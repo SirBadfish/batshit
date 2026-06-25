@@ -1,5 +1,11 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
+  - name: Read the docs
+    url: https://docs.batshit.ai/
+    about: Start here for install, setup, concepts, troubleshooting, and reference docs.
+  - name: Community Discord
+    url: https://discord.gg/3saVHX5xn
+    about: Use Discord for informal community help and discussion.
   - name: Security vulnerability
     url: https://github.com/SirBadfish/batshit/security/advisories/new
     about: Please report suspected vulnerabilities privately instead of opening a public issue.

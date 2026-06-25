@@ -13,6 +13,7 @@
   import SystemPromptEditor from '$lib/components/settings/SystemPromptEditor.svelte'
   import AdminBackupRestoreCard from '$lib/components/settings/admin/AdminBackupRestoreCard.svelte'
   import AdminCoreSystemPromptsCard from '$lib/components/settings/admin/AdminCoreSystemPromptsCard.svelte'
+  import AdminDiagnosticsCard from '$lib/components/settings/admin/AdminDiagnosticsCard.svelte'
   import AdminDynamicSchemaHintsCard from '$lib/components/settings/admin/AdminDynamicSchemaHintsCard.svelte'
   import AdminGoonAssetCleanupCard from '$lib/components/settings/admin/AdminGoonAssetCleanupCard.svelte'
   import AdminUtilityCards from '$lib/components/settings/admin/AdminUtilityCards.svelte'
@@ -54,6 +55,7 @@
     type BackupPreflightSummary,
     type CoreSystemPromptDetail,
     type CoreSystemPromptSummary,
+    type DiagnosticsPreviewSummary,
     type ExaSearchType,
     type GoonAssetAuditSummary,
     type GoonAssetCleanupResult,
@@ -370,6 +372,10 @@
   let backupPreflight = $state<BackupPreflightSummary | null>(null)
   let backupError = $state<string | null>(null)
   let backupConfirmReplace = $state(false)
+  let diagnosticsPreviewBusy = $state(false)
+  let diagnosticsExportBusy = $state(false)
+  let diagnosticsPreview = $state<DiagnosticsPreviewSummary | null>(null)
+  let diagnosticsError = $state<string | null>(null)
   let goonAssetAuditBusy = $state(false)
   let goonAssetCleanupBusy = $state(false)
   let goonAssetAudit = $state<GoonAssetAuditSummary | null>(null)
@@ -1390,6 +1396,71 @@
     }
   }
 
+  async function handleDiagnosticsPreview() {
+    if (diagnosticsPreviewBusy) return
+
+    diagnosticsPreviewBusy = true
+    diagnosticsError = null
+    try {
+      const response = await fetch('/api/admin/diagnostics/preview')
+      if (!response.ok) {
+        const message = await extractError(response, 'Failed to preview diagnostics')
+        throw new Error(message)
+      }
+
+      const result = await response.json()
+      if (!result?.preview) {
+        throw new Error('Diagnostics preview did not return preview data')
+      }
+      diagnosticsPreview = result.preview as DiagnosticsPreviewSummary
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to preview diagnostics'
+      diagnosticsError = message
+      toast.error(message)
+    } finally {
+      diagnosticsPreviewBusy = false
+    }
+  }
+
+  async function handleDiagnosticsExport() {
+    if (diagnosticsExportBusy) return
+    if (!diagnosticsPreview) {
+      await handleDiagnosticsPreview()
+      return
+    }
+
+    diagnosticsExportBusy = true
+    diagnosticsError = null
+    try {
+      const response = await fetch('/api/admin/diagnostics/export', {
+        method: 'POST'
+      })
+
+      if (!response.ok) {
+        const message = await extractError(response, 'Failed to export diagnostics')
+        throw new Error(message)
+      }
+
+      const blob = await response.blob()
+      const disposition = response.headers.get('Content-Disposition') ?? ''
+      const filenameMatch = disposition.match(/filename="([^"]+)"/)
+      const filename = filenameMatch?.[1] ?? diagnosticsPreview.filename ?? 'batshit-diagnostics.zip'
+      const result = await downloadBlob(blob, filename, {
+        title: 'Export Batshit Diagnostics',
+        mimeType: 'application/zip'
+      })
+      if (!result.canceled) {
+        toast.success('Diagnostics exported')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to export diagnostics'
+      diagnosticsError = message
+      toast.error(message)
+    } finally {
+      diagnosticsExportBusy = false
+    }
+  }
+
   async function handleBackupFileSelected(event: Event) {
     const input = event.target as HTMLInputElement
     backupSelectedFile = input.files?.[0] ?? null
@@ -1674,6 +1745,15 @@
       onFileSelected={handleBackupFileSelected}
       onPreflight={handleBackupPreflight}
       onRestore={handleBackupRestore}
+    />
+
+    <AdminDiagnosticsCard
+      previewBusy={diagnosticsPreviewBusy}
+      exportBusy={diagnosticsExportBusy}
+      preview={diagnosticsPreview}
+      error={diagnosticsError}
+      onPreview={handleDiagnosticsPreview}
+      onExport={handleDiagnosticsExport}
     />
 
     <AdminGoonAssetCleanupCard

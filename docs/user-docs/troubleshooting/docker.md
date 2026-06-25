@@ -218,6 +218,10 @@ If a trusted local import is larger and your machine has enough memory, raise `B
 
 ## Where to look for logs
 
+When Batshit opens, prefer Settings -> Admin -> Diagnostics first. Docker installs use a shared `batshit_logs` volume for Batshit app/server file logs when available, and the diagnostics export previews those logs before download.
+
+If Batshit does not open, use Compose logs:
+
 ```sh
 docker compose --env-file .env.docker logs app
 docker compose --env-file .env.docker logs batshit-server

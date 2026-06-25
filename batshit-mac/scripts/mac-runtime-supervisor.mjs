@@ -51,6 +51,8 @@ const DEFAULT_APP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.app}`;
 const DEFAULT_SERVER_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.server}`;
 const DEFAULT_MCP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.mcp}`;
 const DEFAULT_LIVEKIT_AGENT_NAME = 'batshit-livekit-agent';
+const DEFAULT_APP_VERSION = '0.1.0-alpha.1';
+const DEFAULT_APP_CHANNEL = 'alpha';
 const APPLE_CONTAINER_INSTALL_URL = 'https://github.com/apple/container/releases/latest';
 
 const paths = {
@@ -217,6 +219,8 @@ function createServiceDefinitions(env = null) {
         : ['vite', `--port ${ports.app}`, appRoot],
       env: {
         ...packagedFfmpegEnv,
+        BATSHIT_APP_VERSION: process.env.BATSHIT_APP_VERSION || DEFAULT_APP_VERSION,
+        BATSHIT_APP_CHANNEL: process.env.BATSHIT_APP_CHANNEL || DEFAULT_APP_CHANNEL,
         BATSHIT_LOG_DIR: paths.logs,
         ...(useProductionApp
           ? {
@@ -346,6 +350,8 @@ async function ensureRuntimeEnv() {
   setIfMissing('BATSHIT_FRONTEND_PORT', String(DEFAULT_PORTS.app));
   setIfMissing('BATSHIT_SERVER_PORT', String(DEFAULT_PORTS.server));
   setIfMissing('BATSHIT_MCP_STREAMABLE_PORT', String(DEFAULT_PORTS.mcp));
+  setIfMissing('BATSHIT_APP_VERSION', DEFAULT_APP_VERSION);
+  setIfMissing('BATSHIT_APP_CHANNEL', DEFAULT_APP_CHANNEL);
   const ports = runtimePorts(values);
   const appOrigin = loopbackOrigin(ports.app);
   const serverOrigin = loopbackOrigin(ports.server);

@@ -13,6 +13,7 @@
   import ExecutionViewerSheet from '$lib/components/chat/ExecutionViewerSheet.svelte'
   import HeaderBarIcons from '$lib/components/artifacts/HeaderBarIcons.svelte'
   import HeaderOverlay from '$lib/components/artifacts/HeaderOverlay.svelte'
+  import UpdateAvailableIndicator from '$lib/components/update/UpdateAvailableIndicator.svelte'
   import EntityAvatar from '$lib/components/avatar/EntityAvatar.svelte'
   import FirstRunSetupWizard from '$lib/components/onboarding/FirstRunSetupWizard.svelte'
   import { Button } from '$lib/components/ui/button'
@@ -6077,12 +6078,15 @@ const immersiveActive = $derived.by(
 
 <FirstRunSetupWizard {data} />
 
-{#if isMounted && (headerArtifacts.length > 0 || triggerArtifacts.length > 0)}
-  <div class="chat-header-icon-slot">
-    <HeaderBarIcons
-      artifacts={[...headerArtifacts, ...triggerArtifacts]}
-      onOpenOverlay={openArtifactOverlay}
-    />
+{#if isMounted}
+  <div class="chat-header-actions-slot">
+    <UpdateAvailableIndicator />
+    {#if headerArtifacts.length > 0 || triggerArtifacts.length > 0}
+      <HeaderBarIcons
+        artifacts={[...headerArtifacts, ...triggerArtifacts]}
+        onOpenOverlay={openArtifactOverlay}
+      />
+    {/if}
   </div>
 {/if}
 
@@ -6321,11 +6325,15 @@ const immersiveActive = $derived.by(
     background: color-mix(in oklab, var(--bs-app-muted-text) 60%, transparent);
   }
 
-  .chat-header-icon-slot {
+  .chat-header-actions-slot {
     position: fixed;
     top: 0;
     right: calc(var(--sidebar-width-icon, 3rem) + 0.25rem);
     z-index: var(--z-rail);
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    height: var(--app-header-height);
   }
 
   .goon-chat-overlay {

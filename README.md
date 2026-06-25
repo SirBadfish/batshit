@@ -2,11 +2,17 @@
 
 Batshit is an alpha self-hosted AI workspace for n8n orchestration, direct API agents, CLI-powered agents, tools, artifacts, voice, local runtimes, and project-aware work.
 
-This repo is still in pre-launch hardening. The public launch target is open source under **AGPL-3.0-only**, with screenshots, public repo hygiene, and release checklist work completed before the repo is published. See [LICENSE](LICENSE) for code terms and [TRADEMARKS.md](TRADEMARKS.md) for Batshit brand-use rules.
+Batshit is open source under **AGPL-3.0-only**. See [LICENSE](LICENSE) for code terms and [TRADEMARKS.md](TRADEMARKS.md) for Batshit brand-use rules.
 
 User-created chats, agents, prompts, workflows, artifacts, uploaded files, project files, generated content, and local data remain the user's content. Batshit integrates with n8n, which is separately licensed by n8n.
 
 For contribution and security reporting expectations, see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
+## Watch First
+
+[![Informal Alpha Release: Introduction to Batshit playlist card with the Batshit logo and six videos](docs/user-docs/images/batshit-youtube-intro-playlist.png)](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
+
+New to Batshit? Start with the [intro playlist on YouTube](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D), then keep the [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/) handy for walkthroughs and alpha updates.
 
 ## Start Here
 
@@ -39,7 +45,7 @@ See [Ports And URLs](docs/user-docs/reference/ports-and-urls.md) for the full ca
 
 ## Mac app release status
 
-Public users should install the packaged Mac app release artifact once it is published. Source-checkout rebuild scripts are maintainer/development workflow, not the normal install path.
+Public users should install the packaged Mac app release artifact from the current GitHub release. Source-checkout rebuild scripts are maintainer/development workflow, not the normal install path.
 
 ## Documentation Map
 
@@ -51,6 +57,6 @@ Public users should install the packaged Mac app release artifact once it is pub
 - [Security and trust](docs/user-docs/security/overview.md)
 - [Troubleshooting](docs/user-docs/troubleshooting/agents-and-tools.md)
 
-## Launch Status
+## Alpha status
 
-Batshit is preparing for an alpha launch. Expect bugs, sharp edges, and active iteration. The docs should say when something is required, optional, advanced, or not included; when they do not, treat that as a docs bug worth fixing.
+Batshit is in alpha. Expect bugs, sharp edges, and active iteration. The docs should say when something is required, optional, advanced, or not included; when they do not, treat that as a docs bug worth fixing.

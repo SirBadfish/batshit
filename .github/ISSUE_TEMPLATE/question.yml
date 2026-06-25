@@ -1,0 +1,49 @@
+name: Question
+description: Ask a setup or usage question
+title: "[Question]: "
+labels: ["question", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for asking. Please do not include API keys, secrets, private logs, or sensitive local files.
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Setup path
+      options:
+        - Mac app
+        - Docker
+        - Source checkout / contributor setup
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Installation / first run
+        - Providers / models
+        - n8n
+        - Tools / MCP / CLI
+        - Voice / Goons
+        - Backup / restore
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do?
+      description: Tell us what you expected and where you got stuck.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      description: Optional. Include screenshots or sanitized logs only if they help.
+    validations:
+      required: false

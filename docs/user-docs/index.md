@@ -4,9 +4,15 @@ Welcome. These are the launch-facing user docs for Batshit.
 
 Batshit is an alpha self-hosted AI workspace for people who want n8n orchestration, direct AI agents, CLI-powered agents, tools, artifacts, voice, local runtimes, and project-aware work in one place. It's powerful, broad, and still early. These docs are written to save you setup time and to be honest when a feature needs careful configuration.
 
+## Watch first
+
+[![Informal Alpha Release: Introduction to Batshit playlist card with the Batshit logo and six videos](/docs-images/batshit-youtube-intro-playlist.png)](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
+
+Start with the [intro playlist on YouTube](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D), then keep the [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/) handy for walkthroughs and alpha updates.
+
 ## Alpha expectations
 
-Batshit is preparing for an alpha launch. That means:
+Batshit is in alpha. That means:
 
 - Expect sharp edges, and report bugs.
 - Setup is real self-hosting, not a one-click consumer app yet.
@@ -26,6 +32,7 @@ If you're installing Batshit for the first time:
 4. Add [API keys and models](providers/api-keys-and-models.md).
 5. Connect [n8n](primary-agents/connect-n8n.md) when you want n8n agents or workflow tools.
 6. Read [Backup and restore](admin/backup-and-restore.md) before you depend on the instance.
+7. Read [Updating Batshit](installation/updating-batshit.md) before installing a newer alpha release.
 
 You don't need every feature on day one. A good first setup is:
 
@@ -55,6 +62,7 @@ These docs are grouped by subject — everything about a feature lives in one pl
 **Core setup**
 
 - [Installation](installation/choose-mac-app-or-docker.md) — Mac app or Docker, first run, and the Docker runtime and add-ons.
+- [Updating Batshit](installation/updating-batshit.md) — backup first, then update the Mac app or Docker install.
 - [Providers](providers/api-keys-and-models.md) — API keys and model presets.
 - [Security & trust](security/overview.md) — what's safe, what isn't, and the habits that keep your instance yours.
 
@@ -95,6 +103,7 @@ Use these when something isn't behaving the way the setup docs describe:
 - [Agents and tools troubleshooting](troubleshooting/agents-and-tools.md)
 - [Voice and Local AI troubleshooting](troubleshooting/voice-local-ai.md)
 - [Backup and restore troubleshooting](troubleshooting/backup-restore.md)
+- [Bug reports and diagnostics](troubleshooting/bug-reports-and-diagnostics.md)
 
 ## Reference
 

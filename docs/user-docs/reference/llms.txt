@@ -97,6 +97,7 @@ Portable Skills:
 
 Security/documentation constraints:
 - Never publish real tokens, API keys, private local paths, raw logs, or secrets.
+- For bug reports, prefer Settings -> Admin -> Diagnostics and the previewed diagnostics zip over manual raw-log collection.
 - Explain Mac app and Docker security honestly; neither is magically safe.
 - Prefer sandboxed Agent Mode for normal agent command execution when documenting usage.
 - Warn against untrusted skills, MCP gateways, artifacts, and n8n workflows.
@@ -113,6 +114,7 @@ Useful public UserDocs sources for verification:
 - docs/user-docs/groups/overview.md
 - docs/user-docs/chat/execution-viewer.md
 - docs/user-docs/security/overview.md
+- docs/user-docs/troubleshooting/bug-reports-and-diagnostics.md
 - docs/user-docs/skills/portable-skills.md
 - docs/user-docs/reference/ports-and-urls.md
 - docs/user-docs/reference/env-vars.md

@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a Batshit improvement or new capability
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please keep requests concrete: what problem are you trying to solve, and what would better look like?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Chat / agents
+        - n8n
+        - Tools / MCP / CLI
+        - Artifacts
+        - Voice / Goons
+        - Mac app
+        - Docker
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the need in plain language.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Batshit to do?
+      description: A rough idea is fine.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or context
+      description: Optional. Share workarounds, examples from other tools, screenshots, or links if they help.
+    validations:
+      required: false

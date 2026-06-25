@@ -41,6 +41,12 @@ These apply when Batshit runs through `Batshit.app` or directly from source on t
 | `PUBLIC_BATSHIT_SERVER_URL` | Mac app: `http://127.0.0.1:5600`; source checkout: `http://localhost:5610` | Browser-facing batshit-server URL saved/returned to users. |
 | `PUBLIC_BATSHIT_SERVER_API_URL` | Mac app: `http://127.0.0.1:5600/api/v1`; source checkout: `http://localhost:5610/api/v1` | Browser-facing batshit-server API root. |
 | `BATSHIT_ARTIFACT_COMPLETE_URL` | Mac app: `http://127.0.0.1:5620/api/artifacts/complete`; source checkout: `http://localhost:5621/api/artifacts/complete` | Server-to-app artifact completion callback. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.1` | Current installed Batshit version shown by the in-app update check. Normal users should not change this. |
+| `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
+| `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks for offline/private environments. |
+| `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom latest-release feed. Blank uses Batshit's official GitHub release feed. |
+| `BATSHIT_UPDATE_LATEST_VERSION` | blank | Optional local/test override for the latest available version. Leave blank for normal installs. |
+| `BATSHIT_UPDATE_RELEASE_URL` / `BATSHIT_UPDATE_DOWNLOAD_URL` | blank | Optional local/test links used with `BATSHIT_UPDATE_LATEST_VERSION`. |
 | `N8N_BATSHIT_FRONTEND_URL` | Mac app: `http://127.0.0.1:5620`; Docker: the app/container-reachable Batshit URL | Server-to-server Batshit app URL that n8n workflows call for native-tool dispatch and callbacks. |
 | `BODY_SIZE_LIMIT` | Mac app: `1G`; source checkout: unset/SvelteKit default unless you set it | SvelteKit request body limit. The Mac app sets this so large Admin restores and Goon imports can reach batshit-server's route-specific upload handlers. |
 | `REDIS_URL` | Mac app: `redis://127.0.0.1:5639/0`; source checkout: `redis://localhost:6379/0` | Redis Stack connection string. |
@@ -80,6 +86,12 @@ These live in `.env.docker`.
 | `BATSHIT_SESSION_COOKIE_SECURE` | blank | Leave blank for automatic local HTTP vs HTTPS behavior. |
 | `BATSHIT_SESSION_COOKIE_NAME` | `batshit_session_docker` | Lets Docker stay logged in beside another local Batshit instance. |
 | `BODY_SIZE_LIMIT` | `1G` | SvelteKit request body limit for large Admin restore and trusted local import requests. batshit-server still applies narrower Goon-specific caps. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.1` | Current installed Batshit version shown by the in-app update check. |
+| `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
+| `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks. |
+| `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom latest-release feed. Blank uses Batshit's official GitHub release feed. |
+| `BATSHIT_UPDATE_LATEST_VERSION` | blank | Optional local/test override for the latest available version. Leave blank for normal installs. |
+| `BATSHIT_UPDATE_RELEASE_URL` / `BATSHIT_UPDATE_DOWNLOAD_URL` | blank | Optional local/test links used with `BATSHIT_UPDATE_LATEST_VERSION`. |
 
 Docker core containers also set internal values such as `BATSHIT_CONTAINERIZED=1`, `BATSHIT_SERVER_URL=http://batshit-server:5600`, and app `PORT=3000` from `compose.yaml`. Users normally should not override those internal service values.
 

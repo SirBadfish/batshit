@@ -88,6 +88,58 @@ export type BackupPreflightSummary = {
   warnings: string[]
 }
 
+export type DiagnosticsPreviewSummary = {
+  schemaVersion: number
+  createdAt: string
+  filename: string
+  app: {
+    name: 'Batshit'
+    version: string
+  }
+  runtime: {
+    mode: string
+    label: string
+    platform: string
+    arch: string
+    node: string
+    pid: number
+    uptimeSeconds: number
+    cwd: string
+  }
+  health: {
+    ok: boolean
+    checks: {
+      redis: boolean
+      systemPromptDefaults: boolean
+    }
+    errors: string[]
+  }
+  environment: Record<string, string | boolean | null>
+  contents: {
+    included: Array<{
+      path: string
+      label: string
+      description: string
+    }>
+    logFiles: Array<{
+      entryName: string
+      source: string
+      sizeBytes: number
+      includedBytes: number
+      truncated: boolean
+      modifiedAt: string
+      sample: string
+    }>
+    totalLogBytes: number
+  }
+  safety: {
+    redactionApplied: boolean
+    redactionPatterns: string[]
+    notIncluded: string[]
+    warnings: string[]
+  }
+}
+
 export type GoonAssetAuditSummary = {
   uploadRecordCount: number
   referencedRecordCount: number

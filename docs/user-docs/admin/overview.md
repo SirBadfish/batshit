@@ -16,6 +16,10 @@ Backup and restore is the app-owned way to export and re-import your Batshit dat
 
 This is the most important Admin habit to build early: export a backup once after your first working setup, and again before upgrades or risky changes. Full guidance, including what is and isn't included and how Docker and Mac app paths differ, is in [Backup and restore](backup-and-restore.md).
 
+## Diagnostics
+
+Diagnostics is the safe support-bundle export for bug reports. It previews exactly what will be exported, then downloads a zip with runtime context, health checks, selected non-secret environment status, and recent redacted log tails. It does **not** collect chat history, prompts, uploads, project files, backups, saved keys, tokens, cookies, raw Redis data, or n8n workflow contents. See [Bug reports and diagnostics](../troubleshooting/bug-reports-and-diagnostics.md).
+
 ## Runtime status and installers
 
 The Admin area includes a `Runtimes` section that reports the health of optional runtimes Batshit can use, and offers install or repair actions where they apply. It covers status for the n8n runtime, Agent Browser, Cloudflared, Apple Container on Mac, the Docker Sandbox, and the FBX-to-VRMA converter.
@@ -33,6 +37,7 @@ Admin also holds cleanup tools, including Goon Asset Cleanup, which inspects upl
 ## In this section
 
 - [Backup and restore](backup-and-restore.md) — export, inspect, and restore Batshit-owned data safely.
+- [Bug reports and diagnostics](../troubleshooting/bug-reports-and-diagnostics.md) — export a previewed support bundle for GitHub issues.
 
 ## Related
 

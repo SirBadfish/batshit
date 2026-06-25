@@ -33,6 +33,7 @@ services:
       SESSION_STORAGE_PATH: /data/sessions
       SESSIONS_DIR: /data/sessions
       UPLOADS_DIR: /data/uploads
+      BATSHIT_SERVER_LOG_DIR: /data/logs
       BATSHIT_ARTIFACT_COMPLETE_URL: ${BATSHIT_ARTIFACT_COMPLETE_URL:-http://app:3000/api/artifacts/complete}
       CORS_ORIGIN: ${ORIGIN:-http://localhost:5620}
     ports:
@@ -43,6 +44,7 @@ services:
     volumes:
       - batshit_server_sessions:/data/sessions
       - batshit_uploads:/data/uploads
+      - batshit_logs:/data/logs
       - ${BATSHIT_WORKSPACE_MOUNT:-batshit_workspace}:/workspace
     depends_on:
       redis:
@@ -73,6 +75,13 @@ services:
     environment:
       NODE_ENV: production
       BATSHIT_CONTAINERIZED: "1"
+      BATSHIT_APP_VERSION: ${BATSHIT_APP_VERSION:-0.1.0-alpha.1}
+      BATSHIT_APP_CHANNEL: ${BATSHIT_APP_CHANNEL:-alpha}
+      BATSHIT_UPDATE_CHECK_DISABLED: ${BATSHIT_UPDATE_CHECK_DISABLED:-0}
+      BATSHIT_UPDATE_FEED_URL: ${BATSHIT_UPDATE_FEED_URL:-}
+      BATSHIT_UPDATE_LATEST_VERSION: ${BATSHIT_UPDATE_LATEST_VERSION:-}
+      BATSHIT_UPDATE_RELEASE_URL: ${BATSHIT_UPDATE_RELEASE_URL:-}
+      BATSHIT_UPDATE_DOWNLOAD_URL: ${BATSHIT_UPDATE_DOWNLOAD_URL:-}
       BATSHIT_SESSION_COOKIE_NAME: ${BATSHIT_SESSION_COOKIE_NAME:-batshit_session_docker}
       HOST: 0.0.0.0
       PORT: 3000
@@ -92,6 +101,8 @@ services:
       BATSHIT_WORKSPACE_MOUNT: ${BATSHIT_WORKSPACE_MOUNT:-}
       BATSHIT_WORKSPACE_CONTAINER_PATH: /workspace
       UPLOADS_DIR: /data/uploads
+      BATSHIT_LOG_DIR: /data/logs
+      BATSHIT_SERVER_LOG_DIR: /data/logs
       BATSHIT_SERVER_URL: http://batshit-server:5600
       BATSHIT_SERVER_API_URL: http://batshit-server:5600/api/v1
       PUBLIC_BATSHIT_SERVER_URL: ${PUBLIC_BATSHIT_SERVER_URL:-http://localhost:5600}
@@ -129,6 +140,7 @@ services:
         condition: service_healthy
     volumes:
       - batshit_uploads:/data/uploads
+      - batshit_logs:/data/logs
       - ${BATSHIT_WORKSPACE_MOUNT:-batshit_workspace}:/workspace
       - batshit_codex_home:/root/.codex
       - batshit_agent_runtime:/root/.batshit
@@ -435,6 +447,7 @@ volumes:
   batshit_redis_data:
   batshit_server_sessions:
   batshit_uploads:
+  batshit_logs:
   batshit_workspace:
   batshit_codex_home:
   batshit_agent_runtime:

@@ -163,5 +163,6 @@ Large Goons, Motion Vault assets, Clips, and uploaded files make backups large. 
 ## Related docs
 
 - [First run](../installation/first-run.md)
+- [Updating Batshit](../installation/updating-batshit.md)
 - [API keys and models](../providers/api-keys-and-models.md)
 - [Connect n8n](../primary-agents/connect-n8n.md)
