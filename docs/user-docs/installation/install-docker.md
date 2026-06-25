@@ -42,7 +42,7 @@ Node should be version 24 or newer.
 ## Clone Batshit
 
 ```sh
-git clone <public Batshit repo URL>
+git clone https://github.com/SirBadfish/batshit.git
 cd batshit
 ```
 

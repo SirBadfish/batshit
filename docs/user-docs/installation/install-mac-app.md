@@ -4,6 +4,18 @@ The Mac app is the normal Mac setup path. You open `Batshit.app`, use Runtime Do
 
 Docker remains the cross-platform path. Manual source-checkout setup is advanced repair/development material, not the normal public install.
 
+## Download
+
+[Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/download/v0.1.0-alpha.1/Batshit-0.1.0-macos-ReleaseSafe.dmg)
+
+Public alpha releases are published through GitHub Releases, but the link above downloads the DMG directly. After it downloads, open the DMG, drag `Batshit.app` to Applications if prompted, then open `Batshit.app`.
+
+SHA-256 checksum:
+
+```text
+d550a4c77ea6239bcc674ca757ba14ceb99937bfacdc9deb4a7893bb1887375c
+```
+
 ## Current release truth
 
 The Mac app release path is a Developer ID signed, notarized DMG. Local development builds may still be shared as raw `.app` packages, but the public Mac install path is the DMG.

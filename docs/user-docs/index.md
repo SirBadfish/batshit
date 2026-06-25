@@ -36,6 +36,18 @@ You don't need every feature on day one. A good first setup is:
 5. Send a simple message.
 6. Add n8n after the basic chat path works.
 
+## Download, videos, and community
+
+- [Download Batshit for Mac](https://github.com/SirBadfish/batshit/releases/download/v0.1.0-alpha.1/Batshit-0.1.0-macos-ReleaseSafe.dmg)
+- [Install with Docker](installation/install-docker.md)
+- [Watch the informal alpha walkthrough playlist](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D)
+- [Batshit on GitHub](https://github.com/SirBadfish/batshit)
+- [Batshit on X](https://x.com/batshit_ai)
+- [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/)
+- [Join the Discord](https://discord.gg/3saVHX5xn)
+
+The alpha videos are informal and aimed at AI enthusiasts, builders, and people who have used tools like Codex before.
+
 ## Explore by subject
 
 These docs are grouped by subject — everything about a feature lives in one place, with the concepts taught inline where you need them.
