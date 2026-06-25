@@ -26,6 +26,7 @@
     "eslint": "^10.2.0",
     "eslint-plugin-jsonc": "^3.1.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
     "fflate": "^0.8.2",
     "glob": "^13.0.6",
     "globals": "^17.4.0",
@@ -52,6 +53,10 @@
   "devDependencies": {
     "jest": "^30.3.0",
     "nodemon": "^3.1.14"
+  },
+  "overrides": {
+    "@babel/core": "^7.29.6",
+    "js-yaml": "^4.2.0"
   },
   "private": true
 }

@@ -10,31 +10,32 @@
  */
 import { describe, expect, it } from 'vitest'
 import { execSync } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { startCodexAppServerRun } from '../services/codexAppServerLane'
 import { isContextExhaustionError } from '../services/contextExhaustion'
 
 const LIVE = process.env.BATSHIT_LIVE_CODEX === '1'
-const ROOT = '/tmp/batshit-appserver-lane-live'
-const CODEX_HOME = join(ROOT, 'codex-home')
-const WORKSPACE = join(ROOT, 'workspace')
 const MODEL = 'gpt-5.3-codex-spark'
 
 function setupLiveEnv() {
-  rmSync(ROOT, { recursive: true, force: true })
-  mkdirSync(CODEX_HOME, { recursive: true })
-  mkdirSync(WORKSPACE, { recursive: true })
+  const root = mkdtempSync(join(tmpdir(), 'batshit-appserver-lane-live-'))
+  const codexHome = join(root, 'codex-home')
+  const workspace = join(root, 'workspace')
+  mkdirSync(codexHome, { recursive: true })
+  mkdirSync(workspace, { recursive: true })
   const realAuth = join(homedir(), '.codex', 'auth.json')
   if (!existsSync(realAuth)) throw new Error('No ~/.codex/auth.json — cannot run live smoke')
-  symlinkSync(realAuth, join(CODEX_HOME, 'auth.json'))
-  writeFileSync(join(WORKSPACE, 'notes.txt'), 'The live smoke magic word is kumquat.\n')
+  symlinkSync(realAuth, join(codexHome, 'auth.json'))
+  writeFileSync(join(workspace, 'notes.txt'), 'The live smoke magic word is kumquat.\n')
   const executable = execSync('which codex', { encoding: 'utf8' }).trim()
   return {
     executable,
-    env: { ...process.env, CODEX_HOME },
+    env: { ...process.env, CODEX_HOME: codexHome },
+    root,
+    workspace,
   }
 }
 
@@ -43,14 +44,14 @@ describe.runIf(LIVE)('codex app-server lane (LIVE)', () => {
     'completes a managed-style turn with mid-run usage and mapped events',
     { timeout: 120_000 },
     async () => {
-      const { executable, env } = setupLiveEnv()
+      const { executable, env, root, workspace } = setupLiveEnv()
       const run = startCodexAppServerRun({
         executable,
         env,
-        cwd: WORKSPACE,
+        cwd: workspace,
         threadParams: {
           ephemeral: true,
-          cwd: WORKSPACE,
+          cwd: workspace,
           model: MODEL,
           approvalPolicy: 'never',
           sandbox: 'workspace-write',
@@ -60,8 +61,12 @@ describe.runIf(LIVE)('codex app-server lane (LIVE)', () => {
       })
 
       const events: any[] = []
-      for await (const event of run.events) events.push(event)
-      await run.cleanup()
+      try {
+        for await (const event of run.events) events.push(event)
+      } finally {
+        await run.cleanup().catch(() => undefined)
+        rmSync(root, { recursive: true, force: true })
+      }
 
       const types = events.map((e) => e.type)
       expect(types[0]).toBe('thread.started')

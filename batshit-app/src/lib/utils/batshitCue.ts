@@ -65,10 +65,31 @@ function parseControlObject(raw: string): Record<string, unknown> | null {
   const payload = raw.trim()
   if (!payload) return null
 
+  const decodeSelectedEscapes = (value: string, allowed: Set<string>): string => {
+    let output = ''
+    for (let index = 0; index < value.length; index += 1) {
+      const char = value[index]
+      if (char !== '\\') {
+        output += char
+        continue
+      }
+
+      const next = value[index + 1]
+      if (next && allowed.has(next)) {
+        output += next
+        index += 1
+        continue
+      }
+
+      output += char
+    }
+    return output
+  }
+
   const candidates = [
     payload,
-    payload.replace(/\\"/g, '"'),
-    payload.replace(/\\\\/g, '\\').replace(/\\"/g, '"')
+    decodeSelectedEscapes(payload, new Set(['"'])),
+    decodeSelectedEscapes(payload, new Set(['\\', '"']))
   ]
 
   for (const candidate of candidates) {

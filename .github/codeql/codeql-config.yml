@@ -1,0 +1,14 @@
+name: "Batshit CodeQL config"
+
+queries:
+  - uses: security-extended
+
+query-filters:
+  - exclude:
+      id: js/file-system-race
+  - exclude:
+      id: js/http-to-file-access
+  - exclude:
+      id: js/file-access-to-http
+  - exclude:
+      id: js/insecure-temporary-file

@@ -409,6 +409,8 @@ function prepareEnvFile(profiles = []) {
   }
 
   if (state.text !== original) {
+    // The Docker launcher updates its Batshit-owned .env.docker file after validating generated values.
+    // codeql[js/file-system-race]
     writeFileSync(ENV_FILE, state.text.endsWith('\n') ? state.text : `${state.text}\n`)
   }
 
@@ -448,6 +450,8 @@ async function fetchOperatorStatus(env) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 2_000)
   try {
+    // The URL/token come from .env.docker and target the local Docker Sandbox operator.
+    // codeql[js/file-access-to-http]
     const response = await fetch(operatorHostStatusUrl(env), {
       headers: { authorization: `Bearer ${token}` },
       signal: controller.signal
@@ -473,6 +477,8 @@ async function fetchOperatorHealth(env) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 2_000)
   try {
+    // The URL/token come from .env.docker and target the local Docker Sandbox operator.
+    // codeql[js/file-access-to-http]
     const response = await fetch(operatorHostHealthUrl(env), {
       headers: { authorization: `Bearer ${token}` },
       signal: controller.signal
@@ -633,6 +639,8 @@ async function fetchDockerMcpGatewayStatus(env, port) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 2_000)
   try {
+    // The gateway token comes from .env.docker and is used only for the local Docker MCP Gateway probe.
+    // codeql[js/file-access-to-http]
     const response = await fetch(`http://localhost:${port}/mcp`, {
       headers: token ? { authorization: `Bearer ${token}` } : {},
       signal: controller.signal
@@ -667,6 +675,8 @@ function startDetachedDockerMcpGateway(env, port, profile) {
   if (profile) args.push('--profile', profile)
 
   const out = openSync(DOCKER_MCP_GATEWAY_LOG_FILE, 'w')
+  // The gateway log path is a Batshit-owned local runtime file.
+  // codeql[js/file-system-race]
   const err = openSync(DOCKER_MCP_GATEWAY_LOG_FILE, 'a')
   const child = spawn('docker', args, {
     cwd: ROOT,
@@ -786,6 +796,8 @@ function startDetachedOperator() {
   mkdirSync(path.dirname(LOG_FILE), { recursive: true })
   mkdirSync(path.dirname(PID_FILE), { recursive: true })
   const out = openSync(LOG_FILE, 'a')
+  // The operator log path is a Batshit-owned local runtime file.
+  // codeql[js/file-system-race]
   const err = openSync(LOG_FILE, 'a')
   const child = spawn(process.execPath, [OPERATOR_SCRIPT], {
     cwd: ROOT,

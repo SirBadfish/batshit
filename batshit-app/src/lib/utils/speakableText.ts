@@ -122,19 +122,95 @@ function stripEmojiComboJoiners(text: string): string {
   return output
 }
 
-function stripHtmlItalicNarrationForSpeech(text: string): string {
-  let output = text
-  let changed = true
+function isHtmlTagNameBoundary(char: string | undefined): boolean {
+  return !char || char === '>' || char === '/' || char === ' ' || char === '\t' || char === '\n' || char === '\r'
+}
 
-  while (changed) {
-    changed = false
-    output = output.replace(/<(em|i)\b[^>]*>[\s\S]*?<\/\1>/gi, () => {
-      changed = true
-      return ''
-    })
+function findHtmlTag(lowerText: string, tagName: string, fromIndex: number, closing = false): number {
+  const prefix = closing ? `</${tagName}` : `<${tagName}`
+  let searchIndex = fromIndex
+  while (searchIndex < lowerText.length) {
+    const index = lowerText.indexOf(prefix, searchIndex)
+    if (index < 0) return -1
+    if (isHtmlTagNameBoundary(lowerText[index + prefix.length])) return index
+    searchIndex = index + prefix.length
+  }
+  return -1
+}
+
+function stripSelfClosingHtmlTagsByName(text: string, tagName: string): string {
+  let output = text
+  for (let scanCount = 0; scanCount < 50; scanCount += 1) {
+    const lower = output.toLowerCase()
+    const openIndex = findHtmlTag(lower, tagName, 0)
+    if (openIndex < 0) return output
+
+    const openEnd = lower.indexOf('>', openIndex)
+    if (openEnd < 0) return output.slice(0, openIndex)
+
+    const tagText = lower.slice(openIndex, openEnd + 1)
+    if (!tagText.trimEnd().endsWith('/>')) {
+      return output
+    }
+
+    output = `${output.slice(0, openIndex)} ${output.slice(openEnd + 1)}`
+  }
+  return output
+}
+
+function stripHtmlBlocksByTagName(text: string, tagName: string): string {
+  let output = text
+
+  for (let scanCount = 0; scanCount < 50; scanCount += 1) {
+    const lower = output.toLowerCase()
+    const openIndex = findHtmlTag(lower, tagName, 0)
+    if (openIndex < 0) return output
+
+    const openEnd = lower.indexOf('>', openIndex)
+    if (openEnd < 0) {
+      output = `${output.slice(0, openIndex)} ${output.slice(openIndex + tagName.length + 1)}`
+      continue
+    }
+
+    const closeIndex = findHtmlTag(lower, tagName, openEnd + 1, true)
+    if (closeIndex < 0) {
+      output = output.slice(0, openIndex)
+      continue
+    }
+
+    const closeEnd = lower.indexOf('>', closeIndex)
+    output = `${output.slice(0, openIndex)} ${closeEnd >= 0 ? output.slice(closeEnd + 1) : ''}`
   }
 
-  return output.replace(/<(em|i)\b[^>]*\/>/gi, '')
+  return output
+}
+
+function stripRemainingHtmlTags(text: string): string {
+  let output = ''
+  let index = 0
+  while (index < text.length) {
+    const openIndex = text.indexOf('<', index)
+    if (openIndex < 0) {
+      output += text.slice(index)
+      break
+    }
+
+    output += text.slice(index, openIndex)
+    const closeIndex = text.indexOf('>', openIndex + 1)
+    if (closeIndex < 0) {
+      break
+    }
+    output += ' '
+    index = closeIndex + 1
+  }
+  return output
+}
+
+function stripHtmlItalicNarrationForSpeech(text: string): string {
+  let output = stripHtmlBlocksByTagName(text, 'em')
+  output = stripHtmlBlocksByTagName(output, 'i')
+  output = stripSelfClosingHtmlTagsByName(output, 'em')
+  return stripSelfClosingHtmlTagsByName(output, 'i')
 }
 
 function stripMarkdownItalicNarrationForSpeech(text: string): string {
@@ -289,8 +365,8 @@ export function extractSpeakableText(content: string, options: SpeakableTextOpti
   text = text.replace(/\{\{batshit\|id:[^}]+\}\}/g, '')
 
   // Remove script/style blocks entirely (avoid reading embedded JSON payloads).
-  text = text.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
-  text = text.replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, '')
+  text = stripHtmlBlocksByTagName(text, 'script')
+  text = stripHtmlBlocksByTagName(text, 'style')
 
   // Remove unsupported XML-style blocks entirely so custom control tags
   // (for example <emotion>...</emotion>) are never read aloud.
@@ -300,7 +376,7 @@ export function extractSpeakableText(content: string, options: SpeakableTextOpti
   text = text.replace(/<(br|hr)\b[^>]*\/?>/gi, '\n')
 
   // Strip remaining XML/HTML tags but keep their inner text.
-  text = text.replace(/<[^>]*>/g, '')
+  text = stripRemainingHtmlTags(text)
 
   // Remove `+` only when it is acting as an emoji-combo joiner (for example `🙄+🤨`).
   text = stripEmojiComboJoiners(text)

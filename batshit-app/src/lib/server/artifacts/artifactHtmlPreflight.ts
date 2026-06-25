@@ -29,7 +29,7 @@ type InlineScriptBlock = {
   startLine: number
 }
 
-const SCRIPT_TAG_PATTERN = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi
+const SCRIPT_TAG_PATTERN = /<script\b([^>]*)>([\s\S]*?)<\/script(?:\s[^>]*)?>/gi
 const CLASSIC_SCRIPT_TYPES = new Set([
   '',
   'text/javascript',

@@ -106,7 +106,7 @@ router.get('/:type/:filename', async (req, res) => {
     const { type, filename } = req.params;
     let redisKey = `upload:${type}:${filename}`;
     
-    logger.debug(`Serving file from Redis: ${redisKey}`);
+    logger.debug('Serving file from Redis upload metadata');
     
     // Get file data from Redis
     let fileData = await redisService.get(redisKey);
@@ -121,7 +121,7 @@ router.get('/:type/:filename', async (req, res) => {
         const newKey = `upload:avatars:${entityType}:${filename}`;
         fileData = await redisService.get(newKey);
         if (fileData) {
-          logger.debug(`Found avatar in new structure: ${newKey}`);
+          logger.debug('Found avatar in organized Redis upload structure');
         }
       }
       
@@ -138,7 +138,7 @@ router.get('/:type/:filename', async (req, res) => {
     }
     
     if (!fileData) {
-      logger.warn(`File not found in Redis: ${redisKey}`);
+      logger.warn('File not found in Redis upload metadata');
       const looksLikeEphemeralAgentBrowser =
         typeof filename === 'string' && filename.includes('batshit-agent-browser-');
       if (looksLikeEphemeralAgentBrowser) {
@@ -160,7 +160,7 @@ router.get('/:type/:filename', async (req, res) => {
       // Binary files stored as base64
       buffer = Buffer.from(fileData.base64, 'base64');
     } else {
-      logger.error(`File has neither textContent nor base64: ${redisKey}`);
+      logger.error('Redis upload metadata has neither textContent nor base64');
       return res.status(500).json({ error: 'Invalid file data' });
     }
     

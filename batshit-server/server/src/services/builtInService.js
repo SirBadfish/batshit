@@ -528,10 +528,10 @@ class BuiltInService {
         const dirPath = path.dirname(absolutePath);
         await fsp.mkdir(dirPath, { recursive: true });
         
-        // Create empty file if it doesn't exist
-        if (!fs.existsSync(absolutePath)) {
-          await fsp.writeFile(absolutePath, '');
-        } else {
+        try {
+          await fsp.writeFile(absolutePath, '', { flag: 'wx' });
+        } catch (error) {
+          if (error?.code !== 'EEXIST') throw error;
           return {
             success: false,
             tool: 'create_file',
@@ -887,16 +887,23 @@ class BuiltInService {
         
         // For smaller text files, include content preview
         if (stats.size < 1024 * 50) { // Less than 50KB
+          let handle = null;
           try {
             result.isText = this._isLikelyTextFile(filePath);
-            
+
             if (result.isText) {
-              const content = await fsp.readFile(absolutePath, 'utf8');
-              result.previewContent = content.substring(0, 500); // First 500 chars
-              result.lines = content.split('\n').length;
+              handle = await fsp.open(absolutePath, 'r');
+              const handleStats = await handle.stat();
+              if (handleStats.isFile() && handleStats.size < 1024 * 50) {
+                const content = await handle.readFile('utf8');
+                result.previewContent = content.substring(0, 500); // First 500 chars
+                result.lines = content.split('\n').length;
+              }
             }
           } catch (previewError) {
             // Skip preview on error
+          } finally {
+            await handle?.close().catch(() => {});
           }
         }
       } else if (stats.isDirectory()) {
@@ -907,7 +914,7 @@ class BuiltInService {
       
       return result;
     } catch (error) {
-      logger.error(`Error getting file info for ${filePath}: ${error.message}`);
+      logger.error('Error getting file info');
       return {
         success: false,
         tool: 'get_file_info',

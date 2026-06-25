@@ -211,7 +211,6 @@ async function handleRun(req, res) {
     const args = normalizeArgs(body.args)
     const run = await runAgentBrowser(args, {
       env: body.env,
-      timeoutMs: body.timeoutMs,
       maxOutputChars: body.maxOutputChars,
       cwd: TMP_DIR
     })
@@ -219,7 +218,7 @@ async function handleRun(req, res) {
   } catch (error) {
     sendJson(res, 400, {
       ok: false,
-      error: error instanceof Error ? error.message : String(error)
+      error: 'Invalid Agent Browser sidecar request.'
     })
   }
 }
@@ -242,9 +241,10 @@ async function handleRequest(req, res) {
 
     sendJson(res, 404, { ok: false, error: 'Not found.' })
   } catch (error) {
+    console.error('[agent-browser-sidecar] request failed:', error instanceof Error ? error.message : 'Unknown error')
     sendJson(res, 500, {
       ok: false,
-      error: error instanceof Error ? error.message : String(error)
+      error: 'Agent Browser sidecar request failed.'
     })
   }
 }

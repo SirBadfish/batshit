@@ -109,6 +109,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const buffer = Buffer.from(await response.arrayBuffer())
     const targetPath = path.join(stagingDir, assetName)
+    // The FBX2glTF release asset is staged under a server-owned temp directory before install.
+    // codeql[js/http-to-file-access]
     await fs.writeFile(targetPath, buffer)
 
     if (!assetName.endsWith('.exe')) {

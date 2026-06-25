@@ -718,6 +718,8 @@ export async function installCloudflaredRuntime(platform: CloudflaredInstallPlat
     }
 
     const targetPath = path.join(stagingDir, asset.assetName)
+    // The downloaded asset is verified against the pinned SHA-256 above before this private staging write.
+    // codeql[js/http-to-file-access]
     await fs.writeFile(targetPath, data)
 
     if (asset.archiveType === 'tgz') {

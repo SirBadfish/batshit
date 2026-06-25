@@ -82,30 +82,30 @@ class batshitzipService {
       // Use rough estimate for large files to avoid slow tokenizer
       if (textContent.length > 10000) {
         tokens = Math.ceil(textContent.length / 4); // Rough estimate
-        logger.debug(`[batshitzip] Text file token estimate (rough): ${tokens} tokens for ${textContent.length} characters`);
+        logger.debug('[batshitzip] Text file token estimate calculated');
       } else {
         tokens = this.calculateTokens(textContent);
-        logger.debug(`[batshitzip] Text file token count (exact): ${tokens} tokens`);
+        logger.debug('[batshitzip] Text file token count calculated');
       }
     } else if (mimetype && mimetype.startsWith('image/')) {
       // For images, calculate based on whether it's base64 or external URL
       if (base64) {
         // Local storage: calculate from base64 length
         tokens = Math.ceil(base64.length / 4);
-        logger.debug(`[batshitzip] Image token count (base64): ${tokens} tokens for ${originalName}`);
+        logger.debug('[batshitzip] Image token count calculated');
       } else {
         // External URL: use vision model token cost (765 for standard images)
         tokens = 765; // Standard image token cost for URL references
-        logger.debug(`[batshitzip] Image token count (vision model): ${tokens} tokens for ${originalName}`);
+        logger.debug('[batshitzip] Image token count calculated');
       }
     } else if (base64) {
       // For non-image binary files, calculate from base64 length
       tokens = Math.ceil(base64.length / 4);
-      logger.debug(`[batshitzip] Binary file token estimate: ${tokens} tokens for ${base64.length} base64 characters`);
+        logger.debug('[batshitzip] Binary file token estimate calculated');
     } else {
       // Fallback rough estimate
       tokens = Math.ceil(size / 100);
-      logger.debug(`[batshitzip] Fallback token estimate: ${tokens} tokens for ${size} bytes`);
+      logger.debug('[batshitzip] Fallback token estimate calculated');
     }
 
     const description = this.generateDescription(fileData);

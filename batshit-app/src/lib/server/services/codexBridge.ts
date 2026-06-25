@@ -1064,14 +1064,12 @@ export class CodexBridge {
         const res = await fetch(img.url);
         const array = await res.arrayBuffer();
         const filename = path.join(tmpDir, `${randomUUID()}.img`);
+        // Codex image inputs are staged under a private random temp directory and removed after the run.
+        // codeql[js/http-to-file-access]
         await fs.writeFile(filename, Buffer.from(array));
         paths.push(filename);
-      } catch (error) {
-        console.warn(
-          "[CodexBridge] Failed to download image for Codex",
-          img.url,
-          error,
-        );
+      } catch {
+        console.warn("[CodexBridge] Failed to download image for Codex");
       }
     }
 

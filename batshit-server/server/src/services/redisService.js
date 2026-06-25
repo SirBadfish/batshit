@@ -210,7 +210,7 @@ class RedisService {
       // Add to user's clip set
       await this.client.sAdd(`user:${userId}:clips`, clipId);
       
-      logger.debug(`[Redis] Stored clip ${clipId} for user ${userId} using RedisJSON`);
+      logger.debug('[Redis] Stored clip using RedisJSON');
       return true;
     } catch (error) {
       logger.error(`[Redis] Failed to store clip:`, error);

@@ -529,6 +529,8 @@ export async function installManagedCli(
 
   try {
     const archivePath = path.join(stagingRoot, `${runtime}-${version}.tgz`)
+    // The managed CLI tarball is verified against npm integrity before this private staging write.
+    // codeql[js/http-to-file-access]
     await writeFile(archivePath, data)
     await extractTarGz(archivePath, stagingRoot)
     await rm(archivePath, { force: true })
@@ -562,6 +564,8 @@ export async function installManagedCli(
       executablePath,
       versionOutput
     }
+    // The manifest records verified package metadata inside the private staging directory.
+    // codeql[js/http-to-file-access]
     await writeFile(
       path.join(stagingRoot, MANAGED_CLI_MANIFEST_FILE),
       `${JSON.stringify(manifest, null, 2)}\n`,

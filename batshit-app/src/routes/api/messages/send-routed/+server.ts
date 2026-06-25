@@ -1,4 +1,5 @@
-import { readFile, stat, unlink } from 'node:fs/promises'
+import { open, unlink } from 'node:fs/promises'
+import { randomInt } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { json } from '@sveltejs/kit'
@@ -1687,6 +1688,18 @@ const LOCAL_IMAGE_EXT_TO_MEDIA: Record<string, string> = {
   '.svg': 'image/svg+xml',
 }
 
+async function readLocalImageOutputWithinLimit(filePath: string): Promise<Buffer | null> {
+  const handle = await open(filePath, 'r')
+  try {
+    const buffer = Buffer.alloc(MAX_LOCAL_IMAGE_OUTPUT_BYTES + 1)
+    const { bytesRead } = await handle.read(buffer, 0, MAX_LOCAL_IMAGE_OUTPUT_BYTES + 1, 0)
+    if (bytesRead <= 0 || bytesRead > MAX_LOCAL_IMAGE_OUTPUT_BYTES) return null
+    return buffer.subarray(0, bytesRead)
+  } finally {
+    await handle.close()
+  }
+}
+
 function isLikelyBase64(value: string) {
   if (!value) return false
   const trimmed = value.trim()
@@ -1847,8 +1860,6 @@ function inferToolStepSuccess(
   return fallback
 }
 
-const AGENT_BROWSER_BASH_PREFIX_REGEX =
-  /^\s*((?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*)((?:npx(?:\s+-y)?\s+agent-browser|agent-browser))(\s[\s\S]*)?$/i
 const AGENT_BROWSER_BASH_CHAIN_OPERATOR_REGEX = /\s(?:&&|\|\||;)\s/
 const AGENT_BROWSER_BASH_FLAGS_WITH_VALUE = new Set([
   '--cdp',
@@ -1859,20 +1870,117 @@ const AGENT_BROWSER_BASH_FLAGS_WITH_VALUE = new Set([
   '--profile',
 ])
 
+type AgentBrowserBashCommandParts = {
+  rest: string
+}
+
+function unquoteAgentBrowserShellToken(value: string): string {
+  const trimmed = value.trim()
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
+function isShellIdentifierStart(char: string): boolean {
+  return (
+    (char >= 'A' && char <= 'Z') ||
+    (char >= 'a' && char <= 'z') ||
+    char === '_'
+  )
+}
+
+function isShellIdentifierChar(char: string): boolean {
+  return isShellIdentifierStart(char) || (char >= '0' && char <= '9')
+}
+
+function skipShellWhitespace(value: string, start: number): number {
+  let index = start
+  while (index < value.length && /\s/.test(value[index] ?? '')) index += 1
+  return index
+}
+
+function readShellTokenSpan(
+  value: string,
+  start: number,
+): { token: string; start: number; end: number } | null {
+  const tokenStart = skipShellWhitespace(value, start)
+  if (tokenStart >= value.length) return null
+
+  let index = tokenStart
+  let quote: string | null = null
+  while (index < value.length) {
+    const char = value[index] ?? ''
+    if (quote) {
+      if (char === quote) quote = null
+      index += 1
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      index += 1
+      continue
+    }
+    if (/\s/.test(char)) break
+    index += 1
+  }
+
+  return {
+    token: unquoteAgentBrowserShellToken(value.slice(tokenStart, index)),
+    start: tokenStart,
+    end: index,
+  }
+}
+
+function isEnvironmentAssignmentToken(token: string): boolean {
+  const equalsIndex = token.indexOf('=')
+  if (equalsIndex <= 0) return false
+  const name = token.slice(0, equalsIndex)
+  if (!isShellIdentifierStart(name[0] ?? '')) return false
+  for (const char of name.slice(1)) {
+    if (!isShellIdentifierChar(char)) return false
+  }
+  return true
+}
+
+function parseAgentBrowserBashCommand(
+  command: string,
+): AgentBrowserBashCommandParts | null {
+  let index = 0
+  while (index < command.length) {
+    const token = readShellTokenSpan(command, index)
+    if (!token) return null
+    if (!isEnvironmentAssignmentToken(token.token)) break
+    index = token.end
+  }
+
+  const launcherStartToken = readShellTokenSpan(command, index)
+  if (!launcherStartToken) return null
+
+  let launcherEnd = launcherStartToken.end
+  if (launcherStartToken.token.toLowerCase() === 'npx') {
+    let nextToken = readShellTokenSpan(command, launcherEnd)
+    if (nextToken?.token === '-y') {
+      launcherEnd = nextToken.end
+      nextToken = readShellTokenSpan(command, launcherEnd)
+    }
+    if (nextToken?.token.toLowerCase() !== 'agent-browser') return null
+    launcherEnd = nextToken.end
+  } else if (launcherStartToken.token.toLowerCase() !== 'agent-browser') {
+    return null
+  }
+
+  return {
+    rest: command.slice(launcherEnd).trim(),
+  }
+}
+
 function splitShellWordsForAgentBrowser(value: string): string[] {
   const tokens = value.match(/'[^']*'|"[^"]*"|\S+/g) ?? []
-  return tokens
-    .map((token) => {
-      const trimmed = token.trim()
-      if (
-        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-        (trimmed.startsWith("'") && trimmed.endsWith("'"))
-      ) {
-        return trimmed.slice(1, -1)
-      }
-      return trimmed
-    })
-    .filter((token) => token.length > 0)
+  return tokens.map((token) => unquoteAgentBrowserShellToken(token)).filter((token) => token.length > 0)
 }
 
 function splitAgentBrowserCommandAtChainForDetection(commandSegment: string): {
@@ -1923,9 +2031,9 @@ function findAgentBrowserSubcommandIndexForDetection(tokens: string[]): number {
 }
 
 function resolveAgentBrowserBashSubcommand(command: string): string | null {
-  const match = command.match(AGENT_BROWSER_BASH_PREFIX_REGEX)
-  if (!match) return null
-  const rest = (match[3] ?? '').trim()
+  const parsedCommand = parseAgentBrowserBashCommand(command)
+  if (!parsedCommand) return null
+  const rest = parsedCommand.rest
   if (!rest) return null
   const { primary } = splitAgentBrowserCommandAtChainForDetection(rest)
   const tokens = splitShellWordsForAgentBrowser(primary)
@@ -4282,16 +4390,11 @@ async function handleBatshitAgentStream({
     ) {
       const localPath = path.resolve(output.filePath.trim())
       try {
-        const details = await stat(localPath)
-        if (!details.isFile()) return null
-        if (details.size > MAX_LOCAL_IMAGE_OUTPUT_BYTES) {
-          console.warn('[Send-Routed] Skipping oversized local image output', {
-            path: localPath,
-            size: details.size,
-          })
+        const bytes = await readLocalImageOutputWithinLimit(localPath)
+        if (!bytes) {
+          console.warn('[Send-Routed] Skipping unavailable local image output')
           return null
         }
-        const bytes = await readFile(localPath)
         const mediaType =
           output.mediaType ||
           inferImageMediaTypeFromPath(localPath) ||
@@ -4338,12 +4441,8 @@ async function handleBatshitAgentStream({
 
           if (localPath) {
             try {
-              const details = await stat(localPath)
-              if (
-                details.isFile() &&
-                details.size <= MAX_LOCAL_IMAGE_OUTPUT_BYTES
-              ) {
-                const bytes = await readFile(localPath)
+              const bytes = await readLocalImageOutputWithinLimit(localPath)
+              if (bytes) {
                 const fileName = path.basename(localPath)
                 const resolvedMediaType =
                   output.mediaType ||
@@ -5652,7 +5751,7 @@ async function handleBatshitAgentStream({
           const emittedArgs = nativeBashMapping?.mappedArgs ?? args
           const resolvedToolCallId =
             resolveToolCallIdFromEvent(toolCall) ||
-            `tool_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+            `tool_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`
           if (isPlanUpdateTool(toolCall.toolName)) {
             await emitPlanUpdate(rawArgs)
             break
@@ -5881,7 +5980,7 @@ async function handleBatshitAgentStream({
               : undefined)
           const fallbackToolCallId =
             rawToolCallId ||
-            `tool_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+            `tool_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`
 
           const resolvedMetadata = detectToolSource(toolResult.toolName)
           let toolZipReferences:
@@ -7038,8 +7137,7 @@ async function handleGroupChatStream({
 
       if (candidates.length === 0) return
 
-      const pickRandom = <T>(list: T[]) =>
-        list[Math.floor(Math.random() * list.length)]
+      const pickRandom = <T>(list: T[]) => list[randomInt(list.length)]
       let selected = candidates.length === 1 ? candidates[0] : null
 
       if (!selected && event.type === 'user') {

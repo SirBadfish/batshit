@@ -73,8 +73,7 @@ const dockerGatewayUnavailableResponse = (target: URL, reason: unknown): Respons
   return new Response(
     JSON.stringify({
       error: message,
-      code: 'DOCKER_MCP_GATEWAY_UNREACHABLE',
-      detail
+      code: 'DOCKER_MCP_GATEWAY_UNREACHABLE'
     }),
     {
       status: 503,

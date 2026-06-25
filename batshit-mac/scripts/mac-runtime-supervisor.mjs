@@ -1075,6 +1075,8 @@ async function fetchDockerMcpGatewayStatus(env) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 2000);
   try {
+    // The URL/token come from the local Mac app runtime config and target the local Docker MCP Gateway.
+    // codeql[js/file-access-to-http]
     const response = await fetch(dockerMcpGatewayUrl(env), {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       signal: controller.signal
@@ -1827,6 +1829,8 @@ async function spawnService(definition, env, options = {}) {
       spawnError ? normalizeError(spawnError) : 'no pid was assigned'
     }`;
     await supervisorLog('spawn', message);
+    // The log file is a Batshit-owned runtime log path, not a user-selected file target.
+    // codeql[js/file-system-race]
     await writeFile(definition.logFile, `[${new Date().toISOString()}] ${message}\n`, { flag: 'a' });
     return { skipped: false, ok: false, error: message, logFile: definition.logFile };
   }

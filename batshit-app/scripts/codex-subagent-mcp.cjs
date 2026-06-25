@@ -378,8 +378,8 @@ async function main() {
           }
         }))
       }
-    } catch (error) {
-      console.error('[subagent-mcp] listTools failed', error)
+    } catch {
+      console.error('[subagent-mcp] listTools failed')
       return { tools: [] }
     }
   })

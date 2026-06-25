@@ -58,11 +58,86 @@ function normalizeManagedPatchInput(value: string): string {
   return value.replace(/\r\n/g, '\n')
 }
 
+function isShellIdentifierStart(char: string): boolean {
+  return (
+    (char >= 'A' && char <= 'Z') ||
+    (char >= 'a' && char <= 'z') ||
+    char === '_'
+  )
+}
+
+function isShellIdentifierChar(char: string): boolean {
+  return isShellIdentifierStart(char) || (char >= '0' && char <= '9')
+}
+
+function skipShellWhitespace(value: string, start: number): number {
+  let index = start
+  while (index < value.length && /\s/.test(value[index] ?? '')) index += 1
+  return index
+}
+
+function readShellToken(value: string, start: number): { token: string; end: number } | null {
+  const index = skipShellWhitespace(value, start)
+  if (index >= value.length) return null
+
+  let end = index
+  let quote: string | null = null
+  while (end < value.length) {
+    const char = value[end] ?? ''
+    if (quote) {
+      if (char === quote) quote = null
+      end += 1
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      end += 1
+      continue
+    }
+    if (/\s/.test(char)) break
+    end += 1
+  }
+
+  return {
+    token: value.slice(index, end),
+    end
+  }
+}
+
+function isEnvironmentAssignmentToken(token: string): boolean {
+  const equalsIndex = token.indexOf('=')
+  if (equalsIndex <= 0) return false
+  const name = token.slice(0, equalsIndex)
+  if (!isShellIdentifierStart(name[0] ?? '')) return false
+  for (const char of name.slice(1)) {
+    if (!isShellIdentifierChar(char)) return false
+  }
+  return true
+}
+
+function stripLeadingEnvironmentAssignments(line: string): string {
+  let index = 0
+  while (index < line.length) {
+    const token = readShellToken(line, index)
+    if (!token) return ''
+    if (!isEnvironmentAssignmentToken(token.token)) {
+      return line.slice(skipShellWhitespace(line, index))
+    }
+    index = skipShellWhitespace(line, token.end)
+  }
+  return ''
+}
+
+function startsWithApplyPatchInvocation(line: string): boolean {
+  const command = stripLeadingEnvironmentAssignments(line)
+  if (!command.toLowerCase().startsWith('apply_patch')) return false
+  const next = command.at('apply_patch'.length)
+  return !next || !isShellIdentifierChar(next)
+}
+
 export function isManagedApplyPatchCommand(command: string): boolean {
   const normalized = normalizeManagedPatchInput(command)
-  return normalized.split('\n').some((line) =>
-    /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*apply_patch\b/i.test(line)
-  )
+  return normalized.split('\n').some((line) => startsWithApplyPatchInvocation(line))
 }
 
 export function extractManagedApplyPatchPayload(source: string): string | null {

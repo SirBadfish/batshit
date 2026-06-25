@@ -1,11 +1,11 @@
 import { tool } from 'ai'
 import { load as loadHtml } from 'cheerio'
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readdirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { mkdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises'
 import { env } from '$env/dynamic/private'
 import { z } from 'zod'
 import type { AgentDcmDisplaySettings, MCPToolSelections } from '$lib/types/database'
@@ -458,6 +458,18 @@ const DOCKER_AGENT_BROWSER_INSTALL_HELP =
 const DOCKER_AGENT_BROWSER_BASH_HELP =
   'Docker Agent Browser commands run through Batshit Agent Browser tools, not raw app-container Bash. Use agent_browser_find / agent_browser_use or Settings -> Admin -> Agent Browser Runtime.'
 
+async function readFileWithinLimit(filePath: string, maxBytes: number): Promise<Buffer | null> {
+  const handle = await open(filePath, 'r')
+  try {
+    const buffer = Buffer.alloc(maxBytes + 1)
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes + 1, 0)
+    if (bytesRead <= 0 || bytesRead > maxBytes) return null
+    return buffer.subarray(0, bytesRead)
+  } finally {
+    await handle.close()
+  }
+}
+
 function isBatshitContainerizedRuntime() {
   return (
     env.BATSHIT_CONTAINERIZED === '1' ||
@@ -900,10 +912,6 @@ const AGENT_BROWSER_BASH_AUTO_ALLOW_PATTERNS = [
   're:^\\s*agent-browser\\b',
   're:^\\s*npx\\s+(?:-y\\s+)?agent-browser\\b'
 ]
-const AGENT_BROWSER_BASH_PREFIX_REGEX =
-  /^\s*((?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*)((?:npx(?:\s+-y)?\s+agent-browser|agent-browser))(\s[\s\S]*)?$/i
-const AGENT_BROWSER_BASH_DETECT_REGEX =
-  /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*(?:npx(?:\s+-y)?\s+agent-browser|agent-browser)\b/i
 const AGENT_BROWSER_BASH_CHAIN_OPERATOR_REGEX = /\s(?:&&|\|\||;)\s/
 const AGENT_BROWSER_BASH_FLAGS_WITH_VALUE = new Set([
   '--cdp',
@@ -913,6 +921,12 @@ const AGENT_BROWSER_BASH_FLAGS_WITH_VALUE = new Set([
   '--session',
   '--profile'
 ])
+
+type AgentBrowserBashCommandParts = {
+  assignmentPrefix: string
+  launcher: string
+  rest: string
+}
 
 const BASH_ACCESS_MODE_ALIASES: Record<string, NativeBashAccessMode> = {
   plan: 'plan',
@@ -1297,8 +1311,104 @@ function isNativeBashCommandRunFailure(result: Record<string, any>): boolean {
   )
 }
 
+function isShellIdentifierStart(char: string): boolean {
+  return (
+    (char >= 'A' && char <= 'Z') ||
+    (char >= 'a' && char <= 'z') ||
+    char === '_'
+  )
+}
+
+function isShellIdentifierChar(char: string): boolean {
+  return isShellIdentifierStart(char) || (char >= '0' && char <= '9')
+}
+
+function skipShellWhitespace(value: string, start: number): number {
+  let index = start
+  while (index < value.length && /\s/.test(value[index] ?? '')) index += 1
+  return index
+}
+
+function readShellTokenSpan(
+  value: string,
+  start: number
+): { token: string; start: number; end: number } | null {
+  const tokenStart = skipShellWhitespace(value, start)
+  if (tokenStart >= value.length) return null
+
+  let index = tokenStart
+  let quote: string | null = null
+  while (index < value.length) {
+    const char = value[index] ?? ''
+    if (quote) {
+      if (char === quote) quote = null
+      index += 1
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      index += 1
+      continue
+    }
+    if (/\s/.test(char)) break
+    index += 1
+  }
+
+  return {
+    token: unquoteShellToken(value.slice(tokenStart, index)),
+    start: tokenStart,
+    end: index
+  }
+}
+
+function isEnvironmentAssignmentToken(token: string): boolean {
+  const equalsIndex = token.indexOf('=')
+  if (equalsIndex <= 0) return false
+  const name = token.slice(0, equalsIndex)
+  if (!isShellIdentifierStart(name[0] ?? '')) return false
+  for (const char of name.slice(1)) {
+    if (!isShellIdentifierChar(char)) return false
+  }
+  return true
+}
+
+function parseAgentBrowserBashCommand(command: string): AgentBrowserBashCommandParts | null {
+  let index = 0
+  let assignmentEnd = 0
+
+  while (index < command.length) {
+    const token = readShellTokenSpan(command, index)
+    if (!token) return null
+    if (!isEnvironmentAssignmentToken(token.token)) break
+    assignmentEnd = token.end
+    index = token.end
+  }
+
+  const launcherStartToken = readShellTokenSpan(command, index)
+  if (!launcherStartToken) return null
+
+  let launcherEnd = launcherStartToken.end
+  if (launcherStartToken.token.toLowerCase() === 'npx') {
+    let nextToken = readShellTokenSpan(command, launcherEnd)
+    if (nextToken?.token === '-y') {
+      launcherEnd = nextToken.end
+      nextToken = readShellTokenSpan(command, launcherEnd)
+    }
+    if (nextToken?.token.toLowerCase() !== 'agent-browser') return null
+    launcherEnd = nextToken.end
+  } else if (launcherStartToken.token.toLowerCase() !== 'agent-browser') {
+    return null
+  }
+
+  return {
+    assignmentPrefix: command.slice(0, assignmentEnd).trim(),
+    launcher: command.slice(launcherStartToken.start, launcherEnd).trim(),
+    rest: command.slice(launcherEnd).trim()
+  }
+}
+
 function isLikelyAgentBrowserBashCommand(command: string): boolean {
-  return AGENT_BROWSER_BASH_DETECT_REGEX.test(command)
+  return parseAgentBrowserBashCommand(command) !== null
 }
 
 function hasAgentBrowserFlag(command: string, flagPattern: RegExp): boolean {
@@ -1392,8 +1502,8 @@ function parseAgentBrowserBashScreenshotCommand(command: string): {
   screenshotPathToken: string | null
   tokens: string[]
 } {
-  const match = command.match(AGENT_BROWSER_BASH_PREFIX_REGEX)
-  if (!match) {
+  const parsedCommand = parseAgentBrowserBashCommand(command)
+  if (!parsedCommand) {
     return {
       isScreenshot: false,
       hasExplicitPath: false,
@@ -1402,7 +1512,7 @@ function parseAgentBrowserBashScreenshotCommand(command: string): {
     }
   }
 
-  const rest = (match[3] ?? '').trim()
+  const rest = parsedCommand.rest
   if (!rest) {
     return {
       isScreenshot: false,
@@ -1479,17 +1589,15 @@ async function injectAgentBrowserBashScreenshotPath(command: string): Promise<{
   command: string
   injectedPath: string | null
 }> {
-  const match = command.match(AGENT_BROWSER_BASH_PREFIX_REGEX)
-  if (!match) {
+  const parsedCommand = parseAgentBrowserBashCommand(command)
+  if (!parsedCommand) {
     return {
       command,
       injectedPath: null
     }
   }
 
-  const assignmentPrefix = (match[1] ?? '').trim()
-  const launcher = (match[2] ?? '').trim()
-  const rest = (match[3] ?? '').trim()
+  const { assignmentPrefix, launcher, rest } = parsedCommand
   if (!rest) {
     return {
       command,
@@ -1597,12 +1705,11 @@ async function buildAgentBrowserBashScreenshotModelOutput(
   if (!payload.screenshotPath) return null
 
   try {
-    const details = await stat(payload.screenshotPath)
-    if (!details.isFile() || details.size <= 0 || details.size > MAX_AGENT_BROWSER_SCREENSHOT_BYTES) {
-      return null
-    }
-
-    const bytes = await readFile(payload.screenshotPath)
+    const bytes = await readFileWithinLimit(
+      payload.screenshotPath,
+      MAX_AGENT_BROWSER_SCREENSHOT_BYTES
+    )
+    if (!bytes) return null
     return {
       type: 'content',
       value: [
@@ -1642,8 +1749,8 @@ function applyAgentBrowserBashDefaults(
   appliedDefaults: string[]
   matched: boolean
 } {
-  const match = command.match(AGENT_BROWSER_BASH_PREFIX_REGEX)
-  if (!match) {
+  const parsedCommand = parseAgentBrowserBashCommand(command)
+  if (!parsedCommand) {
     return {
       command,
       provider: settings.provider,
@@ -1653,9 +1760,7 @@ function applyAgentBrowserBashDefaults(
     }
   }
 
-  const assignmentPrefix = (match[1] ?? '').trim()
-  const launcher = (match[2] ?? '').trim()
-  const rest = (match[3] ?? '').trim()
+  const { assignmentPrefix, launcher, rest } = parsedCommand
   const restLower = rest.toLowerCase()
   const appliedDefaults: string[] = []
   const injectedTokens: string[] = []
@@ -2239,10 +2344,8 @@ async function captureMappedTextFileSnapshot(options: {
   if (!isPathWithinRoot(realTargetPath, resolvedRoot)) return null
 
   try {
-    const details = await stat(absolutePath)
-    if (!details.isFile() || details.size > MAX_BASH_EDIT_SNAPSHOT_BYTES) return null
-
-    const bytes = await readFile(absolutePath)
+    const bytes = await readFileWithinLimit(absolutePath, MAX_BASH_EDIT_SNAPSHOT_BYTES)
+    if (!bytes) return null
     if (bytes.includes(0)) return null
 
     return bytes.toString('utf8')
@@ -3614,7 +3717,7 @@ async function cleanupDockerSandboxesForSessionViaOperator(sessionId: string): P
 }
 
 function buildDockerSandboxSessionHash(sessionId: string) {
-  return createHash('sha1').update(sessionId).digest('hex').slice(0, 8)
+  return createHash('sha256').update(sessionId).digest('hex').slice(0, 8)
 }
 
 function buildDockerSandboxSessionMarker(sessionId: string) {
@@ -3630,7 +3733,7 @@ function buildDockerSandboxName(options: {
     typeof options.userId === 'string' && options.userId.trim().length > 0
       ? options.userId.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 20)
       : 'user'
-  const workspaceHash = createHash('sha1').update(options.workspaceRoot).digest('hex').slice(0, 10)
+  const workspaceHash = createHash('sha256').update(options.workspaceRoot).digest('hex').slice(0, 10)
   const sessionSegment =
     typeof options.sessionId === 'string' && options.sessionId.trim().length > 0
       ? `s${buildDockerSandboxSessionHash(options.sessionId.trim())}-`
@@ -4774,10 +4877,10 @@ function extractAgentBrowserBashErrorMessage(run: { stdout: string; stderr: stri
 }
 
 function resolveAgentBrowserBashSubcommand(command: string): string {
-  const match = command.match(AGENT_BROWSER_BASH_PREFIX_REGEX)
-  if (!match) return ''
+  const parsedCommand = parseAgentBrowserBashCommand(command)
+  if (!parsedCommand) return ''
 
-  const rest = (match[3] ?? '').trim()
+  const rest = parsedCommand.rest
   if (!rest) return ''
 
   const { primary } = splitAgentBrowserCommandAtChain(rest)
@@ -4794,11 +4897,10 @@ function resolveAgentBrowserBashSubcommand(command: string): string {
 }
 
 function buildAgentBrowserBashBootstrapCommand(command: string, cliArgs: string[]): string | null {
-  const match = command.match(AGENT_BROWSER_BASH_PREFIX_REGEX)
-  if (!match) return null
+  const parsedCommand = parseAgentBrowserBashCommand(command)
+  if (!parsedCommand) return null
 
-  const assignmentPrefix = (match[1] ?? '').trim()
-  const launcher = (match[2] ?? '').trim()
+  const { assignmentPrefix, launcher } = parsedCommand
   if (!launcher) return null
 
   const rebuiltParts: string[] = []
@@ -4810,11 +4912,10 @@ function buildAgentBrowserBashBootstrapCommand(command: string, cliArgs: string[
 }
 
 function replaceAgentBrowserBashLauncher(command: string, launcher: string): string {
-  const match = command.match(AGENT_BROWSER_BASH_PREFIX_REGEX)
-  if (!match) return command
+  const parsedCommand = parseAgentBrowserBashCommand(command)
+  if (!parsedCommand) return command
 
-  const assignmentPrefix = (match[1] ?? '').trim()
-  const rest = (match[3] ?? '').trim()
+  const { assignmentPrefix, rest } = parsedCommand
 
   const rebuiltParts: string[] = []
   if (assignmentPrefix.length > 0) rebuiltParts.push(assignmentPrefix)
@@ -5471,7 +5572,7 @@ async function buildDefaultAgentBrowserScreenshotPath(requestedPath?: string): P
       ? sanitizeScreenshotFilename(requestedPath.trim())
       : ''
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const random = Math.random().toString(36).slice(2, 8)
+  const random = randomUUID().replace(/-/g, '').slice(0, 8)
   const generatedName = `${AGENT_BROWSER_TMP_FILE_PREFIX}${timestamp}-${random}.png`
   const fileName = safeRequestedName || generatedName
   const finalName = path.extname(fileName) ? fileName : `${fileName}.png`
@@ -5516,22 +5617,15 @@ async function uploadAgentBrowserScreenshotForModel(options: {
   let fileBytes: Buffer
   let fileName: string
   try {
-    const fileStats = await stat(filePath)
-    if (!fileStats.isFile()) return null
-    if (fileStats.size > MAX_AGENT_BROWSER_SCREENSHOT_BYTES) {
-      console.warn('[Native Agent Browser] Screenshot too large for model upload', {
-        path: filePath,
-        size: fileStats.size
-      })
+    const bytes = await readFileWithinLimit(filePath, MAX_AGENT_BROWSER_SCREENSHOT_BYTES)
+    if (!bytes) {
+      console.warn('[Native Agent Browser] Screenshot unavailable for model upload')
       return null
     }
-    fileBytes = await readFile(filePath)
+    fileBytes = bytes
     fileName = path.basename(filePath)
-  } catch (error) {
-    console.warn('[Native Agent Browser] Unable to read screenshot for upload:', {
-      path: filePath,
-      error: error instanceof Error ? error.message : String(error)
-    })
+  } catch {
+    console.warn('[Native Agent Browser] Unable to read screenshot for upload')
     return null
   }
 

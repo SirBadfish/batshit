@@ -54,6 +54,7 @@ const TOKENS = Array.from(
 )
 const MAX_OUTPUT_CHARS = 120_000
 const RUN_TIMEOUT_MS = Number(process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_TIMEOUT_MS || 180_000)
+const MAX_RUN_TIMEOUT_MS = 300_000
 const SANDBOX_NETWORK_POLICY = 'deny'
 const SANDBOX_NAME_PREFIX = 'batshit-'
 const SANDBOX_CONTAINER_WORKSPACE_ROOT =
@@ -141,6 +142,12 @@ function appendOutput(current, chunk) {
   return next.length > MAX_OUTPUT_CHARS ? next.slice(0, MAX_OUTPUT_CHARS) : next
 }
 
+function clampRunTimeoutMs(value, fallback = RUN_TIMEOUT_MS) {
+  const parsed = Number(value)
+  const candidate = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+  return Math.min(MAX_RUN_TIMEOUT_MS, Math.max(1_000, Math.floor(candidate)))
+}
+
 function isAuthorized(req) {
   const auth = req.headers.authorization || ''
   const headerToken = req.headers['x-batshit-runtime-addon-operator-token']
@@ -187,7 +194,7 @@ function runDocker(args) {
       timedOut = true
       child.kill('SIGTERM')
       setTimeout(() => child.kill('SIGKILL'), 1_000).unref()
-    }, Math.max(1_000, RUN_TIMEOUT_MS))
+    }, clampRunTimeoutMs(RUN_TIMEOUT_MS))
 
     child.stdout.on('data', (chunk) => {
       stdout = appendOutput(stdout, chunk)
@@ -243,7 +250,7 @@ function runCommand(command, args, options = {}) {
       timedOut = true
       child.kill('SIGTERM')
       setTimeout(() => child.kill('SIGKILL'), 1_000).unref()
-    }, Math.max(1_000, options.timeoutMs || RUN_TIMEOUT_MS))
+    }, clampRunTimeoutMs(options.timeoutMs))
 
     child.stdout.on('data', (chunk) => {
       stdout = appendOutput(stdout, chunk)
@@ -635,7 +642,7 @@ function isManagedSandboxName(name) {
 }
 
 function sessionHash(sessionId) {
-  return createHash('sha1').update(String(sessionId || '')).digest('hex').slice(0, 8)
+  return createHash('sha256').update(String(sessionId || '')).digest('hex').slice(0, 8)
 }
 
 function sandboxSessionMarker(sessionId) {
@@ -648,7 +655,7 @@ function buildSandboxName({ userId, workspaceRoot, sessionId }) {
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, '-')
     .slice(0, 20)
-  const workspaceHash = createHash('sha1').update(workspaceRoot).digest('hex').slice(0, 10)
+  const workspaceHash = createHash('sha256').update(workspaceRoot).digest('hex').slice(0, 10)
   const sessionSegment = sessionId ? `s${sessionHash(sessionId)}-` : ''
   return `${SANDBOX_NAME_PREFIX}${userPrefix || 'user'}-${sessionSegment}${workspaceHash}`
 }
@@ -940,9 +947,7 @@ async function handleSandboxExecute(req, res) {
       envArgs,
       commandText
     })
-    const run = await runCommand(execSpec.command, execSpec.args, {
-      timeoutMs: Number(body.timeoutMs || RUN_TIMEOUT_MS)
-    })
+    const run = await runCommand(execSpec.command, execSpec.args)
     const warnings = []
     if (!body.sessionId) {
       const warning = await removeSandbox(ensured.cli, ensured.sandboxName)

@@ -405,6 +405,8 @@ async function installLiveKitServerBinary(): Promise<void> {
 
   try {
     const archivePath = path.join(stagingRoot, `livekit-${LIVEKIT_NATIVE_RUNTIME_VERSION}.bottle.tar.gz`)
+    // The LiveKit bottle bytes are verified against Homebrew's SHA-256 before this staging write.
+    // codeql[js/http-to-file-access]
     await writeFile(archivePath, data)
     await extractTarGz(archivePath, stagingRoot)
     await rm(archivePath, { force: true })
@@ -443,6 +445,8 @@ async function installLiveKitServerBinary(): Promise<void> {
       checksumVerified: true,
       binaryPath: finalBinaryPath
     }
+    // The manifest records the verified install metadata inside the private staging directory.
+    // codeql[js/http-to-file-access]
     await writeFile(
       manifestPath(stagingRoot, 'batshit-livekit-server-manifest.json'),
       `${JSON.stringify(manifest, null, 2)}\n`,

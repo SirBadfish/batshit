@@ -1930,20 +1930,18 @@ export class VercelAIBrain {
   }
 
   private isGeminiFileUri(url: URL): boolean {
-    return (
-      url.hostname.includes('generativelanguage.googleapis.com') &&
-      url.pathname.includes('/files/')
-    )
+    const hostname = url.hostname.toLowerCase()
+    const pathSegments = url.pathname.split('/').filter(Boolean)
+    return hostname === 'generativelanguage.googleapis.com' && pathSegments.includes('files')
   }
 
   private hashBytes(data: Uint8Array): string {
     return createHash('sha256').update(data).digest('hex')
   }
 
-  private buildGeminiFileCacheKey(apiKey: string, source: string): string {
-    const apiKeyHash = createHash('sha256').update(apiKey).digest('hex').slice(0, 12)
+  private buildGeminiFileCacheKey(source: string): string {
     const sourceHash = createHash('sha256').update(source).digest('hex')
-    return `${GEMINI_FILE_CACHE_PREFIX}:v1:${apiKeyHash}:${sourceHash}`
+    return `${GEMINI_FILE_CACHE_PREFIX}:v2:${sourceHash}`
   }
 
   private async readGeminiFileCache(cacheKey: string): Promise<GeminiFileCacheEntry | null> {
@@ -2118,7 +2116,7 @@ export class VercelAIBrain {
             continue
           }
 
-          cacheKey = this.buildGeminiFileCacheKey(apiKey, `url:${url.toString()}`)
+          cacheKey = this.buildGeminiFileCacheKey(`url:${url.toString()}`)
           cacheHit = await this.readGeminiFileCache(cacheKey)
 
           if (cacheHit?.fileUri) {
@@ -2175,7 +2173,7 @@ export class VercelAIBrain {
 
         if (!cacheKey) {
           const dataHash = this.hashBytes(data)
-          cacheKey = this.buildGeminiFileCacheKey(apiKey, `data:${dataHash}:${mimeType}`)
+          cacheKey = this.buildGeminiFileCacheKey(`data:${dataHash}:${mimeType}`)
           cacheHit = await this.readGeminiFileCache(cacheKey)
         }
 

@@ -49,7 +49,9 @@ router.post('/s', async (req, res) => {
   try {
     const { serviceName, toolName, input, params = {} } = req.body;
 
-    logger.info(`Task request received - Service: ${serviceName}, Tool: ${toolName}`);
+    logger.info(
+      `Task request received - serviceProvided=${Boolean(serviceName)}, toolProvided=${Boolean(toolName)}`
+    );
 
     if (serviceName !== 'built-in') {
       return res.status(400).json({

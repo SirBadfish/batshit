@@ -196,9 +196,10 @@ function sendJson(res, status, payload) {
 }
 
 function sendError(res, status, error) {
+  console.error('[fbx2vrma-worker] request failed:', error instanceof Error ? error.message : 'Unknown error')
   sendJson(res, status, {
     ok: false,
-    error: error instanceof Error ? error.message : String(error)
+    error: status >= 500 ? 'FBX-to-VRMA worker request failed.' : 'Invalid FBX-to-VRMA worker request.'
   })
 }
 

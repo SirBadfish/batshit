@@ -1137,7 +1137,7 @@ function buildOverrideLines(overrides: CodexConfigOverride[]) {
 }
 
 function formatProjectHeader(pathValue: string) {
-  const escaped = pathValue.replace(/"/g, '\\"')
+  const escaped = pathValue.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
   return `[projects."${escaped}"]`
 }
 

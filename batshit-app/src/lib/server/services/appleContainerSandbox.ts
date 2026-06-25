@@ -177,11 +177,11 @@ function commandFailedReason(run: AppleContainerCommandRun, fallback: string) {
 }
 
 function sessionHash(sessionId: string) {
-  return createHash('sha1').update(sessionId).digest('hex').slice(0, 8)
+  return createHash('sha256').update(sessionId).digest('hex').slice(0, 8)
 }
 
 function workspaceHash(workspaceRoot: string) {
-  return createHash('sha1').update(workspaceRoot).digest('hex').slice(0, 10)
+  return createHash('sha256').update(workspaceRoot).digest('hex').slice(0, 10)
 }
 
 // ~/.batshit holds managed engine installs, tools, and runtime state. Mounting it

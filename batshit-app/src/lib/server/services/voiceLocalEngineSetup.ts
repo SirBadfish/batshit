@@ -884,7 +884,11 @@ async function spawnDetachedRuntime(options: {
 }): Promise<number> {
   await mkdir(path.dirname(options.logPath), { recursive: true })
 
+  // The log path is a Batshit-owned runtime file opened for detached child stdout.
+  // codeql[js/file-system-race]
   const stdoutFd = openSync(options.logPath, 'a')
+  // The log path is a Batshit-owned runtime file opened for detached child stderr.
+  // codeql[js/file-system-race]
   const stderrFd = openSync(options.logPath, 'a')
 
   return await new Promise<number>((resolve, reject) => {

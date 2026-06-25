@@ -297,6 +297,8 @@ if (!source.includes(quitLifecycleMarker)) {
 }
 
 if (source !== original) {
+  // Packaging patch target is a pinned vendored Zero Native source path resolved earlier in this script.
+  // codeql[js/file-system-race]
   fs.writeFileSync(appkitHostPath, source)
   console.log('[patch-zero-native] Applied macOS WKWebView file input/media capture/media playback/quit lifecycle patches.')
 } else {
@@ -323,6 +325,8 @@ int zero_native_appkit_close_webview(zero_native_appkit_host_t *host, uint64_t w
 }
 
 if (headerSource !== originalHeaderSource) {
+  // Packaging patch target is a pinned vendored Zero Native header path resolved earlier in this script.
+  // codeql[js/file-system-race]
   fs.writeFileSync(appkitHostHeaderPath, headerSource)
   console.log('[patch-zero-native] Applied macOS AppKit webview C-linkage header patch.')
 } else {
@@ -373,6 +377,8 @@ if (!cefSource.includes(cefMathMarker)) {
 }
 
 if (cefSource !== originalCefSource) {
+  // Packaging patch target is a pinned vendored Zero Native CEF source path resolved earlier in this script.
+  // codeql[js/file-system-race]
   fs.writeFileSync(cefHostPath, cefSource)
   console.log('[patch-zero-native] Applied macOS CEF ObjC++ math macro compatibility patch.')
 } else {

@@ -3,7 +3,21 @@ const redisService = require('../redisService');
 const logger = require('../../utils/logger');
 
 function stripTrailingSlash(value) {
-  return value.replace(/\/+$/, '');
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') end -= 1;
+  return value.slice(0, end);
+}
+
+function removeHttpScheme(value) {
+  const lower = value.toLowerCase();
+  if (lower.startsWith('https://')) return value.slice('https://'.length);
+  if (lower.startsWith('http://')) return value.slice('http://'.length);
+  return value;
+}
+
+function takeBeforeSlash(value) {
+  const slashIndex = value.indexOf('/');
+  return slashIndex >= 0 ? value.slice(0, slashIndex) : value;
 }
 
 function normalizeHost(value) {
@@ -15,7 +29,7 @@ function normalizeHost(value) {
     const parsed = new URL(trimmed.includes('://') ? trimmed : `http://${trimmed}`);
     return parsed.host;
   } catch {
-    return trimmed.replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
+    return takeBeforeSlash(removeHttpScheme(trimmed));
   }
 }
 
@@ -101,7 +115,7 @@ class LocalStorageStrategy extends BaseUploadStrategy {
 
       // Store with TTL when requested (Agent Browser screenshot artifacts), else persist.
       await redisService.setWithTTL(redisKey, fileData, ttlSeconds);
-      logger.debug(`[LocalStrategy] Stored file in Redis: ${redisKey}`);
+      logger.debug('[LocalStrategy] Stored file in Redis');
 
       // Generate URLs
       const localOrigin = resolveLocalServerOrigin(this.config);

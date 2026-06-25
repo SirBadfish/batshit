@@ -1,5 +1,6 @@
 // Redis-based file upload handler
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const sharp = require('sharp');
 const path = require('path');
@@ -49,6 +50,14 @@ const upload = multer({
   limits: {
     fileSize: 10 * 1024 * 1024 // 10MB limit
   }
+});
+
+const avatarUploadRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many avatar uploads. Please wait and try again.' }
 });
 
 const goonDiskUploadTempDir = path.join(config.uploadsDir, '_tmp');
@@ -302,7 +311,9 @@ async function detectUploadSignatureFromFile(file) {
   if (file?.buffer) return detectUploadSignature(file.buffer);
   if (!file?.path) return 'unknown';
 
-  const handle = await fs.open(file.path, 'r');
+  const safePath = resolveMulterDiskUploadPath(file);
+  if (!safePath) return 'unknown';
+  const handle = await fs.open(safePath, 'r');
   try {
     const buffer = Buffer.alloc(16);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
@@ -310,6 +321,30 @@ async function detectUploadSignatureFromFile(file) {
   } finally {
     await handle.close();
   }
+}
+
+function resolveMulterDiskUploadPath(file) {
+  if (!file?.filename || typeof file.filename !== 'string') return null;
+  const filename = file.filename;
+  for (const char of filename) {
+    const safe =
+      (char >= 'A' && char <= 'Z') ||
+      (char >= 'a' && char <= 'z') ||
+      (char >= '0' && char <= '9') ||
+      char === '_' ||
+      char === '-' ||
+      char === '.';
+    if (!safe) {
+      throw new Error('Upload temp filename contains unsafe characters.');
+    }
+  }
+
+  const tempRoot = path.resolve(goonDiskUploadTempDir);
+  const resolvedPath = path.resolve(tempRoot, filename);
+  if (!resolvedPath.startsWith(`${tempRoot}${path.sep}`)) {
+    throw new Error('Upload temp filename escaped the configured upload temp directory.');
+  }
+  return resolvedPath;
 }
 
 async function validateGoonBinaryUpload(file, { expectedExt, expectedSignature, label }) {
@@ -432,6 +467,8 @@ async function transcodeGoonAnimationPreviewToMp4(file) {
       : ['-c:v', videoEncoder, '-preset', 'veryfast', '-crf', '30'];
 
   try {
+    // Uploaded preview media is written only to a random server-owned temp path for ffmpeg conversion.
+    // codeql[js/http-to-file-access]
     await fs.writeFile(inputPath, file.buffer);
 
     await execFileAsync(ffmpegPath, [
@@ -476,17 +513,25 @@ function normalizeTunnelConfig(rawTunnelUrl, explicitHttps) {
         useHttps: parsed.protocol === 'https:'
       };
     } catch (error) {
-      logger.warn(`[Upload] Failed to parse tunnel URL "${trimmed}": ${error.message}`);
+      logger.warn('[Upload] Failed to parse configured tunnel URL');
       return null;
     }
   }
 
-  const normalizedHost = trimmed.replace(/^\/+|\/+$/g, '');
+  const normalizedHost = trimSlashes(trimmed);
   if (!normalizedHost) return null;
   return {
     host: normalizedHost,
     useHttps: explicitHttps === true
   };
+}
+
+function trimSlashes(value) {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === '/') start += 1;
+  while (end > start && value[end - 1] === '/') end -= 1;
+  return value.slice(start, end);
 }
 
 function normalizeLocalUploadSettings(uploadSettings = {}) {
@@ -508,11 +553,48 @@ function requireUploadUserId(req, res) {
   return userId;
 }
 
+function readFirstStringField(...values) {
+  for (const value of values) {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      const nested = readFirstStringField(...value);
+      if (nested) return nested;
+    }
+  }
+  return '';
+}
+
+function isSafeFilenameChar(char) {
+  return (
+    (char >= 'A' && char <= 'Z') ||
+    (char >= 'a' && char <= 'z') ||
+    (char >= '0' && char <= '9') ||
+    char === '_' ||
+    char === '-'
+  );
+}
+
 function sanitizeFilenameSegment(value, fallback = 'file') {
-  const sanitized = String(value || '')
-    .replace(/[^a-zA-Z0-9_-]+/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_+|_+$/g, '');
+  let sanitized = '';
+  let previousWasSeparator = false;
+  for (const char of String(value || '')) {
+    if (isSafeFilenameChar(char)) {
+      sanitized += char;
+      previousWasSeparator = char === '_';
+      continue;
+    }
+    if (!previousWasSeparator) {
+      sanitized += '_';
+      previousWasSeparator = true;
+    }
+  }
+
+  while (sanitized.startsWith('_')) sanitized = sanitized.slice(1);
+  while (sanitized.endsWith('_')) sanitized = sanitized.slice(0, -1);
 
   return sanitized || fallback;
 }
@@ -600,14 +682,16 @@ async function moveFileAcrossDevices(sourcePath, targetPath) {
 }
 
 async function cleanupTempUploadFile(file) {
-  if (file?.path) {
-    await fs.rm(file.path, { force: true }).catch(() => {});
+  const safePath = resolveMulterDiskUploadPath(file);
+  if (safePath) {
+    await fs.rm(safePath, { force: true }).catch(() => {});
   }
 }
 
 async function readUploadedFileBuffer(file) {
   if (file?.buffer) return file.buffer;
-  if (file?.path) return fs.readFile(file.path);
+  const safePath = resolveMulterDiskUploadPath(file);
+  if (safePath) return fs.readFile(safePath);
   return Buffer.alloc(0);
 }
 
@@ -666,21 +750,22 @@ async function storeFilesystemUploadAsset(
     originalName,
     filename,
     mimetype,
-    sourcePath,
+    sourceFile,
     buffer,
     size
   }
 ) {
   const uploadedAt = new Date().toISOString();
+  const safeSourcePath = sourceFile ? resolveMulterDiskUploadPath(sourceFile) : null;
   const resolvedSize =
     typeof size === 'number'
       ? size
-      : buffer?.length || (sourcePath ? (await fs.stat(sourcePath)).size : 0);
+      : buffer?.length || (safeSourcePath ? (await fs.stat(safeSourcePath)).size : 0);
   const filePath = resolveStoredUploadPath(uploadType, filename);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 
-  if (sourcePath) {
-    await moveFileAcrossDevices(sourcePath, filePath);
+  if (safeSourcePath) {
+    await moveFileAcrossDevices(safeSourcePath, filePath);
   } else {
     await fs.writeFile(filePath, buffer || Buffer.alloc(0));
   }
@@ -981,14 +1066,13 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
     try {
       const metadata = await sharp(file.buffer).metadata();
       
-      // Log original image info (using info level so it always shows)
-      logger.info(`[Image Upload] Original: ${originalName}, ${metadata.width}x${metadata.height}, ${file.size} bytes, format: ${metadata.format}`);
+      logger.info('[Image Upload] Original image metadata loaded');
       
       // Check if compression is enabled (default true)
       const compressionEnabled = compressionSettings.compress_images !== false;
       
       if (!compressionEnabled) {
-        logger.info(`[Image Upload] Compression disabled by user settings`);
+        logger.info('[Image Upload] Compression disabled by user settings');
         base64Content = file.buffer.toString('base64');
         processedForAI = `data:${file.mimetype};base64,${base64Content}`;
       } else {
@@ -1005,7 +1089,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
         const forceJpeg = compressionSettings.force_jpeg !== false;
         
         if (needsResize || needsCompression || isPNG) {
-        logger.info(`[Image Upload] Processing needed - Resize: ${needsResize}, Compress: ${needsCompression}, PNG→JPEG: ${isPNG}`);
+        logger.info('[Image Upload] Processing image');
         
         // Build the sharp pipeline
         let pipeline = sharp(file.buffer);
@@ -1025,17 +1109,17 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
         if (forceJpeg || (!isPNG && !hasTransparency)) {
           // Force JPEG conversion or already JPEG/non-transparent
           if (isPNG) {
-            logger.info(`[Image Upload] Converting PNG to JPEG (force_jpeg: ${forceJpeg})`);
+            logger.info('[Image Upload] Converting PNG to JPEG');
           }
-          logger.info(`[Image Upload] Using JPEG quality: ${quality}%`);
+          logger.info('[Image Upload] Using JPEG output');
           
           pipeline = pipeline
             .flatten({ background: { r: 255, g: 255, b: 255 } }) // White background for transparency
             .jpeg({ quality });
         } else if (isPNG) {
           // User disabled force_jpeg and it's a PNG - keep as PNG but optimize
-          logger.info(`[Image Upload] Keeping as PNG (force_jpeg disabled)`);
-          logger.info(`[Image Upload] Using PNG compression level 9 (max)`);
+          logger.info('[Image Upload] Keeping as PNG');
+          logger.info('[Image Upload] Using PNG compression level 9');
           
           pipeline = pipeline
             .png({ 
@@ -1045,7 +1129,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
             });
         } else {
           // Other formats - convert to JPEG
-          logger.info(`[Image Upload] Using JPEG quality: ${quality}%`);
+          logger.info('[Image Upload] Using JPEG output');
           
           pipeline = pipeline
             .flatten({ background: { r: 255, g: 255, b: 255 } })
@@ -1054,17 +1138,9 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
         
         processedBuffer = await pipeline.toBuffer();
         
-        // Calculate token savings
-        const originalTokens = Math.ceil((file.size * 4) / 3 / 4); // Base64 increases size by ~33%, then divide by 4 for tokens
-        const processedTokens = Math.ceil((processedBuffer.length * 4) / 3 / 4);
-        const tokensSaved = originalTokens - processedTokens;
-        const compressionRatio = ((file.size - processedBuffer.length) / file.size * 100).toFixed(1);
-        
-        logger.info(`[Image Upload] Processed: ${processedBuffer.length} bytes (from ${file.size} bytes)`);
-        logger.info(`[Image Upload] Compression: ${compressionRatio}% size reduction`);
-        logger.info(`[Image Upload] Token savings: ~${tokensSaved} tokens (${processedTokens} vs ${originalTokens})`);
+        logger.info('[Image Upload] Image processing complete');
         } else {
-          logger.info(`[Image Upload] No processing needed - image already optimized`);
+          logger.info('[Image Upload] No processing needed - image already optimized');
         }
         
         base64Content = processedBuffer.toString('base64');
@@ -1151,7 +1227,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
     // User has configured a tunnel URL - use it!
     hostConfig = tunnelConfig.host;
     httpsConfig = tunnelConfig.useHttps !== undefined ? tunnelConfig.useHttps : true; // Default true for tunnels
-    logger.info(`[Upload] Using tunnel URL: ${hostConfig} (HTTPS: ${httpsConfig})`);
+    logger.info('[Upload] Using configured tunnel URL');
   } else {
     // No tunnel - use auto-detected host or fallback to localhost
     hostConfig = uploadSettings.host || 'localhost:5600';
@@ -1174,7 +1250,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
     metadata
   );
 
-  logger.debug(`File stored locally through ${uploadResult.strategy}: ${uploadResult.url}`);
+	  logger.debug('[Upload] File stored locally');
   const fallbackUsed = Boolean(uploadResult.fallback);
   const fallbackReason = uploadResult.fallbackReason || null;
   const fallbackFrom = uploadResult.originalStrategy || null;
@@ -1220,25 +1296,31 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
 // Multi-file upload endpoint
 router.post('/upload', upload.array('files', 10), async (req, res) => {
   const uploadStartTime = Date.now();
-  logger.debug(`[TIMING] Multi-file upload started at ${uploadStartTime}`);
+  logger.debug('[TIMING] Multi-file upload started');
   
   try {
-    if (!req.files || req.files.length === 0) {
+    const uploadedFiles = Array.isArray(req.files) ? req.files : [];
+    if (uploadedFiles.length === 0) {
       return res.status(400).json({ error: 'No files uploaded' });
     }
 
-    logger.debug(`Multiple files uploaded: ${req.files.length} files`);
+	    logger.debug('[Upload] Multiple files received');
     
     // Extract session ID from request (could be in body, query, or headers)
-    const sessionId = req.body.sessionId || req.query.sessionId || req.headers['x-session-id'];
-    logger.debug(`Upload session ID: ${sessionId}`);
+    const sessionId = readFirstStringField(
+      req.body.sessionId,
+      req.query.sessionId,
+      req.headers['x-session-id']
+    );
+    logger.debug('[Upload] Session ID presence checked');
     
     // Extract compression settings
     let compressionSettings = {};
     try {
-      if (req.body.compressionSettings) {
-        compressionSettings = JSON.parse(req.body.compressionSettings);
-        logger.info(`[Image Upload] User compression settings: ${JSON.stringify(compressionSettings)}`);
+      const rawCompressionSettings = readFirstStringField(req.body.compressionSettings);
+      if (rawCompressionSettings) {
+        compressionSettings = JSON.parse(rawCompressionSettings);
+        logger.info('[Image Upload] User compression settings received');
       }
     } catch (e) {
       logger.warn('Failed to parse compression settings, using defaults');
@@ -1247,17 +1329,17 @@ router.post('/upload', upload.array('files', 10), async (req, res) => {
     // Extract upload settings
     let uploadSettings = {};
     try {
-      if (req.body.uploadSettings) {
-        uploadSettings = JSON.parse(req.body.uploadSettings);
+      const rawUploadSettings = readFirstStringField(req.body.uploadSettings);
+      if (rawUploadSettings) {
+        uploadSettings = JSON.parse(rawUploadSettings);
         logger.info('[Upload] Received clip upload settings from frontend:', {
-          tunnelProvider: uploadSettings.tunnel_provider || 'none',
           hasTunnelUrl: Boolean(uploadSettings.tunnel_url)
         });
       } else {
         logger.info('[Upload] No upload settings received, using local storage');
       }
     } catch (e) {
-      logger.warn(`[Upload] Failed to parse upload settings: ${e.message}, using local storage`);
+      logger.warn('[Upload] Failed to parse upload settings, using local storage');
       uploadSettings = { strategy: 'local' };
     }
     
@@ -1272,17 +1354,17 @@ router.post('/upload', upload.array('files', 10), async (req, res) => {
     const processedFiles = [];
     let fileIndex = 0;
     
-    for (const file of req.files) {
+    for (const file of uploadedFiles) {
       const fileStartTime = Date.now();
-      logger.debug(`[TIMING] Processing file: ${file.originalname}, type: ${file.mimetype}, size: ${file.size}`);
+	      logger.debug('[TIMING] Processing uploaded file');
 
       // Process, optimize, and store locally.
       const fileData = await processAndStoreFile(file, compressionSettings, uploadSettings);
       
-      logger.info(`[Upload] FileData returned from processAndStoreFile:`, {
-        url: fileData.url,
-        tunnelPath: fileData.tunnelPath,
-        hasClipLevelBase64: !!fileData.base64
+      logger.info('[Upload] FileData returned from processAndStoreFile:', {
+        hasUrl: Boolean(fileData.url),
+        hasTunnelPath: Boolean(fileData.tunnelPath),
+        hasClipLevelBase64: Boolean(fileData.base64)
       });
       
       // Generate clip ID using the batshitzipService for consistency
@@ -1301,22 +1383,22 @@ router.post('/upload', upload.array('files', 10), async (req, res) => {
         userId,
         compressionSettings
       });
-      logger.info(`[Upload] Storage mode determined: ${storageMode}`);
+	      logger.info('[Upload] Storage mode determined');
       
       fileIndex++;
       
-      logger.info(`[Upload] Storing clip with:`, {
-        id: clipData.id,
+      logger.info('[Upload] Storing clip with:', {
+        hasClipId: Boolean(clipData.id),
         storageMode: clipRecord.storageMode,
-        externalUrl: clipRecord.externalUrl,
-        tunnelPath: clipRecord.tunnelPath,
-        localUrl: clipRecord.localUrl,
-        hasLocalBase64: !!clipRecord.localBase64
+        hasExternalUrl: Boolean(clipRecord.externalUrl),
+        hasTunnelPath: Boolean(clipRecord.tunnelPath),
+        hasLocalUrl: Boolean(clipRecord.localUrl),
+        hasLocalBase64: Boolean(clipRecord.localBase64)
       });
       
       // Store clip in Redis
       await redisService.setClip(userId, clipData.id, clipRecord);
-      logger.debug(`[Upload] Stored clip ${clipData.id} in Redis for user ${userId}`);
+      logger.debug('[Upload] Stored clip in Redis');
 
       processedFiles.push({
         ...fileData,
@@ -1336,18 +1418,18 @@ router.post('/upload', upload.array('files', 10), async (req, res) => {
       });
       
       const fileEndTime = Date.now();
-      logger.debug(`[TIMING] File ${file.originalname} processed in ${fileEndTime - fileStartTime}ms`);
+      logger.debug('[TIMING] Uploaded file processed');
     }
 
     const uploadEndTime = Date.now();
-    logger.debug(`[TIMING] Total upload processing time: ${uploadEndTime - uploadStartTime}ms`);
+    logger.debug('[TIMING] Total upload processing complete');
 
     res.json({
       success: true,
       files: processedFiles
     });
   } catch (error) {
-    logger.error('Multi-file upload error:', error);
+	    logger.error('Multi-file upload error');
     sendUploadError(res, 'Multi-file upload failed', error);
   }
 });
@@ -1360,13 +1442,18 @@ router.post('/upload/single', upload.single('file'), async (req, res) => {
     }
     
     // Extract session ID
-    const sessionId = req.body.sessionId || req.query.sessionId || req.headers['x-session-id'];
+    const sessionId = readFirstStringField(
+      req.body.sessionId,
+      req.query.sessionId,
+      req.headers['x-session-id']
+    );
     
     // Extract compression settings
     let compressionSettings = {};
     try {
-      if (req.body.compressionSettings) {
-        compressionSettings = JSON.parse(req.body.compressionSettings);
+      const rawCompressionSettings = readFirstStringField(req.body.compressionSettings);
+      if (rawCompressionSettings) {
+        compressionSettings = JSON.parse(rawCompressionSettings);
       }
     } catch (e) {
       logger.warn('Failed to parse compression settings, using defaults');
@@ -1375,8 +1462,9 @@ router.post('/upload/single', upload.single('file'), async (req, res) => {
     // Extract upload settings
     let uploadSettings = {};
     try {
-      if (req.body.uploadSettings) {
-        uploadSettings = JSON.parse(req.body.uploadSettings);
+      const rawUploadSettings = readFirstStringField(req.body.uploadSettings);
+      if (rawUploadSettings) {
+        uploadSettings = JSON.parse(rawUploadSettings);
       }
     } catch (e) {
       uploadSettings = { strategy: 'local' };
@@ -1457,13 +1545,13 @@ router.post('/upload/single', upload.single('file'), async (req, res) => {
       }
     });
   } catch (error) {
-    logger.error('Upload error:', error);
+	    logger.error('Upload error');
     sendUploadError(res, 'File upload failed', error);
   }
 });
 
-// Avatar upload endpoint
-router.post('/upload/avatar', upload.single('file'), async (req, res) => {
+// Avatar upload endpoint.
+router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -1522,7 +1610,7 @@ router.post('/upload/avatar', upload.single('file'), async (req, res) => {
           const exists = await redisService.client.exists(key);
           if (exists) {
             await redisService.client.del(key);
-            logger.info(`Deleted old avatar: ${key}`);
+	            logger.info('Deleted old avatar');
             break;
           }
         }
@@ -1599,11 +1687,7 @@ router.post('/upload/goon', goonVrmUpload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Goon files must be VRM 1.0 (.vrm)' });
     }
 
-    const safeBase = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'goon';
+    const safeBase = sanitizeFilenameSegment(path.basename(originalName, ext), 'goon').slice(0, 80) || 'goon';
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}.vrm`;
@@ -1613,7 +1697,7 @@ router.post('/upload/goon', goonVrmUpload.single('file'), async (req, res) => {
       originalName,
       filename,
       mimetype: req.file.mimetype || 'application/octet-stream',
-      sourcePath: req.file.path,
+      sourceFile: req.file,
       size: req.file.size
     });
 
@@ -1685,11 +1769,8 @@ router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'
 
     const [, modelBytes] = modelEntries[0];
     const safeBase =
-      path
-        .basename(originalName, ext)
-        .replace(/[^a-zA-Z0-9_-]+/g, '_')
-        .replace(/_+/g, '_')
-        .slice(0, 80) || 'custom_goon';
+      sanitizeFilenameSegment(path.basename(originalName, ext), 'custom_goon').slice(0, 80) ||
+      'custom_goon';
     const timestamp = Date.now();
 
     const packageFilename = `${timestamp}_${safeBase}${ext}`;
@@ -1801,11 +1882,8 @@ router.post('/upload/goon-guided-package', goonGuidedPackageUpload.single('file'
 
     const [, vrmBytes] = vrmEntries[0];
     const safeBase =
-      path
-        .basename(originalName, ext)
-        .replace(/[^a-zA-Z0-9_-]+/g, '_')
-        .replace(/_+/g, '_')
-        .slice(0, 80) || 'guided_goon';
+      sanitizeFilenameSegment(path.basename(originalName, ext), 'guided_goon').slice(0, 80) ||
+      'guided_goon';
     const timestamp = Date.now();
 
     const packageFilename = `${timestamp}_${safeBase}${ext}`;
@@ -1821,7 +1899,7 @@ router.post('/upload/goon-guided-package', goonGuidedPackageUpload.single('file'
       originalName,
       filename: packageFilename,
       mimetype: req.file.mimetype || 'application/zip',
-      sourcePath: req.file.path,
+      sourceFile: req.file,
       size: req.file.size
     });
 
@@ -1878,11 +1956,9 @@ router.post('/upload/goon-animation', goonAnimationUpload.single('file'), async 
       return res.status(400).json({ error: 'Goon animation files must be .glb, .gltf, or .vrma' });
     }
 
-    const safeBase = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'goon_animation';
+    const safeBase =
+      sanitizeFilenameSegment(path.basename(originalName, ext), 'goon_animation').slice(0, 80) ||
+      'goon_animation';
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}${ext}`;
@@ -1933,11 +2009,11 @@ router.post('/upload/goon-animation-preview', goonAnimationPreviewUpload.single(
     }
 
     const transcoded = await transcodeGoonAnimationPreviewToMp4(req.file);
-    const safeBase = path
-      .basename(originalName, sourceExt || path.extname(originalName))
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'motion_preview';
+    const safeBase =
+      sanitizeFilenameSegment(
+        path.basename(originalName, sourceExt || path.extname(originalName)),
+        'motion_preview'
+      ).slice(0, 80) || 'motion_preview';
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}.mp4`;
@@ -1989,11 +2065,9 @@ router.post('/upload/goon-closet', goonImageUpload.single('file'), async (req, r
       return res.status(400).json({ error: 'Closet textures must be PNG images.' });
     }
 
-    const safeBase = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'closet_texture';
+    const safeBase =
+      sanitizeFilenameSegment(path.basename(originalName, ext), 'closet_texture').slice(0, 80) ||
+      'closet_texture';
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}.png`;
@@ -2063,11 +2137,7 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
       return res.status(400).json({ error: 'Scene images must be PNG or JPG.' });
     }
 
-    const safeBase = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'scene';
+    const safeBase = sanitizeFilenameSegment(path.basename(originalName, ext), 'scene').slice(0, 80) || 'scene';
 
     const timestamp = Date.now();
     const normalizedExt = ext === '.jpeg' ? '.jpg' : ext;
@@ -2144,11 +2214,9 @@ router.post('/upload/goon-room-shell', goonSceneModelUpload.single('file'), asyn
       return res.status(400).json({ error: 'Room shells must be GLB or GLTF.' });
     }
 
-    const safeBase = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'room_shell';
+    const safeBase =
+      sanitizeFilenameSegment(path.basename(originalName, ext), 'room_shell').slice(0, 80) ||
+      'room_shell';
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}${ext}`;
@@ -2217,11 +2285,9 @@ router.post('/upload/goon-room-texture', goonSceneUpload.single('file'), async (
     }
 
     const kind = req.body?.kind;
-    const safeBase = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'room_texture';
+    const safeBase =
+      sanitizeFilenameSegment(path.basename(originalName, ext), 'room_texture').slice(0, 80) ||
+      'room_texture';
 
     const timestamp = Date.now();
     const normalizedExt = ext === '.jpeg' ? '.jpg' : ext;
@@ -2292,11 +2358,7 @@ router.post('/upload/goon-scene-prop', goonSceneModelUpload.single('file'), asyn
       return res.status(400).json({ error: 'Props must be GLB or GLTF.' });
     }
 
-    const safeBase = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9_-]+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 80) || 'prop';
+    const safeBase = sanitizeFilenameSegment(path.basename(originalName, ext), 'prop').slice(0, 80) || 'prop';
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}${ext}`;

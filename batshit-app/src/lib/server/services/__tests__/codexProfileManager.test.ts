@@ -910,7 +910,7 @@ describe('codexProfileManager dynamic-only managed config', () => {
         '[features]',
         'extra_feature = true',
         '',
-        `[projects."${tempHome.replace(/"/g, '\\"')}"]`,
+        `[projects."${tempHome.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`,
         'trust_level = "untrusted"',
         '',
         '[projects."/tmp/custom"]',

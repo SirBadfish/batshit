@@ -289,13 +289,41 @@ function decodeShellStringLiteral(value: string): string {
   }
 
   if (trimmed.startsWith("$'") && trimmed.endsWith("'")) {
-    return trimmed
-      .slice(2, -1)
-      .replace(/\\n/g, '\n')
-      .replace(/\\t/g, '\t')
-      .replace(/\\r/g, '\r')
-      .replace(/\\\\/g, '\\')
-      .replace(/\\'/g, "'")
+    let output = ''
+    const body = trimmed.slice(2, -1)
+    for (let index = 0; index < body.length; index += 1) {
+      const char = body[index]
+      if (char !== '\\') {
+        output += char
+        continue
+      }
+
+      const next = body[index + 1]
+      if (!next) {
+        output += char
+        continue
+      }
+
+      index += 1
+      switch (next) {
+        case 'n':
+          output += '\n'
+          break
+        case 't':
+          output += '\t'
+          break
+        case 'r':
+          output += '\r'
+          break
+        case '\\':
+        case "'":
+          output += next
+          break
+        default:
+          output += `\\${next}`
+      }
+    }
+    return output
   }
 
   return trimmed
