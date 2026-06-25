@@ -82,7 +82,7 @@
 		"@iarna/toml": "^2.2.5",
 		"@lobehub/icons-static-svg": "^1.90.0",
 		"@modelcontextprotocol/sdk": "^1.29.0",
-		"@openrouter/ai-sdk-provider": "^2.9.0",
+		"@openrouter/ai-sdk-provider": "^2.9.1",
 		"@redis/json": "5.11.0",
 		"ai": "^6.0.146",
 		"ansi-to-html": "^0.7.2",
