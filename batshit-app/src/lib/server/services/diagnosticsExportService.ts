@@ -8,6 +8,7 @@ import { zipSync } from 'fflate/node'
 import { redis } from '$lib/server/redis'
 import { resolveRuntimeContext } from '$lib/server/services/runtimeContext'
 import { checkCoreSystemPromptDefaults } from '$lib/server/services/systemPromptRegistry'
+import { BATSHIT_APP_VERSION } from '$lib/version'
 
 const DIAGNOSTICS_SCHEMA_VERSION = 1
 const MAX_LOG_FILES = 18
@@ -229,6 +230,19 @@ async function readPackageVersion(): Promise<string> {
   }
 
   return 'unknown'
+}
+
+async function readAppVersion(): Promise<string> {
+  const configuredVersion =
+    env.BATSHIT_APP_VERSION?.trim() || process.env.BATSHIT_APP_VERSION?.trim()
+  if (configuredVersion) return configuredVersion
+
+  const publicVersion = process.env.PUBLIC_BATSHIT_APP_VERSION?.trim()
+  if (publicVersion) return publicVersion
+
+  if (BATSHIT_APP_VERSION.trim()) return BATSHIT_APP_VERSION.trim()
+
+  return readPackageVersion()
 }
 
 function selectedEnvironment(runtimeEnv: RuntimeEnv): Record<string, string | boolean | null> {
@@ -466,7 +480,7 @@ async function buildDiagnosticsSnapshot(runtimeEnv: RuntimeEnv = env): Promise<{
   const createdAt = new Date().toISOString()
   const runtimeContext = resolveRuntimeContext(runtimeEnv)
   const [appVersion, health, logs] = await Promise.all([
-    readPackageVersion(),
+    readAppVersion(),
     collectHealth(),
     captureLogs(runtimeEnv)
   ])
