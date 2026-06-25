@@ -1,0 +1,26 @@
+{
+  "name": "@batshit/livekit-agent-sidecar",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "NODE_OPTIONS=--no-warnings NODE_NO_WARNINGS=1 tsx src/livekit-agent-sidecar.ts dev",
+    "start": "NODE_OPTIONS=--no-warnings NODE_NO_WARNINGS=1 tsx src/livekit-agent-sidecar.ts start",
+    "help": "tsx src/livekit-agent-sidecar.ts --help",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@livekit/agents": "^1.4.3",
+    "@livekit/agents-plugin-deepgram": "^1.4.3",
+    "@livekit/agents-plugin-google": "^1.4.3",
+    "@livekit/agents-plugin-openai": "^1.4.3",
+    "@livekit/agents-plugin-xai": "^1.4.3",
+    "@livekit/rtc-node": "^0.13.27",
+    "tsx": "^4.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3"
+  }
+}

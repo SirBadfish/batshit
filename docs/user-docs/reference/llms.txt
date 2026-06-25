@@ -1,0 +1,118 @@
+# Batshit UserDocs LLM Map
+
+Purpose:
+- Help LLMs and docs tooling find the right Batshit UserDocs source quickly.
+- Do not duplicate full docs content here.
+- Treat docs/user-docs/ as the canonical public UserDocs tree.
+
+Project:
+- Name: Batshit.
+- Launch posture: alpha.
+- License wording: AGPL-3.0-only.
+- Scope: single-user-per-instance self-hosted AI workspace.
+- User content: chats, agents, prompts, workflows, artifacts, uploaded files, project files, generated content, and local data remain the user's content.
+- n8n: Batshit integrates with n8n, which is separately licensed by n8n.
+- Brand: Batshit trademarks/brand assets are separate from the AGPL code license.
+
+Canonical terms:
+- Primary Agents: n8n, API, CLI.
+- Subagents: API Subagents, CLI Subagents, n8n Workflow Subagents, n8n Subnode Subagents.
+- Batshit-original concepts (little or no outside equivalent; teach from zero): Zips, Clips, Tool Grid, DCM (Dynamic Current Message), Schema Hints, Group Chat single-speaker queue, Execution Viewer, Artifact Zones, Goons/Goon Dock.
+- Do not use retired numbered primary-agent labels in public docs.
+- Use Batshit in prose. All-caps brand spelling appears only inside literal env var names.
+- Zip buffer counts previous agent/assistant responses, not user messages or individual tool calls. `Off` never zips; `Normal` uses buffer/threshold; `Auto` zips immediately by default. Very large tool transcripts may stay compressed even inside the buffer to protect model request size.
+
+UserDocs information architecture:
+- Pages are grouped by subject/feature, not by document type. Each subject owns its own folder.
+- Install-first: Installation and Providers come first, then Security & trust, then the feature subjects, then Chat, Admin, Resources, Troubleshooting, and Reference.
+
+Current UserDocs entry points (subject folders):
+- docs/user-docs/README.md
+- docs/user-docs/index.md
+- docs/user-docs/installation/
+- docs/user-docs/providers/
+- docs/user-docs/security/
+- docs/user-docs/primary-agents/
+- docs/user-docs/subagents/
+- docs/user-docs/skills/
+- docs/user-docs/tools/
+- docs/user-docs/artifacts/
+- docs/user-docs/voice/
+- docs/user-docs/goons/
+- docs/user-docs/groups/
+- docs/user-docs/projects/
+- docs/user-docs/clips/
+- docs/user-docs/local-ai/
+- docs/user-docs/admin/
+- docs/user-docs/chat/
+- docs/user-docs/resources/
+- docs/user-docs/troubleshooting/
+- docs/user-docs/reference/ports-and-urls.md
+- docs/user-docs/reference/env-vars.md
+- docs/user-docs/reference/templates.md
+- docs/user-docs/reference/portable-skills.md
+- docs/user-docs/reference/llms.txt
+
+Key URLs and ports:
+- Mac app browser companion: http://127.0.0.1:5620
+- Docker browser Batshit app: http://localhost:5620
+- Source-checkout dev browser Batshit app: http://localhost:5621
+- Browser batshit-server: http://localhost:5600
+- Docker internal app: http://app:3000
+- Docker internal batshit-server: http://batshit-server:5600
+- n8n browser default: http://localhost:5678
+- Docker optional n8n profile internal: http://n8n:5678
+- Docker host services from app container: use host.docker.internal
+- Docker Redis: internal only at redis://redis:6379/0
+
+Setup posture:
+- Mac app and Docker are peer setup paths.
+- Mac app is the richer macOS workstation path for host-local runtimes and local tooling.
+- Docker is the contained Compose path with explicit sidecars/operators/connect-existing rules.
+- Manual source-checkout setup is advanced repair/development material, not the normal public path.
+- Do not frame Docker as the default/recommended path over Mac app.
+- Do not tell public users to run private development launchers as install steps.
+
+Docker core:
+- Core services: app, batshit-server, Redis Stack.
+- Optional profiles/add-ons: n8n, cloudflared, fbx2vrma, agent-browser, livekit, comfyui-validation.
+- Core app container does not get the host Docker socket.
+- Docker Sandbox and approved add-on start/stop use a host operator prepared by ./start-docker.sh.
+- The Mac app uses Apple Container as the default sandbox backend for agent command execution on supported Macs; Docker Sandbox remains selectable and cross-platform.
+
+n8n:
+- n8n workflows and credentials stay in n8n.
+- Batshit Settings API keys are not copied into n8n provider credentials.
+- Current official Batshit n8n Native Tools use scoped `x-batshit-native-tool-token`.
+- Current public-safe n8n templates live in docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/.
+
+Portable Skills:
+- Portable Skills are Batshit system-skill bundles installed into outside coding agents.
+- They operate local Batshit through GET /api/health, POST /api/controls/use, optional POST /api/controls/find, and x-batshit-portable-token.
+- Tokens are minted in Settings -> Skills & Prompts -> Portable Skills, scoped by family, shown once, and revocable.
+- Never tell users to paste BATSHIT_TOKEN, passwords, browser cookies, or n8n callback tokens into outside agents.
+- The Portable Skills tab shows copy-ready install prompts for the four public bundle zips.
+- Public bundles are served under /portable-skills/ and listed in docs/user-docs/reference/portable-skills.md.
+- Private env files should normally live at ~/.batshit/portable-skills/portable-skills.env, not inside downloaded bundles. Per-skill env files are optional narrower-token overrides.
+
+Security/documentation constraints:
+- Never publish real tokens, API keys, private local paths, raw logs, or secrets.
+- Explain Mac app and Docker security honestly; neither is magically safe.
+- Prefer sandboxed Agent Mode for normal agent command execution when documenting usage.
+- Warn against untrusted skills, MCP gateways, artifacts, and n8n workflows.
+- Explain that enabling a Skill for an agent gives that agent permission to load it when a matching request comes up; users do not have to type the slash command first.
+
+Useful public UserDocs sources for verification:
+- docs/user-docs/index.md
+- docs/user-docs/installation/choose-mac-app-or-docker.md
+- docs/user-docs/installation/install-mac-app.md
+- docs/user-docs/installation/install-docker.md
+- docs/user-docs/installation/docker-runtime-and-add-ons.md
+- docs/user-docs/primary-agents/overview.md
+- docs/user-docs/primary-agents/connect-n8n.md
+- docs/user-docs/groups/overview.md
+- docs/user-docs/chat/execution-viewer.md
+- docs/user-docs/security/overview.md
+- docs/user-docs/skills/portable-skills.md
+- docs/user-docs/reference/ports-and-urls.md
+- docs/user-docs/reference/env-vars.md

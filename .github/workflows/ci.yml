@@ -1,0 +1,201 @@
+# Batshit CI
+#
+# Honest scope: this runs exactly what the team runs locally — svelte-check, the app
+# vitest suite (default lane: in-memory Redis fake + mocked AI SDKs, no secrets needed),
+# the batshit-server jest suite (self-contained, boots the real server on a loopback
+# port with in-memory storage), a curated real-Redis lane for the FM-critical suites,
+# and the scanner gates (audit / circular imports / branding / $derived).
+#
+# Live-provider suites (*.live.test.ts) are env-gated (BATSHIT_LIVE_CODEX) and report
+# as skipped here by design. Never set those env vars in CI.
+#
+# Circular-import budget: batshit-app currently has 5 known cycles. The gate fails
+# on new cycles (count > 5); ratchet the budget to 0 when the current cycles are fixed.
+# batshit-server is at 0 and gated hard.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: App (svelte-check + vitest + madge)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: batshit-app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: batshit-app/package-lock.json
+      # The suite exercises Batshit's real runtime dependencies: native bash dispatch
+      # runs commands through zsh (present on macOS and in the Docker app image), and
+      # voice ref-audio normalization shells out to ffmpeg.
+      - name: Install runtime test dependencies (zsh, ffmpeg)
+        run: sudo apt-get update && sudo apt-get install -y zsh ffmpeg
+      # npm ci runs postinstall (patch-package) and prepare (svelte-kit sync) — required.
+      - run: npm ci
+      # svelte-check over ~7.4k files exceeds Node's default ~2GB heap on the 7GB
+      # runner; scope the larger heap to this step only (vitest forks must not inherit it).
+      - run: npm run check
+        env:
+          NODE_OPTIONS: --max-old-space-size=5120
+      - run: npx vitest run
+      - name: Circular imports (budget 5)
+        run: |
+          set -o pipefail
+          npx --yes madge@8 --circular --extensions ts --ts-config tsconfig.json src | tee madge-app.txt || true
+          count=$(grep -cE '^[0-9]+\)' madge-app.txt || true)
+          echo "circular chains: ${count} (budget 5; ratchet to 0 when the current cycles are fixed)"
+          if [ "${count}" -gt 5 ]; then
+            echo "::error::New circular import introduced in batshit-app (count ${count} > budget 5)"
+            exit 1
+          fi
+
+  app-redis:
+    name: App real-Redis lane (FM-critical suites)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis/redis-stack-server:7.4.0-v8
+        ports:
+          - 6379:6379
+    defaults:
+      run:
+        working-directory: batshit-app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: batshit-app/package-lock.json
+      - run: npm ci
+      # Curated Redis Stack lane: RedisJSON/zip/cleanup/backup suites, the two
+      # integration suites whose headers promise real-Redis validation, and every
+      # suite that intentionally restores the real $lib/server/redis module via
+      # vi.importActual (gated by REAL_REDIS_LANE in-file).
+      - name: vitest (real Redis Stack, DB15)
+        run: >
+          npm run test:redis --
+          src/lib/server/tests/redisPatterns.test.ts
+          src/lib/server/tests/redisStreamService.test.ts
+          src/lib/server/tests/messageDeletion.test.ts
+          src/lib/server/tests/folderDeletion.test.ts
+          src/lib/server/services/__tests__/backupRestoreService.test.ts
+          src/tests/integration/story-5.22-gateway-service.test.ts
+          src/tests/integration/story-5.23-redis-persistence.test.ts
+          src/lib/server/icons/iconLibrary.test.ts
+          src/lib/server/icons/onlineIconProviders.test.ts
+          src/lib/server/services/__tests__/nativeCliMode3Contract.test.ts
+          src/lib/server/tests/artifacts-complete.test.ts
+          src/lib/server/tests/artifacts-service.test.ts
+          src/lib/server/tests/cliToolRegistry.test.ts
+          src/lib/server/tests/groupAgentCleanup.test.ts
+
+  server:
+    name: batshit-server (jest + madge)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: batshit-server/server
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: batshit-server/server/package-lock.json
+      - run: npm ci
+      # No --passWithNoTests: if jest stops discovering the suites, that is a failure.
+      - run: npx jest
+      - name: Circular imports (zero budget)
+        run: npx --yes madge@8 --circular --extensions js,cjs,mjs src
+
+  guardrails:
+    name: Guardrails (audit + branding + $derived)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: npm audit — production deps (fail on high/critical)
+        # Blocking gate scoped to what ships: --omit=dev keeps build-chain advisories
+        # (vite/esbuild and friends, which churn upstream weekly and have no path into
+        # the runtime artifact) from turning main red while upstream absorbs fixes.
+        run: |
+          set -e
+          roots=(
+            batshit-app
+            batshit-server/server
+            batshit-server/client
+            batshit-mac
+            tools/livekit-agent-sidecar
+          )
+          for dir in "${roots[@]}"; do
+            if [ -f "${dir}/package-lock.json" ]; then
+              echo "=== audit (prod deps): ${dir} ==="
+              (cd "${dir}" && npm audit --omit=dev --audit-level=high)
+            else
+              echo "=== audit: ${dir} skipped (no lockfile) ==="
+            fi
+          done
+      - name: npm audit — full report (informational, never blocks)
+        continue-on-error: true
+        run: |
+          roots=(
+            batshit-app
+            batshit-server/server
+            batshit-server/client
+            batshit-mac
+            tools/livekit-agent-sidecar
+          )
+          failed=0
+          for dir in "${roots[@]}"; do
+            if [ -f "${dir}/package-lock.json" ]; then
+              echo "=== full audit: ${dir} ==="
+              (cd "${dir}" && npm audit --audit-level=high) || failed=1
+            fi
+          done
+          if [ "$failed" = "1" ]; then
+            echo "::warning::High/critical advisories exist in dev/build dependency chains (see log above). Non-blocking by design — review during dependency maintenance."
+          fi
+          exit $failed
+      - name: Stale branding gate
+        run: |
+          set +e
+          term_one='s''8n'
+          term_two="ctrl$(printf '\\\\+')room"
+          term_three='ctrl''-room'
+          term_four='ctrl''room'
+          rg -in "\\b${term_one}\\b|${term_two}|${term_three}|${term_four}" \
+            README.md docs/user-docs batshit-app/src batshit-server batshit-mac/src batshit-mac/scripts batshit-portable-skills tools start-docker.sh compose.yaml \
+            -g '!**/node_modules/**' > branding-hits.txt
+          set -e
+          cp branding-hits.txt branding-violations.txt
+          if [ -s branding-violations.txt ]; then
+            echo "::error::Stale branding found:"
+            cat branding-violations.txt
+            exit 1
+          fi
+          echo "Branding clean."
+      - name: Svelte $derived(fn) bug-pattern gate (zero tolerance)
+        run: |
+          if rg -n --pcre2 '\$derived\(\s*(async\s*)?\(\)?[a-zA-Z0-9_,\s]*\)?\s*=>' batshit-app/src -g '*.svelte' -g '*.svelte.ts' -g '*.ts' | rg -v '\$derived\.by'; then
+            echo "::error::Found \$derived(() => ...) bug-pattern instances — use \$derived.by for function bodies."
+            exit 1
+          fi
+          echo "No \$derived(fn) bug-pattern instances."

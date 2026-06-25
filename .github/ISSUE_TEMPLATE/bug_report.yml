@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible Batshit bug
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Please do not include API keys, secrets, private logs, or sensitive local files.
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Setup path
+      options:
+        - Mac app
+        - Docker
+        - Source checkout / contributor setup
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the bug in plain language.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      description: Include screenshots or sanitized logs only if they help. Remove secrets first.
+    validations:
+      required: false

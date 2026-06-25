@@ -1,0 +1,438 @@
+:root {
+  color: oklch(0.94 0.006 289.95);
+  background: oklch(0.11 0.02 276);
+  font-family:
+    "Geist Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  font-weight: 300;
+  text-rendering: geometricPrecision;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: oklch(0.11 0.02 276);
+}
+
+button {
+  min-height: 34px;
+  border: 1px solid oklch(0.31 0.022 282);
+  border-radius: 8px;
+  padding: 0 13px;
+  color: oklch(0.94 0.006 289.95);
+  background: oklch(0.18 0.018 282);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color 160ms ease-out,
+    border-color 160ms ease-out,
+    color 160ms ease-out;
+}
+
+button:hover:not(:disabled) {
+  background: oklch(0.23 0.022 282);
+  border-color: oklch(0.41 0.035 282);
+}
+
+button:focus-visible {
+  outline: 2px solid oklch(0.63 0.05 281.84);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: default;
+  color: oklch(0.53 0.012 289.95);
+  background: oklch(0.13 0.014 282);
+}
+
+button.primary {
+  border-color: oklch(0.63 0.05 281.84);
+  background: oklch(0.48 0.05 278.79);
+}
+
+button.quiet {
+  color: oklch(0.72 0.016 289.95);
+}
+
+button.mini {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 0.75rem;
+}
+
+.boot-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 14px;
+  padding: 24px;
+}
+
+.boot-mark {
+  width: 76px;
+  height: 76px;
+  display: grid;
+  place-items: center;
+  border-radius: 22px;
+  box-shadow: 0 18px 50px oklch(0 0 0 / 0.32);
+  animation: icon-breathe 1800ms ease-in-out infinite;
+}
+
+.boot-mark img {
+  width: 76px;
+  height: 76px;
+  display: block;
+  border-radius: 22px;
+}
+
+.boot-shell h1 {
+  font-size: 1.75rem;
+}
+
+.boot-shell p {
+  color: oklch(0.68 0.016 289.95);
+}
+
+.boot-meter {
+  width: min(260px, 72vw);
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: oklch(0.2 0.018 282);
+}
+
+.boot-meter::before {
+  content: "";
+  display: block;
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: oklch(0.82 0.04 292);
+  box-shadow: 0 0 16px oklch(0.76 0.052 292 / 0.42);
+  animation: meter 1300ms ease-in-out infinite;
+}
+
+@keyframes icon-breathe {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.94;
+  }
+
+  50% {
+    transform: translateY(-1px);
+    opacity: 1;
+  }
+}
+
+@keyframes meter {
+  0% {
+    transform: translateX(-110%);
+  }
+
+  100% {
+    transform: translateX(260%);
+  }
+}
+
+.shell {
+  width: min(1120px, calc(100vw - 32px));
+  min-height: calc(100vh - 32px);
+  margin: 16px auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mast,
+.control-band,
+.service-panel,
+.doctor-panel,
+.tool-strip,
+footer,
+.notice {
+  border: 1px solid oklch(0.24 0.015 282);
+  border-radius: 10px;
+  background: oklch(0.145 0.016 282);
+}
+
+.mast {
+  min-height: 92px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 20px 22px;
+}
+
+.eyebrow {
+  margin: 0 0 7px;
+  color: oklch(0.66 0.035 282);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  color: oklch(0.96 0.006 289.95);
+  font-size: 1.55rem;
+  font-weight: 500;
+  line-height: 1.15;
+}
+
+h2 {
+  color: oklch(0.91 0.006 289.95);
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+
+h3 {
+  color: oklch(0.88 0.008 289.95);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+p {
+  color: oklch(0.62 0.015 289.95);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.runtime-mark,
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 24px;
+  border: 1px solid oklch(0.29 0.015 282);
+  border-radius: 999px;
+  padding: 0 9px;
+  color: oklch(0.68 0.015 289.95);
+  background: oklch(0.11 0.014 282);
+  font-size: 0.75rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.runtime-mark span,
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: oklch(0.64 0.275 358);
+}
+
+.runtime-mark.ready span,
+.dot.ready {
+  background: oklch(0.72 0.115 185);
+}
+
+.control-band {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+}
+
+.control-band .primary {
+  margin-left: auto;
+}
+
+.notice {
+  padding: 11px 13px;
+  color: oklch(0.84 0.02 289.95);
+  font-size: 0.8125rem;
+}
+
+.notice.error {
+  border-color: oklch(0.64 0.16 358);
+  color: oklch(0.9 0.07 358);
+  background: oklch(0.19 0.055 358);
+}
+
+.status-layout {
+  min-height: 0;
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(300px, 0.8fr);
+  gap: 14px;
+}
+
+.service-panel,
+.doctor-panel {
+  min-width: 0;
+  padding: 16px;
+}
+
+.section-head {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-head span {
+  color: oklch(0.55 0.014 289.95);
+  font-size: 0.75rem;
+}
+
+.rows,
+.doctor-list {
+  display: grid;
+  gap: 8px;
+}
+
+.status-row,
+.doctor-note {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid oklch(0.22 0.012 282);
+  border-radius: 8px;
+  padding: 12px;
+  background: oklch(0.105 0.012 282);
+}
+
+.status-row p {
+  max-width: 70ch;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+
+.pill.ready {
+  color: oklch(0.81 0.07 185);
+  border-color: oklch(0.48 0.07 185);
+}
+
+.pill.warn {
+  color: oklch(0.82 0.07 74);
+  border-color: oklch(0.5 0.055 74);
+}
+
+.pill.offline {
+  color: oklch(0.83 0.09 358);
+  border-color: oklch(0.5 0.105 358);
+}
+
+.doctor-note {
+  display: block;
+  min-height: 0;
+}
+
+.note-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.doctor-note p {
+  margin-top: 6px;
+}
+
+.doctor-note.blocker,
+.doctor-note.repairable {
+  border-color: oklch(0.48 0.105 358);
+}
+
+.doctor-note.warning {
+  border-color: oklch(0.48 0.055 74);
+}
+
+.empty {
+  min-height: 84px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed oklch(0.28 0.018 282);
+  border-radius: 8px;
+  color: oklch(0.66 0.016 289.95);
+}
+
+.tool-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px;
+}
+
+.tool-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  border: 1px solid oklch(0.22 0.012 282);
+  border-radius: 999px;
+  padding: 0 10px;
+  background: oklch(0.105 0.012 282);
+  color: oklch(0.72 0.016 289.95);
+  font-size: 0.75rem;
+}
+
+.dot.warn {
+  background: oklch(0.78 0.105 74);
+}
+
+.dot.offline {
+  background: oklch(0.64 0.275 358);
+}
+
+footer {
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  padding: 10px 12px;
+  color: oklch(0.5 0.014 289.95);
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+}
+
+.skeleton-row {
+  height: 72px;
+  border-radius: 8px;
+  background: oklch(0.18 0.016 282);
+  opacity: 0.65;
+}
+
+.skeleton-row.short {
+  width: 72%;
+}
+
+@media (max-width: 760px) {
+  .shell {
+    width: min(100vw - 20px, 680px);
+    margin: 10px auto;
+  }
+
+  .mast,
+  .control-band,
+  footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .control-band .primary {
+    margin-left: 0;
+  }
+
+  .status-layout {
+    grid-template-columns: 1fr;
+  }
+}

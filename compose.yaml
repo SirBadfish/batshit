@@ -1,0 +1,446 @@
+services:
+  redis:
+    image: redis/redis-stack-server:7.4.0-v8
+    restart: unless-stopped
+    volumes:
+      - batshit_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  batshit-server:
+    build:
+      context: .
+      dockerfile: batshit-server/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      NODE_ENV: production
+      BATSHIT_SERVER_HOST: 0.0.0.0
+      PORT: 5600
+      REDIS_URL: redis://redis:6379/0
+      BATSHIT_REDIS_REQUIRED: "true"
+      BATSHIT_TOKEN: ${BATSHIT_TOKEN:?Set BATSHIT_TOKEN in .env.docker before starting Batshit}
+      BATSHIT_WORKSPACE_MOUNT: ${BATSHIT_WORKSPACE_MOUNT:-}
+      BATSHIT_WORKSPACE_CONTAINER_PATH: /workspace
+      ENABLE_HTTPS: "false"
+      HTTPS_ONLY: "false"
+      SESSION_STORAGE_PATH: /data/sessions
+      SESSIONS_DIR: /data/sessions
+      UPLOADS_DIR: /data/uploads
+      BATSHIT_ARTIFACT_COMPLETE_URL: ${BATSHIT_ARTIFACT_COMPLETE_URL:-http://app:3000/api/artifacts/complete}
+      CORS_ORIGIN: ${ORIGIN:-http://localhost:5620}
+    ports:
+      # Host publishes default to loopback so another machine on the LAN cannot
+      # reach Batshit. Set BATSHIT_DOCKER_BIND_HOST=0.0.0.0 in .env.docker to
+      # intentionally serve the LAN.
+      - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_SERVER_PORT:-5600}:5600"
+    volumes:
+      - batshit_server_sessions:/data/sessions
+      - batshit_uploads:/data/uploads
+      - ${BATSHIT_WORKSPACE_MOUNT:-batshit_workspace}:/workspace
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5600/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  app:
+    build:
+      context: .
+      dockerfile: batshit-app/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      NODE_ENV: production
+      BATSHIT_CONTAINERIZED: "1"
+      BATSHIT_SESSION_COOKIE_NAME: ${BATSHIT_SESSION_COOKIE_NAME:-batshit_session_docker}
+      HOST: 0.0.0.0
+      PORT: 3000
+      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-1G}
+      ORIGIN: ${ORIGIN:-http://localhost:5620}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:5620}
+      REDIS_URL: redis://redis:6379/0
+      BATSHIT_TOKEN: ${BATSHIT_TOKEN:?Set BATSHIT_TOKEN in .env.docker before starting Batshit}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env.docker before starting Batshit}
+      BATSHIT_CODEX_WORKDIR: ${BATSHIT_CODEX_WORKDIR:-/workspace}
+      BATSHIT_AGENT_RUNTIME_ROOT: ${BATSHIT_AGENT_RUNTIME_ROOT:-/home/batshit-cli/.batshit}
+      BATSHIT_MANAGED_INSTALLS_ROOT: ${BATSHIT_MANAGED_INSTALLS_ROOT:-/home/batshit-cli/.batshit/installs}
+      BATSHIT_CLAUDE_RUN_AS_USER: ${BATSHIT_CLAUDE_RUN_AS_USER:-batshit-cli}
+      BATSHIT_CLAUDE_RUN_AS_UID: ${BATSHIT_CLAUDE_RUN_AS_UID:-10001}
+      BATSHIT_CLAUDE_RUN_AS_GID: ${BATSHIT_CLAUDE_RUN_AS_GID:-10001}
+      BATSHIT_CLAUDE_RUN_AS_HOME: ${BATSHIT_CLAUDE_RUN_AS_HOME:-/home/batshit-cli}
+      BATSHIT_WORKSPACE_MOUNT: ${BATSHIT_WORKSPACE_MOUNT:-}
+      BATSHIT_WORKSPACE_CONTAINER_PATH: /workspace
+      UPLOADS_DIR: /data/uploads
+      BATSHIT_SERVER_URL: http://batshit-server:5600
+      BATSHIT_SERVER_API_URL: http://batshit-server:5600/api/v1
+      PUBLIC_BATSHIT_SERVER_URL: ${PUBLIC_BATSHIT_SERVER_URL:-http://localhost:5600}
+      PUBLIC_BATSHIT_SERVER_API_URL: ${PUBLIC_BATSHIT_SERVER_API_URL:-http://localhost:5600/api/v1}
+      BATSHIT_ARTIFACT_COMPLETE_URL: ${BATSHIT_ARTIFACT_COMPLETE_URL:-http://app:3000/api/artifacts/complete}
+      BATSHIT_N8N_CALLBACK_BASE_URL: ${BATSHIT_N8N_CALLBACK_BASE_URL:-http://app:3000}
+      BATSHIT_CLOUDFLARED_TARGET_URL: ${BATSHIT_CLOUDFLARED_TARGET_URL:-http://batshit-server:5600}
+      BATSHIT_CLOUDFLARED_DOCKER_STATE_PATH: /runtime/cloudflared/status.json
+      BATSHIT_FBX2VRMA_WORKER_URL: ${BATSHIT_FBX2VRMA_WORKER_URL:-http://fbx2vrma-worker:8079}
+      BATSHIT_COMFYUI_VALIDATION_URL: ${BATSHIT_COMFYUI_VALIDATION_URL:-http://comfyui:8188}
+      BATSHIT_AGENT_BROWSER_SIDECAR_URL: ${BATSHIT_AGENT_BROWSER_SIDECAR_URL:-http://agent-browser:8091}
+      BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN: ${BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN:-}
+      BATSHIT_AGENT_BROWSER_TMP_DIR: ${BATSHIT_AGENT_BROWSER_TMP_DIR:-/runtime/agent-browser/tmp}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://localhost:7880}
+      LIVEKIT_INTERNAL_URL: ${LIVEKIT_INTERNAL_URL:-ws://host.docker.internal:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      LIVEKIT_VOICE_AGENT_NAME: ${LIVEKIT_VOICE_AGENT_NAME:-batshit-livekit-agent}
+      LIVEKIT_AGENT_HEALTH_URL: ${LIVEKIT_AGENT_HEALTH_URL:-http://livekit-agent:7899/worker}
+      BATSHIT_RUNTIME_ADDON_OPERATOR_URL: ${BATSHIT_RUNTIME_ADDON_OPERATOR_URL:-}
+      BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN: ${BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN:-}
+      BATSHIT_RUNTIME_ADDON_OPERATOR_TIMEOUT_MS: ${BATSHIT_RUNTIME_ADDON_OPERATOR_TIMEOUT_MS:-180000}
+      BATSHIT_NATIVE_DOCKER_SANDBOX_DRIVER: ${BATSHIT_NATIVE_DOCKER_SANDBOX_DRIVER:-operator}
+      BATSHIT_DOCKER_SANDBOX_OPERATOR_URL: ${BATSHIT_DOCKER_SANDBOX_OPERATOR_URL:-}
+      BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN: ${BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN:-}
+      BATSHIT_DOCKER_SANDBOX_OPERATOR_TIMEOUT_MS: ${BATSHIT_DOCKER_SANDBOX_OPERATOR_TIMEOUT_MS:-30000}
+      BATSHIT_SANDBOX_CONTAINER_WORKSPACE_ROOT: ${BATSHIT_SANDBOX_CONTAINER_WORKSPACE_ROOT:-/workspace}
+      BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT: ${BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT:-}
+    ports:
+      - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_APP_PORT:-5620}:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      batshit-server:
+        condition: service_healthy
+    volumes:
+      - batshit_uploads:/data/uploads
+      - ${BATSHIT_WORKSPACE_MOUNT:-batshit_workspace}:/workspace
+      - batshit_codex_home:/root/.codex
+      - batshit_agent_runtime:/root/.batshit
+      - batshit_agent_runtime:/home/batshit-cli/.batshit
+      - batshit_runtime_state:/runtime
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  cloudflared:
+    profiles:
+      - cloudflared
+    build:
+      context: .
+      dockerfile: tools/docker/cloudflared-sidecar/Dockerfile
+      args:
+        CLOUDFLARED_RELEASE_TAG: ${CLOUDFLARED_RELEASE_TAG:-2026.3.0}
+        CLOUDFLARED_LINUX_AMD64_SHA256: ${CLOUDFLARED_LINUX_AMD64_SHA256:-4a9e50e6d6d798e90fcd01933151a90bf7edd99a0a55c28ad18f2e16263a5c30}
+        CLOUDFLARED_LINUX_ARM64_SHA256: ${CLOUDFLARED_LINUX_ARM64_SHA256:-0755ba4cbab59980e6148367fcf53a8f3ec85a97deefd63c2420cf7850769bee}
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      BATSHIT_CLOUDFLARED_TARGET_URL: ${BATSHIT_CLOUDFLARED_TARGET_URL:-http://batshit-server:5600}
+      BATSHIT_CLOUDFLARED_METRICS: ${BATSHIT_CLOUDFLARED_METRICS:-0.0.0.0:20241}
+      BATSHIT_CLOUDFLARED_STATE_DIR: /runtime/cloudflared
+      BATSHIT_CLOUDFLARED_HEARTBEAT_SECONDS: ${BATSHIT_CLOUDFLARED_HEARTBEAT_SECONDS:-15}
+    volumes:
+      - batshit_runtime_state:/runtime
+    depends_on:
+      batshit-server:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "jq -e '.mode == \"docker-sidecar\" and .status == \"running\" and (.publicUrl | type == \"string\")' /runtime/cloudflared/status.json >/dev/null && wget -q -O /dev/null http://127.0.0.1:20241/metrics"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  fbx2vrma-worker:
+    profiles:
+      - fbx2vrma
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: tools/docker/fbx2vrma-worker/Dockerfile
+      args:
+        FBX2GLTF_VERSION: ${FBX2GLTF_VERSION:-v0.9.7}
+        FBX2GLTF_LINUX_X64_SHA256: ${FBX2GLTF_LINUX_X64_SHA256:-b38210352fdd29d50ba53a6514c3ff05ccbb5d1e0a6442db7a49834bf34a3145}
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      BATSHIT_FBX2VRMA_HOST: 0.0.0.0
+      BATSHIT_FBX2VRMA_PORT: 8079
+      BATSHIT_FBX2GLTF_PATH: /usr/local/bin/FBX2glTF
+      BATSHIT_FBX2GLTF_VERSION: ${FBX2GLTF_VERSION:-v0.9.7}
+      BATSHIT_FBX2VRMA_WORK_DIR: /work
+      BATSHIT_FBX2VRMA_MAX_BYTES: ${BATSHIT_FBX2VRMA_MAX_BYTES:-524288000}
+      BATSHIT_FBX2VRMA_CONVERT_TIMEOUT_MS: ${BATSHIT_FBX2VRMA_CONVERT_TIMEOUT_MS:-120000}
+    volumes:
+      - batshit_fbx2vrma_work:/work
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8079/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  agent-browser:
+    profiles:
+      - agent-browser
+    build:
+      context: .
+      dockerfile: tools/docker/agent-browser-sidecar/Dockerfile
+      args:
+        AGENT_BROWSER_VERSION: ${AGENT_BROWSER_VERSION:-0.24.1}
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      BATSHIT_AGENT_BROWSER_HOST: 0.0.0.0
+      BATSHIT_AGENT_BROWSER_PORT: 8091
+      BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN: ${BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN:-}
+      BATSHIT_AGENT_BROWSER_TMP_DIR: /runtime/agent-browser/tmp
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    volumes:
+      - batshit_runtime_state:/runtime
+      - batshit_agent_browser_data:/root/.agent-browser
+      - batshit_agent_browser_cache:/root/.cache
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8091/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  comfyui-validation:
+    profiles:
+      - comfyui-validation
+    build:
+      context: .
+      dockerfile: tools/docker/comfyui-validation-sidecar/Dockerfile
+    restart: unless-stopped
+    environment:
+      BATSHIT_COMFYUI_VALIDATION_HOST: 0.0.0.0
+      BATSHIT_COMFYUI_VALIDATION_PORT: 8188
+      BATSHIT_COMFYUI_VALIDATION_DATA_DIR: /data
+    ports:
+      - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_COMFYUI_VALIDATION_PORT:-8188}:8188"
+    volumes:
+      - batshit_comfyui_validation_data:/data
+    networks:
+      default:
+        aliases:
+          - comfyui
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8188/system_stats').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  livekit:
+    profiles:
+      - livekit
+    image: ${LIVEKIT_SERVER_IMAGE:-livekit/livekit-server:v1.12.0}
+    restart: unless-stopped
+    command:
+      - --dev
+      - --bind
+      - 0.0.0.0
+      - --keys
+      - "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env.docker before starting the LiveKit profile}: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env.docker before starting the LiveKit profile}"
+    ports:
+      - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_LIVEKIT_PORT:-7880}:7880"
+      - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_LIVEKIT_RTC_TCP_PORT:-7881}:7881"
+      - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_LIVEKIT_RTC_UDP_PORT:-7882}:7882/udp"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O /dev/null http://127.0.0.1:7880/"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  livekit-agent:
+    profiles:
+      - livekit
+    build:
+      context: .
+      dockerfile: tools/docker/livekit-agent-sidecar/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_AGENT_LIVEKIT_URL:-ws://livekit:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env.docker before starting the LiveKit profile}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env.docker before starting the LiveKit profile}
+      LIVEKIT_VOICE_AGENT_NAME: ${LIVEKIT_VOICE_AGENT_NAME:-batshit-livekit-agent}
+      LIVEKIT_AGENT_MODE: ${LIVEKIT_AGENT_MODE:-batshit-bridge}
+      LIVEKIT_AGENT_HEALTH_PORT: 7899
+      LIVEKIT_AGENT_BATSHIT_TOKEN: ${LIVEKIT_AGENT_BATSHIT_TOKEN:-${BATSHIT_TOKEN:?Set BATSHIT_TOKEN in .env.docker before starting Batshit}}
+      LIVEKIT_AGENT_BATSHIT_BASE_URL: ${LIVEKIT_AGENT_BATSHIT_BASE_URL:-http://app:3000}
+      BATSHIT_FRONTEND_URL: ${LIVEKIT_AGENT_BATSHIT_BASE_URL:-http://app:3000}
+    depends_on:
+      app:
+        condition: service_healthy
+      livekit:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:7899/worker').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  n8n:
+    profiles:
+      - n8n
+    image: ${N8N_BASE_IMAGE:-ghcr.io/n8n-io/n8n:2.22.1}
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-America/New_York}
+      TZ: ${TZ:-America/New_York}
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_SECURE_COOKIE: "false"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_RUNNERS_MODE: external
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:-${BATSHIT_TOKEN:?Set BATSHIT_TOKEN in .env.docker before starting Batshit}}
+      N8N_NATIVE_PYTHON_RUNNER: "true"
+      N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL:-http://localhost:5678}
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678/}
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/webhook}
+      BATSHIT_TOKEN: ${BATSHIT_TOKEN:?Set BATSHIT_TOKEN in .env.docker before starting Batshit}
+      BATSHIT_FRONTEND_URL: http://app:3000
+      PUBLIC_BASE_URL: http://app:3000
+    ports:
+      - "${BATSHIT_DOCKER_BIND_HOST:-127.0.0.1}:${BATSHIT_DOCKER_N8N_PORT:-5678}:5678"
+    volumes:
+      - batshit_n8n_data:/home/node/.n8n
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5678/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  n8n-runners:
+    profiles:
+      - n8n
+    image: ${N8N_RUNNERS_IMAGE:-ghcr.io/n8n-io/runners:2.22.1}
+    restart: unless-stopped
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-America/New_York}
+      TZ: ${TZ:-America/New_York}
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n:5679
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:-${BATSHIT_TOKEN:?Set BATSHIT_TOKEN in .env.docker before starting Batshit}}
+    depends_on:
+      n8n:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5680/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  batshit_redis_data:
+  batshit_server_sessions:
+  batshit_uploads:
+  batshit_workspace:
+  batshit_codex_home:
+  batshit_agent_runtime:
+  batshit_runtime_state:
+  batshit_fbx2vrma_work:
+  batshit_agent_browser_data:
+  batshit_agent_browser_cache:
+  batshit_comfyui_validation_data:
+  batshit_n8n_data:

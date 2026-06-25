@@ -1,0 +1,1 @@
+export { default as Sidebar_batshit } from './batshit-sidebar.svelte';

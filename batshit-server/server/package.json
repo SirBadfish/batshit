@@ -1,0 +1,57 @@
+{
+  "name": "batshit-server",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "description": "File, upload, and MCP helper server for Batshit",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "LOG_LEVEL=info node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "jest",
+    "mcp": "node src/mcp/index.js"
+  },
+  "dependencies": {
+    "@astral-sh/ruff-wasm-nodejs": "^0.15.9",
+    "@eslint/js": "^10.0.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@typescript-eslint/eslint-plugin": "^8.58.0",
+    "@typescript-eslint/parser": "^8.58.0",
+    "axios": "^1.16.1",
+    "cors": "^2.8.6",
+    "diff": "^8.0.4",
+    "dotenv": "^17.4.1",
+    "eslint": "^10.2.0",
+    "eslint-plugin-jsonc": "^3.1.2",
+    "express": "^5.2.1",
+    "fflate": "^0.8.2",
+    "glob": "^13.0.6",
+    "globals": "^17.4.0",
+    "helmet": "^8.1.0",
+    "htmlhint": "^1.9.2",
+    "jsonc-parser": "^3.3.1",
+    "markdownlint": "^0.40.0",
+    "minimatch": "^10.2.5",
+    "morgan": "^1.10.0",
+    "multer": "^2.1.1",
+    "nanoid": "^3.3.12",
+    "postcss-less": "^6.0.0",
+    "prettier": "^3.8.1",
+    "redis": "^5.11.0",
+    "selfsigned": "^5.5.0",
+    "sharp": "^0.34.5",
+    "stylelint": "^17.6.0",
+    "stylelint-config-standard": "^40.0.0",
+    "stylelint-config-standard-scss": "^17.0.0",
+    "supergateway": "^3.4.3",
+    "toml": "^4.1.1",
+    "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "nodemon": "^3.1.14"
+  },
+  "private": true
+}

@@ -1,0 +1,114 @@
+/* 
+ * Core CSS Fixes
+ * These are permanent fixes that apply regardless of theme
+ * Document WHY each fix exists so we know if it's still needed later
+ */
+
+/* Fix: Dropdown menus need explicit background in shadcn-svelte (June 2025) */
+[data-slot="dropdown-menu-content"] {
+  background-color: var(--dropdown-background, var(--popover));
+  border-color: var(--dropdown-border, var(--border));
+}
+
+/* Fix: Dialog overlays need proper backdrop */
+[data-slot="dialog-overlay"] {
+  background-color: var(--overlay-background, hsl(0 0% 0% / 0.8));
+}
+
+/* Add more permanent fixes here with documentation */
+
+/* ==========================================================================
+   Tool Result Renderer Styles (June 2025)
+   ========================================================================== */
+.tool-result-wrapper {
+  margin-top: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.tool-result-content {
+  animation: slideDown 200ms ease-out;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-0.5rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Fix: Buttons in Tailwind v4 + shadcn not getting proper background colors (June 2025) */
+/* The bg-primary class isn't applying the OKLCH color properly */
+[data-slot="button"].bg-primary {
+  background-color: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+}
+
+[data-slot="button"].bg-secondary {
+  background-color: var(--secondary) !important;
+  color: var(--secondary-foreground) !important;
+}
+
+[data-slot="button"].bg-destructive {
+  background-color: var(--destructive) !important;
+  color: var(--destructive-foreground) !important;
+}
+
+/* Fix: Ensure button shadows and borders are visible */
+[data-slot="button"].shadow-xs {
+  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05) !important;
+}
+
+[data-slot="button"].border {
+  border: 1px solid var(--border) !important;
+}
+
+/* 
+ * IMPORTANT: Button Nesting Fix Pattern (June 2025)
+ * 
+ * Problem: Cannot nest <Button> components inside dropdown/menu triggers
+ * Error: "node_invalid_placement_ssr: `<button>` cannot be a child of `<button>`"
+ * 
+ * Solution: Apply button styles directly to the trigger element instead
+ * 
+ * Example - WRONG:
+ * <DropdownMenu.Trigger>
+ *   <Button>Click me</Button>
+ * </DropdownMenu.Trigger>
+ * 
+ * Example - CORRECT:
+ * <DropdownMenu.Trigger class="button-styles-here">
+ *   Click me
+ * </DropdownMenu.Trigger>
+ * 
+ * Button styles to copy when needed:
+ * class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50"
+ * 
+ * Add variant-specific styles:
+ * - outline: "border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+ * - default: "bg-primary text-primary-foreground shadow hover:bg-primary/90"
+ * - ghost: "hover:bg-accent hover:text-accent-foreground"
+ * 
+ * Size classes:
+ * - sm: "h-8 px-3 py-1"
+ * - default: "h-9 px-4 py-2"
+ * - icon: "h-9 w-9"
+ */
+
+/* Header specific fixes */
+.header-button-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 2.25rem;
+  width: 2.25rem;
+  border-radius: var(--radius);
+  transition: background-color 150ms;
+}
+
+.header-button-icon:hover {
+  background-color: hsl(var(--accent));
+}

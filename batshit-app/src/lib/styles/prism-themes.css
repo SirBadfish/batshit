@@ -1,0 +1,167 @@
+.prism-theme-okaidia {
+  --prism-bg: #1f1f1b;
+  --prism-fg: #f8f8f2;
+  --prism-border: rgba(255, 255, 255, 0.08);
+  --prism-line-number: rgba(255, 255, 255, 0.6);
+  --prism-selection: rgba(255, 255, 255, 0.08);
+}
+
+.prism-theme-okaidia pre[class*="language-"],
+.prism-theme-okaidia code[class*="language-"] {
+  color: var(--prism-fg);
+  background: var(--prism-bg);
+}
+
+.prism-theme-okaidia .token.comment,
+.prism-theme-okaidia .token.prolog,
+.prism-theme-okaidia .token.doctype,
+.prism-theme-okaidia .token.cdata {
+  color: #8292a2;
+}
+
+.prism-theme-okaidia .token.punctuation {
+  color: #f8f8f2;
+}
+
+.prism-theme-okaidia .token.property,
+.prism-theme-okaidia .token.tag,
+.prism-theme-okaidia .token.constant,
+.prism-theme-okaidia .token.symbol,
+.prism-theme-okaidia .token.deleted {
+  color: #f92672;
+}
+
+.prism-theme-okaidia .token.boolean,
+.prism-theme-okaidia .token.number {
+  color: #ae81ff;
+}
+
+.prism-theme-okaidia .token.selector,
+.prism-theme-okaidia .token.attr-name,
+.prism-theme-okaidia .token.string,
+.prism-theme-okaidia .token.char,
+.prism-theme-okaidia .token.builtin,
+.prism-theme-okaidia .token.inserted {
+  color: #a6e22e;
+}
+
+.prism-theme-okaidia .token.operator,
+.prism-theme-okaidia .token.entity,
+.prism-theme-okaidia .token.url,
+.prism-theme-okaidia .language-css .token.string,
+.prism-theme-okaidia .style .token.string,
+.prism-theme-okaidia .token.variable {
+  color: #f8f8f2;
+}
+
+.prism-theme-okaidia .token.atrule,
+.prism-theme-okaidia .token.attr-value,
+.prism-theme-okaidia .token.function,
+.prism-theme-okaidia .token.class-name {
+  color: #e6db74;
+}
+
+.prism-theme-okaidia .token.keyword {
+  color: #66d9ef;
+}
+
+.prism-theme-okaidia .token.regex,
+.prism-theme-okaidia .token.important {
+  color: #fd971f;
+}
+
+.prism-theme-okaidia .token.important,
+.prism-theme-okaidia .token.bold {
+  font-weight: bold;
+}
+.prism-theme-okaidia .token.italic {
+  font-style: italic;
+}
+
+.prism-theme-okaidia .token.entity {
+  cursor: help;
+}
+
+.prism-theme-twilight {
+  --prism-bg: #0f0f0f;
+  --prism-fg: #f8f8f8;
+  --prism-border: rgba(255, 255, 255, 0.08);
+  --prism-line-number: rgba(255, 255, 255, 0.62);
+  --prism-selection: rgba(255, 255, 255, 0.08);
+}
+
+.prism-theme-twilight pre[class*="language-"],
+.prism-theme-twilight code[class*="language-"] {
+  color: var(--prism-fg);
+  background: var(--prism-bg);
+}
+
+.prism-theme-twilight .token.comment,
+.prism-theme-twilight .token.prolog,
+.prism-theme-twilight .token.doctype,
+.prism-theme-twilight .token.cdata {
+  color: #5f5a60;
+}
+
+.prism-theme-twilight .token.punctuation {
+  color: #f8f8f8;
+}
+
+.prism-theme-twilight .token.property,
+.prism-theme-twilight .token.tag,
+.prism-theme-twilight .token.constant,
+.prism-theme-twilight .token.symbol,
+.prism-theme-twilight .token.deleted {
+  color: #cf6a4c;
+}
+
+.prism-theme-twilight .token.boolean,
+.prism-theme-twilight .token.number {
+  color: #cda869;
+}
+
+.prism-theme-twilight .token.selector,
+.prism-theme-twilight .token.attr-name,
+.prism-theme-twilight .token.string,
+.prism-theme-twilight .token.char,
+.prism-theme-twilight .token.builtin,
+.prism-theme-twilight .token.inserted {
+  color: #8f9d6a;
+}
+
+.prism-theme-twilight .token.operator,
+.prism-theme-twilight .token.entity,
+.prism-theme-twilight .token.url,
+.prism-theme-twilight .language-css .token.string,
+.prism-theme-twilight .style .token.string,
+.prism-theme-twilight .token.variable {
+  color: #f8f8f8;
+}
+
+.prism-theme-twilight .token.atrule,
+.prism-theme-twilight .token.attr-value,
+.prism-theme-twilight .token.function,
+.prism-theme-twilight .token.class-name {
+  color: #f9ee98;
+}
+
+.prism-theme-twilight .token.keyword {
+  color: #cda869;
+}
+
+.prism-theme-twilight .token.regex,
+.prism-theme-twilight .token.important {
+  color: #e9c062;
+}
+
+.prism-theme-twilight .token.important,
+.prism-theme-twilight .token.bold {
+  font-weight: bold;
+}
+.prism-theme-twilight .token.italic {
+  font-style: italic;
+}
+
+.prism-theme-twilight .token.entity {
+  cursor: help;
+}

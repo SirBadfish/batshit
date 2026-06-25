@@ -1,0 +1,43 @@
+// Add this to your existing hooks.server.ts file
+
+import { gatewayManager } from '$lib/server/services/dockerGatewayManager';
+import { redis } from '$lib/server/redis';
+
+// Initialize Docker Gateway Manager on server startup
+async function initializeDockerGateway() {
+  console.log('🐳 Initializing Docker MCP Gateway Manager...');
+
+  // Load default user settings (or implement multi-user later)
+  const settings = await redis.json.get('user:default:settings:docker-mcp') ?? {
+    autoStart: false,
+    port: 8080
+  };
+
+  // Initialize the gateway manager
+  await gatewayManager.initialize(settings);
+
+  if (settings.autoStart) {
+    console.log('🚀 Auto-starting Docker MCP Gateway...');
+    const started = await gatewayManager.startGatewayIfNeeded();
+    if (started) {
+      console.log('✅ Docker MCP Gateway started successfully');
+    } else {
+      console.log('⚠️ Could not start Docker MCP Gateway - Docker Desktop may not be running');
+    }
+  }
+}
+
+// Call this in your app initialization
+initializeDockerGateway().catch(console.error);
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Shutting down Docker MCP Gateway...');
+  gatewayManager.stopGateway();
+});
+
+process.on('SIGINT', () => {
+  console.log('Shutting down Docker MCP Gateway...');
+  gatewayManager.stopGateway();
+  process.exit(0);
+});

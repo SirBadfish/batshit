@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "bundles": [
+    {
+      "id": "voice-engine-installer",
+      "sourceSkillRoot": "batshit-app/src/lib/server/system-skills/speech-setup",
+      "portableRoot": "batshit-portable-skills/voice-engine-installer",
+      "sharedReferences": [
+        "references/chatterbox-turbo.md",
+        "references/dots-tts-soar-mlx.md",
+        "references/expression-contract.md",
+        "references/failure-handling.md",
+        "references/fish-speech-s2.md",
+        "references/kyutai-local-tts.md",
+        "references/local-self-hosted-engines.md",
+        "references/local-stt-readiness.md",
+        "references/mlx-audio-apple-silicon.md",
+        "references/nemotron-asr-mlx.md",
+        "references/open-source-engine-research.md",
+        "references/openai-compatible-adapter.md",
+        "references/registration-patterns.md",
+        "references/runtime-preflight.md"
+      ]
+    },
+    {
+      "id": "artifact-creator",
+      "sourceSkillRoot": "batshit-app/src/lib/server/system-skills/artifacts",
+      "portableRoot": "batshit-portable-skills/artifact-creator",
+      "sharedReferences": [
+        "references/brain-comfyui.md",
+        "references/brain-general.md",
+        "references/brain-huggingface.md",
+        "references/brain-n8n.md",
+        "references/builder-kit-api.md",
+        "references/embed-gradio.md",
+        "references/fabric-and-agent-use.md",
+        "references/templates-gallery.md",
+        "references/zone-patterns.md"
+      ]
+    },
+    {
+      "id": "cli-tool-creator",
+      "sourceSkillRoot": "batshit-app/src/lib/server/system-skills/cli-tools",
+      "portableRoot": "batshit-portable-skills/cli-tool-creator",
+      "sharedReferences": []
+    },
+    {
+      "id": "skill-creator",
+      "sourceSkillRoot": "batshit-app/src/lib/server/system-skills/skill-creator",
+      "portableRoot": "batshit-portable-skills/skill-creator",
+      "sharedReferences": [
+        "references/writing-for-llms.md"
+      ]
+    }
+  ]
+}

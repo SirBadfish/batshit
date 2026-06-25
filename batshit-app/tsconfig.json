@@ -1,0 +1,47 @@
+{
+	"extends": "./.svelte-kit/tsconfig.json",
+	"compilerOptions": {
+		// === JavaScript Support ===
+		"allowJs": true,
+		"checkJs": true,
+
+		// === Strict Type Checking (Professional Standards) ===
+		"strict": true,
+		"noUnusedLocals": false, // Can be noisy in Svelte with $state - disabled
+		"noUnusedParameters": false, // Can be noisy with event handlers - disabled
+		"noImplicitReturns": false, // Svelte components don't always return - disabled
+		"noFallthroughCasesInSwitch": true,
+
+		// === Module Resolution ===
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"moduleResolution": "bundler",
+
+		// === Other Settings ===
+		"skipLibCheck": true,
+		"sourceMap": true
+	},
+	// Exclude test files from type checking (focus on production code)
+	"exclude": [
+		"node_modules/**",
+		"src/service-worker.js",
+		"src/service-worker/**/*.js",
+		"src/service-worker.ts",
+		"src/service-worker/**/*.ts",
+		"src/service-worker.d.ts",
+		"src/service-worker/**/*.d.ts",
+		"**/*.test.ts",
+		"**/*.test.js",
+		"**/*.spec.ts",
+		"**/*.spec.js",
+		"**/*IntegrationTest.ts",
+		"**/__tests__/**",
+		"tests/**"
+	]
+	// Path aliases are handled by https://svelte.dev/docs/kit/configuration#alias
+	// except $lib which is handled by https://svelte.dev/docs/kit/configuration#files
+	//
+	// If you want to overwrite includes/excludes, make sure to copy over the relevant includes/excludes
+	// from the referenced tsconfig.json - TypeScript does not merge them in
+}

@@ -1,0 +1,78 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: "npm"
+    directory: "/batshit-app"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:30"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "batshit-app"
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: "npm"
+    directory: "/batshit-server/server"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "11:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "batshit-server"
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: "npm"
+    directory: "/batshit-mac"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "12:30"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "mac-app"
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: "npm"
+    directory: "/batshit-mac/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "13:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "mac-app"
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: "npm"
+    directory: "/tools/livekit-agent-sidecar"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "13:30"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "voice-runtime"
+    open-pull-requests-limit: 2

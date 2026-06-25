@@ -1,0 +1,36 @@
+diff --git a/node_modules/@sveltejs/adapter-vercel/index.js b/node_modules/@sveltejs/adapter-vercel/index.js
+index d6213e5..173edfe 100644
+--- a/node_modules/@sveltejs/adapter-vercel/index.js
++++ b/node_modules/@sveltejs/adapter-vercel/index.js
+@@ -707,8 +707,7 @@ function static_vercel_config(builder, config, dir) {
+ async function create_function_bundle(builder, entry, dir, config) {
+ 	fs.rmSync(dir, { force: true, recursive: true });
+ 
+-	let base = entry;
+-	while (base !== (base = path.dirname(base)));
++	const base = `${process.cwd()}${path.sep}`;
+ 
+ 	const traced = await nodeFileTrace([entry], { base });
+ 
+@@ -770,10 +769,10 @@ async function create_function_bundle(builder, entry, dir, config) {
+ 		}
+ 	}
+ 
+-	const ancestor = base + common_parts.join(path.sep);
++	const ancestor = common_parts.length ? path.join(base, ...common_parts) : base;
+ 
+ 	for (const file of traced.fileList) {
+-		const source = base + file;
++		const source = path.join(base, file);
+ 		const dest = path.join(dir, path.relative(ancestor, source));
+ 
+ 		const stats = fs.statSync(source);
+@@ -803,7 +802,7 @@ async function create_function_bundle(builder, entry, dir, config) {
+ 				regions: config.regions,
+ 				memory: config.memory,
+ 				maxDuration: config.maxDuration,
+-				handler: path.relative(base + ancestor, entry),
++				handler: path.relative(ancestor, entry),
+ 				launcherType: 'Nodejs',
+ 				experimentalResponseStreaming: !config.isr,
+ 				framework: {

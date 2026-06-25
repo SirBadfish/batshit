@@ -1,0 +1,596 @@
+{
+  "openai": {
+    "displayName": "OpenAI",
+    "n8nNode": "lmChatOpenAi",
+    "models": {
+      "dynamic": true,
+      "endpoint": "/v1/models",
+      "defaults": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-3.5-turbo"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxTokens": {
+        "min": -1,
+        "max": 32768,
+        "default": -1
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.1
+      },
+      "frequencyPenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "presencePenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "responseFormat": {
+        "options": [
+          "text",
+          "json_object"
+        ],
+        "default": "text"
+      },
+      "reasoningEffort": {
+        "options": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium",
+        "showFor": [
+          "o1",
+          "o3"
+        ]
+      },
+      "seed": {
+        "type": "integer",
+        "optional": true
+      },
+      "stopSequences": {
+        "type": "array",
+        "optional": true
+      }
+    },
+    "credentials": "openAiApi",
+    "supportsBaseURL": true
+  },
+  "anthropic": {
+    "displayName": "Anthropic",
+    "n8nNode": "lmChatAnthropic",
+    "models": {
+      "static": [
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-opus-20240229",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 1,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxTokens": {
+        "min": 1,
+        "max": 200000,
+        "default": 4096
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.1
+      },
+      "topK": {
+        "min": 1,
+        "max": 500,
+        "default": 5
+      }
+    },
+    "credentials": "anthropicApi",
+    "supportsBaseURL": false
+  },
+  "google": {
+    "displayName": "Google Gemini",
+    "n8nNode": "lmChatGoogleGemini",
+    "models": {
+      "static": [
+        "gemini-1.5-pro",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.0-pro"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxOutputTokens": {
+        "min": 1,
+        "max": 8192,
+        "default": 2048
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 0.95,
+        "step": 0.01
+      },
+      "topK": {
+        "min": 1,
+        "max": 40,
+        "default": 40
+      },
+      "safetySettings": {
+        "categories": [
+          "HARM_CATEGORY_HARASSMENT",
+          "HARM_CATEGORY_HATE_SPEECH",
+          "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+          "HARM_CATEGORY_DANGEROUS_CONTENT"
+        ],
+        "thresholds": [
+          "BLOCK_NONE",
+          "BLOCK_ONLY_HIGH",
+          "BLOCK_MEDIUM_AND_ABOVE",
+          "BLOCK_LOW_AND_ABOVE"
+        ],
+        "default": "BLOCK_MEDIUM_AND_ABOVE"
+      }
+    },
+    "credentials": "googlePalmApi"
+  },
+  "ollama": {
+    "displayName": "Ollama",
+    "n8nNode": "lmChatOllama",
+    "models": {
+      "dynamic": true,
+      "endpoint": "/api/zips",
+      "defaults": [
+        "llama3:70b",
+        "mixtral:8x7b",
+        "phi3",
+        "gemma2"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxTokens": {
+        "min": -1,
+        "max": 128000,
+        "default": -1
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.1
+      },
+      "topK": {
+        "min": 1,
+        "max": 100,
+        "default": 40
+      },
+      "mirostat": {
+        "type": "boolean",
+        "default": false
+      },
+      "mirostatEta": {
+        "min": 0,
+        "max": 1,
+        "default": 0.1,
+        "step": 0.01
+      },
+      "mirostatTau": {
+        "min": 0,
+        "max": 10,
+        "default": 5,
+        "step": 0.1
+      },
+      "numCtx": {
+        "min": 1,
+        "max": 128000,
+        "default": 2048
+      },
+      "repeatPenalty": {
+        "min": 0,
+        "max": 2,
+        "default": 1.1,
+        "step": 0.1
+      },
+      "seed": {
+        "type": "integer",
+        "optional": true
+      },
+      "stopSequences": {
+        "type": "array",
+        "optional": true
+      }
+    },
+    "credentials": "ollamaApi",
+    "supportsBaseURL": true,
+    "defaultBaseURL": "http://localhost:11434"
+  },
+  "groq": {
+    "displayName": "Groq",
+    "n8nNode": "lmChatGroq",
+    "models": {
+      "static": [
+        "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it",
+        "gemma-7b-it"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxTokens": {
+        "min": 1,
+        "max": 32768,
+        "default": 2048
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.1
+      },
+      "frequencyPenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "presencePenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "stopSequences": {
+        "type": "array",
+        "optional": true
+      }
+    },
+    "credentials": "groqApi",
+    "baseURL": "https://api.groq.com/openai/v1"
+  },
+  "mistral": {
+    "displayName": "Mistral AI",
+    "n8nNode": "lmChatMistralCloud",
+    "models": {
+      "static": [
+        "mistral-large-latest",
+        "mistral-large-2411",
+        "mistral-large-2407",
+        "mistral-medium-latest",
+        "mistral-small-latest",
+        "mistral-tiny-latest",
+        "open-mistral-7b",
+        "open-mixtral-8x7b",
+        "open-mixtral-8x22b"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 1,
+        "default": 0.7,
+        "step": 0.01
+      },
+      "maxTokens": {
+        "min": 1,
+        "max": 32768,
+        "default": 2048
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.01
+      },
+      "randomSeed": {
+        "type": "integer",
+        "optional": true
+      },
+      "safePrompt": {
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "credentials": "mistralCloudApi"
+  },
+  "azure": {
+    "displayName": "Azure OpenAI",
+    "n8nNode": "lmChatAzureOpenAi",
+    "models": {
+      "manual": true,
+      "description": "Enter your Azure OpenAI deployment name"
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxTokens": {
+        "min": -1,
+        "max": 32768,
+        "default": -1
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.1
+      },
+      "frequencyPenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "presencePenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "responseFormat": {
+        "options": [
+          "text",
+          "json_object"
+        ],
+        "default": "text"
+      }
+    },
+    "credentials": "azureOpenAiApi",
+    "requiresDeploymentName": true
+  },
+  "bedrock": {
+    "displayName": "AWS Bedrock",
+    "n8nNode": "lmChatAwsBedrock",
+    "models": {
+      "static": [
+        "amazon.titan-text-premier-v1:0",
+        "amazon.titan-text-express-v1",
+        "amazon.titan-text-lite-v1",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "anthropic.claude-3-opus-20240229-v1:0",
+        "anthropic.claude-3-sonnet-20240229-v1:0",
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "anthropic.claude-v2:1",
+        "anthropic.claude-v2",
+        "anthropic.claude-instant-v1",
+        "meta.llama3-1-405b-instruct-v1:0",
+        "meta.llama3-1-70b-instruct-v1:0",
+        "meta.llama3-1-8b-instruct-v1:0",
+        "meta.llama3-70b-instruct-v1:0",
+        "meta.llama3-8b-instruct-v1:0",
+        "meta.llama2-70b-chat-v1",
+        "meta.llama2-13b-chat-v1",
+        "mistral.mistral-large-2407-v1:0",
+        "mistral.mistral-large-2402-v1:0",
+        "mistral.mistral-small-2402-v1:0",
+        "mistral.mixtral-8x7b-instruct-v0:1",
+        "mistral.mistral-7b-instruct-v0:2"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 1,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxTokens": {
+        "min": 1,
+        "max": 200000,
+        "default": 2048
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.1
+      }
+    },
+    "credentials": "aws",
+    "region": "us-east-1"
+  },
+  "vertex": {
+    "displayName": "Google Vertex AI",
+    "n8nNode": "lmChatGoogleVertex",
+    "models": {
+      "static": [
+        "gemini-1.5-pro-002",
+        "gemini-1.5-pro-001",
+        "gemini-1.5-flash-002",
+        "gemini-1.5-flash-001",
+        "gemini-1.0-pro-002",
+        "gemini-1.0-pro-001"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 0.7,
+        "step": 0.1
+      },
+      "maxOutputTokens": {
+        "min": 1,
+        "max": 8192,
+        "default": 2048
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 0.95,
+        "step": 0.01
+      },
+      "topK": {
+        "min": 1,
+        "max": 40,
+        "default": 40
+      }
+    },
+    "credentials": "googleVertexAiOAuth2Api",
+    "requiresProjectId": true,
+    "requiresRegion": true
+  },
+  "deepseek": {
+    "displayName": "DeepSeek",
+    "n8nNode": "lmChatDeepSeek",
+    "models": {
+      "static": [
+        "deepseek-chat",
+        "deepseek-coder"
+      ]
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 1,
+        "step": 0.1
+      },
+      "maxTokens": {
+        "min": 1,
+        "max": 4096,
+        "default": 2048
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.1
+      },
+      "frequencyPenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "presencePenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.1
+      },
+      "stopSequences": {
+        "type": "array",
+        "optional": true
+      }
+    },
+    "credentials": "deepSeekApi",
+    "supportsBaseURL": false
+  },
+  "openrouter": {
+    "displayName": "OpenRouter",
+    "n8nNode": "lmChatOpenRouter",
+    "models": {
+      "dynamic": true,
+      "endpoint": "/api/v1/models",
+      "description": "Access 100+ models through one API"
+    },
+    "settings": {
+      "temperature": {
+        "min": 0,
+        "max": 2,
+        "default": 1,
+        "step": 0.01
+      },
+      "maxTokens": {
+        "min": 1,
+        "max": 200000,
+        "default": 1024
+      },
+      "topP": {
+        "min": 0,
+        "max": 1,
+        "default": 1,
+        "step": 0.01
+      },
+      "topK": {
+        "min": 1,
+        "max": 500,
+        "default": 0
+      },
+      "frequencyPenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.01
+      },
+      "presencePenalty": {
+        "min": -2,
+        "max": 2,
+        "default": 0,
+        "step": 0.01
+      },
+      "repetitionPenalty": {
+        "min": 0,
+        "max": 2,
+        "default": 1,
+        "step": 0.01
+      },
+      "transformMessages": {
+        "type": "boolean",
+        "default": false
+      },
+      "modelProvider": {
+        "type": "select",
+        "options": [
+          "auto",
+          "specific"
+        ],
+        "default": "auto",
+        "description": "Route to specific provider or auto-select"
+      }
+    },
+    "credentials": "openRouterApi",
+    "supportsBaseURL": false,
+    "baseURL": "https://openrouter.ai/api/v1"
+  }
+}

@@ -1,0 +1,394 @@
+{
+  "id": "73e0a5f7-9783-40f2-9eb0-4b4f1f8e7ee4",
+  "name": "Batshit Docker n8n Workflow Subagent",
+  "nodes": [
+    {
+      "parameters": {
+        "numberInputs": 4,
+        "rules": {
+          "rule": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "01af26a1-ff4f-4464-acd2-963da22f9ed1",
+                    "leftValue": "={{ $json.body.subagentModel.provider }}",
+                    "rightValue": "openai",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "modelIndex": 2,
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "a07f19d2-4f4d-40f8-8d5f-f588f24dc5b2",
+                    "leftValue": "={{ $json.body.subagentModel.provider }}",
+                    "rightValue": "anthropic",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "modelIndex": 3,
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "69be3825-a7cf-4664-bfe1-405fb241fcfc",
+                    "leftValue": "={{ $json.body.subagentModel.provider }}",
+                    "rightValue": "vercel-gateway",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "modelIndex": 4,
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "03fac057-c040-4739-be97-10647b7f3cac",
+                    "leftValue": "={{ $json.body.subagentModel.provider }}",
+                    "rightValue": "openrouter",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.modelSelector",
+      "typeVersion": 1,
+      "position": [
+        32,
+        256
+      ],
+      "id": "696fa38f-e27b-43f9-953a-c3a2900b77a5",
+      "name": "Model Selector"
+    },
+    {
+      "parameters": {
+        "model": "={{ $json.body.subagentModel.model }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatVercelAiGateway",
+      "typeVersion": 1,
+      "position": [
+        160,
+        432
+      ],
+      "id": "11900648-a5af-4d03-ac6a-87c972cc6cc6",
+      "name": "Vercel"
+    },
+    {
+      "parameters": {
+        "model": "={{ $json.body.subagentModel.model }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenRouter",
+      "typeVersion": 1,
+      "position": [
+        272,
+        432
+      ],
+      "id": "503003f6-e6e4-4c6e-b306-eed646cbe21e",
+      "name": "OpenRouter"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "batshit_docker_n8n_workflow_subagent",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "dea75882-4e5b-446f-8283-2883598a9dc3",
+      "name": "Webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        560,
+        0
+      ],
+      "id": "14cf99d0-9cd2-4599-ae73-7d242715c9c5",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "={{ $json.body.subagentModel.model }}",
+          "mode": "id"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -64,
+        432
+      ],
+      "id": "19b12d3d-f953-4344-9e86-78af8c50d2e0",
+      "name": "OpenAI"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "={{ $json.body.subagentModel.model }}",
+          "mode": "id"
+        },
+        "options": {
+          "thinking": true
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        48,
+        432
+      ],
+      "id": "84ffd940-71f9-437b-a906-244cb6219874",
+      "name": "Anthropic"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.body.chatInput }}",
+        "options": {
+          "systemMessage": "={{ $json.body.subagentPrompts[$json.body.subagent_slug] }}"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3,
+      "position": [
+        208,
+        0
+      ],
+      "id": "7ed49304-6f2d-4ba6-a26e-32441687f0c8",
+      "name": "n8n Workflow Subagent"
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "This node gives you access to the Batshit native tool actions available to this subagent. Pick the action first, then send that action's payload in `input`.\n\nUse:\n- `native_skill` for Batshit Skills & Prompts\n- `batshit_tool_search` / `batshit_tool_use` for assigned MCP tools, saved CLI Tools, Agent Browser, and published Artifact Runtime Tools\n- `runtime_addon_list` / `runtime_addon_status` / `runtime_addon_prepare` / `runtime_addon_start` / `runtime_addon_stop` for runtime add-ons\n- `web_search` for Batshit web search\n- `bash_execute` for command execution\n\nImportant: only `native_skill` is the skill action. For `batshit_tool_use`, use the exact result reference returned by `batshit_tool_search`. `fetch_zip` is not available for subagent runs, and broad Fabric control-plane actions are Primary-Agent-only.",
+        "method": "POST",
+        "url": "={{ (($json.body.batshit_frontend_url || $json.body.batshitFrontendUrl || $env.BATSHIT_FRONTEND_URL || 'http://app:3000').replace(/\\/$/, '')) + '/api/native-tools/dispatch' }}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-batshit-user-id",
+              "value": "={{ String($json.body.user_id).toLowerCase() }}"
+            },
+            {
+              "name": "x-batshit-native-tool-token",
+              "value": "={{ $json.body.batshit_native_tool_token || $json.body.batshitNativeToolToken || $json.body.batshit_sse_callback_token || $json.body.batshitSseCallbackToken || '' }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  userId: String($json.body.user_id).toLowerCase(),\n  action: $fromAI('action', 'One Batshit native action to run: bash_execute, native_skill, batshit_tool_search, batshit_tool_use, web_search, runtime_addon_list, runtime_addon_status, runtime_addon_prepare, runtime_addon_start, or runtime_addon_stop. Do not use fetch_zip from subagent context.', 'string'),\n  input: $fromAI('input', 'JSON object payload for the selected action. Use an empty object when the action needs no payload.', 'json'),\n  context: {\n    session_id: $json.body.session_id,\n    message_id: $json.body.message_id || $json.body.messageId,\n    agent_id: $json.body.subagent_id,\n    primary_agent_type: 'n8n',\n    actor_type: 'subagent',\n    parent_agent_id: $json.body.parent_agent_id\n  }\n} }}",
+        "options": {
+          "timeout": 300000
+        },
+        "optimizeResponse": true,
+        "responseType": "json",
+        "fieldsToInclude": "all"
+      },
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.4,
+      "position": [
+        464,
+        256
+      ],
+      "id": "d3ffc341-8745-436d-9339-8ebf265998f4",
+      "name": "Batshit Subagent Tools"
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "=subagent_sessions:{{ $json.body.session_id }}:subagent:{{ $json.body.subagent_slug }}",
+        "contextWindowLength": 500
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
+      "typeVersion": 1.5,
+      "position": [
+        304,
+        256
+      ],
+      "id": "98e913fa-c269-44d6-ae49-39be4e60ba56",
+      "name": "Redis-Subagent"
+    }
+  ],
+  "connections": {
+    "Vercel": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Model Selector",
+            "type": "ai_languageModel",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "OpenRouter": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Model Selector",
+            "type": "ai_languageModel",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Model Selector": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "n8n Workflow Subagent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "n8n Workflow Subagent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Model Selector",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Model Selector",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "n8n Workflow Subagent": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batshit Subagent Tools": {
+      "ai_tool": [
+        [
+          {
+            "node": "n8n Workflow Subagent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Redis-Subagent": {
+      "ai_memory": [
+        [
+          {
+            "node": "n8n Workflow Subagent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  }
+}

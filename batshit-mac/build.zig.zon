@@ -1,0 +1,8 @@
+.{
+    .name = .batshit_mac,
+    .fingerprint = 0x3246c26d5a707070,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "frontend", "scripts", "app.zon", "README.md" },
+}

@@ -1,0 +1,118 @@
+/* 
+ * ShadCN Component Overrides
+ * These override default shadcn styles to work with our theming system
+ * Each override should reference theme variables, not hard-coded values
+ */
+
+/* Dropdown Menu Overrides */
+[data-slot="dropdown-menu-content"] {
+  /* Remove the hard-coded bg-gray-900 we added earlier */
+  background-color: var(--dropdown-background, var(--popover));
+  border-color: var(--dropdown-border, var(--border));
+  box-shadow: var(--dropdown-shadow, var(--shadow-lg));
+}
+
+/* Button Overrides for better theme integration */
+.btn, [data-slot="button"] {
+  border-radius: var(--button-radius, var(--radius));
+  transition-duration: var(--duration-normal);
+}
+
+/* Dialog Overrides */
+[data-slot="dialog-content"] {
+  border-radius: var(--dialog-radius, var(--radius-lg));
+  background-color: var(--dialog-background, var(--card));
+}
+
+
+/* Dialog Close Button - visible inside dialog chrome */
+[data-slot="dialog-close"] {
+  position: static;
+  background-color: var(--dialog-background, var(--card));
+  border-radius: 9999px;
+  padding: 0;
+  width: 2.25rem;
+  height: 2.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  box-shadow: 0 0 0 1px var(--border);
+  transition: all 150ms;
+  cursor: pointer;
+  z-index: auto;
+}
+
+/* Dialog Close Button Hover State */
+[data-slot="dialog-close"]:hover {
+  background-color: var(--accent);
+  color: var(--accent-foreground);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* Dialog Close Button Focus State (for accessibility) */
+[data-slot="dialog-close"]:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--border);
+}
+
+/* Sidebar Overrides */
+[data-slot="sidebar"] {
+  background-color: var(--sidebar-background);
+  border-color: var(--sidebar-border);
+}
+
+[data-sidebar="sidebar"] {
+  --sidebar-width: 260px;
+  --sidebar-width-mobile: 260px;
+}
+
+.sidebar-content {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Sidebar menu button styling */
+[data-sidebar="menu-button"] {
+  justify-content: flex-start;
+  width: 100%;
+  height: auto;
+  padding: 0.5rem;
+  position: relative;
+}
+
+[data-sidebar="menu-button"]:hover {
+  background-color: var(--sidebar-accent);
+}
+
+/* Active state for sidebar items */
+[data-sidebar="menu-button"][data-active="true"],
+[data-sidebar="menu-button"].bg-sidebar-accent {
+  background-color: var(--sidebar-accent);
+  font-weight: 500;
+}
+
+/* Session item more button - show on hover */
+[data-sidebar="menu-button"] .session-item-menu-trigger {
+  opacity: 0;
+  transition: opacity 150ms;
+}
+
+[data-sidebar="menu-button"]:hover .session-item-menu-trigger {
+  opacity: 1;
+}
+
+/* Input Overrides
+ * Keep generic form defaults layered so named Batshit field skins can win by specificity.
+ */
+@layer base {
+  input, textarea, select {
+    border-radius: var(--input-radius, var(--radius));
+    background-color: var(--input-background, transparent);
+    border-color: var(--input-border, var(--border));
+  }
+}
+
+/* Add component-specific overrides here */

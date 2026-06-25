@@ -1,0 +1,39 @@
+/*
+ * Base Theme Variables
+ * These are launch-wide layout, radius, animation, and z-index variables.
+ * Color tokens live in app.css, where Batshit's dark launch theme is the root theme.
+ */
+
+:root {
+  /* Core Layout */
+  --sidebar-width: 16rem;
+  --sidebar-width-icon: 3.5rem;
+  --sidebar-width-collapsed: 3rem;
+  --header-height: 3.5rem;
+  
+  /* Z-index Scale (consistent across all themes) */
+  --z-dropdown: 50;
+  --z-dialog: 100;
+  --z-modal: 200;
+  --z-tooltip: 300;
+  --z-notification: 400;
+  
+  /* Animation Durations */
+  --duration-fast: 150ms;
+  --duration-normal: 200ms;
+  --duration-slow: 300ms;
+  
+  /* Spacing Scale */
+  --spacing-xs: 0.25rem;
+  --spacing-sm: 0.5rem;
+  --spacing-md: 1rem;
+  --spacing-lg: 1.5rem;
+  --spacing-xl: 2rem;
+  
+  /* Border Radius Scale */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-full: 9999px;
+}

@@ -1,0 +1,2606 @@
+<script lang="ts">
+  import * as Sheet from '$lib/components/ui/sheet'
+  import * as Collapsible from '$lib/components/ui/collapsible'
+  import * as Switch from '$lib/components/ui/switch'
+  import { Button } from '$lib/components/ui/button'
+  import JSONViewer from '$lib/components/ui/JSONViewer.svelte'
+  import { Badge } from '$lib/components/ui/badge'
+  import { ChevronDown, RefreshCcw } from '@lucide/svelte'
+  import { getUserSettings } from '$lib/stores/userSettings.svelte'
+  import { approximateTokenCount } from '$lib/utils/tokenCounter'
+  import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+  import {
+    truncateExecutionViewerBase64,
+    truncateExecutionViewerBase64InValue
+  } from '$lib/utils/executionViewerBase64'
+  import {
+    buildExecutionToolActivityEntries,
+    type ExecutionToolActivityEntry,
+  } from './executionViewerToolActivity'
+  import type {
+    ExecutionAvailabilityLevel,
+    ExecutionFieldAvailability,
+    ExecutionRuntimeDetails,
+    ExecutionConfidenceLevel,
+    ExecutionLlmCall,
+    ExecutionTokenStat,
+    ExecutionTokenUsage,
+    ExecutionSnapshot
+  } from '$lib/types/executionViewer'
+
+  let {
+    open = $bindable(false),
+    sessionId
+  } = $props<{
+    open?: boolean
+    sessionId?: string | null
+  }>()
+
+  let loading = $state(false)
+  let error = $state<string | null>(null)
+  let snapshots = $state<ExecutionSnapshot[]>([])
+  let selectedId = $state<string | null>(null)
+  let truncateBase64 = $state(true)
+
+  const currentSnapshot = $derived(
+    (() => {
+      if (snapshots.length === 0) return null
+      if (selectedId) {
+        const match = snapshots.find((entry) => entry.id === selectedId)
+        if (match) return match
+      }
+      return snapshots[0]
+    })()
+  ) as ExecutionSnapshot | null
+
+  const formattedOptions = $derived(
+    (() => {
+      return snapshots.map((entry, index) => ({
+        id: entry.id,
+        label: `${formatTimestamp(entry.createdAt)} • ${entry.agentName || 'Agent'}${
+          entry.executionMetadata?.groupChat ? ' • Group Chat' : ''
+        }${index === 0 ? ' (latest)' : ''}`
+      }))
+    })()
+  ) as Array<{ id: string; label: string }>
+
+  const groupMeta = $derived.by<Record<string, any> | null>(() => {
+    const meta = currentSnapshot?.executionMetadata?.groupChat
+    return meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : null
+  })
+
+  const formatGroupTurnId = (id?: string | null) => {
+    if (!id || typeof id !== 'string') return null
+    return id.length > 10 ? `${id.slice(0, 8)}…` : id
+  }
+
+  const formatSpeakPolicy = (policy?: string | null) => {
+    if (!policy || typeof policy !== 'string') return null
+    return policy.replace(/_/g, ' ')
+  }
+
+  type ExecutionViewerModeKind = 'n8n' | 'vercel' | 'codex' | 'claude' | 'unknown'
+  type UsageDetailEntry = {
+    key: string
+    label: string
+    stat: ExecutionTokenStat | null
+    unavailableText: string
+  }
+
+  const runtimeDetails = $derived.by<ExecutionRuntimeDetails | null>(
+    () => currentSnapshot?.runtime ?? null
+  )
+  const modeKind = $derived.by<ExecutionViewerModeKind>(() => {
+    const primaryAgentType = normalizePrimaryAgentType(undefined, currentSnapshot?.agentType)
+    if (primaryAgentType === 'n8n') return 'n8n'
+    if (runtimeDetails?.runtimeId === 'codex') return 'codex'
+    if (runtimeDetails?.runtimeId === 'claude') return 'claude'
+    if (primaryAgentType === 'api') return 'vercel'
+    return 'unknown'
+  })
+  const runtimeMetadata = $derived.by<Record<string, any> | null>(() => {
+    const metadata = runtimeDetails?.metadata
+    return metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : null
+  })
+  const runtimeMode4Style = $derived.by<string | null>(() => {
+    const value = runtimeMetadata?.mode4Style
+    return typeof value === 'string' && value.trim().length > 0 ? value : null
+  })
+  const runtimeMode4MemoryOwner = $derived.by<string | null>(() => {
+    const value = runtimeMetadata?.mode4MemoryOwner
+    return typeof value === 'string' && value.trim().length > 0 ? value : null
+  })
+  const runtimeProviderSession = $derived.by<Record<string, any> | null>(() => {
+    const value = runtimeMetadata?.providerSession
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null
+  })
+  const runtimeProviderSessionConfigScope = $derived.by<string | null>(() => {
+    const value = runtimeProviderSession?.configScope
+    return typeof value === 'string' && value.trim().length > 0 ? value : null
+  })
+  const runtimeProviderSessionHistoryPersistence = $derived.by<string | null>(() => {
+    const value = runtimeProviderSession?.historyPersistence
+    return typeof value === 'string' && value.trim().length > 0 ? value : null
+  })
+  const runtimeProviderSessionId = $derived.by<string | null>(() => {
+    const value = runtimeProviderSession?.sessionId
+    return typeof value === 'string' && value.trim().length > 0 ? value : null
+  })
+  const hasRuntimeMode4Details = $derived.by<boolean>(
+    () =>
+      Boolean(runtimeMode4Style) ||
+      Boolean(runtimeMode4MemoryOwner) ||
+      Boolean(runtimeProviderSessionConfigScope) ||
+      Boolean(runtimeProviderSessionHistoryPersistence) ||
+      Boolean(runtimeProviderSessionId)
+  )
+
+  const llmSummary = $derived(currentSnapshot?.llmSummary ?? null)
+  const snapshotLlmCalls = $derived(currentSnapshot?.llmCalls ?? null)
+  const snapshotIntermediateSteps = $derived(
+    Array.isArray(currentSnapshot?.intermediateSteps) ? currentSnapshot?.intermediateSteps : null,
+  )
+  const responseSummary = $derived(currentSnapshot?.responseSummary ?? null)
+  const webhookInputAvailability = $derived.by<ExecutionFieldAvailability | null>(() => {
+    const explicit = currentSnapshot?.webhookInputAvailability
+    if (explicit && typeof explicit === 'object') {
+      return explicit
+    }
+    if (currentSnapshot?.agentType !== 'n8n') {
+      return null
+    }
+    if (Array.isArray(currentSnapshot?.webhookStyleInput) && currentSnapshot.webhookStyleInput.length > 0) {
+      return {
+        state: 'unavailable',
+        source: 'batshit-webhook-wrapper',
+        note:
+          'Exact webhook input is not loaded yet. Use Refresh to replace this stored wrapper with the exact n8n Webhook node output when the matching execution is available.'
+      }
+    }
+    return {
+      state: 'unavailable',
+      source: 'execution-viewer',
+      note: 'No webhook payload was captured for this n8n run.'
+    }
+  })
+
+  let selectedCallIndex = $state<number | null>(null)
+  let selectedToolActivityIndex = $state<number | null>(null)
+
+	  const rawSnapshotRequest = $derived.by(() => {
+	    const snapshot = currentSnapshot
+	    if (!snapshot) return null
+
+	    const {
+	      llmSummary: _llmSummary,
+	      llmCalls: _llmCalls,
+	      intermediateSteps: _intermediateSteps,
+	      responseSummary: _responseSummary,
+	      runtime: runtimeRaw,
+	      ...rest
+	    } = snapshot
+
+	    const runtime =
+	      runtimeRaw && typeof runtimeRaw === 'object' && !Array.isArray(runtimeRaw)
+	        ? { ...runtimeRaw, eventLog: undefined }
+	        : runtimeRaw
+
+	    return {
+	      ...rest,
+	      ...(runtime ? { runtime } : {})
+	    }
+	  })
+
+	  const rawProviderResponses = $derived.by(() => {
+	    const calls = Array.isArray(currentSnapshot?.llmCalls) ? currentSnapshot!.llmCalls : null
+	    if (!calls) return null
+
+	    const entries = calls
+	      .map((call) => {
+	        const raw = (call as any)?.rawResponsePayload
+	        if (!raw) return null
+	        return { call: call.index, response: raw }
+	      })
+	      .filter((entry): entry is { call: number; response: any } => Boolean(entry))
+
+	    return entries.length > 0 ? entries : null
+	  })
+
+	  const compiledMessagesForDisplay = $derived.by<any[]>(() => {
+	    const raw = currentSnapshot?.compiledMessages
+	    if (!Array.isArray(raw)) return []
+
+	    return raw.filter((msg) => {
+	      const roleRaw = msg?.role
+	      const role = typeof roleRaw === 'string' ? roleRaw.toLowerCase() : ''
+	      return role !== 'system' && role !== 'developer'
+	    })
+	  })
+
+		  let n8nToolDefinitions = $state<Record<string, any[]>>({})
+		  let n8nToolLoading = $state(false)
+		  let n8nToolError = $state<string | null>(null)
+
+		  const userSettings = $derived(getUserSettings())
+		  const n8nExecutionSearchLimit = $derived.by<number>(() => {
+		    const raw = (userSettings as any)?.admin_settings?.n8n_execution_search_limit
+		    const parsed =
+		      typeof raw === 'number'
+		        ? raw
+		        : typeof raw === 'string'
+		          ? Number.parseInt(raw, 10)
+		          : NaN
+
+		    const fallback = 60
+		    const resolved = Number.isFinite(parsed) ? parsed : fallback
+		    return Math.max(1, Math.min(250, Math.trunc(resolved)))
+		  })
+		  let n8nWebhookHydrationLoading = $state(false)
+		  let n8nWebhookHydrationError = $state<string | null>(null)
+		  let n8nWebhookHydrationAttempted = $state<Record<string, true>>({})
+
+	  function emptyTokenUsage(
+	    confidence: ExecutionConfidenceLevel,
+	    source?: string
+	  ): ExecutionTokenUsage {
+	    const tokenStat = (value: number | null): ExecutionTokenStat => ({
+	      value,
+	      confidence,
+	      ...(source ? { source } : {})
+	    })
+
+	    return {
+	      inputTokens: tokenStat(null),
+	      outputTokens: tokenStat(null),
+	      totalTokens: tokenStat(null)
+	    }
+	  }
+
+	  function formatCompiledMessagesPlainText(messages: any[]): string {
+	    const roleLabel = (role: unknown, msg: any): string => {
+	      const normalized = typeof role === 'string' ? role.toLowerCase() : ''
+	      if (normalized === 'user') return 'User'
+	      if (normalized === 'assistant') return 'Assistant'
+	      if (normalized === 'tool') {
+	        const toolName =
+	          (typeof msg?.name === 'string' ? msg.name : null) ||
+	          (typeof msg?.toolName === 'string' ? msg.toolName : null) ||
+	          null
+	        return toolName ? `Tool (${toolName})` : 'Tool'
+	      }
+
+	      if (typeof role === 'string' && role.trim().length > 0) {
+	        return role.trim().replace(/^\w/, (ch) => ch.toUpperCase())
+	      }
+
+	      return 'Message'
+	    }
+
+	    const partToText = (part: any): string => {
+	      if (part == null) return ''
+	      if (typeof part === 'string') return part
+	      if (typeof part === 'number' || typeof part === 'boolean') return String(part)
+
+	      if (typeof part === 'object') {
+	        const text =
+	          typeof part.text === 'string'
+	            ? part.text
+	            : typeof part.content === 'string'
+	              ? part.content
+	              : null
+	        if (text !== null) return text
+
+	        const imageUrl =
+	          part?.image_url?.url ?? part?.image_url ?? part?.image ?? part?.url ?? null
+	        if (typeof imageUrl === 'string' && imageUrl.trim().length > 0) {
+	          return `[image: ${imageUrl}]`
+	        }
+
+	        if (typeof part.type === 'string' && part.type.trim().length > 0) {
+	          return `[${part.type}]`
+	        }
+
+	        try {
+	          return JSON.stringify(part, null, 2)
+	        } catch {
+	          return String(part)
+	        }
+	      }
+
+	      return String(part)
+	    }
+
+	    const contentToText = (content: any): string => {
+	      if (content == null) return ''
+	      if (typeof content === 'string') return content
+	      if (Array.isArray(content)) {
+	        return content
+	          .map(partToText)
+	          .filter((entry) => entry.trim().length > 0)
+	          .join('')
+	      }
+
+	      return partToText(content)
+	    }
+
+	    const blocks = (Array.isArray(messages) ? messages : [])
+	      .map((msg) => {
+	        const label = roleLabel(msg?.role, msg)
+	        const body = contentToText(msg?.content)
+	        return `${label}:\n${body}`.trimEnd()
+	      })
+	      .filter((block) => block.trim().length > 0)
+
+	    return blocks.join('\n\n')
+	  }
+
+	  const compiledMessagesPlainText = $derived.by(() =>
+	    formatCompiledMessagesPlainText(compiledMessagesForDisplay)
+	  )
+
+	  const toolActivityEntries = $derived.by<ExecutionToolActivityEntry[]>(() =>
+	    buildExecutionToolActivityEntries({
+        steps: snapshotIntermediateSteps,
+        llmCalls: snapshotLlmCalls,
+      })
+	  )
+
+	  const toolCallsCountFromSummary = $derived.by<number | null>(() => {
+	    const value = responseSummary?.toolCallsCount?.value
+	    return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : null
+	  })
+
+	  const toolActivityUnavailableNote = $derived.by<string | null>(() => {
+	    if (toolActivityEntries.length > 0) return null
+
+	    if (typeof toolCallsCountFromSummary === 'number' && toolCallsCountFromSummary > 0) {
+	      if (modeKind === 'n8n') {
+	        return `n8n reported ${toolCallsCountFromSummary} tool call${
+	          toolCallsCountFromSummary === 1 ? '' : 's'
+	        }, but no intermediateSteps were captured for this run.`
+	      }
+
+	      return `This run reported ${toolCallsCountFromSummary} tool call${
+	        toolCallsCountFromSummary === 1 ? '' : 's'
+	      }, but no per-tool payloads were captured for the viewer.`
+	    }
+
+	    return null
+	  })
+
+		  const effectiveLlmCalls = $derived.by<ExecutionLlmCall[] | null>(() => {
+	    const calls = Array.isArray(snapshotLlmCalls) ? snapshotLlmCalls : null
+	    const isNoteOnlyN8n =
+	      currentSnapshot?.agentType === 'n8n' &&
+	      calls?.length === 1 &&
+	      calls[0]?.requestPayload &&
+	      typeof calls[0].requestPayload === 'object' &&
+	      'note' in calls[0].requestPayload &&
+	      Object.keys(calls[0].requestPayload).length === 1
+
+	    if (calls && calls.length > 0 && !isNoteOnlyN8n) {
+	      if (currentSnapshot?.agentType === 'n8n') {
+	        const toolsForSnapshot = n8nToolDefinitions[currentSnapshot.id] ?? null
+	        if (Array.isArray(toolsForSnapshot) && toolsForSnapshot.length > 0) {
+	          return calls.map((call) => {
+	            const requestPayload = call?.requestPayload
+	            if (
+	              requestPayload &&
+	              typeof requestPayload === 'object' &&
+	              !Array.isArray(requestPayload) &&
+	              'tools' in requestPayload
+	            ) {
+	              return call
+	            }
+
+	            const basePayload =
+	              requestPayload && typeof requestPayload === 'object' && !Array.isArray(requestPayload)
+	                ? requestPayload
+	                : {
+	                    systemPrompt: currentSnapshot.primarySystemPrompt ?? null,
+	                    messages: currentSnapshot.compiledMessages ?? null
+	                  }
+
+	            return {
+	              ...call,
+	              requestPayload: { ...basePayload, tools: toolsForSnapshot }
+	            }
+	          })
+	        }
+	      }
+
+	      return calls
+	    }
+
+		    if (currentSnapshot?.agentType !== 'n8n') {
+		      return null
+		    }
+
+		    const usage = llmSummary?.totalUsage ?? emptyTokenUsage('speculative', 'n8n')
+		    const toolsForSnapshot = n8nToolDefinitions[currentSnapshot.id] ?? null
+		    const hasSystemPrompt = typeof currentSnapshot.primarySystemPrompt === 'string'
+		    const hasMessages = Array.isArray(currentSnapshot.compiledMessages)
+
+		    const requestConfidence: ExecutionConfidenceLevel =
+		      hasMessages && hasSystemPrompt ? 'near' : toolsForSnapshot ? 'near' : 'estimated'
+
+		    const requestPayload: Record<string, any> = {
+		      systemPrompt: currentSnapshot.primarySystemPrompt ?? null,
+		      messages: currentSnapshot.compiledMessages ?? null,
+		      ...(Array.isArray(toolsForSnapshot) ? { tools: toolsForSnapshot } : {})
+		    }
+
+		    const notes = [
+		      'This is a best-effort reconstruction for n8n runs; Batshit cannot capture the exact provider payload byte-for-byte.',
+		      'Tools attached directly to n8n nodes may be missing from the tool list.'
+		    ]
+
+		    const responseText =
+		      typeof responseSummary?.content?.value === 'string' ? responseSummary.content.value : null
+		    const estimatedUsage = (() => {
+		      try {
+		        const inputTokens = approximateTokenCount(JSON.stringify(requestPayload))
+		        const outputTokens = responseText ? approximateTokenCount(responseText) : null
+		        const totalTokens = typeof outputTokens === 'number' ? inputTokens + outputTokens : null
+		        const outputConfidence = typeof outputTokens === 'number' ? 'estimated' : 'speculative'
+		        const totalConfidence = typeof totalTokens === 'number' ? 'estimated' : 'speculative'
+
+		        return {
+		          inputTokens: { value: inputTokens, confidence: 'estimated', source: 'batshit' },
+		          outputTokens: { value: outputTokens, confidence: outputConfidence, source: 'batshit' },
+		          totalTokens: { value: totalTokens, confidence: totalConfidence, source: 'batshit' }
+		        } satisfies ExecutionTokenUsage
+		      } catch {
+		        return emptyTokenUsage('speculative', 'batshit')
+		      }
+		    })()
+
+		    const callsCountFromSummary =
+		      typeof llmSummary?.callsCount?.value === 'number' &&
+		      Number.isFinite(llmSummary.callsCount.value)
+		        ? Math.max(1, Math.trunc(llmSummary.callsCount.value))
+		        : null
+
+		    const toolCallsCount =
+		      typeof responseSummary?.toolCallsCount?.value === 'number' &&
+		      Number.isFinite(responseSummary.toolCallsCount.value)
+		        ? Math.max(0, Math.trunc(responseSummary.toolCallsCount.value))
+		        : null
+
+		    const inferredCallsCount =
+		      typeof toolCallsCount === 'number' && toolCallsCount > 0 ? toolCallsCount + 1 : 1
+
+		    const callsCount = callsCountFromSummary ?? inferredCallsCount
+
+		    const perCallUsage =
+		      callsCount === 1 && hasAnyToken(usage)
+		        ? usage
+		        : callsCount === 1
+		          ? estimatedUsage
+		          : emptyTokenUsage('speculative', 'n8n')
+
+		    const perCallNotes =
+		      callsCount > 1
+		        ? [
+		            ...notes,
+		            'Per-call token usage is not available for n8n runs; totals above reflect all calls.'
+		          ]
+		        : notes
+
+		    const syntheticCalls: ExecutionLlmCall[] = Array.from({ length: callsCount }).map(
+		      (_, idx) => {
+		        const index = idx + 1
+		        const isFinalCall = index === callsCount
+
+		        return {
+		          index,
+		          runtime: 'n8n',
+		          usage: perCallUsage,
+		          requestPayload,
+		          requestConfidence: index === 1 ? requestConfidence : 'estimated',
+		          responsePayload: isFinalCall
+		            ? { response: responseText }
+		            : { response: '' },
+		          responseConfidence: 'speculative',
+		          finishReason: null,
+		          toolCallsCount: index === 1 ? toolCallsCount ?? undefined : undefined,
+		          toolResultsCount: undefined,
+		          notes: perCallNotes
+		        }
+		      }
+		    )
+
+		    return syntheticCalls
+	  })
+
+	  $effect(() => {
+	    const snapshot = currentSnapshot
+	    if (!open || !snapshot || snapshot.agentType !== 'n8n') {
+	      n8nToolError = null
+	      return
+	    }
+	    if (!snapshot.agentId) return
+	    if (n8nToolDefinitions[snapshot.id]) return
+	    if (n8nToolLoading) return
+
+	    n8nToolLoading = true
+	    n8nToolError = null
+
+	    void (async () => {
+	      try {
+	        const response = await fetch('/api/mcp/selections/resolve', {
+	          method: 'POST',
+	          headers: { 'Content-Type': 'application/json' },
+	          body: JSON.stringify({
+	            agentId: snapshot.agentId,
+	            selectedGateways: snapshot.selectedGateways ?? null,
+	            mcpToolSelections: snapshot.mcpToolSelections ?? null,
+	            includeToolSchemas: true
+	          })
+	        })
+
+	        if (!response.ok) {
+	          const errorText = await response.text().catch(() => '')
+	          throw new Error(errorText || 'Failed to load tool definitions')
+	        }
+
+	        const data = await response.json().catch(() => null)
+	        const toolDefinitions = Array.isArray(data?.toolDefinitions)
+	          ? data.toolDefinitions
+	          : []
+
+	        n8nToolDefinitions = {
+	          ...n8nToolDefinitions,
+	          [snapshot.id]: toolDefinitions
+	        }
+	      } catch (err: any) {
+	        n8nToolError = err?.message || 'Failed to load tool definitions'
+	      } finally {
+	        n8nToolLoading = false
+	      }
+	    })()
+	  })
+
+	  const selectedCall = $derived.by(() => {
+	    if (!Array.isArray(effectiveLlmCalls) || selectedCallIndex === null) return null
+	    return effectiveLlmCalls.find((call) => call.index === selectedCallIndex) ?? null
+	  })
+
+	  const selectedToolActivity = $derived.by(() => {
+	    if (!Array.isArray(toolActivityEntries) || selectedToolActivityIndex === null) return null
+	    return toolActivityEntries.find((entry) => entry.index === selectedToolActivityIndex) ?? null
+	  })
+
+	  $effect(() => {
+	    if (!currentSnapshot) {
+	      selectedCallIndex = null
+	      selectedToolActivityIndex = null
+	      return
+	    }
+
+	    if (Array.isArray(effectiveLlmCalls) && effectiveLlmCalls.length > 0) {
+	      if (
+	        selectedCallIndex === null ||
+	        !effectiveLlmCalls.some((call) => call.index === selectedCallIndex)
+	      ) {
+	        selectedCallIndex = effectiveLlmCalls[0].index
+	      }
+	    } else {
+	      selectedCallIndex = null
+	    }
+
+	    if (toolActivityEntries.length > 0) {
+	      if (
+	        selectedToolActivityIndex === null ||
+	        !toolActivityEntries.some((entry) => entry.index === selectedToolActivityIndex)
+	      ) {
+	        selectedToolActivityIndex = toolActivityEntries[0].index
+	      }
+	    } else {
+	      selectedToolActivityIndex = null
+	    }
+	  })
+
+  function confidenceLabel(level: ExecutionConfidenceLevel): string {
+    switch (level) {
+      case 'exact':
+        return 'Exact'
+      case 'near':
+        return 'Near'
+      case 'estimated':
+        return 'Estimated'
+      case 'speculative':
+        return 'Speculative'
+      default:
+        return 'Unknown'
+    }
+  }
+
+  function confidenceClasses(level: ExecutionConfidenceLevel): string {
+    switch (level) {
+      case 'exact':
+        return 'execution-viewer-confidence-exact'
+      case 'near':
+        return 'execution-viewer-confidence-near'
+      case 'estimated':
+        return 'execution-viewer-confidence-estimated'
+      case 'speculative':
+        return 'execution-viewer-confidence-speculative'
+      default:
+        return 'execution-viewer-confidence-muted'
+    }
+  }
+
+  function availabilityLabel(level: ExecutionAvailabilityLevel): string {
+    if (level === 'unavailable') return 'Unavailable'
+    if (level === 'not-applicable') return 'Not applicable'
+    return confidenceLabel(level)
+  }
+
+  function availabilityClasses(level: ExecutionAvailabilityLevel): string {
+    if (level === 'unavailable' || level === 'not-applicable') {
+      return 'execution-viewer-confidence-muted'
+    }
+    return confidenceClasses(level)
+  }
+
+  function llmCoverageSummary(kind: ExecutionViewerModeKind): string {
+    switch (kind) {
+      case 'n8n':
+        return 'n8n runs execute inside n8n. Batshit can reconstruct billed payloads and hydrate totals from execution data, but it cannot capture the exact on-wire provider request byte-for-byte.'
+      case 'vercel':
+        return 'API-agent runs capture the strongest per-call truth surface: exact provider request/response metadata when the SDK exposes it, with explicit near labels when Batshit has to backfill totals from raw stream chunks.'
+      case 'codex':
+        return 'Codex CLI runs expose reliable overall usage totals and runtime metadata, but the CLI does not expose the raw on-wire provider response payload or an exact per-step provider-call breakdown. Use Tool Activity below for the per-tool payload trail.'
+      case 'claude':
+        return 'Claude CLI runs expose reliable overall usage totals and runtime metadata, but the CLI does not expose the raw on-wire provider response payload or an exact per-step provider-call breakdown. Use Tool Activity below for the per-tool payload trail. When Claude prompt caching is active, Input/Total include fresh input plus cache-read and cache-creation tokens.'
+      default:
+        return 'Execution Viewer shows the best truth Batshit captured for this run, with explicit confidence labels where the runtime did not expose exact data.'
+    }
+  }
+
+  function llmCallUnavailableMessage(kind: ExecutionViewerModeKind): string {
+    switch (kind) {
+      case 'n8n':
+        return 'Per-call billed payload details are unavailable because this n8n run did not expose enough execution data to reconstruct them.'
+      case 'codex':
+        return 'Per-call billed payload details are unavailable because Codex CLI did not expose a reconstructable provider-call breakdown for this run.'
+      case 'claude':
+        return 'Per-call billed payload details are unavailable because Claude Code CLI did not expose a reconstructable provider-call breakdown for this run.'
+      case 'vercel':
+        return 'Per-call billed payload details were not captured for this API-agent run.'
+      default:
+        return 'Per-call billed payload details are unavailable for this run.'
+    }
+  }
+
+  function runtimeSectionNote(kind: ExecutionViewerModeKind): string {
+    switch (kind) {
+      case 'n8n':
+        return 'n8n runtime execution happens inside n8n, so Batshit can show webhook/execution hydration but not direct sandbox, working-directory, or provider-session telemetry.'
+      case 'vercel':
+        return 'API-agent runs use the Vercel AI SDK. Provider/model metadata is captured directly, while shell-style runtime fields only appear when the runtime actually exposes them.'
+      case 'codex':
+        return 'Codex CLI runtime metadata comes from Batshit plus the Codex bridge. Missing fields below mean the CLI did not expose them for this run.'
+      case 'claude':
+        return 'Claude CLI runtime metadata comes from Batshit plus the Claude bridge. Missing fields below mean the CLI did not expose them for this run.'
+      default:
+        return 'Runtime metadata is shown when Batshit or the underlying runtime exposed it for this run.'
+    }
+  }
+
+  function runtimeUnavailableMessage(kind: ExecutionViewerModeKind): string {
+    switch (kind) {
+      case 'n8n':
+        return 'No direct runtime telemetry is available for n8n-managed runs.'
+      case 'vercel':
+        return 'This API-agent run did not record runtime metadata.'
+      case 'codex':
+        return 'This Codex run did not record runtime metadata.'
+      case 'claude':
+        return 'This Claude run did not record runtime metadata.'
+      default:
+        return 'Runtime metadata is unavailable for this run.'
+    }
+  }
+
+  function rawProviderResponsesUnavailableMessage(kind: ExecutionViewerModeKind): string {
+    switch (kind) {
+      case 'n8n':
+        return 'n8n-managed runs do not expose raw provider response objects to Batshit.'
+      case 'codex':
+        return 'Codex CLI does not expose raw provider response objects for this run.'
+      case 'claude':
+        return 'Claude Code CLI does not expose raw provider response objects for this run.'
+      case 'vercel':
+        return 'The provider did not return raw response objects for this run.'
+      default:
+        return 'Raw provider response objects are unavailable for this run.'
+    }
+  }
+
+  function unavailableForUsageDetail(
+    kind: ExecutionViewerModeKind,
+    detail: 'cachedInputTokens' | 'cacheCreationInputTokens' | 'reasoningTokens'
+  ): string {
+    if (kind === 'n8n') {
+      return 'Not exposed by n8n execution data.'
+    }
+    if (kind === 'codex' || kind === 'claude') {
+      return 'Not reported by the CLI for this run.'
+    }
+    if (detail === 'cachedInputTokens') {
+      return 'Provider did not report cache-read tokens for this run.'
+    }
+    if (detail === 'cacheCreationInputTokens') {
+      return 'Provider did not report cache-creation tokens for this run.'
+    }
+    return 'Provider did not report reasoning tokens for this run.'
+  }
+
+  function usageDetailEntries(
+    usage: ExecutionTokenUsage | null | undefined,
+    kind: ExecutionViewerModeKind
+  ): UsageDetailEntry[] {
+    return [
+      {
+        key: 'inputTokens',
+        label: 'Input',
+        stat: usage?.inputTokens ?? null,
+        unavailableText: 'No input-token total captured for this run.'
+      },
+      {
+        key: 'outputTokens',
+        label: 'Output',
+        stat: usage?.outputTokens ?? null,
+        unavailableText: 'No output-token total captured for this run.'
+      },
+      {
+        key: 'totalTokens',
+        label: 'Total',
+        stat: usage?.totalTokens ?? null,
+        unavailableText: 'No total-token value captured for this run.'
+      },
+      {
+        key: 'cachedInputTokens',
+        label: 'Cached input',
+        stat: usage?.cachedInputTokens ?? null,
+        unavailableText: unavailableForUsageDetail(kind, 'cachedInputTokens')
+      },
+      {
+        key: 'cacheCreationInputTokens',
+        label: 'Cache creation',
+        stat: usage?.cacheCreationInputTokens ?? null,
+        unavailableText: unavailableForUsageDetail(kind, 'cacheCreationInputTokens')
+      },
+      {
+        key: 'reasoningTokens',
+        label: 'Reasoning',
+        stat: usage?.reasoningTokens ?? null,
+        unavailableText: unavailableForUsageDetail(kind, 'reasoningTokens')
+      }
+    ]
+  }
+
+  function formatOptionalValue(
+    value: string | null | undefined,
+    unavailableText: string
+  ): string {
+    return typeof value === 'string' && value.trim().length > 0 ? value : unavailableText
+  }
+
+  function formatRuntimeCapability(
+    value: boolean | undefined,
+    unavailableText: string
+  ): string {
+    if (value === true) return 'Allowed'
+    if (value === false) return 'Blocked'
+    return unavailableText
+  }
+
+  function runtimeFieldUnavailable(
+    kind: ExecutionViewerModeKind,
+    field:
+      | 'transport'
+      | 'sandbox'
+      | 'fileEdits'
+      | 'network'
+      | 'workingDirectory'
+      | 'providerSession'
+      | 'runtimeEvents'
+  ): string {
+    switch (field) {
+      case 'transport':
+        if (kind === 'n8n') return 'Managed inside n8n workflow.'
+        return 'Not reported by the runtime.'
+      case 'sandbox':
+        if (kind === 'n8n') return 'Not exposed for n8n-managed runs.'
+        if (kind === 'vercel') return 'Not applicable to Vercel SDK runs.'
+        return 'Not reported by the CLI runtime.'
+      case 'fileEdits':
+      case 'network':
+        if (kind === 'n8n') return 'Not exposed for n8n-managed runs.'
+        if (kind === 'vercel') return 'Not applicable to Vercel SDK runs.'
+        return 'Not reported by the CLI runtime.'
+      case 'workingDirectory':
+        if (kind === 'n8n') return 'Not exposed for n8n-managed runs.'
+        if (kind === 'vercel') return 'Not used by Vercel SDK runs.'
+        return 'Not reported by the CLI runtime.'
+      case 'providerSession':
+        if (kind === 'n8n') return 'n8n runs do not expose a direct provider CLI session.'
+        if (kind === 'vercel') return 'Vercel SDK runs do not use a provider CLI session.'
+        return 'Provider session details were not reported for this run.'
+      case 'runtimeEvents':
+        if (kind === 'n8n') return 'No direct runtime event log exists for n8n-managed runs.'
+        return 'No runtime event log was captured for this run.'
+      default:
+        return 'Unavailable for this run.'
+    }
+  }
+
+  function formatSandbox(mode?: string | null): string | null {
+    switch (mode) {
+      case 'danger-full-access':
+        return 'Danger · Full access'
+      case 'workspace-write':
+        return 'Workspace write'
+      case 'read-only':
+        return 'Read-only'
+      default:
+        return null
+    }
+  }
+
+  function formatRuntimeEventsSummary(
+    details: ExecutionRuntimeDetails | null,
+    kind: ExecutionViewerModeKind
+  ): string {
+    const eventCount =
+      typeof details?.eventCount === 'number'
+        ? details.eventCount
+        : Array.isArray(details?.eventLog)
+          ? details.eventLog.length
+          : null
+
+    if (typeof eventCount === 'number' && eventCount > 0) {
+      return `${eventCount.toLocaleString()} captured`
+    }
+
+    return runtimeFieldUnavailable(kind, 'runtimeEvents')
+  }
+
+  function formatTokenValue(value: number | null): string {
+    if (typeof value !== 'number') return '—'
+    return value.toLocaleString()
+  }
+
+  function toolActivityStatusClasses(status: ExecutionToolActivityEntry['status']): string {
+    if (status === 'error') {
+      return 'execution-viewer-tool-status-error'
+    }
+    if (status === 'partial') {
+      return 'execution-viewer-tool-status-partial'
+    }
+    return 'execution-viewer-tool-status-success'
+  }
+
+  function toolActivityStatusLabel(status: ExecutionToolActivityEntry['status']): string {
+    if (status === 'error') return 'Error'
+    if (status === 'partial') return 'Partial'
+    return 'Success'
+  }
+
+  function formatDuration(value: number | null | undefined): string {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
+    if (value < 1000) return `${Math.max(0, Math.trunc(value))} ms`
+    return `${(value / 1000).toFixed(1)} s`
+  }
+
+  function tokenBadgeText(label: string, stat: ExecutionTokenStat): string {
+    return `${label}: ${formatTokenValue(stat.value)}`
+  }
+
+  function hasAnyToken(usage: ExecutionTokenUsage | null | undefined): boolean {
+    return Boolean(
+      usage &&
+        (typeof usage.inputTokens?.value === 'number' ||
+          typeof usage.outputTokens?.value === 'number' ||
+          typeof usage.totalTokens?.value === 'number')
+    )
+  }
+
+  function displayViewerText(value: string): string {
+    return truncateExecutionViewerBase64(value, { enabled: truncateBase64 })
+  }
+
+  function displayViewerData<T>(value: T): T {
+    return truncateExecutionViewerBase64InValue(value, { enabled: truncateBase64 })
+  }
+
+		  async function refreshWebhookInputFromN8n() {
+		    if (!sessionId || !currentSnapshot?.id) return
+		    if (currentSnapshot.agentType !== 'n8n') return
+		    if (n8nWebhookHydrationLoading) return
+
+		    n8nWebhookHydrationLoading = true
+		    n8nWebhookHydrationError = null
+
+		    try {
+		      const resolvedLimit = n8nExecutionSearchLimit
+
+		      const response = await fetch(`/api/sessions/${sessionId}/execution-log`, {
+		        method: 'PATCH',
+		        headers: { 'Content-Type': 'application/json' },
+		        body: JSON.stringify({
+		          id: currentSnapshot.id,
+		          hydrateN8nWebhookInput: true,
+		          n8nExecutionSearchLimit: resolvedLimit,
+		          patch: {}
+		        })
+		      })
+
+		      if (!response.ok) {
+		        const text = await response.text().catch(() => '')
+		        throw new Error(text || `Hydration failed (${response.status})`)
+		      }
+
+		      const data = await response.json().catch(() => null)
+		      const hydrated = data?.hydratedWebhookInput === true
+		      const hydrationError = typeof data?.hydrationError === 'string' ? data.hydrationError : null
+
+		      await loadSnapshots()
+
+		      if (hydrationError) {
+		        n8nWebhookHydrationError = hydrationError
+		      } else if (!hydrated) {
+		        n8nWebhookHydrationError = `No matching n8n execution found in the last ${resolvedLimit} executions.`
+		      }
+		    } catch (err: any) {
+		      n8nWebhookHydrationError = err?.message || 'Failed to refresh webhook input from n8n'
+		    } finally {
+		      n8nWebhookHydrationLoading = false
+		    }
+		  }
+
+	  function formatRuntimeName(runtime: ExecutionRuntimeDetails): string {
+	    if (runtime.runtimeId === 'n8n') {
+	      return 'n8n Workflow'
+	    }
+	    if (runtime.runtimeId === 'codex') {
+	      return 'Codex CLI (GPT Plus/Pro)'
+	    }
+	    if (runtime.runtimeId === 'claude') {
+	      return 'Claude Code CLI (Pro/Max)'
+	    }
+    return 'Vercel AI SDK'
+  }
+
+	  function formatTransport(runtime: ExecutionRuntimeDetails): string | null {
+	    switch (runtime.transport) {
+	      case 'n8n-webhook':
+	        return 'Webhook'
+	      case 'codex-sdk':
+	        return 'SDK'
+	      case 'codex-cli':
+	        return 'CLI'
+	      case 'codex-app-server':
+	        return 'App-server'
+	      case 'codex-exec':
+	        return 'Exec'
+	      case 'claude-sdk':
+	        return 'SDK'
+	      case 'claude-cli':
+	        return 'CLI'
+	      case 'vercel-sdk':
+	        return 'SDK'
+	      default:
+	        return null
+	    }
+	  }
+
+  function formatMode4Style(style?: string | null): string {
+    switch (style) {
+      case 'cr':
+        return 'Batshit managed'
+      case 'cli':
+        return 'Provider-native CLI'
+      default:
+        return style ?? 'Unknown'
+    }
+  }
+
+  function formatMode4MemoryOwner(memoryOwner?: string | null): string {
+    switch (memoryOwner) {
+      case 'batshit':
+        return 'Batshit'
+      case 'provider':
+        return 'Provider CLI'
+      default:
+        return memoryOwner ?? 'Unknown'
+    }
+  }
+
+  async function loadSnapshots(options: { defaultToLatest?: boolean } = {}) {
+    const { defaultToLatest = false } = options
+
+    if (!sessionId) {
+      snapshots = []
+      selectedId = null
+      return
+    }
+
+    loading = true
+    error = null
+
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/execution-log`)
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({ error: 'Failed to load execution log' }))
+        throw new Error(data.error || 'Failed to load execution log')
+      }
+
+      const data = await response.json()
+      const entries: ExecutionSnapshot[] = Array.isArray(data.entries) ? data.entries : []
+      snapshots = entries
+
+      if (entries.length > 0) {
+        const latestId = entries[0].id
+        if (defaultToLatest) {
+          selectedId = latestId
+        } else if (!selectedId || !entries.some((entry) => entry.id === selectedId)) {
+          selectedId = latestId
+        }
+      } else {
+        selectedId = null
+      }
+    } catch (err: any) {
+      error = err?.message || 'Failed to load execution data'
+    } finally {
+      loading = false
+    }
+  }
+
+  async function refresh() {
+    await loadSnapshots()
+  }
+
+  async function clearSnapshots() {
+    if (!sessionId) return
+
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/execution-log`, {
+        method: 'DELETE'
+      })
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({ error: 'Failed to clear execution log' }))
+        throw new Error(data.error || 'Failed to clear execution log')
+      }
+
+      await loadSnapshots({ defaultToLatest: true })
+    } catch (err: any) {
+      error = err?.message || 'Failed to clear execution data'
+    }
+  }
+
+  function formatTimestamp(timestamp: string): string {
+    const date = new Date(timestamp)
+    if (Number.isNaN(date.getTime())) return timestamp
+    return date.toLocaleString()
+  }
+
+  function formatRelative(timestamp: string): string {
+    const date = new Date(timestamp)
+    if (Number.isNaN(date.getTime())) return timestamp
+    return date.toLocaleTimeString()
+  }
+
+  function handleSelectionChange(event: Event) {
+    const target = event.currentTarget as HTMLSelectElement
+    selectedId = target.value
+  }
+
+  const selectId = 'execution-viewer-run'
+
+  let openOverview = $state(true)
+  let openRuntime = $state(true)
+  let openLlmCalls = $state(true)
+  let openWebhookInput = $state(false)
+  let openPrimaryPrompt = $state(false)
+  let openSubagentPrompts = $state(false)
+  let openCompiledMessages = $state(false)
+  let openResponse = $state(false)
+  let openRawEvents = $state(false)
+  let openRawSnapshotRequest = $state(false)
+  let openRawProviderResponses = $state(false)
+
+  let wasOpen = $state(false)
+
+  $effect(() => {
+    const snapshotId = currentSnapshot?.id
+    if (!snapshotId) return
+    n8nWebhookHydrationError = null
+  })
+
+  $effect(() => {
+    if (!open || !openWebhookInput) return
+
+    const snapshot = currentSnapshot
+    if (!snapshot || snapshot.agentType !== 'n8n') return
+    if (webhookInputAvailability?.state === 'exact') return
+    if (n8nWebhookHydrationAttempted[snapshot.id]) return
+
+    n8nWebhookHydrationAttempted = { ...n8nWebhookHydrationAttempted, [snapshot.id]: true }
+    refreshWebhookInputFromN8n()
+  })
+
+  $effect(() => {
+    if (open && !wasOpen) {
+      wasOpen = true
+      loadSnapshots({ defaultToLatest: true })
+    } else if (!open && wasOpen) {
+      wasOpen = false
+    }
+  })
+</script>
+
+<Sheet.Root bind:open>
+  <Sheet.Content side="right" class="execution-viewer-sheet">
+    <Sheet.Header class="execution-viewer-header">
+      <Sheet.Title class="execution-viewer-title">Execution Viewer</Sheet.Title>
+      <Sheet.Description class="execution-viewer-muted-copy">
+        Inspect the compiled system prompt, structured payload, and metadata sent to the agent for the most recent requests.
+      </Sheet.Description>
+    </Sheet.Header>
+
+    <div class="execution-viewer-body">
+      {#if loading && snapshots.length === 0}
+        <div class="execution-viewer-loading">
+          Loading execution data...
+        </div>
+      {:else if error}
+        <div class="execution-viewer-error">
+          {error}
+        </div>
+      {:else if snapshots.length === 0}
+        <div class="execution-viewer-empty">
+          Execution data will appear after you send a message to this agent during the current session.
+        </div>
+      {:else if currentSnapshot}
+        <div class="execution-viewer-run-row">
+          <label class="execution-viewer-eyebrow" for={selectId}>Run</label>
+          <select
+            id={selectId}
+            class="execution-viewer-run-select"
+            bind:value={selectedId}
+            onchange={handleSelectionChange}
+          >
+            {#each formattedOptions as option}
+              <option value={option.id}>{option.label}</option>
+            {/each}
+          </select>
+          <span class="execution-viewer-helper">{formatRelative(currentSnapshot.createdAt)}</span>
+          <div class="execution-viewer-base64-toggle">
+            <Switch.Root
+              id="execution-viewer-truncate-base64"
+              checked={truncateBase64}
+              onCheckedChange={(checked) => (truncateBase64 = checked === true)}
+            />
+            <label
+              class="execution-viewer-base64-toggle-label"
+              for="execution-viewer-truncate-base64"
+            >
+              Truncate base64
+            </label>
+          </div>
+          <div class="execution-viewer-flex-spacer"></div>
+          <Button variant="outline" size="sm" onclick={refresh} disabled={loading}>
+            Refresh
+          </Button>
+          <Button variant="ghost" size="sm" onclick={clearSnapshots} disabled={loading}>
+            Clear Log
+          </Button>
+        </div>
+
+        <Collapsible.Root bind:open={openOverview}>
+          <Collapsible.Trigger class="execution-viewer-section-trigger">
+            <div class="execution-viewer-section-label">
+              <span class="execution-viewer-section-heading">Overview</span>
+              <span class="execution-viewer-helper">High-level request metadata</span>
+            </div>
+            <ChevronDown class="execution-viewer-section-chevron" data-open={openOverview} />
+          </Collapsible.Trigger>
+          <Collapsible.Content class="execution-viewer-section-content">
+            <div class="execution-viewer-card execution-viewer-stack-md">
+              <div class="execution-viewer-grid-2">
+                <div class="execution-viewer-stack-xs">
+                  <div class="execution-viewer-eyebrow">Agent</div>
+                  <div class="execution-viewer-value-row">
+                    {currentSnapshot.agentName}
+                    {#if currentSnapshot.agentType}
+                      <Badge variant="outline" class="execution-viewer-confidence-badge execution-viewer-confidence-muted">
+                        {currentSnapshot.agentType}
+                      </Badge>
+                    {/if}
+                  </div>
+                </div>
+                <div class="execution-viewer-stack-xs">
+                  <div class="execution-viewer-eyebrow">Captured</div>
+                  <div class="execution-viewer-value">{formatTimestamp(currentSnapshot.createdAt)}</div>
+                </div>
+              </div>
+
+              {#if currentSnapshot.userMessage}
+                <div class="execution-viewer-stack-xs">
+                  <div class="execution-viewer-eyebrow">User message</div>
+                  <div class="execution-viewer-message-preview">
+                    {displayViewerText(currentSnapshot.userMessage)}
+                  </div>
+                </div>
+              {/if}
+
+              {#if groupMeta}
+                <div class="execution-viewer-stack-xs">
+                  <div class="execution-viewer-eyebrow">Group chat</div>
+                  <div class="execution-viewer-wrap-row">
+                    {#if typeof groupMeta.eventIndex === 'number'}
+                      <Badge variant="secondary">Event {groupMeta.eventIndex}</Badge>
+                    {/if}
+                    {#if formatGroupTurnId(groupMeta.groupTurnId)}
+                      <Badge variant="outline">Turn {formatGroupTurnId(groupMeta.groupTurnId)}</Badge>
+                    {/if}
+                    {#if formatSpeakPolicy(groupMeta.speakPolicy)}
+                      <Badge variant="outline">{formatSpeakPolicy(groupMeta.speakPolicy)}</Badge>
+                    {/if}
+                    {#if groupMeta.groupLayout}
+                      <Badge variant="outline">{groupMeta.groupLayout}</Badge>
+                    {/if}
+                  </div>
+                  {#if Array.isArray(groupMeta.speakTopics) && groupMeta.speakTopics.length > 0}
+                    <div class="execution-viewer-helper">
+                      Topics: {groupMeta.speakTopics.join(', ')}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+
+              <div class="execution-viewer-grid-2">
+                <div class="execution-viewer-stack-xs">
+                  <div class="execution-viewer-eyebrow">Selected gateways</div>
+                  {#if currentSnapshot.selectedGateways && currentSnapshot.selectedGateways.length > 0}
+                    <div class="execution-viewer-wrap-row">
+                      {#each currentSnapshot.selectedGateways as gateway}
+                        <Badge variant="outline">{gateway}</Badge>
+                      {/each}
+                    </div>
+                  {:else}
+                    <div class="execution-viewer-muted-copy">Agent defaults</div>
+                  {/if}
+                </div>
+                <div class="execution-viewer-stack-xs">
+                  <div class="execution-viewer-eyebrow">Selected tools</div>
+                  {#if currentSnapshot.selectedTools && currentSnapshot.selectedTools.length > 0}
+                    <div class="execution-viewer-wrap-row">
+                      {#each currentSnapshot.selectedTools as tool}
+                        <Badge variant="outline">{tool}</Badge>
+                      {/each}
+                    </div>
+                  {:else}
+                    <div class="execution-viewer-muted-copy">No explicit per-tool filters</div>
+                  {/if}
+                </div>
+              </div>
+            </div>
+          </Collapsible.Content>
+        </Collapsible.Root>
+
+        <Collapsible.Root bind:open={openRuntime}>
+          <Collapsible.Trigger class="execution-viewer-section-trigger">
+            <div class="execution-viewer-section-label">
+              <span class="execution-viewer-section-heading">Runtime</span>
+              <span class="execution-viewer-helper">Provider + execution metadata for this run</span>
+            </div>
+            <ChevronDown class="execution-viewer-section-chevron" data-open={openRuntime} />
+          </Collapsible.Trigger>
+          <Collapsible.Content class="execution-viewer-section-content">
+            <div class="execution-viewer-card execution-viewer-stack-md">
+              <div class="execution-viewer-note">
+                {runtimeSectionNote(modeKind)}
+              </div>
+
+              {#if runtimeDetails}
+                <div class="execution-viewer-grid-2">
+                  <div class="execution-viewer-stack-xs">
+                    <div class="execution-viewer-eyebrow">Runtime</div>
+                    <div class="execution-viewer-wrap-row execution-viewer-text-sm">
+                      <span class="execution-viewer-value">{formatRuntimeName(runtimeDetails)}</span>
+                      <Badge variant="outline">
+                        {formatOptionalValue(
+                          formatTransport(runtimeDetails),
+                          runtimeFieldUnavailable(modeKind, 'transport')
+                        )}
+                      </Badge>
+                      {#if runtimeDetails.status}
+                        <Badge
+                          variant={runtimeDetails.status === 'failed' ? 'destructive' : 'secondary'}
+                        >
+                          {runtimeDetails.status}
+                        </Badge>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="execution-viewer-stack-xs">
+                    <div class="execution-viewer-eyebrow">Provider</div>
+                    <div class="execution-viewer-text-sm">
+                      {formatOptionalValue(runtimeDetails.providerId, 'Provider was not recorded.')}
+                      {#if runtimeDetails.connectionId}
+                        <span class="execution-viewer-muted"> · {runtimeDetails.connectionId}</span>
+                      {/if}
+                    </div>
+                    <div class="execution-viewer-helper">
+                      Model: {formatOptionalValue(runtimeDetails.modelName, 'Model was not recorded.')}
+                    </div>
+                  </div>
+                </div>
+
+	                <div class="execution-viewer-grid-2">
+	                  <div class="execution-viewer-stack-xs">
+	                    <div class="execution-viewer-eyebrow">CLI policy</div>
+	                    {#if (modeKind === 'codex' || modeKind === 'claude') && hasRuntimeMode4Details}
+	                      <div class="execution-viewer-wrap-row">
+	                        {#if runtimeMode4Style}
+	                          <Badge variant="outline">Style: {formatMode4Style(runtimeMode4Style)}</Badge>
+	                        {/if}
+                        {#if runtimeMode4MemoryOwner}
+                          <Badge variant="outline">
+                            Memory owner: {formatMode4MemoryOwner(runtimeMode4MemoryOwner)}
+                          </Badge>
+                        {/if}
+                      </div>
+                    {:else}
+                      <div class="execution-viewer-muted-copy">
+                        {modeKind === 'codex' || modeKind === 'claude'
+                          ? 'CLI policy metadata was not reported for this run.'
+                          : 'Not applicable to this mode.'}
+                      </div>
+                    {/if}
+	                  </div>
+	                  <div class="execution-viewer-stack-xs">
+	                    <div class="execution-viewer-eyebrow">Provider session</div>
+	                    {#if (modeKind === 'codex' || modeKind === 'claude') && hasRuntimeMode4Details}
+	                      <div class="execution-viewer-provider-session">
+	                        <div>
+	                          Config scope:
+	                          <code>{formatOptionalValue(runtimeProviderSessionConfigScope, 'Unavailable')}</code>
+	                        </div>
+	                        <div>
+	                          History persistence:
+	                          <code>{formatOptionalValue(runtimeProviderSessionHistoryPersistence, 'Unavailable')}</code>
+	                        </div>
+	                        <div>
+	                          Session ID:
+	                          <code class="execution-viewer-break-all">{formatOptionalValue(runtimeProviderSessionId, 'Unavailable')}</code>
+	                        </div>
+	                      </div>
+	                    {:else}
+	                      <div class="execution-viewer-muted-copy">
+	                        {runtimeFieldUnavailable(modeKind, 'providerSession')}
+	                      </div>
+	                    {/if}
+	                  </div>
+	                </div>
+
+                <div class="execution-viewer-grid-2">
+                  <div class="execution-viewer-stack-xs">
+                    <div class="execution-viewer-eyebrow">Sandbox</div>
+                    <div class="execution-viewer-text-sm">
+                      {formatOptionalValue(
+                        formatSandbox(runtimeDetails.sandboxMode),
+                        runtimeFieldUnavailable(modeKind, 'sandbox')
+                      )}
+                    </div>
+                    <div class="execution-viewer-wrap-row execution-viewer-helper">
+                      <span>
+                        File edits:
+                        {formatRuntimeCapability(
+                          runtimeDetails.allowFileEdits,
+                          runtimeFieldUnavailable(modeKind, 'fileEdits')
+                        )}
+                      </span>
+                      <span>
+                        Network:
+                        {formatRuntimeCapability(
+                          runtimeDetails.allowNetwork,
+                          runtimeFieldUnavailable(modeKind, 'network')
+                        )}
+                      </span>
+                    </div>
+                  </div>
+	                  <div class="execution-viewer-stack-xs">
+	                    <div class="execution-viewer-eyebrow">Working directory</div>
+	                    {#if runtimeDetails.workingDirectory}
+	                      <code class="execution-viewer-code-block">
+	                        {runtimeDetails.workingDirectory}
+	                      </code>
+	                    {:else}
+	                      <div class="execution-viewer-muted-copy">
+	                        {runtimeFieldUnavailable(modeKind, 'workingDirectory')}
+	                      </div>
+	                    {/if}
+	                  </div>
+                </div>
+
+                <div class="execution-viewer-stack-xs">
+                  <div class="execution-viewer-eyebrow">Runtime events</div>
+                  <div class="execution-viewer-muted-copy">
+                    {formatRuntimeEventsSummary(runtimeDetails, modeKind)}
+                  </div>
+                </div>
+
+                {#if runtimeDetails.error}
+                  <div class="execution-viewer-error execution-viewer-error-compact">
+                    {runtimeDetails.error}
+                  </div>
+                {/if}
+              {:else}
+                <div class="execution-viewer-muted-copy">{runtimeUnavailableMessage(modeKind)}</div>
+              {/if}
+            </div>
+          </Collapsible.Content>
+        </Collapsible.Root>
+
+        <div class="execution-viewer-stack-lg">
+          <div class="execution-viewer-eyebrow">Billed Input/Output</div>
+
+          <Collapsible.Root bind:open={openLlmCalls}>
+            <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-strong">
+              <div class="execution-viewer-section-label">
+                <div class="execution-viewer-inline-row">
+	                  <span class="execution-viewer-section-heading">LLM Calls</span>
+                  {#if llmSummary}
+                    <Badge
+                      variant="outline"
+                      class={`execution-viewer-confidence-badge ${confidenceClasses(llmSummary.breakdownConfidence)}`}
+                    >
+                      {confidenceLabel(llmSummary.breakdownConfidence)}
+                    </Badge>
+                  {/if}
+                </div>
+                <span class="execution-viewer-helper">
+                  Exact for API agents (Vercel). Best-effort for n8n and CLI agents.
+                </span>
+              </div>
+              <div class="execution-viewer-inline-row">
+                {#if llmSummary}
+                  <Badge
+                    variant="outline"
+                    class={`execution-viewer-confidence-badge ${confidenceClasses(llmSummary.callsCount.confidence)}`}
+                  >
+                    Calls: {formatTokenValue(llmSummary.callsCount.value)}
+                  </Badge>
+                {/if}
+                {#if llmSummary && hasAnyToken(llmSummary.totalUsage)}
+                  <Badge
+                    variant="outline"
+                    class={`execution-viewer-confidence-badge ${confidenceClasses(llmSummary.totalUsage.inputTokens.confidence)}`}
+                  >
+                    {tokenBadgeText('Input', llmSummary.totalUsage.inputTokens)}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    class={`execution-viewer-confidence-badge ${confidenceClasses(llmSummary.totalUsage.outputTokens.confidence)}`}
+                  >
+                    {tokenBadgeText('Output', llmSummary.totalUsage.outputTokens)}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    class={`execution-viewer-confidence-badge ${confidenceClasses(llmSummary.totalUsage.totalTokens.confidence)}`}
+                  >
+                    {tokenBadgeText('Total', llmSummary.totalUsage.totalTokens)}
+                  </Badge>
+                {/if}
+                <ChevronDown class="execution-viewer-section-chevron" data-open={openLlmCalls} />
+              </div>
+            </Collapsible.Trigger>
+            <Collapsible.Content class="execution-viewer-section-content">
+              <div class="execution-viewer-panel execution-viewer-stack-lg">
+                <div class="execution-viewer-note execution-viewer-note-raised">
+                  {llmCoverageSummary(modeKind)}
+                </div>
+
+                {#if currentSnapshot.agentType === 'n8n'}
+                  <div class="execution-viewer-warning-note">
+                    n8n runs execute inside workflows. Tool definitions for tools attached directly to n8n nodes may not be visible here unless they flow through Batshit gateways.
+                  </div>
+                  {#if n8nToolLoading}
+                    <div class="execution-viewer-helper">Loading tool definitions…</div>
+                  {:else if n8nToolError}
+                    <div class="execution-viewer-error-text">Tool definitions unavailable: {n8nToolError}</div>
+                  {/if}
+                {/if}
+
+                {#if llmSummary}
+                  <div class="execution-viewer-stats-grid execution-viewer-stats-grid-six">
+                    {#each usageDetailEntries(llmSummary.totalUsage, modeKind) as detail}
+                      <div class="execution-viewer-stat-card">
+                        <div class="execution-viewer-stat-label">
+                          {detail.label}
+                        </div>
+                        {#if typeof detail.stat?.value === 'number'}
+                          <div class="execution-viewer-stat-row">
+                            <span class="execution-viewer-stat-value">{formatTokenValue(detail.stat.value)}</span>
+                            <Badge
+                              variant="outline"
+                              class={`execution-viewer-confidence-badge ${confidenceClasses(detail.stat.confidence)}`}
+                            >
+                              {confidenceLabel(detail.stat.confidence)}
+                            </Badge>
+                          </div>
+                        {:else}
+                          <div class="execution-viewer-stat-unavailable">{detail.unavailableText}</div>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+
+                {#if Array.isArray(effectiveLlmCalls) && effectiveLlmCalls.length > 0}
+                  <div class="execution-viewer-table-wrap">
+                    <table class="execution-viewer-table">
+                      <thead class="execution-viewer-table-head">
+                        <tr>
+                          <th class="execution-viewer-table-heading">Call</th>
+                          <th class="execution-viewer-table-heading">Input</th>
+                          <th class="execution-viewer-table-heading">Output</th>
+                          <th class="execution-viewer-table-heading">Tools</th>
+                          <th class="execution-viewer-table-heading">Finish</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {#each effectiveLlmCalls as call}
+                          <tr
+                            class="execution-viewer-table-row" data-selected={selectedCallIndex === call.index}
+                            onclick={() => (selectedCallIndex = call.index)}
+                          >
+                            <td class="execution-viewer-table-primary-cell">Call {call.index}</td>
+                            <td class="execution-viewer-table-cell">
+                              <Badge
+                                variant="outline"
+                                class={`execution-viewer-confidence-badge ${confidenceClasses(call.usage.inputTokens.confidence)}`}
+                              >
+                                {formatTokenValue(call.usage.inputTokens.value)}
+                              </Badge>
+                            </td>
+                            <td class="execution-viewer-table-cell">
+                              <Badge
+                                variant="outline"
+                                class={`execution-viewer-confidence-badge ${confidenceClasses(call.usage.outputTokens.confidence)}`}
+                              >
+                                {formatTokenValue(call.usage.outputTokens.value)}
+                              </Badge>
+                            </td>
+                            <td class="execution-viewer-table-muted-cell">
+                              {call.toolCallsCount ?? '—'}
+                            </td>
+                            <td class="execution-viewer-table-muted-cell">
+                              {call.finishReason ?? '—'}
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {#if selectedCall}
+                    <div class="execution-viewer-stack-lg">
+                      <div class="execution-viewer-card execution-viewer-stack-md">
+                        <div class="execution-viewer-wrap-row">
+                          <div class="execution-viewer-value">Call {selectedCall.index} Input (Billed)</div>
+                          <Badge
+                            variant="outline"
+                            class={`execution-viewer-confidence-badge ${confidenceClasses(selectedCall.requestConfidence)}`}
+                          >
+                            Request: {confidenceLabel(selectedCall.requestConfidence)}
+                          </Badge>
+                        </div>
+
+                        {#if selectedCall.notes?.length}
+                          <div class="execution-viewer-stack-xs execution-viewer-helper">
+                            {#each selectedCall.notes as note}
+                              <div>• {note}</div>
+                            {/each}
+                          </div>
+                        {/if}
+
+                        <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
+                          <JSONViewer data={displayViewerData(selectedCall.requestPayload)} />
+                        </div>
+                      </div>
+
+                      <div class="execution-viewer-card execution-viewer-stack-sm">
+                        <div class="execution-viewer-wrap-row">
+                          <div class="execution-viewer-value">Call {selectedCall.index} Output (Billed)</div>
+                          <Badge
+                            variant="outline"
+                            class={`execution-viewer-confidence-badge ${confidenceClasses(selectedCall.responseConfidence ?? 'speculative')}`}
+                          >
+                            Output: {confidenceLabel(selectedCall.responseConfidence ?? 'speculative')}
+                          </Badge>
+                        </div>
+                        <div class="execution-viewer-json-pane">
+                          <JSONViewer
+                            data={displayViewerData(
+                              selectedCall.responsePayload ?? {
+                                note:
+                                  'Billed output payload unavailable for this call. See Response → Final Output for what you see in chat.'
+                              }
+                            )}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  {/if}
+
+                  <div class="execution-viewer-stack-md">
+                    <div class="execution-viewer-wrap-row">
+                      <div class="execution-viewer-value">Tool Activity</div>
+                      <Badge variant="outline" class="execution-viewer-confidence-badge execution-viewer-confidence-muted">
+                        {toolActivityEntries.length > 0
+                          ? `${toolActivityEntries.length} captured`
+                          : toolCallsCountFromSummary
+                            ? `${toolCallsCountFromSummary} reported`
+                            : 'None reported'}
+                      </Badge>
+                      <Badge
+                        variant="outline"
+                        class={`execution-viewer-confidence-badge ${confidenceClasses('estimated')}`}
+                      >
+                        Tokens: Estimated
+                      </Badge>
+                    </div>
+
+                    <div class="execution-viewer-helper">
+                      Tool token counts below estimate the prompt-facing tool transcript Batshit sends back to the agent. They are not provider-billed LLM token counts.
+                    </div>
+
+                    {#if toolActivityEntries.length > 0}
+                      <div class="execution-viewer-table-wrap">
+                        <table class="execution-viewer-table">
+                          <thead class="execution-viewer-table-head">
+                            <tr>
+                              <th class="execution-viewer-table-heading">Step</th>
+                              <th class="execution-viewer-table-heading">Tool</th>
+                              <th class="execution-viewer-table-heading">Prompt tokens</th>
+                              <th class="execution-viewer-table-heading">Duration</th>
+                              <th class="execution-viewer-table-heading">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {#each toolActivityEntries as entry}
+                              <tr
+                                class="execution-viewer-table-row" data-selected={selectedToolActivityIndex === entry.index}
+                                onclick={() => (selectedToolActivityIndex = entry.index)}
+                              >
+                                <td class="execution-viewer-table-primary-cell">Tool {entry.index}</td>
+                                <td class="execution-viewer-table-cell">
+                                  <div class="execution-viewer-value">{entry.displayName}</div>
+                                  {#if entry.displayName !== entry.rawToolName}
+                                    <div class="execution-viewer-helper">{entry.rawToolName}</div>
+                                  {/if}
+                                </td>
+                                <td class="execution-viewer-table-cell">
+                                  <Badge
+                                    variant="outline"
+                                    class={`execution-viewer-confidence-badge ${confidenceClasses(entry.tokenConfidence)}`}
+                                  >
+                                    {formatTokenValue(entry.tokenEstimate)}
+                                  </Badge>
+                                </td>
+                                <td class="execution-viewer-table-muted-cell">
+                                  {formatDuration(entry.durationMs)}
+                                </td>
+                                <td class="execution-viewer-table-cell">
+                                  <Badge
+                                    variant="outline"
+                                    class={`execution-viewer-confidence-badge ${toolActivityStatusClasses(entry.status)}`}
+                                  >
+                                    {toolActivityStatusLabel(entry.status)}
+                                  </Badge>
+                                </td>
+                              </tr>
+                            {/each}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      {#if selectedToolActivity}
+                        <div class="execution-viewer-stack-lg">
+                          <div class="execution-viewer-card execution-viewer-stack-md">
+                            <div class="execution-viewer-wrap-row">
+                              <div class="execution-viewer-value">
+                                Tool {selectedToolActivity.index} Input
+                              </div>
+                              <Badge
+                                variant="outline"
+                                class={`execution-viewer-confidence-badge ${confidenceClasses(selectedToolActivity.tokenConfidence)}`}
+                              >
+                                Prompt tokens: {formatTokenValue(selectedToolActivity.tokenEstimate)}
+                              </Badge>
+                              <Badge
+                                variant="outline"
+                                class={`execution-viewer-confidence-badge ${toolActivityStatusClasses(selectedToolActivity.status)}`}
+                              >
+                                {toolActivityStatusLabel(selectedToolActivity.status)}
+                              </Badge>
+                            </div>
+
+                            {#if selectedToolActivity.notes.length > 0}
+                              <div class="execution-viewer-stack-xs execution-viewer-helper">
+                                {#each selectedToolActivity.notes as note}
+                                  <div>• {note}</div>
+                                {/each}
+                              </div>
+                            {/if}
+
+                            <div class="execution-viewer-json-pane">
+                              <JSONViewer data={displayViewerData(selectedToolActivity.input)} />
+                            </div>
+                          </div>
+
+                          <div class="execution-viewer-card execution-viewer-stack-sm">
+                            <div class="execution-viewer-wrap-row">
+                              <div class="execution-viewer-value">
+                                Tool {selectedToolActivity.index} Output
+                              </div>
+                              <Badge variant="outline" class="execution-viewer-confidence-badge execution-viewer-confidence-muted">
+                                Duration: {formatDuration(selectedToolActivity.durationMs)}
+                              </Badge>
+                            </div>
+                            <div class="execution-viewer-json-pane">
+                              <JSONViewer data={displayViewerData(selectedToolActivity.output)} />
+                            </div>
+                          </div>
+                        </div>
+                      {/if}
+                    {:else if toolActivityUnavailableNote}
+                      <div class="execution-viewer-note">
+                        {toolActivityUnavailableNote}
+                      </div>
+                    {:else}
+                      <div class="execution-viewer-note">
+                        No tool activity was captured for this run.
+                      </div>
+                    {/if}
+                  </div>
+                {:else}
+                  <div class="execution-viewer-muted-copy">
+                    {llmCallUnavailableMessage(modeKind)}
+                  </div>
+                {/if}
+              </div>
+            </Collapsible.Content>
+          </Collapsible.Root>
+        </div>
+
+        <div class="execution-viewer-stack-lg">
+          <div class="execution-viewer-eyebrow">Request</div>
+
+	          {#if currentSnapshot.agentType === 'n8n'}
+	            <Collapsible.Root bind:open={openWebhookInput}>
+	              <Collapsible.Trigger class="execution-viewer-section-trigger">
+	                <div class="execution-viewer-section-label">
+	                  <div class="execution-viewer-inline-row">
+		                  <span class="execution-viewer-section-heading">n8n Webhook Input</span>
+		                  {#if webhookInputAvailability}
+		                    <Badge
+		                      variant="outline"
+		                      class={`execution-viewer-confidence-badge ${availabilityClasses(webhookInputAvailability.state)}`}
+		                    >
+		                      {availabilityLabel(webhookInputAvailability.state)}
+		                    </Badge>
+		                  {/if}
+	                  </div>
+                  <span class="execution-viewer-helper">
+                    Exact n8n webhook input from matching executions, with explicit unavailable states until hydration succeeds
+                  </span>
+	                </div>
+	                <ChevronDown class="execution-viewer-section-chevron" data-open={openWebhookInput} />
+	              </Collapsible.Trigger>
+	              <Collapsible.Content class="execution-viewer-section-content">
+	                <div class="execution-viewer-hydration-panel">
+                  <div class="execution-viewer-hydration-row">
+                    <div class="execution-viewer-helper">
+                      Pull exact webhook input from n8n (searching last {n8nExecutionSearchLimit} executions). Change in
+                      Settings → Admin.
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onclick={refreshWebhookInputFromN8n}
+                      disabled={n8nWebhookHydrationLoading}
+                    >
+                      <RefreshCcw class="execution-viewer-button-icon-leading" />
+                      {n8nWebhookHydrationLoading ? 'Refreshing…' : 'Refresh'}
+                    </Button>
+                  </div>
+
+	                  {#if n8nWebhookHydrationError}
+	                    <div class="execution-viewer-error-text">{n8nWebhookHydrationError}</div>
+	                  {/if}
+                    {#if webhookInputAvailability?.note}
+                      <div class="execution-viewer-helper">{webhookInputAvailability.note}</div>
+                    {/if}
+	                </div>
+
+	                <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
+                  {#if webhookInputAvailability?.state === 'exact' && currentSnapshot.webhookStyleInput}
+                    <JSONViewer data={displayViewerData(currentSnapshot.webhookStyleInput)} />
+                  {:else if n8nWebhookHydrationLoading}
+                    <div class="execution-viewer-muted-copy">Loading exact webhook input from n8n…</div>
+	                  {:else}
+	                    <div class="execution-viewer-stack-sm execution-viewer-muted-copy">
+	                      <div>{webhookInputAvailability?.note ?? 'Exact webhook input is unavailable for this run.'}</div>
+	                      <div class="execution-viewer-helper">
+	                        Check Settings → API Keys for your n8n API key, then click Refresh.
+	                      </div>
+	                    </div>
+                  {/if}
+                </div>
+                <div class="execution-viewer-helper execution-viewer-helper-offset">
+                  Sensitive headers are redacted before storage.
+                </div>
+              </Collapsible.Content>
+            </Collapsible.Root>
+          {:else}
+            <div class="execution-viewer-note">
+              n8n Webhook Input is not applicable to this mode. Batshit only records that payload surface for n8n runs.
+            </div>
+          {/if}
+
+          <Collapsible.Root bind:open={openPrimaryPrompt} disabled={!currentSnapshot.primarySystemPrompt}>
+            <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
+              <div class="execution-viewer-section-label">
+                <span class="execution-viewer-section-heading">PA System Prompt</span>
+                <span class="execution-viewer-helper">Compiled system prompt for the Primary Agent</span>
+              </div>
+              <ChevronDown class="execution-viewer-section-chevron" data-open={openPrimaryPrompt} />
+            </Collapsible.Trigger>
+            <Collapsible.Content class="execution-viewer-section-content">
+              {#if currentSnapshot.primarySystemPrompt}
+                <pre class="execution-viewer-pre execution-viewer-pre-tall">
+{displayViewerText(currentSnapshot.primarySystemPrompt)}
+                </pre>
+              {/if}
+            </Collapsible.Content>
+          </Collapsible.Root>
+
+          <Collapsible.Root bind:open={openSubagentPrompts} disabled={!currentSnapshot.subagentPrompts || Object.keys(currentSnapshot.subagentPrompts).length === 0}>
+            <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
+              <div class="execution-viewer-section-label">
+                <span class="execution-viewer-section-heading">SA System Prompts</span>
+                <span class="execution-viewer-helper">Compiled prompts per Subagent</span>
+              </div>
+              <ChevronDown class="execution-viewer-section-chevron" data-open={openSubagentPrompts} />
+            </Collapsible.Trigger>
+            <Collapsible.Content class="execution-viewer-section-content">
+              {#if currentSnapshot.subagentPrompts && Object.keys(currentSnapshot.subagentPrompts).length > 0}
+                <div class="execution-viewer-panel execution-viewer-stack-md">
+                  {#each Object.entries(currentSnapshot.subagentPrompts) as [key, prompt]}
+                    <div class="execution-viewer-stack-xs">
+                      <div class="execution-viewer-eyebrow">{key}</div>
+                      <pre class="execution-viewer-pre execution-viewer-pre-short">
+{displayViewerText(typeof prompt === 'string' ? prompt : String(prompt ?? ''))}
+                      </pre>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </Collapsible.Content>
+          </Collapsible.Root>
+
+          <Collapsible.Root bind:open={openCompiledMessages} disabled={!currentSnapshot.compiledMessages || currentSnapshot.compiledMessages.length === 0}>
+            <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
+              <div class="execution-viewer-section-label">
+                <span class="execution-viewer-section-heading">Compiled Messages</span>
+                <span class="execution-viewer-helper">Chat history + current message (no system prompt)</span>
+              </div>
+              <ChevronDown class="execution-viewer-section-chevron" data-open={openCompiledMessages} />
+            </Collapsible.Trigger>
+            <Collapsible.Content class="execution-viewer-section-content">
+              <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
+                <pre class="execution-viewer-pre execution-viewer-pre-plain">
+{displayViewerText(compiledMessagesPlainText || 'No compiled messages captured for this run.')}
+                </pre>
+              </div>
+            </Collapsible.Content>
+          </Collapsible.Root>
+        </div>
+
+        <div class="execution-viewer-stack-lg execution-viewer-section-block">
+          <div class="execution-viewer-eyebrow">Response</div>
+
+          <Collapsible.Root bind:open={openResponse}>
+            <Collapsible.Trigger class="execution-viewer-section-trigger">
+              <div class="execution-viewer-section-label">
+                <div class="execution-viewer-inline-row">
+                  <span class="execution-viewer-section-heading">Final Output (What you see)</span>
+                  {#if responseSummary}
+                    <Badge
+                      variant="outline"
+                      class={`execution-viewer-confidence-badge ${confidenceClasses(responseSummary.content.confidence)}`}
+                    >
+                      {confidenceLabel(responseSummary.content.confidence)}
+                    </Badge>
+                  {/if}
+                </div>
+                <span class="execution-viewer-helper">Final assistant output + usage totals</span>
+              </div>
+              <div class="execution-viewer-inline-row">
+                {#if responseSummary && hasAnyToken(responseSummary.usage)}
+                  <Badge
+                    variant="outline"
+                    class={`execution-viewer-confidence-badge ${confidenceClasses(responseSummary.usage.inputTokens.confidence)}`}
+                  >
+                    {tokenBadgeText('Input', responseSummary.usage.inputTokens)}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    class={`execution-viewer-confidence-badge ${confidenceClasses(responseSummary.usage.outputTokens.confidence)}`}
+                  >
+                    {tokenBadgeText('Output', responseSummary.usage.outputTokens)}
+                  </Badge>
+                  <Badge
+                    variant="outline"
+                    class={`execution-viewer-confidence-badge ${confidenceClasses(responseSummary.usage.totalTokens.confidence)}`}
+                  >
+                    {tokenBadgeText('Total', responseSummary.usage.totalTokens)}
+                  </Badge>
+                {/if}
+                <ChevronDown class="execution-viewer-section-chevron" data-open={openResponse} />
+              </div>
+            </Collapsible.Trigger>
+            <Collapsible.Content class="execution-viewer-section-content">
+              {#if responseSummary}
+                <div class="execution-viewer-stack-md">
+                  <div class="execution-viewer-stats-grid execution-viewer-stats-grid-five">
+                    {#each usageDetailEntries(responseSummary.usage, modeKind) as detail}
+                      <div class="execution-viewer-stat-card">
+                        <div class="execution-viewer-stat-label">
+                          {detail.label}
+                        </div>
+                        {#if typeof detail.stat?.value === 'number'}
+                          <div class="execution-viewer-stat-row">
+                            <span class="execution-viewer-stat-value">{formatTokenValue(detail.stat.value)}</span>
+                            <Badge
+                              variant="outline"
+                              class={`execution-viewer-confidence-badge ${confidenceClasses(detail.stat.confidence)}`}
+                            >
+                              {confidenceLabel(detail.stat.confidence)}
+                            </Badge>
+                          </div>
+                        {:else}
+                          <div class="execution-viewer-stat-unavailable">{detail.unavailableText}</div>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+
+                  <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
+                    {#if typeof responseSummary.content?.value === 'string'}
+                      <pre class="execution-viewer-response-pre">
+{displayViewerText(responseSummary.content.value)}
+                      </pre>
+                    {:else}
+                      <JSONViewer data={displayViewerData(responseSummary.content?.value ?? null)} />
+                    {/if}
+                  </div>
+
+                  {#if Array.isArray(responseSummary.notes) && responseSummary.notes.length > 0}
+                    <div class="execution-viewer-note execution-viewer-stack-xs">
+                      {#each responseSummary.notes as note}
+                        <div>• {note}</div>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {:else}
+                <div class="execution-viewer-note execution-viewer-note-sm">
+                  No final response summary was captured for this run.
+                </div>
+              {/if}
+            </Collapsible.Content>
+          </Collapsible.Root>
+        </div>
+
+	        <div class="execution-viewer-stack-lg execution-viewer-section-block">
+	          <div class="execution-viewer-eyebrow">Debug</div>
+
+	          {#if rawSnapshotRequest}
+	            <Collapsible.Root bind:open={openRawSnapshotRequest}>
+	              <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-debug">
+	                <div class="execution-viewer-section-label">
+	                  <span class="execution-viewer-section-heading">Raw Snapshot Request (Debug)</span>
+	                  <span class="execution-viewer-helper">Request-side snapshot (what Batshit prepared)</span>
+	                </div>
+	                <ChevronDown class="execution-viewer-section-chevron" data-open={openRawSnapshotRequest} />
+	              </Collapsible.Trigger>
+	              <Collapsible.Content class="execution-viewer-section-content">
+	                <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
+	                  <JSONViewer data={rawSnapshotRequest} />
+	                </div>
+	              </Collapsible.Content>
+	            </Collapsible.Root>
+	          {/if}
+
+		          {#if rawProviderResponses}
+		            <Collapsible.Root bind:open={openRawProviderResponses}>
+	              <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-debug">
+	                <div class="execution-viewer-section-label">
+	                  <span class="execution-viewer-section-heading">Raw Provider Responses (Debug)</span>
+	                  <span class="execution-viewer-helper">Exact per-call provider response objects (API agents)</span>
+	                </div>
+	                <ChevronDown class="execution-viewer-section-chevron" data-open={openRawProviderResponses} />
+	              </Collapsible.Trigger>
+	              <Collapsible.Content class="execution-viewer-section-content">
+	                <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
+	                  <JSONViewer data={rawProviderResponses} />
+	                </div>
+		              </Collapsible.Content>
+		            </Collapsible.Root>
+              {:else}
+                <div class="execution-viewer-note">
+                  {rawProviderResponsesUnavailableMessage(modeKind)}
+                </div>
+		          {/if}
+
+	          {#if runtimeDetails?.eventLog?.length}
+	            <Collapsible.Root bind:open={openRawEvents}>
+	              <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-debug">
+	                <div class="execution-viewer-section-label">
+	                  <span class="execution-viewer-section-heading">Raw Runtime Events (Debug)</span>
+	                  <span class="execution-viewer-helper">
+	                    Runtime event log ({runtimeDetails.eventLog.length})
+	                  </span>
+	                </div>
+	                <ChevronDown class="execution-viewer-section-chevron" data-open={openRawEvents} />
+	              </Collapsible.Trigger>
+	              <Collapsible.Content class="execution-viewer-section-content">
+	                <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
+	                  <JSONViewer data={displayViewerData(runtimeDetails.eventLog)} />
+	                </div>
+	              </Collapsible.Content>
+	            </Collapsible.Root>
+            {:else}
+              <div class="execution-viewer-note">
+                {runtimeFieldUnavailable(modeKind, 'runtimeEvents')}
+              </div>
+	          {/if}
+        </div>
+      {/if}
+    </div>
+  </Sheet.Content>
+</Sheet.Root>
+
+<style>
+  :global(.execution-viewer-sheet) {
+    display: flex;
+    width: 100%;
+    max-width: min(48rem, 100vw);
+    flex-direction: column;
+  }
+
+  :global(.execution-viewer-header) {
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+  }
+
+  :global(.execution-viewer-title) {
+    font-size: 1.25rem;
+    line-height: 1.35;
+  }
+
+  .execution-viewer-body,
+  .execution-viewer-stack-lg,
+  .execution-viewer-stack-md,
+  .execution-viewer-stack-sm,
+  .execution-viewer-stack-xs,
+  .execution-viewer-section-label,
+  .execution-viewer-provider-session,
+  .execution-viewer-hydration-panel,
+  .execution-viewer-muted-copy {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .execution-viewer-body {
+    flex: 1 1 0;
+    gap: 16px;
+    overflow-y: auto;
+    padding: 20px 24px;
+  }
+
+  .execution-viewer-stack-lg {
+    gap: 16px;
+  }
+
+  .execution-viewer-stack-md {
+    gap: 12px;
+  }
+
+  .execution-viewer-stack-sm {
+    gap: 8px;
+  }
+
+  .execution-viewer-stack-xs,
+  .execution-viewer-provider-session,
+  .execution-viewer-muted-copy {
+    gap: 4px;
+  }
+
+  .execution-viewer-loading,
+  .execution-viewer-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted-foreground);
+    font-size: 0.875rem;
+  }
+
+  .execution-viewer-loading {
+    height: 12rem;
+  }
+
+  .execution-viewer-empty {
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 32px 16px;
+    text-align: center;
+  }
+
+  .execution-viewer-error {
+    border: 1px solid oklch(from var(--destructive) l c h / 0.4);
+    border-radius: 6px;
+    background: oklch(from var(--destructive) l c h / 0.1);
+    color: var(--destructive);
+    padding: 12px 16px;
+    font-size: 0.875rem;
+  }
+
+  .execution-viewer-error-compact {
+    padding: 8px 12px;
+  }
+
+  .execution-viewer-error-text {
+    color: var(--destructive);
+    font-size: 0.75rem;
+  }
+
+  .execution-viewer-run-row,
+  .execution-viewer-wrap-row,
+  .execution-viewer-inline-row,
+  .execution-viewer-value-row,
+  .execution-viewer-stat-row,
+  .execution-viewer-hydration-row {
+    display: flex;
+    align-items: center;
+  }
+
+  .execution-viewer-run-row {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .execution-viewer-base64-toggle {
+    display: flex;
+    min-height: 32px;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: oklch(from var(--muted) l c h / 0.18);
+    padding: 4px 8px;
+  }
+
+  .execution-viewer-base64-toggle-label {
+    color: var(--muted-foreground);
+    font-size: 0.75rem;
+    line-height: 1.2;
+    white-space: nowrap;
+  }
+
+  .execution-viewer-wrap-row {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .execution-viewer-inline-row,
+  .execution-viewer-value-row,
+  .execution-viewer-stat-row {
+    gap: 8px;
+  }
+
+  .execution-viewer-stat-row {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .execution-viewer-stat-value {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .execution-viewer-flex-spacer {
+    flex: 1 1 0;
+  }
+
+  .execution-viewer-eyebrow,
+  .execution-viewer-stat-label {
+    color: var(--muted-foreground);
+    font-size: 0.75rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .execution-viewer-run-select {
+    height: 32px;
+    border: 1px solid var(--input);
+    border-radius: 6px;
+    background: var(--background);
+    padding-inline: 8px;
+    font-size: 0.875rem;
+  }
+
+  .execution-viewer-run-select:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px oklch(from var(--ring) l c h / 0.5);
+  }
+
+  :global(.execution-viewer-section-trigger) {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    justify-content: space-between;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: oklch(from var(--accent) l c h / 0.3);
+    padding: 8px 12px;
+    text-align: left;
+    transition: background-color 0.16s ease;
+  }
+
+  :global(.execution-viewer-section-trigger-strong) {
+    background: oklch(from var(--accent) l c h / 0.4);
+  }
+
+  :global(.execution-viewer-section-trigger-debug) {
+    background: oklch(from var(--accent) l c h / 0.2);
+  }
+
+  :global(.execution-viewer-section-trigger:hover) {
+    background: var(--accent);
+  }
+
+  :global(.execution-viewer-section-trigger:disabled),
+  :global(.execution-viewer-section-trigger-disabled:disabled) {
+    opacity: 0.5;
+  }
+
+  .execution-viewer-section-heading {
+    font-weight: 600;
+  }
+
+  .execution-viewer-helper,
+  .execution-viewer-muted-copy,
+  .execution-viewer-muted,
+  .execution-viewer-table-muted-cell,
+  .execution-viewer-stat-unavailable,
+  .execution-viewer-note,
+  .execution-viewer-warning-note {
+    color: var(--muted-foreground);
+  }
+
+  .execution-viewer-helper,
+  .execution-viewer-note,
+  .execution-viewer-warning-note,
+  .execution-viewer-stat-unavailable {
+    font-size: 0.75rem;
+  }
+
+  :global(.execution-viewer-section-content) {
+    padding-top: 12px;
+  }
+
+  :global(.execution-viewer-section-chevron) {
+    width: 16px;
+    height: 16px;
+    transition: transform 0.16s ease;
+  }
+
+  :global(.execution-viewer-section-chevron[data-open="true"]) {
+    transform: rotate(180deg);
+  }
+
+  .execution-viewer-card,
+  .execution-viewer-panel,
+  .execution-viewer-note,
+  .execution-viewer-warning-note,
+  .execution-viewer-message-preview,
+  .execution-viewer-code-block,
+  .execution-viewer-stat-card,
+  .execution-viewer-table-wrap,
+  .execution-viewer-json-pane,
+  .execution-viewer-pre,
+  .execution-viewer-hydration-panel {
+    border-radius: 6px;
+  }
+
+  .execution-viewer-card,
+  .execution-viewer-panel,
+  .execution-viewer-note,
+  .execution-viewer-warning-note,
+  .execution-viewer-stat-card,
+  .execution-viewer-table-wrap,
+  .execution-viewer-json-pane,
+  .execution-viewer-pre,
+  .execution-viewer-hydration-panel {
+    border: 1px solid var(--border);
+  }
+
+  .execution-viewer-card {
+    background: oklch(from var(--background) l c h / 0.4);
+    padding: 12px;
+  }
+
+  .execution-viewer-panel,
+  .execution-viewer-hydration-panel {
+    background: oklch(from var(--muted) l c h / 0.1);
+    padding: 12px;
+  }
+
+  .execution-viewer-note {
+    border-color: oklch(from var(--border) l c h / 0.6);
+    background: oklch(from var(--muted) l c h / 0.1);
+    padding: 8px 12px;
+  }
+
+  .execution-viewer-note-raised {
+    background: oklch(from var(--background) l c h / 0.6);
+  }
+
+  .execution-viewer-note-sm,
+  .execution-viewer-text-sm,
+  .execution-viewer-muted-copy {
+    font-size: 0.875rem;
+  }
+
+  .execution-viewer-warning-note {
+    border-color: oklch(0.72 0.12 85 / 0.3);
+    background: oklch(0.72 0.12 85 / 0.1);
+    padding: 8px 12px;
+  }
+
+  .execution-viewer-grid-2,
+  .execution-viewer-stats-grid {
+    display: grid;
+    gap: 12px;
+  }
+
+  .execution-viewer-stats-grid {
+    gap: 8px;
+  }
+
+  @media (min-width: 768px) {
+    .execution-viewer-grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .execution-viewer-stats-grid-five {
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+
+    .execution-viewer-stats-grid-six {
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+    }
+  }
+
+  .execution-viewer-value,
+  .execution-viewer-stat-value,
+  .execution-viewer-table-primary-cell {
+    font-weight: 500;
+  }
+
+  .execution-viewer-message-preview,
+  .execution-viewer-code-block {
+    background: oklch(from var(--muted) l c h / 0.4);
+    padding: 8px 12px;
+  }
+
+  .execution-viewer-message-preview {
+    font-size: 0.875rem;
+    line-height: 1.6;
+  }
+
+  .execution-viewer-break-all {
+    word-break: break-all;
+  }
+
+  .execution-viewer-code-block,
+  .execution-viewer-pre {
+    font-size: 0.75rem;
+  }
+
+  .execution-viewer-stat-card {
+    background: oklch(from var(--background) l c h / 0.5);
+    padding: 8px 12px;
+  }
+
+  .execution-viewer-table-wrap {
+    overflow-x: auto;
+    background: var(--background);
+  }
+
+  .execution-viewer-table {
+    width: 100%;
+    font-size: 0.875rem;
+    border-collapse: collapse;
+  }
+
+  .execution-viewer-table-head {
+    border-bottom: 1px solid var(--border);
+    background: oklch(from var(--muted) l c h / 0.2);
+    color: var(--muted-foreground);
+    font-size: 0.75rem;
+  }
+
+  .execution-viewer-table-heading,
+  .execution-viewer-table-primary-cell,
+  .execution-viewer-table-cell,
+  .execution-viewer-table-muted-cell {
+    padding: 8px 12px;
+    text-align: left;
+  }
+
+  .execution-viewer-table-heading {
+    font-weight: 500;
+  }
+
+  .execution-viewer-table-row {
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+    transition: background-color 0.16s ease;
+  }
+
+  .execution-viewer-table-row:last-child {
+    border-bottom: 0;
+  }
+
+  .execution-viewer-table-row:hover {
+    background: oklch(from var(--muted) l c h / 0.3);
+  }
+
+  .execution-viewer-table-row[data-selected="true"] {
+    background: oklch(from var(--muted) l c h / 0.6);
+  }
+
+  .execution-viewer-json-pane {
+    max-height: 20rem;
+    overflow-y: auto;
+    background: oklch(from var(--muted) l c h / 0.1);
+    padding: 12px;
+  }
+
+  .execution-viewer-json-pane-tall {
+    max-height: 24rem;
+  }
+
+  .execution-viewer-pre {
+    overflow-y: auto;
+    background: oklch(from var(--muted) l c h / 0.1);
+    padding: 12px;
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    line-height: 1.6;
+  }
+
+  .execution-viewer-pre-short {
+    max-height: 14rem;
+    border: 0;
+    background: oklch(from var(--muted) l c h / 0.2);
+  }
+
+  .execution-viewer-pre-tall {
+    max-height: 24rem;
+  }
+
+  .execution-viewer-pre-plain {
+    border: 0;
+    background: transparent;
+    padding: 0;
+  }
+
+  .execution-viewer-response-pre {
+    white-space: pre-wrap;
+    font-size: 0.875rem;
+    line-height: 1.6;
+  }
+
+  .execution-viewer-hydration-panel {
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .execution-viewer-hydration-row {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  @media (min-width: 640px) {
+    .execution-viewer-hydration-row {
+      flex-direction: row;
+      align-items: center;
+    }
+  }
+
+  :global(.execution-viewer-button-icon-leading) {
+    width: 14px;
+    height: 14px;
+    margin-right: 8px;
+  }
+
+  .execution-viewer-helper-offset {
+    padding-top: 8px;
+  }
+
+  .execution-viewer-section-block {
+    padding-top: 8px;
+  }
+
+  :global(.execution-viewer-confidence-badge) {
+    border-width: 1px;
+    border-style: solid;
+    font-size: 0.6875rem;
+    font-weight: 400;
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  :global(.execution-viewer-confidence-exact),
+  :global(.execution-viewer-tool-status-success) {
+    border-color: oklch(0.67 0.13 151 / 0.36);
+    background: oklch(0.67 0.13 151 / 0.11);
+    color: oklch(0.76 0.12 151);
+  }
+
+  :global(.execution-viewer-confidence-near) {
+    border-color: oklch(0.73 0.14 132 / 0.36);
+    background: oklch(0.73 0.14 132 / 0.11);
+    color: oklch(0.78 0.12 132);
+  }
+
+  :global(.execution-viewer-confidence-estimated),
+  :global(.execution-viewer-tool-status-partial) {
+    border-color: oklch(0.75 0.13 85 / 0.36);
+    background: oklch(0.75 0.13 85 / 0.11);
+    color: oklch(0.82 0.12 85);
+  }
+
+  :global(.execution-viewer-confidence-speculative) {
+    border-color: oklch(0.72 0.14 55 / 0.36);
+    background: oklch(0.72 0.14 55 / 0.11);
+    color: oklch(0.8 0.12 55);
+  }
+
+  :global(.execution-viewer-confidence-muted) {
+    border-color: var(--border);
+    background: oklch(from var(--muted) l c h / 0.3);
+    color: var(--muted-foreground);
+  }
+
+  :global(.execution-viewer-tool-status-error) {
+    border-color: oklch(from var(--destructive) l c h / 0.4);
+    background: oklch(from var(--destructive) l c h / 0.1);
+    color: var(--destructive);
+  }
+</style>

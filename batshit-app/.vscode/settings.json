@@ -1,0 +1,60 @@
+{
+  // TypeScript Settings - Aligned with svelte-check
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTypescript": true,
+
+  // Use the same TypeScript settings as npm run check
+  "typescript.validate.enable": true,
+  "javascript.validate.enable": true,
+
+  // Svelte Settings - Match svelte-check behavior
+  "svelte.enable-ts-plugin": true,
+  "svelte.plugin.svelte.compilerWarnings": {
+    // Show all warnings that svelte-check shows
+    "css-unused-selector": "warning",
+    "unused-export-let": "warning"
+  },
+
+  // Editor Settings - Show errors/warnings prominently
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "svelte.svelte-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll": "explicit",
+    "source.organizeImports": "explicit"
+  },
+
+  // File Associations
+  "[svelte]": {
+    "editor.defaultFormatter": "svelte.svelte-vscode"
+  },
+
+  // Problems Panel - Show what matters
+  "problems.showCurrentInStatus": true,
+  "problems.sortOrder": "severity",
+
+  // Files to exclude from TypeScript checking (match tsconfig)
+  "files.exclude": {
+    "**/.svelte-kit": true,
+    "**/node_modules": true
+  },
+
+  // Exclude vendor code from search/problems
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/.svelte-kit": true,
+    "**/dist": true,
+    "**/build": true,
+    // Vendor UI components - DO NOT MODIFY
+    "**/src/lib/components/ui/**": true
+  },
+
+  // TypeScript: Ignore specific vendor paths
+  "typescript.tsserver.exclude": [
+    "**/node_modules",
+    "**/.svelte-kit",
+    "**/dist",
+    "**/build",
+    // Vendor UI components
+    "**/src/lib/components/ui/**"
+  ]
+}

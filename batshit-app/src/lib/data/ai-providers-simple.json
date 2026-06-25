@@ -1,0 +1,79 @@
+{
+  "openai": {
+    "displayName": "OpenAI",
+    "hasModels": true,
+    "settingsCount": 9,
+    "supportsStreaming": true,
+    "requiresCredentials": "openAiApi"
+  },
+  "anthropic": {
+    "displayName": "Anthropic",
+    "hasModels": 5,
+    "settingsCount": 4,
+    "supportsStreaming": true,
+    "requiresCredentials": "anthropicApi"
+  },
+  "google": {
+    "displayName": "Google Gemini",
+    "hasModels": 5,
+    "settingsCount": 5,
+    "supportsStreaming": true,
+    "requiresCredentials": "googlePalmApi"
+  },
+  "ollama": {
+    "displayName": "Ollama",
+    "hasModels": true,
+    "settingsCount": 11,
+    "supportsStreaming": true,
+    "requiresCredentials": "ollamaApi"
+  },
+  "groq": {
+    "displayName": "Groq",
+    "hasModels": 7,
+    "settingsCount": 6,
+    "supportsStreaming": true,
+    "requiresCredentials": "groqApi"
+  },
+  "mistral": {
+    "displayName": "Mistral AI",
+    "hasModels": 9,
+    "settingsCount": 5,
+    "supportsStreaming": true,
+    "requiresCredentials": "mistralCloudApi"
+  },
+  "azure": {
+    "displayName": "Azure OpenAI",
+    "hasModels": true,
+    "settingsCount": 6,
+    "supportsStreaming": true,
+    "requiresCredentials": "azureOpenAiApi"
+  },
+  "bedrock": {
+    "displayName": "AWS Bedrock",
+    "hasModels": 23,
+    "settingsCount": 3,
+    "supportsStreaming": true,
+    "requiresCredentials": "aws"
+  },
+  "vertex": {
+    "displayName": "Google Vertex AI",
+    "hasModels": 6,
+    "settingsCount": 4,
+    "supportsStreaming": true,
+    "requiresCredentials": "googleVertexAiOAuth2Api"
+  },
+  "deepseek": {
+    "displayName": "DeepSeek",
+    "hasModels": 2,
+    "settingsCount": 6,
+    "supportsStreaming": true,
+    "requiresCredentials": "deepSeekApi"
+  },
+  "openrouter": {
+    "displayName": "OpenRouter",
+    "hasModels": true,
+    "settingsCount": 9,
+    "supportsStreaming": true,
+    "requiresCredentials": "openRouterApi"
+  }
+}

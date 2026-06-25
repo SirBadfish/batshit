@@ -1,0 +1,496 @@
+<script lang="ts">
+  import { Button } from '$lib/components/ui/button'
+  import * as Tooltip from '$lib/components/ui/tooltip'
+  import { Archive, Coins, FileText, RotateCcw, Scissors } from '@lucide/svelte'
+
+  let {
+    currentTokens = 0,
+    contextLimit = null,
+    contextPercent = null,
+    contextState = 'unknown',
+    contextLabel = 'Unknown',
+    contextDetail = 'Context usage is unavailable.',
+    trimmedTokens = 0,
+    costLabel = 'Unknown',
+    costDetail = 'Cost is unavailable.',
+    costState = 'unknown',
+    trimAvailable = false,
+    trimUnavailableReason = 'Manual trim is unavailable.',
+    trimBusy = false,
+    compactAvailable = false,
+    compactUnavailableReason = 'Compact is unavailable.',
+    compactBusy = false,
+    compactStatus = null,
+    compactedTokens = 0,
+    onTrim = () => {},
+    onCompact = () => {},
+    onResetTrim = () => {},
+    onOpenExecutionViewer = () => {}
+  } = $props<{
+    currentTokens?: number | null
+    contextLimit?: number | null
+    contextPercent?: number | null
+    contextState?: 'exact' | 'near' | 'estimated' | 'unknown'
+    contextLabel?: string
+    contextDetail?: string
+    trimmedTokens?: number
+    costLabel?: string
+    costDetail?: string
+    costState?: 'exact' | 'estimated' | 'unknown'
+    trimAvailable?: boolean
+    trimUnavailableReason?: string
+    trimBusy?: boolean
+    compactAvailable?: boolean
+    compactUnavailableReason?: string
+    compactBusy?: boolean
+    compactStatus?: string | null
+    compactedTokens?: number
+    onTrim?: (tokensToTrim: number) => void | Promise<void>
+    onCompact?: () => void | Promise<void>
+    onResetTrim?: () => void
+    onOpenExecutionViewer?: () => void
+  }>()
+
+  const resolvedContextPercent = $derived.by(() => {
+    if (typeof contextPercent === 'number' && Number.isFinite(contextPercent)) {
+      return Math.max(0, Math.min(contextPercent, 100))
+    }
+    if (!contextLimit || contextLimit <= 0) return null
+    const safeCurrentTokens =
+      typeof currentTokens === 'number' && Number.isFinite(currentTokens) ? currentTokens : null
+    if (safeCurrentTokens === null) return null
+    return Math.max(0, Math.min((safeCurrentTokens / contextLimit) * 100, 100))
+  })
+
+  const contextPercentLabel = $derived.by(() => {
+    if (resolvedContextPercent === null) return 'Unknown'
+    const prefix = contextState === 'estimated' || contextState === 'near' ? '~' : ''
+    return `${prefix}${Math.round(resolvedContextPercent)}%`
+  })
+
+  const ringCircumference = 2 * Math.PI * 16
+  const ringOffset = $derived.by(() => {
+    if (resolvedContextPercent === null) return ringCircumference
+    return ringCircumference - (ringCircumference * resolvedContextPercent) / 100
+  })
+
+  function formatRoundedThousands(value: number | null | undefined): string {
+    if (!Number.isFinite(value)) return 'Unknown'
+    const safeValue = Math.max(0, Math.round(value as number))
+    if (safeValue < 1000) return `${safeValue}`
+    const roundedThousands = Math.round(safeValue / 1000)
+    if (roundedThousands < 1000) return `${roundedThousands}K`
+    const roundedMillions = Math.round((safeValue / 1_000_000) * 10) / 10
+    return `${roundedMillions.toFixed(Number.isInteger(roundedMillions) ? 0 : 1)}M`
+  }
+
+  function formatPercentUsed(value: number | null): string {
+    if (value === null) return 'Unknown'
+    const used = Math.round(value)
+    const left = Math.max(0, 100 - used)
+    return `${used}% used (${left}% left)`
+  }
+
+  function handleTrimClick() {
+    if (!trimAvailable || trimBusy) return
+    onTrim(50_000)
+  }
+
+  function handleCompactClick() {
+    if (!compactAvailable || compactBusy) return
+    onCompact()
+  }
+
+  function formatTrimmed(value: number): string {
+    if (value <= 0) return '0 trimmed'
+    return `${formatRoundedThousands(value)} trimmed`
+  }
+
+  function formatCompacted(value: number): string {
+    if (value <= 0) return '0 compacted'
+    return `${formatRoundedThousands(value)} compacted`
+  }
+</script>
+
+<Tooltip.Provider delayDuration={0}>
+  <div class="token-panel">
+    <div class="token-panel-bar">
+      <Tooltip.Root>
+        <Tooltip.Trigger
+          class="token-panel-trigger"
+          aria-label="View running chat cost"
+          data-ab-control="token-running-cost"
+        >
+          <Coins class="token-panel-trigger-icon" />
+          <span>{costLabel}</span>
+        </Tooltip.Trigger>
+        <Tooltip.Content side="top" class="token-panel-tooltip is-cost">
+          <div class="token-panel-tooltip-stack">
+            <div class="token-panel-tooltip-section">
+              <div class="token-panel-tooltip-title">Running chat cost</div>
+              <div>{costDetail}</div>
+            </div>
+            {#if contextDetail}
+              <div class="token-panel-tooltip-section">
+                <div class="token-panel-tooltip-title">Context window estimate</div>
+                <div>{contextDetail}</div>
+              </div>
+            {/if}
+          </div>
+        </Tooltip.Content>
+      </Tooltip.Root>
+
+      <Tooltip.Root>
+        <Tooltip.Trigger
+          class="token-panel-trigger"
+          aria-label="View context usage"
+          data-ab-control="token-context-usage"
+        >
+          <span class="token-panel-ring">
+            <svg class="token-panel-ring-svg" viewBox="0 0 40 40" aria-hidden="true">
+              <circle
+                cx="20"
+                cy="20"
+                r="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-opacity="0.18"
+                stroke-width="3"
+              />
+              <circle
+                cx="20"
+                cy="20"
+                r="16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="3"
+                stroke-linecap="round"
+                stroke-dasharray={ringCircumference}
+                stroke-dashoffset={ringOffset}
+                class="token-panel-ring-meter"
+                class:is-danger={resolvedContextPercent !== null && resolvedContextPercent >= 90}
+                class:is-warning={resolvedContextPercent !== null && resolvedContextPercent >= 80 && resolvedContextPercent < 90}
+                class:is-unknown={resolvedContextPercent === null}
+              />
+            </svg>
+          </span>
+          <span>{contextPercentLabel}</span>
+        </Tooltip.Trigger>
+        <Tooltip.Content side="top" class="token-panel-tooltip is-context">
+          <div class="token-panel-tooltip-stack">
+            <div class="token-panel-tooltip-title">Context window</div>
+            <div class="token-panel-tooltip-emphasis">{contextLabel}</div>
+            <div>{formatPercentUsed(resolvedContextPercent)}</div>
+            <div>
+              {formatRoundedThousands(currentTokens)} / {formatRoundedThousands(contextLimit)} tokens used
+            </div>
+          </div>
+        </Tooltip.Content>
+      </Tooltip.Root>
+
+      <Button
+        size="sm"
+        variant="outline"
+        onclick={handleTrimClick}
+        disabled={!trimAvailable || trimBusy}
+        class="token-panel-trim-button"
+        aria-label="Trim 50k from active send context"
+        title={trimBusy ? 'Calculating trim preview' : trimAvailable ? 'Trim 50k from active send context' : trimUnavailableReason}
+        data-testid="token-trim-50k-button"
+        data-ab-control="token-trim-50k"
+      >
+        <Scissors class="token-panel-button-icon" />
+        {trimBusy ? 'Calculating...' : 'Trim 50k'}
+      </Button>
+
+      <span class="token-panel-trimmed">{formatTrimmed(trimmedTokens)}</span>
+
+      <Button
+        size="icon"
+        variant="ghost"
+        onclick={onResetTrim}
+        disabled={trimmedTokens <= 0}
+        class="token-panel-icon-button is-reset"
+        aria-label="Reset manual trim"
+        title="Reset manual trim"
+        data-testid="token-trim-reset-button"
+        data-ab-control="token-trim-reset"
+      >
+        <RotateCcw class="token-panel-icon-button-icon" />
+      </Button>
+
+      <Button
+        size="sm"
+        variant="outline"
+        onclick={handleCompactClick}
+        disabled={!compactAvailable || compactBusy}
+        class="token-panel-trim-button"
+        aria-label="Compact older chat context"
+        title={compactBusy ? (compactStatus || 'Compacting context') : compactAvailable ? 'Compact older chat context' : compactUnavailableReason}
+        data-testid="token-compact-button"
+        data-ab-control="token-compact"
+      >
+        {#if compactBusy}
+          <span class="token-panel-spinner" aria-hidden="true"></span>
+        {:else}
+          <Archive class="token-panel-button-icon" />
+        {/if}
+        {compactBusy ? 'Compacting...' : 'Compact'}
+      </Button>
+
+      <span class="token-panel-trimmed">{formatCompacted(compactedTokens)}</span>
+
+      <div class="token-panel-spacer"></div>
+
+      <Button
+        size="icon"
+        variant="ghost"
+        onclick={onOpenExecutionViewer}
+        class="token-panel-icon-button"
+        aria-label="Open Execution Viewer"
+        title="Open Execution Viewer"
+        data-testid="token-execution-viewer-button"
+        data-ab-control="open-execution-viewer"
+      >
+        <FileText class="token-panel-icon-button-icon" />
+      </Button>
+    </div>
+    {#if compactBusy}
+      <div class="token-panel-compact-status" role="status" aria-live="polite">
+        <span class="token-panel-spinner is-inline" aria-hidden="true"></span>
+        <span>{compactStatus || 'Compacting context...'}</span>
+      </div>
+    {/if}
+  </div>
+</Tooltip.Provider>
+
+<style>
+  .token-panel {
+    padding: 0.25rem 1rem 0.5rem;
+    margin-top: 5px;
+    background: var(--background);
+  }
+
+  :global(body.goon-immersive) .token-panel {
+    background: transparent;
+    backdrop-filter: blur(6px);
+  }
+
+  .token-panel-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    width: 100%;
+    max-width: 52rem;
+    margin: 0 auto;
+    color: var(--bs-app-muted-text);
+    font-size: 0.75rem;
+  }
+
+  :global(body.goon-immersive) .token-panel-bar {
+    color: oklch(0.96 0.006 289.95 / 0.82);
+  }
+
+  :global(.token-panel-trigger) {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-right: 0.375rem;
+    padding: 0.375rem 0.25rem;
+    border: 0;
+    background: transparent;
+    color: var(--bs-app-muted-text);
+    font-size: 0.6875rem;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 150ms ease-out;
+  }
+
+  :global(.token-panel-trigger:hover),
+  :global(.token-panel-trigger:focus-visible) {
+    color: var(--bs-app-title);
+    outline: none;
+  }
+
+  :global(body.goon-immersive .token-panel-trigger) {
+    color: oklch(0.96 0.006 289.95 / 0.8);
+  }
+
+  :global(body.goon-immersive .token-panel-trigger:hover),
+  :global(body.goon-immersive .token-panel-trigger:focus-visible) {
+    color: oklch(0.99 0.002 289.95);
+  }
+
+  :global(.token-panel-trigger-icon),
+  :global(.token-panel-button-icon),
+  :global(.token-panel-icon-button-icon) {
+    width: 14px;
+    height: 14px;
+    color: currentColor;
+  }
+
+  :global(.token-panel-button-icon) {
+    margin-right: 0.25rem;
+  }
+
+  .token-panel-spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    margin-right: 0.25rem;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 999px;
+    animation: token-panel-spin 780ms linear infinite;
+  }
+
+  .token-panel-spinner.is-inline {
+    margin-right: 0;
+  }
+
+  :global(.token-panel-tooltip) {
+    color: var(--bs-app-text);
+  }
+
+  :global(.token-panel-tooltip.is-cost) {
+    max-width: 300px;
+  }
+
+  :global(.token-panel-tooltip.is-context) {
+    max-width: 240px;
+  }
+
+  .token-panel-tooltip-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+  }
+
+  .token-panel-tooltip-title {
+    color: var(--bs-app-title);
+    font-weight: 500;
+  }
+
+  .token-panel-tooltip-section + .token-panel-tooltip-section {
+    margin-top: 0.35rem;
+    padding-top: 0.45rem;
+    border-top: 1px solid var(--bs-app-inner-line);
+  }
+
+  .token-panel-tooltip-emphasis {
+    color: var(--bs-app-title);
+    font-weight: 500;
+  }
+
+  .token-panel-ring {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+  }
+
+  .token-panel-ring-svg {
+    width: 24px;
+    height: 24px;
+    transform: rotate(-90deg);
+  }
+
+  .token-panel-ring-meter {
+    color: var(--bs-app-primary-line);
+  }
+
+  .token-panel-ring-meter.is-danger {
+    color: var(--destructive);
+  }
+
+  .token-panel-ring-meter.is-warning {
+    color: oklch(0.72 0.13 64);
+  }
+
+  .token-panel-ring-meter.is-unknown {
+    color: var(--bs-app-muted-text);
+  }
+
+  :global(.token-panel-trim-button) {
+    height: 28px;
+    padding: 0 0.75rem;
+    border-radius: 999px;
+    border-color: var(--bs-app-field-line);
+    background: var(--bs-app-field);
+    color: var(--bs-app-muted-text);
+    font-size: 0.6875rem;
+  }
+
+  :global(body.goon-immersive .token-panel-trim-button),
+  :global(body.goon-immersive .token-panel-icon-button) {
+    border-color: oklch(0.92 0.006 289.95 / 0.22);
+    background: oklch(0.13 0.02 276 / 0.42);
+    color: oklch(0.96 0.006 289.95 / 0.84);
+    backdrop-filter: blur(8px);
+  }
+
+  :global(.token-panel-trim-button:hover),
+  :global(.token-panel-icon-button:hover) {
+    background: var(--bs-app-field-hover);
+    color: var(--bs-app-title);
+  }
+
+  :global(.token-panel-trim-button:disabled) {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  :global(body.goon-immersive .token-panel-trim-button:hover),
+  :global(body.goon-immersive .token-panel-icon-button:hover) {
+    border-color: oklch(0.96 0.006 289.95 / 0.32);
+    background: oklch(0.18 0.025 276 / 0.66);
+    color: oklch(0.99 0.002 289.95);
+  }
+
+  .token-panel-trimmed {
+    margin-right: 0.375rem;
+    color: var(--bs-app-muted-text);
+  }
+
+  :global(body.goon-immersive) .token-panel-trimmed {
+    color: oklch(0.96 0.006 289.95 / 0.74);
+  }
+
+  .token-panel-spacer {
+    margin-left: auto;
+  }
+
+  .token-panel-compact-status {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    width: 100%;
+    max-width: 52rem;
+    margin: 0.35rem auto 0;
+    color: var(--bs-app-muted-text);
+    font-size: 0.7rem;
+    line-height: 1.2;
+  }
+
+  :global(.token-panel-icon-button) {
+    width: 28px;
+    height: 28px;
+    border-radius: 999px;
+    color: var(--bs-app-muted-text);
+  }
+
+  :global(.token-panel-icon-button.is-reset) {
+    margin-left: -0.5rem;
+  }
+
+  @keyframes token-panel-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+</style>

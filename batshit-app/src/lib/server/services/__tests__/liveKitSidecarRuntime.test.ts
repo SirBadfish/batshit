@@ -1,0 +1,188 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mockGetRuntimeAddonStatus = vi.fn()
+const mockControlRuntimeAddon = vi.fn()
+const mockInspectLocalLiveKitPortOwner = vi.fn()
+
+function dockerAddonStatus() {
+  return {
+    id: 'livekit',
+    label: 'LiveKit',
+    running: false,
+    available: false,
+    reason: 'LiveKit server is not reachable.',
+    details: {
+      browserUrl: 'ws://localhost:7880',
+      agentHealthUrl: 'http://livekit-agent:7899/worker',
+      server: {
+        ready: false,
+        statusHint: 'LiveKit server is not reachable.'
+      }
+    }
+  }
+}
+
+vi.mock('$lib/server/services/runtimeAddons', () => ({
+  getRuntimeAddonStatus: (...args: any[]) => mockGetRuntimeAddonStatus(...args),
+  controlRuntimeAddon: (...args: any[]) => mockControlRuntimeAddon(...args)
+}))
+
+vi.mock('$lib/server/redis', () => ({
+  redis: {
+    getUserSettings: vi.fn(async () => null)
+  }
+}))
+
+vi.mock('$lib/services/apiKey.server', () => ({
+  apiKeyService: {
+    retrieve: vi.fn(async () => null),
+    store: vi.fn(async () => undefined)
+  }
+}))
+
+vi.mock('$lib/server/services/internalRequestAuth', () => ({
+  getConfiguredInternalToken: vi.fn(() => 'test-token')
+}))
+
+vi.mock('$lib/server/services/liveKitVoiceRuntime', () => ({
+  resolveLiveKitVoiceRuntimeConfigForUser: vi.fn(async () => ({
+    serverUrl: 'ws://127.0.0.1:7880',
+    dispatchServerUrl: 'ws://127.0.0.1:7880',
+    apiKey: 'batshit-local',
+    apiSecret: 'secret',
+    tokenTtlSec: 600,
+    roomPrefix: 'batshit-voice',
+    selfHosted: true,
+    agentName: 'batshit-livekit-agent',
+    autoDispatchAgent: true
+  }))
+}))
+
+vi.mock('$lib/server/services/liveKitNativeRuntimeInstaller', () => ({
+  fetchLiveKitServerReady: vi.fn(async () => false),
+  getLocalLiveKitPort: vi.fn(() => 7880),
+  getNativeLiveKitInstallStatus: vi.fn(async () => ({
+    supported: true,
+    installed: false,
+    serverInstalled: false,
+    sidecarInstalled: false,
+    reason: 'Native LiveKit runtime is not installed yet.',
+    version: '1.12.0',
+    serverInstallRoot: '/tmp/livekit-server',
+    sidecarInstallRoot: '/tmp/livekit-sidecar',
+    serverBinaryPath: null,
+    sidecarPackagePath: null,
+    serverManifest: null,
+    sidecarManifest: null
+  })),
+  inspectLocalLiveKitPortOwner: (...args: any[]) => mockInspectLocalLiveKitPortOwner(...args),
+  installNativeLiveKitRuntime: vi.fn(async () => ({
+    installed: true,
+    credentialsSaved: true,
+    serverUrl: 'ws://127.0.0.1:7880',
+    apiKey: 'batshit-local',
+    status: {
+      supported: true,
+      installed: true,
+      serverInstalled: true,
+      sidecarInstalled: true,
+      reason: null,
+      version: '1.12.0',
+      serverInstallRoot: '/tmp/livekit-server',
+      sidecarInstallRoot: '/tmp/livekit-sidecar',
+      serverBinaryPath: '/tmp/livekit-server/livekit-server',
+      sidecarPackagePath: '/tmp/livekit-sidecar',
+      serverManifest: null,
+      sidecarManifest: null
+    }
+  })),
+  liveKitServerHttpUrl: vi.fn(() => 'http://127.0.0.1:7880'),
+  resolveNativeLiveKitSidecarInstallRoot: vi.fn(() => '/tmp/livekit-sidecar'),
+  startNativeLiveKitServerRuntime: vi.fn(async () => ({
+    started: false,
+    alreadyRunning: false,
+    pid: null,
+    logPath: null,
+    statusHint: 'Native LiveKit server is not installed yet.'
+  }))
+}))
+
+import {
+  getLiveKitSidecarRuntimeSummary,
+  startLiveKitSidecarRuntime
+} from '$lib/server/services/liveKitSidecarRuntime'
+
+describe('liveKitSidecarRuntime', () => {
+  let originalContainerized: string | undefined
+  let originalRuntimeEnv: string | undefined
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    originalContainerized = process.env.BATSHIT_CONTAINERIZED
+    originalRuntimeEnv = process.env.BATSHIT_RUNTIME_ENV
+    delete process.env.BATSHIT_CONTAINERIZED
+    delete process.env.BATSHIT_RUNTIME_ENV
+    mockGetRuntimeAddonStatus.mockResolvedValue(dockerAddonStatus())
+    mockControlRuntimeAddon.mockResolvedValue({
+      success: false,
+      error: 'Runtime add-on operator is not configured.',
+      after: dockerAddonStatus()
+    })
+    mockInspectLocalLiveKitPortOwner.mockResolvedValue({
+      pids: [],
+      commands: [],
+      dockerOwned: false
+    })
+  })
+
+  afterEach(() => {
+    if (typeof originalContainerized === 'string') {
+      process.env.BATSHIT_CONTAINERIZED = originalContainerized
+    } else {
+      delete process.env.BATSHIT_CONTAINERIZED
+    }
+    if (typeof originalRuntimeEnv === 'string') {
+      process.env.BATSHIT_RUNTIME_ENV = originalRuntimeEnv
+    } else {
+      delete process.env.BATSHIT_RUNTIME_ENV
+    }
+    vi.unstubAllGlobals()
+  })
+
+  it('reports the Docker LiveKit add-on as waiting in the Docker app container', async () => {
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('runtime offline')
+      })
+    )
+
+    await expect(getLiveKitSidecarRuntimeSummary('user-1')).resolves.toMatchObject({
+      id: 'livekit',
+      installed: true,
+      status: 'unreachable',
+      healthUrl: 'http://livekit-agent:7899/worker',
+      statusHint: expect.stringContaining('LiveKit server is not reachable')
+    })
+  })
+
+  it('starts Docker LiveKit through the runtime add-on operator instead of the host-style launcher', async () => {
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('runtime offline')
+      })
+    )
+
+    await expect(startLiveKitSidecarRuntime('user-1', { forceRestart: true })).resolves.toMatchObject({
+      id: 'livekit',
+      status: 'error',
+      started: false,
+      alreadyRunning: false,
+      restarted: true,
+      statusHint: expect.stringContaining('Runtime add-on operator is not configured')
+    })
+  })
+})
