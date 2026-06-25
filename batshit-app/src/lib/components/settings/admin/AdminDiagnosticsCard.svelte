@@ -25,17 +25,30 @@
     exportBusy: boolean
     preview: DiagnosticsPreviewSummary | null
     error: string | null
+    open?: boolean
+    openNonce?: number
     onPreview: () => void
     onExport: () => void
   }
 
-  let { previewBusy, exportBusy, preview, error, onPreview, onExport }: Props = $props()
+  let {
+    previewBusy,
+    exportBusy,
+    preview,
+    error,
+    open = false,
+    openNonce = 0,
+    onPreview,
+    onExport
+  }: Props = $props()
 </script>
 
+{#key openNonce}
 <SettingsAccordionCard
   name="admin-settings-cards"
   title="Diagnostics"
   icon={Bug}
+  {open}
   contentClass="space-y-4"
 >
   {#snippet info()}
@@ -193,3 +206,4 @@
     {/if}
   </div>
 </SettingsAccordionCard>
+{/key}

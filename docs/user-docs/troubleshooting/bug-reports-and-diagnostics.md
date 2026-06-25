@@ -4,6 +4,15 @@ When you report a Batshit bug, the most useful attachment is a diagnostics zip f
 
 ## Export diagnostics
 
+Fast path:
+
+1. Click the bug icon under the chat bar.
+2. Review the Diagnostics preview.
+3. Click Download Diagnostics Zip.
+4. Attach the zip to your GitHub issue if you are comfortable sharing it.
+
+Manual path:
+
 1. Open Settings -> Admin.
 2. Find Diagnostics.
 3. Click Export Diagnostics.
@@ -65,3 +74,5 @@ Include:
 - The diagnostics zip when Batshit can open far enough to export one.
 
 Bug reports do not need perfect technical wording. Clear steps and a diagnostics zip are enough to make most issues much easier to investigate.
+
+Open the GitHub bug form here: [Report a Batshit bug](https://github.com/SirBadfish/batshit/issues/new?template=bug_report.yml).

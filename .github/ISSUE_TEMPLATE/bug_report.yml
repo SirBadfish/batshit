@@ -8,7 +8,9 @@ body:
       value: |
         Thanks for reporting this. Please do not include API keys, secrets, raw private logs, or sensitive local files.
 
-        If Batshit opens, go to Settings -> Admin -> Diagnostics, click Export Diagnostics, review the preview, then attach the downloaded diagnostics zip if you are comfortable sharing it. Diagnostics excludes chats, prompts, uploads, project files, backups, saved keys, tokens, cookies, raw Redis data, and n8n workflow contents by design.
+        If Batshit opens, click the bug icon under the chat bar or go to Settings -> Admin -> Diagnostics, review the preview, then attach the downloaded diagnostics zip if you are comfortable sharing it. Diagnostics excludes chats, prompts, uploads, project files, backups, saved keys, tokens, cookies, raw Redis data, and n8n workflow contents by design.
+
+        Full checklist: https://docs.batshit.ai/troubleshooting/bug-reports-and-diagnostics/
   - type: dropdown
     id: setup
     attributes:
@@ -47,6 +49,6 @@ body:
     id: context
     attributes:
       label: Extra context
-      description: Attach the diagnostics zip from Settings -> Admin -> Diagnostics if Batshit can open. Screenshots are also useful for visual bugs. Do not paste raw logs with secrets.
+      description: Attach the diagnostics zip from the bug icon or Settings -> Admin -> Diagnostics if Batshit can open. Screenshots are also useful for visual bugs. Do not paste raw logs with secrets.
     validations:
       required: false

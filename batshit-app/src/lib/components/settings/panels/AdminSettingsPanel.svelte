@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte'
+  import { onMount, tick, untrack } from 'svelte'
   import { debounce } from '$lib/utils/debounce'
   import { downloadBlob } from '$lib/utils/download'
   import * as Collapsible from '$lib/components/ui/collapsible'
@@ -302,7 +302,17 @@
     userSettings?: UserSettingsRow | null
   } | null
 
-  let { data = null }: { data?: PanelData } = $props()
+  let {
+    data = null,
+    initialSection = null,
+    initialAction = null,
+    initialSectionNonce = 0
+  }: {
+    data?: PanelData
+    initialSection?: 'diagnostics' | null
+    initialAction?: 'preview' | null
+    initialSectionNonce?: number
+  } = $props()
 
   let adminSettings = $state<AdminSettingsState>(normaliseAdminSettings(null))
   let persistedSignature = $state(makeSignature(normaliseAdminSettings(null)))
@@ -376,6 +386,9 @@
   let diagnosticsExportBusy = $state(false)
   let diagnosticsPreview = $state<DiagnosticsPreviewSummary | null>(null)
   let diagnosticsError = $state<string | null>(null)
+  let diagnosticsCardOpen = $state(false)
+  let diagnosticsSectionElement = $state<HTMLDivElement | null>(null)
+  let lastHandledInitialSectionNonce = $state(-1)
   let goonAssetAuditBusy = $state(false)
   let goonAssetCleanupBusy = $state(false)
   let goonAssetAudit = $state<GoonAssetAuditSummary | null>(null)
@@ -1461,6 +1474,21 @@
     }
   }
 
+  $effect(() => {
+    if (initialSection !== 'diagnostics') return
+    if (initialSectionNonce === lastHandledInitialSectionNonce) return
+
+    lastHandledInitialSectionNonce = initialSectionNonce
+    diagnosticsCardOpen = true
+
+    void tick().then(() => {
+      diagnosticsSectionElement?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+      if (initialAction === 'preview') {
+        void handleDiagnosticsPreview()
+      }
+    })
+  })
+
   async function handleBackupFileSelected(event: Event) {
     const input = event.target as HTMLInputElement
     backupSelectedFile = input.files?.[0] ?? null
@@ -1747,14 +1775,18 @@
       onRestore={handleBackupRestore}
     />
 
-    <AdminDiagnosticsCard
-      previewBusy={diagnosticsPreviewBusy}
-      exportBusy={diagnosticsExportBusy}
-      preview={diagnosticsPreview}
-      error={diagnosticsError}
-      onPreview={handleDiagnosticsPreview}
-      onExport={handleDiagnosticsExport}
-    />
+    <div bind:this={diagnosticsSectionElement}>
+      <AdminDiagnosticsCard
+        open={diagnosticsCardOpen}
+        openNonce={initialSectionNonce}
+        previewBusy={diagnosticsPreviewBusy}
+        exportBusy={diagnosticsExportBusy}
+        preview={diagnosticsPreview}
+        error={diagnosticsError}
+        onPreview={handleDiagnosticsPreview}
+        onExport={handleDiagnosticsExport}
+      />
+    </div>
 
     <AdminGoonAssetCleanupCard
       auditBusy={goonAssetAuditBusy}

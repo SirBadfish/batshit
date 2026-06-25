@@ -5832,6 +5832,18 @@ const immersiveActive = $derived.by(
       await handleArtifactSelect(artifact)
     }
   }
+
+  function openDiagnosticsPanel() {
+    window.dispatchEvent(
+      new CustomEvent('batshit:open-settings', {
+        detail: {
+          tab: 'admin',
+          section: 'diagnostics',
+          diagnosticsAction: 'preview'
+        }
+      })
+    )
+  }
 </script>
 
 <div class="chat-workspace">
@@ -5963,6 +5975,7 @@ const immersiveActive = $derived.by(
           onTrim={handleTrim}
           onResetTrim={handleResetTrim}
           onCompact={() => handleCompact()}
+          onOpenDiagnostics={openDiagnosticsPanel}
           onOpenExecutionViewer={() => {
             executionViewerOpen = true
           }}
@@ -6328,12 +6341,20 @@ const immersiveActive = $derived.by(
   .chat-header-actions-slot {
     position: fixed;
     top: 0;
+    left: calc(var(--sidebar-width, 16rem) + 2.5rem);
     right: calc(var(--sidebar-width-icon, 3rem) + 0.25rem);
     z-index: var(--z-rail);
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 0.25rem;
     height: var(--app-header-height);
+    min-width: 0;
+    pointer-events: none;
+  }
+
+  .chat-header-actions-slot :global(*) {
+    pointer-events: auto;
   }
 
   .goon-chat-overlay {

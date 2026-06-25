@@ -39,6 +39,8 @@ import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
 		| 'admin'
 		| 'dev';
 	type SettingsToolsTab = 'gateway-settings' | 'tool-grid' | 'zip-options';
+	type SettingsAdminSection = 'diagnostics';
+	type SettingsDiagnosticsAction = 'preview';
 
 	// State for settings panel
 	let settingsPanelOpen = $state(false);
@@ -47,6 +49,9 @@ import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
 	let settingsInitialModelId = $state<string | null>(null);
 	let settingsInitialToolsTab = $state<SettingsToolsTab | null>(null);
 	let settingsInitialArtifactId = $state<string | null>(null);
+	let settingsInitialAdminSection = $state<SettingsAdminSection | null>(null);
+	let settingsInitialDiagnosticsAction = $state<SettingsDiagnosticsAction | null>(null);
+	let settingsAdminSectionNonce = $state(0);
 	let settingsProjectsMode = $state<'list' | 'create' | null>(null);
 	let settingsProjectsModeNonce = $state(0);
 	
@@ -97,6 +102,8 @@ import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
 				artifactId?: string;
 				agentId?: string;
 				modelId?: string;
+				section?: SettingsAdminSection;
+				diagnosticsAction?: SettingsDiagnosticsAction;
 			} | undefined;
 			settingsInitialArtifactId = detail?.artifactId ?? null;
 			settingsInitialAgentId =
@@ -116,6 +123,15 @@ import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
 					settingsInitialToolsTab =
 						detail.tab === 'tools' ? (detail.toolsTab ?? 'gateway-settings') : null;
 				}
+			}
+			if (detail?.tab === 'admin' && detail.section === 'diagnostics') {
+				settingsInitialAdminSection = 'diagnostics';
+				settingsInitialDiagnosticsAction =
+					detail.diagnosticsAction === 'preview' ? 'preview' : null;
+				settingsAdminSectionNonce += 1;
+			} else {
+				settingsInitialAdminSection = null;
+				settingsInitialDiagnosticsAction = null;
 			}
 			if (detail?.tab === 'projects') {
 				const mode = detail?.mode === 'create' ? 'create' : 'list';
@@ -230,6 +246,8 @@ function handleUserSettingsClick() {
 	settingsInitialAgentId = null;
 	settingsInitialToolsTab = null;
 	settingsInitialArtifactId = null;
+	settingsInitialAdminSection = null;
+	settingsInitialDiagnosticsAction = null;
 	settingsProjectsMode = null;
 	settingsPanelOpen = true;
 }
@@ -731,6 +749,9 @@ function handleUiSettingsClick() {
 	initialModelId={settingsInitialModelId}
 	initialToolsTab={settingsInitialToolsTab}
 	initialArtifactId={settingsInitialArtifactId}
+	initialAdminSection={settingsInitialAdminSection}
+	initialDiagnosticsAction={settingsInitialDiagnosticsAction}
+	initialAdminSectionNonce={settingsAdminSectionNonce}
 	initialProjectsMode={settingsProjectsMode}
 	initialProjectsModeNonce={settingsProjectsModeNonce}
 />

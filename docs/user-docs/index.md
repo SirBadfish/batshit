@@ -22,6 +22,14 @@ Batshit is planned as open source under **AGPL-3.0-only**, the GNU Affero Genera
 
 Your chats, agents, prompts, workflows, artifacts, uploads, project files, generated content, and local data remain yours. Batshit integrates with n8n, which is separately licensed by n8n.
 
+## Reporting alpha bugs
+
+If something breaks, please open a [GitHub bug report](https://github.com/SirBadfish/batshit/issues/new?template=bug_report.yml). Clear steps and a diagnostics zip help us fix things faster.
+
+When Batshit opens, click the bug icon under the chat bar or go to Settings -> Admin -> Diagnostics. Batshit shows a preview before download, and the diagnostics bundle is designed to exclude chats, prompts, uploads, project files, backups, saved API keys, service tokens, cookies, raw Redis data, and n8n workflow contents.
+
+Read [Bug reports and diagnostics](troubleshooting/bug-reports-and-diagnostics.md) for the full checklist.
+
 ## Install first
 
 If you're installing Batshit for the first time:

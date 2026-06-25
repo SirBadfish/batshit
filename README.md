@@ -14,6 +14,12 @@ For contribution and security reporting expectations, see [CONTRIBUTING.md](CONT
 
 New to Batshit? Start with the [intro playlist on YouTube](https://www.youtube.com/watch?v=hS3NfNPgW70&list=PLeodpgBXojRy4Ssreao79TIX7PylhiI1D), then keep the [Batshit YouTube channel](https://www.youtube.com/@batshit-ai/) handy for walkthroughs and alpha updates.
 
+## Report Alpha Bugs
+
+Please use the [GitHub bug report form](https://github.com/SirBadfish/batshit/issues/new?template=bug_report.yml). If Batshit opens, click the bug icon under the chat bar or go to Settings -> Admin -> Diagnostics, review the preview, then attach the diagnostics zip if you are comfortable sharing it.
+
+Diagnostics are designed to exclude chats, prompts, uploads, project files, backups, saved API keys, tokens, cookies, raw Redis data, and n8n workflow contents. See [Bug reports and diagnostics](docs/user-docs/troubleshooting/bug-reports-and-diagnostics.md).
+
 ## Start Here
 
 The current launch-facing docs source lives in [docs/user-docs](docs/user-docs/README.md). Batshit's hosted docs site at `docs.batshit.ai` is generated from that source by the maintainers.

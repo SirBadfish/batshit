@@ -15,14 +15,32 @@ describe('TokenPanel', () => {
         onTrim: vi.fn(),
         onCompact: vi.fn(),
         onResetTrim: vi.fn(),
+        onOpenDiagnostics: vi.fn(),
         onOpenExecutionViewer: vi.fn(),
       },
     })
 
     expect(screen.getByRole('button', { name: 'Trim 50k from active send context' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Compact older chat context' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Open Diagnostics' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Open Execution Viewer' })).toBeInTheDocument()
     expect(screen.getByText('$0.12')).toBeInTheDocument()
+  })
+
+  it('opens diagnostics from the icon shortcut', async () => {
+    const onOpenDiagnostics = vi.fn()
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        onOpenDiagnostics,
+      },
+    })
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Open Diagnostics' }))
+
+    expect(onOpenDiagnostics).toHaveBeenCalledOnce()
   })
 
   it('does not put native title tooltips on custom tooltip triggers', () => {

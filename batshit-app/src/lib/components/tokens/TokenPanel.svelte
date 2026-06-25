@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button'
   import * as Tooltip from '$lib/components/ui/tooltip'
-  import { Archive, Coins, FileText, RotateCcw, Scissors } from '@lucide/svelte'
+  import { Archive, Bug, Coins, FileText, RotateCcw, Scissors } from '@lucide/svelte'
 
   let {
     currentTokens = 0,
@@ -25,6 +25,7 @@
     onTrim = () => {},
     onCompact = () => {},
     onResetTrim = () => {},
+    onOpenDiagnostics = () => {},
     onOpenExecutionViewer = () => {}
   } = $props<{
     currentTokens?: number | null
@@ -48,6 +49,7 @@
     onTrim?: (tokensToTrim: number) => void | Promise<void>
     onCompact?: () => void | Promise<void>
     onResetTrim?: () => void
+    onOpenDiagnostics?: () => void
     onOpenExecutionViewer?: () => void
   }>()
 
@@ -241,6 +243,19 @@
       <span class="token-panel-trimmed">{formatCompacted(compactedTokens)}</span>
 
       <div class="token-panel-spacer"></div>
+
+      <Button
+        size="icon"
+        variant="ghost"
+        onclick={onOpenDiagnostics}
+        class="token-panel-icon-button"
+        aria-label="Open Diagnostics"
+        title="Open Diagnostics"
+        data-testid="token-diagnostics-button"
+        data-ab-control="open-diagnostics"
+      >
+        <Bug class="token-panel-icon-button-icon" />
+      </Button>
 
       <Button
         size="icon"

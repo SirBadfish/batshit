@@ -40,6 +40,9 @@ interface Props {
   initialModelId?: string | null
   initialToolsTab?: 'gateway-settings' | 'cli-tools' | 'tool-grid' | 'zip-options' | null
   initialArtifactId?: string | null
+  initialAdminSection?: 'diagnostics' | null
+  initialDiagnosticsAction?: 'preview' | null
+  initialAdminSectionNonce?: number
   initialProjectsMode?: 'list' | 'create' | null
   initialProjectsModeNonce?: number
   data?: SettingsPanelData
@@ -64,6 +67,9 @@ let {
   initialModelId: _initialModelId = null,
   initialToolsTab = null,
   initialArtifactId: _initialArtifactId = null,
+  initialAdminSection = null,
+  initialDiagnosticsAction = null,
+  initialAdminSectionNonce = 0,
   initialProjectsMode = null,
   initialProjectsModeNonce = 0,
   data = null
@@ -364,7 +370,16 @@ const tabs: TabDefinition[] = [
     label: 'Admin',
     section: 4,
     icon: { type: 'lucide', component: ShieldCheck },
-    content: { kind: 'component', loader: () => import('./panels/AdminSettingsPanel.svelte'), props: () => ({ data }) }
+    content: {
+      kind: 'component',
+      loader: () => import('./panels/AdminSettingsPanel.svelte'),
+      props: () => ({
+        data,
+        initialSection: initialAdminSection,
+        initialAction: initialDiagnosticsAction,
+        initialSectionNonce: initialAdminSectionNonce
+      })
+    }
   },
   {
     value: 'dev',
