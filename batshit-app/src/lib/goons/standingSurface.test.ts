@@ -1,7 +1,10 @@
 import * as THREE from 'three'
 import { describe, expect, it } from 'vitest'
 
-import { probeStandingSurfaceY } from '$lib/goons/standingSurface'
+import {
+  probeNearestStandingSurfaceY,
+  probeStandingSurfaceY
+} from '$lib/goons/standingSurface'
 
 describe('standing surface probe', () => {
   it('returns the top surface height for a walkable prop', () => {
@@ -55,5 +58,47 @@ describe('standing surface probe', () => {
     })
 
     expect(y).toBeNull()
+  })
+
+  it('chooses the walkable surface nearest stage height instead of the ceiling', () => {
+    const room = new THREE.Group()
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.MeshBasicMaterial())
+    floor.rotation.x = -Math.PI / 2
+    floor.position.y = 0.37
+    room.add(floor)
+
+    const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.MeshBasicMaterial())
+    ceiling.rotation.x = -Math.PI / 2
+    ceiling.position.y = 4
+    room.add(ceiling)
+    room.updateMatrixWorld(true)
+
+    const y = probeNearestStandingSurfaceY({
+      objects: [room],
+      x: 0,
+      z: 0,
+      minY: -1,
+      maxY: 5,
+      targetY: 0
+    })
+
+    expect(y).toBeCloseTo(0.37, 2)
+  })
+
+  it('rejects non-walkable shell faces during nearest-height alignment', () => {
+    const wall = new THREE.Mesh(new THREE.PlaneGeometry(3, 3), new THREE.MeshBasicMaterial())
+    wall.position.z = 0
+    wall.updateMatrixWorld(true)
+
+    expect(
+      probeNearestStandingSurfaceY({
+        objects: [wall],
+        x: 0,
+        z: 0,
+        minY: -2,
+        maxY: 3,
+        targetY: 0
+      })
+    ).toBeNull()
   })
 })

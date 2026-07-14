@@ -44,11 +44,23 @@ The manifest can include stage anchors, face expression mappings, face control m
 4. Choose Create New Goon (Advanced/Blender).
 5. Upload the `.bgoon` or `.zip` package.
 6. Save the Goon.
-7. Open the Goon Editor to check Wardrobe, Moods, Emotes, Eye Contact, and camera framing.
+7. Open the Goon Editor to check Appearance Dials, Wardrobe, Moods, Emotes, Eye Contact, and camera framing.
 8. Assign the Goon to an agent.
 9. Test in the Goon Dock.
 
 Advanced/Blender packages and high-detail VRM files can be large. Batshit supports core Goon imports up to `600M`; Docker keeps a broader `BODY_SIZE_LIMIT=1G` app front-door limit for Admin restores and other trusted local imports, but batshit-server still applies the Goon-specific cap after the request reaches the upload service.
+
+First-party Advanced/GLB packages can include Appearance Dials for Body and Head & Face. Their saved values live with the Goon and update the open Goon Dock without a browser or app reload. Batshit validates the package's exact morph, follower, joint, and dynamic-face ownership before enabling the controls; malformed packages fail clearly instead of loading a partial identity system.
+
+Appearance Dial values are bound to the exact package definition and neutral recipe. A compatible package update keeps valid values and removes stale controls. An incompatible update resets to that package's neutral and tells you it did so. Updating an older first-party Body Dials package is a clean v2 cutover: the old values reset because they cannot be mapped safely onto the new zero-centered controls.
+
+Supported first-party Advanced/GLB packages can also include **Facial Artwork**. Open Edit Goon → Facial Artwork to customize Brows, Lashes & Eye Outline, Iris & Pupil, Eye Highlight, and Sclera. Each section provides the exact Guide, Mask, and transparent Blank expected by that package. Batshit validates uploaded PNG dimensions, transparency, safe paint area, package/template identity, and source rights before it accepts the file.
+
+Every artwork role supports **Same for both** or **Customize each eye**. Shared Brows and Lashes & Eye Outline mirror the artwork automatically; you can still supply different left/right art when the character is intentionally asymmetrical. Iris and Pupil remain independent: each can use a solid color with no artwork, add optional artwork over that color, and use its own physical size. Sclera also has a solid base color plus optional wrapped artwork.
+
+The same panel includes linked physical eye controls for Iris Size, Pupil Size, and fine-tuning the fitted Sclera assembly: Scale, Tilt, Horizontal Position, Vertical Position, and Depth. Reset returns these controls to the package's automatic eye fit. Artwork position/scale/rotation controls are labeled separately and do not move the physical eye geometry.
+
+Save Goon stores both version-bound recipes and the exact upload hashes. Replacing the Goon package keeps them only when the new package declares compatible Facial Artwork and Eye Appearance definitions. Validation failures and incompatible resets are shown instead of silently applying approximate artwork or fit values.
 
 ## Advanced/Blender authoring status
 
@@ -119,7 +131,10 @@ The Goon Dock lives in the right sidebar and starts closed on app launch. Its co
 - Closet/Wardrobe selection
 - Motion previews
 - Emote tests
-- mouse-height zoom focus
+- one continuous Goon-centered scroll range, from close facial framing through normal dolly to wide exterior views; zooming in over the Goon targets that body area, while empty-space zoom and every zoom-out stay centered through full-body, upper-body, and face framing
+- **Indoor Camera**, which keeps the camera inside the room, and **Free Camera**, which allows cinematic views from outside the building
+- viewport controls: left-drag orbits, right-drag rotates the Goon, middle-drag moves the Goon across the room while keeping the currently viewed face/body area centered, and left+right drag pans the camera without moving the Goon or changing zoom
+- Headshot, Portrait, and Full Body framing presets inside the FOV menu
 - field of view
 - quality
 - immersive mode
@@ -139,7 +154,8 @@ Realtime TTS uses live analyser/timing behavior; Rhubarb WASM needs completed au
 
 Batshit supports:
 
-- VRMA animations in the shared Motion Vault
+- VRMA animations in the shared Motion Vault (used by VRM/VRoid Goons)
+- GLB animations in the shared Motion Vault (used by Advanced/GLB Goons — clip tracks must target the Goon's skeleton bone names)
 - Goon-specific animation files
 - FBX uploads converted to VRMA when the converter is available
 
@@ -149,7 +165,13 @@ Native/local installs use the Admin-managed FBX2glTF installer for FBX conversio
 docker compose --env-file .env.docker --profile fbx2vrma up -d --build fbx2vrma-worker
 ```
 
-VRMA is the recommended default for reusable animations. GLB/GLTF animation files are more likely to be rig-specific unless retargeted.
+Each Goon type automatically uses only its own format from the shared vault: VRM Goons play VRMA entries, and Advanced/GLB Goons play GLB entries. VRMA is the recommended default for VRM Goons because the VRM standard retargets it across avatars; GLB animation clips play by direct bone-name matching, so they need to be authored or retargeted for the Goon's specific rig.
+
+You never manage two parallel libraries, though. The Settings → Goons → Motions tab shows **one card per motion**: when a VRMA file and a GLB file share the same base file name, they appear as a single motion with both `VRMA` and `GLB` badges. The name, tags, posture, playback, and eye-contact settings are shared between the two versions — edit them once and both formats stay in sync. Uploading the second format of an existing motion automatically picks up the settings you already gave the first one. If you upload a format the motion already has, Batshit asks before replacing it — replacing swaps the animation file but keeps the motion's settings, or you can skip and rename your file first to keep both. Either way you never end up with duplicate cards. The trash button removes the whole motion (all formats); the `(i)` menu on the card lists each version's source file and lets you remove just one format.
+
+Previews are format-aware. VRMA motions preview on the built-in placeholder avatar, and GLB motions preview on a built-in purple Batshit dummy that uses the first-party Goon skeleton — so GLB previews work even before you create any Goons. If your GLB motions were made for a different skeleton, use the **GLB Preview Body** picker at the top of the Motions tab to preview them on one of your own Advanced/GLB Goons instead. Cards with both formats get a small `VRMA`/`GLB` toggle (under the thumbnail and on the live preview pane) so you can check that each version animates correctly.
+
+Cues reference motions by name, so a paired motion works on every Goon automatically: a mood or emote pointing at that motion plays the VRMA version on VRM Goons and the GLB version on Advanced/GLB Goons.
 
 ## Default Goon Pack
 
@@ -157,7 +179,7 @@ The launch default Goon Pack is an optional import, not a bundled app asset. Thi
 
 [Download the default Goon Pack](https://batshit.ai/downloads/goons/batshit-goon-default-pack.zip), then import it from Settings → Goons → Kitchen → Import Pack.
 
-The pack includes moods, emotes, emoji triggers, custom Stage Postures, and Motion Vault VRMA files. It does not include Scenes.
+The pack includes moods, emotes, emoji triggers, custom Stage Postures, and Motion Vault files. Motions export in every format they have — a motion with both VRMA and GLB versions ships both, so imported cues work on VRM and Advanced/GLB Goons alike. It does not include Scenes.
 
 ## Closet and Wardrobe
 
@@ -170,7 +192,29 @@ Advanced/Blender original outfit pieces can appear as Wardrobe rows when the pac
 
 ## Scenes
 
-Goon scenes can use skyboxes, room builder surfaces, uploaded room shells, props, posture markers, and room textures. Large or high-poly scene assets can hurt performance — take the UI guardrails seriously.
+Goon scenes can use skyboxes, Room Builder surfaces, Ground Level or Elevated placement, uploaded room shells, props, posture markers, room textures, and one saved Scene Atmosphere layer. Scene placement is scene-wide: build scenes as either all-around Ground Level or all-around Elevated / Overlook, not half-ground and half-overlook. Procedural rooms automatically support Indoor Camera. For an Uploaded GLB room, open **Indoor Camera Boundary**, choose **Fit to Room**, and adjust the saved box if the model also contains exterior architecture or scenery. Large or high-poly scene assets can hurt performance — take the UI guardrails seriously.
+
+Inside Scene Editor, the level-one order is **World**, **Room Builder**, **Props**, **Markers**. World contains Skybox upload/preview, Scene Placement, Ground Projection Line, and Scene Atmosphere. Room Builder contains Room Shell upload/replace/remove, the Uploaded GLB versus Procedural Builder choice, room textures, dimensions, and surfaces. Scene Placement is independent from the room choice, so switching between Ground Level and Elevated / Overlook does not replace an uploaded room shell. Prefer a self-contained `.glb` for uploaded Room Shells; a lone `.gltf` can reference external buffers or textures that are not included in a one-file upload.
+
+For **Ground Level**, `50%` is the normal Ground Projection Line: Batshit treats that source-image row as the equirectangular equator and projects everything below it as ground. You can move the saved line from 25%-75% to correct an existing panorama with a globally high or low horizon. It cannot repair a TV, couch, wall, tree, rock, or other upright object already painted into the projected region. Ground Level skyboxes therefore work best when the entire lower region is continuous floor, grass, dirt, sand, terrain, or water. Use Room Builder, a Room Shell, or Props for nearby structure; use Elevated / Overlook when an indoor or furnished panorama should remain unprojected.
+
+In **Uploaded GLB** mode, Room Shell Placement provides uniform scale, X/Y/Z offset, Y rotation, and Reset Placement. **Align Floor** probes for a walkable surface near the Goon and moves it to stage height. Generated models vary, so if Batshit cannot find the intended floor, it tells you clearly and leaves Y Offset available for manual alignment. These controls move the room only; separate Props and Markers do not move with it.
+
+`Outside` atmosphere is physically outside the Room Builder volume, so opaque walls hide it. Use an open or transparent surface for visible exterior weather, or choose `Inside` / `Whole Stage` for motion within a closed room.
+
+The Scenes list stays lightweight until you open a scene. Inside the Scene Editor, Batshit uses a simple standing/sitting proxy body by default for room and prop scale checks. Use the Active Goon preview when you need to check final fit against the real Goon, test a lying/tagged Motion, place posture markers, or judge Scene Atmosphere against the real avatar.
+
+For assisted scene planning, enable the built-in **Goon Scene Creator** skill (`/goon-scene-creator`). Hero 8K is the recommended final skybox for best scene quality; use Standard 4K on smaller or lower-memory Macs/PCs, unusually heavy scenes, or when performance testing shows 8K is too costly. In the embedded Mac app, Ultra can use an 8K skybox when the graphics device supports it; Auto/High use up to 4K and Low uses up to 2K. These skybox limits are separate from avatar and room texture limits. The skill can then produce prompts, texture notes, Room Builder plans, one coherent Ground Level or Elevated placement, Scene Atmosphere choices, prop lists, and sit/lay marker guidance.
+
+If you prefer to use an outside coding agent for scene planning, use the **Portable Goon Scene Creator** with a Portable Skill Token scoped to `Goon Scenes`. The portable version includes the same scene references and Qwen 360 ComfyUI workflow assets, but it does not directly save Goon scene records yet; it hands you Scene Editor steps unless future Goons/Scenes Fabric controls are available.
+
+For local ComfyUI skybox generation, Batshit also ships workflow definitions for the proved Qwen 360 skybox lane inside the Goon Scene Creator skill bundle. The workflow files do not include model weights, LoRAs, VAEs, or upscalers; install those in ComfyUI separately. To copy the visible workflow into a ComfyUI user workflow folder from a source checkout, run:
+
+```sh
+node tools/comfyui/install-goon-scene-skybox-workflow.mjs
+```
+
+If your ComfyUI install is not in a standard location, pass the workflow folder with `--target`.
 
 ## Docker notes
 

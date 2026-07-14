@@ -1,4 +1,9 @@
-export type PortableSkillFamilyId = 'voice-engines' | 'artifacts' | 'cli-tools' | 'skills'
+export type PortableSkillFamilyId =
+  | 'voice-engines'
+  | 'artifacts'
+  | 'cli-tools'
+  | 'skills'
+  | 'goon-scenes'
 
 export type PortableSkillTokenRecord = {
   id: string

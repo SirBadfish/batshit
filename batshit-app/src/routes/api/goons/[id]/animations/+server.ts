@@ -3,6 +3,9 @@ import { redis } from '$lib/server/redis'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
+  normalizeUploadUrlForStorage,
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload,
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import type { GoonFileRef, GoonRecord } from '$lib/types/goons'
@@ -73,7 +76,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     }
 
     const animationFile: GoonFileRef = {
-      url: fileInfo.url,
+      url: normalizeUploadUrlForStorage(fileInfo.url),
       filename: fileInfo.filename,
       originalName: fileInfo.originalName || file.name,
       size: fileInfo.size ?? file.size,
@@ -93,14 +96,14 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
         ? currentAnimations
         : [...currentAnimations, animationFile]
 
-      const updatedGoon: GoonRecord = {
+      const updatedGoon = normalizeUploadUrlsForStorageInPayload<GoonRecord>({
         ...existing,
         files: {
           ...(existing.files ?? {}),
           animations: nextAnimations
         },
         updated_at: new Date().toISOString()
-      }
+      })
 
       await client.json.set(`goon:${params.id}`, '$', updatedGoon as any)
       return updatedGoon
@@ -110,7 +113,10 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       return json({ error: 'Goon not found' }, { status: 404 })
     }
 
-    return json({ goon: updated, animation: animationFile })
+    return json({
+      goon: resolveUploadUrlsForBrowserInPayload(updated),
+      animation: resolveUploadUrlsForBrowserInPayload(animationFile)
+    })
   } catch (error) {
     console.error('Error uploading goon animation:', error)
     return json(
@@ -142,14 +148,14 @@ export const DELETE: RequestHandler = async ({ params, request, locals }) => {
 
       const nextAnimations = currentAnimations.filter((entry) => entry.filename !== filename)
 
-      const updatedGoon: GoonRecord = {
+      const updatedGoon = normalizeUploadUrlsForStorageInPayload<GoonRecord>({
         ...existing,
         files: {
           ...(existing.files ?? {}),
           animations: nextAnimations
         },
         updated_at: new Date().toISOString()
-      }
+      })
 
 	      await client.json.set(`goon:${params.id}`, '$', updatedGoon as any)
 	      return updatedGoon
@@ -168,7 +174,7 @@ export const DELETE: RequestHandler = async ({ params, request, locals }) => {
 	      await deleteGoonUploadAsset('goon_animations', filename)
 	    }
 
-	    return json({ goon: updated })
+	    return json({ goon: resolveUploadUrlsForBrowserInPayload(updated) })
   } catch (error) {
     console.error('Error deleting goon animation:', error)
     return json(

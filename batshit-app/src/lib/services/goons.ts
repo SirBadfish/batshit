@@ -1,5 +1,6 @@
 import type {
   GoonAnimationLibrary,
+  GoonCustomManifestSummary,
   GoonFileRef,
   GoonGuidedManifestSummary,
   GoonGuidedOutfitPiece,
@@ -9,6 +10,11 @@ import type {
   GoonRecord,
   GoonSourceProfile
 } from '$lib/types/goons'
+import type {
+  FacialArtworkProvenance,
+  FacialArtworkRoleId,
+  FacialArtworkUpload
+} from '$lib/goons/facialArtwork'
 import {
   addGoon,
   setGoons,
@@ -41,6 +47,22 @@ export type AdvancedGoonPackageUploadResult = {
   manifestSummary?: GoonGuidedManifestSummary
   outfitPieces: GoonGuidedOutfitPiece[]
   outfitPresets: GoonGuidedOutfitPreset[]
+}
+
+export type CustomGoonPackageUploadResult = {
+  package: GoonFileRef
+  model: GoonFileRef
+  manifest: GoonFileRef
+  manifestSummary?: GoonCustomManifestSummary
+}
+
+export type GoonFacialArtworkUploadInput = {
+  role: FacialArtworkRoleId
+  definitionSha256: string
+  templateId: string
+  templateVersion: string
+  guideSha256: string
+  provenance: FacialArtworkProvenance
 }
 
 async function readApiError(response: Response, fallback: string) {
@@ -211,6 +233,32 @@ export async function uploadAdvancedGoonPackage(
   }
 }
 
+export async function uploadCustomGoonPackage(
+  id: string,
+  file: File
+): Promise<CustomGoonPackageUploadResult> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+
+  const res = await fetch(`/api/goons/${id}/advanced-package`, {
+    method: 'POST',
+    body: form
+  })
+
+  if (!res.ok) {
+    throw new Error(await readApiError(res, 'Failed to upload Goon File Package'))
+  }
+
+  const data = await res.json()
+  const files = data?.files ?? {}
+  return {
+    package: normalizeFileRef(files.package),
+    model: normalizeFileRef(files.model),
+    manifest: normalizeFileRef(files.manifest),
+    manifestSummary: data?.manifestData ?? undefined
+  }
+}
+
 export async function uploadGuidedDufClothesVrm(id: string, file: File): Promise<GoonFileRef> {
   const form = new FormData()
   form.append('file', file, file.name)
@@ -234,6 +282,47 @@ export async function uploadGuidedDufClothesVrm(id: string, file: File): Promise
     mimeType: raw.mimetype ?? raw.mimeType,
     uploadedAt: raw.uploadedAt ?? raw.uploaded_at
   }
+}
+
+export async function uploadGoonFacialArtwork(
+  id: string,
+  file: File,
+  input: GoonFacialArtworkUploadInput
+): Promise<FacialArtworkUpload> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  form.append('role', input.role)
+  form.append('definitionSha256', input.definitionSha256)
+  form.append('templateId', input.templateId)
+  form.append('templateVersion', input.templateVersion)
+  form.append('guideSha256', input.guideSha256)
+  form.append('provenance', JSON.stringify(input.provenance))
+
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/facial-artwork`, {
+    method: 'POST',
+    body: form
+  })
+  if (!res.ok) {
+    throw new Error(await readApiError(res, 'Failed to upload facial artwork'))
+  }
+  const data = (await res.json()) as { artwork?: FacialArtworkUpload }
+  if (!data.artwork?.url || !data.artwork.filename || !data.artwork.sha256) {
+    throw new Error('Facial artwork upload did not return a valid file reference')
+  }
+  return data.artwork
+}
+
+export async function deleteGoonFacialArtwork(id: string, filename: string): Promise<boolean> {
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/facial-artwork`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename })
+  })
+  if (res.status === 409) return false
+  if (!res.ok) {
+    throw new Error(await readApiError(res, 'Failed to delete facial artwork'))
+  }
+  return true
 }
 
 export async function uploadGoonClosetImage(file: File): Promise<GoonFileRef> {
@@ -499,11 +588,54 @@ export async function loadGoonAnimationLibrary(): Promise<GoonAnimationLibrary> 
   }
 }
 
+export type GoonMotionVersionConflict = {
+  motionName: string
+  lane: 'vrm' | 'glb'
+  existingFilename?: string
+  displayName?: string | null
+}
+
+// Thrown when an upload matches an existing motion's name + format and the
+// caller did not pass replaceExisting — the UI prompts before replacing.
+export class GoonMotionVersionExistsError extends Error {
+  conflict: GoonMotionVersionConflict
+
+  constructor(message: string, conflict: GoonMotionVersionConflict) {
+    super(message)
+    this.name = 'GoonMotionVersionExistsError'
+    this.conflict = conflict
+  }
+}
+
+type UploadGoonAnimationOptions = {
+  replaceExisting?: boolean
+}
+
+async function throwGoonAnimationUploadError(res: Response): Promise<never> {
+  const text = await res.text().catch(() => '')
+  if (res.status === 409) {
+    try {
+      const payload = JSON.parse(text)
+      if (payload?.code === 'motion_version_exists' && payload?.conflict) {
+        throw new GoonMotionVersionExistsError(
+          payload.error || 'This motion already has a version in that format.',
+          payload.conflict as GoonMotionVersionConflict
+        )
+      }
+    } catch (error) {
+      if (error instanceof GoonMotionVersionExistsError) throw error
+    }
+  }
+  throw new Error(text || 'Failed to upload animation')
+}
+
 export async function uploadGoonAnimationToLibrary(
-  file: File
+  file: File,
+  options: UploadGoonAnimationOptions = {}
 ): Promise<GoonAnimationLibrary> {
   const form = new FormData()
   form.append('file', file, file.name)
+  if (options.replaceExisting) form.append('replaceExisting', '1')
 
   const res = await fetch('/api/goons/animations', {
     method: 'POST',
@@ -511,8 +643,7 @@ export async function uploadGoonAnimationToLibrary(
   })
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(text || 'Failed to upload animation')
+    await throwGoonAnimationUploadError(res)
   }
 
   const data = await res.json()
@@ -522,10 +653,12 @@ export async function uploadGoonAnimationToLibrary(
 }
 
 export async function uploadGoonAnimationToLibraryFile(
-  file: File
+  file: File,
+  options: UploadGoonAnimationOptions = {}
 ): Promise<{ library: GoonAnimationLibrary; animation: GoonFileRef }> {
   const form = new FormData()
   form.append('file', file, file.name)
+  if (options.replaceExisting) form.append('replaceExisting', '1')
 
   const res = await fetch('/api/goons/animations', {
     method: 'POST',
@@ -533,8 +666,7 @@ export async function uploadGoonAnimationToLibraryFile(
   })
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw new Error(text || 'Failed to upload animation')
+    await throwGoonAnimationUploadError(res)
   }
 
   const data = await res.json()
@@ -570,11 +702,14 @@ export async function uploadGoonAnimationToLibraryFile(
   return { library, animation }
 }
 
-export async function deleteGoonAnimationFromLibrary(filename: string): Promise<GoonAnimationLibrary> {
+export async function deleteGoonAnimationFromLibrary(
+  filename: string | string[]
+): Promise<GoonAnimationLibrary> {
+  const filenames = Array.isArray(filename) ? filename : [filename]
   const res = await fetch('/api/goons/animations', {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filename })
+    body: JSON.stringify({ filenames })
   })
 
   if (!res.ok) {

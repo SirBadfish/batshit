@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -13,9 +14,11 @@ const runtimePath = join(resourcesPath, 'runtime');
 const appSource = join(repoRoot, 'batshit-app');
 const serverSource = join(repoRoot, 'batshit-server', 'server');
 const liveKitSidecarSource = join(repoRoot, 'tools', 'livekit-agent-sidecar');
+const facialArtworkSource = join(appSource, 'static', 'goons', 'facial-artwork', 'v2');
 const appDest = join(runtimePath, 'batshit-app');
 const serverDest = join(runtimePath, 'batshit-server', 'server');
 const liveKitSidecarDest = join(runtimePath, 'tools', 'livekit-agent-sidecar');
+const facialArtworkDest = join(runtimePath, 'assets', 'goons', 'facial-artwork', 'v2');
 const nodeRuntimeDest = join(runtimePath, 'vendor', 'node');
 const redisStackRuntimeDest = join(runtimePath, 'vendor', 'redis-stack');
 const ffmpegRuntimeDest = join(runtimePath, 'vendor', 'ffmpeg');
@@ -110,6 +113,48 @@ async function copyOptionalFile(source, dest) {
   if (!(await exists(source))) return;
   await mkdir(dirname(dest), { recursive: true });
   await cp(source, dest);
+}
+
+async function sha256File(path) {
+  const bytes = await readFile(path);
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+async function inventoryFiles(root, relativeRoot = '') {
+  const directory = join(root, relativeRoot);
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const relative = join(relativeRoot, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await inventoryFiles(root, relative)));
+      continue;
+    }
+    if (!entry.isFile()) {
+      throw new Error(`Facial artwork assets may only contain regular files: ${join(root, relative)}`);
+    }
+    files.push({
+      path: relative.split('\\').join('/'),
+      sha256: await sha256File(join(root, relative))
+    });
+  }
+  return files;
+}
+
+async function copyFacialArtworkAssets() {
+  await copyRequired(facialArtworkSource, facialArtworkDest);
+  const files = await inventoryFiles(facialArtworkSource);
+  if (files.length < 19 || !files.some((entry) => entry.path === 'facial-artwork-v2.json')) {
+    throw new Error(
+      `Facial artwork package input is incomplete: expected the v2 definition plus at least 18 assets, found ${files.length}`
+    );
+  }
+  return {
+    contract: 'facial-artwork/v2',
+    root: 'assets/goons/facial-artwork/v2',
+    definition: 'facial-artwork-v2.json',
+    files
+  };
 }
 
 async function firstExistingPath(base, candidates) {
@@ -365,6 +410,7 @@ async function main() {
   if (await exists(n8nTemplates)) {
     await copyRequired(n8nTemplates, join(runtimePath, 'docs', 'user-docs', 'user-templates', 'batshit-official-n8n-workflow-templates'));
   }
+  const facialArtworkAssets = await copyFacialArtworkAssets();
   await copyLiveKitSidecarSourcePackage();
   const managedRuntimeEntries = await Promise.all([
     copyManagedNodeRuntime(),
@@ -383,6 +429,9 @@ async function main() {
         server: 'batshit-server/server/src plus runtime node_modules',
         n8n: 'not bundled',
         liveKitSidecar: 'tools/livekit-agent-sidecar source package for native runtime install',
+        assets: {
+          facialArtwork: facialArtworkAssets
+        },
         managedRuntimes
       },
       null,

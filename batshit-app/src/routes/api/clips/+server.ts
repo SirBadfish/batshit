@@ -4,6 +4,10 @@ import { redis } from '$lib/server/redis'
 import type { ClipRow } from '$lib/types/database'
 import { requireUser } from '$lib/server/services/routeSecurity'
 import { deleteUserClips } from '$lib/server/services/clipDeletion'
+import {
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
 
 // GET /api/clips - Get all clips for a user
 export const GET: RequestHandler = async ({ locals }) => {
@@ -41,7 +45,7 @@ export const GET: RequestHandler = async ({ locals }) => {
       return dateB - dateA
     })
 
-    return json(clips)
+    return json(resolveUploadUrlsForBrowserInPayload(clips))
   } catch (error) {
     console.error('Error fetching clips:', error)
     return json({ error: 'Failed to fetch clips' }, { status: 500 })
@@ -88,12 +92,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     }
 
     // Store clip in Redis using RedisJSON
-    await redis.set(`clip:${userId}:${clipId}`, clip)
+    const storageClip = normalizeUploadUrlsForStorageInPayload(clip)
+    await redis.set(`clip:${userId}:${clipId}`, storageClip)
     
     // Add to user's clip set
     await redis.sAdd(`user:${userId}:clips`, clipId)
 
-    return json(clip)
+    return json(resolveUploadUrlsForBrowserInPayload(storageClip))
   } catch (error) {
     console.error('Error creating clip:', error)
     return json({ error: 'Failed to create clip' }, { status: 500 })

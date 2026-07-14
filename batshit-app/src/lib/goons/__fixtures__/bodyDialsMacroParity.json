@@ -1,0 +1,1952 @@
+{
+ "note": "MPFB macro product-formula ground truth for the Batshit runtime reimplementation (bodyDials vitest replays these).",
+ "baselineState": {
+  "gender": -4e-06,
+  "age": 0.5,
+  "muscle": 0.5,
+  "weight": 0.0,
+  "proportions": 0.5,
+  "height": 0.5574,
+  "cupsize": 0.730005,
+  "firmness": 1.0,
+  "race": {
+   "asian": 0.33,
+   "caucasian": 0.33,
+   "african": 0.33
+  }
+ },
+ "cutoff": 0.01,
+ "samples": [
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-mincup-min$fi": 0.923875,
+    "$md-$fe-$yn-min$mu-min$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-min$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-min$fi": 0.01847,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-min$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-mincup-$av$fi": 0.942156,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.018835,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.018835
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-min$wg-mincup-max$fi": 0.923875,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-max$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-max$fi": 0.01847,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-max$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-min$fi": 0.942345,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-max$fi": 0.942345,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-min$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-min$fi": 0.923875,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-$av$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-min$fi": 0.01847,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-min$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-$av$fi": 0.942156,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.018835,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.018835
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-max$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-$av$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-max$fi": 0.923875,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.01847,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-max$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-min$fi": 0.942345,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.960992,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.019212
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-max$fi": 0.942345,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi": 0.961184,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.019216
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.961184,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.019216
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-min$fi": 0.942345,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.960992,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.019212
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.018839,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-min$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-min$fi": 0.923875,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-min$fi": 0.01847,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-min$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.018835,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-$av$fi": 0.942156,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi": 0.018835
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-max$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-max$fi": 0.923875,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-max$fi": 0.01847,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-max$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-min$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-max$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-min$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-min$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-min$fi": 0.923875,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi": 0.01847,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-min$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.018835,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi": 0.942156,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.018835
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.0,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.951765,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-max$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi": 0.01847,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-max$fi": 0.923875,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-min$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.960992,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.019212
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-max$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.961184,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.019216
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.961184,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.019216
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-min$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.960992,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.019212
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.970792,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-max$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.961184,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.019216,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.019216
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.980204
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.019216,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi": 0.961184,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.019216
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.9804
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.9804
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.019216,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.961184,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.019216
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.980204
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.9902,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.093871,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.019216,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.019216,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.961184
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-min$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.019212,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi": 0.960992
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-max$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.019216,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.961184
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.019216,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.961184
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-min$fi": 0.942345,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.019212,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.960992
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.5,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.970792,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.018839,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.942345
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-min$fi": 0.923875,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-min$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.018835,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-$av$fi": 0.942156,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.018835
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-max$fi": 0.923875,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-max$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-min$fi": 0.942345,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-max$fi": 0.942345,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-min$fi": 0.923875,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-$av$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-min$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.018835,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-$av$fi": 0.942156,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.018835
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.0,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.951765,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-$av$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-max$fi": 0.923875,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-min$fi": 0.942345,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.019212,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.960992
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-max$fi": 0.942345,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.019216,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.961184
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.019216,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.961184
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-min$fi": 0.942345,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.018839
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.019212,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.960992
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 0.5,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019408,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.970792,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.092031,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.942345
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-mincup-min$fi": 0.923875,
+    "$md-$fe-$yn-max$mu-max$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-min$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi": 0.018835,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.018835,
+    "$md-$fe-$yn-max$mu-max$wg-mincup-$av$fi": 0.942156
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 0.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-mincup-$av$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-mincup-max$fi": 0.923875,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-max$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-min$fi": 0.942345
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 0.5,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.018839,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-max$fi": 0.942345
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 0.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-min$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-min$fi": 0.923875,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-$av$fi": 0.01847
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 0.5
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.018835,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.018835,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-$av$fi": 0.942156
+   }
+  },
+  {
+   "dials": {
+    "muscle": 1.0,
+    "weight": 1.0,
+    "cupsize": 1.0,
+    "firmness": 1.0
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019028,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.951765,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.090227,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-max$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-$av$fi": 0.01847,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-max$fi": 0.923875
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.572,
+    "weight": 0.746,
+    "cupsize": 0.808,
+    "firmness": 0.923
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.440159,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.410225,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.072369,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.067447,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.041727,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.038889,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.146034,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.045796,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.222646,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.136103,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.042682,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.207505,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.02401,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.036606,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-max$fi": 0.022377,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-max$fi": 0.034117
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.193,
+    "weight": 0.648,
+    "cupsize": 0.151,
+    "firmness": 0.118
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.423042,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.17296,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.279802,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.114396,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.040104,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.016397,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.026525,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.010845,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-min$fi": 0.218943,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.07341,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi": 0.101009,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-min$fi": 0.089514,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-$av$fi": 0.030013,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-min$fi": 0.041297,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.14481,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.048554,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.066808,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-min$fi": 0.059205,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi": 0.019851,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.027314
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.043,
+    "weight": 0.968,
+    "cupsize": 0.587,
+    "firmness": 0.916
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.073115,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.814203,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.094404,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.077186,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.049955,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.010275,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-max$fi": 0.556294,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi": 0.025853,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-max$fi": 0.114425,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.064501,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.013267
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.809,
+    "weight": 0.239,
+    "cupsize": 0.053,
+    "firmness": 0.344
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.199685,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.190553,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.307001,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.292962,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.01893,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.018064,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.029104,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.027773,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-min$fi": 0.054017,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.122739,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.051546,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.117126,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-min$fi": 0.083047,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-$av$fi": 0.188703,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-min$fi": 0.011701,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-min$fi": 0.079249,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.180073,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.011166
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.835,
+    "weight": 0.664,
+    "cupsize": 0.506,
+    "firmness": 0.239
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.230478,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.10926,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.441274,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.209189,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.021849,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.010358,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.041833,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.019831,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.117674,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.055784,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.2253,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-min$fi": 0.106805
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.03,
+    "weight": 0.879,
+    "cupsize": 0.758,
+    "firmness": 0.158
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.234439,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.67813,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.019944,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.057688,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.022225,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.064287,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi": 0.078437,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-min$fi": 0.08031,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.039466,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-min$fi": 0.226884,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-min$fi": 0.232302,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi": 0.114159,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.019301,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-min$fi": 0.019762
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.769,
+    "weight": 0.382,
+    "cupsize": 0.678,
+    "firmness": 0.544
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.108218,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.359651,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.120815,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.401515,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.010259,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.034095,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.011453,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.038064,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.034843,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.020453,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.115796,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.010965,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-$av$fi": 0.038898,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.022834,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.129275,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.012241
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.641,
+    "weight": 0.619,
+    "cupsize": 0.554,
+    "firmness": 0.246
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.549271,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.167138,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.209915,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.063875,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.052071,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.015845,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.0199,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.246891,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.029243,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.029501,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.075127,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.094354,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-min$fi": 0.011176,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.011274,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-min$fi": 0.028711
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.059,
+    "weight": 0.418,
+    "cupsize": 0.125,
+    "firmness": 0.631
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.137681,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.718545,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.021543,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.112431,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.013052,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.068118,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.010658,
+    "$md-$fe-$yn-min$mu-min$wg-mincup-$av$fi": 0.075963,
+    "$md-$fe-$yn-min$mu-min$wg-mincup-max$fi": 0.026275,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.396446,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-max$fi": 0.137129,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.049365,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.011886,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.062032,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi": 0.021457
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.93,
+    "weight": 0.324,
+    "cupsize": 0.141,
+    "firmness": 0.875
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.053616,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.101747,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.288102,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.546735,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.027312,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.05183,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.010089,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-max$fi": 0.028025,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.011789,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.019145,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi": 0.053183,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.022372,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-$av$fi": 0.054211,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-max$fi": 0.150591,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-max$fi": 0.063347,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.102877,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-max$fi": 0.285779,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.120215
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.203,
+    "weight": 0.602,
+    "cupsize": 0.768,
+    "firmness": 0.862
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.461275,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.115319,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.330885,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.082721,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.043729,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.010932,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.031368,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.156917,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.071016,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.173783,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-max$fi": 0.039229,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi": 0.017754,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-max$fi": 0.043446,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.112561,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.050942,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.124659,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.02814,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.012735,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.031165
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.084,
+    "weight": 0.678,
+    "cupsize": 0.344,
+    "firmness": 0.586
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.525817,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.281889,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.118804,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.06369,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.049847,
+    "$md-$fe-$yn-min$mu-max$wg-max$hg": 0.026723,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.011263,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi": 0.135019,
+    "$md-$fe-$yn-min$mu-$av$wg-mincup-max$fi": 0.02742,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.062217,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-$av$fi": 0.072384,
+    "$md-$fe-$yn-min$mu-max$wg-mincup-max$fi": 0.0147,
+    "$md-$fe-$yn-min$mu-max$wg-$avcup-max$fi": 0.033354,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.030506,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.014057,
+    "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi": 0.016354
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.46,
+    "weight": 0.719,
+    "cupsize": 0.517,
+    "firmness": 0.537
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.044297,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.033335,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.520711,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.391857,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.049363,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.037148,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.036953,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.016287,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.027809,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.012257
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.82,
+    "weight": 0.114,
+    "cupsize": 0.165,
+    "firmness": 0.112
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.279182,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.089667,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.4703,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.15105,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.026466,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.044584,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.01432,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-min$fi": 0.140868,
+    "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi": 0.044314,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.073608,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi": 0.045244,
+    "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi": 0.014233,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.023641,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-min$fi": 0.237301,
+    "$md-$fe-$yn-max$mu-min$wg-mincup-$av$fi": 0.07465,
+    "$md-$fe-$yn-max$mu-min$wg-$avcup-min$fi": 0.123998,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-min$fi": 0.076216,
+    "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi": 0.023976,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.039825
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.786,
+    "weight": 0.71,
+    "cupsize": 0.943,
+    "firmness": 0.477
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.255806,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.17909,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.32663,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.228674,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.02425,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.016978,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.030965,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.021678,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.01003,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.214362,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.150075,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-min$fi": 0.012807,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.273711,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-$av$fi": 0.191626
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.597,
+    "weight": 0.146,
+    "cupsize": 0.989,
+    "firmness": 0.85
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.556574,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.24529,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.130724,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.057612,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.052763,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.023254,
+    "$md-$fe-$yn-max$mu-min$wg-max$hg": 0.012393,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.015893,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.169061,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-max$fi": 0.369864,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.074507,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.163004,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-$av$fi": 0.039708,
+    "$md-$fe-$yn-max$mu-min$wg-maxcup-max$fi": 0.086871,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.0175,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.038285
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.786,
+    "weight": 0.745,
+    "cupsize": 0.507,
+    "firmness": 0.102
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.225972,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.208924,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.288536,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.266768,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.021422,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.019806,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.027353,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.02529,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.175631,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi": 0.162381,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi": 0.224258,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-min$fi": 0.207339
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.436,
+    "weight": 0.643,
+    "cupsize": 0.855,
+    "firmness": 0.682
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.089425,
+    "$md-universal-$fe-$yn-min$mu-max$wg": 0.034845,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.623123,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.242807,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.059072,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.023018,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.040422,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.022443,
+    "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi": 0.015751,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.068273,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.281665,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.156383,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.026603,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.109754,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.060937
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.831,
+    "weight": 0.695,
+    "cupsize": 0.938,
+    "firmness": 0.667
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.214653,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.132907,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.396894,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.245745,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.020349,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.0126,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.037626,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.023297,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.010028,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.12518,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.060989,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.077508,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi": 0.037763,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.018541,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.231458,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.112769,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-max$fi": 0.01148,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-$av$fi": 0.143312,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-max$fi": 0.069823
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.525,
+    "weight": 0.192,
+    "cupsize": 0.598,
+    "firmness": 0.312
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.568681,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.373,
+    "$md-universal-$fe-$yn-max$mu-min$wg": 0.029301,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.019219,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.053911,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.03536,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.170911,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-min$fi": 0.040665,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.069717,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.112101,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.026672,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.045728
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.446,
+    "weight": 0.118,
+    "cupsize": 0.616,
+    "firmness": 0.256
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.078468,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.026296,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.663192,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.222245,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.062871,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.021069,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-min$fi": 0.029274,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi": 0.247414,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-min$fi": 0.072863,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.079506,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi": 0.082912,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi": 0.024417,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.026644
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.881,
+    "weight": 0.794,
+    "cupsize": 0.617,
+    "firmness": 0.642
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.106054,
+    "$md-universal-$fe-$yn-$av$mu-max$wg": 0.144368,
+    "$md-universal-$fe-$yn-max$mu-$av$wg": 0.313296,
+    "$md-universal-$fe-$yn-max$mu-max$wg": 0.426482,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.010054,
+    "$md-$fe-$yn-$av$mu-max$wg-max$hg": 0.013686,
+    "$md-$fe-$yn-max$mu-$av$wg-max$hg": 0.0297,
+    "$md-$fe-$yn-max$mu-max$wg-max$hg": 0.040431,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.022994,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.017724,
+    "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi": 0.031301,
+    "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi": 0.024128,
+    "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi": 0.067927,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi": 0.05236,
+    "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi": 0.020221,
+    "$md-$fe-$yn-max$mu-max$wg-$avcup-max$fi": 0.092467,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-$av$fi": 0.071277,
+    "$md-$fe-$yn-max$mu-max$wg-maxcup-max$fi": 0.027527
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.178,
+    "weight": 0.472,
+    "cupsize": 0.772,
+    "firmness": 0.808
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.034324,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.590888,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.020038,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.34495,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.056016,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.032701,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-max$fi": 0.011166,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.168212,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.126023,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.192217,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.098199,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.07357,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.112213
+   }
+  },
+  {
+   "dials": {
+    "muscle": 0.173,
+    "weight": 0.228,
+    "cupsize": 0.731,
+    "firmness": 0.656
+   },
+   "corners": {
+    "$md-universal-$fe-$yn-min$mu-min$wg": 0.338601,
+    "$md-universal-$fe-$yn-min$mu-$av$wg": 0.296315,
+    "$md-universal-$fe-$yn-$av$mu-min$wg": 0.189473,
+    "$md-universal-$fe-$yn-$av$mu-$av$wg": 0.165811,
+    "$md-$fe-$yn-min$mu-min$wg-max$hg": 0.032099,
+    "$md-$fe-$yn-min$mu-$av$wg-max$hg": 0.028091,
+    "$md-$fe-$yn-$av$mu-min$wg-max$hg": 0.017962,
+    "$md-$fe-$yn-$av$mu-$av$wg-max$hg": 0.015719,
+    "$md-$fe-$yn-min$mu-min$wg-$avcup-max$fi": 0.057237,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-$av$fi": 0.107504,
+    "$md-$fe-$yn-min$mu-min$wg-maxcup-max$fi": 0.047401,
+    "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi": 0.050089,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi": 0.094078,
+    "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi": 0.041481,
+    "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi": 0.032028,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi": 0.060156,
+    "$md-$fe-$yn-$av$mu-min$wg-maxcup-max$fi": 0.026524,
+    "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi": 0.028028,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi": 0.052644,
+    "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi": 0.023212
+   }
+  }
+ ]
+}

@@ -7,6 +7,15 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import {
+  createDefaultFacialArtworkState,
+  createFacialArtworkArtworkLayer,
+  parseFacialArtworkDefinition
+} from '$lib/goons/facialArtwork'
+import {
+  createDefaultEyeAppearanceState,
+  parseEyeAppearanceDefinition
+} from '$lib/goons/eyeAppearance'
+import {
   BackupRestoreError,
   createBackupBundle,
   createBackupBundleStream,
@@ -96,6 +105,84 @@ async function seedRepresentativeData(userId: string) {
     uploadType: 'avatars',
     uploadedAt: '2026-05-22T00:00:00.000Z'
   })
+  await fs.mkdir(path.join(uploadRoot, 'goon_facial_artwork'), { recursive: true })
+  await fs.writeFile(
+    path.join(uploadRoot, 'goon_facial_artwork', 'brow-left.png'),
+    'facial-artwork-bytes'
+  )
+  const facialDefinition = parseFacialArtworkDefinition(
+    JSON.parse(
+      await fs.readFile(
+        path.resolve(process.cwd(), 'static/goons/facial-artwork/v2/facial-artwork-v2.json'),
+        'utf8'
+      )
+    )
+  )
+  const browRole = facialDefinition.roles.find((entry) => entry.id === 'brows')!
+  const browTemplate = facialDefinition.templates.find((entry) => entry.id === browRole.template)!
+  const facialUpload = {
+    role: 'brows' as const,
+    url: 'http://localhost:5600/uploads/goon_facial_artwork/brow-left.png',
+    filename: 'brow-left.png',
+    size: 20,
+    mimeType: 'image/png' as const,
+    sha256: 'b'.repeat(64),
+    template: {
+      id: browTemplate.id,
+      version: browTemplate.version,
+      guideSha256: browTemplate.guide.sha256
+    },
+    provenance: {
+      sourceKind: 'user-authored' as const,
+      author: 'Fixture Artist',
+      license: 'User-owned',
+      rightsConfirmed: true as const
+    }
+  }
+  await redis.json.set('upload:goon_facial_artwork:brow-left.png', '$', {
+    originalName: 'brow-left.png',
+    mimetype: 'image/png',
+    size: 20,
+    uploadType: 'goon_facial_artwork',
+    storage: 'filesystem',
+    relativePath: 'goon_facial_artwork/brow-left.png',
+    filePath: path.join(uploadRoot, 'goon_facial_artwork', 'brow-left.png'),
+    facialArtwork: {
+      role: facialUpload.role,
+      definitionSha256: facialDefinition.definitionSha256,
+      sha256: facialUpload.sha256,
+      template: facialUpload.template,
+      provenance: facialUpload.provenance
+    },
+    uploadedAt: '2026-05-22T00:00:00.000Z'
+  })
+  await redis.sAdd(`user:${userId}:goons`, 'goon_facial')
+  const facialState = createDefaultFacialArtworkState(facialDefinition)
+  if (facialState.roles.brows.mode !== 'shared') throw new Error('fixture expects shared brows')
+  facialState.roles.brows.shared = {
+    ...facialState.roles.brows.shared,
+    visible: true,
+    artwork: createFacialArtworkArtworkLayer(facialDefinition, 'brows', facialUpload)
+  }
+  const eyeDefinition = parseEyeAppearanceDefinition(
+    JSON.parse(
+      await fs.readFile(
+        path.resolve(process.cwd(), 'static/goons/eye-appearance/v1/eye-appearance-v1.json'),
+        'utf8'
+      )
+    )
+  )
+  const eyeState = createDefaultEyeAppearanceState(eyeDefinition)
+  eyeState.irisSize = 1.1
+  await redis.json.set('goon:goon_facial', '$', {
+    id: 'goon_facial',
+    user_id: userId,
+    name: 'Facial Fixture',
+    facialArtwork: facialState,
+    eyeAppearance: eyeState,
+    created_at: '2026-05-22T00:00:00.000Z',
+    updated_at: '2026-05-22T00:00:00.000Z'
+  })
 }
 
 describe('backupRestoreService', () => {
@@ -150,7 +237,7 @@ describe('backupRestoreService', () => {
     expect(bundle.manifest.secrets.included).toBe(false)
     expect(bundle.manifest.secrets.excludedRecordCount).toBe(1)
     expect(bundle.manifest.secrets.redactedFieldCount).toBeGreaterThan(0)
-    expect(bundle.manifest.contents.fileAssetCount).toBe(2)
+    expect(bundle.manifest.contents.fileAssetCount).toBe(3)
 
     const preflight = await preflightBackupRestore('target', bundle.bytes)
     expect(preflight.ok).toBe(true)
@@ -176,14 +263,18 @@ describe('backupRestoreService', () => {
     const bytes = new Uint8Array(await new Response(bundle.stream).arrayBuffer())
     const entries = unzipSync(bytes)
 
-    expect(bundle.manifest.contents.fileAssetCount).toBe(2)
+    expect(bundle.manifest.contents.fileAssetCount).toBe(3)
     expect(Object.keys(entries)).toContain('manifest.json')
     expect(Object.keys(entries)).toContain('files/uploads/images/photo.png')
     expect(Object.keys(entries)).toContain('files/uploads/avatars/agent/legacy-avatar.png')
+    expect(Object.keys(entries)).toContain('files/uploads/goon_facial_artwork/brow-left.png')
     expect(Buffer.from(entries['files/uploads/images/photo.png']).toString('utf8')).toBe('image-bytes')
     expect(Buffer.from(entries['files/uploads/avatars/agent/legacy-avatar.png']).toString('utf8')).toBe(
       'legacy-avatar-bytes'
     )
+    expect(
+      Buffer.from(entries['files/uploads/goon_facial_artwork/brow-left.png']).toString('utf8')
+    ).toBe('facial-artwork-bytes')
     expect(
       Object.keys(entries).filter((name) => name.startsWith('redis/records/') && name.endsWith('.json'))
         .length
@@ -223,7 +314,7 @@ describe('backupRestoreService', () => {
 
     expect(result.restored).toBe(true)
     expect(result.targetUserId).toBe('target')
-    expect(result.fileAssetCount).toBe(2)
+    expect(result.fileAssetCount).toBe(3)
 
     const settings = (await redis.json.get('user:target:settings')) as Record<string, any>
     expect(settings.user_id).toBe('target')
@@ -258,6 +349,24 @@ describe('backupRestoreService', () => {
     await expect(
       fs.readFile(path.join(uploadRoot, 'avatars', 'agent', 'legacy-avatar.png'), 'utf8')
     ).resolves.toBe('legacy-avatar-bytes')
+    const restoredArtwork = (await redis.json.get(
+      'upload:goon_facial_artwork:brow-left.png'
+    )) as Record<string, any>
+    expect(restoredArtwork.filePath).toBe(
+      path.join(uploadRoot, 'goon_facial_artwork', 'brow-left.png')
+    )
+    await expect(
+      fs.readFile(path.join(uploadRoot, 'goon_facial_artwork', 'brow-left.png'), 'utf8')
+    ).resolves.toBe('facial-artwork-bytes')
+    const restoredGoon = (await redis.json.get('goon:goon_facial')) as Record<string, any>
+    expect(restoredGoon.user_id).toBe('target')
+    expect(restoredGoon.facialArtwork.roles.brows.shared.artwork.upload.url).toBe(
+      '/uploads/goon_facial_artwork/brow-left.png'
+    )
+    expect(restoredGoon.eyeAppearance).toMatchObject({
+      schemaVersion: 'eye-appearance-state/v1',
+      irisSize: 1.1
+    })
   })
 
   it('keeps user-owned seeded agents and models restorable', async () => {
@@ -376,12 +485,12 @@ describe('backupRestoreService', () => {
     expect(uploadRecord.storage).toBe('filesystem')
     expect(uploadRecord.relativePath).toBe('images/local-mode.png')
     expect(uploadRecord.filePath).toBe(path.join(uploadRoot, 'images', 'local-mode.png'))
-    expect(uploadRecord.url).toBe('http://localhost:5614/uploads/images/local-mode.png')
-    expect(uploadRecord.displayUrl).toBe('http://localhost:5614/uploads/images/local-mode.png')
+    expect(uploadRecord.url).toBe('/uploads/images/local-mode.png')
+    expect(uploadRecord.displayUrl).toBe('/uploads/images/local-mode.png')
 
     const agentRecord = (await redis.json.get('agent:agent_local_avatar')) as Record<string, any>
     expect(agentRecord.user_id).toBe('target')
-    expect(agentRecord.avatar).toBe('http://localhost:5614/uploads/images/local-mode.png')
+    expect(agentRecord.avatar).toBe('/uploads/images/local-mode.png')
 
     await expect(fs.readFile(path.join(uploadRoot, 'images', 'local-mode.png'), 'utf8')).resolves.toBe(
       'local-mode-bytes'
@@ -471,22 +580,18 @@ describe('backupRestoreService', () => {
 
     const goonRecord = (await redis.json.get('goon:goon_nested_uploads')) as Record<string, any>
     expect(goonRecord.user_id).toBe('target')
-    expect(goonRecord.files.vrm.url).toBe('http://localhost:5614/uploads/goons/source-avatar.vrm')
-    expect(goonRecord.files.animations[0].url).toBe(
-      'http://localhost:5614/uploads/goon-scenes/source-preview.mp4'
-    )
+    expect(goonRecord.files.vrm.url).toBe('/uploads/goons/source-avatar.vrm')
+    expect(goonRecord.files.animations[0].url).toBe('/uploads/goon-scenes/source-preview.mp4')
     expect(goonRecord.files.animations[0].previewVideo.url).toBe(
-      'http://localhost:5614/uploads/goon-scenes/source-preview.mp4'
+      '/uploads/goon-scenes/source-preview.mp4'
     )
     expect(goonRecord.guidedAvatar.package.url).toBe(
-      'http://localhost:5614/uploads/goon_guided_packages/source-package.bgoon'
+      '/uploads/goon_guided_packages/source-package.bgoon'
     )
     expect(goonRecord.guidedAvatar.manifest.url).toBe(
-      'http://localhost:5614/uploads/goon_guided_manifests/source-avatar.json'
+      '/uploads/goon_guided_manifests/source-avatar.json'
     )
-    expect(goonRecord.closet.items.shirt.texture.url).toBe(
-      'http://localhost:5614/uploads/goon-closet/source-shirt.png'
-    )
+    expect(goonRecord.closet.items.shirt.texture.url).toBe('/uploads/goon-closet/source-shirt.png')
   })
 
   it('preflights legacy single-file Redis record bundles', async () => {

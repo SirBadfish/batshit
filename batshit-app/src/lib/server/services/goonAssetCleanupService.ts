@@ -24,6 +24,7 @@ export const GOON_UPLOAD_TYPES = [
   'goon_animations',
   'goon_animation_previews',
   'goon_closet',
+  'goon_facial_artwork',
   'goon_scenes',
   'goon_scene_thumbs',
   'goon_room_shells',
@@ -256,6 +257,16 @@ function collectSceneRefs(
     collectRoomSurfaceSideRefs(references, wall?.interior, `${context} wall ${wallKey} interior`)
     collectRoomSurfaceSideRefs(references, wall?.exterior, `${context} wall ${wallKey} exterior`)
   }
+
+  for (const [apronKey, apron] of Object.entries(scene.roomShellBuilder?.exteriorAprons ?? {})) {
+    collectRoomSurfaceSideRefs(references, apron?.surface, `${context} apron ${apronKey}`)
+  }
+
+  collectRoomSurfaceSideRefs(
+    references,
+    scene.roomShellBuilder?.terrainSkirt?.surface,
+    `${context} terrain skirt`
+  )
 }
 
 function collectGoonRefs(references: GoonAssetReferenceMap, goon: GoonRecord) {

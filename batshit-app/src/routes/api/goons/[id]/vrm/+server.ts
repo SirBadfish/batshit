@@ -3,6 +3,7 @@ import { redis } from '$lib/server/redis'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
+  resolveUploadUrlsForBrowserInPayload,
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import type { GoonRecord } from '$lib/types/goons'
@@ -97,7 +98,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       return json({ error: 'Goon upload failed to return a URL.' }, { status: 500 })
     }
 
-    return json({ file: fileInfo })
+    return json({ file: resolveUploadUrlsForBrowserInPayload(fileInfo) })
   } catch (error) {
     console.error('Error uploading goon VRM:', error)
     return json({ error: 'Failed to upload goon VRM' }, { status: 500 })

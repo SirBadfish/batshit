@@ -33,6 +33,7 @@ import {
   isSubagentCompatibleWithPrimaryAgent,
   normalizeSubagentType,
 } from '$lib/utils/subagentType'
+import { resolveUploadUrlForBrowser } from '$lib/server/services/batshitServerUrls'
 import { requireOwnedSession } from '$lib/server/services/routeSecurity'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
 import { isTrustedN8nSseCallbackRequest } from '$lib/server/services/n8nCallbackTokens'
@@ -372,6 +373,12 @@ async function enrichToolMetadata(
     return hadMetadata ? baseMetadata : undefined
   }
 
+  const avatar =
+    matched.avatar ||
+    matched.avatar_url ||
+    baseMetadata.subagentAvatar ||
+    baseMetadata.avatarUrl
+
   return {
     ...baseMetadata,
     toolProvider: baseMetadata.toolProvider || 'subagent',
@@ -380,7 +387,7 @@ async function enrichToolMetadata(
     subagentId: matched.id,
     subagentName: matched.displayName || matched.name,
     subagentType: normalizeSubagentType(matched, matched.subagentType),
-    subagentAvatar: matched.avatar || matched.avatar_url || baseMetadata.subagentAvatar || baseMetadata.avatarUrl,
+    subagentAvatar: typeof avatar === 'string' ? resolveUploadUrlForBrowser(avatar) : avatar,
     subagentAvatarIconRef:
       matched.avatar_icon_ref ||
       matched.avatarIconRef ||

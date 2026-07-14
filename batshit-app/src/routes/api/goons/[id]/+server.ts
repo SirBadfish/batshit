@@ -2,10 +2,17 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import type { GoonRecord } from '$lib/types/goons'
 import {
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
+import {
   collectGoonUploadReferencesForClient,
   deleteGoonUploadAsset,
   hasGoonUploadReference
 } from '$lib/server/services/goonAssetCleanupService'
+import { validateGoonFacialArtworkState } from '$lib/server/services/facialArtwork.server'
+import { validateGoonEyeAppearanceState } from '$lib/server/services/eyeAppearance.server'
+import { collectFacialArtworkUploads } from '$lib/goons/facialArtwork'
 
 export const GET: RequestHandler = async ({ params, locals }) => {
   if (!locals.user?.id) {
@@ -30,7 +37,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
       return json({ error: 'Unauthorized' }, { status: 403 })
     }
 
-    return json(goon)
+    return json(resolveUploadUrlsForBrowserInPayload(goon))
   } catch (error) {
     console.error('Error fetching goon:', error)
     return json({ error: 'Failed to fetch goon' }, { status: 500 })
@@ -48,6 +55,9 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 
   try {
     const updates = await request.json()
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates)) {
+      return json({ error: 'Goon updates must be a JSON object' }, { status: 400 })
+    }
 
     const goon = await redis.execute(async (client) => {
       const existing = (await client.json.get(`goon:${goonId}`)) as GoonRecord | null
@@ -62,18 +72,40 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
         created_at: existing.created_at,
         updated_at: new Date().toISOString()
       }
+      if (Object.prototype.hasOwnProperty.call(updates, 'facialArtwork')) {
+        updated.facialArtwork = await validateGoonFacialArtworkState(
+          client as any,
+          updated,
+          updates.facialArtwork
+        )
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, 'eyeAppearance')) {
+        updated.eyeAppearance = await validateGoonEyeAppearanceState(
+          client as any,
+          updated,
+          updates.eyeAppearance
+        )
+      }
+      const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
 
-      await client.json.set(`goon:${goonId}`, '$', updated as any)
-      return updated
+      await client.json.set(`goon:${goonId}`, '$', storageUpdated as any)
+      return storageUpdated
     })
 
     if (!goon) {
       return json({ error: 'Goon not found' }, { status: 404 })
     }
 
-    return json({ goon })
+    return json({ goon: resolveUploadUrlsForBrowserInPayload(goon) })
   } catch (error) {
     console.error('Error updating goon:', error)
+    if (
+      error instanceof Error &&
+      (error.message.startsWith('[facial-artwork/v2]') ||
+        error.message.startsWith('[eye-appearance/v1]'))
+    ) {
+      return json({ error: error.message }, { status: 400 })
+    }
     return json({ error: 'Failed to update goon' }, { status: 500 })
   }
 }
@@ -243,6 +275,12 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 	        const overlayFilename = overlay.file?.filename
 	        if (overlayFilename && !hasGoonUploadReference(references, 'goons', overlayFilename)) {
 	          await deleteGoonUploadAsset('goons', overlayFilename)
+	        }
+	      }
+
+	      for (const artwork of collectFacialArtworkUploads(existing.facialArtwork)) {
+	        if (!hasGoonUploadReference(references, 'goon_facial_artwork', artwork.filename)) {
+	          await deleteGoonUploadAsset('goon_facial_artwork', artwork.filename)
 	        }
 	      }
 

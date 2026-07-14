@@ -5,6 +5,13 @@ import { invalidateUserSettingsCache } from '$lib/services/databaseRedis.server'
 import { normalizeVoiceSettings } from '$lib/utils/voiceSchema'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
+import { mergeGoonsSettingsPatch } from '$lib/goons/resolve'
+
+const NO_STORE_RESPONSE = {
+	headers: {
+		'Cache-Control': 'no-store'
+	}
+}
 
 function stripEngineRegistryFromVoiceSettings(value: unknown) {
 	const normalized = normalizeVoiceSettings(value)
@@ -56,6 +63,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 					return json({ error: 'Display name must be 14 characters or less' }, { status: 400 })
 				}
 			}
+
+			const nextGoonsSettings =
+				data.goons_settings_patch !== undefined
+					? mergeGoonsSettingsPatch((existing as any).goons_settings, data.goons_settings_patch)
+					: data.goons_settings !== undefined ?
+						data.goons_settings : (existing as any).goons_settings
 
 			// Build update object preserving existing values (but allow profile fields when provided)
 			const updateData: any = {
@@ -111,8 +124,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 							data.voice_settings !== undefined ?
 								data.voice_settings : (existing as any).voice_settings
 						),
-				goons_settings: data.goons_settings !== undefined ?
-					data.goons_settings : (existing as any).goons_settings
+				goons_settings: nextGoonsSettings
 			}
 			
 			const settings = await redis.updateUserSettings(locals.user.id, updateData)
@@ -159,7 +171,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 		const redis = new RedisService()
 		const settings = await redis.getUserSettings(locals.user.id)
 		
-		return json({ settings: sanitizeSettingsResponse(settings) })
+		return json({ settings: sanitizeSettingsResponse(settings) }, NO_STORE_RESPONSE)
 	} catch (error) {
 		console.error('Error getting user settings:', error)
 		return json({ 

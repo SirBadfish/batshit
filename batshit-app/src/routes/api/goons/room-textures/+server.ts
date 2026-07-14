@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
+  resolveUploadUrlsForBrowserInPayload,
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 
@@ -37,7 +38,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   const payload = rewriteInternalBatshitServerUrlsInPayload(await uploadResponse.json())
-  return json(payload)
+  return json(resolveUploadUrlsForBrowserInPayload(payload))
 }
 
 export const DELETE: RequestHandler = async ({ request, locals }) => {

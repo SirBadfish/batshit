@@ -1,12 +1,29 @@
 import type {
   GoonFileRef,
+  GoonRoomExteriorApron,
   GoonRoomShellBuilder,
   GoonRoomSurface,
-  GoonRoomSurfaceSide
+  GoonRoomSurfaceSide,
+  GoonRoomTerrainSkirt
 } from '$lib/types/goons'
 
 export const ROOM_DEFAULT_SIZE = 13.5
 export const ROOM_DEFAULT_HEIGHT = ROOM_DEFAULT_SIZE * (1200 / 2048)
+export const ROOM_DEFAULT_EXTERIOR_APRON_DEPTH = 4
+export const ROOM_MIN_EXTERIOR_APRON_DEPTH = 0.5
+export const ROOM_MAX_EXTERIOR_APRON_DEPTH = 40
+export const ROOM_DEFAULT_TERRAIN_SKIRT_RADIUS = 70
+export const ROOM_MIN_TERRAIN_SKIRT_RADIUS = 12
+export const ROOM_MAX_TERRAIN_SKIRT_RADIUS = 240
+export const ROOM_DEFAULT_TERRAIN_SKIRT_EDGE_FADE = 0.35
+export const ROOM_MIN_TERRAIN_SKIRT_EDGE_FADE = 0
+export const ROOM_MAX_TERRAIN_SKIRT_EDGE_FADE = 0.85
+export const ROOM_DEFAULT_TERRAIN_SKIRT_SLOPE_ANGLE_DEG = 0
+export const ROOM_MIN_TERRAIN_SKIRT_SLOPE_ANGLE_DEG = 0
+export const ROOM_MAX_TERRAIN_SKIRT_SLOPE_ANGLE_DEG = 75
+export const ROOM_DEFAULT_TERRAIN_SKIRT_SEGMENTS = 128
+export const ROOM_MIN_TERRAIN_SKIRT_SEGMENTS = 32
+export const ROOM_MAX_TERRAIN_SKIRT_SEGMENTS = 256
 export const ROOM_MIN_HEIGHT = ROOM_DEFAULT_HEIGHT * 0.5
 export const ROOM_LOW_CEILING = ROOM_DEFAULT_HEIGHT * 0.8
 export const ROOM_HEIGHT_PRESET_VALUES = [100, 75, 50] as const
@@ -91,6 +108,73 @@ export function createDefaultRoomSurface(
     enabled: enabled ?? true,
     interior: interiorSide,
     exterior: exteriorSide
+  }
+}
+
+export function createDefaultRoomExteriorApron(
+  overrides: Partial<GoonRoomExteriorApron> = {},
+  defaultTexture?: GoonFileRef
+): GoonRoomExteriorApron {
+  const depth =
+    Number.isFinite(overrides.depth) && (overrides.depth ?? 0) > 0
+      ? Math.min(
+          ROOM_MAX_EXTERIOR_APRON_DEPTH,
+          Math.max(ROOM_MIN_EXTERIOR_APRON_DEPTH, Number(overrides.depth))
+        )
+      : ROOM_DEFAULT_EXTERIOR_APRON_DEPTH
+  return {
+    enabled: overrides.enabled ?? false,
+    depth,
+    surface: createDefaultRoomSurfaceSide({
+      texture: defaultTexture,
+      ...(overrides.surface ?? {})
+    })
+  }
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+  const numeric = Number.isFinite(value) ? Number(value) : fallback
+  return Math.min(max, Math.max(min, numeric))
+}
+
+export function createDefaultRoomTerrainSkirt(
+  overrides: Partial<GoonRoomTerrainSkirt> = {},
+  defaultTexture?: GoonFileRef
+): GoonRoomTerrainSkirt {
+  return {
+    enabled: overrides.enabled ?? false,
+    radius: clampNumber(
+      overrides.radius,
+      ROOM_DEFAULT_TERRAIN_SKIRT_RADIUS,
+      ROOM_MIN_TERRAIN_SKIRT_RADIUS,
+      ROOM_MAX_TERRAIN_SKIRT_RADIUS
+    ),
+    edgeFade: clampNumber(
+      overrides.edgeFade,
+      ROOM_DEFAULT_TERRAIN_SKIRT_EDGE_FADE,
+      ROOM_MIN_TERRAIN_SKIRT_EDGE_FADE,
+      ROOM_MAX_TERRAIN_SKIRT_EDGE_FADE
+    ),
+    slopeAngleDeg: clampNumber(
+      overrides.slopeAngleDeg,
+      ROOM_DEFAULT_TERRAIN_SKIRT_SLOPE_ANGLE_DEG,
+      ROOM_MIN_TERRAIN_SKIRT_SLOPE_ANGLE_DEG,
+      ROOM_MAX_TERRAIN_SKIRT_SLOPE_ANGLE_DEG
+    ),
+    projection: overrides.projection === 'skybox-ground' ? 'skybox-ground' : 'surface',
+    segments: Math.round(
+      clampNumber(
+        overrides.segments,
+        ROOM_DEFAULT_TERRAIN_SKIRT_SEGMENTS,
+        ROOM_MIN_TERRAIN_SKIRT_SEGMENTS,
+        ROOM_MAX_TERRAIN_SKIRT_SEGMENTS
+      )
+    ),
+    opacity: clampNumber(overrides.opacity, 1, 0.05, 1),
+    surface: createDefaultRoomSurfaceSide({
+      texture: defaultTexture,
+      ...(overrides.surface ?? {})
+    })
   }
 }
 
@@ -228,6 +312,8 @@ export function normalizeRoomShellBuilder(
       texture: wallSurfaces.west?.exterior?.texture ?? fallbackExterior
     }
   })
+  const exteriorAprons = base.exteriorAprons ?? {}
+  const terrainSkirt = base.terrainSkirt ?? {}
 
   return {
     width: Number.isFinite(base.width) && (base.width ?? 0) > 0 ? base.width : ROOM_DEFAULT_SIZE,
@@ -240,6 +326,13 @@ export function normalizeRoomShellBuilder(
       floor,
       ceiling,
       walls: { north, south, east, west }
-    }
+    },
+    exteriorAprons: {
+      north: createDefaultRoomExteriorApron(exteriorAprons.north, floor.interior?.texture),
+      south: createDefaultRoomExteriorApron(exteriorAprons.south, floor.interior?.texture),
+      east: createDefaultRoomExteriorApron(exteriorAprons.east, floor.interior?.texture),
+      west: createDefaultRoomExteriorApron(exteriorAprons.west, floor.interior?.texture)
+    },
+    terrainSkirt: createDefaultRoomTerrainSkirt(terrainSkirt, floor.interior?.texture)
   }
 }

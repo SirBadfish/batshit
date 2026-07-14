@@ -1,0 +1,301 @@
+{
+  "schemaVersion": "eye-appearance/v1",
+  "stateSchemaVersion": "eye-appearance-state/v1",
+  "status": "in-development-product-export-unapproved",
+  "productExportApproved": false,
+  "definitionSha256": "ead3b1bba85b06675aa042943db4b5bc1f562c4aeb8ddc88c9976eb1533c1fa5",
+  "facialArtworkDependency": {
+    "schemaVersion": "facial-artwork/v2",
+    "definitionSha256": "f4c8dedfacb29d2bbc1b2d2ed8c7b0c5385f694ffe588a865d880c54b84d589b"
+  },
+  "ownership": "package-owned-physical-eye-controls-separate-from-appearance-dials-v2-and-facial-artwork-state-v2",
+  "zeroLaw": "iris/pupil use exact 1.0 neutral multipliers; all five sclera-fit controls use zero-centered post-fit offsets; reset reproduces automatic Recipe fit",
+  "symmetryLaw": "all seven controls are linked bilateral scalars; asymmetric/per-eye state is forbidden in v1",
+  "compositionOrder": [
+    "automatic-recipe-fit",
+    "iris-pupil-conformal-size-and-reprojection",
+    "complete-eye-sclera-fit-assembly-offsets",
+    "gaze-performance"
+  ],
+  "completeEyeAssemblyNodes": [
+    "sclera",
+    "iris",
+    "pupil",
+    "eye-highlight",
+    "cornea",
+    "eye-bone-pivot"
+  ],
+  "solidColorDefaults": {
+    "iris": [
+      0.035,
+      0.42,
+      0.34,
+      1.0
+    ],
+    "pupil": [
+      0.008,
+      0.009,
+      0.012,
+      1.0
+    ],
+    "sclera": [
+      0.82,
+      0.79,
+      0.74,
+      1.0
+    ]
+  },
+  "runtimeBindings": {
+    "coordinateSpace": "eye-bone-parent-gltf",
+    "pivotBindingLaw": "resolve the current Recipe eye-bone rest first, then compose the linked complete-eye Sclera Fit translation/tilt against that rest; zero offsets reproduce the Recipe result exactly",
+    "inverseBindLaw": "translation or tilt rebases the matching eye-bone rest and inverse bind before gaze performance; never translate child meshes without the pivot",
+    "conformalLaw": "resize each freshly Recipe-resolved iris/pupil disc radially about its local center, reproject every vertex to the current fitted sclera ellipsoid along opticalAxisLocal, then preserve its authored surface offset",
+    "geometryEvidence": {
+      "acceptedV4GlbSha256": "d649400a57fe721be6afa5cbd19bbd50b54b14e20ccd981876d12926e9b38b79",
+      "localizedFitMatrixSha256": "d0bef0892466bad7eb8df9ba4f63e073372f714729a964dabde29a6c03866101",
+      "conformalSolverSha256": "2c554de986075f7991b35a84d0a94905f7218960ed9e6fdaf06f62eeec865d60"
+    },
+    "left": {
+      "eyeBone": "mixamorigLeftEye",
+      "neutralPivotParent": [
+        0.030968548730015755,
+        0.06385061144828796,
+        0.05609587952494621
+      ],
+      "assemblyNodes": {
+        "sclera": "bs_f1_eye_l_sclera",
+        "cornea": "bs_f1_eye_l_cornea",
+        "iris": "bs_f1_eye_l_iris",
+        "pupil": "bs_f1_eye_l_pupil"
+      },
+      "eyeHighlightMaterialNodes": [
+        "bs_f1_eye_l_iris",
+        "bs_f1_eye_l_pupil"
+      ],
+      "horizontalAxisParent": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "verticalAxisParent": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "depthAxisParent": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "forwardAxisParent": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "tiltAxisParent": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "horizontalSign": 1,
+      "tiltSign": 1,
+      "conformal": {
+        "scleraNode": "bs_f1_eye_l_sclera",
+        "irisNode": "bs_f1_eye_l_iris",
+        "pupilNode": "bs_f1_eye_l_pupil",
+        "opticalAxisLocal": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scleraRadiiLocal": [
+          0.01438063569366932,
+          0.013668684288859367,
+          0.01483536884188652
+        ],
+        "irisCenterLocal": [
+          0.0,
+          0.0,
+          0.014915372245013714
+        ],
+        "pupilCenterLocal": [
+          0.0,
+          0.0,
+          0.015075373463332653
+        ],
+        "irisAuthoredOffset": 8e-05,
+        "pupilAuthoredOffset": 0.00024
+      }
+    },
+    "right": {
+      "eyeBone": "mixamorigRightEye",
+      "neutralPivotParent": [
+        -0.03096855990588665,
+        0.06385061144828796,
+        0.05609586462378502
+      ],
+      "assemblyNodes": {
+        "sclera": "bs_f1_eye_r_sclera",
+        "cornea": "bs_f1_eye_r_cornea",
+        "iris": "bs_f1_eye_r_iris",
+        "pupil": "bs_f1_eye_r_pupil"
+      },
+      "eyeHighlightMaterialNodes": [
+        "bs_f1_eye_r_iris",
+        "bs_f1_eye_r_pupil"
+      ],
+      "horizontalAxisParent": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "verticalAxisParent": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "depthAxisParent": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "forwardAxisParent": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "tiltAxisParent": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "horizontalSign": -1,
+      "tiltSign": -1,
+      "conformal": {
+        "scleraNode": "bs_f1_eye_r_sclera",
+        "irisNode": "bs_f1_eye_r_iris",
+        "pupilNode": "bs_f1_eye_r_pupil",
+        "opticalAxisLocal": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scleraRadiiLocal": [
+          0.01438063569366932,
+          0.013668684288859367,
+          0.01483536884188652
+        ],
+        "irisCenterLocal": [
+          0.0,
+          0.0,
+          0.014915372245013714
+        ],
+        "pupilCenterLocal": [
+          0.0,
+          0.0,
+          0.015075373463332653
+        ],
+        "irisAuthoredOffset": 8e-05,
+        "pupilAuthoredOffset": 0.00024
+      }
+    }
+  },
+  "controls": [
+    {
+      "id": "iris_size",
+      "label": "Iris Size",
+      "minimum": 0.75,
+      "maximum": 1.35,
+      "step": 0.01,
+      "default": 1.0,
+      "unit": "neutral-multiplier",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "radial-angular resize then reproject every iris vertex to the freshly resolved fitted sclera surface while preserving authored offset"
+    },
+    {
+      "id": "pupil_size",
+      "label": "Pupil Size",
+      "minimum": 0.5,
+      "maximum": 1.5,
+      "step": 0.01,
+      "default": 1.0,
+      "unit": "neutral-multiplier",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "radial-angular resize then reproject every pupil vertex to the freshly resolved fitted sclera surface while preserving authored offset"
+    },
+    {
+      "id": "sclera_scale",
+      "label": "Sclera Scale",
+      "minimum": -0.1,
+      "maximum": 0.1,
+      "step": 0.005,
+      "default": 0.0,
+      "unit": "post-fit-multiplier-offset",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "multiply the complete bilateral layered-eye assembly by 1 + value and reconform round-front iris/pupil presentation"
+    },
+    {
+      "id": "sclera_tilt",
+      "label": "Sclera Tilt",
+      "minimum": -3.5,
+      "maximum": 3.5,
+      "step": 0.1,
+      "default": 0.0,
+      "unit": "degrees",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "apply mirrored anatomical tilt to both complete eye assemblies and rebase both eye-bone pivots/inverse binds"
+    },
+    {
+      "id": "sclera_horizontal_position",
+      "label": "Sclera Horizontal Position",
+      "minimum": -0.001438,
+      "maximum": 0.001438,
+      "step": 5e-05,
+      "default": 0.0,
+      "unit": "meters",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "translate both complete eye assemblies in mirrored anatomical lateral directions and rebase both eye-bone pivots/inverse binds"
+    },
+    {
+      "id": "sclera_vertical_position",
+      "label": "Sclera Vertical Position",
+      "minimum": -0.001367,
+      "maximum": 0.001367,
+      "step": 5e-05,
+      "default": 0.0,
+      "unit": "meters",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "translate both complete eye assemblies together on the fitted vertical axis and rebase both eye-bone pivots/inverse binds"
+    },
+    {
+      "id": "sclera_depth",
+      "label": "Sclera Depth",
+      "minimum": -0.000742,
+      "maximum": 0.000742,
+      "step": 2.5e-05,
+      "default": 0.0,
+      "unit": "meters",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "translate both complete eye assemblies together on the fitted optical-depth axis and rebase both eye-bone pivots/inverse binds"
+    }
+  ],
+  "rangeEvidence": {
+    "schemaVersion": "sa090-eye-appearance-range-calibration/v1",
+    "sha256": "7252696f562b4e146e644151f63c452b6508178b2454096f00c02fcdb3fdcd92",
+    "canonicalSha256": "0cf94cec3c2cff84e47acaa884b443e8a418cdb4cc804b542716c3d299f7eafe"
+  }
+}

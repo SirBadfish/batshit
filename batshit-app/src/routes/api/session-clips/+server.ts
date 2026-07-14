@@ -3,6 +3,7 @@ import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import type { SessionClipRow } from '$lib/types/database'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
+import { normalizeUploadUrlsForStorageInPayload } from '$lib/server/services/batshitServerUrls'
 
 // POST /api/session-clips - Attach a clip to a session
 export const POST: RequestHandler = async ({ request, locals }) => {
@@ -60,7 +61,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
           usedInSessions.push(session_id)
           clip.usedInSessions = usedInSessions
           clip.lastUsedAt = new Date().toISOString()
-          await redis.set(`clip:${user.value.id}:${clip_id}`, clip)
+          await redis.set(
+            `clip:${user.value.id}:${clip_id}`,
+            normalizeUploadUrlsForStorageInPayload(clip)
+          )
         }
       } catch (parseError) {
         console.error(`Error parsing clip data for ${clip_id}:`, parseError)

@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { resolveGoonCues, resolvePreviewAnimationDefinition } from '$lib/goons/resolve'
+import {
+  mergeGoonsSettingsPatch,
+  resolveGoonCues,
+  resolvePreviewAnimationDefinition
+} from '$lib/goons/resolve'
 import type { GoonCueMap, GoonFileRef, GoonRecord, GoonsSettings } from '$lib/types/goons'
 
 describe('resolvePreviewAnimationDefinition', () => {
@@ -84,5 +88,74 @@ describe('resolveGoonCues', () => {
 
     expect(Object.keys(resolved.cueMap)).toEqual(['calm', 'wave'])
     expect(resolved.enabled).toEqual(['calm', 'wave'])
+  })
+})
+
+describe('mergeGoonsSettingsPatch', () => {
+  it('merges top-level Goon settings patches without wiping scenes or room textures', () => {
+    const settings: GoonsSettings = {
+      dockOpen: true,
+      immersiveMode: true,
+      globalCloset: { items: {} },
+      kitchen: {
+        cues: {},
+        emojiMap: {},
+        scenes: {
+          cyberpunk: {
+            id: 'cyberpunk',
+            name: 'Cyberpunk',
+            skybox: {
+              url: '/uploads/goon_scenes/new.png',
+              filename: 'new.png',
+              originalName: 'new.png'
+            }
+          }
+        },
+        roomTextures: {
+          wall: [
+            {
+              url: '/uploads/goon_room_textures/wall.png',
+              filename: 'wall.png',
+              originalName: 'wall.png'
+            }
+          ]
+        },
+        bodyVariants: { items: {} }
+      }
+    }
+
+    const merged = mergeGoonsSettingsPatch(settings, { dockOpen: false })
+
+    expect(merged.dockOpen).toBe(false)
+    expect(merged.kitchen?.scenes?.cyberpunk?.skybox?.filename).toBe('new.png')
+    expect(merged.kitchen?.roomTextures?.wall?.[0]?.filename).toBe('wall.png')
+  })
+
+  it('merges kitchen patches without dropping unrelated kitchen libraries', () => {
+    const settings: GoonsSettings = {
+      kitchen: {
+        cues: {
+          calm: { name: 'calm', kind: 'mood', playback: 'loop' }
+        },
+        emojiMap: {},
+        scenes: {
+          cyberpunk: { id: 'cyberpunk', name: 'Cyberpunk' }
+        },
+        roomTextures: {},
+        bodyVariants: { items: {} }
+      }
+    }
+
+    const merged = mergeGoonsSettingsPatch(settings, {
+      kitchen: {
+        emojiMap: {
+          ':)': 'calm'
+        }
+      }
+    })
+
+    expect(merged.kitchen?.emojiMap?.[':)']).toBe('calm')
+    expect(merged.kitchen?.cues?.calm?.name).toBe('calm')
+    expect(merged.kitchen?.scenes?.cyberpunk?.name).toBe('Cyberpunk')
   })
 })

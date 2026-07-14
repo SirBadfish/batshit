@@ -10,6 +10,7 @@ import {
   resolveClipTunnelUrl
 } from '$lib/server/services/clipUrlResolver'
 import { resolveClipDataUrlFromStoredUpload } from '$lib/server/services/clipUploadPayload'
+import { resolveUploadUrlForBrowser } from '$lib/server/services/batshitServerUrls'
 
 const MAX_CLIP_SOURCE_DATA_URI_CHARS = 10_000_000
 
@@ -54,14 +55,15 @@ function isModelReachableUrl(value: unknown) {
 }
 
 function pickPreviewUrl(clip: ClipRecord) {
-  return (
+  const previewUrl =
     trimString(clip.thumbnailUrl) ||
     trimString(clip.displayUrl) ||
     trimString(clip.localUrl) ||
     trimString(clip.externalUrl) ||
     trimString(clip.fullResolutionUrl) ||
     null
-  )
+
+  return previewUrl ? resolveUploadUrlForBrowser(previewUrl) : null
 }
 
 function clipListItem(clip: ClipRecord) {
@@ -80,7 +82,7 @@ function clipListItem(clip: ClipRecord) {
     fileSize: clip.fileSize || null,
     createdAt: clip.created_at || null,
     updatedAt: clip.updated_at || null,
-    thumbnailUrl: clip.thumbnailUrl || null,
+    thumbnailUrl: clip.thumbnailUrl ? resolveUploadUrlForBrowser(clip.thumbnailUrl) : null,
     previewUrl: pickPreviewUrl(clip),
     hasTunnelPath: Boolean(tunnelPath),
     hasFullResolutionSource: Boolean(fullResolutionUrl),

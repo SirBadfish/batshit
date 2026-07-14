@@ -38,6 +38,23 @@ describe('goonAssetCleanupService', () => {
           }
         ]
       },
+      facialArtwork: {
+        schemaVersion: 'facial-artwork-state/v2',
+        roles: {
+          brows: {
+            mode: 'shared',
+            shared: {
+              artwork: {
+                upload: {
+                  role: 'brows',
+                  url: 'http://localhost:5601/uploads/goon_facial_artwork/brow-left.png',
+                  filename: 'brow-left.png'
+                }
+              }
+            }
+          }
+        }
+      },
       created_at: '2026-05-22T00:00:00.000Z',
       updated_at: '2026-05-22T00:00:00.000Z'
     })
@@ -108,7 +125,18 @@ describe('goonAssetCleanupService', () => {
                     filename: 'chair.glb'
                   }
                 }
-              ]
+              ],
+              roomShellBuilder: {
+                terrainSkirt: {
+                  enabled: true,
+                  surface: {
+                    texture: {
+                      url: 'http://localhost:5601/uploads/goon_room_textures/terrain.png',
+                      filename: 'terrain.png'
+                    }
+                  }
+                }
+              }
             }
           },
           roomTextures: {
@@ -134,7 +162,9 @@ describe('goonAssetCleanupService', () => {
     await seedUpload('goon_scene_thumbs', 'room_thumb.jpg')
     await seedUpload('goon_room_shells', 'room.glb')
     await seedUpload('goon_room_textures', 'floor.png')
+    await seedUpload('goon_room_textures', 'terrain.png')
     await seedUpload('goon_scene_props', 'chair.glb')
+    await seedUpload('goon_facial_artwork', 'brow-left.png')
 
     const audit = await auditGoonUploadAssets('josh')
 
@@ -143,6 +173,8 @@ describe('goonAssetCleanupService', () => {
     expect(audit.orphans).toMatchObject([{ uploadType: 'goons', filename: 'old.vrm' }])
     expect(audit.entries.find((entry) => entry.filename === 'shared.vrma')?.referenced).toBe(true)
     expect(audit.entries.find((entry) => entry.filename === 'room_thumb.jpg')?.referenced).toBe(true)
+    expect(audit.entries.find((entry) => entry.filename === 'terrain.png')?.referenced).toBe(true)
+    expect(audit.entries.find((entry) => entry.filename === 'brow-left.png')?.referenced).toBe(true)
   })
 
   it('deletes only orphaned Goon upload records during cleanup', async () => {

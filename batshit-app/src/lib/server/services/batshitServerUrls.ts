@@ -1,15 +1,28 @@
-import { env as privateEnv } from '$env/dynamic/private'
-
 function trimTrailingSlash(value: string) {
   return value.replace(/\/+$/, '')
 }
 
+function extractUploadPath(rawUrl: string): string | null {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return null
+
+  if (trimmed.startsWith('/uploads/')) return trimmed
+
+  try {
+    const parsed = new URL(trimmed)
+    if (!parsed.pathname.startsWith('/uploads/')) return null
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`
+  } catch {
+    return null
+  }
+}
+
 function resolvePrivateEnvValue(key: string) {
-  return privateEnv[key] || process.env[key]
+  return process.env[key]
 }
 
 function resolvePublicBatshitServerUrl() {
-  return process.env.PUBLIC_BATSHIT_SERVER_URL || privateEnv.PUBLIC_BATSHIT_SERVER_URL
+  return process.env.PUBLIC_BATSHIT_SERVER_URL
 }
 
 export function getInternalBatshitServerUrl() {
@@ -76,6 +89,63 @@ export function rewriteInternalBatshitServerUrlToPublic(rawUrl: string) {
   parsedRaw.protocol = parsedPublic.protocol
   parsedRaw.host = parsedPublic.host
   return parsedRaw.toString()
+}
+
+export function normalizeUploadUrlForStorage(rawUrl: string) {
+  return extractUploadPath(rawUrl) || rawUrl
+}
+
+export function resolveUploadUrlForBrowser(rawUrl: string) {
+  const uploadPath = extractUploadPath(rawUrl)
+  if (!uploadPath) return rawUrl
+
+  try {
+    return new URL(uploadPath, `${getPublicBatshitServerUrl()}/`).toString()
+  } catch {
+    return rawUrl
+  }
+}
+
+export function normalizeUploadUrlsForStorageInPayload<T>(value: T): T {
+  if (typeof value === 'string') {
+    return normalizeUploadUrlForStorage(value) as T
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeUploadUrlsForStorageInPayload(item)) as T
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        normalizeUploadUrlsForStorageInPayload(item)
+      ])
+    ) as T
+  }
+
+  return value
+}
+
+export function resolveUploadUrlsForBrowserInPayload<T>(value: T): T {
+  if (typeof value === 'string') {
+    return resolveUploadUrlForBrowser(value) as T
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => resolveUploadUrlsForBrowserInPayload(item)) as T
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        resolveUploadUrlsForBrowserInPayload(item)
+      ])
+    ) as T
+  }
+
+  return value
 }
 
 export function rewriteInternalBatshitServerUrlsInPayload<T>(value: T): T {

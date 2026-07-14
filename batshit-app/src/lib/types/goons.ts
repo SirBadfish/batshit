@@ -1,3 +1,7 @@
+import type { AppearanceDialValueState } from '$lib/goons/appearanceDials'
+import type { FacialArtworkStateV2 } from '$lib/goons/facialArtwork'
+import type { EyeAppearanceStateV1 } from '$lib/goons/eyeAppearance'
+
 export type GoonCompatibilityTier = 'A' | 'B' | 'C' | 'pending'
 export type GoonKind = 'vrm' | 'custom'
 export type GoonSourceProfile =
@@ -155,12 +159,16 @@ export type GoonVrmUpdateReport = {
   disabledClosetItems?: string[]
 }
 
+export type GoonCameraMode = 'indoor' | 'free'
+
 export type GoonCamera = {
   orbitTarget?: { x?: number; y?: number; z?: number }
   distance?: number
   yaw?: number
   pitch?: number
   zoom?: number
+  fov?: number
+  mode?: GoonCameraMode
 }
 
 export type GoonSceneSkybox = GoonFileRef & {
@@ -170,6 +178,22 @@ export type GoonSceneSkybox = GoonFileRef & {
 
 export type GoonSceneRoomShell = GoonFileRef & {
   kind?: 'room_shell'
+}
+
+export type GoonSceneRoomShellTransform = {
+  position?: [number, number, number]
+  /** Y-axis rotation in radians. Scene Editor presents this value in degrees. */
+  rotationY?: number
+  uniformScale?: number
+}
+
+export type GoonSceneCameraBoundary = {
+  /** Boundary-box center in the uploaded Room Shell wrapper's local coordinates. */
+  center?: [number, number, number]
+  /** Full boundary-box dimensions before the uploaded Room Shell wrapper transform. */
+  size?: [number, number, number]
+  /** Optional local Y rotation in radians, applied inside the Room Shell wrapper. */
+  rotationY?: number
 }
 
 export type GoonRoomTextureKind = 'floor' | 'wall' | 'ceiling' | 'exterior' | 'trim'
@@ -183,6 +207,8 @@ export type GoonRoomTextureLibrary = Partial<Record<GoonRoomTextureKind, GoonRoo
 export type GoonRoomSurfaceFit = 'tile' | 'stretch'
 
 export type GoonRoomSurfaceTransparency = 'opaque' | 'cutout' | 'glass'
+
+export type GoonRoomWallKey = 'north' | 'south' | 'east' | 'west'
 
 export type GoonRoomSurfaceSide = {
   texture?: GoonFileRef
@@ -212,12 +238,33 @@ export type GoonRoomSurfaces = {
   walls?: GoonRoomWallSurfaces
 }
 
+export type GoonRoomExteriorApron = {
+  enabled?: boolean
+  depth?: number
+  surface?: GoonRoomSurfaceSide
+}
+
+export type GoonRoomExteriorAprons = Partial<Record<GoonRoomWallKey, GoonRoomExteriorApron>>
+
+export type GoonRoomTerrainSkirt = {
+  enabled?: boolean
+  radius?: number
+  edgeFade?: number
+  slopeAngleDeg?: number
+  projection?: 'surface' | 'skybox-ground'
+  segments?: number
+  opacity?: number
+  surface?: GoonRoomSurfaceSide
+}
+
 export type GoonRoomShellBuilder = {
   width?: number
   depth?: number
   height?: number
   floorOffsetY?: number
   surfaces?: GoonRoomSurfaces
+  exteriorAprons?: GoonRoomExteriorAprons
+  terrainSkirt?: GoonRoomTerrainSkirt
 }
 
 export type GoonSceneProp = {
@@ -240,15 +287,45 @@ export type GoonSceneMarker = {
 
 export type GoonSceneMarkers = Record<string, GoonSceneMarker[]>
 
+export type GoonSceneAmbiencePreset =
+  | 'rain'
+  | 'snow'
+  | 'embers'
+  | 'fireflies'
+  | 'dust'
+  | 'petals'
+  | 'magic_sparks'
+  | 'mist'
+
+export type GoonSceneAmbiencePlacement = 'inside' | 'outside' | 'whole_stage'
+
+export type GoonScenePlacement = 'ground' | 'elevated'
+
+export type GoonSceneAmbience = {
+  enabled?: boolean
+  preset?: GoonSceneAmbiencePreset
+  placement?: GoonSceneAmbiencePlacement
+  intensity?: number
+  speed?: number
+  wind?: [number, number]
+  seed?: number
+}
+
 export type GoonSceneDefinition = {
   id: string
   name: string
   description?: string
   skybox?: GoonSceneSkybox
+  scenePlacement?: GoonScenePlacement
+  /** Image-space row from the top used as Ground Level's projection boundary. */
+  groundProjectionLine?: number
   roomShell?: GoonSceneRoomShell
+  roomShellTransform?: GoonSceneRoomShellTransform
+  cameraBoundary?: GoonSceneCameraBoundary
   roomShellBuilder?: GoonRoomShellBuilder
   props?: GoonSceneProp[]
   markers?: GoonSceneMarkers
+  ambience?: GoonSceneAmbience
 }
 
 export type GoonSceneMap = Record<string, GoonSceneDefinition>
@@ -386,6 +463,10 @@ export type GoonFileRef = {
   size?: number
   mimeType?: string
   uploadedAt?: string
+  // Stamped by the animation-library PATCH route whenever motion metadata is
+  // edited; unified motion cards use it to pick the metadata winner when a
+  // pre-pairing VRMA/GLB pair diverged.
+  metaUpdatedAt?: string
   tags?: string[]
   motionMeta?: GoonMotionMetadata
   previewVideo?: Omit<GoonFileRef, 'previewVideo' | 'tags' | 'motionMeta'>
@@ -514,6 +595,12 @@ export interface GoonRecord {
     animations?: GoonFileRef[]
   }
   customAvatar?: GoonCustomAvatarFiles
+  /** Versioned first-party appearance state (avatar.json#appearanceDials contract). */
+  appearanceDials?: AppearanceDialValueState | null
+  /** Recipe-owned facial artwork state, bound to avatar.json#facialArtwork. */
+  facialArtwork?: FacialArtworkStateV2 | null
+  /** Package-owned linked physical eye state, bound to avatar.json#eyeAppearance. */
+  eyeAppearance?: EyeAppearanceStateV1 | null
   guidedAvatar?: GoonGuidedAvatarFiles
   compatibility?: GoonCompatibilityReport
   vrmUpdate?: GoonVrmUpdateReport | null
@@ -555,5 +642,11 @@ export type GoonsSettings = {
     bodyVariants?: GoonBodyVariantLibrary
     eyeContact?: GoonGlobalEyeContactSettingsMap
     defaultPack?: GoonDefaultPack | null
+  }
+  motions?: {
+    // Preview body override for GLB-lane motion previews. Unset means the
+    // bundled BSRigV2 stunt dummy; a goon id targets that custom goon (for
+    // GLB clips authored against a non-first-party rig).
+    glbPreviewGoonId?: string
   }
 }

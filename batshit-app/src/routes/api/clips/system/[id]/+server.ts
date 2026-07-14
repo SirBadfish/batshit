@@ -3,6 +3,10 @@ import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import type { ClipRow } from '$lib/types/database'
 import { requireAdmin } from '$lib/server/services/routeSecurity'
+import {
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
 import { Buffer } from 'buffer'
 
 // Admin-only endpoint to update system clips (clip:system:<id>)
@@ -46,8 +50,9 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     updated_at: now
   }
 
-  await redis.set(key, updated)
+  const storageClip = normalizeUploadUrlsForStorageInPayload(updated)
+  await redis.set(key, storageClip)
   await redis.sAdd('user:system:clips', clipId)
 
-  return json(updated)
+  return json(resolveUploadUrlsForBrowserInPayload(storageClip))
 }

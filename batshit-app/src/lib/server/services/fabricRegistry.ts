@@ -691,6 +691,8 @@ const runtimeAddonByIdInputSchema = z
   })
   .passthrough()
 
+const goonSceneCreatorInfoInputSchema = z.object({}).passthrough()
+
 const RUNTIME_ADDON_ID_OPTIONS = [...RUNTIME_ADDON_IDS]
 const RUNTIME_ADDON_SCHEMA_HINT = `addonId (${RUNTIME_ADDON_ID_OPTIONS.join(', ')})`
 
@@ -1167,6 +1169,36 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     status: 'published',
     tags: ['zip', 'context', 'history'],
     handler: async (context, input) => executeZipFetch(context.userId, input)
+  },
+  {
+    controlId: 'sys.goon_scene.creator_info',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Goon Scene Creator Info',
+    description:
+      'Return the current Portable Goon Scene Creator capability boundary and scene-placement rules. This is a safe proof control for Goon Scenes Portable Skill Tokens.',
+    inputSchema: goonSceneCreatorInfoInputSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {},
+      additionalProperties: true
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        skillId: { type: 'string' },
+        command: { type: 'string' },
+        canSaveScenes: { type: 'boolean' },
+        placementModes: { type: 'array', items: { type: 'string' } },
+        scenePlacementRule: { type: 'string' },
+        groundProjectionRule: { type: 'string' }
+      }
+    },
+    schemaHint: 'no input',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['goons', 'scene', 'skybox', 'skill', 'portable'],
+    handler: async () => executeGoonSceneCreatorInfo()
   },
   {
     controlId: 'sys.mcp.dynamic.find',
@@ -3736,6 +3768,44 @@ async function executeModelCatalogSearch(input: Record<string, any>): Promise<Re
       error: normalized.message,
       status: normalized.status
     }
+  }
+}
+
+async function executeGoonSceneCreatorInfo(): Promise<Record<string, any>> {
+  return {
+    skillId: 'goon-scene-creator',
+    command: '/goon-scene-creator',
+    portableBundle: 'goon-scene-creator',
+    tokenFamily: 'goon-scenes',
+    canSaveScenes: false,
+    placementModes: ['Ground Level', 'Elevated / Overlook'],
+    scenePlacementRule:
+      'Choose one scene-wide placement. Do not create mixed half-ground / half-overlook panoramas until Batshit has real transition geometry or masks.',
+    groundProjectionRule:
+      'Ground Level targets the exact 50% equirectangular equator and reserves the lower region for continuous projectable ground/floor only. Ground Projection Line can correct a global horizon offset but cannot repair upright content in the ground band.',
+    currentCapabilities: [
+      'Plan Batshit-ready Goon scenes with skyboxes, Room Builder surfaces, props, and sit/lay markers.',
+      'Create copy-ready skybox prompts, negative prompts, texture notes, and Scene Editor import steps.',
+      'Plan saved Ground Projection Line plus Uploaded GLB Room Shell scale, offset, Y rotation, and Align Floor/manual-Y confirmation.',
+      'Plan one saved built-in Scene Atmosphere layer with a supported preset and placement.',
+      'Use the bundled Qwen 360 ComfyUI workflow references and assets when ComfyUI is available.'
+    ],
+    limitations: [
+      'Portable agents cannot directly create, update, or save Goon scene records yet.',
+      'Animated props, custom ambience sprites, and multiple ambience layers are not current saved-scene behavior.',
+      'Scene import still happens through the Scene Editor unless future Goons/Scenes Fabric controls are added.'
+    ],
+    references: [
+      'references/batshit-scene-spec.md',
+      'references/skybox-generation.md',
+      'references/qwen360-skybox-workflow.md',
+      'references/lofi-showcase-aesthetics.md'
+    ],
+    assets: [
+      'assets/comfyui/qwen360-skybox-api-workflow.json',
+      'assets/comfyui/qwen360-skybox-ui-workflow.json',
+      'assets/comfyui/qwen360-skybox-metadata.json'
+    ]
   }
 }
 

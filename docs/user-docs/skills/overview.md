@@ -22,9 +22,13 @@ Batshit ships with a few system Skills you can enable right away:
 
 - **Artifact Creator** (`/artifact-creator`) — helps build Artifacts.
 - **CLI Tool Creator** (`/cli-tool-creator`) — helps set up saved CLI Tools.
+- **Goon Scene Creator** (`/goon-scene-creator`) — helps plan and generate Goon scenes, including Room Builder or Uploaded GLB placement, one coherent Ground Level or Elevated placement, projection-safe skyboxes with the 50% Ground Projection Line rule, one Scene Atmosphere layer, props, markers, and 4K vs 8K texture choices.
+- **Skill Creator** (`/skill-creator`) — helps create reusable Skills and Prompts.
 - **TTS/STT Engine Installer** (`/voice-engine-installer`) — helps install and connect local voice engines.
 
 These are first-party and keep their core identity read-only, but you still control their status, trust, and which agents may use them.
+
+The Goon Scene Creator bundle also includes local ComfyUI workflow definitions for Batshit's Qwen 360 skybox path. The workflow files are instructions for ComfyUI, not bundled model weights.
 
 ## Skill sources
 
@@ -45,7 +49,9 @@ The Prompts tab in Settings → Skills & Prompts is where you create and edit sa
 
 Portable Skills are a special kind of Skill that runs **outside** Batshit. Instead of an in-app agent loading the Skill, you install the Skill bundle into your own coding agent — Claude Code, Codex, or another local assistant — and it operates your local Batshit instance through a narrow, scoped Portable Skill Token. No Batshit password, no internal service token.
 
-They're useful when you'd rather have an outside agent you already pay for do longer local setup work, like installing a local voice engine or building a CLI Tool, while still following Batshit's own guidance.
+They're useful when you'd rather have an outside agent you already pay for do longer local setup work, like installing a local voice engine, building a CLI Tool, or planning a Goon scene while still following Batshit's own guidance.
+
+The Goon Scene Creator also has a Portable Skill bundle for outside-agent scene planning, skybox prompting, Scene Atmosphere choices, and ComfyUI workflow handoff. It is honest about the current boundary: scene records are still saved through the Scene Editor unless Batshit adds dedicated Goons/Scenes Fabric controls.
 
 Full details — tokens, scopes, install paths, and the current bundles — are in [Portable Skills](portable-skills.md).
 

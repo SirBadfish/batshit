@@ -40,6 +40,123 @@ function fileKey(file: GoonFileRef | null | undefined) {
   return file.url || file.filename || ''
 }
 
+// Per-lane clip binding: VRM goons consume .vrma library entries, GLB-lane
+// custom goons consume .glb/.gltf entries that target their skeleton by name.
+// The dock and Goon Settings must resolve lanes through these helpers so both
+// surfaces always agree on which clips belong to which lane.
+export type GoonMotionLane = 'vrm' | 'glb'
+
+export function isGlbAnimationFileRef(file: GoonFileRef | null | undefined) {
+  if (!file) return false
+  // The stored asset's filename/url is the authoritative format signal;
+  // originalName is only a last resort — converted entries keep the source
+  // upload's name there (e.g. FBX-sourced VRMAs carry originalName "*.fbx",
+  // and worker-retargeted GLBs will too), which says nothing about the lane.
+  const label = (file.filename || file.url || file.originalName || '').toLowerCase()
+  return label.endsWith('.glb') || label.endsWith('.gltf')
+}
+
+export function resolveGoonMotionLane(file: GoonFileRef | null | undefined): GoonMotionLane {
+  return isGlbAnimationFileRef(file) ? 'glb' : 'vrm'
+}
+
+export function filterGoonAnimationFilesForLane(
+  files: GoonFileRef[] | null | undefined,
+  lane: GoonMotionLane
+): GoonFileRef[] {
+  if (!Array.isArray(files)) return []
+  return files.filter((file) => resolveGoonMotionLane(file) === lane)
+}
+
+// Unified motion library pairing (Settings/UX concept — runtime lanes stay
+// strict). Files pair when their sanitized base names match, which is the
+// exact name contract cues and engine clip registration already use, so a
+// paired card's name resolves on both lanes by construction.
+export type UnifiedGoonMotionEntry = {
+  /** Sanitized base name — the pair key and the runtime animation name. */
+  name: string
+  /** Every library file sharing the pair key, input order preserved. */
+  files: GoonFileRef[]
+  /** First VRM-lane file, if any. */
+  vrma: GoonFileRef | null
+  /** First GLB-lane file, if any. */
+  glb: GoonFileRef | null
+  /** Metadata winner — the file whose displayName/tags/motionMeta the card shows. */
+  primary: GoonFileRef
+}
+
+function parseTimestamp(value: string | undefined) {
+  if (!value) return 0
+  const time = Date.parse(value)
+  return Number.isNaN(time) ? 0 : time
+}
+
+function hasAuthoredMotionMetadata(file: GoonFileRef) {
+  return Boolean(
+    (file.displayName && file.displayName.trim()) ||
+      (Array.isArray(file.tags) && file.tags.length > 0) ||
+      (file.motionMeta && Object.keys(file.motionMeta).length > 0)
+  )
+}
+
+// Winner rule for pre-pairing divergence: an explicit edit stamp beats
+// everything, then a side that actually has authored metadata beats an empty
+// side, then the newer upload, then the VRM lane for stability.
+export function resolveGoonMotionMetadataWinner(files: GoonFileRef[]): GoonFileRef {
+  if (files.length === 1) return files[0]
+
+  const stamped = files.filter((file) => parseTimestamp(file.metaUpdatedAt) > 0)
+  const pool =
+    stamped.length > 0
+      ? stamped
+      : files.some(hasAuthoredMotionMetadata)
+        ? files.filter(hasAuthoredMotionMetadata)
+        : files
+
+  let winner = pool[0]
+  for (const file of pool.slice(1)) {
+    const winnerScore = parseTimestamp(winner.metaUpdatedAt) || parseTimestamp(winner.uploadedAt)
+    const fileScore = parseTimestamp(file.metaUpdatedAt) || parseTimestamp(file.uploadedAt)
+    if (
+      fileScore > winnerScore ||
+      (fileScore === winnerScore &&
+        resolveGoonMotionLane(file) === 'vrm' &&
+        resolveGoonMotionLane(winner) === 'glb')
+    ) {
+      winner = file
+    }
+  }
+  return winner
+}
+
+export function groupGoonMotionLibraryEntries(
+  files: GoonFileRef[] | null | undefined
+): UnifiedGoonMotionEntry[] {
+  if (!Array.isArray(files) || files.length === 0) return []
+
+  const buckets = new Map<string, GoonFileRef[]>()
+  for (const file of files) {
+    if (!file) continue
+    const name = resolveGoonAnimationName(file, file.filename || file.url || '')
+    if (!name) continue
+    const bucket = buckets.get(name) ?? []
+    bucket.push(file)
+    buckets.set(name, bucket)
+  }
+
+  const entries: UnifiedGoonMotionEntry[] = []
+  for (const [name, bucketFiles] of buckets) {
+    entries.push({
+      name,
+      files: bucketFiles,
+      vrma: bucketFiles.find((file) => resolveGoonMotionLane(file) === 'vrm') ?? null,
+      glb: bucketFiles.find((file) => resolveGoonMotionLane(file) === 'glb') ?? null,
+      primary: resolveGoonMotionMetadataWinner(bucketFiles)
+    })
+  }
+  return entries
+}
+
 export function sanitizeGoonAnimationName(value: string, fallback = '') {
   const base = value.replace(/\.[^/.]+$/, '')
   const safe = base

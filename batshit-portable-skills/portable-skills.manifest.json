@@ -51,6 +51,22 @@
       "sharedReferences": [
         "references/writing-for-llms.md"
       ]
+    },
+    {
+      "id": "goon-scene-creator",
+      "sourceSkillRoot": "batshit-app/src/lib/server/system-skills/goon-scene-creator",
+      "portableRoot": "batshit-portable-skills/goon-scene-creator",
+      "sharedReferences": [
+        "references/batshit-scene-spec.md",
+        "references/skybox-generation.md",
+        "references/qwen360-skybox-workflow.md",
+        "references/lofi-showcase-aesthetics.md"
+      ],
+      "sharedFiles": [
+        "assets/comfyui/qwen360-skybox-api-workflow.json",
+        "assets/comfyui/qwen360-skybox-ui-workflow.json",
+        "assets/comfyui/qwen360-skybox-metadata.json"
+      ]
     }
   ]
 }

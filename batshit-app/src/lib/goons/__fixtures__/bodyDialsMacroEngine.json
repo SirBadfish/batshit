@@ -1,0 +1,1131 @@
+{
+ "formula": "mpfb-macro-product/v1",
+ "cutoff": 0.01,
+ "baselineState": {
+  "gender": -4e-06,
+  "age": 0.5,
+  "muscle": 0.5,
+  "weight": 0.0,
+  "proportions": 0.5,
+  "height": 0.5574,
+  "cupsize": 0.730005,
+  "firmness": 1.0,
+  "race": {
+   "asian": 0.33,
+   "caucasian": 0.33,
+   "african": 0.33
+  }
+ },
+ "dims": {
+  "muscle": {
+   "parts": [
+    {
+     "lowest": -0.01,
+     "highest": 0.49998,
+     "low": "minmuscle",
+     "high": "averagemuscle"
+    },
+    {
+     "lowest": 0.49999,
+     "highest": 1.01,
+     "low": "averagemuscle",
+     "high": "maxmuscle"
+    }
+   ]
+  },
+  "weight": {
+   "parts": [
+    {
+     "lowest": -0.01,
+     "highest": 0.49998,
+     "low": "minweight",
+     "high": "averageweight"
+    },
+    {
+     "lowest": 0.49999,
+     "highest": 1.01,
+     "low": "averageweight",
+     "high": "maxweight"
+    }
+   ]
+  },
+  "cupsize": {
+   "parts": [
+    {
+     "lowest": -0.01,
+     "highest": 0.49998,
+     "low": "mincup",
+     "high": "averagecup"
+    },
+    {
+     "lowest": 0.49999,
+     "highest": 1.01,
+     "low": "averagecup",
+     "high": "maxcup"
+    }
+   ]
+  },
+  "firmness": {
+   "parts": [
+    {
+     "lowest": -0.01,
+     "highest": 0.4998,
+     "low": "minfirmness",
+     "high": "averagefirmness"
+    },
+    {
+     "lowest": 0.4999,
+     "highest": 1.01,
+     "low": "averagefirmness",
+     "high": "maxfirmness"
+    }
+   ]
+  }
+ },
+ "corners": [
+  {
+   "key": "$md-universal-$fe-$yn-$av$mu-$av$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.019408
+  },
+  {
+   "key": "$md-universal-$fe-$yn-$av$mu-max$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-universal-$fe-$yn-$av$mu-min$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.970792
+  },
+  {
+   "key": "$md-universal-$fe-$yn-max$mu-$av$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-universal-$fe-$yn-max$mu-max$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-universal-$fe-$yn-max$mu-min$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-universal-$fe-$yn-min$mu-$av$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-universal-$fe-$yn-min$mu-max$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-universal-$fe-$yn-min$mu-min$wg",
+   "family": "universal",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight"
+   },
+   "fixedFactor": 0.9902,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.092031
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-max$hg",
+   "family": "height",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight"
+   },
+   "fixedFactor": 0.093871,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.010549
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-$av$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-max$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.52769
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.433494
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-$av$mu-min$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "averagemuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-$av$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-max$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-max$mu-min$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "maxmuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-$av$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "averageweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-max$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "maxweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-$avcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "averagecup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-$avcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "averagecup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-maxcup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-maxcup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-maxcup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "maxcup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-mincup-$av$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "averagefirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-mincup-max$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "maxfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  },
+  {
+   "key": "$md-$fe-$yn-min$mu-min$wg-mincup-min$fi",
+   "family": "breast",
+   "comps": {
+    "muscle": "minmuscle",
+    "weight": "minweight",
+    "cupsize": "mincup",
+    "firmness": "minfirmness"
+   },
+   "fixedFactor": 1.0,
+   "baselineWeight": 0.0
+  }
+ ]
+}

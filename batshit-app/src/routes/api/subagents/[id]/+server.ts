@@ -12,6 +12,10 @@ import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIco
 import { redis } from '$lib/server/redis'
 import type { AgentRow, SubagentRow } from '$lib/types/database'
 import {
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
+import {
   canonicalizeSubagentRecord,
   isCliSubagentType,
   isWorkflowBackedSubagentType,
@@ -41,7 +45,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 			return json({ error: 'Unauthorized' }, { status: 403 })
 		}
 
-		return json({ subagent })
+		return json({ subagent: resolveUploadUrlsForBrowserInPayload(subagent) })
 	} catch (error) {
 		console.error('Failed to get subagent:', error)
 		return json({ error: 'Failed to get subagent' }, { status: 500 })
@@ -121,15 +125,16 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 			created_at: existing.created_at, // Preserve creation date
 			updated_at: new Date().toISOString()
 		}) as SubagentRow
+		const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
 
 		// Save to Redis
-		await service.json.set(`subagent:${params.id}`, '$', updated)
+		await service.json.set(`subagent:${params.id}`, '$', storageUpdated)
 
-		if (isCliSubagentType(updated.subagentType)) {
-			await syncManagedCliSubagentProfile(locals.user.id, updated)
+		if (isCliSubagentType(storageUpdated.subagentType)) {
+			await syncManagedCliSubagentProfile(locals.user.id, storageUpdated)
 		}
 
-		return json({ subagent: updated })
+		return json({ subagent: resolveUploadUrlsForBrowserInPayload(storageUpdated) })
 	} catch (error) {
 		console.error('Failed to update subagent:', error)
 		return json(

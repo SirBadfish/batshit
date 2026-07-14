@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import {
   access,
@@ -25,6 +25,13 @@ const packagedServerRoot = join(packagedRuntimeRoot, 'batshit-server', 'server')
 const packagedLiveKitSidecarSourceRoot = join(packagedRuntimeRoot, 'tools', 'livekit-agent-sidecar');
 const packagedRedisStackRoot = join(packagedRuntimeRoot, 'vendor', 'redis-stack');
 const packagedFfmpegRoot = join(packagedRuntimeRoot, 'vendor', 'ffmpeg');
+const packagedFacialArtworkRoot = join(
+  packagedRuntimeRoot,
+  'assets',
+  'goons',
+  'facial-artwork',
+  'v2'
+);
 const fallbackRepoRoot = resolve(macRoot, '..');
 const usePackagedRuntime =
   !process.env.BATSHIT_MAC_REPO_ROOT &&
@@ -85,6 +92,9 @@ const MONITOR_MAX_RESTARTS_PER_WINDOW = 5;
 const MONITOR_MAX_BACKOFF_MS = 120_000;
 const MONITOR_ENVIRONMENT_RETRY_MS = 30_000;
 const MONITOR_SERVICE_START_GRACE_MS = 15_000;
+const REDIS_APPENDONLY_ENABLE_TIMEOUT_MS = 60_000;
+const REDIS_SHUTDOWN_SAVE_TIMEOUT_MS = 60_000;
+const REDIS_SHUTDOWN_WAIT_MS = 30_000;
 const runtimeFingerprintPaths = [
   join(appRoot, 'build', 'index.js'),
   join(appRoot, 'build', 'server', 'manifest.js'),
@@ -156,6 +166,9 @@ function createServiceDefinitions(env = null) {
           BATSHIT_FFMPEG_H264_ENCODER: 'h264_videotoolbox'
         }
       : {};
+  const packagedFacialArtworkEnv = usePackagedRuntime
+    ? { BATSHIT_FACIAL_ARTWORK_ASSET_ROOT: packagedFacialArtworkRoot }
+    : {};
 
   return {
     batshitServer: {
@@ -170,6 +183,7 @@ function createServiceDefinitions(env = null) {
       matchCommandFragments: ['src/index.js', serverRoot],
       env: {
         ...packagedFfmpegEnv,
+        ...packagedFacialArtworkEnv,
         LOG_LEVEL: 'info',
         PORT: String(ports.server),
         BATSHIT_SERVER_HOST: '127.0.0.1',
@@ -765,6 +779,50 @@ async function redisConfigGet(env, key) {
     };
   }
   return { value: parseRedisConfigGet(result.stdout, key), error: null };
+}
+
+async function redisConfigSet(env, key, value, timeoutMs = 5000) {
+  const result = await redisCli(env, ['CONFIG', 'SET', key, value], timeoutMs);
+  if (result.ok) return { ok: true, key, value };
+  return {
+    ok: false,
+    key,
+    value,
+    error: (result.stderr || result.stdout || `Redis CONFIG SET ${key} failed.`).trim()
+  };
+}
+
+async function ensureRedisPersistence(env) {
+  const actions = [];
+  const issues = [];
+  const appendfsync = await redisConfigGet(env, 'appendfsync');
+  if (appendfsync.error) {
+    issues.push(`Could not read Redis appendfsync: ${appendfsync.error}`);
+  } else if (appendfsync.value !== 'everysec') {
+    const setResult = await redisConfigSet(env, 'appendfsync', 'everysec');
+    actions.push(setResult);
+    if (!setResult.ok) issues.push(setResult.error);
+  }
+
+  const appendonly = await redisConfigGet(env, 'appendonly');
+  if (appendonly.error) {
+    issues.push(`Could not read Redis appendonly: ${appendonly.error}`);
+  } else if (appendonly.value !== 'yes') {
+    const setResult = await redisConfigSet(
+      env,
+      'appendonly',
+      'yes',
+      REDIS_APPENDONLY_ENABLE_TIMEOUT_MS
+    );
+    actions.push(setResult);
+    if (!setResult.ok) issues.push(setResult.error);
+  }
+
+  return {
+    ok: issues.length === 0,
+    actions,
+    issues
+  };
 }
 
 function parseRedisInfoServer(stdout) {
@@ -1714,7 +1772,18 @@ function doctorAdvice(report) {
 
 async function startRedis(env) {
   const redis = await redisStatus(env);
-  if (redis.healthy) return { skipped: true, ok: true, reason: 'Redis already healthy.' };
+  if (redis.healthy) {
+    const persistence = await ensureRedisPersistence(env);
+    return {
+      skipped: true,
+      ok: persistence.ok,
+      reason: persistence.ok
+        ? 'Redis already healthy.'
+        : 'Redis is healthy, but durable persistence could not be verified.',
+      persistence,
+      status: redis
+    };
+  }
   if (redis.portOccupied || redis.external || redis.response === 'PONG') {
     return {
       skipped: true,
@@ -1736,6 +1805,10 @@ async function startRedis(env) {
     `dir ${redisConfigValue(redisDir)}`,
     `pidfile ${redisConfigValue(redisPidFile)}`,
     `logfile ${redisConfigValue(redisLogFile)}`,
+    'appendonly yes',
+    'appendfsync everysec',
+    'aof-use-rdb-preamble yes',
+    'aof-rewrite-incremental-fsync yes',
     'daemonize yes'
   ].join('\n');
   await writeFile(redisConfigPath, `${config}\n`, { mode: 0o600 });
@@ -1779,9 +1852,20 @@ async function startRedis(env) {
         after.error ||
         (result.stderr || result.stdout).trim() ||
         'redis-stack-server did not start. Install Redis Stack or use Docker.'
+      };
+  }
+  const persistence = await ensureRedisPersistence(env);
+  if (!persistence.ok) {
+    return {
+      skipped: false,
+      ok: false,
+      pid: after.pid,
+      dataDir: after.dataDir,
+      persistence,
+      error: `Redis started, but durable persistence could not be enabled: ${persistence.issues.join('; ')}`
     };
   }
-  return { skipped: false, ok: true, pid: after.pid, dataDir: after.dataDir };
+  return { skipped: false, ok: true, pid: after.pid, dataDir: after.dataDir, persistence };
 }
 
 async function spawnService(definition, env, options = {}) {
@@ -2218,11 +2302,35 @@ async function stopRedis(env = null) {
       pid
     };
   }
-  process.kill(pid, 'SIGTERM');
-  await new Promise((resolveWait) => setTimeout(resolveWait, 1000));
-  if (processAlive(pid)) process.kill(pid, 'SIGKILL');
+  const shutdownSave = await redisCli(runtimeEnv, ['SHUTDOWN', 'SAVE'], REDIS_SHUTDOWN_SAVE_TIMEOUT_MS);
+  const deadline = Date.now() + REDIS_SHUTDOWN_WAIT_MS;
+  while (processAlive(pid) && Date.now() < deadline) {
+    await wait(250);
+  }
+  let escalated = false;
+  if (processAlive(pid)) {
+    await supervisorLog(
+      'stop',
+      `Redis SHUTDOWN SAVE did not stop pid ${pid} within ${REDIS_SHUTDOWN_WAIT_MS}ms; sending SIGTERM.`
+    );
+    process.kill(pid, 'SIGTERM');
+    await wait(5000);
+  }
+  if (processAlive(pid)) {
+    escalated = true;
+    process.kill(pid, 'SIGKILL');
+  }
   await rm(redisPidFile, { force: true });
-  return { skipped: false, ok: true, pid };
+  return {
+    skipped: false,
+    ok: !processAlive(pid),
+    pid,
+    shutdownSave: {
+      ok: shutdownSave.ok,
+      error: shutdownSave.ok ? null : (shutdownSave.stderr || shutdownSave.stdout || '').trim() || null
+    },
+    escalated
+  };
 }
 
 // --- Runtime monitor ---------------------------------------------------------
@@ -2759,10 +2867,12 @@ async function packageAudit(packagePath) {
   const invalidIcons = [];
   const chromiumCefIssues = [];
   const privacyIssues = [];
+  const runtimeAssetIssues = [];
   const requiredRuntimeFiles = [
     'Contents/Resources/THIRD_PARTY_NOTICES.md',
     'Contents/Resources/runtime/batshit-app/package.json',
     'Contents/Resources/runtime/batshit-app/build/index.js',
+    'Contents/Resources/runtime/runtime-manifest.json',
     'Contents/Resources/runtime/batshit-server/server/package.json',
     'Contents/Resources/runtime/batshit-server/server/src/index.js',
     'Contents/Resources/runtime/batshit-server/server/node_modules/async/log.js'
@@ -2822,6 +2932,72 @@ async function packageAudit(packagePath) {
     }
   }
 
+  const runtimeManifestPath = join(
+    realTarget,
+    'Contents',
+    'Resources',
+    'runtime',
+    'runtime-manifest.json'
+  );
+  const runtimeManifestRaw = await readFile(runtimeManifestPath, 'utf8').catch(() => '');
+  let runtimeManifest = null;
+  try {
+    runtimeManifest = runtimeManifestRaw ? JSON.parse(runtimeManifestRaw) : null;
+  } catch {
+    runtimeAssetIssues.push('runtime-manifest.json is not valid JSON.');
+  }
+  const facialArtworkAssets = runtimeManifest?.assets?.facialArtwork;
+  if (
+    facialArtworkAssets?.contract !== 'facial-artwork/v2' ||
+    facialArtworkAssets?.root !== 'assets/goons/facial-artwork/v2' ||
+    facialArtworkAssets?.definition !== 'facial-artwork-v2.json' ||
+    !Array.isArray(facialArtworkAssets?.files) ||
+    facialArtworkAssets.files.length < 19
+  ) {
+    runtimeAssetIssues.push(
+      'runtime-manifest.json is missing the complete facial-artwork/v2 trusted asset inventory.'
+    );
+  } else {
+    const seenPaths = new Set();
+    for (const entry of facialArtworkAssets.files) {
+      const relative = entry?.path;
+      if (
+        typeof relative !== 'string' ||
+        relative.startsWith('/') ||
+        relative.includes('\\') ||
+        relative.split('/').includes('..') ||
+        seenPaths.has(relative) ||
+        !/^[a-f0-9]{64}$/.test(entry?.sha256 || '')
+      ) {
+        runtimeAssetIssues.push(`Invalid facial-artwork runtime asset manifest entry: ${JSON.stringify(entry)}`);
+        continue;
+      }
+      seenPaths.add(relative);
+      const assetPath = join(
+        realTarget,
+        'Contents',
+        'Resources',
+        'runtime',
+        facialArtworkAssets.root,
+        relative
+      );
+      const bytes = await readFile(assetPath).catch(() => null);
+      if (!bytes) {
+        runtimeAssetIssues.push(`Missing facial-artwork runtime asset: ${relative}`);
+        continue;
+      }
+      const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+      if (actualSha256 !== entry.sha256) {
+        runtimeAssetIssues.push(
+          `Facial-artwork runtime asset hash mismatch: ${relative} (${actualSha256} != ${entry.sha256})`
+        );
+      }
+    }
+    if (!seenPaths.has(facialArtworkAssets.definition)) {
+      runtimeAssetIssues.push('The facial-artwork/v2 definition is absent from its runtime asset inventory.');
+    }
+  }
+
   const infoPlist = await readFile(join(realTarget, 'Contents', 'Info.plist'), 'utf8').catch(
     () => ''
   );
@@ -2857,14 +3033,16 @@ async function packageAudit(packagePath) {
       missingRuntimeFiles.length === 0 &&
       invalidIcons.length === 0 &&
       chromiumCefIssues.length === 0 &&
-      privacyIssues.length === 0,
+      privacyIssues.length === 0 &&
+      runtimeAssetIssues.length === 0,
     packagePath: realTarget,
     foundSecrets,
     suspiciousPaths,
     missingRuntimeFiles,
     invalidIcons,
     chromiumCefIssues,
-    privacyIssues
+    privacyIssues,
+    runtimeAssetIssues
   };
 }
 

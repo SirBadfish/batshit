@@ -60,6 +60,10 @@
   } from '$lib/utils/voiceSchema'
   import { getPlaybackState } from '$lib/stores/voicePlayback.svelte'
   import { loadGoons, loadGoonAnimationLibrary, updateGoon as updateGoonRecord } from '$lib/services/goons'
+  import {
+    persistGoonsSettingsPatchRequest,
+    refreshUserSettingsRequest
+  } from '$lib/services/goonsSettingsPersistence'
   import { getGoons } from '$lib/stores/goons.svelte'
   import { getGoonAnimationLibrary } from '$lib/stores/goonAnimationLibrary.svelte'
   import { normalizeGoonsSettings } from '$lib/goons/resolve'
@@ -260,6 +264,15 @@
     // Initialize user settings store
     if (data?.userSettings) {
       setUserSettings(data.userSettings)
+    }
+    if (data?.user?.id) {
+      refreshUserSettingsRequest(fetch)
+        .then((freshSettings) => {
+          setUserSettings(freshSettings)
+        })
+        .catch((error) => {
+          console.error('[Settings] Failed to refresh user settings:', error)
+        })
     }
 
     if (!savedModelsStore.isInitialized()) {
@@ -1693,6 +1706,16 @@ const immersiveActive = $derived.by(
   })
 
   onMount(() => {
+    const handleSettingsOpened = () => {
+      const shouldPersistClosed = goonsPanelOpen || Boolean(userSettings?.goons_settings?.dockOpen)
+      if (goonsPanelOpen) {
+        goonsPanelOpen = false
+      }
+      if (shouldPersistClosed) {
+        updateGoonsSettings({ dockOpen: false })
+      }
+    }
+
     const handleArtifactOpen = async (event: Event) => {
       const detail = (event as CustomEvent).detail as { artifactId?: string }
       if (!detail?.artifactId || !data.user) return
@@ -1767,11 +1790,13 @@ const immersiveActive = $derived.by(
       draftPreviewArtifactId = detail?.artifactId || null
     }
 
+    window.addEventListener('batshit:settings-opened', handleSettingsOpened as EventListener)
     window.addEventListener('batshit:artifact-open', handleArtifactOpen as EventListener)
     window.addEventListener(LIVE_SETTINGS_EVENTS.artifactUpdated, handleArtifactUpdated as EventListener)
     window.addEventListener(LIVE_SETTINGS_EVENTS.artifactDeleted, handleArtifactDeleted as EventListener)
     window.addEventListener(LIVE_SETTINGS_EVENTS.artifactDraftPreview, handleDraftPreview as EventListener)
     return () => {
+      window.removeEventListener('batshit:settings-opened', handleSettingsOpened as EventListener)
       window.removeEventListener('batshit:artifact-open', handleArtifactOpen as EventListener)
       window.removeEventListener(LIVE_SETTINGS_EVENTS.artifactUpdated, handleArtifactUpdated as EventListener)
       window.removeEventListener(LIVE_SETTINGS_EVENTS.artifactDeleted, handleArtifactDeleted as EventListener)
@@ -5402,36 +5427,13 @@ const immersiveActive = $derived.by(
     })
   }
 
-  function mergeGoonsSettings(current: GoonsSettings, patch: Partial<GoonsSettings>) {
-    const normalized = normalizeGoonsSettings(current)
-    const kitchenPatch = patch.kitchen
-    return {
-      ...normalized,
-      ...patch,
-      kitchen: kitchenPatch
-        ? {
-            ...normalized.kitchen,
-            ...kitchenPatch,
-            cues: kitchenPatch.cues ?? normalized.kitchen?.cues,
-            emojiMap: kitchenPatch.emojiMap ?? normalized.kitchen?.emojiMap,
-            scenes: kitchenPatch.scenes ?? normalized.kitchen?.scenes
-          }
-        : normalized.kitchen
-    }
-  }
-
   async function updateGoonsSettings(patch: Partial<GoonsSettings>) {
-    const current = goonsSettings || normalizeGoonsSettings(null)
-    const updated = mergeGoonsSettings(current, patch)
-    if (userSettings) {
-      setUserSettings({ ...userSettings, goons_settings: updated })
-    }
     try {
-      await fetch('/api/user/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goons_settings: updated })
-      })
+      const persistedSettings = await persistGoonsSettingsPatchRequest(fetch, patch)
+      const currentUserSettings = getUserSettings()
+      if (currentUserSettings) {
+        setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
+      }
     } catch (error) {
       console.error('[Goons] Failed to persist settings:', error)
     }

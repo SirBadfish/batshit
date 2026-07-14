@@ -92,7 +92,7 @@ describe('/api/goons/animations metadata persistence', () => {
     })
   })
 
-  it('keeps existing metadata when a same-filename upload refresh returns a bare file ref', async () => {
+  it('keeps existing metadata when a consented same-filename replace returns a bare file ref', async () => {
     await seedLibrary()
 
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
@@ -110,6 +110,10 @@ describe('/api/goons/animations metadata persistence', () => {
 
     const form = new FormData()
     form.append('file', new File(['new bytes'], 'belly.vrma', { type: 'model/vrm' }))
+    // same-name uploads without consent 409 by design (confirm-first
+    // replace-on-reupload, 2026-07-07); the metadata-preservation contract
+    // applies to the consented replace path
+    form.append('replaceExisting', '1')
 
     const response = await POST({
       request: {
@@ -136,5 +140,8 @@ describe('/api/goons/animations metadata persistence', () => {
         eyeContact: 'off'
       }
     })
+
+    const stored = (await redis.json.get(LIBRARY_KEY)) as any
+    expect(stored.vrma[0].url).toBe('/uploads/goon_animations/belly.vrma')
   })
 })

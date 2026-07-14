@@ -36,6 +36,12 @@ const SKILL_CREATOR_ALLOWED_TOOLS = [
   'native_skill'
 ]
 
+const GOON_SCENE_CREATOR_ALLOWED_TOOLS = [
+  'native_batshit_tool_search',
+  'native_batshit_tool_use',
+  'native_skill'
+]
+
 const LEGACY_ARTIFACT_SKILL_IDS = [
   'artifacts-general',
   'artifacts-n8n-brain',
@@ -52,16 +58,22 @@ const LEGACY_COMMAND_CREATOR_IDS = [
   'slash-command-creator'
 ]
 
+const LEGACY_GOON_SCENE_CREATOR_IDS = [
+  'batshit-goon-scene-creator'
+]
+
 const SKILL_CREATOR_COMMAND_ID = 'skill-creator'
 const VOICE_ENGINE_INSTALLER_COMMAND_ID = 'voice-engine-installer'
 const ARTIFACT_CREATOR_COMMAND_ID = 'artifact-creator'
 const CLI_TOOL_CREATOR_COMMAND_ID = 'cli-tool-creator'
+const GOON_SCENE_CREATOR_COMMAND_ID = 'goon-scene-creator'
 
 const SYSTEM_SKILL_IDS_BY_COMMAND_ID: Record<string, string> = {
   [SKILL_CREATOR_COMMAND_ID]: 'skill_creator',
   [VOICE_ENGINE_INSTALLER_COMMAND_ID]: 'voice_engine_installer',
   [ARTIFACT_CREATOR_COMMAND_ID]: 'artifact_creator',
-  [CLI_TOOL_CREATOR_COMMAND_ID]: 'cli_tool_creator'
+  [CLI_TOOL_CREATOR_COMMAND_ID]: 'cli_tool_creator',
+  [GOON_SCENE_CREATOR_COMMAND_ID]: 'goon_scene_creator'
 }
 
 const LEGACY_VOICE_ENGINE_INSTALLER_IDS = ['speech-setup']
@@ -72,7 +84,8 @@ export const SYSTEM_SLASH_COMMAND_IDS = [
   SKILL_CREATOR_COMMAND_ID,
   VOICE_ENGINE_INSTALLER_COMMAND_ID,
   ARTIFACT_CREATOR_COMMAND_ID,
-  CLI_TOOL_CREATOR_COMMAND_ID
+  CLI_TOOL_CREATOR_COMMAND_ID,
+  GOON_SCENE_CREATOR_COMMAND_ID
 ] as const
 
 export function expectedSystemSkillIdForCommand(commandId: string | null | undefined): string | null {
@@ -131,7 +144,11 @@ function directoryHasFiles(dirPath: string): boolean {
   return false
 }
 
-function readSystemSkillContent(skillId: string): { markdown: string; hasReferences: boolean } {
+function readSystemSkillContent(skillId: string): {
+  markdown: string
+  hasReferences: boolean
+  hasAssets: boolean
+} {
   const sourceDir = resolveSystemSkillDir(skillId)
   const skillMdPath = join(sourceDir, 'SKILL.md')
 
@@ -142,7 +159,8 @@ function readSystemSkillContent(skillId: string): { markdown: string; hasReferen
   const markdown = readFileSync(skillMdPath, 'utf-8')
   return {
     markdown,
-    hasReferences: directoryHasFiles(join(sourceDir, 'references'))
+    hasReferences: directoryHasFiles(join(sourceDir, 'references')),
+    hasAssets: directoryHasFiles(join(sourceDir, 'assets'))
   }
 }
 
@@ -202,6 +220,19 @@ async function cleanupLegacyCommandCreator(userId: string): Promise<void> {
   cleanupLegacyUserSkillDirs(LEGACY_COMMAND_CREATOR_IDS)
 }
 
+async function cleanupLegacyGoonSceneCreator(userId: string): Promise<void> {
+  for (const legacyId of LEGACY_GOON_SCENE_CREATOR_IDS) {
+    try {
+      await redis.del(`skill:${userId}:${legacyId}`)
+      await redis.del(`slash_command:${userId}:${legacyId}`)
+    } catch {
+      // Ignore cleanup errors for keys that don't exist.
+    }
+  }
+
+  cleanupLegacyUserSkillDirs(LEGACY_GOON_SCENE_CREATOR_IDS)
+}
+
 async function cleanupRenamedSystemSkillIds(userId: string, legacyIds: string[]): Promise<void> {
   for (const legacyId of legacyIds) {
     try {
@@ -221,7 +252,7 @@ export async function buildSkillCreatorSkillCommand(
   existing?: SlashCommandRow | null
 ): Promise<SlashCommandRow> {
   const sourceDir = resolveSystemSkillDir('skill-creator')
-  const { markdown, hasReferences } = readSystemSkillContent('skill-creator')
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent('skill-creator')
   const accessState = deriveAttachableState(existing)
 
   const skill = await upsertSkill({
@@ -240,7 +271,8 @@ export async function buildSkillCreatorSkillCommand(
       isSystem: true,
       isActive: existing?.is_active ?? true,
       allowedTools: SKILL_CREATOR_ALLOWED_TOOLS,
-      hasReferences
+      hasReferences,
+      hasAssets
     }
   })
 
@@ -265,6 +297,7 @@ export async function buildSkillCreatorSkillCommand(
     trust_level: skill.trust_level,
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
+    has_assets: skill.has_assets ?? false,
     invocation_pattern: '/skill-creator',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
@@ -289,7 +322,7 @@ export async function buildSpeechSetupSkillCommand(
   existing?: SlashCommandRow | null
 ): Promise<SlashCommandRow> {
   const sourceDir = resolveSystemSkillDir('speech-setup')
-  const { markdown, hasReferences } = readSystemSkillContent('speech-setup')
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent('speech-setup')
   const accessState = deriveAttachableState(existing)
 
   const skill = await upsertSkill({
@@ -308,7 +341,8 @@ export async function buildSpeechSetupSkillCommand(
       isSystem: true,
       isActive: existing?.is_active ?? true,
       allowedTools: SPEECH_SETUP_ALLOWED_TOOLS,
-      hasReferences
+      hasReferences,
+      hasAssets
     }
   })
 
@@ -333,6 +367,7 @@ export async function buildSpeechSetupSkillCommand(
     trust_level: skill.trust_level,
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
+    has_assets: skill.has_assets ?? false,
     invocation_pattern: '/voice-engine-installer',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
@@ -357,7 +392,7 @@ export async function buildCliToolsSkillCommand(
   existing?: SlashCommandRow | null
 ): Promise<SlashCommandRow> {
   const sourceDir = resolveSystemSkillDir('cli-tools')
-  const { markdown, hasReferences } = readSystemSkillContent('cli-tools')
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent('cli-tools')
   const accessState = deriveAttachableState(existing)
 
   const skill = await upsertSkill({
@@ -376,7 +411,8 @@ export async function buildCliToolsSkillCommand(
       isSystem: true,
       isActive: existing?.is_active ?? true,
       allowedTools: CLI_TOOLS_ALLOWED_TOOLS,
-      hasReferences
+      hasReferences,
+      hasAssets
     }
   })
 
@@ -401,6 +437,7 @@ export async function buildCliToolsSkillCommand(
     trust_level: skill.trust_level,
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? false,
+    has_assets: skill.has_assets ?? false,
     invocation_pattern: '/cli-tool-creator',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
@@ -419,13 +456,86 @@ export async function buildCliToolsSkillCommand(
   }
 }
 
+export async function buildGoonSceneCreatorSkillCommand(
+  userId: string,
+  now: string,
+  existing?: SlashCommandRow | null
+): Promise<SlashCommandRow> {
+  const sourceDir = resolveSystemSkillDir('goon-scene-creator')
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent('goon-scene-creator')
+  const accessState = deriveAttachableState(existing)
+
+  const skill = await upsertSkill({
+    userId,
+    commandId: GOON_SCENE_CREATOR_COMMAND_ID,
+    nowIso: now,
+    skill: {
+      id: GOON_SCENE_CREATOR_COMMAND_ID,
+      name: GOON_SCENE_CREATOR_COMMAND_ID,
+      displayName: 'Goon Scene Creator',
+      description:
+        'Plan and generate Batshit Goon scenes with Room Builder, scene placement, skyboxes, props, markers, and hardware-aware texture choices.',
+      markdown,
+      source: 'system',
+      sourceRef: sourceDir,
+      trustLevel: existing?.trust_level ?? 'trusted',
+      isSystem: true,
+      isActive: existing?.is_active ?? true,
+      dependencies: [{ id: 'comfyui_mcp', label: 'ComfyUI MCP', required: false }],
+      allowedTools: GOON_SCENE_CREATOR_ALLOWED_TOOLS,
+      hasReferences,
+      hasAssets
+    }
+  })
+
+  cleanupLegacyUserSkillDirs(['goon-scene-creator'])
+
+  return {
+    id: GOON_SCENE_CREATOR_COMMAND_ID,
+    user_id: userId,
+    name: GOON_SCENE_CREATOR_COMMAND_ID,
+    displayName: 'Goon Scene Creator',
+    description:
+      'Plan and generate Batshit Goon scenes with Room Builder, scene placement, skyboxes, props, markers, and hardware-aware texture choices.',
+    type: 'skill',
+    instructions:
+      'Help users create Batshit Goon scenes with truthful current-scene constraints, hardware-aware 4K/8K skybox choices, Room Builder surfaces, Ground Level vs Elevated placement, props, and sit/lay markers. Use optional ComfyUI or image-generation tools only when discoverable.',
+    parameters: [],
+    skill_id: skill.id,
+    skill_source: skill.source,
+    skill_source_ref: skill.source_ref,
+    skill_summary: skill.description,
+    skill_dependencies: skill.dependencies ?? [],
+    skill_allowed_tools: skill.allowed_tools ?? GOON_SCENE_CREATOR_ALLOWED_TOOLS,
+    trust_level: skill.trust_level,
+    has_scripts: skill.has_scripts ?? false,
+    has_references: skill.has_references ?? true,
+    has_assets: skill.has_assets ?? false,
+    invocation_pattern: '/goon-scene-creator',
+    can_be_attached_to_agents: accessState.canBeAttachedToAgents,
+    can_be_invoked_in_chat: true,
+    category: 'goons',
+    tags: ['goons', 'scenes', 'room-builder', 'skybox', 'comfyui', 'textures'],
+    icon_ref: existing?.icon_ref ?? { kind: 'batshit', id: 'scenes' },
+    icon: undefined,
+    usage_count: existing?.usage_count ?? 0,
+    last_used_at: existing?.last_used_at,
+    is_active: existing?.is_active ?? true,
+    enabled_for_all_agents: accessState.enabledForAllAgents,
+    enabled_agent_ids: accessState.enabledAgentIds,
+    is_system: true,
+    created_at: existing?.created_at ?? now,
+    updated_at: now
+  }
+}
+
 export async function buildUnifiedArtifactSkillCommand(
   userId: string,
   now: string,
   existing?: SlashCommandRow | null
 ): Promise<SlashCommandRow> {
   const sourceDir = resolveSystemSkillDir('artifacts')
-  const { markdown, hasReferences } = readSystemSkillContent('artifacts')
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent('artifacts')
   const accessState = deriveAttachableState(existing)
 
   const skill = await upsertSkill({
@@ -448,7 +558,8 @@ export async function buildUnifiedArtifactSkillCommand(
         { id: 'huggingface', label: 'HuggingFace MCP', required: false }
       ],
       allowedTools: ARTIFACT_SKILL_ALLOWED_TOOLS,
-      hasReferences
+      hasReferences,
+      hasAssets
     }
   })
 
@@ -473,6 +584,7 @@ export async function buildUnifiedArtifactSkillCommand(
     trust_level: skill.trust_level,
     has_scripts: skill.has_scripts ?? false,
     has_references: skill.has_references ?? true,
+    has_assets: skill.has_assets ?? false,
     invocation_pattern: '/artifact-creator',
     can_be_attached_to_agents: accessState.canBeAttachedToAgents,
     can_be_invoked_in_chat: true,
@@ -505,26 +617,33 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
   const artifactKey = `slash_command:${userId}:${artifactId}`
   const cliToolsId = CLI_TOOL_CREATOR_COMMAND_ID
   const cliToolsKey = `slash_command:${userId}:${cliToolsId}`
+  const goonSceneCreatorId = GOON_SCENE_CREATOR_COMMAND_ID
+  const goonSceneCreatorKey = `slash_command:${userId}:${goonSceneCreatorId}`
   const legacySpeechKey = `slash_command:${userId}:speech-setup`
   const legacyArtifactKey = `slash_command:${userId}:artifacts`
   const legacyCliToolsKey = `slash_command:${userId}:cli-tools`
+  const legacyGoonSceneCreatorKey = `slash_command:${userId}:batshit-goon-scene-creator`
 
   const [
     existingSkillCreator,
     existingSpeech,
     existingArtifact,
     existingCliTools,
+    existingGoonSceneCreator,
     legacySpeech,
     legacyArtifact,
-    legacyCliTools
+    legacyCliTools,
+    legacyGoonSceneCreator
   ] = await Promise.all([
     redis.json.get(skillCreatorKey),
     redis.json.get(speechKey),
     redis.json.get(artifactKey),
     redis.json.get(cliToolsKey),
+    redis.json.get(goonSceneCreatorKey),
     redis.json.get(legacySpeechKey),
     redis.json.get(legacyArtifactKey),
-    redis.json.get(legacyCliToolsKey)
+    redis.json.get(legacyCliToolsKey),
+    redis.json.get(legacyGoonSceneCreatorKey)
   ])
 
   const skillCreatorSeed = (existingSkillCreator as SlashCommandRow | null) ?? null
@@ -539,6 +658,10 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
   const cliToolsSeed = pickExistingCommand(
     (existingCliTools as SlashCommandRow | null) ?? null,
     (legacyCliTools as SlashCommandRow | null) ?? null
+  )
+  const goonSceneCreatorSeed = pickExistingCommand(
+    (existingGoonSceneCreator as SlashCommandRow | null) ?? null,
+    (legacyGoonSceneCreator as SlashCommandRow | null) ?? null
   )
 
   const skillCreatorCommand = await buildSkillCreatorSkillCommand(
@@ -561,17 +684,24 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
     now,
     cliToolsSeed
   )
+  const goonSceneCreatorCommand = await buildGoonSceneCreatorSkillCommand(
+    userId,
+    now,
+    goonSceneCreatorSeed
+  )
 
   await Promise.all([
     redis.json.set(skillCreatorKey, '$', skillCreatorCommand),
     redis.json.set(speechKey, '$', speechCommand),
     redis.json.set(artifactKey, '$', artifactCommand),
-    redis.json.set(cliToolsKey, '$', cliToolsCommand)
+    redis.json.set(cliToolsKey, '$', cliToolsCommand),
+    redis.json.set(goonSceneCreatorKey, '$', goonSceneCreatorCommand)
   ])
 
   await cleanupLegacyArtifactSkills(userId)
   await cleanupLegacySpeechSkills(userId)
   await cleanupLegacyCommandCreator(userId)
+  await cleanupLegacyGoonSceneCreator(userId)
   await cleanupRenamedSystemSkillIds(userId, LEGACY_VOICE_ENGINE_INSTALLER_IDS)
   await cleanupRenamedSystemSkillIds(userId, LEGACY_ARTIFACT_CREATOR_IDS)
   await cleanupRenamedSystemSkillIds(userId, LEGACY_CLI_TOOL_CREATOR_IDS)
@@ -582,9 +712,11 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
       existingSpeech,
       existingArtifact,
       existingCliTools,
+      existingGoonSceneCreator,
       legacySpeech,
       legacyArtifact,
-      legacyCliTools
+      legacyCliTools,
+      legacyGoonSceneCreator
     ].some((value) => Boolean(value)),
     slashCommands: [...SYSTEM_SLASH_COMMAND_IDS]
   }
@@ -595,7 +727,8 @@ export async function ensureSystemSlashCommands(userId: string): Promise<void> {
   const legacyKeys = [
     `slash_command:${userId}:speech-setup`,
     `slash_command:${userId}:artifacts`,
-    `slash_command:${userId}:cli-tools`
+    `slash_command:${userId}:cli-tools`,
+    `slash_command:${userId}:batshit-goon-scene-creator`
   ]
   const [existing, legacyExisting] = await Promise.all([
     Promise.all(keys.map((key) => redis.json.get(key))),

@@ -108,7 +108,7 @@ Keep enabled Skills trusted and relevant to that agent. Batshit uses its normal 
 
 Portable Skills are the outside-agent version of Batshit system skills. Instead of running inside a Batshit chat, they are installed into an agent you already use, such as Claude Code, Codex, or another coding assistant.
 
-They call your local Batshit instance through the app API with a Portable Skill Token from Settings -> Skills & Prompts -> Portable Skills. That token is scoped by family, such as Voice Engines, Artifacts, CLI Tools, or Skills.
+They call your local Batshit instance through the app API with a Portable Skill Token from Settings -> Skills & Prompts -> Portable Skills. That token is scoped by family, such as Voice Engines, Artifacts, CLI Tools, Skills, or Goon Scenes.
 
 Use Portable Skills when you want an outside agent to do setup work for Batshit without giving it `BATSHIT_TOKEN`, your password, browser cookies, or direct Redis access. Start with [Portable Skills](../skills/portable-skills.md).
 

@@ -2,6 +2,7 @@
   import { X } from '@lucide/svelte'
   import { Button } from '$lib/components/ui/button'
   import * as Dialog from '$lib/components/ui/dialog'
+  import { resolveGoonMotionLane } from '$lib/goons/animationLoadPlan'
   import type {
     GoonCueDefinition,
     GoonFileRef,
@@ -36,9 +37,11 @@
     scene: GoonSceneDefinition
   }
 
+  // One option per unified motion; `files` holds every format version
+  // (.vrma / .glb) that exports with it.
   type PackMotionExportOption = {
     key: string
-    file: GoonFileRef
+    files: GoonFileRef[]
     label: string
   }
 
@@ -203,6 +206,10 @@
         {:else}
           <div class="space-y-2">
             {#each globalPackMotionOptions as option (option.key)}
+              {@const primaryFile = option.files[0]}
+              {@const formatLabels = option.files
+                .map((file) => (resolveGoonMotionLane(file) === 'glb' ? 'GLB' : 'VRMA'))
+                .join(' + ')}
               <label class="batshit-settings-option-card flex items-start gap-3">
                 <input
                   type="checkbox"
@@ -216,9 +223,9 @@
                 <div class="min-w-0">
                   <div class="batshit-settings-form-label">{option.label}</div>
                   <div class="batshit-settings-caption">
-                    {(option.file.tags ?? []).length > 0
-                      ? `${(option.file.tags ?? []).join(', ')} · `
-                      : ''}{option.file.motionMeta?.playback ?? 'Motion Vault item'}
+                    {formatLabels ? `${formatLabels} · ` : ''}{(primaryFile?.tags ?? []).length > 0
+                      ? `${(primaryFile?.tags ?? []).join(', ')} · `
+                      : ''}{primaryFile?.motionMeta?.playback ?? 'Motion Vault item'}
                   </div>
                 </div>
               </label>

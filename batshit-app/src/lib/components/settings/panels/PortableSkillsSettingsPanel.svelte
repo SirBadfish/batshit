@@ -89,6 +89,13 @@
       family: 'skills',
       summary: 'Saves and imports Batshit skills from an outside coding agent.',
       zipUrl: 'https://docs.batshit.ai/portable-skills/skill-creator.zip'
+    },
+    {
+      id: 'goon-scene-creator',
+      title: 'Goon Scene Creator',
+      family: 'goon-scenes',
+      summary: 'Plans Goon scenes, skyboxes, Room Builder settings, and ComfyUI skybox handoffs.',
+      zipUrl: 'https://docs.batshit.ai/portable-skills/goon-scene-creator.zip'
     }
   ]
 

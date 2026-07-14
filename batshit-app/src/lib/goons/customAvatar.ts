@@ -54,6 +54,7 @@ export type GoonCustomBodyConcealManifest = {
 
 export type GoonCustomAvatarManifest = {
   contractVersion?: number
+  baseId?: string
   name?: string
   description?: string
   stage?: {
@@ -63,6 +64,14 @@ export type GoonCustomAvatarManifest = {
     conceal?: GoonCustomBodyConcealManifest
   }
   face?: GoonCustomFaceManifest
+  /** Strict first-party identity/follower contract; parsed before runtime use. */
+  appearanceDials?: unknown
+  /** Immutable first-party facial artwork definition; parsed before runtime use. */
+  facialArtwork?: unknown
+  /** Immutable first-party physical eye definition; parsed before runtime use. */
+  eyeAppearance?: unknown
+  /** First-party skeleton/retarget/corrective contract; parsed by its owning runtimes. */
+  rig?: unknown
 }
 
 export type ResolvedCustomFaceMeshes = {
@@ -100,6 +109,10 @@ function normalizeNameList(value: GoonCustomMorphBindingValue | null | undefined
 
 export function sanitizeCustomRuntimeNodeName(name: string) {
   return name.trim().replace(/\s/g, '_').replace(RESERVED_RUNTIME_NODE_CHARS, '')
+}
+
+export function resolveCustomPerformanceRigBlock(manifest: GoonCustomAvatarManifest) {
+  return isRecord(manifest.rig) ? manifest.rig.performance : undefined
 }
 
 export function getCustomRuntimeNodeNameCandidates(name: string | null | undefined) {
@@ -578,7 +591,11 @@ export async function loadAvatarIntoEngine(engine: GoonEngine, goon: GoonRecord)
 
   if (kind === 'custom') {
     const manifest = await loadCustomAvatarManifest(resolveCustomManifestFile(goon))
-    await engine.loadCustomGoon(avatarUrl, manifest)
+    await engine.loadCustomGoon(avatarUrl, manifest, {
+      appearanceDialValues: goon.appearanceDials ?? null,
+      facialArtworkState: goon.facialArtwork ?? null,
+      eyeAppearanceState: goon.eyeAppearance ?? null
+    })
     return { kind, manifest }
   }
 

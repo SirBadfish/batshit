@@ -3,6 +3,8 @@ import { redis } from '$lib/server/redis'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload,
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import { normalizeGoonsSettings, resolveAutoEnabledCues, resolveKitchenCues } from '$lib/goons/resolve'
@@ -133,7 +135,7 @@ export const GET: RequestHandler = async ({ locals }) => {
       return results
     })
 
-    return json({ goons })
+    return json({ goons: resolveUploadUrlsForBrowserInPayload(goons) })
   } catch (error) {
     console.error('Error loading goons:', error)
     return json({ error: 'Failed to load goons' }, { status: 500 })
@@ -514,12 +516,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       }
     }
 
+    const storageGoon = normalizeUploadUrlsForStorageInPayload(goon)
+
     await redis.execute(async (client) => {
-      await client.json.set(`goon:${goonId}`, '$', goon as any)
+      await client.json.set(`goon:${goonId}`, '$', storageGoon as any)
       await client.sAdd(`user:${locals.user!.id}:goons`, goonId)
     })
 
-    return json(goon)
+    return json(resolveUploadUrlsForBrowserInPayload(storageGoon))
   } catch (error) {
     console.error('Error creating goon:', error)
     return json(

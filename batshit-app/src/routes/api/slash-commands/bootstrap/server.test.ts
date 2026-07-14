@@ -32,6 +32,10 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
+function toPosixPath(value: unknown): string {
+  return String(value ?? '').replace(/\\/g, '/')
+}
+
 describe('slash command bootstrap system skills', () => {
   const originalHome = process.env.HOME
   let tempHome = ''
@@ -56,7 +60,8 @@ describe('slash command bootstrap system skills', () => {
       allowed_tools: input.skill.allowedTools ?? [],
       trust_level: 'trusted',
       has_scripts: false,
-      has_references: input.skill.hasReferences ?? false
+      has_references: input.skill.hasReferences ?? false,
+      has_assets: input.skill.hasAssets ?? false
     }))
   })
 
@@ -84,14 +89,15 @@ describe('slash command bootstrap system skills', () => {
     expect(command.id).toBe('voice-engine-installer')
     expect(command.skill_id).toBe('voice_engine_installer')
     expect(command.invocation_pattern).toBe('/voice-engine-installer')
-    expect(upsertSkillMock).toHaveBeenCalledWith(
+    const upsertInput = upsertSkillMock.mock.calls[0]?.[0]
+    expect(upsertInput).toEqual(
       expect.objectContaining({
         commandId: 'voice-engine-installer',
-        skill: expect.objectContaining({
-          sourceRef: expect.stringContaining('/batshit-app/src/lib/server/system-skills/speech-setup'),
-          hasReferences: true
-        })
+        skill: expect.objectContaining({ hasReferences: true })
       })
+    )
+    expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
+      '/batshit-app/src/lib/server/system-skills/speech-setup'
     )
 
     expect(await pathExists(path.join(tempHome, '.batshit', 'skills', 'speech-setup'))).toBe(false)
@@ -107,14 +113,44 @@ describe('slash command bootstrap system skills', () => {
     expect(command.skill_id).toBe('cli_tool_creator')
     expect(command.invocation_pattern).toBe('/cli-tool-creator')
     expect(command.is_system).toBe(true)
-    expect(upsertSkillMock).toHaveBeenCalledWith(
+    const upsertInput = upsertSkillMock.mock.calls[0]?.[0]
+    expect(upsertInput).toEqual(
       expect.objectContaining({
         commandId: 'cli-tool-creator',
+        skill: expect.objectContaining({ hasReferences: false })
+      })
+    )
+    expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
+      '/batshit-app/src/lib/server/system-skills/cli-tools'
+    )
+  })
+
+  it('builds the goon scene creator system skill command from the repo-backed bundle', async () => {
+    const { buildGoonSceneCreatorSkillCommand } = await import(
+      '$lib/server/services/systemSlashCommands'
+    )
+
+    const command = await buildGoonSceneCreatorSkillCommand('user-1', '2026-07-07T15:00:00.000Z')
+
+    expect(command.id).toBe('goon-scene-creator')
+    expect(command.skill_id).toBe('goon_scene_creator')
+    expect(command.invocation_pattern).toBe('/goon-scene-creator')
+    expect(command.is_system).toBe(true)
+    expect(command.icon_ref).toEqual({ kind: 'batshit', id: 'scenes' })
+    expect(command.has_assets).toBe(true)
+    const upsertInput = upsertSkillMock.mock.calls[0]?.[0]
+    expect(upsertInput).toEqual(
+      expect.objectContaining({
+        commandId: 'goon-scene-creator',
         skill: expect.objectContaining({
-          sourceRef: expect.stringContaining('/batshit-app/src/lib/server/system-skills/cli-tools'),
-          hasReferences: false
+          dependencies: [{ id: 'comfyui_mcp', label: 'ComfyUI MCP', required: false }],
+          hasReferences: true,
+          hasAssets: true
         })
       })
+    )
+    expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
+      '/batshit-app/src/lib/server/system-skills/goon-scene-creator'
     )
   })
 
@@ -135,6 +171,10 @@ describe('slash command bootstrap system skills', () => {
       [
         'cli-tool-creator',
         { id: 'cli-tool-creator', type: 'skill', skill_id: 'cli_tool_creator' }
+      ],
+      [
+        'goon-scene-creator',
+        { id: 'goon-scene-creator', type: 'skill', skill_id: 'goon_scene_creator' }
       ]
     ])
 
@@ -151,7 +191,7 @@ describe('slash command bootstrap system skills', () => {
 
     await ensureSystemSlashCommands('user-1')
 
-    expect(upsertSkillMock).toHaveBeenCalledTimes(4)
+    expect(upsertSkillMock).toHaveBeenCalledTimes(5)
     expect(redisJsonSetMock).toHaveBeenCalledWith(
       'slash_command:user-1:artifact-creator',
       '$',

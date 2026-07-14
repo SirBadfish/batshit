@@ -92,6 +92,8 @@ Source-checkout defaults are intentionally offset from the Mac app's launch-faci
 
 Removing the app bundle does not remove these folders.
 
+Mac app saves write to the Mac-app-owned Redis Stack process immediately. Redis runs with append-only persistence, so recent saved changes are written to disk quickly instead of depending only on delayed snapshot timing.
+
 ## Docker core ports
 
 Docker core services are Batshit app, batshit-server, and internal Redis Stack.

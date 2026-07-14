@@ -10,6 +10,10 @@ export type StandingSurfaceProbeOptions = {
   minNormalY?: number
 }
 
+export type NearestStandingSurfaceProbeOptions = StandingSurfaceProbeOptions & {
+  targetY: number
+}
+
 function resolveIntersectionNormalY(intersection: THREE.Intersection<THREE.Object3D>) {
   if (!intersection.face) return null
   const normal = intersection.face.normal.clone()
@@ -46,6 +50,53 @@ export function probeStandingSurfaceY({
       const candidateY = intersection.point.y + clearance
       if (candidateY < minY - clearance) continue
       if (bestY === null || candidateY > bestY) {
+        bestY = candidateY
+      }
+    }
+  }
+
+  return bestY
+}
+
+/**
+ * Finds the walkable horizontal hit closest to a target height. This is used
+ * for explicit Room Shell floor alignment, where choosing the highest hit can
+ * incorrectly select a ceiling or baked-in furnishing.
+ */
+export function probeNearestStandingSurfaceY({
+  objects,
+  x,
+  z,
+  minY,
+  maxY,
+  targetY,
+  clearance = 0,
+  minNormalY = 0.8
+}: NearestStandingSurfaceProbeOptions): number | null {
+  if (!objects.length) return null
+  if (!Number.isFinite(minY) || !Number.isFinite(maxY) || maxY <= minY) return null
+  if (!Number.isFinite(targetY)) return null
+
+  const raycaster = new THREE.Raycaster(
+    new THREE.Vector3(x, maxY, z),
+    new THREE.Vector3(0, -1, 0),
+    0,
+    maxY - minY
+  )
+
+  let bestY: number | null = null
+  let bestDistance = Number.POSITIVE_INFINITY
+
+  for (const object of objects) {
+    const intersections = raycaster.intersectObject(object, true)
+    for (const intersection of intersections) {
+      const normalY = resolveIntersectionNormalY(intersection)
+      if (normalY !== null && normalY < minNormalY) continue
+      const candidateY = intersection.point.y + clearance
+      if (candidateY < minY - clearance) continue
+      const distance = Math.abs(candidateY - targetY)
+      if (distance < bestDistance) {
+        bestDistance = distance
         bestY = candidateY
       }
     }

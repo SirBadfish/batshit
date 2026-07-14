@@ -34,6 +34,7 @@ After `Batshit.app` starts the runtime, you can also open `http://127.0.0.1:5620
 Inside the Mac app, Settings → Admin → Runtimes shows **Mac App Required Runtime** for viewing Runtime Doctor checks later. Docker installs do not show Mac-only Apple Container/runtime requirement cards.
 
 The Mac app stores durable state under `~/Library/Application Support/Batshit`, logs under `~/Library/Logs/Batshit`, and cache/scratch under `~/Library/Caches/Batshit`.
+When you save settings, agents, chats, Goons, scenes, or other app data, Batshit writes that change to the Mac-app-owned Redis Stack process immediately. The Mac app also runs Redis with append-only persistence so recent saves are written to disk quickly and survive app restarts or Mac reboots.
 
 n8n is connect-existing for the Mac app. Run your own n8n instance when you want `n8n` Primary Agents or workflow tools.
 

@@ -3,6 +3,9 @@ import { redis } from '$lib/server/redis'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
+  normalizeUploadUrlForStorage,
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload,
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import type { GoonAnimationLibrary, GoonFileRef } from '$lib/types/goons'
@@ -15,7 +18,7 @@ function normalizePreviewVideo(value: unknown): GoonFileRef | null {
   const filename = typeof raw.filename === 'string' ? raw.filename : ''
   if (!url || !filename) return null
   return {
-    url,
+    url: normalizeUploadUrlForStorage(url),
     filename,
     originalName:
       typeof raw.originalName === 'string'
@@ -116,11 +119,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
           : entry
       )
 
-      const nextLibrary: GoonAnimationLibrary = {
+      const nextLibrary = normalizeUploadUrlsForStorageInPayload<GoonAnimationLibrary>({
         ...library,
         vrma: next,
         updated_at: new Date().toISOString()
-      }
+      })
 
 	      await client.json.set(key, '$', nextLibrary as any)
 	      return nextLibrary
@@ -135,7 +138,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	      await deleteGoonUploadAsset('goon_animation_previews', previousPreviewFilename)
 	    }
 
-	    return json({ library: updated, previewVideo })
+	    return json({
+	      library: resolveUploadUrlsForBrowserInPayload(updated),
+	      previewVideo: resolveUploadUrlsForBrowserInPayload(previewVideo)
+	    })
   } catch (error) {
     console.error('Error uploading animation preview:', error)
     return json(

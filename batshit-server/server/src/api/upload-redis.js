@@ -16,6 +16,7 @@ const logger = require('../utils/logger');
 const batshitzipService = require('../services/batshitZipService');
 const redisService = require('../services/redisService');
 const uploadManager = require('../services/uploadManager');
+const { validateFacialArtworkUpload } = require('../services/facialArtworkValidator');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -111,6 +112,10 @@ const goonImageUpload = multer({
   limits: {
     fileSize: GOON_IMAGE_UPLOAD_MAX_FILE_SIZE // 25MB limit
   }
+});
+const goonFacialArtworkUpload = multer({
+  storage,
+  limits: { fileSize: GOON_IMAGE_UPLOAD_MAX_FILE_SIZE }
 });
 
 // Goon scene uploads (skybox images can be larger)
@@ -428,6 +433,7 @@ function getUploadLimitForPath(reqPath) {
     case '/upload/goon-animation':
       return GOON_ANIMATION_MAX_FILE_SIZE;
     case '/upload/goon-closet':
+    case '/upload/goon-facial-artwork':
       return GOON_IMAGE_UPLOAD_MAX_FILE_SIZE;
     case '/upload/goon-scene':
     case '/upload/goon-room-texture':
@@ -752,7 +758,8 @@ async function storeFilesystemUploadAsset(
     mimetype,
     sourceFile,
     buffer,
-    size
+    size,
+    metadata
   }
 ) {
   const uploadedAt = new Date().toISOString();
@@ -778,7 +785,8 @@ async function storeFilesystemUploadAsset(
     uploadedAt,
     storage: 'filesystem',
     relativePath: path.relative(config.uploadsDir, filePath),
-    filePath
+    filePath,
+    ...(metadata && typeof metadata === 'object' ? metadata : {})
   };
 
   const redisKey = `upload:${uploadType}:${filename}`;
@@ -2048,6 +2056,46 @@ router.post('/upload/goon-animation-preview', goonAnimationPreviewUpload.single(
   } catch (error) {
     logger.error('Goon animation preview upload error:', error);
     res.status(500).json({ error: 'Goon animation preview upload failed', details: error.message });
+  }
+});
+
+// First-party facial artwork upload. Bytes are validated and stored exactly;
+// resizing/re-encoding would break the package-bound SHA-256 contract.
+router.post('/upload/goon-facial-artwork', goonFacialArtworkUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    const originalName = req.file.originalname || 'facial_artwork.png';
+    if (path.extname(originalName).toLowerCase() !== '.png' || req.file.mimetype !== 'image/png') {
+      throw uploadValidationError('Facial artwork must be a PNG image.');
+    }
+    const validation = await validateFacialArtworkUpload({
+      buffer: req.file.buffer,
+      role: req.body?.role,
+      definitionSha256: req.body?.definitionSha256,
+      templateId: req.body?.templateId,
+      templateVersion: req.body?.templateVersion,
+      guideSha256: req.body?.guideSha256,
+      provenance: req.body?.provenance
+    });
+    const safeBase =
+      sanitizeFilenameSegment(path.basename(originalName, '.png'), validation.role).slice(0, 80) ||
+      validation.role;
+    const filename = `${Date.now()}_${crypto.randomUUID()}_${safeBase}.png`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_facial_artwork',
+      originalName,
+      filename,
+      mimetype: 'image/png',
+      buffer: req.file.buffer,
+      size: req.file.size,
+      metadata: { facialArtwork: validation }
+    });
+    return res.json({ success: true, file, artwork: validation });
+  } catch (error) {
+    logger.error('Goon facial artwork upload error:', error);
+    sendUploadError(res, 'Facial artwork upload failed', error);
   }
 });
 

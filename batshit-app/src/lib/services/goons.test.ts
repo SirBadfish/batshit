@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { createGoon, uploadAdvancedGoonPackage, uploadGuidedDufClothesVrm } from './goons'
+import {
+  createGoon,
+  deleteGoonFacialArtwork,
+  uploadAdvancedGoonPackage,
+  uploadGoonFacialArtwork,
+  uploadGuidedDufClothesVrm
+} from './goons'
 
 describe('goons service create flow', () => {
   const originalFetch = global.fetch
@@ -175,5 +181,74 @@ describe('goons service create flow', () => {
     expect(uploaded.manifestSummary?.name).toBe('Kiriko V2')
     expect(uploaded.outfitPieces[0]?.id).toBe('jacket')
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('uploads exact facial-artwork metadata through the Goon-owned route', async () => {
+    const definitionSha256 = 'a'.repeat(64)
+    const guideSha256 = 'b'.repeat(64)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('/api/goons/goon_custom_1/facial-artwork')
+      const form = init?.body as FormData
+      expect(form.get('role')).toBe('brows')
+      expect(form.get('definitionSha256')).toBe(definitionSha256)
+      expect(form.get('templateId')).toBe('brow-canvas')
+      expect(form.get('templateVersion')).toBe('2.0.0')
+      expect(form.get('guideSha256')).toBe(guideSha256)
+      expect(JSON.parse(String(form.get('provenance')))).toEqual({
+        sourceKind: 'user-authored',
+        author: 'Fixture Artist',
+        license: 'User-owned',
+        rightsConfirmed: true
+      })
+      return new Response(
+        JSON.stringify({
+          artwork: {
+            role: 'brows',
+            url: '/uploads/goon_facial_artwork/brow-left.png',
+            filename: 'brow-left.png',
+            size: 123,
+            mimeType: 'image/png',
+            sha256: 'c'.repeat(64),
+            template: {
+              id: 'brow-canvas',
+              version: '2.0.0',
+              guideSha256
+            },
+            provenance: {
+              sourceKind: 'user-authored',
+              author: 'Fixture Artist',
+              license: 'User-owned',
+              rightsConfirmed: true
+            }
+          }
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    })
+    global.fetch = fetchMock as typeof fetch
+
+    const result = await uploadGoonFacialArtwork(
+      'goon_custom_1',
+      new File(['png'], 'brow.png', { type: 'image/png' }),
+      {
+        role: 'brows',
+        definitionSha256,
+        templateId: 'brow-canvas',
+        templateVersion: '2.0.0',
+        guideSha256,
+        provenance: {
+          sourceKind: 'user-authored',
+          author: 'Fixture Artist',
+          license: 'User-owned',
+          rightsConfirmed: true
+        }
+      }
+    )
+    expect(result).toMatchObject({ role: 'brows', filename: 'brow-left.png' })
+  })
+
+  it('treats referenced facial-artwork deletion as a safe shared-reference result', async () => {
+    global.fetch = vi.fn(async () => new Response('', { status: 409 })) as typeof fetch
+    await expect(deleteGoonFacialArtwork('goon_custom_1', 'shared.png')).resolves.toBe(false)
   })
 })

@@ -302,15 +302,6 @@ function resolveUploadsDir() {
   return path.resolve(process.cwd(), '../batshit-server/server/uploads')
 }
 
-function resolvePublicBatshitServerUrl() {
-  const raw =
-    process.env.PUBLIC_BATSHIT_SERVER_URL?.trim() ||
-    process.env.BATSHIT_PUBLIC_SERVER_URL?.trim() ||
-    process.env.BATSHIT_SERVER_URL?.trim() ||
-    'http://localhost:5600'
-  return raw.replace(/\/+$/, '')
-}
-
 function toPosixPath(input: string) {
   return input.split(path.sep).join('/')
 }
@@ -1504,7 +1495,6 @@ function rewriteLocalUploadUrlFields(
   )
   const explicitRelativePath = normalizeUploadRelativePath(next)
   const explicitUploadPath = explicitRelativePath ? `/uploads/${explicitRelativePath}` : null
-  const serverUrl = resolvePublicBatshitServerUrl()
   const rewritePath = (raw: unknown) => {
     if (typeof raw !== 'string') return explicitUploadPath
     return uploadPathFromString(raw, uploadRelativePathByBasename) ?? explicitUploadPath
@@ -1513,7 +1503,7 @@ function rewriteLocalUploadUrlFields(
   for (const [key, raw] of Object.entries(value)) {
     if (!LOCAL_UPLOAD_URL_FIELDS.has(key) || typeof raw !== 'string') continue
     const uploadPath = rewritePath(raw)
-    if (uploadPath) next[key] = `${serverUrl}${uploadPath}`
+    if (uploadPath) next[key] = uploadPath
   }
 
   const tunnelPath = typeof value.tunnelPath === 'string' ? value.tunnelPath : null

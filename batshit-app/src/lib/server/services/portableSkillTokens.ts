@@ -87,6 +87,13 @@ export const PORTABLE_SKILL_FAMILIES: PortableSkillTokenFamilyDefinition[] = [
     label: 'Skills',
     description: 'Save and import user-authored Batshit skills.',
     controlIds: ['sys.skill.save', 'sys.skill.import']
+  },
+  {
+    id: 'goon-scenes',
+    label: 'Goon Scenes',
+    description:
+      'Verify portable Goon Scene Creator access and retrieve current scene-planning capability guidance.',
+    controlIds: ['sys.goon_scene.creator_info']
   }
 ]
 

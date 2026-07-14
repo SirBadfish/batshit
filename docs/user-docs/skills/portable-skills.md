@@ -10,6 +10,7 @@ A Portable Skill is a folder with:
 
 - `SKILL.md`, the instructions your outside agent reads.
 - `references/`, the same Batshit-owned domain guidance used by the matching in-app skill where that guidance can be shared safely.
+- optional `assets/`, such as non-secret workflow templates owned by the matching in-app skill.
 
 Portable Skills call Batshit through the local app API:
 
@@ -53,6 +54,7 @@ Scopes match the current Portable Skill families:
 | Artifacts | Portable Artifact Creator |
 | CLI Tools | Portable CLI Tool Creator |
 | Skills | Portable Skill Creator |
+| Goon Scenes | Portable Goon Scene Creator |
 
 A token can have more than one scope. For the simplest setup, create one token with the scopes you plan to use and store it once in `portable-skills.env`. Use separate tokens only when you want a tighter boundary for a specific job. You can rotate or revoke tokens from the same Settings page.
 
@@ -181,3 +183,4 @@ Docker has caller-relative URLs. A URL that works in your browser may not be the
 - [Artifact Creator](portable-skills-artifact-creator.md)
 - [CLI Tool Creator](portable-skills-cli-tool-creator.md)
 - [Skill Creator](portable-skills-skill-creator.md)
+- [Goon Scene Creator](portable-skills-goon-scene-creator.md)

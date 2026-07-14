@@ -1,5 +1,9 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
+import {
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
 import type { GoonRecord } from '$lib/types/goons'
 
 function generateGoonId() {
@@ -27,7 +31,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
       const baseName = existing.name?.trim() || 'New Goon'
       const name = `${baseName} Copy`
 
-      const clone: GoonRecord = {
+      const clone = normalizeUploadUrlsForStorageInPayload<GoonRecord>({
         ...JSON.parse(JSON.stringify(existing)),
         id: newGoonId,
         user_id: locals.user!.id,
@@ -35,7 +39,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
         created_at: now,
         updated_at: now,
         vrmUpdate: null
-      }
+      })
       if (clone.files) {
         delete clone.files.vrmPending
       }
@@ -52,7 +56,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
       return json({ error: 'Goon not found' }, { status: 404 })
     }
 
-    return json({ goon: result })
+    return json({ goon: resolveUploadUrlsForBrowserInPayload(result) })
   } catch (error) {
     console.error('Error duplicating goon:', error)
     return json({ error: 'Failed to duplicate goon' }, { status: 500 })

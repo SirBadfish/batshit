@@ -1,6 +1,28 @@
 <script module lang="ts">
-  import type { GoonFileRef as PreviewVideoFileRef } from '$lib/types/goons'
+  import type { GoonFileRef as PreviewVideoFileRef, GoonRecord as PreviewGoonRecord } from '$lib/types/goons'
   import type { GoonEngine as PreviewGenerationEngine } from '$lib/goons/engine'
+  import {
+    loadAvatarIntoEngine,
+    loadCustomAvatarManifest,
+    resolveGoonAvatarUrl
+  } from '$lib/goons/customAvatar'
+
+  // Per-lane preview target: .vrma clips preview on a VRM goon URL (stunt
+  // dummy), .glb clips bind by skeleton node names, so they need either the
+  // bundled BSRigV2 GLB stunt dummy ('custom-url') or a real GLB-lane custom
+  // Goon record ('custom'). No cross-lane fallback — a missing target must
+  // surface as an explicit error, never a frozen wrong-lane video.
+  export type MotionPreviewTarget =
+    | { kind: 'vrm'; url: string }
+    | { kind: 'custom'; goon: PreviewGoonRecord }
+    | { kind: 'custom-url'; modelUrl: string; manifestUrl: string }
+
+  export function resolveMotionPreviewTargetKey(target: MotionPreviewTarget | null | undefined) {
+    if (!target) return ''
+    if (target.kind === 'vrm') return target.url
+    if (target.kind === 'custom-url') return target.modelUrl
+    return resolveGoonAvatarUrl(target.goon) ?? ''
+  }
 
   const PREVIEW_THUMB_WIDTH = 120
   const PREVIEW_THUMB_HEIGHT = 164
@@ -49,7 +71,7 @@
     return host
   }
 
-  async function ensureSharedPreviewGenerationEngine(goonUrl: string) {
+  async function ensureSharedPreviewGenerationEngine(target: MotionPreviewTarget) {
     clearPreviewGenerationDisposeTimer()
 
     if (!previewGenerationEnginePromise) {
@@ -75,9 +97,23 @@
     }
 
     const engine = previewGenerationEngine ?? await previewGenerationEnginePromise
-    if (previewGenerationLoadedGoonUrl !== goonUrl) {
-      await engine.loadGoon(goonUrl)
-      previewGenerationLoadedGoonUrl = goonUrl
+    const targetKey = resolveMotionPreviewTargetKey(target)
+    if (!targetKey) {
+      throw new Error('Preview Goon is missing its model file')
+    }
+    if (previewGenerationLoadedGoonUrl !== targetKey) {
+      if (target.kind === 'custom') {
+        await loadAvatarIntoEngine(engine, target.goon)
+      } else if (target.kind === 'custom-url') {
+        const manifest = await loadCustomAvatarManifest({
+          url: target.manifestUrl,
+          filename: target.manifestUrl.split('/').pop() || 'avatar.json'
+        })
+        await engine.loadCustomGoon(target.modelUrl, manifest)
+      } else {
+        await engine.loadGoon(target.url)
+      }
+      previewGenerationLoadedGoonUrl = targetKey
     }
     return engine
   }
@@ -130,7 +166,8 @@
   const previewThumbHeight = 164
 
   let {
-    goonUrl = '',
+    previewTarget = null,
+    previewUnavailableReason = '',
     animationFile = null,
     animationName = '',
     active = false,
@@ -139,7 +176,8 @@
     warmOnOpen = false,
     onRequestPlay = (_id: string) => {}
   } = $props<{
-    goonUrl?: string
+    previewTarget?: MotionPreviewTarget | null
+    previewUnavailableReason?: string
     animationFile?: GoonFileRef | null
     animationName?: string
     active?: boolean
@@ -248,12 +286,14 @@
     }
   }
 
+  const previewTargetKey = $derived.by(() => resolveMotionPreviewTargetKey(previewTarget))
+
   async function buildPreviewVideoFile() {
-    if (!goonUrl || !animationFile?.url || !animationFile.filename) {
-      throw new Error('Preview source is missing')
+    if (!previewTarget || !previewTargetKey || !animationFile?.url || !animationFile.filename) {
+      throw new Error(previewUnavailableReason || 'Preview source is missing')
     }
 
-    const engine = await ensureSharedPreviewGenerationEngine(goonUrl)
+    const engine = await ensureSharedPreviewGenerationEngine(previewTarget)
     await engine.syncAnimations([animationFile])
     engine.setGoonVisible(true)
 
@@ -289,12 +329,16 @@
 
   async function ensurePreviewVideo() {
     syncPreviewVideoFromRecord()
-    if (previewVideoUrl || generating || (!visible && !shouldWarmPreview) || !goonUrl || !animationFile?.url) {
+    if (previewVideoUrl || generating || (!visible && !shouldWarmPreview) || !animationFile?.url) {
+      return
+    }
+    if (!previewTargetKey) {
+      error = previewUnavailableReason || 'Preview Goon unavailable'
       return
     }
     if (!tryBeginGoonMotionPreviewGeneration()) return
 
-    const previewKey = `${goonUrl}::${animationFile.url}::${animationFile.filename || animationName}`
+    const previewKey = `${previewTargetKey}::${animationFile.url}::${animationFile.filename || animationName}`
     generating = true
     loading = true
     error = null
@@ -324,7 +368,11 @@
 
   async function regeneratePreviewVideo() {
     syncPreviewVideoFromRecord()
-    if (generating || !goonUrl || !animationFile?.url || !animationFile?.filename) return
+    if (generating || !animationFile?.url || !animationFile?.filename) return
+    if (!previewTargetKey) {
+      error = previewUnavailableReason || 'Preview Goon unavailable'
+      return
+    }
     if (!tryBeginGoonMotionPreviewGeneration()) return
 
     generating = true
@@ -334,7 +382,7 @@
     previewVideoFilename = ''
 
     try {
-      const previewKey = `${goonUrl}::${animationFile.url}::${animationFile.filename || animationName}::refresh`
+      const previewKey = `${previewTargetKey}::${animationFile.url}::${animationFile.filename || animationName}::refresh`
       const previewVideo = await getQueuedPreviewGeneration(previewKey, async () => {
         if (destroyed || !visible) {
           return null
@@ -475,8 +523,15 @@
       Preparing…
     </div>
   {:else if error}
-    <div class="animation-preview-thumb-overlay animation-preview-thumb-overlay-error">
-      Preview unavailable
+    <div class="animation-preview-thumb-overlay animation-preview-thumb-overlay-error" title={error}>
+      {previewUnavailableReason && error === previewUnavailableReason ? error : 'Preview unavailable'}
+    </div>
+  {:else if !previewVideoUrl && !previewTargetKey}
+    <div
+      class="animation-preview-thumb-overlay animation-preview-thumb-overlay-error"
+      title={previewUnavailableReason || 'Preview Goon unavailable'}
+    >
+      {previewUnavailableReason || 'Preview Goon unavailable'}
     </div>
   {:else if !previewVideoUrl}
     <div class="animation-preview-thumb-overlay animation-preview-thumb-overlay-waiting">
@@ -491,7 +546,7 @@
       aria-label="Recreate motion preview video"
       title="Recreate preview video"
       onclick={handleRefreshClick}
-      disabled={generating}
+      disabled={generating || !previewTargetKey}
     >
       <RefreshCw class="animation-preview-thumb-refresh-icon" data-spinning={generating} />
     </button>

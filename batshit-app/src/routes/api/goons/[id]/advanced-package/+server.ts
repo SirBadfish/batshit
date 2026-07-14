@@ -3,13 +3,14 @@ import { redis } from '$lib/server/redis'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl,
+  resolveUploadUrlsForBrowserInPayload,
   rewriteInternalBatshitServerUrlsInPayload
 } from '$lib/server/services/batshitServerUrls'
 import type { GoonRecord } from '$lib/types/goons'
 
-async function readUploadError(response: Response) {
+async function readUploadError(response: Response, fallback: string) {
   const text = await response.text().catch(() => '')
-  if (!text) return 'Advanced/Blender Goon File Package upload failed'
+  if (!text) return fallback
 
   try {
     const payload = JSON.parse(text) as { error?: string; details?: string }
@@ -23,10 +24,7 @@ async function readUploadError(response: Response) {
     // Fall through to HTML/plain-text cleanup.
   }
 
-  return (
-    text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() ||
-    'Advanced/Blender Goon File Package upload failed'
-  )
+  return text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || fallback
 }
 
 export const POST: RequestHandler = async ({ params, request, locals }) => {
@@ -51,12 +49,22 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       return json({ error: 'Goon not found' }, { status: 404 })
     }
 
-    if (goon.sourceProfile !== 'guided-custom-vrm') {
+    const profile =
+      goon.sourceProfile === 'guided-custom-vrm'
+        ? 'guided-custom-vrm'
+        : goon.sourceProfile === 'expert-custom-glb'
+          ? 'expert-custom-glb'
+          : null
+
+    if (!profile) {
       return json(
-        { error: 'Only Advanced/Blender Goons accept Goon File Package updates.' },
+        { error: 'Only Advanced/Blender and Advanced/GLB Goons accept Goon File Package updates.' },
         { status: 400 }
       )
     }
+
+    const packageLabel =
+      profile === 'guided-custom-vrm' ? 'Advanced/Blender Goon File Package' : 'Advanced/GLB Goon File Package'
 
     const form = await request.formData()
     const fileValue = form.get('file')
@@ -74,14 +82,19 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     const uploadForm = new FormData()
     uploadForm.append('file', file, file.name)
 
-    const uploadResponse = await fetch(`${getInternalBatshitServerUrl()}/api/upload/goon-guided-package`, {
+    const uploadPath =
+      profile === 'guided-custom-vrm'
+        ? '/api/upload/goon-guided-package'
+        : '/api/upload/goon-custom-package'
+
+    const uploadResponse = await fetch(`${getInternalBatshitServerUrl()}${uploadPath}`, {
       method: 'POST',
       headers: getInternalBatshitServerAuthHeaders(),
       body: uploadForm
     })
 
     if (!uploadResponse.ok) {
-      const error = await readUploadError(uploadResponse)
+      const error = await readUploadError(uploadResponse, `${packageLabel} upload failed`)
       return json({ error }, { status: uploadResponse.status || 500 })
     }
 
@@ -90,7 +103,12 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     )
     const files = uploadPayload?.files ?? null
 
-    if (!files?.package?.url || !files?.vrm?.url || !files?.manifest?.url) {
+    const unpackedComplete =
+      profile === 'guided-custom-vrm'
+        ? Boolean(files?.package?.url && files?.vrm?.url && files?.manifest?.url)
+        : Boolean(files?.package?.url && files?.model?.url && files?.manifest?.url)
+
+    if (!unpackedComplete) {
       return json(
         { error: 'Goon File Package upload failed to return unpacked files.' },
         { status: 500 }
@@ -98,11 +116,12 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     }
 
     return json({
-      files,
+      profile,
+      files: resolveUploadUrlsForBrowserInPayload(files),
       manifestData: uploadPayload?.manifestData ?? null
     })
   } catch (error) {
-    console.error('Error uploading Advanced/Blender Goon File Package:', error)
-    return json({ error: 'Failed to upload Advanced/Blender Goon File Package' }, { status: 500 })
+    console.error('Error uploading Goon File Package:', error)
+    return json({ error: 'Failed to upload Goon File Package' }, { status: 500 })
   }
 }

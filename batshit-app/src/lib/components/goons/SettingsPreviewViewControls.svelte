@@ -2,8 +2,10 @@
   import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import { Button } from '$lib/components/ui/button'
   import { Slider } from '$lib/components/ui/slider'
-  import { Eye, RotateCcw, Settings2 } from '@lucide/svelte'
+  import { Camera, Eye, House, RotateCcw, Settings2 } from '@lucide/svelte'
   import type { GoonEngineQuality } from '$lib/goons/engine'
+  import type { GoonFramingPreset } from '$lib/goons/cameraNavigation'
+  import type { GoonCameraMode } from '$lib/types/goons'
 
   type SettingsPreviewViewControlsProps = {
     disabled?: boolean
@@ -15,6 +17,10 @@
     minFov: number
     maxFov: number
     onFovChange?: ((value: number | number[]) => void) | undefined
+    onFramePreset?: ((preset: GoonFramingPreset) => void) | undefined
+    cameraMode?: GoonCameraMode
+    indoorCameraAvailable?: boolean
+    onCameraModeChange?: ((mode: GoonCameraMode) => void) | undefined
     quality?: GoonEngineQuality | null
     qualityOptions?: Array<{ value: GoonEngineQuality; label: string }>
     onQualityChange?: ((value: GoonEngineQuality) => void) | undefined
@@ -32,6 +38,10 @@
     minFov,
     maxFov,
     onFovChange = undefined,
+    onFramePreset = undefined,
+    cameraMode = 'free',
+    indoorCameraAvailable = false,
+    onCameraModeChange = undefined,
     quality = null,
     qualityOptions = [],
     onQualityChange = undefined,
@@ -62,6 +72,43 @@
     </Button>
   {/if}
 
+  {#if onCameraModeChange}
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger
+        class="settings-preview-menu-icon-trigger"
+        disabled={disabled}
+        aria-label={cameraMode === 'indoor' ? 'Indoor Camera' : 'Free Camera'}
+        title={cameraMode === 'indoor' ? 'Indoor Camera' : 'Free Camera'}
+      >
+        {#if cameraMode === 'indoor'}
+          <House class="settings-preview-button-icon" />
+        {:else}
+          <Camera class="settings-preview-button-icon" />
+        {/if}
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Content align="end" class="settings-preview-menu settings-preview-menu-compact settings-preview-menu-camera">
+        <div class="settings-preview-menu-stack">
+          <div class="settings-preview-menu-label">Camera</div>
+          <div class="settings-preview-quality-grid">
+            <Button
+              variant={cameraMode === 'indoor' ? 'default' : 'outline'}
+              size="sm"
+              class="settings-preview-camera-button"
+              disabled={!indoorCameraAvailable}
+              onclick={() => onCameraModeChange?.('indoor')}
+            ><House class="settings-preview-button-icon" /> Indoor Camera</Button>
+            <Button
+              variant={cameraMode === 'free' ? 'default' : 'outline'}
+              size="sm"
+              class="settings-preview-camera-button"
+              onclick={() => onCameraModeChange?.('free')}
+            ><Camera class="settings-preview-button-icon" /> Free Camera</Button>
+          </div>
+        </div>
+      </DropdownMenu.Content>
+    </DropdownMenu.Root>
+  {/if}
+
   <DropdownMenu.Root>
     <DropdownMenu.Trigger
       class="settings-preview-fov-trigger"
@@ -86,7 +133,32 @@
           step={1}
           class="settings-preview-slider"
         />
-        <p class="settings-preview-menu-help">Shift + Scroll adjusts FOV.</p>
+        {#if onFramePreset}
+          <div class="settings-preview-framing-block">
+            <span class="settings-preview-menu-label">Framing</span>
+            <div class="settings-preview-framing-grid" role="group" aria-label="Preview framing">
+              <Button
+                variant="outline"
+                size="sm"
+                class="settings-preview-framing-button"
+                onclick={() => onFramePreset?.('headshot')}
+              >Headshot</Button>
+              <Button
+                variant="outline"
+                size="sm"
+                class="settings-preview-framing-button"
+                onclick={() => onFramePreset?.('portrait')}
+              >Portrait</Button>
+              <Button
+                variant="outline"
+                size="sm"
+                class="settings-preview-framing-button"
+                onclick={() => onFramePreset?.('full-body')}
+              >Full Body</Button>
+            </div>
+          </div>
+        {/if}
+        <p class="settings-preview-menu-help">Scroll covers close-up through exterior framing. FOV remains available for manual lens control.</p>
       </div>
     </DropdownMenu.Content>
   </DropdownMenu.Root>
@@ -196,6 +268,10 @@
     padding: 8px;
   }
 
+  :global(.settings-preview-menu-camera) {
+    width: 292px;
+  }
+
   .settings-preview-menu-stack {
     display: flex;
     flex-direction: column;
@@ -235,6 +311,26 @@
     color: var(--muted-foreground);
   }
 
+  .settings-preview-framing-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 2px;
+  }
+
+  .settings-preview-framing-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  :global(.settings-preview-framing-button) {
+    width: 100%;
+    height: 28px;
+    padding-inline: 6px;
+    font-size: 0.5625rem;
+  }
+
   .settings-preview-quality-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -245,5 +341,12 @@
     width: 100%;
     height: 28px;
     padding-inline: 8px;
+  }
+
+  :global(.settings-preview-camera-button) {
+    width: 100%;
+    height: 28px;
+    padding-inline: 8px;
+    white-space: nowrap;
   }
 </style>

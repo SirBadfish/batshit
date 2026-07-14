@@ -13,6 +13,10 @@ import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIco
 import type { SubagentRow } from '$lib/types/database'
 import { sanitizeId } from '$lib/utils/idSanitizer' // Story 6.9c
 import {
+	normalizeUploadUrlsForStorageInPayload,
+	resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
+import {
 		canonicalizeSubagentRecord,
 		isCliSubagentType,
 	isWorkflowBackedSubagentType,
@@ -45,7 +49,9 @@ export const GET: RequestHandler = async ({ locals }) => {
 				const subagent = Array.isArray(subagentData) ? subagentData[0] : subagentData
 				if (subagent) {
 					subagents.push(
-						canonicalizeSubagentRecord(subagent as Record<string, any>) as SubagentRow
+						resolveUploadUrlsForBrowserInPayload(
+							canonicalizeSubagentRecord(subagent as Record<string, any>) as SubagentRow
+						)
 					)
 				}
 			}
@@ -136,16 +142,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			created_at: new Date().toISOString(),
 			updated_at: new Date().toISOString()
 		}) as SubagentRow
+		const storageSubagent = normalizeUploadUrlsForStorageInPayload(subagent)
 
 		// Story 6.9c: Save to Redis with slug-based key
-		await service.json.set(`subagent:${id}`, '$', subagent) // Use json.set for objects
+		await service.json.set(`subagent:${id}`, '$', storageSubagent) // Use json.set for objects
 		await service.sAdd(`user:${locals.user.id}:subagents`, id)
 
-		if (isCliSubagentType(subagent.subagentType)) {
-			await syncManagedCliSubagentProfile(locals.user.id, subagent)
+		if (isCliSubagentType(storageSubagent.subagentType)) {
+			await syncManagedCliSubagentProfile(locals.user.id, storageSubagent)
 		}
 
-		return json({ subagent })
+		return json({ subagent: resolveUploadUrlsForBrowserInPayload(storageSubagent) })
 	} catch (error) {
 		console.error('Failed to create subagent:', error)
 		return json(

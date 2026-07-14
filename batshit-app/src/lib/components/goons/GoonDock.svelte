@@ -6,8 +6,10 @@
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import {
     Maximize2,
+    Camera,
     Eye,
     Edit,
+    House,
     RotateCcw,
     Settings2,
     Sparkles
@@ -17,6 +19,7 @@
     GoonCompatibilityReport,
     GoonCueDefinition,
     GoonCamera,
+    GoonCameraMode,
     GoonSceneDefinition,
     GoonFileRef,
     GoonClosetAssignment,
@@ -30,10 +33,12 @@
     GoonEngineQuality,
     GoonRendererRuntime
   } from '$lib/goons/engine'
+  import type { GoonFramingPreset } from '$lib/goons/cameraNavigation'
   import type { GoonClosetItem, GoonXWearData } from '$lib/types/goons'
   import {
     buildGoonAnimationLoadPlan,
     buildGoonAnimationPriorityNames,
+    filterGoonAnimationFilesForLane,
     resolveGoonAnimationName
   } from '$lib/goons/animationLoadPlan'
   import {
@@ -303,7 +308,7 @@
     for (const entry of dockAnimationCatalog) {
       if (entry?.name) names.add(entry.name)
     }
-    for (const file of collectDockAnimationFiles()) {
+    for (const file of collectDockAnimationFilesForLane(goon)) {
       const name = resolveAnimationName(file)
       if (name) names.add(name)
     }
@@ -351,8 +356,12 @@
   let lastBaseLoopSignature = ''
   let lastSceneSignature = ''
   let lastClosetSignature = ''
+  let lastAppearanceDialsSignature = ''
+  let lastFacialArtworkSignature = ''
+  let lastAvatarAssetSignature = ''
   let skyboxPitchOffset = $state(0)
   let viewFov = $state(DEFAULT_VIEW_FOV)
+  let cameraMode = $state<GoonCameraMode>('free')
 
   function handleSkyboxOffsetChange(value: number | number[]) {
     if (Array.isArray(value)) {
@@ -368,6 +377,12 @@
     } else if (typeof value === 'number') {
       viewFov = value
     }
+    applyViewFov()
+  }
+
+  function applyViewFov() {
+    engine?.setCameraFov(viewFov)
+    swapEngine?.setCameraFov(viewFov)
   }
 
   function clampViewFov(value: number) {
@@ -378,6 +393,7 @@
     const direction = Math.sign(rawDelta)
     if (!direction) return
     viewFov = clampViewFov(viewFov + direction * 2)
+    applyViewFov()
   }
 
   function handleViewportFovWheel(event: WheelEvent) {
@@ -399,6 +415,23 @@
   function handleDockCameraChange(camera: GoonCamera) {
     cameraTouched = true
     onCameraChange(camera)
+  }
+
+  function handleCameraModeChange(mode: GoonCameraMode) {
+    const targetEngine = engine
+    if (!targetEngine?.setCameraMode(mode)) return
+    cameraMode = mode
+    swapEngine?.setCameraMode(mode)
+    const camera = targetEngine.getCameraState()
+    if (camera) handleDockCameraChange(camera)
+  }
+
+  function handleDockFramePreset(preset: GoonFramingPreset) {
+    if (!engine?.frameAvatar(preset)) return
+    const camera = engine.getCameraState()
+    if (camera) {
+      handleDockCameraChange(camera)
+    }
   }
 
   function handleRuntimeStatus(status: GoonRendererRuntime) {
@@ -432,8 +465,15 @@
     isDocumentHidden = document.hidden
   }
 
+  // Per-lane clip binding lives in the shared animationLoadPlan helpers so the
+  // dock and Goon Settings always resolve the same lane split.
+  function collectDockAnimationFilesForLane(targetGoon?: GoonRecord | null) {
+    const lane = resolveGoonKind(targetGoon) === 'custom' ? 'glb' : 'vrm'
+    return filterGoonAnimationFilesForLane(collectDockAnimationFiles(), lane)
+  }
+
   function buildAnimationLoadPlan(targetGoon?: GoonRecord | null) {
-    const libraryFiles = collectDockAnimationFiles()
+    const libraryFiles = collectDockAnimationFilesForLane(targetGoon)
     const goonFiles: GoonFileRef[] = []
     const { cueMap } = resolveGoonCues(targetGoon, goonsSettings)
     const baseLoop = targetGoon?.defaults?.baseLoop ?? 'base_stand'
@@ -494,7 +534,7 @@
 
   function buildDockMotionOptions(): DockMotionOption[] {
     const fileByAnimationName = new Map<string, GoonFileRef>()
-    for (const file of collectDockAnimationFiles()) {
+    for (const file of collectDockAnimationFilesForLane(goon)) {
       const name = resolveAnimationName(file)
       if (name && !fileByAnimationName.has(name)) {
         fileByAnimationName.set(name, file)
@@ -560,7 +600,7 @@
   }
 
   function resolveDockPreviewDefinition(animationName: string) {
-    return resolvePreviewAnimationDefinition(animationName, cueMap, collectDockAnimationFiles())
+    return resolvePreviewAnimationDefinition(animationName, cueMap, collectDockAnimationFilesForLane(goon))
   }
 
   function getCurrentMoodLabel() {
@@ -791,6 +831,10 @@
     const shouldApply = options.force || !cameraTouched
     if (!shouldApply) return
     if (targetGoon.camera) {
+      if (typeof targetGoon.camera.fov === 'number') {
+        viewFov = clampViewFov(targetGoon.camera.fov)
+      }
+      cameraMode = targetGoon.camera.mode ?? 'free'
       targetEngine.applyCamera(targetGoon.camera)
       targetEngine.setDefaultCamera(targetGoon.camera)
       return
@@ -1216,6 +1260,7 @@
 
     try {
       await incomingEngine.init()
+      incomingEngine.setCameraFov(viewFov)
       const { kind } = await loadAvatarIntoEngine(incomingEngine, nextGoon)
       await applySceneToEngine(incomingEngine, nextGoon)
       lastSceneSignature = buildGoonSceneSignature(resolveSceneForGoon(nextGoon))
@@ -1232,9 +1277,18 @@
         dockMaterialNames = buildClosetSlotNames(incomingEngine.getMaterialNames())
         lastClosetSignature = buildClosetRuntimeSignature(nextGoon)
       } else {
-        dockAnimationCatalog = []
+        // GLB-lane custom goons: sync .glb library clips inline on the incoming
+        // engine (mirrors the VRM branch — the reactive animation effect can
+        // skip a fresh engine when the plan signature is unchanged).
+        const plan = buildAnimationLoadPlan(nextGoon)
+        animationSignature = buildAnimationSignature(plan)
+        const allAnimations = [...plan.eager, ...plan.deferred]
+        await incomingEngine.syncAnimations(allAnimations)
+        dockAnimationCatalog = incomingEngine.getAnimationCatalog()
         dockMaterialNames = []
         lastClosetSignature = ''
+        lastAppearanceDialsSignature = JSON.stringify(nextGoon.appearanceDials ?? null)
+        lastFacialArtworkSignature = JSON.stringify(nextGoon.facialArtwork ?? null)
       }
       incomingEngine.setGoonVisible(true)
       runtimeError = null
@@ -2051,6 +2105,7 @@
     }
     skyboxPitchOffset = 0
     viewFov = DEFAULT_VIEW_FOV
+    cameraMode = 'free'
     eyeContactEnabled = true
     if (goon && engine) {
       const baseLoop = goon.defaults?.baseLoop ?? 'base_stand'
@@ -2058,6 +2113,7 @@
       engine.setMood(baseLoop, baseLoopDefinition)
       cameraTouched = false
       engine.resetView()
+      engine.setCameraMode('free')
       const camera = engine.getCameraState()
       if (camera) {
         onCameraChange(camera)
@@ -2130,6 +2186,7 @@
     })
     try {
       await engine.init()
+      engine.setCameraFov(viewFov)
       runtimeError = null
     } catch (error) {
       runtimeError = toGoonRuntimeError(error)
@@ -2301,15 +2358,6 @@
   })
 
   $effect(() => {
-    if (engine) {
-      engine.setCameraFov(viewFov)
-    }
-    if (swapEngine) {
-      swapEngine.setCameraFov(viewFov)
-    }
-  })
-
-  $effect(() => {
     const shouldRun = Boolean(
       hasRenderableGoonAvatar(goon) && !isDocumentHidden && viewportVisible && !externallyPaused
     )
@@ -2364,11 +2412,21 @@
 
   $effect(() => {
     if (!engine || !hasRenderableGoonAvatar(goon)) return
-    if (currentGoonId === goon.id) return
+    const avatarAssetSignature = JSON.stringify([
+      goon.id,
+      goon.files?.vrm?.url ?? null,
+      goon.customAvatar?.model?.url ?? null,
+      goon.customAvatar?.manifest?.url ?? null,
+      goon.guidedAvatar?.manifest?.url ?? null
+    ])
+    if (currentGoonId === goon.id && lastAvatarAssetSignature === avatarAssetSignature) return
     currentGoonId = goon.id
+    lastAvatarAssetSignature = avatarAssetSignature
     animationSignature = ''
     lastBaseLoopSignature = ''
     lastClosetSignature = ''
+    lastAppearanceDialsSignature = ''
+    lastFacialArtworkSignature = ''
     dockAnimationCatalog = []
     dockAnimationName = ''
     dockPreviewActive = false
@@ -2381,11 +2439,6 @@
 
   $effect(() => {
     if (!engine) return
-    if (resolveGoonKind(goon) === 'custom') {
-      animationSignature = ''
-      dockAnimationCatalog = []
-      return
-    }
     const plan = buildAnimationLoadPlan(goon)
     const signature = buildAnimationSignature(plan)
     if (signature === animationSignature) return
@@ -2432,6 +2485,31 @@
     lastClosetSignature = signature
     engine.resetMaterialOverrides()
     void applyClosetAssignments(engine, goon)
+  })
+
+  // Live Appearance Dials v2 updates: saved Settings edits must reach the
+  // mounted dock without a reload (live settings registry contract).
+  $effect(() => {
+    if (!engine || !goon) return
+    if (resolveGoonKind(goon) !== 'custom') return
+    const signature = JSON.stringify(goon.appearanceDials ?? null)
+    if (signature === lastAppearanceDialsSignature) return
+    lastAppearanceDialsSignature = signature
+    engine.setAppearanceDialValues(goon.appearanceDials ?? null)
+  })
+
+  // Facial artwork owns custom-root WebGPU materials and uploaded textures,
+  // so saved Recipe changes must refresh the mounted Dock without reloading.
+  $effect(() => {
+    if (!engine || !goon) return
+    if (resolveGoonKind(goon) !== 'custom') return
+    const signature = JSON.stringify(goon.facialArtwork ?? null)
+    if (signature === lastFacialArtworkSignature) return
+    lastFacialArtworkSignature = signature
+    void engine.setFacialArtworkState(goon.facialArtwork ?? null).catch((error) => {
+      console.error('[GoonDock] Failed to apply facial artwork:', error)
+      runtimeError = toGoonRuntimeError(error)
+    })
   })
 
   $effect(() => {
@@ -3071,6 +3149,49 @@
         <div class="goon-dock-footer-secondary">
           <DropdownMenu.Root>
             <DropdownMenu.Trigger
+              class="goon-dock-icon-trigger"
+              disabled={!goon}
+              aria-label={cameraMode === 'indoor' ? 'Indoor Camera' : 'Free Camera'}
+              title={cameraMode === 'indoor' ? 'Indoor Camera' : 'Free Camera'}
+            >
+              {#if cameraMode === 'indoor'}
+                <House class="goon-dock-control-icon" />
+              {:else}
+                <Camera class="goon-dock-control-icon" />
+              {/if}
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Content align="end" class="goon-dock-popover is-compact is-camera">
+              <div class="goon-dock-popover-stack">
+                <div class="goon-dock-popover-label">Camera</div>
+                <div class="goon-dock-quality-grid">
+                  <Button
+                    variant={cameraMode === 'indoor' ? 'default' : 'outline'}
+                    size="sm"
+                    class="goon-dock-quality-option"
+                    disabled={!engine?.canUseIndoorCamera()}
+                    title={engine?.canUseIndoorCamera()
+                      ? 'Stay inside the room while orbiting and zooming'
+                      : 'This scene needs a room boundary before Indoor Camera can be used'}
+                    onclick={() => handleCameraModeChange('indoor')}
+                  >
+                    <House class="goon-dock-control-icon" /> Indoor Camera
+                  </Button>
+                  <Button
+                    variant={cameraMode === 'free' ? 'default' : 'outline'}
+                    size="sm"
+                    class="goon-dock-quality-option"
+                    onclick={() => handleCameraModeChange('free')}
+                  >
+                    <Camera class="goon-dock-control-icon" /> Free Camera
+                  </Button>
+                </div>
+                <p class="goon-dock-popover-help">Indoor stays within the room. Free allows exterior cinematic views.</p>
+              </div>
+            </DropdownMenu.Content>
+          </DropdownMenu.Root>
+
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger
               class="goon-dock-fov-trigger"
               disabled={!goon}
               aria-label={`Field of view: ${Math.round(viewFov)}`}
@@ -3095,7 +3216,30 @@
                   step={1}
                   class="goon-dock-slider"
                 />
-                <p class="goon-dock-popover-help">Shift + Scroll adjusts FOV.</p>
+                <div class="goon-dock-framing-block">
+                  <span class="goon-dock-popover-label">Framing</span>
+                  <div class="goon-dock-framing-grid" role="group" aria-label="Goon framing">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      class="goon-dock-framing-button"
+                      onclick={() => handleDockFramePreset('headshot')}
+                    >Headshot</Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      class="goon-dock-framing-button"
+                      onclick={() => handleDockFramePreset('portrait')}
+                    >Portrait</Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      class="goon-dock-framing-button"
+                      onclick={() => handleDockFramePreset('full-body')}
+                    >Full Body</Button>
+                  </div>
+                </div>
+                <p class="goon-dock-popover-help">Scroll covers the full close-to-exterior range. FOV remains available for manual lens control.</p>
               </div>
             </DropdownMenu.Content>
           </DropdownMenu.Root>
@@ -3642,6 +3786,10 @@
     padding: 0.5rem;
   }
 
+  :global(.goon-dock-popover.is-camera) {
+    width: 292px;
+  }
+
   .goon-dock-popover-stack {
     display: flex;
     flex-direction: column;
@@ -3674,6 +3822,26 @@
     margin: 0;
   }
 
+  .goon-dock-framing-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding-top: 0.125rem;
+  }
+
+  .goon-dock-framing-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.375rem;
+  }
+
+  :global(.goon-dock-framing-button) {
+    width: 100%;
+    height: 28px;
+    padding-inline: 0.375rem;
+    font-size: 0.5625rem;
+  }
+
   .goon-dock-quality-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3685,6 +3853,7 @@
     height: 28px;
     padding: 0 0.5rem;
     font-size: 0.625rem;
+    white-space: nowrap;
   }
 
   .goon-dock-screen-reader {

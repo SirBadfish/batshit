@@ -3115,6 +3115,42 @@
     align-items: start;
   }
 
+  /* VRMA/GLB preview-format toggle on paired motion cards + the Motions stage pane */
+  .batshit-goon-motion-lane-toggle {
+    display: inline-flex;
+    overflow: hidden;
+    border: 1px solid var(--bs-settings-line);
+    border-radius: 999px;
+    background: oklch(0.095 0.009 250 / 0.58);
+  }
+
+  .batshit-goon-motion-lane-toggle-option {
+    display: inline-flex;
+    min-height: 1.32rem;
+    align-items: center;
+    padding: 0 0.52rem;
+    color: var(--bs-settings-title);
+    font-size: 0.62rem;
+    line-height: 1;
+    letter-spacing: 0.03em;
+    transition:
+      background-color 150ms ease-out,
+      color 150ms ease-out;
+  }
+
+  .batshit-goon-motion-lane-toggle-option:hover {
+    background: var(--bs-settings-hover);
+  }
+
+  .batshit-goon-motion-lane-toggle-option.is-selected {
+    background: color-mix(
+      in oklab,
+      var(--bs-settings-primary) 62%,
+      var(--bs-settings-display-surface) 38%
+    );
+    color: var(--bs-settings-primary-foreground);
+  }
+
   .batshit-goon-motion-meta-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 7.8rem), 1fr));
