@@ -226,9 +226,9 @@ When a skill operates on Batshit features, use Fabric controls directly:
 
 ### Reference the Batshit Guide for Deep Context
 
-If your skill needs the agent to understand Batshit systems in depth (artifacts, voice engines, sessions, etc.), don't try to explain everything inside the skill. Instead, tell the agent to reference the **Batshit Guide** system clip:
+If your skill needs the agent to understand Batshit systems in depth (artifacts, voice engines, sessions, etc.), don't try to explain everything inside the skill. Instead, tell the agent to invoke the **Batshit Guide** system skill (`/batshit-guide`), whose references are the official Batshit docs:
 
-> "If you need detailed information about Batshit's artifact system, reference the Batshit Guide for full platform documentation."
+> "If you need detailed information about Batshit's artifact system, invoke the Batshit Guide skill and read its artifact references."
 
 This keeps skills focused on their specific job while giving agents a clear path to deeper context when needed.
 

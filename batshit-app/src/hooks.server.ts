@@ -4,6 +4,7 @@ import { authService, resolveSessionCookieName } from '$lib/services/auth.server
 import { authRateLimiter, apiRateLimiter } from '$lib/middleware/rateLimiter'
 import { ensureSkillFilesystemStartup } from '$lib/server/services/skillRegistry'
 import { listCoreSystemPrompts } from '$lib/server/services/systemPromptRegistry'
+import { removeRetiredSystemClips } from '$lib/server/services/retiredSystemClips'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
 import { assertApiKeyEncryptionConfigured } from '$lib/services/encryption.server'
 import { isAuthRateLimitedPath, shouldApplyBroadApiRateLimit } from '$lib/middleware/rateLimitPolicy'
@@ -83,6 +84,9 @@ function ensureStartupIntegrityPass() {
   void ensureSkillFilesystemStartup()
   void listCoreSystemPrompts().catch((error) => {
     console.error('[Startup] Failed to seed core system prompt defaults:', error)
+  })
+  void removeRetiredSystemClips().catch((error) => {
+    console.error('[Startup] Failed to remove retired system clips:', error)
   })
 }
 

@@ -2,9 +2,10 @@ const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
 const sharp = require('sharp');
+const zlib = require('zlib');
 
-const CONTRACT = 'facial-artwork/v2';
-const PUBLIC_PREFIX = 'goons/facial-artwork/v2/';
+const CONTRACT = 'facial-artwork/v3';
+const PUBLIC_PREFIX = 'goons/facial-artwork/v3/';
 const ROLE_IDS = [
   'brows',
   'lashes_eye_outline',
@@ -26,7 +27,7 @@ let cachedContract = null;
 
 class FacialArtworkValidationError extends Error {
   constructor(message) {
-    super(`[facial-artwork/v2] ${message}`);
+    super(`[facial-artwork/v3] ${message}`);
     this.name = 'FacialArtworkValidationError';
     this.statusCode = 400;
   }
@@ -43,7 +44,7 @@ function sha256(buffer) {
 function resolveAssetRoot() {
   const candidates = [
     process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT,
-    path.resolve(__dirname, '../../../../batshit-app/static/goons/facial-artwork/v2')
+    path.resolve(__dirname, '../../../../batshit-app/static/goons/facial-artwork/v3')
   ].filter(Boolean);
   return candidates[0];
 }
@@ -69,29 +70,29 @@ function resolveContractAsset(root, publicPath) {
 async function loadContract() {
   if (cachedContract) return cachedContract;
   const root = resolveAssetRoot();
-  const contractPath = path.join(root, 'facial-artwork-v2.json');
+  const contractPath = path.join(root, 'facial-artwork-v3.json');
   let raw;
   try {
     raw = await fs.readFile(contractPath, 'utf8');
   } catch (error) {
     throw new Error(
-      `[facial-artwork/v2] trusted validator assets are unavailable at ${contractPath}: ${error.message}`
+      `[facial-artwork/v3] trusted validator assets are unavailable at ${contractPath}: ${error.message}`
     );
   }
   let contract;
   try {
     contract = JSON.parse(raw);
   } catch {
-    throw new Error('[facial-artwork/v2] trusted validator definition is invalid JSON');
+    throw new Error('[facial-artwork/v3] trusted validator definition is invalid JSON');
   }
   if (contract?.schemaVersion !== CONTRACT || !HASH_PATTERN.test(contract?.definitionSha256 || '')) {
-    throw new Error('[facial-artwork/v2] trusted validator definition has an unsupported contract');
+    throw new Error('[facial-artwork/v3] trusted validator definition has an unsupported contract');
   }
   if (
     !Array.isArray(contract.roles) ||
     contract.roles.map((role) => role?.id).join('|') !== ROLE_IDS.join('|')
   ) {
-    throw new Error('[facial-artwork/v2] trusted validator role inventory drifted');
+    throw new Error('[facial-artwork/v3] trusted validator role inventory drifted');
   }
   cachedContract = { root, contract };
   return cachedContract;
@@ -110,7 +111,7 @@ function parsePngChunks(buffer) {
     const dataEnd = dataStart + length;
     if (dataEnd + 4 > buffer.length) fail('PNG chunk framing is invalid');
     const expectedCrc = buffer.readUInt32BE(dataEnd);
-    const actualCrc = require('zlib').crc32(buffer.subarray(offset + 4, dataEnd));
+    const actualCrc = zlib.crc32(buffer.subarray(offset + 4, dataEnd));
     if ((actualCrc >>> 0) !== expectedCrc) fail(`PNG ${type} chunk CRC is invalid`);
     chunks.push({ type, data: buffer.subarray(dataStart, dataEnd) });
     offset = dataEnd + 4;
@@ -127,6 +128,29 @@ function parsePngChunks(buffer) {
     interlace: ihdr[12],
     types: chunks.map((chunk) => chunk.type)
   };
+}
+
+function pngChunk(type, data) {
+  const typeBytes = Buffer.from(type, 'ascii');
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(zlib.crc32(Buffer.concat([typeBytes, data])) >>> 0);
+  return Buffer.concat([length, typeBytes, data, crc]);
+}
+
+function declareCanonicalSrgb(buffer) {
+  const chunks = [buffer.subarray(0, 8)];
+  let offset = 8;
+  while (offset < buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString('ascii', offset + 4, offset + 8);
+    const end = offset + length + 12;
+    if (type !== 'sRGB' && type !== 'iCCP') chunks.push(buffer.subarray(offset, end));
+    if (type === 'IHDR') chunks.push(pngChunk('sRGB', Buffer.from([0])));
+    offset = end;
+  }
+  return Buffer.concat(chunks);
 }
 
 function parseProvenance(value) {
@@ -155,6 +179,25 @@ function parseProvenance(value) {
     license: provenance.license.trim(),
     rightsConfirmed: true
   };
+}
+
+function resolveTemplateVariant(template, orientation) {
+  if (orientation === template?.canonicalOrientation) {
+    return {
+      orientation,
+      guide: template.guide,
+      safePaintMask: template.safePaintMask,
+      semanticMap: template.semanticMap
+    };
+  }
+  if (
+    orientation === 'anatomical-right' &&
+    template?.canonicalOrientation === 'anatomical-left' &&
+    template?.mirroredHorizontalVariant?.orientation === 'anatomical-right'
+  ) {
+    return template.mirroredHorizontalVariant;
+  }
+  fail(`template ${template?.id || 'unknown'} does not support orientation ${String(orientation)}`);
 }
 
 function validateAlpha(roleId, rgba, mask, width, height) {
@@ -193,31 +236,92 @@ function validateAlpha(roleId, rgba, mask, width, height) {
   }
 }
 
-function validateEyeSeams(roleId, rgba, width, template) {
+function validateEyeSeams(roleId, rgba, width, height, template, semanticMap, palette) {
   if (roleId !== 'lashes_eye_outline') return;
-  const band = template.splits?.seamBandPixels;
   const tolerance = template.splits?.maximumJoinAlphaDelta;
-  if (!Number.isInteger(band) || !Number.isInteger(tolerance)) {
-    throw new Error('[facial-artwork/v2] trusted lashes/outline seam contract is malformed');
+  if (
+    !Number.isInteger(tolerance) ||
+    tolerance < 0 ||
+    !Buffer.isBuffer(semanticMap) ||
+    semanticMap.length !== width * height ||
+    !palette ||
+    !Number.isInteger(palette.inner_upper_transition) ||
+    !Number.isInteger(palette.inner_lower_transition) ||
+    !Number.isInteger(palette.outer_upper_transition) ||
+    !Number.isInteger(palette.outer_lower_transition)
+  ) {
+    throw new Error('[facial-artwork/v3] trusted lashes/outline seam contract is malformed');
   }
-  const pairs = [
-    [0, width - 1, 'inner canthus'],
-    [Math.floor(width / 2) - 1, Math.floor(width / 2), 'outer canthus']
-  ];
-  for (const [leftX, rightX, label] of pairs) {
-    let left = 0;
-    let right = 0;
-    for (let y = 0; y < band; y += 1) {
-      left = Math.max(left, rgba[(y * width + leftX) * 4 + 3]);
-      right = Math.max(right, rgba[(y * width + rightX) * 4 + 3]);
+
+  const joins = [
+    {
+      upper: palette.inner_upper_transition,
+      lower: palette.inner_lower_transition,
+      label: 'inner canthus'
+    },
+    {
+      upper: palette.outer_upper_transition,
+      lower: palette.outer_lower_transition,
+      label: 'outer canthus'
     }
-    if ((left === 0) !== (right === 0) || Math.abs(left - right) > tolerance) {
-      fail(`${roleId} has a discontinuous ${label} upper/lower join`);
+  ];
+  const maximumAlpha = (region) => {
+    let maximum = 0;
+    let samples = 0;
+    for (let pixel = 0; pixel < semanticMap.length; pixel += 1) {
+      if (semanticMap[pixel] === region) {
+        maximum = Math.max(maximum, rgba[pixel * 4 + 3]);
+        samples += 1;
+      }
+    }
+    if (samples === 0) {
+      throw new Error(`[facial-artwork/v3] trusted lashes semantic region ${region} is empty`);
+    }
+    return maximum;
+  };
+
+  for (const join of joins) {
+    const upper = maximumAlpha(join.upper);
+    const lower = maximumAlpha(join.lower);
+    if ((upper === 0) !== (lower === 0) || Math.abs(upper - lower) > tolerance) {
+      fail(`${roleId} has a discontinuous ${join.label} upper/lower join`);
     }
   }
 }
 
-async function validateFacialArtworkUpload(input) {
+async function loadTrustedMask(root, template, variant) {
+  const maskPath = resolveContractAsset(root, variant.safePaintMask.path);
+  const maskBytes = await fs.readFile(maskPath);
+  if (sha256(maskBytes) !== variant.safePaintMask.sha256) {
+    throw new Error(`[facial-artwork/v3] trusted safe mask hash drifted for ${template.id}`);
+  }
+  const mask = await sharp(maskBytes, { failOn: 'error' }).greyscale().raw().toBuffer();
+  const [width, height] = template.dimensions;
+  if (mask.length !== width * height) {
+    throw new Error(`[facial-artwork/v3] trusted safe mask channels drifted for ${template.id}`);
+  }
+  return mask;
+}
+
+async function loadTrustedSemanticMap(root, template, variant) {
+  const record = variant.semanticMap;
+  if (!record?.path || !record?.sha256 || record.channels !== 'L8' || !record.palette) {
+    throw new Error(`[facial-artwork/v3] trusted semantic map is missing for ${template.id}`);
+  }
+  const semanticPath = resolveContractAsset(root, record.path);
+  const semanticBytes = await fs.readFile(semanticPath);
+  if (sha256(semanticBytes) !== record.sha256) {
+    throw new Error(`[facial-artwork/v3] trusted semantic map hash drifted for ${template.id}`);
+  }
+  const semanticMap = await sharp(semanticBytes, { failOn: 'error' }).greyscale().raw().toBuffer();
+  const [width, height] = template.dimensions;
+  if (semanticMap.length !== width * height) {
+    throw new Error(`[facial-artwork/v3] trusted semantic map channels drifted for ${template.id}`);
+  }
+  return { semanticMap, palette: record.palette };
+}
+
+async function prepareFacialArtworkUpload(input) {
   const { root, contract } = await loadContract();
   const roleId = String(input.role || '');
   const role = contract.roles.find((candidate) => candidate.id === roleId);
@@ -226,59 +330,141 @@ async function validateFacialArtworkUpload(input) {
     fail('definitionSha256 does not match the current template definition');
   }
   const template = contract.templates.find((candidate) => candidate.id === role.template);
+  const variant = resolveTemplateVariant(template, input.orientation);
   if (
     input.templateId !== template?.id ||
     input.templateVersion !== template?.version ||
-    input.guideSha256 !== template?.guide?.sha256
+    input.guideSha256 !== variant?.guide?.sha256 ||
+    input.maskSha256 !== variant?.safePaintMask?.sha256
   ) {
-    fail('template identity/version/guide hash does not match the selected role');
+    fail('template identity/version/orientation/guide/mask does not match the selected role');
   }
-  const png = parsePngChunks(input.buffer);
+  const sourcePng = parsePngChunks(input.buffer);
+  if (
+    sourcePng.width !== template.dimensions[0] ||
+    sourcePng.height !== template.dimensions[1]
+  ) {
+    fail(`${roleId} must use the exact ${template.dimensions.join('x')} template dimensions`);
+  }
+  if (sourcePng.bitDepth !== 8) {
+    fail(`${roleId} must use 8-bit PNG channels`);
+  }
+  const sourceMetadata = await sharp(input.buffer, {
+    failOn: 'error',
+    limitInputPixels: 2048 * 2048
+  }).metadata();
+  if (
+    sourceMetadata.format !== 'png' ||
+    sourceMetadata.depth !== 'uchar' ||
+    (sourceMetadata.pages ?? 1) !== 1
+  ) {
+    fail(`${roleId} must be a single-frame 8-bit PNG`);
+  }
+
+  const decoded = await sharp(input.buffer, {
+    failOn: 'error',
+    limitInputPixels: 2048 * 2048
+  })
+    .toColourspace('srgb')
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  if (
+    decoded.info.width !== sourcePng.width ||
+    decoded.info.height !== sourcePng.height ||
+    decoded.info.channels !== 4
+  ) {
+    fail(`${roleId} could not be prepared as RGBA artwork`);
+  }
+
+  const mask = await loadTrustedMask(root, template, variant);
+  const semantic =
+    roleId === 'lashes_eye_outline'
+      ? await loadTrustedSemanticMap(root, template, variant)
+      : null;
+  const rgba = Buffer.from(decoded.data);
+  let clippedAlphaPixels = 0;
+  let clearedTransparentRgbPixels = 0;
+  for (let pixel = 0; pixel < sourcePng.width * sourcePng.height; pixel += 1) {
+    const offset = pixel * 4;
+    const sourceAlpha = rgba[offset + 3];
+    const preparedAlpha = Math.min(sourceAlpha, mask[pixel]);
+    if (preparedAlpha !== sourceAlpha) clippedAlphaPixels += 1;
+    rgba[offset + 3] = preparedAlpha;
+    if (preparedAlpha === 0 && (rgba[offset] !== 0 || rgba[offset + 1] !== 0 || rgba[offset + 2] !== 0)) {
+      rgba.fill(0, offset, offset + 3);
+      clearedTransparentRgbPixels += 1;
+    }
+  }
+
+  const encoded = await sharp(rgba, {
+    raw: { width: sourcePng.width, height: sourcePng.height, channels: 4 }
+  })
+    .png({ progressive: false, compressionLevel: 9, adaptiveFiltering: true, palette: false })
+    .toBuffer();
+  const buffer = declareCanonicalSrgb(encoded);
+  const png = parsePngChunks(buffer);
   if (
     png.width !== template.dimensions[0] ||
     png.height !== template.dimensions[1] ||
     png.bitDepth !== 8 ||
     png.colorType !== 6 ||
-    png.interlace !== 0
+    png.interlace !== 0 ||
+    !png.types.includes('sRGB') ||
+    png.types.includes('iCCP')
   ) {
-    fail(`${roleId} must be an exact ${template.dimensions.join('x')} non-interlaced RGBA8 PNG`);
+    throw new Error(`[facial-artwork/v3] canonical PNG preparation drifted for ${roleId}`);
   }
-  if (!png.types.includes('sRGB') || png.types.includes('iCCP')) {
-    fail(`${roleId} must declare canonical sRGB without an embedded ICC profile`);
-  }
-  const metadata = await sharp(input.buffer, { failOn: 'error', limitInputPixels: 2048 * 2048 })
-    .metadata();
-  if (metadata.format !== 'png' || metadata.channels !== 4 || metadata.depth !== 'uchar') {
-    fail(`${roleId} decoder metadata is not RGBA8 PNG`);
-  }
-  const rgba = await sharp(input.buffer, { failOn: 'error', limitInputPixels: 2048 * 2048 })
-    .raw()
-    .toBuffer();
-  const maskPath = resolveContractAsset(root, template.safePaintMask.path);
-  const maskBytes = await fs.readFile(maskPath);
-  if (sha256(maskBytes) !== template.safePaintMask.sha256) {
-    throw new Error(`[facial-artwork/v2] trusted safe mask hash drifted for ${template.id}`);
-  }
-  const mask = await sharp(maskBytes, { failOn: 'error' }).greyscale().raw().toBuffer();
-  if (mask.length !== png.width * png.height) {
-    throw new Error(`[facial-artwork/v2] trusted safe mask channels drifted for ${template.id}`);
+  const canonicalMetadata = await sharp(buffer, {
+    failOn: 'error',
+    limitInputPixels: 2048 * 2048
+  }).metadata();
+  if (
+    canonicalMetadata.format !== 'png' ||
+    canonicalMetadata.channels !== 4 ||
+    canonicalMetadata.depth !== 'uchar' ||
+    canonicalMetadata.hasProfile === true
+  ) {
+    throw new Error(`[facial-artwork/v3] canonical decoder metadata drifted for ${roleId}`);
   }
   validateAlpha(roleId, rgba, mask, png.width, png.height);
-  validateEyeSeams(roleId, rgba, png.width, template);
+  validateEyeSeams(
+    roleId,
+    rgba,
+    png.width,
+    png.height,
+    template,
+    semantic?.semanticMap,
+    semantic?.palette
+  );
   const provenance = parseProvenance(input.provenance);
-  return {
+  const artwork = {
     role: roleId,
     definitionSha256: contract.definitionSha256,
     template: {
       id: template.id,
       version: template.version,
-      guideSha256: template.guide.sha256
+      orientation: variant.orientation,
+      guideSha256: variant.guide.sha256,
+      maskSha256: variant.safePaintMask.sha256
     },
     provenance,
-    sha256: sha256(input.buffer),
+    sha256: sha256(buffer),
     width: png.width,
     height: png.height,
     mimeType: 'image/png'
+  };
+  return {
+    buffer,
+    artwork,
+    preparation: {
+      sourceSha256: sha256(input.buffer),
+      canonicalSha256: artwork.sha256,
+      colorSpaceNormalized:
+        !sourcePng.types.includes('sRGB') || sourcePng.types.includes('iCCP'),
+      clippedAlphaPixels,
+      clearedTransparentRgbPixels
+    }
   };
 }
 
@@ -289,5 +475,5 @@ function clearFacialArtworkContractCacheForTests() {
 module.exports = {
   FacialArtworkValidationError,
   clearFacialArtworkContractCacheForTests,
-  validateFacialArtworkUpload
+  prepareFacialArtworkUpload
 };

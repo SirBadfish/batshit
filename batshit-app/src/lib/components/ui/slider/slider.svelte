@@ -67,10 +67,14 @@
 		{/if}
 	</span>
 	<SliderPrimitive.Thumb
-	index={0}
-	class={cn(
-		"bs-slider-thumb",
-		thumbShape === "bar" ? "is-bar" : "is-round"
-	)}
-/>
+		index={0}
+		aria-label={restProps['aria-label']}
+		aria-labelledby={restProps['aria-labelledby']}
+		aria-describedby={restProps['aria-describedby']}
+		aria-valuetext={restProps['aria-valuetext']}
+		class={cn(
+			"bs-slider-thumb",
+			thumbShape === "bar" ? "is-bar" : "is-round"
+		)}
+	/>
 </SliderPrimitive.Root>

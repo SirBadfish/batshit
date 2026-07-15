@@ -1,5 +1,5 @@
 import type { AppearanceDialValueState } from '$lib/goons/appearanceDials'
-import type { FacialArtworkStateV2 } from '$lib/goons/facialArtwork'
+import type { FacialArtworkStateV3 } from '$lib/goons/facialArtwork'
 import type { EyeAppearanceStateV1 } from '$lib/goons/eyeAppearance'
 
 export type GoonCompatibilityTier = 'A' | 'B' | 'C' | 'pending'
@@ -598,7 +598,7 @@ export interface GoonRecord {
   /** Versioned first-party appearance state (avatar.json#appearanceDials contract). */
   appearanceDials?: AppearanceDialValueState | null
   /** Recipe-owned facial artwork state, bound to avatar.json#facialArtwork. */
-  facialArtwork?: FacialArtworkStateV2 | null
+  facialArtwork?: FacialArtworkStateV3 | null
   /** Package-owned linked physical eye state, bound to avatar.json#eyeAppearance. */
   eyeAppearance?: EyeAppearanceStateV1 | null
   guidedAvatar?: GoonGuidedAvatarFiles

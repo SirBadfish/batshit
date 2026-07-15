@@ -56,7 +56,7 @@
     showAnchorMarker={range[0] < 0 && range[1] > 0}
     aria-label={label}
     aria-describedby={helpId}
-    aria-valuetext={`${formatValue(value)}, zero is the package-fitted result`}
+    aria-valuetext={formatValue(value)}
     {disabled}
     onValueChange={(nextValue: number | number[]) => onChange(normalizeSliderValue(nextValue))}
   />

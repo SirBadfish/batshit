@@ -1,5 +1,5 @@
-export const FACIAL_ARTWORK_SCHEMA_VERSION = 'facial-artwork/v2' as const
-export const FACIAL_ARTWORK_STATE_SCHEMA_VERSION = 'facial-artwork-state/v2' as const
+export const FACIAL_ARTWORK_SCHEMA_VERSION = 'facial-artwork/v3' as const
+export const FACIAL_ARTWORK_STATE_SCHEMA_VERSION = 'facial-artwork-state/v3' as const
 
 export const FACIAL_ARTWORK_ROLE_IDS = [
   'brows',
@@ -12,6 +12,10 @@ export const FACIAL_ARTWORK_ROLE_IDS = [
 
 export type FacialArtworkRoleId = (typeof FACIAL_ARTWORK_ROLE_IDS)[number]
 export type FacialArtworkSide = 'left' | 'right'
+export type FacialArtworkOrientation =
+  | 'orientation-neutral'
+  | 'anatomical-left'
+  | 'anatomical-right'
 export type FacialArtworkBilateralMode = 'shared' | 'per-eye'
 export type FacialArtworkMapping = 'planar' | 'radial' | 'longitude'
 export type FacialArtworkRgb = [number, number, number]
@@ -49,7 +53,9 @@ export type FacialArtworkUpload = {
   template: {
     id: string
     version: string
+    orientation: FacialArtworkOrientation
     guideSha256: string
+    maskSha256: string
   }
   provenance: FacialArtworkProvenance
 }
@@ -78,20 +84,48 @@ export type FacialArtworkEyeState = {
 
 export type FacialArtworkRoleState = FacialArtworkBilateral<FacialArtworkEyeState>
 
-export type FacialArtworkStateV2 = {
+export type FacialArtworkStateV3 = {
   schemaVersion: typeof FACIAL_ARTWORK_STATE_SCHEMA_VERSION
   definitionSha256: string
   templateSet: { id: string; version: string }
   roles: Record<FacialArtworkRoleId, FacialArtworkRoleState>
 }
 
+export type FacialArtworkAsset = { path: string; sha256: string }
+
+export type FacialArtworkMaskAsset = FacialArtworkAsset
+export type FacialArtworkSemanticMapAsset = FacialArtworkAsset & {
+  palette: Record<string, number>
+}
+
+export type FacialArtworkMirroredHorizontalVariant = {
+  orientation: 'anatomical-right'
+  label: string
+  guide: FacialArtworkAsset
+  safePaintMask: FacialArtworkMaskAsset
+  semanticMap?: FacialArtworkSemanticMapAsset
+}
+
 export type FacialArtworkTemplate = {
   id: string
   version: string
   dimensions: [number, number]
-  guide: { path: string; sha256: string }
-  safePaintMask: { path: string; sha256: string }
-  transparentBlank: { path: string; sha256: string }
+  guide: FacialArtworkAsset
+  safePaintMask: FacialArtworkMaskAsset
+  transparentBlank: FacialArtworkAsset
+  semanticMap?: FacialArtworkSemanticMapAsset
+  canonicalOrientation: 'orientation-neutral' | 'anatomical-left'
+  transformOriginUv: [number, number]
+  mirroredHorizontalVariant?: FacialArtworkMirroredHorizontalVariant
+  orientationReference?: FacialArtworkAsset
+}
+
+export type FacialArtworkTemplateVariant = {
+  orientation: FacialArtworkOrientation
+  label: string
+  guide: FacialArtworkAsset
+  safePaintMask: FacialArtworkMaskAsset
+  semanticMap?: FacialArtworkSemanticMapAsset
 }
 
 export type FacialArtworkRuntimeTarget = {
@@ -116,13 +150,14 @@ export type FacialArtworkRoleDefinition = {
   template: string
   ownership: 'canvas' | 'lit-surface' | 'lit-overlay'
   mapping: FacialArtworkMapping
+  artworkScaleCalibration: number
   target: Record<FacialArtworkSide, FacialArtworkRuntimeTarget>
   defaultEyeState: FacialArtworkEyeState
   defaultMode: FacialArtworkBilateralMode
   bounds: FacialArtworkPlanarBounds | FacialArtworkLongitudeBounds
 }
 
-export type FacialArtworkDefinitionV2 = {
+export type FacialArtworkDefinitionV3 = {
   schemaVersion: typeof FACIAL_ARTWORK_SCHEMA_VERSION
   stateSchemaVersion: typeof FACIAL_ARTWORK_STATE_SCHEMA_VERSION
   productExportApproved: false
@@ -133,7 +168,7 @@ export type FacialArtworkDefinitionV2 = {
 }
 
 export type FacialArtworkReconciliation = {
-  state: FacialArtworkStateV2 | null
+  state: FacialArtworkStateV3 | null
   incompatible: boolean
   reason?: string
 }
@@ -146,10 +181,10 @@ const SOURCE_KINDS = new Set<FacialArtworkProvenance['sourceKind']>([
   'approved-external'
 ])
 const COLOR_ROLES = new Set<FacialArtworkRoleId>(['iris', 'pupil', 'sclera'])
-const PUBLIC_PREFIX = 'goons/facial-artwork/v2/'
+const PUBLIC_PREFIX = 'goons/facial-artwork/v3/'
 
 function fail(message: string): never {
-  throw new Error(`[facial-artwork/v2] ${message}`)
+  throw new Error(`[facial-artwork/v3] ${message}`)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -223,7 +258,7 @@ function publicPath(value: unknown, context: string): string {
     parsed.split('/').includes('..') ||
     parsed.includes('_private')
   ) {
-    fail(`${context} must use the canonical public v2 asset root`)
+    fail(`${context} must use the canonical public v3 asset root`)
   }
   return parsed
 }
@@ -253,7 +288,12 @@ function parseTemplate(value: unknown, context: string): FacialArtworkTemplate {
       'pixelContract',
       'guide',
       'safePaintMask',
+      'semanticMap',
       'transparentBlank',
+      'canonicalOrientation',
+      'transformOriginUv',
+      'mirroredHorizontalVariant',
+      'orientationReference',
       'landmarks',
       'splits'
     ],
@@ -277,6 +317,28 @@ function parseTemplate(value: unknown, context: string): FacialArtworkTemplate {
       sha256: hash(asset.sha256, `${assetContext}.sha256`)
     }
   }
+  const parseSemanticMap = (assetValue: unknown, assetContext: string): FacialArtworkSemanticMapAsset => {
+    const asset = record(assetValue, assetContext)
+    rejectUnknownKeys(asset, ['path', 'sha256', 'channels', 'palette'], assetContext)
+    if (stringValue(asset.channels, `${assetContext}.channels`) !== 'L8') {
+      fail(`${assetContext}.channels must be L8`)
+    }
+    const paletteSource = record(asset.palette, `${assetContext}.palette`)
+    const palette: Record<string, number> = {}
+    for (const [key, value] of Object.entries(paletteSource)) {
+      const parsed = finite(value, `${assetContext}.palette.${key}`)
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 255) {
+        fail(`${assetContext}.palette.${key} must be an integer inside [0, 255]`)
+      }
+      palette[key] = parsed
+    }
+    if (Object.keys(palette).length === 0) fail(`${assetContext}.palette cannot be empty`)
+    return {
+      path: publicPath(asset.path, `${assetContext}.path`),
+      sha256: hash(asset.sha256, `${assetContext}.sha256`),
+      palette
+    }
+  }
   const pixelContract = record(source.pixelContract, `${context}.pixelContract`)
   rejectUnknownKeys(
     pixelContract,
@@ -296,14 +358,77 @@ function parseTemplate(value: unknown, context: string): FacialArtworkTemplate {
   if (!dimensions.every(Number.isInteger) || dimensions.some((entry) => entry <= 0)) {
     fail(`${context}.dimensions must be positive integers`)
   }
+  const canonicalOrientation = source.canonicalOrientation
+  if (canonicalOrientation !== 'orientation-neutral' && canonicalOrientation !== 'anatomical-left') {
+    fail(`${context}.canonicalOrientation must be orientation-neutral or anatomical-left`)
+  }
+  const transformOriginUv = tuple2Numbers(source.transformOriginUv, `${context}.transformOriginUv`)
+  if (transformOriginUv.some((entry) => entry < 0 || entry > 1)) {
+    fail(`${context}.transformOriginUv must stay inside normalized UV space`)
+  }
+  let mirroredHorizontalVariant: FacialArtworkMirroredHorizontalVariant | undefined
+  if (source.mirroredHorizontalVariant !== undefined) {
+    const variant = record(source.mirroredHorizontalVariant, `${context}.mirroredHorizontalVariant`)
+    rejectUnknownKeys(
+      variant,
+      ['orientation', 'label', 'guide', 'safePaintMask', 'semanticMap'],
+      `${context}.mirroredHorizontalVariant`
+    )
+    if (variant.orientation !== 'anatomical-right') {
+      fail(`${context}.mirroredHorizontalVariant.orientation must be anatomical-right`)
+    }
+    mirroredHorizontalVariant = {
+      orientation: 'anatomical-right',
+      label: stringValue(variant.label, `${context}.mirroredHorizontalVariant.label`),
+      guide: parseAsset(variant.guide, `${context}.mirroredHorizontalVariant.guide`),
+      safePaintMask: parseAsset(
+        variant.safePaintMask,
+        `${context}.mirroredHorizontalVariant.safePaintMask`,
+        true
+      ),
+      ...(variant.semanticMap === undefined
+        ? {}
+        : {
+            semanticMap: parseSemanticMap(
+              variant.semanticMap,
+              `${context}.mirroredHorizontalVariant.semanticMap`
+            )
+          })
+    }
+  }
+  if (canonicalOrientation === 'orientation-neutral' && mirroredHorizontalVariant) {
+    fail(`${context} cannot add an anatomical-right variant to an orientation-neutral template`)
+  }
+  if (canonicalOrientation === 'anatomical-left' && !mirroredHorizontalVariant) {
+    fail(`${context} must provide the deterministic anatomical-right variant`)
+  }
   return {
     id: stringValue(source.id, `${context}.id`),
     version: stringValue(source.version, `${context}.version`),
     dimensions,
     guide: parseAsset(source.guide, `${context}.guide`),
     safePaintMask: parseAsset(source.safePaintMask, `${context}.safePaintMask`, true),
-    transparentBlank: parseAsset(source.transparentBlank, `${context}.transparentBlank`)
+    transparentBlank: parseAsset(source.transparentBlank, `${context}.transparentBlank`),
+    ...(source.semanticMap === undefined
+      ? {}
+      : { semanticMap: parseSemanticMap(source.semanticMap, `${context}.semanticMap`) }),
+    canonicalOrientation,
+    transformOriginUv,
+    ...(mirroredHorizontalVariant ? { mirroredHorizontalVariant } : {}),
+    ...(source.orientationReference === undefined
+      ? {}
+      : {
+          orientationReference: parseAsset(
+            source.orientationReference,
+            `${context}.orientationReference`
+          )
+        })
   }
+}
+
+function tuple2Numbers(value: unknown, context: string): [number, number] {
+  if (!Array.isArray(value) || value.length !== 2) fail(`${context} must contain two numbers`)
+  return [finite(value[0], `${context}[0]`), finite(value[1], `${context}[1]`)]
 }
 
 function validateEvidenceValue(value: unknown, context: string): void {
@@ -357,6 +482,36 @@ function parseBounds(value: unknown, mapping: FacialArtworkMapping, context: str
   return result
 }
 
+export function resolveFacialArtworkTemplateVariant(
+  template: FacialArtworkTemplate,
+  orientation: FacialArtworkOrientation
+): FacialArtworkTemplateVariant {
+  if (orientation === template.canonicalOrientation) {
+    const anatomicalFeature = template.id.includes('brow') ? 'Brow' : 'Eye'
+    return {
+      orientation,
+      label:
+        orientation === 'anatomical-left'
+          ? `Goon's Left ${anatomicalFeature} (viewer's right)`
+          : 'Orientation-neutral',
+      guide: template.guide,
+      safePaintMask: template.safePaintMask
+    }
+  }
+  if (orientation === 'anatomical-right' && template.mirroredHorizontalVariant) {
+    return template.mirroredHorizontalVariant
+  }
+  fail(`${template.id} does not support ${orientation}`)
+}
+
+export function resolveFacialArtworkTemplateOrientation(
+  template: FacialArtworkTemplate,
+  side: FacialArtworkSide | 'shared'
+): FacialArtworkOrientation {
+  if (template.canonicalOrientation === 'orientation-neutral') return 'orientation-neutral'
+  return side === 'right' ? 'anatomical-right' : 'anatomical-left'
+}
+
 function parseUpload(
   value: unknown,
   role: FacialArtworkRoleDefinition,
@@ -372,13 +527,27 @@ function parseUpload(
   if (source.role !== role.id) fail(`${context}.role must equal ${role.id}`)
   if (source.mimeType !== 'image/png') fail(`${context}.mimeType must be image/png`)
   const templateProof = record(source.template, `${context}.template`)
-  rejectUnknownKeys(templateProof, ['id', 'version', 'guideSha256'], `${context}.template`)
+  rejectUnknownKeys(
+    templateProof,
+    ['id', 'version', 'orientation', 'guideSha256', 'maskSha256'],
+    `${context}.template`
+  )
+  const orientation = templateProof.orientation as FacialArtworkOrientation
+  if (
+    orientation !== 'orientation-neutral' &&
+    orientation !== 'anatomical-left' &&
+    orientation !== 'anatomical-right'
+  ) {
+    fail(`${context}.template.orientation is unsupported`)
+  }
+  const variant = resolveFacialArtworkTemplateVariant(template, orientation)
   if (
     templateProof.id !== template.id ||
     templateProof.version !== template.version ||
-    templateProof.guideSha256 !== template.guide.sha256
+    templateProof.guideSha256 !== variant.guide.sha256 ||
+    templateProof.maskSha256 !== variant.safePaintMask.sha256
   ) {
-    fail(`${context}.template does not match the bound guide identity`)
+    fail(`${context}.template does not match the bound orientation, guide, and mask identity`)
   }
   const size = finite(source.size, `${context}.size`)
   if (!Number.isInteger(size) || size <= 0) fail(`${context}.size must be a positive integer`)
@@ -391,7 +560,13 @@ function parseUpload(
     size,
     mimeType: 'image/png',
     sha256: hash(source.sha256, `${context}.sha256`),
-    template: { id: template.id, version: template.version, guideSha256: template.guide.sha256 },
+    template: {
+      id: template.id,
+      version: template.version,
+      orientation,
+      guideSha256: variant.guide.sha256,
+      maskSha256: variant.safePaintMask.sha256
+    },
     provenance: parseProvenance(source.provenance, `${context}.provenance`)
   }
 }
@@ -490,6 +665,7 @@ function parseRoleDefinition(
       'symmetry',
       'submissionBounds',
       'mapping',
+      'artworkScaleCalibration',
       'target',
       'defaultEyeState',
       'defaultMode',
@@ -527,12 +703,19 @@ function parseRoleDefinition(
     template: templateId,
     ownership: ownership as FacialArtworkRoleDefinition['ownership'],
     mapping: mapping as FacialArtworkMapping,
+    artworkScaleCalibration: finite(
+      source.artworkScaleCalibration,
+      `${context}.artworkScaleCalibration`
+    ),
     target: {
       left: parseRuntimeTarget(targetSource.left, `${context}.target.left`),
       right: parseRuntimeTarget(targetSource.right, `${context}.target.right`)
     },
     defaultMode: defaultMode as FacialArtworkBilateralMode,
     bounds: parseBounds(source.bounds, mapping as FacialArtworkMapping, `${context}.bounds`)
+  }
+  if (partial.artworkScaleCalibration <= 0) {
+    fail(`${context}.artworkScaleCalibration must be greater than zero`)
   }
   const defaultEyeState = parseEyeState(
     source.defaultEyeState,
@@ -578,7 +761,7 @@ function validateRichDefinitionMetadata(source: Record<string, unknown>) {
   const stateModel = record(source.stateModel, 'definition.stateModel')
   rejectUnknownKeys(
     stateModel,
-    ['roles', 'bilateral', 'sharedMirroring', 'overrideOwnership', 'cleanBreak'],
+    ['roles', 'bilateral', 'sharedMirroring', 'overrideOwnership', 'orientationLaw', 'cleanBreak'],
     'definition.stateModel'
   )
   Object.entries(stateModel).forEach(([key, value]) => stringValue(value, `definition.stateModel.${key}`))
@@ -619,7 +802,7 @@ function validateRichDefinitionMetadata(source: Record<string, unknown>) {
     )
   )
   if (allowedKinds.size !== SOURCE_KINDS.size || [...SOURCE_KINDS].some((entry) => !allowedKinds.has(entry))) {
-    fail('definition.provenanceContract.allowedSourceKinds does not match the v2 upload contract')
+    fail('definition.provenanceContract.allowedSourceKinds does not match the v3 upload contract')
   }
   if (provenance.rightsConfirmedMustBe !== true) {
     fail('definition.provenanceContract.rightsConfirmedMustBe must be true')
@@ -669,7 +852,7 @@ function validateRichDefinitionMetadata(source: Record<string, unknown>) {
   topology.nodes.forEach((entry, index) => validateEvidenceValue(entry, `definition.topologyFreeze.nodes[${index}]`))
 }
 
-export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefinitionV2 {
+export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefinitionV3 {
   const source = record(value, 'definition')
   rejectUnknownKeys(
     source,
@@ -716,7 +899,7 @@ export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefin
     !Array.isArray(source.roles) ||
     source.roles.length !== FACIAL_ARTWORK_ROLE_IDS.length
   ) {
-    fail('definition.roles must contain exactly the six v2 product roles')
+    fail('definition.roles must contain exactly the six v3 product roles')
   }
   const roleSources = source.roles as unknown[]
   const roles = FACIAL_ARTWORK_ROLE_IDS.map((id, index) =>
@@ -750,8 +933,8 @@ function cloneValue<T>(value: T): T {
 }
 
 export function createDefaultFacialArtworkState(
-  definition: FacialArtworkDefinitionV2
-): FacialArtworkStateV2 {
+  definition: FacialArtworkDefinitionV3
+): FacialArtworkStateV3 {
   const roles = {} as Record<FacialArtworkRoleId, FacialArtworkRoleState>
   for (const role of definition.roles) {
     const eye = cloneValue(role.defaultEyeState)
@@ -769,9 +952,9 @@ export function createDefaultFacialArtworkState(
 }
 
 export function parseFacialArtworkState(
-  definition: FacialArtworkDefinitionV2,
+  definition: FacialArtworkDefinitionV3,
   value: unknown
-): FacialArtworkStateV2 {
+): FacialArtworkStateV3 {
   const source = record(value, 'state')
   rejectUnknownKeys(source, ['schemaVersion', 'definitionSha256', 'templateSet', 'roles'], 'state')
   if (source.schemaVersion !== FACIAL_ARTWORK_STATE_SCHEMA_VERSION) {
@@ -793,7 +976,7 @@ export function parseFacialArtworkState(
     Object.keys(roleSource).length !== FACIAL_ARTWORK_ROLE_IDS.length ||
     FACIAL_ARTWORK_ROLE_IDS.some((id) => !Object.hasOwn(roleSource, id))
   ) {
-    fail('state.roles must contain exactly the six v2 product roles')
+    fail('state.roles must contain exactly the six v3 product roles')
   }
   const templates = new Map(definition.templates.map((template) => [template.id, template]))
   const definitions = new Map(definition.roles.map((role) => [role.id, role]))
@@ -828,7 +1011,7 @@ export function parseFacialArtworkState(
 }
 
 export function reconcileFacialArtworkState(
-  definition: FacialArtworkDefinitionV2,
+  definition: FacialArtworkDefinitionV3,
   value: unknown
 ): FacialArtworkReconciliation {
   if (value === null || value === undefined) return { state: null, incompatible: false }
@@ -844,14 +1027,14 @@ export function reconcileFacialArtworkState(
 }
 
 export function resolveFacialArtworkState(
-  definition: FacialArtworkDefinitionV2,
-  value: FacialArtworkStateV2 | null | undefined
-): FacialArtworkStateV2 {
+  definition: FacialArtworkDefinitionV3,
+  value: FacialArtworkStateV3 | null | undefined
+): FacialArtworkStateV3 {
   return value ? parseFacialArtworkState(definition, value) : createDefaultFacialArtworkState(definition)
 }
 
 export function resolveFacialArtworkEyeState(
-  state: FacialArtworkStateV2,
+  state: FacialArtworkStateV3,
   roleId: FacialArtworkRoleId,
   side: FacialArtworkSide
 ): FacialArtworkEyeState {
@@ -860,7 +1043,7 @@ export function resolveFacialArtworkEyeState(
 }
 
 export function createFacialArtworkArtworkLayer(
-  definition: FacialArtworkDefinitionV2,
+  definition: FacialArtworkDefinitionV3,
   roleId: FacialArtworkRoleId,
   upload: FacialArtworkUpload
 ): FacialArtworkArtworkLayer {
@@ -892,7 +1075,7 @@ export function resolveFacialArtworkAssetUrl(path: string): string {
   return `/${publicPath(path, 'asset path')}`
 }
 
-export function collectFacialArtworkUploads(value: FacialArtworkStateV2 | null | undefined) {
+export function collectFacialArtworkUploads(value: FacialArtworkStateV3 | null | undefined) {
   const uploads = new Map<string, FacialArtworkUpload>()
   if (!value) return []
   for (const role of Object.values(value.roles)) {
@@ -905,6 +1088,6 @@ export function collectFacialArtworkUploads(value: FacialArtworkStateV2 | null |
   return [...uploads.values()]
 }
 
-export function collectFacialArtworkUploadUrls(value: FacialArtworkStateV2 | null | undefined) {
+export function collectFacialArtworkUploadUrls(value: FacialArtworkStateV3 | null | undefined) {
   return new Set(collectFacialArtworkUploads(value).map((upload) => upload.url))
 }

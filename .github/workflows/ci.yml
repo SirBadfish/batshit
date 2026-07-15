@@ -199,3 +199,7 @@ jobs:
             exit 1
           fi
           echo "No \$derived(fn) bug-pattern instances."
+      - name: Skill reference mirror gates (UserDocs -> batshit-guide, in-app -> portable)
+        run: |
+          node tools/system-skills/sync-userdocs-skill-references.mjs --check
+          node tools/portable-skills/sync-portable-skills.mjs --check

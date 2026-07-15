@@ -1,11 +1,13 @@
 <script lang="ts">
   import type { Snippet } from 'svelte'
   import { ChevronDown, RotateCcw } from '@lucide/svelte'
+  import * as Collapsible from '$lib/components/ui/collapsible'
+  import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
 
   type Props = {
     id: string
     title: string
-    summary: string
+    info?: string | string[]
     open: boolean
     changed?: boolean
     disabled?: boolean
@@ -17,7 +19,7 @@
   let {
     id,
     title,
-    summary,
+    info = [],
     open,
     changed = false,
     disabled = false,
@@ -28,27 +30,36 @@
 
   const triggerId = $derived(`facial-artwork-${id}-trigger`)
   const panelId = $derived(`facial-artwork-${id}-panel`)
+  const infoLines = $derived(Array.isArray(info) ? info : [info])
 </script>
 
-<section class="facial-artwork-accordion" data-state={open ? 'open' : 'closed'}>
-  <div class="facial-artwork-accordion-heading">
+<Collapsible.Root {open} class="goon-level-3-accordion facial-artwork-accordion">
+  <div class="goon-level-3-accordion-header facial-artwork-accordion-heading">
     <button
       id={triggerId}
       type="button"
       class="facial-artwork-accordion-trigger"
+      aria-label={title}
       aria-expanded={open}
       aria-controls={panelId}
       onclick={onToggle}
-    >
-      <span class="facial-artwork-accordion-copy">
-        <span class="facial-artwork-accordion-title">{title}</span>
-        <span class="facial-artwork-accordion-summary">{summary}</span>
-      </span>
-      <span class="facial-artwork-accordion-meta">
-        {#if changed}<span class="facial-artwork-changed">Changed</span>{/if}
-        <ChevronDown aria-hidden="true" class={open ? 'open' : ''} />
-      </span>
-    </button>
+    ></button>
+    <span class="facial-artwork-accordion-title-line">
+      <span class="goon-level-3-accordion-title">{title}</span>
+      {#if infoLines.length > 0}
+        <span class="facial-artwork-accordion-info">
+          <SettingsInfoMenu ariaLabel={`About ${title}`} contentClass="w-80">
+            {#each infoLines as line}
+              <p>{line}</p>
+            {/each}
+          </SettingsInfoMenu>
+        </span>
+      {/if}
+    </span>
+    <span class="facial-artwork-accordion-meta">
+      {#if changed}<span class="facial-artwork-changed">Changed</span>{/if}
+      <ChevronDown aria-hidden="true" class="facial-artwork-chevron" data-open={open} />
+    </span>
     {#if changed}
       <button
         type="button"
@@ -63,82 +74,70 @@
     {/if}
   </div>
 
-  {#if open}
-    <div
-      id={panelId}
-      class="facial-artwork-accordion-panel"
-      role="region"
-      aria-labelledby={triggerId}
-    >
-      {@render children?.()}
-    </div>
-  {/if}
-</section>
+  <Collapsible.Content
+    id={panelId}
+    class="goon-level-3-accordion-content facial-artwork-accordion-panel"
+    role="region"
+    aria-labelledby={triggerId}
+  >
+    {@render children?.()}
+  </Collapsible.Content>
+</Collapsible.Root>
 
 <style>
-  .facial-artwork-accordion {
-    overflow: hidden;
+  :global(.facial-artwork-accordion) {
     min-width: 0;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--background);
-  }
-
-  .facial-artwork-accordion[data-state='open'] {
-    border-color: color-mix(in oklch, var(--primary) 32%, var(--border));
   }
 
   .facial-artwork-accordion-heading,
   .facial-artwork-accordion-trigger,
+  .facial-artwork-accordion-title-line,
   .facial-artwork-accordion-meta {
     display: flex;
     align-items: center;
   }
 
   .facial-artwork-accordion-heading {
-    min-width: 0;
+    position: relative;
+    min-height: 2.14rem;
+    padding: 0;
   }
 
   .facial-artwork-accordion-trigger {
-    flex: 1;
-    min-width: 0;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 9px 10px;
+    position: absolute;
+    z-index: 0;
+    inset: 0;
+    width: 100%;
+    padding: 0;
+    color: inherit;
     text-align: left;
   }
 
-  .facial-artwork-accordion-trigger:hover,
-  .facial-artwork-accordion-reset:hover:not(:disabled) {
-    background: var(--muted);
-  }
-
-  .facial-artwork-accordion-copy {
-    display: flex;
+  .facial-artwork-accordion-title-line {
+    position: relative;
+    z-index: 1;
     min-width: 0;
-    flex-direction: column;
+    flex: 1;
+    gap: 6px;
+    padding: 0.46rem 0 0.46rem 0.62rem;
+    pointer-events: none;
   }
 
-  .facial-artwork-accordion-title {
-    color: var(--foreground);
-    font-size: 0.75rem;
-    font-weight: 650;
-  }
-
-  .facial-artwork-accordion-summary {
-    overflow: hidden;
-    max-width: 34ch;
-    color: var(--muted-foreground);
-    font-size: 0.625rem;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .facial-artwork-accordion-info {
+    display: inline-flex;
+    flex-shrink: 0;
+    pointer-events: auto;
   }
 
   .facial-artwork-accordion-meta {
+    position: relative;
+    z-index: 1;
     flex-shrink: 0;
     gap: 7px;
+    padding: 0.46rem 0.62rem;
     color: var(--muted-foreground);
     font-size: 0.625rem;
+    pointer-events: none;
   }
 
   .facial-artwork-changed {
@@ -146,25 +145,37 @@
     font-weight: 650;
   }
 
-  .facial-artwork-accordion-meta :global(svg),
+  :global(.facial-artwork-chevron),
   .facial-artwork-accordion-reset :global(svg) {
     width: 14px;
     height: 14px;
   }
 
-  .facial-artwork-accordion-meta :global(svg) {
-    transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  :global(.facial-artwork-chevron) {
+    transition: transform 180ms ease-out;
   }
 
-  .facial-artwork-accordion-meta :global(svg.open) {
+  :global(.facial-artwork-chevron[data-open='true']) {
     transform: rotate(180deg);
   }
 
   .facial-artwork-accordion-reset {
+    position: relative;
+    z-index: 1;
+    display: inline-flex;
     align-self: stretch;
-    width: 34px;
-    border-left: 1px solid var(--border);
+    width: 40px;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border-left: 1px solid var(--bs-settings-inner-line);
     color: var(--muted-foreground);
+  }
+
+  .facial-artwork-accordion-reset:hover:not(:disabled) {
+    background: var(--bs-settings-hover);
+    color: var(--foreground);
   }
 
   .facial-artwork-accordion-reset:disabled {
@@ -179,17 +190,8 @@
     outline-offset: -2px;
   }
 
-  .facial-artwork-accordion-panel {
-    display: flex;
-    min-width: 0;
-    flex-direction: column;
-    gap: 12px;
-    padding: 10px;
-    border-top: 1px solid var(--border);
-  }
-
   @media (prefers-reduced-motion: reduce) {
-    .facial-artwork-accordion-meta :global(svg) {
+    :global(.facial-artwork-chevron) {
       transition: none;
     }
   }

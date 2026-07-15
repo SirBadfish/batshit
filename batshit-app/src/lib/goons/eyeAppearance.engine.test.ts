@@ -111,7 +111,7 @@ function expectVectorClose(actual: THREE.Vector3, expected: THREE.Vector3) {
 }
 
 describe('EyeAppearanceEngineRuntime', () => {
-  it('keeps the exact post-Recipe zero state byte-for-byte and transform-for-transform neutral', () => {
+  it('maps logical convergence zero to the accepted four-degree inward neutral and removes it exactly', () => {
     const value = fixture()
     const irisBefore = Array.from(
       (value.left.iris.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array
@@ -119,14 +119,19 @@ describe('EyeAppearanceEngineRuntime', () => {
     const bonePosition = value.leftBone.position.clone()
     const boneQuaternion = value.leftBone.quaternion.clone()
     const inverse = value.skeleton.boneInverses[0].clone()
-    new EyeAppearanceEngineRuntime(value.root, value.definitionValue, null)
+    const runtime = new EyeAppearanceEngineRuntime(value.root, value.definitionValue, null)
     expect(
       Array.from(
         (value.left.iris.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array
       )
     ).toEqual(irisBefore)
     expect(value.leftBone.position.equals(bonePosition)).toBe(true)
-    expect(value.leftBone.quaternion.equals(boneQuaternion)).toBe(true)
+    expect(value.leftBone.quaternion.angleTo(boneQuaternion)).toBeCloseTo(
+      THREE.MathUtils.degToRad(4),
+      8
+    )
+    runtime.prepareForRecipeUpdate()
+    expect(value.leftBone.quaternion.angleTo(boneQuaternion)).toBeLessThan(1e-8)
     expect(value.skeleton.boneInverses[0].equals(inverse)).toBe(true)
   })
 
@@ -151,6 +156,48 @@ describe('EyeAppearanceEngineRuntime', () => {
     runtime.removeOverlay()
     expectVectorClose(value.leftBone.position, sampledPosition)
     expect(value.leftBone.quaternion.angleTo(sampledRotation)).toBeLessThan(1e-8)
+  })
+
+  it('rotates the complete fitted eyes inward for positive convergence and restores them exactly', () => {
+    const value = fixture()
+    const leftBefore = value.leftBone.quaternion.clone()
+    const rightBefore = value.rightBone.quaternion.clone()
+    const state = createDefaultEyeAppearanceState(value.definitionValue)
+    state.eyeConvergence = 8
+
+    const runtime = new EyeAppearanceEngineRuntime(value.root, value.definitionValue, state)
+    const leftForward = new THREE.Vector3(0, 0, 1).applyQuaternion(value.leftBone.quaternion)
+    const rightForward = new THREE.Vector3(0, 0, 1).applyQuaternion(value.rightBone.quaternion)
+
+    expect(leftForward.x).toBeLessThan(0)
+    expect(rightForward.x).toBeGreaterThan(0)
+    expect(leftForward.angleTo(new THREE.Vector3(0, 0, 1))).toBeCloseTo(
+      THREE.MathUtils.degToRad(12),
+      8
+    )
+    expect(rightForward.angleTo(new THREE.Vector3(0, 0, 1))).toBeCloseTo(
+      THREE.MathUtils.degToRad(12),
+      8
+    )
+
+    state.eyeConvergence = -10
+    runtime.setState(state)
+    const leftFarForward = new THREE.Vector3(0, 0, 1).applyQuaternion(value.leftBone.quaternion)
+    const rightFarForward = new THREE.Vector3(0, 0, 1).applyQuaternion(value.rightBone.quaternion)
+    expect(leftFarForward.x).toBeGreaterThan(0)
+    expect(rightFarForward.x).toBeLessThan(0)
+    expect(leftFarForward.angleTo(new THREE.Vector3(0, 0, 1))).toBeCloseTo(
+      THREE.MathUtils.degToRad(6),
+      8
+    )
+    expect(rightFarForward.angleTo(new THREE.Vector3(0, 0, 1))).toBeCloseTo(
+      THREE.MathUtils.degToRad(6),
+      8
+    )
+
+    runtime.removeOverlay()
+    expect(value.leftBone.quaternion.angleTo(leftBefore)).toBeLessThan(1e-8)
+    expect(value.rightBone.quaternion.angleTo(rightBefore)).toBeLessThan(1e-8)
   })
 
   it('restores the Recipe inverse baseline before edits and captures the replacement baseline afterward', () => {
@@ -200,5 +247,25 @@ describe('EyeAppearanceEngineRuntime', () => {
       newRz * Math.sqrt(1 - ((0.012 * 1.35) ** 2) / (newRx * newRx)) +
       leftSpec.conformal.irisAuthoredOffset
     expect(position.getZ(0)).toBeCloseTo(expectedZ, 6)
+  })
+
+  it('treats Pupil Size as a multiplier of the current Iris Size', () => {
+    const value = fixture()
+    const state = createDefaultEyeAppearanceState(value.definitionValue)
+    state.irisSize = 1.2
+    state.pupilSize = 1.5
+    const runtime = new EyeAppearanceEngineRuntime(value.root, value.definitionValue, state)
+
+    const irisPosition = value.left.iris.geometry.getAttribute('position') as THREE.BufferAttribute
+    const pupilPosition = value.left.pupil.geometry.getAttribute('position') as THREE.BufferAttribute
+    expect(irisPosition.getX(0)).toBeCloseTo(0.005 * 1.2, 8)
+    expect(pupilPosition.getX(0)).toBeCloseTo(0.002 * 1.2 * 1.5, 8)
+
+    state.pupilSize = 0
+    runtime.setState(state)
+    for (let index = 0; index < pupilPosition.count; index += 1) {
+      expect(pupilPosition.getX(index)).toBeCloseTo(0, 8)
+      expect(pupilPosition.getY(index)).toBeCloseTo(0, 8)
+    }
   })
 })

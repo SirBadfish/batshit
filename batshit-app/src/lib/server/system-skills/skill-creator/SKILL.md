@@ -326,7 +326,7 @@ When creating skills that interact with Batshit's systems, you need to know abou
 
 **When a skill wraps or orchestrates local commands**, that's the CLI Tools lane — and the skill might depend on specific CLI tools being registered (see the companion section above).
 
-For full details about Batshit's capabilities and architecture, agents can reference the **Batshit Guide** system clip, which covers the complete platform. Don't try to cram all of Batshit's documentation into a skill — point agents to the Guide when deep platform knowledge is needed.
+For full details about Batshit's capabilities and architecture, agents can invoke the **Batshit Guide** system skill (`/batshit-guide`), whose references are the official Batshit docs. Don't try to cram all of Batshit's documentation into a skill — point agents to the Guide when deep platform knowledge is needed.
 
 ---
 

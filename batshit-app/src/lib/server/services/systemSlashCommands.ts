@@ -42,6 +42,12 @@ const GOON_SCENE_CREATOR_ALLOWED_TOOLS = [
   'native_skill'
 ]
 
+const BATSHIT_GUIDE_ALLOWED_TOOLS = [
+  'native_batshit_tool_search',
+  'native_batshit_tool_use',
+  'native_skill'
+]
+
 const LEGACY_ARTIFACT_SKILL_IDS = [
   'artifacts-general',
   'artifacts-n8n-brain',
@@ -67,13 +73,15 @@ const VOICE_ENGINE_INSTALLER_COMMAND_ID = 'voice-engine-installer'
 const ARTIFACT_CREATOR_COMMAND_ID = 'artifact-creator'
 const CLI_TOOL_CREATOR_COMMAND_ID = 'cli-tool-creator'
 const GOON_SCENE_CREATOR_COMMAND_ID = 'goon-scene-creator'
+const BATSHIT_GUIDE_COMMAND_ID = 'batshit-guide'
 
 const SYSTEM_SKILL_IDS_BY_COMMAND_ID: Record<string, string> = {
   [SKILL_CREATOR_COMMAND_ID]: 'skill_creator',
   [VOICE_ENGINE_INSTALLER_COMMAND_ID]: 'voice_engine_installer',
   [ARTIFACT_CREATOR_COMMAND_ID]: 'artifact_creator',
   [CLI_TOOL_CREATOR_COMMAND_ID]: 'cli_tool_creator',
-  [GOON_SCENE_CREATOR_COMMAND_ID]: 'goon_scene_creator'
+  [GOON_SCENE_CREATOR_COMMAND_ID]: 'goon_scene_creator',
+  [BATSHIT_GUIDE_COMMAND_ID]: 'batshit_guide'
 }
 
 const LEGACY_VOICE_ENGINE_INSTALLER_IDS = ['speech-setup']
@@ -85,7 +93,8 @@ export const SYSTEM_SLASH_COMMAND_IDS = [
   VOICE_ENGINE_INSTALLER_COMMAND_ID,
   ARTIFACT_CREATOR_COMMAND_ID,
   CLI_TOOL_CREATOR_COMMAND_ID,
-  GOON_SCENE_CREATOR_COMMAND_ID
+  GOON_SCENE_CREATOR_COMMAND_ID,
+  BATSHIT_GUIDE_COMMAND_ID
 ] as const
 
 export function expectedSystemSkillIdForCommand(commandId: string | null | undefined): string | null {
@@ -529,6 +538,76 @@ export async function buildGoonSceneCreatorSkillCommand(
   }
 }
 
+export async function buildBatshitGuideSkillCommand(
+  userId: string,
+  now: string,
+  existing?: SlashCommandRow | null
+): Promise<SlashCommandRow> {
+  const sourceDir = resolveSystemSkillDir('batshit-guide')
+  const { markdown, hasReferences, hasAssets } = readSystemSkillContent('batshit-guide')
+  const accessState = deriveAttachableState(existing)
+
+  const skill = await upsertSkill({
+    userId,
+    commandId: BATSHIT_GUIDE_COMMAND_ID,
+    nowIso: now,
+    skill: {
+      id: BATSHIT_GUIDE_COMMAND_ID,
+      name: BATSHIT_GUIDE_COMMAND_ID,
+      displayName: 'Batshit Guide',
+      description:
+        'Answer questions about Batshit and guide users through its features using the official product docs as on-demand references.',
+      markdown,
+      source: 'system',
+      sourceRef: sourceDir,
+      trustLevel: existing?.trust_level ?? 'trusted',
+      isSystem: true,
+      isActive: existing?.is_active ?? true,
+      allowedTools: BATSHIT_GUIDE_ALLOWED_TOOLS,
+      hasReferences,
+      hasAssets
+    }
+  })
+
+  return {
+    id: BATSHIT_GUIDE_COMMAND_ID,
+    user_id: userId,
+    name: BATSHIT_GUIDE_COMMAND_ID,
+    displayName: 'Batshit Guide',
+    description:
+      'Answer questions about Batshit and guide users through its features using the official product docs as on-demand references.',
+    type: 'skill',
+    instructions:
+      'In-product Batshit help: load the matching UserDocs reference before answering, relay documented steps faithfully, say plainly when the docs do not cover something, and route build/install work to the operational skills.',
+    parameters: [],
+    skill_id: skill.id,
+    skill_source: skill.source,
+    skill_source_ref: skill.source_ref,
+    skill_summary: skill.description,
+    skill_dependencies: skill.dependencies ?? [],
+    skill_allowed_tools: skill.allowed_tools ?? BATSHIT_GUIDE_ALLOWED_TOOLS,
+    trust_level: skill.trust_level,
+    has_scripts: skill.has_scripts ?? false,
+    has_references: skill.has_references ?? true,
+    has_assets: skill.has_assets ?? false,
+    invocation_pattern: '/batshit-guide',
+    can_be_attached_to_agents: accessState.canBeAttachedToAgents,
+    can_be_invoked_in_chat: true,
+    category: 'help',
+    tags: ['help', 'guide', 'docs', 'batshit', 'onboarding'],
+    icon_ref: existing?.icon_ref ?? { kind: 'lucide', id: 'book-open' },
+    icon: undefined,
+    usage_count: existing?.usage_count ?? 0,
+    last_used_at: existing?.last_used_at,
+    is_active: existing?.is_active ?? true,
+    enabled_for_all_agents: accessState.enabledForAllAgents,
+    enabled_agent_ids: accessState.enabledAgentIds,
+    is_system: true,
+    created_at: existing?.created_at ?? now,
+    updated_at: now
+  }
+}
+
 export async function buildUnifiedArtifactSkillCommand(
   userId: string,
   now: string,
@@ -619,6 +698,8 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
   const cliToolsKey = `slash_command:${userId}:${cliToolsId}`
   const goonSceneCreatorId = GOON_SCENE_CREATOR_COMMAND_ID
   const goonSceneCreatorKey = `slash_command:${userId}:${goonSceneCreatorId}`
+  const batshitGuideId = BATSHIT_GUIDE_COMMAND_ID
+  const batshitGuideKey = `slash_command:${userId}:${batshitGuideId}`
   const legacySpeechKey = `slash_command:${userId}:speech-setup`
   const legacyArtifactKey = `slash_command:${userId}:artifacts`
   const legacyCliToolsKey = `slash_command:${userId}:cli-tools`
@@ -630,6 +711,7 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
     existingArtifact,
     existingCliTools,
     existingGoonSceneCreator,
+    existingBatshitGuide,
     legacySpeech,
     legacyArtifact,
     legacyCliTools,
@@ -640,6 +722,7 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
     redis.json.get(artifactKey),
     redis.json.get(cliToolsKey),
     redis.json.get(goonSceneCreatorKey),
+    redis.json.get(batshitGuideKey),
     redis.json.get(legacySpeechKey),
     redis.json.get(legacyArtifactKey),
     redis.json.get(legacyCliToolsKey),
@@ -663,6 +746,7 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
     (existingGoonSceneCreator as SlashCommandRow | null) ?? null,
     (legacyGoonSceneCreator as SlashCommandRow | null) ?? null
   )
+  const batshitGuideSeed = (existingBatshitGuide as SlashCommandRow | null) ?? null
 
   const skillCreatorCommand = await buildSkillCreatorSkillCommand(
     userId,
@@ -689,13 +773,19 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
     now,
     goonSceneCreatorSeed
   )
+  const batshitGuideCommand = await buildBatshitGuideSkillCommand(
+    userId,
+    now,
+    batshitGuideSeed
+  )
 
   await Promise.all([
     redis.json.set(skillCreatorKey, '$', skillCreatorCommand),
     redis.json.set(speechKey, '$', speechCommand),
     redis.json.set(artifactKey, '$', artifactCommand),
     redis.json.set(cliToolsKey, '$', cliToolsCommand),
-    redis.json.set(goonSceneCreatorKey, '$', goonSceneCreatorCommand)
+    redis.json.set(goonSceneCreatorKey, '$', goonSceneCreatorCommand),
+    redis.json.set(batshitGuideKey, '$', batshitGuideCommand)
   ])
 
   await cleanupLegacyArtifactSkills(userId)
@@ -713,6 +803,7 @@ export async function bootstrapSystemSlashCommands(userId: string): Promise<{
       existingArtifact,
       existingCliTools,
       existingGoonSceneCreator,
+      existingBatshitGuide,
       legacySpeech,
       legacyArtifact,
       legacyCliTools,

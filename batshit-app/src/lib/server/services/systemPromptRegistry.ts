@@ -64,7 +64,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Baseline instructions for the live n8n primary-agent path.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_n8n_system_prompt.md',
-    defaultVersion: '2026-06-12'
+    defaultVersion: '2026-07-14'
   },
   {
     id: 'api_primary',
@@ -73,7 +73,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for API-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_api_system_prompt.md',
-    defaultVersion: '2026-06-12'
+    defaultVersion: '2026-07-14'
   },
   {
     id: 'cli_primary',
@@ -82,7 +82,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for CLI-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_cli_system_prompt.md',
-    defaultVersion: '2026-06-12'
+    defaultVersion: '2026-07-14'
   },
   {
     id: 'subagent_base',

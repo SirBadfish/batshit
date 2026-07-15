@@ -92,6 +92,7 @@ import {
   reapplyGroundProjectionLineToGeometry
 } from '$lib/goons/sceneSkybox'
 import {
+  GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY,
   clampCameraPositionToPaddedBox,
   pointerClientToNdc,
   resolveCinematicGoonZoomTarget,
@@ -173,8 +174,11 @@ import {
 } from '$lib/goons/customAvatar'
 import {
   bindCustomPerformanceRig,
+  composeCustomPerformanceEyeContact,
+  hasCustomPerformanceAuthoredEyeDirection,
   NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION,
   resolveCustomPerformanceDirection,
+  resolveCustomPerformanceEyeContactState,
   resolveCustomPerformanceRigManifest,
   resolveFaceControlEyeLookPresetWeights,
   resolveFinalCustomTargetWeights,
@@ -198,8 +202,8 @@ import type {
 import { FacialArtworkEngineRuntime } from '$lib/goons/facialArtwork.engine'
 import {
   parseFacialArtworkDefinition,
-  type FacialArtworkDefinitionV2,
-  type FacialArtworkStateV2
+  type FacialArtworkDefinitionV3,
+  type FacialArtworkStateV3
 } from '$lib/goons/facialArtwork'
 import { EyeAppearanceEngineRuntime } from '$lib/goons/eyeAppearance.engine'
 import {
@@ -207,6 +211,7 @@ import {
   type EyeAppearanceDefinitionV1,
   type EyeAppearanceStateV1
 } from '$lib/goons/eyeAppearance'
+import { classifyFacialArtworkPackageCapability } from '$lib/goons/facialArtwork.package'
 import {
   evaluateJointCorrectives,
   parseJointCorrectives,
@@ -242,7 +247,6 @@ const FAST_LIP_SYNC_RELEASE = 0.18
 const PRECOMPUTED_LIP_SYNC_VRM_INTENSITY_SCALE = 0.7
 const PRECOMPUTED_LIP_SYNC_CUSTOM_INTENSITY_SCALE = 1
 const MOOD_FACE_BLEND_DURATION_MS = 500
-const CINEMATIC_ZOOM_SENSITIVITY = 0.0009
 const VRM_MOUTH_PRESET_ORDER: GoonExpressionPreset[] = [
   VRMExpressionPresetName.Aa,
   VRMExpressionPresetName.Ih,
@@ -957,8 +961,8 @@ export class GoonEngine implements GoonStageHost {
   private appearanceDialsValues: AppearanceDialValueState | null = null
   private appearanceDialsOwnedTargets = new Set<string>()
   private facialArtworkRuntime: FacialArtworkEngineRuntime | null = null
-  private facialArtworkDefinition: FacialArtworkDefinitionV2 | null = null
-  private facialArtworkState: FacialArtworkStateV2 | null = null
+  private facialArtworkDefinition: FacialArtworkDefinitionV3 | null = null
+  private facialArtworkState: FacialArtworkStateV3 | null = null
   private eyeAppearanceRuntime: EyeAppearanceEngineRuntime | null = null
   private eyeAppearanceDefinition: EyeAppearanceDefinitionV1 | null = null
   private eyeAppearanceState: EyeAppearanceStateV1 | null = null
@@ -1592,7 +1596,7 @@ export class GoonEngine implements GoonStageHost {
     options: {
       bodyDialValues?: Record<string, number> | null
       appearanceDialValues?: AppearanceDialValueState | null
-      facialArtworkState?: FacialArtworkStateV2 | null
+      facialArtworkState?: FacialArtworkStateV3 | null
       eyeAppearanceState?: EyeAppearanceStateV1 | null
     } = {}
   ) {
@@ -1648,8 +1652,16 @@ export class GoonEngine implements GoonStageHost {
         this.setupBodyDials(manifest, options.bodyDialValues ?? null)
       }
       this.setupCustomPerformanceRig(manifest)
-      this.setupEyeAppearance(manifest, options.eyeAppearanceState ?? null)
-      await this.setupFacialArtwork(manifest, options.facialArtworkState ?? null)
+      const facialArtworkCapability = classifyFacialArtworkPackageCapability(manifest)
+      if (facialArtworkCapability.status === 'retired') {
+        this.customFaceManifestIssues.push(facialArtworkCapability.notice)
+      } else {
+        if (facialArtworkCapability.status === 'malformed') {
+          throw new Error(facialArtworkCapability.error)
+        }
+        this.setupEyeAppearance(manifest, options.eyeAppearanceState ?? null)
+        await this.setupFacialArtwork(manifest, options.facialArtworkState ?? null)
+      }
       this.emitCustomCompatibility()
       this.applyRuntimeTextureBudget(scene)
 
@@ -1661,6 +1673,7 @@ export class GoonEngine implements GoonStageHost {
 
       if (this.controls) {
         this.applyDefaultCamera()
+        this.calibrateEyeContactReference()
       }
 
       this.syncBaseLoopAnimation()
@@ -2529,14 +2542,16 @@ export class GoonEngine implements GoonStageHost {
     this.eyeAppearanceRuntime?.prepareForRecipeUpdate()
     this.appearanceDialsValues = values
     runtime.setValues(values)
+    this.customPerformanceRigRuntime?.rebaseLookNodePositions()
     this.eyeAppearanceRuntime?.rebaseFromRecipeAndApply()
+    this.facialArtworkRuntime?.reprojectEyeHighlights()
   }
 
   getFacialArtworkDefinition() {
     return this.facialArtworkDefinition
   }
 
-  async setFacialArtworkState(value: FacialArtworkStateV2 | null) {
+  async setFacialArtworkState(value: FacialArtworkStateV3 | null) {
     const runtime = this.facialArtworkRuntime
     if (!runtime) {
       if (value) throw new Error('The loaded Goon package does not support facial artwork.')
@@ -2558,6 +2573,7 @@ export class GoonEngine implements GoonStageHost {
     }
     this.customPerformanceRigRuntime?.removeOverlay()
     runtime.setState(value)
+    this.facialArtworkRuntime?.reprojectEyeHighlights()
     this.eyeAppearanceState = value
   }
 
@@ -2573,7 +2589,7 @@ export class GoonEngine implements GoonStageHost {
       return
     }
     if (manifest.facialArtwork === undefined || manifest.facialArtwork === null) {
-      throw new Error('eye-appearance/v1 requires the matching facial-artwork/v2 package definition.')
+      throw new Error('eye-appearance/v1 requires the matching facial-artwork/v3 package definition.')
     }
     if (manifest.appearanceDials === undefined || manifest.appearanceDials === null) {
       throw new Error('eye-appearance/v1 requires the package Recipe appearance-dials/v2 definition.')
@@ -2581,7 +2597,7 @@ export class GoonEngine implements GoonStageHost {
     const definition = parseEyeAppearanceDefinition(rawDefinition)
     const facialArtwork = parseFacialArtworkDefinition(manifest.facialArtwork)
     if (definition.facialArtworkDependency.definitionSha256 !== facialArtwork.definitionSha256) {
-      throw new Error('eye-appearance/v1 does not match the package facial-artwork/v2 definition.')
+      throw new Error('eye-appearance/v1 does not match the package facial-artwork/v3 definition.')
     }
     const root = this.customAvatarRoot
     if (!root) throw new Error('Custom avatar root is missing during Eye Appearance setup.')
@@ -2593,12 +2609,12 @@ export class GoonEngine implements GoonStageHost {
 
   private async setupFacialArtwork(
     manifest: GoonCustomAvatarManifest,
-    initialState: FacialArtworkStateV2 | null
+    initialState: FacialArtworkStateV3 | null
   ) {
     const rawDefinition = manifest.facialArtwork
     if (rawDefinition === undefined || rawDefinition === null) {
       if (initialState) {
-        throw new Error('Saved facial artwork targets a package without facial-artwork/v2.')
+        throw new Error('Saved facial artwork targets a package without facial-artwork/v3.')
       }
       return
     }
@@ -3390,7 +3406,7 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private calibrateEyeContactReference() {
-    if (!this.vrm) return
+    if (!this.vrm && !this.customPerformanceRigRuntime) return
     const focusPoint = this.getEyeContactFocusPoint()
     if (!focusPoint) return
 
@@ -3404,6 +3420,11 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private getEyeContactReferenceObject() {
+    if (this.customPerformanceRigRuntime) {
+      const neck = this.customPerformanceRigRuntime.getLookNode('neck')
+      const head = this.customPerformanceRigRuntime.getLookNode('head')
+      return neck.parent ?? head.parent ?? this.customAvatarRoot
+    }
     if (!this.vrm) return null
     return (
       this.bones[VRMHumanBoneName.Neck]?.parent ??
@@ -3416,7 +3437,8 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private getEyeContactReferenceQuaternion() {
-    const reference = this.getEyeContactReferenceObject() ?? this.vrm?.scene
+    const reference =
+      this.getEyeContactReferenceObject() ?? this.vrm?.scene ?? this.customAvatarRoot
     return reference?.getWorldQuaternion(new THREE.Quaternion()) ?? new THREE.Quaternion()
   }
 
@@ -3838,7 +3860,7 @@ export class GoonEngine implements GoonStageHost {
       baseFov: this.baseCameraFov,
       maxFov: 100,
       delta,
-      sensitivity: CINEMATIC_ZOOM_SENSITIVITY
+      sensitivity: GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY
     })
     const nextDistance = nextZoom.distance
 
@@ -8237,11 +8259,81 @@ export class GoonEngine implements GoonStageHost {
     }
 
     const rawMorphWeights = resolveRawMorphTargets(this.collectCustomRawMorphTargets(now))
-    this.customPerformanceDirection = resolveCustomPerformanceDirection({
+    const authoredPerformanceDirection = resolveCustomPerformanceDirection({
       expressionTargets: directionExpressionTargets,
       faceControls,
       rawTargetWeights: rawMorphWeights
     })
+    this.customPerformanceDirection = authoredPerformanceDirection
+    if (this.customPerformanceRigRuntime && this.customAvatarRoot) {
+      const authoredEyeContact = resolveCustomPerformanceEyeContactState(
+        authoredPerformanceDirection
+      )
+      const suppressCameraContact =
+        this.isStaticPoseOverrideActive() || this.lookActive
+      const eyeContactActiveForMotion =
+        this.eyeContactEnabled && !this.isEyeContactSuppressedByMotion()
+
+      if (suppressCameraContact) {
+        this.eyeContactApplied = { ...authoredEyeContact }
+      } else {
+        if (eyeContactActiveForMotion) {
+          this.customPerformanceRigRuntime.neutralizeMotionLookNodes()
+        }
+        this.applyEyeContact({
+          ...authoredEyeContact,
+          authoredEyeOverride: hasCustomPerformanceAuthoredEyeDirection(
+            authoredPerformanceDirection
+          ),
+          enabled: eyeContactActiveForMotion
+        })
+      }
+
+      if (this.eyeLookFreezeHeadEnabled) {
+        this.eyeContactApplied.headYaw = 0
+        this.eyeContactApplied.headPitch = 0
+      }
+
+      const ambientEyeYaw =
+        this.eyeContactApplied.eyeYaw - authoredEyeContact.eyeYaw
+      const ambientEyePitch =
+        this.eyeContactApplied.eyePitch - authoredEyeContact.eyePitch
+      const ambientEyeLookWeights = resolveEyeLookExpressionWeights(
+        ambientEyeYaw,
+        ambientEyePitch,
+        this.eyeContactTuning
+      )
+      this.mergeExpressionWeight(
+        expressionWeights,
+        VRMExpressionPresetName.LookLeft,
+        ambientEyeLookWeights.lookLeft
+      )
+      this.mergeExpressionWeight(
+        expressionWeights,
+        VRMExpressionPresetName.LookRight,
+        ambientEyeLookWeights.lookRight
+      )
+      this.mergeExpressionWeight(
+        expressionWeights,
+        VRMExpressionPresetName.LookUp,
+        ambientEyeLookWeights.lookUp
+      )
+      this.mergeExpressionWeight(
+        expressionWeights,
+        VRMExpressionPresetName.LookDown,
+        ambientEyeLookWeights.lookDown
+      )
+      this.customPerformanceDirection = composeCustomPerformanceEyeContact(
+        authoredPerformanceDirection,
+        this.eyeContactApplied,
+        {
+          eyeYaw: this.eyeContactTuning.eyeYawRange,
+          eyePitch: this.eyeContactTuning.eyePitchRange,
+          headYaw: this.eyeContactTuning.headYawRange,
+          headPitch: this.eyeContactTuning.headPitchRange
+        }
+      )
+    }
     this.customPerformanceTargetWeights = resolveFinalCustomTargetWeights({
       expressionWeights,
       expressionBindings: this.customExpressionMorphMap as ReadonlyMap<
@@ -9370,7 +9462,7 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private resolveCameraEyeContact() {
-    if (!this.vrm) return null
+    if (!this.vrm && !this.customPerformanceRigRuntime) return null
     const focusPoint = this.getEyeContactFocusPoint()
     if (!focusPoint) return null
 
@@ -9408,6 +9500,13 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private getEyeContactFocusPoint() {
+    if (this.customPerformanceRigRuntime) {
+      const leftEye = this.customPerformanceRigRuntime.getLookNode('leftEye')
+      const rightEye = this.customPerformanceRigRuntime.getLookNode('rightEye')
+      const left = leftEye.getWorldPosition(new THREE.Vector3())
+      const right = rightEye.getWorldPosition(new THREE.Vector3())
+      return left.add(right).multiplyScalar(0.5)
+    }
     const head = this.bones[VRMHumanBoneName.Head]
     if (head) {
       return head.getWorldPosition(new THREE.Vector3())

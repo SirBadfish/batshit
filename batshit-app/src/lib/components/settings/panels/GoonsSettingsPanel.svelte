@@ -113,18 +113,27 @@
     parseFacialArtworkDefinition,
     parseFacialArtworkState,
     reconcileFacialArtworkState,
-    type FacialArtworkDefinitionV2,
+    resolveFacialArtworkTemplateVariant,
+    type FacialArtworkDefinitionV3,
+    type FacialArtworkOrientation,
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
-    type FacialArtworkStateV2,
+    type FacialArtworkStateV3,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import { restoreFacialArtworkDraft } from '$lib/goons/facialArtwork.editor'
+  import { classifyFacialArtworkPackageCapability } from '$lib/goons/facialArtwork.package'
   import {
+    createDefaultFacialArtworkUploadCreditDraft,
+    type FacialArtworkUploadCreditDraft
+  } from '$lib/goons/facialArtwork.provenance'
+  import {
+    EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS,
     createDefaultEyeAppearanceState,
     parseEyeAppearanceDefinition,
     parseEyeAppearanceState,
     reconcileEyeAppearanceState,
+    updateEyeAppearanceControl,
     type EyeAppearanceDefinitionV1,
     type EyeAppearanceStateV1
   } from '$lib/goons/eyeAppearance'
@@ -619,6 +628,9 @@
   let editorDirty = $state(false)
   let editorSaving = $state(false)
   let editorFacialArtworkUploadBusy = $state(false)
+  let editorFacialArtworkCreditDraft = $state<FacialArtworkUploadCreditDraft>(
+    createDefaultFacialArtworkUploadCreditDraft()
+  )
   let updateVrmInput = $state<HTMLInputElement | null>(null)
   let updateVrmFile = $state<File | null>(null)
   let updateVrmBusy = $state(false)
@@ -677,8 +689,8 @@
   let editorDescriptionEditorOpen = $state(false)
   let editorBasicSettingsOpen = $state(false)
   let editorEyeContactOpen = $state(false)
-  let editorAppearanceDialsOpen = $state(false)
-  let editorFacialArtworkOpen = $state(false)
+  let editorBodyAppearanceOpen = $state(false)
+  let editorFaceAppearanceOpen = $state(false)
   let editorVrmSectionOpen = $state(false)
   let editorAnimationsSectionOpen = $state(false)
   let editorClosetOpen = $state(false)
@@ -809,6 +821,7 @@
   let previewRuntimeStatus = $state<GoonRendererRuntime | null>(null)
   let previewGoonId = $state<string | null>(null)
   let previewToken = 0
+  let pendingEditorOpeningFrameGoonId: string | null = null
   let previewAnimationSignature = $state('')
   let previewBaseLoopSignature = $state('')
   let previewContextSignature = $state('')
@@ -820,6 +833,7 @@
   const DEFAULT_PREVIEW_VIEW_FOV = 50
   const MIN_PREVIEW_VIEW_FOV = 15
   const MAX_PREVIEW_VIEW_FOV = 100
+  const EDITOR_OPENING_FRAME_PRESET: GoonFramingPreset = 'portrait'
   let previewViewFov = $state(DEFAULT_PREVIEW_VIEW_FOV)
   let previewCameraMode = $state<GoonCameraMode>('free')
   let kitchenPreviewContainer = $state<HTMLDivElement | null>(null)
@@ -5653,6 +5667,7 @@
     editorPendingAdvancedPackageUpdate = null
     editorPendingCustomPackageUpdate = null
     editorFacialArtworkUploadBusy = false
+    editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
     closetBusy = false
     editorFacePreviewSuspended = false
@@ -6234,6 +6249,9 @@
         })
       }
       if (token !== previewToken) return
+      if (mode === 'editor') {
+        applyPendingEditorOpeningFrame(engine, goon.id)
+      }
       engine.setGoonVisible(true)
       previewAnimationActive = false
       previewAnimationRestore = null
@@ -6288,6 +6306,24 @@
     if (options.forceResetIfMissing) {
       engine.resetCamera()
       engine.setDefaultCamera(engine.getCameraState())
+    }
+  }
+
+  function applyPendingEditorOpeningFrame(engine: GoonEngine, goonId: string) {
+    if (pendingEditorOpeningFrameGoonId !== goonId) return
+    pendingEditorOpeningFrameGoonId = null
+
+    // Opening the editor should always reveal the face, but it must not
+    // overwrite the shared per-Goon camera merely because the preview loaded.
+    engine.setCameraChangeHandler()
+    try {
+      if (!engine.frameAvatar(EDITOR_OPENING_FRAME_PRESET)) {
+        console.warn('[GoonsSettings] Could not apply the editor opening frame', { goonId })
+        return
+      }
+      engine.setDefaultCamera(engine.getCameraState())
+    } finally {
+      engine.setCameraChangeHandler(handlePreviewCameraChange)
     }
   }
 
@@ -6821,6 +6857,7 @@
     editorPendingAdvancedPackageUpdate = null
     editorPendingCustomPackageUpdate = null
     editorFacialArtworkUploadBusy = false
+    editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
     if (advancedPackageUpdateInput) advancedPackageUpdateInput.value = ''
     toast.success('Pending package update canceled')
@@ -8068,6 +8105,9 @@
 
   function openCueEditor(goon: GoonRecord) {
     activeTab = 'goons'
+    if (editorGoonId !== goon.id) {
+      pendingEditorOpeningFrameGoonId = goon.id
+    }
     editorGoonId = goon.id
     editorName = goon.name ?? ''
     editorDescription = goon.description ?? ''
@@ -8104,6 +8144,7 @@
     editorPendingAdvancedPackageUpdate = null
     editorPendingCustomPackageUpdate = null
     editorFacialArtworkUploadBusy = false
+    editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
     editorGuidedOutfitPiecesDraft = [...(goon.guidedAvatar?.outfitPieces ?? [])]
     editorGuidedDufOverlays = [...(goon.guidedAvatar?.dufOverlays ?? [])]
@@ -8116,8 +8157,8 @@
     editorDescriptionEditorOpen = false
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
-    editorAppearanceDialsOpen = false
-    editorFacialArtworkOpen = false
+    editorBodyAppearanceOpen = false
+    editorFaceAppearanceOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -9637,13 +9678,14 @@
     editorDirty = true
   }
 
-  // ------------------------------------------ facial artwork v2 + linked eye appearance v1 (SA-090)
-  let editorFacialArtworkDefinition = $state<FacialArtworkDefinitionV2 | null>(null)
-  let editorFacialArtworkState = $state<FacialArtworkStateV2 | null>(null)
+  // ------------------------------------------ facial artwork v3 + linked eye appearance v1 (SA-090)
+  let editorFacialArtworkDefinition = $state<FacialArtworkDefinitionV3 | null>(null)
+  let editorFacialArtworkState = $state<FacialArtworkStateV3 | null>(null)
   let editorEyeAppearanceDefinition = $state<EyeAppearanceDefinitionV1 | null>(null)
   let editorEyeAppearanceState = $state<EyeAppearanceStateV1 | null>(null)
   let editorFacialArtworkHydrated = $state(false)
   let editorFacialArtworkError = $state('')
+  let editorFacialArtworkPackageNotice = $state('')
   let editorFacialArtworkNotice = $state('')
   let editorEyeAppearanceNotice = $state('')
   let editorFacialArtworkPreviewError = $state('')
@@ -9657,8 +9699,8 @@
   const editorFacialArtworkDraftUploads = new Map<string, FacialArtworkUpload>()
 
   function applyStoredFacialArtworkDraft(
-    definition: FacialArtworkDefinitionV2,
-    stored: FacialArtworkStateV2 | null | undefined
+    definition: FacialArtworkDefinitionV3,
+    stored: FacialArtworkStateV3 | null | undefined
   ) {
     const restored = restoreFacialArtworkDraft(definition, stored)
     editorFacialArtworkState = restored.state
@@ -9716,7 +9758,7 @@
     editorFacialArtworkPreviewTimer = null
   }
 
-  function resolveFacialArtworkDraftForSave(): FacialArtworkStateV2 | null {
+  function resolveFacialArtworkDraftForSave(): FacialArtworkStateV3 | null {
     if (!editorFacialArtworkHydrated || !editorFacialArtworkDefinition || !editorFacialArtworkState) {
       return null
     }
@@ -9744,7 +9786,7 @@
     editorFacialArtworkDraftUploads.delete(upload.filename)
   }
 
-  async function pruneDetachedFacialArtworkDrafts(state: FacialArtworkStateV2 | null) {
+  async function pruneDetachedFacialArtworkDrafts(state: FacialArtworkStateV3 | null) {
     const referenced = new Set(collectFacialArtworkUploads(state).map((upload) => upload.filename))
     for (const upload of [...editorFacialArtworkDraftUploads.values()]) {
       if (referenced.has(upload.filename)) continue
@@ -9771,8 +9813,8 @@
   }
 
   async function reconcileFacialArtworkUploadsAfterSave(
-    previous: FacialArtworkStateV2 | null | undefined,
-    saved: FacialArtworkStateV2 | null | undefined
+    previous: FacialArtworkStateV3 | null | undefined,
+    saved: FacialArtworkStateV3 | null | undefined
   ) {
     const retained = new Set(collectFacialArtworkUploads(saved).map((upload) => upload.filename))
     const candidates = new Map<string, FacialArtworkUpload>()
@@ -9795,7 +9837,8 @@
   async function uploadEditorFacialArtwork(
     roleId: FacialArtworkRoleId,
     file: File,
-    provenance: FacialArtworkProvenance
+    provenance: FacialArtworkProvenance,
+    orientation: FacialArtworkOrientation
   ) {
     if (!editorGoonId || !editorFacialArtworkDefinition) {
       throw new Error('Facial Artwork is not ready for this Goon.')
@@ -9805,19 +9848,22 @@
       (candidate) => candidate.id === role?.template
     )
     if (!role || !template) throw new Error('The selected facial-artwork template is unavailable.')
+    const variant = resolveFacialArtworkTemplateVariant(template, orientation)
     const upload = await uploadGoonFacialArtwork(editorGoonId, file, {
       role: role.id,
       definitionSha256: editorFacialArtworkDefinition.definitionSha256,
       templateId: template.id,
       templateVersion: template.version,
-      guideSha256: template.guide.sha256,
+      orientation,
+      guideSha256: variant.guide.sha256,
+      maskSha256: variant.safePaintMask.sha256,
       provenance
     })
     editorFacialArtworkDraftUploads.set(upload.filename, upload)
     return upload
   }
 
-  function updateEditorFacialArtwork(state: FacialArtworkStateV2) {
+  function updateEditorFacialArtwork(state: FacialArtworkStateV3) {
     if (!editorFacialArtworkDefinition) return
     const parsed = parseFacialArtworkState(editorFacialArtworkDefinition, state)
     if (JSON.stringify(editorFacialArtworkState) === JSON.stringify(parsed)) return
@@ -9857,6 +9903,7 @@
       editorEyeAppearanceState = null
       editorFacialArtworkHydrated = false
       editorFacialArtworkError = ''
+      editorFacialArtworkPackageNotice = ''
       editorFacialArtworkNotice = ''
       editorEyeAppearanceNotice = ''
       editorFacialArtworkPreviewError = ''
@@ -9881,6 +9928,7 @@
     editorEyeAppearanceState = null
     editorFacialArtworkHydrated = false
     editorFacialArtworkError = ''
+    editorFacialArtworkPackageNotice = ''
     editorFacialArtworkNotice = ''
     editorEyeAppearanceNotice = ''
     editorFacialArtworkPreviewError = ''
@@ -9888,7 +9936,16 @@
       try {
         const manifest = await loadCustomAvatarManifest(manifestRef)
         if (token !== editorFacialArtworkLoadToken) return
-        if (manifest.facialArtwork === undefined || manifest.facialArtwork === null) {
+        const capability = classifyFacialArtworkPackageCapability(manifest)
+        if (capability.status === 'retired') {
+          editorFacialArtworkPackageNotice = capability.notice
+          editorFacialArtworkHydrated = true
+          return
+        }
+        if (capability.status === 'malformed') {
+          throw new Error(capability.error)
+        }
+        if (capability.status === 'absent') {
           editorFacialArtworkHydrated = true
           return
         }
@@ -9944,8 +10001,8 @@
     section:
       | 'basic'
       | 'eye-contact'
-      | 'appearance-dials'
-      | 'facial-artwork'
+      | 'body-appearance'
+      | 'face-appearance'
       | 'vrm'
       | 'animations'
       | 'closet'
@@ -9953,10 +10010,10 @@
   ) {
     editorBasicSettingsOpen = section === 'basic' ? !editorBasicSettingsOpen : false
     editorEyeContactOpen = section === 'eye-contact' ? !editorEyeContactOpen : false
-    editorAppearanceDialsOpen =
-      section === 'appearance-dials' ? !editorAppearanceDialsOpen : false
-    editorFacialArtworkOpen =
-      section === 'facial-artwork' ? !editorFacialArtworkOpen : false
+    editorBodyAppearanceOpen =
+      section === 'body-appearance' ? !editorBodyAppearanceOpen : false
+    editorFaceAppearanceOpen =
+      section === 'face-appearance' ? !editorFaceAppearanceOpen : false
     editorVrmSectionOpen = section === 'vrm' ? !editorVrmSectionOpen : false
     editorAnimationsSectionOpen =
       section === 'animations' ? !editorAnimationsSectionOpen : false
@@ -9979,8 +10036,8 @@
   function toggleEditorCueSection(section: 'moods' | 'emotes') {
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
-    editorAppearanceDialsOpen = false
-    editorFacialArtworkOpen = false
+    editorBodyAppearanceOpen = false
+    editorFaceAppearanceOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -13918,7 +13975,10 @@
                     {#if moodCues.length > 0}
                       <div class={goonLevel2AccordionListClass}>
                     {#each moodCues as cue (cue.name)}
-                        <div class={goonLevel2AccordionClass}>
+                        <Collapsible.Root
+                          open={openMoodName === cue.name}
+                          class={goonLevel2AccordionClass}
+                        >
                         <div
                           role="button"
                           tabindex="0"
@@ -13947,8 +14007,7 @@
                             />
                           </div>
                         </div>
-                        {#if openMoodName === cue.name}
-                          <div class={goonLevel2CueContentClass}>
+                        <Collapsible.Content class={goonLevel2CueContentClass}>
                             <div class="flex flex-wrap items-center justify-between gap-2">
                               <div class="min-w-[180px] flex-1 space-y-1">
                                 <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Mood Name" />
@@ -14115,9 +14174,8 @@
                                 </Button>
                               </div>
                             </div>
-                          </div>
-                        {/if}
-                      </div>
+                        </Collapsible.Content>
+                      </Collapsible.Root>
                     {/each}
                       </div>
                     {/if}
@@ -14199,7 +14257,10 @@
                     {#each emoteCues as cue (cue.name)}
                       {@const emoteEmoji = getEmoteEmoji(cue.name)}
                       {@const emoteEmojiLabel = formatEmoteEmojiLabel(emoteEmoji)}
-                      <div class={goonLevel2AccordionClass}>
+                      <Collapsible.Root
+                        open={openEmoteName === cue.name}
+                        class={goonLevel2AccordionClass}
+                      >
                         <div
                           role="button"
                           tabindex="0"
@@ -14230,8 +14291,7 @@
                             />
                           </div>
                         </div>
-                        {#if openEmoteName === cue.name}
-                          <div class={goonLevel2CueContentClass}>
+                        <Collapsible.Content class={goonLevel2CueContentClass}>
                             <div class="flex flex-wrap items-center justify-between gap-2">
                               <div class="min-w-[180px] flex-1 space-y-1">
                                 <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Emote Name" />
@@ -14570,9 +14630,8 @@
                                 </Button>
                               </div>
                             </div>
-                          </div>
-                        {/if}
-                      </div>
+                        </Collapsible.Content>
+                      </Collapsible.Root>
                     {/each}
                       </div>
                     {/if}
@@ -15319,24 +15378,38 @@
                 tuning={buildEditorEyeContactTuning()}
                 modeInfo={EDITOR_EYE_CONTACT_MODE_INFO}
                 coordinationInfo={EDITOR_EYE_CONTACT_COORDINATION_INFO}
+                eyeConvergenceControl={editorEyeAppearanceDefinition?.controls.find(
+                  (control) => control.id === EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS[0]
+                ) ?? null}
+                eyeConvergenceValue={editorEyeAppearanceState?.eyeConvergence ?? null}
                 onModeChange={(mode) => {
                   editorEyeContactMode = mode
                   editorDirty = true
                 }}
                 onTuningChange={updateEditorEyeContactTuning}
+                onEyeConvergenceChange={(value) => {
+                  if (!editorEyeAppearanceState) return
+                  updateEditorEyeAppearance(
+                    updateEyeAppearanceControl(
+                      editorEyeAppearanceState,
+                      EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS[0],
+                      value
+                    )
+                  )
+                }}
               />
             </Collapsible.Content>
           </Collapsible.Root>
 
           {#if editorGoonKind === 'custom' && (editorAppearanceDialsManifest || editorAppearanceDialsError)}
-            <Collapsible.Root bind:open={editorAppearanceDialsOpen} class={goonLevel1AccordionClass}>
+            <Collapsible.Root bind:open={editorBodyAppearanceOpen} class={goonLevel1AccordionClass}>
               <Collapsible.Trigger
                 class={goonLevel1AccordionHeaderClass}
-                onclick={() => toggleEditorPrimarySection('appearance-dials')}
+                onclick={() => toggleEditorPrimarySection('body-appearance')}
               >
                 <div class="flex items-center gap-1.5">
                   <SlidersHorizontal class="batshit-goon-l1-icon h-4 w-4" />
-                  <span class="batshit-settings-form-label">Appearance Dials</span>
+                  <span class="batshit-settings-form-label">Body Appearance</span>
                   <div
                     onclick={(event) => {
                       event.preventDefault()
@@ -15344,23 +15417,23 @@
                     }}
                     aria-hidden="true"
                   >
-                    <SettingsInfoMenu ariaLabel="About Appearance Dials" contentClass="w-80">
+                    <SettingsInfoMenu ariaLabel="About Body Appearance" contentClass="w-80">
                       <p>
-                        Versioned body, head, and face controls from this Goon's package.
-                        Changes preview live; Save Goon stores them with the exact package
-                        definition so an incompatible update resets clearly instead of drifting.
+                        Versioned body, head, and neck controls from this Goon's package. Changes
+                        preview live; Save Goon keeps each value with its exact package definition
+                        so an incompatible update resets clearly instead of drifting.
                       </p>
                     </SettingsInfoMenu>
                   </div>
                 </div>
                 <ChevronDown
-                  class={`h-4 w-4 shrink-0 transition-transform ${editorAppearanceDialsOpen ? 'rotate-180' : ''}`}
+                  class={`h-4 w-4 shrink-0 transition-transform ${editorBodyAppearanceOpen ? 'rotate-180' : ''}`}
                 />
               </Collapsible.Trigger>
               <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
                 {#if editorAppearanceDialsError}
                   <p class="batshit-settings-form-error px-3">
-                    Appearance Dials unavailable: {editorAppearanceDialsError}
+                    Body Appearance unavailable: {editorAppearanceDialsError}
                   </p>
                 {:else if editorAppearanceDialsManifest && editorAppearanceDialsState}
                   <div class="px-3 pb-2">
@@ -15372,6 +15445,7 @@
                     <AppearanceDialsEditor
                       manifest={editorAppearanceDialsManifest}
                       valueState={editorAppearanceDialsState}
+                      surface="body"
                       onChange={updateEditorAppearanceDials}
                     />
                   </div>
@@ -15380,15 +15454,15 @@
             </Collapsible.Root>
           {/if}
 
-          {#if editorGoonKind === 'custom' && (editorFacialArtworkDefinition || editorFacialArtworkError)}
-            <Collapsible.Root bind:open={editorFacialArtworkOpen} class={goonLevel1AccordionClass}>
+          {#if editorGoonKind === 'custom' && (editorAppearanceDialsManifest || editorAppearanceDialsError || editorFacialArtworkDefinition || editorFacialArtworkError || editorFacialArtworkPackageNotice)}
+            <Collapsible.Root bind:open={editorFaceAppearanceOpen} class={goonLevel1AccordionClass}>
               <Collapsible.Trigger
                 class={goonLevel1AccordionHeaderClass}
-                onclick={() => toggleEditorPrimarySection('facial-artwork')}
+                onclick={() => toggleEditorPrimarySection('face-appearance')}
               >
                 <div class="flex items-center gap-1.5">
-                  <Palette class="batshit-goon-l1-icon h-4 w-4" />
-                  <span class="batshit-settings-form-label">Facial Artwork</span>
+                  <SlidersHorizontal class="batshit-goon-l1-icon h-4 w-4" />
+                  <span class="batshit-settings-form-label">Face Appearance</span>
                   <div
                     onclick={(event) => {
                       event.preventDefault()
@@ -15396,32 +15470,35 @@
                     }}
                     aria-hidden="true"
                   >
-                    <SettingsInfoMenu ariaLabel="About Facial Artwork" contentClass="w-80">
+                    <SettingsInfoMenu ariaLabel="About Face Appearance" contentClass="w-80">
                       <p>
-                        Package-fitted brows, lashes and eye outlines, irises, pupils, highlights,
-                        and sclera artwork. PNGs are validated against this exact Goon package and
+                        Face-shape controls and package-fitted facial artwork, organized together
+                        by facial region. PNGs are validated against this exact Goon package and
                         preview live before Save Goon stores them.
                       </p>
                     </SettingsInfoMenu>
                   </div>
                 </div>
                 <ChevronDown
-                  class={`h-4 w-4 shrink-0 transition-transform ${editorFacialArtworkOpen ? 'rotate-180' : ''}`}
+                  class={`h-4 w-4 shrink-0 transition-transform ${editorFaceAppearanceOpen ? 'rotate-180' : ''}`}
                 />
               </Collapsible.Trigger>
               <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
-                {#if editorFacialArtworkError}
-                  <p class="batshit-settings-form-error px-3">
-                    Facial Artwork unavailable: {editorFacialArtworkError}
-                  </p>
-                {:else if editorFacialArtworkDefinition && editorFacialArtworkState}
+                {#if editorFacialArtworkPackageNotice}
                   <div class="px-3 pb-2">
-                    {#if editorPendingCustomPackageUpdate}
-                      <p class="mb-2 text-[0.675rem] leading-relaxed text-amber-400" role="status">
-                        Save the pending Goon File Package before editing Facial Artwork. The
-                        server validates PNGs against the currently saved package.
-                      </p>
-                    {/if}
+                    <p class="text-[0.675rem] leading-relaxed text-amber-400" role="status">
+                      {editorPendingCustomPackageUpdate
+                        ? 'Save Goon to install the pending Goon File Package. Facial Artwork and Eye Appearance will become available after the package update resets their retired state.'
+                        : editorFacialArtworkPackageNotice}
+                    </p>
+                  </div>
+                {/if}
+                {#if editorAppearanceDialsError}
+                  <p class="batshit-settings-form-error px-3">
+                    Face Appearance unavailable: {editorAppearanceDialsError}
+                  </p>
+                {:else if editorAppearanceDialsManifest && editorAppearanceDialsState}
+                  <div class="px-3 pb-2">
                     {#if editorFacialArtworkNotice}
                       <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
                         {editorFacialArtworkNotice}
@@ -15437,23 +15514,57 @@
                         Live preview failed: {editorFacialArtworkPreviewError}
                       </p>
                     {/if}
-                    {#if editorEyeAppearanceDefinition && editorEyeAppearanceState}
-                      <FacialArtworkEditor
-                        definition={editorFacialArtworkDefinition}
-                        eyeAppearanceDefinition={editorEyeAppearanceDefinition}
-                        valueState={editorFacialArtworkState}
-                        eyeAppearanceState={editorEyeAppearanceState}
-                        disabled={Boolean(editorPendingCustomPackageUpdate) || editorSaving}
-                        onChange={updateEditorFacialArtwork}
-                        onEyeAppearanceChange={updateEditorEyeAppearance}
-                        onUpload={uploadEditorFacialArtwork}
-                        onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
-                      />
-                    {:else}
-                      <p class="batshit-settings-form-error" role="alert">
-                        Eye Appearance is unavailable for this Goon package.
-                      </p>
-                    {/if}
+                    {#snippet facialArtworkRegion(scope: 'brows' | 'eyes')}
+                      {#if editorPendingCustomPackageUpdate}
+                        <p class="text-[0.675rem] leading-relaxed text-amber-400" role="status">
+                          Save the pending Goon File Package before editing Facial Artwork. The
+                          server validates PNGs against the currently saved package.
+                        </p>
+                      {:else if editorFacialArtworkError}
+                        <p class="batshit-settings-form-error">
+                          Facial Artwork unavailable: {editorFacialArtworkError}
+                        </p>
+                      {:else if editorFacialArtworkDefinition && editorFacialArtworkState && editorEyeAppearanceDefinition && editorEyeAppearanceState}
+                        <FacialArtworkEditor
+                          {scope}
+                          definition={editorFacialArtworkDefinition}
+                          eyeAppearanceDefinition={editorEyeAppearanceDefinition}
+                          valueState={editorFacialArtworkState}
+                          eyeAppearanceState={editorEyeAppearanceState}
+                          ownerDisplayName={userSettings?.displayName ?? ''}
+                          creditDraft={editorFacialArtworkCreditDraft}
+                          disabled={editorSaving}
+                          onCreditDraftChange={(draft) => (editorFacialArtworkCreditDraft = draft)}
+                          onChange={updateEditorFacialArtwork}
+                          onEyeAppearanceChange={updateEditorEyeAppearance}
+                          onUpload={uploadEditorFacialArtwork}
+                          onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
+                        />
+                      {:else}
+                        <p class="batshit-settings-form-error" role="alert">
+                          Facial Artwork or Eye Appearance is unavailable for this Goon package.
+                        </p>
+                      {/if}
+                    {/snippet}
+
+                    <AppearanceDialsEditor
+                      manifest={editorAppearanceDialsManifest}
+                      valueState={editorAppearanceDialsState}
+                      surface="head-face"
+                      onChange={updateEditorAppearanceDials}
+                      eyeAppearanceDefinition={editorEyeAppearanceDefinition}
+                      eyeAppearanceState={editorEyeAppearanceState}
+                      onEyeAppearanceChange={updateEditorEyeAppearance}
+                      regionContentIds={['face.brows', 'face.eyes']}
+                    >
+                      {#snippet regionContent(regionId: string)}
+                        {#if regionId === 'face.brows'}
+                          {@render facialArtworkRegion('brows')}
+                        {:else if regionId === 'face.eyes'}
+                          {@render facialArtworkRegion('eyes')}
+                        {/if}
+                      {/snippet}
+                    </AppearanceDialsEditor>
                   </div>
                 {/if}
               </Collapsible.Content>
@@ -16149,7 +16260,10 @@
                         <div class={goonLevel2AccordionListClass}>
                       {#each moodCues as cue (cue.name)}
                         {@const cueStatus = getEditorCueStatus(cue.name)}
-                        <div class={goonLevel2AccordionClass}>
+                        <Collapsible.Root
+                          open={openMoodName === cue.name}
+                          class={goonLevel2AccordionClass}
+                        >
                           <div
                             role="button"
                             tabindex="0"
@@ -16184,8 +16298,7 @@
                               />
                             </div>
                           </div>
-                          {#if openMoodName === cue.name}
-                            <div class={goonLevel2CueContentClass}>
+                          <Collapsible.Content class={goonLevel2CueContentClass}>
                               <div class="flex flex-wrap items-center gap-2">
                                 <div class="min-w-[180px] flex-1 space-y-1">
                                   <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Mood Name" />
@@ -16365,9 +16478,8 @@
                                   {/if}
                                 </div>
                               </div>
-                            </div>
-                          {/if}
-                        </div>
+                          </Collapsible.Content>
+                        </Collapsible.Root>
                       {/each}
                         </div>
                       {/if}
@@ -16536,7 +16648,10 @@
                         {@const emoteEmoji = getEmoteEmoji(cue.name)}
                         {@const emoteEmojiLabel = formatEmoteEmojiLabel(emoteEmoji)}
                         {@const cueStatus = getEditorCueStatus(cue.name)}
-                        <div class={goonLevel2AccordionClass}>
+                        <Collapsible.Root
+                          open={openEmoteName === cue.name}
+                          class={goonLevel2AccordionClass}
+                        >
                           <div
                             role="button"
                             tabindex="0"
@@ -16573,8 +16688,7 @@
                               />
                             </div>
                           </div>
-                          {#if openEmoteName === cue.name}
-                            <div class={goonLevel2CueContentClass}>
+                          <Collapsible.Content class={goonLevel2CueContentClass}>
                               <div class="flex flex-wrap items-center gap-2">
                                 <div class="min-w-[180px] flex-1 space-y-1">
                                   <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Emote Name" />
@@ -16900,9 +17014,8 @@
                                   {/if}
                                 </div>
                               </div>
-                            </div>
-                          {/if}
-                        </div>
+                          </Collapsible.Content>
+                        </Collapsible.Root>
                       {/each}
                         </div>
                       {/if}

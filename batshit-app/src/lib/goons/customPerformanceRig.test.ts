@@ -3,8 +3,11 @@ import { describe, expect, it } from 'vitest'
 import { resolveCustomPerformanceRigBlock } from './customAvatar'
 import {
   bindCustomPerformanceRig,
+  composeCustomPerformanceEyeContact,
+  hasCustomPerformanceAuthoredEyeDirection,
   NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION,
   resolveCustomPerformanceDirection,
+  resolveCustomPerformanceEyeContactState,
   resolveCustomPerformanceRigManifest,
   resolveFaceControlEyeLookPresetWeights,
   resolveFinalCustomTargetWeights,
@@ -280,6 +283,109 @@ describe('custom performance input resolution', () => {
     expect(direction.rightEyePitch).toBeCloseTo(0.15)
   })
 
+  it('converts Eye Contact signs and composes ambient motion without collapsing asymmetric eyes', () => {
+    const authored: CustomPerformanceDirection = {
+      headYaw: 0.25,
+      headPitch: -0.1,
+      leftEyeYaw: -0.6,
+      leftEyePitch: 0.4,
+      rightEyeYaw: 0.2,
+      rightEyePitch: -0.2
+    }
+    const authoredState = resolveCustomPerformanceEyeContactState(authored)
+
+    expect(authoredState.eyeYaw).toBeCloseTo(0.2)
+    expect(authoredState.eyePitch).toBeCloseTo(-0.1)
+    expect(authoredState.headYaw).toBeCloseTo(-0.25)
+    expect(authoredState.headPitch).toBeCloseTo(0.1)
+    expect(hasCustomPerformanceAuthoredEyeDirection(authored)).toBe(true)
+
+    const composed = composeCustomPerformanceEyeContact(authored, {
+      eyeYaw: authoredState.eyeYaw + 0.3,
+      eyePitch: authoredState.eyePitch - 0.15,
+      headYaw: authoredState.headYaw + 0.4,
+      headPitch: authoredState.headPitch - 0.2
+    })
+
+    expect(composed.headYaw).toBeCloseTo(-0.15)
+    expect(composed.headPitch).toBeCloseTo(0.1)
+    expect(composed.leftEyeYaw).toBeCloseTo(-0.9)
+    expect(composed.rightEyeYaw).toBeCloseTo(-0.1)
+    expect(composed.leftEyePitch).toBeCloseTo(0.55)
+    expect(composed.rightEyePitch).toBeCloseTo(-0.05)
+    expect(composed.rightEyeYaw - composed.leftEyeYaw).toBeCloseTo(0.8)
+    expect(composed.leftEyePitch - composed.rightEyePitch).toBeCloseTo(0.6)
+  })
+
+  it('maps camera-only Eye Contact onto both eyes and Head/Neck in performance-rig signs', () => {
+    const composed = composeCustomPerformanceEyeContact(
+      NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION,
+      {
+        eyeYaw: 0.4,
+        eyePitch: -0.2,
+        headYaw: 0.3,
+        headPitch: -0.1
+      }
+    )
+
+    expect(composed).toEqual({
+      headYaw: -0.3,
+      headPitch: 0.1,
+      leftEyeYaw: -0.4,
+      leftEyePitch: 0.2,
+      rightEyeYaw: -0.4,
+      rightEyePitch: 0.2
+    })
+    expect(
+      hasCustomPerformanceAuthoredEyeDirection({
+        ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION,
+        rightEyeYaw: 0.049
+      })
+    ).toBe(false)
+    expect(
+      hasCustomPerformanceAuthoredEyeDirection({
+        ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION,
+        rightEyeYaw: 0.05
+      })
+    ).toBe(true)
+  })
+
+  it('scales only ambient camera contact with the saved output ranges', () => {
+    const authored: CustomPerformanceDirection = {
+      headYaw: 0.25,
+      headPitch: -0.1,
+      leftEyeYaw: -0.6,
+      leftEyePitch: 0.4,
+      rightEyeYaw: 0.2,
+      rightEyePitch: -0.2
+    }
+    const authoredState = resolveCustomPerformanceEyeContactState(authored)
+    const composed = composeCustomPerformanceEyeContact(
+      authored,
+      {
+        eyeYaw: authoredState.eyeYaw + 0.3,
+        eyePitch: authoredState.eyePitch - 0.15,
+        headYaw: authoredState.headYaw + 0.4,
+        headPitch: authoredState.headPitch - 0.2
+      },
+      {
+        eyeYaw: 0.5,
+        eyePitch: 2,
+        headYaw: 0.5,
+        headPitch: 2
+      }
+    )
+
+    expect(composed.headYaw).toBeCloseTo(0.05)
+    expect(composed.headPitch).toBeCloseTo(0.3)
+    expect(composed.leftEyeYaw).toBeCloseTo(-0.75)
+    expect(composed.rightEyeYaw).toBeCloseTo(0.05)
+    expect(composed.leftEyePitch).toBeCloseTo(0.7)
+    expect(composed.rightEyePitch).toBeCloseTo(0.1)
+    expect(composed.rightEyeYaw - composed.leftEyeYaw).toBeCloseTo(0.8)
+    expect(composed.leftEyePitch - composed.rightEyePitch).toBeCloseTo(0.6)
+  })
+
   it('creates eye-canvas corrective presets from direction controls without collapsing eyes', () => {
     expect(
       Object.fromEntries(
@@ -323,6 +429,83 @@ describe('custom performance input resolution', () => {
 })
 
 describe('CustomPerformanceRigRuntime', () => {
+  it('exposes the exact validated look nodes needed by camera-contact calibration', () => {
+    const rig = buildRig()
+
+    expect(rig.runtime.getLookNode('neck')).toBe(rig.neck)
+    expect(rig.runtime.getLookNode('head')).toBe(rig.head)
+    expect(rig.runtime.getLookNode('leftEye')).toBe(rig.leftEye)
+    expect(rig.runtime.getLookNode('rightEye')).toBe(rig.rightEye)
+  })
+
+  it('restores mixer-authored gaze nodes to their bound parent-rest transforms', () => {
+    const rig = buildRig()
+    const rest = {
+      neckPosition: rig.neck.position.clone(),
+      neckRotation: rig.neck.quaternion.clone(),
+      headPosition: rig.head.position.clone(),
+      headRotation: rig.head.quaternion.clone(),
+      leftEyePosition: rig.leftEye.position.clone(),
+      leftEyeRotation: rig.leftEye.quaternion.clone(),
+      rightEyePosition: rig.rightEye.position.clone(),
+      rightEyeRotation: rig.rightEye.quaternion.clone()
+    }
+
+    for (const node of [rig.neck, rig.head, rig.leftEye, rig.rightEye]) {
+      node.position.add(new THREE.Vector3(0.02, -0.01, 0.03))
+      node.rotateX(0.2)
+      node.rotateY(-0.3)
+    }
+
+    rig.runtime.neutralizeMotionLookNodes()
+
+    expect(rig.neck.position).toEqual(rest.neckPosition)
+    expectQuaternionClose(rig.neck.quaternion, rest.neckRotation)
+    expect(rig.head.position).toEqual(rest.headPosition)
+    expectQuaternionClose(rig.head.quaternion, rest.headRotation)
+    expect(rig.leftEye.position).toEqual(rest.leftEyePosition)
+    expectQuaternionClose(rig.leftEye.quaternion, rest.leftEyeRotation)
+    expect(rig.rightEye.position).toEqual(rest.rightEyePosition)
+    expectQuaternionClose(rig.rightEye.quaternion, rest.rightEyeRotation)
+  })
+
+  it('rebases Recipe-owned positions without adopting mixer-authored rotations', () => {
+    const rig = buildRig()
+    const canonicalRotations = {
+      neck: rig.neck.quaternion.clone(),
+      head: rig.head.quaternion.clone(),
+      leftEye: rig.leftEye.quaternion.clone(),
+      rightEye: rig.rightEye.quaternion.clone()
+    }
+    const recipePositions = {
+      neck: rig.neck.position.clone().add(new THREE.Vector3(0, 0.02, 0)),
+      head: rig.head.position.clone().add(new THREE.Vector3(0.01, 0.03, -0.02)),
+      leftEye: rig.leftEye.position.clone().add(new THREE.Vector3(0.04, 0.01, 0)),
+      rightEye: rig.rightEye.position.clone().add(new THREE.Vector3(-0.04, 0.01, 0))
+    }
+
+    rig.neck.position.copy(recipePositions.neck)
+    rig.head.position.copy(recipePositions.head)
+    rig.leftEye.position.copy(recipePositions.leftEye)
+    rig.rightEye.position.copy(recipePositions.rightEye)
+    rig.neck.rotateX(0.15)
+    rig.head.rotateY(-0.25)
+    rig.leftEye.rotateX(0.3)
+    rig.rightEye.rotateX(-0.2)
+    rig.runtime.rebaseLookNodePositions()
+
+    rig.runtime.neutralizeMotionLookNodes()
+
+    expect(rig.neck.position).toEqual(recipePositions.neck)
+    expectQuaternionClose(rig.neck.quaternion, canonicalRotations.neck)
+    expect(rig.head.position).toEqual(recipePositions.head)
+    expectQuaternionClose(rig.head.quaternion, canonicalRotations.head)
+    expect(rig.leftEye.position).toEqual(recipePositions.leftEye)
+    expectQuaternionClose(rig.leftEye.quaternion, canonicalRotations.leftEye)
+    expect(rig.rightEye.position).toEqual(recipePositions.rightEye)
+    expectQuaternionClose(rig.rightEye.quaternion, canonicalRotations.rightEye)
+  })
+
   it('composes bounded parent-space look overlays onto non-identity motion and keeps eye pivots fixed', () => {
     const rig = buildRig()
     const bases = {

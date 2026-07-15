@@ -27,7 +27,7 @@ async function deleteUploadReferences(clip: ClipRow) {
   }
 }
 
-async function removeClipFromSessionState(sessionId: string, clipId: string) {
+export async function removeClipFromSessionState(sessionId: string, clipId: string) {
   await redis.sRem(`session:${sessionId}:clips`, clipId)
   await redis.sRem(`session:${sessionId}:active_clips`, clipId)
   await redis.del(`session_clip:${sessionId}:${clipId}`)

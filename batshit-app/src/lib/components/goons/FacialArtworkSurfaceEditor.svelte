@@ -1,20 +1,25 @@
 <script lang="ts">
   import { Download, ImagePlus, Trash2 } from '@lucide/svelte'
+  import * as ToggleGroup from '$lib/components/ui/toggle-group'
   import { Button } from '$lib/components/ui/button'
   import { Slider } from '$lib/components/ui/slider'
+  import { downloadBlob } from '$lib/utils/download'
   import {
     createFacialArtworkArtworkLayer,
     resolveFacialArtworkAssetUrl,
+    resolveFacialArtworkTemplateOrientation,
+    resolveFacialArtworkTemplateVariant,
     type FacialArtworkArtworkLayer,
-    type FacialArtworkDefinitionV2,
+    type FacialArtworkDefinitionV3,
     type FacialArtworkEyeState,
     type FacialArtworkLongitudeBounds,
+    type FacialArtworkOrientation,
     type FacialArtworkPlanarBounds,
     type FacialArtworkPlanarTransform,
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
     type FacialArtworkSide,
-    type FacialArtworkStateV2,
+    type FacialArtworkStateV3,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import {
@@ -24,21 +29,20 @@
   } from '$lib/goons/facialArtwork.editor'
 
   type Props = {
-    definition: FacialArtworkDefinitionV2
-    valueState: FacialArtworkStateV2
+    definition: FacialArtworkDefinitionV3
+    valueState: FacialArtworkStateV3
     roleId: FacialArtworkRoleId
     label: string
-    description: string
     leftLabel?: string
     rightLabel?: string
-    sharedMirrorHelp?: string
     disabled?: boolean
     provenance: FacialArtworkProvenance | null
-    onChange: (state: FacialArtworkStateV2) => void
+    onChange: (state: FacialArtworkStateV3) => void
     onUpload: (
       roleId: FacialArtworkRoleId,
       file: File,
-      provenance: FacialArtworkProvenance
+      provenance: FacialArtworkProvenance,
+      orientation: FacialArtworkOrientation
     ) => Promise<FacialArtworkUpload>
     onUploadBusyChange?: (busy: boolean) => void
   }
@@ -48,10 +52,8 @@
     valueState,
     roleId,
     label,
-    description,
     leftLabel = 'Left Eye',
     rightLabel = 'Right Eye',
-    sharedMirrorHelp = '',
     disabled = false,
     provenance,
     onChange,
@@ -63,6 +65,8 @@
   let fileInput = $state<HTMLInputElement | null>(null)
   let uploadBusy = $state(false)
   let uploadError = $state('')
+  let downloadBusy = $state<'template' | null>(null)
+  let downloadError = $state('')
   let collapseChoiceOpen = $state(false)
 
   const role = $derived(definition.roles.find((candidate) => candidate.id === roleId)!)
@@ -70,6 +74,9 @@
   const roleState = $derived(valueState.roles[roleId])
   const perEye = $derived(roleState.mode === 'per-eye')
   const eyeState = $derived(resolveFacialArtworkEyeState(valueState, roleId, activeSide))
+  const uploadSide = $derived(perEye ? activeSide : 'shared')
+  const uploadOrientation = $derived(resolveFacialArtworkTemplateOrientation(template, uploadSide))
+  const templateVariant = $derived(resolveFacialArtworkTemplateVariant(template, uploadOrientation))
   const hasBaseColor = $derived(eyeState.baseColor !== null)
   const fileInputId = $derived(`facial-artwork-file-${roleId}-${perEye ? activeSide : 'shared'}`)
   const collapseChoiceId = $derived(`facial-artwork-${roleId}-collapse-choice`)
@@ -158,7 +165,7 @@
     uploadError = ''
     onUploadBusyChange?.(true)
     try {
-      const upload = await onUpload(roleId, file, provenance)
+      const upload = await onUpload(roleId, file, provenance, uploadOrientation)
       const artwork = createFacialArtworkArtworkLayer(definition, roleId, upload)
       updateEye((current) => ({ ...current, visible: true, artwork }))
     } catch (error) {
@@ -184,95 +191,129 @@
   function planarBounds(): FacialArtworkPlanarBounds {
     return role.bounds as FacialArtworkPlanarBounds
   }
+
+  function downloadFilename(path: string) {
+    const basename = path.split('/').pop()?.trim() || `${roleId}.png`
+    return `template-${basename}`
+  }
+
+  async function downloadTemplateAsset(event: MouseEvent, path: string) {
+    event.preventDefault()
+    if (downloadBusy) return
+    downloadBusy = 'template'
+    downloadError = ''
+    try {
+      const url = resolveFacialArtworkAssetUrl(path)
+      const response = await fetch(url)
+      if (!response.ok) {
+        throw new Error(`Download failed (${response.status}).`)
+      }
+      const blob = await response.blob()
+      await downloadBlob(blob, downloadFilename(path), {
+        title: `Save ${label} Template`,
+        mimeType: 'image/png'
+      })
+    } catch (error) {
+      downloadError = error instanceof Error ? error.message : String(error)
+    } finally {
+      downloadBusy = null
+    }
+  }
 </script>
 
 <div class="facial-artwork-surface" aria-busy={uploadBusy}>
-  <div class="facial-artwork-surface-intro">
-    <h5>{label}</h5>
-    <p>{description}</p>
-  </div>
-
   <div class="facial-artwork-template-row">
-    <span>{template.dimensions[0]} × {template.dimensions[1]} PNG</span>
+    <span>{template.dimensions[0]} × {template.dimensions[1]} PNG · {templateVariant.label}</span>
     <div class="facial-artwork-downloads">
-      <a href={resolveFacialArtworkAssetUrl(template.guide.path)} download>
-        <Download aria-hidden="true" /> Guide
-      </a>
-      <a href={resolveFacialArtworkAssetUrl(template.safePaintMask.path)} download>
-        <Download aria-hidden="true" /> Mask
-      </a>
-      <a href={resolveFacialArtworkAssetUrl(template.transparentBlank.path)} download>
-        <Download aria-hidden="true" /> Blank
+      <a
+        href={resolveFacialArtworkAssetUrl(templateVariant.guide.path)}
+        download
+        aria-label={`Download ${templateVariant.label} Template`}
+        aria-busy={downloadBusy === 'template'}
+        onclick={(event) => void downloadTemplateAsset(event, templateVariant.guide.path)}
+      >
+        <Download aria-hidden="true" /> {downloadBusy === 'template' ? 'Saving…' : 'Template'}
       </a>
     </div>
   </div>
 
-  <div class="facial-artwork-choice" role="group" aria-label={`${label} eye matching`}>
-    <button
-      type="button"
-      class:active={!perEye}
-      aria-pressed={!perEye}
-      disabled={disabled}
-      onclick={() => setRoleMode('shared')}
-    >Same for both</button>
-    <button
-      type="button"
-      class:active={perEye}
-      aria-pressed={perEye}
-      disabled={disabled}
-      onclick={() => setRoleMode('per-eye')}
-    >Customize each eye</button>
-  </div>
-
-  {#if !perEye && sharedMirrorHelp}
-    <p class="facial-artwork-mirror-help">{sharedMirrorHelp}</p>
+  {#if downloadError}
+    <p class="facial-artwork-error" role="alert">Could not save template: {downloadError}</p>
   {/if}
+
+  <ToggleGroup.Root
+    type="single"
+    value={perEye ? 'per-eye' : 'shared'}
+    variant="outline"
+    size="sm"
+    class="facial-artwork-toggle-group"
+    aria-label={`${label} eye matching`}
+    onValueChange={(value: string) => {
+      if (value === 'shared' || value === 'per-eye') setRoleMode(value)
+    }}
+  >
+    <ToggleGroup.Item value="shared" class="facial-artwork-toggle-option" {disabled}>
+      Same for both
+    </ToggleGroup.Item>
+    <ToggleGroup.Item value="per-eye" class="facial-artwork-toggle-option" {disabled}>
+      Customize each eye
+    </ToggleGroup.Item>
+  </ToggleGroup.Root>
 
   {#if collapseChoiceOpen && perEye}
     <div class="facial-artwork-collapse-choice" role="group" aria-labelledby={collapseChoiceId}>
-      <p id={collapseChoiceId}>The two eyes differ. Choose which side to use for both.</p>
+      <p id={collapseChoiceId}>The two eyes differ. Choose which anatomical side to use for both.</p>
       <div>
-        <button type="button" disabled={disabled} onclick={() => collapseToShared('left')}>Use left</button>
-        <button type="button" disabled={disabled} onclick={() => collapseToShared('right')}>Use right</button>
+        <button type="button" disabled={disabled} onclick={() => collapseToShared('left')}
+          >Use Goon's Left (viewer's right)</button
+        >
+        <button type="button" disabled={disabled} onclick={() => collapseToShared('right')}
+          >Use Goon's Right (viewer's left)</button
+        >
         <button type="button" onclick={() => (collapseChoiceOpen = false)}>Cancel</button>
       </div>
     </div>
   {/if}
 
   {#if perEye}
-    <div class="facial-artwork-choice facial-artwork-side-choice" role="group" aria-label={`${label} side`}>
-      <button
-        type="button"
-        class:active={activeSide === 'left'}
-        aria-pressed={activeSide === 'left'}
-        onclick={() => (activeSide = 'left')}
-      >{leftLabel}</button>
-      <button
-        type="button"
-        class:active={activeSide === 'right'}
-        aria-pressed={activeSide === 'right'}
-        onclick={() => (activeSide = 'right')}
-      >{rightLabel}</button>
-    </div>
+    <ToggleGroup.Root
+      type="single"
+      value={activeSide}
+      variant="outline"
+      size="sm"
+      class="facial-artwork-toggle-group"
+      aria-label={`${label} side`}
+      onValueChange={(value: string) => {
+        if (value === 'left' || value === 'right') activeSide = value
+      }}
+    >
+      <ToggleGroup.Item value="left" class="facial-artwork-toggle-option">{leftLabel}</ToggleGroup.Item>
+      <ToggleGroup.Item value="right" class="facial-artwork-toggle-option">{rightLabel}</ToggleGroup.Item>
+    </ToggleGroup.Root>
   {/if}
 
   {#if !hasBaseColor}
-    <div class="facial-artwork-choice" role="group" aria-label={`${label} visibility`}>
-      <button
-        type="button"
-        class:active={!eyeState.visible}
-        aria-pressed={!eyeState.visible}
-        disabled={disabled}
-        onclick={() => setVisible(false)}
-      >Hidden</button>
-      <button
-        type="button"
-        class:active={eyeState.visible}
-        aria-pressed={eyeState.visible}
+    <ToggleGroup.Root
+      type="single"
+      value={eyeState.visible ? 'artwork' : 'hidden'}
+      variant="outline"
+      size="sm"
+      class="facial-artwork-toggle-group"
+      aria-label={`${label} visibility`}
+      onValueChange={(value: string) => {
+        if (value === 'hidden') setVisible(false)
+        if (value === 'artwork') setVisible(true)
+      }}
+    >
+      <ToggleGroup.Item value="hidden" class="facial-artwork-toggle-option" {disabled}>
+        Hidden
+      </ToggleGroup.Item>
+      <ToggleGroup.Item
+        value="artwork"
+        class="facial-artwork-toggle-option"
         disabled={disabled || !eyeState.artwork}
-        onclick={() => setVisible(true)}
-      >Artwork</button>
-    </div>
+      >Artwork</ToggleGroup.Item>
+    </ToggleGroup.Root>
   {/if}
 
   {#if eyeState.baseColor}
@@ -330,7 +371,9 @@
     <div class="facial-artwork-file-proof">
       <span title={artwork.upload.filename}>{artwork.upload.filename}</span>
       <code title={artwork.upload.sha256}>{artwork.upload.sha256.slice(0, 12)}…</code>
-      <span>{artwork.upload.provenance.author}</span>
+      <span
+        title={`${artwork.upload.provenance.sourceKind} · ${artwork.upload.provenance.license}`}
+      >{artwork.upload.provenance.author}</span>
     </div>
 
     <div class="facial-artwork-art-controls">
@@ -419,7 +462,6 @@
 
 <style>
   .facial-artwork-surface,
-  .facial-artwork-surface-intro,
   .facial-artwork-art-controls,
   .facial-artwork-slider-control {
     display: flex;
@@ -431,26 +473,12 @@
     gap: 10px;
   }
 
-  .facial-artwork-surface-intro {
-    gap: 2px;
-  }
-
-  .facial-artwork-surface-intro h5,
-  .facial-artwork-surface-intro p,
-  .facial-artwork-mirror-help,
   .facial-artwork-upload-help,
   .facial-artwork-collapse-choice p,
   .facial-artwork-error {
     margin: 0;
   }
 
-  .facial-artwork-surface-intro h5 {
-    font-size: 0.72rem;
-    font-weight: 650;
-  }
-
-  .facial-artwork-surface-intro p,
-  .facial-artwork-mirror-help,
   .facial-artwork-upload-help,
   .facial-artwork-collapse-choice p {
     max-width: 68ch;
@@ -507,7 +535,6 @@
   }
 
   .facial-artwork-downloads a:focus-visible,
-  .facial-artwork-choice button:focus-visible,
   .facial-artwork-color-control input:focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;
@@ -518,36 +545,18 @@
     height: 12px;
   }
 
-  .facial-artwork-choice {
-    display: grid;
+  :global(.facial-artwork-toggle-group) {
     width: 100%;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 2px;
-    padding: 2px;
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    background: var(--muted);
   }
 
-  .facial-artwork-choice button {
-    min-width: 0;
+  :global(.facial-artwork-toggle-option) {
+    min-width: 0 !important;
     min-height: 32px;
-    padding: 5px 7px;
-    border-radius: 5px;
-    color: var(--muted-foreground);
+    padding-inline: 10px !important;
     font-size: 0.65rem;
+    font-weight: 500;
     line-height: 1.25;
-    text-align: center;
-  }
-
-  .facial-artwork-choice button.active {
-    background: var(--background);
-    color: var(--foreground);
-    box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 12%, transparent);
-  }
-
-  .facial-artwork-choice button:disabled {
-    opacity: 0.45;
+    white-space: normal;
   }
 
   .facial-artwork-collapse-choice {
@@ -661,9 +670,4 @@
     }
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    .facial-artwork-choice button {
-      scroll-behavior: auto;
-    }
-  }
 </style>

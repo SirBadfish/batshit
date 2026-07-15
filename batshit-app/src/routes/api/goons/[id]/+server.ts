@@ -101,7 +101,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     console.error('Error updating goon:', error)
     if (
       error instanceof Error &&
-      (error.message.startsWith('[facial-artwork/v2]') ||
+      (error.message.startsWith('[facial-artwork/v3]') ||
         error.message.startsWith('[eye-appearance/v1]'))
     ) {
       return json({ error: error.message }, { status: 400 })

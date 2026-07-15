@@ -12,6 +12,7 @@ import type {
 } from '$lib/types/goons'
 import type {
   FacialArtworkProvenance,
+  FacialArtworkOrientation,
   FacialArtworkRoleId,
   FacialArtworkUpload
 } from '$lib/goons/facialArtwork'
@@ -61,7 +62,9 @@ export type GoonFacialArtworkUploadInput = {
   definitionSha256: string
   templateId: string
   templateVersion: string
+  orientation: FacialArtworkOrientation
   guideSha256: string
+  maskSha256: string
   provenance: FacialArtworkProvenance
 }
 
@@ -295,7 +298,9 @@ export async function uploadGoonFacialArtwork(
   form.append('definitionSha256', input.definitionSha256)
   form.append('templateId', input.templateId)
   form.append('templateVersion', input.templateVersion)
+  form.append('orientation', input.orientation)
   form.append('guideSha256', input.guideSha256)
+  form.append('maskSha256', input.maskSha256)
   form.append('provenance', JSON.stringify(input.provenance))
 
   const res = await fetch(`/api/goons/${encodeURIComponent(id)}/facial-artwork`, {

@@ -24,6 +24,8 @@ export type CameraBoxClampAxes = {
   z: boolean
 }
 
+export const GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY = 0.0005
+
 const GOON_FRAMING_SLICES: Record<GoonFramingPreset, GoonFramingSlice> = {
   headshot: { bottomRatio: 0.66, topRatio: 1, margin: 1.14, widthRatio: 0.55 },
   portrait: { bottomRatio: 0.5, topRatio: 1, margin: 1.12, widthRatio: 0.8 },
@@ -357,7 +359,9 @@ export function resolveHybridCameraZoom(options: {
   const logicalPosition = resolveHybridCameraZoomPosition(options)
   return resolveHybridCameraZoomAtPosition({
     ...options,
-    logicalPosition: logicalPosition + options.delta * (options.sensitivity ?? 0.0015)
+    logicalPosition:
+      logicalPosition +
+      options.delta * (options.sensitivity ?? GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY)
   })
 }
 

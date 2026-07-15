@@ -39,7 +39,7 @@ describe('goonAssetCleanupService', () => {
         ]
       },
       facialArtwork: {
-        schemaVersion: 'facial-artwork-state/v2',
+        schemaVersion: 'facial-artwork-state/v3',
         roles: {
           brows: {
             mode: 'shared',

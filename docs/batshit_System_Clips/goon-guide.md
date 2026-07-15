@@ -54,7 +54,7 @@ Current truth:
   - lip sync visemes
   - raw morph overrides
 - Advanced/Blender is the current mainstream Blender-authored path because it still rides the normal VRM runtime.
-- Supported first-party Advanced/GLB packages may declare exact-definition-bound Appearance Dials, Facial Artwork, and Eye Appearance. Facial Artwork covers bilateral Brows, Lashes & Eye Outline, independent Iris and Pupil, Eye Highlight, and Sclera layers. Eye Appearance separately owns physical Iris/Pupil sizing and linked Sclera fit. The editor validates package-specific PNG templates and provenance; do not advise users to paint arbitrary files or bypass the Guide/Mask/Blank assets.
+- Supported first-party Advanced/GLB packages may declare exact-definition-bound Appearance Dials, Facial Artwork, and Eye Appearance. Facial Artwork covers bilateral Brows, Lashes & Eye Outline, independent Iris and Pupil, Eye Highlight, and Sclera layers. Eye Appearance separately owns physical Iris/Pupil sizing, Eye Convergence (Gaze), and linked Sclera fit. Eye Convergence and the five Sclera geometry controls render under Appearance Dials -> Head & Face -> Eyes; Sclera color/artwork remains under Facial Artwork. Positive convergence turns both complete eyes inward toward a nearer focus, negative looks farther away, and the Sclera Fit ranges intentionally permit extreme expert adjustments. The editor requires single-frame 8-bit PNGs at the exact package-template dimensions and never resizes them. Users download one side-aware Template, paint on a separate transparent layer, and hide/remove the Template before export. Upload preparation converts pixels to canonical sRGB/RGBA, removes embedded ICC metadata, clips alpha to the trusted internal Mask, clears invisible fringe color, and losslessly re-encodes before strict template/provenance validation. Do not advise users to strip an ordinary ICC profile manually, paint arbitrary dimensions, or bypass package validation.
 - Advanced/GLB is still **not** a full alternative to the VRM lane yet:
   - motions work through GLB Motion Vault clips, but the clips must be authored/retargeted for the Goon's exact skeleton (no rig-agnostic retargeting like VRMA)
   - no Advanced/GLB outfit runtime
@@ -76,17 +76,21 @@ The Goon Editor is the per-Goon surface for:
 - Goon-specific animation files
 - closet slot assignments
 - Appearance Dials for supported first-party Advanced/GLB packages
-- Facial Artwork guide downloads, validated PNG replacement, Same for both/Customize each eye controls, solid eye colors, artwork transforms/tint/opacity, physical Iris/Pupil size and Sclera fit, and reset for supported first-party Advanced/GLB packages
+- Facial Artwork Template downloads, validated PNG replacement, Same for both/Customize each eye controls, solid eye colors, artwork transforms/tint/opacity, physical Iris/Pupil size and Sclera fit, and reset for supported first-party Advanced/GLB packages
 - exporting or applying the shared **Default Pack**
 
 Facial Artwork truth:
-- users work from the exact Guide, Mask, and Blank linked inside each role
-- Batshit validates the PNG against the current package and stores source/author/license/rights-confirmed provenance
-- all six roles can be shared or use explicit per-eye values; shared Brows and Lashes & Eye Outline mirror automatically
+- users work from one exact side-aware Template linked inside each role; the clean Mask, semantic map, and transparent Blank remain internal validation/package assets
+- the Template action opens native Save As in the packaged Mac app or downloads in a browser; it must not navigate away from the editor
+- the Lashes & Eye Outline Template is an open-eye view whose dark gridded full-perimeter region covers upper/lower lids, both canthi, and the wing; pink plus its faded eyebrow/nose/temple cues are forbidden reference territory, not artwork
+- Lashes & Eye Outline uploads are bound to the exact Template and internal Mask orientation they were authored against, so Batshit can mirror shared art once without accidentally double-mirroring an explicit right-eye file
+- Batshit validates the PNG against the current package and stores source/author/license/rights-confirmed provenance; My Artwork and self-created ComfyUI sources derive the live User Settings display name, while External Artwork still requires explicit author, license/permission, and rights confirmation
+- all six roles can be shared or use explicit per-eye values; shared Brows and Lashes & Eye Outline mirror automatically; linked Brow Horizontal Position moves both brows inward/outward rather than sliding them in one screen direction, and the widened brow transforms intentionally permit extreme placement; the Brow template/physical regions meet exactly at the face center for true unibrow art and extend farther outward and upward
 - Iris, Pupil, and Sclera keep solid base colors when no PNG is present; optional artwork composes over the base
-- Iris and Pupil remain independent roles with independent physical size controls
+- Iris and Pupil remain independent artwork roles; Pupil Size is a `0..2` multiplier of the current iris-relative neutral ratio, inherits Iris Size changes, and hides the pupil at zero
+- Eye Highlight is one iris-space layer projected continuously across the combined iris and pupil; one authored mark must appear once, not once per surface
 - Sclera artwork wraps in longitude; its physical Scale, Tilt, Horizontal Position, Vertical Position, and Depth controls move the complete eye assembly rather than the texture
-- Save Goon atomically owns the version-bound Facial Artwork and Eye Appearance states; incompatible package replacement resets them visibly instead of guessing a mapping
+- Save Goon atomically owns the version-bound Facial Artwork and Eye Appearance states; incompatible package replacement resets them visibly instead of guessing a mapping. Retired Facial Artwork v1/v2 capabilities are quarantined so the core Goon and package-update controls still load; advise installing the current package, never translating old artwork state.
 
 Closet truth:
 - the visible `Show all items` toggle is gone for now

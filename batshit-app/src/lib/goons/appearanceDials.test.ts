@@ -498,6 +498,12 @@ describe("appearance-dials/v2 parser and provenance", () => {
     });
   });
 
+  it("allows package dials to omit obsolete inline descriptions with an empty string", () => {
+    const raw = buildManifest();
+    raw.appearanceDials.dials[0].description = "";
+    expect(parseAppearanceDialsManifest(raw)?.dials[0].description).toBe("");
+  });
+
   it("rejects self-asserted ineligible or path-bearing provenance", () => {
     const ccBy = buildManifest();
     ccBy.appearanceDials.targets.face_fullness.provenance.license = "CC-BY-4.0";

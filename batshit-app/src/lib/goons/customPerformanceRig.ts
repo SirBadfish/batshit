@@ -66,6 +66,20 @@ export type CustomPerformanceDirection = {
   rightEyePitch: number
 }
 
+export type CustomPerformanceEyeContactState = {
+  eyeYaw: number
+  eyePitch: number
+  headYaw: number
+  headPitch: number
+}
+
+export type CustomPerformanceEyeContactRange = {
+  eyeYaw: number
+  eyePitch: number
+  headYaw: number
+  headPitch: number
+}
+
 export const NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION: CustomPerformanceDirection =
   Object.freeze({
     headYaw: 0,
@@ -631,6 +645,68 @@ export function resolveCustomPerformanceDirection(input: {
   }
 }
 
+/**
+ * Eye Contact v2 and the custom performance rig use opposite signed look
+ * channels. Reduce the two independent authored eyes only for the shared
+ * camera-contact solver; the final composition below restores their exact
+ * asymmetric difference.
+ */
+export function resolveCustomPerformanceEyeContactState(
+  direction: CustomPerformanceDirection
+): CustomPerformanceEyeContactState {
+  return {
+    eyeYaw: clampSigned(-(direction.leftEyeYaw + direction.rightEyeYaw) / 2),
+    eyePitch: clampSigned(-(direction.leftEyePitch + direction.rightEyePitch) / 2),
+    headYaw: clampSigned(-direction.headYaw),
+    headPitch: clampSigned(-direction.headPitch)
+  }
+}
+
+export function hasCustomPerformanceAuthoredEyeDirection(
+  direction: CustomPerformanceDirection,
+  threshold = 0.05
+) {
+  return (
+    Math.max(
+      Math.abs(direction.leftEyeYaw),
+      Math.abs(direction.leftEyePitch),
+      Math.abs(direction.rightEyeYaw),
+      Math.abs(direction.rightEyePitch)
+    ) >= threshold
+  )
+}
+
+/**
+ * Map the shared Eye Contact result back onto the performance rig without
+ * collapsing one-sided ARKit eye input. The shared ambient eye delta is added
+ * equally to both eyes; authored asymmetry stays intact.
+ */
+export function composeCustomPerformanceEyeContact(
+  authored: CustomPerformanceDirection,
+  applied: CustomPerformanceEyeContactState,
+  range: CustomPerformanceEyeContactRange = {
+    eyeYaw: 1,
+    eyePitch: 1,
+    headYaw: 1,
+    headPitch: 1
+  }
+): CustomPerformanceDirection {
+  const authoredState = resolveCustomPerformanceEyeContactState(authored)
+  const ambientEyeYaw = applied.eyeYaw - authoredState.eyeYaw
+  const ambientEyePitch = applied.eyePitch - authoredState.eyePitch
+  const ambientHeadYaw = applied.headYaw - authoredState.headYaw
+  const ambientHeadPitch = applied.headPitch - authoredState.headPitch
+
+  return {
+    headYaw: clampSigned(authored.headYaw - ambientHeadYaw * range.headYaw),
+    headPitch: clampSigned(authored.headPitch - ambientHeadPitch * range.headPitch),
+    leftEyeYaw: clampSigned(authored.leftEyeYaw - ambientEyeYaw * range.eyeYaw),
+    leftEyePitch: clampSigned(authored.leftEyePitch - ambientEyePitch * range.eyePitch),
+    rightEyeYaw: clampSigned(authored.rightEyeYaw - ambientEyeYaw * range.eyeYaw),
+    rightEyePitch: clampSigned(authored.rightEyePitch - ambientEyePitch * range.eyePitch)
+  }
+}
+
 export function resolveFaceControlEyeLookPresetWeights(
   faceControls: readonly GoonFaceControl[]
 ): Map<string, number> {
@@ -716,6 +792,10 @@ export class CustomPerformanceRigRuntime {
     BoundLookNode
   >
   private readonly targetTransforms: BoundTargetTransform[]
+  private readonly lookRestTransforms = new Map<
+    THREE.Object3D,
+    { position: THREE.Vector3; rotation: THREE.Quaternion }
+  >()
   private applied = new Map<THREE.Object3D, AppliedOverlay>()
   private disposed = false
 
@@ -730,6 +810,31 @@ export class CustomPerformanceRigRuntime {
     this.manifest = manifest
     this.lookNodes = lookNodes
     this.targetTransforms = targetTransforms
+    for (const { node } of Object.values(lookNodes)) {
+      this.lookRestTransforms.set(node, {
+        position: node.position.clone(),
+        rotation: node.quaternion.clone()
+      })
+    }
+  }
+
+  getLookNode(role: keyof CustomPerformanceRigManifest['nodes']) {
+    return this.lookNodes[role].node
+  }
+
+  rebaseLookNodePositions() {
+    for (const { node } of Object.values(this.lookNodes)) {
+      const rest = this.lookRestTransforms.get(node)
+      if (rest) rest.position.copy(node.position)
+    }
+  }
+
+  neutralizeMotionLookNodes() {
+    this.removeOverlay()
+    for (const [node, rest] of this.lookRestTransforms) {
+      node.position.copy(rest.position)
+      node.quaternion.copy(rest.rotation)
+    }
   }
 
   removeOverlay() {

@@ -154,6 +154,35 @@ describe('slash command bootstrap system skills', () => {
     )
   })
 
+  it('builds the batshit guide system skill command from the repo-backed bundle', async () => {
+    const { buildBatshitGuideSkillCommand } = await import(
+      '$lib/server/services/systemSlashCommands'
+    )
+
+    const command = await buildBatshitGuideSkillCommand('user-1', '2026-07-14T09:00:00.000Z')
+
+    expect(command.id).toBe('batshit-guide')
+    expect(command.skill_id).toBe('batshit_guide')
+    expect(command.invocation_pattern).toBe('/batshit-guide')
+    expect(command.is_system).toBe(true)
+    expect(command.icon_ref).toEqual({ kind: 'lucide', id: 'book-open' })
+    expect(command.enabled_for_all_agents).toBe(false)
+    expect(command.enabled_agent_ids).toEqual([])
+    const upsertInput = upsertSkillMock.mock.calls[0]?.[0]
+    expect(upsertInput).toEqual(
+      expect.objectContaining({
+        commandId: 'batshit-guide',
+        skill: expect.objectContaining({
+          hasReferences: true,
+          allowedTools: ['native_batshit_tool_search', 'native_batshit_tool_use', 'native_skill']
+        })
+      })
+    )
+    expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
+      '/batshit-app/src/lib/server/system-skills/batshit-guide'
+    )
+  })
+
   it('rebuilds system slash commands when backing skill records are missing', async () => {
     const existingCommands = new Map<string, Record<string, unknown>>([
       [
@@ -191,13 +220,23 @@ describe('slash command bootstrap system skills', () => {
 
     await ensureSystemSlashCommands('user-1')
 
-    expect(upsertSkillMock).toHaveBeenCalledTimes(5)
+    expect(upsertSkillMock).toHaveBeenCalledTimes(6)
     expect(redisJsonSetMock).toHaveBeenCalledWith(
       'slash_command:user-1:artifact-creator',
       '$',
       expect.objectContaining({
         id: 'artifact-creator',
         skill_id: 'artifact_creator'
+      })
+    )
+    // The existing five commands above deliberately omit batshit-guide: an
+    // instance bootstrapped before SA-092 must auto-heal the sixth built-in.
+    expect(redisJsonSetMock).toHaveBeenCalledWith(
+      'slash_command:user-1:batshit-guide',
+      '$',
+      expect.objectContaining({
+        id: 'batshit-guide',
+        skill_id: 'batshit_guide'
       })
     )
   })

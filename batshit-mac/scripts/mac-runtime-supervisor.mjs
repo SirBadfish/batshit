@@ -25,12 +25,10 @@ const packagedServerRoot = join(packagedRuntimeRoot, 'batshit-server', 'server')
 const packagedLiveKitSidecarSourceRoot = join(packagedRuntimeRoot, 'tools', 'livekit-agent-sidecar');
 const packagedRedisStackRoot = join(packagedRuntimeRoot, 'vendor', 'redis-stack');
 const packagedFfmpegRoot = join(packagedRuntimeRoot, 'vendor', 'ffmpeg');
+const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v3';
 const packagedFacialArtworkRoot = join(
   packagedRuntimeRoot,
-  'assets',
-  'goons',
-  'facial-artwork',
-  'v2'
+  ...FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
 );
 const fallbackRepoRoot = resolve(macRoot, '..');
 const usePackagedRuntime =
@@ -2908,7 +2906,7 @@ async function packageAudit(packagePath) {
       if (!/\.(html|js|json|plist|txt|md|env)$/i.test(entry.name)) continue;
       const text = await readFile(full, 'utf8').catch(() => '');
       if (
-        /\b(BATSHIT_TOKEN|ENCRYPTION_KEY|N8N_API_KEY|OPENAI_API_KEY)=(sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_-]{24,})\b/i.test(
+        /\b(BATSHIT_TOKEN|ENCRYPTION_KEY|N8N_API_KEY|OPENAI_API_KEY)=(?!replace-with-)(sk-[A-Za-z0-9_-]{12,}|[A-Za-z0-9_-]{24,})\b/i.test(
           text
         )
       ) {
@@ -2948,14 +2946,14 @@ async function packageAudit(packagePath) {
   }
   const facialArtworkAssets = runtimeManifest?.assets?.facialArtwork;
   if (
-    facialArtworkAssets?.contract !== 'facial-artwork/v2' ||
-    facialArtworkAssets?.root !== 'assets/goons/facial-artwork/v2' ||
-    facialArtworkAssets?.definition !== 'facial-artwork-v2.json' ||
+    facialArtworkAssets?.contract !== 'facial-artwork/v3' ||
+    facialArtworkAssets?.root !== FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT ||
+    facialArtworkAssets?.definition !== 'facial-artwork-v3.json' ||
     !Array.isArray(facialArtworkAssets?.files) ||
-    facialArtworkAssets.files.length < 19
+    facialArtworkAssets.files.length < 22
   ) {
     runtimeAssetIssues.push(
-      'runtime-manifest.json is missing the complete facial-artwork/v2 trusted asset inventory.'
+      'runtime-manifest.json is missing the complete facial-artwork/v3 trusted asset inventory.'
     );
   } else {
     const seenPaths = new Set();
@@ -2994,7 +2992,7 @@ async function packageAudit(packagePath) {
       }
     }
     if (!seenPaths.has(facialArtworkAssets.definition)) {
-      runtimeAssetIssues.push('The facial-artwork/v2 definition is absent from its runtime asset inventory.');
+      runtimeAssetIssues.push('The facial-artwork/v3 definition is absent from its runtime asset inventory.');
     }
   }
 

@@ -545,7 +545,7 @@ export function parseDials(
         raw.tier !== "advanced") ||
       !isFiniteNumber(raw.order) ||
       !Number.isInteger(raw.order) ||
-      !isNonEmptyString(raw.description) ||
+      typeof raw.description !== "string" ||
       !Array.isArray(raw.keywords) ||
       raw.keywords.length === 0 ||
       !raw.keywords.every(isNonEmptyString) ||

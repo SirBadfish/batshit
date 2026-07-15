@@ -63,7 +63,9 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       'definitionSha256',
       'templateId',
       'templateVersion',
+      'orientation',
       'guideSha256',
+      'maskSha256',
       'provenance'
     ]) {
       const value = form.get(field)
@@ -102,7 +104,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     })
   } catch (error) {
     console.error('Error uploading facial artwork:', error)
-    if (error instanceof Error && error.message.startsWith('[facial-artwork/v2]')) {
+    if (error instanceof Error && error.message.startsWith('[facial-artwork/v3]')) {
       return json({ error: error.message }, { status: 400 })
     }
     return json({ error: 'Failed to upload facial artwork' }, { status: 500 })

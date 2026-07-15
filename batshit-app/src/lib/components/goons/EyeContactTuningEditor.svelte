@@ -5,6 +5,7 @@
   import GoonsFieldLabel from '$lib/components/goons/GoonsFieldLabel.svelte'
   import { cn } from '$lib/utils'
   import { ArrowLeftRight, ArrowUpDown } from '@lucide/svelte'
+  import type { EyeAppearanceControlDefinition } from '$lib/goons/eyeAppearance'
   import type {
     GoonEyeContactMode,
     ResolvedGoonEyeContactTuning
@@ -16,9 +17,12 @@
     showMode?: boolean
     modeInfo?: string | string[] | null
     coordinationInfo?: string | string[] | null
+    eyeConvergenceControl?: EyeAppearanceControlDefinition | null
+    eyeConvergenceValue?: number | null
     class?: string
     onModeChange: (mode: GoonEyeContactMode) => void
     onTuningChange: (patch: Partial<ResolvedGoonEyeContactTuning>) => void
+    onEyeConvergenceChange?: ((value: number) => void) | null
   }
 
   let {
@@ -27,9 +31,12 @@
     showMode = true,
     modeInfo = null,
     coordinationInfo = null,
+    eyeConvergenceControl = null,
+    eyeConvergenceValue = null,
     class: className = '',
     onModeChange,
-    onTuningChange
+    onTuningChange,
+    onEyeConvergenceChange = null
   }: Props = $props()
 
   const modeOptions: Array<{ value: GoonEyeContactMode; label: string }> = [
@@ -56,6 +63,22 @@
 
   function formatMultiplier(value: number) {
     return `${value.toFixed(2)}x`
+  }
+
+  function formatDegrees(value: number, step: number) {
+    const digits = step < 1 ? 1 : 0
+    return `${value.toFixed(digits)} deg`
+  }
+
+  function updateEyeConvergence(value: number | number[]) {
+    if (!eyeConvergenceControl || eyeConvergenceValue === null || !onEyeConvergenceChange) return
+    onEyeConvergenceChange(
+      clamp(
+        normalizeSingleSliderValue(value, eyeConvergenceValue),
+        eyeConvergenceControl.minimum,
+        eyeConvergenceControl.maximum
+      )
+    )
   }
 
   function updateNumber(
@@ -119,6 +142,31 @@
   <div class="goon-eye-section">
     <div class="goon-eye-section-title">Eyes</div>
     <div class="goon-eye-grid">
+      {#if eyeConvergenceControl && eyeConvergenceValue !== null && onEyeConvergenceChange}
+        <div class="goon-eye-slider-field">
+          <div class="goon-eye-row-between">
+            <GoonsFieldLabel
+              label={eyeConvergenceControl.label}
+              info={eyeConvergenceControl.description}
+              ariaLabel={`About ${eyeConvergenceControl.label}`}
+            />
+            <span class="goon-eye-slider-value">
+              {formatDegrees(eyeConvergenceValue, eyeConvergenceControl.step)}
+            </span>
+          </div>
+          <Slider
+            type="single"
+            value={eyeConvergenceValue}
+            onValueChange={updateEyeConvergence}
+            min={eyeConvergenceControl.minimum}
+            max={eyeConvergenceControl.maximum}
+            step={eyeConvergenceControl.step}
+            fillFrom={eyeConvergenceControl.default}
+            showAnchorMarker={eyeConvergenceControl.minimum < eyeConvergenceControl.default && eyeConvergenceControl.maximum > eyeConvergenceControl.default}
+            aria-label={eyeConvergenceControl.label}
+          />
+        </div>
+      {/if}
       <div class="goon-eye-slider-field">
         <div class="goon-eye-row-between">
           <span class="goon-eye-slider-label goon-eye-slider-label-axis">

@@ -14,7 +14,7 @@ function canonical(path: string) {
   return JSON.parse(readFileSync(resolve(process.cwd(), path), 'utf8'))
 }
 
-const facialArtwork = canonical('static/goons/facial-artwork/v2/facial-artwork-v2.json')
+const facialArtwork = canonical('static/goons/facial-artwork/v3/facial-artwork-v3.json')
 const eyeAppearance = canonical('static/goons/eye-appearance/v1/eye-appearance-v1.json')
 const goon = {
   customAvatar: {

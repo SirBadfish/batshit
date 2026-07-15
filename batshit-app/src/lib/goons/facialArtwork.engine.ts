@@ -6,12 +6,13 @@ import {
   resolveFacialArtworkEyeState,
   resolveFacialArtworkState,
   type FacialArtworkArtworkLayer,
-  type FacialArtworkDefinitionV2,
+  type FacialArtworkDefinitionV3,
   type FacialArtworkEyeState,
   type FacialArtworkRoleDefinition,
   type FacialArtworkRoleId,
   type FacialArtworkSide,
-  type FacialArtworkStateV2
+  type FacialArtworkStateV3,
+  type FacialArtworkTemplate
 } from './facialArtwork'
 
 type RuntimeMesh = THREE.Mesh<THREE.BufferGeometry, THREE.Material | THREE.Material[]>
@@ -31,6 +32,14 @@ type Candidate = {
   assignments: Map<RuntimeMesh, CandidateAssignment>
   materials: Set<THREE.Material>
   textures: Set<THREE.Texture>
+  highlightProjections: Map<FacialArtworkSide, HighlightProjection>
+}
+
+type HighlightProjection = {
+  iris: RuntimeMesh
+  pupil: RuntimeMesh
+  irisTexture: THREE.Texture
+  pupilTexture: THREE.Texture
 }
 
 const SURFACE_ROLES = new Set<FacialArtworkRoleId>(['iris', 'pupil', 'sclera'])
@@ -96,7 +105,10 @@ function buildCanvasMaterial(
   material.premultipliedAlpha = false
   material.depthTest = true
   material.depthWrite = false
-  material.side = THREE.FrontSide
+  // Eyelid-owned artwork is a thin animated ribbon. Blink/wide morphs can
+  // legitimately turn a few presentation triangles through the camera plane
+  // at the canthi; render both faces so clean artwork never develops holes.
+  material.side = THREE.DoubleSide
   material.alphaTest = 0
   material.alphaToCoverage = false
   material.blending = THREE.NormalBlending
@@ -141,32 +153,154 @@ function textureKey(roleId: FacialArtworkRoleId, side: FacialArtworkSide) {
   return `${roleId}:${side}`
 }
 
-function configureArtworkTexture(
+export function resolveFacialArtworkHorizontalReflection(
+  targetMirrorU: boolean,
+  artwork: FacialArtworkArtworkLayer
+) {
+  return targetMirrorU !== (artwork.upload.template.orientation === 'anatomical-right')
+}
+
+export function resolveFacialArtworkEffectiveScale(
+  role: FacialArtworkRoleDefinition,
+  logicalScale: number
+) {
+  const effectiveScale = logicalScale * role.artworkScaleCalibration
+  if (!Number.isFinite(effectiveScale) || effectiveScale <= 0) {
+    fail(`${role.id} effective artwork scale must be a finite positive number`)
+  }
+  return effectiveScale
+}
+
+export function buildFacialArtworkTextureMatrix(
+  template: FacialArtworkTemplate,
+  role: FacialArtworkRoleDefinition,
+  side: FacialArtworkSide,
+  artwork: FacialArtworkArtworkLayer
+) {
+  const target = role.target[side]
+  const mirrorU = resolveFacialArtworkHorizontalReflection(target.mirrorU, artwork)
+  const mirrorV = target.mirrorV
+  const authoredRight = artwork.upload.template.orientation === 'anatomical-right'
+  const originU = authoredRight ? 1 - template.transformOriginUv[0] : template.transformOriginUv[0]
+  const originV = template.transformOriginUv[1]
+  const userMatrix = new THREE.Matrix3()
+
+  if (artwork.mapping === 'longitude') {
+    userMatrix.setUvTransform(
+      -artwork.transform.longitudeDegrees / 360,
+      0,
+      1,
+      1,
+      0,
+      originU,
+      originV
+    )
+  } else {
+    const repeat = 1 / resolveFacialArtworkEffectiveScale(role, artwork.transform.scale)
+    userMatrix.setUvTransform(
+      -artwork.transform.translateU,
+      artwork.transform.translateV,
+      repeat,
+      repeat,
+      THREE.MathUtils.degToRad(artwork.transform.rotationDegrees),
+      originU,
+      originV
+    )
+  }
+
+  const atlasReflection = new THREE.Matrix3().set(
+    mirrorU ? -1 : 1,
+    0,
+    mirrorU ? 1 : 0,
+    0,
+    mirrorV ? -1 : 1,
+    mirrorV ? 1 : 0,
+    0,
+    0,
+    1
+  )
+  return userMatrix.multiply(atlasReflection)
+}
+
+export function buildFacialArtworkPupilHighlightTextureMatrix(
+  irisTextureMatrix: THREE.Matrix3,
+  pupilToIrisRadiusRatio: number
+) {
+  if (!Number.isFinite(pupilToIrisRadiusRatio) || pupilToIrisRadiusRatio < 0) {
+    fail('pupil-to-iris highlight projection ratio must be a finite non-negative number')
+  }
+  const inset = (1 - pupilToIrisRadiusRatio) / 2
+  const pupilUvToIrisUv = new THREE.Matrix3().set(
+    pupilToIrisRadiusRatio,
+    0,
+    inset,
+    0,
+    pupilToIrisRadiusRatio,
+    inset,
+    0,
+    0,
+    1
+  )
+  return irisTextureMatrix.clone().multiply(pupilUvToIrisUv)
+}
+
+function radialExtent(mesh: RuntimeMesh) {
+  const position = mesh.geometry.getAttribute('position')
+  if (!position || position.itemSize !== 3 || position.count < 1) {
+    fail(`${mesh.name} must expose a non-empty VEC3 POSITION attribute for highlight projection`)
+  }
+  let minimumX = Number.POSITIVE_INFINITY
+  let maximumX = Number.NEGATIVE_INFINITY
+  let minimumY = Number.POSITIVE_INFINITY
+  let maximumY = Number.NEGATIVE_INFINITY
+  for (let index = 0; index < position.count; index += 1) {
+    minimumX = Math.min(minimumX, position.getX(index))
+    maximumX = Math.max(maximumX, position.getX(index))
+    minimumY = Math.min(minimumY, position.getY(index))
+    maximumY = Math.max(maximumY, position.getY(index))
+  }
+  return Math.max(maximumX - minimumX, maximumY - minimumY) / 2
+}
+
+function updateHighlightProjection(projection: HighlightProjection) {
+  const irisRadius = radialExtent(projection.iris)
+  if (!Number.isFinite(irisRadius) || irisRadius <= 0) {
+    fail(`${projection.iris.name} must retain a positive radius for highlight projection`)
+  }
+  const pupilToIrisRadiusRatio = radialExtent(projection.pupil) / irisRadius
+  projection.pupilTexture.matrix.copy(
+    buildFacialArtworkPupilHighlightTextureMatrix(
+      projection.irisTexture.matrix,
+      pupilToIrisRadiusRatio
+    )
+  )
+  projection.pupilTexture.matrixAutoUpdate = false
+  projection.pupilTexture.needsUpdate = true
+}
+
+export function configureArtworkTexture(
   textureValue: THREE.Texture,
+  template: FacialArtworkTemplate,
   role: FacialArtworkRoleDefinition,
   side: FacialArtworkSide,
   artwork: FacialArtworkArtworkLayer
 ) {
   textureValue.colorSpace = THREE.SRGBColorSpace
   textureValue.flipY = false
-  textureValue.center.set(0.5, 0.5)
-  const target = role.target[side]
 
   if (artwork.mapping === 'longitude') {
     textureValue.wrapS = THREE.RepeatWrapping
     textureValue.wrapT = THREE.ClampToEdgeWrapping
-    textureValue.repeat.set(target.mirrorU ? -1 : 1, target.mirrorV ? -1 : 1)
-    textureValue.offset.set(-artwork.transform.longitudeDegrees / 360, 0)
-    textureValue.rotation = 0
   } else {
     textureValue.wrapS = THREE.ClampToEdgeWrapping
     textureValue.wrapT = THREE.ClampToEdgeWrapping
-    const repeat = 1 / artwork.transform.scale
-    textureValue.repeat.set(target.mirrorU ? -repeat : repeat, target.mirrorV ? -repeat : repeat)
-    textureValue.offset.set(-artwork.transform.translateU, -artwork.transform.translateV)
-    textureValue.rotation = THREE.MathUtils.degToRad(artwork.transform.rotationDegrees)
   }
-  textureValue.matrixAutoUpdate = true
+  textureValue.center.set(0, 0)
+  textureValue.offset.set(0, 0)
+  textureValue.repeat.set(1, 1)
+  textureValue.rotation = 0
+  textureValue.matrix.copy(buildFacialArtworkTextureMatrix(template, role, side, artwork))
+  textureValue.matrixAutoUpdate = false
   textureValue.needsUpdate = true
 }
 
@@ -177,12 +311,13 @@ export class FacialArtworkEngineRuntime {
   private sourceTextures = new Map<string, THREE.Texture>()
   private sourceTextureLoads = new Map<string, Promise<THREE.Texture>>()
   private appliedUploadUrls = new Set<string>()
+  private highlightProjections = new Map<FacialArtworkSide, HighlightProjection>()
   private generation = 0
   private disposed = false
 
   constructor(
     private readonly root: THREE.Object3D,
-    readonly definition: FacialArtworkDefinitionV2,
+    readonly definition: FacialArtworkDefinitionV3,
     private readonly textureLoader: Pick<THREE.TextureLoader, 'loadAsync'> = new THREE.TextureLoader()
   ) {
     for (const role of definition.roles) {
@@ -197,7 +332,7 @@ export class FacialArtworkEngineRuntime {
     }
   }
 
-  async apply(value: FacialArtworkStateV2 | null | undefined) {
+  async apply(value: FacialArtworkStateV3 | null | undefined) {
     if (this.disposed) fail('cannot apply state after disposal')
     const state = resolveFacialArtworkState(this.definition, value)
     const generation = ++this.generation
@@ -222,6 +357,7 @@ export class FacialArtworkEngineRuntime {
     }
     this.ownedMaterials = candidate.materials
     this.ownedTextures = candidate.textures
+    this.highlightProjections = candidate.highlightProjections
 
     for (const material of previousMaterials) material.dispose()
     for (const textureValue of previousTextures) textureValue.dispose()
@@ -232,7 +368,7 @@ export class FacialArtworkEngineRuntime {
     return true
   }
 
-  private async buildCandidate(state: FacialArtworkStateV2): Promise<Candidate> {
+  private async buildCandidate(state: FacialArtworkStateV3): Promise<Candidate> {
     const textures = await this.loadTextures(state)
     const candidate: Candidate = {
       assignments: new Map(
@@ -242,7 +378,8 @@ export class FacialArtworkEngineRuntime {
         ])
       ),
       materials: new Set(),
-      textures: new Set(textures.values())
+      textures: new Set(textures.values()),
+      highlightProjections: new Map()
     }
 
     try {
@@ -266,14 +403,36 @@ export class FacialArtworkEngineRuntime {
         }
       }
 
+      const irisRole = this.definition.roles.find((entry) => entry.id === 'iris')!
+      const pupilRole = this.definition.roles.find((entry) => entry.id === 'pupil')!
+      const highlightRole = this.definition.roles.find((entry) => entry.id === 'eye_highlight')!
+      for (const side of ['left', 'right'] as const) {
+        const highlightState = resolveFacialArtworkEyeState(state, 'eye_highlight', side)
+        const irisTexture = textures.get(textureKey('eye_highlight', side))
+        if (!highlightState.visible || !highlightState.artwork || !irisTexture) continue
+        if (irisRole.target[side].runtimeNodes.length !== 1 || pupilRole.target[side].runtimeNodes.length !== 1) {
+          fail(`Eye Highlight requires one Iris and one Pupil runtime node for ${side}`)
+        }
+        const pupilTexture = irisTexture.clone()
+        const projection: HighlightProjection = {
+          iris: exactNamedMesh(this.root, irisRole.target[side].runtimeNodes[0]),
+          pupil: exactNamedMesh(this.root, pupilRole.target[side].runtimeNodes[0]),
+          irisTexture,
+          pupilTexture
+        }
+        updateHighlightProjection(projection)
+        candidate.textures.add(pupilTexture)
+        candidate.highlightProjections.set(side, projection)
+      }
+
       for (const role of this.definition.roles.filter((entry) => SURFACE_ROLES.has(entry.id))) {
         for (const side of ['left', 'right'] as const) {
           const eyeState = resolveFacialArtworkEyeState(state, role.id, side)
           const ownTexture = textures.get(textureKey(role.id, side))
           const highlightState = resolveFacialArtworkEyeState(state, 'eye_highlight', side)
-          const highlightRole = this.definition.roles.find((entry) => entry.id === 'eye_highlight')!
           const highlightTexture = textures.get(textureKey('eye_highlight', side))
           const highlightTargets = new Set(highlightRole.target[side].runtimeNodes)
+          const highlightProjection = candidate.highlightProjections.get(side)
 
           for (const name of role.target[side].runtimeNodes) {
             const mesh = exactNamedMesh(this.root, name)
@@ -286,7 +445,13 @@ export class FacialArtworkEngineRuntime {
               highlightTexture &&
               highlightTargets.has(name)
             ) {
-              layers.push({ texture: highlightTexture, artwork: highlightState.artwork })
+              layers.push({
+                texture:
+                  role.id === 'pupil' && highlightProjection
+                    ? highlightProjection.pupilTexture
+                    : highlightTexture,
+                artwork: highlightState.artwork
+              })
             }
             if (!eyeState.baseColor) fail(`${role.id} must provide an opaque base color`)
             candidate.assignments.set(mesh, {
@@ -318,15 +483,18 @@ export class FacialArtworkEngineRuntime {
     return Array.isArray(original) ? materials : materials[0]
   }
 
-  private async loadTextures(state: FacialArtworkStateV2) {
+  private async loadTextures(state: FacialArtworkStateV3) {
     const requests: Array<{
       key: string
       url: string
       role: FacialArtworkRoleDefinition
+      template: FacialArtworkTemplate
       side: FacialArtworkSide
       artwork: FacialArtworkArtworkLayer
     }> = []
     for (const role of this.definition.roles) {
+      const template = this.definition.templates.find((candidate) => candidate.id === role.template)
+      if (!template) fail(`definition has no template ${role.template}`)
       for (const side of ['left', 'right'] as const) {
         const eyeState = resolveFacialArtworkEyeState(state, role.id, side)
         if (!eyeState.visible || !eyeState.artwork) continue
@@ -334,6 +502,7 @@ export class FacialArtworkEngineRuntime {
           key: textureKey(role.id, side),
           url: eyeState.artwork.upload.url,
           role,
+          template,
           side,
           artwork: eyeState.artwork
         })
@@ -345,7 +514,13 @@ export class FacialArtworkEngineRuntime {
       requests.map(async (request) => {
         const source = await this.loadSourceTexture(request.url)
         const textureValue = source.clone()
-        configureArtworkTexture(textureValue, request.role, request.side, request.artwork)
+        configureArtworkTexture(
+          textureValue,
+          request.template,
+          request.role,
+          request.side,
+          request.artwork
+        )
         return { key: request.key, textureValue }
       })
     )
@@ -406,6 +581,13 @@ export class FacialArtworkEngineRuntime {
     }
   }
 
+  reprojectEyeHighlights() {
+    if (this.disposed) return
+    for (const projection of this.highlightProjections.values()) {
+      updateHighlightProjection(projection)
+    }
+  }
+
   dispose() {
     if (this.disposed) return
     this.disposed = true
@@ -416,6 +598,7 @@ export class FacialArtworkEngineRuntime {
     for (const textureValue of this.sourceTextures.values()) textureValue.dispose()
     this.ownedMaterials.clear()
     this.ownedTextures.clear()
+    this.highlightProjections.clear()
     this.sourceTextures.clear()
     this.sourceTextureLoads.clear()
   }

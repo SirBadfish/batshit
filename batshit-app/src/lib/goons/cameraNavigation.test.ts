@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import * as THREE from 'three'
 import {
+  GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY,
   clampCameraPositionToPaddedBox,
   pointerClientToNdc,
   resolveCinematicGoonZoomTarget,
@@ -277,6 +278,38 @@ describe('Goon camera navigation', () => {
       expect(restored.logicalPosition).toBeCloseTo(logicalPosition, 10)
       expect(restored.distance).toBeCloseTo(start.distance, 10)
       expect(restored.fov).toBeCloseTo(start.fov, 10)
+    }
+  })
+
+  it('uses the same reduced production wheel rate for zooming in and out', () => {
+    const config = {
+      minDistance: 0.8,
+      maxDistance: 18,
+      minFov: 15,
+      baseFov: 65,
+      maxFov: 100
+    }
+    const rawWheelDelta = 40
+    const expectedLogicalStep = rawWheelDelta * GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY
+
+    expect(GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY).toBe(0.0005)
+    for (const logicalPosition of [0.1, 0.5, 0.9]) {
+      const start = resolveHybridCameraZoomAtPosition({ ...config, logicalPosition })
+      const zoomedOut = resolveHybridCameraZoom({
+        ...config,
+        currentDistance: start.distance,
+        currentFov: start.fov,
+        delta: rawWheelDelta
+      })
+      const zoomedIn = resolveHybridCameraZoom({
+        ...config,
+        currentDistance: start.distance,
+        currentFov: start.fov,
+        delta: -rawWheelDelta
+      })
+
+      expect(zoomedOut.logicalPosition - logicalPosition).toBeCloseTo(expectedLogicalStep, 12)
+      expect(logicalPosition - zoomedIn.logicalPosition).toBeCloseTo(expectedLogicalStep, 12)
     }
   })
 

@@ -186,6 +186,7 @@ describe('goons service create flow', () => {
   it('uploads exact facial-artwork metadata through the Goon-owned route', async () => {
     const definitionSha256 = 'a'.repeat(64)
     const guideSha256 = 'b'.repeat(64)
+    const maskSha256 = 'd'.repeat(64)
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       expect(String(input)).toBe('/api/goons/goon_custom_1/facial-artwork')
       const form = init?.body as FormData
@@ -193,7 +194,9 @@ describe('goons service create flow', () => {
       expect(form.get('definitionSha256')).toBe(definitionSha256)
       expect(form.get('templateId')).toBe('brow-canvas')
       expect(form.get('templateVersion')).toBe('2.0.0')
+      expect(form.get('orientation')).toBe('anatomical-left')
       expect(form.get('guideSha256')).toBe(guideSha256)
+      expect(form.get('maskSha256')).toBe(maskSha256)
       expect(JSON.parse(String(form.get('provenance')))).toEqual({
         sourceKind: 'user-authored',
         author: 'Fixture Artist',
@@ -212,7 +215,9 @@ describe('goons service create flow', () => {
             template: {
               id: 'brow-canvas',
               version: '2.0.0',
-              guideSha256
+              orientation: 'anatomical-left',
+              guideSha256,
+              maskSha256
             },
             provenance: {
               sourceKind: 'user-authored',
@@ -235,7 +240,9 @@ describe('goons service create flow', () => {
         definitionSha256,
         templateId: 'brow-canvas',
         templateVersion: '2.0.0',
+        orientation: 'anatomical-left',
         guideSha256,
+        maskSha256,
         provenance: {
           sourceKind: 'user-authored',
           author: 'Fixture Artist',

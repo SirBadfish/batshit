@@ -1,7 +1,11 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { createDefaultFacialArtworkState, parseFacialArtworkDefinition } from '$lib/goons/facialArtwork'
+import {
+  createDefaultFacialArtworkState,
+  parseFacialArtworkDefinition,
+  resolveFacialArtworkTemplateVariant
+} from '$lib/goons/facialArtwork'
 import {
   loadGoonFacialArtworkDefinition,
   validateGoonFacialArtworkState
@@ -10,7 +14,7 @@ import {
 function canonicalDefinition() {
   return JSON.parse(
     readFileSync(
-      resolve(process.cwd(), 'static/goons/facial-artwork/v2/facial-artwork-v2.json'),
+      resolve(process.cwd(), 'static/goons/facial-artwork/v3/facial-artwork-v3.json'),
       'utf8'
     )
   )
@@ -41,7 +45,7 @@ describe('facialArtwork.server', () => {
     await expect(
       loadGoonFacialArtworkDefinition(reader({ facialArtwork: definition }), goon)
     ).resolves.toMatchObject({
-      schemaVersion: 'facial-artwork/v2',
+      schemaVersion: 'facial-artwork/v3',
       definitionSha256: definition.definitionSha256
     })
   })
@@ -89,6 +93,7 @@ describe('facialArtwork.server', () => {
     const state = createDefaultFacialArtworkState(definition)
     const role = definition.roles.find((candidate) => candidate.id === 'brows')!
     const template = definition.templates.find((candidate) => candidate.id === role.template)!
+    const variant = resolveFacialArtworkTemplateVariant(template, template.canonicalOrientation)
     const artwork = {
       role: 'brows' as const,
       url: '/uploads/goon_facial_artwork/brow-left.png',
@@ -99,7 +104,9 @@ describe('facialArtwork.server', () => {
       template: {
         id: template.id,
         version: template.version,
-        guideSha256: template.guide.sha256
+        orientation: template.canonicalOrientation,
+        guideSha256: variant.guide.sha256,
+        maskSha256: variant.safePaintMask.sha256
       },
       provenance: {
         sourceKind: 'user-authored' as const,

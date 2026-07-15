@@ -16,7 +16,7 @@ const logger = require('../utils/logger');
 const batshitzipService = require('../services/batshitZipService');
 const redisService = require('../services/redisService');
 const uploadManager = require('../services/uploadManager');
-const { validateFacialArtworkUpload } = require('../services/facialArtworkValidator');
+const { prepareFacialArtworkUpload } = require('../services/facialArtworkValidator');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -2059,8 +2059,9 @@ router.post('/upload/goon-animation-preview', goonAnimationPreviewUpload.single(
   }
 });
 
-// First-party facial artwork upload. Bytes are validated and stored exactly;
-// resizing/re-encoding would break the package-bound SHA-256 contract.
+// First-party facial artwork upload. Batshit prepares canonical sRGB/RGBA8
+// bytes against the package-owned safe mask, then validates and stores those
+// exact prepared bytes. Template dimensions remain strict: no resampling.
 router.post('/upload/goon-facial-artwork', goonFacialArtworkUpload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -2070,15 +2071,18 @@ router.post('/upload/goon-facial-artwork', goonFacialArtworkUpload.single('file'
     if (path.extname(originalName).toLowerCase() !== '.png' || req.file.mimetype !== 'image/png') {
       throw uploadValidationError('Facial artwork must be a PNG image.');
     }
-    const validation = await validateFacialArtworkUpload({
+    const prepared = await prepareFacialArtworkUpload({
       buffer: req.file.buffer,
       role: req.body?.role,
       definitionSha256: req.body?.definitionSha256,
       templateId: req.body?.templateId,
       templateVersion: req.body?.templateVersion,
+      orientation: req.body?.orientation,
       guideSha256: req.body?.guideSha256,
+      maskSha256: req.body?.maskSha256,
       provenance: req.body?.provenance
     });
+    const validation = prepared.artwork;
     const safeBase =
       sanitizeFilenameSegment(path.basename(originalName, '.png'), validation.role).slice(0, 80) ||
       validation.role;
@@ -2088,11 +2092,11 @@ router.post('/upload/goon-facial-artwork', goonFacialArtworkUpload.single('file'
       originalName,
       filename,
       mimetype: 'image/png',
-      buffer: req.file.buffer,
-      size: req.file.size,
+      buffer: prepared.buffer,
+      size: prepared.buffer.length,
       metadata: { facialArtwork: validation }
     });
-    return res.json({ success: true, file, artwork: validation });
+    return res.json({ success: true, file, artwork: validation, preparation: prepared.preparation });
   } catch (error) {
     logger.error('Goon facial artwork upload error:', error);
     sendUploadError(res, 'Facial artwork upload failed', error);

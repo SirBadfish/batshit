@@ -54,7 +54,7 @@ export async function loadGoonEyeAppearanceDefinition(
   }
   const definition = parseEyeAppearanceDefinition(manifest.eyeAppearance)
   if (manifest.facialArtwork === undefined) {
-    fail('eye-appearance/v1 requires the matching facial-artwork/v2 package definition')
+    fail('eye-appearance/v1 requires the matching facial-artwork/v3 package definition')
   }
   const facialArtwork = parseFacialArtworkDefinition(manifest.facialArtwork)
   if (definition.facialArtworkDependency.definitionSha256 !== facialArtwork.definitionSha256) {

@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import {
+  resolveEyeAppearanceRuntimeControlValue,
   resolveEyeAppearanceState,
   type EyeAppearanceDefinitionV1,
   type EyeAppearanceRuntimeSideBinding,
@@ -323,17 +324,29 @@ export class EyeAppearanceEngineRuntime {
   }
 
   private rotationFor(runtime: RuntimeSide) {
-    return new THREE.Quaternion().setFromAxisAngle(
+    const tilt = new THREE.Quaternion().setFromAxisAngle(
       tupleVector(runtime.spec.tiltAxisParent),
       THREE.MathUtils.degToRad(this.state.scleraFit.tilt * runtime.spec.tiltSign)
     )
+    const convergence = new THREE.Quaternion().setFromAxisAngle(
+      tupleVector(runtime.spec.convergenceAxisParent),
+      THREE.MathUtils.degToRad(
+        resolveEyeAppearanceRuntimeControlValue(
+          this.definition,
+          'eye_convergence',
+          this.state.eyeConvergence
+        ) * runtime.spec.convergenceSign
+      )
+    )
+    return convergence.multiply(tilt).normalize()
   }
 
   private applyStaticState() {
     resizeConformally(this.sides.left.iris, this.state.irisSize)
     resizeConformally(this.sides.right.iris, this.state.irisSize)
-    resizeConformally(this.sides.left.pupil, this.state.pupilSize)
-    resizeConformally(this.sides.right.pupil, this.state.pupilSize)
+    const pupilMultiplier = this.state.irisSize * this.state.pupilSize
+    resizeConformally(this.sides.left.pupil, pupilMultiplier)
+    resizeConformally(this.sides.right.pupil, pupilMultiplier)
     for (const side of ['left', 'right'] as const) this.applyInverseCorrection(this.sides[side])
   }
 

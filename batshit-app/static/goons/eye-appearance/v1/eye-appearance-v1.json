@@ -3,18 +3,19 @@
   "stateSchemaVersion": "eye-appearance-state/v1",
   "status": "in-development-product-export-unapproved",
   "productExportApproved": false,
-  "definitionSha256": "ead3b1bba85b06675aa042943db4b5bc1f562c4aeb8ddc88c9976eb1533c1fa5",
+  "definitionSha256": "893524d10fb17a1523242508e58b195e17a149bd5b6cafda763264c5a1a66cfb",
   "facialArtworkDependency": {
-    "schemaVersion": "facial-artwork/v2",
-    "definitionSha256": "f4c8dedfacb29d2bbc1b2d2ed8c7b0c5385f694ffe588a865d880c54b84d589b"
+    "schemaVersion": "facial-artwork/v3",
+    "definitionSha256": "c0a9cb6dc2b7e5358dc61e6178ab9366a28d9913c4faa7bb1332500922a70d3a"
   },
-  "ownership": "package-owned-physical-eye-controls-separate-from-appearance-dials-v2-and-facial-artwork-state-v2",
-  "zeroLaw": "iris/pupil use exact 1.0 neutral multipliers; all five sclera-fit controls use zero-centered post-fit offsets; reset reproduces automatic Recipe fit",
-  "symmetryLaw": "all seven controls are linked bilateral scalars; asymmetric/per-eye state is forbidden in v1",
+  "ownership": "package-owned physical eye controls stored separately from appearance-dials/v2 and facial-artwork-state/v3; Eye Convergence renders in per-Goon Eye Contact while Iris/Pupil and Sclera Fit render in their owning appearance editors",
+  "zeroLaw": "iris/pupil use exact 1.0 neutral multipliers; Eye Convergence logical zero adds the package-calibrated 4-degree inward neutral; all five sclera-fit controls use zero-centered post-fit offsets",
+  "symmetryLaw": "all eight controls are linked bilateral scalars; asymmetric/per-eye state is forbidden in v1",
   "compositionOrder": [
     "automatic-recipe-fit",
     "iris-pupil-conformal-size-and-reprojection",
     "complete-eye-sclera-fit-assembly-offsets",
+    "neutral-eye-convergence",
     "gaze-performance"
   ],
   "completeEyeAssemblyNodes": [
@@ -47,8 +48,8 @@
   },
   "runtimeBindings": {
     "coordinateSpace": "eye-bone-parent-gltf",
-    "pivotBindingLaw": "resolve the current Recipe eye-bone rest first, then compose the linked complete-eye Sclera Fit translation/tilt against that rest; zero offsets reproduce the Recipe result exactly",
-    "inverseBindLaw": "translation or tilt rebases the matching eye-bone rest and inverse bind before gaze performance; never translate child meshes without the pivot",
+    "pivotBindingLaw": "resolve the current Recipe eye-bone rest first, then compose linked complete-eye Sclera Fit translation/tilt and logical Eye Convergence plus its package-owned 4-degree neutral offset against that rest",
+    "inverseBindLaw": "translation, tilt, or convergence rebases the matching eye-bone rest and inverse bind before gaze performance; never transform child meshes without the pivot",
     "conformalLaw": "resize each freshly Recipe-resolved iris/pupil disc radially about its local center, reproject every vertex to the current fitted sclera ellipsoid along opticalAxisLocal, then preserve its authored surface offset",
     "geometryEvidence": {
       "acceptedV4GlbSha256": "d649400a57fe721be6afa5cbd19bbd50b54b14e20ccd981876d12926e9b38b79",
@@ -97,8 +98,14 @@
         0.0,
         1.0
       ],
+      "convergenceAxisParent": [
+        0.0,
+        1.0,
+        0.0
+      ],
       "horizontalSign": 1,
       "tiltSign": 1,
+      "convergenceSign": -1,
       "conformal": {
         "scleraNode": "bs_f1_eye_l_sclera",
         "irisNode": "bs_f1_eye_l_iris",
@@ -169,8 +176,14 @@
         0.0,
         1.0
       ],
+      "convergenceAxisParent": [
+        0.0,
+        1.0,
+        0.0
+      ],
       "horizontalSign": -1,
       "tiltSign": -1,
+      "convergenceSign": 1,
       "conformal": {
         "scleraNode": "bs_f1_eye_r_sclera",
         "irisNode": "bs_f1_eye_r_iris",
@@ -204,10 +217,12 @@
     {
       "id": "iris_size",
       "label": "Iris Size",
+      "description": "Makes both irises smaller or larger while keeping them fitted to the sclera.",
       "minimum": 0.75,
       "maximum": 1.35,
       "step": 0.01,
       "default": 1.0,
+      "runtimeNeutralOffset": 0.0,
       "unit": "neutral-multiplier",
       "linkedBilateral": true,
       "perEyeOverridesAllowed": false,
@@ -217,23 +232,42 @@
     {
       "id": "pupil_size",
       "label": "Pupil Size",
-      "minimum": 0.5,
-      "maximum": 1.5,
+      "description": "Sets both pupil sizes relative to the current iris size. Zero hides the pupil; two doubles the neutral pupil-to-iris ratio.",
+      "minimum": 0.0,
+      "maximum": 2.0,
       "step": 0.01,
       "default": 1.0,
-      "unit": "neutral-multiplier",
+      "runtimeNeutralOffset": 0.0,
+      "unit": "iris-relative-multiplier",
       "linkedBilateral": true,
       "perEyeOverridesAllowed": false,
       "runtimeClampingAllowed": false,
-      "geometrySemantics": "radial-angular resize then reproject every pupil vertex to the freshly resolved fitted sclera surface while preserving authored offset"
+      "geometrySemantics": "multiply the neutral pupil-to-iris ratio, inherit current Iris Size, then reproject every pupil vertex to the freshly resolved fitted sclera surface while preserving authored offset"
+    },
+    {
+      "id": "eye_convergence",
+      "label": "Eye Convergence (Gaze)",
+      "description": "Adjusts gaze distance. Negative looks farther away; positive turns both eyes inward toward a nearer focus.",
+      "minimum": -10.0,
+      "maximum": 8.0,
+      "step": 0.1,
+      "default": 0.0,
+      "runtimeNeutralOffset": 4.0,
+      "unit": "degrees",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "rotate the complete left/right eye assemblies around their current Recipe-fitted pivots in opposite parent-space yaw directions before gaze performance"
     },
     {
       "id": "sclera_scale",
       "label": "Sclera Scale",
-      "minimum": -0.1,
-      "maximum": 0.1,
+      "description": "Makes both complete eye assemblies smaller or larger after automatic fitting.",
+      "minimum": -0.2,
+      "maximum": 0.2,
       "step": 0.005,
       "default": 0.0,
+      "runtimeNeutralOffset": 0.0,
       "unit": "post-fit-multiplier-offset",
       "linkedBilateral": true,
       "perEyeOverridesAllowed": false,
@@ -243,10 +277,12 @@
     {
       "id": "sclera_tilt",
       "label": "Sclera Tilt",
-      "minimum": -3.5,
-      "maximum": 3.5,
+      "description": "Tilts both fitted eyes in mirrored anatomical directions.",
+      "minimum": -7.0,
+      "maximum": 7.0,
       "step": 0.1,
       "default": 0.0,
+      "runtimeNeutralOffset": 0.0,
       "unit": "degrees",
       "linkedBilateral": true,
       "perEyeOverridesAllowed": false,
@@ -256,10 +292,12 @@
     {
       "id": "sclera_horizontal_position",
       "label": "Sclera Horizontal Position",
-      "minimum": -0.001438,
-      "maximum": 0.001438,
+      "description": "Moves both fitted eyes inward or outward together.",
+      "minimum": -0.0028,
+      "maximum": 0.0028,
       "step": 5e-05,
       "default": 0.0,
+      "runtimeNeutralOffset": 0.0,
       "unit": "meters",
       "linkedBilateral": true,
       "perEyeOverridesAllowed": false,
@@ -269,10 +307,12 @@
     {
       "id": "sclera_vertical_position",
       "label": "Sclera Vertical Position",
-      "minimum": -0.001367,
-      "maximum": 0.001367,
+      "description": "Moves both fitted eyes down or up together.",
+      "minimum": -0.0027,
+      "maximum": 0.0027,
       "step": 5e-05,
       "default": 0.0,
+      "runtimeNeutralOffset": 0.0,
       "unit": "meters",
       "linkedBilateral": true,
       "perEyeOverridesAllowed": false,
@@ -282,10 +322,12 @@
     {
       "id": "sclera_depth",
       "label": "Sclera Depth",
-      "minimum": -0.000742,
-      "maximum": 0.000742,
+      "description": "Moves both fitted eyes deeper into or farther out of the sockets.",
+      "minimum": -0.0029,
+      "maximum": 0.0029,
       "step": 2.5e-05,
       "default": 0.0,
+      "runtimeNeutralOffset": 0.0,
       "unit": "meters",
       "linkedBilateral": true,
       "perEyeOverridesAllowed": false,
@@ -295,7 +337,7 @@
   ],
   "rangeEvidence": {
     "schemaVersion": "sa090-eye-appearance-range-calibration/v1",
-    "sha256": "7252696f562b4e146e644151f63c452b6508178b2454096f00c02fcdb3fdcd92",
-    "canonicalSha256": "0cf94cec3c2cff84e47acaa884b443e8a418cdb4cc804b542716c3d299f7eafe"
+    "sha256": "aa60542a5658d287efc7f40d532b13d4d7541a59fd07412a224c71188ce47ce6",
+    "canonicalSha256": "912e8014d6e399fe7d1287f907d646ed0ecd2458bf8b15cd9d32eb4aaf46dec0"
   }
 }

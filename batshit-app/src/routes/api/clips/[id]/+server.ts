@@ -42,13 +42,15 @@ export const GET: RequestHandler = async ({ params, locals, url }) => {
       clipData = await redis.get(`clip:system:${clipId}`)
       if (clipData) {
         const systemClipRow = clipData as ClipRow
-        return json(
-          resolveUploadUrlsForBrowserInPayload({
+        // modelFacingUrl attaches AFTER browser resolution: it is deliberately
+        // tunnel/model-facing (G-0063) and must not be rebased to the browser base.
+        return json({
+          ...resolveUploadUrlsForBrowserInPayload({
             ...systemClipRow,
-            systemClip: true,
-            ...(await withModelUrl(systemClipRow))
-          })
-        )
+            systemClip: true
+          }),
+          ...(await withModelUrl(systemClipRow))
+        })
       }
     }
 
@@ -76,13 +78,15 @@ export const GET: RequestHandler = async ({ params, locals, url }) => {
       }
     }
 
-    return json(
-      resolveUploadUrlsForBrowserInPayload({
+    // modelFacingUrl attaches AFTER browser resolution: it is deliberately
+    // tunnel/model-facing (G-0063) and must not be rebased to the browser base.
+    return json({
+      ...resolveUploadUrlsForBrowserInPayload({
         ...clip,
-        systemClip: false,
-        ...(await withModelUrl(clip))
-      })
-    )
+        systemClip: false
+      }),
+      ...(await withModelUrl(clip))
+    })
   } catch (error) {
     console.error('Error fetching clip:', error)
     return json(

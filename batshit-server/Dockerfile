@@ -23,7 +23,7 @@ COPY --from=deps /opt/batshit/batshit-server/server/node_modules ./node_modules
 COPY batshit-server/server/package*.json ./
 COPY batshit-server/server/markdownlint_fix_helper.js ./markdownlint_fix_helper.js
 COPY batshit-server/server/src ./src
-COPY batshit-app/static/goons/facial-artwork/v2 /opt/batshit/batshit-app/static/goons/facial-artwork/v2
+COPY batshit-app/static/goons/facial-artwork/v3 /opt/batshit/batshit-app/static/goons/facial-artwork/v3
 
 RUN mkdir -p /data/uploads
 

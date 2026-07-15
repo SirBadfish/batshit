@@ -9,7 +9,8 @@ import { redis } from '$lib/server/redis'
 import {
   createDefaultFacialArtworkState,
   createFacialArtworkArtworkLayer,
-  parseFacialArtworkDefinition
+  parseFacialArtworkDefinition,
+  resolveFacialArtworkTemplateVariant
 } from '$lib/goons/facialArtwork'
 import {
   createDefaultEyeAppearanceState,
@@ -113,13 +114,17 @@ async function seedRepresentativeData(userId: string) {
   const facialDefinition = parseFacialArtworkDefinition(
     JSON.parse(
       await fs.readFile(
-        path.resolve(process.cwd(), 'static/goons/facial-artwork/v2/facial-artwork-v2.json'),
+        path.resolve(process.cwd(), 'static/goons/facial-artwork/v3/facial-artwork-v3.json'),
         'utf8'
       )
     )
   )
   const browRole = facialDefinition.roles.find((entry) => entry.id === 'brows')!
   const browTemplate = facialDefinition.templates.find((entry) => entry.id === browRole.template)!
+  const browVariant = resolveFacialArtworkTemplateVariant(
+    browTemplate,
+    browTemplate.canonicalOrientation
+  )
   const facialUpload = {
     role: 'brows' as const,
     url: 'http://localhost:5600/uploads/goon_facial_artwork/brow-left.png',
@@ -130,7 +135,9 @@ async function seedRepresentativeData(userId: string) {
     template: {
       id: browTemplate.id,
       version: browTemplate.version,
-      guideSha256: browTemplate.guide.sha256
+      orientation: browTemplate.canonicalOrientation,
+      guideSha256: browVariant.guide.sha256,
+      maskSha256: browVariant.safePaintMask.sha256
     },
     provenance: {
       sourceKind: 'user-authored' as const,
