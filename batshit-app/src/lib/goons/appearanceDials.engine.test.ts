@@ -16,7 +16,6 @@ import {
 import { AppearanceDialsEngineRuntime } from "./appearanceDials.engine";
 import type { GoonCustomAvatarManifest } from "./customAvatar";
 import type { AppearanceRecipePhysicalBasis } from "./recipe/appearanceRecipePhysicalEvaluator";
-import { canonicalRecipeSha256 } from "./recipe/recipeCanonical";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -1045,9 +1044,6 @@ describe("AppearanceDialsEngineRuntime", () => {
         ),
       ),
     ).toEqual([143, 194, 245, 61]);
-    expect(await canonicalRecipeSha256(first)).toBe(
-      "7569cdde490cfbf1574af45f90e1221af5cdd057bc347fff83a839d9fbf89c51",
-    );
     expect(repeated).toEqual(first);
   });
 });

@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   planAppearanceRecipeCleanReset,
@@ -9,22 +7,11 @@ import {
   type AppearanceRecipeMigrationPlannerInput,
 } from "./appearanceRecipeMigrationPlanner";
 import { createRecipePhysicalMigrationFixture } from "./fixtures/recipePhysicalMigrationPair";
+import fixtureOracle from "./fixtures/recipePhysicalMigrationOracle.json";
 import { recipeMigrationPlanSha256 } from "./migrationPlanContracts";
 import { canonicalRecipeSha256 } from "./recipeCanonical";
 
 const mutable = <T>(value: T): any => structuredClone(value);
-
-function fixtureOracle(): Record<string, string> {
-  return JSON.parse(
-    readFileSync(
-      resolve(
-        process.cwd(),
-        "../_private/dev-doc/architecture/deep-dives/makehuman/sa090-recipe-r2-physical-fixture-oracle.json",
-      ),
-      "utf8",
-    ),
-  );
-}
 
 async function plannerInput(
   includeComponentMap = true,
@@ -89,13 +76,12 @@ describe("Appearance Recipe migration planner", () => {
       mismatchDomains: [],
       permitsAppearancePreservedClaim: true,
     });
-    const oracle = fixtureOracle();
-    expect(first.planSha256).toBe(oracle.automaticPlanSha256);
+    expect(first.planSha256).toBe(fixtureOracle.automaticPlanSha256);
     expect(await canonicalRecipeSha256(first.componentProofs)).toBe(
-      oracle.automaticComponentProofsSha256,
+      fixtureOracle.automaticComponentProofsSha256,
     );
     expect(first.wholeRecipeProof.proofSha256).toBe(
-      oracle.automaticWholeRecipeProofSha256,
+      fixtureOracle.automaticWholeRecipeProofSha256,
     );
     await expect(
       verifyPlannedAppearanceRecipeMigration(first, input),
@@ -115,8 +101,7 @@ describe("Appearance Recipe migration planner", () => {
   it("returns unsupported without the required coupled map, then permits only a separately cited clean reset", async () => {
     const input = await plannerInput(false);
     const unsupported = await planAppearanceRecipeMigration(input);
-    const oracle = fixtureOracle();
-    expect(unsupported.planSha256).toBe(oracle.unsupportedPlanSha256);
+    expect(unsupported.planSha256).toBe(fixtureOracle.unsupportedPlanSha256);
     expect(unsupported.outcome).toMatchObject({
       kind: "unsupported",
       readiness: "blocked",
@@ -133,7 +118,7 @@ describe("Appearance Recipe migration planner", () => {
       eligibleUnsupportedPlan: unsupported,
     };
     const reset = await planAppearanceRecipeCleanReset(resetInput);
-    expect(reset.planSha256).toBe(oracle.cleanResetPlanSha256);
+    expect(reset.planSha256).toBe(fixtureOracle.cleanResetPlanSha256);
     expect(reset.outcome).toMatchObject({
       kind: "clean-reset",
       readiness: "preview-required",

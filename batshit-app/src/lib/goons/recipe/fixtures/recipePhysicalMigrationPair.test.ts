@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { unzipSync } from "fflate";
 import { describe, expect, it } from "vitest";
 import { parseAppearanceDialsManifest } from "../../appearanceDials.schema";
@@ -16,6 +14,7 @@ import {
   RECIPE_PHYSICAL_MIGRATION_FIXTURE_CONTRACT,
   createRecipePhysicalMigrationFixture,
 } from "./recipePhysicalMigrationPair";
+import recipePhysicalMigrationOracle from "./recipePhysicalMigrationOracle.json";
 
 function membershipFor(
   graph: ReturnType<typeof buildAppearanceRecipeDependencyGraph>,
@@ -84,16 +83,7 @@ describe("SA-090 R2 physical migration fixture", () => {
 
   it("matches the separate frozen R2 physical oracle", async () => {
     const fixture = await createRecipePhysicalMigrationFixture();
-    const oracle = JSON.parse(
-      readFileSync(
-        resolve(
-          process.cwd(),
-          "../_private/dev-doc/architecture/deep-dives/makehuman/sa090-recipe-r2-physical-fixture-oracle.json",
-        ),
-        "utf8",
-      ),
-    );
-    expect(oracle).toMatchObject({
+    expect(recipePhysicalMigrationOracle).toMatchObject({
       contract: "sa090-recipe-r2-physical-fixture-oracle/v1",
       fixtureSha256: fixture.fixtureSha256,
       sourcePackageSha256: fixture.source.recipeSource.package.sha256,
