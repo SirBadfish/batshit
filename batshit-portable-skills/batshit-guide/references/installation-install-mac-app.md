@@ -81,7 +81,7 @@ The Mac app still owns startup, restart, repair, logs, and local data. Browser c
 
 Closing the Batshit window or quitting the app (Cmd+Q, or Dock right-click → Quit) stops the whole Batshit runtime: the app and server services, the Mac-app-owned Redis process, upload tunnels, and any local voice engines Batshit started for you.
 
-A small "Stopping Batshit services…" notice appears while this happens. It usually takes a few seconds, and the app closes itself once everything has stopped cleanly. If anything from an earlier session was left behind — say, after a crash or force-quit — the next launch cleans it up automatically before starting fresh.
+A small "Stopping Batshit services…" notice remains responsive while this happens. The app closes itself once every managed service has stopped cleanly; you should not need to force-quit it. If anything from an earlier session was left behind — say, after a crash or force-quit — the next launch cleans it up automatically before starting fresh.
 
 If you were using Batshit in a separate browser window, that window stops working after you quit the app, because quitting stops the shared runtime.
 

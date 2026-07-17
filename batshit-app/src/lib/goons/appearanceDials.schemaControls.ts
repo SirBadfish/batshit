@@ -551,7 +551,8 @@ export function parseDials(
       !raw.keywords.every(isNonEmptyString) ||
       (raw.kind !== "tracks" &&
         raw.kind !== "macro-axis" &&
-        raw.kind !== "root-scale") ||
+        raw.kind !== "root-scale" &&
+        raw.kind !== "follower-only") ||
       !isRange(raw.range) ||
       raw.default !== 0 ||
       !isFiniteNumber(raw.step) ||
@@ -654,6 +655,26 @@ export function parseDials(
       }
       definition.axis = axis;
       definition.axisTrack = raw.axisTrack;
+    } else if (raw.kind === "follower-only") {
+      if (
+        raw.members !== undefined ||
+        raw.axis !== undefined ||
+        raw.axisTrack !== undefined ||
+        raw.scalePerUnit !== undefined
+      ) {
+        throw new Error(
+          "appearance follower-only dial " +
+            raw.id +
+            " has incompatible fields",
+        );
+      }
+      if (!requirements) {
+        throw new Error(
+          "appearance follower-only dial " +
+            raw.id +
+            " requires one or more followerRefs",
+        );
+      }
     } else {
       if (
         raw.members !== undefined ||

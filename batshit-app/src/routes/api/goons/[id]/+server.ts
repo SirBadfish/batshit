@@ -6,13 +6,21 @@ import {
   resolveUploadUrlsForBrowserInPayload
 } from '$lib/server/services/batshitServerUrls'
 import {
+  collectGoonRecipeUploadReferencesForClient,
   collectGoonUploadReferencesForClient,
+  deleteGoonRecipeRecordsForClient,
   deleteGoonUploadAsset,
+  deleteUnreferencedGoonUploadReferences,
   hasGoonUploadReference
 } from '$lib/server/services/goonAssetCleanupService'
 import { validateGoonFacialArtworkState } from '$lib/server/services/facialArtwork.server'
 import { validateGoonEyeAppearanceState } from '$lib/server/services/eyeAppearance.server'
 import { collectFacialArtworkUploads } from '$lib/goons/facialArtwork'
+import {
+  GoonMutationError,
+  assertGenericGoonPatchAllowed,
+  patchOwnedGoonForClient
+} from '$lib/server/services/goonMutationRepository.server'
 
 export const GET: RequestHandler = async ({ params, locals }) => {
   if (!locals.user?.id) {
@@ -63,6 +71,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       const existing = (await client.json.get(`goon:${goonId}`)) as GoonRecord | null
       if (!existing) return null
       if (existing.user_id !== locals.user!.id) return null
+      assertGenericGoonPatchAllowed(existing, updates)
 
       const updated: GoonRecord = {
         ...existing,
@@ -87,9 +96,20 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
         )
       }
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
+      const storagePatch = Object.fromEntries(
+        Object.keys(updates).map((field) => [
+          field,
+          (storageUpdated as unknown as Record<string, unknown>)[field]
+        ])
+      )
 
-      await client.json.set(`goon:${goonId}`, '$', storageUpdated as any)
-      return storageUpdated
+      return patchOwnedGoonForClient({
+        client,
+        userId: locals.user!.id,
+        goonId,
+        updates: storagePatch,
+        updatedAt: storageUpdated.updated_at
+      })
     })
 
     if (!goon) {
@@ -99,6 +119,9 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     return json({ goon: resolveUploadUrlsForBrowserInPayload(goon) })
   } catch (error) {
     console.error('Error updating goon:', error)
+    if (error instanceof GoonMutationError) {
+      return json({ error: error.message, code: error.code }, { status: error.status })
+    }
     if (
       error instanceof Error &&
       (error.message.startsWith('[facial-artwork/v3]') ||
@@ -139,10 +162,17 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
         clearedAgentIds.push(agentId)
       }
 
+	      const removedRecipeReferences = await collectGoonRecipeUploadReferencesForClient(
+	        client as any,
+	        locals.user!.id,
+	        goonId
+	      )
+	      await deleteGoonRecipeRecordsForClient(client as any, locals.user!.id, goonId)
 	      await client.del(`goon:${goonId}`)
 	      await client.sRem(`user:${locals.user!.id}:goons`, goonId)
 
 	      const references = await collectGoonUploadReferencesForClient(client as any, locals.user!.id)
+	      await deleteUnreferencedGoonUploadReferences(removedRecipeReferences, references)
 
 	      const filename = existing.files?.vrm?.filename
 	      if (filename && !hasGoonUploadReference(references, 'goons', filename)) {

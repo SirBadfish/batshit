@@ -14,7 +14,8 @@ export type AppearanceDialTier = "core" | "detail" | "advanced";
 export type AppearanceDialTrackPoint = [number, number];
 export type AppearanceDialMacroAxis =
   "muscle" | "weight" | "cupsize" | "firmness";
-export type AppearanceDialKind = "tracks" | "macro-axis" | "root-scale";
+export type AppearanceDialKind =
+  "tracks" | "macro-axis" | "root-scale" | "follower-only";
 export type AppearanceTargetLicense =
   "CC0-1.0" | "LicenseRef-Batshit-First-Party";
 export type AppearanceTargetUsage = "identity" | "pose-corrective";

@@ -23,6 +23,12 @@ export const ALLOWED_USAGES = new Set<AppearanceTargetUsage>([
 ]);
 export const ZERO_TOLERANCE = 1e-8;
 export const MACRO_BASELINE_TOLERANCE = 1e-6;
+/**
+ * Canonical appearance-followers/v2 acceptance tolerance. Endpoint samples
+ * are preserved exactly rather than normalized, so every downstream physical
+ * evaluator must use this same length-space boundary.
+ */
+export const APPEARANCE_QUATERNION_LENGTH_TOLERANCE = 0.01;
 
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 const STABLE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -85,7 +91,8 @@ export function isQuat(value: unknown): value is AppearanceQuat {
     return false;
   }
   return (
-    Math.abs(Math.hypot(value[0], value[1], value[2], value[3]) - 1) < 0.01
+    Math.abs(Math.hypot(value[0], value[1], value[2], value[3]) - 1) <
+    APPEARANCE_QUATERNION_LENGTH_TOLERANCE
   );
 }
 

@@ -17,6 +17,23 @@ import {
   parseEyeAppearanceDefinition
 } from '$lib/goons/eyeAppearance'
 import {
+  GOON_LIVE_BUILD_CONTRACT,
+  GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
+  GOON_RECIPE_JOB_CONTRACT,
+  GOON_RECIPE_OWNER_V2_CONTRACT,
+  GOON_RECIPE_REVISION_CONTRACT,
+  GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+  GOON_RECIPE_STATE_CONTRACT,
+  RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+  RECIPE_MIGRATION_PLAN_CONTRACT,
+  RECIPE_SOURCE_CONTRACT,
+  createGoonRecipeDocument,
+  createRecipeRevisionEnvelope,
+  recipeAuthoringRevisionSha256,
+  recipeRevisionBundleSha256,
+  recipeStateSnapshotSha256
+} from '$lib/goons/recipe'
+import {
   BackupRestoreError,
   createBackupBundle,
   createBackupBundleStream,
@@ -414,6 +431,307 @@ describe('backupRestoreService', () => {
 
     const restoredAgent = (await redis.json.get('agent:seed_api_primary')) as Record<string, any>
     expect(restoredAgent.user_id).toBe('target')
+  })
+
+  it('backs up and remaps durable Recipe revisions, documents, and jobs', async () => {
+    const sha = (value: string) => value.repeat(64)
+    const source = {
+      package: { ref: '/uploads/goon_custom_packages/source.bgoon', sha256: sha('1') },
+      model: { ref: '/uploads/goon_custom_models/source.glb', sha256: sha('2') },
+      manifest: { ref: '/uploads/goon_custom_manifests/source.json', sha256: sha('3') },
+      identities: {
+        contract: RECIPE_SOURCE_CONTRACT,
+        schemaVersion: 1 as const,
+        baseId: 'base-1',
+        fitFamily: 'fit-1',
+        modelSha256: sha('2'),
+        manifestSemanticSha256: sha('4'),
+        definitionSha256: sha('5'),
+        neutralId: 'neutral-1',
+        neutralRecipeSha256: sha('6'),
+        physicalBasisSha256: sha('7'),
+        behaviorSha256: sha('8'),
+        componentGraphSha256: sha('9'),
+        topologySha256: sha('a'),
+        skeletonHierarchySha256: sha('b')
+      }
+    }
+    const state = {
+      contract: GOON_RECIPE_STATE_CONTRACT,
+      stateSha256: sha('0'),
+      appearanceDials: {
+        contract: 'appearance-dial-values/v2' as const,
+        definitionSha256: sha('5'),
+        neutralId: 'neutral-1',
+        neutralRecipeSha256: sha('6'),
+        values: { body_height: 0 },
+        unlockedDialIds: []
+      },
+      siblings: []
+    }
+    state.stateSha256 = await recipeStateSnapshotSha256(state)
+    const receiptDocument = await createGoonRecipeDocument({
+      userId: 'source',
+      goonId: 'goon_recipe',
+      content: { contract: RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT }
+    })
+    const liveDocument = await createGoonRecipeDocument({
+      userId: 'source',
+      goonId: 'goon_recipe',
+      content: { contract: GOON_LIVE_BUILD_CONTRACT }
+    })
+    const planDocument = await createGoonRecipeDocument({
+      userId: 'source',
+      goonId: 'goon_recipe',
+      content: { contract: RECIPE_MIGRATION_PLAN_CONTRACT }
+    })
+    const receiptKey = `goon_recipe_document:source:goon_recipe:${receiptDocument.sha256}`
+    const liveKey = `goon_recipe_document:source:goon_recipe:${liveDocument.sha256}`
+    const planKey = `goon_recipe_document:source:goon_recipe:${planDocument.sha256}`
+    const receiptRef = {
+      contract: receiptDocument.documentContract,
+      ref: receiptKey,
+      sha256: receiptDocument.sha256
+    }
+    const liveRef = {
+      contract: liveDocument.documentContract,
+      ref: liveKey,
+      sha256: liveDocument.sha256
+    }
+    const planRef = {
+      contract: planDocument.documentContract,
+      ref: planKey,
+      sha256: planDocument.sha256
+    }
+    const revision = {
+      contract: GOON_RECIPE_REVISION_CONTRACT,
+      recipeRevision: 1,
+      revisionId: 'revision-1',
+      revisionSha256: sha('0'),
+      source,
+      state,
+      liveBuildReceipt: liveRef,
+      updateReport: null
+    }
+    revision.revisionSha256 = await recipeRevisionBundleSha256(revision)
+    const envelope = await createRecipeRevisionEnvelope({
+      contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      revision,
+      sourceContainmentReceipt: receiptRef,
+      live: {
+        package: { ref: '/uploads/goon_custom_packages/live.bgoon', sha256: sha('c'), bytes: 30 },
+        model: { ref: '/uploads/goon_custom_models/live.glb', sha256: sha('d'), bytes: 20 },
+        manifest: { ref: '/uploads/goon_custom_manifests/live.json', sha256: sha('e'), bytes: 10 }
+      }
+    })
+    const revisionKey = 'goon_recipe_revision:source:goon_recipe:revision-1'
+    const revisionRef = {
+      contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      ref: revisionKey,
+      sha256: envelope.envelopeSha256
+    }
+    const jobKey = 'goon_recipe_job:source:goon_recipe:job-1'
+    const authoringRevision = {
+      contract: GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
+      recipeRevision: 1,
+      revisionId: 'revision-1',
+      revisionSha256: sha('0'),
+      source,
+      state,
+      updateReport: null
+    }
+    authoringRevision.revisionSha256 = await recipeAuthoringRevisionSha256(authoringRevision)
+
+    await redis.sAdd('user:source:goons', 'goon_recipe')
+    await redis.json.set('goon:goon_recipe', '$', {
+      id: 'goon_recipe',
+      user_id: 'source',
+      name: 'Recipe Fixture',
+      files: {},
+      recipe: {
+        contract: GOON_RECIPE_OWNER_V2_CONTRACT,
+        writeVersion: 4,
+        nextRecipeRevision: 2,
+        liveStatus: 'building',
+        authoringRevision,
+        activeRevision: revisionRef,
+        previousRevision: null,
+        pendingJob: {
+          jobId: 'job-1',
+          jobRef: jobKey,
+          status: 'baking',
+          operation: 'package-update',
+          targetWriteVersion: 4,
+          targetRecipeRevision: 2,
+          targetRevisionId: 'revision-2'
+        },
+        latestUpdateReport: null,
+        lastFailure: null,
+        maintenanceFailure: null
+      },
+      created_at: '2026-07-17T00:00:00.000Z',
+      updated_at: '2026-07-17T00:00:00.000Z'
+    })
+    await redis.json.set(revisionKey, '$', envelope)
+    await redis.json.set(receiptKey, '$', receiptDocument)
+    await redis.json.set(liveKey, '$', liveDocument)
+    await redis.json.set(planKey, '$', planDocument)
+    await redis.json.set(jobKey, '$', {
+      contract: GOON_RECIPE_JOB_CONTRACT,
+      userId: 'source',
+      goonId: 'goon_recipe',
+      jobId: 'job-1',
+      idempotencyKey: 'update-1',
+      operation: 'package-update',
+      status: 'baking',
+      stateVersion: 1,
+      attempt: 1,
+      targetWriteVersion: 4,
+      targetRecipeRevision: 2,
+      targetRevisionId: 'revision-2',
+      sourceRevision: revisionRef,
+      stagedSource: {
+        source,
+        containmentReceipt: receiptRef
+      },
+      plan: planRef,
+      candidateRevision: null,
+      lease: { ownerId: 'worker-1', expiresAt: '2026-07-17T00:05:00.000Z' },
+      failure: null,
+      cleanupAssets: [],
+      createdAt: '2026-07-17T00:00:00.000Z',
+      updatedAt: '2026-07-17T00:00:00.000Z'
+    })
+
+    const bundle = await createBackupBundle('source')
+    const entries = unzipSync(bundle.bytes)
+    const exportedRecords = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')) as Record<string, any>)
+    expect(exportedRecords.map((record) => record.key)).toEqual(
+      expect.arrayContaining([revisionKey, receiptKey, jobKey])
+    )
+
+    const tamperedEntries = { ...entries }
+    const revisionEntry = Object.entries(tamperedEntries).find(([, bytes]) => {
+      try {
+        return JSON.parse(Buffer.from(bytes).toString('utf8')).key === revisionKey
+      } catch {
+        return false
+      }
+    })
+    expect(revisionEntry).toBeDefined()
+    const tamperedRevisionRecord = JSON.parse(
+      Buffer.from(revisionEntry![1]).toString('utf8')
+    ) as Record<string, any>
+    tamperedRevisionRecord.value.live.model.bytes += 1
+    tamperedEntries[revisionEntry![0]] = Buffer.from(JSON.stringify(tamperedRevisionRecord))
+    await expect(preflightBackupRestore('target', zipSync(tamperedEntries))).rejects.toBeInstanceOf(
+      BackupRestoreError
+    )
+
+    const otherReceiptDocument = await createGoonRecipeDocument({
+      userId: 'source',
+      goonId: 'other_recipe',
+      content: receiptDocument.content
+    })
+    const otherLiveDocument = await createGoonRecipeDocument({
+      userId: 'source',
+      goonId: 'other_recipe',
+      content: liveDocument.content
+    })
+    const otherReceiptKey = `goon_recipe_document:source:other_recipe:${otherReceiptDocument.sha256}`
+    const otherLiveKey = `goon_recipe_document:source:other_recipe:${otherLiveDocument.sha256}`
+    const otherRevision = {
+      ...revision,
+      revisionId: 'other-revision-1',
+      revisionSha256: sha('0'),
+      liveBuildReceipt: {
+        contract: otherLiveDocument.documentContract,
+        ref: otherLiveKey,
+        sha256: otherLiveDocument.sha256
+      }
+    }
+    otherRevision.revisionSha256 = await recipeRevisionBundleSha256(otherRevision)
+    const otherEnvelope = await createRecipeRevisionEnvelope({
+      contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      revision: otherRevision,
+      sourceContainmentReceipt: {
+        contract: otherReceiptDocument.documentContract,
+        ref: otherReceiptKey,
+        sha256: otherReceiptDocument.sha256
+      },
+      live: envelope.live
+    })
+    const otherRevisionKey =
+      'goon_recipe_revision:source:other_recipe:other-revision-1'
+    const otherRevisionRef = {
+      contract: GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+      ref: otherRevisionKey,
+      sha256: otherEnvelope.envelopeSha256
+    }
+    const otherAuthoring = {
+      contract: GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
+      recipeRevision: 1,
+      revisionId: otherRevision.revisionId,
+      revisionSha256: sha('0'),
+      source,
+      state,
+      updateReport: null
+    }
+    otherAuthoring.revisionSha256 = await recipeAuthoringRevisionSha256(otherAuthoring)
+    await redis.sAdd('user:source:goons', 'other_recipe')
+    await redis.json.set(otherReceiptKey, '$', otherReceiptDocument)
+    await redis.json.set(otherLiveKey, '$', otherLiveDocument)
+    await redis.json.set(otherRevisionKey, '$', otherEnvelope)
+    await redis.json.set('goon:other_recipe', '$', {
+      id: 'other_recipe',
+      user_id: 'source',
+      name: 'Other Recipe Fixture',
+      files: {},
+      recipe: {
+        contract: GOON_RECIPE_OWNER_V2_CONTRACT,
+        writeVersion: 1,
+        nextRecipeRevision: 2,
+        liveStatus: 'up_to_date',
+        authoringRevision: otherAuthoring,
+        activeRevision: otherRevisionRef,
+        previousRevision: null,
+        pendingJob: null,
+        latestUpdateReport: null,
+        lastFailure: null,
+        maintenanceFailure: null
+      },
+      created_at: '2026-07-17T00:00:00.000Z',
+      updated_at: '2026-07-17T00:00:00.000Z'
+    })
+    const crossLinkedGoon = (await redis.json.get('goon:goon_recipe')) as Record<string, any>
+    crossLinkedGoon.recipe.activeRevision = otherRevisionRef
+    await redis.json.set('goon:goon_recipe', '$', crossLinkedGoon)
+    const crossLinkedBundle = await createBackupBundle('source')
+    await expect(preflightBackupRestore('target', crossLinkedBundle.bytes)).rejects.toThrow(
+      /Goon namespace/
+    )
+
+    await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+
+    const targetRevisionKey = revisionKey.replace(':source:', ':target:')
+    const targetReceiptKey = receiptKey.replace(':source:', ':target:')
+    const targetJobKey = jobKey.replace(':source:', ':target:')
+    const restoredGoon = (await redis.json.get('goon:goon_recipe')) as Record<string, any>
+    expect(restoredGoon.user_id).toBe('target')
+    expect(restoredGoon.recipe.activeRevision.ref).toBe(targetRevisionKey)
+    expect(restoredGoon.recipe.activeRevision.sha256).not.toBe(envelope.envelopeSha256)
+    expect(restoredGoon.recipe.pendingJob.jobRef).toBe(targetJobKey)
+
+    const restoredRevision = (await redis.json.get(targetRevisionKey)) as Record<string, any>
+    expect(restoredRevision.sourceContainmentReceipt.ref).toBe(targetReceiptKey)
+    expect(restoredRevision.envelopeSha256).toBe(restoredGoon.recipe.activeRevision.sha256)
+
+    const restoredJob = (await redis.json.get(targetJobKey)) as Record<string, any>
+    expect(restoredJob.userId).toBe('target')
+    expect(restoredJob.sourceRevision.ref).toBe(targetRevisionKey)
+    expect(restoredJob.stagedSource.containmentReceipt.ref).toBe(targetReceiptKey)
   })
 
   it('rewrites imported project paths to the Docker workspace during containerized restore', async () => {

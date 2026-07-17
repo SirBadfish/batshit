@@ -1,6 +1,10 @@
 const BaseUploadStrategy = require('./baseStrategy');
 const redisService = require('../redisService');
 const logger = require('../../utils/logger');
+const {
+  deleteFileBackedPayload,
+  persistFileBackedUpload
+} = require('../fileBackedUploadService');
 
 function stripTrailingSlash(value) {
   let end = value.length;
@@ -71,7 +75,9 @@ function resolveLocalServerOrigin(config) {
 
 /**
  * Local Storage Strategy
- * Stores files in Redis and serves them via local HTTP/HTTPS endpoints
+ * Stores persistent files on disk with metadata in Redis and serves them via
+ * local HTTP/HTTPS endpoints. Short-lived uploads remain in Redis so key expiry
+ * cannot orphan file bytes.
  * This is the current default behavior - 100% private, no external services
  */
 class LocalStorageStrategy extends BaseUploadStrategy {
@@ -93,16 +99,11 @@ class LocalStorageStrategy extends BaseUploadStrategy {
       // Generate unique Redis key
       const redisKey = `upload:${uploadType}:${storedFilename}`;
 
-      // Store in Redis with metadata
-      // IMPORTANT: We ALWAYS store base64 in Redis so files can be served via /uploads/...
-      // The upload handler no longer duplicates that base64 into clip metadata; model-facing
-      // base64 is derived from this upload record at send time when a runtime needs it.
       const fileData = {
         originalName: metadata?.originalName || filename,
         filename: storedFilename,
         mimetype: metadata.mimetype,
         size: buffer.length,
-        base64: buffer.toString('base64'), // Always store for serving
         uploadType: uploadType,
         uploadedAt: new Date().toISOString(),
         strategy: 'local',
@@ -113,9 +114,24 @@ class LocalStorageStrategy extends BaseUploadStrategy {
           ttlSeconds > 0 ? new Date(Date.now() + ttlSeconds * 1000).toISOString() : null
       };
 
-      // Store with TTL when requested (Agent Browser screenshot artifacts), else persist.
-      await redisService.setWithTTL(redisKey, fileData, ttlSeconds);
-      logger.debug('[LocalStrategy] Stored file in Redis');
+      if (ttlSeconds > 0 || fileData.ephemeralUpload) {
+        await redisService.setWithTTL(
+          redisKey,
+          { ...fileData, base64: buffer.toString('base64') },
+          ttlSeconds
+        );
+        logger.debug('[LocalStrategy] Stored expiring file in Redis');
+      } else {
+        await persistFileBackedUpload({
+          redisService,
+          redisKey,
+          uploadType,
+          filename: storedFilename,
+          buffer,
+          payload: fileData
+        });
+        logger.debug('[LocalStrategy] Stored persistent file on disk with Redis metadata');
+      }
 
       // Generate URLs
       const localOrigin = resolveLocalServerOrigin(this.config);
@@ -158,7 +174,10 @@ class LocalStorageStrategy extends BaseUploadStrategy {
 
   async delete(redisKey) {
     try {
-      await redisService.delete(redisKey);
+      const payload = await redisService.get(redisKey);
+      const deleted = await redisService.delete(redisKey);
+      if (!deleted) throw new Error(`Redis refused to delete upload metadata for ${redisKey}.`);
+      if (payload) await deleteFileBackedPayload(payload);
       return true;
     } catch (error) {
       logger.error('[LocalStrategy] Delete error:', error);

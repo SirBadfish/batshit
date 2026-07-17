@@ -3,7 +3,8 @@ import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import {
   auditGoonUploadAssets,
-  cleanupOrphanGoonUploadAssets
+  cleanupOrphanGoonUploadAssets,
+  deleteGoonRecipeRecordsForClient
 } from '../goonAssetCleanupService'
 
 useRedisTestServer()
@@ -207,5 +208,46 @@ describe('goonAssetCleanupService', () => {
     expect(deleted).toEqual(['goons/orphan.vrm'])
     expect(await redis.exists('upload:goons:live.vrm')).toBe(true)
     expect(await redis.exists('upload:goons:orphan.vrm')).toBe(false)
+  })
+
+  it('keeps assets referenced only by durable Recipe records and deletes their records explicitly', async () => {
+    await redis.sAdd('user:josh:goons', 'goon_recipe')
+    await redis.json.set('goon:goon_recipe', '$', {
+      id: 'goon_recipe',
+      user_id: 'josh',
+      name: 'Recipe Goon',
+      created_at: '2026-07-17T00:00:00.000Z',
+      updated_at: '2026-07-17T00:00:00.000Z'
+    })
+    await redis.json.set('goon_recipe_revision:josh:goon_recipe:revision-1', '$', {
+      contract: 'goon-recipe-revision-envelope/v1',
+      live: {
+        package: { ref: '/uploads/goon_custom_packages/live.bgoon' },
+        model: { ref: '/uploads/goon_custom_models/live.glb' },
+        manifest: { ref: '/uploads/goon_custom_manifests/live.json' }
+      }
+    })
+    await redis.json.set('goon_recipe_job:josh:goon_recipe:job-2', '$', {
+      contract: 'goon-recipe-job/v1',
+      cleanupAssets: [{ ref: '/uploads/goon_custom_models/staged.glb' }]
+    })
+
+    await seedUpload('goon_custom_packages', 'live.bgoon')
+    await seedUpload('goon_custom_models', 'live.glb')
+    await seedUpload('goon_custom_manifests', 'live.json')
+    await seedUpload('goon_custom_models', 'staged.glb')
+    await seedUpload('goon_custom_models', 'orphan.glb')
+
+    const audit = await auditGoonUploadAssets('josh')
+    expect(audit.orphans).toMatchObject([{ uploadType: 'goon_custom_models', filename: 'orphan.glb' }])
+    expect(audit.entries.find((entry) => entry.filename === 'live.bgoon')?.referenced).toBe(true)
+    expect(audit.entries.find((entry) => entry.filename === 'staged.glb')?.referenced).toBe(true)
+
+    const deleted = await redis.execute((client) =>
+      deleteGoonRecipeRecordsForClient(client as any, 'josh', 'goon_recipe')
+    )
+    expect(deleted).toBe(2)
+    expect(await redis.exists('goon_recipe_revision:josh:goon_recipe:revision-1')).toBe(false)
+    expect(await redis.exists('goon_recipe_job:josh:goon_recipe:job-2')).toBe(false)
   })
 })

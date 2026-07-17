@@ -10,6 +10,7 @@ import { assertApiKeyEncryptionConfigured } from '$lib/services/encryption.serve
 import { isAuthRateLimitedPath, shouldApplyBroadApiRateLimit } from '$lib/middleware/rateLimitPolicy'
 import { disconnectAllRedisServices } from '$lib/server/redis'
 import { cleanupAllMonitoring } from '$lib/server/visualIndicatorService'
+import { closeRegisteredRuntimeResources } from '$lib/server/services/runtimeShutdown'
 import {
   appendArtifactRuntimeCors,
   artifactRuntimeCorsHeaders,
@@ -26,6 +27,8 @@ let startupIntegrityInitialized = false
 
 type BatshitRuntimeShutdownGlobal = typeof globalThis & {
   __batshitRuntimeShutdownRegistered?: boolean
+  __batshitRuntimeSigtermRegistered?: boolean
+  __batshitRuntimeDrainPromise?: Promise<void> | null
   __batshitRuntimeShutdownPromise?: Promise<void> | null
 }
 
@@ -38,21 +41,42 @@ function registerRuntimeShutdownHandler() {
   process.on('sveltekit:shutdown' as any, (reason: string) => {
     runtimeShutdownGlobal.__batshitRuntimeShutdownPromise ??= closeRuntimeResources(reason)
   })
+
+  if (!runtimeShutdownGlobal.__batshitRuntimeSigtermRegistered) {
+    runtimeShutdownGlobal.__batshitRuntimeSigtermRegistered = true
+    process.on('SIGTERM', () => {
+      // adapter-node waits for active requests before emitting sveltekit:shutdown.
+      // Close long-lived SSE streams immediately so its HTTP server can finish.
+      runtimeShutdownGlobal.__batshitRuntimeDrainPromise ??=
+        closeLongLivedRuntimeResources('SIGTERM')
+    })
+  }
+}
+
+async function closeLongLivedRuntimeResources(reason: string) {
+  try {
+    await closeRegisteredRuntimeResources(reason)
+  } catch (error) {
+    console.error(`[Shutdown] Failed to close a long-lived runtime resource during ${reason}:`, error)
+  }
 }
 
 async function closeRuntimeResources(reason: string) {
-  try {
-    cleanupAllMonitoring()
-  } catch (error) {
-    console.error('[Shutdown] Failed to clean up visual indicator monitoring:', error)
-  }
-
-  const results = await Promise.allSettled([
+  // Registered resources include the SSE visual-monitor subscriptions. Close
+  // them during SIGTERM so adapter-node can finish draining HTTP. Only close
+  // shared Redis clients after adapter-node emits sveltekit:shutdown; destroying
+  // those clients while ordinary requests are still draining creates false
+  // session-validation failures.
+  runtimeShutdownGlobal.__batshitRuntimeDrainPromise ??=
+    closeLongLivedRuntimeResources(reason)
+  await runtimeShutdownGlobal.__batshitRuntimeDrainPromise
+  const remainingResults = await Promise.allSettled([
+    cleanupAllMonitoring(),
     authService.disconnect(),
     disconnectAllRedisServices()
   ])
 
-  for (const result of results) {
+  for (const result of remainingResults) {
     if (result.status === 'rejected') {
       console.error(`[Shutdown] Failed to close app runtime resource during ${reason}:`, result.reason)
     }

@@ -4,11 +4,13 @@ import { existsSync } from 'node:fs';
 import {
   access,
   appendFile,
+  lstat,
   readdir,
   mkdir,
   open,
   readFile,
   realpath,
+  rename,
   rm,
   stat,
   writeFile
@@ -82,6 +84,7 @@ const dockerMcpGatewayLogFile = join(paths.logs, 'docker-mcp-gateway.log');
 const supervisorLogFile = join(paths.logs, 'supervisor.log');
 const monitorPidFile = join(pidDir, 'supervisor-monitor.pid');
 const monitorStateFile = join(runtimeDir, 'supervisor-monitor.state.json');
+const shutdownCompleteFile = join(runtimeDir, 'shutdown-complete.json');
 const MONITOR_POLL_INTERVAL_MS = 5_000;
 const SERVICE_STOP_GRACE_MS = 5_000;
 const LOCAL_RUNTIME_LAUNCH_RECORD_NAME = '.batshit-local-runtime-launch.json';
@@ -90,8 +93,9 @@ const MONITOR_MAX_RESTARTS_PER_WINDOW = 5;
 const MONITOR_MAX_BACKOFF_MS = 120_000;
 const MONITOR_ENVIRONMENT_RETRY_MS = 30_000;
 const MONITOR_SERVICE_START_GRACE_MS = 15_000;
+const BATSHIT_SERVER_MIGRATION_START_GRACE_MS = 15 * 60_000;
 const REDIS_APPENDONLY_ENABLE_TIMEOUT_MS = 60_000;
-const REDIS_SHUTDOWN_SAVE_TIMEOUT_MS = 60_000;
+const REDIS_SHUTDOWN_COMMAND_TIMEOUT_MS = 60_000;
 const REDIS_SHUTDOWN_WAIT_MS = 30_000;
 const runtimeFingerprintPaths = [
   join(appRoot, 'build', 'index.js'),
@@ -179,11 +183,13 @@ function createServiceDefinitions(env = null) {
       command: nodeCommand,
       args: ['src/index.js'],
       matchCommandFragments: ['src/index.js', serverRoot],
+      startupGraceMs: BATSHIT_SERVER_MIGRATION_START_GRACE_MS,
       env: {
         ...packagedFfmpegEnv,
         ...packagedFacialArtworkEnv,
         LOG_LEVEL: 'info',
         PORT: String(ports.server),
+        BATSHIT_REDIS_REQUIRED: 'true',
         BATSHIT_SERVER_HOST: '127.0.0.1',
         ENABLE_HTTPS: 'false',
         HTTPS_ONLY: 'false',
@@ -646,7 +652,21 @@ function serviceWithinStartGrace(metadata) {
   if (!metadata?.generatedAt) return false;
   const generatedAt = Date.parse(metadata.generatedAt);
   if (!Number.isFinite(generatedAt)) return false;
-  return Date.now() - generatedAt < MONITOR_SERVICE_START_GRACE_MS;
+  const graceMs = Number(metadata.startupGraceMs);
+  return Date.now() - generatedAt <
+    (Number.isFinite(graceMs) && graceMs > 0 ? graceMs : MONITOR_SERVICE_START_GRACE_MS);
+}
+
+function redisStatusProvesStopped(status) {
+  return Boolean(
+    status &&
+      status.pidAlive === false &&
+      status.portOccupied === false &&
+      status.external === false &&
+      status.response !== 'PONG' &&
+      status.listenerInspectionOk === true &&
+      !status.listener
+  );
 }
 
 async function writeServiceMetadata(definition, pid, fingerprint) {
@@ -660,6 +680,7 @@ async function writeServiceMetadata(definition, pid, fingerprint) {
         appRoot,
         serverRoot,
         packagedRuntimeRoot,
+        startupGraceMs: definition.startupGraceMs || MONITOR_SERVICE_START_GRACE_MS,
         generatedAt: new Date().toISOString()
       },
       null,
@@ -836,6 +857,98 @@ function parseRedisInfoServer(stdout) {
   };
 }
 
+function parseRedisInfo(stdout) {
+  const info = {};
+  for (const line of String(stdout || '').split(/\r?\n/)) {
+    const index = line.indexOf(':');
+    if (index <= 0) continue;
+    info[line.slice(0, index)] = line.slice(index + 1).trim();
+  }
+  return info;
+}
+
+function chooseRedisShutdownMode({ appendonly, appendfsync, info, error = null }) {
+  const reasons = [];
+  if (error) reasons.push(error);
+  if (appendonly !== 'yes') reasons.push(`appendonly=${appendonly || 'unknown'}`);
+  if (!['everysec', 'always'].includes(appendfsync)) {
+    reasons.push(`appendfsync=${appendfsync || 'unknown'}`);
+  }
+  if (info?.aof_enabled !== '1') reasons.push(`aof_enabled=${info?.aof_enabled || 'unknown'}`);
+  if (info?.aof_last_write_status !== 'ok') {
+    reasons.push(`aof_last_write_status=${info?.aof_last_write_status || 'unknown'}`);
+  }
+  if (info?.aof_last_bgrewrite_status !== 'ok') {
+    reasons.push(`aof_last_bgrewrite_status=${info?.aof_last_bgrewrite_status || 'unknown'}`);
+  }
+  if (info?.loading === '1') reasons.push('loading=1');
+
+  return {
+    mode: reasons.length === 0 ? 'NOSAVE' : 'SAVE',
+    durableAofVerified: reasons.length === 0,
+    reasons
+  };
+}
+
+async function redisShutdownPolicy(env) {
+  const [appendonly, appendfsync, persistenceInfo] = await Promise.all([
+    redisConfigGet(env, 'appendonly'),
+    redisConfigGet(env, 'appendfsync'),
+    redisCli(env, ['--raw', 'INFO', 'persistence'])
+  ]);
+  const errors = [
+    appendonly.error,
+    appendfsync.error,
+    persistenceInfo.ok
+      ? null
+      : (persistenceInfo.stderr || persistenceInfo.stdout || 'Redis INFO persistence failed.').trim()
+  ].filter(Boolean);
+  return chooseRedisShutdownMode({
+    appendonly: appendonly.value,
+    appendfsync: appendfsync.value,
+    info: persistenceInfo.ok ? parseRedisInfo(persistenceInfo.stdout) : {},
+    error: errors.join('; ') || null
+  });
+}
+
+async function redisRecoveryReadyForTempCleanup(env) {
+  const result = await redisCli(env, ['--raw', 'INFO', 'persistence']);
+  if (!result.ok) return false;
+  const info = parseRedisInfo(result.stdout);
+  return Boolean(
+    info.loading === '0' &&
+      info.aof_enabled === '1' &&
+      info.aof_last_write_status === 'ok' &&
+      info.aof_last_bgrewrite_status === 'ok' &&
+      info.rdb_last_bgsave_status === 'ok' &&
+      info.aof_rewrite_in_progress === '0' &&
+      info.rdb_bgsave_in_progress === '0'
+  );
+}
+
+async function cleanupRedisTempsAfterRecovery(env) {
+  const redisRecoveryVerified = await redisRecoveryReadyForTempCleanup(env);
+  if (!redisRecoveryVerified) {
+    await supervisorLog(
+      'redis',
+      'Skipped abandoned temp snapshot cleanup because Redis recovery/persistence health is not fully verified.'
+    );
+    return { removed: [], bytesRemoved: 0, issues: [], skipped: true };
+  }
+  const cleanup = await cleanupAbandonedRedisTempSnapshots({
+    dataDir: redisDir,
+    redisRecoveryVerified
+  });
+  if (cleanup.removed.length > 0) {
+    await supervisorLog(
+      'redis',
+      `Removed ${cleanup.removed.length} abandoned Redis temp snapshot(s) after recovery proof ` +
+        `(${cleanup.bytesRemoved} bytes).`
+    );
+  }
+  return cleanup;
+}
+
 async function redisInfoServer(env) {
   const result = await redisCli(env, ['--raw', 'INFO', 'server']);
   if (!result.ok) return { version: null, processId: null, error: (result.stderr || result.stdout).trim() };
@@ -859,10 +972,21 @@ async function normalizeExistingPath(value) {
 
 async function listenerForPort(port) {
   const result = await run('lsof', ['-nP', `-tiTCP:${port}`, '-sTCP:LISTEN'], { timeoutMs: 3000 });
+  if (
+    !result.ok &&
+    !(result.code === 1 && !result.signal && !result.stdout.trim() && !result.stderr.trim())
+  ) {
+    return {
+      ok: false,
+      listener: null,
+      error:
+        (result.stderr || result.stdout || result.signal || `lsof exit ${result.code}`).trim()
+    };
+  }
   const pid = Number(result.stdout.trim().split('\n').find(Boolean));
-  if (!result.ok || !Number.isInteger(pid) || pid <= 0) return null;
+  if (!Number.isInteger(pid) || pid <= 0) return { ok: true, listener: null, error: null };
   const [info] = await processRowsForPid(pid);
-  return info || { pid, command: null };
+  return { ok: true, listener: info || { pid, command: null }, error: null };
 }
 
 async function redisStatus(env) {
@@ -880,6 +1004,8 @@ async function redisStatus(env) {
   let processId = null;
   let redisJson = { available: false, error: null };
   let listener = null;
+  let listenerInspectionOk = true;
+  let listenerInspectionError = null;
   let dataDirMatches = false;
   let pidFileMatches = false;
 
@@ -898,7 +1024,10 @@ async function redisStatus(env) {
     dataDirMatches = Boolean(configuredDataDir && expectedDataDir && configuredDataDir === expectedDataDir);
     pidFileMatches = Boolean(configuredPidFile && configuredPidFile === resolve(redisPidFile));
   } else {
-    listener = await listenerForPort(port);
+    const listenerInspection = await listenerForPort(port);
+    listener = listenerInspection.listener;
+    listenerInspectionOk = listenerInspection.ok;
+    listenerInspectionError = listenerInspection.error;
   }
 
   const processIdAlive = processAlive(processId);
@@ -910,7 +1039,9 @@ async function redisStatus(env) {
   const external = pingHealthy && !managed;
   const portOccupied = !pingHealthy && Boolean(listener);
   const healthy = pingHealthy && redisJson.available && managed;
-  const unhealthyReason = portOccupied
+  const unhealthyReason = !listenerInspectionOk
+    ? `Could not inspect Redis port ${port}: ${listenerInspectionError || 'listener inspection failed'}.`
+    : portOccupied
     ? `Port ${port} is already in use by pid ${listener.pid}${listener.command ? ` (${listener.command})` : ''}, but it is not Batshit's Redis Stack runtime. Stop that process or change REDIS_PORT before starting Batshit.`
     : pingHealthy && !redisJson.available
       ? `Redis answered PING on ${url}, but RedisJSON is not available. Batshit needs Redis Stack 7.x or Redis with JSON support on this port.`
@@ -943,7 +1074,9 @@ async function redisStatus(env) {
     managed,
     external,
     portOccupied,
-    listener
+    listener,
+    listenerInspectionOk,
+    listenerInspectionError
   };
 }
 
@@ -1772,13 +1905,20 @@ async function startRedis(env) {
   const redis = await redisStatus(env);
   if (redis.healthy) {
     const persistence = await ensureRedisPersistence(env);
+    const tempCleanup = persistence.ok
+      ? await cleanupRedisTempsAfterRecovery(env)
+      : { removed: [], bytesRemoved: 0, issues: [], skipped: true };
+    const cleanupOk = tempCleanup.issues.length === 0;
     return {
       skipped: true,
-      ok: persistence.ok,
-      reason: persistence.ok
+      ok: persistence.ok && cleanupOk,
+      reason: persistence.ok && cleanupOk
         ? 'Redis already healthy.'
-        : 'Redis is healthy, but durable persistence could not be verified.',
+        : !persistence.ok
+          ? 'Redis is healthy, but durable persistence could not be verified.'
+          : 'Redis is healthy, but abandoned temp snapshot cleanup could not be verified.',
       persistence,
+      tempCleanup,
       status: redis
     };
   }
@@ -1789,6 +1929,24 @@ async function startRedis(env) {
       error:
         redis.error ||
         `Redis port ${redis.port} is already in use by a process that is not Batshit's managed Redis Stack runtime.`,
+      status: redis
+    };
+  }
+  if (redis.pidAlive) {
+    return {
+      skipped: true,
+      ok: false,
+      error:
+        `The tracked Mac Redis process (pid ${redis.pid}) is still alive but is not healthy. ` +
+        'Batshit refused to remove temp snapshots or start another Redis process.',
+      status: redis
+    };
+  }
+  if (!redisStatusProvesStopped(redis)) {
+    return {
+      skipped: true,
+      ok: false,
+      error: 'Batshit could not prove that managed Redis and its listener are fully stopped.',
       status: redis
     };
   }
@@ -1863,7 +2021,26 @@ async function startRedis(env) {
       error: `Redis started, but durable persistence could not be enabled: ${persistence.issues.join('; ')}`
     };
   }
-  return { skipped: false, ok: true, pid: after.pid, dataDir: after.dataDir, persistence };
+  const tempCleanup = await cleanupRedisTempsAfterRecovery(env);
+  if (tempCleanup.issues.length > 0) {
+    return {
+      skipped: false,
+      ok: false,
+      pid: after.pid,
+      dataDir: after.dataDir,
+      persistence,
+      tempCleanup,
+      error: `Redis recovered, but temp snapshot cleanup could not be verified: ${tempCleanup.issues.map((issue) => issue.error).join('; ')}`
+    };
+  }
+  return {
+    skipped: false,
+    ok: true,
+    pid: after.pid,
+    dataDir: after.dataDir,
+    persistence,
+    tempCleanup
+  };
 }
 
 async function spawnService(definition, env, options = {}) {
@@ -2272,6 +2449,111 @@ async function sweepOrphans(phase, env = null, serviceDefinitions = createServic
   return { phase, cleaned, issues };
 }
 
+function isRedisTempSnapshotName(name) {
+  return /^temp-[0-9]+\.rdb$/.test(name);
+}
+
+async function defaultFileOpenCheck(filePath) {
+  const result = await run('lsof', ['-t', '--', filePath], { timeoutMs: 3000 });
+  if (result.ok) return result.stdout.trim().length > 0;
+  if (result.code === 1 && !result.signal && !result.stdout.trim() && !result.stderr.trim()) {
+    return false;
+  }
+  throw new Error(
+    `Could not prove whether ${filePath} is open: ` +
+      ((result.stderr || result.stdout || result.signal || `lsof exit ${result.code}`).trim())
+  );
+}
+
+async function cleanupAbandonedRedisTempSnapshots({
+  dataDir = redisDir,
+  redisIsStopped,
+  redisRecoveryVerified,
+  isFileOpen = defaultFileOpenCheck
+}) {
+  if (redisIsStopped !== true && redisRecoveryVerified !== true) {
+    throw new Error(
+      'Redis temp snapshots may be cleaned only after Redis is proven stopped or successful recovery is verified.'
+    );
+  }
+
+  const root = resolve(dataDir);
+  const entries = await readdir(root, { withFileTypes: true }).catch((error) => {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  });
+  const removed = [];
+  const issues = [];
+  let bytesRemoved = 0;
+
+  for (const entry of entries) {
+    if (!isRedisTempSnapshotName(entry.name) || !entry.isFile() || entry.isSymbolicLink()) continue;
+    const filePath = resolve(root, entry.name);
+    if (!filePath.startsWith(`${root}/`)) continue;
+
+    try {
+      const fileStat = await lstat(filePath);
+      if (!fileStat.isFile() || fileStat.isSymbolicLink()) continue;
+      if (await isFileOpen(filePath)) {
+        issues.push({ file: entry.name, error: 'File is still open by a process.' });
+        continue;
+      }
+      await rm(filePath);
+      removed.push(entry.name);
+      bytesRemoved += fileStat.size;
+    } catch (error) {
+      issues.push({ file: entry.name, error: normalizeError(error) });
+    }
+  }
+
+  return { removed, bytesRemoved, issues };
+}
+
+async function waitForProcessExit(pid, timeoutMs = REDIS_SHUTDOWN_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (processAlive(pid) && Date.now() < deadline) {
+    await wait(250);
+  }
+  return !processAlive(pid);
+}
+
+async function attemptSafeRedisShutdown({
+  pid,
+  initialMode,
+  runShutdown,
+  isAlive = processAlive,
+  waitForExit = waitForProcessExit,
+  log = async () => {}
+}) {
+  const modes = initialMode === 'NOSAVE' ? ['NOSAVE', 'SAVE'] : ['SAVE'];
+  const attempts = [];
+
+  for (const mode of modes) {
+    const command = await runShutdown(mode);
+    attempts.push({
+      mode,
+      ok: command.ok,
+      error: command.ok ? null : (command.stderr || command.stdout || '').trim() || null
+    });
+    if (!isAlive(pid)) return { stopped: true, attempts, effectiveMode: mode };
+    if (command.ok && (await waitForExit(pid, REDIS_SHUTDOWN_WAIT_MS))) {
+      return { stopped: true, attempts, effectiveMode: mode };
+    }
+    if (mode === 'NOSAVE') {
+      await log(
+        'Redis SHUTDOWN NOSAVE did not complete; retrying conservative SHUTDOWN SAVE without force-killing Redis.'
+      );
+    }
+  }
+
+  return {
+    stopped: false,
+    attempts,
+    effectiveMode: attempts.at(-1)?.mode || initialMode,
+    forceTerminationRefused: true
+  };
+}
+
 async function stopRedis(env = null) {
   const runtimeEnv = env || await loadRuntimeEnv();
   const current = await redisStatus(runtimeEnv);
@@ -2300,34 +2582,62 @@ async function stopRedis(env = null) {
       pid
     };
   }
-  const shutdownSave = await redisCli(runtimeEnv, ['SHUTDOWN', 'SAVE'], REDIS_SHUTDOWN_SAVE_TIMEOUT_MS);
-  const deadline = Date.now() + REDIS_SHUTDOWN_WAIT_MS;
-  while (processAlive(pid) && Date.now() < deadline) {
-    await wait(250);
-  }
-  let escalated = false;
-  if (processAlive(pid)) {
+  const shutdownPolicy = await redisShutdownPolicy(runtimeEnv);
+  if (shutdownPolicy.mode === 'SAVE') {
     await supervisorLog(
       'stop',
-      `Redis SHUTDOWN SAVE did not stop pid ${pid} within ${REDIS_SHUTDOWN_WAIT_MS}ms; sending SIGTERM.`
+      `Redis AOF durability preflight did not pass; using SHUTDOWN SAVE: ${shutdownPolicy.reasons.join('; ')}`
     );
-    process.kill(pid, 'SIGTERM');
-    await wait(5000);
   }
-  if (processAlive(pid)) {
-    escalated = true;
-    process.kill(pid, 'SIGKILL');
+  const shutdownAttempt = await attemptSafeRedisShutdown({
+    pid,
+    initialMode: shutdownPolicy.mode,
+    runShutdown: (mode) =>
+      redisCli(runtimeEnv, ['SHUTDOWN', mode], REDIS_SHUTDOWN_COMMAND_TIMEOUT_MS),
+    log: (message) => supervisorLog('stop', message)
+  });
+  const stopped = shutdownAttempt.stopped && !processAlive(pid);
+  if (!stopped) {
+    await supervisorLog(
+      'stop',
+      `Redis pid ${pid} did not complete a durable shutdown. Refused SIGKILL; Redis remains alive and retryable.`
+    );
   }
-  await rm(redisPidFile, { force: true });
+  const stoppedStatus = stopped ? await redisStatus(runtimeEnv) : current;
+  const stoppedProof = stopped && redisStatusProvesStopped(stoppedStatus);
+  const tempCleanup = stoppedProof
+    ? await cleanupAbandonedRedisTempSnapshots({ dataDir: redisDir, redisIsStopped: true })
+    : {
+        removed: [],
+        bytesRemoved: 0,
+        issues: [
+          {
+            error: stopped
+              ? 'Redis process exited, but its stopped/listener state could not be proven.'
+              : `Redis pid ${pid} is still running.`
+          }
+        ]
+      };
+  if (stoppedProof) await rm(redisPidFile, { force: true });
+  const lastShutdownAttempt = shutdownAttempt.attempts.at(-1) || null;
   return {
     skipped: false,
-    ok: !processAlive(pid),
+    ok: stoppedProof && tempCleanup.issues.length === 0,
     pid,
-    shutdownSave: {
-      ok: shutdownSave.ok,
-      error: shutdownSave.ok ? null : (shutdownSave.stderr || shutdownSave.stdout || '').trim() || null
+    shutdown: {
+      mode: shutdownPolicy.mode,
+      effectiveMode: shutdownAttempt.effectiveMode,
+      durableAofVerified: shutdownPolicy.durableAofVerified,
+      reasons: shutdownPolicy.reasons,
+      ok: stoppedProof,
+      attempts: shutdownAttempt.attempts,
+      error: stoppedProof
+        ? null
+        : lastShutdownAttempt?.error || `Redis pid ${pid} is still running; force termination was refused.`
     },
-    escalated
+    escalated: false,
+    forceTerminationRefused: shutdownAttempt.forceTerminationRefused === true,
+    tempCleanup
   };
 }
 
@@ -2830,23 +3140,46 @@ async function runMonitorDaemon() {
   }
 }
 
+async function executeOrderedRuntimeStop(operations) {
+  const monitor = await operations.monitor();
+  const batshitApp = await operations.batshitApp();
+  const [localRuntimes, mcpProxy, batshitServer, dockerMcpGateway] = await Promise.all([
+    operations.localRuntimes(),
+    operations.mcpProxy(),
+    operations.batshitServer(),
+    operations.dockerMcpGateway()
+  ]);
+  const redis = await operations.redis();
+  const sweep = await operations.sweep();
+  return {
+    monitor,
+    batshitApp,
+    localRuntimes,
+    mcpProxy,
+    batshitServer,
+    dockerMcpGateway,
+    redis,
+    sweep
+  };
+}
+
 async function stop() {
   await supervisorLog('stop', 'Runtime stop requested.');
   const env = await loadRuntimeEnv();
   const serviceDefinitions = createServiceDefinitions(env);
-  // Order matters: the monitor must die first so it cannot respawn services,
-  // and the app must stop before managed local runtimes so it cannot relaunch
-  // a voice engine mid-stop. The final sweep catches any stragglers.
-  const results = {
-    monitor: await stopMonitor(),
-    batshitApp: await stopService(serviceDefinitions.batshitApp),
-    localRuntimes: await stopManagedLocalRuntimes(env),
-    mcpProxy: await stopService(serviceDefinitions.mcpProxy),
-    batshitServer: await stopService(serviceDefinitions.batshitServer),
-    dockerMcpGateway: await stopDockerMcpGateway(),
-    redis: await stopRedis(env),
-    sweep: await sweepOrphans('stop', env, serviceDefinitions)
-  };
+  // The monitor dies first, then Batshit App so it cannot launch more work.
+  // Independent consumers stop concurrently, Redis stays last, and the final
+  // sweep proves no managed process survived.
+  const results = await executeOrderedRuntimeStop({
+    monitor: stopMonitor,
+    batshitApp: () => stopService(serviceDefinitions.batshitApp),
+    localRuntimes: () => stopManagedLocalRuntimes(env),
+    mcpProxy: () => stopService(serviceDefinitions.mcpProxy),
+    batshitServer: () => stopService(serviceDefinitions.batshitServer),
+    dockerMcpGateway: stopDockerMcpGateway,
+    redis: () => stopRedis(env),
+    sweep: () => sweepOrphans('stop', env, serviceDefinitions)
+  });
   const ok =
     ![results.batshitApp, results.mcpProxy, results.batshitServer, results.dockerMcpGateway, results.redis].some(
       (result) => result && result.ok === false
@@ -2854,6 +3187,37 @@ async function stop() {
     !results.localRuntimes.some((result) => result.ok === false) &&
     results.sweep.issues.length === 0;
   return { ok, stopped: results, status: await status() };
+}
+
+async function writeShutdownCompletion(result) {
+  await publishJsonAtomically(shutdownCompleteFile, {
+    completedAt: new Date().toISOString(),
+    ok: result?.ok === true,
+    error: result?.error || null
+  });
+}
+
+async function publishJsonAtomically(filePath, payload) {
+  await mkdir(dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  let handle = null;
+  try {
+    handle = await open(tempPath, 'wx', 0o600);
+    await handle.writeFile(`${JSON.stringify(payload)}\n`);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await rename(tempPath, filePath);
+    const directory = await open(dirname(filePath), 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await rm(tempPath, { force: true }).catch(() => {});
+  }
 }
 
 async function packageAudit(packagePath) {
@@ -3061,7 +3425,10 @@ async function main() {
       return;
     }
     if (action === 'stop') {
-      jsonResponse({ success: true, ...(await stop()) });
+      await rm(shutdownCompleteFile, { force: true });
+      const result = await stop();
+      await writeShutdownCompletion(result);
+      jsonResponse({ success: true, ...result });
       return;
     }
     if (action === 'restart') {
@@ -3095,9 +3462,27 @@ async function main() {
     }
     throw new Error(`Unknown supervisor action: ${action}`);
   } catch (error) {
+    if (action === 'stop') {
+      await writeShutdownCompletion({ ok: false, error: normalizeError(error) }).catch(() => {});
+    }
     jsonResponse({ success: false, ok: false, error: normalizeError(error) });
     process.exitCode = 1;
   }
 }
 
-await main();
+const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;
+if (invokedPath === fileURLToPath(import.meta.url)) {
+  await main();
+}
+
+export {
+  attemptSafeRedisShutdown,
+  cleanupAbandonedRedisTempSnapshots,
+  chooseRedisShutdownMode,
+  createServiceDefinitions,
+  executeOrderedRuntimeStop,
+  isRedisTempSnapshotName,
+  parseRedisInfo,
+  publishJsonAtomically,
+  redisStatusProvesStopped
+};

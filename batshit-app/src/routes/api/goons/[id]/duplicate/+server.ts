@@ -5,6 +5,12 @@ import {
   resolveUploadUrlsForBrowserInPayload
 } from '$lib/server/services/batshitServerUrls'
 import type { GoonRecord } from '$lib/types/goons'
+import { GOON_RECIPE_OWNER_V2_CONTRACT } from '$lib/goons/recipe'
+import {
+  duplicateRecipeGoon,
+  GoonRecipeDuplicationError
+} from '$lib/server/services/goonRecipeDuplicationService.server'
+import { GoonRecipeLifecycleError } from '$lib/server/services/goonRecipeLifecycleService.server'
 
 function generateGoonId() {
   return `goon_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
@@ -21,6 +27,26 @@ export const POST: RequestHandler = async ({ params, locals }) => {
   const goonId = params.id
 
   try {
+    const source = await redis.execute(async (client) =>
+      client.json.get(`goon:${goonId}`) as Promise<GoonRecord | null>
+    )
+    if (!source || source.user_id !== locals.user.id) {
+      return json({ error: 'Goon not found' }, { status: 404 })
+    }
+    if (source.recipe?.contract === GOON_RECIPE_OWNER_V2_CONTRACT) {
+      const now = new Date().toISOString()
+      const newGoonId = generateGoonId()
+      const baseName = source.name?.trim() || 'New Goon'
+      const result = await duplicateRecipeGoon({
+        userId: locals.user.id,
+        sourceGoonId: goonId,
+        targetGoonId: newGoonId,
+        name: `${baseName} Copy`,
+        now
+      })
+      return json({ goon: resolveUploadUrlsForBrowserInPayload(result) })
+    }
+
     const result = await redis.execute(async (client) => {
       const existing = (await client.json.get(`goon:${goonId}`)) as GoonRecord | null
       if (!existing) return null
@@ -58,6 +84,9 @@ export const POST: RequestHandler = async ({ params, locals }) => {
 
     return json({ goon: resolveUploadUrlsForBrowserInPayload(result) })
   } catch (error) {
+    if (error instanceof GoonRecipeDuplicationError || error instanceof GoonRecipeLifecycleError) {
+      return json({ error: error.message }, { status: error.status })
+    }
     console.error('Error duplicating goon:', error)
     return json({ error: 'Failed to duplicate goon' }, { status: 500 })
   }

@@ -43,11 +43,12 @@ import {
   neutralizeAllClipReferenceSyntax,
   neutralizeUntrustedZipReferenceSyntax
 } from '$lib/utils/zipReferenceSafety'
+import { registerRuntimeShutdownTask } from '$lib/server/services/runtimeShutdown'
 
 type SSEController = ReadableStreamDefaultController & {
   _id?: string;
   _heartbeat?: ReturnType<typeof setInterval>;
-  _visualCleanup?: () => void;
+  _visualCleanup?: () => void | Promise<void>;
   _closed?: boolean;
 }
 
@@ -73,6 +74,7 @@ const sessionSubagentCache = new Map<string, any[]>()
 const EXTERNAL_CHANNEL_PREFIX = 'batshit:sse:'
 let externalSubscriber: ReturnType<typeof createClient> | null = null
 let externalSubscriberReady: Promise<void> | null = null
+let sseRuntimeShutdownPromise: Promise<void> | null = null
 
 function hasToolMetadataSignature(value: unknown): boolean {
   if (Array.isArray(value)) {
@@ -175,8 +177,9 @@ async function ensureExternalSubscriber() {
   if (externalSubscriberReady) return externalSubscriberReady
 
   externalSubscriberReady = (async () => {
+    let subscriber: ReturnType<typeof createClient> | null = null
     try {
-      const subscriber = createClient({ url: resolveRedisConnectionUrl(env) })
+      subscriber = createClient({ url: resolveRedisConnectionUrl(env) })
       subscriber.on('error', (err) => {
         console.error('[SSE] External subscriber error', err)
       })
@@ -200,12 +203,73 @@ async function ensureExternalSubscriber() {
       logger.debug('[SSE] External event subscriber ready')
     } catch (err) {
       console.error('[SSE] Failed to start external subscriber', err)
+      if (subscriber?.isOpen) {
+        await subscriber.disconnect().catch((disconnectError) => {
+          console.error('[SSE] Failed to close partial external subscriber', disconnectError)
+        })
+      }
       externalSubscriberReady = null
     }
   })()
 
   return externalSubscriberReady
 }
+
+export function _closeSseRuntimeResources(reason = 'shutdown'): Promise<void> {
+  sseRuntimeShutdownPromise ??= (async () => {
+    const visualCleanups: Promise<void>[] = []
+    for (const [sessionId, sessionControllers] of connections) {
+      for (const controller of sessionControllers) {
+        controller._closed = true
+        if (controller._heartbeat) {
+          clearInterval(controller._heartbeat)
+          controller._heartbeat = undefined
+        }
+        if (controller._visualCleanup) {
+          visualCleanups.push(Promise.resolve(controller._visualCleanup()))
+          controller._visualCleanup = undefined
+        }
+        try {
+          controller.close()
+        } catch {
+          // The client may already have closed the stream.
+        }
+      }
+      zipDetection.deleteSessionBuffers(sessionId)
+    }
+    connections.clear()
+
+    for (const timers of activeStreamCleanupTimers.values()) {
+      for (const timer of timers.values()) clearTimeout(timer)
+    }
+    activeStreamCleanupTimers.clear()
+    activeStreams.clear()
+    sessionAdapters.clear()
+    sessionSubagentCache.clear()
+    sessionZipSettings.clear()
+    agentSettingsCache.clear()
+
+    const ready = externalSubscriberReady
+    if (ready) await ready.catch(() => undefined)
+    const subscriber = externalSubscriber
+    externalSubscriber = null
+    externalSubscriberReady = null
+    if (subscriber?.isOpen) {
+      try {
+        await subscriber.disconnect()
+      } catch (error) {
+        console.error('[SSE] External subscriber disconnect failed; forcing socket destruction', error)
+        subscriber.destroy()
+        if (subscriber.isOpen) throw error
+      }
+    }
+    await Promise.all(visualCleanups)
+    logger.debug(`[SSE] Runtime resources closed for ${reason}`)
+  })()
+  return sseRuntimeShutdownPromise
+}
+
+registerRuntimeShutdownTask('sse', _closeSseRuntimeResources)
 
 function forwardExternalEvent(sessionId: string, payload: any) {
   const listeners = connections.get(sessionId)
@@ -560,6 +624,16 @@ export const GET: RequestHandler = async ({ url, locals }) => {
         // Continue anyway - monitoring is optional
       }
 
+      // Shutdown can begin while the async Redis subscription is still being
+      // established. If it did, tear down the late resource immediately and
+      // do not create a new heartbeat after the runtime cleanup has finished.
+      if (controllerRef._closed) {
+        const lateVisualCleanup = controllerRef._visualCleanup
+        controllerRef._visualCleanup = undefined
+        await lateVisualCleanup?.()
+        return
+      }
+
       // Keep alive with heartbeat
       const heartbeat = setInterval(() => {
         try {
@@ -590,7 +664,7 @@ export const GET: RequestHandler = async ({ url, locals }) => {
             if (entry._heartbeat) {
               clearInterval(entry._heartbeat)
             }
-            entry._visualCleanup?.()
+            await entry._visualCleanup?.()
             sessionControllers.delete(entry)
             break
           }
@@ -1431,7 +1505,11 @@ function removeController(sessionId: string, controller: SSEController) {
     clearInterval(controller._heartbeat)
     controller._heartbeat = undefined
   }
-  controller._visualCleanup?.()
+  if (controller._visualCleanup) {
+    void Promise.resolve(controller._visualCleanup()).catch((error) => {
+      console.error('[SSE] Failed to close visual monitoring:', error)
+    })
+  }
   sessionControllers.delete(controller)
 
   if (sessionControllers.size === 0) {

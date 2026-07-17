@@ -63,11 +63,14 @@ class RedisService {
     return /LOADING/i.test(message) || /ECONNREFUSED/i.test(message);
   }
 
-  async connect() {
+  async connect(options = {}) {
     const connectionConfig = resolveRedisConnectionConfig(process.env);
+    const maxAttempts = Number.isInteger(options.maxAttempts)
+      ? Math.max(1, options.maxAttempts)
+      : REDIS_STARTUP_MAX_ATTEMPTS;
     this.startingUp = true;
 
-    for (let attempt = 1; attempt <= REDIS_STARTUP_MAX_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         if (this.client?.isOpen) {
           await this.client.quit().catch(() => {});
@@ -78,6 +81,12 @@ class RedisService {
 
         this.client = createClient({
           ...connectionConfig,
+          socket: {
+            ...(connectionConfig.socket || {}),
+            // The service owns bounded startup retries. Disable node-redis's
+            // unbounded reconnect loop so each outer attempt can resolve.
+            reconnectStrategy: false
+          },
           // Redis 8 optimizations
           commandsQueueMaxLength: 10000,
           enableAutoPipelining: true
@@ -111,12 +120,12 @@ class RedisService {
         return true;
       } catch (error) {
         const retryable =
-          this.isStartupRetryableError(error) && attempt < REDIS_STARTUP_MAX_ATTEMPTS;
+          this.isStartupRetryableError(error) && attempt < maxAttempts;
         this.connected = false;
 
         if (retryable) {
           logger.warn(
-            `[Redis] Connection attempt ${attempt}/${REDIS_STARTUP_MAX_ATTEMPTS} hit a transient startup condition; retrying in ${REDIS_STARTUP_RETRY_DELAY_MS}ms`
+            `[Redis] Connection attempt ${attempt}/${maxAttempts} hit a transient startup condition; retrying in ${REDIS_STARTUP_RETRY_DELAY_MS}ms`
           );
           await new Promise((resolve) => setTimeout(resolve, REDIS_STARTUP_RETRY_DELAY_MS));
           continue;

@@ -38,7 +38,9 @@ async function findFreePort() {
   });
 }
 
-async function waitForHealth(url, timeoutMs = 15000) {
+// Redis fallback deliberately preserves the production 15-attempt startup
+// window; leave enough headroom for that bounded retry contract to finish.
+async function waitForHealth(url, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {

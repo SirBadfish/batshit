@@ -4,7 +4,8 @@ const logger = require('../utils/logger');
 /**
  * Local upload manager.
  *
- * Batshit clip uploads always store through the local Redis-backed strategy.
+ * Batshit clip uploads always store through the local strategy: persistent bytes
+ * are file-backed with Redis metadata, while TTL-backed ephemeral bytes stay in Redis.
  * Model-facing URL vs data-URL transport is resolved later by the app runtime.
  */
 class UploadManager {

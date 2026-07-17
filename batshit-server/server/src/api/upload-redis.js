@@ -15,8 +15,13 @@ const config = require('../config');
 const logger = require('../utils/logger');
 const batshitzipService = require('../services/batshitZipService');
 const redisService = require('../services/redisService');
+const { persistFileBackedUpload } = require('../services/fileBackedUploadService');
 const uploadManager = require('../services/uploadManager');
 const { prepareFacialArtworkUpload } = require('../services/facialArtworkValidator');
+const {
+  hashFile,
+  inspectAndExtractRecipeArchive
+} = require('../services/goonRecipeArchiveService');
 
 const router = express.Router();
 const execFileAsync = promisify(execFile);
@@ -93,7 +98,7 @@ const goonGuidedPackageUpload = multer({
 });
 
 const goonCustomPackageUpload = multer({
-  storage,
+  storage: goonDiskStorage,
   limits: {
     fileSize: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE
   }
@@ -759,7 +764,8 @@ async function storeFilesystemUploadAsset(
     sourceFile,
     buffer,
     size,
-    metadata
+    metadata,
+    redisKey: explicitRedisKey
   }
 ) {
   const uploadedAt = new Date().toISOString();
@@ -769,27 +775,49 @@ async function storeFilesystemUploadAsset(
       ? size
       : buffer?.length || (safeSourcePath ? (await fs.stat(safeSourcePath)).size : 0);
   const filePath = resolveStoredUploadPath(uploadType, filename);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-
-  if (safeSourcePath) {
-    await moveFileAcrossDevices(safeSourcePath, filePath);
-  } else {
-    await fs.writeFile(filePath, buffer || Buffer.alloc(0));
-  }
-
-  const payload = {
+  const basePayload = {
     originalName,
     mimetype: mimetype || 'application/octet-stream',
     size: resolvedSize,
     uploadType,
     uploadedAt,
-    storage: 'filesystem',
-    relativePath: path.relative(config.uploadsDir, filePath),
-    filePath,
     ...(metadata && typeof metadata === 'object' ? metadata : {})
   };
+  const redisKey = explicitRedisKey || `upload:${uploadType}:${filename}`;
 
-  const redisKey = `upload:${uploadType}:${filename}`;
+  if (!safeSourcePath) {
+    const payload = await persistFileBackedUpload({
+      redisService,
+      redisKey,
+      uploadType,
+      filename,
+      buffer: buffer || Buffer.alloc(0),
+      payload: basePayload
+    });
+    return {
+      filename,
+      originalName,
+      url: buildRedisUploadUrl(req, uploadType, filename),
+      mimetype: payload.mimetype,
+      size: payload.size,
+      uploadedAt,
+      redisKey,
+      storage: 'filesystem',
+      sha256: payload.sha256
+    };
+  }
+
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+
+  await moveFileAcrossDevices(safeSourcePath, filePath);
+
+  const payload = {
+    ...basePayload,
+    storage: 'filesystem',
+    relativePath: path.relative(config.uploadsDir, filePath),
+    filePath
+  };
+
   try {
     await persistUploadPayload(redisKey, payload);
   } catch (error) {
@@ -805,7 +833,8 @@ async function storeFilesystemUploadAsset(
     size: resolvedSize,
     uploadedAt,
     redisKey,
-    storage: 'filesystem'
+    storage: 'filesystem',
+    ...(typeof payload.sha256 === 'string' ? { sha256: payload.sha256 } : {})
   };
 }
 
@@ -814,14 +843,20 @@ async function deleteStoredUploadAsset(uploadType, filename) {
   validateStoredFilename(filename);
 
   const redisKey = `upload:${uploadType}:${filename}`;
+  return deleteStoredUploadRecord(redisKey);
+}
+
+async function deleteStoredUploadRecord(redisKey) {
   const payload = await redisService.get(redisKey);
   const filePath = payload ? resolveFileBackedPayloadPath(payload) : null;
+  const deleted = await redisService.client.del(redisKey);
+  if (payload && deleted !== 1) {
+    throw new Error(`Redis refused to delete upload metadata for ${redisKey}.`);
+  }
 
   if (filePath) {
     await fs.rm(filePath, { force: true });
   }
-
-  await redisService.client.del(redisKey);
   return {
     redisKey,
     existed: Boolean(payload),
@@ -1617,7 +1652,7 @@ router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), asyn
         for (const key of oldKeys) {
           const exists = await redisService.client.exists(key);
           if (exists) {
-            await redisService.client.del(key);
+            await deleteStoredUploadRecord(key);
 	            logger.info('Deleted old avatar');
             break;
           }
@@ -1628,15 +1663,17 @@ router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), asyn
       }
     }
     
-    // Store in Redis with no expiration
-    await persistUploadPayload(redisKey, {
+    await storeFilesystemUploadAsset(req, {
+      uploadType: 'avatars',
       originalName: req.file.originalname,
+      filename: avatarFilename,
       mimetype: 'image/jpeg',
-      size: avatarBuffer.length,
-      base64: avatarBuffer.toString('base64'),
-      entityType: entityType || 'unknown',
-      entityId: entityId || 'unknown',
-      uploadedAt: new Date().toISOString()
+      buffer: avatarBuffer,
+      redisKey,
+      metadata: {
+        entityType: entityType || 'unknown',
+        entityId: entityId || 'unknown'
+      }
     });
     
     // Construct the public URL - maintaining same URL structure for compatibility
@@ -1722,6 +1759,8 @@ router.post('/upload/goon', goonVrmUpload.single('file'), async (req, res) => {
 });
 
 router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'), async (req, res) => {
+  const newlyStoredAssets = [];
+  let extractedMembers = [];
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -1736,84 +1775,151 @@ router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'
       });
     }
 
-    let archiveEntries;
-    try {
-      if (detectUploadSignature(req.file.buffer) !== 'zip') {
-        throw uploadValidationError('Custom Goon package content is not a zip archive.');
+    const archivePath = resolveMulterDiskUploadPath(req.file);
+    if (!archivePath || (await detectUploadSignatureFromFile(req.file)) !== 'zip') {
+      throw uploadValidationError('Custom Goon package content is not a zip archive.');
+    }
+    const extraction = await inspectAndExtractRecipeArchive({
+      archivePath,
+      outputDir: goonDiskUploadTempDir,
+      maxArchiveBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE,
+      maxModelBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE - GOON_MANIFEST_MAX_BYTES,
+      maxManifestBytes: GOON_MANIFEST_MAX_BYTES,
+      maxTotalUncompressedBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE,
+      maxExpansionRatio: 20
+    });
+    extractedMembers = extraction.members;
+    const { summary } = parseCustomGoonManifest(extraction.manifestText);
+    const manifestMember = extraction.members.find((member) => member.role === 'manifest');
+    const modelMember = extraction.members.find((member) => member.role === 'model');
+    if (!manifestMember || !modelMember) {
+      throw uploadValidationError('Custom Goon package extraction did not return both required members.');
+    }
+
+    const packageFilename = `${extraction.archive.sha256}.bgoon`;
+    const modelFilename = `${modelMember.sha256}.glb`;
+    const manifestFilename = `${manifestMember.sha256}.json`;
+
+    const storeImmutableAsset = async ({
+      uploadType,
+      filename,
+      expectedSha256,
+      expectedBytes,
+      originalAssetName,
+      mimetype,
+      operation
+    }) => {
+      const redisKey = `upload:${uploadType}:${filename}`;
+      const existing = await redisService.get(redisKey);
+      if (existing) {
+        const existingPath = resolveFileBackedPayloadPath(existing);
+        if (
+          existing.storage !== 'filesystem' ||
+          existing.sha256 !== expectedSha256 ||
+          existing.size !== expectedBytes ||
+          !existingPath
+        ) {
+          throw new Error(`Immutable Recipe asset metadata collision at ${redisKey}.`);
+        }
+        const storedHash = await hashFile(existingPath).catch(() => null);
+        if (
+          !storedHash ||
+          storedHash.sha256 !== expectedSha256 ||
+          storedHash.bytes !== expectedBytes
+        ) {
+          throw new Error(`Immutable Recipe asset bytes are corrupt at ${redisKey}.`);
+        }
+        return {
+          filename,
+          originalName: existing.originalName || originalAssetName,
+          url: buildRedisUploadUrl(req, uploadType, filename),
+          mimetype: existing.mimetype || mimetype,
+          size: existing.size,
+          uploadedAt: existing.uploadedAt,
+          redisKey,
+          storage: 'filesystem',
+          sha256: existing.sha256
+        };
       }
-      archiveEntries = readConstrainedGoonArchiveEntries(req.file.buffer, {
-        laneLabel: 'Custom Goon',
-        allowedBasenames: ['avatar.json', 'avatar.glb', 'avatar.gltf'],
-        maxUncompressedBytes: GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE
-      });
-    } catch (error) {
-      if (error?.statusCode) throw error;
-      return res.status(400).json({ error: 'Custom Goon package could not be opened as a zip archive' });
-    }
+      const stored = await operation();
+      newlyStoredAssets.push({ uploadType, filename });
+      return stored;
+    };
 
-    const manifestEntries = archiveEntries.filter(
-      ([entryName]) => getArchiveEntryBasename(entryName).toLowerCase() === 'avatar.json'
-    );
-    const modelEntries = archiveEntries.filter(
-      ([entryName]) => getArchiveEntryBasename(entryName).toLowerCase() === 'avatar.glb'
-    );
-    const gltfEntries = archiveEntries.filter(
-      ([entryName]) => getArchiveEntryBasename(entryName).toLowerCase() === 'avatar.gltf'
-    );
-
-    if (manifestEntries.length !== 1 || modelEntries.length !== 1) {
-      const gltfHint =
-        gltfEntries.length > 0
-          ? ' `avatar.gltf` packages are not supported yet; use a bundled `avatar.glb` instead.'
-          : '';
-      return res.status(400).json({
-        error: `Custom Goon package must contain exactly one avatar.glb and one avatar.json.${gltfHint}`
-      });
-    }
-
-    const [manifestEntryName, manifestBytes] = manifestEntries[0];
-    const manifestText = strFromU8(manifestBytes);
-    const { summary } = parseCustomGoonManifest(manifestText);
-
-    const [, modelBytes] = modelEntries[0];
-    const safeBase =
-      sanitizeFilenameSegment(path.basename(originalName, ext), 'custom_goon').slice(0, 80) ||
-      'custom_goon';
-    const timestamp = Date.now();
-
-    const packageFilename = `${timestamp}_${safeBase}${ext}`;
-    const modelFilename = `${timestamp}_${safeBase}_avatar.glb`;
-    const manifestFilename = `${timestamp}_${safeBase}_avatar.json`;
-    const modelBuffer = Buffer.from(modelBytes);
-    if (detectUploadSignature(modelBuffer) !== 'glb') {
-      throw uploadValidationError('Custom Goon avatar.glb content does not match a GLB signature.');
-    }
-
-    const packageFile = await storeRedisUploadAsset(req, {
+    const packageFile = await storeImmutableAsset({
+      uploadType: 'goon_custom_packages',
+      filename: packageFilename,
+      expectedSha256: extraction.archive.sha256,
+      expectedBytes: extraction.archive.bytes,
+      originalAssetName: originalName,
+      mimetype: req.file.mimetype || 'application/zip',
+      operation: () =>
+      storeFilesystemUploadAsset(req, {
       uploadType: 'goon_custom_packages',
       originalName,
       filename: packageFilename,
       mimetype: req.file.mimetype || 'application/zip',
-      buffer: req.file.buffer,
-      size: req.file.size
+      sourceFile: req.file,
+      size: extraction.archive.bytes,
+      metadata: {
+        sha256: extraction.archive.sha256,
+        immutable: true,
+        recipeArchiveRole: 'archive'
+      }
+    })
     });
 
-    const modelFile = await storeRedisUploadAsset(req, {
+    const modelFile = await storeImmutableAsset({
+      uploadType: 'goon_custom_models',
+      filename: modelFilename,
+      expectedSha256: modelMember.sha256,
+      expectedBytes: modelMember.bytes,
+      originalAssetName: 'avatar.glb',
+      mimetype: 'model/gltf-binary',
+      operation: () =>
+      storeFilesystemUploadAsset(req, {
       uploadType: 'goon_custom_models',
       originalName: 'avatar.glb',
       filename: modelFilename,
       mimetype: 'model/gltf-binary',
-      buffer: modelBuffer,
-      size: modelBuffer.length
+      sourceFile: {
+        filename: path.basename(modelMember.tempPath),
+        originalname: 'avatar.glb'
+      },
+      size: modelMember.bytes,
+      metadata: {
+        sha256: modelMember.sha256,
+        immutable: true,
+        recipeArchiveRole: 'model'
+      }
+    })
     });
 
-    const manifestFile = await storeRedisUploadAsset(req, {
+    const manifestFile = await storeImmutableAsset({
       uploadType: 'goon_custom_manifests',
-      originalName: getArchiveEntryBasename(manifestEntryName) || 'avatar.json',
+      filename: manifestFilename,
+      expectedSha256: manifestMember.sha256,
+      expectedBytes: manifestMember.bytes,
+      originalAssetName: 'avatar.json',
+      mimetype: 'application/json',
+      operation: () =>
+      storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_custom_manifests',
+      originalName: 'avatar.json',
       filename: manifestFilename,
       mimetype: 'application/json',
-      textContent: manifestText,
-      size: Buffer.byteLength(manifestText)
+      sourceFile: {
+        filename: path.basename(manifestMember.tempPath),
+        originalname: 'avatar.json'
+      },
+      size: manifestMember.bytes,
+      metadata: {
+        sha256: manifestMember.sha256,
+        immutable: true,
+        recipeArchiveRole: 'manifest',
+        manifestSummary: summary
+      }
+    })
     });
 
     return res.json({
@@ -1823,11 +1929,56 @@ router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'
         model: modelFile,
         manifest: manifestFile
       },
-      manifestData: summary
+      manifestData: summary,
+      archiveExtraction: {
+        contract: extraction.contract,
+        extractor: extraction.extractor,
+        archive: {
+          ref: `/uploads/goon_custom_packages/${packageFilename}`,
+          sha256: extraction.archive.sha256,
+          bytes: extraction.archive.bytes
+        },
+        entryCount: extraction.entryCount,
+        totalUncompressedBytes: extraction.totalUncompressedBytes,
+        members: [
+          {
+            role: 'manifest',
+            path: manifestMember.path,
+            sha256: manifestMember.sha256,
+            bytes: manifestMember.bytes,
+            extracted: {
+              ref: `/uploads/goon_custom_manifests/${manifestFilename}`,
+              sha256: manifestMember.sha256,
+              bytes: manifestMember.bytes
+            }
+          },
+          {
+            role: 'model',
+            path: modelMember.path,
+            sha256: modelMember.sha256,
+            bytes: modelMember.bytes,
+            extracted: {
+              ref: `/uploads/goon_custom_models/${modelFilename}`,
+              sha256: modelMember.sha256,
+              bytes: modelMember.bytes
+            }
+          }
+        ]
+      }
     });
   } catch (error) {
+    for (const asset of newlyStoredAssets.reverse()) {
+      await deleteStoredUploadAsset(asset.uploadType, asset.filename).catch((cleanupError) => {
+        logger.error('Recipe package partial-write cleanup failed:', cleanupError);
+      });
+    }
     logger.error('Custom Goon package upload error:', error);
     sendUploadError(res, 'Custom Goon package upload failed', error);
+  } finally {
+    await cleanupTempUploadFile(req.file);
+    await Promise.all(
+      extractedMembers.map((member) => fs.rm(member.tempPath, { force: true }).catch(() => {}))
+    );
   }
 });
 
@@ -1970,33 +2121,18 @@ router.post('/upload/goon-animation', goonAnimationUpload.single('file'), async 
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}${ext}`;
-    const redisKey = `upload:goon_animations:${filename}`;
-
-    await persistUploadPayload(
-      redisKey,
-      {
-        originalName,
-        mimetype: req.file.mimetype || 'application/octet-stream',
-        size: req.file.size,
-        base64: req.file.buffer.toString('base64'),
-        uploadType: 'goon_animations',
-        uploadedAt: new Date().toISOString()
-      }
-    );
-
-    const url = `${req.protocol}://${req.get('host')}/uploads/goon_animations/${filename}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_animations',
+      originalName,
+      filename,
+      mimetype: req.file.mimetype || 'application/octet-stream',
+      buffer: req.file.buffer,
+      size: req.file.size
+    });
 
     return res.json({
       success: true,
-      file: {
-        filename,
-        originalName,
-        url,
-        mimetype: req.file.mimetype || 'application/octet-stream',
-        size: req.file.size,
-        uploadedAt: new Date().toISOString(),
-        redisKey
-      }
+      file
     });
   } catch (error) {
     logger.error('Goon animation upload error:', error);
@@ -2025,33 +2161,18 @@ router.post('/upload/goon-animation-preview', goonAnimationPreviewUpload.single(
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}.mp4`;
-    const redisKey = `upload:goon_animation_previews:${filename}`;
-
-    await persistUploadPayload(
-      redisKey,
-      {
-        originalName,
-        mimetype: transcoded.mimetype,
-        size: transcoded.size,
-        base64: transcoded.buffer.toString('base64'),
-        uploadType: 'goon_animation_previews',
-        uploadedAt: new Date().toISOString()
-      }
-    );
-
-    const url = `${req.protocol}://${req.get('host')}/uploads/goon_animation_previews/${filename}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_animation_previews',
+      originalName,
+      filename,
+      mimetype: transcoded.mimetype,
+      buffer: transcoded.buffer,
+      size: transcoded.size
+    });
 
     return res.json({
       success: true,
-      file: {
-        filename,
-        originalName,
-        url,
-        mimetype: transcoded.mimetype,
-        size: transcoded.size,
-        uploadedAt: new Date().toISOString(),
-        redisKey
-      }
+      file
     });
   } catch (error) {
     logger.error('Goon animation preview upload error:', error);
@@ -2123,33 +2244,18 @@ router.post('/upload/goon-closet', goonImageUpload.single('file'), async (req, r
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}.png`;
-    const redisKey = `upload:goon_closet:${filename}`;
-
-    await persistUploadPayload(
-      redisKey,
-      {
-        originalName,
-        mimetype: req.file.mimetype || 'image/png',
-        size: req.file.size,
-        base64: req.file.buffer.toString('base64'),
-        uploadType: 'goon_closet',
-        uploadedAt: new Date().toISOString()
-      }
-    );
-
-    const url = `${req.protocol}://${req.get('host')}/uploads/goon_closet/${filename}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_closet',
+      originalName,
+      filename,
+      mimetype: req.file.mimetype || 'image/png',
+      buffer: req.file.buffer,
+      size: req.file.size
+    });
 
     return res.json({
       success: true,
-      file: {
-        filename,
-        originalName,
-        url,
-        mimetype: req.file.mimetype || 'image/png',
-        size: req.file.size,
-        uploadedAt: new Date().toISOString(),
-        redisKey
-      }
+      file
     });
   } catch (error) {
     logger.error('Goon closet upload error:', error);
@@ -2196,7 +2302,7 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
     const filename = `${timestamp}_${safeBase}${normalizedExt}`;
     const thumbnailFilename = `${timestamp}_${safeBase}_thumb.jpg`;
     const thumbnailBuffer = await buildGoonSceneThumbnail(req.file.buffer);
-    const sceneFile = await storeRedisUploadAsset(req, {
+    const sceneFile = await storeFilesystemUploadAsset(req, {
       uploadType: 'goon_scenes',
       originalName,
       filename,
@@ -2204,7 +2310,7 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
       buffer: req.file.buffer,
       size: req.file.size
     });
-    const thumbnailFile = await storeRedisUploadAsset(req, {
+    const thumbnailFile = await storeFilesystemUploadAsset(req, {
       uploadType: 'goon_scene_thumbs',
       originalName: `${safeBase}_thumb.jpg`,
       filename: thumbnailFilename,
@@ -2272,33 +2378,18 @@ router.post('/upload/goon-room-shell', goonSceneModelUpload.single('file'), asyn
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}${ext}`;
-    const redisKey = `upload:goon_room_shells:${filename}`;
-
-    await persistUploadPayload(
-      redisKey,
-      {
-        originalName,
-        mimetype: req.file.mimetype || (isGlb ? 'model/gltf-binary' : 'model/gltf+json'),
-        size: req.file.size,
-        base64: req.file.buffer.toString('base64'),
-        uploadType: 'goon_room_shells',
-        uploadedAt: new Date().toISOString()
-      }
-    );
-
-    const url = `${req.protocol}://${req.get('host')}/uploads/goon_room_shells/${filename}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_room_shells',
+      originalName,
+      filename,
+      mimetype: req.file.mimetype || (isGlb ? 'model/gltf-binary' : 'model/gltf+json'),
+      buffer: req.file.buffer,
+      size: req.file.size
+    });
 
     return res.json({
       success: true,
-      file: {
-        filename,
-        originalName,
-        url,
-        mimetype: req.file.mimetype || (isGlb ? 'model/gltf-binary' : 'model/gltf+json'),
-        size: req.file.size,
-        uploadedAt: new Date().toISOString(),
-        redisKey
-      }
+      file
     });
   } catch (error) {
     logger.error('Goon room shell upload error:', error);
@@ -2344,35 +2435,19 @@ router.post('/upload/goon-room-texture', goonSceneUpload.single('file'), async (
     const timestamp = Date.now();
     const normalizedExt = ext === '.jpeg' ? '.jpg' : ext;
     const filename = `${timestamp}_${safeBase}${normalizedExt}`;
-    const redisKey = `upload:goon_room_textures:${filename}`;
-
-    await persistUploadPayload(
-      redisKey,
-      {
-        originalName,
-        mimetype: req.file.mimetype || (isPng ? 'image/png' : 'image/jpeg'),
-        size: req.file.size,
-        base64: req.file.buffer.toString('base64'),
-        uploadType: 'goon_room_textures',
-        kind,
-        uploadedAt: new Date().toISOString()
-      }
-    );
-
-    const url = `${req.protocol}://${req.get('host')}/uploads/goon_room_textures/${filename}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_room_textures',
+      originalName,
+      filename,
+      mimetype: req.file.mimetype || (isPng ? 'image/png' : 'image/jpeg'),
+      buffer: req.file.buffer,
+      size: req.file.size,
+      metadata: { kind }
+    });
 
     return res.json({
       success: true,
-      file: {
-        filename,
-        originalName,
-        url,
-        mimetype: req.file.mimetype || (isPng ? 'image/png' : 'image/jpeg'),
-        size: req.file.size,
-        uploadedAt: new Date().toISOString(),
-        kind,
-        redisKey
-      }
+      file: { ...file, kind }
     });
   } catch (error) {
     logger.error('Goon room texture upload error:', error);
@@ -2414,33 +2489,18 @@ router.post('/upload/goon-scene-prop', goonSceneModelUpload.single('file'), asyn
 
     const timestamp = Date.now();
     const filename = `${timestamp}_${safeBase}${ext}`;
-    const redisKey = `upload:goon_scene_props:${filename}`;
-
-    await persistUploadPayload(
-      redisKey,
-      {
-        originalName,
-        mimetype: req.file.mimetype || (isGlb ? 'model/gltf-binary' : 'model/gltf+json'),
-        size: req.file.size,
-        base64: req.file.buffer.toString('base64'),
-        uploadType: 'goon_scene_props',
-        uploadedAt: new Date().toISOString()
-      }
-    );
-
-    const url = `${req.protocol}://${req.get('host')}/uploads/goon_scene_props/${filename}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_scene_props',
+      originalName,
+      filename,
+      mimetype: req.file.mimetype || (isGlb ? 'model/gltf-binary' : 'model/gltf+json'),
+      buffer: req.file.buffer,
+      size: req.file.size
+    });
 
     return res.json({
       success: true,
-      file: {
-        filename,
-        originalName,
-        url,
-        mimetype: req.file.mimetype || (isGlb ? 'model/gltf-binary' : 'model/gltf+json'),
-        size: req.file.size,
-        uploadedAt: new Date().toISOString(),
-        redisKey
-      }
+      file
     });
   } catch (error) {
     logger.error('Goon scene prop upload error:', error);

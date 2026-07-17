@@ -93,6 +93,8 @@ jobs:
           src/lib/server/tests/messageDeletion.test.ts
           src/lib/server/tests/folderDeletion.test.ts
           src/lib/server/services/__tests__/backupRestoreService.test.ts
+          src/lib/server/services/__tests__/goonRecipeRepository.test.ts
+          src/lib/server/services/__tests__/goonMutationRepository.test.ts
           src/tests/integration/story-5.22-gateway-service.test.ts
           src/tests/integration/story-5.23-redis-persistence.test.ts
           src/lib/server/icons/iconLibrary.test.ts

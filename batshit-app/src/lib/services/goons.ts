@@ -10,6 +10,7 @@ import type {
   GoonRecord,
   GoonSourceProfile
 } from '$lib/types/goons'
+import type { RecipeArchiveContainmentReceipt } from '$lib/goons/recipe'
 import type {
   FacialArtworkProvenance,
   FacialArtworkOrientation,
@@ -55,6 +56,7 @@ export type CustomGoonPackageUploadResult = {
   model: GoonFileRef
   manifest: GoonFileRef
   manifestSummary?: GoonCustomManifestSummary
+  archiveReceipt: RecipeArchiveContainmentReceipt
 }
 
 export type GoonFacialArtworkUploadInput = {
@@ -258,7 +260,8 @@ export async function uploadCustomGoonPackage(
     package: normalizeFileRef(files.package),
     model: normalizeFileRef(files.model),
     manifest: normalizeFileRef(files.manifest),
-    manifestSummary: data?.manifestData ?? undefined
+    manifestSummary: data?.manifestData ?? undefined,
+    archiveReceipt: data?.archiveReceipt
   }
 }
 

@@ -578,10 +578,14 @@ describe("appearance-dials/v2 parser and provenance", () => {
       brow_left: appearanceNode("BS_BrowCanvas_L", "brow-canvas", "left"),
       brow_right: appearanceNode("BS_BrowCanvas_R", "brow-canvas", "right"),
       eye_treatment_left: appearanceNode(
-        "BS_EyeTreatmentCanvas_L", "eye-treatment-canvas", "left",
+        "BS_EyeTreatmentCanvas_L",
+        "eye-treatment-canvas",
+        "left",
       ),
       eye_treatment_right: appearanceNode(
-        "BS_EyeTreatmentCanvas_R", "eye-treatment-canvas", "right",
+        "BS_EyeTreatmentCanvas_R",
+        "eye-treatment-canvas",
+        "right",
       ),
       teeth_upper: appearanceNode("BS_Teeth_Upper", "teeth-upper", "none"),
     });
@@ -857,6 +861,76 @@ describe("runtime node/index ownership", () => {
 });
 
 describe("typed follower contract", () => {
+  it("supports follower-only Recipe dials without dummy body targets", () => {
+    const raw = buildManifest();
+    raw.appearanceDials.dials.push({
+      id: "oral_depth",
+      label: "Oral Depth",
+      region: "head",
+      tier: "advanced",
+      order: 9,
+      description: "",
+      keywords: ["oral", "depth"],
+      kind: "follower-only",
+      range: [-1, 1],
+      default: 0,
+      step: 0.01,
+      requirements: { followerRefs: ["oral-depth"] },
+    });
+    raw.appearanceDials.followers["oral-depth"] = {
+      contract: APPEARANCE_FOLLOWER_CONTRACT,
+      space: "node-parent-rest",
+      composition: "rest-relative-follower-channel-id-order/v2",
+      interpolation: "linear-trs-slerp-rotation-morph/v2",
+      extrapolation: "clamp",
+      provenance: {
+        ...provenance("oral-depth"),
+        license: "LicenseRef-Batshit-First-Party",
+      },
+      nodeIds: ["face"],
+      drivers: [
+        {
+          driver: { kind: "dial", id: "oral_depth" },
+          channels: [
+            {
+              id: "oral-depth-translate",
+              kind: "node-trs",
+              node: "face",
+              samples: followerSamples(),
+            },
+          ],
+        },
+      ],
+    };
+
+    const manifest = parse(raw);
+    const resolved = resolveAppearanceDialState(
+      manifest,
+      valueState(manifest, { oral_depth: 0.5 }),
+    );
+    expect(resolved.influences.get("face_fullness")).toBe(0);
+    expect(resolved.followerState.nodeTransforms).toContainEqual(
+      expect.objectContaining({
+        follower: "oral-depth",
+        channel: "oral-depth-translate",
+        node: "face",
+        translation: [0.05, 0, 0],
+      }),
+    );
+    expect(
+      getAppearanceRecipeBakeInventory(manifest).bakeFollowerNodeTransforms,
+    ).toContainEqual({
+      follower: "oral-depth",
+      channel: "oral-depth-translate",
+      node: "face",
+    });
+
+    delete raw.appearanceDials.dials.at(-1).requirements;
+    expect(() => parseAppearanceDialsManifest(raw)).toThrow(
+      "requires one or more followerRefs",
+    );
+  });
+
   it("rejects the retired rigid contract and malformed transform channels", () => {
     const retired = buildManifest();
     retired.appearanceDials.followers["head-assets"].contract =

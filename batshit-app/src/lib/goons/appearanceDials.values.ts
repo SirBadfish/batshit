@@ -438,6 +438,12 @@ export function resolveAppearanceDialState(
       }
       continue;
     }
+    if (dial.kind === "follower-only") {
+      // The saved dial value is consumed exclusively by its declared
+      // appearance-followers/v2 channels. It intentionally owns no body
+      // target and therefore contributes no target influence here.
+      continue;
+    }
     for (const member of dial.members ?? []) contribute(member, value);
     if (
       dial.symmetry?.mode === "linked-with-offsets" &&
