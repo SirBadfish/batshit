@@ -1,0 +1,1634 @@
+[
+  {
+    "perimeterIndex": 0,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.0,
+    "triangleVertexIndices": [
+      1075,
+      6775,
+      1074
+    ],
+    "barycentricWeights": [
+      0.455635275851,
+      1.6271699e-05,
+      0.54434845245
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 1,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.021276596,
+    "triangleVertexIndices": [
+      6775,
+      57,
+      54
+    ],
+    "barycentricWeights": [
+      0.945531947425,
+      2.2261263e-05,
+      0.054445791313
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 2,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.042553191,
+    "triangleVertexIndices": [
+      6775,
+      54,
+      6763
+    ],
+    "barycentricWeights": [
+      0.43040794045,
+      0.569578524774,
+      1.3534775e-05
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 3,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.063829787,
+    "triangleVertexIndices": [
+      6775,
+      57,
+      54
+    ],
+    "barycentricWeights": [
+      0.082498482699,
+      0.001904824382,
+      0.915596692919
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 4,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.085106383,
+    "triangleVertexIndices": [
+      4865,
+      1,
+      54
+    ],
+    "barycentricWeights": [
+      1.6844684e-05,
+      0.190406773708,
+      0.809576381608
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 5,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.106382979,
+    "triangleVertexIndices": [
+      6763,
+      54,
+      1
+    ],
+    "barycentricWeights": [
+      1.948506e-06,
+      0.601097890286,
+      0.398900161208
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 6,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.127659574,
+    "triangleVertexIndices": [
+      4865,
+      1,
+      54
+    ],
+    "barycentricWeights": [
+      0.000112345217,
+      0.556989494819,
+      0.442898159965
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 7,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.14893617,
+    "triangleVertexIndices": [
+      4865,
+      1,
+      54
+    ],
+    "barycentricWeights": [
+      7.3683894e-05,
+      0.681972212431,
+      0.317954103676
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 8,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.170212766,
+    "triangleVertexIndices": [
+      4865,
+      1,
+      54
+    ],
+    "barycentricWeights": [
+      0.000142961536,
+      0.784024902398,
+      0.215832136065
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 9,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.191489362,
+    "triangleVertexIndices": [
+      4865,
+      1,
+      54
+    ],
+    "barycentricWeights": [
+      9.6428431e-05,
+      0.869690166168,
+      0.130213405401
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 10,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.212765957,
+    "triangleVertexIndices": [
+      4865,
+      1,
+      54
+    ],
+    "barycentricWeights": [
+      -4.274286e-06,
+      0.943211337847,
+      0.056792936439
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 11,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.234042553,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      -2.844568e-06,
+      0.009661590683,
+      0.990341253885
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 12,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.255319149,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      3.144444e-05,
+      0.080510269307,
+      0.919458286252
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 13,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.276595745,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      4.236429e-05,
+      0.140762036653,
+      0.859195599057
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 14,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.29787234,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      0.000118734617,
+      0.193016811408,
+      0.806864453976
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 15,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.319148936,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      5.2865158e-05,
+      0.239309693807,
+      0.760637441035
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 16,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.340425532,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      4.4846551e-05,
+      0.280832606855,
+      0.719122546594
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 17,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.361702128,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      8.6888571e-05,
+      0.318553144897,
+      0.681359966532
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 18,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.382978723,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      5.4216804e-05,
+      0.353422290013,
+      0.646523493183
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 19,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.404255319,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      7.100028e-05,
+      0.38589983792,
+      0.6140291618
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 20,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.425531915,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      -1.2935566e-05,
+      0.416636737896,
+      0.583376197669
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 21,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.446808511,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      0.000109417008,
+      0.445732420077,
+      0.554158162915
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 22,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.468085106,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      4.1386672e-05,
+      0.473918750017,
+      0.52603986331
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 23,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.489361702,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      5.3738226e-05,
+      0.501236005767,
+      0.498710256007
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 24,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.510638298,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      0.000109127287,
+      0.527983443099,
+      0.471907429614
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 25,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.531914894,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      9.0988295e-05,
+      0.554529997085,
+      0.44537901462
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 26,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.553191489,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      8.9354311e-05,
+      0.581023563831,
+      0.418887081858
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 27,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.574468085,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      0.000104239206,
+      0.607703219546,
+      0.392192541249
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 28,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.595744681,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      -2.6516188e-05,
+      0.63496626083,
+      0.365060255358
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 29,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.617021277,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      8.523328e-05,
+      0.662713450212,
+      0.337201316507
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 30,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.638297872,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      2.9862019e-05,
+      0.69161552384,
+      0.30835461414
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 31,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.659574468,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      8.7103223e-05,
+      0.721735010186,
+      0.278177886591
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 32,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.680851064,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      0.000117583409,
+      0.753599152147,
+      0.246283264444
+    ],
+    "canvasWidthMeters": 0.0016
+  },
+  {
+    "perimeterIndex": 33,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.70212766,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      5.8819739e-05,
+      0.787711341726,
+      0.212229838535
+    ],
+    "canvasWidthMeters": 0.0016003003687543723
+  },
+  {
+    "perimeterIndex": 34,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.723404255,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      4.5355657e-05,
+      0.824539684268,
+      0.175414960075
+    ],
+    "canvasWidthMeters": 0.0016346180340401277
+  },
+  {
+    "perimeterIndex": 35,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.744680851,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      6.9043022e-05,
+      0.864803716801,
+      0.135127240177
+    ],
+    "canvasWidthMeters": 0.0017198770985234486
+  },
+  {
+    "perimeterIndex": 36,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.765957447,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      6.0585731e-05,
+      0.90948319459,
+      0.090456219679
+    ],
+    "canvasWidthMeters": 0.001847515982507266
+  },
+  {
+    "perimeterIndex": 37,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.787234043,
+    "triangleVertexIndices": [
+      4848,
+      0,
+      1
+    ],
+    "barycentricWeights": [
+      0.000131168473,
+      0.959728239732,
+      0.040140591795
+    ],
+    "canvasWidthMeters": 0.0020089731062945095
+  },
+  {
+    "perimeterIndex": 38,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.808510638,
+    "triangleVertexIndices": [
+      6,
+      0,
+      4848
+    ],
+    "barycentricWeights": [
+      0.022772409845,
+      0.977240419195,
+      -1.2829039e-05
+    ],
+    "canvasWidthMeters": 0.0021956868901881086
+  },
+  {
+    "perimeterIndex": 39,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.829787234,
+    "triangleVertexIndices": [
+      6,
+      0,
+      4848
+    ],
+    "barycentricWeights": [
+      0.112215378292,
+      0.887670325929,
+      0.000114295779
+    ],
+    "canvasWidthMeters": 0.0023990957544909944
+  },
+  {
+    "perimeterIndex": 40,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.85106383,
+    "triangleVertexIndices": [
+      6,
+      0,
+      4848
+    ],
+    "barycentricWeights": [
+      0.222588438704,
+      0.777330899073,
+      8.0662223e-05
+    ],
+    "canvasWidthMeters": 0.002610638119506097
+  },
+  {
+    "perimeterIndex": 41,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.872340426,
+    "triangleVertexIndices": [
+      6,
+      0,
+      4848
+    ],
+    "barycentricWeights": [
+      0.363702886711,
+      0.636238847284,
+      5.8266004e-05
+    ],
+    "canvasWidthMeters": 0.002821752405536346
+  },
+  {
+    "perimeterIndex": 42,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.893617021,
+    "triangleVertexIndices": [
+      6,
+      0,
+      4848
+    ],
+    "barycentricWeights": [
+      0.552524603717,
+      0.44735833888,
+      0.000117057404
+    ],
+    "canvasWidthMeters": 0.003023877032884671
+  },
+  {
+    "perimeterIndex": 43,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.914893617,
+    "triangleVertexIndices": [
+      6,
+      0,
+      4848
+    ],
+    "barycentricWeights": [
+      0.820840920441,
+      0.179136044702,
+      2.3034857e-05
+    ],
+    "canvasWidthMeters": 0.003208450421854003
+  },
+  {
+    "perimeterIndex": 44,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.936170213,
+    "triangleVertexIndices": [
+      9,
+      6,
+      4849
+    ],
+    "barycentricWeights": [
+      0.316677737178,
+      0.683265310521,
+      5.69523e-05
+    ],
+    "canvasWidthMeters": 0.0033669109927472723
+  },
+  {
+    "perimeterIndex": 45,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.957446809,
+    "triangleVertexIndices": [
+      6761,
+      9,
+      12
+    ],
+    "barycentricWeights": [
+      0.383005812301,
+      0.510496890644,
+      0.106497297055
+    ],
+    "canvasWidthMeters": 0.0034906971658674084
+  },
+  {
+    "perimeterIndex": 46,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 0.978723404,
+    "triangleVertexIndices": [
+      6760,
+      12,
+      15
+    ],
+    "barycentricWeights": [
+      0.217976134407,
+      0.426831409346,
+      0.355192456247
+    ],
+    "canvasWidthMeters": 0.00357124736151734
+  },
+  {
+    "perimeterIndex": 47,
+    "surfaceOwner": "upper",
+    "helperGroup": "body-visible-upper-lid-surface",
+    "localU": 1.0,
+    "triangleVertexIndices": [
+      6759,
+      18,
+      6758
+    ],
+    "barycentricWeights": [
+      0.559870071592,
+      0.406754116095,
+      0.033375812313
+    ],
+    "canvasWidthMeters": 0.0036
+  },
+  {
+    "perimeterIndex": 48,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.979591837,
+    "triangleVertexIndices": [
+      6758,
+      21,
+      6781
+    ],
+    "barycentricWeights": [
+      0.068993402592,
+      0.171383562561,
+      0.759623034846
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 49,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.959183673,
+    "triangleVertexIndices": [
+      1062,
+      6781,
+      6780
+    ],
+    "barycentricWeights": [
+      0.000263779619,
+      0.06872000335,
+      0.931016217031
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 50,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.93877551,
+    "triangleVertexIndices": [
+      6780,
+      27,
+      6779
+    ],
+    "barycentricWeights": [
+      0.201381659534,
+      0.338060103961,
+      0.460558236505
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 51,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.918367347,
+    "triangleVertexIndices": [
+      6779,
+      27,
+      5078
+    ],
+    "barycentricWeights": [
+      0.356703259375,
+      0.202048292591,
+      0.441248448034
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 52,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.897959184,
+    "triangleVertexIndices": [
+      6783,
+      5078,
+      30
+    ],
+    "barycentricWeights": [
+      0.224905593176,
+      0.73694167923,
+      0.038152727594
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 53,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.87755102,
+    "triangleVertexIndices": [
+      6783,
+      5078,
+      30
+    ],
+    "barycentricWeights": [
+      0.024400602158,
+      0.447199580733,
+      0.528399817109
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 54,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.857142857,
+    "triangleVertexIndices": [
+      30,
+      5127,
+      4857
+    ],
+    "barycentricWeights": [
+      0.94205586283,
+      0.009231200976,
+      0.048712936194
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 55,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.836734694,
+    "triangleVertexIndices": [
+      30,
+      4858,
+      33
+    ],
+    "barycentricWeights": [
+      0.539708856665,
+      0.066770384293,
+      0.393520759042
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 56,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.816326531,
+    "triangleVertexIndices": [
+      33,
+      6778,
+      6770
+    ],
+    "barycentricWeights": [
+      0.901472362711,
+      0.053906916116,
+      0.044620721173
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 57,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.795918367,
+    "triangleVertexIndices": [
+      6778,
+      33,
+      36
+    ],
+    "barycentricWeights": [
+      0.203516385389,
+      0.550523184884,
+      0.245960429727
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 58,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.775510204,
+    "triangleVertexIndices": [
+      6778,
+      33,
+      36
+    ],
+    "barycentricWeights": [
+      0.336570884114,
+      0.161703960751,
+      0.501725155135
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 59,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.755102041,
+    "triangleVertexIndices": [
+      6778,
+      36,
+      6777
+    ],
+    "barycentricWeights": [
+      0.28329464851,
+      0.305931977372,
+      0.410773374118
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 60,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.734693878,
+    "triangleVertexIndices": [
+      1066,
+      6778,
+      6777
+    ],
+    "barycentricWeights": [
+      0.073367491093,
+      0.02313032922,
+      0.903502179687
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 61,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.714285714,
+    "triangleVertexIndices": [
+      6776,
+      1067,
+      6777
+    ],
+    "barycentricWeights": [
+      0.062631869321,
+      0.158172553665,
+      0.779195577014
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 62,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.693877551,
+    "triangleVertexIndices": [
+      6776,
+      1067,
+      6777
+    ],
+    "barycentricWeights": [
+      0.198877774939,
+      0.177069696452,
+      0.624052528609
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 63,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.673469388,
+    "triangleVertexIndices": [
+      6776,
+      1067,
+      6777
+    ],
+    "barycentricWeights": [
+      0.325702556868,
+      0.255561833253,
+      0.418735609879
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 64,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.653061224,
+    "triangleVertexIndices": [
+      6776,
+      1067,
+      6777
+    ],
+    "barycentricWeights": [
+      0.447870900218,
+      0.331541962447,
+      0.220587137335
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 65,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.632653061,
+    "triangleVertexIndices": [
+      6776,
+      1068,
+      1067
+    ],
+    "barycentricWeights": [
+      0.562905481358,
+      0.001637621739,
+      0.435456896904
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 66,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.612244898,
+    "triangleVertexIndices": [
+      6776,
+      1068,
+      1067
+    ],
+    "barycentricWeights": [
+      0.442654316009,
+      0.25154071703,
+      0.305804966961
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 67,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.591836735,
+    "triangleVertexIndices": [
+      6776,
+      1068,
+      1067
+    ],
+    "barycentricWeights": [
+      0.316881683903,
+      0.504041416477,
+      0.179076899619
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 68,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.571428571,
+    "triangleVertexIndices": [
+      6776,
+      1068,
+      1067
+    ],
+    "barycentricWeights": [
+      0.155453701154,
+      0.789718561267,
+      0.054827737579
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 69,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.551020408,
+    "triangleVertexIndices": [
+      6774,
+      1068,
+      6776
+    ],
+    "barycentricWeights": [
+      0.059179749771,
+      0.880786413877,
+      0.060033836351
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 70,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.530612245,
+    "triangleVertexIndices": [
+      6774,
+      1069,
+      1068
+    ],
+    "barycentricWeights": [
+      0.151166131845,
+      0.013212377699,
+      0.835621490456
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 71,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.510204082,
+    "triangleVertexIndices": [
+      6774,
+      1069,
+      1068
+    ],
+    "barycentricWeights": [
+      0.159179034012,
+      0.112856683218,
+      0.727964282771
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 72,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.489795918,
+    "triangleVertexIndices": [
+      6774,
+      1069,
+      1068
+    ],
+    "barycentricWeights": [
+      0.157662190603,
+      0.221706202648,
+      0.620631606748
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 73,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.469387755,
+    "triangleVertexIndices": [
+      6774,
+      1069,
+      1068
+    ],
+    "barycentricWeights": [
+      0.115267303003,
+      0.372306435819,
+      0.512426261178
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 74,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.448979592,
+    "triangleVertexIndices": [
+      6774,
+      1069,
+      1068
+    ],
+    "barycentricWeights": [
+      0.07245062795,
+      0.524181036804,
+      0.403368335246
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 75,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.428571429,
+    "triangleVertexIndices": [
+      1069,
+      1094,
+      1068
+    ],
+    "barycentricWeights": [
+      0.707663170094,
+      0.00157243201,
+      0.290764397896
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 76,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.408163265,
+    "triangleVertexIndices": [
+      1069,
+      1094,
+      1068
+    ],
+    "barycentricWeights": [
+      0.821510074875,
+      0.020617107968,
+      0.157872817158
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 77,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.387755102,
+    "triangleVertexIndices": [
+      1069,
+      1094,
+      1068
+    ],
+    "barycentricWeights": [
+      0.939169254576,
+      0.044480689615,
+      0.01635005581
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 78,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.367346939,
+    "triangleVertexIndices": [
+      1095,
+      1069,
+      1070
+    ],
+    "barycentricWeights": [
+      0.061482324952,
+      0.871476161943,
+      0.067041513105
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 79,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.346938776,
+    "triangleVertexIndices": [
+      1095,
+      1069,
+      1070
+    ],
+    "barycentricWeights": [
+      0.05412125579,
+      0.734286450033,
+      0.211592294178
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 80,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.326530612,
+    "triangleVertexIndices": [
+      1095,
+      1069,
+      1070
+    ],
+    "barycentricWeights": [
+      0.057157424448,
+      0.58113735568,
+      0.361705219873
+    ],
+    "canvasWidthMeters": 0.0009
+  },
+  {
+    "perimeterIndex": 81,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.306122449,
+    "triangleVertexIndices": [
+      1095,
+      1069,
+      1070
+    ],
+    "barycentricWeights": [
+      0.062200075241,
+      0.418355337295,
+      0.519444587464
+    ],
+    "canvasWidthMeters": 0.0009010958112159899
+  },
+  {
+    "perimeterIndex": 82,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.285714286,
+    "triangleVertexIndices": [
+      1095,
+      1069,
+      1070
+    ],
+    "barycentricWeights": [
+      0.081523238626,
+      0.233137864853,
+      0.685338896521
+    ],
+    "canvasWidthMeters": 0.0009063957725947521
+  },
+  {
+    "perimeterIndex": 83,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.265306122,
+    "triangleVertexIndices": [
+      1095,
+      1069,
+      1070
+    ],
+    "barycentricWeights": [
+      0.108601243062,
+      0.029503007485,
+      0.861895749453
+    ],
+    "canvasWidthMeters": 0.000915530631635203
+  },
+  {
+    "perimeterIndex": 84,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.244897959,
+    "triangleVertexIndices": [
+      1096,
+      1070,
+      1071
+    ],
+    "barycentricWeights": [
+      0.152389518314,
+      0.7804152038,
+      0.067195277886
+    ],
+    "canvasWidthMeters": 0.0009278778400156396
+  },
+  {
+    "perimeterIndex": 85,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.224489796,
+    "triangleVertexIndices": [
+      1096,
+      1070,
+      1071
+    ],
+    "barycentricWeights": [
+      0.18324784326,
+      0.529994185968,
+      0.286757970772
+    ],
+    "canvasWidthMeters": 0.0009428148494143596
+  },
+  {
+    "perimeterIndex": 86,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.204081633,
+    "triangleVertexIndices": [
+      1096,
+      1070,
+      1071
+    ],
+    "barycentricWeights": [
+      0.230148873615,
+      0.245291258779,
+      0.524559867606
+    ],
+    "canvasWidthMeters": 0.0009597191115096601
+  },
+  {
+    "perimeterIndex": 87,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.183673469,
+    "triangleVertexIndices": [
+      1096,
+      1071,
+      1097
+    ],
+    "barycentricWeights": [
+      0.225416800902,
+      0.702603527814,
+      0.071979671285
+    ],
+    "canvasWidthMeters": 0.0009779680779798384
+  },
+  {
+    "perimeterIndex": 88,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.163265306,
+    "triangleVertexIndices": [
+      1097,
+      1071,
+      5102
+    ],
+    "barycentricWeights": [
+      0.385885821836,
+      0.588028156642,
+      0.026086021522
+    ],
+    "canvasWidthMeters": 0.0009969392005031916
+  },
+  {
+    "perimeterIndex": 89,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.142857143,
+    "triangleVertexIndices": [
+      1097,
+      1071,
+      5102
+    ],
+    "barycentricWeights": [
+      0.473745440751,
+      0.049000052453,
+      0.477254506795
+    ],
+    "canvasWidthMeters": 0.0010160099307580173
+  },
+  {
+    "perimeterIndex": 90,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.12244898,
+    "triangleVertexIndices": [
+      5104,
+      1072,
+      1098
+    ],
+    "barycentricWeights": [
+      0.594992168885,
+      0.246872788389,
+      0.158135042726
+    ],
+    "canvasWidthMeters": 0.001034557720422613
+  },
+  {
+    "perimeterIndex": 91,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.102040816,
+    "triangleVertexIndices": [
+      1098,
+      1079,
+      1105
+    ],
+    "barycentricWeights": [
+      0.600470401206,
+      0.000284212297,
+      0.399245386497
+    ],
+    "canvasWidthMeters": 0.0010519600211752755
+  },
+  {
+    "perimeterIndex": 92,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.081632653,
+    "triangleVertexIndices": [
+      1105,
+      1078,
+      1104
+    ],
+    "barycentricWeights": [
+      0.820457444445,
+      1.0543613e-05,
+      0.179532011942
+    ],
+    "canvasWidthMeters": 0.0010675942846943025
+  },
+  {
+    "perimeterIndex": 93,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.06122449,
+    "triangleVertexIndices": [
+      1077,
+      6767,
+      1076
+    ],
+    "barycentricWeights": [
+      0.481088674031,
+      -1.140305e-06,
+      0.518912466274
+    ],
+    "canvasWidthMeters": 0.0010808379626579912
+  },
+  {
+    "perimeterIndex": 94,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.040816327,
+    "triangleVertexIndices": [
+      1080,
+      6773,
+      1075
+    ],
+    "barycentricWeights": [
+      0.862077628208,
+      -2.470816e-06,
+      0.137924842608
+    ],
+    "canvasWidthMeters": 0.0010910685067446386
+  },
+  {
+    "perimeterIndex": 95,
+    "surfaceOwner": "lower",
+    "helperGroup": "body-visible-lower-lid-surface",
+    "localU": 0.020408163,
+    "triangleVertexIndices": [
+      1075,
+      6775,
+      1074
+    ],
+    "barycentricWeights": [
+      0.959859147208,
+      2.0778664e-05,
+      0.040120074128
+    ],
+    "canvasWidthMeters": 0.0010976633686325425
+  }
+]

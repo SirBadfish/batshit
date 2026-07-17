@@ -15,16 +15,19 @@ const mocks = vi.hoisted(() => ({
   getMessageReferences: vi.fn(),
   setContext: vi.fn(),
   deleteSessionBuffers: vi.fn(),
-  finalizeOpenBlocks: vi.fn()
+  finalizeOpenBlocks: vi.fn(),
+  externalDisconnect: vi.fn(async () => undefined)
 }))
 
 vi.mock('redis', () => ({
   createClient: vi.fn(() => ({
+    isOpen: true,
     connect: vi.fn(async () => undefined),
     on: vi.fn(),
     subscribe: vi.fn(async () => undefined),
     pSubscribe: vi.fn(async () => undefined),
-    quit: vi.fn(async () => undefined)
+    quit: vi.fn(async () => undefined),
+    disconnect: mocks.externalDisconnect
   }))
 }))
 
@@ -163,6 +166,47 @@ describe('/api/sse route streaming contract', () => {
 
     await firstReader.cancel()
     await secondReader.cancel()
+  })
+
+  it('closes active streams and external Redis resources during runtime shutdown', async () => {
+    const visualCleanup = vi.fn(async () => undefined)
+    mocks.setupSessionMonitoring.mockResolvedValue(visualCleanup)
+    const route = await import('./+server')
+    const locals = { user: { id: 'user-1' } }
+    const url = new URL('http://localhost/api/sse?sessionId=session-1')
+    const response = await route.GET({ url, locals } as any)
+    const reader = response.body!.getReader()
+    expect(await readSsePayload(reader)).toMatchObject({ type: 'connected' })
+
+    await route._closeSseRuntimeResources('test')
+
+    expect(await reader.read()).toMatchObject({ done: true })
+    expect(visualCleanup).toHaveBeenCalledOnce()
+    expect(mocks.externalDisconnect).toHaveBeenCalledOnce()
+    expect(mocks.deleteSessionBuffers).toHaveBeenCalledWith('session-1')
+  })
+
+  it('cleans up monitoring that finishes connecting after shutdown starts', async () => {
+    let finishSetup!: (cleanup: () => Promise<void>) => void
+    const setupPending = new Promise<() => Promise<void>>((resolve) => {
+      finishSetup = resolve
+    })
+    const lateVisualCleanup = vi.fn(async () => undefined)
+    mocks.setupSessionMonitoring.mockReturnValue(setupPending)
+    const route = await import('./+server')
+    const locals = { user: { id: 'user-1' } }
+    const url = new URL('http://localhost/api/sse?sessionId=session-1')
+    const response = await route.GET({ url, locals } as any)
+    const reader = response.body!.getReader()
+    expect(await readSsePayload(reader)).toMatchObject({ type: 'connected' })
+    await vi.waitFor(() => expect(mocks.setupSessionMonitoring).toHaveBeenCalledOnce())
+
+    const closing = route._closeSseRuntimeResources('test-deferred-setup')
+    finishSetup(lateVisualCleanup)
+    await closing
+
+    await vi.waitFor(() => expect(lateVisualCleanup).toHaveBeenCalledOnce())
+    expect(await reader.read()).toMatchObject({ done: true })
   })
 
   it('stamps stable stream event ids on original delivery and replay', async () => {

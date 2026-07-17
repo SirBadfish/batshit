@@ -54,6 +54,16 @@ export function resolveKitchenCues(goonsSettings?: GoonsSettings | null): {
   return { cueMap, emojiMap }
 }
 
+function normalizeGoonMotionsSettings(
+  value?: GoonsSettings['motions'] | null
+): NonNullable<GoonsSettings['motions']> {
+  const glbPreviewGoonId =
+    typeof value?.glbPreviewGoonId === 'string' && value.glbPreviewGoonId.trim()
+      ? value.glbPreviewGoonId.trim()
+      : undefined
+  return glbPreviewGoonId ? { glbPreviewGoonId } : {}
+}
+
 export function normalizeGoonsSettings(
   settings?: GoonsSettings | null
 ): GoonsSettings {
@@ -71,8 +81,66 @@ export function normalizeGoonsSettings(
       bodyVariants: cloneMap(settings?.kitchen?.bodyVariants ?? { items: {} }),
       eyeContact: normalizeGoonGlobalEyeContactSettingsMap(settings?.kitchen?.eyeContact),
       defaultPack: cloneMap(settings?.kitchen?.defaultPack ?? null)
+    },
+    motions: normalizeGoonMotionsSettings(settings?.motions)
+  }
+}
+
+export function mergeGoonsSettingsPatch(
+  settings: GoonsSettings | null | undefined,
+  patch: Partial<GoonsSettings> | null | undefined
+): GoonsSettings {
+  const normalized = normalizeGoonsSettings(settings)
+  if (!patch || typeof patch !== 'object') return normalized
+
+  const next: GoonsSettings = { ...normalized }
+  if (patch.dockOpen !== undefined) next.dockOpen = patch.dockOpen
+  if (patch.showCues !== undefined) next.showCues = patch.showCues
+  if (patch.immersiveMode !== undefined) next.immersiveMode = patch.immersiveMode
+  if (patch.globalCloset !== undefined) next.globalCloset = cloneMap(patch.globalCloset)
+
+  const kitchenPatch = patch.kitchen
+  if (kitchenPatch && typeof kitchenPatch === 'object') {
+    next.kitchen = {
+      ...normalized.kitchen,
+      ...kitchenPatch,
+      cues: kitchenPatch.cues !== undefined ? cloneMap(kitchenPatch.cues) : normalized.kitchen?.cues,
+      emojiMap:
+        kitchenPatch.emojiMap !== undefined
+          ? cloneMap(kitchenPatch.emojiMap)
+          : normalized.kitchen?.emojiMap,
+      postures:
+        kitchenPatch.postures !== undefined
+          ? normalizeCustomPostureMap(kitchenPatch.postures)
+          : normalized.kitchen?.postures,
+      scenes:
+        kitchenPatch.scenes !== undefined ? cloneMap(kitchenPatch.scenes) : normalized.kitchen?.scenes,
+      roomTextures:
+        kitchenPatch.roomTextures !== undefined
+          ? cloneMap(kitchenPatch.roomTextures)
+          : normalized.kitchen?.roomTextures,
+      bodyVariants:
+        kitchenPatch.bodyVariants !== undefined
+          ? cloneMap(kitchenPatch.bodyVariants)
+          : normalized.kitchen?.bodyVariants,
+      eyeContact:
+        kitchenPatch.eyeContact !== undefined
+          ? normalizeGoonGlobalEyeContactSettingsMap(kitchenPatch.eyeContact)
+          : normalized.kitchen?.eyeContact,
+      defaultPack:
+        kitchenPatch.defaultPack !== undefined
+          ? kitchenPatch.defaultPack === null
+            ? null
+            : cloneMap(kitchenPatch.defaultPack)
+          : normalized.kitchen?.defaultPack
     }
   }
+
+  if (patch.motions !== undefined) {
+    next.motions = normalizeGoonMotionsSettings(patch.motions)
+  }
+
+  return next
 }
 
 export function resolveAutoEnabledCues(cueMap: GoonCueMap): string[] {

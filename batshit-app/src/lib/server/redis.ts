@@ -34,6 +34,10 @@ import {
 } from '$lib/utils/zipReferenceSafety'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
 import { resolveRedisConnectionUrl } from '$lib/server/redisConnection'
+import {
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
 
 async function resolveRuntimeRedisUrl(): Promise<string> {
   return resolveRedisConnectionUrl({
@@ -973,10 +977,14 @@ export class RedisService {
             const normalizedAgent = canonicalizePrimaryAgentRecord(
               agentData as Record<string, any>
             ) as AgentRow
-            agents.push(normalizedAgent)
+            agents.push(resolveUploadUrlsForBrowserInPayload(normalizedAgent))
 
             if (hasLegacyPrimaryAgentFields(agentData as Record<string, any>)) {
-              await client.json.set(`agent:${agentId}`, '$', normalizedAgent as any)
+              await client.json.set(
+                `agent:${agentId}`,
+                '$',
+                normalizeUploadUrlsForStorageInPayload(normalizedAgent) as any
+              )
             }
           }
         } catch (error) {
@@ -1064,9 +1072,10 @@ export class RedisService {
         created_at: agent.created_at || new Date().toISOString(),
         updated_at: new Date().toISOString()
       }) as AgentRow
+      const storageAgentData = normalizeUploadUrlsForStorageInPayload(agentData)
       
       // Store agent using RedisJSON for native JSON storage
-      await client.json.set(`agent:${agent.id}`, '$', agentData as any)
+      await client.json.set(`agent:${agent.id}`, '$', storageAgentData as any)
       
       // Add to user's agent list
       if (agentData.user_id) {
@@ -1075,9 +1084,9 @@ export class RedisService {
       
       // Map database fields to frontend format
       return {
-        ...agentData,
-        displayName: agentData.displayName || '',
-        avatar_url: agentData.avatar || agentData.avatar_url || undefined
+        ...resolveUploadUrlsForBrowserInPayload(storageAgentData),
+        displayName: storageAgentData.displayName || '',
+        avatar_url: storageAgentData.avatar || storageAgentData.avatar_url || undefined
       }
     })
   }
@@ -1156,7 +1165,9 @@ export class RedisService {
         }
       }
 
-      const canonicalUpdated = canonicalizePrimaryAgentRecord(updated)
+      const canonicalUpdated = normalizeUploadUrlsForStorageInPayload(
+        canonicalizePrimaryAgentRecord(updated)
+      )
       await client.json.set(`agent:${id}`, '$', canonicalUpdated as any)
     })
   }
@@ -1215,13 +1226,13 @@ export class RedisService {
               continue
             }
 
-            const updatedGroup: GroupChatGroupRow = {
+            const updatedGroup = normalizeUploadUrlsForStorageInPayload<GroupChatGroupRow>({
               ...group,
               agent_ids: nextAgentIds,
               agent_settings: nextAgentSettings,
               driver_agent_id: nextDriverAgentId,
               updated_at: new Date().toISOString()
-            }
+            })
 
             await client.json.set(`group:${groupId}`, '$', updatedGroup as any)
           } catch (error) {
@@ -1248,7 +1259,7 @@ export class RedisService {
         try {
           const groupData = await client.json.get(`group:${groupId}`)
           if (groupData) {
-            groups.push(groupData as unknown as GroupChatGroupRow)
+            groups.push(resolveUploadUrlsForBrowserInPayload(groupData as unknown as GroupChatGroupRow))
           }
         } catch (error) {
           logger.warn(`Failed to load group ${groupId}:`, error)
@@ -1268,7 +1279,9 @@ export class RedisService {
   async getGroup(id: string): Promise<GroupChatGroupRow | null> {
     return this.execute(async (client) => {
       const group = await client.json.get(`group:${id}`)
-      return (group as unknown as GroupChatGroupRow) ?? null
+      return group
+        ? resolveUploadUrlsForBrowserInPayload(group as unknown as GroupChatGroupRow)
+        : null
     })
   }
 
@@ -1334,11 +1347,12 @@ export class RedisService {
         created_at: group.created_at || now,
         updated_at: now
       }
+      const storageGroupData = normalizeUploadUrlsForStorageInPayload(groupData)
 
-      await client.json.set(`group:${groupData.id}`, '$', groupData as any)
+      await client.json.set(`group:${groupData.id}`, '$', storageGroupData as any)
       await client.sAdd(`user:${groupData.user_id}:groups`, groupData.id)
 
-      return groupData
+      return resolveUploadUrlsForBrowserInPayload(storageGroupData)
     })
   }
 
@@ -1399,8 +1413,9 @@ export class RedisService {
         zip_settings: null,
         updated_at: new Date().toISOString()
       }
+      const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
 
-      await client.json.set(`group:${id}`, '$', updated as any)
+      await client.json.set(`group:${id}`, '$', storageUpdated as any)
     })
   }
 
@@ -1476,7 +1491,9 @@ export class RedisService {
   async getUserSettings(userId: string): Promise<UserSettingsRow | null> {
     try {
       const settings = await this.json.get(`user:${userId}:settings`, '$')
-      return (settings as UserSettingsRow | null) ?? null
+      return settings
+        ? resolveUploadUrlsForBrowserInPayload(settings as UserSettingsRow)
+        : null
     } catch (error) {
       // Null strictly means "no settings saved yet". Redis failures rethrow so callers
       // fail loudly instead of treating an outage as an empty profile — a swallowed read
@@ -1567,9 +1584,10 @@ export class RedisService {
         settingsData.ui_settings.show_zip_visual_indicators = updates.show_zip_visual_indicators
       }
       
-      await client.json.set(`user:${userId}:settings`, '$', settingsData as any)
+      const storageSettingsData = normalizeUploadUrlsForStorageInPayload(settingsData)
+      await client.json.set(`user:${userId}:settings`, '$', storageSettingsData as any)
       
-      return settingsData
+      return resolveUploadUrlsForBrowserInPayload(storageSettingsData)
     })
   }
 
@@ -1596,8 +1614,9 @@ export class RedisService {
         updated_at: new Date().toISOString()
       }
       
-      await client.json.set(`user:${userId}:settings`, '$', updated as any)
-      return updated
+      const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
+      await client.json.set(`user:${userId}:settings`, '$', storageUpdated as any)
+      return resolveUploadUrlsForBrowserInPayload(storageUpdated)
     })
   }
 

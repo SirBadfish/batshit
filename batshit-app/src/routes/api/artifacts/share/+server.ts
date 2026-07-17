@@ -7,7 +7,10 @@ import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
 import { internalServiceHeaders } from '$lib/server/services/internalRequestAuth'
 import {
   getInternalBatshitServerAuthHeaders,
-  getInternalBatshitServerUrl
+  getInternalBatshitServerUrl,
+  normalizeUploadUrlForStorage,
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlForBrowser
 } from '$lib/server/services/batshitServerUrls'
 import {
   isOpaqueArtifactRuntimeRequest,
@@ -306,6 +309,8 @@ async function uploadImageViaStrategy(options: {
     clipId: String(uploadedFile.clipId),
     filename: typeof uploadedFile.originalName === 'string' ? uploadedFile.originalName : fileName,
     fullResolutionUrl: resolvedFullResolutionUrl
+      ? resolveUploadUrlForBrowser(resolvedFullResolutionUrl)
+      : null
   }
 }
 
@@ -382,11 +387,14 @@ async function annotateClipFullResolutionUrl(options: {
   const clip = await redis.get(clipKey)
   if (!clip || typeof clip !== 'object' || Array.isArray(clip)) return
 
-  await redis.set(clipKey, {
-    ...(clip as Record<string, any>),
-    fullResolutionUrl: options.fullResolutionUrl,
-    updated_at: new Date().toISOString()
-  } as any)
+  await redis.set(
+    clipKey,
+    normalizeUploadUrlsForStorageInPayload({
+      ...(clip as Record<string, any>),
+      fullResolutionUrl: normalizeUploadUrlForStorage(options.fullResolutionUrl),
+      updated_at: new Date().toISOString()
+    }) as any
+  )
 }
 
 async function uploadImageUrlViaStrategy(options: {

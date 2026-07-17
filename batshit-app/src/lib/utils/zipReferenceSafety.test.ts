@@ -129,7 +129,7 @@ describe('zipReferenceSafety', () => {
     expect(
       collectTrustedClipIdsFromMetadata({
         clipId: 'clip_1779416324513_primary',
-        clipIds: ['clip_1779416324513_array1', 'clip_id', 'batshit_guide'],
+        clipIds: ['clip_1779416324513_array1', 'clip_id', 'not_a_runtime_clip_id'],
         clippedItems: [{ clipId: 'clip_1779416324513_item1_0' }],
         clipReferences: [{ reference: '{{batshit-clip:clip_1779416324513_ref01:::notes.md}}' }]
       })

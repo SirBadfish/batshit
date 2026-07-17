@@ -15,6 +15,7 @@
   import { Badge } from '$lib/components/ui/badge'
   import * as Tooltip from '$lib/components/ui/tooltip'
   import {
+    Armchair,
     ArrowDownUp,
     Check,
     ChevronDown,
@@ -34,6 +35,7 @@
     RefreshCw,
     RotateCcw,
     Save,
+    SlidersHorizontal,
     Trash2,
     X
   } from '@lucide/svelte'
@@ -48,7 +50,12 @@
   import SettingsTextEditor from '$lib/components/settings/SettingsTextEditor.svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
-  import AnimationPreviewThumb from '$lib/components/goons/AnimationPreviewThumb.svelte'
+  import AnimationPreviewThumb, {
+    resolveMotionPreviewTargetKey,
+    type MotionPreviewTarget
+  } from '$lib/components/goons/AnimationPreviewThumb.svelte'
+  import AppearanceDialsEditor from '$lib/components/goons/AppearanceDialsEditor.svelte'
+  import FacialArtworkEditor from '$lib/components/goons/FacialArtworkEditor.svelte'
   import CustomMorphsEditor from '$lib/components/goons/CustomMorphsEditor.svelte'
   import FaceControlsEditor from '$lib/components/goons/FaceControlsEditor.svelte'
   import EyeContactTuningEditor from '$lib/components/goons/EyeContactTuningEditor.svelte'
@@ -81,7 +88,12 @@
     GOON_STAND_POSE_FALLBACK_NAMES,
     buildGoonAnimationLoadPlan,
     buildGoonAnimationPriorityNames,
-    resolveGoonAnimationName
+    filterGoonAnimationFilesForLane,
+    groupGoonMotionLibraryEntries,
+    resolveGoonAnimationName,
+    resolveGoonMotionLane,
+    type GoonMotionLane,
+    type UnifiedGoonMotionEntry
   } from '$lib/goons/animationLoadPlan'
   import { STARTER_GOON_ASSETS } from '$lib/goons/starterAssets'
   import {
@@ -90,8 +102,45 @@
     type CustomMorphDefinition
   } from '$lib/goons/customMorphs'
   import {
+    parseAppearanceDialsManifest,
+    reconcileAppearanceDialValues,
+    type AppearanceDialValueState,
+    type AppearanceDialsManifest
+  } from '$lib/goons/appearanceDials'
+  import {
+    collectFacialArtworkUploads,
+    createDefaultFacialArtworkState,
+    parseFacialArtworkDefinition,
+    parseFacialArtworkState,
+    reconcileFacialArtworkState,
+    resolveFacialArtworkTemplateVariant,
+    type FacialArtworkDefinitionV3,
+    type FacialArtworkOrientation,
+    type FacialArtworkProvenance,
+    type FacialArtworkRoleId,
+    type FacialArtworkStateV3,
+    type FacialArtworkUpload
+  } from '$lib/goons/facialArtwork'
+  import { restoreFacialArtworkDraft } from '$lib/goons/facialArtwork.editor'
+  import { classifyFacialArtworkPackageCapability } from '$lib/goons/facialArtwork.package'
+  import {
+    createDefaultFacialArtworkUploadCreditDraft,
+    type FacialArtworkUploadCreditDraft
+  } from '$lib/goons/facialArtwork.provenance'
+  import {
+    EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS,
+    createDefaultEyeAppearanceState,
+    parseEyeAppearanceDefinition,
+    parseEyeAppearanceState,
+    reconcileEyeAppearanceState,
+    updateEyeAppearanceControl,
+    type EyeAppearanceDefinitionV1,
+    type EyeAppearanceStateV1
+  } from '$lib/goons/eyeAppearance'
+  import {
     hasRenderableGoonAvatar,
     loadAvatarIntoEngine,
+    loadCustomAvatarManifest,
     resolveGoonAvatarSignature,
     resolveGoonAvatarUrl,
     normalizeGoonGlobalEyeContactSettingsMap,
@@ -141,7 +190,24 @@
     roomHeightToPresetValue,
     roomPresetValueToHeight
   } from '$lib/goons/roomBuilder'
-  import { applyGoonSceneDefinition, buildGoonSceneSignature } from '$lib/goons/stageScene'
+  import {
+    GOON_SCENE_AMBIENCE_PLACEMENT_OPTIONS,
+    GOON_SCENE_AMBIENCE_PRESET_OPTIONS,
+    normalizeGoonSceneAmbience
+  } from '$lib/goons/sceneAmbience'
+  import { normalizeRoomShellTransform } from '$lib/goons/roomShellTransform'
+  import { normalizeRoomCameraBoundary } from '$lib/goons/roomCameraBoundary'
+  import {
+    DEFAULT_GROUND_PROJECTION_LINE,
+    MAX_GROUND_PROJECTION_LINE,
+    MIN_GROUND_PROJECTION_LINE,
+    normalizeGroundProjectionLine
+  } from '$lib/goons/sceneSkybox'
+  import {
+    applyGoonSceneDefinition,
+    buildGoonSceneSignature,
+    resolveGoonScenePlacement
+  } from '$lib/goons/stageScene'
   import { BUILTIN_TRIM_TEXTURES } from '$lib/goons/roomTextures'
   import type {
     GoonBasePosture,
@@ -155,6 +221,12 @@
     GoonClosetLibrary,
     GoonEyeContactMode,
     GoonSceneDefinition,
+    GoonSceneAmbience,
+    GoonSceneAmbiencePlacement,
+    GoonSceneAmbiencePreset,
+    GoonScenePlacement,
+    GoonSceneRoomShellTransform,
+    GoonSceneCameraBoundary,
     GoonSceneMap,
     GoonSceneMarker,
     GoonSceneMarkers,
@@ -167,6 +239,7 @@
     GoonExpressionPreset,
     GoonExpressionTarget,
     GoonCamera,
+    GoonCameraMode,
     GoonEyeContactGlobalProfile,
     GoonGlobalEyeContactSettingsMap,
     GoonFileRef,
@@ -207,6 +280,7 @@
     GoonEngineQuality,
     GoonRendererRuntime
   } from '$lib/goons/engine'
+  import type { GoonFramingPreset } from '$lib/goons/cameraNavigation'
   import {
     createGoon,
     deleteGoon,
@@ -215,6 +289,7 @@
     updateGoon as updateGoonRecord,
     uploadGoonAnimation,
     deleteGoonAnimation,
+    GoonMotionVersionExistsError,
     uploadGoonAnimationToLibrary,
     uploadGoonAnimationToLibraryFile,
     deleteGoonAnimationFromLibrary,
@@ -231,9 +306,16 @@
     deleteGoonSceneProp,
     uploadGoonRoomTexture,
     uploadAdvancedGoonPackage,
+    uploadCustomGoonPackage,
+    uploadGoonFacialArtwork,
+    deleteGoonFacialArtwork,
     uploadGuidedDufClothesVrm
   } from '$lib/services/goons'
-  import type { AdvancedGoonPackageUploadResult } from '$lib/services/goons'
+  import type {
+    AdvancedGoonPackageUploadResult,
+    CustomGoonPackageUploadResult
+  } from '$lib/services/goons'
+  import { persistGoonsSettingsRequest } from '$lib/services/goonsSettingsPersistence'
   import {
     importGoonLibraryExportBundle
   } from '$lib/goons/packs'
@@ -271,6 +353,8 @@
   }
 
   type GoonsTopLevelTab = 'goons' | 'closet' | 'kitchen' | 'scenes' | 'motions'
+  type ScenePreviewBodyMode = 'proxy' | 'active-goon'
+  type SceneProxyPoseId = 'stand' | 'sit'
   type GoonsExitIntent =
     | { type: 'tab'; nextTab: GoonsTopLevelTab }
     | { type: 'close-editor' }
@@ -279,6 +363,7 @@
     successMessage?: string | null
   }
   const MOTION_LIBRARY_PREVIEW_GOON_ID = '__motion_library_preview__'
+  const SCENE_PROXY_PREVIEW_GOON_ID = '__scene_proxy_preview__'
 
   type GuidedDufOverlayDraft = NonNullable<
     NonNullable<GoonRecord['guidedAvatar']>['dufOverlays']
@@ -392,6 +477,9 @@
   let guidedUploadFile = $state<File | null>(null)
   let guidedUploadInput = $state<HTMLInputElement | null>(null)
   let guidedUploadBusy = $state(false)
+  let customUploadFile = $state<File | null>(null)
+  let customUploadInput = $state<HTMLInputElement | null>(null)
+  let customUploadBusy = $state(false)
 
   type FbxInstallPlatform = 'darwin-x64' | 'linux-x64' | 'windows-x64'
   type FbxInstallStatus = {
@@ -444,9 +532,11 @@
     sceneId: string
     scene: GoonSceneDefinition
   }
+  // One export option per unified motion — selecting it bundles every format
+  // version (.vrma + .glb) of that motion into the pack.
   type PackMotionExportOption = {
     key: string
-    file: GoonFileRef
+    files: GoonFileRef[]
     label: string
   }
   type PortablePackCueEntry = {
@@ -472,6 +562,10 @@
     entries: Record<string, Uint8Array>
     fileName: string
   }
+  type SceneAssetKind = 'skybox' | 'roomShell'
+  type SceneAssetUploadTarget =
+    | { session: number; mode: 'create' }
+    | { session: number; mode: 'edit'; sceneId: string }
   type MotionAccordionItem = {
     id: string
     postureId: GoonPosture | ''
@@ -480,7 +574,7 @@
     builtIn: boolean
     editable: boolean
     usageSummary: string
-    files: GoonFileRef[]
+    entries: UnifiedGoonMotionEntry[]
   }
 
   const ANY_POSTURE_BUCKET = '__any_posture__'
@@ -533,6 +627,10 @@
   let editorCamera = $state<GoonCamera>({})
   let editorDirty = $state(false)
   let editorSaving = $state(false)
+  let editorFacialArtworkUploadBusy = $state(false)
+  let editorFacialArtworkCreditDraft = $state<FacialArtworkUploadCreditDraft>(
+    createDefaultFacialArtworkUploadCreditDraft()
+  )
   let updateVrmInput = $state<HTMLInputElement | null>(null)
   let updateVrmFile = $state<File | null>(null)
   let updateVrmBusy = $state(false)
@@ -540,6 +638,7 @@
   let advancedPackageUpdateFile = $state<File | null>(null)
   let advancedPackageUpdateBusy = $state(false)
   let editorPendingAdvancedPackageUpdate = $state<AdvancedGoonPackageUploadResult | null>(null)
+  let editorPendingCustomPackageUpdate = $state<CustomGoonPackageUploadResult | null>(null)
   let guidedDufClothesInput = $state<HTMLInputElement | null>(null)
   let guidedDufClothesBusy = $state(false)
   let editorPendingVrmFile = $state<GoonFileRef | null>(null)
@@ -590,6 +689,8 @@
   let editorDescriptionEditorOpen = $state(false)
   let editorBasicSettingsOpen = $state(false)
   let editorEyeContactOpen = $state(false)
+  let editorBodyAppearanceOpen = $state(false)
+  let editorFaceAppearanceOpen = $state(false)
   let editorVrmSectionOpen = $state(false)
   let editorAnimationsSectionOpen = $state(false)
   let editorClosetOpen = $state(false)
@@ -602,6 +703,10 @@
   let newSceneDescription = $state('')
   let newSceneSkybox = $state<GoonFileRef | null>(null)
   let newSceneRoomShell = $state<GoonFileRef | null>(null)
+  let newScenePlacement = $state<GoonScenePlacement>('elevated')
+  let newSceneGroundProjectionLine = $state(DEFAULT_GROUND_PROJECTION_LINE)
+  let newSceneRoomShellTransform = $state(normalizeRoomShellTransform())
+  let newSceneAmbience = $state(normalizeGoonSceneAmbience())
   let sceneUploadInput = $state<HTMLInputElement | null>(null)
   let sceneRoomShellInput = $state<HTMLInputElement | null>(null)
   let scenePropInput = $state<HTMLInputElement | null>(null)
@@ -611,7 +716,14 @@
   let scenePropBusy = $state(false)
   let roomTextureBusy = $state(false)
   let sceneUploadTargetId = $state<string | null>(null)
+  let sceneSkyboxUploadTarget: SceneAssetUploadTarget | null = null
   let sceneRoomShellTargetId = $state<string | null>(null)
+  let sceneRoomShellUploadTarget: SceneAssetUploadTarget | null = null
+  let sceneEditorSession = 0
+  const draftSceneAssetUploadFilenames: Record<SceneAssetKind, Set<string>> = {
+    skybox: new Set<string>(),
+    roomShell: new Set<string>()
+  }
   let scenePropTargetId = $state<string | null>(null)
   let roomTextureTargetKind = $state<GoonRoomTextureKind>('floor')
   let activeSceneEdit = $state<
@@ -665,6 +777,7 @@
   let closetItemCategoryOverflow = $state<Record<string, boolean>>({})
   let moodsOpen = $state(false)
   let emotesOpen = $state(false)
+  let sceneWorldOpen = $state(false)
   let roomBuilderOpen = $state(false)
   let roomBuilderSurfaceOpen = $state<
     'floor' | 'ceiling' | 'north' | 'south' | 'east' | 'west' | null
@@ -708,9 +821,11 @@
   let previewRuntimeStatus = $state<GoonRendererRuntime | null>(null)
   let previewGoonId = $state<string | null>(null)
   let previewToken = 0
+  let pendingEditorOpeningFrameGoonId: string | null = null
   let previewAnimationSignature = $state('')
   let previewBaseLoopSignature = $state('')
   let previewContextSignature = $state('')
+  let previewFailedContextSignature = $state('')
   let previewSceneSignature = $state('none')
   let previewLoadInFlightSignature = $state('')
   let previewVrmUrl = $state('')
@@ -718,7 +833,9 @@
   const DEFAULT_PREVIEW_VIEW_FOV = 50
   const MIN_PREVIEW_VIEW_FOV = 15
   const MAX_PREVIEW_VIEW_FOV = 100
+  const EDITOR_OPENING_FRAME_PRESET: GoonFramingPreset = 'portrait'
   let previewViewFov = $state(DEFAULT_PREVIEW_VIEW_FOV)
+  let previewCameraMode = $state<GoonCameraMode>('free')
   let kitchenPreviewContainer = $state<HTMLDivElement | null>(null)
   let kitchenPreviewEngine = $state<GoonEngine | null>(null)
   let kitchenPreviewLoading = $state(false)
@@ -734,6 +851,8 @@
   let kitchenPreviewEngineInitPromise: Promise<GoonEngine | null> | null = null
   let kitchenPreviewLoadedEngine: GoonEngine | null = null
   let kitchenPreviewLoadedGoonId = $state<string | null>(null)
+  let scenePreviewBodyMode = $state<ScenePreviewBodyMode>('proxy')
+  let sceneProxyPoseId = $state<SceneProxyPoseId>('stand')
   let kitchenPreviewAnimationName = $state('')
   let kitchenPreviewAnimationActive = $state(false)
   let kitchenPreviewAnimationRestore = $state<{ name: string; definition?: GoonCueDefinition | null } | null>(null)
@@ -886,19 +1005,23 @@
   const vrmaLibrary = $derived.by(() =>
     Array.isArray(animationLibrary?.vrma) ? [...animationLibrary.vrma] : []
   )
-  const sortedVrmaLibrary = $derived.by(() => {
-    const entries = [...vrmaLibrary]
-    const compareAlpha = (a: GoonFileRef, b: GoonFileRef) =>
-      resolveMotionDisplayName(a).localeCompare(resolveMotionDisplayName(b))
+  // Unified motion library: one entry per animation name, holding every
+  // format version (.vrma / .glb). Metadata reads come from the entry's
+  // winner file; staged edits go to every version so pairs stay in lockstep.
+  const motionLibraryEntries = $derived.by(() => groupGoonMotionLibraryEntries(vrmaLibrary))
+  const sortedMotionEntries = $derived.by(() => {
+    const entries = [...motionLibraryEntries]
+    const compareAlpha = (a: UnifiedGoonMotionEntry, b: UnifiedGoonMotionEntry) =>
+      resolveMotionDisplayName(a.primary).localeCompare(resolveMotionDisplayName(b.primary))
     if (animationSortMode === 'newest') {
       return entries.sort((a, b) => {
-        const delta = resolveUploadTime(b) - resolveUploadTime(a)
+        const delta = resolveMotionEntryUploadTime(b) - resolveMotionEntryUploadTime(a)
         return delta !== 0 ? delta : compareAlpha(a, b)
       })
     }
     if (animationSortMode === 'oldest') {
       return entries.sort((a, b) => {
-        const delta = resolveUploadTime(a) - resolveUploadTime(b)
+        const delta = resolveMotionEntryUploadTime(a) - resolveMotionEntryUploadTime(b)
         return delta !== 0 ? delta : compareAlpha(a, b)
       })
     }
@@ -906,56 +1029,45 @@
   })
   const animationTagOptions = $derived.by(() => {
     const tags = new Set<string>()
-    for (const entry of sortedVrmaLibrary) {
-      const entryTags = normalizeTagInput(
-        animationTagInputs[entry.filename ?? ''] ?? (entry.tags ?? []).join(', ')
-      )
-      for (const tag of entryTags) {
+    for (const entry of sortedMotionEntries) {
+      for (const tag of resolveMotionEntryStagedTags(entry)) {
         if (tag) tags.add(tag)
       }
     }
     return Array.from(tags).sort()
   })
-  const untaggedCount = $derived.by(() =>
-    sortedVrmaLibrary.filter((entry) => {
-      const entryTags = normalizeTagInput(
-        animationTagInputs[entry.filename ?? ''] ?? (entry.tags ?? []).join(', ')
-      )
-      return entryTags.length === 0
-    }).length
+  const untaggedCount = $derived.by(
+    () =>
+      sortedMotionEntries.filter((entry) => resolveMotionEntryStagedTags(entry).length === 0)
+        .length
   )
   const animationSortLabel = $derived.by(
     () => ANIMATION_SORT_OPTIONS.find((option) => option.value === animationSortMode)?.label ?? 'Sort'
   )
   const animationTagFilteringActive = $derived.by(() => animationTagFilterMode !== 'all')
-  const filteredVrmaLibrary = $derived.by(() => {
+  const filteredMotionEntries = $derived.by(() => {
     if (animationTagFilterMode === 'all') {
-      return sortedVrmaLibrary
+      return sortedMotionEntries
     }
     if (animationTagFilterMode === 'untagged') {
-      return sortedVrmaLibrary.filter((entry) => {
-        const entryTags = normalizeTagInput(
-          animationTagInputs[entry.filename ?? ''] ?? (entry.tags ?? []).join(', ')
-        )
-        return entryTags.length === 0
-      })
+      return sortedMotionEntries.filter(
+        (entry) => resolveMotionEntryStagedTags(entry).length === 0
+      )
     }
 
-    return sortedVrmaLibrary.filter((entry) => {
-      const entryTags = normalizeTagInput(
-        animationTagInputs[entry.filename ?? ''] ?? (entry.tags ?? []).join(', ')
-      )
+    return sortedMotionEntries.filter((entry) => {
+      const entryTags = resolveMotionEntryStagedTags(entry)
       return animationTagFilters.every((tag) => entryTags.includes(tag))
     })
   })
   const motionAccordionItems = $derived.by<MotionAccordionItem[]>(() => {
-    const grouped = new Map<string, GoonFileRef[]>()
+    const grouped = new Map<string, UnifiedGoonMotionEntry[]>()
     const filterActive = animationTagFilteringActive
 
-    for (const file of filteredVrmaLibrary) {
-      const bucketId = resolveMotionAccordionBucketId(file)
+    for (const entry of filteredMotionEntries) {
+      const bucketId = resolveMotionAccordionBucketId(entry.primary)
       const next = grouped.get(bucketId) ?? []
-      next.push(file)
+      next.push(entry)
       grouped.set(bucketId, next)
     }
 
@@ -970,7 +1082,7 @@
         usageSummary: filterActive
           ? formatMotionCountSummary(grouped.get(ANY_POSTURE_BUCKET)?.length ?? 0)
           : formatAnyPostureSummary(grouped.get(ANY_POSTURE_BUCKET)?.length ?? 0),
-        files: grouped.get(ANY_POSTURE_BUCKET) ?? []
+        entries: grouped.get(ANY_POSTURE_BUCKET) ?? []
       },
       ...motionStagePostureOptions.map((posture) => ({
         id: posture.id,
@@ -984,12 +1096,20 @@
           grouped.get(posture.id)?.length ?? 0,
           filterActive
         ),
-        files: grouped.get(posture.id) ?? []
+        entries: grouped.get(posture.id) ?? []
       }))
     ]
 
-    return filterActive ? items.filter((section) => section.files.length > 0) : items
+    return filterActive ? items.filter((section) => section.entries.length > 0) : items
   })
+  // The unified motion currently playing on the Motions stage preview (cards
+  // use the motion name as the preview id), used for the pane's VRMA/GLB
+  // format toggle when the motion has both versions.
+  const activeMotionPreviewEntry = $derived.by(() =>
+    activePreviewId
+      ? motionLibraryEntries.find((entry) => entry.name === activePreviewId) ?? null
+      : null
+  )
   function sortCueDefinitions(cues: GoonCueDefinition[]) {
     return [...cues].sort((left, right) => left.name.localeCompare(right.name))
   }
@@ -1103,7 +1223,12 @@
     editorPendingVrmUpdate ?? editorGoon?.vrmUpdate ?? null
   )
   const editorHasUnsavedChanges = $derived.by(
-    () => editorDirty || Boolean(editorPendingVrmFile) || Boolean(editorPendingAdvancedPackageUpdate)
+    () =>
+      editorDirty ||
+      editorFacialArtworkUploadBusy ||
+      Boolean(editorPendingVrmFile) ||
+      Boolean(editorPendingAdvancedPackageUpdate) ||
+      Boolean(editorPendingCustomPackageUpdate)
   )
   const currentCustomPackageLabel = $derived.by(() =>
     editorGoon?.customAvatar?.package ? resolveFileLabel(editorGoon.customAvatar.package) : 'No package'
@@ -1125,6 +1250,16 @@
   const backupGuidedPackageLabel = $derived.by(() =>
     editorGoon?.guidedAvatar?.backup?.package
       ? resolveFileLabel(editorGoon.guidedAvatar.backup.package)
+      : ''
+  )
+  const pendingCustomPackageLabel = $derived.by(() =>
+    editorPendingCustomPackageUpdate?.package
+      ? resolveFileLabel(editorPendingCustomPackageUpdate.package)
+      : ''
+  )
+  const backupCustomPackageLabel = $derived.by(() =>
+    editorGoon?.customAvatar?.backup?.package
+      ? resolveFileLabel(editorGoon.customAvatar.backup.package)
       : ''
   )
   const currentGuidedManifestLabel = $derived.by(() =>
@@ -1156,7 +1291,47 @@
     const fallback = goons.find((entry) => hasRenderableGoonAvatar(entry))
     return resolveGoonAvatarUrl(fallback)
   })
-  const thumbnailPreviewGoonUrl = $derived.by(() => STUNT_DUMMY_VRM_URL)
+  // Per-lane motion preview targets: .vrma clips preview on the VRM stunt
+  // dummy; .glb clips bind by skeleton node names and preview on the bundled
+  // BSRigV2 GLB stunt dummy by default. Users with GLB clips authored against
+  // a non-first-party rig can point GLB previews at one of their own
+  // Advanced/GLB Goons instead. No cross-lane fallback.
+  const GLB_STUNT_DUMMY_MODEL_URL = '/goons/stunt-dummy-rigv2.glb'
+  const GLB_STUNT_DUMMY_MANIFEST_URL = '/goons/stunt-dummy-rigv2.avatar.json'
+  const glbPreviewGoonOptions = $derived.by(() =>
+    goons
+      .filter((entry) => resolveGoonKind(entry) === 'custom' && hasRenderableGoonAvatar(entry))
+      .sort((a, b) => (a.name || '').localeCompare(b.name || '') || a.id.localeCompare(b.id))
+  )
+  const glbPreviewGoonId = $derived(goonsSettings?.motions?.glbPreviewGoonId ?? '')
+  const glbMotionPreviewTarget = $derived.by<MotionPreviewTarget>(() => {
+    // A stale override (deleted goon) falls back to the bundled dummy.
+    const overrideGoon = glbPreviewGoonId
+      ? glbPreviewGoonOptions.find((entry) => entry.id === glbPreviewGoonId) ?? null
+      : null
+    if (overrideGoon) {
+      return { kind: 'custom', goon: overrideGoon }
+    }
+    return {
+      kind: 'custom-url',
+      modelUrl: GLB_STUNT_DUMMY_MODEL_URL,
+      manifestUrl: GLB_STUNT_DUMMY_MANIFEST_URL
+    }
+  })
+  function resolveMotionThumbTarget(file: GoonFileRef): {
+    target: MotionPreviewTarget | null
+    unavailableReason: string
+  } {
+    if (resolveGoonMotionLane(file) === 'glb') {
+      return { target: glbMotionPreviewTarget, unavailableReason: '' }
+    }
+    return { target: { kind: 'vrm', url: STUNT_DUMMY_VRM_URL }, unavailableReason: '' }
+  }
+  function getMotionLaneBadge(lane: GoonMotionLane): { label: string; title: string } {
+    return lane === 'glb'
+      ? { label: 'GLB', title: 'Plays on Advanced/GLB Goons' }
+      : { label: 'VRMA', title: 'Plays on VRM Goons' }
+  }
   const editorAnimationFiles = $derived.by(() =>
     Array.isArray(editorGoon?.files?.animations) ? editorGoon?.files?.animations ?? [] : []
   )
@@ -1169,6 +1344,9 @@
   const libraryPreviewGoon = $derived.by(() => resolveGoonById(libraryPreviewGoonId))
   const kitchenPreviewGoon = $derived.by(() => resolveGoonById(kitchenPreviewGoonId))
   const topLevelLivePreviewActive = $derived.by(() => activeTab === 'kitchen' || activeTab === 'motions')
+  const scenePreviewUsingProxy = $derived.by(
+    () => Boolean(sceneEditorMode) && scenePreviewBodyMode === 'proxy'
+  )
   const kitchenKnownAnimationData = $derived.by(() =>
     collectKnownAnimationData(kitchenPreviewGoon, kitchenPreviewAnimationCatalog)
   )
@@ -1248,12 +1426,16 @@
     }))
   )
   const globalPackMotionOptions = $derived.by<PackMotionExportOption[]>(() =>
-    vrmaLibrary
-      .filter((file) => Boolean(file?.url && file?.filename))
-      .map((file) => ({
-        key: `motion:${file.filename || file.url}`,
-        file,
-        label: resolveMotionDisplayName(file) || resolveAnimationName(file)
+    motionLibraryEntries
+      .map((entry) => ({
+        entry,
+        files: entry.files.filter((file) => Boolean(file?.url && file?.filename))
+      }))
+      .filter(({ files }) => files.length > 0)
+      .map(({ entry, files }) => ({
+        key: `motion:${entry.name}`,
+        files,
+        label: resolveMotionDisplayName(entry.primary) || entry.name
       }))
       .sort((a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key))
   )
@@ -1337,6 +1519,11 @@
 
   function isVrmaFile(file: File) {
     return file.name.toLowerCase().endsWith('.vrma')
+  }
+
+  function isGlbAnimationLibraryFile(file: File) {
+    const name = file.name.toLowerCase()
+    return name.endsWith('.glb') || name.endsWith('.gltf')
   }
 
   function isFbxFile(file: File) {
@@ -2867,6 +3054,111 @@
     )
   }
 
+  // ---- Unified motion entry helpers (one card per animation name) ----
+
+  function resolveMotionEntryUploadTime(entry: UnifiedGoonMotionEntry) {
+    return entry.files.reduce((latest, file) => Math.max(latest, resolveUploadTime(file)), 0)
+  }
+
+  type MotionEntryDraft = {
+    displayName: string
+    tags: string
+    posture: GoonPosture | ''
+    playback: GoonMotionPlayback | ''
+    eyeContact: GoonMotionEyeContact | ''
+  }
+
+  // Displayed card values: staged edits first, then the metadata winner's
+  // stored values. Staged edits are written to every version of the entry,
+  // so reading through the winner's filename stays consistent.
+  function resolveMotionEntryDraft(entry: UnifiedGoonMotionEntry): MotionEntryDraft {
+    const key = entry.primary.filename ?? ''
+    return {
+      displayName:
+        animationDisplayNameInputs[key] ?? resolveMotionDisplayName(entry.primary),
+      tags: animationTagInputs[key] ?? (entry.primary.tags ?? []).join(', '),
+      posture: animationPostureInputs[key] ?? entry.primary.motionMeta?.posture ?? '',
+      playback: animationPlaybackInputs[key] ?? entry.primary.motionMeta?.playback ?? '',
+      eyeContact: animationEyeContactInputs[key] ?? entry.primary.motionMeta?.eyeContact ?? ''
+    }
+  }
+
+  function resolveMotionEntryStagedTags(entry: UnifiedGoonMotionEntry) {
+    return normalizeTagInput(resolveMotionEntryDraft(entry).tags)
+  }
+
+  // Metadata lockstep: any edit stages the FULL displayed draft onto every
+  // version of the motion, so a previously divergent pair unifies to the
+  // displayed (winner) values on the next save.
+  function stageMotionEntryDraft(entry: UnifiedGoonMotionEntry, patch: Partial<MotionEntryDraft>) {
+    const nextDraft: MotionEntryDraft = { ...resolveMotionEntryDraft(entry), ...patch }
+    const nextDisplayNames = { ...animationDisplayNameInputs }
+    const nextTags = { ...animationTagInputs }
+    const nextPostures = { ...animationPostureInputs }
+    const nextPlaybacks = { ...animationPlaybackInputs }
+    const nextEyeContacts = { ...animationEyeContactInputs }
+    for (const file of entry.files) {
+      const filename = file.filename ?? ''
+      if (!filename) continue
+      nextDisplayNames[filename] = nextDraft.displayName
+      nextTags[filename] = nextDraft.tags
+      nextPostures[filename] = nextDraft.posture
+      nextPlaybacks[filename] = nextDraft.playback
+      nextEyeContacts[filename] = nextDraft.eyeContact
+    }
+    animationDisplayNameInputs = nextDisplayNames
+    animationTagInputs = nextTags
+    animationPostureInputs = nextPostures
+    animationPlaybackInputs = nextPlaybacks
+    animationEyeContactInputs = nextEyeContacts
+  }
+
+  function addMotionEntryTag(entry: UnifiedGoonMotionEntry, tag: string) {
+    const tags = resolveMotionEntryStagedTags(entry)
+    const normalized = tag.trim().toLowerCase()
+    if (!normalized || tags.includes(normalized)) return
+    stageMotionEntryDraft(entry, { tags: [...tags, normalized].join(', ') })
+  }
+
+  function removeMotionEntryTag(entry: UnifiedGoonMotionEntry, tag: string) {
+    const normalized = tag.trim().toLowerCase()
+    const tags = resolveMotionEntryStagedTags(entry).filter((value) => value !== normalized)
+    stageMotionEntryDraft(entry, { tags: tags.join(', ') })
+  }
+
+  function addNewMotionEntryTag(entry: UnifiedGoonMotionEntry) {
+    const normalized = newAnimationTagDraft.trim().toLowerCase()
+    if (!normalized) return
+    addMotionEntryTag(entry, normalized)
+    newAnimationTagDraft = ''
+  }
+
+  // Per-card preview format: which version (VRMA or GLB) the thumb and the
+  // stage preview play. Session-only state keyed by motion name.
+  let motionCardPreviewLanes = $state<Record<string, GoonMotionLane>>({})
+
+  function resolveMotionEntryPreviewLane(entry: UnifiedGoonMotionEntry): GoonMotionLane {
+    const requested = motionCardPreviewLanes[entry.name]
+    if (requested === 'glb' && entry.glb) return 'glb'
+    if (requested === 'vrm' && entry.vrma) return 'vrm'
+    return entry.vrma ? 'vrm' : 'glb'
+  }
+
+  function resolveMotionEntryPreviewFile(entry: UnifiedGoonMotionEntry): GoonFileRef {
+    return (resolveMotionEntryPreviewLane(entry) === 'glb' ? entry.glb : entry.vrma) ?? entry.primary
+  }
+
+  function setMotionEntryPreviewLane(entry: UnifiedGoonMotionEntry, lane: GoonMotionLane) {
+    if (resolveMotionEntryPreviewLane(entry) === lane) return
+    motionCardPreviewLanes = { ...motionCardPreviewLanes, [entry.name]: lane }
+    // If this motion is playing on the stage, switch the stage to the other
+    // format immediately so the toggle verifies both versions.
+    if (activePreviewId === entry.name) {
+      const laneFile = (lane === 'glb' ? entry.glb : entry.vrma) ?? entry.primary
+      void triggerMotionLibraryPreview(laneFile, entry.name, entry.name)
+    }
+  }
+
   function postureMapsMatch(left: GoonPostureMap, right: GoonPostureMap) {
     const leftKeys = Object.keys(left).sort()
     const rightKeys = Object.keys(right).sort()
@@ -3004,7 +3296,7 @@
       let savedMotionSettings = goonsSettings
       if (!postureMapsMatch(currentPostures, motionCustomPostureDraftMap)) {
         savedMotionSettings = buildMotionDraftSettings()
-        await persistGoonsSettings(savedMotionSettings)
+        savedMotionSettings = await persistGoonsSettings(savedMotionSettings)
       }
 
       let savedMotionLibrary: GoonAnimationLibrary = animationLibrary
@@ -4703,6 +4995,12 @@
     }
   }
 
+  function resolveGoonMotionLaneForGoon(goon: GoonRecord | null | undefined): GoonMotionLane {
+    return resolveGoonKind(goon) === 'custom' ? 'glb' : 'vrm'
+  }
+
+  // Lane-filtered like the dock's collectDockAnimationFilesForLane: VRM goons
+  // consume .vrma entries, GLB-lane custom goons consume .glb entries.
   function resolveAnimationFiles(goon: GoonRecord | null): GoonFileRef[] {
     const files: GoonFileRef[] = []
     const seen = new Set<string>()
@@ -4720,7 +5018,7 @@
     for (const file of goonFiles) {
       addFile(file)
     }
-    return files
+    return filterGoonAnimationFilesForLane(files, resolveGoonMotionLaneForGoon(goon))
   }
 
   function resolveMarkerMotionNamesForPosture(posture: GoonPosture, goon: GoonRecord | null) {
@@ -4735,7 +5033,58 @@
   }
 
   function scenePreviewUsesMotionOnly() {
-    return activeTab === 'scenes' || Boolean(sceneEditorMode)
+    return Boolean(sceneEditorMode) && scenePreviewBodyMode === 'active-goon'
+  }
+
+  function setScenePreviewBodyMode(mode: ScenePreviewBodyMode) {
+    if (scenePreviewBodyMode === mode) return
+    if (activeSceneEdit) {
+      toast.error('Apply or cancel the active scene edit first.')
+      return
+    }
+    scenePreviewBodyMode = mode
+    kitchenPreviewAnimationName = ''
+    kitchenPreviewAnimationActive = false
+    kitchenPreviewAnimationRestore = null
+    resetKitchenPreview()
+    if (sceneEditorMode === 'edit' && sceneEditorId) {
+      kitchenPreviewSceneId = sceneEditorId
+      void ensureKitchenPreviewReady(sceneEditorId)
+    }
+  }
+
+  function resolveSceneProxyPoseAnimation() {
+    if (sceneProxyPoseId !== 'sit') return null
+    return PAINTED_CONCEAL_POSES.find((pose) => pose.id === 'sitting-pose') ?? null
+  }
+
+  async function applySceneProxyPose(engine: GoonEngine) {
+    const pose = resolveSceneProxyPoseAnimation()
+    if (!pose) {
+      engine.setAuthoringPoseMode(false)
+      engine.clearPreviewAnimation()
+      kitchenPreviewAnimationName = ''
+      kitchenPreviewAnimationActive = false
+      kitchenPreviewAnimationRestore = null
+      return
+    }
+    await engine.loadAdditionalAnimations([pose.file])
+    engine.setAuthoringPoseMode(true, pose.animationName)
+    kitchenPreviewAnimationName = pose.animationName
+    kitchenPreviewAnimationActive = false
+    kitchenPreviewAnimationRestore = null
+  }
+
+  function setSceneProxyPose(id: SceneProxyPoseId) {
+    if (sceneProxyPoseId === id) return
+    if (activeSceneEdit) {
+      toast.error('Apply or cancel the active scene edit first.')
+      return
+    }
+    sceneProxyPoseId = id
+    if (scenePreviewUsingProxy && kitchenPreviewEngine && kitchenPreviewReady) {
+      void applySceneProxyPose(kitchenPreviewEngine)
+    }
   }
 
   function resolveScenePreviewMotionName(goon: GoonRecord | null) {
@@ -4790,8 +5139,12 @@
   }
 
   function buildPreviewAnimationLoadPlan(goon: GoonRecord | null, cueMap?: GoonCueMap | null) {
-    const libraryFiles = Array.isArray(vrmaLibrary) ? vrmaLibrary : []
-    const goonFiles = Array.isArray(goon?.files?.animations) ? goon?.files?.animations ?? [] : []
+    const lane = resolveGoonMotionLaneForGoon(goon)
+    const libraryFiles = filterGoonAnimationFilesForLane(vrmaLibrary, lane)
+    const goonFiles = filterGoonAnimationFilesForLane(
+      Array.isArray(goon?.files?.animations) ? goon?.files?.animations ?? [] : [],
+      lane
+    )
     const baseLoop = goon?.defaults?.baseLoop ?? 'base_stand'
     const baseLoopAnimation = cueMap?.[baseLoop]?.animationName ?? baseLoop
     const priorityNames = buildGoonAnimationPriorityNames(baseLoopAnimation)
@@ -5164,12 +5517,12 @@
   })
 
   $effect(() => {
-    if (!active || (activeTab !== 'kitchen' && activeTab !== 'scenes') || sceneEditorMode) return
+    if (!active || activeTab !== 'kitchen' || sceneEditorMode) return
     if (!kitchenPreviewContainer) return
     const goon = resolveGoonById(kitchenPreviewGoonId)
     if (!goon) return
     if (!hasRenderableGoonAvatar(goon)) return
-    void ensureKitchenPreviewReady(activeTab === 'scenes' ? kitchenPreviewSceneId : undefined)
+    void ensureKitchenPreviewReady()
   })
 
   $effect(() => {
@@ -5298,6 +5651,7 @@
     previewAnimationSignature = ''
     previewBaseLoopSignature = ''
     previewContextSignature = ''
+    previewFailedContextSignature = ''
     previewSceneSignature = 'none'
     previewLoadInFlightSignature = ''
     motionLibraryPreviewSignature = ''
@@ -5311,6 +5665,9 @@
     newWardrobeOutfitName = ''
     editorWardrobeOutfitCreateOpen = false
     editorPendingAdvancedPackageUpdate = null
+    editorPendingCustomPackageUpdate = null
+    editorFacialArtworkUploadBusy = false
+    editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
     closetBusy = false
     editorFacePreviewSuspended = false
@@ -5362,6 +5719,15 @@
     clearFacePreviewResumeTimer('kitchen')
     activeSceneEdit = null
     activeSceneEditTransform = null
+  }
+
+  function releaseInactivePreviewEngines(reason = 'inactive-preview') {
+    if (!editorGoonId && activeTab !== 'motions') {
+      resetPreview(reason)
+    }
+    if (!sceneEditorMode && activeTab !== 'kitchen') {
+      resetKitchenPreview()
+    }
   }
 
   function cloneEditTransform(transform: GoonEditTransform | null): GoonEditTransform | null {
@@ -5465,6 +5831,7 @@
       previewEngine = engine
       previewHost = host
       await engine.init()
+      engine.setCameraFov(previewViewFov)
       engine.refreshLayout()
       removeExtraCanvases(host, engine.getCanvasElement())
       return engine
@@ -5535,6 +5902,7 @@
       kitchenPreviewLoadedEngine = null
       kitchenPreviewHost = host
       await engine.init()
+      engine.setCameraFov(previewViewFov)
       engine.refreshLayout()
       removeExtraCanvases(host, engine.getCanvasElement())
       return engine
@@ -5584,15 +5952,12 @@
         applyPreviewCamera(engine, targetGoon.camera ?? null, { forceResetIfMissing: true })
         if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return false
 
-        const animationFiles = kind === 'vrm' ? resolveAnimationFiles(targetGoon) : []
+        const animationFiles = resolveAnimationFiles(targetGoon)
         const { cueMap } = resolveGoonCues(targetGoon, goonsSettings)
         const baseLoop = targetGoon.defaults?.baseLoop ?? 'base_stand'
         const baseLoopDefinition = cueMap?.[baseLoop]
-        const animationPlan =
-          kind === 'vrm'
-            ? buildPreviewAnimationLoadPlan(targetGoon, cueMap)
-            : { eager: [], deferred: [] as GoonFileRef[] }
-        kitchenPreviewAnimationCatalog = kind === 'vrm' ? engine.getAnimationCatalog() : []
+        const animationPlan = buildPreviewAnimationLoadPlan(targetGoon, cueMap)
+        kitchenPreviewAnimationCatalog = engine.getAnimationCatalog()
         kitchenPreviewCustomExpressions = kind === 'vrm' ? engine.getCustomExpressionNames() : []
         kitchenPreviewAnimationSignature = animationFiles.map((entry) => entry.url).join('|')
         kitchenPreviewBaseLoopSignature = buildBaseLoopSignature(baseLoop, baseLoopDefinition)
@@ -5612,19 +5977,19 @@
         kitchenPreviewLoadedEngine = engine
         kitchenPreviewLoadedGoonId = targetGoon.id
 
-        if (kind === 'vrm') {
-          void engine
-            .syncAnimations(animationPlan.eager, { deferredFiles: animationPlan.deferred })
-            .then(() => {
-              if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return
-              kitchenPreviewAnimationCatalog = engine.getAnimationCatalog()
+        void engine
+          .syncAnimations(animationPlan.eager, { deferredFiles: animationPlan.deferred })
+          .then(() => {
+            if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return
+            kitchenPreviewAnimationCatalog = engine.getAnimationCatalog()
+            if (kind === 'vrm') {
               kitchenPreviewCustomExpressions = engine.getCustomExpressionNames()
-            })
-            .catch((error) => {
-              if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return
-              console.warn('[GoonsSettings] Kitchen animation sync failed:', error)
-            })
-        }
+            }
+          })
+          .catch((error) => {
+            if (!isKitchenPreviewLoadRequestCurrent(activeRequestId)) return
+            console.warn('[GoonsSettings] Kitchen animation sync failed:', error)
+          })
         return true
       } catch (error: any) {
         if (isKitchenPreviewLoadRequestCurrent(activeRequestId)) {
@@ -5640,11 +6005,78 @@
     })
   }
 
+  async function ensureSceneProxyPreviewReady(
+    sceneId?: string | null,
+    options: { syncScene?: boolean } = {}
+  ) {
+    const requestId = kitchenPreviewLoadRequestId
+    return queueKitchenPreviewLoad(async () => {
+      if (!isKitchenPreviewLoadRequestCurrent(requestId)) return null
+      const engine = await ensureKitchenPreviewEngine()
+      if (!engine || !isKitchenPreviewLoadRequestCurrent(requestId)) return null
+
+      kitchenPreviewSceneId = sceneId ?? kitchenPreviewSceneId
+      const scene = kitchenPreviewSceneId ? kitchenScenes?.[kitchenPreviewSceneId] ?? null : null
+      const shouldReload =
+        kitchenPreviewVrmUrl !== STUNT_DUMMY_VRM_URL ||
+        kitchenPreviewLoadedGoonId !== SCENE_PROXY_PREVIEW_GOON_ID ||
+        kitchenPreviewLoadedEngine !== engine ||
+        !kitchenPreviewReady
+      const shouldSyncScene = options.syncScene !== false
+
+      if (shouldReload) {
+        kitchenPreviewLoading = true
+        kitchenPreviewError = null
+      }
+
+      try {
+        if (shouldReload) {
+          await engine.loadGoon(STUNT_DUMMY_VRM_URL)
+          if (!isKitchenPreviewLoadRequestCurrent(requestId)) return null
+          applyPreviewCamera(engine, null, { forceResetIfMissing: true })
+          kitchenPreviewAnimationCatalog = engine.getAnimationCatalog()
+          kitchenPreviewCustomExpressions = engine.getCustomExpressionNames()
+          kitchenPreviewAnimationSignature = ''
+          kitchenPreviewBaseLoopSignature = ''
+          kitchenPreviewClosetSignature = ''
+          kitchenPreviewVrmUrl = STUNT_DUMMY_VRM_URL
+          kitchenPreviewLoadedEngine = engine
+          kitchenPreviewLoadedGoonId = SCENE_PROXY_PREVIEW_GOON_ID
+          kitchenPreviewReady = true
+        }
+
+        if (shouldReload || shouldSyncScene) {
+          await applyGoonSceneDefinition(engine, scene, stagePostureMap)
+          kitchenPreviewSceneSignature = buildGoonSceneSignature(scene)
+          if (!isKitchenPreviewLoadRequestCurrent(requestId)) return null
+        }
+
+        await applySceneProxyPose(engine)
+        if (!isKitchenPreviewLoadRequestCurrent(requestId)) return null
+        engine.setGoonVisible(true)
+        return engine
+      } catch (error: any) {
+        if (isKitchenPreviewLoadRequestCurrent(requestId)) {
+          kitchenPreviewError = toGoonPreviewError(error, 'Failed to load preview')
+          kitchenPreviewReady = false
+        }
+        return null
+      } finally {
+        if (isKitchenPreviewLoadRequestCurrent(requestId)) {
+          kitchenPreviewLoading = false
+        }
+      }
+    })
+  }
+
   async function ensureKitchenPreviewReady(
     sceneId?: string | null,
     options: { syncScene?: boolean } = {}
   ) {
     const requestId = kitchenPreviewLoadRequestId
+    if (scenePreviewUsingProxy) {
+      return ensureSceneProxyPreviewReady(sceneId, options)
+    }
     if (!goons.length) {
       toast.error('Create or upload a Goon first.')
       return null
@@ -5719,11 +6151,11 @@
   }
 
   function resolveSceneForPreviewGoon(goon: GoonRecord) {
-    if (editorGoonId === goon.id) {
-      return editorScene
-    }
     if (activeTab === 'goons') {
       return null
+    }
+    if (editorGoonId === goon.id) {
+      return editorScene
     }
     const defaultSceneId = goon.defaults?.sceneId
     return defaultSceneId ? kitchenScenes?.[defaultSceneId] ?? null : null
@@ -5776,6 +6208,7 @@
     const targetUrl = resolveGoonAvatarUrl(goon)
     if (!previewContainer || !targetUrl) return
     const contextSignature = buildPreviewContextSignature(goon, mode)
+    if (previewFailedContextSignature === contextSignature) return
     if (previewLoading && previewLoadInFlightSignature === contextSignature) return
     const token = ++previewToken
     previewLoading = true
@@ -5791,19 +6224,19 @@
       const { kind } = await loadAvatarIntoEngine(engine, goon)
       if (token !== previewToken) return
 
-      const animationFiles = kind === 'vrm' ? resolveAnimationFiles(goon) : []
+      // Both lanes sync their motion set: VRM goons load .vrma entries, GLB
+      // custom goons load .glb entries (resolveAnimationFiles/the load plan
+      // are lane-filtered), keeping Settings previews consistent with the dock.
+      const animationFiles = resolveAnimationFiles(goon)
       const cueMap = resolveCueMapForPreviewGoon(goon)
-      const animationPlan =
-        kind === 'vrm'
-          ? buildPreviewAnimationLoadPlan(goon, cueMap)
-          : { eager: [], deferred: [] as GoonFileRef[] }
+      const animationPlan = buildPreviewAnimationLoadPlan(goon, cueMap)
       await applyGoonSceneDefinition(engine, resolveSceneForPreviewGoon(goon), stagePostureMap)
       applyPreviewCamera(engine, resolvePreviewCameraForGoon(goon), {
         forceResetIfMissing: true
       })
       applyEditorPreviewLoopState(engine)
       previewSceneSignature = buildGoonSceneSignature(resolveSceneForPreviewGoon(goon))
-      previewAnimationCatalog = kind === 'vrm' ? engine.getAnimationCatalog() : []
+      previewAnimationCatalog = engine.getAnimationCatalog()
       previewMaterialNames = kind === 'vrm' ? engine.getMaterialNames() : []
       previewMaterialColorInfo = Object.fromEntries(
         previewMaterialNames.map((name) => [name, engine.getMaterialColorInfo(name) ?? {}])
@@ -5816,30 +6249,35 @@
         })
       }
       if (token !== previewToken) return
+      if (mode === 'editor') {
+        applyPendingEditorOpeningFrame(engine, goon.id)
+      }
       engine.setGoonVisible(true)
       previewAnimationActive = false
       previewAnimationRestore = null
       previewAnimationSignature = animationFiles.map((entry) => entry.url).join('|')
       previewContextSignature = contextSignature
+      previewFailedContextSignature = ''
       previewGoonId = goon.id
       previewVrmUrl = targetUrl
       previewReady = true
 
-      if (kind === 'vrm') {
-        void engine
-          .syncAnimations(animationPlan.eager, { deferredFiles: animationPlan.deferred })
-          .then(() => {
-            if (token !== previewToken) return
-            previewAnimationCatalog = engine.getAnimationCatalog()
+      void engine
+        .syncAnimations(animationPlan.eager, { deferredFiles: animationPlan.deferred })
+        .then(() => {
+          if (token !== previewToken) return
+          previewAnimationCatalog = engine.getAnimationCatalog()
+          if (kind === 'vrm') {
             previewCustomExpressions = engine.getCustomExpressionNames()
-          })
-          .catch((error) => {
-            if (token !== previewToken) return
-            console.warn('[GoonsSettings] Editor animation sync failed:', error)
-          })
-      }
+          }
+        })
+        .catch((error) => {
+          if (token !== previewToken) return
+          console.warn('[GoonsSettings] Editor animation sync failed:', error)
+        })
     } catch (error: any) {
       console.error('[GoonPreview] load failed', { token, error })
+      previewFailedContextSignature = contextSignature
       previewError = toGoonPreviewError(error, 'Failed to load preview')
       previewReady = false
     } finally {
@@ -5858,6 +6296,8 @@
     options: { forceResetIfMissing?: boolean } = {}
   ) {
     if (camera && Object.keys(camera).length > 0) {
+      if (typeof camera.fov === 'number') previewViewFov = clampPreviewFov(camera.fov)
+      previewCameraMode = camera.mode ?? 'free'
       engine.applyCamera(camera)
       engine.setDefaultCamera(camera)
       return
@@ -5866,6 +6306,24 @@
     if (options.forceResetIfMissing) {
       engine.resetCamera()
       engine.setDefaultCamera(engine.getCameraState())
+    }
+  }
+
+  function applyPendingEditorOpeningFrame(engine: GoonEngine, goonId: string) {
+    if (pendingEditorOpeningFrameGoonId !== goonId) return
+    pendingEditorOpeningFrameGoonId = null
+
+    // Opening the editor should always reveal the face, but it must not
+    // overwrite the shared per-Goon camera merely because the preview loaded.
+    engine.setCameraChangeHandler()
+    try {
+      if (!engine.frameAvatar(EDITOR_OPENING_FRAME_PRESET)) {
+        console.warn('[GoonsSettings] Could not apply the editor opening frame', { goonId })
+        return
+      }
+      engine.setDefaultCamera(engine.getCameraState())
+    } finally {
+      engine.setCameraChangeHandler(handlePreviewCameraChange)
     }
   }
 
@@ -6109,11 +6567,9 @@
   $effect(() => {
     if (previewEngine) {
       previewEngine.setSkyboxPitchOffset(previewSkyboxOffset)
-      previewEngine.setCameraFov(previewViewFov)
     }
     if (kitchenPreviewEngine) {
       kitchenPreviewEngine.setSkyboxPitchOffset(previewSkyboxOffset)
-      kitchenPreviewEngine.setCameraFov(previewViewFov)
     }
   })
 
@@ -6139,10 +6595,11 @@
 
   $effect(() => {
     if (!previewEngine || !editorGoonId) return
-    const signature = buildGoonSceneSignature(editorScene)
+    const scene = editorGoon ? resolveSceneForPreviewGoon(editorGoon) : null
+    const signature = buildGoonSceneSignature(scene)
     if (signature === previewSceneSignature) return
     previewSceneSignature = signature
-    void applyGoonSceneDefinition(previewEngine, editorScene, stagePostureMap)
+    void applyGoonSceneDefinition(previewEngine, scene, stagePostureMap)
   })
 
   $effect(() => {
@@ -6192,6 +6649,7 @@
     const vrmUrl = resolveGoonAvatarUrl(goon)
     if (!vrmUrl || !previewContainer) return
     const contextSignature = buildPreviewContextSignature(goon, 'editor')
+    if (previewFailedContextSignature === contextSignature) return
     if (previewContextSignature === contextSignature && previewGoonId === goon.id && previewVrmUrl === vrmUrl) {
       return
     }
@@ -6275,6 +6733,36 @@
     }
   }
 
+  function handleCustomUploadSelection(event: Event) {
+    const input = event.currentTarget as HTMLInputElement
+    const file = input.files?.[0] || null
+    customUploadFile = file
+    if (file) {
+      void handleCustomUpload()
+    }
+  }
+
+  async function handleCustomUpload() {
+    if (!customUploadFile) {
+      toast.error('Select an Advanced/GLB package first.')
+      return
+    }
+    customUploadBusy = true
+    try {
+      await createGoon({
+        sourceProfile: 'expert-custom-glb',
+        file: customUploadFile
+      })
+      customUploadFile = null
+      if (customUploadInput) customUploadInput.value = ''
+      toast.success('Advanced/GLB Goon package uploaded!')
+    } catch (error: any) {
+      toast.error(error?.message || 'Advanced/GLB package upload failed')
+    } finally {
+      customUploadBusy = false
+    }
+  }
+
   function handleUpdateVrmSelection(event: Event) {
     const input = event.currentTarget as HTMLInputElement
     const file = input.files?.[0] || null
@@ -6331,17 +6819,30 @@
   }
 
   async function handleAdvancedPackageUpdate() {
-    if (!editorGoonId || !editorGoon || editorSourceProfile !== 'guided-custom-vrm') return
+    if (!editorGoonId || !editorGoon) return
+    if (
+      editorSourceProfile !== 'guided-custom-vrm' &&
+      editorSourceProfile !== 'expert-custom-glb'
+    ) {
+      return
+    }
     if (!advancedPackageUpdateFile) {
       toast.error('Select a Goon File Package first.')
       return
     }
     advancedPackageUpdateBusy = true
     try {
-      editorPendingAdvancedPackageUpdate = await uploadAdvancedGoonPackage(
-        editorGoonId,
-        advancedPackageUpdateFile
-      )
+      if (editorSourceProfile === 'guided-custom-vrm') {
+        editorPendingAdvancedPackageUpdate = await uploadAdvancedGoonPackage(
+          editorGoonId,
+          advancedPackageUpdateFile
+        )
+      } else {
+        editorPendingCustomPackageUpdate = await uploadCustomGoonPackage(
+          editorGoonId,
+          advancedPackageUpdateFile
+        )
+      }
       toast.success('Package update ready. Save Goon to apply it.')
     } catch (error: any) {
       toast.error(error?.message || 'Package update failed')
@@ -6354,6 +6855,9 @@
 
   function cancelPendingAdvancedPackageUpdate() {
     editorPendingAdvancedPackageUpdate = null
+    editorPendingCustomPackageUpdate = null
+    editorFacialArtworkUploadBusy = false
+    editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
     if (advancedPackageUpdateInput) advancedPackageUpdateInput.value = ''
     toast.success('Pending package update canceled')
@@ -6517,7 +7021,7 @@
   async function handleLibraryUpload(files: File[] = libraryUploadFiles) {
     if (libraryUploadBusy) return
     if (!files || files.length === 0) {
-      toast.error('Select VRMA or FBX files first.')
+      toast.error('Select VRMA, GLB, or FBX files first.')
       return
     }
 
@@ -6526,12 +7030,26 @@
     libraryUploadDone = 0
 
     const failedFiles: File[] = []
+    const conflicts: MotionReplaceConflict[] = []
+    let uploadedCount = 0
     try {
       for (const file of files) {
         try {
           await uploadGoonAnimationToLibrary(file)
+          uploadedCount += 1
         } catch (error) {
-          failedFiles.push(file)
+          if (error instanceof GoonMotionVersionExistsError) {
+            // A motion with this name already has this format. Collected and
+            // confirmed once for the whole batch after the loop — never a
+            // silent replacement, never one popup per file.
+            conflicts.push({
+              file,
+              motionName: error.conflict.displayName || error.conflict.motionName,
+              laneLabel: error.conflict.lane === 'glb' ? 'GLB' : 'VRMA'
+            })
+          } else {
+            failedFiles.push(file)
+          }
         } finally {
           libraryUploadDone += 1
         }
@@ -6545,13 +7063,65 @@
     if (failedFiles.length > 0) {
       libraryUploadFiles = failedFiles
       toast.error(
-        `Uploaded ${files.length - failedFiles.length}/${files.length}. Selection now contains the failed files.`
+        `Uploaded ${uploadedCount}/${files.length}. Selection now contains the failed files.`
       )
-      return
+    } else {
+      resetLibrarySelection()
+      if (uploadedCount > 0) {
+        toast.success(
+          `Uploaded ${uploadedCount} animation${uploadedCount === 1 ? '' : 's'} to the vault.`
+        )
+      }
     }
 
-    resetLibrarySelection()
-    toast.success(`Uploaded ${files.length} animation${files.length === 1 ? '' : 's'} to the vault.`)
+    if (conflicts.length > 0) {
+      motionReplaceConflicts = conflicts
+    }
+  }
+
+  type MotionReplaceConflict = {
+    file: File
+    motionName: string
+    laneLabel: string
+  }
+
+  let motionReplaceConflicts = $state<MotionReplaceConflict[]>([])
+  let motionReplaceBusy = $state(false)
+
+  async function confirmMotionReplacements() {
+    if (motionReplaceBusy || motionReplaceConflicts.length === 0) return
+    const pending = [...motionReplaceConflicts]
+    motionReplaceBusy = true
+    try {
+      let replaced = 0
+      const failed: MotionReplaceConflict[] = []
+      for (const conflict of pending) {
+        try {
+          await uploadGoonAnimationToLibrary(conflict.file, { replaceExisting: true })
+          replaced += 1
+        } catch {
+          failed.push(conflict)
+        }
+      }
+      if (replaced > 0) {
+        toast.success(`Replaced ${replaced} motion version${replaced === 1 ? '' : 's'}.`)
+      }
+      if (failed.length > 0) {
+        toast.error(`Failed to replace ${failed.length} motion version${failed.length === 1 ? '' : 's'}.`)
+      }
+      motionReplaceConflicts = []
+    } finally {
+      motionReplaceBusy = false
+    }
+  }
+
+  function skipMotionReplacements() {
+    if (motionReplaceBusy) return
+    const skipped = motionReplaceConflicts.length
+    motionReplaceConflicts = []
+    toast.info(
+      `Skipped ${skipped} duplicate upload${skipped === 1 ? '' : 's'}. Rename the file${skipped === 1 ? '' : 's'} first to keep both versions.`
+    )
   }
 
   function handleLibrarySelection(event: Event) {
@@ -6564,7 +7134,7 @@
     let blockedFbx = 0
 
     for (const file of files) {
-      if (isVrmaFile(file)) {
+      if (isVrmaFile(file) || isGlbAnimationLibraryFile(file)) {
         accepted.push(file)
         continue
       }
@@ -6593,12 +7163,30 @@
     void handleLibraryUpload(accepted)
   }
 
-  async function handleLibraryDelete(filename: string) {
+  // Whole-motion delete: removes every format version of the motion. The
+  // per-version remove inside the card's info menu deletes a single file.
+  async function handleMotionEntryDelete(entry: UnifiedGoonMotionEntry) {
+    const filenames = entry.files.map((file) => file.filename).filter(Boolean)
+    if (filenames.length === 0) return
     try {
-      await deleteGoonAnimationFromLibrary(filename)
-      toast.success('Animation removed')
+      await deleteGoonAnimationFromLibrary(filenames)
+      toast.success(
+        filenames.length > 1 ? `Motion removed (${filenames.length} files)` : 'Motion removed'
+      )
     } catch (error: any) {
-      toast.error(error?.message || 'Failed to remove animation')
+      toast.error(error?.message || 'Failed to remove motion')
+    }
+  }
+
+  async function handleMotionVersionDelete(entry: UnifiedGoonMotionEntry, file: GoonFileRef) {
+    if (!file.filename) return
+    try {
+      await deleteGoonAnimationFromLibrary(file.filename)
+      toast.success(
+        `${getMotionLaneBadge(resolveGoonMotionLane(file)).label} version removed`
+      )
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to remove animation file')
     }
   }
 
@@ -6629,14 +7217,27 @@
   }
 
   async function persistGoonsSettings(nextSettings: GoonsSettings) {
-    if (userSettings) {
-      setUserSettings({ ...userSettings, goons_settings: nextSettings })
+    const persistedSettings = await persistGoonsSettingsRequest(fetch, nextSettings)
+    const currentUserSettings = getUserSettings()
+    if (currentUserSettings) {
+      setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
     }
-    await fetch('/api/user/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ goons_settings: nextSettings })
-    })
+    return persistedSettings
+  }
+
+  // The GLB preview body choice is a preference, not staged library data —
+  // persist it immediately instead of routing it through Save Motions.
+  async function persistGlbPreviewGoonSelection(goonId: string) {
+    const trimmed = goonId.trim()
+    if ((goonsSettings?.motions?.glbPreviewGoonId ?? '') === trimmed) return
+    try {
+      await persistGoonsSettings({
+        ...(goonsSettings ?? {}),
+        motions: trimmed ? { glbPreviewGoonId: trimmed } : {}
+      })
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to save the GLB preview body choice')
+    }
   }
 
   function togglePackSelection(key: string, selected: boolean) {
@@ -6794,6 +7395,52 @@
     return cloned
   }
 
+  // A cue export carries its own motion file; this adds that motion's OTHER
+  // format versions to the pack's standalone motions so the cue resolves by
+  // name on both lanes after import. Motions already selected for export are
+  // skipped (they are serialized separately).
+  function collectCuePairedMotionRefs(
+    cueOptions: Array<{ motionFile: GoonFileRef | null }>,
+    selectedMotions: PackMotionExportOption[],
+    usedPaths: Set<string>,
+    assetsToFetch: Array<{ path: string; fileRef: GoonFileRef }>,
+    motionAssetCache: Map<string, GoonFileRef>
+  ) {
+    const covered = new Set<string>()
+    for (const option of selectedMotions) {
+      for (const file of option.files) {
+        const key = file.url || file.filename
+        if (key) covered.add(key)
+      }
+    }
+
+    const refs: GoonFileRef[] = []
+    for (const cueOption of cueOptions) {
+      const motionFile = cueOption.motionFile
+      if (!motionFile) continue
+      const entry = motionLibraryEntries.find(
+        (candidate) => candidate.name === resolveAnimationName(motionFile)
+      )
+      if (!entry) continue
+      const cueFileKey = motionFile.url || motionFile.filename
+      for (const file of entry.files) {
+        const key = file.url || file.filename
+        if (!key || covered.has(key) || key === cueFileKey) continue
+        covered.add(key)
+        refs.push(
+          serializeMotionFileRefForPack(
+            file,
+            resolveAnimationName(file),
+            usedPaths,
+            assetsToFetch,
+            motionAssetCache
+          )
+        )
+      }
+    }
+    return refs
+  }
+
   function serializeSceneForPack(
     scene: GoonSceneDefinition,
     usedPaths: Set<string>,
@@ -6823,7 +7470,7 @@
 
     const serializeSurfaceSide = (
       side: GoonRoomSurfaceSide | undefined,
-      zone: 'floor' | 'ceiling' | 'wall',
+      zone: 'floor' | 'ceiling' | 'wall' | 'exterior',
       faceLabel: string
     ) => {
       if (!side) return
@@ -6849,7 +7496,7 @@
 
     const serializeSurface = (
       surface: GoonRoomSurface | undefined,
-      zone: 'floor' | 'ceiling' | 'wall',
+      zone: 'floor' | 'ceiling' | 'wall' | 'exterior',
       faceLabel: string
     ) => {
       if (!surface) return
@@ -6866,6 +7513,16 @@
       serializeSurface(surfaces.walls?.east, 'wall', 'east')
       serializeSurface(surfaces.walls?.west, 'wall', 'west')
     }
+
+    const exteriorAprons = next.roomShellBuilder?.exteriorAprons
+    if (exteriorAprons) {
+      serializeSurfaceSide(exteriorAprons.north?.surface, 'exterior', 'north-apron')
+      serializeSurfaceSide(exteriorAprons.south?.surface, 'exterior', 'south-apron')
+      serializeSurfaceSide(exteriorAprons.east?.surface, 'exterior', 'east-apron')
+      serializeSurfaceSide(exteriorAprons.west?.surface, 'exterior', 'west-apron')
+    }
+
+    serializeSurfaceSide(next.roomShellBuilder?.terrainSkirt?.surface, 'exterior', 'terrain-skirt')
 
     next.props = (next.props ?? []).map((prop, index) => ({
       ...prop,
@@ -6971,7 +7628,9 @@
         addReferencedPosture(option.motionFile?.motionMeta?.posture)
       }
       for (const option of selectedMotions) {
-        addReferencedPosture(option.file.motionMeta?.posture)
+        for (const file of option.files) {
+          addReferencedPosture(file.motionMeta?.posture)
+        }
       }
       for (const option of selectedScenes) {
         for (const postureId of Object.keys(option.scene.markers ?? {})) {
@@ -6985,15 +7644,23 @@
         postures: Array.from(referencedPostureIds).map(
           (postureId) => JSON.parse(JSON.stringify(stagePostureMap[postureId])) as GoonPostureDefinition
         ),
-        motions: selectedMotions.map((option) =>
-          serializeMotionFileRefForPack(
-            option.file,
-            option.label || resolveAnimationName(option.file),
-            usedPaths,
-            assetsToFetch,
-            motionAssetCache
-          )
-        ),
+        // Dual-format: every version of a selected motion ships in the pack,
+        // and cue-referenced motions bring their paired versions along so the
+        // cue resolves on both lanes after import.
+        motions: [
+          ...selectedMotions.flatMap((option) =>
+            option.files.map((file) =>
+              serializeMotionFileRefForPack(
+                file,
+                option.label || resolveAnimationName(file),
+                usedPaths,
+                assetsToFetch,
+                motionAssetCache
+              )
+            )
+          ),
+          ...collectCuePairedMotionRefs(selectedCueOptions, selectedMotions, usedPaths, assetsToFetch, motionAssetCache)
+        ],
         moods: [...selectedMoods, ...selectedLocalMoods].map((option) =>
           serializeCueForPack(option, usedPaths, assetsToFetch, motionAssetCache)
         ),
@@ -7156,7 +7823,10 @@
     }
 
     const file = createPackAssetFile(fileRef, bytes, assetPath)
-    const uploaded = await uploadGoonAnimationToLibraryFile(file)
+    // Pack imports intentionally replace same-name-same-format versions in
+    // place — importing a pack is an explicit action, and this keeps
+    // re-importing the same pack idempotent instead of duplicating motions.
+    const uploaded = await uploadGoonAnimationToLibraryFile(file, { replaceExisting: true })
     if ((fileRef.tags && fileRef.tags.length > 0) || fileRef.motionMeta || fileRef.displayName) {
       await updateGoonAnimationLibraryMetadata(uploaded.animation.filename, {
         displayName: fileRef.displayName,
@@ -7220,12 +7890,18 @@
 
     const restoreSurfaceSide = async (
       side: GoonRoomSurfaceSide | undefined,
-      zone: 'floor' | 'ceiling' | 'wall'
+      zone: 'floor' | 'ceiling' | 'wall' | 'exterior'
     ) => {
       if (!side) return
       if (side.texture) {
         const kind: GoonRoomTextureKind =
-          zone === 'floor' ? 'floor' : zone === 'ceiling' ? 'ceiling' : 'wall'
+          zone === 'floor'
+            ? 'floor'
+            : zone === 'ceiling'
+              ? 'ceiling'
+              : zone === 'exterior'
+                ? 'exterior'
+                : 'wall'
         side.texture = await restoreSceneAssetFile(
           side.texture,
           'room_texture',
@@ -7260,6 +7936,16 @@
       await restoreSurfaceSide(surfaces.walls?.west?.interior, 'wall')
       await restoreSurfaceSide(surfaces.walls?.west?.exterior, 'wall')
     }
+
+    const exteriorAprons = next.roomShellBuilder?.exteriorAprons
+    if (exteriorAprons) {
+      await restoreSurfaceSide(exteriorAprons.north?.surface, 'exterior')
+      await restoreSurfaceSide(exteriorAprons.south?.surface, 'exterior')
+      await restoreSurfaceSide(exteriorAprons.east?.surface, 'exterior')
+      await restoreSurfaceSide(exteriorAprons.west?.surface, 'exterior')
+    }
+
+    await restoreSurfaceSide(next.roomShellBuilder?.terrainSkirt?.surface, 'exterior')
 
     next.props = await Promise.all(
       (next.props ?? []).map(async (prop) => ({
@@ -7358,10 +8044,10 @@
           postures: importedPostures.postures
         }
       }
-      await persistGoonsSettings(imported.settings)
-      applyKitchenStateFromSettings(imported.settings)
-      applyClosetStateFromSettings(imported.settings)
-      applySceneStateFromSettings(imported.settings)
+      const persistedSettings = await persistGoonsSettings(imported.settings)
+      applyKitchenStateFromSettings(persistedSettings)
+      applyClosetStateFromSettings(persistedSettings)
+      applySceneStateFromSettings(persistedSettings)
       const renamedMotions = Object.keys(imported.renamedCueNames).length
       const renamedScenes = Object.keys(imported.renamedSceneNames).length
       const renamedPostures = (currentPack.manifest.postures ?? []).filter((posture) => {
@@ -7419,6 +8105,9 @@
 
   function openCueEditor(goon: GoonRecord) {
     activeTab = 'goons'
+    if (editorGoonId !== goon.id) {
+      pendingEditorOpeningFrameGoonId = goon.id
+    }
     editorGoonId = goon.id
     editorName = goon.name ?? ''
     editorDescription = goon.description ?? ''
@@ -7446,9 +8135,16 @@
     editorEyeContactMode = resolveGoonEyeContactMode(goon, eyeContactSettings)
     applyEditorEyeContactTuning(resolveGoonEyeContactTuning(goon, eyeContactSettings))
     editorCamera = { ...(goon.camera ?? {}) }
+    previewCameraMode = editorCamera.mode ?? 'free'
+    previewViewFov = typeof editorCamera.fov === 'number'
+      ? clampPreviewFov(editorCamera.fov)
+      : DEFAULT_PREVIEW_VIEW_FOV
     editorPendingVrmFile = null
     editorPendingVrmUpdate = null
     editorPendingAdvancedPackageUpdate = null
+    editorPendingCustomPackageUpdate = null
+    editorFacialArtworkUploadBusy = false
+    editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
     editorGuidedOutfitPiecesDraft = [...(goon.guidedAvatar?.outfitPieces ?? [])]
     editorGuidedDufOverlays = [...(goon.guidedAvatar?.dufOverlays ?? [])]
@@ -7461,6 +8157,8 @@
     editorDescriptionEditorOpen = false
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
+    editorBodyAppearanceOpen = false
+    editorFaceAppearanceOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -8310,6 +9008,26 @@
     } else if (typeof value === 'number') {
       previewViewFov = value
     }
+    previewEngine?.setCameraFov(previewViewFov)
+    kitchenPreviewEngine?.setCameraFov(previewViewFov)
+  }
+
+  function handlePreviewCameraModeChange(
+    target: GoonEngine | null,
+    mode: GoonCameraMode,
+    persist: boolean
+  ) {
+    if (!target?.setCameraMode(mode)) return
+    previewCameraMode = mode
+    if (persist) handlePreviewCameraChange(target.getCameraState())
+  }
+
+  function handlePreviewFramePreset(preset: GoonFramingPreset) {
+    previewEngine?.frameAvatar(preset)
+  }
+
+  function handleKitchenPreviewFramePreset(preset: GoonFramingPreset) {
+    kitchenPreviewEngine?.frameAvatar(preset)
   }
 
   function applyEditorEyeContactTuning(tuning: ResolvedGoonEyeContactTuning) {
@@ -8439,6 +9157,8 @@
     const direction = Math.sign(rawDelta)
     if (!direction) return
     previewViewFov = clampPreviewFov(previewViewFov + direction * 2)
+    previewEngine?.setCameraFov(previewViewFov)
+    kitchenPreviewEngine?.setCameraFov(previewViewFov)
   }
 
   function handlePreviewViewportFovWheel(event: WheelEvent) {
@@ -8579,17 +9299,34 @@
       if (previewEngine && previewGoonId !== MOTION_LIBRARY_PREVIEW_GOON_ID) {
         resetPreview('leaving-editor-for-motions')
       }
+      const lane = resolveGoonMotionLane(animationFile)
+      const previewTarget: MotionPreviewTarget =
+        lane === 'glb' ? glbMotionPreviewTarget : { kind: 'vrm', url: STUNT_DUMMY_VRM_URL }
+      const targetUrl = resolveMotionPreviewTargetKey(previewTarget)
+      if (!targetUrl) {
+        throw new Error('Preview Goon is missing its model file.')
+      }
       const engine = await ensurePreviewEngine()
       if (!engine || requestId !== motionLibraryPreviewRequestId) return
-      if (previewVrmUrl !== STUNT_DUMMY_VRM_URL || previewGoonId !== MOTION_LIBRARY_PREVIEW_GOON_ID) {
-        await engine.loadGoon(STUNT_DUMMY_VRM_URL)
+      if (previewVrmUrl !== targetUrl || previewGoonId !== MOTION_LIBRARY_PREVIEW_GOON_ID) {
+        if (previewTarget.kind === 'custom') {
+          await loadAvatarIntoEngine(engine, previewTarget.goon)
+        } else if (previewTarget.kind === 'custom-url') {
+          const manifest = await loadCustomAvatarManifest({
+            url: previewTarget.manifestUrl,
+            filename: previewTarget.manifestUrl.split('/').pop() || 'avatar.json'
+          })
+          await engine.loadCustomGoon(previewTarget.modelUrl, manifest)
+        } else {
+          await engine.loadGoon(STUNT_DUMMY_VRM_URL)
+        }
         if (requestId !== motionLibraryPreviewRequestId) return
-        previewVrmUrl = STUNT_DUMMY_VRM_URL
+        previewVrmUrl = targetUrl
         previewGoonId = MOTION_LIBRARY_PREVIEW_GOON_ID
         motionLibraryPreviewSignature = ''
       }
 
-      const signature = `${STUNT_DUMMY_VRM_URL}::${animationFile.url}`
+      const signature = `${targetUrl}::${animationFile.url}`
       if (motionLibraryPreviewSignature !== signature) {
         await engine.syncAnimations([animationFile])
         if (requestId !== motionLibraryPreviewRequestId) return
@@ -8716,6 +9453,10 @@
   async function resetKitchenPreviewBaseLoop() {
     const engine = await ensureKitchenPreviewReady()
     if (!engine) return
+    if (scenePreviewUsingProxy) {
+      await applySceneProxyPose(engine)
+      return
+    }
     if (scenePreviewUsesMotionOnly()) {
       applyScenePreviewMotionState(engine, kitchenPreviewGoon)
     } else {
@@ -8773,11 +9514,6 @@
     }
   }
 
-  function handleSceneLibraryPreviewSelect(sceneId: string | null) {
-    kitchenPreviewSceneId = sceneId || null
-    void ensureKitchenPreviewReady(sceneId)
-  }
-
   async function resetEditorPreviewAll() {
     if (previewAnimationActive) {
       await clearPreviewAnimation()
@@ -8833,26 +9569,458 @@
     }
   }
 
-  function toggleEditorPrimarySection(
-    section: 'basic' | 'eye-contact' | 'vrm' | 'animations' | 'closet' | 'delete'
-  ) {
-    const next = {
-      basic: section === 'basic' ? !editorBasicSettingsOpen : false,
-      eyeContact: section === 'eye-contact' ? !editorEyeContactOpen : false,
-      vrm: section === 'vrm' ? !editorVrmSectionOpen : false,
-      animations: section === 'animations' ? !editorAnimationsSectionOpen : false,
-      closet: section === 'closet' ? !editorClosetOpen : false,
-      delete: section === 'delete' ? !editorDeleteGoonOpen : false
+  // ------------------------------------------ appearance dials v2 (SA-090)
+  let editorAppearanceDialsManifest = $state<AppearanceDialsManifest | null>(null)
+  let editorAppearanceDialsState = $state<AppearanceDialValueState | null>(null)
+  let editorAppearanceDialsError = $state('')
+  let editorAppearanceDialsNotice = $state('')
+  let editorAppearanceDialsLoadToken = 0
+  // Deliberately non-reactive: hydration bookkeeping, never rendered.
+  let editorAppearanceDialsHydrationKey = ''
+  let editorAppearanceDialsStoredSignature = ''
+
+  function reconcileEditorAppearanceDials(
+    manifest: AppearanceDialsManifest,
+    stored: unknown
+  ): AppearanceDialValueState {
+    const result = reconcileAppearanceDialValues(manifest, stored)
+    if (result.incompatible) {
+      editorAppearanceDialsNotice =
+        'Saved Appearance Dials did not match this package definition and were reset to neutral.'
+    } else {
+      const adjustedCount =
+        result.prunedIds.length +
+        result.prunedUnlockIds.length +
+        result.clampedIds.length +
+        result.resetIds.length
+      editorAppearanceDialsNotice = adjustedCount
+        ? `${adjustedCount} saved Appearance Dial ${adjustedCount === 1 ? 'entry was' : 'entries were'} reconciled with this package.`
+        : ''
+    }
+    return result.state
+  }
+
+  // Hydration is keyed by goon id + manifest URL, NOT the goon object
+  // reference: background PUTs on the edited goon (camera saves,
+  // compatibility reports) replace the store object while the user works and
+  // must not remount the dial editor or clobber an unsaved draft.
+  $effect(() => {
+    const goon = editorGoon
+    const isCustom = Boolean(goon && resolveGoonKind(goon) === 'custom')
+    const manifestRef = isCustom ? goon?.customAvatar?.manifest : null
+    const hydrationKey =
+      goon && manifestRef?.url ? `${goon.id}::${manifestRef.url}` : ''
+    const storedDials = isCustom ? goon?.appearanceDials ?? null : null
+    const storedSignature = JSON.stringify(storedDials ?? null)
+
+    if (!hydrationKey || !manifestRef?.url) {
+      editorAppearanceDialsHydrationKey = ''
+      editorAppearanceDialsStoredSignature = ''
+      editorAppearanceDialsLoadToken += 1
+      editorAppearanceDialsManifest = null
+      editorAppearanceDialsState = null
+      editorAppearanceDialsError = ''
+      editorAppearanceDialsNotice = ''
+      return
     }
 
-    editorBasicSettingsOpen = next.basic
-    editorEyeContactOpen = next.eyeContact
-    editorVrmSectionOpen = next.vrm
-    editorAnimationsSectionOpen = next.animations
-    editorClosetOpen = next.closet
-    editorDeleteGoonOpen = next.delete
+    if (hydrationKey === editorAppearanceDialsHydrationKey) {
+      if (storedSignature === editorAppearanceDialsStoredSignature) return
+      editorAppearanceDialsStoredSignature = storedSignature
+      // Stored dials changed underneath the editor (our save landing, or
+      // another surface writing). Reconcile only when there is no unsaved
+      // draft; the user's in-progress edits always win until they save.
+      if (editorDirty) return
+      if (editorAppearanceDialsManifest) {
+        editorAppearanceDialsState = reconcileEditorAppearanceDials(
+          editorAppearanceDialsManifest,
+          storedDials
+        )
+      }
+      return
+    }
 
-    if (!next.closet) {
+    editorAppearanceDialsHydrationKey = hydrationKey
+    editorAppearanceDialsStoredSignature = storedSignature
+    const token = ++editorAppearanceDialsLoadToken
+    editorAppearanceDialsManifest = null
+    editorAppearanceDialsState = null
+    editorAppearanceDialsError = ''
+    editorAppearanceDialsNotice = ''
+    void (async () => {
+      try {
+        const manifest = await loadCustomAvatarManifest(manifestRef)
+        if (token !== editorAppearanceDialsLoadToken) return
+        const parsed = parseAppearanceDialsManifest(manifest)
+        if (token !== editorAppearanceDialsLoadToken || !parsed) return
+        editorAppearanceDialsManifest = parsed
+        editorAppearanceDialsState = reconcileEditorAppearanceDials(parsed, storedDials)
+      } catch (error) {
+        if (token !== editorAppearanceDialsLoadToken) return
+        editorAppearanceDialsError = error instanceof Error ? error.message : String(error)
+      }
+    })()
+  })
+
+  // live-sync the dial draft onto the settings preview engine (fires on
+  // slider changes and when the preview finishes loading the editor goon)
+  $effect(() => {
+    if (!previewEngine || !previewReady) return
+    if (previewGoonId !== editorGoonId) return
+    if (!editorAppearanceDialsManifest || !editorAppearanceDialsState) return
+    previewEngine.setAppearanceDialValues(editorAppearanceDialsState)
+  })
+
+  function updateEditorAppearanceDials(state: AppearanceDialValueState) {
+    if (JSON.stringify(editorAppearanceDialsState) === JSON.stringify(state)) return
+    editorAppearanceDialsState = state
+    editorAppearanceDialsNotice = ''
+    editorDirty = true
+  }
+
+  // ------------------------------------------ facial artwork v3 + linked eye appearance v1 (SA-090)
+  let editorFacialArtworkDefinition = $state<FacialArtworkDefinitionV3 | null>(null)
+  let editorFacialArtworkState = $state<FacialArtworkStateV3 | null>(null)
+  let editorEyeAppearanceDefinition = $state<EyeAppearanceDefinitionV1 | null>(null)
+  let editorEyeAppearanceState = $state<EyeAppearanceStateV1 | null>(null)
+  let editorFacialArtworkHydrated = $state(false)
+  let editorFacialArtworkError = $state('')
+  let editorFacialArtworkPackageNotice = $state('')
+  let editorFacialArtworkNotice = $state('')
+  let editorEyeAppearanceNotice = $state('')
+  let editorFacialArtworkPreviewError = $state('')
+  let editorFacialArtworkLoadToken = 0
+  let editorFacialArtworkPreviewToken = 0
+  let editorFacialArtworkPreviewTimer: ReturnType<typeof setTimeout> | null = null
+  // Deliberately non-reactive ownership bookkeeping. Draft bytes become saved
+  // only after the Goon PUT succeeds.
+  let editorFacialArtworkHydrationKey = ''
+  let editorFacialArtworkStoredSignature = ''
+  const editorFacialArtworkDraftUploads = new Map<string, FacialArtworkUpload>()
+
+  function applyStoredFacialArtworkDraft(
+    definition: FacialArtworkDefinitionV3,
+    stored: FacialArtworkStateV3 | null | undefined
+  ) {
+    const restored = restoreFacialArtworkDraft(definition, stored)
+    editorFacialArtworkState = restored.state
+    editorFacialArtworkPreviewError = ''
+    editorFacialArtworkNotice = restored.incompatible
+      ? 'Saved Facial Artwork did not match this package definition and was reset to package defaults.'
+      : ''
+  }
+
+  function applyStoredEyeAppearanceDraft(
+    definition: EyeAppearanceDefinitionV1,
+    stored: EyeAppearanceStateV1 | null | undefined
+  ) {
+    const reconciliation = reconcileEyeAppearanceState(definition, stored)
+    editorEyeAppearanceState = reconciliation.state
+      ? structuredClone(reconciliation.state)
+      : createDefaultEyeAppearanceState(definition)
+    editorEyeAppearanceNotice = reconciliation.incompatible
+      ? 'Saved Eye Appearance controls did not match this package definition and were reset to the package-fitted result.'
+      : ''
+  }
+
+  function restorePackageOwnedEditorDrafts(goon: GoonRecord) {
+    if (editorAppearanceDialsManifest) {
+      const storedDials = goon.appearanceDials ?? null
+      editorAppearanceDialsStoredSignature = JSON.stringify(storedDials)
+      editorAppearanceDialsState = reconcileEditorAppearanceDials(
+        editorAppearanceDialsManifest,
+        storedDials
+      )
+      editorAppearanceDialsError = ''
+    }
+    if (editorFacialArtworkDefinition) {
+      editorFacialArtworkStoredSignature = JSON.stringify({
+        storedArtwork: goon.facialArtwork ?? null,
+        storedEyeAppearance: goon.eyeAppearance ?? null
+      })
+      applyStoredFacialArtworkDraft(
+        editorFacialArtworkDefinition,
+        goon.facialArtwork ?? null
+      )
+      editorFacialArtworkError = ''
+      editorFacialArtworkHydrated = true
+    }
+    if (editorEyeAppearanceDefinition) {
+      applyStoredEyeAppearanceDraft(
+        editorEyeAppearanceDefinition,
+        goon.eyeAppearance ?? null
+      )
+    }
+  }
+
+  function clearFacialArtworkPreviewTimer() {
+    if (editorFacialArtworkPreviewTimer) clearTimeout(editorFacialArtworkPreviewTimer)
+    editorFacialArtworkPreviewTimer = null
+  }
+
+  function resolveFacialArtworkDraftForSave(): FacialArtworkStateV3 | null {
+    if (!editorFacialArtworkHydrated || !editorFacialArtworkDefinition || !editorFacialArtworkState) {
+      return null
+    }
+    const parsed = parseFacialArtworkState(
+      editorFacialArtworkDefinition,
+      editorFacialArtworkState
+    )
+    const defaults = createDefaultFacialArtworkState(editorFacialArtworkDefinition)
+    return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
+  }
+
+  function resolveEyeAppearanceDraftForSave(): EyeAppearanceStateV1 | null {
+    if (!editorEyeAppearanceDefinition || !editorEyeAppearanceState) return null
+    const parsed = parseEyeAppearanceState(
+      editorEyeAppearanceDefinition,
+      editorEyeAppearanceState
+    )
+    const defaults = createDefaultEyeAppearanceState(editorEyeAppearanceDefinition)
+    return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
+  }
+
+  async function deleteFacialArtworkDraft(upload: FacialArtworkUpload) {
+    if (!editorGoonId) return
+    await deleteGoonFacialArtwork(editorGoonId, upload.filename)
+    editorFacialArtworkDraftUploads.delete(upload.filename)
+  }
+
+  async function pruneDetachedFacialArtworkDrafts(state: FacialArtworkStateV3 | null) {
+    const referenced = new Set(collectFacialArtworkUploads(state).map((upload) => upload.filename))
+    for (const upload of [...editorFacialArtworkDraftUploads.values()]) {
+      if (referenced.has(upload.filename)) continue
+      try {
+        await deleteFacialArtworkDraft(upload)
+      } catch (error) {
+        console.warn('[GoonsSettings] Failed to delete detached facial-artwork draft:', error)
+      }
+    }
+  }
+
+  async function discardFacialArtworkDraftUploads() {
+    const goonId = editorGoonId
+    const drafts = [...editorFacialArtworkDraftUploads.values()]
+    editorFacialArtworkDraftUploads.clear()
+    if (!goonId) return
+    for (const upload of drafts) {
+      try {
+        await deleteGoonFacialArtwork(goonId, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Failed to delete discarded facial-artwork draft:', error)
+      }
+    }
+  }
+
+  async function reconcileFacialArtworkUploadsAfterSave(
+    previous: FacialArtworkStateV3 | null | undefined,
+    saved: FacialArtworkStateV3 | null | undefined
+  ) {
+    const retained = new Set(collectFacialArtworkUploads(saved).map((upload) => upload.filename))
+    const candidates = new Map<string, FacialArtworkUpload>()
+    for (const upload of collectFacialArtworkUploads(previous)) candidates.set(upload.filename, upload)
+    for (const upload of editorFacialArtworkDraftUploads.values()) {
+      candidates.set(upload.filename, upload)
+    }
+    editorFacialArtworkDraftUploads.clear()
+    for (const upload of candidates.values()) {
+      if (retained.has(upload.filename)) continue
+      try {
+        await deleteGoonFacialArtwork(editorGoonId!, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Saved facial artwork, but an unused upload remains:', error)
+        toast.warning('Facial Artwork saved, but an unused PNG could not be cleaned up.')
+      }
+    }
+  }
+
+  async function uploadEditorFacialArtwork(
+    roleId: FacialArtworkRoleId,
+    file: File,
+    provenance: FacialArtworkProvenance,
+    orientation: FacialArtworkOrientation
+  ) {
+    if (!editorGoonId || !editorFacialArtworkDefinition) {
+      throw new Error('Facial Artwork is not ready for this Goon.')
+    }
+    const role = editorFacialArtworkDefinition.roles.find((candidate) => candidate.id === roleId)
+    const template = editorFacialArtworkDefinition.templates.find(
+      (candidate) => candidate.id === role?.template
+    )
+    if (!role || !template) throw new Error('The selected facial-artwork template is unavailable.')
+    const variant = resolveFacialArtworkTemplateVariant(template, orientation)
+    const upload = await uploadGoonFacialArtwork(editorGoonId, file, {
+      role: role.id,
+      definitionSha256: editorFacialArtworkDefinition.definitionSha256,
+      templateId: template.id,
+      templateVersion: template.version,
+      orientation,
+      guideSha256: variant.guide.sha256,
+      maskSha256: variant.safePaintMask.sha256,
+      provenance
+    })
+    editorFacialArtworkDraftUploads.set(upload.filename, upload)
+    return upload
+  }
+
+  function updateEditorFacialArtwork(state: FacialArtworkStateV3) {
+    if (!editorFacialArtworkDefinition) return
+    const parsed = parseFacialArtworkState(editorFacialArtworkDefinition, state)
+    if (JSON.stringify(editorFacialArtworkState) === JSON.stringify(parsed)) return
+    editorFacialArtworkState = parsed
+    editorFacialArtworkNotice = ''
+    editorFacialArtworkPreviewError = ''
+    editorDirty = true
+    void pruneDetachedFacialArtworkDrafts(parsed)
+  }
+
+  function updateEditorEyeAppearance(state: EyeAppearanceStateV1) {
+    if (!editorEyeAppearanceDefinition) return
+    const parsed = parseEyeAppearanceState(editorEyeAppearanceDefinition, state)
+    if (JSON.stringify(editorEyeAppearanceState) === JSON.stringify(parsed)) return
+    editorEyeAppearanceState = parsed
+    editorEyeAppearanceNotice = ''
+    editorFacialArtworkPreviewError = ''
+    editorDirty = true
+  }
+
+  $effect(() => {
+    const goon = editorGoon
+    const isCustom = Boolean(goon && resolveGoonKind(goon) === 'custom')
+    const manifestRef = isCustom ? goon?.customAvatar?.manifest : null
+    const hydrationKey = goon && manifestRef?.url ? `${goon.id}::${manifestRef.url}` : ''
+    const storedArtwork = isCustom ? goon?.facialArtwork ?? null : null
+    const storedEyeAppearance = isCustom ? goon?.eyeAppearance ?? null : null
+    const storedSignature = JSON.stringify({ storedArtwork, storedEyeAppearance })
+
+    if (!hydrationKey || !manifestRef?.url) {
+      editorFacialArtworkHydrationKey = ''
+      editorFacialArtworkStoredSignature = ''
+      editorFacialArtworkLoadToken += 1
+      editorFacialArtworkDefinition = null
+      editorFacialArtworkState = null
+      editorEyeAppearanceDefinition = null
+      editorEyeAppearanceState = null
+      editorFacialArtworkHydrated = false
+      editorFacialArtworkError = ''
+      editorFacialArtworkPackageNotice = ''
+      editorFacialArtworkNotice = ''
+      editorEyeAppearanceNotice = ''
+      editorFacialArtworkPreviewError = ''
+      return
+    }
+
+    if (hydrationKey === editorFacialArtworkHydrationKey) {
+      if (storedSignature === editorFacialArtworkStoredSignature) return
+      if (editorDirty || !editorFacialArtworkDefinition || !editorEyeAppearanceDefinition) return
+      editorFacialArtworkStoredSignature = storedSignature
+      applyStoredFacialArtworkDraft(editorFacialArtworkDefinition, storedArtwork)
+      applyStoredEyeAppearanceDraft(editorEyeAppearanceDefinition, storedEyeAppearance)
+      return
+    }
+
+    editorFacialArtworkHydrationKey = hydrationKey
+    editorFacialArtworkStoredSignature = storedSignature
+    const token = ++editorFacialArtworkLoadToken
+    editorFacialArtworkDefinition = null
+    editorFacialArtworkState = null
+    editorEyeAppearanceDefinition = null
+    editorEyeAppearanceState = null
+    editorFacialArtworkHydrated = false
+    editorFacialArtworkError = ''
+    editorFacialArtworkPackageNotice = ''
+    editorFacialArtworkNotice = ''
+    editorEyeAppearanceNotice = ''
+    editorFacialArtworkPreviewError = ''
+    void (async () => {
+      try {
+        const manifest = await loadCustomAvatarManifest(manifestRef)
+        if (token !== editorFacialArtworkLoadToken) return
+        const capability = classifyFacialArtworkPackageCapability(manifest)
+        if (capability.status === 'retired') {
+          editorFacialArtworkPackageNotice = capability.notice
+          editorFacialArtworkHydrated = true
+          return
+        }
+        if (capability.status === 'malformed') {
+          throw new Error(capability.error)
+        }
+        if (capability.status === 'absent') {
+          editorFacialArtworkHydrated = true
+          return
+        }
+        const definition = parseFacialArtworkDefinition(manifest.facialArtwork)
+        const eyeDefinition = parseEyeAppearanceDefinition(manifest.eyeAppearance)
+        if (token !== editorFacialArtworkLoadToken) return
+        editorFacialArtworkDefinition = definition
+        editorEyeAppearanceDefinition = eyeDefinition
+        applyStoredFacialArtworkDraft(definition, storedArtwork)
+        applyStoredEyeAppearanceDraft(eyeDefinition, storedEyeAppearance)
+        editorFacialArtworkHydrated = true
+      } catch (error) {
+        if (token !== editorFacialArtworkLoadToken) return
+        editorFacialArtworkHydrated = true
+        editorFacialArtworkError = error instanceof Error ? error.message : String(error)
+      }
+    })()
+  })
+
+  $effect(() => {
+    const token = ++editorFacialArtworkPreviewToken
+    clearFacialArtworkPreviewTimer()
+    if (!previewEngine || !previewReady || previewGoonId !== editorGoonId) return
+    if (
+      !editorFacialArtworkDefinition ||
+      !editorFacialArtworkState ||
+      !editorEyeAppearanceState
+    ) return
+    const state = editorFacialArtworkState
+    const eyeState = editorEyeAppearanceState
+    editorFacialArtworkPreviewTimer = setTimeout(() => {
+      editorFacialArtworkPreviewTimer = null
+      void Promise.resolve()
+        .then(() => {
+          previewEngine!.setEyeAppearanceState(eyeState)
+          return previewEngine!.setFacialArtworkState(state)
+        })
+        .then(() => {
+          if (token === editorFacialArtworkPreviewToken) editorFacialArtworkPreviewError = ''
+        })
+        .catch((error) => {
+          if (token !== editorFacialArtworkPreviewToken) return
+          editorFacialArtworkPreviewError = error instanceof Error ? error.message : String(error)
+        })
+    }, 90)
+  })
+
+  onDestroy(() => {
+    clearFacialArtworkPreviewTimer()
+  })
+
+  function toggleEditorPrimarySection(
+    section:
+      | 'basic'
+      | 'eye-contact'
+      | 'body-appearance'
+      | 'face-appearance'
+      | 'vrm'
+      | 'animations'
+      | 'closet'
+      | 'delete'
+  ) {
+    editorBasicSettingsOpen = section === 'basic' ? !editorBasicSettingsOpen : false
+    editorEyeContactOpen = section === 'eye-contact' ? !editorEyeContactOpen : false
+    editorBodyAppearanceOpen =
+      section === 'body-appearance' ? !editorBodyAppearanceOpen : false
+    editorFaceAppearanceOpen =
+      section === 'face-appearance' ? !editorFaceAppearanceOpen : false
+    editorVrmSectionOpen = section === 'vrm' ? !editorVrmSectionOpen : false
+    editorAnimationsSectionOpen =
+      section === 'animations' ? !editorAnimationsSectionOpen : false
+    editorClosetOpen = section === 'closet' ? !editorClosetOpen : false
+    editorDeleteGoonOpen = section === 'delete' ? !editorDeleteGoonOpen : false
+
+    if (section !== 'closet') {
       editorCustomClosetOpen = false
       editorWardrobeColorEditorKey = null
     }
@@ -8868,6 +10036,8 @@
   function toggleEditorCueSection(section: 'moods' | 'emotes') {
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
+    editorBodyAppearanceOpen = false
+    editorFaceAppearanceOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -8899,10 +10069,20 @@
     }
   }
 
-  function toggleSceneSection(section: 'room' | 'props' | 'markers') {
+  function toggleSceneSection(section: 'world' | 'room' | 'props' | 'markers') {
+    if (section === 'world') {
+      const next = !sceneWorldOpen
+      sceneWorldOpen = next
+      roomBuilderOpen = false
+      roomBuilderSurfaceOpen = null
+      scenePropsOpen = false
+      sceneMarkersOpen = false
+      return
+    }
     if (section === 'room') {
       const next = !roomBuilderOpen
       roomBuilderOpen = next
+      sceneWorldOpen = false
       roomBuilderSurfaceOpen = null
       scenePropsOpen = false
       sceneMarkersOpen = false
@@ -8911,6 +10091,7 @@
     if (section === 'props') {
       const next = !scenePropsOpen
       scenePropsOpen = next
+      sceneWorldOpen = false
       roomBuilderOpen = false
       roomBuilderSurfaceOpen = null
       sceneMarkersOpen = false
@@ -8918,6 +10099,7 @@
     }
     const next = !sceneMarkersOpen
     sceneMarkersOpen = next
+    sceneWorldOpen = false
     roomBuilderOpen = false
     roomBuilderSurfaceOpen = null
     scenePropsOpen = false
@@ -9087,11 +10269,112 @@
     return candidate
   }
 
+  function resolveSceneAssetFilename(scene: GoonSceneDefinition, kind: SceneAssetKind) {
+    return (kind === 'skybox' ? scene.skybox?.filename : scene.roomShell?.filename)?.trim() || null
+  }
+
+  function collectSceneAssetFilenames(kind: SceneAssetKind, scenes?: GoonSceneMap | null) {
+    const filenames = new Set<string>()
+    for (const scene of Object.values(scenes ?? {})) {
+      const filename = resolveSceneAssetFilename(scene, kind)
+      if (filename) filenames.add(filename)
+    }
+    return filenames
+  }
+
+  function collectPersistedSceneAssetFilenames(
+    kind: SceneAssetKind,
+    settings: GoonsSettings = goonsSettings
+  ) {
+    return collectSceneAssetFilenames(kind, settings?.kitchen?.scenes)
+  }
+
+  async function deleteSceneAssetFilenamesNotIn(
+    kind: SceneAssetKind,
+    filenames: Iterable<string>,
+    referencedFilenames: Set<string>
+  ) {
+    for (const filename of new Set(filenames)) {
+      if (!filename || referencedFilenames.has(filename)) continue
+      if (kind === 'skybox') {
+        await deleteUnusedSceneSkyboxUpload(filename)
+      } else {
+        await deleteUnusedRoomShellUpload(filename)
+      }
+    }
+  }
+
+  async function reconcileSceneAssetUploadsAfterSave(
+    previousScenes: GoonSceneMap | undefined,
+    persistedScenes: GoonSceneMap | undefined
+  ) {
+    for (const kind of ['skybox', 'roomShell'] as const) {
+      const previousFilenames = collectSceneAssetFilenames(kind, previousScenes)
+      const persistedFilenames = collectSceneAssetFilenames(kind, persistedScenes)
+      const trackedUploads = draftSceneAssetUploadFilenames[kind]
+      const cleanupCandidates = new Set<string>([...previousFilenames, ...trackedUploads])
+      trackedUploads.clear()
+      await deleteSceneAssetFilenamesNotIn(kind, cleanupCandidates, persistedFilenames)
+    }
+  }
+
+  function discardDraftSceneAssetUploads() {
+    for (const kind of ['skybox', 'roomShell'] as const) {
+      const trackedUploads = draftSceneAssetUploadFilenames[kind]
+      if (trackedUploads.size === 0) continue
+      const cleanupCandidates = [...trackedUploads]
+      const persistedFilenames = collectPersistedSceneAssetFilenames(kind)
+      trackedUploads.clear()
+      void deleteSceneAssetFilenamesNotIn(kind, cleanupCandidates, persistedFilenames)
+    }
+  }
+
+  function invalidateSceneAssetUploadTargets() {
+    sceneEditorSession += 1
+    sceneSkyboxUploadTarget = null
+    sceneUploadTargetId = null
+    sceneRoomShellUploadTarget = null
+    sceneRoomShellTargetId = null
+  }
+
+  function isSceneAssetUploadTargetActive(
+    target: SceneAssetUploadTarget | null
+  ): target is SceneAssetUploadTarget {
+    if (!target || target.session !== sceneEditorSession) return false
+    if (target.mode === 'create') {
+      return sceneEditorMode === 'create' && sceneEditorId === null
+    }
+    return (
+      sceneEditorMode === 'edit' &&
+      sceneEditorId === target.sceneId &&
+      Boolean(kitchenScenes[target.sceneId])
+    )
+  }
+
+  async function discardDetachedSceneAssetUpload(kind: SceneAssetKind, filename: string) {
+    draftSceneAssetUploadFilenames[kind].delete(filename)
+    const referencedFilenames = collectPersistedSceneAssetFilenames(kind)
+    for (const scene of Object.values(kitchenScenes ?? {})) {
+      const draftFilename = resolveSceneAssetFilename(scene, kind)
+      if (draftFilename) referencedFilenames.add(draftFilename)
+    }
+    const createDraftFilename = (
+      kind === 'skybox' ? newSceneSkybox?.filename : newSceneRoomShell?.filename
+    )?.trim()
+    if (createDraftFilename) referencedFilenames.add(createDraftFilename)
+    await deleteSceneAssetFilenamesNotIn(kind, [filename], referencedFilenames)
+  }
+
   function openSceneEditor(sceneId?: string) {
+    invalidateSceneAssetUploadTargets()
     activeTab = 'scenes'
     editorGoonId = null
+    scenePreviewBodyMode = 'proxy'
+    sceneProxyPoseId = 'stand'
     activeSceneEdit = null
     sceneUploadTargetId = null
+    sceneRoomShellTargetId = null
+    sceneWorldOpen = !sceneId
     roomBuilderOpen = false
     roomBuilderSurfaceOpen = null
     scenePropsOpen = false
@@ -9109,23 +10392,26 @@
     newSceneDescription = ''
     newSceneSkybox = null
     newSceneRoomShell = null
+    newScenePlacement = 'elevated'
+    newSceneGroundProjectionLine = DEFAULT_GROUND_PROJECTION_LINE
+    newSceneRoomShellTransform = normalizeRoomShellTransform()
+    newSceneAmbience = normalizeGoonSceneAmbience()
     resetKitchenPreview()
   }
 
   function closeSceneEditor() {
-    const currentSceneId = sceneEditorId
     cancelSceneEdit()
-    sceneUploadTargetId = null
+    invalidateSceneAssetUploadTargets()
+    sceneWorldOpen = false
     roomBuilderOpen = false
     roomBuilderSurfaceOpen = null
     scenePropsOpen = false
     sceneMarkersOpen = false
     sceneEditorMode = null
     sceneEditorId = null
-    if (currentSceneId) {
-      kitchenPreviewSceneId = currentSceneId
-      void ensureKitchenPreviewReady(currentSceneId)
-    }
+    scenePreviewBodyMode = 'proxy'
+    sceneProxyPoseId = 'stand'
+    resetKitchenPreview()
   }
 
   function cancelKitchenChanges() {
@@ -9142,12 +10428,22 @@
     newSceneDescription = ''
     newSceneSkybox = null
     newSceneRoomShell = null
+    newScenePlacement = 'elevated'
+    newSceneGroundProjectionLine = DEFAULT_GROUND_PROJECTION_LINE
+    newSceneRoomShellTransform = normalizeRoomShellTransform()
+    newSceneAmbience = normalizeGoonSceneAmbience()
     sceneUploadTargetId = null
+    sceneSkyboxUploadTarget = null
+    sceneRoomShellTargetId = null
+    sceneRoomShellUploadTarget = null
   }
 
   function discardSceneChanges() {
+    invalidateSceneAssetUploadTargets()
+    discardDraftSceneAssetUploads()
     applySceneStateFromSettings(goonsSettings)
     cancelSceneEdit()
+    sceneWorldOpen = sceneEditorMode === 'create'
     roomBuilderOpen = false
     roomBuilderSurfaceOpen = null
     scenePropsOpen = false
@@ -9169,7 +10465,9 @@
 
     const currentGoon = goons.find((entry) => entry.id === editorGoonId)
     if (currentGoon) {
+      void discardFacialArtworkDraftUploads()
       openCueEditor(currentGoon)
+      restorePackageOwnedEditorDrafts(currentGoon)
       return
     }
 
@@ -9212,6 +10510,14 @@
   function sanitizeSceneDefinition(scene: GoonSceneDefinition): GoonSceneDefinition {
     return {
       ...scene,
+      scenePlacement: resolveGoonScenePlacement(scene),
+      groundProjectionLine: normalizeGroundProjectionLine(scene.groundProjectionLine),
+      roomShellTransform: scene.roomShell
+        ? normalizeRoomShellTransform(scene.roomShellTransform)
+        : undefined,
+      cameraBoundary: scene.roomShell && !scene.roomShellBuilder
+        ? normalizeRoomCameraBoundary(scene.cameraBoundary) ?? undefined
+        : undefined,
       markers: sanitizeSceneMarkers(scene.markers)
     }
   }
@@ -9323,6 +10629,121 @@
     })
   }
 
+  function updateScenePlacement(sceneId: string, placement: GoonScenePlacement) {
+    const scene = kitchenScenes[sceneId]
+    if (!scene) return
+
+    const patch: Partial<GoonSceneDefinition> = { scenePlacement: placement }
+    if (scene.roomShellBuilder) {
+      const builder = normalizeRoomShellBuilder(scene.roomShellBuilder)
+      patch.roomShellBuilder = {
+        ...builder,
+        exteriorAprons: builder.exteriorAprons
+          ? Object.fromEntries(
+              Object.entries(builder.exteriorAprons).map(([key, apron]) => [
+                key,
+                {
+                  ...apron,
+                  enabled: false
+                }
+              ])
+            ) as GoonRoomShellBuilder['exteriorAprons']
+          : undefined
+      }
+    }
+
+    updateScene(sceneId, patch)
+  }
+
+  function updateSceneGroundProjectionLine(sceneId: string, value: number) {
+    updateScene(sceneId, { groundProjectionLine: normalizeGroundProjectionLine(value) })
+  }
+
+  function updateRoomShellTransform(
+    sceneId: string,
+    patch: Partial<GoonSceneRoomShellTransform>
+  ) {
+    const scene = kitchenScenes[sceneId]
+    if (!scene?.roomShell) return
+    updateScene(sceneId, {
+      roomShellTransform: normalizeRoomShellTransform({
+        ...scene.roomShellTransform,
+        ...patch
+      })
+    })
+  }
+
+  function updateNewRoomShellTransform(patch: Partial<GoonSceneRoomShellTransform>) {
+    newSceneRoomShellTransform = normalizeRoomShellTransform({
+      ...newSceneRoomShellTransform,
+      ...patch
+    })
+  }
+
+  function updateRoomCameraBoundary(sceneId: string, boundary: GoonSceneCameraBoundary | null) {
+    updateScene(sceneId, {
+      cameraBoundary: normalizeRoomCameraBoundary(boundary) ?? undefined
+    })
+  }
+
+  async function suggestRoomCameraBoundary(sceneId: string) {
+    const engine = await ensureKitchenPreviewReady(sceneId)
+    const boundary = engine?.getSuggestedRoomCameraBoundary() ?? null
+    if (!boundary) {
+      toast.error('Batshit could not measure this Room Shell. Enter the room boundary manually.')
+      return
+    }
+    updateRoomCameraBoundary(sceneId, boundary)
+    toast.success('Indoor Camera boundary fitted to the Room Shell. Adjust it if needed.')
+  }
+
+  async function alignRoomShellFloor(sceneId: string) {
+    const scene = kitchenScenes[sceneId]
+    if (!scene?.roomShell?.url || scene.roomShellBuilder) {
+      toast.error('Switch Room Builder to Uploaded GLB before aligning its floor.')
+      return
+    }
+
+    const engine = await ensureKitchenPreviewReady(sceneId)
+    const delta = engine?.getRoomShellFloorAlignmentDelta() ?? null
+    if (delta === null || !Number.isFinite(delta)) {
+      toast.error('Batshit could not find a walkable floor near the Goon. Adjust Y Offset manually.')
+      return
+    }
+
+    const transform = normalizeRoomShellTransform(scene.roomShellTransform)
+    if (Math.abs(delta) < 0.001) {
+      toast.success('The detected Room Shell floor is already aligned.')
+      return
+    }
+    updateRoomShellTransform(sceneId, {
+      position: [
+        transform.position[0],
+        Math.round((transform.position[1] + delta) * 1000) / 1000,
+        transform.position[2]
+      ]
+    })
+    toast.success('Aligned the detected Room Shell floor to the Goon stage.')
+  }
+
+  function updateSceneAmbience(sceneId: string, patch: Partial<GoonSceneAmbience>) {
+    const scene = kitchenScenes[sceneId]
+    if (!scene) return
+    updateScene(sceneId, {
+      ambience: normalizeGoonSceneAmbience({
+        ...(scene.ambience ?? {}),
+        ...patch
+      })
+    })
+  }
+
+  function updateNewSceneAmbience(patch: Partial<GoonSceneAmbience>) {
+    newSceneAmbience = normalizeGoonSceneAmbience({
+      ...newSceneAmbience,
+      ...patch
+    })
+  }
+
   function resolveRoomTexture(kind: GoonRoomTextureKind, filename?: string) {
     if (!filename) return undefined
     return (kitchenRoomTextures[kind] ?? []).find((entry) => entry.filename === filename)
@@ -9396,21 +10817,25 @@
   async function handleSceneSelection(event: Event) {
     const input = event.currentTarget as HTMLInputElement
     const file = input.files?.[0] || null
+    const uploadTarget = sceneSkyboxUploadTarget
     if (!file) {
       sceneUploadTargetId = null
+      sceneSkyboxUploadTarget = null
       return
     }
     sceneUploadBusy = true
     try {
+      if (!isSceneAssetUploadTargetActive(uploadTarget)) return
       const fileInfo = await uploadGoonSceneSkybox(file)
-      if (sceneUploadTargetId) {
-        const targetSceneId = sceneUploadTargetId
-        const current = kitchenScenes[targetSceneId]
-        if (!current) {
-          throw new Error('Scene no longer exists.')
-        }
-        const previousFilename = current?.skybox?.filename
+      draftSceneAssetUploadFilenames.skybox.add(fileInfo.filename)
 
+      if (!isSceneAssetUploadTargetActive(uploadTarget)) {
+        await discardDetachedSceneAssetUpload('skybox', fileInfo.filename)
+        return
+      }
+
+      if (uploadTarget.mode === 'edit') {
+        const targetSceneId = uploadTarget.sceneId
         updateScene(targetSceneId, {
           skybox: {
             ...fileInfo,
@@ -9418,16 +10843,6 @@
             projection: 'equirectangular'
           }
         })
-
-        if (previousFilename && previousFilename !== fileInfo.filename) {
-          const stillUsed = Object.values(kitchenScenes).some(
-            (scene) => scene.skybox?.filename === previousFilename
-          )
-          if (!stillUsed) {
-            await deleteUnusedSceneSkyboxUpload(previousFilename)
-          }
-        }
-
         toast.success('Skybox updated')
       } else {
         newSceneSkybox = fileInfo
@@ -9436,7 +10851,10 @@
     } catch (error: any) {
       toast.error(error?.message || 'Upload failed')
     } finally {
-      sceneUploadTargetId = null
+      if (sceneSkyboxUploadTarget === uploadTarget) {
+        sceneUploadTargetId = null
+        sceneSkyboxUploadTarget = null
+      }
       sceneUploadBusy = false
       if (sceneUploadInput) sceneUploadInput.value = ''
     }
@@ -9444,27 +10862,40 @@
 
   function requestSceneSkyboxUpload(sceneId?: string) {
     sceneUploadTargetId = sceneId ?? null
+    sceneSkyboxUploadTarget = sceneId
+      ? { session: sceneEditorSession, mode: 'edit', sceneId }
+      : { session: sceneEditorSession, mode: 'create' }
     sceneUploadInput?.click()
   }
 
   async function handleRoomShellSelection(event: Event) {
     const input = event.currentTarget as HTMLInputElement
     const file = input.files?.[0] || null
+    const uploadTarget = sceneRoomShellUploadTarget
     if (!file) {
       sceneRoomShellTargetId = null
+      sceneRoomShellUploadTarget = null
       return
     }
     sceneRoomShellBusy = true
     try {
       const allowed = await enforceModelTriangleLimit(file, 'shell')
       if (!allowed) return
+      if (!isSceneAssetUploadTargetActive(uploadTarget)) return
       const fileInfo = await uploadGoonRoomShell(file)
-      if (sceneRoomShellTargetId) {
-        updateScene(sceneRoomShellTargetId, {
+      draftSceneAssetUploadFilenames.roomShell.add(fileInfo.filename)
+
+      if (!isSceneAssetUploadTargetActive(uploadTarget)) {
+        await discardDetachedSceneAssetUpload('roomShell', fileInfo.filename)
+        return
+      }
+
+      if (uploadTarget.mode === 'edit') {
+        const targetSceneId = uploadTarget.sceneId
+        updateScene(targetSceneId, {
           roomShell: { ...fileInfo, kind: 'room_shell' }
         })
-        sceneRoomShellTargetId = null
-        toast.success('Room shell uploaded')
+        toast.success('Room shell updated')
       } else {
         newSceneRoomShell = fileInfo
         toast.success('Room shell uploaded')
@@ -9472,6 +10903,10 @@
     } catch (error: any) {
       toast.error(error?.message || 'Upload failed')
     } finally {
+      if (sceneRoomShellUploadTarget === uploadTarget) {
+        sceneRoomShellTargetId = null
+        sceneRoomShellUploadTarget = null
+      }
       sceneRoomShellBusy = false
       if (sceneRoomShellInput) sceneRoomShellInput.value = ''
     }
@@ -9479,6 +10914,9 @@
 
   function requestRoomShellUpload(sceneId?: string) {
     sceneRoomShellTargetId = sceneId ?? null
+    sceneRoomShellUploadTarget = sceneId
+      ? { session: sceneEditorSession, mode: 'edit', sceneId }
+      : { session: sceneEditorSession, mode: 'create' }
     sceneRoomShellInput?.click()
   }
 
@@ -9659,6 +11097,10 @@
       toast.error('Standing uses open floor space and does not use scene markers.')
       return
     }
+    if (scenePreviewUsingProxy) {
+      toast.error('Preview with active Goon to place markers.')
+      return
+    }
     const motionNames = resolveMarkerMotionNamesForPosture(posture, kitchenPreviewGoon)
     if (motionNames.length === 0) {
       toast.error(`Add a ${getPostureLabel(posture)} Motion first.`)
@@ -9668,7 +11110,7 @@
     if (!scene) return
     const engine = await ensureKitchenPreviewReady(sceneId)
     if (!engine) {
-      toast.error('Select a Goon in Scene Preview to place markers.')
+      toast.error('Preview with active Goon to place markers.')
       return
     }
     const markers = scene.markers ?? {}
@@ -9745,10 +11187,14 @@
       toast.error('This prop binding is locked. Delete the Marker and start over to change it.')
       return
     }
+    if (scenePreviewUsingProxy) {
+      toast.error('Preview with active Goon to rebind markers to props.')
+      return
+    }
 
     const engine = await ensureKitchenPreviewReady(sceneId)
     if (!engine) {
-      toast.error('Select a Goon in Scene Preview to rebind markers to props.')
+      toast.error('Preview with active Goon to rebind markers to props.')
       return
     }
 
@@ -9786,7 +11232,7 @@
     }
     const engine = await ensureKitchenPreviewReady(sceneId)
     if (!engine) {
-      toast.error('Select a Goon in Scene Preview to adjust props.')
+      toast.error('Scene Preview is not ready.')
       return
     }
     const ok = await engine.setEditTarget({ type: 'prop', id: propId })
@@ -9926,7 +11372,13 @@
             projection: 'equirectangular'
           }
         : undefined,
-      roomShell: newSceneRoomShell ? { ...newSceneRoomShell, kind: 'room_shell' } : undefined
+      scenePlacement: newScenePlacement,
+      groundProjectionLine: newSceneGroundProjectionLine,
+      roomShell: newSceneRoomShell ? { ...newSceneRoomShell, kind: 'room_shell' } : undefined,
+      roomShellTransform: newSceneRoomShell
+        ? normalizeRoomShellTransform(newSceneRoomShellTransform)
+        : undefined,
+      ambience: normalizeGoonSceneAmbience(newSceneAmbience)
     }
     kitchenScenes = {
       ...(kitchenScenes ?? {}),
@@ -9968,26 +11420,6 @@
       kitchenPreviewSceneId = null
     }
 
-    const skyboxFilename = current.skybox?.filename
-    if (skyboxFilename) {
-      const stillUsed = Object.values(next).some(
-        (scene) => scene.skybox?.filename === skyboxFilename
-      )
-      if (!stillUsed) {
-        await deleteUnusedSceneSkyboxUpload(skyboxFilename)
-      }
-    }
-
-    const roomShellFilename = current.roomShell?.filename
-    if (roomShellFilename) {
-      const stillUsed = Object.values(next).some(
-        (scene) => scene.roomShell?.filename === roomShellFilename
-      )
-      if (!stillUsed) {
-        await deleteUnusedRoomShellUpload(roomShellFilename)
-      }
-    }
-
     const propFiles = current.props ?? []
     for (const prop of propFiles) {
       const filename = prop.fileRef?.filename
@@ -10014,17 +11446,10 @@
     await removeScene(target.id)
   }
 
-  async function clearRoomShell(sceneId: string) {
+  function clearRoomShell(sceneId: string) {
     const current = kitchenScenes[sceneId]
     if (!current?.roomShell) return
-    const filename = current.roomShell.filename
-    updateScene(sceneId, { roomShell: undefined })
-    const stillUsed = Object.values(kitchenScenes).some(
-      (scene) => scene.roomShell?.filename === filename
-    )
-    if (!stillUsed) {
-      await deleteUnusedRoomShellUpload(filename)
-    }
+    updateScene(sceneId, { roomShell: undefined, roomShellTransform: undefined })
   }
 
   function buildClosetId(name: string) {
@@ -10199,9 +11624,84 @@
       const stagedPendingVrm = editorPendingVrmFile ?? currentGoon?.files?.vrmPending ?? null
       const stagedVrmReport = editorPendingVrmUpdate ?? currentGoon?.vrmUpdate ?? null
       const stagedAdvancedPackage = editorPendingAdvancedPackageUpdate
+      const stagedCustomPackage = editorPendingCustomPackageUpdate
+      const legacyBodyDials = (
+        currentGoon as (GoonRecord & { bodyDials?: Record<string, number> | null }) | null
+      )?.bodyDials
+      const hasLegacyBodyDials = Boolean(
+        legacyBodyDials && Object.keys(legacyBodyDials).length > 0
+      )
       const advancedPackageDraft = stagedAdvancedPackage
         ? buildAdvancedPackageUpdateDraft(stagedAdvancedPackage)
         : null
+      const stagedCustomManifest =
+        currentGoon?.customAvatar && stagedCustomPackage
+          ? await loadCustomAvatarManifest(stagedCustomPackage.manifest)
+          : null
+      let appearanceDialsForSave =
+        editorAppearanceDialsState ?? currentGoon?.appearanceDials ?? null
+      let appearanceDialsResetForPackage = false
+      if (currentGoon?.customAvatar && stagedCustomPackage && stagedCustomManifest) {
+        const nextAppearanceManifest = parseAppearanceDialsManifest(stagedCustomManifest)
+        if (!nextAppearanceManifest) {
+          appearanceDialsResetForPackage = Boolean(appearanceDialsForSave)
+          appearanceDialsForSave = null
+        } else {
+          const reconciliation = reconcileAppearanceDialValues(
+            nextAppearanceManifest,
+            appearanceDialsForSave
+          )
+          appearanceDialsForSave = reconciliation.state
+          appearanceDialsResetForPackage = reconciliation.incompatible
+        }
+        if (hasLegacyBodyDials) {
+          appearanceDialsResetForPackage = true
+        }
+      }
+      let facialArtworkForSave =
+        editorFacialArtworkHydrated && editorFacialArtworkDefinition
+          ? resolveFacialArtworkDraftForSave()
+          : currentGoon?.facialArtwork ?? null
+      let facialArtworkResetForPackage = false
+      if (currentGoon?.customAvatar && stagedCustomPackage && stagedCustomManifest) {
+        if (
+          stagedCustomManifest.facialArtwork === undefined ||
+          stagedCustomManifest.facialArtwork === null
+        ) {
+          facialArtworkResetForPackage = Boolean(facialArtworkForSave)
+          facialArtworkForSave = null
+        } else {
+          const nextDefinition = parseFacialArtworkDefinition(stagedCustomManifest.facialArtwork)
+          const reconciliation = reconcileFacialArtworkState(
+            nextDefinition,
+            facialArtworkForSave
+          )
+          facialArtworkForSave = reconciliation.state
+          facialArtworkResetForPackage = reconciliation.incompatible
+        }
+      }
+      let eyeAppearanceForSave =
+        editorFacialArtworkHydrated && editorEyeAppearanceDefinition
+          ? resolveEyeAppearanceDraftForSave()
+          : currentGoon?.eyeAppearance ?? null
+      let eyeAppearanceResetForPackage = false
+      if (currentGoon?.customAvatar && stagedCustomPackage && stagedCustomManifest) {
+        if (
+          stagedCustomManifest.eyeAppearance === undefined ||
+          stagedCustomManifest.eyeAppearance === null
+        ) {
+          eyeAppearanceResetForPackage = Boolean(eyeAppearanceForSave)
+          eyeAppearanceForSave = null
+        } else {
+          const nextDefinition = parseEyeAppearanceDefinition(stagedCustomManifest.eyeAppearance)
+          const reconciliation = reconcileEyeAppearanceState(
+            nextDefinition,
+            eyeAppearanceForSave
+          )
+          eyeAppearanceForSave = reconciliation.state
+          eyeAppearanceResetForPackage = reconciliation.incompatible
+        }
+      }
       const nextName = editorName.trim() || currentGoon?.name || 'Goon'
       const nextDescription = editorDescription?.trim() ?? ''
       const moodOptions = Object.values(editorEnabledCueMap)
@@ -10283,6 +11783,49 @@
         closet: advancedPackageDraft?.closet ?? buildEditorClosetPayload(),
         closetAssignments: advancedPackageDraft?.closetAssignments ?? sanitizeClosetAssignments(closetAssignments)
       }
+      if (
+        editorGoonKind === 'custom' &&
+        (stagedCustomPackage || (editorAppearanceDialsManifest && editorAppearanceDialsState))
+      ) {
+        updates.appearanceDials = appearanceDialsForSave
+      }
+      if (
+        editorGoonKind === 'custom' &&
+        (stagedCustomPackage ||
+          (editorFacialArtworkHydrated && editorFacialArtworkDefinition))
+      ) {
+        updates.facialArtwork = facialArtworkForSave
+      }
+      if (
+        editorGoonKind === 'custom' &&
+        (stagedCustomPackage ||
+          (editorFacialArtworkHydrated && editorEyeAppearanceDefinition))
+      ) {
+        updates.eyeAppearance = eyeAppearanceForSave
+      }
+      if (stagedCustomPackage && hasLegacyBodyDials) {
+        const cleanBreakUpdates = updates as Partial<GoonRecord> & { bodyDials?: null }
+        cleanBreakUpdates.bodyDials = null
+      }
+      if (currentGoon?.customAvatar && stagedCustomPackage) {
+        updates.customAvatar = {
+          ...currentGoon.customAvatar,
+          package: stagedCustomPackage.package,
+          model: stagedCustomPackage.model,
+          manifest: stagedCustomPackage.manifest,
+          backup: {
+            package: currentGoon.customAvatar.package,
+            model: currentGoon.customAvatar.model,
+            manifest: currentGoon.customAvatar.manifest
+          },
+          pending: undefined,
+          manifestSummary: stagedCustomPackage.manifestSummary ?? undefined
+        }
+        updates.compatibility = {
+          tier: 'pending',
+          issues: ['Awaiting Custom avatar analysis']
+        }
+      }
       if (currentGoon?.guidedAvatar) {
         if (stagedAdvancedPackage && advancedPackageDraft) {
           updates.files = {
@@ -10342,7 +11885,11 @@
         }
         updates.vrmUpdate = stagedVrmReport ?? null
       }
-      await updateGoonRecord(editorGoonId, updates)
+      const savedGoon = await updateGoonRecord(editorGoonId, updates)
+      await reconcileFacialArtworkUploadsAfterSave(
+        currentGoon?.facialArtwork,
+        savedGoon.facialArtwork
+      )
       editorEmojiMap = filteredEmojiMap
       editorEmoteEmojiDrafts = buildEmoteEmojiDrafts(editorCueMap, filteredEmojiMap)
       editorPendingVrmFile = null
@@ -10358,7 +11905,17 @@
         closetAssignments = advancedPackageDraft.closetAssignments
       }
       editorPendingAdvancedPackageUpdate = null
+      editorPendingCustomPackageUpdate = null
       editorDirty = false
+      if (appearanceDialsResetForPackage) {
+        toast.warning('Appearance Dials reset because the new package uses a different definition.')
+      }
+      if (facialArtworkResetForPackage) {
+        toast.warning('Facial Artwork reset because the new package uses a different definition.')
+      }
+      if (eyeAppearanceResetForPackage) {
+        toast.warning('Eye Appearance reset because the new package uses a different definition.')
+      }
       if (options.successMessage !== null) {
         toast.success(options.successMessage ?? 'Goon settings updated')
       }
@@ -10393,8 +11950,8 @@
           eyeContact: buildKitchenEyeContactSettings()
         }
       }
-      await persistGoonsSettings(nextSettings)
-      applyKitchenStateFromSettings(nextSettings)
+      const persistedSettings = await persistGoonsSettings(nextSettings)
+      applyKitchenStateFromSettings(persistedSettings)
       kitchenEmojiMap = filteredEmojiMap
       kitchenEmoteEmojiDrafts = buildEmoteEmojiDrafts(kitchenCueMap, filteredEmojiMap)
       toast.success('Goon Kitchen updated')
@@ -10415,8 +11972,8 @@
         ...goonsSettings,
         globalCloset: sanitizedGlobalCloset
       }
-      await persistGoonsSettings(nextSettings)
-      applyClosetStateFromSettings(nextSettings)
+      const persistedSettings = await persistGoonsSettings(nextSettings)
+      applyClosetStateFromSettings(persistedSettings)
       toast.success('Closet updated')
       return true
     } catch (error: any) {
@@ -10438,6 +11995,7 @@
     }
     sceneSaving = true
     try {
+      const previousScenes = cloneSceneMap(goonsSettings?.kitchen?.scenes)
       const restKitchen = { ...(goonsSettings?.kitchen ?? {}) }
       delete (restKitchen as Record<string, unknown>).fallbackPoses
       const finalizedScenes = Object.fromEntries(
@@ -10474,9 +12032,18 @@
           roomTextures: kitchenRoomTextures
         }
       }
-      await persistGoonsSettings(nextSettings)
-      applySceneStateFromSettings(nextSettings)
+      const persistedSettings = await persistGoonsSettings(nextSettings)
+      applySceneStateFromSettings(persistedSettings)
       toast.success(sceneEditorMode ? 'Scene updated' : 'Scenes updated')
+      try {
+        await reconcileSceneAssetUploadsAfterSave(
+          previousScenes,
+          persistedSettings?.kitchen?.scenes
+        )
+      } catch (cleanupError) {
+        console.warn('[GoonsSettings] Scene saved, but scene asset cleanup failed:', cleanupError)
+        toast.warning('Scene saved, but an unused Skybox or Room Shell file could not be cleaned up.')
+      }
       return true
     } catch (error: any) {
       toast.error(error?.message || 'Failed to update Scenes')
@@ -10541,17 +12108,23 @@
       if (intent.nextTab !== 'closet') {
         cancelClosetItemEditing()
       }
+      const wasEditingGoon = Boolean(editorGoonId)
       if (editorGoonId) {
         editorGoonId = null
       } else if (sceneEditorMode) {
         closeSceneEditor()
       }
+      if (wasEditingGoon) {
+        resetPreview('top-level-tab-change')
+      }
       activeTab = intent.nextTab
+      releaseInactivePreviewEngines('top-level-tab-change')
       return
     }
 
     if (intent.type === 'close-editor') {
       editorGoonId = null
+      resetPreview('close-editor')
       return
     }
 
@@ -10600,6 +12173,7 @@
       cancelClosetItemEditing()
     }
     activeTab = nextTab
+    releaseInactivePreviewEngines('top-level-tab-change')
   }
 
   async function saveAndContinueExit() {
@@ -10620,6 +12194,7 @@
     if (editorHasUnsavedChanges) {
       discardCueEditorChanges()
       editorGoonId = null
+      resetPreview('discard-and-continue-exit')
     } else if (sceneCreateDirty || sceneDirty) {
       discardSceneChanges()
     } else if (motionsDirty) {
@@ -10951,6 +12526,8 @@
   })
 
   onDestroy(() => {
+    invalidateSceneAssetUploadTargets()
+    discardDraftSceneAssetUploads()
     onUnsavedStateChange(null)
   })
 </script>
@@ -11086,7 +12663,7 @@
               <input
                 class="hidden"
                 type="file"
-                accept={fbxInstallStatus?.installed ? '.vrma,.fbx' : '.vrma'}
+                accept={fbxInstallStatus?.installed ? '.vrma,.glb,.gltf,.fbx' : '.vrma,.glb,.gltf'}
                 multiple
                 bind:this={libraryUploadInput}
                 onchange={handleLibrarySelection}
@@ -11096,8 +12673,8 @@
                   {libraryUploadBusy
                     ? 'Uploading…'
                     : fbxInstallStatus?.installed
-                      ? 'Upload VRMA / FBX'
-                      : 'Upload VRMA'}
+                      ? 'Upload VRMA / GLB / FBX'
+                      : 'Upload VRMA / GLB'}
                 </Button>
                 <Button
                   variant="outline"
@@ -11145,7 +12722,7 @@
                 </div>
               </div>
 
-              {#if sortedVrmaLibrary.length > 0}
+              {#if sortedMotionEntries.length > 0}
                 <div class="flex flex-wrap items-center gap-2">
                   {#if animationTagOptions.length > 0 || untaggedCount > 0}
                     <button
@@ -11180,7 +12757,42 @@
                       </button>
                     {/each}
                   {/if}
-                  <div class="ml-auto">
+                  <div class="ml-auto flex items-center gap-2">
+                    {#if motionLibraryEntries.some((entry) => entry.glb)}
+                      <div class="flex items-center gap-1.5">
+                        <Label.Root class="batshit-settings-form-label">GLB Preview Body</Label.Root>
+                        <SettingsInfoMenu ariaLabel="About GLB Preview Body" contentClass="w-80">
+                          <p>
+                            GLB motions preview on the built-in Batshit dummy, which uses the
+                            first-party Goon skeleton.
+                          </p>
+                          <p>
+                            If your GLB motions were made for a different skeleton, pick one of
+                            your own Advanced/GLB Goons here so previews bind to the right bones.
+                          </p>
+                        </SettingsInfoMenu>
+                        <Select.Root
+                          type="single"
+                          value={glbPreviewGoonId}
+                          onValueChange={(value: string) => {
+                            void persistGlbPreviewGoonSelection(value)
+                          }}
+                        >
+                          <Select.Trigger class="batshit-settings-select-compact w-44">
+                            {glbPreviewGoonId
+                              ? glbPreviewGoonOptions.find((entry) => entry.id === glbPreviewGoonId)
+                                  ?.name ?? 'Batshit Dummy'
+                              : 'Batshit Dummy'}
+                          </Select.Trigger>
+                          <Select.Content>
+                            <Select.Item value="">Batshit Dummy</Select.Item>
+                            {#each glbPreviewGoonOptions as goonOption (goonOption.id)}
+                              <Select.Item value={goonOption.id}>{goonOption.name}</Select.Item>
+                            {/each}
+                          </Select.Content>
+                        </Select.Root>
+                      </div>
+                    {/if}
                     <DropdownMenu.Root>
                       <DropdownMenu.Trigger
                         class="batshit-settings-icon-trigger"
@@ -11210,7 +12822,7 @@
                 </div>
               {/if}
 
-              {#if filteredVrmaLibrary.length === 0}
+              {#if filteredMotionEntries.length === 0}
                 <p class="batshit-settings-form-label">No motions match this filter.</p>
               {/if}
             </div>
@@ -11380,69 +12992,123 @@
                     {/if}
                   </div>
                   <Collapsible.Content class="pt-3">
-                    {#if section.files.length === 0}
+                    {#if section.entries.length === 0}
                       <p class="batshit-settings-form-label">
                         No motions currently assigned to this posture.
                       </p>
                     {:else}
                       <div class="space-y-3">
-                        {#each section.files as animationFile, motionIndex}
-                          {@const animationName = resolveAnimationName(animationFile)}
-                          {@const motionFilename = animationFile.filename ?? ''}
-                          {@const previewId = motionFilename || animationFile.url || animationName}
-                          {@const displayName =
-                            animationDisplayNameInputs[motionFilename] ?? resolveMotionDisplayName(animationFile)}
-                          {@const tagValue =
-                            animationTagInputs[motionFilename] ?? (animationFile.tags ?? []).join(', ')}
-                          {@const postureValue =
-                            animationPostureInputs[motionFilename] ??
-                            animationFile.motionMeta?.posture ??
-                            ''}
-                          {@const playbackValue =
-                            animationPlaybackInputs[motionFilename] ??
-                            animationFile.motionMeta?.playback ??
-                            ''}
-                          {@const eyeContactValue =
-                            animationEyeContactInputs[motionFilename] ??
-                            animationFile.motionMeta?.eyeContact ??
-                            ''}
-                          {@const currentTags = normalizeTagInput(tagValue)}
+                        {#each section.entries as motionEntry, motionIndex (motionEntry.name)}
+                          {@const animationName = motionEntry.name}
+                          {@const previewId = motionEntry.name}
+                          {@const entryDraft = resolveMotionEntryDraft(motionEntry)}
+                          {@const displayName = entryDraft.displayName}
+                          {@const postureValue = entryDraft.posture}
+                          {@const playbackValue = entryDraft.playback}
+                          {@const eyeContactValue = entryDraft.eyeContact}
+                          {@const currentTags = normalizeTagInput(entryDraft.tags)}
+                          {@const previewLane = resolveMotionEntryPreviewLane(motionEntry)}
+                          {@const previewFile = resolveMotionEntryPreviewFile(motionEntry)}
+                          {@const motionThumbTarget = resolveMotionThumbTarget(previewFile)}
+                          {@const isPairedMotion = Boolean(motionEntry.vrma && motionEntry.glb)}
                           <div class="batshit-goon-motion-card rounded-md border p-3">
                             <div class="batshit-goon-motion-card-body">
-                              <AnimationPreviewThumb
-                                goonUrl={thumbnailPreviewGoonUrl}
-                                animationFile={animationFile}
-                                animationName={animationName}
-                                previewId={previewId}
-                                active={activePreviewId === previewId}
-                                containerOpen={sectionOpen}
-                                warmOnOpen={sectionOpen && motionIndex < 5}
-                                onRequestPlay={() => {
-                                  void triggerMotionLibraryPreview(animationFile, animationName, previewId)
-                                }}
-                              />
+                              <div class="flex shrink-0 flex-col items-center gap-1.5">
+                                <AnimationPreviewThumb
+                                  previewTarget={motionThumbTarget.target}
+                                  previewUnavailableReason={motionThumbTarget.unavailableReason}
+                                  animationFile={previewFile}
+                                  animationName={animationName}
+                                  previewId={previewId}
+                                  active={activePreviewId === previewId}
+                                  containerOpen={sectionOpen}
+                                  warmOnOpen={sectionOpen && motionIndex < 5}
+                                  onRequestPlay={() => {
+                                    void triggerMotionLibraryPreview(previewFile, animationName, previewId)
+                                  }}
+                                />
+                                {#if isPairedMotion}
+                                  <div
+                                    class="batshit-goon-motion-lane-toggle"
+                                    role="group"
+                                    aria-label={`Preview format for ${displayName}`}
+                                  >
+                                    <button
+                                      type="button"
+                                      class={`batshit-goon-motion-lane-toggle-option ${previewLane === 'vrm' ? 'is-selected' : ''}`}
+                                      title="Preview the VRMA version (VRM Goons)"
+                                      onclick={() => setMotionEntryPreviewLane(motionEntry, 'vrm')}
+                                    >
+                                      VRMA
+                                    </button>
+                                    <button
+                                      type="button"
+                                      class={`batshit-goon-motion-lane-toggle-option ${previewLane === 'glb' ? 'is-selected' : ''}`}
+                                      title="Preview the GLB version (Advanced/GLB Goons)"
+                                      onclick={() => setMotionEntryPreviewLane(motionEntry, 'glb')}
+                                    >
+                                      GLB
+                                    </button>
+                                  </div>
+                                {/if}
+                              </div>
                               <div class="min-w-0 flex-1 space-y-3">
                                 <div class="flex items-start justify-between gap-2">
                                   <div class="min-w-0 flex-1 space-y-1">
                                     <div class="flex items-center gap-1.5">
                                       <Label.Root class="batshit-settings-form-label">Name</Label.Root>
+                                      {#each motionEntry.files as versionFile (versionFile.filename || versionFile.url)}
+                                        {@const versionBadge = getMotionLaneBadge(resolveGoonMotionLane(versionFile))}
+                                        <Badge
+                                          variant="outline"
+                                          class="batshit-settings-child-label"
+                                          title={versionBadge.title}
+                                        >
+                                          {versionBadge.label}
+                                        </Badge>
+                                      {/each}
                                       <SettingsInfoMenu
-                                        ariaLabel={`About ${displayName} source file`}
-                                        contentClass="w-72"
+                                        ariaLabel={`About ${displayName} source files`}
+                                        contentClass="w-80"
                                       >
-                                        <p>
-                                          <strong>File Name:</strong> {resolveMotionSourceFilename(animationFile)}
-                                        </p>
+                                        {#if isPairedMotion}
+                                          <p>
+                                            This Motion has both formats. Each Goon plays the version
+                                            its rig understands, and name, tags, and settings stay
+                                            shared between them.
+                                          </p>
+                                        {/if}
+                                        {#each motionEntry.files as versionFile (versionFile.filename || versionFile.url)}
+                                          {@const versionBadge = getMotionLaneBadge(resolveGoonMotionLane(versionFile))}
+                                          <div class="flex items-center justify-between gap-2">
+                                            <p class="min-w-0 break-all">
+                                              <strong>{versionBadge.label}:</strong>
+                                              {resolveMotionSourceFilename(versionFile)}
+                                            </p>
+                                            {#if motionEntry.files.length > 1}
+                                              <Button
+                                                variant="ghost"
+                                                size="icon"
+                                                class="is-danger shrink-0"
+                                                aria-label={`Remove the ${versionBadge.label} version of ${displayName}`}
+                                                title={`Remove ${versionBadge.label} version`}
+                                                onclick={() => handleMotionVersionDelete(motionEntry, versionFile)}
+                                                disabled={libraryUploadBusy}
+                                              >
+                                                <Trash2  />
+                                              </Button>
+                                            {/if}
+                                          </div>
+                                        {/each}
                                       </SettingsInfoMenu>
                                     </div>
                                     <Input
                                       class="batshit-settings-grid-control"
                                       value={displayName}
                                       oninput={(event) => {
-                                        animationDisplayNameInputs = {
-                                          ...animationDisplayNameInputs,
-                                          [motionFilename]: (event.currentTarget as HTMLInputElement).value
-                                        }
+                                        stageMotionEntryDraft(motionEntry, {
+                                          displayName: (event.currentTarget as HTMLInputElement).value
+                                        })
                                       }}
                                     />
                                   </div>
@@ -11451,8 +13117,8 @@
                                     size="icon"
                                     class="is-danger"
                                     aria-label={`Delete ${displayName}`}
-                                    title="Delete Motion"
-                                    onclick={() => handleLibraryDelete(animationFile.filename)}
+                                    title={isPairedMotion ? 'Delete Motion (both formats)' : 'Delete Motion'}
+                                    onclick={() => handleMotionEntryDelete(motionEntry)}
                                     disabled={libraryUploadBusy}
                                   >
                                     <Trash2  />
@@ -11467,7 +13133,7 @@
                                         type="button"
                                         class="batshit-goon-tag-remove"
                                         aria-label={`Remove ${tag} tag`}
-                                        onclick={() => removeAnimationTag(motionFilename, tag)}
+                                        onclick={() => removeMotionEntryTag(motionEntry, tag)}
                                       >
                                         <X aria-hidden="true" />
                                       </button>
@@ -11475,7 +13141,7 @@
                                   {/each}
                                   <DropdownMenu.Root
                                     onOpenChange={(open) => {
-                                      activeAnimationTagMenu = open ? motionFilename : activeAnimationTagMenu === motionFilename ? null : activeAnimationTagMenu
+                                      activeAnimationTagMenu = open ? motionEntry.name : activeAnimationTagMenu === motionEntry.name ? null : activeAnimationTagMenu
                                       if (!open) {
                                         newAnimationTagDraft = ''
                                       }
@@ -11489,7 +13155,7 @@
                                     </DropdownMenu.Trigger>
                                     <DropdownMenu.Content align="start" class="w-56">
                                       {#each getAvailableAnimationTagChoices(currentTags) as tag}
-                                        <DropdownMenu.Item onSelect={() => addAnimationTag(motionFilename, tag)}>
+                                        <DropdownMenu.Item onSelect={() => addMotionEntryTag(motionEntry, tag)}>
                                           {tag}
                                         </DropdownMenu.Item>
                                       {/each}
@@ -11502,21 +13168,21 @@
                                         <Input
                                           class="batshit-settings-grid-control"
                                           placeholder="New tag"
-                                          value={activeAnimationTagMenu === motionFilename ? newAnimationTagDraft : ''}
+                                          value={activeAnimationTagMenu === motionEntry.name ? newAnimationTagDraft : ''}
                                           oninput={(event) => {
                                             newAnimationTagDraft = (event.currentTarget as HTMLInputElement).value
                                           }}
                                           onkeydown={(event) => {
                                             if (event.key === 'Enter') {
                                               event.preventDefault()
-                                              addNewAnimationTag(motionFilename)
+                                              addNewMotionEntryTag(motionEntry)
                                             }
                                           }}
                                         />
                                         <Button
                                           size="sm"
                                           class="batshit-settings-select-compact batshit-button-full"
-                                          onclick={() => addNewAnimationTag(motionFilename)}
+                                          onclick={() => addNewMotionEntryTag(motionEntry)}
                                         >
                                           <Plus aria-hidden="true" />
                                           Add Tag
@@ -11549,13 +13215,12 @@
                                       type="single"
                                       value={postureValue}
                                       onValueChange={(value: string) => {
-                                        animationPostureInputs = {
-                                          ...animationPostureInputs,
-                                          [motionFilename]:
+                                        stageMotionEntryDraft(motionEntry, {
+                                          posture:
                                             value && motionStagePostureMap[value]
                                               ? (value as GoonPosture)
                                               : ''
-                                        }
+                                        })
                                       }}
                                     >
                                       <Select.Trigger class="batshit-settings-select-compact w-full">
@@ -11592,10 +13257,9 @@
                                       type="single"
                                       value={eyeContactValue}
                                       onValueChange={(value: string) => {
-                                        animationEyeContactInputs = {
-                                          ...animationEyeContactInputs,
-                                          [motionFilename]: value === 'off' ? 'off' : ''
-                                        }
+                                        stageMotionEntryDraft(motionEntry, {
+                                          eyeContact: value === 'off' ? 'off' : ''
+                                        })
                                       }}
                                     >
                                       <Select.Trigger class="batshit-settings-select-compact w-full">
@@ -11628,13 +13292,12 @@
                                       type="single"
                                       value={playbackValue}
                                       onValueChange={(value: string) => {
-                                        animationPlaybackInputs = {
-                                          ...animationPlaybackInputs,
-                                          [motionFilename]:
+                                        stageMotionEntryDraft(motionEntry, {
+                                          playback:
                                             value === 'loop' || value === 'oneshot'
                                               ? (value as GoonMotionPlayback)
                                               : ''
-                                        }
+                                        })
                                       }}
                                     >
                                       <Select.Trigger class="batshit-settings-select-compact w-full">
@@ -11779,6 +13442,40 @@
             />
             <Button onclick={() => guidedUploadInput?.click()} disabled={guidedUploadBusy}>
               {guidedUploadBusy ? 'Uploading…' : 'Create Advanced/Blender Goon'}
+            </Button>
+          </div>
+
+          <div class="space-y-3 batshit-settings-muted-panel">
+            <div class="flex items-center gap-1.5">
+              <span class="batshit-goon-brand-strip" aria-label="GLB format icons">
+                {#each ADVANCED_GLB_GOON_FORMAT.icons as icon (icon.label)}
+                  <IconRenderer
+                    ref={icon.ref}
+                    label={icon.label}
+                    class={`batshit-goon-brand-icon ${icon.wide ? 'is-wide' : ''}`}
+                    iconClass="h-full w-full"
+                    imageClass="h-full w-full object-contain"
+                  />
+                {/each}
+              </span>
+              <div class="batshit-settings-form-label batshit-goon-format-title">Create New Goon (Advanced/GLB)</div>
+              <SettingsInfoMenu ariaLabel="About Advanced/GLB Goons" contentClass="w-80">
+                <p>
+                  Upload one `.bgoon` or `.zip` package containing `avatar.glb` and `avatar.json`.
+                  Batshit keeps the GLB model and drives it from the manifest (stage anchors, face
+                  controls, morphs). This is the first-party avatar path for the new Goon system.
+                </p>
+              </SettingsInfoMenu>
+            </div>
+            <input
+              class="hidden"
+              type="file"
+              accept=".bgoon,.zip"
+              bind:this={customUploadInput}
+              onchange={handleCustomUploadSelection}
+            />
+            <Button onclick={() => customUploadInput?.click()} disabled={customUploadBusy}>
+              {customUploadBusy ? 'Uploading…' : 'Create Advanced/GLB Goon'}
             </Button>
           </div>
           </div>
@@ -12278,7 +13975,10 @@
                     {#if moodCues.length > 0}
                       <div class={goonLevel2AccordionListClass}>
                     {#each moodCues as cue (cue.name)}
-                        <div class={goonLevel2AccordionClass}>
+                        <Collapsible.Root
+                          open={openMoodName === cue.name}
+                          class={goonLevel2AccordionClass}
+                        >
                         <div
                           role="button"
                           tabindex="0"
@@ -12307,8 +14007,7 @@
                             />
                           </div>
                         </div>
-                        {#if openMoodName === cue.name}
-                          <div class={goonLevel2CueContentClass}>
+                        <Collapsible.Content class={goonLevel2CueContentClass}>
                             <div class="flex flex-wrap items-center justify-between gap-2">
                               <div class="min-w-[180px] flex-1 space-y-1">
                                 <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Mood Name" />
@@ -12475,9 +14174,8 @@
                                 </Button>
                               </div>
                             </div>
-                          </div>
-                        {/if}
-                      </div>
+                        </Collapsible.Content>
+                      </Collapsible.Root>
                     {/each}
                       </div>
                     {/if}
@@ -12559,7 +14257,10 @@
                     {#each emoteCues as cue (cue.name)}
                       {@const emoteEmoji = getEmoteEmoji(cue.name)}
                       {@const emoteEmojiLabel = formatEmoteEmojiLabel(emoteEmoji)}
-                      <div class={goonLevel2AccordionClass}>
+                      <Collapsible.Root
+                        open={openEmoteName === cue.name}
+                        class={goonLevel2AccordionClass}
+                      >
                         <div
                           role="button"
                           tabindex="0"
@@ -12590,8 +14291,7 @@
                             />
                           </div>
                         </div>
-                        {#if openEmoteName === cue.name}
-                          <div class={goonLevel2CueContentClass}>
+                        <Collapsible.Content class={goonLevel2CueContentClass}>
                             <div class="flex flex-wrap items-center justify-between gap-2">
                               <div class="min-w-[180px] flex-1 space-y-1">
                                 <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Emote Name" />
@@ -12930,9 +14630,8 @@
                                 </Button>
                               </div>
                             </div>
-                          </div>
-                        {/if}
-                      </div>
+                        </Collapsible.Content>
+                      </Collapsible.Root>
                     {/each}
                       </div>
                     {/if}
@@ -13059,7 +14758,7 @@
           {:else}
             {#each sortedScenes as scene}
               <div
-                class={`batshit-settings-option-card ${kitchenPreviewSceneId === scene.id ? 'is-selected' : ''}`}
+                class="batshit-settings-option-card"
               >
                 <div class="space-y-3">
                   <div class="flex flex-wrap items-start justify-between gap-2">
@@ -13074,16 +14773,6 @@
                       {/if}
                     </div>
                     <div class="flex shrink-0 items-center gap-2">
-                      <Button
-                        variant={kitchenPreviewSceneId === scene.id ? 'secondary' : 'outline'}
-                        size="icon"
-
-                        aria-label={kitchenPreviewSceneId === scene.id ? `Previewing ${scene.name}` : `Preview ${scene.name}`}
-                        title={kitchenPreviewSceneId === scene.id ? 'Previewing' : 'Preview'}
-                        onclick={() => handleSceneLibraryPreviewSelect(scene.id)}
-                      >
-                        <Eye  />
-                      </Button>
                       <Button
                         variant="outline"
                         size="icon"
@@ -13354,6 +15043,10 @@
         minFov={MIN_PREVIEW_VIEW_FOV}
         maxFov={MAX_PREVIEW_VIEW_FOV}
         onFovChange={handlePreviewFovChange}
+        onFramePreset={handleKitchenPreviewFramePreset}
+        cameraMode={previewCameraMode}
+        indoorCameraAvailable={kitchenPreviewEngine?.canUseIndoorCamera() ?? false}
+        onCameraModeChange={(mode) => handlePreviewCameraModeChange(kitchenPreviewEngine, mode, false)}
         quality={kitchenPreviewQuality}
         qualityOptions={qualityOptions}
         onQualityChange={(value) => {
@@ -13361,116 +15054,6 @@
         }}
       />
 	    </SettingsLivePreviewPane>
-	  {:else if !editorGoonId && !sceneEditorMode && activeTab === 'scenes'}
-	    <SettingsLivePreviewPane
-      bind:host={kitchenPreviewContainer}
-      width={previewWidth}
-      resizing={previewResizing}
-      resizeAriaLabel="Resize live preview"
-      onResizeStart={startPreviewResize}
-      runtimeBadge={resolveRendererBadge(kitchenPreviewRuntimeStatus)}
-      loading={kitchenPreviewLoading}
-      error={kitchenPreviewError}
-      emptyMessage={
-        !kitchenPreviewGoonId
-          ? 'Select a Goon to preview.'
-          : !kitchenPreviewSceneId
-            ? 'Choose a scene to preview it here.'
-            : null
-      }
-      wrapperClass="h-full min-h-0 batshit-settings-preview-shell"
-    >
-      <div class="flex items-center gap-1 min-w-0 flex-1">
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger
-            class="batshit-settings-icon-trigger"
-            disabled={goons.length === 0}
-            aria-label="Select preview Goon"
-            title={`Preview Goon: ${kitchenPreviewGoon?.name || 'None'}`}
-          >
-            <BatshitIcon id="goons" class="h-4 w-4" />
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Content align="start" class="min-w-[220px] max-w-[360px]">
-            {#if goons.length > 0}
-              {#each goons as goonEntry (goonEntry.id)}
-                <DropdownMenu.Item onSelect={() => handleScenePreviewGoonSelect(goonEntry.id)}>
-                  <span class="truncate">
-                    {goonEntry.name || 'Unnamed Goon'}{kitchenPreviewGoonId === goonEntry.id ? ' • Current' : ''}
-                  </span>
-                </DropdownMenu.Item>
-              {/each}
-            {:else}
-              <DropdownMenu.Item disabled>
-                <span class="text-muted-foreground">No goons available</span>
-              </DropdownMenu.Item>
-            {/if}
-          </DropdownMenu.Content>
-        </DropdownMenu.Root>
-
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger
-            class="batshit-settings-icon-trigger"
-            disabled={!kitchenPreviewGoonId || kitchenAvailableAnimationNames.length === 0}
-            aria-label="Select preview Motion"
-            title={
-              kitchenPreviewAnimationName
-                ? `Preview Motion: ${kitchenPreviewAnimationName}`
-                : 'Select preview Motion'
-            }
-          >
-            <BatshitIcon id="motions" class="h-4 w-4" />
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Content align="start" class="min-w-[240px] max-h-[320px] overflow-y-auto">
-            {#if kitchenAvailableAnimationNames.length > 0}
-              {#each kitchenAvailableAnimationNames as animationName}
-                <DropdownMenu.Item
-                  onSelect={() => {
-                    kitchenPreviewAnimationName = animationName
-                    void triggerKitchenPreviewAnimation()
-                  }}
-                >
-                  <span class="truncate">
-                    {animationName}{kitchenPreviewAnimationName === animationName ? ' • Current' : ''}
-                  </span>
-                </DropdownMenu.Item>
-              {/each}
-            {:else}
-              <DropdownMenu.Item disabled>
-                <span class="text-muted-foreground">No motions available</span>
-              </DropdownMenu.Item>
-            {/if}
-          </DropdownMenu.Content>
-        </DropdownMenu.Root>
-
-        <Button
-          variant="ghost"
-          size="sm"
-
-          onclick={() => void resetKitchenPreviewAll()}
-          disabled={!kitchenPreviewGoonId}
-          aria-label="Reset preview view controls and clear animation preview"
-          title="Reset preview view controls and clear animation preview"
-        >
-          <RotateCcw  />
-        </Button>
-      </div>
-      <SettingsPreviewViewControls
-        disabled={!kitchenPreviewGoonId || !kitchenPreviewSceneId}
-        eyeContactEnabled={settingsPreviewEyeContactEnabled}
-        onEyeContactToggle={() => {
-          settingsPreviewEyeContactEnabled = !settingsPreviewEyeContactEnabled
-        }}
-        fov={previewViewFov}
-        minFov={MIN_PREVIEW_VIEW_FOV}
-        maxFov={MAX_PREVIEW_VIEW_FOV}
-        onFovChange={handlePreviewFovChange}
-        quality={kitchenPreviewQuality}
-        qualityOptions={qualityOptions}
-        onQualityChange={(value) => {
-          kitchenPreviewQuality = value
-        }}
-      />
-    </SettingsLivePreviewPane>
 	  {:else if !editorGoonId && !sceneEditorMode && activeTab === 'motions'}
 	    <SettingsLivePreviewPane
       bind:host={previewContainer}
@@ -13495,6 +15078,33 @@
 	      wrapperClass="h-full min-h-0 batshit-settings-preview-shell"
 	    >
       <div class="flex-1"></div>
+      {#if activeMotionPreviewEntry && activeMotionPreviewEntry.vrma && activeMotionPreviewEntry.glb}
+        {@const stagePreviewLane = resolveMotionEntryPreviewLane(activeMotionPreviewEntry)}
+        <div class="flex items-center justify-center pb-2">
+          <div
+            class="batshit-goon-motion-lane-toggle"
+            role="group"
+            aria-label="Stage preview format"
+          >
+            <button
+              type="button"
+              class={`batshit-goon-motion-lane-toggle-option ${stagePreviewLane === 'vrm' ? 'is-selected' : ''}`}
+              title="Play the VRMA version (VRM Goons)"
+              onclick={() => setMotionEntryPreviewLane(activeMotionPreviewEntry, 'vrm')}
+            >
+              VRMA
+            </button>
+            <button
+              type="button"
+              class={`batshit-goon-motion-lane-toggle-option ${stagePreviewLane === 'glb' ? 'is-selected' : ''}`}
+              title="Play the GLB version (Advanced/GLB Goons)"
+              onclick={() => setMotionEntryPreviewLane(activeMotionPreviewEntry, 'glb')}
+            >
+              GLB
+            </button>
+          </div>
+        </div>
+      {/if}
       <SettingsPreviewViewControls
         disabled={!motionLibraryPreviewName || $goonMotionPreviewGenerationActive}
         showReset={true}
@@ -13505,6 +15115,10 @@
         minFov={MIN_PREVIEW_VIEW_FOV}
         maxFov={MAX_PREVIEW_VIEW_FOV}
         onFovChange={handlePreviewFovChange}
+        onFramePreset={handlePreviewFramePreset}
+        cameraMode={previewCameraMode}
+        indoorCameraAvailable={previewEngine?.canUseIndoorCamera() ?? false}
+        onCameraModeChange={(mode) => handlePreviewCameraModeChange(previewEngine, mode, false)}
       />
     </SettingsLivePreviewPane>
 	  {/if}
@@ -13764,14 +15378,198 @@
                 tuning={buildEditorEyeContactTuning()}
                 modeInfo={EDITOR_EYE_CONTACT_MODE_INFO}
                 coordinationInfo={EDITOR_EYE_CONTACT_COORDINATION_INFO}
+                eyeConvergenceControl={editorEyeAppearanceDefinition?.controls.find(
+                  (control) => control.id === EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS[0]
+                ) ?? null}
+                eyeConvergenceValue={editorEyeAppearanceState?.eyeConvergence ?? null}
                 onModeChange={(mode) => {
                   editorEyeContactMode = mode
                   editorDirty = true
                 }}
                 onTuningChange={updateEditorEyeContactTuning}
+                onEyeConvergenceChange={(value) => {
+                  if (!editorEyeAppearanceState) return
+                  updateEditorEyeAppearance(
+                    updateEyeAppearanceControl(
+                      editorEyeAppearanceState,
+                      EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS[0],
+                      value
+                    )
+                  )
+                }}
               />
             </Collapsible.Content>
           </Collapsible.Root>
+
+          {#if editorGoonKind === 'custom' && (editorAppearanceDialsManifest || editorAppearanceDialsError)}
+            <Collapsible.Root bind:open={editorBodyAppearanceOpen} class={goonLevel1AccordionClass}>
+              <Collapsible.Trigger
+                class={goonLevel1AccordionHeaderClass}
+                onclick={() => toggleEditorPrimarySection('body-appearance')}
+              >
+                <div class="flex items-center gap-1.5">
+                  <SlidersHorizontal class="batshit-goon-l1-icon h-4 w-4" />
+                  <span class="batshit-settings-form-label">Body Appearance</span>
+                  <div
+                    onclick={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                    }}
+                    aria-hidden="true"
+                  >
+                    <SettingsInfoMenu ariaLabel="About Body Appearance" contentClass="w-80">
+                      <p>
+                        Versioned body, head, and neck controls from this Goon's package. Changes
+                        preview live; Save Goon keeps each value with its exact package definition
+                        so an incompatible update resets clearly instead of drifting.
+                      </p>
+                    </SettingsInfoMenu>
+                  </div>
+                </div>
+                <ChevronDown
+                  class={`h-4 w-4 shrink-0 transition-transform ${editorBodyAppearanceOpen ? 'rotate-180' : ''}`}
+                />
+              </Collapsible.Trigger>
+              <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
+                {#if editorAppearanceDialsError}
+                  <p class="batshit-settings-form-error px-3">
+                    Body Appearance unavailable: {editorAppearanceDialsError}
+                  </p>
+                {:else if editorAppearanceDialsManifest && editorAppearanceDialsState}
+                  <div class="px-3 pb-2">
+                    {#if editorAppearanceDialsNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorAppearanceDialsNotice}
+                      </p>
+                    {/if}
+                    <AppearanceDialsEditor
+                      manifest={editorAppearanceDialsManifest}
+                      valueState={editorAppearanceDialsState}
+                      surface="body"
+                      onChange={updateEditorAppearanceDials}
+                    />
+                  </div>
+                {/if}
+              </Collapsible.Content>
+            </Collapsible.Root>
+          {/if}
+
+          {#if editorGoonKind === 'custom' && (editorAppearanceDialsManifest || editorAppearanceDialsError || editorFacialArtworkDefinition || editorFacialArtworkError || editorFacialArtworkPackageNotice)}
+            <Collapsible.Root bind:open={editorFaceAppearanceOpen} class={goonLevel1AccordionClass}>
+              <Collapsible.Trigger
+                class={goonLevel1AccordionHeaderClass}
+                onclick={() => toggleEditorPrimarySection('face-appearance')}
+              >
+                <div class="flex items-center gap-1.5">
+                  <SlidersHorizontal class="batshit-goon-l1-icon h-4 w-4" />
+                  <span class="batshit-settings-form-label">Face Appearance</span>
+                  <div
+                    onclick={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                    }}
+                    aria-hidden="true"
+                  >
+                    <SettingsInfoMenu ariaLabel="About Face Appearance" contentClass="w-80">
+                      <p>
+                        Face-shape controls and package-fitted facial artwork, organized together
+                        by facial region. PNGs are validated against this exact Goon package and
+                        preview live before Save Goon stores them.
+                      </p>
+                    </SettingsInfoMenu>
+                  </div>
+                </div>
+                <ChevronDown
+                  class={`h-4 w-4 shrink-0 transition-transform ${editorFaceAppearanceOpen ? 'rotate-180' : ''}`}
+                />
+              </Collapsible.Trigger>
+              <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
+                {#if editorFacialArtworkPackageNotice}
+                  <div class="px-3 pb-2">
+                    <p class="text-[0.675rem] leading-relaxed text-amber-400" role="status">
+                      {editorPendingCustomPackageUpdate
+                        ? 'Save Goon to install the pending Goon File Package. Facial Artwork and Eye Appearance will become available after the package update resets their retired state.'
+                        : editorFacialArtworkPackageNotice}
+                    </p>
+                  </div>
+                {/if}
+                {#if editorAppearanceDialsError}
+                  <p class="batshit-settings-form-error px-3">
+                    Face Appearance unavailable: {editorAppearanceDialsError}
+                  </p>
+                {:else if editorAppearanceDialsManifest && editorAppearanceDialsState}
+                  <div class="px-3 pb-2">
+                    {#if editorFacialArtworkNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorFacialArtworkNotice}
+                      </p>
+                    {/if}
+                    {#if editorEyeAppearanceNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorEyeAppearanceNotice}
+                      </p>
+                    {/if}
+                    {#if editorFacialArtworkPreviewError}
+                      <p class="batshit-settings-form-error mb-2" role="alert">
+                        Live preview failed: {editorFacialArtworkPreviewError}
+                      </p>
+                    {/if}
+                    {#snippet facialArtworkRegion(scope: 'brows' | 'eyes')}
+                      {#if editorPendingCustomPackageUpdate}
+                        <p class="text-[0.675rem] leading-relaxed text-amber-400" role="status">
+                          Save the pending Goon File Package before editing Facial Artwork. The
+                          server validates PNGs against the currently saved package.
+                        </p>
+                      {:else if editorFacialArtworkError}
+                        <p class="batshit-settings-form-error">
+                          Facial Artwork unavailable: {editorFacialArtworkError}
+                        </p>
+                      {:else if editorFacialArtworkDefinition && editorFacialArtworkState && editorEyeAppearanceDefinition && editorEyeAppearanceState}
+                        <FacialArtworkEditor
+                          {scope}
+                          definition={editorFacialArtworkDefinition}
+                          eyeAppearanceDefinition={editorEyeAppearanceDefinition}
+                          valueState={editorFacialArtworkState}
+                          eyeAppearanceState={editorEyeAppearanceState}
+                          ownerDisplayName={userSettings?.displayName ?? ''}
+                          creditDraft={editorFacialArtworkCreditDraft}
+                          disabled={editorSaving}
+                          onCreditDraftChange={(draft) => (editorFacialArtworkCreditDraft = draft)}
+                          onChange={updateEditorFacialArtwork}
+                          onEyeAppearanceChange={updateEditorEyeAppearance}
+                          onUpload={uploadEditorFacialArtwork}
+                          onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
+                        />
+                      {:else}
+                        <p class="batshit-settings-form-error" role="alert">
+                          Facial Artwork or Eye Appearance is unavailable for this Goon package.
+                        </p>
+                      {/if}
+                    {/snippet}
+
+                    <AppearanceDialsEditor
+                      manifest={editorAppearanceDialsManifest}
+                      valueState={editorAppearanceDialsState}
+                      surface="head-face"
+                      onChange={updateEditorAppearanceDials}
+                      eyeAppearanceDefinition={editorEyeAppearanceDefinition}
+                      eyeAppearanceState={editorEyeAppearanceState}
+                      onEyeAppearanceChange={updateEditorEyeAppearance}
+                      regionContentIds={['face.brows', 'face.eyes']}
+                    >
+                      {#snippet regionContent(regionId: string)}
+                        {#if regionId === 'face.brows'}
+                          {@render facialArtworkRegion('brows')}
+                        {:else if regionId === 'face.eyes'}
+                          {@render facialArtworkRegion('eyes')}
+                        {/if}
+                      {/snippet}
+                    </AppearanceDialsEditor>
+                  </div>
+                {/if}
+              </Collapsible.Content>
+            </Collapsible.Root>
+          {/if}
 
           <Collapsible.Root bind:open={editorClosetOpen} class={goonLevel1AccordionClass}>
             <Collapsible.Trigger
@@ -14462,7 +16260,10 @@
                         <div class={goonLevel2AccordionListClass}>
                       {#each moodCues as cue (cue.name)}
                         {@const cueStatus = getEditorCueStatus(cue.name)}
-                        <div class={goonLevel2AccordionClass}>
+                        <Collapsible.Root
+                          open={openMoodName === cue.name}
+                          class={goonLevel2AccordionClass}
+                        >
                           <div
                             role="button"
                             tabindex="0"
@@ -14497,8 +16298,7 @@
                               />
                             </div>
                           </div>
-                          {#if openMoodName === cue.name}
-                            <div class={goonLevel2CueContentClass}>
+                          <Collapsible.Content class={goonLevel2CueContentClass}>
                               <div class="flex flex-wrap items-center gap-2">
                                 <div class="min-w-[180px] flex-1 space-y-1">
                                   <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Mood Name" />
@@ -14678,9 +16478,8 @@
                                   {/if}
                                 </div>
                               </div>
-                            </div>
-                          {/if}
-                        </div>
+                          </Collapsible.Content>
+                        </Collapsible.Root>
                       {/each}
                         </div>
                       {/if}
@@ -14849,7 +16648,10 @@
                         {@const emoteEmoji = getEmoteEmoji(cue.name)}
                         {@const emoteEmojiLabel = formatEmoteEmojiLabel(emoteEmoji)}
                         {@const cueStatus = getEditorCueStatus(cue.name)}
-                        <div class={goonLevel2AccordionClass}>
+                        <Collapsible.Root
+                          open={openEmoteName === cue.name}
+                          class={goonLevel2AccordionClass}
+                        >
                           <div
                             role="button"
                             tabindex="0"
@@ -14886,8 +16688,7 @@
                               />
                             </div>
                           </div>
-                          {#if openEmoteName === cue.name}
-                            <div class={goonLevel2CueContentClass}>
+                          <Collapsible.Content class={goonLevel2CueContentClass}>
                               <div class="flex flex-wrap items-center gap-2">
                                 <div class="min-w-[180px] flex-1 space-y-1">
                                   <GoonsFieldLabel label="Name" info={CUE_NAME_INFO} ariaLabel="About Emote Name" />
@@ -15213,9 +17014,8 @@
                                   {/if}
                                 </div>
                               </div>
-                            </div>
-                          {/if}
-                        </div>
+                          </Collapsible.Content>
+                        </Collapsible.Root>
                       {/each}
                         </div>
                       {/if}
@@ -15498,6 +17298,47 @@
 	                      <span class="text-foreground">{editorGoon.customAvatar.manifestSummary.name}</span>
 	                    </div>
 	                  {/if}
+	                  {#if editorPendingCustomPackageUpdate}
+	                    <div class="batshit-settings-form-label">
+	                      Pending package update:
+	                      <span class="text-foreground">{pendingCustomPackageLabel}</span>
+	                    </div>
+	                  {/if}
+	                  {#if editorGoon?.customAvatar?.backup?.package}
+	                    <div class="batshit-settings-form-label">
+	                      Previous package:
+	                      <span class="text-foreground">{backupCustomPackageLabel}</span>
+	                    </div>
+	                  {/if}
+	                  <input
+	                    class="hidden"
+	                    type="file"
+	                    accept=".bgoon,.zip"
+	                    bind:this={advancedPackageUpdateInput}
+	                    onchange={handleAdvancedPackageUpdateSelection}
+	                  />
+	                  <div class="flex flex-wrap items-center gap-2">
+	                    <Button
+	                      onclick={() => advancedPackageUpdateInput?.click()}
+	                      disabled={advancedPackageUpdateBusy || Boolean(editorPendingCustomPackageUpdate)}
+	                    >
+	                      {advancedPackageUpdateBusy ? 'Uploading…' : 'Update Goon File Package'}
+	                    </Button>
+	                    {#if editorPendingCustomPackageUpdate}
+	                      <Button variant="ghost" size="sm" onclick={cancelPendingAdvancedPackageUpdate}>
+	                        <X aria-hidden="true" />
+	                        Cancel
+	                      </Button>
+	                    {/if}
+	                  </div>
+	                  <p class="batshit-settings-form-label">
+	                    Save Goon applies the package update. Versioned Appearance Dials are checked
+	                    against the new package definition and reset clearly if it is incompatible.
+	                    Updating an older Body Dials package performs the clean v2 cutover and resets
+	                    those old saved dial values to the new package neutral.
+	                    Moods, emotes, Eye Contact, camera, and agent assignments are kept, and the
+	                    previous package remains available as a backup.
+	                  </p>
 	                {:else}
 	                  <div class="batshit-settings-form-label">
 	                    Current VRM: <span class="text-foreground">{currentVrmLabel}</span>
@@ -15653,7 +17494,7 @@
               <Button
                 variant="ghost"
                 onclick={discardCueEditorChanges}
-                disabled={!editorHasUnsavedChanges || editorSaving}
+                disabled={!editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy}
               >
                 <X aria-hidden="true" />
                 Cancel
@@ -15661,11 +17502,15 @@
               <Button
                 variant="outline"
                 onclick={() => requestWorkspaceExit({ type: 'close-editor' })}
+                disabled={editorFacialArtworkUploadBusy}
               >
                 <X aria-hidden="true" />
                 Close Goon
               </Button>
-              <Button onclick={() => void saveCueEditor()} disabled={!editorHasUnsavedChanges || editorSaving}>
+              <Button
+                onclick={() => void saveCueEditor()}
+                disabled={!editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy}
+              >
                 {editorSaving ? 'Saving…' : 'Save Goon'}
               </Button>
             </div>
@@ -16021,6 +17866,10 @@
             minFov={MIN_PREVIEW_VIEW_FOV}
             maxFov={MAX_PREVIEW_VIEW_FOV}
             onFovChange={handlePreviewFovChange}
+            onFramePreset={handlePreviewFramePreset}
+            cameraMode={previewCameraMode}
+            indoorCameraAvailable={previewEngine?.canUseIndoorCamera() ?? false}
+            onCameraModeChange={(mode) => handlePreviewCameraModeChange(previewEngine, mode, true)}
             quality={editorQuality}
             qualityOptions={qualityOptions}
             onQualityChange={(value) => {
@@ -16033,10 +17882,425 @@
 {/if}
 
 {#if sceneEditorMode}
-      <div
-        bind:this={sceneShellEl}
-        class="flex min-h-0 flex-1 items-stretch overflow-hidden"
-      >
+  <div
+    bind:this={sceneShellEl}
+    class="flex min-h-0 flex-1 items-stretch overflow-hidden"
+  >
+{#snippet scenePlacementControls(
+  placement: GoonScenePlacement,
+  projectionLine: number,
+  onPlacementChange: (placement: GoonScenePlacement) => void,
+  onProjectionLineChange: (value: number) => void
+)}
+  <div class="space-y-3">
+    <div class="flex items-center gap-1.5">
+      <span class="batshit-settings-child-label">Scene Placement</span>
+      <SettingsInfoMenu ariaLabel="About Scene Placement" contentClass="w-80">
+        <p>
+          Ground Level projects the skybox ground so the scene feels placed on the outdoor floor.
+        </p>
+        <p>
+          Elevated / Overlook keeps the skybox unprojected for rooftops, high-rises, balconies,
+          space, cliffs, and distant views.
+        </p>
+        <p>
+          Placement works with either a Procedural Builder room or an Uploaded GLB room shell. It
+          has no visible effect until the scene has a skybox.
+        </p>
+      </SettingsInfoMenu>
+    </div>
+    <Select.Root
+      type="single"
+      value={placement}
+      onValueChange={(value: string) =>
+        onPlacementChange(value === 'ground' ? 'ground' : 'elevated')}
+    >
+      <Select.Trigger class="batshit-settings-select-compact w-full">
+        {placement === 'ground' ? 'Ground Level' : 'Elevated / Overlook'}
+      </Select.Trigger>
+      <Select.Content>
+        <Select.Item value="ground">Ground Level</Select.Item>
+        <Select.Item value="elevated">Elevated / Overlook</Select.Item>
+      </Select.Content>
+    </Select.Root>
+    {#if placement === 'ground'}
+      {@const normalizedLine = normalizeGroundProjectionLine(projectionLine)}
+      <div class="space-y-1">
+        <div class="flex items-center justify-between gap-2">
+          <div class="flex items-center gap-1.5">
+            <span class="batshit-settings-child-label">Ground Projection Line</span>
+            <SettingsInfoMenu ariaLabel="About Ground Projection Line" contentClass="w-96">
+              <p>
+                Chooses which horizontal row of the original panorama becomes the boundary between
+                the upright skybox and projected ground. The normal equirectangular equator is 50%.
+              </p>
+              <p>
+                Moving this line can correct an imperfect horizon, but it cannot repair a TV,
+                couch, wall, tree, rock, or other upright object already painted into the ground
+                region below it.
+              </p>
+            </SettingsInfoMenu>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-[10px] text-muted-foreground">
+              {Math.round(normalizedLine * 100)}%
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={normalizedLine === DEFAULT_GROUND_PROJECTION_LINE}
+              onclick={() => onProjectionLineChange(DEFAULT_GROUND_PROJECTION_LINE)}
+            >
+              Reset
+            </Button>
+          </div>
+        </div>
+        <input
+          class="batshit-settings-range-input w-full"
+          type="range"
+          min={MIN_GROUND_PROJECTION_LINE * 100}
+          max={MAX_GROUND_PROJECTION_LINE * 100}
+          step="1"
+          value={normalizedLine * 100}
+          oninput={(event) =>
+            onProjectionLineChange(
+              Number((event.currentTarget as HTMLInputElement).value) / 100
+            )}
+        />
+        <div class="text-[10px] text-muted-foreground">
+          For the cleanest Ground Level result, keep everything below this row to continuous
+          floor, terrain, grass, dirt, sand, or water.
+        </div>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet roomShellTransformControls(
+  transform: ReturnType<typeof normalizeRoomShellTransform>,
+  onTransformChange: (patch: Partial<GoonSceneRoomShellTransform>) => void,
+  onAlignFloor: (() => void) | null
+)}
+  <div class="batshit-goon-editor-subpanel space-y-3">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-1.5">
+        <span class="batshit-settings-child-label">Room Shell Placement</span>
+        <SettingsInfoMenu ariaLabel="About Room Shell Placement" contentClass="w-96">
+          <p>
+            These saved controls move only the Uploaded GLB room. They do not move separate Props,
+            Markers, the Goon, or the skybox.
+          </p>
+          <p>
+            Align Floor probes for a walkable surface near the Goon and moves that surface to stage
+            height. Generated models are inconsistent, so use Y Offset if Batshit cannot identify
+            the right floor.
+          </p>
+        </SettingsInfoMenu>
+      </div>
+      <div class="flex items-center gap-2">
+        {#if onAlignFloor}
+          <Button variant="outline" size="sm" onclick={onAlignFloor}>Align Floor</Button>
+        {/if}
+        <Button
+          variant="ghost"
+          size="sm"
+          onclick={() => onTransformChange(normalizeRoomShellTransform())}
+        >
+          Reset Placement
+        </Button>
+      </div>
+    </div>
+    <div class="grid gap-2 md:grid-cols-2">
+      <div class="space-y-1">
+        <div class="batshit-settings-child-label">Uniform Scale</div>
+        <Input
+          type="number"
+          min="0.05"
+          max="20"
+          step="0.05"
+          value={transform.uniformScale}
+          oninput={(event) =>
+            onTransformChange({
+              uniformScale: Number((event.currentTarget as HTMLInputElement).value)
+            })}
+        />
+      </div>
+      <div class="space-y-1">
+        <div class="batshit-settings-child-label">Y Rotation</div>
+        <Input
+          type="number"
+          min="-180"
+          max="180"
+          step="1"
+          value={Math.round((transform.rotationY * 180) / Math.PI * 100) / 100}
+          oninput={(event) =>
+            onTransformChange({
+              rotationY:
+                (Number((event.currentTarget as HTMLInputElement).value) * Math.PI) / 180
+            })}
+        />
+      </div>
+    </div>
+    <div class="grid gap-2 md:grid-cols-3">
+      {#each [
+        { label: 'X Offset', index: 0 },
+        { label: 'Y Offset', index: 1 },
+        { label: 'Z Offset', index: 2 }
+      ] as axis}
+        <div class="space-y-1">
+          <div class="batshit-settings-child-label">{axis.label}</div>
+          <Input
+            type="number"
+            min="-1000"
+            max="1000"
+            step="0.05"
+            value={transform.position[axis.index]}
+            oninput={(event) => {
+              const position: [number, number, number] = [...transform.position]
+              position[axis.index] = Number((event.currentTarget as HTMLInputElement).value)
+              onTransformChange({ position })
+            }}
+          />
+        </div>
+      {/each}
+    </div>
+    {#if !onAlignFloor}
+      <div class="text-[10px] text-muted-foreground">
+        Create the scene to preview the shell and use Align Floor.
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet roomCameraBoundaryControls(
+  boundary: GoonSceneCameraBoundary | undefined,
+  onBoundaryChange: (boundary: GoonSceneCameraBoundary | null) => void,
+  onFitRoom: () => void
+)}
+  {@const normalized = normalizeRoomCameraBoundary(boundary)}
+  <div class="batshit-goon-editor-subpanel space-y-3">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="flex items-center gap-1.5">
+        <span class="batshit-settings-child-label">Indoor Camera Boundary</span>
+        <SettingsInfoMenu ariaLabel="About Indoor Camera Boundary" contentClass="w-96">
+          <p>This saved box defines where Indoor Camera may move. Walls, openings, floor, and ceiling all act as boundaries.</p>
+          <p>Fit to Room measures the Uploaded GLB as a starting point. Adjust the box when the visible model includes exterior architecture or scenery.</p>
+        </SettingsInfoMenu>
+      </div>
+      <div class="flex items-center gap-2">
+        <Button variant="outline" size="sm" onclick={onFitRoom}>Fit to Room</Button>
+        {#if normalized}
+          <Button variant="ghost" size="sm" onclick={() => onBoundaryChange(null)}>Remove</Button>
+        {/if}
+      </div>
+    </div>
+    {#if normalized}
+      <div class="grid gap-2 md:grid-cols-3">
+        {#each ['X', 'Y', 'Z'] as axis, index}
+          <div class="space-y-1">
+            <div class="batshit-settings-child-label">{axis} Center</div>
+            <Input
+              type="number"
+              step="0.05"
+              value={normalized.center[index]}
+              oninput={(event) => {
+                const center: [number, number, number] = [...normalized.center]
+                center[index] = Number((event.currentTarget as HTMLInputElement).value)
+                onBoundaryChange({ ...normalized, center })
+              }}
+            />
+          </div>
+        {/each}
+      </div>
+      <div class="grid gap-2 md:grid-cols-3">
+        {#each ['Width', 'Height', 'Depth'] as label, index}
+          <div class="space-y-1">
+            <div class="batshit-settings-child-label">{label}</div>
+            <Input
+              type="number"
+              min="0.1"
+              step="0.05"
+              value={normalized.size[index]}
+              oninput={(event) => {
+                const size: [number, number, number] = [...normalized.size]
+                size[index] = Number((event.currentTarget as HTMLInputElement).value)
+                onBoundaryChange({ ...normalized, size })
+              }}
+            />
+          </div>
+        {/each}
+      </div>
+      <div class="space-y-1 md:max-w-[220px]">
+        <div class="batshit-settings-child-label">Y Rotation</div>
+        <Input
+          type="number"
+          min="-180"
+          max="180"
+          step="1"
+          value={Math.round((normalized.rotationY * 180) / Math.PI * 100) / 100}
+          oninput={(event) => onBoundaryChange({
+            ...normalized,
+            rotationY: Number((event.currentTarget as HTMLInputElement).value) * Math.PI / 180
+          })}
+        />
+      </div>
+    {:else}
+      <div class="text-[11px] text-muted-foreground">
+        Fit and save a boundary to enable Indoor Camera for this Uploaded GLB room.
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet sceneAtmosphereControls(
+  ambience: ReturnType<typeof normalizeGoonSceneAmbience>,
+  onAmbienceChange: (patch: Partial<GoonSceneAmbience>) => void
+)}
+  <div class="space-y-2">
+    <div class="flex items-center gap-1.5">
+      <span class="batshit-settings-child-label">Scene Atmosphere</span>
+      <SettingsInfoMenu ariaLabel="About Scene Atmosphere" contentClass="w-80">
+        <p>Adds one lightweight saved particle layer to the scene.</p>
+        <p>
+          Use Outside for weather beyond the room, Inside for dust or embers, and Whole Stage for
+          subtle all-around motion.
+        </p>
+        <p>
+          Opaque walls hide Outside effects. Use an open or transparent surface to see weather
+          beyond a room.
+        </p>
+      </SettingsInfoMenu>
+    </div>
+    <div class="space-y-3">
+      <div class="flex items-center justify-between gap-3">
+        <span class="batshit-settings-child-label">Enable Atmosphere</span>
+        <Switch.Root
+          checked={ambience.enabled}
+          onCheckedChange={(checked) => onAmbienceChange({ enabled: Boolean(checked) })}
+        />
+      </div>
+      {#if ambience.enabled}
+        <div class="grid gap-2 md:grid-cols-2">
+          <div class="space-y-1">
+            <div class="batshit-settings-child-label">Preset</div>
+            <Select.Root
+              type="single"
+              value={ambience.preset}
+              onValueChange={(value: string) =>
+                onAmbienceChange({ preset: value as GoonSceneAmbiencePreset })}
+            >
+              <Select.Trigger class="batshit-settings-select-compact w-full">
+                {GOON_SCENE_AMBIENCE_PRESET_OPTIONS.find(
+                  (option) => option.value === ambience.preset
+                )?.label || 'Dust / Pollen'}
+              </Select.Trigger>
+              <Select.Content>
+                {#each GOON_SCENE_AMBIENCE_PRESET_OPTIONS as option}
+                  <Select.Item value={option.value}>{option.label}</Select.Item>
+                {/each}
+              </Select.Content>
+            </Select.Root>
+          </div>
+          <div class="space-y-1">
+            <div class="batshit-settings-child-label">Placement</div>
+            <Select.Root
+              type="single"
+              value={ambience.placement}
+              onValueChange={(value: string) =>
+                onAmbienceChange({ placement: value as GoonSceneAmbiencePlacement })}
+            >
+              <Select.Trigger class="batshit-settings-select-compact w-full">
+                {GOON_SCENE_AMBIENCE_PLACEMENT_OPTIONS.find(
+                  (option) => option.value === ambience.placement
+                )?.label || 'Whole Stage'}
+              </Select.Trigger>
+              <Select.Content>
+                {#each GOON_SCENE_AMBIENCE_PLACEMENT_OPTIONS as option}
+                  <Select.Item value={option.value}>{option.label}</Select.Item>
+                {/each}
+              </Select.Content>
+            </Select.Root>
+          </div>
+        </div>
+        <div class="grid gap-2 md:grid-cols-2">
+          <div class="space-y-1">
+            <div class="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+              <span>Intensity</span>
+              <span>{Math.round(ambience.intensity * 100)}%</span>
+            </div>
+            <input
+              class="batshit-settings-range-input w-full"
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={ambience.intensity}
+              oninput={(event) =>
+                onAmbienceChange({
+                  intensity: Number((event.currentTarget as HTMLInputElement).value)
+                })}
+            />
+          </div>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+              <span>Speed</span>
+              <span>{ambience.speed.toFixed(2)}x</span>
+            </div>
+            <input
+              class="batshit-settings-range-input w-full"
+              type="range"
+              min="0.2"
+              max="2.5"
+              step="0.05"
+              value={ambience.speed}
+              oninput={(event) =>
+                onAmbienceChange({
+                  speed: Number((event.currentTarget as HTMLInputElement).value)
+                })}
+            />
+          </div>
+        </div>
+        <div class="grid gap-2 md:grid-cols-2">
+          <div class="space-y-1">
+            <div class="batshit-settings-child-label">Wind X</div>
+            <Input
+              type="number"
+              min="-2"
+              max="2"
+              step="0.05"
+              value={ambience.wind[0]}
+              oninput={(event) =>
+                onAmbienceChange({
+                  wind: [
+                    Number((event.currentTarget as HTMLInputElement).value),
+                    ambience.wind[1]
+                  ]
+                })}
+            />
+          </div>
+          <div class="space-y-1">
+            <div class="batshit-settings-child-label">Wind Z</div>
+            <Input
+              type="number"
+              min="-2"
+              max="2"
+              step="0.05"
+              value={ambience.wind[1]}
+              oninput={(event) =>
+                onAmbienceChange({
+                  wind: [
+                    ambience.wind[0],
+                    Number((event.currentTarget as HTMLInputElement).value)
+                  ]
+                })}
+            />
+          </div>
+        </div>
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
         <div class="batshit-settings-preview-shell batshit-goon-static-card flex h-full min-h-0 min-w-0 flex-1 flex-col">
           <div class="min-h-0 flex-1 overflow-y-auto">
           <div class="space-y-6 px-5 pt-6 pb-0">
@@ -16074,58 +18338,149 @@
                   <Input placeholder="Description (optional)" bind:value={newSceneDescription} />
                 </div>
               </div>
-              <div class="flex flex-wrap items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onclick={() => requestSceneSkyboxUpload()}
-                  disabled={sceneUploadBusy}
+            </div>
+            <div class="space-y-2">
+              <Collapsible.Root bind:open={sceneWorldOpen} class={goonLevel1AccordionClass}>
+                <Collapsible.Trigger
+                  class={goonLevel1AccordionHeaderClass}
+                  onclick={() => toggleSceneSection('world')}
                 >
-                  {sceneUploadBusy
-                    ? 'Uploading…'
-                    : newSceneSkybox
-                      ? 'Replace Skybox'
-                      : 'Upload Skybox'}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onclick={() => requestRoomShellUpload()}
-                  disabled={sceneRoomShellBusy}
-                >
-                  {sceneRoomShellBusy
-                    ? 'Uploading…'
-                    : newSceneRoomShell
-                      ? 'Replace Room Shell'
-                      : 'Upload Room Shell'}
-                </Button>
-              </div>
-              <div class="flex flex-wrap items-start gap-3 text-[11px] text-muted-foreground">
-                {#if newSceneSkybox}
-                  <div class="flex items-start gap-3">
-                    <div class="batshit-goon-thumbnail-frame is-small">
-                      {#if resolveFileThumbnailUrl(newSceneSkybox)}
-                        <img
-                          src={resolveFileThumbnailUrl(newSceneSkybox) ?? undefined}
-                          alt="Skybox thumbnail"
-                          class="h-full w-full object-cover"
-                        />
-                      {:else}
-                        <div class="batshit-settings-child-label flex h-full w-full items-center justify-center">
-                          No Thumb
+                  <div class="flex items-center gap-1.5">
+                    <span class="batshit-settings-form-label">World</span>
+                    <div
+                      onclick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                      }}
+                      aria-hidden="true"
+                    >
+                      <SettingsInfoMenu ariaLabel="About World" contentClass="w-80">
+                        <p>
+                          World controls the 360 Skybox, how it meets the stage, and one saved Scene
+                          Atmosphere layer.
+                        </p>
+                      </SettingsInfoMenu>
+                    </div>
+                  </div>
+                </Collapsible.Trigger>
+                <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
+                  <div class="batshit-goon-editor-subpanel space-y-3">
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="batshit-settings-child-label">Skybox</span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onclick={() => requestSceneSkyboxUpload()}
+                        disabled={sceneUploadBusy}
+                      >
+                        {sceneUploadBusy
+                          ? 'Uploading…'
+                          : newSceneSkybox
+                            ? 'Replace Skybox'
+                            : 'Upload Skybox'}
+                      </Button>
+                    </div>
+                    <div class="flex flex-wrap items-start gap-3 text-[11px] text-muted-foreground">
+                      {#if newSceneSkybox}
+                        <div class="flex items-start gap-3">
+                          <div class="batshit-goon-thumbnail-frame is-small">
+                            {#if resolveFileThumbnailUrl(newSceneSkybox)}
+                              <img
+                                src={resolveFileThumbnailUrl(newSceneSkybox) ?? undefined}
+                                alt="Skybox thumbnail"
+                                class="h-full w-full object-cover"
+                              />
+                            {:else}
+                              <div class="batshit-settings-child-label flex h-full w-full items-center justify-center">
+                                No Thumb
+                              </div>
+                            {/if}
+                          </div>
+                          <span class="pt-1">Skybox ready</span>
                         </div>
+                      {:else}
+                        <span>Upload a 2:1 equirectangular PNG/JPG. Batshit keeps the original file.</span>
                       {/if}
                     </div>
-                    <span class="pt-1">Skybox ready</span>
                   </div>
-                {:else}
-                  <span>Upload an equirectangular PNG/JPG (no resizing).</span>
-                {/if}
-                {#if newSceneRoomShell}
-                  <span>Room shell linked</span>
-                {:else}
-                  <span>Room shell optional (GLB/GLTF).</span>
-                {/if}
+                  {@render scenePlacementControls(
+                    newScenePlacement,
+                    newSceneGroundProjectionLine,
+                    (placement: GoonScenePlacement) => {
+                      newScenePlacement = placement
+                    },
+                    (value: number) => {
+                      newSceneGroundProjectionLine = normalizeGroundProjectionLine(value)
+                    }
+                  )}
+                  {@render sceneAtmosphereControls(newSceneAmbience, updateNewSceneAmbience)}
+                </Collapsible.Content>
+              </Collapsible.Root>
+
+              <Collapsible.Root bind:open={roomBuilderOpen} class={goonLevel1AccordionClass}>
+                <Collapsible.Trigger
+                  class={goonLevel1AccordionHeaderClass}
+                  onclick={() => toggleSceneSection('room')}
+                >
+                  <div class="flex items-center gap-1.5">
+                    <span class="batshit-settings-form-label">Room Builder</span>
+                    <div
+                      onclick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                      }}
+                      aria-hidden="true"
+                    >
+                      <SettingsInfoMenu ariaLabel="About Room Builder" contentClass="w-96">
+                        <p>
+                          Use an Uploaded GLB room shell or create the scene first and configure
+                          Batshit's Procedural Builder surfaces.
+                        </p>
+                      </SettingsInfoMenu>
+                    </div>
+                  </div>
+                </Collapsible.Trigger>
+                <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
+                  <div class="batshit-goon-editor-subpanel space-y-3">
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="batshit-settings-child-label">Room Shell</span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onclick={() => requestRoomShellUpload()}
+                        disabled={sceneRoomShellBusy}
+                      >
+                        {sceneRoomShellBusy
+                          ? 'Uploading…'
+                          : newSceneRoomShell
+                            ? 'Replace Room Shell'
+                            : 'Upload Room Shell'}
+                      </Button>
+                    </div>
+                    <div class="text-[11px] text-muted-foreground">
+                      {#if newSceneRoomShell}
+                        {newSceneRoomShell.originalName || newSceneRoomShell.filename}
+                      {:else}
+                        Optional. Use a self-contained GLB when possible; single-file GLTF uploads
+                        may reference files Batshit cannot receive.
+                      {/if}
+                    </div>
+                    <div class="batshit-settings-child-label">
+                      After creation, choose Uploaded GLB or Procedural Builder and configure the
+                      room surfaces.
+                    </div>
+                  </div>
+                  {#if newSceneRoomShell}
+                    {@render roomShellTransformControls(
+                      newSceneRoomShellTransform,
+                      updateNewRoomShellTransform,
+                      null
+                    )}
+                  {/if}
+                </Collapsible.Content>
+              </Collapsible.Root>
+              <div class="batshit-settings-child-label px-1">
+                Create the scene to configure procedural surfaces, Props, and Markers.
               </div>
             </div>
           {:else}
@@ -16148,80 +18503,95 @@
                         updateScene(scene.id, { description: value || undefined })
                       }}
                     />
-                    <div class="batshit-goon-editor-subpanel">
-                      <div class="flex flex-wrap items-start gap-3">
-                        <div class="batshit-goon-thumbnail-frame is-small">
-                          {#if resolveSceneThumbnailUrl(scene)}
-                            <img
-                              src={resolveSceneThumbnailUrl(scene) ?? undefined}
-                              alt="Skybox thumbnail"
-                              class="h-full w-full object-cover"
-                            />
-                          {:else}
-                            <div class="batshit-settings-child-label flex h-full w-full items-center justify-center">
-                              No Thumb
-                            </div>
-                          {/if}
-                        </div>
-                        <div class="min-w-0 flex-1 space-y-2">
-                          <div class="flex flex-wrap items-center gap-2">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onclick={() => requestSceneSkyboxUpload(scene.id)}
-                              disabled={sceneUploadBusy}
-                            >
-                              {sceneUploadBusy
-                                ? 'Uploading…'
-                                : scene.skybox
-                                  ? 'Update Skybox'
-                                  : 'Upload Skybox'}
-                            </Button>
-                          </div>
-                          <div class="batshit-settings-child-label">
-                            {#if scene.skybox}
-                              {#if !resolveSceneThumbnailUrl(scene)}
-                                This scene still uses the original full image. Update Skybox to generate a thumbnail copy.
-                              {/if}
-                            {:else}
-                              No skybox uploaded.
-                            {/if}
-                          </div>
-                          {#if scene.skybox}
-                            <div class="truncate text-[10px] text-muted-foreground">
-                              {scene.skybox.originalName || scene.skybox.filename}
-                            </div>
-                          {/if}
-                        </div>
-                      </div>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onclick={() => requestRoomShellUpload(scene.id)}
-                        disabled={sceneRoomShellBusy}
-                      >
-                        {scene.roomShell ? 'Replace Room Shell' : 'Add Room Shell'}
-                      </Button>
-                      {#if scene.roomShell}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onclick={() => clearRoomShell(scene.id)}
-                        >
-                          <Trash2 aria-hidden="true" />
-
-                          Remove
-                        </Button>
-                      {/if}
-                    </div>
-                    {#if scene.roomShell}
-                      <div class="batshit-settings-child-label truncate">
-                        {scene.roomShell.originalName || scene.roomShell.filename}
-                      </div>
-                    {/if}
                     <div class="mt-2 space-y-2">
+                      <Collapsible.Root bind:open={sceneWorldOpen} class={goonLevel1AccordionClass}>
+                        <Collapsible.Trigger
+                          class={goonLevel1AccordionHeaderClass}
+                          onclick={() => toggleSceneSection('world')}
+                        >
+                          <div class="flex items-center gap-1.5">
+                            <span class="batshit-settings-form-label">World</span>
+                            <div
+                              onclick={(event) => {
+                                event.preventDefault()
+                                event.stopPropagation()
+                              }}
+                              aria-hidden="true"
+                            >
+                              <SettingsInfoMenu ariaLabel="About World" contentClass="w-80">
+                                <p>
+                                  World controls the 360 Skybox, how it meets the stage, and one saved
+                                  Scene Atmosphere layer.
+                                </p>
+                              </SettingsInfoMenu>
+                            </div>
+                          </div>
+                        </Collapsible.Trigger>
+                        <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
+                          {@const ambience = normalizeGoonSceneAmbience(scene.ambience)}
+                          <div class="batshit-goon-editor-subpanel space-y-3">
+                            <div class="flex items-center justify-between gap-2">
+                              <span class="batshit-settings-child-label">Skybox</span>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onclick={() => requestSceneSkyboxUpload(scene.id)}
+                                disabled={sceneUploadBusy}
+                              >
+                                {sceneUploadBusy
+                                  ? 'Uploading…'
+                                  : scene.skybox
+                                    ? 'Update Skybox'
+                                    : 'Upload Skybox'}
+                              </Button>
+                            </div>
+                            <div class="flex flex-wrap items-start gap-3">
+                              <div class="batshit-goon-thumbnail-frame is-small">
+                                {#if resolveSceneThumbnailUrl(scene)}
+                                  <img
+                                    src={resolveSceneThumbnailUrl(scene) ?? undefined}
+                                    alt="Skybox thumbnail"
+                                    class="h-full w-full object-cover"
+                                  />
+                                {:else}
+                                  <div class="batshit-settings-child-label flex h-full w-full items-center justify-center">
+                                    No Thumb
+                                  </div>
+                                {/if}
+                              </div>
+                              <div class="min-w-0 flex-1 space-y-1">
+                                <div class="batshit-settings-child-label">
+                                  {#if scene.skybox}
+                                    {#if !resolveSceneThumbnailUrl(scene)}
+                                      Update this Skybox to generate a thumbnail copy.
+                                    {:else}
+                                      Skybox ready
+                                    {/if}
+                                  {:else}
+                                    No skybox uploaded.
+                                  {/if}
+                                </div>
+                                {#if scene.skybox}
+                                  <div class="truncate text-[10px] text-muted-foreground">
+                                    {scene.skybox.originalName || scene.skybox.filename}
+                                  </div>
+                                {/if}
+                              </div>
+                            </div>
+                          </div>
+                          {@render scenePlacementControls(
+                            resolveGoonScenePlacement(scene),
+                            normalizeGroundProjectionLine(scene.groundProjectionLine),
+                            (placement: GoonScenePlacement) => updateScenePlacement(scene.id, placement),
+                            (value: number) => updateSceneGroundProjectionLine(scene.id, value)
+                          )}
+                          {@render sceneAtmosphereControls(
+                            ambience,
+                            (patch: Partial<GoonSceneAmbience>) => updateSceneAmbience(scene.id, patch)
+                          )}
+                        </Collapsible.Content>
+                      </Collapsible.Root>
+
                       <Collapsible.Root bind:open={roomBuilderOpen} class={goonLevel1AccordionClass}>
                         <Collapsible.Trigger
                           class={goonLevel1AccordionHeaderClass}
@@ -16254,6 +18624,45 @@
                           </div>
                         </Collapsible.Trigger>
                         <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
+                          <div class="batshit-goon-editor-subpanel space-y-3">
+                            <div class="flex items-center justify-between gap-2">
+                              <span class="batshit-settings-child-label">Room Shell</span>
+                              <div class="flex items-center gap-2">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onclick={() => requestRoomShellUpload(scene.id)}
+                                  disabled={sceneRoomShellBusy}
+                                >
+                                  {sceneRoomShellBusy
+                                    ? 'Uploading…'
+                                    : scene.roomShell
+                                      ? 'Replace Room Shell'
+                                      : 'Upload Room Shell'}
+                                </Button>
+                                {#if scene.roomShell}
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onclick={() => clearRoomShell(scene.id)}
+                                  >
+                                    <Trash2 aria-hidden="true" />
+                                    Remove
+                                  </Button>
+                                {/if}
+                              </div>
+                            </div>
+                            <div class="text-[11px] text-muted-foreground">
+                              {#if scene.roomShell}
+                                <span class="block truncate">
+                                  {scene.roomShell.originalName || scene.roomShell.filename}
+                                </span>
+                              {:else}
+                                Optional. Use a self-contained GLB when possible; single-file GLTF
+                                uploads may reference files Batshit cannot receive.
+                              {/if}
+                            </div>
+                          </div>
                           {#if scene.roomShell?.url}
                             <Select.Root
                               type="single"
@@ -16275,6 +18684,20 @@
                                 <Select.Item value="builder">Procedural Builder</Select.Item>
                               </Select.Content>
                             </Select.Root>
+                          {/if}
+                          {#if scene.roomShell?.url && !scene.roomShellBuilder}
+                            {@render roomShellTransformControls(
+                              normalizeRoomShellTransform(scene.roomShellTransform),
+                              (patch: Partial<GoonSceneRoomShellTransform>) =>
+                                updateRoomShellTransform(scene.id, patch),
+                              () => void alignRoomShellFloor(scene.id)
+                            )}
+                            {@render roomCameraBoundaryControls(
+                              scene.cameraBoundary,
+                              (boundary: GoonSceneCameraBoundary | null) =>
+                                updateRoomCameraBoundary(scene.id, boundary),
+                              () => void suggestRoomCameraBoundary(scene.id)
+                            )}
                           {/if}
                           {#if scene.roomShellBuilder || !scene.roomShell?.url}
                             {@const builder = normalizeRoomShellBuilder(scene.roomShellBuilder)}
@@ -17099,6 +19522,7 @@
                                   size="sm"
                                   onclick={() => addSceneMarker(scene.id, posture)}
                                   disabled={
+                                    scenePreviewBodyMode !== 'active-goon' ||
                                     !kitchenPreviewGoonId ||
                                     postureMotionNames.length === 0 ||
                                     activeSceneEdit?.type === 'marker'
@@ -17109,7 +19533,11 @@
                                   Add
                                 </Button>
                               </div>
-                              {#if !kitchenPreviewGoonId}
+                              {#if scenePreviewBodyMode !== 'active-goon'}
+                                <div class="batshit-settings-child-label">
+                                  Preview with active Goon before creating Markers.
+                                </div>
+                              {:else if !kitchenPreviewGoonId}
                                 <div class="batshit-settings-child-label">
                                   Select a preview Goon first so Batshit can position this Marker with
                                   a real Motion.
@@ -17300,12 +19728,12 @@
           loading={kitchenPreviewLoading}
           error={kitchenPreviewError}
           emptyMessage={
-            !kitchenPreviewGoonId
-              ? 'Select a Goon to preview.'
-              : sceneEditorMode === 'create'
-                ? 'Create the scene to preview it.'
-                : !sceneEditorId
-                  ? 'Select a scene to preview.'
+            sceneEditorMode === 'create'
+              ? 'Create the scene to preview it.'
+              : !sceneEditorId
+                ? 'Select a scene to preview.'
+                : scenePreviewBodyMode === 'active-goon' && !kitchenPreviewGoonId
+                  ? 'Select a Goon to preview.'
                   : null
           }
           wrapperClass="h-full min-h-0 batshit-settings-preview-shell"
@@ -17341,73 +19769,144 @@
             {/if}
           {/snippet}
           <div class="flex items-center gap-1 min-w-0 flex-1">
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger
-                class="batshit-settings-icon-trigger"
-                disabled={goons.length === 0}
-                aria-label="Select preview Goon"
-                title={`Preview Goon: ${kitchenPreviewGoon?.name || 'None'}`}
-              >
-                <BatshitIcon id="goons" class="h-4 w-4" />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Content align="start" class="min-w-[220px] max-w-[360px]">
-                {#if goons.length > 0}
-                  {#each goons as goonEntry (goonEntry.id)}
-                    <DropdownMenu.Item onSelect={() => handleScenePreviewGoonSelect(goonEntry.id)}>
-                      <span class="truncate">
-                        {goonEntry.name || 'Unnamed Goon'}{kitchenPreviewGoonId === goonEntry.id ? ' • Current' : ''}
-                      </span>
-                    </DropdownMenu.Item>
-                  {/each}
-                {:else}
-                  <DropdownMenu.Item disabled>
-                    <span class="text-muted-foreground">No goons available</span>
-                  </DropdownMenu.Item>
-                {/if}
-              </DropdownMenu.Content>
-            </DropdownMenu.Root>
+            <Button
+              variant={scenePreviewBodyMode === 'proxy' ? 'secondary' : 'outline'}
+              size="sm"
+              onclick={() => setScenePreviewBodyMode('proxy')}
+              disabled={Boolean(activeSceneEdit)}
+              aria-label="Use scale proxy"
+              title={
+                activeSceneEdit
+                  ? 'Apply or cancel the active scene edit before changing preview body.'
+                  : 'Use scale proxy'
+              }
+            >
+              <PersonStanding aria-hidden="true" />
+              <span class="hidden xl:inline">Proxy</span>
+            </Button>
+            <Button
+              variant={scenePreviewBodyMode === 'active-goon' ? 'secondary' : 'outline'}
+              size="sm"
+              onclick={() => setScenePreviewBodyMode('active-goon')}
+              disabled={goons.length === 0 || Boolean(activeSceneEdit)}
+              aria-label="Preview with active Goon"
+              title={
+                activeSceneEdit
+                  ? 'Apply or cancel the active scene edit before changing preview body.'
+                  : goons.length === 0
+                    ? 'No Goons available'
+                    : 'Preview with active Goon'
+              }
+            >
+              <BatshitIcon id="goons" class="h-4 w-4" />
+              <span class="hidden xl:inline">Active Goon</span>
+            </Button>
 
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger
-                class="batshit-settings-icon-trigger"
-                disabled={!kitchenPreviewGoonId || kitchenAvailableAnimationNames.length === 0}
-                aria-label="Select preview Motion"
+            {#if scenePreviewBodyMode === 'proxy'}
+              <Button
+                variant={sceneProxyPoseId === 'stand' ? 'secondary' : 'outline'}
+                size="sm"
+                onclick={() => setSceneProxyPose('stand')}
+                disabled={Boolean(activeSceneEdit)}
+                aria-label="Use standing proxy pose"
                 title={
-                  kitchenPreviewAnimationName
-                    ? `Preview Motion: ${kitchenPreviewAnimationName}`
-                    : 'Select preview Motion'
+                  activeSceneEdit
+                    ? 'Apply or cancel the active scene edit before changing proxy pose.'
+                    : 'Standing proxy pose'
                 }
               >
-                <BatshitIcon id="motions" class="h-4 w-4" />
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Content align="start" class="min-w-[240px] max-h-[320px] overflow-y-auto">
-                {#if kitchenAvailableAnimationNames.length > 0}
-                  {#each kitchenAvailableAnimationNames as animationName}
-                    <DropdownMenu.Item
-                      onSelect={() => {
-                        kitchenPreviewAnimationName = animationName
-                        void triggerKitchenPreviewAnimation()
-                      }}
-                    >
-                      <span class="truncate">
-                        {animationName}{kitchenPreviewAnimationName === animationName ? ' • Current' : ''}
-                      </span>
+                <PersonStanding aria-hidden="true" />
+                <span class="hidden xl:inline">Stand</span>
+              </Button>
+              <Button
+                variant={sceneProxyPoseId === 'sit' ? 'secondary' : 'outline'}
+                size="sm"
+                onclick={() => setSceneProxyPose('sit')}
+                disabled={Boolean(activeSceneEdit)}
+                aria-label="Use seated proxy pose"
+                title={
+                  activeSceneEdit
+                    ? 'Apply or cancel the active scene edit before changing proxy pose.'
+                    : 'Seated proxy pose'
+                }
+              >
+                <Armchair aria-hidden="true" />
+                <span class="hidden xl:inline">Sit</span>
+              </Button>
+            {/if}
+
+            {#if scenePreviewBodyMode === 'active-goon'}
+              <DropdownMenu.Root>
+                <DropdownMenu.Trigger
+                  class="batshit-settings-icon-trigger"
+                  disabled={goons.length === 0}
+                  aria-label="Select preview Goon"
+                  title={`Preview Goon: ${kitchenPreviewGoon?.name || 'None'}`}
+                >
+                  <BatshitIcon id="goons" class="h-4 w-4" />
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Content align="start" class="min-w-[220px] max-w-[360px]">
+                  {#if goons.length > 0}
+                    {#each goons as goonEntry (goonEntry.id)}
+                      <DropdownMenu.Item onSelect={() => handleScenePreviewGoonSelect(goonEntry.id)}>
+                        <span class="truncate">
+                          {goonEntry.name || 'Unnamed Goon'}{kitchenPreviewGoonId === goonEntry.id ? ' • Current' : ''}
+                        </span>
+                      </DropdownMenu.Item>
+                    {/each}
+                  {:else}
+                    <DropdownMenu.Item disabled>
+                      <span class="text-muted-foreground">No goons available</span>
                     </DropdownMenu.Item>
-                  {/each}
-                {:else}
-                  <DropdownMenu.Item disabled>
-                    <span class="text-muted-foreground">No motions available</span>
-                  </DropdownMenu.Item>
-                {/if}
-              </DropdownMenu.Content>
-            </DropdownMenu.Root>
+                  {/if}
+                </DropdownMenu.Content>
+              </DropdownMenu.Root>
+
+              <DropdownMenu.Root>
+                <DropdownMenu.Trigger
+                  class="batshit-settings-icon-trigger"
+                  disabled={!kitchenPreviewGoonId || kitchenAvailableAnimationNames.length === 0}
+                  aria-label="Select preview Motion"
+                  title={
+                    kitchenPreviewAnimationName
+                      ? `Preview Motion: ${kitchenPreviewAnimationName}`
+                      : 'Select preview Motion'
+                  }
+                >
+                  <BatshitIcon id="motions" class="h-4 w-4" />
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Content align="start" class="min-w-[240px] max-h-[320px] overflow-y-auto">
+                  {#if kitchenAvailableAnimationNames.length > 0}
+                    {#each kitchenAvailableAnimationNames as animationName}
+                      <DropdownMenu.Item
+                        onSelect={() => {
+                          kitchenPreviewAnimationName = animationName
+                          void triggerKitchenPreviewAnimation()
+                        }}
+                      >
+                        <span class="truncate">
+                          {animationName}{kitchenPreviewAnimationName === animationName ? ' • Current' : ''}
+                        </span>
+                      </DropdownMenu.Item>
+                    {/each}
+                  {:else}
+                    <DropdownMenu.Item disabled>
+                      <span class="text-muted-foreground">No motions available</span>
+                    </DropdownMenu.Item>
+                  {/if}
+                </DropdownMenu.Content>
+              </DropdownMenu.Root>
+            {/if}
 
             <Button
               variant="ghost"
               size="sm"
 
               onclick={() => void resetKitchenPreviewAll()}
-              disabled={!kitchenPreviewGoonId || activeSceneEdit?.type === 'marker'}
+              disabled={
+                (scenePreviewBodyMode === 'active-goon' && !kitchenPreviewGoonId) ||
+                activeSceneEdit?.type === 'marker'
+              }
               aria-label="Reset preview view controls and clear animation preview"
               title={
                 activeSceneEdit?.type === 'marker'
@@ -17419,7 +19918,7 @@
             </Button>
           </div>
           <SettingsPreviewViewControls
-            disabled={!kitchenPreviewGoonId}
+            disabled={scenePreviewBodyMode === 'active-goon' && !kitchenPreviewGoonId}
             eyeContactEnabled={settingsPreviewEyeContactEnabled}
             onEyeContactToggle={() => {
               settingsPreviewEyeContactEnabled = !settingsPreviewEyeContactEnabled
@@ -17428,6 +19927,10 @@
             minFov={MIN_PREVIEW_VIEW_FOV}
             maxFov={MAX_PREVIEW_VIEW_FOV}
             onFovChange={handlePreviewFovChange}
+            onFramePreset={handleKitchenPreviewFramePreset}
+            cameraMode={previewCameraMode}
+            indoorCameraAvailable={kitchenPreviewEngine?.canUseIndoorCamera() ?? false}
+            onCameraModeChange={(mode) => handlePreviewCameraModeChange(kitchenPreviewEngine, mode, false)}
             quality={kitchenPreviewQuality}
             qualityOptions={qualityOptions}
             onQualityChange={(value) => {
@@ -17459,6 +19962,66 @@
         onDiscard={discardAndContinueExit}
         onSave={saveAndContinueExit}
       />
+
+      <Dialog.Root
+        open={motionReplaceConflicts.length > 0}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen && !motionReplaceBusy) {
+            skipMotionReplacements()
+          }
+        }}
+      >
+        <Dialog.Content class="sm:max-w-md">
+          <Dialog.Header>
+            <Dialog.Title>
+              {motionReplaceConflicts.length === 1
+                ? 'Replace this motion version?'
+                : `Replace ${motionReplaceConflicts.length} motion versions?`}
+            </Dialog.Title>
+            <Dialog.Description>
+              {motionReplaceConflicts.length === 1
+                ? 'Your library already has this format of this motion.'
+                : 'Your library already has these formats of these motions.'}
+              Replacing swaps the animation file but keeps the motion's name, tags, and
+              settings. To keep both versions instead, skip and rename the
+              {motionReplaceConflicts.length === 1 ? 'file' : 'files'} before uploading again.
+            </Dialog.Description>
+          </Dialog.Header>
+          <div class="max-h-48 space-y-1 overflow-y-auto text-sm text-muted-foreground">
+            {#each motionReplaceConflicts as conflict (conflict.file.name + conflict.laneLabel)}
+              <p class="break-all">
+                <span class="text-foreground">{conflict.motionName}</span>
+                <Badge variant="outline" class="batshit-settings-child-label ml-1.5">
+                  {conflict.laneLabel}
+                </Badge>
+              </p>
+            {/each}
+          </div>
+          <Dialog.Footer class="gap-2">
+            <Button
+              variant="ghost"
+              type="button"
+              onclick={skipMotionReplacements}
+              disabled={motionReplaceBusy}
+            >
+              <X aria-hidden="true" />
+
+              Skip These
+            </Button>
+            <Button
+              type="button"
+              onclick={() => void confirmMotionReplacements()}
+              disabled={motionReplaceBusy}
+            >
+              {motionReplaceBusy
+                ? 'Replacing…'
+                : motionReplaceConflicts.length === 1
+                  ? 'Replace Version'
+                  : 'Replace All'}
+            </Button>
+          </Dialog.Footer>
+        </Dialog.Content>
+      </Dialog.Root>
 	    </Tabs.Root>
 </div>
 </div>

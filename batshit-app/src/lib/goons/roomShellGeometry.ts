@@ -1,11 +1,31 @@
 import * as THREE from 'three'
 
-import { ROOM_DEFAULT_HEIGHT, ROOM_DEFAULT_SIZE } from '$lib/goons/roomBuilder'
+import {
+  ROOM_DEFAULT_EXTERIOR_APRON_DEPTH,
+  ROOM_DEFAULT_TERRAIN_SKIRT_EDGE_FADE,
+  ROOM_DEFAULT_TERRAIN_SKIRT_RADIUS,
+  ROOM_DEFAULT_TERRAIN_SKIRT_SEGMENTS,
+  ROOM_DEFAULT_TERRAIN_SKIRT_SLOPE_ANGLE_DEG,
+  ROOM_DEFAULT_HEIGHT,
+  ROOM_DEFAULT_SIZE,
+  ROOM_MAX_EXTERIOR_APRON_DEPTH,
+  ROOM_MAX_TERRAIN_SKIRT_EDGE_FADE,
+  ROOM_MAX_TERRAIN_SKIRT_RADIUS,
+  ROOM_MAX_TERRAIN_SKIRT_SEGMENTS,
+  ROOM_MAX_TERRAIN_SKIRT_SLOPE_ANGLE_DEG,
+  ROOM_MIN_EXTERIOR_APRON_DEPTH,
+  ROOM_MIN_TERRAIN_SKIRT_EDGE_FADE,
+  ROOM_MIN_TERRAIN_SKIRT_RADIUS,
+  ROOM_MIN_TERRAIN_SKIRT_SEGMENTS,
+  ROOM_MIN_TERRAIN_SKIRT_SLOPE_ANGLE_DEG
+} from '$lib/goons/roomBuilder'
 import type {
   GoonFileRef,
+  GoonRoomExteriorApron,
   GoonRoomShellBuilder,
   GoonRoomSurface,
-  GoonRoomSurfaceSide
+  GoonRoomSurfaceSide,
+  GoonRoomTerrainSkirt
 } from '$lib/types/goons'
 
 const ROOM_DEFAULT_DEPTH = ROOM_DEFAULT_SIZE
@@ -30,6 +50,23 @@ export type NormalizedRoomSurface = {
   exterior: NormalizedRoomSurfaceSide
 }
 
+export type NormalizedRoomExteriorApron = {
+  enabled: boolean
+  depth: number
+  surface: NormalizedRoomSurfaceSide
+}
+
+export type NormalizedRoomTerrainSkirt = {
+  enabled: boolean
+  radius: number
+  edgeFade: number
+  slopeAngleDeg: number
+  projection: 'surface' | 'skybox-ground'
+  segments: number
+  opacity: number
+  surface: NormalizedRoomSurfaceSide
+}
+
 export type NormalizedRoomShellBuilder = {
   width: number
   depth: number
@@ -45,6 +82,13 @@ export type NormalizedRoomShellBuilder = {
       west: NormalizedRoomSurface
     }
   }
+  exteriorAprons: {
+    north: NormalizedRoomExteriorApron
+    south: NormalizedRoomExteriorApron
+    east: NormalizedRoomExteriorApron
+    west: NormalizedRoomExteriorApron
+  }
+  terrainSkirt: NormalizedRoomTerrainSkirt
   exteriorTexture?: GoonFileRef
 }
 
@@ -66,6 +110,11 @@ export type RoomShellTextureSet = {
   southExteriorTexture: THREE.Texture | null
   eastExteriorTexture: THREE.Texture | null
   westExteriorTexture: THREE.Texture | null
+  northApronTexture: THREE.Texture | null
+  southApronTexture: THREE.Texture | null
+  eastApronTexture: THREE.Texture | null
+  westApronTexture: THREE.Texture | null
+  terrainSkirtTexture: THREE.Texture | null
 }
 
 type CutoutGeometryCacheEntry = {
@@ -126,6 +175,73 @@ function normalizeRoomSurface(
     enabled,
     interior: normalizeRoomSurfaceSide(interiorInput, defaults.interior),
     exterior: normalizeRoomSurfaceSide(exteriorInput, defaults.exterior)
+  }
+}
+
+function normalizeRoomExteriorApron(
+  apron?: GoonRoomExteriorApron | null,
+  defaultTexture?: GoonFileRef
+): NormalizedRoomExteriorApron {
+  const depth =
+    Number.isFinite(apron?.depth) && (apron?.depth ?? 0) > 0
+      ? Math.min(
+          ROOM_MAX_EXTERIOR_APRON_DEPTH,
+          Math.max(ROOM_MIN_EXTERIOR_APRON_DEPTH, Number(apron?.depth))
+        )
+      : ROOM_DEFAULT_EXTERIOR_APRON_DEPTH
+  return {
+    enabled: apron?.enabled ?? false,
+    depth,
+    surface: normalizeRoomSurfaceSide(apron?.surface, {
+      texture: defaultTexture,
+      transparency: 'opaque'
+    })
+  }
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number) {
+  const numeric = Number.isFinite(value) ? Number(value) : fallback
+  return Math.min(max, Math.max(min, numeric))
+}
+
+function normalizeRoomTerrainSkirt(
+  terrainSkirt?: GoonRoomTerrainSkirt | null,
+  defaultTexture?: GoonFileRef
+): NormalizedRoomTerrainSkirt {
+  return {
+    enabled: terrainSkirt?.enabled ?? false,
+    radius: clampNumber(
+      terrainSkirt?.radius,
+      ROOM_DEFAULT_TERRAIN_SKIRT_RADIUS,
+      ROOM_MIN_TERRAIN_SKIRT_RADIUS,
+      ROOM_MAX_TERRAIN_SKIRT_RADIUS
+    ),
+    edgeFade: clampNumber(
+      terrainSkirt?.edgeFade,
+      ROOM_DEFAULT_TERRAIN_SKIRT_EDGE_FADE,
+      ROOM_MIN_TERRAIN_SKIRT_EDGE_FADE,
+      ROOM_MAX_TERRAIN_SKIRT_EDGE_FADE
+    ),
+    slopeAngleDeg: clampNumber(
+      terrainSkirt?.slopeAngleDeg,
+      ROOM_DEFAULT_TERRAIN_SKIRT_SLOPE_ANGLE_DEG,
+      ROOM_MIN_TERRAIN_SKIRT_SLOPE_ANGLE_DEG,
+      ROOM_MAX_TERRAIN_SKIRT_SLOPE_ANGLE_DEG
+    ),
+    projection: terrainSkirt?.projection === 'skybox-ground' ? 'skybox-ground' : 'surface',
+    segments: Math.round(
+      clampNumber(
+        terrainSkirt?.segments,
+        ROOM_DEFAULT_TERRAIN_SKIRT_SEGMENTS,
+        ROOM_MIN_TERRAIN_SKIRT_SEGMENTS,
+        ROOM_MAX_TERRAIN_SKIRT_SEGMENTS
+      )
+    ),
+    opacity: clampNumber(terrainSkirt?.opacity, 1, 0.05, 1),
+    surface: normalizeRoomSurfaceSide(terrainSkirt?.surface, {
+      texture: defaultTexture,
+      transparency: 'opaque'
+    })
   }
 }
 
@@ -218,6 +334,8 @@ export function normalizeGoonRoomShellBuilder(
     interior: { texture: legacy.wallTexture },
     exterior: { texture: fallbackExterior }
   })
+  const exteriorAprons = builder.exteriorAprons ?? {}
+  const terrainSkirt = builder.terrainSkirt ?? {}
 
   return {
     width,
@@ -228,7 +346,14 @@ export function normalizeGoonRoomShellBuilder(
       floor,
       ceiling,
       walls: { north, south, east, west }
-    }
+    },
+    exteriorAprons: {
+      north: normalizeRoomExteriorApron(exteriorAprons.north, floor.interior.texture),
+      south: normalizeRoomExteriorApron(exteriorAprons.south, floor.interior.texture),
+      east: normalizeRoomExteriorApron(exteriorAprons.east, floor.interior.texture),
+      west: normalizeRoomExteriorApron(exteriorAprons.west, floor.interior.texture)
+    },
+    terrainSkirt: normalizeRoomTerrainSkirt(terrainSkirt, floor.interior.texture)
   }
 }
 
@@ -251,6 +376,7 @@ export class RoomShellGeometryBuilder {
     const depth = builder.depth
     const height = builder.height
     const { floor, ceiling, walls } = builder.surfaces
+    const { exteriorAprons, terrainSkirt } = builder
 
     const {
       floorTexture,
@@ -268,7 +394,12 @@ export class RoomShellGeometryBuilder {
       northExteriorTexture,
       southExteriorTexture,
       eastExteriorTexture,
-      westExteriorTexture
+      westExteriorTexture,
+      northApronTexture,
+      southApronTexture,
+      eastApronTexture,
+      westApronTexture,
+      terrainSkirtTexture
     } = textureSet
 
     const group = new THREE.Group()
@@ -391,6 +522,61 @@ export class RoomShellGeometryBuilder {
       group.add(plane)
       return plane
     }
+
+    const buildApronPlane = (
+      apron: NormalizedRoomExteriorApron,
+      texture: THREE.Texture | null,
+      planeWidth: number,
+      planeDepth: number,
+      position: THREE.Vector3,
+      fallbackColor: number
+    ) => {
+      if (!apron.enabled) return
+      if (texture) {
+        this.configureRoomTexture(texture, apron.surface)
+      }
+      const material = buildMaterial(apron.surface, texture, fallbackColor)
+      const plane = new THREE.Mesh(new THREE.PlaneGeometry(planeWidth, planeDepth), material)
+      plane.position.copy(position)
+      plane.rotation.copy(new THREE.Euler(-Math.PI / 2, 0, 0))
+      group.add(plane)
+      return plane
+    }
+
+    const buildTerrainSkirt = (
+      skirt: NormalizedRoomTerrainSkirt,
+      texture: THREE.Texture | null
+    ) => {
+      if (!skirt.enabled || skirt.projection === 'skybox-ground') return
+      if (texture) {
+        this.configureRoomTexture(texture, skirt.surface)
+      }
+      const alphaMap = this.createTerrainSkirtAlphaMap(skirt.edgeFade)
+      const material = new THREE.MeshStandardMaterial({
+        color: texture ? 0xffffff : 0x31452a,
+        map: texture ?? null,
+        alphaMap,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: skirt.opacity,
+        depthWrite: false,
+        roughness: 0.95,
+        metalness: 0
+      })
+      const geometry = this.buildTerrainSkirtGeometry(
+        skirt.radius,
+        skirt.segments,
+        skirt.slopeAngleDeg,
+        Math.max(width, depth) * 0.55
+      )
+      const mesh = new THREE.Mesh(geometry, material)
+      mesh.position.set(0, -0.006, 0)
+      mesh.renderOrder = -10
+      group.add(mesh)
+      return mesh
+    }
+
+    buildTerrainSkirt(terrainSkirt, terrainSkirtTexture)
 
     buildPlane(
       floor,
@@ -566,6 +752,39 @@ export class RoomShellGeometryBuilder {
       0x141414
     )
 
+    buildApronPlane(
+      exteriorAprons.north,
+      northApronTexture,
+      width,
+      exteriorAprons.north.depth,
+      new THREE.Vector3(0, 0.002, -depth / 2 - exteriorAprons.north.depth / 2),
+      0x20201c
+    )
+    buildApronPlane(
+      exteriorAprons.south,
+      southApronTexture,
+      width,
+      exteriorAprons.south.depth,
+      new THREE.Vector3(0, 0.002, depth / 2 + exteriorAprons.south.depth / 2),
+      0x20201c
+    )
+    buildApronPlane(
+      exteriorAprons.east,
+      eastApronTexture,
+      exteriorAprons.east.depth,
+      depth,
+      new THREE.Vector3(width / 2 + exteriorAprons.east.depth / 2, 0.002, 0),
+      0x20201c
+    )
+    buildApronPlane(
+      exteriorAprons.west,
+      westApronTexture,
+      exteriorAprons.west.depth,
+      depth,
+      new THREE.Vector3(-width / 2 - exteriorAprons.west.depth / 2, 0.002, 0),
+      0x20201c
+    )
+
     return group
   }
 
@@ -584,6 +803,95 @@ export class RoomShellGeometryBuilder {
       texture.offset.set(0, 0)
     }
     texture.needsUpdate = true
+  }
+
+  private buildTerrainSkirtGeometry(
+    radius: number,
+    segments: number,
+    slopeAngleDeg: number,
+    flatRadius: number
+  ) {
+    const radialSegments = 16
+    const safeSegments = Math.max(3, Math.round(segments))
+    const safeRadius = Math.max(1, radius)
+    const safeFlatRadius = Math.max(0, Math.min(flatRadius, safeRadius * 0.95))
+    const slopeRadians = THREE.MathUtils.degToRad(
+      Math.max(0, Math.min(ROOM_MAX_TERRAIN_SKIRT_SLOPE_ANGLE_DEG, slopeAngleDeg))
+    )
+    const slope = Math.tan(slopeRadians)
+    const positions: number[] = []
+    const uvs: number[] = []
+    const indices: number[] = []
+
+    for (let ring = 0; ring <= radialSegments; ring += 1) {
+      const t = ring / radialSegments
+      const ringRadius = safeRadius * t
+      const y = -Math.max(0, ringRadius - safeFlatRadius) * slope
+
+      for (let segment = 0; segment < safeSegments; segment += 1) {
+        const angle = (segment / safeSegments) * Math.PI * 2
+        const x = Math.cos(angle) * ringRadius
+        const z = Math.sin(angle) * ringRadius
+        positions.push(x, y, z)
+        uvs.push((x / safeRadius + 1) / 2, (z / safeRadius + 1) / 2)
+      }
+    }
+
+    for (let ring = 0; ring < radialSegments; ring += 1) {
+      for (let segment = 0; segment < safeSegments; segment += 1) {
+        const nextSegment = (segment + 1) % safeSegments
+        const current = ring * safeSegments + segment
+        const currentNext = ring * safeSegments + nextSegment
+        const outer = (ring + 1) * safeSegments + segment
+        const outerNext = (ring + 1) * safeSegments + nextSegment
+        indices.push(current, currentNext, outer)
+        indices.push(currentNext, outerNext, outer)
+      }
+    }
+
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2))
+    geometry.setIndex(indices)
+    geometry.computeVertexNormals()
+    return geometry
+  }
+
+  private createTerrainSkirtAlphaMap(edgeFade: number) {
+    const size = 256
+    const data = new Uint8Array(size * size * 4)
+    const center = (size - 1) / 2
+    const maxRadius = center
+    const fade = Math.max(0, Math.min(0.95, edgeFade))
+    const fadeStart = 1 - fade
+
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        const dx = x - center
+        const dy = y - center
+        const distance = Math.sqrt(dx * dx + dy * dy) / maxRadius
+        let alpha = 255
+        if (distance > 1) {
+          alpha = 0
+        } else if (fade > 0 && distance > fadeStart) {
+          const t = (distance - fadeStart) / fade
+          alpha = Math.max(0, Math.min(255, Math.round(255 * (1 - t))))
+        }
+        const index = (y * size + x) * 4
+        data[index] = alpha
+        data[index + 1] = alpha
+        data[index + 2] = alpha
+        data[index + 3] = alpha
+      }
+    }
+
+    const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat)
+    texture.wrapS = THREE.ClampToEdgeWrapping
+    texture.wrapT = THREE.ClampToEdgeWrapping
+    texture.minFilter = THREE.LinearFilter
+    texture.magFilter = THREE.LinearFilter
+    texture.needsUpdate = true
+    return texture
   }
 
   private normalizeShapeUVs(geometry: THREE.BufferGeometry) {

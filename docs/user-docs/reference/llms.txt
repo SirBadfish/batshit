@@ -88,10 +88,11 @@ n8n:
 
 Portable Skills:
 - Portable Skills are Batshit system-skill bundles installed into outside coding agents.
-- They operate local Batshit through GET /api/health, POST /api/controls/use, optional POST /api/controls/find, and x-batshit-portable-token.
+- Operational bundles operate local Batshit through GET /api/health, POST /api/controls/use, optional POST /api/controls/find, and x-batshit-portable-token.
+- Informational bundles (currently the Portable Batshit Guide) carry docs-only references and need no token at all.
 - Tokens are minted in Settings -> Skills & Prompts -> Portable Skills, scoped by family, shown once, and revocable.
 - Never tell users to paste BATSHIT_TOKEN, passwords, browser cookies, or n8n callback tokens into outside agents.
-- The Portable Skills tab shows copy-ready install prompts for the four public bundle zips.
+- The Portable Skills tab shows copy-ready install prompts for the six public bundle zips.
 - Public bundles are served under /portable-skills/ and listed in docs/user-docs/reference/portable-skills.md.
 - Private env files should normally live at ~/.batshit/portable-skills/portable-skills.env, not inside downloaded bundles. Per-skill env files are optional narrower-token overrides.
 

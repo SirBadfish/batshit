@@ -93,6 +93,8 @@ jobs:
           src/lib/server/tests/messageDeletion.test.ts
           src/lib/server/tests/folderDeletion.test.ts
           src/lib/server/services/__tests__/backupRestoreService.test.ts
+          src/lib/server/services/__tests__/goonRecipeRepository.test.ts
+          src/lib/server/services/__tests__/goonMutationRepository.test.ts
           src/tests/integration/story-5.22-gateway-service.test.ts
           src/tests/integration/story-5.23-redis-persistence.test.ts
           src/lib/server/icons/iconLibrary.test.ts
@@ -199,3 +201,7 @@ jobs:
             exit 1
           fi
           echo "No \$derived(fn) bug-pattern instances."
+      - name: Skill reference mirror gates (UserDocs -> batshit-guide, in-app -> portable)
+        run: |
+          node tools/system-skills/sync-userdocs-skill-references.mjs --check
+          node tools/portable-skills/sync-portable-skills.mjs --check

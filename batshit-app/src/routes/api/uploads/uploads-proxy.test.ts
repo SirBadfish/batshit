@@ -34,6 +34,7 @@ describe('upload proxies', () => {
     }
     process.env.BATSHIT_TOKEN = 'proxy-test-token'
     process.env.BATSHIT_SERVER_URL = 'http://batshit-server.test:5600'
+    process.env.PUBLIC_BATSHIT_SERVER_URL = 'http://localhost:5610'
     vi.stubGlobal('fetch', fetchSpy)
     fetchSpy.mockResolvedValue(
       new Response(JSON.stringify({ success: true }), {
@@ -59,6 +60,17 @@ describe('upload proxies', () => {
     })
 
     it('forwards with the service token and session-derived userId', async () => {
+      fetchSpy.mockResolvedValueOnce(
+        Response.json({
+          files: [
+            {
+              displayUrl: 'http://batshit-server.test:5600/uploads/images/photo.png',
+              localUrl: 'http://batshit-server.test:5600/uploads/images/photo.png'
+            }
+          ]
+        })
+      )
+
       const form = new FormData()
       form.append('files', new File(['fake-image'], 'photo.png', { type: 'image/png' }))
       form.append('compressionSettings', '{}')
@@ -75,6 +87,10 @@ describe('upload proxies', () => {
       const forwarded = init.body as FormData
       expect(forwarded.getAll('userId')).toEqual(['session-user'])
       expect(forwarded.getAll('files')).toHaveLength(1)
+
+      const body = await response.json()
+      expect(body.files[0].displayUrl).toBe('http://localhost:5610/uploads/images/photo.png')
+      expect(body.files[0].localUrl).toBe('http://localhost:5610/uploads/images/photo.png')
     })
   })
 
@@ -94,6 +110,13 @@ describe('upload proxies', () => {
     })
 
     it('forwards known entity types with the service token', async () => {
+      fetchSpy.mockResolvedValueOnce(
+        Response.json({
+          url: 'http://batshit-server.test:5600/uploads/avatars/agent/a.png',
+          avatar_url: 'http://batshit-server.test:5600/uploads/avatars/agent/a.png'
+        })
+      )
+
       const form = new FormData()
       form.append('file', new File(['x'], 'a.png', { type: 'image/png' }))
       form.append('entityType', 'agent')
@@ -107,6 +130,10 @@ describe('upload proxies', () => {
       expect((init.headers as Record<string, string>)['x-batshit-service-token']).toBe(
         'proxy-test-token'
       )
+
+      const body = await response.json()
+      expect(body.url).toBe('http://localhost:5610/uploads/avatars/agent/a.png')
+      expect(body.avatar_url).toBe('http://localhost:5610/uploads/avatars/agent/a.png')
     })
   })
 })

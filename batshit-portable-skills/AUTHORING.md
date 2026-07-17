@@ -9,6 +9,7 @@ Portable skills must stay agent-agnostic.
 - Required frontmatter: `name`, `description`.
 - Optional metadata must be safe for agents to ignore.
 - References are ordinary Markdown files under `references/`.
+- Optional non-secret assets may live under `assets/` when the matching in-app skill owns shippable workflow files or templates.
 - No bundled scripts in v1 portable bundles.
 
 ## Transport
@@ -60,7 +61,7 @@ Do not put real tokens in `batshit-portable-skills/<skill-id>/`, downloaded zips
 
 ## Drift Control
 
-Shared references are copied from in-app system skill sources by `tools/portable-skills/sync-portable-skills.mjs`.
+Shared references and assets are copied from in-app system skill sources by `tools/portable-skills/sync-portable-skills.mjs`.
 
 When a shared in-app reference changes:
 
@@ -69,4 +70,4 @@ node tools/portable-skills/sync-portable-skills.mjs --write
 node tools/portable-skills/sync-portable-skills.mjs --check
 ```
 
-Do not hand-copy shared references.
+Do not hand-copy shared references or shared assets.

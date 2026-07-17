@@ -7,6 +7,26 @@ import { createDeflateRaw, deflateRawSync } from 'node:zlib'
 import { unzipSync } from 'fflate/node'
 
 import { redis } from '$lib/server/redis'
+import {
+  GOON_RECIPE_OWNER_V2_CONTRACT,
+  GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+  parseGoonRecipeJob,
+  parseRecipeRevisionEnvelope,
+  recipeAuthoringRevisionSha256,
+  recipeDocumentRedisKey,
+  recipeJobRedisKey,
+  recipeRevisionBundleSha256,
+  recipeRevisionEnvelopeSha256,
+  recipeRevisionRedisKey,
+  verifyGoonRecipeDocument,
+  verifyGoonRecipeV2,
+  verifyRecipeRevisionEnvelope,
+  type GoonRecipeDocument,
+  type GoonRecipeJob,
+  type GoonRecipeV2,
+  type RecipeDocumentRef,
+  type RecipeRevisionEnvelope
+} from '$lib/goons/recipe'
 
 export const BATSHIT_BACKUP_SCHEMA_VERSION = 1
 
@@ -300,15 +320,6 @@ function resolveUploadsDir() {
   const explicit = process.env.UPLOADS_DIR?.trim()
   if (explicit) return path.resolve(explicit)
   return path.resolve(process.cwd(), '../batshit-server/server/uploads')
-}
-
-function resolvePublicBatshitServerUrl() {
-  const raw =
-    process.env.PUBLIC_BATSHIT_SERVER_URL?.trim() ||
-    process.env.BATSHIT_PUBLIC_SERVER_URL?.trim() ||
-    process.env.BATSHIT_SERVER_URL?.trim() ||
-    'http://localhost:5600'
-  return raw.replace(/\/+$/, '')
 }
 
 function toPosixPath(input: string) {
@@ -914,6 +925,18 @@ function remapUserValue(value: unknown, sourceUserId: string, targetUserId: stri
 
   if (!isPlainObject(value)) {
     if (value === `settings_${sourceUserId}`) return `settings_${targetUserId}`
+    if (typeof value === 'string') {
+      for (const prefix of [
+        'goon_recipe_revision:',
+        'goon_recipe_document:',
+        'goon_recipe_job:'
+      ]) {
+        const sourcePrefix = `${prefix}${sourceUserId}:`
+        if (value.startsWith(sourcePrefix)) {
+          return `${prefix}${targetUserId}:${value.slice(sourcePrefix.length)}`
+        }
+      }
+    }
     return value
   }
 
@@ -955,6 +978,9 @@ function remapUserKey(key: string, sourceUserId: string, targetUserId: string) {
     [`cli_tool_registry:${sourceUserId}`, `cli_tool_registry:${targetUserId}`],
     [`slash_command:${sourceUserId}:`, `slash_command:${targetUserId}:`],
     [`skill:${sourceUserId}:`, `skill:${targetUserId}:`],
+    [`goon_recipe_revision:${sourceUserId}:`, `goon_recipe_revision:${targetUserId}:`],
+    [`goon_recipe_document:${sourceUserId}:`, `goon_recipe_document:${targetUserId}:`],
+    [`goon_recipe_job:${sourceUserId}:`, `goon_recipe_job:${targetUserId}:`],
     [`voice_engine_registry:${sourceUserId}`, `voice_engine_registry:${targetUserId}`],
     [`user_artifact_usage:${sourceUserId}`, `user_artifact_usage:${targetUserId}`]
   ]
@@ -1091,7 +1117,15 @@ function groupForKey(key: string, userId: string): BackupGroupId {
   ) {
     return 'artifacts'
   }
-  if (key === `user:${userId}:goons` || key.startsWith('goon:')) return 'goons'
+  if (
+    key === `user:${userId}:goons` ||
+    key.startsWith('goon:') ||
+    key.startsWith(`goon_recipe_revision:${userId}:`) ||
+    key.startsWith(`goon_recipe_document:${userId}:`) ||
+    key.startsWith(`goon_recipe_job:${userId}:`)
+  ) {
+    return 'goons'
+  }
   if (
     key === `user:${userId}:icons` ||
     key.startsWith(`icon:${userId}:`) ||
@@ -1157,7 +1191,10 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `artifact_runtime_storage:${userId}:`,
     `icon:${userId}:`,
     `slash_command:${userId}:`,
-    `skill:${userId}:`
+    `skill:${userId}:`,
+    `goon_recipe_revision:${userId}:`,
+    `goon_recipe_document:${userId}:`,
+    `goon_recipe_job:${userId}:`
   ]
   if (userPrefixes.some((prefix) => key.startsWith(prefix))) return true
 
@@ -1372,6 +1409,9 @@ async function collectCandidateKeys(client: any, userId: string) {
   await addPatternKeys(keys, client, `user:${userId}:artifact_order:*`)
   await addPatternKeys(keys, client, `slash_command:${userId}:*`)
   await addPatternKeys(keys, client, `skill:${userId}:*`)
+  await addPatternKeys(keys, client, `goon_recipe_revision:${userId}:*`)
+  await addPatternKeys(keys, client, `goon_recipe_document:${userId}:*`)
+  await addPatternKeys(keys, client, `goon_recipe_job:${userId}:*`)
   await addPatternKeys(keys, client, 'clip:system:*')
   await addPatternKeys(keys, client, 'upload:*')
   await addPatternKeys(keys, client, 'zip:*')
@@ -1504,7 +1544,6 @@ function rewriteLocalUploadUrlFields(
   )
   const explicitRelativePath = normalizeUploadRelativePath(next)
   const explicitUploadPath = explicitRelativePath ? `/uploads/${explicitRelativePath}` : null
-  const serverUrl = resolvePublicBatshitServerUrl()
   const rewritePath = (raw: unknown) => {
     if (typeof raw !== 'string') return explicitUploadPath
     return uploadPathFromString(raw, uploadRelativePathByBasename) ?? explicitUploadPath
@@ -1513,7 +1552,7 @@ function rewriteLocalUploadUrlFields(
   for (const [key, raw] of Object.entries(value)) {
     if (!LOCAL_UPLOAD_URL_FIELDS.has(key) || typeof raw !== 'string') continue
     const uploadPath = rewritePath(raw)
-    if (uploadPath) next[key] = `${serverUrl}${uploadPath}`
+    if (uploadPath) next[key] = uploadPath
   }
 
   const tunnelPath = typeof value.tunnelPath === 'string' ? value.tunnelPath : null
@@ -1938,6 +1977,12 @@ export async function preflightBackupRestore(
   bytes: Uint8Array
 ): Promise<BackupPreflightSummary> {
   const bundle = parseBackupBundle(bytes)
+  await validateRecipeRestoreGraph(bundle.records, bundle.manifest.source.userId)
+  const preflightTargetRecords = buildTargetRecords(bundle, userId)
+  if (bundle.manifest.source.userId !== userId) {
+    await rehashRemappedRecipeGraph(preflightTargetRecords, userId)
+  }
+  await validateRecipeRestoreGraph(preflightTargetRecords, userId)
   const currentRecordCount = await countCurrentRecords(userId)
   const fileAssetNames = Object.keys(bundle.zipEntries).filter((name) => name.startsWith(UPLOAD_FILE_ROOT))
   const fileAssetBytes = fileAssetNames.reduce(
@@ -2028,6 +2073,228 @@ function buildTargetRecords(bundle: BackupBundle, targetUserId: string) {
   })
 }
 
+function recipeRestoreError(message: string): never {
+  throw new BackupRestoreError(`Backup Recipe graph is invalid: ${message}`, 400)
+}
+
+function expectRecipeRecord(
+  records: Map<string, BackupRedisRecord>,
+  ref: RecipeDocumentRef,
+  context: string
+) {
+  const record = records.get(ref.ref)
+  if (!record || record.type !== 'json') {
+    recipeRestoreError(`${context} references missing JSON record ${ref.ref}.`)
+  }
+  return record
+}
+
+function assertDocumentRef(
+  records: Map<string, BackupRedisRecord>,
+  ref: RecipeDocumentRef,
+  context: string,
+  userId: string,
+  goonId: string
+) {
+  const record = expectRecipeRecord(records, ref, context)
+  const document = record.value as GoonRecipeDocument
+  if (
+    !ref.ref.startsWith(`goon_recipe_document:${userId}:${goonId}:`) ||
+    document.userId !== userId ||
+    document.goonId !== goonId ||
+    document.documentContract !== ref.contract ||
+    document.sha256 !== ref.sha256
+  ) {
+    recipeRestoreError(`${context} does not match its Goon namespace, document contract, and hash.`)
+  }
+}
+
+function assertRevisionRef(
+  records: Map<string, BackupRedisRecord>,
+  ref: RecipeDocumentRef,
+  context: string,
+  userId: string,
+  goonId: string
+) {
+  const record = expectRecipeRecord(records, ref, context)
+  const envelope = record.value as RecipeRevisionEnvelope
+  if (
+    !ref.ref.startsWith(`goon_recipe_revision:${userId}:${goonId}:`) ||
+    ref.contract !== GOON_RECIPE_REVISION_ENVELOPE_CONTRACT ||
+    envelope.envelopeSha256 !== ref.sha256
+  ) {
+    recipeRestoreError(`${context} does not match its Goon namespace, revision contract, and hash.`)
+  }
+}
+
+async function validateRecipeRestoreGraph(records: BackupRedisRecord[], userId: string) {
+  const byKey = new Map(records.map((record) => [record.key, record]))
+  const owners = new Map<string, GoonRecipeV2>()
+  for (const record of records) {
+    if (record.type !== 'json' || !record.key.startsWith('goon:')) continue
+    if (!isPlainObject(record.value) || !isPlainObject(record.value.recipe)) continue
+    if (record.value.recipe.contract !== GOON_RECIPE_OWNER_V2_CONTRACT) continue
+    const goonId = record.key.slice('goon:'.length)
+    if (record.value.id !== goonId || record.value.user_id !== userId) {
+      recipeRestoreError(`Goon ${goonId} has mismatched restored ownership.`)
+    }
+    try {
+      owners.set(goonId, await verifyGoonRecipeV2(record.value.recipe))
+    } catch (error) {
+      recipeRestoreError(`Goon ${goonId} owner failed verification: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  const revisions = new Map<string, RecipeRevisionEnvelope>()
+  const jobs = new Map<string, GoonRecipeJob>()
+  for (const record of records) {
+    if (record.type !== 'json') continue
+    try {
+      if (record.key.startsWith(`goon_recipe_document:${userId}:`)) {
+        const document = await verifyGoonRecipeDocument(record.value)
+        const expectedKey = recipeDocumentRedisKey(document.userId, document.goonId, document.sha256)
+        if (document.userId !== userId || record.key !== expectedKey || !owners.has(document.goonId)) {
+          recipeRestoreError(`document ${record.key} has mismatched key or owner.`)
+        }
+      } else if (record.key.startsWith(`goon_recipe_revision:${userId}:`)) {
+        const envelope = await verifyRecipeRevisionEnvelope(record.value)
+        const parts = record.key.split(':')
+        const goonId = parts[2] ?? ''
+        const revisionId = parts.slice(3).join(':')
+        if (!owners.has(goonId) || record.key !== recipeRevisionRedisKey(userId, goonId, revisionId)) {
+          recipeRestoreError(`revision ${record.key} has mismatched key or owner.`)
+        }
+        if (envelope.revision.revisionId !== revisionId) {
+          recipeRestoreError(`revision ${record.key} has a mismatched revision id.`)
+        }
+        revisions.set(record.key, envelope)
+      } else if (record.key.startsWith(`goon_recipe_job:${userId}:`)) {
+        const job = parseGoonRecipeJob(record.value)
+        if (
+          job.userId !== userId ||
+          !owners.has(job.goonId) ||
+          record.key !== recipeJobRedisKey(userId, job.goonId, job.jobId)
+        ) {
+          recipeRestoreError(`job ${record.key} has mismatched key or owner.`)
+        }
+        jobs.set(record.key, job)
+      }
+    } catch (error) {
+      if (error instanceof BackupRestoreError) throw error
+      recipeRestoreError(`${record.key} failed verification: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  for (const [goonId, owner] of owners) {
+    if (owner.activeRevision) {
+      assertRevisionRef(byKey, owner.activeRevision, `Goon ${goonId} active revision`, userId, goonId)
+    }
+    if (owner.previousRevision) {
+      assertRevisionRef(byKey, owner.previousRevision, `Goon ${goonId} previous revision`, userId, goonId)
+    }
+    if (owner.latestUpdateReport) {
+      assertDocumentRef(byKey, owner.latestUpdateReport, `Goon ${goonId} latest report`, userId, goonId)
+    }
+    if (owner.lastFailure?.reportRef) {
+      assertDocumentRef(byKey, owner.lastFailure.reportRef, `Goon ${goonId} failure report`, userId, goonId)
+    }
+    if (owner.maintenanceFailure?.reportRef) {
+      assertDocumentRef(
+        byKey,
+        owner.maintenanceFailure.reportRef,
+        `Goon ${goonId} maintenance report`,
+        userId,
+        goonId
+      )
+    }
+    if (owner.pendingJob) {
+      const pending = jobs.get(owner.pendingJob.jobRef)
+      if (
+        !pending ||
+        pending.jobId !== owner.pendingJob.jobId ||
+        pending.status !== owner.pendingJob.status ||
+        pending.targetWriteVersion !== owner.writeVersion
+      ) {
+        recipeRestoreError(`Goon ${goonId} pending job does not match its job record.`)
+      }
+    }
+  }
+  for (const [key, envelope] of revisions) {
+    const parts = key.split(':')
+    const goonId = parts[2] ?? ''
+    assertDocumentRef(byKey, envelope.sourceContainmentReceipt, `${key} source receipt`, userId, goonId)
+    assertDocumentRef(byKey, envelope.revision.liveBuildReceipt, `${key} Live-build receipt`, userId, goonId)
+    if (envelope.revision.updateReport) {
+      assertDocumentRef(byKey, envelope.revision.updateReport, `${key} update report`, userId, goonId)
+    }
+  }
+  for (const [key, job] of jobs) {
+    if (job.sourceRevision) {
+      assertRevisionRef(byKey, job.sourceRevision, `${key} source revision`, userId, job.goonId)
+    }
+    assertDocumentRef(
+      byKey,
+      job.stagedSource.containmentReceipt,
+      `${key} staged source receipt`,
+      userId,
+      job.goonId
+    )
+    if (job.plan) assertDocumentRef(byKey, job.plan, `${key} plan`, userId, job.goonId)
+    if (job.candidateRevision) {
+      assertRevisionRef(byKey, job.candidateRevision, `${key} candidate revision`, userId, job.goonId)
+    }
+    if (job.failure?.reportRef) {
+      assertDocumentRef(byKey, job.failure.reportRef, `${key} failure report`, userId, job.goonId)
+    }
+  }
+}
+
+async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: string) {
+  const revisionHashByKey = new Map<string, string>()
+  for (const record of records) {
+    if (record.type !== 'json' || !record.key.startsWith(`goon_recipe_revision:${userId}:`)) continue
+    try {
+      const envelope = parseRecipeRevisionEnvelope(record.value)
+      envelope.revision.revisionSha256 = await recipeRevisionBundleSha256(envelope.revision)
+      envelope.envelopeSha256 = await recipeRevisionEnvelopeSha256(envelope)
+      record.value = envelope
+      revisionHashByKey.set(record.key, envelope.envelopeSha256)
+    } catch (error) {
+      recipeRestoreError(
+        `${record.key} could not be rehashed after user remapping: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+  }
+  const updateRevisionRef = (ref: unknown) => {
+    if (!isPlainObject(ref) || typeof ref.ref !== 'string') return
+    const hash = revisionHashByKey.get(ref.ref)
+    if (hash) ref.sha256 = hash
+  }
+  for (const record of records) {
+    if (record.type !== 'json' || !isPlainObject(record.value)) continue
+    if (record.key.startsWith('goon:') && isPlainObject(record.value.recipe)) {
+      const owner = record.value.recipe
+      if (owner.contract !== GOON_RECIPE_OWNER_V2_CONTRACT) continue
+      updateRevisionRef(owner.activeRevision)
+      updateRevisionRef(owner.previousRevision)
+      if (isPlainObject(owner.authoringRevision)) {
+        try {
+          owner.authoringRevision.revisionSha256 = await recipeAuthoringRevisionSha256(
+            owner.authoringRevision
+          )
+        } catch (error) {
+          recipeRestoreError(
+            `${record.key} authoring revision could not be rehashed: ${error instanceof Error ? error.message : String(error)}`
+          )
+        }
+      }
+    } else if (record.key.startsWith(`goon_recipe_job:${userId}:`)) {
+      updateRevisionRef(record.value.sourceRevision)
+      updateRevisionRef(record.value.candidateRevision)
+    }
+  }
+}
+
 async function writeUploadFileAssets(bundle: BackupBundle) {
   const uploadRoot = resolveUploadsDir()
   const writtenPaths: string[] = []
@@ -2103,6 +2370,7 @@ export async function restoreBackupBundle(
   options?: { confirmReplace?: boolean }
 ): Promise<RestoreResult> {
   const bundle = parseBackupBundle(bytes)
+  await validateRecipeRestoreGraph(bundle.records, bundle.manifest.source.userId)
   const currentRecordCount = await countCurrentRecords(userId)
   if (currentRecordCount > 0 && options?.confirmReplace !== true) {
     throw new BackupRestoreError(
@@ -2113,6 +2381,10 @@ export async function restoreBackupBundle(
   }
 
   const targetRecords = buildTargetRecords(bundle, userId)
+  if (bundle.manifest.source.userId !== userId) {
+    await rehashRemappedRecipeGraph(targetRecords, userId)
+  }
+  await validateRecipeRestoreGraph(targetRecords, userId)
   const uploadedFiles = await writeUploadFileAssets(bundle)
 
   try {

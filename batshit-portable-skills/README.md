@@ -4,8 +4,9 @@ Batshit Portable Skills are the same Batshit-owned system-skill workflows made r
 
 Each portable bundle is a plain folder:
 
-- `SKILL.md` — agent-agnostic instructions for the outside-agent lane
-- `references/` — shared domain knowledge copied from the in-app system skill source
+- `SKILL.md` - agent-agnostic instructions for the outside-agent lane
+- `references/` - shared domain knowledge copied from the in-app system skill source
+- `assets/` - optional non-secret workflow files or templates copied from the in-app system skill source
 
 Portable skills operate on a local Batshit instance only through HTTP:
 
@@ -18,9 +19,10 @@ Do not paste `BATSHIT_TOKEN`, user passwords, or n8n callback tokens into outsid
 
 ## Bundles
 
-- `voice-engine-installer/` — portable variant of `/voice-engine-installer`
-- `artifact-creator/` — portable variant of `/artifact-creator`
-- `cli-tool-creator/` — portable variant of `/cli-tool-creator`
-- `skill-creator/` — portable variant of `/skill-creator`
+- `voice-engine-installer/` - portable variant of `/voice-engine-installer`
+- `artifact-creator/` - portable variant of `/artifact-creator`
+- `cli-tool-creator/` - portable variant of `/cli-tool-creator`
+- `skill-creator/` - portable variant of `/skill-creator`
+- `goon-scene-creator/` - portable variant of `/goon-scene-creator`
 
 Each bundle needs a Portable Skill Token with the matching scope. A token may include more than one scope; store that token once in `~/.batshit/portable-skills/portable-skills.env` when you want the same token to power multiple Portable Skills. Use per-skill env files only when you deliberately want narrower tokens.

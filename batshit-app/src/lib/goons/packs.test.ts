@@ -247,7 +247,20 @@ describe('goon packs helpers', () => {
       scenes: [
         {
           id: 'lounge',
-          name: 'Lounge'
+          name: 'Lounge',
+          scenePlacement: 'ground',
+          groundProjectionLine: 0.62,
+          roomShell: {
+            kind: 'room_shell',
+            url: '/uploads/goon_room_shells/neon-room.glb',
+            filename: 'neon-room.glb',
+            originalName: 'Neon Room.glb'
+          },
+          roomShellTransform: {
+            position: [1.25, -0.367, -2.5],
+            rotationY: Math.PI / 2,
+            uniformScale: 1.45
+          }
         }
       ]
     })
@@ -260,7 +273,21 @@ describe('goon packs helpers', () => {
       Lounge: 'Lounge2'
     })
     expect(imported.settings.kitchen?.cues?.calm2?.description).toBe('Imported calm')
-    expect(imported.settings.kitchen?.scenes?.lounge2?.name).toBe('Lounge2')
+    const importedScene = imported.settings.kitchen?.scenes?.lounge2
+    expect(importedScene?.name).toBe('Lounge2')
+    expect(importedScene?.scenePlacement).toBe('ground')
+    expect(importedScene?.groundProjectionLine).toBe(0.62)
+    expect(importedScene?.roomShell).toEqual({
+      kind: 'room_shell',
+      url: '/uploads/goon_room_shells/neon-room.glb',
+      filename: 'neon-room.glb',
+      originalName: 'Neon Room.glb'
+    })
+    expect(importedScene?.roomShellTransform).toEqual({
+      position: [1.25, -0.367, -2.5],
+      rotationY: Math.PI / 2,
+      uniformScale: 1.45
+    })
     expect(imported.settings.kitchen?.cues?.wave2?.rawMorphTargets).toEqual([
       { target: 'Fcl_MTH_Small', value: 0.5 }
     ])

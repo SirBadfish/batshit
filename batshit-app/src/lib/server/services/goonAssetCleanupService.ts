@@ -24,6 +24,7 @@ export const GOON_UPLOAD_TYPES = [
   'goon_animations',
   'goon_animation_previews',
   'goon_closet',
+  'goon_facial_artwork',
   'goon_scenes',
   'goon_scene_thumbs',
   'goon_room_shells',
@@ -76,6 +77,7 @@ export type GoonAssetCleanupResult = {
 type RedisClientLike = {
   keys(pattern: string): Promise<string[]>
   sMembers(key: string): Promise<string[]>
+  del(keys: string | string[]): Promise<number>
   json: {
     get(key: string, options?: unknown): Promise<unknown>
   }
@@ -188,10 +190,51 @@ function collectUploadUrlsFromValue(
   if (parsedThumbnail) {
     addReference(references, parsedThumbnail.uploadType, parsedThumbnail.filename, `${context} thumbnail`)
   }
+  const parsedRef = parseUploadUrl(record.ref)
+  if (parsedRef) {
+    addReference(references, parsedRef.uploadType, parsedRef.filename, context)
+  }
 
   for (const child of Object.values(record)) {
     collectUploadUrlsFromValue(references, child, context, seen)
   }
+}
+
+async function recipeRecordKeysForGoon(
+  client: Pick<RedisClientLike, 'keys'>,
+  userId: string,
+  goonId: string
+) {
+  const patterns = [
+    `goon_recipe_revision:${userId}:${goonId}:*`,
+    `goon_recipe_document:${userId}:${goonId}:*`,
+    `goon_recipe_job:${userId}:${goonId}:*`
+  ]
+  const found = await Promise.all(patterns.map((pattern) => client.keys(pattern).catch(() => [])))
+  return Array.from(new Set(found.flat())).sort((left, right) => left.localeCompare(right))
+}
+
+export async function collectGoonRecipeUploadReferencesForClient(
+  client: Pick<RedisClientLike, 'keys' | 'json'>,
+  userId: string,
+  goonId: string
+): Promise<GoonAssetReferenceMap> {
+  const references: GoonAssetReferenceMap = new Map()
+  const keys = await recipeRecordKeysForGoon(client, userId, goonId)
+  for (const key of keys) {
+    const value = await client.json.get(key).catch(() => null)
+    collectUploadUrlsFromValue(references, value, `Recipe record ${key}`)
+  }
+  return references
+}
+
+export async function deleteGoonRecipeRecordsForClient(
+  client: Pick<RedisClientLike, 'keys' | 'del'>,
+  userId: string,
+  goonId: string
+) {
+  const keys = await recipeRecordKeysForGoon(client, userId, goonId)
+  return keys.length > 0 ? client.del(keys) : 0
 }
 
 function collectXWearTextureRefs(
@@ -256,6 +299,16 @@ function collectSceneRefs(
     collectRoomSurfaceSideRefs(references, wall?.interior, `${context} wall ${wallKey} interior`)
     collectRoomSurfaceSideRefs(references, wall?.exterior, `${context} wall ${wallKey} exterior`)
   }
+
+  for (const [apronKey, apron] of Object.entries(scene.roomShellBuilder?.exteriorAprons ?? {})) {
+    collectRoomSurfaceSideRefs(references, apron?.surface, `${context} apron ${apronKey}`)
+  }
+
+  collectRoomSurfaceSideRefs(
+    references,
+    scene.roomShellBuilder?.terrainSkirt?.surface,
+    `${context} terrain skirt`
+  )
 }
 
 function collectGoonRefs(references: GoonAssetReferenceMap, goon: GoonRecord) {
@@ -346,6 +399,12 @@ export async function collectGoonUploadReferencesForClient(
     const goon = (await client.json.get(`goon:${goonId}`).catch(() => null)) as GoonRecord | null
     if (!goon || goon.user_id !== userId) continue
     collectGoonRefs(references, goon)
+    const recipeReferences = await collectGoonRecipeUploadReferencesForClient(client, userId, goonId)
+    for (const [key, contexts] of recipeReferences) {
+      const merged = references.get(key) ?? new Set<string>()
+      for (const context of contexts) merged.add(context)
+      references.set(key, merged)
+    }
   }
 
   const settings = (await client.json.get(`user:${userId}:settings`).catch(() => null)) as
@@ -367,6 +426,26 @@ export function hasGoonUploadReference(
   filename: string | null | undefined
 ) {
   return Boolean(filename && references.has(referenceKey(uploadType, filename)))
+}
+
+export async function deleteUnreferencedGoonUploadReferences(
+  candidates: GoonAssetReferenceMap,
+  remainingReferences: GoonAssetReferenceMap,
+  deleteAsset: DeleteGoonUploadAsset = deleteGoonUploadAsset
+) {
+  const deleted: string[] = []
+  for (const key of Array.from(candidates.keys()).sort((left, right) => left.localeCompare(right))) {
+    if (remainingReferences.has(key)) continue
+    const separator = key.indexOf('/')
+    const uploadType = key.slice(0, separator)
+    const filename = key.slice(separator + 1)
+    if (separator <= 0 || !hasUploadType(uploadType) || !filename) {
+      throw new Error(`Invalid Goon upload reference key: ${key}`)
+    }
+    await deleteAsset(uploadType, filename)
+    deleted.push(key)
+  }
+  return deleted
 }
 
 function resolvePayloadSize(value: unknown) {

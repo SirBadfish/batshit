@@ -20,6 +20,7 @@ const App = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     handlers: [6]zero_native.BridgeHandler = undefined,
+    shutdown_thread: ?std.Thread = null,
 
     fn app(self: *@This()) zero_native.App {
         return .{
@@ -36,14 +37,20 @@ const App = struct {
         };
     }
 
-    // Quit lifecycle hook: the platform layer emits the shutdown event for both
-    // close-window and Cmd+Q/terminate, and the runtime calls this synchronously
-    // before the process exits. Stopping the supervisor here is what keeps Redis,
-    // batshit-server, the MCP child, cloudflared tunnels, and managed voice
-    // engines from outliving the Mac app.
+    // The platform keeps AppKit's main thread alive with NSTerminateLater while
+    // this joined worker waits for the supervisor. The supervisor writes the
+    // shutdown-complete marker that lets AppKit finish termination.
     fn stop(context: *anyopaque, runtime: *zero_native.Runtime) anyerror!void {
         _ = runtime;
         const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.shutdown_thread != null) return;
+        self.shutdown_thread = std.Thread.spawn(.{}, stopSupervisorInBackground, .{self}) catch |err| {
+            std.debug.print("batshit quit worker failed to start: {s}\n", .{@errorName(err)});
+            return;
+        };
+    }
+
+    fn stopSupervisorInBackground(self: *@This()) void {
         var output: [64 * 1024]u8 = undefined;
         const result = self.runSupervisor("stop", &output) catch |err| {
             std.debug.print("batshit quit cleanup failed: {s}\n", .{@errorName(err)});
@@ -270,6 +277,7 @@ const builtin_bridge_policies = [_]zero_native.BridgeCommandPolicy{
 
 pub fn main(init: std.process.Init) !void {
     var app = App{ .env_map = init.environ_map, .gpa = init.gpa, .io = init.io };
+    defer if (app.shutdown_thread) |thread| thread.join();
     try runner.runWithOptions(app.app(), .{
         .app_name = app_name,
         .window_title = app_name,

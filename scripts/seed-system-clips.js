@@ -7,13 +7,10 @@ const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379'
 const SYSTEM_USER = 'system'
 const PRUNE_STALE = process.argv.includes('--prune-stale')
 
+// The Batshit Guide clip was retired in SA-092 (it became the /batshit-guide
+// system skill); app startup removes any leftover record via
+// removeRetiredSystemClips(), and --prune-stale here does the same.
 const clips = [
-  {
-    id: 'batshit_guide',
-    title: 'Batshit Guide',
-    description: 'On-demand Batshit helper for zips, clips, agents, models, tools, and quick how-tos.',
-    filename: 'batshit-guide.md'
-  },
   {
     id: 'goon_guide',
     title: 'Goon Guide',

@@ -6859,9 +6859,9 @@ async function handleBatshitAgentStream({
     clearStreamAbort(sessionId, messageId)
     if (visualCleanup) {
       try {
-        visualCleanup()
+        await visualCleanup()
       } finally {
-        cleanupSessionMonitoring(sessionId)
+        await cleanupSessionMonitoring(sessionId)
       }
     }
   }

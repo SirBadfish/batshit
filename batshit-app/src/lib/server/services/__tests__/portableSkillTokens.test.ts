@@ -176,9 +176,14 @@ describe('portableSkillTokens', () => {
 
   it('exposes deterministic family scope helpers', () => {
     expect(getPortableSkillAllowedControlIds(['artifacts'])).toContain('sys.model_catalog.search')
+    expect(getPortableSkillAllowedControlIds(['goon-scenes'])).toEqual(['sys.goon_scene.creator_info'])
     expect(isPortableSkillControlAllowed('sys.cli_tool.test', ['cli-tools'])).toBe(true)
     expect(isPortableSkillControlAllowed('sys.cli_tool.test', ['skills'])).toBe(false)
+    expect(isPortableSkillControlAllowed('sys.goon_scene.creator_info', ['goon-scenes'])).toBe(true)
     expect(getPortableSkillRequiredFamiliesForControl('sys.artifact.create')).toEqual(['artifacts'])
+    expect(getPortableSkillRequiredFamiliesForControl('sys.goon_scene.creator_info')).toEqual([
+      'goon-scenes'
+    ])
     expect(getPortableSkillRequiredFamiliesForControl('sys.zip.fetch')).toEqual([])
   })
 

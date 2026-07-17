@@ -1,0 +1,20 @@
+{
+  "contract": "sa090-recipe-r2-physical-fixture-oracle/v1",
+  "fixtureSha256": "220f94798d889aa9d015c4e6f5c9c410f260ffb68f96f7f9f94644063705b2a6",
+  "sourcePackageSha256": "2bc61a3a79a287e0276effe4c130a881cda4b2b720ba81f451a6d832d90fc432",
+  "sourceModelSha256": "cfca3d2ced97468a426dd2047089bd1174c865229f588ffd8475abf3e6db0bd8",
+  "sourceManifestSha256": "459d29ebe0da2aef4b47985d77022b186d33a3b382444a08072c937e50d3bc24",
+  "targetPackageSha256": "a75f61d91a6d0f988067ce3fdd4d13f398c72464a508b7206e24b780204b4cdd",
+  "targetModelSha256": "29cd48563ccc785668526a09bdaeea2aff926e1a14338605397ac79929004b7f",
+  "targetManifestSha256": "4a2466ed89f65b5403d8c5d9d1ebe49a45cc93ce898b03c5d8fc648b6257c2fb",
+  "sourceManifestSemanticSha256": "8e1069f6e517af21fff3a48e37cfc9cee5e16deaacd9939e7e2575b20a1aab3c",
+  "targetManifestSemanticSha256": "0def7cdb27474cbed8d7c2d9c017f9302e7f5c6e5ca2332de4e3e179a5f96001",
+  "edgeSha256": "555be4154aa863c48a952db754d5eb76a90020ba62b65306f97b97bf9fa01655",
+  "componentMapBundleSha256": "abf318fa13cbef586ae0ac4e0a27e3bf7691dc0798430136ae42d734ada85da7",
+  "sourceStateSha256": "5446ba3d35c20bcb6d5c8f0c21fe470c2a34c060daf08788da4686140ae781b7",
+  "automaticPlanSha256": "99f98707bb74c05bb57b8e657f680bdbfed4436345b353ccd13ec2f903feb3c6",
+  "automaticComponentProofsSha256": "d3499f19151b031376906960568cf389ca3bf2b7b007cd5462ba337efb673862",
+  "automaticWholeRecipeProofSha256": "5eec7295cf5d5faa0e950685cfda87102a53cc88ab588c9e5ca7473c59807d91",
+  "unsupportedPlanSha256": "e48c44f38dbe64379bea3c029cc36734ee3bbd4fb255076b49c99cd5faa3a829",
+  "cleanResetPlanSha256": "ab4bb9ae7143212f388596ca4ea584d76a3849e887f070ce136470e5860c8c44"
+}

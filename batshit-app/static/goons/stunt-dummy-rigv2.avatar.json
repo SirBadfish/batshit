@@ -1,0 +1,24 @@
+{
+  "contractVersion": 2,
+  "name": "Batshit GLB Stunt Dummy",
+  "description": "Bundled preview body for GLB-lane motion previews (BSRigV2 skeleton, 76 bones, mixamorig core + bs_* twist naming). Decimated plain-purple derivative of batshit-base-f-v1 \u2014 preview use only, not a Goon base.",
+  "stage": {
+    "anchors": {
+      "head": "anchor_head",
+      "hips": "anchor_hips",
+      "feet": "anchor_feet"
+    }
+  },
+  "rig": {
+    "rigId": "bs-rigv2",
+    "rigVersion": 1,
+    "sourceProfile": "first-party-base",
+    "baseId": "batshit-base-f-v1",
+    "restConvention": "a-pose",
+    "provenance": {
+      "sourceBlend": "batshit-base-f-v1-work.blend",
+      "exported": "2026-07-08",
+      "block": "SA-090 unified motion library preview dummy"
+    }
+  }
+}

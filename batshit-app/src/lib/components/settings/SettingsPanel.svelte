@@ -101,6 +101,7 @@ function normalizeInitialToolsTab(
 
 let activeTab = $state('agents')
 let wasOpen = $state(false)
+let settingsOpenEventWasOpen = $state(false)
 let lastInitialTab = $state('agents')
 let activeToolsTab = $state<'gateway-settings' | 'cli-tools' | 'tool-grid' | 'zip-options'>('gateway-settings')
 let lastInitialToolsTab = $state<'gateway-settings' | 'cli-tools' | 'tool-grid' | 'zip-options'>('gateway-settings')
@@ -426,6 +427,13 @@ onMount(() => {
     activeTab = normalizeInitialTab(initialTab)
     lastInitialTab = normalizeInitialTab(initialTab)
   }
+})
+
+$effect(() => {
+  if (typeof window !== 'undefined' && open && !settingsOpenEventWasOpen) {
+    window.dispatchEvent(new CustomEvent('batshit:settings-opened'))
+  }
+  settingsOpenEventWasOpen = open
 })
 
 $effect(() => {

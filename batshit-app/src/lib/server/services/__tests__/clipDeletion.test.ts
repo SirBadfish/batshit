@@ -15,6 +15,11 @@ vi.mock('$lib/server/redis', () => ({
   redis: mocks.redis
 }))
 
+vi.mock('$lib/server/services/batshitServerUrls', () => ({
+  getInternalBatshitServerUrl: () => 'http://batshit-server.test',
+  getInternalBatshitServerAuthHeaders: () => ({ 'x-batshit-service-token': 'test-token' })
+}))
+
 import { deleteUserClips } from '../clipDeletion'
 
 describe('clipDeletion', () => {
@@ -36,6 +41,10 @@ describe('clipDeletion', () => {
     )
     mocks.redis.sRem.mockResolvedValue(undefined)
     mocks.redis.sAdd.mockResolvedValue(undefined)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 }))
+    )
   })
 
   it('deletes clips and removes them from session clip state', async () => {
@@ -59,7 +68,13 @@ describe('clipDeletion', () => {
     const results = await deleteUserClips('josh', ['clip-a'])
 
     expect(results).toEqual([{ clipId: 'clip-a', deleted: true, missing: false }])
-    expect(mocks.redis.del).toHaveBeenCalledWith('upload:images:uploaded-ss.jpg')
+    expect(fetch).toHaveBeenCalledWith(
+      'http://batshit-server.test/api/upload/asset',
+      expect.objectContaining({
+        method: 'DELETE',
+        body: JSON.stringify({ uploadType: 'images', filename: 'uploaded-ss.jpg' })
+      })
+    )
     expect(mocks.redis.del).not.toHaveBeenCalledWith('upload:images:ss.jpg')
     expect(mocks.redis.del).not.toHaveBeenCalledWith('upload:documents:ss.jpg')
     expect(mocks.redis.del).toHaveBeenCalledWith('clip:josh:clip-a')
@@ -88,7 +103,12 @@ describe('clipDeletion', () => {
     const results = await deleteUserClips('josh', ['clip-doc'])
 
     expect(results).toEqual([{ clipId: 'clip-doc', deleted: true, missing: false }])
-    expect(mocks.redis.del).toHaveBeenCalledWith('upload:documents:20260613_notes.pdf')
+    expect(fetch).toHaveBeenCalledWith(
+      'http://batshit-server.test/api/upload/asset',
+      expect.objectContaining({
+        body: JSON.stringify({ uploadType: 'documents', filename: '20260613_notes.pdf' })
+      })
+    )
     expect(mocks.redis.del).not.toHaveBeenCalledWith('upload:images:20260613_notes.pdf')
     expect(mocks.redis.del).not.toHaveBeenCalledWith('upload:documents:notes.pdf')
   })

@@ -16,6 +16,7 @@ import {
   normalizeLiveKitSpeechToSpeechProviderId,
   type LiveKitSpeechToSpeechProviderId
 } from '$lib/server/services/liveKitSpeechToSpeechProviders'
+import { resolveUploadUrlForBrowser } from '$lib/server/services/batshitServerUrls'
 
 const DEFAULT_TOKEN_TTL_SEC = 10 * 60
 const MIN_TOKEN_TTL_SEC = 60
@@ -336,12 +337,18 @@ function normalizeAssignedSubagentRecord(value: unknown, fallbackId: string) {
   const id = typeof row.id === 'string' && row.id.trim() ? row.id.trim() : fallbackId
   const name = row.name || row.displayName || row.display_name || id
   const displayName = row.displayName || row.display_name || row.name || id
+  const avatar =
+    typeof row.avatar === 'string'
+      ? row.avatar
+      : typeof row.avatar_url === 'string'
+        ? row.avatar_url
+        : null
   return {
     ...row,
     id,
     name,
     displayName,
-    avatar: row.avatar || row.avatar_url || null,
+    avatar: avatar ? resolveUploadUrlForBrowser(avatar) : null,
     primary_model_provider: row.primary_model_provider || row.provider || null,
     primary_model_name: row.primary_model_name || row.model || null,
     include_global_prompt: row.include_global_prompt !== false,

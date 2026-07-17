@@ -5,6 +5,10 @@ import type { ClipRow } from '$lib/types/database'
 import { deleteUserClip } from '$lib/server/services/clipDeletion'
 import { resolveClipPreferredUrl } from '$lib/server/services/clipUploadPayload'
 import { logger } from '$lib/utils/logger'
+import {
+  normalizeUploadUrlsForStorageInPayload,
+  resolveUploadUrlsForBrowserInPayload
+} from '$lib/server/services/batshitServerUrls'
 
 // GET /api/clips/[id] - Get a specific clip
 export const GET: RequestHandler = async ({ params, locals, url }) => {
@@ -38,7 +42,15 @@ export const GET: RequestHandler = async ({ params, locals, url }) => {
       clipData = await redis.get(`clip:system:${clipId}`)
       if (clipData) {
         const systemClipRow = clipData as ClipRow
-        return json({ ...systemClipRow, systemClip: true, ...(await withModelUrl(systemClipRow)) })
+        // modelFacingUrl attaches AFTER browser resolution: it is deliberately
+        // tunnel/model-facing (G-0063) and must not be rebased to the browser base.
+        return json({
+          ...resolveUploadUrlsForBrowserInPayload({
+            ...systemClipRow,
+            systemClip: true
+          }),
+          ...(await withModelUrl(systemClipRow))
+        })
       }
     }
 
@@ -66,7 +78,15 @@ export const GET: RequestHandler = async ({ params, locals, url }) => {
       }
     }
 
-    return json({ ...clip, systemClip: false, ...(await withModelUrl(clip)) })
+    // modelFacingUrl attaches AFTER browser resolution: it is deliberately
+    // tunnel/model-facing (G-0063) and must not be rebased to the browser base.
+    return json({
+      ...resolveUploadUrlsForBrowserInPayload({
+        ...clip,
+        systemClip: false
+      }),
+      ...(await withModelUrl(clip))
+    })
   } catch (error) {
     console.error('Error fetching clip:', error)
     return json(
@@ -109,9 +129,10 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     }
 
     // Save updated clip using RedisJSON (the set method will handle it)
-    await redis.set(`clip:${userId}:${clipId}`, updatedClip)
+    const storageClip = normalizeUploadUrlsForStorageInPayload(updatedClip)
+    await redis.set(`clip:${userId}:${clipId}`, storageClip)
 
-    return json(updatedClip)
+    return json(resolveUploadUrlsForBrowserInPayload(storageClip))
   } catch (error) {
     console.error('Error updating clip:', error)
     return json({ error: 'Failed to update clip' }, { status: 500 })

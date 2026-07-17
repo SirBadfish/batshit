@@ -10,6 +10,10 @@ const apiRoutes = require('./api');
 const config = require('./config');
 const logger = require('./utils/logger');
 const redisService = require('./services/redisService');
+const {
+  migrateLegacyBase64Uploads,
+  ensureAofRewriteAfterMigration,
+} = require('./services/fileBackedUploadService');
 const CertificateService = require('./services/certificateService');
 const {
   corsOriginDelegate,
@@ -80,9 +84,8 @@ if (config.httpLogs) {
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Note: Upload directories no longer needed - using Redis storage
-
-// All file uploads now handled by upload-redis.js
+// Persistent upload bytes are owned by batshit-server's configured upload directory;
+// Redis stores metadata and short-lived/explicitly ephemeral upload payloads.
 
 function getHealthPayload() {
   const redisReady = Boolean(redisService.connected && redisService.useRedis);
@@ -130,41 +133,34 @@ if (config.enableHttps) {
 }
 
 // Start servers
+let shutdownRequested = false;
+let startupPromise = null;
+
 async function startServers() {
   const httpPort = config.port || 5600;
   const httpsPort = config.httpsPort || 5443;
   const host = config.host || '127.0.0.1';
 
-  // Start HTTP server (unless HTTPS only mode)
-  if (!config.httpsOnly) {
-    httpServer.listen(httpPort, host, () => {
-      logger.info(`Batshit-Server HTTP server running at http://${host}:${httpPort}`);
-    });
-  }
-
-  // Start HTTPS server if enabled
-  if (config.enableHttps) {
-    try {
-      const certificates = await certificateService.ensureCertificates();
-
-      httpsServer = https.createServer(certificates, app);
-
-      httpsServer.listen(httpsPort, host, () => {
-        logger.info(`Batshit-Server HTTPS server running at https://${host}:${httpsPort}`);
-        logger.info(`HTTPS URL: https://${host}:${httpsPort}`);
-      });
-    } catch (error) {
-      logger.error('Failed to start HTTPS server:', error.message);
-      if (config.httpsOnly) {
-        process.exit(1);
-      }
-    }
-  }
-
-  // Initialize Redis and other services
+  // Redis-backed storage migrations must finish before the server accepts requests.
   const redisConnected = await redisService.connect();
   if (redisConnected) {
     logger.info('Redis connected successfully for Batshit storage');
+    const migration = await migrateLegacyBase64Uploads({
+      redisService,
+      shouldStop: () => shutdownRequested
+    });
+    if (migration.migrated > 0) {
+      logger.info(
+        `[UploadMigration] Completed: ${migration.migrated}/${migration.scanned} records, ` +
+          `${migration.bytesMoved} bytes moved to file-backed storage, ` +
+          `${migration.skippedEphemeral} ephemeral records retained in Redis.`
+      );
+    }
+    await ensureAofRewriteAfterMigration({ redisService, migration });
+    if (migration.interrupted || shutdownRequested) {
+      logger.info('[UploadMigration] Startup stopped safely at the shutdown boundary.');
+      return;
+    }
   } else {
     const message = 'Redis connection failed for Batshit-Server';
     if (config.redisRequired) {
@@ -175,13 +171,30 @@ async function startServers() {
   }
 
   logger.info(`Upload directory: ${config.uploadsDir}`);
-}
 
-// Call the async startup function
-startServers().catch(error => {
-  logger.error('Failed to start servers:', error);
-  process.exit(1);
-});
+  if (shutdownRequested) return;
+
+  // Start HTTP server (unless HTTPS only mode) only after storage is ready.
+  if (!config.httpsOnly) {
+    httpServer.listen(httpPort, host, () => {
+      logger.info(`Batshit-Server HTTP server running at http://${host}:${httpPort}`);
+    });
+  }
+
+  if (config.enableHttps) {
+    try {
+      const certificates = await certificateService.ensureCertificates();
+      httpsServer = https.createServer(certificates, app);
+      httpsServer.listen(httpsPort, host, () => {
+        logger.info(`Batshit-Server HTTPS server running at https://${host}:${httpsPort}`);
+        logger.info(`HTTPS URL: https://${host}:${httpsPort}`);
+      });
+    } catch (error) {
+      logger.error('Failed to start HTTPS server:', error.message);
+      if (config.httpsOnly) process.exit(1);
+    }
+  }
+}
 
 // Graceful shutdown: close HTTP/S servers with a hard deadline so a hung
 // connection can never block process exit.
@@ -189,25 +202,30 @@ let shuttingDown = false;
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  shutdownRequested = true;
   logger.info(`${signal} received, shutting down gracefully...`);
 
   const shutdownPromises = [];
 
-  if (httpServer) {
+  if (httpServer?.listening) {
     shutdownPromises.push(new Promise(resolve => httpServer.close(resolve)));
   }
 
-  if (httpsServer) {
+  if (httpsServer?.listening) {
     shutdownPromises.push(new Promise(resolve => httpsServer.close(resolve)));
   }
+  if (startupPromise) shutdownPromises.push(startupPromise.catch(() => undefined));
 
   const forceExitTimer = setTimeout(() => {
-    logger.warn('Graceful shutdown timed out; exiting now');
-    process.exit(0);
-  }, 4000);
+    logger.error('Graceful shutdown timed out; exiting now');
+    process.exit(1);
+  }, 30_000);
   forceExitTimer.unref();
 
-  Promise.all(shutdownPromises).then(() => {
+  Promise.all(shutdownPromises).then(async () => {
+    await redisService.disconnect().catch((error) => {
+      logger.error('Failed to disconnect batshit-server Redis during shutdown:', error);
+    });
     logger.info('All servers closed');
     process.exit(0);
   });
@@ -215,5 +233,12 @@ function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Call startup only after signal handlers are installed, so a quit during a
+// large pre-listen migration reaches the cancellation boundary safely.
+startupPromise = startServers().catch(error => {
+  logger.error('Failed to start servers:', error);
+  if (!shuttingDown) process.exit(1);
+});
 
 module.exports = { app, httpServer, httpsServer };

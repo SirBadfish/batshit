@@ -73,12 +73,9 @@
     description: string
   }
 
+  // Batshit Guide was retired in SA-092 (now the /batshit-guide system skill);
+  // Goon Guide remains the only System Clip until the post-SA-090 Goon skills.
   const SYSTEM_CLIP_TEMPLATES: SystemClipTemplate[] = [
-    {
-      id: 'batshit_guide',
-      filename: 'Batshit Guide',
-      description: 'On-demand Batshit helper: zips, clips, agents, models, quick how-tos.'
-    },
     {
       id: 'goon_guide',
       filename: 'Goon Guide',

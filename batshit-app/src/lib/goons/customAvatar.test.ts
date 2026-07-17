@@ -539,6 +539,14 @@ describe('customAvatar helpers', () => {
     const customGoon: GoonRecord = {
       ...baseGoon,
       kind: 'custom',
+      appearanceDials: {
+        contract: 'appearance-dial-values/v2',
+        definitionSha256: 'a'.repeat(64),
+        neutralId: 'batshit-base-f-v1-neutral',
+        neutralRecipeSha256: 'b'.repeat(64),
+        values: { head_size: 0.5 },
+        unlockedDialIds: []
+      },
       customAvatar: {
         model: { url: '/avatars/custom-e3.glb', filename: 'custom-e3.glb' },
         manifest: { url: '/avatars/custom-e3.json', filename: 'custom-e3.json' }
@@ -551,16 +559,24 @@ describe('customAvatar helpers', () => {
     const result = await loadAvatarIntoEngine(engine as any, customGoon)
 
     expect(result.kind).toBe('custom')
-    expect(engine.loadCustomGoon).toHaveBeenCalledWith('/avatars/custom-e3.glb', {
-      contractVersion: 1,
-      stage: {
-        anchors: {
-          head: 'Head',
-          hips: 'Hips',
-          feet: 'Feet'
+    expect(engine.loadCustomGoon).toHaveBeenCalledWith(
+      '/avatars/custom-e3.glb',
+      {
+        contractVersion: 1,
+        stage: {
+          anchors: {
+            head: 'Head',
+            hips: 'Hips',
+            feet: 'Feet'
+          }
         }
+      },
+      {
+        appearanceDialValues: customGoon.appearanceDials,
+        eyeAppearanceState: null,
+        facialArtworkState: null
       }
-    })
+    )
     expect(engine.loadGoon).not.toHaveBeenCalled()
   })
 

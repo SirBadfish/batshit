@@ -2,8 +2,9 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 
-const repoRoot = path.resolve(new URL('../..', import.meta.url).pathname)
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const manifestPath = path.join(repoRoot, 'batshit-portable-skills/portable-skills.manifest.json')
 
 function usage() {
@@ -31,7 +32,7 @@ async function sameFile(left, right) {
   }
 }
 
-async function syncReference({ source, destination, write }) {
+async function syncFile({ source, destination, write }) {
   const matches = await sameFile(source, destination)
   if (matches) return { changed: false, destination }
   if (!write) return { changed: true, destination }
@@ -66,11 +67,12 @@ async function main() {
     const sourceRoot = path.join(repoRoot, bundle.sourceSkillRoot)
     const portableRoot = path.join(repoRoot, bundle.portableRoot)
     const references = Array.isArray(bundle.sharedReferences) ? bundle.sharedReferences : []
+    const files = Array.isArray(bundle.sharedFiles) ? bundle.sharedFiles : []
 
-    for (const relativeReference of references) {
-      const source = path.join(sourceRoot, relativeReference)
-      const destination = path.join(portableRoot, relativeReference)
-      const result = await syncReference({
+    for (const relativeFile of [...references, ...files]) {
+      const source = path.join(sourceRoot, relativeFile)
+      const destination = path.join(portableRoot, relativeFile)
+      const result = await syncFile({
         source,
         destination,
         write: mode === 'write'
@@ -95,9 +97,9 @@ async function main() {
   }
 
   if (mode === 'write') {
-    console.log(`Synced ${copied} portable skill reference file${copied === 1 ? '' : 's'}.`)
+    console.log(`Synced ${copied} portable skill file${copied === 1 ? '' : 's'}.`)
   } else {
-    console.log('Portable skill references are in sync.')
+    console.log('Portable skill files are in sync.')
   }
 }
 

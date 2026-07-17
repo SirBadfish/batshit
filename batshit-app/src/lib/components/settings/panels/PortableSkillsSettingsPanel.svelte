@@ -31,7 +31,8 @@
   type PortableSkillInstallCard = {
     id: string
     title: string
-    family: PortableSkillFamilyId
+    // null = informational bundle: no Portable Skill Token family required.
+    family: PortableSkillFamilyId | null
     summary: string
     zipUrl: string
   }
@@ -63,6 +64,13 @@
   const tokenCount = $derived(tokens.filter((token) => !token.revokedAt).length)
   const portableSkillInstallCards: PortableSkillInstallCard[] = [
     {
+      id: 'batshit-guide',
+      title: 'Batshit Guide',
+      family: null,
+      summary: 'Teaches an outside coding agent Batshit itself, with the official product docs bundled as references.',
+      zipUrl: 'https://docs.batshit.ai/portable-skills/batshit-guide.zip'
+    },
+    {
       id: 'voice-engine-installer',
       title: 'Voice Engine Installer',
       family: 'voice-engines',
@@ -89,6 +97,13 @@
       family: 'skills',
       summary: 'Saves and imports Batshit skills from an outside coding agent.',
       zipUrl: 'https://docs.batshit.ai/portable-skills/skill-creator.zip'
+    },
+    {
+      id: 'goon-scene-creator',
+      title: 'Goon Scene Creator',
+      family: 'goon-scenes',
+      summary: 'Plans Goon scenes, skyboxes, Room Builder settings, and ComfyUI skybox handoffs.',
+      zipUrl: 'https://docs.batshit.ai/portable-skills/goon-scene-creator.zip'
     }
   ]
 
@@ -134,6 +149,9 @@
   }
 
   function installPrompt(skill: PortableSkillInstallCard) {
+    if (skill.family === null) {
+      return `Install the Batshit Portable ${skill.title} skill from ${skill.zipUrl}. No token or env file is needed; it is informational only.`
+    }
     return `Install the Batshit Portable ${skill.title} skill from ${skill.zipUrl}. Use credentials from ~/.batshit/portable-skills/portable-skills.env.`
   }
 
@@ -339,9 +357,13 @@
             <div class="min-w-0 space-y-2">
               <div class="flex flex-wrap items-center gap-2">
                 <h3 class="text-base font-medium">{skill.title}</h3>
-                <Badge variant="outline">{familyLabel(skill.family)}</Badge>
-                {#if familyControlCount(skill.family) !== null}
-                  <Badge variant="secondary">{familyControlCount(skill.family)} controls</Badge>
+                {#if skill.family === null}
+                  <Badge variant="outline">No token needed</Badge>
+                {:else}
+                  <Badge variant="outline">{familyLabel(skill.family)}</Badge>
+                  {#if familyControlCount(skill.family) !== null}
+                    <Badge variant="secondary">{familyControlCount(skill.family)} controls</Badge>
+                  {/if}
                 {/if}
               </div>
               <p class="text-sm text-muted-foreground">{skill.summary}</p>

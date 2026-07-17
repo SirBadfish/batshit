@@ -6,6 +6,10 @@ import {
   normalizeSessionClipState
 } from '$lib/server/services/sessionClipState'
 import { resolveClipUploadLocator } from '$lib/server/services/clipUploadPayload'
+import {
+  getInternalBatshitServerAuthHeaders,
+  getInternalBatshitServerUrl
+} from '$lib/server/services/batshitServerUrls'
 
 export interface ClipDeletionResult {
   clipId: string
@@ -16,18 +20,32 @@ export interface ClipDeletionResult {
 async function deleteUploadReferences(clip: ClipRow) {
   const locator = resolveClipUploadLocator(clip)
   if (locator) {
-    await redis.del(locator.redisKey)
+    await deleteUploadAsset(locator.uploadType, locator.filename)
     return
   }
 
   // Legacy clips can predate persisted /uploads/{type}/{filename} URLs.
   if (clip.filename) {
-    await redis.del(`upload:images:${clip.filename}`)
-    await redis.del(`upload:documents:${clip.filename}`)
+    await deleteUploadAsset('images', clip.filename)
+    await deleteUploadAsset('documents', clip.filename)
   }
 }
 
-async function removeClipFromSessionState(sessionId: string, clipId: string) {
+async function deleteUploadAsset(uploadType: string, filename: string) {
+  const response = await fetch(`${getInternalBatshitServerUrl()}/api/upload/asset`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json', ...getInternalBatshitServerAuthHeaders() },
+    body: JSON.stringify({ uploadType, filename })
+  })
+  if (response.ok) return
+
+  const details = (await response.text().catch(() => '')).replace(/<[^>]+>/g, ' ').trim()
+  throw new Error(
+    `Failed to delete clip upload ${uploadType}/${filename}${details ? `: ${details}` : ''}`
+  )
+}
+
+export async function removeClipFromSessionState(sessionId: string, clipId: string) {
   await redis.sRem(`session:${sessionId}:clips`, clipId)
   await redis.sRem(`session:${sessionId}:active_clips`, clipId)
   await redis.del(`session_clip:${sessionId}:${clipId}`)

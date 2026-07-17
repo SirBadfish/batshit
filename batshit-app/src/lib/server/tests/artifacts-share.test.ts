@@ -265,9 +265,11 @@ describe('POST /api/artifacts/share', () => {
     expect(compressedUploadSettings).not.toHaveProperty('skip_clip_persistence')
     expect(fetchMock).not.toHaveBeenCalled()
 
+    // Stored clip records keep canonical relative /uploads/... paths; browser-facing
+    // reads resolve them against the current batshit-server base (clip-lifecycle contract).
     const clip = await redis.get(`clip:user_a:${body.clipId}`)
-    expect((clip as any)?.displayUrl).toBe(previewUrl)
-    expect((clip as any)?.fullResolutionUrl).toBe(originalUrl)
+    expect((clip as any)?.displayUrl).toBe('/uploads/images/preview.jpg')
+    expect((clip as any)?.fullResolutionUrl).toBe('/uploads/images/original.png')
 
     const message = await redis.json.get(`message:sess_1:${body.messageId}`)
     const content = String((message as any)?.content || '')

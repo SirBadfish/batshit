@@ -5,7 +5,8 @@ import { Buffer } from 'node:buffer'
 import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerTaskUrl,
-  getInternalBatshitServerUrl
+  getInternalBatshitServerUrl,
+  resolveUploadUrlsForBrowserInPayload
 } from '$lib/server/services/batshitServerUrls'
 
 function guessMimeType(filename: string) {
@@ -159,7 +160,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       isClipped: true
     }
 
-    return json({ clip })
+    return json({ clip: resolveUploadUrlsForBrowserInPayload(clip) })
   } catch (error) {
     console.error('Failed to upload project file', error)
     return json({ error: 'Failed to upload project file' }, { status: 500 })

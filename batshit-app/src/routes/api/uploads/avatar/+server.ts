@@ -3,7 +3,8 @@ import type { RequestHandler } from './$types'
 import { requireUser } from '$lib/server/services/routeSecurity'
 import {
   getInternalBatshitServerUrl,
-  getInternalBatshitServerAuthHeaders
+  getInternalBatshitServerAuthHeaders,
+  resolveUploadUrlsForBrowserInPayload
 } from '$lib/server/services/batshitServerUrls'
 
 const AVATAR_ENTITY_TYPES = new Set(['user', 'group', 'agent', 'subagent'])
@@ -33,8 +34,16 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     body: incoming
   })
 
-  const payload = await response.text()
-  return new Response(payload, {
+  const payloadText = await response.text()
+  try {
+    return json(resolveUploadUrlsForBrowserInPayload(JSON.parse(payloadText)), {
+      status: response.status
+    })
+  } catch {
+    // Preserve non-JSON batshit-server errors exactly for troubleshooting.
+  }
+
+  return new Response(payloadText, {
     status: response.status,
     headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json' }
   })

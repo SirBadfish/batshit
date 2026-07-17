@@ -60,10 +60,11 @@ export interface VisualIndicatorEvent {
  * Configures Redis to monitor zip:* and unzipped:* patterns
  */
 async function enableKeyspaceNotifications(): Promise<void> {
+  let configClient: ReturnType<typeof createClient> | null = null
   try {
     const redisConfig = await resolveRedisSubscriptionConfig()
     // Create a separate client for configuration
-    const configClient = createClient({
+    configClient = createClient({
       url: redisConfig.url
     })
     
@@ -72,12 +73,16 @@ async function enableKeyspaceNotifications(): Promise<void> {
     // Enable keyspace notifications (KEA = Key events, Expired events, and general commands)
     await configClient.configSet('notify-keyspace-events', 'KEA')
     
-    await configClient.disconnect()
-    
     logger.debug('[VisualIndicators] Redis keyspace notifications enabled')
   } catch (error) {
     console.error('[VisualIndicators] Failed to enable keyspace notifications:', error)
     // Continue anyway - notifications are enhancement, not critical
+  } finally {
+    if (configClient?.isOpen) {
+      await configClient.disconnect().catch((error) => {
+        console.error('[VisualIndicators] Failed to close Redis configuration client:', error)
+      })
+    }
   }
 }
 
@@ -93,7 +98,7 @@ export async function initializeKeyspaceNotifications(): Promise<void> {
 export async function setupSessionMonitoring(
   sessionId: string,
   onEvent: VisualIndicatorListener
-): Promise<() => void> {
+): Promise<() => Promise<void>> {
   // Check if already monitoring this session
   const existing = subscriptions.get(sessionId)
   if (existing) {
@@ -102,10 +107,11 @@ export async function setupSessionMonitoring(
     return () => removeSessionListener(sessionId, onEvent)
   }
 
+  let pubsubClient: ReturnType<typeof createClient> | null = null
   try {
     const redisConfig = await resolveRedisSubscriptionConfig()
     // Create separate Redis connection for pubsub
-    const pubsubClient = createClient({
+    pubsubClient = createClient({
       url: redisConfig.url
     })
     
@@ -139,12 +145,15 @@ export async function setupSessionMonitoring(
     logger.debug(`[VisualIndicators] Monitoring started for session: ${sessionId}`)
     
     // Return cleanup function
-    return () => {
-      removeSessionListener(sessionId, onEvent)
-    }
+    return () => removeSessionListener(sessionId, onEvent)
   } catch (error) {
     console.error(`[VisualIndicators] Failed to setup monitoring for session ${sessionId}:`, error)
-    return () => {}
+    if (pubsubClient?.isOpen) {
+      await pubsubClient.disconnect().catch((disconnectError) => {
+        console.error('[VisualIndicators] Failed to close partial pubsub client:', disconnectError)
+      })
+    }
+    return async () => {}
   }
 }
 
@@ -157,13 +166,16 @@ function emitSessionEvent(sessionId: string, event: VisualIndicatorEvent): void 
   }
 }
 
-function removeSessionListener(sessionId: string, listener: VisualIndicatorListener): void {
+async function removeSessionListener(
+  sessionId: string,
+  listener: VisualIndicatorListener
+): Promise<void> {
   const subscription = subscriptions.get(sessionId)
   if (!subscription) return
 
   subscription.listeners.delete(listener)
   if (subscription.listeners.size === 0) {
-    cleanupSessionMonitoring(sessionId)
+    await cleanupSessionMonitoring(sessionId)
   }
 }
 
@@ -274,12 +286,21 @@ async function handleKeyspaceEvent(
 /**
  * Clean up monitoring for a session
  */
-export function cleanupSessionMonitoring(sessionId: string): void {
+export async function cleanupSessionMonitoring(sessionId: string): Promise<void> {
   const subscription = subscriptions.get(sessionId)
   if (subscription) {
-    subscription.client.disconnect().catch((err: unknown) => {
-      console.error(`[VisualIndicators] Error disconnecting pubsub for ${sessionId}:`, err)
-    })
+    if (subscription.client.isOpen) {
+      try {
+        await subscription.client.disconnect()
+      } catch (error) {
+        console.error(
+          `[VisualIndicators] Disconnect failed for session ${sessionId}; forcing socket destruction:`,
+          error
+        )
+        subscription.client.destroy()
+        if (subscription.client.isOpen) throw error
+      }
+    }
     subscriptions.delete(sessionId)
     logger.debug(`[VisualIndicators] Monitoring stopped for session: ${sessionId}`)
   }
@@ -338,9 +359,7 @@ export async function getVisualState(
 /**
  * Cleanup all monitoring
  */
-export function cleanupAllMonitoring(): void {
-  for (const [sessionId] of subscriptions) {
-    cleanupSessionMonitoring(sessionId)
-  }
+export async function cleanupAllMonitoring(): Promise<void> {
+  await Promise.all(Array.from(subscriptions.keys()).map(cleanupSessionMonitoring))
   visualStateCache.clear()
 }

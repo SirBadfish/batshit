@@ -1,0 +1,253 @@
+{
+ "note": "Verbatim rig.correctives + butt_size dial + corrective key metas from the 2026-07-09 dial-round export (SA-090 correctives engine). Re-extract after any correctives re-export.",
+ "correctives": {
+  "driverContract": "joint-angle-corrective/v1",
+  "drivers": [
+   {
+    "id": "hipFlexion",
+    "kind": "swing-angle",
+    "combine": "mean",
+    "clampDeg": [
+     0.0,
+     90.0
+    ],
+    "bones": [
+     {
+      "bone": "mixamorig:LeftUpLeg",
+      "restRotation": [
+       -0.046042,
+       0.695048,
+       -0.119628,
+       0.707445
+      ],
+      "axisRestLocal": [
+       -0.008951,
+       -0.0,
+       -0.99996
+      ]
+     },
+     {
+      "bone": "mixamorig:RightUpLeg",
+      "restRotation": [
+       -0.045854,
+       -0.695054,
+       0.119818,
+       0.707419
+      ],
+      "axisRestLocal": [
+       -0.008951,
+       0.0,
+       0.99996
+      ]
+     }
+    ],
+    "nonNegotiables": [
+     "qRel = restRotation^-1 * bone.quaternion (rest inversion cancels the baseline; never a literal pose read)",
+     "signed swing = twist-decomposition of qRel about the MEASURED axisRestLocal, never a hardcoded axis",
+     "per-bone angle clamps to clampDeg BEFORE the bilateral combine"
+    ]
+   }
+  ],
+  "entries": [
+   {
+    "driver": "hipFlexion",
+    "key": "bs_TEMP_BALL_gap",
+    "anchorDial": "butt_size",
+    "anchorAt0": -2.0,
+    "anchorAt1": -3.0,
+    "angleCurve": [
+     [
+      0.0,
+      0.0
+     ],
+     [
+      45.0,
+      0.8333
+     ],
+     [
+      90.0,
+      1.0
+     ]
+    ],
+    "mode": "additive"
+   },
+   {
+    "driver": "hipFlexion",
+    "key": "bs_TEMP_BALL_bury",
+    "anchorDial": "butt_size",
+    "anchorAt0": -0.5,
+    "anchorAt1": 2.0,
+    "angleCurve": [
+     [
+      0.0,
+      0.0
+     ],
+     [
+      90.0,
+      1.0
+     ]
+    ],
+    "mode": "additive"
+   },
+   {
+    "driver": "hipFlexion",
+    "key": "bs_TEMP_BALL_ovalTop",
+    "anchorDial": "butt_size",
+    "anchorAt0": 0.0,
+    "anchorAt1": 1.0,
+    "angleCurve": [
+     [
+      0.0,
+      0.0
+     ],
+     [
+      90.0,
+      1.0
+     ]
+    ],
+    "mode": "additive"
+   },
+   {
+    "driver": "hipFlexion",
+    "key": "bs_TEMP_BALL_ovalBot",
+    "anchorDial": "butt_size",
+    "anchorAt0": 0.0,
+    "anchorAt1": -1.0,
+    "angleCurve": [
+     [
+      0.0,
+      0.0
+     ],
+     [
+      90.0,
+      1.0
+     ]
+    ],
+    "mode": "additive"
+   },
+   {
+    "driver": "hipFlexion",
+    "key": "bs_TEMP_BALL_tiltTop",
+    "anchorDial": "butt_size",
+    "anchorAt0": 0.0,
+    "anchorAt1": 1.0,
+    "angleCurve": [
+     [
+      0.0,
+      0.0
+     ],
+     [
+      90.0,
+      1.0
+     ]
+    ],
+    "mode": "additive"
+   },
+   {
+    "driver": "hipFlexion",
+    "key": "bs_TEMP_BALL_tiltTopLat",
+    "anchorDial": "butt_size",
+    "anchorAt0": 0.0,
+    "anchorAt1": 2.0,
+    "angleCurve": [
+     [
+      0.0,
+      0.0
+     ],
+     [
+      90.0,
+      1.0
+     ]
+    ],
+    "mode": "additive"
+   },
+   {
+    "driver": "hipFlexion",
+    "key": "bs_TEMP_BALL_tiltBot",
+    "anchorDial": "butt_size",
+    "anchorAt0": 0.0,
+    "anchorAt1": -1.0,
+    "angleCurve": [
+     [
+      0.0,
+      0.0
+     ],
+     [
+      90.0,
+      1.0
+     ]
+    ],
+    "mode": "additive"
+   }
+  ],
+  "note": "Seated-butt corrective \u2014 Josh's locked spec (dial-review-notes \u00a72a-0, 2026-07-08). anchor = lerp(anchorAt0, anchorAt1, anchorDial value), linear at any dial value; delta = anchor * angleCurve(deg), additive on the dial-resolved influences, clamped to the key's influence bounds; zero standing effect. Bilateral v1 (mean of per-thigh flexion). The same driver serves wrist/knee creases later."
+ },
+ "buttSizeDial": {
+  "id": "butt_size",
+  "label": "Butt Size",
+  "group": "butt",
+  "kind": "tracks",
+  "range": [
+   -0.25,
+   1.0
+  ],
+  "default": 0.0,
+  "members": [
+   {
+    "key": "bs_TEMP_BALL",
+    "track": [
+     [
+      -0.25,
+      -0.25
+     ],
+     [
+      1.0,
+      1.0
+     ]
+    ]
+   }
+  ]
+ },
+ "keys": {
+  "bs_TEMP_BALL": {
+   "baselineValue": 0.0,
+   "influenceMin": -1.0,
+   "influenceMax": 1.0
+  },
+  "bs_TEMP_BALL_gap": {
+   "baselineValue": 0.0,
+   "influenceMin": -5.4,
+   "influenceMax": 2.0
+  },
+  "bs_TEMP_BALL_bury": {
+   "baselineValue": 0.0,
+   "influenceMin": -1.0,
+   "influenceMax": 3.0
+  },
+  "bs_TEMP_BALL_ovalTop": {
+   "baselineValue": 0.0,
+   "influenceMin": -1.0,
+   "influenceMax": 1.0
+  },
+  "bs_TEMP_BALL_ovalBot": {
+   "baselineValue": 0.0,
+   "influenceMin": -1.0,
+   "influenceMax": 1.0
+  },
+  "bs_TEMP_BALL_tiltTop": {
+   "baselineValue": 0.0,
+   "influenceMin": -1.0,
+   "influenceMax": 1.0
+  },
+  "bs_TEMP_BALL_tiltTopLat": {
+   "baselineValue": 0.0,
+   "influenceMin": -1.0,
+   "influenceMax": 5.4
+  },
+  "bs_TEMP_BALL_tiltBot": {
+   "baselineValue": 0.0,
+   "influenceMin": -1.0,
+   "influenceMax": 1.0
+  }
+ }
+}

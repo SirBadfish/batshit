@@ -1,0 +1,160 @@
+{
+  "id": "batshit-qwen360-skybox",
+  "name": "Batshit Qwen 360 Skybox",
+  "version": 2,
+  "updated_at": "2026-07-09",
+  "description": "Repo-owned ComfyUI workflow assets for generating 2:1 equirectangular Batshit Room Builder skyboxes with Qwen-Image-2512 GGUF, the Qwen 360 Diffusion LoRA, and RealESRGAN x2 upscaling.",
+  "workflow_files": {
+    "api_template": "qwen360-skybox-api-workflow.json",
+    "ui_workflow": "qwen360-skybox-ui-workflow.json",
+    "visible_comfyui_filename": "batshit_qwen360_skybox.json"
+  },
+  "formats": {
+    "api_template": {
+      "purpose": "MCP/API automation template with PARAM_* placeholders.",
+      "notes": [
+        "This file is the template shape used by the PC ComfyUI MCP wrapper.",
+        "It is not meant to be pasted directly into ComfyUI's visual workflow editor without the wrapper's parameter substitution."
+      ]
+    },
+    "ui_workflow": {
+      "purpose": "Visible ComfyUI workflow graph for Comfy Desktop or standalone ComfyUI's workflow browser.",
+      "notes": [
+        "This file has normal widget defaults and a Markdown note node.",
+        "Install it into ComfyUI's user/default/workflows folder as batshit_qwen360_skybox.json."
+      ]
+    }
+  },
+  "required_model_files": [
+    {
+      "name": "qwen-image-2512-Q6_K.gguf",
+      "type": "diffusion model",
+      "comfyui_model_family": "unet",
+      "node": "UnetLoaderGGUF",
+      "bundled": false
+    },
+    {
+      "name": "Qwen2.5-VL-7B-Instruct-UD-Q4_K_XL.gguf",
+      "type": "text encoder",
+      "comfyui_model_family": "clip",
+      "node": "CLIPLoaderGGUF",
+      "bundled": false
+    },
+    {
+      "name": "qwen_image_vae.safetensors",
+      "type": "VAE",
+      "comfyui_model_family": "vae",
+      "node": "VAELoader",
+      "bundled": false
+    },
+    {
+      "name": "qwen-360-diffusion-2512-int8-bf16-v2.safetensors",
+      "type": "LoRA",
+      "comfyui_model_family": "loras",
+      "node": "LoraLoaderModelOnly",
+      "bundled": false
+    },
+    {
+      "name": "RealESRGAN_x2plus.pth",
+      "type": "2x upscale model",
+      "comfyui_model_family": "upscale_models",
+      "node": "UpscaleModelLoader",
+      "bundled": false
+    }
+  ],
+  "required_nodes": [
+    {
+      "class_type": "UnetLoaderGGUF",
+      "source": "ComfyUI-GGUF custom node pack"
+    },
+    {
+      "class_type": "CLIPLoaderGGUF",
+      "source": "ComfyUI-GGUF custom node pack"
+    },
+    {
+      "class_type": "LoraLoaderModelOnly",
+      "source": "ComfyUI built-in LoRA loader family"
+    },
+    {
+      "class_type": "ModelSamplingAuraFlow",
+      "source": "ComfyUI comfy_extras nodes_model_advanced.py"
+    },
+    {
+      "class_type": "CFGNorm",
+      "source": "Required custom node class; install the missing-node provider reported by ComfyUI if unavailable"
+    },
+    {
+      "class_type": "EmptySD3LatentImage",
+      "source": "ComfyUI comfy_extras nodes_sd3.py"
+    },
+    {
+      "class_type": "UpscaleModelLoader",
+      "source": "ComfyUI comfy_extras nodes_upscale_model.py"
+    },
+    {
+      "class_type": "ImageUpscaleWithModel",
+      "source": "ComfyUI comfy_extras nodes_upscale_model.py"
+    }
+  ],
+  "defaults": {
+    "workflow_mode": "ground_level",
+    "width": 2048,
+    "height": 1024,
+    "steps": 32,
+    "cfg": 4.0,
+    "sampler_name": "euler",
+    "scheduler": "simple",
+    "denoise": 1.0,
+    "negative_prompt": "text, logos, watermarks, signature, visible seams, border, frame, cropped panorama, broken horizon, distorted horizon, duplicate sun, warped buildings, low detail, blurry, jpeg artifacts, upright objects below the equator, vertical forms in the lower hemisphere, furniture below the equator, walls crossing the equator, television below the equator, trees or rocks below the equator, close foreground objects, broken ground band, multiple horizons",
+    "lora_strength": 1.0,
+    "shift": 3.0,
+    "cfg_norm_strength": 1.0,
+    "filename_prefix": "batshit_skybox_qwen360_2x",
+    "upscale_model": "RealESRGAN_x2plus.pth"
+  },
+  "prompt_baseline": {
+    "positive_detail_terms": "Ultra high detailed, 8K texture detail, crisp high-frequency micro-detail, sharp fine surface detail",
+    "panorama_terms": "true 360 degree equirectangular panorama, exact 2:1 aspect ratio, seamless horizontal wrap, projection-safe panorama",
+    "ground_level_terms": "exact equirectangular equator at 50% image height, entire lower hemisphere contains only continuous ground, floor, terrain, grass, dirt, sand, or water extending from the camera into the distance, all nearby upright and vertical objects remain out of the lower hemisphere, no close foreground furniture or architecture",
+    "ground_level_negative_terms": "upright objects below the equator, vertical forms in the lower hemisphere, furniture below the equator, walls crossing the equator, television below the equator, trees or rocks below the equator, close foreground objects, broken ground band, multiple horizons",
+    "ground_level_validation": "Overlay an exact 50% horizontal guide. Everything below it must be projectable ground/floor only before testing in Batshit Ground Level mode.",
+    "elevated_terms": "elevated open panorama, lower view remains distant world rather than projectable ground",
+    "elevated_negative_terms": "close foreground floor, nearby ground filling the lower hemisphere, enclosed ground-level room",
+    "mode_switch_rule": "The visible workflow defaults are Ground Level. For Elevated / Overlook, replace both the positive and negative prompt nodes so Ground Level equator restrictions do not remain active."
+  },
+  "output_modes": [
+    {
+      "name": "Draft",
+      "base_generation": "2048x1024",
+      "final_size": "2048x1024",
+      "upscale_passes": 0,
+      "use_when": "Early prompt iteration or weak machines."
+    },
+    {
+      "name": "Standard 4K",
+      "base_generation": "2048x1024",
+      "final_size": "4096x2048",
+      "upscale_passes": 1,
+      "typical_file_size": "10-12 MB",
+      "use_when": "Smaller or lower-memory Macs/PCs, unusually heavy scenes, or performance trouble."
+    },
+    {
+      "name": "Hero 8K",
+      "base_generation": "2048x1024",
+      "final_size": "8192x4096",
+      "upscale_passes": 2,
+      "typical_file_size": "30-35 MB",
+      "use_when": "Recommended final skybox for best scene quality."
+    }
+  ],
+  "hardware_notes": {
+    "proved_on": "Josh/Corey PC with RTX 4090",
+    "observed_vram": "Repeated 2048x1024 base plus 2x upscale runs used about 21.3-21.6 GB VRAM on the RTX 4090 during the 2026-07-05 proof.",
+    "policy": "Recommend Hero 8K for final skyboxes. Use Standard 4K for smaller or lower-memory Macs/PCs, unusually heavy scenes, many mounted skyboxes, or performance trouble."
+  },
+  "repo_policy": {
+    "model_weights_bundled": false,
+    "reason": "Model weights, LoRAs, and upscalers are external runtime assets and are not committed to the Batshit repo.",
+    "failure_mode": "Missing model files or node classes must surface as explicit ComfyUI errors; do not silently swap models or downgrade the workflow."
+  }
+}
