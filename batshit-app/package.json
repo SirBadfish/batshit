@@ -112,7 +112,7 @@
 		"@asamuzakjp/dom-selector": {
 			"lru-cache": "^11.2.7"
 		},
-		"body-parser": "^2.2.1",
+		"body-parser": "^2.3.0",
 		"glob": "^10.5.0",
 		"cookie": "^0.7.2"
 	}
