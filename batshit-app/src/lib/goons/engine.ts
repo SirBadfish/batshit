@@ -11283,6 +11283,31 @@ export class GoonEngine implements GoonStageHost {
     return this.authorableRawMorphTargetNames
   }
 
+  /** Canonical ARKit source channels resolved to this package's authored targets. */
+  getArkitFaceAuthoringDefinitions(): Array<{ id: Arkit52Channel; morphTargets: string[] }> {
+    const bindings = this.customArkitFaceDriverBindings?.face
+    if (!bindings) return []
+    return [...bindings].map(([id, morphTargets]) => ({ id, morphTargets: [...morphTargets] }))
+  }
+
+  /** Optional Audio2Face tongue-extension channels resolved to authored targets. */
+  getTongueFaceAuthoringDefinitions(): Array<{
+    id: Audio2FaceTongueChannel
+    morphTargets: string[]
+  }> {
+    const bindings = this.customArkitFaceDriverBindings?.tongue
+    if (!bindings) return []
+    return [...bindings].map(([id, morphTargets]) => ({ id, morphTargets: [...morphTargets] }))
+  }
+
+  /** Exact mouth-control capability for the currently loaded avatar lane. */
+  getMouthPresetSupport(): CustomMouthPresetSupport {
+    return {
+      ...this.customMouthPresetSupport,
+      availablePresets: [...this.customMouthPresetSupport.availablePresets]
+    }
+  }
+
   hasCustomMorphDefinitions(): boolean {
     return this.customMorphDefinitions.length > 0
   }

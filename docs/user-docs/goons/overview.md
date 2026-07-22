@@ -27,7 +27,7 @@ Independent artists can use that expert lane to offer original, commissioned, or
 The ordinary first-party Advanced/GLB flow is **upload, edit, and Save Goon**:
 
 - After upload, Batshit shows **Preparing** and creates the first verified runtime version automatically. The Goon is not assignable or available in the Dock until it reads **Ready**.
-- You can batch Body Appearance and Face Appearance edits, then click **Save Goon** once. One saved appearance batch produces one checked internal update.
+- You can batch face and body edits inside **Custom Goon Builder**, then click **Save Goon** once. One saved appearance batch produces one checked internal update.
 - Mood, Emote, Motion, camera, Eye Contact behavior, voice, and ordinary runtime-only wardrobe/settings saves do not rebuild geometry.
 - A failed update leaves the previously working Goon usable. **Retry** resumes verified stored work; **Discard** removes only unreferenced pending work.
 - **Restore Previous Version** swaps the complete prior package, appearance, artwork, eye state, and runtime version together.
@@ -54,7 +54,7 @@ Some Goons have more mouth shapes than others. Standard/VRoid avatars use their 
 
 A **Mood** is a persistent base expression or motion. It stays active until changed. An **Emote** is a one-shot facial expression, usually triggered by emoji. Body gestures and other one-shot animations are **Motions**, not Emotes; agents trigger those with a `*goon: motion_name*` stage direction.
 
-Every Goon type uses the same six facial choices when you author a Mood, Emote, or expression step: **Happy, Relaxed, Sad, Angry, Surprised, and Neutral**. Batshit adapts the five active expressions to the selected model's real capabilities. **Neutral** is always available and returns the Goon to its authored resting face; it does not require a separate Neutral blendshape. If that model does not map one of the active expressions, the control stays visible and says **Unavailable** instead of disappearing or looking like a broken slider. A previously saved unsupported weight can still be removed.
+Every Goon type uses the same five facial presets when you author a Mood, Emote, or expression step: **Happy, Relaxed, Sad, Angry, and Surprised**. Batshit adapts them to the selected model's real capabilities. **Reset Face** returns the Goon to its authored Neutral resting face; Neutral does not need its own slider or blendshape. If that model does not map one of the five presets, the control stays visible and says **Unavailable** instead of disappearing or looking broken. The editor then exposes the face regions the model can actually drive, while search and changed counts keep large Advanced/GLB control sets manageable.
 
 Those expression recipes are separate from speech mouth shapes. A facial expression can share a basic control such as opening the jaw, but Batshit does not use an O vowel or another viseme preset as a shortcut for Surprised, Happy, or the other semantic expressions.
 

@@ -59,8 +59,7 @@
   import AppearanceDialsEditor from '$lib/components/goons/AppearanceDialsEditor.svelte'
   import FacialArtworkEditor from '$lib/components/goons/FacialArtworkEditor.svelte'
   import OralAppearanceEditor from '$lib/components/goons/OralAppearanceEditor.svelte'
-  import CustomMorphsEditor from '$lib/components/goons/CustomMorphsEditor.svelte'
-  import FaceControlsEditor from '$lib/components/goons/FaceControlsEditor.svelte'
+  import UniversalFaceControlsEditor from '$lib/components/goons/UniversalFaceControlsEditor.svelte'
   import EyeContactTuningEditor from '$lib/components/goons/EyeContactTuningEditor.svelte'
   import SocketEyeContactEditor from '$lib/components/goons/SocketEyeContactEditor.svelte'
   import GoonsFieldLabel from '$lib/components/goons/GoonsFieldLabel.svelte'
@@ -108,6 +107,11 @@
     getCustomMorphValue as getCustomMorphValueForTargets,
     type CustomMorphDefinition
   } from '$lib/goons/customMorphs'
+  import {
+    buildUniversalFaceControlModel,
+    type UniversalFaceControlDefinition,
+    type UniversalFaceControlModel
+  } from '$lib/goons/universalFaceControls'
   import {
     parseAppearanceDialsManifest,
     reconcileAppearanceDialValues,
@@ -740,8 +744,7 @@
   let editorDescriptionEditorOpen = $state(false)
   let editorBasicSettingsOpen = $state(false)
   let editorEyeContactOpen = $state(false)
-  let editorBodyAppearanceOpen = $state(false)
-  let editorFaceAppearanceOpen = $state(false)
+  let editorCustomGoonBuilderOpen = $state(false)
   let editorVrmSectionOpen = $state(false)
   let editorAnimationsSectionOpen = $state(false)
   let editorClosetOpen = $state(false)
@@ -8341,8 +8344,7 @@
     editorDescriptionEditorOpen = false
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
-    editorBodyAppearanceOpen = false
-    editorFaceAppearanceOpen = false
+    editorCustomGoonBuilderOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -8764,26 +8766,43 @@
     if (groupId === 'eyelids') eyelidsLocked = locked
   }
 
-  function currentHasRawMorphTargets(): boolean {
-    const engine = activeTab === 'kitchen' ? kitchenPreviewEngine : previewEngine
-    return engine?.hasRawMorphTargets() ?? false
-  }
-
   function currentRawMorphTargetNames(): string[] {
     const engine = activeTab === 'kitchen' ? kitchenPreviewEngine : previewEngine
     if (!engine?.hasRawMorphTargets()) return []
     return engine.getAuthorableRawMorphTargetNames()
   }
 
-  function currentHasCustomMorphs(): boolean {
-    const engine = activeTab === 'kitchen' ? kitchenPreviewEngine : previewEngine
-    return engine?.hasCustomMorphDefinitions() ?? false
-  }
-
   function currentCustomMorphDefinitions(): CustomMorphDefinition[] {
     const engine = activeTab === 'kitchen' ? kitchenPreviewEngine : previewEngine
     if (!engine?.hasCustomMorphDefinitions()) return []
     return engine.getCustomMorphDefinitions()
+  }
+
+  function currentUniversalFaceControlModel(): UniversalFaceControlModel {
+    const engine = activeTab === 'kitchen' ? kitchenPreviewEngine : previewEngine
+    return buildUniversalFaceControlModel({
+      arkitDefinitions: engine?.getArkitFaceAuthoringDefinitions() ?? [],
+      tongueDefinitions: engine?.getTongueFaceAuthoringDefinitions() ?? [],
+      customMorphDefinitions: currentCustomMorphDefinitions(),
+      mouthPresetSupport: engine?.getMouthPresetSupport() ?? null,
+      classicSections: currentFaceControlSections()
+    })
+  }
+
+  function currentUnmanagedRawMorphTargetNames(): string[] {
+    const managed = new Set(currentUniversalFaceControlModel().managedRawMorphTargetNames)
+    return currentRawMorphTargetNames().filter((targetName) => !managed.has(targetName))
+  }
+
+  function currentHasUnmanagedRawMorphTargets(): boolean {
+    return currentUnmanagedRawMorphTargetNames().length > 0
+  }
+
+  function getUnmanagedRawMorphs(
+    rawMorphTargets: GoonRawMorphTarget[] | undefined
+  ): GoonRawMorphTarget[] {
+    const available = new Set(currentUnmanagedRawMorphTargetNames())
+    return (rawMorphTargets ?? []).filter((entry) => available.has(entry.target))
   }
 
   function getFaceControlValue(cueName: string, controlId: BatshitFaceControlId): number {
@@ -8870,25 +8889,50 @@
     return result.sort((a, b) => a.target.localeCompare(b.target))
   }
 
-  function getCustomMorphValue(cueName: string, customMorphId: string): number {
+  function getUniversalFaceControlValue(
+    cueName: string,
+    control: UniversalFaceControlDefinition
+  ): number {
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName]
-    const definition = currentCustomMorphDefinitions().find((entry) => entry.id === customMorphId)
-    if (!definition) return 0
-    return getCustomMorphValueForTargets(cue?.rawMorphTargets, definition.morphTargets)
+    if (control.storage === 'face-control' && control.faceControlId) {
+      return getFaceControlValue(cueName, control.faceControlId)
+    }
+    if (control.storage === 'expression-preset' && control.expressionPreset) {
+      return getExpressionTargetWeight(cue?.expressionTargets, control.expressionPreset)
+    }
+    return getCustomMorphValueForTargets(cue?.rawMorphTargets, control.morphTargets ?? [])
   }
 
-  function updateCustomMorph(cueName: string, customMorphId: string, value: number) {
+  function updateUniversalFaceControl(
+    cueName: string,
+    control: UniversalFaceControlDefinition,
+    value: number
+  ) {
+    if (control.storage === 'face-control' && control.faceControlId) {
+      updateFaceControl(cueName, control.faceControlId, value)
+      return
+    }
+    if (control.storage === 'expression-preset' && control.expressionPreset) {
+      updateCueExpressionPreset(cueName, control.expressionPreset, value)
+      return
+    }
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName] || { name: cueName, kind: 'emote' }
-    const definition = currentCustomMorphDefinitions().find((entry) => entry.id === customMorphId)
-    if (!definition) return
-    const next = applyCustomMorphValue(cue.rawMorphTargets ?? [], definition.morphTargets, value)
+    const next = applyCustomMorphValue(cue.rawMorphTargets ?? [], control.morphTargets ?? [], value)
     updateCueField(cueName, { rawMorphTargets: next.length > 0 ? next : undefined })
   }
 
+  function resetUniversalFaceControls(cueName: string) {
+    updateCueField(cueName, {
+      expressionTargets: undefined,
+      faceControls: undefined,
+      rawMorphTargets: undefined
+    })
+  }
+
   function addRawMorphTarget(cueName: string) {
-    const available = currentRawMorphTargetNames()
+    const available = currentUnmanagedRawMorphTargetNames()
     if (available.length === 0) return
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName] || { name: cueName, kind: 'emote' }
@@ -9098,34 +9142,56 @@
     updateStepField(cueName, stepIndex, { rawMorphTargets: next.length > 0 ? next : undefined })
   }
 
-  function getStepCustomMorphValue(cueName: string, stepIndex: number, customMorphId: string): number {
+  function getStepUniversalFaceControlValue(
+    cueName: string,
+    stepIndex: number,
+    control: UniversalFaceControlDefinition
+  ): number {
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName]
     const step = cue?.steps?.[stepIndex]
-    const definition = currentCustomMorphDefinitions().find((entry) => entry.id === customMorphId)
-    if (!definition) return 0
-    return getCustomMorphValueForTargets(step?.rawMorphTargets, definition.morphTargets)
+    if (control.storage === 'face-control' && control.faceControlId) {
+      return getStepFaceControlValue(cueName, stepIndex, control.faceControlId)
+    }
+    if (control.storage === 'expression-preset' && control.expressionPreset) {
+      return getExpressionTargetWeight(step?.expressionTargets, control.expressionPreset)
+    }
+    return getCustomMorphValueForTargets(step?.rawMorphTargets, control.morphTargets ?? [])
   }
 
-  function updateStepCustomMorph(
+  function updateStepUniversalFaceControl(
     cueName: string,
     stepIndex: number,
-    customMorphId: string,
+    control: UniversalFaceControlDefinition,
     value: number
   ) {
+    if (control.storage === 'face-control' && control.faceControlId) {
+      updateStepFaceControl(cueName, stepIndex, control.faceControlId, value)
+      return
+    }
+    if (control.storage === 'expression-preset' && control.expressionPreset) {
+      updateStepExpressionPreset(cueName, stepIndex, control.expressionPreset, value)
+      return
+    }
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName]
     if (!cue?.steps) return
     const step = cue.steps[stepIndex]
     if (!step) return
-    const definition = currentCustomMorphDefinitions().find((entry) => entry.id === customMorphId)
-    if (!definition) return
-    const next = applyCustomMorphValue(step.rawMorphTargets ?? [], definition.morphTargets, value)
+    const next = applyCustomMorphValue(step.rawMorphTargets ?? [], control.morphTargets ?? [], value)
     updateStepField(cueName, stepIndex, { rawMorphTargets: next.length > 0 ? next : undefined })
   }
 
+  function resetStepUniversalFaceControls(cueName: string, stepIndex: number) {
+    updateStepField(cueName, stepIndex, {
+      expressionTargets: undefined,
+      faceControls: undefined,
+      rawMorphTargets: undefined
+    })
+  }
+
   function addStepRawMorphTarget(cueName: string, stepIndex: number) {
-    const available = currentRawMorphTargetNames()
+    const available = currentUnmanagedRawMorphTargetNames()
     if (available.length === 0) return
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName]
@@ -10368,8 +10434,7 @@
     section:
       | 'basic'
       | 'eye-contact'
-      | 'body-appearance'
-      | 'face-appearance'
+      | 'custom-goon-builder'
       | 'vrm'
       | 'animations'
       | 'closet'
@@ -10381,10 +10446,8 @@
     }
     editorBasicSettingsOpen = section === 'basic' ? !editorBasicSettingsOpen : false
     editorEyeContactOpen = section === 'eye-contact' ? !editorEyeContactOpen : false
-    editorBodyAppearanceOpen =
-      section === 'body-appearance' ? !editorBodyAppearanceOpen : false
-    editorFaceAppearanceOpen =
-      section === 'face-appearance' ? !editorFaceAppearanceOpen : false
+    editorCustomGoonBuilderOpen =
+      section === 'custom-goon-builder' ? !editorCustomGoonBuilderOpen : false
     editorVrmSectionOpen = section === 'vrm' ? !editorVrmSectionOpen : false
     editorAnimationsSectionOpen =
       section === 'animations' ? !editorAnimationsSectionOpen : false
@@ -10407,8 +10470,7 @@
   function toggleEditorCueSection(section: 'moods' | 'emotes') {
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
-    editorBodyAppearanceOpen = false
-    editorFaceAppearanceOpen = false
+    editorCustomGoonBuilderOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -14407,29 +14469,25 @@
                               </div>
                             </div>
                             <div class="space-y-2">
-                              <FaceControlsEditor
+                              <UniversalFaceControlsEditor
                                 presetOptions={currentSemanticExpressionControls()}
                                 getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                 onPresetChange={(preset, value) =>
                                   updateCueExpressionPreset(cue.name, preset, value)}
-                                sections={currentFaceControlSections(cue)}
-                                getValue={(controlId) => getFaceControlValue(cue.name, controlId)}
-                                onChange={(controlId, value) => updateFaceControl(cue.name, controlId, value)}
+                                model={currentUniversalFaceControlModel()}
+                                getControlValue={(control) => getUniversalFaceControlValue(cue.name, control)}
+                                onControlChange={(control, value) =>
+                                  updateUniversalFaceControl(cue.name, control, value)}
+                                onReset={() => resetUniversalFaceControls(cue.name)}
                                 isGroupLocked={isFaceControlGroupLocked}
                                 onToggleGroupLock={setFaceControlGroupLocked}
                               />
-                              {#if currentHasCustomMorphs()}
-                                <CustomMorphsEditor
-                                  definitions={currentCustomMorphDefinitions()}
-                                  getValue={(customMorphId) => getCustomMorphValue(cue.name, customMorphId)}
-                                  onChange={(customMorphId, value) =>
-                                    updateCustomMorph(cue.name, customMorphId, value)}
-                                />
-                              {/if}
-                              {#if currentHasRawMorphTargets()}
+                              {#if currentHasUnmanagedRawMorphTargets()}
                                 <GoonsRawMorphEditor
-                                  morphs={cue.rawMorphTargets ?? []}
-                                  targetNames={currentRawMorphTargetNames()}
+                                  title="Advanced Raw Morphs"
+                                  description="Only model targets that are not already represented by the universal face controls appear here."
+                                  morphs={getUnmanagedRawMorphs(cue.rawMorphTargets)}
+                                  targetNames={currentUnmanagedRawMorphTargetNames()}
                                   getValue={(targetName) => getRawMorphTargetValue(cue.name, targetName)}
                                   onRename={(currentTarget, nextTarget) =>
                                     renameRawMorphTarget(cue.name, currentTarget, nextTarget)}
@@ -14750,28 +14808,25 @@
                                     </div>
                                   </div>
                                 {/if}
-                                <FaceControlsEditor
+                                <UniversalFaceControlsEditor
                                   presetOptions={currentSemanticExpressionControls()}
                                   getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
-                                  sections={currentFaceControlSections(cue)}
-                                  getValue={(controlId) => getFaceControlValue(cue.name, controlId)}
-                                  onChange={(controlId, value) => updateFaceControl(cue.name, controlId, value)}
+                                  model={currentUniversalFaceControlModel()}
+                                  getControlValue={(control) => getUniversalFaceControlValue(cue.name, control)}
+                                  onControlChange={(control, value) =>
+                                    updateUniversalFaceControl(cue.name, control, value)}
+                                  onReset={() => resetUniversalFaceControls(cue.name)}
                                   isGroupLocked={isFaceControlGroupLocked}
                                   onToggleGroupLock={setFaceControlGroupLocked}
                                 />
-                                {#if currentHasCustomMorphs()}
-                                  <CustomMorphsEditor
-                                    definitions={currentCustomMorphDefinitions()}
-                                    getValue={(customMorphId) => getCustomMorphValue(cue.name, customMorphId)}
-                                    onChange={(customMorphId, value) => updateCustomMorph(cue.name, customMorphId, value)}
-                                  />
-                                {/if}
-                                {#if currentHasRawMorphTargets()}
+                                {#if currentHasUnmanagedRawMorphTargets()}
                                   <GoonsRawMorphEditor
-                                    morphs={cue.rawMorphTargets ?? []}
-                                    targetNames={currentRawMorphTargetNames()}
+                                    title="Advanced Raw Morphs"
+                                    description="Only model targets that are not already represented by the universal face controls appear here."
+                                    morphs={getUnmanagedRawMorphs(cue.rawMorphTargets)}
+                                    targetNames={currentUnmanagedRawMorphTargetNames()}
                                     getValue={(targetName) => getRawMorphTargetValue(cue.name, targetName)}
                                     onRename={(currentTarget, nextTarget) =>
                                       renameRawMorphTarget(cue.name, currentTarget, nextTarget)}
@@ -14822,29 +14877,27 @@
                                           }} />
                                       </div>
                                     </div>
-                                    <FaceControlsEditor
+                                    <UniversalFaceControlsEditor
                                       presetOptions={currentSemanticExpressionControls()}
                                       getPresetValue={(preset) =>
                                         getExpressionTargetWeight(step.expressionTargets, preset)}
                                       onPresetChange={(preset, value) =>
                                         updateStepExpressionPreset(cue.name, stepIndex, preset, value)}
-                                      sections={currentFaceControlSections(step)}
-                                      getValue={(controlId) => getStepFaceControlValue(cue.name, stepIndex, controlId)}
-                                      onChange={(controlId, value) => updateStepFaceControl(cue.name, stepIndex, controlId, value)}
+                                      model={currentUniversalFaceControlModel()}
+                                      getControlValue={(control) =>
+                                        getStepUniversalFaceControlValue(cue.name, stepIndex, control)}
+                                      onControlChange={(control, value) =>
+                                        updateStepUniversalFaceControl(cue.name, stepIndex, control, value)}
+                                      onReset={() => resetStepUniversalFaceControls(cue.name, stepIndex)}
                                       isGroupLocked={isFaceControlGroupLocked}
                                       onToggleGroupLock={setFaceControlGroupLocked}
                                     />
-                                  {#if currentHasCustomMorphs()}
-                                    <CustomMorphsEditor
-                                      definitions={currentCustomMorphDefinitions()}
-                                      getValue={(customMorphId) => getStepCustomMorphValue(cue.name, stepIndex, customMorphId)}
-                                      onChange={(customMorphId, value) => updateStepCustomMorph(cue.name, stepIndex, customMorphId, value)}
-                                    />
-                                    {/if}
-                                    {#if currentHasRawMorphTargets()}
+                                    {#if currentHasUnmanagedRawMorphTargets()}
                                       <GoonsRawMorphEditor
-                                        morphs={step.rawMorphTargets ?? []}
-                                        targetNames={currentRawMorphTargetNames()}
+                                        title="Advanced Raw Morphs"
+                                        description="Only model targets that are not already represented by the universal face controls appear here."
+                                        morphs={getUnmanagedRawMorphs(step.rawMorphTargets)}
+                                        targetNames={currentUnmanagedRawMorphTargetNames()}
                                         getValue={(targetName) =>
                                           getStepRawMorphTargetValue(cue.name, stepIndex, targetName)}
                                         onRename={(currentTarget, nextTarget) =>
@@ -15693,68 +15746,15 @@
             </Collapsible.Content>
           </Collapsible.Root>
 
-          {#if editorGoonKind === 'custom' && (editorAppearanceDialsManifest || editorAppearanceDialsError)}
-            <Collapsible.Root bind:open={editorBodyAppearanceOpen} class={goonLevel1AccordionClass}>
-              <Collapsible.Trigger
-                class={goonLevel1AccordionHeaderClass}
-                onclick={() => toggleEditorPrimarySection('body-appearance')}
-              >
-                <div class="flex items-center gap-1.5">
-                  <SlidersHorizontal class="batshit-goon-l1-icon h-4 w-4" />
-                  <span class="batshit-settings-form-label">Body Appearance</span>
-                  <div
-                    onclick={(event) => {
-                      event.preventDefault()
-                      event.stopPropagation()
-                    }}
-                    aria-hidden="true"
-                  >
-                    <SettingsInfoMenu ariaLabel="About Body Appearance" contentClass="w-80">
-                      <p>
-                        Versioned body, head, and neck controls from this Goon's package. Changes
-                        preview live; Save Goon keeps each value with its exact package definition
-                        so an incompatible update resets clearly instead of drifting.
-                      </p>
-                    </SettingsInfoMenu>
-                  </div>
-                </div>
-                <ChevronDown
-                  class={`h-4 w-4 shrink-0 transition-transform ${editorBodyAppearanceOpen ? 'rotate-180' : ''}`}
-                />
-              </Collapsible.Trigger>
-              <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
-                {#if editorAppearanceDialsError}
-                  <p class="batshit-settings-form-error px-3">
-                    Body Appearance unavailable: {editorAppearanceDialsError}
-                  </p>
-                {:else if editorAppearanceDialsManifest && editorAppearanceDialsState}
-                  <div class="px-3 pb-2">
-                    {#if editorAppearanceDialsNotice}
-                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
-                        {editorAppearanceDialsNotice}
-                      </p>
-                    {/if}
-                    <AppearanceDialsEditor
-                      manifest={editorAppearanceDialsManifest}
-                      valueState={editorAppearanceDialsState}
-                      surface="body"
-                      onChange={updateEditorAppearanceDials}
-                    />
-                  </div>
-                {/if}
-              </Collapsible.Content>
-            </Collapsible.Root>
-          {/if}
-
           {#if editorGoonKind === 'custom' && (editorAppearanceDialsManifest || editorAppearanceDialsError || editorFacialArtworkDefinition || editorFacialArtworkError || editorFacialArtworkPackageNotice)}
-            <Collapsible.Root bind:open={editorFaceAppearanceOpen} class={goonLevel1AccordionClass}>
+            <Collapsible.Root bind:open={editorCustomGoonBuilderOpen} class={goonLevel1AccordionClass}>
               <Collapsible.Trigger
                 class={goonLevel1AccordionHeaderClass}
-                onclick={() => toggleEditorPrimarySection('face-appearance')}
+                onclick={() => toggleEditorPrimarySection('custom-goon-builder')}
               >
                 <div class="flex items-center gap-1.5">
                   <SlidersHorizontal class="batshit-goon-l1-icon h-4 w-4" />
-                  <span class="batshit-settings-form-label">Face Appearance</span>
+                  <span class="batshit-settings-form-label">Custom Goon Builder</span>
                   <div
                     onclick={(event) => {
                       event.preventDefault()
@@ -15762,20 +15762,26 @@
                     }}
                     aria-hidden="true"
                   >
-                    <SettingsInfoMenu ariaLabel="About Face Appearance" contentClass="w-80">
+                    <SettingsInfoMenu ariaLabel="About Custom Goon Builder" contentClass="w-80">
                       <p>
-                        Face-shape controls and package-fitted facial artwork, organized together
-                        by facial region. PNGs are validated against this exact Goon package and
-                        preview live before Save Goon stores them.
+                        Build this Custom Goon's identity in one place. Face shape and fitted facial
+                        artwork come first, followed by body, head, and neck proportions. Every
+                        change previews live and remains tied to this exact package definition.
                       </p>
                     </SettingsInfoMenu>
                   </div>
                 </div>
                 <ChevronDown
-                  class={`h-4 w-4 shrink-0 transition-transform ${editorFaceAppearanceOpen ? 'rotate-180' : ''}`}
+                  class={`h-4 w-4 shrink-0 transition-transform ${editorCustomGoonBuilderOpen ? 'rotate-180' : ''}`}
                 />
               </Collapsible.Trigger>
               <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
+                <div class="batshit-goon-builder-section-heading">
+                  <div class="batshit-goon-builder-section-title">Face</div>
+                  <p class="batshit-goon-builder-section-copy">
+                    Shape the face and apply package-fitted brows, eyes, mouth, and lip artwork.
+                  </p>
+                </div>
                 {#if editorFacialArtworkPackageNotice}
                   <div class="px-3 pb-2">
                     <p class="text-[0.675rem] leading-relaxed text-amber-400" role="status">
@@ -15785,7 +15791,7 @@
                 {/if}
                 {#if editorAppearanceDialsError}
                   <p class="batshit-settings-form-error px-3">
-                    Face Appearance unavailable: {editorAppearanceDialsError}
+                    Face Builder unavailable: {editorAppearanceDialsError}
                   </p>
                 {:else if editorAppearanceDialsManifest && editorAppearanceDialsState}
                   <div class="px-3 pb-2">
@@ -15873,6 +15879,31 @@
                         {/if}
                       {/snippet}
                     </AppearanceDialsEditor>
+                  </div>
+                {/if}
+                <div class="batshit-goon-builder-section-heading is-body">
+                  <div class="batshit-goon-builder-section-title">Body</div>
+                  <p class="batshit-goon-builder-section-copy">
+                    Continue with body, head, and neck proportions after the face is established.
+                  </p>
+                </div>
+                {#if editorAppearanceDialsError}
+                  <p class="batshit-settings-form-error px-3">
+                    Body Builder unavailable: {editorAppearanceDialsError}
+                  </p>
+                {:else if editorAppearanceDialsManifest && editorAppearanceDialsState}
+                  <div class="px-3 pb-2">
+                    {#if editorAppearanceDialsNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorAppearanceDialsNotice}
+                      </p>
+                    {/if}
+                    <AppearanceDialsEditor
+                      manifest={editorAppearanceDialsManifest}
+                      valueState={editorAppearanceDialsState}
+                      surface="body"
+                      onChange={updateEditorAppearanceDials}
+                    />
                   </div>
                 {/if}
               </Collapsible.Content>
@@ -16705,29 +16736,25 @@
                                 </div>
                               </div>
                               <div class="space-y-2">
-                                <FaceControlsEditor
+                                <UniversalFaceControlsEditor
                                   presetOptions={currentSemanticExpressionControls()}
                                   getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
-                                  sections={currentFaceControlSections(cue)}
-                                  getValue={(controlId) => getFaceControlValue(cue.name, controlId)}
-                                  onChange={(controlId, value) => updateFaceControl(cue.name, controlId, value)}
+                                  model={currentUniversalFaceControlModel()}
+                                  getControlValue={(control) => getUniversalFaceControlValue(cue.name, control)}
+                                  onControlChange={(control, value) =>
+                                    updateUniversalFaceControl(cue.name, control, value)}
+                                  onReset={() => resetUniversalFaceControls(cue.name)}
                                   isGroupLocked={isFaceControlGroupLocked}
                                   onToggleGroupLock={setFaceControlGroupLocked}
                                 />
-                                {#if currentHasCustomMorphs()}
-                                  <CustomMorphsEditor
-                                    definitions={currentCustomMorphDefinitions()}
-                                    getValue={(customMorphId) => getCustomMorphValue(cue.name, customMorphId)}
-                                    onChange={(customMorphId, value) =>
-                                      updateCustomMorph(cue.name, customMorphId, value)}
-                                  />
-                                {/if}
-                                {#if currentHasRawMorphTargets()}
+                                {#if currentHasUnmanagedRawMorphTargets()}
                                   <GoonsRawMorphEditor
-                                    morphs={cue.rawMorphTargets ?? []}
-                                    targetNames={currentRawMorphTargetNames()}
+                                    title="Advanced Raw Morphs"
+                                    description="Only model targets that are not already represented by the universal face controls appear here."
+                                    morphs={getUnmanagedRawMorphs(cue.rawMorphTargets)}
+                                    targetNames={currentUnmanagedRawMorphTargetNames()}
                                     getValue={(targetName) => getRawMorphTargetValue(cue.name, targetName)}
                                     onRename={(currentTarget, nextTarget) =>
                                       renameRawMorphTarget(cue.name, currentTarget, nextTarget)}
@@ -17129,28 +17156,25 @@
                                     </div>
                                   </div>
                                 {/if}
-                                <FaceControlsEditor
+                                <UniversalFaceControlsEditor
                                   presetOptions={currentSemanticExpressionControls()}
                                   getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
-                                  sections={currentFaceControlSections(cue)}
-                                  getValue={(controlId) => getFaceControlValue(cue.name, controlId)}
-                                  onChange={(controlId, value) => updateFaceControl(cue.name, controlId, value)}
+                                  model={currentUniversalFaceControlModel()}
+                                  getControlValue={(control) => getUniversalFaceControlValue(cue.name, control)}
+                                  onControlChange={(control, value) =>
+                                    updateUniversalFaceControl(cue.name, control, value)}
+                                  onReset={() => resetUniversalFaceControls(cue.name)}
                                   isGroupLocked={isFaceControlGroupLocked}
                                   onToggleGroupLock={setFaceControlGroupLocked}
                                 />
-                                {#if currentHasCustomMorphs()}
-                                  <CustomMorphsEditor
-                                    definitions={currentCustomMorphDefinitions()}
-                                    getValue={(customMorphId) => getCustomMorphValue(cue.name, customMorphId)}
-                                    onChange={(customMorphId, value) => updateCustomMorph(cue.name, customMorphId, value)}
-                                  />
-                                {/if}
-                                {#if currentHasRawMorphTargets()}
+                                {#if currentHasUnmanagedRawMorphTargets()}
                                   <GoonsRawMorphEditor
-                                    morphs={cue.rawMorphTargets ?? []}
-                                    targetNames={currentRawMorphTargetNames()}
+                                    title="Advanced Raw Morphs"
+                                    description="Only model targets that are not already represented by the universal face controls appear here."
+                                    morphs={getUnmanagedRawMorphs(cue.rawMorphTargets)}
+                                    targetNames={currentUnmanagedRawMorphTargetNames()}
                                     getValue={(targetName) => getRawMorphTargetValue(cue.name, targetName)}
                                     onRename={(currentTarget, nextTarget) =>
                                       renameRawMorphTarget(cue.name, currentTarget, nextTarget)}
@@ -17201,29 +17225,27 @@
                                           }} />
                                       </div>
                                     </div>
-                                      <FaceControlsEditor
+                                      <UniversalFaceControlsEditor
                                         presetOptions={currentSemanticExpressionControls()}
                                         getPresetValue={(preset) =>
                                           getExpressionTargetWeight(step.expressionTargets, preset)}
                                         onPresetChange={(preset, value) =>
                                           updateStepExpressionPreset(cue.name, stepIndex, preset, value)}
-                                        sections={currentFaceControlSections(step)}
-                                        getValue={(controlId) => getStepFaceControlValue(cue.name, stepIndex, controlId)}
-                                        onChange={(controlId, value) => updateStepFaceControl(cue.name, stepIndex, controlId, value)}
+                                        model={currentUniversalFaceControlModel()}
+                                        getControlValue={(control) =>
+                                          getStepUniversalFaceControlValue(cue.name, stepIndex, control)}
+                                        onControlChange={(control, value) =>
+                                          updateStepUniversalFaceControl(cue.name, stepIndex, control, value)}
+                                        onReset={() => resetStepUniversalFaceControls(cue.name, stepIndex)}
                                         isGroupLocked={isFaceControlGroupLocked}
                                         onToggleGroupLock={setFaceControlGroupLocked}
                                       />
-                                    {#if currentHasCustomMorphs()}
-                                      <CustomMorphsEditor
-                                        definitions={currentCustomMorphDefinitions()}
-                                        getValue={(customMorphId) => getStepCustomMorphValue(cue.name, stepIndex, customMorphId)}
-                                        onChange={(customMorphId, value) => updateStepCustomMorph(cue.name, stepIndex, customMorphId, value)}
-                                      />
-                                    {/if}
-                                    {#if currentHasRawMorphTargets()}
+                                    {#if currentHasUnmanagedRawMorphTargets()}
                                       <GoonsRawMorphEditor
-                                        morphs={step.rawMorphTargets ?? []}
-                                        targetNames={currentRawMorphTargetNames()}
+                                        title="Advanced Raw Morphs"
+                                        description="Only model targets that are not already represented by the universal face controls appear here."
+                                        morphs={getUnmanagedRawMorphs(step.rawMorphTargets)}
+                                        targetNames={currentUnmanagedRawMorphTargetNames()}
                                         getValue={(targetName) =>
                                           getStepRawMorphTargetValue(cue.name, stepIndex, targetName)}
                                         onRename={(currentTarget, nextTarget) =>

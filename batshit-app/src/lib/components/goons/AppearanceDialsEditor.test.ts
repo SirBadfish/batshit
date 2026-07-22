@@ -192,7 +192,7 @@ describe("AppearanceDialsEditor", () => {
     expect(eyes).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("shows the reorganized Head controls only on Body Appearance", async () => {
+  it("shows the reorganized Head controls only in the body section", async () => {
     render(AppearanceDialsEditor, {
       manifest: buildManifest(),
       valueState: buildValueState(),
