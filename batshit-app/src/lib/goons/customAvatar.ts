@@ -1,6 +1,19 @@
 import type { Mesh, Object3D } from "three";
 import type { GoonEngine } from "$lib/goons/engine";
+// Keep this core manifest/runtime module independent from the recipe barrel.
+// Worker entrypoints import Custom Avatar types, while the barrel also exports
+// both worker clients; importing the barrel here makes Vite discover each
+// worker from inside the other worker's graph and reject the circular bundle.
+import { isMountedRecipeLiveGoon } from "$lib/goons/recipe/recipeRuntimeProjection";
 import type { BatshitFaceControlId } from "$lib/goons/faceControls";
+import { sanitizeCustomRuntimeNodeName } from "$lib/goons/customRuntimeNames";
+import {
+  ARKIT_52_CHANNEL_ORDER,
+  AUDIO2FACE_16_TONGUE_CHANNEL_ORDER,
+  resolveGoonSpeechFaceProfileDeclaration,
+  type Arkit52Channel,
+  type Audio2FaceTongueChannel,
+} from "$lib/goons/speechFaceProfiles";
 import type {
   GoonEyeContactGlobalProfile,
   GoonEyeContactMode,
@@ -29,6 +42,16 @@ export type GoonCustomStageAnchors = {
 };
 
 export type GoonCustomMorphBindingValue = string | string[];
+export type GoonCustomExpressionRecipeV1 = {
+  schemaVersion: "batshit-expression-recipe/v1";
+  targets: Array<{
+    target: string;
+    weight?: number;
+  }>;
+};
+export type GoonCustomExpressionBindingValue =
+  | GoonCustomMorphBindingValue
+  | GoonCustomExpressionRecipeV1;
 export type GoonCustomFaceControlBindingValue =
   | GoonCustomMorphBindingValue
   | {
@@ -39,7 +62,10 @@ export type GoonCustomFaceControlBindingValue =
 export type GoonCustomFaceManifest = {
   mesh?: string;
   meshes?: string[];
-  expressions?: Record<string, GoonCustomMorphBindingValue>;
+  speechProfile?: unknown;
+  arkit52?: unknown;
+  tongue16?: unknown;
+  expressions?: Record<string, GoonCustomExpressionBindingValue>;
   controls?: Partial<
     Record<
       BatshitFaceControlId | (string & {}),
@@ -81,6 +107,14 @@ export type GoonCustomAvatarManifest = {
   facialArtwork?: unknown;
   /** Immutable first-party physical eye definition; parsed before runtime use. */
   eyeAppearance?: unknown;
+  /** Fixed first-party composite eye surface; valid only with eyeApertureSeam. */
+  socketEyeSurface?: unknown;
+  /** Shared cap/liner aperture ownership contract; valid only with socketEyeSurface. */
+  eyeApertureSeam?: unknown;
+  /** Immutable first-party oral material definition; parsed before runtime use. */
+  oralAppearance?: unknown;
+  /** Authoring-time final-geometry fit definitions; stripped from Live output. */
+  anatomyFit?: unknown;
   /** First-party skeleton/retarget/corrective contract; parsed by its owning runtimes. */
   rig?: unknown;
 };
@@ -95,6 +129,16 @@ export type ResolvedCustomFaceControlBinding = {
   positive: string[];
 };
 
+export type ResolvedCustomExpressionBinding = {
+  target: string;
+  weight: number;
+};
+
+export type ResolvedCustomExpressionBindingContract = {
+  bindings: Record<string, ResolvedCustomExpressionBinding[]>;
+  issues: string[];
+};
+
 export type ResolvedCustomFaceControlBindings = Partial<
   Record<BatshitFaceControlId, ResolvedCustomFaceControlBinding>
 >;
@@ -104,11 +148,16 @@ export type ResolvedCustomMorphDefinition = {
   morphTargets: string[];
 };
 
+export type ResolvedCustomArkitFaceBindings = {
+  face: Map<Arkit52Channel, string[]> | null;
+  tongue: Map<Audio2FaceTongueChannel, string[]> | null;
+  issues: string[];
+};
+
 const customManifestCache = new Map<
   string,
   Promise<GoonCustomAvatarManifest>
 >();
-const RESERVED_RUNTIME_NODE_CHARS = /[\[\]\.:/]/g;
 const EMBEDDED_BATSHIT_GLTF_EXTENSION = "BATSHIT_avatar";
 const EMBEDDED_BATSHIT_GLTF_ASSET_EXTRA_KEY = "batshitAvatar";
 
@@ -117,22 +166,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function normalizeNameList(
-  value: GoonCustomMorphBindingValue | null | undefined,
+  value: unknown,
 ) {
-  const names = Array.isArray(value)
-    ? value
+  const names: string[] = Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
     : typeof value === "string"
       ? [value]
       : [];
   return [...new Set(names.map((name) => name.trim()).filter(Boolean))];
 }
 
-export function sanitizeCustomRuntimeNodeName(name: string) {
-  return name
-    .trim()
-    .replace(/\s/g, "_")
-    .replace(RESERVED_RUNTIME_NODE_CHARS, "");
-}
+export { sanitizeCustomRuntimeNodeName } from "$lib/goons/customRuntimeNames";
 
 export function resolveCustomPerformanceRigBlock(
   manifest: GoonCustomAvatarManifest,
@@ -432,14 +476,156 @@ export function resolveCustomFaceMeshNames(manifest: GoonCustomAvatarManifest) {
 export function resolveCustomExpressionBindings(
   manifest: GoonCustomAvatarManifest,
 ) {
+  return resolveCustomExpressionBindingContract(manifest).bindings;
+}
+
+export function resolveCustomExpressionBindingContract(
+  manifest: GoonCustomAvatarManifest,
+): ResolvedCustomExpressionBindingContract {
   const entries = Object.entries(manifest.face?.expressions ?? {});
-  const bindings: Record<string, string[]> = {};
+  const bindings: Record<string, ResolvedCustomExpressionBinding[]> = {};
+  const issues: string[] = [];
   for (const [preset, rawValue] of entries) {
+    if (isRecord(rawValue)) {
+      const path = `face.expressions.${preset}`;
+      if (rawValue.schemaVersion !== "batshit-expression-recipe/v1") {
+        issues.push(`${path}.schemaVersion must be "batshit-expression-recipe/v1".`);
+        continue;
+      }
+      if (!Array.isArray(rawValue.targets) || rawValue.targets.length === 0) {
+        issues.push(`${path}.targets must be a non-empty array.`);
+        continue;
+      }
+
+      const recipeBindings: ResolvedCustomExpressionBinding[] = [];
+      const targetNames = new Set<string>();
+      let valid = true;
+      for (const [index, rawTarget] of rawValue.targets.entries()) {
+        if (!isRecord(rawTarget)) {
+          issues.push(`${path}.targets[${index}] must be an object.`);
+          valid = false;
+          continue;
+        }
+        const target = typeof rawTarget.target === "string" ? rawTarget.target.trim() : "";
+        const weight = rawTarget.weight === undefined ? 1 : rawTarget.weight;
+        if (!target) {
+          issues.push(`${path}.targets[${index}].target must be a non-empty string.`);
+          valid = false;
+          continue;
+        }
+        if (typeof weight !== "number" || !Number.isFinite(weight) || weight <= 0 || weight > 1) {
+          issues.push(`${path}.targets[${index}].weight must be greater than 0 and at most 1.`);
+          valid = false;
+          continue;
+        }
+        if (targetNames.has(target)) {
+          issues.push(`${path} assigns target "${target}" more than once.`);
+          valid = false;
+          continue;
+        }
+        targetNames.add(target);
+        recipeBindings.push({ target, weight });
+      }
+      if (valid && recipeBindings.length > 0) bindings[preset] = recipeBindings;
+      continue;
+    }
+
     const morphTargets = normalizeNameList(rawValue);
     if (morphTargets.length === 0) continue;
-    bindings[preset] = morphTargets;
+    bindings[preset] = morphTargets.map((target) => ({ target, weight: 1 }));
   }
-  return bindings;
+  return { bindings, issues };
+}
+
+export function resolveCustomSpeechFaceProfile(
+  manifest: GoonCustomAvatarManifest,
+) {
+  return resolveGoonSpeechFaceProfileDeclaration(manifest.face?.speechProfile);
+}
+
+function resolveExactCustomFaceChannelBindings<TChannel extends string>(
+  value: unknown,
+  channels: readonly TChannel[],
+  path: string,
+): { bindings: Map<TChannel, string[]> | null; issues: string[] } {
+  if (value === undefined || value === null) {
+    return { bindings: null, issues: [] };
+  }
+  if (!isRecord(value)) {
+    return { bindings: null, issues: [`${path} must be an object.`] };
+  }
+
+  const expected = new Set<string>(channels);
+  const unknown = Object.keys(value).filter((channel) => !expected.has(channel));
+  const missing = channels.filter((channel) => !(channel in value));
+  const issues: string[] = [];
+  if (unknown.length > 0) {
+    issues.push(`${path} contains unknown channels: ${unknown.join(", ")}.`);
+  }
+  if (missing.length > 0) {
+    issues.push(`${path} is missing required channels: ${missing.join(", ")}.`);
+  }
+
+  const bindings = new Map<TChannel, string[]>();
+  const targetOwners = new Map<string, TChannel>();
+  for (const channel of channels) {
+    if (!(channel in value)) continue;
+    const rawBinding = value[channel];
+    if (
+      typeof rawBinding !== "string" &&
+      !(Array.isArray(rawBinding) && rawBinding.every((entry) => typeof entry === "string"))
+    ) {
+      issues.push(`${path}.${channel} must be a morph-target name or string array.`);
+      continue;
+    }
+    const targets = normalizeNameList(rawBinding);
+    if (targets.length === 0) {
+      issues.push(`${path}.${channel} must map to at least one morph target.`);
+      continue;
+    }
+    for (const target of targets) {
+      const owner = targetOwners.get(target);
+      if (owner && owner !== channel) {
+        issues.push(
+          `${path} maps morph target "${target}" to both ${owner} and ${channel}.`,
+        );
+      } else {
+        targetOwners.set(target, channel);
+      }
+    }
+    bindings.set(channel, targets);
+  }
+
+  return {
+    bindings: issues.length === 0 ? bindings : null,
+    issues,
+  };
+}
+
+/**
+ * Full-fidelity Audio2Face support is declaration-driven. Faceit can retarget
+ * one ARKit source expression to arbitrary target shapes, so runtime filename
+ * guessing is not authoritative; the exported manifest must bind every source
+ * channel explicitly.
+ */
+export function resolveCustomArkitFaceBindings(
+  manifest: GoonCustomAvatarManifest,
+): ResolvedCustomArkitFaceBindings {
+  const face = resolveExactCustomFaceChannelBindings(
+    manifest.face?.arkit52,
+    ARKIT_52_CHANNEL_ORDER,
+    "face.arkit52",
+  );
+  const tongue = resolveExactCustomFaceChannelBindings(
+    manifest.face?.tongue16,
+    AUDIO2FACE_16_TONGUE_CHANNEL_ORDER,
+    "face.tongue16",
+  );
+  return {
+    face: face.bindings,
+    tongue: tongue.bindings,
+    issues: [...face.issues, ...tongue.issues],
+  };
 }
 
 export function resolveCustomFaceControlBindings(
@@ -485,11 +671,15 @@ export function resolveCustomFaceControlBindings(
   // as the two sides of the same Batshit eyelid slider.
   ensureNegativeTargets(
     "eyelids_left",
-    expressionBindings.blinkLeft ?? expressionBindings.blink ?? [],
+    (expressionBindings.blinkLeft ?? expressionBindings.blink ?? []).map(
+      (binding) => binding.target,
+    ),
   );
   ensureNegativeTargets(
     "eyelids_right",
-    expressionBindings.blinkRight ?? expressionBindings.blink ?? [],
+    (expressionBindings.blinkRight ?? expressionBindings.blink ?? []).map(
+      (binding) => binding.target,
+    ),
   );
 
   return bindings;
@@ -682,6 +872,9 @@ export async function loadCustomAvatarManifest(
 export async function loadAvatarIntoEngine(
   engine: GoonEngine,
   goon: GoonRecord,
+  options: {
+    role?: "automatic" | "recipe-source" | "recipe-live-candidate" | "mounted-live";
+  } = {},
 ) {
   const kind = resolveGoonKind(goon);
   const sourceProfile = resolveGoonSourceProfile(goon);
@@ -698,12 +891,30 @@ export async function loadAvatarIntoEngine(
     const manifest = await loadCustomAvatarManifest(
       resolveCustomManifestFile(goon),
     );
+    const isLeanLive = manifest.liveBuild !== undefined && manifest.liveBuild !== null;
+    if (options.role === "recipe-source" && isLeanLive) {
+      throw new Error("Recipe editor resolved a Live package instead of Recipe Source.");
+    }
+    if (options.role === "recipe-live-candidate" && !isLeanLive) {
+      throw new Error("Recipe candidate preview resolved an authoring package instead of lean Live.");
+    }
+    if (
+      options.role === "mounted-live" &&
+      isMountedRecipeLiveGoon(goon) &&
+      !isLeanLive
+    ) {
+      throw new Error("Mounted Recipe Goon resolved an authoring package instead of active Live.");
+    }
+    engine.setSocketEyeContactSettings(goon.defaults?.socketEyeContact ?? null);
     await engine.loadCustomGoon(avatarUrl, manifest, {
-      appearanceDialValues: goon.appearanceDials ?? null,
+      ...(!isLeanLive
+        ? { appearanceDialValues: goon.appearanceDials ?? null }
+        : {}),
       facialArtworkState: goon.facialArtwork ?? null,
       eyeAppearanceState: goon.eyeAppearance ?? null,
+      oralAppearanceState: goon.oralAppearance ?? null,
     });
-    return { kind, manifest };
+    return { kind, manifest, role: isLeanLive ? "live" as const : "source" as const };
   }
 
   if (sourceProfile === "guided-custom-vrm") {
@@ -719,9 +930,9 @@ export async function loadAvatarIntoEngine(
         file: overlay.file,
       })),
     );
-    return { kind, manifest };
+    return { kind, manifest, role: "vrm" as const };
   }
 
   await engine.loadGoon(avatarUrl, null);
-  return { kind, manifest: null };
+  return { kind, manifest: null, role: "vrm" as const };
 }

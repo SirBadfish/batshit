@@ -1,15 +1,15 @@
 import {
-  CUSTOM_RHUBARB_MOUTH_ORDER,
-  createEmptyCustomRhubarbMouthWeights,
-  type CustomRhubarbMouthWeights
-} from '$lib/goons/semanticVisemes'
+  OVR_15_SPEECH_FACE_PROFILE,
+  OVR_15_VISEME_ORDER,
+  createEmptyOvr15Weights,
+  type Ovr15Viseme,
+  type Ovr15Weights
+} from '$lib/goons/speechFaceProfiles'
 import type { VoiceRealtimeTtsAlignmentSegment } from '$lib/types/voiceRealtime'
 import type {
   GoonLipSyncTimeline,
   GoonLipSyncTimelineDiagnostics,
-  GoonLipSyncTimelineKeyframe,
-  GoonLipSyncViseme,
-  GoonLipSyncWeights
+  GoonLipSyncTimelineKeyframe
 } from '$lib/utils/goonLipSync'
 
 type InworldPhoneDetail = NonNullable<VoiceRealtimeTtsAlignmentSegment['phoneticDetails']>[number]
@@ -19,28 +19,28 @@ const REST_GAP_THRESHOLD_MS = 35
 
 const clamp01 = (value: number) => Math.max(0, Math.min(1, value))
 
-function createWeights(patch: Partial<CustomRhubarbMouthWeights>): GoonLipSyncWeights {
-  const weights = createEmptyCustomRhubarbMouthWeights()
-  for (const cue of CUSTOM_RHUBARB_MOUTH_ORDER) {
-    weights[cue] = clamp01(patch[cue] ?? 0)
+function createWeights(patch: Partial<Ovr15Weights>): Ovr15Weights {
+  const weights = createEmptyOvr15Weights()
+  for (const viseme of OVR_15_VISEME_ORDER) {
+    weights[viseme] = clamp01(patch[viseme] ?? 0)
   }
   return weights
 }
 
-const REST_WEIGHTS = createWeights({ rest: 1 })
+const REST_WEIGHTS = createWeights({ sil: 1 })
 
-const INWORLD_VISEME_WEIGHTS: Record<string, GoonLipSyncWeights> = {
-  aei: createWeights({ wide_open: 0.92, mid_open: 0.32 }),
-  o: createWeights({ round: 0.92, pucker: 0.18 }),
-  ee: createWeights({ clenched: 0.9, mid_open: 0.14 }),
-  bmp: createWeights({ closed: 1 }),
-  fv: createWeights({ teeth_lip: 1 }),
-  l: createWeights({ tongue_lift: 0.95, mid_open: 0.16 }),
-  r: createWeights({ tongue_lift: 0.56, round: 0.48 }),
-  th: createWeights({ clenched: 0.78, pucker: 0.16 }),
-  qw: createWeights({ pucker: 0.95, round: 0.2 }),
-  chjsh: createWeights({ tongue_lift: 0.76, clenched: 0.42, pucker: 0.18 }),
-  cdgknstxyz: createWeights({ clenched: 0.92 })
+const INWORLD_VISEME_FALLBACK: Record<string, Ovr15Viseme> = {
+  aei: 'aa',
+  o: 'O',
+  ee: 'I',
+  bmp: 'PP',
+  fv: 'FF',
+  l: 'nn',
+  r: 'RR',
+  th: 'TH',
+  qw: 'U',
+  chjsh: 'CH',
+  cdgknstxyz: 'SS'
 }
 
 const countRecordValue = (record: Record<string, number>, key: string | null) => {
@@ -48,13 +48,13 @@ const countRecordValue = (record: Record<string, number>, key: string | null) =>
   record[key] = (record[key] ?? 0) + 1
 }
 
-function cloneWeights(weights: GoonLipSyncWeights): GoonLipSyncWeights {
+function cloneWeights(weights: Ovr15Weights): Ovr15Weights {
   return { ...weights }
 }
 
-function sameWeights(left: GoonLipSyncWeights, right: GoonLipSyncWeights): boolean {
-  return CUSTOM_RHUBARB_MOUTH_ORDER.every(
-    (cue) => Math.abs((left[cue] ?? 0) - (right[cue] ?? 0)) < 0.0001
+function sameWeights(left: Ovr15Weights, right: Ovr15Weights): boolean {
+  return OVR_15_VISEME_ORDER.every(
+    (viseme) => Math.abs((left[viseme] ?? 0) - (right[viseme] ?? 0)) < 0.0001
   )
 }
 
@@ -66,53 +66,67 @@ function normalizeInworldVisemeSymbol(value: unknown): string | null {
 
 function normalizePhoneSymbol(value: unknown): string | null {
   if (typeof value !== 'string') return null
-  const normalized = value.trim().toLowerCase()
+  const normalized = value.trim().toLowerCase().replace(/[0-9]/g, '')
   return normalized || null
 }
 
-function deriveWeightsFromPhoneSymbol(phoneSymbol: string | null): GoonLipSyncWeights | null {
-  if (!phoneSymbol) return null
-  if (phoneSymbol === '[silence]') return REST_WEIGHTS
-  if (/[bmp]/.test(phoneSymbol)) return INWORLD_VISEME_WEIGHTS.bmp
-  if (/[fv]/.test(phoneSymbol)) return INWORLD_VISEME_WEIGHTS.fv
-  if (phoneSymbol.includes('tʃ') || phoneSymbol.includes('dʒ') || /sh|ch|j|ʃ|ʝ/.test(phoneSymbol)) {
-    return INWORLD_VISEME_WEIGHTS.chjsh
+function resolveOvrVisemeFromInworldPhone(
+  visemeSymbol: string | null,
+  phoneSymbol: string | null
+): Ovr15Viseme | null {
+  if (phoneSymbol === '[silence]') return 'sil'
+  if (!phoneSymbol) return visemeSymbol ? INWORLD_VISEME_FALLBACK[visemeSymbol] ?? null : null
+
+  if (visemeSymbol === 'aei') {
+    if (/[iɪy]/.test(phoneSymbol)) return 'I'
+    if (/[eɛ]/.test(phoneSymbol)) return 'E'
+    return 'aa'
   }
-  if (phoneSymbol.includes('θ') || phoneSymbol.includes('ð') || phoneSymbol === 'th') {
-    return INWORLD_VISEME_WEIGHTS.th
+  if (visemeSymbol === 'o') return /[uʊ]/.test(phoneSymbol) ? 'U' : 'O'
+  if (visemeSymbol === 'ee') return /[eɛ]/.test(phoneSymbol) ? 'E' : 'I'
+  if (visemeSymbol === 'cdgknstxyz') {
+    if (phoneSymbol.includes('tʃ') || phoneSymbol.includes('dʒ') || /sh|ch|j|ʃ|ʝ/.test(phoneSymbol)) return 'CH'
+    if (/[kgq]/.test(phoneSymbol)) return 'kk'
+    if (/[td]/.test(phoneSymbol)) return 'DD'
+    if (/[nlɫ]/.test(phoneSymbol)) return 'nn'
+    return 'SS'
   }
-  if (/[wʍ]/.test(phoneSymbol)) return INWORLD_VISEME_WEIGHTS.qw
-  if (/[rlɝɚɫ]/.test(phoneSymbol)) return phoneSymbol.includes('r') ? INWORLD_VISEME_WEIGHTS.r : INWORLD_VISEME_WEIGHTS.l
-  if (/[uoʊɔ]/.test(phoneSymbol)) return INWORLD_VISEME_WEIGHTS.o
-  if (/[iɪe]/.test(phoneSymbol)) return INWORLD_VISEME_WEIGHTS.ee
-  if (/[aæɑəʌɛ]/.test(phoneSymbol)) return INWORLD_VISEME_WEIGHTS.aei
-  if (/[cdgknstxyz]/.test(phoneSymbol)) return INWORLD_VISEME_WEIGHTS.cdgknstxyz
+
+  const categoryFallback = visemeSymbol ? INWORLD_VISEME_FALLBACK[visemeSymbol] ?? null : null
+  if (categoryFallback) return categoryFallback
+
+  if (/[bmp]/.test(phoneSymbol)) return 'PP'
+  if (/[fv]/.test(phoneSymbol)) return 'FF'
+  if (phoneSymbol.includes('θ') || phoneSymbol.includes('ð') || phoneSymbol === 'th') return 'TH'
+  if (phoneSymbol.includes('tʃ') || phoneSymbol.includes('dʒ') || /sh|ch|j|ʃ|ʝ/.test(phoneSymbol)) return 'CH'
+  if (/[kgq]/.test(phoneSymbol)) return 'kk'
+  if (/[td]/.test(phoneSymbol)) return 'DD'
+  if (/[szx]/.test(phoneSymbol)) return 'SS'
+  if (/[nlɫ]/.test(phoneSymbol)) return 'nn'
+  if (/[rɝɚ]/.test(phoneSymbol)) return 'RR'
+  if (/[uʊwʍ]/.test(phoneSymbol)) return 'U'
+  if (/[oʊɔ]/.test(phoneSymbol)) return 'O'
+  if (/[iɪy]/.test(phoneSymbol)) return 'I'
+  if (/[eɛ]/.test(phoneSymbol)) return 'E'
+  if (/[aæɑəʌ]/.test(phoneSymbol)) return 'aa'
   return null
 }
 
-export function mapInworldVisemeToGoonLipSyncWeights(
+export function mapInworldVisemeToOvr15Weights(
   visemeSymbol: unknown,
   phoneSymbol?: unknown
-): GoonLipSyncWeights | null {
+): Ovr15Weights | null {
   const normalizedPhone = normalizePhoneSymbol(phoneSymbol)
-  if (normalizedPhone === '[silence]') {
-    return cloneWeights(REST_WEIGHTS)
-  }
-
-  const normalized = normalizeInworldVisemeSymbol(visemeSymbol)
-  if (normalized && INWORLD_VISEME_WEIGHTS[normalized]) {
-    return cloneWeights(INWORLD_VISEME_WEIGHTS[normalized])
-  }
-
-  const derived = deriveWeightsFromPhoneSymbol(normalizedPhone)
-  return derived ? cloneWeights(derived) : null
+  const normalizedViseme = normalizeInworldVisemeSymbol(visemeSymbol)
+  const ovrViseme = resolveOvrVisemeFromInworldPhone(normalizedViseme, normalizedPhone)
+  return ovrViseme ? createWeights({ [ovrViseme]: 1 }) : null
 }
 
-function resolvePrimaryCue(weights: GoonLipSyncWeights): GoonLipSyncViseme {
-  let bestCue: GoonLipSyncViseme = 'rest'
+function resolvePrimaryCue(weights: Ovr15Weights): Ovr15Viseme {
+  let bestCue: Ovr15Viseme = 'sil'
   let bestWeight = -1
-  for (const cue of CUSTOM_RHUBARB_MOUTH_ORDER) {
-    const weight = weights[cue] ?? 0
+  for (const cue of OVR_15_VISEME_ORDER) {
+    const weight = weights[cue]
     if (weight > bestWeight) {
       bestCue = cue
       bestWeight = weight
@@ -172,26 +186,29 @@ function normalizePhoneDurationSec(
 function pushKeyframe(
   keyframes: GoonLipSyncTimelineKeyframe[],
   timeMs: number,
-  weights: GoonLipSyncWeights
+  weights: Ovr15Weights
 ) {
   const clampedTimeMs = Math.max(0, Math.round(timeMs))
   const last = keyframes[keyframes.length - 1]
   if (last && Math.abs(last.timeMs - clampedTimeMs) < 0.0001) {
-    if (sameWeights(last.weights, weights)) {
-      last.weights = cloneWeights(weights)
+    if (last.frame.profile !== OVR_15_SPEECH_FACE_PROFILE) {
+      throw new Error('Inworld OVR-15 timeline cannot contain a non-OVR speech-face frame.')
+    }
+    if (sameWeights(last.frame.weights, weights)) {
+      last.frame = { profile: OVR_15_SPEECH_FACE_PROFILE, weights: cloneWeights(weights) }
       return
     }
 
     keyframes.push({
       timeMs: clampedTimeMs,
-      weights: cloneWeights(weights)
+      frame: { profile: OVR_15_SPEECH_FACE_PROFILE, weights: cloneWeights(weights) }
     })
     return
   }
 
   keyframes.push({
     timeMs: clampedTimeMs,
-    weights: cloneWeights(weights)
+    frame: { profile: OVR_15_SPEECH_FACE_PROFILE, weights: cloneWeights(weights) }
   })
 }
 
@@ -202,7 +219,7 @@ export function buildInworldVisemeLipSyncTimeline(options: {
 }): GoonLipSyncTimeline | null {
   const visemeSymbolCounts: Record<string, number> = {}
   const phoneSymbolCounts: Record<string, number> = {}
-  const primaryCueCounts: Partial<Record<GoonLipSyncViseme, number>> = {}
+  const primaryCueCounts: Record<string, number> = {}
   const unmappedSymbolCounts = new Map<string, { phoneSymbol?: string; visemeSymbol?: string; count: number }>()
   let phoneCount = 0
   let mappedPhoneCount = 0
@@ -223,7 +240,7 @@ export function buildInworldVisemeLipSyncTimeline(options: {
         const startSec = normalizePhoneStartSec(phone, segment)
         if (startSec === null) return null
         const durationSec = normalizePhoneDurationSec(phone, segment, startSec)
-        const weights = mapInworldVisemeToGoonLipSyncWeights(phone.visemeSymbol, phone.phoneSymbol)
+        const weights = mapInworldVisemeToOvr15Weights(phone.visemeSymbol, phone.phoneSymbol)
         if (!weights) {
           const unmappedKey = `${normalizedPhone ?? ''}|${normalizedViseme ?? ''}`
           const existing = unmappedSymbolCounts.get(unmappedKey)
@@ -248,14 +265,19 @@ export function buildInworldVisemeLipSyncTimeline(options: {
         }
       })
     )
-    .filter((phone): phone is { startMs: number; endMs: number; weights: GoonLipSyncWeights } =>
+    .filter((phone): phone is { startMs: number; endMs: number; weights: Ovr15Weights } =>
       Boolean(phone && phone.endMs >= phone.startMs)
     )
     .sort((left, right) => left.startMs - right.startMs)
 
   if (phones.length === 0) return null
 
-  const keyframes: GoonLipSyncTimelineKeyframe[] = [{ timeMs: 0, weights: cloneWeights(REST_WEIGHTS) }]
+  const keyframes: GoonLipSyncTimelineKeyframe[] = [
+    {
+      timeMs: 0,
+      frame: { profile: OVR_15_SPEECH_FACE_PROFILE, weights: cloneWeights(REST_WEIGHTS) }
+    }
+  ]
   let lastEndMs = 0
 
   for (const phone of phones) {
@@ -303,6 +325,7 @@ export function buildInworldVisemeLipSyncTimeline(options: {
   return {
     analyzerId: 'inworld-viseme-timing',
     source: 'provider-alignment',
+    profile: OVR_15_SPEECH_FACE_PROFILE,
     keyframes,
     durationMs,
     unitCount: phones.length,

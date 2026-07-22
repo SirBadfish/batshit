@@ -1,4 +1,6 @@
 import type { GoonRecord } from '$lib/types/goons'
+import { parseAppearanceDialsManifest } from '$lib/goons/appearanceDials.schema'
+import type { GoonCustomAvatarManifest } from '$lib/goons/customAvatar'
 import { redis } from '$lib/server/redis'
 import {
   collectGoonRecipeUploadReferencesForClient,
@@ -14,35 +16,55 @@ import {
   GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   RECIPE_MIGRATION_PLAN_CONTRACT,
+  RECIPE_MIGRATION_REPORT_CONTRACT,
+  RECIPE_REVIEWED_STATE_CONTRACT,
+  RECIPE_STRICT_TOLERANCES,
+  RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT,
+  appearanceRecipeControlInventory,
+  applyRecipeRevisionProjection,
   canonicalRecipeSha256,
   canonicalRecipeString,
+  computeAnatomyFitRecipeState,
+  bakeLiveGoon,
   createGoonRecipeDocument,
   createRecipeRevisionEnvelope,
   parseRecipeMigrationPlan,
+  parseRecipeUpdateAnalysisContext,
   recipeAuthoringRevisionSha256,
   recipeDocumentRedisKey,
   recipeJobRedisKey,
   recipeRevisionBundleSha256,
   recipeRevisionRedisKey,
+  recipeMigrationReportSha256,
   sha256Hex,
   verifyGoonLiveBuildReceipt,
+  verifyLiveGoonBakeArtifacts,
   verifyGoonRecipeV2,
   verifyRecipeArchiveContainmentReceipt,
   verifyRecipeMigrationReport,
+  verifyRecipeReviewedState,
+  verifyRecipeUpdateAnalysisContext,
+  deserializeRecipeSiblingInputs,
+  serializeRecipeSiblingInputs,
   verifyRecipePackageMetadata,
   verifyRecipeStateSnapshot,
+  withoutAnatomyFitRecipeSibling,
   type AppearanceRecipeMigrationPlannerInput,
   type AppearanceRecipeMigrationSiblingInput,
   type GoonLiveBuildReceipt,
   type GoonRecipeDocument,
   type GoonRecipeJob,
   type GoonRecipeV2,
+  type RecipeAnalysisHydration,
   type RecipeArchiveContainmentReceipt,
   type RecipeAssetSet,
   type RecipeComponentMapBundle,
   type RecipeDocumentRef,
   type RecipeFailureStage,
   type RecipeMigrationPlan,
+  type RecipeMigrationReport,
+  type RecipeMigrationReportExpectation,
+  type RecipeReviewedState,
   type RecipeRevisionBundle,
   type RecipeRevisionEnvelope,
   type RecipeSiblingSurface,
@@ -51,7 +73,10 @@ import {
   type RecipeStoredAssetRef,
   type RecipeUpdateEdge
 } from '$lib/goons/recipe'
-import { planAppearanceRecipeMigration } from '$lib/goons/recipe/appearanceRecipeMigrationPlanner'
+import {
+  planAppearanceRecipeCleanReset,
+  planAppearanceRecipeMigration
+} from '$lib/goons/recipe/appearanceRecipeMigrationPlanner'
 import {
   compareAndSwapRecipeJobState,
   compareAndSwapRecipeState,
@@ -59,9 +84,12 @@ import {
   getGoonRecipeDocument,
   getGoonRecipeJob,
   getOwnedRecipeGoon,
+  getOwnedGoonForRecipeBootstrap,
   getRecipeRevisionEnvelope,
+  createRecipeBootstrapManagedSnapshot,
   putGoonRecipeDocument,
-  putRecipeRevisionEnvelope
+  putRecipeRevisionEnvelope,
+  initializeRecipeState
 } from './goonRecipeRepository.server'
 import {
   getInternalBatshitServerAuthHeaders,
@@ -88,6 +116,7 @@ export type RecipeLifecycleDependencies = {
   now?: () => Date
   readAsset?: RecipeAssetReader
   deleteAsset?: Parameters<typeof deleteUnreferencedGoonUploadReferences>[2]
+  planMigration?: typeof planAppearanceRecipeMigration
   leaseOwnerId?: string
   leaseMs?: number
 }
@@ -101,11 +130,14 @@ export type AnalyzeRecipePackageUpdateInput = {
 }
 
 export type RecipePackageUpdateAnalysis = {
-  expectedWriteVersion: number
-  sourceRevision: RecipeDocumentRef
-  containmentReceipt: RecipeDocumentRef
+  goon: GoonRecord
+  owner: GoonRecipeV2
+  pendingAnalysis: NonNullable<GoonRecipeV2['pendingAnalysis']>
   plan: RecipeMigrationPlan
-  planRef: RecipeDocumentRef
+  basePlan: RecipeMigrationPlan
+  report: RecipeMigrationReport
+  receipt: RecipeArchiveContainmentReceipt
+  reviewedState: RecipeReviewedState | null
 }
 
 export type StartRecipePackageUpdateInput = {
@@ -113,8 +145,15 @@ export type StartRecipePackageUpdateInput = {
   goonId: string
   expectedWriteVersion: number
   idempotencyKey: string
-  planRef: RecipeDocumentRef
-  containmentReceipt: RecipeDocumentRef
+  analysisId: string
+}
+
+export type StartRecipeBakeInput = {
+  userId: string
+  goonId: string
+  expectedWriteVersion: number
+  idempotencyKey: string
+  state: RecipeStateSnapshot
 }
 
 export type StageRecipeCandidateInput = {
@@ -123,8 +162,6 @@ export type StageRecipeCandidateInput = {
   jobId: string
   expectedWriteVersion: number
   expectedJobStateVersion: number
-  state: RecipeStateSnapshot
-  migrationReport: unknown
   liveBuildReceipt: GoonLiveBuildReceipt
   live: RecipeAssetSet
 }
@@ -237,6 +274,68 @@ async function readVerifiedAsset(asset: RecipeStoredAssetRef, readAsset: RecipeA
   return bytes
 }
 
+async function verifyStoredLiveArtifacts(
+  live: RecipeAssetSet,
+  receipt: GoonLiveBuildReceipt,
+  readAsset: RecipeAssetReader
+) {
+  const [packageBytes, modelBytes, manifestBytes] = await Promise.all([
+    readVerifiedAsset(live.package, readAsset),
+    readVerifiedAsset(live.model, readAsset),
+    readVerifiedAsset(live.manifest, readAsset)
+  ])
+  try {
+    return await verifyLiveGoonBakeArtifacts({
+      packageBytes,
+      modelBytes,
+      manifestBytes,
+      receipt
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown Live artifact verification failure'
+    throw new GoonRecipeLifecycleError(
+      'CANDIDATE_MISMATCH',
+      `The stored Live Goon failed structural verification: ${message}`,
+      409
+    )
+  }
+}
+
+async function verifyDeterministicLiveBake(input: {
+  archive: LoadedArchive
+  revisionId: string
+  revision: number
+  state: RecipeStateSnapshot
+  receipt: GoonLiveBuildReceipt
+}) {
+  let expected: Awaited<ReturnType<typeof bakeLiveGoon>>
+  try {
+    expected = await bakeLiveGoon({
+      source: input.archive.source,
+      sourceRevision: { revisionId: input.revisionId, revision: input.revision },
+      state: input.state,
+      packageBytes: input.archive.packageBytes,
+      modelBytes: input.archive.modelBytes,
+      manifestBytes: input.archive.manifestBytes
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown deterministic bake failure'
+    throw new GoonRecipeLifecycleError(
+      'CANDIDATE_MISMATCH',
+      `The server could not reproduce the staged Live Goon: ${message}`,
+      409
+    )
+  }
+  if (canonicalRecipeString(expected.receipt) !== canonicalRecipeString(input.receipt)) {
+    throw new GoonRecipeLifecycleError(
+      'CANDIDATE_MISMATCH',
+      'The uploaded Live-build receipt differs from the server-reproduced deterministic bake.',
+      409
+    )
+  }
+  return expected
+}
+
 async function loadArchive(
   receiptValue: unknown,
   readAsset: RecipeAssetReader
@@ -274,6 +373,113 @@ async function loadArchive(
     manifest,
     metadata
   }
+}
+
+export async function bootstrapRecipeV2(input: {
+  userId: string
+  goonId: string
+  expectedUpdatedAt: string
+  receipt: RecipeArchiveContainmentReceipt
+  state: RecipeStateSnapshot
+}, dependencies: RecipeLifecycleDependencies = {}) {
+  const readAsset = dependencies.readAsset ?? defaultReadAsset
+  const goon = await getOwnedGoonForRecipeBootstrap(input.userId, input.goonId)
+  if (goon.kind !== 'custom' || goon.sourceProfile !== 'expert-custom-glb') {
+    throw new GoonRecipeLifecycleError(
+      'RECIPE_NOT_CAPABLE',
+      'Only an expert Custom GLB Goon can initialize a Recipe owner.',
+      409
+    )
+  }
+  if (goon.updated_at !== input.expectedUpdatedAt) {
+    throw new GoonRecipeLifecycleError(
+      'WRITE_CONFLICT',
+      'The Goon changed before Recipe initialization. Reload it and try again.',
+      409
+    )
+  }
+  const expectedManagedState = createRecipeBootstrapManagedSnapshot(goon)
+  const archive = await loadArchive(input.receipt, readAsset)
+  const submittedState = await verifyRecipeStateSnapshot(input.state)
+  const stateWithoutAnatomyFit = await withoutAnatomyFitRecipeSibling(submittedState)
+  let state: RecipeStateSnapshot
+  try {
+    // Initial Recipe creation owns the same integrity boundary as package
+    // updates: Anatomy Fit is derived from the exact stored source bytes on
+    // the server, never trusted from a client summary or submitted sibling.
+    state = await computeAnatomyFitRecipeState({
+      state: stateWithoutAnatomyFit,
+      previousState: null,
+      manifest: archive.manifest as GoonCustomAvatarManifest,
+      modelBytes: archive.modelBytes,
+      source: archive.source.identities
+    })
+  } catch (error) {
+    throw new GoonRecipeLifecycleError(
+      'ANATOMY_FIT_FAILED',
+      `The Goon file could not produce its required Anatomy Fit: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      409
+    )
+  }
+  const containmentDocument = await createGoonRecipeDocument({
+    userId: input.userId,
+    goonId: input.goonId,
+    content: archive.receipt
+  })
+  const containmentReceipt = documentRef(containmentDocument)
+  const revisionHash = await canonicalRecipeSha256({
+    userId: input.userId,
+    goonId: input.goonId,
+    source: archive.source,
+    state
+  })
+  const authoringRevision = await createAuthoringRevision({
+    contract: GOON_RECIPE_REVISION_CONTRACT,
+    recipeRevision: 1,
+    revisionId: `recipe_revision_1_${revisionHash.slice(0, 24)}`,
+    revisionSha256: ZERO_SHA256,
+    source: archive.source,
+    state,
+    liveBuildReceipt: {
+      contract: GOON_LIVE_BUILD_CONTRACT,
+      ref: 'bootstrap-pending',
+      sha256: ZERO_SHA256
+    },
+    updateReport: null
+  })
+  const owner: GoonRecipeV2 = {
+    contract: 'goon-recipe/v2',
+    writeVersion: 1,
+    nextRecipeRevision: 2,
+    liveStatus: 'needs_bake',
+    authoringRevision,
+    authoringSourceContainmentReceipt: containmentReceipt,
+    activeRevision: null,
+    previousRevision: null,
+    pendingAnalysis: null,
+    pendingJob: null,
+    latestUpdateReport: null,
+    lastFailure: null,
+    maintenanceFailure: null
+  }
+  await verifyGoonRecipeV2(owner)
+  const now = (dependencies.now ?? (() => new Date()))().toISOString()
+  const nextGoon = cloneGoon(goon)
+  nextGoon.updated_at = now
+  nextGoon.recipe = owner
+  const stored = await initializeRecipeState({
+    userId: input.userId,
+    goonId: input.goonId,
+    expectedManagedState,
+    nextGoon,
+    records: [{
+      key: recipeDocumentRedisKey(input.userId, input.goonId, containmentDocument.sha256),
+      value: containmentDocument
+    }]
+  })
+  return { goon: stored, containmentReceipt }
 }
 
 function revisionIdFromRef(userId: string, goonId: string, ref: RecipeDocumentRef) {
@@ -321,7 +527,12 @@ async function loadArchiveFromDocument(
 }
 
 function assertOwnerReadyForAnalysis(owner: GoonRecipeV2) {
-  if (owner.liveStatus !== 'up_to_date' || !owner.activeRevision || owner.pendingJob) {
+  if (
+    owner.liveStatus !== 'up_to_date' ||
+    !owner.activeRevision ||
+    owner.pendingJob ||
+    owner.pendingAnalysis
+  ) {
     throw new GoonRecipeLifecycleError(
       'RECIPE_BUSY',
       'Finish, retry, or discard the current Recipe work before analyzing another package update.',
@@ -357,6 +568,144 @@ function lease(dependencies: RecipeLifecycleDependencies, now: Date) {
   return { ownerId, expiresAt: new Date(now.getTime() + leaseMs).toISOString() }
 }
 
+const MIGRATION_CLASSIFICATION = {
+  keep: 'kept',
+  'presentation-only': 'presentation-updated',
+  affine: 'remapped',
+  piecewise: 'remapped',
+  new: 'new',
+  removed: 'removed',
+  'reset-required': 'reset-required',
+  blocked: 'blocked'
+} as const
+
+function migrationReportExpectation(
+  plan: RecipeMigrationPlan,
+  edge: RecipeUpdateEdge
+): RecipeMigrationReportExpectation {
+  const rows = new Map(plan.controlRows.map((row) => [row.ledgerId, row]))
+  const classifications = Object.fromEntries(edge.controls.map((control) => {
+    const row = rows.get(control.id)
+    if (!row) {
+      throw new GoonRecipeLifecycleError(
+        'CORRUPT_PLAN',
+        `Migration plan omitted update-edge control ${control.id}.`,
+        500
+      )
+    }
+    if (plan.outcome.kind === 'clean-reset') {
+      return [
+        control.id,
+        row.sourceControl === null
+          ? 'new'
+          : row.targetControl === null
+            ? 'removed'
+            : 'reset-required'
+      ] as const
+    }
+    if (plan.outcome.kind === 'unsupported') {
+      return [control.id, row.sourceControl === null ? 'new' : 'blocked'] as const
+    }
+    if (row.resolution === 'blocked' || row.proofStatus === 'failed') {
+      return [control.id, row.sourceControl === null ? 'new' : 'blocked'] as const
+    }
+    return [control.id, MIGRATION_CLASSIFICATION[control.action]] as const
+  }))
+  return {
+    classifications,
+    status:
+      plan.outcome.readiness === 'blocked'
+        ? 'blocked'
+        : plan.outcome.readiness === 'preview-required'
+          ? 'preview-required'
+          : 'preserved'
+  }
+}
+
+async function createServerMigrationReport(
+  plan: RecipeMigrationPlan,
+  edge: RecipeUpdateEdge
+): Promise<RecipeMigrationReport> {
+  const rows = new Map(plan.controlRows.map((row) => [row.ledgerId, row]))
+  const expectation = migrationReportExpectation(plan, edge)
+  const entries = edge.controls.map((control) => {
+    const row = rows.get(control.id)
+    if (!row) {
+      throw new GoonRecipeLifecycleError(
+        'CORRUPT_PLAN',
+        `Migration plan omitted update-edge control ${control.id}.`,
+        500
+      )
+    }
+    const classification = expectation.classifications[control.id]
+    if (!classification) {
+      throw new GoonRecipeLifecycleError(
+        'CORRUPT_PLAN',
+        `Migration report omitted update-edge control ${control.id}.`,
+        500
+      )
+    }
+    const oldValue = row.sourceControl?.value ?? null
+    const proposedValue =
+      classification === 'new' || classification === 'reset-required'
+        ? 0
+        : classification === 'removed' || classification === 'blocked'
+          ? null
+          : row.targetControl?.value ?? null
+    const cleanReset = plan.outcome.kind === 'clean-reset'
+    const removedNeedsReview = classification === 'removed' && (cleanReset || oldValue !== 0)
+    return {
+      id: control.id,
+      classification,
+      componentId: control.componentId,
+      oldValue,
+      proposedValue,
+      reason: row.message,
+      proofStatus:
+        classification === 'new' || classification === 'removed'
+          ? 'not-required' as const
+          : classification === 'reset-required'
+            ? 'not-preserved' as const
+            : classification === 'blocked'
+              ? 'failed' as const
+              : 'verified' as const,
+      maximumError: row.maximumScalarError,
+      tolerance: RECIPE_STRICT_TOLERANCES.scalar,
+      proofSha256: row.componentProofSha256,
+      requiresPreview:
+        classification === 'blocked' ||
+        classification === 'reset-required' ||
+        removedNeedsReview ||
+        (classification === 'new' && cleanReset),
+      requiresConfirmation:
+        classification === 'reset-required' ||
+        removedNeedsReview ||
+        (classification === 'new' && cleanReset)
+    }
+  }).sort((left, right) => left.id.localeCompare(right.id))
+  const report: RecipeMigrationReport = {
+    contract: RECIPE_MIGRATION_REPORT_CONTRACT,
+    reportId: `report_${plan.planId}`,
+    directEdgeKey: plan.directEdgeKey,
+    edgeSha256: plan.edgeSha256,
+    fromRecipeRevision: plan.fromRecipeRevision,
+    toRecipeRevision: plan.toRecipeRevision,
+    status: expectation.status,
+    entries,
+    warnings: edge.warnings,
+    proof: {
+      toleranceProfile: 'recipe-strict/v1',
+      wholeRecipeMaximumError: plan.wholeRecipeProof.errors.positionMaximumMeters,
+      wholeRecipeRmsError: plan.wholeRecipeProof.errors.positionRmsMeters,
+      wholeRecipeTolerance: RECIPE_STRICT_TOLERANCES.positionMeters,
+      wholeRecipeProofSha256: plan.wholeRecipeProof.proofSha256,
+      reportSha256: ZERO_SHA256
+    }
+  }
+  report.proof.reportSha256 = await recipeMigrationReportSha256(report, edge, expectation)
+  return verifyRecipeMigrationReport(report, edge, expectation)
+}
+
 export async function analyzeRecipePackageUpdate(
   input: AnalyzeRecipePackageUpdateInput,
   dependencies: RecipeLifecycleDependencies = {}
@@ -389,13 +738,12 @@ export async function analyzeRecipePackageUpdate(
     goonId: input.goonId,
     content: target.receipt
   })
-  const storedReceipt = await putGoonRecipeDocument(receiptDocument)
-  const targetReceiptRef = documentRef(storedReceipt.document)
+  const targetReceiptRef = documentRef(receiptDocument)
 
   const source = await loadArchiveFromDocument(
     input.userId,
     input.goonId,
-    activeEnvelope.sourceContainmentReceipt,
+    owner.authoringSourceContainmentReceipt,
     readAsset
   )
   if (canonicalRecipeString(source.source) !== canonicalRecipeString(activeEnvelope.revision.source)) {
@@ -414,12 +762,15 @@ export async function analyzeRecipePackageUpdate(
       targetReceipt: target.receipt.receiptSha256
     })
   ).slice(0, 48)}`
+  const sourceMigrationState = await withoutAnatomyFitRecipeSibling(
+    owner.authoringRevision.state
+  )
   const plannerInput: AppearanceRecipeMigrationPlannerInput = {
     planId,
     fromRecipeRevision: owner.authoringRevision.recipeRevision,
     toRecipeRevision: owner.nextRecipeRevision,
     edge,
-    sourceState: owner.authoringRevision.state,
+    sourceState: sourceMigrationState,
     sourcePackage: {
       recipeSource: source.source,
       packageBytes: source.packageBytes,
@@ -435,19 +786,82 @@ export async function analyzeRecipePackageUpdate(
     siblingInputs: input.siblingInputs,
     ...(input.componentMapBundle ? { componentMapBundle: input.componentMapBundle } : {})
   }
-  const plan = await planAppearanceRecipeMigration(plannerInput)
+  const plan = await (dependencies.planMigration ?? planAppearanceRecipeMigration)(plannerInput)
+  const report = await createServerMigrationReport(plan, edge)
   const planDocument = await createGoonRecipeDocument({
     userId: input.userId,
     goonId: input.goonId,
     content: plan
   })
-  const storedPlan = await putGoonRecipeDocument(planDocument)
-  return {
-    expectedWriteVersion: owner.writeVersion,
-    sourceRevision: owner.activeRevision!,
+  const planRef = documentRef(planDocument)
+  const reportDocument = await createGoonRecipeDocument({
+    userId: input.userId,
+    goonId: input.goonId,
+    content: report
+  })
+  const reportRef = documentRef(reportDocument)
+  const analysisHash = await canonicalRecipeSha256({
+    userId: input.userId,
+    goonId: input.goonId,
+    writeVersion: owner.writeVersion,
+    sourceRevision: owner.activeRevision,
+    receipt: targetReceiptRef,
+    plan: planRef
+  })
+  const analysisId = `recipe_analysis_${analysisHash.slice(0, 40)}`
+  const analysisDocument = await createGoonRecipeDocument({
+    userId: input.userId,
+    goonId: input.goonId,
+    content: {
+      contract: RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT,
+      analysisId,
+      sourceRevision: owner.activeRevision!,
+      containmentReceipt: targetReceiptRef,
+      basePlan: planRef,
+      siblingInputs: serializeRecipeSiblingInputs(input.siblingInputs),
+      componentMapBundle: input.componentMapBundle ?? null
+    }
+  })
+  await verifyRecipeUpdateAnalysisContext(analysisDocument.content)
+  const nextWriteVersion = owner.writeVersion + 1
+  const pendingAnalysis: NonNullable<GoonRecipeV2['pendingAnalysis']> = {
+    analysisId,
+    analysisRef: documentRef(analysisDocument),
+    basePlan: planRef,
+    selectedPlan: planRef,
+    migrationReport: reportRef,
     containmentReceipt: targetReceiptRef,
+    reviewedState: null,
+    targetWriteVersion: nextWriteVersion
+  }
+  const now = (dependencies.now ?? (() => new Date()))().toISOString()
+  const nextGoon = cloneGoon(goon)
+  nextGoon.updated_at = now
+  nextGoon.recipe = {
+    ...owner,
+    writeVersion: nextWriteVersion,
+    pendingAnalysis
+  }
+  const stored = await compareAndSwapRecipeState({
+    userId: input.userId,
+    goonId: input.goonId,
+    expectedWriteVersion: owner.writeVersion,
+    nextGoon,
+    records: [receiptDocument, planDocument, reportDocument, analysisDocument].map((document) => ({
+      key: recipeDocumentRedisKey(input.userId, input.goonId, document.sha256),
+      value: document
+    }))
+  })
+  const storedOwner = await verifyGoonRecipeV2(stored.recipe)
+  return {
+    goon: stored,
+    owner: storedOwner,
+    pendingAnalysis,
     plan,
-    planRef: documentRef(storedPlan.document)
+    basePlan: plan,
+    report,
+    receipt: target.receipt,
+    reviewedState: null
   }
 }
 
@@ -464,6 +878,424 @@ async function loadPlan(userId: string, goonId: string, ref: RecipeDocumentRef) 
   return plan
 }
 
+async function loadReviewedState(userId: string, goonId: string, ref: RecipeDocumentRef) {
+  if (ref.contract !== RECIPE_REVIEWED_STATE_CONTRACT) {
+    throw new GoonRecipeLifecycleError('CORRUPT_REVIEW', 'Reviewed Recipe State ref has the wrong contract.', 500)
+  }
+  const document = await loadDocumentByRef(userId, goonId, ref)
+  return verifyRecipeReviewedState(document.content)
+}
+
+function requirePendingAnalysis(owner: GoonRecipeV2, analysisId?: string) {
+  const pending = owner.pendingAnalysis
+  if (!pending) {
+    throw new GoonRecipeLifecycleError(
+      'NO_PENDING_ANALYSIS',
+      'This Goon has no package update waiting for review.',
+      409
+    )
+  }
+  if (analysisId && pending.analysisId !== stableInputId(analysisId, 'analysis id')) {
+    throw new GoonRecipeLifecycleError(
+      'STALE_ANALYSIS',
+      'The package update review changed. Reload it before continuing.',
+      409
+    )
+  }
+  return pending
+}
+
+export async function getRecipePackageAnalysis(input: {
+  userId: string
+  goonId: string
+}): Promise<RecipeAnalysisHydration> {
+  const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
+  const owner = await verifyGoonRecipeV2(goon.recipe)
+  const pendingAnalysis = requirePendingAnalysis(owner)
+  const [plan, basePlan, reportDocument, receiptDocument, reviewedState] = await Promise.all([
+    loadPlan(input.userId, input.goonId, pendingAnalysis.selectedPlan),
+    loadPlan(input.userId, input.goonId, pendingAnalysis.basePlan),
+    loadDocumentByRef(input.userId, input.goonId, pendingAnalysis.migrationReport),
+    loadDocumentByRef(input.userId, input.goonId, pendingAnalysis.containmentReceipt),
+    pendingAnalysis.reviewedState
+      ? loadReviewedState(input.userId, input.goonId, pendingAnalysis.reviewedState)
+      : Promise.resolve(null)
+  ])
+  if (reportDocument.documentContract !== RECIPE_MIGRATION_REPORT_CONTRACT) {
+    throw new GoonRecipeLifecycleError('CORRUPT_REPORT', 'Stored migration report contract is invalid.', 500)
+  }
+  const report = reportDocument.content as unknown as RecipeMigrationReport
+  const receipt = await verifyRecipeArchiveContainmentReceipt(receiptDocument.content)
+  return { goon, owner, pendingAnalysis, plan, basePlan, report, receipt, reviewedState }
+}
+
+async function analysisPlannerInput(input: {
+  userId: string
+  goonId: string
+  owner: GoonRecipeV2
+  pending: NonNullable<GoonRecipeV2['pendingAnalysis']>
+  basePlan: RecipeMigrationPlan
+  readAsset: RecipeAssetReader
+}) {
+  const contextDocument = await loadDocumentByRef(
+    input.userId,
+    input.goonId,
+    input.pending.analysisRef
+  )
+  const context = parseRecipeUpdateAnalysisContext(contextDocument.content)
+  if (
+    context.analysisId !== input.pending.analysisId ||
+    canonicalRecipeString(context.containmentReceipt) !==
+      canonicalRecipeString(input.pending.containmentReceipt) ||
+    canonicalRecipeString(context.basePlan) !== canonicalRecipeString(input.pending.basePlan)
+  ) {
+    throw new GoonRecipeLifecycleError(
+      'CORRUPT_ANALYSIS',
+      'Stored package analysis context does not match its owner.',
+      500
+    )
+  }
+  const sourceEnvelope = await loadEnvelopeByRef(input.userId, input.goonId, context.sourceRevision)
+  const [source, target] = await Promise.all([
+    loadArchiveFromDocument(
+      input.userId,
+      input.goonId,
+      sourceEnvelope.sourceContainmentReceipt,
+      input.readAsset
+    ),
+    loadArchiveFromDocument(
+      input.userId,
+      input.goonId,
+      context.containmentReceipt,
+      input.readAsset
+    )
+  ])
+  const edge = directUpdateEdge(source.source, target)
+  return {
+    context,
+    source,
+    target,
+    edge,
+    plannerInput: {
+      planId: input.basePlan.planId,
+      fromRecipeRevision: sourceEnvelope.revision.recipeRevision,
+      toRecipeRevision: input.owner.nextRecipeRevision,
+      edge,
+      sourceState: await withoutAnatomyFitRecipeSibling(sourceEnvelope.revision.state),
+      sourcePackage: {
+        recipeSource: source.source,
+        packageBytes: source.packageBytes,
+        glbBytes: source.modelBytes,
+        manifestBytes: source.manifestBytes
+      },
+      targetPackage: {
+        recipeSource: target.source,
+        packageBytes: target.packageBytes,
+        glbBytes: target.modelBytes,
+        manifestBytes: target.manifestBytes
+      },
+      siblingInputs: deserializeRecipeSiblingInputs(context.siblingInputs),
+      ...(context.componentMapBundle ? { componentMapBundle: context.componentMapBundle } : {})
+    } satisfies AppearanceRecipeMigrationPlannerInput
+  }
+}
+
+export async function selectRecipeCleanReset(input: {
+  userId: string
+  goonId: string
+  expectedWriteVersion: number
+  analysisId: string
+  confirmed: boolean
+}, dependencies: RecipeLifecycleDependencies = {}) {
+  if (input.confirmed !== true) {
+    throw new GoonRecipeLifecycleError(
+      'RESET_CONFIRMATION_REQUIRED',
+      'Clean reset must be explicitly confirmed.',
+      409
+    )
+  }
+  const readAsset = dependencies.readAsset ?? defaultReadAsset
+  const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
+  const owner = await verifyGoonRecipeV2(goon.recipe)
+  const pending = requirePendingAnalysis(owner, input.analysisId)
+  if (owner.writeVersion !== input.expectedWriteVersion) {
+    throw new GoonRecipeLifecycleError('WRITE_CONFLICT', 'The package analysis changed.', 409)
+  }
+  const basePlan = await loadPlan(input.userId, input.goonId, pending.basePlan)
+  if (
+    basePlan.outcome.kind !== 'unsupported' ||
+    basePlan.outcome.cleanResetEligibility !== 'eligible'
+  ) {
+    throw new GoonRecipeLifecycleError(
+      'CLEAN_RESET_NOT_ELIGIBLE',
+      'This package analysis is not eligible for a clean reset.',
+      409
+    )
+  }
+  const analysis = await analysisPlannerInput({
+    userId: input.userId,
+    goonId: input.goonId,
+    owner,
+    pending,
+    basePlan,
+    readAsset
+  })
+  const plan = await planAppearanceRecipeCleanReset({
+    planId: `clean_reset_${pending.analysisId}`,
+    migrationInput: analysis.plannerInput,
+    eligibleUnsupportedPlan: basePlan
+  })
+  const report = await createServerMigrationReport(plan, analysis.edge)
+  const planDocument = await createGoonRecipeDocument({
+    userId: input.userId,
+    goonId: input.goonId,
+    content: plan
+  })
+  const selectedPlan = documentRef(planDocument)
+  const reportDocument = await createGoonRecipeDocument({
+    userId: input.userId,
+    goonId: input.goonId,
+    content: report
+  })
+  const migrationReport = documentRef(reportDocument)
+  const now = (dependencies.now ?? (() => new Date()))().toISOString()
+  const nextGoon = cloneGoon(goon)
+  nextGoon.updated_at = now
+  nextGoon.recipe = {
+    ...owner,
+    writeVersion: owner.writeVersion + 1,
+    pendingAnalysis: {
+      ...pending,
+      selectedPlan,
+      migrationReport,
+      reviewedState: null,
+      targetWriteVersion: owner.writeVersion + 1
+    }
+  }
+  await compareAndSwapRecipeState({
+    userId: input.userId,
+    goonId: input.goonId,
+    expectedWriteVersion: owner.writeVersion,
+    nextGoon,
+    records: [planDocument, reportDocument].map((document) => ({
+      key: recipeDocumentRedisKey(input.userId, input.goonId, document.sha256),
+      value: document
+    }))
+  })
+  return getRecipePackageAnalysis({ userId: input.userId, goonId: input.goonId })
+}
+
+function assertReviewedStateAdjustment(input: {
+  plan: RecipeMigrationPlan
+  state: RecipeStateSnapshot
+  target: LoadedArchive
+  confirmedControlIds: string[]
+  cleanResetConfirmed: boolean
+}) {
+  if (!input.plan.proposedState || input.plan.outcome.readiness === 'blocked') {
+    throw new GoonRecipeLifecycleError(
+      'UPDATE_NOT_READY',
+      'This package analysis cannot produce a reviewed Recipe State.',
+      409
+    )
+  }
+  const baseline = input.plan.proposedState
+  if (
+    canonicalRecipeString(input.state.siblings) !== canonicalRecipeString(baseline.siblings) ||
+    input.state.appearanceDials.contract !== baseline.appearanceDials.contract ||
+    input.state.appearanceDials.definitionSha256 !== baseline.appearanceDials.definitionSha256 ||
+    input.state.appearanceDials.neutralId !== baseline.appearanceDials.neutralId ||
+    input.state.appearanceDials.neutralRecipeSha256 !== baseline.appearanceDials.neutralRecipeSha256 ||
+    canonicalRecipeString(input.state.appearanceDials.unlockedDialIds) !==
+      canonicalRecipeString(baseline.appearanceDials.unlockedDialIds)
+  ) {
+    throw new GoonRecipeLifecycleError(
+      'UNAUTHORIZED_REVIEW_CHANGE',
+      'Reviewed package state may only adjust authorized new or reset controls.',
+      409
+    )
+  }
+  const authorized = new Set(
+    input.plan.controlRows
+      .filter((row) =>
+        row.targetControl &&
+        (row.edgeAction === 'new' ||
+          row.edgeAction === 'reset-required' ||
+          row.resolution === 'new-neutral' ||
+          row.resolution === 'reset-to-neutral')
+      )
+      .map((row) => row.targetControl!.id)
+  )
+  const baselineIds = Object.keys(baseline.appearanceDials.values).sort()
+  const candidateIds = Object.keys(input.state.appearanceDials.values).sort()
+  if (canonicalRecipeString(baselineIds) !== canonicalRecipeString(candidateIds)) {
+    throw new GoonRecipeLifecycleError(
+      'UNAUTHORIZED_REVIEW_CHANGE',
+      'Reviewed package state cannot add or remove controls.',
+      409
+    )
+  }
+  const adjustedControlIds = candidateIds.filter(
+    (id) => input.state.appearanceDials.values[id] !== baseline.appearanceDials.values[id]
+  )
+  if (adjustedControlIds.some((id) => !authorized.has(id))) {
+    throw new GoonRecipeLifecycleError(
+      'UNAUTHORIZED_REVIEW_CHANGE',
+      'Only new or reset-authorized controls may be adjusted during package review.',
+      409
+    )
+  }
+  const appearanceManifest = parseAppearanceDialsManifest(input.target.manifest)
+  if (!appearanceManifest) {
+    throw new GoonRecipeLifecycleError('CORRUPT_MANIFEST', 'Target package has no Recipe appearance manifest.', 500)
+  }
+  const ranges = appearanceRecipeControlInventory(appearanceManifest).ranges
+  for (const [id, value] of Object.entries(input.state.appearanceDials.values)) {
+    const range = ranges[id]
+    if (!range || value < range[0] || value > range[1]) {
+      throw new GoonRecipeLifecycleError(
+        'REVIEW_VALUE_OUT_OF_RANGE',
+        `Reviewed control ${id} is outside the exact target package range.`,
+        409
+      )
+    }
+  }
+  const confirmed = [...new Set(input.confirmedControlIds)].sort((a, b) => a.localeCompare(b))
+  if (
+    confirmed.length !== input.confirmedControlIds.length ||
+    confirmed.some((id, index) => id !== input.confirmedControlIds[index])
+  ) {
+    throw new GoonRecipeLifecycleError('INVALID_INPUT', 'Confirmed control ids must be sorted and unique.')
+  }
+  const reviewableRows = new Set(
+    input.plan.controlRows
+      .filter((row) => row.requiresPreview || row.requiresConfirmation)
+      .map((row) => row.ledgerId)
+  )
+  if (confirmed.some((id) => !reviewableRows.has(id))) {
+    throw new GoonRecipeLifecycleError(
+      'INVALID_CONFIRMATION',
+      'The review confirmed a control that does not require review.',
+      409
+    )
+  }
+  const required = input.plan.controlRows
+    .filter((row) => row.requiresConfirmation)
+    .map((row) => row.ledgerId)
+  if (required.some((id) => !confirmed.includes(id))) {
+    throw new GoonRecipeLifecycleError(
+      'CONFIRMATION_REQUIRED',
+      'Every reset or destructive migration row must be explicitly confirmed.',
+      409
+    )
+  }
+  const isCleanReset = input.plan.outcome.kind === 'clean-reset'
+  if (input.cleanResetConfirmed !== isCleanReset) {
+    throw new GoonRecipeLifecycleError(
+      'RESET_CONFIRMATION_REQUIRED',
+      'Clean-reset confirmation must exactly match the selected plan.',
+      409
+    )
+  }
+  return { adjustedControlIds, confirmedControlIds: confirmed }
+}
+
+export async function reviewRecipePackageState(input: {
+  userId: string
+  goonId: string
+  expectedWriteVersion: number
+  analysisId: string
+  state: RecipeStateSnapshot
+  confirmedControlIds: string[]
+  cleanResetConfirmed: boolean
+}, dependencies: RecipeLifecycleDependencies = {}) {
+  const readAsset = dependencies.readAsset ?? defaultReadAsset
+  const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
+  const owner = await verifyGoonRecipeV2(goon.recipe)
+  const pending = requirePendingAnalysis(owner, input.analysisId)
+  if (owner.writeVersion !== input.expectedWriteVersion) {
+    throw new GoonRecipeLifecycleError('WRITE_CONFLICT', 'The package analysis changed.', 409)
+  }
+  const [plan, target, submittedState] = await Promise.all([
+    loadPlan(input.userId, input.goonId, pending.selectedPlan),
+    loadArchiveFromDocument(input.userId, input.goonId, pending.containmentReceipt, readAsset),
+    verifyRecipeStateSnapshot(input.state)
+  ])
+  const reviewState = await withoutAnatomyFitRecipeSibling(submittedState)
+  const review = assertReviewedStateAdjustment({
+    plan,
+    state: reviewState,
+    target,
+    confirmedControlIds: input.confirmedControlIds,
+    cleanResetConfirmed: input.cleanResetConfirmed
+  })
+  let state: RecipeStateSnapshot
+  try {
+    state = await computeAnatomyFitRecipeState({
+      state: reviewState,
+      previousState: owner.authoringRevision.state,
+      manifest: target.manifest as GoonCustomAvatarManifest,
+      modelBytes: target.modelBytes,
+      source: target.source.identities
+    })
+  } catch (error) {
+    throw new GoonRecipeLifecycleError(
+      'ANATOMY_FIT_FAILED',
+      `The updated Goon file could not produce its required Anatomy Fit: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      409
+    )
+  }
+  const reviewHash = await canonicalRecipeSha256({
+    analysisId: pending.analysisId,
+    planSha256: plan.planSha256,
+    state,
+    ...review,
+    cleanResetConfirmed: input.cleanResetConfirmed
+  })
+  const reviewedState: RecipeReviewedState = await verifyRecipeReviewedState({
+    contract: RECIPE_REVIEWED_STATE_CONTRACT,
+    reviewId: `recipe_review_${reviewHash.slice(0, 40)}`,
+    operation: 'package-update',
+    analysisId: pending.analysisId,
+    planSha256: plan.planSha256,
+    containmentReceiptSha256: target.receipt.receiptSha256,
+    state,
+    adjustedControlIds: review.adjustedControlIds,
+    confirmedControlIds: review.confirmedControlIds,
+    cleanResetConfirmed: input.cleanResetConfirmed
+  })
+  const reviewDocument = await createGoonRecipeDocument({
+    userId: input.userId,
+    goonId: input.goonId,
+    content: reviewedState
+  })
+  const now = (dependencies.now ?? (() => new Date()))().toISOString()
+  const nextGoon = cloneGoon(goon)
+  nextGoon.updated_at = now
+  nextGoon.recipe = {
+    ...owner,
+    writeVersion: owner.writeVersion + 1,
+    pendingAnalysis: {
+      ...pending,
+      reviewedState: documentRef(reviewDocument),
+      targetWriteVersion: owner.writeVersion + 1
+    }
+  }
+  await compareAndSwapRecipeState({
+    userId: input.userId,
+    goonId: input.goonId,
+    expectedWriteVersion: owner.writeVersion,
+    nextGoon,
+    records: [{
+      key: recipeDocumentRedisKey(input.userId, input.goonId, reviewDocument.sha256),
+      value: reviewDocument
+    }]
+  })
+  return getRecipePackageAnalysis({ userId: input.userId, goonId: input.goonId })
+}
+
 export async function startRecipePackageUpdate(
   input: StartRecipePackageUpdateInput,
   dependencies: RecipeLifecycleDependencies = {}
@@ -474,15 +1306,12 @@ export async function startRecipePackageUpdate(
   const idempotencyKey = stableInputId(input.idempotencyKey, 'idempotency key')
   if (owner.pendingJob) {
     const existing = await getGoonRecipeJob(input.userId, input.goonId, owner.pendingJob.jobId)
-    if (
-      existing.idempotencyKey === idempotencyKey &&
-      existing.plan?.ref === input.planRef.ref &&
-      existing.stagedSource.containmentReceipt.ref === input.containmentReceipt.ref
-    ) {
-      return { goon, job: existing, replayed: true }
+    if (existing.idempotencyKey === idempotencyKey && existing.operation === 'package-update') {
+      const reviewedState = await loadReviewedState(input.userId, input.goonId, existing.reviewedState)
+      return { goon, job: existing, reviewedState, replayed: true }
     }
   }
-  assertOwnerReadyForAnalysis(owner)
+  const pending = requirePendingAnalysis(owner, input.analysisId)
   if (owner.writeVersion !== input.expectedWriteVersion) {
     throw new GoonRecipeLifecycleError(
       'WRITE_CONFLICT',
@@ -490,13 +1319,30 @@ export async function startRecipePackageUpdate(
       409
     )
   }
-  const plan = await loadPlan(input.userId, input.goonId, input.planRef)
-  if (!plan.proposedState || plan.outcome.readiness !== 'ready') {
+  if (!pending.reviewedState) {
+    throw new GoonRecipeLifecycleError(
+      'REVIEW_REQUIRED',
+      'Review and confirm the proposed Recipe State before starting the rebuild.',
+      409
+    )
+  }
+  const [plan, reviewedState] = await Promise.all([
+    loadPlan(input.userId, input.goonId, pending.selectedPlan),
+    loadReviewedState(input.userId, input.goonId, pending.reviewedState)
+  ])
+  if (!plan.proposedState || plan.outcome.readiness === 'blocked') {
     throw new GoonRecipeLifecycleError(
       'UPDATE_NOT_READY',
       'This analysis is not eligible for Update & Rebuild. Review its blocked or reset-required result.',
       409
     )
+  }
+  if (
+    reviewedState.operation !== 'package-update' ||
+    reviewedState.analysisId !== pending.analysisId ||
+    reviewedState.planSha256 !== plan.planSha256
+  ) {
+    throw new GoonRecipeLifecycleError('CORRUPT_REVIEW', 'Reviewed state does not bind this analysis.', 500)
   }
   if (
     plan.fromRecipeRevision !== owner.authoringRevision.recipeRevision ||
@@ -509,11 +1355,14 @@ export async function startRecipePackageUpdate(
   const target = await loadArchiveFromDocument(
     input.userId,
     input.goonId,
-    input.containmentReceipt,
+    pending.containmentReceipt,
     readAsset
   )
   if (canonicalRecipeString(target.source) !== canonicalRecipeString(plan.toSource)) {
     throw new GoonRecipeLifecycleError('CORRUPT_PLAN', 'The Recipe plan target differs from its extraction receipt.', 500)
+  }
+  if (reviewedState.containmentReceiptSha256 !== target.receipt.receiptSha256) {
+    throw new GoonRecipeLifecycleError('CORRUPT_REVIEW', 'Reviewed state targets another package receipt.', 500)
   }
 
   const now = (dependencies.now ?? (() => new Date()))()
@@ -544,9 +1393,12 @@ export async function startRecipePackageUpdate(
     sourceRevision: owner.activeRevision,
     stagedSource: {
       source: target.source,
-      containmentReceipt: input.containmentReceipt
+      containmentReceipt: pending.containmentReceipt
     },
-    plan: input.planRef,
+    plan: pending.selectedPlan,
+    migrationReport: pending.migrationReport,
+    reviewedState: pending.reviewedState,
+    stagedLive: null,
     candidateRevision: null,
     lease: lease(dependencies, now),
     failure: null,
@@ -565,6 +1417,7 @@ export async function startRecipePackageUpdate(
     writeVersion: nextWriteVersion,
     nextRecipeRevision: owner.nextRecipeRevision + 1,
     liveStatus: 'building',
+    pendingAnalysis: null,
     pendingJob: pendingJob(job),
     lastFailure: null
   }
@@ -576,32 +1429,200 @@ export async function startRecipePackageUpdate(
     nextGoon,
     nextJob: job
   })
-  return { goon: stored, job }
+  return { goon: stored, job, reviewedState, replayed: false }
+}
+
+export async function startRecipeBake(
+  input: StartRecipeBakeInput,
+  dependencies: RecipeLifecycleDependencies = {}
+) {
+  const readAsset = dependencies.readAsset ?? defaultReadAsset
+  const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
+  const owner = await verifyGoonRecipeV2(goon.recipe)
+  const idempotencyKey = stableInputId(input.idempotencyKey, 'idempotency key')
+  if (owner.pendingJob) {
+    const existing = await getGoonRecipeJob(input.userId, input.goonId, owner.pendingJob.jobId)
+    if (
+      existing.idempotencyKey === idempotencyKey &&
+      (existing.operation === 'first-bake' || existing.operation === 'rebake')
+    ) {
+      const reviewedState = await loadReviewedState(input.userId, input.goonId, existing.reviewedState)
+      return { goon, job: existing, reviewedState, replayed: true }
+    }
+    throw new GoonRecipeLifecycleError('RECIPE_BUSY', 'Finish or discard the current Recipe build.', 409)
+  }
+  if (owner.pendingAnalysis) {
+    throw new GoonRecipeLifecycleError('RECIPE_BUSY', 'Keep or finish the current package analysis first.', 409)
+  }
+  if (owner.writeVersion !== input.expectedWriteVersion) {
+    throw new GoonRecipeLifecycleError('WRITE_CONFLICT', 'The Recipe changed before rebuild started.', 409)
+  }
+  if (!['up_to_date', 'needs_bake'].includes(owner.liveStatus)) {
+    throw new GoonRecipeLifecycleError('RECIPE_BUSY', 'Recover current Recipe work before rebuilding.', 409)
+  }
+  const state = await verifyRecipeStateSnapshot(input.state)
+  const source = await loadArchiveFromDocument(
+    input.userId,
+    input.goonId,
+    owner.authoringSourceContainmentReceipt,
+    readAsset
+  )
+  if (canonicalRecipeString(source.source) !== canonicalRecipeString(owner.authoringRevision.source)) {
+    throw new GoonRecipeLifecycleError('CORRUPT_REVISION', 'Authoring Source differs from its containment receipt.', 500)
+  }
+  const operation = owner.activeRevision ? 'rebake' as const : 'first-bake' as const
+  if (
+    operation === 'first-bake' &&
+    canonicalRecipeString(state) !== canonicalRecipeString(owner.authoringRevision.state)
+  ) {
+    throw new GoonRecipeLifecycleError(
+      'WRITE_CONFLICT',
+      'Save the initial Recipe State before starting its first bake.',
+      409
+    )
+  }
+  const targetRecipeRevision = operation === 'first-bake'
+    ? owner.authoringRevision.recipeRevision
+    : owner.nextRecipeRevision
+  const jobHash = await canonicalRecipeSha256({
+    userId: input.userId,
+    goonId: input.goonId,
+    idempotencyKey,
+    operation,
+    source: source.source,
+    state,
+    targetRecipeRevision
+  })
+  const targetRevisionId = operation === 'first-bake'
+    ? owner.authoringRevision.revisionId
+    : `recipe_revision_${targetRecipeRevision}_${jobHash.slice(0, 24)}`
+  const reviewHash = await canonicalRecipeSha256({
+    operation,
+    containmentReceiptSha256: source.receipt.receiptSha256,
+    state
+  })
+  const reviewedState = await verifyRecipeReviewedState({
+    contract: RECIPE_REVIEWED_STATE_CONTRACT,
+    reviewId: `recipe_review_${reviewHash.slice(0, 40)}`,
+    operation,
+    analysisId: null,
+    planSha256: null,
+    containmentReceiptSha256: source.receipt.receiptSha256,
+    state,
+    adjustedControlIds: [],
+    confirmedControlIds: [],
+    cleanResetConfirmed: false
+  })
+  const reviewDocument = await createGoonRecipeDocument({
+    userId: input.userId,
+    goonId: input.goonId,
+    content: reviewedState
+  })
+  const reviewedStateRef = documentRef(reviewDocument)
+  const now = (dependencies.now ?? (() => new Date()))()
+  const nextWriteVersion = owner.writeVersion + 1
+  const authoringRevision = operation === 'first-bake'
+    ? owner.authoringRevision
+    : await createAuthoringRevision({
+        contract: GOON_RECIPE_REVISION_CONTRACT,
+        recipeRevision: targetRecipeRevision,
+        revisionId: targetRevisionId,
+        revisionSha256: ZERO_SHA256,
+        source: source.source,
+        state,
+        liveBuildReceipt: {
+          contract: GOON_LIVE_BUILD_CONTRACT,
+          ref: 'rebake-pending',
+          sha256: ZERO_SHA256
+        },
+        updateReport: null
+      })
+  const job: GoonRecipeJob = {
+    contract: GOON_RECIPE_JOB_CONTRACT,
+    userId: input.userId,
+    goonId: input.goonId,
+    jobId: `recipe_job_${jobHash.slice(0, 40)}`,
+    idempotencyKey,
+    operation,
+    status: 'baking',
+    stateVersion: 1,
+    attempt: 1,
+    targetWriteVersion: nextWriteVersion,
+    targetRecipeRevision,
+    targetRevisionId,
+    sourceRevision: owner.activeRevision,
+    stagedSource: {
+      source: source.source,
+      containmentReceipt: owner.authoringSourceContainmentReceipt
+    },
+    plan: null,
+    migrationReport: null,
+    reviewedState: reviewedStateRef,
+    stagedLive: null,
+    candidateRevision: null,
+    lease: lease(dependencies, now),
+    failure: null,
+    cleanupAssets: [],
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString()
+  }
+  const nextGoon = cloneGoon(goon)
+  nextGoon.updated_at = now.toISOString()
+  nextGoon.recipe = {
+    ...owner,
+    writeVersion: nextWriteVersion,
+    nextRecipeRevision:
+      operation === 'rebake' ? owner.nextRecipeRevision + 1 : owner.nextRecipeRevision,
+    liveStatus: 'building',
+    authoringRevision,
+    pendingJob: pendingJob(job),
+    lastFailure: null
+  }
+  const stored = await compareAndSwapRecipeJobState({
+    userId: input.userId,
+    goonId: input.goonId,
+    expectedWriteVersion: owner.writeVersion,
+    expectedJobStateVersion: null,
+    nextGoon,
+    nextJob: job,
+    records: [{
+      key: recipeDocumentRedisKey(input.userId, input.goonId, reviewDocument.sha256),
+      value: reviewDocument
+    }]
+  })
+  return { goon: stored, job, reviewedState, replayed: false }
 }
 
 export async function discardRecipePackageAnalysis(input: {
   userId: string
   goonId: string
   expectedWriteVersion: number
-  planRef: RecipeDocumentRef
-  containmentReceipt: RecipeDocumentRef
+  analysisId: string
+  confirmed: boolean
 }, dependencies: RecipeLifecycleDependencies = {}) {
+  if (input.confirmed !== true) {
+    throw new GoonRecipeLifecycleError(
+      'KEEP_CURRENT_CONFIRMATION_REQUIRED',
+      'Keeping the current package must be explicitly confirmed.',
+      409
+    )
+  }
   const readAsset = dependencies.readAsset ?? defaultReadAsset
   const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
   const owner = await verifyGoonRecipeV2(goon.recipe)
-  assertOwnerReadyForAnalysis(owner)
+  const pending = requirePendingAnalysis(owner, input.analysisId)
   if (owner.writeVersion !== input.expectedWriteVersion) {
     throw new GoonRecipeLifecycleError('WRITE_CONFLICT', 'The Recipe changed after analysis.', 409)
   }
   const [plan, target, active] = await Promise.all([
-    loadPlan(input.userId, input.goonId, input.planRef),
-    loadArchiveFromDocument(input.userId, input.goonId, input.containmentReceipt, readAsset),
+    loadPlan(input.userId, input.goonId, pending.selectedPlan),
+    loadArchiveFromDocument(input.userId, input.goonId, pending.containmentReceipt, readAsset),
     loadEnvelopeByRef(input.userId, input.goonId, owner.activeRevision!)
   ])
   if (
     canonicalRecipeString(plan.fromSource) !== canonicalRecipeString(owner.authoringRevision.source) ||
     canonicalRecipeString(plan.toSource) !== canonicalRecipeString(target.source) ||
-    active.sourceContainmentReceipt.ref === input.containmentReceipt.ref
+    active.sourceContainmentReceipt.ref === pending.containmentReceipt.ref
   ) {
     throw new GoonRecipeLifecycleError(
       'INVALID_ANALYSIS',
@@ -618,12 +1639,28 @@ export async function discardRecipePackageAnalysis(input: {
     const parts = asset.ref.split('/').filter(Boolean)
     candidates.set(`${parts[1]}/${parts[2]}`, new Set(['discarded Recipe analysis']))
   }
-  await discardRecipeAnalysisRecords({
+  const now = (dependencies.now ?? (() => new Date()))().toISOString()
+  const nextGoon = cloneGoon(goon)
+  nextGoon.updated_at = now
+  nextGoon.recipe = {
+    ...owner,
+    writeVersion: owner.writeVersion + 1,
+    pendingAnalysis: null
+  }
+  const stored = await discardRecipeAnalysisRecords({
     userId: input.userId,
     goonId: input.goonId,
     expectedWriteVersion: owner.writeVersion,
-    planRef: input.planRef.ref,
-    containmentReceiptRef: input.containmentReceipt.ref
+    analysisId: pending.analysisId,
+    nextGoon,
+    recordRefs: [
+      pending.analysisRef.ref,
+      pending.basePlan.ref,
+      pending.selectedPlan.ref,
+      pending.migrationReport.ref,
+      pending.containmentReceipt.ref,
+      ...(pending.reviewedState ? [pending.reviewedState.ref] : [])
+    ]
   })
   const remaining = await redis.execute((client: any) =>
     collectGoonUploadReferencesForClient(client, input.userId)
@@ -633,7 +1670,7 @@ export async function discardRecipePackageAnalysis(input: {
     remaining,
     dependencies.deleteAsset
   )
-  return { discarded: true, deletedAssets }
+  return { goon: stored, discarded: true, deletedAssets }
 }
 
 function assertJobSnapshot(
@@ -737,7 +1774,7 @@ async function createRevisionBundle(input: {
   job: GoonRecipeJob
   state: RecipeStateSnapshot
   liveBuildReceipt: RecipeDocumentRef
-  updateReport: RecipeDocumentRef
+  updateReport: RecipeDocumentRef | null
 }) {
   const candidate: RecipeRevisionBundle = {
     contract: GOON_RECIPE_REVISION_CONTRACT,
@@ -767,6 +1804,75 @@ async function createAuthoringRevision(revision: RecipeRevisionBundle) {
   return authoring
 }
 
+export async function registerRecipeCandidateAssets(input: {
+  userId: string
+  goonId: string
+  jobId: string
+  expectedWriteVersion: number
+  expectedJobStateVersion: number
+  live: RecipeAssetSet
+}, dependencies: RecipeLifecycleDependencies = {}) {
+  const readAsset = dependencies.readAsset ?? defaultReadAsset
+  const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
+  const owner = await verifyGoonRecipeV2(goon.recipe)
+  const job = await getGoonRecipeJob(input.userId, input.goonId, input.jobId)
+  if (job.stagedLive) {
+    if (canonicalRecipeString(job.stagedLive) !== canonicalRecipeString(input.live)) {
+      throw new GoonRecipeLifecycleError(
+        'CANDIDATE_ALREADY_REGISTERED',
+        'This Recipe job already owns a different Live candidate.',
+        409
+      )
+    }
+    const cleanup = new Set(job.cleanupAssets.map((asset) => asset.ref))
+    if (Object.values(job.stagedLive).some((asset) => !cleanup.has(asset.ref))) {
+      throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Registered candidate is missing cleanup ownership.', 500)
+    }
+    return { goon, owner, job, replayed: true }
+  }
+  assertJobSnapshot(owner, job, input.expectedWriteVersion, input.expectedJobStateVersion)
+  if (!['baking', 'packaging', 'verifying'].includes(job.status)) {
+    throw new GoonRecipeLifecycleError(
+      'INVALID_JOB_STATE',
+      `Cannot register candidate assets from ${job.status}.`,
+      409
+    )
+  }
+  assertLeaseCurrent(job, (dependencies.now ?? (() => new Date()))())
+  await Promise.all(Object.values(input.live).map((asset) => readVerifiedAsset(asset, readAsset)))
+  const now = (dependencies.now ?? (() => new Date()))()
+  const nextWriteVersion = owner.writeVersion + 1
+  const nextJob: GoonRecipeJob = {
+    ...job,
+    stateVersion: job.stateVersion + 1,
+    targetWriteVersion: nextWriteVersion,
+    stagedLive: input.live,
+    cleanupAssets: uniqueSortedAssets([...job.cleanupAssets, ...Object.values(input.live)]),
+    updatedAt: now.toISOString()
+  }
+  const nextGoon = cloneGoon(goon)
+  nextGoon.updated_at = now.toISOString()
+  nextGoon.recipe = {
+    ...owner,
+    writeVersion: nextWriteVersion,
+    pendingJob: pendingJob(nextJob)
+  }
+  const stored = await compareAndSwapRecipeJobState({
+    userId: input.userId,
+    goonId: input.goonId,
+    expectedWriteVersion: owner.writeVersion,
+    expectedJobStateVersion: job.stateVersion,
+    nextGoon,
+    nextJob
+  })
+  return {
+    goon: stored,
+    owner: await verifyGoonRecipeV2(stored.recipe),
+    job: nextJob,
+    replayed: false
+  }
+}
+
 export async function stageRecipeUpdateCandidate(
   input: StageRecipeCandidateInput,
   dependencies: RecipeLifecycleDependencies = {}
@@ -781,15 +1887,15 @@ export async function stageRecipeUpdateCandidate(
     throw new GoonRecipeLifecycleError('INVALID_JOB_STATE', `Cannot stage a candidate from ${job.status}.`, 409)
   }
   assertLeaseCurrent(job, now)
-  if (!job.plan) {
-    throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Package-update job is missing its immutable plan.', 500)
+  const reviewedState = await loadReviewedState(input.userId, input.goonId, job.reviewedState)
+  if (reviewedState.operation !== job.operation) {
+    throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Reviewed state operation differs from its job.', 500)
   }
-  const plan = await loadPlan(input.userId, input.goonId, job.plan)
-  const state = await verifyRecipeStateSnapshot(input.state)
-  if (!plan.proposedState || canonicalRecipeString(state) !== canonicalRecipeString(plan.proposedState)) {
+  const state = reviewedState.state
+  if (!job.stagedLive || canonicalRecipeString(job.stagedLive) !== canonicalRecipeString(input.live)) {
     throw new GoonRecipeLifecycleError(
-      'CANDIDATE_MISMATCH',
-      'The staged Recipe State differs from the reviewed migration plan.',
+      'CANDIDATE_NOT_REGISTERED',
+      'Register the exact uploaded Live candidate before staging it.',
       409
     )
   }
@@ -802,42 +1908,61 @@ export async function stageRecipeUpdateCandidate(
   if (canonicalRecipeString(target.source) !== canonicalRecipeString(job.stagedSource.source)) {
     throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Staged source differs from its extraction receipt.', 500)
   }
-  const edge = edgeForPlan(plan, target)
-  const report = await verifyRecipeMigrationReport(input.migrationReport, edge)
-  if (
-    report.fromRecipeRevision !== plan.fromRecipeRevision ||
-    plan.toRecipeRevision !== job.targetRecipeRevision ||
-    report.toRecipeRevision !== job.targetRecipeRevision
-  ) {
-    throw new GoonRecipeLifecycleError(
-      'CANDIDATE_MISMATCH',
-      'The migration report does not bind the allocated Recipe revision.',
-      409
+  let reportRef: RecipeDocumentRef | null = null
+  if (job.operation === 'package-update') {
+    if (!job.plan || !job.migrationReport) {
+      throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Package-update job lost its plan or report.', 500)
+    }
+    const plan = await loadPlan(input.userId, input.goonId, job.plan)
+    if (
+      reviewedState.analysisId === null ||
+      reviewedState.planSha256 !== plan.planSha256 ||
+      plan.toRecipeRevision !== job.targetRecipeRevision
+    ) {
+      throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Reviewed state does not bind the package-update plan.', 500)
+    }
+    const edge = edgeForPlan(plan, target)
+    const reportDocument = await loadDocumentByRef(
+      input.userId,
+      input.goonId,
+      job.migrationReport
     )
+    const report = await verifyRecipeMigrationReport(
+      reportDocument.content,
+      edge,
+      migrationReportExpectation(plan, edge)
+    )
+    if (
+      report.fromRecipeRevision !== plan.fromRecipeRevision ||
+      report.toRecipeRevision !== job.targetRecipeRevision
+    ) {
+      throw new GoonRecipeLifecycleError(
+        'CORRUPT_REPORT',
+        'The server-authored migration report does not bind the allocated Recipe revision.',
+        500
+      )
+    }
+    reportRef = job.migrationReport
+  } else if (job.plan || job.migrationReport) {
+    throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Ordinary bake unexpectedly contains migration proof.', 500)
   }
   const liveBuildReceipt = await verifyGoonLiveBuildReceipt(input.liveBuildReceipt)
-  await Promise.all([
-    readVerifiedAsset(input.live.package, readAsset),
-    readVerifiedAsset(input.live.model, readAsset),
-    readVerifiedAsset(input.live.manifest, readAsset)
-  ])
   assertLiveReceiptBindings(job, state, liveBuildReceipt, input.live)
-
-  const reportDocument = await createGoonRecipeDocument({
-    userId: input.userId,
-    goonId: input.goonId,
-    content: report
+  await verifyDeterministicLiveBake({
+    archive: target,
+    revisionId: job.targetRevisionId,
+    revision: job.targetRecipeRevision,
+    state,
+    receipt: liveBuildReceipt
   })
+  await verifyStoredLiveArtifacts(input.live, liveBuildReceipt, readAsset)
+
   const buildDocument = await createGoonRecipeDocument({
     userId: input.userId,
     goonId: input.goonId,
     content: liveBuildReceipt
   })
-  const [storedReport, storedBuild] = await Promise.all([
-    putGoonRecipeDocument(reportDocument),
-    putGoonRecipeDocument(buildDocument)
-  ])
-  const reportRef = documentRef(storedReport.document)
+  const storedBuild = await putGoonRecipeDocument(buildDocument)
   const buildRef = documentRef(storedBuild.document)
   const revision = await createRevisionBundle({
     job,
@@ -951,11 +2076,6 @@ export async function verifyCompleteRecipeRevision(
     throw new GoonRecipeLifecycleError('CORRUPT_REVISION', 'Revision Live-build receipt contract is invalid.', 500)
   }
   const buildReceipt = await verifyGoonLiveBuildReceipt(buildDocument.content)
-  await Promise.all([
-    readVerifiedAsset(envelope.live.package, readAsset),
-    readVerifiedAsset(envelope.live.model, readAsset),
-    readVerifiedAsset(envelope.live.manifest, readAsset)
-  ])
   assertLiveReceiptBindings(
     {
       targetRevisionId: envelope.revision.revisionId,
@@ -966,6 +2086,14 @@ export async function verifyCompleteRecipeRevision(
     buildReceipt,
     envelope.live
   )
+  await verifyDeterministicLiveBake({
+    archive: source,
+    revisionId: envelope.revision.revisionId,
+    revision: envelope.revision.recipeRevision,
+    state: envelope.revision.state,
+    receipt: buildReceipt
+  })
+  await verifyStoredLiveArtifacts(envelope.live, buildReceipt, readAsset)
   if (envelope.revision.updateReport) {
     await loadDocumentByRef(userId, goonId, envelope.revision.updateReport)
   }
@@ -973,25 +2101,7 @@ export async function verifyCompleteRecipeRevision(
 }
 
 function applyRevisionToGoon(goon: GoonRecord, envelope: RecipeRevisionEnvelope) {
-  goon.customAvatar = {
-    ...(goon.customAvatar ?? {}),
-    package: toGoonFileRef(envelope.live.package),
-    model: toGoonFileRef(envelope.live.model),
-    manifest: toGoonFileRef(envelope.live.manifest)
-  }
-  delete goon.customAvatar.pending
-  delete goon.customAvatar.backup
-  goon.appearanceDials = envelope.revision.state.appearanceDials
-  const siblingFor = (contract: string, ids: string[]) =>
-    envelope.revision.state.siblings.find(
-      (sibling) => sibling.contract === contract || ids.includes(sibling.id)
-    )?.state
-  const facialArtwork = siblingFor('facial-artwork-state/v3', ['facial-artwork', 'facialArtwork'])
-  const eyeAppearance = siblingFor('eye-appearance-state/v1', ['eye-appearance', 'eyeAppearance'])
-  if (facialArtwork) goon.facialArtwork = facialArtwork as GoonRecord['facialArtwork']
-  else delete goon.facialArtwork
-  if (eyeAppearance) goon.eyeAppearance = eyeAppearance as GoonRecord['eyeAppearance']
-  else delete goon.eyeAppearance
+  applyRecipeRevisionProjection(goon, envelope, (asset) => toGoonFileRef(asset))
 }
 
 export async function commitRecipeUpdate(input: {
@@ -1037,6 +2147,7 @@ export async function commitRecipeUpdate(input: {
     writeVersion: nextWriteVersion,
     liveStatus: 'up_to_date',
     authoringRevision,
+    authoringSourceContainmentReceipt: envelope.sourceContainmentReceipt,
     activeRevision: job.candidateRevision,
     previousRevision: owner.activeRevision,
     pendingJob: null,
@@ -1060,7 +2171,11 @@ export async function commitRecipeUpdate(input: {
     })
   } catch (error) {
     cleanupError = error instanceof Error ? error.message : 'Recipe retention cleanup failed.'
-    stored = await recordRecipeMaintenanceFailure(stored, cleanupError, dependencies)
+    const maintenance = await recordRecipeMaintenanceFailure(stored, cleanupError, dependencies)
+    stored = maintenance.goon
+    if (maintenance.persistenceError) {
+      cleanupError = `${cleanupError} Cleanup failure persistence also failed: ${maintenance.persistenceError}`
+    }
   }
   return { goon: stored, job: committedJob, envelope, cleanup, cleanupError }
 }
@@ -1073,6 +2188,7 @@ const LEASED_STATUSES = new Set([
   'verifying',
   'committing'
 ])
+const FAILABLE_STATUSES = new Set([...LEASED_STATUSES, 'ready'])
 
 export async function recoverInterruptedRecipeJob(input: {
   userId: string
@@ -1083,9 +2199,15 @@ export async function recoverInterruptedRecipeJob(input: {
   const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
   const owner = await verifyGoonRecipeV2(goon.recipe)
   const job = await getGoonRecipeJob(input.userId, input.goonId, input.jobId)
-  if (job.status === 'interrupted') return { goon, job, recovered: false }
+  const [reviewedState, candidate] = await Promise.all([
+    loadReviewedState(input.userId, input.goonId, job.reviewedState),
+    job.candidateRevision
+      ? loadEnvelopeByRef(input.userId, input.goonId, job.candidateRevision)
+      : Promise.resolve(null)
+  ])
+  if (job.status === 'interrupted') return { goon, job, reviewedState, candidate, recovered: false }
   if (!LEASED_STATUSES.has(job.status) || !job.lease || Date.parse(job.lease.expiresAt) > now.getTime()) {
-    return { goon, job, recovered: false }
+    return { goon, job, reviewedState, candidate, recovered: false }
   }
   if (owner.pendingJob?.jobId !== job.jobId) {
     throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Expired Recipe job is not owned by the Goon.', 500)
@@ -1122,7 +2244,7 @@ export async function recoverInterruptedRecipeJob(input: {
     nextGoon,
     nextJob
   })
-  return { goon: stored, job: nextJob, recovered: true }
+  return { goon: stored, job: nextJob, reviewedState, candidate, recovered: true }
 }
 
 const NEXT_ACTIVE_STAGE = new Map([
@@ -1197,10 +2319,10 @@ export async function failRecipeJob(input: {
   const owner = await verifyGoonRecipeV2(goon.recipe)
   const job = await getGoonRecipeJob(input.userId, input.goonId, input.jobId)
   assertJobSnapshot(owner, job, input.expectedWriteVersion, input.expectedJobStateVersion)
-  if (!LEASED_STATUSES.has(job.status)) {
+  if (!FAILABLE_STATUSES.has(job.status)) {
     throw new GoonRecipeLifecycleError('INVALID_JOB_STATE', `Recipe job cannot fail from ${job.status}.`, 409)
   }
-  assertLeaseCurrent(job, now)
+  if (job.status !== 'ready') assertLeaseCurrent(job, now)
   const reason = input.reason.trim()
   if (!reason) throw new GoonRecipeLifecycleError('INVALID_INPUT', 'Recipe failure reason is required.')
   if (input.reportRef) await loadDocumentByRef(input.userId, input.goonId, input.reportRef)
@@ -1252,9 +2374,7 @@ export async function retryRecipeJob(input: {
   }
   const nextWriteVersion = owner.writeVersion + 1
   const status = job.candidateRevision ? 'ready' as const : 'baking' as const
-  if (!job.candidateRevision && !job.plan) {
-    throw new GoonRecipeLifecycleError('CORRUPT_JOB', 'Recipe job has no durable plan to retry.', 500)
-  }
+  await loadReviewedState(input.userId, input.goonId, job.reviewedState)
   const nextJob: GoonRecipeJob = {
     ...job,
     status,
@@ -1304,6 +2424,20 @@ export async function discardRecipeJob(input: {
       409
     )
   }
+  const active = owner.activeRevision
+    ? await loadEnvelopeByRef(input.userId, input.goonId, owner.activeRevision)
+    : null
+  const authoringMatchesActive = Boolean(
+    active &&
+    canonicalRecipeString(active.revision.source) ===
+      canonicalRecipeString(owner.authoringRevision.source) &&
+    canonicalRecipeString(active.revision.state) ===
+      canonicalRecipeString(owner.authoringRevision.state) &&
+    canonicalRecipeString(active.revision.updateReport) ===
+      canonicalRecipeString(owner.authoringRevision.updateReport) &&
+    canonicalRecipeString(active.sourceContainmentReceipt) ===
+      canonicalRecipeString(owner.authoringSourceContainmentReceipt)
+  )
   const nextWriteVersion = owner.writeVersion + 1
   const nextJob: GoonRecipeJob = {
     ...job,
@@ -1320,7 +2454,7 @@ export async function discardRecipeJob(input: {
   nextGoon.recipe = {
     ...owner,
     writeVersion: nextWriteVersion,
-    liveStatus: owner.activeRevision ? 'up_to_date' : 'needs_bake',
+    liveStatus: authoringMatchesActive ? 'up_to_date' : 'needs_bake',
     pendingJob: null,
     lastFailure: null
   }
@@ -1340,9 +2474,43 @@ export async function discardRecipeJob(input: {
     })
   } catch (error) {
     cleanupError = error instanceof Error ? error.message : 'Recipe discard cleanup failed.'
-    stored = await recordRecipeMaintenanceFailure(stored, cleanupError, dependencies)
+    const maintenance = await recordRecipeMaintenanceFailure(stored, cleanupError, dependencies)
+    stored = maintenance.goon
+    if (maintenance.persistenceError) {
+      cleanupError = `${cleanupError} Cleanup failure persistence also failed: ${maintenance.persistenceError}`
+    }
   }
   return { goon: stored, job: nextJob, cleanup, cleanupError }
+}
+
+export async function getPreviousRecipeRevisionPreview(input: {
+  userId: string
+  goonId: string
+}, dependencies: RecipeLifecycleDependencies = {}) {
+  const readAsset = dependencies.readAsset ?? defaultReadAsset
+  const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
+  const owner = await verifyGoonRecipeV2(goon.recipe)
+  if (owner.pendingJob) {
+    throw new GoonRecipeLifecycleError(
+      'RECIPE_BUSY',
+      'Finish or discard current Recipe work before previewing rollback.',
+      409
+    )
+  }
+  if (!owner.previousRevision) {
+    throw new GoonRecipeLifecycleError(
+      'NO_PREVIOUS_REVISION',
+      'No complete previous Recipe revision is available.',
+      409
+    )
+  }
+  const previous = await verifyCompleteRecipeRevision(
+    input.userId,
+    input.goonId,
+    owner.previousRevision,
+    readAsset
+  )
+  return { goon, owner, previous }
 }
 
 export async function restorePreviousRecipeRevision(input: {
@@ -1376,6 +2544,7 @@ export async function restorePreviousRecipeRevision(input: {
     writeVersion: owner.writeVersion + 1,
     liveStatus: 'up_to_date',
     authoringRevision,
+    authoringSourceContainmentReceipt: previous.sourceContainmentReceipt,
     activeRevision: owner.previousRevision,
     previousRevision: owner.activeRevision,
     latestUpdateReport: previous.revision.updateReport,
@@ -1396,7 +2565,11 @@ export async function restorePreviousRecipeRevision(input: {
     })
   } catch (error) {
     cleanupError = error instanceof Error ? error.message : 'Recipe rollback cleanup failed.'
-    stored = await recordRecipeMaintenanceFailure(stored, cleanupError, dependencies)
+    const maintenance = await recordRecipeMaintenanceFailure(stored, cleanupError, dependencies)
+    stored = maintenance.goon
+    if (maintenance.persistenceError) {
+      cleanupError = `${cleanupError} Cleanup failure persistence also failed: ${maintenance.persistenceError}`
+    }
   }
   return { goon: stored, restored: previous, replaced: active, cleanup, cleanupError }
 }
@@ -1419,15 +2592,20 @@ async function recordRecipeMaintenanceFailure(
         reportRef: null
       }
     }
-    return await compareAndSwapRecipeState({
-      userId: goon.user_id,
-      goonId: goon.id,
-      expectedWriteVersion: owner.writeVersion,
-      nextGoon
-    })
+    return {
+      goon: await compareAndSwapRecipeState({
+        userId: goon.user_id,
+        goonId: goon.id,
+        expectedWriteVersion: owner.writeVersion,
+        nextGoon
+      }),
+      persistenceError: null
+    }
   } catch (error) {
-    console.error('[Recipe lifecycle] Failed to persist cleanup failure:', error)
-    return goon
+    return {
+      goon,
+      persistenceError: error instanceof Error ? error.message : String(error)
+    }
   }
 }
 
@@ -1492,9 +2670,18 @@ export async function pruneRecipeRetention(
       }
     }
     const unreachable = keys.filter((key) => !reachable.has(key))
+    const unreachableSet = new Set(unreachable)
     const candidates = await collectGoonRecipeUploadReferencesForClient(client, userId, goonId)
-    if (unreachable.length > 0) await client.del(unreachable)
-    const remaining = await collectGoonUploadReferencesForClient(client, userId)
+    const referenceClient = {
+      keys: async (pattern: string) =>
+        (await client.keys(pattern)).filter((key: string) => !unreachableSet.has(key)),
+      sMembers: (key: string) => client.sMembers(key),
+      del: (keys: string | string[]) => client.del(keys),
+      json: {
+        get: (key: string, options?: unknown) => client.json.get(key, options)
+      }
+    }
+    const remaining = await collectGoonUploadReferencesForClient(referenceClient, userId)
     return { unreachable, candidates, remaining }
   })
   const deletedAssets = await deleteUnreferencedGoonUploadReferences(
@@ -1502,5 +2689,8 @@ export async function pruneRecipeRetention(
     result.remaining as GoonAssetReferenceMap,
     options.deleteAsset
   )
+  if (result.unreachable.length > 0) {
+    await redis.execute((client: any) => client.del(result.unreachable))
+  }
   return { deletedRecords: result.unreachable, deletedAssets }
 }

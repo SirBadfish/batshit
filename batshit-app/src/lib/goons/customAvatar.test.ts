@@ -7,12 +7,15 @@ import {
   loadAvatarIntoEngine,
   loadCustomAvatarManifest,
   getCustomRuntimeNodeNameCandidates,
+  resolveCustomArkitFaceBindings,
   resolveCustomFaceControlBindings,
+  resolveCustomExpressionBindingContract,
   resolveCustomExpressionBindings,
   resolveCustomFaceMeshes,
   resolveCustomFaceMeshNames,
   resolveGuidedManifestFile,
   resolveCustomMorphDefinitions,
+  resolveCustomSpeechFaceProfile,
   resolveGoonEyeContactMode,
   resolveGoonEyeContactTuning,
   resolveGoonSourceProfile,
@@ -22,6 +25,7 @@ import {
   resolveGoonManifestFile
 } from '$lib/goons/customAvatar'
 import type { GoonRecord, GoonsSettings } from '$lib/types/goons'
+import { ARKIT_52_CHANNEL_ORDER } from '$lib/goons/speechFaceProfiles'
 
 const baseGoon: GoonRecord = {
   id: 'goon_1',
@@ -376,9 +380,103 @@ describe('customAvatar helpers', () => {
 
     expect(resolveCustomFaceMeshNames(manifest)).toEqual(['FaceMesh', 'TeethMesh', 'EyesMesh'])
     expect(resolveCustomExpressionBindings(manifest)).toEqual({
-      happy: ['Smile'],
-      aa: ['Viseme_AA', 'JawOpen']
+      happy: [{ target: 'Smile', weight: 1 }],
+      aa: [
+        { target: 'Viseme_AA', weight: 1 },
+        { target: 'JawOpen', weight: 1 }
+      ]
     })
+  })
+
+  it('parses exact weighted semantic recipes and fails malformed recipes closed', () => {
+    const resolved = resolveCustomExpressionBindingContract({
+      contractVersion: 2,
+      face: {
+        expressions: {
+          happy: {
+            schemaVersion: 'batshit-expression-recipe/v1',
+            targets: [
+              { target: 'mouthSmileLeft', weight: 0.55 },
+              { target: 'mouthSmileRight', weight: 0.55 },
+              { target: 'cheekSquintLeft', weight: 0.3 }
+            ]
+          },
+          invalid: {
+            schemaVersion: 'batshit-expression-recipe/v1',
+            targets: [{ target: 'badTarget', weight: 1.2 }]
+          }
+        }
+      }
+    })
+
+    expect(resolved.bindings.happy).toEqual([
+      { target: 'mouthSmileLeft', weight: 0.55 },
+      { target: 'mouthSmileRight', weight: 0.55 },
+      { target: 'cheekSquintLeft', weight: 0.3 }
+    ])
+    expect(resolved.bindings).not.toHaveProperty('invalid')
+    expect(resolved.issues).toContain(
+      'face.expressions.invalid.targets[0].weight must be greater than 0 and at most 1.'
+    )
+  })
+
+  it('resolves only exact versioned speech-face profile declarations', () => {
+    expect(
+      resolveCustomSpeechFaceProfile({
+        contractVersion: 2,
+        face: {
+          speechProfile: {
+            schemaVersion: 'batshit-speech-face/v1',
+            profile: 'ovr-15',
+            neutral: 'sil',
+            channels: ['sil', 'PP', 'FF', 'TH', 'DD', 'kk', 'CH', 'SS', 'nn', 'RR', 'aa', 'E', 'I', 'O', 'U']
+          }
+        }
+      })
+    ).toEqual({ profile: 'ovr-15', issues: [] })
+
+    const invalid = resolveCustomSpeechFaceProfile({
+      contractVersion: 2,
+      face: {
+        speechProfile: {
+          schemaVersion: 'batshit-speech-face/v1',
+          profile: 'ovr-15',
+          neutral: 'sil',
+          channels: ['sil', 'PP']
+        }
+      }
+    })
+    expect(invalid.profile).toBeNull()
+    expect(invalid.issues[0]).toContain('must exactly match')
+  })
+
+  it('requires an exact explicit ARKit-52 manifest mapping for full-fidelity face drive', () => {
+    const arkit52 = Object.fromEntries(
+      ARKIT_52_CHANNEL_ORDER.map((channel) => [channel, `FaceIt_${channel}`])
+    )
+    const resolved = resolveCustomArkitFaceBindings({ face: { arkit52 } })
+
+    expect(resolved.issues).toEqual([])
+    expect(resolved.face?.size).toBe(52)
+    expect(resolved.face?.get('jawOpen')).toEqual(['FaceIt_jawOpen'])
+    expect(resolved.tongue).toBeNull()
+  })
+
+  it('rejects partial or ambiguous ARKit declarations instead of enabling a partial driver', () => {
+    const partial = resolveCustomArkitFaceBindings({
+      face: { arkit52: { jawOpen: 'shared_target' } }
+    })
+    expect(partial.face).toBeNull()
+    expect(partial.issues[0]).toContain('missing required channels')
+
+    const duplicateTarget = Object.fromEntries(
+      ARKIT_52_CHANNEL_ORDER.map((channel) => [channel, channel])
+    )
+    duplicateTarget.jawOpen = 'shared_target'
+    duplicateTarget.mouthClose = 'shared_target'
+    const ambiguous = resolveCustomArkitFaceBindings({ face: { arkit52: duplicateTarget } })
+    expect(ambiguous.face).toBeNull()
+    expect(ambiguous.issues.some((issue) => issue.includes('both jawOpen and mouthClose'))).toBe(true)
   })
 
   it('matches the Three.js runtime node-name sanitization used by Custom avatars', () => {
@@ -534,6 +632,7 @@ describe('customAvatar helpers', () => {
 
     const engine = {
       loadGoon: vi.fn(),
+      setSocketEyeContactSettings: vi.fn(),
       loadCustomGoon: vi.fn().mockResolvedValue(undefined)
     }
     const customGoon: GoonRecord = {
@@ -574,10 +673,135 @@ describe('customAvatar helpers', () => {
       {
         appearanceDialValues: customGoon.appearanceDials,
         eyeAppearanceState: null,
-        facialArtworkState: null
+        facialArtworkState: null,
+        oralAppearanceState: null
       }
     )
     expect(engine.loadGoon).not.toHaveBeenCalled()
+    expect(engine.setSocketEyeContactSettings).toHaveBeenCalledWith(null)
+  })
+
+  it('never forwards Recipe dials into a lean Live engine', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        contractVersion: 1,
+        liveBuild: { contract: 'goon-live-manifest/v1' },
+        facialArtwork: null,
+        eyeAppearance: null
+      })
+    }))
+    const engine = {
+      loadGoon: vi.fn(),
+      setSocketEyeContactSettings: vi.fn(),
+      loadCustomGoon: vi.fn().mockResolvedValue(undefined)
+    }
+    const liveGoon: GoonRecord = {
+      ...baseGoon,
+      kind: 'custom',
+      appearanceDials: {
+        contract: 'appearance-dial-values/v2',
+        definitionSha256: 'a'.repeat(64),
+        neutralId: 'neutral-v1',
+        neutralRecipeSha256: 'b'.repeat(64),
+        values: { head_size: 0.75 },
+        unlockedDialIds: []
+      },
+      customAvatar: {
+        model: { url: '/avatars/live-r6.glb', filename: 'live-r6.glb' },
+        manifest: { url: '/avatars/live-r6.json', filename: 'live-r6.json' }
+      },
+      recipe: {
+        contract: 'goon-recipe/v2',
+        activeRevision: {
+          contract: 'goon-recipe-revision-envelope/v1',
+          ref: 'goon_recipe_revision:user:goon:revision_2',
+          sha256: 'c'.repeat(64)
+        }
+      } as any
+    }
+
+    const result = await loadAvatarIntoEngine(engine as any, liveGoon, {
+      role: 'mounted-live'
+    })
+
+    expect(result.role).toBe('live')
+    expect(engine.loadCustomGoon).toHaveBeenCalledWith(
+      '/avatars/live-r6.glb',
+      expect.objectContaining({ liveBuild: expect.any(Object) }),
+      {
+        eyeAppearanceState: null,
+        facialArtworkState: null,
+        oralAppearanceState: null
+      }
+    )
+    expect(engine.setSocketEyeContactSettings).toHaveBeenCalledWith(null)
+  })
+
+  it('fails loudly when mounted Recipe Live resolves an authoring manifest', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        contractVersion: 1,
+        appearanceDials: { contract: 'appearance-dials/v2' }
+      })
+    }))
+    const engine = {
+      loadGoon: vi.fn(),
+      loadCustomGoon: vi.fn().mockResolvedValue(undefined)
+    }
+    const misplacedSource: GoonRecord = {
+      ...baseGoon,
+      kind: 'custom',
+      customAvatar: {
+        model: { url: '/avatars/source-r6.glb', filename: 'source-r6.glb' },
+        manifest: { url: '/avatars/source-r6.json', filename: 'source-r6.json' }
+      },
+      recipe: {
+        contract: 'goon-recipe/v2',
+        activeRevision: {
+          contract: 'goon-recipe-revision-envelope/v1',
+          ref: 'goon_recipe_revision:user:goon:revision_2',
+          sha256: 'c'.repeat(64)
+        }
+      } as any
+    }
+
+    await expect(
+      loadAvatarIntoEngine(engine as any, misplacedSource, { role: 'mounted-live' })
+    ).rejects.toThrow(/authoring package instead of active Live/)
+    expect(engine.loadCustomGoon).not.toHaveBeenCalled()
+  })
+
+  it('fails loudly when a staged Recipe candidate resolves an authoring manifest', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        contractVersion: 1,
+        appearanceDials: { contract: 'appearance-dials/v2' }
+      })
+    }))
+    const engine = {
+      loadGoon: vi.fn(),
+      loadCustomGoon: vi.fn().mockResolvedValue(undefined)
+    }
+    const stagedSource: GoonRecord = {
+      ...baseGoon,
+      kind: 'custom',
+      customAvatar: {
+        model: { url: '/avatars/staged-source.glb', filename: 'staged-source.glb' },
+        manifest: { url: '/avatars/staged-source.json', filename: 'staged-source.json' }
+      },
+      recipe: {
+        contract: 'goon-recipe/v2',
+        activeRevision: null
+      } as any
+    }
+
+    await expect(
+      loadAvatarIntoEngine(engine as any, stagedSource, { role: 'recipe-live-candidate' })
+    ).rejects.toThrow(/authoring package instead of lean Live/)
+    expect(engine.loadCustomGoon).not.toHaveBeenCalled()
   })
 
   it('routes guided vrms through engine.loadGoon with the guided manifest', async () => {

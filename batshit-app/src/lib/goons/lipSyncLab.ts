@@ -11,6 +11,11 @@ export const PREMIUM_GOON_LIP_SYNC_ANALYZER_OPTIONS: Array<{
     value: 'rhubarb-wasm',
     label: 'Rhubarb WASM',
     shortLabel: 'WASM'
+  },
+  {
+    value: 'audio2face-3d',
+    label: 'NVIDIA Audio2Face',
+    shortLabel: 'A2F'
   }
 ]
 

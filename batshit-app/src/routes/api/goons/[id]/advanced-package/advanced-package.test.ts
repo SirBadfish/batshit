@@ -133,4 +133,18 @@ describe('/api/goons/[id]/advanced-package Recipe containment', () => {
     expect(mocks.deleteAsset).toHaveBeenCalledWith('goon_custom_models', 'avatar.glb')
     expect(mocks.deleteAsset).toHaveBeenCalledWith('goon_custom_manifests', 'avatar.json')
   })
+
+  it('fails loudly when rejected staged assets cannot be cleaned completely', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json(uploadPayload(3)))
+    mocks.deleteAsset.mockImplementation(async (uploadType) => {
+      if (uploadType === 'goon_custom_models') throw new Error('Injected delete failure')
+    })
+
+    const response = await POST(event())
+    const body = await response.json()
+
+    expect(response.status).toBe(500)
+    expect(body.error).toContain('rejected assets could not be cleaned completely')
+    expect(mocks.deleteAsset).toHaveBeenCalledTimes(3)
+  })
 })

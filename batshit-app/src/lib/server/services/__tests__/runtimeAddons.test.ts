@@ -11,6 +11,8 @@ import {
 
 const originalContainerized = process.env.BATSHIT_CONTAINERIZED
 const originalWorkerUrl = process.env.BATSHIT_FBX2VRMA_WORKER_URL
+const originalAudio2FaceBridgeUrl = process.env.BATSHIT_AUDIO2FACE_BRIDGE_URL
+const originalAudio2FaceBridgeToken = process.env.BATSHIT_AUDIO2FACE_BRIDGE_TOKEN
 const originalComfyUiValidationUrl = process.env.BATSHIT_COMFYUI_VALIDATION_URL
 const originalAgentBrowserSidecarUrl = process.env.BATSHIT_AGENT_BROWSER_SIDECAR_URL
 const originalLiveKitUrl = process.env.LIVEKIT_URL
@@ -32,6 +34,18 @@ function restoreEnv() {
     delete process.env.BATSHIT_FBX2VRMA_WORKER_URL
   } else {
     process.env.BATSHIT_FBX2VRMA_WORKER_URL = originalWorkerUrl
+  }
+
+  if (originalAudio2FaceBridgeUrl === undefined) {
+    delete process.env.BATSHIT_AUDIO2FACE_BRIDGE_URL
+  } else {
+    process.env.BATSHIT_AUDIO2FACE_BRIDGE_URL = originalAudio2FaceBridgeUrl
+  }
+
+  if (originalAudio2FaceBridgeToken === undefined) {
+    delete process.env.BATSHIT_AUDIO2FACE_BRIDGE_TOKEN
+  } else {
+    process.env.BATSHIT_AUDIO2FACE_BRIDGE_TOKEN = originalAudio2FaceBridgeToken
   }
 
   if (originalComfyUiValidationUrl === undefined) {
@@ -100,6 +114,7 @@ describe('runtime add-on catalog', () => {
     expect(addons.map((entry) => entry.id)).toEqual([
       'cloudflared',
       'fbx2vrma',
+      'audio2face',
       'comfyui-validation',
       'comfyui',
       'local-ai',
@@ -111,6 +126,13 @@ describe('runtime add-on catalog', () => {
       route: 'sidecar/profile',
       composeProfile: 'fbx2vrma',
       internalUrl: 'http://fbx2vrma-worker:8079',
+      controllerRequiredForAutoStart: true
+    })
+    expect(getRuntimeAddonCatalogEntry('audio2face')).toMatchObject({
+      route: 'sidecar/profile',
+      composeProfile: 'audio2face',
+      internalUrl: 'http://audio2face-bridge:8068',
+      services: ['audio2face-bridge'],
       controllerRequiredForAutoStart: true
     })
     expect(getRuntimeAddonCatalogEntry('local-ai')).toMatchObject({
@@ -392,6 +414,111 @@ describe('runtime add-on catalog', () => {
       id: 'fbx2vrma',
       canStartAutomatically: false,
       requiresOperator: false
+    })
+  })
+
+  it('requires a distinct Audio2Face bridge token before probing the sidecar', async () => {
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    process.env.BATSHIT_AUDIO2FACE_BRIDGE_URL = 'http://audio2face.test'
+    delete process.env.BATSHIT_AUDIO2FACE_BRIDGE_TOKEN
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const status = await getRuntimeAddonStatus('audio2face')
+    expect(status).toMatchObject({
+      id: 'audio2face',
+      state: 'waiting',
+      running: false,
+      supported: true,
+      dockerUnsupported: false,
+      reason: expect.stringContaining('BATSHIT_AUDIO2FACE_BRIDGE_TOKEN'),
+      details: {
+        supportLevel: 'docker-sidecar-missing-token',
+        url: 'http://audio2face.test'
+      }
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('distinguishes a live Audio2Face bridge from a ready NVIDIA NIM runtime', async () => {
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    process.env.BATSHIT_AUDIO2FACE_BRIDGE_URL = 'http://audio2face.test'
+    process.env.BATSHIT_AUDIO2FACE_BRIDGE_TOKEN = 'audio2face-token'
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect((init?.headers as Record<string, string>)?.authorization).toBe(
+        'Bearer audio2face-token'
+      )
+      return Response.json({
+        ok: false,
+        bridgeRunning: true,
+        nimReady: false,
+        reason: 'NVIDIA Audio2Face gRPC health check failed: UNAVAILABLE.',
+        version: '0.1.0',
+        protocol: 'nvidia-audio2face-3d-v2-bidirectional-grpc',
+        outputFps: 30,
+        cacheSchema: 'batshit-audio2face/v1'
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const status = await getRuntimeAddonStatus('audio2face')
+    expect(status).toMatchObject({
+      id: 'audio2face',
+      state: 'waiting',
+      running: false,
+      supported: true,
+      reason: 'NVIDIA Audio2Face gRPC health check failed: UNAVAILABLE.',
+      details: {
+        supportLevel: 'docker-sidecar-waiting',
+        bridgeRunning: true,
+        nimReady: false,
+        outputFps: 30,
+        cacheSchema: 'batshit-audio2face/v1'
+      }
+    })
+  })
+
+  it('reports Audio2Face ready only when both bridge and NIM are healthy', async () => {
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    process.env.BATSHIT_AUDIO2FACE_BRIDGE_URL = 'http://audio2face.test'
+    process.env.BATSHIT_AUDIO2FACE_BRIDGE_TOKEN = 'audio2face-token'
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({
+          ok: true,
+          bridgeRunning: true,
+          nimReady: true,
+          version: '0.1.0',
+          protocol: 'nvidia-audio2face-3d-v2-bidirectional-grpc',
+          outputFps: 30,
+          cacheSchema: 'batshit-audio2face/v1'
+        })
+      )
+    )
+
+    const status = await getRuntimeAddonStatus('audio2face')
+    expect(status).toMatchObject({
+      id: 'audio2face',
+      state: 'running',
+      running: true,
+      supported: true,
+      dockerUnsupported: false,
+      details: {
+        supportLevel: 'docker-sidecar',
+        bridgeRunning: true,
+        nimReady: true,
+        version: '0.1.0'
+      }
+    })
+
+    const prepared = await prepareRuntimeAddon('audio2face')
+    expect(prepared).toMatchObject({
+      id: 'audio2face',
+      canStartAutomatically: false,
+      requiresOperator: false,
+      operatorCommand:
+        'docker compose --env-file .env.docker --profile audio2face up -d --build audio2face-bridge'
     })
   })
 

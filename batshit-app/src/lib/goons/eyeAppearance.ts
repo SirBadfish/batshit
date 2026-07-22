@@ -1,46 +1,22 @@
-export const EYE_APPEARANCE_SCHEMA_VERSION = "eye-appearance/v1" as const;
+export const EYE_APPEARANCE_SCHEMA_VERSION = "eye-appearance/v3" as const;
 export const EYE_APPEARANCE_STATE_SCHEMA_VERSION =
-  "eye-appearance-state/v1" as const;
+  "eye-appearance-state/v3" as const;
 
 export const EYE_APPEARANCE_CONTROL_IDS = [
   "iris_size",
   "pupil_size",
-  "eye_convergence",
-  "sclera_scale",
-  "sclera_tilt",
-  "sclera_horizontal_position",
-  "sclera_vertical_position",
-  "sclera_depth",
+  "iris_vertical_position",
 ] as const;
 
 export type EyeAppearanceControlId =
   (typeof EYE_APPEARANCE_CONTROL_IDS)[number];
 
-export const EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS = [
-  "eye_convergence",
-] as const satisfies readonly EyeAppearanceControlId[];
-
-export const EYE_APPEARANCE_SCLERA_FIT_CONTROL_IDS = [
-  "sclera_scale",
-  "sclera_tilt",
-  "sclera_horizontal_position",
-  "sclera_vertical_position",
-  "sclera_depth",
-] as const satisfies readonly EyeAppearanceControlId[];
-
-export type EyeAppearanceStateV1 = {
+export type EyeAppearanceStateV3 = {
   schemaVersion: typeof EYE_APPEARANCE_STATE_SCHEMA_VERSION;
   definitionSha256: string;
   irisSize: number;
   pupilSize: number;
-  eyeConvergence: number;
-  scleraFit: {
-    scale: number;
-    tilt: number;
-    horizontal: number;
-    vertical: number;
-    depth: number;
-  };
+  irisVerticalPosition: number;
 };
 
 export type EyeAppearanceControlDefinition = {
@@ -51,85 +27,85 @@ export type EyeAppearanceControlDefinition = {
   maximum: number;
   step: number;
   default: number;
-  runtimeNeutralOffset: number;
   unit:
     | "neutral-multiplier"
     | "iris-relative-multiplier"
-    | "post-fit-multiplier-offset"
-    | "degrees"
-    | "meters";
+    | "neutral-travel-fraction";
   linkedBilateral: true;
   perEyeOverridesAllowed: false;
   runtimeClampingAllowed: false;
   geometrySemantics: string;
 };
 
+export type EyeAppearanceDefinitionDependency = {
+  schemaVersion: "socket-eye-surface/v1" | "eye-aperture-seam/v1";
+  definitionSha256: string;
+};
+
 export type EyeAppearanceRuntimeSideBinding = {
-  eyeBone: string;
-  neutralPivotParent: [number, number, number];
-  assemblyNodes: {
-    sclera: string;
-    cornea: string;
-    iris: string;
-    pupil: string;
+  compositeCapNode: string;
+  irisNeutralRadiusMeters: number;
+  pupilNeutralRadiusRatio: number;
+  irisVerticalTravelMeters: number;
+  edgeSoftnessMeters: number;
+  artworkMappings: {
+    sclera: "gaze-linked-carrier";
+    iris: "radial-carrier";
+    pupil: "radial-carrier";
+    highlight: "iris-space";
   };
-  eyeHighlightMaterialNodes: [string, string];
-  horizontalAxisParent: [number, number, number];
-  verticalAxisParent: [number, number, number];
-  depthAxisParent: [number, number, number];
-  forwardAxisParent: [number, number, number];
-  tiltAxisParent: [number, number, number];
-  convergenceAxisParent: [number, number, number];
-  horizontalSign: -1 | 1;
-  tiltSign: -1 | 1;
-  convergenceSign: -1 | 1;
-  conformal: {
-    scleraNode: string;
-    irisNode: string;
-    pupilNode: string;
-    opticalAxisLocal: [number, number, number];
-    scleraRadiiLocal: [number, number, number];
-    irisCenterLocal: [number, number, number];
-    pupilCenterLocal: [number, number, number];
-    irisAuthoredOffset: number;
-    pupilAuthoredOffset: number;
+  cornea: {
+    roughness: number;
+    clearcoat: number;
+    clearcoatRoughness: number;
   };
 };
 
-export type EyeAppearanceDefinitionV1 = {
+export type EyeAppearanceDefinitionV3 = {
   schemaVersion: typeof EYE_APPEARANCE_SCHEMA_VERSION;
   stateSchemaVersion: typeof EYE_APPEARANCE_STATE_SCHEMA_VERSION;
-  status: string;
-  productExportApproved: false;
+  status: "product-export-approved";
+  productExportApproved: true;
   definitionSha256: string;
-  facialArtworkDependency: {
-    schemaVersion: "facial-artwork/v3";
-    definitionSha256: string;
+  dependencies: {
+    socketEyeSurface: EyeAppearanceDefinitionDependency & {
+      schemaVersion: "socket-eye-surface/v1";
+    };
+    eyeApertureSeam: EyeAppearanceDefinitionDependency & {
+      schemaVersion: "eye-aperture-seam/v1";
+    };
   };
   ownership: string;
   zeroLaw: string;
   symmetryLaw: string;
-  compositionOrder: string[];
-  completeEyeAssemblyNodes: string[];
+  compositionOrder: [
+    "sclera",
+    "scleraArtwork",
+    "iris",
+    "pupil",
+    "highlight",
+    "cornea",
+  ];
   solidColorDefaults: {
     iris: [number, number, number, number];
     pupil: [number, number, number, number];
     sclera: [number, number, number, number];
   };
   runtimeBindings: {
+    coordinateSpace: "socket-eye-surface";
     left: EyeAppearanceRuntimeSideBinding;
     right: EyeAppearanceRuntimeSideBinding;
-    coordinateSpace: string;
-    pivotBindingLaw: string;
-    inverseBindLaw: string;
-    conformalLaw: string;
     geometryEvidence: {
-      acceptedV4GlbSha256: string;
-      localizedFitMatrixSha256: string;
-      conformalSolverSha256: string;
+      acceptedGlbSha256: string;
+      socketSurfaceSha256: string;
+      apertureSeamSha256: string;
     };
   };
-  controls: EyeAppearanceControlDefinition[];
+  controls: [
+    EyeAppearanceControlDefinition,
+    EyeAppearanceControlDefinition,
+    EyeAppearanceControlDefinition,
+  ];
   rangeEvidence: {
     schemaVersion: string;
     sha256: string;
@@ -138,21 +114,30 @@ export type EyeAppearanceDefinitionV1 = {
 };
 
 export type EyeAppearanceReconciliation = {
-  state: EyeAppearanceStateV1 | null;
+  state: EyeAppearanceStateV3 | null;
   incompatible: boolean;
   reason?: string;
 };
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const CONTROL_ID_SET = new Set<string>(EYE_APPEARANCE_CONTROL_IDS);
+const COMPOSITION_ORDER = [
+  "sclera",
+  "scleraArtwork",
+  "iris",
+  "pupil",
+  "highlight",
+  "cornea",
+] as const;
 
 function fail(message: string): never {
-  throw new Error(`[eye-appearance/v1] ${message}`);
+  throw new Error(`[eye-appearance/v3] ${message}`);
 }
 
 function record(value: unknown, context: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value))
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
     fail(`${context} must be an object`);
+  }
   return value as Record<string, unknown>;
 }
 
@@ -163,8 +148,9 @@ function rejectUnknownKeys(
 ) {
   const accepted = new Set(allowed);
   const extra = Object.keys(value).filter((key) => !accepted.has(key));
-  if (extra.length > 0)
+  if (extra.length > 0) {
     fail(`${context} contains unsupported fields: ${extra.join(", ")}`);
+  }
 }
 
 function stringValue(value: unknown, context: string): string {
@@ -175,9 +161,22 @@ function stringValue(value: unknown, context: string): string {
 }
 
 function finite(value: unknown, context: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value))
+  if (typeof value !== "number" || !Number.isFinite(value)) {
     fail(`${context} must be finite`);
+  }
   return value;
+}
+
+function positive(value: unknown, context: string): number {
+  const parsed = finite(value, context);
+  if (parsed <= 0) fail(`${context} must be greater than zero`);
+  return parsed;
+}
+
+function unitInterval(value: unknown, context: string): number {
+  const parsed = finite(value, context);
+  if (parsed < 0 || parsed > 1) fail(`${context} must be inside [0, 1]`);
+  return parsed;
 }
 
 function hash(value: unknown, context: string): string {
@@ -186,36 +185,47 @@ function hash(value: unknown, context: string): string {
   return parsed;
 }
 
-function stringList(value: unknown, context: string): string[] {
-  if (!Array.isArray(value) || value.length === 0)
-    fail(`${context} must be a non-empty array`);
-  return value.map((entry, index) =>
-    stringValue(entry, `${context}[${index}]`),
-  );
-}
-
 function rgba(
   value: unknown,
   context: string,
 ): [number, number, number, number] {
-  if (!Array.isArray(value) || value.length !== 4)
+  if (!Array.isArray(value) || value.length !== 4) {
     fail(`${context} must contain four channels`);
-  return value.map((channel, index) => {
-    const parsed = finite(channel, `${context}[${index}]`);
-    if (parsed < 0 || parsed > 1)
-      fail(`${context}[${index}] must be inside [0, 1]`);
-    return parsed;
-  }) as [number, number, number, number];
+  }
+  return value.map((channel, index) =>
+    unitInterval(channel, `${context}[${index}]`),
+  ) as [number, number, number, number];
 }
 
-function vec3(value: unknown, context: string): [number, number, number] {
-  if (!Array.isArray(value) || value.length !== 3)
-    fail(`${context} must contain three numbers`);
-  return value.map((entry, index) => finite(entry, `${context}[${index}]`)) as [
-    number,
-    number,
-    number,
-  ];
+function parseDependency<
+  T extends "socket-eye-surface/v1" | "eye-aperture-seam/v1",
+>(value: unknown, schemaVersion: T, context: string) {
+  const source = record(value, context);
+  rejectUnknownKeys(source, ["schemaVersion", "definitionSha256"], context);
+  if (source.schemaVersion !== schemaVersion) {
+    fail(`${context}.schemaVersion must be ${schemaVersion}`);
+  }
+  return {
+    schemaVersion,
+    definitionSha256: hash(
+      source.definitionSha256,
+      `${context}.definitionSha256`,
+    ),
+  };
+}
+
+function parseCompositionOrder(
+  value: unknown,
+): EyeAppearanceDefinitionV3["compositionOrder"] {
+  if (!Array.isArray(value) || value.length !== COMPOSITION_ORDER.length) {
+    fail("definition.compositionOrder must declare all six material layers");
+  }
+  for (const [index, expected] of COMPOSITION_ORDER.entries()) {
+    if (value[index] !== expected) {
+      fail(`definition.compositionOrder[${index}] must be ${expected}`);
+    }
+  }
+  return [...COMPOSITION_ORDER];
 }
 
 function parseRuntimeSide(
@@ -226,184 +236,83 @@ function parseRuntimeSide(
   rejectUnknownKeys(
     source,
     [
-      "eyeBone",
-      "neutralPivotParent",
-      "assemblyNodes",
-      "eyeHighlightMaterialNodes",
-      "horizontalAxisParent",
-      "verticalAxisParent",
-      "depthAxisParent",
-      "forwardAxisParent",
-      "tiltAxisParent",
-      "convergenceAxisParent",
-      "horizontalSign",
-      "tiltSign",
-      "convergenceSign",
-      "conformal",
+      "compositeCapNode",
+      "irisNeutralRadiusMeters",
+      "pupilNeutralRadiusRatio",
+      "irisVerticalTravelMeters",
+      "edgeSoftnessMeters",
+      "artworkMappings",
+      "cornea",
     ],
     context,
   );
-  const assembly = record(source.assemblyNodes, `${context}.assemblyNodes`);
-  rejectUnknownKeys(
-    assembly,
-    ["sclera", "cornea", "iris", "pupil"],
-    `${context}.assemblyNodes`,
+  const artworkMappings = record(
+    source.artworkMappings,
+    `${context}.artworkMappings`,
   );
-  if (
-    !Array.isArray(source.eyeHighlightMaterialNodes) ||
-    source.eyeHighlightMaterialNodes.length !== 2
-  ) {
-    fail(
-      `${context}.eyeHighlightMaterialNodes must contain iris and pupil node names`,
-    );
+  rejectUnknownKeys(
+    artworkMappings,
+    ["sclera", "iris", "pupil", "highlight"],
+    `${context}.artworkMappings`,
+  );
+  const expectedMappings = {
+    sclera: "gaze-linked-carrier",
+    iris: "radial-carrier",
+    pupil: "radial-carrier",
+    highlight: "iris-space",
+  } as const;
+  for (const [key, expected] of Object.entries(expectedMappings)) {
+    if (artworkMappings[key] !== expected) {
+      fail(`${context}.artworkMappings.${key} must be ${expected}`);
+    }
   }
-  const conformal = record(source.conformal, `${context}.conformal`);
+  const cornea = record(source.cornea, `${context}.cornea`);
   rejectUnknownKeys(
-    conformal,
-    [
-      "opticalAxisLocal",
-      "scleraNode",
-      "irisNode",
-      "pupilNode",
-      "scleraRadiiLocal",
-      "irisCenterLocal",
-      "pupilCenterLocal",
-      "irisAuthoredOffset",
-      "pupilAuthoredOffset",
-    ],
-    `${context}.conformal`,
+    cornea,
+    ["roughness", "clearcoat", "clearcoatRoughness"],
+    `${context}.cornea`,
   );
-  const horizontalSign = finite(
-    source.horizontalSign,
-    `${context}.horizontalSign`,
+  const pupilNeutralRadiusRatio = positive(
+    source.pupilNeutralRadiusRatio,
+    `${context}.pupilNeutralRadiusRatio`,
   );
-  const tiltSign = finite(source.tiltSign, `${context}.tiltSign`);
-  const convergenceSign = finite(
-    source.convergenceSign,
-    `${context}.convergenceSign`,
+  if (pupilNeutralRadiusRatio >= 1) {
+    fail(`${context}.pupilNeutralRadiusRatio must stay below one`);
+  }
+  const irisNeutralRadiusMeters = positive(
+    source.irisNeutralRadiusMeters,
+    `${context}.irisNeutralRadiusMeters`,
   );
-  if (horizontalSign !== -1 && horizontalSign !== 1)
-    fail(`${context}.horizontalSign must be -1 or 1`);
-  if (tiltSign !== -1 && tiltSign !== 1)
-    fail(`${context}.tiltSign must be -1 or 1`);
-  if (convergenceSign !== -1 && convergenceSign !== 1)
-    fail(`${context}.convergenceSign must be -1 or 1`);
-  const result: EyeAppearanceRuntimeSideBinding = {
-    eyeBone: stringValue(source.eyeBone, `${context}.eyeBone`),
-    neutralPivotParent: vec3(
-      source.neutralPivotParent,
-      `${context}.neutralPivotParent`,
+  const irisVerticalTravelMeters = positive(
+    source.irisVerticalTravelMeters,
+    `${context}.irisVerticalTravelMeters`,
+  );
+  const edgeSoftnessMeters = positive(
+    source.edgeSoftnessMeters,
+    `${context}.edgeSoftnessMeters`,
+  );
+  if (edgeSoftnessMeters >= irisNeutralRadiusMeters * pupilNeutralRadiusRatio) {
+    fail(`${context}.edgeSoftnessMeters must stay below the neutral pupil radius`);
+  }
+  return {
+    compositeCapNode: stringValue(
+      source.compositeCapNode,
+      `${context}.compositeCapNode`,
     ),
-    assemblyNodes: {
-      sclera: stringValue(assembly.sclera, `${context}.assemblyNodes.sclera`),
-      cornea: stringValue(assembly.cornea, `${context}.assemblyNodes.cornea`),
-      iris: stringValue(assembly.iris, `${context}.assemblyNodes.iris`),
-      pupil: stringValue(assembly.pupil, `${context}.assemblyNodes.pupil`),
-    },
-    eyeHighlightMaterialNodes: source.eyeHighlightMaterialNodes.map(
-      (entry, index) =>
-        stringValue(entry, `${context}.eyeHighlightMaterialNodes[${index}]`),
-    ) as [string, string],
-    horizontalAxisParent: vec3(
-      source.horizontalAxisParent,
-      `${context}.horizontalAxisParent`,
-    ),
-    verticalAxisParent: vec3(
-      source.verticalAxisParent,
-      `${context}.verticalAxisParent`,
-    ),
-    depthAxisParent: vec3(source.depthAxisParent, `${context}.depthAxisParent`),
-    forwardAxisParent: vec3(
-      source.forwardAxisParent,
-      `${context}.forwardAxisParent`,
-    ),
-    tiltAxisParent: vec3(source.tiltAxisParent, `${context}.tiltAxisParent`),
-    convergenceAxisParent: vec3(
-      source.convergenceAxisParent,
-      `${context}.convergenceAxisParent`,
-    ),
-    horizontalSign: horizontalSign as -1 | 1,
-    tiltSign: tiltSign as -1 | 1,
-    convergenceSign: convergenceSign as -1 | 1,
-    conformal: {
-      scleraNode: stringValue(
-        conformal.scleraNode,
-        `${context}.conformal.scleraNode`,
-      ),
-      irisNode: stringValue(
-        conformal.irisNode,
-        `${context}.conformal.irisNode`,
-      ),
-      pupilNode: stringValue(
-        conformal.pupilNode,
-        `${context}.conformal.pupilNode`,
-      ),
-      opticalAxisLocal: vec3(
-        conformal.opticalAxisLocal,
-        `${context}.conformal.opticalAxisLocal`,
-      ),
-      scleraRadiiLocal: vec3(
-        conformal.scleraRadiiLocal,
-        `${context}.conformal.scleraRadiiLocal`,
-      ),
-      irisCenterLocal: vec3(
-        conformal.irisCenterLocal,
-        `${context}.conformal.irisCenterLocal`,
-      ),
-      pupilCenterLocal: vec3(
-        conformal.pupilCenterLocal,
-        `${context}.conformal.pupilCenterLocal`,
-      ),
-      irisAuthoredOffset: finite(
-        conformal.irisAuthoredOffset,
-        `${context}.conformal.irisAuthoredOffset`,
-      ),
-      pupilAuthoredOffset: finite(
-        conformal.pupilAuthoredOffset,
-        `${context}.conformal.pupilAuthoredOffset`,
+    irisNeutralRadiusMeters,
+    pupilNeutralRadiusRatio,
+    irisVerticalTravelMeters,
+    edgeSoftnessMeters,
+    artworkMappings: expectedMappings,
+    cornea: {
+      roughness: unitInterval(cornea.roughness, `${context}.cornea.roughness`),
+      clearcoat: unitInterval(cornea.clearcoat, `${context}.cornea.clearcoat`),
+      clearcoatRoughness: unitInterval(
+        cornea.clearcoatRoughness,
+        `${context}.cornea.clearcoatRoughness`,
       ),
     },
   };
-  const expectedHighlights = new Set([
-    result.assemblyNodes.iris,
-    result.assemblyNodes.pupil,
-  ]);
-  if (
-    new Set(result.eyeHighlightMaterialNodes).size !== 2 ||
-    result.eyeHighlightMaterialNodes.some(
-      (node) => !expectedHighlights.has(node),
-    )
-  ) {
-    fail(
-      `${context}.eyeHighlightMaterialNodes must exactly reference the iris and pupil assembly nodes`,
-    );
-  }
-  if (
-    result.conformal.scleraNode !== result.assemblyNodes.sclera ||
-    result.conformal.irisNode !== result.assemblyNodes.iris ||
-    result.conformal.pupilNode !== result.assemblyNodes.pupil
-  ) {
-    fail(
-      `${context}.conformal node bindings must match the complete-eye assembly`,
-    );
-  }
-  if (result.conformal.scleraRadiiLocal.some((radius) => radius <= 0)) {
-    fail(`${context}.conformal.scleraRadiiLocal must be positive`);
-  }
-  for (const [field, axis] of [
-    ["horizontalAxisParent", result.horizontalAxisParent],
-    ["verticalAxisParent", result.verticalAxisParent],
-    ["depthAxisParent", result.depthAxisParent],
-    ["forwardAxisParent", result.forwardAxisParent],
-    ["tiltAxisParent", result.tiltAxisParent],
-    ["convergenceAxisParent", result.convergenceAxisParent],
-    ["opticalAxisLocal", result.conformal.opticalAxisLocal],
-  ] as const) {
-    const length = Math.hypot(...axis);
-    if (Math.abs(length - 1) > 1e-5)
-      fail(`${context}.${field} must be a unit vector`);
-  }
-  return result;
 }
 
 function isOnStepLattice(
@@ -420,7 +329,7 @@ function parseControl(
   value: unknown,
   expectedId: EyeAppearanceControlId,
   context: string,
-) {
+): EyeAppearanceControlDefinition {
   const source = record(value, context);
   rejectUnknownKeys(
     source,
@@ -432,7 +341,6 @@ function parseControl(
       "maximum",
       "step",
       "default",
-      "runtimeNeutralOffset",
       "unit",
       "linkedBilateral",
       "perEyeOverridesAllowed",
@@ -442,43 +350,41 @@ function parseControl(
     context,
   );
   const id = stringValue(source.id, `${context}.id`);
-  if (id !== expectedId || !CONTROL_ID_SET.has(id))
+  if (id !== expectedId || !CONTROL_ID_SET.has(id)) {
     fail(`${context}.id must be ${expectedId}`);
+  }
   const minimum = finite(source.minimum, `${context}.minimum`);
   const maximum = finite(source.maximum, `${context}.maximum`);
   const step = finite(source.step, `${context}.step`);
   const defaultValue = finite(source.default, `${context}.default`);
-  const runtimeNeutralOffset = finite(
-    source.runtimeNeutralOffset,
-    `${context}.runtimeNeutralOffset`,
-  );
   if (minimum >= maximum) fail(`${context} minimum must be less than maximum`);
   if (step <= 0) fail(`${context}.step must be positive`);
-  if (defaultValue < minimum || defaultValue > maximum)
+  if (defaultValue < minimum || defaultValue > maximum) {
     fail(`${context}.default must be inside its bounds`);
+  }
   if (!isOnStepLattice(maximum, minimum, step)) {
     fail(`${context}.maximum must be reachable from minimum by whole steps`);
   }
   if (!isOnStepLattice(defaultValue, minimum, step)) {
     fail(`${context}.default must be reachable from minimum by whole steps`);
   }
-  if (source.linkedBilateral !== true)
+  if (source.linkedBilateral !== true) {
     fail(`${context}.linkedBilateral must be true`);
-  if (source.perEyeOverridesAllowed !== false)
+  }
+  if (source.perEyeOverridesAllowed !== false) {
     fail(`${context}.perEyeOverridesAllowed must be false`);
-  if (source.runtimeClampingAllowed !== false)
+  }
+  if (source.runtimeClampingAllowed !== false) {
     fail(`${context}.runtimeClampingAllowed must be false`);
-  const unit = stringValue(source.unit, `${context}.unit`);
-  if (
-    ![
-      "neutral-multiplier",
-      "iris-relative-multiplier",
-      "post-fit-multiplier-offset",
-      "degrees",
-      "meters",
-    ].includes(unit)
-  ) {
-    fail(`${context}.unit is unsupported`);
+  }
+  const expectedUnit =
+    expectedId === "iris_size"
+      ? "neutral-multiplier"
+      : expectedId === "pupil_size"
+        ? "iris-relative-multiplier"
+        : "neutral-travel-fraction";
+  if (source.unit !== expectedUnit) {
+    fail(`${context}.unit must be ${expectedUnit}`);
   }
   return {
     id: expectedId,
@@ -488,8 +394,7 @@ function parseControl(
     maximum,
     step,
     default: defaultValue,
-    runtimeNeutralOffset,
-    unit: unit as EyeAppearanceControlDefinition["unit"],
+    unit: expectedUnit,
     linkedBilateral: true,
     perEyeOverridesAllowed: false,
     runtimeClampingAllowed: false,
@@ -497,12 +402,12 @@ function parseControl(
       source.geometrySemantics,
       `${context}.geometrySemantics`,
     ),
-  } satisfies EyeAppearanceControlDefinition;
+  };
 }
 
 export function parseEyeAppearanceDefinition(
   value: unknown,
-): EyeAppearanceDefinitionV1 {
+): EyeAppearanceDefinitionV3 {
   const source = record(value, "definition");
   rejectUnknownKeys(
     source,
@@ -512,12 +417,11 @@ export function parseEyeAppearanceDefinition(
       "status",
       "productExportApproved",
       "definitionSha256",
-      "facialArtworkDependency",
+      "dependencies",
       "ownership",
       "zeroLaw",
       "symmetryLaw",
       "compositionOrder",
-      "completeEyeAssemblyNodes",
       "solidColorDefaults",
       "runtimeBindings",
       "controls",
@@ -525,26 +429,27 @@ export function parseEyeAppearanceDefinition(
     ],
     "definition",
   );
-  if (source.schemaVersion !== EYE_APPEARANCE_SCHEMA_VERSION)
-    fail("definition schemaVersion is unsupported");
-  if (source.stateSchemaVersion !== EYE_APPEARANCE_STATE_SCHEMA_VERSION) {
-    fail("definition stateSchemaVersion is unsupported");
+  if (source.schemaVersion !== EYE_APPEARANCE_SCHEMA_VERSION) {
+    fail(`definition.schemaVersion must be ${EYE_APPEARANCE_SCHEMA_VERSION}`);
   }
-  if (source.productExportApproved !== false)
-    fail("definition productExportApproved must remain false");
+  if (source.stateSchemaVersion !== EYE_APPEARANCE_STATE_SCHEMA_VERSION) {
+    fail(
+      `definition.stateSchemaVersion must be ${EYE_APPEARANCE_STATE_SCHEMA_VERSION}`,
+    );
+  }
+  if (source.status !== "product-export-approved") {
+    fail("definition.status must be product-export-approved");
+  }
+  if (source.productExportApproved !== true) {
+    fail("definition.productExportApproved must be true");
+  }
 
-  const dependency = record(
-    source.facialArtworkDependency,
-    "definition.facialArtworkDependency",
-  );
+  const dependencies = record(source.dependencies, "definition.dependencies");
   rejectUnknownKeys(
-    dependency,
-    ["schemaVersion", "definitionSha256"],
-    "definition.facialArtworkDependency",
+    dependencies,
+    ["socketEyeSurface", "eyeApertureSeam"],
+    "definition.dependencies",
   );
-  if (dependency.schemaVersion !== "facial-artwork/v3")
-    fail("definition dependency must target facial-artwork/v3");
-
   const colors = record(
     source.solidColorDefaults,
     "definition.solidColorDefaults",
@@ -554,51 +459,40 @@ export function parseEyeAppearanceDefinition(
     ["iris", "pupil", "sclera"],
     "definition.solidColorDefaults",
   );
-
   const runtimeBindings = record(
     source.runtimeBindings,
     "definition.runtimeBindings",
   );
   rejectUnknownKeys(
     runtimeBindings,
-    [
-      "coordinateSpace",
-      "pivotBindingLaw",
-      "inverseBindLaw",
-      "conformalLaw",
-      "geometryEvidence",
-      "left",
-      "right",
-    ],
+    ["coordinateSpace", "left", "right", "geometryEvidence"],
     "definition.runtimeBindings",
   );
+  if (runtimeBindings.coordinateSpace !== "socket-eye-surface") {
+    fail("definition.runtimeBindings.coordinateSpace must be socket-eye-surface");
+  }
   const geometryEvidence = record(
     runtimeBindings.geometryEvidence,
     "definition.runtimeBindings.geometryEvidence",
   );
   rejectUnknownKeys(
     geometryEvidence,
-    [
-      "acceptedV4GlbSha256",
-      "localizedFitMatrixSha256",
-      "conformalSolverSha256",
-    ],
+    ["acceptedGlbSha256", "socketSurfaceSha256", "apertureSeamSha256"],
     "definition.runtimeBindings.geometryEvidence",
   );
-
-  if (
-    !Array.isArray(source.controls) ||
-    source.controls.length !== EYE_APPEARANCE_CONTROL_IDS.length
-  ) {
+  if (!Array.isArray(source.controls) || source.controls.length !== 3) {
     fail(
-      `definition.controls must contain exactly ${EYE_APPEARANCE_CONTROL_IDS.length} controls`,
+      "definition.controls must contain exactly Iris Size, Pupil Size, and Iris Vertical Position",
     );
   }
-  const controlSources = source.controls as unknown[];
+  const controlSources = source.controls;
   const controls = EYE_APPEARANCE_CONTROL_IDS.map((id, index) =>
     parseControl(controlSources[index], id, `definition.controls[${index}]`),
-  );
-
+  ) as [
+    EyeAppearanceControlDefinition,
+    EyeAppearanceControlDefinition,
+    EyeAppearanceControlDefinition,
+  ];
   const rangeEvidence = record(
     source.rangeEvidence,
     "definition.rangeEvidence",
@@ -608,76 +502,63 @@ export function parseEyeAppearanceDefinition(
     ["schemaVersion", "sha256", "canonicalSha256"],
     "definition.rangeEvidence",
   );
-
+  const left = parseRuntimeSide(
+    runtimeBindings.left,
+    "definition.runtimeBindings.left",
+  );
+  const right = parseRuntimeSide(
+    runtimeBindings.right,
+    "definition.runtimeBindings.right",
+  );
+  if (left.compositeCapNode === right.compositeCapNode) {
+    fail("definition runtime composite-cap nodes must be unique per side");
+  }
   return {
     schemaVersion: EYE_APPEARANCE_SCHEMA_VERSION,
     stateSchemaVersion: EYE_APPEARANCE_STATE_SCHEMA_VERSION,
-    status: stringValue(source.status, "definition.status"),
-    productExportApproved: false,
+    status: "product-export-approved",
+    productExportApproved: true,
     definitionSha256: hash(
       source.definitionSha256,
       "definition.definitionSha256",
     ),
-    facialArtworkDependency: {
-      schemaVersion: "facial-artwork/v3",
-      definitionSha256: hash(
-        dependency.definitionSha256,
-        "definition.facialArtworkDependency.definitionSha256",
+    dependencies: {
+      socketEyeSurface: parseDependency(
+        dependencies.socketEyeSurface,
+        "socket-eye-surface/v1",
+        "definition.dependencies.socketEyeSurface",
+      ),
+      eyeApertureSeam: parseDependency(
+        dependencies.eyeApertureSeam,
+        "eye-aperture-seam/v1",
+        "definition.dependencies.eyeApertureSeam",
       ),
     },
     ownership: stringValue(source.ownership, "definition.ownership"),
     zeroLaw: stringValue(source.zeroLaw, "definition.zeroLaw"),
     symmetryLaw: stringValue(source.symmetryLaw, "definition.symmetryLaw"),
-    compositionOrder: stringList(
-      source.compositionOrder,
-      "definition.compositionOrder",
-    ),
-    completeEyeAssemblyNodes: stringList(
-      source.completeEyeAssemblyNodes,
-      "definition.completeEyeAssemblyNodes",
-    ),
+    compositionOrder: parseCompositionOrder(source.compositionOrder),
     solidColorDefaults: {
       iris: rgba(colors.iris, "definition.solidColorDefaults.iris"),
       pupil: rgba(colors.pupil, "definition.solidColorDefaults.pupil"),
       sclera: rgba(colors.sclera, "definition.solidColorDefaults.sclera"),
     },
     runtimeBindings: {
-      left: parseRuntimeSide(
-        runtimeBindings.left,
-        "definition.runtimeBindings.left",
-      ),
-      right: parseRuntimeSide(
-        runtimeBindings.right,
-        "definition.runtimeBindings.right",
-      ),
-      coordinateSpace: stringValue(
-        runtimeBindings.coordinateSpace,
-        "definition.runtimeBindings.coordinateSpace",
-      ),
-      pivotBindingLaw: stringValue(
-        runtimeBindings.pivotBindingLaw,
-        "definition.runtimeBindings.pivotBindingLaw",
-      ),
-      inverseBindLaw: stringValue(
-        runtimeBindings.inverseBindLaw,
-        "definition.runtimeBindings.inverseBindLaw",
-      ),
-      conformalLaw: stringValue(
-        runtimeBindings.conformalLaw,
-        "definition.runtimeBindings.conformalLaw",
-      ),
+      coordinateSpace: "socket-eye-surface",
+      left,
+      right,
       geometryEvidence: {
-        acceptedV4GlbSha256: hash(
-          geometryEvidence.acceptedV4GlbSha256,
-          "definition.runtimeBindings.geometryEvidence.acceptedV4GlbSha256",
+        acceptedGlbSha256: hash(
+          geometryEvidence.acceptedGlbSha256,
+          "definition.runtimeBindings.geometryEvidence.acceptedGlbSha256",
         ),
-        localizedFitMatrixSha256: hash(
-          geometryEvidence.localizedFitMatrixSha256,
-          "definition.runtimeBindings.geometryEvidence.localizedFitMatrixSha256",
+        socketSurfaceSha256: hash(
+          geometryEvidence.socketSurfaceSha256,
+          "definition.runtimeBindings.geometryEvidence.socketSurfaceSha256",
         ),
-        conformalSolverSha256: hash(
-          geometryEvidence.conformalSolverSha256,
-          "definition.runtimeBindings.geometryEvidence.conformalSolverSha256",
+        apertureSeamSha256: hash(
+          geometryEvidence.apertureSeamSha256,
+          "definition.runtimeBindings.geometryEvidence.apertureSeamSha256",
         ),
       },
     },
@@ -697,7 +578,7 @@ export function parseEyeAppearanceDefinition(
 }
 
 function control(
-  definition: EyeAppearanceDefinitionV1,
+  definition: EyeAppearanceDefinitionV3,
   id: EyeAppearanceControlId,
 ) {
   const found = definition.controls.find((entry) => entry.id === id);
@@ -706,16 +587,20 @@ function control(
 }
 
 export function resolveEyeAppearanceRuntimeControlValue(
-  definition: EyeAppearanceDefinitionV1,
+  definition: EyeAppearanceDefinitionV3,
   id: EyeAppearanceControlId,
   logicalValue: number,
 ) {
-  const value = finite(logicalValue, `${id} logical value`);
-  return value + control(definition, id).runtimeNeutralOffset;
+  const parsed = finite(logicalValue, `${id} logical value`);
+  const bounds = control(definition, id);
+  if (parsed < bounds.minimum || parsed > bounds.maximum) {
+    fail(`${id} logical value must be inside [${bounds.minimum}, ${bounds.maximum}]`);
+  }
+  return parsed;
 }
 
 function bounded(
-  definition: EyeAppearanceDefinitionV1,
+  definition: EyeAppearanceDefinitionV3,
   id: EyeAppearanceControlId,
   value: unknown,
   context: string,
@@ -729,28 +614,24 @@ function bounded(
 }
 
 export function createDefaultEyeAppearanceState(
-  definition: EyeAppearanceDefinitionV1,
-): EyeAppearanceStateV1 {
+  definition: EyeAppearanceDefinitionV3,
+): EyeAppearanceStateV3 {
   return {
     schemaVersion: EYE_APPEARANCE_STATE_SCHEMA_VERSION,
     definitionSha256: definition.definitionSha256,
     irisSize: control(definition, "iris_size").default,
     pupilSize: control(definition, "pupil_size").default,
-    eyeConvergence: control(definition, "eye_convergence").default,
-    scleraFit: {
-      scale: control(definition, "sclera_scale").default,
-      tilt: control(definition, "sclera_tilt").default,
-      horizontal: control(definition, "sclera_horizontal_position").default,
-      vertical: control(definition, "sclera_vertical_position").default,
-      depth: control(definition, "sclera_depth").default,
-    },
+    irisVerticalPosition: control(
+      definition,
+      "iris_vertical_position",
+    ).default,
   };
 }
 
 export function parseEyeAppearanceState(
-  definition: EyeAppearanceDefinitionV1,
+  definition: EyeAppearanceDefinitionV3,
   value: unknown,
-): EyeAppearanceStateV1 {
+): EyeAppearanceStateV3 {
   const source = record(value, "state");
   rejectUnknownKeys(
     source,
@@ -759,21 +640,16 @@ export function parseEyeAppearanceState(
       "definitionSha256",
       "irisSize",
       "pupilSize",
-      "eyeConvergence",
-      "scleraFit",
+      "irisVerticalPosition",
     ],
     "state",
   );
-  if (source.schemaVersion !== EYE_APPEARANCE_STATE_SCHEMA_VERSION)
-    fail("state schemaVersion is unsupported");
-  if (source.definitionSha256 !== definition.definitionSha256)
-    fail("state definitionSha256 does not match this package");
-  const fit = record(source.scleraFit, "state.scleraFit");
-  rejectUnknownKeys(
-    fit,
-    ["scale", "tilt", "horizontal", "vertical", "depth"],
-    "state.scleraFit",
-  );
+  if (source.schemaVersion !== EYE_APPEARANCE_STATE_SCHEMA_VERSION) {
+    fail(`state.schemaVersion must be ${EYE_APPEARANCE_STATE_SCHEMA_VERSION}`);
+  }
+  if (source.definitionSha256 !== definition.definitionSha256) {
+    fail("state.definitionSha256 does not match this package");
+  }
   return {
     schemaVersion: EYE_APPEARANCE_STATE_SCHEMA_VERSION,
     definitionSha256: definition.definitionSha256,
@@ -789,50 +665,18 @@ export function parseEyeAppearanceState(
       source.pupilSize,
       "state.pupilSize",
     ),
-    eyeConvergence: bounded(
+    irisVerticalPosition: bounded(
       definition,
-      "eye_convergence",
-      source.eyeConvergence,
-      "state.eyeConvergence",
+      "iris_vertical_position",
+      source.irisVerticalPosition,
+      "state.irisVerticalPosition",
     ),
-    scleraFit: {
-      scale: bounded(
-        definition,
-        "sclera_scale",
-        fit.scale,
-        "state.scleraFit.scale",
-      ),
-      tilt: bounded(
-        definition,
-        "sclera_tilt",
-        fit.tilt,
-        "state.scleraFit.tilt",
-      ),
-      horizontal: bounded(
-        definition,
-        "sclera_horizontal_position",
-        fit.horizontal,
-        "state.scleraFit.horizontal",
-      ),
-      vertical: bounded(
-        definition,
-        "sclera_vertical_position",
-        fit.vertical,
-        "state.scleraFit.vertical",
-      ),
-      depth: bounded(
-        definition,
-        "sclera_depth",
-        fit.depth,
-        "state.scleraFit.depth",
-      ),
-    },
   };
 }
 
 export function resolveEyeAppearanceState(
-  definition: EyeAppearanceDefinitionV1,
-  value: EyeAppearanceStateV1 | null | undefined,
+  definition: EyeAppearanceDefinitionV3,
+  value: EyeAppearanceStateV3 | null | undefined,
 ) {
   return value
     ? parseEyeAppearanceState(definition, value)
@@ -840,7 +684,7 @@ export function resolveEyeAppearanceState(
 }
 
 export function reconcileEyeAppearanceState(
-  definition: EyeAppearanceDefinitionV1,
+  definition: EyeAppearanceDefinitionV3,
   value: unknown,
 ): EyeAppearanceReconciliation {
   if (value == null) return { state: null, incompatible: false };
@@ -862,66 +706,22 @@ export function reconcileEyeAppearanceState(
 }
 
 export function readEyeAppearanceControl(
-  state: EyeAppearanceStateV1,
+  state: EyeAppearanceStateV3,
   id: EyeAppearanceControlId,
 ) {
-  switch (id) {
-    case "iris_size":
-      return state.irisSize;
-    case "pupil_size":
-      return state.pupilSize;
-    case "eye_convergence":
-      return state.eyeConvergence;
-    case "sclera_scale":
-      return state.scleraFit.scale;
-    case "sclera_tilt":
-      return state.scleraFit.tilt;
-    case "sclera_horizontal_position":
-      return state.scleraFit.horizontal;
-    case "sclera_vertical_position":
-      return state.scleraFit.vertical;
-    case "sclera_depth":
-      return state.scleraFit.depth;
-  }
+  if (id === "iris_size") return state.irisSize;
+  if (id === "pupil_size") return state.pupilSize;
+  return state.irisVerticalPosition;
 }
 
 export function updateEyeAppearanceControl(
-  state: EyeAppearanceStateV1,
+  state: EyeAppearanceStateV3,
   id: EyeAppearanceControlId,
   value: number,
-): EyeAppearanceStateV1 {
-  // Mounted Svelte editors pass a $state proxy here. Safari/WKWebView rejects
-  // that proxy in structuredClone(), so copy this scalar domain state
-  // explicitly and keep the helper independent from Svelte internals.
-  const next: EyeAppearanceStateV1 = {
-    ...state,
-    scleraFit: { ...state.scleraFit },
-  };
-  switch (id) {
-    case "iris_size":
-      next.irisSize = value;
-      break;
-    case "pupil_size":
-      next.pupilSize = value;
-      break;
-    case "eye_convergence":
-      next.eyeConvergence = value;
-      break;
-    case "sclera_scale":
-      next.scleraFit.scale = value;
-      break;
-    case "sclera_tilt":
-      next.scleraFit.tilt = value;
-      break;
-    case "sclera_horizontal_position":
-      next.scleraFit.horizontal = value;
-      break;
-    case "sclera_vertical_position":
-      next.scleraFit.vertical = value;
-      break;
-    case "sclera_depth":
-      next.scleraFit.depth = value;
-      break;
-  }
+): EyeAppearanceStateV3 {
+  const next: EyeAppearanceStateV3 = { ...state };
+  if (id === "iris_size") next.irisSize = value;
+  else if (id === "pupil_size") next.pupilSize = value;
+  else next.irisVerticalPosition = value;
   return next;
 }

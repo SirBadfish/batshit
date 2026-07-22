@@ -47,7 +47,7 @@ export interface VoiceTtsNarrationSettings {
 }
 
 export type GoonLipSyncMode = 'amplitude' | 'viseme'
-export type GoonLipSyncPremiumAnalyzerId = 'rhubarb-wasm'
+export type GoonLipSyncPremiumAnalyzerId = 'rhubarb-wasm' | 'audio2face-3d'
 
 export interface GoonLipSyncSettings {
   mode?: GoonLipSyncMode

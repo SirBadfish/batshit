@@ -253,6 +253,11 @@ export type RecipeMigrationReport = {
   proof: RecipeMigrationReportProof;
 };
 
+export type RecipeMigrationReportExpectation = {
+  classifications: Readonly<Record<string, RecipeMigrationClassification>>;
+  status: RecipeMigrationReportStatus;
+};
+
 export type RecipeUpdateJobFailure = {
   stage: RecipeUpdateFailureStage;
   code: string;
@@ -1153,7 +1158,7 @@ function parseReportEntry(
       oldValue !== null ||
       proposedValue !== 0 ||
       proofStatus !== "not-required" ||
-      requiresConfirmation
+      requiresPreview !== requiresConfirmation
     ) {
       throw new Error(
         `migration report entry ${id} has invalid new-control state`,
@@ -1164,8 +1169,8 @@ function parseReportEntry(
       oldValue === null ||
       proposedValue !== null ||
       proofStatus !== "not-required" ||
-      requiresPreview !== (oldValue !== 0) ||
-      requiresConfirmation !== (oldValue !== 0)
+      requiresPreview !== requiresConfirmation ||
+      (oldValue !== 0 && !requiresPreview)
     ) {
       throw new Error(`migration report entry ${id} has invalid removal state`);
     }
@@ -1273,6 +1278,7 @@ const EXPECTED_CLASSIFICATION: Record<
 export function parseRecipeMigrationReport(
   value: unknown,
   expectedEdge: RecipeUpdateEdge,
+  expectation?: RecipeMigrationReportExpectation,
 ): RecipeMigrationReport {
   canonicalRecipeString(value);
   canonicalRecipeString(expectedEdge);
@@ -1342,11 +1348,21 @@ export function parseRecipeMigrationReport(
   if (!sameSet(entryIds, [...controlsById.keys()])) {
     throw new Error("recipe migration report is not exhaustive");
   }
+  const expectedClassifications = expectation?.classifications ??
+    Object.fromEntries(
+      validatedEdge.controls.map((control) => [
+        control.id,
+        EXPECTED_CLASSIFICATION[control.action],
+      ]),
+    );
+  if (!sameSet(Object.keys(expectedClassifications), [...controlsById.keys()])) {
+    throw new Error("recipe migration report expectations are not exhaustive");
+  }
   for (const entry of entries) {
     const control = controlsById.get(entry.id);
     if (
       !control ||
-      entry.classification !== EXPECTED_CLASSIFICATION[control.action] ||
+      entry.classification !== expectedClassifications[entry.id] ||
       entry.componentId !== control.componentId
     ) {
       throw new Error(
@@ -1365,15 +1381,14 @@ export function parseRecipeMigrationReport(
   }
 
   const status = requireEnum(raw.status, REPORT_STATUSES, context + ".status");
-  const expectedStatus: RecipeMigrationReportStatus = entries.some(
-    (entry) => entry.classification === "blocked",
-  )
-    ? "blocked"
-    : entries.some(
-          (entry) => entry.requiresPreview || entry.requiresConfirmation,
-        ) || warnings.length > 0
-      ? "preview-required"
-      : "preserved";
+  const expectedStatus: RecipeMigrationReportStatus = expectation?.status ??
+    (entries.some((entry) => entry.classification === "blocked")
+      ? "blocked"
+      : entries.some(
+            (entry) => entry.requiresPreview || entry.requiresConfirmation,
+          ) || warnings.length > 0
+        ? "preview-required"
+        : "preserved");
   if (status !== expectedStatus) {
     throw new Error("recipe migration report status contradicts its entries");
   }
@@ -1726,18 +1741,24 @@ function recipeMigrationReportHashContent(report: RecipeMigrationReport): Omit<
 export async function recipeMigrationReportSha256(
   value: unknown,
   expectedEdge: RecipeUpdateEdge,
+  expectation?: RecipeMigrationReportExpectation,
 ): Promise<string> {
-  const report = parseRecipeMigrationReport(value, expectedEdge);
+  const report = parseRecipeMigrationReport(value, expectedEdge, expectation);
   return canonicalRecipeSha256(recipeMigrationReportHashContent(report));
 }
 
 export async function verifyRecipeMigrationReport(
   value: unknown,
   expectedEdge: RecipeUpdateEdge,
+  expectation?: RecipeMigrationReportExpectation,
 ): Promise<RecipeMigrationReport> {
   const verifiedEdge = await verifyRecipeUpdateEdge(expectedEdge);
-  const report = parseRecipeMigrationReport(value, verifiedEdge);
-  const actual = await recipeMigrationReportSha256(report, verifiedEdge);
+  const report = parseRecipeMigrationReport(value, verifiedEdge, expectation);
+  const actual = await recipeMigrationReportSha256(
+    report,
+    verifiedEdge,
+    expectation,
+  );
   if (actual !== report.proof.reportSha256) {
     throw new Error(
       `recipe migration report hash mismatch: expected ${report.proof.reportSha256}, got ${actual}`,

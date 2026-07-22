@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const sharp = require('sharp');
 const zlib = require('zlib');
@@ -11,7 +12,7 @@ const {
 const ROOT = path.resolve(__dirname, '../../../../..');
 const CONTRACT = require(path.join(
   ROOT,
-  'batshit-app/static/goons/facial-artwork/v3/facial-artwork-v3.json'
+  'batshit-app/static/goons/facial-artwork/v4/facial-artwork-v4.json'
 ));
 const TEMPLATE = CONTRACT.templates.find((item) => item.id === 'brow-canvas');
 const LASHES_TEMPLATE = CONTRACT.templates.find(
@@ -165,11 +166,55 @@ describe('facialArtworkValidator', () => {
     expect(chunkTypes(prepared.buffer)).not.toContain('iCCP');
   });
 
-  test('rejects stale definitions and wrong template identity', async () => {
+  test('accepts a package-specific definition when its trusted template identity is exact', async () => {
+    const buffer = await createPaintedTemplateFixture(TEMPLATE);
+    const packageDefinitionSha256 = 'f'.repeat(64);
+    const prepared = await prepareFacialArtworkUpload(
+      input(buffer, { definitionSha256: packageDefinitionSha256 })
+    );
+    expect(prepared.artwork.definitionSha256).toBe(packageDefinitionSha256);
+  });
+
+  test('reloads the trusted definition when its file changes without a server restart', async () => {
+    const temporaryParent = fs.mkdtempSync(path.join(os.tmpdir(), 'batshit-facial-artwork-'));
+    const temporaryRoot = path.join(temporaryParent, 'v4');
+    const sourceRoot = path.join(
+      ROOT,
+      'batshit-app/static/goons/facial-artwork/v4'
+    );
+    const previousRoot = process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT;
+    fs.cpSync(sourceRoot, temporaryRoot, { recursive: true });
+    process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT = temporaryRoot;
+    clearFacialArtworkContractCacheForTests();
+
+    try {
+      const buffer = await createPaintedTemplateFixture(TEMPLATE);
+      await expect(prepareFacialArtworkUpload(input(buffer))).resolves.toBeTruthy();
+
+      const contractPath = path.join(temporaryRoot, 'facial-artwork-v4.json');
+      const changedContract = JSON.parse(fs.readFileSync(contractPath, 'utf8'));
+      changedContract.templates.find((item) => item.id === TEMPLATE.id).version = 'cache-reloaded';
+      fs.writeFileSync(contractPath, `${JSON.stringify(changedContract, null, 2)}\n`);
+
+      await expect(prepareFacialArtworkUpload(input(buffer))).rejects.toThrow(
+        /template identity/
+      );
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT;
+      } else {
+        process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT = previousRoot;
+      }
+      clearFacialArtworkContractCacheForTests();
+      fs.rmSync(temporaryParent, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects malformed definition ownership and wrong template identity', async () => {
     const buffer = await createPaintedTemplateFixture(TEMPLATE);
     await expect(
-      prepareFacialArtworkUpload(input(buffer, { definitionSha256: 'f'.repeat(64) }))
-    ).rejects.toThrow(/does not match the current template definition/);
+      prepareFacialArtworkUpload(input(buffer, { definitionSha256: 'not-a-sha256' }))
+    ).rejects.toThrow(/must be a lowercase SHA-256 hash/);
     await expect(
       prepareFacialArtworkUpload(input(buffer, { guideSha256: 'e'.repeat(64) }))
     ).rejects.toThrow(/template identity/);

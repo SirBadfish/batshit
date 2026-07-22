@@ -19,6 +19,7 @@ import {
   GOON_RECIPE_STATE_CONTRACT,
   recipeStateSnapshotSha256,
   type RecipeSource,
+  type RecipeSiblingStateRecord,
   type RecipeStateSnapshot,
 } from "../recipeContracts";
 import { deriveRecipeSourceProjectionHashes } from "../sourcePackageProjections";
@@ -31,6 +32,7 @@ import {
   type RecipeControlIdentity,
   type RecipeControlUpdatePlan,
   type RecipeSiblingSurface,
+  type RecipeSiblingSubplan,
   type RecipeUpdateEdge,
 } from "../updateContracts";
 
@@ -63,12 +65,27 @@ export type RecipePhysicalMigrationFixture = {
   siblingInputs: Record<
     RecipeSiblingSurface,
     {
-      sourceStateId: null;
-      targetStateId: null;
-      targetDefinition: null;
+      sourceStateId: string | null;
+      targetStateId: string | null;
+      targetDefinition: {
+        contract: string;
+        definitionSha256: string;
+      } | null;
     }
   >;
   fixtureSha256: string;
+};
+
+export type RecipePhysicalMigrationFixtureOptions = {
+  siblingSubplans?: RecipeSiblingSubplan[];
+  sourceSiblings?: RecipeSiblingStateRecord[];
+  siblingInputs?: RecipePhysicalMigrationFixture["siblingInputs"];
+  runtimeMorphName?: string;
+  /** Add the strict runtime performance contract used by manual UI fixtures. */
+  runtimePreviewCompatible?: boolean;
+  /** Override only for isolated product-policy smoke; defaults preserve the frozen R2 oracle. */
+  baseId?: string;
+  fitFamily?: string;
 };
 
 const ZERO_SHA256 = "0".repeat(64);
@@ -219,17 +236,23 @@ const MORPH_NAMES = [
   "piecewise_shape",
   "removed_shape",
 ] as const;
-
 function morphDelta(scale: number, slot: number): number[] {
   const values = new Array(9).fill(0) as number[];
   values[(slot % 3) * 3 + (slot % 2)] = scale;
   return values;
 }
 
-function physicalGlb(version: "source" | "target"): Uint8Array {
+function physicalGlb(
+  version: "source" | "target",
+  runtimeMorphName?: string,
+): Uint8Array {
   const accessors = new FixtureAccessors();
   const basePosition = accessors.floatVec3([0, 0, 0, 1, 0, 0, 0, 1, 0]);
-  const morphs = MORPH_NAMES.map((name, index) =>
+  const morphNames = [
+    ...MORPH_NAMES,
+    ...(runtimeMorphName ? [runtimeMorphName] : []),
+  ];
+  const morphs = morphNames.map((name, index) =>
     accessors.floatVec3(morphDelta(0.1, index)),
   );
   const binary = Uint8Array.from(accessors.bytes);
@@ -254,8 +277,8 @@ function physicalGlb(version: "source" | "target"): Uint8Array {
       meshes: [
         {
           name: "FixtureBody",
-          extras: { targetNames: [...MORPH_NAMES] },
-          weights: MORPH_NAMES.map(() => 0),
+          extras: { targetNames: morphNames },
+          weights: morphNames.map(() => 0),
           primitives: [
             {
               attributes: { POSITION: basePosition },
@@ -324,7 +347,13 @@ function dial(
   };
 }
 
-function appearanceManifest(version: "source" | "target"): JsonRecord {
+function appearanceManifest(
+  version: "source" | "target",
+  runtimeMorphName?: string,
+  runtimePreviewCompatible = false,
+  baseId = "sa090-r2-physical-fixture",
+  fitFamily = "sa090-r2-physical-fixture.v1",
+): JsonRecord {
   const source = version === "source";
   const targets: JsonRecord = {
     affine_target: targetDefinition("affine_shape", "component.affine"),
@@ -387,8 +416,93 @@ function appearanceManifest(version: "source" | "target"): JsonRecord {
   const neutralRecipeSha256 = source ? "3".repeat(64) : "4".repeat(64);
   return {
     rig: {
-      baseId: "sa090-r2-physical-fixture",
-      fitFamily: "sa090-r2-physical-fixture.v1",
+      baseId,
+      fitFamily,
+      ...(runtimePreviewCompatible
+        ? {
+            performance: {
+              contract: "batshit-performance-rig/v1",
+              space: "node-parent-rest",
+              rotation: {
+                representation: "rotation-vector",
+                units: "radians",
+                composition: "ordered-expmap/v1",
+              },
+              nodes: {
+                head: {
+                  node: "HeadAnchor",
+                  yaw: {
+                    axis: [0, 1, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                  pitch: {
+                    axis: [1, 0, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                },
+                neck: {
+                  node: "HipsAnchor",
+                  yaw: {
+                    axis: [0, 1, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                  pitch: {
+                    axis: [1, 0, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                },
+                leftEye: {
+                  node: "FeetAnchor",
+                  yaw: {
+                    axis: [0, 1, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                  pitch: {
+                    axis: [1, 0, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                },
+                rightEye: {
+                  node: "Body",
+                  yaw: {
+                    axis: [0, 1, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                  pitch: {
+                    axis: [1, 0, 0],
+                    sign: 1,
+                    rangeDegrees: { negative: 1, positive: 1 },
+                  },
+                },
+              },
+              look: {
+                headYawShares: { head: 0.5, neck: 0.5 },
+                headPitchShares: { head: 0.5, neck: 0.5 },
+                eyeYawMode: "asymmetric-in-out",
+                eyePitchMode: "asymmetric-up-down",
+              },
+              targetTransforms: {
+                fixture: {
+                  node: "FixtureRoot",
+                  combine: "translation-sum-rotation-vector-sum/v1",
+                  channels: {
+                    fixture_runtime_driver: {
+                      translation: [0, 0, 0],
+                      rotationVector: [0.01, 0, 0],
+                    },
+                  },
+                },
+              },
+            },
+          }
+        : {}),
     },
     stage: {
       anchors: {
@@ -440,22 +554,37 @@ function appearanceManifest(version: "source" | "target"): JsonRecord {
       targets,
       followers: {},
     },
+    ...(runtimeMorphName
+      ? { face: { expressions: { blink: runtimeMorphName } } }
+      : {}),
   };
 }
 
-async function sourcePackageDraft(version: "source" | "target") {
-  const glbBytes = physicalGlb(version);
-  const avatarManifest = appearanceManifest(version);
+async function sourcePackageDraft(
+  version: "source" | "target",
+  runtimeMorphName?: string,
+  runtimePreviewCompatible = false,
+  baseId = "sa090-r2-physical-fixture",
+  fitFamily = "sa090-r2-physical-fixture.v1",
+) {
+  const glbBytes = physicalGlb(version, runtimeMorphName);
+  const avatarManifest = appearanceManifest(
+    version,
+    runtimeMorphName,
+    runtimePreviewCompatible,
+    baseId,
+    fitFamily,
+  );
   const appearance = avatarManifest.appearanceDials as JsonRecord;
   const neutral = appearance.neutral as JsonRecord;
-  const projectionHashes = await deriveRecipeSourceProjectionHashes(
+  let projectionHashes = await deriveRecipeSourceProjectionHashes(
     avatarManifest,
     glbBytes,
   );
   const identity = await createRecipeSourceIdentity(
     {
-      baseId: "sa090-r2-physical-fixture",
-      fitFamily: "sa090-r2-physical-fixture.v1",
+      baseId,
+      fitFamily,
       modelSha256: await sha256Hex(glbBytes),
       definitionSha256: appearance.definitionSha256 as string,
       neutralId: neutral.id as string,
@@ -532,6 +661,7 @@ async function controlIdentity(
 async function updateEdge(
   from: RecipeSourceIdentity,
   to: RecipeSourceIdentity,
+  siblingSubplans?: RecipeSiblingSubplan[],
 ): Promise<RecipeUpdateEdge> {
   const fromIds = [
     "affine_control",
@@ -655,16 +785,18 @@ async function updateEdge(
     },
     controls,
     aliases: [],
-    siblingSubplans: ["facialArtwork", "eyeAppearance", "oralAppearance"].map(
-      (surface) => ({
-        surface: surface as RecipeSiblingSurface,
-        fromContract: null,
-        toContract: null,
-        action: "not-present" as const,
-        reason: `${surface} is absent from both physical fixture packages.`,
-        proofSha256: ZERO_SHA256,
-      }),
-    ),
+    siblingSubplans:
+      siblingSubplans ??
+      ["facialArtwork", "eyeAppearance", "oralAppearance"].map(
+        (surface) => ({
+          surface: surface as RecipeSiblingSurface,
+          fromContract: null,
+          toContract: null,
+          action: "not-present" as const,
+          reason: `${surface} is absent from both physical fixture packages.`,
+          proofSha256: ZERO_SHA256,
+        }),
+      ),
     warnings: [],
     proof: {
       contract: RECIPE_UPDATE_PROOF_CONTRACT,
@@ -754,6 +886,7 @@ async function componentMaps(
 
 async function fixtureSourceState(
   identity: RecipeSourceIdentity,
+  siblings: RecipeSiblingStateRecord[] = [],
 ): Promise<RecipeStateSnapshot> {
   const appearanceDials: AppearanceDialValueState = {
     contract: APPEARANCE_DIAL_VALUES_CONTRACT,
@@ -774,27 +907,50 @@ async function fixtureSourceState(
     contract: GOON_RECIPE_STATE_CONTRACT,
     stateSha256: ZERO_SHA256,
     appearanceDials,
-    siblings: [],
+    siblings: structuredClone(siblings).sort((left, right) =>
+      compareText(left.id, right.id),
+    ),
   };
   snapshot.stateSha256 = await recipeStateSnapshotSha256(snapshot);
   return snapshot;
 }
 
 /** Build the isolated R2-D physical fixture without touching frozen R1 data. */
-export async function createRecipePhysicalMigrationFixture(): Promise<RecipePhysicalMigrationFixture> {
+export async function createRecipePhysicalMigrationFixture(
+  options: RecipePhysicalMigrationFixtureOptions = {},
+): Promise<RecipePhysicalMigrationFixture> {
   return (async () => {
     const [sourceDraft, targetDraft] = await Promise.all([
-      sourcePackageDraft("source"),
-      sourcePackageDraft("target"),
+      sourcePackageDraft(
+        "source",
+        options.runtimeMorphName,
+        options.runtimePreviewCompatible,
+        options.baseId,
+        options.fitFamily,
+      ),
+      sourcePackageDraft(
+        "target",
+        options.runtimeMorphName,
+        options.runtimePreviewCompatible,
+        options.baseId,
+        options.fitFamily,
+      ),
     ]);
-    const edge = await updateEdge(sourceDraft.identity, targetDraft.identity);
+    const edge = await updateEdge(
+      sourceDraft.identity,
+      targetDraft.identity,
+      options.siblingSubplans,
+    );
     const [source, target] = await Promise.all([
       finalizeSourcePackage("source", sourceDraft, []),
       finalizeSourcePackage("target", targetDraft, [edge]),
     ]);
     const componentMapBundle = await componentMaps(edge);
-    const sourceState = await fixtureSourceState(source.identity);
-    const siblingInputs = {
+    let sourceState = await fixtureSourceState(
+      source.identity,
+      options.sourceSiblings,
+    );
+    const siblingInputs = options.siblingInputs ?? {
       facialArtwork: {
         sourceStateId: null,
         targetStateId: null,
@@ -810,7 +966,7 @@ export async function createRecipePhysicalMigrationFixture(): Promise<RecipePhys
         targetStateId: null,
         targetDefinition: null,
       },
-    } as const;
+    };
     const fixtureSha256 = await canonicalRecipeSha256({
       contract: RECIPE_PHYSICAL_MIGRATION_FIXTURE_CONTRACT,
       source: source.recipeSource,

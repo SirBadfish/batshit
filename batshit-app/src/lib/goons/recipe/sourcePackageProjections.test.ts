@@ -263,6 +263,7 @@ function glb(
     rootRotation?: number[];
     parentCycle?: boolean;
     unsafeAccessorCount?: boolean;
+    secondPrimitiveMorph?: boolean;
   } = {},
 ): Uint8Array {
   const builder = new BinaryBuilder();
@@ -301,6 +302,9 @@ function glb(
   const morph = options.semanticPacking
     ? builder.addSparseVec3(3, options.sparseIndex ?? 1, [0.1, 0, 0])
     : builder.addAccessor([0, 0, 0, 0.1, 0, 0, 0, 0, 0], 5126, "VEC3");
+  const secondMorph = options.secondPrimitiveMorph
+    ? builder.addAccessor([0, 0, 0, 0.2, 0, 0, 0, 0, 0], 5126, "VEC3")
+    : null;
   const inverseBind = builder.addAccessor(
     [
       1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0,
@@ -333,6 +337,20 @@ function glb(
             material: options.material ?? 0,
             targets: [{ POSITION: morph }],
           },
+          ...(secondMorph === null
+            ? []
+            : [
+                {
+                  attributes: {
+                    POSITION: position,
+                    JOINTS_0: joints,
+                    WEIGHTS_0: weights,
+                  },
+                  indices,
+                  material: options.material ?? 0,
+                  targets: [{ POSITION: secondMorph }],
+                },
+              ]),
         ],
       },
     ],
@@ -428,6 +446,27 @@ describe("Recipe source-package projections", () => {
     );
   });
 
+  it("normalizes a real cross-engine quaternion with the frozen compensated v1 arithmetic", async () => {
+    // V8 Math.hypot:          1.000000050191092
+    // JavaScriptCore hypot:   1.0000000501910917
+    // The projection must not depend on either engine approximation.
+    const crossEngineRotation = [
+      0.39359232783317566,
+      -0.5416399240493774,
+      0.45666053891181946,
+      0.5858092904090881,
+    ];
+
+    const projection = await deriveRecipeSourceProjectionHashes(
+      manifest(),
+      glb({ rootRotation: crossEngineRotation }),
+    );
+
+    expect(projection.physicalBasisSha256).toBe(
+      "5bce306989d1a81c1d392ef65afa7ad6ab946330d1018a2d3341ad23ed3cce39",
+    );
+  });
+
   it("normalizes dense, sparse, interleaved, index-width, and normalized-weight packing", async () => {
     const first = await deriveRecipeSourceProjectionHashes(manifest(), glb());
     const second = await deriveRecipeSourceProjectionHashes(
@@ -435,6 +474,24 @@ describe("Recipe source-package projections", () => {
       glb({ semanticPacking: true, material: 1 }),
     );
     expect(second).toEqual(first);
+  });
+
+  it("retains every per-primitive POSITION accessor for one node morph", async () => {
+    const singlePrimitive = await deriveRecipeSourceProjectionHashes(
+      manifest(),
+      glb(),
+    );
+    const twoPrimitives = await deriveRecipeSourceProjectionHashes(
+      manifest(),
+      glb({ secondPrimitiveMorph: true }),
+    );
+
+    expect(twoPrimitives.physicalBasisSha256).not.toBe(
+      singlePrimitive.physicalBasisSha256,
+    );
+    expect(twoPrimitives.behaviorSha256).toBe(
+      singlePrimitive.behaviorSha256,
+    );
   });
 
   it("keeps presentation and provenance edits out of every projection", async () => {

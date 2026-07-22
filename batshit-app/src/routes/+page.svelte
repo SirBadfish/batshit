@@ -66,6 +66,7 @@
   } from '$lib/services/goonsSettingsPersistence'
   import { getGoons } from '$lib/stores/goons.svelte'
   import { getGoonAnimationLibrary } from '$lib/stores/goonAnimationLibrary.svelte'
+  import { isGoonRuntimeReady } from '$lib/goons/recipe'
   import { normalizeGoonsSettings } from '$lib/goons/resolve'
   import type { GoonsSettings, GoonCamera, GoonDefaults } from '$lib/types/goons'
   import { LIVE_SETTINGS_EVENTS, dispatchSessionClipStateChanged } from '$lib/utils/liveSettingsEvents'
@@ -610,7 +611,8 @@ const runningCost = $derived.by(() =>
 const activeGoon = $derived.by(() => {
   const goonId = dockAgent?.goon_id
   if (!goonId) return null
-  return goons.find((s) => s.id === goonId) || null
+  const assigned = goons.find((entry) => entry.id === goonId) || null
+  return isGoonRuntimeReady(assigned) ? assigned : null
 })
 const dockAgentSpeaking = $derived.by(
   () =>

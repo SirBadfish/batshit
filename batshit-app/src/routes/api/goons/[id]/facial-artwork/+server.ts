@@ -104,7 +104,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     })
   } catch (error) {
     console.error('Error uploading facial artwork:', error)
-    if (error instanceof Error && error.message.startsWith('[facial-artwork/v3]')) {
+    if (error instanceof Error && error.message.startsWith('[facial-artwork/v4]')) {
       return json({ error: error.message }, { status: 400 })
     }
     return json({ error: 'Failed to upload facial artwork' }, { status: 500 })

@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import {
   auditGoonUploadAssets,
   cleanupOrphanGoonUploadAssets,
+  cleanupOrphanGoonUploadAssetsForClient,
   deleteGoonRecipeRecordsForClient
 } from '../goonAssetCleanupService'
 
@@ -21,6 +22,25 @@ async function seedUpload(uploadType: string, filename: string, size = 10) {
 }
 
 describe('goonAssetCleanupService', () => {
+  it('fails closed before deletion when reference enumeration cannot be trusted', async () => {
+    const deleteAsset = vi.fn(async () => undefined)
+    const client = {
+      keys: vi.fn(async () => ['upload:goons:orphan.vrm']),
+      sMembers: vi.fn(async () => {
+        throw new Error('Redis reference read failed')
+      }),
+      del: vi.fn(async () => 0),
+      json: {
+        get: vi.fn(async () => ({ size: 10, base64: 'AA==' }))
+      }
+    }
+
+    await expect(
+      cleanupOrphanGoonUploadAssetsForClient(client, 'josh', { deleteAsset })
+    ).rejects.toThrow('Redis reference read failed')
+    expect(deleteAsset).not.toHaveBeenCalled()
+  })
+
   it('keeps assets referenced by Goons, Motion Vault, Closet, and Scenes while flagging orphans', async () => {
     await redis.sAdd('user:josh:goons', 'goon_one', 'goon_two')
     await redis.json.set('goon:goon_one', '$', {

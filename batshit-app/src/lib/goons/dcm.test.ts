@@ -42,28 +42,31 @@ const goonsSettings: GoonsSettings = {
         playback: 'loop',
         description: 'Happy idle'
       },
-      wave: {
-        name: 'wave',
+      smile: {
+        name: 'smile',
         kind: 'emote',
         playback: 'oneshot',
-        description: 'Friendly wave'
+        description: 'Warm smile',
+        expressionTargets: [{ preset: 'happy', weight: 0.6 }]
       },
-      shrug: {
-        name: 'shrug',
+      smirk: {
+        name: 'smirk',
         kind: 'emote',
         playback: 'oneshot',
-        description: 'Shrug'
+        description: 'Playful smirk',
+        expressionTargets: [{ preset: 'relaxed', weight: 0.8 }]
       },
       laugh: {
         name: 'laugh',
         kind: 'emote',
         playback: 'oneshot',
         description: 'Short laugh beat',
-        blocking: true
+        blocking: true,
+        faceControls: [{ control: 'mouth_open', value: 0.4 }]
       }
     },
     emojiMap: {
-      '👋': 'wave'
+      '🙂': 'smile'
     },
     scenes: {
       cyberpunk: {
@@ -87,7 +90,7 @@ const goon: GoonRecord = {
     }
   },
   cues: {
-    enabled: ['base_stand', 'calm', 'happy', 'wave', 'shrug', 'laugh'],
+    enabled: ['base_stand', 'calm', 'happy', 'smile', 'smirk', 'laugh'],
     overrides: {},
     emojiOverrides: {}
   },
@@ -125,10 +128,13 @@ describe('goon dcm', () => {
     const emotesLine = lines.find((line) => line.startsWith('Emotes: '))
     const emojiLine = lines.find((line) => line.startsWith('Emoji triggers: '))
 
-    expect(emotesLine).toContain('wave (Friendly wave)')
-    expect(emotesLine).toContain('shrug (Shrug)')
+    expect(emotesLine).toContain('smile (Warm smile)')
+    expect(emotesLine).toContain('smirk (Playful smirk)')
     expect(emotesLine).toContain('laugh (Short laugh beat)')
-    expect(emojiLine).toContain('👋=wave')
+    expect(emojiLine).toContain('🙂=smile')
+    expect(lines).toContain(
+      'One-shot goon Motions and facial-only emoji Emotes fire on spoken replies with TTS timing. Use *goon: motion_name* for a body Motion or the emoji mappings below for a facial Emote.'
+    )
     expect(lines).toContain(
       'If an emote has Pause speech timing, that authored pause wins.'
     )

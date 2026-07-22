@@ -17,7 +17,8 @@ import {
   type GoonCustomAvatarManifest,
 } from "./customAvatar";
 import { resolveCustomPerformanceRigManifest } from "./customPerformanceRig";
-import { parseEyeAppearanceDefinition } from "./eyeAppearance";
+import { parseFirstPartySocketEyePackage } from "./socketEyePackage";
+import { socketEyeCapRetainedDynamicMorphs } from "./socketEyeSurface";
 import {
   APPEARANCE_RECIPE_PHYSICAL_BASIS_CONTRACT,
   evaluateAppearanceRecipePhysicalOutput,
@@ -29,6 +30,8 @@ type RuntimeMorphBinding = {
   index: number;
   morph: string;
 };
+
+type RuntimeMorphBindings = Map<string, RuntimeMorphBinding[]>;
 
 type RuntimeBakedMesh = {
   mesh: THREE.Mesh;
@@ -72,6 +75,56 @@ function morphRuntimeKey(runtimeId: string, index: number): string {
   return runtimeId + "\u0000" + index;
 }
 
+function socketEyeSourceOnlyMorphRuntimeKeys(
+  rawManifest: GoonCustomAvatarManifest,
+  inventory: AppearanceRuntimeInventory,
+): Set<string> {
+  const packageValue = parseFirstPartySocketEyePackage(rawManifest);
+  if (!packageValue) return new Set();
+
+  const keys = new Set<string>();
+  for (const side of ["left", "right"] as const) {
+    const nodeContracts = [
+      {
+        nodeName: packageValue.socketEyeSurface.runtimeBindings[side].nodes.compositeCap,
+        retained: new Set(socketEyeCapRetainedDynamicMorphs(side)),
+      },
+      {
+        nodeName: packageValue.eyeApertureSeam.runtimeBindings[side]
+          .lashesEyeOutlineNode,
+        retained: new Set(
+          packageValue.eyeApertureSeam.runtimeBindings[side].liner
+            .retainedPerformanceMorphs,
+        ),
+      },
+    ];
+    for (const { nodeName, retained } of nodeContracts) {
+      const matches = inventory.nodes.filter(
+        (node) => node.node === nodeName && node.kind === "mesh",
+      );
+      if (matches.length !== 1) {
+        throw new Error(
+          `appearance socket-eye source node ${nodeName} must resolve to one logical mesh inventory`,
+        );
+      }
+      const node = matches[0]!;
+      const actual = new Set(node.morphs.map((morph) => morph.name));
+      const missing = [...retained].filter((morph) => !actual.has(morph));
+      if (missing.length > 0) {
+        throw new Error(
+          `appearance socket-eye source node ${nodeName} is missing retained morphs: ${missing.join(", ")}`,
+        );
+      }
+      for (const morph of node.morphs) {
+        if (!retained.has(morph.name)) {
+          keys.add(morphRuntimeKey(node.runtimeId, morph.index));
+        }
+      }
+    }
+  }
+  return keys;
+}
+
 function lazyPositionDelta(delta: Float32Array) {
   return {
     length: delta.length,
@@ -113,15 +166,20 @@ function buildRuntimeInventory(
 ): {
   inventory: AppearanceRuntimeInventory;
   nodesByRuntimeId: Map<string, THREE.Object3D>;
-  morphBindings: Map<string, RuntimeMorphBinding>;
+  morphBindings: RuntimeMorphBindings;
+  logicalMeshOwners: Map<THREE.Mesh, THREE.Object3D>;
 } {
   const nodesByRuntimeId = new Map<string, THREE.Object3D>();
-  const morphBindings = new Map<string, RuntimeMorphBinding>();
+  const morphBindings: RuntimeMorphBindings = new Map();
+  const logicalMeshOwners = new Map<THREE.Mesh, THREE.Object3D>();
   const nodes: AppearanceRuntimeInventory["nodes"] = [];
   const faceBindings: AppearanceRuntimeInventory["faceBindings"] = [];
   const mappedFaceMorphNames = new Set(manifest.mappedFaceMorphNames);
   const declaredNodeNames = new Set(
     Object.values(manifest.nodes).map((entry) => entry.node),
+  );
+  const declaredNodesByName = new Map(
+    Object.values(manifest.nodes).map((entry) => [entry.node, entry]),
   );
   const selectedNodes: THREE.Object3D[] = [];
 
@@ -140,8 +198,22 @@ function buildRuntimeInventory(
     nodesByRuntimeId.set(runtimeId, node);
     const mesh = node as THREE.Mesh;
     const isMesh = Boolean((mesh as { isMesh?: boolean }).isMesh);
-    const dict = isMesh ? (mesh.morphTargetDictionary ?? {}) : {};
-    const influences = isMesh ? mesh.morphTargetInfluences : undefined;
+    const declared = declaredNodesByName.get(node.name);
+    const logicalMeshPrimitives = isMesh
+      ? [mesh]
+      : declared?.kind === "mesh"
+        ? node.children.filter((child): child is THREE.Mesh =>
+            Boolean((child as { isMesh?: boolean }).isMesh),
+          )
+        : [];
+    const logicalMesh = logicalMeshPrimitives[0];
+    if (!isMesh && logicalMesh) {
+      for (const primitive of logicalMeshPrimitives) {
+        logicalMeshOwners.set(primitive, node);
+      }
+    }
+    const dict = logicalMesh?.morphTargetDictionary ?? {};
+    const influences = logicalMesh?.morphTargetInfluences;
     const morphs = Object.entries(dict)
       .map(([name, index]) => ({
         name,
@@ -152,13 +224,29 @@ function buildRuntimeInventory(
         (left, right) =>
           left.index - right.index || left.name.localeCompare(right.name),
       );
+    for (const primitive of logicalMeshPrimitives.slice(1)) {
+      const primitiveDictionary = primitive.morphTargetDictionary ?? {};
+      const primitiveMorphs = Object.entries(primitiveDictionary).sort(
+        (left, right) => left[1] - right[1] || left[0].localeCompare(right[0]),
+      );
+      const expectedMorphs = morphs.map(({ name, index }) => [name, index]);
+      if (JSON.stringify(primitiveMorphs) !== JSON.stringify(expectedMorphs)) {
+        throw new Error(
+          `appearance logical mesh ${node.name || runtimeId} has misaligned primitive morph inventories`,
+        );
+      }
+    }
     for (const morph of morphs) {
-      morphBindings.set(morphRuntimeKey(runtimeId, morph.index), {
-        mesh,
-        index: morph.index,
-        morph: morph.name,
-      });
+      morphBindings.set(
+        morphRuntimeKey(runtimeId, morph.index),
+        logicalMeshPrimitives.map((primitive) => ({
+          mesh: primitive,
+          index: morph.index,
+          morph: morph.name,
+        })),
+      );
       if (
+        isMesh &&
         faceMeshes.has(mesh) &&
         mappedFaceMorphNames.has(normalizeFaceMorphCollisionName(morph.name))
       ) {
@@ -168,7 +256,7 @@ function buildRuntimeInventory(
     nodes.push({
       runtimeId,
       node: node.name,
-      kind: isMesh ? "mesh" : "anchor",
+      kind: logicalMesh ? "mesh" : "anchor",
       ...(node.parent && selectedNodeSet.has(node.parent)
         ? { parentRuntimeId: node.parent.uuid }
         : {}),
@@ -184,6 +272,7 @@ function buildRuntimeInventory(
     inventory: { nodes, faceBindings },
     nodesByRuntimeId,
     morphBindings,
+    logicalMeshOwners,
   };
 }
 
@@ -197,6 +286,7 @@ export class AppearanceDialsEngineRuntime {
   readonly ownedFaceMorphNames: Set<string>;
 
   private readonly root: THREE.Object3D;
+  private readonly logicalMeshOwners: Map<THREE.Mesh, THREE.Object3D>;
   private readonly targetBindings = new Map<string, RuntimeMorphBinding[]>();
   private readonly retainedPhysicalBindings = new Map<
     string,
@@ -208,11 +298,11 @@ export class AppearanceDialsEngineRuntime {
   >();
   private readonly followerMorphBindings = new Map<
     string,
-    RuntimeMorphBinding
+    RuntimeMorphBinding[]
   >();
   private readonly bakedFollowerMorphBindings = new Map<
     string,
-    RuntimeBakedMorphBinding
+    RuntimeBakedMorphBinding[]
   >();
   private readonly bakedMeshes = new Set<RuntimeBakedMesh>();
   private readonly followerNodes = new Map<string, RuntimeFollowerNode>();
@@ -243,6 +333,7 @@ export class AppearanceDialsEngineRuntime {
 
     const faceMeshes = new Set(options.faceMeshes ?? []);
     const built = buildRuntimeInventory(root, manifest, faceMeshes);
+    this.logicalMeshOwners = built.logicalMeshOwners;
     const validated = validateAppearanceRuntimeInventory(
       manifest,
       built.inventory,
@@ -263,6 +354,12 @@ export class AppearanceDialsEngineRuntime {
         morphRuntimeKey(binding.runtimeNodeId, binding.index),
       );
     }
+    for (const key of socketEyeSourceOnlyMorphRuntimeKeys(
+      rawManifest,
+      built.inventory,
+    )) {
+      recipeRuntimeKeys.add(key);
+    }
     const bakedByRuntimeKey = this.prepareRecipeBaking(
       built.morphBindings,
       recipeRuntimeKeys,
@@ -270,37 +367,37 @@ export class AppearanceDialsEngineRuntime {
 
     for (const binding of validated.bindings) {
       const key = morphRuntimeKey(binding.runtimeNodeId, binding.index);
-      const runtime = built.morphBindings.get(key);
-      if (!runtime) {
+      const runtimes = built.morphBindings.get(key);
+      if (!runtimes || runtimes.length === 0) {
         throw new Error(
           `appearance target ${binding.target} lost its validated runtime binding`,
         );
       }
-      const baked = bakedByRuntimeKey.get(key);
-      if (baked) {
+      const baked = bakedByRuntimeKey.get(key) ?? [];
+      if (baked.length > 0) {
         const entries = this.bakedTargetBindings.get(binding.target) ?? [];
-        entries.push(baked);
+        entries.push(...baked);
         this.bakedTargetBindings.set(binding.target, entries);
       } else {
         const entries = this.targetBindings.get(binding.target) ?? [];
-        entries.push(runtime);
+        entries.push(...runtimes);
         this.targetBindings.set(binding.target, entries);
       }
     }
     for (const binding of validated.followerMorphBindings) {
       const key = morphRuntimeKey(binding.runtimeNodeId, binding.index);
-      const runtime = built.morphBindings.get(key);
-      if (!runtime) {
+      const runtimes = built.morphBindings.get(key);
+      if (!runtimes || runtimes.length === 0) {
         throw new Error(
           `appearance follower ${binding.follower}/${binding.channel} lost its runtime binding`,
         );
       }
       const followerKey = binding.follower + "\u0000" + binding.channel;
-      const baked = bakedByRuntimeKey.get(key);
-      if (baked) {
+      const baked = bakedByRuntimeKey.get(key) ?? [];
+      if (baked.length > 0) {
         this.bakedFollowerMorphBindings.set(followerKey, baked);
       } else {
-        this.followerMorphBindings.set(followerKey, runtime);
+        this.followerMorphBindings.set(followerKey, runtimes);
       }
     }
     for (const [
@@ -342,20 +439,20 @@ export class AppearanceDialsEngineRuntime {
    * full identity catalog.
    */
   private prepareRecipeBaking(
-    morphBindings: Map<string, RuntimeMorphBinding>,
+    morphBindings: RuntimeMorphBindings,
     recipeRuntimeKeys: Set<string>,
-  ): Map<string, RuntimeBakedMorphBinding> {
+  ): Map<string, RuntimeBakedMorphBinding[]> {
     const recipeIndicesByMesh = new Map<THREE.Mesh, Set<number>>();
     for (const key of recipeRuntimeKeys) {
-      const binding = morphBindings.get(key);
-      if (!binding) continue;
-      const indices =
-        recipeIndicesByMesh.get(binding.mesh) ?? new Set<number>();
-      indices.add(binding.index);
-      recipeIndicesByMesh.set(binding.mesh, indices);
+      for (const binding of morphBindings.get(key) ?? []) {
+        const indices =
+          recipeIndicesByMesh.get(binding.mesh) ?? new Set<number>();
+        indices.add(binding.index);
+        recipeIndicesByMesh.set(binding.mesh, indices);
+      }
     }
 
-    const bakedByRuntimeKey = new Map<string, RuntimeBakedMorphBinding>();
+    const bakedByRuntimeKey = new Map<string, RuntimeBakedMorphBinding[]>();
     for (const [mesh, recipeIndices] of recipeIndicesByMesh) {
       const geometry = mesh.geometry;
       const sourcePosition = geometry.getAttribute("position");
@@ -385,24 +482,28 @@ export class AppearanceDialsEngineRuntime {
       };
       this.bakedMeshes.add(bakedMesh);
 
-      for (const [key, binding] of morphBindings) {
-        if (binding.mesh !== mesh || !recipeIndices.has(binding.index))
-          continue;
-        const morphPosition =
-          geometry.morphAttributes.position?.[binding.index];
-        if (!morphPosition) {
-          throw new Error(
-            `appearance recipe morph ${mesh.name || mesh.uuid}/${binding.morph} has no POSITION delta`,
-          );
-        }
-        let delta = readVec3Attribute(morphPosition);
-        if (!geometry.morphTargetsRelative) {
-          delta = delta.slice();
-          for (let index = 0; index < delta.length; index += 1) {
-            delta[index] -= basePosition[index] ?? 0;
+      for (const [key, bindings] of morphBindings) {
+        for (const binding of bindings) {
+          if (binding.mesh !== mesh || !recipeIndices.has(binding.index))
+            continue;
+          const morphPosition =
+            geometry.morphAttributes.position?.[binding.index];
+          if (!morphPosition) {
+            throw new Error(
+              `appearance recipe morph ${mesh.name || mesh.uuid}/${binding.morph} has no POSITION delta`,
+            );
           }
+          let delta = readVec3Attribute(morphPosition);
+          if (!geometry.morphTargetsRelative) {
+            delta = delta.slice();
+            for (let index = 0; index < delta.length; index += 1) {
+              delta[index] -= basePosition[index] ?? 0;
+            }
+          }
+          const entries = bakedByRuntimeKey.get(key) ?? [];
+          entries.push({ runtime: bakedMesh, delta });
+          bakedByRuntimeKey.set(key, entries);
         }
-        bakedByRuntimeKey.set(key, { runtime: bakedMesh, delta });
       }
 
       const oldToNew = new Map(
@@ -440,15 +541,18 @@ export class AppearanceDialsEngineRuntime {
         (index) => originalInfluences[index] ?? 0,
       );
 
-      for (const binding of morphBindings.values()) {
-        if (binding.mesh !== mesh || recipeIndices.has(binding.index)) continue;
-        const newIndex = oldToNew.get(binding.index);
-        if (newIndex === undefined) {
-          throw new Error(
-            `appearance live morph ${mesh.name || mesh.uuid}/${binding.morph} lost its index`,
-          );
+      for (const bindings of morphBindings.values()) {
+        for (const binding of bindings) {
+          if (binding.mesh !== mesh || recipeIndices.has(binding.index))
+            continue;
+          const newIndex = oldToNew.get(binding.index);
+          if (newIndex === undefined) {
+            throw new Error(
+              `appearance live morph ${mesh.name || mesh.uuid}/${binding.morph} lost its index`,
+            );
+          }
+          binding.index = newIndex;
         }
-        binding.index = newIndex;
       }
     }
     return bakedByRuntimeKey;
@@ -555,7 +659,7 @@ export class AppearanceDialsEngineRuntime {
       meshBasePositions.set(mesh.uuid, basePositions);
       meshes.push({
         id: mesh.uuid,
-        nodeId: mesh.uuid,
+        nodeId: this.logicalMeshOwners.get(mesh)?.uuid ?? mesh.uuid,
         basePositions,
       });
     });
@@ -619,62 +723,75 @@ export class AppearanceDialsEngineRuntime {
       ) {
         continue;
       }
-      const runtime = (this.targetBindings.get(binding.target) ?? []).find(
-        (candidate) =>
-          candidate.mesh.uuid === binding.runtimeNodeId &&
-          candidate.morph === binding.morph,
+      const runtimes = (this.targetBindings.get(binding.target) ?? []).filter(
+        (candidate) => candidate.morph === binding.morph,
       );
-      const basePositions = runtime
-        ? meshBasePositions.get(runtime.mesh.uuid)
-        : undefined;
-      if (!runtime || !basePositions) {
+      if (runtimes.length === 0) {
         throw new Error(
           `appearance retained target ${binding.target}/${binding.morph} lost its active mesh`,
         );
       }
-      const id = `retained:${index}`;
-      this.retainedPhysicalBindings.set(id, runtime);
-      retainedTargetPositionBindings.push({
-        id,
-        targetId: binding.target,
-        node: binding.node,
-        morph: binding.morph,
-        meshId: runtime.mesh.uuid,
-        positionDelta: runtimePositionDelta(
-          runtime.mesh,
-          runtime.index,
-          basePositions,
-        ),
-      });
+      for (const [primitiveIndex, runtime] of runtimes.entries()) {
+        const basePositions = meshBasePositions.get(runtime.mesh.uuid);
+        if (!basePositions) {
+          throw new Error(
+            `appearance retained target ${binding.target}/${binding.morph} lost its active mesh basis`,
+          );
+        }
+        const id =
+          runtimes.length === 1
+            ? `retained:${index}`
+            : `retained:${index}:${primitiveIndex}`;
+        this.retainedPhysicalBindings.set(id, runtime);
+        retainedTargetPositionBindings.push({
+          id,
+          targetId: binding.target,
+          node: binding.node,
+          morph: binding.morph,
+          meshId: runtime.mesh.uuid,
+          positionDelta: runtimePositionDelta(
+            runtime.mesh,
+            runtime.index,
+            basePositions,
+          ),
+        });
+      }
     }
 
     const followerMorphPositionBindings: AppearanceRecipePhysicalBasis["followerMorphPositionBindings"] =
       [];
     for (const binding of validated.followerMorphBindings) {
-      const runtime = this.bakedFollowerMorphBindings.get(
+      const runtimes = this.bakedFollowerMorphBindings.get(
         binding.follower + "\u0000" + binding.channel,
       );
-      if (!runtime) {
+      if (!runtimes || runtimes.length === 0) {
         throw new Error(
           `appearance follower ${binding.follower}/${binding.channel} has no baked physical binding`,
         );
       }
-      followerMorphPositionBindings.push({
-        id: `follower:${binding.follower}:${binding.channel}`,
-        follower: binding.follower,
-        channel: binding.channel,
-        node: binding.node,
-        morph: binding.morph,
-        meshId: runtime.runtime.mesh.uuid,
-        positionDelta: lazyPositionDelta(runtime.delta),
-      });
+      for (const [primitiveIndex, runtime] of runtimes.entries()) {
+        followerMorphPositionBindings.push({
+          id:
+            runtimes.length === 1
+              ? `follower:${binding.follower}:${binding.channel}`
+              : `follower:${binding.follower}:${binding.channel}:${primitiveIndex}`,
+          follower: binding.follower,
+          channel: binding.channel,
+          node: binding.node,
+          morph: binding.morph,
+          meshId: runtime.runtime.mesh.uuid,
+          positionDelta: lazyPositionDelta(runtime.delta),
+        });
+      }
     }
-    const followerMorphPositionIdByKey = new Map(
-      followerMorphPositionBindings.map((binding) => [
-        binding.follower + "\u0000" + binding.channel,
+    const followerMorphPositionIdsByKey = new Map<string, string[]>();
+    for (const binding of followerMorphPositionBindings) {
+      const key = binding.follower + "\u0000" + binding.channel;
+      followerMorphPositionIdsByKey.set(key, [
+        ...(followerMorphPositionIdsByKey.get(key) ?? []),
         binding.id,
-      ]),
-    );
+      ]);
+    }
     const followerMorphBindings: AppearanceRecipePhysicalBasis["followerMorphBindings"] =
       [];
     const followerNodeTransformBindings: AppearanceRecipePhysicalBasis["followerNodeTransformBindings"] =
@@ -692,7 +809,7 @@ export class AppearanceDialsEngineRuntime {
         .sort((left, right) => left.channel.id.localeCompare(right.channel.id));
       for (const { driver, channel } of channels) {
         if (channel.kind === "morph-weight") {
-          const positionBindingId = followerMorphPositionIdByKey.get(
+          const positionBindingIds = followerMorphPositionIdsByKey.get(
             follower + "\u0000" + channel.id,
           );
           followerMorphBindings.push({
@@ -701,7 +818,7 @@ export class AppearanceDialsEngineRuntime {
             driver: { ...driver },
             node: channel.node,
             morph: channel.morph,
-            ...(positionBindingId ? { positionBindingId } : {}),
+            ...(positionBindingIds ? { positionBindingIds } : {}),
           });
         } else {
           const runtime = this.followerNodes.get(channel.node);
@@ -786,8 +903,10 @@ export class AppearanceDialsEngineRuntime {
     }
     if (performance.manifest) {
       const claimed = new Map<string, string>();
-      for (const role of ["head", "neck", "leftEye", "rightEye"] as const) {
-        const nodeName = performance.manifest.nodes[role].node;
+      for (const [role, lookNode] of Object.entries(
+        performance.manifest.nodes,
+      )) {
+        const nodeName = lookNode.node;
         const node = resolveExactRoleNode(
           nodeName,
           `rig.performance.nodes.${role}.node`,
@@ -827,60 +946,45 @@ export class AppearanceDialsEngineRuntime {
       }
     }
 
-    if (
-      rawManifest.eyeAppearance !== undefined &&
-      rawManifest.eyeAppearance !== null
-    ) {
-      const eye = parseEyeAppearanceDefinition(rawManifest.eyeAppearance);
-      const skinJointIds = new Set(
-        this.skins.flatMap((skin) =>
-          skin.mesh.skeleton.bones.map((bone) => bone.uuid),
-        ),
-      );
-      const claimedAssemblies = new Set<string>();
+    const socketEyePackage = parseFirstPartySocketEyePackage(rawManifest);
+    if (socketEyePackage) {
+      const claimedNodes = new Set<string>();
       for (const side of ["left", "right"] as const) {
-        const binding = eye.runtimeBindings[side];
-        const eyeBone = resolveExactRoleNode(
-          binding.eyeBone,
-          `eyeAppearance.runtimeBindings.${side}.eyeBone`,
-        );
-        if (!skinJointIds.has(eyeBone.uuid)) {
-          throw new Error(
-            `appearance eyeAppearance ${side} eye bone is not a skin joint`,
-          );
-        }
-        roles.push({
-          kind: "eye",
-          id: `${side}.bone`,
-          nodeId: eyeBone.uuid,
-        });
-        for (const [assemblyRole, assemblyName] of Object.entries(
-          binding.assemblyNodes,
-        )) {
-          const assembly = resolveExactRoleNode(
-            assemblyName,
-            `eyeAppearance.runtimeBindings.${side}.assemblyNodes.${assemblyRole}`,
-          );
-          if (assembly.parent !== eyeBone) {
+        const declared = [
+          {
+            id: `${side}.compositeCap`,
+            name: socketEyePackage.socketEyeSurface.runtimeBindings[side].nodes
+              .compositeCap,
+            path: `socketEyeSurface.runtimeBindings.${side}.nodes.compositeCap`,
+          },
+          {
+            id: `${side}.lashesEyeOutline`,
+            name: socketEyePackage.eyeApertureSeam.runtimeBindings[side]
+              .lashesEyeOutlineNode,
+            path: `eyeApertureSeam.runtimeBindings.${side}.lashesEyeOutlineNode`,
+          },
+        ];
+        for (const entry of declared) {
+          const node = resolveExactRoleNode(entry.name, entry.path);
+          const isMesh = Boolean((node as { isMesh?: boolean }).isMesh);
+          const isLogicalMesh =
+            !isMesh &&
+            node.children.some((child) =>
+              Boolean((child as { isMesh?: boolean }).isMesh),
+            );
+          if (!isMesh && !isLogicalMesh) {
+            throw new Error(`appearance ${entry.path} is not a mesh node`);
+          }
+          if (claimedNodes.has(node.uuid)) {
             throw new Error(
-              `appearance eyeAppearance ${side} ${assemblyRole} is not a direct child of its eye bone`,
+              `appearance socket-eye node ${entry.name} is declared more than once`,
             );
           }
-          if (!(assembly as { isMesh?: boolean }).isMesh) {
-            throw new Error(
-              `appearance eyeAppearance ${side} ${assemblyRole} is not a mesh node`,
-            );
-          }
-          if (claimedAssemblies.has(assembly.uuid)) {
-            throw new Error(
-              `appearance eyeAppearance assembly node ${assemblyName} is declared more than once`,
-            );
-          }
-          claimedAssemblies.add(assembly.uuid);
+          claimedNodes.add(node.uuid);
           roles.push({
             kind: "eye",
-            id: `${side}.assembly.${assemblyRole}`,
-            nodeId: assembly.uuid,
+            id: entry.id,
+            nodeId: node.uuid,
           });
         }
       }
@@ -975,12 +1079,13 @@ export class AppearanceDialsEngineRuntime {
       if (Array.isArray(weights)) weights[binding.index] = retained.weight;
     }
     for (const morph of evaluated.followerMorphWeights) {
-      const binding = this.followerMorphBindings.get(
+      const bindings = this.followerMorphBindings.get(
         morph.follower + "\u0000" + morph.channel,
       );
-      if (!binding) continue;
-      const weights = binding.mesh.morphTargetInfluences;
-      if (Array.isArray(weights)) weights[binding.index] = morph.weight;
+      for (const binding of bindings ?? []) {
+        const weights = binding.mesh.morphTargetInfluences;
+        if (Array.isArray(weights)) weights[binding.index] = morph.weight;
+      }
     }
 
     const evaluatedMeshes = new Map(

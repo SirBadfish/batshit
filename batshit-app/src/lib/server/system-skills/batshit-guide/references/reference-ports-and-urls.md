@@ -119,6 +119,7 @@ Optional profiles are not part of the core Docker stack. They start only when th
 | Optional Docker n8n profile | `http://localhost:5678` by default | `http://n8n:5678` | Optional profile: `n8n`. Host port override: `BATSHIT_DOCKER_N8N_PORT`. |
 | Cloudflared | no normal browser UI | targets `http://batshit-server:5600` | Optional profile: `cloudflared`. Metrics default `0.0.0.0:20241` inside sidecar. |
 | FBX-to-VRMA worker | no normal browser UI | `http://fbx2vrma-worker:8079` | Optional profile: `fbx2vrma`. Internal worker for Goon Motion Vault FBX uploads. |
+| NVIDIA Audio2Face bridge | no normal browser UI | `http://audio2face-bridge:8068` | Optional profile: `audio2face`. Connects to a separate NVIDIA NIM gRPC endpoint, normally `host.docker.internal:52000`. |
 | Agent Browser sidecar | no normal browser UI | `http://agent-browser:8091` | Optional profile: `agent-browser`. Uses its own headless Chromium, not host Chrome. |
 | LiveKit server | `ws://localhost:7880` | `ws://livekit:7880` for sidecar, `ws://host.docker.internal:7880` for app dispatch | Native managed runtime or optional Docker profile: `livekit`. Also uses `7881` TCP and `7882/udp` for WebRTC. |
 | LiveKit agent worker | no normal browser UI | `http://livekit-agent:7899/worker` | Native managed sidecar health uses `http://127.0.0.1:7899/worker`; Docker profile uses `livekit-agent`. |

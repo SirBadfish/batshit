@@ -2216,7 +2216,7 @@ describe('VoiceService realtime playback', () => {
 
       expect(lipSyncAnalysisMock.analyzeAudioLedGoonLipSync).toHaveBeenCalled()
       expect(warnSpy).toHaveBeenCalledWith(
-        '[VoiceService] Premium lip sync analysis failed; using text timing fallback.',
+        '[VoiceService] Lip sync analyzer "rhubarb-wasm" failed.',
         expect.any(Error)
       )
       expect(createObjectURL).toHaveBeenCalled()
@@ -2269,9 +2269,10 @@ describe('VoiceService realtime playback', () => {
       timeline: {
         analyzerId: 'rhubarb-wasm',
         source: 'audio-analysis',
+        profile: 'rhubarb-9',
         keyframes: [
-          { timeMs: 0, weights },
-          { timeMs: 500, weights }
+          { timeMs: 0, frame: { profile: 'rhubarb-9', weights } },
+          { timeMs: 500, frame: { profile: 'rhubarb-9', weights } }
         ],
         durationMs: 500,
         unitCount: 1,
@@ -2363,5 +2364,87 @@ describe('VoiceService realtime playback', () => {
       window.removeEventListener('batshit:voice-playback-start', handleStart)
       window.removeEventListener('batshit:voice-playback-end', handleEnd)
     }
+  })
+
+  it('falls visibly from Audio2Face to Rhubarb before using text timing', async () => {
+    const rhubarbWeights = {
+      rest: 0,
+      closed: 0,
+      clenched: 0,
+      mid_open: 0,
+      wide_open: 1,
+      round: 0,
+      pucker: 0,
+      teeth_lip: 0,
+      tongue_lift: 0
+    }
+    lipSyncAnalysisMock.analyzeAudioLedGoonLipSync
+      .mockRejectedValueOnce(new Error('AUDIO2FACE_NIM_UNAVAILABLE: NVIDIA NIM is unavailable.'))
+      .mockResolvedValueOnce({
+        timeline: {
+          analyzerId: 'rhubarb-wasm',
+          source: 'audio-analysis',
+          profile: 'rhubarb-9',
+          keyframes: [{ timeMs: 0, frame: { profile: 'rhubarb-9', weights: rhubarbWeights } }],
+          durationMs: 500,
+          unitCount: 1,
+          sourceText: 'Fallback speech.'
+        },
+        metrics: {
+          analyzerId: 'rhubarb-wasm',
+          runtimeMode: 'precomputed',
+          totalMs: 12
+        }
+      })
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      const service = new VoiceService()
+      const result = await (service as any).resolveNonBrowserLipSyncAnalysis({
+        buffer: new ArrayBuffer(4),
+        mediaType: 'audio/wav',
+        text: 'Fallback speech.',
+        settings: {
+          goonLipSync: { mode: 'viseme', analyzerId: 'audio2face-3d' }
+        },
+        goonLipSyncActive: true
+      })
+
+      expect(lipSyncAnalysisMock.analyzeAudioLedGoonLipSync).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ analyzerId: 'audio2face-3d' })
+      )
+      expect(lipSyncAnalysisMock.analyzeAudioLedGoonLipSync).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ analyzerId: 'rhubarb-wasm' })
+      )
+      expect(result).toMatchObject({
+        analyzerId: 'rhubarb-wasm',
+        timeline: { analyzerId: 'rhubarb-wasm' }
+      })
+      expect(result.warnings).toEqual([
+        'NVIDIA Audio2Face failed before playback (AUDIO2FACE_NIM_UNAVAILABLE: NVIDIA NIM is unavailable.), so Batshit used Rhubarb WASM for this utterance.'
+      ])
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('does not add Rhubarb boundary blending to continuous Audio2Face frames', () => {
+    const service = new VoiceService()
+    const timeline = (service as any).withGoonLipSyncVisemeBlend(
+      {
+        analyzerId: 'audio2face-3d',
+        source: 'audio-analysis',
+        profile: 'arkit-52',
+        keyframes: [],
+        durationMs: 500,
+        unitCount: 0,
+        sourceText: ''
+      },
+      { goonLipSync: { mode: 'viseme', analyzerId: 'audio2face-3d', visemeBlendMs: 80 } }
+    )
+
+    expect(timeline.visemeBlendMs).toBe(0)
   })
 })

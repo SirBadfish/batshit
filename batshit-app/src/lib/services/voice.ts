@@ -3,6 +3,7 @@ import { logger } from '$lib/utils/logger'
 import { buildTextTimingLipSyncAnalysis } from '$lib/goons/lipSyncAnalyzer'
 import { DEFAULT_PREMIUM_GOON_LIP_SYNC_ANALYZER } from '$lib/goons/lipSyncLab'
 import { buildInworldVisemeLipSyncTimeline } from '$lib/goons/providerVisemeTimeline'
+import { ARKIT_52_FACE_DRIVER_PROFILE } from '$lib/goons/speechFaceProfiles'
 import { analyzeAudioLedGoonLipSync } from '$lib/services/goonLipSyncAnalysis'
 import {
   publishAudioElementToLiveKitRoom,
@@ -18,6 +19,7 @@ import {
 } from '$lib/stores/voicePlayback.svelte'
 import type {
   AgentVoiceProfile,
+  GoonLipSyncPremiumAnalyzerId,
   VoiceProviderId,
   VoiceProviderSummary,
   VoiceSettings
@@ -2597,37 +2599,53 @@ export class VoiceService {
     const preferredAnalyzerId =
       options.settings.goonLipSync?.analyzerId ?? DEFAULT_PREMIUM_GOON_LIP_SYNC_ANALYZER
 
-    try {
-      const result = await analyzeAudioLedGoonLipSync({
-        analyzerId: preferredAnalyzerId,
-        audioBuffer: options.buffer.slice(0),
-        mediaType: options.mediaType,
-        text: options.text
-      })
+    const analyzerOrder: GoonLipSyncPremiumAnalyzerId[] =
+      preferredAnalyzerId === 'audio2face-3d'
+        ? ['audio2face-3d', 'rhubarb-wasm']
+        : [preferredAnalyzerId]
+    const failures: Array<{ analyzerId: GoonLipSyncPremiumAnalyzerId; reason: string }> = []
 
-      return {
-        analyzerId: preferredAnalyzerId,
-        runtime: 'client' as const,
-        source: 'audio-analysis' as const,
-        timeline: result.timeline,
-        warnings: [] as string[],
-        metrics: result.metrics ?? undefined
+    for (const analyzerId of analyzerOrder) {
+      try {
+        const result = await analyzeAudioLedGoonLipSync({
+          analyzerId,
+          audioBuffer: options.buffer.slice(0),
+          mediaType: options.mediaType,
+          text: options.text
+        })
+        const audio2FaceFailure = failures.find((failure) => failure.analyzerId === 'audio2face-3d')
+
+        return {
+          analyzerId: result.timeline.analyzerId,
+          runtime: 'client' as const,
+          source: 'audio-analysis' as const,
+          timeline: result.timeline,
+          warnings: audio2FaceFailure
+            ? [
+                `NVIDIA Audio2Face failed before playback (${audio2FaceFailure.reason}), so Batshit used Rhubarb WASM for this utterance.`
+              ]
+            : ([] as string[]),
+          metrics: result.metrics ?? undefined
+        }
+      } catch (error) {
+        const reason = describeVoiceError(error)
+        failures.push({ analyzerId, reason })
+        console.warn(`[VoiceService] Lip sync analyzer "${analyzerId}" failed.`, error)
       }
-    } catch (error) {
-      console.warn('[VoiceService] Premium lip sync analysis failed; using text timing fallback.', error)
-      const failureReason = describeVoiceError(error)
-      const fallback = buildTextTimingLipSyncAnalysis({
-        speakableText: options.text,
-        playbackRate: DEFAULT_CLIENT_PLAYBACK_RATE
-      })
-      return {
-        ...fallback,
-        warnings: [
-          ...fallback.warnings,
-          `Premium lip sync analyzer "${preferredAnalyzerId}" failed before playback (${failureReason}), so Batshit used text timing for this utterance.`
-        ],
-        metrics: undefined
-      }
+    }
+
+    const fallback = buildTextTimingLipSyncAnalysis({
+      speakableText: options.text,
+      playbackRate: DEFAULT_CLIENT_PLAYBACK_RATE
+    })
+    const failureWarning =
+      preferredAnalyzerId === 'audio2face-3d'
+        ? `NVIDIA Audio2Face failed before playback (${failures[0]?.reason ?? 'Unknown failure'}), and Rhubarb WASM also failed (${failures[1]?.reason ?? 'Unknown failure'}), so Batshit used text timing for this utterance.`
+        : `Premium lip sync analyzer "${preferredAnalyzerId}" failed before playback (${failures[0]?.reason ?? 'Unknown failure'}), so Batshit used text timing for this utterance.`
+    return {
+      ...fallback,
+      warnings: [...fallback.warnings, failureWarning],
+      metrics: undefined
     }
   }
 
@@ -2636,6 +2654,9 @@ export class VoiceService {
     settings: VoiceSettings
   ): GoonLipSyncTimeline | null {
     if (!timeline) return null
+    if (timeline.profile === ARKIT_52_FACE_DRIVER_PROFILE) {
+      return { ...timeline, visemeBlendMs: 0 }
+    }
     return {
       ...timeline,
       visemeBlendMs: normalizeGoonLipSyncVisemeBlendMs(settings.goonLipSync?.visemeBlendMs)

@@ -246,6 +246,7 @@ The core Docker stack is small. Add-ons are opt-in.
 | `n8n` | Optional Docker n8n profile plus n8n runners | `./start-docker.sh --profile n8n` |
 | `cloudflared` | Optional sidecar for managed local Clip tunnel URLs | `docker compose --env-file .env.docker --profile cloudflared up -d --build` |
 | `fbx2vrma` | Optional worker for Goon Motion Vault `.fbx` conversion | `docker compose --env-file .env.docker --profile fbx2vrma up -d --build fbx2vrma-worker` |
+| `audio2face` | Batshit bridge for a separately installed/licensed NVIDIA Audio2Face-3D NIM v2.0 GPU runtime | `docker compose --env-file .env.docker --profile audio2face up -d --build audio2face-bridge` |
 | `agent-browser` | Optional headless Agent Browser sidecar | `docker compose --env-file .env.docker --profile agent-browser up -d --build agent-browser` |
 | `livekit` | Optional local LiveKit voice runtime | `./start-docker.sh --profile livekit` |
 | `comfyui-validation` | ComfyUI-shaped validation sidecar, not full GPU ComfyUI | `docker compose --env-file .env.docker --profile comfyui-validation up -d --build comfyui-validation` |

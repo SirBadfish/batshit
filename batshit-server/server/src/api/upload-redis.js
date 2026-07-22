@@ -899,6 +899,11 @@ function parseManifestObject(text, laneLabel) {
   return manifest;
 }
 
+// R9 launches the automatic Recipe lifecycle only for product-owned bases that
+// Batshit has proven end to end. Independent Advanced/GLB packages remain on
+// their existing lane until an author contract is separately proven.
+const FIRST_PARTY_RECIPE_BASE_IDS = new Set(['batshit-base-f-v1']);
+
 function parseManifestSummary(manifest, laneLabel) {
   const contractVersionRaw = manifest.contractVersion;
   if (
@@ -919,7 +924,39 @@ function parseManifestSummary(manifest, laneLabel) {
     summary: {
       contractVersion: typeof contractVersionRaw === 'number' ? contractVersionRaw : 1,
       name: trimmedName,
-      description: trimmedDescription
+      description: trimmedDescription,
+      ...(laneLabel === 'Custom Goon'
+        ? {
+            baseId:
+              manifest.recipeSource !== null &&
+              typeof manifest.recipeSource === 'object' &&
+              !Array.isArray(manifest.recipeSource) &&
+              typeof manifest.recipeSource.baseId === 'string'
+                ? manifest.recipeSource.baseId
+                : undefined,
+            recipeReady:
+              manifest.recipeSource !== null &&
+              typeof manifest.recipeSource === 'object' &&
+              !Array.isArray(manifest.recipeSource) &&
+              manifest.recipeSource.contract === 'recipe-source/v1' &&
+              FIRST_PARTY_RECIPE_BASE_IDS.has(manifest.recipeSource.baseId) &&
+              manifest.recipeSource.fitFamily === manifest.recipeSource.baseId &&
+              manifest.appearanceDials !== null &&
+              typeof manifest.appearanceDials === 'object' &&
+              !Array.isArray(manifest.appearanceDials) &&
+              manifest.appearanceDials.contract === 'appearance-dials/v2' &&
+              manifest.recipeUpdates !== null &&
+              typeof manifest.recipeUpdates === 'object' &&
+              !Array.isArray(manifest.recipeUpdates) &&
+              manifest.recipeUpdates.contract === 'recipe-updates/v1' &&
+              !Object.prototype.hasOwnProperty.call(manifest, 'liveBuild'),
+            anatomyFitReady:
+              manifest.anatomyFit !== null &&
+              typeof manifest.anatomyFit === 'object' &&
+              !Array.isArray(manifest.anatomyFit) &&
+              manifest.anatomyFit.contract === 'anatomy-fit-manifest/v2'
+          }
+        : {})
     }
   };
 }
@@ -2539,6 +2576,7 @@ router.use((error, req, res, next) => {
 module.exports = router;
 module.exports.buildSafeUploadFilename = buildSafeUploadFilename;
 module.exports.parseGuidedOutfitData = parseGuidedOutfitData;
+module.exports.parseCustomGoonManifest = parseCustomGoonManifest;
 module.exports.detectUploadSignature = detectUploadSignature;
 module.exports.validateGenericUploadFile = validateGenericUploadFile;
 module.exports.readConstrainedGoonArchiveEntries = readConstrainedGoonArchiveEntries;

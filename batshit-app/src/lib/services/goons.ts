@@ -265,6 +265,27 @@ export async function uploadCustomGoonPackage(
   }
 }
 
+export async function cleanupCustomGoonPackageUpload(
+  id: string,
+  archiveReceipt: unknown
+): Promise<{ deleted: string[]; retained: string[] }> {
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/advanced-package/cleanup`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ archiveReceipt })
+  })
+
+  if (!res.ok) {
+    throw new Error(await readApiError(res, 'Failed to clean rejected Recipe package upload'))
+  }
+
+  const data = await res.json()
+  return {
+    deleted: Array.isArray(data?.deleted) ? data.deleted : [],
+    retained: Array.isArray(data?.retained) ? data.retained : []
+  }
+}
+
 export async function uploadGuidedDufClothesVrm(id: string, file: File): Promise<GoonFileRef> {
   const form = new FormData()
   form.append('file', file, file.name)

@@ -8,7 +8,8 @@ import type {
   ResolvedAppearanceFollowerNodeTransform,
 } from "../appearanceDials.contracts";
 import { APPEARANCE_QUATERNION_LENGTH_TOLERANCE } from "../appearanceDials.validation";
-import { sanitizeCustomRuntimeNodeName } from "../customAvatar";
+import { sanitizeCustomRuntimeNodeName } from "../customRuntimeNames";
+import type { AnatomyFitResult } from "./anatomyFitContracts";
 
 export const APPEARANCE_RECIPE_PHYSICAL_BASIS_CONTRACT =
   "appearance-recipe-physical-basis/v1" as const;
@@ -70,8 +71,8 @@ export type AppearanceRecipePhysicalBasis = {
     driver: AppearanceFollowerDriverRef;
     node: string;
     morph: string;
-    /** Present only when the optional runtime node/morph exists. */
-    positionBindingId?: string;
+    /** Present only when the optional runtime node/morph exists. One id per mesh primitive. */
+    positionBindingIds?: string[];
   }>;
   nodes: Array<{
     id: string;
@@ -371,7 +372,11 @@ function validateFollowerDriver(
   if (!driver || typeof driver !== "object" || Array.isArray(driver)) {
     fail(`${context} driver must be an object`);
   }
-  if (driver.kind !== "dial" && driver.kind !== "target") {
+  if (
+    driver.kind !== "dial" &&
+    driver.kind !== "target" &&
+    driver.kind !== "anatomy-fit"
+  ) {
     fail(`${context} has an unsupported driver kind`);
   }
   assertId(driver.id, `${context} driver id`);
@@ -385,17 +390,24 @@ function followerDriverEqual(
 }
 
 function followerDeltaMatrix(
-  entry: ResolvedAppearanceFollowerNodeTransform,
+  entry: Pick<
+    ResolvedAppearanceFollowerNodeTransform,
+    "translation" | "rotation" | "scale" | "pivot"
+  > & { follower?: string; channel?: string; nodeId?: string },
 ): THREE.Matrix4 {
+  const label =
+    entry.follower && entry.channel
+      ? `${entry.follower}/${entry.channel}`
+      : `Anatomy Fit node ${entry.nodeId ?? "unknown"}`;
   const translation = new THREE.Matrix4().makeTranslation(
     ...finiteVec3(
       entry.translation,
-      `${entry.follower}/${entry.channel} translation`,
+      `${label} translation`,
     ),
   );
   const pivotValue = finiteVec3(
     entry.pivot,
-    `${entry.follower}/${entry.channel} pivot`,
+    `${label} pivot`,
   );
   const pivot = new THREE.Matrix4().makeTranslation(...pivotValue);
   const inversePivot = new THREE.Matrix4().makeTranslation(
@@ -405,17 +417,17 @@ function followerDeltaMatrix(
   );
   const rotationValue = finiteQuat(
     entry.rotation,
-    `${entry.follower}/${entry.channel} rotation`,
+    `${label} rotation`,
   );
   assertUnitQuaternion(
     rotationValue,
-    `${entry.follower}/${entry.channel} rotation`,
+    `${label} rotation`,
   );
   const rotation = new THREE.Matrix4().makeRotationFromQuaternion(
     new THREE.Quaternion(...rotationValue),
   );
   const scale = new THREE.Matrix4().makeScale(
-    ...finiteVec3(entry.scale, `${entry.follower}/${entry.channel} scale`),
+    ...finiteVec3(entry.scale, `${label} scale`),
   );
   return assertFiniteMatrix(
     translation
@@ -423,8 +435,44 @@ function followerDeltaMatrix(
       .multiply(rotation)
       .multiply(scale)
       .multiply(inversePivot),
-    `${entry.follower}/${entry.channel} follower delta matrix`,
+    `${label} follower delta matrix`,
   );
+}
+
+function orderedAnatomyFitResults(
+  results: readonly AnatomyFitResult[] | undefined,
+): AnatomyFitResult[] {
+  const ordered = [...(results ?? [])].sort((left, right) =>
+    left.domain.localeCompare(right.domain),
+  );
+  const seenDomains = new Set<string>();
+  const seenNodes = new Set<string>();
+  const seenMorphs = new Set<string>();
+  for (const result of ordered) {
+    if (result.status !== "converged" || !result.convergence.converged) {
+      fail(`Anatomy Fit result ${result.domain} is not reusable`);
+    }
+    if (seenDomains.has(result.domain)) {
+      fail(`Anatomy Fit duplicates domain ${result.domain}`);
+    }
+    seenDomains.add(result.domain);
+    for (const transform of result.nodeTransforms) {
+      if (seenNodes.has(transform.nodeId)) {
+        fail(`Anatomy Fit writes node ${transform.nodeId} more than once`);
+      }
+      seenNodes.add(transform.nodeId);
+    }
+    for (const morph of result.followerMorphCoefficients) {
+      const key = `${morph.followerId}\u0000${morph.channelId}`;
+      if (seenMorphs.has(key)) {
+        fail(
+          `Anatomy Fit writes follower morph ${morph.followerId}/${morph.channelId} more than once`,
+        );
+      }
+      seenMorphs.add(key);
+    }
+  }
+  return ordered;
 }
 
 function deltaLength(delta: AppearanceRecipePositionDelta): number {
@@ -645,11 +693,6 @@ function validatePhysicalBasis(
     assertId(binding.node, `${binding.id}.node`);
     assertId(binding.morph, `${binding.id}.morph`);
     const key = followerKey(binding.follower, binding.channel);
-    if (followerMorphKeys.has(key)) {
-      fail(
-        `follower morph ${binding.follower}/${binding.channel} is ambiguous`,
-      );
-    }
     followerMorphKeys.add(key);
     const mesh = meshById.get(binding.meshId);
     if (!mesh)
@@ -683,7 +726,7 @@ function validatePhysicalBasis(
       );
     }
     followerMorphInventoryKeys.add(key);
-    if (binding.positionBindingId === undefined) {
+    if (binding.positionBindingIds === undefined) {
       if (followerMorphKeys.has(key)) {
         fail(
           `follower morph ${binding.follower}/${binding.channel} omits its present physical binding`,
@@ -691,32 +734,43 @@ function validatePhysicalBasis(
       }
       continue;
     }
-    assertId(
-      binding.positionBindingId,
-      `${binding.follower}/${binding.channel} positionBindingId`,
-    );
-    const physical = followerMorphPositionById.get(binding.positionBindingId);
-    if (!physical) {
-      fail(
-        `follower morph ${binding.follower}/${binding.channel} references missing position binding`,
-      );
-    }
     if (
-      physical.follower !== binding.follower ||
-      physical.channel !== binding.channel ||
-      physical.node !== binding.node ||
-      physical.morph !== binding.morph
+      !Array.isArray(binding.positionBindingIds) ||
+      binding.positionBindingIds.length === 0 ||
+      new Set(binding.positionBindingIds).size !== binding.positionBindingIds.length
     ) {
       fail(
-        `follower morph ${binding.follower}/${binding.channel} changed physical identity`,
+        `follower morph ${binding.follower}/${binding.channel} positionBindingIds must be a non-empty unique array`,
       );
     }
-    if (referencedFollowerPositionIds.has(binding.positionBindingId)) {
-      fail(
-        `follower morph position binding ${binding.positionBindingId} is referenced twice`,
+    for (const positionBindingId of binding.positionBindingIds) {
+      assertId(
+        positionBindingId,
+        `${binding.follower}/${binding.channel} positionBindingIds`,
       );
+      const physical = followerMorphPositionById.get(positionBindingId);
+      if (!physical) {
+        fail(
+          `follower morph ${binding.follower}/${binding.channel} references missing position binding`,
+        );
+      }
+      if (
+        physical.follower !== binding.follower ||
+        physical.channel !== binding.channel ||
+        physical.node !== binding.node ||
+        physical.morph !== binding.morph
+      ) {
+        fail(
+          `follower morph ${binding.follower}/${binding.channel} changed physical identity`,
+        );
+      }
+      if (referencedFollowerPositionIds.has(positionBindingId)) {
+        fail(
+          `follower morph position binding ${positionBindingId} is referenced twice`,
+        );
+      }
+      referencedFollowerPositionIds.add(positionBindingId);
     }
-    referencedFollowerPositionIds.add(binding.positionBindingId);
   }
   if (referencedFollowerPositionIds.size !== followerMorphPositionById.size) {
     const missing = [...followerMorphPositionById.keys()].filter(
@@ -1105,9 +1159,11 @@ function validateResolvedState(
 export function evaluateAppearanceRecipePhysicalOutput(
   basis: AppearanceRecipePhysicalBasis,
   state: ResolvedAppearanceDialState,
+  options: { anatomyFitResults?: readonly AnatomyFitResult[] } = {},
 ): AppearanceRecipePhysicalEvaluation {
   const validated = validatePhysicalBasis(basis);
   validateResolvedState(basis, validated, state);
+  const anatomyFitResults = orderedAnatomyFitResults(options.anatomyFitResults);
 
   const positionsByMesh = new Map(
     basis.meshes.map((mesh) => [mesh.id, mesh.basePositions.slice()]),
@@ -1142,16 +1198,40 @@ export function evaluateAppearanceRecipePhysicalOutput(
   for (let index = 0; index < state.followerState.morphs.length; index += 1) {
     const morph = state.followerState.morphs[index]!;
     const inventory = basis.followerMorphBindings[index]!;
-    if (inventory.positionBindingId === undefined) continue;
-    const binding = validated.followerMorphPositionById.get(
-      inventory.positionBindingId,
-    )!;
-    applyPositionDelta(
-      binding.meshId,
-      binding.positionDelta,
-      morph.weight,
-      `follower morph binding ${binding.id} delta`,
-    );
+    for (const positionBindingId of inventory.positionBindingIds ?? []) {
+      const binding = validated.followerMorphPositionById.get(positionBindingId)!;
+      applyPositionDelta(
+        binding.meshId,
+        binding.positionDelta,
+        morph.weight,
+        `follower morph binding ${binding.id} delta`,
+      );
+    }
+  }
+  for (const result of anatomyFitResults) {
+    for (const coefficient of result.followerMorphCoefficients) {
+      const matches = basis.followerMorphBindings.filter(
+        (binding) =>
+          binding.follower === coefficient.followerId &&
+          binding.channel === coefficient.channelId &&
+          binding.node === coefficient.nodeId &&
+          binding.morph === coefficient.morph,
+      );
+      if (matches.length !== 1 || matches[0]!.positionBindingIds === undefined) {
+        fail(
+          `Anatomy Fit morph ${coefficient.followerId}/${coefficient.channelId} does not bind a physical recipe-only POSITION channel`,
+        );
+      }
+      for (const positionBindingId of matches[0]!.positionBindingIds!) {
+        const binding = validated.followerMorphPositionById.get(positionBindingId)!;
+        applyPositionDelta(
+          binding.meshId,
+          binding.positionDelta,
+          coefficient.weight,
+          `Anatomy Fit ${result.domain} morph ${coefficient.followerId}/${coefficient.channelId}`,
+        );
+      }
+    }
   }
 
   const retainedTargetPositionBindings =
@@ -1194,7 +1274,6 @@ export function evaluateAppearanceRecipePhysicalOutput(
     offsetsByBoneId.set(basis.jointOffsetBindings[index]!.boneId, vector);
   }
   const zero = new THREE.Vector3();
-  const jointRests: AppearanceRecipePhysicalEvaluation["jointRests"] = [];
   for (const bone of basis.bones) {
     const node = validated.nodeById.get(bone.nodeId)!;
     const baseLocal = validated.baseLocalByNodeId.get(bone.nodeId)!;
@@ -1205,7 +1284,6 @@ export function evaluateAppearanceRecipePhysicalOutput(
     assertFiniteVector3(position, `bone ${bone.name} base position`);
     assertFiniteQuaternion(rotation, `bone ${bone.name} base rotation`);
     assertFiniteVector3(scale, `bone ${bone.name} base scale`);
-    const baseLocalPosition = position.clone();
     const ownOffset = offsetsByBoneId.get(bone.id) ?? zero;
     const parentBone = node.parentId
       ? validated.boneByNodeId.get(node.parentId)
@@ -1239,59 +1317,6 @@ export function evaluateAppearanceRecipePhysicalOutput(
       `bone ${bone.name} local matrix`,
     );
     localByNodeId.set(bone.nodeId, local);
-    jointRests.push({
-      boneId: bone.id,
-      bone: bone.name,
-      nodeId: bone.nodeId,
-      ...(parentBone ? { parentBoneId: parentBone.id } : {}),
-      avatarRootOffset: tupleFromVector(ownOffset),
-      baseLocalPosition: tupleFromVector(baseLocalPosition),
-      localPosition: tupleFromVector(position),
-      localMatrix: arrayFromMatrix(local),
-    });
-  }
-
-  const skins = basis.skins.map((skin) => ({
-    id: skin.id,
-    joints: skin.joints.map((joint) => {
-      const offset = offsetsByBoneId.get(joint.boneId) ?? zero;
-      const inverse = matrixFrom(
-        joint.baseInverseBindMatrix,
-        `skin ${skin.id}/${joint.boneId} inverse bind`,
-        false,
-      );
-      if (offset.lengthSq() > 0) {
-        inverse.multiply(
-          new THREE.Matrix4().makeTranslation(-offset.x, -offset.y, -offset.z),
-        );
-      }
-      assertFiniteMatrix(
-        inverse,
-        `skin ${skin.id}/${joint.boneId} output inverse bind`,
-      );
-      return {
-        boneId: joint.boneId,
-        inverseBindMatrix: arrayFromMatrix(inverse),
-      };
-    }),
-  }));
-
-  let hipsClipRemap: AppearanceRecipePhysicalEvaluation["hipsClipRemap"] = null;
-  if (basis.hipsBone) {
-    const hips = resolveBoneByName(validated, basis.hipsBone);
-    const rest = jointRests.find((candidate) => candidate.boneId === hips.id)!;
-    const ratio =
-      Math.abs(rest.baseLocalPosition[1]) > 1e-6
-        ? rest.localPosition[1] / rest.baseLocalPosition[1]
-        : 1;
-    finite(ratio, `hips ${hips.name} remap ratio`);
-    hipsClipRemap = {
-      boneId: hips.id,
-      bone: hips.name,
-      baseRest: [...rest.baseLocalPosition],
-      newRest: [...rest.localPosition],
-      ratio,
-    };
   }
 
   const transformsByNode = new Map<
@@ -1307,7 +1332,10 @@ export function evaluateAppearanceRecipePhysicalOutput(
   // captured rest per manifest node binding and applies those bindings in its
   // validated inventory order.
   for (const binding of basis.followerNodeBindings) {
-    const composed = validated.baseLocalByNodeId.get(binding.nodeId)!.clone();
+    // A declared follower anchor may be a real skeleton node. Start from the
+    // already-resolved joint-follow rest so declaring that anchor never erases
+    // an identity-owned pivot offset before Anatomy Fit composes on top.
+    const composed = localByNodeId.get(binding.nodeId)!.clone();
     for (const transform of transformsByNode.get(binding.id) ?? []) {
       composed.premultiply(followerDeltaMatrix(transform));
       assertFiniteMatrix(
@@ -1331,6 +1359,171 @@ export function evaluateAppearanceRecipePhysicalOutput(
     );
   }
 
+  const rootRelativeForCurrentLocals = () => {
+    const result = new Map<string, THREE.Matrix4>();
+    const resolve = (nodeId: string): THREE.Matrix4 => {
+      const cached = result.get(nodeId);
+      if (cached) return cached;
+      const node = validated.nodeById.get(nodeId)!;
+      const local = localByNodeId.get(nodeId)!;
+      const rootRelative = node.parentId
+        ? resolve(node.parentId).clone().multiply(local)
+        : local.clone();
+      result.set(
+        nodeId,
+        assertFiniteMatrix(rootRelative, `node ${nodeId} root-relative matrix`),
+      );
+      return rootRelative;
+    };
+    for (const node of basis.nodes) resolve(node.id);
+    return result;
+  };
+  const nodeDepth = (nodeId: string) => {
+    let depth = 0;
+    let current = validated.nodeById.get(nodeId);
+    while (current?.parentId) {
+      depth += 1;
+      current = validated.nodeById.get(current.parentId);
+    }
+    return depth;
+  };
+  const anatomyNodeTransforms = anatomyFitResults
+    .flatMap((result) =>
+      result.nodeTransforms.map((transform) => ({
+        domain: result.domain,
+        transform,
+        nodeId: validated.followerNodeById.get(transform.nodeId),
+      })),
+    )
+    .map((entry) => {
+      if (!entry.nodeId) {
+        fail(
+          `Anatomy Fit node ${entry.transform.nodeId} is not a physical follower node`,
+        );
+      }
+      return { ...entry, nodeId: entry.nodeId };
+    })
+    .sort((left, right) =>
+      nodeDepth(left.nodeId) - nodeDepth(right.nodeId) ||
+      left.domain.localeCompare(right.domain) ||
+      left.transform.nodeId.localeCompare(right.transform.nodeId),
+    );
+  for (const { domain, transform, nodeId } of anatomyNodeTransforms) {
+    const currentRoot = rootRelativeForCurrentLocals();
+    const node = validated.nodeById.get(nodeId)!;
+    const rootDelta = matrixFrom(
+      transform.rootDeltaMatrix,
+      `Anatomy Fit ${domain}/${transform.nodeId} root delta`,
+      false,
+    );
+    const targetRoot = assertFiniteMatrix(
+      rootDelta.clone().multiply(currentRoot.get(nodeId)!),
+      `Anatomy Fit ${domain}/${transform.nodeId} target root matrix`,
+    );
+    const targetLocal = node.parentId
+      ? currentRoot.get(node.parentId)!.clone().invert().multiply(targetRoot)
+      : targetRoot;
+    const position = new THREE.Vector3();
+    const rotation = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    targetLocal.decompose(position, rotation, scale);
+    assertFiniteVector3(position, `Anatomy Fit node ${transform.nodeId} position`);
+    assertFiniteQuaternion(rotation, `Anatomy Fit node ${transform.nodeId} rotation`);
+    assertFiniteVector3(scale, `Anatomy Fit node ${transform.nodeId} scale`);
+    const decomposed = assertFiniteMatrix(
+      new THREE.Matrix4().compose(position, rotation, scale),
+      `Anatomy Fit node ${transform.nodeId} local matrix`,
+    );
+    const shearError = decomposed.elements.reduce(
+      (maximum, value, index) =>
+        Math.max(maximum, Math.abs(value - targetLocal.elements[index]!)),
+      0,
+    );
+    if (shearError > 1e-7) {
+      fail(
+        `Anatomy Fit node ${transform.nodeId} root delta cannot be represented as one glTF local TRS (error ${shearError})`,
+      );
+    }
+    localByNodeId.set(nodeId, decomposed);
+  }
+
+  const rootRelativeByNodeId = rootRelativeForCurrentLocals();
+  const jointRests: AppearanceRecipePhysicalEvaluation["jointRests"] = [];
+  for (const bone of basis.bones) {
+    const node = validated.nodeById.get(bone.nodeId)!;
+    const baseLocal = validated.baseLocalByNodeId.get(bone.nodeId)!;
+    const basePosition = new THREE.Vector3();
+    baseLocal.decompose(
+      basePosition,
+      new THREE.Quaternion(),
+      new THREE.Vector3(),
+    );
+    const local = localByNodeId.get(bone.nodeId)!;
+    const position = new THREE.Vector3();
+    local.decompose(position, new THREE.Quaternion(), new THREE.Vector3());
+    const rootDelta = rootRelativeByNodeId
+      .get(bone.nodeId)!
+      .clone()
+      .multiply(validated.baseRootRelativeByNodeId.get(bone.nodeId)!.clone().invert());
+    const avatarRootOffset = new THREE.Vector3().setFromMatrixPosition(rootDelta);
+    const parentBone = node.parentId
+      ? validated.boneByNodeId.get(node.parentId)
+      : undefined;
+    jointRests.push({
+      boneId: bone.id,
+      bone: bone.name,
+      nodeId: bone.nodeId,
+      ...(parentBone ? { parentBoneId: parentBone.id } : {}),
+      avatarRootOffset: tupleFromVector(avatarRootOffset),
+      baseLocalPosition: tupleFromVector(basePosition),
+      localPosition: tupleFromVector(position),
+      localMatrix: arrayFromMatrix(local),
+    });
+  }
+
+  const skins = basis.skins.map((skin) => ({
+    id: skin.id,
+    joints: skin.joints.map((joint) => {
+      const bone = validated.boneById.get(joint.boneId)!;
+      const rootDelta = rootRelativeByNodeId
+        .get(bone.nodeId)!
+        .clone()
+        .multiply(validated.baseRootRelativeByNodeId.get(bone.nodeId)!.clone().invert());
+      const inverse = matrixFrom(
+        joint.baseInverseBindMatrix,
+        `skin ${skin.id}/${joint.boneId} inverse bind`,
+        false,
+      ).multiply(rootDelta.invert());
+      return {
+        boneId: joint.boneId,
+        inverseBindMatrix: arrayFromMatrix(
+          assertFiniteMatrix(
+            inverse,
+            `skin ${skin.id}/${joint.boneId} output inverse bind`,
+          ),
+        ),
+      };
+    }),
+  }));
+
+  let hipsClipRemap: AppearanceRecipePhysicalEvaluation["hipsClipRemap"] = null;
+  if (basis.hipsBone) {
+    const hips = resolveBoneByName(validated, basis.hipsBone);
+    const rest = jointRests.find((candidate) => candidate.boneId === hips.id)!;
+    const ratio =
+      Math.abs(rest.baseLocalPosition[1]) > 1e-6
+        ? rest.localPosition[1] / rest.baseLocalPosition[1]
+        : 1;
+    finite(ratio, `hips ${hips.name} remap ratio`);
+    hipsClipRemap = {
+      boneId: hips.id,
+      bone: hips.name,
+      baseRest: [...rest.baseLocalPosition],
+      newRest: [...rest.localPosition],
+      ratio,
+    };
+  }
+
   const rootMatrix = matrixFrom(basis.rootBaseMatrix, "rootBaseMatrix", true);
   const rootPosition = new THREE.Vector3();
   const rootRotation = new THREE.Quaternion();
@@ -1349,21 +1542,6 @@ export function evaluateAppearanceRecipePhysicalOutput(
   assertFiniteVector3(rootPosition, "root grounded position");
   rootMatrix.compose(rootPosition, rootRotation, rootScale);
   assertFiniteMatrix(rootMatrix, "root evaluated matrix");
-
-  const rootRelativeByNodeId = new Map<string, THREE.Matrix4>();
-  const resolveRootRelative = (nodeId: string): THREE.Matrix4 => {
-    const cached = rootRelativeByNodeId.get(nodeId);
-    if (cached) return cached;
-    const node = validated.nodeById.get(nodeId)!;
-    const local = localByNodeId.get(nodeId)!;
-    const result = node.parentId
-      ? resolveRootRelative(node.parentId).clone().multiply(local)
-      : local.clone();
-    assertFiniteMatrix(result, `node ${nodeId} root-relative matrix`);
-    rootRelativeByNodeId.set(nodeId, result);
-    return result;
-  };
-  for (const node of basis.nodes) resolveRootRelative(node.id);
 
   const nodes = basis.nodes.map((node) => {
     const rootRelative = rootRelativeByNodeId.get(node.id)!;

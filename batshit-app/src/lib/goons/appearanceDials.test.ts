@@ -168,10 +168,10 @@ function buildManifest(): Record<string, any> {
           parent: { kind: "bone", name: "Head" },
           exactNodeMatches: 1,
         },
-        sclera_left: {
-          node: "ScleraLeft",
+        composite_cap_left: {
+          node: "BS_Eye_L_CompositeCap",
           kind: "mesh",
-          role: "eye-sclera",
+          role: "socket-eye-composite-cap",
           side: "left",
           required: true,
           scalePolicy: "any",
@@ -365,7 +365,7 @@ function buildManifest(): Record<string, any> {
             ...provenance("head-assets"),
             license: "LicenseRef-Batshit-First-Party",
           },
-          nodeIds: ["eyes", "sclera_left"],
+          nodeIds: ["eyes", "composite_cap_left"],
           drivers: [
             {
               driver: { kind: "target", id: "head_forward" },
@@ -379,7 +379,7 @@ function buildManifest(): Record<string, any> {
                 {
                   id: "sclera-deform",
                   kind: "morph-weight",
-                  node: "sclera_left",
+                  node: "composite_cap_left",
                   morph: "follow_head_forward",
                   weightRange: [-1, 1],
                   runtimeRetention: "recipe-only",
@@ -455,7 +455,7 @@ function runtimeInventory(): AppearanceRuntimeInventory {
       },
       {
         runtimeId: "sclera-left-0",
-        node: "ScleraLeft",
+        node: "BS_Eye_L_CompositeCap",
         kind: "mesh",
         parentBone: "Head",
         localScale: [1, 1, 1],
@@ -496,6 +496,30 @@ describe("appearance-dials/v2 parser and provenance", () => {
       node: "face",
       morph: "head_forward",
     });
+  });
+
+  it("collects only morph targets from versioned weighted semantic recipes", () => {
+    const raw = buildManifest();
+    raw.face.expressions.happy = {
+      schemaVersion: "batshit-expression-recipe/v1",
+      targets: [
+        { target: "mouthSmileLeft", weight: 0.55 },
+        { target: "cheekSquintLeft", weight: 0.32 },
+      ],
+    };
+    const manifest = parseAppearanceDialsManifest(raw);
+
+    expect(manifest?.mappedFaceMorphNames).toEqual([
+      "blink",
+      "cheekSquintLeft",
+      "eyeBlinkLeft",
+      "eyeWideLeft",
+      "mouthSmileLeft",
+      "scar",
+    ]);
+    expect(manifest?.mappedFaceMorphNames).not.toContain(
+      "batshit-expression-recipe/v1",
+    );
   });
 
   it("allows package dials to omit obsolete inline descriptions with an empty string", () => {
@@ -559,7 +583,7 @@ describe("appearance-dials/v2 parser and provenance", () => {
 
   it("enforces exact node roles, sides, and acyclic hierarchy", () => {
     const wrongEyeSide = buildManifest();
-    wrongEyeSide.appearanceDials.nodes.sclera_left.side = "none";
+    wrongEyeSide.appearanceDials.nodes.composite_cap_left.side = "none";
     expect(() => parseAppearanceDialsManifest(wrongEyeSide)).toThrow(
       "requires a left/right side",
     );
@@ -572,7 +596,7 @@ describe("appearance-dials/v2 parser and provenance", () => {
     );
   });
 
-  it("accepts one brow and eye-treatment canvas per side while preserving eye/oral uniqueness", () => {
+  it("accepts one cap, brow, and eye-treatment canvas per side while preserving eye/oral uniqueness", () => {
     const perSide = buildManifest();
     Object.assign(perSide.appearanceDials.nodes, {
       brow_left: appearanceNode("BS_BrowCanvas_L", "brow-canvas", "left"),
@@ -586,6 +610,12 @@ describe("appearance-dials/v2 parser and provenance", () => {
         "BS_EyeTreatmentCanvas_R",
         "eye-treatment-canvas",
         "right",
+      ),
+      composite_cap_right: appearanceNode(
+        "BS_Eye_R_CompositeCap",
+        "socket-eye-composite-cap",
+        "right",
+        { parent: { kind: "bone", name: "Head" } },
       ),
       teeth_upper: appearanceNode("BS_Teeth_Upper", "teeth-upper", "none"),
     });
@@ -608,13 +638,19 @@ describe("appearance-dials/v2 parser and provenance", () => {
     );
 
     const duplicateEyeSide = structuredClone(perSide);
-    duplicateEyeSide.appearanceDials.nodes.sclera_left_second = appearanceNode(
-      "BS_Sclera_Second_L",
-      "eye-sclera",
+    duplicateEyeSide.appearanceDials.nodes.composite_cap_left_second = appearanceNode(
+      "BS_Eye_Second_L_CompositeCap",
+      "socket-eye-composite-cap",
       "left",
     );
     expect(() => parseAppearanceDialsManifest(duplicateEyeSide)).toThrow(
-      "role/side eye-sclera/left is duplicated",
+      "role/side socket-eye-composite-cap/left is duplicated",
+    );
+
+    const retiredGlobeRole = structuredClone(perSide);
+    retiredGlobeRole.appearanceDials.nodes.composite_cap_left.role = "eye-sclera";
+    expect(() => parseAppearanceDialsManifest(retiredGlobeRole)).toThrow(
+      "appearance node composite_cap_left is malformed",
     );
 
     const duplicateOralRole = structuredClone(perSide);
@@ -691,7 +727,7 @@ describe("target usages, corrective ownership, and Recipe retention", () => {
     expect(inventory.bakeAndRemoveFollowerMorphs).toContainEqual({
       follower: "head-assets",
       channel: "sclera-deform",
-      node: "sclera_left",
+      node: "composite_cap_left",
       morph: "follow_head_forward",
     });
     expect(inventory.bakeFollowerNodeTransforms).toContainEqual({
@@ -1041,7 +1077,7 @@ describe("typed follower contract", () => {
     follower.drivers[0].channels.push({
       id: "aaa-sclera-trs",
       kind: "node-trs",
-      node: "sclera_left",
+      node: "composite_cap_left",
       samples: followerSamples(),
     });
     const manifest = parse(raw);
@@ -1071,7 +1107,7 @@ describe("typed follower contract", () => {
       expect.objectContaining({
         follower: "head-assets",
         channel: "sclera-deform",
-        node: "sclera_left",
+        node: "composite_cap_left",
         weight: 0.5,
       }),
     ]);

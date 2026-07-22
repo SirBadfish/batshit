@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { BRAND_ICON_MAP } from '$lib/data/brand-icons.generated'
+import { getLucideIconComponent } from './lucideIconRegistry'
 import {
   BATSHIT_ICON_CATALOG,
   BRAND_ICON_CATALOG,
@@ -104,10 +105,17 @@ describe('Batshit icon catalog', () => {
 
   it('checks whether structured icon refs point at available picker entries', () => {
     expect(isCatalogIconRef({ kind: 'lucide', id: 'image' })).toBe(true)
+    expect(isCatalogIconRef({ kind: 'lucide', id: 'file-axis-3d' })).toBe(true)
     expect(isCatalogIconRef({ kind: 'brand', slug: 'huggingface-color' })).toBe(true)
     expect(isCatalogIconRef({ kind: 'batshit', id: 'artifacts' })).toBe(true)
 
     expect(isCatalogIconRef({ kind: 'lucide', id: 'smile' })).toBe(false)
     expect(isCatalogIconRef({ kind: 'brand', slug: 'made-up-runtime-color' })).toBe(false)
+  })
+
+  it('renders the registered 3D-file symbol instead of the unknown-icon fallback', () => {
+    expect(getLucideIconComponent('file-axis-3d')).not.toBe(
+      getLucideIconComponent('made-up-runtime-icon')
+    )
   })
 })

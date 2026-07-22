@@ -7,6 +7,7 @@ import {
   mergeDefaultPackIntoSettings
 } from '$lib/goons/packs'
 import type { GoonRecord, GoonsSettings } from '$lib/types/goons'
+import { DEFAULT_SOCKET_EYE_CONTACT_SETTINGS } from '$lib/goons/socketEyeContact'
 
 const baseSettings: GoonsSettings = {
   dockOpen: false,
@@ -89,6 +90,12 @@ const baseGoon: GoonRecord = {
       headPitchSpeed: 0.8,
       eyeYawHeadCompensation: 1.2,
       eyePitchHeadCompensation: 0.5
+    },
+    socketEyeContact: {
+      ...DEFAULT_SOCKET_EYE_CONTACT_SETTINGS,
+      strength: 0.8,
+      headFollow: 0.6,
+      response: 0.4
     }
   },
   created_at: '2026-03-15T00:00:00.000Z',
@@ -103,6 +110,7 @@ describe('goon packs helpers', () => {
     expect(pack.defaults?.baseLoop).toBe('calm')
     expect(pack.defaults?.sceneId).toBe('lounge')
     expect(pack.defaults?.eyeContactMode).toBe('expression')
+    expect(pack.defaults?.socketEyeContact).toEqual(baseGoon.defaults?.socketEyeContact)
     expect(pack.defaults?.eyeContactTuning).toEqual({
       eyeYawSensitivity: 2.5,
       eyeYawRange: 1.75,
@@ -192,6 +200,7 @@ describe('goon packs helpers', () => {
     expect(updates?.defaults?.baseLoop).toBe('calm')
     expect(updates?.defaults?.quality).toBe('high')
     expect(updates?.defaults?.eyeContactMode).toBe('expression')
+    expect(updates?.defaults?.socketEyeContact).toEqual(baseGoon.defaults?.socketEyeContact)
     expect(updates?.defaults?.eyeContactTuning).toEqual({
       eyeYawSensitivity: 2.5,
       eyeYawRange: 1.75,

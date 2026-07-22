@@ -11,6 +11,15 @@ import {
   normalizeGoonLipSyncTimelineDuration,
   sampleGoonLipSyncTimeline
 } from './goonLipSync'
+import { RHUBARB_9_SPEECH_FACE_PROFILE } from '$lib/goons/speechFaceProfiles'
+
+function sampleRhubarb(timeline: Parameters<typeof sampleGoonLipSyncTimeline>[0], timeMs: number) {
+  const frame = sampleGoonLipSyncTimeline(timeline, timeMs)
+  if (frame.profile !== RHUBARB_9_SPEECH_FACE_PROFILE) {
+    throw new Error(`Expected Rhubarb-9 frame, received ${frame.profile}.`)
+  }
+  return frame.weights
+}
 
 describe('goonLipSync', () => {
   it('builds a time-based viseme timeline that changes mouth shapes across the phrase', () => {
@@ -20,7 +29,13 @@ describe('goonLipSync', () => {
     expect(timeline?.keyframes.length ?? 0).toBeGreaterThan(3)
 
     const maxWeight = (viseme: 'clenched' | 'pucker' | 'wide_open') =>
-      Math.max(...(timeline?.keyframes ?? []).map((keyframe) => keyframe.weights[viseme]))
+      Math.max(
+        ...(timeline?.keyframes ?? []).map((keyframe) =>
+          keyframe.frame.profile === RHUBARB_9_SPEECH_FACE_PROFILE
+            ? keyframe.frame.weights[viseme]
+            : 0
+        )
+      )
 
     expect(maxWeight('clenched')).toBeGreaterThan(0.9)
     expect(maxWeight('pucker')).toBeGreaterThan(0.9)
@@ -50,7 +65,13 @@ describe('goonLipSync', () => {
     const maxWeight = (
       viseme: 'closed' | 'teeth_lip' | 'clenched' | 'pucker' | 'tongue_lift'
     ) =>
-      Math.max(...(timeline?.keyframes ?? []).map((keyframe) => keyframe.weights[viseme]))
+      Math.max(
+        ...(timeline?.keyframes ?? []).map((keyframe) =>
+          keyframe.frame.profile === RHUBARB_9_SPEECH_FACE_PROFILE
+            ? keyframe.frame.weights[viseme]
+            : 0
+        )
+      )
 
     expect(maxWeight('closed')).toBeGreaterThan(0.9)
     expect(maxWeight('teeth_lip')).toBeGreaterThan(0.8)
@@ -61,11 +82,15 @@ describe('goonLipSync', () => {
 
   it('converts blended viseme weights into a capped mouth openness value', () => {
     const openness = getGoonLipSyncOpenness({
-      wide_open: 0.7,
-      mid_open: 0.3,
-      pucker: 0.2,
-      clenched: 0.1,
-      round: 0
+      profile: RHUBARB_9_SPEECH_FACE_PROFILE,
+      weights: {
+        ...createEmptyGoonLipSyncWeights(),
+        wide_open: 0.7,
+        mid_open: 0.3,
+        pucker: 0.2,
+        clenched: 0.1,
+        round: 0
+      }
     })
 
     expect(openness).toBeGreaterThan(0.7)
@@ -100,21 +125,22 @@ describe('goonLipSync', () => {
     const timeline = {
       analyzerId: 'rhubarb-wasm' as const,
       source: 'audio-analysis' as const,
+      profile: RHUBARB_9_SPEECH_FACE_PROFILE,
       durationMs: 200,
       unitCount: 2,
       sourceText: 'pop',
       visemeBlendMs: DEFAULT_GOON_LIP_SYNC_VISEME_BLEND_MS,
       keyframes: [
-        { timeMs: 0, weights: closed },
-        { timeMs: 100, weights: closed },
-        { timeMs: 100, weights: wideOpen },
-        { timeMs: 200, weights: wideOpen }
+        { timeMs: 0, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: closed } },
+        { timeMs: 100, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: closed } },
+        { timeMs: 100, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: wideOpen } },
+        { timeMs: 200, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: wideOpen } }
       ]
     }
 
-    const beforeBoundary = sampleGoonLipSyncTimeline(timeline, 95)
-    const atBoundary = sampleGoonLipSyncTimeline(timeline, 100)
-    const afterBoundary = sampleGoonLipSyncTimeline(timeline, 105)
+    const beforeBoundary = sampleRhubarb(timeline, 95)
+    const atBoundary = sampleRhubarb(timeline, 100)
+    const afterBoundary = sampleRhubarb(timeline, 105)
 
     expect(beforeBoundary.closed).toBeGreaterThan(beforeBoundary.wide_open)
     expect(beforeBoundary.wide_open).toBeGreaterThan(0)
@@ -130,13 +156,14 @@ describe('goonLipSync', () => {
     const timeline = {
       analyzerId: 'rhubarb-wasm' as const,
       source: 'audio-analysis' as const,
+      profile: RHUBARB_9_SPEECH_FACE_PROFILE,
       durationMs: 1000,
       unitCount: 2,
       sourceText: 'hello',
       keyframes: [
-        { timeMs: 0, weights: rest },
-        { timeMs: 500, weights: wideOpen },
-        { timeMs: 1000, weights: rest }
+        { timeMs: 0, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: rest } },
+        { timeMs: 500, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: wideOpen } },
+        { timeMs: 1000, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: rest } }
       ]
     }
 
@@ -146,7 +173,7 @@ describe('goonLipSync', () => {
 
     expect(stretched?.durationMs).toBe(2000)
     expect(stretched?.keyframes.map((keyframe) => keyframe.timeMs)).toEqual([0, 1000, 2000])
-    expect(sampleGoonLipSyncTimeline(stretched, 1000).wide_open).toBe(1)
+    expect(sampleRhubarb(stretched, 1000).wide_open).toBe(1)
 
     expect(defaultNoShrink).toBe(timeline)
     expect(compressed?.durationMs).toBe(500)

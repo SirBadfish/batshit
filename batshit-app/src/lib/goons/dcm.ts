@@ -165,7 +165,7 @@ export function buildGoonDcmLines(
   )
   if (includeSpokenCues) {
     lines.push(
-      'One-shot goon motions and emoji emotes only fire on spoken replies with TTS timing. Use *goon: motion_name* or the emoji mappings below when the reply will be spoken.'
+      'One-shot goon Motions and facial-only emoji Emotes fire on spoken replies with TTS timing. Use *goon: motion_name* for a body Motion or the emoji mappings below for a facial Emote.'
     )
     lines.push('If an emote has Pause speech timing, that authored pause wins.')
     lines.push(
@@ -207,7 +207,7 @@ export function buildGoonDcmLines(
 
   if (includeSpokenCues && blockingCues.length > 0) {
     lines.push(
-      `Pause speech motions: ${formatList(sortUnique(blockingCues), limits.maxCuesPerGroup)}`
+      `Pause speech emotes: ${formatList(sortUnique(blockingCues), limits.maxCuesPerGroup)}`
     )
   }
 

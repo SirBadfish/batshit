@@ -1,7 +1,13 @@
 import type { AppearanceDialValueState } from "$lib/goons/appearanceDials";
-import type { FacialArtworkStateV3 } from "$lib/goons/facialArtwork";
-import type { EyeAppearanceStateV1 } from "$lib/goons/eyeAppearance";
-import type { GoonRecipeV1, GoonRecipeV2 } from "$lib/goons/recipe";
+import type { FacialArtworkStateV4 } from "$lib/goons/facialArtwork";
+import type { EyeAppearanceStateV3 } from "$lib/goons/eyeAppearance";
+import type { OralAppearanceStateV1 } from "$lib/goons/oralAppearance";
+import type { SocketEyeContactSettingsV2 } from "$lib/goons/socketEyeContact";
+import type {
+  GoonRecipeFitReceipt,
+  GoonRecipeV1,
+  GoonRecipeV2,
+} from "$lib/goons/recipe";
 
 export type GoonCompatibilityTier = "A" | "B" | "C" | "pending";
 export type GoonKind = "vrm" | "custom";
@@ -482,6 +488,7 @@ export type GoonDefaults = {
   lipSync?: boolean;
   eyeContactMode?: GoonEyeContactMode;
   eyeContactTuning?: GoonEyeContactTuning;
+  socketEyeContact?: SocketEyeContactSettingsV2;
   sceneId?: string;
   bodyVariantId?: string;
   closetOutfitId?: string;
@@ -494,6 +501,7 @@ export type GoonDefaultPackDefaults = Pick<
   | "lipSync"
   | "eyeContactMode"
   | "eyeContactTuning"
+  | "socketEyeContact"
   | "sceneId"
 >;
 
@@ -518,6 +526,12 @@ export type GoonCustomManifestSummary = {
   contractVersion?: number;
   name?: string;
   description?: string;
+  /** Exact Recipe base identity when the package declares one. */
+  baseId?: string;
+  /** Capability hint only; exact Recipe verification still gates activation. */
+  recipeReady?: boolean;
+  /** Capability hint for automatic authoring-time Anatomy Fit recompute. */
+  anatomyFitReady?: boolean;
 };
 
 export type GoonGuidedOutfitPiece = {
@@ -609,9 +623,13 @@ export interface GoonRecord {
   /** Versioned first-party appearance state (avatar.json#appearanceDials contract). */
   appearanceDials?: AppearanceDialValueState | null;
   /** Recipe-owned facial artwork state, bound to avatar.json#facialArtwork. */
-  facialArtwork?: FacialArtworkStateV3 | null;
+  facialArtwork?: FacialArtworkStateV4 | null;
   /** Package-owned linked physical eye state, bound to avatar.json#eyeAppearance. */
-  eyeAppearance?: EyeAppearanceStateV1 | null;
+  eyeAppearance?: EyeAppearanceStateV3 | null;
+  /** Package-owned oral material state, bound to avatar.json#oralAppearance. */
+  oralAppearance?: OralAppearanceStateV1 | null;
+  /** Revision-bound hair/clothing/conceal/attachment fit evidence. */
+  recipeFitReceipts?: GoonRecipeFitReceipt[];
   guidedAvatar?: GoonGuidedAvatarFiles;
   compatibility?: GoonCompatibilityReport;
   vrmUpdate?: GoonVrmUpdateReport | null;

@@ -13,7 +13,12 @@
   } from '$lib/goons/faceControls'
 
   type FaceControlsEditorProps = {
-    presetOptions?: Array<{ value: GoonExpressionPreset; label: string }>
+    presetOptions?: Array<{
+      value: GoonExpressionPreset
+      label: string
+      available?: boolean
+      unavailableReason?: string
+    }>
     getPresetValue?: (preset: GoonExpressionPreset) => number
     onPresetChange?: (preset: GoonExpressionPreset, value: number) => void
     sections: FaceControlSection[]
@@ -82,11 +87,25 @@
       <Collapsible.Content class="goon-level-3-accordion-content">
         {#each presetOptions as preset (preset.value)}
           {@const value = getPresetValue(preset.value)}
-          <div class="goon-face-slider-field">
+          {@const unavailable = preset.available === false}
+          <div
+            class="goon-face-slider-field"
+            data-unavailable={unavailable}
+            title={unavailable ? preset.unavailableReason : undefined}
+          >
             <div class="goon-face-row-between">
-              <span class="goon-face-label">{preset.label}</span>
+              <span class="goon-face-label goon-face-preset-label">
+                {preset.label}
+                {#if unavailable}
+                  <span class="goon-face-unavailable-badge">Unavailable</span>
+                {/if}
+              </span>
               <span class="goon-face-value">
-                {formatPresetDisplayValue(value)}
+                {unavailable
+                  ? value > 0
+                    ? `Saved ${formatPresetDisplayValue(value)} · Not mapped`
+                    : 'Not mapped'
+                  : formatPresetDisplayValue(value)}
               </span>
             </div>
             <div class="goon-face-inline-row">
@@ -99,10 +118,28 @@
                 min={0}
                 max={1}
                 step={0.01}
+                disabled={unavailable}
+                aria-label={`${preset.label} expression${unavailable ? ' unavailable' : ''}`}
                 class="goon-face-slider"
               />
               <span class="goon-face-range-label goon-face-range-label-small">100%</span>
             </div>
+            {#if unavailable && preset.unavailableReason}
+              <div class="goon-face-unavailable-detail">
+                <span class="goon-face-unavailable-reason">{preset.unavailableReason}</span>
+                {#if value > 0}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    class="goon-face-remove-unavailable"
+                    onclick={() => onPresetChange(preset.value, 0)}
+                  >
+                    Remove saved weight
+                  </Button>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/each}
       </Collapsible.Content>
@@ -247,6 +284,49 @@
 
   .goon-face-label {
     font-size: 0.75rem;
+  }
+
+  .goon-face-preset-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .goon-face-unavailable-badge {
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: 999px;
+    color: var(--muted-foreground);
+    font-size: 0.5625rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    line-height: 1;
+    padding: 3px 5px;
+    text-transform: uppercase;
+  }
+
+  .goon-face-slider-field[data-unavailable='true'] {
+    opacity: 0.72;
+  }
+
+  .goon-face-unavailable-detail {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-left: 3rem;
+  }
+
+  .goon-face-unavailable-reason {
+    color: var(--muted-foreground);
+    font-size: 0.625rem;
+    line-height: 1.35;
+  }
+
+  :global(.goon-face-remove-unavailable) {
+    flex-shrink: 0;
+    height: 22px;
+    color: var(--muted-foreground);
+    font-size: 0.625rem;
   }
 
   .goon-face-value,

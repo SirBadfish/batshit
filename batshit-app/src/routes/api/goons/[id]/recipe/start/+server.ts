@@ -12,8 +12,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       goonId: owner.goonId,
       expectedWriteVersion: body.expectedWriteVersion,
       idempotencyKey: body.idempotencyKey,
-      planRef: body.planRef,
-      containmentReceipt: body.containmentReceipt
+      analysisId: body.analysisId
     })
     return json(result)
   } catch (error) {

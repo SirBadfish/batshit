@@ -22,6 +22,7 @@ import Cpu from '@lucide/svelte/icons/cpu'
 import Database from '@lucide/svelte/icons/database'
 import File from '@lucide/svelte/icons/file'
 import FileArchive from '@lucide/svelte/icons/file-archive'
+import FileAxis3d from '@lucide/svelte/icons/file-axis-3d'
 import FileBraces from '@lucide/svelte/icons/file-braces'
 import FileChartColumn from '@lucide/svelte/icons/file-chart-column'
 import FileChartPie from '@lucide/svelte/icons/file-chart-pie'
@@ -111,6 +112,7 @@ export const LUCIDE_ICON_COMPONENTS: Record<string, Component> = {
   database: Database,
   file: File,
   'file-archive': FileArchive,
+  'file-axis-3d': FileAxis3d,
   'file-braces': FileBraces,
   'file-chart-column': FileChartColumn,
   'file-chart-pie': FileChartPie,

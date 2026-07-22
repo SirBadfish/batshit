@@ -19,6 +19,7 @@ import {
   verifyRecipeUpdateJob,
   verifyRecipeUpdatesContract,
   verifyRecipeUpdatesForSource,
+  type RecipeMigrationReportExpectation,
 } from "./updateContracts";
 
 const mutable = <T>(value: T): any => structuredClone(value);
@@ -188,6 +189,111 @@ describe("recipe update v1/v2 fixture corpus", () => {
       proofStatus: "failed",
     });
     expect(report.status).toBe("blocked");
+  });
+
+  it("binds an unsupported analysis report to its blocked server plan instead of claiming a verified remap", async () => {
+    const edge = parseRecipeUpdatesContract(recipeUpdatesFixture).edges[0];
+    const report = mutable(recipeMigrationReportFixture);
+    const entry = report.entries.find(
+      (candidate: { id: string }) => candidate.id === "affine_remap",
+    );
+    entry.classification = "blocked";
+    entry.proposedValue = null;
+    entry.proofStatus = "failed";
+    entry.requiresPreview = true;
+    entry.requiresConfirmation = false;
+    report.status = "blocked";
+    const expectation: RecipeMigrationReportExpectation = {
+      classifications: Object.fromEntries(
+        edge.controls.map((control) => [
+          control.id,
+          control.id === "affine_remap"
+            ? "blocked"
+            : report.entries.find(
+                (candidate: { id: string }) => candidate.id === control.id,
+              ).classification,
+        ]),
+      ),
+      status: "blocked",
+    };
+    report.proof.reportSha256 = await recipeMigrationReportSha256(
+      report,
+      edge,
+      expectation,
+    );
+
+    await expect(
+      verifyRecipeMigrationReport(report, edge, expectation),
+    ).resolves.toMatchObject({
+      status: "blocked",
+      entries: expect.arrayContaining([
+        expect.objectContaining({
+          id: "affine_remap",
+          classification: "blocked",
+          proofStatus: "failed",
+        }),
+      ]),
+    });
+    await expect(verifyRecipeMigrationReport(report, edge)).rejects.toThrow(
+      /contradicts its edge/,
+    );
+  });
+
+  it("binds a clean-reset report to reset, new, and removed plan outcomes", async () => {
+    const edge = parseRecipeUpdatesContract(recipeUpdatesFixture).edges[0];
+    const report = mutable(recipeMigrationReportFixture);
+    const classifications = Object.fromEntries(
+      edge.controls.map((control) => [
+        control.id,
+        control.action === "new"
+          ? "new"
+          : control.action === "removed"
+            ? "removed"
+            : "reset-required",
+      ]),
+    ) as RecipeMigrationReportExpectation["classifications"];
+    for (const entry of report.entries) {
+      entry.classification = classifications[entry.id];
+      entry.proposedValue = entry.classification === "removed" ? null : 0;
+      entry.proofStatus = ["new", "removed"].includes(entry.classification)
+        ? "not-required"
+        : "not-preserved";
+      entry.requiresPreview = true;
+      entry.requiresConfirmation = true;
+    }
+    report.status = "preview-required";
+    const expectation: RecipeMigrationReportExpectation = {
+      classifications,
+      status: "preview-required",
+    };
+    report.proof.reportSha256 = await recipeMigrationReportSha256(
+      report,
+      edge,
+      expectation,
+    );
+
+    await expect(
+      verifyRecipeMigrationReport(report, edge, expectation),
+    ).resolves.toMatchObject({
+      status: "preview-required",
+      entries: expect.arrayContaining([
+        expect.objectContaining({
+          id: "removed_zero",
+          classification: "removed",
+          requiresConfirmation: true,
+        }),
+        expect.objectContaining({
+          id: "new_control",
+          classification: "new",
+          requiresConfirmation: true,
+        }),
+        expect.objectContaining({
+          id: "affine_remap",
+          classification: "reset-required",
+          proofStatus: "not-preserved",
+        }),
+      ]),
+    });
   });
 });
 

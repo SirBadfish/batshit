@@ -11,13 +11,16 @@ import {
   GOON_RECIPE_OWNER_V2_CONTRACT,
   GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
   parseGoonRecipeJob,
+  parseGoonRecipeFitReceipt,
   parseRecipeRevisionEnvelope,
+  recipeRevisionIdentity,
   recipeAuthoringRevisionSha256,
   recipeDocumentRedisKey,
   recipeJobRedisKey,
   recipeRevisionBundleSha256,
   recipeRevisionEnvelopeSha256,
   recipeRevisionRedisKey,
+  reconcileGoonRecipeFitReceipts,
   verifyGoonRecipeDocument,
   verifyGoonRecipeV2,
   verifyRecipeRevisionEnvelope,
@@ -2251,6 +2254,14 @@ async function validateRecipeRestoreGraph(records: BackupRedisRecord[], userId: 
 
 async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: string) {
   const revisionHashByKey = new Map<string, string>()
+  const revisionIdentityByKey = new Map<
+    string,
+    ReturnType<typeof recipeRevisionIdentity>
+  >()
+  const revisionIdentityByGoonRevision = new Map<
+    string,
+    ReturnType<typeof recipeRevisionIdentity>
+  >()
   for (const record of records) {
     if (record.type !== 'json' || !record.key.startsWith(`goon_recipe_revision:${userId}:`)) continue
     try {
@@ -2259,6 +2270,13 @@ async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: s
       envelope.envelopeSha256 = await recipeRevisionEnvelopeSha256(envelope)
       record.value = envelope
       revisionHashByKey.set(record.key, envelope.envelopeSha256)
+      const identity = recipeRevisionIdentity(envelope.revision)
+      const goonId = record.key.split(':')[2] ?? ''
+      revisionIdentityByKey.set(record.key, identity)
+      revisionIdentityByGoonRevision.set(
+        `${goonId}:${identity.recipeRevision}:${identity.revisionId}`,
+        identity
+      )
     } catch (error) {
       recipeRestoreError(
         `${record.key} could not be rehashed after user remapping: ${error instanceof Error ? error.message : String(error)}`
@@ -2285,6 +2303,29 @@ async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: s
         } catch (error) {
           recipeRestoreError(
             `${record.key} authoring revision could not be rehashed: ${error instanceof Error ? error.message : String(error)}`
+          )
+        }
+      }
+      if (Array.isArray(record.value.recipeFitReceipts)) {
+        try {
+          const goonId = String(record.value.id ?? '')
+          const receipts = record.value.recipeFitReceipts.map((value) => {
+            const receipt = parseGoonRecipeFitReceipt(value)
+            const mappedBound = revisionIdentityByGoonRevision.get(
+              `${goonId}:${receipt.boundRevision.recipeRevision}:${receipt.boundRevision.revisionId}`
+            )
+            return mappedBound ? { ...receipt, boundRevision: mappedBound } : receipt
+          })
+          const activeIdentity = isPlainObject(owner.activeRevision) &&
+            typeof owner.activeRevision.ref === 'string'
+            ? revisionIdentityByKey.get(owner.activeRevision.ref)
+            : undefined
+          record.value.recipeFitReceipts = activeIdentity
+            ? reconcileGoonRecipeFitReceipts(receipts, activeIdentity)
+            : receipts
+        } catch (error) {
+          recipeRestoreError(
+            `${record.key} Recipe fit receipts could not be remapped: ${error instanceof Error ? error.message : String(error)}`
           )
         }
       }

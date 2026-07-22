@@ -15,7 +15,9 @@ import {
 } from '$lib/server/services/goonAssetCleanupService'
 import { validateGoonFacialArtworkState } from '$lib/server/services/facialArtwork.server'
 import { validateGoonEyeAppearanceState } from '$lib/server/services/eyeAppearance.server'
+import { validateGoonOralAppearanceState } from '$lib/server/services/oralAppearance.server'
 import { collectFacialArtworkUploads } from '$lib/goons/facialArtwork'
+import { parseSocketEyeContactSettings } from '$lib/goons/socketEyeContact'
 import {
   GoonMutationError,
   assertGenericGoonPatchAllowed,
@@ -81,6 +83,20 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
         created_at: existing.created_at,
         updated_at: new Date().toISOString()
       }
+      if (
+        Object.prototype.hasOwnProperty.call(updates, 'defaults') &&
+        updates.defaults &&
+        typeof updates.defaults === 'object' &&
+        !Array.isArray(updates.defaults) &&
+        Object.prototype.hasOwnProperty.call(updates.defaults, 'socketEyeContact')
+      ) {
+        updated.defaults = {
+          ...updated.defaults,
+          socketEyeContact: parseSocketEyeContactSettings(
+            (updates.defaults as Record<string, unknown>).socketEyeContact
+          )
+        }
+      }
       if (Object.prototype.hasOwnProperty.call(updates, 'facialArtwork')) {
         updated.facialArtwork = await validateGoonFacialArtworkState(
           client as any,
@@ -93,6 +109,13 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
           client as any,
           updated,
           updates.eyeAppearance
+        )
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, 'oralAppearance')) {
+        updated.oralAppearance = await validateGoonOralAppearanceState(
+          client as any,
+          updated,
+          updates.oralAppearance
         )
       }
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
@@ -124,8 +147,10 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     }
     if (
       error instanceof Error &&
-      (error.message.startsWith('[facial-artwork/v3]') ||
-        error.message.startsWith('[eye-appearance/v1]'))
+      (error.message.startsWith('[facial-artwork/v4]') ||
+        error.message.startsWith('[eye-appearance/v3]') ||
+        error.message.startsWith('[socket-eye-contact-settings/v2]') ||
+        error.message.startsWith('[oral-appearance/v1]'))
     ) {
       return json({ error: error.message }, { status: 400 })
     }

@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { describe, expect, it } from "vitest";
@@ -192,6 +190,7 @@ function packageGlb(
     nonzeroWeight?: boolean;
     duplicateJoint?: boolean;
     extraRecipePrimitive?: boolean;
+    alignedRecipePrimitive?: boolean;
     unboundOffset?: number;
     missingUnboundPosition?: boolean;
     omitInactiveMalformedSkin?: boolean;
@@ -274,6 +273,21 @@ function packageGlb(
             },
             ...(options.extraRecipePrimitive
               ? [{ attributes: { POSITION: bodyBase } }]
+              : []),
+            ...(options.alignedRecipePrimitive
+              ? [
+                  {
+                    attributes: {
+                      POSITION: bodyBase,
+                      JOINTS_0: bodyJoints,
+                      WEIGHTS_0: bodyWeights,
+                    },
+                    targets: [
+                      { POSITION: bodyShape },
+                      { POSITION: bodyCorrective },
+                    ],
+                  },
+                ]
               : []),
           ],
         },
@@ -373,54 +387,6 @@ function performanceRig() {
   };
 }
 
-function eyeAppearance() {
-  const source = JSON.parse(
-    readFileSync(
-      resolve(
-        process.cwd(),
-        "static/goons/eye-appearance/v1/eye-appearance-v1.json",
-      ),
-      "utf8",
-    ),
-  );
-  const names = {
-    left: {
-      eyeBone: "LeftEye",
-      assemblyNodes: {
-        sclera: "LeftSclera",
-        cornea: "LeftCornea",
-        iris: "LeftIris",
-        pupil: "LeftPupil",
-      },
-    },
-    right: {
-      eyeBone: "RightEye",
-      assemblyNodes: {
-        sclera: "RightSclera",
-        cornea: "RightCornea",
-        iris: "RightIris",
-        pupil: "RightPupil",
-      },
-    },
-  } as const;
-  for (const side of ["left", "right"] as const) {
-    const binding = source.runtimeBindings[side];
-    binding.eyeBone = names[side].eyeBone;
-    binding.assemblyNodes = names[side].assemblyNodes;
-    binding.eyeHighlightMaterialNodes = [
-      names[side].assemblyNodes.iris,
-      names[side].assemblyNodes.pupil,
-    ];
-    binding.conformal.scleraNode = names[side].assemblyNodes.sclera;
-    binding.conformal.irisNode = names[side].assemblyNodes.iris;
-    binding.conformal.pupilNode = names[side].assemblyNodes.pupil;
-  }
-  source.completeEyeAssemblyNodes = Object.values(names).flatMap((entry) =>
-    Object.values(entry.assemblyNodes),
-  );
-  return source;
-}
-
 function avatarManifest(): JsonRecord {
   return {
     stage: {
@@ -434,7 +400,6 @@ function avatarManifest(): JsonRecord {
       performance: performanceRig(),
       correctives: { entries: [{ target: "corrective" }] },
     },
-    eyeAppearance: eyeAppearance(),
     appearanceDials: {
       contract: APPEARANCE_DIALS_CONTRACT,
       definitionSha256: HASH_C,
@@ -819,7 +784,7 @@ describe("appearance Recipe physical GLB model", () => {
         driver: { kind: "target", id: "shape" },
         node: "follower_mesh",
         morph: "follow_shape",
-        positionBindingId: "follower:fit:a-morph",
+        positionBindingIds: ["follower:fit:a-morph"],
       },
       {
         follower: "fit",
@@ -849,7 +814,7 @@ describe("appearance Recipe physical GLB model", () => {
     expect(
       basis.roles.filter((role) => role.kind === "performance"),
     ).toHaveLength(5);
-    expect(basis.roles.filter((role) => role.kind === "eye")).toHaveLength(10);
+    expect(basis.roles.filter((role) => role.kind === "eye")).toHaveLength(0);
     expect(
       basis.roles.find((role) => role.kind === "attachment"),
     ).toMatchObject({
@@ -917,6 +882,28 @@ describe("appearance Recipe physical GLB model", () => {
     );
   });
 
+  it("keeps every aligned primitive of one Recipe mesh as an independent material owner", () => {
+    const basis = buildAppearanceRecipePhysicalBasisFromGlb(
+      packageGlb({ alignedRecipePrimitive: true }),
+      avatarManifest(),
+    );
+    expect(basis.meshes.map((mesh) => mesh.id)).toContain("mesh:6:1");
+    expect(
+      basis.targetPositionBindings.filter((binding) => binding.targetId === "shape"),
+    ).toMatchObject([
+      { id: "target:shape:0:0", meshId: "mesh:6:0" },
+      { id: "target:shape:0:1", meshId: "mesh:6:1" },
+    ]);
+    expect(
+      basis.retainedTargetPositionBindings.filter(
+        (binding) => binding.targetId === "corrective",
+      ),
+    ).toMatchObject([
+      { id: "retained:corrective:0:0", meshId: "mesh:6:0" },
+      { id: "retained:corrective:0:1", meshId: "mesh:6:1" },
+    ]);
+  });
+
   it("rejects nonzero Recipe ownership and inactive-scene role references", () => {
     expect(() =>
       buildAppearanceRecipePhysicalBasisFromGlb(
@@ -963,7 +950,7 @@ describe("appearance Recipe physical GLB model", () => {
         packageGlb({ extraRecipePrimitive: true }),
         avatarManifest(),
       ),
-    ).toThrow(/exactly one primitive/);
+    ).toThrow(/morph target names and payloads are misaligned/);
     expect(() =>
       buildAppearanceRecipePhysicalBasisFromGlb(
         packageGlb({ missingUnboundPosition: true }),
@@ -981,7 +968,7 @@ describe("appearance Recipe physical GLB model", () => {
       "nodeId",
     );
     expect(optional.followerMorphBindings[1]).not.toHaveProperty(
-      "positionBindingId",
+      "positionBindingIds",
     );
 
     const target = avatarManifest();

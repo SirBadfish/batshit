@@ -27,7 +27,7 @@ const packagedServerRoot = join(packagedRuntimeRoot, 'batshit-server', 'server')
 const packagedLiveKitSidecarSourceRoot = join(packagedRuntimeRoot, 'tools', 'livekit-agent-sidecar');
 const packagedRedisStackRoot = join(packagedRuntimeRoot, 'vendor', 'redis-stack');
 const packagedFfmpegRoot = join(packagedRuntimeRoot, 'vendor', 'ffmpeg');
-const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v3';
+const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v4';
 const packagedFacialArtworkRoot = join(
   packagedRuntimeRoot,
   ...FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
@@ -3310,14 +3310,14 @@ async function packageAudit(packagePath) {
   }
   const facialArtworkAssets = runtimeManifest?.assets?.facialArtwork;
   if (
-    facialArtworkAssets?.contract !== 'facial-artwork/v3' ||
+    facialArtworkAssets?.contract !== 'facial-artwork/v4' ||
     facialArtworkAssets?.root !== FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT ||
-    facialArtworkAssets?.definition !== 'facial-artwork-v3.json' ||
+    facialArtworkAssets?.definition !== 'facial-artwork-v4.json' ||
     !Array.isArray(facialArtworkAssets?.files) ||
     facialArtworkAssets.files.length < 22
   ) {
     runtimeAssetIssues.push(
-      'runtime-manifest.json is missing the complete facial-artwork/v3 trusted asset inventory.'
+      'runtime-manifest.json is missing the complete facial-artwork/v4 trusted asset inventory.'
     );
   } else {
     const seenPaths = new Set();
@@ -3356,7 +3356,7 @@ async function packageAudit(packagePath) {
       }
     }
     if (!seenPaths.has(facialArtworkAssets.definition)) {
-      runtimeAssetIssues.push('The facial-artwork/v3 definition is absent from its runtime asset inventory.');
+      runtimeAssetIssues.push('The facial-artwork/v4 definition is absent from its runtime asset inventory.');
     }
   }
 

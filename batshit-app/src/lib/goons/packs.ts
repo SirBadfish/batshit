@@ -4,7 +4,8 @@ import {
   normalizeGoonEyeContactMultiplier,
   normalizeGoonEyeContactSpeed
 } from '$lib/goons/customAvatar'
-import { normalizeGoonsSettings, resolveGoonCues } from '$lib/goons/resolve'
+import { normalizeGoonCueMap, normalizeGoonsSettings, resolveGoonCues } from '$lib/goons/resolve'
+import { parseSocketEyeContactSettings } from '$lib/goons/socketEyeContact'
 import type {
   GoonCueDefinition,
   GoonCueMap,
@@ -141,6 +142,9 @@ function normalizeDefaultPackDefaults(
       eyePitchHeadCompensation: normalizeGoonEyeContactCompensation(tuning.eyePitchHeadCompensation)
     }
   }
+  if (defaults.socketEyeContact) {
+    next.socketEyeContact = parseSocketEyeContactSettings(defaults.socketEyeContact)
+  }
   if (typeof defaults.sceneId === 'string' && defaults.sceneId.trim()) {
     next.sceneId = defaults.sceneId.trim()
   }
@@ -161,6 +165,7 @@ export function buildDefaultPackFromGoon(
     lipSync: goon.defaults?.lipSync,
     eyeContactMode: goon.defaults?.eyeContactMode,
     eyeContactTuning: goon.defaults?.eyeContactTuning,
+    socketEyeContact: goon.defaults?.socketEyeContact,
     sceneId: goon.defaults?.sceneId
   })
 
@@ -263,18 +268,26 @@ export function importGoonLibraryExportBundle(
   const importedCues = [...(bundle.moods ?? []), ...(bundle.emotes ?? [])]
   for (const cue of importedCues) {
     const originalName = cue.name?.trim() || 'motion'
+    const normalizedCue = normalizeGoonCueMap({
+      [originalName]: {
+        ...clone(cue),
+        name: originalName
+      }
+    })[originalName]
+    if (!normalizedCue) continue
     const nextName = uniqueName(originalName, takenCueNames)
     if (nextName !== originalName) {
       renamedCueNames[originalName] = nextName
     }
     nextCueMap[nextName] = {
-      ...clone(cue),
+      ...normalizedCue,
       name: nextName
     }
   }
 
   for (const [emoji, cueName] of Object.entries(bundle.emojiMap ?? {})) {
     const nextCueName = renamedCueNames[cueName] ?? cueName
+    if (nextCueMap[nextCueName]?.kind !== 'emote') continue
     if (nextEmojiMap[emoji] && nextEmojiMap[emoji] !== nextCueName) {
       emojiConflicts.push(emoji)
       continue

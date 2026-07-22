@@ -51,10 +51,7 @@ const ALLOWED_NODE_ROLES = new Set<AppearanceDialNode["role"]>([
   "body",
   "face",
   "generic-follower",
-  "eye-sclera",
-  "eye-iris",
-  "eye-pupil",
-  "eye-cornea",
+  "socket-eye-composite-cap",
   "brow-canvas",
   "eye-treatment-canvas",
   "teeth-upper",
@@ -66,10 +63,7 @@ const ALLOWED_NODE_ROLES = new Set<AppearanceDialNode["role"]>([
 ]);
 
 const EYE_NODE_ROLES = new Set<AppearanceDialNode["role"]>([
-  "eye-sclera",
-  "eye-iris",
-  "eye-pupil",
-  "eye-cornea",
+  "socket-eye-composite-cap",
 ]);
 
 function parseApprovedProvenance(
@@ -193,7 +187,22 @@ export function collectMappedFaceMorphNames(
       for (const entry of Object.values(value)) visit(entry);
     }
   };
-  visit(face.expressions);
+  const expressions = isRecord(face.expressions) ? face.expressions : null;
+  if (expressions) {
+    for (const value of Object.values(expressions)) {
+      if (
+        isRecord(value) &&
+        value.schemaVersion === "batshit-expression-recipe/v1" &&
+        Array.isArray(value.targets)
+      ) {
+        for (const target of value.targets) {
+          if (isRecord(target)) visit(target.target);
+        }
+      } else {
+        visit(value);
+      }
+    }
+  }
   visit(face.controls);
   visit(face.customMorphs);
   return names;
@@ -631,7 +640,8 @@ export function parseFollowers(
         !isRecord(rawDriver) ||
         !isRecord(rawDriver.driver) ||
         (rawDriver.driver.kind !== "dial" &&
-          rawDriver.driver.kind !== "target") ||
+          rawDriver.driver.kind !== "target" &&
+          rawDriver.driver.kind !== "anatomy-fit") ||
         !isStableId(rawDriver.driver.id) ||
         !Array.isArray(rawDriver.channels) ||
         rawDriver.channels.length === 0
@@ -654,12 +664,14 @@ export function parseFollowers(
       const inputRange =
         driver.kind === "dial"
           ? dialRanges.get(driver.id)
-          : hasOwn(targets, driver.id)
+          : driver.kind === "target" && hasOwn(targets, driver.id)
             ? ([
                 targets[driver.id].influenceMin,
                 targets[driver.id].influenceMax,
               ] as [number, number])
-            : undefined;
+            : driver.kind === "anatomy-fit"
+              ? ([-1, 1] as [number, number])
+              : undefined;
       if (!inputRange) {
         throw new Error(
           "appearance follower " +
@@ -693,6 +705,12 @@ export function parseFollowers(
         const declaration = nodes[rawChannel.node];
 
         if (rawChannel.kind === "node-trs") {
+          if (driver.kind === "anatomy-fit") {
+            throw new Error(
+              "appearance follower " + id +
+                " cannot expose Anatomy Fit through an ordinary node channel",
+            );
+          }
           const operationKey = "node-trs\u0000" + rawChannel.node;
           if (seenOperations.has(operationKey)) {
             throw new Error(
@@ -744,7 +762,8 @@ export function parseFollowers(
           samples[0][0] > inputRange[0] + ZERO_TOLERANCE ||
           samples[samples.length - 1][0] < inputRange[1] - ZERO_TOLERANCE ||
           Math.abs(evaluateAppearanceDialTrack(samples, 0)) > ZERO_TOLERANCE ||
-          samples.every(([, output]) => Math.abs(output) <= ZERO_TOLERANCE) ||
+          (driver.kind !== "anatomy-fit" &&
+            samples.every(([, output]) => Math.abs(output) <= ZERO_TOLERANCE)) ||
           samples.some(
             ([, output]) => output < weightRange[0] || output > weightRange[1],
           )

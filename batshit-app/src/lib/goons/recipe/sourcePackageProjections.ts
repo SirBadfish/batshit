@@ -293,7 +293,7 @@ function morphAccessor(
   nodeIndex: number,
   morphNameValue: unknown,
   context: string,
-): unknown {
+): Array<{ primitiveIndex: number; accessor: unknown }> {
   const morphName = nonEmptyString(morphNameValue, context);
   const node = parsed.nodes[nodeIndex];
   const meshIndex = integer(node.mesh, `${context} node.mesh`);
@@ -308,7 +308,7 @@ function morphAccessor(
     fail(`${context} has duplicate morph names`);
   const targetIndex = names.indexOf(morphName);
   if (targetIndex < 0) fail(`${context} morph ${morphName} is missing`);
-  const matches: unknown[] = [];
+  const matches: Array<{ primitiveIndex: number; accessor: unknown }> = [];
   for (const [primitiveIndex, primitive] of primitiveRecords(
     parsed,
     nodeIndex,
@@ -324,14 +324,34 @@ function morphAccessor(
       targets[targetIndex],
       `${context} morph ${morphName}`,
     );
-    if (target.POSITION !== undefined) matches.push(target.POSITION);
+    if (target.POSITION !== undefined) {
+      matches.push({ primitiveIndex, accessor: target.POSITION });
+    }
   }
-  if (matches.length !== 1) {
-    fail(
-      `${context} morph ${morphName} has ${matches.length} POSITION accessors`,
-    );
+  if (matches.length === 0) {
+    fail(`${context} morph ${morphName} has no POSITION accessors`);
   }
-  return matches[0];
+  return matches;
+}
+
+async function hashMorphPositionAccessors(
+  parsed: ParsedGlb,
+  accessors: Array<{ primitiveIndex: number; accessor: unknown }>,
+): Promise<string> {
+  if (accessors.length === 1) {
+    return hashNumbers(decodeAccessor(parsed, accessors[0].accessor));
+  }
+  return canonicalRecipeSha256({
+    contract: "recipe-morph-position-deltas/v1",
+    primitives: await Promise.all(
+      accessors.map(async ({ primitiveIndex, accessor }) => ({
+        primitiveIndex,
+        positionDeltaSha256: await hashNumbers(
+          decodeAccessor(parsed, accessor),
+        ),
+      })),
+    ),
+  });
 }
 
 function appearanceNodeIndex(
@@ -581,7 +601,26 @@ function localMatrix(node: JsonRecord, context: string): number[] {
   // malformed rotations instead of silently repairing them. Keep the old
   // normalization policy isolated to this immutable v1 identity projection;
   // the R2 physical model consumes the exact semantic transform above.
-  const length = Math.hypot(...exact.rotation);
+  // `Math.hypot` is implementation-approximated by ECMAScript. V8 and
+  // JavaScriptCore differ by one ULP for several real Base Female rotations,
+  // which made the exact same Recipe Source hash differently in the Mac app
+  // than in the Node-side package finalizer. Spell out the compensated scaled
+  // sum used when this v1 identity was frozen so every JS engine produces the
+  // already-audited digest.
+  let maximum = 0;
+  for (const component of exact.rotation) {
+    maximum = Math.max(maximum, Math.abs(component));
+  }
+  let sum = 0;
+  let compensation = 0;
+  for (const component of exact.rotation) {
+    const scaled = component / maximum;
+    const summand = scaled * scaled - compensation;
+    const preliminary = sum + summand;
+    compensation = preliminary - sum - summand;
+    sum = preliminary;
+  }
+  const length = Math.sqrt(sum) * maximum;
   return resolveSemanticGlbNodeTransform(
     {
       ...node,
@@ -794,7 +833,12 @@ async function physicalBasisProjection(
 
   const morphRefs = new Map<
     string,
-    { nodeId: string; runtimeNode: string; morph: string; accessor: unknown }
+    {
+      nodeId: string;
+      runtimeNode: string;
+      morph: string;
+      accessors: Array<{ primitiveIndex: number; accessor: unknown }>;
+    }
   >();
   const addMorph = (
     nodeIdValue: unknown,
@@ -806,15 +850,17 @@ async function physicalBasisProjection(
     const nodeIndex = appearanceNodeIndex(parsed, context, nodeId, owner);
     const runtimeNode = stableNodeName(parsed, nodeIndex, owner);
     const key = `${nodeId}\u0000${morph}`;
-    const accessor = morphAccessor(parsed, nodeIndex, morph, owner);
+    const accessors = morphAccessor(parsed, nodeIndex, morph, owner);
     const previous = morphRefs.get(key);
     if (
       previous &&
-      (previous.runtimeNode !== runtimeNode || previous.accessor !== accessor)
+      (previous.runtimeNode !== runtimeNode ||
+        canonicalRecipeString(previous.accessors) !==
+          canonicalRecipeString(accessors))
     ) {
       fail(`${owner} resolves an ambiguous morph binding`);
     }
-    morphRefs.set(key, { nodeId, runtimeNode, morph, accessor });
+    morphRefs.set(key, { nodeId, runtimeNode, morph, accessors });
   };
   for (const [targetId, targetValue] of Object.entries(context.targets)) {
     const target = record(targetValue, `appearance target ${targetId}`);
@@ -872,8 +918,9 @@ async function physicalBasisProjection(
       nodeId: entry.nodeId,
       runtimeNode: entry.runtimeNode,
       morph: entry.morph,
-      positionDeltaSha256: await hashNumbers(
-        decodeAccessor(parsed, entry.accessor),
+      positionDeltaSha256: await hashMorphPositionAccessors(
+        parsed,
+        entry.accessors,
       ),
     });
   }
@@ -1264,6 +1311,8 @@ function componentGraphProjection(
           ? `control:${driverId}`
           : driverRef.kind === "target"
             ? `target:${driverId}`
+            : driverRef.kind === "anatomy-fit"
+              ? addNode("anatomy-fit", driverId, "Anatomy Fit driver")
             : fail(`follower ${followerId} has invalid driver kind`);
       if (!nodes.has(driverNode))
         fail(`follower ${followerId} references missing driver ${driverId}`);

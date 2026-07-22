@@ -5,14 +5,15 @@ import {
   RHUBARB_CUE_TO_CUSTOM_RHUBARB_MOUTH_WEIGHTS,
   type RhubarbCueValue
 } from '$lib/goons/semanticVisemes'
+import { RHUBARB_9_SPEECH_FACE_PROFILE } from '$lib/goons/speechFaceProfiles'
 import type {
   GoonLipSyncAnalyzerId,
   GoonLipSyncTimeline,
   GoonLipSyncTimelineDiagnostics,
   GoonLipSyncTimelineKeyframe,
-  GoonLipSyncViseme,
   GoonLipSyncWeights
 } from '$lib/utils/goonLipSync'
+import type { CustomRhubarbMouthCue } from '$lib/goons/semanticVisemes'
 
 export type RhubarbJsonResult = {
   metadata?: {
@@ -41,16 +42,16 @@ function incrementCount(target: Record<string, number>, key: string, amount = 1)
 }
 
 function incrementCueCount(
-  target: Partial<Record<GoonLipSyncViseme, number>>,
-  cue: GoonLipSyncViseme,
+  target: Record<string, number>,
+  cue: CustomRhubarbMouthCue,
   amount = 1
 ) {
   target[cue] = (target[cue] ?? 0) + amount
 }
 
 function setCueMaximum(
-  target: Partial<Record<GoonLipSyncViseme, number>>,
-  cue: GoonLipSyncViseme,
+  target: Record<string, number>,
+  cue: CustomRhubarbMouthCue,
   value: number
 ) {
   target[cue] = Math.max(target[cue] ?? 0, value)
@@ -66,10 +67,10 @@ function buildRhubarbDiagnostics(
 ): GoonLipSyncTimelineDiagnostics {
   const cues = Array.isArray(payload.mouthCues) ? payload.mouthCues : []
   const visemeSymbolCounts: Record<string, number> = {}
-  const primaryCueCounts: Partial<Record<GoonLipSyncViseme, number>> = {}
+  const primaryCueCounts: Record<string, number> = {}
   const cueDurationMs: Record<string, number> = {}
-  const weightMaxima: Partial<Record<GoonLipSyncViseme, number>> = {}
-  const weightedDurationMs: Partial<Record<GoonLipSyncViseme, number>> = {}
+  const weightMaxima: Record<string, number> = {}
+  const weightedDurationMs: Record<string, number> = {}
   const unmappedSymbolCounts = new Map<string, { visemeSymbol: string; count: number }>()
   let mappedCueCount = 0
   let silenceCueCount = 0
@@ -147,12 +148,18 @@ function buildTimelineKeyframes(payload: RhubarbJsonResult): GoonLipSyncTimeline
     const endMs = Math.max(startMs, Math.round((cue.end ?? cue.start ?? 0) * 1000))
     const weights = mapRhubarbCueToWeights(cueValue ?? 'X')
 
-    keyframes.push({ timeMs: startMs, weights })
-    keyframes.push({ timeMs: endMs, weights: { ...weights } })
+    keyframes.push({ timeMs: startMs, frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights } })
+    keyframes.push({
+      timeMs: endMs,
+      frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: { ...weights } }
+    })
   }
 
   if (keyframes.length === 0) {
-    keyframes.push({ timeMs: 0, weights: mapRhubarbCueToWeights('X') })
+    keyframes.push({
+      timeMs: 0,
+      frame: { profile: RHUBARB_9_SPEECH_FACE_PROFILE, weights: mapRhubarbCueToWeights('X') }
+    })
   }
 
   return keyframes
@@ -175,10 +182,16 @@ export function convertRhubarbJsonToTimeline(
   )
 
   if ((keyframes[keyframes.length - 1]?.timeMs ?? 0) < durationMs) {
+    const lastFrame = keyframes[keyframes.length - 1]?.frame
+    const finalWeights =
+      lastFrame?.profile === RHUBARB_9_SPEECH_FACE_PROFILE
+        ? { ...lastFrame.weights }
+        : mapRhubarbCueToWeights('X')
     keyframes.push({
       timeMs: durationMs,
-      weights: {
-        ...(keyframes[keyframes.length - 1]?.weights ?? mapRhubarbCueToWeights('X'))
+      frame: {
+        profile: RHUBARB_9_SPEECH_FACE_PROFILE,
+        weights: finalWeights
       }
     })
   }
@@ -186,6 +199,7 @@ export function convertRhubarbJsonToTimeline(
   return {
     analyzerId,
     source: 'audio-analysis',
+    profile: RHUBARB_9_SPEECH_FACE_PROFILE,
     keyframes,
     durationMs,
     unitCount: Math.max(1, payload.mouthCues?.length ?? 0),

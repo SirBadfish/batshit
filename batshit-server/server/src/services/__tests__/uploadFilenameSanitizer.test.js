@@ -122,3 +122,87 @@ describe('guided outfit manifest parsing', () => {
     ]);
   });
 });
+
+describe('Custom Goon manifest summary', () => {
+  it('marks only authoring packages that declare the Recipe-ready capability shape', () => {
+    const ready = uploadRouter.parseCustomGoonManifest(
+      JSON.stringify({
+        contractVersion: 2,
+        name: 'Batshit Base',
+        recipeSource: {
+          contract: 'recipe-source/v1',
+          baseId: 'batshit-base-f-v1',
+          fitFamily: 'batshit-base-f-v1'
+        },
+        appearanceDials: { contract: 'appearance-dials/v2' },
+        recipeUpdates: { contract: 'recipe-updates/v1', edges: [] }
+      })
+    );
+    expect(ready.summary.baseId).toBe('batshit-base-f-v1');
+    expect(ready.summary.recipeReady).toBe(true);
+    expect(ready.summary.anatomyFitReady).toBe(false);
+
+    const fitting = uploadRouter.parseCustomGoonManifest(
+      JSON.stringify({
+        recipeSource: {
+          contract: 'recipe-source/v1',
+          baseId: 'batshit-base-f-v1',
+          fitFamily: 'batshit-base-f-v1'
+        },
+        appearanceDials: { contract: 'appearance-dials/v2' },
+        recipeUpdates: { contract: 'recipe-updates/v1', edges: [] },
+        anatomyFit: { contract: 'anatomy-fit-manifest/v2' }
+      })
+    );
+    expect(fitting.summary.anatomyFitReady).toBe(true);
+
+    const retiredFitting = uploadRouter.parseCustomGoonManifest(
+      JSON.stringify({
+        recipeSource: {
+          contract: 'recipe-source/v1',
+          baseId: 'batshit-base-f-v1',
+          fitFamily: 'batshit-base-f-v1'
+        },
+        appearanceDials: { contract: 'appearance-dials/v2' },
+        recipeUpdates: { contract: 'recipe-updates/v1', edges: [] },
+        anatomyFit: { contract: 'anatomy-fit-manifest/v1' }
+      })
+    );
+    expect(retiredFitting.summary.anatomyFitReady).toBe(false);
+
+    const legacy = uploadRouter.parseCustomGoonManifest(
+      JSON.stringify({
+        contractVersion: 2,
+        name: 'Legacy Custom Goon',
+        appearanceDials: { contract: 'appearance-dials/v2' }
+      })
+    );
+    expect(legacy.summary.recipeReady).toBe(false);
+    expect(legacy.summary.anatomyFitReady).toBe(false);
+
+    const independent = uploadRouter.parseCustomGoonManifest(
+      JSON.stringify({
+        contractVersion: 2,
+        name: 'Independent Recipe Goon',
+        recipeSource: {
+          contract: 'recipe-source/v1',
+          baseId: 'independent-base-v1',
+          fitFamily: 'independent-base-v1'
+        },
+        appearanceDials: { contract: 'appearance-dials/v2' },
+        recipeUpdates: { contract: 'recipe-updates/v1', edges: [] }
+      })
+    );
+    expect(independent.summary.recipeReady).toBe(false);
+
+    const live = uploadRouter.parseCustomGoonManifest(
+      JSON.stringify({
+        recipeSource: {},
+        appearanceDials: {},
+        recipeUpdates: {},
+        liveBuild: { contract: 'goon-live-build/v1' }
+      })
+    );
+    expect(live.summary.recipeReady).toBe(false);
+  });
+});

@@ -12,11 +12,29 @@ The Goon Dock is a right-sidebar surface. It's intentionally user-opened, becaus
 
 | Goon path | What it is |
 | --- | --- |
-| Standard/VRoid | A direct `.vrm` avatar import. The most straightforward user path. |
-| Advanced/Blender | A `.bgoon` or `.zip` package containing `avatar.vrm` and `avatar.json`, created by a compatible Advanced/Blender authoring workflow. |
-| Advanced/GLB | Expert custom package using `avatar.glb` and `avatar.json`. Implemented, but not the normal pre-launch UI path. |
+| Standard/VRoid | A direct `.vrm` avatar import. The simplest user path, with VRoid's real expression and mouth-shape limits. |
+| Advanced/GLB | A first-party or expert custom package using `avatar.glb` and `avatar.json`. Supported first-party packages prepare automatically, making this the nearly-as-simple but much richer Batshit-owned path. |
+| Advanced/Blender | A `.bgoon` or `.zip` containing `avatar.vrm` and `avatar.json`, created through the most advanced authoring workflow. It is intended for Blender artists and newcomers willing to follow the full preparation, mapping, validation, and export guide. |
 
-VRM 1.0 is the full live avatar runtime format for launch. Advanced/Blender Goons still ride the VRM runtime, with extra manifest data for Batshit-specific face, outfit, and stage behavior. Starter Goons and the default Goon Pack are optional hosted downloads — they aren't bundled as large avatar or motion files inside the app package; importing them stores the assets in your instance.
+Standard/VRoid and Advanced/Blender Goons use the VRM 1.0 runtime. Advanced/GLB Goons use an explicit package manifest for their stage, face, appearance, rig, and baked runtime contracts; arbitrary GLB humanoids are not automatically compatible. Starter Goons and the default Goon Pack are optional hosted downloads — they aren't bundled as large avatar or motion files inside the app package; importing them stores the assets in your instance.
+
+All three are supported product lanes, but they intentionally require different amounts of authoring work. Advanced/Blender is first-class expert support: Batshit provides the compatible add-on workflow, exact mapping rules, clear validation failures, runtime support, and documentation. It does not promise that an arbitrary Blender character becomes ready without rig, blendshape/shape-key, anchor, and export work.
+
+Independent artists can use that expert lane to offer original, commissioned, or properly licensed Batshit-ready models and conversion services. "Batshit-ready" describes technical compatibility only; it does not prove that an artist owns a character or has permission to redistribute it. Buying or locating a model—including a model extracted from a game—does not automatically grant resale rights. Batshit does not host or supply third-party game-character models. Check the model license and the rights holder's current policy before sharing or selling anything.
+
+## First-party Advanced/GLB Goons
+
+The ordinary first-party Advanced/GLB flow is **upload, edit, and Save Goon**:
+
+- After upload, Batshit shows **Preparing** and creates the first verified runtime version automatically. The Goon is not assignable or available in the Dock until it reads **Ready**.
+- You can batch Body Appearance and Face Appearance edits, then click **Save Goon** once. One saved appearance batch produces one checked internal update.
+- Mood, Emote, Motion, camera, Eye Contact behavior, voice, and ordinary runtime-only wardrobe/settings saves do not rebuild geometry.
+- A failed update leaves the previously working Goon usable. **Retry** resumes verified stored work; **Discard** removes only unreferenced pending work.
+- **Restore Previous Version** swaps the complete prior package, appearance, artwork, eye state, and runtime version together.
+
+When a newer supported package is available, choose **Update Goon File**. Batshit offers **Update Goon** only when exact proof passes, **Reset Appearance and Update** only after a safe reset is proven and confirmed, or a clear blocked/ineligible result. **Keep Current** leaves the existing Goon untouched. Exact internal identities, stages, revisions, and proof remain available under **Technical Details** for support and authors.
+
+The first Blender-author update contract is limited to supported first-party Advanced/GLB exports. Loose GLBs, hand-patched packages, and independently authored Advanced/GLB updates are not assumed compatible from names or visual similarity. See [Goon setup and packages](setup-and-packages.md#advancedglb-preparation-and-updates) for the full flow and compatibility matrix.
 
 ## Lip sync
 
@@ -25,15 +43,20 @@ Batshit has two broad lip-sync paths:
 | Path | What it means |
 | --- | --- |
 | Shitty but Fast | Quick amplitude/timing-based mouth movement. A good fallback. |
-| Rhubarb WASM / provider visemes | Better mouth timing where supported. Completed-audio providers use Rhubarb WASM; Inworld realtime TTS can use provider phoneme/viseme timing live. |
+| Rhubarb WASM / provider visemes | Better mouth timing where supported. Completed-audio providers can use Rhubarb WASM; Inworld realtime TTS can use provider phoneme/viseme timing live. |
+| NVIDIA Audio2Face | Optional completed-audio full-face ARKit animation for compatible Advanced/GLB Goons through a separate NVIDIA GPU runtime. |
 
 Rhubarb WASM is an analyzer lane — it analyzes completed audio for mouth shapes, and it's not the same thing as LiveKit. Provider visemes are different: when a realtime TTS provider sends timing, Batshit can use that timing directly without waiting for Rhubarb analysis. Inworld is the current live provider-viseme path: with Inworld realtime TTS plus the Rhubarb WASM / Premium viseme lip-sync lane, Batshit drives the Goon mouth from Inworld's phoneme/viseme timestamps as audio plays.
 
-Some Goons have more mouth shapes than others. Standard/VRoid avatars use their real five-mouth VRM contract, while Advanced/Blender avatars can use richer mouth shapes when the package manifest maps them. If lip sync is timed correctly but the mouth looks too closed or some words look visually weak, that is usually an avatar mouth-shape or manifest-authoring problem rather than a voice timing problem.
+Some Goons have more mouth shapes than others. Standard/VRoid avatars use their real five-mouth VRM contract, while Advanced packages can declare either Batshit's Rhubarb-9 authoring profile or the exact OVR-15 profile used by Inworld timing. Compatible first-party Advanced/GLB packages receive Audio2Face ARKit-52 frames directly; Advanced/Blender packages receive the same full-fidelity face drive only after their manifest explicitly maps all 52 channels. Optional 16-channel tongue output also requires a complete explicit tongue map. Batshit keeps the provider or analyzer detail through playback, then adapts it to the selected Goon only at the final face-mapping step. If lip sync is timed correctly but the mouth looks too closed, robotic, or visually weak on some words, that is usually avatar-specific mouth-shape/expression calibration rather than a voice-timing failure.
 
 ## Moods, emotes, and cues
 
-A **Mood** is a persistent base expression or motion. It stays active until changed. An **Emote** is a one-shot expression or gesture, usually triggered by emoji or stage directions.
+A **Mood** is a persistent base expression or motion. It stays active until changed. An **Emote** is a one-shot facial expression, usually triggered by emoji. Body gestures and other one-shot animations are **Motions**, not Emotes; agents trigger those with a `*goon: motion_name*` stage direction.
+
+Every Goon type uses the same six facial choices when you author a Mood, Emote, or expression step: **Happy, Relaxed, Sad, Angry, Surprised, and Neutral**. Batshit adapts the five active expressions to the selected model's real capabilities. **Neutral** is always available and returns the Goon to its authored resting face; it does not require a separate Neutral blendshape. If that model does not map one of the active expressions, the control stays visible and says **Unavailable** instead of disappearing or looking like a broken slider. A previously saved unsupported weight can still be removed.
+
+Those expression recipes are separate from speech mouth shapes. A facial expression can share a basic control such as opening the jaw, but Batshit does not use an O vowel or another viseme preset as a shortcut for Surprised, Happy, or the other semantic expressions.
 
 Agents can cue Goons with:
 
@@ -52,7 +75,7 @@ When an assistant reply is spoken:
 3. Goon cues are parsed from the original reply.
 4. TTS begins or streams.
 5. The Goon Dock receives playback timing.
-6. Lip sync and emotes play against the voice timeline where possible.
+6. Lip sync, facial Emotes, and one-shot Motions play against the voice timeline where possible.
 
 If the Dock is closed, the agent can still speak — the visual avatar just isn't rendered.
 

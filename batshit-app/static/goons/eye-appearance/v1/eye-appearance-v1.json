@@ -3,10 +3,10 @@
   "stateSchemaVersion": "eye-appearance-state/v1",
   "status": "in-development-product-export-unapproved",
   "productExportApproved": false,
-  "definitionSha256": "893524d10fb17a1523242508e58b195e17a149bd5b6cafda763264c5a1a66cfb",
+  "definitionSha256": "cc52fd4163ccc9c7002337de22ba0d4b0826b83b17434e5ffad35dde21104622",
   "facialArtworkDependency": {
     "schemaVersion": "facial-artwork/v3",
-    "definitionSha256": "c0a9cb6dc2b7e5358dc61e6178ab9366a28d9913c4faa7bb1332500922a70d3a"
+    "definitionSha256": "777f179ef57461ef741890046db996eebdbb350f687e5f5fe547ea8fd21c34e8"
   },
   "ownership": "package-owned physical eye controls stored separately from appearance-dials/v2 and facial-artwork-state/v3; Eye Convergence renders in per-Goon Eye Contact while Iris/Pupil and Sclera Fit render in their owning appearance editors",
   "zeroLaw": "iris/pupil use exact 1.0 neutral multipliers; Eye Convergence logical zero adds the package-calibrated 4-degree inward neutral; all five sclera-fit controls use zero-centered post-fit offsets",

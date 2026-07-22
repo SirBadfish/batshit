@@ -84,6 +84,13 @@ describe('parseJointCorrectives', () => {
       'mixamorig:LeftUpLeg',
       'mixamorig:RightUpLeg'
     ])
+    expect(Object.keys(hipDriver).sort()).toEqual([
+      'bones',
+      'clampDeg',
+      'combine',
+      'id',
+      'kind'
+    ])
 
     // Josh's locked numbers (dial-review-notes §2a-0, 2026-07-08)
     const byKey = Object.fromEntries(spec.entries.map((e) => [e.key, e]))
@@ -106,6 +113,15 @@ describe('parseJointCorrectives', () => {
       expect(entry.driver).toBe('hipFlexion')
       expect(entry.anchorDial).toBe('butt_size')
       expect(entry.mode).toBe('additive')
+      expect(Object.keys(entry).sort()).toEqual([
+        'anchorAt0',
+        'anchorAt1',
+        'anchorDial',
+        'angleCurve',
+        'driver',
+        'key',
+        'mode'
+      ])
       if (entry.key !== 'bs_TEMP_BALL_gap') {
         expect(entry.angleCurve).toEqual([
           [0, 0],

@@ -479,7 +479,7 @@ describe('voiceSchema legacy cutover normalization', () => {
     expect(invalid?.tts?.narration?.italicBehavior).toBe('speak')
   })
 
-  it('preserves Rhubarb WASM and falls back to it for retired or invalid analyzer values', () => {
+  it('preserves current analyzers and falls back to Rhubarb for retired or invalid values', () => {
     const retiredWawa = normalizeVoiceSettings({
       goonLipSync: {
         mode: 'viseme',
@@ -493,6 +493,15 @@ describe('voiceSchema legacy cutover normalization', () => {
       goonLipSync: {
         mode: 'viseme',
         analyzerId: 'rhubarb-wasm'
+      },
+      tts: { providerId: 'browser' },
+      stt: { providerId: 'browser' }
+    })
+
+    const audio2Face = normalizeVoiceSettings({
+      goonLipSync: {
+        mode: 'viseme',
+        analyzerId: 'audio2face-3d'
       },
       tts: { providerId: 'browser' },
       stt: { providerId: 'browser' }
@@ -517,6 +526,7 @@ describe('voiceSchema legacy cutover normalization', () => {
     })
 
     expect(saved.goonLipSync?.analyzerId).toBe('rhubarb-wasm')
+    expect(audio2Face.goonLipSync?.analyzerId).toBe('audio2face-3d')
     expect(retiredWawa.goonLipSync?.analyzerId).toBe('rhubarb-wasm')
     expect(retiredRhubarb.goonLipSync?.analyzerId).toBe('rhubarb-wasm')
     expect(fallback.goonLipSync?.analyzerId).toBe('rhubarb-wasm')

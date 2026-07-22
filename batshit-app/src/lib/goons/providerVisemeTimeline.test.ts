@@ -2,26 +2,35 @@ import { describe, expect, it } from 'vitest'
 import { sampleGoonLipSyncTimeline } from '$lib/utils/goonLipSync'
 import {
   buildInworldVisemeLipSyncTimeline,
-  mapInworldVisemeToGoonLipSyncWeights
+  mapInworldVisemeToOvr15Weights
 } from './providerVisemeTimeline'
+import type { GoonLipSyncTimeline } from '$lib/utils/goonLipSync'
+
+function sampleOvr(timeline: GoonLipSyncTimeline, timeMs: number) {
+  const frame = sampleGoonLipSyncTimeline(timeline, timeMs)
+  if (frame.profile !== 'ovr-15') {
+    throw new Error(`Expected OVR-15 frame, received ${frame.profile}.`)
+  }
+  return frame.weights
+}
 
 describe('providerVisemeTimeline', () => {
-  it('maps Inworld viseme symbols into Custom Rhubarb 9 mouth weights', () => {
-    const open = mapInworldVisemeToGoonLipSyncWeights('aei')
-    const closed = mapInworldVisemeToGoonLipSyncWeights('bmp')
-    const teeth = mapInworldVisemeToGoonLipSyncWeights('fv')
-    const pucker = mapInworldVisemeToGoonLipSyncWeights('qw')
-    const rest = mapInworldVisemeToGoonLipSyncWeights(null, '[silence]')
-    const silenceWithBmpViseme = mapInworldVisemeToGoonLipSyncWeights('bmp', '[silence]')
-
-    expect(open?.wide_open).toBeGreaterThan(0.9)
-    expect(open?.wide_open ?? 0).toBeGreaterThan(open?.mid_open ?? 0)
-    expect(closed?.closed).toBe(1)
-    expect(teeth?.teeth_lip).toBe(1)
-    expect(pucker?.pucker).toBeGreaterThan(0.9)
-    expect(rest?.rest).toBe(1)
-    expect(silenceWithBmpViseme?.rest).toBe(1)
-    expect(silenceWithBmpViseme?.closed).toBe(0)
+  it('maps Inworld categories and phone detail directly into OVR-15', () => {
+    expect(mapInworldVisemeToOvr15Weights('aei', 'a')?.aa).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('aei', 'ɛ')?.E).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('aei', 'i')?.I).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('o', 'o')?.O).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('o', 'u')?.U).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('bmp', 'p')?.PP).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('fv', 'f')?.FF).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('th', 'θ')?.TH).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('chjsh', 'tʃ')?.CH).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('cdgknstxyz', 'd')?.DD).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('cdgknstxyz', 'k')?.kk).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('cdgknstxyz', 's')?.SS).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('cdgknstxyz', 'n')?.nn).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('r', 'r')?.RR).toBe(1)
+    expect(mapInworldVisemeToOvr15Weights('bmp', '[silence]')?.sil).toBe(1)
   })
 
   it('builds a provider-aligned timeline from Inworld phonetic details', () => {
@@ -67,6 +76,7 @@ describe('providerVisemeTimeline', () => {
     expect(timeline).not.toBeNull()
     expect(timeline?.analyzerId).toBe('inworld-viseme-timing')
     expect(timeline?.source).toBe('provider-alignment')
+    expect(timeline?.profile).toBe('ovr-15')
     expect(timeline?.durationMs).toBe(850)
     expect(timeline?.unitCount).toBe(3)
     expect(timeline?.diagnostics).toMatchObject({
@@ -83,15 +93,15 @@ describe('providerVisemeTimeline', () => {
       }
     })
 
-    const consonant = sampleGoonLipSyncTimeline(timeline!, 120)
-    const vowel = sampleGoonLipSyncTimeline(timeline!, 200)
-    const affricate = sampleGoonLipSyncTimeline(timeline!, 540)
-    const afterSpeech = sampleGoonLipSyncTimeline(timeline!, 840)
+    const consonant = sampleOvr(timeline!, 120)
+    const vowel = sampleOvr(timeline!, 200)
+    const affricate = sampleOvr(timeline!, 540)
+    const afterSpeech = sampleOvr(timeline!, 840)
 
-    expect(consonant.clenched).toBeGreaterThan(0.8)
-    expect(vowel.wide_open).toBeGreaterThan(0.8)
-    expect(affricate.tongue_lift).toBeGreaterThan(0.7)
-    expect(afterSpeech.rest).toBe(1)
+    expect(consonant.SS).toBe(1)
+    expect(vowel.E).toBe(1)
+    expect(affricate.CH).toBe(1)
+    expect(afterSpeech.sil).toBe(1)
   })
 
   it('accepts word-relative Inworld phone offsets when absolute starts are absent', () => {
@@ -115,8 +125,8 @@ describe('providerVisemeTimeline', () => {
     })
 
     expect(timeline).not.toBeNull()
-    expect(sampleGoonLipSyncTimeline(timeline!, 245).rest).toBe(1)
-    expect(sampleGoonLipSyncTimeline(timeline!, 260).closed).toBe(1)
+    expect(sampleOvr(timeline!, 245).sil).toBe(1)
+    expect(sampleOvr(timeline!, 260).PP).toBe(1)
   })
 
   it('applies realtime chunk offsets to chunk-relative Inworld phonetic starts', () => {
@@ -142,8 +152,8 @@ describe('providerVisemeTimeline', () => {
     })
 
     expect(timeline).not.toBeNull()
-    expect(sampleGoonLipSyncTimeline(timeline!, 2240).rest).toBe(1)
-    expect(sampleGoonLipSyncTimeline(timeline!, 2260).tongue_lift).toBeGreaterThan(0.8)
+    expect(sampleOvr(timeline!, 2240).sil).toBe(1)
+    expect(sampleOvr(timeline!, 2260).nn).toBe(1)
   })
 
   it('does not double-offset absolute Inworld phonetic starts on later chunks', () => {
@@ -170,8 +180,8 @@ describe('providerVisemeTimeline', () => {
 
     expect(timeline).not.toBeNull()
     expect(timeline?.durationMs).toBe(2550)
-    expect(sampleGoonLipSyncTimeline(timeline!, 2260).tongue_lift).toBeGreaterThan(0.8)
-    expect(sampleGoonLipSyncTimeline(timeline!, 4260).rest).toBe(1)
+    expect(sampleOvr(timeline!, 2260).nn).toBe(1)
+    expect(sampleOvr(timeline!, 4260).sil).toBe(1)
   })
 
   it('treats Inworld silence phones as rest even when the provider reports bmp', () => {
@@ -208,13 +218,13 @@ describe('providerVisemeTimeline', () => {
     })
 
     expect(timeline).not.toBeNull()
-    expect(sampleGoonLipSyncTimeline(timeline!, 100).rest).toBe(1)
-    expect(sampleGoonLipSyncTimeline(timeline!, 100).closed).toBe(0)
-    expect(sampleGoonLipSyncTimeline(timeline!, 260).wide_open).toBeGreaterThan(0.8)
+    expect(sampleOvr(timeline!, 100).sil).toBe(1)
+    expect(sampleOvr(timeline!, 100).PP).toBe(0)
+    expect(sampleOvr(timeline!, 260).E).toBe(1)
     expect(timeline?.diagnostics?.silencePhoneCount).toBe(1)
     expect(timeline?.diagnostics?.primaryCueCounts).toMatchObject({
-      rest: 1,
-      wide_open: 1
+      sil: 1,
+      E: 1
     })
   })
 })

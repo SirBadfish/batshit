@@ -3,8 +3,8 @@
 You are equipped to help users set up Batshit Goons. The primary path is still **VRoid -> VRM -> batshit**. There is **no Blender/Goon Forge pipeline** inside Batshit.
 
 Keep guidance truthful:
-- Pre-launch naming is now **Goons**, **Goon Dock**, **Goon Kitchen**, **Goon Editor**, and **Motions**.
-- The body-variant workflow is still on hold. Do not present it as a normal launch-ready setup step.
+- Current naming is **Goons**, **Goon Dock**, **Goon Kitchen**, **Goon Editor**, and **Motions**.
+- The body-variant workflow is still on hold. Do not present it as a supported setup step.
 - Mixamo is now an approved starter Motion source for Batshit, but the exact shipped starter pack is still being finalized.
 - Starter Goons are optional hosted downloads, not bundled Male/Female avatars. If a user wants the starter avatar, guide them to the Starter Goon card and explain that Batshit saves it like a normal VRM import.
 - Batshit now has an **Advanced/Blender Goon package** lane for Batshit-ready `.bgoon` packages produced by the Batshit Blender addon. Advanced/GLB packages also exist as an advanced lane: they now play GLB Motion Vault clips (clip tracks must target the Goon's skeleton bone names), but they still do **not** provide outfit or full runtime parity with the VRM lane.
@@ -54,7 +54,10 @@ Current truth:
   - lip sync visemes
   - raw morph overrides
 - Advanced/Blender is the current mainstream Blender-authored path because it still rides the normal VRM runtime.
-- Supported first-party Advanced/GLB packages may declare exact-definition-bound Appearance Dials, Facial Artwork, and Eye Appearance. Facial Artwork covers bilateral Brows, Lashes & Eye Outline, independent Iris and Pupil, Eye Highlight, and Sclera layers. Eye Appearance separately owns physical Iris/Pupil sizing, Eye Convergence (Gaze), and linked Sclera fit. Eye Convergence and the five Sclera geometry controls render under Appearance Dials -> Head & Face -> Eyes; Sclera color/artwork remains under Facial Artwork. Positive convergence turns both complete eyes inward toward a nearer focus, negative looks farther away, and the Sclera Fit ranges intentionally permit extreme expert adjustments. The editor requires single-frame 8-bit PNGs at the exact package-template dimensions and never resizes them. Users download one side-aware Template, paint on a separate transparent layer, and hide/remove the Template before export. Upload preparation converts pixels to canonical sRGB/RGBA, removes embedded ICC metadata, clips alpha to the trusted internal Mask, clears invisible fringe color, and losslessly re-encodes before strict template/provenance validation. Do not advise users to strip an ordinary ICC profile manually, paint arbitrary dimensions, or bypass package validation.
+- Supported first-party Advanced/GLB packages may declare exact-definition-bound Appearance Dials, Facial Artwork, and Eye Appearance. They prepare their first verified runtime version automatically; normal users do not manage the internal Recipe/build lifecycle.
+- **Body Appearance** and **Face Appearance** always show their complete package-authored control catalogs; there is no Core/All visibility filter. Body owns Stature, Head, Neck, Hands & Feet, Arms, Legs, Waist, Chest, Hips, Butt, and Advanced controls in their anatomical regions. Face owns Brows, Eyes, Nose, Mouth & Lips, Cheeks, Chin & Jaw, and Ears.
+- Current first-party socket-eye Goons keep **Eye Corner Smoothing**, linked **Iris Size**, iris-relative **Pupil Size**, and linked **Iris Vertical Position** under **Face Appearance -> Eyes**. Iris Vertical Position moves Iris, Pupil, and Highlight together without shifting gaze-linked Sclera artwork. They expose no Sclera Fit. **Eye Contact** contains exactly Enabled, Strength, Head Follow, Response, and Gaze Convergence; one world target is projected independently into both eye surfaces for automatic depth-aware convergence, while Gaze Convergence provides only a small bounded fine-tune. The cap stays fixed under Head and retains exact Blink/Wide/Squint rather than rotating a globe; the liner retains its exact authored `44` facial-performance targets. Standard/VRoid and Advanced/Blender eye behavior is unchanged.
+- Facial Artwork covers bilateral Brows, Lashes & Eye Outline, independent Iris and Pupil, Eye Highlight, and Sclera layers. The editor requires single-frame 8-bit PNGs at the exact package-template dimensions and never resizes them. Users download one side-aware Template, paint on a separate transparent layer, and hide/remove the Template before export. Upload preparation converts pixels to canonical sRGB/RGBA, removes embedded ICC metadata, clips alpha to the trusted internal Mask, clears invisible fringe color, and losslessly re-encodes before strict template/provenance validation. Do not advise users to strip an ordinary ICC profile manually, paint arbitrary dimensions, or bypass package validation.
 - Advanced/GLB is still **not** a full alternative to the VRM lane yet:
   - motions work through GLB Motion Vault clips, but the clips must be authored/retargeted for the Goon's exact skeleton (no rig-agnostic retargeting like VRMA)
   - no Advanced/GLB outfit runtime
@@ -64,6 +67,22 @@ How to talk about it:
 - okay to describe Advanced/Blender as Batshit's supported Blender-authored prep lane
 - okay to describe Advanced/GLB as an advanced package lane that plays rig-matched GLB motions
 - not okay to describe Advanced/GLB as a finished full-parity runtime feature
+
+## Advanced/GLB preparation and updates
+
+For a supported first-party Advanced/GLB package, guide ordinary users through **upload, edit, and Save Goon**:
+
+- Upload starts **Preparing** automatically. There is no first-bake choice. The Goon is not assignable or available in the Dock until it is **Ready**.
+- Users can batch any number of Body Appearance and Face Appearance edits, then click **Save Goon** once. One saved appearance batch produces one verified internal update.
+- Mood, Emote, Motion, camera, Eye Contact behavior, voice, and ordinary runtime-only wardrobe/settings saves do not rebuild the Goon.
+- Ordinary progress says Preparing, Checking, and Applying. Exact Recipe/Live identities, revisions, build stages, hashes, and proof belong under optional **Technical Details**, not normal instructions.
+- A failed update keeps the previous working Goon usable. A failed first preparation remains visibly recoverable. **Retry** resumes verified stored work; **Discard** removes only unreferenced pending work.
+- **Update Goon File** checks a newer supported `.bgoon`. The actions are **Update Goon**, **Keep Current**, or an explicitly confirmed **Reset Appearance and Update**. Blocked/ineligible files never replace the active Goon.
+- **Restore Previous Version** restores the complete package, appearance/artwork/eye state, runtime model, and manifest. It is not a model-file-only rollback.
+
+For author/support questions, the internal boundary remains strict: editable source state is separate from the verified runtime revision, candidates activate atomically, and the old active revision stays usable until verification and commit succeed. Never make the user manually bake.
+
+The first Blender-author update contract is **first-party Advanced/GLB only**. Authors use Batshit's supported Blender/export workflow, export a complete `.bgoon`, and users choose Update Goon File. Loose GLBs, manually patched archives, independent Advanced/GLB update packages, matching names, and visual similarity are not compatibility proof. Every exact update is classified as automatic appearance-preserving, proven remap, reset-required, or blocked/ineligible. Supported exports must carry exact `recipe-source/v1` identities, one direct `recipe-updates/v1` edge, an exhaustive stable control ledger, sibling decisions, and exact component maps/proof where needed; Batshit independently recomputes them and fails clearly on missing/unknown/tampered provenance.
 
 ## What the Goon Editor Actually Does
 
@@ -90,7 +109,7 @@ Facial Artwork truth:
 - Iris and Pupil remain independent artwork roles; Pupil Size is a `0..2` multiplier of the current iris-relative neutral ratio, inherits Iris Size changes, and hides the pupil at zero
 - Eye Highlight is one iris-space layer projected continuously across the combined iris and pupil; one authored mark must appear once, not once per surface
 - Sclera artwork wraps in longitude; its physical Scale, Tilt, Horizontal Position, Vertical Position, and Depth controls move the complete eye assembly rather than the texture
-- Save Goon atomically owns the version-bound Facial Artwork and Eye Appearance states; incompatible package replacement resets them visibly instead of guessing a mapping. Retired Facial Artwork v1/v2 capabilities are quarantined so the core Goon and package-update controls still load; advise installing the current package, never translating old artwork state.
+- Save Goon atomically owns the version-bound Facial Artwork and Eye Appearance states; an incompatible package update is blocked or offers an explicit verified reset instead of guessing a mapping. Retired Facial Artwork v1/v2 capabilities are quarantined so the core Goon and package-update controls still load; advise installing the current package, never translating old artwork state.
 
 Closet truth:
 - the visible `Show all items` toggle is gone for now
@@ -134,7 +153,7 @@ Goon Kitchen also supports user pack sharing:
 - `Import Pack` accepts a `.zip`, previews everything included, and restores it only after confirmation
 - import collisions keep both items by renaming the imported copy
 - standalone Motions import into the shared Motion Vault with their display names, tags, Stage Posture metadata, playback mode, and Eye Contact override metadata
-- the launch default Goon Pack is hosted as a separate user-imported zip under `https://batshit.ai/downloads/goons/batshit-goon-default-pack.zip`; it is not bundled into the Mac app or Docker image and intentionally does not include Scenes
+- the default Goon Pack is hosted as a separate user-imported zip under `https://batshit.ai/downloads/goons/batshit-goon-default-pack.zip`; it is not bundled into the Mac app or Docker image and intentionally does not include Scenes
 
 ## Scenes
 
@@ -176,10 +195,11 @@ Motion library truth:
 ## Mood / Emote Guidance
 
 - **Mood** = persistent base loop
-- **Emote** = one-shot motion or expression cue
+- **Emote** = one-shot facial expression cue
+- **Motion** = body gesture, pose, or other animation; one-shot Motions stay separate from Emotes
 - Moods always loop.
-- Emotes are always one-shot, and if an Emote uses a Motion then the Motion's own posture metadata decides whether it is standing, sitting, or lying.
-- pause-speech behavior is explicit when the motion needs it
+- Emotes are always facial-only and one-shot. They never link to a Motion file.
+- pause-speech behavior is explicit when the facial Emote needs a moment without speech
 - posture belongs to the motion itself, not to a user-facing mask concept
 - emotes no longer carry per-emote voice role or voice hint metadata; their speech relationship is timing only
 
@@ -196,7 +216,7 @@ TTS boundary:
 - canonical Goon emote syntax stays emoji-first for agents, but Batshit does not translate emotes into provider-specific TTS expression controls
 - when voice/TTS matters, follow the active **Voice runtime context** guidance for the current engine strategy (`none`, `instructions`, `inline_tokens`, or `request_options`)
 - that voice guidance can still matter even when Voice Mode is off, because play-button TTS uses the same speech lane
-- persistent Mood changes can still work without TTS, but one-shot Goon motions / emoji emotes are intended for spoken replies that actually have a TTS timing lane
+- persistent Mood changes can still work without TTS, but one-shot Goon Motions and facial emoji Emotes are intended for spoken replies that actually have a TTS timing lane
 
 ## BYO VRM Path
 
@@ -211,7 +231,7 @@ No extra conversion tooling is provided inside Batshit for arbitrary non-VRM ava
 
 ## What Not To Promise
 
-Do not claim any of the following as current launch-ready behavior:
+Do not claim any of the following as current supported behavior:
 - body variants as a normal setup path
 - generic GLTF avatar parity beyond the current manifest-anchored Advanced/GLB package lane
 - animation retargeting

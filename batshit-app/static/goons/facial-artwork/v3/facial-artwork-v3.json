@@ -3,10 +3,10 @@
   "stateSchemaVersion": "facial-artwork-state/v3",
   "status": "in-development-product-export-unapproved",
   "productExportApproved": false,
-  "definitionSha256": "c0a9cb6dc2b7e5358dc61e6178ab9366a28d9913c4faa7bb1332500922a70d3a",
+  "definitionSha256": "777f179ef57461ef741890046db996eebdbb350f687e5f5fe547ea8fd21c34e8",
   "templateSet": {
     "id": "batshit-base-f-v3",
-    "version": "3.0.0"
+    "version": "3.2.0"
   },
   "ownership": {
     "definition": "immutable-package-template",
@@ -70,7 +70,7 @@
   "templates": [
     {
       "id": "brow-canvas",
-      "version": "3.0.0",
+      "version": "3.2.0",
       "dimensions": [
         2048,
         1024
@@ -129,7 +129,7 @@
     },
     {
       "id": "lashes-eye-outline-canvas",
-      "version": "3.0.0",
+      "version": "3.2.0",
       "dimensions": [
         2048,
         1024
@@ -256,7 +256,7 @@
     },
     {
       "id": "iris-radial",
-      "version": "3.0.0",
+      "version": "3.2.0",
       "dimensions": [
         1024,
         1024
@@ -299,7 +299,7 @@
     },
     {
       "id": "pupil-radial",
-      "version": "3.0.0",
+      "version": "3.2.0",
       "dimensions": [
         1024,
         1024
@@ -342,7 +342,7 @@
     },
     {
       "id": "eye-highlight-radial",
-      "version": "3.0.0",
+      "version": "3.2.0",
       "dimensions": [
         1024,
         1024
@@ -384,7 +384,7 @@
     },
     {
       "id": "sclera-equirectangular",
-      "version": "3.0.0",
+      "version": "3.2.0",
       "dimensions": [
         2048,
         1024
@@ -1068,7 +1068,7 @@
       },
       {
         "id": "paired-brow-geometry-helper",
-        "sha256": "bed58b591e7bec27da438f8e9d5b689a61a533a9be9bbf10c5230bea2e9185f4"
+        "sha256": "1d019df88f3ed7c575b233f39c4cf75352fc56eb4b1bd352ff6ce59a6ee45e31"
       }
     ],
     "nodes": [
@@ -1088,20 +1088,27 @@
         "verticalSpanMeters": 0.0195,
         "outerOffsetMeters": -0.00165,
         "outerRecessMeters": 0.02,
-        "geometryAndUvSha256": "0ac493f7161da8fcaa90eae45e8339ce5455a35c24bfd1082bb4d9febf9d1b3b",
-        "bindingsSha256": "2d05a89e7756450db186b429bbcd0f4c0498ca9b066cd7e14ba07f22ebee2209",
+        "outwardExpansionRatio": 0.3,
+        "uvOuterExtent": 1.3,
+        "uvDensityLaw": "pre-expansion-physical-pixel-density-preserved-from-centerline",
+        "outerReachMeters": 0.059139993,
+        "averageSurfaceArcMeters": 0.079617314,
+        "prior120AverageSurfaceArcMeters": 0.0731662,
+        "geometryAndUvSha256": "8c96c3eb55bf47678b00b4bb96ed284e261b8445032a1800f989a82463198be1",
+        "bindingsSha256": "5822fe4cd11eeb080fa24270d251015e38204ce89daa0600f838b2d3254f490d",
         "bindingCount": 1536,
         "bindingRecordsFrozen": true,
         "bindingLaw": "shared-centerline-column-with-side-specific-conformal-forehead-projection",
         "innerEdge": "u-zero-columns-share-identical-neutral-vertices-and-frozen-bindings",
+        "outerEdge": "temple-only-130-percent-authoring-width-with-restrained-conformal-temple-follow",
         "frontSideWinding": "canonical-grid-source-preserved",
         "geometryRecords": {
-          "sha256": "379581a16b31ce3728dd2493a196c655d8ff0db06fd071abdc948676a0c2dd72",
-          "canonicalGeometryAndUvSha256": "0ac493f7161da8fcaa90eae45e8339ce5455a35c24bfd1082bb4d9febf9d1b3b"
+          "sha256": "ba8479b1f03f2e7207c110d7a0db43d7b7501842a5cc72a41c802779351295a8",
+          "canonicalGeometryAndUvSha256": "8c96c3eb55bf47678b00b4bb96ed284e261b8445032a1800f989a82463198be1"
         },
         "bindingRecords": {
-          "sha256": "2782650c0fec97cb948f5df4c0f09f83c850f7e5fb66a8a7af230f8d1433e3d3",
-          "canonicalRecordsSha256": "2d05a89e7756450db186b429bbcd0f4c0498ca9b066cd7e14ba07f22ebee2209"
+          "sha256": "6f2aea431e8dcd1abc4f79818fc4d34f92c9f0f6eeac9e5a836c3db0a6ae816e",
+          "canonicalRecordsSha256": "5822fe4cd11eeb080fa24270d251015e38204ce89daa0600f838b2d3254f490d"
         }
       },
       {
@@ -1120,20 +1127,27 @@
         "verticalSpanMeters": 0.0195,
         "outerOffsetMeters": -0.00165,
         "outerRecessMeters": 0.02,
-        "geometryAndUvSha256": "9c01286a297ef7f620b0ef965a5b225726aee091e04cd1dff72e5cd5e0162846",
-        "bindingsSha256": "0768581fd70db46d7ea4caeaaef4e2c0a79723710461f76eba6130aaeaa7f2ec",
+        "outwardExpansionRatio": 0.3,
+        "uvOuterExtent": 1.3,
+        "uvDensityLaw": "pre-expansion-physical-pixel-density-preserved-from-centerline",
+        "outerReachMeters": 0.059058856,
+        "averageSurfaceArcMeters": 0.079359315,
+        "prior120AverageSurfaceArcMeters": 0.072995265,
+        "geometryAndUvSha256": "9a131159fbee54c7b0755f1f6b6327e415d5d2641c0b1e6dbb926b50d87e205e",
+        "bindingsSha256": "af373ea062387afc87a4ade7272f699e7ceaec3a5fa4ee805a1f183a739af04d",
         "bindingCount": 1536,
         "bindingRecordsFrozen": true,
         "bindingLaw": "shared-centerline-column-with-side-specific-conformal-forehead-projection",
         "innerEdge": "u-zero-columns-share-identical-neutral-vertices-and-frozen-bindings",
+        "outerEdge": "temple-only-130-percent-authoring-width-with-restrained-conformal-temple-follow",
         "frontSideWinding": "each-polygon-and-matching-uv-loop-slice-reversed",
         "geometryRecords": {
-          "sha256": "30a383883a9ef94ce10d1d9607395822858c929445ccb3dc94b2db2fbd532c6e",
-          "canonicalGeometryAndUvSha256": "9c01286a297ef7f620b0ef965a5b225726aee091e04cd1dff72e5cd5e0162846"
+          "sha256": "88390e177215efa189177d1e4bf4fbe7a1866c3071c00f4e495c917b5bed12fa",
+          "canonicalGeometryAndUvSha256": "9a131159fbee54c7b0755f1f6b6327e415d5d2641c0b1e6dbb926b50d87e205e"
         },
         "bindingRecords": {
-          "sha256": "9faca9fc111330d1400aa630fbb93c357d9aa9bdb8f2ad02f9f0523da3c49d2d",
-          "canonicalRecordsSha256": "0768581fd70db46d7ea4caeaaef4e2c0a79723710461f76eba6130aaeaa7f2ec"
+          "sha256": "3cf922686633bca1abc470cbd454e20e009fb071c183745b64c2f058740f163f",
+          "canonicalRecordsSha256": "af373ea062387afc87a4ade7272f699e7ceaec3a5fa4ee805a1f183a739af04d"
         }
       },
       {

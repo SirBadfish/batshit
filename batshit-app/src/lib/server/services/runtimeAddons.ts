@@ -9,6 +9,7 @@ import {
 export const RUNTIME_ADDON_IDS = [
   'cloudflared',
   'fbx2vrma',
+  'audio2face',
   'comfyui-validation',
   'comfyui',
   'local-ai',
@@ -107,6 +108,22 @@ const RUNTIME_ADDON_CATALOG: RuntimeAddonCatalogEntry[] = [
     browserUrl: null,
     backupBoundary:
       'The worker keeps only temporary conversion files in its Docker volume. Converted VRMA uploads are normal Batshit uploads and are covered by Batshit backup/restore.',
+    controllerRequiredForAutoStart: true
+  },
+  {
+    id: 'audio2face',
+    title: 'NVIDIA Audio2Face Bridge',
+    description:
+      'Optional Batshit bridge for a separately installed and licensed NVIDIA Audio2Face-3D NIM v2.0 runtime.',
+    route: 'sidecar/profile',
+    composeProfile: 'audio2face',
+    services: ['audio2face-bridge'],
+    startCommand:
+      'docker compose --env-file .env.docker --profile audio2face up -d --build audio2face-bridge',
+    internalUrl: 'http://audio2face-bridge:8068',
+    browserUrl: null,
+    backupBoundary:
+      'Batshit keeps completed-utterance animation cache entries in a dedicated Docker volume. NVIDIA NIM images, model caches, licenses, GPU runtime state, and TLS credentials remain external and are not included in Batshit backup/restore.',
     controllerRequiredForAutoStart: true
   },
   {
@@ -211,6 +228,7 @@ const DEFAULT_OPERATOR_TIMEOUT_MS = 180_000
 const OPERATION_SETTLE_TIMEOUT_MS = 15_000
 const OPERATION_SETTLE_INTERVAL_MS = 500
 const DEFAULT_AGENT_BROWSER_SIDECAR_URL = 'http://agent-browser:8091'
+const DEFAULT_AUDIO2FACE_BRIDGE_URL = 'http://audio2face-bridge:8068'
 const DEFAULT_LIVEKIT_BROWSER_URL = 'ws://localhost:7880'
 const DEFAULT_LIVEKIT_INTERNAL_URL = 'ws://host.docker.internal:7880'
 const DEFAULT_LIVEKIT_AGENT_HEALTH_URL = 'http://livekit-agent:7899/worker'
@@ -437,6 +455,97 @@ async function getFbx2VrmaAddonStatus(entry: RuntimeAddonCatalogEntry): Promise<
       supportLevel: running ? 'docker-worker' : 'docker-worker-missing',
       worker,
       manifest: running ? buildFbx2VrmaWorkerManifest(worker.health) : null
+    }
+  }
+}
+
+function resolveAudio2FaceBridgeUrl(entry: RuntimeAddonCatalogEntry) {
+  return process.env.BATSHIT_AUDIO2FACE_BRIDGE_URL?.trim() || entry.internalUrl || DEFAULT_AUDIO2FACE_BRIDGE_URL
+}
+
+async function getAudio2FaceAddonStatus(entry: RuntimeAddonCatalogEntry): Promise<RuntimeAddonStatus> {
+  const checkedAt = new Date().toISOString()
+  const url = resolveAudio2FaceBridgeUrl(entry)
+  const token = process.env.BATSHIT_AUDIO2FACE_BRIDGE_TOKEN?.trim()
+
+  if (!isBatshitContainerizedRuntime()) {
+    return {
+      ...cloneEntry(entry),
+      state: 'not-applicable',
+      running: false,
+      supported: false,
+      dockerUnsupported: false,
+      reason: 'Audio2Face bridge add-on status applies to the Docker Compose runtime.',
+      installHelp: entry.startCommand,
+      observedAt: checkedAt,
+      details: { supportLevel: 'docker-sidecar-not-applicable', url }
+    }
+  }
+
+  if (!token) {
+    return {
+      ...cloneEntry(entry),
+      state: 'waiting',
+      running: false,
+      supported: true,
+      dockerUnsupported: false,
+      reason: 'BATSHIT_AUDIO2FACE_BRIDGE_TOKEN is required for the Audio2Face bridge boundary.',
+      installHelp: entry.startCommand,
+      observedAt: checkedAt,
+      details: { supportLevel: 'docker-sidecar-missing-token', url }
+    }
+  }
+
+  try {
+    const response = await fetch(`${url.replace(/\/+$/, '')}/health`, {
+      headers: {
+        accept: 'application/json',
+        authorization: `Bearer ${token}`
+      }
+    })
+    const payload = (await response.json().catch(() => null)) as Record<string, any> | null
+    const bridgeRunning = response.ok && payload?.bridgeRunning === true
+    const running = bridgeRunning && payload?.nimReady === true && payload?.ok === true
+    return {
+      ...cloneEntry(entry),
+      state: running ? 'running' : 'waiting',
+      running,
+      supported: true,
+      dockerUnsupported: false,
+      reason: running
+        ? null
+        : typeof payload?.reason === 'string'
+          ? payload.reason
+          : bridgeRunning
+            ? 'Audio2Face bridge is running, but NVIDIA NIM is not ready.'
+            : `Audio2Face bridge returned HTTP ${response.status}.`,
+      installHelp: entry.startCommand,
+      observedAt: checkedAt,
+      details: {
+        supportLevel: running ? 'docker-sidecar' : 'docker-sidecar-waiting',
+        url,
+        bridgeRunning,
+        nimReady: payload?.nimReady === true,
+        version: typeof payload?.version === 'string' ? payload.version : null,
+        protocol: typeof payload?.protocol === 'string' ? payload.protocol : null,
+        outputFps: typeof payload?.outputFps === 'number' ? payload.outputFps : null,
+        cacheSchema: typeof payload?.cacheSchema === 'string' ? payload.cacheSchema : null
+      }
+    }
+  } catch (error) {
+    return {
+      ...cloneEntry(entry),
+      state: 'waiting',
+      running: false,
+      supported: true,
+      dockerUnsupported: false,
+      reason:
+        error instanceof Error
+          ? `Audio2Face bridge is not reachable: ${error.message}`
+          : 'Audio2Face bridge is not reachable.',
+      installHelp: entry.startCommand,
+      observedAt: checkedAt,
+      details: { supportLevel: 'docker-sidecar-missing', url, bridgeRunning: false, nimReady: false }
     }
   }
 }
@@ -777,6 +886,7 @@ export async function getRuntimeAddonStatus(addonId: string): Promise<RuntimeAdd
 
   if (entry.id === 'cloudflared') return await getCloudflaredAddonStatus(entry)
   if (entry.id === 'fbx2vrma') return await getFbx2VrmaAddonStatus(entry)
+  if (entry.id === 'audio2face') return await getAudio2FaceAddonStatus(entry)
   if (entry.id === 'agent-browser') return await getAgentBrowserAddonStatus(entry)
   if (entry.id === 'comfyui-validation') return await getComfyUiValidationAddonStatus(entry)
   if (entry.id === 'livekit') return await getLiveKitAddonStatus(entry)

@@ -26,6 +26,7 @@
     Eye,
     FlipHorizontal2,
     Lock,
+    Loader2,
     Paintbrush,
     Palette,
     Pencil,
@@ -41,6 +42,7 @@
   } from '@lucide/svelte'
   import { debounce } from '$lib/utils/debounce'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
+  import { BATSHIT_SERVER_URL } from '$lib/services/apiClient'
   import type * as THREE from 'three'
   import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate'
   import GalleryGrid from '$lib/components/ui/gallery/GalleryGrid.svelte'
@@ -56,9 +58,11 @@
   } from '$lib/components/goons/AnimationPreviewThumb.svelte'
   import AppearanceDialsEditor from '$lib/components/goons/AppearanceDialsEditor.svelte'
   import FacialArtworkEditor from '$lib/components/goons/FacialArtworkEditor.svelte'
+  import OralAppearanceEditor from '$lib/components/goons/OralAppearanceEditor.svelte'
   import CustomMorphsEditor from '$lib/components/goons/CustomMorphsEditor.svelte'
   import FaceControlsEditor from '$lib/components/goons/FaceControlsEditor.svelte'
   import EyeContactTuningEditor from '$lib/components/goons/EyeContactTuningEditor.svelte'
+  import SocketEyeContactEditor from '$lib/components/goons/SocketEyeContactEditor.svelte'
   import GoonsFieldLabel from '$lib/components/goons/GoonsFieldLabel.svelte'
   import GoonMotionPicker, { type GoonMotionPickerOption } from '$lib/components/goons/GoonMotionPicker.svelte'
   import GoonsRawMorphEditor from '$lib/components/goons/GoonsRawMorphEditor.svelte'
@@ -67,7 +71,10 @@
   import GoonsDeleteDialogs from '$lib/components/settings/goons/GoonsDeleteDialogs.svelte'
   import GoonsPackDialogs from '$lib/components/settings/goons/GoonsPackDialogs.svelte'
   import GoonsUnsavedExitDialog from '$lib/components/settings/goons/GoonsUnsavedExitDialog.svelte'
+  import RecipeWorkflowController from '$lib/components/settings/goons/recipe/RecipeWorkflowController.svelte'
+  import { resolveGoonSettingsPreviewTarget } from '$lib/components/settings/goons/recipe/recipeEditorPreviewTarget'
   import {
+    normalizeGoonCueMap,
     normalizeGoonsSettings,
     resolveKitchenCues,
     resolveGoonCues,
@@ -110,15 +117,14 @@
   import {
     collectFacialArtworkUploads,
     createDefaultFacialArtworkState,
-    parseFacialArtworkDefinition,
     parseFacialArtworkState,
     reconcileFacialArtworkState,
     resolveFacialArtworkTemplateVariant,
-    type FacialArtworkDefinitionV3,
+    type FacialArtworkDefinitionV4,
     type FacialArtworkOrientation,
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
-    type FacialArtworkStateV3,
+    type FacialArtworkStateV4,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import { restoreFacialArtworkDraft } from '$lib/goons/facialArtwork.editor'
@@ -128,15 +134,28 @@
     type FacialArtworkUploadCreditDraft
   } from '$lib/goons/facialArtwork.provenance'
   import {
-    EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS,
     createDefaultEyeAppearanceState,
-    parseEyeAppearanceDefinition,
     parseEyeAppearanceState,
     reconcileEyeAppearanceState,
-    updateEyeAppearanceControl,
-    type EyeAppearanceDefinitionV1,
-    type EyeAppearanceStateV1
+    type EyeAppearanceDefinitionV3,
+    type EyeAppearanceStateV3
   } from '$lib/goons/eyeAppearance'
+  import { parseFirstPartySocketEyePackage } from '$lib/goons/socketEyePackage'
+  import {
+    DEFAULT_SOCKET_EYE_CONTACT_SETTINGS,
+    parseSocketEyeContactSettings,
+    resolveSocketEyeContactSettings,
+    type SocketEyeContactSettingsV2
+  } from '$lib/goons/socketEyeContact'
+  import {
+    countChangedOralAppearanceControls,
+    createDefaultOralAppearanceState,
+    parseOralAppearanceDefinition,
+    parseOralAppearanceState,
+    reconcileOralAppearanceState,
+    type OralAppearanceDefinitionV1,
+    type OralAppearanceStateV1
+  } from '$lib/goons/oralAppearance'
   import {
     hasRenderableGoonAvatar,
     loadAvatarIntoEngine,
@@ -273,6 +292,10 @@
     NORMAL_FACE_CONTROL_SECTIONS,
     getSupportedNormalFaceControlSections,
   } from '$lib/goons/faceControls'
+  import {
+    GOON_SEMANTIC_EXPRESSION_CONTROLS,
+    resolveGoonSemanticExpressionControlStates
+  } from '$lib/goons/semanticExpressions'
   import type {
     GoonBodyConcealTopology,
     GoonEditTransform,
@@ -306,15 +329,21 @@
     deleteGoonSceneProp,
     uploadGoonRoomTexture,
     uploadAdvancedGoonPackage,
-    uploadCustomGoonPackage,
     uploadGoonFacialArtwork,
     deleteGoonFacialArtwork,
     uploadGuidedDufClothesVrm
   } from '$lib/services/goons'
-  import type {
-    AdvancedGoonPackageUploadResult,
-    CustomGoonPackageUploadResult
-  } from '$lib/services/goons'
+  import type { AdvancedGoonPackageUploadResult } from '$lib/services/goons'
+  import {
+    applyRecipeRevisionProjection,
+    isRecipePreparationRequired,
+    projectGoonRecipeSource,
+    resolveRecipeAssetUrl,
+    resolveRecipeProductReadiness,
+    resolveRecipePreviewGoonAssetUrls,
+    type RecipeStageResponse,
+    type RecipeStateSnapshot
+  } from '$lib/goons/recipe'
   import { persistGoonsSettingsRequest } from '$lib/services/goonsSettingsPersistence'
   import {
     importGoonLibraryExportBundle
@@ -361,7 +390,17 @@
     | { type: 'close-scene' }
   type SaveCueEditorOptions = {
     successMessage?: string | null
+    skipRecipeWorkflow?: boolean
   }
+  type RecipeWorkflowControllerHandle = {
+    saveRecipeDraftIfNeeded: () => Promise<boolean>
+  }
+  type RecipeEditorPreviewTarget = {
+    goon: GoonRecord
+    state: RecipeStateSnapshot
+    side: 'current' | 'updated'
+  }
+  type GoonPreviewMode = 'editor' | 'library' | 'recipe-live-candidate'
   const MOTION_LIBRARY_PREVIEW_GOON_ID = '__motion_library_preview__'
   const SCENE_PROXY_PREVIEW_GOON_ID = '__scene_proxy_preview__'
 
@@ -394,6 +433,8 @@
   const VRM_ICON_REF = { kind: 'brand', slug: 'vrm-color' } satisfies IconRef
   const VROID_ICON_REF = { kind: 'brand', slug: 'vroid-color' } satisfies IconRef
   const BLENDER_ICON_REF = { kind: 'brand', slug: 'blender-color' } satisfies IconRef
+  const BATSHIT_BRAND_ICON_REF = { kind: 'brand', slug: 'batshit-icon' } satisfies IconRef
+  const GLB_FILE_ICON_REF = { kind: 'lucide', id: 'file-axis-3d' } satisfies IconRef
   const STANDARD_GOON_FORMAT = {
     label: 'Standard/VRoid',
     icons: [
@@ -408,10 +449,13 @@
       { label: 'VRM', ref: VRM_ICON_REF, wide: true }
     ]
   } satisfies GoonFormatVisual
-  const ADVANCED_GLB_GOON_FORMAT = {
+  const ADVANCED_GLB_GOON_FORMAT: GoonFormatVisual = {
     label: 'Advanced/GLB',
-    icons: [] as GoonFormatIcon[]
-  } satisfies GoonFormatVisual
+    icons: [
+      { label: 'Batshit', ref: BATSHIT_BRAND_ICON_REF },
+      { label: 'GLB', ref: GLB_FILE_ICON_REF }
+    ]
+  }
 
   const PAINTED_CONCEAL_POSES: PaintedConcealPoseOption[] = [
     {
@@ -608,6 +652,10 @@
   let editorQuality = $state<GoonEngineQuality>('auto')
   let editorLipSync = $state(true)
   let editorEyeContactMode = $state<GoonEyeContactMode>('bone')
+  let editorSocketEyeContact = $state<SocketEyeContactSettingsV2>({
+    ...DEFAULT_SOCKET_EYE_CONTACT_SETTINGS
+  })
+  let editorHasSocketEyeContact = $state(false)
   let editorEyeContactEyeYawSensitivity = $state(1)
   let editorEyeContactEyeYawRange = $state(1)
   let editorEyeContactEyePitchSensitivity = $state(1)
@@ -638,7 +686,10 @@
   let advancedPackageUpdateFile = $state<File | null>(null)
   let advancedPackageUpdateBusy = $state(false)
   let editorPendingAdvancedPackageUpdate = $state<AdvancedGoonPackageUploadResult | null>(null)
-  let editorPendingCustomPackageUpdate = $state<CustomGoonPackageUploadResult | null>(null)
+  let recipeWorkflowController = $state<RecipeWorkflowControllerHandle | null>(null)
+  let recipeWorkflowBusy = $state(false)
+  let recipeEditorPreviewTarget = $state<RecipeEditorPreviewTarget | null>(null)
+  let recipePreviewTransitioning = $state(false)
   let guidedDufClothesInput = $state<HTMLInputElement | null>(null)
   let guidedDufClothesBusy = $state(false)
   let editorPendingVrmFile = $state<GoonFileRef | null>(null)
@@ -1199,6 +1250,29 @@
   const editorGoon = $derived.by(() =>
     editorGoonId ? goons.find((entry) => entry.id === editorGoonId) ?? null : null
   )
+  const RETIRED_RECIPE_RECOVERY_MESSAGE =
+    'This experimental Goon uses a retired Recipe format. Batshit will not guess at or silently migrate its appearance state. Delete this Goon below, then create a new Goon from the current package.'
+  // The editor always owns immutable Recipe Source + authoring Recipe State.
+  // Mounted stages continue to consume the store record's active Live refs.
+  const editorRecipeSourceProjection = $derived.by(() => {
+    if (!editorGoon) return { goon: null, error: null }
+    try {
+      return {
+        goon: resolveRecipePreviewGoonAssetUrls(
+          projectGoonRecipeSource(editorGoon),
+          BATSHIT_SERVER_URL
+        ),
+        error: null
+      }
+    } catch (error) {
+      return {
+        goon: null,
+        error: error instanceof Error ? error.message : 'The saved Recipe state is incompatible.'
+      }
+    }
+  })
+  const editorRecipeSourceGoon = $derived(editorRecipeSourceProjection.goon)
+  const editorRecipeSourceError = $derived(editorRecipeSourceProjection.error)
   const editorGoonKind = $derived.by<GoonKind>(() => (editorGoon?.kind === 'custom' ? 'custom' : 'vrm'))
   const editorSourceProfile = $derived.by<GoonSourceProfile>(() => resolveGoonSourceProfile(editorGoon))
   const editorIsGuidedCustomVrm = $derived.by(() => editorSourceProfile === 'guided-custom-vrm')
@@ -1227,17 +1301,22 @@
       editorDirty ||
       editorFacialArtworkUploadBusy ||
       Boolean(editorPendingVrmFile) ||
-      Boolean(editorPendingAdvancedPackageUpdate) ||
-      Boolean(editorPendingCustomPackageUpdate)
+      Boolean(editorPendingAdvancedPackageUpdate)
   )
   const currentCustomPackageLabel = $derived.by(() =>
-    editorGoon?.customAvatar?.package ? resolveFileLabel(editorGoon.customAvatar.package) : 'No package'
+    editorRecipeSourceGoon?.customAvatar?.package
+      ? resolveFileLabel(editorRecipeSourceGoon.customAvatar.package)
+      : 'No package'
   )
   const currentCustomModelLabel = $derived.by(() =>
-    editorGoon?.customAvatar?.model ? resolveFileLabel(editorGoon.customAvatar.model) : 'No model'
+    editorRecipeSourceGoon?.customAvatar?.model
+      ? resolveFileLabel(editorRecipeSourceGoon.customAvatar.model)
+      : 'No model'
   )
   const currentCustomManifestLabel = $derived.by(() =>
-    editorGoon?.customAvatar?.manifest ? resolveFileLabel(editorGoon.customAvatar.manifest) : 'No manifest'
+    editorRecipeSourceGoon?.customAvatar?.manifest
+      ? resolveFileLabel(editorRecipeSourceGoon.customAvatar.manifest)
+      : 'No manifest'
   )
   const currentGuidedPackageLabel = $derived.by(() =>
     editorGoon?.guidedAvatar?.package ? resolveFileLabel(editorGoon.guidedAvatar.package) : 'No package'
@@ -1250,16 +1329,6 @@
   const backupGuidedPackageLabel = $derived.by(() =>
     editorGoon?.guidedAvatar?.backup?.package
       ? resolveFileLabel(editorGoon.guidedAvatar.backup.package)
-      : ''
-  )
-  const pendingCustomPackageLabel = $derived.by(() =>
-    editorPendingCustomPackageUpdate?.package
-      ? resolveFileLabel(editorPendingCustomPackageUpdate.package)
-      : ''
-  )
-  const backupCustomPackageLabel = $derived.by(() =>
-    editorGoon?.customAvatar?.backup?.package
-      ? resolveFileLabel(editorGoon.customAvatar.backup.package)
       : ''
   )
   const currentGuidedManifestLabel = $derived.by(() =>
@@ -1286,8 +1355,9 @@
   )
   const editorGuidedDufOverlayCount = $derived.by(() => editorGuidedDufOverlays.length)
   const previewGoonUrl = $derived.by(() => {
-    const editorUrl = resolveGoonAvatarUrl(editorGoon)
+    const editorUrl = resolveGoonAvatarUrl(editorRecipeSourceGoon)
     if (editorUrl) return editorUrl
+    if (editorGoon && editorRecipeSourceError) return ''
     const fallback = goons.find((entry) => hasRenderableGoonAvatar(entry))
     return resolveGoonAvatarUrl(fallback)
   })
@@ -1410,7 +1480,7 @@
         cue,
         emojis: resolveCueEmojis(kitchenEmojiMap, cue.name),
         scope: 'global' as const,
-        motionFile: resolveMotionFileForCue(cue, null, 'global')
+        motionFile: null
       }))
   )
   const goonPackCueGroups = $derived.by(() =>
@@ -2669,6 +2739,7 @@
     goon: GoonRecord | null,
     scope: PackCueScope
   ): GoonFileRef | null {
+    if (cue.kind === 'emote') return null
     const animationName = cue.animationName?.trim()
     if (!animationName) return null
 
@@ -3355,14 +3426,6 @@
       : kitchenEyeContactBlenderTuning
   )
 
-  const FACE_PRESET_SLIDER_OPTIONS: Array<{ value: GoonExpressionPreset; label: string }> = [
-    { value: 'happy', label: 'Happy' },
-    { value: 'relaxed', label: 'Relaxed' },
-    { value: 'sad', label: 'Sad' },
-    { value: 'angry', label: 'Angry' },
-    { value: 'surprised', label: 'Surprised' },
-    { value: 'neutral', label: 'Neutral' }
-  ]
   const CUE_NAME_INFO = [
     'The AI sees this Name when it decides which Mood or Emote to use.',
     'Use a clear, recognizable name so the AI can understand the cue at a glance.'
@@ -3381,8 +3444,6 @@
   ]
   const CUE_LOOP_MOTION_INFO =
     'Moods use Loop Motion. The selected animation repeats for as long as the Mood stays active.'
-  const CUE_EMOTE_MOTION_INFO =
-    'Emotes use Motion as a one-shot animation. The selected animation plays once when the Emote triggers.'
   const CUE_PAUSE_SPEECH_INFO =
     'Pause Speech temporarily pauses spoken output while the cue plays. Duration controls how long the pause lasts.'
   const CUE_DURATION_INFO =
@@ -5665,7 +5726,6 @@
     newWardrobeOutfitName = ''
     editorWardrobeOutfitCreateOpen = false
     editorPendingAdvancedPackageUpdate = null
-    editorPendingCustomPackageUpdate = null
     editorFacialArtworkUploadBusy = false
     editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
@@ -6196,7 +6256,7 @@
     return goon.camera ?? null
   }
 
-  function buildPreviewContextSignature(goon: GoonRecord, mode: 'editor' | 'library') {
+  function buildPreviewContextSignature(goon: GoonRecord, mode: GoonPreviewMode) {
     const vrmUrl = resolveGoonAvatarSignature(goon)
     const animationSignature = resolveAnimationFiles(goon)
       .map((entry) => entry.url)
@@ -6204,12 +6264,33 @@
     return [mode, goon.id, vrmUrl, animationSignature].join('::')
   }
 
-  async function loadPreviewGoon(goon: GoonRecord, mode: 'editor' | 'library' = 'editor') {
+  async function loadPreviewGoon(
+    goon: GoonRecord,
+    mode: GoonPreviewMode = 'editor',
+    options: { strict?: boolean; awaitAnimations?: boolean } = {}
+  ): Promise<boolean> {
+    goon = resolveRecipePreviewGoonAssetUrls(goon, BATSHIT_SERVER_URL)
     const targetUrl = resolveGoonAvatarUrl(goon)
-    if (!previewContainer || !targetUrl) return
+    if (!previewContainer || !targetUrl) {
+      const error = new Error(
+        !previewContainer
+          ? 'The Goon preview surface is unavailable.'
+          : 'The Goon preview candidate has no renderable model.'
+      )
+      if (options.strict) throw error
+      return false
+    }
     const contextSignature = buildPreviewContextSignature(goon, mode)
-    if (previewFailedContextSignature === contextSignature) return
-    if (previewLoading && previewLoadInFlightSignature === contextSignature) return
+    if (previewFailedContextSignature === contextSignature) {
+      const error = new Error('This Goon preview candidate already failed to load.')
+      if (options.strict) throw error
+      return false
+    }
+    if (previewLoading && previewLoadInFlightSignature === contextSignature) {
+      const error = new Error('This Goon preview candidate is already loading.')
+      if (options.strict) throw error
+      return false
+    }
     const token = ++previewToken
     previewLoading = true
     previewLoadInFlightSignature = contextSignature
@@ -6217,12 +6298,28 @@
 
     try {
       const engine = await ensurePreviewEngine()
-      if (!engine) return
-      if (token !== previewToken) return
+      if (!engine) throw new Error('The Goon preview engine is unavailable.')
+      if (token !== previewToken) {
+        if (options.strict) throw new Error('The Goon preview candidate was superseded before it loaded.')
+        return false
+      }
       engine.refreshLayout()
+      const comparisonState = previewGoonId === goon.id
+        ? engine.captureComparisonPreviewState()
+        : null
 
-      const { kind } = await loadAvatarIntoEngine(engine, goon)
-      if (token !== previewToken) return
+      const { kind } = await loadAvatarIntoEngine(engine, goon, {
+        role:
+          mode === 'recipe-live-candidate'
+            ? 'recipe-live-candidate'
+            : mode === 'editor' && goon.recipe?.contract === 'goon-recipe/v2'
+            ? 'recipe-source'
+            : 'automatic'
+      })
+      if (token !== previewToken) {
+        if (options.strict) throw new Error('The Goon preview candidate was superseded while it loaded.')
+        return false
+      }
 
       // Both lanes sync their motion set: VRM goons load .vrma entries, GLB
       // custom goons load .glb entries (resolveAnimationFiles/the load plan
@@ -6248,7 +6345,10 @@
           guidedPieceStates: resolveGuidedPieceStatesForPreviewGoon(goon)
         })
       }
-      if (token !== previewToken) return
+      if (token !== previewToken) {
+        if (options.strict) throw new Error('The Goon preview candidate was superseded during scene setup.')
+        return false
+      }
       if (mode === 'editor') {
         applyPendingEditorOpeningFrame(engine, goon.id)
       }
@@ -6262,10 +6362,16 @@
       previewVrmUrl = targetUrl
       previewReady = true
 
-      void engine
+      const syncAnimations = engine
         .syncAnimations(animationPlan.eager, { deferredFiles: animationPlan.deferred })
         .then(() => {
-          if (token !== previewToken) return
+          if (token !== previewToken) {
+            if (options.strict) {
+              throw new Error('The Goon preview candidate was superseded during animation loading.')
+            }
+            return
+          }
+          if (comparisonState) engine.restoreComparisonPreviewState(comparisonState)
           previewAnimationCatalog = engine.getAnimationCatalog()
           if (kind === 'vrm') {
             previewCustomExpressions = engine.getCustomExpressionNames()
@@ -6274,12 +6380,20 @@
         .catch((error) => {
           if (token !== previewToken) return
           console.warn('[GoonsSettings] Editor animation sync failed:', error)
+          throw error
         })
+      if (options.awaitAnimations) await syncAnimations
+      else void syncAnimations.catch(() => undefined)
+      return true
     } catch (error: any) {
       console.error('[GoonPreview] load failed', { token, error })
-      previewFailedContextSignature = contextSignature
-      previewError = toGoonPreviewError(error, 'Failed to load preview')
-      previewReady = false
+      if (token === previewToken) {
+        previewFailedContextSignature = contextSignature
+        previewError = toGoonPreviewError(error, 'Failed to load preview')
+        previewReady = false
+      }
+      if (options.strict) throw error
+      return false
     } finally {
       if (token === previewToken) {
         previewLoading = false
@@ -6287,6 +6401,70 @@
           previewLoadInFlightSignature = ''
         }
       }
+    }
+  }
+
+  function projectStagedRecipeLiveCandidate(staged: RecipeStageResponse): GoonRecord {
+    return applyRecipeRevisionProjection(
+      structuredClone(staged.goon),
+      staged.envelope,
+      (asset, role) => ({
+        url: resolveRecipeAssetUrl(asset.ref, BATSHIT_SERVER_URL),
+        filename: asset.ref.split('/').pop()?.trim() || `recipe-live-${role}`,
+        size: asset.bytes
+      })
+    )
+  }
+
+  async function handleRecipeEditorPreviewTargetChange(
+    target: RecipeEditorPreviewTarget | null
+  ) {
+    const resolvedTarget = target
+      ? {
+          ...target,
+          goon: resolveRecipePreviewGoonAssetUrls(
+            target.goon,
+            BATSHIT_SERVER_URL
+          )
+        }
+      : null
+    recipePreviewTransitioning = true
+    try {
+      if (resolvedTarget) {
+        await loadPreviewGoon(resolvedTarget.goon, 'editor', {
+          strict: true,
+          awaitAnimations: true
+        })
+      }
+      recipeEditorPreviewTarget = resolvedTarget
+    } finally {
+      recipePreviewTransitioning = false
+    }
+  }
+
+  async function previewStagedRecipeLiveCandidate(staged: RecipeStageResponse) {
+    const candidate = projectStagedRecipeLiveCandidate(staged)
+    const previousPreview = recipeEditorPreviewTarget?.goon ?? editorRecipeSourceGoon
+    try {
+      const loaded = await loadPreviewGoon(candidate, 'recipe-live-candidate', {
+        strict: true,
+        awaitAnimations: true
+      })
+      if (!loaded) throw new Error('The staged Recipe Live candidate did not become preview-ready.')
+    } catch (candidateError) {
+      if (!previousPreview) throw candidateError
+      try {
+        await loadPreviewGoon(previousPreview, 'editor', {
+          strict: true,
+          awaitAnimations: true
+        })
+      } catch (restoreError) {
+        throw new AggregateError(
+          [candidateError, restoreError],
+          'The Recipe Live candidate failed to load, and the prior Settings preview could not be restored.'
+        )
+      }
+      throw candidateError
     }
   }
 
@@ -6335,7 +6513,13 @@
     goonOverride?: GoonRecord | null,
     mode: 'editor' | 'library' = 'editor'
   ): Promise<GoonEngine | null> {
-    const targetGoon = goonOverride ?? editorGoon
+    const targetGoon = resolveGoonSettingsPreviewTarget({
+      explicitTarget: goonOverride,
+      mode,
+      editorGoon,
+      recipeSourceGoon: editorRecipeSourceGoon,
+      recipePreviewGoon: recipeEditorPreviewTarget?.goon
+    })
     if (!targetGoon) return null
     if (!hasRenderableGoonAvatar(targetGoon)) return null
     const engine = await ensurePreviewEngine()
@@ -6644,7 +6828,7 @@
 
 
   $effect(() => {
-    const goon = editorGoon
+    const goon = recipeEditorPreviewTarget?.goon ?? editorRecipeSourceGoon
     if (!goon) return
     const vrmUrl = resolveGoonAvatarUrl(goon)
     if (!vrmUrl || !previewContainer) return
@@ -6749,13 +6933,24 @@
     }
     customUploadBusy = true
     try {
-      await createGoon({
+      const created = await createGoon({
         sourceProfile: 'expert-custom-glb',
         file: customUploadFile
       })
       customUploadFile = null
       if (customUploadInput) customUploadInput.value = ''
-      toast.success('Advanced/GLB Goon package uploaded!')
+      openCueEditor(created)
+      if (isRecipePreparationRequired(created)) {
+        // The verified first-party preparation controller lives in the Goon File
+        // section because it needs the editor's shared preview engine. Open that
+        // section immediately so preparation starts without another user action.
+        editorVrmSectionOpen = true
+      }
+      toast.success(
+        isRecipePreparationRequired(created)
+          ? 'Goon uploaded. Preparing it now…'
+          : 'Advanced/GLB Goon package uploaded!'
+      )
     } catch (error: any) {
       toast.error(error?.message || 'Advanced/GLB package upload failed')
     } finally {
@@ -6820,29 +7015,17 @@
 
   async function handleAdvancedPackageUpdate() {
     if (!editorGoonId || !editorGoon) return
-    if (
-      editorSourceProfile !== 'guided-custom-vrm' &&
-      editorSourceProfile !== 'expert-custom-glb'
-    ) {
-      return
-    }
+    if (editorSourceProfile !== 'guided-custom-vrm') return
     if (!advancedPackageUpdateFile) {
       toast.error('Select a Goon File Package first.')
       return
     }
     advancedPackageUpdateBusy = true
     try {
-      if (editorSourceProfile === 'guided-custom-vrm') {
-        editorPendingAdvancedPackageUpdate = await uploadAdvancedGoonPackage(
-          editorGoonId,
-          advancedPackageUpdateFile
-        )
-      } else {
-        editorPendingCustomPackageUpdate = await uploadCustomGoonPackage(
-          editorGoonId,
-          advancedPackageUpdateFile
-        )
-      }
+      editorPendingAdvancedPackageUpdate = await uploadAdvancedGoonPackage(
+        editorGoonId,
+        advancedPackageUpdateFile
+      )
       toast.success('Package update ready. Save Goon to apply it.')
     } catch (error: any) {
       toast.error(error?.message || 'Package update failed')
@@ -6855,7 +7038,6 @@
 
   function cancelPendingAdvancedPackageUpdate() {
     editorPendingAdvancedPackageUpdate = null
-    editorPendingCustomPackageUpdate = null
     editorFacialArtworkUploadBusy = false
     editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
@@ -8006,12 +8188,11 @@
           importedPostures.idMap
         )
         if (entry.motion) {
-          const restoredMotion = await restorePackMotionFile(
+          await restorePackMotionFile(
             remapImportedMotionRefPosture(entry.motion, importedPostures.idMap),
             currentPack.entries,
             motionCache
           )
-          cue.animationName = resolveAnimationName(restoredMotion)
         }
         emotes.push(cue)
         for (const emoji of entry.emojis ?? []) {
@@ -8109,13 +8290,14 @@
       pendingEditorOpeningFrameGoonId = goon.id
     }
     editorGoonId = goon.id
+    recipeWorkflowBusy = false
     editorName = goon.name ?? ''
     editorDescription = goon.description ?? ''
     const resolved = resolveGoonCues(goon, goonsSettings)
-    const nextCueMap = {
+    const nextCueMap = normalizeGoonCueMap({
       ...cloneCueMap(kitchenCueMap),
       ...cloneCueMap(goon.cues?.overrides ?? goon.cues?.cueMap ?? {})
-    }
+    })
     const nextEmojiMap = filterEmojiMapForEmotes(
       {
         ...cloneEmojiMap(kitchenEmojiMap),
@@ -8134,6 +8316,8 @@
     const eyeContactSettings = buildSettingsWithDraftKitchenEyeContact()
     editorEyeContactMode = resolveGoonEyeContactMode(goon, eyeContactSettings)
     applyEditorEyeContactTuning(resolveGoonEyeContactTuning(goon, eyeContactSettings))
+    editorSocketEyeContact = resolveSocketEyeContactSettings(goon.defaults?.socketEyeContact)
+    editorHasSocketEyeContact = false
     editorCamera = { ...(goon.camera ?? {}) }
     previewCameraMode = editorCamera.mode ?? 'free'
     previewViewFov = typeof editorCamera.fov === 'number'
@@ -8142,7 +8326,7 @@
     editorPendingVrmFile = null
     editorPendingVrmUpdate = null
     editorPendingAdvancedPackageUpdate = null
-    editorPendingCustomPackageUpdate = null
+    recipeEditorPreviewTarget = null
     editorFacialArtworkUploadBusy = false
     editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
@@ -8559,6 +8743,16 @@
       )
     }
     return NORMAL_FACE_CONTROL_SECTIONS
+  }
+
+  function currentSemanticExpressionControls() {
+    const engine = activeTab === 'kitchen' ? kitchenPreviewEngine : previewEngine
+    const ready = activeTab === 'kitchen' ? kitchenPreviewReady : previewReady
+    if (!engine || !ready) return [...GOON_SEMANTIC_EXPRESSION_CONTROLS]
+    return resolveGoonSemanticExpressionControlStates(
+      new Set(engine.getSupportedSemanticExpressionPresets()),
+      engine.getSemanticExpressionSourceLabel()
+    )
   }
 
   function isFaceControlGroupLocked(groupId: string): boolean {
@@ -9141,11 +9335,19 @@
   }
 
   function resetEditorEyeContactToGlobal() {
-    const goon = editorGoon
+    const goon = editorRecipeSourceGoon
     if (!goon) return
     const nextSettings = resolveGlobalEyeContactForGoon(goon)
     editorEyeContactMode = nextSettings.mode
     applyEditorEyeContactTuning(nextSettings.tuning)
+    editorDirty = true
+  }
+
+  function updateEditorSocketEyeContact(value: SocketEyeContactSettingsV2) {
+    const parsed = parseSocketEyeContactSettings(value)
+    if (JSON.stringify(parsed) === JSON.stringify(editorSocketEyeContact)) return
+    editorSocketEyeContact = parsed
+    previewEngine?.setSocketEyeContactSettings(parsed)
     editorDirty = true
   }
 
@@ -9605,7 +9807,7 @@
   // compatibility reports) replace the store object while the user works and
   // must not remount the dial editor or clobber an unsaved draft.
   $effect(() => {
-    const goon = editorGoon
+    const goon = editorRecipeSourceGoon
     const isCustom = Boolean(goon && resolveGoonKind(goon) === 'custom')
     const manifestRef = isCustom ? goon?.customAvatar?.manifest : null
     const hydrationKey =
@@ -9665,10 +9867,11 @@
   // live-sync the dial draft onto the settings preview engine (fires on
   // slider changes and when the preview finishes loading the editor goon)
   $effect(() => {
-    if (!previewEngine || !previewReady) return
+    if (!previewEngine || !previewReady || previewLoading || recipePreviewTransitioning) return
     if (previewGoonId !== editorGoonId) return
-    if (!editorAppearanceDialsManifest || !editorAppearanceDialsState) return
-    previewEngine.setAppearanceDialValues(editorAppearanceDialsState)
+    const state = recipeEditorPreviewTarget?.state.appearanceDials ?? editorAppearanceDialsState
+    if (!state) return
+    previewEngine.setAppearanceDialValues(state)
   })
 
   function updateEditorAppearanceDials(state: AppearanceDialValueState) {
@@ -9678,16 +9881,19 @@
     editorDirty = true
   }
 
-  // ------------------------------------------ facial artwork v3 + linked eye appearance v1 (SA-090)
-  let editorFacialArtworkDefinition = $state<FacialArtworkDefinitionV3 | null>(null)
-  let editorFacialArtworkState = $state<FacialArtworkStateV3 | null>(null)
-  let editorEyeAppearanceDefinition = $state<EyeAppearanceDefinitionV1 | null>(null)
-  let editorEyeAppearanceState = $state<EyeAppearanceStateV1 | null>(null)
+  // ---------------- package-bound facial artwork, eye appearance, and oral appearance (SA-090)
+  let editorFacialArtworkDefinition = $state<FacialArtworkDefinitionV4 | null>(null)
+  let editorFacialArtworkState = $state<FacialArtworkStateV4 | null>(null)
+  let editorEyeAppearanceDefinition = $state<EyeAppearanceDefinitionV3 | null>(null)
+  let editorEyeAppearanceState = $state<EyeAppearanceStateV3 | null>(null)
+  let editorOralAppearanceDefinition = $state<OralAppearanceDefinitionV1 | null>(null)
+  let editorOralAppearanceState = $state<OralAppearanceStateV1 | null>(null)
   let editorFacialArtworkHydrated = $state(false)
   let editorFacialArtworkError = $state('')
   let editorFacialArtworkPackageNotice = $state('')
   let editorFacialArtworkNotice = $state('')
   let editorEyeAppearanceNotice = $state('')
+  let editorOralAppearanceNotice = $state('')
   let editorFacialArtworkPreviewError = $state('')
   let editorFacialArtworkLoadToken = 0
   let editorFacialArtworkPreviewToken = 0
@@ -9699,8 +9905,8 @@
   const editorFacialArtworkDraftUploads = new Map<string, FacialArtworkUpload>()
 
   function applyStoredFacialArtworkDraft(
-    definition: FacialArtworkDefinitionV3,
-    stored: FacialArtworkStateV3 | null | undefined
+    definition: FacialArtworkDefinitionV4,
+    stored: FacialArtworkStateV4 | null | undefined
   ) {
     const restored = restoreFacialArtworkDraft(definition, stored)
     editorFacialArtworkState = restored.state
@@ -9711,8 +9917,8 @@
   }
 
   function applyStoredEyeAppearanceDraft(
-    definition: EyeAppearanceDefinitionV1,
-    stored: EyeAppearanceStateV1 | null | undefined
+    definition: EyeAppearanceDefinitionV3,
+    stored: EyeAppearanceStateV3 | null | undefined
   ) {
     const reconciliation = reconcileEyeAppearanceState(definition, stored)
     editorEyeAppearanceState = reconciliation.state
@@ -9720,6 +9926,19 @@
       : createDefaultEyeAppearanceState(definition)
     editorEyeAppearanceNotice = reconciliation.incompatible
       ? 'Saved Eye Appearance controls did not match this package definition and were reset to the package-fitted result.'
+      : ''
+  }
+
+  function applyStoredOralAppearanceDraft(
+    definition: OralAppearanceDefinitionV1,
+    stored: OralAppearanceStateV1 | null | undefined
+  ) {
+    const reconciliation = reconcileOralAppearanceState(definition, stored)
+    editorOralAppearanceState = reconciliation.state
+      ? structuredClone(reconciliation.state)
+      : createDefaultOralAppearanceState(definition)
+    editorOralAppearanceNotice = reconciliation.incompatible
+      ? 'Saved Oral Appearance controls did not match this package definition and were reset to the authored materials.'
       : ''
   }
 
@@ -9736,7 +9955,8 @@
     if (editorFacialArtworkDefinition) {
       editorFacialArtworkStoredSignature = JSON.stringify({
         storedArtwork: goon.facialArtwork ?? null,
-        storedEyeAppearance: goon.eyeAppearance ?? null
+        storedEyeAppearance: goon.eyeAppearance ?? null,
+        storedOralAppearance: goon.oralAppearance ?? null
       })
       applyStoredFacialArtworkDraft(
         editorFacialArtworkDefinition,
@@ -9751,6 +9971,12 @@
         goon.eyeAppearance ?? null
       )
     }
+    if (editorOralAppearanceDefinition) {
+      applyStoredOralAppearanceDraft(
+        editorOralAppearanceDefinition,
+        goon.oralAppearance ?? null
+      )
+    }
   }
 
   function clearFacialArtworkPreviewTimer() {
@@ -9758,7 +9984,7 @@
     editorFacialArtworkPreviewTimer = null
   }
 
-  function resolveFacialArtworkDraftForSave(): FacialArtworkStateV3 | null {
+  function resolveFacialArtworkDraftForSave(): FacialArtworkStateV4 | null {
     if (!editorFacialArtworkHydrated || !editorFacialArtworkDefinition || !editorFacialArtworkState) {
       return null
     }
@@ -9770,7 +9996,7 @@
     return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
   }
 
-  function resolveEyeAppearanceDraftForSave(): EyeAppearanceStateV1 | null {
+  function resolveEyeAppearanceDraftForSave(): EyeAppearanceStateV3 | null {
     if (!editorEyeAppearanceDefinition || !editorEyeAppearanceState) return null
     const parsed = parseEyeAppearanceState(
       editorEyeAppearanceDefinition,
@@ -9780,13 +10006,23 @@
     return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
   }
 
+  function resolveOralAppearanceDraftForSave(): OralAppearanceStateV1 | null {
+    if (!editorOralAppearanceDefinition || !editorOralAppearanceState) return null
+    const parsed = parseOralAppearanceState(
+      editorOralAppearanceDefinition,
+      editorOralAppearanceState
+    )
+    const defaults = createDefaultOralAppearanceState(editorOralAppearanceDefinition)
+    return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
+  }
+
   async function deleteFacialArtworkDraft(upload: FacialArtworkUpload) {
     if (!editorGoonId) return
     await deleteGoonFacialArtwork(editorGoonId, upload.filename)
     editorFacialArtworkDraftUploads.delete(upload.filename)
   }
 
-  async function pruneDetachedFacialArtworkDrafts(state: FacialArtworkStateV3 | null) {
+  async function pruneDetachedFacialArtworkDrafts(state: FacialArtworkStateV4 | null) {
     const referenced = new Set(collectFacialArtworkUploads(state).map((upload) => upload.filename))
     for (const upload of [...editorFacialArtworkDraftUploads.values()]) {
       if (referenced.has(upload.filename)) continue
@@ -9813,8 +10049,8 @@
   }
 
   async function reconcileFacialArtworkUploadsAfterSave(
-    previous: FacialArtworkStateV3 | null | undefined,
-    saved: FacialArtworkStateV3 | null | undefined
+    previous: FacialArtworkStateV4 | null | undefined,
+    saved: FacialArtworkStateV4 | null | undefined
   ) {
     const retained = new Set(collectFacialArtworkUploads(saved).map((upload) => upload.filename))
     const candidates = new Map<string, FacialArtworkUpload>()
@@ -9863,7 +10099,7 @@
     return upload
   }
 
-  function updateEditorFacialArtwork(state: FacialArtworkStateV3) {
+  function updateEditorFacialArtwork(state: FacialArtworkStateV4) {
     if (!editorFacialArtworkDefinition) return
     const parsed = parseFacialArtworkState(editorFacialArtworkDefinition, state)
     if (JSON.stringify(editorFacialArtworkState) === JSON.stringify(parsed)) return
@@ -9874,7 +10110,7 @@
     void pruneDetachedFacialArtworkDrafts(parsed)
   }
 
-  function updateEditorEyeAppearance(state: EyeAppearanceStateV1) {
+  function updateEditorEyeAppearance(state: EyeAppearanceStateV3) {
     if (!editorEyeAppearanceDefinition) return
     const parsed = parseEyeAppearanceState(editorEyeAppearanceDefinition, state)
     if (JSON.stringify(editorEyeAppearanceState) === JSON.stringify(parsed)) return
@@ -9884,14 +10120,79 @@
     editorDirty = true
   }
 
+  function updateEditorOralAppearance(state: OralAppearanceStateV1) {
+    if (!editorOralAppearanceDefinition) return
+    const parsed = parseOralAppearanceState(editorOralAppearanceDefinition, state)
+    if (JSON.stringify(editorOralAppearanceState) === JSON.stringify(parsed)) return
+    editorOralAppearanceState = parsed
+    editorOralAppearanceNotice = ''
+    editorFacialArtworkPreviewError = ''
+    editorDirty = true
+  }
+
+  function resetEditorOralAppearance(regionId: string) {
+    if (regionId !== 'face.mouth-lips' || !editorOralAppearanceDefinition) return
+    updateEditorOralAppearance(createDefaultOralAppearanceState(editorOralAppearanceDefinition))
+  }
+
+  const editorOralAppearanceChangedCount = $derived.by(() => {
+    if (!editorOralAppearanceDefinition || !editorOralAppearanceState) return 0
+    return countChangedOralAppearanceControls(
+      editorOralAppearanceDefinition,
+      editorOralAppearanceState
+    )
+  })
+
+  const editorAppearanceRegionContentSearchText = $derived.by(() => {
+    const artworkControls = [
+      'artwork',
+      'upload',
+      'credit',
+      'source',
+      'color',
+      'tint',
+      'opacity',
+      'horizontal position',
+      'vertical position',
+      'scale',
+      'rotation',
+      'left',
+      'right',
+      'shared'
+    ].join(' ')
+    const eyeControls = editorEyeAppearanceDefinition?.controls
+      .flatMap((control) => [control.id, control.label, control.description])
+      .join(' ')
+    const oralControls = editorOralAppearanceDefinition?.controls
+      .flatMap((control) => [control.id, control.label, control.description])
+      .join(' ')
+
+    return {
+      'face.brows': `Brow Artwork eyebrows ${artworkControls}`,
+      'face.eyes': [
+        'Lash Outline Iris Pupil Eye Highlight Sclera Eye Artwork',
+        artworkControls,
+        eyeControls ?? ''
+      ].join(' '),
+      'face.mouth-lips': `Oral Appearance teeth gums tongue ${oralControls ?? ''}`
+    }
+  })
+
   $effect(() => {
-    const goon = editorGoon
+    const goon = editorRecipeSourceGoon
     const isCustom = Boolean(goon && resolveGoonKind(goon) === 'custom')
     const manifestRef = isCustom ? goon?.customAvatar?.manifest : null
     const hydrationKey = goon && manifestRef?.url ? `${goon.id}::${manifestRef.url}` : ''
     const storedArtwork = isCustom ? goon?.facialArtwork ?? null : null
     const storedEyeAppearance = isCustom ? goon?.eyeAppearance ?? null : null
-    const storedSignature = JSON.stringify({ storedArtwork, storedEyeAppearance })
+    const storedOralAppearance = isCustom ? goon?.oralAppearance ?? null : null
+    const storedSocketEyeContact = isCustom ? goon?.defaults?.socketEyeContact ?? null : null
+    const storedSignature = JSON.stringify({
+      storedArtwork,
+      storedEyeAppearance,
+      storedOralAppearance,
+      storedSocketEyeContact
+    })
 
     if (!hydrationKey || !manifestRef?.url) {
       editorFacialArtworkHydrationKey = ''
@@ -9901,11 +10202,15 @@
       editorFacialArtworkState = null
       editorEyeAppearanceDefinition = null
       editorEyeAppearanceState = null
+      editorHasSocketEyeContact = false
+      editorOralAppearanceDefinition = null
+      editorOralAppearanceState = null
       editorFacialArtworkHydrated = false
       editorFacialArtworkError = ''
       editorFacialArtworkPackageNotice = ''
       editorFacialArtworkNotice = ''
       editorEyeAppearanceNotice = ''
+      editorOralAppearanceNotice = ''
       editorFacialArtworkPreviewError = ''
       return
     }
@@ -9916,6 +10221,11 @@
       editorFacialArtworkStoredSignature = storedSignature
       applyStoredFacialArtworkDraft(editorFacialArtworkDefinition, storedArtwork)
       applyStoredEyeAppearanceDraft(editorEyeAppearanceDefinition, storedEyeAppearance)
+      editorSocketEyeContact = resolveSocketEyeContactSettings(storedSocketEyeContact)
+      previewEngine?.setSocketEyeContactSettings(editorSocketEyeContact)
+      if (editorOralAppearanceDefinition) {
+        applyStoredOralAppearanceDraft(editorOralAppearanceDefinition, storedOralAppearance)
+      }
       return
     }
 
@@ -9926,16 +10236,22 @@
     editorFacialArtworkState = null
     editorEyeAppearanceDefinition = null
     editorEyeAppearanceState = null
+    editorHasSocketEyeContact = false
+    editorOralAppearanceDefinition = null
+    editorOralAppearanceState = null
     editorFacialArtworkHydrated = false
     editorFacialArtworkError = ''
     editorFacialArtworkPackageNotice = ''
     editorFacialArtworkNotice = ''
     editorEyeAppearanceNotice = ''
+    editorOralAppearanceNotice = ''
     editorFacialArtworkPreviewError = ''
     void (async () => {
       try {
         const manifest = await loadCustomAvatarManifest(manifestRef)
         if (token !== editorFacialArtworkLoadToken) return
+        const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
+        editorHasSocketEyeContact = Boolean(socketEyePackage)
         const capability = classifyFacialArtworkPackageCapability(manifest)
         if (capability.status === 'retired') {
           editorFacialArtworkPackageNotice = capability.notice
@@ -9949,13 +10265,23 @@
           editorFacialArtworkHydrated = true
           return
         }
-        const definition = parseFacialArtworkDefinition(manifest.facialArtwork)
-        const eyeDefinition = parseEyeAppearanceDefinition(manifest.eyeAppearance)
+        if (!socketEyePackage) {
+          throw new Error('The current first-party eye package tuple is incomplete.')
+        }
+        const definition = socketEyePackage.facialArtwork
+        const eyeDefinition = socketEyePackage.eyeAppearance
+        const oralDefinition = manifest.oralAppearance === undefined
+          ? null
+          : parseOralAppearanceDefinition(manifest.oralAppearance)
         if (token !== editorFacialArtworkLoadToken) return
         editorFacialArtworkDefinition = definition
         editorEyeAppearanceDefinition = eyeDefinition
+        editorOralAppearanceDefinition = oralDefinition
         applyStoredFacialArtworkDraft(definition, storedArtwork)
         applyStoredEyeAppearanceDraft(eyeDefinition, storedEyeAppearance)
+        if (oralDefinition) {
+          applyStoredOralAppearanceDraft(oralDefinition, storedOralAppearance)
+        }
         editorFacialArtworkHydrated = true
       } catch (error) {
         if (token !== editorFacialArtworkLoadToken) return
@@ -9968,7 +10294,34 @@
   $effect(() => {
     const token = ++editorFacialArtworkPreviewToken
     clearFacialArtworkPreviewTimer()
-    if (!previewEngine || !previewReady || previewGoonId !== editorGoonId) return
+    if (
+      !previewEngine ||
+      !previewReady ||
+      previewLoading ||
+      recipePreviewTransitioning ||
+      previewGoonId !== editorGoonId
+    ) return
+    const recipePreview = recipeEditorPreviewTarget
+    if (recipePreview) {
+      const state = recipePreview.goon.facialArtwork
+      const eyeState = recipePreview.goon.eyeAppearance
+      const oralState = recipePreview.goon.oralAppearance
+      if (!state || !eyeState) return
+      editorFacialArtworkPreviewTimer = setTimeout(() => {
+        editorFacialArtworkPreviewTimer = null
+        void Promise.resolve()
+          .then(() => {
+            previewEngine!.setEyeAppearanceState(eyeState)
+            previewEngine!.setOralAppearanceState(oralState ?? null)
+            return previewEngine!.setFacialArtworkState(state)
+          })
+          .catch((error) => {
+            if (token !== editorFacialArtworkPreviewToken) return
+            editorFacialArtworkPreviewError = error instanceof Error ? error.message : String(error)
+          })
+      }, 90)
+      return
+    }
     if (
       !editorFacialArtworkDefinition ||
       !editorFacialArtworkState ||
@@ -9976,11 +10329,13 @@
     ) return
     const state = editorFacialArtworkState
     const eyeState = editorEyeAppearanceState
+    const oralState = editorOralAppearanceState
     editorFacialArtworkPreviewTimer = setTimeout(() => {
       editorFacialArtworkPreviewTimer = null
       void Promise.resolve()
         .then(() => {
           previewEngine!.setEyeAppearanceState(eyeState)
+          if (oralState) previewEngine!.setOralAppearanceState(oralState)
           return previewEngine!.setFacialArtworkState(state)
         })
         .then(() => {
@@ -9991,6 +10346,18 @@
           editorFacialArtworkPreviewError = error instanceof Error ? error.message : String(error)
         })
     }, 90)
+  })
+
+  $effect(() => {
+    if (
+      !editorHasSocketEyeContact ||
+      !previewEngine ||
+      !previewReady ||
+      previewLoading ||
+      recipePreviewTransitioning ||
+      previewGoonId !== editorGoonId
+    ) return
+    previewEngine.setSocketEyeContactSettings(editorSocketEyeContact)
   })
 
   onDestroy(() => {
@@ -10008,6 +10375,10 @@
       | 'closet'
       | 'delete'
   ) {
+    if (recipeWorkflowBusy) {
+      toast.info('Wait for the current Goon update to finish before leaving this section.')
+      return
+    }
     editorBasicSettingsOpen = section === 'basic' ? !editorBasicSettingsOpen : false
     editorEyeContactOpen = section === 'eye-contact' ? !editorEyeContactOpen : false
     editorBodyAppearanceOpen =
@@ -11620,91 +11991,40 @@
     if (!editorGoonId) return false
     editorSaving = true
     try {
+      if (
+        !options.skipRecipeWorkflow &&
+        editorSourceProfile === 'expert-custom-glb' &&
+        recipeWorkflowController &&
+        !(await recipeWorkflowController.saveRecipeDraftIfNeeded())
+      ) {
+        return false
+      }
       const currentGoon = goons.find((entry) => entry.id === editorGoonId)
       const stagedPendingVrm = editorPendingVrmFile ?? currentGoon?.files?.vrmPending ?? null
       const stagedVrmReport = editorPendingVrmUpdate ?? currentGoon?.vrmUpdate ?? null
       const stagedAdvancedPackage = editorPendingAdvancedPackageUpdate
-      const stagedCustomPackage = editorPendingCustomPackageUpdate
-      const legacyBodyDials = (
-        currentGoon as (GoonRecord & { bodyDials?: Record<string, number> | null }) | null
-      )?.bodyDials
-      const hasLegacyBodyDials = Boolean(
-        legacyBodyDials && Object.keys(legacyBodyDials).length > 0
-      )
       const advancedPackageDraft = stagedAdvancedPackage
         ? buildAdvancedPackageUpdateDraft(stagedAdvancedPackage)
         : null
-      const stagedCustomManifest =
-        currentGoon?.customAvatar && stagedCustomPackage
-          ? await loadCustomAvatarManifest(stagedCustomPackage.manifest)
-          : null
-      let appearanceDialsForSave =
+      const appearanceDialsForSave =
         editorAppearanceDialsState ?? currentGoon?.appearanceDials ?? null
-      let appearanceDialsResetForPackage = false
-      if (currentGoon?.customAvatar && stagedCustomPackage && stagedCustomManifest) {
-        const nextAppearanceManifest = parseAppearanceDialsManifest(stagedCustomManifest)
-        if (!nextAppearanceManifest) {
-          appearanceDialsResetForPackage = Boolean(appearanceDialsForSave)
-          appearanceDialsForSave = null
-        } else {
-          const reconciliation = reconcileAppearanceDialValues(
-            nextAppearanceManifest,
-            appearanceDialsForSave
-          )
-          appearanceDialsForSave = reconciliation.state
-          appearanceDialsResetForPackage = reconciliation.incompatible
-        }
-        if (hasLegacyBodyDials) {
-          appearanceDialsResetForPackage = true
-        }
-      }
-      let facialArtworkForSave =
+      const facialArtworkForSave =
         editorFacialArtworkHydrated && editorFacialArtworkDefinition
           ? resolveFacialArtworkDraftForSave()
           : currentGoon?.facialArtwork ?? null
-      let facialArtworkResetForPackage = false
-      if (currentGoon?.customAvatar && stagedCustomPackage && stagedCustomManifest) {
-        if (
-          stagedCustomManifest.facialArtwork === undefined ||
-          stagedCustomManifest.facialArtwork === null
-        ) {
-          facialArtworkResetForPackage = Boolean(facialArtworkForSave)
-          facialArtworkForSave = null
-        } else {
-          const nextDefinition = parseFacialArtworkDefinition(stagedCustomManifest.facialArtwork)
-          const reconciliation = reconcileFacialArtworkState(
-            nextDefinition,
-            facialArtworkForSave
-          )
-          facialArtworkForSave = reconciliation.state
-          facialArtworkResetForPackage = reconciliation.incompatible
-        }
-      }
-      let eyeAppearanceForSave =
+      const eyeAppearanceForSave =
         editorFacialArtworkHydrated && editorEyeAppearanceDefinition
           ? resolveEyeAppearanceDraftForSave()
           : currentGoon?.eyeAppearance ?? null
-      let eyeAppearanceResetForPackage = false
-      if (currentGoon?.customAvatar && stagedCustomPackage && stagedCustomManifest) {
-        if (
-          stagedCustomManifest.eyeAppearance === undefined ||
-          stagedCustomManifest.eyeAppearance === null
-        ) {
-          eyeAppearanceResetForPackage = Boolean(eyeAppearanceForSave)
-          eyeAppearanceForSave = null
-        } else {
-          const nextDefinition = parseEyeAppearanceDefinition(stagedCustomManifest.eyeAppearance)
-          const reconciliation = reconcileEyeAppearanceState(
-            nextDefinition,
-            eyeAppearanceForSave
-          )
-          eyeAppearanceForSave = reconciliation.state
-          eyeAppearanceResetForPackage = reconciliation.incompatible
-        }
-      }
+      const oralAppearanceForSave =
+        editorFacialArtworkHydrated && editorOralAppearanceDefinition
+          ? resolveOralAppearanceDraftForSave()
+          : currentGoon?.oralAppearance ?? null
+      const recipeOwnsAppearance = currentGoon?.recipe?.contract === 'goon-recipe/v2'
       const nextName = editorName.trim() || currentGoon?.name || 'Goon'
       const nextDescription = editorDescription?.trim() ?? ''
-      const moodOptions = Object.values(editorEnabledCueMap)
+      const normalizedEditorCueMap = normalizeGoonCueMap(editorCueMap)
+      const moodOptions = Object.values(normalizedEditorCueMap)
         .filter((cue) => cue.kind === 'mood')
         .map((cue) => cue.name)
       const resolvedBaseLoop = moodOptions.includes(editorBaseLoop)
@@ -11712,7 +12032,7 @@
         : moodOptions[0] ?? 'base_stand'
       editorBaseLoop = resolvedBaseLoop
       const { emojiMap: filteredEmojiMap, conflicts } = buildEmojiMapFromDrafts(
-        editorCueMap,
+        normalizedEditorCueMap,
         editorEmojiMap,
         editorEmoteEmojiDrafts
       )
@@ -11720,14 +12040,14 @@
         throw new Error("You've already use this emoji")
       }
       const kitchen = resolveKitchenCues(goonsSettings)
-      let enabled = editorEnabledCueNames.filter((name) => Boolean(editorCueMap[name]))
+      let enabled = editorEnabledCueNames.filter((name) => Boolean(normalizedEditorCueMap[name]))
       if (stagedPendingVrm) {
         const disabledSet = new Set(stagedVrmReport?.disabledCues ?? [])
         enabled = enabled.filter((name) => !disabledSet.has(name))
       }
-      const disabled = Object.keys(editorCueMap).filter((name) => !enabled.includes(name))
+      const disabled = Object.keys(normalizedEditorCueMap).filter((name) => !enabled.includes(name))
       const overrides: GoonCueMap = {}
-      for (const [name, cue] of Object.entries(editorCueMap)) {
+      for (const [name, cue] of Object.entries(normalizedEditorCueMap)) {
         const base = kitchen.cueMap[name]
         const baseSerialized = base ? JSON.stringify(base) : null
         const cueSerialized = JSON.stringify(cue)
@@ -11745,6 +12065,7 @@
       delete (restDefaults as Record<string, unknown>).fallbackPoses
       delete (restDefaults as Record<string, unknown>).eyeContactMode
       delete (restDefaults as Record<string, unknown>).eyeContactTuning
+      delete (restDefaults as Record<string, unknown>).socketEyeContact
       delete (restDefaults as Record<string, unknown>).closetOutfitId
       const editorEyeContactTuning = buildEditorEyeContactTuning()
       const globalEyeContact = currentGoon
@@ -11763,11 +12084,15 @@
           ? { closetOutfitId: editorActiveWardrobeOutfitId }
           : {})
       }
-      if (editorEyeContactMode !== globalEyeContact.mode) {
-        nextDefaults.eyeContactMode = editorEyeContactMode
-      }
-      if (!eyeContactTuningMatches(editorEyeContactTuning, globalEyeContact.tuning)) {
-        nextDefaults.eyeContactTuning = editorEyeContactTuning
+      if (editorHasSocketEyeContact) {
+        nextDefaults.socketEyeContact = parseSocketEyeContactSettings(editorSocketEyeContact)
+      } else {
+        if (editorEyeContactMode !== globalEyeContact.mode) {
+          nextDefaults.eyeContactMode = editorEyeContactMode
+        }
+        if (!eyeContactTuningMatches(editorEyeContactTuning, globalEyeContact.tuning)) {
+          nextDefaults.eyeContactTuning = editorEyeContactTuning
+        }
       }
       const updates: Partial<GoonRecord> = {
         name: nextName,
@@ -11784,47 +12109,32 @@
         closetAssignments: advancedPackageDraft?.closetAssignments ?? sanitizeClosetAssignments(closetAssignments)
       }
       if (
+        !recipeOwnsAppearance &&
         editorGoonKind === 'custom' &&
-        (stagedCustomPackage || (editorAppearanceDialsManifest && editorAppearanceDialsState))
+        editorAppearanceDialsManifest && editorAppearanceDialsState
       ) {
         updates.appearanceDials = appearanceDialsForSave
       }
       if (
+        !recipeOwnsAppearance &&
         editorGoonKind === 'custom' &&
-        (stagedCustomPackage ||
-          (editorFacialArtworkHydrated && editorFacialArtworkDefinition))
+        editorFacialArtworkHydrated && editorFacialArtworkDefinition
       ) {
         updates.facialArtwork = facialArtworkForSave
       }
       if (
+        !recipeOwnsAppearance &&
         editorGoonKind === 'custom' &&
-        (stagedCustomPackage ||
-          (editorFacialArtworkHydrated && editorEyeAppearanceDefinition))
+        editorFacialArtworkHydrated && editorEyeAppearanceDefinition
       ) {
         updates.eyeAppearance = eyeAppearanceForSave
       }
-      if (stagedCustomPackage && hasLegacyBodyDials) {
-        const cleanBreakUpdates = updates as Partial<GoonRecord> & { bodyDials?: null }
-        cleanBreakUpdates.bodyDials = null
-      }
-      if (currentGoon?.customAvatar && stagedCustomPackage) {
-        updates.customAvatar = {
-          ...currentGoon.customAvatar,
-          package: stagedCustomPackage.package,
-          model: stagedCustomPackage.model,
-          manifest: stagedCustomPackage.manifest,
-          backup: {
-            package: currentGoon.customAvatar.package,
-            model: currentGoon.customAvatar.model,
-            manifest: currentGoon.customAvatar.manifest
-          },
-          pending: undefined,
-          manifestSummary: stagedCustomPackage.manifestSummary ?? undefined
-        }
-        updates.compatibility = {
-          tier: 'pending',
-          issues: ['Awaiting Custom avatar analysis']
-        }
+      if (
+        !recipeOwnsAppearance &&
+        editorGoonKind === 'custom' &&
+        editorFacialArtworkHydrated && editorOralAppearanceDefinition
+      ) {
+        updates.oralAppearance = oralAppearanceForSave
       }
       if (currentGoon?.guidedAvatar) {
         if (stagedAdvancedPackage && advancedPackageDraft) {
@@ -11890,8 +12200,9 @@
         currentGoon?.facialArtwork,
         savedGoon.facialArtwork
       )
+      editorCueMap = normalizedEditorCueMap
       editorEmojiMap = filteredEmojiMap
-      editorEmoteEmojiDrafts = buildEmoteEmojiDrafts(editorCueMap, filteredEmojiMap)
+      editorEmoteEmojiDrafts = buildEmoteEmojiDrafts(normalizedEditorCueMap, filteredEmojiMap)
       editorPendingVrmFile = null
       editorPendingVrmUpdate = null
       if (advancedPackageDraft) {
@@ -11905,17 +12216,7 @@
         closetAssignments = advancedPackageDraft.closetAssignments
       }
       editorPendingAdvancedPackageUpdate = null
-      editorPendingCustomPackageUpdate = null
       editorDirty = false
-      if (appearanceDialsResetForPackage) {
-        toast.warning('Appearance Dials reset because the new package uses a different definition.')
-      }
-      if (facialArtworkResetForPackage) {
-        toast.warning('Facial Artwork reset because the new package uses a different definition.')
-      }
-      if (eyeAppearanceResetForPackage) {
-        toast.warning('Eye Appearance reset because the new package uses a different definition.')
-      }
       if (options.successMessage !== null) {
         toast.success(options.successMessage ?? 'Goon settings updated')
       }
@@ -11931,8 +12232,9 @@
   async function saveKitchenSettings() {
     kitchenSaving = true
     try {
+      const normalizedKitchenCueMap = normalizeGoonCueMap(kitchenCueMap)
       const { emojiMap: filteredEmojiMap, conflicts } = buildEmojiMapFromDrafts(
-        kitchenCueMap,
+        normalizedKitchenCueMap,
         kitchenEmojiMap,
         kitchenEmoteEmojiDrafts
       )
@@ -11945,7 +12247,7 @@
         ...goonsSettings,
         kitchen: {
           ...restKitchen,
-          cues: kitchenCueMap,
+          cues: normalizedKitchenCueMap,
           emojiMap: filteredEmojiMap,
           eyeContact: buildKitchenEyeContactSettings()
         }
@@ -11953,7 +12255,7 @@
       const persistedSettings = await persistGoonsSettings(nextSettings)
       applyKitchenStateFromSettings(persistedSettings)
       kitchenEmojiMap = filteredEmojiMap
-      kitchenEmoteEmojiDrafts = buildEmoteEmojiDrafts(kitchenCueMap, filteredEmojiMap)
+      kitchenEmoteEmojiDrafts = buildEmoteEmojiDrafts(normalizedKitchenCueMap, filteredEmojiMap)
       toast.success('Goon Kitchen updated')
       return true
     } catch (error: any) {
@@ -13447,7 +13749,7 @@
 
           <div class="space-y-3 batshit-settings-muted-panel">
             <div class="flex items-center gap-1.5">
-              <span class="batshit-goon-brand-strip" aria-label="GLB format icons">
+              <span class="batshit-goon-brand-strip" aria-label="Batshit and GLB format icons">
                 {#each ADVANCED_GLB_GOON_FORMAT.icons as icon (icon.label)}
                   <IconRenderer
                     ref={icon.ref}
@@ -14106,7 +14408,7 @@
                             </div>
                             <div class="space-y-2">
                               <FaceControlsEditor
-                                presetOptions={FACE_PRESET_SLIDER_OPTIONS}
+                                presetOptions={currentSemanticExpressionControls()}
                                 getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                 onPresetChange={(preset, value) =>
                                   updateCueExpressionPreset(cue.name, preset, value)}
@@ -14350,33 +14652,6 @@
                                 />
                               </div>
                             </div>
-                            <div class="grid grid-cols-12 gap-2 items-center">
-                              <GoonsFieldLabel
-                                label="Motion"
-                                info={CUE_EMOTE_MOTION_INFO}
-                                ariaLabel="About Emote Motion"
-                                class="col-span-4"
-                              />
-                              <div class="col-span-8">
-                                {#if globalAnimationOptions.length > 0}
-                                  <GoonMotionPicker
-                                    options={globalMotionPickerOptions}
-                                    value={
-                                      cue.animationName && globalAnimationOptions.includes(cue.animationName)
-                                        ? cue.animationName
-                                        : ''
-                                    }
-                                    ariaLabel="Select Emote Motion"
-                                    onChange={(value) =>
-                                      updateCueField(cue.name, { animationName: value || undefined })}
-                                  />
-                                {:else}
-                                  <div class="batshit-settings-form-label">
-                                    Upload a motion to select one.
-                                  </div>
-                                {/if}
-                              </div>
-                            </div>
                             <div class="batshit-goon-cue-subpanel space-y-2">
                               <div class="grid grid-cols-12 gap-2 items-end">
                                 <div class="col-span-6 space-y-1">
@@ -14476,7 +14751,7 @@
                                   </div>
                                 {/if}
                                 <FaceControlsEditor
-                                  presetOptions={FACE_PRESET_SLIDER_OPTIONS}
+                                  presetOptions={currentSemanticExpressionControls()}
                                   getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
@@ -14548,7 +14823,7 @@
                                       </div>
                                     </div>
                                     <FaceControlsEditor
-                                      presetOptions={FACE_PRESET_SLIDER_OPTIONS}
+                                      presetOptions={currentSemanticExpressionControls()}
                                       getPresetValue={(preset) =>
                                         getExpressionTargetWeight(step.expressionTargets, preset)}
                                       onPresetChange={(preset, value) =>
@@ -14847,6 +15122,7 @@
           {:else}
             {#each goons as goon}
               {@const formatVisual = goonFormatVisual(goon)}
+              {@const recipeReadiness = resolveRecipeProductReadiness(goon)}
               <div class="batshit-settings-muted-panel batshit-settings-display-card space-y-2">
               <div class="flex items-start justify-between gap-3">
                 <div class="min-w-0 flex-1">
@@ -14906,6 +15182,24 @@
                       {/each}
                     </Tooltip.Content>
                   </Tooltip.Root>
+                  {#if recipeReadiness !== 'not-required'}
+                    <Badge
+                      variant="outline"
+                      class={`batshit-settings-status-badge ${
+                        recipeReadiness === 'ready'
+                          ? 'is-success'
+                          : recipeReadiness === 'failed'
+                            ? 'is-danger'
+                            : 'is-info'
+                      }`}
+                    >
+                      {recipeReadiness === 'ready'
+                        ? 'Ready'
+                        : recipeReadiness === 'failed'
+                          ? 'Preparation failed'
+                          : 'Preparing'}
+                    </Badge>
+                  {/if}
                 </div>
               </div>
                 <div class="flex items-center justify-between">
@@ -15358,7 +15652,11 @@
                   aria-hidden="true"
                 >
                   <SettingsInfoMenu ariaLabel="About Eye Contact" contentClass="w-80">
-                    <p>{EDITOR_EYE_CONTACT_TUNING_INFO}</p>
+                    <p>
+                      {editorHasSocketEyeContact
+                        ? 'The eyes move across each fixed eye surface toward one shared target while the matching ARKit Look shapes naturally accommodate the eyelids and artwork. Gaze Convergence fine-tunes the inward aim, and Head Follow helps only when the target reaches the package-safe edge.'
+                        : EDITOR_EYE_CONTACT_TUNING_INFO}
+                    </p>
                   </SettingsInfoMenu>
                 </div>
               </div>
@@ -15367,37 +15665,31 @@
               />
             </Collapsible.Trigger>
             <Collapsible.Content class={`${goonLevel1AccordionContentClass} space-y-3`}>
-              <div class="flex justify-end px-3">
-                <Button variant="outline" size="sm" onclick={resetEditorEyeContactToGlobal}>
-                  <RotateCcw aria-hidden="true" />
-                  Reset to Global
-                </Button>
-              </div>
-              <EyeContactTuningEditor
-                mode={editorEyeContactMode}
-                tuning={buildEditorEyeContactTuning()}
-                modeInfo={EDITOR_EYE_CONTACT_MODE_INFO}
-                coordinationInfo={EDITOR_EYE_CONTACT_COORDINATION_INFO}
-                eyeConvergenceControl={editorEyeAppearanceDefinition?.controls.find(
-                  (control) => control.id === EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS[0]
-                ) ?? null}
-                eyeConvergenceValue={editorEyeAppearanceState?.eyeConvergence ?? null}
-                onModeChange={(mode) => {
-                  editorEyeContactMode = mode
-                  editorDirty = true
-                }}
-                onTuningChange={updateEditorEyeContactTuning}
-                onEyeConvergenceChange={(value) => {
-                  if (!editorEyeAppearanceState) return
-                  updateEditorEyeAppearance(
-                    updateEyeAppearanceControl(
-                      editorEyeAppearanceState,
-                      EYE_APPEARANCE_EYE_CONTACT_CONTROL_IDS[0],
-                      value
-                    )
-                  )
-                }}
-              />
+              {#if editorHasSocketEyeContact}
+                <SocketEyeContactEditor
+                  value={editorSocketEyeContact}
+                  disabled={editorSaving}
+                  onChange={updateEditorSocketEyeContact}
+                />
+              {:else}
+                <div class="flex justify-end px-3">
+                  <Button variant="outline" size="sm" onclick={resetEditorEyeContactToGlobal}>
+                    <RotateCcw aria-hidden="true" />
+                    Reset to Global
+                  </Button>
+                </div>
+                <EyeContactTuningEditor
+                  mode={editorEyeContactMode}
+                  tuning={buildEditorEyeContactTuning()}
+                  modeInfo={EDITOR_EYE_CONTACT_MODE_INFO}
+                  coordinationInfo={EDITOR_EYE_CONTACT_COORDINATION_INFO}
+                  onModeChange={(mode) => {
+                    editorEyeContactMode = mode
+                    editorDirty = true
+                  }}
+                  onTuningChange={updateEditorEyeContactTuning}
+                />
+              {/if}
             </Collapsible.Content>
           </Collapsible.Root>
 
@@ -15487,9 +15779,7 @@
                 {#if editorFacialArtworkPackageNotice}
                   <div class="px-3 pb-2">
                     <p class="text-[0.675rem] leading-relaxed text-amber-400" role="status">
-                      {editorPendingCustomPackageUpdate
-                        ? 'Save Goon to install the pending Goon File Package. Facial Artwork and Eye Appearance will become available after the package update resets their retired state.'
-                        : editorFacialArtworkPackageNotice}
+                      {editorFacialArtworkPackageNotice}
                     </p>
                   </div>
                 {/if}
@@ -15509,18 +15799,18 @@
                         {editorEyeAppearanceNotice}
                       </p>
                     {/if}
+                    {#if editorOralAppearanceNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorOralAppearanceNotice}
+                      </p>
+                    {/if}
                     {#if editorFacialArtworkPreviewError}
                       <p class="batshit-settings-form-error mb-2" role="alert">
                         Live preview failed: {editorFacialArtworkPreviewError}
                       </p>
                     {/if}
                     {#snippet facialArtworkRegion(scope: 'brows' | 'eyes')}
-                      {#if editorPendingCustomPackageUpdate}
-                        <p class="text-[0.675rem] leading-relaxed text-amber-400" role="status">
-                          Save the pending Goon File Package before editing Facial Artwork. The
-                          server validates PNGs against the currently saved package.
-                        </p>
-                      {:else if editorFacialArtworkError}
+                      {#if editorFacialArtworkError}
                         <p class="batshit-settings-form-error">
                           Facial Artwork unavailable: {editorFacialArtworkError}
                         </p>
@@ -15552,16 +15842,34 @@
                       valueState={editorAppearanceDialsState}
                       surface="head-face"
                       onChange={updateEditorAppearanceDials}
-                      eyeAppearanceDefinition={editorEyeAppearanceDefinition}
-                      eyeAppearanceState={editorEyeAppearanceState}
-                      onEyeAppearanceChange={updateEditorEyeAppearance}
-                      regionContentIds={['face.brows', 'face.eyes']}
+                      regionContentIds={[
+                        'face.brows',
+                        'face.eyes',
+                        ...(editorOralAppearanceDefinition && editorOralAppearanceState
+                          ? ['face.mouth-lips']
+                          : [])
+                      ]}
+                      regionContentControlCounts={{
+                        'face.mouth-lips': editorOralAppearanceDefinition ? 5 : 0
+                      }}
+                      regionContentChangedCounts={{
+                        'face.mouth-lips': editorOralAppearanceChangedCount
+                      }}
+                      regionContentSearchText={editorAppearanceRegionContentSearchText}
+                      onResetRegionContent={resetEditorOralAppearance}
                     >
                       {#snippet regionContent(regionId: string)}
                         {#if regionId === 'face.brows'}
                           {@render facialArtworkRegion('brows')}
                         {:else if regionId === 'face.eyes'}
                           {@render facialArtworkRegion('eyes')}
+                        {:else if regionId === 'face.mouth-lips' && editorOralAppearanceDefinition && editorOralAppearanceState}
+                          <OralAppearanceEditor
+                            definition={editorOralAppearanceDefinition}
+                            valueState={editorOralAppearanceState}
+                            disabled={editorSaving}
+                            onChange={updateEditorOralAppearance}
+                          />
                         {/if}
                       {/snippet}
                     </AppearanceDialsEditor>
@@ -16398,7 +16706,7 @@
                               </div>
                               <div class="space-y-2">
                                 <FaceControlsEditor
-                                  presetOptions={FACE_PRESET_SLIDER_OPTIONS}
+                                  presetOptions={currentSemanticExpressionControls()}
                                   getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
@@ -16747,34 +17055,6 @@
                                   />
                                 </div>
                               </div>
-                              <div class="grid grid-cols-12 gap-2 items-center">
-                                <GoonsFieldLabel
-                                  label="Motion"
-                                  info={CUE_EMOTE_MOTION_INFO}
-                                  ariaLabel="About Emote Motion"
-                                  class="col-span-4"
-                                />
-                                <div class="col-span-8">
-                                  {#if availableAnimationNames.length > 0}
-                                    <GoonMotionPicker
-                                      options={editorMotionPickerOptions}
-                                      value={
-                                        cue.animationName && availableAnimationNames.includes(cue.animationName)
-                                          ? cue.animationName
-                                          : ''
-                                      }
-                                      ariaLabel="Select Emote Motion"
-                                      onChange={(value) =>
-                                        updateCueField(cue.name, { animationName: value || undefined })
-                                      }
-                                    />
-                                  {:else}
-                                    <div class="batshit-settings-form-label">
-                                      Upload a motion to select one.
-                                    </div>
-                                  {/if}
-                                </div>
-                              </div>
                               <div class="batshit-goon-cue-subpanel space-y-2">
                                 <div class="grid grid-cols-12 gap-2 items-end">
                                   <div class="col-span-6 space-y-1">
@@ -16850,7 +17130,7 @@
                                   </div>
                                 {/if}
                                 <FaceControlsEditor
-                                  presetOptions={FACE_PRESET_SLIDER_OPTIONS}
+                                  presetOptions={currentSemanticExpressionControls()}
                                   getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
@@ -16922,7 +17202,7 @@
                                       </div>
                                     </div>
                                       <FaceControlsEditor
-                                        presetOptions={FACE_PRESET_SLIDER_OPTIONS}
+                                        presetOptions={currentSemanticExpressionControls()}
                                         getPresetValue={(preset) =>
                                           getExpressionTargetWeight(step.expressionTargets, preset)}
                                         onPresetChange={(preset, value) =>
@@ -17199,7 +17479,7 @@
 	                class={`h-4 w-4 shrink-0 transition-transform ${editorVrmSectionOpen ? 'rotate-180' : ''}`}
 	              />
 	            </Collapsible.Trigger>
-	            <Collapsible.Content class={goonLevel1AccordionContentClass}>
+	            <Collapsible.Content forceMount class={goonLevel1AccordionContentClass}>
 	              <div class="batshit-goon-editor-subpanel space-y-2">
 	                {#if editorSourceProfile === 'guided-custom-vrm'}
 	                  <div class="batshit-settings-form-label">
@@ -17277,68 +17557,84 @@
 	                    Wardrobe items, Outfits, and DUF clothes where possible, and clears painted conceal masks.
 	                  </p>
 	                {:else if editorGoonKind === 'custom'}
-	                  <div class="batshit-settings-form-label">
-	                    Package: <span class="text-foreground">{currentCustomPackageLabel}</span>
-	                  </div>
-	                  <div class="batshit-settings-form-label">
-	                    Model: <span class="text-foreground">{currentCustomModelLabel}</span>
-	                  </div>
-	                  <div class="batshit-settings-form-label">
-	                    Manifest: <span class="text-foreground">{currentCustomManifestLabel}</span>
-	                  </div>
-	                  <div class="batshit-settings-form-label">
-	                    Contract version:
-	                    <span class="text-foreground">
-	                      {editorGoon?.customAvatar?.manifestSummary?.contractVersion ?? 1}
-	                    </span>
-	                  </div>
-	                  {#if editorGoon?.customAvatar?.manifestSummary?.name}
-	                    <div class="batshit-settings-form-label">
-	                      Manifest name:
-	                      <span class="text-foreground">{editorGoon.customAvatar.manifestSummary.name}</span>
+	                  {#if editorRecipeSourceError}
+	                    <div class="batshit-settings-muted-panel space-y-3" role="alert">
+	                      <div class="flex items-start gap-2">
+	                        <CircleAlert class="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden="true" />
+	                        <div class="min-w-0">
+	                          <div class="batshit-settings-form-label is-danger">
+	                            This Goon needs to be recreated
+	                          </div>
+	                          <p class="batshit-settings-caption mt-1 break-words">
+	                            {RETIRED_RECIPE_RECOVERY_MESSAGE}
+	                          </p>
+	                        </div>
+	                      </div>
+	                      <details>
+	                        <summary class="batshit-settings-child-label cursor-pointer">
+	                          Technical Details
+	                        </summary>
+	                        <p class="batshit-settings-caption mt-2 break-words">
+	                          {editorRecipeSourceError}
+	                        </p>
+	                      </details>
 	                    </div>
-	                  {/if}
-	                  {#if editorPendingCustomPackageUpdate}
+	                  {:else if editorGoon && (isRecipePreparationRequired(editorGoon) || editorGoon.recipe?.contract === 'goon-recipe/v2')}
 	                    <div class="batshit-settings-form-label">
-	                      Pending package update:
-	                      <span class="text-foreground">{pendingCustomPackageLabel}</span>
+	                      Appearance changes are applied when you click Save Goon.
 	                    </div>
-	                  {/if}
-	                  {#if editorGoon?.customAvatar?.backup?.package}
-	                    <div class="batshit-settings-form-label">
-	                      Previous package:
-	                      <span class="text-foreground">{backupCustomPackageLabel}</span>
+	                    <div class="border-t border-border/50 pt-3">
+	                      <RecipeWorkflowController
+	                        bind:this={recipeWorkflowController}
+	                        goon={editorGoon}
+	                        appearanceDials={editorAppearanceDialsState}
+	                        facialArtwork={editorFacialArtworkState}
+	                        eyeAppearance={editorEyeAppearanceState}
+	                        oralAppearance={editorOralAppearanceState}
+	                        fileTechnicalDetails={{
+	                          packageLabel: currentCustomPackageLabel,
+	                          modelLabel: currentCustomModelLabel,
+	                          manifestLabel: currentCustomManifestLabel,
+	                          contractVersion: editorRecipeSourceGoon?.customAvatar?.manifestSummary?.contractVersion ?? 1,
+	                          manifestName: editorRecipeSourceGoon?.customAvatar?.manifestSummary?.name ?? null
+	                        }}
+	                        onSaveEditorDraft={() =>
+	                          saveCueEditor({ successMessage: null, skipRecipeWorkflow: true })}
+	                        onDiscardEditorDraft={discardCueEditorChanges}
+	                        onPreviewTargetChange={handleRecipeEditorPreviewTargetChange}
+	                        onPreviewLiveCandidate={previewStagedRecipeLiveCandidate}
+	                        autoPrepare={isRecipePreparationRequired(editorGoon)}
+	                        onWorkflowBusyChange={(busy) => { recipeWorkflowBusy = busy }}
+	                      />
 	                    </div>
+	                  {:else}
+	                    <details class="batshit-settings-muted-panel">
+	                      <summary class="batshit-settings-child-label cursor-pointer">Technical Details</summary>
+	                      <div class="mt-3 space-y-2">
+	                        <div class="batshit-settings-form-label">
+	                          Package: <span class="text-foreground">{currentCustomPackageLabel}</span>
+	                        </div>
+	                        <div class="batshit-settings-form-label">
+	                          Model: <span class="text-foreground">{currentCustomModelLabel}</span>
+	                        </div>
+	                        <div class="batshit-settings-form-label">
+	                          Manifest: <span class="text-foreground">{currentCustomManifestLabel}</span>
+	                        </div>
+	                        <div class="batshit-settings-form-label">
+	                          Contract version:
+	                          <span class="text-foreground">
+	                            {editorGoon?.customAvatar?.manifestSummary?.contractVersion ?? 1}
+	                          </span>
+	                        </div>
+	                        {#if editorGoon?.customAvatar?.manifestSummary?.name}
+	                          <div class="batshit-settings-form-label">
+	                            Manifest name:
+	                            <span class="text-foreground">{editorGoon.customAvatar.manifestSummary.name}</span>
+	                          </div>
+	                        {/if}
+	                      </div>
+	                    </details>
 	                  {/if}
-	                  <input
-	                    class="hidden"
-	                    type="file"
-	                    accept=".bgoon,.zip"
-	                    bind:this={advancedPackageUpdateInput}
-	                    onchange={handleAdvancedPackageUpdateSelection}
-	                  />
-	                  <div class="flex flex-wrap items-center gap-2">
-	                    <Button
-	                      onclick={() => advancedPackageUpdateInput?.click()}
-	                      disabled={advancedPackageUpdateBusy || Boolean(editorPendingCustomPackageUpdate)}
-	                    >
-	                      {advancedPackageUpdateBusy ? 'Uploading…' : 'Update Goon File Package'}
-	                    </Button>
-	                    {#if editorPendingCustomPackageUpdate}
-	                      <Button variant="ghost" size="sm" onclick={cancelPendingAdvancedPackageUpdate}>
-	                        <X aria-hidden="true" />
-	                        Cancel
-	                      </Button>
-	                    {/if}
-	                  </div>
-	                  <p class="batshit-settings-form-label">
-	                    Save Goon applies the package update. Versioned Appearance Dials are checked
-	                    against the new package definition and reset clearly if it is incompatible.
-	                    Updating an older Body Dials package performs the clean v2 cutover and resets
-	                    those old saved dial values to the new package neutral.
-	                    Moods, emotes, Eye Contact, camera, and agent assignments are kept, and the
-	                    previous package remains available as a backup.
-	                  </p>
 	                {:else}
 	                  <div class="batshit-settings-form-label">
 	                    Current VRM: <span class="text-foreground">{currentVrmLabel}</span>
@@ -17494,7 +17790,7 @@
               <Button
                 variant="ghost"
                 onclick={discardCueEditorChanges}
-                disabled={!editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy}
+                disabled={!editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy || recipeWorkflowBusy}
               >
                 <X aria-hidden="true" />
                 Cancel
@@ -17502,16 +17798,24 @@
               <Button
                 variant="outline"
                 onclick={() => requestWorkspaceExit({ type: 'close-editor' })}
-                disabled={editorFacialArtworkUploadBusy}
+                disabled={editorFacialArtworkUploadBusy || recipeWorkflowBusy}
               >
                 <X aria-hidden="true" />
                 Close Goon
               </Button>
               <Button
                 onclick={() => void saveCueEditor()}
-                disabled={!editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy}
+                disabled={Boolean(editorRecipeSourceError) || !editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy || recipeWorkflowBusy}
               >
-                {editorSaving ? 'Saving…' : 'Save Goon'}
+                {#if recipeWorkflowBusy}
+                  <Loader2 class="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  <span aria-live="polite">Updating Appearance…</span>
+                {:else if editorSaving}
+                  <Loader2 class="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  <span aria-live="polite">Saving…</span>
+                {:else}
+                  Save Goon
+                {/if}
               </Button>
             </div>
           </div>
@@ -17590,7 +17894,7 @@
           onResizeStart={startPreviewResize}
           runtimeBadge={resolveRendererBadge(previewRuntimeStatus)}
           loading={previewLoading}
-          error={previewError}
+          error={editorRecipeSourceError ? RETIRED_RECIPE_RECOVERY_MESSAGE : previewError}
           emptyMessage={
             !hasRenderableGoonAvatar(editorGoon)
               ? editorGoonKind === 'custom'

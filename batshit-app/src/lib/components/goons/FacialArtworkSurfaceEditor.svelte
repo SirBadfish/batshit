@@ -10,7 +10,7 @@
     resolveFacialArtworkTemplateOrientation,
     resolveFacialArtworkTemplateVariant,
     type FacialArtworkArtworkLayer,
-    type FacialArtworkDefinitionV3,
+    type FacialArtworkDefinitionV4,
     type FacialArtworkEyeState,
     type FacialArtworkLongitudeBounds,
     type FacialArtworkOrientation,
@@ -19,7 +19,7 @@
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
     type FacialArtworkSide,
-    type FacialArtworkStateV3,
+    type FacialArtworkStateV4,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import {
@@ -29,15 +29,15 @@
   } from '$lib/goons/facialArtwork.editor'
 
   type Props = {
-    definition: FacialArtworkDefinitionV3
-    valueState: FacialArtworkStateV3
+    definition: FacialArtworkDefinitionV4
+    valueState: FacialArtworkStateV4
     roleId: FacialArtworkRoleId
     label: string
     leftLabel?: string
     rightLabel?: string
     disabled?: boolean
     provenance: FacialArtworkProvenance | null
-    onChange: (state: FacialArtworkStateV3) => void
+    onChange: (state: FacialArtworkStateV4) => void
     onUpload: (
       roleId: FacialArtworkRoleId,
       file: File,

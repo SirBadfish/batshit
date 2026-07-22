@@ -7,14 +7,6 @@ import {
   type AppearanceDialValueState,
   type AppearanceDialsManifest,
 } from "$lib/goons/appearanceDials";
-import {
-  EYE_APPEARANCE_CONTROL_IDS,
-  createDefaultEyeAppearanceState,
-  readEyeAppearanceControl,
-  updateEyeAppearanceControl,
-  type EyeAppearanceControlDefinition,
-  type EyeAppearanceDefinitionV1,
-} from "$lib/goons/eyeAppearance";
 
 if (typeof globalThis.ResizeObserver === "undefined") {
   Object.defineProperty(globalThis, "ResizeObserver", {
@@ -72,6 +64,7 @@ function buildManifest(): AppearanceDialsManifest {
       { id: "face.brows", label: "Brows", surface: "head-face", order: 0 },
       { id: "face.eyes", label: "Eyes", surface: "head-face", order: 1 },
       { id: "face.cheeks", label: "Cheeks", surface: "head-face", order: 2 },
+      { id: "face.mouth-lips", label: "Mouth & Lips", surface: "head-face", order: 3 },
     ],
     dials: [
       {
@@ -130,6 +123,20 @@ function buildManifest(): AppearanceDialsManifest {
         step: 0.01,
         scalePerUnit: 0.1,
       },
+      {
+        id: "eye_corner_smoothing",
+        label: "Eye Corner Smoothing",
+        region: "face.eyes",
+        tier: "advanced",
+        order: 1,
+        description: "",
+        keywords: [],
+        kind: "root-scale",
+        range: [-2.5, 0.5],
+        default: 0,
+        step: 0.01,
+        scalePerUnit: 0.1,
+      },
     ],
     targets: {},
     followers: {},
@@ -147,175 +154,16 @@ function buildValueState(): AppearanceDialValueState {
   };
 }
 
-function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV1 {
-  const controlsById: Record<
-    (typeof EYE_APPEARANCE_CONTROL_IDS)[number],
-    Omit<EyeAppearanceControlDefinition, "id">
-  > = {
-    iris_size: {
-      label: "Iris Size",
-      description: "Scale the fitted iris.",
-      minimum: 0.72,
-      maximum: 1.28,
-      step: 0.01,
-      default: 1,
-      runtimeNeutralOffset: 0,
-      unit: "neutral-multiplier",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Scale the fitted iris.",
-    },
-    pupil_size: {
-      label: "Pupil Size",
-      description: "Scale the fitted pupil.",
-      minimum: 0.55,
-      maximum: 1.45,
-      step: 0.01,
-      default: 1,
-      runtimeNeutralOffset: 0,
-      unit: "neutral-multiplier",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Scale the fitted pupil.",
-    },
-    eye_convergence: {
-      label: "Eye Convergence (Gaze)",
-      description: "Adjust gaze distance toward a nearer or farther focus.",
-      minimum: -10,
-      maximum: 8,
-      step: 0.1,
-      default: 0,
-      runtimeNeutralOffset: 4,
-      unit: "degrees",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Rotate both fitted eyes around their pivots.",
-    },
-    sclera_scale: {
-      label: "Sclera Scale",
-      description: "Scale the complete fitted eye assembly.",
-      minimum: -0.2,
-      maximum: 0.2,
-      step: 0.005,
-      default: 0,
-      runtimeNeutralOffset: 0,
-      unit: "post-fit-multiplier-offset",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Scale the complete fitted eye assembly.",
-    },
-    sclera_tilt: {
-      label: "Sclera Tilt",
-      description: "Tilt the complete fitted eye assembly.",
-      minimum: -7,
-      maximum: 7,
-      step: 0.1,
-      default: 0,
-      runtimeNeutralOffset: 0,
-      unit: "degrees",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Tilt the complete fitted eye assembly.",
-    },
-    sclera_horizontal_position: {
-      label: "Sclera Horizontal Position",
-      description: "Move both eyes horizontally.",
-      minimum: -0.0028,
-      maximum: 0.0028,
-      step: 0.00005,
-      default: 0,
-      runtimeNeutralOffset: 0,
-      unit: "meters",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Move both eyes horizontally.",
-    },
-    sclera_vertical_position: {
-      label: "Sclera Vertical Position",
-      description: "Move both eyes vertically.",
-      minimum: -0.0027,
-      maximum: 0.0027,
-      step: 0.00005,
-      default: 0,
-      runtimeNeutralOffset: 0,
-      unit: "meters",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Move both eyes vertically.",
-    },
-    sclera_depth: {
-      label: "Sclera Depth",
-      description: "Move both eyes forward or backward.",
-      minimum: -0.00145,
-      maximum: 0.00145,
-      step: 0.000025,
-      default: 0,
-      runtimeNeutralOffset: 0,
-      unit: "meters",
-      linkedBilateral: true,
-      perEyeOverridesAllowed: false,
-      runtimeClampingAllowed: false,
-      geometrySemantics: "Move both eyes forward or backward.",
-    },
-  };
-
-  return {
-    schemaVersion: "eye-appearance/v1",
-    stateSchemaVersion: "eye-appearance-state/v1",
-    status: "test",
-    productExportApproved: false,
-    definitionSha256: HASH,
-    facialArtworkDependency: {
-      schemaVersion: "facial-artwork/v3",
-      definitionSha256: HASH,
-    },
-    ownership: "test",
-    zeroLaw: "Zero keeps the fitted result.",
-    symmetryLaw: "All physical controls are linked.",
-    compositionOrder: ["automatic-fit", "user-offset"],
-    completeEyeAssemblyNodes: ["EyeAssembly_L", "EyeAssembly_R"],
-    solidColorDefaults: {
-      iris: [0.1, 0.5, 0.6, 1],
-      pupil: [0.02, 0.02, 0.02, 1],
-      sclera: [0.92, 0.9, 0.86, 1],
-    },
-    controls: EYE_APPEARANCE_CONTROL_IDS.map((id) => ({
-      id,
-      ...controlsById[id],
-    })),
-    rangeEvidence: {
-      schemaVersion: "test",
-      sha256: HASH,
-      canonicalSha256: HASH,
-    },
-  } as EyeAppearanceDefinitionV1;
-}
-
 describe("AppearanceDialsEditor", () => {
-  it("starts every face region closed and keeps only one level-two region open", async () => {
-    const eyeAppearanceDefinition = buildEyeAppearanceDefinition();
-    const onEyeAppearanceChange = vi.fn();
-
+  it("shows the complete dial catalog without a tier filter and keeps only one face region open", async () => {
     render(AppearanceDialsEditor, {
       manifest: buildManifest(),
       valueState: buildValueState(),
       surface: "head-face",
       onChange: vi.fn(),
-      eyeAppearanceDefinition,
-      eyeAppearanceState: createDefaultEyeAppearanceState(
-        eyeAppearanceDefinition,
-      ),
-      onEyeAppearanceChange,
     });
 
-    expect(onEyeAppearanceChange).not.toHaveBeenCalled();
+    expect(screen.queryByRole("group", { name: "Dial detail level" })).not.toBeInTheDocument();
     const brows = screen.getByRole("button", { name: /Brows/ });
     const eyes = screen.getByRole("button", { name: /Eyes/ });
     const cheeks = screen.getByRole("button", { name: /Cheeks/ });
@@ -332,31 +180,12 @@ describe("AppearanceDialsEditor", () => {
         "text-left",
       );
     }
-    expect(screen.queryByRole("slider", { name: "Sclera Scale" })).not.toBeInTheDocument();
-
     await fireEvent.click(eyes);
 
-    expect(screen.getByText("Sclera Fit")).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: "Eye Corner Smoothing" })).toBeInTheDocument();
     expect(screen.queryByRole("slider", { name: "Eye Convergence (Gaze)" })).not.toBeInTheDocument();
-    const expectedRanges: Record<string, [string, string]> = {
-      "Sclera Scale": ["-0.2", "0.2"],
-      "Sclera Tilt": ["-7", "7"],
-      "Sclera Horizontal Position": ["-0.0028", "0.0028"],
-      "Sclera Vertical Position": ["-0.0027", "0.0027"],
-      "Sclera Depth": ["-0.00145", "0.00145"],
-    };
-    for (const label of [
-      "Sclera Scale",
-      "Sclera Tilt",
-      "Sclera Horizontal Position",
-      "Sclera Vertical Position",
-      "Sclera Depth",
-    ]) {
-      const slider = screen.getByRole("slider", { name: label });
-      expect(slider).toHaveAttribute("aria-valuemin", expectedRanges[label][0]);
-      expect(slider).toHaveAttribute("aria-valuemax", expectedRanges[label][1]);
-    }
-    expect(onEyeAppearanceChange).not.toHaveBeenCalled();
+    expect(screen.queryByText("Sclera Fit")).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider", { name: "Sclera Scale" })).not.toBeInTheDocument();
 
     await fireEvent.click(brows);
     expect(brows).toHaveAttribute("aria-expanded", "true");
@@ -379,35 +208,100 @@ describe("AppearanceDialsEditor", () => {
     expect(screen.getByRole("slider", { name: "Head Size" })).toBeInTheDocument();
   });
 
-  it("resets only the Sclera Fit controls and preserves Eye Contact convergence", async () => {
-    const eyeAppearanceDefinition = buildEyeAppearanceDefinition();
-    let eyeAppearanceState = createDefaultEyeAppearanceState(eyeAppearanceDefinition);
-    eyeAppearanceState = updateEyeAppearanceControl(
-      eyeAppearanceState,
-      "eye_convergence",
-      2,
-    );
-    eyeAppearanceState = updateEyeAppearanceControl(
-      eyeAppearanceState,
-      "sclera_scale",
-      0.1,
-    );
-    const onEyeAppearanceChange = vi.fn();
-
+  it("searches ordinary dials and embedded regional controls as one complete catalog", async () => {
     render(AppearanceDialsEditor, {
       manifest: buildManifest(),
       valueState: buildValueState(),
       surface: "head-face",
       onChange: vi.fn(),
-      eyeAppearanceDefinition,
-      eyeAppearanceState,
-      onEyeAppearanceChange,
+      regionContentIds: ["face.mouth-lips"],
+      regionContentControlCounts: { "face.mouth-lips": 5 },
+      regionContentSearchText: {
+        "face.mouth-lips": "Teeth Color Teeth Brightness Teeth Shine Gum Color Tongue Color",
+      },
     });
-    await fireEvent.click(screen.getByRole("button", { name: "Reset Eyes" }));
 
-    expect(onEyeAppearanceChange).toHaveBeenCalledTimes(1);
-    const nextState = onEyeAppearanceChange.mock.calls[0][0];
-    expect(readEyeAppearanceControl(nextState, "sclera_scale")).toBe(0);
-    expect(readEyeAppearanceControl(nextState, "eye_convergence")).toBe(2);
+    const search = screen.getByRole("searchbox", { name: "Search Face Appearance" });
+    await fireEvent.input(search, { target: { value: "forehead tighten" } });
+    expect(screen.getByRole("button", { name: /Brows/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Mouth & Lips/ })).not.toBeInTheDocument();
+
+    await fireEvent.input(search, { target: { value: "teeth brightness" } });
+    expect(screen.getByRole("button", { name: /^Mouth & Lips/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Brows/ })).not.toBeInTheDocument();
+
+    await fireEvent.input(search, { target: { value: "not a real face control" } });
+    expect(screen.getByText("No face dials match this filter.")).toBeInTheDocument();
+  });
+
+  it("reports and resets every changed embedded control in a region", async () => {
+    const onChange = vi.fn();
+    const onResetRegionContent = vi.fn();
+
+    render(AppearanceDialsEditor, {
+      manifest: buildManifest(),
+      valueState: buildValueState(),
+      surface: "head-face",
+      onChange,
+      regionContentIds: ["face.mouth-lips"],
+      regionContentControlCounts: { "face.mouth-lips": 5 },
+      regionContentChangedCounts: { "face.mouth-lips": 5 },
+      onResetRegionContent,
+    });
+
+    const mouth = screen.getByRole("button", { name: /^Mouth & Lips/ });
+    expect(mouth).toHaveAttribute("type", "button");
+    expect(mouth).toHaveAttribute("aria-expanded", "false");
+    expect(mouth).toHaveTextContent("5 changed");
+    expect(screen.getByRole("button", { name: /Reset Dials/ })).toHaveTextContent("(5)");
+
+    await fireEvent.click(screen.getByRole("button", { name: "Reset Mouth & Lips" }));
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onResetRegionContent).toHaveBeenCalledWith("face.mouth-lips");
+  });
+
+  it("keeps feminine and masculine style descriptors visible in the same catalog", async () => {
+    const manifest = buildManifest();
+    manifest.dials.push(
+      {
+        id: "feminine_brow_shape",
+        label: "Feminine Brow Shape",
+        region: "face.brows",
+        tier: "detail",
+        order: 1,
+        description: "A style description, never an access restriction.",
+        keywords: ["feminine", "brow"],
+        kind: "root-scale",
+        range: [-1, 1],
+        default: 0,
+        step: 0.01,
+        scalePerUnit: 0.1,
+      },
+      {
+        id: "masculine_brow_shape",
+        label: "Masculine Brow Shape",
+        region: "face.brows",
+        tier: "detail",
+        order: 2,
+        description: "A style description, never an access restriction.",
+        keywords: ["masculine", "brow"],
+        kind: "root-scale",
+        range: [-1, 1],
+        default: 0,
+        step: 0.01,
+        scalePerUnit: 0.1,
+      },
+    );
+
+    render(AppearanceDialsEditor, {
+      manifest,
+      valueState: buildValueState(),
+      surface: "head-face",
+      onChange: vi.fn(),
+    });
+
+    await fireEvent.click(screen.getByRole("button", { name: /Brows/ }));
+    expect(screen.getByRole("slider", { name: "Feminine Brow Shape" })).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: "Masculine Brow Shape" })).toBeInTheDocument();
   });
 });

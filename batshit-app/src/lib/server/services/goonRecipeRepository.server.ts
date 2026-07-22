@@ -19,6 +19,7 @@ export type RecipeRepositoryErrorCode =
   | 'NOT_FOUND'
   | 'FORBIDDEN'
   | 'RECIPE_NOT_INITIALIZED'
+  | 'RECIPE_ALREADY_INITIALIZED'
   | 'WRITE_CONFLICT'
   | 'CORRUPT_RECORD'
 
@@ -32,6 +33,31 @@ export class RecipeRepositoryError extends Error {
     this.code = code
     this.status = status
   }
+}
+
+const RECIPE_MANAGED_GOON_FIELDS = [
+  'recipe',
+  'customAvatar',
+  'appearanceDials',
+  'facialArtwork',
+  'eyeAppearance',
+  'oralAppearance',
+  'recipeFitReceipts'
+] as const
+
+export type RecipeBootstrapManagedSnapshot = Partial<
+  Pick<GoonRecord, (typeof RECIPE_MANAGED_GOON_FIELDS)[number]>
+>
+
+export function createRecipeBootstrapManagedSnapshot(
+  goon: GoonRecord
+): RecipeBootstrapManagedSnapshot {
+  const source = goon as unknown as Record<string, unknown>
+  return Object.fromEntries(
+    RECIPE_MANAGED_GOON_FIELDS
+      .filter((field) => Object.prototype.hasOwnProperty.call(source, field))
+      .map((field) => [field, source[field]])
+  ) as RecipeBootstrapManagedSnapshot
 }
 
 const RECIPE_COMPARE_AND_SWAP_SCRIPT = `
@@ -60,7 +86,9 @@ local managedFields = {
   'customAvatar',
   'appearanceDials',
   'facialArtwork',
-  'eyeAppearance'
+  'eyeAppearance',
+  'oralAppearance',
+  'recipeFitReceipts'
 }
 for index, field in ipairs(managedFields) do
   local value = ARGV[index + 2]
@@ -71,9 +99,76 @@ for index, field in ipairs(managedFields) do
     redis.call('JSON.SET', KEYS[1], path, value)
   end
 end
-redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[8])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[10])
 for index = 2, #KEYS do
-  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 7])
+  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 9])
+end
+return redis.call('JSON.GET', KEYS[1])
+`
+
+const RECIPE_BOOTSTRAP_SCRIPT = `
+local function deepEqual(left, right)
+  if left == cjson.null or right == cjson.null then
+    return left == cjson.null and right == cjson.null
+  end
+  if type(left) ~= type(right) then
+    return false
+  end
+  if type(left) ~= 'table' then
+    return left == right
+  end
+  for key, value in pairs(left) do
+    if not deepEqual(value, right[key]) then
+      return false
+    end
+  end
+  for key, _ in pairs(right) do
+    if left[key] == nil then
+      return false
+    end
+  end
+  return true
+end
+
+local raw = redis.call('JSON.GET', KEYS[1])
+if not raw then
+  return 'NOT_FOUND'
+end
+local current = cjson.decode(raw)
+if current['user_id'] ~= ARGV[1] then
+  return 'FORBIDDEN'
+end
+if current['recipe'] and current['recipe'] ~= cjson.null then
+  return 'RECIPE_ALREADY_INITIALIZED'
+end
+local managedFields = {
+  'recipe',
+  'customAvatar',
+  'appearanceDials',
+  'facialArtwork',
+  'eyeAppearance',
+  'oralAppearance',
+  'recipeFitReceipts'
+}
+local currentManaged = {}
+for _, field in ipairs(managedFields) do
+  if current[field] ~= nil then
+    currentManaged[field] = current[field]
+  end
+end
+local expectedManaged = cjson.decode(ARGV[2])
+if not deepEqual(currentManaged, expectedManaged) then
+  return 'WRITE_CONFLICT'
+end
+for index = 2, #KEYS do
+  if redis.call('EXISTS', KEYS[index]) == 1 then
+    return 'IMMUTABLE_COLLISION'
+  end
+end
+redis.call('JSON.SET', KEYS[1], '$.recipe', ARGV[3])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[4])
+for index = 2, #KEYS do
+  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 3])
 end
 return redis.call('JSON.GET', KEYS[1])
 `
@@ -135,7 +230,9 @@ local managedFields = {
   'customAvatar',
   'appearanceDials',
   'facialArtwork',
-  'eyeAppearance'
+  'eyeAppearance',
+  'oralAppearance',
+  'recipeFitReceipts'
 }
 for index, field in ipairs(managedFields) do
   local value = ARGV[index + 5]
@@ -146,10 +243,10 @@ for index, field in ipairs(managedFields) do
     redis.call('JSON.SET', KEYS[1], path, value)
   end
 end
-redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[11])
-redis.call('JSON.SET', KEYS[2], '$', ARGV[12])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[13])
+redis.call('JSON.SET', KEYS[2], '$', ARGV[14])
 for index = 3, #KEYS do
-  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 10])
+  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 12])
 end
 return redis.call('JSON.GET', KEYS[1])
 `
@@ -172,8 +269,20 @@ if tonumber(recipe['writeVersion']) ~= tonumber(ARGV[2]) or
    (pendingJob and pendingJob ~= cjson.null) then
   return 'WRITE_CONFLICT'
 end
-redis.call('DEL', KEYS[2], KEYS[3])
-return 'DISCARDED'
+local pendingAnalysis = recipe['pendingAnalysis']
+if not pendingAnalysis or pendingAnalysis == cjson.null or pendingAnalysis['analysisId'] ~= ARGV[3] then
+  return 'ANALYSIS_WRITE_CONFLICT'
+end
+redis.call('JSON.SET', KEYS[1], '$.recipe', ARGV[4])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[5])
+if #KEYS > 1 then
+  local deleteKeys = {}
+  for index = 2, #KEYS do
+    deleteKeys[#deleteKeys + 1] = KEYS[index]
+  end
+  redis.call('DEL', unpack(deleteKeys))
+end
+return redis.call('JSON.GET', KEYS[1])
 `
 
 function goonKey(goonId: string) {
@@ -185,6 +294,7 @@ function statusForCode(code: RecipeRepositoryErrorCode) {
   if (code === 'FORBIDDEN') return 403
   if (code === 'WRITE_CONFLICT') return 409
   if (code === 'RECIPE_NOT_INITIALIZED') return 409
+  if (code === 'RECIPE_ALREADY_INITIALIZED') return 409
   return 500
 }
 
@@ -203,6 +313,13 @@ function throwCasFailure(code: string): never {
       409
     )
   }
+  if (code === 'ANALYSIS_WRITE_CONFLICT') {
+    throw new RecipeRepositoryError(
+      'WRITE_CONFLICT',
+      'The pending Recipe analysis changed. Reload it before continuing.',
+      409
+    )
+  }
   if (code === 'JOB_CORRUPT') {
     throw new RecipeRepositoryError(
       'CORRUPT_RECORD',
@@ -214,6 +331,7 @@ function throwCasFailure(code: string): never {
     'NOT_FOUND',
     'FORBIDDEN',
     'RECIPE_NOT_INITIALIZED',
+    'RECIPE_ALREADY_INITIALIZED',
     'WRITE_CONFLICT'
   ] as const
   if (!known.includes(code as (typeof known)[number])) {
@@ -228,6 +346,7 @@ function throwCasFailure(code: string): never {
     NOT_FOUND: 'Goon not found.',
     FORBIDDEN: 'The Goon belongs to another user.',
     RECIPE_NOT_INITIALIZED: 'This Goon does not have a durable Recipe owner yet.',
+    RECIPE_ALREADY_INITIALIZED: 'This Goon already has a durable Recipe owner.',
     WRITE_CONFLICT: 'The Recipe changed while this operation was in progress. Analyze it again.'
   }
   throw new RecipeRepositoryError(typed, messages[typed], statusForCode(typed))
@@ -264,6 +383,27 @@ export async function getOwnedRecipeGoon(
     )
   }
   parseGoonRecipeV2(goon.recipe)
+  return goon
+}
+
+export async function getOwnedGoonForRecipeBootstrap(
+  userId: string,
+  goonId: string
+): Promise<GoonRecord> {
+  const goon = await redis.execute(async (client) =>
+    client.json.get(goonKey(goonId)) as Promise<GoonRecord | null>
+  )
+  if (!goon) throw new RecipeRepositoryError('NOT_FOUND', 'Goon not found.', 404)
+  if (goon.user_id !== userId) {
+    throw new RecipeRepositoryError('FORBIDDEN', 'The Goon belongs to another user.', 403)
+  }
+  if (goon.recipe) {
+    throw new RecipeRepositoryError(
+      'RECIPE_ALREADY_INITIALIZED',
+      'This Goon already has a durable Recipe owner.',
+      409
+    )
+  }
   return goon
 }
 
@@ -409,7 +549,9 @@ export async function compareAndSwapRecipeState(input: {
     'customAvatar',
     'appearanceDials',
     'facialArtwork',
-    'eyeAppearance'
+    'eyeAppearance',
+    'oralAppearance',
+    'recipeFitReceipts'
   ] as const
   const args = [
     input.userId,
@@ -441,6 +583,52 @@ export async function compareAndSwapRecipeState(input: {
     return client.eval(RECIPE_COMPARE_AND_SWAP_SCRIPT, {
       keys,
       arguments: args
+    })
+  })
+  const serialized = String(result)
+  if (!serialized.startsWith('{')) throwCasFailure(serialized)
+  const stored = JSON.parse(serialized) as GoonRecord
+  assertGoonIdentity(stored, input.userId, input.goonId)
+  parseGoonRecipeV2(stored.recipe)
+  return stored
+}
+
+export async function initializeRecipeState(input: {
+  userId: string
+  goonId: string
+  expectedManagedState: RecipeBootstrapManagedSnapshot
+  nextGoon: GoonRecord
+  records: Array<{ key: string; value: unknown }>
+}): Promise<GoonRecord> {
+  assertGoonIdentity(input.nextGoon, input.userId, input.goonId)
+  const owner = parseGoonRecipeV2(input.nextGoon.recipe)
+  if (owner.writeVersion !== 1) {
+    throw new RecipeRepositoryError(
+      'CORRUPT_RECORD',
+      'Recipe bootstrap must create owner writeVersion 1.',
+      500
+    )
+  }
+  for (const record of input.records) canonicalRecipeString(record.value)
+  canonicalRecipeString(input.expectedManagedState)
+  const keys = [goonKey(input.goonId), ...input.records.map((record) => record.key)]
+  const result = await redis.execute(async (client: any) => {
+    if (typeof client.eval !== 'function') {
+      throw new RecipeRepositoryError(
+        'CORRUPT_RECORD',
+        'Redis EVAL is unavailable; Recipe bootstrap cannot proceed atomically.',
+        500
+      )
+    }
+    return client.eval(RECIPE_BOOTSTRAP_SCRIPT, {
+      keys,
+      arguments: [
+        input.userId,
+        JSON.stringify(input.expectedManagedState),
+        JSON.stringify(owner),
+        JSON.stringify(input.nextGoon.updated_at),
+        ...input.records.map((record) => JSON.stringify(record.value))
+      ]
     })
   })
   const serialized = String(result)
@@ -502,7 +690,9 @@ export async function compareAndSwapRecipeJobState(input: {
     'customAvatar',
     'appearanceDials',
     'facialArtwork',
-    'eyeAppearance'
+    'eyeAppearance',
+    'oralAppearance',
+    'recipeFitReceipts'
   ] as const
   const args = [
     input.userId,
@@ -545,9 +735,20 @@ export async function discardRecipeAnalysisRecords(input: {
   userId: string
   goonId: string
   expectedWriteVersion: number
-  planRef: string
-  containmentReceiptRef: string
-}) {
+  analysisId: string
+  nextGoon: GoonRecord
+  recordRefs: string[]
+}): Promise<GoonRecord> {
+  assertGoonIdentity(input.nextGoon, input.userId, input.goonId)
+  const nextOwner = parseGoonRecipeV2(input.nextGoon.recipe)
+  if (nextOwner.writeVersion !== input.expectedWriteVersion + 1 || nextOwner.pendingAnalysis) {
+    throw new RecipeRepositoryError(
+      'CORRUPT_RECORD',
+      'Recipe analysis discard must advance once and clear pending analysis.',
+      500
+    )
+  }
+  const recordRefs = [...new Set(input.recordRefs)].sort((left, right) => left.localeCompare(right))
   const result = await redis.execute(async (client: any) => {
     if (typeof client.eval !== 'function') {
       throw new RecipeRepositoryError(
@@ -557,9 +758,20 @@ export async function discardRecipeAnalysisRecords(input: {
       )
     }
     return client.eval(RECIPE_ANALYSIS_DISCARD_SCRIPT, {
-      keys: [goonKey(input.goonId), input.planRef, input.containmentReceiptRef],
-      arguments: [input.userId, String(input.expectedWriteVersion)]
+      keys: [goonKey(input.goonId), ...recordRefs],
+      arguments: [
+        input.userId,
+        String(input.expectedWriteVersion),
+        input.analysisId,
+        JSON.stringify(nextOwner),
+        JSON.stringify(input.nextGoon.updated_at)
+      ]
     })
   })
-  if (result !== 'DISCARDED') throwCasFailure(String(result))
+  const serialized = String(result)
+  if (!serialized.startsWith('{')) throwCasFailure(serialized)
+  const stored = JSON.parse(serialized) as GoonRecord
+  assertGoonIdentity(stored, input.userId, input.goonId)
+  parseGoonRecipeV2(stored.recipe)
+  return stored
 }

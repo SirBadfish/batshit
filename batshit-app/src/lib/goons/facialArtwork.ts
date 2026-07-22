@@ -1,5 +1,5 @@
-export const FACIAL_ARTWORK_SCHEMA_VERSION = 'facial-artwork/v3' as const
-export const FACIAL_ARTWORK_STATE_SCHEMA_VERSION = 'facial-artwork-state/v3' as const
+export const FACIAL_ARTWORK_SCHEMA_VERSION = 'facial-artwork/v4' as const
+export const FACIAL_ARTWORK_STATE_SCHEMA_VERSION = 'facial-artwork-state/v4' as const
 
 export const FACIAL_ARTWORK_ROLE_IDS = [
   'brows',
@@ -84,7 +84,7 @@ export type FacialArtworkEyeState = {
 
 export type FacialArtworkRoleState = FacialArtworkBilateral<FacialArtworkEyeState>
 
-export type FacialArtworkStateV3 = {
+export type FacialArtworkStateV4 = {
   schemaVersion: typeof FACIAL_ARTWORK_STATE_SCHEMA_VERSION
   definitionSha256: string
   templateSet: { id: string; version: string }
@@ -128,10 +128,19 @@ export type FacialArtworkTemplateVariant = {
   semanticMap?: FacialArtworkSemanticMapAsset
 }
 
+export type FacialArtworkRuntimeBindingKind =
+  | 'face-conformal-canvas'
+  | 'eye-aperture-liner'
+  | 'socket-eye-composite-layer'
+
+export type FacialArtworkCompositeLayer = 'scleraArtwork' | 'iris' | 'pupil' | 'highlight'
+
 export type FacialArtworkRuntimeTarget = {
-  runtimeNodes: string[]
+  runtimeNodes: [string]
   mirrorU: boolean
   mirrorV: boolean
+  bindingKind: FacialArtworkRuntimeBindingKind
+  compositeLayer: FacialArtworkCompositeLayer | null
 }
 
 export type FacialArtworkPlanarBounds = {
@@ -157,18 +166,32 @@ export type FacialArtworkRoleDefinition = {
   bounds: FacialArtworkPlanarBounds | FacialArtworkLongitudeBounds
 }
 
-export type FacialArtworkDefinitionV3 = {
+export type FacialArtworkDefinitionDependency = {
+  schemaVersion:
+    | 'eye-appearance/v3'
+    | 'socket-eye-surface/v1'
+    | 'eye-aperture-seam/v1'
+  definitionSha256: string
+}
+
+export type FacialArtworkDefinitionV4 = {
   schemaVersion: typeof FACIAL_ARTWORK_SCHEMA_VERSION
   stateSchemaVersion: typeof FACIAL_ARTWORK_STATE_SCHEMA_VERSION
-  productExportApproved: false
+  status: 'product-export-approved'
+  productExportApproved: true
   definitionSha256: string
+  dependencies: {
+    eyeAppearance: FacialArtworkDefinitionDependency & { schemaVersion: 'eye-appearance/v3' }
+    socketEyeSurface: FacialArtworkDefinitionDependency & { schemaVersion: 'socket-eye-surface/v1' }
+    eyeApertureSeam: FacialArtworkDefinitionDependency & { schemaVersion: 'eye-aperture-seam/v1' }
+  }
   templateSet: { id: string; version: string }
   templates: FacialArtworkTemplate[]
   roles: FacialArtworkRoleDefinition[]
 }
 
 export type FacialArtworkReconciliation = {
-  state: FacialArtworkStateV3 | null
+  state: FacialArtworkStateV4 | null
   incompatible: boolean
   reason?: string
 }
@@ -181,10 +204,10 @@ const SOURCE_KINDS = new Set<FacialArtworkProvenance['sourceKind']>([
   'approved-external'
 ])
 const COLOR_ROLES = new Set<FacialArtworkRoleId>(['iris', 'pupil', 'sclera'])
-const PUBLIC_PREFIX = 'goons/facial-artwork/v3/'
+const PUBLIC_PREFIX = 'goons/facial-artwork/v4/'
 
 function fail(message: string): never {
-  throw new Error(`[facial-artwork/v3] ${message}`)
+  throw new Error(`[facial-artwork/v4] ${message}`)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -250,6 +273,20 @@ function hash(value: unknown, context: string): string {
   return parsed
 }
 
+function parseDefinitionDependency<
+  T extends 'eye-appearance/v3' | 'socket-eye-surface/v1' | 'eye-aperture-seam/v1'
+>(value: unknown, expectedSchemaVersion: T, context: string) {
+  const source = record(value, context)
+  rejectUnknownKeys(source, ['schemaVersion', 'definitionSha256'], context)
+  if (source.schemaVersion !== expectedSchemaVersion) {
+    fail(`${context}.schemaVersion must be ${expectedSchemaVersion}`)
+  }
+  return {
+    schemaVersion: expectedSchemaVersion,
+    definitionSha256: hash(source.definitionSha256, `${context}.definitionSha256`)
+  }
+}
+
 function publicPath(value: unknown, context: string): string {
   const parsed = stringValue(value, context)
   if (
@@ -258,7 +295,7 @@ function publicPath(value: unknown, context: string): string {
     parsed.split('/').includes('..') ||
     parsed.includes('_private')
   ) {
-    fail(`${context} must use the canonical public v3 asset root`)
+    fail(`${context} must use the canonical public v4 asset root`)
   }
   return parsed
 }
@@ -448,20 +485,50 @@ function validateEvidenceValue(value: unknown, context: string): void {
 
 function parseRuntimeTarget(value: unknown, context: string): FacialArtworkRuntimeTarget {
   const source = record(value, context)
-  rejectUnknownKeys(source, ['runtimeNodes', 'mirrorU', 'mirrorV'], context)
+  rejectUnknownKeys(
+    source,
+    ['runtimeNodes', 'mirrorU', 'mirrorV', 'bindingKind', 'compositeLayer'],
+    context
+  )
   if (
     !Array.isArray(source.runtimeNodes) ||
-    source.runtimeNodes.length === 0 ||
+    source.runtimeNodes.length !== 1 ||
     source.runtimeNodes.some((node) => typeof node !== 'string' || !node.trim())
   ) {
-    fail(`${context}.runtimeNodes must contain exact runtime node names`)
+    fail(`${context}.runtimeNodes must contain exactly one runtime node name`)
+  }
+  const bindingKind = stringValue(
+    source.bindingKind,
+    `${context}.bindingKind`
+  ) as FacialArtworkRuntimeBindingKind
+  if (
+    bindingKind !== 'face-conformal-canvas' &&
+    bindingKind !== 'eye-aperture-liner' &&
+    bindingKind !== 'socket-eye-composite-layer'
+  ) {
+    fail(`${context}.bindingKind is unsupported`)
+  }
+  const compositeLayer = source.compositeLayer
+  if (
+    compositeLayer !== null &&
+    compositeLayer !== 'scleraArtwork' &&
+    compositeLayer !== 'iris' &&
+    compositeLayer !== 'pupil' &&
+    compositeLayer !== 'highlight'
+  ) {
+    fail(`${context}.compositeLayer is unsupported`)
+  }
+  if ((bindingKind === 'socket-eye-composite-layer') !== (compositeLayer !== null)) {
+    fail(`${context}.compositeLayer must exist only for socket-eye-composite-layer bindings`)
   }
   return {
     runtimeNodes: source.runtimeNodes.map((node, index) =>
       stringValue(node, `${context}.runtimeNodes[${index}]`)
-    ),
+    ) as [string],
     mirrorU: booleanValue(source.mirrorU, `${context}.mirrorU`),
-    mirrorV: booleanValue(source.mirrorV, `${context}.mirrorV`)
+    mirrorV: booleanValue(source.mirrorV, `${context}.mirrorV`),
+    bindingKind,
+    compositeLayer: compositeLayer as FacialArtworkCompositeLayer | null
   }
 }
 
@@ -723,11 +790,30 @@ function parseRoleDefinition(
     template,
     `${context}.defaultEyeState`
   )
-  if (partial.ownership === 'canvas' && partial.target.left.runtimeNodes.length !== 1) {
-    fail(`${context}.target.left must bind one canvas node`)
-  }
-  if (partial.ownership === 'canvas' && partial.target.right.runtimeNodes.length !== 1) {
-    fail(`${context}.target.right must bind one canvas node`)
+  const expectedBindingKind: FacialArtworkRuntimeBindingKind =
+    expectedId === 'brows'
+      ? 'face-conformal-canvas'
+      : expectedId === 'lashes_eye_outline'
+        ? 'eye-aperture-liner'
+        : 'socket-eye-composite-layer'
+  const expectedCompositeLayer: FacialArtworkCompositeLayer | null =
+    expectedId === 'sclera'
+      ? 'scleraArtwork'
+      : expectedId === 'iris' || expectedId === 'pupil'
+        ? expectedId
+        : expectedId === 'eye_highlight'
+          ? 'highlight'
+          : null
+  for (const side of ['left', 'right'] as const) {
+    const target = partial.target[side]
+    if (target.bindingKind !== expectedBindingKind) {
+      fail(`${context}.target.${side}.bindingKind must be ${expectedBindingKind}`)
+    }
+    if (target.compositeLayer !== expectedCompositeLayer) {
+      fail(
+        `${context}.target.${side}.compositeLayer must be ${expectedCompositeLayer ?? 'null'}`
+      )
+    }
   }
   return { ...partial, defaultEyeState }
 }
@@ -766,14 +852,6 @@ function validateRichDefinitionMetadata(source: Record<string, unknown>) {
   )
   Object.entries(stateModel).forEach(([key, value]) => stringValue(value, `definition.stateModel.${key}`))
 
-  const eyePackage = record(source.eyeAppearancePackage, 'definition.eyeAppearancePackage')
-  rejectUnknownKeys(eyePackage, ['schemaVersion', 'stateSchemaVersion', 'ownership'], 'definition.eyeAppearancePackage')
-  if (eyePackage.schemaVersion !== 'eye-appearance/v1') fail('definition.eyeAppearancePackage.schemaVersion is unsupported')
-  if (eyePackage.stateSchemaVersion !== 'eye-appearance-state/v1') {
-    fail('definition.eyeAppearancePackage.stateSchemaVersion is unsupported')
-  }
-  stringValue(eyePackage.ownership, 'definition.eyeAppearancePackage.ownership')
-
   const hashContract = record(source.hashContract, 'definition.hashContract')
   rejectUnknownKeys(
     hashContract,
@@ -802,7 +880,7 @@ function validateRichDefinitionMetadata(source: Record<string, unknown>) {
     )
   )
   if (allowedKinds.size !== SOURCE_KINDS.size || [...SOURCE_KINDS].some((entry) => !allowedKinds.has(entry))) {
-    fail('definition.provenanceContract.allowedSourceKinds does not match the v3 upload contract')
+    fail('definition.provenanceContract.allowedSourceKinds does not match the v4 upload contract')
   }
   if (provenance.rightsConfirmedMustBe !== true) {
     fail('definition.provenanceContract.rightsConfirmedMustBe must be true')
@@ -852,7 +930,7 @@ function validateRichDefinitionMetadata(source: Record<string, unknown>) {
   topology.nodes.forEach((entry, index) => validateEvidenceValue(entry, `definition.topologyFreeze.nodes[${index}]`))
 }
 
-export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefinitionV3 {
+export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefinitionV4 {
   const source = record(value, 'definition')
   rejectUnknownKeys(
     source,
@@ -862,12 +940,12 @@ export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefin
       'status',
       'productExportApproved',
       'definitionSha256',
+      'dependencies',
       'templateSet',
       'templates',
       'roles',
       'ownership',
       'stateModel',
-      'eyeAppearancePackage',
       'hashContract',
       'provenanceContract',
       'rendering',
@@ -881,10 +959,36 @@ export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefin
   if (source.stateSchemaVersion !== FACIAL_ARTWORK_STATE_SCHEMA_VERSION) {
     fail(`definition.stateSchemaVersion must equal ${FACIAL_ARTWORK_STATE_SCHEMA_VERSION}`)
   }
-  if (source.productExportApproved !== false) {
-    fail('definition.productExportApproved must remain false until final clearance')
+  if (source.status !== 'product-export-approved') {
+    fail('definition.status must be product-export-approved')
+  }
+  if (source.productExportApproved !== true) {
+    fail('definition.productExportApproved must be true')
   }
   validateRichDefinitionMetadata(source)
+  const dependencySource = record(source.dependencies, 'definition.dependencies')
+  rejectUnknownKeys(
+    dependencySource,
+    ['eyeAppearance', 'socketEyeSurface', 'eyeApertureSeam'],
+    'definition.dependencies'
+  )
+  const dependencies: FacialArtworkDefinitionV4['dependencies'] = {
+    eyeAppearance: parseDefinitionDependency(
+      dependencySource.eyeAppearance,
+      'eye-appearance/v3',
+      'definition.dependencies.eyeAppearance'
+    ),
+    socketEyeSurface: parseDefinitionDependency(
+      dependencySource.socketEyeSurface,
+      'socket-eye-surface/v1',
+      'definition.dependencies.socketEyeSurface'
+    ),
+    eyeApertureSeam: parseDefinitionDependency(
+      dependencySource.eyeApertureSeam,
+      'eye-aperture-seam/v1',
+      'definition.dependencies.eyeApertureSeam'
+    )
+  }
   const templateSetSource = record(source.templateSet, 'definition.templateSet')
   rejectUnknownKeys(templateSetSource, ['id', 'version'], 'definition.templateSet')
   if (!Array.isArray(source.templates) || source.templates.length === 0) {
@@ -899,14 +1003,16 @@ export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefin
     !Array.isArray(source.roles) ||
     source.roles.length !== FACIAL_ARTWORK_ROLE_IDS.length
   ) {
-    fail('definition.roles must contain exactly the six v3 product roles')
+    fail('definition.roles must contain exactly the six v4 product roles')
   }
   const roleSources = source.roles as unknown[]
   const roles = FACIAL_ARTWORK_ROLE_IDS.map((id, index) =>
     parseRoleDefinition(roleSources[index], id, templateMap, `definition.roles[${index}]`)
   )
   const claimedNodes = new Set<string>()
-  for (const role of roles.filter((entry) => entry.ownership !== 'lit-overlay')) {
+  for (const role of roles.filter(
+    (entry) => entry.target.left.bindingKind !== 'socket-eye-composite-layer'
+  )) {
     for (const side of ['left', 'right'] as const) {
       for (const node of role.target[side].runtimeNodes) {
         if (claimedNodes.has(node)) fail(`runtime node ${node} has multiple surface owners`)
@@ -914,11 +1020,27 @@ export function parseFacialArtworkDefinition(value: unknown): FacialArtworkDefin
       }
     }
   }
+  for (const side of ['left', 'right'] as const) {
+    const compositeNodes = new Set(
+      roles
+        .filter((role) => role.target[side].bindingKind === 'socket-eye-composite-layer')
+        .map((role) => role.target[side].runtimeNodes[0])
+    )
+    if (compositeNodes.size !== 1) {
+      fail(`all ${side} eye-surface artwork roles must share one composite-cap node`)
+    }
+    const compositeNode = [...compositeNodes][0]
+    if (claimedNodes.has(compositeNode)) {
+      fail(`runtime node ${compositeNode} cannot own both a surface and composite eye layers`)
+    }
+  }
   return {
     schemaVersion: FACIAL_ARTWORK_SCHEMA_VERSION,
     stateSchemaVersion: FACIAL_ARTWORK_STATE_SCHEMA_VERSION,
-    productExportApproved: false,
+    status: 'product-export-approved',
+    productExportApproved: true,
     definitionSha256: hash(source.definitionSha256, 'definition.definitionSha256'),
+    dependencies,
     templateSet: {
       id: stringValue(templateSetSource.id, 'definition.templateSet.id'),
       version: stringValue(templateSetSource.version, 'definition.templateSet.version')
@@ -933,8 +1055,8 @@ function cloneValue<T>(value: T): T {
 }
 
 export function createDefaultFacialArtworkState(
-  definition: FacialArtworkDefinitionV3
-): FacialArtworkStateV3 {
+  definition: FacialArtworkDefinitionV4
+): FacialArtworkStateV4 {
   const roles = {} as Record<FacialArtworkRoleId, FacialArtworkRoleState>
   for (const role of definition.roles) {
     const eye = cloneValue(role.defaultEyeState)
@@ -952,9 +1074,9 @@ export function createDefaultFacialArtworkState(
 }
 
 export function parseFacialArtworkState(
-  definition: FacialArtworkDefinitionV3,
+  definition: FacialArtworkDefinitionV4,
   value: unknown
-): FacialArtworkStateV3 {
+): FacialArtworkStateV4 {
   const source = record(value, 'state')
   rejectUnknownKeys(source, ['schemaVersion', 'definitionSha256', 'templateSet', 'roles'], 'state')
   if (source.schemaVersion !== FACIAL_ARTWORK_STATE_SCHEMA_VERSION) {
@@ -976,7 +1098,7 @@ export function parseFacialArtworkState(
     Object.keys(roleSource).length !== FACIAL_ARTWORK_ROLE_IDS.length ||
     FACIAL_ARTWORK_ROLE_IDS.some((id) => !Object.hasOwn(roleSource, id))
   ) {
-    fail('state.roles must contain exactly the six v3 product roles')
+    fail('state.roles must contain exactly the six v4 product roles')
   }
   const templates = new Map(definition.templates.map((template) => [template.id, template]))
   const definitions = new Map(definition.roles.map((role) => [role.id, role]))
@@ -1011,7 +1133,7 @@ export function parseFacialArtworkState(
 }
 
 export function reconcileFacialArtworkState(
-  definition: FacialArtworkDefinitionV3,
+  definition: FacialArtworkDefinitionV4,
   value: unknown
 ): FacialArtworkReconciliation {
   if (value === null || value === undefined) return { state: null, incompatible: false }
@@ -1027,14 +1149,14 @@ export function reconcileFacialArtworkState(
 }
 
 export function resolveFacialArtworkState(
-  definition: FacialArtworkDefinitionV3,
-  value: FacialArtworkStateV3 | null | undefined
-): FacialArtworkStateV3 {
+  definition: FacialArtworkDefinitionV4,
+  value: FacialArtworkStateV4 | null | undefined
+): FacialArtworkStateV4 {
   return value ? parseFacialArtworkState(definition, value) : createDefaultFacialArtworkState(definition)
 }
 
 export function resolveFacialArtworkEyeState(
-  state: FacialArtworkStateV3,
+  state: FacialArtworkStateV4,
   roleId: FacialArtworkRoleId,
   side: FacialArtworkSide
 ): FacialArtworkEyeState {
@@ -1043,7 +1165,7 @@ export function resolveFacialArtworkEyeState(
 }
 
 export function createFacialArtworkArtworkLayer(
-  definition: FacialArtworkDefinitionV3,
+  definition: FacialArtworkDefinitionV4,
   roleId: FacialArtworkRoleId,
   upload: FacialArtworkUpload
 ): FacialArtworkArtworkLayer {
@@ -1075,7 +1197,7 @@ export function resolveFacialArtworkAssetUrl(path: string): string {
   return `/${publicPath(path, 'asset path')}`
 }
 
-export function collectFacialArtworkUploads(value: FacialArtworkStateV3 | null | undefined) {
+export function collectFacialArtworkUploads(value: FacialArtworkStateV4 | null | undefined) {
   const uploads = new Map<string, FacialArtworkUpload>()
   if (!value) return []
   for (const role of Object.values(value.roles)) {
@@ -1088,6 +1210,6 @@ export function collectFacialArtworkUploads(value: FacialArtworkStateV3 | null |
   return [...uploads.values()]
 }
 
-export function collectFacialArtworkUploadUrls(value: FacialArtworkStateV3 | null | undefined) {
+export function collectFacialArtworkUploadUrls(value: FacialArtworkStateV4 | null | undefined) {
   return new Set(collectFacialArtworkUploads(value).map((upload) => upload.url))
 }

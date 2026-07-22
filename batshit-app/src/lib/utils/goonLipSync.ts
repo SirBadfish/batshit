@@ -6,6 +6,16 @@ import {
   type CustomRhubarbMouthCue,
   type CustomRhubarbMouthWeights
 } from '$lib/goons/semanticVisemes'
+import {
+  RHUBARB_9_SPEECH_FACE_PROFILE,
+  cloneGoonSpeechFaceFrame,
+  createEmptyGoonSpeechFaceFrame,
+  lerpGoonSpeechFaceFrames,
+  projectGoonSpeechFaceFrameToRhubarb9,
+  sameGoonSpeechFaceFrame,
+  type GoonSpeechFaceFrame,
+  type GoonFaceDriverProfile
+} from '$lib/goons/speechFaceProfiles'
 
 export const DEFAULT_GOON_LIP_SYNC_MODE: GoonLipSyncMode = 'amplitude'
 export const MIN_GOON_LIP_SYNC_VISEME_BLEND_MS = 0
@@ -26,12 +36,13 @@ export type GoonLipSyncWeights = CustomRhubarbMouthWeights
 
 export type GoonLipSyncTimelineKeyframe = {
   timeMs: number
-  weights: GoonLipSyncWeights
+  frame: GoonSpeechFaceFrame
 }
 
 export type GoonLipSyncTimeline = {
   analyzerId: GoonLipSyncAnalyzerId
   source: GoonLipSyncTimelineSource
+  profile: GoonFaceDriverProfile
   keyframes: GoonLipSyncTimelineKeyframe[]
   durationMs: number
   unitCount: number
@@ -52,7 +63,7 @@ export type GoonLipSyncTimelineDiagnostics = {
   durationMs: number
   visemeSymbolCounts: Record<string, number>
   phoneSymbolCounts: Record<string, number>
-  primaryCueCounts: Partial<Record<GoonLipSyncViseme, number>>
+  primaryCueCounts: Record<string, number>
   unmappedSymbols: Array<{
     phoneSymbol?: string
     visemeSymbol?: string
@@ -60,8 +71,8 @@ export type GoonLipSyncTimelineDiagnostics = {
   }>
   cueDurationMs?: Record<string, number>
   activeDurationMs?: number
-  weightMaxima?: Partial<Record<GoonLipSyncViseme, number>>
-  weightedDurationMs?: Partial<Record<GoonLipSyncViseme, number>>
+  weightMaxima?: Record<string, number>
+  weightedDurationMs?: Record<string, number>
 }
 
 export type GoonLipSyncSampleOptions = {
@@ -174,6 +185,13 @@ const cloneWeights = (weights: GoonLipSyncWeights): GoonLipSyncWeights => ({
   tongue_lift: clamp01(weights.tongue_lift)
 })
 
+function createRhubarbFrame(weights: GoonLipSyncWeights): GoonSpeechFaceFrame {
+  return {
+    profile: RHUBARB_9_SPEECH_FACE_PROFILE,
+    weights: cloneWeights(weights)
+  }
+}
+
 export function createEmptyGoonLipSyncWeights(): GoonLipSyncWeights {
   return createEmptyCustomRhubarbMouthWeights()
 }
@@ -184,6 +202,12 @@ export function downmixGoonLipSyncWeightsToLegacy(
   return downmixCustomRhubarbMouthToGoonWeights(weights)
 }
 
+export function downmixGoonLipSyncFrameToLegacy(
+  frame: GoonSpeechFaceFrame
+): LegacyGoonLipSyncWeights {
+  return downmixGoonLipSyncWeightsToLegacy(projectGoonSpeechFaceFrameToRhubarb9(frame))
+}
+
 export function applyGoonLipSyncWeightMultipliers(
   weights: GoonLipSyncWeights,
   multipliers: Partial<GoonLipSyncWeights>
@@ -191,21 +215,6 @@ export function applyGoonLipSyncWeightMultipliers(
   const next = createEmptyGoonLipSyncWeights()
   for (const viseme of CUSTOM_RHUBARB_MOUTH_ORDER) {
     next[viseme] = clamp01(weights[viseme] * (multipliers[viseme] ?? 1))
-  }
-  return next
-}
-
-const sameWeights = (a: GoonLipSyncWeights, b: GoonLipSyncWeights) =>
-  CUSTOM_RHUBARB_MOUTH_ORDER.every((viseme) => a[viseme] === b[viseme])
-
-function lerpWeights(
-  from: GoonLipSyncWeights,
-  to: GoonLipSyncWeights,
-  amount: number
-): GoonLipSyncWeights {
-  const next = createEmptyGoonLipSyncWeights()
-  for (const viseme of CUSTOM_RHUBARB_MOUTH_ORDER) {
-    next[viseme] = from[viseme] + (to[viseme] - from[viseme]) * amount
   }
   return next
 }
@@ -242,25 +251,25 @@ function createVisemeWeights(viseme: LegacyGoonLipSyncViseme): GoonLipSyncWeight
 function pushKeyframe(
   keyframes: GoonLipSyncTimelineKeyframe[],
   timeMs: number,
-  weights: GoonLipSyncWeights
+  frame: GoonSpeechFaceFrame
 ) {
   const clamped = Math.max(0, timeMs)
   const last = keyframes[keyframes.length - 1]
   if (!last) {
-    keyframes.push({ timeMs: clamped, weights: cloneWeights(weights) })
+    keyframes.push({ timeMs: clamped, frame: cloneGoonSpeechFaceFrame(frame) })
     return
   }
 
   if (Math.abs(last.timeMs - clamped) < 0.0001) {
-    last.weights = cloneWeights(weights)
+    last.frame = cloneGoonSpeechFaceFrame(frame)
     return
   }
 
-  if (sameWeights(last.weights, weights)) {
+  if (sameGoonSpeechFaceFrame(last.frame, frame)) {
     return
   }
 
-  keyframes.push({ timeMs: clamped, weights: cloneWeights(weights) })
+  keyframes.push({ timeMs: clamped, frame: cloneGoonSpeechFaceFrame(frame) })
 }
 
 function normalizeWordToken(token: string): string[] {
@@ -522,7 +531,9 @@ export function buildTextGoonLipSyncTimeline(
     typeof durationOverrideMs === 'number' && Number.isFinite(durationOverrideMs) && durationOverrideMs > 0
       ? Math.max(estimatedDurationMs, Math.round(durationOverrideMs))
       : estimatedDurationMs
-  const keyframes: GoonLipSyncTimelineKeyframe[] = [{ timeMs: 0, weights: cloneWeights(ZERO_WEIGHTS) }]
+  const keyframes: GoonLipSyncTimelineKeyframe[] = [
+    { timeMs: 0, frame: createRhubarbFrame(ZERO_WEIGHTS) }
+  ]
   let elapsedMs = 0
 
   for (const unit of units) {
@@ -534,16 +545,17 @@ export function buildTextGoonLipSyncTimeline(
     const attackEndMs = Math.min(endMs, startMs + attackMs)
     const releaseStartMs = Math.max(attackEndMs, endMs - releaseMs)
 
-    pushKeyframe(keyframes, attackEndMs, unit.weights)
-    pushKeyframe(keyframes, releaseStartMs, unit.weights)
+    pushKeyframe(keyframes, attackEndMs, createRhubarbFrame(unit.weights))
+    pushKeyframe(keyframes, releaseStartMs, createRhubarbFrame(unit.weights))
     elapsedMs = endMs
   }
 
-  pushKeyframe(keyframes, durationMs, ZERO_WEIGHTS)
+  pushKeyframe(keyframes, durationMs, createRhubarbFrame(ZERO_WEIGHTS))
 
   return {
     analyzerId: 'batshit-text-timing',
     source: 'text-timing',
+    profile: RHUBARB_9_SPEECH_FACE_PROFILE,
     keyframes,
     durationMs,
     unitCount: units.length,
@@ -555,9 +567,9 @@ export function sampleGoonLipSyncTimeline(
   timeline: GoonLipSyncTimeline | null | undefined,
   elapsedMs: number,
   options: GoonLipSyncSampleOptions = {}
-): GoonLipSyncWeights {
+): GoonSpeechFaceFrame {
   if (!timeline || timeline.keyframes.length === 0) {
-    return cloneWeights(ZERO_WEIGHTS)
+    return createEmptyGoonSpeechFaceFrame(RHUBARB_9_SPEECH_FACE_PROFILE)
   }
 
   const clamped = Math.max(0, Math.min(timeline.durationMs, elapsedMs))
@@ -565,15 +577,15 @@ export function sampleGoonLipSyncTimeline(
   const last = timeline.keyframes[timeline.keyframes.length - 1]
 
   if (!first || !last) {
-    return cloneWeights(ZERO_WEIGHTS)
+    return createEmptyGoonSpeechFaceFrame(timeline.profile)
   }
 
   if (clamped <= first.timeMs) {
-    return cloneWeights(first.weights)
+    return cloneGoonSpeechFaceFrame(first.frame)
   }
 
   if (clamped >= last.timeMs) {
-    return cloneWeights(last.weights)
+    return cloneGoonSpeechFaceFrame(last.frame)
   }
 
   const transitionWeights = sampleTimelineBoundaryTransition(timeline, clamped, options)
@@ -587,13 +599,13 @@ export function sampleGoonLipSyncTimeline(
     if (clamped < current.timeMs || clamped > next.timeMs) continue
     const span = next.timeMs - current.timeMs
     if (span <= 0.0001) {
-      return cloneWeights(next.weights)
+      return cloneGoonSpeechFaceFrame(next.frame)
     }
     const amount = (clamped - current.timeMs) / span
-    return lerpWeights(current.weights, next.weights, amount)
+    return lerpGoonSpeechFaceFrames(current.frame, next.frame, amount)
   }
 
-  return cloneWeights(last.weights)
+  return cloneGoonSpeechFaceFrame(last.frame)
 }
 
 export function normalizeGoonLipSyncTimelineDuration(
@@ -617,7 +629,7 @@ export function normalizeGoonLipSyncTimelineDuration(
       durationMs: target,
       keyframes: timeline.keyframes.map((keyframe) => ({
         timeMs: Math.max(0, Math.min(target, Math.round(keyframe.timeMs))),
-        weights: cloneWeights(keyframe.weights)
+        frame: cloneGoonSpeechFaceFrame(keyframe.frame)
       }))
     }
   }
@@ -632,13 +644,13 @@ export function normalizeGoonLipSyncTimelineDuration(
   const scale = target / current
   const keyframes = timeline.keyframes.map((keyframe) => ({
     timeMs: Math.max(0, Math.min(target, Math.round(keyframe.timeMs * scale))),
-    weights: cloneWeights(keyframe.weights)
+    frame: cloneGoonSpeechFaceFrame(keyframe.frame)
   }))
   const last = keyframes[keyframes.length - 1]
   if (last && last.timeMs < target) {
     keyframes.push({
       timeMs: target,
-      weights: cloneWeights(last.weights)
+      frame: cloneGoonSpeechFaceFrame(last.frame)
     })
   }
 
@@ -659,7 +671,7 @@ function sampleTimelineBoundaryTransition(
   timeline: GoonLipSyncTimeline,
   clampedMs: number,
   options: GoonLipSyncSampleOptions
-): GoonLipSyncWeights | null {
+): GoonSpeechFaceFrame | null {
   const requestedBlendMs = normalizeGoonLipSyncVisemeBlendMs(
     options.visemeBlendMs ?? timeline.visemeBlendMs ?? 0,
     0
@@ -672,7 +684,7 @@ function sampleTimelineBoundaryTransition(
     const to = keyframes[index + 1]
     if (!from || !to) continue
     if (Math.abs(from.timeMs - to.timeMs) > 0.0001) continue
-    if (sameWeights(from.weights, to.weights)) continue
+    if (sameGoonSpeechFaceFrame(from.frame, to.frame)) continue
 
     const boundaryMs = from.timeMs
     const previousTimeMs = findPreviousDistinctTimeMs(keyframes, index, boundaryMs)
@@ -688,7 +700,7 @@ function sampleTimelineBoundaryTransition(
     if (clampedMs < transitionStartMs || clampedMs > transitionEndMs) continue
 
     const amount = easeVisemeBlend((clampedMs - transitionStartMs) / blendMs)
-    return lerpWeights(from.weights, to.weights, amount)
+    return lerpGoonSpeechFaceFrames(from.frame, to.frame, amount)
   }
 
   return null
@@ -720,9 +732,11 @@ function findNextDistinctTimeMs(
 }
 
 export function getGoonLipSyncOpenness(
-  weights: Partial<Record<CustomRhubarbMouthCue, number>>
+  frame: GoonSpeechFaceFrame
 ): number {
-  const legacyWeights = downmixGoonLipSyncWeightsToLegacy(weights)
+  const legacyWeights = downmixGoonLipSyncWeightsToLegacy(
+    projectGoonSpeechFaceFrameToRhubarb9(frame)
+  )
   return getLegacyGoonLipSyncOpenness(legacyWeights)
 }
 

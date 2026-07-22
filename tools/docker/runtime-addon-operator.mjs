@@ -88,6 +88,30 @@ const ADDONS = {
     start: ['compose', '--env-file', ENV_FILE, '--profile', 'fbx2vrma', 'up', '-d', '--build', 'fbx2vrma-worker'],
     stop: ['compose', '--env-file', ENV_FILE, '--profile', 'fbx2vrma', 'stop', 'fbx2vrma-worker']
   },
+  audio2face: {
+    title: 'NVIDIA Audio2Face Bridge',
+    profile: 'audio2face',
+    start: [
+      'compose',
+      '--env-file',
+      ENV_FILE,
+      '--profile',
+      'audio2face',
+      'up',
+      '-d',
+      '--build',
+      'audio2face-bridge'
+    ],
+    stop: [
+      'compose',
+      '--env-file',
+      ENV_FILE,
+      '--profile',
+      'audio2face',
+      'stop',
+      'audio2face-bridge'
+    ]
+  },
   'agent-browser': {
     title: 'Agent Browser Runtime',
     profile: 'agent-browser',

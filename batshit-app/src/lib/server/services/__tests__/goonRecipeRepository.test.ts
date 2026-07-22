@@ -9,8 +9,15 @@ import {
   GOON_RECIPE_JOB_CONTRACT,
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   RECIPE_MIGRATION_PLAN_CONTRACT,
+  RECIPE_MIGRATION_REPORT_CONTRACT,
   RECIPE_SOURCE_CONTRACT,
-  createGoonRecipeDocument
+  anatomyFitRecipeSibling,
+  canonicalRecipeSha256,
+  createAnatomyFitInput,
+  createAnatomyFitResult,
+  createAnatomyFitState,
+  createGoonRecipeDocument,
+  verifyRecipeStateSnapshot
 } from '$lib/goons/recipe'
 import type { GoonRecord } from '$lib/types/goons'
 import {
@@ -83,8 +90,14 @@ function recipeOwner(writeVersion = 1) {
       },
       updateReport: null
     },
+    authoringSourceContainmentReceipt: {
+      contract: RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+      ref: `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('5')}`,
+      sha256: sha('5')
+    },
     activeRevision: documentRef('e'),
     previousRevision: null,
+    pendingAnalysis: null,
     pendingJob: null,
     latestUpdateReport: null,
     lastFailure: null,
@@ -103,6 +116,97 @@ function goon(name = 'Recipe CAS Goon', writeVersion = 1): GoonRecord {
     recipe: recipeOwner(writeVersion),
     created_at: '2026-07-17T00:00:00.000Z',
     updated_at: '2026-07-17T00:00:00.000Z'
+  }
+}
+
+async function storageStableAnatomyFitSnapshot() {
+  const fitInput = await createAnatomyFitInput({
+    solverVersion: 'eye-socket-fit/neutral-relative/v3',
+    domain: 'eye-socket-left',
+    source: {
+      modelSha256: sha('3'),
+      appearanceDefinitionSha256: sha('6'),
+      topologySha256: sha('b'),
+      positionsSha256: sha('d'),
+      positionsScalarCount: 61_074,
+      physicalEvaluationSha256: sha('e'),
+      physicalEvaluationScalarCount: 128,
+      landmarkSetSha256: sha('f'),
+      landmarkSampleCount: 194
+    },
+    relevantInputs: [
+      { id: 'eye_size', value: 0.9963701302315507 }
+    ],
+    parameters: [
+      {
+        id: 'sclera-scale',
+        lower: 0.88,
+        upper: 1.12,
+        neutral: 1,
+        regularizationWeight: 0.5,
+        initialStep: 0.04,
+        minimumStep: 0.005
+      }
+    ]
+  })
+  const fitResult = await createAnatomyFitResult({
+    solverVersion: fitInput.solverVersion,
+    domain: fitInput.domain,
+    inputSha256: fitInput.inputSha256,
+    status: 'converged',
+    convergence: {
+      converged: true,
+      iterations: 8,
+      objective: 0.0015013614251065596,
+      tolerance: 0.00025,
+      reason: 'objective-tolerance'
+    },
+    resolvedParameters: [
+      { id: 'sclera-scale', value: 0.9722222222222207, lower: 0.88, upper: 1.12, neutral: 1 }
+    ],
+    nodeTransforms: [
+      {
+        nodeId: 'eye-l-sclera',
+        rootDeltaMatrix: [
+          -0.11218153564400829, 0, 0, 0,
+          0, 1, 0, 0,
+          0, 0, 1, 0,
+          3.3040728006091187, 0, 0, 1
+        ]
+      }
+    ],
+    followerMorphCoefficients: [],
+    metrics: [
+      {
+        id: 'minimum-lid-clearance',
+        value: 0.0015013614251065596,
+        unit: 'meters',
+        minimum: 0.00025,
+        maximum: null,
+        passed: true
+      }
+    ],
+    diagnostics: []
+  })
+  const fitState = await createAnatomyFitState(sha('6'), [
+    { input: fitInput, result: fitResult }
+  ])
+  const sibling = await anatomyFitRecipeSibling(fitState)
+  const content = {
+    contract: GOON_RECIPE_STATE_CONTRACT,
+    appearanceDials: {
+      contract: 'appearance-dial-values/v2' as const,
+      definitionSha256: sha('6'),
+      neutralId: 'neutral-1',
+      neutralRecipeSha256: sha('7'),
+      values: { body_height: 0 },
+      unlockedDialIds: []
+    },
+    siblings: [sibling]
+  }
+  return {
+    ...content,
+    stateSha256: await canonicalRecipeSha256(content)
   }
 }
 
@@ -134,6 +238,17 @@ function bakingJob(stateVersion = 1, targetWriteVersion = 2) {
       ref: `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('6')}`,
       sha256: sha('6')
     },
+    migrationReport: {
+      contract: RECIPE_MIGRATION_REPORT_CONTRACT,
+      ref: `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('7')}`,
+      sha256: sha('7')
+    },
+    reviewedState: {
+      contract: 'recipe-reviewed-state/v1',
+      ref: `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('8')}`,
+      sha256: sha('8')
+    },
+    stagedLive: null,
     candidateRevision: null,
     lease: { ownerId: 'worker-1', expiresAt: '2026-07-17T00:05:00.000Z' },
     failure: null,
@@ -251,6 +366,63 @@ describe('Goon Recipe repository', () => {
     })
   })
 
+  it.runIf(REAL_REDIS_LANE)('commits the complete Recipe sibling and fit projection in one CAS', async () => {
+    await redis.json.set(`goon:${GOON_ID}`, '$', {
+      ...goon(),
+      appearanceDials: { marker: 'old' },
+      facialArtwork: { marker: 'old' },
+      eyeAppearance: { marker: 'old' },
+      oralAppearance: { marker: 'old' },
+      recipeFitReceipts: [{ receiptId: 'old-fit' }]
+    })
+    const next = {
+      ...goon('Complete Revision', 2),
+      recipe: { ...recipeOwner(2), activeRevision: documentRef('f') },
+      appearanceDials: { marker: 'new' },
+      facialArtwork: { marker: 'new' },
+      eyeAppearance: { marker: 'new' },
+      oralAppearance: { marker: 'new' },
+      recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }],
+      updated_at: '2026-07-17T00:00:01.000Z'
+    } as unknown as GoonRecord
+
+    const stored = await compareAndSwapRecipeState({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      expectedWriteVersion: 1,
+      nextGoon: next
+    })
+
+    expect(stored).toMatchObject({
+      appearanceDials: { marker: 'new' },
+      facialArtwork: { marker: 'new' },
+      eyeAppearance: { marker: 'new' },
+      oralAppearance: { marker: 'new' },
+      recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }]
+    })
+  })
+
+  it.runIf(REAL_REDIS_LANE)('preserves Anatomy Fit hashes through a nested RedisJSON round trip', async () => {
+    const snapshot = await storageStableAnatomyFitSnapshot()
+    const storedInput = {
+      ...goon(),
+      recipe: {
+        ...recipeOwner(),
+        authoringRevision: {
+          ...recipeOwner().authoringRevision,
+          state: snapshot
+        }
+      }
+    } as GoonRecord
+
+    await redis.json.set(`goon:${GOON_ID}`, '$', storedInput)
+    const stored = await getOwnedRecipeGoon(USER_ID, GOON_ID)
+
+    await expect(
+      verifyRecipeStateSnapshot(stored.recipe!.authoringRevision.state)
+    ).resolves.toEqual(snapshot)
+  })
+
   it.runIf(REAL_REDIS_LANE)('never replaces an existing immutable transaction record', async () => {
     await redis.json.set(`goon:${GOON_ID}`, '$', goon())
     const immutableKey = `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('c')}`
@@ -322,17 +494,57 @@ describe('Goon Recipe repository', () => {
   it.runIf(REAL_REDIS_LANE)('atomically discards analysis only when pendingJob is JSON null', async () => {
     const planKey = `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('1')}`
     const receiptKey = `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('2')}`
-    await redis.json.set(`goon:${GOON_ID}`, '$', goon())
+    const analysisOwner = {
+      ...recipeOwner(1),
+      pendingAnalysis: {
+        analysisId: 'analysis-1',
+        analysisRef: {
+          contract: 'recipe-update-analysis-context/v1',
+          ref: `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('3')}`,
+          sha256: sha('3')
+        },
+        basePlan: {
+          contract: RECIPE_MIGRATION_PLAN_CONTRACT,
+          ref: planKey,
+          sha256: sha('1')
+        },
+        selectedPlan: {
+          contract: RECIPE_MIGRATION_PLAN_CONTRACT,
+          ref: planKey,
+          sha256: sha('1')
+        },
+        migrationReport: {
+          contract: RECIPE_MIGRATION_REPORT_CONTRACT,
+          ref: `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('4')}`,
+          sha256: sha('4')
+        },
+        containmentReceipt: {
+          contract: RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+          ref: receiptKey,
+          sha256: sha('2')
+        },
+        reviewedState: null,
+        targetWriteVersion: 1
+      }
+    }
+    const analysisGoon = { ...goon(), recipe: analysisOwner }
+    await redis.json.set(`goon:${GOON_ID}`, '$', analysisGoon)
     await redis.json.set(planKey, '$', { contract: RECIPE_MIGRATION_PLAN_CONTRACT })
     await redis.json.set(receiptKey, '$', { contract: RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT })
 
-    await expect(discardRecipeAnalysisRecords({
+    const discarded = await discardRecipeAnalysisRecords({
       userId: USER_ID,
       goonId: GOON_ID,
       expectedWriteVersion: 1,
-      planRef: planKey,
-      containmentReceiptRef: receiptKey
-    })).resolves.toBeUndefined()
+      analysisId: 'analysis-1',
+      nextGoon: {
+        ...analysisGoon,
+        recipe: { ...analysisOwner, writeVersion: 2, pendingAnalysis: null },
+        updated_at: '2026-07-17T00:00:01.000Z'
+      },
+      recordRefs: [planKey, receiptKey]
+    })
+    expect(discarded.recipe).toMatchObject({ writeVersion: 2, pendingAnalysis: null })
     await expect(redis.json.get(planKey)).resolves.toBeNull()
     await expect(redis.json.get(receiptKey)).resolves.toBeNull()
 
@@ -343,8 +555,13 @@ describe('Goon Recipe repository', () => {
       userId: USER_ID,
       goonId: GOON_ID,
       expectedWriteVersion: 2,
-      planRef: planKey,
-      containmentReceiptRef: receiptKey
+      analysisId: 'analysis-1',
+      nextGoon: {
+        ...goonWithPendingJob(1, 2),
+        recipe: { ...recipeOwner(3), writeVersion: 3, pendingAnalysis: null },
+        updated_at: '2026-07-17T00:00:02.000Z'
+      },
+      recordRefs: [planKey, receiptKey]
     })).rejects.toMatchObject({ code: 'WRITE_CONFLICT', status: 409 })
     await expect(redis.json.get(planKey)).resolves.not.toBeNull()
     await expect(redis.json.get(receiptKey)).resolves.not.toBeNull()

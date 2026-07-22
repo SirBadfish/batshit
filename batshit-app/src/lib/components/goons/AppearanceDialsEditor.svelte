@@ -2,7 +2,6 @@
   import type { Snippet } from 'svelte'
   import { ChevronDown, Link2, RotateCcw, Search, Unlink2 } from '@lucide/svelte'
   import * as Collapsible from '$lib/components/ui/collapsible'
-  import * as ToggleGroup from '$lib/components/ui/toggle-group'
   import { Button } from '$lib/components/ui/button'
   import { Input } from '$lib/components/ui/input'
   import { Slider } from '$lib/components/ui/slider'
@@ -15,27 +14,17 @@
     type AppearanceDialValueState,
     type AppearanceDialsManifest
   } from '$lib/goons/appearanceDials'
-  import {
-    EYE_APPEARANCE_SCLERA_FIT_CONTROL_IDS,
-    createDefaultEyeAppearanceState,
-    readEyeAppearanceControl,
-    updateEyeAppearanceControl,
-    type EyeAppearanceControlDefinition,
-    type EyeAppearanceDefinitionV1,
-    type EyeAppearanceStateV1
-  } from '$lib/goons/eyeAppearance'
-
-  type TierFilter = 'core' | 'all'
 
   type Props = {
     manifest: AppearanceDialsManifest
     valueState: AppearanceDialValueState
     surface: AppearanceDialSurface
     onChange: (state: AppearanceDialValueState) => void
-    eyeAppearanceDefinition?: EyeAppearanceDefinitionV1 | null
-    eyeAppearanceState?: EyeAppearanceStateV1 | null
-    onEyeAppearanceChange?: (state: EyeAppearanceStateV1) => void
     regionContentIds?: string[]
+    regionContentControlCounts?: Record<string, number>
+    regionContentChangedCounts?: Record<string, number>
+    regionContentSearchText?: Record<string, string>
+    onResetRegionContent?: (regionId: string) => void
     regionContent?: Snippet<[regionId: string]>
   }
 
@@ -44,42 +33,20 @@
     valueState,
     surface,
     onChange,
-    eyeAppearanceDefinition = null,
-    eyeAppearanceState = null,
-    onEyeAppearanceChange,
     regionContentIds = [],
+    regionContentControlCounts = {},
+    regionContentChangedCounts = {},
+    regionContentSearchText = {},
+    onResetRegionContent,
     regionContent
   }: Props = $props()
 
-  let tierFilter = $state<TierFilter>('core')
   let searchQuery = $state('')
   let openRegionId = $state<string | null>(null)
 
   const surfaceLabel = $derived(surface === 'body' ? 'Body' : 'Face')
   const reconciled = $derived.by(() => reconcileAppearanceDialValues(manifest, valueState))
   const normalizedSearch = $derived(searchQuery.trim().toLocaleLowerCase())
-  const eyeRegionId = $derived.by(
-    () =>
-      manifest.regions.find(
-        (region) =>
-          region.surface === 'head-face' &&
-          (region.id === 'face.eyes' || region.label.toLocaleLowerCase() === 'eyes')
-      )?.id ?? null
-  )
-  const defaultEyeAppearanceState = $derived.by(() =>
-    eyeAppearanceDefinition ? createDefaultEyeAppearanceState(eyeAppearanceDefinition) : null
-  )
-  const eyeAppearanceControls = $derived.by(() => {
-    if (!eyeAppearanceDefinition || !eyeAppearanceState || !onEyeAppearanceChange) return []
-    return EYE_APPEARANCE_SCLERA_FIT_CONTROL_IDS.map((id) =>
-      eyeAppearanceDefinition.controls.find((control) => control.id === id)
-    ).filter((control): control is EyeAppearanceControlDefinition => Boolean(control))
-  })
-  const scleraFitControls = $derived(
-    eyeAppearanceControls.filter((control) =>
-      EYE_APPEARANCE_SCLERA_FIT_CONTROL_IDS.some((id) => id === control.id)
-    )
-  )
 
   function dialValue(id: string): number {
     const value = reconciled.values[id]
@@ -100,27 +67,20 @@
     )
   }
 
-  function isEyeAppearanceControlChanged(control: EyeAppearanceControlDefinition): boolean {
-    if (!eyeAppearanceState) return false
-    return Math.abs(readEyeAppearanceControl(eyeAppearanceState, control.id) - control.default) > 1e-9
-  }
-
-  const eyeAppearanceChangedCount = $derived(
-    eyeAppearanceControls.filter(isEyeAppearanceControlChanged).length
-  )
-
   function surfaceChangedCount(targetSurface: AppearanceDialSurface): number {
     const appearanceCount = manifest.dials.filter((dial) => {
       const region = manifest.regions.find((candidate) => candidate.id === dial.region)
       return region?.surface === targetSurface && isDialChanged(dial)
     }).length
-    return appearanceCount + (targetSurface === 'head-face' ? eyeAppearanceChangedCount : 0)
+    const embeddedCount = manifest.regions
+      .filter((region) => region.surface === targetSurface)
+      .reduce((count, region) => count + (regionContentChangedCounts[region.id] ?? 0), 0)
+    return appearanceCount + embeddedCount
   }
 
   const changedCount = $derived(surfaceChangedCount(surface))
 
   function matchesDial(dial: AppearanceDialDefinition): boolean {
-    if (tierFilter === 'core' && dial.tier !== 'core') return false
     if (!normalizedSearch) return true
     return [dial.label, dial.id, dial.description, ...dial.keywords]
       .join(' ')
@@ -128,16 +88,10 @@
       .includes(normalizedSearch)
   }
 
-  function matchesEyeAppearanceControl(control: EyeAppearanceControlDefinition): boolean {
+  function matchesEmbeddedRegionContent(region: AppearanceDialsManifest['regions'][number]): boolean {
+    if (!regionContentIds.includes(region.id)) return false
     if (!normalizedSearch) return true
-    return [
-      control.label,
-      control.id,
-      control.description,
-      control.geometrySemantics,
-      'eyes',
-      'sclera fit'
-    ]
+    return [region.id, region.label, regionContentSearchText[region.id] ?? '']
       .join(' ')
       .toLocaleLowerCase()
       .includes(normalizedSearch)
@@ -152,16 +106,11 @@
         dials: manifest.dials
           .filter((dial) => dial.region === region.id && matchesDial(dial))
           .sort((left, right) => left.order - right.order || left.label.localeCompare(right.label)),
-        scleraControls:
-          region.id === eyeRegionId
-            ? scleraFitControls.filter(matchesEyeAppearanceControl)
-            : [],
-        hasEmbeddedContent: !normalizedSearch && regionContentIds.includes(region.id)
+        hasEmbeddedContent: matchesEmbeddedRegionContent(region)
       }))
       .filter(
         (region) =>
           region.dials.length > 0 ||
-          region.scleraControls.length > 0 ||
           region.hasEmbeddedContent
       )
   )
@@ -219,7 +168,7 @@
 
   function resetRegion(regionId: string) {
     resetDials(manifest.dials.filter((candidate) => candidate.region === regionId))
-    if (regionId === eyeRegionId) resetScleraFitControls()
+    onResetRegionContent?.(regionId)
   }
 
   function resetSurface() {
@@ -227,32 +176,7 @@
       manifest.regions.filter((region) => region.surface === surface).map((region) => region.id)
     )
     resetDials(manifest.dials.filter((dial) => regionIds.has(dial.region)))
-    if (surface === 'head-face') resetScleraFitControls()
-  }
-
-  function updateEyeAppearanceValue(control: EyeAppearanceControlDefinition, value: number) {
-    if (!eyeAppearanceState || !onEyeAppearanceChange) return
-    if (Math.abs(readEyeAppearanceControl(eyeAppearanceState, control.id) - value) < control.step / 2) {
-      return
-    }
-    onEyeAppearanceChange(updateEyeAppearanceControl(eyeAppearanceState, control.id, value))
-  }
-
-  function resetEyeAppearanceControl(control: EyeAppearanceControlDefinition) {
-    updateEyeAppearanceValue(control, control.default)
-  }
-
-  function resetScleraFitControls() {
-    if (!eyeAppearanceState || !defaultEyeAppearanceState || !onEyeAppearanceChange) return
-    let nextState = eyeAppearanceState
-    for (const controlId of EYE_APPEARANCE_SCLERA_FIT_CONTROL_IDS) {
-      nextState = updateEyeAppearanceControl(
-        nextState,
-        controlId,
-        readEyeAppearanceControl(defaultEyeAppearanceState, controlId)
-      )
-    }
-    if (nextState !== eyeAppearanceState) onEyeAppearanceChange(nextState)
+    for (const regionId of regionIds) onResetRegionContent?.(regionId)
   }
 
   function toggleSideUnlock(dial: AppearanceDialDefinition) {
@@ -277,52 +201,9 @@
     const appearanceCount = manifest.dials.filter(
       (dial) => dial.region === regionId && isDialChanged(dial)
     ).length
-    return appearanceCount + (regionId === eyeRegionId ? eyeAppearanceChangedCount : 0)
+    return appearanceCount + (regionContentChangedCounts[regionId] ?? 0)
   }
 </script>
-
-{#snippet eyeAppearanceControlRow(control: EyeAppearanceControlDefinition)}
-  {@const value = eyeAppearanceState
-    ? readEyeAppearanceControl(eyeAppearanceState, control.id)
-    : control.default}
-  {@const controlChanged = isEyeAppearanceControlChanged(control)}
-  <div class="appearance-dial-row">
-    <div class="appearance-dial-label-row">
-      <GoonsFieldLabel
-        label={control.label}
-        info={control.description}
-        ariaLabel={`About ${control.label}`}
-      />
-      <div class="appearance-dial-actions">
-        <span class="appearance-dial-value">{formatValue(value, control.step)}</span>
-        {#if controlChanged}
-          <button
-            type="button"
-            class="appearance-dials-reset-dial"
-            aria-label={`Reset ${control.label}`}
-            title={`Reset ${control.label}`}
-            onclick={() => resetEyeAppearanceControl(control)}
-          >
-            <RotateCcw aria-hidden="true" />
-          </button>
-        {/if}
-      </div>
-    </div>
-    <Slider
-      type="single"
-      {value}
-      onValueChange={(nextValue: number | number[]) =>
-        updateEyeAppearanceValue(control, normalizeSliderValue(nextValue))}
-      min={control.minimum}
-      max={control.maximum}
-      step={control.step}
-      fillFrom={control.default}
-      showAnchorMarker={control.minimum < control.default && control.maximum > control.default}
-      aria-label={control.label}
-      class="appearance-dial-slider"
-    />
-  </div>
-{/snippet}
 
 <div class="appearance-dials-editor">
   <div class="appearance-dials-toolbar">
@@ -335,19 +216,6 @@
         aria-label={`Search ${surfaceLabel} Appearance`}
       />
     </label>
-    <ToggleGroup.Root
-      type="single"
-      value={tierFilter}
-      variant="outline"
-      size="sm"
-      aria-label="Dial detail level"
-      onValueChange={(value: string) => {
-        if (value === 'core' || value === 'all') tierFilter = value
-      }}
-    >
-      <ToggleGroup.Item value="core" class="appearance-dials-tier-option">Core</ToggleGroup.Item>
-      <ToggleGroup.Item value="all" class="appearance-dials-tier-option">All</ToggleGroup.Item>
-    </ToggleGroup.Root>
     <Button variant="outline" size="sm" onclick={resetSurface} disabled={changedCount === 0}>
       <RotateCcw aria-hidden="true" />
       Reset Dials
@@ -373,7 +241,7 @@
           >
             <span class="batshit-settings-form-label appearance-dials-region-title">{region.label}</span>
             <span class="appearance-dials-region-meta">
-              {region.dials.length + region.scleraControls.length}
+              {region.dials.length + (regionContentControlCounts[region.id] ?? 0)}
               {#if regionChangeCount > 0}
                 <span class="appearance-dials-changed-label">{regionChangeCount} changed</span>
               {/if}
@@ -479,19 +347,6 @@
               </div>
             {/each}
 
-            {#if region.scleraControls.length > 0}
-              <div class="appearance-dial-subgroup-heading">
-                <GoonsFieldLabel
-                  label="Sclera Fit"
-                  info="Linked across both eyes. Zero keeps the package-fitted result."
-                  ariaLabel="About Sclera Fit"
-                />
-              </div>
-              {#each region.scleraControls as control (control.id)}
-                {@render eyeAppearanceControlRow(control)}
-              {/each}
-            {/if}
-
             {#if region.hasEmbeddedContent && regionContent}
               {@render regionContent(region.id)}
             {/if}
@@ -513,6 +368,7 @@
   }
 
   .appearance-dials-editor {
+    container-type: inline-size;
     gap: 10px;
   }
 
@@ -553,13 +409,6 @@
     height: 32px;
     padding-left: 28px;
     font-size: 0.6875rem;
-  }
-
-  :global(.appearance-dials-tier-option) {
-    min-width: 3.75rem !important;
-    padding-inline: 12px !important;
-    font-size: 0.6875rem;
-    font-weight: 500;
   }
 
   .appearance-dials-empty {
@@ -714,11 +563,6 @@
   .appearance-dial-side-label {
     color: var(--foreground);
     font-size: 0.625rem;
-  }
-
-  .appearance-dial-subgroup-heading {
-    padding-top: 10px;
-    border-top: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
   }
 
   @container (max-width: 420px) {
