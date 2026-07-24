@@ -88,7 +88,7 @@
 		"ansi-to-html": "^0.7.2",
 		"bcrypt": "^6.0.0",
 		"cheerio": "^1.2.0",
-		"dompurify": "^3.4.11",
+		"dompurify": "^3.4.12",
 		"eventsource": "^4.1.0",
 		"fflate": "^0.8.2",
 		"livekit-server-sdk": "^2.15.3",
