@@ -47,7 +47,7 @@ export type OralAppearanceDefinitionV1 = {
   schemaVersion: typeof ORAL_APPEARANCE_SCHEMA_VERSION
   stateSchemaVersion: typeof ORAL_APPEARANCE_STATE_SCHEMA_VERSION
   status: string
-  productExportApproved: false
+  productExportApproved: true
   definitionSha256: string
   ownership: string
   defaultLaw: string
@@ -242,8 +242,8 @@ export function parseOralAppearanceDefinition(value: unknown): OralAppearanceDef
   if (source.stateSchemaVersion !== ORAL_APPEARANCE_STATE_SCHEMA_VERSION) {
     fail('definition stateSchemaVersion is unsupported')
   }
-  if (source.productExportApproved !== false) {
-    fail('definition productExportApproved must remain false')
+  if (source.productExportApproved !== true) {
+    fail('definition productExportApproved must be true')
   }
 
   const rawBindings = record(source.runtimeBindings, 'definition.runtimeBindings')
@@ -336,7 +336,7 @@ export function parseOralAppearanceDefinition(value: unknown): OralAppearanceDef
     schemaVersion: ORAL_APPEARANCE_SCHEMA_VERSION,
     stateSchemaVersion: ORAL_APPEARANCE_STATE_SCHEMA_VERSION,
     status: text(source.status, 'definition.status'),
-    productExportApproved: false,
+    productExportApproved: true,
     definitionSha256: sha256(source.definitionSha256, 'definition.definitionSha256'),
     ownership: text(source.ownership, 'definition.ownership'),
     defaultLaw: text(source.defaultLaw, 'definition.defaultLaw'),

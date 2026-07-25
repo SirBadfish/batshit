@@ -17,6 +17,7 @@ import type {
   FacialArtworkRoleId,
   FacialArtworkUpload
 } from '$lib/goons/facialArtwork'
+import type { LipArtworkUpload } from '$lib/goons/lipArtwork'
 import {
   addGoon,
   setGoons,
@@ -67,6 +68,11 @@ export type GoonFacialArtworkUploadInput = {
   orientation: FacialArtworkOrientation
   guideSha256: string
   maskSha256: string
+  provenance: FacialArtworkProvenance
+}
+
+export type GoonLipArtworkUploadInput = {
+  definitionSha256: string
   provenance: FacialArtworkProvenance
 }
 
@@ -351,6 +357,38 @@ export async function deleteGoonFacialArtwork(id: string, filename: string): Pro
   if (!res.ok) {
     throw new Error(await readApiError(res, 'Failed to delete facial artwork'))
   }
+  return true
+}
+
+export async function uploadGoonLipArtwork(
+  id: string,
+  file: File,
+  input: GoonLipArtworkUploadInput
+): Promise<LipArtworkUpload> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  form.append('definitionSha256', input.definitionSha256)
+  form.append('provenance', JSON.stringify(input.provenance))
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/lip-artwork`, {
+    method: 'POST',
+    body: form
+  })
+  if (!res.ok) throw new Error(await readApiError(res, 'Failed to upload Lip Artwork'))
+  const data = (await res.json()) as { artwork?: LipArtworkUpload }
+  if (!data.artwork?.url || !data.artwork.filename || !data.artwork.sha256) {
+    throw new Error('Lip Artwork upload did not return a valid file reference')
+  }
+  return data.artwork
+}
+
+export async function deleteGoonLipArtwork(id: string, filename: string): Promise<boolean> {
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/lip-artwork`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename })
+  })
+  if (res.status === 409) return false
+  if (!res.ok) throw new Error(await readApiError(res, 'Failed to delete Lip Artwork'))
   return true
 }
 

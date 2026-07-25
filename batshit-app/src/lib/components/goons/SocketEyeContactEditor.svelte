@@ -79,7 +79,7 @@
         class="batshit-settings-form-label-line"
       />
     </div>
-    <div class="batshit-settings-form-control socket-eye-contact-switch">
+    <div class="batshit-settings-form-control is-inline-status">
       <Switch.Root
         checked={value.enabled}
         onCheckedChange={(checked) => update({ enabled: checked })}
@@ -122,11 +122,6 @@
     flex-direction: column;
     gap: 14px;
     padding: 0 12px 8px;
-  }
-
-  .socket-eye-contact-switch {
-    display: flex;
-    justify-content: flex-end;
   }
 
   .socket-eye-contact-control {

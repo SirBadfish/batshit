@@ -101,14 +101,22 @@ export function resolveAuthoredSocketEyeCoordinates(
   const left = definition.runtimeBindings.left.gaze
   const right = definition.runtimeBindings.right.gaze
   return {
-    left: {
-      horizontal: -clampSigned(direction.leftEyeYaw) * left.maximumHorizontal,
-      vertical: clampSigned(direction.leftEyePitch) * left.maximumVertical
-    },
-    right: {
-      horizontal: -clampSigned(direction.rightEyeYaw) * right.maximumHorizontal,
-      vertical: clampSigned(direction.rightEyePitch) * right.maximumVertical
-    }
+    left: clampToSafeDomain(
+      {
+        horizontal: -clampSigned(direction.leftEyeYaw) * left.maximumHorizontal,
+        vertical: clampSigned(direction.leftEyePitch) * left.maximumVertical
+      },
+      left.maximumHorizontal,
+      left.maximumVertical
+    ),
+    right: clampToSafeDomain(
+      {
+        horizontal: -clampSigned(direction.rightEyeYaw) * right.maximumHorizontal,
+        vertical: clampSigned(direction.rightEyePitch) * right.maximumVertical
+      },
+      right.maximumHorizontal,
+      right.maximumVertical
+    )
   }
 }
 

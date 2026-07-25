@@ -1,4 +1,5 @@
 import type {
+  AnatomyFitResult,
   RecipeFailureStage,
   RecipeJobStatus,
   RecipeLiveStatus,
@@ -7,6 +8,13 @@ import type {
   RecipeBuildDirtyDomain,
   RecipeAuthorUpdateClassification,
 } from "$lib/goons/recipe";
+import type { AppearanceDialValueState } from "$lib/goons/appearanceDials";
+
+export type RecipeFittedPreviewState = {
+  stateSha256: string;
+  appearanceDials: AppearanceDialValueState;
+  anatomyFitResults: AnatomyFitResult[];
+};
 
 export type RecipeEditorStatus =
   "not-initialized" | "ready" | "dirty" | "reviewing";

@@ -11,6 +11,8 @@ export * from "./anatomyFitAuthoring";
 export * from "./anatomyFitAuthoringClient";
 export * from "./anatomyFitManifest";
 export * from "./anatomyFitSolver";
+export * from "./oralCavityFit";
+export * from "./oralCavityFitPackage";
 export * from "./eyeSocketFit";
 export * from "./appearanceRecipeCandidateGenerator";
 export * from "./appearanceRecipeCandidateUniqueness";

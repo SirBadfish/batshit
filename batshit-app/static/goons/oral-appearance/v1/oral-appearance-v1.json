@@ -1,9 +1,9 @@
 {
   "schemaVersion": "oral-appearance/v1",
   "stateSchemaVersion": "oral-appearance-state/v1",
-  "status": "runtime-ready-pending-painterly-default-art",
-  "productExportApproved": false,
-  "definitionSha256": "dffdbe6d9db2840260b3822409f29e927ad82485916b8f288d22e610fe507177",
+  "status": "runtime-ready-painterly-default-approved",
+  "productExportApproved": true,
+  "definitionSha256": "a38ea318356fb471ecc859a9b8575643ceacd91a7a7032498c8bacd15c5b28b7",
   "ownership": "Package-authored oral materials are the exact reset state. Mutable color, brightness, and shine values live only in the Goon's Oral Appearance sibling.",
   "defaultLaw": "Null state and the generated default state reproduce the package-authored material color factors and roughness exactly.",
   "compositionOrder": [
@@ -42,7 +42,7 @@
         1.0,
         1.0
       ],
-      "roughness": 0.7
+      "roughness": 0.23
     },
     "gums": {
       "color": [
@@ -50,7 +50,7 @@
         1.0,
         1.0
       ],
-      "roughness": 0.7
+      "roughness": 0.38
     },
     "tongue": {
       "color": [
@@ -93,7 +93,7 @@
       "minimum": 0.0,
       "maximum": 1.0,
       "step": 0.01,
-      "default": 0.3,
+      "default": 0.77,
       "unit": "inverse-roughness"
     },
     {

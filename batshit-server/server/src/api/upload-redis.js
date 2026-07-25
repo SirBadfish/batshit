@@ -18,6 +18,7 @@ const redisService = require('../services/redisService');
 const { persistFileBackedUpload } = require('../services/fileBackedUploadService');
 const uploadManager = require('../services/uploadManager');
 const { prepareFacialArtworkUpload } = require('../services/facialArtworkValidator');
+const { prepareLipArtworkUpload } = require('../services/lipArtworkValidator');
 const {
   hashFile,
   inspectAndExtractRecipeArchive
@@ -439,6 +440,7 @@ function getUploadLimitForPath(reqPath) {
       return GOON_ANIMATION_MAX_FILE_SIZE;
     case '/upload/goon-closet':
     case '/upload/goon-facial-artwork':
+    case '/upload/goon-lip-artwork':
       return GOON_IMAGE_UPLOAD_MAX_FILE_SIZE;
     case '/upload/goon-scene':
     case '/upload/goon-room-texture':
@@ -2258,6 +2260,50 @@ router.post('/upload/goon-facial-artwork', goonFacialArtworkUpload.single('file'
   } catch (error) {
     logger.error('Goon facial artwork upload error:', error);
     sendUploadError(res, 'Facial artwork upload failed', error);
+  }
+});
+
+router.post('/upload/goon-lip-artwork', goonFacialArtworkUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const originalName = req.file.originalname || 'lip_artwork.png';
+    if (path.extname(originalName).toLowerCase() !== '.png' || req.file.mimetype !== 'image/png') {
+      throw uploadValidationError('Lip Artwork must be a PNG image.');
+    }
+    const prepared = await prepareLipArtworkUpload({
+      buffer: req.file.buffer,
+      definitionSha256: req.body?.definitionSha256,
+      templateId: req.body?.templateId,
+      templateVersion: req.body?.templateVersion,
+      guideSha256: req.body?.guideSha256,
+      maskSha256: req.body?.maskSha256,
+      baseLipReferenceMaskSha256: req.body?.baseLipReferenceMaskSha256,
+      width: Number(req.body?.width),
+      height: Number(req.body?.height),
+      provenance: req.body?.provenance
+    });
+    const safeBase =
+      sanitizeFilenameSegment(path.basename(originalName, '.png'), 'lip_artwork').slice(0, 80) ||
+      'lip_artwork';
+    const filename = `${Date.now()}_${crypto.randomUUID()}_${safeBase}.png`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_facial_artwork',
+      originalName,
+      filename,
+      mimetype: 'image/png',
+      buffer: prepared.buffer,
+      size: prepared.buffer.length,
+      metadata: { lipArtwork: prepared.artwork }
+    });
+    return res.json({
+      success: true,
+      file,
+      artwork: prepared.artwork,
+      preparation: prepared.preparation
+    });
+  } catch (error) {
+    logger.error('Goon Lip Artwork upload error:', error);
+    sendUploadError(res, 'Lip Artwork upload failed', error);
   }
 });
 

@@ -1,15 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
+  ORAL_CAVITY_ANATOMY_FIT_SOLVER,
   SOCKET_EYE_ANATOMY_FIT_SOLVER,
   createAnatomyFitInput,
   createAnatomyFitResult,
   createAnatomyFitState,
 } from "./anatomyFitContracts";
 import {
+  ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT,
   SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT,
   createAnatomyFitManifestDefinition,
   parseAnatomyFitManifestDefinition,
   requireAnatomyFitStateDefinition,
+  type OralCavityAnatomyFitDomain,
   type SocketEyeAnatomyFitDomain,
 } from "./anatomyFitManifest";
 
@@ -29,10 +32,22 @@ function domain(side: "left" | "right"): SocketEyeAnatomyFitDomain {
   };
 }
 
-async function fit(side: "left" | "right") {
+function oralDomain(): OralCavityAnatomyFitDomain {
+  return {
+    contract: ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT,
+    bodyMeshId: "mesh:1:0",
+    bodyTopologySha256: sha("c"),
+    oralCavityFitDefinitionSha256: sha("7"),
+  };
+}
+
+async function fit(domain: "oral-cavity" | "socket-eye:left" | "socket-eye:right") {
+  const solverVersion = domain === "oral-cavity"
+    ? ORAL_CAVITY_ANATOMY_FIT_SOLVER
+    : SOCKET_EYE_ANATOMY_FIT_SOLVER;
   const input = await createAnatomyFitInput({
-    solverVersion: SOCKET_EYE_ANATOMY_FIT_SOLVER,
-    domain: `socket-eye:${side}`,
+    solverVersion,
+    domain,
     source: {
       modelSha256: sha("a"),
       appearanceDefinitionSha256: sha("b"),
@@ -48,7 +63,7 @@ async function fit(side: "left" | "right") {
     parameters: [],
   });
   const result = await createAnatomyFitResult({
-    solverVersion: SOCKET_EYE_ANATOMY_FIT_SOLVER,
+    solverVersion,
     domain: input.domain,
     inputSha256: input.inputSha256,
     status: "converged",
@@ -69,17 +84,28 @@ async function fit(side: "left" | "right") {
 }
 
 describe("Anatomy Fit v2 manifest definition", () => {
-  it("self-hashes the bilateral socket/seam bindings and round-trips exactly", async () => {
+  it("self-hashes the oral plus bilateral socket/seam bindings and round-trips exactly", async () => {
     const manifest = await createAnatomyFitManifestDefinition([
       domain("right"),
+      oralDomain(),
       domain("left"),
     ]);
     await expect(parseAnatomyFitManifestDefinition(manifest)).resolves.toEqual(manifest);
     expect(manifest.contract).toBe("anatomy-fit-manifest/v2");
-    expect(manifest.domains.map((entry) => entry.side)).toEqual(["left", "right"]);
+    expect(manifest.domains.map((entry) =>
+      entry.contract === ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT
+        ? "oral-cavity"
+        : `socket-eye:${entry.side}`,
+    )).toEqual(["oral-cavity", "socket-eye:left", "socket-eye:right"]);
 
     const tampered = structuredClone(manifest);
-    tampered.domains[0]!.compositeCapNodeId = "BS_Eye_L_Other";
+    const left = tampered.domains.find(
+      (entry) => entry.contract === SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT && entry.side === "left",
+    );
+    if (!left || left.contract !== SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT) {
+      throw new Error("left test domain is missing");
+    }
+    left.compositeCapNodeId = "BS_Eye_L_Other";
     await expect(parseAnatomyFitManifestDefinition(tampered)).rejects.toThrow(
       "definitionSha256 does not match canonical content",
     );
@@ -87,12 +113,14 @@ describe("Anatomy Fit v2 manifest definition", () => {
 
   it("binds reusable state to the exact definition and complete bilateral domain set", async () => {
     const manifest = await createAnatomyFitManifestDefinition([
+      oralDomain(),
       domain("left"),
       domain("right"),
     ]);
     const state = await createAnatomyFitState(manifest.definitionSha256, [
-      await fit("left"),
-      await fit("right"),
+      await fit("oral-cavity"),
+      await fit("socket-eye:left"),
+      await fit("socket-eye:right"),
     ]);
     expect(requireAnatomyFitStateDefinition(manifest, state)).toBe(state);
 
@@ -108,16 +136,27 @@ describe("Anatomy Fit v2 manifest definition", () => {
     );
   });
 
-  it("rejects unilateral, duplicate, and globe-era domain definitions", async () => {
-    await expect(createAnatomyFitManifestDefinition([domain("left")])).rejects.toThrow(
-      "exactly the left and right",
+  it("rejects incomplete, duplicate, and globe-era domain definitions", async () => {
+    await expect(createAnatomyFitManifestDefinition([
+      oralDomain(),
+      domain("left"),
+    ])).rejects.toThrow(
+      "oral cavity plus left and right",
     );
     await expect(
-      createAnatomyFitManifestDefinition([domain("left"), domain("left")]),
+      createAnatomyFitManifestDefinition([
+        oralDomain(),
+        domain("left"),
+        domain("left"),
+      ]),
     ).rejects.toThrow("duplicate specialization ids");
-    await expect(createAnatomyFitManifestDefinition([{
-      contract: "eye-socket-fit-definition/v1",
-      side: "left",
-    } as never])).rejects.toThrow("must contain exactly");
+    await expect(createAnatomyFitManifestDefinition([
+      oralDomain(),
+      domain("right"),
+      {
+        contract: "eye-socket-fit-definition/v1",
+        side: "left",
+      } as never,
+    ])).rejects.toThrow("must contain exactly");
   });
 });

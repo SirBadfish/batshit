@@ -55,7 +55,7 @@
   }
 
   type PortablePackManifest = {
-    version: 2 | 3 | 4 | 5
+    version: 6
     exportedAt: string
     name: string
     postures: GoonPostureDefinition[]

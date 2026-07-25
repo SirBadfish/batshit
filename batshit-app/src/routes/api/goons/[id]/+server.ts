@@ -16,6 +16,7 @@ import {
 import { validateGoonFacialArtworkState } from '$lib/server/services/facialArtwork.server'
 import { validateGoonEyeAppearanceState } from '$lib/server/services/eyeAppearance.server'
 import { validateGoonOralAppearanceState } from '$lib/server/services/oralAppearance.server'
+import { validateGoonLipArtworkState } from '$lib/server/services/lipArtwork.server'
 import { collectFacialArtworkUploads } from '$lib/goons/facialArtwork'
 import { parseSocketEyeContactSettings } from '$lib/goons/socketEyeContact'
 import {
@@ -118,6 +119,13 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
           updates.oralAppearance
         )
       }
+      if (Object.prototype.hasOwnProperty.call(updates, 'lipArtwork')) {
+        updated.lipArtwork = await validateGoonLipArtworkState(
+          client as any,
+          updated,
+          updates.lipArtwork
+        )
+      }
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
       const storagePatch = Object.fromEntries(
         Object.keys(updates).map((field) => [
@@ -150,7 +158,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       (error.message.startsWith('[facial-artwork/v4]') ||
         error.message.startsWith('[eye-appearance/v3]') ||
         error.message.startsWith('[socket-eye-contact-settings/v2]') ||
-        error.message.startsWith('[oral-appearance/v1]'))
+        error.message.startsWith('[oral-appearance/v1]') ||
+        error.message.startsWith('[lip-artwork/v2]'))
     ) {
       return json({ error: error.message }, { status: 400 })
     }
@@ -337,6 +346,13 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 	        if (!hasGoonUploadReference(references, 'goon_facial_artwork', artwork.filename)) {
 	          await deleteGoonUploadAsset('goon_facial_artwork', artwork.filename)
 	        }
+	      }
+	      const lipArtworkFilename = existing.lipArtwork?.artwork?.filename
+	      if (
+	        lipArtworkFilename &&
+	        !hasGoonUploadReference(references, 'goon_facial_artwork', lipArtworkFilename)
+	      ) {
+	        await deleteGoonUploadAsset('goon_facial_artwork', lipArtworkFilename)
 	      }
 
 	      const animationFiles = Array.isArray(existing.files?.animations)

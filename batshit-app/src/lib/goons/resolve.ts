@@ -10,6 +10,10 @@ import { sanitizeGoonAnimationName } from '$lib/goons/animationLoadPlan'
 import { DEFAULT_GOON_CUES, DEFAULT_GOON_EMOJI_MAP } from '$lib/goons/defaults'
 import { normalizeCustomPostureMap } from '$lib/goons/postures'
 import { normalizeGoonGlobalEyeContactSettingsMap } from '$lib/goons/customAvatar'
+import {
+  hasCueFacePayload,
+  normalizeCueFaceSource
+} from '$lib/goons/cueFaceProfiles'
 
 export type ResolvedGoonCues = {
   cueMap: GoonCueMap
@@ -32,15 +36,35 @@ const LEGACY_MOTION_ONLY_EMOTE_NAMES = new Set([
 ])
 
 function hasFacialPayload(cue: GoonCueDefinition): boolean {
-  if ((cue.expressionTargets?.length ?? 0) > 0) return true
-  if ((cue.faceControls?.length ?? 0) > 0) return true
-  if ((cue.rawMorphTargets?.length ?? 0) > 0) return true
-  return (cue.steps ?? []).some(
-    (step) =>
-      (step.expressionTargets?.length ?? 0) > 0 ||
-      (step.faceControls?.length ?? 0) > 0 ||
-      (step.rawMorphTargets?.length ?? 0) > 0
-  )
+  if (hasCueFacePayload(cue)) return true
+  return (cue.steps ?? []).some((step) => hasCueFacePayload(step))
+}
+
+function normalizeCueFaceProfiles(cue: GoonCueDefinition): GoonCueDefinition {
+  const topLevel = normalizeCueFaceSource(cue, {
+    initializeNeutralArkit52: cue.kind === 'emote'
+  })
+  const normalized: GoonCueDefinition = {
+    ...cue,
+    faceProfiles: topLevel.faceProfiles,
+    rawMorphTargets: topLevel.rawMorphTargets,
+    steps: cue.steps?.map((step) => {
+      const face = normalizeCueFaceSource(step, {
+        initializeNeutralArkit52: cue.kind === 'emote'
+      })
+      const normalizedStep = {
+        ...step,
+        faceProfiles: face.faceProfiles,
+        rawMorphTargets: face.rawMorphTargets
+      }
+      delete normalizedStep.expressionTargets
+      delete normalizedStep.faceControls
+      return normalizedStep
+    })
+  }
+  delete normalized.expressionTargets
+  delete normalized.faceControls
+  return normalized
 }
 
 /**
@@ -56,7 +80,7 @@ export function normalizeGoonCueMap(cueMap: GoonCueMap): GoonCueMap {
     if (!cue || kind === 'move') continue
 
     if (cue.kind !== 'emote') {
-      next[name] = cue
+      next[name] = normalizeCueFaceProfiles(cue)
       continue
     }
 
@@ -71,7 +95,7 @@ export function normalizeGoonCueMap(cueMap: GoonCueMap): GoonCueMap {
     }
 
     const normalized: GoonCueDefinition = {
-      ...cue,
+      ...normalizeCueFaceProfiles(cue),
       name: normalizedName || name,
       playback: 'oneshot'
     }

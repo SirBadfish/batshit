@@ -32,10 +32,17 @@ import {
   type AnatomyFitResult
 } from './anatomyFitContracts'
 import {
+  ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT,
+  anatomyFitManifestDomainId,
   parseAnatomyFitManifestDefinition,
   requireAnatomyFitStateDefinition
 } from './anatomyFitManifest'
 import { createSocketEyeAnatomyProof } from './socketEyeSurfaceFit'
+import { solveOralCavityFit } from './oralCavityFit'
+import {
+  composeOralCavityLandmarkPositions,
+  parseOralCavityFitPackage
+} from './oralCavityFitPackage'
 import { buildAppearanceRecipeSemanticMaterialProof } from './appearanceRecipeSemanticProof'
 import {
   createGoonLiveBuildReceipt,
@@ -277,6 +284,7 @@ async function resolveBakedAnatomyFitResults(args: {
   manifest: JsonRecord
   appearanceManifest: AppearanceManifest
   baseline: AppearanceRecipePhysicalEvaluation
+  resolved: ReturnType<typeof resolveStrictAppearanceRecipeSnapshot>['resolved']
 }): Promise<AnatomyFitResult[]> {
   const rawDefinition = args.manifest.anatomyFit
   const siblings = args.state.siblings.filter(
@@ -300,14 +308,19 @@ async function resolveBakedAnatomyFitResults(args: {
   ) {
     fail('Anatomy Fit Recipe sibling identity is ambiguous')
   }
-  if (args.manifest.socketEyeSurface === undefined || args.manifest.eyeApertureSeam === undefined) {
-    fail('Anatomy Fit v2 requires socketEyeSurface and eyeApertureSeam definitions')
+  if (
+    args.manifest.socketEyeSurface === undefined ||
+    args.manifest.eyeApertureSeam === undefined ||
+    args.manifest.oralCavityFit === undefined
+  ) {
+    fail('Anatomy Fit v2 requires socket-eye, aperture-seam, and Oral Cavity Fit definitions')
   }
-  const [definition, fitState, socketEyeSurface, eyeApertureSeam] = await Promise.all([
+  const [definition, fitState, socketEyeSurface, eyeApertureSeam, oralCavityFit] = await Promise.all([
     parseAnatomyFitManifestDefinition(rawDefinition),
     parseAnatomyFitState(sibling.state),
     Promise.resolve(parseSocketEyeSurfaceDefinition(args.manifest.socketEyeSurface)),
-    Promise.resolve(parseEyeApertureSeamDefinition(args.manifest.eyeApertureSeam))
+    Promise.resolve(parseEyeApertureSeamDefinition(args.manifest.eyeApertureSeam)),
+    parseOralCavityFitPackage(args.manifest.oralCavityFit)
   ])
   validateSocketEyeApertureOwnership(socketEyeSurface, eyeApertureSeam)
   if (
@@ -318,7 +331,7 @@ async function resolveBakedAnatomyFitResults(args: {
   }
   requireAnatomyFitStateDefinition(definition, fitState)
   const domainById = new Map(
-    definition.domains.map((entry) => [`socket-eye:${entry.side}`, entry])
+    definition.domains.map((entry) => [anatomyFitManifestDomainId(entry), entry])
   )
   const meshById = new Map(args.baseline.meshes.map((entry) => [entry.id, entry]))
   const results: AnatomyFitResult[] = []
@@ -348,6 +361,45 @@ async function resolveBakedAnatomyFitResults(args: {
     }
     if (fit.input.source.positionsSha256 !== (await sha256Hex(uint8View(mesh.positions)))) {
       fail(`Anatomy Fit ${fit.result.domain} composed POSITION hash is stale`)
+    }
+    if (domain.contract === ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT) {
+      if (
+        domain.oralCavityFitDefinitionSha256 !== oralCavityFit.definitionSha256 ||
+        domain.bodyMeshId !== oralCavityFit.definition.bodyMeshId ||
+        domain.bodyTopologySha256 !== oralCavityFit.definition.bodyTopologySha256 ||
+        mesh.nodeId !== oralCavityFit.definition.bodyNodeId
+      ) {
+        fail('Anatomy Fit oral-cavity package/body binding is stale')
+      }
+      const landmarkRootPositions = composeOralCavityLandmarkPositions(
+        oralCavityFit.landmarkBasis,
+        args.resolved
+      )
+      const exact = await solveOralCavityFit({
+        input: fit.input,
+        source: {
+          modelSha256: args.input.source.model.sha256,
+          appearanceDefinitionSha256: args.appearanceManifest.definitionSha256,
+          topologySha256: args.input.source.identities.topologySha256
+        },
+        definition: oralCavityFit.definition,
+        bodyMeshId: domain.bodyMeshId,
+        bodyNodeId: mesh.nodeId,
+        bodyRootPositions: mesh.positions,
+        landmarkRootPositions,
+        appearanceValues: args.state.appearanceDials.values
+      })
+      if (exact.resultSha256 !== fit.result.resultSha256) {
+        fail('Anatomy Fit oral-cavity output is stale for the final Recipe geometry')
+      }
+      results.push(
+        await assertAnatomyFitFollowerCompatibility(
+          fit.input,
+          exact,
+          args.appearanceManifest
+        )
+      )
+      continue
     }
     const surfaceSide = socketEyeSurface.runtimeBindings[domain.side]
     const seamSide = eyeApertureSeam.runtimeBindings[domain.side]
@@ -849,6 +901,7 @@ function buildMorphPlan(
   collectStrings(rawManifest.face, runtimeNames)
   collectStrings(rawManifest.eyeAppearance, runtimeNames)
   collectStrings(rawManifest.oralAppearance, runtimeNames)
+  collectStrings(rawManifest.lipArtwork, runtimeNames)
   const rig = rawManifest.rig === undefined ? null : record(rawManifest.rig, 'avatar.json#rig')
   collectStrings(rig?.performance, runtimeNames)
   const socketEyeRuntimeMorphs = socketEyeRuntimeMorphsByNode(
@@ -2030,6 +2083,7 @@ function createLiveAvatarManifest(
   const output = cloneJson(sourceManifest)
   delete output.appearanceDials
   delete output.anatomyFit
+  delete output.oralCavityFit
   delete output.dials
   delete output.recipeSource
   delete output.recipeUpdates
@@ -2065,6 +2119,7 @@ function sourceIdentity(input: LiveGoonBakeInput): GoonLiveBuildSourceIdentity {
 function buildInventory(rewrite: StructuralRewrite, sourceManifest: JsonRecord): GoonLiveBuildInventory {
   const removedManifestEntries = ['manifest:/appearanceDials']
   if (sourceManifest.anatomyFit !== undefined) removedManifestEntries.push('manifest:/anatomyFit')
+  if (sourceManifest.oralCavityFit !== undefined) removedManifestEntries.push('manifest:/oralCavityFit')
   if (sourceManifest.recipeSource !== undefined) removedManifestEntries.push('manifest:/recipeSource')
   if (sourceManifest.recipeUpdates !== undefined) removedManifestEntries.push('manifest:/recipeUpdates')
   const sourceRig = sourceManifest.rig === undefined ? null : record(sourceManifest.rig, 'avatar.json#rig')
@@ -2121,7 +2176,7 @@ export async function verifyLiveGoonBakeArtifacts(
   }
   const manifest = parseJsonManifestBytes(input.manifestBytes)
   const liveManifest = await verifyGoonLiveAvatarManifestAgainstReceipt(manifest, receipt)
-  if (manifest.appearanceDials !== undefined || manifest.anatomyFit !== undefined || manifest.dials !== undefined || manifest.recipeSource !== undefined || manifest.recipeUpdates !== undefined) {
+  if (manifest.appearanceDials !== undefined || manifest.anatomyFit !== undefined || manifest.oralCavityFit !== undefined || manifest.dials !== undefined || manifest.recipeSource !== undefined || manifest.recipeUpdates !== undefined) {
     fail('Live manifest retains editable Recipe authoring definitions')
   }
   const rig = manifest.rig === undefined ? null : record(manifest.rig, 'avatar.json#rig')
@@ -2172,7 +2227,8 @@ export async function bakeLiveGoon(
     state,
     manifest: verifiedAssets.manifest as JsonRecord,
     appearanceManifest,
-    baseline
+    baseline,
+    resolved: strict.resolved
   })
   const evaluation = anatomyFitResults.length > 0
     ? evaluateAppearanceRecipePhysicalOutput(basis, strict.resolved, { anatomyFitResults })

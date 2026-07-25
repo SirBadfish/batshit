@@ -59,6 +59,15 @@ describe('universal face control model', () => {
     expect(representedTargets).toContain('BS_ARKit_jawOpen')
     expect(representedTargets).toContain('BS_OVR_PP')
     expect(representedTargets).not.toContain('BS_Duplicate_JawOpen')
+    expect(
+      model.sections
+        .find((section) => section.id === 'jaw')
+        ?.controls.find((control) => control.id === 'arkit:jawOpen')
+    ).toMatchObject({
+      storage: 'arkit-channel',
+      arkitChannel: 'jawOpen',
+      morphTargets: ['BS_ARKit_jawOpen']
+    })
   })
 
   it('keeps the normal semantic controls for a Standard VRoid face', () => {

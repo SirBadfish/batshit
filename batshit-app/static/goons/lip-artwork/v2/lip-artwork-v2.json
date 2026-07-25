@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "lip-artwork/v2",
+  "stateSchemaVersion": "lip-artwork-state/v2",
+  "status": "product-export-approved",
+  "productExportApproved": true,
+  "definitionSha256": "88f32b6bf1992547e72e838660ca1484e645bab7f2915d28fad45098c11d708c",
+  "ownership": "immutable-package-template-with-recipe-owned-upload-state",
+  "defaultLaw": "null state inherits the package-authored lip artwork; custom state replaces only artwork RGB/alpha, tint, and opacity",
+  "runtimeBinding": {
+    "node": "bs_f1_lip_artwork_overlay_v1",
+    "material": "bs_f1_lip_artwork_overlay_v1_mat"
+  },
+  "template": {
+    "id": "batshit-base-f-lips-v5",
+    "version": "5.0.0",
+    "dimensions": [
+      2048,
+      2048
+    ],
+    "guide": {
+      "path": "goons/lip-artwork/v2/batshit-base-f-v5/guides/lip-artwork.png",
+      "sha256": "b78fa951f1b214dd224de43e449c76e5e68f8ab1c200f7cd141d23d08b7914a1"
+    },
+    "safePaintMask": {
+      "path": "goons/lip-artwork/v2/batshit-base-f-v5/masks/lip-artwork-safe.png",
+      "sha256": "a32836b879d69bbdcf291315eb9faa4edf8ce07e63793ac178af0a37ef8aaa7c",
+      "channels": "L8",
+      "paintThreshold": 1
+    },
+    "baseLipReferenceMask": {
+      "path": "goons/lip-artwork/v2/batshit-base-f-v5/references/lip-artwork-base-lips.png",
+      "sha256": "de105bf82900b043ffa9aa3fd844ec0e4e04820f354904ac0e0aa7c444e7b50f",
+      "channels": "L8"
+    },
+    "transparentBlank": {
+      "path": "goons/lip-artwork/v2/batshit-base-f-v5/blanks/lip-artwork.png",
+      "sha256": "de69b58c45f52fdf68f61391889183e73cd593d64520af27f0d4e9acbb3bc3ba"
+    }
+  }
+}

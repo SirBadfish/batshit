@@ -42,6 +42,7 @@ const RECIPE_MANAGED_GOON_FIELDS = [
   'facialArtwork',
   'eyeAppearance',
   'oralAppearance',
+  'lipArtwork',
   'recipeFitReceipts'
 ] as const
 
@@ -88,6 +89,7 @@ local managedFields = {
   'facialArtwork',
   'eyeAppearance',
   'oralAppearance',
+  'lipArtwork',
   'recipeFitReceipts'
 }
 for index, field in ipairs(managedFields) do
@@ -99,9 +101,9 @@ for index, field in ipairs(managedFields) do
     redis.call('JSON.SET', KEYS[1], path, value)
   end
 end
-redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[10])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[11])
 for index = 2, #KEYS do
-  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 9])
+  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 10])
 end
 return redis.call('JSON.GET', KEYS[1])
 `
@@ -148,6 +150,7 @@ local managedFields = {
   'facialArtwork',
   'eyeAppearance',
   'oralAppearance',
+  'lipArtwork',
   'recipeFitReceipts'
 }
 local currentManaged = {}
@@ -232,6 +235,7 @@ local managedFields = {
   'facialArtwork',
   'eyeAppearance',
   'oralAppearance',
+  'lipArtwork',
   'recipeFitReceipts'
 }
 for index, field in ipairs(managedFields) do
@@ -243,10 +247,10 @@ for index, field in ipairs(managedFields) do
     redis.call('JSON.SET', KEYS[1], path, value)
   end
 end
-redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[13])
-redis.call('JSON.SET', KEYS[2], '$', ARGV[14])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[14])
+redis.call('JSON.SET', KEYS[2], '$', ARGV[15])
 for index = 3, #KEYS do
-  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 12])
+  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 13])
 end
 return redis.call('JSON.GET', KEYS[1])
 `
@@ -551,6 +555,7 @@ export async function compareAndSwapRecipeState(input: {
     'facialArtwork',
     'eyeAppearance',
     'oralAppearance',
+    'lipArtwork',
     'recipeFitReceipts'
   ] as const
   const args = [
@@ -692,6 +697,7 @@ export async function compareAndSwapRecipeJobState(input: {
     'facialArtwork',
     'eyeAppearance',
     'oralAppearance',
+    'lipArtwork',
     'recipeFitReceipts'
   ] as const
   const args = [

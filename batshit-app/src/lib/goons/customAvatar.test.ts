@@ -674,7 +674,8 @@ describe('customAvatar helpers', () => {
         appearanceDialValues: customGoon.appearanceDials,
         eyeAppearanceState: null,
         facialArtworkState: null,
-        oralAppearanceState: null
+        oralAppearanceState: null,
+        lipArtworkState: null
       }
     )
     expect(engine.loadGoon).not.toHaveBeenCalled()
@@ -732,7 +733,8 @@ describe('customAvatar helpers', () => {
       {
         eyeAppearanceState: null,
         facialArtworkState: null,
-        oralAppearanceState: null
+        oralAppearanceState: null,
+        lipArtworkState: null
       }
     )
     expect(engine.setSocketEyeContactSettings).toHaveBeenCalledWith(null)

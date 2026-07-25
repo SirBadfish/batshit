@@ -11,6 +11,7 @@
     buildRecipeSiblingInputs,
     buildRecipeStateSnapshot,
     parseRecipeMigrationPlan,
+    parseAnatomyFitState,
     projectGoonRecipeSource,
     getAnatomyFitRecipeSibling,
     replaceAnatomyFitRecipeSibling,
@@ -40,6 +41,7 @@
   import type { FacialArtworkStateV4 } from '$lib/goons/facialArtwork'
   import type { EyeAppearanceStateV3 } from '$lib/goons/eyeAppearance'
   import type { OralAppearanceStateV1 } from '$lib/goons/oralAppearance'
+  import type { LipArtworkStateV2 } from '$lib/goons/lipArtwork'
   import {
     cleanupCustomGoonPackageUpload,
     loadGoons,
@@ -52,6 +54,7 @@
     RecipeFileTechnicalDetails,
     RecipeLifecycleBusyAction,
     RecipePreviewSide,
+    RecipeFittedPreviewState,
     RecipeWorkflowActions,
     RecipeWorkflowViewModel
   } from './types'
@@ -59,6 +62,7 @@
   type RecipePreviewTarget = {
     goon: GoonRecord
     state: RecipeStateSnapshot
+    preview: RecipeFittedPreviewState
     side: RecipePreviewSide
   }
 
@@ -78,9 +82,13 @@
     facialArtwork: FacialArtworkStateV4 | null
     eyeAppearance: EyeAppearanceStateV3 | null
     oralAppearance: OralAppearanceStateV1 | null
+    lipArtwork: LipArtworkStateV2 | null
     onSaveEditorDraft: () => Promise<boolean>
     onDiscardEditorDraft: () => void | Promise<void>
     onRecipeGoonChanged?: (goon: GoonRecord) => void | Promise<void>
+    onDraftPreviewStateChange?: (
+      preview: RecipeFittedPreviewState | null
+    ) => void | Promise<void>
     onPreviewTargetChange?: (target: RecipePreviewTarget | null) => void | Promise<void>
     onPreviewLiveCandidate: (staged: RecipeStageResponse) => Promise<void>
     fileTechnicalDetails?: RecipeFileTechnicalDetails | null
@@ -94,9 +102,11 @@
     facialArtwork,
     eyeAppearance,
     oralAppearance,
+    lipArtwork,
     onSaveEditorDraft,
     onDiscardEditorDraft,
     onRecipeGoonChanged,
+    onDraftPreviewStateChange,
     onPreviewTargetChange,
     onPreviewLiveCandidate,
     fileTechnicalDetails = null,
@@ -151,6 +161,7 @@
     facialArtwork,
     eyeAppearance,
     oralAppearance,
+    lipArtwork,
     sourceModel: owner?.authoringRevision?.source?.model?.ref ?? goon.customAvatar?.model?.url ?? null,
     sourceManifest: owner?.authoringRevision?.source?.manifest?.ref ?? goon.customAvatar?.manifest?.url ?? null,
     anatomyFitReady: goon.customAvatar?.manifestSummary?.anatomyFitReady ?? false
@@ -169,6 +180,7 @@
 
   onDestroy(() => {
     previewFitAbortController?.abort()
+    void onDraftPreviewStateChange?.(null)
     onWorkflowBusyChange?.(false)
   })
 
@@ -180,6 +192,20 @@
     return JSON.parse(JSON.stringify(value)) as T
   }
 
+  async function fittedPreviewState(
+    state: RecipeStateSnapshot
+  ): Promise<RecipeFittedPreviewState> {
+    const sibling = await getAnatomyFitRecipeSibling(state)
+    const fitState = sibling ? await parseAnatomyFitState(sibling.state) : null
+    return {
+      stateSha256: state.stateSha256,
+      appearanceDials: cloneJson(state.appearanceDials),
+      anatomyFitResults: cloneJson(
+        fitState?.fits.map((entry) => entry.result) ?? []
+      )
+    }
+  }
+
   function buildPreviewGoon(source: RecipeSource, state: RecipeStateSnapshot): GoonRecord {
     return projectGoonRecipeSource(goon, { source, state })
   }
@@ -189,7 +215,8 @@
       ...goon,
       facialArtwork: facialArtwork ? cloneJson(facialArtwork) : null,
       eyeAppearance: eyeAppearance ? cloneJson(eyeAppearance) : null,
-      oralAppearance: oralAppearance ? cloneJson(oralAppearance) : null
+      oralAppearance: oralAppearance ? cloneJson(oralAppearance) : null,
+      lipArtwork: lipArtwork ? cloneJson(lipArtwork) : null
     }
   }
 
@@ -258,21 +285,49 @@
     draftInputSignature
     const token = ++draftToken
     const abortController = new AbortController()
-    void buildCurrentDraftState(
-      abortController.signal,
-      Boolean(autoPrepare && !owner && goon.customAvatar?.manifestSummary?.anatomyFitReady)
+    const appearanceChanged =
+      !owner ||
+      canonicalRecipeString(appearanceDials) !==
+        canonicalRecipeString(owner.authoringRevision.state.appearanceDials)
+    const recomputeAnatomyFit = Boolean(
+      appearanceChanged &&
+      (
+        goon.customAvatar?.manifestSummary?.anatomyFitReady ||
+        owner?.authoringRevision.state.siblings.some(
+          (entry) => entry.id === 'anatomy-fit' || entry.contract === 'anatomy-fit-state/v2'
+        )
+      )
     )
-      .then((state) => {
-        if (token !== draftToken) return
-        draftState = state
-        draftStateError = null
-      })
-      .catch((error) => {
-        if (token !== draftToken || abortController.signal.aborted) return
-        draftState = null
-        draftStateError = errorMessage(error)
-      })
-    return () => abortController.abort()
+    const run = () => {
+      void buildCurrentDraftState(
+        abortController.signal,
+        recomputeAnatomyFit
+      )
+        .then(async (state) => ({
+          state,
+          preview: await fittedPreviewState(state)
+        }))
+        .then(({ state, preview }) => {
+          if (token !== draftToken) return
+          draftState = state
+          draftStateError = null
+          void onDraftPreviewStateChange?.(preview)
+        })
+        .catch((error) => {
+          if (token !== draftToken || abortController.signal.aborted) return
+          draftState = null
+          draftStateError = errorMessage(error)
+        })
+    }
+    // Slider input can emit many intermediate values. Keep the last valid
+    // fitted preview visible while one exact replacement is computed off the
+    // UI thread after the pointer settles.
+    const timer = recomputeAnatomyFit ? setTimeout(run, 90) : null
+    if (timer === null) run()
+    return () => {
+      if (timer !== null) clearTimeout(timer)
+      abortController.abort()
+    }
   })
 
   async function emitAnalysisPreview() {
@@ -288,6 +343,7 @@
     await onPreviewTargetChange?.({
       goon: buildPreviewGoon(source, state),
       state,
+      preview: await fittedPreviewState(state),
       side: previewSide
     })
   }
@@ -924,6 +980,7 @@
       await onPreviewTargetChange?.({
         goon: buildPreviewGoon(preview.previous.revision.source, preview.previous.revision.state),
         state: preview.previous.revision.state,
+        preview: await fittedPreviewState(preview.previous.revision.state),
         side: 'updated'
       })
       rollbackPreview = preview

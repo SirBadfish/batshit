@@ -26,7 +26,7 @@ describe('oral-appearance/v1', () => {
   it('parses the canonical five-control definition and exact runtime families', () => {
     const definition = parseOralAppearanceDefinition(loadDefinition())
     expect(definition.definitionSha256).toBe(
-      'dffdbe6d9db2840260b3822409f29e927ad82485916b8f288d22e610fe507177'
+      'a38ea318356fb471ecc859a9b8575643ceacd91a7a7032498c8bacd15c5b28b7'
     )
     expect(definition.controls.map((control) => control.id)).toEqual([
       'teeth_color',
@@ -48,7 +48,7 @@ describe('oral-appearance/v1', () => {
     expect(state).toEqual({
       schemaVersion: 'oral-appearance-state/v1',
       definitionSha256: definition.definitionSha256,
-      teeth: { color: [1, 1, 1], brightness: 1, shine: 0.3 },
+      teeth: { color: [1, 1, 1], brightness: 1, shine: 0.77 },
       gums: { color: [1, 1, 1] },
       tongue: { color: [1, 1, 1] }
     })

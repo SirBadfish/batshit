@@ -14,6 +14,10 @@ import {
 import { AppearanceDialsEngineRuntime } from "./appearanceDials.engine";
 import type { GoonCustomAvatarManifest } from "./customAvatar";
 import type { AppearanceRecipePhysicalBasis } from "./recipe/appearanceRecipePhysicalEvaluator";
+import {
+  ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+  type AnatomyFitResult,
+} from "./recipe/anatomyFitContracts";
 import { parseFirstPartySocketEyePackage } from "./socketEyePackage";
 
 vi.mock("./socketEyePackage", async (importOriginal) => {
@@ -463,6 +467,65 @@ function physicalBasis(
 }
 
 describe("AppearanceDialsEngineRuntime", () => {
+  it("applies one Appearance state and its matching Anatomy Fit atomically", () => {
+    const scene = buildScene();
+    const runtime = new AppearanceDialsEngineRuntime(
+      scene.root,
+      buildManifest(),
+      { faceMeshes: [scene.face] },
+    );
+    const fit: AnatomyFitResult = {
+      contract: "anatomy-fit-result/v2",
+      solverVersion: ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+      domain: "oral-cavity",
+      inputSha256: HASH_A,
+      status: "converged",
+      convergence: {
+        converged: true,
+        iterations: 0,
+        objective: 0,
+        tolerance: 0,
+        reason: "closed-form-fit",
+      },
+      resolvedParameters: [],
+      nodeTransforms: [
+        {
+          nodeId: "eyes",
+          rootDeltaMatrix: [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            2, 0, 0, 1,
+          ],
+        },
+      ],
+      followerMorphCoefficients: [
+        {
+          followerId: "head-assets",
+          channelId: "sclera-fit",
+          nodeId: "composite_cap_left",
+          morph: "follow_head_forward",
+          weight: 0.25,
+          lower: -1,
+          upper: 1,
+        },
+      ],
+      metrics: [],
+      diagnostics: [],
+      resultSha256: HASH_B,
+    };
+
+    runtime.setFittedValues(values(runtime.manifest, {}), [fit]);
+    expect(scene.eyes.position.toArray()).toEqual([3, 0, 0]);
+    expect(scene.sclera.geometry.getAttribute("position").getX(0)).toBeCloseTo(
+      0.25,
+    );
+
+    runtime.setValues(values(runtime.manifest, {}));
+    expect(scene.eyes.position.toArray()).toEqual([1, 0, 0]);
+    expect(scene.sclera.geometry.getAttribute("position").getX(0)).toBe(0);
+  });
+
   it("binds the scene inventory, applies every v2 output, and resets to captured rest", () => {
     const scene = buildScene();
     const runtime = new AppearanceDialsEngineRuntime(
@@ -858,6 +921,59 @@ describe("AppearanceDialsEngineRuntime", () => {
     expect(retainedIndex).toBeTypeOf("number");
     expect(scene.face.morphTargetInfluences?.[retainedIndex!]).toBe(0.8);
     expect(scene.face.geometry.getAttribute("position").getX(0)).toBe(0);
+  });
+
+  it("keeps retained bindings on their declared meshes when follower meshes share a morph name", () => {
+    const scene = buildScene();
+    const overlay = morphMesh("LipArtworkOverlay", ["seated_corrective"]);
+    scene.root.add(overlay);
+    scene.root.updateMatrixWorld(true);
+
+    const manifest = buildManifest() as Record<string, any>;
+    manifest.appearanceDials.nodes.lip_artwork_overlay = {
+      node: "LipArtworkOverlay",
+      kind: "mesh",
+      role: "generic-follower",
+      side: "none",
+      required: true,
+      scalePolicy: "any",
+      exactNodeMatches: 1,
+    };
+    manifest.appearanceDials.targets.seated_corrective.usages = [
+      "identity",
+      "pose-corrective",
+    ];
+    manifest.appearanceDials.targets.seated_corrective.runtimeRetention =
+      "retain-in-live-goon";
+    manifest.appearanceDials.targets.seated_corrective.bindings.push({
+      node: "lip_artwork_overlay",
+      morph: "seated_corrective",
+    });
+    manifest.rig = {
+      correctives: { entries: [{ target: "seated_corrective" }] },
+    };
+
+    const runtime = new AppearanceDialsEngineRuntime(
+      scene.root,
+      manifest as GoonCustomAvatarManifest,
+      { faceMeshes: [scene.face] },
+    );
+    const retained = physicalBasis(runtime).retainedTargetPositionBindings;
+    expect(retained).toHaveLength(2);
+    expect(retained).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          node: "face",
+          morph: "seated_corrective",
+          meshId: scene.face.uuid,
+        }),
+        expect.objectContaining({
+          node: "lip_artwork_overlay",
+          morph: "seated_corrective",
+          meshId: overlay.uuid,
+        }),
+      ]),
+    );
   });
 
   it("fails loudly when strict performance role nodes are missing", () => {

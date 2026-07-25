@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { AppearanceDialsManifest } from "../appearanceDials.contracts";
 import {
+  ORAL_CAVITY_ANATOMY_FIT_SOLVER,
   SOCKET_EYE_ANATOMY_FIT_SOLVER,
   anatomyFitRecipeSibling,
   assertAnatomyFitFollowerCompatibility,
   createAnatomyFitInput,
   createAnatomyFitResult,
   createAnatomyFitState,
+  normalizeAnatomyFitPhysicalOutput,
   parseAnatomyFitInput,
   parseAnatomyFitResult,
   parseAnatomyFitState,
@@ -104,6 +106,55 @@ describe("Anatomy Fit v2 content-addressed contracts", () => {
     const browserResult = await result(browser.inputSha256, 9720.000000000004);
     const redisResult = await result(browser.inputSha256, 9720.000000000002);
     expect(redisResult).toEqual(browserResult);
+
+    const physicalBrowser = normalizeAnatomyFitPhysicalOutput({
+      nodeTransforms: [{
+        nodeId: "lower-gums",
+        rootDeltaMatrix: [
+          1, 0, 0, 0,
+          0, 1, 0, 0,
+          0, 0, 1, 0,
+          0.01234567890123456, 0, 0, 1,
+        ],
+      }],
+      followerMorphCoefficients: [{
+        followerId: "anatomy-fit.oral-cavity.lower-gums",
+        channelId: "oral-cavity:lower-gums:scale-x",
+        nodeId: "lower-gums",
+        morph: "bs_anatomy_oral__lower_gums__scale_x",
+        weight: 0.1234567890123456,
+        lower: -0.3,
+        upper: 0.35,
+      }],
+      metrics: [{
+        id: "maximum-translation",
+        value: 0.01234567890123456,
+        unit: "meters",
+        minimum: 0,
+        maximum: 0.05,
+        passed: true,
+      }],
+    });
+    const physicalNode = normalizeAnatomyFitPhysicalOutput({
+      nodeTransforms: [{
+        ...physicalBrowser.nodeTransforms[0]!,
+        rootDeltaMatrix: [
+          1, 0, 0, 0,
+          0, 1, 0, 0,
+          0, 0, 1, 0,
+          0.01234567890123458, 0, 0, 1,
+        ],
+      }],
+      followerMorphCoefficients: [{
+        ...physicalBrowser.followerMorphCoefficients[0]!,
+        weight: 0.1234567890123458,
+      }],
+      metrics: [{
+        ...physicalBrowser.metrics[0]!,
+        value: 0.01234567890123458,
+      }],
+    });
+    expect(physicalNode).toEqual(physicalBrowser);
   });
 
   it("rejects globe-era solvers and localized output instead of adapting it", async () => {
@@ -154,6 +205,90 @@ describe("Anatomy Fit v2 content-addressed contracts", () => {
     await expect(
       assertAnatomyFitFollowerCompatibility(legacyInput, legacyResult, appearance),
     ).rejects.toThrow("retained globe-era localized output");
+  });
+
+  it("accepts exact oral closed-form outputs bound to declared Recipe-only followers", async () => {
+    const oralAppearance = {
+      contract: "appearance-dials/v2",
+      definitionSha256: DEFINITION_SHA,
+      nodes: {
+        "lower-gums": { node: "LowerGums" },
+      },
+      followers: {
+        "anatomy-fit.oral-cavity.lower-gums": {
+          nodeIds: ["lower-gums"],
+          drivers: [{
+            driver: { kind: "dial", id: "dental_arch_width" },
+            channels: [{
+              id: "oral-cavity:lower-gums:scale-x",
+              kind: "morph-weight",
+              node: "lower-gums",
+              morph: "bs_anatomy_oral__lower_gums__scale_x",
+              weightRange: [-0.3, 0.35],
+            }],
+          }],
+        },
+      },
+    } as unknown as AppearanceDialsManifest;
+    const fitInput = await createAnatomyFitInput({
+      solverVersion: ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+      domain: "oral-cavity",
+      source: {
+        modelSha256: sha("a"),
+        appearanceDefinitionSha256: DEFINITION_SHA,
+        topologySha256: sha("c"),
+        positionsSha256: sha("d"),
+        positionsScalarCount: 24,
+        physicalEvaluationSha256: sha("e"),
+        physicalEvaluationScalarCount: 24,
+        landmarkSetSha256: sha("f"),
+        landmarkSampleCount: 8,
+      },
+      relevantInputs: [{ id: "face_width", value: 0.2 }],
+      parameters: [],
+    });
+    const fitResult = await createAnatomyFitResult({
+      solverVersion: ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+      domain: "oral-cavity",
+      inputSha256: fitInput.inputSha256,
+      status: "converged",
+      convergence: {
+        converged: true,
+        iterations: 0,
+        objective: 0,
+        tolerance: 0,
+        reason: "closed-form-fit",
+      },
+      resolvedParameters: [],
+      nodeTransforms: [{
+        nodeId: "lower-gums",
+        rootDeltaMatrix: [
+          1, 0, 0, 0,
+          0, 1, 0, 0,
+          0, 0, 1, 0,
+          0.001, 0, 0, 1,
+        ],
+      }],
+      followerMorphCoefficients: [{
+        followerId: "anatomy-fit.oral-cavity.lower-gums",
+        channelId: "oral-cavity:lower-gums:scale-x",
+        nodeId: "lower-gums",
+        morph: "bs_anatomy_oral__lower_gums__scale_x",
+        weight: 0.1,
+        lower: -0.3,
+        upper: 0.35,
+      }],
+      metrics: [],
+      diagnostics: [],
+    });
+
+    await expect(
+      assertAnatomyFitFollowerCompatibility(
+        fitInput,
+        fitResult,
+        oralAppearance,
+      ),
+    ).resolves.toEqual(fitResult);
   });
 
   it("invalidates changed final body or cap/liner proofs", async () => {

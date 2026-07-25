@@ -186,6 +186,7 @@ import {
   resolveCustomRigCompatibilityCoverage,
   type CustomMouthPresetSupport
 } from '$lib/goons/customCompatibility'
+import { selectCueFacePayload } from '$lib/goons/cueFaceProfiles'
 import {
   bindCustomPerformanceRig,
   composeCustomPerformanceEyeContact,
@@ -214,6 +215,7 @@ import type {
   AppearanceDialValueState,
   AppearanceDialsManifest
 } from '$lib/goons/appearanceDials'
+import type { AnatomyFitResult } from '$lib/goons/recipe/anatomyFitContracts'
 import { FacialArtworkEngineRuntime } from '$lib/goons/facialArtwork.engine'
 import {
   type FacialArtworkDefinitionV4,
@@ -230,6 +232,12 @@ import {
   type OralAppearanceDefinitionV1,
   type OralAppearanceStateV1
 } from '$lib/goons/oralAppearance'
+import { LipArtworkEngineRuntime } from '$lib/goons/lipArtwork.engine'
+import {
+  parseLipArtworkDefinition,
+  type LipArtworkDefinitionV2,
+  type LipArtworkStateV2
+} from '$lib/goons/lipArtwork'
 import { classifyFacialArtworkPackageCapability } from '$lib/goons/facialArtwork.package'
 import { parseFirstPartySocketEyePackage } from '$lib/goons/socketEyePackage'
 import {
@@ -1075,6 +1083,9 @@ export class GoonEngine implements GoonStageHost {
   private oralAppearanceRuntime: OralAppearanceEngineRuntime | null = null
   private oralAppearanceDefinition: OralAppearanceDefinitionV1 | null = null
   private oralAppearanceState: OralAppearanceStateV1 | null = null
+  private lipArtworkRuntime: LipArtworkEngineRuntime | null = null
+  private lipArtworkDefinition: LipArtworkDefinitionV2 | null = null
+  private lipArtworkState: LipArtworkStateV2 | null = null
   // ------------------------------------ joint-driven correctives (SA-090)
   private jointCorrectivesSpec: JointCorrectivesSpec | null = null
   private liveJointCorrectivesSpec: LiveJointCorrectivesSpec | null = null
@@ -1682,7 +1693,7 @@ export class GoonEngine implements GoonStageHost {
       if (this.paused) {
         this.renderer.setAnimationLoop(null)
       } else {
-        this.renderer.setAnimationLoop(() => this.update())
+        this.renderer.setAnimationLoop(this.runAnimationFrame)
       }
     })()
 
@@ -1785,6 +1796,7 @@ export class GoonEngine implements GoonStageHost {
       facialArtworkState?: FacialArtworkStateV4 | null
       eyeAppearanceState?: EyeAppearanceStateV3 | null
       oralAppearanceState?: OralAppearanceStateV1 | null
+      lipArtworkState?: LipArtworkStateV2 | null
     } = {}
   ) {
     const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
@@ -1870,6 +1882,7 @@ export class GoonEngine implements GoonStageHost {
         }
       }
       this.setupOralAppearance(manifest, options.oralAppearanceState ?? null)
+      await this.setupLipArtwork(manifest, options.lipArtworkState ?? null)
       // Performance-rig/v2 depends on the socket-eye surface. Bind it only
       // after every appearance runtime has completed so a failed eye setup
       // cannot leave a half-active performance driver behind.
@@ -2308,6 +2321,10 @@ export class GoonEngine implements GoonStageHost {
     this.oralAppearanceRuntime = null
     this.oralAppearanceDefinition = null
     this.oralAppearanceState = null
+    this.lipArtworkRuntime?.dispose()
+    this.lipArtworkRuntime = null
+    this.lipArtworkDefinition = null
+    this.lipArtworkState = null
     this.resetMaterialOverrides()
     this.releaseAllMaterialRuntimeTextures()
     this.clearBodyConcealRuntime()
@@ -2776,6 +2793,19 @@ export class GoonEngine implements GoonStageHost {
     this.customPerformanceRigRuntime?.rebaseLookNodePositions()
   }
 
+  setFittedAppearanceDialValues(
+    values: AppearanceDialValueState | null,
+    anatomyFitResults: readonly AnatomyFitResult[]
+  ) {
+    const runtime = this.appearanceDialsRuntime
+    if (!runtime) return
+    this.customPerformanceRigRuntime?.removeOverlay()
+    this.appearanceDialsValues = values
+    runtime.setFittedValues(values, anatomyFitResults)
+    this.socketEyeSurfaceRuntime?.syncIdentitySurfaceFrames()
+    this.customPerformanceRigRuntime?.rebaseLookNodePositions()
+  }
+
   getFacialArtworkDefinition() {
     return this.facialArtworkDefinition
   }
@@ -2893,6 +2923,52 @@ export class GoonEngine implements GoonStageHost {
     this.oralAppearanceRuntime = runtime
     this.oralAppearanceDefinition = definition
     this.oralAppearanceState = initialState
+  }
+
+  getLipArtworkDefinition() {
+    return this.lipArtworkDefinition
+  }
+
+  async setLipArtworkState(value: LipArtworkStateV2 | null) {
+    const runtime = this.lipArtworkRuntime
+    if (!runtime) {
+      if (value) throw new Error('The loaded Goon package does not support Lip Artwork.')
+      return
+    }
+    const applied = await runtime.apply(value)
+    if (applied) this.lipArtworkState = value
+  }
+
+  private async setupLipArtwork(
+    manifest: GoonCustomAvatarManifest,
+    initialState: LipArtworkStateV2 | null
+  ) {
+    const rawDefinition = manifest.lipArtwork
+    if (rawDefinition === undefined || rawDefinition === null) {
+      if (initialState) {
+        throw new Error('Saved Lip Artwork state targets a package without lip-artwork/v2.')
+      }
+      return
+    }
+    if (
+      (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
+      (manifest.liveBuild === undefined || manifest.liveBuild === null)
+    ) {
+      throw new Error('lip-artwork/v2 requires a Recipe Source or verified Live Goon package.')
+    }
+    const definition = parseLipArtworkDefinition(rawDefinition)
+    const root = this.customAvatarRoot
+    if (!root) throw new Error('Custom avatar root is missing during Lip Artwork setup.')
+    const runtime = new LipArtworkEngineRuntime(root, definition)
+    try {
+      await runtime.apply(initialState)
+    } catch (error) {
+      runtime.dispose()
+      throw error
+    }
+    this.lipArtworkRuntime = runtime
+    this.lipArtworkDefinition = definition
+    this.lipArtworkState = initialState
   }
 
   private async setupFacialArtwork(
@@ -6056,7 +6132,7 @@ export class GoonEngine implements GoonStageHost {
       this.lastFpsTime = this.lastFrameTime
       this.lastPoseUpdateTime = this.lastFrameTime
       this.frameCounter = 0
-      this.renderer.setAnimationLoop(() => this.update())
+      this.renderer.setAnimationLoop(this.runAnimationFrame)
     }
   }
 
@@ -6310,14 +6386,26 @@ export class GoonEngine implements GoonStageHost {
   }
 
   setMood(name: string, definition?: GoonCueDefinition, options: PlacementOptions = {}) {
+    const face = definition
+      ? selectCueFacePayload(definition, {
+          arkit52Available: this.customArkitFaceDriverBindings !== null,
+          arkit52Bindings: this.customArkitFaceDriverBindings?.face
+        })
+      : null
     this.baseLoop = name
     this.baseLoopAnimationName = definition?.animationName ?? name
     this.baseLoopPosture = this.resolvePosture(name, definition)
     this.activeMood = definition ?? null
-    this.moodExpressionTargets = this.resolveExpressionTargets(name, definition)
+    this.moodExpressionTargets = this.resolveExpressionTargets(
+      name,
+      definition && face
+        ? { ...definition, expressionTargets: face.expressionTargets }
+        : definition,
+      face?.profile !== 'arkit52'
+    )
     this.moodExpressionIntensity = definition?.intensity ?? 1
-    this.moodFaceControls = definition?.faceControls ?? []
-    this.moodRawMorphTargets = definition?.rawMorphTargets ?? []
+    this.moodFaceControls = face?.faceControls ?? []
+    this.moodRawMorphTargets = face?.rawMorphTargets ?? []
     this.syncBaseLoopAnimation()
     if (this.baseLoopAnimationName && !this.animationMap.has(this.baseLoopAnimationName)) {
       this.requestDeferredAnimation(this.baseLoopAnimationName, 'mood', definition, name)
@@ -6338,15 +6426,23 @@ export class GoonEngine implements GoonStageHost {
       : {
           name,
           kind: 'emote',
+          faceProfiles: definition.faceProfiles,
           expressionTargets: definition.expressionTargets,
           faceControls: definition.faceControls,
           rawMorphTargets: definition.rawMorphTargets
         }
+    const face = selectCueFacePayload(cueLike, {
+      arkit52Available: this.customArkitFaceDriverBindings !== null,
+      arkit52Bindings: this.customArkitFaceDriverBindings?.face
+    })
 
-    this.authoringPreviewExpressionTargets = this.resolveExpressionTargets(name, cueLike)
+    this.authoringPreviewExpressionTargets = this.resolveExpressionTargets(name, {
+      ...cueLike,
+      expressionTargets: face.expressionTargets
+    }, face.profile !== 'arkit52')
     this.authoringPreviewIntensity = cueLike.intensity ?? 1
-    this.authoringPreviewFaceControls = cueLike.faceControls ?? []
-    this.authoringPreviewRawMorphTargets = cueLike.rawMorphTargets ?? []
+    this.authoringPreviewFaceControls = face.faceControls
+    this.authoringPreviewRawMorphTargets = face.rawMorphTargets
   }
 
   clearAuthoringFacePreview() {
@@ -8205,6 +8301,7 @@ export class GoonEngine implements GoonStageHost {
     }
 
     if (
+      definition?.faceProfiles ||
       definition?.expressionTargets ||
       definition?.faceControls ||
       definition?.rawMorphTargets ||
@@ -8405,6 +8502,14 @@ export class GoonEngine implements GoonStageHost {
     this.renderer.setSize(clientWidth * this.renderScale, clientHeight * this.renderScale, false)
     this.renderer.domElement.style.width = '100%'
     this.renderer.domElement.style.height = '100%'
+  }
+
+  private runAnimationFrame = () => {
+    try {
+      this.update()
+    } catch (error) {
+      this.handleRenderFailure(error)
+    }
   }
 
   private update() {
@@ -9016,13 +9121,14 @@ export class GoonEngine implements GoonStageHost {
       )
     }
 
+    const authored = { ...this.customPerformanceDirection }
     const contactAllowed =
       this.socketEyeContact.enabled &&
       this.eyeContactEnabled &&
+      !hasCustomPerformanceAuthoredEyeDirection(authored) &&
       !this.isStaticPoseOverrideActive() &&
       !this.lookActive &&
       !this.isEyeContactSuppressedByMotion()
-    const authored = { ...this.customPerformanceDirection }
     performance.apply(authored, this.customPerformanceTargetWeights)
     this.customAvatarRoot.updateMatrixWorld(true)
 
@@ -9523,9 +9629,21 @@ export class GoonEngine implements GoonStageHost {
     if (!this.hasExpressionBlendshapes && !this.hasFaceControls() && !this.hasRawMorphTargets()) return
     const kind = definition?.kind ?? 'emote'
     const intensity = definition?.kind === 'emote' ? 1 : definition?.intensity ?? 1
-    const targets = this.resolveExpressionTargets(name, definition)
-    const faceControls = definition?.faceControls ?? []
-    const rawMorphTargets = definition?.rawMorphTargets ?? []
+    const face = definition
+      ? selectCueFacePayload(definition, {
+          arkit52Available: this.customArkitFaceDriverBindings !== null,
+          arkit52Bindings: this.customArkitFaceDriverBindings?.face
+        })
+      : null
+    const targets = this.resolveExpressionTargets(
+      name,
+      definition && face
+        ? { ...definition, expressionTargets: face.expressionTargets }
+        : definition,
+      face?.profile !== 'arkit52'
+    )
+    const faceControls = face?.faceControls ?? []
+    const rawMorphTargets = face?.rawMorphTargets ?? []
     if (
       targets.length === 0 &&
       faceControls.length === 0 &&
@@ -9538,17 +9656,23 @@ export class GoonEngine implements GoonStageHost {
 
     // Check for multi-step emote
     if (definition?.steps && definition.steps.length > 0) {
-      const steps: ActiveExpressionStep[] = definition.steps.map((step) => ({
-        targets: this.resolveExpressionTargets(name, {
-          ...definition,
-          expressionTargets: step.expressionTargets
-        }),
-        faceControls: step.faceControls ?? [],
-        rawMorphTargets: step.rawMorphTargets ?? [],
-        attackMs: step.attackMs ?? 120,
-        holdMs: step.holdMs ?? 200,
-        releaseMs: step.releaseMs ?? 180
-      }))
+      const steps: ActiveExpressionStep[] = definition.steps.map((step) => {
+        const stepFace = selectCueFacePayload(step, {
+          arkit52Available: this.customArkitFaceDriverBindings !== null,
+          arkit52Bindings: this.customArkitFaceDriverBindings?.face
+        })
+        return {
+          targets: this.resolveExpressionTargets(name, {
+            ...definition,
+            expressionTargets: stepFace.expressionTargets
+          }, stepFace.profile !== 'arkit52'),
+          faceControls: stepFace.faceControls,
+          rawMorphTargets: stepFace.rawMorphTargets,
+          attackMs: step.attackMs ?? 120,
+          holdMs: step.holdMs ?? 200,
+          releaseMs: step.releaseMs ?? 180
+        }
+      })
 
       const totalDuration = steps.reduce(
         (sum, s) => sum + s.attackMs + s.holdMs + s.releaseMs,
@@ -9646,6 +9770,10 @@ export class GoonEngine implements GoonStageHost {
     }
 
     const hasFacePayload = Boolean(
+      definition.faceProfiles?.portable.expressionTargets?.length ||
+      definition.faceProfiles?.portable.faceControls?.length ||
+      definition.faceProfiles?.arkit52?.channels?.length ||
+      definition.faceProfiles?.arkit52?.headControls?.length ||
       definition.expressionTargets?.length ||
       definition.faceControls?.length ||
       definition.rawMorphTargets?.length
@@ -10487,7 +10615,11 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  private resolveExpressionTargets(name: string, definition?: GoonCueDefinition) {
+  private resolveExpressionTargets(
+    name: string,
+    definition?: GoonCueDefinition,
+    allowNameFallback = true
+  ) {
     const targets: Array<{ preset: ResolvedExpressionPreset; weight: number }> = []
     const manager = this.vrm?.expressionManager
     const hasLookAt = Boolean(this.vrm?.lookAt)
@@ -10537,7 +10669,7 @@ export class GoonEngine implements GoonStageHost {
       return targets
     }
 
-    const fallback = this.resolveExpressionPreset(name)
+    const fallback = allowNameFallback ? this.resolveExpressionPreset(name) : null
     if (fallback) {
       if (this.supportsExpressionPreset(fallback)) {
         targets.push({ preset: fallback, weight: 1 })

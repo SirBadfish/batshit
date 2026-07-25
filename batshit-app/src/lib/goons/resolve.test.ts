@@ -130,8 +130,14 @@ describe('resolveGoonCues', () => {
       name: 'animated_smile',
       kind: 'emote',
       playback: 'oneshot',
-      expressionTargets: [{ preset: 'happy', weight: 0.5 }]
+      faceProfiles: {
+        portable: {
+          expressionTargets: [{ preset: 'happy', weight: 0.5 }]
+        },
+        arkit52: {}
+      }
     })
+    expect(normalized.animated_smile.expressionTargets).toBeUndefined()
     expect(normalized.animated_smile.animationName).toBeUndefined()
     expect(normalized.animated_smile.posture).toBeUndefined()
     expect(normalized.fresh_emote).toBeDefined()

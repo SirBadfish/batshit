@@ -51,7 +51,11 @@ export type GoonRecipeOpaqueSiblingState = Record<string, RecipeJsonValue>;
 
 type RecipeSiblingProjection = Pick<
   GoonRecord,
-  "appearanceDials" | "facialArtwork" | "eyeAppearance" | "oralAppearance"
+  | "appearanceDials"
+  | "facialArtwork"
+  | "eyeAppearance"
+  | "oralAppearance"
+  | "lipArtwork"
 >;
 
 const SIBLING_PROJECTIONS = [
@@ -69,6 +73,11 @@ const SIBLING_PROJECTIONS = [
     field: "oralAppearance",
     contract: null,
     ids: ["oralAppearance", "oral-appearance"],
+  },
+  {
+    field: "lipArtwork",
+    contract: "lip-artwork-state/v2",
+    ids: ["lipArtwork", "lip-artwork"],
   },
 ] as const;
 
@@ -315,7 +324,12 @@ function applySiblingProjection(
 ) {
   const projection = projectSiblingState(state);
   goon.appearanceDials = projection.appearanceDials;
-  for (const field of ["facialArtwork", "eyeAppearance", "oralAppearance"] as const) {
+  for (const field of [
+    "facialArtwork",
+    "eyeAppearance",
+    "oralAppearance",
+    "lipArtwork",
+  ] as const) {
     const value = projection[field];
     if (value) goon[field] = value as never;
     else delete goon[field];

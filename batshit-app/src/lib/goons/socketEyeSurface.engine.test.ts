@@ -9,6 +9,7 @@ import {
 } from "./socketEyeSurface.engine";
 import { parseSocketEyeSurfaceDefinition } from "./socketEyeSurface";
 import { parseEyeApertureSeamDefinition } from "./eyeApertureSeam";
+import { resolveAuthoredSocketEyeCoordinates } from "./socketEyeGaze";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -333,6 +334,20 @@ describe("SocketEyeCompositeMaterialRuntime", () => {
     ).toBe(4);
     runtime.setGaze(0.2, -0.1);
     expect(runtime.getGaze().toArray()).toEqual([0.2, -0.1]);
+    const authored = resolveAuthoredSocketEyeCoordinates(definition, {
+      headYaw: 0,
+      headPitch: 0,
+      leftEyeYaw: -1,
+      leftEyePitch: 1,
+      rightEyeYaw: 1,
+      rightEyePitch: -1,
+    });
+    expect(() =>
+      runtime.setGaze(
+        authored.left.horizontal,
+        authored.left.vertical,
+      ),
+    ).not.toThrow();
     expect(() => runtime.setGaze(0.58, 0.45)).toThrow("safe domain");
     runtime.dispose();
   });

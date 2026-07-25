@@ -22,7 +22,9 @@ describe('SocketEyeContactEditor', () => {
       onChange: vi.fn()
     })
 
-    expect(screen.getByRole('switch', { name: 'Enable Eye Contact' })).toBeChecked()
+    const enabledSwitch = screen.getByRole('switch', { name: 'Enable Eye Contact' })
+    expect(enabledSwitch).toBeChecked()
+    expect(enabledSwitch.parentElement).toHaveClass('is-inline-status')
     expect(screen.getAllByRole('slider').map((slider) => slider.getAttribute('aria-label'))).toEqual([
       'Strength',
       'Gaze Convergence',
@@ -50,7 +52,7 @@ describe('SocketEyeContactEditor', () => {
     })
     expect(onChange).toHaveBeenLastCalledWith({
       ...DEFAULT_SOCKET_EYE_CONTACT_SETTINGS,
-      response: 0.64
+      response: 0.49
     })
 
     await fireEvent.keyDown(screen.getByRole('slider', { name: 'Gaze Convergence' }), {

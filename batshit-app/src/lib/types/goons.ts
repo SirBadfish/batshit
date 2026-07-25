@@ -1,6 +1,7 @@
 import type { AppearanceDialValueState } from "$lib/goons/appearanceDials";
 import type { FacialArtworkStateV4 } from "$lib/goons/facialArtwork";
 import type { EyeAppearanceStateV3 } from "$lib/goons/eyeAppearance";
+import type { LipArtworkStateV2 } from "$lib/goons/lipArtwork";
 import type { OralAppearanceStateV1 } from "$lib/goons/oralAppearance";
 import type { SocketEyeContactSettingsV2 } from "$lib/goons/socketEyeContact";
 import type {
@@ -93,10 +94,38 @@ export type GoonRawMorphTarget = {
   value: number;
 };
 
-export type GoonEmoteStep = {
+export type GoonCuePortableFaceProfile = {
   expressionTargets?: GoonExpressionTarget[];
   faceControls?: GoonFaceControl[];
+};
+
+export type GoonArkit52ChannelTarget = {
+  channel: import("$lib/goons/speechFaceProfiles").Arkit52Channel;
+  value: number;
+};
+
+export type GoonCueArkit52FaceProfile = {
+  channels?: GoonArkit52ChannelTarget[];
+  headControls?: GoonFaceControl[];
+};
+
+export type GoonCueFaceProfiles = {
+  portable: GoonCuePortableFaceProfile;
+  /**
+   * Presence is meaningful. An explicit empty object means an ARKit-capable
+   * Goon should stay neutral instead of falling back to the portable profile.
+   */
+  arkit52?: GoonCueArkit52FaceProfile;
+};
+
+export type GoonEmoteStep = {
+  faceProfiles?: GoonCueFaceProfiles;
+  /** Package-bound expert morphs. Portable packs intentionally omit these. */
   rawMorphTargets?: GoonRawMorphTarget[];
+  /** @deprecated Read-only migration input. Normalize into faceProfiles. */
+  expressionTargets?: GoonExpressionTarget[];
+  /** @deprecated Read-only migration input. Normalize into faceProfiles. */
+  faceControls?: GoonFaceControl[];
   attackMs?: number;
   holdMs?: number;
   releaseMs?: number;
@@ -123,9 +152,13 @@ export type GoonCueDefinition = {
   releaseMs?: number;
   easing?: GoonEnvelopeEasing;
   animationName?: string;
-  expressionTargets?: GoonExpressionTarget[];
-  faceControls?: GoonFaceControl[];
+  faceProfiles?: GoonCueFaceProfiles;
+  /** Package-bound expert morphs. Portable packs intentionally omit these. */
   rawMorphTargets?: GoonRawMorphTarget[];
+  /** @deprecated Read-only migration input. Normalize into faceProfiles. */
+  expressionTargets?: GoonExpressionTarget[];
+  /** @deprecated Read-only migration input. Normalize into faceProfiles. */
+  faceControls?: GoonFaceControl[];
   steps?: GoonEmoteStep[];
 };
 
@@ -628,6 +661,8 @@ export interface GoonRecord {
   eyeAppearance?: EyeAppearanceStateV3 | null;
   /** Package-owned oral material state, bound to avatar.json#oralAppearance. */
   oralAppearance?: OralAppearanceStateV1 | null;
+  /** Recipe-owned lip artwork state, bound to avatar.json#lipArtwork. Null inherits package art. */
+  lipArtwork?: LipArtworkStateV2 | null;
   /** Revision-bound hair/clothing/conceal/attachment fit evidence. */
   recipeFitReceipts?: GoonRecipeFitReceipt[];
   guidedAvatar?: GoonGuidedAvatarFiles;

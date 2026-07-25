@@ -295,7 +295,7 @@ describe('custom performance input resolution', () => {
     expect(shouldApplyCustomExpressionMorphPreset('happy', false)).toBe(true)
   })
 
-  it('combines semantic presets and original controls while retaining asymmetric raw eye input', () => {
+  it('lets authored raw eye axes override portable eye controls without double application', () => {
     const direction = resolveCustomPerformanceDirection({
       expressionTargets: [
         { preset: 'lookRightHead', weight: 0.4 },
@@ -314,10 +314,10 @@ describe('custom performance input resolution', () => {
     })
 
     expect(direction.headYaw).toBeCloseTo(0.6)
-    expect(direction.leftEyeYaw).toBeCloseTo(-0.6)
-    expect(direction.rightEyeYaw).toBeCloseTo(0.5)
+    expect(direction.leftEyeYaw).toBeCloseTo(-0.5)
+    expect(direction.rightEyeYaw).toBeCloseTo(0.6)
     expect(direction.leftEyePitch).toBeCloseTo(0.3)
-    expect(direction.rightEyePitch).toBeCloseTo(0.15)
+    expect(direction.rightEyePitch).toBeCloseTo(-0.15)
   })
 
   it('converts Eye Contact signs and composes ambient motion without collapsing asymmetric eyes', () => {

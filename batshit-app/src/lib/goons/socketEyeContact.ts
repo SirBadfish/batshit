@@ -16,10 +16,10 @@ export type SocketEyeContactSettingsV2 = {
 export const DEFAULT_SOCKET_EYE_CONTACT_SETTINGS = Object.freeze({
   schemaVersion: SOCKET_EYE_CONTACT_SETTINGS_SCHEMA_VERSION,
   enabled: true,
-  strength: 1,
+  strength: 0.8,
   convergence: 0,
-  headFollow: 1,
-  response: 0.65
+  headFollow: 0.5,
+  response: 0.5
 }) satisfies Readonly<SocketEyeContactSettingsV2>
 
 function fail(message: string): never {

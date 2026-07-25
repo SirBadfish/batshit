@@ -24,6 +24,7 @@ import {
   evaluateAppearanceRecipePhysicalOutput,
   type AppearanceRecipePhysicalBasis,
 } from "./recipe/appearanceRecipePhysicalEvaluator";
+import type { AnatomyFitResult } from "./recipe/anatomyFitContracts";
 
 type RuntimeMorphBinding = {
   mesh: THREE.Mesh;
@@ -314,6 +315,7 @@ export class AppearanceDialsEngineRuntime {
   private hipsRemap: HipsClipRemap | null = null;
   private values: unknown;
   private state: ResolvedAppearanceDialState;
+  private anatomyFitResults: readonly AnatomyFitResult[] = [];
 
   constructor(
     root: THREE.Object3D,
@@ -426,7 +428,11 @@ export class AppearanceDialsEngineRuntime {
     }
 
     this.captureRig();
-    this.physicalBasis = this.capturePhysicalBasis(rawManifest, validated);
+    this.physicalBasis = this.capturePhysicalBasis(
+      rawManifest,
+      validated,
+      built.morphBindings,
+    );
     this.state = resolveAppearanceDialState(manifest, this.values);
     this.applyResolvedState(this.state);
   }
@@ -603,6 +609,7 @@ export class AppearanceDialsEngineRuntime {
   private capturePhysicalBasis(
     rawManifest: GoonCustomAvatarManifest,
     validated: ValidatedAppearanceRuntimeInventory,
+    morphBindings: RuntimeMorphBindings,
   ): AppearanceRecipePhysicalBasis {
     const baseMatrix = (node: THREE.Object3D) => {
       if (!node.matrixAutoUpdate) return node.matrix.toArray();
@@ -723,9 +730,14 @@ export class AppearanceDialsEngineRuntime {
       ) {
         continue;
       }
-      const runtimes = (this.targetBindings.get(binding.target) ?? []).filter(
-        (candidate) => candidate.morph === binding.morph,
-      );
+      // One target can deliberately drive the same-named morph on multiple
+      // physical meshes (for example body + Lip Artwork overlay). Capture
+      // this manifest binding's exact runtime node/index rather than the
+      // target-wide runtime set, or the physical basis can cross-wire meshes.
+      const runtimes =
+        morphBindings.get(
+          morphRuntimeKey(binding.runtimeNodeId, binding.index),
+        ) ?? [];
       if (runtimes.length === 0) {
         throw new Error(
           `appearance retained target ${binding.target}/${binding.morph} lost its active mesh`,
@@ -1047,8 +1059,21 @@ export class AppearanceDialsEngineRuntime {
   setValues(
     values: AppearanceDialValueState | null | undefined,
   ): ResolvedAppearanceDialState {
+    return this.setFittedValues(values, []);
+  }
+
+  /**
+   * Apply one exact authoring preview atomically. Anatomy Fit output is
+   * identity-dependent, so a new dial state must never render with the
+   * previous state's fit (or with no fit) between writes.
+   */
+  setFittedValues(
+    values: AppearanceDialValueState | null | undefined,
+    anatomyFitResults: readonly AnatomyFitResult[],
+  ): ResolvedAppearanceDialState {
     this.values = values ?? null;
     this.state = resolveAppearanceDialState(this.manifest, this.values);
+    this.anatomyFitResults = anatomyFitResults;
     this.applyResolvedState(this.state);
     return this.state;
   }
@@ -1066,6 +1091,7 @@ export class AppearanceDialsEngineRuntime {
     const evaluated = evaluateAppearanceRecipePhysicalOutput(
       this.physicalBasis,
       state,
+      { anatomyFitResults: this.anatomyFitResults },
     );
 
     for (const retained of evaluated.retainedTargetPositionBindings) {

@@ -676,20 +676,24 @@ export function resolveCustomPerformanceDirection(input: {
   }
 
   const raw = input.rawTargetWeights ?? new Map<string, number>()
+  const hasLeftEyeYawRaw = raw.has('eyeLookOutLeft') || raw.has('eyeLookInLeft')
+  const hasRightEyeYawRaw = raw.has('eyeLookInRight') || raw.has('eyeLookOutRight')
+  const hasLeftEyePitchRaw = raw.has('eyeLookDownLeft') || raw.has('eyeLookUpLeft')
+  const hasRightEyePitchRaw = raw.has('eyeLookDownRight') || raw.has('eyeLookUpRight')
   const leftEyeYaw =
-    eyeYaw -
+    (hasLeftEyeYawRaw ? 0 : eyeYaw) -
     readWeight(raw, 'eyeLookOutLeft') +
     readWeight(raw, 'eyeLookInLeft')
   const rightEyeYaw =
-    eyeYaw -
+    (hasRightEyeYawRaw ? 0 : eyeYaw) -
     readWeight(raw, 'eyeLookInRight') +
     readWeight(raw, 'eyeLookOutRight')
   const leftEyePitch =
-    eyePitch -
+    (hasLeftEyePitchRaw ? 0 : eyePitch) -
     readWeight(raw, 'eyeLookDownLeft') +
     readWeight(raw, 'eyeLookUpLeft')
   const rightEyePitch =
-    eyePitch -
+    (hasRightEyePitchRaw ? 0 : eyePitch) -
     readWeight(raw, 'eyeLookDownRight') +
     readWeight(raw, 'eyeLookUpRight')
 

@@ -8,7 +8,14 @@ import {
 
 describe('socket eye contact settings', () => {
   it('resolves one explicit five-setting first-party contract', () => {
-    expect(resolveSocketEyeContactSettings(null)).toEqual(DEFAULT_SOCKET_EYE_CONTACT_SETTINGS)
+    expect(resolveSocketEyeContactSettings(null)).toEqual({
+      schemaVersion: 'socket-eye-contact-settings/v2',
+      enabled: true,
+      strength: 0.8,
+      convergence: 0,
+      headFollow: 0.5,
+      response: 0.5
+    })
     expect(
       parseSocketEyeContactSettings({
         schemaVersion: 'socket-eye-contact-settings/v2',
@@ -33,10 +40,10 @@ describe('socket eye contact settings', () => {
       parseSocketEyeContactSettings({
         schemaVersion: 'socket-eye-contact-settings/v1',
         enabled: true,
-        strength: 1,
+        strength: 0.8,
         convergence: 0,
-        headFollow: 1,
-        response: 0.65
+        headFollow: 0.5,
+        response: 0.5
       })
     ).toThrow('schemaVersion must be socket-eye-contact-settings/v2')
     expect(() =>

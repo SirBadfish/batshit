@@ -176,8 +176,37 @@ describe('socket-eye gaze composition', () => {
       rightEyePitch: -0.25
     }
     const coordinates = resolveAuthoredSocketEyeCoordinates(definition, authored)
-    expect(coordinates.left).toEqual({ horizontal: 0.75, vertical: 0.3 })
+    expect(coordinates.left.horizontal).toBeCloseTo(0.6708203932)
+    expect(coordinates.left.vertical).toBeCloseTo(0.2683281573)
     expect(coordinates.right).toEqual({ horizontal: -0.375, vertical: -0.15 })
+    for (const side of ['left', 'right'] as const) {
+      const limits = definition.runtimeBindings[side].gaze
+      expect(
+        Math.hypot(
+          coordinates[side].horizontal / limits.maximumHorizontal,
+          coordinates[side].vertical / limits.maximumVertical
+        )
+      ).toBeLessThanOrEqual(1)
+    }
+  })
+
+  it('projects full authored diagonals onto the package safe ellipse', () => {
+    const coordinates = resolveAuthoredSocketEyeCoordinates(definition, {
+      ...neutralDirection,
+      leftEyeYaw: -1,
+      leftEyePitch: 1,
+      rightEyeYaw: 1,
+      rightEyePitch: -1
+    })
+    for (const side of ['left', 'right'] as const) {
+      const limits = definition.runtimeBindings[side].gaze
+      expect(
+        Math.hypot(
+          coordinates[side].horizontal / limits.maximumHorizontal,
+          coordinates[side].vertical / limits.maximumVertical
+        )
+      ).toBeCloseTo(1)
+    }
   })
 
   it('maps final per-eye socket coordinates into all eight ARKit Look accommodation channels', () => {

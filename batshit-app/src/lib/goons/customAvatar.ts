@@ -113,6 +113,10 @@ export type GoonCustomAvatarManifest = {
   eyeApertureSeam?: unknown;
   /** Immutable first-party oral material definition; parsed before runtime use. */
   oralAppearance?: unknown;
+  /** Immutable first-party lip artwork definition; parsed before runtime use. */
+  lipArtwork?: unknown;
+  /** Exact hidden-landmark and rigid-assembly Oral Cavity Fit authoring package. */
+  oralCavityFit?: unknown;
   /** Authoring-time final-geometry fit definitions; stripped from Live output. */
   anatomyFit?: unknown;
   /** First-party skeleton/retarget/corrective contract; parsed by its owning runtimes. */
@@ -913,6 +917,7 @@ export async function loadAvatarIntoEngine(
       facialArtworkState: goon.facialArtwork ?? null,
       eyeAppearanceState: goon.eyeAppearance ?? null,
       oralAppearanceState: goon.oralAppearance ?? null,
+      lipArtworkState: goon.lipArtwork ?? null,
     });
     return { kind, manifest, role: isLeanLive ? "live" as const : "source" as const };
   }

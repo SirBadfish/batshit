@@ -12,6 +12,8 @@ export const ANATOMY_FIT_MANIFEST_CONTRACT =
   "anatomy-fit-manifest/v2" as const;
 export const SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT =
   "socket-eye-anatomy-domain/v1" as const;
+export const ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT =
+  "oral-cavity-anatomy-domain/v1" as const;
 
 export type SocketEyeAnatomyFitDomain = {
   contract: typeof SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT;
@@ -24,10 +26,21 @@ export type SocketEyeAnatomyFitDomain = {
   lashesEyeOutlineNodeId: string;
 };
 
+export type OralCavityAnatomyFitDomain = {
+  contract: typeof ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT;
+  bodyMeshId: string;
+  bodyTopologySha256: string;
+  oralCavityFitDefinitionSha256: string;
+};
+
+export type AnatomyFitManifestDomain =
+  | OralCavityAnatomyFitDomain
+  | SocketEyeAnatomyFitDomain;
+
 export type AnatomyFitManifestDefinition = {
   contract: typeof ANATOMY_FIT_MANIFEST_CONTRACT;
   stateSchemaVersion: typeof ANATOMY_FIT_STATE_CONTRACT;
-  domains: SocketEyeAnatomyFitDomain[];
+  domains: AnatomyFitManifestDomain[];
   definitionSha256: string;
 };
 
@@ -75,13 +88,39 @@ function stableId(value: unknown, context: string): string {
   return value;
 }
 
-function domainId(value: Pick<SocketEyeAnatomyFitDomain, "side">) {
-  return `socket-eye:${value.side}`;
+export function anatomyFitManifestDomainId(value: AnatomyFitManifestDomain) {
+  return value.contract === ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT
+    ? "oral-cavity"
+    : `socket-eye:${value.side}`;
 }
 
-function parseDomain(value: unknown, index: number): SocketEyeAnatomyFitDomain {
+function parseDomain(value: unknown, index: number): AnatomyFitManifestDomain {
   const context = `Anatomy Fit manifest domains[${index}]`;
   const raw = record(value, context);
+  if (raw.contract === ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT) {
+    exactKeys(
+      raw,
+      [
+        "contract",
+        "bodyMeshId",
+        "bodyTopologySha256",
+        "oralCavityFitDefinitionSha256",
+      ],
+      context,
+    );
+    return {
+      contract: ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT,
+      bodyMeshId: stableId(raw.bodyMeshId, `${context}.bodyMeshId`),
+      bodyTopologySha256: requireLowercaseSha256(
+        raw.bodyTopologySha256,
+        `${context}.bodyTopologySha256`,
+      ),
+      oralCavityFitDefinitionSha256: requireLowercaseSha256(
+        raw.oralCavityFitDefinitionSha256,
+        `${context}.oralCavityFitDefinitionSha256`,
+      ),
+    };
+  }
   exactKeys(
     raw,
     [
@@ -138,26 +177,44 @@ function parsePayload(value: unknown): AnatomyFitManifestPayload {
   if (raw.stateSchemaVersion !== ANATOMY_FIT_STATE_CONTRACT) {
     fail(`stateSchemaVersion must be ${ANATOMY_FIT_STATE_CONTRACT}`);
   }
-  if (!Array.isArray(raw.domains) || raw.domains.length !== 2) {
-    fail("domains must contain exactly the left and right socket-eye specializations");
+  if (!Array.isArray(raw.domains) || raw.domains.length !== 3) {
+    fail("domains must contain the oral cavity plus left and right socket-eye specializations");
   }
   const domains = raw.domains.map(parseDomain);
-  const ids = domains.map(domainId);
+  const ids = domains.map(anatomyFitManifestDomainId);
   if (new Set(ids).size !== ids.length) fail("domains must not contain duplicate specialization ids");
-  const sorted = [...domains].sort((left, right) => domainId(left).localeCompare(domainId(right)));
-  if (domains.some((entry, index) => domainId(entry) !== domainId(sorted[index]!))) {
+  const sorted = [...domains].sort((left, right) =>
+    anatomyFitManifestDomainId(left).localeCompare(anatomyFitManifestDomainId(right)),
+  );
+  if (
+    domains.some(
+      (entry, index) =>
+        anatomyFitManifestDomainId(entry) !== anatomyFitManifestDomainId(sorted[index]!),
+    )
+  ) {
     fail("domains must be sorted by specialization id");
   }
-  if (ids[0] !== "socket-eye:left" || ids[1] !== "socket-eye:right") {
-    fail("domains must contain exactly socket-eye:left and socket-eye:right");
+  if (
+    ids[0] !== "oral-cavity" ||
+    ids[1] !== "socket-eye:left" ||
+    ids[2] !== "socket-eye:right"
+  ) {
+    fail("domains must contain exactly oral-cavity, socket-eye:left, and socket-eye:right");
   }
   const topology = new Set(domains.map((entry) => entry.bodyTopologySha256));
-  const surface = new Set(domains.map((entry) => entry.socketEyeSurfaceDefinitionSha256));
-  const seam = new Set(domains.map((entry) => entry.apertureSeamDefinitionSha256));
+  const socketDomains = domains.filter(
+    (entry): entry is SocketEyeAnatomyFitDomain =>
+      entry.contract === SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT,
+  );
+  const surface = new Set(socketDomains.map((entry) => entry.socketEyeSurfaceDefinitionSha256));
+  const seam = new Set(socketDomains.map((entry) => entry.apertureSeamDefinitionSha256));
   if (topology.size !== 1 || surface.size !== 1 || seam.size !== 1) {
-    fail("bilateral domains must share one topology, socket-eye definition, and aperture seam");
+    fail("all domains must share one topology and bilateral sockets must share one surface and seam");
   }
-  const nodes = domains.flatMap((entry) => [entry.compositeCapNodeId, entry.lashesEyeOutlineNodeId]);
+  const nodes = socketDomains.flatMap((entry) => [
+    entry.compositeCapNodeId,
+    entry.lashesEyeOutlineNodeId,
+  ]);
   if (new Set(nodes).size !== nodes.length) fail("bilateral cap and liner node ids must be unique");
   return {
     contract: ANATOMY_FIT_MANIFEST_CONTRACT,
@@ -167,11 +224,13 @@ function parsePayload(value: unknown): AnatomyFitManifestPayload {
 }
 
 export async function createAnatomyFitManifestDefinition(
-  domainsValue: readonly SocketEyeAnatomyFitDomain[],
+  domainsValue: readonly AnatomyFitManifestDomain[],
 ): Promise<AnatomyFitManifestDefinition> {
   const domains = domainsValue
     .map((entry, index) => parseDomain(entry, index))
-    .sort((left, right) => domainId(left).localeCompare(domainId(right)));
+    .sort((left, right) =>
+      anatomyFitManifestDomainId(left).localeCompare(anatomyFitManifestDomainId(right)),
+    );
   const payload = parsePayload({
     contract: ANATOMY_FIT_MANIFEST_CONTRACT,
     stateSchemaVersion: ANATOMY_FIT_STATE_CONTRACT,
@@ -208,7 +267,7 @@ export function requireAnatomyFitStateDefinition(
   if (state.definitionSha256 !== definition.definitionSha256) {
     fail("state targets a different Anatomy Fit definition");
   }
-  const declared = new Set(definition.domains.map(domainId));
+  const declared = new Set(definition.domains.map(anatomyFitManifestDomainId));
   const actual = state.fits.map((entry) => entry.result.domain);
   if (actual.length !== declared.size || actual.some((entry) => !declared.has(entry))) {
     fail("state must contain exactly one fit for every declared domain");

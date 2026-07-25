@@ -417,6 +417,18 @@ export async function buildRecipeStateSnapshot(
     siblings.set(next.id, next)
   }
 
+  removeSiblingSurface(siblings, ['lipArtwork', 'lip-artwork'], 'lip-artwork-state/v2')
+  if (input.goon.lipArtwork) {
+    const state = cloneRecipeJson(input.goon.lipArtwork)
+    const next = await siblingRecord({
+      id: 'lipArtwork',
+      contract: state.schemaVersion,
+      definitionSha256: state.definitionSha256,
+      state
+    })
+    siblings.set(next.id, next)
+  }
+
   if (input.anatomyFitState !== undefined) {
     removeSiblingSurface(
       siblings,

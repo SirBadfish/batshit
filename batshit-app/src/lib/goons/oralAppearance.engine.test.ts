@@ -19,8 +19,8 @@ function definition() {
   )
 }
 
-function material(name: string) {
-  const value = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7 })
+function material(name: string, roughness: number) {
+  const value = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness })
   value.name = name
   return value
 }
@@ -33,10 +33,10 @@ function mesh(name: string, value: THREE.Material) {
 
 function scene(options: { splitTeethMaterial?: boolean } = {}) {
   const root = new THREE.Group()
-  const teeth = material('bs_f1_teeth_mat')
-  const lowerTeeth = options.splitTeethMaterial ? material('bs_f1_teeth_mat') : teeth
-  const gums = material('bs_f1_gums_mat')
-  const tongue = material('bs_f1_tongue_mat')
+  const teeth = material('bs_f1_teeth_mat', 0.23)
+  const lowerTeeth = options.splitTeethMaterial ? material('bs_f1_teeth_mat', 0.23) : teeth
+  const gums = material('bs_f1_gums_mat', 0.38)
+  const tongue = material('bs_f1_tongue_mat', 0.7)
   root.add(
     mesh('bs_f1_upper_teeth', teeth),
     mesh('bs_f1_lower_teeth', lowerTeeth),
@@ -71,13 +71,14 @@ describe('OralAppearanceEngineRuntime', () => {
 
     runtime.setState(null)
     expect(value.teeth.color.getHex()).toBe(0xffffff)
-    expect(value.teeth.roughness).toBeCloseTo(0.7)
+    expect(value.teeth.roughness).toBeCloseTo(0.23)
     runtime.setState(state)
     runtime.dispose()
     expect(value.teeth.color.getHex()).toBe(0xffffff)
     expect(value.gums.color.getHex()).toBe(0xffffff)
     expect(value.tongue.color.getHex()).toBe(0xffffff)
-    expect(value.teeth.roughness).toBeCloseTo(0.7)
+    expect(value.teeth.roughness).toBeCloseTo(0.23)
+    expect(value.gums.roughness).toBeCloseTo(0.38)
   })
 
   it('fails loudly for missing nodes or separately instantiated family materials', () => {

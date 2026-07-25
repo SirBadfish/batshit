@@ -15,6 +15,8 @@ export const ANATOMY_FIT_RESULT_CONTRACT = "anatomy-fit-result/v2" as const;
 export const ANATOMY_FIT_STATE_CONTRACT = "anatomy-fit-state/v2" as const;
 export const ANATOMY_FIT_RECIPE_SIBLING_ID = "anatomy-fit" as const;
 export const SOCKET_EYE_ANATOMY_FIT_SOLVER = "socket-eye-anatomy-fit/v2" as const;
+export const ORAL_CAVITY_ANATOMY_FIT_SOLVER =
+  "oral-cavity-anatomy-fit/v2" as const;
 
 const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const VERSIONED_CONTRACT_PATTERN =
@@ -79,6 +81,12 @@ export type AnatomyFitFollowerMorphCoefficient = {
   weight: number;
   lower: number;
   upper: number;
+};
+
+export type AnatomyFitPhysicalOutput = {
+  nodeTransforms: AnatomyFitNodeTransform[];
+  followerMorphCoefficients: AnatomyFitFollowerMorphCoefficient[];
+  metrics: AnatomyFitMetric[];
 };
 
 export type AnatomyFitResolvedParameter = {
@@ -398,6 +406,17 @@ function parseInputPayload(value: unknown): AnatomyFitInputPayload {
       fail(ANATOMY_FIT_INPUT_CONTRACT, "socket-eye verification cannot declare local fit parameters");
     }
   }
+  if (solverVersion === ORAL_CAVITY_ANATOMY_FIT_SOLVER) {
+    if (domain !== "oral-cavity") {
+      fail(ANATOMY_FIT_INPUT_CONTRACT, "domain must be oral-cavity");
+    }
+    if (parameters.length !== 0) {
+      fail(
+        ANATOMY_FIT_INPUT_CONTRACT,
+        "oral-cavity closed-form fitting cannot declare iterative parameters",
+      );
+    }
+  }
   return {
     contract: ANATOMY_FIT_INPUT_CONTRACT,
     solverVersion,
@@ -609,6 +628,24 @@ function parseMetrics(value: unknown): AnatomyFitMetric[] {
   );
 }
 
+/**
+ * Canonicalize the reusable physical result at the same precision boundary as
+ * persisted Anatomy Fit results. Browser, Node, and Redis may retain adjacent
+ * double representations beyond the solver's declared precision; those bits
+ * are not physical identity.
+ */
+export function normalizeAnatomyFitPhysicalOutput(
+  value: AnatomyFitPhysicalOutput,
+): AnatomyFitPhysicalOutput {
+  return {
+    nodeTransforms: parseNodeTransforms(value.nodeTransforms),
+    followerMorphCoefficients: parseMorphCoefficients(
+      value.followerMorphCoefficients,
+    ),
+    metrics: parseMetrics(value.metrics),
+  };
+}
+
 function parseDiagnostics(value: unknown): AnatomyFitDiagnostic[] {
   if (!Array.isArray(value)) fail("anatomy-fit-result.diagnostics", "must be an array");
   return sortedUnique(
@@ -680,9 +717,16 @@ function parseResultPayload(value: unknown): AnatomyFitResultPayload {
   }
   const convergence = parseConvergence(raw.convergence);
   const resolvedParameters = parseResolvedParameters(raw.resolvedParameters);
-  const nodeTransforms = parseNodeTransforms(raw.nodeTransforms);
-  const followerMorphCoefficients = parseMorphCoefficients(raw.followerMorphCoefficients);
-  const metrics = parseMetrics(raw.metrics);
+  const {
+    nodeTransforms,
+    followerMorphCoefficients,
+    metrics,
+  } = normalizeAnatomyFitPhysicalOutput({
+    nodeTransforms: raw.nodeTransforms as AnatomyFitNodeTransform[],
+    followerMorphCoefficients:
+      raw.followerMorphCoefficients as AnatomyFitFollowerMorphCoefficient[],
+    metrics: raw.metrics as AnatomyFitMetric[],
+  });
   const diagnostics = parseDiagnostics(raw.diagnostics);
   if (raw.solverVersion === SOCKET_EYE_ANATOMY_FIT_SOLVER) {
     if (raw.domain !== "socket-eye:left" && raw.domain !== "socket-eye:right") {
@@ -696,6 +740,17 @@ function parseResultPayload(value: unknown): AnatomyFitResultPayload {
       fail(
         ANATOMY_FIT_RESULT_CONTRACT,
         "socket-eye verification cannot emit local parameters, node transforms, or morph coefficients",
+      );
+    }
+  }
+  if (raw.solverVersion === ORAL_CAVITY_ANATOMY_FIT_SOLVER) {
+    if (raw.domain !== "oral-cavity") {
+      fail(ANATOMY_FIT_RESULT_CONTRACT, "domain must be oral-cavity");
+    }
+    if (resolvedParameters.length > 0) {
+      fail(
+        ANATOMY_FIT_RESULT_CONTRACT,
+        "oral-cavity closed-form fitting cannot emit iterative parameters",
       );
     }
   }
@@ -855,12 +910,27 @@ export async function assertAnatomyFitFollowerCompatibility(
   if (input.source.appearanceDefinitionSha256 !== appearance.definitionSha256) {
     fail(ANATOMY_FIT_RESULT_CONTRACT, "fit input targets a different Appearance Dials definition");
   }
-  if (
-    result.nodeTransforms.length !== 0 ||
-    result.followerMorphCoefficients.length !== 0 ||
-    result.resolvedParameters.length !== 0
+  if (input.solverVersion === SOCKET_EYE_ANATOMY_FIT_SOLVER) {
+    if (
+      result.nodeTransforms.length !== 0 ||
+      result.followerMorphCoefficients.length !== 0 ||
+      result.resolvedParameters.length !== 0
+    ) {
+      fail(
+        ANATOMY_FIT_RESULT_CONTRACT,
+        "socket-eye verification retained globe-era localized output",
+      );
+    }
+  } else if (
+    input.solverVersion !== ORAL_CAVITY_ANATOMY_FIT_SOLVER &&
+    (result.nodeTransforms.length !== 0 ||
+      result.followerMorphCoefficients.length !== 0 ||
+      result.resolvedParameters.length !== 0)
   ) {
-    fail(ANATOMY_FIT_RESULT_CONTRACT, "socket-eye verification retained globe-era localized output");
+    fail(
+      ANATOMY_FIT_RESULT_CONTRACT,
+      "unsupported Anatomy Fit solver retained globe-era localized output",
+    );
   }
   const followerNodes = new Set<string>();
   for (const follower of Object.values(appearance.followers)) {

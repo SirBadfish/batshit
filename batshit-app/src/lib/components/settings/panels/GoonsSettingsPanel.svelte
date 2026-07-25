@@ -59,6 +59,7 @@
   import AppearanceDialsEditor from '$lib/components/goons/AppearanceDialsEditor.svelte'
   import FacialArtworkEditor from '$lib/components/goons/FacialArtworkEditor.svelte'
   import OralAppearanceEditor from '$lib/components/goons/OralAppearanceEditor.svelte'
+  import LipArtworkEditor from '$lib/components/goons/LipArtworkEditor.svelte'
   import UniversalFaceControlsEditor from '$lib/components/goons/UniversalFaceControlsEditor.svelte'
   import EyeContactTuningEditor from '$lib/components/goons/EyeContactTuningEditor.svelte'
   import SocketEyeContactEditor from '$lib/components/goons/SocketEyeContactEditor.svelte'
@@ -72,6 +73,7 @@
   import GoonsUnsavedExitDialog from '$lib/components/settings/goons/GoonsUnsavedExitDialog.svelte'
   import RecipeWorkflowController from '$lib/components/settings/goons/recipe/RecipeWorkflowController.svelte'
   import { resolveGoonSettingsPreviewTarget } from '$lib/components/settings/goons/recipe/recipeEditorPreviewTarget'
+  import type { RecipeFittedPreviewState } from '$lib/components/settings/goons/recipe/types'
   import {
     normalizeGoonCueMap,
     normalizeGoonsSettings,
@@ -112,6 +114,10 @@
     type UniversalFaceControlDefinition,
     type UniversalFaceControlModel
   } from '$lib/goons/universalFaceControls'
+  import {
+    normalizeCueFaceSource,
+    prepareCueForPortablePack
+  } from '$lib/goons/cueFaceProfiles'
   import {
     parseAppearanceDialsManifest,
     reconcileAppearanceDialValues,
@@ -160,6 +166,14 @@
     type OralAppearanceDefinitionV1,
     type OralAppearanceStateV1
   } from '$lib/goons/oralAppearance'
+  import {
+    parseLipArtworkDefinition,
+    parseLipArtworkState,
+    reconcileLipArtworkState,
+    type LipArtworkDefinitionV2,
+    type LipArtworkStateV2,
+    type LipArtworkUpload
+  } from '$lib/goons/lipArtwork'
   import {
     hasRenderableGoonAvatar,
     loadAvatarIntoEngine,
@@ -286,6 +300,8 @@
     GoonsSettings,
     GoonXWearData,
     GoonFaceControl,
+    GoonCueFaceProfiles,
+    GoonArkit52ChannelTarget,
     GoonEmoteStep,
     GoonRawMorphTarget,
     ResolvedGoonEyeContactTuning
@@ -335,6 +351,8 @@
     uploadAdvancedGoonPackage,
     uploadGoonFacialArtwork,
     deleteGoonFacialArtwork,
+    uploadGoonLipArtwork,
+    deleteGoonLipArtwork,
     uploadGuidedDufClothesVrm
   } from '$lib/services/goons'
   import type { AdvancedGoonPackageUploadResult } from '$lib/services/goons'
@@ -402,6 +420,7 @@
   type RecipeEditorPreviewTarget = {
     goon: GoonRecord
     state: RecipeStateSnapshot
+    preview: RecipeFittedPreviewState
     side: 'current' | 'updated'
   }
   type GoonPreviewMode = 'editor' | 'library' | 'recipe-live-candidate'
@@ -596,7 +615,7 @@
     motion?: GoonFileRef | null
   }
   type PortablePackManifest = {
-    version: 2 | 3 | 4 | 5
+    version: 6
     exportedAt: string
     name: string
     postures: GoonPostureDefinition[]
@@ -693,6 +712,7 @@
   let recipeWorkflowController = $state<RecipeWorkflowControllerHandle | null>(null)
   let recipeWorkflowBusy = $state(false)
   let recipeEditorPreviewTarget = $state<RecipeEditorPreviewTarget | null>(null)
+  let recipeEditorDraftPreview = $state<RecipeFittedPreviewState | null>(null)
   let recipePreviewTransitioning = $state(false)
   let guidedDufClothesInput = $state<HTMLInputElement | null>(null)
   let guidedDufClothesBusy = $state(false)
@@ -2979,7 +2999,11 @@
 
     const usedExpressionPresets = new Set<GoonExpressionPreset>()
     for (const cue of Object.values(resolved.cueMap)) {
-      for (const target of cue.expressionTargets ?? []) {
+      const portableTargets = resolveEditorFaceProfiles(
+        cue,
+        false
+      ).portable.expressionTargets
+      for (const target of portableTargets ?? []) {
         usedExpressionPresets.add(target.preset)
       }
     }
@@ -2994,9 +3018,13 @@
 
     const disabledCues: string[] = []
     for (const cue of Object.values(resolved.cueMap)) {
-      if (!cue.expressionTargets || cue.expressionTargets.length === 0) continue
+      const portableTargets = resolveEditorFaceProfiles(
+        cue,
+        false
+      ).portable.expressionTargets
+      if (!portableTargets || portableTargets.length === 0) continue
       if (cue.animationName) continue
-      const hasAnyExpression = cue.expressionTargets.some((target) =>
+      const hasAnyExpression = portableTargets.some((target) =>
         target.preset.endsWith('Head') ? true : nextExpressions.has(target.preset)
       )
       if (hasAnyExpression) continue
@@ -6445,6 +6473,33 @@
     }
   }
 
+  function applyRecipeFittedPreviewState(
+    preview: RecipeFittedPreviewState
+  ) {
+    if (!previewEngine || !previewReady || previewLoading || recipePreviewTransitioning) {
+      return
+    }
+    if (previewGoonId !== editorGoonId) {
+      return
+    }
+    try {
+      previewEngine.setFittedAppearanceDialValues(
+        preview.appearanceDials,
+        preview.anatomyFitResults
+      )
+      editorAppearanceDialsError = ''
+    } catch (error) {
+      editorAppearanceDialsError =
+        error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  function handleRecipeEditorDraftPreviewStateChange(
+    preview: RecipeFittedPreviewState | null
+  ) {
+    recipeEditorDraftPreview = preview
+  }
+
   async function previewStagedRecipeLiveCandidate(staged: RecipeStageResponse) {
     const candidate = projectStagedRecipeLiveCandidate(staged)
     const previousPreview = recipeEditorPreviewTarget?.goon ?? editorRecipeSourceGoon
@@ -7738,7 +7793,9 @@
           motionAssetCache
         )
       : null
-    const cue = JSON.parse(JSON.stringify(option.cue)) as GoonCueDefinition
+    const cue = prepareCueForPortablePack(option.cue)
+    // Raw physical morph names belong to one package. Cross-Goon packs carry
+    // only the portable semantic profile and canonical ARKit-52 channels.
     if (
       cue.posture &&
       !isBuiltInPosture(cue.posture) &&
@@ -7823,7 +7880,7 @@
         }
       }
       const manifest: PortablePackManifest = {
-        version: 5,
+        version: 6,
         exportedAt: new Date().toISOString(),
         name: 'Batshit Goon Pack',
         postures: Array.from(referencedPostureIds).map(
@@ -7885,7 +7942,7 @@
     if (!value || typeof value !== 'object') return false
     const record = value as Record<string, unknown>
     return (
-      (record.version === 2 || record.version === 3 || record.version === 4 || record.version === 5) &&
+      record.version === 6 &&
       (record.postures === undefined || Array.isArray(record.postures)) &&
       (record.motions === undefined || Array.isArray(record.motions)) &&
       Array.isArray(record.moods) &&
@@ -7915,6 +7972,15 @@
 
       const parsed = JSON.parse(strFromU8(manifestBytes))
       if (!isPortablePackManifest(parsed)) {
+        const parsedVersion =
+          parsed && typeof parsed === 'object'
+            ? (parsed as Record<string, unknown>).version
+            : undefined
+        if (parsedVersion !== undefined && parsedVersion !== 6) {
+          throw new Error(
+            `That Goon pack uses obsolete format v${String(parsedVersion)}. Export it again from the current Batshit Goon Kitchen.`
+          )
+        }
         throw new Error('That file is not a valid Batshit Goon pack zip.')
       }
 
@@ -8515,6 +8581,7 @@
 
   function cuePatchTouchesFacePreview(patch: Partial<GoonCueMap[string]>) {
     return (
+      Object.prototype.hasOwnProperty.call(patch, 'faceProfiles') ||
       Object.prototype.hasOwnProperty.call(patch, 'expressionTargets') ||
       Object.prototype.hasOwnProperty.call(patch, 'faceControls') ||
       Object.prototype.hasOwnProperty.call(patch, 'rawMorphTargets')
@@ -8705,8 +8772,20 @@
   ) {
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName] || { name: cueName, kind: 'emote' }
+    const faceProfiles = resolveEditorFaceProfiles(cue)
     updateCueField(cueName, {
-      expressionTargets: setExpressionTargetWeight(cue.expressionTargets, preset, value)
+      faceProfiles: {
+        ...faceProfiles,
+        portable: {
+          ...faceProfiles.portable,
+          expressionTargets: setExpressionTargetWeight(
+            faceProfiles.portable.expressionTargets,
+            preset,
+            value
+          )
+        }
+      },
+      expressionTargets: undefined
     })
   }
 
@@ -8751,6 +8830,7 @@
     const engine = activeTab === 'kitchen' ? kitchenPreviewEngine : previewEngine
     const ready = activeTab === 'kitchen' ? kitchenPreviewReady : previewReady
     if (!engine || !ready) return [...GOON_SEMANTIC_EXPRESSION_CONTROLS]
+    if (engine.getArkitFaceAuthoringDefinitions().length > 0) return []
     return resolveGoonSemanticExpressionControlStates(
       new Set(engine.getSupportedSemanticExpressionPresets()),
       engine.getSemanticExpressionSourceLabel()
@@ -8789,6 +8869,46 @@
     })
   }
 
+  function currentUsesArkit52FaceProfile(): boolean {
+    return currentUniversalFaceControlModel().sections.some((section) =>
+      section.controls.some((control) => control.storage === 'arkit-channel')
+    )
+  }
+
+  function resolveEditorFaceProfiles(
+    cueLike: Pick<
+      GoonCueDefinition | GoonEmoteStep,
+      'faceProfiles' | 'expressionTargets' | 'faceControls' | 'rawMorphTargets'
+    >,
+    initializeNeutralArkit52 = true
+  ): GoonCueFaceProfiles {
+    return normalizeCueFaceSource(cueLike, { initializeNeutralArkit52 }).faceProfiles
+  }
+
+  function setArkitChannelValue(
+    channels: GoonArkit52ChannelTarget[] | undefined,
+    channel: GoonArkit52ChannelTarget['channel'],
+    value: number
+  ): GoonArkit52ChannelTarget[] | undefined {
+    const next = (channels ?? []).filter((entry) => entry.channel !== channel)
+    if (value > 0) next.push({ channel, value })
+    next.sort((left, right) => left.channel.localeCompare(right.channel))
+    return next.length > 0 ? next : undefined
+  }
+
+  function getCueExpressionPresetValue(
+    cueName: string,
+    preset: GoonExpressionPreset
+  ): number {
+    const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
+    const cue = map[cueName]
+    if (!cue) return 0
+    return getExpressionTargetWeight(
+      resolveEditorFaceProfiles(cue).portable.expressionTargets,
+      preset
+    )
+  }
+
   function currentUnmanagedRawMorphTargetNames(): string[] {
     const managed = new Set(currentUniversalFaceControlModel().managedRawMorphTargetNames)
     return currentRawMorphTargetNames().filter((targetName) => !managed.has(targetName))
@@ -8808,22 +8928,49 @@
   function getFaceControlValue(cueName: string, controlId: BatshitFaceControlId): number {
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName]
-    if (!cue?.faceControls) return 0
-    const fc = cue.faceControls.find((c) => c.control === controlId)
+    if (!cue) return 0
+    const profiles = resolveEditorFaceProfiles(cue)
+    const controls = currentUsesArkit52FaceProfile()
+      ? profiles.arkit52?.headControls
+      : profiles.portable.faceControls
+    const fc = controls?.find((c) => c.control === controlId)
     return fc?.value ?? 0
   }
 
   function updateFaceControl(cueName: string, controlId: BatshitFaceControlId, value: number) {
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName] || { name: cueName, kind: 'emote' }
-    let next = [...(cue.faceControls ?? [])]
+    const faceProfiles = resolveEditorFaceProfiles(cue)
+    const usesArkit = currentUsesArkit52FaceProfile()
+    let next = [
+      ...(usesArkit
+        ? faceProfiles.arkit52?.headControls ?? []
+        : faceProfiles.portable.faceControls ?? [])
+    ]
 
     // Apply the primary control
     next = applyFaceControlToArray(next, controlId, value)
 
     next = applyLockedFaceControlMirrors(next, controlId, value)
 
-    updateCueField(cueName, { faceControls: next.length > 0 ? next : undefined })
+    updateCueField(cueName, {
+      faceProfiles: usesArkit
+        ? {
+            ...faceProfiles,
+            arkit52: {
+              ...faceProfiles.arkit52,
+              headControls: next.length > 0 ? next : undefined
+            }
+          }
+        : {
+            ...faceProfiles,
+            portable: {
+              ...faceProfiles.portable,
+              faceControls: next.length > 0 ? next : undefined
+            }
+          },
+      faceControls: undefined
+    })
   }
 
   function applyFaceControlToArray(
@@ -8898,8 +9045,14 @@
     if (control.storage === 'face-control' && control.faceControlId) {
       return getFaceControlValue(cueName, control.faceControlId)
     }
+    if (control.storage === 'arkit-channel' && control.arkitChannel) {
+      const channels = cue
+        ? resolveEditorFaceProfiles(cue).arkit52?.channels
+        : undefined
+      return channels?.find((entry) => entry.channel === control.arkitChannel)?.value ?? 0
+    }
     if (control.storage === 'expression-preset' && control.expressionPreset) {
-      return getExpressionTargetWeight(cue?.expressionTargets, control.expressionPreset)
+      return getCueExpressionPresetValue(cueName, control.expressionPreset)
     }
     return getCustomMorphValueForTargets(cue?.rawMorphTargets, control.morphTargets ?? [])
   }
@@ -8913,6 +9066,25 @@
       updateFaceControl(cueName, control.faceControlId, value)
       return
     }
+    if (control.storage === 'arkit-channel' && control.arkitChannel) {
+      const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
+      const cue = map[cueName] || { name: cueName, kind: 'emote' }
+      const faceProfiles = resolveEditorFaceProfiles(cue)
+      updateCueField(cueName, {
+        faceProfiles: {
+          ...faceProfiles,
+          arkit52: {
+            ...faceProfiles.arkit52,
+            channels: setArkitChannelValue(
+              faceProfiles.arkit52?.channels,
+              control.arkitChannel,
+              value
+            )
+          }
+        }
+      })
+      return
+    }
     if (control.storage === 'expression-preset' && control.expressionPreset) {
       updateCueExpressionPreset(cueName, control.expressionPreset, value)
       return
@@ -8924,7 +9096,14 @@
   }
 
   function resetUniversalFaceControls(cueName: string) {
+    const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
+    const cue = map[cueName] || { name: cueName, kind: 'emote' }
+    const faceProfiles = resolveEditorFaceProfiles(cue)
+    const usesArkit = currentUsesArkit52FaceProfile()
     updateCueField(cueName, {
+      faceProfiles: usesArkit
+        ? { ...faceProfiles, arkit52: {} }
+        : { ...faceProfiles, portable: {} },
       expressionTargets: undefined,
       faceControls: undefined,
       rawMorphTargets: undefined
@@ -8985,8 +9164,7 @@
     // If first step and no steps exist yet, promote current top-level to step 1
     if (promotingTopLevelToStep) {
       steps.push({
-        expressionTargets: cue.expressionTargets ?? [],
-        faceControls: cue.faceControls ?? [],
+        faceProfiles: resolveEditorFaceProfiles(cue),
         rawMorphTargets: cue.rawMorphTargets ?? [],
         attackMs: cue.attackMs,
         holdMs: cue.holdMs,
@@ -8996,8 +9174,10 @@
 
     // Add new empty step
     steps.push({
-      expressionTargets: [],
-      faceControls: [],
+      faceProfiles: {
+        portable: {},
+        arkit52: {}
+      },
       rawMorphTargets: [],
       attackMs: 200,
       holdMs: 1000,
@@ -9006,6 +9186,12 @@
 
     updateCueField(cueName, {
       steps,
+      faceProfiles: promotingTopLevelToStep
+        ? {
+            portable: {},
+            ...(cue.kind === 'emote' ? { arkit52: {} } : {})
+          }
+        : cue.faceProfiles,
       expressionTargets: promotingTopLevelToStep ? undefined : cue.expressionTargets,
       faceControls: promotingTopLevelToStep ? undefined : cue.faceControls,
       rawMorphTargets: promotingTopLevelToStep ? undefined : cue.rawMorphTargets,
@@ -9026,6 +9212,7 @@
       const single = steps[0]
       updateCueField(cueName, {
         steps: undefined,
+        faceProfiles: single?.faceProfiles,
         expressionTargets: single?.expressionTargets,
         faceControls: single?.faceControls,
         rawMorphTargets: single?.rawMorphTargets,
@@ -9057,7 +9244,11 @@
     if (!cue) return null
 
     const topLevelHasFaceAuthoring = Boolean(
-      cue.expressionTargets?.length || cue.faceControls?.length || cue.rawMorphTargets?.length
+      cue.faceProfiles?.portable.expressionTargets?.length ||
+      cue.faceProfiles?.portable.faceControls?.length ||
+      cue.faceProfiles?.arkit52?.channels?.length ||
+      cue.faceProfiles?.arkit52?.headControls?.length ||
+      cue.rawMorphTargets?.length
     )
     const selectedStep =
       typeof selection.stepIndex === 'number' ? cue.steps?.[selection.stepIndex] : undefined
@@ -9069,6 +9260,7 @@
       name: cue.name,
       kind: cue.kind,
       intensity: cue.intensity,
+      faceProfiles: step?.faceProfiles ?? cue.faceProfiles,
       expressionTargets: step?.expressionTargets ?? cue.expressionTargets,
       faceControls: step?.faceControls ?? cue.faceControls,
       rawMorphTargets: step?.rawMorphTargets ?? cue.rawMorphTargets
@@ -9086,8 +9278,20 @@
     if (!cue?.steps) return
     const step = cue.steps[stepIndex]
     if (!step) return
+    const faceProfiles = resolveEditorFaceProfiles(step)
     updateStepField(cueName, stepIndex, {
-      expressionTargets: setExpressionTargetWeight(step.expressionTargets, preset, value)
+      faceProfiles: {
+        ...faceProfiles,
+        portable: {
+          ...faceProfiles.portable,
+          expressionTargets: setExpressionTargetWeight(
+            faceProfiles.portable.expressionTargets,
+            preset,
+            value
+          )
+        }
+      },
+      expressionTargets: undefined
     })
   }
 
@@ -9102,9 +9306,34 @@
     if (!cue?.steps) return
     const step = cue.steps[stepIndex]
     if (!step) return
-    let next = applyFaceControlToArray(step.faceControls ?? [], controlId, value)
+    const faceProfiles = resolveEditorFaceProfiles(step)
+    const usesArkit = currentUsesArkit52FaceProfile()
+    let next = applyFaceControlToArray(
+      usesArkit
+        ? faceProfiles.arkit52?.headControls ?? []
+        : faceProfiles.portable.faceControls ?? [],
+      controlId,
+      value
+    )
     next = applyLockedFaceControlMirrors(next, controlId, value)
-    updateStepField(cueName, stepIndex, { faceControls: next.length > 0 ? next : undefined })
+    updateStepField(cueName, stepIndex, {
+      faceProfiles: usesArkit
+        ? {
+            ...faceProfiles,
+            arkit52: {
+              ...faceProfiles.arkit52,
+              headControls: next.length > 0 ? next : undefined
+            }
+          }
+        : {
+            ...faceProfiles,
+            portable: {
+              ...faceProfiles.portable,
+              faceControls: next.length > 0 ? next : undefined
+            }
+          },
+      faceControls: undefined
+    })
   }
 
   function getStepFaceControlValue(
@@ -9115,7 +9344,12 @@
     const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
     const cue = map[cueName]
     const step = cue?.steps?.[stepIndex]
-    const fc = step?.faceControls?.find((c) => c.control === controlId)
+    if (!step) return 0
+    const faceProfiles = resolveEditorFaceProfiles(step)
+    const controls = currentUsesArkit52FaceProfile()
+      ? faceProfiles.arkit52?.headControls
+      : faceProfiles.portable.faceControls
+    const fc = controls?.find((c) => c.control === controlId)
     return fc?.value ?? 0
   }
 
@@ -9153,8 +9387,17 @@
     if (control.storage === 'face-control' && control.faceControlId) {
       return getStepFaceControlValue(cueName, stepIndex, control.faceControlId)
     }
+    if (control.storage === 'arkit-channel' && control.arkitChannel) {
+      const channels = step
+        ? resolveEditorFaceProfiles(step).arkit52?.channels
+        : undefined
+      return channels?.find((entry) => entry.channel === control.arkitChannel)?.value ?? 0
+    }
     if (control.storage === 'expression-preset' && control.expressionPreset) {
-      return getExpressionTargetWeight(step?.expressionTargets, control.expressionPreset)
+      return getExpressionTargetWeight(
+        step ? resolveEditorFaceProfiles(step).portable.expressionTargets : undefined,
+        control.expressionPreset
+      )
     }
     return getCustomMorphValueForTargets(step?.rawMorphTargets, control.morphTargets ?? [])
   }
@@ -9167,6 +9410,26 @@
   ) {
     if (control.storage === 'face-control' && control.faceControlId) {
       updateStepFaceControl(cueName, stepIndex, control.faceControlId, value)
+      return
+    }
+    if (control.storage === 'arkit-channel' && control.arkitChannel) {
+      const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
+      const step = map[cueName]?.steps?.[stepIndex]
+      if (!step) return
+      const faceProfiles = resolveEditorFaceProfiles(step)
+      updateStepField(cueName, stepIndex, {
+        faceProfiles: {
+          ...faceProfiles,
+          arkit52: {
+            ...faceProfiles.arkit52,
+            channels: setArkitChannelValue(
+              faceProfiles.arkit52?.channels,
+              control.arkitChannel,
+              value
+            )
+          }
+        }
+      })
       return
     }
     if (control.storage === 'expression-preset' && control.expressionPreset) {
@@ -9183,7 +9446,15 @@
   }
 
   function resetStepUniversalFaceControls(cueName: string, stepIndex: number) {
+    const map = activeTab === 'kitchen' ? kitchenCueMap : editorCueMap
+    const step = map[cueName]?.steps?.[stepIndex]
+    if (!step) return
+    const faceProfiles = resolveEditorFaceProfiles(step)
+    const usesArkit = currentUsesArkit52FaceProfile()
     updateStepField(cueName, stepIndex, {
+      faceProfiles: usesArkit
+        ? { ...faceProfiles, arkit52: {} }
+        : { ...faceProfiles, portable: {} },
       expressionTargets: undefined,
       faceControls: undefined,
       rawMorphTargets: undefined
@@ -9931,13 +10202,20 @@
   })
 
   // live-sync the dial draft onto the settings preview engine (fires on
-  // slider changes and when the preview finishes loading the editor goon)
+  // fitted draft changes and when the preview finishes loading the editor
+  // goon). Recipe Source previews must apply the Appearance state and its
+  // matching Anatomy Fit atomically; showing either side alone can put rigid
+  // assemblies visibly outside the edited body.
   $effect(() => {
     if (!previewEngine || !previewReady || previewLoading || recipePreviewTransitioning) return
     if (previewGoonId !== editorGoonId) return
-    const state = recipeEditorPreviewTarget?.state.appearanceDials ?? editorAppearanceDialsState
-    if (!state) return
-    previewEngine.setAppearanceDialValues(state)
+    const fitted = recipeEditorPreviewTarget?.preview ?? recipeEditorDraftPreview
+    if (fitted) {
+      applyRecipeFittedPreviewState(fitted)
+      return
+    }
+    if (!editorAppearanceDialsState) return
+    previewEngine.setAppearanceDialValues(editorAppearanceDialsState)
   })
 
   function updateEditorAppearanceDials(state: AppearanceDialValueState) {
@@ -9954,12 +10232,15 @@
   let editorEyeAppearanceState = $state<EyeAppearanceStateV3 | null>(null)
   let editorOralAppearanceDefinition = $state<OralAppearanceDefinitionV1 | null>(null)
   let editorOralAppearanceState = $state<OralAppearanceStateV1 | null>(null)
+  let editorLipArtworkDefinition = $state<LipArtworkDefinitionV2 | null>(null)
+  let editorLipArtworkState = $state<LipArtworkStateV2 | null>(null)
   let editorFacialArtworkHydrated = $state(false)
   let editorFacialArtworkError = $state('')
   let editorFacialArtworkPackageNotice = $state('')
   let editorFacialArtworkNotice = $state('')
   let editorEyeAppearanceNotice = $state('')
   let editorOralAppearanceNotice = $state('')
+  let editorLipArtworkNotice = $state('')
   let editorFacialArtworkPreviewError = $state('')
   let editorFacialArtworkLoadToken = 0
   let editorFacialArtworkPreviewToken = 0
@@ -9969,6 +10250,7 @@
   let editorFacialArtworkHydrationKey = ''
   let editorFacialArtworkStoredSignature = ''
   const editorFacialArtworkDraftUploads = new Map<string, FacialArtworkUpload>()
+  const editorLipArtworkDraftUploads = new Map<string, LipArtworkUpload>()
 
   function applyStoredFacialArtworkDraft(
     definition: FacialArtworkDefinitionV4,
@@ -10008,6 +10290,19 @@
       : ''
   }
 
+  function applyStoredLipArtworkDraft(
+    definition: LipArtworkDefinitionV2,
+    stored: LipArtworkStateV2 | null | undefined
+  ) {
+    const reconciliation = reconcileLipArtworkState(definition, stored)
+    editorLipArtworkState = reconciliation.state
+      ? structuredClone(reconciliation.state)
+      : null
+    editorLipArtworkNotice = reconciliation.incompatible
+      ? 'Saved Lip Artwork did not match this package definition and was reset to the package artwork.'
+      : ''
+  }
+
   function restorePackageOwnedEditorDrafts(goon: GoonRecord) {
     if (editorAppearanceDialsManifest) {
       const storedDials = goon.appearanceDials ?? null
@@ -10022,7 +10317,8 @@
       editorFacialArtworkStoredSignature = JSON.stringify({
         storedArtwork: goon.facialArtwork ?? null,
         storedEyeAppearance: goon.eyeAppearance ?? null,
-        storedOralAppearance: goon.oralAppearance ?? null
+        storedOralAppearance: goon.oralAppearance ?? null,
+        storedLipArtwork: goon.lipArtwork ?? null
       })
       applyStoredFacialArtworkDraft(
         editorFacialArtworkDefinition,
@@ -10042,6 +10338,9 @@
         editorOralAppearanceDefinition,
         goon.oralAppearance ?? null
       )
+    }
+    if (editorLipArtworkDefinition) {
+      applyStoredLipArtworkDraft(editorLipArtworkDefinition, goon.lipArtwork ?? null)
     }
   }
 
@@ -10082,6 +10381,11 @@
     return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
   }
 
+  function resolveLipArtworkDraftForSave(): LipArtworkStateV2 | null {
+    if (!editorLipArtworkDefinition || !editorLipArtworkState) return null
+    return parseLipArtworkState(editorLipArtworkDefinition, editorLipArtworkState)
+  }
+
   async function deleteFacialArtworkDraft(upload: FacialArtworkUpload) {
     if (!editorGoonId) return
     await deleteGoonFacialArtwork(editorGoonId, upload.filename)
@@ -10103,13 +10407,22 @@
   async function discardFacialArtworkDraftUploads() {
     const goonId = editorGoonId
     const drafts = [...editorFacialArtworkDraftUploads.values()]
+    const lipDrafts = [...editorLipArtworkDraftUploads.values()]
     editorFacialArtworkDraftUploads.clear()
+    editorLipArtworkDraftUploads.clear()
     if (!goonId) return
     for (const upload of drafts) {
       try {
         await deleteGoonFacialArtwork(goonId, upload.filename)
       } catch (error) {
         console.warn('[GoonsSettings] Failed to delete discarded facial-artwork draft:', error)
+      }
+    }
+    for (const upload of lipDrafts) {
+      try {
+        await deleteGoonLipArtwork(goonId, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Failed to delete discarded Lip Artwork draft:', error)
       }
     }
   }
@@ -10132,6 +10445,28 @@
       } catch (error) {
         console.warn('[GoonsSettings] Saved facial artwork, but an unused upload remains:', error)
         toast.warning('Facial Artwork saved, but an unused PNG could not be cleaned up.')
+      }
+    }
+  }
+
+  async function reconcileLipArtworkUploadsAfterSave(
+    previous: LipArtworkStateV2 | null | undefined,
+    saved: LipArtworkStateV2 | null | undefined
+  ) {
+    const retained = saved?.artwork.filename ?? null
+    const candidates = new Map<string, LipArtworkUpload>()
+    if (previous?.artwork) candidates.set(previous.artwork.filename, previous.artwork)
+    for (const upload of editorLipArtworkDraftUploads.values()) {
+      candidates.set(upload.filename, upload)
+    }
+    editorLipArtworkDraftUploads.clear()
+    for (const upload of candidates.values()) {
+      if (upload.filename === retained) continue
+      try {
+        await deleteGoonLipArtwork(editorGoonId!, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Saved Lip Artwork, but an unused upload remains:', error)
+        toast.warning('Lip Artwork saved, but an unused PNG could not be cleaned up.')
       }
     }
   }
@@ -10162,6 +10497,18 @@
       provenance
     })
     editorFacialArtworkDraftUploads.set(upload.filename, upload)
+    return upload
+  }
+
+  async function uploadEditorLipArtwork(file: File, provenance: FacialArtworkProvenance) {
+    if (!editorGoonId || !editorLipArtworkDefinition) {
+      throw new Error('Lip Artwork is not ready for this Goon.')
+    }
+    const upload = await uploadGoonLipArtwork(editorGoonId, file, {
+      definitionSha256: editorLipArtworkDefinition.definitionSha256,
+      provenance
+    })
+    editorLipArtworkDraftUploads.set(upload.filename, upload)
     return upload
   }
 
@@ -10196,9 +10543,35 @@
     editorDirty = true
   }
 
+  function updateEditorLipArtwork(state: LipArtworkStateV2 | null) {
+    const parsed =
+      state && editorLipArtworkDefinition
+        ? parseLipArtworkState(editorLipArtworkDefinition, state)
+        : null
+    if (JSON.stringify(editorLipArtworkState) === JSON.stringify(parsed)) return
+    const detached = editorLipArtworkState?.artwork
+    editorLipArtworkState = parsed
+    editorLipArtworkNotice = ''
+    editorFacialArtworkPreviewError = ''
+    editorDirty = true
+    if (detached && detached.filename !== parsed?.artwork.filename) {
+      const draft = editorLipArtworkDraftUploads.get(detached.filename)
+      if (draft && editorGoonId) {
+        void deleteGoonLipArtwork(editorGoonId, draft.filename)
+          .then(() => editorLipArtworkDraftUploads.delete(draft.filename))
+          .catch((error) =>
+            console.warn('[GoonsSettings] Failed to delete detached Lip Artwork draft:', error)
+          )
+      }
+    }
+  }
+
   function resetEditorOralAppearance(regionId: string) {
-    if (regionId !== 'face.mouth-lips' || !editorOralAppearanceDefinition) return
-    updateEditorOralAppearance(createDefaultOralAppearanceState(editorOralAppearanceDefinition))
+    if (regionId !== 'face.mouth-lips') return
+    if (editorOralAppearanceDefinition) {
+      updateEditorOralAppearance(createDefaultOralAppearanceState(editorOralAppearanceDefinition))
+    }
+    if (editorLipArtworkDefinition) updateEditorLipArtwork(null)
   }
 
   const editorOralAppearanceChangedCount = $derived.by(() => {
@@ -10240,7 +10613,7 @@
         artworkControls,
         eyeControls ?? ''
       ].join(' '),
-      'face.mouth-lips': `Oral Appearance teeth gums tongue ${oralControls ?? ''}`
+      'face.mouth-lips': `Oral Appearance Lip Artwork upload PNG template lip color opacity teeth gums tongue ${oralControls ?? ''}`
     }
   })
 
@@ -10252,11 +10625,13 @@
     const storedArtwork = isCustom ? goon?.facialArtwork ?? null : null
     const storedEyeAppearance = isCustom ? goon?.eyeAppearance ?? null : null
     const storedOralAppearance = isCustom ? goon?.oralAppearance ?? null : null
+    const storedLipArtwork = isCustom ? goon?.lipArtwork ?? null : null
     const storedSocketEyeContact = isCustom ? goon?.defaults?.socketEyeContact ?? null : null
     const storedSignature = JSON.stringify({
       storedArtwork,
       storedEyeAppearance,
       storedOralAppearance,
+      storedLipArtwork,
       storedSocketEyeContact
     })
 
@@ -10271,12 +10646,15 @@
       editorHasSocketEyeContact = false
       editorOralAppearanceDefinition = null
       editorOralAppearanceState = null
+      editorLipArtworkDefinition = null
+      editorLipArtworkState = null
       editorFacialArtworkHydrated = false
       editorFacialArtworkError = ''
       editorFacialArtworkPackageNotice = ''
       editorFacialArtworkNotice = ''
       editorEyeAppearanceNotice = ''
       editorOralAppearanceNotice = ''
+      editorLipArtworkNotice = ''
       editorFacialArtworkPreviewError = ''
       return
     }
@@ -10292,6 +10670,9 @@
       if (editorOralAppearanceDefinition) {
         applyStoredOralAppearanceDraft(editorOralAppearanceDefinition, storedOralAppearance)
       }
+      if (editorLipArtworkDefinition) {
+        applyStoredLipArtworkDraft(editorLipArtworkDefinition, storedLipArtwork)
+      }
       return
     }
 
@@ -10305,12 +10686,15 @@
     editorHasSocketEyeContact = false
     editorOralAppearanceDefinition = null
     editorOralAppearanceState = null
+    editorLipArtworkDefinition = null
+    editorLipArtworkState = null
     editorFacialArtworkHydrated = false
     editorFacialArtworkError = ''
     editorFacialArtworkPackageNotice = ''
     editorFacialArtworkNotice = ''
     editorEyeAppearanceNotice = ''
     editorOralAppearanceNotice = ''
+    editorLipArtworkNotice = ''
     editorFacialArtworkPreviewError = ''
     void (async () => {
       try {
@@ -10339,14 +10723,21 @@
         const oralDefinition = manifest.oralAppearance === undefined
           ? null
           : parseOralAppearanceDefinition(manifest.oralAppearance)
+        const lipDefinition = manifest.lipArtwork === undefined
+          ? null
+          : parseLipArtworkDefinition(manifest.lipArtwork)
         if (token !== editorFacialArtworkLoadToken) return
         editorFacialArtworkDefinition = definition
         editorEyeAppearanceDefinition = eyeDefinition
         editorOralAppearanceDefinition = oralDefinition
+        editorLipArtworkDefinition = lipDefinition
         applyStoredFacialArtworkDraft(definition, storedArtwork)
         applyStoredEyeAppearanceDraft(eyeDefinition, storedEyeAppearance)
         if (oralDefinition) {
           applyStoredOralAppearanceDraft(oralDefinition, storedOralAppearance)
+        }
+        if (lipDefinition) {
+          applyStoredLipArtworkDraft(lipDefinition, storedLipArtwork)
         }
         editorFacialArtworkHydrated = true
       } catch (error) {
@@ -10372,6 +10763,7 @@
       const state = recipePreview.goon.facialArtwork
       const eyeState = recipePreview.goon.eyeAppearance
       const oralState = recipePreview.goon.oralAppearance
+      const lipState = recipePreview.goon.lipArtwork
       if (!state || !eyeState) return
       editorFacialArtworkPreviewTimer = setTimeout(() => {
         editorFacialArtworkPreviewTimer = null
@@ -10379,6 +10771,9 @@
           .then(() => {
             previewEngine!.setEyeAppearanceState(eyeState)
             previewEngine!.setOralAppearanceState(oralState ?? null)
+            return previewEngine!.setLipArtworkState(lipState ?? null)
+          })
+          .then(() => {
             return previewEngine!.setFacialArtworkState(state)
           })
           .catch((error) => {
@@ -10396,12 +10791,16 @@
     const state = editorFacialArtworkState
     const eyeState = editorEyeAppearanceState
     const oralState = editorOralAppearanceState
+    const lipState = editorLipArtworkState
     editorFacialArtworkPreviewTimer = setTimeout(() => {
       editorFacialArtworkPreviewTimer = null
       void Promise.resolve()
         .then(() => {
           previewEngine!.setEyeAppearanceState(eyeState)
           if (oralState) previewEngine!.setOralAppearanceState(oralState)
+          return previewEngine!.setLipArtworkState(lipState)
+        })
+        .then(() => {
           return previewEngine!.setFacialArtworkState(state)
         })
         .then(() => {
@@ -12082,6 +12481,10 @@
         editorFacialArtworkHydrated && editorOralAppearanceDefinition
           ? resolveOralAppearanceDraftForSave()
           : currentGoon?.oralAppearance ?? null
+      const lipArtworkForSave =
+        editorFacialArtworkHydrated && editorLipArtworkDefinition
+          ? resolveLipArtworkDraftForSave()
+          : currentGoon?.lipArtwork ?? null
       const recipeOwnsAppearance = currentGoon?.recipe?.contract === 'goon-recipe/v2'
       const nextName = editorName.trim() || currentGoon?.name || 'Goon'
       const nextDescription = editorDescription?.trim() ?? ''
@@ -12198,6 +12601,13 @@
       ) {
         updates.oralAppearance = oralAppearanceForSave
       }
+      if (
+        !recipeOwnsAppearance &&
+        editorGoonKind === 'custom' &&
+        editorFacialArtworkHydrated && editorLipArtworkDefinition
+      ) {
+        updates.lipArtwork = lipArtworkForSave
+      }
       if (currentGoon?.guidedAvatar) {
         if (stagedAdvancedPackage && advancedPackageDraft) {
           updates.files = {
@@ -12261,6 +12671,10 @@
       await reconcileFacialArtworkUploadsAfterSave(
         currentGoon?.facialArtwork,
         savedGoon.facialArtwork
+      )
+      await reconcileLipArtworkUploadsAfterSave(
+        currentGoon?.lipArtwork,
+        savedGoon.lipArtwork
       )
       editorCueMap = normalizedEditorCueMap
       editorEmojiMap = filteredEmojiMap
@@ -14471,7 +14885,7 @@
                             <div class="space-y-2">
                               <UniversalFaceControlsEditor
                                 presetOptions={currentSemanticExpressionControls()}
-                                getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
+                                getPresetValue={(preset) => getCueExpressionPresetValue(cue.name, preset)}
                                 onPresetChange={(preset, value) =>
                                   updateCueExpressionPreset(cue.name, preset, value)}
                                 model={currentUniversalFaceControlModel()}
@@ -14810,7 +15224,7 @@
                                 {/if}
                                 <UniversalFaceControlsEditor
                                   presetOptions={currentSemanticExpressionControls()}
-                                  getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
+                                  getPresetValue={(preset) => getCueExpressionPresetValue(cue.name, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
                                   model={currentUniversalFaceControlModel()}
@@ -14880,7 +15294,10 @@
                                     <UniversalFaceControlsEditor
                                       presetOptions={currentSemanticExpressionControls()}
                                       getPresetValue={(preset) =>
-                                        getExpressionTargetWeight(step.expressionTargets, preset)}
+                                        getExpressionTargetWeight(
+                                          resolveEditorFaceProfiles(step).portable.expressionTargets,
+                                          preset
+                                        )}
                                       onPresetChange={(preset, value) =>
                                         updateStepExpressionPreset(cue.name, stepIndex, preset, value)}
                                       model={currentUniversalFaceControlModel()}
@@ -15810,6 +16227,11 @@
                         {editorOralAppearanceNotice}
                       </p>
                     {/if}
+                    {#if editorLipArtworkNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorLipArtworkNotice}
+                      </p>
+                    {/if}
                     {#if editorFacialArtworkPreviewError}
                       <p class="batshit-settings-form-error mb-2" role="alert">
                         Live preview failed: {editorFacialArtworkPreviewError}
@@ -15851,15 +16273,19 @@
                       regionContentIds={[
                         'face.brows',
                         'face.eyes',
-                        ...(editorOralAppearanceDefinition && editorOralAppearanceState
+                        ...((editorOralAppearanceDefinition && editorOralAppearanceState) ||
+                        editorLipArtworkDefinition
                           ? ['face.mouth-lips']
                           : [])
                       ]}
                       regionContentControlCounts={{
-                        'face.mouth-lips': editorOralAppearanceDefinition ? 5 : 0
+                        'face.mouth-lips':
+                          (editorOralAppearanceDefinition ? 5 : 0) +
+                          (editorLipArtworkDefinition ? 1 : 0)
                       }}
                       regionContentChangedCounts={{
-                        'face.mouth-lips': editorOralAppearanceChangedCount
+                        'face.mouth-lips':
+                          editorOralAppearanceChangedCount + (editorLipArtworkState ? 1 : 0)
                       }}
                       regionContentSearchText={editorAppearanceRegionContentSearchText}
                       onResetRegionContent={resetEditorOralAppearance}
@@ -15869,13 +16295,28 @@
                           {@render facialArtworkRegion('brows')}
                         {:else if regionId === 'face.eyes'}
                           {@render facialArtworkRegion('eyes')}
-                        {:else if regionId === 'face.mouth-lips' && editorOralAppearanceDefinition && editorOralAppearanceState}
-                          <OralAppearanceEditor
-                            definition={editorOralAppearanceDefinition}
-                            valueState={editorOralAppearanceState}
-                            disabled={editorSaving}
-                            onChange={updateEditorOralAppearance}
-                          />
+                        {:else if regionId === 'face.mouth-lips'}
+                          {#if editorOralAppearanceDefinition && editorOralAppearanceState}
+                            <OralAppearanceEditor
+                              definition={editorOralAppearanceDefinition}
+                              valueState={editorOralAppearanceState}
+                              disabled={editorSaving}
+                              onChange={updateEditorOralAppearance}
+                            />
+                          {/if}
+                          {#if editorLipArtworkDefinition}
+                            <LipArtworkEditor
+                              definition={editorLipArtworkDefinition}
+                              valueState={editorLipArtworkState}
+                              ownerDisplayName={userSettings?.displayName ?? ''}
+                              creditDraft={editorFacialArtworkCreditDraft}
+                              disabled={editorSaving}
+                              onCreditDraftChange={(draft) => (editorFacialArtworkCreditDraft = draft)}
+                              onChange={updateEditorLipArtwork}
+                              onUpload={uploadEditorLipArtwork}
+                              onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
+                            />
+                          {/if}
                         {/if}
                       {/snippet}
                     </AppearanceDialsEditor>
@@ -16738,7 +17179,7 @@
                               <div class="space-y-2">
                                 <UniversalFaceControlsEditor
                                   presetOptions={currentSemanticExpressionControls()}
-                                  getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
+                                  getPresetValue={(preset) => getCueExpressionPresetValue(cue.name, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
                                   model={currentUniversalFaceControlModel()}
@@ -17158,7 +17599,7 @@
                                 {/if}
                                 <UniversalFaceControlsEditor
                                   presetOptions={currentSemanticExpressionControls()}
-                                  getPresetValue={(preset) => getExpressionTargetWeight(cue.expressionTargets, preset)}
+                                  getPresetValue={(preset) => getCueExpressionPresetValue(cue.name, preset)}
                                   onPresetChange={(preset, value) =>
                                     updateCueExpressionPreset(cue.name, preset, value)}
                                   model={currentUniversalFaceControlModel()}
@@ -17228,7 +17669,10 @@
                                       <UniversalFaceControlsEditor
                                         presetOptions={currentSemanticExpressionControls()}
                                         getPresetValue={(preset) =>
-                                          getExpressionTargetWeight(step.expressionTargets, preset)}
+                                          getExpressionTargetWeight(
+                                            resolveEditorFaceProfiles(step).portable.expressionTargets,
+                                            preset
+                                          )}
                                         onPresetChange={(preset, value) =>
                                           updateStepExpressionPreset(cue.name, stepIndex, preset, value)}
                                         model={currentUniversalFaceControlModel()}
@@ -17613,6 +18057,7 @@
 	                        facialArtwork={editorFacialArtworkState}
 	                        eyeAppearance={editorEyeAppearanceState}
 	                        oralAppearance={editorOralAppearanceState}
+	                        lipArtwork={editorLipArtworkState}
 	                        fileTechnicalDetails={{
 	                          packageLabel: currentCustomPackageLabel,
 	                          modelLabel: currentCustomModelLabel,
@@ -17623,6 +18068,7 @@
 	                        onSaveEditorDraft={() =>
 	                          saveCueEditor({ successMessage: null, skipRecipeWorkflow: true })}
 	                        onDiscardEditorDraft={discardCueEditorChanges}
+	                        onDraftPreviewStateChange={handleRecipeEditorDraftPreviewStateChange}
 	                        onPreviewTargetChange={handleRecipeEditorPreviewTargetChange}
 	                        onPreviewLiveCandidate={previewStagedRecipeLiveCandidate}
 	                        autoPrepare={isRecipePreparationRequired(editorGoon)}

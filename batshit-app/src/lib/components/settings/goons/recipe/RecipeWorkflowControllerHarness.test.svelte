@@ -54,6 +54,7 @@
   facialArtwork={null}
   eyeAppearance={null}
   oralAppearance={null}
+  lipArtwork={null}
   onSaveEditorDraft={async () => true}
   onDiscardEditorDraft={discardDraft}
   onRecipeGoonChanged={(next) => { activeGoon = structuredClone(next) }}

@@ -26,7 +26,11 @@ export const UNIVERSAL_FACE_SECTION_ORDER = [
 ] as const
 
 export type UniversalFaceSectionId = (typeof UNIVERSAL_FACE_SECTION_ORDER)[number]
-export type UniversalFaceControlStorage = 'face-control' | 'expression-preset' | 'raw-morph'
+export type UniversalFaceControlStorage =
+  | 'face-control'
+  | 'expression-preset'
+  | 'arkit-channel'
+  | 'raw-morph'
 
 export type UniversalFaceControlDefinition = {
   id: string
@@ -35,6 +39,7 @@ export type UniversalFaceControlDefinition = {
   storage: UniversalFaceControlStorage
   faceControlId?: BatshitFaceControlId
   expressionPreset?: GoonExpressionPreset
+  arkitChannel?: Arkit52Channel
   morphTargets?: string[]
   min: number
   max: number
@@ -181,6 +186,26 @@ function rawControl(
   }
 }
 
+function arkitControl(
+  channel: Arkit52Channel,
+  morphTargets: string[]
+): UniversalFaceControlDefinition {
+  return {
+    id: `arkit:${channel}`,
+    label: formatArkitFaceControlLabel(channel),
+    searchText: `${channel} ${formatArkitFaceControlLabel(channel)} ARKit`,
+    storage: 'arkit-channel',
+    arkitChannel: channel,
+    morphTargets: [...new Set(morphTargets)].sort((left, right) => left.localeCompare(right)),
+    min: 0,
+    max: 1,
+    step: 0.01,
+    bipolar: false,
+    negativeLabel: 'Neutral',
+    positiveLabel: 'Full'
+  }
+}
+
 function expressionControl(
   preset: GoonExpressionPreset,
   label: string
@@ -279,7 +304,7 @@ export function buildUniversalFaceControlModel(
       managedDefinitionIds.add(definition.id)
       append(
         sectionForArkitChannel(channel),
-        rawControl(`arkit:${channel}`, formatArkitFaceControlLabel(channel), definition.morphTargets, 'ARKit')
+        arkitControl(channel, definition.morphTargets)
       )
     }
 
