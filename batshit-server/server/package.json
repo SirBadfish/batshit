@@ -16,10 +16,10 @@
   "dependencies": {
     "@astral-sh/ruff-wasm-nodejs": "^0.15.9",
     "@eslint/js": "^10.0.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@typescript-eslint/eslint-plugin": "^8.58.0",
     "@typescript-eslint/parser": "^8.58.0",
-    "axios": "^1.16.1",
+    "axios": "^1.18.1",
     "cors": "^2.8.6",
     "diff": "^8.0.4",
     "dotenv": "^17.4.1",
@@ -35,14 +35,14 @@
     "jsonc-parser": "^3.3.1",
     "markdownlint": "^0.40.0",
     "minimatch": "^10.2.5",
-    "morgan": "^1.10.0",
+    "morgan": "^1.11.0",
     "multer": "^2.1.1",
     "nanoid": "^3.3.12",
     "postcss-less": "^6.0.0",
     "prettier": "^3.8.1",
     "redis": "^5.11.0",
     "selfsigned": "^5.5.0",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.3",
     "stylelint": "^17.6.0",
     "stylelint-config-standard": "^40.0.0",
     "stylelint-config-standard-scss": "^17.0.0",
@@ -56,7 +56,7 @@
   },
   "overrides": {
     "@babel/core": "^7.29.6",
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^4.2.1"
   },
   "private": true
 }
