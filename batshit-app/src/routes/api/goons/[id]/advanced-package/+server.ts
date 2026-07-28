@@ -40,14 +40,18 @@ async function cleanupCustomPackageFiles(files: Record<string, any> | null) {
     ['goon_custom_models', files?.model?.filename],
     ['goon_custom_manifests', files?.manifest?.filename]
   ] as const
-  await Promise.all(
-    assets.map(async ([uploadType, filename]) => {
-      if (!filename) return
-      await deleteGoonUploadAsset(uploadType, filename).catch((error) => {
-        console.error('[Recipe archive] Failed to clean rejected staged asset:', error)
-      })
-    })
-  )
+  const failures: unknown[] = []
+  await Promise.all(assets.map(async ([uploadType, filename]) => {
+    if (!filename) return
+    try {
+      await deleteGoonUploadAsset(uploadType, filename)
+    } catch (error) {
+      failures.push(error)
+    }
+  }))
+  if (failures.length > 0) {
+    throw new AggregateError(failures, 'Rejected Recipe package assets could not be cleaned completely.')
+  }
 }
 
 async function buildArchiveReceipt(
@@ -168,6 +172,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
         : Boolean(files?.package?.url && files?.model?.url && files?.manifest?.url)
 
     if (!unpackedComplete) {
+      if (profile === 'expert-custom-glb') await cleanupCustomPackageFiles(files)
       return json(
         { error: 'Goon File Package upload failed to return unpacked files.' },
         { status: 500 }
@@ -179,7 +184,14 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       try {
         archiveReceipt = await buildArchiveReceipt(uploadPayload?.archiveExtraction, files)
       } catch (error) {
-        await cleanupCustomPackageFiles(files)
+        try {
+          await cleanupCustomPackageFiles(files)
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            'Recipe archive validation failed and rejected assets could not be cleaned completely.'
+          )
+        }
         throw error
       }
     }
@@ -192,6 +204,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
     })
   } catch (error) {
     console.error('Error uploading Goon File Package:', error)
-    return json({ error: 'Failed to upload Goon File Package' }, { status: 500 })
+    const details = error instanceof Error ? error.message : String(error)
+    return json({ error: `Failed to upload Goon File Package: ${details}` }, { status: 500 })
   }
 }

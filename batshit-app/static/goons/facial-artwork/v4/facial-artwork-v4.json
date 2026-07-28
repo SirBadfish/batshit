@@ -1,0 +1,1233 @@
+{
+  "schemaVersion": "facial-artwork/v4",
+  "stateSchemaVersion": "facial-artwork-state/v4",
+  "status": "product-export-approved",
+  "productExportApproved": true,
+  "definitionSha256": "7239d27baa0cb2ec9e18cb8cbf501243cb304c0a6336f66098847f58b77ec40a",
+  "templateSet": {
+    "id": "batshit-base-f-v3",
+    "version": "3.2.0"
+  },
+  "ownership": {
+    "definition": "immutable-package-template",
+    "recipeState": "mutable-goon-record",
+    "artwork": "recipe-owned-upload",
+    "baseSkinContaminationAllowed": false,
+    "packageArchiveFiles": [
+      "avatar.glb",
+      "avatar.json"
+    ],
+    "uploadCategory": "goon_facial_artwork"
+  },
+  "stateModel": {
+    "roles": "exactly-six",
+    "bilateral": "one shared default plus optional left/right override states",
+    "sharedMirroring": "brows and lashes_eye_outline horizontally mirror shared artwork for the right side",
+    "overrideOwnership": "per-eye override artwork/state belongs to the same six-role record; upload orientation is hash-bound and participates in effective mirroring",
+    "orientationLaw": "effective horizontal mirror is target mirrorU XOR artwork anatomical-right orientation",
+    "cleanBreak": "all pre-v4 Facial Artwork state and upload proof are rejected; installing the current v4 definition explicitly resets the six Facial Artwork roles"
+  },
+  "hashContract": {
+    "algorithm": "sha256",
+    "fileHashes": "exact-bytes",
+    "definitionHash": "canonical-utf8-json-with-definitionSha256-null",
+    "absolutePathsAllowed": false
+  },
+  "provenanceContract": {
+    "required": [
+      "sourceKind",
+      "author",
+      "license",
+      "rightsConfirmed"
+    ],
+    "allowedSourceKinds": [
+      "batshit-original",
+      "user-authored",
+      "comfyui-generated",
+      "approved-external"
+    ],
+    "rightsConfirmedMustBe": true
+  },
+  "rendering": {
+    "canvasAndHighlight": {
+      "transparent": true,
+      "depthTest": true,
+      "depthWrite": false,
+      "renderOrderWorkaroundAllowed": false,
+      "sideLaw": {
+        "brows": "double",
+        "eyeHighlight": "socket-eye-composite-layer",
+        "eyeApertureLinerSide": "front"
+      }
+    },
+    "irisPupilAndSclera": "socket-eye-composite-artwork-with-solid-color-or-uploaded-artwork-per-role",
+    "effectiveAlpha": "texture-alpha-times-tint-alpha-times-opacity",
+    "visibilityPrecedence": "hidden-mode-or-visible-false-disables-role",
+    "highlightComposition": "one-shared-iris-space-layer-projected-continuously-across-iris-and-pupil-below-cornea",
+    "cornea": "unchanged-and-outermost"
+  },
+  "templates": [
+    {
+      "id": "brow-canvas",
+      "version": "3.2.0",
+      "dimensions": [
+        2048,
+        1024
+      ],
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [
+        0.5,
+        0.48
+      ],
+      "pixelContract": {
+        "format": "PNG",
+        "channels": "RGBA8",
+        "colorSpace": "sRGB",
+        "alpha": "straight",
+        "interlaced": false
+      },
+      "guide": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/guides/brow-canvas.png",
+        "sha256": "5791e8694b0e79ece40cd5495c1355f1d1bead1bb631d3852b85b90f4e1790d1"
+      },
+      "safePaintMask": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/masks/brow-canvas.png",
+        "sha256": "46d145ad5ad55f2c7d9af5e020264852dea6361809009561b95a3278ff504890",
+        "channels": "L8",
+        "paintThreshold": 1
+      },
+      "transparentBlank": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/blanks/brow-canvas.png",
+        "sha256": "4bcdef63d128457fffc88607b738fc2371d36074eab1051304d2e59fca988a1d"
+      },
+      "landmarks": {
+        "transformOriginUv": [
+          0.5,
+          0.48
+        ],
+        "innerRootUv": [
+          0.08,
+          0.38
+        ],
+        "archUv": [
+          0.5,
+          0.61
+        ],
+        "outerTipUv": [
+          0.92,
+          0.36
+        ],
+        "safeUvBounds": [
+          0.0,
+          0.145,
+          0.97,
+          0.815
+        ]
+      },
+      "splits": null
+    },
+    {
+      "id": "lashes-eye-outline-canvas",
+      "version": "3.2.0",
+      "dimensions": [
+        2048,
+        1024
+      ],
+      "canonicalOrientation": "anatomical-left",
+      "transformOriginUv": [
+        0.46,
+        0.51
+      ],
+      "pixelContract": {
+        "format": "PNG",
+        "channels": "RGBA8",
+        "colorSpace": "sRGB",
+        "alpha": "straight",
+        "interlaced": false
+      },
+      "guide": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/guides/lashes-eye-outline-canvas.png",
+        "sha256": "f7df83710231a8493cc7af54465633a9da8983d1cad16e77f26e2ef8a90234b3"
+      },
+      "safePaintMask": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/masks/lashes-eye-outline-canvas.png",
+        "sha256": "e6be966c8f01b35d30210f29f009359b74ba1e24caf462ebf97968f0dca47460",
+        "channels": "L8",
+        "paintThreshold": 1
+      },
+      "transparentBlank": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/blanks/lashes-eye-outline-canvas.png",
+        "sha256": "4bcdef63d128457fffc88607b738fc2371d36074eab1051304d2e59fca988a1d"
+      },
+      "landmarks": {
+        "innerCanthusRootUv": [
+          0.18,
+          0.51
+        ],
+        "innerTransitionTipUv": [
+          0.04,
+          0.51
+        ],
+        "outerCanthusRootUv": [
+          0.74,
+          0.51
+        ],
+        "upperWingTipUv": [
+          0.97,
+          0.51
+        ],
+        "lowerWingTipUv": [
+          0.97,
+          0.51
+        ],
+        "upperFarEdgeLimitV": 0.12,
+        "lowerFarEdgeLimitV": 0.88,
+        "innerTransitionEndLocalU": 0.19148936170212766,
+        "outerTransitionStartLocalU": 0.7021276595744681
+      },
+      "splits": {
+        "innerCornerRootX": 0.18,
+        "outerCornerRootX": 0.74,
+        "innerTransitionU": [
+          0.04,
+          0.18
+        ],
+        "outerTransitionU": [
+          0.74,
+          0.97
+        ],
+        "upperRootCurve": "root_v(upper,local_u)",
+        "lowerRootCurve": "root_v(lower,local_u)",
+        "seamBandPixels": 24,
+        "canthusBandPixels": 64,
+        "maximumJoinAlphaDelta": 32
+      },
+      "semanticMap": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/semantic-maps/lashes-eye-outline-canvas.png",
+        "sha256": "9be72cacb81b685808500eca714e15e6c5f6045428d13fba6b378309fc71aec5",
+        "channels": "L8",
+        "palette": {
+          "forbidden": 0,
+          "upper_main": 1,
+          "lower_main": 2,
+          "inner_upper_transition": 3,
+          "inner_lower_transition": 4,
+          "outer_upper_transition": 5,
+          "outer_lower_transition": 6,
+          "upper_wing": 7,
+          "lower_wing": 8
+        }
+      },
+      "mirroredHorizontalVariant": {
+        "orientation": "anatomical-right",
+        "label": "Goon's Right Eye (viewer's left)",
+        "guide": {
+          "path": "goons/facial-artwork/v4/batshit-base-f-v3/guides/lashes-eye-outline-canvas-anatomical-right.png",
+          "sha256": "3401cb374bc8303f0331b6d4d48f00002109b7653038cbe4be9acc9c4c3166f0"
+        },
+        "safePaintMask": {
+          "path": "goons/facial-artwork/v4/batshit-base-f-v3/masks/lashes-eye-outline-canvas-anatomical-right.png",
+          "sha256": "aaf82d18126e1a1f64cb68c9849d96ca5b856949b034da104559ed30f3949f0f",
+          "channels": "L8",
+          "paintThreshold": 1
+        },
+        "semanticMap": {
+          "path": "goons/facial-artwork/v4/batshit-base-f-v3/semantic-maps/lashes-eye-outline-canvas-anatomical-right.png",
+          "sha256": "ac14016c8303188b8819e69db140c914cf8935208c2c617a44fa3d0965eed50d",
+          "channels": "L8",
+          "palette": {
+            "forbidden": 0,
+            "upper_main": 1,
+            "lower_main": 2,
+            "inner_upper_transition": 3,
+            "inner_lower_transition": 4,
+            "outer_upper_transition": 5,
+            "outer_lower_transition": 6,
+            "upper_wing": 7,
+            "lower_wing": 8
+          }
+        }
+      },
+      "orientationReference": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/references/lashes-eye-outline-open-eye-reference.png",
+        "sha256": "220c20b54629340b4dab52930d8fdc8ac9221bd7b02a88ef18fdcbab3c7168ca"
+      }
+    },
+    {
+      "id": "iris-radial",
+      "version": "3.2.0",
+      "dimensions": [
+        1024,
+        1024
+      ],
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [
+        0.5,
+        0.5
+      ],
+      "pixelContract": {
+        "format": "PNG",
+        "channels": "RGBA8",
+        "colorSpace": "sRGB",
+        "alpha": "straight",
+        "interlaced": false
+      },
+      "guide": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/guides/iris-radial.png",
+        "sha256": "94689f13af63ad4abd0ef4ace78b71d286a3d7c16542df62f3172158bc13d400"
+      },
+      "safePaintMask": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/masks/iris-radial.png",
+        "sha256": "ea52dbe173f287c5c3ac5328a9d4c77a3970eabd140cce186147e7048e9f2bdd",
+        "channels": "L8",
+        "paintThreshold": 1
+      },
+      "transparentBlank": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/blanks/iris-radial.png",
+        "sha256": "3ddb05f1efd47dc4209b7fecb4b698217dbe4f3af604557214d8f9f621968ba4"
+      },
+      "landmarks": {
+        "centerUv": [
+          0.5,
+          0.5
+        ],
+        "safeRadiusUv": 0.485,
+        "artRadiusUv": 0.44
+      },
+      "splits": null
+    },
+    {
+      "id": "pupil-radial",
+      "version": "3.2.0",
+      "dimensions": [
+        1024,
+        1024
+      ],
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [
+        0.5,
+        0.5
+      ],
+      "pixelContract": {
+        "format": "PNG",
+        "channels": "RGBA8",
+        "colorSpace": "sRGB",
+        "alpha": "straight",
+        "interlaced": false
+      },
+      "guide": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/guides/pupil-radial.png",
+        "sha256": "5f77e5a09228188804cb01388972343e194e0272e94144c8a107b0a9b3669994"
+      },
+      "safePaintMask": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/masks/pupil-radial.png",
+        "sha256": "ea52dbe173f287c5c3ac5328a9d4c77a3970eabd140cce186147e7048e9f2bdd",
+        "channels": "L8",
+        "paintThreshold": 1
+      },
+      "transparentBlank": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/blanks/pupil-radial.png",
+        "sha256": "3ddb05f1efd47dc4209b7fecb4b698217dbe4f3af604557214d8f9f621968ba4"
+      },
+      "landmarks": {
+        "centerUv": [
+          0.5,
+          0.5
+        ],
+        "safeRadiusUv": 0.485,
+        "artRadiusUv": 0.42
+      },
+      "splits": null
+    },
+    {
+      "id": "eye-highlight-radial",
+      "version": "3.2.0",
+      "dimensions": [
+        1024,
+        1024
+      ],
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [
+        0.5,
+        0.5
+      ],
+      "pixelContract": {
+        "format": "PNG",
+        "channels": "RGBA8",
+        "colorSpace": "sRGB",
+        "alpha": "straight",
+        "interlaced": false
+      },
+      "guide": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/guides/eye-highlight-radial.png",
+        "sha256": "4e0c19e7214f24b973142d1cb8c35482536ce19fb3a67cad4e79e93e76518c99"
+      },
+      "safePaintMask": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/masks/eye-highlight-radial.png",
+        "sha256": "a139c387e270be57f5d3cfbb43f1cbbec06da53bea0813765c2ede10b88d6315",
+        "channels": "L8",
+        "paintThreshold": 1
+      },
+      "transparentBlank": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/blanks/eye-highlight-radial.png",
+        "sha256": "3ddb05f1efd47dc4209b7fecb4b698217dbe4f3af604557214d8f9f621968ba4"
+      },
+      "landmarks": {
+        "centerUv": [
+          0.5,
+          0.5
+        ],
+        "safeRadiusUv": 0.46
+      },
+      "splits": null
+    },
+    {
+      "id": "sclera-equirectangular",
+      "version": "3.2.0",
+      "dimensions": [
+        2048,
+        1024
+      ],
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [
+        0.5,
+        0.5
+      ],
+      "pixelContract": {
+        "format": "PNG",
+        "channels": "RGBA8",
+        "colorSpace": "sRGB",
+        "alpha": "straight",
+        "interlaced": false
+      },
+      "guide": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/guides/sclera-equirectangular.png",
+        "sha256": "634d2e0c39996f0b52e19d3e29e0ac8583ce781c5ce39fe89c4c085713bfc223"
+      },
+      "safePaintMask": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/masks/sclera-equirectangular.png",
+        "sha256": "d358a9a73056ab7e3278c1b378c92e290eb1cb3f081b6bc7c0c39dc5837fdbf1",
+        "channels": "L8",
+        "paintThreshold": 1
+      },
+      "transparentBlank": {
+        "path": "goons/facial-artwork/v4/batshit-base-f-v3/blanks/sclera-equirectangular.png",
+        "sha256": "4bcdef63d128457fffc88607b738fc2371d36074eab1051304d2e59fca988a1d"
+      },
+      "landmarks": {
+        "frontCenterUv": [
+          0.5,
+          0.5
+        ],
+        "equatorV": 0.5,
+        "safeV": [
+          0.05,
+          0.95
+        ]
+      },
+      "splits": {
+        "wrapU": true,
+        "poleGuardV": [
+          0.05,
+          0.95
+        ]
+      }
+    }
+  ],
+  "roles": [
+    {
+      "id": "brows",
+      "template": "brow-canvas",
+      "ownership": "canvas",
+      "geometryOwnership": "conformal-face-canvas",
+      "mapping": "planar",
+      "artworkScaleCalibration": 0.8,
+      "target": {
+        "left": {
+          "runtimeNodes": [
+            "bs_f1_brow_canvas_l"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "face-conformal-canvas",
+          "compositeLayer": null
+        },
+        "right": {
+          "runtimeNodes": [
+            "bs_f1_brow_canvas_r"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "face-conformal-canvas",
+          "compositeLayer": null
+        }
+      },
+      "defaultMode": "shared",
+      "defaultEyeState": {
+        "visible": false,
+        "baseColor": null,
+        "artwork": null
+      },
+      "side": "bilateral-shared-with-overrides",
+      "modes": [
+        "artwork",
+        "hidden"
+      ],
+      "defaultState": {
+        "mode": "hidden",
+        "transform": {
+          "translateU": 0.0,
+          "translateV": 0.0,
+          "scale": 1.0,
+          "rotationDegrees": 0.0
+        },
+        "tint": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "opacity": 1.0,
+        "visible": false,
+        "perEyeOverrides": {
+          "left": null,
+          "right": null
+        },
+        "symmetry": "shared-mirrored"
+      },
+      "symmetry": {
+        "default": "shared-mirrored",
+        "allowed": [
+          "shared-mirrored",
+          "per-eye-overrides"
+        ],
+        "rightSharedOperation": "anatomical-mirror-from-side-uv"
+      },
+      "bounds": {
+        "translateU": [
+          -0.24,
+          0.24
+        ],
+        "translateV": [
+          -0.36,
+          0.36
+        ],
+        "scale": [
+          0.6,
+          1.4
+        ],
+        "rotationDegrees": [
+          -40,
+          40
+        ]
+      },
+      "submissionBounds": {
+        "translateU": [
+          -0.24,
+          0.24
+        ],
+        "translateV": [
+          -0.36,
+          0.36
+        ],
+        "scale": [
+          0.6,
+          1.4
+        ],
+        "rotationDegrees": [
+          -40,
+          40
+        ]
+      }
+    },
+    {
+      "id": "lashes_eye_outline",
+      "template": "lashes-eye-outline-canvas",
+      "ownership": "canvas",
+      "geometryOwnership": "shared-eye-aperture-liner",
+      "mapping": "planar",
+      "artworkScaleCalibration": 1.0,
+      "target": {
+        "left": {
+          "runtimeNodes": [
+            "bs_f1_eye_treatment_canvas_l"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "eye-aperture-liner",
+          "compositeLayer": null
+        },
+        "right": {
+          "runtimeNodes": [
+            "bs_f1_eye_treatment_canvas_r"
+          ],
+          "mirrorU": true,
+          "mirrorV": false,
+          "bindingKind": "eye-aperture-liner",
+          "compositeLayer": null
+        }
+      },
+      "defaultMode": "shared",
+      "defaultEyeState": {
+        "visible": false,
+        "baseColor": null,
+        "artwork": null
+      },
+      "side": "bilateral-shared-with-overrides",
+      "modes": [
+        "artwork",
+        "hidden"
+      ],
+      "defaultState": {
+        "mode": "hidden",
+        "transform": {
+          "translateU": 0.0,
+          "translateV": 0.0,
+          "scale": 1.0,
+          "rotationDegrees": 0.0
+        },
+        "tint": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "opacity": 1.0,
+        "visible": false,
+        "perEyeOverrides": {
+          "left": null,
+          "right": null
+        },
+        "symmetry": "shared-mirrored"
+      },
+      "symmetry": {
+        "default": "shared-mirrored",
+        "allowed": [
+          "shared-mirrored",
+          "per-eye-overrides"
+        ],
+        "rightSharedOperation": "horizontal-texture-mirror"
+      },
+      "bounds": {
+        "translateU": [
+          -0.04,
+          0.04
+        ],
+        "translateV": [
+          -0.08,
+          0.08
+        ],
+        "scale": [
+          0.85,
+          1.15
+        ],
+        "rotationDegrees": [
+          -8,
+          8
+        ]
+      },
+      "submissionBounds": {
+        "translateU": [
+          -0.04,
+          0.04
+        ],
+        "translateV": [
+          -0.08,
+          0.08
+        ],
+        "scale": [
+          0.85,
+          1.15
+        ],
+        "rotationDegrees": [
+          -8,
+          8
+        ]
+      }
+    },
+    {
+      "id": "iris",
+      "template": "iris-radial",
+      "ownership": "lit-surface",
+      "geometryOwnership": "socket-eye-composite-layer",
+      "mapping": "radial",
+      "artworkScaleCalibration": 1.15,
+      "target": {
+        "left": {
+          "runtimeNodes": [
+            "bs_f1_eye_l_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "iris"
+        },
+        "right": {
+          "runtimeNodes": [
+            "bs_f1_eye_r_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "iris"
+        }
+      },
+      "defaultMode": "shared",
+      "defaultEyeState": {
+        "visible": true,
+        "baseColor": [
+          0.035,
+          0.42,
+          0.34
+        ],
+        "artwork": null
+      },
+      "side": "bilateral-shared-with-overrides",
+      "modes": [
+        "solid",
+        "artwork"
+      ],
+      "defaultState": {
+        "mode": "solid",
+        "transform": {
+          "translateU": 0.0,
+          "translateV": 0.0,
+          "scale": 1.0,
+          "rotationDegrees": 0.0
+        },
+        "tint": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "opacity": 1.0,
+        "visible": true,
+        "perEyeOverrides": {
+          "left": null,
+          "right": null
+        },
+        "symmetry": "shared"
+      },
+      "symmetry": {
+        "default": "shared",
+        "allowed": [
+          "shared",
+          "per-eye-overrides"
+        ]
+      },
+      "bounds": {
+        "translateU": [
+          -0.15,
+          0.15
+        ],
+        "translateV": [
+          -0.15,
+          0.15
+        ],
+        "scale": [
+          0.5,
+          1.5
+        ],
+        "rotationDegrees": [
+          -180,
+          180
+        ]
+      },
+      "submissionBounds": {
+        "translateU": [
+          -0.15,
+          0.15
+        ],
+        "translateV": [
+          -0.15,
+          0.15
+        ],
+        "scale": [
+          0.5,
+          1.5
+        ],
+        "rotationDegrees": [
+          -180,
+          180
+        ]
+      }
+    },
+    {
+      "id": "pupil",
+      "template": "pupil-radial",
+      "ownership": "lit-surface",
+      "geometryOwnership": "socket-eye-composite-layer",
+      "mapping": "radial",
+      "artworkScaleCalibration": 1.2,
+      "target": {
+        "left": {
+          "runtimeNodes": [
+            "bs_f1_eye_l_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "pupil"
+        },
+        "right": {
+          "runtimeNodes": [
+            "bs_f1_eye_r_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "pupil"
+        }
+      },
+      "defaultMode": "shared",
+      "defaultEyeState": {
+        "visible": true,
+        "baseColor": [
+          0.008,
+          0.009,
+          0.012
+        ],
+        "artwork": null
+      },
+      "side": "bilateral-shared-with-overrides",
+      "modes": [
+        "solid",
+        "artwork"
+      ],
+      "defaultState": {
+        "mode": "solid",
+        "transform": {
+          "translateU": 0.0,
+          "translateV": 0.0,
+          "scale": 1.0,
+          "rotationDegrees": 0.0
+        },
+        "tint": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "opacity": 1.0,
+        "visible": true,
+        "perEyeOverrides": {
+          "left": null,
+          "right": null
+        },
+        "symmetry": "shared"
+      },
+      "symmetry": {
+        "default": "shared",
+        "allowed": [
+          "shared",
+          "per-eye-overrides"
+        ]
+      },
+      "bounds": {
+        "translateU": [
+          -0.15,
+          0.15
+        ],
+        "translateV": [
+          -0.15,
+          0.15
+        ],
+        "scale": [
+          0.5,
+          1.5
+        ],
+        "rotationDegrees": [
+          -180,
+          180
+        ]
+      },
+      "submissionBounds": {
+        "translateU": [
+          -0.15,
+          0.15
+        ],
+        "translateV": [
+          -0.15,
+          0.15
+        ],
+        "scale": [
+          0.5,
+          1.5
+        ],
+        "rotationDegrees": [
+          -180,
+          180
+        ]
+      }
+    },
+    {
+      "id": "eye_highlight",
+      "template": "eye-highlight-radial",
+      "ownership": "lit-overlay",
+      "geometryOwnership": "socket-eye-composite-layer",
+      "mapping": "radial",
+      "artworkScaleCalibration": 1.0,
+      "target": {
+        "left": {
+          "runtimeNodes": [
+            "bs_f1_eye_l_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "highlight"
+        },
+        "right": {
+          "runtimeNodes": [
+            "bs_f1_eye_r_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "highlight"
+        }
+      },
+      "defaultMode": "shared",
+      "defaultEyeState": {
+        "visible": false,
+        "baseColor": null,
+        "artwork": null
+      },
+      "side": "bilateral-shared-with-overrides",
+      "modes": [
+        "hidden",
+        "artwork"
+      ],
+      "defaultState": {
+        "mode": "hidden",
+        "transform": {
+          "translateU": 0.0,
+          "translateV": 0.0,
+          "scale": 1.0,
+          "rotationDegrees": 0.0
+        },
+        "tint": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "opacity": 1.0,
+        "visible": false,
+        "perEyeOverrides": {
+          "left": null,
+          "right": null
+        },
+        "symmetry": "shared"
+      },
+      "symmetry": {
+        "default": "shared",
+        "allowed": [
+          "shared",
+          "per-eye-overrides"
+        ]
+      },
+      "bounds": {
+        "translateU": [
+          -0.15,
+          0.15
+        ],
+        "translateV": [
+          -0.15,
+          0.15
+        ],
+        "scale": [
+          0.5,
+          1.5
+        ],
+        "rotationDegrees": [
+          -180,
+          180
+        ]
+      },
+      "submissionBounds": {
+        "translateU": [
+          -0.15,
+          0.15
+        ],
+        "translateV": [
+          -0.15,
+          0.15
+        ],
+        "scale": [
+          0.5,
+          1.5
+        ],
+        "rotationDegrees": [
+          -180,
+          180
+        ]
+      }
+    },
+    {
+      "id": "sclera",
+      "template": "sclera-equirectangular",
+      "ownership": "lit-surface",
+      "geometryOwnership": "socket-eye-composite-layer",
+      "mapping": "longitude",
+      "artworkScaleCalibration": 1.0,
+      "target": {
+        "left": {
+          "runtimeNodes": [
+            "bs_f1_eye_l_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "scleraArtwork"
+        },
+        "right": {
+          "runtimeNodes": [
+            "bs_f1_eye_r_composite_cap"
+          ],
+          "mirrorU": false,
+          "mirrorV": false,
+          "bindingKind": "socket-eye-composite-layer",
+          "compositeLayer": "scleraArtwork"
+        }
+      },
+      "defaultMode": "shared",
+      "defaultEyeState": {
+        "visible": true,
+        "baseColor": [
+          0.82,
+          0.79,
+          0.74
+        ],
+        "artwork": null
+      },
+      "side": "bilateral-shared-with-overrides",
+      "modes": [
+        "solid",
+        "artwork"
+      ],
+      "defaultState": {
+        "mode": "solid",
+        "transform": {
+          "translateU": 0.0,
+          "translateV": 0.0,
+          "scale": 1.0,
+          "rotationDegrees": 0.0
+        },
+        "tint": [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        "opacity": 1.0,
+        "visible": true,
+        "perEyeOverrides": {
+          "left": null,
+          "right": null
+        },
+        "symmetry": "shared"
+      },
+      "symmetry": {
+        "default": "shared",
+        "allowed": [
+          "shared",
+          "per-eye-overrides"
+        ]
+      },
+      "bounds": {
+        "longitudeDegrees": [
+          -180,
+          180
+        ]
+      },
+      "submissionBounds": {
+        "translateU": [
+          -0.15,
+          0.15
+        ],
+        "translateV": [
+          -0.15,
+          0.15
+        ],
+        "scale": [
+          0.75,
+          1.25
+        ],
+        "rotationDegrees": [
+          -180,
+          180
+        ]
+      }
+    }
+  ],
+  "topologyFreeze": {
+    "acceptedInputSha256": "267eab87f1dec32d0870e59312926a553a5bf84f23dd19cdfadfee985bc90a83",
+    "acceptedProofBlendSha256": "87e5679d1d16002074823755d5158c866bae16e8d7b7d4bd862261b2968ece99",
+    "acceptedProofReportSha256": "c17cd0bd737f9f3420719d85422a57a2f49d1739823cbd3a6bdeb8a6adecb6e8",
+    "generatorDependencies": [
+      {
+        "id": "canvas-proof-builder",
+        "sha256": "706fa12bd92ef69b9038ad8b6e0009722c1bc5130ad0bfdf5ac5f1fe3c545512"
+      },
+      {
+        "id": "candidate-helper",
+        "sha256": "203a322bc7253a01ecdd6329ea42b3986f963d80a1a7b1d19149cfd88451383f"
+      },
+      {
+        "id": "facial-artwork-follower-helper",
+        "sha256": "b653f1e49ecda0f28c7c5903a5a0aa04b47396ae41baee9ad444119da3a096d6"
+      },
+      {
+        "id": "paired-brow-geometry-helper",
+        "sha256": "1d019df88f3ed7c575b233f39c4cf75352fc56eb4b1bd352ff6ce59a6ee45e31"
+      },
+      {
+        "id": "socket-eye-liner-assets/v1",
+        "sha256": "374498bd3f4732d9051665b35eb39756a6097d567d3085200fc3bae88cb82a94"
+      }
+    ],
+    "nodes": [
+      {
+        "authoringNode": "BS_BrowCanvas_L",
+        "runtimeNode": "bs_f1_brow_canvas_l",
+        "role": "brows",
+        "side": "left",
+        "evidenceId": "brows_left",
+        "v1EvidenceId": "brow_left",
+        "vertexCount": 1536,
+        "faceCount": 1449,
+        "connectedComponents": 1,
+        "zeroAreaFaceCount": 0,
+        "normalOffsetMeters": 0.00035,
+        "lowerLiftMeters": 0.0065,
+        "verticalSpanMeters": 0.0195,
+        "outerOffsetMeters": -0.00165,
+        "outerRecessMeters": 0.02,
+        "outwardExpansionRatio": 0.3,
+        "uvOuterExtent": 1.3,
+        "uvDensityLaw": "pre-expansion-physical-pixel-density-preserved-from-centerline",
+        "outerReachMeters": 0.059139993,
+        "averageSurfaceArcMeters": 0.079617314,
+        "prior120AverageSurfaceArcMeters": 0.0731662,
+        "geometryAndUvSha256": "8c96c3eb55bf47678b00b4bb96ed284e261b8445032a1800f989a82463198be1",
+        "bindingsSha256": "5822fe4cd11eeb080fa24270d251015e38204ce89daa0600f838b2d3254f490d",
+        "bindingCount": 1536,
+        "bindingRecordsFrozen": true,
+        "bindingLaw": "shared-centerline-column-with-side-specific-conformal-forehead-projection",
+        "innerEdge": "u-zero-columns-share-identical-neutral-vertices-and-frozen-bindings",
+        "outerEdge": "temple-only-130-percent-authoring-width-with-restrained-conformal-temple-follow",
+        "frontSideWinding": "canonical-grid-source-preserved",
+        "geometryRecords": {
+          "sha256": "ba8479b1f03f2e7207c110d7a0db43d7b7501842a5cc72a41c802779351295a8",
+          "canonicalGeometryAndUvSha256": "8c96c3eb55bf47678b00b4bb96ed284e261b8445032a1800f989a82463198be1"
+        },
+        "bindingRecords": {
+          "sha256": "6f2aea431e8dcd1abc4f79818fc4d34f92c9f0f6eeac9e5a836c3db0a6ae816e",
+          "canonicalRecordsSha256": "5822fe4cd11eeb080fa24270d251015e38204ce89daa0600f838b2d3254f490d"
+        }
+      },
+      {
+        "authoringNode": "BS_BrowCanvas_R",
+        "runtimeNode": "bs_f1_brow_canvas_r",
+        "role": "brows",
+        "side": "right",
+        "evidenceId": "brows_right",
+        "v1EvidenceId": "brow_right",
+        "vertexCount": 1536,
+        "faceCount": 1449,
+        "connectedComponents": 1,
+        "zeroAreaFaceCount": 0,
+        "normalOffsetMeters": 0.00035,
+        "lowerLiftMeters": 0.0065,
+        "verticalSpanMeters": 0.0195,
+        "outerOffsetMeters": -0.00165,
+        "outerRecessMeters": 0.02,
+        "outwardExpansionRatio": 0.3,
+        "uvOuterExtent": 1.3,
+        "uvDensityLaw": "pre-expansion-physical-pixel-density-preserved-from-centerline",
+        "outerReachMeters": 0.059058856,
+        "averageSurfaceArcMeters": 0.079359315,
+        "prior120AverageSurfaceArcMeters": 0.072995265,
+        "geometryAndUvSha256": "9a131159fbee54c7b0755f1f6b6327e415d5d2641c0b1e6dbb926b50d87e205e",
+        "bindingsSha256": "af373ea062387afc87a4ade7272f699e7ceaec3a5fa4ee805a1f183a739af04d",
+        "bindingCount": 1536,
+        "bindingRecordsFrozen": true,
+        "bindingLaw": "shared-centerline-column-with-side-specific-conformal-forehead-projection",
+        "innerEdge": "u-zero-columns-share-identical-neutral-vertices-and-frozen-bindings",
+        "outerEdge": "temple-only-130-percent-authoring-width-with-restrained-conformal-temple-follow",
+        "frontSideWinding": "each-polygon-and-matching-uv-loop-slice-reversed",
+        "geometryRecords": {
+          "sha256": "88390e177215efa189177d1e4bf4fbe7a1866c3071c00f4e495c917b5bed12fa",
+          "canonicalGeometryAndUvSha256": "9a131159fbee54c7b0755f1f6b6327e415d5d2641c0b1e6dbb926b50d87e205e"
+        },
+        "bindingRecords": {
+          "sha256": "3cf922686633bca1abc470cbd454e20e009fb071c183745b64c2f058740f163f",
+          "canonicalRecordsSha256": "af373ea062387afc87a4ade7272f699e7ceaec3a5fa4ee805a1f183a739af04d"
+        }
+      },
+      {
+        "schemaVersion": "socket-eye-liner-topology-evidence/v1",
+        "role": "lashes_eye_outline",
+        "side": "left",
+        "authoringNode": "BS_EyeTreatmentCanvas_L",
+        "runtimeNode": "bs_f1_eye_treatment_canvas_l",
+        "geometryOwnership": "shared-eye-aperture-liner",
+        "bindingLaw": "shared-aperture-seam-face-conformal-root-bindings",
+        "assetManifestSha256": "374498bd3f4732d9051665b35eb39756a6097d567d3085200fc3bae88cb82a94",
+        "bindingsSha256": "3afce687d28705ca8ac575d43074e0c9541970430de9dffa2fa85fc631c46bbf",
+        "geometryAndUvSha256": "cb14fe6e62a57689677c48cf7ba805540030d15172da703a20192e91d7b8d271",
+        "bindingCount": 1536,
+        "vertexCount": 1536,
+        "faceCount": 2820,
+        "uvLoopCount": 8460,
+        "connectedComponents": 2,
+        "surfaceClearanceMeters": 0.00032,
+        "innerOverlapMeters": 0.00085,
+        "baseForwardPitchDegrees": 0.0,
+        "frontSideWinding": "canonical-front-side-shared-aperture-liner",
+        "ordinaryDepthTest": true,
+        "visibleLidRimAllowed": false
+      },
+      {
+        "schemaVersion": "socket-eye-liner-topology-evidence/v1",
+        "role": "lashes_eye_outline",
+        "side": "right",
+        "authoringNode": "BS_EyeTreatmentCanvas_R",
+        "runtimeNode": "bs_f1_eye_treatment_canvas_r",
+        "geometryOwnership": "shared-eye-aperture-liner",
+        "bindingLaw": "shared-aperture-seam-face-conformal-root-bindings",
+        "assetManifestSha256": "374498bd3f4732d9051665b35eb39756a6097d567d3085200fc3bae88cb82a94",
+        "bindingsSha256": "9373b257931f9e3fe6fb33d8915d9d58d7bd272983a21a2c7ae260438cd0040e",
+        "geometryAndUvSha256": "41e0a8c428d49aa1a840b75c4f6e3ded4d3e7ddf27d816a87e6d9c1e66ba668f",
+        "bindingCount": 1536,
+        "vertexCount": 1536,
+        "faceCount": 2820,
+        "uvLoopCount": 8460,
+        "connectedComponents": 2,
+        "surfaceClearanceMeters": 0.00032,
+        "innerOverlapMeters": 0.00085,
+        "baseForwardPitchDegrees": 0.0,
+        "frontSideWinding": "canonical-front-side-shared-aperture-liner",
+        "ordinaryDepthTest": true,
+        "visibleLidRimAllowed": false
+      }
+    ],
+    "openDependency": "The product-export-approved v4 topology is frozen to the hash-bound socket-eye composite cap, shared-seam liner, Recipe state, and accepted identity-extreme evidence."
+  },
+  "dependencies": {
+    "eyeAppearance": {
+      "schemaVersion": "eye-appearance/v3",
+      "definitionSha256": "90df1dad9791a10969feb81f6e227dd9088449c25715d49143b624a7132737e8"
+    },
+    "socketEyeSurface": {
+      "schemaVersion": "socket-eye-surface/v1",
+      "definitionSha256": "cf946c62c8b81158b96692e99fa8eb9d40cc9e540f2981f18b26fb4f12748f12"
+    },
+    "eyeApertureSeam": {
+      "schemaVersion": "eye-aperture-seam/v1",
+      "definitionSha256": "84c07b601e0d6d6093666f813bb0ee09ad1d09393c3f0d6900682a89d3803949"
+    }
+  }
+}

@@ -5,7 +5,7 @@ import { downloadBlob } from "$lib/utils/download";
 import {
   FACIAL_ARTWORK_ROLE_IDS,
   createDefaultFacialArtworkState,
-  type FacialArtworkDefinitionV3,
+  type FacialArtworkDefinitionV4,
   type FacialArtworkRoleDefinition,
 } from "$lib/goons/facialArtwork";
 import { setFacialArtworkRoleMode } from "$lib/goons/facialArtwork.editor";
@@ -17,7 +17,7 @@ import {
   EYE_APPEARANCE_CONTROL_IDS,
   createDefaultEyeAppearanceState,
   type EyeAppearanceControlDefinition,
-  type EyeAppearanceDefinitionV1,
+  type EyeAppearanceDefinitionV3,
 } from "$lib/goons/eyeAppearance";
 
 vi.mock("$lib/utils/download", () => ({
@@ -55,7 +55,7 @@ if (typeof Element !== "undefined" && typeof Element.prototype.animate !== "func
 
 const HASH = "a".repeat(64);
 
-function buildFacialArtworkDefinition(): FacialArtworkDefinitionV3 {
+function buildFacialArtworkDefinition(): FacialArtworkDefinitionV4 {
   const roleDefinitions = FACIAL_ARTWORK_ROLE_IDS.map((id) => {
     const mapping =
       id === "sclera"
@@ -81,6 +81,21 @@ function buildFacialArtworkDefinition(): FacialArtworkDefinitionV3 {
             ? "canvas"
             : "lit-surface",
       mapping,
+      bindingKind:
+        id === "brows"
+          ? "face-conformal-canvas"
+          : id === "lashes_eye_outline"
+            ? "eye-aperture-liner"
+            : "socket-eye-composite-layer",
+      ...(id === "sclera"
+        ? { compositeLayer: "scleraArtwork" as const }
+        : id === "iris"
+          ? { compositeLayer: "iris" as const }
+          : id === "pupil"
+            ? { compositeLayer: "pupil" as const }
+            : id === "eye_highlight"
+              ? { compositeLayer: "highlight" as const }
+              : {}),
       target: {
         left: { runtimeNodes: [`${id}_left`], mirrorU: false, mirrorV: false },
         right: {
@@ -108,25 +123,31 @@ function buildFacialArtworkDefinition(): FacialArtworkDefinitionV3 {
   });
 
   return {
-    schemaVersion: "facial-artwork/v3",
-    stateSchemaVersion: "facial-artwork-state/v3",
-    productExportApproved: false,
+    schemaVersion: "facial-artwork/v4",
+    stateSchemaVersion: "facial-artwork-state/v4",
+    status: "product-export-approved",
+    productExportApproved: true,
     definitionSha256: HASH,
+    dependencies: {
+      eyeAppearance: { schemaVersion: "eye-appearance/v3", definitionSha256: HASH },
+      socketEyeSurface: { schemaVersion: "socket-eye-surface/v1", definitionSha256: HASH },
+      eyeApertureSeam: { schemaVersion: "eye-aperture-seam/v1", definitionSha256: HASH },
+    },
     templateSet: { id: "test", version: "2.0.0" },
     templates: FACIAL_ARTWORK_ROLE_IDS.map((id) => ({
       id: `${id}_template`,
       version: "2.0.0",
       dimensions: [1024, 1024],
       guide: {
-        path: `goons/facial-artwork/v3/${id}/guide-left.png`,
+        path: `goons/facial-artwork/v4/${id}/guide-left.png`,
         sha256: HASH,
       },
       safePaintMask: {
-        path: `goons/facial-artwork/v3/${id}/mask-left.png`,
+        path: `goons/facial-artwork/v4/${id}/mask-left.png`,
         sha256: HASH,
       },
       transparentBlank: {
-        path: `goons/facial-artwork/v3/${id}/blank.png`,
+        path: `goons/facial-artwork/v4/${id}/blank.png`,
         sha256: HASH,
       },
       canonicalOrientation:
@@ -140,11 +161,11 @@ function buildFacialArtworkDefinition(): FacialArtworkDefinitionV3 {
               orientation: "anatomical-right" as const,
               label: "Goon's Right Eye (viewer's left)",
               guide: {
-                path: `goons/facial-artwork/v3/${id}/guide-right.png`,
+                path: `goons/facial-artwork/v4/${id}/guide-right.png`,
                 sha256: HASH,
               },
               safePaintMask: {
-                path: `goons/facial-artwork/v3/${id}/mask-right.png`,
+                path: `goons/facial-artwork/v4/${id}/mask-right.png`,
                 sha256: HASH,
               },
             },
@@ -153,7 +174,7 @@ function buildFacialArtworkDefinition(): FacialArtworkDefinitionV3 {
       ...(id === "lashes_eye_outline"
         ? {
             orientationReference: {
-              path: "goons/facial-artwork/v3/lashes_eye_outline/open-eye-reference.png",
+              path: "goons/facial-artwork/v4/lashes_eye_outline/open-eye-reference.png",
               sha256: HASH,
             },
           }
@@ -163,16 +184,11 @@ function buildFacialArtworkDefinition(): FacialArtworkDefinitionV3 {
   };
 }
 
-function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV1 {
+function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV3 {
   const labels: Record<(typeof EYE_APPEARANCE_CONTROL_IDS)[number], string> = {
     iris_size: "Iris Size",
     pupil_size: "Pupil Size",
-    eye_convergence: "Eye Convergence (Gaze)",
-    sclera_scale: "Sclera Scale",
-    sclera_tilt: "Sclera Tilt",
-    sclera_horizontal_position: "Sclera Horizontal Position",
-    sclera_vertical_position: "Sclera Vertical Position",
-    sclera_depth: "Sclera Depth",
+    iris_vertical_position: "Iris Vertical Position",
   };
   const controls = EYE_APPEARANCE_CONTROL_IDS.map((id) => {
     const sizeRange =
@@ -187,8 +203,13 @@ function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV1 {
       description: `${labels[id]} test description`,
       ...sizeRange,
       step: 0.01,
-      runtimeNeutralOffset: id === "eye_convergence" ? 4 : 0,
-      unit: id === "pupil_size" ? "iris-relative-multiplier" : "post-fit-multiplier-offset",
+      runtimeNeutralOffset: 0,
+      unit:
+        id === "pupil_size"
+          ? "iris-relative-multiplier"
+          : id === "iris_vertical_position"
+            ? "neutral-travel-fraction"
+            : "neutral-multiplier",
       linkedBilateral: true,
       perEyeOverridesAllowed: false,
       runtimeClampingAllowed: false,
@@ -197,32 +218,73 @@ function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV1 {
   }) as EyeAppearanceControlDefinition[];
 
   return {
-    schemaVersion: "eye-appearance/v1",
-    stateSchemaVersion: "eye-appearance-state/v1",
-    status: "test",
-    productExportApproved: false,
+    schemaVersion: "eye-appearance/v3",
+    stateSchemaVersion: "eye-appearance-state/v3",
+    status: "product-export-approved",
+    productExportApproved: true,
     definitionSha256: HASH,
-    facialArtworkDependency: {
-      schemaVersion: "facial-artwork/v3",
-      definitionSha256: HASH,
+    dependencies: {
+      socketEyeSurface: {
+        schemaVersion: "socket-eye-surface/v1",
+        definitionSha256: HASH,
+      },
+      eyeApertureSeam: {
+        schemaVersion: "eye-aperture-seam/v1",
+        definitionSha256: HASH,
+      },
     },
     ownership: "test",
-    zeroLaw: "Zero keeps the fitted result.",
-    symmetryLaw: "All physical controls are linked.",
-    compositionOrder: ["automatic-fit", "user-offset"],
-    completeEyeAssemblyNodes: ["EyeAssembly_L", "EyeAssembly_R"],
+    zeroLaw: "One keeps the package-authored iris and pupil size.",
+    symmetryLaw: "Iris and pupil controls are linked bilaterally.",
+    compositionOrder: ["sclera", "scleraArtwork", "iris", "pupil", "highlight", "cornea"],
     solidColorDefaults: {
       iris: [0.1, 0.5, 0.6, 1],
       pupil: [0.02, 0.02, 0.02, 1],
       sclera: [0.92, 0.9, 0.86, 1],
     },
-    controls,
+    runtimeBindings: {
+      coordinateSpace: "socket-eye-surface",
+      left: {
+        compositeCapNode: "EyeCompositeCap_L",
+        irisNeutralRadiusMeters: 0.01,
+        pupilNeutralRadiusRatio: 0.4,
+        irisVerticalTravelMeters: 0.003,
+        edgeSoftnessMeters: 0.0002,
+        artworkMappings: {
+          sclera: "gaze-linked-carrier",
+          iris: "radial-carrier",
+          pupil: "radial-carrier",
+          highlight: "iris-space",
+        },
+        cornea: { roughness: 0.2, clearcoat: 0.8, clearcoatRoughness: 0.1 },
+      },
+      right: {
+        compositeCapNode: "EyeCompositeCap_R",
+        irisNeutralRadiusMeters: 0.01,
+        pupilNeutralRadiusRatio: 0.4,
+        irisVerticalTravelMeters: 0.003,
+        edgeSoftnessMeters: 0.0002,
+        artworkMappings: {
+          sclera: "gaze-linked-carrier",
+          iris: "radial-carrier",
+          pupil: "radial-carrier",
+          highlight: "iris-space",
+        },
+        cornea: { roughness: 0.2, clearcoat: 0.8, clearcoatRoughness: 0.1 },
+      },
+      geometryEvidence: {
+        acceptedGlbSha256: HASH,
+        socketSurfaceSha256: HASH,
+        apertureSeamSha256: HASH,
+      },
+    },
+    controls: controls as EyeAppearanceDefinitionV3["controls"],
     rangeEvidence: {
       schemaVersion: "test",
       sha256: HASH,
       canonicalSha256: HASH,
     },
-  } as EyeAppearanceDefinitionV1;
+  } as EyeAppearanceDefinitionV3;
 }
 
 function renderEditor(
@@ -371,7 +433,7 @@ describe("FacialArtworkEditor", () => {
       }),
     ).toHaveAttribute(
       "href",
-      "/goons/facial-artwork/v3/lashes_eye_outline/guide-left.png",
+      "/goons/facial-artwork/v4/lashes_eye_outline/guide-left.png",
     );
     expect(within(panel).queryByText(/pink is forbidden/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "About Lash & Outline Artwork" })).toBeInTheDocument();
@@ -391,7 +453,7 @@ describe("FacialArtworkEditor", () => {
       }),
     ).toHaveAttribute(
       "href",
-      "/goons/facial-artwork/v3/lashes_eye_outline/guide-right.png",
+      "/goons/facial-artwork/v4/lashes_eye_outline/guide-right.png",
     );
   });
 
@@ -427,7 +489,7 @@ describe("FacialArtworkEditor", () => {
       ),
     );
     expect(fetchMock).toHaveBeenCalledWith(
-      "/goons/facial-artwork/v3/lashes_eye_outline/guide-left.png",
+      "/goons/facial-artwork/v4/lashes_eye_outline/guide-left.png",
     );
 
     await fireEvent.click(
@@ -465,12 +527,18 @@ describe("FacialArtworkEditor", () => {
     expect(downloadBlob).not.toHaveBeenCalled();
   });
 
-  it("keeps Iris and Pupil separate with independent artwork symmetry and linked physical sizes", async () => {
+  it("keeps Iris and Pupil artwork separate while linking Iris, Pupil, and Highlight position", async () => {
     renderEditor();
 
     await fireEvent.click(screen.getByRole("button", { name: /^Iris Artwork/ }));
     const irisPanel = screen.getByRole("region", { name: /^Iris Artwork/ });
     expect(within(irisPanel).getByRole("slider", { name: "Iris Size" })).toBeInTheDocument();
+    const verticalSlider = within(irisPanel).getByRole("slider", {
+      name: "Iris Vertical Position",
+    });
+    expect(verticalSlider).toHaveAttribute("aria-valuemin", "-1");
+    expect(verticalSlider).toHaveAttribute("aria-valuemax", "1");
+    expect(verticalSlider).toHaveAttribute("aria-valuenow", "0");
     expect(within(irisPanel).getByRole("radio", { name: "Customize each eye" })).toBeInTheDocument();
 
     await fireEvent.click(screen.getByRole("button", { name: /^Pupil Artwork/ }));
@@ -481,7 +549,7 @@ describe("FacialArtworkEditor", () => {
     expect(pupilSlider).toHaveAttribute("aria-valuemax", "2");
   });
 
-  it("keeps Sclera focused on surface artwork while geometry lives in Appearance Dials", async () => {
+  it("keeps Sclera focused on surface artwork without retired globe geometry controls", async () => {
     renderEditor();
     await fireEvent.click(screen.getByRole("button", { name: /^Sclera Artwork/ }));
 

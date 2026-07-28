@@ -210,7 +210,7 @@ async function recipeRecordKeysForGoon(
     `goon_recipe_document:${userId}:${goonId}:*`,
     `goon_recipe_job:${userId}:${goonId}:*`
   ]
-  const found = await Promise.all(patterns.map((pattern) => client.keys(pattern).catch(() => [])))
+  const found = await Promise.all(patterns.map((pattern) => client.keys(pattern)))
   return Array.from(new Set(found.flat())).sort((left, right) => left.localeCompare(right))
 }
 
@@ -222,7 +222,7 @@ export async function collectGoonRecipeUploadReferencesForClient(
   const references: GoonAssetReferenceMap = new Map()
   const keys = await recipeRecordKeysForGoon(client, userId, goonId)
   for (const key of keys) {
-    const value = await client.json.get(key).catch(() => null)
+    const value = await client.json.get(key)
     collectUploadUrlsFromValue(references, value, `Recipe record ${key}`)
   }
   return references
@@ -394,9 +394,9 @@ export async function collectGoonUploadReferencesForClient(
 ): Promise<GoonAssetReferenceMap> {
   const references: GoonAssetReferenceMap = new Map()
 
-  const goonIds = await client.sMembers(`user:${userId}:goons`).catch(() => [])
+  const goonIds = await client.sMembers(`user:${userId}:goons`)
   for (const goonId of goonIds) {
-    const goon = (await client.json.get(`goon:${goonId}`).catch(() => null)) as GoonRecord | null
+    const goon = (await client.json.get(`goon:${goonId}`)) as GoonRecord | null
     if (!goon || goon.user_id !== userId) continue
     collectGoonRefs(references, goon)
     const recipeReferences = await collectGoonRecipeUploadReferencesForClient(client, userId, goonId)
@@ -407,12 +407,12 @@ export async function collectGoonUploadReferencesForClient(
     }
   }
 
-  const settings = (await client.json.get(`user:${userId}:settings`).catch(() => null)) as
+  const settings = (await client.json.get(`user:${userId}:settings`)) as
     | { goons_settings?: GoonsSettings }
     | null
   collectSettingsRefs(references, settings?.goons_settings)
 
-  const library = (await client.json.get(`user:${userId}:goons_animation_library`).catch(() => null)) as
+  const library = (await client.json.get(`user:${userId}:goons_animation_library`)) as
     | GoonAnimationLibrary
     | null
   collectAnimationLibraryRefs(references, library)
@@ -470,7 +470,7 @@ export async function auditGoonUploadAssetsForClient(
     const keys = await client.keys(`upload:${uploadType}:*`)
     for (const redisKey of keys) {
       const filename = redisKey.slice(`upload:${uploadType}:`.length)
-      const payload = await client.json.get(redisKey).catch(() => null)
+      const payload = await client.json.get(redisKey)
       const referenceContexts = references.get(referenceKey(uploadType, filename))
       entries.push({
         uploadType,
@@ -542,7 +542,20 @@ export async function cleanupOrphanGoonUploadAssets(
   userId: string,
   options: { deleteAsset?: DeleteGoonUploadAsset } = {}
 ): Promise<GoonAssetCleanupResult> {
-  const audit = await auditGoonUploadAssets(userId)
+  return redis.execute((client) =>
+    cleanupOrphanGoonUploadAssetsForClient(client as RedisClientLike, userId, options)
+  )
+}
+
+export async function cleanupOrphanGoonUploadAssetsForClient(
+  client: RedisClientLike,
+  userId: string,
+  options: { deleteAsset?: DeleteGoonUploadAsset } = {}
+): Promise<GoonAssetCleanupResult> {
+  // Reference enumeration is deliberately completed before the first delete.
+  // Any Redis read failure rejects the operation so incomplete evidence can
+  // never be mistaken for an empty reference graph.
+  const audit = await auditGoonUploadAssetsForClient(client, userId)
   const deleteAsset = options.deleteAsset ?? deleteGoonUploadAsset
   const deleted: GoonAssetAuditEntry[] = []
   const failed: Array<GoonAssetAuditEntry & { error: string }> = []

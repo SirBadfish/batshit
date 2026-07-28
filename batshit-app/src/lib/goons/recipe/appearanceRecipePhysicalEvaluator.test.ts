@@ -13,6 +13,7 @@ import {
   type AppearanceRecipePhysicalBasis,
   type AppearanceRecipePositionDelta,
 } from "./appearanceRecipePhysicalEvaluator";
+import type { AnatomyFitResult } from "./anatomyFitContracts";
 
 const IDENTITY_QUAT: AppearanceQuat = [0, 0, 0, 1];
 const ONE: AppearanceVec3 = [1, 1, 1];
@@ -102,7 +103,7 @@ function basis(): AppearanceRecipePhysicalBasis {
         driver: { kind: "dial", id: "fit_control" },
         node: "body_node",
         morph: "fit_surface",
-        positionBindingId: "fit/surface/body",
+        positionBindingIds: ["fit/surface/body"],
       },
       {
         follower: "optional",
@@ -308,7 +309,132 @@ function expectVecClose(
   );
 }
 
+function anatomyFitResult(
+  overrides: Partial<AnatomyFitResult> = {},
+): AnatomyFitResult {
+  return {
+    contract: "anatomy-fit-result/v1",
+    solverVersion: "eye-socket-fit/geometry-clearance/v1",
+    domain: "eye-socket:left",
+    inputSha256: "a".repeat(64),
+    status: "converged",
+    convergence: {
+      converged: true,
+      iterations: 1,
+      objective: 0,
+      tolerance: 1e-12,
+      reason: "minimum-step",
+    },
+    resolvedParameters: [],
+    nodeTransforms: [
+      {
+        nodeId: "fit_anchor",
+        rootDeltaMatrix: [
+          1, 0, 0, 0,
+          0, 1, 0, 0,
+          0, 0, 1, 0,
+          0.5, 0, 0, 1,
+        ],
+      },
+    ],
+    followerMorphCoefficients: [
+      {
+        followerId: "fit",
+        channelId: "surface",
+        nodeId: "body_node",
+        morph: "fit_surface",
+        weight: 0.5,
+        lower: 0,
+        upper: 1,
+      },
+    ],
+    metrics: [],
+    diagnostics: [],
+    resultSha256: "b".repeat(64),
+    ...overrides,
+  };
+}
+
 describe("appearance Recipe physical evaluator", () => {
+  it("composes verified Anatomy Fit morphs and node transforms after ordinary dial followers", () => {
+    const output = evaluateAppearanceRecipePhysicalOutput(basis(), state(false), {
+      anatomyFitResults: [anatomyFitResult()],
+    });
+    expect(Array.from(output.meshes[0].positions)).toEqual([
+      0.125, -0.30000001192092896, 1_000_000.5,
+    ]);
+    const fit = output.nodes.find((node) => node.id === "fit_node")!;
+    expectVecClose(fit.localMatrix.slice(12, 15), [1.5, 0, 0]);
+
+    expect(() =>
+      evaluateAppearanceRecipePhysicalOutput(basis(), state(false), {
+        anatomyFitResults: [
+          anatomyFitResult(),
+          anatomyFitResult({
+            domain: "eye-socket:right",
+            resultSha256: "c".repeat(64),
+          }),
+        ],
+      }),
+    ).toThrow("writes node fit_anchor more than once");
+
+    expect(() =>
+      evaluateAppearanceRecipePhysicalOutput(basis(), state(false), {
+        anatomyFitResults: [
+          anatomyFitResult({
+            followerMorphCoefficients: [
+              {
+                followerId: "fit",
+                channelId: "missing",
+                nodeId: "body_node",
+                morph: "missing",
+                weight: 0.5,
+                lower: 0,
+                upper: 1,
+              },
+            ],
+          }),
+        ],
+      }),
+    ).toThrow("does not bind a physical recipe-only POSITION channel");
+  });
+
+  it("conjugates Anatomy Fit root deltas into bone rests and matching inverse binds", () => {
+    const physicalBasis = basis();
+    physicalBasis.followerNodeBindings.push({
+      id: "pelvis_fit_anchor",
+      nodeId: "pelvis_node",
+    });
+    const result = anatomyFitResult({
+      nodeTransforms: [
+        {
+          nodeId: "pelvis_fit_anchor",
+          rootDeltaMatrix: [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0.25, 0, 0, 1,
+          ],
+        },
+      ],
+      followerMorphCoefficients: [],
+    });
+    const output = evaluateAppearanceRecipePhysicalOutput(
+      physicalBasis,
+      state(false),
+      { anatomyFitResults: [result] },
+    );
+
+    const pelvis = output.jointRests.find((entry) => entry.boneId === "pelvis")!;
+    const head = output.jointRests.find((entry) => entry.boneId === "head")!;
+    expectVecClose(pelvis.localPosition, [0.25, 1, 0]);
+    expectVecClose(pelvis.avatarRootOffset, [0.25, 0, 0]);
+    expectVecClose(head.avatarRootOffset, [0.25, 0, 0]);
+    for (const joint of output.skins[0].joints) {
+      expectVecClose(joint.inverseBindMatrix.slice(12, 15), [-0.25, 0, 0]);
+    }
+  });
+
   it("pins Float32 bake order, retained weights, joint rests, inverse slots, and hips remap", () => {
     const physicalBasis = basis();
     const resolvedState = state(true);
@@ -672,7 +798,7 @@ describe("appearance Recipe physical evaluator", () => {
     ).toThrow(/retained target binding .* changed its physical mesh identity/);
 
     const omittedFollower = basis();
-    delete omittedFollower.followerMorphBindings[0].positionBindingId;
+    delete omittedFollower.followerMorphBindings[0].positionBindingIds;
     expect(() =>
       validateAppearanceRecipePhysicalBasis(omittedFollower),
     ).toThrow(/omits its present physical binding/);

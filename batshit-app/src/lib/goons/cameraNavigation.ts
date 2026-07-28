@@ -7,6 +7,7 @@ export type GoonFramingSlice = {
   topRatio: number
   margin: number
   widthRatio: number
+  semanticWidthRatio?: number
 }
 
 export type HybridCameraZoomZone = 'close-extension' | 'physical-dolly' | 'far-extension'
@@ -27,7 +28,13 @@ export type CameraBoxClampAxes = {
 export const GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY = 0.0005
 
 const GOON_FRAMING_SLICES: Record<GoonFramingPreset, GoonFramingSlice> = {
-  headshot: { bottomRatio: 0.66, topRatio: 1, margin: 1.14, widthRatio: 0.55 },
+  headshot: {
+    bottomRatio: 0.66,
+    topRatio: 1,
+    margin: 1.14,
+    widthRatio: 0.55,
+    semanticWidthRatio: 0.4
+  },
   portrait: { bottomRatio: 0.5, topRatio: 1, margin: 1.12, widthRatio: 0.8 },
   'full-body': { bottomRatio: 0, topRatio: 1, margin: 1.08, widthRatio: 1 }
 }
@@ -482,7 +489,13 @@ export function resolveGoonFraming(options: {
         : anchors.headY - semanticSpan * 0.4
     : bounds.min.y + size.y * slice.bottomRatio
   const visibleHeight = Math.max(0.01, top - bottom)
-  const visibleWidth = Math.max(0.01, size.x * slice.widthRatio)
+  const boundedWidth = size.x * slice.widthRatio
+  // Headshots may crop shoulders and arms. When semantic anchors exist, fit
+  // the head band rather than letting whole-body mesh width push the face away.
+  const semanticWidth = anchors && slice.semanticWidthRatio
+    ? semanticSpan * slice.semanticWidthRatio
+    : Number.POSITIVE_INFINITY
+  const visibleWidth = Math.max(0.01, Math.min(boundedWidth, semanticWidth))
   const verticalHalfAngle = THREE.MathUtils.degToRad(verticalFovDegrees) / 2
   const horizontalHalfAngle = Math.atan(Math.tan(verticalHalfAngle) * Math.max(0.01, aspect))
   const verticalDistance = visibleHeight / 2 / Math.tan(verticalHalfAngle)

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   mergeGoonsSettingsPatch,
+  normalizeGoonCueMap,
   resolveGoonCues,
   resolvePreviewAnimationDefinition
 } from '$lib/goons/resolve'
@@ -59,8 +60,18 @@ describe('resolveGoonCues', () => {
       kitchen: {
         cues: {
           calm: { name: 'calm', kind: 'mood', playback: 'loop' },
-          wave: { name: 'wave', kind: 'emote', playback: 'oneshot' },
-          laugh: { name: 'laugh', kind: 'emote', playback: 'oneshot' }
+          smile: {
+            name: 'smile',
+            kind: 'emote',
+            playback: 'oneshot',
+            expressionTargets: [{ preset: 'happy', weight: 0.6 }]
+          },
+          laugh: {
+            name: 'laugh',
+            kind: 'emote',
+            playback: 'oneshot',
+            faceControls: [{ control: 'mouth_open', value: 0.4 }]
+          }
         },
         emojiMap: {},
         scenes: {},
@@ -75,7 +86,7 @@ describe('resolveGoonCues', () => {
       name: 'Jen',
       files: { animations: [] },
       cues: {
-        enabled: ['wave'],
+        enabled: ['smile'],
         disabled: ['laugh'],
         overrides: {},
         emojiOverrides: {}
@@ -86,8 +97,50 @@ describe('resolveGoonCues', () => {
 
     const resolved = resolveGoonCues(goon, settings)
 
-    expect(Object.keys(resolved.cueMap)).toEqual(['calm', 'wave'])
-    expect(resolved.enabled).toEqual(['calm', 'wave'])
+    expect(Object.keys(resolved.cueMap)).toEqual(['calm', 'smile'])
+    expect(resolved.enabled).toEqual(['calm', 'smile'])
+  })
+
+  it('removes motion-only Emotes while preserving facial payloads without motion fields', () => {
+    const normalized = normalizeGoonCueMap({
+      wave: {
+        name: 'wave',
+        kind: 'emote',
+        playback: 'oneshot',
+        animationName: 'gesture-wave',
+        mask: 'upper'
+      },
+      animated_smile: {
+        name: 'animated_smile',
+        kind: 'emote',
+        playback: 'loop',
+        animationName: 'gesture-wave',
+        posture: 'stand',
+        expressionTargets: [{ preset: 'happy', weight: 0.5 }]
+      },
+      fresh_emote: {
+        name: 'fresh_emote',
+        kind: 'emote',
+        playback: 'oneshot'
+      }
+    })
+
+    expect(normalized.wave).toBeUndefined()
+    expect(normalized.animated_smile).toMatchObject({
+      name: 'animated_smile',
+      kind: 'emote',
+      playback: 'oneshot',
+      faceProfiles: {
+        portable: {
+          expressionTargets: [{ preset: 'happy', weight: 0.5 }]
+        },
+        arkit52: {}
+      }
+    })
+    expect(normalized.animated_smile.expressionTargets).toBeUndefined()
+    expect(normalized.animated_smile.animationName).toBeUndefined()
+    expect(normalized.animated_smile.posture).toBeUndefined()
+    expect(normalized.fresh_emote).toBeDefined()
   })
 })
 
@@ -135,7 +188,13 @@ describe('mergeGoonsSettingsPatch', () => {
     const settings: GoonsSettings = {
       kitchen: {
         cues: {
-          calm: { name: 'calm', kind: 'mood', playback: 'loop' }
+          calm: { name: 'calm', kind: 'mood', playback: 'loop' },
+          smile: {
+            name: 'smile',
+            kind: 'emote',
+            playback: 'oneshot',
+            expressionTargets: [{ preset: 'happy', weight: 0.6 }]
+          }
         },
         emojiMap: {},
         scenes: {
@@ -149,12 +208,12 @@ describe('mergeGoonsSettingsPatch', () => {
     const merged = mergeGoonsSettingsPatch(settings, {
       kitchen: {
         emojiMap: {
-          ':)': 'calm'
+          ':)': 'smile'
         }
       }
     })
 
-    expect(merged.kitchen?.emojiMap?.[':)']).toBe('calm')
+    expect(merged.kitchen?.emojiMap?.[':)']).toBe('smile')
     expect(merged.kitchen?.cues?.calm?.name).toBe('calm')
     expect(merged.kitchen?.scenes?.cyberpunk?.name).toBe('Cyberpunk')
   })

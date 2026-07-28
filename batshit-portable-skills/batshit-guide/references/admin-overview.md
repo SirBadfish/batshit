@@ -22,7 +22,7 @@ Diagnostics is the safe support-bundle export for bug reports. It previews exact
 
 ## Runtime status and installers
 
-The Admin area includes a `Runtimes` section that reports the health of optional runtimes Batshit can use, and offers install or repair actions where they apply. It covers status for the n8n runtime, Agent Browser, Cloudflared, Apple Container on Mac, the Docker Sandbox, and the FBX-to-VRMA converter.
+The Admin area includes a `Runtimes` section that reports the health of optional runtimes Batshit can use, and offers install or repair actions where they apply. It covers status for the n8n runtime, Agent Browser, Cloudflared, Apple Container on Mac, the Docker Sandbox, the FBX-to-VRMA converter, and Batshit's optional NVIDIA Audio2Face bridge. Audio2Face status distinguishes the bridge process from the separately installed NVIDIA NIM so a running bridge is never mistaken for inference readiness.
 
 The behavior is honest about each environment. For example, the n8n runtime entry is status-only — it checks whether your n8n URL and API key are reachable and reports readiness, rather than pretending Batshit can launch n8n for you. In Docker, runtimes like Agent Browser and Cloudflared appear as sidecar states (active or stopped) and defer start/stop to the approved host operator, instead of offering native installs that wouldn't fit the container. When a runtime isn't available, Batshit shows that clearly rather than hiding it.
 

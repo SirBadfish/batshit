@@ -199,6 +199,7 @@ An add-on listed in `compose.yaml` is an opt-in recipe. It's not automatically r
 | Optional Docker n8n profile | Optional `n8n` profile. Manual n8n workflow/credential setup still required. |
 | Cloudflared | Optional `cloudflared` sidecar for managed Clip tunnel URLs. |
 | FBX-to-VRMA | Optional `fbx2vrma` worker for Goon Motion Vault `.fbx` uploads. |
+| NVIDIA Audio2Face bridge | Optional `audio2face` bridge for a separately installed and licensed NVIDIA Audio2Face-3D NIM v2.0 GPU runtime. Batshit does not bundle NVIDIA's NIM, models, or license. |
 | Agent Browser | Optional `agent-browser` sidecar/controller with headless Chromium. |
 | LiveKit | Optional `livekit` voice runtime profile with LiveKit server plus Batshit agent worker. |
 | `comfyui-validation` | Optional validation sidecar for ComfyUI-shaped artifact routing. Not full GPU ComfyUI. |
@@ -220,6 +221,14 @@ FBX-to-VRMA worker:
 ```sh
 docker compose --env-file .env.docker --profile fbx2vrma up -d --build fbx2vrma-worker
 ```
+
+Audio2Face bridge, after the separate NVIDIA NIM is running and its gRPC endpoint is configured in `.env.docker`:
+
+```sh
+docker compose --env-file .env.docker --profile audio2face up -d --build audio2face-bridge
+```
+
+The bridge's Admin status separates `Bridge Running` from `NIM Ready`. A healthy bridge with an unavailable NVIDIA NIM is not ready for analysis. Completed-utterance animation results are cached in a dedicated Docker volume; NVIDIA images, model caches, TLS files, and GPU state remain external to Batshit backup/restore.
 
 Agent Browser sidecar:
 

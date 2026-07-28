@@ -12,6 +12,7 @@
   import type { Agent as AgentStoreRecord } from "$lib/stores/agents.svelte";
   import { loadGoons } from "$lib/services/goons";
   import { getGoons } from "$lib/stores/goons.svelte";
+  import { isGoonRuntimeReady } from "$lib/goons/recipe";
   import { subagentStore } from "$lib/stores/subagents.svelte";
   import { getUserSettings } from "$lib/stores/userSettings.svelte";
   import { confirmDialog } from "$lib/stores/confirmDialog";
@@ -1024,6 +1025,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
   let projectOptionsError = $state<string | null>(null);
   const projectService = new ProjectService();
   const goons = $derived(getGoons());
+  const assignableGoons = $derived.by(() => goons.filter(isGoonRuntimeReady));
 
   let selectedAgentId = $state<string | null>(null);
   let detailLoading = $state(false);
@@ -1504,7 +1506,9 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
   function getGoonLipSyncLabel(settings: ReturnType<typeof normalizeVoiceSettings>) {
     if (settings.goonLipSync?.mode === "viseme") {
-      return settings.goonLipSync.analyzerId === "rhubarb-wasm" ? "Rhubarb WASM" : "Viseme analyzer";
+      return settings.goonLipSync.analyzerId === "audio2face-3d"
+        ? "NVIDIA Audio2Face"
+        : "Rhubarb WASM";
     }
 
     return "Shitty but Fast";
@@ -8346,14 +8350,14 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                           {/if}
                         {/if}
 
-                        <div class={`batshit-settings-form-row ${goons.length === 0 ? "is-tall" : ""}`}>
+                        <div class={`batshit-settings-form-row ${assignableGoons.length === 0 ? "is-tall" : ""}`}>
                           <div class="batshit-settings-form-copy">
                             <div class="batshit-settings-form-label-line">
                               <Label.Label class="batshit-settings-form-label">Assigned 3D Goon</Label.Label>
                             </div>
-                            {#if goons.length === 0}
+                            {#if assignableGoons.length === 0}
                               <p class="batshit-settings-form-help">
-                                No Goons yet. Create one in Settings → 3D Goons.
+                                No ready Goons yet. Create or finish preparing one in Settings → 3D Goons.
                               </p>
                             {/if}
                           </div>
@@ -8375,7 +8379,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                               </Select.Trigger>
                               <Select.Content>
                                 <Select.Item value="none">None</Select.Item>
-                                {#each goons as goon}
+                                {#each assignableGoons as goon}
                                   <Select.Item value={goon.id}>{goon.name}</Select.Item>
                                 {/each}
                               </Select.Content>

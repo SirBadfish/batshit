@@ -270,23 +270,22 @@ export function recipeManifestSemanticContent(value: unknown): unknown {
       typeof topologyFreeze === "object" &&
       !Array.isArray(topologyFreeze)
     ) {
-      const stripTopologyProvenanceHashes = (entry: unknown): void => {
+      const stripTopologyProvenanceHashes = (entry: unknown): unknown => {
         if (Array.isArray(entry)) {
-          for (const child of entry) stripTopologyProvenanceHashes(child);
-          return;
+          return entry.map(stripTopologyProvenanceHashes);
         }
-        if (!entry || typeof entry !== "object") return;
-        for (const [key, child] of Object.entries(
-          entry as Record<string, unknown>,
-        )) {
-          if (/sha256$/i.test(key)) {
-            delete (entry as Record<string, unknown>)[key];
-          } else {
-            stripTopologyProvenanceHashes(child);
-          }
-        }
+        if (!entry || typeof entry !== "object") return entry;
+        return Object.fromEntries(
+          Object.entries(entry as Record<string, unknown>)
+            .filter(([key]) => !/sha256$/i.test(key))
+            .map(([key, child]) => [
+              key,
+              stripTopologyProvenanceHashes(child),
+            ]),
+        );
       };
-      stripTopologyProvenanceHashes(topologyFreeze);
+      facialArtworkRecord.topologyFreeze =
+        stripTopologyProvenanceHashes(topologyFreeze);
     }
   }
 

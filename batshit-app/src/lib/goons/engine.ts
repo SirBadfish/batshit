@@ -69,6 +69,7 @@ import {
   type RoomShellTextureSet
 } from '$lib/goons/roomShellGeometry'
 import { createAmbientBlinkState, updateAmbientBlinkState } from '$lib/goons/ambientBlink'
+import { GOON_SEMANTIC_EXPRESSION_CONTROLS } from '$lib/goons/semanticExpressions'
 import {
   normalizeGoonSceneAmbience,
   type NormalizedGoonSceneAmbience
@@ -132,22 +133,24 @@ import {
   normalizePaintedConcealMask
 } from '$lib/goons/paintedConcealMasks'
 import {
-  createEmptyGoonLipSyncWeights,
   DEFAULT_GOON_LIP_SYNC_MODE,
-  downmixGoonLipSyncWeightsToLegacy,
+  downmixGoonLipSyncFrameToLegacy,
   getGoonLipSyncOpenness,
   getLegacyGoonLipSyncOpenness,
   isTimelineOwnedGoonLipSyncSource,
   sampleGoonLipSyncTimeline,
   type GoonLipSyncAnalyzerId,
   type GoonLipSyncTimeline,
-  type GoonLipSyncWeights,
   type LegacyGoonLipSyncWeights
 } from '$lib/utils/goonLipSync'
 import {
-  CUSTOM_RHUBARB_LIP_SYNC_MOUTH_ORDER,
-  CUSTOM_RHUBARB_MOUTH_ORDER
-} from '$lib/goons/semanticVisemes'
+  RHUBARB_9_SPEECH_FACE_PROFILE,
+  createEmptyGoonSpeechFaceFrame,
+  scaleGoonSpeechFaceFrame,
+  type Arkit52Channel,
+  type Audio2FaceTongueChannel,
+  type GoonSpeechFaceFrame
+} from '$lib/goons/speechFaceProfiles'
 import { getXWearMaterials, resolveXWearLayersForMaterial } from '$lib/utils/xwear'
 import { findNearestValidStandingPoint } from '$lib/goons/standing'
 import {
@@ -165,13 +168,25 @@ import {
   resolveCustomPerformanceRigBlock,
   resolveCustomNamedNode,
   resolveCustomFaceControlBindings,
-  resolveCustomExpressionBindings,
+  resolveCustomExpressionBindingContract,
   resolveCustomFaceMeshes,
   resolveCustomFaceMeshNames,
   resolveCustomMorphDefinitions,
+  resolveCustomArkitFaceBindings,
+  resolveCustomSpeechFaceProfile,
   sanitizeCustomRuntimeNodeName,
-  type GoonCustomAvatarManifest
+  type GoonCustomAvatarManifest,
+  type ResolvedCustomExpressionBinding
 } from '$lib/goons/customAvatar'
+import {
+  isCustomCompatibleMouthPreset,
+  resolveDirectCustomArkitFaceDriverWeights,
+  resolveCustomLipSyncPresetWeights,
+  resolveCustomMouthPresetSupport,
+  resolveCustomRigCompatibilityCoverage,
+  type CustomMouthPresetSupport
+} from '$lib/goons/customCompatibility'
+import { selectCueFacePayload } from '$lib/goons/cueFaceProfiles'
 import {
   bindCustomPerformanceRig,
   composeCustomPerformanceEyeContact,
@@ -182,6 +197,7 @@ import {
   resolveCustomPerformanceRigManifest,
   resolveFaceControlEyeLookPresetWeights,
   resolveFinalCustomTargetWeights,
+  resolveSocketEyeBlinkClosureTargetWeights,
   shouldApplyCustomExpressionMorphPreset,
   type CustomPerformanceDirection,
   type CustomPerformanceRigRuntime
@@ -199,19 +215,54 @@ import type {
   AppearanceDialValueState,
   AppearanceDialsManifest
 } from '$lib/goons/appearanceDials'
+import type { AnatomyFitResult } from '$lib/goons/recipe/anatomyFitContracts'
 import { FacialArtworkEngineRuntime } from '$lib/goons/facialArtwork.engine'
 import {
-  parseFacialArtworkDefinition,
-  type FacialArtworkDefinitionV3,
-  type FacialArtworkStateV3
+  type FacialArtworkDefinitionV4,
+  type FacialArtworkStateV4
 } from '$lib/goons/facialArtwork'
 import { EyeAppearanceEngineRuntime } from '$lib/goons/eyeAppearance.engine'
 import {
-  parseEyeAppearanceDefinition,
-  type EyeAppearanceDefinitionV1,
-  type EyeAppearanceStateV1
+  type EyeAppearanceDefinitionV3,
+  type EyeAppearanceStateV3
 } from '$lib/goons/eyeAppearance'
+import { OralAppearanceEngineRuntime } from '$lib/goons/oralAppearance.engine'
+import {
+  parseOralAppearanceDefinition,
+  type OralAppearanceDefinitionV1,
+  type OralAppearanceStateV1
+} from '$lib/goons/oralAppearance'
+import { LipArtworkEngineRuntime } from '$lib/goons/lipArtwork.engine'
+import {
+  parseLipArtworkDefinition,
+  type LipArtworkDefinitionV2,
+  type LipArtworkStateV2
+} from '$lib/goons/lipArtwork'
 import { classifyFacialArtworkPackageCapability } from '$lib/goons/facialArtwork.package'
+import { parseFirstPartySocketEyePackage } from '$lib/goons/socketEyePackage'
+import {
+  SocketEyeSurfaceEngineRuntime,
+  type SocketEyeCompositeVisualState
+} from '$lib/goons/socketEyeSurface.engine'
+import type { SocketEyeSurfaceDefinitionV1 } from '$lib/goons/socketEyeSurface'
+import type { EyeApertureSeamDefinitionV1 } from '$lib/goons/eyeApertureSeam'
+import {
+  resolveSocketEyeLookTargetWeights,
+  resolveSocketEyeGaze,
+  resolveSocketEyeHeadAssist,
+  smoothSocketEyeHeadAssist,
+  SOCKET_EYE_LOOK_TARGETS,
+  type SocketEyeCoordinates
+} from '$lib/goons/socketEyeGaze'
+import {
+  resolveSocketEyeContactSettings,
+  socketEyeContactResponseLerp,
+  type SocketEyeContactSettingsV2
+} from '$lib/goons/socketEyeContact'
+import {
+  buildGoonRendererConstructionOptions,
+  shouldRetryGoonRendererWithWebGL2
+} from '$lib/goons/goonRendererRequirements'
 import {
   evaluateJointCorrectives,
   parseJointCorrectives,
@@ -220,6 +271,15 @@ import {
   type JointCorrectiveDriver,
   type JointCorrectivesSpec
 } from '$lib/goons/jointCorrectives'
+import {
+  evaluateLiveJointCorrectiveAngles,
+  parseLiveJointCorrectivesFromManifest,
+  type LiveJointCorrectivesSpec
+} from '$lib/goons/liveJointCorrectives'
+import {
+  parseGoonLiveManifestFromAvatarManifest,
+  verifyGoonLiveManifest
+} from '$lib/goons/recipe/liveManifestContracts'
 import { cloneGeometryForBodyConceal } from '$lib/goons/bodyConcealGeometry'
 import type { GoonStageHost } from '$lib/goons/stageScene'
 
@@ -254,11 +314,6 @@ const VRM_MOUTH_PRESET_ORDER: GoonExpressionPreset[] = [
   VRMExpressionPresetName.Ee,
   VRMExpressionPresetName.Oh
 ]
-const CUSTOM_MOUTH_PRESET_ORDER: GoonExpressionPreset[] = [...CUSTOM_RHUBARB_MOUTH_ORDER]
-const CUSTOM_LIP_SYNC_MOUTH_PRESET_ORDER = [
-  ...CUSTOM_RHUBARB_LIP_SYNC_MOUTH_ORDER
-] satisfies GoonExpressionPreset[]
-
 export type GoonEngineQuality = 'auto' | 'low' | 'high' | 'ultra'
 export type GoonZoomTarget = 'hips' | 'head' | 'feet'
 export type GoonStageAnchorName = GoonZoomTarget
@@ -316,6 +371,7 @@ export type GoonEngineOptions = {
   lipSyncEnabled?: boolean
   eyeContactMode?: GoonEyeContactMode
   eyeContactTuning?: GoonEyeContactTuning
+  socketEyeContact?: SocketEyeContactSettingsV2 | null
   cameraFov?: number
   forceWebGL2?: boolean
   debugRootMotion?: boolean
@@ -342,6 +398,50 @@ type GoonZoomGesture =
 
 export type GoonAnimationSyncOptions = {
   deferredFiles?: GoonFileRef[]
+}
+
+export type GoonMountedRuntimeState = {
+  camera: GoonCamera | null
+  baseLoop: {
+    name: string
+    definition: GoonCueDefinition | null
+    clipName: string | null
+    time: number
+  }
+  oneShot: {
+    clipName: string
+    time: number
+    restorePosture: GoonPosture | null
+    preserveCamera: boolean
+    overridePosture: GoonPosture | null
+  } | null
+  eyeContact: {
+    enabled: boolean
+    mode: GoonEyeContactMode
+    tuning: ResolvedGoonEyeContactTuning
+    applied: DirectionLookState
+    socket?: SocketEyeContactSettingsV2
+  }
+  performance: {
+    direction: CustomPerformanceDirection
+    moodFaceBlend: number
+    activeEmoteRemainingMs: number
+    expressions: Array<
+      Omit<ActiveExpression, 'endsAt' | 'startTime' | 'stepStartTime'> & {
+        remainingMs: number
+        elapsedMs: number
+        stepElapsedMs: number
+      }
+    >
+  }
+  speech: {
+    speaking: boolean
+    pausedForCue: boolean
+    timeline: GoonLipSyncTimeline | null
+    analyzerId: GoonLipSyncAnalyzerId
+    durationMs: number | null
+    elapsedMs: number
+  }
 }
 
 type GoonMaterialColorInfo = {
@@ -471,16 +571,6 @@ type ActiveExpression = {
   stepStartTime: number
 }
 
-type ActiveGesture = {
-  name: string
-  durationMs: number
-  startTime: number
-  intensity: number
-  mask?: GoonCueDefinition['mask']
-  restorePosture?: GoonPosture
-  preserveCamera?: boolean
-}
-
 type FaceMorphBinding = {
   mesh: THREE.Mesh
   dict: Record<string, number>
@@ -562,7 +652,7 @@ function applyFaceControlDirection(
 }
 
 type PendingAnimationRequest = {
-  kind: 'mood' | 'emote' | 'generic'
+  kind: 'mood' | 'generic'
   cueName: string
   definition?: GoonCueDefinition
   requestedAt: number
@@ -733,6 +823,9 @@ export class GoonEngine implements GoonStageHost {
   private container: HTMLElement
   private renderer?: WebGPURenderer
   private initPromise: Promise<void> | null = null
+  private requiredMaxTextureArrayLayers = 0
+  private activeMaxTextureArrayLayersRequirement = 0
+  private sceneLightingInitialized = false
   private scene = new THREE.Scene()
   private sceneRoot = new THREE.Group()
   private skyboxScene = new THREE.Scene()
@@ -801,6 +894,7 @@ export class GoonEngine implements GoonStageHost {
   private clock = new THREE.Timer()
   private vrm: VRM | null = null
   private customAvatarRoot: THREE.Object3D | null = null
+  private customAvatarManifest: GoonCustomAvatarManifest | null = null
   private guidedDufOverlayRoot: THREE.Group | null = null
   private guidedOutfitPieceNodes = new Map<string, THREE.Object3D[]>()
   private guidedDufOverlayBonePairs: Array<{ baseBone: THREE.Bone; overlayBone: THREE.Bone }> = []
@@ -892,19 +986,30 @@ export class GoonEngine implements GoonStageHost {
     LookAtRangeMapApplier,
     BoneLookAtRangeMapScales
   >()
-  private activeGesture: ActiveGesture | null = null
   private hasBodyAnimations = false
   private hasMouthBlendshapes = false
   private hasExpressionBlendshapes = false
   private availableMouthPresets = new Set<GoonExpressionPreset>()
+  private customMouthPresetSupport: CustomMouthPresetSupport = {
+    mode: 'none',
+    profile: null,
+    availablePresets: []
+  }
   private faceMorphBindings: FaceMorphBinding[] = []
   private faceMorphTargetNames: string[] = []
   private authorableRawMorphTargetNames: string[] = []
   private faceControlMorphNames: string[] = []
   private mouthExpressionMorphTargetNames = new Set<string>()
-  private customExpressionMorphMap = new Map<GoonExpressionPreset, string[]>()
+  private customExpressionMorphMap = new Map<
+    GoonExpressionPreset,
+    ResolvedCustomExpressionBinding[]
+  >()
   private customFaceControlMap: Record<string, FaceControlMapping> | null = null
   private customMorphDefinitions: Array<{ id: string; morphTargets: string[] }> = []
+  private customArkitFaceDriverBindings: {
+    face: Map<Arkit52Channel, string[]>
+    tongue: Map<Audio2FaceTongueChannel, string[]> | null
+  } | null = null
   private customFaceManifestIssues: string[] = []
   private customPerformanceRigRuntime: CustomPerformanceRigRuntime | null = null
   private customPerformanceDirection: CustomPerformanceDirection = {
@@ -961,13 +1066,33 @@ export class GoonEngine implements GoonStageHost {
   private appearanceDialsValues: AppearanceDialValueState | null = null
   private appearanceDialsOwnedTargets = new Set<string>()
   private facialArtworkRuntime: FacialArtworkEngineRuntime | null = null
-  private facialArtworkDefinition: FacialArtworkDefinitionV3 | null = null
-  private facialArtworkState: FacialArtworkStateV3 | null = null
+  private facialArtworkDefinition: FacialArtworkDefinitionV4 | null = null
+  private facialArtworkState: FacialArtworkStateV4 | null = null
   private eyeAppearanceRuntime: EyeAppearanceEngineRuntime | null = null
-  private eyeAppearanceDefinition: EyeAppearanceDefinitionV1 | null = null
-  private eyeAppearanceState: EyeAppearanceStateV1 | null = null
+  private eyeAppearanceDefinition: EyeAppearanceDefinitionV3 | null = null
+  private eyeAppearanceState: EyeAppearanceStateV3 | null = null
+  private socketEyeSurfaceRuntime: SocketEyeSurfaceEngineRuntime | null = null
+  private socketEyeSurfaceDefinition: SocketEyeSurfaceDefinitionV1 | null = null
+  private eyeApertureSeamDefinition: EyeApertureSeamDefinitionV1 | null = null
+  private socketEyeContact: SocketEyeContactSettingsV2
+  private socketEyeGaze: Record<'left' | 'right', SocketEyeCoordinates> = {
+    left: { horizontal: 0, vertical: 0 },
+    right: { horizontal: 0, vertical: 0 }
+  }
+  private socketEyeHeadAssist = { headYaw: 0, headPitch: 0 }
+  private oralAppearanceRuntime: OralAppearanceEngineRuntime | null = null
+  private oralAppearanceDefinition: OralAppearanceDefinitionV1 | null = null
+  private oralAppearanceState: OralAppearanceStateV1 | null = null
+  private lipArtworkRuntime: LipArtworkEngineRuntime | null = null
+  private lipArtworkDefinition: LipArtworkDefinitionV2 | null = null
+  private lipArtworkState: LipArtworkStateV2 | null = null
   // ------------------------------------ joint-driven correctives (SA-090)
   private jointCorrectivesSpec: JointCorrectivesSpec | null = null
+  private liveJointCorrectivesSpec: LiveJointCorrectivesSpec | null = null
+  private liveJointCorrectiveBindings = new Map<
+    string,
+    { mesh: THREE.Mesh; index: number }
+  >()
   private jointCorrectivesDrivers: Array<{
     driver: JointCorrectiveDriver
     nodes: THREE.Object3D[]
@@ -1079,6 +1204,7 @@ export class GoonEngine implements GoonStageHost {
     this.lipSyncEnabled = options.lipSyncEnabled ?? true
     this.eyeContactMode = options.eyeContactMode ?? 'bone'
     this.eyeContactTuning = this.normalizeEyeContactTuning(options.eyeContactTuning)
+    this.socketEyeContact = resolveSocketEyeContactSettings(options.socketEyeContact)
     this.onRuntimeStatus = options.onRuntimeStatus
     this.onCompatibility = options.onCompatibility
     this.onPerformance = options.onPerformance
@@ -1393,6 +1519,54 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
+  private releaseRendererSurface() {
+    const renderer = this.renderer
+    if (!renderer) return
+    const element = renderer.domElement
+    element.removeEventListener('pointerdown', this.handlePointerDown)
+    element.removeEventListener('pointermove', this.handlePointerMove)
+    element.removeEventListener('pointerup', this.handlePointerUp)
+    element.removeEventListener('pointerleave', this.handlePointerUp)
+    element.removeEventListener('pointercancel', this.handlePointerUp)
+    element.removeEventListener('contextmenu', this.handleContextMenu)
+    element.removeEventListener('wheel', this.handleWheel)
+    element.removeEventListener('keyup', this.handleKeyUp)
+    renderer.setAnimationLoop(null)
+    if (this.controls) {
+      this.controls.removeEventListener('change', this.handleCameraChange)
+      this.controls.dispose()
+      this.controls = undefined
+    }
+    this.clearEditTarget()
+    if (this.transformControls) {
+      this.transformControls.removeEventListener('dragging-changed', this.handleTransformDragging)
+      this.transformControls.removeEventListener('mouseDown', this.handleTransformMouseDown)
+      this.transformControls.removeEventListener('mouseUp', this.handleTransformMouseUp)
+      this.transformControls.removeEventListener('objectChange', this.handleTransformObjectChange)
+      this.transformControls.dispose()
+      this.transformControls = undefined
+    }
+    if (this.transformControlsHelper) {
+      this.scene.remove(this.transformControlsHelper)
+      this.transformControlsHelper = undefined
+    }
+    this.resizeObserver?.disconnect()
+    this.resizeObserver = undefined
+    renderer.dispose()
+    element.parentElement?.removeChild(element)
+    this.renderer = undefined
+  }
+
+  private async ensureRendererTextureArrayLayers(required: number) {
+    if (!Number.isInteger(required) || required <= 0) {
+      throw new Error('Socket-eye renderer requirement must be a positive integer.')
+    }
+    if (required <= this.activeMaxTextureArrayLayersRequirement) return
+    this.requiredMaxTextureArrayLayers = required
+    if (this.renderer) this.releaseRendererSurface()
+    await this.init()
+  }
+
   async init() {
     if (this.renderer) return
     if (this.initPromise) {
@@ -1402,20 +1576,40 @@ export class GoonEngine implements GoonStageHost {
 
     const initPromise = (async () => {
       this.renderFailed = false
-      const renderer = new WebGPURenderer({
-        antialias: true,
-        alpha: false,
-        powerPreference: 'high-performance',
-        forceWebGL: this.forceWebGL2
-      })
+      const createRenderer = (forceWebGL: boolean) => new WebGPURenderer(
+        buildGoonRendererConstructionOptions(forceWebGL, this.requiredMaxTextureArrayLayers)
+      )
+      let renderer = createRenderer(this.forceWebGL2)
       try {
         await renderer.init()
       } catch (error) {
-        const unsupported = this.buildUnsupportedRuntimeStatus(error)
-        this.setRuntimeStatus(unsupported)
         renderer.dispose()
-        throw new Error(unsupported.message ?? 'Goon rendering is unavailable.')
+        if (
+          shouldRetryGoonRendererWithWebGL2(
+            this.forceWebGL2,
+            this.requiredMaxTextureArrayLayers
+          )
+        ) {
+          console.warn(
+            '[GoonEngine] WebGPU could not satisfy the socket-eye texture-array requirement; retrying with WebGL2.',
+            error
+          )
+          renderer = createRenderer(true)
+          try {
+            await renderer.init()
+          } catch (fallbackError) {
+            renderer.dispose()
+            const unsupported = this.buildUnsupportedRuntimeStatus(fallbackError)
+            this.setRuntimeStatus(unsupported)
+            throw new Error(unsupported.message ?? 'Goon rendering is unavailable.')
+          }
+        } else {
+          const unsupported = this.buildUnsupportedRuntimeStatus(error)
+          this.setRuntimeStatus(unsupported)
+          throw new Error(unsupported.message ?? 'Goon rendering is unavailable.')
+        }
       }
+      this.activeMaxTextureArrayLayersRequirement = this.requiredMaxTextureArrayLayers
       this.setRuntimeStatus(this.resolveRendererRuntime(renderer))
       renderer.setClearColor(0x000000, 1)
       renderer.outputColorSpace = THREE.SRGBColorSpace
@@ -1482,11 +1676,14 @@ export class GoonEngine implements GoonStageHost {
       this.skyboxCamera.rotation.order = 'YXZ'
       this.skyboxCamera.fov = this.camera.fov
 
-      const ambient = new THREE.AmbientLight(0xffffff, 0.6)
-      const key = new THREE.DirectionalLight(0xffffff, 0.8)
-      key.position.set(1, 2, 2)
-      this.scene.add(ambient, key)
-      this.scene.add(this.sceneRoot)
+      if (!this.sceneLightingInitialized) {
+        const ambient = new THREE.AmbientLight(0xffffff, 0.6)
+        const key = new THREE.DirectionalLight(0xffffff, 0.8)
+        key.position.set(1, 2, 2)
+        this.scene.add(ambient, key)
+        this.scene.add(this.sceneRoot)
+        this.sceneLightingInitialized = true
+      }
 
       this.resizeObserver = new ResizeObserver(() => this.handleResize())
       this.resizeObserver.observe(this.container)
@@ -1496,7 +1693,7 @@ export class GoonEngine implements GoonStageHost {
       if (this.paused) {
         this.renderer.setAnimationLoop(null)
       } else {
-        this.renderer.setAnimationLoop(() => this.update())
+        this.renderer.setAnimationLoop(this.runAnimationFrame)
       }
     })()
 
@@ -1596,10 +1793,18 @@ export class GoonEngine implements GoonStageHost {
     options: {
       bodyDialValues?: Record<string, number> | null
       appearanceDialValues?: AppearanceDialValueState | null
-      facialArtworkState?: FacialArtworkStateV3 | null
-      eyeAppearanceState?: EyeAppearanceStateV1 | null
+      facialArtworkState?: FacialArtworkStateV4 | null
+      eyeAppearanceState?: EyeAppearanceStateV3 | null
+      oralAppearanceState?: OralAppearanceStateV1 | null
+      lipArtworkState?: LipArtworkStateV2 | null
     } = {}
   ) {
+    const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
+    if (socketEyePackage) {
+      await this.ensureRendererTextureArrayLayers(
+        socketEyePackage.socketEyeSurface.rendering.requiredMaxTextureArrayLayers
+      )
+    }
     if (!this.renderer) {
       await this.init()
     }
@@ -1627,6 +1832,7 @@ export class GoonEngine implements GoonStageHost {
       }
 
       this.customAvatarRoot = scene
+      this.customAvatarManifest = manifest
       this.disableAvatarMeshCulling(scene)
       scene.visible = this.goonVisible
 
@@ -1646,22 +1852,41 @@ export class GoonEngine implements GoonStageHost {
       this.captureCustomStageAnchors(manifest)
       this.discoverCustomFaceSupport(manifest)
       const appearanceDials = manifest.appearanceDials
-      if (appearanceDials !== undefined && appearanceDials !== null) {
+      if (manifest.liveBuild !== undefined && manifest.liveBuild !== null) {
+        await verifyGoonLiveManifest(parseGoonLiveManifestFromAvatarManifest(manifest))
+        this.resetBodyDialsState()
+        this.setupLiveJointCorrectives(manifest)
+      } else if (appearanceDials !== undefined && appearanceDials !== null) {
         this.setupAppearanceDials(manifest, options.appearanceDialValues ?? null)
       } else {
         this.setupBodyDials(manifest, options.bodyDialValues ?? null)
       }
-      this.setupCustomPerformanceRig(manifest)
-      const facialArtworkCapability = classifyFacialArtworkPackageCapability(manifest)
-      if (facialArtworkCapability.status === 'retired') {
-        this.customFaceManifestIssues.push(facialArtworkCapability.notice)
+      if (socketEyePackage) {
+        this.setupSocketEyeAppearance(
+          socketEyePackage,
+          options.eyeAppearanceState ?? null
+        )
+        await this.setupFacialArtwork(
+          socketEyePackage.facialArtwork,
+          options.facialArtworkState ?? null
+        )
       } else {
-        if (facialArtworkCapability.status === 'malformed') {
-          throw new Error(facialArtworkCapability.error)
+        const facialArtworkCapability = classifyFacialArtworkPackageCapability(manifest)
+        if (facialArtworkCapability.status === 'retired') {
+          this.customFaceManifestIssues.push(facialArtworkCapability.notice)
         }
-        this.setupEyeAppearance(manifest, options.eyeAppearanceState ?? null)
-        await this.setupFacialArtwork(manifest, options.facialArtworkState ?? null)
+        if (options.eyeAppearanceState || options.facialArtworkState) {
+          throw new Error(
+            'Saved socket-eye appearance state targets a Goon package without the current first-party eye tuple.'
+          )
+        }
       }
+      this.setupOralAppearance(manifest, options.oralAppearanceState ?? null)
+      await this.setupLipArtwork(manifest, options.lipArtworkState ?? null)
+      // Performance-rig/v2 depends on the socket-eye surface. Bind it only
+      // after every appearance runtime has completed so a failed eye setup
+      // cannot leave a half-active performance driver behind.
+      this.setupCustomPerformanceRig(manifest)
       this.emitCustomCompatibility()
       this.applyRuntimeTextureBudget(scene)
 
@@ -1677,6 +1902,13 @@ export class GoonEngine implements GoonStageHost {
       }
 
       this.syncBaseLoopAnimation()
+    } catch (error) {
+      // Loading is transactional. A failed package must not leave the render
+      // loop holding a mixer, performance rig, or partially bound eye runtime.
+      if (goonLoadToken === this.goonLoadToken) {
+        this.clearLoadedGoonState()
+      }
+      throw error
     } finally {
       if (shouldResumeAfterLoad && !this.renderFailed && this.renderer && goonLoadToken === this.goonLoadToken) {
         this.setPaused(false)
@@ -2073,14 +2305,26 @@ export class GoonEngine implements GoonStageHost {
     this.customPerformanceRigRuntime = null
     this.customPerformanceDirection = { ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION }
     this.customPerformanceTargetWeights = new Map()
-    this.eyeAppearanceRuntime?.dispose()
-    this.eyeAppearanceRuntime = null
-    this.eyeAppearanceDefinition = null
-    this.eyeAppearanceState = null
+    this.socketEyeSurfaceRuntime?.dispose()
+    this.socketEyeSurfaceRuntime = null
+    this.socketEyeSurfaceDefinition = null
+    this.eyeApertureSeamDefinition = null
     this.facialArtworkRuntime?.dispose()
     this.facialArtworkRuntime = null
     this.facialArtworkDefinition = null
     this.facialArtworkState = null
+    this.eyeAppearanceRuntime?.dispose()
+    this.eyeAppearanceRuntime = null
+    this.eyeAppearanceDefinition = null
+    this.eyeAppearanceState = null
+    this.oralAppearanceRuntime?.dispose()
+    this.oralAppearanceRuntime = null
+    this.oralAppearanceDefinition = null
+    this.oralAppearanceState = null
+    this.lipArtworkRuntime?.dispose()
+    this.lipArtworkRuntime = null
+    this.lipArtworkDefinition = null
+    this.lipArtworkState = null
     this.resetMaterialOverrides()
     this.releaseAllMaterialRuntimeTextures()
     this.clearBodyConcealRuntime()
@@ -2095,6 +2339,7 @@ export class GoonEngine implements GoonStageHost {
       this.disposeObject3D(this.customAvatarRoot)
       this.customAvatarRoot = null
     }
+    this.customAvatarManifest = null
     this.customStageAnchors = {}
 
     this.bones = {}
@@ -2108,6 +2353,7 @@ export class GoonEngine implements GoonStageHost {
     this.hasMouthBlendshapes = false
     this.hasExpressionBlendshapes = false
     this.availableMouthPresets.clear()
+    this.customMouthPresetSupport = { mode: 'none', profile: null, availablePresets: [] }
     this.faceMorphBindings = []
     this.faceMorphTargetNames = []
     this.authorableRawMorphTargetNames = []
@@ -2116,6 +2362,7 @@ export class GoonEngine implements GoonStageHost {
     this.customExpressionMorphMap.clear()
     this.customFaceControlMap = null
     this.customMorphDefinitions = []
+    this.customArkitFaceDriverBindings = null
     this.customFaceManifestIssues = []
     this.guidedManifestOverlay = null
     this.faceControlSummaryLog = ''
@@ -2156,7 +2403,6 @@ export class GoonEngine implements GoonStageHost {
     this.lookAtOverrideActive = false
     this.lookAtRestoreAutoUpdate = true
     this.lookAtRestoreTarget = null
-    this.activeGesture = null
     this.speaking = false
     this.activeEmoteUntil = 0
     this.materialMap.clear()
@@ -2523,6 +2769,8 @@ export class GoonEngine implements GoonStageHost {
     this.appearanceDialsValues = null
     this.appearanceDialsOwnedTargets = new Set()
     this.jointCorrectivesSpec = null
+    this.liveJointCorrectivesSpec = null
+    this.liveJointCorrectiveBindings = new Map()
     this.jointCorrectivesDrivers = []
     this.jointCorrectivesActive = false
   }
@@ -2539,19 +2787,30 @@ export class GoonEngine implements GoonStageHost {
     const runtime = this.appearanceDialsRuntime
     if (!runtime) return
     this.customPerformanceRigRuntime?.removeOverlay()
-    this.eyeAppearanceRuntime?.prepareForRecipeUpdate()
     this.appearanceDialsValues = values
     runtime.setValues(values)
+    this.socketEyeSurfaceRuntime?.syncIdentitySurfaceFrames()
     this.customPerformanceRigRuntime?.rebaseLookNodePositions()
-    this.eyeAppearanceRuntime?.rebaseFromRecipeAndApply()
-    this.facialArtworkRuntime?.reprojectEyeHighlights()
+  }
+
+  setFittedAppearanceDialValues(
+    values: AppearanceDialValueState | null,
+    anatomyFitResults: readonly AnatomyFitResult[]
+  ) {
+    const runtime = this.appearanceDialsRuntime
+    if (!runtime) return
+    this.customPerformanceRigRuntime?.removeOverlay()
+    this.appearanceDialsValues = values
+    runtime.setFittedValues(values, anatomyFitResults)
+    this.socketEyeSurfaceRuntime?.syncIdentitySurfaceFrames()
+    this.customPerformanceRigRuntime?.rebaseLookNodePositions()
   }
 
   getFacialArtworkDefinition() {
     return this.facialArtworkDefinition
   }
 
-  async setFacialArtworkState(value: FacialArtworkStateV3 | null) {
+  async setFacialArtworkState(value: FacialArtworkStateV4 | null) {
     const runtime = this.facialArtworkRuntime
     if (!runtime) {
       if (value) throw new Error('The loaded Goon package does not support facial artwork.')
@@ -2565,63 +2824,170 @@ export class GoonEngine implements GoonStageHost {
     return this.eyeAppearanceDefinition
   }
 
-  setEyeAppearanceState(value: EyeAppearanceStateV1 | null) {
+  getSocketEyeSurfaceDefinition() {
+    return this.socketEyeSurfaceDefinition
+  }
+
+  setEyeAppearanceState(value: EyeAppearanceStateV3 | null) {
     const runtime = this.eyeAppearanceRuntime
     if (!runtime) {
       if (value) throw new Error('The loaded Goon package does not support Eye Appearance.')
       return
     }
-    this.customPerformanceRigRuntime?.removeOverlay()
     runtime.setState(value)
-    this.facialArtworkRuntime?.reprojectEyeHighlights()
     this.eyeAppearanceState = value
   }
 
-  private setupEyeAppearance(
-    manifest: GoonCustomAvatarManifest,
-    initialState: EyeAppearanceStateV1 | null
+  private setupSocketEyeAppearance(
+    packageValue: NonNullable<ReturnType<typeof parseFirstPartySocketEyePackage>>,
+    initialState: EyeAppearanceStateV3 | null
   ) {
-    const rawDefinition = manifest.eyeAppearance
+    const root = this.customAvatarRoot
+    if (!root) throw new Error('Custom avatar root is missing during socket-eye setup.')
+    const eyeRuntime = new EyeAppearanceEngineRuntime(
+      packageValue.eyeAppearance,
+      initialState,
+      () => this.facialArtworkRuntime?.refreshSocketVisualState()
+    )
+    const initialVisualState = (side: 'left' | 'right'): SocketEyeCompositeVisualState => {
+      const physical = eyeRuntime.resolveSide(side)
+      return {
+        scleraColor: packageValue.eyeAppearance.solidColorDefaults.sclera,
+        irisColor: packageValue.eyeAppearance.solidColorDefaults.iris,
+        pupilColor: packageValue.eyeAppearance.solidColorDefaults.pupil,
+        irisRadiusMeters: physical.irisRadiusMeters,
+        pupilRadiusRatio: physical.pupilRadiusRatio,
+        irisVerticalOffsetMeters: physical.irisVerticalOffsetMeters,
+        edgeSoftnessMeters: physical.edgeSoftnessMeters,
+        scleraArtwork: { texture: null, tint: [1, 1, 1, 0], opacity: 0 },
+        irisArtwork: { texture: null, tint: [1, 1, 1, 0], opacity: 0 },
+        pupilArtwork: { texture: null, tint: [1, 1, 1, 0], opacity: 0 },
+        highlight: { texture: null, tint: [1, 1, 1, 0], opacity: 0 },
+        cornea: physical.cornea
+      }
+    }
+    const socketRuntime = new SocketEyeSurfaceEngineRuntime(
+      root,
+      packageValue.socketEyeSurface,
+      packageValue.eyeApertureSeam,
+      { left: initialVisualState('left'), right: initialVisualState('right') }
+    )
+    this.eyeAppearanceRuntime = eyeRuntime
+    this.eyeAppearanceDefinition = packageValue.eyeAppearance
+    this.eyeAppearanceState = initialState
+    this.socketEyeSurfaceRuntime = socketRuntime
+    this.socketEyeSurfaceDefinition = packageValue.socketEyeSurface
+    this.eyeApertureSeamDefinition = packageValue.eyeApertureSeam
+    this.socketEyeGaze = {
+      left: { horizontal: 0, vertical: 0 },
+      right: { horizontal: 0, vertical: 0 }
+    }
+    this.socketEyeHeadAssist = { headYaw: 0, headPitch: 0 }
+  }
+
+  getOralAppearanceDefinition() {
+    return this.oralAppearanceDefinition
+  }
+
+  setOralAppearanceState(value: OralAppearanceStateV1 | null) {
+    const runtime = this.oralAppearanceRuntime
+    if (!runtime) {
+      if (value) throw new Error('The loaded Goon package does not support Oral Appearance.')
+      return
+    }
+    runtime.setState(value)
+    this.oralAppearanceState = value
+  }
+
+  private setupOralAppearance(
+    manifest: GoonCustomAvatarManifest,
+    initialState: OralAppearanceStateV1 | null
+  ) {
+    const rawDefinition = manifest.oralAppearance
     if (rawDefinition === undefined || rawDefinition === null) {
       if (initialState) {
-        throw new Error('Saved Eye Appearance state targets a package without eye-appearance/v1.')
+        throw new Error('Saved Oral Appearance state targets a package without oral-appearance/v1.')
       }
       return
     }
-    if (manifest.facialArtwork === undefined || manifest.facialArtwork === null) {
-      throw new Error('eye-appearance/v1 requires the matching facial-artwork/v3 package definition.')
+    if (
+      (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
+      (manifest.liveBuild === undefined || manifest.liveBuild === null)
+    ) {
+      throw new Error('oral-appearance/v1 requires a Recipe Source or verified Live Goon package.')
     }
-    if (manifest.appearanceDials === undefined || manifest.appearanceDials === null) {
-      throw new Error('eye-appearance/v1 requires the package Recipe appearance-dials/v2 definition.')
-    }
-    const definition = parseEyeAppearanceDefinition(rawDefinition)
-    const facialArtwork = parseFacialArtworkDefinition(manifest.facialArtwork)
-    if (definition.facialArtworkDependency.definitionSha256 !== facialArtwork.definitionSha256) {
-      throw new Error('eye-appearance/v1 does not match the package facial-artwork/v3 definition.')
-    }
+    const definition = parseOralAppearanceDefinition(rawDefinition)
     const root = this.customAvatarRoot
-    if (!root) throw new Error('Custom avatar root is missing during Eye Appearance setup.')
-    const runtime = new EyeAppearanceEngineRuntime(root, definition, initialState)
-    this.eyeAppearanceRuntime = runtime
-    this.eyeAppearanceDefinition = definition
-    this.eyeAppearanceState = initialState
+    if (!root) throw new Error('Custom avatar root is missing during Oral Appearance setup.')
+    const runtime = new OralAppearanceEngineRuntime(root, definition, initialState)
+    this.oralAppearanceRuntime = runtime
+    this.oralAppearanceDefinition = definition
+    this.oralAppearanceState = initialState
+  }
+
+  getLipArtworkDefinition() {
+    return this.lipArtworkDefinition
+  }
+
+  async setLipArtworkState(value: LipArtworkStateV2 | null) {
+    const runtime = this.lipArtworkRuntime
+    if (!runtime) {
+      if (value) throw new Error('The loaded Goon package does not support Lip Artwork.')
+      return
+    }
+    const applied = await runtime.apply(value)
+    if (applied) this.lipArtworkState = value
+  }
+
+  private async setupLipArtwork(
+    manifest: GoonCustomAvatarManifest,
+    initialState: LipArtworkStateV2 | null
+  ) {
+    const rawDefinition = manifest.lipArtwork
+    if (rawDefinition === undefined || rawDefinition === null) {
+      if (initialState) {
+        throw new Error('Saved Lip Artwork state targets a package without lip-artwork/v2.')
+      }
+      return
+    }
+    if (
+      (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
+      (manifest.liveBuild === undefined || manifest.liveBuild === null)
+    ) {
+      throw new Error('lip-artwork/v2 requires a Recipe Source or verified Live Goon package.')
+    }
+    const definition = parseLipArtworkDefinition(rawDefinition)
+    const root = this.customAvatarRoot
+    if (!root) throw new Error('Custom avatar root is missing during Lip Artwork setup.')
+    const runtime = new LipArtworkEngineRuntime(root, definition)
+    try {
+      await runtime.apply(initialState)
+    } catch (error) {
+      runtime.dispose()
+      throw error
+    }
+    this.lipArtworkRuntime = runtime
+    this.lipArtworkDefinition = definition
+    this.lipArtworkState = initialState
   }
 
   private async setupFacialArtwork(
-    manifest: GoonCustomAvatarManifest,
-    initialState: FacialArtworkStateV3 | null
+    definition: FacialArtworkDefinitionV4,
+    initialState: FacialArtworkStateV4 | null
   ) {
-    const rawDefinition = manifest.facialArtwork
-    if (rawDefinition === undefined || rawDefinition === null) {
-      if (initialState) {
-        throw new Error('Saved facial artwork targets a package without facial-artwork/v3.')
-      }
-      return
-    }
     const root = this.customAvatarRoot
     if (!root) throw new Error('Custom avatar root is missing during facial artwork setup.')
-    const definition = parseFacialArtworkDefinition(rawDefinition)
-    const runtime = new FacialArtworkEngineRuntime(root, definition)
+    const socketEyes = this.socketEyeSurfaceRuntime
+    const eyeAppearance = this.eyeAppearanceRuntime
+    if (!socketEyes || !eyeAppearance) {
+      throw new Error('Facial Artwork v4 requires the active socket-eye runtime.')
+    }
+    const runtime = new FacialArtworkEngineRuntime(
+      root,
+      definition,
+      socketEyes,
+      eyeAppearance
+    )
     try {
       await runtime.apply(initialState)
     } catch (error) {
@@ -2679,8 +3045,8 @@ export class GoonEngine implements GoonStageHost {
     const rawPerformanceRig = resolveCustomPerformanceRigBlock(manifest)
     const resolved = resolveCustomPerformanceRigManifest(rawPerformanceRig, {
       required:
-        manifest.appearanceDials !== undefined &&
-        manifest.appearanceDials !== null
+        (manifest.appearanceDials !== undefined && manifest.appearanceDials !== null) ||
+        (manifest.liveBuild !== undefined && manifest.liveBuild !== null)
     })
     if (resolved.issues.length > 0) {
       const message = resolved.issues.join('\n- ')
@@ -2903,6 +3269,45 @@ export class GoonEngine implements GoonStageHost {
     )
   }
 
+  /** Bind the baker-projected, authoring-free corrective contract in a Live Goon. */
+  private setupLiveJointCorrectives(manifest: GoonCustomAvatarManifest) {
+    const root = this.customAvatarRoot
+    if (!root) throw new Error('Custom avatar root is missing during Live corrective setup.')
+    const spec = parseLiveJointCorrectivesFromManifest(manifest)
+    if (!spec) return
+    const drivers: Array<{ driver: JointCorrectiveDriver; nodes: THREE.Object3D[] }> = []
+    for (const driver of spec.drivers) {
+      const nodes = driver.bones.map((bone) => {
+        const node = resolveCustomNamedNode(root, bone.bone)
+        if (!node) {
+          throw new Error(`Live corrective driver bone ${bone.bone} is missing from avatar.glb.`)
+        }
+        return node
+      })
+      drivers.push({ driver, nodes })
+    }
+    const bindings = new Map<string, { mesh: THREE.Mesh; index: number }>()
+    for (const entry of spec.entries) {
+      const node = resolveCustomNamedNode(root, entry.node)
+      const mesh = node as THREE.Mesh | null
+      if (!mesh || !(mesh as { isMesh?: boolean }).isMesh) {
+        throw new Error(`Live corrective node ${entry.node} is missing or is not a mesh.`)
+      }
+      const index = mesh.morphTargetDictionary?.[entry.morph]
+      if (index === undefined || !Array.isArray(mesh.morphTargetInfluences)) {
+        throw new Error(`Live corrective morph ${entry.node}/${entry.morph} is missing from avatar.glb.`)
+      }
+      bindings.set(`${entry.node}\u0000${entry.morph}`, { mesh, index })
+    }
+    this.liveJointCorrectivesSpec = spec
+    this.liveJointCorrectiveBindings = bindings
+    this.jointCorrectivesDrivers = drivers
+    logger.debug(
+      `[GoonEngine] Live joint correctives ready: ${spec.drivers.length} driver(s), ` +
+        `${spec.entries.length} entries`
+    )
+  }
+
   private resolveBodyDialBone(name: string) {
     if (!this.bodyDialsBones) return null
     const direct = this.bodyDialsBones.get(name)
@@ -3061,12 +3466,13 @@ export class GoonEngine implements GoonStageHost {
    */
   private applyJointCorrectives() {
     const spec = this.jointCorrectivesSpec
+    const liveSpec = this.liveJointCorrectivesSpec
     const bodyManifest = this.bodyDialsManifest
     const appearanceRuntime = this.appearanceDialsRuntime
     const appearanceManifest = this.appearanceDialsManifest
     if (
-      !spec ||
-      (!bodyManifest && (!appearanceRuntime || !appearanceManifest)) ||
+      (!spec && !liveSpec) ||
+      (spec && !bodyManifest && (!appearanceRuntime || !appearanceManifest)) ||
       this.jointCorrectivesDrivers.length === 0
     ) return
 
@@ -3086,7 +3492,16 @@ export class GoonEngine implements GoonStageHost {
     const active = maxAngle >= 0.05
     if (!active && !this.jointCorrectivesActive) return
 
-    if (appearanceRuntime && appearanceManifest) {
+    if (liveSpec) {
+      const finals = evaluateLiveJointCorrectiveAngles(liveSpec, angles)
+      for (const [key, value] of finals) {
+        const binding = this.liveJointCorrectiveBindings.get(key)
+        if (!binding || !Array.isArray(binding.mesh.morphTargetInfluences)) {
+          throw new Error(`Live corrective runtime binding ${key} disappeared after package validation.`)
+        }
+        binding.mesh.morphTargetInfluences[binding.index] = value
+      }
+    } else if (spec && appearanceRuntime && appearanceManifest) {
       const appearanceState = appearanceRuntime.getState()
       const finals = evaluateJointCorrectives(
         spec,
@@ -3096,7 +3511,7 @@ export class GoonEngine implements GoonStageHost {
         appearanceManifest.targets
       )
       appearanceRuntime.applyTargetInfluences(finals)
-    } else if (bodyManifest) {
+    } else if (spec && bodyManifest) {
       const finals = evaluateJointCorrectives(
         spec,
         angles,
@@ -3128,6 +3543,7 @@ export class GoonEngine implements GoonStageHost {
     this.customExpressionMorphMap.clear()
     this.customFaceControlMap = null
     this.customMorphDefinitions = []
+    this.customArkitFaceDriverBindings = null
     this.customFaceManifestIssues = []
     this.faceControlSummaryLog = ''
     this.faceControlDebugLogged = false
@@ -3173,33 +3589,74 @@ export class GoonEngine implements GoonStageHost {
     this.faceMorphTargetNames = [...normalizedNames].sort((a, b) => a.localeCompare(b))
     this.authorableRawMorphTargetNames = [...rawNames].sort((a, b) => a.localeCompare(b))
 
-    const manifestExpressions = resolveCustomExpressionBindings(manifest)
+    const expressionContract = resolveCustomExpressionBindingContract(manifest)
+    const manifestExpressions = expressionContract.bindings
+    const speechFaceProfile = resolveCustomSpeechFaceProfile(manifest)
+    const arkitFaceBindings = resolveCustomArkitFaceBindings(manifest)
+    this.customFaceManifestIssues.push(...speechFaceProfile.issues)
+    this.customFaceManifestIssues.push(...arkitFaceBindings.issues)
+    this.customFaceManifestIssues.push(...expressionContract.issues)
+
+    const resolveAvailableArkitBindings = <TChannel extends string>(
+      bindings: Map<TChannel, string[]> | null,
+      path: string
+    ): Map<TChannel, string[]> | null => {
+      if (!bindings) return null
+      const resolved = new Map<TChannel, string[]>()
+      let complete = true
+      for (const [channel, targetNames] of bindings) {
+        const missingTargets = targetNames.filter(
+          (targetName) =>
+            !this.faceMorphBindings.some((binding) => binding.dict[targetName] !== undefined)
+        )
+        if (missingTargets.length > 0) {
+          complete = false
+          this.customFaceManifestIssues.push(
+            `${path}.${channel} does not resolve morph targets in the model: ${missingTargets.join(', ')}.`
+          )
+          continue
+        }
+        resolved.set(channel, targetNames)
+      }
+      return complete ? resolved : null
+    }
+
+    const resolvedArkitFace = resolveAvailableArkitBindings(
+      arkitFaceBindings.face,
+      'face.arkit52'
+    )
+    const resolvedArkitTongue = resolveAvailableArkitBindings(
+      arkitFaceBindings.tongue,
+      'face.tongue16'
+    )
+    this.customArkitFaceDriverBindings = resolvedArkitFace
+      ? { face: resolvedArkitFace, tongue: resolvedArkitTongue }
+      : null
     if (manifest.face && Object.keys(manifestExpressions).length === 0) {
       this.customFaceManifestIssues.push(
         'Custom face contract is missing semantic expression/viseme mappings.'
       )
     }
 
-    for (const [preset, targetNames] of Object.entries(manifestExpressions)) {
-      const resolvedTargets = [
-        ...new Set(
-          targetNames.filter((targetName) =>
-            this.faceMorphBindings.some((binding) => binding.dict[targetName] !== undefined)
-          )
+    for (const [preset, targetBindings] of Object.entries(manifestExpressions)) {
+      const missingTargets = targetBindings
+        .map((binding) => binding.target)
+        .filter(
+          (targetName) =>
+            !this.faceMorphBindings.some((binding) => binding.dict[targetName] !== undefined)
         )
-      ]
 
-      if (resolvedTargets.length === 0) {
+      if (missingTargets.length > 0) {
         this.customFaceManifestIssues.push(
-          `Custom face preset "${preset}" does not resolve to any morph targets in the model.`
+          `Custom face preset "${preset}" does not resolve every mapped morph target in the model: ${missingTargets.join(', ')}.`
         )
         continue
       }
 
-      this.customExpressionMorphMap.set(preset as GoonExpressionPreset, resolvedTargets)
-      if (CUSTOM_MOUTH_PRESET_ORDER.includes(preset as GoonExpressionPreset)) {
-        for (const targetName of resolvedTargets) {
-          this.mouthExpressionMorphTargetNames.add(targetName)
+      this.customExpressionMorphMap.set(preset as GoonExpressionPreset, targetBindings)
+      if (isCustomCompatibleMouthPreset(preset as GoonExpressionPreset)) {
+        for (const binding of targetBindings) {
+          this.mouthExpressionMorphTargetNames.add(binding.target)
         }
       }
     }
@@ -3269,17 +3726,20 @@ export class GoonEngine implements GoonStageHost {
         return false
       })
 
-    this.hasMouthBlendshapes = CUSTOM_LIP_SYNC_MOUTH_PRESET_ORDER.some((preset) =>
-      this.customExpressionMorphMap.has(preset)
+    this.customMouthPresetSupport = resolveCustomMouthPresetSupport(
+      this.customExpressionMorphMap.keys(),
+      speechFaceProfile.profile
     )
-    this.availableMouthPresets = new Set<GoonExpressionPreset>(
-      CUSTOM_LIP_SYNC_MOUTH_PRESET_ORDER.filter((preset) =>
-        this.customExpressionMorphMap.has(preset)
+    if (speechFaceProfile.profile && this.customMouthPresetSupport.mode === 'none') {
+      this.customFaceManifestIssues.push(
+        `Custom face speech profile "${speechFaceProfile.profile}" does not resolve every required moving channel in the model.`
       )
-    )
+    }
+    this.hasMouthBlendshapes = this.customMouthPresetSupport.mode !== 'none'
+    this.availableMouthPresets = new Set(this.customMouthPresetSupport.availablePresets)
     this.hasExpressionBlendshapes = this.customExpressionMorphMap.size > 0
 
-    const summary = `[GoonEngine] Manifest face support: ${this.faceMorphBindings.length} morph meshes, ${this.faceMorphTargetNames.length} morph names, ${this.customExpressionMorphMap.size} mapped presets, ${this.faceControlMorphNames.length} mapped control morphs, ${this.customMorphDefinitions.length} custom morphs`
+    const summary = `[GoonEngine] Manifest face support: ${this.faceMorphBindings.length} morph meshes, ${this.faceMorphTargetNames.length} morph names, ${this.customExpressionMorphMap.size} mapped presets, ${this.faceControlMorphNames.length} mapped control morphs, ${this.customMorphDefinitions.length} custom morphs, Audio2Face ${this.customArkitFaceDriverBindings ? 'ready' : 'not declared'}`
     if (summary !== this.faceControlSummaryLog) {
       this.faceControlSummaryLog = summary
       logger.debug(summary)
@@ -3299,13 +3759,11 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private emitCustomCompatibility() {
-    const hasHead = Boolean(this.customStageAnchors.head)
-    const hasHips = Boolean(this.customStageAnchors.hips)
-    const hasFeet = Boolean(
-      this.customStageAnchors.feet ||
-        (this.customStageAnchors.leftFoot && this.customStageAnchors.rightFoot)
-    )
-    const present = [hasHead, hasHips, hasFeet].filter(Boolean).length
+    const root = this.customAvatarRoot
+    const manifest = this.customAvatarManifest
+    if (!root || !manifest) return
+
+    const coverage = resolveCustomRigCompatibilityCoverage(root, manifest)
     const hasBlink =
       this.customExpressionMorphMap.has(VRMExpressionPresetName.Blink) ||
       this.customExpressionMorphMap.has(VRMExpressionPresetName.BlinkLeft) ||
@@ -3323,30 +3781,44 @@ export class GoonEngine implements GoonStageHost {
 
     const issues = [...this.customFaceManifestIssues]
 
-    if (!hasHead) issues.push('Missing Custom stage anchor: head.')
-    if (!hasHips) issues.push('Missing Custom stage anchor: hips.')
-    if (!hasFeet) issues.push('Missing Custom stage anchor: feet.')
     if (!this.hasMouthBlendshapes) {
       issues.push('Missing mouth viseme mappings (lip sync unavailable).')
     }
     if (!hasCoreExpressions) {
       issues.push('Missing core Custom expression mappings.')
     }
+    if (coverage.present < coverage.total) {
+      issues.push(`Rig coverage: ${coverage.present}/${coverage.total} key bones detected.`)
+    }
+    if (coverage.missingCoreBones.length > 0) {
+      issues.push(`Missing core bones: ${coverage.missingCoreBones.join(', ')}.`)
+    }
+    if (coverage.missingUpperBody.length > 0) {
+      issues.push(`Missing upper-body bones: ${coverage.missingUpperBody.join(', ')}.`)
+    }
+    if (coverage.missingArms.length > 0) {
+      issues.push(`Missing arm bones: ${coverage.missingArms.join(', ')}.`)
+    }
     if (!this.hasBodyAnimations) {
       issues.push('No animations detected (procedural motions only).')
     }
+    for (const warning of this.animationWarnings) {
+      if (!issues.includes(warning)) issues.push(warning)
+    }
 
-    this.boneCoveragePresent = present
-    this.boneCoverageTotal = 3
+    this.boneCoveragePresent = coverage.present
+    this.boneCoverageTotal = coverage.total
+    const animationNames = Array.from(this.animationMap.keys())
+    const criticalBonesMissing = coverage.missingCoreBones.length > 0
     this.onCompatibility?.({
       tier:
-        hasHead && hasHips && hasFeet
-          ? this.hasMouthBlendshapes && hasCoreExpressions
+        criticalBonesMissing
+          ? 'C'
+          : this.hasMouthBlendshapes && hasCoreExpressions
             ? 'A'
             : this.hasMouthBlendshapes
               ? 'B'
-              : 'C'
-          : 'C',
+              : 'C',
       issues,
       hasMouth: this.hasMouthBlendshapes,
       hasExpressions: this.hasExpressionBlendshapes,
@@ -3356,8 +3828,17 @@ export class GoonEngine implements GoonStageHost {
         present: this.boneCoveragePresent,
         total: this.boneCoverageTotal
       },
+      animationNames: animationNames.length > 0 ? animationNames : undefined,
       updated_at: new Date().toISOString()
     })
+  }
+
+  private emitActiveCompatibility() {
+    if (this.customAvatarRoot) {
+      this.emitCustomCompatibility()
+      return
+    }
+    this.emitCompatibility()
   }
 
   private applyDefaultCamera() {
@@ -3924,16 +4405,26 @@ export class GoonEngine implements GoonStageHost {
     const anchors = headTarget && hipsTarget && feetTarget
       ? { headY: headTarget.y, hipsY: hipsTarget.y, feetY: feetTarget.y }
       : null
+    const provisionalLimits = this.resolveCameraDistanceLimits()
     const framing = resolveGoonFraming({
       bounds,
       preset,
       verticalFovDegrees: this.camera.fov,
       aspect: this.camera.aspect,
-      minDistance: this.controls.minDistance ?? 0.8,
-      maxDistance: this.controls.maxDistance ?? 6,
+      minDistance: provisionalLimits.minDistance,
+      maxDistance: provisionalLimits.maxDistance,
       anchors
     })
     if (!framing) return false
+
+    const finalLimits = this.resolveCameraDistanceLimits(framing.target)
+    this.controls.minDistance = finalLimits.minDistance
+    this.controls.maxDistance = finalLimits.maxDistance
+    const framingDistance = THREE.MathUtils.clamp(
+      framing.distance,
+      finalLimits.minDistance,
+      finalLimits.maxDistance
+    )
 
     const forward = new THREE.Vector3()
     this.camera.getWorldDirection(forward)
@@ -3941,7 +4432,10 @@ export class GoonEngine implements GoonStageHost {
       forward.set(0, 0, -1)
     }
     this.controls.target.copy(framing.target)
-    this.camera.position.copy(framing.target).addScaledVector(forward, -framing.distance)
+    this.camera.position.copy(framing.target).addScaledVector(forward, -framingDistance)
+    // A preset establishes a new physical frame. Do not persist a stale
+    // hybrid-wheel logical zoom that would override this distance on reload.
+    this.cameraZoomPosition = null
     this.camera.updateMatrixWorld()
     this.controls.update()
     this.syncSkyboxZoomFromCamera()
@@ -5638,7 +6132,7 @@ export class GoonEngine implements GoonStageHost {
       this.lastFpsTime = this.lastFrameTime
       this.lastPoseUpdateTime = this.lastFrameTime
       this.frameCounter = 0
-      this.renderer.setAnimationLoop(() => this.update())
+      this.renderer.setAnimationLoop(this.runAnimationFrame)
     }
   }
 
@@ -5658,6 +6152,14 @@ export class GoonEngine implements GoonStageHost {
       this.eyeContactPitchTravel = 'out'
     }
     this.eyeContactEnabled = value
+  }
+
+  setSocketEyeContactSettings(value: SocketEyeContactSettingsV2 | null | undefined) {
+    this.socketEyeContact = resolveSocketEyeContactSettings(value)
+  }
+
+  getSocketEyeContactSettings() {
+    return { ...this.socketEyeContact }
   }
 
   setEyeContactMode(value: GoonEyeContactMode) {
@@ -5884,14 +6386,26 @@ export class GoonEngine implements GoonStageHost {
   }
 
   setMood(name: string, definition?: GoonCueDefinition, options: PlacementOptions = {}) {
+    const face = definition
+      ? selectCueFacePayload(definition, {
+          arkit52Available: this.customArkitFaceDriverBindings !== null,
+          arkit52Bindings: this.customArkitFaceDriverBindings?.face
+        })
+      : null
     this.baseLoop = name
     this.baseLoopAnimationName = definition?.animationName ?? name
     this.baseLoopPosture = this.resolvePosture(name, definition)
     this.activeMood = definition ?? null
-    this.moodExpressionTargets = this.resolveExpressionTargets(name, definition)
+    this.moodExpressionTargets = this.resolveExpressionTargets(
+      name,
+      definition && face
+        ? { ...definition, expressionTargets: face.expressionTargets }
+        : definition,
+      face?.profile !== 'arkit52'
+    )
     this.moodExpressionIntensity = definition?.intensity ?? 1
-    this.moodFaceControls = definition?.faceControls ?? []
-    this.moodRawMorphTargets = definition?.rawMorphTargets ?? []
+    this.moodFaceControls = face?.faceControls ?? []
+    this.moodRawMorphTargets = face?.rawMorphTargets ?? []
     this.syncBaseLoopAnimation()
     if (this.baseLoopAnimationName && !this.animationMap.has(this.baseLoopAnimationName)) {
       this.requestDeferredAnimation(this.baseLoopAnimationName, 'mood', definition, name)
@@ -5912,15 +6426,23 @@ export class GoonEngine implements GoonStageHost {
       : {
           name,
           kind: 'emote',
+          faceProfiles: definition.faceProfiles,
           expressionTargets: definition.expressionTargets,
           faceControls: definition.faceControls,
           rawMorphTargets: definition.rawMorphTargets
         }
+    const face = selectCueFacePayload(cueLike, {
+      arkit52Available: this.customArkitFaceDriverBindings !== null,
+      arkit52Bindings: this.customArkitFaceDriverBindings?.face
+    })
 
-    this.authoringPreviewExpressionTargets = this.resolveExpressionTargets(name, cueLike)
+    this.authoringPreviewExpressionTargets = this.resolveExpressionTargets(name, {
+      ...cueLike,
+      expressionTargets: face.expressionTargets
+    }, face.profile !== 'arkit52')
     this.authoringPreviewIntensity = cueLike.intensity ?? 1
-    this.authoringPreviewFaceControls = cueLike.faceControls ?? []
-    this.authoringPreviewRawMorphTargets = cueLike.rawMorphTargets ?? []
+    this.authoringPreviewFaceControls = face.faceControls
+    this.authoringPreviewRawMorphTargets = face.rawMorphTargets
   }
 
   clearAuthoringFacePreview() {
@@ -5928,6 +6450,171 @@ export class GoonEngine implements GoonStageHost {
     this.authoringPreviewIntensity = 1
     this.authoringPreviewFaceControls = []
     this.authoringPreviewRawMorphTargets = []
+  }
+
+  /**
+   * Capture serializable same-Goon continuity before a mounted Live revision
+   * is replaced. No mixer, action, scene-node, material, or runtime object is
+   * allowed across the engine boundary.
+   */
+  captureMountedRuntimeState(): GoonMountedRuntimeState {
+    const now = performance.now()
+    const baseLoopClip = this.baseLoopAction?.getClip().name ?? null
+    return {
+      camera: this.getCameraState(),
+      baseLoop: {
+        name: this.baseLoop,
+        definition: this.activeMood ? structuredClone(this.activeMood) : null,
+        clipName: baseLoopClip,
+        time: this.baseLoopAction?.time ?? 0
+      },
+      oneShot: this.oneShotAction
+        ? {
+            clipName: this.oneShotAction.getClip().name,
+            time: this.oneShotAction.time,
+            restorePosture: this.oneShotRestorePosture,
+            preserveCamera: this.oneShotRestorePreserveCamera,
+            overridePosture: this.animationOverridePosture
+          }
+        : null,
+      eyeContact: {
+        enabled: this.eyeContactEnabled,
+        mode: this.eyeContactMode,
+        tuning: { ...this.eyeContactTuning },
+        applied: { ...this.eyeContactApplied },
+        ...(this.socketEyeSurfaceDefinition
+          ? { socket: { ...this.socketEyeContact } }
+          : {})
+      },
+      performance: {
+        direction: { ...this.customPerformanceDirection },
+        moodFaceBlend: this.moodFaceBlend,
+        activeEmoteRemainingMs: Math.max(0, this.activeEmoteUntil - now),
+        expressions: this.activeExpressions.map((expression) => {
+          const {
+            endsAt,
+            startTime,
+            stepStartTime,
+            ...rest
+          } = structuredClone(expression)
+          return {
+            ...rest,
+            remainingMs: Math.max(0, endsAt - now),
+            elapsedMs: Math.max(0, now - startTime),
+            stepElapsedMs: Math.max(0, now - stepStartTime)
+          }
+        })
+      },
+      speech: {
+        speaking: this.speaking,
+        pausedForCue: this.speechPausedForCue,
+        timeline: this.speechLipSyncTimeline
+          ? structuredClone(this.speechLipSyncTimeline)
+          : null,
+        analyzerId: this.speechLipSyncAnalyzerId,
+        durationMs: this.speechLipSyncDurationMs,
+        elapsedMs: this.getSpeechLipSyncElapsedMs()
+      }
+    }
+  }
+
+  /** Restore semantic continuity after the incoming engine is fully loaded. */
+  restoreMountedRuntimeState(state: GoonMountedRuntimeState) {
+    const now = performance.now()
+    this.setEyeContactEnabled(state.eyeContact.enabled)
+    this.setEyeContactMode(state.eyeContact.mode)
+    this.setEyeContactTuning(state.eyeContact.tuning)
+    if (state.eyeContact.socket) {
+      this.setSocketEyeContactSettings(state.eyeContact.socket)
+    }
+    this.eyeContactApplied = { ...state.eyeContact.applied }
+    this.customPerformanceDirection = { ...state.performance.direction }
+
+    this.setMood(state.baseLoop.name, state.baseLoop.definition ?? undefined, {
+      preservePlacement: true,
+      preserveCamera: true
+    })
+    if (
+      state.baseLoop.clipName &&
+      this.baseLoopAction?.getClip().name === state.baseLoop.clipName
+    ) {
+      this.baseLoopAction.time = state.baseLoop.time
+    }
+
+    if (state.oneShot && this.playOneShotAnimation(state.oneShot.clipName)) {
+      if (this.oneShotAction) this.oneShotAction.time = state.oneShot.time
+      this.oneShotRestorePosture = state.oneShot.restorePosture
+      this.oneShotRestorePreserveCamera = state.oneShot.preserveCamera
+      this.animationOverridePosture = state.oneShot.overridePosture
+    }
+
+    this.moodFaceBlend = state.performance.moodFaceBlend
+    this.moodFaceBlendUpdatedAt = now
+    this.activeEmoteUntil = now + state.performance.activeEmoteRemainingMs
+    this.activeExpressions = state.performance.expressions.map((expression) => {
+      const { remainingMs, elapsedMs, stepElapsedMs, ...rest } = structuredClone(expression)
+      return {
+        ...rest,
+        endsAt: now + remainingMs,
+        startTime: now - elapsedMs,
+        stepStartTime: now - stepElapsedMs
+      }
+    })
+    this.speaking = state.speech.speaking
+    this.speechPausedForCue = state.speech.pausedForCue
+    this.speechLipSyncTimeline = state.speech.timeline
+      ? structuredClone(state.speech.timeline)
+      : null
+    this.speechLipSyncAnalyzerId = state.speech.analyzerId
+    this.speechLipSyncDurationMs = state.speech.durationMs
+    this.speechLipSyncStartedAt = state.speech.timeline
+      ? now - state.speech.elapsedMs
+      : 0
+    if (state.camera) this.applyCamera(state.camera)
+  }
+
+  /**
+   * Snapshot the single-engine Settings comparison state before swapping a
+   * Recipe Source. This is editor-only continuity data; it does not alter the
+   * mounted Dock/stage ownership contract handled by Packet R6.
+   */
+  captureComparisonPreviewState() {
+    const actionState = (action: THREE.AnimationAction | null) => action
+      ? { clipName: action.getClip().name, time: action.time }
+      : null
+    return {
+      camera: this.getCameraState(),
+      baseLoop: actionState(this.baseLoopAction),
+      oneShot: actionState(this.oneShotAction),
+      authoringPose: actionState(this.authoringPoseAction),
+      authoringPoseMode: this.authoringPoseMode,
+      authoringPoseAnimationName: this.authoringPoseAnimationName
+    }
+  }
+
+  /** Restore camera/pose/animation time after a matched Recipe preview swap. */
+  restoreComparisonPreviewState(
+    state: ReturnType<GoonEngine['captureComparisonPreviewState']>
+  ) {
+    if (state.camera) this.applyCamera(state.camera)
+    if (state.authoringPoseMode) {
+      this.setAuthoringPoseMode(true, state.authoringPoseAnimationName)
+      if (
+        state.authoringPose &&
+        this.authoringPoseAction?.getClip().name === state.authoringPose.clipName
+      ) {
+        this.authoringPoseAction.time = state.authoringPose.time
+      }
+      return
+    }
+    if (state.oneShot && this.playOneShotAnimation(state.oneShot.clipName)) {
+      if (this.oneShotAction) this.oneShotAction.time = state.oneShot.time
+      return
+    }
+    this.syncBaseLoopAnimation()
+    if (state.baseLoop && this.baseLoopAction?.getClip().name === state.baseLoop.clipName) {
+      this.baseLoopAction.time = state.baseLoop.time
+    }
   }
 
   setAuthoringPoseMode(enabled: boolean, animationName?: string | null) {
@@ -5978,21 +6665,6 @@ export class GoonEngine implements GoonStageHost {
     const motionPosture = animationName ? this.animationMetadata.get(animationName)?.posture : undefined
     if (motionPosture) return motionPosture
     return resolveBasePosture(name as GoonPosture | undefined, undefined, this.postureDefinitions)
-  }
-
-  private resolveEmoteMotionPosture(name?: string, definition?: GoonCueDefinition): GoonPosture | null {
-    const animationName = definition?.animationName?.trim()
-    if (!animationName) return null
-
-    const motionPosture = this.animationMetadata.get(animationName)?.posture
-    if (motionPosture) return motionPosture
-
-    const lowered = animationName.toLowerCase()
-    if (!/(^|[_\s-])sit|seat|seated|lay|lie|lying|stand|standing/.test(lowered)) {
-      return null
-    }
-
-    return resolveBasePosture(animationName as GoonPosture, undefined, this.postureDefinitions)
   }
 
   private resolveActionMotionMetadata(action: THREE.AnimationAction | null) {
@@ -6150,7 +6822,7 @@ export class GoonEngine implements GoonStageHost {
     }
 
     if (added || hadWarnings) {
-      this.emitCompatibility()
+      this.emitActiveCompatibility()
       this.syncBaseLoopAnimation()
     }
   }
@@ -6165,7 +6837,7 @@ export class GoonEngine implements GoonStageHost {
     if (files && files.length > 0) {
       await this.loadAdditionalAnimations(files, token)
     } else {
-      this.emitCompatibility()
+      this.emitActiveCompatibility()
       this.syncBaseLoopAnimation()
     }
 
@@ -6258,8 +6930,6 @@ export class GoonEngine implements GoonStageHost {
       this.pendingAnimationRequests.delete(name)
       if (request.kind === 'mood') {
         this.setMood(request.cueName, request.definition)
-      } else if (request.kind === 'emote') {
-        this.playEmote(request.cueName, request.definition)
       } else {
         this.playOneShotAnimation(name)
       }
@@ -7181,7 +7851,7 @@ export class GoonEngine implements GoonStageHost {
 
   resetAnimationWarnings() {
     this.animationWarnings = []
-    this.emitCompatibility()
+    this.emitActiveCompatibility()
   }
 
   private registerAnimations(
@@ -7626,12 +8296,18 @@ export class GoonEngine implements GoonStageHost {
     }
 
     if (playback === 'oneshot' || kind === 'emote') {
-      this.playEmote(name, definition, options)
+      this.playEmote(name, definition)
       return
     }
 
-    if (definition?.expressionTargets || definition?.animationName) {
-      this.playEmote(name, definition, options)
+    if (
+      definition?.faceProfiles ||
+      definition?.expressionTargets ||
+      definition?.faceControls ||
+      definition?.rawMorphTargets ||
+      definition?.steps
+    ) {
+      this.playEmote(name, definition)
       return
     }
 
@@ -7646,7 +8322,6 @@ export class GoonEngine implements GoonStageHost {
       return
     }
     this.requestDeferredAnimation(fallbackAnimationName, 'generic', definition)
-    this.triggerGesture(name, definition, options)
   }
 
   dispose() {
@@ -7829,6 +8504,14 @@ export class GoonEngine implements GoonStageHost {
     this.renderer.domElement.style.height = '100%'
   }
 
+  private runAnimationFrame = () => {
+    try {
+      this.update()
+    } catch (error) {
+      this.handleRenderFailure(error)
+    }
+  }
+
   private update() {
     if (this.renderFailed) return
     const now = performance.now()
@@ -7836,7 +8519,6 @@ export class GoonEngine implements GoonStageHost {
     const hasSceneAmbience = Boolean(this.sceneAmbienceRuntime)
     const idle =
       !this.speaking &&
-      !this.activeGesture &&
       !hasExpressions &&
       !hasSceneAmbience &&
       !this.baseLoopAction &&
@@ -7864,7 +8546,6 @@ export class GoonEngine implements GoonStageHost {
 
     if (this.customAvatarRoot) {
       this.customPerformanceRigRuntime?.removeOverlay()
-      this.eyeAppearanceRuntime?.removeOverlay()
     }
     if (this.mixer && !this.authoringPoseMode) {
       this.mixer.update(delta)
@@ -7875,7 +8556,7 @@ export class GoonEngine implements GoonStageHost {
     if (this.customAvatarRoot && this.appearanceDialsRuntime) {
       this.appearanceDialsRuntime.applyHipsClipRemap()
     }
-    if (this.customAvatarRoot && this.jointCorrectivesSpec) {
+    if (this.customAvatarRoot && (this.jointCorrectivesSpec || this.liveJointCorrectivesSpec)) {
       this.applyJointCorrectives()
     }
 
@@ -7890,7 +8571,8 @@ export class GoonEngine implements GoonStageHost {
         if (
           this.customExpressionMorphMap.size > 0 ||
           this.customFaceControlMap !== null ||
-          this.customMorphDefinitions.length > 0
+          this.customMorphDefinitions.length > 0 ||
+          this.customArkitFaceDriverBindings !== null
         ) {
           this.applyCustomPerformance(elapsed)
         }
@@ -7908,11 +8590,7 @@ export class GoonEngine implements GoonStageHost {
         this.applyCustomPerformance(elapsed)
         this.lastPoseUpdateTime = now
       }
-      this.eyeAppearanceRuntime?.applyOverlay()
-      this.customPerformanceRigRuntime?.apply(
-        this.customPerformanceDirection,
-        this.customPerformanceTargetWeights
-      )
+      this.applyCustomPerformanceOverlays()
     }
 
     if (this.guidedDufOverlayBonePairs.length > 0) {
@@ -8213,7 +8891,6 @@ export class GoonEngine implements GoonStageHost {
         this.applySpeakingMotion(elapsed)
       }
 
-      this.applyGestures(elapsed)
     }
 
     if (manager) {
@@ -8245,120 +8922,152 @@ export class GoonEngine implements GoonStageHost {
       )
     }
 
-    if (this.hasMouthBlendshapes) {
-      const lipSyncWeights = this.resolveCurrentLipSyncWeights(
-        elapsed,
-        PRECOMPUTED_LIP_SYNC_CUSTOM_INTENSITY_SCALE
-      )
-      for (const preset of CUSTOM_LIP_SYNC_MOUTH_PRESET_ORDER) {
-        const value = lipSyncWeights[preset]
-        if (!this.availableMouthPresets.has(preset) || value <= 0.001) continue
+    const fullStrengthLipSyncFrame = this.resolveCurrentLipSyncFrame(elapsed, 1)
+    const directArkitFaceDriverWeights = this.customArkitFaceDriverBindings
+      ? resolveDirectCustomArkitFaceDriverWeights(
+          fullStrengthLipSyncFrame,
+          this.customArkitFaceDriverBindings
+        )
+      : null
+
+    if (this.hasMouthBlendshapes && !directArkitFaceDriverWeights) {
+      const lipSyncFrame =
+        this.lipSyncMode === 'viseme' && this.speechLipSyncTimeline
+          ? scaleGoonSpeechFaceFrame(
+              fullStrengthLipSyncFrame,
+              PRECOMPUTED_LIP_SYNC_CUSTOM_INTENSITY_SCALE
+            )
+          : fullStrengthLipSyncFrame
+      for (const [preset, value] of resolveCustomLipSyncPresetWeights(
+        lipSyncFrame,
+        this.customMouthPresetSupport
+      )) {
         const current = expressionWeights.get(preset) ?? 0
         expressionWeights.set(preset, Math.max(current, value))
       }
     }
 
     const rawMorphWeights = resolveRawMorphTargets(this.collectCustomRawMorphTargets(now))
+    const finalRawMorphWeights = new Map(directArkitFaceDriverWeights ?? [])
+    for (const [targetName, value] of rawMorphWeights) {
+      finalRawMorphWeights.set(targetName, value)
+    }
     const authoredPerformanceDirection = resolveCustomPerformanceDirection({
       expressionTargets: directionExpressionTargets,
       faceControls,
-      rawTargetWeights: rawMorphWeights
+      rawTargetWeights: finalRawMorphWeights
     })
     this.customPerformanceDirection = authoredPerformanceDirection
     if (this.customPerformanceRigRuntime && this.customAvatarRoot) {
-      const authoredEyeContact = resolveCustomPerformanceEyeContactState(
-        authoredPerformanceDirection
-      )
-      const suppressCameraContact =
-        this.isStaticPoseOverrideActive() || this.lookActive
-      const eyeContactActiveForMotion =
-        this.eyeContactEnabled && !this.isEyeContactSuppressedByMotion()
-
-      if (suppressCameraContact) {
-        this.eyeContactApplied = { ...authoredEyeContact }
+      if (this.customPerformanceRigRuntime.usesSocketEyeDriver()) {
+        // The socket path owns eye projection and head follow in the overlay
+        // phase. Never route it through the shared globe/bone Eye Contact
+        // solver or synthesize Look* expression morphs.
+        this.eyeContactApplied = resolveCustomPerformanceEyeContactState(
+          authoredPerformanceDirection
+        )
       } else {
-        if (eyeContactActiveForMotion) {
-          this.customPerformanceRigRuntime.neutralizeMotionLookNodes()
-        }
-        this.applyEyeContact({
-          ...authoredEyeContact,
-          authoredEyeOverride: hasCustomPerformanceAuthoredEyeDirection(
-            authoredPerformanceDirection
-          ),
-          enabled: eyeContactActiveForMotion
-        })
-      }
+        const authoredEyeContact = resolveCustomPerformanceEyeContactState(
+          authoredPerformanceDirection
+        )
+        const suppressCameraContact =
+          this.isStaticPoseOverrideActive() || this.lookActive
+        const eyeContactActiveForMotion =
+          this.eyeContactEnabled && !this.isEyeContactSuppressedByMotion()
 
-      if (this.eyeLookFreezeHeadEnabled) {
-        this.eyeContactApplied.headYaw = 0
-        this.eyeContactApplied.headPitch = 0
-      }
-
-      const ambientEyeYaw =
-        this.eyeContactApplied.eyeYaw - authoredEyeContact.eyeYaw
-      const ambientEyePitch =
-        this.eyeContactApplied.eyePitch - authoredEyeContact.eyePitch
-      const ambientEyeLookWeights = resolveEyeLookExpressionWeights(
-        ambientEyeYaw,
-        ambientEyePitch,
-        this.eyeContactTuning
-      )
-      this.mergeExpressionWeight(
-        expressionWeights,
-        VRMExpressionPresetName.LookLeft,
-        ambientEyeLookWeights.lookLeft
-      )
-      this.mergeExpressionWeight(
-        expressionWeights,
-        VRMExpressionPresetName.LookRight,
-        ambientEyeLookWeights.lookRight
-      )
-      this.mergeExpressionWeight(
-        expressionWeights,
-        VRMExpressionPresetName.LookUp,
-        ambientEyeLookWeights.lookUp
-      )
-      this.mergeExpressionWeight(
-        expressionWeights,
-        VRMExpressionPresetName.LookDown,
-        ambientEyeLookWeights.lookDown
-      )
-      this.customPerformanceDirection = composeCustomPerformanceEyeContact(
-        authoredPerformanceDirection,
-        this.eyeContactApplied,
-        {
-          eyeYaw: this.eyeContactTuning.eyeYawRange,
-          eyePitch: this.eyeContactTuning.eyePitchRange,
-          headYaw: this.eyeContactTuning.headYawRange,
-          headPitch: this.eyeContactTuning.headPitchRange
+        if (suppressCameraContact) {
+          this.eyeContactApplied = { ...authoredEyeContact }
+        } else {
+          if (eyeContactActiveForMotion) {
+            this.customPerformanceRigRuntime.neutralizeMotionLookNodes()
+          }
+          this.applyEyeContact({
+            ...authoredEyeContact,
+            authoredEyeOverride: hasCustomPerformanceAuthoredEyeDirection(
+              authoredPerformanceDirection
+            ),
+            enabled: eyeContactActiveForMotion
+          })
         }
-      )
+
+        if (this.eyeLookFreezeHeadEnabled) {
+          this.eyeContactApplied.headYaw = 0
+          this.eyeContactApplied.headPitch = 0
+        }
+
+        const ambientEyeYaw =
+          this.eyeContactApplied.eyeYaw - authoredEyeContact.eyeYaw
+        const ambientEyePitch =
+          this.eyeContactApplied.eyePitch - authoredEyeContact.eyePitch
+        const ambientEyeLookWeights = resolveEyeLookExpressionWeights(
+          ambientEyeYaw,
+          ambientEyePitch,
+          this.eyeContactTuning
+        )
+        this.mergeExpressionWeight(
+          expressionWeights,
+          VRMExpressionPresetName.LookLeft,
+          ambientEyeLookWeights.lookLeft
+        )
+        this.mergeExpressionWeight(
+          expressionWeights,
+          VRMExpressionPresetName.LookRight,
+          ambientEyeLookWeights.lookRight
+        )
+        this.mergeExpressionWeight(
+          expressionWeights,
+          VRMExpressionPresetName.LookUp,
+          ambientEyeLookWeights.lookUp
+        )
+        this.mergeExpressionWeight(
+          expressionWeights,
+          VRMExpressionPresetName.LookDown,
+          ambientEyeLookWeights.lookDown
+        )
+        this.customPerformanceDirection = composeCustomPerformanceEyeContact(
+          authoredPerformanceDirection,
+          this.eyeContactApplied,
+          {
+            eyeYaw: this.eyeContactTuning.eyeYawRange,
+            eyePitch: this.eyeContactTuning.eyePitchRange,
+            headYaw: this.eyeContactTuning.headYawRange,
+            headPitch: this.eyeContactTuning.headPitchRange
+          }
+        )
+      }
     }
-    this.customPerformanceTargetWeights = resolveFinalCustomTargetWeights({
+    const resolvedCustomTargetWeights = resolveFinalCustomTargetWeights({
       expressionWeights,
-      expressionBindings: this.customExpressionMorphMap as ReadonlyMap<
-        string,
-        readonly string[]
-      >,
+      expressionBindings: this.customExpressionMorphMap,
       faceControlWeights,
-      rawTargetWeights: rawMorphWeights
+      rawTargetWeights: finalRawMorphWeights
     })
+    this.customPerformanceTargetWeights = this.eyeApertureSeamDefinition
+      ? resolveSocketEyeBlinkClosureTargetWeights(
+          resolvedCustomTargetWeights,
+          this.eyeApertureSeamDefinition.blinkClosure.fullBlinkSquintFloor
+        )
+      : resolvedCustomTargetWeights
     const clearTargets = new Set<string>(this.lastAppliedRawMorphTargets)
 
-    for (const targets of this.customExpressionMorphMap.values()) {
-      for (const targetName of targets) {
-        clearTargets.add(targetName)
+    for (const bindings of this.customExpressionMorphMap.values()) {
+      for (const binding of bindings) {
+        clearTargets.add(binding.target)
       }
     }
-    for (const targetName of rawMorphWeights.keys()) {
+    for (const targetName of finalRawMorphWeights.keys()) {
       clearTargets.add(targetName)
+    }
+    if (this.eyeApertureSeamDefinition) {
+      clearTargets.add('eyeSquintLeft')
+      clearTargets.add('eyeSquintRight')
     }
 
     if (
       clearTargets.size === 0 &&
       expressionWeights.size === 0 &&
       faceControlWeights.size === 0 &&
-      rawMorphWeights.size === 0
+      finalRawMorphWeights.size === 0
     ) {
       return
     }
@@ -8368,11 +9077,11 @@ export class GoonEngine implements GoonStageHost {
     const appliedTargets = new Set<string>()
     for (const [preset, value] of expressionWeights.entries()) {
       if (value <= 0.001) continue
-      const targetNames = this.customExpressionMorphMap.get(preset)
-      if (!targetNames) continue
-      for (const targetName of targetNames) {
-        this.applyMorphTargetWeight(targetName, value, 'max')
-        appliedTargets.add(targetName)
+      const bindings = this.customExpressionMorphMap.get(preset)
+      if (!bindings) continue
+      for (const binding of bindings) {
+        this.applyMorphTargetWeight(binding.target, value * binding.weight, 'max')
+        appliedTargets.add(binding.target)
       }
     }
 
@@ -8382,13 +9091,120 @@ export class GoonEngine implements GoonStageHost {
       appliedTargets.add(targetName)
     }
 
-    for (const [targetName, value] of rawMorphWeights.entries()) {
-      if (value <= 0.001) continue
+    for (const [targetName, value] of finalRawMorphWeights.entries()) {
       this.applyMorphTargetWeight(targetName, value, 'set')
       appliedTargets.add(targetName)
     }
+    if (this.eyeApertureSeamDefinition) {
+      for (const targetName of ['eyeSquintLeft', 'eyeSquintRight'] as const) {
+        const value = this.customPerformanceTargetWeights.get(targetName) ?? 0
+        this.applyMorphTargetWeight(targetName, value, 'set')
+        if (value > 0.001) appliedTargets.add(targetName)
+      }
+    }
 
     this.lastAppliedRawMorphTargets = [...appliedTargets]
+  }
+
+  private applyCustomPerformanceOverlays() {
+    const performance = this.customPerformanceRigRuntime
+    if (!performance || !this.customAvatarRoot) return
+    const socketEyes = this.socketEyeSurfaceRuntime
+    const socketDefinition = this.socketEyeSurfaceDefinition
+    if (!performance.usesSocketEyeDriver()) {
+      performance.apply(this.customPerformanceDirection, this.customPerformanceTargetWeights)
+      return
+    }
+    if (!socketEyes || !socketDefinition) {
+      throw new Error(
+        '[socket-eye-runtime] performance-rig/v2 is active without the required socket-eye surface.'
+      )
+    }
+
+    const authored = { ...this.customPerformanceDirection }
+    const contactAllowed =
+      this.socketEyeContact.enabled &&
+      this.eyeContactEnabled &&
+      !hasCustomPerformanceAuthoredEyeDirection(authored) &&
+      !this.isStaticPoseOverrideActive() &&
+      !this.lookActive &&
+      !this.isEyeContactSuppressedByMotion()
+    performance.apply(authored, this.customPerformanceTargetWeights)
+    this.customAvatarRoot.updateMatrixWorld(true)
+
+    const head = performance.getLookNode('head')
+    let targetHeadLocal = head.worldToLocal(this.camera.position.clone())
+    let resolution = resolveSocketEyeGaze(
+      socketDefinition,
+      [targetHeadLocal.x, targetHeadLocal.y, targetHeadLocal.z],
+      authored,
+      this.socketEyeContact,
+      contactAllowed
+    )
+    const response = socketEyeContactResponseLerp(this.socketEyeContact.response)
+    const headAssistTarget =
+      !this.eyeLookFreezeHeadEnabled &&
+      contactAllowed &&
+      resolution.headFollowPressure > 0
+        ? resolveSocketEyeHeadAssist(
+            [targetHeadLocal.x, targetHeadLocal.y, targetHeadLocal.z],
+            resolution.headFollowPressure,
+            this.socketEyeContact.headFollow
+          )
+        : { headYaw: 0, headPitch: 0 }
+    this.socketEyeHeadAssist = smoothSocketEyeHeadAssist(
+      this.socketEyeHeadAssist,
+      headAssistTarget,
+      response
+    )
+    if (
+      Math.abs(this.socketEyeHeadAssist.headYaw) > 1e-5 ||
+      Math.abs(this.socketEyeHeadAssist.headPitch) > 1e-5
+    ) {
+      const assisted = {
+        ...authored,
+        headYaw: THREE.MathUtils.clamp(
+          authored.headYaw + this.socketEyeHeadAssist.headYaw,
+          -1,
+          1
+        ),
+        headPitch: THREE.MathUtils.clamp(
+          authored.headPitch + this.socketEyeHeadAssist.headPitch,
+          -1,
+          1
+        )
+      }
+      if (this.eyeLookFreezeHeadEnabled) {
+        assisted.headYaw = authored.headYaw
+        assisted.headPitch = authored.headPitch
+      }
+      performance.apply(assisted, this.customPerformanceTargetWeights)
+      this.customAvatarRoot.updateMatrixWorld(true)
+      targetHeadLocal = head.worldToLocal(this.camera.position.clone())
+      resolution = resolveSocketEyeGaze(
+        socketDefinition,
+        [targetHeadLocal.x, targetHeadLocal.y, targetHeadLocal.z],
+        authored,
+        this.socketEyeContact,
+        contactAllowed
+      )
+    }
+
+    for (const side of ['left', 'right'] as const) {
+      const target = resolution.gaze[side]
+      const current = this.socketEyeGaze[side]
+      current.horizontal = THREE.MathUtils.lerp(current.horizontal, target.horizontal, response)
+      current.vertical = THREE.MathUtils.lerp(current.vertical, target.vertical, response)
+      socketEyes.setGaze(side, current.horizontal, current.vertical)
+    }
+    const lookWeights = resolveSocketEyeLookTargetWeights(
+      socketDefinition,
+      this.socketEyeGaze
+    )
+    this.clearMorphTargetWeights(SOCKET_EYE_LOOK_TARGETS)
+    for (const target of SOCKET_EYE_LOOK_TARGETS) {
+      this.applyMorphTargetWeight(target, lookWeights.get(target) ?? 0, 'set')
+    }
   }
 
   private buildCustomExpressionWeights(now: number) {
@@ -8813,9 +9629,21 @@ export class GoonEngine implements GoonStageHost {
     if (!this.hasExpressionBlendshapes && !this.hasFaceControls() && !this.hasRawMorphTargets()) return
     const kind = definition?.kind ?? 'emote'
     const intensity = definition?.kind === 'emote' ? 1 : definition?.intensity ?? 1
-    const targets = this.resolveExpressionTargets(name, definition)
-    const faceControls = definition?.faceControls ?? []
-    const rawMorphTargets = definition?.rawMorphTargets ?? []
+    const face = definition
+      ? selectCueFacePayload(definition, {
+          arkit52Available: this.customArkitFaceDriverBindings !== null,
+          arkit52Bindings: this.customArkitFaceDriverBindings?.face
+        })
+      : null
+    const targets = this.resolveExpressionTargets(
+      name,
+      definition && face
+        ? { ...definition, expressionTargets: face.expressionTargets }
+        : definition,
+      face?.profile !== 'arkit52'
+    )
+    const faceControls = face?.faceControls ?? []
+    const rawMorphTargets = face?.rawMorphTargets ?? []
     if (
       targets.length === 0 &&
       faceControls.length === 0 &&
@@ -8828,17 +9656,23 @@ export class GoonEngine implements GoonStageHost {
 
     // Check for multi-step emote
     if (definition?.steps && definition.steps.length > 0) {
-      const steps: ActiveExpressionStep[] = definition.steps.map((step) => ({
-        targets: this.resolveExpressionTargets(name, {
-          ...definition,
-          expressionTargets: step.expressionTargets
-        }),
-        faceControls: step.faceControls ?? [],
-        rawMorphTargets: step.rawMorphTargets ?? [],
-        attackMs: step.attackMs ?? 120,
-        holdMs: step.holdMs ?? 200,
-        releaseMs: step.releaseMs ?? 180
-      }))
+      const steps: ActiveExpressionStep[] = definition.steps.map((step) => {
+        const stepFace = selectCueFacePayload(step, {
+          arkit52Available: this.customArkitFaceDriverBindings !== null,
+          arkit52Bindings: this.customArkitFaceDriverBindings?.face
+        })
+        return {
+          targets: this.resolveExpressionTargets(name, {
+            ...definition,
+            expressionTargets: stepFace.expressionTargets
+          }, stepFace.profile !== 'arkit52'),
+          faceControls: stepFace.faceControls,
+          rawMorphTargets: stepFace.rawMorphTargets,
+          attackMs: step.attackMs ?? 120,
+          holdMs: step.holdMs ?? 200,
+          releaseMs: step.releaseMs ?? 180
+        }
+      })
 
       const totalDuration = steps.reduce(
         (sum, s) => sum + s.attackMs + s.holdMs + s.releaseMs,
@@ -8914,48 +9748,11 @@ export class GoonEngine implements GoonStageHost {
     })
   }
 
-  private triggerGesture(name: string, definition?: GoonCueDefinition, options: PlacementOptions = {}) {
-    const durationMs = definition?.durationMs ?? 800
-    const intensity = definition?.kind === 'emote' ? 1 : definition?.intensity ?? 1
-    const cuePosture =
-      definition?.kind === 'emote'
-        ? this.resolveEmoteMotionPosture(name, definition)
-        : definition?.posture
-    const restorePosture =
-      !options.preservePlacement && cuePosture && cuePosture !== this.baseLoopPosture
-        ? this.baseLoopPosture
-        : undefined
-    this.activeGesture = {
-      name,
-      durationMs,
-      startTime: performance.now(),
-      intensity,
-      mask: definition?.mask,
-      restorePosture,
-      preserveCamera: options.preserveCamera
-    }
-  }
-
-  private playEmote(name: string, definition?: GoonCueDefinition, options: PlacementOptions = {}) {
+  private playEmote(name: string, definition?: GoonCueDefinition) {
     this.activeEmoteUntil = Math.max(
       this.activeEmoteUntil,
       performance.now() + this.estimateCueDurationMs(name, definition)
     )
-    const cuePosture = this.resolveEmoteMotionPosture(name, definition)
-    if (!options.preservePlacement && cuePosture && cuePosture !== this.baseLoopPosture) {
-      this.oneShotRestorePosture = this.baseLoopPosture
-      this.oneShotRestorePreserveCamera = options.preserveCamera === true
-      this.transitionToPosture(cuePosture, undefined, undefined, options)
-    } else {
-      this.oneShotRestorePosture = null
-      this.oneShotRestorePreserveCamera = false
-    }
-    const animationName = definition?.animationName ?? name
-    const playedAnimation = this.playOneShotAnimation(animationName)
-    if (!playedAnimation) {
-      this.requestDeferredAnimation(animationName, 'emote', definition, name)
-      this.triggerGesture(name, definition, options)
-    }
     this.triggerExpression(name, definition)
   }
 
@@ -8973,6 +9770,10 @@ export class GoonEngine implements GoonStageHost {
     }
 
     const hasFacePayload = Boolean(
+      definition.faceProfiles?.portable.expressionTargets?.length ||
+      definition.faceProfiles?.portable.faceControls?.length ||
+      definition.faceProfiles?.arkit52?.channels?.length ||
+      definition.faceProfiles?.arkit52?.headControls?.length ||
       definition.expressionTargets?.length ||
       definition.faceControls?.length ||
       definition.rawMorphTargets?.length
@@ -9000,60 +9801,6 @@ export class GoonEngine implements GoonStageHost {
           : 200
 
     return attackMs + holdMs + releaseMs
-  }
-
-  private applyGestures(elapsed: number) {
-    if (!this.activeGesture) return
-    const now = performance.now()
-    const progress = (now - this.activeGesture.startTime) / this.activeGesture.durationMs
-    if (progress >= 1) {
-      if (this.activeGesture.restorePosture) {
-        this.transitionToPosture(this.activeGesture.restorePosture, undefined, undefined, {
-          preserveCamera: this.activeGesture.preserveCamera
-        })
-      }
-      this.activeGesture = null
-      return
-    }
-
-    const mask = this.activeGesture.mask
-    const allowHead = !mask || mask === 'head' || mask === 'upper' || mask === 'full'
-    const allowUpper = !mask || mask === 'upper' || mask === 'full'
-    const intensity = this.activeGesture.intensity
-
-    const head = this.bones[VRMHumanBoneName.Head]
-    const neck = this.bones[VRMHumanBoneName.Neck]
-    const rightUpperArm = this.bones[VRMHumanBoneName.RightUpperArm]
-    const rightLowerArm = this.bones[VRMHumanBoneName.RightLowerArm]
-
-    const wobble = Math.sin(progress * Math.PI * 2) * intensity
-
-    switch (this.activeGesture.name) {
-      case 'nod':
-        if (allowHead && head) head.rotation.x += wobble * 0.25
-        break
-      case 'shake_head':
-        if (allowHead && head) head.rotation.y += wobble * 0.3
-        break
-      case 'wave':
-        if (allowUpper && rightUpperArm) rightUpperArm.rotation.z -= 0.5 * intensity
-        if (allowUpper && rightLowerArm) rightLowerArm.rotation.z -= 0.7 + wobble * 0.4
-        break
-      case 'shrug':
-        if (allowHead && neck) neck.rotation.z += wobble * 0.1
-        break
-      case 'point':
-        if (allowUpper && rightUpperArm) rightUpperArm.rotation.z -= 0.4 * intensity
-        if (allowUpper && rightLowerArm) rightLowerArm.rotation.x -= 0.6 * intensity
-        break
-      case 'thinking_beat':
-        if (allowHead && head) head.rotation.x += Math.sin(elapsed * 2) * 0.08 * intensity
-        if (allowHead && neck) neck.rotation.y += Math.sin(elapsed * 2) * 0.05 * intensity
-        break
-      case 'laugh':
-        if (allowHead && head) head.rotation.x += Math.abs(Math.sin(elapsed * 6)) * 0.2 * intensity
-        break
-    }
   }
 
   private playOneShotAnimation(name: string) {
@@ -9501,6 +10248,21 @@ export class GoonEngine implements GoonStageHost {
 
   private getEyeContactFocusPoint() {
     if (this.customPerformanceRigRuntime) {
+      if (
+        this.customPerformanceRigRuntime.usesSocketEyeDriver() &&
+        this.socketEyeSurfaceDefinition
+      ) {
+        const head = this.customPerformanceRigRuntime.getLookNode('head')
+        const left = this.socketEyeSurfaceDefinition.runtimeBindings.left.gazeAnchorHeadLocal
+        const right = this.socketEyeSurfaceDefinition.runtimeBindings.right.gazeAnchorHeadLocal
+        const midpoint = new THREE.Vector3(
+          (left[0] + right[0]) / 2,
+          (left[1] + right[1]) / 2,
+          (left[2] + right[2]) / 2
+        )
+        head.updateWorldMatrix(true, false)
+        return head.localToWorld(midpoint)
+      }
       const leftEye = this.customPerformanceRigRuntime.getLookNode('leftEye')
       const rightEye = this.customPerformanceRigRuntime.getLookNode('rightEye')
       const left = leftEye.getWorldPosition(new THREE.Vector3())
@@ -9530,35 +10292,38 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  private resolveCurrentLipSyncWeights(
+  private resolveCurrentLipSyncFrame(
     elapsed: number,
     intensityScale = PRECOMPUTED_LIP_SYNC_VRM_INTENSITY_SCALE
-  ): GoonLipSyncWeights {
+  ): GoonSpeechFaceFrame {
     const audioActivity = this.measureSpeechAudioActivity()
-    let weights: GoonLipSyncWeights = createEmptyGoonLipSyncWeights()
+    let frame = createEmptyGoonSpeechFaceFrame(RHUBARB_9_SPEECH_FACE_PROFILE)
 
     if (this.lipSyncEnabled && this.speaking) {
       if (this.lipSyncMode === 'viseme' && this.speechLipSyncTimeline) {
-        weights = sampleGoonLipSyncTimeline(
+        frame = sampleGoonLipSyncTimeline(
           this.speechLipSyncTimeline,
           this.getSpeechLipSyncElapsedMs()
         )
         const gate = isTimelineOwnedGoonLipSyncSource(this.speechLipSyncTimeline.source)
           ? 1
           : this.resolveSpeechAudioGate(audioActivity, this.speechLipSyncTimeline.source)
-        weights = this.scaleLipSyncWeights(weights, gate * intensityScale)
+        frame = scaleGoonSpeechFaceFrame(frame, gate * intensityScale)
       } else {
-        weights.wide_open = this.computeFastLipSyncOpenness(elapsed)
+        if (frame.profile !== RHUBARB_9_SPEECH_FACE_PROFILE) {
+          throw new Error('Amplitude lip sync must use the Rhubarb-9 fallback frame.')
+        }
+        frame.weights.wide_open = this.computeFastLipSyncOpenness(elapsed)
       }
     }
 
-    return weights
+    return frame
   }
 
   private applyLipSync(manager: NonNullable<VRM['expressionManager']>, elapsed: number) {
     if (!this.hasMouthBlendshapes) return
-    const weights = this.resolveCurrentLipSyncWeights(elapsed)
-    const legacyWeights = downmixGoonLipSyncWeightsToLegacy(weights)
+    const frame = this.resolveCurrentLipSyncFrame(elapsed)
+    const legacyWeights = downmixGoonLipSyncFrameToLegacy(frame)
 
     if (this.lipSyncMode === 'viseme' && this.availableMouthPresets.size > 1) {
       this.applyDetailedMouthWeights(manager, legacyWeights)
@@ -9850,7 +10615,11 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  private resolveExpressionTargets(name: string, definition?: GoonCueDefinition) {
+  private resolveExpressionTargets(
+    name: string,
+    definition?: GoonCueDefinition,
+    allowNameFallback = true
+  ) {
     const targets: Array<{ preset: ResolvedExpressionPreset; weight: number }> = []
     const manager = this.vrm?.expressionManager
     const hasLookAt = Boolean(this.vrm?.lookAt)
@@ -9889,13 +10658,7 @@ export class GoonEngine implements GoonStageHost {
           })
           continue
         }
-        if (manager) {
-          const hasManagerExpression = manager.getExpression(preset as VRMExpressionPresetName | string)
-          const hasCustomOverlayExpression = this.customExpressionMorphMap.has(
-            preset as GoonExpressionPreset
-          )
-          if (!hasManagerExpression && !hasCustomOverlayExpression) continue
-        } else if (!this.customExpressionMorphMap.has(preset as GoonExpressionPreset)) {
+        if (!this.supportsExpressionPreset(preset as GoonExpressionPreset)) {
           continue
         }
         targets.push({
@@ -9906,14 +10669,9 @@ export class GoonEngine implements GoonStageHost {
       return targets
     }
 
-    const fallback = this.resolveExpressionPreset(name)
+    const fallback = allowNameFallback ? this.resolveExpressionPreset(name) : null
     if (fallback) {
-      if (
-        (manager &&
-          (manager.getExpression(fallback) ||
-            this.customExpressionMorphMap.has(fallback))) ||
-        (!manager && this.customExpressionMorphMap.has(fallback))
-      ) {
+      if (this.supportsExpressionPreset(fallback)) {
         targets.push({ preset: fallback, weight: 1 })
       }
     }
@@ -10469,14 +11227,6 @@ export class GoonEngine implements GoonStageHost {
     return THREE.MathUtils.clamp(this.smoothedLipSyncAmplitude, 0, 1)
   }
 
-  private scaleLipSyncWeights(weights: GoonLipSyncWeights, amount: number): GoonLipSyncWeights {
-    const scaled = createEmptyGoonLipSyncWeights()
-    for (const viseme of CUSTOM_RHUBARB_MOUTH_ORDER) {
-      scaled[viseme] = THREE.MathUtils.clamp(weights[viseme] * amount, 0, 1)
-    }
-    return scaled
-  }
-
   private applyDetailedMouthWeights(
     manager: NonNullable<VRM['expressionManager']>,
     weights: LegacyGoonLipSyncWeights
@@ -10619,6 +11369,37 @@ export class GoonEngine implements GoonStageHost {
     return this.faceMorphBindings.length > 0 && this.authorableRawMorphTargetNames.length > 0
   }
 
+  /**
+   * Check whether the loaded model can actually apply one semantic expression.
+   * Advanced packages use explicit avatar.json mappings; Standard/VRoid models
+   * use registered VRM expressions.
+   */
+  supportsExpressionPreset(preset: GoonExpressionPreset): boolean {
+    // Neutral is the model's authored rest state. It clears active expression
+    // weights and therefore never requires a synthetic morph target.
+    if (preset === VRMExpressionPresetName.Neutral) return true
+    return Boolean(
+      this.customExpressionMorphMap.has(preset) ||
+        this.vrm?.expressionManager?.getExpression(preset as VRMExpressionPresetName | string)
+    )
+  }
+
+  /** Public accessor: list the shared Mood/Emote controls supported by this model. */
+  getSupportedSemanticExpressionPresets(): GoonExpressionPreset[] {
+    return GOON_SEMANTIC_EXPRESSION_CONTROLS.filter((control) =>
+      this.supportsExpressionPreset(control.value)
+    ).map((control) => control.value)
+  }
+
+  /** Public accessor: plain-language owner used by unavailable-control copy. */
+  getSemanticExpressionSourceLabel(): string {
+    if (this.guidedManifestOverlay?.face || this.customExpressionMorphMap.size > 0) {
+      return 'This Advanced package'
+    }
+    if (this.vrmSource === 'vroid') return 'This Standard/VRoid model'
+    return 'This Goon model'
+  }
+
   /** Public accessor: get the detected VRM source type */
   getVRMSourceType(): VRMSourceType {
     return this.vrmSource
@@ -10632,6 +11413,31 @@ export class GoonEngine implements GoonStageHost {
   /** Public accessor: get canonical raw morph target names for expert authoring. */
   getAuthorableRawMorphTargetNames(): string[] {
     return this.authorableRawMorphTargetNames
+  }
+
+  /** Canonical ARKit source channels resolved to this package's authored targets. */
+  getArkitFaceAuthoringDefinitions(): Array<{ id: Arkit52Channel; morphTargets: string[] }> {
+    const bindings = this.customArkitFaceDriverBindings?.face
+    if (!bindings) return []
+    return [...bindings].map(([id, morphTargets]) => ({ id, morphTargets: [...morphTargets] }))
+  }
+
+  /** Optional Audio2Face tongue-extension channels resolved to authored targets. */
+  getTongueFaceAuthoringDefinitions(): Array<{
+    id: Audio2FaceTongueChannel
+    morphTargets: string[]
+  }> {
+    const bindings = this.customArkitFaceDriverBindings?.tongue
+    if (!bindings) return []
+    return [...bindings].map(([id, morphTargets]) => ({ id, morphTargets: [...morphTargets] }))
+  }
+
+  /** Exact mouth-control capability for the currently loaded avatar lane. */
+  getMouthPresetSupport(): CustomMouthPresetSupport {
+    return {
+      ...this.customMouthPresetSupport,
+      availablePresets: [...this.customMouthPresetSupport.availablePresets]
+    }
   }
 
   hasCustomMorphDefinitions(): boolean {

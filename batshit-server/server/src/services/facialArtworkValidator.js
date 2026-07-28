@@ -4,8 +4,8 @@ const path = require('path');
 const sharp = require('sharp');
 const zlib = require('zlib');
 
-const CONTRACT = 'facial-artwork/v3';
-const PUBLIC_PREFIX = 'goons/facial-artwork/v3/';
+const CONTRACT = 'facial-artwork/v4';
+const PUBLIC_PREFIX = 'goons/facial-artwork/v4/';
 const ROLE_IDS = [
   'brows',
   'lashes_eye_outline',
@@ -27,7 +27,7 @@ let cachedContract = null;
 
 class FacialArtworkValidationError extends Error {
   constructor(message) {
-    super(`[facial-artwork/v3] ${message}`);
+    super(`[facial-artwork/v4] ${message}`);
     this.name = 'FacialArtworkValidationError';
     this.statusCode = 400;
   }
@@ -44,7 +44,7 @@ function sha256(buffer) {
 function resolveAssetRoot() {
   const candidates = [
     process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT,
-    path.resolve(__dirname, '../../../../batshit-app/static/goons/facial-artwork/v3')
+    path.resolve(__dirname, '../../../../batshit-app/static/goons/facial-artwork/v4')
   ].filter(Boolean);
   return candidates[0];
 }
@@ -68,33 +68,39 @@ function resolveContractAsset(root, publicPath) {
 }
 
 async function loadContract() {
-  if (cachedContract) return cachedContract;
   const root = resolveAssetRoot();
-  const contractPath = path.join(root, 'facial-artwork-v3.json');
+  const contractPath = path.join(root, 'facial-artwork-v4.json');
   let raw;
   try {
     raw = await fs.readFile(contractPath, 'utf8');
   } catch (error) {
     throw new Error(
-      `[facial-artwork/v3] trusted validator assets are unavailable at ${contractPath}: ${error.message}`
+      `[facial-artwork/v4] trusted validator assets are unavailable at ${contractPath}: ${error.message}`
     );
+  }
+  const sourceSha256 = sha256(raw);
+  if (
+    cachedContract?.contractPath === contractPath &&
+    cachedContract.sourceSha256 === sourceSha256
+  ) {
+    return cachedContract;
   }
   let contract;
   try {
     contract = JSON.parse(raw);
   } catch {
-    throw new Error('[facial-artwork/v3] trusted validator definition is invalid JSON');
+    throw new Error('[facial-artwork/v4] trusted validator definition is invalid JSON');
   }
   if (contract?.schemaVersion !== CONTRACT || !HASH_PATTERN.test(contract?.definitionSha256 || '')) {
-    throw new Error('[facial-artwork/v3] trusted validator definition has an unsupported contract');
+    throw new Error('[facial-artwork/v4] trusted validator definition has an unsupported contract');
   }
   if (
     !Array.isArray(contract.roles) ||
     contract.roles.map((role) => role?.id).join('|') !== ROLE_IDS.join('|')
   ) {
-    throw new Error('[facial-artwork/v3] trusted validator role inventory drifted');
+    throw new Error('[facial-artwork/v4] trusted validator role inventory drifted');
   }
-  cachedContract = { root, contract };
+  cachedContract = { root, contractPath, sourceSha256, contract };
   return cachedContract;
 }
 
@@ -250,7 +256,7 @@ function validateEyeSeams(roleId, rgba, width, height, template, semanticMap, pa
     !Number.isInteger(palette.outer_upper_transition) ||
     !Number.isInteger(palette.outer_lower_transition)
   ) {
-    throw new Error('[facial-artwork/v3] trusted lashes/outline seam contract is malformed');
+    throw new Error('[facial-artwork/v4] trusted lashes/outline seam contract is malformed');
   }
 
   const joins = [
@@ -275,7 +281,7 @@ function validateEyeSeams(roleId, rgba, width, height, template, semanticMap, pa
       }
     }
     if (samples === 0) {
-      throw new Error(`[facial-artwork/v3] trusted lashes semantic region ${region} is empty`);
+      throw new Error(`[facial-artwork/v4] trusted lashes semantic region ${region} is empty`);
     }
     return maximum;
   };
@@ -293,12 +299,12 @@ async function loadTrustedMask(root, template, variant) {
   const maskPath = resolveContractAsset(root, variant.safePaintMask.path);
   const maskBytes = await fs.readFile(maskPath);
   if (sha256(maskBytes) !== variant.safePaintMask.sha256) {
-    throw new Error(`[facial-artwork/v3] trusted safe mask hash drifted for ${template.id}`);
+    throw new Error(`[facial-artwork/v4] trusted safe mask hash drifted for ${template.id}`);
   }
   const mask = await sharp(maskBytes, { failOn: 'error' }).greyscale().raw().toBuffer();
   const [width, height] = template.dimensions;
   if (mask.length !== width * height) {
-    throw new Error(`[facial-artwork/v3] trusted safe mask channels drifted for ${template.id}`);
+    throw new Error(`[facial-artwork/v4] trusted safe mask channels drifted for ${template.id}`);
   }
   return mask;
 }
@@ -306,17 +312,17 @@ async function loadTrustedMask(root, template, variant) {
 async function loadTrustedSemanticMap(root, template, variant) {
   const record = variant.semanticMap;
   if (!record?.path || !record?.sha256 || record.channels !== 'L8' || !record.palette) {
-    throw new Error(`[facial-artwork/v3] trusted semantic map is missing for ${template.id}`);
+    throw new Error(`[facial-artwork/v4] trusted semantic map is missing for ${template.id}`);
   }
   const semanticPath = resolveContractAsset(root, record.path);
   const semanticBytes = await fs.readFile(semanticPath);
   if (sha256(semanticBytes) !== record.sha256) {
-    throw new Error(`[facial-artwork/v3] trusted semantic map hash drifted for ${template.id}`);
+    throw new Error(`[facial-artwork/v4] trusted semantic map hash drifted for ${template.id}`);
   }
   const semanticMap = await sharp(semanticBytes, { failOn: 'error' }).greyscale().raw().toBuffer();
   const [width, height] = template.dimensions;
   if (semanticMap.length !== width * height) {
-    throw new Error(`[facial-artwork/v3] trusted semantic map channels drifted for ${template.id}`);
+    throw new Error(`[facial-artwork/v4] trusted semantic map channels drifted for ${template.id}`);
   }
   return { semanticMap, palette: record.palette };
 }
@@ -326,8 +332,8 @@ async function prepareFacialArtworkUpload(input) {
   const roleId = String(input.role || '');
   const role = contract.roles.find((candidate) => candidate.id === roleId);
   if (!role) fail('role is unknown');
-  if (input.definitionSha256 !== contract.definitionSha256) {
-    fail('definitionSha256 does not match the current template definition');
+  if (!HASH_PATTERN.test(input.definitionSha256 || '')) {
+    fail('definitionSha256 must be a lowercase SHA-256 hash');
   }
   const template = contract.templates.find((candidate) => candidate.id === role.template);
   const variant = resolveTemplateVariant(template, input.orientation);
@@ -413,7 +419,7 @@ async function prepareFacialArtworkUpload(input) {
     !png.types.includes('sRGB') ||
     png.types.includes('iCCP')
   ) {
-    throw new Error(`[facial-artwork/v3] canonical PNG preparation drifted for ${roleId}`);
+    throw new Error(`[facial-artwork/v4] canonical PNG preparation drifted for ${roleId}`);
   }
   const canonicalMetadata = await sharp(buffer, {
     failOn: 'error',
@@ -425,7 +431,7 @@ async function prepareFacialArtworkUpload(input) {
     canonicalMetadata.depth !== 'uchar' ||
     canonicalMetadata.hasProfile === true
   ) {
-    throw new Error(`[facial-artwork/v3] canonical decoder metadata drifted for ${roleId}`);
+    throw new Error(`[facial-artwork/v4] canonical decoder metadata drifted for ${roleId}`);
   }
   validateAlpha(roleId, rgba, mask, png.width, png.height);
   validateEyeSeams(
@@ -440,7 +446,7 @@ async function prepareFacialArtworkUpload(input) {
   const provenance = parseProvenance(input.provenance);
   const artwork = {
     role: roleId,
-    definitionSha256: contract.definitionSha256,
+    definitionSha256: input.definitionSha256,
     template: {
       id: template.id,
       version: template.version,

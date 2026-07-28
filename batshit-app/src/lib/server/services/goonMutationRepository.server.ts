@@ -6,7 +6,10 @@ export const RECIPE_MANAGED_GOON_FIELDS = [
   'customAvatar',
   'appearanceDials',
   'facialArtwork',
-  'eyeAppearance'
+  'eyeAppearance',
+  'oralAppearance',
+  'lipArtwork',
+  'recipeFitReceipts'
 ] as const
 
 const IDENTITY_FIELDS = ['id', 'user_id', 'created_at', 'updated_at'] as const
@@ -56,7 +59,7 @@ for index = 3, #ARGV, 2 do
     return 'RESERVED_FIELD'
   end
   if recipeManaged then
-    if field == 'customAvatar' or field == 'appearanceDials' or field == 'facialArtwork' or field == 'eyeAppearance' then
+    if field == 'customAvatar' or field == 'appearanceDials' or field == 'facialArtwork' or field == 'eyeAppearance' or field == 'oralAppearance' or field == 'lipArtwork' or field == 'recipeFitReceipts' then
       return 'RECIPE_MANAGED_FIELD'
     end
   end

@@ -28,6 +28,9 @@ export default defineConfig({
 	build: {
 		assetsInlineLimit: shouldInlineAsset
 	},
+	worker: {
+		format: 'es'
+	},
 	server: {
 		host: configuredDevHost,
 		...(hasConfiguredDevPort

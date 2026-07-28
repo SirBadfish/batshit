@@ -10,6 +10,10 @@ import { sanitizeGoonAnimationName } from '$lib/goons/animationLoadPlan'
 import { DEFAULT_GOON_CUES, DEFAULT_GOON_EMOJI_MAP } from '$lib/goons/defaults'
 import { normalizeCustomPostureMap } from '$lib/goons/postures'
 import { normalizeGoonGlobalEyeContactSettingsMap } from '$lib/goons/customAvatar'
+import {
+  hasCueFacePayload,
+  normalizeCueFaceSource
+} from '$lib/goons/cueFaceProfiles'
 
 export type ResolvedGoonCues = {
   cueMap: GoonCueMap
@@ -21,12 +25,93 @@ function cloneMap<T extends Record<string, any>>(input: T | undefined | null): T
   return JSON.parse(JSON.stringify(input ?? {})) as T
 }
 
-function stripMoveCues(cueMap: GoonCueMap): GoonCueMap {
+const LEGACY_MOTION_ONLY_EMOTE_NAMES = new Set([
+  'wave',
+  'nod',
+  'shake_head',
+  'shrug',
+  'point',
+  'thinking_beat',
+  'laugh'
+])
+
+function hasFacialPayload(cue: GoonCueDefinition): boolean {
+  if (hasCueFacePayload(cue)) return true
+  return (cue.steps ?? []).some((step) => hasCueFacePayload(step))
+}
+
+function normalizeCueFaceProfiles(cue: GoonCueDefinition): GoonCueDefinition {
+  const topLevel = normalizeCueFaceSource(cue, {
+    initializeNeutralArkit52: cue.kind === 'emote'
+  })
+  const normalized: GoonCueDefinition = {
+    ...cue,
+    faceProfiles: topLevel.faceProfiles,
+    rawMorphTargets: topLevel.rawMorphTargets,
+    steps: cue.steps?.map((step) => {
+      const face = normalizeCueFaceSource(step, {
+        initializeNeutralArkit52: cue.kind === 'emote'
+      })
+      const normalizedStep = {
+        ...step,
+        faceProfiles: face.faceProfiles,
+        rawMorphTargets: face.rawMorphTargets
+      }
+      delete normalizedStep.expressionTargets
+      delete normalizedStep.faceControls
+      return normalizedStep
+    })
+  }
+  delete normalized.expressionTargets
+  delete normalized.faceControls
+  return normalized
+}
+
+/**
+ * Enforces the product boundary between facial Emotes and body Motions.
+ * Older motion-linked Emotes keep any authored face payload, but their motion
+ * fields are removed. Legacy motion-only defaults disappear from the Emote
+ * catalog entirely; their animation files remain ordinary Motion Vault items.
+ */
+export function normalizeGoonCueMap(cueMap: GoonCueMap): GoonCueMap {
   const next: GoonCueMap = {}
   for (const [name, cue] of Object.entries(cueMap ?? {})) {
     const kind = (cue as { kind?: string })?.kind
     if (!cue || kind === 'move') continue
-    next[name] = cue
+
+    if (cue.kind !== 'emote') {
+      next[name] = normalizeCueFaceProfiles(cue)
+      continue
+    }
+
+    const hadMotionFields = Boolean(cue.animationName?.trim() || cue.posture || cue.mask)
+    const facial = hasFacialPayload(cue)
+    const normalizedName = (cue.name || name).trim()
+    if (
+      !facial &&
+      (hadMotionFields || LEGACY_MOTION_ONLY_EMOTE_NAMES.has(normalizedName.toLowerCase()))
+    ) {
+      continue
+    }
+
+    const normalized: GoonCueDefinition = {
+      ...normalizeCueFaceProfiles(cue),
+      name: normalizedName || name,
+      playback: 'oneshot'
+    }
+    delete normalized.animationName
+    delete normalized.posture
+    delete normalized.mask
+    next[name] = normalized
+  }
+  return next
+}
+
+function normalizeEmojiMap(emojiMap: GoonEmojiMap, cueMap: GoonCueMap): GoonEmojiMap {
+  const next: GoonEmojiMap = {}
+  for (const [emoji, cueName] of Object.entries(emojiMap ?? {})) {
+    if (cueMap[cueName]?.kind !== 'emote') continue
+    next[emoji] = cueName
   }
   return next
 }
@@ -45,12 +130,13 @@ export function resolveKitchenCues(goonsSettings?: GoonsSettings | null): {
   emojiMap: GoonEmojiMap
 } {
   const kitchen = goonsSettings?.kitchen
-  const cueMap = stripMoveCues(
+  const cueMap = normalizeGoonCueMap(
     kitchen?.cues ? cloneMap(kitchen.cues) : cloneMap(DEFAULT_GOON_CUES)
   )
-  const emojiMap = kitchen?.emojiMap
-    ? cloneMap(kitchen.emojiMap)
-    : cloneMap(DEFAULT_GOON_EMOJI_MAP)
+  const emojiMap = normalizeEmojiMap(
+    kitchen?.emojiMap ? cloneMap(kitchen.emojiMap) : cloneMap(DEFAULT_GOON_EMOJI_MAP),
+    cueMap
+  )
   return { cueMap, emojiMap }
 }
 
@@ -67,14 +153,19 @@ function normalizeGoonMotionsSettings(
 export function normalizeGoonsSettings(
   settings?: GoonsSettings | null
 ): GoonsSettings {
+  const cues = normalizeGoonCueMap(cloneMap(settings?.kitchen?.cues ?? DEFAULT_GOON_CUES))
+  const emojiMap = normalizeEmojiMap(
+    cloneMap(settings?.kitchen?.emojiMap ?? DEFAULT_GOON_EMOJI_MAP),
+    cues
+  )
   return {
     dockOpen: settings?.dockOpen ?? false,
     showCues: settings?.showCues ?? false,
     immersiveMode: settings?.immersiveMode ?? true,
     globalCloset: cloneMap(settings?.globalCloset ?? { items: {} }),
     kitchen: {
-      cues: stripMoveCues(cloneMap(settings?.kitchen?.cues ?? DEFAULT_GOON_CUES)),
-      emojiMap: cloneMap(settings?.kitchen?.emojiMap ?? DEFAULT_GOON_EMOJI_MAP),
+      cues,
+      emojiMap,
       postures: normalizeCustomPostureMap(settings?.kitchen?.postures),
       scenes: cloneMap(settings?.kitchen?.scenes ?? {}),
       roomTextures: cloneMap(settings?.kitchen?.roomTextures ?? {}),
@@ -140,7 +231,7 @@ export function mergeGoonsSettingsPatch(
     next.motions = normalizeGoonMotionsSettings(patch.motions)
   }
 
-  return next
+  return normalizeGoonsSettings(next)
 }
 
 export function resolveAutoEnabledCues(cueMap: GoonCueMap): string[] {
@@ -160,7 +251,7 @@ export function resolveGoonCues(
     (Array.isArray(goon?.cues?.disabled) ? goon?.cues?.disabled : []).filter(Boolean)
   )
 
-  const mergedCueMap: GoonCueMap = stripMoveCues({
+  const mergedCueMap: GoonCueMap = normalizeGoonCueMap({
     ...kitchen.cueMap,
     ...overrides
   })

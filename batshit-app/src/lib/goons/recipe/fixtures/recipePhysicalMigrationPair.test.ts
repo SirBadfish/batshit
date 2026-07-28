@@ -1,6 +1,11 @@
 import { unzipSync } from "fflate";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { describe, expect, it } from "vitest";
 import { parseAppearanceDialsManifest } from "../../appearanceDials.schema";
+import {
+  bindCustomPerformanceRig,
+  resolveCustomPerformanceRigManifest,
+} from "../../customPerformanceRig";
 import { buildAppearanceRecipeDependencyGraph } from "../appearanceRecipeDependencyGraph";
 import { buildAppearanceRecipePhysicalBasisFromGlb } from "../appearanceRecipePhysicalModel";
 import { verifyRecipeComponentMapBundle } from "../componentMapContracts";
@@ -79,6 +84,37 @@ describe("SA-090 R2 physical migration fixture", () => {
     expect(first.source.identity.physicalBasisSha256).not.toBe(
       first.target.identity.physicalBasisSha256,
     );
+  });
+
+  it("can add a runtime-valid performance rig without changing the frozen default fixture", async () => {
+    const frozen = await createRecipePhysicalMigrationFixture({
+      runtimeMorphName: "blink_runtime",
+    });
+    const acceptance = await createRecipePhysicalMigrationFixture({
+      runtimeMorphName: "blink_runtime",
+      runtimePreviewCompatible: true,
+    });
+
+    expect(acceptance.fixtureSha256).not.toBe(frozen.fixtureSha256);
+    for (const side of [acceptance.source, acceptance.target]) {
+      const rig = side.avatarManifest.rig as Record<string, unknown>;
+      const resolved = resolveCustomPerformanceRigManifest(rig.performance, {
+        required: true,
+      });
+      expect(resolved.issues).toEqual([]);
+      expect(resolved.manifest).not.toBeNull();
+      if (!resolved.manifest) throw new Error("Expected a performance rig.");
+
+      const glb = side.glbBytes.slice();
+      const gltf = await new GLTFLoader().parseAsync(
+        glb.buffer as ArrayBuffer,
+        "",
+      );
+      const binding = bindCustomPerformanceRig(gltf.scene, resolved.manifest);
+      expect(binding.issues).toEqual([]);
+      expect(binding.runtime).not.toBeNull();
+      binding.runtime?.dispose();
+    }
   });
 
   it("matches the separate frozen R2 physical oracle", async () => {

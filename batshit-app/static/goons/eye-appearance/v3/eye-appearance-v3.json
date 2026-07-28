@@ -1,0 +1,141 @@
+{
+  "schemaVersion": "eye-appearance/v3",
+  "stateSchemaVersion": "eye-appearance-state/v3",
+  "status": "product-export-approved",
+  "productExportApproved": true,
+  "definitionSha256": "90df1dad9791a10969feb81f6e227dd9088449c25715d49143b624a7132737e8",
+  "dependencies": {
+    "socketEyeSurface": {
+      "schemaVersion": "socket-eye-surface/v1",
+      "definitionSha256": "cf946c62c8b81158b96692e99fa8eb9d40cc9e540f2981f18b26fb4f12748f12"
+    },
+    "eyeApertureSeam": {
+      "schemaVersion": "eye-aperture-seam/v1",
+      "definitionSha256": "84c07b601e0d6d6093666f813bb0ee09ad1d09393c3f0d6900682a89d3803949"
+    }
+  },
+  "ownership": "Package definition owns calibration; state owns three logical controls.",
+  "zeroLaw": "Defaults reproduce the authored composite eye.",
+  "symmetryLaw": "All controls remain linked bilateral.",
+  "compositionOrder": [
+    "sclera",
+    "scleraArtwork",
+    "iris",
+    "pupil",
+    "highlight",
+    "cornea"
+  ],
+  "solidColorDefaults": {
+    "iris": [
+      0.035,
+      0.42,
+      0.34,
+      1.0
+    ],
+    "pupil": [
+      0.008,
+      0.009,
+      0.012,
+      1.0
+    ],
+    "sclera": [
+      0.92,
+      0.94,
+      0.96,
+      1.0
+    ]
+  },
+  "runtimeBindings": {
+    "coordinateSpace": "socket-eye-surface",
+    "left": {
+      "compositeCapNode": "bs_f1_eye_l_composite_cap",
+      "irisNeutralRadiusMeters": 0.006,
+      "pupilNeutralRadiusRatio": 0.35,
+      "irisVerticalTravelMeters": 0.003,
+      "edgeSoftnessMeters": 0.0002,
+      "artworkMappings": {
+        "sclera": "gaze-linked-carrier",
+        "iris": "radial-carrier",
+        "pupil": "radial-carrier",
+        "highlight": "iris-space"
+      },
+      "cornea": {
+        "roughness": 0.12,
+        "clearcoat": 1.0,
+        "clearcoatRoughness": 0.08
+      }
+    },
+    "right": {
+      "compositeCapNode": "bs_f1_eye_r_composite_cap",
+      "irisNeutralRadiusMeters": 0.006,
+      "pupilNeutralRadiusRatio": 0.35,
+      "irisVerticalTravelMeters": 0.003,
+      "edgeSoftnessMeters": 0.0002,
+      "artworkMappings": {
+        "sclera": "gaze-linked-carrier",
+        "iris": "radial-carrier",
+        "pupil": "radial-carrier",
+        "highlight": "iris-space"
+      },
+      "cornea": {
+        "roughness": 0.12,
+        "clearcoat": 1.0,
+        "clearcoatRoughness": 0.08
+      }
+    },
+    "geometryEvidence": {
+      "acceptedGlbSha256": "8424404f3843e48dc0195bf98e4705de2effe28e5cedcf25d0e60749ff8e2e65",
+      "socketSurfaceSha256": "cf946c62c8b81158b96692e99fa8eb9d40cc9e540f2981f18b26fb4f12748f12",
+      "apertureSeamSha256": "84c07b601e0d6d6093666f813bb0ee09ad1d09393c3f0d6900682a89d3803949"
+    }
+  },
+  "controls": [
+    {
+      "id": "iris_size",
+      "label": "Iris Size",
+      "description": "Adjust the linked bilateral iris artwork radius.",
+      "minimum": 0.75,
+      "maximum": 1.35,
+      "step": 0.01,
+      "default": 1.0,
+      "unit": "neutral-multiplier",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "Moves composite artwork coordinates on the fixed socket-conformal cap."
+    },
+    {
+      "id": "pupil_size",
+      "label": "Pupil Size",
+      "description": "Adjust the linked bilateral pupil radius relative to the iris.",
+      "minimum": 0.0,
+      "maximum": 2.0,
+      "step": 0.01,
+      "default": 1.0,
+      "unit": "iris-relative-multiplier",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "Moves composite artwork coordinates on the fixed socket-conformal cap."
+    },
+    {
+      "id": "iris_vertical_position",
+      "label": "Iris Vertical Position",
+      "description": "Move both irises vertically; pupils and highlights remain centered with them.",
+      "minimum": -1.0,
+      "maximum": 1.0,
+      "step": 0.01,
+      "default": 0.0,
+      "unit": "neutral-travel-fraction",
+      "linkedBilateral": true,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "geometrySemantics": "Moves composite artwork coordinates on the fixed socket-conformal cap."
+    }
+  ],
+  "rangeEvidence": {
+    "schemaVersion": "sa090-eye-appearance-range-calibration/v3",
+    "sha256": "59bf5024aeeb2785bdd8b9409eb0675be81401e50730c77cee18c4d2e3648784",
+    "canonicalSha256": "59bf5024aeeb2785bdd8b9409eb0675be81401e50730c77cee18c4d2e3648784"
+  }
+}

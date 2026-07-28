@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { RECIPE_MIGRATION_REPORT_CONTRACT } from "./contractIds";
-import { GOON_LIVE_BUILD_CONTRACT } from "./liveBuildContracts";
+import {
+  GOON_LIVE_BUILD_CONTRACT,
+  createGoonLiveBuildReceipt,
+} from "./liveBuildContracts";
 import { RECIPE_SOURCE_CONTRACT } from "./packageMetadata";
 import {
   GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
@@ -156,6 +159,81 @@ async function authoringRevision(recipeRevision: number) {
   return result;
 }
 
+async function redisSensitiveLiveBuildReceipt() {
+  return createGoonLiveBuildReceipt({
+    contract: GOON_LIVE_BUILD_CONTRACT,
+    source: {
+      revisionId: "recipe-revision-2",
+      revision: 2,
+      packageSha256: sha("1"),
+      modelSha256: sha("2"),
+      manifestSha256: sha("3"),
+      definitionSha256: sha("4"),
+      neutralRecipeSha256: sha("5"),
+      basisSha256: sha("6"),
+    },
+    state: { contract: GOON_RECIPE_STATE_CONTRACT, sha256: sha("7") },
+    baker: {
+      id: "batshit-live-goon-baker",
+      version: "r4-v1",
+      resolverVersion: "appearance-recipe-physical-evaluation/v1",
+      schemaVersion: "goon-live-manifest/v1",
+    },
+    inventory: {
+      kept: [],
+      removed: ["manifest:/appearanceDials"],
+      liveMorphTargets: [],
+      retainedDynamicMorphs: [],
+      retainedCorrectiveMorphs: [],
+    },
+    proofs: {
+      neutralPositionSha256: sha("8"),
+      skeletonRestSha256: sha("9"),
+      followerSha256: sha("a"),
+      rootSha256: sha("b"),
+      groundingSha256: sha("c"),
+      performanceSha256: sha("d"),
+      pivotSha256: sha("e"),
+      attachmentSha256: sha("f"),
+      validationReportSha256: sha("0"),
+      liveManifestProvenanceSha256: sha("1"),
+    },
+    output: {
+      package: { sha256: sha("2"), bytes: 3 },
+      model: { sha256: sha("3"), bytes: 2 },
+      manifest: { sha256: sha("4"), bytes: 1 },
+      counts: {
+        meshes: 0,
+        vertices: 0,
+        nodes: 0,
+        bones: 0,
+        morphTargets: 0,
+        dynamicMorphTargets: 0,
+        correctiveMorphTargets: 0,
+        recipeMorphTargets: 0,
+      },
+    },
+    cost: {
+      inputBytes: 6,
+      meshesProcessed: 0,
+      verticesProcessed: 0,
+      morphTargetsProcessed: 0,
+    },
+    validation: {
+      maxWeightScalarError: 0,
+      maxVertexErrorMeters: 0,
+      maxJointErrorMeters: 0,
+      maxNodeTranslationErrorMeters: 0,
+      maxPivotErrorMeters: 8.82002134167e-12,
+      maxScaleError: 0,
+      maxRotationErrorRadians: 0,
+      maxGroundingErrorMeters: 0,
+      maxFinalPositionErrorMeters: 8.74657111143e-12,
+      rmsFinalPositionErrorMeters: 7.18260749159e-12,
+    },
+  });
+}
+
 async function owner() {
   return {
     contract: GOON_RECIPE_OWNER_V2_CONTRACT,
@@ -163,6 +241,11 @@ async function owner() {
     nextRecipeRevision: 3,
     liveStatus: "up_to_date",
     authoringRevision: await authoringRevision(2),
+    authoringSourceContainmentReceipt: documentRef(
+      RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+      `goon_recipe_document:user-1:goon-1:${sha("5")}`,
+      "5",
+    ),
     activeRevision: documentRef(
       GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
       "goon_recipe_revision:user-1:goon-1:recipe-revision-2",
@@ -173,6 +256,7 @@ async function owner() {
       "goon_recipe_revision:user-1:goon-1:recipe-revision-1",
       "a",
     ),
+    pendingAnalysis: null,
     pendingJob: null,
     latestUpdateReport: documentRef(
       RECIPE_MIGRATION_REPORT_CONTRACT,
@@ -212,6 +296,17 @@ function planningJob(source: Awaited<ReturnType<typeof verifiedRevision>>["sourc
       ),
     },
     plan: null,
+    migrationReport: documentRef(
+      RECIPE_MIGRATION_REPORT_CONTRACT,
+      `goon_recipe_document:user-1:goon-1:${sha("b")}`,
+      "b",
+    ),
+    reviewedState: documentRef(
+      "recipe-reviewed-state/v1",
+      `goon_recipe_document:user-1:goon-1:${sha("c")}`,
+      "c",
+    ),
+    stagedLive: null,
     candidateRevision: null,
     lease: { ownerId: "runtime-1", expiresAt: "2026-07-17T17:05:00.000Z" },
     failure: null,
@@ -248,6 +343,25 @@ describe("Recipe R3 lifecycle contracts", () => {
     await expect(verifyGoonRecipeDocument(document)).rejects.toThrow(/mismatch/);
   });
 
+  it("normalizes RedisJSON float drift before verifying Live-build documents", async () => {
+    const receipt = await redisSensitiveLiveBuildReceipt();
+    const document = await createGoonRecipeDocument({
+      userId: "user-1",
+      goonId: "goon-1",
+      content: receipt,
+    });
+    const stored = structuredClone(document);
+    const validation = stored.content.validation as Record<string, number>;
+    validation.maxPivotErrorMeters = 8.820021341670001e-12;
+    validation.maxFinalPositionErrorMeters = 8.746571111430001e-12;
+    validation.rmsFinalPositionErrorMeters = 7.1826074915900006e-12;
+
+    await expect(verifyGoonRecipeDocument(stored)).resolves.toEqual(document);
+
+    validation.maxFinalPositionErrorMeters = 9.74657111143e-12;
+    await expect(verifyGoonRecipeDocument(stored)).rejects.toThrow(/mismatch/);
+  });
+
   it("keeps rollback activation separate from monotonic write/allocation versions", async () => {
     const current = await owner();
     const rolledBack = {
@@ -282,6 +396,11 @@ describe("Recipe R3 lifecycle contracts", () => {
         "goon_recipe_revision:user-1:goon-1:recipe-revision-3",
         "d",
       ),
+      stagedLive: {
+        package: storedAsset("goon_custom_packages", "candidate.bgoon", "d", 300),
+        model: storedAsset("goon_custom_models", "candidate.glb", "e", 200),
+        manifest: storedAsset("goon_custom_manifests", "candidate.json", "f", 100),
+      },
     };
     const parsedJob = parseGoonRecipeJob(job);
     const parsedOwner = parseGoonRecipeV2({

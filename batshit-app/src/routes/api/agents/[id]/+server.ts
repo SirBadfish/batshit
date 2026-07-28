@@ -15,6 +15,7 @@ import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { presentAgentForRuntime } from '$lib/server/services/agentRuntimePresentation'
 import { resolveUploadUrlsForBrowserInPayload } from '$lib/server/services/batshitServerUrls'
+import { isGoonRuntimeReady } from '$lib/goons/recipe/recipeProductLifecycle'
 
 // GET /api/agents/[id] - Get a specific agent
 export const GET: RequestHandler = async ({ params, locals }) => {
@@ -71,6 +72,19 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     
     if (agent.user_id !== locals.user.id) {
       return json({ error: 'Unauthorized' }, { status: 403 })
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'goon_id') && updates.goon_id) {
+      const goon = await redis.get(`goon:${String(updates.goon_id)}`)
+      if (!goon || goon.user_id !== locals.user.id) {
+        return json({ error: 'Goon not found' }, { status: 400 })
+      }
+      if (!isGoonRuntimeReady(goon)) {
+        return json(
+          { error: 'That Goon is still preparing. Finish it in Settings → 3D Goons first.' },
+          { status: 409 }
+        )
+      }
     }
     
     const resolvedAgentType = normalizePrimaryAgentType({

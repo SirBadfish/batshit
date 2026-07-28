@@ -1,20 +1,27 @@
 import {
   parseEyeAppearanceDefinition,
   parseEyeAppearanceState,
-  type EyeAppearanceDefinitionV1,
-  type EyeAppearanceStateV1
+  type EyeAppearanceDefinitionV3,
+  type EyeAppearanceStateV3
 } from '$lib/goons/eyeAppearance'
+import { APPEARANCE_DIAL_VALUES_CONTRACT } from '$lib/goons/appearanceDials.contracts'
 import { parseFacialArtworkDefinition } from '$lib/goons/facialArtwork'
+import {
+  parseEyeApertureSeamDefinition,
+  validateSocketEyeApertureOwnership
+} from '$lib/goons/eyeApertureSeam'
+import { parseSocketEyeSurfaceDefinition } from '$lib/goons/socketEyeSurface'
 import type { GoonRecord } from '$lib/types/goons'
+import {
+  readStoredGoonManifest,
+  StoredUploadJsonError,
+  type StoredUploadJsonReader
+} from './storedUploadJson.server'
 
-type RedisJsonReader = {
-  json: {
-    get(key: string): Promise<unknown>
-  }
-}
+type RedisJsonReader = StoredUploadJsonReader
 
 function fail(message: string): never {
-  throw new Error(`[eye-appearance/v1] ${message}`)
+  throw new Error(`[eye-appearance/v3] ${message}`)
 }
 
 async function loadStoredManifest(
@@ -23,51 +30,124 @@ async function loadStoredManifest(
 ): Promise<Record<string, unknown> | null> {
   const filename = goon.customAvatar?.manifest?.filename
   if (!filename) return null
-  const upload = await client.json.get(`upload:goon_custom_manifests:${filename}`)
-  if (!upload || typeof upload !== 'object' || Array.isArray(upload)) {
-    fail('current Custom Goon manifest upload is missing')
-  }
-  const textContent = (upload as Record<string, unknown>).textContent
-  if (typeof textContent !== 'string' || !textContent.trim()) {
-    fail('current Custom Goon manifest upload has no JSON content')
-  }
-  let manifest: unknown
   try {
-    manifest = JSON.parse(textContent)
-  } catch {
-    fail('current Custom Goon manifest upload is invalid JSON')
+    return await readStoredGoonManifest(client, filename)
+  } catch (error) {
+    if (error instanceof StoredUploadJsonError) {
+      fail(error.message)
+    }
+    throw error
   }
-  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    fail('current Custom Goon manifest must be a JSON object')
-  }
-  return manifest as Record<string, unknown>
 }
 
 export async function loadGoonEyeAppearanceDefinition(
   client: RedisJsonReader,
-  goon: Pick<GoonRecord, 'customAvatar'>
-): Promise<EyeAppearanceDefinitionV1 | null> {
+  goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>
+): Promise<EyeAppearanceDefinitionV3 | null> {
   const manifest = await loadStoredManifest(client, goon)
   if (!manifest || manifest.eyeAppearance === undefined) return null
-  if (manifest.appearanceDials === undefined || manifest.appearanceDials === null) {
-    fail('eye-appearance/v1 requires the package Recipe appearance-dials/v2 definition')
+  const recipeAppearanceDials = goon.recipe?.authoringRevision.state.appearanceDials
+  const hasRecipeAppearanceOwnership =
+    recipeAppearanceDials?.contract === APPEARANCE_DIAL_VALUES_CONTRACT
+  if (
+    (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
+    !hasRecipeAppearanceOwnership
+  ) {
+    fail('eye-appearance/v3 requires the package Recipe appearance-dials/v2 definition')
   }
   const definition = parseEyeAppearanceDefinition(manifest.eyeAppearance)
+  if (manifest.socketEyeSurface === undefined || manifest.eyeApertureSeam === undefined) {
+    fail('eye-appearance/v3 requires socket-eye-surface/v1 and eye-aperture-seam/v1')
+  }
+  const socketEyeSurface = parseSocketEyeSurfaceDefinition(manifest.socketEyeSurface)
+  const eyeApertureSeam = parseEyeApertureSeamDefinition(manifest.eyeApertureSeam)
+  validateSocketEyeApertureOwnership(socketEyeSurface, eyeApertureSeam)
+  if (
+    definition.dependencies.socketEyeSurface.definitionSha256 !==
+      socketEyeSurface.definitionSha256 ||
+    definition.dependencies.eyeApertureSeam.definitionSha256 !==
+      eyeApertureSeam.definitionSha256
+  ) {
+    fail('eye-appearance/v3 dependencies do not match the installed socket-eye definitions')
+  }
+  for (const side of ['left', 'right'] as const) {
+    if (
+      definition.runtimeBindings[side].compositeCapNode !==
+      socketEyeSurface.runtimeBindings[side].nodes.compositeCap
+    ) {
+      fail(`eye-appearance/v3 ${side} composite-cap binding does not match socket-eye-surface/v1`)
+    }
+    if (
+      definition.runtimeBindings[side].irisNeutralRadiusMeters *
+        definition.controls[0].maximum >=
+      Math.min(
+        socketEyeSurface.runtimeBindings[side].cap.carrierHalfWidthMeters,
+        socketEyeSurface.runtimeBindings[side].cap.carrierHalfHeightMeters
+      )
+    ) {
+      fail(`eye-appearance/v3 ${side} Iris Size range exceeds the virtual carrier`)
+    }
+    if (
+      definition.runtimeBindings[side].pupilNeutralRadiusRatio *
+        definition.controls[1].maximum >=
+      1
+    ) {
+      fail(`eye-appearance/v3 ${side} Pupil Size range exceeds the iris surface`)
+    }
+    const verticalControl = definition.controls[2]
+    const maximumVerticalTravel =
+      definition.runtimeBindings[side].irisVerticalTravelMeters *
+      Math.max(Math.abs(verticalControl.minimum), Math.abs(verticalControl.maximum))
+    const maximumIrisRadius =
+      definition.runtimeBindings[side].irisNeutralRadiusMeters *
+      definition.controls[0].maximum
+    if (
+      maximumVerticalTravel + maximumIrisRadius >=
+      socketEyeSurface.runtimeBindings[side].cap.carrierHalfHeightMeters
+    ) {
+      fail(`eye-appearance/v3 ${side} Iris Vertical Position range exceeds the virtual carrier`)
+    }
+  }
   if (manifest.facialArtwork === undefined) {
-    fail('eye-appearance/v1 requires the matching facial-artwork/v3 package definition')
+    fail('eye-appearance/v3 requires the matching facial-artwork/v4 package definition')
   }
   const facialArtwork = parseFacialArtworkDefinition(manifest.facialArtwork)
-  if (definition.facialArtworkDependency.definitionSha256 !== facialArtwork.definitionSha256) {
-    fail('eye-appearance/v1 facial artwork dependency does not match the installed package')
+  if (
+    facialArtwork.dependencies.eyeAppearance.definitionSha256 !== definition.definitionSha256 ||
+    facialArtwork.dependencies.socketEyeSurface.definitionSha256 !==
+      socketEyeSurface.definitionSha256 ||
+    facialArtwork.dependencies.eyeApertureSeam.definitionSha256 !==
+      eyeApertureSeam.definitionSha256
+  ) {
+    fail('facial-artwork/v4 dependencies do not match the installed socket-eye tuple')
+  }
+  for (const side of ['left', 'right'] as const) {
+    const compositeNode = socketEyeSurface.runtimeBindings[side].nodes.compositeCap
+    const linerNode = eyeApertureSeam.runtimeBindings[side].lashesEyeOutlineNode
+    for (const role of facialArtwork.roles) {
+      const target = role.target[side]
+      if (
+        target.bindingKind === 'socket-eye-composite-layer' &&
+        target.runtimeNodes[0] !== compositeNode
+      ) {
+        fail(`facial-artwork/v4 ${role.id} ${side} target does not match the composite cap`)
+      }
+      if (
+        role.id === 'lashes_eye_outline' &&
+        target.runtimeNodes[0] !== linerNode
+      ) {
+        fail(`facial-artwork/v4 ${side} liner target does not match eye-aperture-seam/v1`)
+      }
+    }
   }
   return definition
 }
 
 export async function validateGoonEyeAppearanceState(
   client: RedisJsonReader,
-  goon: Pick<GoonRecord, 'customAvatar'>,
+  goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>,
   value: unknown
-): Promise<EyeAppearanceStateV1 | null> {
+): Promise<EyeAppearanceStateV3 | null> {
   if (value === null) return null
   const definition = await loadGoonEyeAppearanceDefinition(client, goon)
   if (!definition) fail('current Goon package does not support Eye Appearance')

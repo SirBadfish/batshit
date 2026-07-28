@@ -14,11 +14,13 @@ const runtimePath = join(resourcesPath, 'runtime');
 const appSource = join(repoRoot, 'batshit-app');
 const serverSource = join(repoRoot, 'batshit-server', 'server');
 const liveKitSidecarSource = join(repoRoot, 'tools', 'livekit-agent-sidecar');
-const facialArtworkSource = join(appSource, 'static', 'goons', 'facial-artwork', 'v3');
+const facialArtworkSource = join(appSource, 'static', 'goons', 'facial-artwork', 'v4');
+const lipArtworkSource = join(appSource, 'static', 'goons', 'lip-artwork', 'v2');
 const appDest = join(runtimePath, 'batshit-app');
 const serverDest = join(runtimePath, 'batshit-server', 'server');
 const liveKitSidecarDest = join(runtimePath, 'tools', 'livekit-agent-sidecar');
-const facialArtworkDest = join(runtimePath, 'assets', 'goons', 'facial-artwork', 'v3');
+const facialArtworkDest = join(runtimePath, 'assets', 'goons', 'facial-artwork', 'v4');
+const lipArtworkDest = join(runtimePath, 'assets', 'goons', 'lip-artwork', 'v2');
 const nodeRuntimeDest = join(runtimePath, 'vendor', 'node');
 const redisStackRuntimeDest = join(runtimePath, 'vendor', 'redis-stack');
 const ffmpegRuntimeDest = join(runtimePath, 'vendor', 'ffmpeg');
@@ -131,7 +133,7 @@ async function inventoryFiles(root, relativeRoot = '') {
       continue;
     }
     if (!entry.isFile()) {
-      throw new Error(`Facial artwork assets may only contain regular files: ${join(root, relative)}`);
+      throw new Error(`Trusted Goon artwork assets may only contain regular files: ${join(root, relative)}`);
     }
     files.push({
       path: relative.split('\\').join('/'),
@@ -144,15 +146,31 @@ async function inventoryFiles(root, relativeRoot = '') {
 async function copyFacialArtworkAssets() {
   await copyRequired(facialArtworkSource, facialArtworkDest);
   const files = await inventoryFiles(facialArtworkSource);
-  if (files.length < 22 || !files.some((entry) => entry.path === 'facial-artwork-v3.json')) {
+  if (files.length < 22 || !files.some((entry) => entry.path === 'facial-artwork-v4.json')) {
     throw new Error(
-      `Facial artwork package input is incomplete: expected the v3 definition plus at least 21 assets, found ${files.length}`
+      `Facial artwork package input is incomplete: expected the v4 definition plus at least 21 assets, found ${files.length}`
     );
   }
   return {
-    contract: 'facial-artwork/v3',
-    root: 'assets/goons/facial-artwork/v3',
-    definition: 'facial-artwork-v3.json',
+    contract: 'facial-artwork/v4',
+    root: 'assets/goons/facial-artwork/v4',
+    definition: 'facial-artwork-v4.json',
+    files
+  };
+}
+
+async function copyLipArtworkAssets() {
+  await copyRequired(lipArtworkSource, lipArtworkDest);
+  const files = await inventoryFiles(lipArtworkSource);
+  if (files.length !== 5 || !files.some((entry) => entry.path === 'lip-artwork-v2.json')) {
+    throw new Error(
+      `Lip Artwork package input is incomplete: expected the v2 definition plus four template assets, found ${files.length}`
+    );
+  }
+  return {
+    contract: 'lip-artwork/v2',
+    root: 'assets/goons/lip-artwork/v2',
+    definition: 'lip-artwork-v2.json',
     files
   };
 }
@@ -411,6 +429,7 @@ async function main() {
     await copyRequired(n8nTemplates, join(runtimePath, 'docs', 'user-docs', 'user-templates', 'batshit-official-n8n-workflow-templates'));
   }
   const facialArtworkAssets = await copyFacialArtworkAssets();
+  const lipArtworkAssets = await copyLipArtworkAssets();
   await copyLiveKitSidecarSourcePackage();
   const managedRuntimeEntries = await Promise.all([
     copyManagedNodeRuntime(),
@@ -430,7 +449,8 @@ async function main() {
         n8n: 'not bundled',
         liveKitSidecar: 'tools/livekit-agent-sidecar source package for native runtime install',
         assets: {
-          facialArtwork: facialArtworkAssets
+          facialArtwork: facialArtworkAssets,
+          lipArtwork: lipArtworkAssets
         },
         managedRuntimes
       },

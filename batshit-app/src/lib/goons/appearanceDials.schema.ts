@@ -122,6 +122,7 @@ function validateRequirements(
   }
   for (const [followerId, follower] of Object.entries(followers)) {
     for (const entry of follower.drivers) {
+      if (entry.driver.kind === "anatomy-fit") continue;
       const key = driverKey(entry.driver.kind, entry.driver.id);
       if (!(requirements.get(key) ?? []).includes(followerId)) {
         throw new Error(

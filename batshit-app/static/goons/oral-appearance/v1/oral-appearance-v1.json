@@ -1,0 +1,124 @@
+{
+  "schemaVersion": "oral-appearance/v1",
+  "stateSchemaVersion": "oral-appearance-state/v1",
+  "status": "runtime-ready-painterly-default-approved",
+  "productExportApproved": true,
+  "definitionSha256": "a38ea318356fb471ecc859a9b8575643ceacd91a7a7032498c8bacd15c5b28b7",
+  "ownership": "Package-authored oral materials are the exact reset state. Mutable color, brightness, and shine values live only in the Goon's Oral Appearance sibling.",
+  "defaultLaw": "Null state and the generated default state reproduce the package-authored material color factors and roughness exactly.",
+  "compositionOrder": [
+    "package-authored texture and PBR material",
+    "family color tint",
+    "teeth brightness multiplier",
+    "teeth shine to roughness conversion"
+  ],
+  "customTexturePolicy": "No user texture upload is accepted by v1. Gum and tongue remain color-only; custom teeth textures require a future template, validation, and asset lifecycle.",
+  "runtimeBindings": {
+    "teeth": {
+      "nodes": [
+        "bs_f1_upper_teeth",
+        "bs_f1_lower_teeth"
+      ],
+      "material": "bs_f1_teeth_mat"
+    },
+    "gums": {
+      "nodes": [
+        "bs_f1_upper_gums",
+        "bs_f1_lower_gums"
+      ],
+      "material": "bs_f1_gums_mat"
+    },
+    "tongue": {
+      "nodes": [
+        "bs_f1_tongue"
+      ],
+      "material": "bs_f1_tongue_mat"
+    }
+  },
+  "materialDefaults": {
+    "teeth": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "roughness": 0.23
+    },
+    "gums": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "roughness": 0.38
+    },
+    "tongue": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "roughness": 0.7
+    }
+  },
+  "controls": [
+    {
+      "id": "teeth_color",
+      "kind": "color",
+      "label": "Teeth Color",
+      "description": "Tint both upper and lower teeth without changing their authored texture detail.",
+      "default": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "unit": "srgb-tint"
+    },
+    {
+      "id": "teeth_brightness",
+      "kind": "number",
+      "label": "Teeth Brightness",
+      "description": "Darken or brighten the teeth after their color tint is applied.",
+      "minimum": 0.5,
+      "maximum": 1.5,
+      "step": 0.01,
+      "default": 1.0,
+      "unit": "multiplier"
+    },
+    {
+      "id": "teeth_shine",
+      "kind": "number",
+      "label": "Teeth Shine",
+      "description": "Control the teeth surface gloss. Higher values create a shinier finish.",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "step": 0.01,
+      "default": 0.77,
+      "unit": "inverse-roughness"
+    },
+    {
+      "id": "gum_color",
+      "kind": "color",
+      "label": "Gum Color",
+      "description": "Tint the shared upper and lower gum material.",
+      "default": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "unit": "srgb-tint"
+    },
+    {
+      "id": "tongue_color",
+      "kind": "color",
+      "label": "Tongue Color",
+      "description": "Tint the tongue while preserving its authored surface detail.",
+      "default": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "unit": "srgb-tint"
+    }
+  ]
+}

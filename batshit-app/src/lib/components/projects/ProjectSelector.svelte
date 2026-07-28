@@ -80,10 +80,7 @@
           const loadedProjects = await projectService.loadProjects(data.user.id);
           projectStore.setProjects(loadedProjects);
           
-          // If no projects exist, prompt user to create one
-          if (loadedProjects.length === 0) {
-            openProjectsSettings('create');
-          } else {
+          if (loadedProjects.length > 0) {
             await restoreProjectForAgent(agentStore.getCurrentAgentId(), loadedProjects, { notify: false });
           }
         } catch (error) {

@@ -38,57 +38,6 @@ export const DEFAULT_GOON_CUES: GoonCueMap = {
     animationName: 'base_stand',
     expressionTargets: [{ preset: 'neutral', weight: 1 }]
   },
-  wave: {
-    name: 'wave',
-    kind: 'emote',
-    playback: 'oneshot',
-    description: 'Friendly wave',
-    mask: 'upper'
-  },
-  nod: {
-    name: 'nod',
-    kind: 'emote',
-    playback: 'oneshot',
-    description: 'Nod yes',
-    mask: 'head'
-  },
-  shake_head: {
-    name: 'shake_head',
-    kind: 'emote',
-    playback: 'oneshot',
-    description: 'Shake head no',
-    mask: 'head'
-  },
-  shrug: {
-    name: 'shrug',
-    kind: 'emote',
-    playback: 'oneshot',
-    description: 'Shrug',
-    mask: 'upper'
-  },
-  point: {
-    name: 'point',
-    kind: 'emote',
-    playback: 'oneshot',
-    description: 'Point',
-    mask: 'upper'
-  },
-  thinking_beat: {
-    name: 'thinking_beat',
-    kind: 'emote',
-    playback: 'oneshot',
-    description: 'Short thinking beat',
-    blocking: true,
-    durationMs: 900
-  },
-  laugh: {
-    name: 'laugh',
-    kind: 'emote',
-    playback: 'oneshot',
-    description: 'Short laugh beat',
-    blocking: true,
-    durationMs: 1200
-  },
   smile: {
     name: 'smile',
     kind: 'emote',
@@ -134,7 +83,6 @@ export const DEFAULT_GOON_CUES: GoonCueMap = {
 }
 
 export const DEFAULT_GOON_EMOJI_MAP: GoonEmojiMap = {
-  '👋': 'wave',
   '🙂': 'smile',
   '😊': 'smile',
   '😏': 'smirk',
@@ -142,8 +90,5 @@ export const DEFAULT_GOON_EMOJI_MAP: GoonEmojiMap = {
   '😡': 'angry',
   '😮': 'surprised',
   '😲': 'surprised',
-  '🤔': 'thinking_beat',
-  '😂': 'laugh',
-  '🤣': 'laugh',
   '😉': 'smirk'
 }

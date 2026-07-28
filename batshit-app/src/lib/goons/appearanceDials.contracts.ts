@@ -30,10 +30,7 @@ export type AppearanceNodeRole =
   | "body"
   | "face"
   | "generic-follower"
-  | "eye-sclera"
-  | "eye-iris"
-  | "eye-pupil"
-  | "eye-cornea"
+  | "socket-eye-composite-cap"
   | "brow-canvas"
   | "eye-treatment-canvas"
   | "teeth-upper"
@@ -163,7 +160,10 @@ export type AppearanceFollowerSample = {
 };
 
 export type AppearanceFollowerDriverRef =
-  { kind: "dial"; id: string } | { kind: "target"; id: string };
+  | { kind: "dial"; id: string }
+  | { kind: "target"; id: string }
+  /** Derived authoring output. Ordinary Appearance resolution always supplies zero. */
+  | { kind: "anatomy-fit"; id: string };
 
 export type AppearanceFollowerNodeTransformChannel = {
   id: string;

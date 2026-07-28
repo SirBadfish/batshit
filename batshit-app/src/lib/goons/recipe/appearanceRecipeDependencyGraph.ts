@@ -15,6 +15,7 @@ export type AppearanceRecipeDependencyNodeKind =
   | "track"
   | "macro-engine"
   | "macro-corner"
+  | "anatomy-fit"
   | "target-accumulator"
   | "target-clamp"
   | "follower"
@@ -251,6 +252,7 @@ function addSideOffset(
 }
 
 function followerDriverNode(
+  graph: MutableDependencyGraph,
   manifest: AppearanceDialsManifest,
   controls: Set<string>,
   driver: AppearanceFollowerDriverRef,
@@ -262,6 +264,9 @@ function followerDriverNode(
       );
     }
     return controlNode(driver.id);
+  }
+  if (driver.kind === "anatomy-fit") {
+    return graph.addNode(`anatomy-fit:${driver.id}`, "anatomy-fit");
   }
   requireTarget(manifest, driver.id);
   return targetClampNode(driver.id);
@@ -436,7 +441,7 @@ export function buildAppearanceRecipeDependencyGraph(
     );
     for (const driver of drivers) {
       graph.addEdge(
-        followerDriverNode(manifest, controls, driver.driver),
+        followerDriverNode(graph, manifest, controls, driver.driver),
         followerNode,
         "drives-follower",
       );

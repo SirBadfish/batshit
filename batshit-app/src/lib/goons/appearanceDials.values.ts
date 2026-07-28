@@ -559,7 +559,9 @@ export function resolveAppearanceDialState(
     for (const entry of follower.drivers) {
       inputs.set(
         followerDriverKey(entry.driver),
-        entry.driver.kind === "target"
+        entry.driver.kind === "anatomy-fit"
+          ? 0
+          : entry.driver.kind === "target"
           ? (influences.get(entry.driver.id) ?? 0)
           : (values[entry.driver.id] ?? 0),
       );

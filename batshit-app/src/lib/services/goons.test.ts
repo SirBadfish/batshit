@@ -5,6 +5,7 @@ import {
   deleteGoonFacialArtwork,
   uploadAdvancedGoonPackage,
   uploadGoonFacialArtwork,
+  uploadGoonLipArtwork,
   uploadGuidedDufClothesVrm
 } from './goons'
 
@@ -257,5 +258,44 @@ describe('goons service create flow', () => {
   it('treats referenced facial-artwork deletion as a safe shared-reference result', async () => {
     global.fetch = vi.fn(async () => new Response('', { status: 409 })) as typeof fetch
     await expect(deleteGoonFacialArtwork('goon_custom_1', 'shared.png')).resolves.toBe(false)
+  })
+
+  it('uploads Lip Artwork without exposing package template proof to the browser', async () => {
+    const definitionSha256 = 'a'.repeat(64)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('/api/goons/goon_custom_1/lip-artwork')
+      const form = init?.body as FormData
+      expect([...form.keys()].sort()).toEqual(['definitionSha256', 'file', 'provenance'])
+      expect(form.get('definitionSha256')).toBe(definitionSha256)
+      return new Response(
+        JSON.stringify({
+          artwork: {
+            url: '/uploads/goon_facial_artwork/lips.png',
+            filename: 'lips.png',
+            size: 123,
+            mimeType: 'image/png',
+            sha256: 'b'.repeat(64)
+          }
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    })
+    global.fetch = fetchMock as typeof fetch
+
+    await expect(
+      uploadGoonLipArtwork(
+        'goon_custom_1',
+        new File(['png'], 'lips.png', { type: 'image/png' }),
+        {
+          definitionSha256,
+          provenance: {
+            sourceKind: 'user-authored',
+            author: 'Fixture Artist',
+            license: 'User-owned',
+            rightsConfirmed: true
+          }
+        }
+      )
+    ).resolves.toMatchObject({ filename: 'lips.png' })
   })
 })

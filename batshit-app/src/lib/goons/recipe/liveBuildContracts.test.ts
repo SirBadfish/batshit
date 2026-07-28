@@ -311,6 +311,17 @@ describe("goon-live-build/v1 receipt", () => {
     );
   });
 
+  it("normalizes validation noise to RedisJSON-stable significant precision", () => {
+    const content = validContent();
+    content.validation.maxFinalPositionErrorMeters = 1.6098712117226137e-11;
+    content.validation.rmsFinalPositionErrorMeters = 1.3268250429733845e-11;
+
+    const parsed = parseGoonLiveBuildReceiptContent(content);
+
+    expect(parsed.validation.maxFinalPositionErrorMeters).toBe(1.60987121172e-11);
+    expect(parsed.validation.rmsFinalPositionErrorMeters).toBe(1.32682504297e-11);
+  });
+
   it("rejects invalid byte sizes and non-integer counts", () => {
     const zeroBytes = validContent();
     zeroBytes.output.model.bytes = 0;

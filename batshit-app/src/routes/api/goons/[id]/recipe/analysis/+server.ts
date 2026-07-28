@@ -1,6 +1,19 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
-import { discardRecipePackageAnalysis } from '$lib/server/services/goonRecipeLifecycleService.server'
+import {
+  discardRecipePackageAnalysis,
+  getRecipePackageAnalysis
+} from '$lib/server/services/goonRecipeLifecycleService.server'
 import { authenticatedRecipeOwner, recipeRouteError } from '$lib/server/services/goonRecipeRoute.server'
+
+export const GET: RequestHandler = async ({ params, locals }) => {
+  const owner = authenticatedRecipeOwner(locals.user?.id, params.id)
+  if (owner instanceof Response) return owner
+  try {
+    return json(await getRecipePackageAnalysis({ userId: owner.userId, goonId: owner.goonId }))
+  } catch (error) {
+    return recipeRouteError(error)
+  }
+}
 
 export const DELETE: RequestHandler = async ({ params, request, locals }) => {
   const owner = authenticatedRecipeOwner(locals.user?.id, params.id)
@@ -11,8 +24,8 @@ export const DELETE: RequestHandler = async ({ params, request, locals }) => {
       userId: owner.userId,
       goonId: owner.goonId,
       expectedWriteVersion: body.expectedWriteVersion,
-      planRef: body.planRef,
-      containmentReceipt: body.containmentReceipt
+      analysisId: body.analysisId,
+      confirmed: body.confirmed
     }))
   } catch (error) {
     return recipeRouteError(error)

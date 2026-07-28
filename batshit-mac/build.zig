@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
     const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
     const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
     const package_target = b.option(PackageTarget, "package-target", "Package target: macos, windows, linux") orelse .macos;
+    const artifact_suffix = b.option([]const u8, "artifact-suffix", "Optional package filename suffix, including its leading dash") orelse "";
     const zero_native_path = b.option([]const u8, "zero-native-path", "Path to the zero-native framework checkout") orelse default_zero_native_path;
     const optimize_name = @tagName(optimize);
     const selected_platform: PlatformOption = switch (platform_option) {
@@ -117,7 +118,7 @@ pub fn build(b: *std.Build) void {
     const dev_step = b.step("dev", "Run the frontend dev server and native shell");
     dev_step.dependOn(&dev.step);
 
-    const package_output = b.fmt("zig-out/package/{s}-0.1.0-{s}-{s}{s}{s}", .{ app_exe_name, @tagName(package_target), optimize_name, webEnginePackageSuffix(web_engine), packageSuffix(package_target) });
+    const package_output = b.fmt("zig-out/package/{s}-0.1.0-{s}-{s}{s}{s}{s}", .{ app_exe_name, @tagName(package_target), optimize_name, artifact_suffix, webEnginePackageSuffix(web_engine), packageSuffix(package_target) });
     const package_clean = b.addSystemCommand(&.{
         "node",
         "scripts/clean-package-output.mjs",

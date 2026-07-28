@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { describe, expect, it, vi } from 'vitest'
 import {
   createDefaultFacialArtworkState,
   parseFacialArtworkDefinition,
@@ -11,21 +12,33 @@ import {
   validateGoonFacialArtworkState
 } from '../facialArtwork.server'
 
+vi.mock('../eyeAppearance.server', () => ({
+  loadGoonEyeAppearanceDefinition: vi.fn(async () => ({
+    definitionSha256: 'a'.repeat(64)
+  }))
+}))
+
 function canonicalDefinition() {
-  return JSON.parse(
+  const definition = JSON.parse(
     readFileSync(
-      resolve(process.cwd(), 'static/goons/facial-artwork/v3/facial-artwork-v3.json'),
+      resolve(process.cwd(), 'static/goons/facial-artwork/v4/facial-artwork-v4.json'),
       'utf8'
     )
   )
+  definition.dependencies.eyeAppearance.definitionSha256 = 'a'.repeat(64)
+  return definition
 }
 
-function reader(manifest: unknown, uploads: Record<string, unknown> = {}) {
+function reader(
+  manifest: unknown,
+  uploads: Record<string, unknown> = {},
+  manifestUpload: Record<string, unknown> | null = null
+) {
   return {
     json: {
       async get(key: string) {
         if (key === 'upload:goon_custom_manifests:avatar.json') {
-          return { textContent: JSON.stringify(manifest) }
+          return manifestUpload ?? { textContent: JSON.stringify(manifest) }
         }
         return uploads[key] ?? null
       }
@@ -45,9 +58,45 @@ describe('facialArtwork.server', () => {
     await expect(
       loadGoonFacialArtworkDefinition(reader({ facialArtwork: definition }), goon)
     ).resolves.toMatchObject({
-      schemaVersion: 'facial-artwork/v3',
+      schemaVersion: 'facial-artwork/v4',
       definitionSha256: definition.definitionSha256
     })
+  })
+
+  it('loads the definition from the current filesystem-backed manifest upload', async () => {
+    const definition = canonicalDefinition()
+    const textContent = JSON.stringify({ facialArtwork: definition })
+    const uploadRoot = mkdtempSync(join(tmpdir(), 'batshit-facial-artwork-upload-'))
+    const manifestDir = join(uploadRoot, 'goon_custom_manifests')
+    const previousUploadsDir = process.env.UPLOADS_DIR
+    mkdirSync(manifestDir, { recursive: true })
+    writeFileSync(join(manifestDir, 'avatar.json'), textContent)
+    process.env.UPLOADS_DIR = uploadRoot
+
+    try {
+      await expect(
+        loadGoonFacialArtworkDefinition(
+          reader(
+            {},
+            {},
+            {
+              uploadType: 'goon_custom_manifests',
+              storage: 'filesystem',
+              relativePath: 'goon_custom_manifests/avatar.json',
+              size: Buffer.byteLength(textContent)
+            }
+          ),
+          goon
+        )
+      ).resolves.toMatchObject({
+        schemaVersion: 'facial-artwork/v4',
+        definitionSha256: definition.definitionSha256
+      })
+    } finally {
+      if (previousUploadsDir === undefined) delete process.env.UPLOADS_DIR
+      else process.env.UPLOADS_DIR = previousUploadsDir
+      rmSync(uploadRoot, { recursive: true, force: true })
+    }
   })
 
   it('returns null when the current package has no facial artwork definition', async () => {

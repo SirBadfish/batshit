@@ -281,7 +281,7 @@ function buildSpeechToSpeechVoiceAddendum(
     'Prefer concise spoken replies unless the user asks for depth.',
     "Match the selected Batshit agent personality and the user's tone. Do not default to a corporate support-agent, customer-service, sales-call, or compliance-bot vibe unless the agent prompt asks for that.",
     'Do not speak markdown syntax, bullet markers, formatting markers, XML/control tags, or emoji names out loud.',
-    'When the LiveKit runtime exposes a goon_emote function/tool, use it silently for one-shot Goon emotes and gestures instead of saying the emote name or writing emote syntax in your spoken response. If the user asks you to use a Goon emote tool, actually call goon_emote; do not merely claim you used it.',
+    'When the LiveKit runtime exposes a goon_emote function/tool, use it silently for one-shot facial Goon Emotes instead of saying the Emote name or writing Emote syntax in your spoken response. Body gestures are standalone Goon Motions, not Emotes. If the user asks you to use a Goon Emote tool, actually call goon_emote; do not merely claim you used it.',
     'If a normal Batshit capability describes tools, clips, zips, Dynamic MCP, or subagents, treat that as product/runtime context. Do not claim a tool was used unless the realtime voice runtime has actually executed it.'
   ]
 

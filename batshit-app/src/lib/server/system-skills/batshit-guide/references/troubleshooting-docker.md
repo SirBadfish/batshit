@@ -192,6 +192,12 @@ docker compose --env-file .env.docker --profile cloudflared up -d --build
 
 The sidecar should target `http://batshit-server:5600` — that's the internal Compose service URL. Don't change it to the host `localhost:5600` unless you're deliberately running a different topology. On macOS, the launcher/operator may trigger a system prompt about `node` accessing data from other apps; allow it if you want Docker Sandbox and approved sidecar Start/Stop controls.
 
+## Audio2Face says Bridge Running but NIM Not Ready
+
+That status is intentional: Batshit's bridge container is healthy, but it cannot reach the separate NVIDIA Audio2Face-3D NIM v2.0 gRPC service. Confirm that the licensed NVIDIA NIM is running on the GPU host and that `BATSHIT_AUDIO2FACE_NIM_ENDPOINT` is reachable from Docker. A host NIM normally uses `host.docker.internal:52000`; a remote NIM needs its reachable host and port. If you enable TLS or mTLS, also check the configured certificate paths.
+
+Batshit does not silently call a different remote service. For an utterance, it reports the Audio2Face failure, tries Rhubarb WASM, then uses text timing only if Rhubarb also fails.
+
 ## Agent Browser doesn't work in Docker
 
 Docker Agent Browser uses the optional `agent-browser` sidecar. It does not use your host Chrome profile, cookies, display, or extensions.

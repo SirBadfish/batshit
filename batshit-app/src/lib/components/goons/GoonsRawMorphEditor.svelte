@@ -8,6 +8,8 @@
   import type { GoonRawMorphTarget } from '$lib/types/goons'
 
   type Props = {
+    title?: string
+    description?: string
     morphs: GoonRawMorphTarget[]
     targetNames: string[]
     getValue: (target: string) => number
@@ -17,7 +19,17 @@
     onAdd: () => void
   }
 
-  let { morphs, targetNames, getValue, onRename, onChange, onRemove, onAdd }: Props = $props()
+  let {
+    title = 'Advanced Raw Morphs',
+    description = 'Model-specific. These sliders write directly to raw morph targets on the current avatar.',
+    morphs,
+    targetNames,
+    getValue,
+    onRename,
+    onChange,
+    onRemove,
+    onAdd
+  }: Props = $props()
 
   let open = $state(false)
 
@@ -52,11 +64,11 @@
   >
     <div class="batshit-goon-raw-morph-title-row">
       <span class="batshit-goon-raw-morph-title">
-        Expert Raw Morphs
+        {title}
       </span>
       <div role="presentation" class="batshit-goon-raw-morph-info" onclick={stopToggle} onkeydown={stopToggle}>
-        <SettingsInfoMenu ariaLabel="About Expert Raw Morphs" contentClass="batshit-goon-raw-morph-info-content">
-          <p>Model-specific. These sliders write directly to raw morph targets on the current avatar.</p>
+        <SettingsInfoMenu ariaLabel={`About ${title}`} contentClass="batshit-goon-raw-morph-info-content">
+          <p>{description}</p>
         </SettingsInfoMenu>
       </div>
     </div>

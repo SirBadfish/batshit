@@ -19,6 +19,7 @@ import {
 import {
   GOON_LIVE_BUILD_CONTRACT,
   GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
+  GOON_RECIPE_FIT_RECEIPT_CONTRACT,
   GOON_RECIPE_JOB_CONTRACT,
   GOON_RECIPE_OWNER_V2_CONTRACT,
   GOON_RECIPE_REVISION_CONTRACT,
@@ -27,10 +28,12 @@ import {
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   RECIPE_MIGRATION_PLAN_CONTRACT,
   RECIPE_SOURCE_CONTRACT,
+  createGoonLiveBuildReceipt,
   createGoonRecipeDocument,
   createRecipeRevisionEnvelope,
   recipeAuthoringRevisionSha256,
   recipeRevisionBundleSha256,
+  recipeRevisionIdentity,
   recipeStateSnapshotSha256
 } from '$lib/goons/recipe'
 import {
@@ -49,6 +52,192 @@ let previousPublicServerUrl: string | undefined
 let previousContainerized: string | undefined
 let previousRuntimeEnv: string | undefined
 let previousCodexWorkdir: string | undefined
+
+const EYE_HASH = 'a'.repeat(64)
+const SOCKET_HASH = 'b'.repeat(64)
+const SEAM_HASH = 'c'.repeat(64)
+const ARTWORK_HASH = 'd'.repeat(64)
+
+function backupEyeDefinition() {
+  const runtimeBinding = (side: 'L' | 'R') => ({
+    compositeCapNode: `BS_Eye_${side}_CompositeCap`,
+    irisNeutralRadiusMeters: 0.006,
+    pupilNeutralRadiusRatio: 0.35,
+    irisVerticalTravelMeters: 0.003,
+    edgeSoftnessMeters: 0.0002,
+    artworkMappings: {
+      sclera: 'gaze-linked-carrier',
+      iris: 'radial-carrier',
+      pupil: 'radial-carrier',
+      highlight: 'iris-space'
+    },
+    cornea: { roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.08 }
+  })
+  const control = (id: 'iris_size' | 'pupil_size' | 'iris_vertical_position') => ({
+    id,
+    label:
+      id === 'iris_size'
+        ? 'Iris Size'
+        : id === 'pupil_size'
+          ? 'Pupil Size'
+          : 'Iris Vertical Position',
+    description: `${id} on the fixed cap`,
+    minimum: id === 'iris_size' ? 0.75 : id === 'pupil_size' ? 0 : -1,
+    maximum: id === 'iris_size' ? 1.35 : id === 'pupil_size' ? 2 : 1,
+    step: 0.01,
+    default: id === 'iris_vertical_position' ? 0 : 1,
+    unit:
+      id === 'iris_size'
+        ? 'neutral-multiplier'
+        : id === 'pupil_size'
+          ? 'iris-relative-multiplier'
+          : 'neutral-travel-fraction',
+    linkedBilateral: true,
+    perEyeOverridesAllowed: false,
+    runtimeClampingAllowed: false,
+    geometrySemantics: 'Moves artwork coordinates without rotating the cap.'
+  })
+  return {
+    schemaVersion: 'eye-appearance/v3',
+    stateSchemaVersion: 'eye-appearance-state/v3',
+    status: 'product-export-approved',
+    productExportApproved: true,
+    definitionSha256: EYE_HASH,
+    dependencies: {
+      socketEyeSurface: {
+        schemaVersion: 'socket-eye-surface/v1',
+        definitionSha256: SOCKET_HASH
+      },
+      eyeApertureSeam: {
+        schemaVersion: 'eye-aperture-seam/v1',
+        definitionSha256: SEAM_HASH
+      }
+    },
+    ownership: 'Package-owned calibration.',
+    zeroLaw: 'Defaults reproduce authored eyes.',
+    symmetryLaw: 'Linked bilateral controls.',
+    compositionOrder: ['sclera', 'scleraArtwork', 'iris', 'pupil', 'highlight', 'cornea'],
+    solidColorDefaults: {
+      iris: [0.035, 0.42, 0.34, 1],
+      pupil: [0.008, 0.009, 0.012, 1],
+      sclera: [0.92, 0.94, 0.96, 1]
+    },
+    runtimeBindings: {
+      coordinateSpace: 'socket-eye-surface',
+      left: runtimeBinding('L'),
+      right: runtimeBinding('R'),
+      geometryEvidence: {
+        acceptedGlbSha256: 'e'.repeat(64),
+        socketSurfaceSha256: 'f'.repeat(64),
+        apertureSeamSha256: '1'.repeat(64)
+      }
+    },
+    controls: [control('iris_size'), control('pupil_size'), control('iris_vertical_position')],
+    rangeEvidence: {
+      schemaVersion: 'eye-appearance-range-evidence/v3',
+      sha256: '2'.repeat(64),
+      canonicalSha256: '3'.repeat(64)
+    }
+  }
+}
+
+async function backupFacialDefinition() {
+  const definition = JSON.parse(
+    await fs.readFile(
+      path.resolve(process.cwd(), 'static/goons/facial-artwork/v4/facial-artwork-v4.json'),
+      'utf8'
+    )
+  )
+  definition.definitionSha256 = ARTWORK_HASH
+  definition.dependencies = {
+    eyeAppearance: { schemaVersion: 'eye-appearance/v3', definitionSha256: EYE_HASH },
+    socketEyeSurface: {
+      schemaVersion: 'socket-eye-surface/v1',
+      definitionSha256: SOCKET_HASH
+    },
+    eyeApertureSeam: {
+      schemaVersion: 'eye-aperture-seam/v1',
+      definitionSha256: SEAM_HASH
+    }
+  }
+  return definition
+}
+
+async function createBackupRecipeLiveBuildReceipt() {
+  const sha = (value: string) => value.repeat(64)
+  return createGoonLiveBuildReceipt({
+    contract: GOON_LIVE_BUILD_CONTRACT,
+    source: {
+      revisionId: 'revision-1',
+      revision: 1,
+      packageSha256: sha('1'),
+      modelSha256: sha('2'),
+      manifestSha256: sha('3'),
+      definitionSha256: sha('4'),
+      neutralRecipeSha256: sha('5'),
+      basisSha256: sha('6')
+    },
+    state: { contract: GOON_RECIPE_STATE_CONTRACT, sha256: sha('7') },
+    baker: {
+      id: 'batshit-live-goon-baker',
+      version: 'r4-v1',
+      resolverVersion: 'appearance-recipe-physical-evaluation/v1',
+      schemaVersion: 'goon-live-manifest/v1'
+    },
+    inventory: {
+      kept: [],
+      removed: ['manifest:/appearanceDials'],
+      liveMorphTargets: [],
+      retainedDynamicMorphs: [],
+      retainedCorrectiveMorphs: []
+    },
+    proofs: {
+      neutralPositionSha256: sha('8'),
+      skeletonRestSha256: sha('9'),
+      followerSha256: sha('a'),
+      rootSha256: sha('b'),
+      groundingSha256: sha('c'),
+      performanceSha256: sha('d'),
+      pivotSha256: sha('e'),
+      attachmentSha256: sha('f'),
+      validationReportSha256: sha('0'),
+      liveManifestProvenanceSha256: sha('1')
+    },
+    output: {
+      package: { sha256: sha('2'), bytes: 3 },
+      model: { sha256: sha('3'), bytes: 2 },
+      manifest: { sha256: sha('4'), bytes: 1 },
+      counts: {
+        meshes: 0,
+        vertices: 0,
+        nodes: 0,
+        bones: 0,
+        morphTargets: 0,
+        dynamicMorphTargets: 0,
+        correctiveMorphTargets: 0,
+        recipeMorphTargets: 0
+      }
+    },
+    cost: {
+      inputBytes: 6,
+      meshesProcessed: 0,
+      verticesProcessed: 0,
+      morphTargetsProcessed: 0
+    },
+    validation: {
+      maxWeightScalarError: 0,
+      maxVertexErrorMeters: 0,
+      maxJointErrorMeters: 0,
+      maxNodeTranslationErrorMeters: 0,
+      maxPivotErrorMeters: 0,
+      maxScaleError: 0,
+      maxRotationErrorRadians: 0,
+      maxGroundingErrorMeters: 0,
+      maxFinalPositionErrorMeters: 0,
+      rmsFinalPositionErrorMeters: 0
+    }
+  })
+}
 
 async function seedRepresentativeData(userId: string) {
   await redis.json.set(`user:${userId}:settings`, '$', {
@@ -128,14 +317,7 @@ async function seedRepresentativeData(userId: string) {
     path.join(uploadRoot, 'goon_facial_artwork', 'brow-left.png'),
     'facial-artwork-bytes'
   )
-  const facialDefinition = parseFacialArtworkDefinition(
-    JSON.parse(
-      await fs.readFile(
-        path.resolve(process.cwd(), 'static/goons/facial-artwork/v3/facial-artwork-v3.json'),
-        'utf8'
-      )
-    )
-  )
+  const facialDefinition = parseFacialArtworkDefinition(await backupFacialDefinition())
   const browRole = facialDefinition.roles.find((entry) => entry.id === 'brows')!
   const browTemplate = facialDefinition.templates.find((entry) => entry.id === browRole.template)!
   const browVariant = resolveFacialArtworkTemplateVariant(
@@ -188,14 +370,7 @@ async function seedRepresentativeData(userId: string) {
     visible: true,
     artwork: createFacialArtworkArtworkLayer(facialDefinition, 'brows', facialUpload)
   }
-  const eyeDefinition = parseEyeAppearanceDefinition(
-    JSON.parse(
-      await fs.readFile(
-        path.resolve(process.cwd(), 'static/goons/eye-appearance/v1/eye-appearance-v1.json'),
-        'utf8'
-      )
-    )
-  )
+  const eyeDefinition = parseEyeAppearanceDefinition(backupEyeDefinition())
   const eyeState = createDefaultEyeAppearanceState(eyeDefinition)
   eyeState.irisSize = 1.1
   await redis.json.set('goon:goon_facial', '$', {
@@ -388,7 +563,7 @@ describe('backupRestoreService', () => {
       '/uploads/goon_facial_artwork/brow-left.png'
     )
     expect(restoredGoon.eyeAppearance).toMatchObject({
-      schemaVersion: 'eye-appearance-state/v1',
+      schemaVersion: 'eye-appearance-state/v3',
       irisSize: 1.1
     })
   })
@@ -478,16 +653,29 @@ describe('backupRestoreService', () => {
     const liveDocument = await createGoonRecipeDocument({
       userId: 'source',
       goonId: 'goon_recipe',
-      content: { contract: GOON_LIVE_BUILD_CONTRACT }
+      content: await createBackupRecipeLiveBuildReceipt()
     })
     const planDocument = await createGoonRecipeDocument({
       userId: 'source',
       goonId: 'goon_recipe',
       content: { contract: RECIPE_MIGRATION_PLAN_CONTRACT }
     })
+    const reportDocument = await createGoonRecipeDocument({
+      userId: 'source',
+      goonId: 'goon_recipe',
+      content: { contract: 'recipe-migration-report/v1' }
+    })
+    const reviewedStateDocument = await createGoonRecipeDocument({
+      userId: 'source',
+      goonId: 'goon_recipe',
+      content: { contract: 'recipe-reviewed-state/v1' }
+    })
     const receiptKey = `goon_recipe_document:source:goon_recipe:${receiptDocument.sha256}`
     const liveKey = `goon_recipe_document:source:goon_recipe:${liveDocument.sha256}`
     const planKey = `goon_recipe_document:source:goon_recipe:${planDocument.sha256}`
+    const reportKey = `goon_recipe_document:source:goon_recipe:${reportDocument.sha256}`
+    const reviewedStateKey =
+      `goon_recipe_document:source:goon_recipe:${reviewedStateDocument.sha256}`
     const receiptRef = {
       contract: receiptDocument.documentContract,
       ref: receiptKey,
@@ -502,6 +690,16 @@ describe('backupRestoreService', () => {
       contract: planDocument.documentContract,
       ref: planKey,
       sha256: planDocument.sha256
+    }
+    const reportRef = {
+      contract: reportDocument.documentContract,
+      ref: reportKey,
+      sha256: reportDocument.sha256
+    }
+    const reviewedStateRef = {
+      contract: reviewedStateDocument.documentContract,
+      ref: reviewedStateKey,
+      sha256: reviewedStateDocument.sha256
     }
     const revision = {
       contract: GOON_RECIPE_REVISION_CONTRACT,
@@ -541,6 +739,7 @@ describe('backupRestoreService', () => {
       updateReport: null
     }
     authoringRevision.revisionSha256 = await recipeAuthoringRevisionSha256(authoringRevision)
+    const sourceRevisionIdentity = recipeRevisionIdentity(revision)
 
     await redis.sAdd('user:source:goons', 'goon_recipe')
     await redis.json.set('goon:goon_recipe', '$', {
@@ -554,8 +753,10 @@ describe('backupRestoreService', () => {
         nextRecipeRevision: 2,
         liveStatus: 'building',
         authoringRevision,
+        authoringSourceContainmentReceipt: receiptRef,
         activeRevision: revisionRef,
         previousRevision: null,
+        pendingAnalysis: null,
         pendingJob: {
           jobId: 'job-1',
           jobRef: jobKey,
@@ -569,6 +770,17 @@ describe('backupRestoreService', () => {
         lastFailure: null,
         maintenanceFailure: null
       },
+      recipeFitReceipts: [{
+        contract: GOON_RECIPE_FIT_RECEIPT_CONTRACT,
+        receiptId: 'fit-hair-1',
+        surface: 'hair',
+        assetId: 'hair-1',
+        fitSha256: sha('f'),
+        boundRevision: sourceRevisionIdentity,
+        evaluatedRevision: sourceRevisionIdentity,
+        status: 'current',
+        staleReason: null
+      }],
       created_at: '2026-07-17T00:00:00.000Z',
       updated_at: '2026-07-17T00:00:00.000Z'
     })
@@ -576,6 +788,8 @@ describe('backupRestoreService', () => {
     await redis.json.set(receiptKey, '$', receiptDocument)
     await redis.json.set(liveKey, '$', liveDocument)
     await redis.json.set(planKey, '$', planDocument)
+    await redis.json.set(reportKey, '$', reportDocument)
+    await redis.json.set(reviewedStateKey, '$', reviewedStateDocument)
     await redis.json.set(jobKey, '$', {
       contract: GOON_RECIPE_JOB_CONTRACT,
       userId: 'source',
@@ -595,6 +809,9 @@ describe('backupRestoreService', () => {
         containmentReceipt: receiptRef
       },
       plan: planRef,
+      migrationReport: reportRef,
+      reviewedState: reviewedStateRef,
+      stagedLive: null,
       candidateRevision: null,
       lease: { ownerId: 'worker-1', expiresAt: '2026-07-17T00:05:00.000Z' },
       failure: null,
@@ -695,8 +912,14 @@ describe('backupRestoreService', () => {
         nextRecipeRevision: 2,
         liveStatus: 'up_to_date',
         authoringRevision: otherAuthoring,
+        authoringSourceContainmentReceipt: {
+          contract: otherReceiptDocument.documentContract,
+          ref: otherReceiptKey,
+          sha256: otherReceiptDocument.sha256
+        },
         activeRevision: otherRevisionRef,
         previousRevision: null,
+        pendingAnalysis: null,
         pendingJob: null,
         latestUpdateReport: null,
         lastFailure: null,
@@ -727,6 +950,19 @@ describe('backupRestoreService', () => {
     const restoredRevision = (await redis.json.get(targetRevisionKey)) as Record<string, any>
     expect(restoredRevision.sourceContainmentReceipt.ref).toBe(targetReceiptKey)
     expect(restoredRevision.envelopeSha256).toBe(restoredGoon.recipe.activeRevision.sha256)
+    expect(restoredGoon.recipeFitReceipts[0]).toMatchObject({
+      boundRevision: {
+        recipeRevision: restoredRevision.revision.recipeRevision,
+        revisionId: restoredRevision.revision.revisionId,
+        revisionSha256: restoredRevision.revision.revisionSha256,
+        stateSha256: restoredRevision.revision.state.stateSha256
+      },
+      evaluatedRevision: {
+        revisionSha256: restoredRevision.revision.revisionSha256
+      },
+      status: 'current',
+      staleReason: null
+    })
 
     const restoredJob = (await redis.json.get(targetJobKey)) as Record<string, any>
     expect(restoredJob.userId).toBe('target')

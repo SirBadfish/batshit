@@ -14,8 +14,6 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
       jobId: params.jobId,
       expectedWriteVersion: body.expectedWriteVersion,
       expectedJobStateVersion: body.expectedJobStateVersion,
-      state: body.state,
-      migrationReport: body.migrationReport,
       liveBuildReceipt: body.liveBuildReceipt,
       live: body.live
     }))

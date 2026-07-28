@@ -320,6 +320,12 @@
       label: 'Rhubarb WASM',
       mode: 'viseme',
       analyzerId: 'rhubarb-wasm'
+    },
+    {
+      value: 'audio2face-3d',
+      label: 'NVIDIA Audio2Face',
+      mode: 'viseme',
+      analyzerId: 'audio2face-3d'
     }
   ]
   const selectedGoonLipSyncOption = $derived.by(() => {
@@ -3427,9 +3433,10 @@
                       <Label.Label class="batshit-settings-form-label">3D Goon Lip Sync</Label.Label>
                       <SettingsInfoMenu ariaLabel="About 3D Goon Lip Sync" contentClass="w-80">
                         <p>
-                          Shitty but Fast uses Batshit&apos;s quick fallback lane. Rhubarb WASM uses the
-                          premium analyzer lane, and this single dropdown is the saved global source of
-                          truth for both Voice Settings and the Dock lab.
+                          Shitty but Fast uses Batshit&apos;s quick fallback lane. Rhubarb WASM runs in
+                          the browser. NVIDIA Audio2Face uses the optional Docker bridge and a separate
+                          GPU NIM runtime. If Audio2Face is unavailable, Batshit reports it and tries
+                          Rhubarb before falling back to text timing.
                         </p>
                       </SettingsInfoMenu>
                     </div>
@@ -3452,7 +3459,7 @@
                   </div>
                 </div>
 
-                {#if settings.goonLipSyncMode === 'viseme'}
+                {#if settings.goonLipSyncMode === 'viseme' && settings.goonLipSyncAnalyzerId === 'rhubarb-wasm'}
                   <div class="batshit-settings-form-row is-compact">
                     <div class="batshit-settings-form-copy">
                       <div class="batshit-settings-form-label-line">

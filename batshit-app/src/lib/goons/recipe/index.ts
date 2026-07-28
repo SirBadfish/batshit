@@ -6,6 +6,14 @@
  */
 
 export * from "./appearanceRecipeSnapshot";
+export * from "./anatomyFitContracts";
+export * from "./anatomyFitAuthoring";
+export * from "./anatomyFitAuthoringClient";
+export * from "./anatomyFitManifest";
+export * from "./anatomyFitSolver";
+export * from "./oralCavityFit";
+export * from "./oralCavityFitPackage";
+export * from "./eyeSocketFit";
 export * from "./appearanceRecipeCandidateGenerator";
 export * from "./appearanceRecipeCandidateUniqueness";
 export * from "./appearanceRecipeDependencyGraph";
@@ -18,12 +26,21 @@ export * from "./archiveContainmentContracts";
 export * from "./componentMapContracts";
 export * from "./contractIds";
 export * from "./liveBuildContracts";
+export * from "./liveGoonBaker";
+export * from "./liveGoonBakerClient";
+export * from "./liveGoonBaker.workerProtocol";
 export * from "./liveManifestContracts";
 export * from "./migrationPlanContracts";
 export * from "./packageMetadata";
 export * from "./recipeCanonical";
+export * from "./recipeAuthorUpdatePolicy";
+export * from "./recipeBuildDirtyDomains";
 export * from "./recipeContracts";
 export * from "./recipeLifecycleContracts";
+export * from "./recipeProductLifecycle";
+export * from "./recipeReviewContracts";
+export * from "./recipeRuntimeProjection";
+export * from "./recipeWorkflowClient";
 export * from "./recipeSourceAssets";
 export * from "./semanticGlb";
 export * from "./sourcePackageProjections";

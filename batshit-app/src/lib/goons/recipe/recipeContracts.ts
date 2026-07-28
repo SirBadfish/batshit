@@ -255,13 +255,13 @@ function parseJsonValue(value: unknown, context: string): RecipeJsonValue {
     );
   }
   const source = record(value, context);
-  const result: { [key: string]: RecipeJsonValue } = Object.create(null);
+  const entries: [string, RecipeJsonValue][] = [];
   for (const [key, entry] of Object.entries(source)) {
     if (FORBIDDEN_RECORD_KEYS.has(key))
       fail(`${context} contains forbidden field ${key}`);
-    result[key] = parseJsonValue(entry, `${context}.${key}`);
+    entries.push([key, parseJsonValue(entry, `${context}.${key}`)]);
   }
-  return result;
+  return Object.fromEntries(entries);
 }
 
 function parseAssetRef(value: unknown, context: string): RecipeAssetRef {
@@ -327,14 +327,15 @@ function parseAppearanceDialState(
   const valueSource = record(source.values, `${context}.values`);
   if (Object.keys(valueSource).length === 0)
     fail(`${context}.values must not be empty`);
-  const values: Record<string, number> = Object.create(null);
+  const valueEntries: [string, number][] = [];
   for (const [id, rawValue] of Object.entries(valueSource)) {
     stableId(id, `${context}.values key`);
     if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
       fail(`${context}.values.${id} must be finite`);
     }
-    values[id] = rawValue;
+    valueEntries.push([id, rawValue]);
   }
+  const values = Object.fromEntries(valueEntries);
   if (!Array.isArray(source.unlockedDialIds)) {
     fail(`${context}.unlockedDialIds must be an array`);
   }

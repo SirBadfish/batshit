@@ -3,6 +3,7 @@ import type { GoonRecord } from '$lib/types/goons'
 import {
   GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
   GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
+  applyRecipeRevisionProjection,
   canonicalRecipeString,
   createGoonRecipeDocument,
   createRecipeRevisionEnvelope,
@@ -174,25 +175,7 @@ function fileRef(asset: RecipeRevisionEnvelope['live']['package']) {
 }
 
 function applyActiveRevision(clone: GoonRecord, envelope: RecipeRevisionEnvelope) {
-  clone.customAvatar = {
-    ...(clone.customAvatar ?? {}),
-    package: fileRef(envelope.live.package),
-    model: fileRef(envelope.live.model),
-    manifest: fileRef(envelope.live.manifest)
-  }
-  delete clone.customAvatar.pending
-  delete clone.customAvatar.backup
-  clone.appearanceDials = envelope.revision.state.appearanceDials
-  const siblingFor = (contract: string, ids: string[]) =>
-    envelope.revision.state.siblings.find(
-      (sibling) => sibling.contract === contract || ids.includes(sibling.id)
-    )?.state
-  const facialArtwork = siblingFor('facial-artwork-state/v3', ['facial-artwork', 'facialArtwork'])
-  const eyeAppearance = siblingFor('eye-appearance-state/v1', ['eye-appearance', 'eyeAppearance'])
-  if (facialArtwork) clone.facialArtwork = facialArtwork as GoonRecord['facialArtwork']
-  else delete clone.facialArtwork
-  if (eyeAppearance) clone.eyeAppearance = eyeAppearance as GoonRecord['eyeAppearance']
-  else delete clone.eyeAppearance
+  applyRecipeRevisionProjection(clone, envelope, (asset) => fileRef(asset))
 }
 
 export async function duplicateRecipeGoon(input: {
@@ -253,8 +236,10 @@ export async function duplicateRecipeGoon(input: {
     nextRecipeRevision: Math.max(sourceOwner.nextRecipeRevision, authoringRevision.recipeRevision + 1),
     liveStatus: 'up_to_date',
     authoringRevision,
+    authoringSourceContainmentReceipt: active.envelope.sourceContainmentReceipt,
     activeRevision: active.ref,
     previousRevision: previous?.ref ?? null,
+    pendingAnalysis: null,
     pendingJob: null,
     latestUpdateReport: active.envelope.revision.updateReport,
     lastFailure: null,

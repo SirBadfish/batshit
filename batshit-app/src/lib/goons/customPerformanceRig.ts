@@ -1,7 +1,9 @@
 import * as THREE from 'three'
 import type { GoonFaceControl } from '$lib/types/goons'
+import type { ResolvedCustomExpressionBinding } from '$lib/goons/customAvatar'
 
-const CONTRACT = 'batshit-performance-rig/v1' as const
+const LEGACY_CONTRACT = 'batshit-performance-rig/v1' as const
+const SOCKET_CONTRACT = 'batshit-performance-rig/v2' as const
 const TRANSFORM_COMBINE = 'translation-sum-rotation-vector-sum/v1' as const
 const EPSILON = 1e-8
 const SHARE_TOLERANCE = 1e-6
@@ -34,14 +36,18 @@ export type CustomPerformanceTargetTransform = {
   channels: Record<string, CustomPerformanceTargetChannel>
 }
 
-export type CustomPerformanceRigManifest = {
-  contract: typeof CONTRACT
+type CustomPerformanceRigManifestBase = {
   space: 'node-parent-rest'
   rotation: {
     representation: 'rotation-vector'
     units: 'radians'
     composition: 'ordered-expmap/v1'
   }
+  targetTransforms: Record<string, CustomPerformanceTargetTransform>
+}
+
+export type LegacyCustomPerformanceRigManifest = CustomPerformanceRigManifestBase & {
+  contract: typeof LEGACY_CONTRACT
   nodes: {
     head: CustomPerformanceLookNode
     neck: CustomPerformanceLookNode
@@ -54,8 +60,24 @@ export type CustomPerformanceRigManifest = {
     eyeYawMode: 'asymmetric-in-out'
     eyePitchMode: 'asymmetric-up-down'
   }
-  targetTransforms: Record<string, CustomPerformanceTargetTransform>
 }
+
+export type SocketCustomPerformanceRigManifest = CustomPerformanceRigManifestBase & {
+  contract: typeof SOCKET_CONTRACT
+  nodes: {
+    head: CustomPerformanceLookNode
+    neck: CustomPerformanceLookNode
+  }
+  look: {
+    headYawShares: { head: number; neck: number }
+    headPitchShares: { head: number; neck: number }
+    eyeDriver: 'socket-surface-target/v1'
+  }
+}
+
+export type CustomPerformanceRigManifest =
+  | LegacyCustomPerformanceRigManifest
+  | SocketCustomPerformanceRigManifest
 
 export type CustomPerformanceDirection = {
   headYaw: number
@@ -114,6 +136,8 @@ type BoundLookNode = {
   spec: CustomPerformanceLookNode
 }
 
+type CustomPerformanceLookRole = 'head' | 'neck' | 'leftEye' | 'rightEye'
+
 type BoundTargetTransform = {
   node: THREE.Object3D
   spec: CustomPerformanceTargetTransform
@@ -141,7 +165,7 @@ function rejectUnknownKeys(
   const allowedSet = new Set(allowed)
   for (const key of Object.keys(value)) {
     if (!allowedSet.has(key))
-      addIssue(issues, `${path}.${key}`, 'is not allowed by v1.')
+      addIssue(issues, `${path}.${key}`, 'is not allowed by this performance contract.')
   }
 }
 
@@ -383,8 +407,16 @@ export function resolveCustomPerformanceRigManifest(
     path,
     issues
   )
-  if (value.contract !== CONTRACT) {
-    addIssue(issues, `${path}.contract`, `must equal "${CONTRACT}".`)
+  const contract =
+    value.contract === LEGACY_CONTRACT || value.contract === SOCKET_CONTRACT
+      ? value.contract
+      : null
+  if (!contract) {
+    addIssue(
+      issues,
+      `${path}.contract`,
+      `must equal "${LEGACY_CONTRACT}" or "${SOCKET_CONTRACT}".`
+    )
   }
   if (value.space !== 'node-parent-rest') {
     addIssue(issues, `${path}.space`, 'must equal "node-parent-rest".')
@@ -425,12 +457,14 @@ export function resolveCustomPerformanceRigManifest(
   } else {
     rejectUnknownKeys(
       nodes,
-      ['head', 'neck', 'leftEye', 'rightEye'],
+      contract === SOCKET_CONTRACT
+        ? ['head', 'neck']
+        : ['head', 'neck', 'leftEye', 'rightEye'],
       `${path}.nodes`,
       issues
     )
   }
-  const parsedNodes = {
+  const parsedHeadAndNeck = {
     head: parseLookNode(
       isRecord(nodes) ? nodes.head : undefined,
       `${path}.nodes.head`,
@@ -440,18 +474,23 @@ export function resolveCustomPerformanceRigManifest(
       isRecord(nodes) ? nodes.neck : undefined,
       `${path}.nodes.neck`,
       issues
-    ),
-    leftEye: parseLookNode(
-      isRecord(nodes) ? nodes.leftEye : undefined,
-      `${path}.nodes.leftEye`,
-      issues
-    ),
-    rightEye: parseLookNode(
-      isRecord(nodes) ? nodes.rightEye : undefined,
-      `${path}.nodes.rightEye`,
-      issues
     )
   }
+  const parsedLegacyEyeNodes =
+    contract === SOCKET_CONTRACT
+      ? null
+      : {
+          leftEye: parseLookNode(
+            isRecord(nodes) ? nodes.leftEye : undefined,
+            `${path}.nodes.leftEye`,
+            issues
+          ),
+          rightEye: parseLookNode(
+            isRecord(nodes) ? nodes.rightEye : undefined,
+            `${path}.nodes.rightEye`,
+            issues
+          )
+        }
 
   const look = value.look
   if (!isRecord(look)) {
@@ -459,26 +498,29 @@ export function resolveCustomPerformanceRigManifest(
   } else {
     rejectUnknownKeys(
       look,
-      ['headYawShares', 'headPitchShares', 'eyeYawMode', 'eyePitchMode'],
+      contract === SOCKET_CONTRACT
+        ? ['headYawShares', 'headPitchShares', 'eyeDriver']
+        : ['headYawShares', 'headPitchShares', 'eyeYawMode', 'eyePitchMode'],
       `${path}.look`,
       issues
     )
-    if (look.eyeYawMode !== 'asymmetric-in-out') {
+    if (contract === SOCKET_CONTRACT && look.eyeDriver !== 'socket-surface-target/v1') {
+      addIssue(
+        issues,
+        `${path}.look.eyeDriver`,
+        'must equal "socket-surface-target/v1".'
+      )
+    } else if (contract !== SOCKET_CONTRACT && look.eyeYawMode !== 'asymmetric-in-out') {
       addIssue(
         issues,
         `${path}.look.eyeYawMode`,
         'must equal "asymmetric-in-out".'
       )
-    }
-    if (look.eyePitchMode !== 'asymmetric-up-down') {
-      addIssue(
-        issues,
-        `${path}.look.eyePitchMode`,
-        'must equal "asymmetric-up-down".'
-      )
+    } else if (contract !== SOCKET_CONTRACT && look.eyePitchMode !== 'asymmetric-up-down') {
+      addIssue(issues, `${path}.look.eyePitchMode`, 'must equal "asymmetric-up-down".')
     }
   }
-  const parsedLook = {
+  const parsedShares = {
     headYawShares: parseShares(
       isRecord(look) ? look.headYawShares : undefined,
       `${path}.look.headYawShares`,
@@ -488,12 +530,10 @@ export function resolveCustomPerformanceRigManifest(
       isRecord(look) ? look.headPitchShares : undefined,
       `${path}.look.headPitchShares`,
       issues
-    ),
-    eyeYawMode: 'asymmetric-in-out' as const,
-    eyePitchMode: 'asymmetric-up-down' as const
+    )
   }
 
-  const targetTransforms: Record<string, CustomPerformanceTargetTransform> = {}
+  const targetTransformEntries = new Map<string, CustomPerformanceTargetTransform>()
   if (!isRecord(value.targetTransforms)) {
     addIssue(issues, `${path}.targetTransforms`, 'must be an object.')
   } else if (Object.keys(value.targetTransforms).length === 0) {
@@ -520,7 +560,7 @@ export function resolveCustomPerformanceRigManifest(
           'must not contain surrounding whitespace.'
         )
       }
-      if (Object.hasOwn(targetTransforms, trimmed)) {
+      if (targetTransformEntries.has(trimmed)) {
         addIssue(
           issues,
           `${path}.targetTransforms.${role}`,
@@ -528,28 +568,50 @@ export function resolveCustomPerformanceRigManifest(
         )
         continue
       }
-      targetTransforms[trimmed] = parseTargetTransform(
-        rawTransform,
-        `${path}.targetTransforms.${trimmed}`,
-        issues
+      targetTransformEntries.set(
+        trimmed,
+        parseTargetTransform(
+          rawTransform,
+          `${path}.targetTransforms.${trimmed}`,
+          issues
+        )
       )
     }
   }
 
   if (issues.length > 0) return { manifest: null, issues }
-  return {
-    manifest: {
-      contract: CONTRACT,
+  const targetTransforms = Object.fromEntries(targetTransformEntries)
+  const base = {
       space: 'node-parent-rest',
       rotation: {
         representation: 'rotation-vector',
         units: 'radians',
         composition: 'ordered-expmap/v1'
       },
-      nodes: parsedNodes,
-      look: parsedLook,
       targetTransforms
-    },
+  } satisfies CustomPerformanceRigManifestBase
+  return {
+    manifest:
+      contract === SOCKET_CONTRACT
+        ? {
+            ...base,
+            contract: SOCKET_CONTRACT,
+            nodes: parsedHeadAndNeck,
+            look: {
+              ...parsedShares,
+              eyeDriver: 'socket-surface-target/v1'
+            }
+          }
+        : {
+            ...base,
+            contract: LEGACY_CONTRACT,
+            nodes: { ...parsedHeadAndNeck, ...parsedLegacyEyeNodes! },
+            look: {
+              ...parsedShares,
+              eyeYawMode: 'asymmetric-in-out',
+              eyePitchMode: 'asymmetric-up-down'
+            }
+          },
     issues: []
   }
 }
@@ -618,20 +680,24 @@ export function resolveCustomPerformanceDirection(input: {
   }
 
   const raw = input.rawTargetWeights ?? new Map<string, number>()
+  const hasLeftEyeYawRaw = raw.has('eyeLookOutLeft') || raw.has('eyeLookInLeft')
+  const hasRightEyeYawRaw = raw.has('eyeLookInRight') || raw.has('eyeLookOutRight')
+  const hasLeftEyePitchRaw = raw.has('eyeLookDownLeft') || raw.has('eyeLookUpLeft')
+  const hasRightEyePitchRaw = raw.has('eyeLookDownRight') || raw.has('eyeLookUpRight')
   const leftEyeYaw =
-    eyeYaw -
+    (hasLeftEyeYawRaw ? 0 : eyeYaw) -
     readWeight(raw, 'eyeLookOutLeft') +
     readWeight(raw, 'eyeLookInLeft')
   const rightEyeYaw =
-    eyeYaw -
+    (hasRightEyeYawRaw ? 0 : eyeYaw) -
     readWeight(raw, 'eyeLookInRight') +
     readWeight(raw, 'eyeLookOutRight')
   const leftEyePitch =
-    eyePitch -
+    (hasLeftEyePitchRaw ? 0 : eyePitch) -
     readWeight(raw, 'eyeLookDownLeft') +
     readWeight(raw, 'eyeLookUpLeft')
   const rightEyePitch =
-    eyePitch -
+    (hasRightEyePitchRaw ? 0 : eyePitch) -
     readWeight(raw, 'eyeLookDownRight') +
     readWeight(raw, 'eyeLookUpRight')
 
@@ -731,7 +797,7 @@ export function resolveFaceControlEyeLookPresetWeights(
 
 export function resolveFinalCustomTargetWeights(input: {
   expressionWeights: ReadonlyMap<string, number>
-  expressionBindings: ReadonlyMap<string, readonly string[]>
+  expressionBindings: ReadonlyMap<string, readonly ResolvedCustomExpressionBinding[]>
   faceControlWeights: ReadonlyMap<string, number>
   rawTargetWeights: ReadonlyMap<string, number>
 }): Map<string, number> {
@@ -745,8 +811,9 @@ export function resolveFinalCustomTargetWeights(input: {
     result.set(target, Math.max(result.get(target) ?? 0, clamped))
   }
   for (const [preset, value] of input.expressionWeights) {
-    for (const target of input.expressionBindings.get(preset) ?? [])
-      setMax(target, value)
+    for (const binding of input.expressionBindings.get(preset) ?? []) {
+      setMax(binding.target, value * binding.weight)
+    }
   }
   for (const [target, value] of input.faceControlWeights) setMax(target, value)
   for (const [target, value] of input.rawTargetWeights) {
@@ -754,6 +821,26 @@ export function resolveFinalCustomTargetWeights(input: {
       target,
       THREE.MathUtils.clamp(Number.isFinite(value) ? value : 0, 0, 1)
     )
+  }
+  return result
+}
+
+export function resolveSocketEyeBlinkClosureTargetWeights(
+  input: ReadonlyMap<string, number>,
+  fullBlinkSquintFloor: number
+): Map<string, number> {
+  const floor = THREE.MathUtils.clamp(
+    Number.isFinite(fullBlinkSquintFloor) ? fullBlinkSquintFloor : 0,
+    0,
+    1
+  )
+  const result = new Map(input)
+  for (const suffix of ['Left', 'Right'] as const) {
+    const blinkTarget = `eyeBlink${suffix}`
+    const squintTarget = `eyeSquint${suffix}`
+    const blink = THREE.MathUtils.clamp(result.get(blinkTarget) ?? 0, 0, 1)
+    const explicitSquint = THREE.MathUtils.clamp(result.get(squintTarget) ?? 0, 0, 1)
+    result.set(squintTarget, Math.max(explicitSquint, blink * floor))
   }
   return result
 }
@@ -787,10 +874,7 @@ function axisRotationVector(
 
 export class CustomPerformanceRigRuntime {
   readonly manifest: CustomPerformanceRigManifest
-  private readonly lookNodes: Record<
-    keyof CustomPerformanceRigManifest['nodes'],
-    BoundLookNode
-  >
+  private readonly lookNodes: Partial<Record<CustomPerformanceLookRole, BoundLookNode>>
   private readonly targetTransforms: BoundTargetTransform[]
   private readonly lookRestTransforms = new Map<
     THREE.Object3D,
@@ -801,16 +885,15 @@ export class CustomPerformanceRigRuntime {
 
   constructor(
     manifest: CustomPerformanceRigManifest,
-    lookNodes: Record<
-      keyof CustomPerformanceRigManifest['nodes'],
-      BoundLookNode
-    >,
+    lookNodes: Partial<Record<CustomPerformanceLookRole, BoundLookNode>>,
     targetTransforms: BoundTargetTransform[]
   ) {
     this.manifest = manifest
     this.lookNodes = lookNodes
     this.targetTransforms = targetTransforms
-    for (const { node } of Object.values(lookNodes)) {
+    for (const binding of Object.values(lookNodes)) {
+      if (!binding) continue
+      const { node } = binding
       this.lookRestTransforms.set(node, {
         position: node.position.clone(),
         rotation: node.quaternion.clone()
@@ -818,12 +901,28 @@ export class CustomPerformanceRigRuntime {
     }
   }
 
-  getLookNode(role: keyof CustomPerformanceRigManifest['nodes']) {
-    return this.lookNodes[role].node
+  getLookNode(role: CustomPerformanceLookRole) {
+    const binding = this.lookNodes[role]
+    if (!binding) {
+      throw new Error(
+        `[custom-performance-rig] ${this.manifest.contract} does not expose ${role} as a rotating look node.`
+      )
+    }
+    return binding.node
+  }
+
+  hasLookNode(role: CustomPerformanceLookRole) {
+    return Boolean(this.lookNodes[role])
+  }
+
+  usesSocketEyeDriver() {
+    return this.manifest.contract === SOCKET_CONTRACT
   }
 
   rebaseLookNodePositions() {
-    for (const { node } of Object.values(this.lookNodes)) {
+    for (const binding of Object.values(this.lookNodes)) {
+      if (!binding) continue
+      const { node } = binding
       const rest = this.lookRestTransforms.get(node)
       if (rest) rest.position.copy(node.position)
     }
@@ -871,29 +970,23 @@ export class CustomPerformanceRigRuntime {
     }
 
     addLook(
-      this.lookNodes.head,
+      this.lookNodes.head!,
       direction.headYaw,
       direction.headPitch,
       this.manifest.look.headYawShares.head,
       this.manifest.look.headPitchShares.head
     )
     addLook(
-      this.lookNodes.neck,
+      this.lookNodes.neck!,
       direction.headYaw,
       direction.headPitch,
       this.manifest.look.headYawShares.neck,
       this.manifest.look.headPitchShares.neck
     )
-    addLook(
-      this.lookNodes.leftEye,
-      direction.leftEyeYaw,
-      direction.leftEyePitch
-    )
-    addLook(
-      this.lookNodes.rightEye,
-      direction.rightEyeYaw,
-      direction.rightEyePitch
-    )
+    if (this.manifest.contract === LEGACY_CONTRACT) {
+      addLook(this.lookNodes.leftEye!, direction.leftEyeYaw, direction.leftEyePitch)
+      addLook(this.lookNodes.rightEye!, direction.rightEyeYaw, direction.rightEyePitch)
+    }
 
     for (const binding of this.targetTransforms) {
       const translation = translations.get(binding.node) ?? new THREE.Vector3()
@@ -974,13 +1067,21 @@ export function bindCustomPerformanceRig(
     return matches[0]!
   }
 
-  const boundLook = {} as Record<
-    keyof CustomPerformanceRigManifest['nodes'],
-    BoundLookNode
-  >
+  const boundLook: Partial<Record<CustomPerformanceLookRole, BoundLookNode>> = {}
   const claimedNodes = new Map<THREE.Object3D, string>()
-  for (const role of ['head', 'neck', 'leftEye', 'rightEye'] as const) {
-    const spec = manifest.nodes[role]
+  const lookRoles: CustomPerformanceLookRole[] =
+    manifest.contract === SOCKET_CONTRACT
+      ? ['head', 'neck']
+      : ['head', 'neck', 'leftEye', 'rightEye']
+  const lookNodeSpecs = manifest.nodes as Partial<
+    Record<CustomPerformanceLookRole, CustomPerformanceLookNode>
+  >
+  for (const role of lookRoles) {
+    const spec = lookNodeSpecs[role]
+    if (!spec) {
+      addIssue(issues, `rig.performance.nodes.${role}`, 'is required.')
+      continue
+    }
     const node = resolveUnique(spec.node, `rig.performance.nodes.${role}.node`)
     if (!node) continue
     const prior = claimedNodes.get(node)

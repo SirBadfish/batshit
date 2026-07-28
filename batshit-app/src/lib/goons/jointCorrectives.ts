@@ -178,7 +178,17 @@ export function parseJointCorrectives(
     }
     if (driverIds.has(id)) throw new Error(`rig.correctives duplicate driver id ${id}`)
     driverIds.add(id)
-    drivers.push(entry as unknown as JointCorrectiveDriver)
+    drivers.push({
+      id,
+      kind: 'swing-angle',
+      combine: 'mean',
+      clampDeg: [clamp[0], clamp[1]],
+      bones: entry.bones.map((bone) => ({
+        bone: (bone as Record<string, unknown>).bone as string,
+        restRotation: [...((bone as Record<string, unknown>).restRotation as CorrectiveQuat)],
+        axisRestLocal: [...((bone as Record<string, unknown>).axisRestLocal as CorrectiveVec3)]
+      }))
+    })
   }
 
   const dialIds = new Set(dials.dials.map((dial) => dial.id))
@@ -215,7 +225,15 @@ export function parseJointCorrectives(
     if (!dialIds.has(entry.anchorDial)) {
       throw new Error(`rig.correctives entry ${key} references unknown anchor dial ${entry.anchorDial}`)
     }
-    entries.push({ ...(entry as unknown as JointCorrectiveEntry), key })
+    entries.push({
+      driver: entry.driver,
+      key,
+      anchorDial: entry.anchorDial,
+      anchorAt0: entry.anchorAt0,
+      anchorAt1: entry.anchorAt1,
+      angleCurve: entry.angleCurve.map((point) => [point[0], point[1]]),
+      mode: 'additive'
+    })
   }
 
   return { contract: JOINT_CORRECTIVES_CONTRACT, drivers, entries }

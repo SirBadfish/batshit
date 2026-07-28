@@ -453,8 +453,8 @@ describe('Goon camera navigation', () => {
 
   it('does not back a narrow headshot away to fit the avatar arms', () => {
     const bounds = new THREE.Box3(
-      new THREE.Vector3(-0.4, 0, -0.2),
-      new THREE.Vector3(0.4, 1.8, 0.2)
+      new THREE.Vector3(-0.9, 0, -0.2),
+      new THREE.Vector3(0.9, 1.8, 0.2)
     )
     const anchors = { headY: 1.56, hipsY: 1.1, feetY: 0 }
     const frame = (preset: GoonFramingPreset) =>
@@ -464,10 +464,11 @@ describe('Goon camera navigation', () => {
         preset,
         verticalFovDegrees: 50,
         aspect: 0.55,
-        minDistance: 0.8,
+        minDistance: 0.35,
         maxDistance: 6
       })!
 
+    expect(frame('headshot').distance).toBeLessThan(0.6)
     expect(frame('headshot').distance).toBeLessThan(frame('portrait').distance)
     expect(frame('portrait').distance).toBeLessThan(frame('full-body').distance)
   })

@@ -69,7 +69,7 @@ That prompt is given to the AI only when Batshit is about to speak a reply with 
 
 Fish realtime TTS needs a Fish API key and a selected Fish voice in Voice Settings (or a `voiceId` supplied by the caller). If Fish fails with a missing-voice message, the network usually isn't the problem — choose the Fish voice/reference voice in the Voice field first. Fish realtime playback buffers the first two audio chunks and defaults to a smoother chunk length so playback does not starve when provider chunks arrive unevenly. If you manually lower Fish chunk length for speed and hear buzzing or repeated syllables, raise it again. Fish can keep Goon mouth timing stretched to the streamed audio duration, but it does not currently send provider-native viseme mouth shapes.
 
-Inworld realtime TTS needs an Inworld API key and a selected Inworld voice in Voice Settings. Batshit calls Inworld's realtime TTS endpoint directly and keeps ownership of chat context, tools, Zips, message storage, and playback events. When 3D Goon Lip Sync is set to Rhubarb WASM / the Premium viseme lane, Inworld realtime TTS can drive live Goon mouth shapes from Inworld's phoneme/viseme timestamps instead of waiting for Rhubarb WASM analysis.
+Inworld realtime TTS needs an Inworld API key and a selected Inworld voice in Voice Settings. Batshit calls Inworld's realtime TTS endpoint directly and keeps ownership of chat context, tools, Zips, message storage, and playback events. When 3D Goon Lip Sync is set to Rhubarb WASM / the Premium viseme lane, Batshit keeps Inworld's OVR-style phoneme/viseme detail through playback and adapts it to the active Goon's authored mouth profile instead of flattening it early or waiting for Rhubarb WASM analysis.
 
 MiniMax, MiMo, Alibaba Cloud, and StepFun reuse the same saved API key for direct model presets and TTS. Inworld, Cartesia, Async, and Azure Speech are TTS-only rows in Settings -> API Keys; Inworld is TTS-only but supports Batshit-owned direct realtime TTS, while Cartesia, Async, and Azure Speech remain batch TTS lanes in Batshit until direct streaming adapters land. Azure's current Batshit lane is REST batch TTS and regional voice listing; provider viseme/lip-sync events need a future Azure Speech SDK bridge.
 
@@ -206,9 +206,12 @@ Not every TTS provider supports cloning. If cloning isn't available for a provid
 If you use 3D Goons, voice playback can drive mouth movement. Global lip-sync choices:
 
 - **Shitty but Fast** — quick amplitude-based mouth movement with timing fallback.
-- **Rhubarb WASM / provider visemes** — better mouth timing where supported. Completed-audio providers use Rhubarb WASM; Inworld realtime TTS can use Inworld's own phoneme/viseme timing for live mouth shapes.
+- **Rhubarb WASM** — completed-audio mouth analysis in the browser. Inworld realtime TTS can still use its own phoneme/viseme timing live.
+- **NVIDIA Audio2Face** — optional completed-audio full-face ARKit animation for compatible Advanced/GLB Goons. It needs Batshit's Docker bridge plus a separately installed and licensed NVIDIA Audio2Face-3D NIM v2.0 GPU runtime.
 
-Direct realtime TTS does not wait for Rhubarb analysis because Rhubarb needs completed audio. Fish and Inworld realtime alignment can improve cue timing when provider timestamps are available. Inworld can also drive live Goon mouth shapes from its provider phoneme/viseme timing when 3D Goon Lip Sync is set to Rhubarb WASM / the Premium viseme lane, making it the best current realtime test lane for live Goon lip sync.
+Direct realtime TTS does not wait for completed-audio analysis. Fish and Inworld realtime alignment can improve cue timing when provider timestamps are available. Inworld can also drive live Goon mouth shapes from its provider phoneme/viseme timing during realtime playback.
+
+Audio2Face is an optional advanced lane, not part of Batshit's core install and not an NVIDIA runtime distributor. Start your licensed NVIDIA NIM separately, set its reachable gRPC endpoint in `.env.docker`, then start the `audio2face` bridge profile. Admin → Runtimes reports the bridge and NVIDIA NIM separately. If Audio2Face fails for a completed utterance, Batshit shows the failure and tries Rhubarb WASM; if Rhubarb also fails, it reports that and uses text timing. The first Audio2Face release is completed-audio/cache-first only, not realtime streaming.
 
 Visual quality still depends on the avatar's authored mouth expressions. If timing is aligned but some shapes look too closed, too narrow, or generally awkward, check the Goon's Blender/VRM mouth morphs and `avatar.json` face-expression mapping before assuming the voice provider is wrong.
 

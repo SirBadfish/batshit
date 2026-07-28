@@ -18,6 +18,11 @@ describe('atomic Goon mutation repository', () => {
     expect(() => assertGenericGoonPatchAllowed(existing, { customAvatar: null })).toThrowError(
       expect.objectContaining({ code: 'RECIPE_MANAGED_FIELD', status: 409 })
     )
+    for (const field of ['oralAppearance', 'recipeFitReceipts']) {
+      expect(() => assertGenericGoonPatchAllowed(existing, { [field]: null })).toThrowError(
+        expect.objectContaining({ code: 'RECIPE_MANAGED_FIELD', status: 409 })
+      )
+    }
     expect(() => assertGenericGoonPatchAllowed(existing, { recipe: null })).toThrowError(
       expect.objectContaining({ code: 'RESERVED_FIELD', status: 400 })
     )

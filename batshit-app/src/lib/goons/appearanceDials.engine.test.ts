@@ -1,7 +1,5 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import * as THREE from "three";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   APPEARANCE_CLIP_REMAP_CONTRACT,
   APPEARANCE_DIALS_CONTRACT,
@@ -16,6 +14,21 @@ import {
 import { AppearanceDialsEngineRuntime } from "./appearanceDials.engine";
 import type { GoonCustomAvatarManifest } from "./customAvatar";
 import type { AppearanceRecipePhysicalBasis } from "./recipe/appearanceRecipePhysicalEvaluator";
+import {
+  ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+  type AnatomyFitResult,
+} from "./recipe/anatomyFitContracts";
+import { parseFirstPartySocketEyePackage } from "./socketEyePackage";
+
+vi.mock("./socketEyePackage", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./socketEyePackage")>();
+  return {
+    ...actual,
+    parseFirstPartySocketEyePackage: vi.fn(
+      actual.parseFirstPartySocketEyePackage,
+    ),
+  };
+});
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -100,54 +113,6 @@ function performanceRig(nodes: {
   };
 }
 
-function eyeAppearance() {
-  const source = JSON.parse(
-    readFileSync(
-      resolve(
-        process.cwd(),
-        "static/goons/eye-appearance/v1/eye-appearance-v1.json",
-      ),
-      "utf8",
-    ),
-  );
-  const names = {
-    left: {
-      eyeBone: "Head",
-      assemblyNodes: {
-        sclera: "OracleLeftSclera",
-        cornea: "OracleLeftCornea",
-        iris: "OracleLeftIris",
-        pupil: "OracleLeftPupil",
-      },
-    },
-    right: {
-      eyeBone: "mixamorigHips",
-      assemblyNodes: {
-        sclera: "OracleRightSclera",
-        cornea: "OracleRightCornea",
-        iris: "OracleRightIris",
-        pupil: "OracleRightPupil",
-      },
-    },
-  } as const;
-  for (const side of ["left", "right"] as const) {
-    const binding = source.runtimeBindings[side];
-    binding.eyeBone = names[side].eyeBone;
-    binding.assemblyNodes = names[side].assemblyNodes;
-    binding.eyeHighlightMaterialNodes = [
-      names[side].assemblyNodes.iris,
-      names[side].assemblyNodes.pupil,
-    ];
-    binding.conformal.scleraNode = names[side].assemblyNodes.sclera;
-    binding.conformal.irisNode = names[side].assemblyNodes.iris;
-    binding.conformal.pupilNode = names[side].assemblyNodes.pupil;
-  }
-  source.completeEyeAssemblyNodes = Object.values(names).flatMap((entry) =>
-    Object.values(entry.assemblyNodes),
-  );
-  return source;
-}
-
 function buildManifest(): GoonCustomAvatarManifest {
   return {
     contractVersion: 2,
@@ -209,10 +174,10 @@ function buildManifest(): GoonCustomAvatarManifest {
           parent: { kind: "bone", name: "Head" },
           exactNodeMatches: 1,
         },
-        sclera_left: {
-          node: "ScleraLeft",
+        composite_cap_left: {
+          node: "BS_Eye_L_CompositeCap",
           kind: "mesh",
-          role: "eye-sclera",
+          role: "socket-eye-composite-cap",
           side: "left",
           required: true,
           scalePolicy: "any",
@@ -351,7 +316,7 @@ function buildManifest(): GoonCustomAvatarManifest {
             ...provenance("head-assets"),
             license: "LicenseRef-Batshit-First-Party",
           },
-          nodeIds: ["face", "eyes", "sclera_left"],
+          nodeIds: ["face", "eyes", "composite_cap_left"],
           drivers: [
             {
               driver: { kind: "target", id: "head_forward" },
@@ -365,7 +330,7 @@ function buildManifest(): GoonCustomAvatarManifest {
                 {
                   id: "sclera-fit",
                   kind: "morph-weight",
-                  node: "sclera_left",
+                  node: "composite_cap_left",
                   morph: "follow_head_forward",
                   weightRange: [-1, 1],
                   runtimeRetention: "recipe-only",
@@ -432,6 +397,16 @@ function morphMesh(name: string, morphs: string[], skinned = false) {
   return mesh;
 }
 
+function logicalMorphMesh(name: string, morphs: string[]) {
+  const logical = new THREE.Group();
+  logical.name = name;
+  logical.add(
+    morphMesh(`${name}_visible`, morphs),
+    morphMesh(`${name}_hidden`, morphs),
+  );
+  return logical;
+}
+
 function buildScene() {
   const root = new THREE.Group();
   root.name = "AvatarRoot";
@@ -463,7 +438,7 @@ function buildScene() {
   eyes.name = "Eyes";
   eyes.position.x = 1;
   head.add(eyes);
-  const sclera = morphMesh("ScleraLeft", ["follow_head_forward"]);
+  const sclera = morphMesh("BS_Eye_L_CompositeCap", ["follow_head_forward"]);
   head.add(sclera);
   root.updateMatrixWorld(true);
   return { root, hips, head, body, face, eyes, sclera };
@@ -492,6 +467,65 @@ function physicalBasis(
 }
 
 describe("AppearanceDialsEngineRuntime", () => {
+  it("applies one Appearance state and its matching Anatomy Fit atomically", () => {
+    const scene = buildScene();
+    const runtime = new AppearanceDialsEngineRuntime(
+      scene.root,
+      buildManifest(),
+      { faceMeshes: [scene.face] },
+    );
+    const fit: AnatomyFitResult = {
+      contract: "anatomy-fit-result/v2",
+      solverVersion: ORAL_CAVITY_ANATOMY_FIT_SOLVER,
+      domain: "oral-cavity",
+      inputSha256: HASH_A,
+      status: "converged",
+      convergence: {
+        converged: true,
+        iterations: 0,
+        objective: 0,
+        tolerance: 0,
+        reason: "closed-form-fit",
+      },
+      resolvedParameters: [],
+      nodeTransforms: [
+        {
+          nodeId: "eyes",
+          rootDeltaMatrix: [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            2, 0, 0, 1,
+          ],
+        },
+      ],
+      followerMorphCoefficients: [
+        {
+          followerId: "head-assets",
+          channelId: "sclera-fit",
+          nodeId: "composite_cap_left",
+          morph: "follow_head_forward",
+          weight: 0.25,
+          lower: -1,
+          upper: 1,
+        },
+      ],
+      metrics: [],
+      diagnostics: [],
+      resultSha256: HASH_B,
+    };
+
+    runtime.setFittedValues(values(runtime.manifest, {}), [fit]);
+    expect(scene.eyes.position.toArray()).toEqual([3, 0, 0]);
+    expect(scene.sclera.geometry.getAttribute("position").getX(0)).toBeCloseTo(
+      0.25,
+    );
+
+    runtime.setValues(values(runtime.manifest, {}));
+    expect(scene.eyes.position.toArray()).toEqual([1, 0, 0]);
+    expect(scene.sclera.geometry.getAttribute("position").getX(0)).toBe(0);
+  });
+
   it("binds the scene inventory, applies every v2 output, and resets to captured rest", () => {
     const scene = buildScene();
     const runtime = new AppearanceDialsEngineRuntime(
@@ -660,7 +694,7 @@ describe("AppearanceDialsEngineRuntime", () => {
     const optionalScene = buildScene();
     optionalScene.sclera.removeFromParent();
     const optionalManifest = buildManifest() as Record<string, any>;
-    optionalManifest.appearanceDials.nodes.sclera_left.required = false;
+    optionalManifest.appearanceDials.nodes.composite_cap_left.required = false;
     const optionalRuntime = new AppearanceDialsEngineRuntime(
       optionalScene.root,
       optionalManifest as GoonCustomAvatarManifest,
@@ -673,14 +707,162 @@ describe("AppearanceDialsEngineRuntime", () => {
       expect.objectContaining({
         follower: "head-assets",
         channel: "sclera-fit",
-        node: "sclera_left",
+        node: "composite_cap_left",
       }),
     );
     expect(
       physicalBasis(optionalRuntime).followerMorphBindings.find(
         (binding) => binding.channel === "sclera-fit",
       ),
-    ).not.toHaveProperty("positionBindingId");
+    ).not.toHaveProperty("positionBindingIds");
+  });
+
+  it("binds one declared GLB mesh node across aligned loader primitives", () => {
+    const scene = buildScene();
+    scene.sclera.removeFromParent();
+    const compositeCap = new THREE.Group();
+    compositeCap.name = "BS_Eye_L_CompositeCap";
+    const visibleFront = morphMesh("BS_Eye_L_CompositeCap_1", [
+      "follow_head_forward",
+    ]);
+    const hiddenClosure = morphMesh("BS_Eye_L_CompositeCap_2", [
+      "follow_head_forward",
+    ]);
+    compositeCap.add(visibleFront, hiddenClosure);
+    scene.head.add(compositeCap);
+    scene.root.updateMatrixWorld(true);
+
+    const runtime = new AppearanceDialsEngineRuntime(
+      scene.root,
+      buildManifest(),
+      { faceMeshes: [scene.face, visibleFront, hiddenClosure] },
+    );
+    runtime.setValues(values(runtime.manifest, { head_projection: 0.5 }));
+
+    expect(visibleFront.geometry.getAttribute("position").getX(0)).toBeCloseTo(
+      0.5,
+    );
+    expect(hiddenClosure.geometry.getAttribute("position").getX(0)).toBeCloseTo(
+      0.5,
+    );
+    expect(
+      physicalBasis(runtime).followerMorphBindings.find(
+        (binding) => binding.channel === "sclera-fit",
+      )?.positionBindingIds,
+    ).toHaveLength(2);
+  });
+
+  it("strips socket-eye Source-only liner morphs before the strict runtime binds", async () => {
+    const scene = buildScene();
+    scene.sclera.removeFromParent();
+    const manifest = buildManifest() as Record<string, any>;
+    const linerPerformanceMorphs = (suffix: "Left" | "Right") => [
+      `eyeBlink${suffix}`,
+      `eyeSquint${suffix}`,
+      `eyeWide${suffix}`,
+      ...Array.from({ length: 41 }, (_, index) => `performance${suffix}${index}`),
+    ].sort();
+    const nodes = [
+      {
+        id: "composite_cap_left",
+        name: "BS_Eye_L_CompositeCap",
+        role: "socket-eye-composite-cap",
+        side: "left",
+        retained: ["eyeBlinkLeft", "eyeSquintLeft", "eyeWideLeft"],
+      },
+      {
+        id: "composite_cap_right",
+        name: "BS_Eye_R_CompositeCap",
+        role: "socket-eye-composite-cap",
+        side: "right",
+        retained: ["eyeBlinkRight", "eyeSquintRight", "eyeWideRight"],
+      },
+      {
+        id: "eye_treatment_canvas_left",
+        name: "BS_EyeTreatmentCanvas_L",
+        role: "eye-treatment-canvas",
+        side: "left",
+        retained: linerPerformanceMorphs("Left"),
+      },
+      {
+        id: "eye_treatment_canvas_right",
+        name: "BS_EyeTreatmentCanvas_R",
+        role: "eye-treatment-canvas",
+        side: "right",
+        retained: linerPerformanceMorphs("Right"),
+      },
+    ] as const;
+    const logicalNodes = nodes.map((entry) => ({
+      ...entry,
+      node: logicalMorphMesh(entry.name, [
+        "sourceOnlySmile",
+        ...entry.retained,
+        ...(entry.id === "composite_cap_left"
+          ? ["follow_head_forward"]
+          : []),
+      ]),
+    }));
+    for (const entry of logicalNodes) {
+      scene.head.add(entry.node);
+      manifest.appearanceDials.nodes[entry.id] = {
+        node: entry.name,
+        kind: "mesh",
+        role: entry.role,
+        side: entry.side,
+        required: true,
+        scalePolicy: "any",
+        parent: { kind: "bone", name: "Head" },
+        exactNodeMatches: 1,
+      };
+    }
+    scene.root.updateMatrixWorld(true);
+
+    const packageValue = {
+      socketEyeSurface: {
+        runtimeBindings: {
+          left: { nodes: { compositeCap: "BS_Eye_L_CompositeCap" } },
+          right: { nodes: { compositeCap: "BS_Eye_R_CompositeCap" } },
+        },
+      },
+      eyeApertureSeam: {
+        runtimeBindings: {
+          left: {
+            lashesEyeOutlineNode: "BS_EyeTreatmentCanvas_L",
+            liner: { retainedPerformanceMorphs: linerPerformanceMorphs("Left") },
+          },
+          right: {
+            lashesEyeOutlineNode: "BS_EyeTreatmentCanvas_R",
+            liner: { retainedPerformanceMorphs: linerPerformanceMorphs("Right") },
+          },
+        },
+      },
+    } as NonNullable<ReturnType<typeof parseFirstPartySocketEyePackage>>;
+    const parser = vi.mocked(parseFirstPartySocketEyePackage);
+    parser.mockReturnValue(packageValue);
+    try {
+      new AppearanceDialsEngineRuntime(
+        scene.root,
+        manifest as GoonCustomAvatarManifest,
+        { faceMeshes: [scene.face] },
+      );
+
+      for (const entry of logicalNodes) {
+        for (const primitive of entry.node.children as THREE.Mesh[]) {
+          expect(
+            Object.keys(primitive.morphTargetDictionary ?? {}).sort(),
+          ).toEqual([...entry.retained].sort());
+          expect(primitive.geometry.morphAttributes.position).toHaveLength(
+            entry.retained.length,
+          );
+          expect(primitive.morphTargetInfluences).toHaveLength(entry.retained.length);
+        }
+      }
+    } finally {
+      const actual = await vi.importActual<
+        typeof import("./socketEyePackage")
+      >("./socketEyePackage");
+      parser.mockImplementation(actual.parseFirstPartySocketEyePackage);
+    }
   });
 
   it("captures retained absolute morph deltas and applies their live weights", () => {
@@ -741,7 +923,60 @@ describe("AppearanceDialsEngineRuntime", () => {
     expect(scene.face.geometry.getAttribute("position").getX(0)).toBe(0);
   });
 
-  it("fails loudly when strict performance or eye role nodes are missing", () => {
+  it("keeps retained bindings on their declared meshes when follower meshes share a morph name", () => {
+    const scene = buildScene();
+    const overlay = morphMesh("LipArtworkOverlay", ["seated_corrective"]);
+    scene.root.add(overlay);
+    scene.root.updateMatrixWorld(true);
+
+    const manifest = buildManifest() as Record<string, any>;
+    manifest.appearanceDials.nodes.lip_artwork_overlay = {
+      node: "LipArtworkOverlay",
+      kind: "mesh",
+      role: "generic-follower",
+      side: "none",
+      required: true,
+      scalePolicy: "any",
+      exactNodeMatches: 1,
+    };
+    manifest.appearanceDials.targets.seated_corrective.usages = [
+      "identity",
+      "pose-corrective",
+    ];
+    manifest.appearanceDials.targets.seated_corrective.runtimeRetention =
+      "retain-in-live-goon";
+    manifest.appearanceDials.targets.seated_corrective.bindings.push({
+      node: "lip_artwork_overlay",
+      morph: "seated_corrective",
+    });
+    manifest.rig = {
+      correctives: { entries: [{ target: "seated_corrective" }] },
+    };
+
+    const runtime = new AppearanceDialsEngineRuntime(
+      scene.root,
+      manifest as GoonCustomAvatarManifest,
+      { faceMeshes: [scene.face] },
+    );
+    const retained = physicalBasis(runtime).retainedTargetPositionBindings;
+    expect(retained).toHaveLength(2);
+    expect(retained).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          node: "face",
+          morph: "seated_corrective",
+          meshId: scene.face.uuid,
+        }),
+        expect.objectContaining({
+          node: "lip_artwork_overlay",
+          morph: "seated_corrective",
+          meshId: overlay.uuid,
+        }),
+      ]),
+    );
+  });
+
+  it("fails loudly when strict performance role nodes are missing", () => {
     const malformedRigScene = buildScene();
     const malformedRigManifest = buildManifest() as Record<string, any>;
     malformedRigManifest.rig = [];
@@ -773,18 +1008,6 @@ describe("AppearanceDialsEngineRuntime", () => {
           { faceMeshes: [performanceScene.face] },
         ),
     ).toThrow(/targetTransforms\.jaw\.node points to missing node/);
-
-    const eyeScene = buildScene();
-    const eyeManifest = buildManifest() as Record<string, any>;
-    eyeManifest.eyeAppearance = eyeAppearance();
-    expect(
-      () =>
-        new AppearanceDialsEngineRuntime(
-          eyeScene.root,
-          eyeManifest as GoonCustomAvatarManifest,
-          { faceMeshes: [eyeScene.face] },
-        ),
-    ).toThrow(/assemblyNodes\.sclera points to missing node OracleLeftSclera/);
   });
 
   it("pins the R2-C final physical engine oracle before extraction", async () => {
@@ -871,36 +1094,6 @@ describe("AppearanceDialsEngineRuntime", () => {
         target: "StageAnchor",
       }),
     };
-    manifest.eyeAppearance = eyeAppearance();
-    const eyeAssemblyNodes = new Map<string, THREE.Mesh>();
-    for (const [bone, names] of [
-      [
-        scene.head,
-        [
-          "OracleLeftSclera",
-          "OracleLeftCornea",
-          "OracleLeftIris",
-          "OracleLeftPupil",
-        ],
-      ],
-      [
-        scene.hips,
-        [
-          "OracleRightSclera",
-          "OracleRightCornea",
-          "OracleRightIris",
-          "OracleRightPupil",
-        ],
-      ],
-    ] as const) {
-      for (const name of names) {
-        const assembly = morphMesh(name, []);
-        bone.add(assembly);
-        eyeAssemblyNodes.set(name, assembly);
-      }
-    }
-    eyeAssemblyNodes.get("OracleLeftPupil")!.visible = false;
-
     scene.hips.add(scene.head);
     scene.hips.quaternion.setFromAxisAngle(
       new THREE.Vector3(0, 0, 1),
@@ -945,22 +1138,9 @@ describe("AppearanceDialsEngineRuntime", () => {
       "look.rightEye",
       "target.jaw",
     ]);
-    expect(
-      capturedBasis.roles
-        .filter((role) => role.kind === "eye")
-        .map((role) => role.id),
-    ).toEqual([
-      "left.bone",
-      "left.assembly.sclera",
-      "left.assembly.cornea",
-      "left.assembly.iris",
-      "left.assembly.pupil",
-      "right.bone",
-      "right.assembly.sclera",
-      "right.assembly.cornea",
-      "right.assembly.iris",
-      "right.assembly.pupil",
-    ]);
+    expect(capturedBasis.roles.filter((role) => role.kind === "eye")).toEqual(
+      [],
+    );
     expect(capturedBasis.targets.map((target) => target.id)).toEqual([
       "head_forward",
       "seated_corrective",
@@ -977,11 +1157,6 @@ describe("AppearanceDialsEngineRuntime", () => {
     expect(
       capturedBasis.followerMorphBindings.map((binding) => binding.channel),
     ).toEqual(["sclera-fit"]);
-    expect(
-      capturedBasis.meshes.some(
-        (mesh) => mesh.nodeId === eyeAssemblyNodes.get("OracleLeftPupil")!.uuid,
-      ),
-    ).toBe(true);
     const active = values(runtime.manifest, {
       head_projection: 0.1,
       butt_size: 0.1,

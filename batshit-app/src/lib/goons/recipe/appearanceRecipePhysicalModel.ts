@@ -6,7 +6,7 @@ import type {
 } from "../appearanceDials.contracts";
 import { parseAppearanceDialsManifest } from "../appearanceDials.schema";
 import { resolveCustomPerformanceRigManifest } from "../customPerformanceRig";
-import { parseEyeAppearanceDefinition } from "../eyeAppearance";
+import { parseFirstPartySocketEyePackage } from "../socketEyePackage";
 import {
   APPEARANCE_RECIPE_PHYSICAL_BASIS_CONTRACT,
   validateAppearanceRecipePhysicalBasis,
@@ -55,6 +55,12 @@ type PhysicalMesh = {
 type RecipeMesh = PhysicalMesh & {
   targetNames: string[];
   targetWeights: number[];
+};
+
+type RecipeMeshGroup = {
+  targetNames: string[];
+  targetWeights: number[];
+  primitives: RecipeMesh[];
 };
 
 const DIAGNOSTIC_PREFIX = APPEARANCE_RECIPE_PHYSICAL_MODEL_CONTRACT;
@@ -367,14 +373,10 @@ function createRecipeMesh(
   appearanceNodeId: string,
   physicalMeshesByNode: Map<number, PhysicalMesh[]>,
   nodeIndex: number,
-): RecipeMesh {
+): RecipeMeshGroup {
   const context = `appearance mesh ${appearanceNodeId}`;
   const physicalMeshes = physicalMeshesByNode.get(nodeIndex) ?? [];
-  if (physicalMeshes.length !== 1) {
-    fail(
-      `${context} must have exactly one primitive for first-party Recipe morph binding`,
-    );
-  }
+  if (physicalMeshes.length === 0) fail(`${context} has no mesh primitives`);
   const physical = physicalMeshes[0]!;
 
   const extras = record(physical.mesh.extras, `${context}.mesh.extras`);
@@ -387,13 +389,6 @@ function createRecipeMesh(
   if (new Set(targetNames).size !== targetNames.length) {
     fail(`${context} has duplicate morph target names`);
   }
-  const targets = optionalArray(
-    physical.primitive.targets,
-    `${context}.targets`,
-  );
-  if (targets.length !== targetNames.length) {
-    fail(`${context} morph target names and payloads are misaligned`);
-  }
   const targetWeights = effectiveTargetWeights(
     parsed,
     nodeIndex,
@@ -401,14 +396,20 @@ function createRecipeMesh(
     targetNames.length,
     context,
   );
-  return {
-    ...physical,
-    targetNames,
-    targetWeights,
-  };
+  const primitives = physicalMeshes.map((primitive) => {
+    const targets = optionalArray(
+      primitive.primitive.targets,
+      `${context} primitive ${primitive.primitiveIndex}.targets`,
+    );
+    if (targets.length !== targetNames.length) {
+      fail(`${context} morph target names and payloads are misaligned`);
+    }
+    return { ...primitive, targetNames, targetWeights };
+  });
+  return { targetNames, targetWeights, primitives };
 }
 
-function morphIndex(mesh: RecipeMesh, morph: string, context: string): number {
+function morphIndex(mesh: RecipeMeshGroup, morph: string, context: string): number {
   const index = mesh.targetNames.indexOf(morph);
   if (index < 0) fail(`${context} references missing morph ${morph}`);
   if (mesh.targetWeights[index] !== 0) {
@@ -420,12 +421,11 @@ function morphIndex(mesh: RecipeMesh, morph: string, context: string): number {
 function lazyPositionDelta(
   parsed: SemanticGlbDocument,
   mesh: RecipeMesh,
-  morph: string,
+  morphIndex: number,
   context: string,
 ): AppearanceRecipePositionDelta {
-  const index = morphIndex(mesh, morph, context);
   const target = record(
-    array(mesh.primitive.targets, `${context}.targets`)[index],
+    array(mesh.primitive.targets, `${context}.targets`)[morphIndex],
     `${context}.target`,
   );
   const accessorIndex = integer(target.POSITION, `${context}.POSITION`);
@@ -553,8 +553,8 @@ export function buildAppearanceRecipePhysicalBasisFromGlb(
     assertDeclaredParent(parsed, active, manifest, appearanceNodeIndices, id);
   }
 
-  const recipeMeshes = new Map<string, RecipeMesh>();
-  const ensureRecipeMesh = (appearanceNodeId: string): RecipeMesh => {
+  const recipeMeshes = new Map<string, RecipeMeshGroup>();
+  const ensureRecipeMesh = (appearanceNodeId: string): RecipeMeshGroup => {
     const cached = recipeMeshes.get(appearanceNodeId);
     if (cached) return cached;
     const resolved = appearanceNodeIndices.get(appearanceNodeId);
@@ -581,35 +581,29 @@ export function buildAppearanceRecipePhysicalBasisFromGlb(
   for (const [targetId, target] of Object.entries(manifest.targets)) {
     targets.push({ id: targetId, runtimeRetention: target.runtimeRetention });
     target.bindings.forEach((binding, bindingIndex) => {
-      const mesh = ensureRecipeMesh(binding.node);
+      const meshGroup = ensureRecipeMesh(binding.node);
       const context = `appearance target ${targetId} binding ${bindingIndex}`;
-      morphIndex(mesh, binding.morph, context);
-      if (target.runtimeRetention === "recipe-only") {
-        targetPositionBindings.push({
-          id: `target:${targetId}:${bindingIndex}`,
-          targetId,
-          meshId: mesh.id,
-          positionDelta: lazyPositionDelta(
-            parsed,
-            mesh,
-            binding.morph,
-            context,
-          ),
-        });
-      } else {
-        retainedTargetPositionBindings.push({
-          id: `retained:${targetId}:${bindingIndex}`,
-          targetId,
-          node: binding.node,
-          morph: binding.morph,
-          meshId: mesh.id,
-          positionDelta: lazyPositionDelta(
-            parsed,
-            mesh,
-            binding.morph,
-            context,
-          ),
-        });
+      const targetIndex = morphIndex(meshGroup, binding.morph, context);
+      for (const mesh of meshGroup.primitives) {
+        const primitiveSuffix =
+          meshGroup.primitives.length === 1 ? "" : `:${mesh.primitiveIndex}`;
+        if (target.runtimeRetention === "recipe-only") {
+          targetPositionBindings.push({
+            id: `target:${targetId}:${bindingIndex}${primitiveSuffix}`,
+            targetId,
+            meshId: mesh.id,
+            positionDelta: lazyPositionDelta(parsed, mesh, targetIndex, context),
+          });
+        } else {
+          retainedTargetPositionBindings.push({
+            id: `retained:${targetId}:${bindingIndex}${primitiveSuffix}`,
+            targetId,
+            node: binding.node,
+            morph: binding.morph,
+            meshId: mesh.id,
+            positionDelta: lazyPositionDelta(parsed, mesh, targetIndex, context),
+          });
+        }
       }
     });
   }
@@ -649,17 +643,23 @@ export function buildAppearanceRecipePhysicalBasisFromGlb(
       });
       continue;
     }
-    const mesh = ensureRecipeMesh(channel.node);
+    const meshGroup = ensureRecipeMesh(channel.node);
     const context = `appearance follower ${follower}/${channel.id}`;
-    const positionBindingId = `follower:${follower}:${channel.id}`;
-    followerMorphPositionBindings.push({
-      id: positionBindingId,
-      follower,
-      channel: channel.id,
-      node: channel.node,
-      morph: channel.morph,
-      meshId: mesh.id,
-      positionDelta: lazyPositionDelta(parsed, mesh, channel.morph, context),
+    const targetIndex = morphIndex(meshGroup, channel.morph, context);
+    const positionBindingIds = meshGroup.primitives.map((mesh) => {
+      const primitiveSuffix =
+        meshGroup.primitives.length === 1 ? "" : `:${mesh.primitiveIndex}`;
+      const id = `follower:${follower}:${channel.id}${primitiveSuffix}`;
+      followerMorphPositionBindings.push({
+        id,
+        follower,
+        channel: channel.id,
+        node: channel.node,
+        morph: channel.morph,
+        meshId: mesh.id,
+        positionDelta: lazyPositionDelta(parsed, mesh, targetIndex, context),
+      });
+      return id;
     });
     followerMorphBindings.push({
       follower,
@@ -667,7 +667,7 @@ export function buildAppearanceRecipePhysicalBasisFromGlb(
       driver,
       node: channel.node,
       morph: channel.morph,
-      positionBindingId,
+      positionBindingIds,
     });
   }
 
@@ -856,11 +856,11 @@ export function buildAppearanceRecipePhysicalBasisFromGlb(
   }
   if (performance.manifest) {
     const claimed = new Map<number, string>();
-    for (const role of ["head", "neck", "leftEye", "rightEye"] as const) {
+    for (const [role, lookNode] of Object.entries(performance.manifest.nodes)) {
       const physical = resolveReachableNode(
         parsed,
         active,
-        performance.manifest.nodes[role].node,
+        lookNode.node,
         `rig.performance.nodes.${role}.node`,
       );
       const prior = claimed.get(physical);
@@ -896,57 +896,35 @@ export function buildAppearanceRecipePhysicalBasisFromGlb(
     }
   }
 
-  if (
-    rawManifest.eyeAppearance !== undefined &&
-    rawManifest.eyeAppearance !== null
-  ) {
-    const eye = parseEyeAppearanceDefinition(rawManifest.eyeAppearance);
-    const claimedAssemblies = new Set<number>();
+  const socketEyePackage = parseFirstPartySocketEyePackage(rawManifest);
+  if (socketEyePackage) {
+    const claimedNodes = new Set<number>();
     for (const side of ["left", "right"] as const) {
-      const binding = eye.runtimeBindings[side];
-      const eyeBone = resolveReachableNode(
-        parsed,
-        active,
-        binding.eyeBone,
-        `eyeAppearance.runtimeBindings.${side}.eyeBone`,
-      );
-      if (!jointNodeIndices.has(eyeBone)) {
-        fail(`eyeAppearance ${side} eye bone is not a skin joint`);
-      }
-      roles.push({ kind: "eye", id: `${side}.bone`, nodeId: nodeId(eyeBone) });
-      for (const [assemblyRole, assemblyName] of Object.entries(
-        binding.assemblyNodes,
-      )) {
-        const assembly = resolveReachableNode(
-          parsed,
-          active,
-          assemblyName,
-          `eyeAppearance.runtimeBindings.${side}.assemblyNodes.${assemblyRole}`,
-        );
-        if (parsed.parents.get(assembly) !== eyeBone) {
-          fail(
-            `eyeAppearance ${side} ${assemblyRole} is not a direct child of its eye bone`,
-          );
+      const declared = [
+        {
+          id: `${side}.compositeCap`,
+          name: socketEyePackage.socketEyeSurface.runtimeBindings[side].nodes.compositeCap,
+          path: `socketEyeSurface.runtimeBindings.${side}.nodes.compositeCap`,
+        },
+        {
+          id: `${side}.lashesEyeOutline`,
+          name: socketEyePackage.eyeApertureSeam.runtimeBindings[side].lashesEyeOutlineNode,
+          path: `eyeApertureSeam.runtimeBindings.${side}.lashesEyeOutlineNode`,
+        },
+      ];
+      for (const entry of declared) {
+        const physical = resolveReachableNode(parsed, active, entry.name, entry.path);
+        if (getSemanticGlbNode(parsed, physical, entry.path).mesh === undefined) {
+          fail(`${entry.path} is not a mesh node`);
         }
-        if (
-          getSemanticGlbNode(
-            parsed,
-            assembly,
-            `eyeAppearance ${side} ${assemblyRole}`,
-          ).mesh === undefined
-        ) {
-          fail(`eyeAppearance ${side} ${assemblyRole} is not a mesh node`);
+        if (claimedNodes.has(physical)) {
+          fail(`socket-eye node ${entry.name} is declared more than once`);
         }
-        if (claimedAssemblies.has(assembly)) {
-          fail(
-            `eyeAppearance assembly node ${assemblyName} is declared more than once`,
-          );
-        }
-        claimedAssemblies.add(assembly);
+        claimedNodes.add(physical);
         roles.push({
           kind: "eye",
-          id: `${side}.assembly.${assemblyRole}`,
-          nodeId: nodeId(assembly),
+          id: entry.id,
+          nodeId: nodeId(physical),
         });
       }
     }

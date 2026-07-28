@@ -17,7 +17,7 @@ services:
       dockerfile: batshit-server/Dockerfile
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       NODE_ENV: production
@@ -70,7 +70,7 @@ services:
       dockerfile: batshit-app/Dockerfile
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       NODE_ENV: production
@@ -112,6 +112,8 @@ services:
       BATSHIT_CLOUDFLARED_TARGET_URL: ${BATSHIT_CLOUDFLARED_TARGET_URL:-http://batshit-server:5600}
       BATSHIT_CLOUDFLARED_DOCKER_STATE_PATH: /runtime/cloudflared/status.json
       BATSHIT_FBX2VRMA_WORKER_URL: ${BATSHIT_FBX2VRMA_WORKER_URL:-http://fbx2vrma-worker:8079}
+      BATSHIT_AUDIO2FACE_BRIDGE_URL: ${BATSHIT_AUDIO2FACE_BRIDGE_URL:-http://audio2face-bridge:8068}
+      BATSHIT_AUDIO2FACE_BRIDGE_TOKEN: ${BATSHIT_AUDIO2FACE_BRIDGE_TOKEN:-}
       BATSHIT_COMFYUI_VALIDATION_URL: ${BATSHIT_COMFYUI_VALIDATION_URL:-http://comfyui:8188}
       BATSHIT_AGENT_BROWSER_SIDECAR_URL: ${BATSHIT_AGENT_BROWSER_SIDECAR_URL:-http://agent-browser:8091}
       BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN: ${BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN:-}
@@ -173,7 +175,7 @@ services:
         CLOUDFLARED_LINUX_ARM64_SHA256: ${CLOUDFLARED_LINUX_ARM64_SHA256:-0755ba4cbab59980e6148367fcf53a8f3ec85a97deefd63c2420cf7850769bee}
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       BATSHIT_CLOUDFLARED_TARGET_URL: ${BATSHIT_CLOUDFLARED_TARGET_URL:-http://batshit-server:5600}
@@ -208,7 +210,7 @@ services:
         FBX2GLTF_LINUX_X64_SHA256: ${FBX2GLTF_LINUX_X64_SHA256:-b38210352fdd29d50ba53a6514c3ff05ccbb5d1e0a6442db7a49834bf34a3145}
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       BATSHIT_FBX2VRMA_HOST: 0.0.0.0
@@ -233,6 +235,52 @@ services:
       retries: 12
       start_period: 20s
 
+  audio2face-bridge:
+    profiles:
+      - audio2face
+    build:
+      context: .
+      dockerfile: tools/docker/audio2face-bridge/Dockerfile
+      args:
+        NVIDIA_A2F_SAMPLES_COMMIT: ${NVIDIA_A2F_SAMPLES_COMMIT:-a2d0150043be7dc15db2fad8193a78b660e1100f}
+        NVIDIA_A2F_SAMPLES_SHA256: ${NVIDIA_A2F_SAMPLES_SHA256:-827b47831b1640b8bffef005a2a07eb58bc793894e331638253b3080e628ab27}
+    restart: unless-stopped
+    env_file:
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
+        required: false
+    environment:
+      BATSHIT_AUDIO2FACE_BRIDGE_HOST: 0.0.0.0
+      BATSHIT_AUDIO2FACE_BRIDGE_PORT: 8068
+      BATSHIT_AUDIO2FACE_BRIDGE_TOKEN: ${BATSHIT_AUDIO2FACE_BRIDGE_TOKEN:-}
+      BATSHIT_AUDIO2FACE_NIM_ENDPOINT: ${BATSHIT_AUDIO2FACE_NIM_ENDPOINT:-host.docker.internal:52000}
+      BATSHIT_AUDIO2FACE_NIM_TLS: ${BATSHIT_AUDIO2FACE_NIM_TLS:-0}
+      BATSHIT_AUDIO2FACE_NIM_ROOT_CERT: ${BATSHIT_AUDIO2FACE_NIM_ROOT_CERT:-}
+      BATSHIT_AUDIO2FACE_NIM_CLIENT_CERT: ${BATSHIT_AUDIO2FACE_NIM_CLIENT_CERT:-}
+      BATSHIT_AUDIO2FACE_NIM_CLIENT_KEY: ${BATSHIT_AUDIO2FACE_NIM_CLIENT_KEY:-}
+      BATSHIT_AUDIO2FACE_NIM_TIMEOUT_SECONDS: ${BATSHIT_AUDIO2FACE_NIM_TIMEOUT_SECONDS:-180}
+      BATSHIT_AUDIO2FACE_NIM_HEALTH_TIMEOUT_SECONDS: ${BATSHIT_AUDIO2FACE_NIM_HEALTH_TIMEOUT_SECONDS:-3}
+      BATSHIT_AUDIO2FACE_MAX_AUDIO_BYTES: ${BATSHIT_AUDIO2FACE_MAX_AUDIO_BYTES:-67108864}
+      BATSHIT_AUDIO2FACE_CACHE_DIR: /cache
+      BATSHIT_AUDIO2FACE_CACHE_MAX_BYTES: ${BATSHIT_AUDIO2FACE_CACHE_MAX_BYTES:-2147483648}
+      BATSHIT_AUDIO2FACE_CACHE_MAX_ENTRIES: ${BATSHIT_AUDIO2FACE_CACHE_MAX_ENTRIES:-2000}
+      BATSHIT_AUDIO2FACE_TONGUE_ENABLED: ${BATSHIT_AUDIO2FACE_TONGUE_ENABLED:-0}
+    volumes:
+      - batshit_audio2face_cache:/cache
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8068/live', timeout=3)"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   agent-browser:
     profiles:
       - agent-browser
@@ -243,7 +291,7 @@ services:
         AGENT_BROWSER_VERSION: ${AGENT_BROWSER_VERSION:-0.24.1}
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       BATSHIT_AGENT_BROWSER_HOST: 0.0.0.0
@@ -336,7 +384,7 @@ services:
       dockerfile: tools/docker/livekit-agent-sidecar/Dockerfile
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       LIVEKIT_URL: ${LIVEKIT_AGENT_LIVEKIT_URL:-ws://livekit:7880}
@@ -374,7 +422,7 @@ services:
     image: ${N8N_BASE_IMAGE:-ghcr.io/n8n-io/n8n:2.22.1}
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-America/New_York}
@@ -420,7 +468,7 @@ services:
     image: ${N8N_RUNNERS_IMAGE:-ghcr.io/n8n-io/runners:2.22.1}
     restart: unless-stopped
     env_file:
-      - path: .env.docker
+      - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
     environment:
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-America/New_York}
@@ -453,6 +501,7 @@ volumes:
   batshit_agent_runtime:
   batshit_runtime_state:
   batshit_fbx2vrma_work:
+  batshit_audio2face_cache:
   batshit_agent_browser_data:
   batshit_agent_browser_cache:
   batshit_comfyui_validation_data:

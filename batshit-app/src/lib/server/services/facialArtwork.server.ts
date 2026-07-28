@@ -2,19 +2,21 @@ import {
   collectFacialArtworkUploads,
   parseFacialArtworkDefinition,
   parseFacialArtworkState,
-  type FacialArtworkDefinitionV3,
-  type FacialArtworkStateV3
+  type FacialArtworkDefinitionV4,
+  type FacialArtworkStateV4
 } from '$lib/goons/facialArtwork'
 import type { GoonRecord } from '$lib/types/goons'
+import { loadGoonEyeAppearanceDefinition } from './eyeAppearance.server'
+import {
+  readStoredGoonManifest,
+  StoredUploadJsonError,
+  type StoredUploadJsonReader
+} from './storedUploadJson.server'
 
-type RedisJsonReader = {
-  json: {
-    get(key: string): Promise<unknown>
-  }
-}
+type RedisJsonReader = StoredUploadJsonReader
 
 function fail(message: string): never {
-  throw new Error(`[facial-artwork/v3] ${message}`)
+  throw new Error(`[facial-artwork/v4] ${message}`)
 }
 
 function exactJson(left: unknown, right: unknown): boolean {
@@ -23,7 +25,7 @@ function exactJson(left: unknown, right: unknown): boolean {
 
 async function assertStoredArtworkOwnership(
   client: RedisJsonReader,
-  state: FacialArtworkStateV3
+  state: FacialArtworkStateV4
 ): Promise<void> {
   for (const upload of collectFacialArtworkUploads(state)) {
     const stored = await client.json.get(`upload:goon_facial_artwork:${upload.filename}`)
@@ -53,38 +55,38 @@ async function assertStoredArtworkOwnership(
 
 export async function loadGoonFacialArtworkDefinition(
   client: RedisJsonReader,
-  goon: Pick<GoonRecord, 'customAvatar'>
-): Promise<FacialArtworkDefinitionV3 | null> {
+  goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>
+): Promise<FacialArtworkDefinitionV4 | null> {
   const filename = goon.customAvatar?.manifest?.filename
   if (!filename) return null
 
-  const upload = await client.json.get(`upload:goon_custom_manifests:${filename}`)
-  if (!upload || typeof upload !== 'object' || Array.isArray(upload)) {
-    fail('current Custom Goon manifest upload is missing')
-  }
-  const textContent = (upload as Record<string, unknown>).textContent
-  if (typeof textContent !== 'string' || !textContent.trim()) {
-    fail('current Custom Goon manifest upload has no JSON content')
-  }
-
-  let manifest: unknown
+  let manifest: Record<string, unknown>
   try {
-    manifest = JSON.parse(textContent)
-  } catch {
-    fail('current Custom Goon manifest upload is invalid JSON')
+    manifest = await readStoredGoonManifest(client, filename)
+  } catch (error) {
+    if (error instanceof StoredUploadJsonError) {
+      fail(error.message)
+    }
+    throw error
   }
-  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    fail('current Custom Goon manifest must be a JSON object')
+  const value = manifest.facialArtwork
+  if (value === undefined) return null
+  const definition = parseFacialArtworkDefinition(value)
+  const eyeAppearance = await loadGoonEyeAppearanceDefinition(client, goon)
+  if (!eyeAppearance) {
+    fail('facial-artwork/v4 requires the complete eye-appearance/v3 socket-eye tuple')
   }
-  const definition = (manifest as Record<string, unknown>).facialArtwork
-  return definition === undefined ? null : parseFacialArtworkDefinition(definition)
+  if (definition.dependencies.eyeAppearance.definitionSha256 !== eyeAppearance.definitionSha256) {
+    fail('facial-artwork/v4 Eye Appearance dependency does not match the installed package')
+  }
+  return definition
 }
 
 export async function validateGoonFacialArtworkState(
   client: RedisJsonReader,
-  goon: Pick<GoonRecord, 'customAvatar'>,
+  goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>,
   value: unknown
-): Promise<FacialArtworkStateV3 | null> {
+): Promise<FacialArtworkStateV4 | null> {
   if (value === null) return null
   const definition = await loadGoonFacialArtworkDefinition(client, goon)
   if (!definition) fail('current Goon package does not support facial artwork')

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { sampleGoonLipSyncTimeline } from '$lib/utils/goonLipSync'
+import { RHUBARB_9_SPEECH_FACE_PROFILE } from './speechFaceProfiles'
 import { convertRhubarbJsonToTimeline, mapRhubarbCueToWeights } from './rhubarbTimeline'
 
 describe('rhubarbTimeline', () => {
@@ -42,6 +43,7 @@ describe('rhubarbTimeline', () => {
 
     expect(timeline.analyzerId).toBe('rhubarb-wasm')
     expect(timeline.source).toBe('audio-analysis')
+    expect(timeline.profile).toBe('rhubarb-9')
     expect(timeline.durationMs).toBe(470)
     expect(timeline.keyframes.length).toBeGreaterThanOrEqual(10)
     expect(timeline.diagnostics).toMatchObject({
@@ -86,9 +88,17 @@ describe('rhubarbTimeline', () => {
       }
     })
 
-    const early = sampleGoonLipSyncTimeline(timeline, 10)
-    const middle = sampleGoonLipSyncTimeline(timeline, 140)
-    const late = sampleGoonLipSyncTimeline(timeline, 350)
+    const samples = [10, 140, 350].map((timeMs) => sampleGoonLipSyncTimeline(timeline, timeMs))
+    for (const sample of samples) {
+      expect(sample.profile).toBe(RHUBARB_9_SPEECH_FACE_PROFILE)
+      if (sample.profile !== RHUBARB_9_SPEECH_FACE_PROFILE) {
+        throw new Error(`Expected Rhubarb-9 frame, received ${sample.profile}.`)
+      }
+    }
+    const [early, middle, late] = samples.map((sample) => {
+      if (sample.profile !== RHUBARB_9_SPEECH_FACE_PROFILE) throw new Error('Expected Rhubarb-9 frame.')
+      return sample.weights
+    })
 
     expect(early).toMatchObject({ rest: 1, wide_open: 0, pucker: 0, round: 0 })
     expect(middle.wide_open).toBeGreaterThan(0.9)

@@ -27,6 +27,10 @@ import {
   canonicalRecipeString,
   requireLowercaseSha256,
 } from "./recipeCanonical";
+import {
+  GOON_LIVE_BUILD_CONTRACT,
+  parseGoonLiveBuildReceipt,
+} from "./liveBuildContracts";
 
 export const GOON_RECIPE_OWNER_V2_CONTRACT = "goon-recipe/v2" as const;
 export const GOON_RECIPE_REVISION_ENVELOPE_CONTRACT =
@@ -98,6 +102,9 @@ export type GoonRecipeJob = {
   sourceRevision: RecipeDocumentRef | null;
   stagedSource: RecipeStagedSource;
   plan: RecipeDocumentRef | null;
+  migrationReport: RecipeDocumentRef | null;
+  reviewedState: RecipeDocumentRef;
+  stagedLive: RecipeAssetSet | null;
   candidateRevision: RecipeDocumentRef | null;
   lease: RecipeJobLease | null;
   failure: RecipeLifecycleFailure | null;
@@ -116,14 +123,27 @@ export type RecipePendingJobV2 = {
   targetRevisionId: string;
 };
 
+export type RecipePendingAnalysisV2 = {
+  analysisId: string;
+  analysisRef: RecipeDocumentRef;
+  basePlan: RecipeDocumentRef;
+  selectedPlan: RecipeDocumentRef;
+  migrationReport: RecipeDocumentRef;
+  containmentReceipt: RecipeDocumentRef;
+  reviewedState: RecipeDocumentRef | null;
+  targetWriteVersion: number;
+};
+
 export type GoonRecipeV2 = {
   contract: typeof GOON_RECIPE_OWNER_V2_CONTRACT;
   writeVersion: number;
   nextRecipeRevision: number;
   liveStatus: RecipeLiveStatus;
   authoringRevision: RecipeAuthoringRevision;
+  authoringSourceContainmentReceipt: RecipeDocumentRef;
   activeRevision: RecipeDocumentRef | null;
   previousRevision: RecipeDocumentRef | null;
+  pendingAnalysis: RecipePendingAnalysisV2 | null;
   pendingJob: RecipePendingJobV2 | null;
   latestUpdateReport: RecipeDocumentRef | null;
   lastFailure: RecipeLifecycleFailure | null;
@@ -400,18 +420,35 @@ export function parseGoonRecipeDocument(value: unknown): GoonRecipeDocument {
   };
 }
 
+function normalizedRecipeDocumentContent(
+  documentContract: string,
+  content: Record<string, unknown>,
+): Record<string, unknown> {
+  if (documentContract === GOON_LIVE_BUILD_CONTRACT) {
+    return parseGoonLiveBuildReceipt(content) as unknown as Record<
+      string,
+      unknown
+    >;
+  }
+  return content;
+}
+
 export async function verifyGoonRecipeDocument(
   value: unknown,
 ): Promise<GoonRecipeDocument> {
   const document = parseGoonRecipeDocument(value);
-  const actual = await canonicalRecipeSha256(document.content);
+  const content = normalizedRecipeDocumentContent(
+    document.documentContract,
+    document.content,
+  );
+  const actual = await canonicalRecipeSha256(content);
   if (actual !== document.sha256) {
     fail(
       "Recipe document.sha256",
       `mismatch: expected ${document.sha256}, got ${actual}`,
     );
   }
-  return document;
+  return { ...document, content };
 }
 
 export async function createGoonRecipeDocument(input: {
@@ -423,13 +460,17 @@ export async function createGoonRecipeDocument(input: {
     input.content.contract,
     "Recipe document.content.contract",
   );
+  const content = normalizedRecipeDocumentContent(
+    documentContract,
+    input.content,
+  );
   return parseGoonRecipeDocument({
     contract: GOON_RECIPE_DOCUMENT_CONTRACT,
     userId: input.userId,
     goonId: input.goonId,
     documentContract,
-    sha256: await canonicalRecipeSha256(input.content),
-    content: input.content,
+    sha256: await canonicalRecipeSha256(content),
+    content,
   });
 }
 
@@ -476,6 +517,9 @@ export function parseGoonRecipeJob(value: unknown): GoonRecipeJob {
       "sourceRevision",
       "stagedSource",
       "plan",
+      "migrationReport",
+      "reviewedState",
+      "stagedLive",
       "candidateRevision",
       "lease",
       "failure",
@@ -524,6 +568,10 @@ export function parseGoonRecipeJob(value: unknown): GoonRecipeJob {
     "Recipe job.candidateRevision",
     GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
   );
+  const stagedLive = raw.stagedLive === null ? null : parseAssetSet(raw.stagedLive, "Recipe job.stagedLive");
+  if (candidateRevision && !stagedLive) {
+    fail("Recipe job.stagedLive", "is required once a candidate revision exists");
+  }
   if (
     (status === "ready" || status === "committing" || status === "committed") &&
     !candidateRevision
@@ -541,12 +589,28 @@ export function parseGoonRecipeJob(value: unknown): GoonRecipeJob {
     "Recipe job.plan",
     RECIPE_MIGRATION_PLAN_CONTRACT,
   );
+  const reviewedState = parseDocumentRef(
+    raw.reviewedState,
+    "Recipe job.reviewedState",
+    "recipe-reviewed-state/v1",
+  );
+  const migrationReport = nullableDocumentRef(
+    raw.migrationReport,
+    "Recipe job.migrationReport",
+    "recipe-migration-report/v1",
+  );
   if (
     raw.operation === "package-update" &&
     ["baking", "packaging", "verifying", "ready", "committing", "committed"].includes(status) &&
     !plan
   ) {
     fail("Recipe job.plan", "is required after package-update planning");
+  }
+  if (raw.operation === "package-update" && !migrationReport) {
+    fail("Recipe job.migrationReport", "is required for package updates");
+  }
+  if (raw.operation !== "package-update" && migrationReport) {
+    fail("Recipe job.migrationReport", "is only valid for package updates");
   }
   const createdAt = isoDate(raw.createdAt, "Recipe job.createdAt");
   const updatedAt = isoDate(raw.updatedAt, "Recipe job.updatedAt");
@@ -579,12 +643,70 @@ export function parseGoonRecipeJob(value: unknown): GoonRecipeJob {
     ),
     stagedSource: parseStagedSource(raw.stagedSource),
     plan,
+    migrationReport,
+    reviewedState,
+    stagedLive,
     candidateRevision,
     lease,
     failure,
     cleanupAssets,
     createdAt,
     updatedAt,
+  };
+}
+
+function parsePendingAnalysis(value: unknown): RecipePendingAnalysisV2 {
+  const raw = record(value, "Recipe owner.pendingAnalysis");
+  exactKeys(
+    raw,
+    [
+      "analysisId",
+      "analysisRef",
+      "basePlan",
+      "selectedPlan",
+      "migrationReport",
+      "containmentReceipt",
+      "reviewedState",
+      "targetWriteVersion",
+    ],
+    "Recipe owner.pendingAnalysis",
+  );
+  return {
+    analysisId: stableId(raw.analysisId, "Recipe owner.pendingAnalysis.analysisId"),
+    analysisRef: parseDocumentRef(
+      raw.analysisRef,
+      "Recipe owner.pendingAnalysis.analysisRef",
+      "recipe-update-analysis-context/v1",
+    ),
+    basePlan: parseDocumentRef(
+      raw.basePlan,
+      "Recipe owner.pendingAnalysis.basePlan",
+      RECIPE_MIGRATION_PLAN_CONTRACT,
+    ),
+    selectedPlan: parseDocumentRef(
+      raw.selectedPlan,
+      "Recipe owner.pendingAnalysis.selectedPlan",
+      RECIPE_MIGRATION_PLAN_CONTRACT,
+    ),
+    migrationReport: parseDocumentRef(
+      raw.migrationReport,
+      "Recipe owner.pendingAnalysis.migrationReport",
+      "recipe-migration-report/v1",
+    ),
+    containmentReceipt: parseDocumentRef(
+      raw.containmentReceipt,
+      "Recipe owner.pendingAnalysis.containmentReceipt",
+      RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+    ),
+    reviewedState: nullableDocumentRef(
+      raw.reviewedState,
+      "Recipe owner.pendingAnalysis.reviewedState",
+      "recipe-reviewed-state/v1",
+    ),
+    targetWriteVersion: positiveInteger(
+      raw.targetWriteVersion,
+      "Recipe owner.pendingAnalysis.targetWriteVersion",
+    ),
   };
 }
 
@@ -640,8 +762,10 @@ export function parseGoonRecipeV2(value: unknown): GoonRecipeV2 {
       "nextRecipeRevision",
       "liveStatus",
       "authoringRevision",
+      "authoringSourceContainmentReceipt",
       "activeRevision",
       "previousRevision",
+      "pendingAnalysis",
       "pendingJob",
       "latestUpdateReport",
       "lastFailure",
@@ -675,6 +799,11 @@ export function parseGoonRecipeV2(value: unknown): GoonRecipeV2 {
     "Recipe owner.activeRevision",
     GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
   );
+  const authoringSourceContainmentReceipt = parseDocumentRef(
+    raw.authoringSourceContainmentReceipt,
+    "Recipe owner.authoringSourceContainmentReceipt",
+    RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
+  );
   const previousRevision = nullableDocumentRef(
     raw.previousRevision,
     "Recipe owner.previousRevision",
@@ -689,6 +818,14 @@ export function parseGoonRecipeV2(value: unknown): GoonRecipeV2 {
     fail("Recipe owner", "active and previous revisions must be distinct");
   }
   const pendingJob = raw.pendingJob === null ? null : parsePendingJob(raw.pendingJob);
+  const pendingAnalysis =
+    raw.pendingAnalysis === null ? null : parsePendingAnalysis(raw.pendingAnalysis);
+  if (pendingAnalysis && pendingJob) {
+    fail("Recipe owner", "cannot retain analysis review and a build job simultaneously");
+  }
+  if (pendingAnalysis && pendingAnalysis.targetWriteVersion !== writeVersion) {
+    fail("Recipe owner.pendingAnalysis", "must target the current write version");
+  }
   if (pendingJob && pendingJob.targetWriteVersion !== writeVersion) {
     fail("Recipe owner.pendingJob", "must target the current write version");
   }
@@ -699,9 +836,11 @@ export function parseGoonRecipeV2(value: unknown): GoonRecipeV2 {
       fail("Recipe owner", "up_to_date requires active output and no pending failure");
     }
   } else if (liveStatus === "needs_bake") {
-    if (pendingJob) fail("Recipe owner", "needs_bake cannot retain a pending job");
+    if (pendingJob || pendingAnalysis) {
+      fail("Recipe owner", "needs_bake cannot retain pending analysis or build work");
+    }
   } else if (liveStatus === "building") {
-    if (!pendingJob || !BUILDING_JOB_STATUSES.has(pendingJob.status) || lastFailure) {
+    if (pendingAnalysis || !pendingJob || !BUILDING_JOB_STATUSES.has(pendingJob.status) || lastFailure) {
       fail("Recipe owner", "building requires one active or ready job and no failure");
     }
   } else if (liveStatus === "failed") {
@@ -717,8 +856,10 @@ export function parseGoonRecipeV2(value: unknown): GoonRecipeV2 {
     nextRecipeRevision,
     liveStatus,
     authoringRevision,
+    authoringSourceContainmentReceipt,
     activeRevision,
     previousRevision,
+    pendingAnalysis,
     pendingJob,
     latestUpdateReport: nullableDocumentRef(
       raw.latestUpdateReport,

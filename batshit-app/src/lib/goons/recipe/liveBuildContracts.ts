@@ -186,7 +186,12 @@ function finiteMetric(value: unknown, path: string, maximum: number): number {
   ) {
     fail(path, `must be a finite number between 0 and ${maximum}`);
   }
-  return value;
+  // RedisJSON stores JSON numbers as binary doubles and can shift the final
+  // insignificant digit of full-precision floating-point evidence. Keep the
+  // strict raw tolerance check above, then retain twelve significant digits:
+  // far beyond every R7 acceptance tolerance, stable across RedisJSON, and
+  // deterministic when the immutable receipt is read back for commit.
+  return value === 0 ? 0 : Number(value.toPrecision(12));
 }
 
 function sortedUniqueStrings(value: unknown, path: string): string[] {

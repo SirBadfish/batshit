@@ -16,7 +16,7 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
-const ENV_FILE = path.join(ROOT, '.env.docker')
+let envFilePath = path.resolve(ROOT, process.env.BATSHIT_DOCKER_ENV_FILE || '.env.docker')
 const ENV_EXAMPLE = path.join(ROOT, '.env.docker.example')
 const OPERATOR_SCRIPT = path.join(ROOT, 'tools', 'docker', 'runtime-addon-operator.mjs')
 const LOG_FILE = path.join(ROOT, '_local', 'logs', 'docker-sandbox-operator-current.log')
@@ -36,6 +36,8 @@ Starts Batshit Docker and prepares the built-in Docker host helper.
 
 Options:
   --profile <name>          Enable a Docker Compose profile, for example n8n.
+  --env-file <path>         Use and prepare a separate Docker env file.
+  --project-name <name>     Use a separate Docker Compose project/volume namespace.
   --no-build                Start without rebuilding images.
   --no-sandbox-operator     Do not start the host Docker Sandbox/add-on operator.
   --no-docker-mcp-gateway   Do not start the optional host Docker MCP Gateway.
@@ -48,6 +50,8 @@ function parseArgs(argv) {
   let build = true
   let startSandboxOperator = true
   let startDockerMcpGateway = true
+  let envFile = process.env.BATSHIT_DOCKER_ENV_FILE || '.env.docker'
+  let projectName = process.env.COMPOSE_PROJECT_NAME || ''
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -74,6 +78,30 @@ function parseArgs(argv) {
       build = false
       continue
     }
+    if (arg === '--env-file') {
+      const value = argv[i + 1]
+      if (!value || value.startsWith('-')) throw new Error('--env-file requires a path.')
+      envFile = value
+      i += 1
+      continue
+    }
+    if (arg.startsWith('--env-file=')) {
+      envFile = arg.slice('--env-file='.length).trim()
+      if (!envFile) throw new Error('--env-file requires a path.')
+      continue
+    }
+    if (arg === '--project-name') {
+      const value = argv[i + 1]
+      if (!value || value.startsWith('-')) throw new Error('--project-name requires a name.')
+      projectName = value
+      i += 1
+      continue
+    }
+    if (arg.startsWith('--project-name=')) {
+      projectName = arg.slice('--project-name='.length).trim()
+      if (!projectName) throw new Error('--project-name requires a name.')
+      continue
+    }
     if (arg === '--no-sandbox-operator') {
       startSandboxOperator = false
       continue
@@ -85,7 +113,7 @@ function parseArgs(argv) {
     throw new Error(`Unknown option: ${arg}`)
   }
 
-  return { profiles, build, startSandboxOperator, startDockerMcpGateway }
+  return { profiles, build, startSandboxOperator, startDockerMcpGateway, envFile, projectName }
 }
 
 function parseEnv(text) {
@@ -185,11 +213,12 @@ function isDefaultHostN8nApiUrl(value) {
 }
 
 function prepareEnvFile(profiles = []) {
-  if (!existsSync(ENV_FILE)) {
-    copyFileSync(ENV_EXAMPLE, ENV_FILE)
+  mkdirSync(path.dirname(envFilePath), { recursive: true })
+  if (!existsSync(envFilePath)) {
+    copyFileSync(ENV_EXAMPLE, envFilePath)
   }
 
-  const original = readFileSync(ENV_FILE, 'utf8')
+  const original = readFileSync(envFilePath, 'utf8')
   const state = { text: original, notes: [] }
   const envBefore = parseEnv(original)
   const hasDockerMcpGatewayConfig = dockerMcpGatewayConfigured(envBefore)
@@ -277,6 +306,27 @@ function prepareEnvFile(profiles = []) {
     '/runtime/agent-browser/tmp',
     (current) => !current,
     'Set shared Agent Browser screenshot temp directory.'
+  )
+  updateEnvValue(
+    state,
+    'BATSHIT_AUDIO2FACE_BRIDGE_URL',
+    'http://audio2face-bridge:8068',
+    (current) => !current,
+    'Set Audio2Face bridge URL for the Docker app container.'
+  )
+  updateEnvValue(
+    state,
+    'BATSHIT_AUDIO2FACE_BRIDGE_TOKEN',
+    randomBytes(32).toString('hex'),
+    isBlankOrPlaceholder,
+    'Generated Audio2Face bridge token in .env.docker.'
+  )
+  updateEnvValue(
+    state,
+    'BATSHIT_AUDIO2FACE_NIM_ENDPOINT',
+    'host.docker.internal:52000',
+    (current) => !current,
+    'Set default host Audio2Face-3D NIM gRPC endpoint.'
   )
   updateEnvValue(
     state,
@@ -411,10 +461,10 @@ function prepareEnvFile(profiles = []) {
   if (state.text !== original) {
     // The Docker launcher updates its Batshit-owned .env.docker file after validating generated values.
     // codeql[js/file-system-race]
-    writeFileSync(ENV_FILE, state.text.endsWith('\n') ? state.text : `${state.text}\n`)
+    writeFileSync(envFilePath, state.text.endsWith('\n') ? state.text : `${state.text}\n`)
   }
 
-  const env = parseEnv(readFileSync(ENV_FILE, 'utf8'))
+  const env = parseEnv(readFileSync(envFilePath, 'utf8'))
   const finalWorkspace = resolveWorkspaceMount(env.get('BATSHIT_WORKSPACE_MOUNT'))
   if (!existsSync(finalWorkspace)) {
     throw new Error(
@@ -553,7 +603,7 @@ function writeMacLaunchAgentPlist() {
     <key>BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT</key>
     <string>${xmlEscape(ROOT)}</string>
     <key>BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE</key>
-    <string>${xmlEscape(ENV_FILE)}</string>
+    <string>${xmlEscape(envFilePath)}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -805,7 +855,7 @@ function startDetachedOperator() {
     env: {
       ...process.env,
       BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT: ROOT,
-      BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE: ENV_FILE
+      BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE: envFilePath
     },
     stdio: ['ignore', out, err]
   })
@@ -884,8 +934,9 @@ function ensureDockerCli() {
   }
 }
 
-function runCompose({ profiles, build }) {
-  const args = ['compose', '--env-file', '.env.docker']
+function runCompose({ profiles, build, projectName }) {
+  const args = ['compose', '--env-file', envFilePath]
+  if (projectName) args.push('--project-name', projectName)
   for (const profile of profiles) args.push('--profile', profile)
   args.push('up', '-d')
   if (build) args.push('--build')
@@ -893,7 +944,11 @@ function runCompose({ profiles, build }) {
   console.log(`Running: docker ${args.join(' ')}`)
   const result = spawnSync('docker', args, {
     cwd: ROOT,
-    env: process.env,
+    env: {
+      ...process.env,
+      BATSHIT_DOCKER_ENV_FILE: envFilePath,
+      ...(projectName ? { COMPOSE_PROJECT_NAME: projectName } : {})
+    },
     stdio: 'inherit'
   })
   if (result.status !== 0) {
@@ -903,6 +958,7 @@ function runCompose({ profiles, build }) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2))
+  envFilePath = path.resolve(ROOT, options.envFile)
   ensureDockerCli()
 
   const { env, notes } = prepareEnvFile(options.profiles)
@@ -917,7 +973,7 @@ async function main() {
 
   runCompose(options)
 
-  const appPort = env.get('BATSHIT_DOCKER_APP_PORT') || '5620'
+  const appPort = process.env.BATSHIT_DOCKER_APP_PORT || env.get('BATSHIT_DOCKER_APP_PORT') || '5620'
   console.log(`Batshit Docker is starting at http://localhost:${appPort}`)
 }
 

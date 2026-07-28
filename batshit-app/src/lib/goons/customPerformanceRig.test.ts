@@ -11,6 +11,7 @@ import {
   resolveCustomPerformanceRigManifest,
   resolveFaceControlEyeLookPresetWeights,
   resolveFinalCustomTargetWeights,
+  resolveSocketEyeBlinkClosureTargetWeights,
   shouldApplyCustomExpressionMorphPreset,
   type CustomPerformanceDirection,
   type CustomPerformanceRigManifest
@@ -85,6 +86,25 @@ function buildManifest(): CustomPerformanceRigManifest {
         }
       }
     }
+  }
+}
+
+function buildSocketManifest(): CustomPerformanceRigManifest {
+  const legacy = buildManifest()
+  return {
+    contract: 'batshit-performance-rig/v2',
+    space: legacy.space,
+    rotation: legacy.rotation,
+    nodes: {
+      head: legacy.nodes.head,
+      neck: legacy.nodes.neck
+    },
+    look: {
+      headYawShares: legacy.look.headYawShares,
+      headPitchShares: legacy.look.headPitchShares,
+      eyeDriver: 'socket-surface-target/v1'
+    },
+    targetTransforms: legacy.targetTransforms
   }
 }
 
@@ -170,6 +190,23 @@ describe('resolveCustomPerformanceRigManifest', () => {
       node: 'Any_Runtime_Head',
       yaw: { rangeDegrees: { positive: 41.252961 } }
     })
+  })
+
+  it('accepts the socket contract without rotating-eye nodes and rejects mixed eye-node payloads', () => {
+    const manifest = buildSocketManifest()
+    const resolved = resolveCustomPerformanceRigManifest(manifest)
+    expect(resolved.issues).toEqual([])
+    expect(resolved.manifest).toMatchObject({
+      contract: 'batshit-performance-rig/v2',
+      nodes: { head: { node: 'Head' }, neck: { node: 'Neck' } },
+      look: { eyeDriver: 'socket-surface-target/v1' }
+    })
+
+    const mixed = structuredClone(manifest) as unknown as Record<string, unknown>
+    ;(mixed.nodes as Record<string, unknown>).leftEye = buildManifest().nodes.leftEye
+    expect(resolveCustomPerformanceRigManifest(mixed).issues).toContain(
+      'rig.performance.nodes.leftEye is not allowed by this performance contract.'
+    )
   })
 
   it('fails closed with actionable paths for malformed or incomplete contracts', () => {
@@ -258,7 +295,7 @@ describe('custom performance input resolution', () => {
     expect(shouldApplyCustomExpressionMorphPreset('happy', false)).toBe(true)
   })
 
-  it('combines semantic presets and original controls while retaining asymmetric raw eye input', () => {
+  it('lets authored raw eye axes override portable eye controls without double application', () => {
     const direction = resolveCustomPerformanceDirection({
       expressionTargets: [
         { preset: 'lookRightHead', weight: 0.4 },
@@ -277,10 +314,10 @@ describe('custom performance input resolution', () => {
     })
 
     expect(direction.headYaw).toBeCloseTo(0.6)
-    expect(direction.leftEyeYaw).toBeCloseTo(-0.6)
-    expect(direction.rightEyeYaw).toBeCloseTo(0.5)
+    expect(direction.leftEyeYaw).toBeCloseTo(-0.5)
+    expect(direction.rightEyeYaw).toBeCloseTo(0.6)
     expect(direction.leftEyePitch).toBeCloseTo(0.3)
-    expect(direction.rightEyePitch).toBeCloseTo(0.15)
+    expect(direction.rightEyePitch).toBeCloseTo(-0.15)
   })
 
   it('converts Eye Contact signs and composes ambient motion without collapsing asymmetric eyes', () => {
@@ -405,8 +442,14 @@ describe('custom performance input resolution', () => {
         ['aa', 0.7]
       ]),
       expressionBindings: new Map([
-        ['happy', ['smileTarget']],
-        ['aa', ['viseme_aa']]
+        [
+          'happy',
+          [
+            { target: 'smileTarget', weight: 0.5 },
+            { target: 'cheekTarget', weight: 0.25 }
+          ]
+        ],
+        ['aa', [{ target: 'viseme_aa', weight: 1 }]]
       ]),
       faceControlWeights: new Map([
         ['smileTarget', 0.8],
@@ -420,11 +463,44 @@ describe('custom performance input resolution', () => {
     })
     expect(Object.fromEntries(weights)).toEqual({
       smileTarget: 0.2,
+      cheekTarget: 0.1,
       viseme_aa: 0.7,
       jawLeft: 0.5,
       eyeLookOutLeft: 0.6,
       custom_scar: 0.9
     })
+  })
+
+  it('uses Blink as a same-side Squint floor without adding or collapsing authored Squint', () => {
+    const resolved = resolveSocketEyeBlinkClosureTargetWeights(
+      new Map([
+        ['eyeBlinkLeft', 1],
+        ['eyeSquintLeft', 0.2],
+        ['eyeBlinkRight', 0.4],
+        ['eyeSquintRight', 0.8],
+        ['mouthSmileLeft', 0.7]
+      ]),
+      0.5
+    )
+
+    expect(Object.fromEntries(resolved)).toEqual({
+      eyeBlinkLeft: 1,
+      eyeSquintLeft: 0.5,
+      eyeBlinkRight: 0.4,
+      eyeSquintRight: 0.8,
+      mouthSmileLeft: 0.7
+    })
+    expect(
+      Object.fromEntries(
+        resolveSocketEyeBlinkClosureTargetWeights(
+          new Map([
+            ['eyeBlinkLeft', 1],
+            ['eyeSquintLeft', 1]
+          ]),
+          0.5
+        )
+      )
+    ).toMatchObject({ eyeSquintLeft: 1, eyeSquintRight: 0 })
   })
 })
 
@@ -436,6 +512,35 @@ describe('CustomPerformanceRigRuntime', () => {
     expect(rig.runtime.getLookNode('head')).toBe(rig.head)
     expect(rig.runtime.getLookNode('leftEye')).toBe(rig.leftEye)
     expect(rig.runtime.getLookNode('rightEye')).toBe(rig.rightEye)
+  })
+
+  it('keeps socket caps stationary by applying v2 look motion only to Head and Neck', () => {
+    const rig = buildRig()
+    const binding = bindCustomPerformanceRig(rig.root, buildSocketManifest())
+    expect(binding.issues).toEqual([])
+    const runtime = binding.runtime!
+    const leftRest = rig.leftEye.quaternion.clone()
+    const rightRest = rig.rightEye.quaternion.clone()
+
+    runtime.apply(
+      {
+        headYaw: 0.5,
+        headPitch: -0.25,
+        leftEyeYaw: 1,
+        leftEyePitch: 1,
+        rightEyeYaw: -1,
+        rightEyePitch: -1
+      },
+      new Map()
+    )
+
+    expect(runtime.usesSocketEyeDriver()).toBe(true)
+    expect(runtime.hasLookNode('leftEye')).toBe(false)
+    expect(() => runtime.getLookNode('leftEye')).toThrow('does not expose leftEye')
+    expectQuaternionClose(rig.leftEye.quaternion, leftRest)
+    expectQuaternionClose(rig.rightEye.quaternion, rightRest)
+    expect(rig.head.quaternion.angleTo(new THREE.Quaternion())).toBeGreaterThan(0)
+    runtime.dispose()
   })
 
   it('restores mixer-authored gaze nodes to their bound parent-rest transforms', () => {

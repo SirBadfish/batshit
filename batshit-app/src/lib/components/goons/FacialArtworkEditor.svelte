@@ -10,11 +10,11 @@
   import FacialArtworkSurfaceEditor from './FacialArtworkSurfaceEditor.svelte'
   import {
     createDefaultFacialArtworkState,
-    type FacialArtworkDefinitionV3,
+    type FacialArtworkDefinitionV4,
     type FacialArtworkOrientation,
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
-    type FacialArtworkStateV3,
+    type FacialArtworkStateV4,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import { cloneFacialArtworkState } from '$lib/goons/facialArtwork.editor'
@@ -28,8 +28,8 @@
     readEyeAppearanceControl,
     updateEyeAppearanceControl,
     type EyeAppearanceControlId,
-    type EyeAppearanceDefinitionV1,
-    type EyeAppearanceStateV1
+    type EyeAppearanceDefinitionV3,
+    type EyeAppearanceStateV3
   } from '$lib/goons/eyeAppearance'
 
   export type FacialArtworkEditorScope = 'brows' | 'eyes'
@@ -37,16 +37,16 @@
 
   type Props = {
     scope: FacialArtworkEditorScope
-    definition: FacialArtworkDefinitionV3
-    eyeAppearanceDefinition: EyeAppearanceDefinitionV1
-    valueState: FacialArtworkStateV3
-    eyeAppearanceState: EyeAppearanceStateV1
+    definition: FacialArtworkDefinitionV4
+    eyeAppearanceDefinition: EyeAppearanceDefinitionV3
+    valueState: FacialArtworkStateV4
+    eyeAppearanceState: EyeAppearanceStateV3
     ownerDisplayName: string
     creditDraft: FacialArtworkUploadCreditDraft
     disabled?: boolean
     onCreditDraftChange: (draft: FacialArtworkUploadCreditDraft) => void
-    onChange: (state: FacialArtworkStateV3) => void
-    onEyeAppearanceChange: (state: EyeAppearanceStateV1) => void
+    onChange: (state: FacialArtworkStateV4) => void
+    onEyeAppearanceChange: (state: EyeAppearanceStateV3) => void
     onUpload: (
       roleId: FacialArtworkRoleId,
       file: File,
@@ -110,7 +110,7 @@
   }
 
   const sectionEyeControlIds: Partial<Record<SectionId, EyeAppearanceControlId[]>> = {
-    iris: ['iris_size'],
+    iris: ['iris_size', 'iris_vertical_position'],
     pupil: ['pupil_size']
   }
 
@@ -170,6 +170,7 @@
   }
 
   const irisSizeControl = $derived(eyeControl('iris_size'))
+  const irisVerticalPositionControl = $derived(eyeControl('iris_vertical_position'))
   const pupilSizeControl = $derived(eyeControl('pupil_size'))
 
   function updateEyeControl(id: EyeAppearanceControlId, value: number) {
@@ -360,9 +361,9 @@
           />
           <div class="facial-artwork-physical-group">
             <GoonsFieldLabel
-              label="Physical Size"
-              info="Linked across both eyes. 1 keeps the package-fitted iris size."
-              ariaLabel="About Iris Physical Size"
+              label="Physical Size & Position"
+              info="Linked across both eyes. Position moves Iris, Pupil, and Highlight together without changing gaze."
+              ariaLabel="About Iris Physical Size and Position"
             />
             <FacialArtworkPhysicalSlider
               id="facial-artwork-iris-size"
@@ -372,6 +373,19 @@
               step={irisSizeControl.step}
               {disabled}
               onChange={(value) => updateEyeControl('iris_size', value)}
+            />
+            <FacialArtworkPhysicalSlider
+              id="facial-artwork-iris-vertical-position"
+              label={irisVerticalPositionControl.label}
+              description="Move both irises up or down. Pupils and highlights stay centered with them."
+              value={eyeAppearanceState.irisVerticalPosition}
+              range={[
+                irisVerticalPositionControl.minimum,
+                irisVerticalPositionControl.maximum
+              ]}
+              step={irisVerticalPositionControl.step}
+              {disabled}
+              onChange={(value) => updateEyeControl('iris_vertical_position', value)}
             />
           </div>
         </section>
