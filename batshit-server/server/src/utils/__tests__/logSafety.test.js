@@ -16,7 +16,7 @@ describe('logSafety', () => {
     writeErrorLog(logger, 'Upload request', error);
 
     expect(logger.error).toHaveBeenCalledTimes(1);
-    expect(logger.error.mock.calls[0][0]).toContain('Upload request: Error: upload failed forged entry');
+    expect(logger.error.mock.calls[0][0]).toContain('Upload request: Error: upload failedforged entry');
     expect(logger.error.mock.calls[0][0]).not.toMatch(/[\r\n\u2028\u2029]/);
   });
 

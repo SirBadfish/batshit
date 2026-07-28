@@ -17,7 +17,8 @@ function stringifyLogValue(value) {
 
 function sanitizeLogValue(value) {
   return stringifyLogValue(value)
-    .replace(/[\r\n\u2028\u2029]+/g, ' ')
+    .replace(/\n|\r/g, '')
+    .replace(/\u2028|\u2029/g, '')
     .slice(0, MAX_LOG_VALUE_LENGTH);
 }
 
