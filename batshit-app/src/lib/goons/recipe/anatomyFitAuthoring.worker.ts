@@ -17,8 +17,8 @@ type AnatomyFitWorkerResponse =
 const workerScope: DedicatedWorkerGlobalScope = self as unknown as DedicatedWorkerGlobalScope;
 
 workerScope.addEventListener("message", (event: MessageEvent<AnatomyFitWorkerRequest>) => {
-  if (event.origin !== workerScope.origin) {
-    throw new Error("Anatomy Fit worker rejected a request from an unexpected origin");
+  if (event.origin !== "" || event.source !== null) {
+    throw new Error("Anatomy Fit worker rejected a request outside its dedicated channel");
   }
   const request = event.data;
   if (
