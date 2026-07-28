@@ -30,13 +30,14 @@
 		"livekit:agent:start": "npm --prefix ../tools/livekit-agent-sidecar run start"
 	},
 	"devDependencies": {
+		"@emnapi/runtime": "^1.11.3",
 		"@internationalized/date": "^3.12.0",
 		"@lucide/svelte": "^1.7.0",
 		"@pixiv/three-vrm": "^3.5.3",
 		"@pixiv/three-vrm-animation": "^3.5.3",
 		"@sveltejs/adapter-node": "^5.5.4",
 		"@sveltejs/adapter-vercel": "^6.3.3",
-		"@sveltejs/kit": "^2.57.1",
+		"@sveltejs/kit": "^2.70.1",
 		"@sveltejs/vite-plugin-svelte": "^7.0.0",
 		"@tailwindcss/postcss": "^4.2.2",
 		"@tailwindcss/vite": "^4.2.2",
@@ -81,14 +82,14 @@
 		"@ai-sdk/replicate": "^2.0.27",
 		"@iarna/toml": "^2.2.5",
 		"@lobehub/icons-static-svg": "^1.90.0",
-		"@modelcontextprotocol/sdk": "^1.29.0",
+		"@modelcontextprotocol/sdk": "^1.30.0",
 		"@openrouter/ai-sdk-provider": "^2.9.0",
 		"@redis/json": "5.11.0",
 		"ai": "^6.0.146",
 		"ansi-to-html": "^0.7.2",
 		"bcrypt": "^6.0.0",
 		"cheerio": "^1.2.0",
-		"dompurify": "^3.4.11",
+		"dompurify": "^3.4.12",
 		"eventsource": "^4.1.0",
 		"fflate": "^0.8.2",
 		"livekit-server-sdk": "^2.15.3",
@@ -112,7 +113,7 @@
 		"@asamuzakjp/dom-selector": {
 			"lru-cache": "^11.2.7"
 		},
-		"body-parser": "^2.2.1",
+		"body-parser": "^2.3.0",
 		"glob": "^10.5.0",
 		"cookie": "^0.7.2"
 	}

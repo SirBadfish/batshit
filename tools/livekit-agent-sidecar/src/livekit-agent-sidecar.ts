@@ -887,7 +887,7 @@ function attachSpeechToSpeechForwarders(
 }
 
 function createSpeechToSpeechToolContext(context: SpeechToSpeechContext): llm.ToolContext {
-  return {
+  return new llm.ToolContext({
     goon_emote: llm.tool({
       description:
         'Silently trigger a Batshit Goon one-shot facial expression or gesture. Use exact cue names from the live Batshit session context. This tool is not spoken out loud and should be used instead of saying emoji names or writing emote tags.',
@@ -928,7 +928,7 @@ function createSpeechToSpeechToolContext(context: SpeechToSpeechContext): llm.To
         return undefined
       }
     })
-  }
+  })
 }
 
 async function startSpeechToSpeechSession(ctx: JobContext) {
