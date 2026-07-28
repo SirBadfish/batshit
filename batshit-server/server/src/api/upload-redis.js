@@ -13,6 +13,7 @@ const { promisify } = require('util');
 const { unzipSync, strFromU8 } = require('fflate');
 const config = require('../config');
 const logger = require('../utils/logger');
+const { writeErrorLog } = require('../utils/logSafety');
 const batshitzipService = require('../services/batshitZipService');
 const redisService = require('../services/redisService');
 const { persistFileBackedUpload } = require('../services/fileBackedUploadService');
@@ -1192,7 +1193,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
         processedForAI = `data:${finalMimeType};base64,${base64Content}`;
       }
     } catch (error) {
-      logger.error('Error processing image:', error);
+      writeErrorLog(logger, 'Error processing image', error);
       throw error;
     }
   }
@@ -1221,7 +1222,7 @@ async function processAndStoreFile(file, compressionSettings = {}, uploadSetting
       // Don't base64 encode text files - it wastes tokens!
       base64Content = null;
     } catch (error) {
-      logger.error('Error processing text file:', error);
+      writeErrorLog(logger, 'Error processing text file', error);
     }
   }
   
@@ -1658,7 +1659,7 @@ router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), asyn
           }
         }
       } catch (cleanupError) {
-        logger.error('Failed to delete old avatar:', cleanupError);
+        writeErrorLog(logger, 'Failed to delete old avatar', cleanupError);
         // Continue with upload even if cleanup fails
       }
     }
@@ -1685,7 +1686,7 @@ router.post('/upload/avatar', avatarUploadRateLimit, upload.single('file'), asyn
       filename: avatarFilename
     });
   } catch (error) {
-    logger.error('Avatar upload error:', error);
+    writeErrorLog(logger, 'Avatar upload error', error);
     sendUploadError(res, 'Avatar upload failed', error);
   }
 });
@@ -1704,7 +1705,7 @@ router.delete('/upload/asset', async (req, res) => {
       ...result
     });
   } catch (error) {
-    logger.error('Upload asset delete error:', error);
+    writeErrorLog(logger, 'Upload asset delete error', error);
     return res.status(500).json({
       error: 'Upload asset delete failed',
       details: error.message
@@ -1751,7 +1752,7 @@ router.post('/upload/goon', goonVrmUpload.single('file'), async (req, res) => {
       file
     });
   } catch (error) {
-    logger.error('Goon upload error:', error);
+    writeErrorLog(logger, 'Goon upload error', error);
     sendUploadError(res, 'Goon upload failed', error);
   } finally {
     await cleanupTempUploadFile(req.file);
@@ -1969,10 +1970,10 @@ router.post('/upload/goon-custom-package', goonCustomPackageUpload.single('file'
   } catch (error) {
     for (const asset of newlyStoredAssets.reverse()) {
       await deleteStoredUploadAsset(asset.uploadType, asset.filename).catch((cleanupError) => {
-        logger.error('Recipe package partial-write cleanup failed:', cleanupError);
+        writeErrorLog(logger, 'Recipe package partial-write cleanup failed', cleanupError);
       });
     }
-    logger.error('Custom Goon package upload error:', error);
+    writeErrorLog(logger, 'Custom Goon package upload error', error);
     sendUploadError(res, 'Custom Goon package upload failed', error);
   } finally {
     await cleanupTempUploadFile(req.file);
@@ -2094,7 +2095,7 @@ router.post('/upload/goon-guided-package', goonGuidedPackageUpload.single('file'
       }
     });
   } catch (error) {
-    logger.error('Advanced/Blender Goon package upload error:', error);
+    writeErrorLog(logger, 'Advanced/Blender Goon package upload error', error);
     sendUploadError(res, 'Advanced/Blender Goon package upload failed', error);
   } finally {
     await cleanupTempUploadFile(req.file);
@@ -2135,7 +2136,7 @@ router.post('/upload/goon-animation', goonAnimationUpload.single('file'), async 
       file
     });
   } catch (error) {
-    logger.error('Goon animation upload error:', error);
+    writeErrorLog(logger, 'Goon animation upload error', error);
     res.status(500).json({ error: 'Goon animation upload failed', details: error.message });
   }
 });
@@ -2175,7 +2176,7 @@ router.post('/upload/goon-animation-preview', goonAnimationPreviewUpload.single(
       file
     });
   } catch (error) {
-    logger.error('Goon animation preview upload error:', error);
+    writeErrorLog(logger, 'Goon animation preview upload error', error);
     res.status(500).json({ error: 'Goon animation preview upload failed', details: error.message });
   }
 });
@@ -2219,7 +2220,7 @@ router.post('/upload/goon-facial-artwork', goonFacialArtworkUpload.single('file'
     });
     return res.json({ success: true, file, artwork: validation, preparation: prepared.preparation });
   } catch (error) {
-    logger.error('Goon facial artwork upload error:', error);
+    writeErrorLog(logger, 'Goon facial artwork upload error', error);
     sendUploadError(res, 'Facial artwork upload failed', error);
   }
 });
@@ -2258,7 +2259,7 @@ router.post('/upload/goon-closet', goonImageUpload.single('file'), async (req, r
       file
     });
   } catch (error) {
-    logger.error('Goon closet upload error:', error);
+    writeErrorLog(logger, 'Goon closet upload error', error);
     res.status(500).json({ error: 'Closet upload failed', details: error.message });
   }
 });
@@ -2272,7 +2273,7 @@ router.delete('/upload/goon-closet', async (req, res) => {
     await deleteStoredUploadAsset('goon_closet', filename);
     return res.json({ success: true });
   } catch (error) {
-    logger.error('Goon closet delete error:', error);
+    writeErrorLog(logger, 'Goon closet delete error', error);
     res.status(500).json({ error: 'Closet delete failed', details: error.message });
   }
 });
@@ -2333,7 +2334,7 @@ router.post('/upload/goon-scene', goonSceneUpload.single('file'), async (req, re
       }
     });
   } catch (error) {
-    logger.error('Goon scene upload error:', error);
+    writeErrorLog(logger, 'Goon scene upload error', error);
     res.status(500).json({ error: 'Scene upload failed', details: error.message });
   }
 });
@@ -2351,7 +2352,7 @@ router.delete('/upload/goon-scene', async (req, res) => {
     await deleteStoredUploadAsset('goon_scene_thumbs', thumbnailFilename);
     return res.json({ success: true });
   } catch (error) {
-    logger.error('Goon scene delete error:', error);
+    writeErrorLog(logger, 'Goon scene delete error', error);
     res.status(500).json({ error: 'Scene delete failed', details: error.message });
   }
 });
@@ -2392,7 +2393,7 @@ router.post('/upload/goon-room-shell', goonSceneModelUpload.single('file'), asyn
       file
     });
   } catch (error) {
-    logger.error('Goon room shell upload error:', error);
+    writeErrorLog(logger, 'Goon room shell upload error', error);
     res.status(500).json({ error: 'Room shell upload failed', details: error.message });
   }
 });
@@ -2406,7 +2407,7 @@ router.delete('/upload/goon-room-shell', async (req, res) => {
     await deleteStoredUploadAsset('goon_room_shells', filename);
     return res.json({ success: true });
   } catch (error) {
-    logger.error('Goon room shell delete error:', error);
+    writeErrorLog(logger, 'Goon room shell delete error', error);
     res.status(500).json({ error: 'Room shell delete failed', details: error.message });
   }
 });
@@ -2450,7 +2451,7 @@ router.post('/upload/goon-room-texture', goonSceneUpload.single('file'), async (
       file: { ...file, kind }
     });
   } catch (error) {
-    logger.error('Goon room texture upload error:', error);
+    writeErrorLog(logger, 'Goon room texture upload error', error);
     res.status(500).json({ error: 'Room texture upload failed', details: error.message });
   }
 });
@@ -2464,7 +2465,7 @@ router.delete('/upload/goon-room-texture', async (req, res) => {
     await deleteStoredUploadAsset('goon_room_textures', filename);
     return res.json({ success: true });
   } catch (error) {
-    logger.error('Goon room texture delete error:', error);
+    writeErrorLog(logger, 'Goon room texture delete error', error);
     res.status(500).json({ error: 'Room texture delete failed', details: error.message });
   }
 });
@@ -2503,7 +2504,7 @@ router.post('/upload/goon-scene-prop', goonSceneModelUpload.single('file'), asyn
       file
     });
   } catch (error) {
-    logger.error('Goon scene prop upload error:', error);
+    writeErrorLog(logger, 'Goon scene prop upload error', error);
     res.status(500).json({ error: 'Prop upload failed', details: error.message });
   }
 });
@@ -2517,7 +2518,7 @@ router.delete('/upload/goon-scene-prop', async (req, res) => {
     await deleteStoredUploadAsset('goon_scene_props', filename);
     return res.json({ success: true });
   } catch (error) {
-    logger.error('Goon scene prop delete error:', error);
+    writeErrorLog(logger, 'Goon scene prop delete error', error);
     res.status(500).json({ error: 'Prop delete failed', details: error.message });
   }
 });

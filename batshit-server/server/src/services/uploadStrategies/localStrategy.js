@@ -1,6 +1,7 @@
 const BaseUploadStrategy = require('./baseStrategy');
 const redisService = require('../redisService');
 const logger = require('../../utils/logger');
+const { writeErrorLog } = require('../../utils/logSafety');
 const {
   deleteFileBackedPayload,
   persistFileBackedUpload
@@ -151,7 +152,7 @@ class LocalStorageStrategy extends BaseUploadStrategy {
         requiresHttps: false
       };
     } catch (error) {
-      logger.error('[LocalStrategy] Upload error:', error);
+      writeErrorLog(logger, '[LocalStrategy] Upload error', error);
       throw error;
     }
   }
@@ -162,7 +163,7 @@ class LocalStorageStrategy extends BaseUploadStrategy {
       await redisService.ping();
       return true;
     } catch (error) {
-      logger.error('[LocalStrategy] Connection test failed:', error);
+      writeErrorLog(logger, '[LocalStrategy] Connection test failed', error);
       return false;
     }
   }
@@ -180,7 +181,7 @@ class LocalStorageStrategy extends BaseUploadStrategy {
       if (payload) await deleteFileBackedPayload(payload);
       return true;
     } catch (error) {
-      logger.error('[LocalStrategy] Delete error:', error);
+      writeErrorLog(logger, '[LocalStrategy] Delete error', error);
       return false;
     }
   }
