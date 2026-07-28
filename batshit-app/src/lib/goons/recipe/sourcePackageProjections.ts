@@ -403,12 +403,13 @@ function stripPresentationFromDial(dial: JsonRecord): JsonRecord {
 function stripProvenance(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripProvenance);
   if (value && typeof value === "object") {
-    const result: JsonRecord = {};
-    for (const [key, child] of Object.entries(value as JsonRecord)) {
-      if (key === "provenance" || key.endsWith("Sha256")) continue;
-      result[key] = stripProvenance(child);
-    }
-    return result;
+    return Object.fromEntries(
+      Object.entries(value as JsonRecord)
+        .filter(
+          ([key]) => key !== "provenance" && !key.endsWith("Sha256"),
+        )
+        .map(([key, child]) => [key, stripProvenance(child)]),
+    );
   }
   return value;
 }

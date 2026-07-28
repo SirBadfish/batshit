@@ -14,6 +14,9 @@ function post(event: LiveGoonBakerWorkerEvent, transfer: Transferable[] = []) {
 }
 
 scope.addEventListener('message', (message: MessageEvent<LiveGoonBakerWorkerRequest>) => {
+  if (message.origin !== scope.origin) {
+    throw new Error('Live Goon baker worker rejected a request from an unexpected origin.')
+  }
   const request = message.data
   if (
     !request ||

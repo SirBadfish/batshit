@@ -310,10 +310,10 @@ function validateMacroDialEffect(
     fixedFactor: corner.fixedFactor,
   }));
   for (const input of inputs) {
-    const state = {
-      ...engine.baselineState,
-      [axis]: evaluateAppearanceDialTrack(track, input),
-    };
+    const state = Object.fromEntries([
+      ...Object.entries(engine.baselineState),
+      [axis, evaluateAppearanceDialTrack(track, input)],
+    ]) as Record<AppearanceDialMacroAxis, number>;
     const weights = resolveMpfbMacroCornerWeights(
       MACRO_AXES,
       engine.dims,

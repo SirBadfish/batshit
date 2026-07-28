@@ -533,7 +533,7 @@ export function resolveCustomPerformanceRigManifest(
     )
   }
 
-  const targetTransforms: Record<string, CustomPerformanceTargetTransform> = {}
+  const targetTransformEntries = new Map<string, CustomPerformanceTargetTransform>()
   if (!isRecord(value.targetTransforms)) {
     addIssue(issues, `${path}.targetTransforms`, 'must be an object.')
   } else if (Object.keys(value.targetTransforms).length === 0) {
@@ -560,7 +560,7 @@ export function resolveCustomPerformanceRigManifest(
           'must not contain surrounding whitespace.'
         )
       }
-      if (Object.hasOwn(targetTransforms, trimmed)) {
+      if (targetTransformEntries.has(trimmed)) {
         addIssue(
           issues,
           `${path}.targetTransforms.${role}`,
@@ -568,15 +568,19 @@ export function resolveCustomPerformanceRigManifest(
         )
         continue
       }
-      targetTransforms[trimmed] = parseTargetTransform(
-        rawTransform,
-        `${path}.targetTransforms.${trimmed}`,
-        issues
+      targetTransformEntries.set(
+        trimmed,
+        parseTargetTransform(
+          rawTransform,
+          `${path}.targetTransforms.${trimmed}`,
+          issues
+        )
       )
     }
   }
 
   if (issues.length > 0) return { manifest: null, issues }
+  const targetTransforms = Object.fromEntries(targetTransformEntries)
   const base = {
       space: 'node-parent-rest',
       rotation: {

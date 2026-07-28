@@ -824,7 +824,7 @@ export function parseJointFollow(
   ) {
     throw new Error("avatar.json#appearanceDials jointFollow is malformed");
   }
-  const deltas = createRecord<Record<string, AppearanceVec3>>();
+  const deltaEntries: [string, Record<string, AppearanceVec3>][] = [];
   for (const [targetId, rawPerBone] of Object.entries(value.deltas)) {
     if (
       !hasOwn(targets, targetId) ||
@@ -835,17 +835,18 @@ export function parseJointFollow(
         "appearance joint deltas for " + targetId + " are malformed",
       );
     }
-    const perBone = createRecord<AppearanceVec3>();
+    const perBoneEntries: [string, AppearanceVec3][] = [];
     for (const [bone, delta] of Object.entries(rawPerBone)) {
       if (!isNonEmptyString(bone) || !isVec3(delta)) {
         throw new Error(
           "appearance joint delta " + targetId + "/" + bone + " is malformed",
         );
       }
-      perBone[bone] = delta;
+      perBoneEntries.push([bone, delta]);
     }
-    deltas[targetId] = perBone;
+    deltaEntries.push([targetId, Object.fromEntries(perBoneEntries)]);
   }
+  const deltas = Object.fromEntries(deltaEntries);
 
   let clipRemap: AppearanceJointFollow["clipRemap"];
   if (value.clipRemap !== undefined) {

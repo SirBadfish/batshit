@@ -361,14 +361,15 @@ function parseTemplate(value: unknown, context: string): FacialArtworkTemplate {
       fail(`${assetContext}.channels must be L8`)
     }
     const paletteSource = record(asset.palette, `${assetContext}.palette`)
-    const palette: Record<string, number> = {}
+    const paletteEntries: [string, number][] = []
     for (const [key, value] of Object.entries(paletteSource)) {
       const parsed = finite(value, `${assetContext}.palette.${key}`)
       if (!Number.isInteger(parsed) || parsed < 0 || parsed > 255) {
         fail(`${assetContext}.palette.${key} must be an integer inside [0, 255]`)
       }
-      palette[key] = parsed
+      paletteEntries.push([key, parsed])
     }
+    const palette = Object.fromEntries(paletteEntries)
     if (Object.keys(palette).length === 0) fail(`${assetContext}.palette cannot be empty`)
     return {
       path: publicPath(asset.path, `${assetContext}.path`),
