@@ -1,5 +1,6 @@
 const LocalStorageStrategy = require('./uploadStrategies/localStrategy');
 const logger = require('../utils/logger');
+const { writeErrorLog } = require('../utils/logSafety');
 
 /**
  * Local upload manager.
@@ -40,7 +41,7 @@ class UploadManager {
       
       logger.info(`[UploadManager] Local upload storage ready: ${this.currentStrategy.displayName || strategyName}`);
     } catch (error) {
-      logger.error(`[UploadManager] Failed to initialize strategy ${strategyName}:`, error);
+      writeErrorLog(logger, `[UploadManager] Failed to initialize strategy ${strategyName}`, error);
       this.currentStrategy = new LocalStorageStrategy(config);
     }
   }
@@ -62,7 +63,7 @@ class UploadManager {
       result.strategy = this.currentStrategy.name;
       return result;
     } catch (error) {
-      logger.error(`[UploadManager] Local upload failed:`, error);
+      writeErrorLog(logger, '[UploadManager] Local upload failed', error);
       throw error;
     }
   }
