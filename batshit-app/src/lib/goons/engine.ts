@@ -1,9 +1,9 @@
 import * as THREE from 'three'
 import { logger } from '$lib/utils/logger'
 import { WebGPURenderer, type PointsNodeMaterial } from 'three/webgpu'
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js'
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { TransformControls } from 'three/addons/controls/TransformControls.js'
 import { GroundedSkybox } from 'three/addons/objects/GroundedSkybox.js'
 import {
   VRM,

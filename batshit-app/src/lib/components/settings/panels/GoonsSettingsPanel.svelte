@@ -11589,7 +11589,7 @@
     if (ext !== 'glb' && ext !== 'gltf') return null
     try {
       const buffer = await file.arrayBuffer()
-      const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js')
+      const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js')
       const loader = new GLTFLoader()
       const triangles = await new Promise<number>((resolve, reject) => {
         loader.parse(
