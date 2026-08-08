@@ -2,6 +2,8 @@ import type { FacialArtworkProvenance } from './facialArtwork'
 
 export const LIP_ARTWORK_SCHEMA_VERSION = 'lip-artwork/v2' as const
 export const LIP_ARTWORK_STATE_SCHEMA_VERSION = 'lip-artwork-state/v2' as const
+export const LIP_ARTWORK_PRESENCE_STATE_SCHEMA_VERSION =
+  'lip-artwork-presence-state/v1' as const
 
 export type LipArtworkRgb = [number, number, number]
 
@@ -58,6 +60,12 @@ export type LipArtworkStateV2 = {
   artwork: LipArtworkUpload
   tint: LipArtworkRgb
   opacity: number
+}
+
+export type LipArtworkPresenceStateV1 = {
+  schemaVersion: typeof LIP_ARTWORK_PRESENCE_STATE_SCHEMA_VERSION
+  definitionSha256: string
+  enabled: boolean
 }
 
 export type LipArtworkReconciliation = {
@@ -354,6 +362,39 @@ export function reconcileLipArtworkState(
       reason: error instanceof Error ? error.message : 'Lip Artwork state is incompatible.'
     }
   }
+}
+
+export function parseLipArtworkPresenceState(
+  definition: LipArtworkDefinitionV2,
+  value: unknown
+): LipArtworkPresenceStateV1 {
+  const source = record(value, 'presence')
+  exactKeys(source, ['schemaVersion', 'definitionSha256', 'enabled'], 'presence')
+  if (source.schemaVersion !== LIP_ARTWORK_PRESENCE_STATE_SCHEMA_VERSION) {
+    fail('presence schemaVersion is unsupported')
+  }
+  if (source.definitionSha256 !== definition.definitionSha256) {
+    fail('presence definitionSha256 does not match this package')
+  }
+  if (typeof source.enabled !== 'boolean') {
+    fail('presence.enabled must be boolean')
+  }
+  return {
+    schemaVersion: LIP_ARTWORK_PRESENCE_STATE_SCHEMA_VERSION,
+    definitionSha256: definition.definitionSha256,
+    enabled: source.enabled
+  }
+}
+
+export function createLipArtworkPresenceState(
+  definition: LipArtworkDefinitionV2,
+  enabled: boolean
+): LipArtworkPresenceStateV1 {
+  return parseLipArtworkPresenceState(definition, {
+    schemaVersion: LIP_ARTWORK_PRESENCE_STATE_SCHEMA_VERSION,
+    definitionSha256: definition.definitionSha256,
+    enabled
+  })
 }
 
 export function lipArtworkRgbToHex(value: LipArtworkRgb) {

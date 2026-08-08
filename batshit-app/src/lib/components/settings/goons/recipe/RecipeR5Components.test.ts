@@ -181,6 +181,7 @@ describe('Recipe R5 Settings components', () => {
       onRequestCleanReset: noop,
       onPreviewSideChange: noop,
       onPreviewControlChange: noop,
+      onResumeReadyJob: noop,
       onRetryJob: noop,
       onDiscardJob: noop,
       onCloseCleanReset: noop,
@@ -247,6 +248,7 @@ describe('Recipe R5 Settings components', () => {
   it('makes a longer appearance save visibly active in ordinary language', () => {
     render(RecipeBuildProgress, {
       status: 'baking',
+      onResume: vi.fn(),
       onRetry: vi.fn(),
       onDiscard: vi.fn()
     })
@@ -255,6 +257,102 @@ describe('Recipe R5 Settings components', () => {
     expect(activeStatus.querySelector('.animate-spin')).toBeTruthy()
     expect(screen.getByText(/This can take a few seconds/)).toBeTruthy()
     expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuetext', 'Applying')
+  })
+
+  it('turns a recovered ready candidate into explicit finish or discard actions', async () => {
+    const onResume = vi.fn()
+    const onDiscard = vi.fn()
+
+    render(RecipeBuildProgress, {
+      status: 'ready',
+      resumable: true,
+      onResume,
+      onRetry: vi.fn(),
+      onDiscard
+    })
+
+    expect(screen.queryByRole('status', { name: 'Updating Appearance' })).toBeNull()
+    expect(screen.getByText('Appearance Update Ready')).toBeTruthy()
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuetext', 'Ready to finish')
+    await fireEvent.click(screen.getByRole('button', { name: 'Finish Update' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Discard' }))
+    expect(onResume).toHaveBeenCalledOnce()
+    expect(onDiscard).toHaveBeenCalledOnce()
+  })
+
+  it('finishes an exact ready checkpoint recovered after reload', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const pendingJob = {
+      jobId: 'recipe-ready-after-reload-job',
+      jobRef: 'recipe:job:recipe-ready-after-reload-job',
+      status: 'ready',
+      operation: 'rebake',
+      targetWriteVersion: 2,
+      targetRecipeRevision: 2,
+      targetRevisionId: 'recipe-ready-after-reload-revision'
+    }
+    const readyGoon = {
+      id: 'recipe-ready-after-reload-goon',
+      user_id: 'recipe-ready-after-reload-user',
+      name: 'Ready After Reload',
+      kind: 'custom',
+      sourceProfile: 'expert-custom-glb',
+      files: {},
+      recipe: {
+        contract: 'goon-recipe/v2',
+        writeVersion: 2,
+        nextRecipeRevision: 3,
+        liveStatus: 'building',
+        authoringRevision: { recipeRevision: 2, state: fixture.sourceState },
+        activeRevision: { ref: 'active-1' },
+        previousRevision: null,
+        pendingAnalysis: null,
+        pendingJob,
+        lastFailure: null
+      },
+      appearanceDials: fixture.sourceState.appearanceDials,
+      created_at: '2026-08-04T00:00:00.000Z',
+      updated_at: '2026-08-04T00:00:00.000Z'
+    } as unknown as GoonRecord
+    const committedGoon = {
+      ...structuredClone(readyGoon),
+      recipe: {
+        ...structuredClone(readyGoon.recipe),
+        writeVersion: 3,
+        liveStatus: 'up_to_date',
+        activeRevision: { ref: 'active-2' },
+        previousRevision: { ref: 'active-1' },
+        pendingJob: null
+      }
+    } as unknown as GoonRecord
+    const job = {
+      jobId: pendingJob.jobId,
+      status: 'ready',
+      operation: 'rebake'
+    }
+    const recovery = {
+      goon: readyGoon,
+      owner: readyGoon.recipe,
+      job,
+      reviewedState: { state: fixture.sourceState },
+      candidate: { ref: 'candidate-2' },
+      recovered: false
+    }
+    const recoverJob = vi.fn(async () => recovery)
+    const resumeReadyCandidate = vi.fn(async () => ({ goon: committedGoon }))
+    recipeServiceMocks.workflowClient = { recoverJob, resumeReadyCandidate }
+    recipeServiceMocks.loadGoons.mockResolvedValue([committedGoon])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: readyGoon,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials)
+    })
+
+    await waitFor(() => expect(screen.getByText('Appearance Update Ready')).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Finish Update' }))
+    await waitFor(() => expect(resumeReadyCandidate).toHaveBeenCalledOnce())
+    expect(recoverJob).toHaveBeenCalledWith(pendingJob.jobId)
+    expect(recipeServiceMocks.loadGoons).toHaveBeenCalled()
   })
 
   it('shows the real Recipe preparation failure instead of an unexplained empty action state', () => {
@@ -283,6 +381,7 @@ describe('Recipe R5 Settings components', () => {
       failureStage: 'preview-load',
       failureReason: 'The verified candidate could not load in the preview engine.',
       retryable: true,
+      onResume: vi.fn(),
       onRetry,
       onDiscard
     })

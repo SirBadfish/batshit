@@ -41,7 +41,15 @@
   import type { FacialArtworkStateV4 } from '$lib/goons/facialArtwork'
   import type { EyeAppearanceStateV3 } from '$lib/goons/eyeAppearance'
   import type { OralAppearanceStateV1 } from '$lib/goons/oralAppearance'
-  import type { LipArtworkStateV2 } from '$lib/goons/lipArtwork'
+  import type {
+    LipArtworkPresenceStateV1,
+    LipArtworkStateV2
+  } from '$lib/goons/lipArtwork'
+  import type {
+    NailSurfacePresenceStateV1,
+    NailSurfaceStateV1
+  } from '$lib/goons/nailSurface'
+  import type { SkinAppearanceStateV2 } from '$lib/goons/skinAppearance'
   import {
     cleanupCustomGoonPackageUpload,
     loadGoons,
@@ -83,6 +91,10 @@
     eyeAppearance: EyeAppearanceStateV3 | null
     oralAppearance: OralAppearanceStateV1 | null
     lipArtwork: LipArtworkStateV2 | null
+    lipArtworkPresence: LipArtworkPresenceStateV1 | null
+    nailSurface: NailSurfaceStateV1 | null
+    nailSurfacePresence: NailSurfacePresenceStateV1 | null
+    skinAppearance: SkinAppearanceStateV2 | null
     onSaveEditorDraft: () => Promise<boolean>
     onDiscardEditorDraft: () => void | Promise<void>
     onRecipeGoonChanged?: (goon: GoonRecord) => void | Promise<void>
@@ -103,6 +115,10 @@
     eyeAppearance,
     oralAppearance,
     lipArtwork,
+    lipArtworkPresence,
+    nailSurface,
+    nailSurfacePresence,
+    skinAppearance,
     onSaveEditorDraft,
     onDiscardEditorDraft,
     onRecipeGoonChanged,
@@ -131,7 +147,7 @@
   let workflowProgress = $state<RecipeWorkflowProgress | null>(null)
   let lifecycleBusy = $state<RecipeLifecycleBusyAction>(null)
   let reviewBusy = $state<'updating' | 'keeping' | 'resetting' | null>(null)
-  let jobBusy = $state<'retrying' | 'discarding' | 'canceling' | null>(null)
+  let jobBusy = $state<'resuming' | 'retrying' | 'discarding' | 'canceling' | null>(null)
   let dirtyGuardOpen = $state(false)
   let dirtyGuardBusy = $state<'saving' | 'discarding' | null>(null)
   let cleanResetOpen = $state(false)
@@ -162,6 +178,10 @@
     eyeAppearance,
     oralAppearance,
     lipArtwork,
+    lipArtworkPresence,
+    nailSurface,
+    nailSurfacePresence,
+    skinAppearance,
     sourceModel: owner?.authoringRevision?.source?.model?.ref ?? goon.customAvatar?.model?.url ?? null,
     sourceManifest: owner?.authoringRevision?.source?.manifest?.ref ?? goon.customAvatar?.manifest?.url ?? null,
     anatomyFitReady: goon.customAvatar?.manifestSummary?.anatomyFitReady ?? false
@@ -216,7 +236,12 @@
       facialArtwork: facialArtwork ? cloneJson(facialArtwork) : null,
       eyeAppearance: eyeAppearance ? cloneJson(eyeAppearance) : null,
       oralAppearance: oralAppearance ? cloneJson(oralAppearance) : null,
-      lipArtwork: lipArtwork ? cloneJson(lipArtwork) : null
+      lipArtwork: lipArtwork ? cloneJson(lipArtwork) : null,
+      lipArtworkPresence: lipArtworkPresence ? cloneJson(lipArtworkPresence) : null,
+      nailSurface: nailSurface ? cloneJson(nailSurface) : null,
+      nailSurfacePresence: nailSurfacePresence ? cloneJson(nailSurfacePresence) : null,
+      skinAppearance: skinAppearance ? cloneJson(skinAppearance) : null,
+      skinMaterialArtwork: null
     }
   }
 
@@ -1056,6 +1081,16 @@
     }
   }
 
+  async function resumeReadyJob() {
+    if (!jobView || jobView.job.status !== 'ready') return
+    jobBusy = 'resuming'
+    try {
+      await resumeReadyBuild(await client.recoverJob(jobView.job.jobId))
+    } finally {
+      jobBusy = null
+    }
+  }
+
   async function discardJob() {
     if (!jobView) return
     jobBusy = 'discarding'
@@ -1155,6 +1190,7 @@
           failureStage: jobView?.job.failure?.stage ?? owner?.lastFailure?.stage ?? null,
           failureReason: jobView?.job.failure?.reason ?? owner?.lastFailure?.reason ?? null,
           retryable: displayedJobStatus === 'failed' || displayedJobStatus === 'interrupted',
+          resumable: displayedJobStatus === 'ready' && !buildAbortController,
           cancelable: Boolean(buildAbortController),
           busyAction: jobBusy
         }
@@ -1194,6 +1230,7 @@
         void updatePreviewControl(id, control.neutralValue).then(commitPreviewControl)
       }
     },
+    onResumeReadyJob: resumeReadyJob,
     onRetryJob: retryJob,
     onDiscardJob: discardJob,
     onCancelBuild: cancelBuild,

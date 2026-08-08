@@ -60,6 +60,9 @@
   import FacialArtworkEditor from '$lib/components/goons/FacialArtworkEditor.svelte'
   import OralAppearanceEditor from '$lib/components/goons/OralAppearanceEditor.svelte'
   import LipArtworkEditor from '$lib/components/goons/LipArtworkEditor.svelte'
+  import NailSurfaceEditor from '$lib/components/goons/NailSurfaceEditor.svelte'
+  import SkinAppearanceEditor from '$lib/components/goons/SkinAppearanceEditor.svelte'
+  import SkinSurfaceEditor from '$lib/components/goons/SkinSurfaceEditor.svelte'
   import UniversalFaceControlsEditor from '$lib/components/goons/UniversalFaceControlsEditor.svelte'
   import EyeContactTuningEditor from '$lib/components/goons/EyeContactTuningEditor.svelte'
   import SocketEyeContactEditor from '$lib/components/goons/SocketEyeContactEditor.svelte'
@@ -167,13 +170,46 @@
     type OralAppearanceStateV1
   } from '$lib/goons/oralAppearance'
   import {
+    createLipArtworkPresenceState,
     parseLipArtworkDefinition,
+    parseLipArtworkPresenceState,
     parseLipArtworkState,
     reconcileLipArtworkState,
     type LipArtworkDefinitionV2,
+    type LipArtworkPresenceStateV1,
     type LipArtworkStateV2,
     type LipArtworkUpload
   } from '$lib/goons/lipArtwork'
+  import {
+    countChangedNailSurfaceControls,
+    createDefaultNailSurfaceState,
+    createNailSurfacePresenceState,
+    parseNailSurfaceDefinition,
+    parseNailSurfacePresenceState,
+    parseNailSurfaceState,
+    reconcileNailSurfaceState,
+    type NailArtworkUploadV1,
+    type NailFamily,
+    type NailSurfaceDefinitionV1,
+    type NailSurfacePresenceStateV1,
+    type NailSurfaceStateV1
+  } from '$lib/goons/nailSurface'
+  import {
+    countChangedSkinAppearanceControls,
+    createDefaultSkinAppearanceState,
+    parseSkinAppearanceDefinition,
+    parseSkinAppearanceState,
+    reconcileSkinAppearanceState,
+    updateSkinAppearanceRegion,
+    type SkinAppearanceDefinitionV1,
+    type SkinAppearanceRegionId,
+    type SkinAppearanceStateV2
+  } from '$lib/goons/skinAppearance'
+  import {
+    collectSkinSurfaceUploads,
+    type SkinSurfaceMapRole,
+    type SkinSurfaceUploadV1
+  } from '$lib/goons/skinSurface'
   import {
     hasRenderableGoonAvatar,
     loadAvatarIntoEngine,
@@ -353,6 +389,10 @@
     deleteGoonFacialArtwork,
     uploadGoonLipArtwork,
     deleteGoonLipArtwork,
+    uploadGoonNailArtwork,
+    deleteGoonNailArtwork,
+    uploadGoonSkinSurfaceArtwork,
+    deleteGoonSkinSurfaceArtwork,
     uploadGuidedDufClothesVrm
   } from '$lib/services/goons'
   import type { AdvancedGoonPackageUploadResult } from '$lib/services/goons'
@@ -10225,7 +10265,7 @@
     editorDirty = true
   }
 
-  // ---------------- package-bound facial artwork, eye appearance, and oral appearance (SA-090)
+  // ---------------- package-bound appearance surfaces (SA-090)
   let editorFacialArtworkDefinition = $state<FacialArtworkDefinitionV4 | null>(null)
   let editorFacialArtworkState = $state<FacialArtworkStateV4 | null>(null)
   let editorEyeAppearanceDefinition = $state<EyeAppearanceDefinitionV3 | null>(null)
@@ -10234,6 +10274,12 @@
   let editorOralAppearanceState = $state<OralAppearanceStateV1 | null>(null)
   let editorLipArtworkDefinition = $state<LipArtworkDefinitionV2 | null>(null)
   let editorLipArtworkState = $state<LipArtworkStateV2 | null>(null)
+  let editorLipArtworkPresence = $state<LipArtworkPresenceStateV1 | null>(null)
+  let editorNailSurfaceDefinition = $state<NailSurfaceDefinitionV1 | null>(null)
+  let editorNailSurfaceState = $state<NailSurfaceStateV1 | null>(null)
+  let editorNailSurfacePresence = $state<NailSurfacePresenceStateV1 | null>(null)
+  let editorSkinAppearanceDefinition = $state<SkinAppearanceDefinitionV1 | null>(null)
+  let editorSkinAppearanceState = $state<SkinAppearanceStateV2 | null>(null)
   let editorFacialArtworkHydrated = $state(false)
   let editorFacialArtworkError = $state('')
   let editorFacialArtworkPackageNotice = $state('')
@@ -10241,16 +10287,28 @@
   let editorEyeAppearanceNotice = $state('')
   let editorOralAppearanceNotice = $state('')
   let editorLipArtworkNotice = $state('')
+  let editorNailSurfaceNotice = $state('')
+  let editorNailSurfaceError = $state('')
+  let editorSkinAppearanceNotice = $state('')
+  let editorSkinAppearanceError = $state('')
   let editorFacialArtworkPreviewError = $state('')
+  let editorNailSurfacePreviewError = $state('')
+  let editorSkinAppearancePreviewError = $state('')
   let editorFacialArtworkLoadToken = 0
   let editorFacialArtworkPreviewToken = 0
+  let editorNailSurfacePreviewToken = 0
+  let editorSkinAppearancePreviewToken = 0
   let editorFacialArtworkPreviewTimer: ReturnType<typeof setTimeout> | null = null
+  let editorNailSurfacePreviewTimer: ReturnType<typeof setTimeout> | null = null
+  let editorSkinAppearancePreviewTimer: ReturnType<typeof setTimeout> | null = null
   // Deliberately non-reactive ownership bookkeeping. Draft bytes become saved
   // only after the Goon PUT succeeds.
   let editorFacialArtworkHydrationKey = ''
   let editorFacialArtworkStoredSignature = ''
   const editorFacialArtworkDraftUploads = new Map<string, FacialArtworkUpload>()
   const editorLipArtworkDraftUploads = new Map<string, LipArtworkUpload>()
+  const editorNailArtworkDraftUploads = new Map<string, NailArtworkUploadV1>()
+  const editorSkinSurfaceDraftUploads = new Map<string, SkinSurfaceUploadV1>()
 
   function applyStoredFacialArtworkDraft(
     definition: FacialArtworkDefinitionV4,
@@ -10303,6 +10361,67 @@
       : ''
   }
 
+  function applyStoredLipArtworkPresence(
+    definition: LipArtworkDefinitionV2,
+    stored: LipArtworkPresenceStateV1 | null | undefined
+  ) {
+    try {
+      editorLipArtworkPresence = stored
+        ? parseLipArtworkPresenceState(definition, stored)
+        : null
+    } catch {
+      editorLipArtworkPresence = null
+      editorLipArtworkNotice = 'Saved Lip Artwork visibility did not match this package and was reset to on.'
+    }
+  }
+
+  function applyStoredNailSurfaceDraft(
+    definition: NailSurfaceDefinitionV1,
+    stored: NailSurfaceStateV1 | null | undefined
+  ) {
+    const reconciliation = reconcileNailSurfaceState(definition, stored)
+    editorNailSurfaceState = reconciliation.state
+      ? structuredClone(reconciliation.state)
+      : createDefaultNailSurfaceState(definition)
+    editorNailSurfaceNotice = reconciliation.incompatible
+      ? 'Saved Nail Surface controls did not match this package definition and were reset to package defaults.'
+      : ''
+    editorNailSurfacePreviewError = ''
+  }
+
+  function applyStoredNailSurfacePresence(
+    definition: NailSurfaceDefinitionV1,
+    stored: NailSurfacePresenceStateV1 | null | undefined
+  ) {
+    try {
+      editorNailSurfacePresence = stored
+        ? parseNailSurfacePresenceState(definition, stored)
+        : null
+    } catch {
+      editorNailSurfacePresence = null
+      editorNailSurfaceNotice = 'Saved Nail Surface visibility did not match this package and was reset to on.'
+    }
+  }
+
+  function applyStoredSkinAppearanceDraft(
+    definition: SkinAppearanceDefinitionV1,
+    stored: unknown,
+    legacyMaterialArtwork: unknown = null
+  ) {
+    const reconciliation = reconcileSkinAppearanceState(
+      definition,
+      stored,
+      legacyMaterialArtwork
+    )
+    editorSkinAppearanceState = reconciliation.state
+      ? structuredClone(reconciliation.state)
+      : createDefaultSkinAppearanceState(definition)
+    editorSkinAppearanceNotice = reconciliation.incompatible
+      ? `Saved Skin Appearance could not be migrated and was reset to package defaults. ${reconciliation.reason ?? ''}`.trim()
+      : ''
+    editorSkinAppearancePreviewError = ''
+  }
+
   function restorePackageOwnedEditorDrafts(goon: GoonRecord) {
     if (editorAppearanceDialsManifest) {
       const storedDials = goon.appearanceDials ?? null
@@ -10318,7 +10437,10 @@
         storedArtwork: goon.facialArtwork ?? null,
         storedEyeAppearance: goon.eyeAppearance ?? null,
         storedOralAppearance: goon.oralAppearance ?? null,
-        storedLipArtwork: goon.lipArtwork ?? null
+        storedLipArtwork: goon.lipArtwork ?? null,
+        storedNailSurface: goon.nailSurface ?? null,
+        storedSkinAppearance: goon.skinAppearance ?? null,
+        storedSkinMaterialArtwork: goon.skinMaterialArtwork ?? null
       })
       applyStoredFacialArtworkDraft(
         editorFacialArtworkDefinition,
@@ -10342,11 +10464,31 @@
     if (editorLipArtworkDefinition) {
       applyStoredLipArtworkDraft(editorLipArtworkDefinition, goon.lipArtwork ?? null)
     }
+    if (editorNailSurfaceDefinition) {
+      applyStoredNailSurfaceDraft(editorNailSurfaceDefinition, goon.nailSurface ?? null)
+    }
+    if (editorSkinAppearanceDefinition) {
+      applyStoredSkinAppearanceDraft(
+        editorSkinAppearanceDefinition,
+        goon.skinAppearance ?? null,
+        goon.skinMaterialArtwork ?? null
+      )
+    }
   }
 
   function clearFacialArtworkPreviewTimer() {
     if (editorFacialArtworkPreviewTimer) clearTimeout(editorFacialArtworkPreviewTimer)
     editorFacialArtworkPreviewTimer = null
+  }
+
+  function clearNailSurfacePreviewTimer() {
+    if (editorNailSurfacePreviewTimer) clearTimeout(editorNailSurfacePreviewTimer)
+    editorNailSurfacePreviewTimer = null
+  }
+
+  function clearSkinAppearancePreviewTimer() {
+    if (editorSkinAppearancePreviewTimer) clearTimeout(editorSkinAppearancePreviewTimer)
+    editorSkinAppearancePreviewTimer = null
   }
 
   function resolveFacialArtworkDraftForSave(): FacialArtworkStateV4 | null {
@@ -10386,6 +10528,40 @@
     return parseLipArtworkState(editorLipArtworkDefinition, editorLipArtworkState)
   }
 
+  function resolveLipArtworkPresenceDraftForSave(): LipArtworkPresenceStateV1 | null {
+    if (!editorLipArtworkDefinition || !editorLipArtworkPresence) return null
+    return parseLipArtworkPresenceState(
+      editorLipArtworkDefinition,
+      editorLipArtworkPresence
+    )
+  }
+
+  function resolveNailSurfaceDraftForSave(): NailSurfaceStateV1 | null {
+    if (!editorNailSurfaceDefinition || !editorNailSurfaceState) return null
+    const parsed = parseNailSurfaceState(editorNailSurfaceDefinition, editorNailSurfaceState)
+    const defaults = createDefaultNailSurfaceState(editorNailSurfaceDefinition)
+    return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
+  }
+
+  function resolveNailSurfacePresenceDraftForSave(): NailSurfacePresenceStateV1 | null {
+    if (!editorNailSurfaceDefinition || !editorNailSurfacePresence) return null
+    return parseNailSurfacePresenceState(
+      editorNailSurfaceDefinition,
+      editorNailSurfacePresence
+    )
+  }
+
+  function resolveSkinAppearanceDraftForSave(): SkinAppearanceStateV2 | null {
+    if (!editorSkinAppearanceDefinition || !editorSkinAppearanceState) return null
+    const parsed = parseSkinAppearanceState(
+      editorSkinAppearanceDefinition,
+      editorSkinAppearanceState
+    )
+    return countChangedSkinAppearanceControls(editorSkinAppearanceDefinition, parsed) === 0
+      ? null
+      : parsed
+  }
+
   async function deleteFacialArtworkDraft(upload: FacialArtworkUpload) {
     if (!editorGoonId) return
     await deleteGoonFacialArtwork(editorGoonId, upload.filename)
@@ -10408,8 +10584,12 @@
     const goonId = editorGoonId
     const drafts = [...editorFacialArtworkDraftUploads.values()]
     const lipDrafts = [...editorLipArtworkDraftUploads.values()]
+    const nailDrafts = [...editorNailArtworkDraftUploads.values()]
+    const skinSurfaceDrafts = [...editorSkinSurfaceDraftUploads.values()]
     editorFacialArtworkDraftUploads.clear()
     editorLipArtworkDraftUploads.clear()
+    editorNailArtworkDraftUploads.clear()
+    editorSkinSurfaceDraftUploads.clear()
     if (!goonId) return
     for (const upload of drafts) {
       try {
@@ -10423,6 +10603,20 @@
         await deleteGoonLipArtwork(goonId, upload.filename)
       } catch (error) {
         console.warn('[GoonsSettings] Failed to delete discarded Lip Artwork draft:', error)
+      }
+    }
+    for (const upload of nailDrafts) {
+      try {
+        await deleteGoonNailArtwork(goonId, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Failed to delete discarded Nail Artwork draft:', error)
+      }
+    }
+    for (const upload of skinSurfaceDrafts) {
+      try {
+        await deleteGoonSkinSurfaceArtwork(goonId, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Failed to delete discarded Skin Surface draft:', error)
       }
     }
   }
@@ -10471,6 +10665,61 @@
     }
   }
 
+  async function reconcileNailArtworkUploadsAfterSave(
+    previous: NailSurfaceStateV1 | null | undefined,
+    saved: NailSurfaceStateV1 | null | undefined
+  ) {
+    const retained = new Set(
+      (['fingers', 'toes'] as const)
+        .map((family) => saved?.appearance[family].artwork?.filename)
+        .filter((filename): filename is string => Boolean(filename))
+    )
+    const candidates = new Map<string, NailArtworkUploadV1>()
+    for (const family of ['fingers', 'toes'] as const) {
+      const upload = previous?.appearance[family].artwork
+      if (upload) candidates.set(upload.filename, upload)
+    }
+    for (const upload of editorNailArtworkDraftUploads.values()) {
+      candidates.set(upload.filename, upload)
+    }
+    editorNailArtworkDraftUploads.clear()
+    for (const upload of candidates.values()) {
+      if (retained.has(upload.filename)) continue
+      try {
+        await deleteGoonNailArtwork(editorGoonId!, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Saved Nail Surface, but an unused upload remains:', error)
+        toast.warning('Nail Surface saved, but an unused PNG could not be cleaned up.')
+      }
+    }
+  }
+
+  async function reconcileSkinSurfaceUploadsAfterSave(
+    previous: SkinAppearanceStateV2 | null | undefined,
+    saved: SkinAppearanceStateV2 | null | undefined
+  ) {
+    const retained = new Set(
+      collectSkinSurfaceUploads(saved).map((upload) => upload.filename)
+    )
+    const candidates = new Map<string, SkinSurfaceUploadV1>()
+    for (const upload of collectSkinSurfaceUploads(previous)) {
+      candidates.set(upload.filename, upload)
+    }
+    for (const upload of editorSkinSurfaceDraftUploads.values()) {
+      candidates.set(upload.filename, upload)
+    }
+    editorSkinSurfaceDraftUploads.clear()
+    for (const upload of candidates.values()) {
+      if (retained.has(upload.filename)) continue
+      try {
+        await deleteGoonSkinSurfaceArtwork(editorGoonId!, upload.filename)
+      } catch (error) {
+        console.warn('[GoonsSettings] Saved Skin Surface, but an unused upload remains:', error)
+        toast.warning('Skin Surface saved, but an unused PNG could not be cleaned up.')
+      }
+    }
+  }
+
   async function uploadEditorFacialArtwork(
     roleId: FacialArtworkRoleId,
     file: File,
@@ -10509,6 +10758,40 @@
       provenance
     })
     editorLipArtworkDraftUploads.set(upload.filename, upload)
+    return upload
+  }
+
+  async function uploadEditorNailArtwork(
+    family: NailFamily,
+    file: File,
+    provenance: FacialArtworkProvenance
+  ) {
+    if (!editorGoonId || !editorNailSurfaceDefinition) {
+      throw new Error('Nail Artwork is not ready for this Goon.')
+    }
+    const upload = await uploadGoonNailArtwork(editorGoonId, file, {
+      family,
+      definitionSha256: editorNailSurfaceDefinition.definitionSha256,
+      provenance
+    })
+    editorNailArtworkDraftUploads.set(upload.filename, upload)
+    return upload
+  }
+
+  async function uploadEditorSkinSurfaceArtwork(
+    map: SkinSurfaceMapRole,
+    file: File,
+    provenance: FacialArtworkProvenance
+  ) {
+    if (!editorGoonId || !editorSkinAppearanceDefinition) {
+      throw new Error('Skin Surface Artwork is not ready for this Goon.')
+    }
+    const upload = await uploadGoonSkinSurfaceArtwork(editorGoonId, file, {
+      map,
+      definitionSha256: editorSkinAppearanceDefinition.definitionSha256,
+      provenance
+    })
+    editorSkinSurfaceDraftUploads.set(upload.filename, upload)
     return upload
   }
 
@@ -10566,12 +10849,139 @@
     }
   }
 
+  function updateEditorLipArtworkPresence(enabled: boolean) {
+    if (!editorLipArtworkDefinition) return
+    const next = enabled
+      ? null
+      : createLipArtworkPresenceState(editorLipArtworkDefinition, false)
+    if (JSON.stringify(editorLipArtworkPresence) === JSON.stringify(next)) return
+    editorLipArtworkPresence = next
+    editorLipArtworkNotice = ''
+    editorFacialArtworkPreviewError = ''
+    editorDirty = true
+  }
+
+  function updateEditorNailSurface(state: NailSurfaceStateV1) {
+    if (!editorNailSurfaceDefinition) return
+    const parsed = parseNailSurfaceState(editorNailSurfaceDefinition, state)
+    if (JSON.stringify(editorNailSurfaceState) === JSON.stringify(parsed)) return
+    const detached = new Map<string, NailArtworkUploadV1>()
+    for (const family of ['fingers', 'toes'] as const) {
+      const upload = editorNailSurfaceState?.appearance[family].artwork
+      if (upload && upload.filename !== parsed.appearance[family].artwork?.filename) {
+        detached.set(upload.filename, upload)
+      }
+    }
+    editorNailSurfaceState = parsed
+    editorNailSurfaceNotice = ''
+    editorNailSurfacePreviewError = ''
+    editorDirty = true
+    for (const upload of detached.values()) {
+      const draft = editorNailArtworkDraftUploads.get(upload.filename)
+      if (draft && editorGoonId) {
+        void deleteGoonNailArtwork(editorGoonId, draft.filename)
+          .then(() => editorNailArtworkDraftUploads.delete(draft.filename))
+          .catch((error) =>
+            console.warn('[GoonsSettings] Failed to delete detached Nail Artwork draft:', error)
+          )
+      }
+    }
+  }
+
+  function updateEditorNailSurfacePresence(enabled: boolean) {
+    if (!editorNailSurfaceDefinition) return
+    const next = enabled
+      ? null
+      : createNailSurfacePresenceState(editorNailSurfaceDefinition, false)
+    if (JSON.stringify(editorNailSurfacePresence) === JSON.stringify(next)) return
+    editorNailSurfacePresence = next
+    editorNailSurfaceNotice = ''
+    editorNailSurfacePreviewError = ''
+    editorDirty = true
+  }
+
+  function updateEditorSkinAppearance(state: SkinAppearanceStateV2) {
+    if (!editorSkinAppearanceDefinition) return
+    const parsed = parseSkinAppearanceState(editorSkinAppearanceDefinition, state)
+    if (JSON.stringify(editorSkinAppearanceState) === JSON.stringify(parsed)) return
+    const retained = new Set(
+      collectSkinSurfaceUploads(parsed).map((upload) => upload.filename)
+    )
+    const detached = collectSkinSurfaceUploads(editorSkinAppearanceState).filter(
+      (upload) => !retained.has(upload.filename)
+    )
+    editorSkinAppearanceState = parsed
+    editorSkinAppearanceNotice = ''
+    editorSkinAppearancePreviewError = ''
+    editorDirty = true
+    for (const upload of detached) {
+      const draft = editorSkinSurfaceDraftUploads.get(upload.filename)
+      if (draft && editorGoonId) {
+        void deleteGoonSkinSurfaceArtwork(editorGoonId, draft.filename)
+          .then(() => editorSkinSurfaceDraftUploads.delete(draft.filename))
+          .catch((error) =>
+            console.warn(
+              '[GoonsSettings] Failed to delete detached Skin Surface draft:',
+              error
+            )
+          )
+      }
+    }
+  }
+
+  function skinAppearanceControlForAppearanceRegion(
+    regionId: string
+  ): SkinAppearanceRegionId | null {
+    if (regionId === 'body.chest') return 'nipplesAreolae'
+    if (regionId === 'body.hands-feet') return 'palmsSoles'
+    if (regionId === 'face.cheeks') return 'cheekBlush'
+    return null
+  }
+
+  function resetEditorSkinAppearanceRegion(regionId: string) {
+    if (!editorSkinAppearanceDefinition || !editorSkinAppearanceState) return
+    if (regionId === 'body.skin') {
+      const defaults = createDefaultSkinAppearanceState(editorSkinAppearanceDefinition)
+      updateEditorSkinAppearance({
+        ...editorSkinAppearanceState,
+        surface: structuredClone(defaults.surface)
+      })
+      return
+    }
+    const controlId = skinAppearanceControlForAppearanceRegion(regionId)
+    if (!controlId) return
+    const defaultRegion =
+      createDefaultSkinAppearanceState(editorSkinAppearanceDefinition).regions[controlId]
+    updateEditorSkinAppearance(
+      updateSkinAppearanceRegion(
+        editorSkinAppearanceDefinition,
+        editorSkinAppearanceState,
+        controlId,
+        structuredClone(defaultRegion)
+      )
+    )
+  }
+
   function resetEditorOralAppearance(regionId: string) {
-    if (regionId !== 'face.mouth-lips') return
-    if (editorOralAppearanceDefinition) {
+    if (regionId === 'face.cheeks') {
+      resetEditorSkinAppearanceRegion(regionId)
+      return
+    }
+    if (regionId === 'face.mouth-lips' && editorOralAppearanceDefinition) {
       updateEditorOralAppearance(createDefaultOralAppearanceState(editorOralAppearanceDefinition))
     }
-    if (editorLipArtworkDefinition) updateEditorLipArtwork(null)
+    if (regionId === 'face.mouth-lips' && editorLipArtworkDefinition) {
+      updateEditorLipArtwork(null)
+      updateEditorLipArtworkPresence(true)
+    }
+  }
+
+  function resetEditorNailSurface(regionId: string) {
+    if (regionId === 'body.hands-feet' && editorNailSurfaceDefinition) {
+      updateEditorNailSurface(createDefaultNailSurfaceState(editorNailSurfaceDefinition))
+      updateEditorNailSurfacePresence(true)
+    }
+    resetEditorSkinAppearanceRegion(regionId)
   }
 
   const editorOralAppearanceChangedCount = $derived.by(() => {
@@ -10581,6 +10991,35 @@
       editorOralAppearanceState
     )
   })
+
+  const editorNailSurfaceChangedCount = $derived.by(() => {
+    if (!editorNailSurfaceDefinition || !editorNailSurfaceState) return 0
+    return countChangedNailSurfaceControls(
+      editorNailSurfaceDefinition,
+      editorNailSurfaceState
+    ) + (editorNailSurfacePresence ? 1 : 0)
+  })
+
+  function editorSkinAppearanceChangedCount(regionId: string) {
+    if (!editorSkinAppearanceState) return 0
+    if (regionId === 'body.skin' && editorSkinAppearanceDefinition) {
+      const defaults = createDefaultSkinAppearanceState(editorSkinAppearanceDefinition)
+      return Object.keys(editorSkinAppearanceState.surface).filter((role) =>
+        JSON.stringify(
+          editorSkinAppearanceState!.surface[
+            role as keyof SkinAppearanceStateV2['surface']
+          ]
+        ) !==
+        JSON.stringify(
+          defaults.surface[role as keyof SkinAppearanceStateV2['surface']]
+        )
+      ).length
+    }
+    const controlId = skinAppearanceControlForAppearanceRegion(regionId)
+    return controlId && editorSkinAppearanceState.regions[controlId].mode !== 'inherit'
+      ? 1
+      : 0
+  }
 
   const editorAppearanceRegionContentSearchText = $derived.by(() => {
     const artworkControls = [
@@ -10613,7 +11052,12 @@
         artworkControls,
         eyeControls ?? ''
       ].join(' '),
-      'face.mouth-lips': `Oral Appearance Lip Artwork upload PNG template lip color opacity teeth gums tongue ${oralControls ?? ''}`
+      'face.mouth-lips': `Oral Appearance Lip Artwork upload PNG template lip color opacity teeth gums tongue ${oralControls ?? ''}`,
+      'face.cheeks': 'Cheek Blush color package inherit off true off custom skin appearance',
+      'body.skin': 'Base Color Artwork tint albedo Normal Map strength Roughness Metallic metal cyborg UV texture upload PNG package custom none skin appearance',
+      'body.chest': 'Nipples Areolae color package inherit custom skin appearance',
+      'body.hands-feet':
+        'Palms Soles skin color package inherit custom Nails Fingernails Toenails length width narrow fantasy claw shape round soft square almond pointed arch left right straight toe free edge color finish natural matte glossy artwork PNG template cuticle growth tip'
     }
   })
 
@@ -10626,12 +11070,22 @@
     const storedEyeAppearance = isCustom ? goon?.eyeAppearance ?? null : null
     const storedOralAppearance = isCustom ? goon?.oralAppearance ?? null : null
     const storedLipArtwork = isCustom ? goon?.lipArtwork ?? null : null
+    const storedLipArtworkPresence = isCustom ? goon?.lipArtworkPresence ?? null : null
+    const storedNailSurface = isCustom ? goon?.nailSurface ?? null : null
+    const storedNailSurfacePresence = isCustom ? goon?.nailSurfacePresence ?? null : null
+    const storedSkinAppearance = isCustom ? goon?.skinAppearance ?? null : null
+    const storedSkinMaterialArtwork = isCustom ? goon?.skinMaterialArtwork ?? null : null
     const storedSocketEyeContact = isCustom ? goon?.defaults?.socketEyeContact ?? null : null
     const storedSignature = JSON.stringify({
       storedArtwork,
       storedEyeAppearance,
       storedOralAppearance,
       storedLipArtwork,
+      storedLipArtworkPresence,
+      storedNailSurface,
+      storedNailSurfacePresence,
+      storedSkinAppearance,
+      storedSkinMaterialArtwork,
       storedSocketEyeContact
     })
 
@@ -10648,6 +11102,12 @@
       editorOralAppearanceState = null
       editorLipArtworkDefinition = null
       editorLipArtworkState = null
+      editorLipArtworkPresence = null
+      editorNailSurfaceDefinition = null
+      editorNailSurfaceState = null
+      editorNailSurfacePresence = null
+      editorSkinAppearanceDefinition = null
+      editorSkinAppearanceState = null
       editorFacialArtworkHydrated = false
       editorFacialArtworkError = ''
       editorFacialArtworkPackageNotice = ''
@@ -10655,7 +11115,13 @@
       editorEyeAppearanceNotice = ''
       editorOralAppearanceNotice = ''
       editorLipArtworkNotice = ''
+      editorNailSurfaceNotice = ''
+      editorNailSurfaceError = ''
+      editorSkinAppearanceNotice = ''
+      editorSkinAppearanceError = ''
       editorFacialArtworkPreviewError = ''
+      editorNailSurfacePreviewError = ''
+      editorSkinAppearancePreviewError = ''
       return
     }
 
@@ -10672,6 +11138,18 @@
       }
       if (editorLipArtworkDefinition) {
         applyStoredLipArtworkDraft(editorLipArtworkDefinition, storedLipArtwork)
+        applyStoredLipArtworkPresence(editorLipArtworkDefinition, storedLipArtworkPresence)
+      }
+      if (editorNailSurfaceDefinition) {
+        applyStoredNailSurfaceDraft(editorNailSurfaceDefinition, storedNailSurface)
+        applyStoredNailSurfacePresence(editorNailSurfaceDefinition, storedNailSurfacePresence)
+      }
+      if (editorSkinAppearanceDefinition) {
+        applyStoredSkinAppearanceDraft(
+          editorSkinAppearanceDefinition,
+          storedSkinAppearance,
+          storedSkinMaterialArtwork
+        )
       }
       return
     }
@@ -10688,6 +11166,12 @@
     editorOralAppearanceState = null
     editorLipArtworkDefinition = null
     editorLipArtworkState = null
+    editorLipArtworkPresence = null
+    editorNailSurfaceDefinition = null
+    editorNailSurfaceState = null
+    editorNailSurfacePresence = null
+    editorSkinAppearanceDefinition = null
+    editorSkinAppearanceState = null
     editorFacialArtworkHydrated = false
     editorFacialArtworkError = ''
     editorFacialArtworkPackageNotice = ''
@@ -10695,11 +11179,40 @@
     editorEyeAppearanceNotice = ''
     editorOralAppearanceNotice = ''
     editorLipArtworkNotice = ''
+    editorNailSurfaceNotice = ''
+    editorNailSurfaceError = ''
+    editorSkinAppearanceNotice = ''
+    editorSkinAppearanceError = ''
     editorFacialArtworkPreviewError = ''
+    editorNailSurfacePreviewError = ''
+    editorSkinAppearancePreviewError = ''
     void (async () => {
       try {
         const manifest = await loadCustomAvatarManifest(manifestRef)
         if (token !== editorFacialArtworkLoadToken) return
+        if (manifest.nailSurface !== undefined) {
+          try {
+            const nailDefinition = parseNailSurfaceDefinition(manifest.nailSurface)
+            editorNailSurfaceDefinition = nailDefinition
+            applyStoredNailSurfaceDraft(nailDefinition, storedNailSurface)
+            applyStoredNailSurfacePresence(nailDefinition, storedNailSurfacePresence)
+          } catch (error) {
+            editorNailSurfaceError = error instanceof Error ? error.message : String(error)
+          }
+        }
+        if (manifest.skinAppearance !== undefined) {
+          try {
+            const skinDefinition = parseSkinAppearanceDefinition(manifest.skinAppearance)
+            editorSkinAppearanceDefinition = skinDefinition
+            applyStoredSkinAppearanceDraft(
+              skinDefinition,
+              storedSkinAppearance,
+              storedSkinMaterialArtwork
+            )
+          } catch (error) {
+            editorSkinAppearanceError = error instanceof Error ? error.message : String(error)
+          }
+        }
         const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
         editorHasSocketEyeContact = Boolean(socketEyePackage)
         const capability = classifyFacialArtworkPackageCapability(manifest)
@@ -10738,6 +11251,7 @@
         }
         if (lipDefinition) {
           applyStoredLipArtworkDraft(lipDefinition, storedLipArtwork)
+          applyStoredLipArtworkPresence(lipDefinition, storedLipArtworkPresence)
         }
         editorFacialArtworkHydrated = true
       } catch (error) {
@@ -10764,6 +11278,7 @@
       const eyeState = recipePreview.goon.eyeAppearance
       const oralState = recipePreview.goon.oralAppearance
       const lipState = recipePreview.goon.lipArtwork
+      const lipArtworkEnabled = recipePreview.goon.lipArtworkPresence?.enabled ?? true
       if (!state || !eyeState) return
       editorFacialArtworkPreviewTimer = setTimeout(() => {
         editorFacialArtworkPreviewTimer = null
@@ -10772,6 +11287,9 @@
             previewEngine!.setEyeAppearanceState(eyeState)
             previewEngine!.setOralAppearanceState(oralState ?? null)
             return previewEngine!.setLipArtworkState(lipState ?? null)
+          })
+          .then(() => {
+            previewEngine!.setLipArtworkEnabled(lipArtworkEnabled)
           })
           .then(() => {
             return previewEngine!.setFacialArtworkState(state)
@@ -10792,6 +11310,7 @@
     const eyeState = editorEyeAppearanceState
     const oralState = editorOralAppearanceState
     const lipState = editorLipArtworkState
+    const lipArtworkEnabled = editorLipArtworkPresence?.enabled ?? true
     editorFacialArtworkPreviewTimer = setTimeout(() => {
       editorFacialArtworkPreviewTimer = null
       void Promise.resolve()
@@ -10799,6 +11318,9 @@
           previewEngine!.setEyeAppearanceState(eyeState)
           if (oralState) previewEngine!.setOralAppearanceState(oralState)
           return previewEngine!.setLipArtworkState(lipState)
+        })
+        .then(() => {
+          previewEngine!.setLipArtworkEnabled(lipArtworkEnabled)
         })
         .then(() => {
           return previewEngine!.setFacialArtworkState(state)
@@ -10809,6 +11331,70 @@
         .catch((error) => {
           if (token !== editorFacialArtworkPreviewToken) return
           editorFacialArtworkPreviewError = error instanceof Error ? error.message : String(error)
+        })
+    }, 90)
+  })
+
+  $effect(() => {
+    const token = ++editorNailSurfacePreviewToken
+    clearNailSurfacePreviewTimer()
+    if (
+      !previewEngine ||
+      !previewReady ||
+      previewLoading ||
+      recipePreviewTransitioning ||
+      previewGoonId !== editorGoonId ||
+      !editorNailSurfaceDefinition
+    ) return
+    const state = recipeEditorPreviewTarget
+      ? recipeEditorPreviewTarget.goon.nailSurface ?? null
+      : editorNailSurfaceState
+    const nailSurfaceEnabled = recipeEditorPreviewTarget
+      ? recipeEditorPreviewTarget.goon.nailSurfacePresence?.enabled ?? true
+      : editorNailSurfacePresence?.enabled ?? true
+    if (!state && !recipeEditorPreviewTarget) return
+    editorNailSurfacePreviewTimer = setTimeout(() => {
+      editorNailSurfacePreviewTimer = null
+      void previewEngine!
+        .setNailSurfaceState(state)
+        .then(() => previewEngine!.setNailSurfaceEnabled(nailSurfaceEnabled))
+        .then(() => {
+          if (token === editorNailSurfacePreviewToken) editorNailSurfacePreviewError = ''
+        })
+        .catch((error) => {
+          if (token !== editorNailSurfacePreviewToken) return
+          editorNailSurfacePreviewError = error instanceof Error ? error.message : String(error)
+        })
+    }, 90)
+  })
+
+  $effect(() => {
+    const token = ++editorSkinAppearancePreviewToken
+    clearSkinAppearancePreviewTimer()
+    if (
+      !previewEngine ||
+      !previewReady ||
+      previewLoading ||
+      recipePreviewTransitioning ||
+      previewGoonId !== editorGoonId ||
+      !editorSkinAppearanceDefinition
+    ) return
+    const state = recipeEditorPreviewTarget
+      ? recipeEditorPreviewTarget.goon.skinAppearance ?? null
+      : resolveSkinAppearanceDraftForSave()
+    editorSkinAppearancePreviewTimer = setTimeout(() => {
+      editorSkinAppearancePreviewTimer = null
+      void previewEngine!
+        .setSkinAppearanceState(state)
+        .then(() => {
+          if (token === editorSkinAppearancePreviewToken) {
+            editorSkinAppearancePreviewError = ''
+          }
+        })
+        .catch((error) => {
+          if (token !== editorSkinAppearancePreviewToken) return
+          editorSkinAppearancePreviewError =
+            error instanceof Error ? error.message : String(error)
         })
     }, 90)
   })
@@ -10827,6 +11413,8 @@
 
   onDestroy(() => {
     clearFacialArtworkPreviewTimer()
+    clearNailSurfacePreviewTimer()
+    clearSkinAppearancePreviewTimer()
   })
 
   function toggleEditorPrimarySection(
@@ -12485,6 +13073,22 @@
         editorFacialArtworkHydrated && editorLipArtworkDefinition
           ? resolveLipArtworkDraftForSave()
           : currentGoon?.lipArtwork ?? null
+      const lipArtworkPresenceForSave =
+        editorFacialArtworkHydrated && editorLipArtworkDefinition
+          ? resolveLipArtworkPresenceDraftForSave()
+          : currentGoon?.lipArtworkPresence ?? null
+      const nailSurfaceForSave =
+        editorNailSurfaceDefinition
+          ? resolveNailSurfaceDraftForSave()
+          : currentGoon?.nailSurface ?? null
+      const nailSurfacePresenceForSave =
+        editorNailSurfaceDefinition
+          ? resolveNailSurfacePresenceDraftForSave()
+          : currentGoon?.nailSurfacePresence ?? null
+      const skinAppearanceForSave =
+        editorSkinAppearanceDefinition
+          ? resolveSkinAppearanceDraftForSave()
+          : currentGoon?.skinAppearance ?? null
       const recipeOwnsAppearance = currentGoon?.recipe?.contract === 'goon-recipe/v2'
       const nextName = editorName.trim() || currentGoon?.name || 'Goon'
       const nextDescription = editorDescription?.trim() ?? ''
@@ -12607,6 +13211,24 @@
         editorFacialArtworkHydrated && editorLipArtworkDefinition
       ) {
         updates.lipArtwork = lipArtworkForSave
+        updates.lipArtworkPresence = lipArtworkPresenceForSave
+      }
+      if (
+        !recipeOwnsAppearance &&
+        editorGoonKind === 'custom' &&
+        editorNailSurfaceDefinition
+      ) {
+        updates.nailSurface = nailSurfaceForSave
+        updates.nailSurfacePresence = nailSurfacePresenceForSave
+      }
+      if (
+        !recipeOwnsAppearance &&
+        editorGoonKind === 'custom' &&
+        editorSkinAppearanceDefinition
+      ) {
+        updates.skinAppearance = skinAppearanceForSave
+        // Clear the retired sibling when the unified v2 surface state is saved.
+        updates.skinMaterialArtwork = null
       }
       if (currentGoon?.guidedAvatar) {
         if (stagedAdvancedPackage && advancedPackageDraft) {
@@ -12675,6 +13297,14 @@
       await reconcileLipArtworkUploadsAfterSave(
         currentGoon?.lipArtwork,
         savedGoon.lipArtwork
+      )
+      await reconcileNailArtworkUploadsAfterSave(
+        currentGoon?.nailSurface,
+        savedGoon.nailSurface
+      )
+      await reconcileSkinSurfaceUploadsAfterSave(
+        currentGoon?.skinAppearance,
+        savedGoon.skinAppearance
       )
       editorCueMap = normalizedEditorCueMap
       editorEmojiMap = filteredEmojiMap
@@ -16232,9 +16862,24 @@
                         {editorLipArtworkNotice}
                       </p>
                     {/if}
+                    {#if editorSkinAppearanceNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorSkinAppearanceNotice}
+                      </p>
+                    {/if}
+                    {#if editorSkinAppearanceError}
+                      <p class="batshit-settings-form-error mb-2" role="alert">
+                        Skin Appearance unavailable: {editorSkinAppearanceError}
+                      </p>
+                    {/if}
                     {#if editorFacialArtworkPreviewError}
                       <p class="batshit-settings-form-error mb-2" role="alert">
                         Live preview failed: {editorFacialArtworkPreviewError}
+                      </p>
+                    {/if}
+                    {#if editorSkinAppearancePreviewError}
+                      <p class="batshit-settings-form-error mb-2" role="alert">
+                        Skin preview failed: {editorSkinAppearancePreviewError}
                       </p>
                     {/if}
                     {#snippet facialArtworkRegion(scope: 'brows' | 'eyes')}
@@ -16276,16 +16921,23 @@
                         ...((editorOralAppearanceDefinition && editorOralAppearanceState) ||
                         editorLipArtworkDefinition
                           ? ['face.mouth-lips']
+                          : []),
+                        ...(editorSkinAppearanceDefinition && editorSkinAppearanceState
+                          ? ['face.cheeks']
                           : [])
                       ]}
                       regionContentControlCounts={{
                         'face.mouth-lips':
                           (editorOralAppearanceDefinition ? 5 : 0) +
-                          (editorLipArtworkDefinition ? 1 : 0)
+                          (editorLipArtworkDefinition ? 1 : 0),
+                        'face.cheeks': editorSkinAppearanceDefinition ? 1 : 0
                       }}
                       regionContentChangedCounts={{
                         'face.mouth-lips':
-                          editorOralAppearanceChangedCount + (editorLipArtworkState ? 1 : 0)
+                          editorOralAppearanceChangedCount +
+                          (editorLipArtworkState ? 1 : 0) +
+                          (editorLipArtworkPresence ? 1 : 0),
+                        'face.cheeks': editorSkinAppearanceChangedCount('face.cheeks')
                       }}
                       regionContentSearchText={editorAppearanceRegionContentSearchText}
                       onResetRegionContent={resetEditorOralAppearance}
@@ -16308,15 +16960,25 @@
                             <LipArtworkEditor
                               definition={editorLipArtworkDefinition}
                               valueState={editorLipArtworkState}
+                              surfaceEnabled={editorLipArtworkPresence?.enabled ?? true}
                               ownerDisplayName={userSettings?.displayName ?? ''}
                               creditDraft={editorFacialArtworkCreditDraft}
                               disabled={editorSaving}
                               onCreditDraftChange={(draft) => (editorFacialArtworkCreditDraft = draft)}
                               onChange={updateEditorLipArtwork}
+                              onSurfaceEnabledChange={updateEditorLipArtworkPresence}
                               onUpload={uploadEditorLipArtwork}
                               onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
                             />
                           {/if}
+                        {:else if regionId === 'face.cheeks' && editorSkinAppearanceDefinition && editorSkinAppearanceState}
+                          <SkinAppearanceEditor
+                            definition={editorSkinAppearanceDefinition}
+                            valueState={editorSkinAppearanceState}
+                            regionId="cheekBlush"
+                            disabled={editorSaving}
+                            onChange={updateEditorSkinAppearance}
+                          />
                         {/if}
                       {/snippet}
                     </AppearanceDialsEditor>
@@ -16339,12 +17001,108 @@
                         {editorAppearanceDialsNotice}
                       </p>
                     {/if}
+                    {#if editorNailSurfaceNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorNailSurfaceNotice}
+                      </p>
+                    {/if}
+                    {#if editorNailSurfaceError}
+                      <p class="batshit-settings-form-error mb-2" role="alert">
+                        Nails unavailable: {editorNailSurfaceError}
+                      </p>
+                    {/if}
+                    {#if editorNailSurfacePreviewError}
+                      <p class="batshit-settings-form-error mb-2" role="alert">
+                        Nail preview failed: {editorNailSurfacePreviewError}
+                      </p>
+                    {/if}
+                    {#if editorSkinAppearanceNotice}
+                      <p class="mb-2 text-[0.625rem] leading-relaxed text-muted-foreground" role="status">
+                        {editorSkinAppearanceNotice}
+                      </p>
+                    {/if}
+                    {#if editorSkinAppearanceError}
+                      <p class="batshit-settings-form-error mb-2" role="alert">
+                        Skin Appearance unavailable: {editorSkinAppearanceError}
+                      </p>
+                    {/if}
+                    {#if editorSkinAppearancePreviewError}
+                      <p class="batshit-settings-form-error mb-2" role="alert">
+                        Skin preview failed: {editorSkinAppearancePreviewError}
+                      </p>
+                    {/if}
                     <AppearanceDialsEditor
                       manifest={editorAppearanceDialsManifest}
                       valueState={editorAppearanceDialsState}
                       surface="body"
                       onChange={updateEditorAppearanceDials}
-                    />
+                      regionContentIds={editorSkinAppearanceDefinition && editorSkinAppearanceState
+                        ? ['body.skin', 'body.chest', 'body.hands-feet']
+                        : editorNailSurfaceDefinition && editorNailSurfaceState
+                          ? ['body.hands-feet']
+                          : []}
+                      regionContentControlCounts={{
+                        'body.skin': editorSkinAppearanceDefinition ? 4 : 0,
+                        'body.chest': editorSkinAppearanceDefinition ? 1 : 0,
+                        'body.hands-feet':
+                          (editorNailSurfaceDefinition ? 17 : 0) +
+                          (editorSkinAppearanceDefinition ? 1 : 0)
+                      }}
+                      regionContentChangedCounts={{
+                        'body.skin': editorSkinAppearanceChangedCount('body.skin'),
+                        'body.chest': editorSkinAppearanceChangedCount('body.chest'),
+                        'body.hands-feet':
+                          editorNailSurfaceChangedCount +
+                          editorSkinAppearanceChangedCount('body.hands-feet')
+                      }}
+                      regionContentSearchText={editorAppearanceRegionContentSearchText}
+                      onResetRegionContent={resetEditorNailSurface}
+                    >
+                      {#snippet regionContent(regionId: string)}
+                        {#if editorSkinAppearanceDefinition && editorSkinAppearanceState}
+                          {@const skinControlId = skinAppearanceControlForAppearanceRegion(regionId)}
+                          {#if regionId === 'body.skin'}
+                            <SkinSurfaceEditor
+                              definition={editorSkinAppearanceDefinition}
+                              valueState={editorSkinAppearanceState}
+                              ownerDisplayName={userSettings?.displayName ?? ''}
+                              creditDraft={editorFacialArtworkCreditDraft}
+                              disabled={editorSaving}
+                              onCreditDraftChange={(draft) =>
+                                (editorFacialArtworkCreditDraft = draft)}
+                              onChange={updateEditorSkinAppearance}
+                              onUpload={uploadEditorSkinSurfaceArtwork}
+                              onUploadBusyChange={(busy) =>
+                                (editorFacialArtworkUploadBusy = busy)}
+                            />
+                          {/if}
+                          {#if skinControlId}
+                            <SkinAppearanceEditor
+                              definition={editorSkinAppearanceDefinition}
+                              valueState={editorSkinAppearanceState}
+                              regionId={skinControlId}
+                              disabled={editorSaving}
+                              onChange={updateEditorSkinAppearance}
+                            />
+                          {/if}
+                        {/if}
+                        {#if regionId === 'body.hands-feet' && editorNailSurfaceDefinition && editorNailSurfaceState}
+                          <NailSurfaceEditor
+                            definition={editorNailSurfaceDefinition}
+                            valueState={editorNailSurfaceState}
+                            surfaceEnabled={editorNailSurfacePresence?.enabled ?? true}
+                            ownerDisplayName={userSettings?.displayName ?? ''}
+                            creditDraft={editorFacialArtworkCreditDraft}
+                            disabled={editorSaving}
+                            onCreditDraftChange={(draft) => (editorFacialArtworkCreditDraft = draft)}
+                            onChange={updateEditorNailSurface}
+                            onSurfaceEnabledChange={updateEditorNailSurfacePresence}
+                            onUpload={uploadEditorNailArtwork}
+                            onUploadBusyChange={(busy) => (editorFacialArtworkUploadBusy = busy)}
+                          />
+                        {/if}
+                      {/snippet}
+                    </AppearanceDialsEditor>
                   </div>
                 {/if}
               </Collapsible.Content>
@@ -18058,6 +18816,10 @@
 	                        eyeAppearance={editorEyeAppearanceState}
 	                        oralAppearance={editorOralAppearanceState}
 	                        lipArtwork={editorLipArtworkState}
+	                        lipArtworkPresence={editorLipArtworkPresence}
+	                        nailSurface={editorNailSurfaceState}
+	                        nailSurfacePresence={editorNailSurfacePresence}
+	                        skinAppearance={editorSkinAppearanceState}
 	                        fileTechnicalDetails={{
 	                          packageLabel: currentCustomPackageLabel,
 	                          modelLabel: currentCustomModelLabel,

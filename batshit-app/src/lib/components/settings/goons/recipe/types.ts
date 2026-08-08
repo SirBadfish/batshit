@@ -67,6 +67,7 @@ export type RecipeBuildPresentation = {
   failureStage?: RecipeFailureStage | null;
   failureReason?: string | null;
   retryable?: boolean;
+  resumable?: boolean;
 };
 
 export type RecipeWorkflowViewModel = {
@@ -97,7 +98,7 @@ export type RecipeWorkflowViewModel = {
         status: RecipeJobStatus;
         initialPreparation?: boolean;
         cancelable?: boolean;
-        busyAction?: "retrying" | "discarding" | "canceling" | null;
+        busyAction?: "resuming" | "retrying" | "discarding" | "canceling" | null;
       })
     | null;
   dirtyGuard: {
@@ -128,6 +129,7 @@ export type RecipeWorkflowActions = {
   onPreviewControlCommit?: () => void | Promise<void>;
   onResetPreviewControl?: (id: string) => void;
   onRetryJob: () => void | Promise<void>;
+  onResumeReadyJob: () => void | Promise<void>;
   onDiscardJob: () => void | Promise<void>;
   onCancelBuild?: () => void | Promise<void>;
   onCloseCleanReset: () => void;

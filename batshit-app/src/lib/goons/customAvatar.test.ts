@@ -675,7 +675,12 @@ describe('customAvatar helpers', () => {
         eyeAppearanceState: null,
         facialArtworkState: null,
         oralAppearanceState: null,
-        lipArtworkState: null
+        lipArtworkState: null,
+        lipArtworkEnabled: true,
+        nailSurfaceState: null,
+        nailSurfaceEnabled: true,
+        skinAppearanceState: null,
+        skinMaterialArtworkState: null
       }
     )
     expect(engine.loadGoon).not.toHaveBeenCalled()
@@ -734,7 +739,12 @@ describe('customAvatar helpers', () => {
         eyeAppearanceState: null,
         facialArtworkState: null,
         oralAppearanceState: null,
-        lipArtworkState: null
+        lipArtworkState: null,
+        lipArtworkEnabled: true,
+        nailSurfaceState: null,
+        nailSurfaceEnabled: true,
+        skinAppearanceState: null,
+        skinMaterialArtworkState: null
       }
     )
     expect(engine.setSocketEyeContactSettings).toHaveBeenCalledWith(null)

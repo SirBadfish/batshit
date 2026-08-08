@@ -16,8 +16,17 @@ import {
 import { validateGoonFacialArtworkState } from '$lib/server/services/facialArtwork.server'
 import { validateGoonEyeAppearanceState } from '$lib/server/services/eyeAppearance.server'
 import { validateGoonOralAppearanceState } from '$lib/server/services/oralAppearance.server'
-import { validateGoonLipArtworkState } from '$lib/server/services/lipArtwork.server'
+import {
+  validateGoonLipArtworkPresenceState,
+  validateGoonLipArtworkState
+} from '$lib/server/services/lipArtwork.server'
+import {
+  validateGoonNailSurfacePresenceState,
+  validateGoonNailSurfaceState
+} from '$lib/server/services/nailSurface.server'
+import { validateGoonSkinAppearanceState } from '$lib/server/services/skinAppearance.server'
 import { collectFacialArtworkUploads } from '$lib/goons/facialArtwork'
+import { collectSkinSurfaceUploads } from '$lib/goons/skinSurface'
 import { parseSocketEyeContactSettings } from '$lib/goons/socketEyeContact'
 import {
   GoonMutationError,
@@ -126,6 +135,34 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
           updates.lipArtwork
         )
       }
+      if (Object.prototype.hasOwnProperty.call(updates, 'lipArtworkPresence')) {
+        updated.lipArtworkPresence = await validateGoonLipArtworkPresenceState(
+          client as any,
+          updated,
+          updates.lipArtworkPresence
+        )
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, 'nailSurface')) {
+        updated.nailSurface = await validateGoonNailSurfaceState(
+          client as any,
+          updated,
+          updates.nailSurface
+        )
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, 'nailSurfacePresence')) {
+        updated.nailSurfacePresence = await validateGoonNailSurfacePresenceState(
+          client as any,
+          updated,
+          updates.nailSurfacePresence
+        )
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, 'skinAppearance')) {
+        updated.skinAppearance = await validateGoonSkinAppearanceState(
+          client as any,
+          updated,
+          updates.skinAppearance
+        )
+      }
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
       const storagePatch = Object.fromEntries(
         Object.keys(updates).map((field) => [
@@ -159,7 +196,10 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
         error.message.startsWith('[eye-appearance/v3]') ||
         error.message.startsWith('[socket-eye-contact-settings/v2]') ||
         error.message.startsWith('[oral-appearance/v1]') ||
-        error.message.startsWith('[lip-artwork/v2]'))
+        error.message.startsWith('[lip-artwork/v2]') ||
+        error.message.startsWith('[nail-surface/v1]') ||
+        error.message.startsWith('[skin-appearance/v2]') ||
+        error.message.startsWith('[skin-surface-artwork/v1]'))
     ) {
       return json({ error: error.message }, { status: 400 })
     }
@@ -353,6 +393,37 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 	        !hasGoonUploadReference(references, 'goon_facial_artwork', lipArtworkFilename)
 	      ) {
 	        await deleteGoonUploadAsset('goon_facial_artwork', lipArtworkFilename)
+	      }
+	      for (const family of ['fingers', 'toes'] as const) {
+	        const nailArtworkFilename = existing.nailSurface?.appearance[family].artwork?.filename
+	        if (
+	          nailArtworkFilename &&
+	          !hasGoonUploadReference(references, 'goon_nail_artwork', nailArtworkFilename)
+	        ) {
+	          await deleteGoonUploadAsset('goon_nail_artwork', nailArtworkFilename)
+	        }
+	      }
+	      for (const artwork of collectSkinSurfaceUploads(existing.skinAppearance)) {
+	        if (!hasGoonUploadReference(references, 'goon_skin_artwork', artwork.filename)) {
+	          await deleteGoonUploadAsset('goon_skin_artwork', artwork.filename)
+	        }
+	      }
+	      const legacySkinMaterialArtwork = existing.skinMaterialArtwork
+	      const legacyBaseColor =
+	        legacySkinMaterialArtwork &&
+	        typeof legacySkinMaterialArtwork === 'object' &&
+	        !Array.isArray(legacySkinMaterialArtwork)
+	          ? (legacySkinMaterialArtwork as { baseColor?: { filename?: unknown } }).baseColor
+	          : null
+	      const legacyBaseColorFilename =
+	        typeof legacyBaseColor?.filename === 'string'
+	          ? legacyBaseColor.filename
+	          : null
+	      if (
+	        legacyBaseColorFilename &&
+	        !hasGoonUploadReference(references, 'goon_skin_artwork', legacyBaseColorFilename)
+	      ) {
+	        await deleteGoonUploadAsset('goon_skin_artwork', legacyBaseColorFilename)
 	      }
 
 	      const animationFiles = Array.isArray(existing.files?.animations)

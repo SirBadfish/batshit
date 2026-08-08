@@ -84,6 +84,11 @@ describe('LipArtworkEngineRuntime', () => {
     expect(applied.depthWrite).toBe(false)
     expect(texture.flipY).toBe(false)
 
+    runtime.setEnabled(false)
+    expect(mesh.visible).toBe(false)
+    runtime.setEnabled(true)
+    expect(mesh.visible).toBe(true)
+
     expect(await runtime.apply(null)).toBe(true)
     expect(mesh.material).toBe(original)
     runtime.dispose()

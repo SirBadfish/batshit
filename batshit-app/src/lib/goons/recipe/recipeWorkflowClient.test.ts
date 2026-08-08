@@ -553,7 +553,35 @@ describe('Recipe workflow browser client', () => {
         schemaVersion: 'oral-appearance-state/v1',
         definitionSha256: hash('c'),
         values: { tongue_rest: 0.25 }
-      }
+      },
+      nailSurface: {
+        schemaVersion: 'nail-surface-state/v1',
+        definitionSha256: hash('d'),
+        geometry: {},
+        appearance: {}
+      } as unknown as GoonRecord['nailSurface'],
+      lipArtworkPresence: {
+        schemaVersion: 'lip-artwork-presence-state/v1',
+        definitionSha256: hash('f'),
+        enabled: false
+      },
+      nailSurfacePresence: {
+        schemaVersion: 'nail-surface-presence-state/v1',
+        definitionSha256: hash('d'),
+        enabled: false
+      },
+      skinAppearance: {
+        schemaVersion: 'skin-appearance-state/v2',
+        definitionSha256: hash('e'),
+        surface: {},
+        regions: {}
+      } as unknown as GoonRecord['skinAppearance'],
+      skinMaterialArtwork: {
+        schemaVersion: 'skin-material-artwork-state/v2',
+        definitionSha256: hash('e'),
+        baseColor: {},
+        tint: [1, 1, 1]
+      } as unknown as GoonRecord['skinMaterialArtwork']
     })
 
     const first = await buildRecipeStateSnapshot({ goon, appearanceDials: appearanceState() })
@@ -563,7 +591,11 @@ describe('Recipe workflow browser client', () => {
     expect(first.siblings.map((entry) => entry.id)).toEqual([
       'eyeAppearance',
       'facialArtwork',
-      'oralAppearance'
+      'lipArtworkPresence',
+      'nailSurface',
+      'nailSurfacePresence',
+      'oralAppearance',
+      'skinAppearance'
     ])
     expect(first.siblings.every((entry) => /^[a-f0-9]{64}$/.test(entry.stateSha256))).toBe(true)
     expect(first.stateSha256).toMatch(/^[a-f0-9]{64}$/)

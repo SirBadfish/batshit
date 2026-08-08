@@ -2,9 +2,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
+  createLipArtworkPresenceState,
   lipArtworkHexToRgb,
   lipArtworkRgbToHex,
   parseLipArtworkDefinition,
+  parseLipArtworkPresenceState,
   parseLipArtworkState,
   reconcileLipArtworkState
 } from './lipArtwork'
@@ -105,5 +107,18 @@ describe('lip-artwork/v2', () => {
       0.921569,
       0.376471
     ])
+  })
+
+  it('binds an explicit off state to this package without changing package defaults', () => {
+    const contract = definition()
+    const presence = createLipArtworkPresenceState(contract, false)
+    expect(parseLipArtworkPresenceState(contract, presence)).toEqual({
+      schemaVersion: 'lip-artwork-presence-state/v1',
+      definitionSha256: contract.definitionSha256,
+      enabled: false
+    })
+    expect(() =>
+      parseLipArtworkPresenceState(contract, { ...presence, enabled: 'no' })
+    ).toThrow(/must be boolean/)
   })
 })

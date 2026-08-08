@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Download, ImagePlus, RotateCcw } from '@lucide/svelte'
   import * as Select from '$lib/components/ui/select'
+  import * as Switch from '$lib/components/ui/switch'
   import { Button } from '$lib/components/ui/button'
   import { Input } from '$lib/components/ui/input'
   import { Slider } from '$lib/components/ui/slider'
@@ -27,9 +28,11 @@
     valueState: LipArtworkStateV2 | null
     ownerDisplayName: string
     creditDraft: FacialArtworkUploadCreditDraft
+    surfaceEnabled: boolean
     disabled?: boolean
     onCreditDraftChange: (draft: FacialArtworkUploadCreditDraft) => void
     onChange: (state: LipArtworkStateV2 | null) => void
+    onSurfaceEnabledChange: (enabled: boolean) => void
     onUpload: (file: File, provenance: FacialArtworkProvenance) => Promise<LipArtworkUpload>
     onUploadBusyChange?: (busy: boolean) => void
   }
@@ -39,9 +42,11 @@
     valueState,
     ownerDisplayName,
     creditDraft,
+    surfaceEnabled,
     disabled = false,
     onCreditDraftChange,
     onChange,
+    onSurfaceEnabledChange,
     onUpload,
     onUploadBusyChange
   }: Props = $props()
@@ -132,15 +137,35 @@
     'The Template is a front-view guide: cyan is the package-authored base-lip reference, but this experiment does not require you to cover all of it. Pale gray is additional safe room and pink is forbidden. Paint on a separate transparent layer, then hide the guide before export.',
     'Upload a transparent PNG that controls the exact painted lip shape and alpha.',
     'Lip Color and Opacity stay independent, so you can recolor the same artwork without changing its edge.',
+    'Turn Use Lip Artwork off when the Base Color Artwork already contains the lips you want.',
     'Reset restores the artwork authored in the installed Goon package.'
   ]}
   {open}
-  changed={valueState !== null}
+  changed={valueState !== null || !surfaceEnabled}
   {disabled}
   onToggle={() => (open = !open)}
-  onReset={() => onChange(null)}
+  onReset={() => {
+    onChange(null)
+    onSurfaceEnabledChange(true)
+  }}
 >
   <div class="lip-artwork-editor" aria-busy={uploadBusy}>
+    <div class="lip-artwork-presence">
+      <div>
+        <GoonsFieldLabel
+          label="Use Lip Artwork"
+          info="Turn this off to hide Batshit's lip overlay completely and show only lips already painted into Base Color Artwork."
+          ariaLabel="About Using Lip Artwork"
+        />
+        <p>{surfaceEnabled ? 'Lip overlay is visible' : 'Lip overlay is off'}</p>
+      </div>
+      <Switch.Root
+        checked={surfaceEnabled}
+        onCheckedChange={onSurfaceEnabledChange}
+        {disabled}
+        aria-label="Use Lip Artwork"
+      />
+    </div>
     <div class="lip-artwork-template-row">
       <span>{definition.template.dimensions[0]} × {definition.template.dimensions[1]} PNG</span>
       <a
@@ -329,6 +354,7 @@
   }
 
   .lip-artwork-template-row,
+  .lip-artwork-presence,
   .lip-artwork-actions,
   .lip-artwork-color,
   .lip-artwork-opacity > span,
@@ -337,6 +363,24 @@
     display: flex;
     min-width: 0;
     align-items: center;
+  }
+
+  .lip-artwork-presence {
+    justify-content: space-between;
+    gap: 12px;
+    border: 1px solid hsl(var(--border) / 0.6);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+
+  .lip-artwork-presence > div {
+    min-width: 0;
+  }
+
+  .lip-artwork-presence p {
+    margin: 2px 0 0;
+    color: hsl(var(--muted-foreground));
+    font-size: 0.625rem;
   }
 
   .lip-artwork-template-row,

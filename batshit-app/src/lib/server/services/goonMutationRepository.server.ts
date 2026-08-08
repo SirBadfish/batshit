@@ -9,6 +9,11 @@ export const RECIPE_MANAGED_GOON_FIELDS = [
   'eyeAppearance',
   'oralAppearance',
   'lipArtwork',
+  'lipArtworkPresence',
+  'nailSurface',
+  'nailSurfacePresence',
+  'skinAppearance',
+  'skinMaterialArtwork',
   'recipeFitReceipts'
 ] as const
 
@@ -59,7 +64,7 @@ for index = 3, #ARGV, 2 do
     return 'RESERVED_FIELD'
   end
   if recipeManaged then
-    if field == 'customAvatar' or field == 'appearanceDials' or field == 'facialArtwork' or field == 'eyeAppearance' or field == 'oralAppearance' or field == 'lipArtwork' or field == 'recipeFitReceipts' then
+    if field == 'customAvatar' or field == 'appearanceDials' or field == 'facialArtwork' or field == 'eyeAppearance' or field == 'oralAppearance' or field == 'lipArtwork' or field == 'lipArtworkPresence' or field == 'nailSurface' or field == 'nailSurfacePresence' or field == 'skinAppearance' or field == 'skinMaterialArtwork' or field == 'recipeFitReceipts' then
       return 'RECIPE_MANAGED_FIELD'
     end
   end

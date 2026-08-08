@@ -20,6 +20,10 @@ const { persistFileBackedUpload } = require('../services/fileBackedUploadService
 const uploadManager = require('../services/uploadManager');
 const { prepareFacialArtworkUpload } = require('../services/facialArtworkValidator');
 const { prepareLipArtworkUpload } = require('../services/lipArtworkValidator');
+const { prepareNailArtworkUpload } = require('../services/nailArtworkValidator');
+const {
+  prepareSkinSurfaceArtworkUpload
+} = require('../services/skinSurfaceArtworkValidator');
 const {
   hashFile,
   inspectAndExtractRecipeArchive
@@ -35,6 +39,7 @@ const GOON_GUIDED_PACKAGE_MAX_FILE_SIZE = GOON_CORE_IMPORT_MAX_FILE_SIZE;
 const GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE = GOON_CORE_IMPORT_MAX_FILE_SIZE;
 const GOON_ANIMATION_MAX_FILE_SIZE = 350 * MIB;
 const GOON_IMAGE_UPLOAD_MAX_FILE_SIZE = 25 * MIB;
+const GOON_SKIN_SURFACE_UPLOAD_MAX_FILE_SIZE = 100 * MIB;
 const GOON_SCENE_UPLOAD_MAX_FILE_SIZE = 50 * MIB;
 const GOON_SCENE_MODEL_UPLOAD_MAX_FILE_SIZE = 200 * MIB;
 const GOON_ANIMATION_PREVIEW_MAX_FILE_SIZE = 40 * MIB;
@@ -123,6 +128,10 @@ const goonImageUpload = multer({
 const goonFacialArtworkUpload = multer({
   storage,
   limits: { fileSize: GOON_IMAGE_UPLOAD_MAX_FILE_SIZE }
+});
+const goonSkinSurfaceArtworkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: GOON_SKIN_SURFACE_UPLOAD_MAX_FILE_SIZE }
 });
 
 // Goon scene uploads (skybox images can be larger)
@@ -2305,6 +2314,92 @@ router.post('/upload/goon-lip-artwork', goonFacialArtworkUpload.single('file'), 
   } catch (error) {
     writeErrorLog(logger, 'Goon Lip Artwork upload error', error);
     sendUploadError(res, 'Lip Artwork upload failed', error);
+  }
+});
+
+router.post('/upload/goon-nail-artwork', goonFacialArtworkUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const originalName = req.file.originalname || 'nail_artwork.png';
+    if (path.extname(originalName).toLowerCase() !== '.png' || req.file.mimetype !== 'image/png') {
+      throw uploadValidationError('Nail Artwork must be a PNG image.');
+    }
+    const prepared = await prepareNailArtworkUpload({
+      buffer: req.file.buffer,
+      family: req.body?.family,
+      definitionSha256: req.body?.definitionSha256,
+      templateId: req.body?.templateId,
+      templateVersion: req.body?.templateVersion,
+      guideSha256: req.body?.guideSha256,
+      slotMaskSha256: req.body?.slotMaskSha256,
+      baseArtworkSha256: req.body?.baseArtworkSha256,
+      width: Number(req.body?.width),
+      height: Number(req.body?.height),
+      provenance: req.body?.provenance
+    });
+    const safeBase =
+      sanitizeFilenameSegment(
+        path.basename(originalName, '.png'),
+        `${prepared.artwork.family}_nails`
+      ).slice(0, 80) || `${prepared.artwork.family}_nails`;
+    const filename = `${Date.now()}_${crypto.randomUUID()}_${safeBase}.png`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_nail_artwork',
+      originalName,
+      filename,
+      mimetype: 'image/png',
+      buffer: prepared.buffer,
+      size: prepared.buffer.length,
+      metadata: { nailArtwork: prepared.artwork }
+    });
+    return res.json({
+      success: true,
+      file,
+      artwork: prepared.artwork,
+      preparation: prepared.preparation
+    });
+  } catch (error) {
+    writeErrorLog(logger, 'Goon Nail Artwork upload error', error);
+    sendUploadError(res, 'Nail Artwork upload failed', error);
+  }
+});
+
+router.post('/upload/goon-skin-surface-artwork', goonSkinSurfaceArtworkUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const map = typeof req.body?.map === 'string' ? req.body.map : '';
+    const originalName = req.file.originalname || `${map || 'skin_surface'}_artwork.png`;
+    if (path.extname(originalName).toLowerCase() !== '.png' || req.file.mimetype !== 'image/png') {
+      throw uploadValidationError('Skin Surface Artwork must be a PNG image.');
+    }
+    const prepared = await prepareSkinSurfaceArtworkUpload({
+      buffer: req.file.buffer,
+      map,
+      definitionSha256: req.body?.definitionSha256,
+      provenance: req.body?.provenance
+    });
+    const safeBase =
+      sanitizeFilenameSegment(path.basename(originalName, '.png'), `${map || 'skin_surface'}_artwork`).slice(0, 80) ||
+      `${map || 'skin_surface'}_artwork`;
+    const filename = `${Date.now()}_${crypto.randomUUID()}_${safeBase}.png`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_skin_artwork',
+      originalName,
+      filename,
+      mimetype: 'image/png',
+      buffer: prepared.buffer,
+      size: prepared.buffer.length,
+      metadata: { skinSurfaceArtwork: prepared.artwork }
+    });
+    return res.json({
+      success: true,
+      file,
+      artwork: prepared.artwork,
+      preparation: prepared.preparation
+    });
+  } catch (error) {
+    writeErrorLog(logger, 'Goon Skin Surface Artwork upload error', error);
+    sendUploadError(res, 'Skin Surface Artwork upload failed', error);
   }
 });
 

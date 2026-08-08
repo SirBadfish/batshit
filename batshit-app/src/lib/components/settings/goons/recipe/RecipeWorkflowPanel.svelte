@@ -76,8 +76,10 @@
         failureStage={viewModel.build.failureStage}
         failureReason={viewModel.build.failureReason}
         retryable={viewModel.build.retryable}
+        resumable={viewModel.build.resumable}
         cancelable={viewModel.build.cancelable}
         busyAction={viewModel.build.busyAction}
+        onResume={actions.onResumeReadyJob}
         onRetry={actions.onRetryJob}
         onDiscard={actions.onDiscardJob}
         onCancelBuild={actions.onCancelBuild}

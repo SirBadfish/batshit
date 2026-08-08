@@ -1,0 +1,803 @@
+{
+  "artworkSchemaVersion": "nail-artwork/v1",
+  "compositionOrder": [
+    "appearance-followers",
+    "length",
+    "width",
+    "shape",
+    "transverse-arch",
+    "straight-toe-free-edge",
+    "analytic-toe-longitudinal-profile",
+    "nominal-thickness-shell-with-hard-toe-top-edge"
+  ],
+  "controls": {
+    "fingers": {
+      "arch": {
+        "default": 0,
+        "description": "Adds a stronger transverse left-to-right C curve while keeping both sidewalls seated.",
+        "kind": "number",
+        "label": "Fingernail Arch",
+        "maximum": 1,
+        "minimum": 0,
+        "step": 0.01
+      },
+      "length": {
+        "default": 0,
+        "description": "Shortens the growth zone or extends the free edge.",
+        "kind": "number",
+        "label": "Fingernail Length",
+        "maximum": 1,
+        "minimum": -1,
+        "step": 0.01
+      },
+      "shape": {
+        "default": "round",
+        "kind": "preset",
+        "label": "Fingernail Shape",
+        "options": [
+          "round",
+          "soft-square",
+          "almond",
+          "pointed"
+        ]
+      },
+      "width": {
+        "default": 0,
+        "description": "Supports a strong narrow fantasy taper and a bounded wide endpoint.",
+        "kind": "number",
+        "label": "Fingernail Width",
+        "maximum": 1,
+        "minimum": -1,
+        "step": 0.01
+      }
+    },
+    "toes": {
+      "arch": {
+        "default": 0,
+        "description": "Adds a stronger per-digit transverse arch; pinky toe response is exactly zero.",
+        "kind": "number",
+        "label": "Toenail Arch",
+        "maximum": 1,
+        "minimum": 0,
+        "step": 0.01
+      },
+      "length": {
+        "default": 0,
+        "description": "Uses the shorter toe-safe length range.",
+        "kind": "number",
+        "label": "Toenail Length",
+        "maximum": 1,
+        "minimum": -1,
+        "step": 0.01
+      },
+      "shape": {
+        "default": "round",
+        "kind": "preset",
+        "label": "Toenail Shape",
+        "options": [
+          "round",
+          "soft-square"
+        ]
+      },
+      "width": {
+        "default": 0,
+        "description": "Supports useful narrowing with a tightly bounded wide endpoint.",
+        "kind": "number",
+        "label": "Toenail Width",
+        "maximum": 1,
+        "minimum": -1,
+        "step": 0.01
+      }
+    }
+  },
+  "defaultLaw": "null state inherits package-authored geometry, pale neutral color, Natural finish, and white full-coverage artwork",
+  "definitionSha256": "96fd99de666e47f3dac016cdb42c6d1bc4e6d7842fb754055cf53d05e8888612",
+  "finishes": {
+    "glossy": {
+      "clearcoat": 0.72,
+      "clearcoatRoughness": 0.12,
+      "roughness": 0.2
+    },
+    "matte": {
+      "clearcoat": 0.0,
+      "clearcoatRoughness": 0.5,
+      "roughness": 0.78
+    },
+    "natural": {
+      "clearcoat": 0.18,
+      "clearcoatRoughness": 0.32,
+      "roughness": 0.46
+    }
+  },
+  "geometry": {
+    "archLaw": "transverse-left-to-right-c-curve-both-families-full-after-cuticle-anchor",
+    "archRiseRatio": 0.3,
+    "fingerPositiveGrowthLaw": "neutral-and-short-unchanged-positive-extension-continues-local-plate-rise",
+    "fingerPositiveGrowthRiseRatio": 0.18,
+    "fingers": {
+      "archWeights": {
+        "index": 1.0,
+        "middle": 1.0,
+        "pinky": 0.7,
+        "ring": 0.9,
+        "thumb": 0.9
+      },
+      "generatedTriangleCount": 632,
+      "generatedVertexCount": 336,
+      "plateCount": 10
+    },
+    "freeEdgeTopBevelMeters": 0.0,
+    "nominalThicknessMeters": 0.0003,
+    "plateCount": 20,
+    "shapeLaw": "fixed-topology-morph-composition-no-mesh-swaps",
+    "softSquareLaw": "single-distal-cutting-plane-with-symmetric-six-percent-corner-roundback",
+    "toeFreeEdgeLaw": "seated-bed-through-0.68-then-y-level-toe-forward-neutral-and-length-shape-growth",
+    "toeFreeEdgeStart": 0.68,
+    "toeGrowthAxisY": 0.0,
+    "toeShortClearanceLaw": "full-short-subtle-y-clearance-on-second-through-pinky-big-toe-exactly-zero",
+    "toeShortClearanceRatio": 0.2,
+    "toeSurfaceProfileLaw": "linear-cuticle-to-tip-profile-plus-transverse-quadratic-crown-with-zero-geometric-top-bevel",
+    "toeTopEdgeNormalLaw": "hard-top-to-side-boundary",
+    "toes": {
+      "archWeights": {
+        "big": 0.8,
+        "fourth": 0.2,
+        "pinky": 0.0,
+        "second": 0.5,
+        "third": 0.35
+      },
+      "generatedTriangleCount": 1040,
+      "generatedVertexCount": 1020,
+      "plateCount": 10
+    }
+  },
+  "materialDefaults": {
+    "fingers": {
+      "color": [
+        0.956863,
+        0.854902,
+        0.827451
+      ],
+      "finish": "natural"
+    },
+    "toes": {
+      "color": [
+        0.956863,
+        0.854902,
+        0.827451
+      ],
+      "finish": "natural"
+    }
+  },
+  "ownership": "immutable-package-geometry-and-templates-with-recipe-owned-controls-color-finish-and-artwork",
+  "productExportApproved": true,
+  "runtimeBindings": {
+    "fingers": {
+      "material": "bs_f1_finger_nail_surface_v1_mat",
+      "node": "bs_f1_finger_nail_surface_v1",
+      "targets": {
+        "arch": "bs_nail_finger_arch",
+        "lengthDecrease": "bs_nail_finger_length_decrease",
+        "lengthIncrease": "bs_nail_finger_length_increase",
+        "shapeAlmond": "bs_nail_finger_shape_almond",
+        "shapePointed": "bs_nail_finger_shape_pointed",
+        "shapeSoftSquare": "bs_nail_finger_shape_soft_square",
+        "widthNarrow": "bs_nail_finger_width_narrow",
+        "widthWide": "bs_nail_finger_width_wide"
+      }
+    },
+    "toes": {
+      "material": "bs_f1_toe_nail_surface_v1_mat",
+      "node": "bs_f1_toe_nail_surface_v1",
+      "targets": {
+        "arch": "bs_nail_toe_arch",
+        "lengthDecrease": "bs_nail_toe_length_decrease",
+        "lengthIncrease": "bs_nail_toe_length_increase",
+        "shapeSoftSquare": "bs_nail_toe_shape_soft_square",
+        "widthNarrow": "bs_nail_toe_width_narrow",
+        "widthWide": "bs_nail_toe_width_wide"
+      }
+    }
+  },
+  "schemaVersion": "nail-surface/v1",
+  "stateSchemaVersion": "nail-surface-state/v1",
+  "status": "product-export-approved",
+  "templates": {
+    "fingers": {
+      "baseArtwork": {
+        "law": "neutral-white-opaque-inside-slots",
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/fingers/bases/fingers-nail-artwork-white.png",
+        "sha256": "0de9af27bd800d0852f34da3201c7fa14a3385cadd4a1e1ffad993c3fc97a509"
+      },
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "family": "fingers",
+      "guide": {
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/fingers/guides/fingers-nail-artwork.png",
+        "sha256": "7dd43e3cd25217632e7773721bcee528e9577b939c848c1a4e6110937269a8a2"
+      },
+      "id": "batshit-base-f-v1-fingers-nails",
+      "orientation": "cuticle-bottom-tip-top",
+      "slotMask": {
+        "channels": "L8",
+        "paintThreshold": 1,
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/fingers/masks/fingers-nail-artwork-slots.png",
+        "sha256": "2991b26147773c3843bb724328196e2a28c08695f997bb8dc5a1b7b261c60e6d"
+      },
+      "slotOrder": [
+        "left-thumb",
+        "left-index",
+        "left-middle",
+        "left-ring",
+        "left-pinky",
+        "right-thumb",
+        "right-index",
+        "right-middle",
+        "right-ring",
+        "right-pinky"
+      ],
+      "slots": [
+        {
+          "id": "left-thumb",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            37,
+            72,
+            373,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-index",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            446,
+            72,
+            782,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-middle",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            856,
+            72,
+            1192,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-ring",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1266,
+            72,
+            1602,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-pinky",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1675,
+            72,
+            2011,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "right-thumb",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            37,
+            1096,
+            373,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-index",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            446,
+            1096,
+            782,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-middle",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            856,
+            1096,
+            1192,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-ring",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1266,
+            1096,
+            1602,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-pinky",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1675,
+            1096,
+            2011,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        }
+      ],
+      "transparentBlank": {
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/fingers/blanks/fingers-nail-artwork.png",
+        "sha256": "de69b58c45f52fdf68f61391889183e73cd593d64520af27f0d4e9acbb3bc3ba"
+      },
+      "version": "1.0.0",
+      "zoneLaw": {
+        "cuticleAnchor": [
+          0.0,
+          0.22
+        ],
+        "growth": [
+          0.22,
+          0.78
+        ],
+        "lengthBehavior": "cuticle and tip UV anchors stay fixed; only the physical growth-zone span expands or contracts",
+        "tipAnchor": [
+          0.78,
+          1.0
+        ]
+      }
+    },
+    "toes": {
+      "baseArtwork": {
+        "law": "neutral-white-opaque-inside-slots",
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/toes/bases/toes-nail-artwork-white.png",
+        "sha256": "0de9af27bd800d0852f34da3201c7fa14a3385cadd4a1e1ffad993c3fc97a509"
+      },
+      "dimensions": [
+        2048,
+        2048
+      ],
+      "family": "toes",
+      "guide": {
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/toes/guides/toes-nail-artwork.png",
+        "sha256": "fa990597f9f36db62be9c618a87ad6452ed79c8edf12f72d6c08c38fd6ce6402"
+      },
+      "id": "batshit-base-f-v1-toes-nails",
+      "orientation": "cuticle-bottom-tip-top",
+      "slotMask": {
+        "channels": "L8",
+        "paintThreshold": 1,
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/toes/masks/toes-nail-artwork-slots.png",
+        "sha256": "2991b26147773c3843bb724328196e2a28c08695f997bb8dc5a1b7b261c60e6d"
+      },
+      "slotOrder": [
+        "left-big",
+        "left-second",
+        "left-third",
+        "left-fourth",
+        "left-pinky",
+        "right-big",
+        "right-second",
+        "right-third",
+        "right-fourth",
+        "right-pinky"
+      ],
+      "slots": [
+        {
+          "id": "left-big",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            37,
+            72,
+            373,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-second",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            446,
+            72,
+            782,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-third",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            856,
+            72,
+            1192,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-fourth",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1266,
+            72,
+            1602,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "left-pinky",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1675,
+            72,
+            2011,
+            952
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              758,
+              952
+            ],
+            "growth": [
+              266,
+              758
+            ],
+            "tipAnchor": [
+              72,
+              266
+            ]
+          }
+        },
+        {
+          "id": "right-big",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            37,
+            1096,
+            373,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-second",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            446,
+            1096,
+            782,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-third",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            856,
+            1096,
+            1192,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-fourth",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1266,
+            1096,
+            1602,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        },
+        {
+          "id": "right-pinky",
+          "orientation": "cuticle-bottom-tip-top",
+          "rect": [
+            1675,
+            1096,
+            2011,
+            1976
+          ],
+          "zones": {
+            "cuticleAnchor": [
+              1782,
+              1976
+            ],
+            "growth": [
+              1290,
+              1782
+            ],
+            "tipAnchor": [
+              1096,
+              1290
+            ]
+          }
+        }
+      ],
+      "transparentBlank": {
+        "path": "goons/nail-surface/v1/batshit-base-f-v1/toes/blanks/toes-nail-artwork.png",
+        "sha256": "de69b58c45f52fdf68f61391889183e73cd593d64520af27f0d4e9acbb3bc3ba"
+      },
+      "version": "1.0.0",
+      "zoneLaw": {
+        "cuticleAnchor": [
+          0.0,
+          0.22
+        ],
+        "growth": [
+          0.22,
+          0.78
+        ],
+        "lengthBehavior": "cuticle and tip UV anchors stay fixed; only the physical growth-zone span expands or contracts",
+        "tipAnchor": [
+          0.78,
+          1.0
+        ]
+      }
+    }
+  }
+}

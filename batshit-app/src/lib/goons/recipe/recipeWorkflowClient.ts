@@ -345,10 +345,11 @@ async function siblingRecord(input: RecipeSiblingStateDraft): Promise<RecipeSibl
 function removeSiblingSurface(
   siblings: Map<string, RecipeSiblingStateRecord>,
   ids: readonly string[],
-  contract: string
+  contract: string | readonly string[]
 ) {
+  const contracts = new Set(Array.isArray(contract) ? contract : [contract])
   for (const [id, sibling] of siblings) {
-    if (ids.includes(id) || sibling.contract === contract) siblings.delete(id)
+    if (ids.includes(id) || contracts.has(sibling.contract)) siblings.delete(id)
   }
 }
 
@@ -428,6 +429,72 @@ export async function buildRecipeStateSnapshot(
     })
     siblings.set(next.id, next)
   }
+
+  removeSiblingSurface(
+    siblings,
+    ['lipArtworkPresence', 'lip-artwork-presence'],
+    'lip-artwork-presence-state/v1'
+  )
+  if (input.goon.lipArtworkPresence) {
+    const state = cloneRecipeJson(input.goon.lipArtworkPresence)
+    const next = await siblingRecord({
+      id: 'lipArtworkPresence',
+      contract: state.schemaVersion,
+      definitionSha256: state.definitionSha256,
+      state
+    })
+    siblings.set(next.id, next)
+  }
+
+  removeSiblingSurface(siblings, ['nailSurface', 'nail-surface'], 'nail-surface-state/v1')
+  if (input.goon.nailSurface) {
+    const state = cloneRecipeJson(input.goon.nailSurface)
+    const next = await siblingRecord({
+      id: 'nailSurface',
+      contract: state.schemaVersion,
+      definitionSha256: state.definitionSha256,
+      state
+    })
+    siblings.set(next.id, next)
+  }
+
+  removeSiblingSurface(
+    siblings,
+    ['nailSurfacePresence', 'nail-surface-presence'],
+    'nail-surface-presence-state/v1'
+  )
+  if (input.goon.nailSurfacePresence) {
+    const state = cloneRecipeJson(input.goon.nailSurfacePresence)
+    const next = await siblingRecord({
+      id: 'nailSurfacePresence',
+      contract: state.schemaVersion,
+      definitionSha256: state.definitionSha256,
+      state
+    })
+    siblings.set(next.id, next)
+  }
+
+  removeSiblingSurface(
+    siblings,
+    ['skinAppearance', 'skin-appearance'],
+    ['skin-appearance-state/v1', 'skin-appearance-state/v2']
+  )
+  if (input.goon.skinAppearance) {
+    const state = cloneRecipeJson(input.goon.skinAppearance)
+    const next = await siblingRecord({
+      id: 'skinAppearance',
+      contract: state.schemaVersion,
+      definitionSha256: state.definitionSha256,
+      state
+    })
+    siblings.set(next.id, next)
+  }
+
+  removeSiblingSurface(
+    siblings,
+    ['skinMaterialArtwork', 'skin-material-artwork'],
+    ['skin-material-artwork-state/v1', 'skin-material-artwork-state/v2']
+  )
 
   if (input.anatomyFitState !== undefined) {
     removeSiblingSurface(

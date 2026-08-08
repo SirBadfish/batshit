@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Ban, ChevronDown, Loader2, RotateCcw, TriangleAlert, X } from '@lucide/svelte'
+  import { Ban, Check, ChevronDown, Loader2, RotateCcw, TriangleAlert, X } from '@lucide/svelte'
   import { Badge } from '$lib/components/ui/badge'
   import { Button } from '$lib/components/ui/button'
   import * as Collapsible from '$lib/components/ui/collapsible'
@@ -49,8 +49,10 @@
     failureStage?: RecipeFailureStage | null
     failureReason?: string | null
     retryable?: boolean
+    resumable?: boolean
     cancelable?: boolean
-    busyAction?: 'retrying' | 'discarding' | 'canceling' | null
+    busyAction?: 'resuming' | 'retrying' | 'discarding' | 'canceling' | null
+    onResume: () => void | Promise<void>
     onRetry: () => void | Promise<void>
     onDiscard: () => void | Promise<void>
     onCancelBuild?: () => void | Promise<void>
@@ -62,8 +64,10 @@
     failureStage = null,
     failureReason = null,
     retryable = false,
+    resumable = false,
     cancelable = false,
     busyAction = null,
+    onResume,
     onRetry,
     onDiscard,
     onCancelBuild
@@ -79,13 +83,15 @@
         : 0
   )
   const terminalProblem = $derived(status === 'failed' || status === 'interrupted')
+  const readyCheckpoint = $derived(status === 'ready' && resumable)
   const updateInProgress = $derived(
-    !terminalProblem && status !== 'committed' && status !== 'discarded'
+    !terminalProblem && !readyCheckpoint && status !== 'committed' && status !== 'discarded'
   )
   const ordinaryStatus = $derived.by(() => {
     if (status === 'failed') return initialPreparation ? 'Preparation failed' : 'Update failed'
     if (status === 'interrupted') return initialPreparation ? 'Preparation interrupted' : 'Update interrupted'
     if (status === 'committed') return 'Ready'
+    if (status === 'ready') return readyCheckpoint ? 'Ready to finish' : 'Applying'
     if (status === 'validating' || status === 'planning') return 'Checking'
     if (status === 'discarded') return 'Discarded'
     return initialPreparation ? 'Preparing' : 'Applying'
@@ -113,10 +119,16 @@
         {#if updateInProgress}
           <Loader2 class="animate-spin motion-reduce:animate-none" aria-hidden="true" />
         {/if}
-        {initialPreparation ? 'Preparing Goon' : 'Updating Appearance'}
+        {readyCheckpoint
+          ? initialPreparation ? 'Goon Ready to Finish' : 'Appearance Update Ready'
+          : initialPreparation ? 'Preparing Goon' : 'Updating Appearance'}
       </h3>
       <p class="batshit-settings-caption mt-1">
-        {initialPreparation
+        {readyCheckpoint
+          ? initialPreparation
+            ? 'This Goon passed every build check but was not activated. Finish Update to make it available, or discard this unfinished candidate.'
+            : 'This appearance passed every build check but was not applied. Finish Update to make it active, or discard this unfinished candidate.'
+          : initialPreparation
           ? 'Batshit is preparing and checking this Goon. This can take a few seconds. It becomes available after every check passes.'
           : 'Batshit is preparing and checking this appearance. This can take a few seconds. Your current Goon stays usable until the update is ready.'}
       </p>
@@ -160,6 +172,21 @@
   />
 
   <div class="recipe-build-actions" aria-label="Goon update actions">
+    {#if readyCheckpoint}
+      <Button onclick={onResume} disabled={busyAction !== null}>
+        {#if busyAction === 'resuming'}
+          <Loader2 class="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+          Finishing…
+        {:else}
+          <Check aria-hidden="true" />
+          Finish Update
+        {/if}
+      </Button>
+      <Button variant="destructive" onclick={onDiscard} disabled={busyAction !== null}>
+        <Ban aria-hidden="true" />
+        {busyAction === 'discarding' ? 'Discarding…' : 'Discard'}
+      </Button>
+    {/if}
     {#if terminalProblem && retryable}
       <Button onclick={onRetry} disabled={busyAction !== null}>
         <RotateCcw aria-hidden="true" />

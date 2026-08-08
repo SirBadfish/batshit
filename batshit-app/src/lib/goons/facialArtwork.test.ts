@@ -231,6 +231,25 @@ describe('facial-artwork/v4', () => {
     })
   })
 
+  it('normalizes browser color channels before state hashing and Redis storage', () => {
+    const definition = parseFacialArtworkDefinition(loadDefinition())
+    const state = createDefaultFacialArtworkState(definition)
+    const brows = state.roles.brows
+    if (brows.mode !== 'shared') throw new Error('Brow fixture must be shared')
+    brows.shared.visible = true
+    brows.shared.artwork = createFacialArtworkArtworkLayer(
+      definition,
+      'brows',
+      upload('brows', definition)
+    )
+    brows.shared.artwork.tint = [0, 199 / 255, 252 / 255, 1]
+    const parsed = parseFacialArtworkState(definition, state)
+    expect(parsed.roles.brows).toMatchObject({
+      mode: 'shared',
+      shared: { artwork: { tint: [0, 0.780392, 0.988235, 1] } }
+    })
+  })
+
   it('rejects values outside bounds rather than clamping and reports incompatible package state', () => {
     const definition = parseFacialArtworkDefinition(loadDefinition())
     let state = createDefaultFacialArtworkState(definition)
