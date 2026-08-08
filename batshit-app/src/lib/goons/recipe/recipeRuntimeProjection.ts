@@ -56,28 +56,58 @@ type RecipeSiblingProjection = Pick<
   | "eyeAppearance"
   | "oralAppearance"
   | "lipArtwork"
+  | "lipArtworkPresence"
+  | "nailSurface"
+  | "nailSurfacePresence"
+  | "skinAppearance"
+  | "skinMaterialArtwork"
 >;
 
 const SIBLING_PROJECTIONS = [
   {
     field: "facialArtwork",
-    contract: "facial-artwork-state/v4",
+    contracts: ["facial-artwork-state/v4"],
     ids: ["facialArtwork", "facial-artwork"],
   },
   {
     field: "eyeAppearance",
-    contract: "eye-appearance-state/v3",
+    contracts: ["eye-appearance-state/v3"],
     ids: ["eyeAppearance", "eye-appearance"],
   },
   {
     field: "oralAppearance",
-    contract: null,
+    contracts: null,
     ids: ["oralAppearance", "oral-appearance"],
   },
   {
     field: "lipArtwork",
-    contract: "lip-artwork-state/v2",
+    contracts: ["lip-artwork-state/v2"],
     ids: ["lipArtwork", "lip-artwork"],
+  },
+  {
+    field: "lipArtworkPresence",
+    contracts: ["lip-artwork-presence-state/v1"],
+    ids: ["lipArtworkPresence", "lip-artwork-presence"],
+  },
+  {
+    field: "nailSurface",
+    contracts: ["nail-surface-state/v1"],
+    ids: ["nailSurface", "nail-surface"],
+  },
+  {
+    field: "nailSurfacePresence",
+    contracts: ["nail-surface-presence-state/v1"],
+    ids: ["nailSurfacePresence", "nail-surface-presence"],
+  },
+  {
+    field: "skinAppearance",
+    contracts: ["skin-appearance-state/v1", "skin-appearance-state/v2"],
+    ids: ["skinAppearance", "skin-appearance"],
+  },
+  {
+    field: "skinMaterialArtwork",
+    contracts: ["skin-material-artwork-state/v1", "skin-material-artwork-state/v2"],
+    ids: ["skinMaterialArtwork", "skin-material-artwork"],
   },
 ] as const;
 
@@ -278,7 +308,8 @@ function projectSiblingState(
     const matches = state.siblings.filter(
       (sibling) =>
         (descriptor.ids as readonly string[]).includes(sibling.id) ||
-        (descriptor.contract !== null && sibling.contract === descriptor.contract),
+        (descriptor.contracts !== null &&
+          (descriptor.contracts as readonly string[]).includes(sibling.contract)),
     );
     if (matches.length > 1) {
       throw new Error(
@@ -290,9 +321,12 @@ function projectSiblingState(
     if (claimed.has(sibling.id)) {
       throw new Error(`Recipe sibling ${sibling.id} is bound to more than one surface.`);
     }
-    if (descriptor.contract !== null && sibling.contract !== descriptor.contract) {
+    if (
+      descriptor.contracts !== null &&
+      !(descriptor.contracts as readonly string[]).includes(sibling.contract)
+    ) {
       throw new Error(
-        `Recipe sibling ${sibling.id} must use ${descriptor.contract}.`,
+        `Recipe sibling ${sibling.id} must use ${(descriptor.contracts as readonly string[]).join(" or ")}.`,
       );
     }
     const siblingState = requiredRecord(
@@ -329,6 +363,11 @@ function applySiblingProjection(
     "eyeAppearance",
     "oralAppearance",
     "lipArtwork",
+    "lipArtworkPresence",
+    "nailSurface",
+    "nailSurfacePresence",
+    "skinAppearance",
+    "skinMaterialArtwork",
   ] as const) {
     const value = projection[field];
     if (value) goon[field] = value as never;

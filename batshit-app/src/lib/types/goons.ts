@@ -1,8 +1,16 @@
 import type { AppearanceDialValueState } from "$lib/goons/appearanceDials";
 import type { FacialArtworkStateV4 } from "$lib/goons/facialArtwork";
 import type { EyeAppearanceStateV3 } from "$lib/goons/eyeAppearance";
-import type { LipArtworkStateV2 } from "$lib/goons/lipArtwork";
+import type {
+  LipArtworkPresenceStateV1,
+  LipArtworkStateV2,
+} from "$lib/goons/lipArtwork";
+import type {
+  NailSurfacePresenceStateV1,
+  NailSurfaceStateV1,
+} from "$lib/goons/nailSurface";
 import type { OralAppearanceStateV1 } from "$lib/goons/oralAppearance";
+import type { SkinAppearanceStateV2 } from "$lib/goons/skinAppearance";
 import type { SocketEyeContactSettingsV2 } from "$lib/goons/socketEyeContact";
 import type {
   GoonRecipeFitReceipt,
@@ -663,6 +671,16 @@ export interface GoonRecord {
   oralAppearance?: OralAppearanceStateV1 | null;
   /** Recipe-owned lip artwork state, bound to avatar.json#lipArtwork. Null inherits package art. */
   lipArtwork?: LipArtworkStateV2 | null;
+  /** Recipe-owned Lip Artwork presence. Null/absent keeps the package overlay enabled. */
+  lipArtworkPresence?: LipArtworkPresenceStateV1 | null;
+  /** Recipe-owned nail geometry/material/artwork state, bound to avatar.json#nailSurface. */
+  nailSurface?: NailSurfaceStateV1 | null;
+  /** Recipe-owned Nail Surface presence. Null/absent keeps both nail meshes enabled. */
+  nailSurfacePresence?: NailSurfacePresenceStateV1 | null;
+  /** Recipe-owned body surface maps, tint, and regional pigment state. */
+  skinAppearance?: SkinAppearanceStateV2 | null;
+  /** @deprecated Read-only migration input; new writes fold this into skinAppearance.surface. */
+  skinMaterialArtwork?: unknown;
   /** Revision-bound hair/clothing/conceal/attachment fit evidence. */
   recipeFitReceipts?: GoonRecipeFitReceipt[];
   guidedAvatar?: GoonGuidedAvatarFiles;

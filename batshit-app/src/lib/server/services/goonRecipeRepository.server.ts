@@ -43,8 +43,22 @@ const RECIPE_MANAGED_GOON_FIELDS = [
   'eyeAppearance',
   'oralAppearance',
   'lipArtwork',
+  'lipArtworkPresence',
+  'nailSurface',
+  'nailSurfacePresence',
+  'skinAppearance',
+  'skinMaterialArtwork',
   'recipeFitReceipts'
 ] as const
+
+const RECIPE_MANAGED_GOON_FIELDS_LUA = RECIPE_MANAGED_GOON_FIELDS
+  .map((field) => `  '${field}'`)
+  .join(',\n')
+const RECIPE_CAS_UPDATED_AT_ARG_INDEX = RECIPE_MANAGED_GOON_FIELDS.length + 3
+const RECIPE_CAS_RECORD_ARG_OFFSET = RECIPE_MANAGED_GOON_FIELDS.length + 2
+const RECIPE_JOB_UPDATED_AT_ARG_INDEX = RECIPE_MANAGED_GOON_FIELDS.length + 6
+const RECIPE_JOB_VALUE_ARG_INDEX = RECIPE_MANAGED_GOON_FIELDS.length + 7
+const RECIPE_JOB_RECORD_ARG_OFFSET = RECIPE_MANAGED_GOON_FIELDS.length + 5
 
 export type RecipeBootstrapManagedSnapshot = Partial<
   Pick<GoonRecord, (typeof RECIPE_MANAGED_GOON_FIELDS)[number]>
@@ -83,14 +97,7 @@ for index = 2, #KEYS do
   end
 end
 local managedFields = {
-  'recipe',
-  'customAvatar',
-  'appearanceDials',
-  'facialArtwork',
-  'eyeAppearance',
-  'oralAppearance',
-  'lipArtwork',
-  'recipeFitReceipts'
+${RECIPE_MANAGED_GOON_FIELDS_LUA}
 }
 for index, field in ipairs(managedFields) do
   local value = ARGV[index + 2]
@@ -101,9 +108,9 @@ for index, field in ipairs(managedFields) do
     redis.call('JSON.SET', KEYS[1], path, value)
   end
 end
-redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[11])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[${RECIPE_CAS_UPDATED_AT_ARG_INDEX}])
 for index = 2, #KEYS do
-  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 10])
+  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + ${RECIPE_CAS_RECORD_ARG_OFFSET}])
 end
 return redis.call('JSON.GET', KEYS[1])
 `
@@ -144,14 +151,7 @@ if current['recipe'] and current['recipe'] ~= cjson.null then
   return 'RECIPE_ALREADY_INITIALIZED'
 end
 local managedFields = {
-  'recipe',
-  'customAvatar',
-  'appearanceDials',
-  'facialArtwork',
-  'eyeAppearance',
-  'oralAppearance',
-  'lipArtwork',
-  'recipeFitReceipts'
+${RECIPE_MANAGED_GOON_FIELDS_LUA}
 }
 local currentManaged = {}
 for _, field in ipairs(managedFields) do
@@ -229,14 +229,7 @@ for index = 3, #KEYS do
   end
 end
 local managedFields = {
-  'recipe',
-  'customAvatar',
-  'appearanceDials',
-  'facialArtwork',
-  'eyeAppearance',
-  'oralAppearance',
-  'lipArtwork',
-  'recipeFitReceipts'
+${RECIPE_MANAGED_GOON_FIELDS_LUA}
 }
 for index, field in ipairs(managedFields) do
   local value = ARGV[index + 5]
@@ -247,10 +240,10 @@ for index, field in ipairs(managedFields) do
     redis.call('JSON.SET', KEYS[1], path, value)
   end
 end
-redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[14])
-redis.call('JSON.SET', KEYS[2], '$', ARGV[15])
+redis.call('JSON.SET', KEYS[1], '$.updated_at', ARGV[${RECIPE_JOB_UPDATED_AT_ARG_INDEX}])
+redis.call('JSON.SET', KEYS[2], '$', ARGV[${RECIPE_JOB_VALUE_ARG_INDEX}])
 for index = 3, #KEYS do
-  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + 13])
+  redis.call('JSON.SET', KEYS[index], '$', ARGV[index + ${RECIPE_JOB_RECORD_ARG_OFFSET}])
 end
 return redis.call('JSON.GET', KEYS[1])
 `
@@ -548,20 +541,10 @@ export async function compareAndSwapRecipeState(input: {
   for (const record of records) canonicalRecipeString(record.value)
   const keys = [goonKey(input.goonId), ...records.map((record) => record.key)]
   const nextFields = input.nextGoon as unknown as Record<string, unknown>
-  const managedFields = [
-    'recipe',
-    'customAvatar',
-    'appearanceDials',
-    'facialArtwork',
-    'eyeAppearance',
-    'oralAppearance',
-    'lipArtwork',
-    'recipeFitReceipts'
-  ] as const
   const args = [
     input.userId,
     String(input.expectedWriteVersion),
-    ...managedFields.map((field) =>
+    ...RECIPE_MANAGED_GOON_FIELDS.map((field) =>
       Object.prototype.hasOwnProperty.call(nextFields, field)
         ? (JSON.stringify(nextFields[field]) ?? '__BATSHIT_DELETE__')
         : '__BATSHIT_DELETE__'
@@ -690,23 +673,13 @@ export async function compareAndSwapRecipeJobState(input: {
   const jobKey = recipeJobRedisKey(input.userId, input.goonId, nextJob.jobId)
   const keys = [goonKey(input.goonId), jobKey, ...records.map((record) => record.key)]
   const nextFields = input.nextGoon as unknown as Record<string, unknown>
-  const managedFields = [
-    'recipe',
-    'customAvatar',
-    'appearanceDials',
-    'facialArtwork',
-    'eyeAppearance',
-    'oralAppearance',
-    'lipArtwork',
-    'recipeFitReceipts'
-  ] as const
   const args = [
     input.userId,
     String(input.expectedWriteVersion),
     String(expectedJobVersion),
     input.goonId,
     nextJob.jobId,
-    ...managedFields.map((field) =>
+    ...RECIPE_MANAGED_GOON_FIELDS.map((field) =>
       Object.prototype.hasOwnProperty.call(nextFields, field)
         ? (JSON.stringify(nextFields[field]) ?? '__BATSHIT_DELETE__')
         : '__BATSHIT_DELETE__'

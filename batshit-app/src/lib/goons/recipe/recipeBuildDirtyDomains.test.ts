@@ -103,4 +103,57 @@ describe('Recipe build dirty-domain classifier', () => {
       classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
     ).toEqual(['recipe-sibling:futureSurface'])
   })
+
+  it('classifies Nail Surface changes as their own build domain', () => {
+    const saved = state({
+      siblings: [sibling('nailSurface', 'nail-surface-state/v1', 0)]
+    })
+    const draft = state({
+      stateSha256: HASH_B,
+      siblings: [sibling('nailSurface', 'nail-surface-state/v1', 1, HASH_B)]
+    })
+    expect(
+      classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
+    ).toEqual(['nail-surface'])
+  })
+
+  it('classifies Lip Artwork and Nail Surface off states with their owning domains', () => {
+    const saved = state({ siblings: [] })
+    const draft = state({
+      stateSha256: HASH_B,
+      siblings: [
+        sibling('lipArtworkPresence', 'lip-artwork-presence-state/v1', 0),
+        sibling('nailSurfacePresence', 'nail-surface-presence-state/v1', 0)
+      ]
+    })
+    expect(
+      classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
+    ).toEqual(['lip-artwork', 'nail-surface'])
+  })
+
+  it('classifies Skin Appearance changes as their own build domain', () => {
+    const saved = state({
+      siblings: [sibling('skinAppearance', 'skin-appearance-state/v1', 0)]
+    })
+    const draft = state({
+      stateSha256: HASH_B,
+      siblings: [sibling('skinAppearance', 'skin-appearance-state/v1', 1, HASH_B)]
+    })
+    expect(
+      classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
+    ).toEqual(['skin-appearance'])
+  })
+
+  it('classifies Base Color Artwork as part of the Skin Appearance build domain', () => {
+    const saved = state({ siblings: [] })
+    const draft = state({
+      stateSha256: HASH_B,
+      siblings: [
+        sibling('skinMaterialArtwork', 'skin-material-artwork-state/v2', 1, HASH_B)
+      ]
+    })
+    expect(
+      classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
+    ).toEqual(['skin-appearance'])
+  })
 })

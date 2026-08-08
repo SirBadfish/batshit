@@ -9,6 +9,7 @@
     title: string
     info?: string | string[]
     open: boolean
+    forceMount?: boolean
     changed?: boolean
     disabled?: boolean
     onToggle: () => void
@@ -21,6 +22,7 @@
     title,
     info = [],
     open,
+    forceMount = false,
     changed = false,
     disabled = false,
     onToggle,
@@ -75,6 +77,7 @@
   </div>
 
   <Collapsible.Content
+    {forceMount}
     id={panelId}
     class="goon-level-3-accordion-content facial-artwork-accordion-panel"
     role="region"

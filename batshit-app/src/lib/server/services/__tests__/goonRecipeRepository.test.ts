@@ -373,6 +373,8 @@ describe('Goon Recipe repository', () => {
       facialArtwork: { marker: 'old' },
       eyeAppearance: { marker: 'old' },
       oralAppearance: { marker: 'old' },
+      nailSurface: { marker: 'old' },
+      skinAppearance: { marker: 'old' },
       recipeFitReceipts: [{ receiptId: 'old-fit' }]
     })
     const next = {
@@ -382,6 +384,8 @@ describe('Goon Recipe repository', () => {
       facialArtwork: { marker: 'new' },
       eyeAppearance: { marker: 'new' },
       oralAppearance: { marker: 'new' },
+      nailSurface: { marker: 'new' },
+      skinAppearance: { marker: 'new' },
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }],
       updated_at: '2026-07-17T00:00:01.000Z'
     } as unknown as GoonRecord
@@ -398,6 +402,8 @@ describe('Goon Recipe repository', () => {
       facialArtwork: { marker: 'new' },
       eyeAppearance: { marker: 'new' },
       oralAppearance: { marker: 'new' },
+      nailSurface: { marker: 'new' },
+      skinAppearance: { marker: 'new' },
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }]
     })
   })
@@ -453,19 +459,46 @@ describe('Goon Recipe repository', () => {
     expect(storedGoon.recipe).toMatchObject({ writeVersion: 1 })
   })
 
-  it.runIf(REAL_REDIS_LANE)('atomically creates and advances a restart-safe job without changing empty arrays', async () => {
+  it.runIf(REAL_REDIS_LANE)('atomically creates and advances a restart-safe Nail Surface job without shifting Redis arguments', async () => {
     await redis.json.set(`goon:${GOON_ID}`, '$', goon())
+    const jobRecordKey =
+      `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('f')}`
+    const nextWithNails = {
+      ...goonWithPendingJob(1, 2),
+      nailSurface: { marker: 'v24-default' },
+      skinAppearance: { marker: 'v29-default' }
+    } as unknown as GoonRecord
     const created = await compareAndSwapRecipeJobState({
       userId: USER_ID,
       goonId: GOON_ID,
       expectedWriteVersion: 1,
       expectedJobStateVersion: null,
-      nextGoon: goonWithPendingJob(1, 2),
-      nextJob: bakingJob(1, 2)
+      nextGoon: nextWithNails,
+      nextJob: bakingJob(1, 2),
+      records: [
+        {
+          key: jobRecordKey,
+          value: { contract: 'recipe-job-report/v1', marker: 'nail-surface-v24' }
+        }
+      ]
     })
-    expect(created.recipe).toMatchObject({ writeVersion: 2, liveStatus: 'building' })
+    expect(created).toMatchObject({
+      recipe: { writeVersion: 2, liveStatus: 'building' },
+      nailSurface: { marker: 'v24-default' },
+      skinAppearance: { marker: 'v29-default' },
+      updated_at: '2026-07-17T00:00:01.000Z'
+    })
     const storedJob = await redis.json.get(`goon_recipe_job:${USER_ID}:${GOON_ID}:job-1`) as any
+    expect(storedJob).toMatchObject({
+      jobId: 'job-1',
+      stateVersion: 1,
+      status: 'baking'
+    })
     expect(storedJob.cleanupAssets).toEqual([])
+    await expect(redis.json.get(jobRecordKey)).resolves.toEqual({
+      contract: 'recipe-job-report/v1',
+      marker: 'nail-surface-v24'
+    })
     expect((created.recipe as any).authoringRevision.state.appearanceDials.unlockedDialIds).toEqual([])
     expect((created.recipe as any).authoringRevision.state.siblings).toEqual([])
 

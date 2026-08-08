@@ -34,6 +34,8 @@ export class LipArtworkEngineRuntime {
   private readonly originalVisible: boolean
   private ownedMaterial: THREE.Material | null = null
   private ownedTexture: THREE.Texture | null = null
+  private enabled = true
+  private contentVisible: boolean
   private generation = 0
   private disposed = false
 
@@ -59,6 +61,17 @@ export class LipArtworkEngineRuntime {
     }
     this.originalMaterial = originalMaterial
     this.originalVisible = this.mesh.visible
+    this.contentVisible = this.originalVisible
+  }
+
+  private syncVisibility() {
+    this.mesh.visible = this.enabled && this.contentVisible
+  }
+
+  setEnabled(enabled: boolean) {
+    if (this.disposed) fail('cannot change presence after disposal')
+    this.enabled = enabled
+    this.syncVisibility()
   }
 
   async apply(value: LipArtworkStateV2 | null | undefined) {
@@ -102,7 +115,8 @@ export class LipArtworkEngineRuntime {
     const previousMaterial = this.ownedMaterial
     const previousTexture = this.ownedTexture
     this.mesh.material = material
-    this.mesh.visible = true
+    this.contentVisible = true
+    this.syncVisibility()
     this.ownedMaterial = material
     this.ownedTexture = loaded
     previousMaterial?.dispose()
@@ -112,7 +126,8 @@ export class LipArtworkEngineRuntime {
 
   private restoreOriginal() {
     this.mesh.material = this.originalMaterial
-    this.mesh.visible = this.originalVisible
+    this.contentVisible = this.originalVisible
+    this.syncVisibility()
     this.ownedMaterial?.dispose()
     this.ownedTexture?.dispose()
     this.ownedMaterial = null
@@ -122,6 +137,7 @@ export class LipArtworkEngineRuntime {
   dispose() {
     if (this.disposed) return
     this.generation += 1
+    this.enabled = true
     this.restoreOriginal()
     this.disposed = true
   }

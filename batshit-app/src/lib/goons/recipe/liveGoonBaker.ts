@@ -902,6 +902,8 @@ function buildMorphPlan(
   collectStrings(rawManifest.eyeAppearance, runtimeNames)
   collectStrings(rawManifest.oralAppearance, runtimeNames)
   collectStrings(rawManifest.lipArtwork, runtimeNames)
+  collectStrings(rawManifest.nailSurface, runtimeNames)
+  collectStrings(rawManifest.skinAppearance, runtimeNames)
   const rig = rawManifest.rig === undefined ? null : record(rawManifest.rig, 'avatar.json#rig')
   collectStrings(rig?.performance, runtimeNames)
   const socketEyeRuntimeMorphs = socketEyeRuntimeMorphsByNode(

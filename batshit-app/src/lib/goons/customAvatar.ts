@@ -8,6 +8,14 @@ import { isMountedRecipeLiveGoon } from "$lib/goons/recipe/recipeRuntimeProjecti
 import type { BatshitFaceControlId } from "$lib/goons/faceControls";
 import { sanitizeCustomRuntimeNodeName } from "$lib/goons/customRuntimeNames";
 import {
+  parseLipArtworkDefinition,
+  parseLipArtworkPresenceState,
+} from "$lib/goons/lipArtwork";
+import {
+  parseNailSurfaceDefinition,
+  parseNailSurfacePresenceState,
+} from "$lib/goons/nailSurface";
+import {
   ARKIT_52_CHANNEL_ORDER,
   AUDIO2FACE_16_TONGUE_CHANNEL_ORDER,
   resolveGoonSpeechFaceProfileDeclaration,
@@ -115,6 +123,10 @@ export type GoonCustomAvatarManifest = {
   oralAppearance?: unknown;
   /** Immutable first-party lip artwork definition; parsed before runtime use. */
   lipArtwork?: unknown;
+  /** Immutable first-party finger/toe Nail Surface definition. */
+  nailSurface?: unknown;
+  /** Immutable first-party regional skin pigment definition. */
+  skinAppearance?: unknown;
   /** Exact hidden-landmark and rigid-assembly Oral Cavity Fit authoring package. */
   oralCavityFit?: unknown;
   /** Authoring-time final-geometry fit definitions; stripped from Live output. */
@@ -910,6 +922,18 @@ export async function loadAvatarIntoEngine(
       throw new Error("Mounted Recipe Goon resolved an authoring package instead of active Live.");
     }
     engine.setSocketEyeContactSettings(goon.defaults?.socketEyeContact ?? null);
+    const lipArtworkEnabled = goon.lipArtworkPresence
+      ? parseLipArtworkPresenceState(
+          parseLipArtworkDefinition(manifest.lipArtwork),
+          goon.lipArtworkPresence,
+        ).enabled
+      : true;
+    const nailSurfaceEnabled = goon.nailSurfacePresence
+      ? parseNailSurfacePresenceState(
+          parseNailSurfaceDefinition(manifest.nailSurface),
+          goon.nailSurfacePresence,
+        ).enabled
+      : true;
     await engine.loadCustomGoon(avatarUrl, manifest, {
       ...(!isLeanLive
         ? { appearanceDialValues: goon.appearanceDials ?? null }
@@ -918,6 +942,11 @@ export async function loadAvatarIntoEngine(
       eyeAppearanceState: goon.eyeAppearance ?? null,
       oralAppearanceState: goon.oralAppearance ?? null,
       lipArtworkState: goon.lipArtwork ?? null,
+      lipArtworkEnabled,
+      nailSurfaceState: goon.nailSurface ?? null,
+      nailSurfaceEnabled,
+      skinAppearanceState: goon.skinAppearance ?? null,
+      skinMaterialArtworkState: goon.skinMaterialArtwork ?? null,
     });
     return { kind, manifest, role: isLeanLive ? "live" as const : "source" as const };
   }

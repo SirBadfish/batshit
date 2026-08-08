@@ -76,6 +76,17 @@ describe('goonAssetCleanupService', () => {
           }
         }
       },
+      nailSurface: {
+        appearance: {
+          fingers: {
+            artwork: {
+              url: 'http://localhost:5601/uploads/goon_nail_artwork/fingers.png',
+              filename: 'fingers.png'
+            }
+          },
+          toes: { artwork: null }
+        }
+      },
       created_at: '2026-05-22T00:00:00.000Z',
       updated_at: '2026-05-22T00:00:00.000Z'
     })
@@ -186,6 +197,7 @@ describe('goonAssetCleanupService', () => {
     await seedUpload('goon_room_textures', 'terrain.png')
     await seedUpload('goon_scene_props', 'chair.glb')
     await seedUpload('goon_facial_artwork', 'brow-left.png')
+    await seedUpload('goon_nail_artwork', 'fingers.png')
 
     const audit = await auditGoonUploadAssets('josh')
 
@@ -196,6 +208,7 @@ describe('goonAssetCleanupService', () => {
     expect(audit.entries.find((entry) => entry.filename === 'room_thumb.jpg')?.referenced).toBe(true)
     expect(audit.entries.find((entry) => entry.filename === 'terrain.png')?.referenced).toBe(true)
     expect(audit.entries.find((entry) => entry.filename === 'brow-left.png')?.referenced).toBe(true)
+    expect(audit.entries.find((entry) => entry.filename === 'fingers.png')?.referenced).toBe(true)
   })
 
   it('deletes only orphaned Goon upload records during cleanup', async () => {

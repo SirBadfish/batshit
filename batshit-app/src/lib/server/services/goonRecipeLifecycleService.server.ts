@@ -95,6 +95,10 @@ import {
   getInternalBatshitServerAuthHeaders,
   getInternalBatshitServerUrl
 } from './batshitServerUrls'
+import {
+  validateGoonLegacySkinMaterialArtworkState,
+  validateGoonSkinAppearanceState
+} from './skinAppearance.server'
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000
 const ZERO_SHA256 = '0'.repeat(64)
@@ -107,6 +111,63 @@ export class GoonRecipeLifecycleError extends Error {
   ) {
     super(message)
     this.name = 'GoonRecipeLifecycleError'
+  }
+}
+
+async function validateSkinSurfaceSiblingOwnership(
+  goon: GoonRecord,
+  state: RecipeStateSnapshot
+) {
+  const surfaceMatches = state.siblings.filter(
+    (entry) =>
+      entry.id === 'skin-appearance' ||
+      entry.id === 'skinAppearance' ||
+      entry.contract === 'skin-appearance-state/v2'
+  )
+  if (surfaceMatches.length > 1) {
+    throw new GoonRecipeLifecycleError(
+      'INVALID_STATE',
+      'Recipe State contains more than one Skin Appearance sibling.',
+      400
+    )
+  }
+  const legacyMatches = state.siblings.filter(
+    (entry) =>
+      entry.id === 'skin-material-artwork' ||
+      entry.id === 'skinMaterialArtwork' ||
+      entry.contract === 'skin-material-artwork-state/v1' ||
+      entry.contract === 'skin-material-artwork-state/v2'
+  )
+  if (legacyMatches.length > 1) {
+    throw new GoonRecipeLifecycleError(
+      'INVALID_STATE',
+      'Recipe State contains more than one Base Color Artwork sibling.',
+      400
+    )
+  }
+  try {
+    await redis.execute(async (client) => {
+      if (surfaceMatches[0]?.contract === 'skin-appearance-state/v2') {
+        await validateGoonSkinAppearanceState(
+          client as any,
+          goon,
+          surfaceMatches[0].state
+        )
+      }
+      if (legacyMatches[0]) {
+        await validateGoonLegacySkinMaterialArtworkState(
+          client as any,
+          goon,
+          legacyMatches[0].state
+        )
+      }
+    })
+  } catch (error) {
+    throw new GoonRecipeLifecycleError(
+      'INVALID_STATE',
+      error instanceof Error ? error.message : String(error),
+      400
+    )
   }
 }
 
@@ -401,6 +462,7 @@ export async function bootstrapRecipeV2(input: {
   const expectedManagedState = createRecipeBootstrapManagedSnapshot(goon)
   const archive = await loadArchive(input.receipt, readAsset)
   const submittedState = await verifyRecipeStateSnapshot(input.state)
+  await validateSkinSurfaceSiblingOwnership(goon, submittedState)
   const stateWithoutAnatomyFit = await withoutAnatomyFitRecipeSibling(submittedState)
   let state: RecipeStateSnapshot
   try {
@@ -1461,6 +1523,7 @@ export async function startRecipeBake(
     throw new GoonRecipeLifecycleError('RECIPE_BUSY', 'Recover current Recipe work before rebuilding.', 409)
   }
   const state = await verifyRecipeStateSnapshot(input.state)
+  await validateSkinSurfaceSiblingOwnership(goon, state)
   const source = await loadArchiveFromDocument(
     input.userId,
     input.goonId,

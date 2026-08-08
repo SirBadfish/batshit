@@ -1,0 +1,124 @@
+{
+  "canvas": {
+    "colorSpace": "srgb",
+    "flipY": false,
+    "height": 4096,
+    "width": 4096
+  },
+  "compositionOrder": [
+    "baseSkin",
+    "nipplesAreolae",
+    "palmsSoles",
+    "cheekBlush"
+  ],
+  "controls": [
+    {
+      "defaultColor": [
+        0.729412,
+        0.486275,
+        0.407843
+      ],
+      "description": "Sets the general body-skin color without changing regional extent.",
+      "id": "baseSkin",
+      "label": "Base Skin",
+      "modes": [
+        "inherit",
+        "custom"
+      ]
+    },
+    {
+      "defaultColor": [
+        0.647059,
+        0.329412,
+        0.356863
+      ],
+      "description": "Sets one shared bilateral color inside the package-authored nipple and areola extent.",
+      "id": "nipplesAreolae",
+      "label": "Nipples & Areolae",
+      "modes": [
+        "inherit",
+        "custom"
+      ]
+    },
+    {
+      "defaultColor": [
+        0.854902,
+        0.615686,
+        0.517647
+      ],
+      "description": "Sets one shared color through the broad, island-safe palm and sole fade.",
+      "id": "palmsSoles",
+      "label": "Palms & Soles",
+      "modes": [
+        "inherit",
+        "custom"
+      ]
+    },
+    {
+      "defaultColor": [
+        0.847059,
+        0.407843,
+        0.423529
+      ],
+      "description": "Uses the package blush, removes it completely, or applies a custom color without changing its extent.",
+      "id": "cheekBlush",
+      "label": "Cheek Blush",
+      "modes": [
+        "inherit",
+        "off",
+        "custom"
+      ]
+    }
+  ],
+  "defaultLaw": "Null state or per-region inherit restores exact package-authored pixels. Cheek off restores true base-skin color through the package cheek extent.",
+  "definitionSha256": "d1a609899ed6c67463c67f141adb3f3e5277e83921501d23907bb88762af8c52",
+  "masks": {
+    "cheekBlush": {
+      "channels": "alpha-rgba8",
+      "height": 2048,
+      "path": "goons/skin-appearance/v1/batshit-base-f-v1/masks/cheek-blush.png",
+      "sha256": "0d00b8cc8c96ef310cb2998dad18442593221c2537d5a2f91b6aef969b0dfe01",
+      "width": 2048
+    },
+    "generalSkin": {
+      "channels": "alpha-rgba8",
+      "height": 2048,
+      "path": "goons/skin-appearance/v1/batshit-base-f-v1/masks/general-skin.png",
+      "sha256": "0be9c6bd6772f42fa0d7d05981805a2901145793ffe8e9b2b5153ae7ef64827b",
+      "width": 2048
+    },
+    "nipplesAreolae": {
+      "channels": "alpha-rgba8",
+      "height": 2048,
+      "path": "goons/skin-appearance/v1/batshit-base-f-v1/masks/nipples-areolae.png",
+      "sha256": "53d02e8457e302c996fb3e6fee2f8418e3ea6e50dcef489dceb8aadcf7747ab7",
+      "width": 2048
+    },
+    "palmsSoles": {
+      "channels": "alpha-rgba8",
+      "height": 2048,
+      "path": "goons/skin-appearance/v1/batshit-base-f-v1/masks/palms-soles.png",
+      "sha256": "4a6ffc820037c0847b356d0fa95766169db343cb67f91ce14ebe17bcc1cf85aa",
+      "width": 2048
+    }
+  },
+  "materialDefaults": {
+    "color": [
+      1,
+      1,
+      1
+    ],
+    "metalness": 0.0,
+    "roughness": 0.699999988079071
+  },
+  "ownership": "Skin Appearance owns body-albedo pigment for base skin, shared nipples/areolae, shared palms/soles, and cheek blush. Lip Color remains owned by lip-artwork/v2; Nail Surface remains owned by nail-surface/v1.",
+  "productExportApproved": true,
+  "runtimeBinding": {
+    "baseColorTextureSha256": "e90f5f9badd5836cb7211fc10860a3310338ad362ff70034a30c69a71ebed81a",
+    "material": "bs_f1_body_mat",
+    "node": "bs_f1_body"
+  },
+  "schemaVersion": "skin-appearance/v1",
+  "stateSchemaVersion": "skin-appearance-state/v1",
+  "status": "product-master-art-accepted-v1"
+}

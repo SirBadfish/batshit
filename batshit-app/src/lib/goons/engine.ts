@@ -93,6 +93,16 @@ import {
   reapplyGroundProjectionLineToGeometry
 } from '$lib/goons/sceneSkybox'
 import {
+  GoonSceneLighting,
+  applyGoonToneMapping,
+  resolveGoonLightingBrightness,
+  resolveGoonLightingMode,
+  resolveGoonToneMappingMode,
+  type GoonLightingMode,
+  type GoonStudioLightingTuning,
+  type GoonToneMappingMode
+} from '$lib/goons/sceneLighting'
+import {
   GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY,
   clampCameraPositionToPaddedBox,
   pointerClientToNdc,
@@ -238,6 +248,18 @@ import {
   type LipArtworkDefinitionV2,
   type LipArtworkStateV2
 } from '$lib/goons/lipArtwork'
+import { NailSurfaceEngineRuntime } from '$lib/goons/nailSurface.engine'
+import {
+  parseSkinAppearanceDefinition,
+  type SkinAppearanceDefinitionV1,
+  type SkinAppearanceStateV2
+} from '$lib/goons/skinAppearance'
+import { SkinAppearanceEngineRuntime } from '$lib/goons/skinAppearance.engine'
+import {
+  parseNailSurfaceDefinition,
+  type NailSurfaceDefinitionV1,
+  type NailSurfaceStateV1
+} from '$lib/goons/nailSurface'
 import { classifyFacialArtworkPackageCapability } from '$lib/goons/facialArtwork.package'
 import { parseFirstPartySocketEyePackage } from '$lib/goons/socketEyePackage'
 import {
@@ -827,6 +849,9 @@ export class GoonEngine implements GoonStageHost {
   private activeMaxTextureArrayLayersRequirement = 0
   private sceneLightingInitialized = false
   private scene = new THREE.Scene()
+  private sceneLighting = new GoonSceneLighting(this.scene)
+  private lightingMode: GoonLightingMode = 'legacy'
+  private toneMappingMode: GoonToneMappingMode = 'none'
   private sceneRoot = new THREE.Group()
   private skyboxScene = new THREE.Scene()
   private skyboxCamera = new THREE.PerspectiveCamera(70, 1, 0.1, 200)
@@ -1086,6 +1111,13 @@ export class GoonEngine implements GoonStageHost {
   private lipArtworkRuntime: LipArtworkEngineRuntime | null = null
   private lipArtworkDefinition: LipArtworkDefinitionV2 | null = null
   private lipArtworkState: LipArtworkStateV2 | null = null
+  private nailSurfaceRuntime: NailSurfaceEngineRuntime | null = null
+  private nailSurfaceDefinition: NailSurfaceDefinitionV1 | null = null
+  private nailSurfaceState: NailSurfaceStateV1 | null = null
+  private skinAppearanceRuntime: SkinAppearanceEngineRuntime | null = null
+  private skinAppearanceDefinition: SkinAppearanceDefinitionV1 | null = null
+  private skinAppearanceState: SkinAppearanceStateV2 | null = null
+  private legacySkinMaterialArtworkState: unknown = null
   // ------------------------------------ joint-driven correctives (SA-090)
   private jointCorrectivesSpec: JointCorrectivesSpec | null = null
   private liveJointCorrectivesSpec: LiveJointCorrectivesSpec | null = null
@@ -1213,6 +1245,10 @@ export class GoonEngine implements GoonStageHost {
     this.embeddedWebKitRuntime = this.resolveEmbeddedWebKitRuntime()
     this.forceWebGL2 =
       options.forceWebGL2 ?? this.resolveDebugToggle('goonForceWebGL2', 'batshit:goonForceWebGL2')
+    this.lightingMode = resolveGoonLightingMode()
+    this.toneMappingMode = resolveGoonToneMappingMode()
+    this.sceneLighting.setTuning({ brightness: resolveGoonLightingBrightness() })
+    this.sceneLighting.setToneMappingModeForDiagnostics(this.toneMappingMode)
     this.debugRootMotionEnabled =
       options.debugRootMotion ?? this.resolveDebugToggle('goonRootMotionDebug', 'batshit:goonRootMotionDebug')
     this.eyeLookDebugEnabled = this.resolveDebugToggle('goonEyeLookDebug', 'batshit:goonEyeLookDebug')
@@ -1613,6 +1649,7 @@ export class GoonEngine implements GoonStageHost {
       this.setRuntimeStatus(this.resolveRendererRuntime(renderer))
       renderer.setClearColor(0x000000, 1)
       renderer.outputColorSpace = THREE.SRGBColorSpace
+      applyGoonToneMapping(renderer, this.toneMappingMode)
       renderer.autoClear = false
       this.renderer = renderer
       if (typeof document !== 'undefined') {
@@ -1677,10 +1714,7 @@ export class GoonEngine implements GoonStageHost {
       this.skyboxCamera.fov = this.camera.fov
 
       if (!this.sceneLightingInitialized) {
-        const ambient = new THREE.AmbientLight(0xffffff, 0.6)
-        const key = new THREE.DirectionalLight(0xffffff, 0.8)
-        key.position.set(1, 2, 2)
-        this.scene.add(ambient, key)
+        this.sceneLighting.applyMode(this.lightingMode, renderer)
         this.scene.add(this.sceneRoot)
         this.sceneLightingInitialized = true
       }
@@ -1742,6 +1776,7 @@ export class GoonEngine implements GoonStageHost {
       const effectiveGuidedManifest = guidedManifest ?? embeddedManifest
 
       this.vrm = vrm
+      this.syncLightingLane()
       if (vrm.lookAt) {
         const existingProxy = vrm.scene.children.find(
           (child) => child instanceof VRMLookAtQuaternionProxy
@@ -1797,6 +1832,12 @@ export class GoonEngine implements GoonStageHost {
       eyeAppearanceState?: EyeAppearanceStateV3 | null
       oralAppearanceState?: OralAppearanceStateV1 | null
       lipArtworkState?: LipArtworkStateV2 | null
+      lipArtworkEnabled?: boolean
+      nailSurfaceState?: NailSurfaceStateV1 | null
+      nailSurfaceEnabled?: boolean
+      skinAppearanceState?: SkinAppearanceStateV2 | unknown | null
+      /** @deprecated Read-only migration input for pre-surface Recipe state. */
+      skinMaterialArtworkState?: unknown
     } = {}
   ) {
     const socketEyePackage = parseFirstPartySocketEyePackage(manifest)
@@ -1832,6 +1873,7 @@ export class GoonEngine implements GoonStageHost {
       }
 
       this.customAvatarRoot = scene
+      this.syncLightingLane()
       this.customAvatarManifest = manifest
       this.disableAvatarMeshCulling(scene)
       scene.visible = this.goonVisible
@@ -1882,7 +1924,21 @@ export class GoonEngine implements GoonStageHost {
         }
       }
       this.setupOralAppearance(manifest, options.oralAppearanceState ?? null)
-      await this.setupLipArtwork(manifest, options.lipArtworkState ?? null)
+      await this.setupLipArtwork(
+        manifest,
+        options.lipArtworkState ?? null,
+        options.lipArtworkEnabled ?? true
+      )
+      await this.setupNailSurface(
+        manifest,
+        options.nailSurfaceState ?? null,
+        options.nailSurfaceEnabled ?? true
+      )
+      await this.setupSkinAppearance(
+        manifest,
+        options.skinAppearanceState ?? null,
+        options.skinMaterialArtworkState ?? null
+      )
       // Performance-rig/v2 depends on the socket-eye surface. Bind it only
       // after every appearance runtime has completed so a failed eye setup
       // cannot leave a half-active performance driver behind.
@@ -2325,6 +2381,15 @@ export class GoonEngine implements GoonStageHost {
     this.lipArtworkRuntime = null
     this.lipArtworkDefinition = null
     this.lipArtworkState = null
+    this.nailSurfaceRuntime?.dispose()
+    this.nailSurfaceRuntime = null
+    this.nailSurfaceDefinition = null
+    this.nailSurfaceState = null
+    this.skinAppearanceRuntime?.dispose()
+    this.skinAppearanceRuntime = null
+    this.skinAppearanceDefinition = null
+    this.skinAppearanceState = null
+    this.legacySkinMaterialArtworkState = null
     this.resetMaterialOverrides()
     this.releaseAllMaterialRuntimeTextures()
     this.clearBodyConcealRuntime()
@@ -2339,6 +2404,7 @@ export class GoonEngine implements GoonStageHost {
       this.disposeObject3D(this.customAvatarRoot)
       this.customAvatarRoot = null
     }
+    this.syncLightingLane()
     this.customAvatarManifest = null
     this.customStageAnchors = {}
 
@@ -2939,13 +3005,23 @@ export class GoonEngine implements GoonStageHost {
     if (applied) this.lipArtworkState = value
   }
 
+  setLipArtworkEnabled(enabled: boolean) {
+    const runtime = this.lipArtworkRuntime
+    if (!runtime) {
+      if (!enabled) throw new Error('The loaded Goon package does not support Lip Artwork.')
+      return
+    }
+    runtime.setEnabled(enabled)
+  }
+
   private async setupLipArtwork(
     manifest: GoonCustomAvatarManifest,
-    initialState: LipArtworkStateV2 | null
+    initialState: LipArtworkStateV2 | null,
+    enabled: boolean
   ) {
     const rawDefinition = manifest.lipArtwork
     if (rawDefinition === undefined || rawDefinition === null) {
-      if (initialState) {
+      if (initialState || !enabled) {
         throw new Error('Saved Lip Artwork state targets a package without lip-artwork/v2.')
       }
       return
@@ -2962,6 +3038,7 @@ export class GoonEngine implements GoonStageHost {
     const runtime = new LipArtworkEngineRuntime(root, definition)
     try {
       await runtime.apply(initialState)
+      runtime.setEnabled(enabled)
     } catch (error) {
       runtime.dispose()
       throw error
@@ -2969,6 +3046,134 @@ export class GoonEngine implements GoonStageHost {
     this.lipArtworkRuntime = runtime
     this.lipArtworkDefinition = definition
     this.lipArtworkState = initialState
+  }
+
+  getNailSurfaceDefinition() {
+    return this.nailSurfaceDefinition
+  }
+
+  async setNailSurfaceState(value: NailSurfaceStateV1 | null) {
+    const runtime = this.nailSurfaceRuntime
+    if (!runtime) {
+      if (value) throw new Error('The loaded Goon package does not support Nail Surface.')
+      return
+    }
+    const applied = await runtime.apply(value)
+    if (applied) this.nailSurfaceState = value
+  }
+
+  setNailSurfaceEnabled(enabled: boolean) {
+    const runtime = this.nailSurfaceRuntime
+    if (!runtime) {
+      if (!enabled) throw new Error('The loaded Goon package does not support Nail Surface.')
+      return
+    }
+    runtime.setEnabled(enabled)
+  }
+
+  private async setupNailSurface(
+    manifest: GoonCustomAvatarManifest,
+    initialState: NailSurfaceStateV1 | null,
+    enabled: boolean
+  ) {
+    const rawDefinition = manifest.nailSurface
+    if (rawDefinition === undefined || rawDefinition === null) {
+      if (initialState || !enabled) {
+        throw new Error('Saved Nail Surface state targets a package without nail-surface/v1.')
+      }
+      return
+    }
+    if (
+      (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
+      (manifest.liveBuild === undefined || manifest.liveBuild === null)
+    ) {
+      throw new Error('nail-surface/v1 requires a Recipe Source or verified Live Goon package.')
+    }
+    const definition = parseNailSurfaceDefinition(rawDefinition)
+    const root = this.customAvatarRoot
+    if (!root) throw new Error('Custom avatar root is missing during Nail Surface setup.')
+    const runtime = new NailSurfaceEngineRuntime(root, definition, initialState)
+    try {
+      await runtime.apply(initialState)
+      runtime.setEnabled(enabled)
+    } catch (error) {
+      runtime.dispose()
+      throw error
+    }
+    this.nailSurfaceRuntime = runtime
+    this.nailSurfaceDefinition = definition
+    this.nailSurfaceState = initialState
+  }
+
+  getSkinAppearanceDefinition() {
+    return this.skinAppearanceDefinition
+  }
+
+  async setSkinAppearanceState(value: SkinAppearanceStateV2 | null) {
+    return this.setSkinMaterialState(value)
+  }
+
+  async setSkinMaterialState(
+    appearance: SkinAppearanceStateV2 | unknown | null,
+    legacyArtwork: unknown = null
+  ) {
+    const runtime = this.skinAppearanceRuntime
+    if (!runtime) {
+      if (appearance || legacyArtwork) {
+        throw new Error('The loaded Goon package does not support Skin Appearance.')
+      }
+      return
+    }
+    const applied = await runtime.apply(appearance, legacyArtwork)
+    if (applied) {
+      this.skinAppearanceState = appearance as SkinAppearanceStateV2 | null
+      this.legacySkinMaterialArtworkState = legacyArtwork
+    }
+  }
+
+  /** @deprecated Use setSkinAppearanceState with skin-appearance-state/v2. */
+  async setSkinMaterialArtworkState(value: unknown) {
+    return this.setSkinMaterialState(this.skinAppearanceState, value)
+  }
+
+  private async setupSkinAppearance(
+    manifest: GoonCustomAvatarManifest,
+    initialState: SkinAppearanceStateV2 | unknown | null,
+    initialMaterialArtwork: unknown
+  ) {
+    const rawDefinition = manifest.skinAppearance
+    if (rawDefinition === undefined || rawDefinition === null) {
+      if (initialState || initialMaterialArtwork) {
+        throw new Error(
+          'Saved Skin Appearance state targets a package without skin-appearance/v1.'
+        )
+      }
+      return
+    }
+    if (
+      (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
+      (manifest.liveBuild === undefined || manifest.liveBuild === null)
+    ) {
+      throw new Error(
+        'skin-appearance/v1 requires a Recipe Source or verified Live Goon package.'
+      )
+    }
+    const definition = parseSkinAppearanceDefinition(rawDefinition)
+    const root = this.customAvatarRoot
+    if (!root) {
+      throw new Error('Custom avatar root is missing during Skin Appearance setup.')
+    }
+    const runtime = new SkinAppearanceEngineRuntime(root, definition)
+    try {
+      await runtime.apply(initialState, initialMaterialArtwork)
+    } catch (error) {
+      runtime.dispose()
+      throw error
+    }
+    this.skinAppearanceRuntime = runtime
+    this.skinAppearanceDefinition = definition
+    this.skinAppearanceState = initialState as SkinAppearanceStateV2 | null
+    this.legacySkinMaterialArtworkState = initialMaterialArtwork
   }
 
   private async setupFacialArtwork(
@@ -6119,6 +6324,54 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
+  /**
+   * SA-090 lighting A/B (research ladder L1/L2). `legacy` is the exact rig every
+   * currently accepted Goon was reviewed under and stays the default; `studio`
+   * adds image-based lighting plus a hemisphere fill so surface orientation
+   * carries light away from the key.
+   */
+  setLightingMode(mode: GoonLightingMode) {
+    if (this.lightingMode === mode) return
+    this.lightingMode = mode
+    if (!this.sceneLightingInitialized) return
+    this.sceneLighting.applyMode(mode, this.renderer ?? null)
+    this.syncLightingLane()
+  }
+
+  /**
+   * Tells the lighting rig whether anything in the scene can consume
+   * `scene.environment`. Only the first-party GLB lane can; VRM/MToon cannot,
+   * and silently loses ~69% of the studio rig without this.
+   */
+  private syncLightingLane() {
+    this.sceneLighting.setEnvironmentConsumerPresent(!!this.customAvatarRoot)
+  }
+
+  getLightingMode(): GoonLightingMode {
+    return this.lightingMode
+  }
+
+  /** SA-090 lighting A/B (research ladder L4). Changes every Goon and scene. */
+  setToneMappingMode(mode: GoonToneMappingMode) {
+    if (this.toneMappingMode === mode) return
+    this.toneMappingMode = mode
+    if (!this.renderer) return
+    applyGoonToneMapping(this.renderer, mode)
+  }
+
+  getToneMappingMode(): GoonToneMappingMode {
+    return this.toneMappingMode
+  }
+
+  /** Live studio-rig calibration for review sessions. No effect in `legacy`. */
+  setStudioLightingTuning(tuning: Partial<GoonStudioLightingTuning>) {
+    this.sceneLighting.setTuning(tuning)
+  }
+
+  getStudioLightingTuning(): GoonStudioLightingTuning {
+    return this.sceneLighting.getTuning()
+  }
+
   setPaused(paused: boolean) {
     if (this.paused === paused) return
     this.paused = paused
@@ -8364,6 +8617,8 @@ export class GoonEngine implements GoonStageHost {
       clearTimeout(this.cameraChangeTimer)
       this.cameraChangeTimer = null
     }
+    this.sceneLighting.dispose()
+    this.sceneLightingInitialized = false
     this.resetMaterialOverrides()
     this.releaseAllMaterialRuntimeTextures()
     if (this.vrm) {

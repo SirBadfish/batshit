@@ -197,6 +197,7 @@ export type FacialArtworkReconciliation = {
 }
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/
+const COLOR_DECIMAL_SCALE = 1_000_000
 const SOURCE_KINDS = new Set<FacialArtworkProvenance['sourceKind']>([
   'batshit-original',
   'user-authored',
@@ -250,6 +251,13 @@ function bounded(value: unknown, bounds: [number, number], context: string): num
   return parsed
 }
 
+function stableColorUnit(value: unknown, context: string): number {
+  return (
+    Math.round(bounded(value, [0, 1], context) * COLOR_DECIMAL_SCALE) /
+    COLOR_DECIMAL_SCALE
+  )
+}
+
 function tuple2(value: unknown, context: string): [number, number] {
   if (!Array.isArray(value) || value.length !== 2) fail(`${context} must contain two numbers`)
   const result: [number, number] = [finite(value[0], `${context}[0]`), finite(value[1], `${context}[1]`)]
@@ -259,12 +267,16 @@ function tuple2(value: unknown, context: string): [number, number] {
 
 function rgb(value: unknown, context: string): FacialArtworkRgb {
   if (!Array.isArray(value) || value.length !== 3) fail(`${context} must contain three channels`)
-  return value.map((channel, index) => bounded(channel, [0, 1], `${context}[${index}]`)) as FacialArtworkRgb
+  return value.map((channel, index) =>
+    stableColorUnit(channel, `${context}[${index}]`)
+  ) as FacialArtworkRgb
 }
 
 function rgba(value: unknown, context: string): FacialArtworkRgba {
   if (!Array.isArray(value) || value.length !== 4) fail(`${context} must contain four channels`)
-  return value.map((channel, index) => bounded(channel, [0, 1], `${context}[${index}]`)) as FacialArtworkRgba
+  return value.map((channel, index) =>
+    stableColorUnit(channel, `${context}[${index}]`)
+  ) as FacialArtworkRgba
 }
 
 function hash(value: unknown, context: string): string {

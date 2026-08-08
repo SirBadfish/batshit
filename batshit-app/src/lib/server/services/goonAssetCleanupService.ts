@@ -25,6 +25,8 @@ export const GOON_UPLOAD_TYPES = [
   'goon_animation_previews',
   'goon_closet',
   'goon_facial_artwork',
+  'goon_nail_artwork',
+  'goon_skin_artwork',
   'goon_scenes',
   'goon_scene_thumbs',
   'goon_room_shells',

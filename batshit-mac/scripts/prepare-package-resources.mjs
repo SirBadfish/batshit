@@ -16,11 +16,15 @@ const serverSource = join(repoRoot, 'batshit-server', 'server');
 const liveKitSidecarSource = join(repoRoot, 'tools', 'livekit-agent-sidecar');
 const facialArtworkSource = join(appSource, 'static', 'goons', 'facial-artwork', 'v4');
 const lipArtworkSource = join(appSource, 'static', 'goons', 'lip-artwork', 'v2');
+const nailSurfaceSource = join(appSource, 'static', 'goons', 'nail-surface', 'v1');
+const skinAppearanceSource = join(appSource, 'static', 'goons', 'skin-appearance', 'v1');
 const appDest = join(runtimePath, 'batshit-app');
 const serverDest = join(runtimePath, 'batshit-server', 'server');
 const liveKitSidecarDest = join(runtimePath, 'tools', 'livekit-agent-sidecar');
 const facialArtworkDest = join(runtimePath, 'assets', 'goons', 'facial-artwork', 'v4');
 const lipArtworkDest = join(runtimePath, 'assets', 'goons', 'lip-artwork', 'v2');
+const nailSurfaceDest = join(runtimePath, 'assets', 'goons', 'nail-surface', 'v1');
+const skinAppearanceDest = join(runtimePath, 'assets', 'goons', 'skin-appearance', 'v1');
 const nodeRuntimeDest = join(runtimePath, 'vendor', 'node');
 const redisStackRuntimeDest = join(runtimePath, 'vendor', 'redis-stack');
 const ffmpegRuntimeDest = join(runtimePath, 'vendor', 'ffmpeg');
@@ -171,6 +175,38 @@ async function copyLipArtworkAssets() {
     contract: 'lip-artwork/v2',
     root: 'assets/goons/lip-artwork/v2',
     definition: 'lip-artwork-v2.json',
+    files
+  };
+}
+
+async function copyNailSurfaceAssets() {
+  await copyRequired(nailSurfaceSource, nailSurfaceDest);
+  const files = await inventoryFiles(nailSurfaceSource);
+  if (files.length !== 9 || !files.some((entry) => entry.path === 'nail-surface-v1.json')) {
+    throw new Error(
+      `Nail Surface package input is incomplete: expected the v1 definition plus eight finger/toe template assets, found ${files.length}`
+    );
+  }
+  return {
+    contract: 'nail-surface/v1',
+    root: 'assets/goons/nail-surface/v1',
+    definition: 'nail-surface-v1.json',
+    files
+  };
+}
+
+async function copySkinAppearanceAssets() {
+  await copyRequired(skinAppearanceSource, skinAppearanceDest);
+  const files = await inventoryFiles(skinAppearanceSource);
+  if (files.length !== 5 || !files.some((entry) => entry.path === 'skin-appearance-v1.json')) {
+    throw new Error(
+      `Skin Appearance package input is incomplete: expected the v1 definition plus four region masks, found ${files.length}`
+    );
+  }
+  return {
+    contract: 'skin-appearance/v1',
+    root: 'assets/goons/skin-appearance/v1',
+    definition: 'skin-appearance-v1.json',
     files
   };
 }
@@ -430,6 +466,8 @@ async function main() {
   }
   const facialArtworkAssets = await copyFacialArtworkAssets();
   const lipArtworkAssets = await copyLipArtworkAssets();
+  const nailSurfaceAssets = await copyNailSurfaceAssets();
+  const skinAppearanceAssets = await copySkinAppearanceAssets();
   await copyLiveKitSidecarSourcePackage();
   const managedRuntimeEntries = await Promise.all([
     copyManagedNodeRuntime(),
@@ -450,7 +488,9 @@ async function main() {
         liveKitSidecar: 'tools/livekit-agent-sidecar source package for native runtime install',
         assets: {
           facialArtwork: facialArtworkAssets,
-          lipArtwork: lipArtworkAssets
+          lipArtwork: lipArtworkAssets,
+          nailSurface: nailSurfaceAssets,
+          skinAppearance: skinAppearanceAssets
         },
         managedRuntimes
       },

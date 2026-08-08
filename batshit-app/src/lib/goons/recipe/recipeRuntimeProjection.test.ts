@@ -66,6 +66,33 @@ function state(): RecipeStateSnapshot {
         schemaVersion: 'oral-appearance-state/v1',
         definitionSha256: SHA_C,
         values: { tongue_rest: 0.2 }
+      }),
+      sibling('nailSurface', 'nail-surface-state/v1', SHA_D, {
+        schemaVersion: 'nail-surface-state/v1',
+        definitionSha256: SHA_D,
+        geometry: {},
+        appearance: {}
+      }),
+      sibling('lipArtworkPresence', 'lip-artwork-presence-state/v1', SHA_A, {
+        schemaVersion: 'lip-artwork-presence-state/v1',
+        definitionSha256: SHA_A,
+        enabled: false
+      }),
+      sibling('nailSurfacePresence', 'nail-surface-presence-state/v1', SHA_D, {
+        schemaVersion: 'nail-surface-presence-state/v1',
+        definitionSha256: SHA_D,
+        enabled: false
+      }),
+      sibling('skinAppearance', 'skin-appearance-state/v1', SHA_A, {
+        schemaVersion: 'skin-appearance-state/v1',
+        definitionSha256: SHA_A,
+        regions: {}
+      }),
+      sibling('skinMaterialArtwork', 'skin-material-artwork-state/v2', SHA_A, {
+        schemaVersion: 'skin-material-artwork-state/v2',
+        definitionSha256: SHA_A,
+        baseColor: {},
+        tint: [1, 1, 1]
       })
     ]
   }
@@ -197,6 +224,13 @@ describe('Recipe runtime projection', () => {
     expect(editorGoon.facialArtwork?.schemaVersion).toBe('facial-artwork-state/v4')
     expect(editorGoon.eyeAppearance?.schemaVersion).toBe('eye-appearance-state/v3')
     expect(editorGoon.oralAppearance?.schemaVersion).toBe('oral-appearance-state/v1')
+    expect(editorGoon.nailSurface?.schemaVersion).toBe('nail-surface-state/v1')
+    expect(editorGoon.lipArtworkPresence?.enabled).toBe(false)
+    expect(editorGoon.nailSurfacePresence?.enabled).toBe(false)
+    expect(editorGoon.skinAppearance?.schemaVersion).toBe('skin-appearance-state/v1')
+    expect(editorGoon.skinMaterialArtwork?.schemaVersion).toBe(
+      'skin-material-artwork-state/v2'
+    )
     expect(liveGoon.customAvatar?.model?.url).toBe('/live/avatar.glb')
   })
 
@@ -225,6 +259,11 @@ describe('Recipe runtime projection', () => {
     expect(target.facialArtwork?.definitionSha256).toBe(SHA_A)
     expect(target.eyeAppearance?.definitionSha256).toBe(SHA_B)
     expect(target.oralAppearance?.definitionSha256).toBe(SHA_C)
+    expect(target.nailSurface?.definitionSha256).toBe(SHA_D)
+    expect(target.lipArtworkPresence?.enabled).toBe(false)
+    expect(target.nailSurfacePresence?.enabled).toBe(false)
+    expect(target.skinAppearance?.definitionSha256).toBe(SHA_A)
+    expect(target.skinMaterialArtwork?.definitionSha256).toBe(SHA_A)
   })
 
   it('rejects an ambiguous sibling projection instead of mixing revisions', () => {

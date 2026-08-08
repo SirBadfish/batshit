@@ -8,6 +8,8 @@ export const RECIPE_BUILD_DIRTY_DOMAINS = [
   'eye-appearance',
   'oral-appearance',
   'lip-artwork',
+  'nail-surface',
+  'skin-appearance',
   'recipe-state'
 ] as const
 
@@ -30,7 +32,13 @@ const SIBLING_DOMAIN_ALIASES: Record<string, RecipeBuildDirtyDomain> = {
   oralAppearance: 'oral-appearance',
   'oral-appearance': 'oral-appearance',
   lipArtwork: 'lip-artwork',
-  'lip-artwork': 'lip-artwork'
+  'lip-artwork': 'lip-artwork',
+  nailSurface: 'nail-surface',
+  'nail-surface': 'nail-surface',
+  skinAppearance: 'skin-appearance',
+  'skin-appearance': 'skin-appearance',
+  skinMaterialArtwork: 'skin-appearance',
+  'skin-material-artwork': 'skin-appearance'
 }
 
 function siblingDomain(sibling: RecipeSiblingStateRecord): RecipeBuildDirtyDomain {
@@ -40,6 +48,14 @@ function siblingDomain(sibling: RecipeSiblingStateRecord): RecipeBuildDirtyDomai
   if (sibling.contract === 'eye-appearance-state/v3') return 'eye-appearance'
   if (sibling.contract.startsWith('oral-appearance-state/')) return 'oral-appearance'
   if (sibling.contract === 'lip-artwork-state/v2') return 'lip-artwork'
+  if (sibling.contract === 'lip-artwork-presence-state/v1') return 'lip-artwork'
+  if (sibling.contract === 'nail-surface-state/v1') return 'nail-surface'
+  if (sibling.contract === 'nail-surface-presence-state/v1') return 'nail-surface'
+  if (sibling.contract === 'skin-appearance-state/v1') return 'skin-appearance'
+  if (
+    sibling.contract === 'skin-material-artwork-state/v1' ||
+    sibling.contract === 'skin-material-artwork-state/v2'
+  ) return 'skin-appearance'
   return `recipe-sibling:${sibling.id}`
 }
 

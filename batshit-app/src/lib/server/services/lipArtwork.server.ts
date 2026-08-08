@@ -1,7 +1,9 @@
 import {
   parseLipArtworkDefinition,
+  parseLipArtworkPresenceState,
   parseLipArtworkState,
   type LipArtworkDefinitionV2,
+  type LipArtworkPresenceStateV1,
   type LipArtworkStateV2
 } from '$lib/goons/lipArtwork'
 import type { GoonRecord } from '$lib/types/goons'
@@ -13,6 +15,17 @@ import {
 
 function fail(message: string): never {
   throw new Error(`[lip-artwork/v2] ${message}`)
+}
+
+export async function validateGoonLipArtworkPresenceState(
+  client: StoredUploadJsonReader,
+  goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>,
+  value: unknown
+): Promise<LipArtworkPresenceStateV1 | null> {
+  if (value === null) return null
+  const definition = await loadGoonLipArtworkDefinition(client, goon)
+  if (!definition) fail('current Goon package does not support Lip Artwork')
+  return parseLipArtworkPresenceState(definition, value)
 }
 
 function exactJson(left: unknown, right: unknown) {

@@ -29,6 +29,8 @@ const packagedRedisStackRoot = join(packagedRuntimeRoot, 'vendor', 'redis-stack'
 const packagedFfmpegRoot = join(packagedRuntimeRoot, 'vendor', 'ffmpeg');
 const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v4';
 const LIP_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/lip-artwork/v2';
+const NAIL_SURFACE_RUNTIME_RELATIVE_ROOT = 'assets/goons/nail-surface/v1';
+const SKIN_APPEARANCE_RUNTIME_RELATIVE_ROOT = 'assets/goons/skin-appearance/v1';
 const packagedFacialArtworkRoot = join(
   packagedRuntimeRoot,
   ...FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
@@ -36,6 +38,14 @@ const packagedFacialArtworkRoot = join(
 const packagedLipArtworkRoot = join(
   packagedRuntimeRoot,
   ...LIP_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
+);
+const packagedNailSurfaceRoot = join(
+  packagedRuntimeRoot,
+  ...NAIL_SURFACE_RUNTIME_RELATIVE_ROOT.split('/')
+);
+const packagedSkinAppearanceRoot = join(
+  packagedRuntimeRoot,
+  ...SKIN_APPEARANCE_RUNTIME_RELATIVE_ROOT.split('/')
 );
 const fallbackRepoRoot = resolve(macRoot, '..');
 const usePackagedRuntime =
@@ -179,6 +189,12 @@ function createServiceDefinitions(env = null) {
   const packagedLipArtworkEnv = usePackagedRuntime
     ? { BATSHIT_LIP_ARTWORK_ASSET_ROOT: packagedLipArtworkRoot }
     : {};
+  const packagedNailSurfaceEnv = usePackagedRuntime
+    ? { BATSHIT_NAIL_SURFACE_ASSET_ROOT: packagedNailSurfaceRoot }
+    : {};
+  const packagedSkinAppearanceEnv = usePackagedRuntime
+    ? { BATSHIT_SKIN_APPEARANCE_ASSET_ROOT: packagedSkinAppearanceRoot }
+    : {};
 
   return {
     batshitServer: {
@@ -196,6 +212,8 @@ function createServiceDefinitions(env = null) {
         ...packagedFfmpegEnv,
         ...packagedFacialArtworkEnv,
         ...packagedLipArtworkEnv,
+        ...packagedNailSurfaceEnv,
+        ...packagedSkinAppearanceEnv,
         LOG_LEVEL: 'info',
         PORT: String(ports.server),
         BATSHIT_REDIS_REQUIRED: 'true',
@@ -3417,6 +3435,108 @@ async function packageAudit(packagePath) {
     }
     if (!seenPaths.has(lipArtworkAssets.definition)) {
       runtimeAssetIssues.push('The lip-artwork/v2 definition is absent from its runtime asset inventory.');
+    }
+  }
+  const nailSurfaceAssets = runtimeManifest?.assets?.nailSurface;
+  if (
+    nailSurfaceAssets?.contract !== 'nail-surface/v1' ||
+    nailSurfaceAssets?.root !== NAIL_SURFACE_RUNTIME_RELATIVE_ROOT ||
+    nailSurfaceAssets?.definition !== 'nail-surface-v1.json' ||
+    !Array.isArray(nailSurfaceAssets?.files) ||
+    nailSurfaceAssets.files.length !== 9
+  ) {
+    runtimeAssetIssues.push(
+      'runtime-manifest.json is missing the complete nail-surface/v1 trusted asset inventory.'
+    );
+  } else {
+    const seenPaths = new Set();
+    for (const entry of nailSurfaceAssets.files) {
+      const relative = entry?.path;
+      if (
+        typeof relative !== 'string' ||
+        relative.startsWith('/') ||
+        relative.includes('\\') ||
+        relative.split('/').includes('..') ||
+        seenPaths.has(relative) ||
+        !/^[a-f0-9]{64}$/.test(entry?.sha256 || '')
+      ) {
+        runtimeAssetIssues.push(`Invalid Nail Surface runtime asset manifest entry: ${JSON.stringify(entry)}`);
+        continue;
+      }
+      seenPaths.add(relative);
+      const assetPath = join(
+        realTarget,
+        'Contents',
+        'Resources',
+        'runtime',
+        nailSurfaceAssets.root,
+        relative
+      );
+      const bytes = await readFile(assetPath).catch(() => null);
+      if (!bytes) {
+        runtimeAssetIssues.push(`Missing Nail Surface runtime asset: ${relative}`);
+        continue;
+      }
+      const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+      if (actualSha256 !== entry.sha256) {
+        runtimeAssetIssues.push(
+          `Nail Surface runtime asset hash mismatch: ${relative} (${actualSha256} != ${entry.sha256})`
+        );
+      }
+    }
+    if (!seenPaths.has(nailSurfaceAssets.definition)) {
+      runtimeAssetIssues.push('The nail-surface/v1 definition is absent from its runtime asset inventory.');
+    }
+  }
+  const skinAppearanceAssets = runtimeManifest?.assets?.skinAppearance;
+  if (
+    skinAppearanceAssets?.contract !== 'skin-appearance/v1' ||
+    skinAppearanceAssets?.root !== SKIN_APPEARANCE_RUNTIME_RELATIVE_ROOT ||
+    skinAppearanceAssets?.definition !== 'skin-appearance-v1.json' ||
+    !Array.isArray(skinAppearanceAssets?.files) ||
+    skinAppearanceAssets.files.length !== 5
+  ) {
+    runtimeAssetIssues.push(
+      'runtime-manifest.json is missing the complete skin-appearance/v1 trusted asset inventory.'
+    );
+  } else {
+    const seenPaths = new Set();
+    for (const entry of skinAppearanceAssets.files) {
+      const relative = entry?.path;
+      if (
+        typeof relative !== 'string' ||
+        relative.startsWith('/') ||
+        relative.includes('\\') ||
+        relative.split('/').includes('..') ||
+        seenPaths.has(relative) ||
+        !/^[a-f0-9]{64}$/.test(entry?.sha256 || '')
+      ) {
+        runtimeAssetIssues.push(`Invalid Skin Appearance runtime asset manifest entry: ${JSON.stringify(entry)}`);
+        continue;
+      }
+      seenPaths.add(relative);
+      const assetPath = join(
+        realTarget,
+        'Contents',
+        'Resources',
+        'runtime',
+        skinAppearanceAssets.root,
+        relative
+      );
+      const bytes = await readFile(assetPath).catch(() => null);
+      if (!bytes) {
+        runtimeAssetIssues.push(`Missing Skin Appearance runtime asset: ${relative}`);
+        continue;
+      }
+      const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+      if (actualSha256 !== entry.sha256) {
+        runtimeAssetIssues.push(
+          `Skin Appearance runtime asset hash mismatch: ${relative} (${actualSha256} != ${entry.sha256})`
+        );
+      }
+    }
+    if (!seenPaths.has(skinAppearanceAssets.definition)) {
+      runtimeAssetIssues.push('The skin-appearance/v1 definition is absent from its runtime asset inventory.');
     }
   }
 

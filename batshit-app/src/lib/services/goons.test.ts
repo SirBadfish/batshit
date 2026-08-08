@@ -6,6 +6,7 @@ import {
   uploadAdvancedGoonPackage,
   uploadGoonFacialArtwork,
   uploadGoonLipArtwork,
+  uploadGoonNailArtwork,
   uploadGuidedDufClothesVrm
 } from './goons'
 
@@ -297,5 +298,52 @@ describe('goons service create flow', () => {
         }
       )
     ).resolves.toMatchObject({ filename: 'lips.png' })
+  })
+
+  it('uploads family-bound Nail Artwork without exposing trusted template proof to the browser', async () => {
+    const definitionSha256 = 'a'.repeat(64)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('/api/goons/goon_custom_1/nail-artwork')
+      const form = init?.body as FormData
+      expect([...form.keys()].sort()).toEqual([
+        'definitionSha256',
+        'family',
+        'file',
+        'provenance'
+      ])
+      expect(form.get('family')).toBe('fingers')
+      return new Response(
+        JSON.stringify({
+          artwork: {
+            schemaVersion: 'nail-artwork/v1',
+            family: 'fingers',
+            url: '/uploads/goon_nail_artwork/fingers.png',
+            filename: 'fingers.png',
+            size: 123,
+            mimeType: 'image/png',
+            sha256: 'b'.repeat(64)
+          }
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    })
+    global.fetch = fetchMock as typeof fetch
+
+    await expect(
+      uploadGoonNailArtwork(
+        'goon_custom_1',
+        new File(['png'], 'fingers.png', { type: 'image/png' }),
+        {
+          family: 'fingers',
+          definitionSha256,
+          provenance: {
+            sourceKind: 'user-authored',
+            author: 'Fixture Artist',
+            license: 'User-owned',
+            rightsConfirmed: true
+          }
+        }
+      )
+    ).resolves.toMatchObject({ family: 'fingers', filename: 'fingers.png' })
   })
 })

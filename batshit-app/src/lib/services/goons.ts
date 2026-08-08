@@ -18,6 +18,11 @@ import type {
   FacialArtworkUpload
 } from '$lib/goons/facialArtwork'
 import type { LipArtworkUpload } from '$lib/goons/lipArtwork'
+import type { NailArtworkUploadV1, NailFamily } from '$lib/goons/nailSurface'
+import type {
+  SkinSurfaceMapRole,
+  SkinSurfaceUploadV1
+} from '$lib/goons/skinSurface'
 import {
   addGoon,
   setGoons,
@@ -72,6 +77,18 @@ export type GoonFacialArtworkUploadInput = {
 }
 
 export type GoonLipArtworkUploadInput = {
+  definitionSha256: string
+  provenance: FacialArtworkProvenance
+}
+
+export type GoonNailArtworkUploadInput = {
+  family: NailFamily
+  definitionSha256: string
+  provenance: FacialArtworkProvenance
+}
+
+export type GoonSkinSurfaceArtworkUploadInput = {
+  map: SkinSurfaceMapRole
   definitionSha256: string
   provenance: FacialArtworkProvenance
 }
@@ -389,6 +406,89 @@ export async function deleteGoonLipArtwork(id: string, filename: string): Promis
   })
   if (res.status === 409) return false
   if (!res.ok) throw new Error(await readApiError(res, 'Failed to delete Lip Artwork'))
+  return true
+}
+
+export async function uploadGoonNailArtwork(
+  id: string,
+  file: File,
+  input: GoonNailArtworkUploadInput
+): Promise<NailArtworkUploadV1> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  form.append('family', input.family)
+  form.append('definitionSha256', input.definitionSha256)
+  form.append('provenance', JSON.stringify(input.provenance))
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/nail-artwork`, {
+    method: 'POST',
+    body: form
+  })
+  if (!res.ok) throw new Error(await readApiError(res, 'Failed to upload Nail Artwork'))
+  const data = (await res.json()) as { artwork?: NailArtworkUploadV1 }
+  if (
+    !data.artwork?.url ||
+    !data.artwork.filename ||
+    !data.artwork.sha256 ||
+    data.artwork.family !== input.family
+  ) {
+    throw new Error('Nail Artwork upload did not return a valid file reference')
+  }
+  return data.artwork
+}
+
+export async function deleteGoonNailArtwork(id: string, filename: string): Promise<boolean> {
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/nail-artwork`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename })
+  })
+  if (res.status === 409) return false
+  if (!res.ok) throw new Error(await readApiError(res, 'Failed to delete Nail Artwork'))
+  return true
+}
+
+export async function uploadGoonSkinSurfaceArtwork(
+  id: string,
+  file: File,
+  input: GoonSkinSurfaceArtworkUploadInput
+): Promise<SkinSurfaceUploadV1> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  form.append('map', input.map)
+  form.append('definitionSha256', input.definitionSha256)
+  form.append('provenance', JSON.stringify(input.provenance))
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/skin-surface-artwork`, {
+    method: 'POST',
+    body: form
+  })
+  if (!res.ok) {
+    throw new Error(await readApiError(res, `Failed to upload ${input.map} artwork`))
+  }
+  const data = (await res.json()) as { artwork?: SkinSurfaceUploadV1 }
+  if (
+    !data.artwork?.url ||
+    !data.artwork.filename ||
+    !data.artwork.sha256 ||
+    data.artwork.map !== input.map
+  ) {
+    throw new Error(`${input.map} artwork upload did not return a valid file reference`)
+  }
+  return data.artwork
+}
+
+export async function deleteGoonSkinSurfaceArtwork(
+  id: string,
+  filename: string
+): Promise<boolean> {
+  const res = await fetch(`/api/goons/${encodeURIComponent(id)}/skin-surface-artwork`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename })
+  })
+  if (res.status === 409) return false
+  if (!res.ok) {
+    throw new Error(await readApiError(res, 'Failed to delete Skin Surface Artwork'))
+  }
   return true
 }
 
