@@ -13,7 +13,7 @@ Public alpha releases are published through GitHub Releases, but the link above 
 SHA-256 checksum:
 
 ```text
-d550a4c77ea6239bcc674ca757ba14ceb99937bfacdc9deb4a7893bb1887375c
+0b3ea4bbc4bdb8c89b6127fea5f4428029aee0ba1181a47b606b1e26c55de0c9
 ```
 
 ## Current release truth
