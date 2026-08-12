@@ -231,13 +231,15 @@ describe("Hair Asset immutable Redis repository", () => {
     await expect(
       putUserHairAssetRevision(USER_ID, structuredClone(asset)),
     ).resolves.toEqual(asset);
-    await expect(listHairAssets(USER_ID)).resolves.toEqual([asset]);
+    await expect(listHairAssets(USER_ID, { builtinAssets: [] })).resolves.toEqual([asset]);
     await expect(listHairRefitSources(USER_ID)).resolves.toEqual([]);
     await expect(
       getHairRefitSource(USER_ID, asset.assetId, asset.revisionId),
     ).resolves.toBeNull();
     await expect(
-      resolveHairAssetRevision(USER_ID, createHairState(asset).selected!),
+      resolveHairAssetRevision(USER_ID, createHairState(asset).selected!, {
+        builtinAssets: [],
+      }),
     ).resolves.toEqual(asset);
     expect(await redis.sMembers(userHairAssetIndexKey(USER_ID))).toEqual([
       "imported-style@imported-style-r1",
@@ -245,7 +247,9 @@ describe("Hair Asset immutable Redis repository", () => {
 
     await redis.del("upload:goon_hair_assets:hair.glb");
     await expect(
-      resolveHairAssetRevision(USER_ID, createHairState(asset).selected!),
+      resolveHairAssetRevision(USER_ID, createHairState(asset).selected!, {
+        builtinAssets: [],
+      }),
     ).rejects.toMatchObject({ code: "INVALID_OWNED_FILE" });
   });
 
