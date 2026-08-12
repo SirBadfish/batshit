@@ -1,4 +1,352 @@
 {
   "schemaVersion": "hair-catalog/v1",
-  "assets": []
+  "assets": [
+    {
+      "schemaVersion": "hair-assets/v1",
+      "assetId": "batshit-style-01",
+      "revisionId": "batshit-style-01-r1",
+      "revision": 1,
+      "revisionSha256": "9c78aa4a29f14a4e6005b887348bbab945df77124f61b03b8266cfa28c420d6e",
+      "sourceClass": "builtin",
+      "display": {
+        "name": "Style 01 · Shaggy Layers",
+        "previewImage": {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/preview.png",
+          "sha256": "2d482f6d6ff9b786be6f4f014022601f38639922307c6b8eb6301215b0687217",
+          "bytes": 673945,
+          "mimeType": "image/png"
+        },
+        "tags": [
+          "anime",
+          "fantasy",
+          "medium",
+          "root-weighted-motion-v2",
+          "shaggy",
+          "stylized"
+        ]
+      },
+      "compatibility": {
+        "baseId": "batshit-base-f-v1",
+        "fitFamily": "batshit-base-f-v1"
+      },
+      "geometry": {
+        "main": {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/geometry.glb",
+          "sha256": "b0246684f0d02ccbfde2e701e4ec38c629a8a103f8d2841d12297941021250d2",
+          "bytes": 10327632,
+          "mimeType": "model/gltf-binary"
+        },
+        "sparseAccent": null
+      },
+      "attachment": {
+        "headNode": "mixamorigHead",
+        "authoredRootMatrix": [
+          1.000000119209,
+          7.2e-11,
+          9.2225e-8,
+          0,
+          -1.2e-11,
+          1.000000027322,
+          -0.000020774661,
+          0,
+          -9.2222e-8,
+          0.000021082299,
+          1.000002229265,
+          0,
+          4.233e-9,
+          -1.473168069099,
+          -0.04590650021,
+          1
+        ],
+        "fitReceipt": {
+          "contract": "hair-fit-receipt/v1",
+          "receiptId": "batshit-style-01-fit-r1",
+          "assetId": "batshit-style-01",
+          "assetRevisionId": "batshit-style-01-r1",
+          "assetRevisionSha256": "9c78aa4a29f14a4e6005b887348bbab945df77124f61b03b8266cfa28c420d6e",
+          "baseId": "batshit-base-f-v1",
+          "fitFamily": "batshit-base-f-v1",
+          "headAttachmentNode": "mixamorigHead",
+          "appearanceDefinitionSha256": "d7ffdf73562971efe832b5a1478f4479fcc82afe0929ac26e66b02ee50a06200",
+          "physicalBasisSha256": "6d272e0acaebd969fba84fce118f3c400ca8c8253b863b5eb88d9b76f32d87d4",
+          "topologySha256": "496bc45fbbfc1c8104ab50abfcb0015aab676150906f62c7162a449099d3c7ab",
+          "skeletonHierarchySha256": "92cb80ea144e9bd41cb94f8444e08d9519711d2ccabcc2ef1f6f53c5d5838ea0",
+          "fitSha256": "615381aaa87dec9d5120b2a548edf45575893d3f14e58120b4d771bca4ad4f43"
+        }
+      },
+      "material": {
+        "contract": "hair-material-declaration/v1",
+        "status": "ready",
+        "definitionSha256": "19d5ff16129ae4f58e4c750ca13d7b9105fa66f55352d3f31a9684dfb8e3fb6a",
+        "layout": {
+          "width": 1024,
+          "height": 1024,
+          "uvSet": 0,
+          "flipY": false,
+          "neutralValue": {
+            "colorSpace": "srgb",
+            "channel": "rgb",
+            "pivot": 0.5,
+            "highlightStrength": 0.35
+          },
+          "highlightMask": {
+            "colorSpace": "linear",
+            "channel": "r"
+          },
+          "normal": null,
+          "roughness": null
+        },
+        "neutralValueTexture": {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/neutral-value.png",
+          "sha256": "4779db21b8c846d963f49b9cbc053cc90ab30ff75438a45519a33580c647b304",
+          "bytes": 84919,
+          "mimeType": "image/png"
+        },
+        "highlightMask": {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/highlight-mask.png",
+          "sha256": "9ff0508ef09f592b07cd7db0994db99c97abf6871e7f71e793f4375a3553a3f3",
+          "bytes": 66430,
+          "mimeType": "image/png"
+        },
+        "normalTexture": null,
+        "roughnessTexture": null,
+        "defaults": {
+          "baseColor": "#21142f",
+          "highlightColor": "#68468f",
+          "metalness": 0,
+          "roughness": 0.58,
+          "alphaMode": "OPAQUE"
+        }
+      },
+      "follower": {
+        "contract": "hair-follower-declaration/v1",
+        "mode": "appearance-followers/v2",
+        "definitionSha256": "cbd8e5f941e28e3f2c930b86afd174ef86c2322c3742a6d3fcff71f71bfb7f01",
+        "asset": {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/appearance-followers.json",
+          "sha256": "7db131e02b47ba0b6fab7845ef3a394a2e594d1c5119049e0f40cc2d7a253781",
+          "bytes": 12915,
+          "mimeType": "application/json"
+        },
+        "staticReason": null
+      },
+      "physics": {
+        "contract": "hair-physics-declaration/v1",
+        "mode": "secondary-motion/v1",
+        "definitionSha256": "3cbec3e13fccc7a130898e1bce20876f94ec11098aed5464a60e32f9d7188878",
+        "asset": {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/secondary-motion.json",
+          "sha256": "857ee056299c99aec222eda962843ec9f02b6073d306de09d8912fbfcc3686dd",
+          "bytes": 360143,
+          "mimeType": "application/json"
+        },
+        "staticReason": null
+      },
+      "audit": {
+        "contract": "hair-asset-audit/v1",
+        "meshCount": 49,
+        "vertexCount": 14651,
+        "triangleCount": 26460,
+        "materialCount": 1,
+        "textureCount": 2,
+        "sparseAccent": false,
+        "receiptSha256": "fcd055d13da210a1f73213e8481e34e0b98f779da0ce92a39bb444714757a408"
+      },
+      "provenance": {
+        "author": "Josh and Batshit",
+        "license": "LicenseRef-Batshit-First-Party",
+        "sourceTool": "Anime Hair Studio + Batshit H5 Hair authoring",
+        "sourceSha256": "ab4e8c9737da31f10921a35a1dfe8875864a713d01a2ed99ea99a237ae4f9168",
+        "catalogEligible": true,
+        "productExportApproved": true
+      },
+      "receiptRefs": [
+        {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/accepted-source-receipt.json",
+          "sha256": "388a22dc15d1ba535d78ec5de5638e429c0fc97b022f3d9f380d34f52cbb5b1a",
+          "bytes": 20568,
+          "mimeType": "application/json"
+        },
+        {
+          "ref": "/goon-assets/hair/v1/style-01-shaggy-layers/promotion-receipt.json",
+          "sha256": "fcd055d13da210a1f73213e8481e34e0b98f779da0ce92a39bb444714757a408",
+          "bytes": 3400,
+          "mimeType": "application/json"
+        }
+      ]
+    },
+    {
+      "schemaVersion": "hair-assets/v1",
+      "assetId": "batshit-style-02",
+      "revisionId": "batshit-style-02-r1",
+      "revision": 1,
+      "revisionSha256": "d647f03c9737c942c55f0d2d6c153cb183a7c5c76151309eb54cf33b6aa041c9",
+      "sourceClass": "builtin",
+      "display": {
+        "name": "Style 02 · Twisted Bun",
+        "previewImage": {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/preview.png",
+          "sha256": "5afd9a2b8792608aa7615e5ef6f9b4cc45c316281510b53a121d432ac8b3885e",
+          "bytes": 1830851,
+          "mimeType": "image/png"
+        },
+        "tags": [
+          "bun",
+          "medium",
+          "root-weighted-motion-v2",
+          "stylized",
+          "updo"
+        ]
+      },
+      "compatibility": {
+        "baseId": "batshit-base-f-v1",
+        "fitFamily": "batshit-base-f-v1"
+      },
+      "geometry": {
+        "main": {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/geometry.glb",
+          "sha256": "3c7d16f32f364537bf0c9db0d0ba79a43ecdfa9897245ef6f45bf7121b2e2619",
+          "bytes": 7579680,
+          "mimeType": "model/gltf-binary"
+        },
+        "sparseAccent": null
+      },
+      "attachment": {
+        "headNode": "mixamorigHead",
+        "authoredRootMatrix": [
+          1.0000001192093,
+          7.18896403009831e-11,
+          9.22246217534272e-8,
+          0,
+          -1.1900130381507e-11,
+          1.00000002732229,
+          -0.0000207746607962069,
+          0,
+          -9.22218657054819e-8,
+          0.0000210822989135251,
+          1.00000222926525,
+          0,
+          4.23305451475091e-9,
+          -1.47316806909942,
+          -0.0459065002102639,
+          1
+        ],
+        "fitReceipt": {
+          "contract": "hair-fit-receipt/v1",
+          "receiptId": "batshit-style-02-fit-r1",
+          "assetId": "batshit-style-02",
+          "assetRevisionId": "batshit-style-02-r1",
+          "assetRevisionSha256": "d647f03c9737c942c55f0d2d6c153cb183a7c5c76151309eb54cf33b6aa041c9",
+          "baseId": "batshit-base-f-v1",
+          "fitFamily": "batshit-base-f-v1",
+          "headAttachmentNode": "mixamorigHead",
+          "appearanceDefinitionSha256": "d7ffdf73562971efe832b5a1478f4479fcc82afe0929ac26e66b02ee50a06200",
+          "physicalBasisSha256": "6d272e0acaebd969fba84fce118f3c400ca8c8253b863b5eb88d9b76f32d87d4",
+          "topologySha256": "496bc45fbbfc1c8104ab50abfcb0015aab676150906f62c7162a449099d3c7ab",
+          "skeletonHierarchySha256": "92cb80ea144e9bd41cb94f8444e08d9519711d2ccabcc2ef1f6f53c5d5838ea0",
+          "fitSha256": "218a2f40777f722c4774f3a3116b481755e785a0d00401d7b0aabe306c50a9c7"
+        }
+      },
+      "material": {
+        "contract": "hair-material-declaration/v1",
+        "status": "ready",
+        "definitionSha256": "f26ab700e7eb42c394a4431becab5873daf14895be51b2e49b065bd6916bac24",
+        "layout": {
+          "width": 64,
+          "height": 64,
+          "uvSet": 0,
+          "flipY": false,
+          "neutralValue": {
+            "colorSpace": "srgb",
+            "channel": "rgb",
+            "pivot": 0.5,
+            "highlightStrength": 0.35
+          },
+          "highlightMask": {
+            "colorSpace": "linear",
+            "channel": "r"
+          },
+          "normal": null,
+          "roughness": null
+        },
+        "neutralValueTexture": {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/neutral-value.png",
+          "sha256": "f50ee8a043e710e228c92464d8d2dc81fa41bdf4ad7358f50cb95247303973f5",
+          "bytes": 156,
+          "mimeType": "image/png"
+        },
+        "highlightMask": {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/highlight-mask.png",
+          "sha256": "6d81bce78e7b5fc648e1934560d4316c12c95dd7d286f3b4796867d819c55476",
+          "bytes": 401,
+          "mimeType": "image/png"
+        },
+        "normalTexture": null,
+        "roughnessTexture": null,
+        "defaults": {
+          "baseColor": "#2a1738",
+          "highlightColor": "#6f4a8e",
+          "metalness": 0,
+          "roughness": 0.58,
+          "alphaMode": "OPAQUE"
+        }
+      },
+      "follower": {
+        "contract": "hair-follower-declaration/v1",
+        "mode": "appearance-followers/v2",
+        "definitionSha256": "48ba79a62cbb09d4ebc2a7206b1a3797ac11a4795b16e890cdd5833d3d787daf",
+        "asset": {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/appearance-followers.json",
+          "sha256": "0ef3747fe2d98b1130e186d4a59889be772834738d6ac8d2981f5db47a324ae4",
+          "bytes": 10087,
+          "mimeType": "application/json"
+        },
+        "staticReason": null
+      },
+      "physics": {
+        "contract": "hair-physics-declaration/v1",
+        "mode": "secondary-motion/v1",
+        "definitionSha256": "492a4f7d532fd2b020e3e608f187046ff6fb8f2d5d8e85bd954ac0f83b9aa19f",
+        "asset": {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/secondary-motion.json",
+          "sha256": "33407a036c45064f8837b11dd9f49519190ac53d7b36f5dd0faa3f4fc615da69",
+          "bytes": 6775,
+          "mimeType": "application/json"
+        },
+        "staticReason": null
+      },
+      "audit": {
+        "contract": "hair-asset-audit/v1",
+        "meshCount": 2,
+        "vertexCount": 34902,
+        "triangleCount": 11634,
+        "materialCount": 1,
+        "textureCount": 2,
+        "sparseAccent": false,
+        "receiptSha256": "ff8d5fcae0907fa77cdcac3d6ca7fd9714d5e9708ae2c5317474bab78c761120"
+      },
+      "provenance": {
+        "author": "Josh and Batshit",
+        "license": "LicenseRef-Batshit-First-Party",
+        "sourceTool": "Tripo Pro + Batshit H6 reviewed Hair importer",
+        "sourceSha256": "a4c0baab026f09b437c4e3e4f36c9f106ee35bffffb2662cd2435b390a4be84c",
+        "catalogEligible": true,
+        "productExportApproved": true
+      },
+      "receiptRefs": [
+        {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/accepted-source-receipt.json",
+          "sha256": "00ced9d6a9cd6e03b13003b8867c28c4f16cdea4195f0e2c9d59423c1145c29a",
+          "bytes": 11504,
+          "mimeType": "application/json"
+        },
+        {
+          "ref": "/goon-assets/hair/v1/style-02-twisted-bun/promotion-receipt.json",
+          "sha256": "ff8d5fcae0907fa77cdcac3d6ca7fd9714d5e9708ae2c5317474bab78c761120",
+          "bytes": 3483,
+          "mimeType": "application/json"
+        }
+      ]
+    }
+  ]
 }
