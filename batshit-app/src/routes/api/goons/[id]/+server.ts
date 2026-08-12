@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import type { GoonRecord } from '$lib/types/goons'
+import { parseHairState } from '$lib/goons/hairAssets'
 import {
   normalizeUploadUrlsForStorageInPayload,
   resolveUploadUrlsForBrowserInPayload
@@ -163,6 +164,15 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
           updates.skinAppearance
         )
       }
+      if (Object.prototype.hasOwnProperty.call(updates, 'hairState')) {
+        const hairState = updates.hairState === null ? null : parseHairState(updates.hairState)
+        if (hairState?.selected) {
+          throw new Error(
+            '[hair-assets/v1] Selected Hair Asset state must be committed through the Recipe workflow; generic Goon updates cannot persist Hair before deterministic Live composition is available.'
+          )
+        }
+        updated.hairState = hairState
+      }
       const storageUpdated = normalizeUploadUrlsForStorageInPayload(updated)
       const storagePatch = Object.fromEntries(
         Object.keys(updates).map((field) => [
@@ -199,7 +209,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
         error.message.startsWith('[lip-artwork/v2]') ||
         error.message.startsWith('[nail-surface/v1]') ||
         error.message.startsWith('[skin-appearance/v2]') ||
-        error.message.startsWith('[skin-surface-artwork/v1]'))
+        error.message.startsWith('[skin-surface-artwork/v1]') ||
+        error.message.startsWith('[hair-assets/v1]'))
     ) {
       return json({ error: error.message }, { status: 400 })
     }

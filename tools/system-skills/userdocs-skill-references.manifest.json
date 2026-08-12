@@ -70,6 +70,7 @@
         { "source": "troubleshooting/n8n.md", "reference": "troubleshooting-n8n.md" },
         { "source": "troubleshooting/voice-local-ai.md", "reference": "troubleshooting-voice-local-ai.md" },
         { "source": "user/overview.md", "reference": "user-overview.md" },
+        { "source": "user-templates/batshit-anime-hair-studio/README.md", "reference": "user-templates-batshit-anime-hair-studio.md" },
         { "source": "voice/overview.md", "reference": "voice-overview.md" },
         { "source": "voice/voice-clones.md", "reference": "voice-voice-clones.md" },
         { "source": "voice/voice-settings.md", "reference": "voice-voice-settings.md" }

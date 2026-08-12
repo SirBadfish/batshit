@@ -438,6 +438,7 @@ vi.mock('$lib/server/redis', async () => {
         rPush: vi.fn(async (key: string, value: any) => redisMock.rPush(key, value)),
         sAdd: vi.fn(async (key: string, ...members: any[]) => redisMock.sAdd(key, ...members)),
         sMembers: vi.fn(async (key: string) => redisMock.sMembers(key)),
+        sRem: vi.fn(async (key: string, ...members: any[]) => redisMock.sRem(key, ...members)),
         json: redisJsonMock,
         multi: vi.fn(() => createMulti())
       }

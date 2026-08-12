@@ -375,6 +375,7 @@ describe('Goon Recipe repository', () => {
       oralAppearance: { marker: 'old' },
       nailSurface: { marker: 'old' },
       skinAppearance: { marker: 'old' },
+      hairState: { marker: 'old' },
       recipeFitReceipts: [{ receiptId: 'old-fit' }]
     })
     const next = {
@@ -386,6 +387,7 @@ describe('Goon Recipe repository', () => {
       oralAppearance: { marker: 'new' },
       nailSurface: { marker: 'new' },
       skinAppearance: { marker: 'new' },
+      hairState: { marker: 'new' },
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }],
       updated_at: '2026-07-17T00:00:01.000Z'
     } as unknown as GoonRecord
@@ -404,6 +406,7 @@ describe('Goon Recipe repository', () => {
       oralAppearance: { marker: 'new' },
       nailSurface: { marker: 'new' },
       skinAppearance: { marker: 'new' },
+      hairState: { marker: 'new' },
       recipeFitReceipts: [{ receiptId: 'new-fit', status: 'stale' }]
     })
   })

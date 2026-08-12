@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { redis } from '$lib/server/redis'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import type { GoonRecord } from '$lib/types/goons'
+import { createHairState } from '$lib/goons/hairAssets'
 import {
   GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
   GOON_RECIPE_OWNER_V2_CONTRACT,
@@ -17,6 +18,7 @@ import {
   createRecipeRevisionEnvelope,
   recipeAuthoringRevisionSha256,
   recipeRevisionBundleSha256,
+  recipeSiblingStateSha256,
   recipeStateSnapshotSha256,
   recipeMigrationReportSha256,
   recipeJobRedisKey,
@@ -27,6 +29,12 @@ import {
   type RecipeStoredAssetRef
 } from '$lib/goons/recipe'
 import { createRecipePhysicalMigrationFixture } from '$lib/goons/recipe/fixtures/recipePhysicalMigrationPair'
+import {
+  createHairAssetFixture,
+  createRigidHairGlbFixture,
+  HAIR_HIGHLIGHT_MASK_PNG_FIXTURE,
+  HAIR_NEUTRAL_VALUE_PNG_FIXTURE
+} from '$lib/goons/recipe/fixtures/hairAssetFixture'
 import {
   getGoonRecipeJob,
   getGoonRecipeDocument,
@@ -49,6 +57,7 @@ import {
   stageRecipeUpdateCandidate,
   commitRecipeUpdate,
   pruneRecipeRetention,
+  resetRetiredHairRecipeState,
   discardRecipePackageAnalysis,
   getPreviousRecipeRevisionPreview,
   restorePreviousRecipeRevision,
@@ -158,6 +167,149 @@ async function migrationReport(plan: RecipeMigrationPlan, edge: Awaited<ReturnTy
 
 describe('Goon Recipe lifecycle service', () => {
   useRedisTestServer()
+
+  it.runIf(REAL_REDIS_LANE)(
+    'resets only retired Hair state while preserving the Goon and every unrelated Recipe surface',
+    async () => {
+      const fixture = await createRecipePhysicalMigrationFixture()
+      const sourceArchive = await archiveReceipt('retired-hair-recovery', fixture.source)
+      const source = sourceFromReceipt(sourceArchive.receipt, fixture.source.identity)
+      const containmentDocument = await createGoonRecipeDocument({
+        userId: USER_ID,
+        goonId: GOON_ID,
+        content: sourceArchive.receipt
+      })
+      const storedContainment = await putGoonRecipeDocument(containmentDocument)
+      const containmentReceipt = {
+        contract: containmentDocument.documentContract,
+        ref: storedContainment.key,
+        sha256: containmentDocument.sha256
+      }
+      const retiredHairState = {
+        schemaVersion: 'hair-state/v1',
+        definitionSha256: 'e'.repeat(64),
+        selected: null,
+        baseColor: '#20152f',
+        highlightColor: '#76558f',
+        motionSettings: null
+      }
+      const retiredState = structuredClone(fixture.sourceState)
+      retiredState.siblings.push({
+        id: 'hairState',
+        contract: 'hair-state/v1',
+        definitionSha256: retiredHairState.definitionSha256,
+        stateSha256: await recipeSiblingStateSha256(retiredHairState),
+        state: retiredHairState
+      })
+      retiredState.siblings.sort((left, right) => left.id.localeCompare(right.id))
+      retiredState.stateSha256 = await recipeStateSnapshotSha256(retiredState)
+      const authoringRevision = {
+        contract: GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
+        recipeRevision: 1,
+        revisionId: 'recipe_revision_retired_hair',
+        revisionSha256: ZERO_SHA256,
+        source,
+        state: retiredState,
+        updateReport: null
+      }
+      authoringRevision.revisionSha256 = await recipeAuthoringRevisionSha256(authoringRevision)
+      const goon = {
+        id: GOON_ID,
+        user_id: USER_ID,
+        name: 'Retired Hair Recovery Fixture',
+        description: 'Must survive Hair recovery.',
+        kind: 'custom',
+        sourceProfile: 'expert-custom-glb',
+        files: {},
+        customAvatar: {
+          package: { url: '/live/current.bgoon', filename: 'current.bgoon' },
+          model: { url: '/live/current.glb', filename: 'current.glb' },
+          manifest: { url: '/live/current.json', filename: 'current.json' }
+        },
+        recipe: {
+          contract: GOON_RECIPE_OWNER_V2_CONTRACT,
+          writeVersion: 1,
+          nextRecipeRevision: 2,
+          liveStatus: 'needs_bake',
+          authoringRevision,
+          authoringSourceContainmentReceipt: containmentReceipt,
+          activeRevision: null,
+          previousRevision: null,
+          pendingAnalysis: null,
+          pendingJob: null,
+          latestUpdateReport: null,
+          lastFailure: null,
+          maintenanceFailure: null
+        },
+        appearanceDials: retiredState.appearanceDials,
+        facialArtwork: { preserved: 'face' },
+        skinAppearance: { preserved: 'skin' },
+        hairState: retiredHairState,
+        recipeFitReceipts: [
+          { receiptId: 'fit-hair', surface: 'hair', marker: 'remove' },
+          { receiptId: 'fit-shirt', surface: 'clothing', marker: 'preserve' }
+        ],
+        cues: { enabled: ['happy'] },
+        defaults: { baseLoop: 'base_stand' },
+        camera: { mode: 'free' },
+        created_at: '2026-08-10T00:00:00.000Z',
+        updated_at: '2026-08-10T00:00:00.000Z'
+      } as unknown as GoonRecord
+      await redis.json.set(`goon:${GOON_ID}`, '$', goon)
+      await redis.sAdd(`user:${USER_ID}:goons`, GOON_ID)
+
+      const result = await resetRetiredHairRecipeState(
+        { userId: USER_ID, goonId: GOON_ID, expectedWriteVersion: 1 },
+        { now: () => new Date('2026-08-10T00:00:01.000Z') }
+      )
+
+      expect(result).toMatchObject({ recovered: true, removedContract: 'hair-state/v1' })
+      expect(result.goon).toMatchObject({
+        name: goon.name,
+        description: goon.description,
+        customAvatar: goon.customAvatar,
+        facialArtwork: goon.facialArtwork,
+        skinAppearance: goon.skinAppearance,
+        cues: goon.cues,
+        defaults: goon.defaults,
+        camera: goon.camera,
+        recipe: {
+          writeVersion: 2,
+          liveStatus: 'needs_bake',
+          activeRevision: null,
+          authoringRevision: {
+            recipeRevision: 1,
+            revisionId: 'recipe_revision_retired_hair',
+            state: {
+              appearanceDials: retiredState.appearanceDials,
+              siblings: expect.not.arrayContaining([
+                expect.objectContaining({ id: 'hairState' })
+              ])
+            }
+          }
+        },
+        recipeFitReceipts: [
+          { receiptId: 'fit-shirt', surface: 'clothing', marker: 'preserve' }
+        ]
+      })
+      expect(result.goon.hairState).toBeUndefined()
+      expect(
+        (result.goon.recipe as any).authoringRevision.revisionSha256
+      ).toBe(
+        await recipeAuthoringRevisionSha256(
+          (result.goon.recipe as any).authoringRevision
+        )
+      )
+
+      await expect(
+        resetRetiredHairRecipeState({
+          userId: USER_ID,
+          goonId: GOON_ID,
+          expectedWriteVersion: 2
+        })
+      ).rejects.toMatchObject({ code: 'RECOVERY_NOT_REQUIRED' })
+    }
+  )
 
   it.runIf(REAL_REDIS_LANE)(
     'persists exact analysis evidence and recovers, retries, and discards one durable job without asset leaks',
@@ -811,11 +963,33 @@ describe('Goon Recipe lifecycle service', () => {
     async () => {
       const fixture = await createRecipePhysicalMigrationFixture()
       const sourceArchive = await archiveReceipt('bootstrap-source', fixture.source)
+      const hairBytes = createRigidHairGlbFixture()
+      const hairAsset = await createHairAssetFixture({
+        recipeSource: fixture.source.recipeSource,
+        mainBytes: hairBytes,
+        headNode: 'HeadAnchor',
+        sourceClass: 'user'
+      })
+      const hairState = createHairState(hairAsset)
+      const recipeState = structuredClone(fixture.sourceState)
+      recipeState.siblings.push({
+        id: 'hairState',
+        contract: 'hair-state/v2',
+        definitionSha256: hairState.definitionSha256!,
+        stateSha256: await recipeSiblingStateSha256(hairState),
+        state: hairState
+      })
+      recipeState.siblings.sort((left, right) => left.id.localeCompare(right.id))
+      recipeState.stateSha256 = await recipeStateSnapshotSha256(recipeState)
       const bytes = new Map<string, Uint8Array>([
         [sourceArchive.assets[0]!.ref, fixture.source.packageBytes],
         [sourceArchive.assets[1]!.ref, fixture.source.glbBytes],
-        [sourceArchive.assets[2]!.ref, fixture.source.manifestBytes]
+        [sourceArchive.assets[2]!.ref, fixture.source.manifestBytes],
+        [hairAsset.geometry.main.ref, hairBytes],
+        [hairAsset.material.neutralValueTexture!.ref, HAIR_NEUTRAL_VALUE_PNG_FIXTURE],
+        [hairAsset.material.highlightMask!.ref, HAIR_HIGHLIGHT_MASK_PNG_FIXTURE]
       ])
+      const resolveHairAsset = async () => hairAsset
       const readAsset = async (asset: RecipeStoredAssetRef) => {
         const value = bytes.get(asset.ref)
         if (!value) throw new Error(`missing fixture asset ${asset.ref}`)
@@ -834,14 +1008,15 @@ describe('Goon Recipe lifecycle service', () => {
         sourceProfile: 'expert-custom-glb',
         files: {},
         customAvatar: legacyLive,
-        appearanceDials: fixture.sourceState.appearanceDials,
+        appearanceDials: recipeState.appearanceDials,
+        hairState,
         created_at: '2026-07-17T00:00:00.000Z',
         updated_at: '2026-07-17T00:00:00.000Z'
       }
       await redis.json.set(`goon:${GOON_ID}`, '$', legacy)
       await redis.sAdd(`user:${USER_ID}:goons`, GOON_ID)
 
-      const submittedBootstrapState = structuredClone(fixture.sourceState)
+      const submittedBootstrapState = structuredClone(recipeState)
       const injectedBootstrapFit = await createAnatomyFitState('a'.repeat(64), [])
       submittedBootstrapState.siblings.push(
         await anatomyFitRecipeSibling(injectedBootstrapFit)
@@ -866,7 +1041,10 @@ describe('Goon Recipe lifecycle service', () => {
         expectedUpdatedAt: legacy.updated_at,
         receipt: sourceArchive.receipt,
         state: submittedBootstrapState
-      }, { readAsset: readAssetWithSourceRace })).rejects.toMatchObject({
+      }, {
+        readAsset: readAssetWithSourceRace,
+        resolveHairAsset
+      })).rejects.toMatchObject({
         code: 'WRITE_CONFLICT'
       })
       const conflicted = await redis.json.get<GoonRecord>(`goon:${GOON_ID}`)
@@ -897,13 +1075,14 @@ describe('Goon Recipe lifecycle service', () => {
         state: submittedBootstrapState
       }, {
         readAsset: readAssetWithRuntimeWrite,
+        resolveHairAsset,
         now: () => new Date('2026-07-17T00:00:01.000Z')
       })
       expect(bootstrapped.goon.recipe).toMatchObject({
         writeVersion: 1,
         liveStatus: 'needs_bake',
         activeRevision: null,
-        authoringRevision: { state: fixture.sourceState }
+        authoringRevision: { state: recipeState }
       })
       expect(bootstrapped.goon.customAvatar).toEqual(legacyLive)
       expect(bootstrapped.goon.camera).toEqual({ mode: 'free', target: [0, 1.2, 0] })
@@ -913,9 +1092,10 @@ describe('Goon Recipe lifecycle service', () => {
         goonId: GOON_ID,
         expectedWriteVersion: 1,
         idempotencyKey: 'fixture-first-bake-1',
-        state: fixture.sourceState
+        state: recipeState
       }, {
         readAsset,
+        resolveHairAsset,
         now: () => new Date('2026-07-17T00:00:02.000Z'),
         leaseMs: 10_000
       })
@@ -931,7 +1111,13 @@ describe('Goon Recipe lifecycle service', () => {
         state: started.reviewedState.state,
         packageBytes: fixture.source.packageBytes,
         modelBytes: fixture.source.glbBytes,
-        manifestBytes: fixture.source.manifestBytes
+        manifestBytes: fixture.source.manifestBytes,
+        hair: {
+          asset: hairAsset,
+          mainBytes: hairBytes,
+          neutralValueBytes: Uint8Array.from(HAIR_NEUTRAL_VALUE_PNG_FIXTURE),
+          highlightMaskBytes: Uint8Array.from(HAIR_HIGHLIGHT_MASK_PNG_FIXTURE)
+        }
       })
       const live = {
         package: await storedAsset('/uploads/goon_custom_packages/bootstrap-live.bgoon', bake.packageBytes),
@@ -957,7 +1143,11 @@ describe('Goon Recipe lifecycle service', () => {
         expectedJobStateVersion: registered.job.stateVersion,
         liveBuildReceipt: bake.receipt,
         live
-      }, { readAsset, now: () => new Date('2026-07-17T00:00:04.000Z') })
+      }, {
+        readAsset,
+        resolveHairAsset,
+        now: () => new Date('2026-07-17T00:00:04.000Z')
+      })
       expect(staged.goon.customAvatar).toEqual(legacyLive)
       const committed = await commitRecipeUpdate({
         userId: USER_ID,
@@ -967,6 +1157,7 @@ describe('Goon Recipe lifecycle service', () => {
         expectedJobStateVersion: staged.job.stateVersion
       }, {
         readAsset,
+        resolveHairAsset,
         now: () => new Date('2026-07-17T00:00:05.000Z'),
         deleteAsset: async () => {}
       })
@@ -976,6 +1167,8 @@ describe('Goon Recipe lifecycle service', () => {
         previousRevision: null
       })
       expect(committed.goon.customAvatar?.package?.url).toBe(live.package.ref)
+      bytes.delete(hairAsset.geometry.main.ref)
+      expect(bytes.get(live.model.ref)).toEqual(bake.modelBytes)
     },
     30_000
   )

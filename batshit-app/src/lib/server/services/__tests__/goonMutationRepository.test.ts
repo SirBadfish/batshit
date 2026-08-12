@@ -18,7 +18,13 @@ describe('atomic Goon mutation repository', () => {
     expect(() => assertGenericGoonPatchAllowed(existing, { customAvatar: null })).toThrowError(
       expect.objectContaining({ code: 'RECIPE_MANAGED_FIELD', status: 409 })
     )
-    for (const field of ['oralAppearance', 'nailSurface', 'skinAppearance', 'recipeFitReceipts']) {
+    for (const field of [
+      'oralAppearance',
+      'nailSurface',
+      'skinAppearance',
+      'hairState',
+      'recipeFitReceipts'
+    ]) {
       expect(() => assertGenericGoonPatchAllowed(existing, { [field]: null })).toThrowError(
         expect.objectContaining({ code: 'RECIPE_MANAGED_FIELD', status: 409 })
       )

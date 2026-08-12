@@ -36,8 +36,10 @@
     RefreshCw,
     RotateCcw,
     Save,
+    Scissors,
     SlidersHorizontal,
     Trash2,
+    Upload,
     X
   } from '@lucide/svelte'
   import { debounce } from '$lib/utils/debounce'
@@ -63,6 +65,18 @@
   import NailSurfaceEditor from '$lib/components/goons/NailSurfaceEditor.svelte'
   import SkinAppearanceEditor from '$lib/components/goons/SkinAppearanceEditor.svelte'
   import SkinSurfaceEditor from '$lib/components/goons/SkinSurfaceEditor.svelte'
+  import HairCatalogEditor from '$lib/components/goons/HairCatalogEditor.svelte'
+  import HairImportWizard from '$lib/components/goons/hair-import/HairImportWizard.svelte'
+  import HairMotionPaintOverlay from '$lib/components/goons/hair-import/HairMotionPaintOverlay.svelte'
+  import {
+    revealHairImportEditor,
+    snapshotHairImportEditorContext
+  } from '$lib/components/goons/hair-import/hairImportUiState'
+  import type {
+    HairImportFinalizeRequest,
+    HairImportInspection,
+    HairImportPreviewRequest
+  } from '$lib/components/goons/hair-import/hairImportUiState'
   import UniversalFaceControlsEditor from '$lib/components/goons/UniversalFaceControlsEditor.svelte'
   import EyeContactTuningEditor from '$lib/components/goons/EyeContactTuningEditor.svelte'
   import SocketEyeContactEditor from '$lib/components/goons/SocketEyeContactEditor.svelte'
@@ -211,6 +225,38 @@
     type SkinSurfaceUploadV1
   } from '$lib/goons/skinSurface'
   import {
+    createHairCatalogSelection,
+    classifyHairAssetAvailability,
+    hairStateEquals,
+    loadHairAssetCatalog,
+    resolveHairAssetBrowserUrl,
+    resolveHairSelectionCatalogStatus,
+    type HairAssetCatalog
+  } from '$lib/goons/hairCatalog'
+  import {
+    createHairState,
+    parseHairState,
+    verifyHairAsset,
+    type HairAssetV1,
+    type HairRefitSourceV1,
+    type HairStateV2
+  } from '$lib/goons/hairAssets'
+  import type { HairMotionPaintV1 } from '$lib/goons/hairMotionPaint'
+  import {
+    HAIR_MOTION_DEFAULT_INTENSITY,
+    type SecondaryMotionTuning
+  } from '$lib/goons/secondaryMotion'
+  import {
+    cancelHairImport,
+    createHairImport,
+    createHairRefit,
+    deleteHairAssetRevision,
+    finalizeHairImport,
+    prepareHairImport,
+    selectHairImportFiles,
+    type HairImportPreparedCandidate
+  } from '$lib/services/hairImports'
+  import {
     hasRenderableGoonAvatar,
     loadAvatarIntoEngine,
     loadCustomAvatarManifest,
@@ -357,15 +403,18 @@
     GoonEditTransform,
     GoonEngine,
     GoonEngineQuality,
-    GoonRendererRuntime
+    GoonRendererRuntime,
+    HairImportMotionPaintTopology
   } from '$lib/goons/engine'
   import type { GoonFramingPreset } from '$lib/goons/cameraNavigation'
   import {
     createGoon,
     deleteGoon,
     loadGoons,
+    resetRetiredGoonHair,
     loadGoonAnimationLibrary,
     updateGoon as updateGoonRecord,
+    persistGoonCamera,
     uploadGoonAnimation,
     deleteGoonAnimation,
     GoonMotionVersionExistsError,
@@ -398,6 +447,7 @@
   import type { AdvancedGoonPackageUploadResult } from '$lib/services/goons'
   import {
     applyRecipeRevisionProjection,
+    findRetiredHairRecipeSibling,
     isRecipePreparationRequired,
     projectGoonRecipeSource,
     resolveRecipeAssetUrl,
@@ -735,7 +785,10 @@
   let editorEyeContactHeadPitchSpeed = $state(1)
   let editorEyeContactEyeYawHeadCompensation = $state(1)
   let editorEyeContactEyePitchHeadCompensation = $state(1)
-  let editorCamera = $state<GoonCamera>({})
+  // Deliberately non-reactive. OrbitControls owns the mounted live camera;
+  // turning every settled movement into Svelte state invalidates this very
+  // large editor even though no rendered control reads the camera object.
+  let editorCamera: GoonCamera = {}
   let editorDirty = $state(false)
   let editorSaving = $state(false)
   let editorFacialArtworkUploadBusy = $state(false)
@@ -751,6 +804,7 @@
   let editorPendingAdvancedPackageUpdate = $state<AdvancedGoonPackageUploadResult | null>(null)
   let recipeWorkflowController = $state<RecipeWorkflowControllerHandle | null>(null)
   let recipeWorkflowBusy = $state(false)
+  let retiredHairRecoveryBusy = $state(false)
   let recipeEditorPreviewTarget = $state<RecipeEditorPreviewTarget | null>(null)
   let recipeEditorDraftPreview = $state<RecipeFittedPreviewState | null>(null)
   let recipePreviewTransitioning = $state(false)
@@ -805,6 +859,7 @@
   let editorBasicSettingsOpen = $state(false)
   let editorEyeContactOpen = $state(false)
   let editorCustomGoonBuilderOpen = $state(false)
+  let editorHairOpen = $state(false)
   let editorVrmSectionOpen = $state(false)
   let editorAnimationsSectionOpen = $state(false)
   let editorClosetOpen = $state(false)
@@ -825,6 +880,39 @@
   let sceneRoomShellInput = $state<HTMLInputElement | null>(null)
   let scenePropInput = $state<HTMLInputElement | null>(null)
   let roomTextureInput = $state<HTMLInputElement | null>(null)
+  let hairAssets = $state<HairAssetV1[]>([])
+  let hairRefitSources = $state<HairRefitSourceV1[]>([])
+  let hairCatalogLoaded = $state(false)
+  let hairCatalogLoading = $state(false)
+  let hairCatalogError = $state<string | null>(null)
+  let editorHairState = $state<HairStateV2>(createHairState(null))
+  let editorHairStateError = $state<string | null>(null)
+  let hairPreviewBusy = $state(false)
+  let hairPreviewError = $state<string | null>(null)
+  let editorHairImportOpen = $state(false)
+  let hairImportInitialFile = $state<File | null>(null)
+  let hairImportInitialCalibrationFile = $state<File | null>(null)
+  let hairImportInitialInspection = $state<HairImportInspection | null>(null)
+  let hairImportRefitAsset = $state<HairAssetV1 | null>(null)
+  let hairImportRefitSource = $state<HairRefitSourceV1 | null>(null)
+  let editorScrollElement = $state<HTMLElement | null>(null)
+  let hairImportWizardElement = $state<HTMLElement | null>(null)
+  let hairImportCandidate = $state<HairImportPreparedCandidate | null>(null)
+  let hairImportFileName = $state('')
+  let hairImportOriginalState = $state<HairStateV2 | null>(null)
+  let hairImportOriginalDials = $state<AppearanceDialValueState | null>(null)
+  let hairImportOriginalCamera = $state<GoonCamera | null>(null)
+  let hairMotionPaintEditorOpen = $state(false)
+  let hairMotionPaintTopology = $state<HairImportMotionPaintTopology | null>(null)
+  let hairMotionPaintInitial = $state<HairMotionPaintV1 | null>(null)
+  let hairMotionPaintResolver: ((paint: HairMotionPaintV1 | null) => void) | null = null
+  let editorHairMotionTuning = $state<SecondaryMotionTuning>({
+    enabled: true,
+    intensity: HAIR_MOTION_DEFAULT_INTENSITY
+  })
+  let hairCatalogPromise: Promise<HairAssetCatalog> | null = null
+  let editorHairHydrationGoonId = ''
+  let editorHairStoredSignature = ''
   let sceneUploadBusy = $state(false)
   let sceneRoomShellBusy = $state(false)
   let scenePropBusy = $state(false)
@@ -1315,6 +1403,19 @@
   )
   const RETIRED_RECIPE_RECOVERY_MESSAGE =
     'This experimental Goon uses a retired Recipe format. Batshit will not guess at or silently migrate its appearance state. Delete this Goon below, then create a new Goon from the current package.'
+  const RETIRED_HAIR_RECOVERY_MESSAGE =
+    'This Goon uses the retired Hair motion state. Reset only its old Hair selection, then refit or re-import Hair. The Goon and every other appearance setting stay intact.'
+  const editorRetiredHairSibling = $derived.by(() => {
+    if (editorGoon?.recipe?.contract !== 'goon-recipe/v2') return null
+    try {
+      return findRetiredHairRecipeSibling(editorGoon.recipe.authoringRevision.state)
+    } catch {
+      return null
+    }
+  })
+  const editorRecipeRecoveryMessage = $derived(
+    editorRetiredHairSibling ? RETIRED_HAIR_RECOVERY_MESSAGE : RETIRED_RECIPE_RECOVERY_MESSAGE
+  )
   // The editor always owns immutable Recipe Source + authoring Recipe State.
   // Mounted stages continue to consume the store record's active Live refs.
   const editorRecipeSourceProjection = $derived.by(() => {
@@ -1338,6 +1439,12 @@
   const editorRecipeSourceError = $derived(editorRecipeSourceProjection.error)
   const editorGoonKind = $derived.by<GoonKind>(() => (editorGoon?.kind === 'custom' ? 'custom' : 'vrm'))
   const editorSourceProfile = $derived.by<GoonSourceProfile>(() => resolveGoonSourceProfile(editorGoon))
+  const editorHairSupported = $derived(editorSourceProfile === 'expert-custom-glb')
+  const editorHairRecipeSource = $derived.by(() =>
+    editorGoon?.recipe?.contract === 'goon-recipe/v2'
+      ? editorGoon.recipe.authoringRevision.source.identities
+      : null
+  )
   const editorIsGuidedCustomVrm = $derived.by(() => editorSourceProfile === 'guided-custom-vrm')
   const editorClosetPickerLabel = $derived.by(() =>
     editorGoonId && editorCustomClosetItems.length > 0
@@ -1359,12 +1466,17 @@
   const activeVrmUpdateReport = $derived.by<GoonVrmUpdateReport | null>(() =>
     editorPendingVrmUpdate ?? editorGoon?.vrmUpdate ?? null
   )
+  const editorRecipeNeedsSave = $derived(
+    editorGoon?.recipe?.contract === 'goon-recipe/v2' &&
+      editorGoon.recipe.liveStatus === 'needs_bake'
+  )
   const editorHasUnsavedChanges = $derived.by(
     () =>
       editorDirty ||
       editorFacialArtworkUploadBusy ||
       Boolean(editorPendingVrmFile) ||
-      Boolean(editorPendingAdvancedPackageUpdate)
+      Boolean(editorPendingAdvancedPackageUpdate) ||
+      editorRecipeNeedsSave
   )
   const currentCustomPackageLabel = $derived.by(() =>
     editorRecipeSourceGoon?.customAvatar?.package
@@ -5475,11 +5587,19 @@
 
   onMount(() => {
     const handleGoonsManage = () => {
+      if (editorHairImportOpen) {
+        toast.info('Finish or cancel the active Hair import before leaving its review.')
+        return
+      }
       activeTab = 'goons'
       editorGoonId = null
     }
 
     const handleGoonsCreate = () => {
+      if (editorHairImportOpen) {
+        toast.info('Finish or cancel the active Hair import before creating another Goon.')
+        return
+      }
       activeTab = 'goons'
       editorGoonId = null
       requestAnimationFrame(() => {
@@ -5488,6 +5608,10 @@
     }
 
     const handleGoonsEdit = (event: Event) => {
+      if (editorHairImportOpen) {
+        toast.info('Finish or cancel the active Hair import before editing another Goon.')
+        return
+      }
       const detail = (event as CustomEvent).detail as { goonId?: string }
       if (!detail?.goonId) {
         activeTab = 'goons'
@@ -5978,6 +6102,587 @@
     }
   }
 
+  async function refreshHairCatalog() {
+    if (hairCatalogPromise) return hairCatalogPromise
+    hairCatalogLoading = true
+    hairCatalogError = null
+    const request = loadHairAssetCatalog()
+    hairCatalogPromise = request
+    try {
+      const catalog = await request
+      hairAssets = catalog.assets
+      hairRefitSources = catalog.refitSources
+      hairCatalogLoaded = true
+      return catalog
+    } catch (error) {
+      hairCatalogError = error instanceof Error ? error.message : 'The Hair catalog could not be loaded.'
+      throw error
+    } finally {
+      if (hairCatalogPromise === request) hairCatalogPromise = null
+      hairCatalogLoading = false
+    }
+  }
+
+  async function ensureHairCatalog() {
+    if (hairCatalogLoaded) {
+      return hairAssets
+    }
+    return (await refreshHairCatalog()).assets
+  }
+
+  function applyStoredHairDraft(goon: GoonRecord) {
+    editorHairHydrationGoonId = goon.id
+    editorHairStoredSignature = JSON.stringify(goon.hairState ?? null)
+    try {
+      editorHairState = goon.hairState ? parseHairState(goon.hairState) : createHairState(null)
+      editorHairStateError = null
+    } catch (error) {
+      editorHairState = createHairState(null)
+      editorHairStateError =
+        error instanceof Error ? error.message : 'The saved Hair state is invalid.'
+    }
+    hairPreviewError = null
+    editorHairMotionTuning = editorHairState.motionSettings ?? {
+      enabled: true,
+      intensity: HAIR_MOTION_DEFAULT_INTENSITY
+    }
+  }
+
+  $effect(() => {
+    const goon = editorGoon
+    const signature = JSON.stringify(goon?.hairState ?? null)
+    const dirty = editorDirty
+    if (!goon) {
+      editorHairHydrationGoonId = ''
+      editorHairStoredSignature = ''
+      return
+    }
+    if (
+      goon.id === editorHairHydrationGoonId &&
+      signature === editorHairStoredSignature
+    ) return
+    if (dirty) return
+    applyStoredHairDraft(goon)
+  })
+
+  async function applyHairStatePreview(
+    engine: GoonEngine,
+    stateValue: HairStateV2 | null | undefined
+  ) {
+    const state = stateValue ? parseHairState(stateValue) : createHairState(null)
+    if (!state.selected) {
+      engine.clearHairPreview()
+      return null
+    }
+    const catalog = await ensureHairCatalog()
+    const selection = resolveHairSelectionCatalogStatus(state, catalog)
+    if (selection.status !== 'ready' || !selection.asset) {
+      throw new Error(selection.message ?? 'The selected Hair style is unavailable.')
+    }
+    const summary = await engine.loadHairAssetPreview(
+      selection.asset,
+      state,
+      resolveHairAssetBrowserUrl(selection.asset.geometry.main.ref, BATSHIT_SERVER_URL),
+      (ref) => resolveHairAssetBrowserUrl(ref, BATSHIT_SERVER_URL)
+    )
+    const tuning = engine.getHairMotionPreviewTuning()
+    if (tuning && engine === previewEngine) editorHairMotionTuning = tuning
+    return summary
+  }
+
+  function updateEditorHairMotionTuning(value: SecondaryMotionTuning) {
+    hairPreviewError = null
+    try {
+      if (!previewEngine) throw new Error('The current Goon preview is unavailable.')
+      const nextState = parseHairState({ ...editorHairState, motionSettings: value })
+      previewEngine.updateHairMotionPreviewTuning(nextState.motionSettings!)
+      editorHairMotionTuning = nextState.motionSettings!
+      editorHairState = nextState
+      editorHairStateError = null
+      editorDirty = true
+    } catch (error) {
+      hairPreviewError =
+        error instanceof Error ? error.message : 'The Hair motion could not be previewed.'
+      toast.error(hairPreviewError)
+    }
+  }
+
+  async function updateEditorHairColors(colors: {
+    baseColor: string
+    highlightColor: string
+  }) {
+    if (!editorHairState.selected) return
+    const nextState = parseHairState({ ...editorHairState, ...colors })
+    if (hairStateEquals(editorHairState, nextState)) return
+    hairPreviewError = null
+    try {
+      const engine = await ensurePreviewGoonReady()
+      if (!engine) throw new Error('The current Goon preview is unavailable.')
+      engine.updateHairPreviewColors(nextState)
+      editorHairState = nextState
+      editorHairStateError = null
+      editorDirty = true
+    } catch (error) {
+      hairPreviewError =
+        error instanceof Error ? error.message : 'The Hair colors could not be previewed.'
+      toast.error(hairPreviewError)
+    }
+  }
+
+  async function selectEditorHairAsset(asset: HairAssetV1 | null) {
+    if (!editorHairSupported) {
+      hairPreviewError = 'Hair Assets currently require an Advanced/GLB Goon.'
+      return
+    }
+    if (asset) {
+      const availability = classifyHairAssetAvailability(asset, editorHairRecipeSource)
+      if (!availability.selectable) {
+        hairPreviewError = availability.message
+        toast.error(availability.message)
+        return
+      }
+    }
+    const previousState = editorHairState
+    const nextState = createHairCatalogSelection(asset, previousState)
+    if (hairStateEquals(previousState, nextState)) return
+    hairPreviewBusy = true
+    hairPreviewError = null
+    try {
+      const engine = await ensurePreviewGoonReady()
+      if (!engine) throw new Error('The current Goon preview is unavailable.')
+      const summary = await applyHairStatePreview(engine, nextState)
+      editorHairState = nextState
+      editorHairStateError = null
+      editorDirty = true
+      if (asset && summary) {
+        toast.success(
+          `${asset.display.name} previewed: ${summary.meshCount.toLocaleString()} pieces, ${summary.triangleCount.toLocaleString()} triangles.`
+        )
+      }
+    } catch (error) {
+      hairPreviewError = error instanceof Error ? error.message : 'The Hair preview could not be updated.'
+      toast.error(hairPreviewError)
+    } finally {
+      hairPreviewBusy = false
+    }
+  }
+
+  async function openEditorHairImport(files: File[]) {
+    if (!editorGoonId || !editorHairSupported) {
+      toast.error('Hair import requires an open Advanced/GLB Goon with a verified Recipe.')
+      return
+    }
+    let selection
+    try {
+      selection = selectHairImportFiles(files)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Choose one OBJ or GLB Hair file.')
+      return
+    }
+    hairImportInitialFile = selection.file
+    hairImportInitialCalibrationFile = selection.calibrationFile
+    hairImportInitialInspection = null
+    hairImportRefitAsset = null
+    hairImportRefitSource = null
+    hairImportCandidate = null
+    hairImportFileName = selection.file.name
+    const originalContext = snapshotHairImportEditorContext(
+      editorHairState,
+      editorAppearanceDialsState
+    )
+    hairImportOriginalState = originalContext.hairState
+    hairImportOriginalDials = originalContext.appearanceDials
+    hairImportOriginalCamera = previewEngine?.getCameraState() ?? null
+    editorHairImportOpen = true
+    await tick()
+    revealHairImportEditor(editorScrollElement, hairImportWizardElement)
+  }
+
+  function resetEditorHairImportContext() {
+    if (hairMotionPaintResolver) finishEditorHairMotionPaint(null)
+    hairImportInitialFile = null
+    hairImportInitialCalibrationFile = null
+    hairImportInitialInspection = null
+    hairImportRefitAsset = null
+    hairImportRefitSource = null
+    hairImportCandidate = null
+    hairImportFileName = ''
+    hairImportOriginalState = null
+    hairImportOriginalDials = null
+    hairImportOriginalCamera = null
+  }
+
+  function closeEditorHairImport() {
+    editorHairImportOpen = false
+    resetEditorHairImportContext()
+  }
+
+  async function applyHairImportAuthoringPose(engine: GoonEngine) {
+    const pose = resolvePaintedConcealPose('t-pose')
+    await engine.loadAdditionalAnimations([pose.file])
+    engine.setAuthoringPoseMode(true, pose.animationName)
+  }
+
+  async function inspectEditorHairImport(file: File, calibrationFile: File | null) {
+    if (!editorGoonId) throw new Error('Open one Goon before importing Hair.')
+    hairImportFileName = file.name
+    const engine = await ensurePreviewGoonReady()
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    await applyHairImportAuthoringPose(engine)
+    if (!hairImportOriginalCamera) {
+      hairImportOriginalCamera = engine.getCameraState() ?? null
+    }
+    const inspection = await createHairImport({ file, calibrationFile, goonId: editorGoonId })
+    await engine.loadHairImportInspectionPreview(
+      resolveHairAssetBrowserUrl(inspection.previewGeometryUrl, BATSHIT_SERVER_URL),
+      inspection.objects.map((object) => object.id),
+      inspection.objects.filter((object) => object.recommendedHair).map((object) => object.id),
+      inspection.proposedTransform
+    )
+    setTransientHairImportCamera(engine, 0)
+    await waitForHairImportPreviewFrame()
+    return inspection
+  }
+
+  async function openEditorHairRefit(asset: HairAssetV1, refitSource: HairRefitSourceV1) {
+    if (
+      !editorGoonId ||
+      !editorHairSupported ||
+      refitSource.assetId !== asset.assetId ||
+      refitSource.revisionId !== asset.revisionId
+    ) {
+      toast.error('Hair refit requires an imported Hair revision and an open Advanced/GLB Goon.')
+      return
+    }
+    const originalContext = snapshotHairImportEditorContext(
+      editorHairState,
+      editorAppearanceDialsState
+    )
+    hairImportOriginalState = originalContext.hairState
+    hairImportOriginalDials = originalContext.appearanceDials
+    hairImportOriginalCamera = previewEngine?.getCameraState() ?? null
+    hairImportInitialFile = null
+    hairImportInitialCalibrationFile = null
+    hairImportInitialInspection = null
+    hairImportRefitAsset = asset
+    hairImportRefitSource = refitSource
+    hairImportCandidate = null
+    hairImportFileName = asset.display.name
+    hairPreviewBusy = true
+    let inspection: HairImportInspection | null = null
+    try {
+      const engine = await ensurePreviewGoonReady()
+      if (!engine) throw new Error('The current Goon preview is unavailable.')
+      await applyHairImportAuthoringPose(engine)
+      inspection = await createHairRefit({ goonId: editorGoonId, asset })
+      await engine.loadHairImportInspectionPreview(
+        resolveHairAssetBrowserUrl(inspection.previewGeometryUrl, BATSHIT_SERVER_URL),
+        inspection.objects.map((object) => object.id),
+        inspection.objects.filter((object) => object.recommendedHair).map((object) => object.id),
+        inspection.initialTransform
+      )
+      setTransientHairImportCamera(engine, 0)
+      await waitForHairImportPreviewFrame()
+      hairImportInitialInspection = inspection
+      editorHairImportOpen = true
+      await tick()
+      revealHairImportEditor(editorScrollElement, hairImportWizardElement)
+    } catch (error) {
+      if (inspection?.sessionId) {
+        try {
+          await cancelHairImport(inspection.sessionId)
+        } catch (cleanupError) {
+          console.error('[GoonsSettingsPanel] Hair refit cleanup failed:', cleanupError)
+        }
+      }
+      previewEngine?.setAuthoringPoseMode(false)
+      try {
+        const engine = await ensurePreviewGoonReady()
+        if (engine) {
+          await applyHairStatePreview(engine, hairImportOriginalState)
+          engine.setAppearanceDialValues(hairImportOriginalDials)
+          if (hairImportOriginalCamera) engine.applyCamera(hairImportOriginalCamera)
+        }
+      } catch (restoreError) {
+        console.error('[GoonsSettingsPanel] Hair refit preview restoration failed:', restoreError)
+      }
+      resetEditorHairImportContext()
+      toast.error(error instanceof Error ? error.message : 'The Hair refit could not be opened.')
+    } finally {
+      hairPreviewBusy = false
+    }
+  }
+
+  function updateEditorHairImportSelection(
+    selectedObjectIds: string[],
+    soloObjectId: string | null
+  ) {
+    const engine = previewEngine
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    engine.updateHairImportInspectionSelection(selectedObjectIds, soloObjectId)
+  }
+
+  function updateEditorHairImportTransform(transform: HairImportPreviewRequest['transform']) {
+    const engine = previewEngine
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    engine.updateHairImportInspectionTransform(transform)
+  }
+
+  async function restoreEditorHairImportFit(
+    inspection: HairImportInspection,
+    request: HairImportPreviewRequest
+  ) {
+    const engine = await ensurePreviewGoonReady()
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    await engine.loadHairImportInspectionPreview(
+      resolveHairAssetBrowserUrl(inspection.previewGeometryUrl, BATSHIT_SERVER_URL),
+      inspection.objects.map((object) => object.id),
+      request.selectedObjectIds,
+      request.transform
+    )
+    setTransientHairImportCamera(engine, 0)
+    await waitForHairImportPreviewFrame()
+  }
+
+  function setTransientHairImportCamera(engine: GoonEngine, yaw: number) {
+    engine.setCameraChangeHandler()
+    try {
+      if (!engine.frameAvatar('headshot')) {
+        throw new Error('The Goon preview could not frame the imported Hair.')
+      }
+      const framed = engine.getCameraState()
+      if (!framed) throw new Error('The Goon preview camera is unavailable.')
+      engine.applyCamera({ ...framed, yaw, pitch: 0, mode: 'free' })
+    } finally {
+      engine.setCameraChangeHandler(handlePreviewCameraChange)
+    }
+  }
+
+  async function waitForHairImportPreviewFrame() {
+    await tick()
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    })
+  }
+
+  async function buildEditorHairImportPreview(request: HairImportPreviewRequest) {
+    const prepared = await prepareHairImport({
+      ...request,
+      reviewedAppearanceState: hairImportOriginalDials
+    })
+    const engine = await ensurePreviewGoonReady()
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    await engine.loadHairAssetPreview(
+      prepared.candidate.asset,
+      prepared.candidate.hairState,
+      resolveHairAssetBrowserUrl(prepared.candidate.geometryUrl, BATSHIT_SERVER_URL),
+      (ref) => resolveHairAssetBrowserUrl(ref, BATSHIT_SERVER_URL)
+    )
+    hairImportCandidate = prepared.candidate
+    setTransientHairImportCamera(engine, 0)
+    await waitForHairImportPreviewFrame()
+    return prepared.proposals
+  }
+
+  async function setEditorHairImportMotionMap(
+    enabled: boolean,
+    _request: HairImportPreviewRequest
+  ) {
+    if (!hairImportCandidate) throw new Error('Build the Hair preview before reviewing motion.')
+    const engine = await ensurePreviewGoonReady()
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    engine.setAppearanceDialValues(hairImportOriginalDials)
+    if (enabled) engine.showHairImportMotionMap()
+    else engine.hideHairImportMotionMap()
+    setTransientHairImportCamera(engine, 0)
+    await waitForHairImportPreviewFrame()
+  }
+
+  function finishEditorHairMotionPaint(paint: HairMotionPaintV1 | null) {
+    const engine = previewEngine
+    if (engine) {
+      engine.setHairImportMotionPaintActive(false)
+      engine.setHairImportMotionPaintGoonVisible(true)
+      for (const mesh of hairMotionPaintTopology?.meshes ?? []) {
+        try {
+          engine.setHairImportMotionPaintMeshVisible(mesh.meshNode, true)
+        } catch {
+          // The preview may already have been replaced while the editor was closing.
+        }
+      }
+    }
+    const resolve = hairMotionPaintResolver
+    hairMotionPaintResolver = null
+    hairMotionPaintEditorOpen = false
+    hairMotionPaintTopology = null
+    hairMotionPaintInitial = null
+    resolve?.(paint)
+  }
+
+  async function editEditorHairMotionPaint(
+    current: HairMotionPaintV1 | null
+  ): Promise<HairMotionPaintV1 | null> {
+    if (!hairImportCandidate) {
+      throw new Error('Build the reviewed Hair candidate before painting motion areas.')
+    }
+    if (paintedConcealEditorOpen) {
+      throw new Error('Finish the active Wardrobe paint editor before painting Hair motion.')
+    }
+    if (hairMotionPaintResolver) {
+      throw new Error('The Hair motion paint editor is already open.')
+    }
+    const engine = await ensurePreviewGoonReady()
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    engine.setAppearanceDialValues(hairImportOriginalDials)
+    hairMotionPaintTopology = engine.getHairImportMotionPaintTopology()
+    hairMotionPaintInitial = current
+    engine.setHairImportMotionPaintGoonVisible(true)
+    for (const mesh of hairMotionPaintTopology.meshes) {
+      engine.setHairImportMotionPaintMeshVisible(mesh.meshNode, true)
+    }
+    engine.setHairImportMotionPaintActive(true)
+    hairMotionPaintEditorOpen = true
+    return new Promise((resolve) => {
+      hairMotionPaintResolver = resolve
+    })
+  }
+
+  async function previewEditorHairMotionPaint(
+    paint: HairMotionPaintV1,
+    activeRegionId: string | null
+  ) {
+    const engine = previewEngine
+    if (!engine || !hairMotionPaintEditorOpen) return
+    engine.showHairImportMotionPaint(paint, activeRegionId)
+    await waitForHairImportPreviewFrame()
+  }
+
+  function pickEditorHairMotionPaint(
+    clientX: number,
+    clientY: number,
+    brushRadiusPx: number
+  ) {
+    return previewEngine?.pickHairImportMotionTriangles(clientX, clientY, brushRadiusPx) ?? null
+  }
+
+  function setEditorHairMotionPaintGoonVisible(visible: boolean) {
+    previewEngine?.setHairImportMotionPaintGoonVisible(visible)
+  }
+
+  function setEditorHairMotionPaintMeshVisible(meshNode: string, visible: boolean) {
+    previewEngine?.setHairImportMotionPaintMeshVisible(meshNode, visible)
+  }
+
+  function cancelEditorHairMotionPaint() {
+    if (hairImportCandidate && previewEngine) {
+      try {
+        previewEngine.hideHairImportMotionMap()
+      } catch (error) {
+        console.error('[GoonsSettingsPanel] Hair motion paint cleanup failed:', error)
+      }
+    }
+    finishEditorHairMotionPaint(null)
+  }
+
+  function saveEditorHairMotionPaint(paint: HairMotionPaintV1) {
+    if (hairImportCandidate && previewEngine) {
+      try {
+        previewEngine.hideHairImportMotionMap()
+      } catch (error) {
+        console.error('[GoonsSettingsPanel] Hair motion paint cleanup failed:', error)
+      }
+    }
+    finishEditorHairMotionPaint(paint)
+  }
+
+  function hairImportPreviewPng(engine: GoonEngine) {
+    const dataUrl = engine.captureSnapshot()
+    const prefix = 'data:image/png;base64,'
+    if (!dataUrl?.startsWith(prefix)) {
+      throw new Error('The exact reviewed Hair preview could not be captured as PNG.')
+    }
+    const decoded = atob(dataUrl.slice(prefix.length))
+    const bytes = new Uint8Array(decoded.length)
+    for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index)
+    return bytesToBlob(bytes, { type: 'image/png' })
+  }
+
+  function hairImportDisplayName() {
+    if (hairImportRefitAsset) return hairImportRefitAsset.display.name
+    const value = hairImportFileName
+      .replace(/\.(obj|glb)$/i, '')
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    return (value || 'Imported Hair').slice(0, 120)
+  }
+
+  async function finalizeEditorHairImport(request: HairImportFinalizeRequest) {
+    const candidate = hairImportCandidate
+    if (!candidate) throw new Error('The finished Hair candidate is unavailable.')
+    const engine = await ensurePreviewGoonReady()
+    if (!engine) throw new Error('The current Goon preview is unavailable.')
+    engine.setAppearanceDialValues(hairImportOriginalDials)
+    engine.hideHairImportMotionMap()
+    setTransientHairImportCamera(engine, 0)
+    await waitForHairImportPreviewFrame()
+    return finalizeHairImport({
+      ...request,
+      previewPng: hairImportPreviewPng(engine),
+      displayName: hairImportDisplayName(),
+      author: hairImportRefitAsset
+        ? hairImportRefitAsset.provenance.author
+        : (userSettings?.displayName?.trim() || 'Local Batshit user').slice(0, 160),
+      license: hairImportRefitAsset
+        ? hairImportRefitAsset.provenance.license
+        : 'User-provided source; rights retained by importer'
+    })
+  }
+
+  async function completeEditorHairImport(result: unknown) {
+    const asset = await verifyHairAsset(result)
+    await refreshHairCatalog()
+    try {
+      await selectEditorHairAsset(asset)
+    } finally {
+      previewEngine?.setAuthoringPoseMode(false)
+    }
+    toast.success(
+      `${asset.display.name} was saved as immutable imported Hair revision ${asset.revision}.`
+    )
+  }
+
+  async function deleteEditorHairAsset(asset: HairAssetV1) {
+    try {
+      await deleteHairAssetRevision(asset.assetId, asset.revisionId)
+      await refreshHairCatalog()
+      toast.success(`${asset.display.name} revision ${asset.revision} was deleted.`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The Hair revision could not be deleted.'
+      toast.error(message)
+      throw error
+    }
+  }
+
+  async function cancelEditorHairImport(sessionId: string | null) {
+    if (sessionId) await cancelHairImport(sessionId)
+    previewEngine?.setAuthoringPoseMode(false)
+    try {
+      const engine = await ensurePreviewGoonReady()
+      if (engine) {
+        await applyHairStatePreview(engine, hairImportOriginalState)
+        engine.setAppearanceDialValues(hairImportOriginalDials)
+        if (hairImportOriginalCamera) engine.applyCamera(hairImportOriginalCamera)
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? `The unfinished import was cleaned up, but the prior preview could not be restored: ${error.message}`
+          : 'The unfinished import was cleaned up, but the prior preview could not be restored.'
+      )
+    }
+  }
+
   function resolveGoonById(id?: string | null) {
     if (!id) return null
     return goons.find((entry) => entry.id === id) ?? null
@@ -6332,13 +7037,18 @@
     const animationSignature = resolveAnimationFiles(goon)
       .map((entry) => entry.url)
       .join('|')
-    return [mode, goon.id, vrmUrl, animationSignature].join('::')
+    const hairSignature = JSON.stringify(goon.hairState ?? null)
+    return [mode, goon.id, vrmUrl, animationSignature, hairSignature].join('::')
   }
 
   async function loadPreviewGoon(
     goon: GoonRecord,
     mode: GoonPreviewMode = 'editor',
-    options: { strict?: boolean; awaitAnimations?: boolean } = {}
+    options: {
+      strict?: boolean
+      awaitAnimations?: boolean
+      hairState?: HairStateV2 | null
+    } = {}
   ): Promise<boolean> {
     goon = resolveRecipePreviewGoonAssetUrls(goon, BATSHIT_SERVER_URL)
     const targetUrl = resolveGoonAvatarUrl(goon)
@@ -6390,6 +7100,23 @@
       if (token !== previewToken) {
         if (options.strict) throw new Error('The Goon preview candidate was superseded while it loaded.')
         return false
+      }
+      if (kind === 'custom' && mode !== 'recipe-live-candidate') {
+        const previewHairState = Object.prototype.hasOwnProperty.call(options, 'hairState')
+          ? options.hairState
+          : goon.id === editorGoonId && !recipeEditorPreviewTarget
+            ? editorHairState
+            : goon.hairState
+        try {
+          await applyHairStatePreview(engine, previewHairState)
+          hairPreviewError = null
+        } catch (error) {
+          hairPreviewError =
+            error instanceof Error ? error.message : 'The selected Hair style could not be restored.'
+          toast.error(hairPreviewError)
+        }
+      } else {
+        hairPreviewError = null
       }
 
       // Both lanes sync their motion set: VRM goons load .vrma entries, GLB
@@ -6504,7 +7231,8 @@
       if (resolvedTarget) {
         await loadPreviewGoon(resolvedTarget.goon, 'editor', {
           strict: true,
-          awaitAnimations: true
+          awaitAnimations: true,
+          hairState: resolvedTarget.goon.hairState ?? null
         })
       }
       recipeEditorPreviewTarget = resolvedTarget
@@ -8393,6 +9121,32 @@
     }
   }
 
+  async function resetEditorRetiredHair() {
+    if (
+      retiredHairRecoveryBusy ||
+      !editorGoon ||
+      editorGoon.recipe?.contract !== 'goon-recipe/v2' ||
+      !editorRetiredHairSibling
+    ) {
+      return
+    }
+    retiredHairRecoveryBusy = true
+    try {
+      const recovered = await resetRetiredGoonHair(
+        editorGoon.id,
+        editorGoon.recipe.writeVersion
+      )
+      closeEditorHairImport()
+      openCueEditor(recovered)
+      editorHairOpen = true
+      toast.success('Retired Hair reset. The rest of the Goon was preserved.')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to reset retired Hair')
+    } finally {
+      retiredHairRecoveryBusy = false
+    }
+  }
+
   function openCueEditor(goon: GoonRecord) {
     activeTab = 'goons'
     if (editorGoonId !== goon.id) {
@@ -8436,6 +9190,7 @@
     editorPendingVrmUpdate = null
     editorPendingAdvancedPackageUpdate = null
     recipeEditorPreviewTarget = null
+    applyStoredHairDraft(goon)
     editorFacialArtworkUploadBusy = false
     editorFacialArtworkCreditDraft = createDefaultFacialArtworkUploadCreditDraft()
     advancedPackageUpdateFile = null
@@ -8451,6 +9206,7 @@
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
     editorCustomGoonBuilderOpen = false
+    editorHairOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -9553,7 +10309,7 @@
   const saveCamera = debounce(async (camera: GoonCamera) => {
     if (!editorGoonId) return
     try {
-      await updateGoonRecord(editorGoonId, { camera })
+      await persistGoonCamera(editorGoonId, camera)
     } catch (error: any) {
       toast.error(error?.message || 'Failed to save camera view')
     }
@@ -10062,6 +10818,10 @@
   }
 
   function handleEditorGoonSelect(nextGoonId: string | null) {
+    if (nextGoonId !== editorGoonId) {
+      previewEngine?.clearHairPreview()
+      hairPreviewError = null
+    }
     if (!nextGoonId) {
       editorGoonId = null
       return
@@ -10180,9 +10940,10 @@
   }
 
   // Hydration is keyed by goon id + manifest URL, NOT the goon object
-  // reference: background PUTs on the edited goon (camera saves,
-  // compatibility reports) replace the store object while the user works and
-  // must not remount the dial editor or clobber an unsaved draft.
+  // reference: background PUTs on the edited goon (for example compatibility
+  // reports) can replace the store object while the user works and must not
+  // remount the dial editor or clobber an unsaved draft. Camera-only writes
+  // intentionally bypass that global-store replacement.
   $effect(() => {
     const goon = editorRecipeSourceGoon
     const isCustom = Boolean(goon && resolveGoonKind(goon) === 'custom')
@@ -11422,11 +12183,16 @@
       | 'basic'
       | 'eye-contact'
       | 'custom-goon-builder'
+      | 'hair'
       | 'vrm'
       | 'animations'
       | 'closet'
       | 'delete'
   ) {
+    if (editorHairImportOpen) {
+      toast.info('Finish or cancel the active Hair import before leaving its review.')
+      return
+    }
     if (recipeWorkflowBusy) {
       toast.info('Wait for the current Goon update to finish before leaving this section.')
       return
@@ -11435,6 +12201,10 @@
     editorEyeContactOpen = section === 'eye-contact' ? !editorEyeContactOpen : false
     editorCustomGoonBuilderOpen =
       section === 'custom-goon-builder' ? !editorCustomGoonBuilderOpen : false
+    editorHairOpen = section === 'hair' ? !editorHairOpen : false
+    if (section === 'hair' && editorHairOpen && !hairCatalogLoaded && !hairCatalogLoading) {
+      void refreshHairCatalog().catch(() => {})
+    }
     editorVrmSectionOpen = section === 'vrm' ? !editorVrmSectionOpen : false
     editorAnimationsSectionOpen =
       section === 'animations' ? !editorAnimationsSectionOpen : false
@@ -11455,9 +12225,14 @@
   }
 
   function toggleEditorCueSection(section: 'moods' | 'emotes') {
+    if (editorHairImportOpen) {
+      toast.info('Finish or cancel the active Hair import before leaving its review.')
+      return
+    }
     editorBasicSettingsOpen = false
     editorEyeContactOpen = false
     editorCustomGoonBuilderOpen = false
+    editorHairOpen = false
     editorVrmSectionOpen = false
     editorAnimationsSectionOpen = false
     editorClosetOpen = false
@@ -13040,6 +13815,9 @@
     if (!editorGoonId) return false
     editorSaving = true
     try {
+      if (editorHairSupported && editorHairStateError) {
+        throw new Error('Resolve the saved Hair state before saving this Goon.')
+      }
       if (
         !options.skipRecipeWorkflow &&
         editorSourceProfile === 'expert-custom-glb' &&
@@ -13176,6 +13954,9 @@
         camera: editorCamera,
         closet: advancedPackageDraft?.closet ?? buildEditorClosetPayload(),
         closetAssignments: advancedPackageDraft?.closetAssignments ?? sanitizeClosetAssignments(closetAssignments)
+      }
+      if (editorHairSupported && !recipeOwnsAppearance) {
+        updates.hairState = editorHairState
       }
       if (
         !recipeOwnsAppearance &&
@@ -13540,6 +14321,10 @@
   }
 
   function requestWorkspaceExit(intent: GoonsExitIntent) {
+    if (editorHairImportOpen) {
+      toast.info('Finish or cancel the active Hair import before leaving its review.')
+      return
+    }
     if (activeSceneEdit?.type === 'marker') {
       toast.error('Save or cancel the active marker position first.')
       return
@@ -14001,7 +14786,6 @@
         bind:this={roomTextureInput}
         onchange={handleRoomTextureSelection}
       />
-
       {#if !editorGoonId && !sceneEditorMode}
       <div class="goon-tab-content-shell flex min-h-0 flex-1 items-stretch overflow-hidden">
         <div
@@ -16310,7 +17094,11 @@
                       size="sm"
                       onclick={() => {
                         if (editorGoonId === goon.id) {
-                          editorGoonId = null
+                          requestWorkspaceExit({ type: 'close-editor' })
+                        } else if (editorHairImportOpen) {
+                          toast.info(
+                            'Finish or cancel the active Hair import before editing another Goon.'
+                          )
                         } else {
                           openCueEditor(goon)
                         }
@@ -16526,7 +17314,7 @@
         class="flex min-h-0 flex-1 items-stretch overflow-hidden"
       >
         <div class="batshit-settings-preview-shell batshit-goon-static-card flex h-full min-h-0 min-w-0 flex-1 flex-col">
-          <div class="min-h-0 flex-1 overflow-y-auto">
+          <div bind:this={editorScrollElement} class="min-h-0 flex-1 overflow-y-auto">
           <div class="space-y-3 px-5 pt-6 pb-24">
           <div class="flex items-center justify-between">
             <div class="batshit-settings-badge-row flex items-center gap-2">
@@ -17108,6 +17896,98 @@
               </Collapsible.Content>
             </Collapsible.Root>
           {/if}
+
+          <Collapsible.Root bind:open={editorHairOpen} class={goonLevel1AccordionClass}>
+            <Collapsible.Trigger
+              class={goonLevel1AccordionHeaderClass}
+              onclick={() => toggleEditorPrimarySection('hair')}
+            >
+              <div class="flex items-center gap-1.5">
+                <Scissors class="batshit-goon-l1-icon h-4 w-4" />
+                <span class="batshit-settings-form-label">Hair</span>
+                <div
+                  onclick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                  }}
+                  aria-hidden="true"
+                >
+                  <SettingsInfoMenu ariaLabel="About Hair" contentClass="w-80">
+                    <p>
+                      Choose a compatible built-in or imported Hair style. Changes preview on the
+                      current Goon immediately and become part of its self-contained Live Goon when
+                      you click Save Goon.
+                    </p>
+                  </SettingsInfoMenu>
+                </div>
+              </div>
+              <ChevronDown
+                class={`h-4 w-4 shrink-0 transition-transform ${editorHairOpen ? 'rotate-180' : ''}`}
+              />
+            </Collapsible.Trigger>
+            <Collapsible.Content class={`${goonLevel1AccordionContentClass} pt-3`}>
+              <HairCatalogEditor
+                assets={hairAssets}
+                refitSources={hairRefitSources}
+                valueState={editorHairState}
+                recipeSource={editorHairRecipeSource}
+                supported={editorHairSupported}
+                loading={hairCatalogLoading}
+                busy={hairPreviewBusy}
+                loadError={hairCatalogError}
+                previewError={editorHairStateError ?? hairPreviewError}
+                retiredStateRecovery={editorRetiredHairSibling
+                  ? {
+                      busy: retiredHairRecoveryBusy,
+                      onReset: resetEditorRetiredHair
+                    }
+                  : null}
+                disabled={editorSaving || recipeWorkflowBusy || Boolean(editorRetiredHairSibling)}
+                onRefresh={() => refreshHairCatalog().then(() => undefined).catch(() => undefined)}
+                onSelect={selectEditorHairAsset}
+                onImport={openEditorHairImport}
+                onRefit={openEditorHairRefit}
+                onDelete={deleteEditorHairAsset}
+                onColorsChange={updateEditorHairColors}
+                motionTuning={editorHairMotionTuning}
+                onMotionTuningChange={updateEditorHairMotionTuning}
+              />
+              {#if editorHairImportOpen && (hairImportInitialFile || hairImportInitialInspection)}
+                <div
+                  bind:this={hairImportWizardElement}
+                  role="region"
+                  aria-label="Hair import review"
+                  tabindex="-1"
+                >
+                  <HairImportWizard
+                    initialFile={hairImportInitialFile}
+                    initialCalibrationFile={hairImportInitialCalibrationFile}
+                    initialInspection={hairImportInitialInspection}
+                    initialFileSelection={hairImportRefitAsset && hairImportRefitSource
+                      ? {
+                          name: `${hairImportRefitAsset.display.name}.glb`,
+                          size: hairImportRefitSource.source.bytes,
+                          type: hairImportRefitSource.source.mimeType
+                        }
+                      : null}
+                    mode={hairImportRefitAsset ? 'refit' : 'import'}
+                    disabled={editorSaving || recipeWorkflowBusy}
+                    onInspect={inspectEditorHairImport}
+                    onPreviewSelectionChange={updateEditorHairImportSelection}
+                    onPreviewTransformChange={updateEditorHairImportTransform}
+                    onReturnToFit={restoreEditorHairImportFit}
+                    onBuildPreview={buildEditorHairImportPreview}
+                    onEditMotionPaint={editEditorHairMotionPaint}
+                    onSetMotionMap={setEditorHairImportMotionMap}
+                    onFinalize={finalizeEditorHairImport}
+                    onCancel={cancelEditorHairImport}
+                    onComplete={completeEditorHairImport}
+                    onClose={closeEditorHairImport}
+                  />
+                </div>
+              {/if}
+            </Collapsible.Content>
+          </Collapsible.Root>
 
           <Collapsible.Root bind:open={editorClosetOpen} class={goonLevel1AccordionClass}>
             <Collapsible.Trigger
@@ -18787,13 +19667,26 @@
 	                        <CircleAlert class="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden="true" />
 	                        <div class="min-w-0">
 	                          <div class="batshit-settings-form-label is-danger">
-	                            This Goon needs to be recreated
+	                            {editorRetiredHairSibling ? 'This Goon needs a Hair reset' : 'This Goon needs to be recreated'}
 	                          </div>
 	                          <p class="batshit-settings-caption mt-1 break-words">
-	                            {RETIRED_RECIPE_RECOVERY_MESSAGE}
+	                            {editorRecipeRecoveryMessage}
 	                          </p>
 	                        </div>
 	                      </div>
+	                      {#if editorRetiredHairSibling}
+	                        <div class="batshit-settings-action-row">
+	                          <Button
+	                            variant="outline"
+	                            type="button"
+	                            onclick={resetEditorRetiredHair}
+	                            disabled={retiredHairRecoveryBusy}
+	                          >
+	                            <RotateCcw aria-hidden="true" />
+	                            {retiredHairRecoveryBusy ? 'Resetting Hair…' : 'Reset retired Hair'}
+	                          </Button>
+	                        </div>
+	                      {/if}
 	                      <details>
 	                        <summary class="batshit-settings-child-label cursor-pointer">
 	                          Technical Details
@@ -18820,6 +19713,7 @@
 	                        nailSurface={editorNailSurfaceState}
 	                        nailSurfacePresence={editorNailSurfacePresence}
 	                        skinAppearance={editorSkinAppearanceState}
+	                        hairState={editorHairState}
 	                        fileTechnicalDetails={{
 	                          packageLabel: currentCustomPackageLabel,
 	                          modelLabel: currentCustomModelLabel,
@@ -19035,7 +19929,7 @@
               </Button>
               <Button
                 onclick={() => void saveCueEditor()}
-                disabled={Boolean(editorRecipeSourceError) || !editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy || recipeWorkflowBusy}
+                disabled={Boolean(editorRecipeSourceError) || Boolean(editorHairStateError) || !editorHasUnsavedChanges || editorSaving || editorFacialArtworkUploadBusy || recipeWorkflowBusy}
               >
                 {#if recipeWorkflowBusy}
                   <Loader2 class="animate-spin motion-reduce:animate-none" aria-hidden="true" />
@@ -19124,7 +20018,7 @@
           onResizeStart={startPreviewResize}
           runtimeBadge={resolveRendererBadge(previewRuntimeStatus)}
           loading={previewLoading}
-          error={editorRecipeSourceError ? RETIRED_RECIPE_RECOVERY_MESSAGE : previewError}
+          error={editorRecipeSourceError ? editorRecipeRecoveryMessage : previewError}
           emptyMessage={
             !hasRenderableGoonAvatar(editorGoon)
               ? editorGoonKind === 'custom'
@@ -19135,7 +20029,18 @@
           wrapperClass="h-full min-h-0 batshit-settings-preview-shell"
         >
           {#snippet overlay()}
-            {#if paintedConcealEditorOpen}
+            {#if hairMotionPaintEditorOpen && hairMotionPaintTopology}
+              <HairMotionPaintOverlay
+                topology={hairMotionPaintTopology}
+                initialPaint={hairMotionPaintInitial}
+                onPreview={previewEditorHairMotionPaint}
+                onPick={pickEditorHairMotionPaint}
+                onSetGoonVisible={setEditorHairMotionPaintGoonVisible}
+                onSetMeshVisible={setEditorHairMotionPaintMeshVisible}
+                onSave={saveEditorHairMotionPaint}
+                onCancel={cancelEditorHairMotionPaint}
+              />
+            {:else if paintedConcealEditorOpen}
               <div
                 class="pointer-events-none absolute inset-0 z-20"
                 role="application"

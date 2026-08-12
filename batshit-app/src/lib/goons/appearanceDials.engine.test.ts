@@ -526,6 +526,24 @@ describe("AppearanceDialsEngineRuntime", () => {
     expect(scene.sclera.geometry.getAttribute("position").getX(0)).toBe(0);
   });
 
+  it("preserves editor-owned avatar rotation while applying Appearance values", () => {
+    const scene = buildScene();
+    const runtime = new AppearanceDialsEngineRuntime(
+      scene.root,
+      buildManifest(),
+      { faceMeshes: [scene.face] },
+    );
+    const editorRotation = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 1, 0),
+      Math.PI / 3,
+    );
+    scene.root.quaternion.copy(editorRotation);
+
+    runtime.setValues(values(runtime.manifest, { head_projection: 0.5 }));
+
+    expect(scene.root.quaternion.toArray()).toEqual(editorRotation.toArray());
+  });
+
   it("binds the scene inventory, applies every v2 output, and resets to captured rest", () => {
     const scene = buildScene();
     const runtime = new AppearanceDialsEngineRuntime(

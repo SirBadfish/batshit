@@ -2,7 +2,15 @@
 
 This page lists the public-safe template files published by the docs site under `/user-templates/`.
 
-## Current template rule
+## Batshit Anime Hair Studio template
+
+Use [Batshit Base Female Hair Template v1](/user-templates/batshit-anime-hair-studio/Batshit-Base-Female-Hair-Template-v1.ahs) to create Hair for the first-party Base Female Goon in Anime Hair Studio. Duplicate the project, author and export the finished hairstyle as OBJ, then select the OBJ and saved `.ahs` together in **Goon Editor -> Hair -> Import Hair**.
+
+The `.ahs` project is optional calibration data, not Hair geometry. Batshit recognizes the unmodified head/scalp calibration after ordinary project saves and Hair edits, but a changed or independently calibrated scalp uses the visible general-fit path. An `.ahs` file cannot be imported without its exported OBJ.
+
+[Anime Hair Studio](https://github.com/Ludetools/Animehairstudio) remains a separate application governed by its own license. Batshit publishes only its own template project data and embedded Batshit calibration; it does not bundle Anime Hair Studio or its source code.
+
+## n8n template rule
 
 Import workflow templates in n8n. Batshit does not silently provision n8n workflows, credentials, provider keys, or model nodes for the user.
 

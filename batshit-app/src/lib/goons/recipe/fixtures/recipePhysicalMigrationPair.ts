@@ -86,6 +86,8 @@ export type RecipePhysicalMigrationFixtureOptions = {
   /** Override only for isolated product-policy smoke; defaults preserve the frozen R2 oracle. */
   baseId?: string;
   fitFamily?: string;
+  /** Use the canonical Head Size id so generic Hair-import smoke can share this isolated fixture. */
+  hairImportCompatible?: boolean;
 };
 
 const ZERO_SHA256 = "0".repeat(64);
@@ -236,8 +238,8 @@ const MORPH_NAMES = [
   "piecewise_shape",
   "removed_shape",
 ] as const;
-function morphDelta(scale: number, slot: number): number[] {
-  const values = new Array(9).fill(0) as number[];
+function morphDelta(scale: number, slot: number, vertexCount = 3): number[] {
+  const values = new Array(vertexCount * 3).fill(0) as number[];
   values[(slot % 3) * 3 + (slot % 2)] = scale;
   return values;
 }
@@ -245,15 +247,22 @@ function morphDelta(scale: number, slot: number): number[] {
 function physicalGlb(
   version: "source" | "target",
   runtimeMorphName?: string,
+  hairImportCompatible = false,
 ): Uint8Array {
   const accessors = new FixtureAccessors();
-  const basePosition = accessors.floatVec3([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+  const bodyPositions = hairImportCompatible
+    ? [
+        -0.3, 1.3, -0.2, 0.3, 1.3, -0.2, -0.3, 1.68, 0.2, 0.3, 1.3, -0.2,
+        0.3, 1.68, 0.2, -0.3, 1.68, 0.2,
+      ]
+    : [0, 0, 0, 1, 0, 0, 0, 1, 0];
+  const basePosition = accessors.floatVec3(bodyPositions);
   const morphNames = [
     ...MORPH_NAMES,
     ...(runtimeMorphName ? [runtimeMorphName] : []),
   ];
   const morphs = morphNames.map((name, index) =>
-    accessors.floatVec3(morphDelta(0.1, index)),
+    accessors.floatVec3(morphDelta(0.1, index, bodyPositions.length / 3)),
   );
   const binary = Uint8Array.from(accessors.bytes);
   return makeGlb(
@@ -270,7 +279,10 @@ function physicalGlb(
       nodes: [
         { name: "FixtureRoot", children: [1, 2, 3, 4] },
         { name: "Body", mesh: 0 },
-        { name: "HeadAnchor" },
+        {
+          name: "HeadAnchor",
+          ...(hairImportCompatible ? { translation: [0, 1.48, 0] } : {}),
+        },
         { name: "HipsAnchor" },
         { name: "FeetAnchor" },
       ],
@@ -325,7 +337,7 @@ function dial(
   return {
     id,
     label: id,
-    region: id === "keep_control" ? "head" : "body",
+    region: id === "keep_control" || id === "head_size" ? "head" : "body",
     tier: "core",
     order,
     description: `SA-090 R2 fixture control ${id}.`,
@@ -353,6 +365,7 @@ function appearanceManifest(
   runtimePreviewCompatible = false,
   baseId = "sa090-r2-physical-fixture",
   fitFamily = "sa090-r2-physical-fixture.v1",
+  keepControlId = "keep_control",
 ): JsonRecord {
   const source = version === "source";
   const targets: JsonRecord = {
@@ -392,7 +405,7 @@ function appearanceManifest(
     ),
     dial("complex_a", "complex_target", 1),
     dial("complex_b", "complex_target", 2),
-    dial("keep_control", "keep_target", 3),
+    dial(keepControlId, "keep_target", 3),
     dial(
       "piecewise_control",
       "piecewise_target",
@@ -566,14 +579,17 @@ async function sourcePackageDraft(
   runtimePreviewCompatible = false,
   baseId = "sa090-r2-physical-fixture",
   fitFamily = "sa090-r2-physical-fixture.v1",
+  keepControlId = "keep_control",
+  hairImportCompatible = false,
 ) {
-  const glbBytes = physicalGlb(version, runtimeMorphName);
+  const glbBytes = physicalGlb(version, runtimeMorphName, hairImportCompatible);
   const avatarManifest = appearanceManifest(
     version,
     runtimeMorphName,
     runtimePreviewCompatible,
     baseId,
     fitFamily,
+    keepControlId,
   );
   const appearance = avatarManifest.appearanceDials as JsonRecord;
   const neutral = appearance.neutral as JsonRecord;
@@ -662,12 +678,13 @@ async function updateEdge(
   from: RecipeSourceIdentity,
   to: RecipeSourceIdentity,
   siblingSubplans?: RecipeSiblingSubplan[],
+  keepControlId = "keep_control",
 ): Promise<RecipeUpdateEdge> {
   const fromIds = [
     "affine_control",
     "complex_a",
     "complex_b",
-    "keep_control",
+    keepControlId,
     "piecewise_control",
     "removed_control",
   ].sort(compareText);
@@ -675,18 +692,18 @@ async function updateEdge(
     "affine_control",
     "complex_a",
     "complex_b",
-    "keep_control",
+    keepControlId,
     "new_control",
     "piecewise_control",
   ].sort(compareText);
   const allIds = [...new Set([...fromIds, ...toIds])].sort(compareText);
-  const sharedKeep = await controlIdentity("keep_control", "shared");
+  const sharedKeep = await controlIdentity(keepControlId, "shared");
   const sharedComplexB = await controlIdentity("complex_b", "shared");
   const componentById: Record<string, string> = {
     affine_control: "component.affine",
     complex_a: "component.complex",
     complex_b: "component.complex",
-    keep_control: "component.keep",
+    [keepControlId]: "component.keep",
     new_control: "component.new",
     piecewise_control: "component.piecewise",
     removed_control: "component.removed",
@@ -695,7 +712,7 @@ async function updateEdge(
     affine_control: "affine",
     complex_a: "affine",
     complex_b: "keep",
-    keep_control: "keep",
+    [keepControlId]: "keep",
     new_control: "new",
     piecewise_control: "piecewise",
     removed_control: "removed",
@@ -704,7 +721,7 @@ async function updateEdge(
     allIds.map(async (id): Promise<RecipeControlUpdatePlan> => {
       const action = actionById[id]!;
       const shared =
-        id === "keep_control"
+        id === keepControlId
           ? sharedKeep
           : id === "complex_b"
             ? sharedComplexB
@@ -787,16 +804,14 @@ async function updateEdge(
     aliases: [],
     siblingSubplans:
       siblingSubplans ??
-      ["facialArtwork", "eyeAppearance", "oralAppearance"].map(
-        (surface) => ({
-          surface: surface as RecipeSiblingSurface,
-          fromContract: null,
-          toContract: null,
-          action: "not-present" as const,
-          reason: `${surface} is absent from both physical fixture packages.`,
-          proofSha256: ZERO_SHA256,
-        }),
-      ),
+      ["facialArtwork", "eyeAppearance", "oralAppearance"].map((surface) => ({
+        surface: surface as RecipeSiblingSurface,
+        fromContract: null,
+        toContract: null,
+        action: "not-present" as const,
+        reason: `${surface} is absent from both physical fixture packages.`,
+        proofSha256: ZERO_SHA256,
+      })),
     warnings: [],
     proof: {
       contract: RECIPE_UPDATE_PROOF_CONTRACT,
@@ -887,6 +902,7 @@ async function componentMaps(
 async function fixtureSourceState(
   identity: RecipeSourceIdentity,
   siblings: RecipeSiblingStateRecord[] = [],
+  keepControlId = "keep_control",
 ): Promise<RecipeStateSnapshot> {
   const appearanceDials: AppearanceDialValueState = {
     contract: APPEARANCE_DIAL_VALUES_CONTRACT,
@@ -897,7 +913,7 @@ async function fixtureSourceState(
       affine_control: 0.4,
       complex_a: 0.2,
       complex_b: -0.1,
-      keep_control: 0.2,
+      [keepControlId]: 0.2,
       piecewise_control: 0.4,
       removed_control: 0,
     },
@@ -920,6 +936,9 @@ export async function createRecipePhysicalMigrationFixture(
   options: RecipePhysicalMigrationFixtureOptions = {},
 ): Promise<RecipePhysicalMigrationFixture> {
   return (async () => {
+    const keepControlId = options.hairImportCompatible
+      ? "head_size"
+      : "keep_control";
     const [sourceDraft, targetDraft] = await Promise.all([
       sourcePackageDraft(
         "source",
@@ -927,6 +946,8 @@ export async function createRecipePhysicalMigrationFixture(
         options.runtimePreviewCompatible,
         options.baseId,
         options.fitFamily,
+        keepControlId,
+        options.hairImportCompatible,
       ),
       sourcePackageDraft(
         "target",
@@ -934,12 +955,15 @@ export async function createRecipePhysicalMigrationFixture(
         options.runtimePreviewCompatible,
         options.baseId,
         options.fitFamily,
+        keepControlId,
+        options.hairImportCompatible,
       ),
     ]);
     const edge = await updateEdge(
       sourceDraft.identity,
       targetDraft.identity,
       options.siblingSubplans,
+      keepControlId,
     );
     const [source, target] = await Promise.all([
       finalizeSourcePackage("source", sourceDraft, []),
@@ -949,6 +973,7 @@ export async function createRecipePhysicalMigrationFixture(
     let sourceState = await fixtureSourceState(
       source.identity,
       options.sourceSiblings,
+      keepControlId,
     );
     const siblingInputs = options.siblingInputs ?? {
       facialArtwork: {

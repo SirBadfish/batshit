@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { bakeLiveGoonInWorker } from './liveGoonBakerClient'
 import { LIVE_GOON_BAKER_WORKER_CONTRACT } from './liveGoonBaker.workerProtocol'
 import type { LiveGoonBakeInput } from './liveGoonBaker'
+import type { HairAssetV1 } from '../hairAssets'
 
 class TransferProbeWorker {
   static latest: TransferProbeWorker | null = null
@@ -37,7 +38,11 @@ class TransferProbeWorker {
         for (const listener of this.listeners.get('message') ?? []) listener({ data })
       }
       if (TransferProbeWorker.behavior === 'invalid') {
-        emitMessage({ contract: 'wrong-contract', id: request.id, kind: 'complete' })
+        emitMessage({
+          contract: 'wrong-contract',
+          id: request.id,
+          kind: 'complete'
+        })
         return
       }
       if (TransferProbeWorker.behavior === 'complete') {
@@ -104,6 +109,31 @@ describe('Live Goon baker Worker client', () => {
     expect(TransferProbeWorker.latest?.terminate).toHaveBeenCalledOnce()
   })
 
+  it('also transfers the selected Hair geometry buffers into the Worker', async () => {
+    vi.stubGlobal('Worker', TransferProbeWorker)
+    const input = inputBytes()
+    input.hair = {
+      asset: {} as HairAssetV1,
+      mainBytes: new Uint8Array([10, 11]),
+      followerBytes: new Uint8Array([15, 16]),
+      physicsBytes: new Uint8Array([17, 18]),
+      neutralValueBytes: new Uint8Array([12]),
+      highlightMaskBytes: new Uint8Array([13]),
+      sparseAccentBytes: new Uint8Array([14])
+    }
+
+    const result = bakeLiveGoonInWorker(input)
+
+    expect(TransferProbeWorker.latest?.transfers[0]).toHaveLength(9)
+    expect(input.hair.mainBytes.byteLength).toBe(0)
+    expect(input.hair.followerBytes.byteLength).toBe(0)
+    expect(input.hair.physicsBytes.byteLength).toBe(0)
+    expect(input.hair.neutralValueBytes.byteLength).toBe(0)
+    expect(input.hair.highlightMaskBytes.byteLength).toBe(0)
+    expect(input.hair.sparseAccentBytes?.byteLength).toBe(0)
+    await expect(result).rejects.toThrow('Transfer probe complete.')
+  })
+
   it('forwards progress, resolves completion, and terminates the Worker', async () => {
     vi.stubGlobal('Worker', TransferProbeWorker)
     TransferProbeWorker.behavior = 'complete'
@@ -136,7 +166,9 @@ describe('Live Goon baker Worker client', () => {
     vi.stubGlobal('Worker', TransferProbeWorker)
     TransferProbeWorker.behavior = 'hang'
     const controller = new AbortController()
-    const result = bakeLiveGoonInWorker(inputBytes(), { signal: controller.signal })
+    const result = bakeLiveGoonInWorker(inputBytes(), {
+      signal: controller.signal
+    })
 
     controller.abort()
 

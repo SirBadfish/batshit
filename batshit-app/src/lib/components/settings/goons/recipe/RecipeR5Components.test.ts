@@ -16,6 +16,7 @@ import RecipeWorkflowPanel from './RecipeWorkflowPanel.svelte'
 import RecipeWorkflowControllerHarness from './RecipeWorkflowControllerHarness.test.svelte'
 import { createRecipePhysicalMigrationFixture } from '$lib/goons/recipe/fixtures/recipePhysicalMigrationPair'
 import type { GoonRecord } from '$lib/types/goons'
+import { HAIR_STATE_CONTRACT, createHairState, parseHairState } from '$lib/goons/hairAssets'
 import type {
   RecipeAuthorizedPreviewControl,
   RecipeWorkflowActions,
@@ -639,6 +640,227 @@ describe('Recipe R5 Settings components', () => {
     expect(buildUploadStageCommit.mock.calls[0]?.[0]?.start.kind).toBe('bake')
   })
 
+  it('includes a newly selected Hair revision in the exact Recipe state built by Save Goon', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const noneState = createHairState(null)
+    const selectedState = parseHairState({
+      schemaVersion: HAIR_STATE_CONTRACT,
+      definitionSha256: HASH,
+      selected: {
+        assetId: 'style-01',
+        assetRevisionId: 'style-01-r1',
+        assetRevision: 1,
+        assetRevisionSha256: HASH,
+        fitFamily: 'batshit-base-f.v1',
+        fitSha256: HASH
+      },
+      baseColor: '#2a1738',
+      highlightColor: '#6f4a8e',
+      motionSettings: {
+        enabled: true,
+        intensity: 1.1
+      }
+    })
+    const committedGoon = {
+      id: 'recipe-hair-save-goon',
+      user_id: 'recipe-hair-save-user',
+      name: 'Hair Save Goon',
+      kind: 'custom',
+      sourceProfile: 'expert-custom-glb',
+      files: {},
+      hairState: selectedState,
+      recipe: {
+        contract: 'goon-recipe/v2',
+        writeVersion: 2,
+        nextRecipeRevision: 3,
+        liveStatus: 'up_to_date',
+        authoringRevision: { recipeRevision: 2, state: fixture.sourceState },
+        activeRevision: { ref: 'active-2' },
+        previousRevision: { ref: 'active-1' },
+        pendingAnalysis: null,
+        pendingJob: null,
+        lastFailure: null
+      },
+      appearanceDials: fixture.sourceState.appearanceDials,
+      created_at: '2026-08-08T00:00:00.000Z',
+      updated_at: '2026-08-08T00:00:00.000Z'
+    } as unknown as GoonRecord
+    const startingGoon = {
+      ...structuredClone(committedGoon),
+      hairState: noneState,
+      recipe: {
+        ...structuredClone(committedGoon.recipe),
+        writeVersion: 1,
+        nextRecipeRevision: 2,
+        authoringRevision: { recipeRevision: 1, state: fixture.sourceState },
+        activeRevision: { ref: 'active-1' },
+        previousRevision: null
+      }
+    } as unknown as GoonRecord
+    const buildUploadStageCommit = vi.fn(async () => ({
+      committed: { goon: committedGoon }
+    }))
+    recipeServiceMocks.workflowClient = { buildUploadStageCommit }
+    recipeServiceMocks.loadGoons.mockResolvedValue([committedGoon])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: startingGoon,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+      hairState: noneState,
+      nextHairState: selectedState
+    })
+    await waitFor(() => expect(screen.getByText('Ready')).toBeTruthy())
+    await fireEvent.click(screen.getByRole('button', { name: 'Select Hair style' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('true'))
+    expect(buildUploadStageCommit).toHaveBeenCalledOnce()
+    const requestedState = buildUploadStageCommit.mock.calls[0]?.[0]?.start.request.state
+    expect(requestedState.siblings).toContainEqual(
+      expect.objectContaining({
+        id: 'hairState',
+        contract: HAIR_STATE_CONTRACT,
+        state: selectedState
+      })
+    )
+  })
+
+  it('replaces an older failed candidate when Save Goon contains a different Hair draft', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const noneState = createHairState(null)
+    const selectedState = parseHairState({
+      schemaVersion: HAIR_STATE_CONTRACT,
+      definitionSha256: HASH,
+      selected: {
+        assetId: 'painted-bun',
+        assetRevisionId: 'painted-bun-r2',
+        assetRevision: 2,
+        assetRevisionSha256: HASH,
+        fitFamily: 'batshit-base-f.v1',
+        fitSha256: HASH
+      },
+      baseColor: '#2a1738',
+      highlightColor: '#6f4a8e',
+      motionSettings: {
+        enabled: true,
+        intensity: 1
+      }
+    })
+    const pendingJob = {
+      jobId: 'failed-old-hair-job',
+      jobRef: 'recipe:job:failed-old-hair-job',
+      status: 'failed',
+      operation: 'rebake',
+      targetWriteVersion: 1,
+      targetRecipeRevision: 2,
+      targetRevisionId: 'failed-old-hair-revision'
+    }
+    const startingOwner = {
+      contract: 'goon-recipe/v2',
+      writeVersion: 1,
+      nextRecipeRevision: 3,
+      liveStatus: 'failed',
+      authoringRevision: { recipeRevision: 2, state: fixture.sourceState },
+      activeRevision: { ref: 'active-1' },
+      previousRevision: null,
+      pendingAnalysis: null,
+      pendingJob,
+      lastFailure: {
+        stage: 'baking',
+        reason: 'The previous Hair candidate failed.'
+      }
+    }
+    const startingGoon = {
+      id: 'recipe-replace-failed-hair-goon',
+      user_id: 'recipe-replace-failed-hair-user',
+      name: 'Replace Failed Hair Goon',
+      kind: 'custom',
+      sourceProfile: 'expert-custom-glb',
+      files: {},
+      hairState: noneState,
+      recipe: startingOwner,
+      appearanceDials: fixture.sourceState.appearanceDials,
+      created_at: '2026-08-11T00:00:00.000Z',
+      updated_at: '2026-08-11T00:00:00.000Z'
+    } as unknown as GoonRecord
+    const discardedOwner = {
+      ...structuredClone(startingOwner),
+      writeVersion: 2,
+      liveStatus: 'needs_bake',
+      pendingJob: null,
+      lastFailure: null
+    }
+    const discardedGoon = {
+      ...structuredClone(startingGoon),
+      recipe: discardedOwner
+    } as unknown as GoonRecord
+    const committedGoon = {
+      ...structuredClone(discardedGoon),
+      hairState: selectedState,
+      recipe: {
+        ...structuredClone(discardedOwner),
+        writeVersion: 3,
+        liveStatus: 'up_to_date',
+        authoringRevision: { recipeRevision: 3, state: fixture.sourceState },
+        activeRevision: { ref: 'active-3' },
+        previousRevision: { ref: 'active-1' }
+      }
+    } as unknown as GoonRecord
+    const recoveredJob = {
+      goon: startingGoon,
+      owner: startingOwner,
+      job: {
+        ...pendingJob,
+        stateVersion: 1
+      },
+      reviewedState: { state: fixture.sourceState },
+      candidate: null,
+      recovered: true
+    }
+    const recoverJob = vi.fn(async () => recoveredJob)
+    const discardJob = vi.fn(async () => ({
+      goon: discardedGoon,
+      owner: discardedOwner,
+      job: {
+        ...recoveredJob.job,
+        status: 'discarded',
+        stateVersion: 2
+      }
+    }))
+    const buildUploadStageCommit = vi.fn(async () => ({
+      committed: { goon: committedGoon }
+    }))
+    recipeServiceMocks.workflowClient = {
+      recoverJob,
+      discardJob,
+      buildUploadStageCommit
+    }
+    recipeServiceMocks.loadGoons
+      .mockResolvedValueOnce([discardedGoon])
+      .mockResolvedValue([committedGoon])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: startingGoon,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials),
+      hairState: noneState,
+      nextHairState: selectedState
+    })
+    await waitFor(() => expect(recoverJob).toHaveBeenCalled())
+    await fireEvent.click(screen.getByRole('button', { name: 'Select Hair style' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('true'))
+    expect(discardJob).toHaveBeenCalledOnce()
+    expect(buildUploadStageCommit).toHaveBeenCalledOnce()
+    const requestedState = buildUploadStageCommit.mock.calls[0]?.[0]?.start.request.state
+    expect(requestedState.siblings).toContainEqual(
+      expect.objectContaining({
+        id: 'hairState',
+        state: selectedState
+      })
+    )
+  })
+
   it('performs zero Recipe builds when Save Goon contains only runtime-owned changes', async () => {
     const fixture = await createRecipePhysicalMigrationFixture()
     const unchangedGoon = {
@@ -676,6 +898,61 @@ describe('Recipe R5 Settings components', () => {
 
     await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('true'))
     expect(buildUploadStageCommit).not.toHaveBeenCalled()
+  })
+
+  it('builds an unchanged draft when an explicit recovery left the Recipe needing a bake', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const recoveredGoon = {
+      id: 'recipe-recovered-hair-goon',
+      user_id: 'recipe-recovered-hair-user',
+      name: 'Recovered Hair Goon',
+      kind: 'custom',
+      sourceProfile: 'expert-custom-glb',
+      files: {},
+      recipe: {
+        contract: 'goon-recipe/v2',
+        writeVersion: 2,
+        nextRecipeRevision: 3,
+        liveStatus: 'needs_bake',
+        authoringRevision: { recipeRevision: 1, state: fixture.sourceState },
+        activeRevision: { ref: 'active-1' },
+        previousRevision: null,
+        pendingAnalysis: null,
+        pendingJob: null,
+        lastFailure: null
+      },
+      appearanceDials: fixture.sourceState.appearanceDials,
+      created_at: '2026-08-11T00:00:00.000Z',
+      updated_at: '2026-08-11T00:00:00.000Z'
+    } as unknown as GoonRecord
+    const committedGoon = {
+      ...structuredClone(recoveredGoon),
+      recipe: {
+        ...structuredClone(recoveredGoon.recipe),
+        writeVersion: 3,
+        liveStatus: 'up_to_date',
+        activeRevision: { ref: 'active-2' },
+        previousRevision: { ref: 'active-1' }
+      }
+    } as unknown as GoonRecord
+    const buildUploadStageCommit = vi.fn(async () => ({
+      committed: { goon: committedGoon }
+    }))
+    recipeServiceMocks.workflowClient = { buildUploadStageCommit }
+    recipeServiceMocks.loadGoons.mockResolvedValue([committedGoon])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon: recoveredGoon,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials)
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Save Goon' }))
+
+    await waitFor(() => expect(screen.getByTestId('save-result')).toHaveTextContent('true'))
+    expect(buildUploadStageCommit).toHaveBeenCalledOnce()
+    expect(buildUploadStageCommit.mock.calls[0]?.[0]?.start.kind).toBe('bake')
+    expect(buildUploadStageCommit.mock.calls[0]?.[0]?.start.request.state).toEqual(
+      fixture.sourceState
+    )
   })
 
   it('automatically prepares an eligible first-party import exactly once', async () => {

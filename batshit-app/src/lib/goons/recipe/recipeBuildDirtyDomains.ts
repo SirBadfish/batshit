@@ -10,6 +10,7 @@ export const RECIPE_BUILD_DIRTY_DOMAINS = [
   'lip-artwork',
   'nail-surface',
   'skin-appearance',
+  'hair',
   'recipe-state'
 ] as const
 
@@ -38,7 +39,9 @@ const SIBLING_DOMAIN_ALIASES: Record<string, RecipeBuildDirtyDomain> = {
   skinAppearance: 'skin-appearance',
   'skin-appearance': 'skin-appearance',
   skinMaterialArtwork: 'skin-appearance',
-  'skin-material-artwork': 'skin-appearance'
+  'skin-material-artwork': 'skin-appearance',
+  hairState: 'hair',
+  'hair-state': 'hair'
 }
 
 function siblingDomain(sibling: RecipeSiblingStateRecord): RecipeBuildDirtyDomain {
@@ -56,6 +59,7 @@ function siblingDomain(sibling: RecipeSiblingStateRecord): RecipeBuildDirtyDomai
     sibling.contract === 'skin-material-artwork-state/v1' ||
     sibling.contract === 'skin-material-artwork-state/v2'
   ) return 'skin-appearance'
+  if (sibling.contract === 'hair-state/v2') return 'hair'
   return `recipe-sibling:${sibling.id}`
 }
 

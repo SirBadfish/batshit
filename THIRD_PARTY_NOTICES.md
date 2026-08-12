@@ -25,6 +25,13 @@ The Mac app can include app-owned runtime binaries under `Batshit.app/Contents/R
 - Redis license overview: <https://redis.io/legal/licenses/>
 - Packaging rule: include the Redis Stack package's `RSALv2.txt` and `SSPLv1.txt` notices, do not remove Redis licensing/copyright notices, and keep Redis bound to Batshit's private loopback port/data directory.
 
+### OpenSSL
+
+- Purpose: provides the TLS/cryptography dynamic libraries required by the packaged Redis Stack binaries and modules.
+- Launch target: OpenSSL 3.5 LTS for macOS arm64.
+- Official source and license: <https://www.openssl.org/source/> and <https://www.openssl.org/source/license-openssl-3.0.txt>.
+- Packaging rule: build from the checksum-verified official source archive, include `LICENSE.txt`, the source/checksum record, and both package-owned dynamic libraries with loader-relative references. Redis must never resolve OpenSSL through Homebrew or another build-machine path.
+
 ### FFmpeg
 
 - Purpose: media and Goon preview transcoding in `batshit-server`.
@@ -32,6 +39,7 @@ The Mac app can include app-owned runtime binaries under `Batshit.app/Contents/R
 - Packaging rule: do not bundle an arbitrary FFmpeg binary. Any packaged FFmpeg runtime must include the exact license files, source-code offer/source reference, checksum record, and build configuration used for that binary.
 - Mac app encoder rule: the packaged Mac runtime is expected to use FFmpeg's `h264_videotoolbox` encoder for MP4 previews, so the Mac bundle does not need a bundled `libx264`/GPL dependency for that path.
 - Release guardrail: package preparation rejects FFmpeg builds configured with `--enable-nonfree`, and rejects `--enable-gpl` unless release owners explicitly accept GPL obligations for that release package.
+- Portability guardrail: the Mac build disables dependency autodetection and X11/XCB integration, targets macOS 14, and must resolve every non-system dynamic library from inside the app bundle.
 
 ### Apple Container
 

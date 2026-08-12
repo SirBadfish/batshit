@@ -40,6 +40,7 @@ const GOON_CUSTOM_PACKAGE_MAX_FILE_SIZE = GOON_CORE_IMPORT_MAX_FILE_SIZE;
 const GOON_ANIMATION_MAX_FILE_SIZE = 350 * MIB;
 const GOON_IMAGE_UPLOAD_MAX_FILE_SIZE = 25 * MIB;
 const GOON_SKIN_SURFACE_UPLOAD_MAX_FILE_SIZE = 100 * MIB;
+const GOON_HAIR_ASSET_MAX_FILE_SIZE = 64 * MIB;
 const GOON_SCENE_UPLOAD_MAX_FILE_SIZE = 50 * MIB;
 const GOON_SCENE_MODEL_UPLOAD_MAX_FILE_SIZE = 200 * MIB;
 const GOON_ANIMATION_PREVIEW_MAX_FILE_SIZE = 40 * MIB;
@@ -132,6 +133,10 @@ const goonFacialArtworkUpload = multer({
 const goonSkinSurfaceArtworkUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: GOON_SKIN_SURFACE_UPLOAD_MAX_FILE_SIZE }
+});
+const goonHairAssetUpload = multer({
+  storage,
+  limits: { fileSize: GOON_HAIR_ASSET_MAX_FILE_SIZE }
 });
 
 // Goon scene uploads (skybox images can be larger)
@@ -460,6 +465,8 @@ function getUploadLimitForPath(reqPath) {
       return GOON_SCENE_MODEL_UPLOAD_MAX_FILE_SIZE;
     case '/upload/goon-animation-preview':
       return GOON_ANIMATION_PREVIEW_MAX_FILE_SIZE;
+    case '/upload/goon-hair-asset':
+      return GOON_HAIR_ASSET_MAX_FILE_SIZE;
     default:
       return null;
   }
@@ -2400,6 +2407,117 @@ router.post('/upload/goon-skin-surface-artwork', goonSkinSurfaceArtworkUpload.si
   } catch (error) {
     writeErrorLog(logger, 'Goon Skin Surface Artwork upload error', error);
     sendUploadError(res, 'Skin Surface Artwork upload failed', error);
+  }
+});
+
+const GOON_HAIR_ASSET_ROLES = new Map([
+  ['geometry', { ext: '.glb', signature: 'glb', mimetype: 'model/gltf-binary' }],
+  ['follower-definition', { ext: '.json', signature: 'json', mimetype: 'application/json' }],
+  ['physics-definition', { ext: '.json', signature: 'json', mimetype: 'application/json' }],
+  ['material-definition', { ext: '.json', signature: 'json', mimetype: 'application/json' }],
+  ['neutral-value', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['highlight-mask', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['normal', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['roughness', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['preview', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['import-receipt', { ext: '.json', signature: 'json', mimetype: 'application/json' }],
+  ['fit-receipt', { ext: '.json', signature: 'json', mimetype: 'application/json' }],
+  ['refit-source', { ext: '.glb', signature: 'glb', mimetype: 'model/gltf-binary' }]
+]);
+
+function validateHairAssetArtifact(file, role) {
+  const spec = GOON_HAIR_ASSET_ROLES.get(role);
+  if (!spec) throw uploadValidationError('Hair Asset artifact role is unsupported.');
+  const originalName = file?.originalname || `hair${spec.ext}`;
+  if (path.extname(originalName).toLowerCase() !== spec.ext) {
+    throw uploadValidationError(`Hair Asset ${role} must use the ${spec.ext} extension.`);
+  }
+  if (!file?.buffer?.length) throw uploadValidationError(`Hair Asset ${role} is empty.`);
+  if (spec.signature === 'json') {
+    if (!bufferLooksText(file.buffer)) {
+      throw uploadValidationError(`Hair Asset ${role} must be strict UTF-8 JSON.`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(file.buffer));
+    } catch {
+      throw uploadValidationError(`Hair Asset ${role} must be strict UTF-8 JSON.`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw uploadValidationError(`Hair Asset ${role} must contain one JSON object.`);
+    }
+  } else if (detectUploadSignature(file.buffer) !== spec.signature) {
+    throw uploadValidationError(`Hair Asset ${role} content does not match ${spec.ext}.`);
+  }
+  return spec;
+}
+
+function validateHairAssetOwnerSegment(value, label) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  const safe = sanitizeFilenameSegment(raw, '').slice(0, 80);
+  if (!raw || raw.length > 80 || safe !== raw) {
+    throw uploadValidationError(`Hair Asset ${label} must be a 1-80 character stable ID using letters, numbers, hyphens, or underscores.`);
+  }
+  return safe;
+}
+
+router.post('/upload/goon-hair-asset', goonHairAssetUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No Hair Asset artifact uploaded' });
+    const role = typeof req.body?.role === 'string' ? req.body.role.trim() : '';
+    const assetId = validateHairAssetOwnerSegment(req.body?.assetId, 'assetId');
+    const revisionId = validateHairAssetOwnerSegment(req.body?.revisionId, 'revisionId');
+    const spec = validateHairAssetArtifact(req.file, role);
+    const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+    const filename = `${assetId}_${revisionId}_${sanitizeFilenameSegment(role, 'artifact')}_${sha256}${spec.ext}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_hair_assets',
+      originalName: req.file.originalname || filename,
+      filename,
+      mimetype: spec.mimetype,
+      buffer: req.file.buffer,
+      size: req.file.buffer.length,
+      metadata: {
+        hairAssetArtifact: { assetId, revisionId, role, sha256 }
+      }
+    });
+    return res.json({ success: true, file, role });
+  } catch (error) {
+    writeErrorLog(logger, 'Goon Hair Asset artifact upload error', error);
+    sendUploadError(res, 'Hair Asset artifact upload failed', error);
+  }
+});
+
+router.post('/upload/goon-hair-import-source', goonHairAssetUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No Hair import source uploaded' });
+    const originalName = req.file.originalname || 'hair.obj';
+    const ext = path.extname(originalName).toLowerCase();
+    if (ext !== '.obj' && ext !== '.glb') {
+      throw uploadValidationError('Hair import sources must use .obj or .glb.');
+    }
+    if (!req.file.buffer?.length) throw uploadValidationError('Hair import source is empty.');
+    if (ext === '.glb' && detectUploadSignature(req.file.buffer) !== 'glb') {
+      throw uploadValidationError('Hair import source content does not match .glb.');
+    }
+    if (ext === '.obj' && (!bufferLooksText(req.file.buffer) || detectUploadSignature(req.file.buffer) !== 'unknown')) {
+      throw uploadValidationError('Hair import source content does not match a text OBJ file.');
+    }
+    const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+    const filename = `${Date.now()}_${crypto.randomUUID()}_${sha256}${ext}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_hair_imports',
+      originalName,
+      filename,
+      mimetype: ext === '.glb' ? 'model/gltf-binary' : 'text/plain',
+      buffer: req.file.buffer,
+      size: req.file.buffer.length,
+      metadata: { hairImportSource: { sha256, stagedAt: new Date().toISOString() } }
+    });
+    return res.json({ success: true, file });
+  } catch (error) {
+    writeErrorLog(logger, 'Goon Hair import source upload error', error);
+    sendUploadError(res, 'Hair import source upload failed', error);
   }
 });
 

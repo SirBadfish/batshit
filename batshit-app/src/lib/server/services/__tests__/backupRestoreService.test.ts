@@ -608,6 +608,103 @@ describe('backupRestoreService', () => {
     expect(restoredAgent.user_id).toBe('target')
   })
 
+  it('backs up and remaps the Hair Asset library index, immutable metadata, and owned files', async () => {
+    const relativePath = 'goon_hair_assets/imported-hair.glb'
+    const refitRelativePath = 'goon_hair_assets/imported-hair-refit-source.glb'
+    const sourcePath = path.join(uploadRoot, relativePath)
+    const refitSourcePath = path.join(uploadRoot, refitRelativePath)
+    await fs.mkdir(path.dirname(sourcePath), { recursive: true })
+    await fs.writeFile(sourcePath, 'immutable-hair-bytes')
+    await fs.writeFile(refitSourcePath, 'reusable-refit-bytes')
+    await redis.sAdd('user:source:hair_assets', 'imported-style@imported-style-r1')
+    await redis.json.set('hair_asset:source:imported-style:imported-style-r1', '$', {
+      schemaVersion: 'hair-assets/v1',
+      assetId: 'imported-style',
+      revisionId: 'imported-style-r1',
+      revisionSha256: 'a'.repeat(64),
+      geometry: {
+        main: {
+          ref: '/uploads/goon_hair_assets/imported-hair.glb',
+          sha256: 'b'.repeat(64),
+          bytes: 20,
+          mimeType: 'model/gltf-binary'
+        }
+      }
+    })
+    await redis.json.set('hair_refit_source:source:imported-style:imported-style-r1', '$', {
+      contract: 'hair-refit-source/v1',
+      assetId: 'imported-style',
+      revisionId: 'imported-style-r1',
+      source: {
+        ref: '/uploads/goon_hair_assets/imported-hair-refit-source.glb',
+        sha256: 'c'.repeat(64),
+        bytes: 20,
+        mimeType: 'model/gltf-binary'
+      },
+      startingTransform: {
+        move: { x: 0, y: 0, z: 0 },
+        rotate: { x: 0, y: 0, z: 0 },
+        uniformScale: 1,
+        axisScale: { x: 1, y: 1, z: 1 }
+      },
+      savedTransform: {
+        move: { x: 0, y: 17, z: 0 },
+        rotate: { x: 0, y: -90, z: 0 },
+        uniformScale: 0.27,
+        axisScale: { x: 1.15, y: 1.15, z: 1.01 }
+      }
+    })
+    await redis.json.set('upload:goon_hair_assets:imported-hair.glb', '$', {
+      originalName: 'imported-hair.glb',
+      filename: 'imported-hair.glb',
+      mimetype: 'model/gltf-binary',
+      size: 20,
+      uploadType: 'goon_hair_assets',
+      storage: 'filesystem',
+      relativePath,
+      filePath: sourcePath,
+      sha256: 'b'.repeat(64),
+      uploadedAt: '2026-08-08T00:00:00.000Z'
+    })
+    await redis.json.set('upload:goon_hair_assets:imported-hair-refit-source.glb', '$', {
+      originalName: 'imported-hair-refit-source.glb',
+      filename: 'imported-hair-refit-source.glb',
+      mimetype: 'model/gltf-binary',
+      size: 20,
+      uploadType: 'goon_hair_assets',
+      storage: 'filesystem',
+      relativePath: refitRelativePath,
+      filePath: refitSourcePath,
+      sha256: 'c'.repeat(64),
+      uploadedAt: '2026-08-08T00:00:00.000Z'
+    })
+
+    const bundle = await createBackupBundle('source')
+    const preflight = await preflightBackupRestore('target', bundle.bytes)
+    expect(preflight.ok).toBe(true)
+    await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+
+    await expect(redis.sMembers('user:target:hair_assets')).resolves.toEqual([
+      'imported-style@imported-style-r1'
+    ])
+    await expect(
+      redis.json.get('hair_asset:target:imported-style:imported-style-r1')
+    ).resolves.toMatchObject({
+      schemaVersion: 'hair-assets/v1',
+      assetId: 'imported-style',
+      revisionId: 'imported-style-r1'
+    })
+    await expect(
+      redis.json.get('hair_refit_source:target:imported-style:imported-style-r1')
+    ).resolves.toMatchObject({
+      contract: 'hair-refit-source/v1',
+      assetId: 'imported-style',
+      revisionId: 'imported-style-r1'
+    })
+    await expect(fs.readFile(sourcePath, 'utf8')).resolves.toBe('immutable-hair-bytes')
+    await expect(fs.readFile(refitSourcePath, 'utf8')).resolves.toBe('reusable-refit-bytes')
+  })
+
   it('backs up and remaps durable Recipe revisions, documents, and jobs', async () => {
     const sha = (value: string) => value.repeat(64)
     const source = {

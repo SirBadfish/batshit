@@ -243,6 +243,51 @@ describe('goonAssetCleanupService', () => {
     expect(await redis.exists('upload:goons:orphan.vrm')).toBe(false)
   })
 
+  it('keeps reusable owned files referenced by an unselected Hair Asset library revision', async () => {
+    await redis.sAdd('user:josh:hair_assets', 'style-01@style-01-r1')
+    await redis.json.set('hair_asset:josh:style-01:style-01-r1', '$', {
+      schemaVersion: 'hair-assets/v1',
+      assetId: 'style-01',
+      revisionId: 'style-01-r1',
+      geometry: {
+        main: {
+          ref: '/uploads/goon_hair_assets/style-01.glb'
+        }
+      },
+      receiptRefs: [
+        {
+          ref: '/uploads/goon_hair_assets/style-01-receipt.json'
+        }
+      ]
+    })
+    await redis.json.set('hair_refit_source:josh:style-01:style-01-r1', '$', {
+      contract: 'hair-refit-source/v1',
+      assetId: 'style-01',
+      revisionId: 'style-01-r1',
+      source: {
+        ref: '/uploads/goon_hair_assets/style-01-refit-source.glb'
+      }
+    })
+    await seedUpload('goon_hair_assets', 'style-01.glb')
+    await seedUpload('goon_hair_assets', 'style-01-receipt.json')
+    await seedUpload('goon_hair_assets', 'style-01-refit-source.glb')
+    await seedUpload('goon_hair_assets', 'unowned.glb')
+
+    const audit = await auditGoonUploadAssets('josh')
+    expect(audit.entries.find((entry) => entry.filename === 'style-01.glb')?.referenced).toBe(
+      true
+    )
+    expect(
+      audit.entries.find((entry) => entry.filename === 'style-01-receipt.json')?.referenced
+    ).toBe(true)
+    expect(
+      audit.entries.find((entry) => entry.filename === 'style-01-refit-source.glb')?.referenced
+    ).toBe(true)
+    expect(audit.orphans).toMatchObject([
+      { uploadType: 'goon_hair_assets', filename: 'unowned.glb' }
+    ])
+  })
+
   it('keeps assets referenced only by durable Recipe records and deletes their records explicitly', async () => {
     await redis.sAdd('user:josh:goons', 'goon_recipe')
     await redis.json.set('goon:goon_recipe', '$', {

@@ -48,6 +48,7 @@ const RECIPE_MANAGED_GOON_FIELDS = [
   'nailSurfacePresence',
   'skinAppearance',
   'skinMaterialArtwork',
+  'hairState',
   'recipeFitReceipts'
 ] as const
 

@@ -8,6 +8,7 @@ import type {
 } from "../appearanceDials.contracts";
 import {
   APPEARANCE_RECIPE_PHYSICAL_BASIS_CONTRACT,
+  createAppearanceRecipePhysicalEvaluator,
   evaluateAppearanceRecipePhysicalOutput,
   validateAppearanceRecipePhysicalBasis,
   type AppearanceRecipePhysicalBasis,
@@ -329,12 +330,7 @@ function anatomyFitResult(
     nodeTransforms: [
       {
         nodeId: "fit_anchor",
-        rootDeltaMatrix: [
-          1, 0, 0, 0,
-          0, 1, 0, 0,
-          0, 0, 1, 0,
-          0.5, 0, 0, 1,
-        ],
+        rootDeltaMatrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.5, 0, 0, 1],
       },
     ],
     followerMorphCoefficients: [
@@ -356,10 +352,36 @@ function anatomyFitResult(
 }
 
 describe("appearance Recipe physical evaluator", () => {
+  it("reuses live mesh buffers while resetting every evaluation to the exact basis", () => {
+    const physicalBasis = basis();
+    const evaluator = createAppearanceRecipePhysicalEvaluator(physicalBasis);
+    const neutral = evaluator.evaluate(state(false));
+    const positions = neutral.meshes[0].positions;
+    const neutralSnapshot = Array.from(positions);
+
+    const active = evaluator.evaluate(state(true));
+    const exactActive = evaluateAppearanceRecipePhysicalOutput(
+      physicalBasis,
+      state(true),
+    );
+    expect(active.meshes[0].positions).toBe(positions);
+    expect(Array.from(active.meshes[0].positions)).toEqual(
+      Array.from(exactActive.meshes[0].positions),
+    );
+
+    const reset = evaluator.evaluate(state(false));
+    expect(reset.meshes[0].positions).toBe(positions);
+    expect(Array.from(reset.meshes[0].positions)).toEqual(neutralSnapshot);
+  });
+
   it("composes verified Anatomy Fit morphs and node transforms after ordinary dial followers", () => {
-    const output = evaluateAppearanceRecipePhysicalOutput(basis(), state(false), {
-      anatomyFitResults: [anatomyFitResult()],
-    });
+    const output = evaluateAppearanceRecipePhysicalOutput(
+      basis(),
+      state(false),
+      {
+        anatomyFitResults: [anatomyFitResult()],
+      },
+    );
     expect(Array.from(output.meshes[0].positions)).toEqual([
       0.125, -0.30000001192092896, 1_000_000.5,
     ]);
@@ -409,12 +431,7 @@ describe("appearance Recipe physical evaluator", () => {
       nodeTransforms: [
         {
           nodeId: "pelvis_fit_anchor",
-          rootDeltaMatrix: [
-            1, 0, 0, 0,
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            0.25, 0, 0, 1,
-          ],
+          rootDeltaMatrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.25, 0, 0, 1],
         },
       ],
       followerMorphCoefficients: [],
@@ -425,7 +442,9 @@ describe("appearance Recipe physical evaluator", () => {
       { anatomyFitResults: [result] },
     );
 
-    const pelvis = output.jointRests.find((entry) => entry.boneId === "pelvis")!;
+    const pelvis = output.jointRests.find(
+      (entry) => entry.boneId === "pelvis",
+    )!;
     const head = output.jointRests.find((entry) => entry.boneId === "head")!;
     expectVecClose(pelvis.localPosition, [0.25, 1, 0]);
     expectVecClose(pelvis.avatarRootOffset, [0.25, 0, 0]);

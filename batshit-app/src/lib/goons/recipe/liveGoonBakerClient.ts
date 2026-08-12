@@ -11,7 +11,23 @@ export type LiveGoonBakerClientOptions = {
 }
 
 function inputTransferList(input: LiveGoonBakeInput): Transferable[] {
-  const buffers = [input.packageBytes.buffer, input.modelBytes.buffer, input.manifestBytes.buffer]
+  const buffers = [
+    input.packageBytes.buffer,
+    input.modelBytes.buffer,
+    input.manifestBytes.buffer,
+    ...(input.hair
+      ? [
+          input.hair.mainBytes.buffer,
+          input.hair.followerBytes?.buffer,
+          input.hair.physicsBytes?.buffer,
+          input.hair.neutralValueBytes.buffer,
+          input.hair.highlightMaskBytes.buffer,
+          input.hair.normalBytes?.buffer,
+          input.hair.roughnessBytes?.buffer,
+          input.hair.sparseAccentBytes?.buffer
+        ].filter((buffer): buffer is ArrayBufferLike => buffer !== undefined)
+      : [])
+  ]
   if (buffers.some((buffer) => !(buffer instanceof ArrayBuffer))) {
     throw new Error('Live Goon baker input bytes must use transferable ArrayBuffers.')
   }
@@ -29,7 +45,9 @@ export function bakeLiveGoonInWorker(
   if (options.signal?.aborted) {
     return Promise.reject(new DOMException('Live Goon bake was aborted.', 'AbortError'))
   }
-  const worker = new Worker(new URL('./liveGoonBaker.worker.ts', import.meta.url), { type: 'module' })
+  const worker = new Worker(new URL('./liveGoonBaker.worker.ts', import.meta.url), {
+    type: 'module'
+  })
   const id = crypto.randomUUID()
   return new Promise((resolve, reject) => {
     let settled = false
@@ -50,7 +68,9 @@ export function bakeLiveGoonInWorker(
     worker.addEventListener('message', (message: MessageEvent<LiveGoonBakerWorkerEvent>) => {
       const event = message.data
       if (!event || event.contract !== LIVE_GOON_BAKER_WORKER_CONTRACT || event.id !== id) {
-        finish(() => reject(new Error('Live Goon baker worker returned an invalid event envelope.')))
+        finish(() =>
+          reject(new Error('Live Goon baker worker returned an invalid event envelope.'))
+        )
         return
       }
       if (event.kind === 'progress') {

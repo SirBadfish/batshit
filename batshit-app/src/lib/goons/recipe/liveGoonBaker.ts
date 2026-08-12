@@ -1,5 +1,11 @@
 import * as THREE from 'three'
 import { parseAppearanceDialsManifest } from '../appearanceDials.schema'
+import { parseHairState, validateHairStateBinding, type HairAssetV1 } from '../hairAssets'
+import { verifyHairFollowerDefinitionBytes } from '../hairFollowers'
+import {
+  createEmbeddedSecondaryMotion,
+  verifyHairSecondaryMotionDefinitionBytes
+} from '../secondaryMotion'
 import { parseJointCorrectives } from '../jointCorrectives'
 import {
   parseEyeApertureSeamDefinition,
@@ -15,9 +21,7 @@ import {
   type LiveJointCorrectiveEntry,
   type LiveJointCorrectivesSpec
 } from '../liveJointCorrectives'
-import {
-  buildAppearanceRecipePhysicalBasisFromGlb
-} from './appearanceRecipePhysicalModel'
+import { buildAppearanceRecipePhysicalBasisFromGlb } from './appearanceRecipePhysicalModel'
 import {
   evaluateAppearanceRecipePhysicalOutput,
   type AppearanceRecipePhysicalBasis,
@@ -38,6 +42,8 @@ import {
   requireAnatomyFitStateDefinition
 } from './anatomyFitManifest'
 import { createSocketEyeAnatomyProof } from './socketEyeSurfaceFit'
+import { composeHairIntoAvatarGlb } from './hairAvatarGlbComposer'
+import { bakeHairFollowerGlb } from './hairFollowerGlbBaker'
 import { solveOralCavityFit } from './oralCavityFit'
 import {
   composeOralCavityLandmarkPositions,
@@ -92,7 +98,7 @@ import { resolveStrictAppearanceRecipeSnapshot } from './strictAppearanceRecipeR
 type AppearanceManifest = NonNullable<ReturnType<typeof parseAppearanceDialsManifest>>
 
 export const LIVE_GOON_BAKER_ID = 'batshit-live-goon-baker' as const
-export const LIVE_GOON_BAKER_VERSION = 'r4-v1' as const
+export const LIVE_GOON_BAKER_VERSION = 'r5-v1' as const
 export const LIVE_GOON_BAKER_SCHEMA_VERSION = 'goon-live-manifest/v1' as const
 export const LIVE_GOON_BAKER_RESOLVER_VERSION = 'appearance-recipe-physical-evaluation/v1' as const
 
@@ -113,6 +119,19 @@ export type LiveGoonBakeInput = {
   packageBytes: Uint8Array
   modelBytes: Uint8Array
   manifestBytes: Uint8Array
+  hair?: LiveGoonHairBakeInput
+}
+
+export type LiveGoonHairBakeInput = {
+  asset: HairAssetV1
+  mainBytes: Uint8Array
+  followerBytes?: Uint8Array
+  physicsBytes?: Uint8Array
+  neutralValueBytes: Uint8Array
+  highlightMaskBytes: Uint8Array
+  normalBytes?: Uint8Array
+  roughnessBytes?: Uint8Array
+  sparseAccentBytes?: Uint8Array
 }
 
 export type LiveGoonBakeAudit = {
@@ -289,12 +308,13 @@ async function resolveBakedAnatomyFitResults(args: {
   const rawDefinition = args.manifest.anatomyFit
   const siblings = args.state.siblings.filter(
     (entry) =>
-      entry.id === ANATOMY_FIT_RECIPE_SIBLING_ID ||
-      entry.contract === ANATOMY_FIT_STATE_CONTRACT
+      entry.id === ANATOMY_FIT_RECIPE_SIBLING_ID || entry.contract === ANATOMY_FIT_STATE_CONTRACT
   )
   if (rawDefinition === undefined || rawDefinition === null) {
     if (siblings.length > 0) {
-      fail('Recipe State carries Anatomy Fit output but the source package has no Anatomy Fit definition')
+      fail(
+        'Recipe State carries Anatomy Fit output but the source package has no Anatomy Fit definition'
+      )
     }
     return []
   }
@@ -315,13 +335,14 @@ async function resolveBakedAnatomyFitResults(args: {
   ) {
     fail('Anatomy Fit v2 requires socket-eye, aperture-seam, and Oral Cavity Fit definitions')
   }
-  const [definition, fitState, socketEyeSurface, eyeApertureSeam, oralCavityFit] = await Promise.all([
-    parseAnatomyFitManifestDefinition(rawDefinition),
-    parseAnatomyFitState(sibling.state),
-    Promise.resolve(parseSocketEyeSurfaceDefinition(args.manifest.socketEyeSurface)),
-    Promise.resolve(parseEyeApertureSeamDefinition(args.manifest.eyeApertureSeam)),
-    parseOralCavityFitPackage(args.manifest.oralCavityFit)
-  ])
+  const [definition, fitState, socketEyeSurface, eyeApertureSeam, oralCavityFit] =
+    await Promise.all([
+      parseAnatomyFitManifestDefinition(rawDefinition),
+      parseAnatomyFitState(sibling.state),
+      Promise.resolve(parseSocketEyeSurfaceDefinition(args.manifest.socketEyeSurface)),
+      Promise.resolve(parseEyeApertureSeamDefinition(args.manifest.eyeApertureSeam)),
+      parseOralCavityFitPackage(args.manifest.oralCavityFit)
+    ])
   validateSocketEyeApertureOwnership(socketEyeSurface, eyeApertureSeam)
   if (
     sibling.definitionSha256 !== definition.definitionSha256 ||
@@ -342,10 +363,7 @@ async function resolveBakedAnatomyFitResults(args: {
     if (fit.input.source.modelSha256 !== args.input.source.model.sha256) {
       fail(`Anatomy Fit ${fit.result.domain} targets another source model`)
     }
-    if (
-      fit.input.source.appearanceDefinitionSha256 !==
-      args.appearanceManifest.definitionSha256
-    ) {
+    if (fit.input.source.appearanceDefinitionSha256 !== args.appearanceManifest.definitionSha256) {
       fail(`Anatomy Fit ${fit.result.domain} targets another Appearance definition`)
     }
     if (fit.input.source.topologySha256 !== domain.bodyTopologySha256) {
@@ -355,7 +373,8 @@ async function resolveBakedAnatomyFitResults(args: {
       fail(`Anatomy Fit ${fit.result.domain} topology does not match the verified Recipe Source`)
     }
     const mesh = meshById.get(domain.bodyMeshId)
-    if (!mesh) fail(`Anatomy Fit ${fit.result.domain} body mesh is missing from the physical evaluation`)
+    if (!mesh)
+      fail(`Anatomy Fit ${fit.result.domain} body mesh is missing from the physical evaluation`)
     if (fit.input.source.positionsScalarCount !== mesh.positions.length) {
       fail(`Anatomy Fit ${fit.result.domain} composed POSITION count is stale`)
     }
@@ -393,11 +412,7 @@ async function resolveBakedAnatomyFitResults(args: {
         fail('Anatomy Fit oral-cavity output is stale for the final Recipe geometry')
       }
       results.push(
-        await assertAnatomyFitFollowerCompatibility(
-          fit.input,
-          exact,
-          args.appearanceManifest
-        )
+        await assertAnatomyFitFollowerCompatibility(fit.input, exact, args.appearanceManifest)
       )
       continue
     }
@@ -423,17 +438,16 @@ async function resolveBakedAnatomyFitResults(args: {
       fit.input.source.physicalEvaluationSha256 !== physicalProjection.proofSha256 ||
       fit.input.source.physicalEvaluationScalarCount !== physicalProjection.scalarCount
     ) {
-      fail(`Anatomy Fit ${fit.result.domain} generated cap/liner geometry or follower inventory is stale`)
+      fail(
+        `Anatomy Fit ${fit.result.domain} generated cap/liner geometry or follower inventory is stale`
+      )
     }
     const landmarkSet = {
       domain,
       surface: socketEyeSurface.definitionSha256,
       seam: eyeApertureSeam.definitionSha256
     }
-    if (
-      fit.input.source.landmarkSetSha256 !==
-      (await canonicalRecipeSha256(landmarkSet))
-    ) {
+    if (fit.input.source.landmarkSetSha256 !== (await canonicalRecipeSha256(landmarkSet))) {
       fail(`Anatomy Fit ${fit.result.domain} socket/seam definition proof is stale`)
     }
     const relevantIds = fit.input.relevantInputs.map((entry) => entry.id)
@@ -447,11 +461,7 @@ async function resolveBakedAnatomyFitResults(args: {
       }
     }
     results.push(
-      await assertAnatomyFitFollowerCompatibility(
-        fit.input,
-        fit.result,
-        args.appearanceManifest
-      )
+      await assertAnatomyFitFollowerCompatibility(fit.input, fit.result, args.appearanceManifest)
     )
   }
   return results
@@ -615,10 +625,16 @@ function validateStructuralExtensions(parsed: SemanticGlbDocument): void {
       mesh.primitives,
       `gltf.meshes[${meshIndex}].primitives`
     ).entries()) {
-      const primitive = record(primitiveValue, `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`)
+      const primitive = record(
+        primitiveValue,
+        `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`
+      )
       if (primitive.extensions !== undefined) {
         const names = Object.keys(
-          record(primitive.extensions, `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}].extensions`)
+          record(
+            primitive.extensions,
+            `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}].extensions`
+          )
         )
         const unsupported = names.filter((name) => !SAFE_PRESERVED_EXTENSIONS.has(name))
         if (unsupported.length > 0) {
@@ -629,7 +645,11 @@ function validateStructuralExtensions(parsed: SemanticGlbDocument): void {
   }
 }
 
-function activeSceneOrder(parsed: SemanticGlbDocument): { scene: JsonRecord; roots: number[]; order: number[] } {
+function activeSceneOrder(parsed: SemanticGlbDocument): {
+  scene: JsonRecord
+  roots: number[]
+  order: number[]
+} {
   const scenes = array(parsed.gltf.scenes, 'gltf.scenes')
   if (scenes.length === 0) fail('avatar.glb has no scenes')
   const sceneIndex = integer(parsed.gltf.scene ?? 0, 'gltf.scene')
@@ -695,13 +715,15 @@ function collectStrings(value: unknown, output: Set<string>): void {
     return
   }
   if (value && typeof value === 'object') {
-    Object.values(value as Record<string, unknown>).forEach((entry) => collectStrings(entry, output))
+    Object.values(value as Record<string, unknown>).forEach((entry) =>
+      collectStrings(entry, output)
+    )
   }
 }
 
 function socketEyeRuntimeMorphsByNode(
   parsed: SemanticGlbDocument,
-  rawManifest: JsonRecord,
+  rawManifest: JsonRecord
 ): Map<number, Set<string>> {
   const result = new Map<number, Set<string>>()
   const rawSurface = rawManifest.socketEyeSurface
@@ -728,7 +750,7 @@ function socketEyeRuntimeMorphsByNode(
       const rootIndex = resolveSemanticGlbNode(
         parsed,
         rootName,
-        `socket-eye Recipe Source node ${rootName}`,
+        `socket-eye Recipe Source node ${rootName}`
       )
       const pending = [rootIndex]
       const visited = new Set<number>()
@@ -739,7 +761,7 @@ function socketEyeRuntimeMorphsByNode(
         const node = getSemanticGlbNode(
           parsed,
           nodeIndex,
-          `socket-eye Recipe Source node ${rootName}`,
+          `socket-eye Recipe Source node ${rootName}`
         )
         if (node.mesh !== undefined) result.set(nodeIndex, retained)
         for (const child of optionalArray(node.children, `${rootName}.children`)) {
@@ -754,9 +776,15 @@ function socketEyeRuntimeMorphsByNode(
 function morphTargetNames(mesh: JsonRecord, context: string): string[] {
   const primitives = array(mesh.primitives, `${context}.primitives`)
   if (primitives.length === 0) fail(`${context} has no primitives`)
-  const targetCount = optionalArray(record(primitives[0], `${context}.primitives[0]`).targets, `${context}.targets`).length
+  const targetCount = optionalArray(
+    record(primitives[0], `${context}.primitives[0]`).targets,
+    `${context}.targets`
+  ).length
   for (const [index, primitiveValue] of primitives.entries()) {
-    const count = optionalArray(record(primitiveValue, `${context}.primitives[${index}]`).targets, `${context}.targets`).length
+    const count = optionalArray(
+      record(primitiveValue, `${context}.primitives[${index}]`).targets,
+      `${context}.targets`
+    ).length
     if (count !== targetCount) fail(`${context} primitives disagree on morph target count`)
   }
   if (targetCount === 0) return []
@@ -803,7 +831,8 @@ function createLiveCorrectives(
       fail(`corrective ${entry.key} is not retained in the Live Goon`)
     }
     const dialValue = resolved.values[entry.anchorDial]
-    if (dialValue === undefined) fail(`corrective ${entry.key} anchor dial is absent from resolved state`)
+    if (dialValue === undefined)
+      fail(`corrective ${entry.key} anchor dial is absent from resolved state`)
     const anchor = entry.anchorAt0 + (entry.anchorAt1 - entry.anchorAt0) * dialValue
     const baseInfluence = resolved.influences.get(entry.key)
     if (baseInfluence === undefined) fail(`corrective ${entry.key} has no resolved base influence`)
@@ -906,10 +935,7 @@ function buildMorphPlan(
   collectStrings(rawManifest.skinAppearance, runtimeNames)
   const rig = rawManifest.rig === undefined ? null : record(rawManifest.rig, 'avatar.json#rig')
   collectStrings(rig?.performance, runtimeNames)
-  const socketEyeRuntimeMorphs = socketEyeRuntimeMorphsByNode(
-    parsed,
-    rawManifest,
-  )
+  const socketEyeRuntimeMorphs = socketEyeRuntimeMorphsByNode(parsed, rawManifest)
 
   const { spec: liveCorrectives, correctiveKeys } = createLiveCorrectives(
     rawManifest,
@@ -944,7 +970,9 @@ function buildMorphPlan(
     const keepIndexes: number[] = []
     const outputNames: string[] = []
     for (const [targetIndex, name] of names.entries()) {
-      const removeDecisions = nodeIndexes.map((nodeIndex) => removeByNode.get(nodeIndex)?.has(name) ?? false)
+      const removeDecisions = nodeIndexes.map(
+        (nodeIndex) => removeByNode.get(nodeIndex)?.has(name) ?? false
+      )
       const requiredDecisions = nodeIndexes.map(
         (nodeIndex) =>
           requiredByNode.get(nodeIndex)?.has(name) ||
@@ -1012,15 +1040,22 @@ function rewriteMorphTargets(
     }
     const primitives = array(mesh.primitives, `gltf.meshes[${meshIndex}].primitives`)
     for (const [primitiveIndex, primitiveValue] of primitives.entries()) {
-      const primitive = record(primitiveValue, `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`)
-      const targets = optionalArray(primitive.targets, `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}].targets`)
+      const primitive = record(
+        primitiveValue,
+        `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`
+      )
+      const targets = optionalArray(
+        primitive.targets,
+        `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}].targets`
+      )
       if (targets.length !== originalNames.length) {
         fail(`mesh ${meshIndex} primitive ${primitiveIndex} morph inventory drifted`)
       }
       if (keepIndexes.length > 0) primitive.targets = keepIndexes.map((index) => targets[index])
       else delete primitive.targets
     }
-    const extras = mesh.extras === undefined ? {} : record(mesh.extras, `gltf.meshes[${meshIndex}].extras`)
+    const extras =
+      mesh.extras === undefined ? {} : record(mesh.extras, `gltf.meshes[${meshIndex}].extras`)
     if (outputNames.length > 0) {
       extras.targetNames = outputNames
       mesh.extras = extras
@@ -1029,7 +1064,8 @@ function rewriteMorphTargets(
       if (Object.keys(extras).length === 0) delete mesh.extras
     }
     if (mesh.weights !== undefined) {
-      if (keepIndexes.length > 0) mesh.weights = keepIndexes.map((index) => originalMeshWeights[index]!)
+      if (keepIndexes.length > 0)
+        mesh.weights = keepIndexes.map((index) => originalMeshWeights[index]!)
       else delete mesh.weights
     }
     for (const [nodeIndex, nodeValue] of nodes.entries()) {
@@ -1041,7 +1077,8 @@ function rewriteMorphTargets(
           : array(node.weights, `gltf.nodes[${nodeIndex}].weights`).map((value, index) =>
               finite(value, `gltf.nodes[${nodeIndex}].weights[${index}]`)
             )
-      if (sourceWeights.length !== originalNames.length) fail(`node ${nodeIndex} default weights are misaligned`)
+      if (sourceWeights.length !== originalNames.length)
+        fail(`node ${nodeIndex} default weights are misaligned`)
       if (keepIndexes.length > 0) {
         node.weights = keepIndexes.map((sourceIndex) => {
           const retained = morphPlan.retainedWeightByNodeMorph.get(
@@ -1073,8 +1110,14 @@ function rewriteWeightAnimations(
     const samplerPlans = new Map<number, { keep: number[]; originalCount: number }>()
     const removedChannels = new Set<number>()
     for (const [channelIndex, channelValue] of channels.entries()) {
-      const channel = record(channelValue, `gltf.animations[${animationIndex}].channels[${channelIndex}]`)
-      const target = record(channel.target, `gltf.animations[${animationIndex}].channels[${channelIndex}].target`)
+      const channel = record(
+        channelValue,
+        `gltf.animations[${animationIndex}].channels[${channelIndex}]`
+      )
+      const target = record(
+        channel.target,
+        `gltf.animations[${animationIndex}].channels[${channelIndex}].target`
+      )
       if (target.path !== 'weights') continue
       const nodeIndex = integer(target.node, `animation ${animationIndex} weights target node`)
       const node = record(nodes[nodeIndex], `gltf.nodes[${nodeIndex}]`)
@@ -1088,41 +1131,70 @@ function rewriteWeightAnimations(
       }
       const samplerIndex = integer(channel.sampler, `animation ${animationIndex} channel sampler`)
       const previous = samplerPlans.get(samplerIndex)
-      if (previous && canonicalRecipeString(previous) !== canonicalRecipeString({ keep, originalCount })) {
+      if (
+        previous &&
+        canonicalRecipeString(previous) !== canonicalRecipeString({ keep, originalCount })
+      ) {
         fail('one animation sampler is shared by incompatible morph inventories')
       }
       samplerPlans.set(samplerIndex, { keep, originalCount })
     }
     for (const [samplerIndex, plan] of samplerPlans) {
-      const sampler = record(samplers[samplerIndex], `gltf.animations[${animationIndex}].samplers[${samplerIndex}]`)
+      const sampler = record(
+        samplers[samplerIndex],
+        `gltf.animations[${animationIndex}].samplers[${samplerIndex}]`
+      )
       const inputAccessor = decodeSemanticGlbAccessor(parsed, sampler.input)
       const outputIndex = integer(sampler.output, `animation ${animationIndex} sampler output`)
       const outputAccessor = decodeSemanticGlbAccessor(parsed, outputIndex)
-      if (outputAccessor.type !== 'SCALAR' || outputAccessor.componentType !== 5126 || outputAccessor.normalized) {
+      if (
+        outputAccessor.type !== 'SCALAR' ||
+        outputAccessor.componentType !== 5126 ||
+        outputAccessor.normalized
+      ) {
         fail('morph weight animation output must be an unnormalized FLOAT SCALAR accessor')
       }
       const multiplier = sampler.interpolation === 'CUBICSPLINE' ? 3 : 1
       const expected = inputAccessor.count * plan.originalCount * multiplier
-      if (outputAccessor.count !== expected) fail('morph weight animation output count is malformed')
+      if (outputAccessor.count !== expected)
+        fail('morph weight animation output count is malformed')
       const values = new Float32Array(inputAccessor.count * plan.keep.length * multiplier)
       let destination = 0
       for (let keyframe = 0; keyframe < inputAccessor.count; keyframe += 1) {
         for (let spline = 0; spline < multiplier; spline += 1) {
           const base = (keyframe * multiplier + spline) * plan.originalCount
-          for (const targetIndex of plan.keep) values[destination++] = outputAccessor.values[base + targetIndex]!
+          for (const targetIndex of plan.keep)
+            values[destination++] = outputAccessor.values[base + targetIndex]!
         }
       }
-      accessorOverrides.set(outputIndex, { values, type: 'SCALAR', count: values.length })
+      accessorOverrides.set(outputIndex, {
+        values,
+        type: 'SCALAR',
+        count: values.length
+      })
     }
     const retainedChannels = channels.filter((_channel, index) => !removedChannels.has(index))
     if (retainedChannels.length === 0) continue
-    const usedSamplerIndexes = [...new Set(retainedChannels.map((channelValue, channelIndex) =>
-      integer(record(channelValue, `animation ${animationIndex} retained channel ${channelIndex}`).sampler, 'animation sampler')
-    ))].sort((left, right) => left - right)
-    const samplerMapping = new Map(usedSamplerIndexes.map((sourceIndex, outputIndex) => [sourceIndex, outputIndex]))
+    const usedSamplerIndexes = [
+      ...new Set(
+        retainedChannels.map((channelValue, channelIndex) =>
+          integer(
+            record(channelValue, `animation ${animationIndex} retained channel ${channelIndex}`)
+              .sampler,
+            'animation sampler'
+          )
+        )
+      )
+    ].sort((left, right) => left - right)
+    const samplerMapping = new Map(
+      usedSamplerIndexes.map((sourceIndex, outputIndex) => [sourceIndex, outputIndex])
+    )
     animation.samplers = usedSamplerIndexes.map((sourceIndex) => samplers[sourceIndex])
     animation.channels = retainedChannels.map((channelValue, channelIndex) => {
-      const channel = record(channelValue, `animation ${animationIndex} retained channel ${channelIndex}`)
+      const channel = record(
+        channelValue,
+        `animation ${animationIndex} retained channel ${channelIndex}`
+      )
       const mapped = samplerMapping.get(integer(channel.sampler, 'animation sampler'))
       if (mapped === undefined) fail('retained animation channel lost its sampler')
       channel.sampler = mapped
@@ -1135,7 +1207,8 @@ function rewriteWeightAnimations(
 }
 
 function minMaxVec3(values: Float32Array): { min: number[]; max: number[] } {
-  if (values.length === 0 || values.length % 3 !== 0) fail('POSITION override must contain VEC3 rows')
+  if (values.length === 0 || values.length % 3 !== 0)
+    fail('POSITION override must contain VEC3 rows')
   const min = [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY]
   const max = [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY]
   for (let index = 0; index < values.length; index += 3) {
@@ -1174,7 +1247,8 @@ function addPhysicalOverrides(
     const accessorIndex = integer(attributes.POSITION, `mesh ${mesh.id}.POSITION`)
     const previous = positionByAccessor.get(accessorIndex)
     if (previous) {
-      if (previous.length !== mesh.positions.length) fail('shared POSITION accessor output length differs')
+      if (previous.length !== mesh.positions.length)
+        fail('shared POSITION accessor output length differs')
       for (let index = 0; index < previous.length; index += 1) {
         if (previous[index] !== mesh.positions[index]) {
           fail(`shared POSITION accessor ${accessorIndex} requires different baked outputs`)
@@ -1199,16 +1273,22 @@ function addPhysicalOverrides(
     if (!match) fail(`physical skin id ${skinOutput.id} is malformed`)
     const skinIndex = Number(match[2])
     const skin = record(skins[skinIndex], `gltf.skins[${skinIndex}]`)
-    const accessorIndex = integer(skin.inverseBindMatrices, `gltf.skins[${skinIndex}].inverseBindMatrices`)
+    const accessorIndex = integer(
+      skin.inverseBindMatrices,
+      `gltf.skins[${skinIndex}].inverseBindMatrices`
+    )
     const values = new Float32Array(skinOutput.joints.length * 16)
     skinOutput.joints.forEach((joint, slot) => {
-      matrixArray(joint.inverseBindMatrix, `skin ${skinOutput.id} joint ${slot}`).forEach((value, index) => {
-        values[slot * 16 + index] = value
-      })
+      matrixArray(joint.inverseBindMatrix, `skin ${skinOutput.id} joint ${slot}`).forEach(
+        (value, index) => {
+          values[slot * 16 + index] = value
+        }
+      )
     })
     const previous = inverseByAccessor.get(accessorIndex)
     if (previous) {
-      if (previous.length !== values.length) fail('shared inverse-bind accessor output length differs')
+      if (previous.length !== values.length)
+        fail('shared inverse-bind accessor output length differs')
       for (let index = 0; index < previous.length; index += 1) {
         if (previous[index] !== values[index]) {
           fail(`shared inverse-bind accessor ${accessorIndex} requires different baked outputs`)
@@ -1240,12 +1320,27 @@ function writeNodeMatrix(node: JsonRecord, matrixValue: readonly number[], conte
   const rotation = new THREE.Quaternion()
   const scale = new THREE.Vector3()
   matrix.decompose(position, rotation, scale)
-  if (![position.x, position.y, position.z, rotation.x, rotation.y, rotation.z, rotation.w, scale.x, scale.y, scale.z].every(Number.isFinite)) {
+  if (
+    ![
+      position.x,
+      position.y,
+      position.z,
+      rotation.x,
+      rotation.y,
+      rotation.z,
+      rotation.w,
+      scale.x,
+      scale.y,
+      scale.z
+    ].every(Number.isFinite)
+  ) {
     fail(`${context} cannot be decomposed into finite TRS`)
   }
   rotation.normalize()
   if (rotation.w < 0) rotation.set(-rotation.x, -rotation.y, -rotation.z, -rotation.w)
-  node.translation = [position.x, position.y, position.z].map((value) => (Object.is(value, -0) ? 0 : value))
+  node.translation = [position.x, position.y, position.z].map((value) =>
+    Object.is(value, -0) ? 0 : value
+  )
   node.rotation = [rotation.x, rotation.y, rotation.z, rotation.w].map((value) =>
     Object.is(value, -0) ? 0 : value
   )
@@ -1267,16 +1362,31 @@ function rewriteNodeRests(
       return [integer(Number(match[1]), `physical node ${node.id}`), node.localMatrix] as const
     })
   )
-  const rootTransform = new THREE.Matrix4().fromArray(matrixArray(evaluation.root.matrix, 'evaluated root matrix'))
-  const rootChanges = matrixMaximumError(evaluation.root.matrix, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) > MATRIX_EPSILON
+  const rootTransform = new THREE.Matrix4().fromArray(
+    matrixArray(evaluation.root.matrix, 'evaluated root matrix')
+  )
+  const rootChanges =
+    matrixMaximumError(evaluation.root.matrix, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) >
+    MATRIX_EPSILON
   if (rootChanges) {
     const roots = new Set(active.roots)
-    for (const [animationIndex, animationValue] of optionalArray(gltf.animations, 'gltf.animations').entries()) {
+    for (const [animationIndex, animationValue] of optionalArray(
+      gltf.animations,
+      'gltf.animations'
+    ).entries()) {
       const animation = record(animationValue, `gltf.animations[${animationIndex}]`)
-      for (const channelValue of array(animation.channels, `gltf.animations[${animationIndex}].channels`)) {
-        const target = record(record(channelValue, 'animation channel').target, 'animation channel target')
+      for (const channelValue of array(
+        animation.channels,
+        `gltf.animations[${animationIndex}].channels`
+      )) {
+        const target = record(
+          record(channelValue, 'animation channel').target,
+          'animation channel target'
+        )
         if (target.node !== undefined && roots.has(integer(target.node, 'animation target node'))) {
-          fail('root scale/grounding cannot be baked over an embedded animation targeting an active scene root')
+          fail(
+            'root scale/grounding cannot be baked over an embedded animation targeting an active scene root'
+          )
         }
       }
     }
@@ -1285,7 +1395,9 @@ function rewriteNodeRests(
     const node = record(nodes[nodeIndex], `gltf.nodes[${nodeIndex}]`)
     const evaluated = evaluatedByNode.get(nodeIndex)
     if (!evaluated) fail(`physical evaluation omitted active node ${nodeIndex}`)
-    let expected = new THREE.Matrix4().fromArray(matrixArray(evaluated, `evaluated node ${nodeIndex}`))
+    let expected = new THREE.Matrix4().fromArray(
+      matrixArray(evaluated, `evaluated node ${nodeIndex}`)
+    )
     if (active.roots.includes(nodeIndex)) expected = rootTransform.clone().multiply(expected)
     const original = resolveSemanticGlbNodeTransform(
       parsed.nodes[nodeIndex]!,
@@ -1303,22 +1415,37 @@ function collectReferencedAccessors(gltf: JsonRecord): Set<number> {
   const add = (value: unknown, context: string) => references.add(integer(value, context))
   for (const [meshIndex, meshValue] of optionalArray(gltf.meshes, 'gltf.meshes').entries()) {
     const mesh = record(meshValue, `gltf.meshes[${meshIndex}]`)
-    for (const [primitiveIndex, primitiveValue] of array(mesh.primitives, `gltf.meshes[${meshIndex}].primitives`).entries()) {
-      const primitive = record(primitiveValue, `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`)
+    for (const [primitiveIndex, primitiveValue] of array(
+      mesh.primitives,
+      `gltf.meshes[${meshIndex}].primitives`
+    ).entries()) {
+      const primitive = record(
+        primitiveValue,
+        `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`
+      )
       if (primitive.indices !== undefined) add(primitive.indices, 'primitive.indices')
-      for (const value of Object.values(record(primitive.attributes, 'primitive.attributes'))) add(value, 'attribute')
+      for (const value of Object.values(record(primitive.attributes, 'primitive.attributes')))
+        add(value, 'attribute')
       for (const targetValue of optionalArray(primitive.targets, 'primitive.targets')) {
-        for (const value of Object.values(record(targetValue, 'primitive target'))) add(value, 'target attribute')
+        for (const value of Object.values(record(targetValue, 'primitive target')))
+          add(value, 'target attribute')
       }
     }
   }
   for (const [skinIndex, skinValue] of optionalArray(gltf.skins, 'gltf.skins').entries()) {
     const skin = record(skinValue, `gltf.skins[${skinIndex}]`)
-    if (skin.inverseBindMatrices !== undefined) add(skin.inverseBindMatrices, 'skin.inverseBindMatrices')
+    if (skin.inverseBindMatrices !== undefined)
+      add(skin.inverseBindMatrices, 'skin.inverseBindMatrices')
   }
-  for (const [animationIndex, animationValue] of optionalArray(gltf.animations, 'gltf.animations').entries()) {
+  for (const [animationIndex, animationValue] of optionalArray(
+    gltf.animations,
+    'gltf.animations'
+  ).entries()) {
     const animation = record(animationValue, `gltf.animations[${animationIndex}]`)
-    for (const samplerValue of array(animation.samplers, `gltf.animations[${animationIndex}].samplers`)) {
+    for (const samplerValue of array(
+      animation.samplers,
+      `gltf.animations[${animationIndex}].samplers`
+    )) {
       const sampler = record(samplerValue, 'animation sampler')
       add(sampler.input, 'animation sampler input')
       add(sampler.output, 'animation sampler output')
@@ -1338,9 +1465,11 @@ function remapAccessorReferences(gltf: JsonRecord, mapping: Map<number, number>)
     const mesh = record(meshValue, 'mesh')
     for (const primitiveValue of array(mesh.primitives, 'mesh.primitives')) {
       const primitive = record(primitiveValue, 'primitive')
-      if (primitive.indices !== undefined) primitive.indices = remap(primitive.indices, 'primitive.indices')
+      if (primitive.indices !== undefined)
+        primitive.indices = remap(primitive.indices, 'primitive.indices')
       const attributes = record(primitive.attributes, 'primitive.attributes')
-      for (const key of Object.keys(attributes)) attributes[key] = remap(attributes[key], `attribute ${key}`)
+      for (const key of Object.keys(attributes))
+        attributes[key] = remap(attributes[key], `attribute ${key}`)
       for (const targetValue of optionalArray(primitive.targets, 'primitive.targets')) {
         const target = record(targetValue, 'primitive target')
         for (const key of Object.keys(target)) target[key] = remap(target[key], `target ${key}`)
@@ -1365,23 +1494,39 @@ function remapAccessorReferences(gltf: JsonRecord, mapping: Map<number, number>)
 
 function accessorBufferViews(accessor: JsonRecord, context: string): number[] {
   const views: number[] = []
-  if (accessor.bufferView !== undefined) views.push(integer(accessor.bufferView, `${context}.bufferView`))
+  if (accessor.bufferView !== undefined)
+    views.push(integer(accessor.bufferView, `${context}.bufferView`))
   if (accessor.sparse !== undefined) {
     const sparse = record(accessor.sparse, `${context}.sparse`)
-    views.push(integer(record(sparse.indices, `${context}.sparse.indices`).bufferView, `${context}.sparse.indices.bufferView`))
-    views.push(integer(record(sparse.values, `${context}.sparse.values`).bufferView, `${context}.sparse.values.bufferView`))
+    views.push(
+      integer(
+        record(sparse.indices, `${context}.sparse.indices`).bufferView,
+        `${context}.sparse.indices.bufferView`
+      )
+    )
+    views.push(
+      integer(
+        record(sparse.values, `${context}.sparse.values`).bufferView,
+        `${context}.sparse.values.bufferView`
+      )
+    )
   }
   return views
 }
 
-function remapAccessorBufferViews(accessor: JsonRecord, mapping: Map<number, number>, context: string): void {
+function remapAccessorBufferViews(
+  accessor: JsonRecord,
+  mapping: Map<number, number>,
+  context: string
+): void {
   const remap = (value: unknown, path: string) => {
     const source = integer(value, path)
     const target = mapping.get(source)
     if (target === undefined) fail(`${path} references removed bufferView ${source}`)
     return target
   }
-  if (accessor.bufferView !== undefined) accessor.bufferView = remap(accessor.bufferView, `${context}.bufferView`)
+  if (accessor.bufferView !== undefined)
+    accessor.bufferView = remap(accessor.bufferView, `${context}.bufferView`)
   if (accessor.sparse !== undefined) {
     const sparse = record(accessor.sparse, `${context}.sparse`)
     const indices = record(sparse.indices, `${context}.sparse.indices`)
@@ -1398,31 +1543,47 @@ function compactGlbResources(
 ): Uint8Array {
   const sourceAccessors = optionalArray(parsed.gltf.accessors, 'source gltf.accessors')
   const sourceViews = optionalArray(parsed.gltf.bufferViews, 'source gltf.bufferViews')
-  const referencedAccessors = [...collectReferencedAccessors(gltf)].sort((left, right) => left - right)
+  const referencedAccessors = [...collectReferencedAccessors(gltf)].sort(
+    (left, right) => left - right
+  )
   for (const accessorIndex of referencedAccessors) {
-    if (accessorIndex >= sourceAccessors.length) fail(`referenced accessor ${accessorIndex} is out of range`)
+    if (accessorIndex >= sourceAccessors.length)
+      fail(`referenced accessor ${accessorIndex} is out of range`)
   }
   const referencedOriginalViews = new Set<number>()
   for (const accessorIndex of referencedAccessors) {
     if (accessorOverrides.has(accessorIndex)) continue
     const accessor = record(sourceAccessors[accessorIndex], `gltf.accessors[${accessorIndex}]`)
-    accessorBufferViews(accessor, `gltf.accessors[${accessorIndex}]`).forEach((view) => referencedOriginalViews.add(view))
+    accessorBufferViews(accessor, `gltf.accessors[${accessorIndex}]`).forEach((view) =>
+      referencedOriginalViews.add(view)
+    )
   }
   for (const [imageIndex, imageValue] of optionalArray(gltf.images, 'gltf.images').entries()) {
     const image = record(imageValue, `gltf.images[${imageIndex}]`)
-    if (image.bufferView !== undefined) referencedOriginalViews.add(integer(image.bufferView, `gltf.images[${imageIndex}].bufferView`))
+    if (image.bufferView !== undefined)
+      referencedOriginalViews.add(
+        integer(image.bufferView, `gltf.images[${imageIndex}].bufferView`)
+      )
   }
   const originalViewIndexes = [...referencedOriginalViews].sort((left, right) => left - right)
   for (const viewIndex of originalViewIndexes) {
     if (viewIndex >= sourceViews.length) fail(`referenced bufferView ${viewIndex} is out of range`)
   }
 
-  const chunks: Array<{ bytes: Uint8Array; view: JsonRecord; original?: number; override?: number }> = []
+  const chunks: Array<{
+    bytes: Uint8Array
+    view: JsonRecord
+    original?: number
+    override?: number
+  }> = []
   for (const viewIndex of originalViewIndexes) {
     const source = record(sourceViews[viewIndex], `gltf.bufferViews[${viewIndex}]`)
     const byteOffset = integer(source.byteOffset ?? 0, `gltf.bufferViews[${viewIndex}].byteOffset`)
     const byteLength = integer(source.byteLength, `gltf.bufferViews[${viewIndex}].byteLength`)
-    if (byteOffset > parsed.binary.byteLength || byteLength > parsed.binary.byteLength - byteOffset) {
+    if (
+      byteOffset > parsed.binary.byteLength ||
+      byteLength > parsed.binary.byteLength - byteOffset
+    ) {
       fail(`gltf.bufferViews[${viewIndex}] exceeds the source binary`)
     }
     const view = cloneJson(source)
@@ -1436,10 +1597,16 @@ function compactGlbResources(
   for (const accessorIndex of referencedAccessors) {
     const override = accessorOverrides.get(accessorIndex)
     if (!override) continue
-    const sourceAccessor = record(sourceAccessors[accessorIndex], `gltf.accessors[${accessorIndex}]`)
+    const sourceAccessor = record(
+      sourceAccessors[accessorIndex],
+      `gltf.accessors[${accessorIndex}]`
+    )
     let target: unknown
     if (sourceAccessor.bufferView !== undefined) {
-      target = record(sourceViews[integer(sourceAccessor.bufferView, 'override source bufferView')], 'override source bufferView').target
+      target = record(
+        sourceViews[integer(sourceAccessor.bufferView, 'override source bufferView')],
+        'override source bufferView'
+      ).target
     }
     chunks.push({
       bytes: uint8View(override.values),
@@ -1475,7 +1642,9 @@ function compactGlbResources(
   const accessorMapping = new Map<number, number>()
   const newAccessors = referencedAccessors.map((sourceIndex, newIndex) => {
     accessorMapping.set(sourceIndex, newIndex)
-    const accessor = cloneJson(record(sourceAccessors[sourceIndex], `gltf.accessors[${sourceIndex}]`))
+    const accessor = cloneJson(
+      record(sourceAccessors[sourceIndex], `gltf.accessors[${sourceIndex}]`)
+    )
     const override = accessorOverrides.get(sourceIndex)
     if (override) {
       accessor.bufferView = overrideView.get(sourceIndex)!
@@ -1520,7 +1689,9 @@ function buildStructuralLiveGlb(
   resolved: ReturnType<typeof resolveStrictAppearanceRecipeSnapshot>['resolved'],
   evaluation: AppearanceRecipePhysicalEvaluation
 ): StructuralRewrite {
-  const parsed = parseSemanticGlb(sourceModelBytes, { diagnosticPrefix: LIVE_GOON_BAKER_ID })
+  const parsed = parseSemanticGlb(sourceModelBytes, {
+    diagnosticPrefix: LIVE_GOON_BAKER_ID
+  })
   validateStructuralExtensions(parsed)
   const gltf = cloneJson(parsed.gltf)
   const accessorOverrides = new Map<number, AccessorOverride>()
@@ -1540,7 +1711,10 @@ function buildStructuralLiveGlb(
     const mesh = getSemanticGlbMesh(parsed, node.mesh, `gltf.nodes[${nodeIndex}].mesh`)
     for (const primitiveValue of array(mesh.primitives, 'mesh.primitives')) {
       const primitive = record(primitiveValue, 'mesh primitive')
-      const position = inspectSemanticGlbAccessor(parsed, record(primitive.attributes, 'primitive.attributes').POSITION)
+      const position = inspectSemanticGlbAccessor(
+        parsed,
+        record(primitive.attributes, 'primitive.attributes').POSITION
+      )
       meshesProcessed += 1
       verticesProcessed += position.count
       morphTargetsProcessed += optionalArray(primitive.targets, 'primitive.targets').length
@@ -1608,7 +1782,8 @@ function strictStoredZipEntries(packageBytes: Uint8Array): Map<string, Uint8Arra
   }
   const centralSize = view.getUint32(eocdOffset + 12, true)
   const centralOffset = view.getUint32(eocdOffset + 16, true)
-  if (centralOffset + centralSize !== eocdOffset) fail('Live package central directory is malformed')
+  if (centralOffset + centralSize !== eocdOffset)
+    fail('Live package central directory is malformed')
   const result = new Map<string, Uint8Array>()
   const localRanges: Array<[number, number]> = []
   let cursor = centralOffset
@@ -1661,7 +1836,8 @@ function strictStoredZipEntries(packageBytes: Uint8Array): Map<string, Uint8Arra
     const localName = DECODER.decode(
       packageBytes.subarray(localOffset + 30, localOffset + 30 + localNameLength)
     )
-    if (localName !== name) fail(`Live package local entry name ${localName} disagrees with ${name}`)
+    if (localName !== name)
+      fail(`Live package local entry name ${localName} disagrees with ${name}`)
     const bytes = packageBytes.subarray(dataOffset, dataEnd)
     if (crc32(bytes) !== crc) fail(`Live package entry ${name} failed CRC validation`)
     result.set(name, bytes)
@@ -1670,7 +1846,11 @@ function strictStoredZipEntries(packageBytes: Uint8Array): Map<string, Uint8Arra
   }
   if (cursor !== eocdOffset) fail('Live package central directory contains trailing records')
   localRanges.sort((left, right) => left[0] - right[0])
-  if (localRanges[0]?.[0] !== 0 || localRanges[0]?.[1] !== localRanges[1]?.[0] || localRanges[1]?.[1] !== centralOffset) {
+  if (
+    localRanges[0]?.[0] !== 0 ||
+    localRanges[0]?.[1] !== localRanges[1]?.[0] ||
+    localRanges[1]?.[1] !== centralOffset
+  ) {
     fail('Live package local entries are not contiguous and canonical')
   }
   return result
@@ -1720,7 +1900,10 @@ function worldMatrices(parsed: SemanticGlbDocument): Map<number, THREE.Matrix4> 
       }).matrix
     )
     const parent = parsed.parents.get(nodeIndex)
-    result.set(nodeIndex, parent === undefined ? local : result.get(parent)!.clone().multiply(local))
+    result.set(
+      nodeIndex,
+      parent === undefined ? local : result.get(parent)!.clone().multiply(local)
+    )
   }
   return result
 }
@@ -1776,9 +1959,7 @@ function verifySocketEyeLiveMorphInventory(
       const mesh = getSemanticGlbMesh(parsed, meshIndex, `Live socket-eye mesh ${nodeName}`)
       const actual = morphTargetNames(mesh, `Live socket-eye mesh ${nodeName}`).sort(compareText)
       if (canonicalRecipeString(actual) !== canonicalRecipeString(expected)) {
-        fail(
-          `Live socket-eye node ${nodeName} must retain exactly ${expected.join(', ')}`
-        )
+        fail(`Live socket-eye node ${nodeName} must retain exactly ${expected.join(', ')}`)
       }
     }
   }
@@ -1799,12 +1980,15 @@ async function retainedMorphProof(
 ): Promise<{ sha256: string; maxError: number }> {
   const entries: Array<Record<string, unknown>> = []
   let maxError = 0
-  for (const [meshIndex, keepIndexes] of [...plan.keepIndexesByMesh.entries()].sort((a, b) => a[0] - b[0])) {
+  for (const [meshIndex, keepIndexes] of [...plan.keepIndexesByMesh.entries()].sort(
+    (a, b) => a[0] - b[0]
+  )) {
     const sourceMesh = getSemanticGlbMesh(source, meshIndex, `source mesh ${meshIndex}`)
     const outputMesh = getSemanticGlbMesh(output, meshIndex, `output mesh ${meshIndex}`)
     const sourcePrimitives = array(sourceMesh.primitives, `source mesh ${meshIndex}.primitives`)
     const outputPrimitives = array(outputMesh.primitives, `output mesh ${meshIndex}.primitives`)
-    if (sourcePrimitives.length !== outputPrimitives.length) fail(`mesh ${meshIndex} primitive count changed`)
+    if (sourcePrimitives.length !== outputPrimitives.length)
+      fail(`mesh ${meshIndex} primitive count changed`)
     for (let primitiveIndex = 0; primitiveIndex < sourcePrimitives.length; primitiveIndex += 1) {
       const sourceTargets = optionalArray(
         record(sourcePrimitives[primitiveIndex], 'source primitive').targets,
@@ -1814,12 +1998,16 @@ async function retainedMorphProof(
         record(outputPrimitives[primitiveIndex], 'output primitive').targets,
         'output primitive targets'
       )
-      if (outputTargets.length !== keepIndexes.length) fail(`mesh ${meshIndex} retained target count changed`)
+      if (outputTargets.length !== keepIndexes.length)
+        fail(`mesh ${meshIndex} retained target count changed`)
       for (const [outputIndex, sourceIndex] of keepIndexes.entries()) {
         const sourceTarget = record(sourceTargets[sourceIndex], 'source morph target')
         const outputTarget = record(outputTargets[outputIndex], 'output morph target')
         const semantics = Object.keys(sourceTarget).sort(compareText)
-        if (canonicalRecipeString(semantics) !== canonicalRecipeString(Object.keys(outputTarget).sort(compareText))) {
+        if (
+          canonicalRecipeString(semantics) !==
+          canonicalRecipeString(Object.keys(outputTarget).sort(compareText))
+        ) {
           fail(`mesh ${meshIndex} retained morph ${sourceIndex} attribute semantics changed`)
         }
         for (const semantic of semantics) {
@@ -1832,7 +2020,9 @@ async function retainedMorphProof(
             left.type !== right.type ||
             left.normalized !== right.normalized
           ) {
-            fail(`mesh ${meshIndex} retained morph ${sourceIndex}/${semantic} accessor shape changed`)
+            fail(
+              `mesh ${meshIndex} retained morph ${sourceIndex}/${semantic} accessor shape changed`
+            )
           }
           maxError = Math.max(maxError, maximumArrayError(left.values, right.values))
           entries.push({
@@ -1874,10 +2064,16 @@ async function auditStructuralLiveGlb(
   evaluation: AppearanceRecipePhysicalEvaluation,
   rewrite: StructuralRewrite
 ): Promise<StructuralAudit> {
-  const source = parseSemanticGlb(sourceModelBytes, { diagnosticPrefix: `${LIVE_GOON_BAKER_ID}:source-audit` })
-  const output = parseSemanticGlb(outputModelBytes, { diagnosticPrefix: `${LIVE_GOON_BAKER_ID}:output-audit` })
+  const source = parseSemanticGlb(sourceModelBytes, {
+    diagnosticPrefix: `${LIVE_GOON_BAKER_ID}:source-audit`
+  })
+  const output = parseSemanticGlb(outputModelBytes, {
+    diagnosticPrefix: `${LIVE_GOON_BAKER_ID}:output-audit`
+  })
   const liveMorphTargets = inventoryMorphRefs(output)
-  if (canonicalRecipeString(liveMorphTargets) !== canonicalRecipeString(rewrite.morphPlan.keptRefs)) {
+  if (
+    canonicalRecipeString(liveMorphTargets) !== canonicalRecipeString(rewrite.morphPlan.keptRefs)
+  ) {
     fail('re-imported Live morph inventory differs from the bake plan')
   }
   const removedRefs = new Set(rewrite.morphPlan.removedRefs)
@@ -1904,20 +2100,30 @@ async function auditStructuralLiveGlb(
   for (const nodeIndex of active.order) {
     const evaluationNode = evaluationNodes.get(`node:${nodeIndex}`)
     if (!evaluationNode) fail(`physical evaluation omitted node:${nodeIndex}`)
-    const outputLocal = resolveSemanticGlbNodeTransform(output.nodes[nodeIndex]!, `output node ${nodeIndex}`, {
-      diagnosticPrefix: LIVE_GOON_BAKER_ID
-    }).matrix
+    const outputLocal = resolveSemanticGlbNodeTransform(
+      output.nodes[nodeIndex]!,
+      `output node ${nodeIndex}`,
+      {
+        diagnosticPrefix: LIVE_GOON_BAKER_ID
+      }
+    ).matrix
     const expectedLocal = roots.has(nodeIndex)
-      ? new THREE.Matrix4().fromArray(evaluation.root.matrix).multiply(
-          new THREE.Matrix4().fromArray(evaluationNode.localMatrix)
-        ).elements
+      ? new THREE.Matrix4()
+          .fromArray(evaluation.root.matrix)
+          .multiply(new THREE.Matrix4().fromArray(evaluationNode.localMatrix)).elements
       : evaluationNode.localMatrix
     const metrics = matrixMetricErrors(outputLocal, expectedLocal)
     maxNodeTranslationErrorMeters = Math.max(maxNodeTranslationErrorMeters, metrics.translation)
     maxScaleError = Math.max(maxScaleError, metrics.scale)
     maxRotationErrorRadians = Math.max(maxRotationErrorRadians, metrics.rotation)
-    const worldMetrics = matrixMetricErrors(outputWorld.get(nodeIndex)!.elements, evaluationNode.worldMatrix)
-    maxNodeTranslationErrorMeters = Math.max(maxNodeTranslationErrorMeters, worldMetrics.translation)
+    const worldMetrics = matrixMetricErrors(
+      outputWorld.get(nodeIndex)!.elements,
+      evaluationNode.worldMatrix
+    )
+    maxNodeTranslationErrorMeters = Math.max(
+      maxNodeTranslationErrorMeters,
+      worldMetrics.translation
+    )
     maxScaleError = Math.max(maxScaleError, worldMetrics.scale)
     maxRotationErrorRadians = Math.max(maxRotationErrorRadians, worldMetrics.rotation)
   }
@@ -1929,10 +2135,22 @@ async function auditStructuralLiveGlb(
     const nodeIndex = Number(match[1])
     const primitiveIndex = Number(match[2])
     const node = output.nodes[nodeIndex]!
-    const gltfMesh = record(meshes[integer(node.mesh, `output node ${nodeIndex}.mesh`)], 'output mesh')
-    const primitive = record(array(gltfMesh.primitives, 'output mesh primitives')[primitiveIndex], 'output primitive')
-    const positions = decodeSemanticGlbAccessor(output, record(primitive.attributes, 'output attributes').POSITION)
-    maxVertexErrorMeters = Math.max(maxVertexErrorMeters, maximumArrayError(mesh.positions, positions.values))
+    const gltfMesh = record(
+      meshes[integer(node.mesh, `output node ${nodeIndex}.mesh`)],
+      'output mesh'
+    )
+    const primitive = record(
+      array(gltfMesh.primitives, 'output mesh primitives')[primitiveIndex],
+      'output primitive'
+    )
+    const positions = decodeSemanticGlbAccessor(
+      output,
+      record(primitive.attributes, 'output attributes').POSITION
+    )
+    maxVertexErrorMeters = Math.max(
+      maxVertexErrorMeters,
+      maximumArrayError(mesh.positions, positions.values)
+    )
     const expectedNode = evaluationNodes.get(mesh.nodeId)
     if (!expectedNode) fail(`physical mesh ${mesh.id} references missing ${mesh.nodeId}`)
     const expectedWorld = new THREE.Matrix4().fromArray(expectedNode.worldMatrix)
@@ -1940,8 +2158,16 @@ async function auditStructuralLiveGlb(
     const expectedPoint = new THREE.Vector3()
     const actualPoint = new THREE.Vector3()
     for (let scalar = 0; scalar < positions.values.length; scalar += 3) {
-      expectedPoint.set(mesh.positions[scalar]!, mesh.positions[scalar + 1]!, mesh.positions[scalar + 2]!).applyMatrix4(expectedWorld)
-      actualPoint.set(positions.values[scalar]!, positions.values[scalar + 1]!, positions.values[scalar + 2]!).applyMatrix4(actualWorld)
+      expectedPoint
+        .set(mesh.positions[scalar]!, mesh.positions[scalar + 1]!, mesh.positions[scalar + 2]!)
+        .applyMatrix4(expectedWorld)
+      actualPoint
+        .set(
+          positions.values[scalar]!,
+          positions.values[scalar + 1]!,
+          positions.values[scalar + 2]!
+        )
+        .applyMatrix4(actualWorld)
       const error = expectedPoint.distanceTo(actualPoint)
       maxFinalPositionErrorMeters = Math.max(maxFinalPositionErrorMeters, error)
       finalSquaredError += error * error
@@ -1954,7 +2180,10 @@ async function auditStructuralLiveGlb(
     if (!match) fail(`retained binding ${binding.id} has malformed mesh id ${binding.meshId}`)
     const nodeIndex = Number(match[1])
     const node = output.nodes[nodeIndex]!
-    const mesh = record(meshes[integer(node.mesh, `retained binding ${binding.id} mesh`)], 'retained mesh')
+    const mesh = record(
+      meshes[integer(node.mesh, `retained binding ${binding.id} mesh`)],
+      'retained mesh'
+    )
     const names = morphTargetNames(mesh, `retained binding ${binding.id} mesh`)
     const morphIndex = names.indexOf(binding.morph)
     if (morphIndex < 0) fail(`retained binding ${binding.id} morph is absent after re-import`)
@@ -1964,10 +2193,13 @@ async function auditStructuralLiveGlb(
           ? names.map(() => 0)
           : array(mesh.weights, 'retained mesh weights')
         : array(node.weights, `retained node ${nodeIndex} weights`)
-    if (weights.length !== names.length) fail(`retained binding ${binding.id} weights are misaligned`)
+    if (weights.length !== names.length)
+      fail(`retained binding ${binding.id} weights are misaligned`)
     maxWeightScalarError = Math.max(
       maxWeightScalarError,
-      Math.abs(finite(weights[morphIndex], `retained binding ${binding.id} weight`) - binding.weight)
+      Math.abs(
+        finite(weights[morphIndex], `retained binding ${binding.id} weight`) - binding.weight
+      )
     )
   }
 
@@ -1981,35 +2213,51 @@ async function auditStructuralLiveGlb(
     skinOutput.joints.forEach((joint, jointIndex) => {
       maxJointErrorMeters = Math.max(
         maxJointErrorMeters,
-        maximumArrayError(joint.inverseBindMatrix, inverse.values.subarray(jointIndex * 16, jointIndex * 16 + 16))
+        maximumArrayError(
+          joint.inverseBindMatrix,
+          inverse.values.subarray(jointIndex * 16, jointIndex * 16 + 16)
+        )
       )
     })
   }
   for (const joint of evaluation.jointRests) {
     const match = /^node:([0-9]+)$/.exec(joint.nodeId)
     if (!match) fail(`joint ${joint.bone} has malformed node id ${joint.nodeId}`)
-    const outputLocal = resolveSemanticGlbNodeTransform(output.nodes[Number(match[1])]!, `joint ${joint.bone}`, {
-      diagnosticPrefix: LIVE_GOON_BAKER_ID
-    }).matrix
-    maxJointErrorMeters = Math.max(maxJointErrorMeters, matrixMetricErrors(outputLocal, joint.localMatrix).translation)
+    const outputLocal = resolveSemanticGlbNodeTransform(
+      output.nodes[Number(match[1])]!,
+      `joint ${joint.bone}`,
+      {
+        diagnosticPrefix: LIVE_GOON_BAKER_ID
+      }
+    ).matrix
+    maxJointErrorMeters = Math.max(
+      maxJointErrorMeters,
+      matrixMetricErrors(outputLocal, joint.localMatrix).translation
+    )
   }
   for (const role of evaluation.roles) {
     const match = /^node:([0-9]+)$/.exec(role.nodeId)
     if (!match) fail(`role ${role.id} has malformed node id ${role.nodeId}`)
     const actual = new THREE.Vector3().setFromMatrixPosition(outputWorld.get(Number(match[1]))!)
     const error = actual.distanceTo(new THREE.Vector3(...role.worldPosition))
-    if (role.kind === 'eye' || role.kind === 'stage') maxPivotErrorMeters = Math.max(maxPivotErrorMeters, error)
+    if (role.kind === 'eye' || role.kind === 'stage')
+      maxPivotErrorMeters = Math.max(maxPivotErrorMeters, error)
   }
 
   const retained = await retainedMorphProof(source, output, rewrite.morphPlan)
-  const retainedNames = new Set([...rewrite.morphPlan.outputNamesByMesh.values()].flatMap((names) => names))
+  const retainedNames = new Set(
+    [...rewrite.morphPlan.outputNamesByMesh.values()].flatMap((names) => names)
+  )
   const [sourceMaterials, outputMaterials] = await Promise.all([
     buildAppearanceRecipeSemanticMaterialProof(source),
     buildAppearanceRecipeSemanticMaterialProof(output)
   ])
   const sourceMaterialProjection = materialProjectionForComparison(sourceMaterials, retainedNames)
   const outputMaterialProjection = materialProjectionForComparison(outputMaterials, retainedNames)
-  if (canonicalRecipeString(sourceMaterialProjection) !== canonicalRecipeString(outputMaterialProjection)) {
+  if (
+    canonicalRecipeString(sourceMaterialProjection) !==
+    canonicalRecipeString(outputMaterialProjection)
+  ) {
     fail('material, texture, UV, or retained morph shading semantics changed during Live baking')
   }
   const materialProofSha256 = await canonicalRecipeSha256(outputMaterialProjection)
@@ -2028,10 +2276,14 @@ async function auditStructuralLiveGlb(
     maxRotationErrorRadians,
     maxGroundingErrorMeters,
     maxFinalPositionErrorMeters,
-    rmsFinalPositionErrorMeters: finalSamples === 0 ? 0 : Math.sqrt(finalSquaredError / finalSamples)
+    rmsFinalPositionErrorMeters:
+      finalSamples === 0 ? 0 : Math.sqrt(finalSquaredError / finalSamples)
   }
   const hashedMeshes = await Promise.all(
-    evaluation.meshes.map(async (mesh) => ({ id: mesh.id, sha256: await sha256Hex(uint8View(mesh.positions)) }))
+    evaluation.meshes.map(async (mesh) => ({
+      id: mesh.id,
+      sha256: await sha256Hex(uint8View(mesh.positions))
+    }))
   )
   const rig = rawManifest.rig === undefined ? null : record(rawManifest.rig, 'avatar.json#rig')
   const proofsWithoutValidation = {
@@ -2101,7 +2353,9 @@ function createLiveAvatarManifest(
   } else if (liveCorrectives) {
     output.rig = { liveCorrectives }
   }
-  parseLiveJointCorrectives(output.rig === undefined ? undefined : record(output.rig, 'avatar.json#rig').liveCorrectives)
+  parseLiveJointCorrectives(
+    output.rig === undefined ? undefined : record(output.rig, 'avatar.json#rig').liveCorrectives
+  )
   return output
 }
 
@@ -2118,20 +2372,26 @@ function sourceIdentity(input: LiveGoonBakeInput): GoonLiveBuildSourceIdentity {
   }
 }
 
-function buildInventory(rewrite: StructuralRewrite, sourceManifest: JsonRecord): GoonLiveBuildInventory {
+function buildInventory(
+  rewrite: StructuralRewrite,
+  sourceManifest: JsonRecord
+): GoonLiveBuildInventory {
   const removedManifestEntries = ['manifest:/appearanceDials']
   if (sourceManifest.anatomyFit !== undefined) removedManifestEntries.push('manifest:/anatomyFit')
-  if (sourceManifest.oralCavityFit !== undefined) removedManifestEntries.push('manifest:/oralCavityFit')
-  if (sourceManifest.recipeSource !== undefined) removedManifestEntries.push('manifest:/recipeSource')
-  if (sourceManifest.recipeUpdates !== undefined) removedManifestEntries.push('manifest:/recipeUpdates')
-  const sourceRig = sourceManifest.rig === undefined ? null : record(sourceManifest.rig, 'avatar.json#rig')
+  if (sourceManifest.oralCavityFit !== undefined)
+    removedManifestEntries.push('manifest:/oralCavityFit')
+  if (sourceManifest.recipeSource !== undefined)
+    removedManifestEntries.push('manifest:/recipeSource')
+  if (sourceManifest.recipeUpdates !== undefined)
+    removedManifestEntries.push('manifest:/recipeUpdates')
+  const sourceRig =
+    sourceManifest.rig === undefined ? null : record(sourceManifest.rig, 'avatar.json#rig')
   if (sourceRig?.correctives !== undefined) removedManifestEntries.push('manifest:/rig/correctives')
   return {
     kept: rewrite.morphPlan.keptRefs,
-    removed: [...new Set([
-      ...rewrite.morphPlan.removedRefs,
-      ...removedManifestEntries
-    ])].sort(compareText),
+    removed: [...new Set([...rewrite.morphPlan.removedRefs, ...removedManifestEntries])].sort(
+      compareText
+    ),
     liveMorphTargets: rewrite.morphPlan.keptRefs,
     retainedDynamicMorphs: rewrite.morphPlan.dynamicRefs,
     retainedCorrectiveMorphs: rewrite.morphPlan.correctiveRefs
@@ -2139,23 +2399,186 @@ function buildInventory(rewrite: StructuralRewrite, sourceManifest: JsonRecord):
 }
 
 function assertInputBounds(input: LiveGoonBakeInput): void {
-  const entries = [
+  const entries: Array<readonly [string, Uint8Array]> = [
     ['package', input.packageBytes],
     ['model', input.modelBytes],
     ['manifest', input.manifestBytes]
-  ] as const
+  ]
+  if (input.hair) {
+    entries.push(['Hair main geometry', input.hair.mainBytes])
+    if (input.hair.followerBytes) {
+      entries.push(['Hair follower definition', input.hair.followerBytes])
+    }
+    if (input.hair.physicsBytes) {
+      entries.push(['Hair secondary-motion definition', input.hair.physicsBytes])
+    }
+    entries.push(['Hair neutral value texture', input.hair.neutralValueBytes])
+    entries.push(['Hair Highlight mask texture', input.hair.highlightMaskBytes])
+    if (input.hair.normalBytes) entries.push(['Hair Normal texture', input.hair.normalBytes])
+    if (input.hair.roughnessBytes) {
+      entries.push(['Hair Roughness texture', input.hair.roughnessBytes])
+    }
+    if (input.hair.sparseAccentBytes) {
+      entries.push(['Hair sparse accent geometry', input.hair.sparseAccentBytes])
+    }
+  }
   let total = 0
   for (const [name, bytes] of entries) {
     exactBytes(bytes, `${name} bytes`)
-    if (bytes.byteLength > MAX_BAKER_INPUT_BYTES) fail(`${name} exceeds the 1 GiB baker input limit`)
+    if (bytes.byteLength > MAX_BAKER_INPUT_BYTES)
+      fail(`${name} exceeds the 1 GiB baker input limit`)
     total += bytes.byteLength
   }
-  if (total > MAX_BAKER_INPUT_BYTES * 2) fail('combined baker input exceeds the bounded working-set contract')
+  if (total > MAX_BAKER_INPUT_BYTES * 2)
+    fail('combined baker input exceeds the bounded working-set contract')
 }
 
-export async function verifyLiveGoonBakeArtifacts(
-  input: LiveGoonBakeArtifactInput
-): Promise<{ manifest: JsonRecord; liveManifest: GoonLiveManifest; receipt: GoonLiveBuildReceipt }> {
+type RigidHairMetrics = {
+  meshes: number
+  vertices: number
+  nodes: number
+}
+
+function inspectRigidHairMetrics(bytes: Uint8Array): RigidHairMetrics {
+  const parsed = parseSemanticGlb(bytes, {
+    diagnosticPrefix: `${LIVE_GOON_BAKER_ID}:Hair-metrics`
+  })
+  let meshes = 0
+  let vertices = 0
+  for (const [nodeIndex, node] of parsed.nodes.entries()) {
+    if (node.mesh === undefined) continue
+    const mesh = getSemanticGlbMesh(parsed, node.mesh, `Hair gltf.nodes[${nodeIndex}].mesh`)
+    for (const [primitiveIndex, primitiveValue] of array(
+      mesh.primitives,
+      `Hair gltf.meshes[${node.mesh}].primitives`
+    ).entries()) {
+      const primitive = record(
+        primitiveValue,
+        `Hair gltf.meshes[${node.mesh}].primitives[${primitiveIndex}]`
+      )
+      const position = inspectSemanticGlbAccessor(
+        parsed,
+        record(primitive.attributes, 'Hair primitive.attributes').POSITION
+      )
+      meshes += 1
+      vertices += position.count
+    }
+  }
+  return { meshes, vertices, nodes: parsed.nodes.length }
+}
+
+async function resolveSelectedHair(input: LiveGoonBakeInput, state: RecipeStateSnapshot) {
+  const siblings = state.siblings.filter(
+    (entry) =>
+      entry.id === 'hairState' || entry.id === 'hair-state' || entry.contract === 'hair-state/v2'
+  )
+  if (siblings.length > 1) fail('Recipe State contains more than one Hair sibling')
+  if (siblings.length === 0) {
+    if (input.hair) fail('Hair bake input is present without Recipe Hair state')
+    return null
+  }
+  const hairState = parseHairState(siblings[0].state)
+  if (!hairState.selected) {
+    if (input.hair) fail('Hair bake input is present while Recipe Hair state selects None')
+    return null
+  }
+  if (!input.hair) {
+    fail('selected Recipe Hair state is missing its immutable Hair Asset bake input')
+  }
+  const { asset } = await validateHairStateBinding({
+    asset: input.hair.asset,
+    state: hairState,
+    recipeSource: input.source.identities
+  })
+  if (asset.material.status !== 'ready') {
+    fail('selected Hair Asset is missing its ready H3 material declaration')
+  }
+  if (asset.geometry.sparseAccent || input.hair.sparseAccentBytes) {
+    fail('sparse Hair accent geometry is not supported by the V1 Live Goon contract')
+  }
+  const mainBytes = exactBytes(input.hair.mainBytes, 'Hair main geometry bytes')
+  const mainSha256 = await sha256Hex(mainBytes)
+  if (
+    mainBytes.byteLength !== asset.geometry.main.bytes ||
+    mainSha256 !== asset.geometry.main.sha256
+  ) {
+    fail('Hair main geometry does not match its immutable asset byte receipt')
+  }
+  let followerDefinition: Awaited<ReturnType<typeof verifyHairFollowerDefinitionBytes>> | null =
+    null
+  if (asset.follower.mode === 'appearance-followers/v2') {
+    if (!input.hair.followerBytes) {
+      fail('production Hair follower is missing its immutable definition bytes')
+    }
+    followerDefinition = await verifyHairFollowerDefinitionBytes(
+      asset,
+      exactBytes(input.hair.followerBytes, 'Hair follower definition bytes')
+    )
+  } else {
+    if (input.hair.followerBytes) {
+      fail('static Hair Asset carries undeclared follower definition bytes')
+    }
+    if (asset.follower.staticReason === 'pending-h4-preview-only') {
+      fail('Hair Asset remains preview-only until its H4 appearance follower is approved')
+    }
+  }
+  let physicsDefinition: Awaited<
+    ReturnType<typeof verifyHairSecondaryMotionDefinitionBytes>
+  > | null = null
+  if (asset.physics.mode === 'secondary-motion/v1') {
+    if (!input.hair.physicsBytes) {
+      fail('production Hair secondary motion is missing its immutable definition bytes')
+    }
+    physicsDefinition = await verifyHairSecondaryMotionDefinitionBytes(
+      asset,
+      exactBytes(input.hair.physicsBytes, 'Hair secondary-motion definition bytes')
+    )
+  } else {
+    if (input.hair.physicsBytes) {
+      fail('static Hair Asset carries undeclared secondary-motion definition bytes')
+    }
+    if (asset.physics.staticReason === 'pending-h5-preview-only') {
+      fail('Hair Asset remains preview-only until its H5 secondary motion is approved')
+    }
+  }
+  const textureEntries = [
+    ['neutral value', asset.material.neutralValueTexture, input.hair.neutralValueBytes],
+    ['Highlight mask', asset.material.highlightMask, input.hair.highlightMaskBytes],
+    ['Normal', asset.material.normalTexture, input.hair.normalBytes],
+    ['Roughness', asset.material.roughnessTexture, input.hair.roughnessBytes]
+  ] as const
+  for (const [label, ref, bytesValue] of textureEntries) {
+    if (Boolean(ref) !== Boolean(bytesValue)) {
+      fail(`Hair ${label} texture bytes do not match the immutable material declaration`)
+    }
+    if (!ref || !bytesValue) continue
+    const bytes = exactBytes(bytesValue, `Hair ${label} texture bytes`)
+    const sha256 = await sha256Hex(bytes)
+    if (bytes.byteLength !== ref.bytes || sha256 !== ref.sha256) {
+      fail(`Hair ${label} texture does not match its immutable asset byte receipt`)
+    }
+  }
+  return {
+    asset,
+    state: hairState,
+    mainBytes,
+    followerDefinition,
+    followerBytes: input.hair.followerBytes,
+    physicsDefinition,
+    physicsBytes: input.hair.physicsBytes,
+    neutralValueBytes: input.hair.neutralValueBytes,
+    highlightMaskBytes: input.hair.highlightMaskBytes,
+    normalBytes: input.hair.normalBytes,
+    roughnessBytes: input.hair.roughnessBytes,
+    metrics: inspectRigidHairMetrics(mainBytes)
+  }
+}
+
+export async function verifyLiveGoonBakeArtifacts(input: LiveGoonBakeArtifactInput): Promise<{
+  manifest: JsonRecord
+  liveManifest: GoonLiveManifest
+  receipt: GoonLiveBuildReceipt
+}> {
   const [receipt, packageSha256, modelSha256, manifestSha256] = await Promise.all([
     verifyGoonLiveBuildReceipt(input.receipt),
     sha256Hex(exactBytes(input.packageBytes, 'Live package bytes')),
@@ -2173,25 +2596,42 @@ export async function verifyLiveGoonBakeArtifacts(
     fail('Live output bytes do not match the external receipt')
   }
   const entries = strictStoredZipEntries(input.packageBytes)
-  if (!bytesEqual(entries.get('avatar.glb')!, input.modelBytes) || !bytesEqual(entries.get('avatar.json')!, input.manifestBytes)) {
+  if (
+    !bytesEqual(entries.get('avatar.glb')!, input.modelBytes) ||
+    !bytesEqual(entries.get('avatar.json')!, input.manifestBytes)
+  ) {
     fail('Live package entries differ from the independently supplied model or manifest')
   }
   const manifest = parseJsonManifestBytes(input.manifestBytes)
   const liveManifest = await verifyGoonLiveAvatarManifestAgainstReceipt(manifest, receipt)
-  if (manifest.appearanceDials !== undefined || manifest.anatomyFit !== undefined || manifest.oralCavityFit !== undefined || manifest.dials !== undefined || manifest.recipeSource !== undefined || manifest.recipeUpdates !== undefined) {
+  if (
+    manifest.appearanceDials !== undefined ||
+    manifest.anatomyFit !== undefined ||
+    manifest.oralCavityFit !== undefined ||
+    manifest.dials !== undefined ||
+    manifest.recipeSource !== undefined ||
+    manifest.recipeUpdates !== undefined
+  ) {
     fail('Live manifest retains editable Recipe authoring definitions')
   }
   const rig = manifest.rig === undefined ? null : record(manifest.rig, 'avatar.json#rig')
   if (rig?.correctives !== undefined) fail('Live manifest retains authoring joint correctives')
   parseLiveJointCorrectives(rig?.liveCorrectives)
-  const parsed = parseSemanticGlb(input.modelBytes, { diagnosticPrefix: `${LIVE_GOON_BAKER_ID}:artifact-verifier` })
+  const parsed = parseSemanticGlb(input.modelBytes, {
+    diagnosticPrefix: `${LIVE_GOON_BAKER_ID}:artifact-verifier`
+  })
   validateStructuralExtensions(parsed)
   verifySocketEyeLiveMorphInventory(parsed, manifest)
   const morphs = inventoryMorphRefs(parsed)
-  if (canonicalRecipeString(morphs) !== canonicalRecipeString(liveManifest.inventory.liveMorphTargets)) {
+  if (
+    canonicalRecipeString(morphs) !== canonicalRecipeString(liveManifest.inventory.liveMorphTargets)
+  ) {
     fail('re-imported model morphs differ from the receipt inventory')
   }
-  if (liveManifest.counts.recipeMorphTargets !== 0 || liveManifest.counts.morphTargets !== morphs.length) {
+  if (
+    liveManifest.counts.recipeMorphTargets !== 0 ||
+    liveManifest.counts.morphTargets !== morphs.length
+  ) {
     fail('Live manifest morph counts are invalid')
   }
   return { manifest, liveManifest, receipt }
@@ -2215,6 +2655,7 @@ export async function bakeLiveGoon(
     ),
     verifyRecipeStateSnapshot(input.state)
   ])
+  const hair = await resolveSelectedHair(input, state)
   const appearanceManifest = parseAppearanceDialsManifest(verifiedAssets.manifest)
   if (!appearanceManifest) fail('Recipe Source does not contain appearance-dials/v2')
   onStage('evaluating-recipe')
@@ -2232,9 +2673,12 @@ export async function bakeLiveGoon(
     baseline,
     resolved: strict.resolved
   })
-  const evaluation = anatomyFitResults.length > 0
-    ? evaluateAppearanceRecipePhysicalOutput(basis, strict.resolved, { anatomyFitResults })
-    : baseline
+  const evaluation =
+    anatomyFitResults.length > 0
+      ? evaluateAppearanceRecipePhysicalOutput(basis, strict.resolved, {
+          anatomyFitResults
+        })
+      : baseline
   onStage('rewriting-model')
   const rewrite = buildStructuralLiveGlb(
     input.modelBytes,
@@ -2251,6 +2695,61 @@ export async function bakeLiveGoon(
     evaluation,
     rewrite
   )
+  const resolvedHairGlb = hair?.followerDefinition
+    ? bakeHairFollowerGlb({
+        hairGlb: hair.mainBytes,
+        definition: hair.followerDefinition,
+        state: strict.resolved
+      })
+    : hair?.mainBytes
+  const embeddedHairSecondaryMotion = hair?.physicsDefinition
+    ? await createEmbeddedSecondaryMotion(
+        hair.physicsDefinition,
+        strict.resolved,
+        hair.state.motionSettings
+      )
+    : undefined
+  const modelBytes = hair
+    ? composeHairIntoAvatarGlb({
+        sourceAvatarGlb: rewrite.bytes,
+        hairGlb: resolvedHairGlb!,
+        attachment: hair.asset.attachment,
+        material: {
+          asset: hair.asset,
+          state: hair.state,
+          neutralValueBytes: hair.neutralValueBytes,
+          highlightMaskBytes: hair.highlightMaskBytes,
+          normalBytes: hair.normalBytes,
+          roughnessBytes: hair.roughnessBytes
+        },
+        sourceSecondaryMotion: hair.physicsDefinition ?? undefined,
+        secondaryMotion: embeddedHairSecondaryMotion
+      })
+    : rewrite.bytes
+  const counts: GoonLiveBuildOutputCounts = hair
+    ? {
+        ...rewrite.counts,
+        meshes: rewrite.counts.meshes + hair.metrics.meshes,
+        vertices: rewrite.counts.vertices + hair.metrics.vertices,
+        nodes: rewrite.counts.nodes + hair.metrics.nodes
+      }
+    : rewrite.counts
+  const cost = hair
+    ? {
+        ...rewrite.cost,
+        inputBytes:
+          rewrite.cost.inputBytes +
+          hair.mainBytes.byteLength +
+          (hair.followerBytes?.byteLength ?? 0) +
+          (hair.physicsBytes?.byteLength ?? 0) +
+          hair.neutralValueBytes.byteLength +
+          hair.highlightMaskBytes.byteLength +
+          (hair.normalBytes?.byteLength ?? 0) +
+          (hair.roughnessBytes?.byteLength ?? 0),
+        meshesProcessed: rewrite.cost.meshesProcessed + hair.metrics.meshes,
+        verticesProcessed: rewrite.cost.verticesProcessed + hair.metrics.vertices
+      }
+    : rewrite.cost
   const source = sourceIdentity(input)
   const stateIdentity = { contract: state.contract, sha256: state.stateSha256 }
   const inventory = buildInventory(rewrite, verifiedAssets.manifest)
@@ -2261,7 +2760,7 @@ export async function bakeLiveGoon(
     baker: LIVE_GOON_BAKER_IDENTITY,
     inventory,
     proofs: structuralAudit.proofs,
-    counts: rewrite.counts
+    counts
   })
   onStage('packaging-live-goon')
   const manifest = createLiveAvatarManifest(
@@ -2271,12 +2770,12 @@ export async function bakeLiveGoon(
   )
   const manifestBytes = canonicalRecipeUtf8(manifest)
   const packageBytes = deterministicStoredZip([
-    { name: 'avatar.glb', bytes: rewrite.bytes },
+    { name: 'avatar.glb', bytes: modelBytes },
     { name: 'avatar.json', bytes: manifestBytes }
   ])
   const [packageSha256, modelSha256, manifestSha256] = await Promise.all([
     sha256Hex(packageBytes),
-    sha256Hex(rewrite.bytes),
+    sha256Hex(modelBytes),
     sha256Hex(manifestBytes)
   ])
   const receipt = await createGoonLiveBuildReceipt({
@@ -2291,23 +2790,23 @@ export async function bakeLiveGoon(
     },
     output: {
       package: { sha256: packageSha256, bytes: packageBytes.byteLength },
-      model: { sha256: modelSha256, bytes: rewrite.bytes.byteLength },
+      model: { sha256: modelSha256, bytes: modelBytes.byteLength },
       manifest: { sha256: manifestSha256, bytes: manifestBytes.byteLength },
-      counts: rewrite.counts
+      counts
     },
-    cost: rewrite.cost,
+    cost,
     validation: structuralAudit.validation
   })
   onStage('verifying-output')
   await verifyLiveGoonBakeArtifacts({
-    modelBytes: rewrite.bytes,
+    modelBytes,
     manifestBytes,
     packageBytes,
     receipt
   })
   return {
     contract: 'goon-live-bake-output/v1',
-    modelBytes: rewrite.bytes,
+    modelBytes,
     manifestBytes,
     packageBytes,
     manifest,

@@ -3,13 +3,18 @@ import { cp, lstat, mkdir, rm, symlink } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { shouldIgnoreNonCodeSigningPath } from './managed-runtime-portability.mjs';
+
+import { sign } from '@electron/osx-sign';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
 const packageRoot = resolve(macRoot, 'zig-out', 'package');
-const defaultAppPath = join(packageRoot, 'Batshit-0.1.0-macos-ReleaseSafe.app');
+const defaultAppPath = join(packageRoot, 'Batshit.app');
 const defaultDmgPath = join(packageRoot, 'Batshit-0.1.0-macos-ReleaseSafe.dmg');
 const defaultStagingRoot = join(packageRoot, 'release-dmg-staging');
 const entitlementsPath = join(macRoot, 'macos.entitlements');
+const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');
 
 function usage() {
   console.log(`Usage: npm run package:dmg -- [options]
@@ -155,39 +160,6 @@ function findDeveloperIdIdentity() {
   return match?.[1] || '';
 }
 
-function collectMachOCandidates(root) {
-  const result = run('find', [
-    root,
-    '-type',
-    'f',
-    '(',
-    '-perm',
-    '-111',
-    '-o',
-    '-name',
-    '*.dylib',
-    '-o',
-    '-name',
-    '*.node',
-    '-o',
-    '-name',
-    '*.so',
-    ')',
-    '-print0'
-  ], { encoding: false, stdio: ['ignore', 'pipe', 'inherit'] });
-  return Buffer.from(result.stdout || '')
-    .toString('utf8')
-    .split('\0')
-    .filter(Boolean)
-    .sort((a, b) => b.length - a.length);
-}
-
-function isMachO(path) {
-  const result = runCaptured('file', ['-b', path], { timeoutMs: 5000 });
-  if (!result.ok) return false;
-  return /\bMach-O\b/.test(result.stdout);
-}
-
 function codesign(path, identity, extraArgs = []) {
   run('codesign', [
     '--force',
@@ -206,23 +178,25 @@ function verifyCodesign(path) {
 }
 
 async function signAppBundle(appPath, identity) {
-  const mainExecutable = join(appPath, 'Contents', 'MacOS', 'batshit');
-  const candidates = collectMachOCandidates(appPath);
-  let signedNestedCount = 0;
-
-  for (const candidate of candidates) {
-    if (candidate === mainExecutable || !isMachO(candidate)) continue;
-    codesign(candidate, identity);
-    signedNestedCount += 1;
-  }
-
-  if (await exists(mainExecutable)) {
-    codesign(mainExecutable, identity, ['--entitlements', entitlementsPath]);
-  }
-
-  codesign(appPath, identity, ['--entitlements', entitlementsPath]);
+  const mainExecutable = join(appPath, 'Contents', 'MacOS', 'Batshit');
+  await sign({
+    app: appPath,
+    platform: 'darwin',
+    identity,
+    ignore: [shouldIgnoreNonCodeSigningPath],
+    preAutoEntitlements: false,
+    preEmbedProvisioningProfile: false,
+    strictVerify: true,
+    version: '43.3.0',
+    optionsForFile(filePath) {
+      if (filePath === appPath || filePath === mainExecutable) {
+        return { entitlements: entitlementsPath, hardenedRuntime: true };
+      }
+      if (/\((?:GPU|Plugin|Renderer)\)\.app(?:\/|$)/.test(filePath)) return null;
+      return { entitlements: childEntitlementsPath, hardenedRuntime: true };
+    }
+  });
   verifyCodesign(appPath);
-  return signedNestedCount;
 }
 
 async function stageApp(appPath) {
@@ -294,8 +268,6 @@ async function main() {
 
   requireExecutable('codesign');
   requireExecutable('hdiutil');
-  requireExecutable('file');
-  requireExecutable('find');
   requireXcrunTool('notarytool');
   requireXcrunTool('stapler');
 
@@ -321,8 +293,8 @@ async function main() {
   const stagedApp = await stageApp(options.appPath);
 
   console.log('==> Signing Batshit.app with Developer ID');
-  const signedNestedCount = await signAppBundle(stagedApp, identity);
-  console.log(`==> Signed ${signedNestedCount} nested Mach-O file(s) plus Batshit.app`);
+  await signAppBundle(stagedApp, identity);
+  console.log('==> Signed Batshit.app and the complete Electron helper/framework graph');
 
   console.log('==> Creating DMG');
   await createDmg(defaultStagingRoot, options.dmgPath, options.volumeName);

@@ -4,10 +4,15 @@ import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promi
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  inspectManagedRuntimePortability,
+  MAC_RUNTIME_MINIMUM_VERSION
+} from './managed-runtime-portability.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
 const repoRoot = resolve(macRoot, '..');
-const packagePath = resolve(process.argv[2] || join(macRoot, 'zig-out/package/Batshit-0.1.0-macos-ReleaseSafe.app'));
+const packagePath = resolve(process.argv[2] || join(macRoot, 'zig-out/package/Batshit.app'));
 const resourcesPath = join(packagePath, 'Contents', 'Resources');
 const runtimePath = join(resourcesPath, 'runtime');
 
@@ -18,6 +23,7 @@ const facialArtworkSource = join(appSource, 'static', 'goons', 'facial-artwork',
 const lipArtworkSource = join(appSource, 'static', 'goons', 'lip-artwork', 'v2');
 const nailSurfaceSource = join(appSource, 'static', 'goons', 'nail-surface', 'v1');
 const skinAppearanceSource = join(appSource, 'static', 'goons', 'skin-appearance', 'v1');
+const hairCatalogSource = join(appSource, 'static', 'goon-assets', 'hair', 'v1');
 const appDest = join(runtimePath, 'batshit-app');
 const serverDest = join(runtimePath, 'batshit-server', 'server');
 const liveKitSidecarDest = join(runtimePath, 'tools', 'livekit-agent-sidecar');
@@ -25,10 +31,10 @@ const facialArtworkDest = join(runtimePath, 'assets', 'goons', 'facial-artwork',
 const lipArtworkDest = join(runtimePath, 'assets', 'goons', 'lip-artwork', 'v2');
 const nailSurfaceDest = join(runtimePath, 'assets', 'goons', 'nail-surface', 'v1');
 const skinAppearanceDest = join(runtimePath, 'assets', 'goons', 'skin-appearance', 'v1');
+const hairCatalogDest = join(appDest, 'static', 'goon-assets', 'hair', 'v1');
 const nodeRuntimeDest = join(runtimePath, 'vendor', 'node');
 const redisStackRuntimeDest = join(runtimePath, 'vendor', 'redis-stack');
 const ffmpegRuntimeDest = join(runtimePath, 'vendor', 'ffmpeg');
-const entitlementsPath = join(macRoot, 'macos.entitlements');
 const thirdPartyNoticesSource = join(repoRoot, 'THIRD_PARTY_NOTICES.md');
 
 async function exists(path) {
@@ -74,23 +80,14 @@ function shouldSkipCopiedPath(relativePath) {
   return false;
 }
 
-function plistEscape(value) {
-  return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
-}
-
-async function ensureInfoPlistStringKey(plistPath, key, value) {
-  let content = await readFile(plistPath, 'utf8');
-  if (content.includes(`<key>${key}</key>`)) return;
-  const insertion = `  <key>${key}</key>\n  <string>${plistEscape(value)}</string>\n`;
-  if (!content.includes('</dict>')) {
-    throw new Error(`Info.plist is missing closing </dict>: ${plistPath}`);
-  }
-  content = content.replace('</dict>', `${insertion}</dict>`);
-  await writeFile(plistPath, content);
+function setInfoPlistStringKey(plistPath, key, value) {
+  const replace = spawnSync('plutil', ['-replace', key, '-string', value, plistPath], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  if (replace.status === 0) return;
+  runChecked('plutil', ['-insert', key, '-string', value, plistPath]);
 }
 
 async function copyRequired(source, dest) {
@@ -211,6 +208,29 @@ async function copySkinAppearanceAssets() {
   };
 }
 
+async function copyHairCatalogAssets() {
+  await copyRequired(hairCatalogSource, hairCatalogDest);
+  const files = await inventoryFiles(hairCatalogSource);
+  const catalog = files.find((entry) => entry.path === 'catalog.json');
+  if (!catalog) {
+    throw new Error('Hair Asset package input is incomplete: expected the hair-catalog/v1 catalog.');
+  }
+  const parsed = JSON.parse(await readFile(join(hairCatalogSource, 'catalog.json'), 'utf8'));
+  if (
+    parsed?.schemaVersion !== 'hair-catalog/v1' ||
+    !Array.isArray(parsed?.assets) ||
+    Object.keys(parsed).sort().join(',') !== 'assets,schemaVersion'
+  ) {
+    throw new Error('Hair Asset package input contains an invalid hair-catalog/v1 catalog.');
+  }
+  return {
+    contract: 'hair-catalog/v1',
+    root: 'batshit-app/static/goon-assets/hair/v1',
+    definition: 'catalog.json',
+    files
+  };
+}
+
 async function firstExistingPath(base, candidates) {
   for (const candidate of candidates) {
     const target = join(base, candidate);
@@ -262,7 +282,11 @@ async function copyLiveKitSidecarSourcePackage() {
 
 async function copyManagedNodeRuntime() {
   const source = process.env.BATSHIT_MAC_NODE_DIST_DIR || process.env.BATSHIT_MAC_NODE_RUNTIME_DIR;
-  if (!source) return null;
+  if (!source) {
+    throw new Error(
+      'BATSHIT_MAC_NODE_DIST_DIR is required because the packaged Electron shell cannot start Batshit services without its app-owned Node.js runtime. Run npm run prepare:managed-runtimes, source the generated environment file it reports, then run npm run package:mac.'
+    );
+  }
 
   const resolvedSource = resolve(source);
   const nodeBin = join(resolvedSource, 'bin', 'node');
@@ -273,6 +297,12 @@ async function copyManagedNodeRuntime() {
   if (!(await exists(licensePath))) {
     throw new Error(`BATSHIT_MAC_NODE_DIST_DIR must include Node license files: ${licensePath}`);
   }
+  const portability = await inspectManagedRuntimePortability(resolvedSource);
+  if (!portability.ok) {
+    throw new Error(
+      `BATSHIT_MAC_NODE_DIST_DIR is not clean-machine portable:\n- ${portability.issues.join('\n- ')}`
+    );
+  }
   const proof = await runtimeProofFiles(resolvedSource, 'BATSHIT_MAC_NODE_DIST_DIR');
 
   await copyRequired(resolvedSource, nodeRuntimeDest);
@@ -280,6 +310,7 @@ async function copyManagedNodeRuntime() {
     node: {
       distribution: 'Node.js official macOS arm64 runtime archive',
       appBundlePath: 'Contents/Resources/runtime/vendor/node',
+      minimumMacosVersion: MAC_RUNTIME_MINIMUM_VERSION,
       license: 'Contents/Resources/runtime/vendor/node/LICENSE',
       sourceReference: `Contents/Resources/runtime/vendor/node/${proof.sourceReference}`,
       checksums: `Contents/Resources/runtime/vendor/node/${proof.checksums}`
@@ -299,13 +330,24 @@ async function copyManagedRedisStackRuntime() {
     'bin/redis-cli',
     'lib/redisearch.so',
     'lib/rejson.so',
+    'lib/libssl.3.dylib',
+    'lib/libcrypto.3.dylib',
     'share/RSALv2.txt',
-    'share/SSPLv1.txt'
+    'share/SSPLv1.txt',
+    'share/openssl/LICENSE.txt',
+    'share/openssl/SOURCE.txt',
+    'share/openssl/CHECKSUMS.txt'
   ];
   for (const relative of requiredFiles) {
     if (!(await exists(join(resolvedSource, relative)))) {
       throw new Error(`BATSHIT_MAC_REDIS_STACK_DIST_DIR is missing ${relative}: ${resolvedSource}`);
     }
+  }
+  const portability = await inspectManagedRuntimePortability(resolvedSource);
+  if (!portability.ok) {
+    throw new Error(
+      `BATSHIT_MAC_REDIS_STACK_DIST_DIR is not clean-machine portable:\n- ${portability.issues.join('\n- ')}`
+    );
   }
   const proof = await runtimeProofFiles(resolvedSource, 'BATSHIT_MAC_REDIS_STACK_DIST_DIR');
 
@@ -316,8 +358,14 @@ async function copyManagedRedisStackRuntime() {
       appBundlePath: 'Contents/Resources/runtime/vendor/redis-stack',
       licenses: [
         'Contents/Resources/runtime/vendor/redis-stack/share/RSALv2.txt',
-        'Contents/Resources/runtime/vendor/redis-stack/share/SSPLv1.txt'
+        'Contents/Resources/runtime/vendor/redis-stack/share/SSPLv1.txt',
+        'Contents/Resources/runtime/vendor/redis-stack/share/openssl/LICENSE.txt'
       ],
+      bundledOpenSslSource:
+        'Contents/Resources/runtime/vendor/redis-stack/share/openssl/SOURCE.txt',
+      bundledOpenSslChecksums:
+        'Contents/Resources/runtime/vendor/redis-stack/share/openssl/CHECKSUMS.txt',
+      minimumMacosVersion: MAC_RUNTIME_MINIMUM_VERSION,
       sourceReference: `Contents/Resources/runtime/vendor/redis-stack/${proof.sourceReference}`,
       checksums: `Contents/Resources/runtime/vendor/redis-stack/${proof.checksums}`
     }
@@ -394,6 +442,12 @@ async function copyManagedFfmpegRuntime() {
       'BATSHIT_MAC_FFMPEG_DIST_DIR must include the h264_videotoolbox encoder so the Mac app can avoid a bundled libx264/GPL dependency.'
     );
   }
+  const portability = await inspectManagedRuntimePortability(resolvedSource);
+  if (!portability.ok) {
+    throw new Error(
+      `BATSHIT_MAC_FFMPEG_DIST_DIR is not clean-machine portable:\n- ${portability.issues.join('\n- ')}`
+    );
+  }
 
   await copyRequired(resolvedSource, ffmpegRuntimeDest);
   return {
@@ -403,6 +457,7 @@ async function copyManagedFfmpegRuntime() {
       version: versionOutput.split(/\r?\n/).find(Boolean) || null,
       licenseMode: gplEnabled ? 'GPL-enabled' : 'LGPL-compatible',
       h264Encoder: 'h264_videotoolbox',
+      minimumMacosVersion: MAC_RUNTIME_MINIMUM_VERSION,
       license: `Contents/Resources/runtime/vendor/ffmpeg/${license}`,
       buildConfig: `Contents/Resources/runtime/vendor/ffmpeg/${buildConfig}`,
       sourceReference: `Contents/Resources/runtime/vendor/ffmpeg/${proof.sourceReference}`,
@@ -428,6 +483,10 @@ async function main() {
 
   await mkdir(join(resourcesPath, 'scripts'), { recursive: true });
   await cp(join(macRoot, 'scripts', 'mac-runtime-supervisor.mjs'), join(resourcesPath, 'scripts', 'mac-runtime-supervisor.mjs'));
+  await cp(
+    join(macRoot, 'scripts', 'managed-runtime-portability.mjs'),
+    join(resourcesPath, 'scripts', 'managed-runtime-portability.mjs')
+  );
   await copyRequiredFile(thirdPartyNoticesSource, join(resourcesPath, 'THIRD_PARTY_NOTICES.md'));
 
   await rm(runtimePath, { recursive: true, force: true });
@@ -468,6 +527,7 @@ async function main() {
   const lipArtworkAssets = await copyLipArtworkAssets();
   const nailSurfaceAssets = await copyNailSurfaceAssets();
   const skinAppearanceAssets = await copySkinAppearanceAssets();
+  const hairCatalogAssets = await copyHairCatalogAssets();
   await copyLiveKitSidecarSourcePackage();
   const managedRuntimeEntries = await Promise.all([
     copyManagedNodeRuntime(),
@@ -490,7 +550,8 @@ async function main() {
           facialArtwork: facialArtworkAssets,
           lipArtwork: lipArtworkAssets,
           nailSurface: nailSurfaceAssets,
-          skinAppearance: skinAppearanceAssets
+          skinAppearance: skinAppearanceAssets,
+          hairCatalog: hairCatalogAssets
         },
         managedRuntimes
       },
@@ -499,25 +560,22 @@ async function main() {
     )}\n`
   );
 
-  await ensureInfoPlistStringKey(
+  setInfoPlistStringKey(
     join(packagePath, 'Contents', 'Info.plist'),
     'NSMicrophoneUsageDescription',
     'Batshit uses your microphone for speech-to-text, voice mode, and LiveKit voice sessions when you turn voice features on.'
   );
-  await ensureInfoPlistStringKey(
+  setInfoPlistStringKey(
     join(packagePath, 'Contents', 'Info.plist'),
     'NSSpeechRecognitionUsageDescription',
     'Batshit uses speech recognition for Browser speech-to-text and Voice Mode when you choose the browser speech engine.'
   );
+  setInfoPlistStringKey(
+    join(packagePath, 'Contents', 'Info.plist'),
+    'LSMinimumSystemVersion',
+    MAC_RUNTIME_MINIMUM_VERSION
+  );
 
-  if (process.platform === 'darwin') {
-    const args = ['--force', '--deep', '--sign', '-'];
-    if (await exists(entitlementsPath)) {
-      args.push('--entitlements', entitlementsPath);
-    }
-    args.push(packagePath);
-    runChecked('codesign', args);
-  }
 }
 
 await main();
