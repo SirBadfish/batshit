@@ -5,6 +5,7 @@ const lifecycle = vi.hoisted(() => ({
   discardRecipePackageAnalysis: vi.fn(),
   getRecipePackageAnalysis: vi.fn(),
   getPreviousRecipeRevisionPreview: vi.fn(),
+  resetRetiredHairRecipeState: vi.fn(),
   restorePreviousRecipeRevision: vi.fn(),
   selectRecipeCleanReset: vi.fn(),
   reviewRecipePackageState: vi.fn(),
@@ -25,6 +26,7 @@ import { POST as resetAnalysis } from './analysis/reset/+server'
 import { POST as reviewState } from './analysis/review-state/+server'
 import { POST as startBake } from './bake/start/+server'
 import { POST as startPackageUpdate } from './start/+server'
+import { POST as resetRetiredHair } from './recover-retired-hair/+server'
 import { POST as registerCandidateAssets } from './jobs/[jobId]/candidate-assets/+server'
 import { POST as stageCandidate } from './jobs/[jobId]/stage/+server'
 import { GET as previewRollback } from './rollback/+server'
@@ -92,6 +94,21 @@ describe('Recipe lifecycle routes', () => {
       expectedUpdatedAt: '2026-07-17T10:00:00.000Z',
       receipt,
       state
+    })
+  })
+
+  it('keeps retired Hair recovery server-owned and revision-guarded', async () => {
+    const response = await resetRetiredHair(event({
+      expectedWriteVersion: 7,
+      replacementHairState: { forged: true },
+      appearanceDials: { forged: true }
+    }))
+
+    expect(response.status).toBe(200)
+    expect(lifecycle.resetRetiredHairRecipeState).toHaveBeenCalledWith({
+      userId: USER_ID,
+      goonId: GOON_ID,
+      expectedWriteVersion: 7
     })
   })
 

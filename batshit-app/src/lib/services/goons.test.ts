@@ -3,19 +3,83 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createGoon,
   deleteGoonFacialArtwork,
+  persistGoonCamera,
+  resetRetiredGoonHair,
   uploadAdvancedGoonPackage,
   uploadGoonFacialArtwork,
   uploadGoonLipArtwork,
   uploadGoonNailArtwork,
   uploadGuidedDufClothesVrm
 } from './goons'
+import { getGoons, setGoons } from '$lib/stores/goons.svelte'
+import type { GoonRecord } from '$lib/types/goons'
 
 describe('goons service create flow', () => {
   const originalFetch = global.fetch
 
   afterEach(() => {
     global.fetch = originalFetch
+    setGoons([])
     vi.restoreAllMocks()
+  })
+
+  it('persists editor camera changes without invalidating the global Goon collection', async () => {
+    const original = {
+      id: 'goon_custom_1',
+      name: 'Unsaved editor draft owner',
+      camera: { position: [0, 1, 2] }
+    } as GoonRecord
+    setGoons([original])
+    const storedBefore = getGoons()[0]
+    const camera = { position: [2, 3, 4] } as NonNullable<GoonRecord['camera']>
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('/api/goons/goon_custom_1')
+      expect(init?.method).toBe('PUT')
+      expect(JSON.parse(String(init?.body))).toEqual({ camera })
+      return new Response(
+        JSON.stringify({
+          goon: {
+            ...original,
+            camera,
+            updated_at: '2026-08-10T00:00:00.000Z'
+          }
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    }) as typeof fetch
+
+    await persistGoonCamera(original.id, camera)
+
+    expect(getGoons()).toHaveLength(1)
+    expect(getGoons()[0]).toBe(storedBefore)
+    expect(getGoons()[0]?.camera).toEqual({ position: [0, 1, 2] })
+  })
+
+  it('resets retired Hair through the dedicated Recipe route and refreshes the stored Goon', async () => {
+    const original = {
+      id: 'goon_custom_1',
+      user_id: 'user_1',
+      name: 'Hair recovery owner',
+      files: {},
+      recipe: { contract: 'goon-recipe/v2', writeVersion: 4 },
+      hairState: { schemaVersion: 'hair-state/v1' }
+    } as unknown as GoonRecord
+    const recovered = structuredClone(original)
+    recovered.recipe = { contract: 'goon-recipe/v2', writeVersion: 5 } as GoonRecord['recipe']
+    delete recovered.hairState
+    setGoons([original])
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('/api/goons/goon_custom_1/recipe/recover-retired-hair')
+      expect(init?.method).toBe('POST')
+      expect(JSON.parse(String(init?.body))).toEqual({ expectedWriteVersion: 4 })
+      return new Response(JSON.stringify({ goon: recovered }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    }) as typeof fetch
+
+    await expect(resetRetiredGoonHair(original.id, 4)).resolves.toEqual(recovered)
+    expect(getGoons()[0]).toEqual(recovered)
   })
 
   it('submits custom goon creation with kind=custom', async () => {
@@ -44,7 +108,9 @@ describe('goons service create flow', () => {
 
     global.fetch = fetchMock as typeof fetch
 
-    const file = new File(['package'], 'kiriko.bgoon', { type: 'application/octet-stream' })
+    const file = new File(['package'], 'kiriko.bgoon', {
+      type: 'application/octet-stream'
+    })
     const goon = await createGoon({ kind: 'custom', file })
 
     expect(goon.kind).toBe('custom')
@@ -96,7 +162,9 @@ describe('goons service create flow', () => {
       })
     }) as typeof fetch
 
-    const file = new File(['package'], 'kiriko.bgoon', { type: 'application/octet-stream' })
+    const file = new File(['package'], 'kiriko.bgoon', {
+      type: 'application/octet-stream'
+    })
 
     await expect(createGoon({ kind: 'custom', file })).rejects.toThrow(
       'File too large. 350 MB or smaller.'
@@ -161,7 +229,13 @@ describe('goons service create flow', () => {
           manifestData: {
             summary: { name: 'Kiriko V2', contractVersion: 1 },
             outfitPieces: [{ id: 'jacket', label: 'Jacket', runtimeNodeNames: ['Jacket'] }],
-            outfitPresets: [{ id: 'all_original', name: 'All Original', piecesOn: ['jacket'] }]
+            outfitPresets: [
+              {
+                id: 'all_original',
+                name: 'All Original',
+                piecesOn: ['jacket']
+              }
+            ]
           }
         }),
         {
@@ -284,19 +358,15 @@ describe('goons service create flow', () => {
     global.fetch = fetchMock as typeof fetch
 
     await expect(
-      uploadGoonLipArtwork(
-        'goon_custom_1',
-        new File(['png'], 'lips.png', { type: 'image/png' }),
-        {
-          definitionSha256,
-          provenance: {
-            sourceKind: 'user-authored',
-            author: 'Fixture Artist',
-            license: 'User-owned',
-            rightsConfirmed: true
-          }
+      uploadGoonLipArtwork('goon_custom_1', new File(['png'], 'lips.png', { type: 'image/png' }), {
+        definitionSha256,
+        provenance: {
+          sourceKind: 'user-authored',
+          author: 'Fixture Artist',
+          license: 'User-owned',
+          rightsConfirmed: true
         }
-      )
+      })
     ).resolves.toMatchObject({ filename: 'lips.png' })
   })
 
@@ -305,12 +375,7 @@ describe('goons service create flow', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       expect(String(input)).toBe('/api/goons/goon_custom_1/nail-artwork')
       const form = init?.body as FormData
-      expect([...form.keys()].sort()).toEqual([
-        'definitionSha256',
-        'family',
-        'file',
-        'provenance'
-      ])
+      expect([...form.keys()].sort()).toEqual(['definitionSha256', 'family', 'file', 'provenance'])
       expect(form.get('family')).toBe('fingers')
       return new Response(
         JSON.stringify({

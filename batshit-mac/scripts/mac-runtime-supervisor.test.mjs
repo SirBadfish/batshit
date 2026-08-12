@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import {
   attemptSafeRedisShutdown,
+  auditElectronPackage,
   cleanupAbandonedRedisTempSnapshots,
   chooseRedisShutdownMode,
   createServiceDefinitions,
@@ -14,6 +15,57 @@ import {
   publishJsonAtomically,
   redisStatusProvesStopped
 } from './mac-runtime-supervisor.mjs';
+
+async function writeElectronPackageFixture(root, { omit = null } = {}) {
+  const resources = join(root, 'Contents', 'Resources');
+  const framework = join(root, 'Contents', 'Frameworks', 'Electron Framework.framework');
+  await mkdir(resources, { recursive: true });
+  await writeFile(join(resources, 'app.asar'), 'immutable shell');
+  for (const relative of [
+    'Versions/A/Electron Framework',
+    'Versions/A/Resources/icudtl.dat',
+    'Versions/A/Resources/chrome_100_percent.pak',
+    'Versions/A/Resources/en.lproj/locale.pak'
+  ]) {
+    if (relative === omit) continue;
+    const path = join(framework, relative);
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, 'runtime');
+  }
+  for (const helperName of [
+    'Batshit Helper',
+    'Batshit Helper (GPU)',
+    'Batshit Helper (Plugin)',
+    'Batshit Helper (Renderer)'
+  ]) {
+    const helperContents = join(
+      root,
+      'Contents',
+      'Frameworks',
+      `${helperName}.app`,
+      'Contents'
+    );
+    await mkdir(join(helperContents, 'MacOS'), { recursive: true });
+    await writeFile(join(helperContents, 'MacOS', helperName), 'helper');
+    await writeFile(join(helperContents, 'Info.plist'), '<plist/>');
+  }
+}
+
+test('Electron package audit accepts the standard hidden-helper packaging', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-electron-package-'));
+  await writeElectronPackageFixture(root);
+
+  assert.deepEqual(await auditElectronPackage(root), []);
+});
+
+test('Electron package audit fails when its pinned Chromium runtime is incomplete', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-electron-incomplete-'));
+  await writeElectronPackageFixture(root, { omit: 'Versions/A/Resources/icudtl.dat' });
+
+  assert.deepEqual(await auditElectronPackage(root), [
+    'The Electron package is missing required Chromium runtime file: Versions/A/Resources/icudtl.dat'
+  ]);
+});
 
 const healthyAofInfo = {
   aof_enabled: '1',

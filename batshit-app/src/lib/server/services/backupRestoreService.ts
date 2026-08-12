@@ -984,6 +984,8 @@ function remapUserKey(key: string, sourceUserId: string, targetUserId: string) {
     [`goon_recipe_revision:${sourceUserId}:`, `goon_recipe_revision:${targetUserId}:`],
     [`goon_recipe_document:${sourceUserId}:`, `goon_recipe_document:${targetUserId}:`],
     [`goon_recipe_job:${sourceUserId}:`, `goon_recipe_job:${targetUserId}:`],
+    [`hair_asset:${sourceUserId}:`, `hair_asset:${targetUserId}:`],
+    [`hair_refit_source:${sourceUserId}:`, `hair_refit_source:${targetUserId}:`],
     [`voice_engine_registry:${sourceUserId}`, `voice_engine_registry:${targetUserId}`],
     [`user_artifact_usage:${sourceUserId}`, `user_artifact_usage:${targetUserId}`]
   ]
@@ -1122,7 +1124,10 @@ function groupForKey(key: string, userId: string): BackupGroupId {
   }
   if (
     key === `user:${userId}:goons` ||
+    key === `user:${userId}:hair_assets` ||
     key.startsWith('goon:') ||
+    key.startsWith(`hair_asset:${userId}:`) ||
+    key.startsWith(`hair_refit_source:${userId}:`) ||
     key.startsWith(`goon_recipe_revision:${userId}:`) ||
     key.startsWith(`goon_recipe_document:${userId}:`) ||
     key.startsWith(`goon_recipe_job:${userId}:`)
@@ -1169,6 +1174,7 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `user:${userId}:models`,
     `user:${userId}:clips`,
     `user:${userId}:goons`,
+    `user:${userId}:hair_assets`,
     `user:${userId}:icons`,
     `user:${userId}:artifacts`,
     `user:${userId}:voice_profiles`,
@@ -1197,7 +1203,9 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `skill:${userId}:`,
     `goon_recipe_revision:${userId}:`,
     `goon_recipe_document:${userId}:`,
-    `goon_recipe_job:${userId}:`
+    `goon_recipe_job:${userId}:`,
+    `hair_asset:${userId}:`,
+    `hair_refit_source:${userId}:`
   ]
   if (userPrefixes.some((prefix) => key.startsWith(prefix))) return true
 
@@ -1321,6 +1329,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     `user:${userId}:models`,
     `user:${userId}:clips`,
     `user:${userId}:goons`,
+    `user:${userId}:hair_assets`,
     `user:${userId}:icons`,
     `user:${userId}:artifacts`,
     `user:${userId}:voice_profiles`,
@@ -1415,6 +1424,8 @@ async function collectCandidateKeys(client: any, userId: string) {
   await addPatternKeys(keys, client, `goon_recipe_revision:${userId}:*`)
   await addPatternKeys(keys, client, `goon_recipe_document:${userId}:*`)
   await addPatternKeys(keys, client, `goon_recipe_job:${userId}:*`)
+  await addPatternKeys(keys, client, `hair_asset:${userId}:*`)
+  await addPatternKeys(keys, client, `hair_refit_source:${userId}:*`)
   await addPatternKeys(keys, client, 'clip:system:*')
   await addPatternKeys(keys, client, 'upload:*')
   await addPatternKeys(keys, client, 'zip:*')

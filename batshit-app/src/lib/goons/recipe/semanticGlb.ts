@@ -78,6 +78,7 @@ const GLB_VERSION = 2;
 const GLB_JSON_CHUNK = 0x4e4f534a;
 const GLB_BINARY_CHUNK = 0x004e4942;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
+const ENCODER = new TextEncoder();
 const MAX_DECODED_ACCESSOR_BYTES = 256 * 1024 * 1024;
 
 const COMPONENT_BYTES: Record<number, number> = {
@@ -214,6 +215,52 @@ function readUint32(
     fail(prefix, `${context} is out of bounds`);
   }
   return view.getUint32(offset, true);
+}
+
+function alignGlbChunk(value: number, prefix: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    fail(prefix, "GLB chunk byte length is invalid");
+  }
+  return Math.ceil(value / 4) * 4;
+}
+
+export function writeDeterministicSemanticGlb(
+  gltf: SemanticGltfRecord,
+  binary: Uint8Array,
+  options: ParseSemanticGlbOptions = {},
+): Uint8Array {
+  const prefix = diagnosticPrefix(
+    options.diagnosticPrefix ?? DEFAULT_DIAGNOSTIC_PREFIX,
+  );
+  canonicalRecipeString(gltf);
+  if (
+    !ArrayBuffer.isView(binary) ||
+    !('BYTES_PER_ELEMENT' in binary) ||
+    binary.BYTES_PER_ELEMENT !== 1
+  ) {
+    fail(prefix, "GLB binary must be a Uint8Array");
+  }
+  const json = ENCODER.encode(canonicalRecipeString(gltf));
+  const jsonLength = alignGlbChunk(json.byteLength, prefix);
+  const binaryLength = alignGlbChunk(binary.byteLength, prefix);
+  const total = 12 + 8 + jsonLength + 8 + binaryLength;
+  if (!Number.isSafeInteger(total) || total > 0xffffffff) {
+    fail(prefix, "GLB exceeds the glTF 2.0 32-bit length limit");
+  }
+  const output = new Uint8Array(total);
+  const view = new DataView(output.buffer);
+  view.setUint32(0, GLB_MAGIC, true);
+  view.setUint32(4, GLB_VERSION, true);
+  view.setUint32(8, total, true);
+  view.setUint32(12, jsonLength, true);
+  view.setUint32(16, GLB_JSON_CHUNK, true);
+  output.fill(0x20, 20, 20 + jsonLength);
+  output.set(json, 20);
+  const binaryHeader = 20 + jsonLength;
+  view.setUint32(binaryHeader, binaryLength, true);
+  view.setUint32(binaryHeader + 4, GLB_BINARY_CHUNK, true);
+  output.set(binary, binaryHeader + 8);
+  return output;
 }
 
 export function semanticGlbRuntimeNodeName(name: string): string {

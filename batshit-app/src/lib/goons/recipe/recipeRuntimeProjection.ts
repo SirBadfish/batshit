@@ -18,6 +18,10 @@ import type {
 export const GOON_RECIPE_FIT_RECEIPT_CONTRACT =
   "goon-recipe-fit-receipt/v1" as const;
 
+export const RETIRED_HAIR_STATE_CONTRACT = "hair-state/v1" as const;
+export const CURRENT_HAIR_STATE_CONTRACT = "hair-state/v2" as const;
+const RECIPE_HAIR_SIBLING_IDS = new Set(["hairState", "hair-state"]);
+
 export const GOON_RECIPE_FIT_SURFACES = [
   "hair",
   "clothing",
@@ -61,6 +65,7 @@ type RecipeSiblingProjection = Pick<
   | "nailSurfacePresence"
   | "skinAppearance"
   | "skinMaterialArtwork"
+  | "hairState"
 >;
 
 const SIBLING_PROJECTIONS = [
@@ -109,6 +114,11 @@ const SIBLING_PROJECTIONS = [
     contracts: ["skin-material-artwork-state/v1", "skin-material-artwork-state/v2"],
     ids: ["skinMaterialArtwork", "skin-material-artwork"],
   },
+  {
+    field: "hairState",
+    contracts: ["hair-state/v2"],
+    ids: ["hairState", "hair-state"],
+  },
 ] as const;
 
 const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -116,6 +126,23 @@ const FIT_SURFACE_SET = new Set<string>(GOON_RECIPE_FIT_SURFACES);
 
 function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/**
+ * Identify the one retired Hair surface that may be explicitly discarded.
+ * This never treats an unknown or malformed sibling as recoverable Hair.
+ */
+export function findRetiredHairRecipeSibling(
+  state: Pick<RecipeStateSnapshot, "siblings">,
+): RecipeSiblingStateRecord | null {
+  const matches = state.siblings.filter((sibling) =>
+    RECIPE_HAIR_SIBLING_IDS.has(sibling.id),
+  );
+  if (matches.length > 1) {
+    throw new Error("Recipe State ambiguously binds more than one Hair sibling.");
+  }
+  const sibling = matches[0];
+  return sibling?.contract === RETIRED_HAIR_STATE_CONTRACT ? sibling : null;
 }
 
 function requiredRecord(value: unknown, context: string): Record<string, unknown> {
@@ -368,6 +395,7 @@ function applySiblingProjection(
     "nailSurfacePresence",
     "skinAppearance",
     "skinMaterialArtwork",
+    "hairState",
   ] as const) {
     const value = projection[field];
     if (value) goon[field] = value as never;

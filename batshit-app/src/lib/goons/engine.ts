@@ -56,10 +56,7 @@ import {
   resolveEyeLookExpressionWeights
 } from '$lib/goons/eyeContact'
 import type { EyeContactTravelDirection } from '$lib/goons/eyeContact'
-import {
-  BUILTIN_GOON_POSTURES,
-  resolveBasePosture
-} from '$lib/goons/postures'
+import { BUILTIN_GOON_POSTURES, resolveBasePosture } from '$lib/goons/postures'
 import { DEFAULT_TRIM_TEXTURE } from '$lib/goons/roomTextures'
 import {
   RoomShellGeometryBuilder,
@@ -143,6 +140,11 @@ import {
   normalizePaintedConcealMask
 } from '$lib/goons/paintedConcealMasks'
 import {
+  expandHairMotionTriangleRanges,
+  parseHairMotionPaint,
+  type HairMotionPaintV1
+} from '$lib/goons/hairMotionPaint'
+import {
   DEFAULT_GOON_LIP_SYNC_MODE,
   downmixGoonLipSyncFrameToLegacy,
   getGoonLipSyncOpenness,
@@ -163,10 +165,7 @@ import {
 } from '$lib/goons/speechFaceProfiles'
 import { getXWearMaterials, resolveXWearLayersForMaterial } from '$lib/utils/xwear'
 import { findNearestValidStandingPoint } from '$lib/goons/standing'
-import {
-  probeNearestStandingSurfaceY,
-  probeStandingSurfaceY
-} from '$lib/goons/standingSurface'
+import { probeNearestStandingSurfaceY, probeStandingSurfaceY } from '$lib/goons/standingSurface'
 import {
   captureMarkerFromAvatarPlacement,
   rebindMarkerPreservingWorldPlacement,
@@ -198,6 +197,34 @@ import {
 } from '$lib/goons/customCompatibility'
 import { selectCueFacePayload } from '$lib/goons/cueFaceProfiles'
 import {
+  attachRigidHairAsset,
+  summarizeHairAsset,
+  type HairAttachmentSummary
+} from '$lib/goons/hairAttachmentRuntime'
+import { verifyHairAsset, type HairAssetV1 } from '$lib/goons/hairAssets'
+import type { HairStateV2 } from '$lib/goons/hairAssets'
+import { verifyHairFollowerDefinitionBytes } from '$lib/goons/hairFollowers'
+import {
+  HairFollowerEngineRuntime,
+  type HairFollowerRuntimeHandle
+} from '$lib/goons/hairFollowers.engine'
+import {
+  applyEmbeddedHairMaterials,
+  applyHairAssetMaterial,
+  type HairMaterialRuntimeHandle
+} from '$lib/goons/hairMaterial.engine'
+import {
+  parseEmbeddedSecondaryMotion,
+  HAIR_ROOT_WEIGHTED_TIP_ATTRIBUTE,
+  resolveSecondaryMotionChains,
+  resolveSecondaryMotionColliders,
+  runtimeSecondaryMotionDefinition,
+  verifyHairSecondaryMotionDefinitionBytes,
+  type SecondaryMotionDefinitionV1,
+  type SecondaryMotionTuning
+} from '$lib/goons/secondaryMotion'
+import { SecondaryMotionEngineRuntime } from '$lib/goons/secondaryMotion.engine'
+import {
   bindCustomPerformanceRig,
   composeCustomPerformanceEyeContact,
   hasCustomPerformanceAuthoredEyeDirection,
@@ -218,24 +245,13 @@ import {
   resolveBodyDialState,
   type BodyDialsManifest
 } from '$lib/goons/bodyDials'
-import {
-  AppearanceDialsEngineRuntime
-} from '$lib/goons/appearanceDials.engine'
-import type {
-  AppearanceDialValueState,
-  AppearanceDialsManifest
-} from '$lib/goons/appearanceDials'
+import { AppearanceDialsEngineRuntime } from '$lib/goons/appearanceDials.engine'
+import type { AppearanceDialValueState, AppearanceDialsManifest } from '$lib/goons/appearanceDials'
 import type { AnatomyFitResult } from '$lib/goons/recipe/anatomyFitContracts'
 import { FacialArtworkEngineRuntime } from '$lib/goons/facialArtwork.engine'
-import {
-  type FacialArtworkDefinitionV4,
-  type FacialArtworkStateV4
-} from '$lib/goons/facialArtwork'
+import { type FacialArtworkDefinitionV4, type FacialArtworkStateV4 } from '$lib/goons/facialArtwork'
 import { EyeAppearanceEngineRuntime } from '$lib/goons/eyeAppearance.engine'
-import {
-  type EyeAppearanceDefinitionV3,
-  type EyeAppearanceStateV3
-} from '$lib/goons/eyeAppearance'
+import { type EyeAppearanceDefinitionV3, type EyeAppearanceStateV3 } from '$lib/goons/eyeAppearance'
 import { OralAppearanceEngineRuntime } from '$lib/goons/oralAppearance.engine'
 import {
   parseOralAppearanceDefinition,
@@ -283,6 +299,8 @@ import {
 } from '$lib/goons/socketEyeContact'
 import {
   buildGoonRendererConstructionOptions,
+  resolveGoonRendererBackendPolicy,
+  type GoonRendererBackendPolicyReason,
   shouldRetryGoonRendererWithWebGL2
 } from '$lib/goons/goonRendererRequirements'
 import {
@@ -305,7 +323,18 @@ import {
 import { cloneGeometryForBodyConceal } from '$lib/goons/bodyConcealGeometry'
 import type { GoonStageHost } from '$lib/goons/stageScene'
 
+export type HairImportInspectionTransform = {
+  move: { x: number; y: number; z: number }
+  rotate: { x: number; y: number; z: number }
+  uniformScale: number
+  axisScale: { x: number; y: number; z: number }
+}
+
 const VRM_PRESET_NAMES = new Set(Object.values(VRMExpressionPresetName))
+const HAIR_IMPORT_INSPECTION_ROOT_NODE = 'HairImportRoot'
+const HAIR_IMPORT_INSPECTION_COLORS = [
+  0x6f4b9a, 0x3d7c98, 0xa35f75, 0x557a5a, 0x9a6d3e, 0x6e6e9f
+] as const
 const ORBIT_FLOOR_CLEARANCE_ANGLE = THREE.MathUtils.degToRad(1)
 const ORBIT_FLOOR_BUFFER = THREE.MathUtils.degToRad(8)
 const STANDING_BLOCKER_MARGIN = 0.18
@@ -386,6 +415,21 @@ export type GoonBodyConcealMeshPick = {
 
 export type GoonBodyConcealPick = GoonBodyConcealMeshPick & {
   mirroredPicks?: GoonBodyConcealMeshPick[]
+}
+
+export type HairImportMotionPaintTopologyMesh = {
+  meshNode: string
+  triangleCount: number
+  vertexCount: number
+}
+
+export type HairImportMotionPaintTopology = {
+  meshes: HairImportMotionPaintTopologyMesh[]
+}
+
+export type HairImportMotionPaintPick = HairImportMotionPaintTopologyMesh & {
+  faceIndex: number
+  triangleIndices: number[]
 }
 
 export type GoonEngineOptions = {
@@ -484,7 +528,10 @@ type BoneLookAtRangeMapScales = {
 
 type LookAtRangeMapApplier = Pick<
   VRMLookAtBoneApplier,
-  'rangeMapHorizontalInner' | 'rangeMapHorizontalOuter' | 'rangeMapVerticalDown' | 'rangeMapVerticalUp'
+  | 'rangeMapHorizontalInner'
+  | 'rangeMapHorizontalOuter'
+  | 'rangeMapVerticalDown'
+  | 'rangeMapVerticalUp'
 >
 
 type MaterialOriginalState = {
@@ -911,18 +958,45 @@ export class GoonEngine implements GoonStageHost {
   private scaleDragBaseline: THREE.Vector3 | null = null
   private suppressTransformObjectChange = false
   private editTarget:
-    | { type: 'prop'; id: string }
-    | { type: 'marker'; id: string; posture: GoonPosture }
-    | null = null
+    { type: 'prop'; id: string } | { type: 'marker'; id: string; posture: GoonPosture } | null =
+    null
   private markerEditHelper: THREE.Object3D | null = null
   private markerEditParent: THREE.Object3D | null = null
   private clock = new THREE.Timer()
   private vrm: VRM | null = null
   private customAvatarRoot: THREE.Object3D | null = null
   private customAvatarManifest: GoonCustomAvatarManifest | null = null
+  private hairPreviewRoot: THREE.Object3D | null = null
+  private hairPreviewLoadToken = 0
+  private hairPreviewMaterialRuntime: HairMaterialRuntimeHandle | null = null
+  private hairPreviewFollowerRuntime: HairFollowerRuntimeHandle | null = null
+  private hairPreviewSecondaryMotionRuntime: SecondaryMotionEngineRuntime | null = null
+  private hairPreviewSecondaryMotionDefinition: SecondaryMotionDefinitionV1 | null = null
+  private hairPreviewSecondaryMotionSuspended = false
+  private hairImportMotionMapMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>()
+  private hairImportMotionMapColorAttributes = new Map<
+    THREE.BufferGeometry,
+    THREE.BufferAttribute | THREE.InterleavedBufferAttribute | null
+  >()
+  private hairImportMotionMapOverlayMaterials = new Set<THREE.Material>()
+  private hairImportMotionPaintOverlays = new Set<THREE.Mesh>()
+  private hairImportMotionPaintGoonVisibility = new Map<THREE.Object3D, boolean>()
+  private hairImportPaintRaycaster = new THREE.Raycaster()
+  private hairImportPaintPointer = new THREE.Vector2()
+  private hairImportPaintBrushTopology = new WeakMap<
+    THREE.BufferGeometry,
+    { centroids: Float32Array; neighbors: number[][] }
+  >()
+  private hairImportInspectionRoot: THREE.Object3D | null = null
+  private hairImportInspectionObjects = new Map<string, THREE.Object3D>()
+  private embeddedSecondaryMotionRuntimes: SecondaryMotionEngineRuntime[] = []
+  private customHairAttachmentRestMatrix: THREE.Matrix4 | null = null
   private guidedDufOverlayRoot: THREE.Group | null = null
   private guidedOutfitPieceNodes = new Map<string, THREE.Object3D[]>()
-  private guidedDufOverlayBonePairs: Array<{ baseBone: THREE.Bone; overlayBone: THREE.Bone }> = []
+  private guidedDufOverlayBonePairs: Array<{
+    baseBone: THREE.Bone
+    overlayBone: THREE.Bone
+  }> = []
   private bodyConcealMeshes = new Map<string, BodyConcealRuntimeMesh>()
   private activeBodyConcealPaintedMasks: GoonPaintedConcealMask[] = []
   private bodyConcealRaycaster = new THREE.Raycaster()
@@ -963,8 +1037,13 @@ export class GoonEngine implements GoonStageHost {
   private rawRestRotations = new Map<VRMHumanBoneName, THREE.Quaternion>()
   private rawRestPositions = new Map<VRMHumanBoneName, THREE.Vector3>()
   private rootMotionTrackHints = new Set<string>()
-  private rootMotionLockNodes: Array<{ node: THREE.Object3D; restX: number; restZ: number }> = []
+  private rootMotionLockNodes: Array<{
+    node: THREE.Object3D
+    restX: number
+    restZ: number
+  }> = []
   private forceWebGL2 = false
+  private rendererBackendPolicyReason: GoonRendererBackendPolicyReason = 'default-webgpu'
   private debugRootMotionEnabled = false
   private lastRootMotionDriftLogAt = 0
   private eyeLookDebugEnabled = false
@@ -996,7 +1075,10 @@ export class GoonEngine implements GoonStageHost {
   private baseLoopAnimationName: string | null = null
   private baseLoopPosture: GoonPosture = 'stand'
   private activeMood: GoonCueDefinition | null = null
-  private moodExpressionTargets: Array<{ preset: ResolvedExpressionPreset; weight: number }> = []
+  private moodExpressionTargets: Array<{
+    preset: ResolvedExpressionPreset
+    weight: number
+  }> = []
   private moodExpressionIntensity = 1
   private activeExpressions: ActiveExpression[] = []
   private ambientBlinkState = createAmbientBlinkState(performance.now())
@@ -1007,10 +1089,7 @@ export class GoonEngine implements GoonStageHost {
   private lookAtOverrideActive = false
   private lookAtRestoreAutoUpdate = true
   private lookAtRestoreTarget: THREE.Object3D | null = null
-  private lookAtRangeMapBaseScales = new WeakMap<
-    LookAtRangeMapApplier,
-    BoneLookAtRangeMapScales
-  >()
+  private lookAtRangeMapBaseScales = new WeakMap<LookAtRangeMapApplier, BoneLookAtRangeMapScales>()
   private hasBodyAnimations = false
   private hasMouthBlendshapes = false
   private hasExpressionBlendshapes = false
@@ -1030,7 +1109,10 @@ export class GoonEngine implements GoonStageHost {
     ResolvedCustomExpressionBinding[]
   >()
   private customFaceControlMap: Record<string, FaceControlMapping> | null = null
-  private customMorphDefinitions: Array<{ id: string; morphTargets: string[] }> = []
+  private customMorphDefinitions: Array<{
+    id: string
+    morphTargets: string[]
+  }> = []
   private customArkitFaceDriverBindings: {
     face: Map<Arkit52Channel, string[]>
     tongue: Map<Audio2FaceTongueChannel, string[]> | null
@@ -1047,14 +1129,20 @@ export class GoonEngine implements GoonStageHost {
   private vrmSource: VRMSourceType = 'unknown'
   private moodFaceControls: GoonFaceControl[] = []
   private moodRawMorphTargets: GoonRawMorphTarget[] = []
-  private authoringPreviewExpressionTargets: Array<{ preset: ResolvedExpressionPreset; weight: number }> = []
+  private authoringPreviewExpressionTargets: Array<{
+    preset: ResolvedExpressionPreset
+    weight: number
+  }> = []
   private authoringPreviewIntensity = 1
   private authoringPreviewFaceControls: GoonFaceControl[] = []
   private authoringPreviewRawMorphTargets: GoonRawMorphTarget[] = []
   // -------------------------------------------------- body dials (SA-090)
   private bodyDialsManifest: BodyDialsManifest | null = null
   private bodyDialsValues: Record<string, number> | null = null
-  private bodyDialsBindings: Array<{ mesh: THREE.Mesh; rawDict: Record<string, number> }> = []
+  private bodyDialsBindings: Array<{
+    mesh: THREE.Mesh
+    rawDict: Record<string, number>
+  }> = []
   private bodyDialsOwnedTargets = new Set<string>()
   private bodyDialsAppliedTargets = new Set<string>()
   private bodyDialsRawMorphWarned = new Set<string>()
@@ -1067,7 +1155,10 @@ export class GoonEngine implements GoonStageHost {
       parentKey: string | null
     }
   > | null = null
-  private bodyDialsSkins: Array<{ mesh: THREE.SkinnedMesh; baseInverses: THREE.Matrix4[] }> = []
+  private bodyDialsSkins: Array<{
+    mesh: THREE.SkinnedMesh
+    baseInverses: THREE.Matrix4[]
+  }> = []
   private bodyDialsHipsRemap: {
     node: THREE.Object3D
     baseRest: THREE.Vector3
@@ -1081,7 +1172,10 @@ export class GoonEngine implements GoonStageHost {
     baseScale: THREE.Vector3
     pivotLocal: THREE.Vector3
   }> = []
-  private bodyDialsRootBase: { scale: THREE.Vector3; positionY: number } | null = null
+  private bodyDialsRootBase: {
+    scale: THREE.Vector3
+    positionY: number
+  } | null = null
   // dial-resolved state cached for the per-frame corrective composition
   private bodyDialsResolvedInfluences = new Map<string, number>()
   private bodyDialsNormalizedValues: Record<string, number> = {}
@@ -1121,10 +1215,7 @@ export class GoonEngine implements GoonStageHost {
   // ------------------------------------ joint-driven correctives (SA-090)
   private jointCorrectivesSpec: JointCorrectivesSpec | null = null
   private liveJointCorrectivesSpec: LiveJointCorrectivesSpec | null = null
-  private liveJointCorrectiveBindings = new Map<
-    string,
-    { mesh: THREE.Mesh; index: number }
-  >()
+  private liveJointCorrectiveBindings = new Map<string, { mesh: THREE.Mesh; index: number }>()
   private jointCorrectivesDrivers: Array<{
     driver: JointCorrectiveDriver
     nodes: THREE.Object3D[]
@@ -1195,7 +1286,10 @@ export class GoonEngine implements GoonStageHost {
   private onCameraChange?: (camera: GoonCamera) => void
   private onEditTransformChange?: (transform: GoonEditTransform | null) => void
   private onRuntimeStatus?: (status: GoonRendererRuntime) => void
-  private runtimeStatus: GoonRendererRuntime = { backend: 'unsupported', label: 'Unavailable' }
+  private runtimeStatus: GoonRendererRuntime = {
+    backend: 'unsupported',
+    label: 'Unavailable'
+  }
   private materialDisposeErrorCount = 0
   private readonly rootMotionDriftLogIntervalMs = 250
   private frameCounter = 0
@@ -1243,15 +1337,26 @@ export class GoonEngine implements GoonStageHost {
     this.onCameraChange = options.onCameraChange
     this.onEditTransformChange = options.onEditTransformChange
     this.embeddedWebKitRuntime = this.resolveEmbeddedWebKitRuntime()
-    this.forceWebGL2 =
-      options.forceWebGL2 ?? this.resolveDebugToggle('goonForceWebGL2', 'batshit:goonForceWebGL2')
+    const rendererBackendPolicy = resolveGoonRendererBackendPolicy({
+      explicitForceWebGL2: options.forceWebGL2,
+      embeddedWebKitRuntime: this.embeddedWebKitRuntime,
+      debugForceWebGL2: this.resolveDebugToggle('goonForceWebGL2', 'batshit:goonForceWebGL2')
+    })
+    this.forceWebGL2 = rendererBackendPolicy.forceWebGL2
+    this.rendererBackendPolicyReason = rendererBackendPolicy.reason
     this.lightingMode = resolveGoonLightingMode()
     this.toneMappingMode = resolveGoonToneMappingMode()
-    this.sceneLighting.setTuning({ brightness: resolveGoonLightingBrightness() })
+    this.sceneLighting.setTuning({
+      brightness: resolveGoonLightingBrightness()
+    })
     this.sceneLighting.setToneMappingModeForDiagnostics(this.toneMappingMode)
     this.debugRootMotionEnabled =
-      options.debugRootMotion ?? this.resolveDebugToggle('goonRootMotionDebug', 'batshit:goonRootMotionDebug')
-    this.eyeLookDebugEnabled = this.resolveDebugToggle('goonEyeLookDebug', 'batshit:goonEyeLookDebug')
+      options.debugRootMotion ??
+      this.resolveDebugToggle('goonRootMotionDebug', 'batshit:goonRootMotionDebug')
+    this.eyeLookDebugEnabled = this.resolveDebugToggle(
+      'goonEyeLookDebug',
+      'batshit:goonEyeLookDebug'
+    )
     this.eyeLookFreezeHeadEnabled = this.resolveDebugToggle(
       'goonEyeLookFreezeHead',
       'batshit:goonEyeLookFreezeHead'
@@ -1262,6 +1367,7 @@ export class GoonEngine implements GoonStageHost {
     )
     if (this.forceWebGL2) {
       console.debug('[GoonRendererDebug] Forcing the WebGL2 fallback backend.', {
+        reason: this.rendererBackendPolicyReason,
         enableByQueryParam: 'goonForceWebGL2=1',
         enableByLocalStorage: 'batshit:goonForceWebGL2=1'
       })
@@ -1364,9 +1470,7 @@ export class GoonEngine implements GoonStageHost {
   private resolveDebugToggle(queryKey: string, storageKey: string) {
     try {
       const location = (globalThis as { location?: Location }).location
-      const query = location?.search
-        ? new URLSearchParams(location.search).get(queryKey)
-        : null
+      const query = location?.search ? new URLSearchParams(location.search).get(queryKey) : null
       if (query === '1' || query === 'true') return true
     } catch {
       // no-op
@@ -1399,11 +1503,23 @@ export class GoonEngine implements GoonStageHost {
   private resolveRendererRuntime(renderer: WebGPURenderer): GoonRendererRuntime {
     const backend = renderer.backend as { isWebGPUBackend?: boolean } | undefined
     if (backend?.isWebGPUBackend) {
-      return { backend: 'webgpu', label: 'WebGPU', environment: this.resolveRendererEnvironment() }
+      return {
+        backend: 'webgpu',
+        label: 'WebGPU',
+        environment: this.resolveRendererEnvironment()
+      }
     }
     return {
       backend: 'fallback-webgl2',
-      label: 'WebGL2 fallback',
+      label:
+        this.rendererBackendPolicyReason === 'embedded-webkit-stability'
+          ? 'WebGL2 · Mac stability'
+          : 'WebGL2 fallback',
+      ...(this.rendererBackendPolicyReason === 'embedded-webkit-stability'
+        ? {
+            message: 'The packaged Mac app uses WebGL2 to avoid a macOS WebKit WebGPU memory leak.'
+          }
+        : {}),
       environment: this.resolveRendererEnvironment()
     }
   }
@@ -1424,7 +1540,8 @@ export class GoonEngine implements GoonStageHost {
     if (this.renderFailed) return
     this.renderFailed = true
     const reason = error instanceof Error ? error.message : String(error)
-    const message = 'Goon renderer encountered an unrecoverable error and was stopped. Reopen the preview to retry.'
+    const message =
+      'Goon renderer encountered an unrecoverable error and was stopped. Reopen the preview to retry.'
     this.setRuntimeStatus({
       backend: 'unsupported',
       label: 'Renderer error',
@@ -1435,7 +1552,14 @@ export class GoonEngine implements GoonStageHost {
     this.setPaused(true)
   }
 
-  setViewOffset(value?: { fullWidth: number; fullHeight: number; offsetX?: number; offsetY?: number } | null) {
+  setViewOffset(
+    value?: {
+      fullWidth: number
+      fullHeight: number
+      offsetX?: number
+      offsetY?: number
+    } | null
+  ) {
     if (!value) {
       if (!this.viewOffset) return
       this.viewOffset = null
@@ -1525,13 +1649,8 @@ export class GoonEngine implements GoonStageHost {
 
   setScenePlacement(placement: GoonScenePlacement, radius: number) {
     const enabled = placement === 'ground'
-    const normalizedRadius = enabled
-      ? Math.max(1, Number.isFinite(radius) ? radius : 1)
-      : 0
-    if (
-      enabled === this.groundedSkyboxEnabled &&
-      normalizedRadius === this.groundedSkyboxRadius
-    ) {
+    const normalizedRadius = enabled ? Math.max(1, Number.isFinite(radius) ? radius : 1) : 0
+    if (enabled === this.groundedSkyboxEnabled && normalizedRadius === this.groundedSkyboxRadius) {
       return
     }
     this.groundedSkyboxEnabled = enabled
@@ -1612,19 +1731,17 @@ export class GoonEngine implements GoonStageHost {
 
     const initPromise = (async () => {
       this.renderFailed = false
-      const createRenderer = (forceWebGL: boolean) => new WebGPURenderer(
-        buildGoonRendererConstructionOptions(forceWebGL, this.requiredMaxTextureArrayLayers)
-      )
+      const createRenderer = (forceWebGL: boolean) =>
+        new WebGPURenderer(
+          buildGoonRendererConstructionOptions(forceWebGL, this.requiredMaxTextureArrayLayers)
+        )
       let renderer = createRenderer(this.forceWebGL2)
       try {
         await renderer.init()
       } catch (error) {
         renderer.dispose()
         if (
-          shouldRetryGoonRendererWithWebGL2(
-            this.forceWebGL2,
-            this.requiredMaxTextureArrayLayers
-          )
+          shouldRetryGoonRendererWithWebGL2(this.forceWebGL2, this.requiredMaxTextureArrayLayers)
         ) {
           console.warn(
             '[GoonEngine] WebGPU could not satisfy the socket-eye texture-array requirement; retrying with WebGL2.',
@@ -1674,7 +1791,9 @@ export class GoonEngine implements GoonStageHost {
       renderer.domElement.addEventListener('pointerleave', this.handlePointerUp)
       renderer.domElement.addEventListener('pointercancel', this.handlePointerUp)
       renderer.domElement.addEventListener('contextmenu', this.handleContextMenu)
-      renderer.domElement.addEventListener('wheel', this.handleWheel, { passive: false })
+      renderer.domElement.addEventListener('wheel', this.handleWheel, {
+        passive: false
+      })
       renderer.domElement.addEventListener('keyup', this.handleKeyUp)
 
       this.camera.position.set(0, 1.4, 2.2)
@@ -1798,7 +1917,9 @@ export class GoonEngine implements GoonStageHost {
       this.animationWarnings = []
       this.hasBodyAnimations = this.registerAnimations(this.baseAnimations, 'vrm', 'vrm')
       this.guidedManifestOverlay =
-        effectiveGuidedManifest?.face || effectiveGuidedManifest?.body ? effectiveGuidedManifest : null
+        effectiveGuidedManifest?.face || effectiveGuidedManifest?.body
+          ? effectiveGuidedManifest
+          : null
       this.configureBodyConcealManifest(vrm.scene, effectiveGuidedManifest)
 
       this.captureBones()
@@ -1816,7 +1937,12 @@ export class GoonEngine implements GoonStageHost {
 
       this.syncBaseLoopAnimation()
     } finally {
-      if (shouldResumeAfterLoad && !this.renderFailed && this.renderer && goonLoadToken === this.goonLoadToken) {
+      if (
+        shouldResumeAfterLoad &&
+        !this.renderFailed &&
+        this.renderer &&
+        goonLoadToken === this.goonLoadToken
+      ) {
         this.setPaused(false)
       }
     }
@@ -1872,6 +1998,13 @@ export class GoonEngine implements GoonStageHost {
         throw new Error('Custom avatar model is missing a scene root.')
       }
 
+      try {
+        applyEmbeddedHairMaterials(scene)
+      } catch (error) {
+        this.disposeObject3D(scene)
+        throw error
+      }
+
       this.customAvatarRoot = scene
       this.syncLightingLane()
       this.customAvatarManifest = manifest
@@ -1904,10 +2037,7 @@ export class GoonEngine implements GoonStageHost {
         this.setupBodyDials(manifest, options.bodyDialValues ?? null)
       }
       if (socketEyePackage) {
-        this.setupSocketEyeAppearance(
-          socketEyePackage,
-          options.eyeAppearanceState ?? null
-        )
+        this.setupSocketEyeAppearance(socketEyePackage, options.eyeAppearanceState ?? null)
         await this.setupFacialArtwork(
           socketEyePackage.facialArtwork,
           options.facialArtworkState ?? null
@@ -1943,6 +2073,8 @@ export class GoonEngine implements GoonStageHost {
       // after every appearance runtime has completed so a failed eye setup
       // cannot leave a half-active performance driver behind.
       this.setupCustomPerformanceRig(manifest)
+      this.setupEmbeddedSecondaryMotion(scene)
+      this.captureCustomHairAttachmentRestMatrix()
       this.emitCustomCompatibility()
       this.applyRuntimeTextureBudget(scene)
 
@@ -1966,7 +2098,12 @@ export class GoonEngine implements GoonStageHost {
       }
       throw error
     } finally {
-      if (shouldResumeAfterLoad && !this.renderFailed && this.renderer && goonLoadToken === this.goonLoadToken) {
+      if (
+        shouldResumeAfterLoad &&
+        !this.renderFailed &&
+        this.renderer &&
+        goonLoadToken === this.goonLoadToken
+      ) {
         this.setPaused(false)
       }
     }
@@ -1989,9 +2126,7 @@ export class GoonEngine implements GoonStageHost {
     if (meshes.length === 0) return null
 
     return {
-      topologySignature: meshes
-        .map((mesh) => `${mesh.mesh}:${mesh.topologySignature}`)
-        .join('|'),
+      topologySignature: meshes.map((mesh) => `${mesh.mesh}:${mesh.topologySignature}`).join('|'),
       meshes
     }
   }
@@ -2021,7 +2156,10 @@ export class GoonEngine implements GoonStageHost {
           const runtimeMesh = this.bodyConcealMeshes.get(meshMask.mesh)
           if (!runtimeMesh || runtimeMesh.topologySignature !== meshMask.topologySignature) continue
           const bucket = paintedTrianglesByMesh.get(meshMask.mesh) ?? new Set<number>()
-          for (const triangleIndex of expandPaintedTriangleRanges(meshMask.triangleRanges, runtimeMesh.triangleCount)) {
+          for (const triangleIndex of expandPaintedTriangleRanges(
+            meshMask.triangleRanges,
+            runtimeMesh.triangleCount
+          )) {
             bucket.add(triangleIndex)
           }
           paintedTrianglesByMesh.set(meshMask.mesh, bucket)
@@ -2039,12 +2177,14 @@ export class GoonEngine implements GoonStageHost {
       if (!geometry.getIndex()) continue
 
       if (hiddenTriangles.size === 0) {
-        geometry.setIndex(
-          new THREE.BufferAttribute(runtimeMesh.originalIndexArray.slice(), 1)
-        )
+        geometry.setIndex(new THREE.BufferAttribute(runtimeMesh.originalIndexArray.slice(), 1))
       } else {
         const keptIndices: number[] = []
-        for (let triangleIndex = 0; triangleIndex < runtimeMesh.originalIndexArray.length / 3; triangleIndex += 1) {
+        for (
+          let triangleIndex = 0;
+          triangleIndex < runtimeMesh.originalIndexArray.length / 3;
+          triangleIndex += 1
+        ) {
           if (hiddenTriangles.has(triangleIndex)) continue
           const base = triangleIndex * 3
           keptIndices.push(
@@ -2054,8 +2194,7 @@ export class GoonEngine implements GoonStageHost {
           )
         }
         const IndexArrayCtor = runtimeMesh.originalIndexArray.constructor as
-          | Uint16ArrayConstructor
-          | Uint32ArrayConstructor
+          Uint16ArrayConstructor | Uint32ArrayConstructor
         geometry.setIndex(new THREE.BufferAttribute(new IndexArrayCtor(keptIndices), 1))
       }
 
@@ -2097,7 +2236,9 @@ export class GoonEngine implements GoonStageHost {
       )
       const first = intersections[0]
       if (!first || typeof first.faceIndex !== 'number') return null
-      const runtimeMesh = [...this.bodyConcealMeshes.values()].find((candidate) => candidate.mesh === first.object)
+      const runtimeMesh = [...this.bodyConcealMeshes.values()].find(
+        (candidate) => candidate.mesh === first.object
+      )
       if (!runtimeMesh) return null
       const faceIndex = Math.max(0, Math.min(runtimeMesh.triangleCount - 1, first.faceIndex))
       const primaryCollection = this.collectBodyConcealBrushTriangles(
@@ -2175,11 +2316,16 @@ export class GoonEngine implements GoonStageHost {
       const aIndex = runtimeMesh.originalIndexArray[base]
       const bIndex = runtimeMesh.originalIndexArray[base + 1]
       const cIndex = runtimeMesh.originalIndexArray[base + 2]
-      if (typeof aIndex !== 'number' || typeof bIndex !== 'number' || typeof cIndex !== 'number') continue
+      if (typeof aIndex !== 'number' || typeof bIndex !== 'number' || typeof cIndex !== 'number')
+        continue
       a.fromBufferAttribute(position, aIndex)
       b.fromBufferAttribute(position, bIndex)
       c.fromBufferAttribute(position, cIndex)
-      centroid.copy(a).add(b).add(c).multiplyScalar(1 / 3)
+      centroid
+        .copy(a)
+        .add(b)
+        .add(c)
+        .multiplyScalar(1 / 3)
       runtimeMesh.mesh.localToWorld(centroid)
       const distanceSq = centroid.distanceToSquared(hitPoint)
       if (distanceSq < nearestDistanceSq) {
@@ -2341,7 +2487,944 @@ export class GoonEngine implements GoonStageHost {
     return this.vrm?.scene ?? this.customAvatarRoot
   }
 
+  private disposeHairPreview() {
+    this.hairPreviewSecondaryMotionSuspended = false
+    this.setHairImportMotionPaintGoonVisible(true)
+    this.clearHairImportMotionMap()
+    this.hairPreviewSecondaryMotionRuntime?.dispose()
+    this.hairPreviewSecondaryMotionRuntime = null
+    this.hairPreviewSecondaryMotionDefinition = null
+    this.hairPreviewFollowerRuntime?.dispose()
+    this.hairPreviewFollowerRuntime = null
+    this.hairImportInspectionRoot = null
+    this.hairImportInspectionObjects.clear()
+    if (!this.hairPreviewRoot) return
+    this.hairPreviewRoot.removeFromParent()
+    this.disposeObject3D(this.hairPreviewRoot)
+    this.hairPreviewRoot = null
+    this.hairPreviewMaterialRuntime = null
+  }
+
+  private captureCustomHairAttachmentRestMatrix() {
+    this.customHairAttachmentRestMatrix = null
+    const avatarRoot = this.customAvatarRoot
+    const manifest = this.customAvatarManifest
+    if (!avatarRoot || !manifest) return
+    const performance = resolveCustomPerformanceRigManifest(
+      resolveCustomPerformanceRigBlock(manifest)
+    )
+    if (performance.issues.length || !performance.manifest) return
+    const headNode = resolveCustomNamedNode(avatarRoot, performance.manifest.nodes.head.node)
+    if (!headNode) return
+
+    avatarRoot.updateMatrixWorld(true)
+    this.customHairAttachmentRestMatrix = avatarRoot.matrixWorld
+      .clone()
+      .invert()
+      .multiply(headNode.matrixWorld)
+  }
+
+  private setupEmbeddedSecondaryMotion(avatarRoot: THREE.Object3D) {
+    const runtimes: SecondaryMotionEngineRuntime[] = []
+    try {
+      avatarRoot.traverse((object) => {
+        const embedded = parseEmbeddedSecondaryMotion(object.userData?.batshitSecondaryMotion)
+        if (!embedded) return
+        const runtime = new SecondaryMotionEngineRuntime(
+          object,
+          avatarRoot,
+          runtimeSecondaryMotionDefinition(embedded)
+        )
+        if (embedded.motionSettings) runtime.setMotionTuning(embedded.motionSettings)
+        runtimes.push(runtime)
+      })
+    } catch (error) {
+      for (const runtime of runtimes) runtime.dispose()
+      throw error
+    }
+    this.embeddedSecondaryMotionRuntimes = runtimes
+  }
+
+  clearHairPreview() {
+    this.hairPreviewLoadToken += 1
+    this.disposeHairPreview()
+  }
+
+  private clearHairImportMotionMap() {
+    for (const overlay of this.hairImportMotionPaintOverlays) {
+      overlay.removeFromParent()
+      overlay.geometry.dispose()
+      const materials = Array.isArray(overlay.material) ? overlay.material : [overlay.material]
+      for (const material of materials) material.dispose()
+    }
+    for (const [mesh, material] of this.hairImportMotionMapMaterials) {
+      mesh.material = material
+    }
+    for (const [geometry, color] of this.hairImportMotionMapColorAttributes) {
+      if (color) geometry.setAttribute('color', color)
+      else geometry.deleteAttribute('color')
+    }
+    for (const material of this.hairImportMotionMapOverlayMaterials) material.dispose()
+    this.hairImportMotionMapMaterials.clear()
+    this.hairImportMotionMapColorAttributes.clear()
+    this.hairImportMotionMapOverlayMaterials.clear()
+    this.hairImportMotionPaintOverlays.clear()
+  }
+
+  showHairImportMotionMap() {
+    const root = this.hairPreviewRoot
+    if (!root || this.hairImportInspectionRoot) {
+      throw new Error('Build the reviewed Hair candidate before showing its motion map.')
+    }
+    this.clearHairImportMotionMap()
+    let mappedMeshes = 0
+    root.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return
+      if (object.userData.batshitHairMotionPaintOverlay === true) return
+      const geometry = object.geometry
+      const positions = geometry.getAttribute('position')
+      const tipWeights = geometry.getAttribute(HAIR_ROOT_WEIGHTED_TIP_ATTRIBUTE)
+      if (!positions || !tipWeights || tipWeights.count !== positions.count) return
+      const skinIndices = geometry.getAttribute('skinIndex')
+      const colors = new Float32Array(positions.count * 3)
+      const still = new THREE.Color('#251936')
+      const selectedRoot = new THREE.Color('#16627a')
+      const moving = new THREE.Color('#39d9ff')
+      const color = new THREE.Color()
+      for (let vertex = 0; vertex < positions.count; vertex += 1) {
+        const weight = THREE.MathUtils.clamp(tipWeights.getX(vertex), 0, 1)
+        const selected =
+          skinIndices && skinIndices.count === positions.count && skinIndices.itemSize >= 2
+            ? skinIndices.getY(vertex) > 0
+            : weight > 0
+        color.copy(selected ? selectedRoot : still).lerp(moving, weight)
+        const offset = vertex * 3
+        colors[offset] = color.r
+        colors[offset + 1] = color.g
+        colors[offset + 2] = color.b
+      }
+      this.hairImportMotionMapMaterials.set(object, object.material)
+      this.hairImportMotionMapColorAttributes.set(geometry, geometry.getAttribute('color') ?? null)
+      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+      const material = new THREE.MeshStandardMaterial({
+        name: 'BatshitHairMotionMap',
+        color: 0xffffff,
+        vertexColors: true,
+        roughness: 0.7,
+        metalness: 0,
+        side: THREE.DoubleSide
+      })
+      object.material = material
+      this.hairImportMotionMapOverlayMaterials.add(material)
+      mappedMeshes += 1
+    })
+    if (mappedMeshes === 0) {
+      this.clearHairImportMotionMap()
+      throw new Error('The reviewed Hair candidate has no authored motion weights to display.')
+    }
+  }
+
+  hideHairImportMotionMap() {
+    this.clearHairImportMotionMap()
+  }
+
+  private hairImportPaintMeshes(options: { visibleOnly?: boolean } = {}) {
+    const root = this.hairPreviewRoot
+    if (!root || this.hairImportInspectionRoot) {
+      throw new Error('Build the reviewed Hair candidate before painting motion areas.')
+    }
+    const meshes = new Map<string, THREE.Mesh>()
+    root.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return
+      if (object.userData.batshitHairMotionPaintOverlay === true) return
+      if (options.visibleOnly && !this.isHairImportPaintObjectVisible(object, root)) return
+      const position = object.geometry.getAttribute('position')
+      const index = object.geometry.getIndex()
+      const cornerCount = index?.count ?? position?.count ?? 0
+      if (!position || cornerCount < 3 || cornerCount % 3 !== 0) return
+      const meshNode = object.name.trim()
+      if (!meshNode) return
+      if (meshes.has(meshNode)) {
+        throw new Error(`The reviewed Hair candidate repeats paintable mesh name "${meshNode}".`)
+      }
+      meshes.set(meshNode, object)
+    })
+    if (meshes.size === 0 && !options.visibleOnly) {
+      throw new Error('The reviewed Hair candidate has no indexed polygon meshes to paint.')
+    }
+    return meshes
+  }
+
+  private isHairImportPaintObjectVisible(object: THREE.Object3D, root: THREE.Object3D) {
+    let current: THREE.Object3D | null = object
+    while (current) {
+      if (!current.visible) return false
+      if (current === root) return true
+      current = current.parent
+    }
+    return false
+  }
+
+  private isInsideHairImportPreview(object: THREE.Object3D) {
+    const root = this.hairPreviewRoot
+    let current: THREE.Object3D | null = object
+    while (current) {
+      if (current === root) return true
+      current = current.parent
+    }
+    return false
+  }
+
+  setHairImportMotionPaintGoonVisible(visible: boolean) {
+    if (visible) {
+      for (const [object, originalVisible] of this.hairImportMotionPaintGoonVisibility) {
+        object.visible = originalVisible
+      }
+      this.hairImportMotionPaintGoonVisibility.clear()
+      return
+    }
+    if (this.hairImportMotionPaintGoonVisibility.size > 0) return
+    const roots = [this.getActiveAvatarRoot(), this.guidedDufOverlayRoot].filter(
+      (root): root is THREE.Object3D => Boolean(root)
+    )
+    for (const root of roots) {
+      root.traverse((object) => {
+        if (!(object instanceof THREE.Mesh) || this.isInsideHairImportPreview(object)) return
+        this.hairImportMotionPaintGoonVisibility.set(object, object.visible)
+        object.visible = false
+      })
+    }
+  }
+
+  setHairImportMotionPaintMeshVisible(meshNode: string, visible: boolean) {
+    const mesh = this.hairImportPaintMeshes().get(meshNode)
+    if (!mesh) throw new Error(`The Hair paint preview does not contain mesh "${meshNode}".`)
+    mesh.visible = visible
+    for (const overlay of this.hairImportMotionPaintOverlays) {
+      if (overlay.userData.batshitHairMotionPaintSourceMesh === meshNode) {
+        overlay.visible = visible
+      }
+    }
+  }
+
+  private hairImportPaintTriangleCount(geometry: THREE.BufferGeometry) {
+    const position = geometry.getAttribute('position')
+    const cornerCount = geometry.getIndex()?.count ?? position?.count ?? 0
+    if (!position || cornerCount < 3 || cornerCount % 3 !== 0) {
+      throw new Error('The reviewed Hair candidate contains malformed triangle geometry.')
+    }
+    return cornerCount / 3
+  }
+
+  private hairImportPaintTriangleVertex(
+    geometry: THREE.BufferGeometry,
+    triangle: number,
+    corner: number
+  ) {
+    const offset = triangle * 3 + corner
+    return geometry.getIndex()?.getX(offset) ?? offset
+  }
+
+  getHairImportMotionPaintTopology(): HairImportMotionPaintTopology {
+    return {
+      meshes: [...this.hairImportPaintMeshes()]
+        .map(([meshNode, mesh]) => ({
+          meshNode,
+          triangleCount: this.hairImportPaintTriangleCount(mesh.geometry),
+          vertexCount: mesh.geometry.getAttribute('position').count
+        }))
+        .sort((left, right) => left.meshNode.localeCompare(right.meshNode))
+    }
+  }
+
+  showHairImportMotionPaint(value: HairMotionPaintV1, activeRegionId: string | null = null) {
+    const paint = parseHairMotionPaint(value)
+    const meshes = this.hairImportPaintMeshes()
+    this.clearHairImportMotionMap()
+    const still = new THREE.Color('#251936')
+    const selected = new THREE.Color('#16627a')
+    const active = new THREE.Color('#39d9ff')
+    for (const [meshNode, mesh] of meshes) {
+      const geometry = mesh.geometry
+      const triangleCount = this.hairImportPaintTriangleCount(geometry)
+      const selectedTriangles = new Uint8Array(triangleCount)
+      const activeTriangles = new Uint8Array(triangleCount)
+      for (const region of paint.regions) {
+        if (!region.enabled) continue
+        const paintedMesh = region.meshes.find((entry) => entry.meshNode === meshNode)
+        if (!paintedMesh) continue
+        if (paintedMesh.triangleCount !== triangleCount) {
+          throw new Error(`Painted area ${region.label} no longer matches ${meshNode}.`)
+        }
+        const target = region.id === activeRegionId ? activeTriangles : selectedTriangles
+        for (const triangle of expandHairMotionTriangleRanges(
+          paintedMesh.triangleRanges,
+          triangleCount
+        )) {
+          target[triangle] = 1
+        }
+      }
+
+      const originalMaterial = mesh.material
+      const originalMaterials = Array.isArray(originalMaterial)
+        ? originalMaterial
+        : [originalMaterial]
+      const stillMaterials = originalMaterials.map(
+        (material, index) =>
+          new THREE.MeshBasicMaterial({
+            name: `BatshitHairMotionPaintStill_${index + 1}`,
+            color: still,
+            side: material.side,
+            depthTest: material.depthTest,
+            depthWrite: material.depthWrite
+          })
+      )
+      this.hairImportMotionMapMaterials.set(mesh, originalMaterial)
+      for (const material of stillMaterials) this.hairImportMotionMapOverlayMaterials.add(material)
+      mesh.material = Array.isArray(originalMaterial) ? stillMaterials : stillMaterials[0]!
+
+      if (
+        !selectedTriangles.some((value) => value === 1) &&
+        !activeTriangles.some((value) => value === 1)
+      ) {
+        continue
+      }
+      const overlayGeometry = geometry.getIndex() ? geometry.toNonIndexed() : geometry.clone()
+      overlayGeometry.clearGroups()
+      let runStart = 0
+      let runMaterial = activeTriangles[0] ? 2 : selectedTriangles[0] ? 1 : 0
+      for (let triangle = 1; triangle <= triangleCount; triangle += 1) {
+        const nextMaterial =
+          triangle < triangleCount
+            ? activeTriangles[triangle]
+              ? 2
+              : selectedTriangles[triangle]
+                ? 1
+                : 0
+            : -1
+        if (nextMaterial === runMaterial) continue
+        if (runMaterial > 0) {
+          overlayGeometry.addGroup(runStart * 3, (triangle - runStart) * 3, runMaterial - 1)
+        }
+        runStart = triangle
+        runMaterial = nextMaterial
+      }
+      const previewSide = originalMaterials[0]?.side ?? THREE.FrontSide
+      const materials = [
+        new THREE.MeshBasicMaterial({
+          name: 'BatshitHairMotionPaintSelected',
+          color: selected,
+          side: previewSide,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1
+        }),
+        new THREE.MeshBasicMaterial({
+          name: 'BatshitHairMotionPaintActive',
+          color: active,
+          side: previewSide,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1
+        })
+      ]
+      const overlay =
+        mesh instanceof THREE.SkinnedMesh
+          ? new THREE.SkinnedMesh(overlayGeometry, materials)
+          : new THREE.Mesh(overlayGeometry, materials)
+      overlay.name = `${meshNode}__BatshitHairMotionPaintOverlay`
+      overlay.userData.batshitHairMotionPaintOverlay = true
+      overlay.userData.batshitHairMotionPaintSourceMesh = meshNode
+      overlay.visible = mesh.visible
+      overlay.position.copy(mesh.position)
+      overlay.quaternion.copy(mesh.quaternion)
+      overlay.scale.copy(mesh.scale)
+      overlay.renderOrder = mesh.renderOrder + 10
+      overlay.morphTargetDictionary = mesh.morphTargetDictionary
+      overlay.morphTargetInfluences = mesh.morphTargetInfluences?.slice()
+      if (overlay instanceof THREE.SkinnedMesh && mesh instanceof THREE.SkinnedMesh) {
+        overlay.bindMode = mesh.bindMode
+        overlay.bind(mesh.skeleton, mesh.bindMatrix)
+        overlay.bindMatrixInverse.copy(mesh.bindMatrixInverse)
+      }
+      mesh.parent?.add(overlay)
+      this.hairImportMotionPaintOverlays.add(overlay)
+    }
+  }
+
+  pickHairImportMotionTriangles(
+    clientX: number,
+    clientY: number,
+    brushRadiusPx = 1
+  ): HairImportMotionPaintPick | null {
+    const canvas = this.renderer?.domElement as HTMLCanvasElement | undefined
+    if (!canvas) return null
+    const meshes = this.hairImportPaintMeshes({ visibleOnly: true })
+    const rect = canvas.getBoundingClientRect()
+    if (!rect.width || !rect.height) return null
+    this.hairImportPaintPointer.set(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1
+    )
+    this.hairImportPaintRaycaster.setFromCamera(this.hairImportPaintPointer, this.camera)
+    const intersections = this.hairImportPaintRaycaster.intersectObjects(
+      [...meshes.values()],
+      false
+    )
+    const first = intersections[0]
+    if (!first || typeof first.faceIndex !== 'number') return null
+    if (this.hairImportMotionPaintGoonVisibility.size === 0) {
+      const avatarRoot = this.getActiveAvatarRoot()
+      if (avatarRoot) {
+        const blocker = this.hairImportPaintRaycaster
+          .intersectObject(avatarRoot, true)
+          .find((intersection) => {
+            if (this.isInsideHairImportPreview(intersection.object)) return false
+            let current: THREE.Object3D | null = intersection.object
+            while (current) {
+              if (!current.visible) return false
+              if (current === avatarRoot) break
+              current = current.parent
+            }
+            const mesh = intersection.object as THREE.Mesh
+            const materials = Array.isArray(mesh.material)
+              ? mesh.material
+              : mesh.material
+                ? [mesh.material]
+                : []
+            return (
+              materials.length === 0 ||
+              materials.some((material) => material.visible && material.opacity > 0.02)
+            )
+          })
+        if (blocker && blocker.distance + 1e-5 < first.distance) return null
+      }
+    }
+    const entry = [...meshes].find(([, mesh]) => mesh === first.object)
+    if (!entry) return null
+    const [meshNode, mesh] = entry
+    const triangleCount = this.hairImportPaintTriangleCount(mesh.geometry)
+    const faceIndex = Math.max(0, Math.min(triangleCount - 1, first.faceIndex))
+    const triangleIndices = this.collectHairImportBrushTriangles(
+      mesh,
+      first.point,
+      faceIndex,
+      brushRadiusPx,
+      rect
+    )
+    return {
+      meshNode,
+      triangleCount,
+      vertexCount: mesh.geometry.getAttribute('position').count,
+      faceIndex,
+      triangleIndices
+    }
+  }
+
+  private collectHairImportBrushTriangles(
+    mesh: THREE.Mesh,
+    hitPoint: THREE.Vector3,
+    seedFaceIndex: number,
+    brushRadiusPx: number,
+    rect: DOMRect
+  ) {
+    const normalizedRadiusPx = Math.max(1, Math.min(120, Math.round(brushRadiusPx)))
+    if (normalizedRadiusPx <= 2) return [seedFaceIndex]
+    const distance = Math.max(0.01, this.camera.position.distanceTo(hitPoint))
+    const fov = THREE.MathUtils.degToRad(this.camera.fov)
+    const worldRadius = Math.max(
+      0.004,
+      (normalizedRadiusPx / Math.max(1, rect.height)) * 2 * distance * Math.tan(fov / 2)
+    )
+    const radiusSq = worldRadius * worldRadius
+    const geometry = mesh.geometry
+    const position = geometry.getAttribute('position')
+    const triangleCount = this.hairImportPaintTriangleCount(geometry)
+    let topology = this.hairImportPaintBrushTopology.get(geometry)
+    if (!topology) {
+      const centroids = new Float32Array(triangleCount * 3)
+      const edgeTriangles = new Map<string, number[]>()
+      const a = new THREE.Vector3()
+      const b = new THREE.Vector3()
+      const c = new THREE.Vector3()
+      const vertexKey = (vertex: number) => {
+        const x = Math.round(position.getX(vertex) * 1_000_000)
+        const y = Math.round(position.getY(vertex) * 1_000_000)
+        const z = Math.round(position.getZ(vertex) * 1_000_000)
+        return `${x},${y},${z}`
+      }
+      for (let triangle = 0; triangle < triangleCount; triangle += 1) {
+        const first = this.hairImportPaintTriangleVertex(geometry, triangle, 0)
+        const second = this.hairImportPaintTriangleVertex(geometry, triangle, 1)
+        const third = this.hairImportPaintTriangleVertex(geometry, triangle, 2)
+        a.fromBufferAttribute(position, first)
+        b.fromBufferAttribute(position, second)
+        c.fromBufferAttribute(position, third)
+        const centroidOffset = triangle * 3
+        centroids[centroidOffset] = (a.x + b.x + c.x) / 3
+        centroids[centroidOffset + 1] = (a.y + b.y + c.y) / 3
+        centroids[centroidOffset + 2] = (a.z + b.z + c.z) / 3
+        for (const [left, right] of [
+          [vertexKey(first), vertexKey(second)],
+          [vertexKey(second), vertexKey(third)],
+          [vertexKey(third), vertexKey(first)]
+        ]) {
+          const edge = left < right ? `${left}:${right}` : `${right}:${left}`
+          const attached = edgeTriangles.get(edge)
+          if (attached) attached.push(triangle)
+          else edgeTriangles.set(edge, [triangle])
+        }
+      }
+      const neighborSets = Array.from({ length: triangleCount }, () => new Set<number>())
+      for (const attached of edgeTriangles.values()) {
+        for (const triangle of attached) {
+          for (const neighbor of attached) {
+            if (neighbor !== triangle) neighborSets[triangle]!.add(neighbor)
+          }
+        }
+      }
+      topology = {
+        centroids,
+        neighbors: neighborSets.map((neighbors) =>
+          [...neighbors].sort((left, right) => left - right)
+        )
+      }
+      this.hairImportPaintBrushTopology.set(geometry, topology)
+    }
+    const centroid = new THREE.Vector3()
+    const picked = new Set<number>([seedFaceIndex])
+    const queue = [seedFaceIndex]
+    const visited = new Set<number>(queue)
+    for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
+      const triangle = queue[queueIndex]!
+      for (const neighbor of topology.neighbors[triangle] ?? []) {
+        if (visited.has(neighbor)) continue
+        visited.add(neighbor)
+        const offset = neighbor * 3
+        centroid.set(
+          topology.centroids[offset]!,
+          topology.centroids[offset + 1]!,
+          topology.centroids[offset + 2]!
+        )
+        mesh.localToWorld(centroid)
+        if (centroid.distanceToSquared(hitPoint) > radiusSq) continue
+        picked.add(neighbor)
+        queue.push(neighbor)
+      }
+    }
+    return [...picked].sort((left, right) => left - right)
+  }
+
+  async loadHairPreview(url: string): Promise<HairAttachmentSummary> {
+    return this.loadHairPreviewCandidate(url, null, null, (ref) => ref)
+  }
+
+  async loadHairImportInspectionPreview(
+    url: string,
+    objectIds: readonly string[],
+    selectedObjectIds: readonly string[],
+    transform: HairImportInspectionTransform
+  ): Promise<HairAttachmentSummary> {
+    this.clearHairImportMotionMap()
+    const trimmedUrl = url.trim()
+    if (!trimmedUrl) throw new Error('The inspected Hair preview URL is missing.')
+    const avatarRoot = this.customAvatarRoot
+    const manifest = this.customAvatarManifest
+    if (!avatarRoot || !manifest) {
+      throw new Error('Hair import preview requires a loaded Advanced/GLB Goon.')
+    }
+    const performance = resolveCustomPerformanceRigManifest(
+      resolveCustomPerformanceRigBlock(manifest)
+    )
+    if (performance.issues.length || !performance.manifest) {
+      throw new Error(
+        performance.issues[0] ?? 'The Goon does not declare an animated head attachment node.'
+      )
+    }
+    const headNodeName = performance.manifest.nodes.head.node
+    const headNode = resolveCustomNamedNode(avatarRoot, headNodeName)
+    if (!headNode) {
+      throw new Error(`The Goon is missing its declared head node "${headNodeName}".`)
+    }
+    const headRestMatrix = this.customHairAttachmentRestMatrix
+    if (!headRestMatrix) {
+      throw new Error('The Goon head rest transform is unavailable for Hair import preview.')
+    }
+    if (objectIds.length === 0 || new Set(objectIds).size !== objectIds.length) {
+      throw new Error('The inspected Hair preview object list is invalid.')
+    }
+
+    const loadToken = ++this.hairPreviewLoadToken
+    const loader = new GLTFLoader()
+    const gltf = await loader.loadAsync(trimmedUrl)
+    const hairRoot = gltf.scene ?? gltf.scenes?.[0]
+    if (!hairRoot) throw new Error('The inspected Hair GLB is missing a scene root.')
+    if (loadToken !== this.hairPreviewLoadToken || avatarRoot !== this.customAvatarRoot) {
+      this.disposeObject3D(hairRoot)
+      throw new Error('The Goon changed before the inspected Hair preview finished loading.')
+    }
+
+    const canonicalRoot = hairRoot.getObjectByName(HAIR_IMPORT_INSPECTION_ROOT_NODE)
+    if (!canonicalRoot) {
+      this.disposeObject3D(hairRoot)
+      throw new Error(`The inspected Hair preview is missing ${HAIR_IMPORT_INSPECTION_ROOT_NODE}.`)
+    }
+    const objectNodes = new Map<string, THREE.Object3D>()
+    const replacedMaterials = new Set<THREE.Material>()
+    try {
+      objectIds.forEach((objectId, index) => {
+        if (!/^object-[0-9]{4}$/.test(objectId)) {
+          throw new Error(`The inspected Hair object id "${objectId}" is invalid.`)
+        }
+        const node = canonicalRoot.getObjectByName(`Hair_${objectId}`)
+        if (!node) {
+          throw new Error(`The inspected Hair preview is missing object "${objectId}".`)
+        }
+        const material = new THREE.MeshStandardMaterial({
+          name: `BatshitHairInspection_${objectId}`,
+          color: HAIR_IMPORT_INSPECTION_COLORS[index % HAIR_IMPORT_INSPECTION_COLORS.length],
+          roughness: 0.72,
+          metalness: 0,
+          side: THREE.DoubleSide
+        })
+        node.traverse((object) => {
+          if (!(object instanceof THREE.Mesh)) return
+          const previous = Array.isArray(object.material) ? object.material : [object.material]
+          previous.filter(Boolean).forEach((entry) => replacedMaterials.add(entry))
+          object.material = material
+          object.frustumCulled = false
+          object.castShadow = true
+          object.receiveShadow = true
+        })
+        objectNodes.set(objectId, node)
+      })
+      const disposedTextures = new Set<THREE.Texture>()
+      for (const material of replacedMaterials) this.disposeMaterial(material, disposedTextures)
+      this.applyHairImportInspectionTransform(canonicalRoot, transform)
+      this.applyHairImportInspectionSelection(objectNodes, selectedObjectIds, null)
+      hairRoot.name = 'BatshitHairImportInspectionPreview'
+      attachRigidHairAsset(avatarRoot, headNode, hairRoot, headRestMatrix)
+    } catch (error) {
+      this.disposeObject3D(hairRoot)
+      throw error
+    }
+
+    const previous = this.hairPreviewRoot
+    const previousFollower = this.hairPreviewFollowerRuntime
+    const previousSecondaryMotion = this.hairPreviewSecondaryMotionRuntime
+    this.hairPreviewRoot = hairRoot
+    this.hairPreviewMaterialRuntime = null
+    this.hairPreviewFollowerRuntime = null
+    this.hairPreviewSecondaryMotionRuntime = null
+    this.hairPreviewSecondaryMotionDefinition = null
+    this.hairImportInspectionRoot = canonicalRoot
+    this.hairImportInspectionObjects = objectNodes
+    previousSecondaryMotion?.dispose()
+    previousFollower?.dispose()
+    if (previous && previous !== hairRoot) {
+      previous.removeFromParent()
+      this.disposeObject3D(previous)
+    }
+    return summarizeHairAsset(hairRoot)
+  }
+
+  private applyHairImportInspectionTransform(
+    root: THREE.Object3D,
+    transform: HairImportInspectionTransform
+  ) {
+    const values = [
+      ...Object.values(transform.move),
+      ...Object.values(transform.rotate),
+      transform.uniformScale,
+      ...Object.values(transform.axisScale)
+    ]
+    if (!values.every(Number.isFinite) || transform.uniformScale <= 0) {
+      throw new Error('The inspected Hair preview transform is invalid.')
+    }
+    root.position.set(transform.move.x, transform.move.y, transform.move.z)
+    root.rotation.set(
+      THREE.MathUtils.degToRad(transform.rotate.x),
+      THREE.MathUtils.degToRad(transform.rotate.y),
+      THREE.MathUtils.degToRad(transform.rotate.z),
+      'XYZ'
+    )
+    root.scale.set(
+      transform.uniformScale * transform.axisScale.x,
+      transform.uniformScale * transform.axisScale.y,
+      transform.uniformScale * transform.axisScale.z
+    )
+    root.updateMatrix()
+    root.updateMatrixWorld(true)
+  }
+
+  private applyHairImportInspectionSelection(
+    objects: ReadonlyMap<string, THREE.Object3D>,
+    selectedObjectIds: readonly string[],
+    soloObjectId: string | null
+  ) {
+    const selected = new Set(selectedObjectIds)
+    for (const objectId of selected) {
+      if (!objects.has(objectId)) {
+        throw new Error(`The inspected Hair preview does not contain object "${objectId}".`)
+      }
+    }
+    if (soloObjectId !== null && !selected.has(soloObjectId)) {
+      throw new Error('Only an included Hair object can be shown by itself.')
+    }
+    for (const [objectId, object] of objects) {
+      object.visible = soloObjectId === null ? selected.has(objectId) : objectId === soloObjectId
+    }
+  }
+
+  updateHairImportInspectionSelection(
+    selectedObjectIds: readonly string[],
+    soloObjectId: string | null = null
+  ) {
+    if (!this.hairImportInspectionRoot || this.hairImportInspectionObjects.size === 0) {
+      throw new Error('Inspect a Hair file before changing its visible objects.')
+    }
+    this.applyHairImportInspectionSelection(
+      this.hairImportInspectionObjects,
+      selectedObjectIds,
+      soloObjectId
+    )
+  }
+
+  updateHairImportInspectionTransform(transform: HairImportInspectionTransform) {
+    if (!this.hairImportInspectionRoot) {
+      throw new Error('Inspect a Hair file before changing its fit.')
+    }
+    this.applyHairImportInspectionTransform(this.hairImportInspectionRoot, transform)
+  }
+
+  async loadHairAssetPreview(
+    assetValue: HairAssetV1,
+    state: HairStateV2,
+    url = assetValue.geometry.main.ref,
+    resolveAssetUrl: (ref: string) => string = (ref) => ref
+  ): Promise<HairAttachmentSummary> {
+    const asset = await verifyHairAsset(assetValue)
+    return this.loadHairPreviewCandidate(url, asset, state, resolveAssetUrl)
+  }
+
+  updateHairPreviewColors(state: HairStateV2) {
+    const runtime = this.hairPreviewMaterialRuntime
+    if (!runtime || !this.hairPreviewRoot) {
+      throw new Error('Choose and mount a Hair style before changing its colors.')
+    }
+    runtime.updateColors(state)
+  }
+
+  getHairMotionPreviewTuning(): SecondaryMotionTuning | null {
+    return this.hairPreviewSecondaryMotionRuntime?.getMotionTuning() ?? null
+  }
+
+  updateHairMotionPreviewTuning(value: SecondaryMotionTuning) {
+    const runtime = this.hairPreviewSecondaryMotionRuntime
+    if (!runtime || !this.hairPreviewRoot) {
+      throw new Error('Choose and mount a root-weighted Hair style before tuning its motion.')
+    }
+    runtime.setMotionTuning(value)
+  }
+
+  setHairImportMotionPaintActive(active: boolean) {
+    if (this.hairPreviewSecondaryMotionSuspended === active) return
+    this.hairPreviewSecondaryMotionSuspended = active
+    this.hairPreviewSecondaryMotionRuntime?.reset()
+  }
+
+  private updateHairSecondaryMotionRuntimes(delta: number) {
+    if (!this.hairPreviewSecondaryMotionSuspended) {
+      this.hairPreviewSecondaryMotionRuntime?.update(delta)
+    }
+    for (const runtime of this.embeddedSecondaryMotionRuntimes) runtime.update(delta)
+  }
+
+  private async loadHairPreviewCandidate(
+    url: string,
+    asset: HairAssetV1 | null,
+    state: HairStateV2 | null,
+    resolveAssetUrl: (ref: string) => string
+  ): Promise<HairAttachmentSummary> {
+    this.clearHairImportMotionMap()
+    const trimmedUrl = url.trim()
+    if (!trimmedUrl) {
+      throw new Error('Choose a GLB hair asset to preview.')
+    }
+    const avatarRoot = this.customAvatarRoot
+    const manifest = this.customAvatarManifest
+    if (!avatarRoot || !manifest) {
+      throw new Error('Hair preview requires a loaded Advanced/GLB Goon.')
+    }
+
+    const performance = resolveCustomPerformanceRigManifest(
+      resolveCustomPerformanceRigBlock(manifest)
+    )
+    if (performance.issues.length || !performance.manifest) {
+      throw new Error(
+        performance.issues[0] ?? 'The Goon does not declare an animated head attachment node.'
+      )
+    }
+    const declaredHeadNodeName = performance.manifest.nodes.head.node
+    if (asset && asset.attachment.headNode !== declaredHeadNodeName) {
+      throw new Error(
+        `Hair Asset ${asset.assetId}@${asset.revisionId} targets head node "${asset.attachment.headNode}", but this Goon declares "${declaredHeadNodeName}".`
+      )
+    }
+    const headNodeName = asset?.attachment.headNode ?? declaredHeadNodeName
+    const headNode = resolveCustomNamedNode(avatarRoot, headNodeName)
+    if (!headNode) {
+      throw new Error(`The Goon is missing its declared head node "${headNodeName}".`)
+    }
+    const headRestMatrix = this.customHairAttachmentRestMatrix
+    if (!headRestMatrix) {
+      throw new Error('The Goon head rest transform is unavailable for fitted hair preview.')
+    }
+
+    const loadToken = ++this.hairPreviewLoadToken
+    const loader = new GLTFLoader()
+    const gltf = await loader.loadAsync(trimmedUrl)
+    const hairRoot = gltf.scene ?? gltf.scenes?.[0]
+    if (!hairRoot) {
+      throw new Error('The selected hair GLB is missing a scene root.')
+    }
+    if (loadToken !== this.hairPreviewLoadToken || avatarRoot !== this.customAvatarRoot) {
+      this.disposeObject3D(hairRoot)
+      throw new Error('The Goon changed before the hair preview finished loading.')
+    }
+
+    hairRoot.name = 'BatshitHairPreview'
+    if (asset) {
+      hairRoot.matrix.fromArray(asset.attachment.authoredRootMatrix)
+      hairRoot.matrix.decompose(hairRoot.position, hairRoot.quaternion, hairRoot.scale)
+      hairRoot.updateMatrix()
+    }
+    let summary: HairAttachmentSummary
+    let materialRuntime: HairMaterialRuntimeHandle | null = null
+    let followerRuntime: HairFollowerRuntimeHandle | null = null
+    let secondaryMotionRuntime: SecondaryMotionEngineRuntime | null = null
+    let secondaryMotionDefinition: SecondaryMotionDefinitionV1 | null = null
+    try {
+      if (asset) {
+        if (!state) throw new Error('The selected Hair style has no color state.')
+        materialRuntime = await applyHairAssetMaterial(hairRoot, asset, state, resolveAssetUrl)
+        if (loadToken !== this.hairPreviewLoadToken || avatarRoot !== this.customAvatarRoot) {
+          throw new Error(
+            'The Goon or Hair selection changed before the material finished loading.'
+          )
+        }
+        if (asset.follower.mode === 'appearance-followers/v2') {
+          if (!asset.follower.asset) {
+            throw new Error('The selected Hair style is missing its declared follower asset.')
+          }
+          const response = await fetch(resolveAssetUrl(asset.follower.asset.ref))
+          if (!response.ok) {
+            throw new Error(`Hair follower asset failed to load (${response.status}).`)
+          }
+          const definition = await verifyHairFollowerDefinitionBytes(
+            asset,
+            new Uint8Array(await response.arrayBuffer())
+          )
+          if (loadToken !== this.hairPreviewLoadToken || avatarRoot !== this.customAvatarRoot) {
+            throw new Error(
+              'The Goon or Hair selection changed before the follower finished loading.'
+            )
+          }
+          const appearanceRuntime = this.appearanceDialsRuntime
+          if (!appearanceRuntime) {
+            throw new Error('The loaded Goon has no Appearance Dials runtime for Hair followers.')
+          }
+          followerRuntime = new HairFollowerEngineRuntime(hairRoot, definition)
+          followerRuntime.apply(appearanceRuntime.getState())
+        }
+        if (asset.physics.mode === 'secondary-motion/v1') {
+          if (!asset.physics.asset) {
+            throw new Error(
+              'The selected Hair style is missing its declared secondary-motion asset.'
+            )
+          }
+          const response = await fetch(resolveAssetUrl(asset.physics.asset.ref))
+          if (!response.ok) {
+            throw new Error(`Hair secondary-motion asset failed to load (${response.status}).`)
+          }
+          secondaryMotionDefinition = await verifyHairSecondaryMotionDefinitionBytes(
+            asset,
+            new Uint8Array(await response.arrayBuffer())
+          )
+          if (loadToken !== this.hairPreviewLoadToken || avatarRoot !== this.customAvatarRoot) {
+            throw new Error(
+              'The Goon or Hair selection changed before secondary motion finished loading.'
+            )
+          }
+        }
+      }
+      hairRoot.traverse((object) => {
+        if (!(object instanceof THREE.Mesh)) return
+        object.frustumCulled = false
+        object.castShadow = true
+        object.receiveShadow = true
+      })
+      if (asset) {
+        hairRoot.removeFromParent()
+        headNode.add(hairRoot)
+        avatarRoot.updateMatrixWorld(true)
+        if (secondaryMotionDefinition) {
+          const appearanceRuntime = this.appearanceDialsRuntime
+          if (!appearanceRuntime) {
+            throw new Error('The loaded Goon has no Appearance Dials runtime for Hair colliders.')
+          }
+          secondaryMotionRuntime = new SecondaryMotionEngineRuntime(hairRoot, avatarRoot, {
+            owner: secondaryMotionDefinition.owner,
+            chainSpace: secondaryMotionDefinition.chainSpace,
+            colliderSpace: secondaryMotionDefinition.colliderSpace,
+            simulation: secondaryMotionDefinition.simulation,
+            chains: resolveSecondaryMotionChains(
+              secondaryMotionDefinition,
+              appearanceRuntime.getState()
+            ),
+            colliders: resolveSecondaryMotionColliders(
+              secondaryMotionDefinition,
+              appearanceRuntime.getState()
+            )
+          })
+          if (state?.motionSettings) {
+            secondaryMotionRuntime.setMotionTuning(state.motionSettings)
+          }
+        }
+        summary = summarizeHairAsset(hairRoot)
+      } else {
+        summary = attachRigidHairAsset(avatarRoot, headNode, hairRoot, headRestMatrix)
+      }
+    } catch (error) {
+      secondaryMotionRuntime?.dispose()
+      followerRuntime?.dispose()
+      this.disposeObject3D(hairRoot)
+      throw error
+    }
+    const previous = this.hairPreviewRoot
+    const previousFollower = this.hairPreviewFollowerRuntime
+    const previousSecondaryMotion = this.hairPreviewSecondaryMotionRuntime
+    this.hairPreviewRoot = hairRoot
+    this.hairPreviewMaterialRuntime = materialRuntime
+    this.hairPreviewFollowerRuntime = followerRuntime
+    this.hairPreviewSecondaryMotionRuntime = secondaryMotionRuntime
+    this.hairPreviewSecondaryMotionDefinition = secondaryMotionDefinition
+    this.hairPreviewSecondaryMotionSuspended = false
+    this.hairImportInspectionRoot = null
+    this.hairImportInspectionObjects.clear()
+    previousSecondaryMotion?.dispose()
+    previousFollower?.dispose()
+    if (previous && previous !== hairRoot) {
+      previous.removeFromParent()
+      this.disposeObject3D(previous)
+    }
+    return summary
+  }
+
   private clearLoadedGoonState() {
+    this.clearHairPreview()
+    for (const runtime of this.embeddedSecondaryMotionRuntimes) runtime.dispose()
+    this.embeddedSecondaryMotionRuntimes = []
     this.zoomGesture = null
     if (this.mixer) {
       const mixer = this.mixer
@@ -2359,7 +3442,9 @@ export class GoonEngine implements GoonStageHost {
 
     this.customPerformanceRigRuntime?.dispose()
     this.customPerformanceRigRuntime = null
-    this.customPerformanceDirection = { ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION }
+    this.customPerformanceDirection = {
+      ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION
+    }
     this.customPerformanceTargetWeights = new Map()
     this.socketEyeSurfaceRuntime?.dispose()
     this.socketEyeSurfaceRuntime = null
@@ -2406,6 +3491,7 @@ export class GoonEngine implements GoonStageHost {
     }
     this.syncLightingLane()
     this.customAvatarManifest = null
+    this.customHairAttachmentRestMatrix = null
     this.customStageAnchors = {}
 
     this.bones = {}
@@ -2419,7 +3505,11 @@ export class GoonEngine implements GoonStageHost {
     this.hasMouthBlendshapes = false
     this.hasExpressionBlendshapes = false
     this.availableMouthPresets.clear()
-    this.customMouthPresetSupport = { mode: 'none', profile: null, availablePresets: [] }
+    this.customMouthPresetSupport = {
+      mode: 'none',
+      profile: null,
+      availablePresets: []
+    }
     this.faceMorphBindings = []
     this.faceMorphTargetNames = []
     this.authorableRawMorphTargetNames = []
@@ -2519,7 +3609,9 @@ export class GoonEngine implements GoonStageHost {
     return hash.toString(36)
   }
 
-  private resolveBodyConcealMirrorCenterX(position: THREE.BufferAttribute | THREE.InterleavedBufferAttribute) {
+  private resolveBodyConcealMirrorCenterX(
+    position: THREE.BufferAttribute | THREE.InterleavedBufferAttribute
+  ) {
     let minX = Number.POSITIVE_INFINITY
     let maxX = Number.NEGATIVE_INFINITY
     for (let index = 0; index < position.count; index += 1) {
@@ -2533,7 +3625,9 @@ export class GoonEngine implements GoonStageHost {
 
   private getBodyConcealMaterialNames(mesh: THREE.Mesh | THREE.SkinnedMesh) {
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
-    return materials.map((material) => material?.name?.trim()).filter((name): name is string => Boolean(name))
+    return materials
+      .map((material) => material?.name?.trim())
+      .filter((name): name is string => Boolean(name))
   }
 
   private resolveBodyConcealMeshName(mesh: THREE.Mesh | THREE.SkinnedMesh) {
@@ -2548,7 +3642,9 @@ export class GoonEngine implements GoonStageHost {
     return !BODY_CONCEAL_EXCLUDED_NAME_RE.test(normalized)
   }
 
-  private resolveManifestBodyConcealFallbackMeshNames(manifest: GoonCustomAvatarManifest | null | undefined) {
+  private resolveManifestBodyConcealFallbackMeshNames(
+    manifest: GoonCustomAvatarManifest | null | undefined
+  ) {
     return [
       ...new Set(
         [manifest?.face?.mesh, ...(manifest?.face?.meshes ?? [])]
@@ -2568,11 +3664,9 @@ export class GoonEngine implements GoonStageHost {
     return nextName
   }
 
-  private registerBodyConcealMesh(
-    meshName: string,
-    node: THREE.Mesh | THREE.SkinnedMesh
-  ) {
-    if ([...this.bodyConcealMeshes.values()].some((runtimeMesh) => runtimeMesh.mesh === node)) return
+  private registerBodyConcealMesh(meshName: string, node: THREE.Mesh | THREE.SkinnedMesh) {
+    if ([...this.bodyConcealMeshes.values()].some((runtimeMesh) => runtimeMesh.mesh === node))
+      return
     const geometry = node.geometry
     const index = geometry.getIndex()
     const position = geometry.getAttribute('position')
@@ -2587,7 +3681,9 @@ export class GoonEngine implements GoonStageHost {
     const triangleCount = originalIndexArray.length / 3
     const vertexCount = clonedPosition.count
     const mirrorCenterX = this.resolveBodyConcealMirrorCenterX(clonedPosition)
-    const runtimeMeshName = this.buildUniqueBodyConcealMeshName(meshName.trim() || this.resolveBodyConcealMeshName(node))
+    const runtimeMeshName = this.buildUniqueBodyConcealMeshName(
+      meshName.trim() || this.resolveBodyConcealMeshName(node)
+    )
     const topologySignature = `${runtimeMeshName}:v${vertexCount}:t${triangleCount}:i${this.buildBodyConcealIndexHash(originalIndexArray)}`
     this.bodyConcealMeshes.set(runtimeMeshName, {
       meshName: runtimeMeshName,
@@ -2614,7 +3710,8 @@ export class GoonEngine implements GoonStageHost {
   private registerSceneFallbackBodyConcealMeshes(root: THREE.Object3D) {
     root.traverse((node) => {
       if (!(node instanceof THREE.Mesh || node instanceof THREE.SkinnedMesh)) return
-      if ([...this.bodyConcealMeshes.values()].some((runtimeMesh) => runtimeMesh.mesh === node)) return
+      if ([...this.bodyConcealMeshes.values()].some((runtimeMesh) => runtimeMesh.mesh === node))
+        return
       const materialNames = this.getBodyConcealMaterialNames(node)
       const meshName = this.resolveBodyConcealMeshName(node)
       const hasBodySkinMaterial = materialNames.some((materialName) =>
@@ -2629,7 +3726,10 @@ export class GoonEngine implements GoonStageHost {
     })
   }
 
-  private configureBodyConcealManifest(root: THREE.Object3D, manifest: GoonCustomAvatarManifest | null | undefined) {
+  private configureBodyConcealManifest(
+    root: THREE.Object3D,
+    manifest: GoonCustomAvatarManifest | null | undefined
+  ) {
     this.clearBodyConcealRuntime()
     const concealMeshes = manifest?.body?.conceal?.meshes ?? []
     for (const concealMesh of concealMeshes) {
@@ -2717,7 +3817,10 @@ export class GoonEngine implements GoonStageHost {
       const bucket = sourceNodesByName.get(name) ?? []
       bucket.push(node)
       sourceNodesByName.set(name, bucket)
-      if ((node instanceof THREE.Mesh || node instanceof THREE.SkinnedMesh) && !selectedNodeNames.has(name)) {
+      if (
+        (node instanceof THREE.Mesh || node instanceof THREE.SkinnedMesh) &&
+        !selectedNodeNames.has(name)
+      ) {
         node.visible = false
       }
       if (node instanceof THREE.Bone) {
@@ -2754,9 +3857,7 @@ export class GoonEngine implements GoonStageHost {
 
     const anchors = manifest.stage?.anchors
     if (!anchors) {
-      throw new Error(
-        'Custom avatar manifest must define stage anchors for head, hips, and feet.'
-      )
+      throw new Error('Custom avatar manifest must define stage anchors for head, hips, and feet.')
     }
 
     const resolveNode = (label: string, name?: string) => {
@@ -2855,6 +3956,16 @@ export class GoonEngine implements GoonStageHost {
     this.customPerformanceRigRuntime?.removeOverlay()
     this.appearanceDialsValues = values
     runtime.setValues(values)
+    this.hairPreviewFollowerRuntime?.apply(runtime.getState())
+    if (this.hairPreviewSecondaryMotionRuntime && this.hairPreviewSecondaryMotionDefinition) {
+      this.hairPreviewSecondaryMotionRuntime.setResolvedState(
+        resolveSecondaryMotionChains(this.hairPreviewSecondaryMotionDefinition, runtime.getState()),
+        resolveSecondaryMotionColliders(
+          this.hairPreviewSecondaryMotionDefinition,
+          runtime.getState()
+        )
+      )
+    }
     this.socketEyeSurfaceRuntime?.syncIdentitySurfaceFrames()
     this.customPerformanceRigRuntime?.rebaseLookNodePositions()
   }
@@ -2868,6 +3979,16 @@ export class GoonEngine implements GoonStageHost {
     this.customPerformanceRigRuntime?.removeOverlay()
     this.appearanceDialsValues = values
     runtime.setFittedValues(values, anatomyFitResults)
+    this.hairPreviewFollowerRuntime?.apply(runtime.getState())
+    if (this.hairPreviewSecondaryMotionRuntime && this.hairPreviewSecondaryMotionDefinition) {
+      this.hairPreviewSecondaryMotionRuntime.setResolvedState(
+        resolveSecondaryMotionChains(this.hairPreviewSecondaryMotionDefinition, runtime.getState()),
+        resolveSecondaryMotionColliders(
+          this.hairPreviewSecondaryMotionDefinition,
+          runtime.getState()
+        )
+      )
+    }
     this.socketEyeSurfaceRuntime?.syncIdentitySurfaceFrames()
     this.customPerformanceRigRuntime?.rebaseLookNodePositions()
   }
@@ -3144,9 +4265,7 @@ export class GoonEngine implements GoonStageHost {
     const rawDefinition = manifest.skinAppearance
     if (rawDefinition === undefined || rawDefinition === null) {
       if (initialState || initialMaterialArtwork) {
-        throw new Error(
-          'Saved Skin Appearance state targets a package without skin-appearance/v1.'
-        )
+        throw new Error('Saved Skin Appearance state targets a package without skin-appearance/v1.')
       }
       return
     }
@@ -3154,9 +4273,7 @@ export class GoonEngine implements GoonStageHost {
       (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
       (manifest.liveBuild === undefined || manifest.liveBuild === null)
     ) {
-      throw new Error(
-        'skin-appearance/v1 requires a Recipe Source or verified Live Goon package.'
-      )
+      throw new Error('skin-appearance/v1 requires a Recipe Source or verified Live Goon package.')
     }
     const definition = parseSkinAppearanceDefinition(rawDefinition)
     const root = this.customAvatarRoot
@@ -3187,12 +4304,7 @@ export class GoonEngine implements GoonStageHost {
     if (!socketEyes || !eyeAppearance) {
       throw new Error('Facial Artwork v4 requires the active socket-eye runtime.')
     }
-    const runtime = new FacialArtworkEngineRuntime(
-      root,
-      definition,
-      socketEyes,
-      eyeAppearance
-    )
+    const runtime = new FacialArtworkEngineRuntime(root, definition, socketEyes, eyeAppearance)
     try {
       await runtime.apply(initialState)
     } catch (error) {
@@ -3265,7 +4377,9 @@ export class GoonEngine implements GoonStageHost {
     }
 
     this.customPerformanceRigRuntime = binding.runtime
-    this.customPerformanceDirection = { ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION }
+    this.customPerformanceDirection = {
+      ...NEUTRAL_CUSTOM_PERFORMANCE_DIRECTION
+    }
     this.customPerformanceTargetWeights = new Map()
   }
 
@@ -3361,8 +4475,7 @@ export class GoonEngine implements GoonStageHost {
     })
 
     // hips clip remap baseline (rest-relative/v1)
-    const rigHips =
-      (manifest as { rig?: { hips?: string } }).rig?.hips ?? 'mixamorig:Hips'
+    const rigHips = (manifest as { rig?: { hips?: string } }).rig?.hips ?? 'mixamorig:Hips'
     const hipsNode = this.resolveBodyDialBone(rigHips)
     if (hipsNode) {
       this.bodyDialsHipsRemap = {
@@ -3435,7 +4548,10 @@ export class GoonEngine implements GoonStageHost {
     }
     if (!spec) return
 
-    const drivers: Array<{ driver: JointCorrectiveDriver; nodes: THREE.Object3D[] }> = []
+    const drivers: Array<{
+      driver: JointCorrectiveDriver
+      nodes: THREE.Object3D[]
+    }> = []
     for (const driver of spec.drivers) {
       const nodes: THREE.Object3D[] = []
       for (const bone of driver.bones) {
@@ -3480,7 +4596,10 @@ export class GoonEngine implements GoonStageHost {
     if (!root) throw new Error('Custom avatar root is missing during Live corrective setup.')
     const spec = parseLiveJointCorrectivesFromManifest(manifest)
     if (!spec) return
-    const drivers: Array<{ driver: JointCorrectiveDriver; nodes: THREE.Object3D[] }> = []
+    const drivers: Array<{
+      driver: JointCorrectiveDriver
+      nodes: THREE.Object3D[]
+    }> = []
     for (const driver of spec.drivers) {
       const nodes = driver.bones.map((bone) => {
         const node = resolveCustomNamedNode(root, bone.bone)
@@ -3500,7 +4619,9 @@ export class GoonEngine implements GoonStageHost {
       }
       const index = mesh.morphTargetDictionary?.[entry.morph]
       if (index === undefined || !Array.isArray(mesh.morphTargetInfluences)) {
-        throw new Error(`Live corrective morph ${entry.node}/${entry.morph} is missing from avatar.glb.`)
+        throw new Error(
+          `Live corrective morph ${entry.node}/${entry.morph} is missing from avatar.glb.`
+        )
       }
       bindings.set(`${entry.node}\u0000${entry.morph}`, { mesh, index })
     }
@@ -3612,8 +4733,7 @@ export class GoonEngine implements GoonStageHost {
         )
         if (hipsEntry) {
           remap.newRest.copy(hipsEntry.node.position)
-          remap.ratio =
-            Math.abs(remap.baseRest.y) > 1e-6 ? remap.newRest.y / remap.baseRest.y : 1
+          remap.ratio = Math.abs(remap.baseRest.y) > 1e-6 ? remap.newRest.y / remap.baseRest.y : 1
           remap.lastOutput = remap.node.position.clone()
         }
       }
@@ -3634,8 +4754,7 @@ export class GoonEngine implements GoonStageHost {
     const root = this.customAvatarRoot
     if (root && this.bodyDialsRootBase) {
       root.scale.copy(this.bodyDialsRootBase.scale).multiplyScalar(state.rootScale)
-      root.position.y =
-        this.bodyDialsRootBase.positionY - state.soleOffsetY * state.rootScale
+      root.position.y = this.bodyDialsRootBase.positionY - state.soleOffsetY * state.rootScale
       root.updateMatrixWorld(true)
     }
   }
@@ -3657,9 +4776,7 @@ export class GoonEngine implements GoonStageHost {
       remap.newRest.y + remap.ratio * (position.y - remap.baseRest.y),
       remap.newRest.z + remap.ratio * (position.z - remap.baseRest.z)
     )
-    remap.lastOutput = remap.lastOutput
-      ? remap.lastOutput.copy(position)
-      : position.clone()
+    remap.lastOutput = remap.lastOutput ? remap.lastOutput.copy(position) : position.clone()
   }
 
   /**
@@ -3679,7 +4796,8 @@ export class GoonEngine implements GoonStageHost {
       (!spec && !liveSpec) ||
       (spec && !bodyManifest && (!appearanceRuntime || !appearanceManifest)) ||
       this.jointCorrectivesDrivers.length === 0
-    ) return
+    )
+      return
 
     const angles: Record<string, number> = {}
     let maxAngle = 0
@@ -3702,7 +4820,9 @@ export class GoonEngine implements GoonStageHost {
       for (const [key, value] of finals) {
         const binding = this.liveJointCorrectiveBindings.get(key)
         if (!binding || !Array.isArray(binding.mesh.morphTargetInfluences)) {
-          throw new Error(`Live corrective runtime binding ${key} disappeared after package validation.`)
+          throw new Error(
+            `Live corrective runtime binding ${key} disappeared after package validation.`
+          )
         }
         binding.mesh.morphTargetInfluences[binding.index] = value
       }
@@ -3826,10 +4946,7 @@ export class GoonEngine implements GoonStageHost {
       return complete ? resolved : null
     }
 
-    const resolvedArkitFace = resolveAvailableArkitBindings(
-      arkitFaceBindings.face,
-      'face.arkit52'
-    )
+    const resolvedArkitFace = resolveAvailableArkitBindings(arkitFaceBindings.face, 'face.arkit52')
     const resolvedArkitTongue = resolveAvailableArkitBindings(
       arkitFaceBindings.tongue,
       'face.tongue16'
@@ -4016,14 +5133,13 @@ export class GoonEngine implements GoonStageHost {
     const animationNames = Array.from(this.animationMap.keys())
     const criticalBonesMissing = coverage.missingCoreBones.length > 0
     this.onCompatibility?.({
-      tier:
-        criticalBonesMissing
-          ? 'C'
-          : this.hasMouthBlendshapes && hasCoreExpressions
-            ? 'A'
-            : this.hasMouthBlendshapes
-              ? 'B'
-              : 'C',
+      tier: criticalBonesMissing
+        ? 'C'
+        : this.hasMouthBlendshapes && hasCoreExpressions
+          ? 'A'
+          : this.hasMouthBlendshapes
+            ? 'B'
+            : 'C',
       issues,
       hasMouth: this.hasMouthBlendshapes,
       hasExpressions: this.hasExpressionBlendshapes,
@@ -4158,9 +5274,10 @@ export class GoonEngine implements GoonStageHost {
     const { minDistance, maxDistance } = this.resolveCameraDistanceLimits(target)
     this.controls.minDistance = minDistance
     this.controls.maxDistance = maxDistance
-    let distance = typeof camera.distance === 'number'
-      ? THREE.MathUtils.clamp(camera.distance, minDistance, maxDistance)
-      : currentSpherical.radius
+    let distance =
+      typeof camera.distance === 'number'
+        ? THREE.MathUtils.clamp(camera.distance, minDistance, maxDistance)
+        : currentSpherical.radius
     let renderedFov = this.baseCameraFov
     if (typeof camera.zoom === 'number') {
       const zoom = resolveHybridCameraZoomAtPosition({
@@ -4377,20 +5494,25 @@ export class GoonEngine implements GoonStageHost {
     avatarRoot.updateWorldMatrix(true, true)
     this.camera.updateMatrixWorld()
     this.zoomRaycaster.setFromCamera(pointerNdc, this.camera)
-    const hit = this.zoomRaycaster
-      .intersectObject(avatarRoot, true)
-      .find((intersection) => {
-        if (!Number.isFinite(intersection.distance)) return false
-        let node: THREE.Object3D | null = intersection.object
-        while (node) {
-          if (!node.visible) return false
-          if (node === avatarRoot) break
-          node = node.parent
-        }
-        const mesh = intersection.object as THREE.Mesh
-        const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : []
-        return materials.length === 0 || materials.some((material) => material.visible && material.opacity > 0.02)
-      })
+    const hit = this.zoomRaycaster.intersectObject(avatarRoot, true).find((intersection) => {
+      if (!Number.isFinite(intersection.distance)) return false
+      let node: THREE.Object3D | null = intersection.object
+      while (node) {
+        if (!node.visible) return false
+        if (node === avatarRoot) break
+        node = node.parent
+      }
+      const mesh = intersection.object as THREE.Mesh
+      const materials = Array.isArray(mesh.material)
+        ? mesh.material
+        : mesh.material
+          ? [mesh.material]
+          : []
+      return (
+        materials.length === 0 ||
+        materials.some((material) => material.visible && material.opacity > 0.02)
+      )
+    })
     if (!hit) return null
     return { point: hit.point.clone(), pointerNdc }
   }
@@ -4485,7 +5607,11 @@ export class GoonEngine implements GoonStageHost {
 
     if (this.roomShellBuilderObject && this.builderBounds) {
       const bounds = new THREE.Box3(
-        new THREE.Vector3(this.builderBounds.minX, this.builderBounds.minY, this.builderBounds.minZ),
+        new THREE.Vector3(
+          this.builderBounds.minX,
+          this.builderBounds.minY,
+          this.builderBounds.minZ
+        ),
         new THREE.Vector3(this.builderBounds.maxX, this.builderBounds.maxY, this.builderBounds.maxZ)
       )
       const clamped = clampCameraPositionToPaddedBox({
@@ -4518,9 +5644,7 @@ export class GoonEngine implements GoonStageHost {
     })
     if (!clamped) return false
     const constrainedWorld = this.roomShell.localToWorld(
-      clamped.position
-        .applyAxisAngle(new THREE.Vector3(0, 1, 0), rotation)
-        .add(center)
+      clamped.position.applyAxisAngle(new THREE.Vector3(0, 1, 0), rotation).add(center)
     )
     if (constrainedWorld.equals(this.camera.position)) return false
     this.camera.position.copy(constrainedWorld)
@@ -4550,18 +5674,17 @@ export class GoonEngine implements GoonStageHost {
     })
     const nextDistance = nextZoom.distance
 
-    const gesture = pointer && !this.editTarget
-      ? this.resolveZoomGesture(pointer, delta < 0)
-      : null
-    const cursorDolly = gesture?.kind === 'goon'
-      ? resolvePerspectivePinnedPointZoom({
-          camera: this.camera,
-          pointerNdc: gesture.pointerNdc,
-          pinnedPoint: gesture.pinnedPoint,
-          nextDistance,
-          nextFovDegrees: nextZoom.fov
-        })
-      : null
+    const gesture = pointer && !this.editTarget ? this.resolveZoomGesture(pointer, delta < 0) : null
+    const cursorDolly =
+      gesture?.kind === 'goon'
+        ? resolvePerspectivePinnedPointZoom({
+            camera: this.camera,
+            pointerNdc: gesture.pointerNdc,
+            pinnedPoint: gesture.pinnedPoint,
+            nextDistance,
+            nextFovDegrees: nextZoom.fov
+          })
+        : null
 
     if (cursorDolly && this.controls) {
       this.camera.position.copy(cursorDolly.nextPosition)
@@ -4607,9 +5730,10 @@ export class GoonEngine implements GoonStageHost {
     const feetTarget = this.customAvatarRoot
       ? this.getCustomAnchorPosition('feet')
       : this.getFeetTarget()
-    const anchors = headTarget && hipsTarget && feetTarget
-      ? { headY: headTarget.y, hipsY: hipsTarget.y, feetY: feetTarget.y }
-      : null
+    const anchors =
+      headTarget && hipsTarget && feetTarget
+        ? { headY: headTarget.y, hipsY: hipsTarget.y, feetY: feetTarget.y }
+        : null
     const provisionalLimits = this.resolveCameraDistanceLimits()
     const framing = resolveGoonFraming({
       bounds,
@@ -4811,7 +5935,9 @@ export class GoonEngine implements GoonStageHost {
         forward.set(0, 0, -1)
       }
       forward.normalize()
-      const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize()
+      const right = new THREE.Vector3()
+        .crossVectors(forward, new THREE.Vector3(0, 1, 0))
+        .normalize()
       const delta = right.multiplyScalar(dx * panScale).add(forward.multiplyScalar(-dy * panScale))
       delta.y = 0
       this.applyPanDelta(delta)
@@ -4848,7 +5974,10 @@ export class GoonEngine implements GoonStageHost {
     const rawDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX
     const delta = Math.sign(rawDelta) * Math.min(Math.abs(rawDelta), 120)
     if (!delta) return
-    this.applyUnifiedZoom(delta, { clientX: event.clientX, clientY: event.clientY })
+    this.applyUnifiedZoom(delta, {
+      clientX: event.clientX,
+      clientY: event.clientY
+    })
   }
 
   private updateSkyboxCamera() {
@@ -4882,9 +6011,7 @@ export class GoonEngine implements GoonStageHost {
     groundedSkybox.renderOrder = -1000
 
     const uv = groundedSkybox.geometry.getAttribute('uv')
-    this.groundedSkyboxCanonicalUv = uv
-      ? new Float32Array(uv.array as ArrayLike<number>)
-      : null
+    this.groundedSkyboxCanonicalUv = uv ? new Float32Array(uv.array as ArrayLike<number>) : null
     if (this.groundedSkyboxCanonicalUv) {
       reapplyGroundProjectionLineToGeometry(
         groundedSkybox.geometry,
@@ -5570,7 +6697,7 @@ export class GoonEngine implements GoonStageHost {
     const { floor, ceiling, walls } = builder.surfaces
     const { exteriorAprons, terrainSkirt } = builder
     const resolveTrim = (side: NormalizedRoomSurfaceSide) =>
-      side.transparency === 'cutout' ? side.trimTexture ?? DEFAULT_TRIM_TEXTURE : null
+      side.transparency === 'cutout' ? (side.trimTexture ?? DEFAULT_TRIM_TEXTURE) : null
     const floorTexture = await loadTexture(floor.interior.texture)
     const floorExteriorTexture = await loadTexture(floor.exterior.texture)
     const ceilingTexture = await loadTexture(ceiling.interior.texture)
@@ -5675,10 +6802,7 @@ export class GoonEngine implements GoonStageHost {
     this.applyMarkerForPosture(this.resolveCurrentPlacementPosture())
   }
 
-  setSceneMarkers(
-    markers: GoonSceneMarkers = {},
-    options: { reapplyPlacement?: boolean } = {}
-  ) {
+  setSceneMarkers(markers: GoonSceneMarkers = {}, options: { reapplyPlacement?: boolean } = {}) {
     this.sceneMarkers = { ...markers }
     if (
       this.editTarget?.type === 'marker' &&
@@ -5855,9 +6979,7 @@ export class GoonEngine implements GoonStageHost {
 
   async setEditTarget(
     target:
-      | { type: 'prop'; id: string }
-      | { type: 'marker'; id: string; posture: GoonPosture }
-      | null
+      { type: 'prop'; id: string } | { type: 'marker'; id: string; posture: GoonPosture } | null
   ) {
     if (!this.transformControls) return false
     if (!target) {
@@ -5921,8 +7043,16 @@ export class GoonEngine implements GoonStageHost {
       const object = this.propObjects.get(this.editTarget.id)
       if (!object) return null
       return {
-        position: [object.position.x, object.position.y, object.position.z] as [number, number, number],
-        rotation: [object.rotation.x, object.rotation.y, object.rotation.z] as [number, number, number],
+        position: [object.position.x, object.position.y, object.position.z] as [
+          number,
+          number,
+          number
+        ],
+        rotation: [object.rotation.x, object.rotation.y, object.rotation.z] as [
+          number,
+          number,
+          number
+        ],
         scale: [object.scale.x, object.scale.y, object.scale.z] as [number, number, number]
       }
     }
@@ -5986,7 +7116,7 @@ export class GoonEngine implements GoonStageHost {
   getGoonMarkerSnapshot(propId?: string) {
     const currentPlacement = this.getCurrentVisualPlacement()
     if (!currentPlacement) return null
-    const parent = propId ? this.propObjects.get(propId) ?? this.sceneRoot : this.sceneRoot
+    const parent = propId ? (this.propObjects.get(propId) ?? this.sceneRoot) : this.sceneRoot
     const snapshot = captureMarkerFromAvatarPlacement({
       avatarWorldPosition: currentPlacement.position,
       worldYaw: currentPlacement.rotationY,
@@ -6052,12 +7182,16 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private resolveMarkerWorldPosition(marker: GoonSceneMarker): THREE.Vector3 {
-    const parent = marker.propId ? this.propObjects.get(marker.propId) ?? this.sceneRoot : this.sceneRoot
+    const parent = marker.propId
+      ? (this.propObjects.get(marker.propId) ?? this.sceneRoot)
+      : this.sceneRoot
     return resolveMarkerWorldPositionFromParent(marker, parent)
   }
 
   private resolveMarkerWorldRotationY(marker: GoonSceneMarker) {
-    const parent = marker.propId ? this.propObjects.get(marker.propId) ?? this.sceneRoot : this.sceneRoot
+    const parent = marker.propId
+      ? (this.propObjects.get(marker.propId) ?? this.sceneRoot)
+      : this.sceneRoot
     return resolveMarkerWorldYaw(marker, parent)
   }
 
@@ -6093,8 +7227,7 @@ export class GoonEngine implements GoonStageHost {
     const marker =
       (preferredMarkerId
         ? postureMarkers.find((candidate) => candidate.id === preferredMarkerId)
-        : null) ??
-      postureMarkers[0]
+        : null) ?? postureMarkers[0]
 
     if (!marker) {
       return {
@@ -6113,7 +7246,10 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  private resolvePosturePlacement(posture: GoonPosture, preferredMarkerId?: string): PosturePlacement | null {
+  private resolvePosturePlacement(
+    posture: GoonPosture,
+    preferredMarkerId?: string
+  ): PosturePlacement | null {
     const exactMarker =
       (preferredMarkerId ? this.findMarker(posture, preferredMarkerId) : null) ??
       this.getSceneMarkerList(posture)[0]
@@ -6282,7 +7418,6 @@ export class GoonEngine implements GoonStageHost {
     this.syncSkyboxZoomFromCamera()
   }
 
-
   setQuality(quality: GoonEngineQuality) {
     const previousSkyboxMaxSize = this.loadedSkyboxTextureMaxSize
     this.quality = quality
@@ -6299,13 +7434,14 @@ export class GoonEngine implements GoonStageHost {
         ? 1
         : quality === 'ultra'
           ? Math.min(Math.max(devicePixelRatio * 1.3, 2.4), 3)
-        : quality === 'high'
-          ? Math.min(Math.max(devicePixelRatio * 1.15, 1.9), 2.5)
-          : Math.min(Math.max(devicePixelRatio * 1.05, 1.5), 2)
+          : quality === 'high'
+            ? Math.min(Math.max(devicePixelRatio * 1.15, 1.9), 2.5)
+            : Math.min(Math.max(devicePixelRatio * 1.05, 1.5), 2)
 
     this.renderScale = quality === 'low' ? 0.8 : this.embeddedWebKitRuntime ? 0.9 : 1
     this.renderer.setPixelRatio(ratio)
-    this.targetFrameIntervalMs = quality === 'low' || this.embeddedWebKitRuntime ? 1000 / 30 : 1000 / 60
+    this.targetFrameIntervalMs =
+      quality === 'low' || this.embeddedWebKitRuntime ? 1000 / 30 : 1000 / 60
     this.poseUpdateIntervalMs = Math.max(
       this.coveragePoseIntervalMs,
       quality === 'low' || this.embeddedWebKitRuntime ? 1000 / 30 : 0
@@ -6315,11 +7451,7 @@ export class GoonEngine implements GoonStageHost {
     this.refreshSkyboxBudgetRuntimeStatus()
 
     const nextSkyboxMaxSize = this.getRuntimeSkyboxTextureMaxSize()
-    if (
-      this.skyboxUrl &&
-      this.skyboxTexture &&
-      previousSkyboxMaxSize !== nextSkyboxMaxSize
-    ) {
+    if (this.skyboxUrl && this.skyboxTexture && previousSkyboxMaxSize !== nextSkyboxMaxSize) {
       void this.setSkyboxBackground(this.skyboxUrl, { forceReload: true })
     }
   }
@@ -6445,7 +7577,12 @@ export class GoonEngine implements GoonStageHost {
         0,
         8
       ),
-      eyeYawRange: this.normalizeEyeContactTuningNumber(value?.eyeYawRange ?? legacy?.yawStrength, 1, 0, 8),
+      eyeYawRange: this.normalizeEyeContactTuningNumber(
+        value?.eyeYawRange ?? legacy?.yawStrength,
+        1,
+        0,
+        8
+      ),
       eyePitchSensitivity: this.normalizeEyeContactTuningNumber(
         value?.eyePitchSensitivity ?? legacy?.pitchStrength,
         1,
@@ -6591,7 +7728,7 @@ export class GoonEngine implements GoonStageHost {
     this.speechLipSyncDurationMs =
       typeof durationMs === 'number' && durationMs > 0
         ? durationMs
-        : (timeline.durationMs || this.speechLipSyncDurationMs)
+        : timeline.durationMs || this.speechLipSyncDurationMs
   }
 
   clearSpeechPlayback() {
@@ -6674,25 +7811,30 @@ export class GoonEngine implements GoonStageHost {
       return
     }
 
-    const cueLike: GoonCueDefinition = 'kind' in definition
-      ? definition
-      : {
-          name,
-          kind: 'emote',
-          faceProfiles: definition.faceProfiles,
-          expressionTargets: definition.expressionTargets,
-          faceControls: definition.faceControls,
-          rawMorphTargets: definition.rawMorphTargets
-        }
+    const cueLike: GoonCueDefinition =
+      'kind' in definition
+        ? definition
+        : {
+            name,
+            kind: 'emote',
+            faceProfiles: definition.faceProfiles,
+            expressionTargets: definition.expressionTargets,
+            faceControls: definition.faceControls,
+            rawMorphTargets: definition.rawMorphTargets
+          }
     const face = selectCueFacePayload(cueLike, {
       arkit52Available: this.customArkitFaceDriverBindings !== null,
       arkit52Bindings: this.customArkitFaceDriverBindings?.face
     })
 
-    this.authoringPreviewExpressionTargets = this.resolveExpressionTargets(name, {
-      ...cueLike,
-      expressionTargets: face.expressionTargets
-    }, face.profile !== 'arkit52')
+    this.authoringPreviewExpressionTargets = this.resolveExpressionTargets(
+      name,
+      {
+        ...cueLike,
+        expressionTargets: face.expressionTargets
+      },
+      face.profile !== 'arkit52'
+    )
     this.authoringPreviewIntensity = cueLike.intensity ?? 1
     this.authoringPreviewFaceControls = face.faceControls
     this.authoringPreviewRawMorphTargets = face.rawMorphTargets
@@ -6735,21 +7877,14 @@ export class GoonEngine implements GoonStageHost {
         mode: this.eyeContactMode,
         tuning: { ...this.eyeContactTuning },
         applied: { ...this.eyeContactApplied },
-        ...(this.socketEyeSurfaceDefinition
-          ? { socket: { ...this.socketEyeContact } }
-          : {})
+        ...(this.socketEyeSurfaceDefinition ? { socket: { ...this.socketEyeContact } } : {})
       },
       performance: {
         direction: { ...this.customPerformanceDirection },
         moodFaceBlend: this.moodFaceBlend,
         activeEmoteRemainingMs: Math.max(0, this.activeEmoteUntil - now),
         expressions: this.activeExpressions.map((expression) => {
-          const {
-            endsAt,
-            startTime,
-            stepStartTime,
-            ...rest
-          } = structuredClone(expression)
+          const { endsAt, startTime, stepStartTime, ...rest } = structuredClone(expression)
           return {
             ...rest,
             remainingMs: Math.max(0, endsAt - now),
@@ -6761,9 +7896,7 @@ export class GoonEngine implements GoonStageHost {
       speech: {
         speaking: this.speaking,
         pausedForCue: this.speechPausedForCue,
-        timeline: this.speechLipSyncTimeline
-          ? structuredClone(this.speechLipSyncTimeline)
-          : null,
+        timeline: this.speechLipSyncTimeline ? structuredClone(this.speechLipSyncTimeline) : null,
         analyzerId: this.speechLipSyncAnalyzerId,
         durationMs: this.speechLipSyncDurationMs,
         elapsedMs: this.getSpeechLipSyncElapsedMs()
@@ -6820,9 +7953,7 @@ export class GoonEngine implements GoonStageHost {
       : null
     this.speechLipSyncAnalyzerId = state.speech.analyzerId
     this.speechLipSyncDurationMs = state.speech.durationMs
-    this.speechLipSyncStartedAt = state.speech.timeline
-      ? now - state.speech.elapsedMs
-      : 0
+    this.speechLipSyncStartedAt = state.speech.timeline ? now - state.speech.elapsedMs : 0
     if (state.camera) this.applyCamera(state.camera)
   }
 
@@ -6832,9 +7963,8 @@ export class GoonEngine implements GoonStageHost {
    * mounted Dock/stage ownership contract handled by Packet R6.
    */
   captureComparisonPreviewState() {
-    const actionState = (action: THREE.AnimationAction | null) => action
-      ? { clipName: action.getClip().name, time: action.time }
-      : null
+    const actionState = (action: THREE.AnimationAction | null) =>
+      action ? { clipName: action.getClip().name, time: action.time } : null
     return {
       camera: this.getCameraState(),
       baseLoop: actionState(this.baseLoopAction),
@@ -6846,9 +7976,7 @@ export class GoonEngine implements GoonStageHost {
   }
 
   /** Restore camera/pose/animation time after a matched Recipe preview swap. */
-  restoreComparisonPreviewState(
-    state: ReturnType<GoonEngine['captureComparisonPreviewState']>
-  ) {
+  restoreComparisonPreviewState(state: ReturnType<GoonEngine['captureComparisonPreviewState']>) {
     if (state.camera) this.applyCamera(state.camera)
     if (state.authoringPoseMode) {
       this.setAuthoringPoseMode(true, state.authoringPoseAnimationName)
@@ -6872,7 +8000,8 @@ export class GoonEngine implements GoonStageHost {
 
   setAuthoringPoseMode(enabled: boolean, animationName?: string | null) {
     const nextAnimationName = enabled ? animationName?.trim() || null : null
-    if (this.authoringPoseMode === enabled && this.authoringPoseAnimationName === nextAnimationName) return
+    if (this.authoringPoseMode === enabled && this.authoringPoseAnimationName === nextAnimationName)
+      return
     this.authoringPoseMode = enabled
     this.authoringPoseAnimationName = nextAnimationName
 
@@ -6915,7 +8044,9 @@ export class GoonEngine implements GoonStageHost {
     const explicit = definition?.posture
     if (explicit) return explicit
     const animationName = definition?.animationName ?? name
-    const motionPosture = animationName ? this.animationMetadata.get(animationName)?.posture : undefined
+    const motionPosture = animationName
+      ? this.animationMetadata.get(animationName)?.posture
+      : undefined
     if (motionPosture) return motionPosture
     return resolveBasePosture(name as GoonPosture | undefined, undefined, this.postureDefinitions)
   }
@@ -7000,9 +8131,11 @@ export class GoonEngine implements GoonStageHost {
           if (token !== this.loadToken) return
           const currentVrm = this.vrm
           if (!currentVrm) {
-            if (this.addAnimationWarning(
-              `VRMA file "${sourceLabel}" targets VRM goons and cannot play on this GLB rig.`
-            )) {
+            if (
+              this.addAnimationWarning(
+                `VRMA file "${sourceLabel}" targets VRM goons and cannot play on this GLB rig.`
+              )
+            ) {
               hadWarnings = true
             }
             continue
@@ -7012,9 +8145,9 @@ export class GoonEngine implements GoonStageHost {
             : []
 
           if (vrmAnimations.length === 0) {
-            if (this.addAnimationWarning(
-              `VRMA file "${sourceLabel}" contains no VRM animations.`
-            )) {
+            if (
+              this.addAnimationWarning(`VRMA file "${sourceLabel}" contains no VRM animations.`)
+            ) {
               hadWarnings = true
             }
             continue
@@ -7051,15 +8184,19 @@ export class GoonEngine implements GoonStageHost {
         const analysis = this.analyzeAnimationTargets(gltf.animations, normalizedSceneNames)
         if (analysis.totalTracks > 0) {
           if (analysis.matchedTracks === 0) {
-            if (this.addAnimationWarning(
-              `Animation file "${sourceLabel}" may not match this Goon's rig (no matching tracks found).`
-            )) {
+            if (
+              this.addAnimationWarning(
+                `Animation file "${sourceLabel}" may not match this Goon's rig (no matching tracks found).`
+              )
+            ) {
               hadWarnings = true
             }
           } else if (analysis.matchRatio < 0.15 && analysis.matchedTracks < 4) {
-            if (this.addAnimationWarning(
-              `Animation file "${sourceLabel}" has low rig overlap (${analysis.matchedTracks}/${analysis.totalTracks} tracks matched).`
-            )) {
+            if (
+              this.addAnimationWarning(
+                `Animation file "${sourceLabel}" has low rig overlap (${analysis.matchedTracks}/${analysis.totalTracks} tracks matched).`
+              )
+            ) {
               hadWarnings = true
             }
           }
@@ -7085,7 +8222,11 @@ export class GoonEngine implements GoonStageHost {
     this.loadToken += 1
     const token = this.loadToken
     this.clearLoadedAnimationState()
-    this.registerAnimations(this.baseAnimations, this.vrm ? 'vrm' : 'custom', this.vrm ? 'vrm' : 'goon')
+    this.registerAnimations(
+      this.baseAnimations,
+      this.vrm ? 'vrm' : 'custom',
+      this.vrm ? 'vrm' : 'goon'
+    )
 
     if (files && files.length > 0) {
       await this.loadAdditionalAnimations(files, token)
@@ -7289,7 +8430,9 @@ export class GoonEngine implements GoonStageHost {
 
   estimateCueDurationMs(name: string, definition?: GoonCueDefinition) {
     const animationName = definition?.animationName ?? name
-    const animationDuration = animationName ? this.lookupAnimationDurationMs(animationName) ?? 0 : 0
+    const animationDuration = animationName
+      ? (this.lookupAnimationDurationMs(animationName) ?? 0)
+      : 0
     const expressionDuration = this.estimateExpressionDurationMs(definition)
     const definitionDuration = definition?.durationMs ?? 0
     const duration = Math.max(animationDuration, expressionDuration, definitionDuration)
@@ -7376,8 +8519,7 @@ export class GoonEngine implements GoonStageHost {
     const baseColor = originalState?.color ?? anyMaterial.color ?? null
     const shadeColor = originalState?.shadeColorFactor ?? anyMaterial.shadeColorFactor ?? null
     const emissiveColor = originalState?.emissive ?? anyMaterial.emissive ?? null
-    const outlineColor =
-      originalState?.outlineColorFactor ?? anyMaterial.outlineColorFactor ?? null
+    const outlineColor = originalState?.outlineColorFactor ?? anyMaterial.outlineColorFactor ?? null
 
     return {
       baseHex: baseColor?.isColor ? linearRgbToHex(baseColor) : undefined,
@@ -7433,10 +8575,8 @@ export class GoonEngine implements GoonStageHost {
         })
       | undefined
     if (!image) return null
-    const width =
-      image.width ?? image.naturalWidth ?? image.videoWidth ?? 0
-    const height =
-      image.height ?? image.naturalHeight ?? image.videoHeight ?? 0
+    const width = image.width ?? image.naturalWidth ?? image.videoWidth ?? 0
+    const height = image.height ?? image.naturalHeight ?? image.videoHeight ?? 0
     if (!width || !height) return null
     return { image, width, height }
   }
@@ -7449,12 +8589,16 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private getRendererMaxTextureSize() {
-    const backend = (this.renderer as unknown as {
-      backend?: {
-        device?: { limits?: { maxTextureDimension2D?: number } }
-        getContext?: () => WebGL2RenderingContext | GPUCanvasContext | null
-      }
-    } | undefined)?.backend
+    const backend = (
+      this.renderer as unknown as
+        | {
+            backend?: {
+              device?: { limits?: { maxTextureDimension2D?: number } }
+              getContext?: () => WebGL2RenderingContext | GPUCanvasContext | null
+            }
+          }
+        | undefined
+    )?.backend
     const webGpuLimit = backend?.device?.limits?.maxTextureDimension2D
     if (typeof webGpuLimit === 'number' && Number.isFinite(webGpuLimit)) {
       return webGpuLimit
@@ -7530,7 +8674,11 @@ export class GoonEngine implements GoonStageHost {
     if (existingReplacement) return existingReplacement
 
     const source = this.getTextureImageSource(texture)
-    if (!source || Math.max(source.width, source.height) <= maxSize || typeof document === 'undefined') {
+    if (
+      !source ||
+      Math.max(source.width, source.height) <= maxSize ||
+      typeof document === 'undefined'
+    ) {
       return texture
     }
 
@@ -7635,7 +8783,11 @@ export class GoonEngine implements GoonStageHost {
     texture: THREE.Texture | null | undefined,
     disposedTextures: Set<THREE.Texture>
   ) {
-    if (!texture || texture === this.transparentTexture || !this.materialRuntimeTextures.has(texture)) {
+    if (
+      !texture ||
+      texture === this.transparentTexture ||
+      !this.materialRuntimeTextures.has(texture)
+    ) {
       return
     }
     if (disposedTextures.has(texture)) {
@@ -7661,7 +8813,8 @@ export class GoonEngine implements GoonStageHost {
     state: MaterialOriginalState,
     disposedTextures: Set<THREE.Texture>
   ) {
-    const target = material as THREE.Material & Record<MaterialTextureStateKey, THREE.Texture | null | undefined>
+    const target = material as THREE.Material &
+      Record<MaterialTextureStateKey, THREE.Texture | null | undefined>
     for (const key of MATERIAL_TEXTURE_STATE_KEYS) {
       const currentTexture = target[key]
       const originalTexture = state[key]
@@ -7903,7 +9056,9 @@ export class GoonEngine implements GoonStageHost {
     const disposedTextures = new Set<THREE.Texture>()
     let appliedTexture = false
     for (const material of materials) {
-      const target = material as THREE.Material & { map?: THREE.Texture | null }
+      const target = material as THREE.Material & {
+        map?: THREE.Texture | null
+      }
       if (!('map' in target)) continue
       this.rememberMaterialState(material)
       if (target.map && target.map !== texture) {
@@ -7940,10 +9095,7 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  async applyXWearMaterial(
-    materialName: string,
-    xwear: GoonXWearData
-  ): Promise<boolean> {
+  async applyXWearMaterial(materialName: string, xwear: GoonXWearData): Promise<boolean> {
     if (!materialName || !xwear) return false
     if (!this.vrm) return false
     if (this.materialMap.size === 0) {
@@ -8084,7 +9236,10 @@ export class GoonEngine implements GoonStageHost {
               assignedLayerTextures.add(texture)
             }
             if (target[targetKey] && target[targetKey] !== nextTexture) {
-              this.releaseMaterialRuntimeTexture(target[targetKey] as THREE.Texture, disposedTextures)
+              this.releaseMaterialRuntimeTexture(
+                target[targetKey] as THREE.Texture,
+                disposedTextures
+              )
             }
             target[targetKey] = nextTexture
           }
@@ -8361,20 +9516,20 @@ export class GoonEngine implements GoonStageHost {
     if (roots.length === 0) return
     for (const root of roots) {
       root.traverse((node) => {
-      const mesh = node as THREE.Mesh
-      if (!((mesh as any).isMesh || (mesh as any).isSkinnedMesh)) return
-      if (mesh.visible === false) return
-      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
-      for (const material of materials) {
-        if (!material) continue
-        const name = material.name?.trim()
-        if (!name) continue
-        const bucket = this.materialMap.get(name) ?? []
-        if (!bucket.includes(material)) {
-          bucket.push(material)
+        const mesh = node as THREE.Mesh
+        if (!((mesh as any).isMesh || (mesh as any).isSkinnedMesh)) return
+        if (mesh.visible === false) return
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+        for (const material of materials) {
+          if (!material) continue
+          const name = material.name?.trim()
+          if (!name) continue
+          const bucket = this.materialMap.get(name) ?? []
+          if (!bucket.includes(material)) {
+            bucket.push(material)
+          }
+          this.materialMap.set(name, bucket)
         }
-        this.materialMap.set(name, bucket)
-      }
       })
     }
   }
@@ -8387,7 +9542,8 @@ export class GoonEngine implements GoonStageHost {
       for (const material of materials) {
         const anyMaterial = material as THREE.Material & Record<string, any>
         if (typeof anyMaterial.alphaToCoverage !== 'boolean') continue
-        const usesCutoutAlpha = typeof anyMaterial.alphaTest === 'number' && anyMaterial.alphaTest > 0
+        const usesCutoutAlpha =
+          typeof anyMaterial.alphaTest === 'number' && anyMaterial.alphaTest > 0
         const nextAlphaToCoverage = enableCutoutSmoothing && usesCutoutAlpha
         if (anyMaterial.alphaToCoverage === nextAlphaToCoverage) continue
         anyMaterial.alphaToCoverage = nextAlphaToCoverage
@@ -8516,7 +9672,10 @@ export class GoonEngine implements GoonStageHost {
       }
       void this.audioContext.resume()
     } catch (error) {
-      console.warn('[GoonEngine] Failed to attach audio analyser; using procedural lip sync fallback.', error)
+      console.warn(
+        '[GoonEngine] Failed to attach audio analyser; using procedural lip sync fallback.',
+        error
+      )
       this.disconnectAudioAnalyser()
     }
   }
@@ -8621,6 +9780,9 @@ export class GoonEngine implements GoonStageHost {
     this.sceneLightingInitialized = false
     this.resetMaterialOverrides()
     this.releaseAllMaterialRuntimeTextures()
+    this.clearHairPreview()
+    for (const runtime of this.embeddedSecondaryMotionRuntimes) runtime.dispose()
+    this.embeddedSecondaryMotionRuntimes = []
     if (this.vrm) {
       this.disposeVrmScene(this.vrm.scene)
       this.scene.remove(this.vrm.scene)
@@ -8631,6 +9793,7 @@ export class GoonEngine implements GoonStageHost {
       this.disposeObject3D(this.customAvatarRoot)
       this.customAvatarRoot = null
     }
+    this.customHairAttachmentRestMatrix = null
     this.customStageAnchors = {}
     this.rootMotionTrackHints.clear()
     this.rootMotionLockNodes = []
@@ -8741,7 +9904,14 @@ export class GoonEngine implements GoonStageHost {
       this.camera.setViewOffset(fullWidth, fullHeight, offsetX, offsetY, clientWidth, clientHeight)
       this.camera.updateProjectionMatrix()
       this.skyboxCamera.aspect = fullWidth / fullHeight
-      this.skyboxCamera.setViewOffset(fullWidth, fullHeight, offsetX, offsetY, clientWidth, clientHeight)
+      this.skyboxCamera.setViewOffset(
+        fullWidth,
+        fullHeight,
+        offsetX,
+        offsetY,
+        clientWidth,
+        clientHeight
+      )
       this.skyboxCamera.updateProjectionMatrix()
     } else {
       this.camera.aspect = clientWidth / clientHeight
@@ -8772,10 +9942,15 @@ export class GoonEngine implements GoonStageHost {
     const now = performance.now()
     const hasExpressions = this.activeExpressions.length > 0
     const hasSceneAmbience = Boolean(this.sceneAmbienceRuntime)
+    const hasSecondaryMotion =
+      (Boolean(this.hairPreviewSecondaryMotionRuntime) &&
+        !this.hairPreviewSecondaryMotionSuspended) ||
+      this.embeddedSecondaryMotionRuntimes.length > 0
     const idle =
       !this.speaking &&
       !hasExpressions &&
       !hasSceneAmbience &&
+      !hasSecondaryMotion &&
       !this.baseLoopAction &&
       !this.animationOverrideActive &&
       !this.oneShotAction
@@ -8817,7 +9992,8 @@ export class GoonEngine implements GoonStageHost {
 
     if (this.vrm) {
       const shouldUpdatePose =
-        this.poseUpdateIntervalMs === 0 || now - this.lastPoseUpdateTime >= this.poseUpdateIntervalMs
+        this.poseUpdateIntervalMs === 0 ||
+        now - this.lastPoseUpdateTime >= this.poseUpdateIntervalMs
       if (shouldUpdatePose) {
         this.applyPose(elapsed)
         this.vrm.update(delta)
@@ -8840,7 +10016,8 @@ export class GoonEngine implements GoonStageHost {
 
     if (this.customAvatarRoot) {
       const shouldUpdatePose =
-        this.poseUpdateIntervalMs === 0 || now - this.lastPoseUpdateTime >= this.poseUpdateIntervalMs
+        this.poseUpdateIntervalMs === 0 ||
+        now - this.lastPoseUpdateTime >= this.poseUpdateIntervalMs
       if (shouldUpdatePose) {
         this.applyCustomPerformance(elapsed)
         this.lastPoseUpdateTime = now
@@ -8851,6 +10028,8 @@ export class GoonEngine implements GoonStageHost {
     if (this.guidedDufOverlayBonePairs.length > 0) {
       this.syncGuidedDufOverlayBones()
     }
+
+    this.updateHairSecondaryMotionRuntimes(delta)
 
     this.updateAnchorTransition(now)
     this.updateSceneAmbienceRuntime(delta, elapsed)
@@ -8911,7 +10090,8 @@ export class GoonEngine implements GoonStageHost {
       if (preset.direction === 'float') {
         const wave = Math.sin(elapsed * (0.8 + config.speed * 0.35) + phases[index])
         positions[offset] += wave * preset.jitter * delta * 0.16
-        positions[offset + 2] += Math.cos(elapsed * 0.7 + phases[index]) * preset.jitter * delta * 0.12
+        positions[offset + 2] +=
+          Math.cos(elapsed * 0.7 + phases[index]) * preset.jitter * delta * 0.12
       }
 
       const outOfBounds =
@@ -9145,7 +10325,6 @@ export class GoonEngine implements GoonStageHost {
       if (this.speaking) {
         this.applySpeakingMotion(elapsed)
       }
-
     }
 
     if (manager) {
@@ -9225,8 +10404,7 @@ export class GoonEngine implements GoonStageHost {
         const authoredEyeContact = resolveCustomPerformanceEyeContactState(
           authoredPerformanceDirection
         )
-        const suppressCameraContact =
-          this.isStaticPoseOverrideActive() || this.lookActive
+        const suppressCameraContact = this.isStaticPoseOverrideActive() || this.lookActive
         const eyeContactActiveForMotion =
           this.eyeContactEnabled && !this.isEyeContactSuppressedByMotion()
 
@@ -9250,10 +10428,8 @@ export class GoonEngine implements GoonStageHost {
           this.eyeContactApplied.headPitch = 0
         }
 
-        const ambientEyeYaw =
-          this.eyeContactApplied.eyeYaw - authoredEyeContact.eyeYaw
-        const ambientEyePitch =
-          this.eyeContactApplied.eyePitch - authoredEyeContact.eyePitch
+        const ambientEyeYaw = this.eyeContactApplied.eyeYaw - authoredEyeContact.eyeYaw
+        const ambientEyePitch = this.eyeContactApplied.eyePitch - authoredEyeContact.eyePitch
         const ambientEyeLookWeights = resolveEyeLookExpressionWeights(
           ambientEyeYaw,
           ambientEyePitch,
@@ -9398,9 +10574,7 @@ export class GoonEngine implements GoonStageHost {
     )
     const response = socketEyeContactResponseLerp(this.socketEyeContact.response)
     const headAssistTarget =
-      !this.eyeLookFreezeHeadEnabled &&
-      contactAllowed &&
-      resolution.headFollowPressure > 0
+      !this.eyeLookFreezeHeadEnabled && contactAllowed && resolution.headFollowPressure > 0
         ? resolveSocketEyeHeadAssist(
             [targetHeadLocal.x, targetHeadLocal.y, targetHeadLocal.z],
             resolution.headFollowPressure,
@@ -9418,11 +10592,7 @@ export class GoonEngine implements GoonStageHost {
     ) {
       const assisted = {
         ...authored,
-        headYaw: THREE.MathUtils.clamp(
-          authored.headYaw + this.socketEyeHeadAssist.headYaw,
-          -1,
-          1
-        ),
+        headYaw: THREE.MathUtils.clamp(authored.headYaw + this.socketEyeHeadAssist.headYaw, -1, 1),
         headPitch: THREE.MathUtils.clamp(
           authored.headPitch + this.socketEyeHeadAssist.headPitch,
           -1,
@@ -9452,10 +10622,7 @@ export class GoonEngine implements GoonStageHost {
       current.vertical = THREE.MathUtils.lerp(current.vertical, target.vertical, response)
       socketEyes.setGaze(side, current.horizontal, current.vertical)
     }
-    const lookWeights = resolveSocketEyeLookTargetWeights(
-      socketDefinition,
-      this.socketEyeGaze
-    )
+    const lookWeights = resolveSocketEyeLookTargetWeights(socketDefinition, this.socketEyeGaze)
     this.clearMorphTargetWeights(SOCKET_EYE_LOOK_TARGETS)
     for (const target of SOCKET_EYE_LOOK_TARGETS) {
       this.applyMorphTargetWeight(target, lookWeights.get(target) ?? 0, 'set')
@@ -9474,10 +10641,7 @@ export class GoonEngine implements GoonStageHost {
     ) => {
       if (!preset) return
       if (
-        !shouldApplyCustomExpressionMorphPreset(
-          preset,
-          Boolean(this.customPerformanceRigRuntime)
-        )
+        !shouldApplyCustomExpressionMorphPreset(preset, Boolean(this.customPerformanceRigRuntime))
       ) {
         return
       }
@@ -9508,7 +10672,10 @@ export class GoonEngine implements GoonStageHost {
         }
       }
 
-      let currentTargets: Array<{ preset: ResolvedExpressionPreset; weight: number }>
+      let currentTargets: Array<{
+        preset: ResolvedExpressionPreset
+        weight: number
+      }>
       let envelope: number
 
       if (exp.steps && exp.steps.length > 0) {
@@ -9602,14 +10769,20 @@ export class GoonEngine implements GoonStageHost {
       const ambientEyePitch =
         (this.eyeContactApplied.eyePitch - authoredEyePitch) * this.eyeContactTuning.eyePitchRange
 
-      if (Math.abs(ambientEyeYaw) > 0.001 && this.hasCustomDirectionControlBinding('eyes_leftright')) {
+      if (
+        Math.abs(ambientEyeYaw) > 0.001 &&
+        this.hasCustomDirectionControlBinding('eyes_leftright')
+      ) {
         allControls.push({
           control: 'eyes_leftright',
           value: -ambientEyeYaw
         })
       }
 
-      if (Math.abs(ambientEyePitch) > 0.001 && this.hasCustomDirectionControlBinding('eyes_updown')) {
+      if (
+        Math.abs(ambientEyePitch) > 0.001 &&
+        this.hasCustomDirectionControlBinding('eyes_updown')
+      ) {
         allControls.push({
           control: 'eyes_updown',
           value: -ambientEyePitch
@@ -9689,7 +10862,8 @@ export class GoonEngine implements GoonStageHost {
         if (
           this.bodyDialsOwnedTargets.has(targetName) ||
           this.appearanceDialsOwnedTargets.has(targetName)
-        ) continue
+        )
+          continue
         const index = binding.dict[targetName]
         if (index === undefined) continue
         influences[index] = 0
@@ -9737,7 +10911,9 @@ export class GoonEngine implements GoonStageHost {
     const canBlink =
       authoredBlinkWeight < AMBIENT_BLINK_SUPPRESS_THRESHOLD &&
       eyelidsValue > -AMBIENT_BLINK_SUPPRESS_THRESHOLD
-    const next = updateAmbientBlinkState(this.ambientBlinkState, now, { canBlink })
+    const next = updateAmbientBlinkState(this.ambientBlinkState, now, {
+      canBlink
+    })
     this.ambientBlinkState = next.state
     if (next.weight <= 0.001) return
 
@@ -9828,7 +11004,11 @@ export class GoonEngine implements GoonStageHost {
       this.baseLoopAction && typeof this.baseLoopAction.getClip === 'function'
         ? this.baseLoopAction.getClip()
         : null
-    if (this.baseLoopAction === action && currentClip === animationClip && this.baseLoopIsFallback === usingFallback) {
+    if (
+      this.baseLoopAction === action &&
+      currentClip === animationClip &&
+      this.baseLoopIsFallback === usingFallback
+    ) {
       this.baseLoopAction.enabled = true
       this.baseLoopAction.play()
       this.normalizeActionPlayback(this.baseLoopAction)
@@ -9881,9 +11061,10 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private triggerExpression(name: string, definition?: GoonCueDefinition) {
-    if (!this.hasExpressionBlendshapes && !this.hasFaceControls() && !this.hasRawMorphTargets()) return
+    if (!this.hasExpressionBlendshapes && !this.hasFaceControls() && !this.hasRawMorphTargets())
+      return
     const kind = definition?.kind ?? 'emote'
-    const intensity = definition?.kind === 'emote' ? 1 : definition?.intensity ?? 1
+    const intensity = definition?.kind === 'emote' ? 1 : (definition?.intensity ?? 1)
     const face = definition
       ? selectCueFacePayload(definition, {
           arkit52Available: this.customArkitFaceDriverBindings !== null,
@@ -9917,10 +11098,14 @@ export class GoonEngine implements GoonStageHost {
           arkit52Bindings: this.customArkitFaceDriverBindings?.face
         })
         return {
-          targets: this.resolveExpressionTargets(name, {
-            ...definition,
-            expressionTargets: stepFace.expressionTargets
-          }, stepFace.profile !== 'arkit52'),
+          targets: this.resolveExpressionTargets(
+            name,
+            {
+              ...definition,
+              expressionTargets: stepFace.expressionTargets
+            },
+            stepFace.profile !== 'arkit52'
+          ),
           faceControls: stepFace.faceControls,
           rawMorphTargets: stepFace.rawMorphTargets,
           attackMs: step.attackMs ?? 120,
@@ -9929,10 +11114,7 @@ export class GoonEngine implements GoonStageHost {
         }
       })
 
-      const totalDuration = steps.reduce(
-        (sum, s) => sum + s.attackMs + s.holdMs + s.releaseMs,
-        0
-      )
+      const totalDuration = steps.reduce((sum, s) => sum + s.attackMs + s.holdMs + s.releaseMs, 0)
 
       this.activeExpressions = this.activeExpressions.filter((exp) => exp.name !== name)
       this.activeExpressions.push({
@@ -10016,10 +11198,7 @@ export class GoonEngine implements GoonStageHost {
     if (definition.steps && definition.steps.length > 0) {
       return definition.steps.reduce(
         (sum, step) =>
-          sum +
-          (step.attackMs ?? 120) +
-          (step.holdMs ?? 200) +
-          (step.releaseMs ?? 180),
+          sum + (step.attackMs ?? 120) + (step.holdMs ?? 200) + (step.releaseMs ?? 180),
         0
       )
     }
@@ -10185,7 +11364,10 @@ export class GoonEngine implements GoonStageHost {
       }
 
       // Resolve current targets and envelope
-      let currentTargets: Array<{ preset: ResolvedExpressionPreset; weight: number }>
+      let currentTargets: Array<{
+        preset: ResolvedExpressionPreset
+        weight: number
+      }>
       let envelope: number
 
       if (exp.steps && exp.steps.length > 0) {
@@ -10254,7 +11436,8 @@ export class GoonEngine implements GoonStageHost {
         this.clearLookAtOverride(lookAt)
       }
     } else {
-      const eyeContactActiveForMotion = this.eyeContactEnabled && !this.isEyeContactSuppressedByMotion()
+      const eyeContactActiveForMotion =
+        this.eyeContactEnabled && !this.isEyeContactSuppressedByMotion()
       if (eyeContactActiveForMotion) {
         this.neutralizeMotionGazeBones()
       }
@@ -10277,11 +11460,27 @@ export class GoonEngine implements GoonStageHost {
     }
 
     if (eyeLookLane === 'expression-presets') {
-      const expressionWeights = resolveEyeLookExpressionWeights(eyeYaw, eyePitch, this.eyeContactTuning)
-      this.mergeExpressionWeight(weights, VRMExpressionPresetName.LookLeft, expressionWeights.lookLeft)
-      this.mergeExpressionWeight(weights, VRMExpressionPresetName.LookRight, expressionWeights.lookRight)
+      const expressionWeights = resolveEyeLookExpressionWeights(
+        eyeYaw,
+        eyePitch,
+        this.eyeContactTuning
+      )
+      this.mergeExpressionWeight(
+        weights,
+        VRMExpressionPresetName.LookLeft,
+        expressionWeights.lookLeft
+      )
+      this.mergeExpressionWeight(
+        weights,
+        VRMExpressionPresetName.LookRight,
+        expressionWeights.lookRight
+      )
       this.mergeExpressionWeight(weights, VRMExpressionPresetName.LookUp, expressionWeights.lookUp)
-      this.mergeExpressionWeight(weights, VRMExpressionPresetName.LookDown, expressionWeights.lookDown)
+      this.mergeExpressionWeight(
+        weights,
+        VRMExpressionPresetName.LookDown,
+        expressionWeights.lookDown
+      )
     }
 
     for (const [preset, weight] of weights.entries()) {
@@ -10348,7 +11547,9 @@ export class GoonEngine implements GoonStageHost {
     const canBlink =
       authoredBlinkWeight < AMBIENT_BLINK_SUPPRESS_THRESHOLD &&
       eyelidsValue > -AMBIENT_BLINK_SUPPRESS_THRESHOLD
-    const next = updateAmbientBlinkState(this.ambientBlinkState, now, { canBlink })
+    const next = updateAmbientBlinkState(this.ambientBlinkState, now, {
+      canBlink
+    })
     this.ambientBlinkState = next.state
     if (next.weight <= 0.001) return
 
@@ -10539,9 +11740,7 @@ export class GoonEngine implements GoonStageHost {
       case 'easeOut':
         return 1 - Math.pow(1 - clamped, 2)
       case 'easeInOut':
-        return clamped < 0.5
-          ? 2 * clamped * clamped
-          : 1 - Math.pow(-2 * clamped + 2, 2) / 2
+        return clamped < 0.5 ? 2 * clamped * clamped : 1 - Math.pow(-2 * clamped + 2, 2) / 2
       default:
         return clamped
     }
@@ -10588,11 +11787,7 @@ export class GoonEngine implements GoonStageHost {
     this.applyBasicMouthWeight(manager, legacyWeights)
   }
 
-  private applyEyeLook(
-    lookAt: NonNullable<VRM['lookAt']>,
-    eyeYaw: number,
-    eyePitch: number
-  ) {
+  private applyEyeLook(lookAt: NonNullable<VRM['lookAt']>, eyeYaw: number, eyePitch: number) {
     const active = Math.abs(eyeYaw) >= 0.001 || Math.abs(eyePitch) >= 0.001
     if (!active) {
       this.clearLookAtOverride(lookAt)
@@ -10627,7 +11822,9 @@ export class GoonEngine implements GoonStageHost {
     return applier as LookAtRangeMapApplier
   }
 
-  private resolveLookAtRangeMapBaseScales(applier: LookAtRangeMapApplier): BoneLookAtRangeMapScales {
+  private resolveLookAtRangeMapBaseScales(
+    applier: LookAtRangeMapApplier
+  ): BoneLookAtRangeMapScales {
     const existing = this.lookAtRangeMapBaseScales.get(applier)
     if (existing) return existing
 
@@ -10759,9 +11956,9 @@ export class GoonEngine implements GoonStageHost {
     if (!humanoid) return false
     return Boolean(
       humanoid.getRawBoneNode(VRMHumanBoneName.LeftEye) &&
-        humanoid.getNormalizedBoneNode(VRMHumanBoneName.LeftEye) &&
-        humanoid.getRawBoneNode(VRMHumanBoneName.RightEye) &&
-        humanoid.getNormalizedBoneNode(VRMHumanBoneName.RightEye)
+      humanoid.getNormalizedBoneNode(VRMHumanBoneName.LeftEye) &&
+      humanoid.getRawBoneNode(VRMHumanBoneName.RightEye) &&
+      humanoid.getNormalizedBoneNode(VRMHumanBoneName.RightEye)
     )
   }
 
@@ -10941,7 +12138,10 @@ export class GoonEngine implements GoonStageHost {
     const boneGroups = [
       { label: 'hips', bones: [VRMHumanBoneName.Hips] },
       { label: 'spine', bones: [VRMHumanBoneName.Spine] },
-      { label: 'chest', bones: [VRMHumanBoneName.Chest, VRMHumanBoneName.UpperChest] },
+      {
+        label: 'chest',
+        bones: [VRMHumanBoneName.Chest, VRMHumanBoneName.UpperChest]
+      },
       { label: 'neck', bones: [VRMHumanBoneName.Neck] },
       { label: 'head', bones: [VRMHumanBoneName.Head] },
       { label: 'rightUpperArm', bones: [VRMHumanBoneName.RightUpperArm] },
@@ -11062,14 +12262,13 @@ export class GoonEngine implements GoonStageHost {
     }
 
     const criticalBonesMissing = missingCoreBones.length > 0
-    const tier =
-      criticalBonesMissing
-        ? 'C'
-        : effectiveHasMouth && effectiveHasExpressions
-          ? 'A'
-          : effectiveHasMouth
-            ? 'B'
-            : 'C'
+    const tier = criticalBonesMissing
+      ? 'C'
+      : effectiveHasMouth && effectiveHasExpressions
+        ? 'A'
+        : effectiveHasMouth
+          ? 'B'
+          : 'C'
     const animationNames = Array.from(this.animationMap.keys())
 
     this.onCompatibility?.({
@@ -11134,10 +12333,14 @@ export class GoonEngine implements GoonStageHost {
     const normalizedDict = this.buildNormalizedMorphDict(bestMesh)
 
     this.faceMorphTargetNames = Object.keys(normalizedDict)
-    this.authorableRawMorphTargetNames = [...new Set(rawNames.map((name) => {
-      const fclIdx = name.indexOf('Fcl_')
-      return fclIdx >= 0 ? name.substring(fclIdx) : name
-    }))].sort((a, b) => a.localeCompare(b))
+    this.authorableRawMorphTargetNames = [
+      ...new Set(
+        rawNames.map((name) => {
+          const fclIdx = name.indexOf('Fcl_')
+          return fclIdx >= 0 ? name.substring(fclIdx) : name
+        })
+      )
+    ].sort((a, b) => a.localeCompare(b))
     this.vrmSource = detectVRMSource(this.faceMorphTargetNames)
 
     const targetNameSet = new Set(this.faceMorphTargetNames)
@@ -11249,9 +12452,10 @@ export class GoonEngine implements GoonStageHost {
       }
     }
 
-    const resolvedSemantic = mapping && allControls.length > 0
-      ? resolveFaceControls(allControls, mapping)
-      : new Map<string, number>()
+    const resolvedSemantic =
+      mapping && allControls.length > 0
+        ? resolveFaceControls(allControls, mapping)
+        : new Map<string, number>()
     const resolvedRaw = resolveRawMorphTargets(allRawMorphTargets)
     const clearTargets = new Set<string>()
     const preserveSpeechTargets = this.speaking ? this.mouthExpressionMorphTargetNames : null
@@ -11419,11 +12623,7 @@ export class GoonEngine implements GoonStageHost {
     )
     this.speechAudioPeak = Math.max(this.speechAudioPeak, normalized)
 
-    if (
-      this.audioElement &&
-      this.speechAudioStartOffsetSec === null &&
-      normalized > 0.12
-    ) {
+    if (this.audioElement && this.speechAudioStartOffsetSec === null && normalized > 0.12) {
       this.speechAudioStartOffsetSec = this.audioElement.currentTime
     }
 
@@ -11542,7 +12742,13 @@ export class GoonEngine implements GoonStageHost {
     // Single-step: use top-level face controls with envelope
     if (exp.faceControls.length === 0) return []
     const elapsed = now - exp.startTime
-    const envelope = this.computeEnvelope(elapsed, exp.attackMs, exp.holdMs, exp.releaseMs, exp.easing)
+    const envelope = this.computeEnvelope(
+      elapsed,
+      exp.attackMs,
+      exp.holdMs,
+      exp.releaseMs,
+      exp.easing
+    )
     return exp.faceControls.map((fc) => ({
       control: fc.control,
       value: fc.value * envelope
@@ -11567,7 +12773,13 @@ export class GoonEngine implements GoonStageHost {
 
     if (exp.rawMorphTargets.length === 0) return []
     const elapsed = now - exp.startTime
-    const envelope = this.computeEnvelope(elapsed, exp.attackMs, exp.holdMs, exp.releaseMs, exp.easing)
+    const envelope = this.computeEnvelope(
+      elapsed,
+      exp.attackMs,
+      exp.holdMs,
+      exp.releaseMs,
+      exp.easing
+    )
     return exp.rawMorphTargets.map((rawMorph) => ({
       target: rawMorph.target,
       value: rawMorph.value * envelope
@@ -11635,7 +12847,7 @@ export class GoonEngine implements GoonStageHost {
     if (preset === VRMExpressionPresetName.Neutral) return true
     return Boolean(
       this.customExpressionMorphMap.has(preset) ||
-        this.vrm?.expressionManager?.getExpression(preset as VRMExpressionPresetName | string)
+      this.vrm?.expressionManager?.getExpression(preset as VRMExpressionPresetName | string)
     )
   }
 
@@ -11671,10 +12883,16 @@ export class GoonEngine implements GoonStageHost {
   }
 
   /** Canonical ARKit source channels resolved to this package's authored targets. */
-  getArkitFaceAuthoringDefinitions(): Array<{ id: Arkit52Channel; morphTargets: string[] }> {
+  getArkitFaceAuthoringDefinitions(): Array<{
+    id: Arkit52Channel
+    morphTargets: string[]
+  }> {
     const bindings = this.customArkitFaceDriverBindings?.face
     if (!bindings) return []
-    return [...bindings].map(([id, morphTargets]) => ({ id, morphTargets: [...morphTargets] }))
+    return [...bindings].map(([id, morphTargets]) => ({
+      id,
+      morphTargets: [...morphTargets]
+    }))
   }
 
   /** Optional Audio2Face tongue-extension channels resolved to authored targets. */
@@ -11684,7 +12902,10 @@ export class GoonEngine implements GoonStageHost {
   }> {
     const bindings = this.customArkitFaceDriverBindings?.tongue
     if (!bindings) return []
-    return [...bindings].map(([id, morphTargets]) => ({ id, morphTargets: [...morphTargets] }))
+    return [...bindings].map(([id, morphTargets]) => ({
+      id,
+      morphTargets: [...morphTargets]
+    }))
   }
 
   /** Exact mouth-control capability for the currently loaded avatar lane. */

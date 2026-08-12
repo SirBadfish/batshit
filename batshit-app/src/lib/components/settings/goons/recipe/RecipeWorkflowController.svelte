@@ -50,6 +50,7 @@
     NailSurfaceStateV1
   } from '$lib/goons/nailSurface'
   import type { SkinAppearanceStateV2 } from '$lib/goons/skinAppearance'
+  import type { HairStateV2 } from '$lib/goons/hairAssets'
   import {
     cleanupCustomGoonPackageUpload,
     loadGoons,
@@ -95,6 +96,7 @@
     nailSurface: NailSurfaceStateV1 | null
     nailSurfacePresence: NailSurfacePresenceStateV1 | null
     skinAppearance: SkinAppearanceStateV2 | null
+    hairState?: HairStateV2 | null
     onSaveEditorDraft: () => Promise<boolean>
     onDiscardEditorDraft: () => void | Promise<void>
     onRecipeGoonChanged?: (goon: GoonRecord) => void | Promise<void>
@@ -119,6 +121,7 @@
     nailSurface,
     nailSurfacePresence,
     skinAppearance,
+    hairState = null,
     onSaveEditorDraft,
     onDiscardEditorDraft,
     onRecipeGoonChanged,
@@ -182,6 +185,7 @@
     nailSurface,
     nailSurfacePresence,
     skinAppearance,
+    hairState,
     sourceModel: owner?.authoringRevision?.source?.model?.ref ?? goon.customAvatar?.model?.url ?? null,
     sourceManifest: owner?.authoringRevision?.source?.manifest?.ref ?? goon.customAvatar?.manifest?.url ?? null,
     anatomyFitReady: goon.customAvatar?.manifestSummary?.anatomyFitReady ?? false
@@ -241,6 +245,7 @@
       nailSurface: nailSurface ? cloneJson(nailSurface) : null,
       nailSurfacePresence: nailSurfacePresence ? cloneJson(nailSurfacePresence) : null,
       skinAppearance: skinAppearance ? cloneJson(skinAppearance) : null,
+      hairState: hairState ? cloneJson(hairState) : null,
       skinMaterialArtwork: null
     }
   }
@@ -655,7 +660,8 @@
 
   async function runBake(
     kind: 'first-bake' | 'rebake',
-    requestedState: RecipeStateSnapshot | null = draftState
+    requestedState: RecipeStateSnapshot | null = draftState,
+    startingOwner: GoonRecipeV2 | null = owner
   ) {
     if (!requestedState) {
       toast.error(draftStateError ?? 'This Goon’s appearance state is not ready.')
@@ -664,7 +670,7 @@
     lifecycleBusy = kind
     if (kind === 'first-bake') preparationFailure = null
     try {
-      let activeOwner = owner
+      let activeOwner = startingOwner
       if (!activeOwner) {
         const initialized = await client.initializeFromCurrentPackage(goon, requestedState)
         activeOwner = initialized.owner
@@ -695,28 +701,61 @@
       toast.error('Wait for the current Goon update to finish before saving again.')
       return false
     }
-    if (owner?.pendingAnalysis || owner?.pendingJob) {
-      toast.error('Finish or discard the current Goon file update before saving new appearance edits.')
-      return false
-    }
     try {
       // Rebuild from the current controlled props at the Save boundary. The
       // reactive preview hash is intentionally asynchronous, so a fast Save
       // click can otherwise observe the previous draft and silently skip the
       // one build required for the newly staged appearance batch.
-      const appearanceChanged = !owner || canonicalRecipeString(appearanceDials) !==
-        canonicalRecipeString(owner.authoringRevision.state.appearanceDials)
+      let activeOwner = owner
+      const appearanceChanged = !activeOwner || canonicalRecipeString(appearanceDials) !==
+        canonicalRecipeString(activeOwner.authoringRevision.state.appearanceDials)
       const currentDraftState = await buildCurrentDraftState(undefined, appearanceChanged)
       draftState = currentDraftState
       draftStateError = null
+      if (activeOwner?.pendingAnalysis) {
+        toast.error('Finish or discard the current Goon file update before saving new appearance edits.')
+        return false
+      }
+      if (activeOwner?.pendingJob) {
+        const visibleJobView = jobView
+        const pending =
+          visibleJobView?.job.jobId === activeOwner.pendingJob.jobId &&
+          'reviewedState' in visibleJobView
+            ? visibleJobView
+            : await client.recoverJob(activeOwner.pendingJob.jobId)
+        jobView = pending
+        jobReviewedState = pending.reviewedState.state
+        if (pending.job.status !== 'failed' && pending.job.status !== 'interrupted') {
+          toast.error('Finish or discard the current Goon file update before saving new appearance edits.')
+          return false
+        }
+        if (pending.reviewedState.state.stateSha256 === currentDraftState.stateSha256) {
+          toast.error('This failed update already contains these exact appearance changes. Choose Retry or Discard in Goon File.')
+          return false
+        }
+        const discarded = await client.discardJob(pending)
+        jobView = null
+        jobReviewedState = null
+        activeOwner = discarded.owner
+        await refreshGoon(discarded.goon)
+        toast.info('The previous failed update was replaced with your current appearance changes.')
+      }
       const currentDecision = classifyRecipeBuildDirtyDomains({
-        savedState: owner?.authoringRevision.state ?? null,
+        savedState: activeOwner?.authoringRevision.state ?? null,
         draftState: currentDraftState
       })
-      if (!currentDecision.requiresBuild) return true
+      if (!currentDecision.requiresBuild) {
+        if (activeOwner?.liveStatus !== 'needs_bake') return true
+        return runBake(
+          activeOwner.activeRevision ? 'rebake' : 'first-bake',
+          currentDraftState,
+          activeOwner
+        )
+      }
       return runBake(
         currentDecision.action === 'prepare' ? 'first-bake' : 'rebake',
-        currentDraftState
+        currentDraftState,
+        activeOwner
       )
     } catch (error) {
       const message = errorMessage(error)

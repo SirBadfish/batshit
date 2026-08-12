@@ -20,6 +20,10 @@ export function updateGoon(id: string, updates: Partial<GoonRecord>) {
   goons = goons.map((s) => (s.id === id ? { ...s, ...updates } : s))
 }
 
+export function replaceGoon(id: string, goon: GoonRecord) {
+  goons = goons.map((entry) => (entry.id === id ? goon : entry))
+}
+
 export function removeGoon(id: string) {
   goons = goons.filter((s) => s.id !== id)
 }

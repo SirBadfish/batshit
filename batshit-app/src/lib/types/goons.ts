@@ -1,6 +1,7 @@
 import type { AppearanceDialValueState } from "$lib/goons/appearanceDials";
 import type { FacialArtworkStateV4 } from "$lib/goons/facialArtwork";
 import type { EyeAppearanceStateV3 } from "$lib/goons/eyeAppearance";
+import type { HairStateV2 } from "$lib/goons/hairAssets";
 import type {
   LipArtworkPresenceStateV1,
   LipArtworkStateV2,
@@ -679,6 +680,8 @@ export interface GoonRecord {
   nailSurfacePresence?: NailSurfacePresenceStateV1 | null;
   /** Recipe-owned body surface maps, tint, and regional pigment state. */
   skinAppearance?: SkinAppearanceStateV2 | null;
+  /** Recipe-owned immutable Hair Asset selection and user color choices. */
+  hairState?: HairStateV2 | null;
   /** @deprecated Read-only migration input; new writes fold this into skinAppearance.surface. */
   skinMaterialArtwork?: unknown;
   /** Revision-bound hair/clothing/conceal/attachment fit evidence. */

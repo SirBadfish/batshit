@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import {
@@ -19,6 +19,11 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+  inspectManagedRuntimePortability,
+  MAC_RUNTIME_MINIMUM_VERSION
+} from './managed-runtime-portability.mjs';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
 const packagedRuntimeRoot = resolve(__dirname, '..', 'runtime');
@@ -31,6 +36,7 @@ const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v4';
 const LIP_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/lip-artwork/v2';
 const NAIL_SURFACE_RUNTIME_RELATIVE_ROOT = 'assets/goons/nail-surface/v1';
 const SKIN_APPEARANCE_RUNTIME_RELATIVE_ROOT = 'assets/goons/skin-appearance/v1';
+const HAIR_CATALOG_RUNTIME_RELATIVE_ROOT = 'batshit-app/static/goon-assets/hair/v1';
 const packagedFacialArtworkRoot = join(
   packagedRuntimeRoot,
   ...FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
@@ -285,6 +291,23 @@ function jsonResponse(payload) {
 
 function normalizeError(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function runCaptured(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: options.cwd || repoRoot,
+    env: options.env || process.env,
+    encoding: 'utf8',
+    timeout: options.timeoutMs || 10_000,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  return {
+    ok: result.status === 0,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    status: result.status,
+    error: result.error
+  };
 }
 
 async function supervisorLog(scope, message) {
@@ -3247,6 +3270,68 @@ async function publishJsonAtomically(filePath, payload) {
   }
 }
 
+async function auditElectronPackage(packageRoot) {
+  const issues = [];
+  const frameworkRoot = join(
+    packageRoot,
+    'Contents',
+    'Frameworks',
+    'Electron Framework.framework'
+  );
+  const frameworkInfo = await stat(frameworkRoot).catch(() => null);
+  if (!frameworkInfo?.isDirectory()) {
+    issues.push('The Electron package is missing Contents/Frameworks/Electron Framework.framework.');
+    return issues;
+  }
+
+  const requiredRuntimeFiles = [
+    'Versions/A/Electron Framework',
+    'Versions/A/Resources/icudtl.dat',
+    'Versions/A/Resources/chrome_100_percent.pak',
+    'Versions/A/Resources/en.lproj/locale.pak'
+  ];
+  for (const relative of requiredRuntimeFiles) {
+    const file = await stat(join(frameworkRoot, relative)).catch(() => null);
+    if (!file?.isFile() || file.size === 0) {
+      issues.push(`The Electron package is missing required Chromium runtime file: ${relative}`);
+    }
+  }
+
+  for (const helperName of [
+    'Batshit Helper',
+    'Batshit Helper (GPU)',
+    'Batshit Helper (Plugin)',
+    'Batshit Helper (Renderer)'
+  ]) {
+    const helperRoot = join(
+      packageRoot,
+      'Contents',
+      'Frameworks',
+      `${helperName}.app`,
+      'Contents'
+    );
+    const helperExecutable = await stat(join(helperRoot, 'MacOS', helperName)).catch(() => null);
+    if (!helperExecutable?.isFile() || helperExecutable.size === 0) {
+      issues.push(
+        `The Electron package is missing helper executable: Contents/Frameworks/${helperName}.app/Contents/MacOS/${helperName}`
+      );
+    }
+    const helperInfo = await stat(join(helperRoot, 'Info.plist')).catch(() => null);
+    if (!helperInfo?.isFile() || helperInfo.size === 0) {
+      issues.push(
+        `The Electron package is missing helper Info.plist: Contents/Frameworks/${helperName}.app/Contents/Info.plist`
+      );
+    }
+  }
+
+  const appAsar = await stat(join(packageRoot, 'Contents', 'Resources', 'app.asar')).catch(() => null);
+  if (!appAsar?.isFile() || appAsar.size === 0) {
+    issues.push('The Electron package is missing its immutable Contents/Resources/app.asar shell.');
+  }
+
+  return issues;
+}
+
 async function packageAudit(packagePath) {
   const target = resolve(packagePath || join(macRoot, 'zig-out', 'package'));
   const realTarget = await realpath(target).catch(() => null);
@@ -3254,11 +3339,22 @@ async function packageAudit(packagePath) {
   const suspiciousPaths = [];
   const missingRuntimeFiles = [];
   const invalidIcons = [];
-  const chromiumCefIssues = [];
+  const electronPackageIssues = [];
   const privacyIssues = [];
   const runtimeAssetIssues = [];
   const requiredRuntimeFiles = [
     'Contents/Resources/THIRD_PARTY_NOTICES.md',
+    'Contents/Resources/scripts/managed-runtime-portability.mjs',
+    'Contents/Resources/runtime/vendor/node/bin/node',
+    'Contents/Resources/runtime/vendor/redis-stack/bin/redis-server',
+    'Contents/Resources/runtime/vendor/redis-stack/bin/redis-cli',
+    'Contents/Resources/runtime/vendor/redis-stack/lib/libssl.3.dylib',
+    'Contents/Resources/runtime/vendor/redis-stack/lib/libcrypto.3.dylib',
+    'Contents/Resources/runtime/vendor/redis-stack/share/openssl/LICENSE.txt',
+    'Contents/Resources/runtime/vendor/redis-stack/share/openssl/SOURCE.txt',
+    'Contents/Resources/runtime/vendor/redis-stack/share/openssl/CHECKSUMS.txt',
+    'Contents/Resources/runtime/vendor/ffmpeg/bin/ffmpeg',
+    'Contents/Resources/runtime/vendor/ffmpeg/BUILD-CONFIG.txt',
     'Contents/Resources/runtime/batshit-app/package.json',
     'Contents/Resources/runtime/batshit-app/build/index.js',
     'Contents/Resources/runtime/runtime-manifest.json',
@@ -3539,34 +3635,106 @@ async function packageAudit(packagePath) {
       runtimeAssetIssues.push('The skin-appearance/v1 definition is absent from its runtime asset inventory.');
     }
   }
+  const hairCatalogAssets = runtimeManifest?.assets?.hairCatalog;
+  if (
+    hairCatalogAssets?.contract !== 'hair-catalog/v1' ||
+    hairCatalogAssets?.root !== HAIR_CATALOG_RUNTIME_RELATIVE_ROOT ||
+    hairCatalogAssets?.definition !== 'catalog.json' ||
+    !Array.isArray(hairCatalogAssets?.files) ||
+    hairCatalogAssets.files.length < 1
+  ) {
+    runtimeAssetIssues.push(
+      'runtime-manifest.json is missing the complete hair-catalog/v1 trusted asset inventory.'
+    );
+  } else {
+    const seenPaths = new Set();
+    for (const entry of hairCatalogAssets.files) {
+      const relative = entry?.path;
+      if (
+        typeof relative !== 'string' ||
+        relative.startsWith('/') ||
+        relative.includes('\\') ||
+        relative.split('/').includes('..') ||
+        seenPaths.has(relative) ||
+        !/^[a-f0-9]{64}$/.test(entry?.sha256 || '')
+      ) {
+        runtimeAssetIssues.push(`Invalid Hair Asset runtime manifest entry: ${JSON.stringify(entry)}`);
+        continue;
+      }
+      seenPaths.add(relative);
+      const assetPath = join(
+        realTarget,
+        'Contents',
+        'Resources',
+        'runtime',
+        hairCatalogAssets.root,
+        relative
+      );
+      const bytes = await readFile(assetPath).catch(() => null);
+      if (!bytes) {
+        runtimeAssetIssues.push(`Missing Hair Asset runtime file: ${relative}`);
+        continue;
+      }
+      const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+      if (actualSha256 !== entry.sha256) {
+        runtimeAssetIssues.push(
+          `Hair Asset runtime file hash mismatch: ${relative} (${actualSha256} != ${entry.sha256})`
+        );
+      }
+    }
+    if (!seenPaths.has(hairCatalogAssets.definition)) {
+      runtimeAssetIssues.push('The hair-catalog/v1 definition is absent from its runtime asset inventory.');
+    }
+  }
+
+  const managedRuntimeRoot = join(realTarget, 'Contents', 'Resources', 'runtime', 'vendor');
+  const portability = await inspectManagedRuntimePortability(managedRuntimeRoot, {
+    maximumMinimumVersion: MAC_RUNTIME_MINIMUM_VERSION
+  });
+  if (!portability.ok) {
+    runtimeAssetIssues.push(
+      ...portability.issues.map((issue) => `Managed runtime portability failure: ${issue}`)
+    );
+  }
 
   const infoPlist = await readFile(join(realTarget, 'Contents', 'Info.plist'), 'utf8').catch(
     () => ''
   );
-  if (!infoPlist.includes('<key>NSMicrophoneUsageDescription</key>')) {
+  const infoPlistPath = join(realTarget, 'Contents', 'Info.plist');
+  const microphoneDescription = runCaptured(
+    'plutil',
+    ['-extract', 'NSMicrophoneUsageDescription', 'raw', '-o', '-', infoPlistPath],
+    { timeoutMs: 5000 }
+  );
+  const speechDescription = runCaptured(
+    'plutil',
+    ['-extract', 'NSSpeechRecognitionUsageDescription', 'raw', '-o', '-', infoPlistPath],
+    { timeoutMs: 5000 }
+  );
+  const minimumSystemVersion = runCaptured(
+    'plutil',
+    ['-extract', 'LSMinimumSystemVersion', 'raw', '-o', '-', infoPlistPath],
+    { timeoutMs: 5000 }
+  );
+  if (!infoPlist || !microphoneDescription.ok || !microphoneDescription.stdout.trim()) {
     privacyIssues.push(
-      'Info.plist is missing NSMicrophoneUsageDescription, so macOS microphone permission prompts and WKWebView microphone capture are not launch-safe.'
+      'Info.plist is missing NSMicrophoneUsageDescription, so macOS microphone permission prompts and Electron microphone capture are not launch-safe.'
     );
   }
-  if (!infoPlist.includes('<key>NSSpeechRecognitionUsageDescription</key>')) {
+  if (!speechDescription.ok || !speechDescription.stdout.trim()) {
     privacyIssues.push(
-      'Info.plist is missing NSSpeechRecognitionUsageDescription, so Browser speech-to-text can fail inside WKWebView even when microphone capture is allowed.'
+      'Info.plist is missing NSSpeechRecognitionUsageDescription, so Browser speech-to-text can fail inside the Mac app even when microphone capture is allowed.'
     );
   }
-  const isChromiumPackage =
-    infoPlist.includes('ai.batshit.mac.chromium') || /Chromium\.app$/i.test(realTarget);
-  if (isChromiumPackage) {
-    const frameworksDir = join(realTarget, 'Contents', 'Frameworks');
-    const frameworkEntries = await readdir(frameworksDir, { withFileTypes: true }).catch(() => []);
-    const helperApps = frameworkEntries.filter(
-      (entry) => entry.isDirectory() && /helper.*\.app$/i.test(entry.name)
+  if (
+    !minimumSystemVersion.ok ||
+    minimumSystemVersion.stdout.trim() !== MAC_RUNTIME_MINIMUM_VERSION
+  ) {
+    electronPackageIssues.push(
+      `Info.plist must declare LSMinimumSystemVersion ${MAC_RUNTIME_MINIMUM_VERSION} to match the managed runtime portability contract.`
     );
-    if (helperApps.length === 0) {
-      chromiumCefIssues.push(
-        'Chromium/CEF package is missing hidden macOS helper app bundles in Contents/Frameworks. This packaging shape launches CEF subprocesses through the visible app executable, which opens blank windows and extra Dock icons. Do not ship this artifact until helper packaging is implemented.'
-      );
-    }
   }
+  electronPackageIssues.push(...(await auditElectronPackage(realTarget)));
 
   return {
     ok:
@@ -3574,7 +3742,7 @@ async function packageAudit(packagePath) {
       suspiciousPaths.length === 0 &&
       missingRuntimeFiles.length === 0 &&
       invalidIcons.length === 0 &&
-      chromiumCefIssues.length === 0 &&
+      electronPackageIssues.length === 0 &&
       privacyIssues.length === 0 &&
       runtimeAssetIssues.length === 0,
     packagePath: realTarget,
@@ -3582,7 +3750,7 @@ async function packageAudit(packagePath) {
     suspiciousPaths,
     missingRuntimeFiles,
     invalidIcons,
-    chromiumCefIssues,
+    electronPackageIssues,
     privacyIssues,
     runtimeAssetIssues
   };
@@ -3656,6 +3824,7 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
 }
 
 export {
+  auditElectronPackage,
   attemptSafeRedisShutdown,
   cleanupAbandonedRedisTempSnapshots,
   chooseRedisShutdownMode,

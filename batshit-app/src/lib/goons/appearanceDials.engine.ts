@@ -21,7 +21,8 @@ import { parseFirstPartySocketEyePackage } from "./socketEyePackage";
 import { socketEyeCapRetainedDynamicMorphs } from "./socketEyeSurface";
 import {
   APPEARANCE_RECIPE_PHYSICAL_BASIS_CONTRACT,
-  evaluateAppearanceRecipePhysicalOutput,
+  createAppearanceRecipePhysicalEvaluator,
+  type AppearanceRecipePhysicalEvaluator,
   type AppearanceRecipePhysicalBasis,
 } from "./recipe/appearanceRecipePhysicalEvaluator";
 import type { AnatomyFitResult } from "./recipe/anatomyFitContracts";
@@ -87,12 +88,15 @@ function socketEyeSourceOnlyMorphRuntimeKeys(
   for (const side of ["left", "right"] as const) {
     const nodeContracts = [
       {
-        nodeName: packageValue.socketEyeSurface.runtimeBindings[side].nodes.compositeCap,
+        nodeName:
+          packageValue.socketEyeSurface.runtimeBindings[side].nodes
+            .compositeCap,
         retained: new Set(socketEyeCapRetainedDynamicMorphs(side)),
       },
       {
-        nodeName: packageValue.eyeApertureSeam.runtimeBindings[side]
-          .lashesEyeOutlineNode,
+        nodeName:
+          packageValue.eyeApertureSeam.runtimeBindings[side]
+            .lashesEyeOutlineNode,
         retained: new Set(
           packageValue.eyeApertureSeam.runtimeBindings[side].liner
             .retainedPerformanceMorphs,
@@ -311,7 +315,7 @@ export class AppearanceDialsEngineRuntime {
   private readonly skins: RuntimeSkin[] = [];
   private readonly physicalNodes = new Map<string, THREE.Object3D>();
   private readonly physicalBasis: AppearanceRecipePhysicalBasis;
-  private readonly rootBaseQuaternion: THREE.Quaternion;
+  private readonly physicalEvaluator: AppearanceRecipePhysicalEvaluator;
   private hipsRemap: HipsClipRemap | null = null;
   private values: unknown;
   private state: ResolvedAppearanceDialState;
@@ -331,7 +335,6 @@ export class AppearanceDialsEngineRuntime {
     this.root = root;
     this.manifest = manifest;
     this.values = options.initialValues ?? null;
-    this.rootBaseQuaternion = root.quaternion.clone();
 
     const faceMeshes = new Set(options.faceMeshes ?? []);
     const built = buildRuntimeInventory(root, manifest, faceMeshes);
@@ -432,6 +435,9 @@ export class AppearanceDialsEngineRuntime {
       rawManifest,
       validated,
       built.morphBindings,
+    );
+    this.physicalEvaluator = createAppearanceRecipePhysicalEvaluator(
+      this.physicalBasis,
     );
     this.state = resolveAppearanceDialState(manifest, this.values);
     this.applyResolvedState(this.state);
@@ -1088,11 +1094,9 @@ export class AppearanceDialsEngineRuntime {
   }
 
   private applyResolvedState(state: ResolvedAppearanceDialState) {
-    const evaluated = evaluateAppearanceRecipePhysicalOutput(
-      this.physicalBasis,
-      state,
-      { anatomyFitResults: this.anatomyFitResults },
-    );
+    const evaluated = this.physicalEvaluator.evaluate(state, {
+      anatomyFitResults: this.anatomyFitResults,
+    });
 
     for (const retained of evaluated.retainedTargetPositionBindings) {
       const binding = this.retainedPhysicalBindings.get(retained.id);
@@ -1187,10 +1191,9 @@ export class AppearanceDialsEngineRuntime {
     }
 
     this.root.position.set(...evaluated.root.position);
-    // Recipe only owns uniform scale and grounding on the runtime root. Keep
-    // the captured scene quaternion byte-for-byte instead of round-tripping
-    // this unowned value through Matrix4 decomposition.
-    this.root.quaternion.copy(this.rootBaseQuaternion);
+    // Recipe owns only uniform scale and grounding on the runtime root. The
+    // editor/stage owns its live rotation, so leave that unowned quaternion
+    // untouched while dials are applied.
     this.root.scale.set(...evaluated.root.scale);
     if (this.hipsRemap && evaluated.hipsClipRemap) {
       this.hipsRemap.baseRest.set(...evaluated.hipsClipRemap.baseRest);

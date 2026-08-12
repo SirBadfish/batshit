@@ -61,7 +61,7 @@ If the n8n execution says `ECONNREFUSED ::1:5620` or `ECONNREFUSED ::1:5621`, n8
 
 ## Mac app n8n sheet shows a secure-cookie warning
 
-Local n8n may reject secure cookies inside the Mac app WebView and warn about insecure URLs or Safari. Open n8n in a normal browser from the sheet instead — Batshit can still call the webhook from the Mac app, and the browser window can run test-mode executions.
+Local n8n may reject secure cookies inside the Mac app's embedded browser and warn about an insecure local URL. Open n8n in a normal browser from the sheet instead — Batshit can still call the webhook from the Mac app, and the browser window can run test-mode executions.
 
 For a local-only n8n you own, setting `N8N_SECURE_COOKIE=false` can also remove that warning. Don't use that setting for a public or HTTPS n8n instance.
 

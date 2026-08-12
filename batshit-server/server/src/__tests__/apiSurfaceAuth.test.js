@@ -134,6 +134,8 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     { method: 'POST', path: '/api/upload/single' },
     { method: 'POST', path: '/api/upload/avatar' },
     { method: 'DELETE', path: '/api/upload/asset', body: { uploadType: 'images', filename: 'x.png' } },
+    { method: 'POST', path: '/api/upload/goon-hair-asset' },
+    { method: 'POST', path: '/api/upload/goon-hair-import-source' },
     { method: 'GET', path: '/api/v1/' },
   ];
 
@@ -162,6 +164,21 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.taskId).toBe('some-task-id');
+  });
+
+  it('rejects a Hair artifact without exact immutable-owner IDs before storage', async () => {
+    const form = new FormData();
+    form.set('role', 'material-definition');
+    form.set('file', new Blob(['{}'], { type: 'application/json' }), 'material.json');
+    const response = await fetch(`${baseUrl}/api/upload/goon-hair-asset`, {
+      method: 'POST',
+      headers: tokenHeaders,
+      body: form,
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(
+      expect.objectContaining({ error: expect.stringContaining('assetId must be') }),
+    );
   });
 
   it('executes an allow-listed tool with the token (file-tree lane stays alive)', async () => {

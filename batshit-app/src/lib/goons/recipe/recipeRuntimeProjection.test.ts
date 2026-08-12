@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   GOON_RECIPE_FIT_RECEIPT_CONTRACT,
   applyRecipeRevisionProjection,
+  findRetiredHairRecipeSibling,
   projectGoonRecipeSource,
   recipeRevisionIdentity,
   reconcileGoonRecipeFitReceipts,
@@ -93,6 +94,24 @@ function state(): RecipeStateSnapshot {
         definitionSha256: SHA_A,
         baseColor: {},
         tint: [1, 1, 1]
+      }),
+      sibling('hairState', 'hair-state/v2', SHA_B, {
+        schemaVersion: 'hair-state/v2',
+        definitionSha256: SHA_B,
+        selected: {
+          assetId: 'style-01',
+          assetRevisionId: 'style-01-r1',
+          assetRevision: 1,
+          assetRevisionSha256: SHA_B,
+          fitFamily: 'batshit-base-female-v1',
+          fitSha256: SHA_C
+        },
+        baseColor: '#2a1738',
+        highlightColor: '#6f4a8e',
+        motionSettings: {
+          enabled: true,
+          intensity: 1.1
+        }
       })
     ]
   }
@@ -214,6 +233,29 @@ function fitReceipt(bound = recipeRevisionIdentity(envelope().revision)): GoonRe
 }
 
 describe('Recipe runtime projection', () => {
+  it('identifies only the exact retired Hair sibling as safely resettable', () => {
+    const current = state()
+    expect(findRetiredHairRecipeSibling(current)).toBeNull()
+
+    const retired = state()
+    const hairIndex = retired.siblings.findIndex((entry) => entry.id === 'hairState')
+    retired.siblings[hairIndex] = {
+      ...retired.siblings[hairIndex],
+      contract: 'hair-state/v1',
+      state: {
+        ...retired.siblings[hairIndex].state,
+        schemaVersion: 'hair-state/v1'
+      }
+    }
+    expect(findRetiredHairRecipeSibling(retired)).toMatchObject({
+      id: 'hairState',
+      contract: 'hair-state/v1'
+    })
+
+    retired.siblings.push({ ...retired.siblings[hairIndex], id: 'hair-state' })
+    expect(() => findRetiredHairRecipeSibling(retired)).toThrow(/more than one Hair sibling/)
+  })
+
   it('projects immutable Recipe Source and all sibling state for the editor only', () => {
     const liveGoon = goon()
     const editorGoon = projectGoonRecipeSource(liveGoon)
@@ -231,6 +273,11 @@ describe('Recipe runtime projection', () => {
     expect(editorGoon.skinMaterialArtwork?.schemaVersion).toBe(
       'skin-material-artwork-state/v2'
     )
+    expect(editorGoon.hairState?.selected?.assetRevisionId).toBe('style-01-r1')
+    expect(editorGoon.hairState?.motionSettings).toEqual({
+      enabled: true,
+      intensity: 1.1
+    })
     expect(liveGoon.customAvatar?.model?.url).toBe('/live/avatar.glb')
   })
 

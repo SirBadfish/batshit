@@ -194,6 +194,17 @@ export type AppearanceRecipePhysicalEvaluation = {
   } | null;
 };
 
+export type AppearanceRecipePhysicalEvaluator = {
+  /**
+   * Evaluate into reusable mesh-position buffers. The returned evaluation is
+   * ephemeral: callers must consume it before the next evaluate call.
+   */
+  evaluate: (
+    state: ResolvedAppearanceDialState,
+    options?: { anatomyFitResults?: readonly AnatomyFitResult[] },
+  ) => AppearanceRecipePhysicalEvaluation;
+};
+
 type BasisNode = AppearanceRecipePhysicalBasis["nodes"][number];
 type BasisBone = AppearanceRecipePhysicalBasis["bones"][number];
 
@@ -400,29 +411,17 @@ function followerDeltaMatrix(
       ? `${entry.follower}/${entry.channel}`
       : `Anatomy Fit node ${entry.nodeId ?? "unknown"}`;
   const translation = new THREE.Matrix4().makeTranslation(
-    ...finiteVec3(
-      entry.translation,
-      `${label} translation`,
-    ),
+    ...finiteVec3(entry.translation, `${label} translation`),
   );
-  const pivotValue = finiteVec3(
-    entry.pivot,
-    `${label} pivot`,
-  );
+  const pivotValue = finiteVec3(entry.pivot, `${label} pivot`);
   const pivot = new THREE.Matrix4().makeTranslation(...pivotValue);
   const inversePivot = new THREE.Matrix4().makeTranslation(
     -pivotValue[0],
     -pivotValue[1],
     -pivotValue[2],
   );
-  const rotationValue = finiteQuat(
-    entry.rotation,
-    `${label} rotation`,
-  );
-  assertUnitQuaternion(
-    rotationValue,
-    `${label} rotation`,
-  );
+  const rotationValue = finiteQuat(entry.rotation, `${label} rotation`);
+  assertUnitQuaternion(rotationValue, `${label} rotation`);
   const rotation = new THREE.Matrix4().makeRotationFromQuaternion(
     new THREE.Quaternion(...rotationValue),
   );
@@ -737,7 +736,8 @@ function validatePhysicalBasis(
     if (
       !Array.isArray(binding.positionBindingIds) ||
       binding.positionBindingIds.length === 0 ||
-      new Set(binding.positionBindingIds).size !== binding.positionBindingIds.length
+      new Set(binding.positionBindingIds).size !==
+        binding.positionBindingIds.length
     ) {
       fail(
         `follower morph ${binding.follower}/${binding.channel} positionBindingIds must be a non-empty unique array`,
@@ -1162,11 +1162,62 @@ export function evaluateAppearanceRecipePhysicalOutput(
   options: { anatomyFitResults?: readonly AnatomyFitResult[] } = {},
 ): AppearanceRecipePhysicalEvaluation {
   const validated = validatePhysicalBasis(basis);
+  return evaluateValidatedAppearanceRecipePhysicalOutput(
+    basis,
+    validated,
+    state,
+    options,
+  );
+}
+
+/**
+ * Build the live-editor evaluator once per loaded Recipe. Validation maps and
+ * full mesh-position buffers are reused across dial changes, avoiding large
+ * bursts of short-lived memory while preserving the exact pure evaluator math.
+ */
+export function createAppearanceRecipePhysicalEvaluator(
+  basis: AppearanceRecipePhysicalBasis,
+): AppearanceRecipePhysicalEvaluator {
+  const validated = validatePhysicalBasis(basis);
+  const positionsByMesh = new Map(
+    basis.meshes.map((mesh) => [
+      mesh.id,
+      new Float32Array(mesh.basePositions.length),
+    ]),
+  );
+  return {
+    evaluate(state, options = {}) {
+      return evaluateValidatedAppearanceRecipePhysicalOutput(
+        basis,
+        validated,
+        state,
+        options,
+        positionsByMesh,
+      );
+    },
+  };
+}
+
+function evaluateValidatedAppearanceRecipePhysicalOutput(
+  basis: AppearanceRecipePhysicalBasis,
+  validated: ValidatedBasis,
+  state: ResolvedAppearanceDialState,
+  options: { anatomyFitResults?: readonly AnatomyFitResult[] },
+  reusablePositionsByMesh?: Map<string, Float32Array>,
+): AppearanceRecipePhysicalEvaluation {
   validateResolvedState(basis, validated, state);
   const anatomyFitResults = orderedAnatomyFitResults(options.anatomyFitResults);
 
   const positionsByMesh = new Map(
-    basis.meshes.map((mesh) => [mesh.id, mesh.basePositions.slice()]),
+    basis.meshes.map((mesh) => {
+      const positions =
+        reusablePositionsByMesh?.get(mesh.id) ?? mesh.basePositions.slice();
+      if (positions.length !== mesh.basePositions.length) {
+        fail(`reusable mesh ${mesh.id} POSITION length changed`);
+      }
+      if (reusablePositionsByMesh) positions.set(mesh.basePositions);
+      return [mesh.id, positions] as const;
+    }),
   );
   const applyPositionDelta = (
     meshId: string,
@@ -1199,7 +1250,8 @@ export function evaluateAppearanceRecipePhysicalOutput(
     const morph = state.followerState.morphs[index]!;
     const inventory = basis.followerMorphBindings[index]!;
     for (const positionBindingId of inventory.positionBindingIds ?? []) {
-      const binding = validated.followerMorphPositionById.get(positionBindingId)!;
+      const binding =
+        validated.followerMorphPositionById.get(positionBindingId)!;
       applyPositionDelta(
         binding.meshId,
         binding.positionDelta,
@@ -1217,13 +1269,17 @@ export function evaluateAppearanceRecipePhysicalOutput(
           binding.node === coefficient.nodeId &&
           binding.morph === coefficient.morph,
       );
-      if (matches.length !== 1 || matches[0]!.positionBindingIds === undefined) {
+      if (
+        matches.length !== 1 ||
+        matches[0]!.positionBindingIds === undefined
+      ) {
         fail(
           `Anatomy Fit morph ${coefficient.followerId}/${coefficient.channelId} does not bind a physical recipe-only POSITION channel`,
         );
       }
       for (const positionBindingId of matches[0]!.positionBindingIds!) {
-        const binding = validated.followerMorphPositionById.get(positionBindingId)!;
+        const binding =
+          validated.followerMorphPositionById.get(positionBindingId)!;
         applyPositionDelta(
           binding.meshId,
           binding.positionDelta,
@@ -1403,10 +1459,11 @@ export function evaluateAppearanceRecipePhysicalOutput(
       }
       return { ...entry, nodeId: entry.nodeId };
     })
-    .sort((left, right) =>
-      nodeDepth(left.nodeId) - nodeDepth(right.nodeId) ||
-      left.domain.localeCompare(right.domain) ||
-      left.transform.nodeId.localeCompare(right.transform.nodeId),
+    .sort(
+      (left, right) =>
+        nodeDepth(left.nodeId) - nodeDepth(right.nodeId) ||
+        left.domain.localeCompare(right.domain) ||
+        left.transform.nodeId.localeCompare(right.transform.nodeId),
     );
   for (const { domain, transform, nodeId } of anatomyNodeTransforms) {
     const currentRoot = rootRelativeForCurrentLocals();
@@ -1427,8 +1484,14 @@ export function evaluateAppearanceRecipePhysicalOutput(
     const rotation = new THREE.Quaternion();
     const scale = new THREE.Vector3();
     targetLocal.decompose(position, rotation, scale);
-    assertFiniteVector3(position, `Anatomy Fit node ${transform.nodeId} position`);
-    assertFiniteQuaternion(rotation, `Anatomy Fit node ${transform.nodeId} rotation`);
+    assertFiniteVector3(
+      position,
+      `Anatomy Fit node ${transform.nodeId} position`,
+    );
+    assertFiniteQuaternion(
+      rotation,
+      `Anatomy Fit node ${transform.nodeId} rotation`,
+    );
     assertFiniteVector3(scale, `Anatomy Fit node ${transform.nodeId} scale`);
     const decomposed = assertFiniteMatrix(
       new THREE.Matrix4().compose(position, rotation, scale),
@@ -1464,8 +1527,12 @@ export function evaluateAppearanceRecipePhysicalOutput(
     const rootDelta = rootRelativeByNodeId
       .get(bone.nodeId)!
       .clone()
-      .multiply(validated.baseRootRelativeByNodeId.get(bone.nodeId)!.clone().invert());
-    const avatarRootOffset = new THREE.Vector3().setFromMatrixPosition(rootDelta);
+      .multiply(
+        validated.baseRootRelativeByNodeId.get(bone.nodeId)!.clone().invert(),
+      );
+    const avatarRootOffset = new THREE.Vector3().setFromMatrixPosition(
+      rootDelta,
+    );
     const parentBone = node.parentId
       ? validated.boneByNodeId.get(node.parentId)
       : undefined;
@@ -1488,7 +1555,9 @@ export function evaluateAppearanceRecipePhysicalOutput(
       const rootDelta = rootRelativeByNodeId
         .get(bone.nodeId)!
         .clone()
-        .multiply(validated.baseRootRelativeByNodeId.get(bone.nodeId)!.clone().invert());
+        .multiply(
+          validated.baseRootRelativeByNodeId.get(bone.nodeId)!.clone().invert(),
+        );
       const inverse = matrixFrom(
         joint.baseInverseBindMatrix,
         `skin ${skin.id}/${joint.boneId} inverse bind`,

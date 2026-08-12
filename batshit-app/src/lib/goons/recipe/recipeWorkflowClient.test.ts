@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { APPEARANCE_DIAL_VALUES_CONTRACT } from '../appearanceDials.contracts'
 import { parseAppearanceDialsManifest } from '../appearanceDials'
+import { createHairState } from '../hairAssets'
+import { hairFollowerDefinitionSha256 } from '../hairFollowers'
+import {
+  HAIR_ROOT_WEIGHTED_MOTION_TAG,
+  secondaryMotionDefinitionSha256
+} from '../secondaryMotion'
 import {
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   createRecipeArchiveContainmentReceipt,
@@ -11,7 +17,7 @@ import {
   createGoonLiveBuildReceipt,
   type GoonLiveBuildReceiptContent
 } from './liveBuildContracts'
-import { sha256Hex } from './recipeCanonical'
+import { canonicalRecipeString, sha256Hex } from './recipeCanonical'
 import {
   GOON_RECIPE_STATE_CONTRACT,
   type RecipeSource,
@@ -40,6 +46,14 @@ import type {
   RecipeReviewedState
 } from './recipeReviewContracts'
 import { createRecipePhysicalMigrationFixture } from './fixtures/recipePhysicalMigrationPair'
+import {
+  createHairAssetFixture,
+  createRootWeightedFollowerHairGlbFixture,
+  createHairFollowerDefinitionFixture,
+  createHairSecondaryMotionDefinitionFixture,
+  HAIR_HIGHLIGHT_MASK_PNG_FIXTURE,
+  HAIR_NEUTRAL_VALUE_PNG_FIXTURE
+} from './fixtures/hairAssetFixture'
 import { planAppearanceRecipeMigration } from './appearanceRecipeMigrationPlanner'
 
 const hash = (character: string) => character.repeat(64)
@@ -160,9 +174,18 @@ async function liveReceipt(
       liveManifestProvenanceSha256: hash('0')
     },
     output: {
-      package: { sha256: await sha256Hex(packageBytes), bytes: packageBytes.byteLength },
-      model: { sha256: await sha256Hex(modelBytes), bytes: modelBytes.byteLength },
-      manifest: { sha256: await sha256Hex(manifestBytes), bytes: manifestBytes.byteLength },
+      package: {
+        sha256: await sha256Hex(packageBytes),
+        bytes: packageBytes.byteLength
+      },
+      model: {
+        sha256: await sha256Hex(modelBytes),
+        bytes: modelBytes.byteLength
+      },
+      manifest: {
+        sha256: await sha256Hex(manifestBytes),
+        bytes: manifestBytes.byteLength
+      },
       counts: {
         meshes: 1,
         vertices: 3,
@@ -205,25 +228,34 @@ function source(
     sha256Hex(packageBytes),
     sha256Hex(modelBytes),
     sha256Hex(manifestBytes)
-  ]).then(([packageSha256, modelSha256, manifestSha256]) => ({
-    package: { ref: '/uploads/source/package.bgoon', sha256: packageSha256 },
-    model: { ref: '/uploads/source/model.glb', sha256: modelSha256 },
-    manifest: { ref: '/uploads/source/manifest.json', sha256: manifestSha256 },
-    identities: {
-      contract: 'recipe-source/v1',
-      baseId: 'base_client',
-      fitFamily: 'fit_client',
-      definitionSha256: hash('1'),
-      neutralId: 'neutral_recipe_client',
-      neutralRecipeSha256: hash('2'),
-      manifestSemanticSha256: hash('3'),
-      physicalBasisSha256: hash('4'),
-      behaviorSha256: hash('5'),
-      componentGraphSha256: hash('6'),
-      topologySha256: hash('7'),
-      skeletonHierarchySha256: hash('8')
-    }
-  } as unknown as RecipeSource))
+  ]).then(
+    ([packageSha256, modelSha256, manifestSha256]) =>
+      ({
+        package: {
+          ref: '/uploads/source/package.bgoon',
+          sha256: packageSha256
+        },
+        model: { ref: '/uploads/source/model.glb', sha256: modelSha256 },
+        manifest: {
+          ref: '/uploads/source/manifest.json',
+          sha256: manifestSha256
+        },
+        identities: {
+          contract: 'recipe-source/v1',
+          baseId: 'base_client',
+          fitFamily: 'fit_client',
+          definitionSha256: hash('1'),
+          neutralId: 'neutral_recipe_client',
+          neutralRecipeSha256: hash('2'),
+          manifestSemanticSha256: hash('3'),
+          physicalBasisSha256: hash('4'),
+          behaviorSha256: hash('5'),
+          componentGraphSha256: hash('6'),
+          topologySha256: hash('7'),
+          skeletonHierarchySha256: hash('8')
+        }
+      }) as unknown as RecipeSource
+  )
 }
 
 async function createFailureWorkflowHarness(
@@ -254,13 +286,28 @@ async function createFailureWorkflowHarness(
   const started = {
     goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
     job,
-    reviewedState: { operation: 'rebake', state: recipeState } as RecipeReviewedState,
+    reviewedState: {
+      operation: 'rebake',
+      state: recipeState
+    } as RecipeReviewedState,
     replayed: false
   } as RecipeJobStartResponse
   const upload = {
-    package: { url: archiveReceipt.archive.ref, filename: 'live.bgoon', size: livePackage.byteLength },
-    model: { url: archiveReceipt.members[1].extracted.ref, filename: 'live.glb', size: liveModel.byteLength },
-    manifest: { url: archiveReceipt.members[0].extracted.ref, filename: 'live.json', size: liveManifest.byteLength },
+    package: {
+      url: archiveReceipt.archive.ref,
+      filename: 'live.bgoon',
+      size: livePackage.byteLength
+    },
+    model: {
+      url: archiveReceipt.members[1].extracted.ref,
+      filename: 'live.glb',
+      size: liveModel.byteLength
+    },
+    manifest: {
+      url: archiveReceipt.members[0].extracted.ref,
+      filename: 'live.json',
+      size: liveManifest.byteLength
+    },
     archiveReceipt
   }
   const sourceByRef = new Map([
@@ -268,7 +315,10 @@ async function createFailureWorkflowHarness(
     [recipeSource.model.ref, sourceModel],
     [recipeSource.manifest.ref, sourceManifest]
   ])
-  const cleanupCustomPackage = vi.fn(async () => ({ deleted: [], retained: [] }))
+  const cleanupCustomPackage = vi.fn(async () => ({
+    deleted: [],
+    retained: []
+  }))
   const uploadCustomPackage = vi.fn(async () => upload)
   const client = new RecipeWorkflowClient(minimalGoon().id, {
     fetchImpl: (async (input: RequestInfo | URL) => {
@@ -278,16 +328,19 @@ async function createFailureWorkflowHarness(
         : new Response('missing', { status: 404 })
     }) as typeof fetch,
     assetUrl: (ref) => ref,
-    bake: vi.fn(async () => ({
-      contract: 'goon-live-bake-output/v1' as const,
-      packageBytes: livePackage,
-      modelBytes: liveModel,
-      manifestBytes: liveManifest,
-      receipt: buildReceipt,
-      manifest: {},
-      liveManifest: {},
-      audit: {}
-    } as any)),
+    bake: vi.fn(
+      async () =>
+        ({
+          contract: 'goon-live-bake-output/v1' as const,
+          packageBytes: livePackage,
+          modelBytes: liveModel,
+          manifestBytes: liveManifest,
+          receipt: buildReceipt,
+          manifest: {},
+          liveManifest: {},
+          audit: {}
+        }) as any
+    ),
     uploadCustomPackage,
     cleanupCustomPackage
   })
@@ -313,18 +366,16 @@ async function createFailureWorkflowHarness(
   else stage.mockResolvedValue(staged)
   if (point === 'commit') commit.mockRejectedValue(injectedError)
   else commit.mockResolvedValue({} as RecipeCommitResponse)
-  const recoveryJob = point === 'upload' || point === 'registration'
-    ? job
-    : point === 'staging'
-      ? registered.job
-      : staged.job
+  const recoveryJob =
+    point === 'upload' || point === 'registration'
+      ? job
+      : point === 'staging'
+        ? registered.job
+        : staged.job
   vi.spyOn(client, 'recoverJob').mockResolvedValue({
     owner: {
-      writeVersion: point === 'upload' || point === 'registration'
-        ? 20
-        : point === 'staging'
-          ? 21
-          : 22
+      writeVersion:
+        point === 'upload' || point === 'registration' ? 20 : point === 'staging' ? 21 : 22
     } as GoonRecipeV2,
     job: recoveryJob
   } as RecipeJobRecoveryResponse)
@@ -349,13 +400,11 @@ async function createFailureWorkflowHarness(
 describe('Recipe workflow browser client', () => {
   it('resolves stored Recipe upload refs against the browser-facing batshit-server URL', () => {
     expect(
-      resolveRecipeAssetUrl(
-        '/uploads/goon_custom_manifests/live.json',
-        'http://127.0.0.1:5651/'
-      )
+      resolveRecipeAssetUrl('/uploads/goon_custom_manifests/live.json', 'http://127.0.0.1:5651/')
     ).toBe('http://127.0.0.1:5651/uploads/goon_custom_manifests/live.json')
-    expect(resolveRecipeAssetUrl('https://cdn.example/live.json', 'http://127.0.0.1:5651'))
-      .toBe('https://cdn.example/live.json')
+    expect(resolveRecipeAssetUrl('https://cdn.example/live.json', 'http://127.0.0.1:5651')).toBe(
+      'https://cdn.example/live.json'
+    )
   })
 
   it('resolves every projected Recipe preview asset through the isolated file server', () => {
@@ -378,14 +427,16 @@ describe('Recipe workflow browser client', () => {
 
     const resolved = resolveRecipePreviewGoonAssetUrls(projected, 'http://127.0.0.1:5651/')
 
-    expect(resolved.customAvatar?.package?.url)
-      .toBe('http://127.0.0.1:5651/uploads/goon_custom_packages/source.bgoon')
-    expect(resolved.customAvatar?.model?.url)
-      .toBe('http://127.0.0.1:5651/uploads/goon_custom_models/source.glb')
-    expect(resolved.customAvatar?.manifest?.url)
-      .toBe('http://127.0.0.1:5651/uploads/goon_custom_manifests/source.json')
-    expect(projected.customAvatar?.manifest?.url)
-      .toBe('/uploads/goon_custom_manifests/source.json')
+    expect(resolved.customAvatar?.package?.url).toBe(
+      'http://127.0.0.1:5651/uploads/goon_custom_packages/source.bgoon'
+    )
+    expect(resolved.customAvatar?.model?.url).toBe(
+      'http://127.0.0.1:5651/uploads/goon_custom_models/source.glb'
+    )
+    expect(resolved.customAvatar?.manifest?.url).toBe(
+      'http://127.0.0.1:5651/uploads/goon_custom_manifests/source.json'
+    )
+    expect(projected.customAvatar?.manifest?.url).toBe('/uploads/goon_custom_manifests/source.json')
   })
 
   it('refreshes the Goon after source upload so a runtime-only camera save cannot stale initial preparation', async () => {
@@ -401,7 +452,10 @@ describe('Recipe workflow browser client', () => {
     const goon = minimalGoon({
       customAvatar: { package: sourcePackage }
     })
-    const state = await buildRecipeStateSnapshot({ goon, appearanceDials: appearanceState() })
+    const state = await buildRecipeStateSnapshot({
+      goon,
+      appearanceDials: appearanceState()
+    })
     const latestGoon = minimalGoon({
       updated_at: '2026-07-17T00:00:01.000Z',
       camera: { mode: 'free', fov: 42 },
@@ -418,7 +472,10 @@ describe('Recipe workflow browser client', () => {
       throw new Error(`Unexpected request: ${url}`)
     })
     const uploadCustomPackage = vi.fn(async () => ({ archiveReceipt }))
-    const cleanupCustomPackage = vi.fn(async () => ({ deleted: [], retained: [] }))
+    const cleanupCustomPackage = vi.fn(async () => ({
+      deleted: [],
+      retained: []
+    }))
     const client = new RecipeWorkflowClient(goon.id, {
       fetchImpl: fetchImpl as typeof fetch,
       uploadCustomPackage: uploadCustomPackage as any,
@@ -427,13 +484,15 @@ describe('Recipe workflow browser client', () => {
     const initialized = {
       goon: latestGoon,
       owner: { writeVersion: 1 } as GoonRecipeV2,
-      containmentReceipt: { contract: 'goon-recipe-document-ref/v1', ref: 'doc', sha256: hash('a') }
+      containmentReceipt: {
+        contract: 'goon-recipe-document-ref/v1',
+        ref: 'doc',
+        sha256: hash('a')
+      }
     }
     const initialize = vi.spyOn(client, 'initialize').mockResolvedValue(initialized as any)
 
-    await expect(
-      client.initializeFromCurrentPackage(goon, state)
-    ).resolves.toBe(initialized)
+    await expect(client.initializeFromCurrentPackage(goon, state)).resolves.toBe(initialized)
 
     expect(initialize).toHaveBeenCalledWith(
       expect.objectContaining({ expectedUpdatedAt: latestGoon.updated_at }),
@@ -468,7 +527,10 @@ describe('Recipe workflow browser client', () => {
         }
       }
     })
-    const state = await buildRecipeStateSnapshot({ goon, appearanceDials: appearanceState() })
+    const state = await buildRecipeStateSnapshot({
+      goon,
+      appearanceDials: appearanceState()
+    })
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url === goon.customAvatar?.package?.url) return new Response(packageBytes)
@@ -476,7 +538,10 @@ describe('Recipe workflow browser client', () => {
       throw new Error(`Unexpected request: ${url}`)
     })
     const uploadCustomPackage = vi.fn(async () => ({ archiveReceipt }))
-    const cleanupCustomPackage = vi.fn(async () => ({ deleted: ['temporary'], retained: [] }))
+    const cleanupCustomPackage = vi.fn(async () => ({
+      deleted: ['temporary'],
+      retained: []
+    }))
     const client = new RecipeWorkflowClient(goon.id, {
       fetchImpl: fetchImpl as typeof fetch,
       uploadCustomPackage: uploadCustomPackage as any,
@@ -484,9 +549,9 @@ describe('Recipe workflow browser client', () => {
     })
     const initialize = vi.spyOn(client, 'initialize')
 
-    await expect(
-      client.initializeFromCurrentPackage(goon, state)
-    ).rejects.toThrow('The Goon file changed while initial preparation was starting')
+    await expect(client.initializeFromCurrentPackage(goon, state)).rejects.toThrow(
+      'The Goon file changed while initial preparation was starting'
+    )
 
     expect(initialize).not.toHaveBeenCalled()
     expect(cleanupCustomPackage).toHaveBeenCalledWith(goon.id, archiveReceipt)
@@ -495,9 +560,21 @@ describe('Recipe workflow browser client', () => {
   it('resumes a verified ready candidate at preview instead of replaying completed bake stages', async () => {
     const goon = minimalGoon()
     const live = {
-      package: { ref: '/uploads/goon_custom_packages/ready.bgoon', sha256: hash('1'), bytes: 10 },
-      model: { ref: '/uploads/goon_custom_models/ready.glb', sha256: hash('2'), bytes: 20 },
-      manifest: { ref: '/uploads/goon_custom_manifests/ready.json', sha256: hash('3'), bytes: 30 }
+      package: {
+        ref: '/uploads/goon_custom_packages/ready.bgoon',
+        sha256: hash('1'),
+        bytes: 10
+      },
+      model: {
+        ref: '/uploads/goon_custom_models/ready.glb',
+        sha256: hash('2'),
+        bytes: 20
+      },
+      manifest: {
+        ref: '/uploads/goon_custom_manifests/ready.json',
+        sha256: hash('3'),
+        bytes: 30
+      }
     }
     const recovery = {
       goon,
@@ -518,7 +595,9 @@ describe('Recipe workflow browser client', () => {
     const committed = { goon } as RecipeCommitResponse
     const commit = vi.spyOn(client, 'commitJob').mockResolvedValue(committed)
 
-    await expect(client.resumeReadyCandidate({ recovery, previewCandidate })).resolves.toBe(committed)
+    await expect(client.resumeReadyCandidate({ recovery, previewCandidate })).resolves.toBe(
+      committed
+    )
 
     expect(previewCandidate).toHaveBeenCalledWith({
       goon,
@@ -530,7 +609,9 @@ describe('Recipe workflow browser client', () => {
       expectedWriteVersion: 41,
       expectedJobStateVersion: 8
     })
-    expect(previewCandidate.mock.invocationCallOrder[0]).toBeLessThan(commit.mock.invocationCallOrder[0])
+    expect(previewCandidate.mock.invocationCallOrder[0]).toBeLessThan(
+      commit.mock.invocationCallOrder[0]
+    )
   })
 
   it('builds one deterministic Recipe State and preserves definition-bound siblings', async () => {
@@ -581,16 +662,41 @@ describe('Recipe workflow browser client', () => {
         definitionSha256: hash('e'),
         baseColor: {},
         tint: [1, 1, 1]
-      } as unknown as GoonRecord['skinMaterialArtwork']
+      } as unknown as GoonRecord['skinMaterialArtwork'],
+      hairState: {
+        schemaVersion: 'hair-state/v2',
+        definitionSha256: hash('9'),
+        selected: {
+          assetId: 'style-01',
+          assetRevisionId: 'style-01-r1',
+          assetRevision: 1,
+          assetRevisionSha256: hash('9'),
+          fitFamily: 'batshit-base-female-v1',
+          fitSha256: hash('8')
+        },
+        baseColor: '#2a1738',
+        highlightColor: '#6f4a8e',
+        motionSettings: {
+          enabled: true,
+          intensity: 1.1
+        }
+      }
     })
 
-    const first = await buildRecipeStateSnapshot({ goon, appearanceDials: appearanceState() })
-    const second = await buildRecipeStateSnapshot({ goon, appearanceDials: appearanceState() })
+    const first = await buildRecipeStateSnapshot({
+      goon,
+      appearanceDials: appearanceState()
+    })
+    const second = await buildRecipeStateSnapshot({
+      goon,
+      appearanceDials: appearanceState()
+    })
 
     expect(first).toEqual(second)
     expect(first.siblings.map((entry) => entry.id)).toEqual([
       'eyeAppearance',
       'facialArtwork',
+      'hairState',
       'lipArtworkPresence',
       'nailSurface',
       'nailSurfacePresence',
@@ -598,6 +704,9 @@ describe('Recipe workflow browser client', () => {
       'skinAppearance'
     ])
     expect(first.siblings.every((entry) => /^[a-f0-9]{64}$/.test(entry.stateSha256))).toBe(true)
+    expect(first.siblings.find((entry) => entry.id === 'hairState')?.state).toMatchObject({
+      motionSettings: { enabled: true, intensity: 1.1 }
+    })
     expect(first.stateSha256).toMatch(/^[a-f0-9]{64}$/)
   })
 
@@ -647,11 +756,14 @@ describe('Recipe workflow browser client', () => {
       'facialArtwork',
       'oralAppearance'
     ])
-    expect(Object.values(siblingInputs).every((input) =>
-      input.sourceStateId === null &&
-      input.targetStateId === null &&
-      input.targetDefinition === null
-    )).toBe(true)
+    expect(
+      Object.values(siblingInputs).every(
+        (input) =>
+          input.sourceStateId === null &&
+          input.targetStateId === null &&
+          input.targetDefinition === null
+      )
+    ).toBe(true)
   })
 
   it('uses the server-authored proposed state for initial Analyze preview controls', async () => {
@@ -679,17 +791,22 @@ describe('Recipe workflow browser client', () => {
     const manifest = parseAppearanceDialsManifest(fixture.target.avatarManifest)
     expect(manifest).not.toBeNull()
 
-    const controls = await deriveServerAuthorizedRecipePreviewControls({
-      plan,
-      reviewedState: null
-    } as RecipeAnalysisHydration, manifest!)
+    const controls = await deriveServerAuthorizedRecipePreviewControls(
+      {
+        plan,
+        reviewedState: null
+      } as RecipeAnalysisHydration,
+      manifest!
+    )
 
-    expect(controls).toContainEqual(expect.objectContaining({
-      authorization: 'server-verified',
-      id: 'new_control',
-      classification: 'new',
-      value: 0
-    }))
+    expect(controls).toContainEqual(
+      expect.objectContaining({
+        authorization: 'server-verified',
+        id: 'new_control',
+        classification: 'new',
+        value: 0
+      })
+    )
   })
 
   it('derives complete stored Live assets from the verified archive receipt', async () => {
@@ -723,7 +840,10 @@ describe('Recipe workflow browser client', () => {
       model: receipt.members[1].extracted,
       manifest: receipt.members[0].extracted
     })
-    expect(live.package).toMatchObject({ sha256: await sha256Hex(packageBytes), bytes: packageBytes.byteLength })
+    expect(live.package).toMatchObject({
+      sha256: await sha256Hex(packageBytes),
+      bytes: packageBytes.byteLength
+    })
   })
 
   it('bakes exact server state, registers upload ownership, stages, then commits with current CAS', async () => {
@@ -733,13 +853,41 @@ describe('Recipe workflow browser client', () => {
     const livePackage = bytes('live-package')
     const liveModel = bytes('live-model')
     const liveManifest = bytes('live-manifest')
+    const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
+    const hairBytes = createRootWeightedFollowerHairGlbFixture()
+    const followerDefinition = createHairFollowerDefinitionFixture({
+      recipeSource,
+      geometrySha256: await sha256Hex(hairBytes),
+      headNode: 'HeadAnchor'
+    })
+    const followerBytes = bytes(`${canonicalRecipeString(followerDefinition)}\n`)
+    const physicsDefinition = createHairSecondaryMotionDefinitionFixture({
+      recipeSource,
+      geometrySha256: await sha256Hex(hairBytes),
+      motionNode: 'HairFollowerFixtureMotion',
+      colliderNode: 'HeadAnchor'
+    })
+    const physicsBytes = bytes(`${canonicalRecipeString(physicsDefinition)}\n`)
+    const hairAsset = await createHairAssetFixture({
+      recipeSource,
+      mainBytes: hairBytes,
+      headNode: 'HeadAnchor',
+      tags: [HAIR_ROOT_WEIGHTED_MOTION_TAG],
+      follower: {
+        bytes: followerBytes,
+        definitionSha256: await hairFollowerDefinitionSha256(followerDefinition)
+      },
+      physics: {
+        bytes: physicsBytes,
+        definitionSha256: await secondaryMotionDefinitionSha256(physicsDefinition)
+      }
+    })
     const recipeState = await buildRecipeStateSnapshot({
-      goon: minimalGoon(),
+      goon: minimalGoon({ hairState: createHairState(hairAsset) }),
       appearanceDials: appearanceState()
     })
     const buildReceipt = await liveReceipt(livePackage, liveModel, liveManifest, recipeState)
     const archiveReceipt = await storedArchive(livePackage, liveModel, liveManifest)
-    const recipeSource = await source(sourcePackage, sourceModel, sourceManifest)
     const job = {
       jobId: 'job_client',
       operation: 'package-update',
@@ -760,32 +908,57 @@ describe('Recipe workflow browser client', () => {
       replayed: false
     } as RecipeJobStartResponse
     const upload = {
-      package: { url: archiveReceipt.archive.ref, filename: 'live.bgoon', size: livePackage.byteLength },
-      model: { url: archiveReceipt.members[1].extracted.ref, filename: 'live.glb', size: liveModel.byteLength },
-      manifest: { url: archiveReceipt.members[0].extracted.ref, filename: 'live.json', size: liveManifest.byteLength },
+      package: {
+        url: archiveReceipt.archive.ref,
+        filename: 'live.bgoon',
+        size: livePackage.byteLength
+      },
+      model: {
+        url: archiveReceipt.members[1].extracted.ref,
+        filename: 'live.glb',
+        size: liveModel.byteLength
+      },
+      manifest: {
+        url: archiveReceipt.members[0].extracted.ref,
+        filename: 'live.json',
+        size: liveManifest.byteLength
+      },
       archiveReceipt
     }
     const sourceByRef = new Map([
       [recipeSource.package.ref, sourcePackage],
       [recipeSource.model.ref, sourceModel],
-      [recipeSource.manifest.ref, sourceManifest]
+      [recipeSource.manifest.ref, sourceManifest],
+      [hairAsset.geometry.main.ref, hairBytes],
+      [hairAsset.follower.asset!.ref, followerBytes],
+      [hairAsset.physics.asset!.ref, physicsBytes],
+      [hairAsset.material.neutralValueTexture!.ref, HAIR_NEUTRAL_VALUE_PNG_FIXTURE],
+      [hairAsset.material.highlightMask!.ref, HAIR_HIGHLIGHT_MASK_PNG_FIXTURE]
     ])
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === '/api/goons/hair-assets') {
+        return new Response(JSON.stringify({ assets: [hairAsset] }), {
+          status: 200
+        })
+      }
       const body = sourceByRef.get(String(input))
       return body
         ? new Response(body.slice().buffer, { status: 200 })
         : new Response('missing', { status: 404 })
     })
-    const bake = vi.fn(async (input) => ({
-      contract: 'goon-live-bake-output/v1' as const,
-      packageBytes: livePackage,
-      modelBytes: liveModel,
-      manifestBytes: liveManifest,
-      receipt: buildReceipt,
-      manifest: {},
-      liveManifest: {},
-      audit: {}
-    } as any))
+    const bake = vi.fn(
+      async (input) =>
+        ({
+          contract: 'goon-live-bake-output/v1' as const,
+          packageBytes: livePackage,
+          modelBytes: liveModel,
+          manifestBytes: liveManifest,
+          receipt: buildReceipt,
+          manifest: {},
+          liveManifest: {},
+          audit: {}
+        }) as any
+    )
     const client = new RecipeWorkflowClient(minimalGoon().id, {
       fetchImpl: fetchImpl as typeof fetch,
       assetUrl: (ref) => ref,
@@ -810,7 +983,11 @@ describe('Recipe workflow browser client', () => {
     const result = await client.buildUploadStageCommit({
       start: {
         kind: 'package-update',
-        request: { expectedWriteVersion: 11, idempotencyKey: 'client-key', analysisId: 'analysis_client' }
+        request: {
+          expectedWriteVersion: 11,
+          idempotencyKey: 'client-key',
+          analysisId: 'analysis_client'
+        }
       },
       previewCandidate
     })
@@ -821,22 +998,39 @@ describe('Recipe workflow browser client', () => {
     expect(Array.from(bakeInput.packageBytes)).toEqual(Array.from(sourcePackage))
     expect(Array.from(bakeInput.modelBytes)).toEqual(Array.from(sourceModel))
     expect(Array.from(bakeInput.manifestBytes)).toEqual(Array.from(sourceManifest))
+    expect(bakeInput.hair.asset).toEqual(hairAsset)
+    expect(Array.from(bakeInput.hair.mainBytes)).toEqual(Array.from(hairBytes))
+    expect(Array.from(bakeInput.hair.followerBytes)).toEqual(Array.from(followerBytes))
+    expect(Array.from(bakeInput.hair.physicsBytes)).toEqual(Array.from(physicsBytes))
+    expect(Array.from(bakeInput.hair.neutralValueBytes)).toEqual(
+      Array.from(HAIR_NEUTRAL_VALUE_PNG_FIXTURE)
+    )
+    expect(Array.from(bakeInput.hair.highlightMaskBytes)).toEqual(
+      Array.from(HAIR_HIGHLIGHT_MASK_PNG_FIXTURE)
+    )
     expect(bakeOptions).toEqual({ signal: undefined, onProgress: undefined })
     expect(register).toHaveBeenCalledWith('job_client', {
       expectedWriteVersion: 11,
       expectedJobStateVersion: 4,
       live: result.live
     })
-    expect(stage).toHaveBeenCalledWith('job_client', expect.objectContaining({
-      expectedWriteVersion: 12,
-      expectedJobStateVersion: 5,
-      liveBuildReceipt: buildReceipt,
-      live: result.live
-    }))
+    expect(stage).toHaveBeenCalledWith(
+      'job_client',
+      expect.objectContaining({
+        expectedWriteVersion: 12,
+        expectedJobStateVersion: 5,
+        liveBuildReceipt: buildReceipt,
+        live: result.live
+      })
+    )
     expect(register.mock.invocationCallOrder[0]).toBeLessThan(stage.mock.invocationCallOrder[0])
     expect(previewCandidate).toHaveBeenCalledWith(staged)
-    expect(stage.mock.invocationCallOrder[0]).toBeLessThan(previewCandidate.mock.invocationCallOrder[0])
-    expect(previewCandidate.mock.invocationCallOrder[0]).toBeLessThan(commit.mock.invocationCallOrder[0])
+    expect(stage.mock.invocationCallOrder[0]).toBeLessThan(
+      previewCandidate.mock.invocationCallOrder[0]
+    )
+    expect(previewCandidate.mock.invocationCallOrder[0]).toBeLessThan(
+      commit.mock.invocationCallOrder[0]
+    )
     expect(commit).toHaveBeenCalledWith('job_client', {
       expectedWriteVersion: 13,
       expectedJobStateVersion: 6
@@ -864,7 +1058,10 @@ describe('Recipe workflow browser client', () => {
     const started = {
       goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
       job,
-      reviewedState: { operation: 'rebake', state: recipeState } as RecipeReviewedState,
+      reviewedState: {
+        operation: 'rebake',
+        state: recipeState
+      } as RecipeReviewedState,
       replayed: false
     } as RecipeJobStartResponse
     const sourceByRef = new Map([
@@ -892,20 +1089,29 @@ describe('Recipe workflow browser client', () => {
     vi.spyOn(client, 'recoverJob').mockResolvedValue(recovery)
     const action = vi.spyOn(client, 'actOnJob').mockResolvedValue({} as RecipeJobActionResponse)
 
-    await expect(client.buildUploadStageCommit({
-      start: {
-        kind: 'bake',
-        request: { expectedWriteVersion: 20, idempotencyKey: 'rebake-key', state: recipeState }
-      },
-      previewCandidate: vi.fn(async () => undefined)
-    })).rejects.toMatchObject({ name: 'AbortError' })
-    expect(action).toHaveBeenCalledWith('job_failure', expect.objectContaining({
-      action: 'fail',
-      expectedWriteVersion: 21,
-      expectedJobStateVersion: 4,
-      stage: 'baking',
-      reason: 'Worker canceled'
-    }))
+    await expect(
+      client.buildUploadStageCommit({
+        start: {
+          kind: 'bake',
+          request: {
+            expectedWriteVersion: 20,
+            idempotencyKey: 'rebake-key',
+            state: recipeState
+          }
+        },
+        previewCandidate: vi.fn(async () => undefined)
+      })
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    expect(action).toHaveBeenCalledWith(
+      'job_failure',
+      expect.objectContaining({
+        action: 'fail',
+        expectedWriteVersion: 21,
+        expectedJobStateVersion: 4,
+        stage: 'baking',
+        reason: 'Worker canceled'
+      })
+    )
   })
 
   it('records the exact source ref when a Recipe asset load fails before baking', async () => {
@@ -929,7 +1135,10 @@ describe('Recipe workflow browser client', () => {
     const started = {
       goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
       job,
-      reviewedState: { operation: 'first-bake', state: recipeState } as RecipeReviewedState,
+      reviewedState: {
+        operation: 'first-bake',
+        state: recipeState
+      } as RecipeReviewedState,
       replayed: false
     } as RecipeJobStartResponse
     const client = new RecipeWorkflowClient(minimalGoon().id, {
@@ -945,23 +1154,30 @@ describe('Recipe workflow browser client', () => {
     } as RecipeJobRecoveryResponse)
     const action = vi.spyOn(client, 'actOnJob').mockResolvedValue({} as RecipeJobActionResponse)
 
-    await expect(client.buildUploadStageCommit({
-      start: {
-        kind: 'bake',
-        request: { expectedWriteVersion: 20, idempotencyKey: 'source-load-key', state: recipeState }
-      },
-      previewCandidate: vi.fn(async () => undefined)
-    })).rejects.toThrow(
-      `Failed to load exact Recipe asset ${recipeSource.package.ref}: Load failed`
-    )
+    await expect(
+      client.buildUploadStageCommit({
+        start: {
+          kind: 'bake',
+          request: {
+            expectedWriteVersion: 20,
+            idempotencyKey: 'source-load-key',
+            state: recipeState
+          }
+        },
+        previewCandidate: vi.fn(async () => undefined)
+      })
+    ).rejects.toThrow(`Failed to load exact Recipe asset ${recipeSource.package.ref}: Load failed`)
 
-    expect(action).toHaveBeenCalledWith('job_source_load_failure', expect.objectContaining({
-      action: 'fail',
-      expectedWriteVersion: 21,
-      expectedJobStateVersion: 4,
-      stage: 'validating',
-      reason: `Failed to load exact Recipe asset ${recipeSource.package.ref}: Load failed`
-    }))
+    expect(action).toHaveBeenCalledWith(
+      'job_source_load_failure',
+      expect.objectContaining({
+        action: 'fail',
+        expectedWriteVersion: 21,
+        expectedJobStateVersion: 4,
+        stage: 'validating',
+        reason: `Failed to load exact Recipe asset ${recipeSource.package.ref}: Load failed`
+      })
+    )
   })
 
   it('records preview-load failure durably and never commits the staged candidate', async () => {
@@ -990,13 +1206,28 @@ describe('Recipe workflow browser client', () => {
     const started = {
       goon: minimalGoon({ recipe: { writeVersion: 20 } as GoonRecipeV2 }),
       job,
-      reviewedState: { operation: 'rebake', state: recipeState } as RecipeReviewedState,
+      reviewedState: {
+        operation: 'rebake',
+        state: recipeState
+      } as RecipeReviewedState,
       replayed: false
     } as RecipeJobStartResponse
     const upload = {
-      package: { url: archiveReceipt.archive.ref, filename: 'live.bgoon', size: livePackage.byteLength },
-      model: { url: archiveReceipt.members[1].extracted.ref, filename: 'live.glb', size: liveModel.byteLength },
-      manifest: { url: archiveReceipt.members[0].extracted.ref, filename: 'live.json', size: liveManifest.byteLength },
+      package: {
+        url: archiveReceipt.archive.ref,
+        filename: 'live.bgoon',
+        size: livePackage.byteLength
+      },
+      model: {
+        url: archiveReceipt.members[1].extracted.ref,
+        filename: 'live.glb',
+        size: liveModel.byteLength
+      },
+      manifest: {
+        url: archiveReceipt.members[0].extracted.ref,
+        filename: 'live.json',
+        size: liveManifest.byteLength
+      },
       archiveReceipt
     }
     const sourceByRef = new Map([
@@ -1004,7 +1235,10 @@ describe('Recipe workflow browser client', () => {
       [recipeSource.model.ref, sourceModel],
       [recipeSource.manifest.ref, sourceManifest]
     ])
-    const cleanupCustomPackage = vi.fn(async () => ({ deleted: [], retained: [] }))
+    const cleanupCustomPackage = vi.fn(async () => ({
+      deleted: [],
+      retained: []
+    }))
     const client = new RecipeWorkflowClient(minimalGoon().id, {
       fetchImpl: (async (input: RequestInfo | URL) => {
         const body = sourceByRef.get(String(input))
@@ -1013,16 +1247,19 @@ describe('Recipe workflow browser client', () => {
           : new Response('missing', { status: 404 })
       }) as typeof fetch,
       assetUrl: (ref) => ref,
-      bake: vi.fn(async () => ({
-        contract: 'goon-live-bake-output/v1' as const,
-        packageBytes: livePackage,
-        modelBytes: liveModel,
-        manifestBytes: liveManifest,
-        receipt: buildReceipt,
-        manifest: {},
-        liveManifest: {},
-        audit: {}
-      } as any)),
+      bake: vi.fn(
+        async () =>
+          ({
+            contract: 'goon-live-bake-output/v1' as const,
+            packageBytes: livePackage,
+            modelBytes: liveModel,
+            manifestBytes: liveManifest,
+            receipt: buildReceipt,
+            manifest: {},
+            liveManifest: {},
+            audit: {}
+          }) as any
+      ),
       uploadCustomPackage: vi.fn(async () => upload),
       cleanupCustomPackage
     })
@@ -1045,25 +1282,34 @@ describe('Recipe workflow browser client', () => {
     } as RecipeJobRecoveryResponse)
     const action = vi.spyOn(client, 'actOnJob').mockResolvedValue({} as RecipeJobActionResponse)
 
-    await expect(client.buildUploadStageCommit({
-      start: {
-        kind: 'bake',
-        request: { expectedWriteVersion: 20, idempotencyKey: 'preview-key', state: recipeState }
-      },
-      previewCandidate: vi.fn(async () => {
-        throw new Error('Candidate GLB could not be loaded')
+    await expect(
+      client.buildUploadStageCommit({
+        start: {
+          kind: 'bake',
+          request: {
+            expectedWriteVersion: 20,
+            idempotencyKey: 'preview-key',
+            state: recipeState
+          }
+        },
+        previewCandidate: vi.fn(async () => {
+          throw new Error('Candidate GLB could not be loaded')
+        })
       })
-    })).rejects.toThrow('Candidate GLB could not be loaded')
+    ).rejects.toThrow('Candidate GLB could not be loaded')
 
     expect(commit).not.toHaveBeenCalled()
     expect(cleanupCustomPackage).toHaveBeenCalledWith(minimalGoon().id, archiveReceipt)
-    expect(action).toHaveBeenCalledWith('job_preview_failure', expect.objectContaining({
-      action: 'fail',
-      expectedWriteVersion: 22,
-      expectedJobStateVersion: 5,
-      stage: 'preview-load',
-      reason: 'Candidate GLB could not be loaded'
-    }))
+    expect(action).toHaveBeenCalledWith(
+      'job_preview_failure',
+      expect.objectContaining({
+        action: 'fail',
+        expectedWriteVersion: 22,
+        expectedJobStateVersion: 5,
+        stage: 'preview-load',
+        reason: 'Candidate GLB could not be loaded'
+      })
+    )
   })
 
   it.each([
@@ -1076,17 +1322,19 @@ describe('Recipe workflow browser client', () => {
     async ({ point, stage: failureStage, previewed }) => {
       const harness = await createFailureWorkflowHarness(point)
 
-      await expect(harness.client.buildUploadStageCommit({
-        start: {
-          kind: 'bake',
-          request: {
-            expectedWriteVersion: 20,
-            idempotencyKey: `${point}-failure-key`,
-            state: harness.recipeState
-          }
-        },
-        previewCandidate: harness.previewCandidate
-      })).rejects.toThrow(harness.injectedError.message)
+      await expect(
+        harness.client.buildUploadStageCommit({
+          start: {
+            kind: 'bake',
+            request: {
+              expectedWriteVersion: 20,
+              idempotencyKey: `${point}-failure-key`,
+              state: harness.recipeState
+            }
+          },
+          previewCandidate: harness.previewCandidate
+        })
+      ).rejects.toThrow(harness.injectedError.message)
 
       if (point === 'upload') {
         expect(harness.cleanupCustomPackage).not.toHaveBeenCalled()
@@ -1110,19 +1358,27 @@ describe('Recipe workflow browser client', () => {
   )
 
   it('surfaces typed route errors with the server conflict code', async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
-      error: 'The Recipe changed after analysis.',
-      code: 'WRITE_CONFLICT'
-    }), { status: 409 }))
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: 'The Recipe changed after analysis.',
+            code: 'WRITE_CONFLICT'
+          }),
+          { status: 409 }
+        )
+    )
     const client = new RecipeWorkflowClient('goon/client id', {
       fetchImpl: fetchImpl as typeof fetch
     })
 
-    const error = await client.startPackageUpdate({
-      expectedWriteVersion: 2,
-      idempotencyKey: 'client-key',
-      analysisId: 'analysis_client'
-    }).catch((caught) => caught)
+    const error = await client
+      .startPackageUpdate({
+        expectedWriteVersion: 2,
+        idempotencyKey: 'client-key',
+        analysisId: 'analysis_client'
+      })
+      .catch((caught) => caught)
 
     expect(error).toBeInstanceOf(RecipeWorkflowHttpError)
     expect(error).toMatchObject({ status: 409, code: 'WRITE_CONFLICT' })

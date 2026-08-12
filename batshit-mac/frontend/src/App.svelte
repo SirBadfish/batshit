@@ -52,7 +52,7 @@
   async function invoke(action) {
     if (!window.zero?.invoke) {
       bridgeReady = false;
-      error = "The native bridge is not available in this window.";
+      error = "The Mac app bridge is not available in this window.";
       return null;
     }
     bridgeReady = true;
@@ -102,7 +102,7 @@
       bridgeReady = false;
       loading = false;
       booting = false;
-      error = "The native bridge is not available in this window.";
+      error = "The Mac app bridge is not available in this window.";
       return;
     }
 
@@ -183,7 +183,7 @@
     {/if}
 
     {#if !bridgeReady && !loading}
-      <section class="notice">Native bridge unavailable. Launch this screen from Batshit.app.</section>
+      <section class="notice">Mac app bridge unavailable. Launch this screen from Batshit.app.</section>
     {/if}
 
     <section class="control-band" aria-label="Runtime controls">

@@ -156,4 +156,15 @@ describe('Recipe build dirty-domain classifier', () => {
       classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
     ).toEqual(['skin-appearance'])
   })
+
+  it('classifies immutable Hair Asset selection and color changes as Hair work', () => {
+    const saved = state({ siblings: [] })
+    const draft = state({
+      stateSha256: HASH_B,
+      siblings: [sibling('hairState', 'hair-state/v2', 1, HASH_B)]
+    })
+    expect(
+      classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
+    ).toEqual(['hair'])
+  })
 })

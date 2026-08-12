@@ -29,6 +29,7 @@ import {
   setGoonsError,
   setGoonsLoading,
   updateGoon as updateGoonStore,
+  replaceGoon as replaceGoonStore,
   removeGoon as removeGoonStore
 } from '$lib/stores/goons.svelte'
 import {
@@ -161,7 +162,11 @@ export async function createGoon(input: CreateGoonInput): Promise<GoonRecord> {
   return goon
 }
 
-export async function updateGoon(id: string, updates: Partial<GoonRecord>): Promise<GoonRecord> {
+async function putGoon(
+  id: string,
+  updates: Partial<GoonRecord>,
+  options: { syncStore: boolean }
+): Promise<GoonRecord> {
   const res = await fetch(`/api/goons/${id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -174,8 +179,44 @@ export async function updateGoon(id: string, updates: Partial<GoonRecord>): Prom
 
   const data = await res.json()
   const goon = (data?.goon ?? data) as GoonRecord
-  updateGoonStore(id, goon)
+  if (options.syncStore) updateGoonStore(id, goon)
   return goon
+}
+
+export async function updateGoon(id: string, updates: Partial<GoonRecord>): Promise<GoonRecord> {
+  return putGoon(id, updates, { syncStore: true })
+}
+
+export async function resetRetiredGoonHair(
+  id: string,
+  expectedWriteVersion: number
+): Promise<GoonRecord> {
+  const res = await fetch(`/api/goons/${id}/recipe/recover-retired-hair`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expectedWriteVersion })
+  })
+
+  if (!res.ok) {
+    throw new Error(await readApiError(res, 'Failed to reset retired Hair'))
+  }
+
+  const data = await res.json()
+  const goon = (data?.goon ?? data) as GoonRecord
+  replaceGoonStore(id, goon)
+  return goon
+}
+
+/**
+ * Persist the editor camera without replacing the global Goon collection.
+ * The live editor already owns the current camera, and publishing every orbit
+ * stop through the shared store wakes the entire Settings reactive graph.
+ */
+export async function persistGoonCamera(
+  id: string,
+  camera: NonNullable<GoonRecord['camera']>
+): Promise<GoonRecord> {
+  return putGoon(id, { camera }, { syncStore: false })
 }
 
 export async function duplicateGoon(id: string): Promise<GoonRecord> {

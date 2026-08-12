@@ -1,7 +1,11 @@
-import type { AppearanceDialValueState, AppearanceDialsManifest } from '../appearanceDials.contracts'
+import type {
+  AppearanceDialValueState,
+  AppearanceDialsManifest
+} from '../appearanceDials.contracts'
 import type { GoonCustomAvatarManifest } from '../customAvatar'
 import { parseEyeAppearanceDefinition } from '../eyeAppearance'
 import { parseFacialArtworkDefinition } from '../facialArtwork'
+import { parseHairState, validateHairStateBinding, verifyHairAsset } from '../hairAssets'
 import type { GoonFileRef, GoonRecord } from '$lib/types/goons'
 import type { CustomGoonPackageUploadResult } from '$lib/services/goons'
 import {
@@ -11,11 +15,9 @@ import {
   type RecipeStoredAssetRef
 } from './archiveContainmentContracts'
 import { bakeLiveGoonInWorker, type LiveGoonBakerClientOptions } from './liveGoonBakerClient'
+import type { LiveGoonHairBakeInput } from './liveGoonBaker'
 import { withoutAnatomyFitRecipeSibling } from './anatomyFitContracts'
-import {
-  verifyGoonLiveBuildReceipt,
-  type GoonLiveBuildReceipt
-} from './liveBuildContracts'
+import { verifyGoonLiveBuildReceipt, type GoonLiveBuildReceipt } from './liveBuildContracts'
 import type { AppearanceRecipeMigrationSiblingInput } from './appearanceRecipeMigrationPlanner'
 import {
   canonicalRecipeSha256,
@@ -32,6 +34,7 @@ import {
   type RecipeFailureStage,
   type RecipeDocumentRef,
   type RecipeJsonValue,
+  type RecipeSource,
   type RecipeSiblingStateRecord,
   type RecipeStateSnapshot
 } from './recipeContracts'
@@ -286,10 +289,7 @@ export type RecipeReadyResumeInput = {
 export type RecipeWorkflowClientDependencies = {
   fetchImpl?: typeof fetch
   bake?: typeof bakeLiveGoonInWorker
-  uploadCustomPackage?: (
-    goonId: string,
-    file: File
-  ) => Promise<CustomGoonPackageUploadResult>
+  uploadCustomPackage?: (goonId: string, file: File) => Promise<CustomGoonPackageUploadResult>
   cleanupCustomPackage?: (goonId: string, archiveReceipt: unknown) => Promise<unknown>
   assetUrl?: (ref: string) => string | Promise<string>
 }
@@ -365,11 +365,7 @@ export async function buildRecipeStateSnapshot(
     currentAuthoringSiblings(input.goon).map((sibling) => [sibling.id, sibling])
   )
 
-  removeSiblingSurface(
-    siblings,
-    ['facialArtwork', 'facial-artwork'],
-    'facial-artwork-state/v4'
-  )
+  removeSiblingSurface(siblings, ['facialArtwork', 'facial-artwork'], 'facial-artwork-state/v4')
   if (input.goon.facialArtwork) {
     const state = cloneRecipeJson(input.goon.facialArtwork)
     const next = await siblingRecord({
@@ -381,11 +377,7 @@ export async function buildRecipeStateSnapshot(
     siblings.set(next.id, next)
   }
 
-  removeSiblingSurface(
-    siblings,
-    ['eyeAppearance', 'eye-appearance'],
-    'eye-appearance-state/v3'
-  )
+  removeSiblingSurface(siblings, ['eyeAppearance', 'eye-appearance'], 'eye-appearance-state/v3')
   if (input.goon.eyeAppearance) {
     const state = cloneRecipeJson(input.goon.eyeAppearance)
     const next = await siblingRecord({
@@ -496,12 +488,20 @@ export async function buildRecipeStateSnapshot(
     ['skin-material-artwork-state/v1', 'skin-material-artwork-state/v2']
   )
 
+  removeSiblingSurface(siblings, ['hairState', 'hair-state'], 'hair-state/v2')
+  if (input.goon.hairState?.selected) {
+    const state = cloneRecipeJson(input.goon.hairState)
+    const next = await siblingRecord({
+      id: 'hairState',
+      contract: state.schemaVersion,
+      definitionSha256: requiredText(state.definitionSha256, 'Recipe Hair state definitionSha256'),
+      state
+    })
+    siblings.set(next.id, next)
+  }
+
   if (input.anatomyFitState !== undefined) {
-    removeSiblingSurface(
-      siblings,
-      ['anatomy-fit'],
-      'anatomy-fit-state/v2'
-    )
+    removeSiblingSurface(siblings, ['anatomy-fit'], 'anatomy-fit-state/v2')
     if (input.anatomyFitState) {
       const next = await siblingRecord(input.anatomyFitState)
       siblings.set(next.id, next)
@@ -701,22 +701,26 @@ export async function deriveServerAuthorizedRecipePreviewControls(
     if (!classification) return []
     const definition = definitions.get(endpoint.id)
     if (!definition) {
-      throw new Error(`Server-authorized preview control ${endpoint.id} is missing from the target manifest.`)
+      throw new Error(
+        `Server-authorized preview control ${endpoint.id} is missing from the target manifest.`
+      )
     }
     const value = state.appearanceDials.values[endpoint.id] ?? 0
-    return [{
-      authorization: 'server-verified' as const,
-      id: endpoint.id,
-      label: definition.label,
-      classification,
-      minimum: definition.range[0],
-      maximum: definition.range[1],
-      step: definition.step,
-      neutralValue: 0 as const,
-      value,
-      reason: row.message,
-      description: definition.description
-    }]
+    return [
+      {
+        authorization: 'server-verified' as const,
+        id: endpoint.id,
+        label: definition.label,
+        classification,
+        minimum: definition.range[0],
+        maximum: definition.range[1],
+        step: definition.step,
+        neutralValue: 0 as const,
+        value,
+        reason: row.message,
+        description: definition.description
+      }
+    ]
   })
 }
 
@@ -792,7 +796,10 @@ async function parseAnalysisHydration(value: unknown): Promise<RecipeAnalysisHyd
   if (!owner.pendingAnalysis) throw new Error('Recipe analysis response has no pending analysis.')
   const plan = parseRecipeMigrationPlan(raw.plan)
   const basePlan = parseRecipeMigrationPlan(raw.basePlan)
-  const report = record(raw.report, 'Recipe analysis response.report') as unknown as RecipeMigrationReport
+  const report = record(
+    raw.report,
+    'Recipe analysis response.report'
+  ) as unknown as RecipeMigrationReport
   if (
     report.contract !== RECIPE_MIGRATION_REPORT_CONTRACT ||
     report.directEdgeKey !== plan.directEdgeKey ||
@@ -806,9 +813,8 @@ async function parseAnalysisHydration(value: unknown): Promise<RecipeAnalysisHyd
   }
   requireLowercaseSha256(report.proof.reportSha256, 'Recipe analysis report proof hash')
   const receipt = await verifyRecipeArchiveContainmentReceipt(raw.receipt)
-  const reviewedState = raw.reviewedState === null
-    ? null
-    : await verifyRecipeReviewedState(raw.reviewedState)
+  const reviewedState =
+    raw.reviewedState === null ? null : await verifyRecipeReviewedState(raw.reviewedState)
   const [planDocumentSha256, basePlanDocumentSha256, reportDocumentSha256, receiptDocumentSha256] =
     await Promise.all([
       canonicalRecipeSha256(plan),
@@ -850,22 +856,21 @@ async function parseJobResponse(
   if (
     job.goonId !== goon.id ||
     job.userId !== goon.user_id ||
-    job.reviewedState.sha256 !== await canonicalRecipeSha256(reviewedState) ||
+    job.reviewedState.sha256 !== (await canonicalRecipeSha256(reviewedState)) ||
     reviewedState.operation !== job.operation
   ) {
     throw new Error('Recipe job response has inconsistent Goon, job, or reviewed-state bindings.')
   }
   const marked = requiredBoolean(raw[marker], `Recipe job response.${marker}`)
   if (marker === 'replayed') return { goon, job, reviewedState, replayed: marked }
-  const candidate = raw.candidate === null
-    ? null
-    : await verifyRecipeRevisionEnvelope(raw.candidate)
+  const candidate =
+    raw.candidate === null ? null : await verifyRecipeRevisionEnvelope(raw.candidate)
   if (
     Boolean(candidate) !== Boolean(job.candidateRevision) ||
-    (candidate && job.candidateRevision && (
-      candidate.envelopeSha256 !== job.candidateRevision.sha256 ||
-      !job.candidateRevision.ref.endsWith(`:${candidate.revision.revisionId}`)
-    ))
+    (candidate &&
+      job.candidateRevision &&
+      (candidate.envelopeSha256 !== job.candidateRevision.sha256 ||
+        !job.candidateRevision.ref.endsWith(`:${candidate.revision.revisionId}`)))
   ) {
     throw new Error('Recovered Recipe candidate differs from the job candidate revision ref.')
   }
@@ -891,10 +896,7 @@ async function parseCandidateAssetsResponse(
   value: unknown
 ): Promise<RecipeCandidateAssetsResponse> {
   const raw = record(value, 'Recipe candidate-assets response')
-  const { goon, owner } = await parseRecipeGoon(
-    raw.goon,
-    'Recipe candidate-assets response.goon'
-  )
+  const { goon, owner } = await parseRecipeGoon(raw.goon, 'Recipe candidate-assets response.goon')
   const explicitOwner = await verifyGoonRecipeV2(raw.owner)
   const job = parseGoonRecipeJob(raw.job)
   if (
@@ -1005,8 +1007,12 @@ export class RecipeWorkflowClient {
   readonly goonId: string
   private readonly fetchImpl: typeof fetch
   private readonly bake: typeof bakeLiveGoonInWorker
-  private readonly uploadCustomPackage: NonNullable<RecipeWorkflowClientDependencies['uploadCustomPackage']>
-  private readonly cleanupCustomPackage: NonNullable<RecipeWorkflowClientDependencies['cleanupCustomPackage']>
+  private readonly uploadCustomPackage: NonNullable<
+    RecipeWorkflowClientDependencies['uploadCustomPackage']
+  >
+  private readonly cleanupCustomPackage: NonNullable<
+    RecipeWorkflowClientDependencies['cleanupCustomPackage']
+  >
   private readonly resolveAssetUrl: NonNullable<RecipeWorkflowClientDependencies['assetUrl']>
 
   constructor(goonId: string, dependencies: RecipeWorkflowClientDependencies = {}) {
@@ -1037,9 +1043,11 @@ export class RecipeWorkflowClient {
       }
     }
     if (!response.ok) {
-      const body = payload && typeof payload === 'object' ? payload as UnknownRecord : null
+      const body = payload && typeof payload === 'object' ? (payload as UnknownRecord) : null
       throw new RecipeWorkflowHttpError(
-        typeof body?.error === 'string' ? body.error : `Current Goon lookup failed (${response.status}).`,
+        typeof body?.error === 'string'
+          ? body.error
+          : `Current Goon lookup failed (${response.status}).`,
         {
           status: response.status,
           code: typeof body?.code === 'string' ? body.code : null,
@@ -1067,10 +1075,9 @@ export class RecipeWorkflowClient {
       }
     }
     if (!response.ok) {
-      const body = payload && typeof payload === 'object' ? payload as UnknownRecord : null
-      const message = typeof body?.error === 'string'
-        ? body.error
-        : `Recipe request failed (${response.status}).`
+      const body = payload && typeof payload === 'object' ? (payload as UnknownRecord) : null
+      const message =
+        typeof body?.error === 'string' ? body.error : `Recipe request failed (${response.status}).`
       throw new RecipeWorkflowHttpError(message, {
         status: response.status,
         code: typeof body?.code === 'string' ? body.code : null,
@@ -1098,7 +1105,10 @@ export class RecipeWorkflowClient {
       await this.request('/bootstrap', this.json('POST', request, options.signal)),
       'Recipe initialization response'
     )
-    const { goon, owner } = await parseRecipeGoon(payload.goon, 'Recipe initialization response.goon')
+    const { goon, owner } = await parseRecipeGoon(
+      payload.goon,
+      'Recipe initialization response.goon'
+    )
     const rawReceipt = record(
       payload.containmentReceipt,
       'Recipe initialization response.containmentReceipt'
@@ -1106,10 +1116,7 @@ export class RecipeWorkflowClient {
     const containmentReceipt: RecipeDocumentRef = {
       contract: requiredText(rawReceipt.contract, 'Recipe initialization containment contract'),
       ref: requiredText(rawReceipt.ref, 'Recipe initialization containment ref'),
-      sha256: requireLowercaseSha256(
-        rawReceipt.sha256,
-        'Recipe initialization containment hash'
-      )
+      sha256: requireLowercaseSha256(rawReceipt.sha256, 'Recipe initialization containment hash')
     }
     if (
       containmentReceipt.contract !== RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT ||
@@ -1141,8 +1148,13 @@ export class RecipeWorkflowClient {
     )
     try {
       const receipt = await verifyRecipeArchiveContainmentReceipt(upload.archiveReceipt)
-      if (receipt.archive.sha256 !== await sha256Hex(bytes) || receipt.archive.bytes !== bytes.byteLength) {
-        throw new Error('Re-uploaded current package does not match the exact initialization bytes.')
+      if (
+        receipt.archive.sha256 !== (await sha256Hex(bytes)) ||
+        receipt.archive.bytes !== bytes.byteLength
+      ) {
+        throw new Error(
+          'Re-uploaded current package does not match the exact initialization bytes.'
+        )
       }
 
       // Reading and re-uploading a large source package gives ordinary runtime
@@ -1155,13 +1167,18 @@ export class RecipeWorkflowClient {
         canonicalRecipeString(latestGoon.customAvatar?.package ?? null) !==
         canonicalRecipeString(current)
       ) {
-        throw new Error('The Goon file changed while initial preparation was starting. Retry preparation from the current file.')
+        throw new Error(
+          'The Goon file changed while initial preparation was starting. Retry preparation from the current file.'
+        )
       }
-      return await this.initialize({
-        expectedUpdatedAt: latestGoon.updated_at,
-        receipt,
-        state: await verifyRecipeStateSnapshot(state)
-      }, options)
+      return await this.initialize(
+        {
+          expectedUpdatedAt: latestGoon.updated_at,
+          receipt,
+          state: await verifyRecipeStateSnapshot(state)
+        },
+        options
+      )
     } catch (error) {
       try {
         await this.cleanupCustomPackage(this.goonId, upload.archiveReceipt)
@@ -1200,7 +1217,9 @@ export class RecipeWorkflowClient {
       storedManifest.ref !== plan.toSource.manifest.ref ||
       storedManifest.sha256 !== plan.toSource.manifest.sha256
     ) {
-      throw new Error('Recipe analysis target manifest differs from its archive containment receipt.')
+      throw new Error(
+        'Recipe analysis target manifest differs from its archive containment receipt.'
+      )
     }
     const bytes = await this.fetchExactBytes(
       storedManifest.ref,
@@ -1251,7 +1270,12 @@ export class RecipeWorkflowClient {
     if (payload.discarded !== true || owner.pendingAnalysis) {
       throw new Error('Recipe analysis discard did not clear the pending analysis.')
     }
-    return { goon, owner, discarded: true, deletedAssets: payload.deletedAssets }
+    return {
+      goon,
+      owner,
+      discarded: true,
+      deletedAssets: payload.deletedAssets
+    }
   }
 
   async resetAnalysis(
@@ -1297,7 +1321,9 @@ export class RecipeWorkflowClient {
     options: RecipeWorkflowRequestOptions = {}
   ): Promise<RecipeJobRecoveryResponse> {
     return parseJobResponse(
-      await this.request(`/jobs/${encodeURIComponent(jobId)}`, { signal: options.signal }),
+      await this.request(`/jobs/${encodeURIComponent(jobId)}`, {
+        signal: options.signal
+      }),
       'recovered'
     ) as Promise<RecipeJobRecoveryResponse>
   }
@@ -1385,10 +1411,7 @@ export class RecipeWorkflowClient {
     options: RecipeWorkflowRequestOptions = {}
   ): Promise<RecipeRollbackResponse> {
     const payload = record(
-      await this.request(
-        '/rollback',
-        this.json('POST', { expectedWriteVersion }, options.signal)
-      ),
+      await this.request('/rollback', this.json('POST', { expectedWriteVersion }, options.signal)),
       'Recipe rollback response'
     )
     const { goon, owner } = await parseRecipeGoon(payload.goon, 'Recipe rollback response.goon')
@@ -1443,10 +1466,9 @@ export class RecipeWorkflowClient {
       response = await this.fetchImpl(url, { signal })
     } catch (error) {
       if ((error as Error)?.name === 'AbortError' || signal?.aborted) throw error
-      throw new Error(
-        `Failed to load exact Recipe asset ${ref}: ${errorMessage(error)}`,
-        { cause: error }
-      )
+      throw new Error(`Failed to load exact Recipe asset ${ref}: ${errorMessage(error)}`, {
+        cause: error
+      })
     }
     if (!response.ok) {
       throw new Error(`Failed to fetch exact Recipe asset ${ref} (${response.status}).`)
@@ -1456,7 +1478,7 @@ export class RecipeWorkflowClient {
     if (expectedBytes !== undefined && bytes.byteLength !== expectedBytes) {
       throw new Error(`Recipe asset ${ref} byte count does not match its trusted evidence.`)
     }
-    if (expectedSha256 && await sha256Hex(bytes) !== expectedSha256) {
+    if (expectedSha256 && (await sha256Hex(bytes)) !== expectedSha256) {
       throw new Error(`Recipe asset ${ref} hash does not match its trusted evidence.`)
     }
     return bytes
@@ -1472,11 +1494,135 @@ export class RecipeWorkflowClient {
     return { packageBytes, modelBytes, manifestBytes }
   }
 
-  private async recordDurableFailure(
-    jobId: string,
-    stage: RecipeFailureStage,
-    failure: unknown
-  ) {
+  private async fetchJobHair(
+    state: RecipeStateSnapshot,
+    source: RecipeSource,
+    signal?: AbortSignal
+  ): Promise<LiveGoonHairBakeInput | undefined> {
+    const siblings = state.siblings.filter(
+      (entry) =>
+        entry.id === 'hairState' || entry.id === 'hair-state' || entry.contract === 'hair-state/v2'
+    )
+    if (siblings.length === 0) return undefined
+    if (siblings.length > 1) throw new Error('Recipe State contains more than one Hair sibling.')
+    const hairState = parseHairState(siblings[0].state)
+    if (!hairState.selected) return undefined
+    const selection = hairState.selected
+
+    const response = await this.fetchImpl('/api/goons/hair-assets', { signal })
+    const payload = await response.json().catch(() => null)
+    if (!response.ok) {
+      const body = payload && typeof payload === 'object' ? (payload as UnknownRecord) : null
+      throw new Error(
+        typeof body?.error === 'string'
+          ? body.error
+          : `Hair Asset lookup failed (${response.status}).`
+      )
+    }
+    const body = record(payload, 'Hair Asset lookup')
+    if (!Array.isArray(body.assets)) throw new Error('Hair Asset lookup returned no asset list.')
+    const matches = body.assets.filter((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
+      const candidate = entry as UnknownRecord
+      return (
+        candidate.assetId === selection.assetId &&
+        candidate.revisionId === selection.assetRevisionId
+      )
+    })
+    if (matches.length !== 1) {
+      throw new Error(
+        `Hair Asset ${selection.assetId}@${selection.assetRevisionId} is missing or ambiguous.`
+      )
+    }
+    const asset = await verifyHairAsset(matches[0])
+    await validateHairStateBinding({
+      asset,
+      state: hairState,
+      recipeSource: source.identities
+    })
+    if (
+      asset.material.status !== 'ready' ||
+      !asset.material.neutralValueTexture ||
+      !asset.material.highlightMask
+    ) {
+      throw new Error('The selected Hair Asset has no ready neutral material.')
+    }
+    if (asset.geometry.sparseAccent) {
+      throw new Error('Sparse Hair accent geometry is not supported by the V1 Live Goon contract.')
+    }
+    const [
+      mainBytes,
+      followerBytes,
+      physicsBytes,
+      neutralValueBytes,
+      highlightMaskBytes,
+      normalBytes,
+      roughnessBytes
+    ] = await Promise.all([
+      this.fetchExactBytes(
+        asset.geometry.main.ref,
+        asset.geometry.main.sha256,
+        asset.geometry.main.bytes,
+        signal
+      ),
+      asset.follower.mode === 'appearance-followers/v2' && asset.follower.asset
+        ? this.fetchExactBytes(
+            asset.follower.asset.ref,
+            asset.follower.asset.sha256,
+            asset.follower.asset.bytes,
+            signal
+          )
+        : Promise.resolve(undefined),
+      asset.physics.mode === 'secondary-motion/v1' && asset.physics.asset
+        ? this.fetchExactBytes(
+            asset.physics.asset.ref,
+            asset.physics.asset.sha256,
+            asset.physics.asset.bytes,
+            signal
+          )
+        : Promise.resolve(undefined),
+      this.fetchExactBytes(
+        asset.material.neutralValueTexture.ref,
+        asset.material.neutralValueTexture.sha256,
+        asset.material.neutralValueTexture.bytes,
+        signal
+      ),
+      this.fetchExactBytes(
+        asset.material.highlightMask.ref,
+        asset.material.highlightMask.sha256,
+        asset.material.highlightMask.bytes,
+        signal
+      ),
+      asset.material.normalTexture
+        ? this.fetchExactBytes(
+            asset.material.normalTexture.ref,
+            asset.material.normalTexture.sha256,
+            asset.material.normalTexture.bytes,
+            signal
+          )
+        : Promise.resolve(undefined),
+      asset.material.roughnessTexture
+        ? this.fetchExactBytes(
+            asset.material.roughnessTexture.ref,
+            asset.material.roughnessTexture.sha256,
+            asset.material.roughnessTexture.bytes,
+            signal
+          )
+        : Promise.resolve(undefined)
+    ])
+    return {
+      asset,
+      mainBytes,
+      followerBytes,
+      physicsBytes,
+      neutralValueBytes,
+      highlightMaskBytes,
+      normalBytes,
+      roughnessBytes
+    }
+  }
+
+  private async recordDurableFailure(jobId: string, stage: RecipeFailureStage, failure: unknown) {
     const current = await this.recoverJob(jobId)
     if (!ACTIVE_JOB_STATUSES.has(current.job.status)) return
     await this.actOnJob(jobId, {
@@ -1489,32 +1635,46 @@ export class RecipeWorkflowClient {
     })
   }
 
-  async buildUploadStageCommit(input: RecipeBuildWorkflowInput): Promise<RecipeBuildWorkflowResult> {
+  async buildUploadStageCommit(
+    input: RecipeBuildWorkflowInput
+  ): Promise<RecipeBuildWorkflowResult> {
     throwIfAborted(input.signal)
     input.onProgress?.('starting')
-    const started = input.start.kind === 'package-update'
-      ? await this.startPackageUpdate(input.start.request)
-      : await this.startBake(input.start.request)
+    const started =
+      input.start.kind === 'package-update'
+        ? await this.startPackageUpdate(input.start.request)
+        : await this.startBake(input.start.request)
     let uploadedArchiveReceipt: unknown = null
     let failureStage: RecipeFailureStage = 'validating'
     try {
       throwIfAborted(input.signal)
       input.onProgress?.('fetching-source')
-      const sourceBytes = await this.fetchJobSource(started.job, input.signal)
+      const [sourceBytes, hair] = await Promise.all([
+        this.fetchJobSource(started.job, input.signal),
+        this.fetchJobHair(
+          started.reviewedState.state,
+          started.job.stagedSource.source,
+          input.signal
+        )
+      ])
       failureStage = 'baking'
       const bakeOptions: LiveGoonBakerClientOptions = {
         signal: input.signal,
         onProgress: input.onProgress
       }
-      const bake = await this.bake({
-        source: started.job.stagedSource.source,
-        sourceRevision: {
-          revisionId: started.job.targetRevisionId,
-          revision: started.job.targetRecipeRevision
+      const bake = await this.bake(
+        {
+          source: started.job.stagedSource.source,
+          sourceRevision: {
+            revisionId: started.job.targetRevisionId,
+            revision: started.job.targetRecipeRevision
+          },
+          state: started.reviewedState.state,
+          ...sourceBytes,
+          ...(hair ? { hair } : {})
         },
-        state: started.reviewedState.state,
-        ...sourceBytes
-      }, bakeOptions)
+        bakeOptions
+      )
       const buildReceipt = await verifyGoonLiveBuildReceipt(bake.receipt)
       throwIfAborted(input.signal)
       failureStage = 'upload'
@@ -1523,7 +1683,8 @@ export class RecipeWorkflowClient {
         this.goonId,
         new File(
           [exactArrayBuffer(bake.packageBytes)],
-          input.candidateFilename ?? `${this.goonId}-live-r${started.job.targetRecipeRevision}.bgoon`,
+          input.candidateFilename ??
+            `${this.goonId}-live-r${started.job.targetRecipeRevision}.bgoon`,
           { type: 'application/zip' }
         )
       )
@@ -1585,9 +1746,12 @@ export class RecipeWorkflowClient {
           cleanupError
             ? `rejected upload cleanup could not be confirmed: ${errorMessage(cleanupError)}`
             : null
-        ].filter(Boolean).join('; ')
+        ]
+          .filter(Boolean)
+          .join('; ')
         const combined = new AggregateError(failures, `Recipe workflow failed and ${details}`)
-        if ((error as Error)?.name === 'AbortError' || input.signal?.aborted) combined.name = 'AbortError'
+        if ((error as Error)?.name === 'AbortError' || input.signal?.aborted)
+          combined.name = 'AbortError'
         throw combined
       }
       throw error
@@ -1605,7 +1769,9 @@ export class RecipeWorkflowClient {
       canonicalRecipeString(recovery.job.stagedLive) !==
         canonicalRecipeString(recovery.candidate.live)
     ) {
-      throw new Error('Recipe Retry cannot resume because the verified ready candidate is incomplete.')
+      throw new Error(
+        'Recipe Retry cannot resume because the verified ready candidate is incomplete.'
+      )
     }
 
     const staged: RecipeStageResponse = {
@@ -1636,7 +1802,8 @@ export class RecipeWorkflowClient {
           [error, durabilityError],
           `Recipe Retry failed and durable failure state could not be confirmed: ${errorMessage(durabilityError)}`
         )
-        if ((error as Error)?.name === 'AbortError' || input.signal?.aborted) combined.name = 'AbortError'
+        if ((error as Error)?.name === 'AbortError' || input.signal?.aborted)
+          combined.name = 'AbortError'
         throw combined
       }
       throw error

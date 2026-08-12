@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildGoonRendererConstructionOptions,
+  resolveGoonRendererBackendPolicy,
   shouldRetryGoonRendererWithWebGL2
 } from './goonRendererRequirements'
 
@@ -28,5 +29,39 @@ describe('Goon renderer requirements', () => {
     expect(() => buildGoonRendererConstructionOptions(false, 501.5)).toThrow(
       'non-negative integer'
     )
+  })
+
+  it('uses WebGL2 inside the packaged Mac WebKit shell to avoid the platform WebGPU leak', () => {
+    expect(
+      resolveGoonRendererBackendPolicy({
+        embeddedWebKitRuntime: true,
+        debugForceWebGL2: false
+      })
+    ).toEqual({
+      forceWebGL2: true,
+      reason: 'embedded-webkit-stability'
+    })
+  })
+
+  it('keeps ordinary browsers WebGPU-first and retains explicit QA overrides', () => {
+    expect(
+      resolveGoonRendererBackendPolicy({
+        embeddedWebKitRuntime: false,
+        debugForceWebGL2: false
+      })
+    ).toEqual({
+      forceWebGL2: false,
+      reason: 'default-webgpu'
+    })
+    expect(
+      resolveGoonRendererBackendPolicy({
+        explicitForceWebGL2: false,
+        embeddedWebKitRuntime: true,
+        debugForceWebGL2: true
+      })
+    ).toEqual({
+      forceWebGL2: false,
+      reason: 'explicit-webgpu'
+    })
   })
 })
