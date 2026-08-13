@@ -188,6 +188,15 @@ vi.mock('$lib/server/redis', () => ({
       // seeded fixture so the client lane's G-0148 path exercises the real handler.
       return redisFake.getProjects()
     }
+    getClient() {
+      // SA-096 P4: the capability index reaches the Fabric registry, which reaches
+      // ArtifactsService, which constructs its own RedisService and asks for the raw
+      // client. Serve the same seeded fixture rather than a second store.
+      return redisFake.getClient()
+    }
+    execute(fn: (client: any) => any) {
+      return redisFake.execute(fn)
+    }
   }
 }))
 
@@ -934,5 +943,142 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     expect(dcm).toContain('Moods: happy (Happy idle)')
     expect(dcm).toContain('Emotes: smile (Warm smile)')
     expect(dcm).not.toContain('Scene: Neon Rooftop')
+  })
+
+  const DISCOVERY_BLOCK_HEADER = '==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ===='
+
+  it('S13 SA-096 P5: Dynamic MCP off but Fabric live still ships broker guidance in BOTH lanes', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    // This agent gets native_batshit_tool_search registered off the Fabric family alone.
+    // Before P5 the guidance was gated on dynamicMcpEnabled, so it received the broker
+    // tools and zero instructions for them.
+    const nativeTools = {
+      dynamicMcpEnabled: false,
+      cliToolsEnabled: false,
+      artifactRuntimeEnabled: false,
+      batshitToolsEnabled: false,
+      fetchZipEnabled: true
+    }
+
+    const { server, client } = await runBothTwins({
+      sessionId,
+      messages: [],
+      agent: apiAgent({ provider_specific_settings: { nativeTools } }),
+      currentUserMessage: 'what can you do?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    expect(server.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
+    expect(client.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
+    expect(normalize(server)).toEqual(normalize(client))
+  })
+
+  it('S14 SA-096 P5: no reachable family withholds broker guidance in BOTH lanes', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    const nativeTools = {
+      dynamicMcpEnabled: false,
+      cliToolsEnabled: false,
+      artifactRuntimeEnabled: false,
+      batshitToolsEnabled: false,
+      fetchZipEnabled: false,
+      agentBrowserEnabled: false
+    }
+
+    const { server, client } = await runBothTwins({
+      sessionId,
+      messages: [],
+      agent: apiAgent({ provider_specific_settings: { nativeTools } }),
+      currentUserMessage: 'what can you do?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    // The broker is not registered for this agent, so ~900 tokens explaining it would be
+    // an instruction for a tool that does not exist.
+    expect(server.primarySystemPrompt).not.toContain(DISCOVERY_BLOCK_HEADER)
+    expect(client.primarySystemPrompt).not.toContain(DISCOVERY_BLOCK_HEADER)
+    // The surrounding tool + zip guidance is unaffected — only the broker block is gated.
+    expect(server.primarySystemPrompt).toContain('==== TOOL + ZIP GUIDANCE')
+    expect(client.primarySystemPrompt).toContain('==== TOOL + ZIP GUIDANCE')
+    expect(normalize(server)).toEqual(normalize(client))
+  })
+
+  it('S15 SA-096 P5: an n8n agent with only fetch-zip left on still ships broker guidance', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    // The n8n automation pack opens its Fabric family from fetch-zip, so the gate must
+    // follow the pack's rules rather than the API lane's.
+    const { server, client } = await runBothTwins({
+      sessionId,
+      messages: [],
+      agent: n8nAgent({
+        provider_specific_settings: {
+          nativeTools: {
+            dynamicMcpEnabled: false,
+            cliToolsEnabled: false,
+            artifactRuntimeEnabled: false,
+            batshitToolsEnabled: false,
+            agentBrowserEnabled: false,
+            fetchZipEnabled: true
+          }
+        }
+      }),
+      currentUserMessage: 'n8n turn with only fetch-zip',
+      options: { runtimeFlavor: 'n8n' }
+    })
+
+    expect(server.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
+    expect(client.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
+    expect(currentUserMessageContent(server)).toContain('native_tools_broker_families: fabric')
+    expect(normalize(server)).toEqual(normalize(client))
+  })
+
+  it('S16 SA-096 P1: no instruction appears in two blocks of the same compiled prompt', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    const { server, client } = await runBothTwins({
+      sessionId,
+      messages: [],
+      agent: apiAgent(),
+      currentUserMessage: 'compile a full default prompt',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    for (const prompt of [server.primarySystemPrompt ?? '', client.primarySystemPrompt ?? '']) {
+      // A default API agent receives all three blocks, which is exactly when the
+      // duplication used to bite.
+      expect(prompt).toContain('==== API PRIMARY SYSTEM PROMPT ====')
+      expect(prompt).toContain('==== TOOL + ZIP GUIDANCE')
+      expect(prompt).toContain(DISCOVERY_BLOCK_HEADER)
+
+      const occurrences = (needle: string) => prompt.split(needle).length - 1
+
+      // Broker rules: discovery block only.
+      expect({ needle: 'Never invent placeholder refs', n: occurrences('Never invent placeholder refs') })
+        .toEqual({ needle: 'Never invent placeholder refs', n: 1 })
+      expect({ needle: 'Prefer the broker over bash', n: occurrences('Prefer the broker over bash') })
+        .toEqual({ needle: 'Prefer the broker over bash', n: 1 })
+
+      // Bash policy: tool + zip block only.
+      expect({ needle: 'POLICY_BLOCKED', n: occurrences('POLICY_BLOCKED') })
+        .toEqual({ needle: 'POLICY_BLOCKED', n: 1 })
+      expect({ needle: 'native_bash', n: occurrences('native_bash') })
+        .toEqual({ needle: 'native_bash', n: 1 })
+
+      // Fetch Zip: one canonical statement, referenced by name elsewhere.
+      expect({ needle: 'fabric:sys.zip.fetch', n: occurrences('fabric:sys.zip.fetch') })
+        .toEqual({ needle: 'fabric:sys.zip.fetch', n: 1 })
+
+      // DL-4: an API agent is never shown a tool name it does not have.
+      expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_use\b/)
+      expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_search\b/)
+    }
+
+    expect(normalize(server)).toEqual(normalize(client))
   })
 })

@@ -1241,6 +1241,7 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 						mcpRenderNonce={mcpRenderNonce}
 						nativeDynamicMcpEnabled={nativeDynamicMcpEnabled}
 						nativeCliToolsEnabled={nativeCliToolsEnabled}
+						nativeToolSettings={getNativeToolsSettings(currentAgent)}
 						isCodexMode={isCliPrimaryAgentType(normalizePrimaryAgentType(currentAgent))}
 						onGatewaysChange={handleMcpGatewaysChange}
 						onDcmDisplaySettingsChange={handleMcpDcmDisplaySettingsChange}

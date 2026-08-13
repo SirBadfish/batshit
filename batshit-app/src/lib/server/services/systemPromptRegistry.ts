@@ -73,7 +73,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for API-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_api_system_prompt.md',
-    defaultVersion: '2026-07-14'
+    defaultVersion: '2026-08-13'
   },
   {
     id: 'cli_primary',
@@ -109,7 +109,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected when tool prompting is needed and Zip Control is enabled for the agent.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_zip_control_enabled.md',
-    defaultVersion: '2026-06-04'
+    defaultVersion: '2026-08-13'
   },
   {
     id: 'tool_guidance_zip_disabled',
@@ -118,7 +118,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected when tool prompting is needed and Zip Control is disabled for the agent.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_zip_control_disabled.md',
-    defaultVersion: '2026-06-04'
+    defaultVersion: '2026-08-13'
   },
   {
     id: 'dynamic_mcp',
@@ -127,7 +127,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected when Dynamic MCP capability is enabled for the current agent.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_dynamic_mcp.md',
-    defaultVersion: '2026-05-22'
+    defaultVersion: '2026-08-13'
   }
 ]
 

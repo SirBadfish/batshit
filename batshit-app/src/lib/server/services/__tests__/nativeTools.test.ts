@@ -18,6 +18,8 @@ import {
   resolveSkillRuntimeForTool
 } from '../skillRuntimeToolService'
 import * as runtimeAddons from '../runtimeAddons'
+import { resolveEnabledMode4InternalHelperTools } from '../mode4InternalTools'
+import { isBrokerAvailable, resolveBrokerToolToggles } from '$lib/utils/brokerAvailability'
 
 const skillRuntimeToolMocks = vi.hoisted(() => ({
   resolveSkillRuntimeForTool: vi.fn(),
@@ -7404,4 +7406,222 @@ describe('protected Batshit repo write guardrail', () => {
       await rm(tempWorkspace, { recursive: true, force: true })
     }
   })
+})
+
+describe('SA-096 P5 — broker registration pins the documented availability rules', () => {
+  // The compiled system prompt gates its broker guidance on isBrokerAvailable(). Both the
+  // gate and the registration sites derive families from $lib/utils/brokerAvailability, so
+  // comparing them to each other proves nothing. These cases instead restate the intended
+  // condition independently and walk the whole toggle matrix through the REAL registration
+  // path — a change to either side that is not also a deliberate contract change fails here.
+  const BROKER_TOGGLE_KEYS = [
+    'dynamicMcpEnabled',
+    'cliToolsEnabled',
+    'artifactRuntimeEnabled',
+    'batshitToolsEnabled',
+    'fetchZipEnabled'
+  ] as const
+
+  type ToggleCase = Record<string, boolean>
+
+  const buildCases = (): ToggleCase[] => {
+    const cases: ToggleCase[] = []
+    for (let mask = 0; mask < 1 << BROKER_TOGGLE_KEYS.length; mask += 1) {
+      const settings: ToggleCase = {
+        webSearchEnabled: false,
+        bashEnabled: false,
+        agentBrowserEnabled: false
+      }
+      BROKER_TOGGLE_KEYS.forEach((key, index) => {
+        settings[key] = Boolean(mask & (1 << index))
+      })
+      cases.push(settings)
+    }
+    return cases
+  }
+
+  it.each([false, true])(
+    'registers the mode 3 broker exactly when a family is reachable (allowFabricControlTools=%s)',
+    async (allowFabricControlTools) => {
+      const cases = buildCases()
+      expect(cases).toHaveLength(32)
+      const registrations: boolean[] = []
+
+      for (const nativeTools of cases) {
+        const tools = await nativeToolService.buildMode3NativeTools({
+          userId: 'josh',
+          sessionId: 'session_sa096_p5',
+          providerSettings: { nativeTools },
+          selectedCliToolIds: [],
+          allowArtifactRuntimeTools: true,
+          allowFabricControlTools
+        } as any)
+
+        const registered = Boolean((tools as any).native_batshit_tool_search)
+        registrations.push(registered)
+
+        // Independent restatement of buildMode3NativeTools' documented condition. Agent
+        // Browser is deliberately absent: it is a separate native tool on this lane, and
+        // selectedCliToolIds is empty so the cli family can never open here.
+        const expected =
+          nativeTools.dynamicMcpEnabled ||
+          nativeTools.artifactRuntimeEnabled ||
+          nativeTools.fetchZipEnabled ||
+          (nativeTools.batshitToolsEnabled && allowFabricControlTools)
+
+        expect({ nativeTools, registered }).toEqual({ nativeTools, registered: expected })
+        expect(Boolean((tools as any).native_batshit_tool_use)).toBe(expected)
+      }
+
+      // Guards against a matrix that silently collapses to one answer.
+      expect(registrations).toContain(true)
+      expect(registrations).toContain(false)
+    }
+  )
+
+  it('registers the mode 3 cli family only when a CLI Tool is actually selected', async () => {
+    const providerSettings = {
+      nativeTools: {
+        dynamicMcpEnabled: false,
+        cliToolsEnabled: true,
+        artifactRuntimeEnabled: false,
+        batshitToolsEnabled: false,
+        fetchZipEnabled: false,
+        agentBrowserEnabled: false,
+        webSearchEnabled: false,
+        bashEnabled: false
+      }
+    }
+
+    const withoutSelection = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      sessionId: 'session_sa096_p5_cli_empty',
+      providerSettings,
+      selectedCliToolIds: []
+    } as any)
+    expect((withoutSelection as any).native_batshit_tool_search).toBeUndefined()
+
+    const withSelection = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      sessionId: 'session_sa096_p5_cli_selected',
+      providerSettings,
+      selectedCliToolIds: ['cli_tool_alpha']
+    } as any)
+    expect((withSelection as any).native_batshit_tool_search).toBeTruthy()
+  })
+
+  it('exposes the mode 4 broker helpers exactly when a family is reachable', () => {
+    const registrations: boolean[] = []
+
+    for (const settings of buildCases()) {
+      for (const agentBrowserEnabled of [false, true]) {
+        for (const hasCliTools of [false, true]) {
+          const input = { ...settings, agentBrowserEnabled }
+          const registered = resolveEnabledMode4InternalHelperTools(input, {
+            hasCliTools
+          }).includes('batshit_tool_search')
+          registrations.push(registered)
+
+          // Independent restatement of the managed-CLI condition. Fetch-zip is deliberately
+          // absent: it ships as its own helper (batshit_server_fetch_zip) on this lane.
+          const expected =
+            input.dynamicMcpEnabled ||
+            (input.cliToolsEnabled && hasCliTools) ||
+            input.agentBrowserEnabled ||
+            input.artifactRuntimeEnabled ||
+            input.batshitToolsEnabled
+
+          expect({ input, hasCliTools, registered }).toEqual({
+            input,
+            hasCliTools,
+            registered: expected
+          })
+        }
+      }
+    }
+
+    expect(registrations).toContain(true)
+    expect(registrations).toContain(false)
+  })
+
+  // SA-096 P4 — the Fabric control-id scope the broker will serve.
+  //
+  // The DCM capability index states a Fabric count, so that count has to be the set
+  // registration actually opens. Probing through native_batshit_tool_use's OUT_OF_SCOPE
+  // response pins the real registered allowlist rather than re-calling the shared helper,
+  // which is the mistake the P5 pins already had to be rewritten to avoid.
+  async function probeFabricRef(
+    nativeTools: Record<string, boolean>,
+    ref: string,
+    allowFabricControlTools = true
+  ): Promise<string | undefined> {
+    const tools = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      sessionId: 'session_sa096_p4_fabric_scope',
+      providerSettings: { nativeTools },
+      selectedCliToolIds: [],
+      allowArtifactRuntimeTools: true,
+      allowFabricControlTools
+    } as any)
+
+    const result = await (tools as any).native_batshit_tool_use.execute({ ref, input: {} })
+    return result?.code
+  }
+
+  const FABRIC_ONLY_FETCH_ZIP = {
+    dynamicMcpEnabled: false,
+    cliToolsEnabled: false,
+    artifactRuntimeEnabled: false,
+    batshitToolsEnabled: false,
+    fetchZipEnabled: true,
+    agentBrowserEnabled: false,
+    webSearchEnabled: false,
+    bashEnabled: false
+  }
+
+  it('opens only fetch-zip on the Fabric lane when Batshit Tools is off', async () => {
+    await expect(probeFabricRef(FABRIC_ONLY_FETCH_ZIP, 'fabric:sys.zip.fetch')).resolves.not.toBe(
+      'OUT_OF_SCOPE'
+    )
+    await expect(
+      probeFabricRef(FABRIC_ONLY_FETCH_ZIP, 'fabric:sys.artifact.update')
+    ).resolves.toBe('OUT_OF_SCOPE')
+    await expect(
+      probeFabricRef(FABRIC_ONLY_FETCH_ZIP, 'fabric:sys.voice.engine.enable')
+    ).resolves.toBe('OUT_OF_SCOPE')
+  })
+
+  it('opens the Batshit Tools control scope when that toggle is on', async () => {
+    const withBatshitTools = { ...FABRIC_ONLY_FETCH_ZIP, batshitToolsEnabled: true }
+    await expect(
+      probeFabricRef(withBatshitTools, 'fabric:sys.artifact.update')
+    ).resolves.not.toBe('OUT_OF_SCOPE')
+    await expect(
+      probeFabricRef(withBatshitTools, 'fabric:sys.voice.engine.enable')
+    ).resolves.not.toBe('OUT_OF_SCOPE')
+  })
+
+  it('closes the Fabric control plane for an actor that may not use it, keeping fetch-zip', async () => {
+    const withBatshitTools = { ...FABRIC_ONLY_FETCH_ZIP, batshitToolsEnabled: true }
+    await expect(
+      probeFabricRef(withBatshitTools, 'fabric:sys.artifact.update', false)
+    ).resolves.toBe('OUT_OF_SCOPE')
+    await expect(
+      probeFabricRef(withBatshitTools, 'fabric:sys.zip.fetch', false)
+    ).resolves.not.toBe('OUT_OF_SCOPE')
+  })
+
+  it('opens the Dynamic MCP Fabric pair only when Dynamic MCP is on', async () => {
+    const withBatshitTools = { ...FABRIC_ONLY_FETCH_ZIP, batshitToolsEnabled: true }
+    await expect(
+      probeFabricRef(withBatshitTools, 'fabric:sys.mcp.dynamic.find')
+    ).resolves.toBe('OUT_OF_SCOPE')
+    await expect(
+      probeFabricRef(
+        { ...withBatshitTools, dynamicMcpEnabled: true },
+        'fabric:sys.mcp.dynamic.find'
+      )
+    ).resolves.not.toBe('OUT_OF_SCOPE')
+  })
+
 })

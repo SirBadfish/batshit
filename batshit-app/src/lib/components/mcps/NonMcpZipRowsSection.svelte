@@ -11,8 +11,10 @@
     normalizeZipBufferInputValue,
     normalizeZipThresholdInputValue
   } from '$lib/utils/zipBufferInput'
+  import BrokerFamilyDiscoverabilityCells from '$lib/components/tools/BrokerFamilyDiscoverabilityCells.svelte'
   import { Check, ChevronDown, Clock3, Infinity } from '@lucide/svelte'
   import type { IconRef } from '$lib/icons/iconTypes'
+  import type { BrokerFamilyRowControls } from '$lib/components/tools/brokerFamilyRowControls'
   import type {
     SharedNonMcpToolGridRowConfig,
     SharedNonMcpToolGridRowId
@@ -50,6 +52,13 @@
     otherColumnClass: string
     getRowOverride: (rowId: SharedNonMcpToolGridRowId) => OtherZipRowOverride
     onUpdateRowOverride: (rowId: SharedNonMcpToolGridRowId, patch: OtherZipRowPatch) => void
+    /**
+     * SA-096: Discoverable + Display Detail controls for the rows that are also broker
+     * families (`fabric_find`, `artifact_find`). Returns null for every other row, and
+     * for a family the current agent cannot reach, which leaves those two columns empty
+     * exactly as they were.
+     */
+    getBrokerFamilyControls?: (rowId: SharedNonMcpToolGridRowId) => BrokerFamilyRowControls | null
     onHeaderClick: (event: MouseEvent, sectionKey: string) => void
     onToggle: (sectionKey: string) => void
     showBulkZipApply?: boolean
@@ -72,6 +81,7 @@
     otherColumnClass,
     getRowOverride,
     onUpdateRowOverride,
+    getBrokerFamilyControls = () => null,
     onHeaderClick,
     onToggle,
     showBulkZipApply = false,
@@ -205,6 +215,25 @@
   function getOnlyRowId(): SharedNonMcpToolGridRowId {
     return rowIds[0] as SharedNonMcpToolGridRowId
   }
+
+  /**
+   * SA-096: the shared row config carries only what the row *is*, because the Group
+   * tool-sharing grid reads the same config and has none of these columns. The sentence
+   * about what this surface's columns mean is added here, where those columns exist.
+   */
+  const BROKER_FAMILY_COLUMN_NOTE =
+    'On this grid, Discoverable and Display Detail control the family itself, while the ' +
+    'Zip Buffer, Zip Threshold, and Zip Behavior columns only control how the results of ' +
+    'a search get compressed in the conversation.'
+
+  function resolveRowInfoParagraphs(
+    rowId: SharedNonMcpToolGridRowId,
+    hasBrokerFamilyControls: boolean
+  ): string[] {
+    const paragraphs = rowConfig[rowId]?.infoParagraphs ?? []
+    if (!hasBrokerFamilyControls) return paragraphs
+    return [...paragraphs, BROKER_FAMILY_COLUMN_NOTE]
+  }
 </script>
 
 {#snippet toolRowCells(rowId: SharedNonMcpToolGridRowId, nested: boolean)}
@@ -215,6 +244,7 @@
   {@const rowZipDisabled = isEffectiveZipDisabled(rowZip.auto_zip, rowZip.inherited_zip_disabled)}
   {@const rowZipInputsDisabled = rowAutoZipActive || rowZipDisabled}
   {@const rowZipBehaviorLabel = getZipBehaviorLabel(rowZip.auto_zip, rowZip.inherited_auto_zip, rowZip.inherited_zip_disabled)}
+  {@const brokerFamilyControls = getBrokerFamilyControls(rowId)}
   <td class={`batshit-settings-table-cell is-strong ${nested ? 'is-nested' : ''}`}>
     <div class="batshit-settings-tool-grid-label">
       <ToolGridIdentityIcon
@@ -225,20 +255,24 @@
       <span class="batshit-settings-tool-grid-name block truncate" title={config.label}>
         {config.label}
       </span>
-      {#if config.infoParagraphs?.length}
+      {#if resolveRowInfoParagraphs(rowId, brokerFamilyControls !== null).length}
         <SettingsInfoMenu
           ariaLabel={`About ${config.label}`}
           contentClass="w-80"
         >
-          {#each config.infoParagraphs as paragraph, index}
+          {#each resolveRowInfoParagraphs(rowId, brokerFamilyControls !== null) as paragraph, index}
             <p class={index === 0 ? '' : 'mt-2'}>{paragraph}</p>
           {/each}
         </SettingsInfoMenu>
       {/if}
     </div>
   </td>
-  <td class="batshit-settings-table-cell"></td>
-  <td class="batshit-settings-table-cell"></td>
+  {#if brokerFamilyControls}
+    <BrokerFamilyDiscoverabilityCells controls={brokerFamilyControls} />
+  {:else}
+    <td class="batshit-settings-table-cell"></td>
+    <td class="batshit-settings-table-cell"></td>
+  {/if}
   <td class="batshit-settings-table-cell">
     <input
       type={rowZipInputsDisabled ? 'text' : 'number'}

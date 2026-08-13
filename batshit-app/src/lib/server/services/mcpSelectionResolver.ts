@@ -8,6 +8,7 @@ import {
   LEGACY_AGENT_MCP_SELECTION_FIELDS,
   buildDynamicOnlySelectionResetKey
 } from './mcpRuntimePolicy'
+import { runGatewayOrphanReferenceCleanup } from './mcpGatewayReferenceCleanup'
 
 interface MCPSelectionResolverOptions {
   userId: string
@@ -60,6 +61,10 @@ export async function resolveMCPSelections(
 
   // Dynamic-only migration (one-time): clear legacy direct tool lists.
   await runDynamicOnlySelectionReset(userId)
+
+  // SA-096 P6 (one-time): repair references left behind by gateway deletes that
+  // happened before `mcpGatewayService.delete()` swept them.
+  await runGatewayOrphanReferenceCleanup(userId)
 
   let agent: AgentRow | null | undefined = preloadedAgent
   if (!agent && agentId) {

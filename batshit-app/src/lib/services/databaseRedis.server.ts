@@ -29,7 +29,6 @@ import { replacePromptVariables } from '$lib/utils/promptVariables'
 import { createReference, extractAllReferences } from '$lib/services/universalResolver'
 import { buildFileReferenceBlock, type FileReferencePayload } from '$lib/utils/fileMentions'
 import { buildDynamicMcpIndex } from '$lib/server/services/dynamicMcpIndex'
-import { findControls } from '$lib/server/services/fabricRegistry'
 import {
   buildGoonDcmLines as formatGoonDcmLines,
   shouldIncludeGoonSpokenCues
@@ -39,6 +38,16 @@ import {
   buildToolGuidanceZipPromptBlock,
   normalizeDynamicMcpPromptContent
 } from '$lib/utils/toolPromptInjection'
+import {
+  applyPromptRuntimeScope,
+  brokerToolNamesForScope,
+  runtimeFlavorToScope
+} from '$lib/utils/promptRuntimeScope'
+import {
+  isBrokerAvailable,
+  resolveBrokerFamilies,
+  resolveBrokerToolToggles
+} from '$lib/utils/brokerAvailability'
 import {
   resolveClipDataUrlFromStoredUpload,
   resolveClipPreferredUrl
@@ -146,7 +155,6 @@ const USER_SETTINGS_CACHE = new Map<string, { settings: UserSettingsRow; fetched
 const USER_SETTINGS_CACHE_TTL_MS = 5_000
 const GOON_DCM_CACHE = new Map<string, { goon: GoonRecord; fetchedAt: number }>()
 const GOON_DCM_CACHE_TTL_MS = 30_000
-const ARTIFACT_DCM_ALLOWED_CONTROL_IDS = ['sys.artifact.*', 'artifact.*', 'use.artifact.*'] as const
 
 export function invalidateUserSettingsCache(userId?: string) {
   if (userId) {
@@ -907,12 +915,17 @@ export class DatabaseService {
       toolNotesEnabled: options.notesEnabled
     })
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
+    // SA-096 P1: the Fetch Zip instruction is the one place this block still names a broker
+    // tool, so it resolves to the receiving agent's real tool name (DL-4).
+    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(options.runtimeFlavor))
     return replacePromptVariables(prompt, options.agent, {
       ...(options.agent?.settings ?? {}),
       runtime_flavor: options.runtimeFlavor,
       zip_ai_view_mode: options.zipViewMode,
       zip_control_permission: options.hasPermission ? 'agent' : 'user',
-      zip_tool_notes_enabled: options.notesEnabled ? 'enabled' : 'disabled'
+      zip_tool_notes_enabled: options.notesEnabled ? 'enabled' : 'disabled',
+      tool_search_tool: brokerNames.search,
+      tool_use_tool: brokerNames.use
     })
   }
 
@@ -1136,12 +1149,7 @@ export class DatabaseService {
           : ''
     if (agentType !== 'n8n') return []
 
-    const providerSettings =
-      agent?.provider_specific_settings && typeof agent.provider_specific_settings === 'object'
-        ? agent.provider_specific_settings
-        : agent?.providerSpecificSettings && typeof agent.providerSpecificSettings === 'object'
-          ? agent.providerSpecificSettings
-          : {}
+    const providerSettings = this.getAgentProviderSettings(agent)
     const nested =
       providerSettings?.nativeTools && typeof providerSettings.nativeTools === 'object'
         ? providerSettings.nativeTools
@@ -1149,27 +1157,10 @@ export class DatabaseService {
           ? providerSettings.batshitNativeTools
           : {}
 
-    const fetchZipEnabled =
-      this.parseBooleanSetting(
-        nested.fetchZipEnabled ??
-          nested.nativeFetchZipEnabled ??
-          providerSettings.fetchZipEnabled ??
-          providerSettings.nativeFetchZipEnabled
-      ) ?? true
-    const dynamicMcpEnabled =
-      this.parseBooleanSetting(
-        nested.dynamicMcpEnabled ??
-          nested.nativeDynamicMcpEnabled ??
-          providerSettings.dynamicMcpEnabled ??
-          providerSettings.nativeDynamicMcpEnabled
-      ) ?? true
-    const cliToolsEnabled =
-      this.parseBooleanSetting(
-        nested.cliToolsEnabled ??
-          nested.nativeCliToolsEnabled ??
-          providerSettings.cliToolsEnabled ??
-          providerSettings.nativeCliToolsEnabled
-      ) ?? true
+    // SA-096: broker toggles and families come from the shared rules so this DCM block, the
+    // broker-guidance gate, and n8n's registered actions cannot disagree.
+    const brokerToggles = resolveBrokerToolToggles(providerSettings)
+    const { fetchZipEnabled, batshitToolsEnabled } = brokerToggles
     const webSearchEnabled =
       this.parseBooleanSetting(
         nested.webSearchEnabled ??
@@ -1184,37 +1175,14 @@ export class DatabaseService {
           providerSettings.bashEnabled ??
           providerSettings.nativeBashEnabled
       ) ?? true
-    const artifactRuntimeEnabled =
-      this.parseBooleanSetting(
-        nested.artifactRuntimeEnabled ??
-          nested.nativeArtifactRuntimeEnabled ??
-          providerSettings.artifactRuntimeEnabled ??
-          providerSettings.nativeArtifactRuntimeEnabled
-      ) ?? true
-    const agentBrowserEnabled =
-      this.parseBooleanSetting(
-        nested.agentBrowserEnabled ??
-          nested.nativeAgentBrowserEnabled ??
-          providerSettings.agentBrowserEnabled ??
-          providerSettings.nativeAgentBrowserEnabled
-      ) ?? true
-    const batshitToolsEnabled =
-      this.parseBooleanSetting(
-        nested.batshitToolsEnabled ??
-          nested.nativeBatshitToolsEnabled ??
-          providerSettings.batshitToolsEnabled ??
-          providerSettings.nativeBatshitToolsEnabled
-      ) ?? true
 
     const enabledActions: string[] = []
-    const brokerFamilies: string[] = []
+    const brokerFamilies: string[] = resolveBrokerFamilies({
+      runtime: 'n8n',
+      toggles: brokerToggles
+    })
     if (bashEnabled) enabledActions.push('bash_execute')
     enabledActions.push('native_skill')
-    if (dynamicMcpEnabled) brokerFamilies.push('mcp')
-    if (cliToolsEnabled) brokerFamilies.push('cli')
-    if (artifactRuntimeEnabled) brokerFamilies.push('artifact')
-    if (agentBrowserEnabled) brokerFamilies.push('agent_browser')
-    if (fetchZipEnabled) brokerFamilies.push('fabric')
     if (brokerFamilies.length > 0) enabledActions.push('batshit_tool_search', 'batshit_tool_use')
     if (batshitToolsEnabled) {
       enabledActions.push(
@@ -1467,8 +1435,39 @@ export class DatabaseService {
     return this.isBatshitPrimaryAgent(agent)
   }
 
-  private hasDynamicMcpTools(agent: any): boolean {
-    return this.resolveDynamicMcpEnabled(agent)
+  /**
+   * SA-096 P5: does this agent actually have the Batshit Tool Search/Use broker?
+   *
+   * The broker guidance block used to ship on the Dynamic MCP toggle alone, which was wrong
+   * in both directions: an agent with Dynamic MCP off but live Fabric or artifact families
+   * got the broker tools and no instructions, while an agent with Dynamic MCP on and nothing
+   * else reachable paid for instructions it could not use. The families are now derived from
+   * the same shared rules the registration sites use (`$lib/utils/brokerAvailability`).
+   *
+   * `hasCliTools` is intentionally left unresolved. The saved CLI Tool selection can be
+   * overridden per chat and the n8n twin is client-side, so neither twin can read it
+   * reliably. Unresolved counts as reachable, which keeps this gate from ever being
+   * narrower than registration — withholding guidance from an agent that has the tools is
+   * the failure this packet exists to prevent.
+   */
+  private hasBrokerAccess(
+    agent: any,
+    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+  ): boolean {
+    return isBrokerAvailable({
+      runtime: runtimeFlavorToScope(runtimeFlavor),
+      toggles: resolveBrokerToolToggles(this.getAgentProviderSettings(agent))
+    })
+  }
+
+  private getAgentProviderSettings(agent: any): Record<string, any> {
+    if (agent?.provider_specific_settings && typeof agent.provider_specific_settings === 'object') {
+      return agent.provider_specific_settings
+    }
+    if (agent?.providerSpecificSettings && typeof agent.providerSpecificSettings === 'object') {
+      return agent.providerSpecificSettings
+    }
+    return {}
   }
 
   private hasAnyToolAccess(context: {
@@ -1490,12 +1489,25 @@ export class DatabaseService {
     return false
   }
 
-  private async resolveDynamicMcpPrompt(agent: any) {
+  private async resolveDynamicMcpPrompt(
+    agent: any,
+    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+  ) {
     const storedPrompt = await this.getRedisStringValue('batshit:dynamic_mcp_prompt')
-    const fallbackPrompt = buildDynamicMcpPromptBlock()
+    const fallbackPrompt = buildDynamicMcpPromptBlock({ runtimeFlavor })
     const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
     const normalizedPrompt = normalizeDynamicMcpPromptContent(prompt)
-    return replacePromptVariables(normalizedPrompt, agent, agent?.settings)
+    // SA-096: drop the other runtimes' tool names, call shapes, and examples before variable
+    // substitution so an API agent is never taught a tool name it does not have.
+    const scope = runtimeFlavorToScope(runtimeFlavor)
+    const scopedPrompt = applyPromptRuntimeScope(normalizedPrompt, scope)
+    const brokerNames = brokerToolNamesForScope(scope)
+    return replacePromptVariables(scopedPrompt, agent, {
+      ...(agent?.settings ?? {}),
+      runtime_flavor: runtimeFlavor,
+      tool_search_tool: brokerNames.search,
+      tool_use_tool: brokerNames.use
+    })
   }
 
   private shouldInjectToolGuidance(context: {
@@ -2041,102 +2053,6 @@ export class DatabaseService {
     }
   }
 
-  private async buildArtifactControlsDcm(options: {
-    userId?: string | null
-    agentId?: string | null
-    runtimeMode?: 'mode3' | 'mode4'
-  }): Promise<string[]> {
-    const userId = options.userId?.trim()
-    const agentId = options.agentId?.trim()
-    if (!userId || !agentId) return []
-
-    const allLines: string[] = []
-
-    try {
-      const result = await findControls({
-        userId,
-        agentId,
-        sourceType: 'artifact',
-        query: 'artifact',
-        runtimeMode: options.runtimeMode ?? 'mode3',
-        allowedControlIds: Array.from(ARTIFACT_DCM_ALLOWED_CONTROL_IDS),
-        limit: 200,
-        includeSchema: false
-      })
-
-      // Separate per-instance controls (artifact.<id>.*) from typed invoke aliases (use.artifact.{slug})
-      const dynamicControls = result.results
-        .filter((entry) => entry.controlId.startsWith('artifact.'))
-      const typedInvokeAliases = result.results
-        .filter((entry) => entry.controlId.startsWith('use.artifact.'))
-
-      if (dynamicControls.length === 0 && typedInvokeAliases.length === 0) return allLines
-
-      // Build a lookup: artifactId → use.artifact.{slug} alias (by matching typed.invoke suffix)
-      // The use.artifact.{slug} alias shares the same schemaHint as artifact.<id>.typed.invoke
-      const typedInvokeByArtifact = new Map<string, { slug: string; schemaHint: string }>()
-      for (const control of dynamicControls) {
-        if (control.controlId.endsWith('.typed.invoke')) {
-          const parts = control.controlId.split('.')
-          const artifactId = parts[1] || ''
-          // Find the matching use.artifact.* alias for the slug
-          const alias = typedInvokeAliases.find((a) => a.schemaHint === control.schemaHint)
-          if (artifactId) {
-            typedInvokeByArtifact.set(artifactId, {
-              slug: alias ? alias.controlId : control.controlId,
-              schemaHint: control.schemaHint || ''
-            })
-          }
-        }
-      }
-
-      // Group config controls by artifact ID, excluding the typed.invoke record from count
-      const configCounts = new Map<string, number>()
-      for (const control of dynamicControls) {
-        if (control.controlId.endsWith('.typed.invoke')) continue
-        const parts = control.controlId.split('.')
-        const artifactId = parts[1] || 'unknown'
-        configCounts.set(artifactId, (configCounts.get(artifactId) || 0) + 1)
-      }
-      // Ensure all artifacts with typed invoke are in the map even if no other config controls
-      for (const artifactId of typedInvokeByArtifact.keys()) {
-        if (!configCounts.has(artifactId)) configCounts.set(artifactId, 0)
-      }
-
-      // Unified artifact list
-      const hasTypedInvoke = typedInvokeByArtifact.size > 0
-      allLines.push('', 'artifacts:')
-      const sortedArtifacts = Array.from(configCounts.keys()).sort((a, b) => a.localeCompare(b))
-      for (const artifactId of sortedArtifacts) {
-        const controlCount = configCounts.get(artifactId) || 0
-        const typed = typedInvokeByArtifact.get(artifactId)
-        if (typed) {
-          // Artifact with typed invoke — show slug + field hints + config count
-          const hint = typed.schemaHint ? ` — fields: ${typed.schemaHint}` : ''
-          allLines.push(`- ${typed.slug}${hint} | ${controlCount} config controls`)
-        } else {
-          // Artifact without typed invoke — config controls only
-          allLines.push(`- artifact.${artifactId} | ${controlCount} config controls`)
-        }
-      }
-
-      // Single hint covering both paths
-      if (hasTypedInvoke) {
-        allLines.push(
-          'artifact_hint: use.artifact.{slug} entries are agent-runnable through Dynamic Tool Search. Search with family="artifact", then use the exact artifact:use.artifact.{slug} ref and structured field input. Only discovered use.artifact entries are agent-runnable; user-only panel artifacts such as Gradio/HuggingFace embeds and ComfyUI panel artifacts are not. Do not change an artifact brain type or power source to force agent use.'
-        )
-      } else {
-        allLines.push(
-          'artifact_hint: Published runtime artifact tools are discoverable through Dynamic Tool Search with family="artifact". User-only panel artifacts such as Gradio/HuggingFace embeds and ComfyUI panel artifacts are not agent-runnable; tell the user instead of changing brain type or power source.'
-        )
-      }
-      return allLines
-    } catch (error) {
-      console.warn('[buildDynamicInfoBlock] Failed to load artifact controls DCM index:', error)
-      return allLines
-    }
-  }
-
   private async fetchGoonRecord(options: {
     goonId?: string | null
     userId?: string | null
@@ -2464,15 +2380,6 @@ export class DatabaseService {
     })
     if (skillSessionContextLines.length > 0) {
       lines.push('', ...skillSessionContextLines)
-    }
-
-    const artifactControlLines = await this.buildArtifactControlsDcm({
-      userId: options.userId,
-      agentId: options.agentId,
-      runtimeMode: options.isCodexMode ? 'mode4' : 'mode3'
-    })
-    if (artifactControlLines.length > 0) {
-      lines.push('', ...artifactControlLines)
     }
 
     const fileReferences = Array.isArray(options.fileReferences)
@@ -2845,7 +2752,6 @@ export class DatabaseService {
       runtimeFlavor
     })
     if (shouldInjectToolGuidance || shouldInjectZipGuidance) {
-      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
       const toolZipPrompt = await this.resolveToolZipGuidancePrompt({
         hasPermission: zipPermission,
         notesEnabled: zipToolNotesEnabled,
@@ -2854,17 +2760,23 @@ export class DatabaseService {
         runtimeFlavor
       })
       if (toolZipPrompt.trim()) {
+        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         const label = zipPermission
           ? 'TOOL + ZIP GUIDANCE (ZIP CONTROL ENABLED)'
           : 'TOOL + ZIP GUIDANCE (ZIP CONTROL USER-ONLY)'
         mergedSystemPrompt += `==== ${label} ====\n\n${toolZipPrompt}`
       }
+    }
 
-      if (shouldInjectToolGuidance && this.hasDynamicMcpTools(agent)) {
-        const dynamicMcpPrompt = await this.resolveDynamicMcpPrompt(agent)
-        if (dynamicMcpPrompt.trim()) {
-          mergedSystemPrompt += `\n\n==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====\n\n${dynamicMcpPrompt}`
-        }
+    // SA-096 P5: the broker block is gated on broker availability alone, not nested under
+    // the tool + zip condition. `shouldInjectToolGuidance` is stricter than the broker on
+    // the n8n lane (it wants MCP selections or subagents), so nesting hid the instructions
+    // from n8n agents whose Batshit Tools node advertises broker families in their DCM.
+    if (this.hasBrokerAccess(agent, runtimeFlavor)) {
+      const dynamicMcpPrompt = await this.resolveDynamicMcpPrompt(agent, runtimeFlavor)
+      if (dynamicMcpPrompt.trim()) {
+        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+        mergedSystemPrompt += `==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====\n\n${dynamicMcpPrompt}`
       }
     }
 

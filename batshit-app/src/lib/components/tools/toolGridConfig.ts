@@ -1,4 +1,8 @@
 import type { IconRef } from '$lib/icons/iconTypes'
+import {
+  ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS,
+  FABRIC_TOOL_GRID_INFO_PARAGRAPHS
+} from '$lib/utils/toolGridBrokerFamilies'
 
 export type ToolGridAutoZipValue = 'inherit' | 'enabled' | 'disabled' | 'off'
 export type ToolGridZipFallbackLabel = 'default' | 'inherit'
@@ -267,6 +271,7 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     id: 'artifact_find',
     label: 'Artifact Tools',
     iconRef: { kind: 'batshit', id: 'artifacts' },
+    infoParagraphs: ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS,
     mode: 'custom',
     toolName: 'artifact_find',
     minBuffer: 1,
@@ -289,6 +294,7 @@ export const SHARED_NON_MCP_TOOL_GRID_CONFIG: Record<
     id: 'fabric_find',
     label: 'Fabric Controls',
     iconRef: { kind: 'batshit', id: 'fabric' },
+    infoParagraphs: FABRIC_TOOL_GRID_INFO_PARAGRAPHS,
     mode: 'custom',
     toolName: 'fabric_find',
     minBuffer: 1,

@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { CLI_TOOL_GRID_GROUP_NAME, CLI_TOOL_GRID_ID } from '$lib/utils/toolGridCli'
+import {
+  ARTIFACT_TOOL_GRID_GROUP_NAME,
+  ARTIFACT_TOOL_GRID_ID,
+  FABRIC_TOOL_GRID_GROUP_NAME,
+  FABRIC_TOOL_GRID_ID
+} from '$lib/utils/toolGridBrokerFamilies'
 
 const redisMock = vi.hoisted(() => ({
   get: vi.fn(),
@@ -12,6 +18,7 @@ const loadToolsForUserMock = vi.hoisted(() => vi.fn())
 const resolveMCPSelectionsMock = vi.hoisted(() => vi.fn())
 const listCliToolsMock = vi.hoisted(() => vi.fn())
 const resolveCliToolSelectionScopeMock = vi.hoisted(() => vi.fn())
+const listVisibleControlsMock = vi.hoisted(() => vi.fn())
 
 vi.mock('$lib/server/redis', () => ({
   redis: redisMock
@@ -32,7 +39,15 @@ vi.mock('../cliToolRegistry', () => ({
   resolveCliToolSelectionScope: resolveCliToolSelectionScopeMock
 }))
 
-import { buildCompositeKey, buildDynamicMcpIndex } from '../dynamicMcpIndex'
+vi.mock('../fabricRegistry', () => ({
+  listVisibleControls: listVisibleControlsMock
+}))
+
+import { UNKNOWN_GATEWAY, buildCompositeKey, buildDynamicMcpIndex } from '../dynamicMcpIndex'
+import {
+  RESERVED_TOOL_GRID_IDS,
+  extractGatewayIdFromCompositeKey
+} from '../mcpGatewayReferenceCleanup'
 
 function makeSchema(requiredField: string, optionalField = 'limit') {
   return {
@@ -84,6 +99,21 @@ function mockGatewayTools() {
   })
 }
 
+// SA-096 P6: `mcpGatewayReferenceCleanup` restates the composite-key separator
+// and the unknown-gateway placeholder because importing this module would create
+// a cycle. These pin the two copies together from the side that can see both.
+describe('composite key contract shared with mcpGatewayReferenceCleanup', () => {
+  it('extracts the gateway ID from a key this module built', () => {
+    expect(extractGatewayIdFromCompositeKey(buildCompositeKey('gw_hf', 'HuggingFace'))).toBe(
+      'gw_hf'
+    )
+  })
+
+  it('reserves the unknown-gateway placeholder this module assigns', () => {
+    expect(RESERVED_TOOL_GRID_IDS.has(UNKNOWN_GATEWAY)).toBe(true)
+  })
+})
+
 describe('buildDynamicMcpIndex', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -104,6 +134,7 @@ describe('buildDynamicMcpIndex', () => {
       resolvedGateways: ['gw_hf']
     })
     listCliToolsMock.mockResolvedValue([])
+    listVisibleControlsMock.mockResolvedValue([])
     resolveCliToolSelectionScopeMock.mockImplementation(
       async ({ selectedToolIds }: { selectedToolIds?: string[] }) => ({
         toolIds: Array.isArray(selectedToolIds) ? selectedToolIds : []
@@ -218,5 +249,208 @@ describe('buildDynamicMcpIndex', () => {
       '  - local_screenshot — Local Screenshot — Capture a screenshot — outputPath:string*'
     )
     expect(result.text).toContain('  - repo_snapshot — Repo Snapshot — Summarize a repo — path:string*')
+  })
+
+  /**
+   * SA-096 P4 — the Fabric and Artifact families in the capability index.
+   *
+   * The defect that opened this story was a `tool_discovery` header with nothing under it
+   * while the broker had a live ~41-control Fabric surface. These cover the four index
+   * states the packet names: fabric-only, artifact-only, mixed, and fully empty.
+   */
+  describe('broker families', () => {
+    const ALL_BROKER_OFF = {
+      fetchZipEnabled: false,
+      dynamicMcpEnabled: false,
+      cliToolsEnabled: false,
+      artifactRuntimeEnabled: false,
+      batshitToolsEnabled: false,
+      agentBrowserEnabled: false
+    }
+
+    function fabricControl(controlId: string, title: string) {
+      return {
+        controlId,
+        sourceType: 'core' as const,
+        title,
+        description: '',
+        schemaHint: 'no input',
+        riskLevel: 'safe' as const,
+        artifactId: null
+      }
+    }
+
+    function artifactAlias(slug: string, artifactId: string, schemaHint: string) {
+      return {
+        controlId: `use.artifact.${slug}`,
+        sourceType: 'artifact' as const,
+        title: slug,
+        description: '',
+        schemaHint,
+        riskLevel: 'safe' as const,
+        artifactId
+      }
+    }
+
+    it('renders Fabric as a group-only count by default, with no bare tool list', async () => {
+      listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) =>
+        allowedControlIds?.includes('use.artifact.*')
+          ? []
+          : [fabricControl('sys.voice.engine.enable', 'Enable voice engine')]
+      )
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'api',
+        brokerToggles: { ...ALL_BROKER_OFF, fetchZipEnabled: true, batshitToolsEnabled: true }
+      })
+
+      // Two native helper controls are allowed by `sys.comfyui.*` plus fetch-zip, and one
+      // registry control, so the truthful count is four.
+      expect(result.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (4 tools)`)
+      expect(result.text).not.toContain('sys.voice.engine.enable')
+      expect(result.text).toContain('tool_discovery')
+    })
+
+    it('lists Fabric controls with hints when the agent overrides the row', async () => {
+      listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) =>
+        allowedControlIds?.includes('use.artifact.*') ? [] : []
+      )
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'api',
+        toolNameThreshold: 10,
+        brokerToggles: { ...ALL_BROKER_OFF, fetchZipEnabled: true },
+        dcmDisplaySettings: {
+          version: 1,
+          groups: {
+            [buildCompositeKey(FABRIC_TOOL_GRID_ID, FABRIC_TOOL_GRID_GROUP_NAME)]:
+              'group+tools+hints'
+          },
+          tools: {}
+        }
+      })
+
+      expect(result.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (1 tool):`)
+      expect(result.text).toContain('  - sys.zip.fetch — Fetch Zip — zipId (required)')
+    })
+
+    it('lists artifact refs with field hints and a config-control count', async () => {
+      listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) => {
+        if (allowedControlIds?.includes('use.artifact.*')) {
+          return [artifactAlias('poster-maker', 'art_1', 'prompt (string), size (string)')]
+        }
+        return [
+          { ...fabricControl('artifact.art_1.field.model.set', 'Poster: model'), artifactId: 'art_1' },
+          { ...fabricControl('artifact.art_1.action.run.run', 'Poster: run'), artifactId: 'art_1' },
+          { ...fabricControl('artifact.art_1.typed.invoke', 'Poster'), artifactId: 'art_1' }
+        ]
+      })
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'api',
+        brokerToggles: { ...ALL_BROKER_OFF, artifactRuntimeEnabled: true, batshitToolsEnabled: true }
+      })
+
+      expect(result.text).toContain(`- ${ARTIFACT_TOOL_GRID_GROUP_NAME} (1 tool):`)
+      expect(result.text).toContain(
+        '  - use.artifact.poster-maker — fields: prompt (string), size (string) | 2 config controls'
+      )
+      expect(result.text).toContain('artifact_hint:')
+    })
+
+    it('renders Fabric and Artifact together with MCP groups', async () => {
+      mockGatewayTools()
+      listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) =>
+        allowedControlIds?.includes('use.artifact.*')
+          ? [artifactAlias('poster-maker', 'art_1', 'prompt (string)')]
+          : [fabricControl('sys.voice.engine.enable', 'Enable voice engine')]
+      )
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'api',
+        selectedGateways: ['gw_hf'],
+        nativeDynamicMcpEnabled: true,
+        toolNameThreshold: 2
+      })
+
+      expect(result.text).toContain('- HuggingFace (3 tools)')
+      expect(result.text).toContain(FABRIC_TOOL_GRID_GROUP_NAME)
+      expect(result.text).toContain(`- ${ARTIFACT_TOOL_GRID_GROUP_NAME} (1 tool):`)
+    })
+
+    it('emits no text at all when every family is empty', async () => {
+      resolveMCPSelectionsMock.mockResolvedValue({
+        resolvedToolSelections: [],
+        resolvedGateways: []
+      })
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'api',
+        brokerToggles: ALL_BROKER_OFF
+      })
+
+      // The original defect: a `tool_discovery` header with nothing under it.
+      expect(result.text).toBe('')
+      expect(result.groups).toEqual([])
+    })
+
+    it('emits no text when the broker is live but every family returns nothing', async () => {
+      resolveMCPSelectionsMock.mockResolvedValue({
+        resolvedToolSelections: [],
+        resolvedGateways: []
+      })
+      loadToolsForUserMock.mockResolvedValue({ tools: {}, metadata: new Map() })
+      listVisibleControlsMock.mockResolvedValue([])
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'api',
+        brokerToggles: { ...ALL_BROKER_OFF, artifactRuntimeEnabled: true }
+      })
+
+      expect(result.text).toBe('')
+    })
+
+    it('omits Fabric on the managed CLI lane when only fetch-zip is on', async () => {
+      // On mode 4 fetch-zip ships as its own helper tool, not through the broker, so a
+      // Fabric row here would advertise a family the broker would refuse.
+      listVisibleControlsMock.mockResolvedValue([])
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'cli',
+        brokerToggles: { ...ALL_BROKER_OFF, fetchZipEnabled: true }
+      })
+
+      expect(result.text).toBe('')
+    })
+
+    it('hides a family entirely when the Tool Grid row is switched off', async () => {
+      listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) =>
+        allowedControlIds?.includes('use.artifact.*')
+          ? [artifactAlias('poster-maker', 'art_1', 'prompt (string)')]
+          : []
+      )
+
+      const result = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'api',
+        brokerToggles: { ...ALL_BROKER_OFF, artifactRuntimeEnabled: true },
+        dcmDisplaySettings: {
+          version: 1,
+          groups: {
+            [buildCompositeKey(ARTIFACT_TOOL_GRID_ID, ARTIFACT_TOOL_GRID_GROUP_NAME)]: 'hidden'
+          },
+          tools: {}
+        }
+      })
+
+      expect(result.text).toBe('')
+    })
   })
 })

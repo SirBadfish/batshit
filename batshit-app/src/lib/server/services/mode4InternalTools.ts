@@ -1,3 +1,5 @@
+import { isBrokerAvailable, type BrokerToolToggles } from '$lib/utils/brokerAvailability'
+
 export const MODE4_INTERNAL_FETCH_ZIP_TOOL_NAMES = ['batshit_server_fetch_zip'] as const
 export const MODE4_INTERNAL_BATSHIT_TOOL_NAMES = [
   'batshit_tool_search',
@@ -74,12 +76,23 @@ export function resolveEnabledMode4InternalHelperTools(settings: {
     }
   }
 
+  // SA-096: the managed-CLI broker condition is shared with the compile twins' guidance
+  // gate. Rules live in $lib/utils/brokerAvailability — do not restate them here.
+  const brokerToggles: BrokerToolToggles = {
+    fetchZipEnabled: settings.fetchZipEnabled === true,
+    dynamicMcpEnabled: settings.dynamicMcpEnabled === true,
+    cliToolsEnabled: settings.cliToolsEnabled !== false,
+    artifactRuntimeEnabled: settings.artifactRuntimeEnabled === true,
+    batshitToolsEnabled: settings.batshitToolsEnabled === true,
+    agentBrowserEnabled: settings.agentBrowserEnabled === true
+  }
+
   if (
-    settings.dynamicMcpEnabled ||
-    (settings.cliToolsEnabled !== false && options?.hasCliTools) ||
-    settings.agentBrowserEnabled ||
-    settings.artifactRuntimeEnabled ||
-    settings.batshitToolsEnabled
+    isBrokerAvailable({
+      runtime: 'cli',
+      toggles: brokerToggles,
+      hasCliTools: options?.hasCliTools === true
+    })
   ) {
     for (const toolName of MODE4_INTERNAL_BATSHIT_TOOL_NAMES) {
       enabled.add(toolName)

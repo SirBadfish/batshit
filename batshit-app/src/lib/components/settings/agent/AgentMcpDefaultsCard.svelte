@@ -36,6 +36,23 @@
 	    normalizeCliToolIdList
 	  } from '$lib/utils/toolGridCli'
 	  import {
+	    ARTIFACT_TOOL_GRID_GROUP_NAME,
+	    ARTIFACT_TOOL_GRID_ID,
+	    ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS,
+	    createDefaultArtifactToolGridSettings,
+	    createDefaultFabricToolGridSettings,
+	    FABRIC_TOOL_GRID_GROUP_NAME,
+	    FABRIC_TOOL_GRID_ID,
+	    FABRIC_TOOL_GRID_INFO_PARAGRAPHS,
+	    normalizeArtifactToolGridSettings,
+	    normalizeFabricToolGridSettings,
+	    TOOL_GRID_ARTIFACT_ICON_REF,
+	    TOOL_GRID_FABRIC_ICON_REF
+	  } from '$lib/utils/toolGridBrokerFamilies'
+	  import { resolveBrokerFamilies, resolveBrokerToolToggles } from '$lib/utils/brokerAvailability'
+	  import BrokerFamilyToolGridRow from '$lib/components/tools/BrokerFamilyToolGridRow.svelte'
+  import type { BrokerFamilyRowControls } from '$lib/components/tools/brokerFamilyRowControls'
+	  import {
 	    cloneDcmDisplaySettings,
 	    createDefaultDcmDisplaySettings,
 	    createDefaultGatewayDcmDisplaySettings,
@@ -199,6 +216,12 @@
     mcpRenderNonce: number
     nativeDynamicMcpEnabled?: boolean | null
     nativeCliToolsEnabled?: boolean | null
+    /**
+     * The agent's native-tool settings object. SA-096 P3 reads the remaining broker
+     * toggles from it through the shared resolver instead of adding one prop per toggle,
+     * so the grid's idea of a reachable family cannot drift from registration's.
+     */
+    nativeToolSettings?: Record<string, unknown> | null
     isCodexMode?: boolean
     onGatewaysChange: (gateways: string[]) => void
     onDcmDisplaySettingsChange: (settings: AgentDcmDisplaySettings) => void
@@ -247,6 +270,7 @@
     mcpRenderNonce = 0,
     nativeDynamicMcpEnabled = null,
     nativeCliToolsEnabled = null,
+    nativeToolSettings = null,
     isCodexMode = false,
     onGatewaysChange,
     onDcmDisplaySettingsChange,
@@ -413,6 +437,8 @@
   let dcmCatalog = $state<DcmGatewayRow[]>([])
   let cliToolCatalog = $state<CliToolCatalogRow[]>([])
   let globalCliToolGridSettings = $state(createDefaultCliToolGridSettings())
+  let globalFabricToolGridSettings = $state(createDefaultFabricToolGridSettings())
+  let globalArtifactToolGridSettings = $state(createDefaultArtifactToolGridSettings())
   let dcmCatalogSignature = $state<string | null>(null)
   let openTopLevelAccordionItemKey = $state<string | null>(null)
   let openNestedAccordionItemKey = $state<string | null>(null)
@@ -456,6 +482,26 @@
       : effectiveCliToolIds.length > 0
   )
 
+  // SA-096 P3: which broker families this agent can actually reach. Derived from the one
+  // shared rule set, never restated here, so the grid cannot offer a row for a family the
+  // broker would refuse on this runtime.
+  const brokerRuntime = $derived(
+    isCodexMode ? 'cli' : agentType === 'n8n' ? 'n8n' : ('api' as const)
+  )
+  const brokerFamilies = $derived.by(() =>
+    resolveBrokerFamilies({
+      runtime: brokerRuntime,
+      toggles: {
+        ...resolveBrokerToolToggles(nativeToolSettings),
+        dynamicMcpEnabled,
+        cliToolsEnabled
+      },
+      hasCliTools: effectiveCliToolIds.length > 0
+    })
+  )
+  const fabricFamilyEnabled = $derived(brokerFamilies.includes('fabric'))
+  const artifactFamilyEnabled = $derived(brokerFamilies.includes('artifact'))
+
   const columnCount = $derived(showZipControls ? 6 : 3)
 
   const zipToolGridTableSizeClass = $derived(
@@ -487,6 +533,8 @@
   const hasToolGridRows = $derived(
     dcmCatalog.length > 0 ||
       cliToolCatalog.length > 0 ||
+      fabricFamilyEnabled ||
+      artifactFamilyEnabled ||
       (showZipControls &&
         (batshitNonMcpRows.length > 0 || otherNonMcpRows.length > 0))
   )
@@ -600,6 +648,108 @@
       return mode as DcmToolDisplayMode
     }
     return 'inherit'
+  }
+
+  // SA-096 P3: Fabric and Artifact use the same synthetic-gateway shape as CLI Tools, so
+  // every resolution helper below is the shared one. Nothing family-specific is decided here.
+  function buildBrokerFamilyGatewayRow(
+    gatewayId: string,
+    groupName: string,
+    iconRef: IconRef,
+    globalDefaults: GatewayDcmDisplaySettings
+  ): DcmGatewayRow {
+    return { id: gatewayId, name: groupName, iconRef, globalDefaults, groups: [] }
+  }
+
+  function brokerFamilyOptionIconMode(
+    gateway: DcmGatewayRow,
+    groupName: string,
+    optionValue: string
+  ): GroupIconMode {
+    return optionValue === 'use-global'
+      ? getGroupIconModeForPreference(
+          gateway,
+          groupName,
+          getGroupMode(gateway.id, groupName),
+          optionValue as AgentDcmGroupDisplayPreference
+        )
+      : normalizeGroupIconMode(optionValue as DcmGroupDisplayMode)
+  }
+
+  /**
+   * SA-096: one description of a broker family's Discoverable + Display Detail controls,
+   * used by both placements — the `Fabric Controls` / `Artifact Tools` rows inside the
+   * `Batshit Tools` accordion where zip columns exist, and the standalone top-level row
+   * on the discoverability-only surfaces. Building it once is what keeps a family from
+   * ever rendering twice with two behaviors.
+   */
+  function buildBrokerFamilyControls(
+    gatewayId: string,
+    groupName: string,
+    iconRef: IconRef,
+    globalDefaults: GatewayDcmDisplaySettings,
+    infoParagraphs: string[]
+  ): BrokerFamilyRowControls {
+    const gateway = buildBrokerFamilyGatewayRow(gatewayId, groupName, iconRef, globalDefaults)
+    const preference = getGroupPreference(gatewayId, groupName)
+
+    return {
+      label: groupName,
+      iconRef,
+      visible: isGroupVisible(gatewayId, groupName),
+      value: preference,
+      iconMode: getGroupIconModeForPreference(
+        gateway,
+        groupName,
+        getGroupMode(gatewayId, groupName),
+        preference
+      ),
+      options: GROUP_DISPLAY_OPTIONS,
+      optionIconMode: (value) => brokerFamilyOptionIconMode(gateway, groupName, value),
+      modeLabel: (value) => getGroupModeLabel(value as AgentDcmGroupDisplayPreference),
+      infoParagraphs,
+      triggerClass: (value) => inheritTriggerClass(value === 'use-global'),
+      toneClass: (value) => iconToneClass(value === 'use-global'),
+      onVisibleChange: (visible) => handleGroupVisibilityToggle(gatewayId, groupName, visible),
+      onModeChange: (value) => handleGroupModeChange(gatewayId, groupName, value)
+    }
+  }
+
+  function getFabricFamilyControls(): BrokerFamilyRowControls {
+    return buildBrokerFamilyControls(
+      FABRIC_TOOL_GRID_ID,
+      FABRIC_TOOL_GRID_GROUP_NAME,
+      TOOL_GRID_FABRIC_ICON_REF,
+      globalFabricToolGridSettings.dcmDisplayDefaults,
+      FABRIC_TOOL_GRID_INFO_PARAGRAPHS
+    )
+  }
+
+  function getArtifactFamilyControls(): BrokerFamilyRowControls {
+    return buildBrokerFamilyControls(
+      ARTIFACT_TOOL_GRID_ID,
+      ARTIFACT_TOOL_GRID_GROUP_NAME,
+      TOOL_GRID_ARTIFACT_ICON_REF,
+      globalArtifactToolGridSettings.dcmDisplayDefaults,
+      ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS
+    )
+  }
+
+  /**
+   * Maps the two `Batshit Tools` zip rows that are also broker families onto their
+   * controls. Every other row, and any family this agent cannot reach, returns null so
+   * those two columns stay empty.
+   */
+  function getBrokerFamilyControlsForRow(
+    rowId: SharedNonMcpToolGridRowId
+  ): BrokerFamilyRowControls | null {
+    if (rowId === 'fabric_find') {
+      return fabricFamilyEnabled ? getFabricFamilyControls() : null
+    }
+    if (rowId === 'artifact_find') {
+      return artifactFamilyEnabled ? getArtifactFamilyControls() : null
+    }
+    return null
   }
 
   function buildCliGatewayRow(): DcmGatewayRow {
@@ -990,7 +1140,8 @@
       nativeDynamicMcpEnabled,
       nativeCliToolsEnabled,
       dcmDisplaySettings: normalizedDcmDisplaySettings,
-      isCodexMode
+      isCodexMode,
+      brokerRuntime
     })
   }
 
@@ -1019,7 +1170,10 @@
           nativeDynamicMcpEnabled,
           nativeCliToolsEnabled,
           dcmDisplaySettings: normalizedDcmDisplaySettings,
-          isCodexMode: isCodexMode === true
+          isCodexMode: isCodexMode === true,
+          // SA-096 P4: the preview has to use this agent's own broker rules, otherwise it
+          // shows a Fabric or Artifact group the agent's runtime would never serve.
+          runtime: brokerRuntime
         })
       })
 
@@ -1053,10 +1207,22 @@
         throw new Error('Failed to load global Tool Grid defaults')
       }
       const settingsPayload = (await settingsResponse.json()) as {
-        settings?: { global_tool_grid_settings?: { cli?: Record<string, unknown> } | null } | null
+        settings?: {
+          global_tool_grid_settings?: {
+            cli?: Record<string, unknown>
+            fabric?: Record<string, unknown>
+            artifact?: Record<string, unknown>
+          } | null
+        } | null
       }
       const nextGlobalCliSettings = normalizeCliToolGridSettings(
         settingsPayload?.settings?.global_tool_grid_settings?.cli ?? null
+      )
+      const nextGlobalFabricSettings = normalizeFabricToolGridSettings(
+        settingsPayload?.settings?.global_tool_grid_settings?.fabric ?? null
+      )
+      const nextGlobalArtifactSettings = normalizeArtifactToolGridSettings(
+        settingsPayload?.settings?.global_tool_grid_settings?.artifact ?? null
       )
 
       const gatewayResponse = await fetch('/api/mcp/gateways?enabled=true')
@@ -1139,6 +1305,8 @@
 
       if (dcmCatalogSignature !== signature) return
       globalCliToolGridSettings = nextGlobalCliSettings
+      globalFabricToolGridSettings = nextGlobalFabricSettings
+      globalArtifactToolGridSettings = nextGlobalArtifactSettings
       cliToolCatalog = nextCliToolCatalog
       dcmCatalog = gatewayRows
     } catch (error) {
@@ -1465,6 +1633,7 @@
                 otherColumnClass="w-[100px]"
                 getRowOverride={getSectionNonMcpZipOverride}
                 onUpdateRowOverride={updateSectionNonMcpZipOverride}
+                getBrokerFamilyControls={getBrokerFamilyControlsForRow}
                 onHeaderClick={handleTopLevelHeaderClick}
                 onToggle={toggleTopLevelAccordionItem}
                 showBulkZipApply
@@ -1878,6 +2047,20 @@
                   </td>
                 </tr>
               </Collapsible.Root>
+            {/if}
+
+            {#if !showZipControls && fabricFamilyEnabled}
+              <BrokerFamilyToolGridRow
+                controls={getFabricFamilyControls()}
+                rowClass={topLevelAccordionRowClass}
+              />
+            {/if}
+
+            {#if !showZipControls && artifactFamilyEnabled}
+              <BrokerFamilyToolGridRow
+                controls={getArtifactFamilyControls()}
+                rowClass={topLevelAccordionRowClass}
+              />
             {/if}
 
             {#each dcmCatalog as gateway}

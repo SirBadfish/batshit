@@ -1,7 +1,6 @@
 import { redis } from '$lib/server/redis'
 import type { AgentDcmDisplaySettings, MCPToolSelections, SubagentRow } from '$lib/types/database'
 import { buildSkillsCommandsDcmLines, getEnabledAgentSlashCapabilities } from '$lib/server/services/slashCommandCapabilities'
-import { findControls } from '$lib/server/services/fabricRegistry'
 import {
   buildDynamicMcpIndex,
   normalizeDcmDisplaySettings,
@@ -10,8 +9,6 @@ import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelection
 import { resolveCliToolSelectionScope } from '$lib/server/services/cliToolRegistry'
 import { resolveNativeToolSettings } from '$lib/server/services/nativeTools'
 import { isApiSubagentType, normalizeSubagentType, type SubagentType } from '$lib/utils/subagentType'
-
-const ARTIFACT_DCM_ALLOWED_CONTROL_IDS = ['use.artifact.*'] as const
 
 function normalizeStringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null
@@ -47,42 +44,6 @@ async function resolveSessionProjectPath(
     session?.metadata && typeof session.metadata === 'object' ? session.metadata : null
   const projectPath = typeof metadata?.projectPath === 'string' ? metadata.projectPath.trim() : ''
   return projectPath || null
-}
-
-async function buildSubagentArtifactLines(options: {
-  userId: string
-  subagentId: string
-}): Promise<string[]> {
-  const result = await findControls({
-    userId: options.userId,
-    agentId: options.subagentId,
-    sourceType: 'artifact',
-    query: 'artifact',
-    runtimeMode: 'mode3',
-    allowedControlIds: Array.from(ARTIFACT_DCM_ALLOWED_CONTROL_IDS),
-    limit: 200,
-    includeSchema: false,
-  })
-
-  const typedInvokeAliases = result.results.filter((entry) =>
-    entry.controlId.startsWith('use.artifact.'),
-  )
-
-  if (typedInvokeAliases.length === 0) return []
-
-  const lines: string[] = ['', 'artifacts:']
-  const sortedArtifacts = [...typedInvokeAliases].sort((a, b) =>
-    a.controlId.localeCompare(b.controlId),
-  )
-  for (const control of sortedArtifacts) {
-    const hint = control.schemaHint ? ` — fields: ${control.schemaHint}` : ''
-    lines.push(`- ${control.controlId}${hint}`)
-  }
-  lines.push(
-    'artifact_hint: use.artifact.{slug} entries accept structured field inputs through Batshit Tool Use. Only discovered use.artifact entries are agent-runnable; user-only panel artifacts such as Gradio/HuggingFace embeds and ComfyUI panel artifacts are not. Do not change an artifact brain type or power source to force agent use.',
-  )
-
-  return lines
 }
 
 export interface SubagentResolvedScope {
@@ -164,14 +125,28 @@ export async function buildManagedSubagentDynamicInfo(options: {
     lines.push('project_path: (not set)')
   }
 
+  // SA-096 P4: the capability index now covers Fabric and published artifact runtime tools
+  // as well, so the subagent's own artifact block is gone. Subagents keep artifact runtime
+  // but never the Fabric control plane (SA-064), which `allowFabricControlTools` expresses.
   const mcpIndex = await buildDynamicMcpIndex({
     userId: options.userId,
+    controlAgentId: options.subagent.id,
     toolSelections: scope.defaultMcpToolSelections,
     selectedGateways: scope.resolvedGateways,
     selectedCliToolIds: scope.resolvedCliToolIds,
     nativeDynamicMcpEnabled: scope.nativeToolSettings.dynamicMcpEnabled,
     cliToolsEnabled: scope.nativeToolSettings.cliToolsEnabled,
     dcmDisplaySettings: scope.dcmDisplaySettings,
+    runtime: isApiSubagentType(scope.subagentType) ? 'api' : 'cli',
+    brokerToggles: {
+      fetchZipEnabled: scope.nativeToolSettings.fetchZipEnabled,
+      dynamicMcpEnabled: scope.nativeToolSettings.dynamicMcpEnabled,
+      cliToolsEnabled: scope.nativeToolSettings.cliToolsEnabled,
+      artifactRuntimeEnabled: scope.nativeToolSettings.artifactRuntimeEnabled,
+      batshitToolsEnabled: scope.nativeToolSettings.batshitToolsEnabled,
+      agentBrowserEnabled: scope.nativeToolSettings.agentBrowserEnabled,
+    },
+    allowFabricControlTools: false,
   })
   if (mcpIndex.text.trim()) {
     lines.push('', mcpIndex.text.trim())
@@ -181,19 +156,6 @@ export async function buildManagedSubagentDynamicInfo(options: {
   const skillsLines = buildSkillsCommandsDcmLines(capabilities)
   if (skillsLines.length > 0) {
     lines.push('', ...skillsLines)
-  }
-
-  if (
-    isApiSubagentType(scope.subagentType) &&
-    scope.nativeToolSettings.artifactRuntimeEnabled
-  ) {
-    const artifactLines = await buildSubagentArtifactLines({
-      userId: options.userId,
-      subagentId: options.subagent.id,
-    })
-    if (artifactLines.length > 0) {
-      lines.push(...artifactLines)
-    }
   }
 
   const content = lines.filter((line, index, all) => {

@@ -28,10 +28,6 @@ const dynamicMcpIndexMocks = vi.hoisted(() => ({
   normalizeDcmDisplaySettings: vi.fn((value: any) => value ?? { version: 1, groups: {}, tools: {} }),
 }))
 
-const fabricRegistryMocks = vi.hoisted(() => ({
-  findControls: vi.fn(),
-}))
-
 const nativeToolMocks = vi.hoisted(() => ({
   resolveNativeToolSettings: vi.fn(),
 }))
@@ -61,10 +57,6 @@ vi.mock('../dynamicMcpIndex', () => ({
   normalizeDcmDisplaySettings: dynamicMcpIndexMocks.normalizeDcmDisplaySettings,
 }))
 
-vi.mock('../fabricRegistry', () => ({
-  findControls: fabricRegistryMocks.findControls,
-}))
-
 vi.mock('../nativeTools', () => ({
   resolveNativeToolSettings: nativeToolMocks.resolveNativeToolSettings,
 }))
@@ -88,7 +80,9 @@ describe('subagentRuntimeScope', () => {
     })
     dynamicMcpIndexMocks.buildDynamicMcpIndex.mockResolvedValue({
       groups: [],
-      text: 'mcp_dynamic:\n- CLI Tools',
+      // SA-096 P4: artifact runtime context now arrives inside the capability index
+      // instead of a separate subagent-owned artifact block.
+      text: 'mcp_dynamic:\n- CLI Tools\n- Artifact Tools (1 tool):\n  - use.artifact.demo-tool — fields: prompt (string)',
       tokenEstimates: {},
       counts: {},
       threshold: 6,
@@ -109,17 +103,13 @@ describe('subagentRuntimeScope', () => {
       'skills_commands:',
       '- /artifact-creator | skill | skillId=artifact_creator',
     ])
-    fabricRegistryMocks.findControls.mockResolvedValue({
-      results: [
-        {
-          controlId: 'use.artifact.demo-tool',
-          schemaHint: 'prompt (string)',
-        },
-      ],
-    })
     nativeToolMocks.resolveNativeToolSettings.mockReturnValue({
+      fetchZipEnabled: true,
       dynamicMcpEnabled: true,
+      cliToolsEnabled: true,
       artifactRuntimeEnabled: true,
+      batshitToolsEnabled: true,
+      agentBrowserEnabled: true,
     })
   })
 
@@ -192,13 +182,20 @@ describe('subagentRuntimeScope', () => {
     expect(result).toContain('mcp_dynamic:')
     expect(result).toContain('skills_commands:')
     expect(result).toContain('use.artifact.demo-tool')
-    expect(result).not.toContain('config controls')
+    // SA-096 P4: the subagent lane scopes the index to its own controls and keeps the
+    // Fabric control plane closed (SA-064), rather than building its own artifact block.
     expect(dynamicMcpIndexMocks.buildDynamicMcpIndex).toHaveBeenCalledWith(
       expect.objectContaining({
         toolSelections: null,
         selectedGateways: ['gw-subagent'],
         selectedCliToolIds: ['cli-one'],
+        controlAgentId: 'subagent_api',
+        runtime: 'api',
+        allowFabricControlTools: false,
       }),
+    )
+    expect(dynamicMcpIndexMocks.buildDynamicMcpIndex).not.toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: 'subagent_api' }),
     )
   })
 

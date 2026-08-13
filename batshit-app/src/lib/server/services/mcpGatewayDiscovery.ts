@@ -595,8 +595,13 @@ export class MCPGatewayDiscovery {
     discoveryOptions?: DiscoveryOptions
   ): Promise<ToolMetadataMap> {
     try {
-      // Get all enabled gateways first
-      const allGateways = await mcpGatewayService.listEnabled(userId)
+      // Get every registered gateway, then keep the enabled ones. Reading the
+      // full registry (rather than the enabled subset) lets SA-096 P6 tell a
+      // selection pointing at a *disabled* gateway apart from one pointing at a
+      // gateway that no longer exists; the second used to be indistinguishable
+      // from "this gateway returned no tools".
+      const registeredGateways = await mcpGatewayService.list(userId)
+      const allGateways = registeredGateways.filter(g => g.enabled)
       const gatewaysWithAuth = await this.applyUserAuthTokens(allGateways, userId)
 
       // Filter by selectedGatewayIds if provided
@@ -604,6 +609,18 @@ export class MCPGatewayDiscovery {
       const gateways = selectedGatewayIds !== undefined
         ? gatewaysWithAuth.filter(g => selectedGatewayIds.includes(g.id))  // Includes [] case (returns [])
         : gatewaysWithAuth  // Only when undefined (no selection made)
+
+      if (selectedGatewayIds !== undefined && selectedGatewayIds.length > 0) {
+        const registeredIds = new Set(registeredGateways.map(g => g.id))
+        const orphanIds = selectedGatewayIds.filter(id => !registeredIds.has(id))
+        if (orphanIds.length > 0) {
+          logger.warn(
+            `[Gateway Discovery] ${orphanIds.length} selected gateway ID(s) are not in the ` +
+            `registry for user ${userId} and resolve to no tools: ${orphanIds.join(', ')}. ` +
+            `These should have been swept when the gateway was deleted (SA-096 P6).`
+          )
+        }
+      }
 
       logger.debug(
         `[Gateway Discovery] Loading ${gateways.length}/${allGateways.length} gateways for user ${userId}` +

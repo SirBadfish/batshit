@@ -701,8 +701,14 @@ export interface GlobalCliToolGridSettings {
   dcmDisplayDefaults?: GatewayDcmDisplaySettings
 }
 
+export interface GlobalBrokerFamilyToolGridSettings {
+  dcmDisplayDefaults?: GatewayDcmDisplaySettings
+}
+
 export interface GlobalToolGridSettings {
   cli?: GlobalCliToolGridSettings
+  fabric?: GlobalBrokerFamilyToolGridSettings
+  artifact?: GlobalBrokerFamilyToolGridSettings
 }
 
 export interface AgentDcmDisplaySettings {

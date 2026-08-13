@@ -24,6 +24,15 @@ import {
 } from './cliToolRegistry'
 import { mapBashCommandToRendererTool } from './bashCommandMapper'
 import { resolveDefaultNativeExecutionBackend } from './nativeExecutionDefaults'
+import {
+  BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
+  BROKER_TOOL_FAMILIES,
+  isControlIdAllowedByList,
+  resolveBrokerFabricAllowedControlIds,
+  resolveBrokerFamilies,
+  resolveBrokerToolToggles
+} from '$lib/utils/brokerAvailability'
+import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
 import { findControls, useControl, type ControlRuntimeMode, type ControlUseErrorCode } from './fabricRegistry'
 import {
   DEFAULT_DYNAMIC_MCP_RESULTS,
@@ -100,13 +109,10 @@ type AgentBrowserBashSettings = {
   timeoutMs?: number
 }
 
-export const BATSHIT_TOOL_FAMILIES = [
-  'mcp',
-  'cli',
-  'artifact',
-  'fabric',
-  'agent_browser'
-] as const
+// SA-096: the family list and the rules deciding which families the broker serves live in
+// $lib/utils/brokerAvailability so the compile twins can gate their broker guidance on the
+// same truth this file registers tools from.
+export const BATSHIT_TOOL_FAMILIES = BROKER_TOOL_FAMILIES
 export type BatshitToolFamily = (typeof BATSHIT_TOOL_FAMILIES)[number]
 type BatshitToolSchemaMode = 'compact' | 'full' | 'none'
 
@@ -382,7 +388,7 @@ const DEFAULT_COMFYUI_WORKFLOW_TIMEOUT_MS = 8_000
 const MAX_COMFYUI_WORKFLOW_TIMEOUT_MS = 20_000
 const DEFAULT_COMFYUI_WORKFLOW_LIST_LIMIT = 200
 const MAX_COMFYUI_WORKFLOW_LIST_LIMIT = 1_000
-const FABRIC_FETCH_ZIP_CONTROL_ID = 'sys.zip.fetch'
+const FABRIC_FETCH_ZIP_CONTROL_ID = BROKER_FABRIC_FETCH_ZIP_CONTROL_ID
 const FABRIC_COMFYUI_WORKFLOWS_CONTROL_ID = 'sys.comfyui.workflows'
 const FABRIC_COMFYUI_OBJECT_INFO_CONTROL_ID = 'sys.comfyui.object_info'
 const FABRIC_COMFYUI_ALLOWED_CONTROL_ID = 'sys.comfyui.*'
@@ -2974,8 +2980,10 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
       'nativeBashAgentApprovalCardsEnabled',
       'nativeBashApprovalCardsEnabled'
     ) ?? false
-  const agentBrowserEnabled =
-    getToggle('agentBrowserEnabled', 'nativeAgentBrowserEnabled') ?? true
+  // SA-096: the six broker-relevant toggles are resolved by the shared util so the compile
+  // twins read agent settings exactly the way tool registration does.
+  const brokerToggles = resolveBrokerToolToggles(providerSettings)
+  const agentBrowserEnabled = brokerToggles.agentBrowserEnabled
   const agentBrowserRuntimeMode = normalizeAgentBrowserRuntimeMode(
     (nested as any).agentBrowserRuntimeMode ??
       (nested as any).nativeAgentBrowserRuntimeMode ??
@@ -3035,14 +3043,11 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
   )
 
   return {
-    fetchZipEnabled: getToggle('fetchZipEnabled', 'nativeFetchZipEnabled') ?? true,
-    dynamicMcpEnabled: getToggle('dynamicMcpEnabled', 'nativeDynamicMcpEnabled') ?? true,
-    cliToolsEnabled: getToggle('cliToolsEnabled', 'nativeCliToolsEnabled') ?? true,
-    artifactRuntimeEnabled:
-      getToggle('artifactRuntimeEnabled', 'nativeArtifactRuntimeEnabled') ??
-      getToggle('batshitToolsEnabled', 'nativeBatshitToolsEnabled') ??
-      true,
-    batshitToolsEnabled: getToggle('batshitToolsEnabled', 'nativeBatshitToolsEnabled') ?? true,
+    fetchZipEnabled: brokerToggles.fetchZipEnabled,
+    dynamicMcpEnabled: brokerToggles.dynamicMcpEnabled,
+    cliToolsEnabled: brokerToggles.cliToolsEnabled,
+    artifactRuntimeEnabled: brokerToggles.artifactRuntimeEnabled,
+    batshitToolsEnabled: brokerToggles.batshitToolsEnabled,
     webSearchEnabled: getToggle('webSearchEnabled', 'nativeWebSearchEnabled') ?? true,
     bashEnabled: getToggle('bashEnabled', 'nativeBashEnabled') ?? true,
     executionBackend: resolvedExecutionBackend,
@@ -6005,55 +6010,23 @@ type NativeFabricHelperControlDefinition = {
   tags: string[]
 }
 
-const NATIVE_FABRIC_HELPER_CONTROLS: NativeFabricHelperControlDefinition[] = [
-  {
-    controlId: FABRIC_FETCH_ZIP_CONTROL_ID,
-    title: 'Fetch Zip',
-    description:
-      'Fetch an existing Batshit zip by ID without changing unzip state.',
-    inputSchema: ZIP_FETCH_INPUT_SCHEMA_JSON,
-    schemaHint: 'zipId (required), includeContent?, maxChars?',
-    tags: ['zip', 'fetch', 'context', 'tool-result']
-  },
-  {
-    controlId: FABRIC_COMFYUI_WORKFLOWS_CONTROL_ID,
-    title: 'ComfyUI Workflows',
-    description:
-      'List or fetch ComfyUI saved workflows through Batshit host runtime URL aliases.',
-    inputSchema: COMFYUI_WORKFLOWS_INPUT_SCHEMA_JSON,
-    schemaHint:
-      'action=list|get, baseUrl?, workflowName? for get, includeWorkflow?, limit?, timeoutMs?',
-    tags: ['comfyui', 'workflow', 'artifact', 'runtime']
-  },
-  {
-    controlId: FABRIC_COMFYUI_OBJECT_INFO_CONTROL_ID,
-    title: 'ComfyUI Object Info',
-    description:
-      'Fetch targeted ComfyUI /object_info schema through Batshit host runtime URL aliases.',
-    inputSchema: COMFYUI_OBJECT_INFO_INPUT_SCHEMA_JSON,
-    schemaHint:
-      'baseUrl?, includeSchema?, classTypes?, maxNodes?, timeoutMs?',
-    tags: ['comfyui', 'object_info', 'schema', 'artifact', 'runtime']
-  }
-]
-
-function controlIdMatchesAllowedEntry(controlId: string, allowedEntry: string): boolean {
-  const normalizedControlId = controlId.trim()
-  const normalizedAllowed = allowedEntry.trim()
-  if (!normalizedControlId || !normalizedAllowed) return false
-  if (normalizedAllowed === normalizedControlId) return true
-  if (!normalizedAllowed.includes('*')) return false
-  const escaped = normalizedAllowed
-    .split('*')
-    .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('.*')
-  return new RegExp(`^${escaped}$`).test(normalizedControlId)
+// Input schemas stay here with the execution code; identity/title/hint live in the shared
+// catalog so the DCM capability index can count this family without importing this module.
+const NATIVE_FABRIC_HELPER_INPUT_SCHEMAS: Record<string, Record<string, any>> = {
+  [FABRIC_FETCH_ZIP_CONTROL_ID]: ZIP_FETCH_INPUT_SCHEMA_JSON,
+  [FABRIC_COMFYUI_WORKFLOWS_CONTROL_ID]: COMFYUI_WORKFLOWS_INPUT_SCHEMA_JSON,
+  [FABRIC_COMFYUI_OBJECT_INFO_CONTROL_ID]: COMFYUI_OBJECT_INFO_INPUT_SCHEMA_JSON
 }
 
-function isControlIdAllowedByList(controlId: string, allowedControlIds?: string[] | null): boolean {
-  if (!Array.isArray(allowedControlIds) || allowedControlIds.length === 0) return false
-  return allowedControlIds.some((entry) => controlIdMatchesAllowedEntry(controlId, entry))
-}
+const NATIVE_FABRIC_HELPER_CONTROLS: NativeFabricHelperControlDefinition[] =
+  NATIVE_FABRIC_HELPER_CONTROL_META.map((meta) => ({
+    controlId: meta.controlId,
+    title: meta.title,
+    description: meta.description,
+    schemaHint: meta.schemaHint,
+    tags: meta.tags,
+    inputSchema: NATIVE_FABRIC_HELPER_INPUT_SCHEMAS[meta.controlId]
+  }))
 
 function allowedControlEntryIsNativeFabricHelperOnly(entry: string): boolean {
   const normalized = entry.trim()
@@ -10295,34 +10268,24 @@ export async function dispatchNativeAutomationPackAction(input: {
           })
         : null
     const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context)
-    const brokerFabricAllowedControlIds = new Set<string>()
-    if (nativeSettings.fetchZipEnabled && context.actor_type === 'primary') {
-      brokerFabricAllowedControlIds.add(FABRIC_FETCH_ZIP_CONTROL_ID)
-    }
-    if (
-      nativeSettings.batshitToolsEnabled &&
-      context.actor_type === 'primary' &&
-      (context.mode === 'mode3' || context.mode === 'mode4')
-    ) {
-      brokerFabricAllowedControlIds.add(FABRIC_COMFYUI_ALLOWED_CONTROL_ID)
-      if (nativeSettings.dynamicMcpEnabled) {
-        brokerFabricAllowedControlIds.add('sys.mcp.dynamic.find')
-        brokerFabricAllowedControlIds.add('sys.mcp.dynamic.use')
-      }
-      brokerFabricAllowedControlIds.add('sys.artifact.*')
-      brokerFabricAllowedControlIds.add('artifact.*')
-      brokerFabricAllowedControlIds.add('sys.model_catalog.search')
-      brokerFabricAllowedControlIds.add('sys.cli_tool.*')
-      brokerFabricAllowedControlIds.add('sys.skill.save')
-      brokerFabricAllowedControlIds.add('sys.skill.import')
-      brokerFabricAllowedControlIds.add('sys.runtime_addon.*')
-      brokerFabricAllowedControlIds.add('sys.voice.engine.register')
-      brokerFabricAllowedControlIds.add('sys.voice.engine.update')
-      brokerFabricAllowedControlIds.add('sys.voice.engine.health_check')
-      brokerFabricAllowedControlIds.add('sys.voice.engine.complete_local_setup')
-      brokerFabricAllowedControlIds.add('sys.voice.engine.enable')
-      brokerFabricAllowedControlIds.add('sys.voice.engine.delete')
-    }
+    // SA-096 P4: same source as mode 3 registration and the DCM capability index's Fabric
+    // count. This lane keeps its own actor/mode conditions, expressed as the two flags.
+    const brokerFabricAllowedControlIds = new Set<string>(
+      resolveBrokerFabricAllowedControlIds({
+        toggles: {
+          fetchZipEnabled: nativeSettings.fetchZipEnabled,
+          dynamicMcpEnabled: nativeSettings.dynamicMcpEnabled,
+          cliToolsEnabled: nativeSettings.cliToolsEnabled,
+          artifactRuntimeEnabled: nativeSettings.artifactRuntimeEnabled,
+          batshitToolsEnabled: nativeSettings.batshitToolsEnabled,
+          agentBrowserEnabled: nativeSettings.agentBrowserEnabled
+        },
+        allowFetchZip: context.actor_type === 'primary',
+        allowFabricControlTools:
+          context.actor_type === 'primary' &&
+          (context.mode === 'mode3' || context.mode === 'mode4')
+      })
+    )
     const brokerSelectedGateways =
       context.actor_type === 'subagent'
         ? subagentGatewayScope?.resolvedGateways
@@ -11249,7 +11212,6 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const selectedCliToolIds = cliToolScope.toolIds
 
   const tools: Record<string, any> = {}
-  const fabricAllowedControlIds = new Set<string>()
   const resolvedSessionId = normalizeOptionalString(context.sessionId)
   const resolvedAgentId = normalizeOptionalString(context.agentId)
   const gatewayToolsCache: GatewayToolsCache = new Map()
@@ -11427,15 +11389,6 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     }
 
     return response
-  }
-
-  if (settings.fetchZipEnabled) {
-    fabricAllowedControlIds.add(FABRIC_FETCH_ZIP_CONTROL_ID)
-  }
-
-  if (settings.dynamicMcpEnabled) {
-    fabricAllowedControlIds.add('sys.mcp.dynamic.find')
-    fabricAllowedControlIds.add('sys.mcp.dynamic.use')
   }
 
   const bashApprovalRequestsEnabled =
@@ -11638,37 +11591,23 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const allowArtifactRuntimeTools = context.allowArtifactRuntimeTools !== false
   const allowFabricControlTools = context.allowFabricControlTools !== false
 
-  if (settings.batshitToolsEnabled && allowFabricControlTools) {
-    fabricAllowedControlIds.add(FABRIC_COMFYUI_ALLOWED_CONTROL_ID)
-    fabricAllowedControlIds.add('sys.artifact.*')
-    fabricAllowedControlIds.add('artifact.*')
-    fabricAllowedControlIds.add('sys.model_catalog.search')
-    fabricAllowedControlIds.add('sys.cli_tool.*')
-    fabricAllowedControlIds.add('sys.skill.save')
-    fabricAllowedControlIds.add('sys.skill.import')
-    fabricAllowedControlIds.add('sys.runtime_addon.*')
-    fabricAllowedControlIds.add('sys.voice.engine.register')
-    fabricAllowedControlIds.add('sys.voice.engine.update')
-    fabricAllowedControlIds.add('sys.voice.engine.health_check')
-    fabricAllowedControlIds.add('sys.voice.engine.complete_local_setup')
-    fabricAllowedControlIds.add('sys.voice.engine.enable')
-    fabricAllowedControlIds.add('sys.voice.engine.delete')
-  }
-
-  const apiBrokerAllowedFamilies: BatshitToolFamily[] = []
-  if (settings.dynamicMcpEnabled) apiBrokerAllowedFamilies.push('mcp')
-  if (settings.cliToolsEnabled && selectedCliToolIds.length > 0) apiBrokerAllowedFamilies.push('cli')
-  if (settings.artifactRuntimeEnabled && allowArtifactRuntimeTools) apiBrokerAllowedFamilies.push('artifact')
-  const apiBrokerFabricAllowedControlIds = new Set<string>()
-  if (settings.fetchZipEnabled) {
-    apiBrokerFabricAllowedControlIds.add(FABRIC_FETCH_ZIP_CONTROL_ID)
-  }
-  if (settings.batshitToolsEnabled && allowFabricControlTools) {
-    for (const controlId of fabricAllowedControlIds) {
-      apiBrokerFabricAllowedControlIds.add(controlId)
-    }
-  }
-  if (apiBrokerFabricAllowedControlIds.size > 0) apiBrokerAllowedFamilies.push('fabric')
+  // SA-096: shared with the compile twins' broker-guidance gate so registered tools and
+  // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
+  const brokerToggles = resolveBrokerToolToggles(context.providerSettings)
+  const apiBrokerAllowedFamilies: BatshitToolFamily[] = resolveBrokerFamilies({
+    runtime: 'api',
+    toggles: brokerToggles,
+    hasCliTools: selectedCliToolIds.length > 0,
+    allowArtifactRuntimeTools,
+    allowFabricControlTools
+  })
+  // SA-096 P4: same source as the DCM capability index's Fabric count.
+  const apiBrokerFabricAllowedControlIds = new Set<string>(
+    resolveBrokerFabricAllowedControlIds({
+      toggles: brokerToggles,
+      allowFabricControlTools
+    })
+  )
 
   if (apiBrokerAllowedFamilies.length > 0) {
     tools.native_batshit_tool_search = tool({

@@ -1,26 +1,5 @@
 Runtime: {{ $runtime_flavor }} | Zip AI view: {{ $zip_ai_view_mode }}
 
-## Dynamic Tool Search (When Selected)
-
-Dynamic Tool Search is the compact broker for discoverable Batshit capability families. It is not the same thing as raw shell commands, web search, fetch zip, or skills.
-
-If the user asks you to use a selected Batshit capability:
-- Prefer Dynamic Tool Search/Use over bash for saved CLI tools, MCP tools, artifact runtime tools, Fabric controls, and Agent Browser actions when that family is available.
-- Search first when you need the exact ref or required input fields.
-- Use the exact typed ref returned by search, such as `mcp:tool_name`, `cli:tool_id`, `artifact:use.artifact.slug`, `fabric:sys.control`, or `agent_browser:open`.
-- Keep capability-specific fields inside the nested `input` object.
-- Never invent placeholder refs like `"selected"`.
-- Never flatten required fields to the top level.
-
-Runtime-specific names:
-- `n8n`: use `Batshit Tools` with `action="batshit_tool_search"` / `action="batshit_tool_use"`
-- `vercel`: `native_batshit_tool_search` / `native_batshit_tool_use`
-- `codex` / `claude`: `batshit_tool_search` / `batshit_tool_use`
-
-In n8n primary agents, `batshit_tool_search` / `batshit_tool_use` are action names for the `Batshit Tools` node, not standalone skills. Do not call `native_skill` with `skillId="batshit_tool_search"` or `skillId="batshit_tool_use"`.
-
-If the hint/schema says a required field is `inputFile`, pass it inside `input`, not at the top level. If a call fails because a required field is missing, inspect the schema/result and retry with the exact field names.
-
 ## How Batshit Handles Tool Results
 
 Batshit automatically compresses (zips) tool results to save tokens. This is different from other platforms where tool outputs bloat your context window.
@@ -56,14 +35,14 @@ Use them only when helpful:
 - `zip`: use zip IDs for content you are done with and want compressed again. Do not zip user-locked items.
 - `toolResultsSummary`: use short factual notes when a summary is enough.
 
-Need to read an older zip right now? Use the Batshit tool broker with ref `fabric:sys.zip.fetch` (`native_batshit_tool_use` for API agents, `batshit_tool_use` for n8n/managed CLI where the broker exposes it), or `batshit_server_fetch_zip` when a managed CLI exposes that direct helper. If that content should stay available after this response, also put its zip ID in `unzip`.
+**Fetch Zip** is how you read a zip right now. Call `{{ $tool_use_tool }}` with ref `fabric:sys.zip.fetch`, or `batshit_server_fetch_zip` when a managed CLI exposes that direct helper. It peeks at any zip without changing its state. If that content should also stay available after this response, put its zip ID in `unzip` as well.
 
 ## Auto-zipped (Immediate Compression)
 
 Some content types/tools are marked **Auto-zipped**. These compress immediately by default, but you may request `unzip` for them when zip control is enabled.
 - The DCM lists auto-zipped content/tools.
 - Treat summaries as your memory.
-- If you must re-check raw output, fetch the zip through `fabric:sys.zip.fetch` or the managed CLI Fetch Zip helper when available.
+- If you must re-check raw output, use Fetch Zip.
 - If a zip stays compressed because of size safety, do not fight it with repeated unzip requests; fetch it for the current task and leave a short summary.
 
 Zip behavior modes: `Off` means never zip this output. `Normal` uses buffer and threshold. `Auto` zips immediately by default. Threshold `0` means there is no minimum-size floor.
@@ -97,5 +76,3 @@ Never output the JSON by itself. It must be wrapped in `<batshit-zip-control>` a
 - Only include this block when you actually need to change zip state or save useful Tool Results Summary notes.
 - Summaries: short, factual—just what you'll need later
 - Never include literal Batshit zip-reference examples in visible text.
-
-**Backup option:** Fetch Zip through `fabric:sys.zip.fetch` lets you peek at any zip without unzipping it.

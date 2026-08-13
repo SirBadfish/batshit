@@ -96,6 +96,33 @@ The Global Tool Grid has `Reset to defaults`. The Agent Tool Grid has `Reset to 
 
 Keep tool access as narrow as the job allows. Broad access is powerful, but it also makes agent behavior harder to predict.
 
+### The Fabric Controls and Artifact Tools rows
+
+Most people never need to touch these two. They're already set the way they should be, and this section is here for the times you're curious what they are or you want to turn one off.
+
+You'll find both inside the **Batshit Tools** group, on the rows already named `Fabric Controls` and `Artifact Tools`.
+
+**Fabric Controls** are Batshit's own app actions, the things that let an agent manage Artifacts, install a CLI Tool, look at your model catalog, and so on. There are around forty of them, and they all live in one row.
+
+**Artifact Tools** are the Artifacts you've published and marked as agent-usable. Each one shows up as something the agent can run directly.
+
+Each row carries the same controls as everything else in the grid:
+
+- **Discoverable** decides whether the agent may find and use that family at all. Turn it off and the whole family disappears for that agent.
+- **Display detail** decides how much shows up in the compact capability list Batshit gives the agent on every message.
+- The **Zip** columns work like every other Batshit Tools row: they control how the results of a search get compressed in the conversation, not what the agent can reach.
+
+The two rows ship with different display detail on purpose, because they're different sizes:
+
+- **Fabric Controls** shows **the group name only**. Around forty entries is too many to list on every single message, and listing them would cost you real tokens for something the agent can find in one search anyway. The agent still reaches all of them, it just searches instead of being handed the full list.
+- **Artifact Tools** shows **names and hints**. This family is small and it's yours, so spelling out each Artifact's input fields is worth it: the agent can call your Artifact directly instead of spending an extra round trip searching for it first.
+
+Discoverable and Display detail only appear when the family is actually reachable for that agent. If Fabric is switched off for an agent entirely, the row keeps its Zip settings and drops the other two controls.
+
+The Chat Bar tool grid works the same way, since it's the same grid. Subagent Settings doesn't have a Batshit Tools group, so the two families appear there as their own rows instead, with the same controls. Group Settings is a different grid that only decides whether a tool's results are shared into the thread, so it has nothing to set here.
+
+If you do change one, the most useful move is usually turning **Artifact Tools** display detail down when you have a lot of published Artifacts and only a few matter to that agent, or turning **Discoverable** off entirely for an agent that has no business managing your app.
+
 ## Skills and Prompts
 
 Skills are reusable instruction bundles with optional reference files and scripts. They differ from CLI Tools: a Skill teaches an agent a *workflow*, while a CLI Tool *runs* a saved command or executable.

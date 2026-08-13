@@ -9,6 +9,12 @@ import {
   SHARED_NON_MCP_TOOL_GRID_OTHER_ROW_IDS,
   SHARED_NON_MCP_TOOL_GRID_ROW_ORDER
 } from './toolGridConfig'
+import {
+  ARTIFACT_TOOL_GRID_GROUP_NAME,
+  ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS,
+  FABRIC_TOOL_GRID_GROUP_NAME,
+  FABRIC_TOOL_GRID_INFO_PARAGRAPHS
+} from '$lib/utils/toolGridBrokerFamilies'
 
 describe('shared Tool Grid taxonomy', () => {
   it('keeps Batshit Tools in the product-approved order', () => {
@@ -43,6 +49,35 @@ describe('shared Tool Grid taxonomy', () => {
     expect(DYNAMIC_TOOL_SEARCH_INFO_PARAGRAPHS.join(' ')).toContain('published Artifact runtime tools')
     expect(DYNAMIC_TOOL_SEARCH_INFO_PARAGRAPHS.join(' ')).toContain('Fabric controls')
     expect(DYNAMIC_TOOL_SEARCH_INFO_PARAGRAPHS.join(' ')).toContain('Agent Browser actions')
+  })
+
+  // SA-096: the Fabric and Artifact broker families are configured on these two Batshit
+  // Tools rows rather than on separate top-level rows, so a family never appears twice in
+  // one grid. The row label IS the family group name; if either side is renamed
+  // independently the merge silently becomes two differently-named things again.
+  it('hosts the broker families on their Batshit Tools rows', () => {
+    expect(SHARED_NON_MCP_TOOL_GRID_CONFIG.fabric_find.label).toBe(FABRIC_TOOL_GRID_GROUP_NAME)
+    expect(SHARED_NON_MCP_TOOL_GRID_CONFIG.artifact_find.label).toBe(ARTIFACT_TOOL_GRID_GROUP_NAME)
+    expect(SHARED_NON_MCP_TOOL_GRID_BATSHIT_ROW_IDS).toContain('fabric_find')
+    expect(SHARED_NON_MCP_TOOL_GRID_BATSHIT_ROW_IDS).toContain('artifact_find')
+  })
+
+  it('carries only the family explanation, which is true on every Tool Grid surface', () => {
+    // The Group tool-sharing grid reads this same config and has no Discoverable,
+    // Display Detail, or Zip columns. Surface-specific column copy therefore belongs to
+    // the surface (NonMcpZipRowsSection appends it), never to the shared row config.
+    expect(SHARED_NON_MCP_TOOL_GRID_CONFIG.fabric_find.infoParagraphs).toEqual(
+      FABRIC_TOOL_GRID_INFO_PARAGRAPHS
+    )
+    expect(SHARED_NON_MCP_TOOL_GRID_CONFIG.artifact_find.infoParagraphs).toEqual(
+      ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS
+    )
+
+    for (const paragraphs of [FABRIC_TOOL_GRID_INFO_PARAGRAPHS, ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS]) {
+      const joined = paragraphs.join(' ')
+      expect(joined).not.toContain('Zip Buffer')
+      expect(joined).not.toContain('Discoverable')
+    }
   })
 
   it('keeps legacy find/use rows out of the visible shared row order', () => {
