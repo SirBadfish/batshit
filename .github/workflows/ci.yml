@@ -1,7 +1,8 @@
 # Batshit CI
 #
 # Honest scope: this runs exactly what the team runs locally — svelte-check, the app
-# vitest suite (default lane: in-memory Redis fake + mocked AI SDKs, no secrets needed),
+# vitest suite split across three parallel shards (default lane: in-memory Redis fake +
+# mocked AI SDKs, no secrets needed),
 # the batshit-server jest suite (self-contained, boots the real server on a loopback
 # port with in-memory storage), a curated real-Redis lane for the FM-critical suites,
 # and the scanner gates (audit / circular imports / branding / $derived).
@@ -9,9 +10,8 @@
 # Live-provider suites (*.live.test.ts) are env-gated (BATSHIT_LIVE_CODEX) and report
 # as skipped here by design. Never set those env vars in CI.
 #
-# Circular-import budget: batshit-app currently has 5 known cycles. The gate fails
-# on new cycles (count > 5); ratchet the budget to 0 when the current cycles are fixed.
-# batshit-server is at 0 and gated hard.
+# Circular-import budget: both batshit-app and batshit-server are at zero and gated
+# hard. Any new cycle fails CI.
 
 name: CI
 
@@ -25,9 +25,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  app:
-    name: App (svelte-check + vitest + madge)
+  app_static:
+    name: App static checks (svelte-check + madge)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: batshit-app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: batshit-app/package-lock.json
+      # npm ci runs postinstall (patch-package) and prepare (svelte-kit sync) — required.
+      - run: npm ci
+      # svelte-check over ~7.4k files exceeds Node's default ~2GB heap on the 7GB
+      # runner; scope the larger heap to this step only (vitest forks must not inherit it).
+      - run: npm run check
+        env:
+          NODE_OPTIONS: --max-old-space-size=5120
+      - name: Circular imports (zero budget)
+        run: |
+          set -o pipefail
+          npx --yes madge@8 --circular --extensions ts --ts-config tsconfig.json src | tee madge-app.txt || true
+          count=$(grep -cE '^[0-9]+\)' madge-app.txt || true)
+          echo "circular chains: ${count} (zero budget)"
+          if [ "${count}" -gt 0 ]; then
+            echo "::error::Circular import introduced in batshit-app (count ${count} > budget 0)"
+            exit 1
+          fi
+
+  app_tests:
+    name: App Vitest shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/3", "2/3", "3/3"]
     defaults:
       run:
         working-directory: batshit-app
@@ -43,24 +78,27 @@ jobs:
       # voice ref-audio normalization shells out to ffmpeg.
       - name: Install runtime test dependencies (zsh, ffmpeg)
         run: sudo apt-get update && sudo apt-get install -y zsh ffmpeg
-      # npm ci runs postinstall (patch-package) and prepare (svelte-kit sync) — required.
       - run: npm ci
-      # svelte-check over ~7.4k files exceeds Node's default ~2GB heap on the 7GB
-      # runner; scope the larger heap to this step only (vitest forks must not inherit it).
-      - run: npm run check
+      - run: npx vitest run --shard=${{ matrix.shard }}
+
+  # Keep the existing required-check name stable for branch protection. This small
+  # fan-in job fails unless the static lane and every Vitest shard passed.
+  app:
+    name: App (svelte-check + vitest + madge)
+    if: ${{ always() }}
+    needs: [app_static, app_tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every app validation lane passed
         env:
-          NODE_OPTIONS: --max-old-space-size=5120
-      - run: npx vitest run
-      - name: Circular imports (budget 5)
+          STATIC_RESULT: ${{ needs.app_static.result }}
+          TEST_RESULT: ${{ needs.app_tests.result }}
         run: |
-          set -o pipefail
-          npx --yes madge@8 --circular --extensions ts --ts-config tsconfig.json src | tee madge-app.txt || true
-          count=$(grep -cE '^[0-9]+\)' madge-app.txt || true)
-          echo "circular chains: ${count} (budget 5; ratchet to 0 when the current cycles are fixed)"
-          if [ "${count}" -gt 5 ]; then
-            echo "::error::New circular import introduced in batshit-app (count ${count} > budget 5)"
+          if [ "${STATIC_RESULT}" != "success" ] || [ "${TEST_RESULT}" != "success" ]; then
+            echo "::error::App validation failed (static=${STATIC_RESULT}, tests=${TEST_RESULT})"
             exit 1
           fi
+          echo "All app validation lanes passed."
 
   app-redis:
     name: App real-Redis lane (FM-critical suites)
