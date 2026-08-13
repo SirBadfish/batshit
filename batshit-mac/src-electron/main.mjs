@@ -33,6 +33,7 @@ import {
   validateDesktopGoonCommandEnvelope
 } from './desktop-goon-contract.mjs';
 import { DesktopGoonWindowController } from './desktop-goon-window-controller.mjs';
+import { resolveMainWindowSizePolicy } from './main-window-policy.mjs';
 
 import {
   SUPERVISOR_COMMANDS,
@@ -351,10 +352,7 @@ function configureRoleNavigation(contents, role) {
 
 function createWindow() {
   const window = new BrowserWindow({
-    width: 1600,
-    height: 1000,
-    minWidth: 1024,
-    minHeight: 720,
+    ...resolveMainWindowSizePolicy(),
     show: false,
     backgroundColor: '#080810',
     title: 'Batshit',

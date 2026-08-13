@@ -17,6 +17,7 @@ const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');
 
 export const ELECTRON_SOURCE_FILES = Object.freeze([
   'main.mjs',
+  'main-window-policy.mjs',
   'preload.cjs',
   'electron-shell-policy.mjs',
   'desktop-controls-contract.mjs',

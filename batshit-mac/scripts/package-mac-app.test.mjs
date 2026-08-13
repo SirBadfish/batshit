@@ -31,9 +31,10 @@ test('unsafe or unknown package arguments fail closed', () => {
   assert.throws(() => parsePackageArgs(['--mystery']), /Unknown Mac package argument/);
 });
 
-test('the immutable Electron staging inventory includes every Desktop Goon module', () => {
+test('the immutable Electron staging inventory includes every required shell module', () => {
   assert.deepEqual(ELECTRON_SOURCE_FILES, [
     'main.mjs',
+    'main-window-policy.mjs',
     'preload.cjs',
     'electron-shell-policy.mjs',
     'desktop-controls-contract.mjs',
