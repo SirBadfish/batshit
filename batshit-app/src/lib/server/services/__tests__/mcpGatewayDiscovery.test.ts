@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  listEnabled: vi.fn(),
+  list: vi.fn(),
   discoverTools: vi.fn(),
   createClient: vi.fn(),
   targetExecute: vi.fn(),
@@ -15,7 +15,9 @@ vi.mock('ai', () => ({
 
 vi.mock('../mcpGatewayService', () => ({
   mcpGatewayService: {
-    listEnabled: mocks.listEnabled
+    // SA-096 P6: discovery reads the full registry and filters enabled itself,
+    // so it can tell a disabled gateway apart from one that no longer exists.
+    list: mocks.list
   }
 }))
 
@@ -95,7 +97,7 @@ describe('MCPGatewayDiscovery', () => {
       stderrChunks: [],
       toolCallTimeoutMs: 1000
     })
-    mocks.listEnabled.mockResolvedValue([
+    mocks.list.mockResolvedValue([
       {
         id: 'gw-stdio',
         name: 'Filesystem',
@@ -141,5 +143,63 @@ describe('MCPGatewayDiscovery', () => {
     expect(mocks.targetExecute).toHaveBeenCalledWith({
       path: '/Users/example/batshit/README.md'
     })
+  })
+
+  // SA-096 P6 moved the enabled filter from mcpGatewayService.listEnabled into
+  // loadToolsForUser. These pin that the move changed nothing observable.
+  it('still ignores a selected gateway that is registered but disabled', async () => {
+    mocks.list.mockResolvedValue([
+      {
+        id: 'gw-stdio',
+        name: 'Filesystem',
+        type: 'stdio',
+        enabled: false,
+        stdioConfig: { command: 'node', cwdPolicy: 'project' },
+        created_at: new Date().toISOString()
+      }
+    ])
+
+    const { mcpGatewayDiscovery } = await import('../mcpGatewayDiscovery')
+    const result = await mcpGatewayDiscovery.loadToolsForUser('josh', ['gw-stdio'], undefined, {
+      skipFiltering: true
+    })
+
+    expect(mocks.discoverTools).not.toHaveBeenCalled()
+    expect(result.tools).toEqual({})
+  })
+
+  it('warns when a selected gateway ID is not in the registry at all', async () => {
+    const { logger } = await import('$lib/utils/logger')
+    const { mcpGatewayDiscovery } = await import('../mcpGatewayDiscovery')
+
+    await mcpGatewayDiscovery.loadToolsForUser('josh', ['gw-stdio', 'gw-orphan'], undefined, {
+      skipFiltering: true
+    })
+
+    const warned = (logger.warn as any).mock.calls.some((call: unknown[]) =>
+      call.some((arg) => typeof arg === 'string' && arg.includes('gw-orphan'))
+    )
+    expect(warned).toBe(true)
+  })
+
+  it('does not warn when every selected gateway is registered but disabled', async () => {
+    const { logger } = await import('$lib/utils/logger')
+    mocks.list.mockResolvedValue([
+      {
+        id: 'gw-stdio',
+        name: 'Filesystem',
+        type: 'stdio',
+        enabled: false,
+        stdioConfig: { command: 'node', cwdPolicy: 'project' },
+        created_at: new Date().toISOString()
+      }
+    ])
+
+    const { mcpGatewayDiscovery } = await import('../mcpGatewayDiscovery')
+    await mcpGatewayDiscovery.loadToolsForUser('josh', ['gw-stdio'], undefined, {
+      skipFiltering: true
+    })
+
+    expect(logger.warn as any).not.toHaveBeenCalled()
   })
 })

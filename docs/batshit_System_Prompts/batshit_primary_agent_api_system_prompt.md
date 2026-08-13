@@ -30,9 +30,6 @@ If the user asks to add or edit a CLI tool, tell them to open **Settings -> Tool
 
 The current user message may include a `==== DYNAMIC INFO ====` block. It is ephemeral (not stored) and contains live session context (agent_id, subagents, project_path, file_refs, zip state, etc).
 
-If DCM includes `native_bash: ...`, treat it as the authoritative runtime bash policy for this chat. The user can change these settings at any time.
-If any tool result says `success:false`, `blocked:true`, or `POLICY_BLOCKED`, the requested action did not happen. Say that it was not applied/executed, include the blocker reason, and do not describe it as completed. If an edit is blocked, provide the patch or handoff for the external coding workspace when useful.
-
 ---
 
 ## Clips

@@ -17,6 +17,37 @@ import {
 } from './dynamicMcpSchema'
 import { shouldHideInternalMcpTool } from './nativeToolConstants'
 import { listCliTools, resolveCliToolSelectionScope } from './cliToolRegistry'
+import type { ControlRuntimeMode } from './fabricControlModes'
+import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
+import {
+  buildCompositeKey,
+  mapGroupModeToVisibility,
+  resolveAgentDcmDisplaySettings,
+  resolveEffectiveGroupMode,
+  resolveEffectiveToolVisibility,
+  resolveGatewayDisplayDefaults,
+  resolveMcpToolDcmVisibility,
+  isExplicitAgentToolListMode,
+  type DcmGroupVisibility,
+  type DcmToolVisibility
+} from './dynamicMcpVisibility'
+import {
+  BROKER_ARTIFACT_ALLOWED_CONTROL_IDS,
+  isControlIdAllowedByList,
+  resolveBrokerFabricAllowedControlIds,
+  resolveBrokerFamilies,
+  resolveBrokerToolToggles,
+  type BrokerRuntime,
+  type BrokerToolToggles
+} from '$lib/utils/brokerAvailability'
+import {
+  ARTIFACT_TOOL_GRID_GROUP_NAME,
+  ARTIFACT_TOOL_GRID_ID,
+  FABRIC_TOOL_GRID_GROUP_NAME,
+  FABRIC_TOOL_GRID_ID,
+  normalizeArtifactToolGridSettings,
+  normalizeFabricToolGridSettings
+} from '$lib/utils/toolGridBrokerFamilies'
 import {
   CLI_TOOL_GRID_GROUP_NAME,
   CLI_TOOL_GRID_ID,
@@ -38,8 +69,20 @@ export {
   normalizeGatewayDcmDisplaySettings
 }
 
-export type DcmGroupVisibility = 'hidden' | 'group-only' | 'group+tools'
-export type DcmToolVisibility = 'hidden' | 'name-only' | 'name+hint'
+// SA-096: visibility resolution moved to `dynamicMcpVisibility` to break the
+// dynamicMcpTools -> dynamicMcpIndex -> fabricRegistry -> dynamicMcpTools cycle.
+// Re-exported so existing import paths keep working.
+export {
+  buildCompositeKey,
+  mapGroupModeToVisibility,
+  resolveAgentDcmDisplaySettings,
+  resolveEffectiveGroupMode,
+  resolveEffectiveToolVisibility,
+  resolveGatewayDisplayDefaults,
+  resolveMcpToolDcmVisibility
+}
+export type { DcmGroupVisibility, DcmToolVisibility }
+
 
 export interface DynamicMcpIndexTool {
   name: string
@@ -52,6 +95,8 @@ export interface DynamicMcpIndexGroup {
   toolCount: number
   visibility: DcmGroupVisibility
   tools?: DynamicMcpIndexTool[]
+  /** Rendered once under the group. Used for family-level rules that are not per-tool. */
+  note?: string | null
 }
 
 export interface DynamicMcpIndexResult {
@@ -85,6 +130,24 @@ interface DynamicMcpIndexOptions {
   isCodexMode?: boolean
   includeEnabledTools?: boolean
   toolNameThreshold?: number
+  /**
+   * Which runtime's broker registration rules decide which families are reachable.
+   * SA-096 P4: `api` and `n8n` open Fabric on fetch-zip, `cli` does not — the index must
+   * not advertise a family the broker would refuse for this lane.
+   */
+  runtime?: BrokerRuntime | null
+  /** Explicit broker toggles. When omitted they are read from the agent record. */
+  brokerToggles?: BrokerToolToggles | null
+  /**
+   * Actor id used for Fabric/Artifact control visibility only. The subagent lane resolves
+   * MCP selections from an explicit gateway/tool scope rather than from `agentId`, but its
+   * controls still have to be filtered by the subagent's own allowlists.
+   */
+  controlAgentId?: string | null
+  /** Raw `provider_specific_settings`, used when the caller already has the record. */
+  providerSettings?: unknown
+  allowArtifactRuntimeTools?: boolean
+  allowFabricControlTools?: boolean
 }
 
 interface WorkingGroup extends DynamicMcpIndexGroup {
@@ -95,171 +158,40 @@ interface WorkingGroup extends DynamicMcpIndexGroup {
 }
 
 const UNGROUPED_GROUP = 'Ungrouped Tools'
-const UNKNOWN_GATEWAY = 'unknown_gateway'
+// Exported so `mcpGatewayReferenceCleanup` can pin its reserved-ID list against
+// the real placeholder instead of a copied literal (SA-096 P6).
+export const UNKNOWN_GATEWAY = 'unknown_gateway'
 const UNKNOWN_GATEWAY_LABEL = 'Unknown Gateway'
 const DEFAULT_TOOL_NAME_THRESHOLD = 6
 const MIN_TOOL_NAME_THRESHOLD = 1
 const MAX_TOOL_NAME_THRESHOLD = 100
 const REQUIRED_DYNAMIC_TOOLS = ['batshit_server_dynamic_mcp_find', 'batshit_server_dynamic_mcp_use']
 
-export function buildCompositeKey(left: string, right: string): string {
-  return `${left}::${right}`
+
+/**
+ * `fabricRegistry` is loaded on demand rather than imported at module scope.
+ *
+ * SA-096 P4 added this module's dependency on the Fabric registry so the capability
+ * index could report a truthful Fabric count. That closed a cycle:
+ * `dynamicMcpTools` -> `dynamicMcpIndex` -> `fabricRegistry` -> `dynamicMcpTools`,
+ * because the registry's `sys.mcp.dynamic.*` controls delegate to the shared Dynamic
+ * MCP executor by design (see `fabric-registry.md`). CI enforces a zero circular-import
+ * budget, and `npm run check` cannot see cycles, so this is the guard that matters.
+ *
+ * The dependency is genuinely lazy — `listVisibleControls` is only ever called from
+ * inside an async index build, never at module init — so deferring it removes the cycle
+ * without weakening the delegation the registry contract requires. Node caches the
+ * module after the first call. Extracting `listVisibleControls` into a leaf module was
+ * rejected: it resolves through the registry's full control store, so the extraction
+ * would mean refactoring an FM-listed 6k-line module to fix an import edge.
+ *
+ * Keep this lazy. A static import here fails the `Circular imports (zero budget)` CI job.
+ */
+async function loadListVisibleControls() {
+  const { listVisibleControls } = await import('./fabricRegistry')
+  return listVisibleControls
 }
 
-export function mapGroupModeToVisibility(mode: DcmGroupDisplayMode): DcmGroupVisibility {
-  if (mode === 'hidden') return 'hidden'
-  if (mode === 'group-only') return 'group-only'
-  return 'group+tools'
-}
-
-function mapGroupModeToDefaultToolVisibility(mode: DcmGroupDisplayMode): DcmToolVisibility {
-  return mode === 'group+tools+names' ? 'name-only' : 'name+hint'
-}
-
-function mapToolModeToVisibility(mode: DcmToolDisplayMode): DcmToolVisibility {
-  if (mode === 'name-only') return 'name-only'
-  if (mode === 'hidden') return 'hidden'
-  return 'name+hint'
-}
-
-function isExplicitAgentToolListMode(mode: AgentDcmGroupDisplayMode | undefined): boolean {
-  return mode === 'group+tools+hints' || mode === 'group+tools+names'
-}
-
-export function resolveEffectiveGroupMode(options: {
-  agentSettings: AgentDcmDisplaySettings
-  gatewayDefaults: GatewayDcmDisplaySettings
-  gatewayId: string
-  groupName: string
-}): DcmGroupDisplayMode {
-  const { agentSettings, gatewayDefaults, gatewayId, groupName } = options
-  const agentMode = agentSettings.groups[buildCompositeKey(gatewayId, groupName)]
-  if (agentMode && agentMode !== 'use-global') {
-    return normalizeLegacyGroupMode(agentMode) ?? 'group+tools+hints'
-  }
-
-  const gatewayMode = gatewayDefaults.groups[groupName]
-  return normalizeLegacyGroupMode(gatewayMode) ?? 'group+tools+hints'
-}
-
-export function resolveEffectiveToolVisibility(options: {
-  agentSettings: AgentDcmDisplaySettings
-  gatewayDefaults: GatewayDcmDisplaySettings
-  gatewayId: string
-  toolNameVariants: string[]
-  groupMode: DcmGroupDisplayMode
-  agentGroupMode: AgentDcmGroupDisplayMode | undefined
-}): DcmToolVisibility {
-  const { agentSettings, gatewayDefaults, gatewayId, toolNameVariants, groupMode, agentGroupMode } =
-    options
-
-  const keys = toolNameVariants
-    .map((name) => name.trim())
-    .filter((name) => name.length > 0)
-
-  let agentToolMode: DcmToolDisplayMode | null = null
-  for (const name of keys) {
-    const value = agentSettings.tools[buildCompositeKey(gatewayId, name)]
-    const normalized = normalizeLegacyToolMode(value)
-    if (normalized) {
-      agentToolMode = normalized
-      break
-    }
-  }
-
-  if (agentToolMode && agentToolMode !== 'inherit') {
-    return mapToolModeToVisibility(agentToolMode)
-  }
-
-  const agentGroupOverride = Boolean(agentGroupMode && agentGroupMode !== 'use-global')
-  if (agentGroupOverride) {
-    return mapGroupModeToDefaultToolVisibility(groupMode)
-  }
-
-  let gatewayToolMode: DcmToolDisplayMode | null = null
-  for (const name of keys) {
-    const value = gatewayDefaults.tools[name]
-    const normalized = normalizeLegacyToolMode(value)
-    if (normalized) {
-      gatewayToolMode = normalized
-      break
-    }
-  }
-
-  if (gatewayToolMode && gatewayToolMode !== 'inherit') {
-    return mapToolModeToVisibility(gatewayToolMode)
-  }
-
-  return mapGroupModeToDefaultToolVisibility(groupMode)
-}
-
-export function resolveMcpToolDcmVisibility(options: {
-  agentSettings: AgentDcmDisplaySettings
-  gatewayDefaults: GatewayDcmDisplaySettings
-  gatewayId: string
-  groupName: string
-  toolNameVariants: string[]
-}): {
-  agentGroupMode: AgentDcmGroupDisplayMode | undefined
-  effectiveGroupMode: DcmGroupDisplayMode
-  groupVisibility: DcmGroupVisibility
-  toolVisibility: DcmToolVisibility | null
-  isGroupVisible: boolean
-  isToolVisibleInDcm: boolean
-  isToolDiscoverable: boolean
-} {
-  const agentGroupMode = options.agentSettings.groups[buildCompositeKey(options.gatewayId, options.groupName)]
-  const effectiveGroupMode = resolveEffectiveGroupMode({
-    agentSettings: options.agentSettings,
-    gatewayDefaults: options.gatewayDefaults,
-    gatewayId: options.gatewayId,
-    groupName: options.groupName
-  })
-  const groupVisibility = mapGroupModeToVisibility(effectiveGroupMode)
-
-  if (groupVisibility === 'hidden') {
-    return {
-      agentGroupMode,
-      effectiveGroupMode,
-      groupVisibility,
-      toolVisibility: null,
-      isGroupVisible: false,
-      isToolVisibleInDcm: false,
-      isToolDiscoverable: false
-    }
-  }
-
-  if (groupVisibility === 'group-only') {
-    return {
-      agentGroupMode,
-      effectiveGroupMode,
-      groupVisibility,
-      toolVisibility: null,
-      isGroupVisible: true,
-      isToolVisibleInDcm: false,
-      isToolDiscoverable: true
-    }
-  }
-
-  const toolVisibility = resolveEffectiveToolVisibility({
-    agentSettings: options.agentSettings,
-    gatewayDefaults: options.gatewayDefaults,
-    gatewayId: options.gatewayId,
-    toolNameVariants: options.toolNameVariants,
-    groupMode: effectiveGroupMode,
-    agentGroupMode
-  })
-
-  return {
-    agentGroupMode,
-    effectiveGroupMode,
-    groupVisibility,
-    toolVisibility,
-    isGroupVisible: true,
-    isToolVisibleInDcm: toolVisibility !== 'hidden',
-    isToolDiscoverable: toolVisibility !== 'hidden'
-  }
-}
 
 function hasRequiredDynamicTools(enabledNames: Set<string>): boolean {
   const normalized = new Set([...enabledNames].map((name) => name.toLowerCase()))
@@ -309,10 +241,13 @@ function formatGroupLine(name: string, count: number): string {
   return `- ${name} (${count} ${label})`
 }
 
+/**
+ * SA-096 P4: returns an empty string rather than a bare `tool_discovery` header when no
+ * family has anything to show. The orphaned header — a heading with nothing under it —
+ * is the defect that opened this story.
+ */
 function buildDcmText(groups: DynamicMcpIndexGroup[]): string {
-  const lines: string[] = []
-  lines.push('tool_discovery')
-  lines.push('(current discoverable tools and hints for this agent)')
+  const body: string[] = []
 
   for (const group of groups) {
     if (group.visibility === 'hidden') continue
@@ -323,20 +258,28 @@ function buildDcmText(groups: DynamicMcpIndexGroup[]): string {
       Array.isArray(group.tools) &&
       group.tools.length > 0
     ) {
-      lines.push(`${formatGroupLine(group.name, group.toolCount)}:`)
+      body.push(`${formatGroupLine(group.name, group.toolCount)}:`)
       for (const tool of group.tools) {
         const hint =
           tool.visibility === 'name+hint' && tool.schemaHint
             ? ` — ${tool.schemaHint}`
             : ''
-        lines.push(`  - ${tool.name}${hint}`)
+        body.push(`  - ${tool.name}${hint}`)
       }
     } else {
-      lines.push(formatGroupLine(group.name, group.toolCount))
+      body.push(formatGroupLine(group.name, group.toolCount))
+    }
+
+    if (group.note) {
+      body.push(`  ${group.note}`)
     }
   }
 
-  return lines.join('\n')
+  if (body.length === 0) return ''
+
+  return ['tool_discovery', '(current discoverable tools and hints for this agent)', ...body].join(
+    '\n'
+  )
 }
 
 function buildCliFieldSummary(inputSchema: Record<string, any> | undefined): string {
@@ -365,6 +308,86 @@ function buildCliFieldSummary(inputSchema: Record<string, any> | undefined): str
       return required.has(fieldName) ? `${fieldName}:${type}*` : `${fieldName}:${type}`
     })
     .join(', ')
+}
+
+function truncateHint(value: string, maxChars: number): string {
+  const trimmed = value.trim()
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return trimmed
+  if (trimmed.length <= maxChars) return trimmed
+  return `${trimmed.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+}
+
+interface BrokerFamilyEntry {
+  name: string
+  hint: string | null
+}
+
+/**
+ * Applies the Tool Grid contract to one synthetic-gateway family (Fabric or Artifact).
+ *
+ * SA-096 P3/P4: this is the same resolution the CLI Tools row already uses — agent
+ * override, then the family's global defaults, then the group mode's implied tool
+ * visibility. Nothing family-specific happens here, which is the point: Fabric and
+ * Artifact are configured with exactly the vocabulary MCP and CLI already use.
+ */
+function buildBrokerFamilyGroup(input: {
+  gatewayId: string
+  groupName: string
+  gatewayDefaults: GatewayDcmDisplaySettings
+  agentSettings: AgentDcmDisplaySettings
+  entries: BrokerFamilyEntry[]
+  note?: string | null
+}): WorkingGroup | null {
+  if (input.entries.length === 0) return null
+
+  const agentGroupMode = input.agentSettings.groups[buildCompositeKey(input.gatewayId, input.groupName)]
+  const effectiveGroupMode = resolveEffectiveGroupMode({
+    agentSettings: input.agentSettings,
+    gatewayDefaults: input.gatewayDefaults,
+    gatewayId: input.gatewayId,
+    groupName: input.groupName
+  })
+  const groupVisibility = mapGroupModeToVisibility(effectiveGroupMode)
+  if (groupVisibility === 'hidden') return null
+
+  const group: WorkingGroup = {
+    gatewayId: input.gatewayId,
+    gatewayName: input.groupName,
+    baseName: input.groupName,
+    name: input.groupName,
+    toolCount: 0,
+    visibility: groupVisibility,
+    tools: groupVisibility === 'group-only' ? undefined : [],
+    forceToolList: isExplicitAgentToolListMode(agentGroupMode),
+    note: input.note ?? null
+  }
+
+  for (const entry of input.entries) {
+    const toolVisibility = resolveEffectiveToolVisibility({
+      agentSettings: input.agentSettings,
+      gatewayDefaults: input.gatewayDefaults,
+      gatewayId: input.gatewayId,
+      toolNameVariants: [entry.name],
+      groupMode: effectiveGroupMode,
+      agentGroupMode
+    })
+
+    if (toolVisibility === 'hidden') continue
+
+    group.toolCount += 1
+
+    if (groupVisibility === 'group+tools') {
+      group.tools = group.tools || []
+      group.tools.push({
+        name: entry.name,
+        visibility: toolVisibility,
+        schemaHint: toolVisibility === 'name+hint' ? entry.hint ?? null : null
+      })
+    }
+  }
+
+  if (group.toolCount === 0) return null
+  return group
 }
 
 function buildCliToolHint(record: Record<string, any>): string {
@@ -419,57 +442,30 @@ async function resolveEnabledTools(
   }
 }
 
-export async function resolveAgentDcmDisplaySettings(options: {
-  agentId?: string | null
-  dcmDisplaySettings?: AgentDcmDisplaySettings | null
-}): Promise<AgentDcmDisplaySettings> {
-  if (options.dcmDisplaySettings) {
-    return normalizeDcmDisplaySettings(options.dcmDisplaySettings)
+async function resolveIndexBrokerToggles(
+  options: DynamicMcpIndexOptions
+): Promise<BrokerToolToggles> {
+  if (options.brokerToggles) {
+    return { ...options.brokerToggles }
+  }
+
+  if (options.providerSettings !== undefined) {
+    return resolveBrokerToolToggles(options.providerSettings)
   }
 
   const agentId = options.agentId?.trim()
   if (!agentId) {
-    return createDefaultDcmDisplaySettings()
+    return resolveBrokerToolToggles(null)
   }
 
   try {
     const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
-    return normalizeDcmDisplaySettings(
-      agent?.dcmDisplaySettings ?? agent?.dcm_display_settings ?? null
+    return resolveBrokerToolToggles(
+      agent?.provider_specific_settings ?? agent?.providerSpecificSettings ?? null
     )
   } catch (error) {
-    console.warn('[Dynamic MCP DCM] Failed to resolve agent DCM display settings:', error)
-    return createDefaultDcmDisplaySettings()
-  }
-}
-
-export async function resolveGatewayDisplayDefaults(
-  userId: string
-): Promise<Map<string, GatewayDcmDisplaySettings>> {
-  try {
-    const gateways = await redis.execute(async (client) => {
-      const data = await client.json.get(`mcp_gateways:${userId}`)
-      const value = Array.isArray(data) ? data[0] : data
-      const registry = (value || {}) as { gateways?: Array<Record<string, unknown>> }
-      return Array.isArray(registry.gateways) ? registry.gateways : []
-    })
-
-    const map = new Map<string, GatewayDcmDisplaySettings>()
-    for (const gateway of gateways) {
-      const id = typeof gateway?.id === 'string' ? gateway.id : ''
-      if (!id) continue
-      map.set(
-        id,
-        normalizeGatewayDcmDisplaySettings(
-          (gateway as Record<string, unknown>).dcmDisplayDefaults
-        )
-      )
-    }
-
-    return map
-  } catch (error) {
-    console.warn('[Dynamic MCP DCM] Failed to resolve gateway defaults:', error)
-    return new Map<string, GatewayDcmDisplaySettings>()
+    console.warn('[Dynamic MCP DCM] Failed to resolve broker toggles:', error)
+    return resolveBrokerToolToggles(null)
   }
 }
 
@@ -498,6 +494,12 @@ export async function buildDynamicMcpIndex(
   const cliToolGridSettings = normalizeCliToolGridSettings(
     userSettings?.global_tool_grid_settings?.cli ?? null
   )
+  const fabricToolGridSettings = normalizeFabricToolGridSettings(
+    userSettings?.global_tool_grid_settings?.fabric ?? null
+  )
+  const artifactToolGridSettings = normalizeArtifactToolGridSettings(
+    userSettings?.global_tool_grid_settings?.artifact ?? null
+  )
   const adminToolNameThreshold = normalizeToolNameThreshold(
     admin.dcm_tool_name_threshold,
     DEFAULT_TOOL_NAME_THRESHOLD
@@ -525,7 +527,28 @@ export async function buildDynamicMcpIndex(
         .filter((record) => selectedCliToolIds.has(record.toolId))
     : []
 
-  if (!dynamicMcpEnabled && cliTools.length === 0) {
+  // SA-096 P4: Fabric and Artifact are broker families with no gateway and no CLI record,
+  // so their reachability comes from the same shared rules tool registration uses. The
+  // index must never claim a family the broker would refuse on this runtime.
+  const controlAgentId = (options.controlAgentId ?? options.agentId) ?? null
+  const brokerToggles = await resolveIndexBrokerToggles(options)
+  brokerToggles.dynamicMcpEnabled = dynamicMcpEnabled
+  brokerToggles.cliToolsEnabled = cliToolsEnabled
+  const brokerRuntime: BrokerRuntime =
+    options.runtime ?? (options.isCodexMode === true ? 'cli' : 'api')
+  const controlRuntimeMode: ControlRuntimeMode = brokerRuntime === 'cli' ? 'mode4' : 'mode3'
+  const allowFabricControlTools = options.allowFabricControlTools !== false
+  const brokerFamilies = resolveBrokerFamilies({
+    runtime: brokerRuntime,
+    toggles: brokerToggles,
+    hasCliTools: selectedCliToolIds.size > 0,
+    allowArtifactRuntimeTools: options.allowArtifactRuntimeTools,
+    allowFabricControlTools: options.allowFabricControlTools
+  })
+  const fabricReachable = brokerFamilies.includes('fabric')
+  const artifactReachable = brokerFamilies.includes('artifact')
+
+  if (!dynamicMcpEnabled && cliTools.length === 0 && !fabricReachable && !artifactReachable) {
     let enabledTokens = 0
     let enabledToolCount = 0
 
@@ -718,6 +741,112 @@ export async function buildDynamicMcpIndex(
     }
   }
 
+  // SA-096 P4: Fabric controls. `listVisibleControls` applies the same per-agent and
+  // per-runtime visibility filter the broker's own search applies, and the allowlist is
+  // the one tool registration builds, so the count here is the count the agent can reach.
+  const fabricAllowedControlIds = fabricReachable
+    ? resolveBrokerFabricAllowedControlIds({
+        toggles: brokerToggles,
+        allowFabricControlTools: options.allowFabricControlTools
+      })
+    : []
+  const fabricControls = fabricReachable
+    ? await (await loadListVisibleControls())({
+        userId,
+        agentId: controlAgentId,
+        runtimeMode: controlRuntimeMode,
+        allowedControlIds: fabricAllowedControlIds
+      })
+    : []
+
+  if (fabricReachable) {
+    const nativeHelperIds = new Set(
+      NATIVE_FABRIC_HELPER_CONTROL_META.map((meta) => meta.controlId)
+    )
+    const entries: BrokerFamilyEntry[] = [
+      ...NATIVE_FABRIC_HELPER_CONTROL_META.filter((meta) =>
+        isControlIdAllowedByList(meta.controlId, fabricAllowedControlIds)
+      ).map((meta) => ({
+        name: meta.controlId,
+        hint: truncateHint(
+          [meta.title, meta.schemaHint].filter(Boolean).join(' — '),
+          schemaHintCaps.maxChars
+        )
+      })),
+      ...fabricControls
+        .filter((control) => !nativeHelperIds.has(control.controlId))
+        .map((control) => ({
+          name: control.controlId,
+          hint: truncateHint(
+            [control.title, control.schemaHint].filter(Boolean).join(' — '),
+            schemaHintCaps.maxChars
+          )
+        }))
+    ].sort((left, right) => left.name.localeCompare(right.name))
+
+    availableToolCount += entries.length
+    const fabricGroup = buildBrokerFamilyGroup({
+      gatewayId: FABRIC_TOOL_GRID_ID,
+      groupName: FABRIC_TOOL_GRID_GROUP_NAME,
+      gatewayDefaults: fabricToolGridSettings.dcmDisplayDefaults,
+      agentSettings: dcmDisplaySettings,
+      entries
+    })
+    if (fabricGroup) {
+      dcmToolCount += fabricGroup.toolCount
+      groups.set(buildCompositeKey(FABRIC_TOOL_GRID_ID, FABRIC_TOOL_GRID_GROUP_NAME), fabricGroup)
+    }
+  }
+
+  // SA-096 P4: published agent-usable artifacts. Only the `use.artifact.{slug}` aliases are
+  // agent-runnable; the per-artifact `artifact.<id>.*` config controls belong to the Fabric
+  // family, so they are reported here as a count and only when Fabric is actually reachable.
+  if (artifactReachable) {
+    const artifactControls = await (await loadListVisibleControls())({
+      userId,
+      agentId: controlAgentId,
+      runtimeMode: controlRuntimeMode,
+      allowedControlIds: Array.from(BROKER_ARTIFACT_ALLOWED_CONTROL_IDS)
+    })
+
+    const configCounts = new Map<string, number>()
+    for (const control of fabricControls) {
+      if (!control.controlId.startsWith('artifact.')) continue
+      if (control.controlId.endsWith('.typed.invoke')) continue
+      if (!control.artifactId) continue
+      configCounts.set(control.artifactId, (configCounts.get(control.artifactId) ?? 0) + 1)
+    }
+
+    const entries: BrokerFamilyEntry[] = artifactControls.map((control) => {
+      const fields = control.schemaHint?.trim()
+      const configCount = control.artifactId ? configCounts.get(control.artifactId) : undefined
+      const parts: string[] = []
+      if (fields) parts.push(`fields: ${fields}`)
+      if (typeof configCount === 'number') parts.push(`${configCount} config controls`)
+      return {
+        name: control.controlId,
+        hint: parts.length > 0 ? truncateHint(parts.join(' | '), schemaHintCaps.maxChars) : null
+      }
+    })
+
+    availableToolCount += entries.length
+    const artifactGroup = buildBrokerFamilyGroup({
+      gatewayId: ARTIFACT_TOOL_GRID_ID,
+      groupName: ARTIFACT_TOOL_GRID_GROUP_NAME,
+      gatewayDefaults: artifactToolGridSettings.dcmDisplayDefaults,
+      agentSettings: dcmDisplaySettings,
+      entries,
+      note: 'artifact_hint: run these with the exact artifact:use.artifact.{slug} ref and structured field input. User-only panel artifacts such as Gradio/HuggingFace embeds and ComfyUI panel artifacts are not agent-runnable; tell the user instead of changing an artifact brain type or power source.'
+    })
+    if (artifactGroup) {
+      dcmToolCount += artifactGroup.toolCount
+      groups.set(
+        buildCompositeKey(ARTIFACT_TOOL_GRID_ID, ARTIFACT_TOOL_GRID_GROUP_NAME),
+        artifactGroup
+      )
+    }
+  }
+
   const workingGroups = Array.from(groups.values())
   applyDuplicateGroupDisambiguation(workingGroups)
 
@@ -728,6 +857,7 @@ export async function buildDynamicMcpIndex(
       toolCount: group.toolCount,
       visibility: group.visibility,
       tools: group.tools,
+      note: group.note ?? null,
       forceToolList: group.forceToolList
     }))
 

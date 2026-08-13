@@ -19,7 +19,12 @@ import { redis } from '$lib/server/redis'
 import { cloneIconRef, isIconRef } from '$lib/icons/iconTypes'
 import type { MCPGateway, MCPGatewayRegistry, MCPToolGrouping } from '$lib/types/database'
 import type { RedisJSON } from '@redis/json'
+import { logger } from '$lib/utils/logger'
 import { getBlockedBatshitServerGatewayReason, isBlockedBatshitServerGatewayUrl } from './mcpGatewayPolicy'
+import {
+  resolveOrphanToolNames,
+  sweepGatewayReferencesForUser
+} from './mcpGatewayReferenceCleanup'
 import {
   sanitizeStdioGatewayConfig,
   validateStdioGatewayConfig
@@ -417,20 +422,24 @@ export class MCPGatewayService {
    *
    * ✅ CORRECT Redis 8 Pattern:
    * - Retrieve, filter, store - all with json operations
+   *
+   * SA-096 DL-8: a delete also sweeps every agent and subagent reference to the
+   * gateway, so no record is left pointing at an ID that resolves to nothing.
    */
   async delete(userId: string, gatewayId: string): Promise<void> {
     const key = this.getKey(userId)
 
-    await redis.execute(async (client) => {
+    const removal = await redis.execute(async (client) => {
       // Get existing registry (already parsed!)
       const registry = await client.json.get(key) as MCPGatewayRegistry | null
 
       if (!registry) {
-        return // Nothing to delete
+        return null // Nothing to delete
       }
 
       // Filter out the gateway
       const originalLength = registry.gateways.length
+      const removedGateway = registry.gateways.find((g: MCPGateway) => g.id === gatewayId) ?? null
       registry.gateways = registry.gateways.filter((g: MCPGateway) => g.id !== gatewayId)
 
       if (registry.gateways.length === originalLength) {
@@ -439,7 +448,29 @@ export class MCPGatewayService {
 
       // Store updated registry (NO JSON.stringify!)
       await client.json.set(key, '$', registry as unknown as RedisJSON)
+
+      return { removedGateway, survivingGateways: registry.gateways }
     })
+
+    if (!removal) return
+
+    // Reference sweep runs after the registry write so it compares against the
+    // post-delete live set. A sweep failure must not leave the caller believing
+    // the gateway is still present.
+    try {
+      await sweepGatewayReferencesForUser({
+        userId,
+        orphanToolNames: resolveOrphanToolNames(
+          removal.removedGateway,
+          removal.survivingGateways
+        )
+      })
+    } catch (error) {
+      logger.error(
+        `[MCP Gateway] Deleted gateway ${gatewayId} but failed to sweep references:`,
+        error
+      )
+    }
   }
 
   /**

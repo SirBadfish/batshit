@@ -7983,6 +7983,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                   getNativeToolToggle("dynamicMcpEnabled", true)
                 }
                 nativeCliToolsEnabled={getNativeToolToggle("cliToolsEnabled", true)}
+                nativeToolSettings={getNativeToolsSettings("agent")}
                 isCodexMode={isCliProvider}
                 onGatewaysChange={handleMcpGatewaysChange}
                 onDcmDisplaySettingsChange={handleMcpDcmDisplaySettingsChange}
@@ -12387,6 +12388,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     getNativeToolToggle("dynamicMcpEnabled", true, "subagent")
                   }
                   nativeCliToolsEnabled={getNativeToolToggle("cliToolsEnabled", true, "subagent")}
+                  nativeToolSettings={getNativeToolsSettings("subagent")}
                   isCodexMode={isCodexCliSubagentProvider}
                   onGatewaysChange={handleSubagentMcpGatewaysChange}
                   onDcmDisplaySettingsChange={handleSubagentMcpDcmDisplaySettingsChange}

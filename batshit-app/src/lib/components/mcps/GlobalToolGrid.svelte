@@ -58,6 +58,20 @@
 	    normalizeCliToolGridSettings
 	  } from '$lib/utils/toolGridCli'
 	  import {
+	    ARTIFACT_TOOL_GRID_GROUP_NAME,
+	    ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS,
+	    createDefaultArtifactToolGridSettings,
+	    createDefaultFabricToolGridSettings,
+	    FABRIC_TOOL_GRID_GROUP_NAME,
+	    FABRIC_TOOL_GRID_INFO_PARAGRAPHS,
+	    normalizeArtifactToolGridSettings,
+	    normalizeFabricToolGridSettings,
+	    TOOL_GRID_ARTIFACT_ICON_REF,
+	    TOOL_GRID_FABRIC_ICON_REF,
+	    type BrokerFamilyToolGridKey
+	  } from '$lib/utils/toolGridBrokerFamilies'
+	  import type { BrokerFamilyRowControls } from '$lib/components/tools/brokerFamilyRowControls'
+	  import {
 	    createDefaultGatewayDcmDisplaySettings,
 	    normalizeGatewayDcmDisplaySettings,
 	    normalizeLegacyDcmGroupMode as normalizeLegacyGroupMode,
@@ -236,6 +250,8 @@
 
   let globalZipSettingsRaw = $state<GlobalZipSettings>({})
   let globalCliToolGridSettings = $state(createDefaultCliToolGridSettings())
+  let globalFabricToolGridSettings = $state(createDefaultFabricToolGridSettings())
+  let globalArtifactToolGridSettings = $state(createDefaultArtifactToolGridSettings())
   let customToolSettings = $state<CustomToolSetting[]>([])
   let bulkZipDrafts = $state<Record<string, BulkZipDraft>>({})
   let zipAgentControlEnabled = $state(false)
@@ -341,6 +357,12 @@
       const globalToolGridSettings = normalizeCliToolGridSettings(
         settings?.global_tool_grid_settings?.cli ?? null
       )
+      const nextFabricToolGridSettings = normalizeFabricToolGridSettings(
+        settings?.global_tool_grid_settings?.fabric ?? null
+      )
+      const nextArtifactToolGridSettings = normalizeArtifactToolGridSettings(
+        settings?.global_tool_grid_settings?.artifact ?? null
+      )
       const custom = normalizeCustomToolSettings(global.custom_tool_settings)
       const legacyPermission =
         global.zip_control_mode === 'agent'
@@ -351,6 +373,8 @@
 
       globalZipSettingsRaw = global
       globalCliToolGridSettings = globalToolGridSettings
+      globalFabricToolGridSettings = nextFabricToolGridSettings
+      globalArtifactToolGridSettings = nextArtifactToolGridSettings
       customToolSettings = custom
       zipAgentControlEnabled =
         typeof global.zip_agent_control_enabled === 'boolean'
@@ -573,7 +597,11 @@
 
   async function saveUserToolGridDefaults(
     nextGlobalZipSettings: GlobalZipSettings,
-    nextCliToolGridSettings: ReturnType<typeof createDefaultCliToolGridSettings>
+    nextCliToolGridSettings: ReturnType<typeof createDefaultCliToolGridSettings>,
+    nextFabricToolGridSettings: ReturnType<typeof createDefaultFabricToolGridSettings> =
+      globalFabricToolGridSettings,
+    nextArtifactToolGridSettings: ReturnType<typeof createDefaultArtifactToolGridSettings> =
+      globalArtifactToolGridSettings
   ): Promise<UserSettingsRow | null> {
     const response = await fetch('/api/user/settings', {
       method: 'POST',
@@ -584,7 +612,9 @@
           cli: {
             discoverableToolIds: [...nextCliToolGridSettings.discoverableToolIds],
             dcmDisplayDefaults: nextCliToolGridSettings.dcmDisplayDefaults
-          }
+          },
+          fabric: { dcmDisplayDefaults: nextFabricToolGridSettings.dcmDisplayDefaults },
+          artifact: { dcmDisplayDefaults: nextArtifactToolGridSettings.dcmDisplayDefaults }
         },
         updated_at: new Date().toISOString()
       })
@@ -823,6 +853,100 @@
     mutate(next)
     globalCliToolGridSettings = next
     queueSaveZipSettings()
+  }
+
+  // SA-096 P3: Fabric and Artifact global defaults. Same shape as the CLI handlers; the
+  // family's own default mode is the one the normalizer seeds, so "back to default" is a
+  // delete rather than a hard-coded 'group+tools+hints'.
+  function getBrokerFamilySettings(key: BrokerFamilyToolGridKey) {
+    return key === 'fabric' ? globalFabricToolGridSettings : globalArtifactToolGridSettings
+  }
+
+  function getBrokerFamilyGroupName(key: BrokerFamilyToolGridKey): string {
+    return key === 'fabric' ? FABRIC_TOOL_GRID_GROUP_NAME : ARTIFACT_TOOL_GRID_GROUP_NAME
+  }
+
+  function getBrokerFamilyGroupMode(key: BrokerFamilyToolGridKey): DcmGroupDisplayMode {
+    const mode = getBrokerFamilySettings(key).dcmDisplayDefaults.groups[
+      getBrokerFamilyGroupName(key)
+    ]
+    return VALID_GROUP_MODES.has(mode as DcmGroupDisplayMode)
+      ? (mode as DcmGroupDisplayMode)
+      : 'group+tools+hints'
+  }
+
+  function updateBrokerFamilyToolGridSettings(
+    key: BrokerFamilyToolGridKey,
+    mutate: (next: ReturnType<typeof createDefaultFabricToolGridSettings>) => void
+  ) {
+    const next = {
+      dcmDisplayDefaults: normalizeGatewayDcmDisplayDefaults(
+        getBrokerFamilySettings(key).dcmDisplayDefaults
+      )
+    }
+    mutate(next)
+    const normalized =
+      key === 'fabric'
+        ? normalizeFabricToolGridSettings(next)
+        : normalizeArtifactToolGridSettings(next)
+    if (key === 'fabric') {
+      globalFabricToolGridSettings = normalized
+    } else {
+      globalArtifactToolGridSettings = normalized
+    }
+    queueSaveZipSettings()
+  }
+
+  function handleBrokerFamilyGroupModeChange(key: BrokerFamilyToolGridKey, value: string) {
+    const mode = normalizeLegacyGroupMode(value)
+    if (!mode || mode === 'hidden') return
+    updateBrokerFamilyToolGridSettings(key, (next) => {
+      next.dcmDisplayDefaults.groups[getBrokerFamilyGroupName(key)] = mode
+    })
+  }
+
+  /**
+   * SA-096: the Discoverable + Display Detail pair for a broker family, rendered on the
+   * existing `Fabric Controls` / `Artifact Tools` rows inside the `Batshit Tools`
+   * accordion. Global defaults always show zip columns, so those rows are the family's
+   * only home here and the name never appears twice in the grid.
+   */
+  function buildBrokerFamilyControls(key: BrokerFamilyToolGridKey): BrokerFamilyRowControls {
+    const groupName = getBrokerFamilyGroupName(key)
+    const mode = getBrokerFamilyGroupMode(key)
+
+    return {
+      label: groupName,
+      iconRef: key === 'fabric' ? TOOL_GRID_FABRIC_ICON_REF : TOOL_GRID_ARTIFACT_ICON_REF,
+      visible: mode !== 'hidden',
+      value: mode,
+      iconMode: normalizeGroupIconMode(mode),
+      options: GROUP_DISPLAY_OPTIONS,
+      optionIconMode: (value) => normalizeGroupIconMode(value as DcmGroupDisplayMode),
+      modeLabel: (value) => getGroupModeLabel(value as DcmGroupDisplayMode),
+      infoParagraphs:
+        key === 'fabric' ? FABRIC_TOOL_GRID_INFO_PARAGRAPHS : ARTIFACT_TOOL_GRID_INFO_PARAGRAPHS,
+      onVisibleChange: (visible) => handleBrokerFamilyGroupToggle(key, visible),
+      onModeChange: (value) => handleBrokerFamilyGroupModeChange(key, value)
+    }
+  }
+
+  function getBrokerFamilyControlsForRow(
+    rowId: SharedNonMcpToolGridRowId
+  ): BrokerFamilyRowControls | null {
+    if (rowId === 'fabric_find') return buildBrokerFamilyControls('fabric')
+    if (rowId === 'artifact_find') return buildBrokerFamilyControls('artifact')
+    return null
+  }
+
+  function handleBrokerFamilyGroupToggle(key: BrokerFamilyToolGridKey, visible: boolean) {
+    updateBrokerFamilyToolGridSettings(key, (next) => {
+      if (visible) {
+        delete next.dcmDisplayDefaults.groups[getBrokerFamilyGroupName(key)]
+      } else {
+        next.dcmDisplayDefaults.groups[getBrokerFamilyGroupName(key)] = 'hidden'
+      }
+    })
   }
 
   function handleCliGroupModeChange(value: string) {
@@ -1621,6 +1745,7 @@
               otherColumnClass={TOOL_GRID_OTHER_COLUMN_CLASS}
               getRowOverride={getOtherZipRowOverride}
               onUpdateRowOverride={updateOtherZipRowOverride}
+              getBrokerFamilyControls={getBrokerFamilyControlsForRow}
               onHeaderClick={handleTopLevelHeaderClick}
               onToggle={toggleTopLevelAccordionItem}
               showBulkZipApply

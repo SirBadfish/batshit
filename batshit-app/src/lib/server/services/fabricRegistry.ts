@@ -82,7 +82,8 @@ export type ControlSourceType = 'core' | 'artifact' | 'workflow' | 'plugin'
 export type ControlExecutorType = 'internal_handler' | 'artifact_use' | 'workflow_run' | 'bash_adapter'
 export type ControlRiskLevel = 'safe' | 'confirm' | 'restricted'
 export type ControlStatus = 'draft' | 'published' | 'deprecated'
-export type ControlRuntimeMode = 'mode1' | 'mode2' | 'mode3' | 'mode4'
+import type { ControlRuntimeMode } from './fabricControlModes'
+export type { ControlRuntimeMode }
 
 /**
  * Registry storage contract lock:
@@ -6048,6 +6049,61 @@ async function resolveVisibleControls(options: {
     }
     return true
   })
+}
+
+/**
+ * Every control this actor can reach, unscored and uncapped, sorted by control id.
+ *
+ * SA-096 P4. `findControls` is the model-facing search: it scores against a query and
+ * clamps to `MAX_CONTROL_RESULTS`. The DCM capability index needs the opposite — a
+ * complete, stable list, because its whole job is to state a truthful count. Both go
+ * through the same `resolveVisibleControls` filter, so the index can never advertise a
+ * control the broker would refuse.
+ */
+export interface VisibleControlSummary {
+  controlId: string
+  sourceType: ControlSourceType
+  title: string
+  description: string
+  schemaHint: string
+  riskLevel: ControlRiskLevel
+  /** Set for the per-artifact controls and their `use.artifact.{slug}` aliases. */
+  artifactId: string | null
+}
+
+export async function listVisibleControls(options: {
+  userId?: string | null
+  agentId?: string | null
+  runtimeMode?: ControlRuntimeMode | null
+  allowedControlIds?: string[]
+  includeDraft?: boolean
+}): Promise<VisibleControlSummary[]> {
+  const controls = await resolveVisibleControls({
+    userId: options.userId ?? null,
+    agentId: options.agentId ?? null,
+    runtimeMode: options.runtimeMode ?? null,
+    includeDraft: options.includeDraft === true,
+    allowedControlIds: options.allowedControlIds
+  })
+
+  return controls
+    .map((definition) => {
+      const executorConfig = (definition.executorConfig ?? {}) as Record<string, unknown>
+      const artifactId =
+        typeof executorConfig.artifactId === 'string' && executorConfig.artifactId.trim().length > 0
+          ? executorConfig.artifactId.trim()
+          : null
+      return {
+        controlId: definition.controlId,
+        sourceType: definition.sourceType,
+        title: definition.title,
+        description: definition.description,
+        schemaHint: definition.schemaHint,
+        riskLevel: definition.riskLevel,
+        artifactId
+      }
+    })
+    .sort((left, right) => left.controlId.localeCompare(right.controlId))
 }
 
 export async function findControls(options: ControlFindOptions): Promise<ControlFindResult> {

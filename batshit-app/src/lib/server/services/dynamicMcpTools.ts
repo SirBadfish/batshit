@@ -1,9 +1,11 @@
+import { createDefaultGatewayDcmDisplaySettings } from '$lib/utils/dcmDisplaySettings'
+// SA-096: visibility comes from the shared leaf module, not the index. Importing these
+// from `dynamicMcpIndex` re-closes the cycle CI blocks at a zero budget.
 import {
-  createDefaultGatewayDcmDisplaySettings,
   resolveAgentDcmDisplaySettings,
   resolveGatewayDisplayDefaults,
   resolveMcpToolDcmVisibility
-} from './dynamicMcpIndex'
+} from './dynamicMcpVisibility'
 import { mcpGatewayDiscovery } from './mcpGatewayDiscovery'
 import { resolveDynamicMcpGatewayScope } from './mcpSelectionResolver'
 import { shouldHideInternalMcpTool } from './nativeToolConstants'

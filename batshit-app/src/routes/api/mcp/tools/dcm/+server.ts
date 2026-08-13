@@ -5,6 +5,7 @@
 
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { buildDynamicMcpIndex } from '$lib/server/services/dynamicMcpIndex'
+import { BROKER_RUNTIMES, type BrokerRuntime } from '$lib/utils/brokerAvailability'
 import type { AgentDcmDisplaySettings } from '$lib/types/database'
 
 interface DcmPreviewRequest {
@@ -17,6 +18,17 @@ interface DcmPreviewRequest {
   nativeCliToolsEnabled?: boolean | null
   dcmDisplaySettings?: AgentDcmDisplaySettings
   isCodexMode?: boolean
+  /**
+   * SA-096 P4: which runtime's broker rules to apply. The n8n compile twin and the Tool
+   * Grid preview both reach the index through this route, and they are different lanes.
+   */
+  runtime?: string | null
+}
+
+function normalizeBrokerRuntime(value: unknown): BrokerRuntime | undefined {
+  return typeof value === 'string' && (BROKER_RUNTIMES as readonly string[]).includes(value)
+    ? (value as BrokerRuntime)
+    : undefined
 }
 
 export const POST: RequestHandler = async ({ locals, request }) => {
@@ -47,7 +59,8 @@ export const POST: RequestHandler = async ({ locals, request }) => {
           ? body.nativeCliToolsEnabled
           : undefined,
       dcmDisplaySettings: body.dcmDisplaySettings,
-      isCodexMode: body.isCodexMode === true
+      isCodexMode: body.isCodexMode === true,
+      runtime: normalizeBrokerRuntime(body.runtime)
     })
 
     return json(result)
