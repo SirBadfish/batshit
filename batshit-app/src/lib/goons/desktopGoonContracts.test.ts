@@ -81,6 +81,40 @@ describe("Desktop Goon runtime snapshot v1", () => {
 });
 
 describe("Desktop Goon delta envelope v1", () => {
+  it("accepts bounded quick-control deltas on the existing ordered bridge", () => {
+    expect(
+      validateDesktopGoonDeltaEnvelopeV1(
+        envelope({
+          delta: {
+            type: "quick-control.changed",
+            value: {
+              kind: "mood",
+              name: "Calm",
+              definition: { name: "Calm", kind: "mood" },
+            },
+          },
+        }),
+        { epoch: "desktop-window:1", lastSequence: 0 },
+      ),
+    ).toMatchObject({ ok: true });
+
+    expect(
+      validateDesktopGoonDeltaEnvelopeV1(
+        envelope({
+          delta: {
+            type: "quick-control.changed",
+            value: {
+              kind: "closet",
+              goonId: "goon-1",
+              recordUpdatedAt: "2026-08-13T05:28:25.452Z",
+            },
+          },
+        }),
+        { epoch: "desktop-window:1", lastSequence: 0 },
+      ),
+    ).toMatchObject({ ok: true });
+  });
+
   it("requires the exact connection epoch and next contiguous sequence", () => {
     expect(
       validateDesktopGoonDeltaEnvelopeV1(envelope(), {

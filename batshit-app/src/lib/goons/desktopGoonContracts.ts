@@ -68,6 +68,18 @@ export type DesktopGoonRuntimeDeltaV1 =
       name: string;
       payload: { [key: string]: DesktopGoonJsonValue };
     }
+  | {
+      type: "quick-control.changed";
+      value:
+        | {
+            kind: "mood";
+            name: string;
+            definition: { [key: string]: DesktopGoonJsonValue };
+          }
+        | { kind: "closet"; goonId: string; recordUpdatedAt: string }
+        | { kind: "quality"; quality: "auto" | "low" | "high" | "ultra" }
+        | { kind: "eye-contact"; enabled: boolean };
+    }
   | { type: "settings.changed"; preferences: DesktopGoonPreferences }
   | { type: "camera.command"; value: DesktopGoonCameraCommandV1 }
   | { type: "camera.state"; camera: DesktopGoonCameraStateV1 }
@@ -129,6 +141,7 @@ const DELTA_TYPES = new Set<DesktopGoonRuntimeDeltaV1["type"]>([
   "goon.invalidated",
   "voice.visual",
   "cue",
+  "quick-control.changed",
   "settings.changed",
   "camera.command",
   "camera.state",

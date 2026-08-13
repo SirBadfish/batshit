@@ -3,6 +3,7 @@
   import {
     AudioLines,
     ArrowDownToLine,
+    Eye,
     Hand,
     LayersArrowDown,
     LayersArrowUp,
@@ -11,10 +12,12 @@
     Move3d,
     Paperclip,
     PhoneOff,
+    Settings2,
     X
   } from '@lucide/svelte'
   import { Button } from '$lib/components/ui/button'
   import { Badge } from '$lib/components/ui/badge'
+  import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import {
     DesktopControlsClipStateController,
     type DesktopControlsClip,
@@ -28,6 +31,13 @@
     type DesktopControlsStateEvent
   } from '$lib/goons/desktopControlsNativeBridge'
   import { dispatchSessionClipStateChanged } from '$lib/utils/liveSettingsEvents'
+  import {
+    GOON_QUICK_CONTROLS_SCHEMA_VERSION,
+    normalizeGoonQuickControlAction,
+    type GoonQuickControlAction,
+    type GoonQuickControlClosetAction,
+    type GoonQuickControlsProjection
+  } from '$lib/goons/goonQuickControls'
 
   type ProjectedPreferences = {
     stayOnTop: boolean
@@ -46,6 +56,9 @@
   let clipUnsubscribe: (() => void) | null = null
   let projectedSessionId: string | null = null
   let projectedClipRevision = -1
+  let moodSelection = $state('')
+  let closetSelection = $state('')
+  let qualitySelection = $state('')
 
   const preferences = $derived.by<ProjectedPreferences>(() => {
     const projection = shellState?.projection
@@ -79,6 +92,35 @@
       pendingIntent: null,
       intentError: null
     }
+  })
+  const goonControlsEnvelope = $derived.by(() => {
+    const value = shellState?.projection?.goonControls
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { state: null, pendingAction: null, error: null }
+    }
+    const record = value as Record<string, unknown>
+    const state = record.state
+    const validState =
+      state &&
+      typeof state === 'object' &&
+      !Array.isArray(state) &&
+      (state as Record<string, unknown>).schemaVersion === GOON_QUICK_CONTROLS_SCHEMA_VERSION
+        ? (state as GoonQuickControlsProjection)
+        : null
+    return {
+      state: validState,
+      pendingAction:
+        typeof record.pendingAction === 'string' ? record.pendingAction : null,
+      error: typeof record.error === 'string' ? record.error : null
+    }
+  })
+  const goonControls = $derived(goonControlsEnvelope.state)
+  const closetActionsByKey = $derived.by(() => {
+    const entries =
+      goonControls?.closet.groups.flatMap((group) =>
+        group.options.map((option) => [option.key, option.action] as const)
+      ) ?? []
+    return new Map<string, GoonQuickControlClosetAction>(entries)
   })
 
   function clipPreviewUrl(clip: DesktopControlsClip) {
@@ -160,6 +202,38 @@
 
   async function endVoice() {
     await runAction('End Voice Mode', () => sendIntent('voice.end'))
+  }
+
+  async function runGoonQuickControl(action: GoonQuickControlAction) {
+    // Closet actions originate inside a reactive projection, so their objects can be
+    // Svelte proxies. Rebuild every action as a bounded plain object before Electron
+    // tries to structured-clone the renderer intent across the native bridge.
+    const normalizedAction = normalizeGoonQuickControlAction(action)
+    await runAction('Goon Control', () =>
+      sendIntent('goon.quick-control', { action: normalizedAction })
+    )
+  }
+
+  function selectMood(cueName: string) {
+    queueMicrotask(() => (moodSelection = ''))
+    if (!cueName) return
+    void runGoonQuickControl({ kind: 'mood', cueName })
+  }
+
+  function selectCloset(key: string) {
+    queueMicrotask(() => (closetSelection = ''))
+    const action = closetActionsByKey.get(key)
+    if (!action) return
+    void runGoonQuickControl(action)
+  }
+
+  function selectQuality(value: string) {
+    queueMicrotask(() => (qualitySelection = ''))
+    if (!['auto', 'low', 'high', 'ultra'].includes(value)) return
+    void runGoonQuickControl({
+      kind: 'quality',
+      value: value as 'auto' | 'low' | 'high' | 'ultra'
+    })
   }
 
   async function detachClip(clipId: string) {
@@ -285,29 +359,6 @@
     <div class="desktop-controls-grabber" aria-hidden="true"></div>
 
     <div class="desktop-controls-clips" aria-label="Attached Clips">
-      {#if clipState.attachedClips.length}
-        {#each clipState.attachedClips.slice(0, 4) as clip (clip.id)}
-          <div class="desktop-clip-token" title={clip.filename}>
-            {#if clipPreviewUrl(clip)}
-              <img src={clipPreviewUrl(clip)} alt="" />
-            {:else}
-              <Paperclip aria-hidden="true" />
-            {/if}
-            <button
-              type="button"
-              aria-label={`Unclip ${clip.filename}`}
-              onclick={() => void detachClip(clip.id)}
-            >
-              <X aria-hidden="true" />
-            </button>
-          </div>
-        {/each}
-        {#if clipState.attachedClips.length > 4}
-          <Badge variant="secondary">+{clipState.attachedClips.length - 4}</Badge>
-        {/if}
-      {:else}
-        <span class="desktop-controls-empty">Drop files</span>
-      {/if}
       <input
         bind:this={fileInput}
         class="sr-only"
@@ -329,6 +380,115 @@
       >
         <Paperclip aria-hidden="true" />
       </Button>
+      <div class="desktop-controls-clip-list">
+        {#if clipState.attachedClips.length}
+          {#each clipState.attachedClips.slice(0, 4) as clip (clip.id)}
+            <div class="desktop-clip-token" title={clip.filename}>
+              {#if clipPreviewUrl(clip)}
+                <img src={clipPreviewUrl(clip)} alt="" />
+              {:else}
+                <Paperclip aria-hidden="true" />
+              {/if}
+              <button
+                type="button"
+                aria-label={`Unclip ${clip.filename}`}
+                onclick={() => void detachClip(clip.id)}
+              >
+                <X aria-hidden="true" />
+              </button>
+            </div>
+          {/each}
+          {#if clipState.attachedClips.length > 4}
+            <Badge variant="secondary">+{clipState.attachedClips.length - 4}</Badge>
+          {/if}
+        {/if}
+      </div>
+      <div class="desktop-goon-quick-controls" aria-label="Goon quick controls">
+        <label
+          class:disabled={!goonControls || goonControls.mood.options.length === 0}
+          class="desktop-goon-quick-select"
+          title={goonControls ? `Mood: ${goonControls.mood.currentLabel}` : 'Mood unavailable'}
+        >
+          <BatshitIcon id="moods" />
+          <select
+            bind:value={moodSelection}
+            disabled={Boolean(busy) || Boolean(goonControlsEnvelope.pendingAction) || !goonControls || goonControls.mood.options.length === 0}
+            aria-label="Select Mood"
+            onchange={(event) => selectMood(event.currentTarget.value)}
+          >
+            <option value="" disabled>Mood</option>
+            {#each goonControls?.mood.options ?? [] as option (option.name)}
+              <option value={option.name}>
+                {option.label}{option.current ? ' • Current' : ''}
+              </option>
+            {/each}
+          </select>
+        </label>
+
+        <label
+          class:disabled={!goonControls?.closet.available}
+          class="desktop-goon-quick-select"
+          title={goonControls?.closet.available ? 'Closet quick access' : 'Closet unavailable'}
+        >
+          <BatshitIcon id="closet" />
+          <select
+            bind:value={closetSelection}
+            disabled={Boolean(busy) || Boolean(goonControlsEnvelope.pendingAction) || !goonControls?.closet.available}
+            aria-label="Closet quick access"
+            onchange={(event) => selectCloset(event.currentTarget.value)}
+          >
+            <option value="" disabled>Closet</option>
+            {#each goonControls?.closet.groups ?? [] as group (group.key)}
+              <optgroup label={group.label}>
+                {#each group.options as option (option.key)}
+                  <option value={option.key}>
+                    {option.label}{option.current ? ' • Current' : ''}
+                  </option>
+                {/each}
+              </optgroup>
+            {/each}
+          </select>
+        </label>
+
+        <label
+          class:disabled={!goonControls}
+          class="desktop-goon-quick-select"
+          title={goonControls
+            ? `Quality: ${goonControls.quality.options.find((option) => option.value === goonControls?.quality.current)?.label ?? 'Auto'}`
+            : 'Quality unavailable'}
+        >
+          <Settings2 aria-hidden="true" />
+          <select
+            bind:value={qualitySelection}
+            disabled={Boolean(busy) || Boolean(goonControlsEnvelope.pendingAction) || !goonControls}
+            aria-label="Select Goon Quality"
+            onchange={(event) => selectQuality(event.currentTarget.value)}
+          >
+            <option value="" disabled>Quality</option>
+            {#each goonControls?.quality.options ?? [] as option (option.value)}
+              <option value={option.value}>
+                {option.label}{option.value === goonControls?.quality.current ? ' • Current' : ''}
+              </option>
+            {/each}
+          </select>
+        </label>
+
+        <Button
+          variant={goonControls?.eyeContactEnabled ? 'default' : 'ghost'}
+          size="icon"
+          disabled={Boolean(busy) || Boolean(goonControlsEnvelope.pendingAction) || !goonControls}
+          aria-pressed={goonControls?.eyeContactEnabled ?? false}
+          aria-label={goonControls?.eyeContactEnabled ? 'Disable eye contact' : 'Enable eye contact'}
+          title={goonControls?.eyeContactEnabled ? 'Disable eye contact' : 'Enable eye contact'}
+          onclick={() =>
+            void runGoonQuickControl({
+              kind: 'eye-contact',
+              enabled: !(goonControls?.eyeContactEnabled ?? false)
+            })}
+        >
+          <Eye aria-hidden="true" />
+        </Button>
+      </div>
     </div>
 
     <div class="desktop-controls-divider"></div>
@@ -443,9 +603,9 @@
       <span>Clip to chat</span>
     </div>
   {/if}
-  {#if error || clipState.error || voiceState.intentError}
+  {#if error || clipState.error || voiceState.intentError || goonControlsEnvelope.error}
     <div class="desktop-controls-error" role="alert">
-      {error ?? clipState.error?.message ?? voiceState.intentError?.message}
+      {error ?? clipState.error?.message ?? voiceState.intentError?.message ?? goonControlsEnvelope.error}
     </div>
   {/if}
 </main>
@@ -489,7 +649,8 @@
   }
 
   .desktop-controls-island :global(button),
-  .desktop-controls-island :global(input) {
+  .desktop-controls-island :global(input),
+  .desktop-controls-island :global(select) {
     -webkit-app-region: no-drag;
   }
 
@@ -511,18 +672,81 @@
 
   .desktop-controls-clips {
     flex: 1 1 auto;
-    overflow: hidden;
   }
 
   .desktop-controls-voice {
     flex: 0 1 auto;
   }
 
-  .desktop-controls-empty {
-    padding-left: 4px;
-    white-space: nowrap;
-    font-size: 11px;
-    color: hsl(var(--muted-foreground));
+  .desktop-controls-clip-list {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .desktop-goon-quick-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+  }
+
+  .desktop-goon-quick-select {
+    position: relative;
+    width: 34px;
+    height: 34px;
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border-radius: 0.375rem;
+    color: hsl(var(--foreground));
+  }
+
+  .desktop-goon-quick-select:hover:not(.disabled) {
+    background: hsl(var(--accent));
+    color: hsl(var(--accent-foreground));
+  }
+
+  .desktop-goon-quick-select.disabled {
+    opacity: 0.5;
+  }
+
+  .desktop-goon-quick-select > :global(svg) {
+    width: 16px;
+    height: 16px;
+    pointer-events: none;
+  }
+
+  .desktop-goon-quick-select > select {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    appearance: none;
+    border: 0;
+    border-radius: inherit;
+    background: transparent;
+    color: transparent;
+    font-size: 0;
+    cursor: pointer;
+  }
+
+  .desktop-goon-quick-select > select:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px hsl(var(--ring));
+  }
+
+  .desktop-goon-quick-select > select:disabled {
+    cursor: not-allowed;
+  }
+
+  .desktop-goon-quick-select > select option,
+  .desktop-goon-quick-select > select optgroup {
+    color: CanvasText;
+    font-size: 13px;
   }
 
   .desktop-controls-divider {

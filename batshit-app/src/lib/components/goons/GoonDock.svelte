@@ -43,14 +43,12 @@
   } from '$lib/goons/animationLoadPlan'
   import {
     hasRenderableGoonAvatar,
-    isGuidedCustomVrmGoon,
     resolveGoonEyeContactMode,
     resolveGoonEyeContactTuning,
     resolveGoonKind
   } from '$lib/goons/customAvatar'
   import { buildGuidedPieceOriginalClosetSlot } from '$lib/goons/concealRegions'
   import {
-    buildGuidedOutfitPieceStates,
     listStandaloneGuidedOutfitPieces,
     resolveGuidedOutfitManagedSlotName,
     resolveGuidedOutfitPieceVisible
@@ -58,8 +56,6 @@
   import {
     ALL_ORIGINAL_WARDROBE_OUTFIT_ID,
     NO_WARDROBE_OUTFIT_ID,
-    cloneWardrobeGuidedPieceStates,
-    cloneWardrobeOutfitAssignments,
     sanitizeWardrobeOutfits
   } from '$lib/goons/wardrobeOutfits'
   import { countPaintedConcealTriangles } from '$lib/goons/paintedConcealMasks'
@@ -70,7 +66,12 @@
     estimateCueTimingMsFromAlignment,
     usesAnalyzerOwnedCueProgress
   } from '$lib/goons/cueTiming'
-  import { applyClosetSelectionChange } from '$lib/goons/closetAssignments'
+  import {
+    buildGoonQuickControlPatch,
+    normalizeGoonQuickControlRuntimeContext,
+    type GoonQuickControlAction,
+    type GoonQuickControlRuntimeContext
+  } from '$lib/goons/goonQuickControls'
   import { parseGoonCues, parseLiveKitNaturalGoonCues } from '$lib/goons/cueParser'
   import { resolveGoonCues, resolvePreviewAnimationDefinition } from '$lib/goons/resolve'
   import { logClientEvent } from '$lib/services/clientTelemetry'
@@ -449,6 +450,13 @@
 
   export function captureMountedRuntimeState(): GoonMountedRuntimeState | null {
     return engine?.captureMountedRuntimeState() ?? null
+  }
+
+  export function captureQuickControlRuntimeContext(): GoonQuickControlRuntimeContext {
+    return normalizeGoonQuickControlRuntimeContext({
+      materialNames: dockMaterialNames,
+      eyeContactEnabled
+    })
   }
 
   export function isMountedRendererReady(): boolean {
@@ -1037,142 +1045,22 @@
       .sort((left, right) => left.name.localeCompare(right.name))
   }
 
-  function buildDockGuidedAvatarForAssignments(
-    targetGoon: GoonRecord,
-    nextAssignments: Record<string, GoonClosetAssignment>,
-    options: {
-      pieceStates?: Record<string, boolean>
-      clearActivePreset?: boolean
-    } = {}
-  ): GoonRecord['guidedAvatar'] | undefined {
-    if (!isGuidedCustomVrmGoon(targetGoon) || !targetGoon.guidedAvatar) return undefined
-    const pieces = targetGoon.guidedAvatar.outfitPieces ?? []
-    return {
-      ...targetGoon.guidedAvatar,
-      pieceStates: buildGuidedOutfitPieceStates(pieces, {
-        availableSlotNames: buildDockClosetSlotNames(targetGoon),
-        pieceStates: options.pieceStates ?? targetGoon.guidedAvatar.pieceStates ?? {},
-        assignments: nextAssignments
-      }),
-      activePresetId: options.clearActivePreset
-        ? null
-        : targetGoon.guidedAvatar.activePresetId ?? null
-    }
-  }
-
-  function buildDockWardrobeAssignmentKeys(targetGoon: GoonRecord | null | undefined = goon) {
-    const keys = new Set<string>()
-    for (const slotName of buildDockClosetSlotNames(targetGoon)) {
-      keys.add(slotName)
-    }
-    const availableSlotNames = buildDockClosetSlotNames(targetGoon)
-    for (const piece of listStandaloneGuidedOutfitPieces(
-      targetGoon?.guidedAvatar?.outfitPieces ?? [],
-      availableSlotNames
-    )) {
-      keys.add(buildGuidedPieceOriginalClosetSlot(piece.id))
-    }
-    return keys
-  }
-
-  function clearDockWardrobeOutfitDefault(targetGoon: GoonRecord) {
-    const nextDefaults = { ...(targetGoon.defaults ?? {}) }
-    delete (nextDefaults as Record<string, unknown>).closetOutfitId
-    return nextDefaults
-  }
-
-  function buildDockBuiltInWardrobeOutfit(
-    outfitId: string
-  ): Pick<GoonWardrobeOutfit, 'assignments' | 'guidedPieceStates'> | null {
-    if (!goon) return null
-    if (
-      outfitId !== ALL_ORIGINAL_WARDROBE_OUTFIT_ID &&
-      outfitId !== NO_WARDROBE_OUTFIT_ID
-    ) {
-      return null
-    }
-    const mode = outfitId === NO_WARDROBE_OUTFIT_ID ? 'none' : 'original'
-    const assignments: Record<string, GoonClosetAssignment> = {}
-    for (const slotName of dockClosetSlotNames) {
-      const label = goon.closetAssignments?.[slotName]?.label?.trim()
-      assignments[slotName] = {
-        mode,
-        ...(label ? { label } : {})
-      }
-    }
-    const guidedPieceStates = Object.fromEntries(
-      dockStandaloneGuidedOutfitPieces.map((piece) => [
-        piece.id,
-        outfitId === ALL_ORIGINAL_WARDROBE_OUTFIT_ID
-      ])
-    )
-    return { assignments, guidedPieceStates }
-  }
-
-  async function applyDockWardrobeOutfitState(
-    outfit: Pick<GoonWardrobeOutfit, 'assignments' | 'guidedPieceStates'>,
-    activeOutfitId: string | null
-  ) {
-    if (!goon) return
-    if (dockPreviewActive) {
-      clearDockPreview()
-    }
-    const outfitAssignments = cloneWardrobeOutfitAssignments(outfit.assignments)
-    const nextAssignments = { ...(goon.closetAssignments ?? {}) }
-    for (const key of buildDockWardrobeAssignmentKeys(goon)) {
-      delete nextAssignments[key]
-    }
-    for (const [slotName, assignment] of Object.entries(outfitAssignments)) {
-      if (assignment.mode === 'item' && !resolveClosetItem(goon, assignment.itemId)) {
-        nextAssignments[slotName] = {
-          mode: 'original',
-          ...(assignment.label?.trim() ? { label: assignment.label.trim() } : {})
-        }
-        continue
-      }
-      if (assignment.mode === 'original' && !assignment.label) {
-        continue
-      }
-      nextAssignments[slotName] = assignment
-    }
-
-    const guidedAvatar = buildDockGuidedAvatarForAssignments(goon, nextAssignments, {
-      pieceStates: {
-        ...(goon.guidedAvatar?.pieceStates ?? {}),
-        ...cloneWardrobeGuidedPieceStates(outfit.guidedPieceStates)
-      },
-      clearActivePreset: true
-    })
-    const nextDefaults = clearDockWardrobeOutfitDefault(goon)
-    if (activeOutfitId && dockWardrobeOutfits[activeOutfitId]) {
-      nextDefaults.closetOutfitId = activeOutfitId
-    }
-    const patch: Partial<GoonRecord> = {
-      closetAssignments: nextAssignments,
-      defaults: nextDefaults
-    }
-    if (guidedAvatar) {
-      patch.guidedAvatar = guidedAvatar
-    }
-
-    try {
-      await updateGoonRecord(goon.id, patch)
-      showDockSaveStatus('Outfit Applied ✓')
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to apply Outfit')
-    }
-  }
-
   async function applyDockBuiltInWardrobeOutfit(outfitId: string) {
-    const outfit = buildDockBuiltInWardrobeOutfit(outfitId)
-    if (!outfit) return
-    await applyDockWardrobeOutfitState(outfit, outfitId)
+    if (dockPreviewActive) clearDockPreview()
+    await persistDockQuickControl(
+      { kind: 'outfit', outfitId },
+      'Outfit Applied ✓',
+      'Failed to apply Outfit'
+    )
   }
 
   async function applyDockSavedWardrobeOutfit(outfitId: string) {
-    const outfit = dockWardrobeOutfits[outfitId]
-    if (!outfit) return
-    await applyDockWardrobeOutfitState(outfit, outfit.id)
+    if (dockPreviewActive) clearDockPreview()
+    await persistDockQuickControl(
+      { kind: 'outfit', outfitId },
+      'Outfit Applied ✓',
+      'Failed to apply Outfit'
+    )
   }
 
   function buildClosetRuntimeSignature(targetGoon: GoonRecord) {
@@ -1995,6 +1883,22 @@
     }
   }
 
+  async function persistDockQuickControl(
+    action: GoonQuickControlAction,
+    successMessage: string,
+    failureMessage: string
+  ) {
+    if (!goon) return
+    try {
+      const patch = buildGoonQuickControlPatch(goon, goonsSettings, dockMaterialNames, action)
+      if (!patch) return
+      await updateGoonRecord(goon.id, patch)
+      if (successMessage) showDockSaveStatus(successMessage)
+    } catch (error: any) {
+      toast.error(error?.message || failureMessage)
+    }
+  }
+
   async function persistDockCurrentMood(cueName: string, options?: { showStatus?: boolean }) {
     if (!goon) return
     const trimmedCueName = cueName.trim()
@@ -2002,19 +1906,11 @@
     if (dockPreviewActive) {
       clearDockPreview()
     }
-    try {
-      await updateGoonRecord(goon.id, {
-        defaults: {
-          ...(goon.defaults ?? {}),
-          baseLoop: trimmedCueName
-        }
-      })
-      if (options?.showStatus) {
-        showDockSaveStatus('Current Mood Saved ✓')
-      }
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to update Current Mood')
-    }
+    await persistDockQuickControl(
+      { kind: 'mood', cueName: trimmedCueName },
+      options?.showStatus ? 'Current Mood Saved ✓' : '',
+      'Failed to update Current Mood'
+    )
   }
 
   async function updateDockMood(cueName: string) {
@@ -2059,33 +1955,11 @@
     if (dockPreviewActive) {
       clearDockPreview()
     }
-    const editedOriginal = nextValue === '__original__'
-      ? resolveDockEditedOriginalForSlot(slotName)
-      : null
-    const nextAssignments = applyClosetSelectionChange(
-      goon.closetAssignments ?? {},
-      slotName,
-      (editedOriginal?.id ?? nextValue) as '__original__' | '__none__' | string,
-      (itemId) => resolveClosetItem(goon, itemId),
-      dockClosetSlotNames
+    await persistDockQuickControl(
+      { kind: 'slot', slotName, value: nextValue },
+      'Closet Saved ✓',
+      'Failed to update Closet'
     )
-    const guidedAvatar = buildDockGuidedAvatarForAssignments(goon, nextAssignments, {
-      clearActivePreset: resolveDockGuidedPiecesForSlot(slotName, goon).length > 0
-    })
-    const patch: Partial<GoonRecord> = {
-      closetAssignments: nextAssignments,
-      defaults: clearDockWardrobeOutfitDefault(goon)
-    }
-    if (guidedAvatar) {
-      patch.guidedAvatar = guidedAvatar
-    }
-
-    try {
-      await updateGoonRecord(goon.id, patch)
-      showDockSaveStatus('Closet Saved ✓')
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to update Closet')
-    }
   }
 
   async function updateDockGuidedPiece(piece: GoonGuidedOutfitPiece, nextValue: string) {
@@ -2093,58 +1967,11 @@
     if (dockPreviewActive) {
       clearDockPreview()
     }
-    const virtualSlotName = buildGuidedPieceOriginalClosetSlot(piece.id)
-    const nextAssignments = { ...(goon.closetAssignments ?? {}) }
-    const nextPieceStates = { ...(goon.guidedAvatar?.pieceStates ?? {}) }
-
-    if (nextValue === '__none__') {
-      delete nextAssignments[virtualSlotName]
-      nextPieceStates[piece.id] = false
-    } else if (nextValue === '__original__') {
-      const editedOriginal = resolveDockEditedOriginalForGuidedPiece(piece.id)
-      if (editedOriginal) {
-        nextAssignments[virtualSlotName] = {
-          mode: 'item',
-          itemId: editedOriginal.id
-        }
-      } else {
-        delete nextAssignments[virtualSlotName]
-      }
-      nextPieceStates[piece.id] = true
-    } else {
-      const item = resolveClosetItem(goon, nextValue)
-      if (
-        !item ||
-        item.originalSource?.kind !== 'guided-piece-original' ||
-        item.originalSource.pieceId !== piece.id
-      ) {
-        return
-      }
-      nextAssignments[virtualSlotName] = {
-        mode: 'item',
-        itemId: item.id
-      }
-      nextPieceStates[piece.id] = true
-    }
-
-    const guidedAvatar = buildDockGuidedAvatarForAssignments(goon, nextAssignments, {
-      pieceStates: nextPieceStates,
-      clearActivePreset: true
-    })
-    const patch: Partial<GoonRecord> = {
-      closetAssignments: nextAssignments,
-      defaults: clearDockWardrobeOutfitDefault(goon)
-    }
-    if (guidedAvatar) {
-      patch.guidedAvatar = guidedAvatar
-    }
-
-    try {
-      await updateGoonRecord(goon.id, patch)
-      showDockSaveStatus('Closet Saved ✓')
-    } catch (error: any) {
-      toast.error(error?.message || 'Failed to update Closet')
-    }
+    await persistDockQuickControl(
+      { kind: 'guided-piece', pieceId: piece.id, value: nextValue },
+      'Closet Saved ✓',
+      'Failed to update Closet'
+    )
   }
 
   function resetDockAll() {
