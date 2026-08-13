@@ -1,4 +1,5 @@
 import type {
+  DesktopGoonPreferences,
   GoonCueDefinition,
   GoonCueMap,
   GoonEmojiMap,
@@ -10,10 +11,7 @@ import { sanitizeGoonAnimationName } from '$lib/goons/animationLoadPlan'
 import { DEFAULT_GOON_CUES, DEFAULT_GOON_EMOJI_MAP } from '$lib/goons/defaults'
 import { normalizeCustomPostureMap } from '$lib/goons/postures'
 import { normalizeGoonGlobalEyeContactSettingsMap } from '$lib/goons/customAvatar'
-import {
-  hasCueFacePayload,
-  normalizeCueFaceSource
-} from '$lib/goons/cueFaceProfiles'
+import { hasCueFacePayload, normalizeCueFaceSource } from '$lib/goons/cueFaceProfiles'
 
 export type ResolvedGoonCues = {
   cueMap: GoonCueMap
@@ -150,9 +148,60 @@ function normalizeGoonMotionsSettings(
   return glbPreviewGoonId ? { glbPreviewGoonId } : {}
 }
 
-export function normalizeGoonsSettings(
-  settings?: GoonsSettings | null
-): GoonsSettings {
+export const DEFAULT_DESKTOP_GOON_PREFERENCES: Readonly<DesktopGoonPreferences> = Object.freeze({
+  fullHeight: true,
+  normalizedWidth: 0.35,
+  stayOnTop: true,
+  clickThrough: false,
+  controlsShortcut: 'CommandOrControl+Shift+G',
+  workspace: 'current-workspace'
+})
+
+export const DESKTOP_GOON_NORMALIZED_WIDTH_RANGE = Object.freeze({
+  min: 0.1,
+  max: 1
+})
+
+export function normalizeDesktopGoonPreferences(
+  value?: GoonsSettings['desktop'] | null
+): DesktopGoonPreferences {
+  const rawWidth = Number(value?.normalizedWidth)
+  const normalizedWidth = Number.isFinite(rawWidth)
+    ? Math.max(
+        DESKTOP_GOON_NORMALIZED_WIDTH_RANGE.min,
+        Math.min(DESKTOP_GOON_NORMALIZED_WIDTH_RANGE.max, rawWidth)
+      )
+    : DEFAULT_DESKTOP_GOON_PREFERENCES.normalizedWidth
+  const shortcut =
+    typeof value?.controlsShortcut === 'string' &&
+    value.controlsShortcut.trim() &&
+    value.controlsShortcut.trim().length <= 128
+      ? value.controlsShortcut.trim()
+      : DEFAULT_DESKTOP_GOON_PREFERENCES.controlsShortcut
+
+  return {
+    fullHeight:
+      typeof value?.fullHeight === 'boolean'
+        ? value.fullHeight
+        : DEFAULT_DESKTOP_GOON_PREFERENCES.fullHeight,
+    normalizedWidth,
+    stayOnTop:
+      typeof value?.stayOnTop === 'boolean'
+        ? value.stayOnTop
+        : DEFAULT_DESKTOP_GOON_PREFERENCES.stayOnTop,
+    clickThrough:
+      typeof value?.clickThrough === 'boolean'
+        ? value.clickThrough
+        : DEFAULT_DESKTOP_GOON_PREFERENCES.clickThrough,
+    controlsShortcut: shortcut,
+    workspace:
+      value?.workspace === 'all-workspaces' || value?.workspace === 'current-workspace'
+        ? value.workspace
+        : DEFAULT_DESKTOP_GOON_PREFERENCES.workspace
+  }
+}
+
+export function normalizeGoonsSettings(settings?: GoonsSettings | null): GoonsSettings {
   const cues = normalizeGoonCueMap(cloneMap(settings?.kitchen?.cues ?? DEFAULT_GOON_CUES))
   const emojiMap = normalizeEmojiMap(
     cloneMap(settings?.kitchen?.emojiMap ?? DEFAULT_GOON_EMOJI_MAP),
@@ -162,6 +211,7 @@ export function normalizeGoonsSettings(
     dockOpen: settings?.dockOpen ?? false,
     showCues: settings?.showCues ?? false,
     immersiveMode: settings?.immersiveMode ?? true,
+    desktop: normalizeDesktopGoonPreferences(settings?.desktop),
     globalCloset: cloneMap(settings?.globalCloset ?? { items: {} }),
     kitchen: {
       cues,
@@ -188,6 +238,12 @@ export function mergeGoonsSettingsPatch(
   if (patch.dockOpen !== undefined) next.dockOpen = patch.dockOpen
   if (patch.showCues !== undefined) next.showCues = patch.showCues
   if (patch.immersiveMode !== undefined) next.immersiveMode = patch.immersiveMode
+  if (patch.desktop !== undefined) {
+    next.desktop = normalizeDesktopGoonPreferences({
+      ...normalized.desktop,
+      ...patch.desktop
+    })
+  }
   if (patch.globalCloset !== undefined) next.globalCloset = cloneMap(patch.globalCloset)
 
   const kitchenPatch = patch.kitchen
@@ -195,7 +251,8 @@ export function mergeGoonsSettingsPatch(
     next.kitchen = {
       ...normalized.kitchen,
       ...kitchenPatch,
-      cues: kitchenPatch.cues !== undefined ? cloneMap(kitchenPatch.cues) : normalized.kitchen?.cues,
+      cues:
+        kitchenPatch.cues !== undefined ? cloneMap(kitchenPatch.cues) : normalized.kitchen?.cues,
       emojiMap:
         kitchenPatch.emojiMap !== undefined
           ? cloneMap(kitchenPatch.emojiMap)
@@ -205,7 +262,9 @@ export function mergeGoonsSettingsPatch(
           ? normalizeCustomPostureMap(kitchenPatch.postures)
           : normalized.kitchen?.postures,
       scenes:
-        kitchenPatch.scenes !== undefined ? cloneMap(kitchenPatch.scenes) : normalized.kitchen?.scenes,
+        kitchenPatch.scenes !== undefined
+          ? cloneMap(kitchenPatch.scenes)
+          : normalized.kitchen?.scenes,
       roomTextures:
         kitchenPatch.roomTextures !== undefined
           ? cloneMap(kitchenPatch.roomTextures)
@@ -268,7 +327,7 @@ export function resolveGoonCues(
   for (const name of resolveAutoEnabledCues(kitchen.cueMap)) {
     addEnabledName(name)
   }
-  for (const name of Array.isArray(goon?.cues?.enabled) ? goon?.cues?.enabled ?? [] : []) {
+  for (const name of Array.isArray(goon?.cues?.enabled) ? (goon?.cues?.enabled ?? []) : []) {
     addEnabledName(name)
   }
   for (const name of Object.keys(overrides)) {

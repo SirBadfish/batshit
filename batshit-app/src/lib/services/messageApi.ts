@@ -771,6 +771,7 @@ export class MessageApiService {
       typeof metadataOverrides?.goonsEnabled === 'boolean'
         ? metadataOverrides.goonsEnabled
         : undefined
+    const goonPresentationMode = metadataOverrides?.goonPresentationMode
     const formatted = await databaseService.buildFormattedChatInput(
       sessionId,
       previousMessages,
@@ -785,6 +786,7 @@ export class MessageApiService {
         fileReferences: metadataOverrides?.fileReferences ?? [],
         voiceState,
         goonsEnabled,
+        goonPresentationMode,
         goonsSettings: userSettings?.goons_settings ?? null,
       },
     )

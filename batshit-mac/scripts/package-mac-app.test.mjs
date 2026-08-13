@@ -5,6 +5,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ELECTRON_SOURCE_FILES,
   packageBasename,
   parsePackageArgs,
   signingOptionsForFile
@@ -28,6 +29,25 @@ test('unsafe or unknown package arguments fail closed', () => {
   assert.throws(() => parsePackageArgs(['-Dartifact-suffix=../../bad']), /artifact suffix/);
   assert.throws(() => parsePackageArgs(['--web-engine=system']), /Unknown Mac package argument/);
   assert.throws(() => parsePackageArgs(['--mystery']), /Unknown Mac package argument/);
+});
+
+test('the immutable Electron staging inventory includes every Desktop Goon module', () => {
+  assert.deepEqual(ELECTRON_SOURCE_FILES, [
+    'main.mjs',
+    'preload.cjs',
+    'electron-shell-policy.mjs',
+    'desktop-controls-contract.mjs',
+    'desktop-controls-window-policy.mjs',
+    'desktop-controls-window-state.mjs',
+    'desktop-controls-window-controller.mjs',
+    'desktop-goon-contract.mjs',
+    'desktop-goon-window-policy.mjs',
+    'desktop-goon-window-state.mjs',
+    'desktop-goon-window-controller.mjs'
+  ]);
+  for (const file of ELECTRON_SOURCE_FILES) {
+    assert.equal(fs.existsSync(path.join(scriptsRoot, '..', 'src-electron', file)), true, file);
+  }
 });
 
 test('release packaging honors the configured Developer ID signing identity', () => {

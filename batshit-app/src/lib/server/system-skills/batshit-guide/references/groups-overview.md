@@ -41,7 +41,9 @@ Group Chat supports Voice. Batshit queues playback by agent, so spoken replies d
 
 ## Goons in a Group
 
-Goons aren't used in Group Chat yet. The Goon Dock shows one active avatar at a time, so during a group conversation Batshit closes and suppresses the Dock and keeps Goon cue instructions out of group prompts. Voice still works; the 3D avatar just sits this one out.
+Group Chat uses one visible Goon at a time in the Goon Dock or Mac Desktop Mode. Batshit follows the same single-speaker order as the conversation: the agent whose voice is audibly playing wins first, then the current streaming speaker. While the group is idle, a valid configured Group driver is the visual fallback, followed by the current agent.
+
+The Goon changes when the active speaker changes; Batshit does not render the whole group at once. If that agent has no ready Goon assigned, there is no avatar to show for that speaker. Voice remains independently queued by agent, so the visual change never creates overlapping audio.
 
 ## Setting up a Group
 
@@ -61,7 +63,8 @@ Get each agent working solo before grouping them. A Group can only be as healthy
 | The group feels stuck | Turns are sequential, so one agent's slow or stuck tool call holds the line. | Check that agent's model/provider and tools on their own. |
 | The wrong agent keeps answering | Speak policies, or you didn't name a specific agent. | Address an agent by name, or adjust speak policies. |
 | Agents ignore each other | Tool results aren't shared, so they're missing each other's context. | Turn on tool sharing for the results the group should see. |
-| No Goon appears | Expected — Goons are suppressed during Group Chat. | Use a single-agent chat if you want the Goon Dock. |
+| No Goon appears | The current speaker has no ready Goon assigned, or the Dock/Desktop Mode is not active. | Assign a ready Goon to that agent and open the Goon Dock. |
+| The idle Goon is not the one you expected | The Group driver is the idle visual fallback when it is valid. | Check the Group driver and each agent's Goon assignment. |
 
 ## Related docs
 

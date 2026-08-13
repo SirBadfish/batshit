@@ -165,6 +165,27 @@ describe('/api/settings/api-keys managed profile sync hooks', () => {
     })
   })
 
+  it('GET blocks editing when saved API key records cannot be decrypted', async () => {
+    apiKeyService.getAllMasked.mockResolvedValue({
+      openai: {
+        service: 'openai',
+        masked: '****',
+        status: 'error',
+        updatedAt: '2026-08-12T00:00:00.000Z'
+      }
+    })
+
+    const response = await routeModule.GET({
+      request: new Request('http://localhost:5620/api/settings/api-keys'),
+      locals: { user: { id: 'josh' } }
+    } as any)
+    const payload = await response.json()
+
+    expect(response.status).toBe(409)
+    expect(payload.success).toBe(false)
+    expect(payload.error).toContain('Do not re-enter or delete the keys')
+  })
+
   it('GET reports Batshit internal token as source runtime-managed in host/source installs', async () => {
     dynamicPrivateEnv.env.BATSHIT_TOKEN = 'source-runtime-token-1357'
     apiKeyService.getAllMasked.mockResolvedValue({

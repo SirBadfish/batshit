@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import {
   access,
   appendFile,
+  chmod,
   lstat,
   readdir,
   mkdir,
@@ -96,6 +97,7 @@ const configDir = join(paths.data, 'config');
 const redisDir = join(paths.data, 'redis');
 const pidDir = join(runtimeDir, 'pids');
 const runtimeEnvPath = join(configDir, 'runtime.env');
+const apiKeyEncryptionKeyPath = join(configDir, 'api-key-encryption.key');
 const redisConfigPath = join(paths.cache, 'redis.conf');
 const redisPidFile = join(pidDir, 'redis.pid');
 const redisLogFile = join(paths.logs, 'redis.log');
@@ -361,6 +363,68 @@ function secret(length = 48) {
   return randomBytes(length).toString('base64url');
 }
 
+function assertValidEncryptionKey(value, source) {
+  if (!value || value.length < 32) {
+    throw new Error(`${source} must contain a secret of at least 32 characters.`);
+  }
+}
+
+async function readDurableEncryptionKey(path) {
+  if (!(await exists(path))) return null;
+  const value = (await readFile(path, 'utf8')).trim();
+  assertValidEncryptionKey(value, 'The durable Mac API-key encryption key');
+  return value;
+}
+
+async function writeDurableEncryptionKey(path, value) {
+  assertValidEncryptionKey(value, 'The Mac API-key encryption key');
+  try {
+    await writeFile(path, `${value}\n`, { mode: 0o600, flag: 'wx' });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    const existing = await readDurableEncryptionKey(path);
+    if (existing !== value) {
+      throw new Error(
+        'The durable Mac API-key encryption key changed during runtime initialization. ' +
+          'Batshit refused to start with an ambiguous encryption key.'
+      );
+    }
+  }
+  await chmod(path, 0o600);
+}
+
+async function ensureDurableEncryptionKey(
+  values,
+  { keyPath = apiKeyEncryptionKeyPath, generateSecret = secret } = {}
+) {
+  const runtimeKey = (values.get('ENCRYPTION_KEY') || '').trim();
+  const durableKey = await readDurableEncryptionKey(keyPath);
+
+  if (durableKey) {
+    if (runtimeKey && runtimeKey !== durableKey) {
+      throw new Error(
+        'Mac runtime encryption key mismatch. Saved provider API keys may still be intact, ' +
+          'so Batshit refused to start instead of making them appear missing. Restore the ' +
+          'original ENCRYPTION_KEY in runtime.env or recover the matching durable key before retrying.'
+      );
+    }
+    if (!runtimeKey) {
+      values.set('ENCRYPTION_KEY', durableKey);
+      return { changed: true, source: 'durable-key' };
+    }
+    return { changed: false, source: 'runtime-and-durable-key' };
+  }
+
+  const resolvedKey = runtimeKey || generateSecret(48);
+  assertValidEncryptionKey(resolvedKey, 'The Mac API-key encryption key');
+  await writeDurableEncryptionKey(keyPath, resolvedKey);
+  if (!runtimeKey) {
+    values.set('ENCRYPTION_KEY', resolvedKey);
+    return { changed: true, source: 'generated-key' };
+  }
+  return { changed: false, source: 'runtime-key' };
+}
+
 function redisConfigValue(value) {
   return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
@@ -379,7 +443,8 @@ async function ensureRuntimeEnv() {
   // Distinct secret per boundary: the Docker MCP gateway token must not reuse
   // the internal service token (G-0180).
   setIfMissing('MCP_GATEWAY_AUTH_TOKEN', secret(48));
-  setIfMissing('ENCRYPTION_KEY', secret(48));
+  const encryptionKey = await ensureDurableEncryptionKey(values);
+  if (encryptionKey.changed) changed = true;
   setIfMissing('REDIS_URL', `redis://127.0.0.1:${DEFAULT_PORTS.redis}/0`);
   setIfMissing('REDIS_HOST', '127.0.0.1');
   setIfMissing('REDIS_PORT', String(DEFAULT_PORTS.redis));
@@ -3830,6 +3895,7 @@ export {
   chooseRedisShutdownMode,
   createServiceDefinitions,
   executeOrderedRuntimeStop,
+  ensureDurableEncryptionKey,
   isRedisTempSnapshotName,
   parseRedisInfo,
   publishJsonAtomically,

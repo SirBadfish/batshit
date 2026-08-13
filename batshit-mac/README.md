@@ -12,11 +12,14 @@ This package stays separate from `batshit-app` and `batshit-server`: Electron ow
 - Standard Electron sandboxed renderers and hidden helper app bundles.
 - Context isolation on, Node integration off, web security on, and navigation limited to the packaged startup shell plus explicit Batshit loopback origins.
 - One visible app instance; a second launch focuses the existing window.
+- One optional Desktop Goon companion window: exact authenticated route, isolated role-scoped preload/state port, transparent frameless policy, no microphone permission, and deterministic return-to-main lifecycle.
 - Runtime Doctor starts the packaged SvelteKit app, batshit-server, streamable MCP helper, and Mac-owned Redis before opening the real UI.
 - The runtime/data contract remains under `~/Library/Application Support/Batshit`, `~/Library/Logs/Batshit`, and `~/Library/Caches/Batshit` unless an isolated test lane supplies overrides.
 - Release runtime target: Apple Silicon on macOS 14 or newer. Node, Redis Stack, OpenSSL, and FFmpeg are package-owned; the build and final package audits reject Homebrew paths, missing loader-relative libraries, unresolved runtime search paths, and native files with a newer deployment target.
 
-The packaged startup UI is served from the privileged `batshit-shell://app` scheme instead of `file://`. The preload bridge exposes only exact runtime actions and the native save dialog. Renderer crashes and unresponsive states remain visible; the shell does not silently reload and discard editor state.
+The packaged startup UI is served from the privileged `batshit-shell://app` scheme instead of `file://`. The main preload bridge exposes only exact runtime actions, the native save dialog, and the narrow Desktop Goon controller. The Desktop preload exposes only its role-scoped Desktop API; raw Electron and raw `MessagePort` objects never enter app code. Renderer crashes, readiness timeouts, port/schema failures, and unresponsive states remain visible; the shell does not silently reload and discard editor state.
+
+Desktop Goon Mode keeps chat, microphone, speech recognition, audio playback, and session routing in the main renderer. The transparent renderer receives clone-safe snapshots/deltas only after both roles are ready, and the native window is shown only after the Goon renderer reports readiness. Close/failure destroys the Desktop owner before the main Dock is told to remount. `darwin` owns panel/Spaces behavior; deterministic `win32` policy tests are architecture proof only and are not a Windows support claim.
 
 ## Commands
 
@@ -63,7 +66,7 @@ npm run package:zip
 
 The preparation command prints the exact generated environment-file path when a custom asset root is configured; source that reported file before packaging.
 
-The normal app bundle is `zig-out/package/Batshit.app`, matching the product name shown in Finder and the Dock. Version and release-safety labeling remain on distributable artifacts such as `Batshit-0.1.0-macos-ReleaseSafe.zip` and `.dmg`, while isolated review builds use an explicit app suffix such as `Batshit-SA090-R7.app`. Local packages are ad-hoc signed. Set `MACOS_CODESIGN_IDENTITY` or `BATSHIT_MAC_SIGN_IDENTITY` to sign the full Electron helper/framework graph with a Developer ID identity.
+The normal app bundle is `zig-out/package/Batshit.app`, matching the product name shown in Finder and the Dock. Version and release-safety labeling remain on distributable artifacts such as `Batshit-0.1.0-macos-ReleaseSafe.zip` and `.dmg`, while isolated review builds use an explicit app suffix such as `Batshit-SA090-R7.app`. Direct `npm run package:mac` builds remain ad-hoc unless `MACOS_CODESIGN_IDENTITY` or `BATSHIT_MAC_SIGN_IDENTITY` is set. Team development rebuild tooling can automatically reuse an installed Developer ID so repeated local rebuilds retain one macOS code identity; `BATSHIT_MAC_SIGNING_MODE=stable` requires that identity and `BATSHIT_MAC_SIGNING_MODE=ad-hoc` explicitly opts out.
 
 Maintainers can launch the disposable first-run test lane from the private checkout. It rebuilds the same Electron package, wipes only the disposable first-run data/log/cache roots, and runs on isolated local ports without touching the normal Mac app data.
 

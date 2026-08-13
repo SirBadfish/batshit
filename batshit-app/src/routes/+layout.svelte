@@ -10,6 +10,10 @@
   import { installGlobalClientTelemetry } from '$lib/services/clientTelemetry';
   const { data, children } = $props();
 
+  const isDesktopGoonPage = $derived(page.url.pathname === '/desktop-goon');
+  const isDesktopControlsPage = $derived(page.url.pathname === '/desktop-controls');
+  const isDesktopCompanionPage = $derived(isDesktopGoonPage || isDesktopControlsPage);
+
   function normalizeRecord(value: unknown): Record<string, any> {
     return value && typeof value === 'object' && !Array.isArray(value)
       ? { ...(value as Record<string, any>) }
@@ -44,6 +48,7 @@
   
   // No registry sync needed anymore - we fetch directly from Upstash when needed!
   onMount(async () => {
+    if (isDesktopCompanionPage) return;
     enforceLaunchDarkTheme();
 
     if (data?.user) {
@@ -94,6 +99,20 @@
   }
 
   enforceLaunchDarkTheme();
+
+  $effect(() => {
+    if (typeof document === 'undefined') return;
+    document.documentElement.classList.toggle('batshit-desktop-goon-surface', isDesktopGoonPage);
+    document.body.classList.toggle('batshit-desktop-goon-surface', isDesktopGoonPage);
+    document.documentElement.classList.toggle('batshit-desktop-controls-surface', isDesktopControlsPage);
+    document.body.classList.toggle('batshit-desktop-controls-surface', isDesktopControlsPage);
+    return () => {
+      document.documentElement.classList.remove('batshit-desktop-goon-surface');
+      document.body.classList.remove('batshit-desktop-goon-surface');
+      document.documentElement.classList.remove('batshit-desktop-controls-surface');
+      document.body.classList.remove('batshit-desktop-controls-surface');
+    };
+  });
   
   // Check if we're on auth pages
   const isAuthPage = $derived(
@@ -102,7 +121,9 @@
   )
 </script>
 
-{#if isAuthPage}
+{#if isDesktopCompanionPage}
+  {@render children?.()}
+{:else if isAuthPage}
   <!-- Auth pages (login/setup) -->
   {@render children?.()}
 {:else}
@@ -126,5 +147,7 @@
   </Sidebar.SidebarProvider>
 {/if}
 
-<Toaster position="top-right" />
-<ConfirmDialogHost />
+{#if !isDesktopCompanionPage}
+  <Toaster position="top-right" />
+  <ConfirmDialogHost />
+{/if}

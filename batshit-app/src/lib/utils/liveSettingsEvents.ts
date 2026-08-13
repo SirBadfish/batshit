@@ -1,3 +1,5 @@
+import type { DesktopGoonPreferences } from '$lib/types/goons'
+
 export const LIVE_SETTINGS_EVENTS = {
   artifactUpdated: 'batshit:artifact-updated',
   artifactDeleted: 'batshit:artifact-deleted',
@@ -5,6 +7,7 @@ export const LIVE_SETTINGS_EVENTS = {
   localAiSettingsUpdated: 'batshit:local-ai-settings-updated',
   modelConnectionsUpdated: 'batshit:model-connections-updated',
   projectPreferencesUpdated: 'batshit:project-preferences-updated',
+  desktopGoonPreferencesUpdated: 'batshit:desktop-goon-preferences-updated',
   sessionClipStateChanged: 'batshit:session-clip-state-changed',
   slashCommandsUpdated: 'batshit:slash-commands-updated'
 } as const
@@ -22,17 +25,16 @@ export type ArtifactDraftPreviewDetail = {
 }
 
 export type ModelConnectionsUpdatedDetail = {
-  source:
-    | 'api-keys'
-    | 'custom-providers'
-    | 'local-ai'
-    | 'saved-models'
-    | 'runtime'
-    | 'unknown'
+  source: 'api-keys' | 'custom-providers' | 'local-ai' | 'saved-models' | 'runtime' | 'unknown'
 }
 
 export type ProjectPreferencesUpdatedDetail = {
   defaultWorkspacePath: string | null
+}
+
+export type DesktopGoonPreferencesUpdatedDetail = {
+  preferences: DesktopGoonPreferences
+  source: 'settings' | 'desktop-controls' | 'runtime'
 }
 
 export type SessionClipStateChangedDetail = {
@@ -42,13 +44,7 @@ export type SessionClipStateChangedDetail = {
 }
 
 export type SlashCommandsUpdatedDetail = {
-  source:
-    | 'agent-access'
-    | 'settings'
-    | 'skill-source'
-    | 'bootstrap'
-    | 'runtime'
-    | 'unknown'
+  source: 'agent-access' | 'settings' | 'skill-source' | 'bootstrap' | 'runtime' | 'unknown'
   commandId?: string
 }
 
@@ -58,24 +54,21 @@ function dispatchLiveSettingsEvent<T>(name: string, detail?: T) {
 }
 
 export function dispatchArtifactUpdated(artifactId: string) {
-  dispatchLiveSettingsEvent<ArtifactUpdatedDetail>(
-    LIVE_SETTINGS_EVENTS.artifactUpdated,
-    { artifactId }
-  )
+  dispatchLiveSettingsEvent<ArtifactUpdatedDetail>(LIVE_SETTINGS_EVENTS.artifactUpdated, {
+    artifactId
+  })
 }
 
 export function dispatchArtifactDeleted(artifactId: string) {
-  dispatchLiveSettingsEvent<ArtifactDeletedDetail>(
-    LIVE_SETTINGS_EVENTS.artifactDeleted,
-    { artifactId }
-  )
+  dispatchLiveSettingsEvent<ArtifactDeletedDetail>(LIVE_SETTINGS_EVENTS.artifactDeleted, {
+    artifactId
+  })
 }
 
 export function dispatchArtifactDraftPreview(artifactId: string | null) {
-  dispatchLiveSettingsEvent<ArtifactDraftPreviewDetail>(
-    LIVE_SETTINGS_EVENTS.artifactDraftPreview,
-    { artifactId }
-  )
+  dispatchLiveSettingsEvent<ArtifactDraftPreviewDetail>(LIVE_SETTINGS_EVENTS.artifactDraftPreview, {
+    artifactId
+  })
 }
 
 export function dispatchLocalAiSettingsUpdated() {
@@ -95,6 +88,13 @@ export function dispatchModelConnectionsUpdated(
 export function dispatchProjectPreferencesUpdated(detail: ProjectPreferencesUpdatedDetail) {
   dispatchLiveSettingsEvent<ProjectPreferencesUpdatedDetail>(
     LIVE_SETTINGS_EVENTS.projectPreferencesUpdated,
+    detail
+  )
+}
+
+export function dispatchDesktopGoonPreferencesUpdated(detail: DesktopGoonPreferencesUpdatedDetail) {
+  dispatchLiveSettingsEvent<DesktopGoonPreferencesUpdatedDetail>(
+    LIVE_SETTINGS_EVENTS.desktopGoonPreferencesUpdated,
     detail
   )
 }

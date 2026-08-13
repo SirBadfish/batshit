@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  DEFAULT_DESKTOP_GOON_PREFERENCES,
   mergeGoonsSettingsPatch,
+  normalizeDesktopGoonPreferences,
   normalizeGoonCueMap,
+  normalizeGoonsSettings,
   resolveGoonCues,
   resolvePreviewAnimationDefinition
 } from '$lib/goons/resolve'
@@ -216,5 +219,63 @@ describe('mergeGoonsSettingsPatch', () => {
     expect(merged.kitchen?.emojiMap?.[':)']).toBe('smile')
     expect(merged.kitchen?.cues?.calm?.name).toBe('calm')
     expect(merged.kitchen?.scenes?.cyberpunk?.name).toBe('Cyberpunk')
+  })
+
+  it('merges Desktop preferences without persisting transient mode or machine bounds', () => {
+    const settings = normalizeGoonsSettings({
+      desktop: {
+        fullHeight: true,
+        normalizedWidth: 0.4,
+        stayOnTop: true,
+        clickThrough: false,
+        controlsShortcut: 'CommandOrControl+Shift+G',
+        workspace: 'current-workspace'
+      }
+    })
+
+    const merged = mergeGoonsSettingsPatch(settings, {
+      desktop: {
+        clickThrough: true,
+        active: true,
+        bounds: { x: 40, y: 20 }
+      } as GoonsSettings['desktop'] & {
+        active?: boolean
+        bounds?: { x: number; y: number }
+      }
+    })
+
+    expect(merged.desktop).toEqual({
+      ...DEFAULT_DESKTOP_GOON_PREFERENCES,
+      normalizedWidth: 0.4,
+      clickThrough: true
+    })
+    expect(merged.desktop).not.toHaveProperty('active')
+    expect(merged.desktop).not.toHaveProperty('bounds')
+  })
+})
+
+describe('normalizeDesktopGoonPreferences', () => {
+  it('applies safe defaults and clamps the normalized display width', () => {
+    expect(normalizeDesktopGoonPreferences(null)).toEqual(DEFAULT_DESKTOP_GOON_PREFERENCES)
+    expect(normalizeDesktopGoonPreferences({ normalizedWidth: 4 }).normalizedWidth).toBe(1)
+    expect(normalizeDesktopGoonPreferences({ normalizedWidth: -1 }).normalizedWidth).toBe(0.1)
+  })
+
+  it('defaults stay-on-top on and click-through off while preserving explicit choices', () => {
+    expect(normalizeDesktopGoonPreferences({})).toMatchObject({
+      stayOnTop: true,
+      clickThrough: false
+    })
+    expect(
+      normalizeDesktopGoonPreferences({
+        stayOnTop: false,
+        clickThrough: true,
+        workspace: 'all-workspaces'
+      })
+    ).toMatchObject({
+      stayOnTop: false,
+      clickThrough: true,
+      workspace: 'all-workspaces'
+    })
   })
 })

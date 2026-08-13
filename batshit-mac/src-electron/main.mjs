@@ -10,24 +10,51 @@ import {
   app,
   BrowserWindow,
   dialog,
+  globalShortcut,
   ipcMain,
+  MessageChannelMain,
   protocol,
+  screen,
   session,
   shell
 } from 'electron';
 
 import {
+  DESKTOP_CONTROLS_IPC_CHANNEL,
+  DESKTOP_CONTROLS_STATE_CHANNEL,
+  validateDesktopControlsCommandEnvelope
+} from './desktop-controls-contract.mjs';
+import { DesktopControlsWindowController } from './desktop-controls-window-controller.mjs';
+import {
+  DESKTOP_GOON_IPC_CHANNEL,
+  DESKTOP_GOON_SCHEMA_VERSION,
+  DESKTOP_GOON_STATUS_CHANNEL,
+  DESKTOP_GOON_WINDOW_ROLES,
+  validateDesktopGoonCommandEnvelope
+} from './desktop-goon-contract.mjs';
+import { DesktopGoonWindowController } from './desktop-goon-window-controller.mjs';
+
+import {
   SUPERVISOR_COMMANDS,
   collectAllowedOrigins,
   isAllowedAppUrl,
+  isAllowedElectronMediaPermission,
+  isAllowedMainWindowUrl,
+  isExactDesktopControlsUrl,
+  isExactDesktopGoonUrl,
   isSafeExternalUrl,
+  resolveDesktopControlsUrl,
+  resolveDesktopGoonUrl,
   resolveShellAssetPath,
+  validateElectronIpcSender,
   validateSaveFileOptions
 } from './electron-shell-policy.mjs';
 
 const execFileAsync = promisify(execFile);
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const allowedOrigins = collectAllowedOrigins();
+const desktopGoonUrl = resolveDesktopGoonUrl();
+const desktopControlsUrl = resolveDesktopControlsUrl();
 const shellRoot = app.isPackaged
   ? join(app.getAppPath(), 'shell')
   : join(app.getAppPath(), 'frontend', 'dist');
@@ -46,8 +73,11 @@ const mimeTypes = new Map([
 ]);
 
 let mainWindow = null;
+let desktopGoonController = null;
+let desktopControlsController = null;
 let shutdownStarted = false;
 let quittingAfterShutdown = false;
+const windowRoleRegistry = new Map();
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -122,16 +152,82 @@ async function runSupervisor(action) {
   }
 }
 
-function validateIpcSender(event) {
-  const url = event.senderFrame?.url || event.sender.getURL();
-  if (!isAllowedAppUrl(url, allowedOrigins)) {
-    throw new Error('The native Mac bridge rejected an untrusted sender.');
+function registerWindowRole(webContents, role) {
+  const record = {
+    role,
+    webContents,
+    lastDesktopSequence: 0,
+    lastControlsSequence: 0
+  };
+  windowRoleRegistry.set(webContents.id, record);
+  const resetSequence = (_event, _url, _isInPlace, isMainFrame) => {
+    if (isMainFrame) {
+      record.lastDesktopSequence = 0;
+      record.lastControlsSequence = 0;
+    }
+  };
+  const remove = () => {
+    if (windowRoleRegistry.get(webContents.id) === record) {
+      windowRoleRegistry.delete(webContents.id);
+    }
+  };
+  webContents.on('did-start-navigation', resetSequence);
+  webContents.once('destroyed', remove);
+  return () => {
+    webContents.removeListener('did-start-navigation', resetSequence);
+    webContents.removeListener('destroyed', remove);
+    remove();
+  };
+}
+
+function validateIpcSender(event, allowedRoles) {
+  return validateElectronIpcSender(event, {
+    allowedOrigins,
+    roleRegistry: windowRoleRegistry,
+    allowedRoles,
+    desktopUrl: desktopGoonUrl,
+    controlsUrl: desktopControlsUrl
+  });
+}
+
+function sendDesktopGoonStatus(value) {
+  for (const record of windowRoleRegistry.values()) {
+    if (
+      !record.webContents.isDestroyed() &&
+      [DESKTOP_GOON_WINDOW_ROLES.main, DESKTOP_GOON_WINDOW_ROLES.desktop].includes(record.role)
+    ) {
+      record.webContents.send(DESKTOP_GOON_STATUS_CHANNEL, value);
+    }
   }
+}
+
+function sendDesktopControlsState(value) {
+  for (const record of windowRoleRegistry.values()) {
+    if (
+      !record.webContents.isDestroyed() &&
+      [DESKTOP_GOON_WINDOW_ROLES.main, DESKTOP_GOON_WINDOW_ROLES.controls].includes(record.role)
+    ) {
+      record.webContents.send(DESKTOP_CONTROLS_STATE_CHANNEL, value);
+    }
+  }
+}
+
+function restoreMainRecoverySurface(reason = 'recovery') {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  sendDesktopGoonStatus({
+    schemaVersion: DESKTOP_GOON_SCHEMA_VERSION,
+    type: 'main-recovery-surface-restored',
+    detail: { reason },
+    status: desktopGoonController?.getStatus() || null
+  });
 }
 
 function installIpcHandlers() {
   ipcMain.handle('batshit:invoke', async (event, command, payload) => {
-    validateIpcSender(event);
+    validateIpcSender(event, [DESKTOP_GOON_WINDOW_ROLES.main]);
     if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
       throw new Error('Runtime bridge payload must be an object.');
     }
@@ -141,7 +237,7 @@ function installIpcHandlers() {
   });
 
   ipcMain.handle('batshit:save-file', async (event, rawOptions) => {
-    validateIpcSender(event);
+    validateIpcSender(event, [DESKTOP_GOON_WINDOW_ROLES.main]);
     const options = validateSaveFileOptions(rawOptions);
     const defaultPath = options.defaultPath ||
       (options.defaultName ? join(app.getPath('downloads'), basename(options.defaultName)) : undefined);
@@ -150,6 +246,38 @@ function installIpcHandlers() {
       defaultPath
     });
     return result.canceled ? null : result.filePath || null;
+  });
+
+  ipcMain.handle(DESKTOP_GOON_IPC_CHANNEL, async (event, rawEnvelope) => {
+    if (!desktopGoonController) throw new Error('Desktop Goon controller is unavailable.');
+    const record = validateIpcSender(event, [
+      DESKTOP_GOON_WINDOW_ROLES.main,
+      DESKTOP_GOON_WINDOW_ROLES.desktop
+    ]);
+    const envelope = validateDesktopGoonCommandEnvelope(rawEnvelope, {
+      role: record.role,
+      lastSequence: record.lastDesktopSequence
+    });
+    record.lastDesktopSequence = envelope.sequence;
+    return desktopGoonController.handleCommand(record.role, envelope.command, envelope.payload);
+  });
+
+  ipcMain.handle(DESKTOP_CONTROLS_IPC_CHANNEL, async (event, rawEnvelope) => {
+    if (!desktopControlsController) throw new Error('Desktop Controls are unavailable.');
+    const record = validateIpcSender(event, [
+      DESKTOP_GOON_WINDOW_ROLES.main,
+      DESKTOP_GOON_WINDOW_ROLES.controls
+    ]);
+    const envelope = validateDesktopControlsCommandEnvelope(rawEnvelope, {
+      role: record.role,
+      lastSequence: record.lastControlsSequence
+    });
+    record.lastControlsSequence = envelope.sequence;
+    return desktopControlsController.handleCommand(
+      record.role,
+      envelope.command,
+      envelope.payload
+    );
   });
 }
 
@@ -173,11 +301,16 @@ async function installShellProtocol() {
 
 function configureSessionPermissions() {
   const isAllowed = (webContents, permission, requestingOrigin, details = {}) => {
-    const origin = requestingOrigin || details.requestingUrl || webContents?.getURL?.() || '';
-    if (!isAllowedAppUrl(origin, allowedOrigins)) return false;
-    if (permission !== 'media') return false;
-    const mediaTypes = details.mediaTypes || [];
-    return mediaTypes.length === 0 || mediaTypes.every((type) => type === 'audio');
+    return isAllowedElectronMediaPermission({
+      webContents,
+      permission,
+      requestingUrl: requestingOrigin || details.requestingUrl,
+      details,
+      roleRegistry: windowRoleRegistry,
+      allowedOrigins,
+      desktopUrl: desktopGoonUrl,
+      controlsUrl: desktopControlsUrl
+    });
   };
   session.defaultSession.setPermissionCheckHandler(isAllowed);
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
@@ -185,7 +318,7 @@ function configureSessionPermissions() {
   });
 }
 
-function configureWebContents(contents) {
+function configureBaseWebContents(contents) {
   contents.on('will-navigate', (event, navigationUrl) => {
     if (isAllowedAppUrl(navigationUrl, allowedOrigins)) return;
     event.preventDefault();
@@ -196,6 +329,24 @@ function configureWebContents(contents) {
     return { action: 'deny' };
   });
   contents.on('will-attach-webview', (event) => event.preventDefault());
+}
+
+function configureRoleNavigation(contents, role) {
+  const isAllowed = (navigationUrl) => role === DESKTOP_GOON_WINDOW_ROLES.desktop
+    ? isExactDesktopGoonUrl(navigationUrl, desktopGoonUrl)
+    : role === DESKTOP_GOON_WINDOW_ROLES.controls
+      ? isExactDesktopControlsUrl(navigationUrl, desktopControlsUrl)
+      : isAllowedMainWindowUrl(
+          navigationUrl,
+          allowedOrigins,
+          desktopGoonUrl,
+          desktopControlsUrl
+        );
+  const enforce = (event, navigationUrl) => {
+    if (!isAllowed(navigationUrl)) event.preventDefault();
+  };
+  contents.on('will-navigate', enforce);
+  contents.on('will-redirect', enforce);
 }
 
 function createWindow() {
@@ -217,25 +368,39 @@ function createWindow() {
       devTools: process.env.BATSHIT_MAC_ENABLE_DEVTOOLS === '1'
     }
   });
+  registerWindowRole(window.webContents, DESKTOP_GOON_WINDOW_ROLES.main);
+  configureRoleNavigation(window.webContents, DESKTOP_GOON_WINDOW_ROLES.main);
   window.once('ready-to-show', () => window.show());
   window.webContents.on('render-process-gone', (_event, details) => {
     if (quittingAfterShutdown) return;
-    void dialog.showMessageBox(window, {
-      type: 'error',
-      title: 'Batshit renderer stopped',
-      message: 'The Batshit window process stopped unexpectedly.',
-      detail: `Reason: ${details.reason}. Your local runtime was left running so this failure is visible and recoverable.`,
-      buttons: ['Close']
+    void desktopGoonController?.handleMainRendererFailure('main-renderer-stopped').finally(() => {
+      void dialog.showMessageBox(window, {
+        type: 'error',
+        title: 'Batshit renderer stopped',
+        message: 'The Batshit window process stopped unexpectedly.',
+        detail: `Reason: ${details.reason}. The Desktop Goon was closed and your local runtime was left running so this failure is visible and recoverable.`,
+        buttons: ['Close']
+      });
     });
   });
   window.on('unresponsive', () => {
-    void dialog.showMessageBox(window, {
-      type: 'warning',
-      title: 'Batshit is not responding',
-      message: 'The Batshit window stopped responding.',
-      detail: 'The app will not silently reload or discard your editor state. Wait for the current work to finish or close the app deliberately.',
-      buttons: ['OK']
+    void desktopGoonController?.handleMainRendererFailure('main-renderer-unresponsive').finally(() => {
+      void dialog.showMessageBox(window, {
+        type: 'warning',
+        title: 'Batshit is not responding',
+        message: 'The Batshit window stopped responding.',
+        detail: 'The Desktop Goon was closed. The app will not silently reload or discard your editor state.',
+        buttons: ['OK']
+      });
     });
+  });
+  window.on('close', (event) => {
+    if (quittingAfterShutdown) return;
+    event.preventDefault();
+    app.quit();
+  });
+  window.on('closed', () => {
+    if (mainWindow === window) mainWindow = null;
   });
   void window.loadURL(shellUrl);
   return window;
@@ -245,6 +410,8 @@ async function stopRuntimeBeforeQuit() {
   if (shutdownStarted) return;
   shutdownStarted = true;
   try {
+    await desktopGoonController?.prepareForQuit();
+    await desktopControlsController?.prepareForQuit();
     await runSupervisor('stop');
   } catch (error) {
     console.error('[Batshit Mac] Runtime shutdown failed:', error);
@@ -256,10 +423,7 @@ if (!hasSingleInstanceLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.show();
-    mainWindow.focus();
+    restoreMainRecoverySurface('second-instance');
   });
 
   app.on('before-quit', (event) => {
@@ -275,9 +439,69 @@ if (!hasSingleInstanceLock) {
 
   app.whenReady().then(async () => {
     await installShellProtocol();
-    installIpcHandlers();
     configureSessionPermissions();
-    app.on('web-contents-created', (_event, contents) => configureWebContents(contents));
+    app.on('web-contents-created', (_event, contents) => configureBaseWebContents(contents));
+    desktopControlsController = new DesktopControlsWindowController({
+      BrowserWindow,
+      screen,
+      platform: process.platform,
+      preloadPath: join(moduleDir, 'preload.cjs'),
+      controlsUrl: desktopControlsUrl,
+      stateFilePath: join(app.getPath('userData'), 'desktop-controls-window-state-v1.json'),
+      registerWindowRole,
+      configureControlsWebContents: (contents) =>
+        configureRoleNavigation(contents, DESKTOP_GOON_WINDOW_ROLES.controls),
+      getDesktopGoonState: () => desktopGoonController?.getStatus() || null,
+      setAdjust: (enabled, source) => desktopGoonController?.setAdjustMode(enabled, source),
+      emitState: (state) => sendDesktopControlsState(state),
+      devTools: process.env.BATSHIT_MAC_ENABLE_DEVTOOLS === '1'
+    });
+    desktopGoonController = new DesktopGoonWindowController({
+      BrowserWindow,
+      MessageChannelMain,
+      screen,
+      globalShortcut,
+      platform: process.platform,
+      preloadPath: join(moduleDir, 'preload.cjs'),
+      desktopUrl: desktopGoonUrl,
+      stateFilePath: join(app.getPath('userData'), 'desktop-goon-window-state-v1.json'),
+      registerWindowRole,
+      configureDesktopWebContents: (contents) =>
+        configureRoleNavigation(contents, DESKTOP_GOON_WINDOW_ROLES.desktop),
+      getMainWindow: () => mainWindow,
+      emitStatus: (status) => sendDesktopGoonStatus(status),
+      openDesktopControls: (options) => desktopControlsController.open(options),
+      closeDesktopControls: (options) => desktopControlsController.close(options),
+      toggleDesktopControls: (source) => desktopControlsController.toggle(source),
+      syncDesktopControlsWorkspace: (workspace) =>
+        desktopControlsController.syncWorkspace(workspace),
+      notifyAdjustChanged: (enabled, source) =>
+        desktopControlsController.handleAdjustChanged(enabled, source),
+      requestReturnToBatshit: async (reason) => {
+        sendDesktopGoonStatus({
+          schemaVersion: DESKTOP_GOON_SCHEMA_VERSION,
+          type: 'return-to-batshit-requested',
+          detail: { reason },
+          status: desktopGoonController?.getStatus() || null
+        });
+        restoreMainRecoverySurface(reason);
+      },
+      showFailure: async (message) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          await dialog.showMessageBox(mainWindow, {
+            type: 'error',
+            title: 'Desktop Goon stopped',
+            message,
+            detail: 'The Desktop Goon was returned to Batshit so the failure remains recoverable.',
+            buttons: ['OK']
+          });
+        } else {
+          dialog.showErrorBox('Desktop Goon stopped', message);
+        }
+      },
+      devTools: process.env.BATSHIT_MAC_ENABLE_DEVTOOLS === '1'
+    });
+    installIpcHandlers();
     mainWindow = createWindow();
   }).catch((error) => {
     console.error('[Batshit Mac] Shell startup failed:', error);

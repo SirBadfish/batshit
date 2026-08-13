@@ -1,10 +1,15 @@
 import type { GoonCueMap, GoonEmojiMap, GoonRecord, GoonsSettings } from '$lib/types/goons'
 import { resolveGoonCues } from '$lib/goons/resolve'
+import {
+  normalizeDesktopGoonPresentationMode,
+  type DesktopGoonPresentationMode
+} from '$lib/goons/desktopGoonPresentation'
 
 export type GoonDcmOptions = {
   maxCuesPerGroup?: number
   maxEmojis?: number
   includeSpokenCues?: boolean
+  presentationMode?: DesktopGoonPresentationMode | null
 }
 
 type GoonDcmLimits = Required<Pick<GoonDcmOptions, 'maxCuesPerGroup' | 'maxEmojis'>>
@@ -133,6 +138,7 @@ export function buildGoonDcmLines(
     ...options
   }
   const includeSpokenCues = options.includeSpokenCues === true
+  const presentationMode = normalizeDesktopGoonPresentationMode(options.presentationMode) ?? 'dock'
 
   const { cueMap, emojiMap } = resolveGoonCues(goon, goonsSettings)
 
@@ -182,10 +188,24 @@ export function buildGoonDcmLines(
     lines.push(`Current mood: ${baseLoop}`)
   }
 
-  const sceneId = goon.defaults?.sceneId?.trim()
-  const activeScene = sceneId ? goonsSettings?.kitchen?.scenes?.[sceneId] : null
-  if (activeScene?.name) {
-    lines.push(`Scene: ${activeScene.name}`)
+  if (presentationMode === 'desktop') {
+    lines.push(
+      "Presentation: Desktop Mode — your live 3D Goon is currently visible directly on the user's operating-system desktop in a transparent, scene-free window, with wallpaper or other apps potentially behind and around you."
+    )
+    lines.push(
+      "Desktop visibility boundary: no Batshit room, skybox, or saved Goon scene is visible. Desktop Mode does not give you screen vision; do not claim to see the user's wallpaper, windows, apps, or desktop contents unless the user shares them."
+    )
+  } else {
+    lines.push(
+      presentationMode === 'immersive'
+        ? "Presentation: Immersive Mode — your live 3D Goon is currently visible across the user's Batshit workspace."
+        : "Presentation: Goon Dock — your live 3D Goon is currently visible inside the user's Batshit app."
+    )
+    const sceneId = goon.defaults?.sceneId?.trim()
+    const activeScene = sceneId ? goonsSettings?.kitchen?.scenes?.[sceneId] : null
+    if (activeScene?.name) {
+      lines.push(`Scene: ${activeScene.name}`)
+    }
   }
 
   const closetEntries = resolveClosetEntries(goon, goonsSettings)

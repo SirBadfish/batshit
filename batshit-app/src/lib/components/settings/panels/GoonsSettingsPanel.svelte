@@ -12,6 +12,7 @@
   import * as Dialog from '$lib/components/ui/dialog'
   import { Button } from '$lib/components/ui/button'
   import { Input } from '$lib/components/ui/input'
+  import { Slider } from '$lib/components/ui/slider'
   import { Badge } from '$lib/components/ui/badge'
   import * as Tooltip from '$lib/components/ui/tooltip'
   import {
@@ -38,6 +39,7 @@
     Save,
     Scissors,
     SlidersHorizontal,
+    MonitorUp,
     Trash2,
     Upload,
     X
@@ -52,6 +54,7 @@
   import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCard.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import SettingsTextEditor from '$lib/components/settings/SettingsTextEditor.svelte'
+  import DesktopShortcutRecorder from '$lib/components/settings/DesktopShortcutRecorder.svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
   import AnimationPreviewThumb, {
@@ -93,6 +96,7 @@
   import type { RecipeFittedPreviewState } from '$lib/components/settings/goons/recipe/types'
   import {
     normalizeGoonCueMap,
+    normalizeDesktopGoonPreferences,
     normalizeGoonsSettings,
     resolveKitchenCues,
     resolveGoonCues,
@@ -380,6 +384,7 @@
     GoonSourceProfile,
     GoonVrmUpdateReport,
     GoonsSettings,
+    DesktopGoonPreferences,
     GoonXWearData,
     GoonFaceControl,
     GoonCueFaceProfiles,
@@ -456,7 +461,12 @@
     type RecipeStageResponse,
     type RecipeStateSnapshot
   } from '$lib/goons/recipe'
-  import { persistGoonsSettingsRequest } from '$lib/services/goonsSettingsPersistence'
+  import {
+    persistGoonsSettingsPatchRequest,
+    persistGoonsSettingsRequest
+  } from '$lib/services/goonsSettingsPersistence'
+  import { DEFAULT_DESKTOP_CONTROLS_SHORTCUT } from '$lib/goons/desktopShortcut'
+  import { dispatchDesktopGoonPreferencesUpdated } from '$lib/utils/liveSettingsEvents'
   import {
     importGoonLibraryExportBundle
   } from '$lib/goons/packs'
@@ -1168,6 +1178,12 @@
 
   const userSettings = $derived(getUserSettings())
   const goonsSettings = $derived.by(() => normalizeGoonsSettings(userSettings?.goons_settings ?? null))
+  let desktopSettingsSaving = $state(false)
+  let desktopNormalizedWidthDraft = $state<number | null>(null)
+  const desktopNormalizedWidthPercent = $derived(
+    desktopNormalizedWidthDraft ?? Math.round((goonsSettings.desktop?.normalizedWidth ?? 0.35) * 100)
+  )
+
   const stagePostureMap = $derived.by(() => resolveStagePostures(goonsSettings))
   const stagePostureOptions = $derived.by(() => listStagePostures(goonsSettings))
   const motionCustomPostureDraftMap = $derived.by(() => {
@@ -8231,6 +8247,37 @@
       setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
     }
     return persistedSettings
+  }
+
+  async function persistDesktopGoonPreferences(patch: Partial<DesktopGoonPreferences>) {
+    if (desktopSettingsSaving) return
+    desktopSettingsSaving = true
+    try {
+      const persistedSettings = await persistGoonsSettingsPatchRequest(fetch, {
+        desktop: normalizeDesktopGoonPreferences({
+          ...goonsSettings.desktop,
+          ...patch
+        })
+      })
+      const currentUserSettings = getUserSettings()
+      if (currentUserSettings) {
+        setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
+      }
+      dispatchDesktopGoonPreferencesUpdated({
+        source: 'settings',
+        preferences: normalizeDesktopGoonPreferences(persistedSettings.desktop)
+      })
+    } catch (error: any) {
+      toast.error(error?.message || 'Failed to save Desktop Mode settings')
+    } finally {
+      desktopSettingsSaving = false
+      desktopNormalizedWidthDraft = null
+    }
+  }
+
+  function normalizeDesktopWidthSlider(value: number | number[]) {
+    const next = typeof value === 'number' ? value : value[0]
+    return Number.isFinite(next) ? Math.max(10, Math.min(100, Math.round(next))) : 35
   }
 
   // The GLB preview body choice is a preference, not staged library data —
@@ -16989,9 +17036,208 @@
           </div>
         </Card.Content>
       </Card.Root>
-    {/if}
+	    {/if}
 	    {#if activeTab === 'goons'}
-      <SettingsAccordionCard name="goon-settings-cards" title="Goon Library" batshitIcon="goons" open>
+	      <SettingsAccordionCard name="goon-settings-cards" title="Desktop Mode" open>
+	        {#snippet info()}
+	          <SettingsInfoMenu ariaLabel="About Desktop Mode" contentClass="w-96">
+	            <p>
+	              Desktop Mode moves the active Live Goon into a transparent companion window while
+	              Batshit keeps ownership of chat, microphone, speech, and audio playback.
+	            </p>
+	            <p>
+	              These preferences take effect only in the managed Batshit desktop app. Exact monitor
+	              position and pixel bounds stay on this computer.
+	            </p>
+	          </SettingsInfoMenu>
+	        {/snippet}
+	        <div class="batshit-settings-form-stack">
+	          <div class="batshit-settings-form-row">
+	            <div class="batshit-settings-form-copy">
+	              <div class="batshit-settings-form-label-line">
+	                <MonitorUp aria-hidden="true" class="h-4 w-4" />
+	                <Label.Root class="batshit-settings-form-label">Full Height</Label.Root>
+	                <SettingsInfoMenu ariaLabel="About Full Height" contentClass="w-80">
+	                  <p>
+	                    Locks the transparent frame to the selected monitor's usable height. Width and
+	                    horizontal position remain adjustable while Adjust is on.
+	                  </p>
+	                </SettingsInfoMenu>
+	              </div>
+	            </div>
+	            <div class="batshit-settings-form-control is-inline-status">
+	              <span class="batshit-settings-form-label">
+	                {goonsSettings.desktop?.fullHeight ? 'Enabled' : 'Disabled'}
+	              </span>
+	              <Switch.Root
+	                checked={goonsSettings.desktop?.fullHeight ?? true}
+	                disabled={desktopSettingsSaving}
+	                aria-label="Full Height"
+	                onCheckedChange={(checked) =>
+	                  void persistDesktopGoonPreferences({ fullHeight: Boolean(checked) })}
+	              />
+	            </div>
+	          </div>
+
+	          <div class="batshit-settings-form-row">
+	            <div class="batshit-settings-form-copy">
+	              <div class="batshit-settings-form-label-line">
+	                <Label.Root class="batshit-settings-form-label">Frame Width</Label.Root>
+	                <SettingsInfoMenu ariaLabel="About Desktop Goon Frame Width" contentClass="w-80">
+	                  <p>
+	                    Sets the starting width as a percentage of the selected monitor. Adjust can
+	                    still resize and place the frame anywhere on that monitor.
+	                  </p>
+	                </SettingsInfoMenu>
+	              </div>
+	            </div>
+	            <div class="batshit-settings-form-control">
+	              <div class="flex items-center gap-3">
+	                <Slider
+	                  type="single"
+	                  value={desktopNormalizedWidthPercent}
+	                  min={10}
+	                  max={100}
+	                  step={5}
+	                  disabled={desktopSettingsSaving}
+	                  aria-label="Desktop Goon frame width"
+	                  aria-valuetext={`${desktopNormalizedWidthPercent}% of the selected monitor`}
+	                  onValueChange={(value: number | number[]) => {
+	                    desktopNormalizedWidthDraft = normalizeDesktopWidthSlider(value)
+	                  }}
+	                  onValueCommit={(value: number | number[]) => {
+	                    const percent = normalizeDesktopWidthSlider(value)
+	                    desktopNormalizedWidthDraft = percent
+	                    void persistDesktopGoonPreferences({ normalizedWidth: percent / 100 })
+	                  }}
+	                  class="w-full"
+	                />
+	                <span class="min-w-10 text-right text-xs text-muted-foreground">
+	                  {desktopNormalizedWidthPercent}%
+	                </span>
+	              </div>
+	            </div>
+	          </div>
+
+	          <div class="batshit-settings-form-row">
+	            <div class="batshit-settings-form-copy">
+	              <div class="batshit-settings-form-label-line">
+	                <Label.Root class="batshit-settings-form-label">Stay on Top</Label.Root>
+	                <SettingsInfoMenu ariaLabel="About Stay on Top" contentClass="w-80">
+	                  <p>Keeps the Desktop Goon above normal application windows.</p>
+	                </SettingsInfoMenu>
+	              </div>
+	            </div>
+	            <div class="batshit-settings-form-control is-inline-status">
+	              <span class="batshit-settings-form-label">
+	                {goonsSettings.desktop?.stayOnTop ? 'Enabled' : 'Disabled'}
+	              </span>
+	              <Switch.Root
+	                checked={goonsSettings.desktop?.stayOnTop ?? true}
+	                disabled={desktopSettingsSaving}
+	                aria-label="Stay on Top"
+	                onCheckedChange={(checked) =>
+	                  void persistDesktopGoonPreferences({ stayOnTop: Boolean(checked) })}
+	              />
+	            </div>
+	          </div>
+
+	          <div class="batshit-settings-form-row">
+	            <div class="batshit-settings-form-copy">
+	              <div class="batshit-settings-form-label-line">
+	                <Label.Root class="batshit-settings-form-label">Click-Through</Label.Root>
+	                <SettingsInfoMenu ariaLabel="About Click-Through" contentClass="w-96">
+	                  <p>
+	                    Lets clicks pass through the entire transparent Goon window. The Desktop Controls
+	                    island remains clickable, and its Adjust button temporarily restores Goon input.
+	                  </p>
+	                </SettingsInfoMenu>
+	              </div>
+	            </div>
+	            <div class="batshit-settings-form-control is-inline-status">
+	              <span class="batshit-settings-form-label">
+	                {goonsSettings.desktop?.clickThrough ? 'Enabled' : 'Disabled'}
+	              </span>
+	              <Switch.Root
+	                checked={goonsSettings.desktop?.clickThrough ?? false}
+	                disabled={desktopSettingsSaving}
+	                aria-label="Click-Through"
+	                onCheckedChange={(checked) =>
+	                  void persistDesktopGoonPreferences({ clickThrough: Boolean(checked) })}
+	              />
+	            </div>
+	          </div>
+
+	          <div class="batshit-settings-form-row">
+	            <div class="batshit-settings-form-copy">
+	              <div class="batshit-settings-form-label-line">
+	                <Label.Root for="desktop-controls-shortcut" class="batshit-settings-form-label">
+	                  Desktop Controls Shortcut
+	                </Label.Root>
+	                <SettingsInfoMenu ariaLabel="About the Desktop Controls shortcut" contentClass="w-96">
+	                  <p>
+	                    This system-global shortcut shows or hides the Desktop Controls island even when
+	                    Batshit is covered or the Desktop Goon is click-through.
+	                  </p>
+	                </SettingsInfoMenu>
+	              </div>
+	            </div>
+	            <div class="batshit-settings-form-control">
+	              <DesktopShortcutRecorder
+	                id="desktop-controls-shortcut"
+	                value={goonsSettings.desktop?.controlsShortcut ?? DEFAULT_DESKTOP_CONTROLS_SHORTCUT}
+	                defaultValue={DEFAULT_DESKTOP_CONTROLS_SHORTCUT}
+	                disabled={desktopSettingsSaving}
+	                onCommit={(controlsShortcut) =>
+	                  void persistDesktopGoonPreferences({ controlsShortcut })}
+	              />
+	            </div>
+	          </div>
+
+	          <div class="batshit-settings-form-row">
+	            <div class="batshit-settings-form-copy">
+	              <div class="batshit-settings-form-label-line">
+	                <Label.Root class="batshit-settings-form-label">Desktop Visibility</Label.Root>
+	                <SettingsInfoMenu ariaLabel="About desktop visibility" contentClass="w-96">
+	                  <p>
+	                    This Desktop keeps the companion on its current macOS desktop. All Desktops follows
+	                    you across desktops and full-screen apps. Windows ignores All Desktops.
+	                  </p>
+	                </SettingsInfoMenu>
+	              </div>
+	            </div>
+	            <div class="batshit-settings-form-control">
+	              <Select.Root
+	                type="single"
+	                value={goonsSettings.desktop?.workspace ?? 'current-workspace'}
+	                disabled={desktopSettingsSaving}
+	                onValueChange={(value: string) => {
+	                  if (value !== 'current-workspace' && value !== 'all-workspaces') return
+	                  void persistDesktopGoonPreferences({ workspace: value })
+	                }}
+	              >
+	              <Select.Trigger aria-label="Desktop Goon desktop visibility">
+	                  {goonsSettings.desktop?.workspace === 'all-workspaces'
+	                    ? 'All Desktops'
+	                    : 'This Desktop'}
+	                </Select.Trigger>
+	                <Select.Content>
+	                  <Select.Item value="current-workspace">This Desktop</Select.Item>
+	                  <Select.Item value="all-workspaces">All Desktops</Select.Item>
+	                </Select.Content>
+	              </Select.Root>
+	            </div>
+	          </div>
+
+	          {#if desktopSettingsSaving}
+	            <div class="batshit-settings-action-row justify-end" aria-live="polite">
+	              <Badge variant="outline" class="batshit-settings-child-label">Saving…</Badge>
+	            </div>
+	          {/if}
+	        </div>
+	      </SettingsAccordionCard>
+
+	      <SettingsAccordionCard name="goon-settings-cards" title="Goon Library" batshitIcon="goons" open>
         {#snippet info()}
           <SettingsInfoMenu ariaLabel="About Goon Library" contentClass="w-80">
             <p>

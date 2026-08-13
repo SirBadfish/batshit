@@ -1185,7 +1185,7 @@ function getServiceIconRef(row: ApiKeyServiceDefinition): IconRef {
           Loading API keys…
         </Card.Content>
       </Card.Root>
-    {:else}
+    {:else if !loadError}
       {#each GROUPS as group}
         <Card.Root class="batshit-settings-card batshit-settings-card-default batshit-settings-l1-card batshit-api-key-group-card">
           <Collapsible.Root open={openGroupId === group.id}>

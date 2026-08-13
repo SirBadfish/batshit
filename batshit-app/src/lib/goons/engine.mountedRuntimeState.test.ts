@@ -41,6 +41,7 @@ describe('GoonEngine mounted runtime continuity', () => {
     outgoing.oneShotRestorePosture = 'stand'
     outgoing.oneShotRestorePreserveCamera = true
     outgoing.animationOverridePosture = 'sit'
+    outgoing.goonRotation = 1.25
     outgoing.eyeContactEnabled = false
     outgoing.eyeContactApplied = { eyeYaw: 0.2, eyePitch: -0.1, headYaw: 0.3, headPitch: 0.1 }
     outgoing.customPerformanceDirection = { headYaw: 0.3, headPitch: 0.1, eyeYaw: 0.2, eyePitch: -0.1 }
@@ -77,6 +78,7 @@ describe('GoonEngine mounted runtime continuity', () => {
     const snapshot = outgoing.captureMountedRuntimeState()
     expect(snapshot.baseLoop).toMatchObject({ clipName: 'base-relaxed.glb', time: 4.25 })
     expect(snapshot.oneShot).toMatchObject({ clipName: 'wave.glb', time: 0.6 })
+    expect(snapshot.goonRotation).toBe(1.25)
     expect(snapshot.performance.expressions[0]).not.toHaveProperty('startTime')
     expect(snapshot.performance.expressions[0]).not.toHaveProperty('endsAt')
 
@@ -91,6 +93,8 @@ describe('GoonEngine mounted runtime continuity', () => {
       return true
     })
     const applyCamera = vi.spyOn(incoming, 'applyCamera').mockImplementation(() => {})
+    const avatarRoot = { rotation: { y: 0 } }
+    vi.spyOn(incoming, 'getActiveAvatarRoot').mockReturnValue(avatarRoot)
 
     incoming.restoreMountedRuntimeState(snapshot)
 
@@ -99,6 +103,8 @@ describe('GoonEngine mounted runtime continuity', () => {
     expect(incoming.speaking).toBe(true)
     expect(incoming.speechPausedForCue).toBe(true)
     expect(incoming.speechLipSyncTimeline).toEqual(snapshot.speech.timeline)
+    expect(incoming.goonRotation).toBe(1.25)
+    expect(avatarRoot.rotation.y).toBe(1.25)
     expect(incoming.activeExpressions[0].endsAt).toBeGreaterThan(performance.now())
     expect(applyCamera).toHaveBeenCalledWith(snapshot.camera)
   })

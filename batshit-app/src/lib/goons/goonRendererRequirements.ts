@@ -1,6 +1,8 @@
+export type GoonRendererSurfaceProfile = 'opaque' | 'desktop-transparent'
+
 export type GoonRendererConstructionOptions = {
   antialias: true
-  alpha: false
+  alpha: boolean
   powerPreference: 'high-performance'
   forceWebGL: boolean
   requiredLimits?: {
@@ -51,14 +53,15 @@ export function resolveGoonRendererBackendPolicy(options: {
 
 export function buildGoonRendererConstructionOptions(
   forceWebGL: boolean,
-  requiredMaxTextureArrayLayers: number
+  requiredMaxTextureArrayLayers: number,
+  surfaceProfile: GoonRendererSurfaceProfile = 'opaque'
 ): GoonRendererConstructionOptions {
   if (!Number.isInteger(requiredMaxTextureArrayLayers) || requiredMaxTextureArrayLayers < 0) {
     throw new Error('Renderer texture-array requirement must be a non-negative integer.')
   }
   return {
     antialias: true,
-    alpha: false,
+    alpha: surfaceProfile === 'desktop-transparent',
     powerPreference: 'high-performance',
     forceWebGL,
     ...(!forceWebGL && requiredMaxTextureArrayLayers > 0
@@ -69,6 +72,12 @@ export function buildGoonRendererConstructionOptions(
         }
       : {})
   }
+}
+
+export function resolveGoonRendererClearAlpha(
+  surfaceProfile: GoonRendererSurfaceProfile = 'opaque'
+) {
+  return surfaceProfile === 'desktop-transparent' ? 0 : 1
 }
 
 export function shouldRetryGoonRendererWithWebGL2(

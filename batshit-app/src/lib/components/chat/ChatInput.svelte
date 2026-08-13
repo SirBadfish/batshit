@@ -95,6 +95,12 @@
   import { neutralizeAllClipReferenceSyntax } from '$lib/utils/zipReferenceSafety'
   import { ProjectService } from '$lib/services/projects'
   import { SessionService } from '$lib/services/sessions'
+  import {
+    desktopControlsVoiceCoordinator,
+    type DesktopControlsVoiceOwner,
+    type DesktopControlsVoiceOwnerState
+  } from '$lib/services/desktopControlsVoice'
+  import type { DesktopGoonPresentationMode } from '$lib/goons/desktopGoonPresentation'
   
   type BatshitSlashExpandResult = {
     text: string
@@ -129,6 +135,7 @@
     sessionId = null,
     data = null,
     goonsPanelOpen = false,
+    goonPresentationMode = null,
     showExecutionViewer = $bindable(false),
     onOpenExecutionViewer = (sessionId?: string | null) => {},
     workBusy = false,
@@ -144,6 +151,7 @@
     sessionId?: string | null
     data?: any
     goonsPanelOpen?: boolean
+    goonPresentationMode?: DesktopGoonPresentationMode | null
     showExecutionViewer?: boolean
     onOpenExecutionViewer?: (sessionId?: string | null) => void
     workBusy?: boolean
@@ -169,6 +177,7 @@
   let liveKitVoiceAbortController: AbortController | null = null
   let liveKitVoiceConnectSerial = 0
   let liveKitRemoteGoonAudioElements = new Set<HTMLMediaElement>()
+  let desktopControlsVoiceOwner: DesktopControlsVoiceOwner | null = null
   let waitingForAI = $state(false)
   let stoppingWork = $state(false)
   let finalizingDictation = $state(false)
@@ -548,6 +557,7 @@
         ui: 'main-chatbar',
         mode,
         goonsEnabled: goonsPanelOpen,
+        goonPresentationMode,
         ...(speechToSpeech
           ? {
               providerId: speechToSpeech.providerId,
@@ -574,6 +584,7 @@
           ui: 'main-chatbar',
           mode,
           goonsEnabled: goonsPanelOpen,
+          goonPresentationMode,
           ...(speechToSpeech
             ? {
                 providerId: speechToSpeech.providerId,
@@ -1109,6 +1120,52 @@
       return 'is-ready'
     }
     return isListening ? 'is-listening' : 'is-ready'
+  })
+  const desktopControlsVoiceOwnerState = $derived.by<DesktopControlsVoiceOwnerState>(() => {
+    const active = voiceModeSessionPillActive
+    const runtime = useLiveKitVoiceButton ? 'livekit' : 'direct'
+    const processing =
+      recordedVoiceModeCaptureFinalizing || voiceModeTurnSendPending || waitingForAI
+    const phase: DesktopControlsVoiceOwnerState['phase'] =
+      liveKitVoiceStatus === 'error'
+        ? 'error'
+        : isLiveKitVoiceConnecting
+          ? 'starting'
+          : !active
+            ? 'inactive'
+            : voiceReplyActive
+              ? 'speaking'
+              : processing
+                ? 'processing'
+                : runtime === 'livekit' || isListening
+                  ? 'listening'
+                  : 'ready'
+    const allowedIntents: DesktopControlsVoiceOwnerState['allowedIntents'] = active
+      ? [
+          'end',
+          ...(runtime === 'direct' && voiceModeInputKind === 'recorded' && !processing
+            ? (['toggle-listening'] as const)
+            : [])
+        ]
+      : liveKitVoiceStatus === 'connecting'
+        ? []
+        : ['start']
+    return {
+      active,
+      listening: active && (runtime === 'livekit' ? isLiveKitVoiceConnected : isListening),
+      runtime,
+      inputKind: runtime === 'livekit' && active ? 'livekit' : voiceModeInputKind,
+      phase,
+      label: active ? voiceModeSessionLabel : 'Voice Mode off',
+      modeLabel: active ? voiceModeSessionModeLabel : runtime === 'livekit' ? 'LiveKit' : 'Voice Mode',
+      error: liveKitVoiceError,
+      allowedIntents
+    }
+  })
+
+  $effect(() => {
+    const state = desktopControlsVoiceOwnerState
+    desktopControlsVoiceOwner?.publish(state)
   })
 
 function includesCodexIdentifier(value?: string | null) {
@@ -2463,6 +2520,16 @@ $effect(() => {
   }
 
   onMount(() => {
+    desktopControlsVoiceOwner = desktopControlsVoiceCoordinator.attachOwner({
+      initialState: desktopControlsVoiceOwnerState,
+      handleIntent: async (intent) => {
+        if (intent.type === 'end') {
+          handleVoiceSessionEndClick()
+          return
+        }
+        await handleVoiceModeButtonClick()
+      }
+    })
     void loadDefaultWorkspacePreference()
     void loadProjectsForContext()
 
@@ -2557,6 +2624,8 @@ $effect(() => {
       window.removeEventListener('resize', handleViewportResize)
       resetVoiceModeActivityFeedback()
       disconnectLiveKitVoiceRoom()
+      desktopControlsVoiceOwner?.detach()
+      desktopControlsVoiceOwner = null
     }
   })
   

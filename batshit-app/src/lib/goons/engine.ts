@@ -101,9 +101,13 @@ import {
 } from '$lib/goons/sceneLighting'
 import {
   GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY,
+  DESKTOP_GOON_VERTICAL_ORBIT_MAX_PITCH,
+  DESKTOP_GOON_VERTICAL_ORBIT_MIN_PITCH,
   clampCameraPositionToPaddedBox,
   pointerClientToNdc,
   resolveCinematicGoonZoomTarget,
+  resolveDesktopGoonVerticalOrbit,
+  resolveDesktopGoonPointerDragMode,
   resolveGoonRelativeRecenter,
   resolveGoonFraming,
   resolveHybridCameraZoom,
@@ -300,7 +304,9 @@ import {
 import {
   buildGoonRendererConstructionOptions,
   resolveGoonRendererBackendPolicy,
+  resolveGoonRendererClearAlpha,
   type GoonRendererBackendPolicyReason,
+  type GoonRendererSurfaceProfile,
   shouldRetryGoonRendererWithWebGL2
 } from '$lib/goons/goonRendererRequirements'
 import {
@@ -440,6 +446,7 @@ export type GoonEngineOptions = {
   socketEyeContact?: SocketEyeContactSettingsV2 | null
   cameraFov?: number
   forceWebGL2?: boolean
+  surfaceProfile?: GoonRendererSurfaceProfile
   debugRootMotion?: boolean
   onRuntimeStatus?: (status: GoonRendererRuntime) => void
   onCompatibility?: (report: GoonCompatibilityReport) => void
@@ -468,6 +475,7 @@ export type GoonAnimationSyncOptions = {
 
 export type GoonMountedRuntimeState = {
   camera: GoonCamera | null
+  goonRotation: number
   baseLoop: {
     name: string
     definition: GoonCueDefinition | null
@@ -891,6 +899,7 @@ export class GoonEngine implements GoonStageHost {
   private goonVisible = true
   private container: HTMLElement
   private renderer?: WebGPURenderer
+  private rendererSurfaceProfile: GoonRendererSurfaceProfile
   private initPromise: Promise<void> | null = null
   private requiredMaxTextureArrayLayers = 0
   private activeMaxTextureArrayLayersRequirement = 0
@@ -946,7 +955,13 @@ export class GoonEngine implements GoonStageHost {
   private sceneRootOffsetY = 0
   private lookActive = false
   private peekState: { position: THREE.Vector3; target: THREE.Vector3 } | null = null
-  private dragMode: 'none' | 'view' | 'goon' | 'pan' | 'camera-pan' = 'none'
+  private dragMode:
+    | 'none'
+    | 'view'
+    | 'goon'
+    | 'pan'
+    | 'camera-pan'
+    | 'desktop-vertical-orbit' = 'none'
   private dragLast = new THREE.Vector2()
   private dragPointerId: number | null = null
   private goonRotation = 0
@@ -1250,6 +1265,8 @@ export class GoonEngine implements GoonStageHost {
   private speechAudioGate = 0
   private speechAudioPeak = 0
   private speechAudioStartOffsetSec: number | null = null
+  private desktopSpeechFaceFrame: GoonSpeechFaceFrame | null = null
+  private desktopSpeechAudioLevel: number | null = null
 
   private handleTransformDragging = (event: any) => {
     if (this.controls) {
@@ -1336,6 +1353,7 @@ export class GoonEngine implements GoonStageHost {
     this.onPerformance = options.onPerformance
     this.onCameraChange = options.onCameraChange
     this.onEditTransformChange = options.onEditTransformChange
+    this.rendererSurfaceProfile = options.surfaceProfile ?? 'opaque'
     this.embeddedWebKitRuntime = this.resolveEmbeddedWebKitRuntime()
     const rendererBackendPolicy = resolveGoonRendererBackendPolicy({
       explicitForceWebGL2: options.forceWebGL2,
@@ -1590,6 +1608,76 @@ export class GoonEngine implements GoonStageHost {
     this.handleCameraChange()
   }
 
+  /**
+   * Desktop Mode's bounded manual camera seam. The desktop surface converts
+   * its normalized pointer coordinate back into this renderer's client space
+   * so the canonical cursor-targeted zoom path remains the only zoom owner.
+   */
+  applyDesktopCameraZoom(delta: number, pointerNdc: { x: number; y: number }) {
+    const canvas = this.renderer?.domElement
+    if (!canvas || !Number.isFinite(delta)) return false
+    const rect = canvas.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return false
+    this.applyUnifiedZoom(delta, {
+      clientX: rect.left + ((pointerNdc.x + 1) / 2) * rect.width,
+      clientY: rect.top + ((1 - pointerNdc.y) / 2) * rect.height
+    })
+    return true
+  }
+
+  /** Apply the canonical screen-space camera pan without enabling horizontal orbit. */
+  applyDesktopCameraPan(deltaX: number, deltaY: number, viewportHeight: number) {
+    if (!this.controls) return false
+    const delta = resolvePerspectiveScreenPanDelta({
+      camera: this.camera,
+      deltaX,
+      deltaY,
+      viewportHeight,
+      targetDistance: this.getCameraDistance()
+    })
+    this.applyCameraPanDelta(delta)
+    return true
+  }
+
+  /**
+   * Apply Desktop Mode's manual vertical-only orbit while preserving the
+   * current target, distance, horizontal angle, zoom, and FOV.
+   */
+  applyDesktopCameraVerticalOrbit(deltaPitchRadians: number) {
+    if (
+      this.rendererSurfaceProfile !== 'desktop-transparent' ||
+      !this.controls ||
+      !Number.isFinite(deltaPitchRadians)
+    ) {
+      return false
+    }
+    const resolved = resolveDesktopGoonVerticalOrbit({
+      currentCameraPosition: this.camera.position,
+      currentOrbitTarget: this.controls.target,
+      deltaPitchRadians
+    })
+    if (!resolved) return false
+    this.camera.position.copy(resolved.nextCameraPosition)
+    this.camera.updateMatrixWorld()
+    this.controls.update()
+    this.syncSkyboxZoomFromCamera()
+    this.handleCameraChange()
+    return true
+  }
+
+  /** Rotate the Goon itself; this is intentionally distinct from camera orbit. */
+  rotateDesktopGoon(deltaRadians: number) {
+    if (!Number.isFinite(deltaRadians)) return false
+    this.goonRotation += deltaRadians
+    const avatarRoot = this.getActiveAvatarRoot()
+    if (avatarRoot) avatarRoot.rotation.y = this.goonRotation
+    return Boolean(avatarRoot)
+  }
+
+  getGoonRotation() {
+    return this.goonRotation
+  }
+
   private applyRenderedCameraFov(fov: number) {
     const next = THREE.MathUtils.clamp(fov, 15, 100)
     if (next === this.cameraFov) return
@@ -1733,7 +1821,11 @@ export class GoonEngine implements GoonStageHost {
       this.renderFailed = false
       const createRenderer = (forceWebGL: boolean) =>
         new WebGPURenderer(
-          buildGoonRendererConstructionOptions(forceWebGL, this.requiredMaxTextureArrayLayers)
+          buildGoonRendererConstructionOptions(
+            forceWebGL,
+            this.requiredMaxTextureArrayLayers,
+            this.rendererSurfaceProfile
+          )
         )
       let renderer = createRenderer(this.forceWebGL2)
       try {
@@ -1764,7 +1856,7 @@ export class GoonEngine implements GoonStageHost {
       }
       this.activeMaxTextureArrayLayersRequirement = this.requiredMaxTextureArrayLayers
       this.setRuntimeStatus(this.resolveRendererRuntime(renderer))
-      renderer.setClearColor(0x000000, 1)
+      renderer.setClearColor(0x000000, resolveGoonRendererClearAlpha(this.rendererSurfaceProfile))
       renderer.outputColorSpace = THREE.SRGBColorSpace
       applyGoonToneMapping(renderer, this.toneMappingMode)
       renderer.autoClear = false
@@ -1802,7 +1894,13 @@ export class GoonEngine implements GoonStageHost {
       this.controls.minDistance = 0.8
       this.controls.maxDistance = 6
       this.controls.minPolarAngle = 0.05
-      this.controls.maxPolarAngle = Math.PI / 2 - ORBIT_FLOOR_CLEARANCE_ANGLE
+      this.controls.maxPolarAngle =
+        this.rendererSurfaceProfile === 'desktop-transparent'
+          ? Math.PI / 2 - DESKTOP_GOON_VERTICAL_ORBIT_MIN_PITCH
+          : Math.PI / 2 - ORBIT_FLOOR_CLEARANCE_ANGLE
+      if (this.rendererSurfaceProfile === 'desktop-transparent') {
+        this.controls.minPolarAngle = Math.PI / 2 - DESKTOP_GOON_VERTICAL_ORBIT_MAX_PITCH
+      }
       this.controls.enablePan = false
       this.controls.enableRotate = false
       this.controls.enableZoom = false
@@ -5788,7 +5886,7 @@ export class GoonEngine implements GoonStageHost {
     metaKey?: boolean
     altKey?: boolean
     ctrlKey?: boolean
-  }): 'view' | 'goon' | 'pan' | 'none' {
+  }): 'view' | 'pan' | 'none' {
     if (event.metaKey || event.altKey || event.ctrlKey) {
       return this.getActiveRoomBounds() ? 'pan' : 'none'
     }
@@ -5832,6 +5930,18 @@ export class GoonEngine implements GoonStageHost {
   private handlePointerDown = (event: PointerEvent) => {
     if (this.transformControls?.dragging) return
     if (this.transformControls?.enabled && this.transformControls.axis) return
+    if (this.rendererSurfaceProfile === 'desktop-transparent') {
+      const mode = resolveDesktopGoonPointerDragMode(event)
+      if (mode === 'none') return
+      if (this.lookActive) this.exitLookAround()
+      this.dragMode = mode
+      this.dragPointerId = event.pointerId
+      this.dragLast.set(event.clientX, event.clientY)
+      this.focusRendererCanvas()
+      this.renderer?.domElement.setPointerCapture?.(event.pointerId)
+      event.preventDefault()
+      return
+    }
     if ((event.buttons & 3) === 3) {
       if (this.lookActive) this.exitLookAround()
       this.dragMode = 'camera-pan'
@@ -5912,6 +6022,8 @@ export class GoonEngine implements GoonStageHost {
         targetDistance: this.getCameraDistance()
       })
       this.applyCameraPanDelta(delta)
+    } else if (this.dragMode === 'desktop-vertical-orbit') {
+      this.applyDesktopCameraVerticalOrbit(viewScale * dy)
     } else if (this.dragMode === 'view') {
       if (!this.lookActive && this.controls) {
         this.controls._rotateLeft(viewScale * dx)
@@ -7673,12 +7785,32 @@ export class GoonEngine implements GoonStageHost {
   setSpeaking(value: boolean) {
     this.speaking = value
     if (!value) {
+      this.desktopSpeechFaceFrame = null
+      this.desktopSpeechAudioLevel = null
       this.speechPausedForCue = false
       this.smoothedLipSyncAmplitude = 0
       this.speechAudioGate = 0
       this.speechAudioPeak = 0
       this.speechAudioStartOffsetSec = null
     }
+  }
+
+  setDesktopSpeechVisualFrame(
+    frame: GoonSpeechFaceFrame | null,
+    audioLevel: number | null
+  ) {
+    if (this.rendererSurfaceProfile !== 'desktop-transparent') return false
+    this.desktopSpeechFaceFrame = frame ? structuredClone(frame) : null
+    this.desktopSpeechAudioLevel =
+      typeof audioLevel === 'number' && Number.isFinite(audioLevel)
+        ? THREE.MathUtils.clamp(audioLevel, 0, 1)
+        : null
+    return true
+  }
+
+  clearDesktopSpeechVisualFrame() {
+    this.desktopSpeechFaceFrame = null
+    this.desktopSpeechAudioLevel = null
   }
 
   private getMoodFaceBlendTarget(now: number) {
@@ -7857,6 +7989,7 @@ export class GoonEngine implements GoonStageHost {
     const baseLoopClip = this.baseLoopAction?.getClip().name ?? null
     return {
       camera: this.getCameraState(),
+      goonRotation: this.goonRotation,
       baseLoop: {
         name: this.baseLoop,
         definition: this.activeMood ? structuredClone(this.activeMood) : null,
@@ -7915,6 +8048,9 @@ export class GoonEngine implements GoonStageHost {
     }
     this.eyeContactApplied = { ...state.eyeContact.applied }
     this.customPerformanceDirection = { ...state.performance.direction }
+    this.goonRotation = Number.isFinite(state.goonRotation) ? state.goonRotation : 0
+    const avatarRoot = this.getActiveAvatarRoot()
+    if (avatarRoot) avatarRoot.rotation.y = this.goonRotation
 
     this.setMood(state.baseLoop.name, state.baseLoop.definition ?? undefined, {
       preservePlacement: true,
@@ -11750,6 +11886,19 @@ export class GoonEngine implements GoonStageHost {
     elapsed: number,
     intensityScale = PRECOMPUTED_LIP_SYNC_VRM_INTENSITY_SCALE
   ): GoonSpeechFaceFrame {
+    if (
+      this.rendererSurfaceProfile === 'desktop-transparent' &&
+      this.lipSyncEnabled &&
+      this.speaking &&
+      (this.desktopSpeechFaceFrame || this.desktopSpeechAudioLevel !== null)
+    ) {
+      if (this.desktopSpeechFaceFrame) {
+        return scaleGoonSpeechFaceFrame(this.desktopSpeechFaceFrame, intensityScale)
+      }
+      const bridged = createEmptyGoonSpeechFaceFrame(RHUBARB_9_SPEECH_FACE_PROFILE)
+      ;(bridged.weights as Record<string, number>).wide_open = this.desktopSpeechAudioLevel ?? 0
+      return bridged
+    }
     const audioActivity = this.measureSpeechAudioActivity()
     let frame = createEmptyGoonSpeechFaceFrame(RHUBARB_9_SPEECH_FACE_PROFILE)
 
