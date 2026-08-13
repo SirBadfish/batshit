@@ -138,6 +138,10 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
   import AgentWebSearchDefaultsDisclosure from "$lib/components/settings/agent/AgentWebSearchDefaultsDisclosure.svelte";
   import SubagentAccessAssignmentsSection from "$lib/components/settings/agent/SubagentAccessAssignmentsSection.svelte";
   import {
+    CREATE_AGENT_SENTINEL,
+    requireHydratedAgentDetail,
+  } from "$lib/components/settings/agent/agentDetailSaveGuard";
+  import {
     normalizeAgentAutoCompactSettings,
     type AgentAutoCompactSettings
   } from "$lib/utils/contextCompaction";
@@ -307,7 +311,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     reason: string | null;
   };
 
-  const CREATE_AGENT_SENTINEL = "__create__";
 
   interface BasicForm {
     displayName: string;
@@ -4850,18 +4853,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     agentVoicePreviewBusy = false;
   }
 
-  function requireHydratedAgentDetail(signature: string | null, label: string) {
-    if (!selectedAgentId || selectedAgentId === CREATE_AGENT_SENTINEL) {
-      throw new Error(`Select an agent before saving ${label}.`);
-    }
-    if (!signature) {
-      throw new Error(
-        `Agent details are still loading. Wait for the selected agent to finish loading before saving ${label}.`,
-      );
-    }
-    return selectedAgentId;
-  }
-
   function normaliseZipForm(agent: AgentRow): ZipForm {
     const legacyPermission =
       agent.zip_control_mode === "agent"
@@ -6394,6 +6385,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
   async function saveAgentPromptFromEditor(nextPrompt: string) {
     const agentId = requireHydratedAgentDetail(
+      selectedAgentId,
       promptPersistedSignature,
       "the agent prompt",
     );
@@ -6406,6 +6398,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     mutator: (current: BasicForm) => BasicForm,
   ) {
     const agentId = requireHydratedAgentDetail(
+      selectedAgentId,
       basicPersistedSignature,
       "agent settings",
     );
