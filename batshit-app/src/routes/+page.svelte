@@ -112,6 +112,14 @@
     type DesktopControlsStateEvent
   } from '$lib/goons/desktopControlsNativeBridge'
   import {
+    buildGoonQuickControlPatch,
+    buildGoonQuickControlsProjection,
+    normalizeGoonQuickControlAction,
+    normalizeGoonQuickControlRuntimeContext,
+    type GoonQuickControlAction,
+    type GoonQuickControlRuntimeContext
+  } from '$lib/goons/goonQuickControls'
+  import {
     desktopControlsVoiceCoordinator,
     type DesktopControlsVoiceState
   } from '$lib/services/desktopControlsVoice'
@@ -481,6 +489,7 @@
   let goonsPanelOpen = $state(false)
   type GoonDockHandoffHandle = {
     captureMountedRuntimeState(): GoonMountedRuntimeState | null
+    captureQuickControlRuntimeContext(): GoonQuickControlRuntimeContext
     isMountedRendererReady(): boolean
     releaseMountedRenderer(): GoonMountedRuntimeState | null
   }
@@ -508,6 +517,9 @@
   )
   let desktopControlsClipRevision = $state(0)
   let desktopControlsProjectionSignature = ''
+  let desktopQuickControlContext = $state.raw<GoonQuickControlRuntimeContext | null>(null)
+  let desktopQuickControlPending = $state<string | null>(null)
+  let desktopQuickControlError = $state<string | null>(null)
   let desktopReplaceableFlushTimer: ReturnType<typeof setInterval> | null = null
   let desktopLastVoiceVisual: DesktopGoonRuntimeSnapshotV1['voiceVisual'] = null
   let desktopVoiceFrameTimer: ReturnType<typeof setInterval> | null = null
@@ -5986,6 +5998,11 @@ const immersiveActive = $derived.by(
         transitionId
       )
       desktopBridgeError = null
+      desktopQuickControlContext = normalizeGoonQuickControlRuntimeContext(
+        goonDockRef.captureQuickControlRuntimeContext()
+      )
+      desktopQuickControlPending = null
+      desktopQuickControlError = null
       const released = goonDockRef.releaseMountedRenderer()
       if (!released) throw new Error('The Dock renderer was not ready to transfer.')
       desktopHandoffState = desktopPlainJson(released)
@@ -6042,6 +6059,9 @@ const immersiveActive = $derived.by(
       clearDesktopCueTimers()
       desktopHandoffState = null
       desktopEpoch = ''
+      desktopQuickControlContext = null
+      desktopQuickControlPending = null
+      desktopQuickControlError = null
       goonsPanelOpen = false
       artifactsPanelOpen = false
       await updateGoonsSettings({ dockOpen: false, immersiveMode: false })
@@ -6078,11 +6098,19 @@ const immersiveActive = $derived.by(
 
   function publishDesktopControlsProjection() {
     if (!desktopControlsBridge) return
+    const goonControls = desktopQuickControlContext
+      ? buildGoonQuickControlsProjection(activeGoon, goonsSettings, desktopQuickControlContext)
+      : null
     const projection = desktopPlainJson({
       sessionId: currentSessionId ?? null,
       clipRevision: desktopControlsClipRevision,
       preferences: desktopGoonPreferences,
-      voice: desktopControlsVoiceState
+      voice: desktopControlsVoiceState,
+      goonControls: {
+        state: goonControls,
+        pendingAction: desktopQuickControlPending,
+        error: desktopQuickControlError
+      }
     })
     const signature = JSON.stringify(projection)
     if (signature === desktopControlsProjectionSignature) return
@@ -6114,6 +6142,92 @@ const immersiveActive = $derived.by(
     applyDesktopGoonPreferencesLive(normalizeDesktopGoonPreferences(persistedSettings.desktop))
   }
 
+  function updateDesktopHandoffEyeContact(enabled: boolean) {
+    if (!desktopHandoffState?.eyeContact) return
+    desktopHandoffState = desktopPlainJson({
+      ...desktopHandoffState,
+      eyeContact: {
+        ...desktopHandoffState.eyeContact,
+        enabled
+      }
+    })
+  }
+
+  async function applyDesktopQuickControl(action: GoonQuickControlAction) {
+    if (desktopQuickControlPending) return
+    desktopQuickControlPending = action.kind
+    desktopQuickControlError = null
+    try {
+      const targetGoon = activeGoon
+      const context = desktopQuickControlContext
+      if (!targetGoon || !context || desktopPresentation.mode !== 'desktop') {
+        throw new Error('Desktop Goon quick controls are unavailable.')
+      }
+      if (action.kind === 'eye-contact') {
+        desktopQuickControlContext = normalizeGoonQuickControlRuntimeContext({
+          ...context,
+          eyeContactEnabled: action.enabled
+        })
+        updateDesktopHandoffEyeContact(action.enabled)
+        publishDesktopDelta({
+          type: 'quick-control.changed',
+          value: { kind: 'eye-contact', enabled: action.enabled }
+        })
+        return
+      }
+
+      const patch = buildGoonQuickControlPatch(
+        targetGoon,
+        goonsSettings,
+        context.materialNames,
+        action
+      )
+      if (!patch) return
+      const updatedGoon = await updateGoonRecord(targetGoon.id, patch)
+
+      if (action.kind === 'mood') {
+        const cueMap = resolveGoonCues(targetGoon, goonsSettings).cueMap
+        const definition =
+          cueMap[action.cueName] ??
+          Object.values(cueMap).find((entry) => entry.name === action.cueName)
+        if (!definition || definition.kind !== 'mood') {
+          throw new Error('The selected Mood is no longer available.')
+        }
+        publishDesktopDelta({
+          type: 'quick-control.changed',
+          value: {
+            kind: 'mood',
+            name: definition.name,
+            definition: desktopPlainJson(definition) as unknown as {
+              [key: string]: DesktopGoonJsonValue
+            }
+          }
+        })
+      } else if (action.kind === 'quality') {
+        publishDesktopDelta({
+          type: 'quick-control.changed',
+          value: { kind: 'quality', quality: action.value }
+        })
+      } else {
+        publishDesktopDelta({
+          type: 'quick-control.changed',
+          value: {
+            kind: 'closet',
+            goonId: updatedGoon.id,
+            recordUpdatedAt: updatedGoon.updated_at
+          }
+        })
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'The Desktop Goon control could not update.'
+      desktopQuickControlError = message
+      toast.error(message)
+    } finally {
+      desktopQuickControlPending = null
+    }
+  }
+
   function handleDesktopControlsState(event: DesktopControlsStateEvent) {
     if (event.type !== 'renderer-intent') return
     const intent = typeof event.detail?.intent === 'string' ? event.detail.intent : ''
@@ -6143,6 +6257,18 @@ const immersiveActive = $derived.by(
       desktopControlsClipRevision += 1
       if (currentSessionId) {
         dispatchSessionClipStateChanged({ sessionId: currentSessionId, source: 'runtime' })
+      }
+      return
+    }
+    if (intent === 'goon.quick-control') {
+      try {
+        const action = normalizeGoonQuickControlAction(payload.action)
+        void applyDesktopQuickControl(action)
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'The Desktop Goon control is invalid.'
+        desktopQuickControlError = message
+        toast.error(message)
       }
       return
     }
@@ -6413,6 +6539,11 @@ const immersiveActive = $derived.by(
     desktopControlsClipRevision
     desktopGoonPreferences
     desktopControlsVoiceState
+    desktopQuickControlContext
+    desktopQuickControlPending
+    desktopQuickControlError
+    activeGoon
+    goonsSettings
     publishDesktopControlsProjection()
   })
 

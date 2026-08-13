@@ -8,7 +8,11 @@
     resolveGoonEyeContactTuning
   } from '$lib/goons/customAvatar'
   import { resolveGoonLiveActivationKey } from '$lib/goons/recipe'
-  import { buildMountedLiveGoonLoadPlan, loadMountedLiveGoon } from '$lib/goons/mountedLiveGoon'
+  import {
+    applyMountedLiveGoonClosetAssignments,
+    buildMountedLiveGoonLoadPlan,
+    loadMountedLiveGoon
+  } from '$lib/goons/mountedLiveGoon'
   import {
     adaptDesktopGoonStatePort,
     getDesktopGoonNativeBridge,
@@ -35,6 +39,7 @@
   let engine: GoonEngine | null = null
   let snapshot: DesktopGoonRuntimeSnapshotV1 | null = null
   let loadGeneration = 0
+  let closetRefreshQueue: Promise<void> = Promise.resolve()
   let rendererReportedReady = false
   let statusMessage = $state('Connecting Desktop Mode…')
   let errorMessage = $state<string | null>(null)
@@ -131,6 +136,50 @@
     engine.clearDesktopSpeechVisualFrame()
     engine.clearSpeechPlayback()
     engine.setSpeaking(false)
+  }
+
+  async function applyClosetRefresh(goonId: string, recordUpdatedAt: string) {
+    const generation = loadGeneration
+    const [goons, userSettings] = await Promise.all([
+      loadGoons(),
+      refreshUserSettingsRequest(fetch)
+    ])
+    if (generation !== loadGeneration) return
+    const goon = goons.find((entry) => entry.id === goonId)
+    if (!goon) throw new Error('The updated Desktop Goon record is no longer available.')
+    const savedRevision = Date.parse(goon.updated_at)
+    const requestedRevision = Date.parse(recordUpdatedAt)
+    if (
+      !Number.isFinite(savedRevision) ||
+      !Number.isFinite(requestedRevision) ||
+      savedRevision < requestedRevision
+    ) {
+      throw new Error('The Desktop Goon Closet update is newer than the available saved record.')
+    }
+    const targetEngine = engine
+    if (!targetEngine) throw new Error('The Desktop Goon renderer is not ready for Closet changes.')
+
+    errorMessage = null
+    statusMessage = 'Updating outfit…'
+    targetEngine.resetMaterialOverrides()
+    await applyMountedLiveGoonClosetAssignments(targetEngine, {
+      goon,
+      goonsSettings: normalizeGoonsSettings(userSettings.goons_settings)
+    })
+    if (generation !== loadGeneration || engine !== targetEngine) return
+    if (snapshot?.goon?.goonId === goon.id) {
+      snapshot = {
+        ...snapshot,
+        goon: { ...snapshot.goon, recordUpdatedAt: goon.updated_at }
+      }
+    }
+    statusMessage = ''
+  }
+
+  function queueClosetRefresh(goonId: string, recordUpdatedAt: string) {
+    closetRefreshQueue = closetRefreshQueue
+      .then(() => applyClosetRefresh(goonId, recordUpdatedAt))
+      .catch((error) => failRenderer(error))
   }
 
   async function mountSnapshot(value: DesktopGoonRuntimeSnapshotV1) {
@@ -262,6 +311,19 @@
     }
     if (delta.type === 'cue') {
       engine?.playCue(delta.name, delta.payload as GoonCueDefinition)
+      return
+    }
+    if (delta.type === 'quick-control.changed') {
+      if (!engine) return
+      if (delta.value.kind === 'mood') {
+        engine.setMood(delta.value.name, delta.value.definition as GoonCueDefinition)
+      } else if (delta.value.kind === 'closet') {
+        queueClosetRefresh(delta.value.goonId, delta.value.recordUpdatedAt)
+      } else if (delta.value.kind === 'quality') {
+        engine.setQuality(delta.value.quality)
+      } else {
+        engine.setEyeContactEnabled(delta.value.enabled)
+      }
       return
     }
     if (delta.type === 'terminal.error') {
