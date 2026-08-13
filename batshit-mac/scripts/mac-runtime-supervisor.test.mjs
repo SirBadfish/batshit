@@ -10,6 +10,7 @@ import {
   cleanupAbandonedRedisTempSnapshots,
   chooseRedisShutdownMode,
   createServiceDefinitions,
+  ensureDurableEncryptionKey,
   executeOrderedRuntimeStop,
   isRedisTempSnapshotName,
   publishJsonAtomically,
@@ -73,6 +74,47 @@ const healthyAofInfo = {
   aof_last_bgrewrite_status: 'ok',
   loading: '0'
 };
+
+test('Mac encryption key is persisted separately and remains stable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-mac-encryption-key-'));
+  const keyPath = join(root, 'api-key-encryption.key');
+  const values = new Map([['ENCRYPTION_KEY', 'a'.repeat(48)]]);
+
+  assert.deepEqual(await ensureDurableEncryptionKey(values, { keyPath }), {
+    changed: false,
+    source: 'runtime-key'
+  });
+  assert.equal((await readFile(keyPath, 'utf8')).trim(), 'a'.repeat(48));
+  assert.deepEqual(await ensureDurableEncryptionKey(values, { keyPath }), {
+    changed: false,
+    source: 'runtime-and-durable-key'
+  });
+});
+
+test('Mac encryption key recovers from the durable copy when runtime.env loses it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-mac-encryption-recovery-'));
+  const keyPath = join(root, 'api-key-encryption.key');
+  await writeFile(keyPath, `${'b'.repeat(48)}\n`, { mode: 0o600 });
+  const values = new Map();
+
+  assert.deepEqual(await ensureDurableEncryptionKey(values, { keyPath }), {
+    changed: true,
+    source: 'durable-key'
+  });
+  assert.equal(values.get('ENCRYPTION_KEY'), 'b'.repeat(48));
+});
+
+test('Mac encryption key mismatch fails closed before provider keys appear missing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-mac-encryption-mismatch-'));
+  const keyPath = join(root, 'api-key-encryption.key');
+  await writeFile(keyPath, `${'c'.repeat(48)}\n`, { mode: 0o600 });
+  const values = new Map([['ENCRYPTION_KEY', 'd'.repeat(48)]]);
+
+  await assert.rejects(
+    ensureDurableEncryptionKey(values, { keyPath }),
+    /refused to start instead of making them appear missing/
+  );
+});
 
 test('packaged batshit-server is required to use the managed Redis service', () => {
   const definitions = createServiceDefinitions(new Map());

@@ -717,6 +717,7 @@ export type GoonsSettings = {
   dockOpen?: boolean;
   showCues?: boolean;
   immersiveMode?: boolean;
+  desktop?: DesktopGoonPreferencesPatch;
   globalCloset?: GoonClosetLibrary;
   kitchen?: {
     cues?: GoonCueMap;
@@ -735,3 +736,22 @@ export type GoonsSettings = {
     glbPreviewGoonId?: string;
   };
 };
+
+export type DesktopGoonWorkspacePreference =
+  "current-workspace" | "all-workspaces";
+
+/**
+ * User-owned Desktop Mode preferences. Active presentation state and exact
+ * display/bounds data are intentionally absent: those are transient or
+ * machine-local Electron shell state, not roaming user settings.
+ */
+export type DesktopGoonPreferences = {
+  fullHeight: boolean;
+  normalizedWidth: number;
+  stayOnTop: boolean;
+  clickThrough: boolean;
+  controlsShortcut: string;
+  workspace: DesktopGoonWorkspacePreference;
+};
+
+export type DesktopGoonPreferencesPatch = Partial<DesktopGoonPreferences>;

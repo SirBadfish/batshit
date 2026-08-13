@@ -3127,11 +3127,10 @@ async function handleBatshitAgentStream({
       groupContext,
       voiceState,
       goonsEnabled:
-        streamMetadata?.groupChat === true
-          ? false
-          : typeof metadata?.goonsEnabled === 'boolean'
-            ? metadata.goonsEnabled
-            : undefined,
+        typeof metadata?.goonsEnabled === 'boolean'
+          ? metadata.goonsEnabled
+          : undefined,
+      goonPresentationMode: metadata?.goonPresentationMode ?? null,
       goonsSettings: userSettings?.goons_settings ?? null,
     },
   )

@@ -32,7 +32,7 @@
 	"devDependencies": {
 		"@emnapi/runtime": "^1.11.3",
 		"@internationalized/date": "^3.12.0",
-		"@lucide/svelte": "^1.7.0",
+		"@lucide/svelte": "^1.31.0",
 		"@pixiv/three-vrm": "^3.5.3",
 		"@pixiv/three-vrm-animation": "^3.5.3",
 		"@sveltejs/adapter-node": "^5.5.4",

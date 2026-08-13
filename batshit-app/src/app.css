@@ -301,6 +301,16 @@
     font-weight: var(--bs-font-weight-normal);
   }
 
+  html.batshit-desktop-goon-surface,
+  html.batshit-desktop-goon-surface body,
+  body.batshit-desktop-goon-surface {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: transparent;
+  }
+
   /* Make sure form elements inherit font */
   button, input, select, textarea {
     color-scheme: dark;

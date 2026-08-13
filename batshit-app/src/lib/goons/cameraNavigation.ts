@@ -25,7 +25,26 @@ export type CameraBoxClampAxes = {
   z: boolean
 }
 
+export type DesktopGoonPointerDragMode = 'desktop-vertical-orbit' | 'camera-pan' | 'goon' | 'none'
+
 export const GOON_CINEMATIC_WHEEL_ZOOM_SENSITIVITY = 0.0005
+export const DESKTOP_GOON_VERTICAL_ORBIT_MIN_PITCH = THREE.MathUtils.degToRad(-8)
+export const DESKTOP_GOON_VERTICAL_ORBIT_MAX_PITCH = Math.PI / 2 - 0.05
+
+/**
+ * Keeps Desktop input aligned with the established Goon control scheme:
+ * left-drag orbits vertically, right-drag rotates the Goon, and holding both
+ * buttons pans. The result is deliberately bounded to the three Desktop modes.
+ */
+export function resolveDesktopGoonPointerDragMode(options: {
+  button: number
+  buttons: number
+}): DesktopGoonPointerDragMode {
+  if ((options.buttons & 3) === 3) return 'camera-pan'
+  if (options.button === 0) return 'desktop-vertical-orbit'
+  if (options.button === 2) return 'goon'
+  return 'none'
+}
 
 const GOON_FRAMING_SLICES: Record<GoonFramingPreset, GoonFramingSlice> = {
   headshot: {
@@ -137,10 +156,7 @@ export function resolvePerspectiveCursorZoom(options: {
     .unproject(camera)
     .sub(camera.position)
     .normalize()
-  if (
-    !Number.isFinite(currentRayDirection.lengthSq()) ||
-    currentRayDirection.lengthSq() < 0.999
-  ) {
+  if (!Number.isFinite(currentRayDirection.lengthSq()) || currentRayDirection.lengthSq() < 0.999) {
     return null
   }
 
@@ -217,6 +233,51 @@ export function resolvePerspectiveScreenPanDelta(options: {
   return right
     .multiplyScalar(-options.deltaX * worldPerPixel)
     .add(up.multiplyScalar(options.deltaY * worldPerPixel))
+}
+
+/**
+ * Orbits only vertically around the current framing target. The camera-target
+ * distance and horizontal angle are preserved exactly, so this cannot become
+ * an accidental free-orbit path for the transparent Desktop surface.
+ */
+export function resolveDesktopGoonVerticalOrbit(options: {
+  currentCameraPosition: THREE.Vector3
+  currentOrbitTarget: THREE.Vector3
+  deltaPitchRadians: number
+  minPitchRadians?: number
+  maxPitchRadians?: number
+}) {
+  const minPitchRadians = options.minPitchRadians ?? DESKTOP_GOON_VERTICAL_ORBIT_MIN_PITCH
+  const maxPitchRadians = options.maxPitchRadians ?? DESKTOP_GOON_VERTICAL_ORBIT_MAX_PITCH
+  if (
+    !Number.isFinite(options.deltaPitchRadians) ||
+    !Number.isFinite(minPitchRadians) ||
+    !Number.isFinite(maxPitchRadians) ||
+    minPitchRadians > maxPitchRadians
+  ) {
+    return null
+  }
+
+  const offset = options.currentCameraPosition.clone().sub(options.currentOrbitTarget)
+  if (!Number.isFinite(offset.lengthSq()) || offset.lengthSq() < 0.0000000001) return null
+
+  const spherical = new THREE.Spherical().setFromVector3(offset)
+  const currentPitchRadians = Math.PI / 2 - spherical.phi
+  const pitchRadians = THREE.MathUtils.clamp(
+    currentPitchRadians + options.deltaPitchRadians,
+    minPitchRadians,
+    maxPitchRadians
+  )
+  const nextOffset = new THREE.Vector3().setFromSpherical(
+    new THREE.Spherical(spherical.radius, Math.PI / 2 - pitchRadians, spherical.theta)
+  )
+  return {
+    nextCameraPosition: options.currentOrbitTarget.clone().add(nextOffset),
+    orbitTarget: options.currentOrbitTarget.clone(),
+    distance: spherical.radius,
+    yawRadians: spherical.theta,
+    pitchRadians
+  }
 }
 
 /** Re-centers a moved Goon around the currently viewed Goon-relative anchor. */
@@ -346,7 +407,11 @@ export function resolveHybridCameraZoomPosition(options: {
   }
 
   const distanceT = THREE.MathUtils.inverseLerp(minDistance, maxDistance, options.currentDistance)
-  return THREE.MathUtils.clamp(THREE.MathUtils.lerp(closeEnd, farStart, distanceT), closeEnd, farStart)
+  return THREE.MathUtils.clamp(
+    THREE.MathUtils.lerp(closeEnd, farStart, distanceT),
+    closeEnd,
+    farStart
+  )
 }
 
 /** Applies wheel input to the reversible logical zoom path. Positive delta zooms out. */
@@ -440,9 +505,10 @@ export function clampCameraPositionToPaddedBox(options: {
   padding?: number | THREE.Vector3
 }) {
   if (options.bounds.isEmpty()) return null
-  const padding = typeof options.padding === 'number'
-    ? new THREE.Vector3(options.padding, options.padding, options.padding)
-    : options.padding?.clone() ?? new THREE.Vector3()
+  const padding =
+    typeof options.padding === 'number'
+      ? new THREE.Vector3(options.padding, options.padding, options.padding)
+      : (options.padding?.clone() ?? new THREE.Vector3())
   padding.set(Math.max(0, padding.x), Math.max(0, padding.y), Math.max(0, padding.z))
 
   const position = options.position.clone()
@@ -452,9 +518,8 @@ export function clampCameraPositionToPaddedBox(options: {
   for (const axis of ['x', 'y', 'z'] as const) {
     const minimum = options.bounds.min[axis] + padding[axis]
     const maximum = options.bounds.max[axis] - padding[axis]
-    const next = minimum <= maximum
-      ? THREE.MathUtils.clamp(position[axis], minimum, maximum)
-      : center[axis]
+    const next =
+      minimum <= maximum ? THREE.MathUtils.clamp(position[axis], minimum, maximum) : center[axis]
     clampedAxes[axis] = next !== position[axis]
     position[axis] = next
   }
@@ -492,9 +557,10 @@ export function resolveGoonFraming(options: {
   const boundedWidth = size.x * slice.widthRatio
   // Headshots may crop shoulders and arms. When semantic anchors exist, fit
   // the head band rather than letting whole-body mesh width push the face away.
-  const semanticWidth = anchors && slice.semanticWidthRatio
-    ? semanticSpan * slice.semanticWidthRatio
-    : Number.POSITIVE_INFINITY
+  const semanticWidth =
+    anchors && slice.semanticWidthRatio
+      ? semanticSpan * slice.semanticWidthRatio
+      : Number.POSITIVE_INFINITY
   const visibleWidth = Math.max(0.01, Math.min(boundedWidth, semanticWidth))
   const verticalHalfAngle = THREE.MathUtils.degToRad(verticalFovDegrees) / 2
   const horizontalHalfAngle = Math.atan(Math.tan(verticalHalfAngle) * Math.max(0.01, aspect))

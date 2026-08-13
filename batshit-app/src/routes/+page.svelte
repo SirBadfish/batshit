@@ -50,6 +50,11 @@
   } from '$lib/services/voice'
   import type { VoiceConfig } from '$lib/services/voice'
   import {
+    sampleGoonLipSyncTimeline,
+    type GoonLipSyncAnalyzerId,
+    type GoonLipSyncTimeline
+  } from '$lib/utils/goonLipSync'
+  import {
     flattenLegacyVoiceStyle,
     getProviderOptionsFor,
     mergeVoiceCommon,
@@ -67,9 +72,62 @@
   import { getGoons } from '$lib/stores/goons.svelte'
   import { getGoonAnimationLibrary } from '$lib/stores/goonAnimationLibrary.svelte'
   import { isGoonRuntimeReady } from '$lib/goons/recipe'
-  import { normalizeGoonsSettings } from '$lib/goons/resolve'
-  import type { GoonsSettings, GoonCamera, GoonDefaults } from '$lib/types/goons'
-  import { LIVE_SETTINGS_EVENTS, dispatchSessionClipStateChanged } from '$lib/utils/liveSettingsEvents'
+  import { resolveGoonLiveActivationKey } from '$lib/goons/recipe'
+  import {
+    normalizeDesktopGoonPreferences,
+    normalizeGoonsSettings,
+    resolveGoonCues
+  } from '$lib/goons/resolve'
+  import {
+    createDesktopGoonPresentationState,
+    beginDesktopGoonPresentationTransition,
+    commitDesktopGoonPresentationTransition,
+    rollbackDesktopGoonPresentationTransition,
+    resolveVisibleGoonPresentationMode,
+    type DesktopGoonPresentationMode,
+    type DesktopGoonPresentationState
+  } from '$lib/goons/desktopGoonPresentation'
+  import { resolveDesktopGoonActiveSpeaker } from '$lib/goons/desktopGoonActiveSpeaker'
+  import {
+    DESKTOP_GOON_RUNTIME_SCHEMA_VERSION,
+    type DesktopGoonJsonValue,
+    type DesktopGoonRuntimeDeltaV1,
+    type DesktopGoonRuntimeGoonRefV1,
+    type DesktopGoonRuntimeSnapshotV1
+  } from '$lib/goons/desktopGoonContracts'
+  import {
+    DesktopGoonMainStatePublisher,
+    type DesktopGoonBridgeFailure
+  } from '$lib/goons/desktopGoonStateBridge'
+  import {
+    adaptDesktopGoonStatePort,
+    getDesktopGoonNativeBridge,
+    type DesktopGoonNativeBridge,
+    type DesktopGoonShellStatus,
+    type DesktopGoonStatePortFacade
+  } from '$lib/goons/desktopGoonNativeBridge'
+  import {
+    getDesktopControlsNativeBridge,
+    type DesktopControlsNativeBridge,
+    type DesktopControlsStateEvent
+  } from '$lib/goons/desktopControlsNativeBridge'
+  import {
+    desktopControlsVoiceCoordinator,
+    type DesktopControlsVoiceState
+  } from '$lib/services/desktopControlsVoice'
+  import type { GoonMountedRuntimeState } from '$lib/goons/engine'
+  import { parseGoonCues, parseLiveKitNaturalGoonCues } from '$lib/goons/cueParser'
+  import type {
+    DesktopGoonPreferences,
+    GoonsSettings,
+    GoonCamera,
+    GoonDefaults
+  } from '$lib/types/goons'
+  import {
+    LIVE_SETTINGS_EVENTS,
+    dispatchSessionClipStateChanged,
+    type DesktopGoonPreferencesUpdatedDetail
+  } from '$lib/utils/liveSettingsEvents'
   import { logger } from '$lib/utils/logger'
   import {
     isManagedPrimaryAgentType,
@@ -369,6 +427,7 @@
   let voiceMode = $state(false)
   let activeComposerClipIds = $state<string[]>([])
   let activeComposerClipScopeId = $state<string | null>(null)
+  let desktopControlsComposerClipSignature = ''
   let chatInputRef: any = null
 
   $effect(() => {
@@ -420,6 +479,69 @@
   }
   let artifactsPanelOpen = $state(false)
   let goonsPanelOpen = $state(false)
+  type GoonDockHandoffHandle = {
+    captureMountedRuntimeState(): GoonMountedRuntimeState | null
+    isMountedRendererReady(): boolean
+    releaseMountedRenderer(): GoonMountedRuntimeState | null
+  }
+  let goonDockRef = $state<GoonDockHandoffHandle | null>(null)
+  let desktopNativeBridge: DesktopGoonNativeBridge | null = null
+  let desktopControlsBridge: DesktopControlsNativeBridge | null = null
+  let desktopShellStatus = $state<DesktopGoonShellStatus | null>(null)
+  let desktopPresentation = $state<DesktopGoonPresentationState>(
+    createDesktopGoonPresentationState('dock')
+  )
+  // Mounted renderer snapshots are opaque transfer values. Deep Svelte proxies
+  // are not structured-cloneable and must never cross the Dock/Desktop bridge.
+  let desktopHandoffState = $state.raw<GoonMountedRuntimeState | null>(null)
+  let desktopPublisher: DesktopGoonMainStatePublisher | null = null
+  let desktopBridgeError = $state<string | null>(null)
+  let desktopEpoch = ''
+  let desktopEpochCounter = 0
+  let desktopExitInProgress = false
+  let desktopStatusUnsubscribe: (() => void) | null = null
+  let desktopPortUnsubscribe: (() => void) | null = null
+  let desktopControlsUnsubscribe: (() => void) | null = null
+  let desktopControlsVoiceUnsubscribe: (() => void) | null = null
+  let desktopControlsVoiceState = $state<DesktopControlsVoiceState>(
+    desktopControlsVoiceCoordinator.getState()
+  )
+  let desktopControlsClipRevision = $state(0)
+  let desktopControlsProjectionSignature = ''
+  let desktopReplaceableFlushTimer: ReturnType<typeof setInterval> | null = null
+  let desktopLastVoiceVisual: DesktopGoonRuntimeSnapshotV1['voiceVisual'] = null
+  let desktopVoiceFrameTimer: ReturnType<typeof setInterval> | null = null
+  let desktopVoiceGeneration = ''
+  type DesktopVoicePlaybackDetail = {
+    messageId?: string | null
+    agentId?: string | null
+    audio?: HTMLMediaElement | null
+    durationMs?: number | null
+    lipSyncAnalyzerId?: GoonLipSyncAnalyzerId | null
+    lipSyncTimeline?: GoonLipSyncTimeline | null
+  }
+  let desktopActiveVoiceDetail: DesktopVoicePlaybackDetail | null = null
+  let desktopVoiceAudioContext: AudioContext | null = null
+  let desktopVoiceAudioSource: MediaStreamAudioSourceNode | null = null
+  let desktopVoiceAudioAnalyser: AnalyserNode | null = null
+  let desktopVoiceAudioSamples: Uint8Array<ArrayBuffer> | null = null
+  let desktopCueTimers = new Set<ReturnType<typeof setTimeout>>()
+  let desktopSessionSignature = ''
+  let desktopSpeakerSignature = ''
+  let desktopGoonSignature = ''
+  let desktopPreferencesSignature = ''
+  let desktopPresentationSignature = ''
+  const desktopTransitionBusy = $derived(Boolean(desktopPresentation.transition))
+  const desktopModeActive = $derived(
+    desktopPresentation.mode === 'desktop' || desktopPresentation.transition?.to === 'desktop'
+  )
+  const desktopModeAvailable = $derived(Boolean(desktopShellStatus?.supported))
+  const desktopModeUnavailableReason = $derived.by(() => {
+    if (!desktopNativeBridge) return 'Desktop Mode requires the managed Batshit desktop app.'
+    return typeof desktopShellStatus?.unavailableReason === 'string'
+      ? desktopShellStatus.unavailableReason
+      : null
+  })
   const RIGHT_PANEL_MIN_WIDTH = 480
   const RIGHT_PANEL_MAX_WIDTH = 1200
   const RIGHT_PANEL_MIN_CHAT_WIDTH = 480
@@ -460,10 +582,21 @@ const playbackState = $derived(getPlaybackState())
 const goonsSettings = $derived.by<GoonsSettings>(() =>
   normalizeGoonsSettings(userSettings?.goons_settings ?? null)
 )
+const desktopGoonPreferences = $derived(
+  normalizeDesktopGoonPreferences(goonsSettings.desktop)
+)
 const goonLipSyncMode = $derived(voiceSettings.goonLipSync?.mode ?? 'amplitude')
 const premiumGoonLipSyncAnalyzer = $derived(voiceSettings.goonLipSync?.analyzerId ?? 'rhubarb-wasm')
 const goonLipSyncLabEnabled = $derived(Boolean(userSettings?.admin_settings?.goon_lip_sync_lab_enabled))
 const immersiveMode = $derived.by(() => Boolean(goonsSettings?.immersiveMode))
+const goonDcmPresentationMode = $derived(
+  resolveVisibleGoonPresentationMode({
+    dockOpen: goonsPanelOpen,
+    immersiveMode,
+    desktopModeActive
+  })
+)
+const goonPresentationVisible = $derived(Boolean(goonDcmPresentationMode))
 const sharedGoonAnimations = $derived.by(() =>
   Array.isArray(goonAnimationLibrary?.vrma) ? goonAnimationLibrary.vrma : []
 )
@@ -548,15 +681,25 @@ const activeGroupDriverAgentId = $derived.by(() => {
   if (!group.agent_ids?.includes(driverId)) return null
   return driverId
 })
-const dockAgentId = $derived.by(() =>
-  activeGroupDriverAgentId || playbackState.activeAgentId || streamingSpeakerId || agentStore.getCurrentAgentId()
+const resolvedDesktopGoonSpeaker = $derived.by(() =>
+  resolveDesktopGoonActiveSpeaker({
+    audiblePlaybackAgentId: playbackState.activeAgentId,
+    currentSessionId,
+    activeStream: {
+      active: activeStreamCount > 0,
+      agentId: streamingSpeakerId,
+      sessionId: currentSessionId
+    },
+    groupDriverAgentId: activeGroupDriverAgentId,
+    groupAgentIds: activeGroup?.agent_ids ?? [],
+    currentAgentId: agentStore.getCurrentAgentId()
+  })
 )
+const dockAgentId = $derived(resolvedDesktopGoonSpeaker?.agentId ?? null)
 const dockAgent = $derived.by(() =>
   dockAgentId ? agentStore.getAgentById(dockAgentId) : agentStore.getCurrentAgent()
 )
-const activeSpeakerId = $derived.by(() =>
-  playbackState.activeAgentId || streamingSpeakerId || agentStore.getCurrentAgentId()
-)
+const activeSpeakerId = $derived(resolvedDesktopGoonSpeaker?.agentId ?? null)
 const activeSpeaker = $derived.by(() =>
   activeSpeakerId ? agentStore.getAgentById(activeSpeakerId) : agentStore.getCurrentAgent()
 )
@@ -3283,7 +3426,7 @@ const immersiveActive = $derived.by(
           voiceSettings: speechVoiceSettings,
           agentId: speechAgentId,
           messageId: targetMessageId,
-          goonLipSyncActive: goonsPanelOpen && (activeGoon?.defaults?.lipSync ?? true),
+          goonLipSyncActive: goonPresentationVisible && (activeGoon?.defaults?.lipSync ?? true),
           manual: true
         })
       }
@@ -4052,6 +4195,12 @@ const immersiveActive = $derived.by(
 	  }
 
 		  async function handleSendMessage(content: string, metadata: any = {}) {
+		    const goonPresentationMode: DesktopGoonPresentationMode | null = goonDcmPresentationMode
+		    metadata = {
+		      ...metadata,
+		      goonsEnabled: goonPresentationMode !== null,
+		      goonPresentationMode: goonPresentationMode ?? undefined
+		    }
 		    const composerSessionId = normalizeComposerSessionId(metadata?.composerSessionId)
 		    if (composerSessionId && sessionStore.getCurrentSessionId() !== composerSessionId) {
 		      logger.debug('[handleSendMessage] Aligning store to composer session before send', {
@@ -4917,13 +5066,18 @@ const immersiveActive = $derived.by(
   }
 
   function handleComposerClippedItemsChange(clips: Array<{ id?: string | null }>) {
-    activeComposerClipIds = Array.from(
+    const nextClipIds = Array.from(
       new Set(
         clips
           .map((clip) => (typeof clip?.id === 'string' ? clip.id.trim() : ''))
           .filter(Boolean)
       )
     )
+    activeComposerClipIds = nextClipIds
+    const signature = JSON.stringify(nextClipIds)
+    if (signature === desktopControlsComposerClipSignature) return
+    desktopControlsComposerClipSignature = signature
+    desktopControlsClipRevision += 1
   }
 
   function stripMessagesForContextRequest(sourceMessages: Message[]) {
@@ -5537,6 +5691,731 @@ const immersiveActive = $derived.by(
     }
   }
 
+  function desktopPlainJson<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value)) as T
+  }
+
+  function latestDesktopShellStatus(value: DesktopGoonShellStatus) {
+    return value.status && typeof value.status === 'object' ? value.status : value
+  }
+
+  function buildDesktopGoonRef(): DesktopGoonRuntimeGoonRefV1 | null {
+    if (!activeGoon) return null
+    const activationKey = resolveGoonLiveActivationKey(activeGoon)
+    if (!activationKey) return null
+    return {
+      goonId: activeGoon.id,
+      activationKey,
+      recordUpdatedAt: activeGoon.updated_at,
+      packageRevision: null
+    }
+  }
+
+  function buildDesktopCameraState(state: GoonMountedRuntimeState | null) {
+    if (!state?.camera) return null
+    return {
+      schemaVersion: 'desktop-goon-camera/v1' as const,
+      camera: { ...state.camera, mode: 'free' as const },
+      goonRotation: state.goonRotation
+    }
+  }
+
+  function buildDesktopRuntimeSnapshot(): DesktopGoonRuntimeSnapshotV1 | null {
+    if (!desktopEpoch || !desktopHandoffState) return null
+    return {
+      schemaVersion: DESKTOP_GOON_RUNTIME_SCHEMA_VERSION,
+      epoch: desktopEpoch,
+      sequence: 0,
+      createdAtMs: Date.now(),
+      presentation: desktopPlainJson(desktopPresentation),
+      sessionId: currentSessionId ?? null,
+      activeAgentId: dockAgentId,
+      activeSpeaker: resolvedDesktopGoonSpeaker,
+      goon: buildDesktopGoonRef(),
+      mountedRuntimeState: desktopPlainJson(
+        desktopHandoffState
+      ) as unknown as { [key: string]: DesktopGoonJsonValue },
+      voiceVisual: desktopLastVoiceVisual,
+      camera: buildDesktopCameraState(desktopHandoffState),
+      preferences: desktopPlainJson(desktopGoonPreferences)
+    }
+  }
+
+  function publishDesktopDelta(delta: DesktopGoonRuntimeDeltaV1) {
+    const result = desktopPublisher?.publishDelta(delta)
+    if (result && !result.ok) desktopBridgeError = result.failure.message
+    return result
+  }
+
+  function clearDesktopVoiceFrames() {
+    if (!desktopVoiceFrameTimer) return
+    clearInterval(desktopVoiceFrameTimer)
+    desktopVoiceFrameTimer = null
+  }
+
+  function clearDesktopVoiceAudioProjection() {
+    desktopVoiceAudioSource?.disconnect()
+    desktopVoiceAudioAnalyser?.disconnect()
+    desktopVoiceAudioSource = null
+    desktopVoiceAudioAnalyser = null
+    desktopVoiceAudioSamples = null
+    const context = desktopVoiceAudioContext
+    desktopVoiceAudioContext = null
+    if (context && context.state !== 'closed') void context.close().catch(() => {})
+  }
+
+  function startDesktopVoiceAudioProjection(audio?: HTMLMediaElement | null) {
+    clearDesktopVoiceAudioProjection()
+    if (!audio || typeof window === 'undefined') return
+    const captureStream = (audio as HTMLMediaElement & { captureStream?: () => MediaStream })
+      .captureStream
+    const AudioContextConstructor = window.AudioContext
+    if (typeof captureStream !== 'function' || !AudioContextConstructor) return
+    try {
+      const stream = captureStream.call(audio)
+      const context = new AudioContextConstructor()
+      const source = context.createMediaStreamSource(stream)
+      const analyser = context.createAnalyser()
+      analyser.fftSize = 256
+      source.connect(analyser)
+      desktopVoiceAudioContext = context
+      desktopVoiceAudioSource = source
+      desktopVoiceAudioAnalyser = analyser
+      desktopVoiceAudioSamples = new Uint8Array(new ArrayBuffer(analyser.fftSize))
+    } catch (error) {
+      console.warn('[Desktop Goon] Audio projection unavailable; using timeline or procedural lip sync.', error)
+      clearDesktopVoiceAudioProjection()
+    }
+  }
+
+  function measureDesktopVoiceAudioLevel() {
+    const analyser = desktopVoiceAudioAnalyser
+    const samples = desktopVoiceAudioSamples
+    if (!analyser || !samples) return null
+    analyser.getByteTimeDomainData(samples)
+    let sum = 0
+    for (const sample of samples) {
+      const normalized = (sample - 128) / 128
+      sum += normalized * normalized
+    }
+    return Math.min(1, Math.sqrt(sum / samples.length) * 4)
+  }
+
+  function beginDesktopVoiceProjection(
+    detail: DesktopVoicePlaybackDetail,
+    generation = `voice-${Date.now()}-${detail.messageId ?? 'live'}`,
+    publishStart = true
+  ) {
+    clearDesktopVoiceFrames()
+    desktopVoiceGeneration = generation
+    startDesktopVoiceAudioProjection(detail.audio)
+    const initialElapsedMs =
+      detail.audio && Number.isFinite(detail.audio.currentTime)
+        ? Math.max(0, detail.audio.currentTime * 1000)
+        : 0
+    if (publishStart) {
+      const visual = desktopPlainJson({
+        kind: 'start' as const,
+        generation,
+        agentId: detail.agentId ?? null,
+        messageId: detail.messageId ?? null,
+        startedAtMs: Math.max(0, Date.now() - initialElapsedMs),
+        durationMs: detail.durationMs ?? null,
+        analyzerId: detail.lipSyncAnalyzerId ?? null,
+        timeline: detail.lipSyncTimeline ?? null
+      })
+      desktopLastVoiceVisual = visual
+      if (desktopPublisher) publishDesktopDelta({ type: 'voice.visual', visual })
+    }
+
+    const projectionStartedAt = performance.now() - initialElapsedMs
+    desktopVoiceFrameTimer = setInterval(() => {
+      const elapsedMs =
+        detail.audio && Number.isFinite(detail.audio.currentTime)
+          ? Math.max(0, detail.audio.currentTime * 1000)
+          : Math.max(0, performance.now() - projectionStartedAt)
+      const frame = detail.lipSyncTimeline
+        ? sampleGoonLipSyncTimeline(detail.lipSyncTimeline, elapsedMs)
+        : null
+      const audioLevel = measureDesktopVoiceAudioLevel()
+      if (!frame && audioLevel === null) return
+      const next = desktopPlainJson({
+        kind: 'frame' as const,
+        generation,
+        agentId: detail.agentId ?? null,
+        messageId: detail.messageId ?? null,
+        atMs: Date.now(),
+        elapsedMs,
+        frame,
+        audioLevel
+      })
+      desktopLastVoiceVisual = next
+      if (desktopPublisher) publishDesktopDelta({ type: 'voice.visual', visual: next })
+    }, 40)
+  }
+
+  function clearDesktopCueTimers() {
+    for (const timer of desktopCueTimers) clearTimeout(timer)
+    desktopCueTimers.clear()
+  }
+
+  function restoreDesktopGoonToDock(reason: string, error?: string | null) {
+    if (desktopExitInProgress) return
+    const involvedDesktop =
+      desktopPresentation.mode === 'desktop' ||
+      desktopPresentation.transition?.to === 'desktop' ||
+      desktopPresentation.transition?.from === 'desktop'
+    if (!involvedDesktop) return
+    desktopExitInProgress = true
+    const transition = desktopPresentation.transition
+    if (transition) {
+      desktopPresentation = rollbackDesktopGoonPresentationTransition(
+        desktopPresentation,
+        transition.id,
+        error || reason
+      )
+    } else {
+      const id = `desktop-return-${Date.now()}`
+      desktopPresentation = beginDesktopGoonPresentationTransition(desktopPresentation, 'dock', id)
+      desktopPresentation = commitDesktopGoonPresentationTransition(desktopPresentation, id)
+      if (error) desktopPresentation = { ...desktopPresentation, lastError: error }
+    }
+    desktopBridgeError = error ?? null
+    desktopPublisher?.close()
+    desktopPublisher = null
+    clearDesktopVoiceFrames()
+    clearDesktopVoiceAudioProjection()
+    clearDesktopCueTimers()
+    goonsPanelOpen = true
+    artifactsPanelOpen = false
+    void updateGoonsSettings({ dockOpen: true, immersiveMode: false })
+    void tick().then(() => {
+      desktopExitInProgress = false
+    })
+  }
+
+  function handleDesktopBridgeFailure(failure: DesktopGoonBridgeFailure) {
+    desktopBridgeError = failure.message
+    restoreDesktopGoonToDock('Desktop state bridge disconnected.', failure.message)
+  }
+
+  function handleDesktopStatePort(facade: DesktopGoonStatePortFacade) {
+    const snapshot = buildDesktopRuntimeSnapshot()
+    if (!snapshot) {
+      desktopBridgeError = 'Desktop Mode could not build its initial Goon snapshot.'
+      restoreDesktopGoonToDock('Desktop snapshot unavailable.', desktopBridgeError)
+      return
+    }
+    desktopPublisher?.close()
+    desktopPublisher = new DesktopGoonMainStatePublisher({
+      port: adaptDesktopGoonStatePort(facade),
+      onSnapshotRequired: () => buildDesktopRuntimeSnapshot(),
+      onTerminal: handleDesktopBridgeFailure
+    })
+    desktopSessionSignature = JSON.stringify([currentSessionId, dockAgentId])
+    desktopSpeakerSignature = JSON.stringify(resolvedDesktopGoonSpeaker)
+    desktopGoonSignature = JSON.stringify(buildDesktopGoonRef())
+    desktopPreferencesSignature = JSON.stringify(desktopGoonPreferences)
+    desktopPresentationSignature = JSON.stringify(desktopPresentation)
+    const result = desktopPublisher.publishInitialSnapshot(snapshot)
+    if (!result.ok) handleDesktopBridgeFailure(result.failure)
+  }
+
+  function handleDesktopShellStatus(value: DesktopGoonShellStatus) {
+    desktopShellStatus = latestDesktopShellStatus(value)
+    const type = value.type
+    if (type === 'renderer-ready' && desktopPresentation.transition?.to === 'desktop') {
+      desktopPresentation = commitDesktopGoonPresentationTransition(
+        desktopPresentation,
+        desktopPresentation.transition.id
+      )
+      desktopBridgeError = null
+      return
+    }
+    if (type === 'shortcut-conflict') {
+      const message =
+        typeof value.detail?.message === 'string'
+          ? value.detail.message
+          : 'The Desktop Controls shortcut is already in use.'
+      desktopBridgeError = message
+      toast.error(message)
+      return
+    }
+    if (type === 'return-to-batshit-requested') {
+      restoreDesktopGoonToDock('The Goon returned to Batshit.')
+      return
+    }
+    const failureTypes = new Set([
+      'desktop-renderer-initialization-failed',
+      'desktop-renderer-ready-timeout',
+      'desktop-renderer-unresponsive',
+      'desktop-renderer-stopped',
+      'desktop-route-load-failed',
+      'desktop-bridge-ready-timeout',
+      'state-port-transfer-failed'
+    ])
+    if (type && failureTypes.has(type)) {
+      const message =
+        typeof value.detail?.message === 'string'
+          ? value.detail.message
+          : 'Desktop Mode stopped unexpectedly.'
+      restoreDesktopGoonToDock('Desktop Mode failed.', message)
+    }
+  }
+
+  async function enterDesktopGoonMode() {
+    if (desktopTransitionBusy || desktopPresentation.mode === 'desktop') return
+    if (!desktopNativeBridge || !desktopModeAvailable) {
+      toast.error(desktopModeUnavailableReason ?? 'Desktop Mode is unavailable.')
+      return
+    }
+    if (!activeGoon || !goonDockRef) {
+      toast.error('Open a ready Goon in the Dock before starting Desktop Mode.')
+      return
+    }
+    if (!goonDockRef.isMountedRendererReady()) {
+      toast.error('The Goon is still preparing. Try Desktop Mode again in a moment.')
+      return
+    }
+    const transitionId = `desktop-enter-${Date.now()}`
+    let nativeWindowOpened = false
+    try {
+      desktopPresentation = beginDesktopGoonPresentationTransition(
+        desktopPresentation,
+        'desktop',
+        transitionId
+      )
+      desktopBridgeError = null
+      const released = goonDockRef.releaseMountedRenderer()
+      if (!released) throw new Error('The Dock renderer was not ready to transfer.')
+      desktopHandoffState = desktopPlainJson(released)
+      desktopEpoch = `desktop-${Date.now()}-${++desktopEpochCounter}`
+      if (desktopActiveVoiceDetail) beginDesktopVoiceProjection(desktopActiveVoiceDetail)
+      goonsPanelOpen = false
+      await updateGoonsSettings({ dockOpen: false, immersiveMode: false })
+      await tick()
+      await desktopNativeBridge.invoke('desktopGoon.open', {
+        preferences: desktopPlainJson(desktopGoonPreferences)
+      })
+      nativeWindowOpened = true
+      await desktopNativeBridge.invoke('desktopGoon.connectStatePort')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Desktop Mode failed to start.'
+      if (nativeWindowOpened) {
+        try {
+          await desktopNativeBridge.invoke('desktopGoon.close', { reason: 'enter-failed' })
+        } catch {
+          // The Dock rollback below remains available when the native close also fails.
+        }
+      }
+      if (desktopPresentation.transition?.id === transitionId) {
+        desktopPresentation = rollbackDesktopGoonPresentationTransition(
+          desktopPresentation,
+          transitionId,
+          message
+        )
+      }
+      desktopBridgeError = message
+      goonsPanelOpen = true
+      await updateGoonsSettings({ dockOpen: true, immersiveMode: false })
+      toast.error(message)
+    }
+  }
+
+  async function closeDesktopGoonMode(reason = 'main-window') {
+    if (desktopExitInProgress || !desktopNativeBridge) return
+    desktopExitInProgress = true
+    try {
+      desktopShellStatus = latestDesktopShellStatus(
+        await desktopNativeBridge.invoke('desktopGoon.close', { reason })
+      )
+      const transitionId = `desktop-close-${Date.now()}`
+      desktopPresentation = commitDesktopGoonPresentationTransition(
+        beginDesktopGoonPresentationTransition(desktopPresentation, 'dock', transitionId),
+        transitionId
+      )
+      desktopBridgeError = null
+      desktopPublisher?.close()
+      desktopPublisher = null
+      clearDesktopVoiceFrames()
+      clearDesktopVoiceAudioProjection()
+      clearDesktopCueTimers()
+      desktopHandoffState = null
+      desktopEpoch = ''
+      goonsPanelOpen = false
+      artifactsPanelOpen = false
+      await updateGoonsSettings({ dockOpen: false, immersiveMode: false })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Desktop Mode could not close.'
+      desktopBridgeError = message
+      toast.error(message)
+    } finally {
+      desktopExitInProgress = false
+    }
+  }
+
+  function applyDesktopGoonPreferencesLive(preferencesInput: DesktopGoonPreferences) {
+    if (!desktopNativeBridge) return
+    const preferences = desktopPlainJson(normalizeDesktopGoonPreferences(preferencesInput))
+    const signature = JSON.stringify(preferences)
+    if (signature === desktopPreferencesSignature) return
+    desktopPreferencesSignature = signature
+    if (desktopPublisher) {
+      publishDesktopDelta({ type: 'settings.changed', preferences })
+    }
+    void desktopNativeBridge
+      .invoke('desktopGoon.updatePreferences', { preferences })
+      .then((status) => {
+        desktopShellStatus = latestDesktopShellStatus(status)
+      })
+      .catch((error) => {
+        const message =
+          error instanceof Error ? error.message : 'Desktop Mode preferences could not be updated.'
+        desktopBridgeError = message
+        toast.error(message)
+      })
+  }
+
+  function publishDesktopControlsProjection() {
+    if (!desktopControlsBridge) return
+    const projection = desktopPlainJson({
+      sessionId: currentSessionId ?? null,
+      clipRevision: desktopControlsClipRevision,
+      preferences: desktopGoonPreferences,
+      voice: desktopControlsVoiceState
+    })
+    const signature = JSON.stringify(projection)
+    if (signature === desktopControlsProjectionSignature) return
+    void desktopControlsBridge
+      .invoke('desktopControls.updateState', { state: projection })
+      .then(() => {
+        desktopControlsProjectionSignature = signature
+      })
+      .catch((error) => {
+        // Keep the old signature so the next canonical state change retries this projection.
+        const message =
+          error instanceof Error ? error.message : 'Desktop Controls state could not update.'
+        desktopBridgeError = message
+        toast.error(message)
+      })
+  }
+
+  async function persistDesktopControlsPreferences(patch: Partial<DesktopGoonPreferences>) {
+    const persistedSettings = await persistGoonsSettingsPatchRequest(fetch, {
+      desktop: normalizeDesktopGoonPreferences({
+        ...desktopGoonPreferences,
+        ...patch
+      })
+    })
+    const currentUserSettings = getUserSettings()
+    if (currentUserSettings) {
+      setUserSettings({ ...currentUserSettings, goons_settings: persistedSettings })
+    }
+    applyDesktopGoonPreferencesLive(normalizeDesktopGoonPreferences(persistedSettings.desktop))
+  }
+
+  function handleDesktopControlsState(event: DesktopControlsStateEvent) {
+    if (event.type !== 'renderer-intent') return
+    const intent = typeof event.detail?.intent === 'string' ? event.detail.intent : ''
+    const payload =
+      event.detail?.payload && typeof event.detail.payload === 'object' && !Array.isArray(event.detail.payload)
+        ? (event.detail.payload as Record<string, unknown>)
+        : {}
+    if (intent === 'voice.start') {
+      void desktopControlsVoiceCoordinator.requestStart().catch((error) => {
+        toast.error(error instanceof Error ? error.message : 'Voice Mode could not start.')
+      })
+      return
+    }
+    if (intent === 'voice.end') {
+      void desktopControlsVoiceCoordinator.requestEnd().catch((error) => {
+        toast.error(error instanceof Error ? error.message : 'Voice Mode could not end.')
+      })
+      return
+    }
+    if (intent === 'voice.toggle-listening') {
+      void desktopControlsVoiceCoordinator.requestListeningToggle().catch((error) => {
+        toast.error(error instanceof Error ? error.message : 'Voice listening could not change.')
+      })
+      return
+    }
+    if (intent === 'clips.changed') {
+      desktopControlsClipRevision += 1
+      if (currentSessionId) {
+        dispatchSessionClipStateChanged({ sessionId: currentSessionId, source: 'runtime' })
+      }
+      return
+    }
+    if (intent === 'desktop.close') {
+      void closeDesktopGoonMode(
+        typeof payload.reason === 'string' ? payload.reason : 'controls-island'
+      )
+      return
+    }
+    if (intent === 'preferences.update') {
+      const patch: Partial<DesktopGoonPreferences> = {}
+      if (typeof payload.stayOnTop === 'boolean') patch.stayOnTop = payload.stayOnTop
+      if (typeof payload.clickThrough === 'boolean') patch.clickThrough = payload.clickThrough
+      if (Object.keys(patch).length === 0) return
+      void persistDesktopControlsPreferences(patch).catch((error) => {
+        toast.error(error instanceof Error ? error.message : 'Desktop Mode settings could not update.')
+      })
+    }
+  }
+
+  onMount(() => {
+    desktopNativeBridge = getDesktopGoonNativeBridge('main')
+    if (!desktopNativeBridge) return
+    desktopControlsBridge = getDesktopControlsNativeBridge('main')
+    if (desktopControlsBridge) {
+      desktopControlsUnsubscribe = desktopControlsBridge.onState(handleDesktopControlsState)
+      desktopControlsVoiceUnsubscribe = desktopControlsVoiceCoordinator.subscribe((state) => {
+        desktopControlsVoiceState = state
+      })
+      void desktopControlsBridge.invoke('desktopControls.getState').catch(() => {
+        // Desktop Goon availability remains authoritative; projection resumes when its window exists.
+      })
+    }
+
+    desktopStatusUnsubscribe = desktopNativeBridge.onStatus(handleDesktopShellStatus)
+    desktopPortUnsubscribe = desktopNativeBridge.onStatePort(handleDesktopStatePort)
+    void desktopNativeBridge
+      .invoke('desktopGoon.getStatus')
+      .then((status) => {
+        desktopShellStatus = latestDesktopShellStatus(status)
+      })
+      .catch((error) => {
+        desktopBridgeError =
+          error instanceof Error ? error.message : 'Desktop Mode status is unavailable.'
+      })
+
+    desktopReplaceableFlushTimer = setInterval(() => {
+      desktopPublisher?.flushReplaceable()
+    }, 40)
+
+    const handleVoiceStart = (event: Event) => {
+      const detail = (event as CustomEvent).detail as DesktopVoicePlaybackDetail
+      desktopActiveVoiceDetail = detail
+      if (!desktopModeActive) return
+      if (dockAgentId && detail?.agentId && detail.agentId !== dockAgentId) return
+      beginDesktopVoiceProjection(detail)
+    }
+
+    const handleVoiceAlignment = (event: Event) => {
+      const detail = (event as CustomEvent).detail as DesktopVoicePlaybackDetail
+      if (desktopActiveVoiceDetail && detail?.messageId === desktopActiveVoiceDetail.messageId) {
+        desktopActiveVoiceDetail = {
+          ...desktopActiveVoiceDetail,
+          ...detail,
+          audio: desktopActiveVoiceDetail.audio
+        }
+      }
+      if (!desktopModeActive || !desktopPublisher || !desktopVoiceGeneration) return
+      if (!detail?.lipSyncTimeline || !detail.lipSyncAnalyzerId) return
+      if (dockAgentId && detail.agentId && detail.agentId !== dockAgentId) return
+      const visual = desktopPlainJson({
+        kind: 'alignment' as const,
+        generation: desktopVoiceGeneration,
+        agentId: detail.agentId ?? null,
+        messageId: detail.messageId ?? null,
+        atMs: Date.now(),
+        durationMs: detail.durationMs ?? null,
+        analyzerId: detail.lipSyncAnalyzerId,
+        timeline: detail.lipSyncTimeline
+      })
+      desktopLastVoiceVisual = visual
+      publishDesktopDelta({ type: 'voice.visual', visual })
+      beginDesktopVoiceProjection(
+        {
+          ...(desktopActiveVoiceDetail ?? {}),
+          ...detail,
+          audio: desktopActiveVoiceDetail?.audio ?? null
+        },
+        desktopVoiceGeneration,
+        false
+      )
+    }
+
+    const handleVoiceEnd = (event: Event) => {
+      const detail = (event as CustomEvent).detail as {
+        messageId?: string | null
+        agentId?: string | null
+      }
+      if (
+        desktopActiveVoiceDetail &&
+        ((detail?.messageId && desktopActiveVoiceDetail.messageId !== detail.messageId) ||
+          (detail?.agentId && desktopActiveVoiceDetail.agentId !== detail.agentId))
+      ) {
+        return
+      }
+      desktopActiveVoiceDetail = null
+      if (!desktopModeActive || !desktopPublisher || !desktopVoiceGeneration) return
+      if (dockAgentId && detail?.agentId && detail.agentId !== dockAgentId) return
+      clearDesktopVoiceFrames()
+      clearDesktopVoiceAudioProjection()
+      const visual = {
+        kind: 'end' as const,
+        generation: desktopVoiceGeneration,
+        agentId: detail?.agentId ?? null,
+        messageId: detail?.messageId ?? null,
+        endedAtMs: Date.now()
+      }
+      desktopLastVoiceVisual = visual
+      publishDesktopDelta({ type: 'voice.visual', visual })
+      desktopVoiceGeneration = ''
+    }
+
+    const handleGoonMessage = (event: Event) => {
+      if (!desktopModeActive || !desktopPublisher || !activeGoon) return
+      const detail = (event as CustomEvent).detail as {
+        messageId?: string
+        agentId?: string | null
+        content?: string
+        source?: string
+      }
+      if (!detail?.messageId || !detail.content) return
+      if (dockAgentId && detail.agentId && detail.agentId !== dockAgentId) return
+      const { cueMap, emojiMap } = resolveGoonCues(activeGoon, goonsSettings)
+      const parsed = parseGoonCues(detail.content, emojiMap, cueMap)
+      const natural =
+        parsed.length === 0 && detail.source?.startsWith('livekit')
+          ? parseLiveKitNaturalGoonCues(detail.content, cueMap)
+          : []
+      const cues = parsed.length > 0 ? parsed : natural
+      cues.forEach((cue, index) => {
+        const publish = () => {
+          publishDesktopDelta({
+            type: 'cue',
+            cueId: `${detail.messageId}:${index}:${cue.name}`,
+            name: cue.name,
+            payload: desktopPlainJson(cue.definition ?? {}) as {
+              [key: string]: DesktopGoonJsonValue
+            }
+          })
+        }
+        if (cue.definition?.kind === 'mood' || cue.definition?.playback === 'loop') {
+          publish()
+          return
+        }
+        const timer = setTimeout(() => {
+          desktopCueTimers.delete(timer)
+          publish()
+        }, index * 650)
+        desktopCueTimers.add(timer)
+      })
+    }
+
+    const handleDesktopGoonPreferencesUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<DesktopGoonPreferencesUpdatedDetail>).detail
+      if (!detail?.preferences) return
+      applyDesktopGoonPreferencesLive(detail.preferences)
+    }
+
+    window.addEventListener('batshit:voice-playback-start', handleVoiceStart as EventListener)
+    window.addEventListener('batshit:voice-alignment-update', handleVoiceAlignment as EventListener)
+    window.addEventListener('batshit:voice-playback-end', handleVoiceEnd as EventListener)
+    window.addEventListener('batshit:goon-message', handleGoonMessage as EventListener)
+    window.addEventListener(
+      LIVE_SETTINGS_EVENTS.desktopGoonPreferencesUpdated,
+      handleDesktopGoonPreferencesUpdated as EventListener
+    )
+
+    return () => {
+      desktopStatusUnsubscribe?.()
+      desktopStatusUnsubscribe = null
+      desktopPortUnsubscribe?.()
+      desktopPortUnsubscribe = null
+      desktopControlsUnsubscribe?.()
+      desktopControlsUnsubscribe = null
+      desktopControlsVoiceUnsubscribe?.()
+      desktopControlsVoiceUnsubscribe = null
+      desktopControlsBridge = null
+      desktopPublisher?.close()
+      desktopPublisher = null
+      if (desktopReplaceableFlushTimer) clearInterval(desktopReplaceableFlushTimer)
+      desktopReplaceableFlushTimer = null
+      clearDesktopVoiceFrames()
+      clearDesktopVoiceAudioProjection()
+      clearDesktopCueTimers()
+      window.removeEventListener('batshit:voice-playback-start', handleVoiceStart as EventListener)
+      window.removeEventListener('batshit:voice-alignment-update', handleVoiceAlignment as EventListener)
+      window.removeEventListener('batshit:voice-playback-end', handleVoiceEnd as EventListener)
+      window.removeEventListener('batshit:goon-message', handleGoonMessage as EventListener)
+      window.removeEventListener(
+        LIVE_SETTINGS_EVENTS.desktopGoonPreferencesUpdated,
+        handleDesktopGoonPreferencesUpdated as EventListener
+      )
+    }
+  })
+
+  $effect(() => {
+    if (desktopPresentation.transition || desktopPresentation.mode === 'desktop') return
+    const target = immersiveActive ? 'immersive' : 'dock'
+    if (desktopPresentation.mode === target) return
+    const transitionId = `desktop-presentation-sync-${Date.now()}`
+    desktopPresentation = commitDesktopGoonPresentationTransition(
+      beginDesktopGoonPresentationTransition(desktopPresentation, target, transitionId),
+      transitionId
+    )
+  })
+
+  $effect(() => {
+    if (!desktopPublisher) return
+    const signature = JSON.stringify(desktopPresentation)
+    if (signature === desktopPresentationSignature) return
+    desktopPresentationSignature = signature
+    publishDesktopDelta({
+      type: 'presentation.changed',
+      presentation: desktopPlainJson(desktopPresentation)
+    })
+  })
+
+  $effect(() => {
+    if (!desktopPublisher) return
+    const signature = JSON.stringify([currentSessionId, dockAgentId])
+    if (signature === desktopSessionSignature) return
+    desktopSessionSignature = signature
+    publishDesktopDelta({
+      type: 'session-agent.changed',
+      sessionId: currentSessionId ?? null,
+      activeAgentId: dockAgentId
+    })
+  })
+
+  $effect(() => {
+    if (!desktopPublisher) return
+    const signature = JSON.stringify(resolvedDesktopGoonSpeaker)
+    if (signature === desktopSpeakerSignature) return
+    desktopSpeakerSignature = signature
+    publishDesktopDelta({
+      type: 'speaker.changed',
+      activeSpeaker: desktopPlainJson(resolvedDesktopGoonSpeaker)
+    })
+  })
+
+  $effect(() => {
+    if (!desktopPublisher) return
+    const goon = buildDesktopGoonRef()
+    const signature = JSON.stringify(goon)
+    if (signature === desktopGoonSignature) return
+    desktopGoonSignature = signature
+    publishDesktopDelta({ type: 'goon.invalidated', goon: desktopPlainJson(goon) })
+  })
+
+  $effect(() => {
+    if (!desktopNativeBridge) return
+    applyDesktopGoonPreferencesLive(desktopGoonPreferences)
+  })
+
+  $effect(() => {
+    if (!desktopControlsBridge) return
+    currentSessionId
+    desktopControlsClipRevision
+    desktopGoonPreferences
+    desktopControlsVoiceState
+    publishDesktopControlsProjection()
+  })
+
   $effect(() => {
     if (typeof window === 'undefined') return
     if (!rightPanelDragging) return
@@ -5558,11 +6437,8 @@ const immersiveActive = $derived.by(
   })
 
   function toggleGoonsPanel() {
-    if (groupChatActive) {
-      if (goonsPanelOpen) {
-        goonsPanelOpen = false
-      }
-      updateGoonsSettings({ dockOpen: false })
+    if (desktopModeActive) {
+      void closeDesktopGoonMode('main-goon-tab')
       return
     }
     const next = !goonsPanelOpen
@@ -5642,16 +6518,6 @@ const immersiveActive = $derived.by(
     }
     // Launch always starts closed. After that, local state is source of truth
     // and persists through toggleGoonsPanel/handleArtifactSelect for this session.
-  })
-
-  $effect(() => {
-    if (!groupChatActive) return
-    if (goonsPanelOpen) {
-      goonsPanelOpen = false
-    }
-    if (Boolean(userSettings?.goons_settings?.dockOpen)) {
-      updateGoonsSettings({ dockOpen: false })
-    }
   })
 
   $effect(() => {
@@ -5932,7 +6798,8 @@ const immersiveActive = $derived.by(
             bind:voiceMode
             onOpenN8nSheet={() => n8nSheetOpen = true}
             sessionId={currentSessionId}
-            {goonsPanelOpen}
+            goonsPanelOpen={goonPresentationVisible}
+            goonPresentationMode={goonDcmPresentationMode}
             onVoiceModeChange={(enabled) => voiceMode = enabled}
             showExecutionViewer={false}
             workBusy={chatWorkBusy || compactBusy}
@@ -5993,14 +6860,15 @@ const immersiveActive = $derived.by(
       class={`right-panel-slot ${immersiveActive ? 'goon-right-panel' : ''} ${rightPanelOverlayMode ? 'is-overlay' : ''}`}
       style="margin-right: var(--sidebar-width-icon);"
     >
-    {#if !immersiveActive && !groupChatActive}
+    {#if !immersiveActive}
       <!-- Goon Dock toggle tab -->
       <button
         type="button"
         class="goon-dock-tab-trigger"
         style="top: {tokenPanelOpen ? '115px' : '14px'};"
-        aria-expanded={goonsPanelOpen}
-        aria-label={goonsPanelOpen ? 'Close Goon Dock' : 'Open Goon Dock'}
+        aria-expanded={goonsPanelOpen || desktopModeActive}
+        aria-label={desktopModeActive ? 'Close Desktop Goon' : goonsPanelOpen ? 'Close Goon Dock' : 'Open Goon Dock'}
+        title={desktopBridgeError ?? (desktopModeActive ? 'Close Desktop Goon' : 'Goon Dock')}
         onclick={() => toggleGoonsPanel()}
       >
         <BatshitIcon id="goons" class="goon-dock-tab-icon" />
@@ -6037,6 +6905,7 @@ const immersiveActive = $derived.by(
           </div>
         </button>
         <GoonDock
+          bind:this={goonDockRef}
           open={goonsPanelOpen}
           goon={activeGoon}
           speakerName={dockAgent?.displayName || 'Unknown speaker'}
@@ -6051,11 +6920,19 @@ const immersiveActive = $derived.by(
           goonsSettings={goonsSettings}
           immersiveMode={immersiveMode}
           immersiveStage={goonStageRect}
+          {desktopModeAvailable}
+          desktopModeBusy={desktopTransitionBusy}
+          {desktopModeUnavailableReason}
+          handoffMountedState={desktopHandoffState}
           onImmersiveChange={(value) => updateGoonsSettings({ immersiveMode: value })}
+          onDesktopModeChange={() => enterDesktopGoonMode()}
           onQualityChange={(value) => updateActiveGoonDefaults({ quality: value })}
           onLipSyncChange={(value) => updateActiveGoonDefaults({ lipSync: value })}
           onCompatibilityReport={handleGoonCompatibility}
           onCameraChange={handleGoonCamera}
+          onHandoffMountedStateConsumed={() => {
+            desktopHandoffState = null
+          }}
         />
       </div>
     {:else}

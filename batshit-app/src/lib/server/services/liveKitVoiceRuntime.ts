@@ -3,6 +3,7 @@ import { env } from '$env/dynamic/private'
 import { AccessToken, AgentDispatchClient, type AgentDispatch, type VideoGrant } from 'livekit-server-sdk'
 import { redis } from '$lib/server/redis'
 import { databaseService } from '$lib/services/databaseRedis.server'
+import { normalizeDesktopGoonPresentationMode } from '$lib/goons/desktopGoonPresentation'
 import type {
   LiveKitVoiceSessionRequest,
   LiveKitVoiceSessionResponse
@@ -423,6 +424,9 @@ async function compileSpeechToSpeechPrimaryInstructions(
         ]
       },
       goonsEnabled: readBooleanMetadata(request.metadata, 'goonsEnabled'),
+      goonPresentationMode: normalizeDesktopGoonPresentationMode(
+        request.metadata?.goonPresentationMode
+      ),
       goonsSettings: userSettings?.goons_settings ?? null
     }
   )

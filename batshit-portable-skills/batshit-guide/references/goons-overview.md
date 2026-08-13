@@ -4,7 +4,7 @@ Goons are Batshit's 3D avatars — expressive characters tied to your agents tha
 
 ## Goons
 
-Goons are 3D avatars assigned to agents. They can show in the Goon Dock, use moods and emotes, lip sync to voice, wear saved outfits, use scenes/props/room shells/skyboxes, and react to cues in assistant messages.
+Goons are 3D avatars assigned to agents. They can show in the Goon Dock or, in the packaged Mac app, move into Desktop Mode as a transparent desktop companion. They use moods and emotes, lip sync to voice, wear saved outfits, use scenes/props/room shells/skyboxes in Batshit, and react to cues in assistant messages.
 
 The Goon Dock is a right-sidebar surface. It's intentionally user-opened, because 3D runtime work can be heavy.
 
@@ -74,14 +74,32 @@ When an assistant reply is spoken:
 2. The assistant text is cleaned for speech.
 3. Goon cues are parsed from the original reply.
 4. TTS begins or streams.
-5. The Goon Dock receives playback timing.
+5. The active Goon surface — Dock or Desktop Mode — receives playback timing.
 6. Lip sync, facial Emotes, and one-shot Motions play against the voice timeline where possible.
 
-If the Dock is closed, the agent can still speak — the visual avatar just isn't rendered.
+If neither the Dock nor Desktop Mode is active, the agent can still speak — the visual avatar just isn't rendered.
+
+## Desktop Mode (Mac app)
+
+In the packaged Mac app, use the monitor button in the Goon Dock to move the active Goon into a transparent desktop window. Batshit keeps the chat, microphone, speech recognition, voice playback, interruptions, and session running in the main window; Desktop Mode renders the same Goon and never starts a second audio or microphone owner.
+
+Desktop Mode shows only one Goon. It does not bring the room, skybox, chat, captions, or Batshit controls onto the desktop. Dock, Immersive, and Desktop Mode are mutually exclusive, and the Goon tab in the main window becomes a reliable **Close Desktop Goon** action while Desktop Mode is active.
+
+While a Goon is visible, Batshit tells the active agent whether it is appearing in the Goon Dock, Immersive Mode, or Desktop Mode and keeps its normal Mood, Emote, outfit, and voice-cue guidance. In Desktop Mode, the agent is told that its live 3D Goon is literally visible in a transparent, scene-free window on your operating-system desktop, rather than inside a saved Batshit scene. This is presentation awareness, not screen vision: the agent cannot see your wallpaper, windows, apps, or anything else on the desktop unless you share it in chat.
+
+Desktop Mode opens with the camera, framing, FOV, and rotation you already chose in the Goon Dock, so the Dock acts as the staging view. Animation, expression, outfit, Hair motion, lip sync, and the conversation continue normally. Closing Desktop Mode leaves the Goon Dock closed; open the Dock whenever you want the Goon back inside Batshit, then send it to the desktop again once it is ready.
+
+The small **Desktop Controls** island can remain visible while Batshit is minimized. It stays above the Goon and remains clickable even when the large Goon window is click-through or set to Stay on Top. Use it to drag or pick files into the active chat's real Clips, see and unclip current attachments, start or end Voice Mode, close the Desktop Goon, or turn on **Adjust**. Goon Stay on Top and Lock each use a bordered two-sided icon control whose filled side shows the current state; the Hand means the Goon is adjustable, while the Lock means the Goon is fixed and clicks pass through it. The global shortcut shows or hides the island.
+
+Adjust exposes the Goon frame only while you need it: drag the handle to move it, resize horizontally, scroll or use the trackpad to zoom, left-drag to move through a limited vertical camera orbit, hold left and right together while dragging to pan, right-drag to rotate the Goon, and Shift+scroll to adjust field of view. The orbit stops slightly below eye level and before extreme overhead angles; horizontal/free orbit is intentionally unavailable. Turning Adjust off—or hiding the island with the shortcut—restores the saved Click-Through behavior and removes the frame outline.
+
+The configurable global Desktop Controls shortcut defaults to Command+Shift+G on Mac and is recorded by pressing the desired chord in Settings; users never need to type Electron syntax. Press it to show or hide the island from any app. Settings → 3D Goons → Desktop Mode also controls Full Height, starting width, Goon Stay on Top, Goon Click-Through, the shortcut, and **Desktop Visibility** (`This Desktop` or `All Desktops`) on macOS. Exact Goon and island placement stays on that computer, while Clips and Voice Mode continue to belong to the active Batshit chat. Desktop Mode never turns itself on automatically after launch.
+
+Mac is the supported Desktop Mode platform in this release. Browser, Docker, and source-web sessions cannot create an operating-system overlay. The shared Electron design includes a Windows-safe policy contract, but Batshit does not claim Windows support until a separately packaged and signed Windows build passes real Windows testing.
 
 ## Group Chat
 
-Group Chat can use voice, but it doesn't use Goons yet. The visual Dock shows one active Goon at a time, so Batshit closes/suppresses the Dock during group chats and keeps Goon cue instructions out of group prompts. Voice playback is queued by agent so multiple speakers don't talk over each other.
+Group Chat can use one visible Goon at a time. During audible playback, the Dock or Desktop Mode follows the agent whose voice is actually playing; while a response is streaming it follows that current speaker. When the group is idle, a valid configured Group driver is the visual fallback, followed by the current agent. Voice playback remains queued so speakers never talk over each other, and Batshit never opens multiple Goon renderers for a group.
 
 ## Common problems
 

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildGoonRendererConstructionOptions,
   resolveGoonRendererBackendPolicy,
+  resolveGoonRendererClearAlpha,
   shouldRetryGoonRendererWithWebGL2
 } from './goonRendererRequirements'
 
@@ -13,6 +14,30 @@ describe('Goon renderer requirements', () => {
       requiredLimits: { maxTextureArrayLayers: 501 }
     })
     expect(shouldRetryGoonRendererWithWebGL2(false, 501)).toBe(true)
+  })
+
+  it('keeps the existing opaque surface as the default on both renderer backends', () => {
+    expect(buildGoonRendererConstructionOptions(false, 0)).toMatchObject({
+      forceWebGL: false,
+      alpha: false
+    })
+    expect(buildGoonRendererConstructionOptions(true, 0)).toMatchObject({
+      forceWebGL: true,
+      alpha: false
+    })
+    expect(resolveGoonRendererClearAlpha()).toBe(1)
+  })
+
+  it('selects transparent output explicitly on both renderer backends', () => {
+    expect(buildGoonRendererConstructionOptions(false, 0, 'desktop-transparent')).toMatchObject({
+      forceWebGL: false,
+      alpha: true
+    })
+    expect(buildGoonRendererConstructionOptions(true, 0, 'desktop-transparent')).toMatchObject({
+      forceWebGL: true,
+      alpha: true
+    })
+    expect(resolveGoonRendererClearAlpha('desktop-transparent')).toBe(0)
   })
 
   it('retries WebGL2 without passing WebGPU-only required limits', () => {

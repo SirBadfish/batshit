@@ -15,6 +15,20 @@ const entitlementsPath = join(macRoot, 'macos.entitlements');
 const localEntitlementsPath = join(macRoot, 'macos.local.entitlements');
 const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');
 
+export const ELECTRON_SOURCE_FILES = Object.freeze([
+  'main.mjs',
+  'preload.cjs',
+  'electron-shell-policy.mjs',
+  'desktop-controls-contract.mjs',
+  'desktop-controls-window-policy.mjs',
+  'desktop-controls-window-state.mjs',
+  'desktop-controls-window-controller.mjs',
+  'desktop-goon-contract.mjs',
+  'desktop-goon-window-policy.mjs',
+  'desktop-goon-window-state.mjs',
+  'desktop-goon-window-controller.mjs'
+]);
+
 export function parsePackageArgs(argv) {
   let artifactSuffix = '';
   for (const argument of argv) {
@@ -52,7 +66,7 @@ function runChecked(command, args, options = {}) {
 async function stageElectronSource(stagingRoot) {
   await rm(stagingRoot, { recursive: true, force: true });
   await mkdir(stagingRoot, { recursive: true });
-  for (const file of ['main.mjs', 'preload.cjs', 'electron-shell-policy.mjs']) {
+  for (const file of ELECTRON_SOURCE_FILES) {
     await cp(join(macRoot, 'src-electron', file), join(stagingRoot, file));
   }
   await cp(join(macRoot, 'frontend', 'dist'), join(stagingRoot, 'shell'), { recursive: true });

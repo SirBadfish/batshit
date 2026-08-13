@@ -117,10 +117,47 @@ describe('goon dcm', () => {
     const lines = buildGoonDcmLines(goon, {}, goonsSettings)
 
     expect(lines.some((line) => line.startsWith('Goon: '))).toBe(false)
+    expect(lines).toContain(
+      "Presentation: Goon Dock — your live 3D Goon is currently visible inside the user's Batshit app."
+    )
     expect(lines).toContain('Scene: Cyberpunk')
     expect(lines).toContain(
       'Closet outfit: Bottom: BS-Pants-Black (Black graffiti sweatpants); Shoes: Chucks'
     )
+  })
+
+  it('replaces the saved scene with truthful scene-free Desktop Mode awareness', () => {
+    const lines = buildGoonDcmLines(
+      goon,
+      { presentationMode: 'desktop', includeSpokenCues: true },
+      goonsSettings
+    )
+
+    expect(lines).toContain(
+      "Presentation: Desktop Mode — your live 3D Goon is currently visible directly on the user's operating-system desktop in a transparent, scene-free window, with wallpaper or other apps potentially behind and around you."
+    )
+    expect(lines).toContain(
+      "Desktop visibility boundary: no Batshit room, skybox, or saved Goon scene is visible. Desktop Mode does not give you screen vision; do not claim to see the user's wallpaper, windows, apps, or desktop contents unless the user shares them."
+    )
+    expect(lines).not.toContain('Scene: Cyberpunk')
+    expect(lines.find((line) => line.startsWith('Moods: '))).toContain('happy (Happy idle)')
+    expect(lines.find((line) => line.startsWith('Emotes: '))).toContain('smile (Warm smile)')
+    expect(lines).toContain(
+      'Closet outfit: Bottom: BS-Pants-Black (Black graffiti sweatpants); Shoes: Chucks'
+    )
+  })
+
+  it('describes Immersive Mode while preserving its configured scene', () => {
+    const lines = buildGoonDcmLines(
+      goon,
+      { presentationMode: 'immersive' },
+      goonsSettings
+    )
+
+    expect(lines).toContain(
+      "Presentation: Immersive Mode — your live 3D Goon is currently visible across the user's Batshit workspace."
+    )
+    expect(lines).toContain('Scene: Cyberpunk')
   })
 
   it('lists all enabled emotes without truncating the current cue set', () => {

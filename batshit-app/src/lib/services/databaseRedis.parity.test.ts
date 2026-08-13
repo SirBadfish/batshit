@@ -276,6 +276,7 @@ const routeImports: Record<string, () => Promise<RouteModule>> = {
   unzipping: () => import('../../routes/api/unzipping/+server'),
   sessionClips: () => import('../../routes/api/session-clips/state/[sessionId]/+server'),
   clips: () => import('../../routes/api/clips/[id]/+server'),
+  goon: () => import('../../routes/api/goons/[id]/+server'),
   agentCapabilities: () => import('../../routes/api/slash-commands/agent-capabilities/+server'),
   skillSessionContext: () => import('../../routes/api/skills/session-context/+server'),
   controlsFind: () => import('../../routes/api/controls/find/+server'),
@@ -348,6 +349,9 @@ function createFetchRouter() {
     }
     if ((match = path.match(/^\/api\/clips\/([^/]+)$/))) {
       return invokeRoute('clips', method, url, { id: decodeURIComponent(match[1]) }, init)
+    }
+    if ((match = path.match(/^\/api\/goons\/([^/]+)$/))) {
+      return invokeRoute('goon', method, url, { id: decodeURIComponent(match[1]) }, init)
     }
     if (path === '/api/slash-commands/agent-capabilities') {
       return invokeRoute('agentCapabilities', method, url, {}, init)
@@ -869,5 +873,66 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     expect(normalize(server)).toEqual(normalize(client))
     const dcm = currentUserMessageContent(server)
     expect(dcm).toContain('Voice runtime context:')
+  })
+
+  it('S12: Desktop Goon presentation DCM is identical across twins', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    state.current.userSettings.goons_settings = {
+      dockOpen: true,
+      globalCloset: { items: {} },
+      kitchen: {
+        cues: {
+          happy: {
+            name: 'happy',
+            kind: 'mood',
+            playback: 'loop',
+            description: 'Happy idle'
+          },
+          smile: {
+            name: 'smile',
+            kind: 'emote',
+            playback: 'oneshot',
+            description: 'Warm smile'
+          }
+        },
+        emojiMap: { '🙂': 'smile' },
+        scenes: { rooftop: { id: 'rooftop', name: 'Neon Rooftop' } },
+        roomTextures: {},
+        bodyVariants: { items: {} }
+      }
+    }
+    state.current.kv.set('goon:desktop-parity', {
+      id: 'desktop-parity',
+      user_id: USER_ID,
+      name: 'Desktop Parity',
+      files: { vrm: { url: '/goons/desktop-parity.vrm', filename: 'desktop-parity.vrm' } },
+      cues: { enabled: ['happy', 'smile'], overrides: {}, emojiOverrides: {} },
+      defaults: { baseLoop: 'happy', sceneId: 'rooftop' },
+      created_at: '2026-08-12T00:00:00.000Z',
+      updated_at: '2026-08-12T00:00:00.000Z'
+    })
+
+    const { server, client } = await runBothTwins({
+      sessionId,
+      messages: [],
+      agent: apiAgent({ goon_id: 'desktop-parity' }),
+      currentUserMessage: 'talk to me from the desktop',
+      options: {
+        runtimeFlavor: 'vercel',
+        goonsEnabled: true,
+        goonPresentationMode: 'desktop',
+        voiceState: { tts: true, voiceMode: 'voice' },
+        goonsSettings: state.current.userSettings.goons_settings
+      }
+    })
+
+    expect(normalize(server)).toEqual(normalize(client))
+    const dcm = currentUserMessageContent(server)
+    expect(dcm).toContain('Presentation: Desktop Mode')
+    expect(dcm).toContain('does not give you screen vision')
+    expect(dcm).toContain('Moods: happy (Happy idle)')
+    expect(dcm).toContain('Emotes: smile (Warm smile)')
+    expect(dcm).not.toContain('Scene: Neon Rooftop')
   })
 })

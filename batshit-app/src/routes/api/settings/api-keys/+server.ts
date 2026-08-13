@@ -156,7 +156,23 @@ export const GET: RequestHandler = async ({ locals, request }) => {
     }
 
     const skipServices = ['batshit_token'];
-    const keys = applyRuntimeManagedKeys(await apiKeyService.getAllMasked(userId, { skipServices }), request);
+    const storedKeys = await apiKeyService.getAllMasked(userId, { skipServices });
+    const unreadableKeyCount = Object.values(storedKeys).filter(
+      (record) => record.status === 'error'
+    ).length;
+    if (unreadableKeyCount > 0) {
+      return json(
+        {
+          success: false,
+          error:
+            `Batshit found ${unreadableKeyCount} saved API key record${unreadableKeyCount === 1 ? '' : 's'} ` +
+            'but could not decrypt them. Do not re-enter or delete the keys. Restore the original ' +
+            'ENCRYPTION_KEY for this Batshit data, then restart Batshit.'
+        },
+        { status: 409 }
+      );
+    }
+    const keys = applyRuntimeManagedKeys(storedKeys, request);
 
     return json({
       success: true,

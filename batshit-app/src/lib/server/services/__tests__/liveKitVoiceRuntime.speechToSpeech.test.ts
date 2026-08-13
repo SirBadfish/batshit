@@ -151,7 +151,8 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
         agentId: 'agent-1',
         participantName: 'Josh',
         metadata: {
-          goonsEnabled: true
+          goonsEnabled: true,
+          goonPresentationMode: 'desktop'
         },
         speechToSpeech: {
           enabled: true,
@@ -248,6 +249,7 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
           provider: 'livekit'
         }),
         goonsEnabled: true,
+        goonPresentationMode: 'desktop',
         goonsSettings: expect.objectContaining({
           dockOpen: true
         })

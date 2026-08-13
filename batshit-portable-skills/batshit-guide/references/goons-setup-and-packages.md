@@ -253,8 +253,28 @@ The Goon Dock lives in the right sidebar and starts closed on app launch. Its co
 - field of view
 - quality
 - immersive mode
+- Desktop Mode in the packaged Mac app
 
 Selecting Goon, Scene, Mood, or Closet from the Dock saves real state. Motion and Emote quick actions are for preview/testing and usually return to the saved Mood afterward. Only one visible active Goon renders at a time in v1.
+
+### Desktop Mode
+
+The Dock's monitor button transfers the active Goon into one transparent desktop companion window in the packaged Mac app. The transfer keeps the current Dock camera, framing, FOV, and Goon rotation along with the same Live Goon package, Appearance, outfit, Hair and motion, Mood/Emote state, speech timing, and active speaker. It does not copy the room or create a second Goon/audio runtime. Returning remounts the Dock renderer; its Desktop button becomes available as soon as that Goon is ready, and another transfer does not require closing and reopening the Dock.
+
+The agent keeps the same Goon cue awareness in Dock, Immersive, and Desktop presentation. Desktop Mode replaces the saved Scene description with an explicit note that the Goon is visible directly on the operating-system desktop in a transparent, scene-free window. It does not grant screen vision, so the agent cannot see or describe wallpaper, windows, apps, or desktop contents unless you attach or share them.
+
+Settings → 3D Goons → Desktop Mode owns the saved preferences:
+
+- **Full Height** locks the frame to the selected monitor's usable height.
+- **Frame Width** sets the starting percentage; Adjust can still move and resize it.
+- **Stay on Top** keeps the companion above normal windows.
+- **Click-Through** passes all mouse input to the desktop beneath it.
+- **Desktop Controls Shortcut** shows or hides the island globally. Click the recorder and press the desired chord; the default is Command+Shift+G on Mac.
+- **Desktop Visibility** chooses **This Desktop** or **All Desktops** on macOS.
+
+The Desktop Controls island stays above the large Goon window and remains clickable while the Goon is click-through or set to Stay on Top. It shows active-chat Clips, accepts file drops and picks, controls Voice Mode, and includes Adjust and Close Desktop Goon actions; the global shortcut shows or hides the island. Stay on Top and Lock each use a bordered two-sided icon control whose filled side shows the current state. In the Lock pair, the Hand means the Goon is adjustable and the Lock means the Goon is fixed while clicks pass through it. Adjust temporarily reveals the Goon outline and interaction: drag the top handle to move the frame, use either side handle to resize horizontally, left-drag for the limited vertical orbit, hold left and right together while dragging to pan, and right-drag to rotate the Goon. Turning Adjust off, hiding the island with the shortcut, or pressing Escape removes the frame and restores the saved click-through behavior. The Goon tab in Batshit is another close path. Closing discards the old Desktop handoff and leaves the Dock closed; explicitly open the Dock when you want a fresh Goon renderer back inside Batshit. Exact Goon/island bounds remain local to that computer, and a fresh app launch always starts with Desktop Mode off.
+
+The transparent Goon view keeps scroll/trackpad zoom, left-drag bounded vertical orbit, left+right drag screen-space pan, right-drag Goon rotation, and Shift+scroll FOV. Horizontal/free camera orbit, Indoor Camera, room controls, new user-facing framing presets, captions, and agent-owned desktop-control powers are not part of Desktop Mode.
 
 ## Voice and lip sync
 

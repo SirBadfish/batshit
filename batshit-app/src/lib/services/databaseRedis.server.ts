@@ -20,6 +20,7 @@ import type { UnzippedItem } from '$lib/services/zipping'
 // Import types
 import type { ChatSessionRow, ChatMemoryRow, AgentRow, UserSettingsRow, ClipRow, SessionClipRow, ChatFolderRow, SubagentRow } from '$lib/types/database'
 import type { GoonRecord, GoonsSettings } from '$lib/types/goons'
+import type { DesktopGoonPresentationMode } from '$lib/goons/desktopGoonPresentation'
 import type { Message } from '$lib/stores/messages.svelte'
 import type { GroupChatAgentSettings } from '$lib/types/groupChat'
 import { compileForAI, type ZipExposure } from '$lib/services/messageCompiler'
@@ -2171,6 +2172,7 @@ export class DatabaseService {
     userId?: string | null
     goonsSettings?: GoonsSettings | null
     voiceState?: VoiceState
+    goonPresentationMode?: DesktopGoonPresentationMode | null
   }): Promise<string[]> {
     const dockOpen =
       typeof options.goonsEnabled === 'boolean'
@@ -2184,7 +2186,10 @@ export class DatabaseService {
     if (!goon) return []
     return formatGoonDcmLines(
       goon,
-      { includeSpokenCues: shouldIncludeGoonSpokenCues(options.voiceState) },
+      {
+        includeSpokenCues: shouldIncludeGoonSpokenCues(options.voiceState),
+        presentationMode: options.goonPresentationMode
+      },
       options.goonsSettings
     )
   }
@@ -2211,6 +2216,7 @@ export class DatabaseService {
     goonId?: string | null
     goonsEnabled?: boolean
     goonsSettings?: GoonsSettings | null
+    goonPresentationMode?: DesktopGoonPresentationMode | null
     groupContext?: GroupChatDcmContext
     voiceState?: VoiceState
     zipState?: {
@@ -2527,7 +2533,8 @@ export class DatabaseService {
       goonsEnabled: options.goonsEnabled,
       userId: options.userId,
       goonsSettings: options.goonsSettings,
-      voiceState: options.voiceState
+      voiceState: options.voiceState,
+      goonPresentationMode: options.goonPresentationMode
     })
     if (goonLines.length > 0) {
       lines.push('', ...goonLines)
@@ -2576,6 +2583,7 @@ export class DatabaseService {
       voiceState?: VoiceState
       goonsSettings?: GoonsSettings | null
       goonsEnabled?: boolean
+      goonPresentationMode?: DesktopGoonPresentationMode | null
     }
   ): Promise<{
     structuredInput: any
@@ -2999,6 +3007,7 @@ export class DatabaseService {
           goonId: agent?.goon_id ?? null,
           goonsEnabled,
           goonsSettings: options?.goonsSettings ?? null,
+          goonPresentationMode: options?.goonPresentationMode ?? null,
           groupContext: options?.groupContext,
           voiceState: options?.voiceState,
           zipState,

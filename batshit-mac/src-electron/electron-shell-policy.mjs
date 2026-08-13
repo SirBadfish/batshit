@@ -1,5 +1,10 @@
 import { resolve, sep } from 'node:path';
 
+import {
+  DESKTOP_GOON_WINDOW_ROLES
+} from './desktop-goon-contract.mjs';
+import { DESKTOP_GOON_ROUTE_PATH } from './desktop-goon-window-policy.mjs';
+
 export const SUPERVISOR_COMMANDS = Object.freeze({
   'batshit.runtime.status': 'status',
   'batshit.runtime.doctor': 'doctor',
@@ -65,6 +70,129 @@ export function isAllowedAppUrl(value, allowedOrigins) {
   } catch {
     return false;
   }
+}
+
+export function resolveDesktopControlsUrl(env = process.env) {
+  const goonUrl = new URL(resolveDesktopGoonUrl(env));
+  goonUrl.pathname = '/desktop-controls';
+  return goonUrl.toString();
+}
+
+export function isExactDesktopControlsUrl(value, controlsUrl) {
+  if (typeof value !== 'string' || typeof controlsUrl !== 'string') return false;
+  try {
+    const parsed = new URL(value);
+    const expected = new URL(controlsUrl);
+    return (
+      parsed.protocol === 'http:' &&
+      parsed.origin === expected.origin &&
+      parsed.pathname === '/desktop-controls' &&
+      expected.pathname === '/desktop-controls' &&
+      !parsed.search &&
+      !parsed.hash &&
+      !parsed.username &&
+      !parsed.password
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function resolveDesktopGoonUrl(env = process.env) {
+  for (const key of ['BATSHIT_FRONTEND_URL', 'BATSHIT_MAC_DIRECT_URL']) {
+    const origin = normalizeLoopbackOrigin(env[key]);
+    if (origin) return `${origin}${DESKTOP_GOON_ROUTE_PATH}`;
+  }
+  const configuredPort = Number(env.BATSHIT_FRONTEND_PORT || 0);
+  if (Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65_535) {
+    return `http://127.0.0.1:${configuredPort}${DESKTOP_GOON_ROUTE_PATH}`;
+  }
+  return `http://127.0.0.1:5620${DESKTOP_GOON_ROUTE_PATH}`;
+}
+
+export function isExactDesktopGoonUrl(value, desktopUrl) {
+  if (typeof value !== 'string' || typeof desktopUrl !== 'string') return false;
+  try {
+    const parsed = new URL(value);
+    const expected = new URL(desktopUrl);
+    return (
+      parsed.protocol === 'http:' &&
+      parsed.origin === expected.origin &&
+      parsed.pathname === DESKTOP_GOON_ROUTE_PATH &&
+      expected.pathname === DESKTOP_GOON_ROUTE_PATH &&
+      !parsed.search &&
+      !parsed.hash &&
+      !parsed.username &&
+      !parsed.password
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function isAllowedMainWindowUrl(
+  value,
+  allowedOrigins,
+  desktopUrl,
+  controlsUrl
+) {
+  return (
+    isAllowedAppUrl(value, allowedOrigins) &&
+    !isExactDesktopGoonUrl(value, desktopUrl) &&
+    !isExactDesktopControlsUrl(value, controlsUrl)
+  );
+}
+
+export function validateElectronIpcSender(
+  event,
+  { allowedOrigins, roleRegistry, allowedRoles, desktopUrl, controlsUrl }
+) {
+  const sender = event?.sender;
+  const frame = event?.senderFrame;
+  if (!sender || !frame || frame !== sender.mainFrame) {
+    throw new Error('The native bridge rejected a non-top-frame sender.');
+  }
+  const record = roleRegistry.get(sender.id);
+  if (!record || record.webContents !== sender || !allowedRoles.includes(record.role)) {
+    throw new Error('The native bridge rejected an unexpected window role.');
+  }
+  const url = frame.url || sender.getURL?.() || '';
+  const trusted = record.role === DESKTOP_GOON_WINDOW_ROLES.desktop
+    ? isExactDesktopGoonUrl(url, desktopUrl)
+    : record.role === DESKTOP_GOON_WINDOW_ROLES.controls
+      ? isExactDesktopControlsUrl(url, controlsUrl)
+      : isAllowedMainWindowUrl(url, allowedOrigins, desktopUrl, controlsUrl);
+  if (!trusted) throw new Error('The native bridge rejected an untrusted sender URL.');
+  return record;
+}
+
+export function isAllowedElectronMediaPermission({
+  webContents,
+  permission,
+  requestingUrl,
+  details = {},
+  roleRegistry,
+  allowedOrigins,
+  desktopUrl,
+  controlsUrl
+}) {
+  const record = webContents ? roleRegistry.get(webContents.id) : null;
+  if (
+    !record ||
+    record.webContents !== webContents ||
+    record.role !== DESKTOP_GOON_WINDOW_ROLES.main ||
+    !isAllowedMainWindowUrl(
+      requestingUrl || webContents.getURL?.() || '',
+      allowedOrigins,
+      desktopUrl,
+      controlsUrl
+    ) ||
+    permission !== 'media'
+  ) {
+    return false;
+  }
+  const mediaTypes = details.mediaTypes || [];
+  return mediaTypes.length === 0 || mediaTypes.every((type) => type === 'audio');
 }
 
 export function isSafeExternalUrl(value) {

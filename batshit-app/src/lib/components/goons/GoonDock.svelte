@@ -10,6 +10,7 @@
     Eye,
     Edit,
     House,
+    MonitorUp,
     RotateCcw,
     Settings2,
     Sparkles
@@ -31,28 +32,23 @@
   import type {
     GoonEngine,
     GoonEngineQuality,
+    GoonMountedRuntimeState,
     GoonRendererRuntime
   } from '$lib/goons/engine'
   import type { GoonFramingPreset } from '$lib/goons/cameraNavigation'
-  import type { GoonClosetItem, GoonXWearData } from '$lib/types/goons'
+  import type { GoonClosetItem } from '$lib/types/goons'
   import {
-    buildGoonAnimationLoadPlan,
-    buildGoonAnimationPriorityNames,
     filterGoonAnimationFilesForLane,
     resolveGoonAnimationName
   } from '$lib/goons/animationLoadPlan'
   import {
     hasRenderableGoonAvatar,
     isGuidedCustomVrmGoon,
-    loadAvatarIntoEngine,
     resolveGoonEyeContactMode,
     resolveGoonEyeContactTuning,
     resolveGoonKind
   } from '$lib/goons/customAvatar'
-  import {
-    buildGuidedPieceOriginalClosetSlot,
-    resolveActiveWearableConceal
-  } from '$lib/goons/concealRegions'
+  import { buildGuidedPieceOriginalClosetSlot } from '$lib/goons/concealRegions'
   import {
     buildGuidedOutfitPieceStates,
     listStandaloneGuidedOutfitPieces,
@@ -81,10 +77,18 @@
   import {
     buildClosetSlotNames,
     getDefaultClosetSlotLabel,
-    isSkinOverlayClosetSlotKey,
-    normalizeHexColor,
-    resolveClosetRuntimeMaterialName
+    isSkinOverlayClosetSlotKey
   } from '$lib/goons/closetMaterials'
+  import {
+    applyMountedLiveGoonClosetAssignments,
+    buildMountedLiveGoonAnimationPlan,
+    buildMountedLiveGoonAnimationSignature,
+    buildMountedLiveGoonBaseLoopSignature,
+    buildMountedLiveGoonClosetSignature,
+    buildMountedLiveGoonLoadPlan,
+    loadMountedLiveGoon,
+    resolveMountedLiveGoonScene
+  } from '$lib/goons/mountedLiveGoon'
   import { voiceService } from '$lib/services/voice'
   import { updateGoon as updateGoonRecord } from '$lib/services/goons'
   import { getGoons } from '$lib/stores/goons.svelte'
@@ -140,11 +144,17 @@
     goonsSettings = null,
     immersiveMode = false,
     immersiveStage = null,
+    desktopModeAvailable = false,
+    desktopModeBusy = false,
+    desktopModeUnavailableReason = null,
+    handoffMountedState = null,
     onImmersiveChange = (_value: boolean) => {},
+    onDesktopModeChange = () => {},
     onQualityChange = (_value: GoonEngineQuality) => {},
     onLipSyncChange = (_value: boolean) => {},
     onCompatibilityReport = (_report: GoonCompatibilityReport) => {},
-    onCameraChange = (_camera: GoonCamera) => {}
+    onCameraChange = (_camera: GoonCamera) => {},
+    onHandoffMountedStateConsumed = (_state: GoonMountedRuntimeState) => {}
   } = $props<{
     open?: boolean
     goon?: GoonRecord | null
@@ -160,11 +170,17 @@
     goonsSettings?: GoonsSettings | null
     immersiveMode?: boolean
     immersiveStage?: { left: number; top: number; width: number; height: number } | null
+    desktopModeAvailable?: boolean
+    desktopModeBusy?: boolean
+    desktopModeUnavailableReason?: string | null
+    handoffMountedState?: GoonMountedRuntimeState | null
     onImmersiveChange?: (value: boolean) => void
+    onDesktopModeChange?: () => void
     onQualityChange?: (value: GoonEngineQuality) => void
     onLipSyncChange?: (value: boolean) => void
     onCompatibilityReport?: (report: GoonCompatibilityReport) => void
     onCameraChange?: (camera: GoonCamera) => void
+    onHandoffMountedStateConsumed?: (state: GoonMountedRuntimeState) => void
   }>()
 
   const goons = $derived(getGoons())
@@ -179,8 +195,7 @@
   let goonMenuOpen = $state(false)
   let engine = $state<GoonEngine | null>(null)
   let swapEngine = $state<GoonEngine | null>(null)
-  const TRANSPARENT_TEXTURE_URL =
-    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
+  const loadingEngines = new Set<GoonEngine>()
   let activeSlot = $state<0 | 1>(0)
   let swapFromSlot = $state<0 | 1>(0)
   let swapToSlot = $state<0 | 1>(1)
@@ -188,10 +203,12 @@
   let currentGoonId = $state<string | null>(null)
   let failedLiveActivationKey = $state('')
   let liveActivationRetryVersion = $state(0)
-  const liveActivationGate = new GoonLiveActivationGate()
+  let liveActivationGate = new GoonLiveActivationGate()
   let animationSignature = $state('')
   let swapActive = $state(false)
   let swapToken = 0
+  let handoffMountedStateInFlight: GoonMountedRuntimeState | null = null
+  let consumedHandoffMountedState: GoonMountedRuntimeState | null = null
   let isDocumentHidden = $state(false)
   let viewportVisible = $state(true)
   let cueTimersByMessage = new Map<string, Set<CueTimer>>()
@@ -209,6 +226,9 @@
   let autoQuality = $state<'low' | 'high' | 'ultra'>('high')
   let eyeContactEnabled = $state(true)
   let cameraTouched = $state(false)
+  const mountedRendererReadyForDesktop = $derived(
+    Boolean(engine && currentGoonId && !swapActive)
+  )
   let dockRect = $state<{ left: number; top: number; width: number; height: number } | null>(null)
   let dockObserver: ResizeObserver | null = null
   let dockAnimationName = $state('')
@@ -427,6 +447,77 @@
     return GoonEngineCtor
   }
 
+  export function captureMountedRuntimeState(): GoonMountedRuntimeState | null {
+    return engine?.captureMountedRuntimeState() ?? null
+  }
+
+  export function isMountedRendererReady(): boolean {
+    return mountedRendererReadyForDesktop
+  }
+
+  export function releaseMountedRenderer(): GoonMountedRuntimeState | null {
+    if (!mountedRendererReadyForDesktop) return null
+    const mountedState = captureMountedRuntimeState()
+    swapToken += 1
+    liveActivationGate = new GoonLiveActivationGate()
+    handoffMountedStateInFlight = null
+    failedLiveActivationKey = ''
+    swapActive = false
+    swapReady = false
+    currentGoonId = null
+    clearCueTimers()
+    clearVoicePauseCueTimer()
+    clearDockPreviewTimer()
+    clearDockPreviewStatus()
+    clearDockSaveStatusTimer()
+    dockSaveStatusMessage = ''
+    dockPreviewActive = false
+    dockPreviewRestore = null
+
+    const ownedEngines = new Set<GoonEngine>()
+    if (engine) ownedEngines.add(engine)
+    if (swapEngine) ownedEngines.add(swapEngine)
+    for (const loadingEngine of loadingEngines) ownedEngines.add(loadingEngine)
+    engine = null
+    swapEngine = null
+    loadingEngines.clear()
+    for (const ownedEngine of ownedEngines) {
+      ownedEngine.dispose()
+    }
+
+    return mountedState
+  }
+
+  function claimHandoffMountedState() {
+    if (!handoffMountedState) return null
+    if (handoffMountedState === consumedHandoffMountedState) return null
+    if (handoffMountedStateInFlight) return null
+    handoffMountedStateInFlight = handoffMountedState
+    return handoffMountedState
+  }
+
+  function releaseHandoffMountedStateClaim(state: GoonMountedRuntimeState | null) {
+    if (state && handoffMountedStateInFlight === state) {
+      handoffMountedStateInFlight = null
+    }
+  }
+
+  function consumeHandoffMountedState(state: GoonMountedRuntimeState | null) {
+    if (!state || handoffMountedStateInFlight !== state) return
+    consumedHandoffMountedState = state
+    handoffMountedStateInFlight = null
+    try {
+      onHandoffMountedStateConsumed(state)
+    } catch (error) {
+      console.error('[GoonDock] Mounted renderer handoff callback failed:', error)
+    }
+  }
+
+  function disposeLoadingEngine(loadingEngine: GoonEngine) {
+    if (!loadingEngines.delete(loadingEngine)) return
+    loadingEngine.dispose()
+  }
+
   function handleDockCameraChange(camera: GoonCamera) {
     cameraTouched = true
     onCameraChange(camera)
@@ -480,28 +571,23 @@
     isDocumentHidden = document.hidden
   }
 
-  // Per-lane clip binding lives in the shared animationLoadPlan helpers so the
-  // dock and Goon Settings always resolve the same lane split.
+  // Preview and catalog helpers still need an eagerly filtered per-avatar lane;
+  // mounted loading performs the same filter inside its shared load planner.
   function collectDockAnimationFilesForLane(targetGoon?: GoonRecord | null) {
     const lane = resolveGoonKind(targetGoon) === 'custom' ? 'glb' : 'vrm'
     return filterGoonAnimationFilesForLane(collectDockAnimationFiles(), lane)
   }
 
   function buildAnimationLoadPlan(targetGoon?: GoonRecord | null) {
-    const libraryFiles = collectDockAnimationFilesForLane(targetGoon)
-    const goonFiles: GoonFileRef[] = []
-    const { cueMap } = resolveGoonCues(targetGoon, goonsSettings)
-    const baseLoop = targetGoon?.defaults?.baseLoop ?? 'base_stand'
-    const baseLoopDefinition = cueMap?.[baseLoop]
-    const baseLoopAnimation = baseLoopDefinition?.animationName ?? baseLoop
-    const priorityNames = buildGoonAnimationPriorityNames(baseLoopAnimation)
-    return buildGoonAnimationLoadPlan(libraryFiles, goonFiles, { priorityNames })
+    return buildMountedLiveGoonAnimationPlan(
+      targetGoon,
+      collectDockAnimationFiles(),
+      goonsSettings
+    )
   }
 
   function buildAnimationSignature(plan: { eager: GoonFileRef[]; deferred: GoonFileRef[] }) {
-    const eager = plan.eager.map((file) => file.url).join('|')
-    const deferred = plan.deferred.map((file) => file.url).join('|')
-    return `${eager}::${deferred}`
+    return buildMountedLiveGoonAnimationSignature(plan)
   }
 
   function resolveAnimationName(file: GoonFileRef) {
@@ -653,13 +739,6 @@
     return buildAvailableClosetSlotNames(
       [...dockMaterialNames, ...guidedMaterialNames],
       Object.keys(targetGoon?.closetAssignments ?? {})
-    )
-  }
-
-  function buildRuntimeClosetSlotNames(targetEngine: GoonEngine, targetGoon: GoonRecord) {
-    return buildAvailableClosetSlotNames(
-      targetEngine.getMaterialNames(),
-      Object.keys(targetGoon.closetAssignments ?? {})
     )
   }
 
@@ -833,50 +912,11 @@
   }
 
   function buildBaseLoopSignature(baseLoop: string, definition?: GoonCueDefinition) {
-    const expressionTargets = definition?.expressionTargets
-      ? JSON.stringify(definition.expressionTargets)
-      : ''
-    return [
-      baseLoop,
-      definition?.animationName ?? '',
-      definition?.posture ?? '',
-      definition?.kind ?? '',
-      definition?.intensity ?? '',
-      expressionTargets
-    ].join('|')
-  }
-
-  function applySavedCamera(
-    targetEngine: GoonEngine,
-    targetGoon: GoonRecord,
-    options: { force?: boolean } = {}
-  ) {
-    const shouldApply = options.force || !cameraTouched
-    if (!shouldApply) return
-    if (targetGoon.camera) {
-      if (typeof targetGoon.camera.fov === 'number') {
-        viewFov = clampViewFov(targetGoon.camera.fov)
-      }
-      cameraMode = targetGoon.camera.mode ?? 'free'
-      targetEngine.applyCamera(targetGoon.camera)
-      targetEngine.setDefaultCamera(targetGoon.camera)
-      return
-    }
-    if (options.force) {
-      targetEngine.resetCamera()
-    }
+    return buildMountedLiveGoonBaseLoopSignature(baseLoop, definition)
   }
 
   function resolveSceneForGoon(targetGoon?: GoonRecord | null): GoonSceneDefinition | null {
-    const sceneId = targetGoon?.defaults?.sceneId
-    if (!sceneId) return null
-    const kitchenScenes = goonsSettings?.kitchen?.scenes
-    if (!kitchenScenes) return null
-    return kitchenScenes[sceneId] ?? null
-  }
-
-  async function applySceneToEngine(targetEngine: GoonEngine, targetGoon: GoonRecord) {
-    await applyGoonSceneDefinition(targetEngine, resolveSceneForGoon(targetGoon), stagePostures)
+    return resolveMountedLiveGoonScene(targetGoon, goonsSettings, 'saved')
   }
 
 	  function resolveClosetItem(targetGoon: GoonRecord | null | undefined, itemId?: string | null): GoonClosetItem | null {
@@ -1135,115 +1175,15 @@
     await applyDockWardrobeOutfitState(outfit, outfit.id)
   }
 
-  function applyGuidedOutfitPieceVisibility(targetEngine: GoonEngine, targetGoon: GoonRecord) {
-    if (!isGuidedCustomVrmGoon(targetGoon)) return
-    const availableSlotNames = buildRuntimeClosetSlotNames(targetEngine, targetGoon)
-    const assignments = targetGoon.closetAssignments ?? {}
-    const pieceStates = targetGoon.guidedAvatar?.pieceStates ?? {}
-    for (const piece of targetGoon.guidedAvatar?.outfitPieces ?? []) {
-      if (piece.source === 'duf-overlay') continue
-      targetEngine.setGuidedOutfitPieceVisible(
-        piece.id,
-        resolveGuidedOutfitPieceVisible(piece, {
-          availableSlotNames,
-          pieceStates,
-          assignments
-        })
-      )
-    }
-  }
-
-  function resolveAppliedClosetColors(
-    _assignment: GoonClosetAssignment,
-    item?: GoonClosetItem | null
-  ) {
-    return {
-      baseHex: normalizeHexColor(item?.materialColors?.baseHex),
-      shadeHex: normalizeHexColor(item?.materialColors?.shadeHex)
-    }
-  }
-
   function buildClosetRuntimeSignature(targetGoon: GoonRecord) {
-    const assignments = targetGoon?.closetAssignments ?? {}
-    const itemMetadata = Object.values(assignments)
-      .filter((assignment) => assignment.mode === 'item' && assignment.itemId)
-      .map((assignment) => resolveClosetItem(targetGoon, assignment.itemId))
-      .filter(Boolean)
-      .map((item) => ({
-        id: item?.id,
-        updatedAt: item?.updatedAt ?? null,
-        paintedConcealMask: item?.paintedConcealMask ?? null
-      }))
-    return JSON.stringify({
-      assignments,
-      itemMetadata,
-	      guidedPieceStates: targetGoon?.guidedAvatar?.pieceStates ?? {},
-	      savedOriginalConceal: Object.values(targetGoon?.closet?.items ?? {})
-	        .filter((item) => item.originalSource)
-	        .map((item) => ({
-	          id: item.id,
-	          updatedAt: item.updatedAt ?? null,
-	          originalSource: item.originalSource,
-	          paintedConcealMask: item.paintedConcealMask ?? null
-	        })),
-	      guidedPieceIds: (targetGoon?.guidedAvatar?.outfitPieces ?? []).map((piece) => piece.id)
-    })
+    return buildMountedLiveGoonClosetSignature(targetGoon, goonsSettings)
   }
 
   async function applyClosetAssignments(targetEngine: GoonEngine, targetGoon: GoonRecord) {
-    const assignments = targetGoon?.closetAssignments ?? {}
-    for (const [materialName, assignment] of Object.entries(assignments)) {
-      const runtimeMaterialName =
-        resolveClosetRuntimeMaterialName(materialName, targetEngine.getMaterialNames()) ?? null
-      if (!runtimeMaterialName) continue
-
-      if (!assignment || assignment.mode === 'original') {
-        const colors = resolveAppliedClosetColors(assignment ?? { mode: 'original' })
-        if (colors.baseHex || colors.shadeHex) {
-          targetEngine.resetMaterialOverrides(runtimeMaterialName)
-          targetEngine.applyMaterialColorOverride(runtimeMaterialName, colors)
-        }
-        continue
-      }
-      if (assignment.mode === 'none') {
-        if (isSkinOverlayClosetSlotKey(materialName)) {
-          targetEngine.resetMaterialOverrides(runtimeMaterialName)
-          continue
-        }
-        await targetEngine.applyMaterialTexture(runtimeMaterialName, TRANSPARENT_TEXTURE_URL)
-        const colors = resolveAppliedClosetColors(assignment)
-        if (colors.baseHex || colors.shadeHex) {
-          targetEngine.applyMaterialColorOverride(runtimeMaterialName, colors)
-        }
-        continue
-      }
-      if (assignment.mode === 'item') {
-        const item = resolveClosetItem(targetGoon, assignment.itemId)
-        if (!item) continue
-	        if (item.xwear) {
-	          await targetEngine.applyXWearMaterial(runtimeMaterialName, item.xwear as GoonXWearData)
-	        } else if (item.texture?.url) {
-	          await targetEngine.applyMaterialTexture(runtimeMaterialName, item.texture.url)
-	        } else if (item.originalSource) {
-	          targetEngine.resetMaterialOverrides(runtimeMaterialName)
-	        }
-        const colors = resolveAppliedClosetColors(assignment, item)
-        if (colors.baseHex || colors.shadeHex) {
-          targetEngine.applyMaterialColorOverride(runtimeMaterialName, colors)
-        }
-      }
-    }
-	    const bodyConceal = resolveActiveWearableConceal({
-	      closetAssignments: assignments,
-	      resolveClosetItem: (itemId) => resolveClosetItem(targetGoon, itemId),
-	      resolveOriginalSavedItem: (source) => resolveSavedOriginalClosetItem(targetGoon, source),
-	      guidedOutfitPieces: targetGoon?.guidedAvatar?.outfitPieces ?? [],
-      guidedPieceStates: targetGoon?.guidedAvatar?.pieceStates ?? {}
+    await applyMountedLiveGoonClosetAssignments(targetEngine, {
+      goon: targetGoon,
+      goonsSettings: goonsSettings ?? null
     })
-    targetEngine.applyBodyConceal({
-      paintedMasks: bodyConceal.paintedMasks
-    })
-    applyGuidedOutfitPieceVisibility(targetEngine, targetGoon)
   }
 
   async function loadGoonWithTransition(
@@ -1254,9 +1194,10 @@
     const activationKey = activation.key
     const token = ++swapToken
     const replacingSameGoon = currentGoonId === nextGoon.id && Boolean(engine)
-    const mountedState = replacingSameGoon
-      ? engine?.captureMountedRuntimeState() ?? null
-      : null
+    const claimedHandoffMountedState = claimHandoffMountedState()
+    const mountedState =
+      claimedHandoffMountedState ??
+      (replacingSameGoon ? engine?.captureMountedRuntimeState() ?? null : null)
     if (!replacingSameGoon) cameraTouched = false
     const incomingSlot = activeSlot === 0 ? 1 : 0
     swapFromSlot = activeSlot
@@ -1271,6 +1212,7 @@
       if (liveActivationGate.fail(activation)) {
         failedLiveActivationKey = activationKey
       }
+      releaseHandoffMountedStateClaim(claimedHandoffMountedState)
       runtimeError = 'The Goon viewport is unavailable for Live activation.'
       return
     }
@@ -1285,6 +1227,7 @@
         swapReady = false
         failedLiveActivationKey = activationKey
       }
+      releaseHandoffMountedStateClaim(claimedHandoffMountedState)
       return
     }
 
@@ -1305,6 +1248,7 @@
         onPerformance: (stats) => handlePerformance(stats),
         onCameraChange: (camera) => handleDockCameraChange(camera)
       })
+      loadingEngines.add(incomingEngine)
     } catch (error) {
       runtimeError = toGoonRuntimeError(error)
       if (token === swapToken && liveActivationGate.fail(activation)) {
@@ -1312,6 +1256,7 @@
         swapReady = false
         failedLiveActivationKey = activationKey
       }
+      releaseHandoffMountedStateClaim(claimedHandoffMountedState)
       return
     }
     let incomingSceneSignature = ''
@@ -1326,67 +1271,51 @@
     let incomingOralAppearanceSignature = ''
 
     try {
-      await incomingEngine.init()
-      incomingEngine.setCameraFov(viewFov)
-      const { kind } = await loadAvatarIntoEngine(incomingEngine, nextGoon, {
-        role: 'mounted-live'
+      const loadPlan = buildMountedLiveGoonLoadPlan(nextGoon, {
+        goonsSettings,
+        animationFiles: collectDockAnimationFiles(),
+        stagePostures,
+        sceneMode: 'saved',
+        initialFov: viewFov,
+        mountedState
       })
-      await applySceneToEngine(incomingEngine, nextGoon)
-      incomingSceneSignature = buildGoonSceneSignature(resolveSceneForGoon(nextGoon))
-      const baseLoop = nextGoon.defaults?.baseLoop ?? 'base_stand'
-      const cueMapForGoon = resolveGoonCues(nextGoon, goonsSettings).cueMap
-      const baseLoopDefinition = cueMapForGoon?.[baseLoop]
-      incomingEngine.setMood(baseLoop, baseLoopDefinition)
-      incomingBaseLoopSignature = buildBaseLoopSignature(baseLoop, baseLoopDefinition)
-      applySavedCamera(incomingEngine, nextGoon, { force: true })
-      if (kind === 'vrm') {
-        const plan = buildAnimationLoadPlan(nextGoon)
-        incomingAnimationSignature = buildAnimationSignature(plan)
-        const allAnimations = [...plan.eager, ...plan.deferred]
-        await incomingEngine.syncAnimations(allAnimations)
-        await applyClosetAssignments(incomingEngine, nextGoon)
-        incomingAnimationCatalog = incomingEngine.getAnimationCatalog()
-        incomingMaterialNames = buildClosetSlotNames(incomingEngine.getMaterialNames())
-        incomingClosetSignature = buildClosetRuntimeSignature(nextGoon)
-      } else {
-        // GLB-lane custom goons: sync .glb library clips inline on the incoming
-        // engine (mirrors the VRM branch — the reactive animation effect can
-        // skip a fresh engine when the plan signature is unchanged).
-        const plan = buildAnimationLoadPlan(nextGoon)
-        incomingAnimationSignature = buildAnimationSignature(plan)
-        const allAnimations = [...plan.eager, ...plan.deferred]
-        await incomingEngine.syncAnimations(allAnimations)
-        incomingAnimationCatalog = incomingEngine.getAnimationCatalog()
-        if (!isMountedRecipeLiveGoon(nextGoon)) {
-          incomingAppearanceDialsSignature = JSON.stringify(nextGoon.appearanceDials ?? null)
-          incomingFacialArtworkSignature = JSON.stringify(nextGoon.facialArtwork ?? null)
-          incomingEyeAppearanceSignature = JSON.stringify(nextGoon.eyeAppearance ?? null)
-          incomingOralAppearanceSignature = JSON.stringify(nextGoon.oralAppearance ?? null)
-        }
-      }
-      if (mountedState) incomingEngine.restoreMountedRuntimeState(mountedState)
-      incomingEngine.setGoonVisible(true)
+      const loadResult = await loadMountedLiveGoon(incomingEngine, loadPlan)
+      incomingSceneSignature = loadResult.sceneSignature
+      incomingBaseLoopSignature = loadResult.baseLoopSignature
+      incomingAnimationSignature = loadResult.animationSignature
+      incomingClosetSignature = loadResult.closetSignature
+      incomingAnimationCatalog = loadResult.animationCatalog
+      incomingMaterialNames = loadResult.materialNames
+      incomingAppearanceDialsSignature = loadResult.appearanceDialsSignature
+      incomingFacialArtworkSignature = loadResult.facialArtworkSignature
+      incomingEyeAppearanceSignature = loadResult.eyeAppearanceSignature
+      incomingOralAppearanceSignature = loadResult.oralAppearanceSignature
+      viewFov = loadResult.viewFov
+      cameraMode = loadResult.cameraMode
       runtimeError = null
     } catch (error) {
       console.error('[GoonDock] Failed to load goon:', error)
-      runtimeError = toGoonRuntimeError(error)
-      incomingEngine.dispose()
+      disposeLoadingEngine(incomingEngine)
       if (token === swapToken) {
+        runtimeError = toGoonRuntimeError(error)
         swapActive = false
         swapReady = false
         if (liveActivationGate.fail(activation)) {
           failedLiveActivationKey = activationKey
         }
       }
+      releaseHandoffMountedStateClaim(claimedHandoffMountedState)
       return
     }
 
     if (token !== swapToken) {
-      incomingEngine.dispose()
+      disposeLoadingEngine(incomingEngine)
+      releaseHandoffMountedStateClaim(claimedHandoffMountedState)
       return
     }
     if (!liveActivationGate.accept(activation)) {
-      incomingEngine.dispose()
+      disposeLoadingEngine(incomingEngine)
+      releaseHandoffMountedStateClaim(claimedHandoffMountedState)
       return
     }
 
@@ -1395,6 +1324,7 @@
       engine.setPerformanceHandler(undefined)
     }
 
+    loadingEngines.delete(incomingEngine)
     swapEngine = engine
     engine = incomingEngine
     activeSlot = incomingSlot
@@ -1411,6 +1341,7 @@
     dockAnimationCatalog = incomingAnimationCatalog
     dockMaterialNames = incomingMaterialNames
     failedLiveActivationKey = ''
+    consumeHandoffMountedState(claimedHandoffMountedState)
     if (!replacingSameGoon) {
       dockAnimationName = ''
       dockPreviewActive = false
@@ -2291,7 +2222,7 @@
   onMount(async () => {
     if (!primaryViewportEl) return
     const EngineCtor = await getGoonEngineCtor()
-    engine = new EngineCtor(primaryViewportEl, {
+    const mountedEngine = new EngineCtor(primaryViewportEl, {
       quality: resolvedQuality,
       lipSyncEnabled,
       eyeContactMode: currentEyeContactMode,
@@ -2301,12 +2232,17 @@
       onPerformance: (stats) => handlePerformance(stats),
       onCameraChange: (camera) => handleDockCameraChange(camera)
     })
+    engine = mountedEngine
     try {
-      await engine.init()
-      engine.setCameraFov(viewFov)
-      runtimeError = null
+      await mountedEngine.init()
+      if (engine === mountedEngine) {
+        mountedEngine.setCameraFov(viewFov)
+        runtimeError = null
+      }
     } catch (error) {
-      runtimeError = toGoonRuntimeError(error)
+      if (engine === mountedEngine) {
+        runtimeError = toGoonRuntimeError(error)
+      }
     }
 
     handleVisibilityChange()
@@ -2337,6 +2273,7 @@
   })
 
   onDestroy(() => {
+    swapToken += 1
     clearCueTimers()
     clearVoicePauseCueTimer()
     clearDockPreviewTimer()
@@ -2346,6 +2283,8 @@
     pendingAudio.clear()
     engine?.dispose()
     swapEngine?.dispose()
+    for (const loadingEngine of loadingEngines) loadingEngine.dispose()
+    loadingEngines.clear()
     engine = null
     swapEngine = null
     viewportObserver?.disconnect()
@@ -2527,6 +2466,11 @@
       voicePlaying = false
       runtimeError = null
     }
+  })
+
+  $effect(() => {
+    if (handoffMountedState) return
+    consumedHandoffMountedState = null
   })
 
   $effect(() => {
@@ -3433,6 +3377,31 @@
             title={immersiveMode ? 'Disable immersive mode' : 'Enable immersive mode'}
           >
             <Maximize2 class="goon-dock-control-icon" />
+          </Button>
+
+          <Button
+            variant="ghost"
+            size="sm"
+            class="goon-dock-icon-button"
+            onclick={onDesktopModeChange}
+            disabled={
+              !goon ||
+              !desktopModeAvailable ||
+              desktopModeBusy ||
+              !mountedRendererReadyForDesktop
+            }
+            aria-label={desktopModeBusy ? 'Moving Goon to Desktop Mode' : 'Move Goon to Desktop Mode'}
+            title={
+              desktopModeAvailable
+                ? desktopModeBusy
+                  ? 'Moving Goon to Desktop Mode…'
+                  : !mountedRendererReadyForDesktop
+                    ? 'The Goon renderer is still preparing…'
+                  : 'Move Goon to Desktop Mode'
+                : desktopModeUnavailableReason ?? 'Desktop Mode requires the managed Batshit desktop app.'
+            }
+          >
+            <MonitorUp class="goon-dock-control-icon" />
           </Button>
         </div>
       </div>
