@@ -17,8 +17,20 @@ import {
 } from './dynamicMcpSchema'
 import { shouldHideInternalMcpTool } from './nativeToolConstants'
 import { listCliTools, resolveCliToolSelectionScope } from './cliToolRegistry'
-import { listVisibleControls, type ControlRuntimeMode } from './fabricRegistry'
+import type { ControlRuntimeMode } from './fabricControlModes'
 import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
+import {
+  buildCompositeKey,
+  mapGroupModeToVisibility,
+  resolveAgentDcmDisplaySettings,
+  resolveEffectiveGroupMode,
+  resolveEffectiveToolVisibility,
+  resolveGatewayDisplayDefaults,
+  resolveMcpToolDcmVisibility,
+  isExplicitAgentToolListMode,
+  type DcmGroupVisibility,
+  type DcmToolVisibility
+} from './dynamicMcpVisibility'
 import {
   BROKER_ARTIFACT_ALLOWED_CONTROL_IDS,
   isControlIdAllowedByList,
@@ -57,8 +69,20 @@ export {
   normalizeGatewayDcmDisplaySettings
 }
 
-export type DcmGroupVisibility = 'hidden' | 'group-only' | 'group+tools'
-export type DcmToolVisibility = 'hidden' | 'name-only' | 'name+hint'
+// SA-096: visibility resolution moved to `dynamicMcpVisibility` to break the
+// dynamicMcpTools -> dynamicMcpIndex -> fabricRegistry -> dynamicMcpTools cycle.
+// Re-exported so existing import paths keep working.
+export {
+  buildCompositeKey,
+  mapGroupModeToVisibility,
+  resolveAgentDcmDisplaySettings,
+  resolveEffectiveGroupMode,
+  resolveEffectiveToolVisibility,
+  resolveGatewayDisplayDefaults,
+  resolveMcpToolDcmVisibility
+}
+export type { DcmGroupVisibility, DcmToolVisibility }
+
 
 export interface DynamicMcpIndexTool {
   name: string
@@ -143,164 +167,31 @@ const MIN_TOOL_NAME_THRESHOLD = 1
 const MAX_TOOL_NAME_THRESHOLD = 100
 const REQUIRED_DYNAMIC_TOOLS = ['batshit_server_dynamic_mcp_find', 'batshit_server_dynamic_mcp_use']
 
-export function buildCompositeKey(left: string, right: string): string {
-  return `${left}::${right}`
+
+/**
+ * `fabricRegistry` is loaded on demand rather than imported at module scope.
+ *
+ * SA-096 P4 added this module's dependency on the Fabric registry so the capability
+ * index could report a truthful Fabric count. That closed a cycle:
+ * `dynamicMcpTools` -> `dynamicMcpIndex` -> `fabricRegistry` -> `dynamicMcpTools`,
+ * because the registry's `sys.mcp.dynamic.*` controls delegate to the shared Dynamic
+ * MCP executor by design (see `fabric-registry.md`). CI enforces a zero circular-import
+ * budget, and `npm run check` cannot see cycles, so this is the guard that matters.
+ *
+ * The dependency is genuinely lazy — `listVisibleControls` is only ever called from
+ * inside an async index build, never at module init — so deferring it removes the cycle
+ * without weakening the delegation the registry contract requires. Node caches the
+ * module after the first call. Extracting `listVisibleControls` into a leaf module was
+ * rejected: it resolves through the registry's full control store, so the extraction
+ * would mean refactoring an FM-listed 6k-line module to fix an import edge.
+ *
+ * Keep this lazy. A static import here fails the `Circular imports (zero budget)` CI job.
+ */
+async function loadListVisibleControls() {
+  const { listVisibleControls } = await import('./fabricRegistry')
+  return listVisibleControls
 }
 
-export function mapGroupModeToVisibility(mode: DcmGroupDisplayMode): DcmGroupVisibility {
-  if (mode === 'hidden') return 'hidden'
-  if (mode === 'group-only') return 'group-only'
-  return 'group+tools'
-}
-
-function mapGroupModeToDefaultToolVisibility(mode: DcmGroupDisplayMode): DcmToolVisibility {
-  return mode === 'group+tools+names' ? 'name-only' : 'name+hint'
-}
-
-function mapToolModeToVisibility(mode: DcmToolDisplayMode): DcmToolVisibility {
-  if (mode === 'name-only') return 'name-only'
-  if (mode === 'hidden') return 'hidden'
-  return 'name+hint'
-}
-
-function isExplicitAgentToolListMode(mode: AgentDcmGroupDisplayMode | undefined): boolean {
-  return mode === 'group+tools+hints' || mode === 'group+tools+names'
-}
-
-export function resolveEffectiveGroupMode(options: {
-  agentSettings: AgentDcmDisplaySettings
-  gatewayDefaults: GatewayDcmDisplaySettings
-  gatewayId: string
-  groupName: string
-}): DcmGroupDisplayMode {
-  const { agentSettings, gatewayDefaults, gatewayId, groupName } = options
-  const agentMode = agentSettings.groups[buildCompositeKey(gatewayId, groupName)]
-  if (agentMode && agentMode !== 'use-global') {
-    return normalizeLegacyGroupMode(agentMode) ?? 'group+tools+hints'
-  }
-
-  const gatewayMode = gatewayDefaults.groups[groupName]
-  return normalizeLegacyGroupMode(gatewayMode) ?? 'group+tools+hints'
-}
-
-export function resolveEffectiveToolVisibility(options: {
-  agentSettings: AgentDcmDisplaySettings
-  gatewayDefaults: GatewayDcmDisplaySettings
-  gatewayId: string
-  toolNameVariants: string[]
-  groupMode: DcmGroupDisplayMode
-  agentGroupMode: AgentDcmGroupDisplayMode | undefined
-}): DcmToolVisibility {
-  const { agentSettings, gatewayDefaults, gatewayId, toolNameVariants, groupMode, agentGroupMode } =
-    options
-
-  const keys = toolNameVariants
-    .map((name) => name.trim())
-    .filter((name) => name.length > 0)
-
-  let agentToolMode: DcmToolDisplayMode | null = null
-  for (const name of keys) {
-    const value = agentSettings.tools[buildCompositeKey(gatewayId, name)]
-    const normalized = normalizeLegacyToolMode(value)
-    if (normalized) {
-      agentToolMode = normalized
-      break
-    }
-  }
-
-  if (agentToolMode && agentToolMode !== 'inherit') {
-    return mapToolModeToVisibility(agentToolMode)
-  }
-
-  const agentGroupOverride = Boolean(agentGroupMode && agentGroupMode !== 'use-global')
-  if (agentGroupOverride) {
-    return mapGroupModeToDefaultToolVisibility(groupMode)
-  }
-
-  let gatewayToolMode: DcmToolDisplayMode | null = null
-  for (const name of keys) {
-    const value = gatewayDefaults.tools[name]
-    const normalized = normalizeLegacyToolMode(value)
-    if (normalized) {
-      gatewayToolMode = normalized
-      break
-    }
-  }
-
-  if (gatewayToolMode && gatewayToolMode !== 'inherit') {
-    return mapToolModeToVisibility(gatewayToolMode)
-  }
-
-  return mapGroupModeToDefaultToolVisibility(groupMode)
-}
-
-export function resolveMcpToolDcmVisibility(options: {
-  agentSettings: AgentDcmDisplaySettings
-  gatewayDefaults: GatewayDcmDisplaySettings
-  gatewayId: string
-  groupName: string
-  toolNameVariants: string[]
-}): {
-  agentGroupMode: AgentDcmGroupDisplayMode | undefined
-  effectiveGroupMode: DcmGroupDisplayMode
-  groupVisibility: DcmGroupVisibility
-  toolVisibility: DcmToolVisibility | null
-  isGroupVisible: boolean
-  isToolVisibleInDcm: boolean
-  isToolDiscoverable: boolean
-} {
-  const agentGroupMode = options.agentSettings.groups[buildCompositeKey(options.gatewayId, options.groupName)]
-  const effectiveGroupMode = resolveEffectiveGroupMode({
-    agentSettings: options.agentSettings,
-    gatewayDefaults: options.gatewayDefaults,
-    gatewayId: options.gatewayId,
-    groupName: options.groupName
-  })
-  const groupVisibility = mapGroupModeToVisibility(effectiveGroupMode)
-
-  if (groupVisibility === 'hidden') {
-    return {
-      agentGroupMode,
-      effectiveGroupMode,
-      groupVisibility,
-      toolVisibility: null,
-      isGroupVisible: false,
-      isToolVisibleInDcm: false,
-      isToolDiscoverable: false
-    }
-  }
-
-  if (groupVisibility === 'group-only') {
-    return {
-      agentGroupMode,
-      effectiveGroupMode,
-      groupVisibility,
-      toolVisibility: null,
-      isGroupVisible: true,
-      isToolVisibleInDcm: false,
-      isToolDiscoverable: true
-    }
-  }
-
-  const toolVisibility = resolveEffectiveToolVisibility({
-    agentSettings: options.agentSettings,
-    gatewayDefaults: options.gatewayDefaults,
-    gatewayId: options.gatewayId,
-    toolNameVariants: options.toolNameVariants,
-    groupMode: effectiveGroupMode,
-    agentGroupMode
-  })
-
-  return {
-    agentGroupMode,
-    effectiveGroupMode,
-    groupVisibility,
-    toolVisibility,
-    isGroupVisible: true,
-    isToolVisibleInDcm: toolVisibility !== 'hidden',
-    isToolDiscoverable: toolVisibility !== 'hidden'
-  }
-}
 
 function hasRequiredDynamicTools(enabledNames: Set<string>): boolean {
   const normalized = new Set([...enabledNames].map((name) => name.toLowerCase()))
@@ -551,38 +442,6 @@ async function resolveEnabledTools(
   }
 }
 
-export async function resolveAgentDcmDisplaySettings(options: {
-  agentId?: string | null
-  dcmDisplaySettings?: AgentDcmDisplaySettings | null
-}): Promise<AgentDcmDisplaySettings> {
-  if (options.dcmDisplaySettings) {
-    return normalizeDcmDisplaySettings(options.dcmDisplaySettings)
-  }
-
-  const agentId = options.agentId?.trim()
-  if (!agentId) {
-    return createDefaultDcmDisplaySettings()
-  }
-
-  try {
-    const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
-    return normalizeDcmDisplaySettings(
-      agent?.dcmDisplaySettings ?? agent?.dcm_display_settings ?? null
-    )
-  } catch (error) {
-    console.warn('[Dynamic MCP DCM] Failed to resolve agent DCM display settings:', error)
-    return createDefaultDcmDisplaySettings()
-  }
-}
-
-/**
- * The broker toggles this agent runs with.
- *
- * Explicit input wins, then the caller's raw provider settings, then the stored agent
- * record. `dynamicMcpEnabled` and `cliToolsEnabled` are overwritten afterwards by the
- * values this index already resolved, so the Fabric scope's `sys.mcp.dynamic.*` entries
- * agree with the MCP section rather than being read twice from different places.
- */
 async function resolveIndexBrokerToggles(
   options: DynamicMcpIndexOptions
 ): Promise<BrokerToolToggles> {
@@ -607,36 +466,6 @@ async function resolveIndexBrokerToggles(
   } catch (error) {
     console.warn('[Dynamic MCP DCM] Failed to resolve broker toggles:', error)
     return resolveBrokerToolToggles(null)
-  }
-}
-
-export async function resolveGatewayDisplayDefaults(
-  userId: string
-): Promise<Map<string, GatewayDcmDisplaySettings>> {
-  try {
-    const gateways = await redis.execute(async (client) => {
-      const data = await client.json.get(`mcp_gateways:${userId}`)
-      const value = Array.isArray(data) ? data[0] : data
-      const registry = (value || {}) as { gateways?: Array<Record<string, unknown>> }
-      return Array.isArray(registry.gateways) ? registry.gateways : []
-    })
-
-    const map = new Map<string, GatewayDcmDisplaySettings>()
-    for (const gateway of gateways) {
-      const id = typeof gateway?.id === 'string' ? gateway.id : ''
-      if (!id) continue
-      map.set(
-        id,
-        normalizeGatewayDcmDisplaySettings(
-          (gateway as Record<string, unknown>).dcmDisplayDefaults
-        )
-      )
-    }
-
-    return map
-  } catch (error) {
-    console.warn('[Dynamic MCP DCM] Failed to resolve gateway defaults:', error)
-    return new Map<string, GatewayDcmDisplaySettings>()
   }
 }
 
@@ -922,7 +751,7 @@ export async function buildDynamicMcpIndex(
       })
     : []
   const fabricControls = fabricReachable
-    ? await listVisibleControls({
+    ? await (await loadListVisibleControls())({
         userId,
         agentId: controlAgentId,
         runtimeMode: controlRuntimeMode,
@@ -973,7 +802,7 @@ export async function buildDynamicMcpIndex(
   // agent-runnable; the per-artifact `artifact.<id>.*` config controls belong to the Fabric
   // family, so they are reported here as a count and only when Fabric is actually reachable.
   if (artifactReachable) {
-    const artifactControls = await listVisibleControls({
+    const artifactControls = await (await loadListVisibleControls())({
       userId,
       agentId: controlAgentId,
       runtimeMode: controlRuntimeMode,

@@ -1,5 +1,5 @@
 import { render, screen } from '@testing-library/svelte'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import BrokerFamilyToolGridRow from './BrokerFamilyToolGridRow.svelte'
 import type { BrokerFamilyRowControls } from './brokerFamilyRowControls'
@@ -32,11 +32,24 @@ function buildControls(overrides: Partial<BrokerFamilyRowControls> = {}): Broker
   }
 }
 
+// A `<tr>` needs a real table ancestor to survive, so each case builds one and attaches
+// it so `screen` queries can reach the row. Anything attached here is removed again in
+// afterEach: leaving detached tables on document.body outlives the jsdom environment and
+// makes teardown fail with "document is not defined" once the environment is disposed.
+const mountedTables: HTMLTableElement[] = []
+
+afterEach(() => {
+  for (const table of mountedTables.splice(0)) {
+    table.remove()
+  }
+})
+
 function renderRow(controls: BrokerFamilyRowControls) {
   const table = document.createElement('table')
   const body = document.createElement('tbody')
   table.appendChild(body)
   document.body.appendChild(table)
+  mountedTables.push(table)
 
   return render(BrokerFamilyToolGridRow, {
     props: { controls, rowClass: 'batshit-settings-table-row' },

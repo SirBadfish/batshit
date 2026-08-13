@@ -82,7 +82,8 @@ export type ControlSourceType = 'core' | 'artifact' | 'workflow' | 'plugin'
 export type ControlExecutorType = 'internal_handler' | 'artifact_use' | 'workflow_run' | 'bash_adapter'
 export type ControlRiskLevel = 'safe' | 'confirm' | 'restricted'
 export type ControlStatus = 'draft' | 'published' | 'deprecated'
-export type ControlRuntimeMode = 'mode1' | 'mode2' | 'mode3' | 'mode4'
+import type { ControlRuntimeMode } from './fabricControlModes'
+export type { ControlRuntimeMode }
 
 /**
  * Registry storage contract lock:
