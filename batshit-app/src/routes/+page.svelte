@@ -535,14 +535,6 @@
   const desktopModeActive = $derived(
     desktopPresentation.mode === 'desktop' || desktopPresentation.transition?.to === 'desktop'
   )
-  const goonDcmPresentationMode = $derived(
-    resolveVisibleGoonPresentationMode({
-      dockOpen: goonsPanelOpen,
-      immersiveMode,
-      desktopModeActive
-    })
-  )
-  const goonPresentationVisible = $derived(Boolean(goonDcmPresentationMode))
   const desktopModeAvailable = $derived(Boolean(desktopShellStatus?.supported))
   const desktopModeUnavailableReason = $derived.by(() => {
     if (!desktopNativeBridge) return 'Desktop Mode requires the managed Batshit desktop app.'
@@ -597,6 +589,14 @@ const goonLipSyncMode = $derived(voiceSettings.goonLipSync?.mode ?? 'amplitude')
 const premiumGoonLipSyncAnalyzer = $derived(voiceSettings.goonLipSync?.analyzerId ?? 'rhubarb-wasm')
 const goonLipSyncLabEnabled = $derived(Boolean(userSettings?.admin_settings?.goon_lip_sync_lab_enabled))
 const immersiveMode = $derived.by(() => Boolean(goonsSettings?.immersiveMode))
+const goonDcmPresentationMode = $derived(
+  resolveVisibleGoonPresentationMode({
+    dockOpen: goonsPanelOpen,
+    immersiveMode,
+    desktopModeActive
+  })
+)
+const goonPresentationVisible = $derived(Boolean(goonDcmPresentationMode))
 const sharedGoonAnimations = $derived.by(() =>
   Array.isArray(goonAnimationLibrary?.vrma) ? goonAnimationLibrary.vrma : []
 )
