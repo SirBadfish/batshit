@@ -1,10 +1,16 @@
 <script module lang="ts">
 	import { toast } from 'svelte-sonner';
+	import { runUnlessExpectedIntentionalShutdownNotification } from '$lib/services/appLifecycle.client';
 	import { scopeToastOptions } from './toast-scope';
 
 	const PERSISTENT_ERROR_TOAST_DURATION = Number.POSITIVE_INFINITY;
 	const SCOPED_TOAST_PATCH_FLAG = '__batshitScopedToastsPatched';
 	const toastRecord = toast as unknown as Record<string, unknown>;
+	const suppressedShutdownToastId = 'batshit-intentional-shutdown';
+
+	function shutdownSuppressedToastId(data: { id?: string | number } | undefined) {
+		return data?.id ?? suppressedShutdownToastId;
+	}
 
 	if (!toastRecord[SCOPED_TOAST_PATCH_FLAG]) {
 		const originalSuccess = toast.success.bind(toast);
@@ -27,13 +33,26 @@
 		toast.warning = ((
 			message: Parameters<typeof originalWarning>[0],
 			data?: Parameters<typeof originalWarning>[1]
-		) => originalWarning(message, scopeToastOptions(data, 'app'))) as typeof toast.warning;
-		toast.error = ((message: Parameters<typeof originalError>[0], data?: Parameters<typeof originalError>[1]) =>
-			originalError(message, {
-				closeButton: true,
-				duration: PERSISTENT_ERROR_TOAST_DURATION,
-				...scopeToastOptions(data, 'app')
-			})) as typeof toast.error;
+		) =>
+			runUnlessExpectedIntentionalShutdownNotification(
+				message,
+				() => originalWarning(message, scopeToastOptions(data, 'app')),
+				shutdownSuppressedToastId(data)
+			)) as typeof toast.warning;
+		toast.error = ((
+			message: Parameters<typeof originalError>[0],
+			data?: Parameters<typeof originalError>[1]
+		) =>
+			runUnlessExpectedIntentionalShutdownNotification(
+				message,
+				() =>
+					originalError(message, {
+						closeButton: true,
+						duration: PERSISTENT_ERROR_TOAST_DURATION,
+						...scopeToastOptions(data, 'app')
+					}),
+				shutdownSuppressedToastId(data)
+			)) as typeof toast.error;
 		toast.custom = ((
 			component: Parameters<typeof originalCustom>[0],
 			data?: Parameters<typeof originalCustom>[1]
@@ -55,11 +74,15 @@
 </script>
 
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { Toaster as Sonner } from 'svelte-sonner';
+	import { onIntentionalAppShutdown } from '$lib/services/appLifecycle.client';
 
 	let {
 		...restProps
 	} = $props();
+
+	onMount(() => onIntentionalAppShutdown(() => {}));
 </script>
 
 <Sonner 

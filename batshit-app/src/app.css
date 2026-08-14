@@ -282,6 +282,15 @@
   display: none;
 }
 
+/*
+ * Bits UI's modal scroll lock disables pointer events on the document body.
+ * The Settings sheet opts itself back in, but Sonner is a sibling portal and
+ * must do the same so visible Settings-scoped toasts remain dismissible.
+ */
+:root.batshit-settings-panel-open [data-sonner-toaster] {
+  pointer-events: auto;
+}
+
 @layer base {
   * {
     border-color: var(--border);

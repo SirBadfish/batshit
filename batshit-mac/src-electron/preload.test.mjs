@@ -74,12 +74,48 @@ test('main preload retains existing narrow APIs and adds Desktop Goon commands',
     'desktopControls',
     'desktopGoon',
     'dialogs',
-    'invoke'
+    'invoke',
+    'lifecycle'
   ]);
   assert.equal(zero.desktopGoon.role, 'main');
   await zero.desktopGoon.invoke('desktopGoon.open', {});
   const invocation = ipcRenderer.listeners('batshit:desktop-goon:status');
   assert.equal(invocation.length, 1);
+});
+
+test('main preload exposes a frozen one-way intentional-shutdown lifecycle', () => {
+  const { zero, ipcRenderer } = loadPreload('main');
+  const received = [];
+  const unsubscribe = zero.lifecycle.onShutdown((event) => received.push(event));
+
+  assert.equal(Object.isFrozen(zero.lifecycle), true);
+  assert.equal(zero.lifecycle.isShuttingDown(), false);
+  ipcRenderer.emit('batshit:lifecycle:shutdown-started', {}, {
+    schemaVersion: 'app-lifecycle/v0',
+    type: 'shutdown-started',
+    reason: 'window-close'
+  });
+  assert.equal(zero.lifecycle.isShuttingDown(), false);
+  assert.equal(received.length, 0);
+  ipcRenderer.emit('batshit:lifecycle:shutdown-started', {}, {
+    schemaVersion: 'app-lifecycle/v1',
+    type: 'shutdown-started',
+    reason: 'window-close'
+  });
+  assert.equal(zero.lifecycle.isShuttingDown(), true);
+  assert.equal(received.length, 1);
+  assert.equal(Object.isFrozen(received[0]), true);
+  assert.equal(received[0].schemaVersion, 'app-lifecycle/v1');
+  assert.equal(received[0].type, 'shutdown-started');
+  assert.equal(received[0].reason, 'window-close');
+
+  ipcRenderer.emit('batshit:lifecycle:shutdown-started', {}, {
+    schemaVersion: 'app-lifecycle/v1',
+    type: 'shutdown-started',
+    reason: 'app-quit'
+  });
+  assert.equal(received.length, 1);
+  unsubscribe();
 });
 
 test('controls preload exposes only its frozen role-scoped state and intent bridge', async () => {

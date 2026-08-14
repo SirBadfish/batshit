@@ -60,6 +60,8 @@ const shellRoot = app.isPackaged
   ? join(app.getAppPath(), 'shell')
   : join(app.getAppPath(), 'frontend', 'dist');
 const shellUrl = 'batshit-shell://app/index.html';
+const appLifecycleSchemaVersion = 'app-lifecycle/v1';
+const appShutdownChannel = 'batshit:lifecycle:shutdown-started';
 const mimeTypes = new Map([
   ['.css', 'text/css; charset=utf-8'],
   ['.html', 'text/html; charset=utf-8'],
@@ -78,6 +80,7 @@ let desktopGoonController = null;
 let desktopControlsController = null;
 let shutdownStarted = false;
 let quittingAfterShutdown = false;
+let pendingShutdownReason = 'app-quit';
 const windowRoleRegistry = new Map();
 
 protocol.registerSchemesAsPrivileged([
@@ -395,6 +398,7 @@ function createWindow() {
   window.on('close', (event) => {
     if (quittingAfterShutdown) return;
     event.preventDefault();
+    pendingShutdownReason = 'window-close';
     app.quit();
   });
   window.on('closed', () => {
@@ -404,9 +408,23 @@ function createWindow() {
   return window;
 }
 
-async function stopRuntimeBeforeQuit() {
+function notifyRendererShutdown(reason) {
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return;
+  if (!window.webContents.isDestroyed()) {
+    window.webContents.send(appShutdownChannel, {
+      schemaVersion: appLifecycleSchemaVersion,
+      type: 'shutdown-started',
+      reason
+    });
+  }
+  window.hide();
+}
+
+async function stopRuntimeBeforeQuit(reason = 'app-quit') {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  notifyRendererShutdown(reason);
   try {
     await desktopGoonController?.prepareForQuit();
     await desktopControlsController?.prepareForQuit();
@@ -427,7 +445,7 @@ if (!hasSingleInstanceLock) {
   app.on('before-quit', (event) => {
     if (quittingAfterShutdown) return;
     event.preventDefault();
-    void stopRuntimeBeforeQuit().finally(() => {
+    void stopRuntimeBeforeQuit(pendingShutdownReason).finally(() => {
       quittingAfterShutdown = true;
       app.quit();
     });
