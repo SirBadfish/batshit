@@ -1,10 +1,8 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen } from '@testing-library/svelte'
+import { describe, expect, it, vi } from 'vitest'
 
 import { HAIR_MOTION_PAINT_CONTRACT } from '$lib/goons/hairMotionPaint'
 import HairMotionPaintOverlay from './HairMotionPaintOverlay.svelte'
-
-afterEach(cleanup)
 
 describe('HairMotionPaintOverlay', () => {
   it('uses one paint selection and keeps visibility, cleanup, and exit actions distinct', async () => {

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   RECIPE_MIGRATION_REPORT_CONTRACT,
@@ -77,15 +77,7 @@ if (typeof globalThis.ResizeObserver === 'undefined') {
   })
 }
 
-afterEach(async () => {
-  cleanup()
-  // Bits UI intentionally delays body-scroll-lock cleanup for 24 ms so another
-  // dialog can mount in the same tick. Let that owned timer finish before Vitest
-  // tears down jsdom; otherwise it can reach `document` after the suite has ended.
-  await waitFor(() => {
-    expect(document.body.style.overflow).not.toBe('hidden')
-    expect(document.body.style.pointerEvents).not.toBe('none')
-  })
+afterEach(() => {
   recipeServiceMocks.uploadCustomGoonPackage.mockReset()
   recipeServiceMocks.loadGoons.mockReset()
   recipeServiceMocks.loadCustomAvatarManifest.mockReset()

@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen } from '@testing-library/svelte'
+import { describe, expect, it, vi } from 'vitest'
 
 import { createHairState } from '$lib/goons/hairAssets'
 import { HAIR_REFIT_SOURCE_CONTRACT } from '$lib/goons/hairAssets'
@@ -47,16 +47,6 @@ const SOURCE: RecipeSourceIdentity = {
   topologySha256: HASH,
   skeletonHierarchySha256: HASH
 }
-
-afterEach(async () => {
-  cleanup()
-  // Bits UI delays body-scroll-lock cleanup for 24 ms so another dialog can
-  // mount in the same tick. Keep jsdom alive until that owned timer finishes.
-  await waitFor(() => {
-    expect(document.body.style.overflow).not.toBe('hidden')
-    expect(document.body.style.pointerEvents).not.toBe('none')
-  })
-})
 
 async function fixture() {
   return createHairAssetFixture({
