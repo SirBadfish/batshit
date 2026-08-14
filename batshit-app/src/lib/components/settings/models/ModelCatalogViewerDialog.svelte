@@ -8,19 +8,21 @@
   import * as Select from '$lib/components/ui/select'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
+  import {
+    CATALOG_ROLE_OPTIONS,
+    type CatalogRoleFilter
+  } from '$lib/components/settings/models/modelSettingsFormatters'
   import { themeStore } from '$lib/stores/theme'
   import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
   import type { ModelCapabilities } from '$lib/types/savedModels'
   import type { ThemeMode } from '$lib/types/theme'
-
-  type CatalogViewerRole = 'all' | 'chat' | 'visual' | 'audio' | 'utility'
 
   interface Props {
     open?: boolean
     catalogLoading: boolean
     catalogViewerConnection?: string
     catalogViewerProvider?: string
-    catalogViewerRole?: CatalogViewerRole
+    catalogViewerRole?: CatalogRoleFilter
     catalogViewerSearch?: string
     catalogViewerLimit?: number
     catalogViewerConnectionOptions: string[]
@@ -46,7 +48,7 @@
     catalogLoading,
     catalogViewerConnection = $bindable('all'),
     catalogViewerProvider = $bindable('all'),
-    catalogViewerRole = $bindable<CatalogViewerRole>('all'),
+    catalogViewerRole = $bindable<CatalogRoleFilter>('all'),
     catalogViewerSearch = $bindable(''),
     catalogViewerLimit = $bindable(100),
     catalogViewerConnectionOptions,
@@ -77,7 +79,7 @@
         Model Catalog Viewer
       </Dialog.Title>
       <Dialog.Description>
-        Browse the shared registry with filters for providers, developers, and pricing.
+        Browse the shared registry by provider, developer, and model type, or search directly.
       </Dialog.Description>
     </Dialog.Header>
     <div class="batshit-settings-model-catalog-dialog-body">
@@ -183,23 +185,25 @@
           </Select.Root>
         </div>
         <div class="flex min-w-[160px] flex-col gap-1">
-          <Label.Root class="batshit-settings-form-label">Role</Label.Root>
+          <Label.Root class="batshit-settings-form-label">Model Type</Label.Root>
           <Select.Root
             type="single"
             value={catalogViewerRole}
-            onValueChange={(value) => (catalogViewerRole = normalizeSelectValue(value) as CatalogViewerRole)}
+            onValueChange={(value) => (catalogViewerRole = normalizeSelectValue(value) as CatalogRoleFilter)}
           >
             <Select.Trigger class="w-full" size="sm">
               <span class="truncate">
-                {catalogViewerRole === 'all' ? 'All Roles' : catalogViewerRole}
+                {catalogViewerRole === 'all'
+                  ? 'All Roles'
+                  : CATALOG_ROLE_OPTIONS.find((option) => option.value === catalogViewerRole)?.label ??
+                    catalogViewerRole}
               </span>
             </Select.Trigger>
             <Select.Content>
               <Select.Item value="all">All Roles</Select.Item>
-              <Select.Item value="chat">chat</Select.Item>
-              <Select.Item value="visual">visual</Select.Item>
-              <Select.Item value="audio">audio</Select.Item>
-              <Select.Item value="utility">utility</Select.Item>
+              {#each CATALOG_ROLE_OPTIONS.filter((option) => option.value !== 'all') as option (option.value)}
+                <Select.Item value={option.value}>{option.label}</Select.Item>
+              {/each}
             </Select.Content>
           </Select.Root>
         </div>

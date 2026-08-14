@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ParameterDefinition } from '$lib/data/parameter-schemas'
 import {
+  CATALOG_ROLE_OPTIONS,
   formatCurrencyDisplay,
   formatDeveloperLabel,
   formatGroupedIntegerDisplay,
@@ -41,18 +42,53 @@ describe('modelSettingsFormatters', () => {
     expect(formatParameterDisplayValue(numberParameter, '0.734')).toBe('0.73')
   })
 
-  it('matches catalog roles with vision normalized to visual', () => {
-    const model = {
+  it('defines the shared catalog filters in display order', () => {
+    expect(CATALOG_ROLE_OPTIONS).toEqual([
+      { value: 'all', label: 'All' },
+      { value: 'chat', label: 'Text' },
+      { value: 'vision', label: 'Vision' },
+      { value: 'visual', label: 'Media' },
+      { value: 'audio', label: 'Audio' },
+      { value: 'utility', label: 'Utility' }
+    ])
+  })
+
+  it('filters vision as a capability while retaining the model in Text', () => {
+    const visionModel = {
       id: 'test/model',
       name: 'model',
       displayName: 'Model',
       provider: 'test',
-      purpose: 'vision'
+      purpose: 'chat',
+      features: { vision: true }
+    } as CatalogModel
+    const textOnlyModel = {
+      ...visionModel,
+      id: 'test/text-only',
+      features: { vision: false }
+    } as CatalogModel
+    const mediaModel = {
+      ...visionModel,
+      id: 'test/media',
+      purpose: 'visual',
+      features: { image: true, vision: true }
+    } as CatalogModel
+    const legacyVisionModel = {
+      ...visionModel,
+      id: 'test/legacy-vision',
+      purpose: 'vision',
+      features: {}
     } as CatalogModel
 
-    expect(matchesCatalogRole(model, 'visual')).toBe(true)
-    expect(matchesCatalogRole(model, 'chat')).toBe(false)
-    expect(matchesCatalogRole(model, 'all')).toBe(true)
+    expect(matchesCatalogRole(visionModel, 'vision')).toBe(true)
+    expect(matchesCatalogRole(visionModel, 'chat')).toBe(true)
+    expect(matchesCatalogRole(textOnlyModel, 'vision')).toBe(false)
+    expect(matchesCatalogRole(mediaModel, 'visual')).toBe(true)
+    expect(matchesCatalogRole(mediaModel, 'vision')).toBe(false)
+    expect(matchesCatalogRole(legacyVisionModel, 'vision')).toBe(true)
+    expect(matchesCatalogRole(legacyVisionModel, 'chat')).toBe(true)
+    expect(matchesCatalogRole(legacyVisionModel, 'visual')).toBe(false)
+    expect(matchesCatalogRole(visionModel, 'all')).toBe(true)
   })
 
   it('uses the Docker icon key for Docker Model Runner connections', () => {

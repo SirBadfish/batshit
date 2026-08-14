@@ -141,19 +141,34 @@ export function getConnectionIconMeta(option: CatalogConnectionOption, theme: Th
   }
 }
 
+export type CatalogRoleFilter = 'all' | 'chat' | 'vision' | 'visual' | 'audio' | 'utility'
+
+export const CATALOG_ROLE_OPTIONS: ReadonlyArray<{
+  value: CatalogRoleFilter
+  label: string
+}> = [
+  { value: 'all', label: 'All' },
+  { value: 'chat', label: 'Text' },
+  { value: 'vision', label: 'Vision' },
+  { value: 'visual', label: 'Media' },
+  { value: 'audio', label: 'Audio' },
+  { value: 'utility', label: 'Utility' }
+]
+
 export function normalizeCatalogRole(value?: string | null): 'chat' | 'visual' | 'audio' | 'utility' {
   if (value === 'visual') return 'visual'
-  if (value === 'vision') return 'visual'
+  if (value === 'vision') return 'chat'
   if (value === 'audio') return 'audio'
   if (value === 'utility') return 'utility'
   return 'chat'
 }
 
-export function matchesCatalogRole(
-  model: CatalogModel,
-  role: 'all' | 'chat' | 'visual' | 'audio' | 'utility'
-) {
+export function matchesCatalogRole(model: CatalogModel, role: CatalogRoleFilter) {
   if (role === 'all') return true
+  if (role === 'vision') {
+    const hasVision = model.features?.vision === true || String(model.purpose) === 'vision'
+    return hasVision && normalizeCatalogRole(model.purpose ?? null) === 'chat'
+  }
   return normalizeCatalogRole(model.purpose ?? null) === role
 }
 

@@ -14,6 +14,8 @@ The Model Catalog solves that. It's one combined, searchable list that pulls tog
 
 Instead of memorizing model IDs, you browse the catalog, filter to what you want, and let Batshit fill in the exact identifiers. It lives in Settings → Models, with a toggleable catalog viewer for browsing and searching the full normalized list.
 
+The catalog's model-type filters are **Text**, **Vision**, **Media**, **Audio**, and **Utility**. Vision sits immediately after Text because it narrows the text models to those that can inspect images; Media covers image and video generation models. A vision-capable text model therefore appears under both Text and Vision. Open **View Details** on the selected model to see every capability the catalog reports, such as streaming, vision, tool calling, reasoning, cache control, and long context.
+
 When catalog data includes a trustworthy max output token limit, Batshit fills it into the preset. If the catalog does not provide that limit, or reports a value that would reserve nearly the whole context window for output, Batshit fills a conservative safe default instead. In that case the Max Output Tokens row shows an **Estimated** badge so you know the value is a Batshit default, not confirmed provider metadata.
 
 ## How a model gets named
