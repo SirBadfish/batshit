@@ -77,7 +77,7 @@ import {
   collectReasoningTextFromFinish,
   extractReasoningTextFromRawChunk,
   resolveTaggedReasoningTagName,
-  withReasoningDisplayProviderOptions,
+  withReasoningProviderOptions,
 } from '$lib/utils/reasoningDisplay'
 import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
 import { resolveModelIds } from '$lib/utils/modelIdResolver'
@@ -4729,7 +4729,7 @@ async function handleBatshitAgentStream({
     streamMessages: any[] = compiledMessages,
     streamImages: Array<{ url: string }> = images,
   ): NativeModeRequest => {
-    const providerOptions = withReasoningDisplayProviderOptions(
+    const providerOptions = withReasoningProviderOptions(
       Object.keys(settings.providerOptions).length > 0
         ? settings.providerOptions
         : undefined,

@@ -84,15 +84,36 @@ export function resolveTaggedReasoningTagName(
   return looksReasoningCapable(args) ? 'think' : null
 }
 
-export function withReasoningDisplayProviderOptions(
+export function withReasoningProviderOptions(
   providerOptions: Record<string, Record<string, any>> | undefined,
   args: ReasoningOptionsArgs
 ): Record<string, Record<string, any>> | undefined {
-  if (!args.showReasoning || !looksReasoningCapable(args)) {
+  if (!looksReasoningCapable(args)) {
     return providerOptions
   }
 
   const providerKey = inferProviderKey(args)
+
+  // MiMo defaults to thinking mode, but some OpenAI-compatible routes collapse
+  // the reasoning and final answer into one tagged text block when that default
+  // is left implicit. Explicitly requesting Xiaomi's thinking contract makes
+  // reasoning_content and content arrive as separate stream fields. Keep this
+  // independent of Display Reasoning so hiding the panel never changes model
+  // behavior or leaks reasoning back into ordinary assistant text.
+  if (providerKey === 'mimo') {
+    const next = cloneProviderOptions(providerOptions)
+    const xiaomi = { ...(next.xiaomi ?? {}) }
+    if (xiaomi.thinking === undefined) {
+      xiaomi.thinking = { type: 'enabled' }
+    }
+    next.xiaomi = xiaomi
+    return next
+  }
+
+  if (!args.showReasoning) {
+    return providerOptions
+  }
+
   const next = cloneProviderOptions(providerOptions)
 
   if (providerKey === 'openai') {

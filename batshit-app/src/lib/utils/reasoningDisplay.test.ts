@@ -3,12 +3,12 @@ import {
   collectReasoningTextFromFinish,
   extractReasoningTextFromRawChunk,
   resolveTaggedReasoningTagName,
-  withReasoningDisplayProviderOptions,
+  withReasoningProviderOptions,
 } from './reasoningDisplay'
 
 describe('reasoningDisplay utilities', () => {
   it('requests OpenAI reasoning summaries when Display Reasoning is enabled', () => {
-    const options = withReasoningDisplayProviderOptions(undefined, {
+    const options = withReasoningProviderOptions(undefined, {
       provider: 'openai',
       modelId: 'gpt-5.5',
       capabilities: { reasoning: true },
@@ -19,7 +19,7 @@ describe('reasoningDisplay utilities', () => {
   })
 
   it('requests Gemini thought summaries when Display Reasoning is enabled', () => {
-    const options = withReasoningDisplayProviderOptions(
+    const options = withReasoningProviderOptions(
       { google: { thinkingConfig: { thinkingBudget: 8192, includeThoughts: false } } },
       {
         provider: 'google',
@@ -47,6 +47,41 @@ describe('reasoningDisplay utilities', () => {
     })
 
     expect(text).toBe('Checking constraints...')
+  })
+
+  it('explicitly requests structured MiMo thinking even when Display Reasoning is off', () => {
+    const options = withReasoningProviderOptions(
+      { gateway: { only: ['xiaomi'] } },
+      {
+        provider: 'xiaomi',
+        modelId: 'xiaomi/mimo-v2.5',
+        connection: {
+          id: 'vercel-gateway',
+          type: 'vercel-gateway',
+        },
+        capabilities: { reasoning: true },
+        showReasoning: false,
+      },
+    )
+
+    expect(options).toEqual({
+      gateway: { only: ['xiaomi'] },
+      xiaomi: { thinking: { type: 'enabled' } },
+    })
+  })
+
+  it('preserves an explicit MiMo thinking override', () => {
+    const options = withReasoningProviderOptions(
+      { xiaomi: { thinking: { type: 'disabled' } } },
+      {
+        provider: 'mimo',
+        modelId: 'mimo-v2.5',
+        capabilities: { reasoning: true },
+        showReasoning: true,
+      },
+    )
+
+    expect(options?.xiaomi?.thinking).toEqual({ type: 'disabled' })
   })
 
   it('normalizes think-tag reasoning for MiMo even without catalog capability metadata', () => {
