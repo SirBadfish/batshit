@@ -1482,6 +1482,16 @@ export class VercelAIBrain {
     })
     if (!taggedReasoningTagName) return model
 
+    if (
+      typeof model !== 'object' ||
+      model === null ||
+      model.specificationVersion !== 'v3'
+    ) {
+      throw new Error(
+        `[VercelBrain API] Tagged reasoning extraction requires an AI SDK v3 model instance for "${modelName}"`,
+      )
+    }
+
     return wrapLanguageModel({
       model,
       middleware: extractReasoningMiddleware({

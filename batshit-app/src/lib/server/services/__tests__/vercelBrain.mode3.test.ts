@@ -20,8 +20,12 @@ import { redis } from '$lib/server/redis'
 const providerMocks = vi.hoisted(() => ({
   providerManagerFactory: () => ({
     getModel: vi.fn().mockReturnValue({
+      specificationVersion: 'v3',
       provider: 'anthropic',
-      modelId: 'claude-3-5-sonnet'
+      modelId: 'claude-3-5-sonnet',
+      supportedUrls: {},
+      doGenerate: vi.fn(),
+      doStream: vi.fn(),
     }),
     listAvailableModels: vi.fn().mockReturnValue([
       { id: 'anthropic/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet' }
