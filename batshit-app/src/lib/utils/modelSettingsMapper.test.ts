@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS,
   OPENROUTER_DEFAULT_MAX_OUTPUT_TOKENS,
   buildRuntimeModelSettings
 } from './modelSettingsMapper'
@@ -138,5 +139,23 @@ describe('buildRuntimeModelSettings', () => {
     })
 
     expect(runtime.standard.maxTokens).toBe(40000)
+  })
+
+  it('clamps the rounded MiMo V2.5 catalog limit to Xiaomi\'s accepted boundary', () => {
+    const runtime = buildRuntimeModelSettings({
+      provider: 'xiaomi',
+      modelId: 'xiaomi/mimo-v2.5',
+      connection: {
+        id: 'vercel-gateway',
+        type: 'vercel-gateway',
+        service: 'vercel-gateway'
+      },
+      contextWindow: 1_050_000,
+      settings: {
+        maxTokens: 131_100
+      }
+    })
+
+    expect(runtime.standard.maxTokens).toBe(MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS)
   })
 })
