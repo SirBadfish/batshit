@@ -69,6 +69,8 @@ Reasoning-capable models do not all send their thinking the same way. Some provi
 
 For `API` agents, Batshit normalizes both formats into the same reasoning panel when the preset is marked reasoning-capable or the model/provider is a known MiMo or DeepSeek path. **Display Reasoning** controls whether that panel is shown, and **Preserve Reasoning** controls whether it remains after the live response. The tags and their contents do not become part of the normal assistant answer.
 
+MiMo's thinking mode is requested explicitly even when Display Reasoning is off. This keeps the provider's reasoning and final answer in their separate stream fields instead of relying on an implicit provider default that can merge both into one malformed tagged block. Display Reasoning remains a visibility choice; it does not turn the model's thinking mode on or off.
+
 ## How presets connect to keys and Local AI
 
 Presets sit in the middle of three things:
