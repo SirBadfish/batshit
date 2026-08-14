@@ -8,6 +8,8 @@ const portCloseChannel = 'batshit:desktop-goon:port-close';
 const controlsSchemaVersion = 'desktop-controls/v1';
 const controlsCommandChannel = 'batshit:desktop-controls:command';
 const controlsStateChannel = 'batshit:desktop-controls:state';
+const appLifecycleSchemaVersion = 'app-lifecycle/v1';
+const appShutdownChannel = 'batshit:lifecycle:shutdown-started';
 const maximumPortMessageBytes = 512 * 1024;
 const roleArgument = process.argv.find((argument) => argument.startsWith('--batshit-window-role='));
 const requestedRole = roleArgument?.slice('--batshit-window-role='.length);
@@ -46,6 +48,8 @@ let activePortGeneration = 0;
 const statusListeners = new Set();
 const portListeners = new Set();
 const controlsStateListeners = new Set();
+const shutdownListeners = new Set();
+let shutdownEvent = null;
 
 function subscribe(listeners, listener, label) {
   if (typeof listener !== 'function') throw new TypeError(`${label} listener must be a function.`);
@@ -218,6 +222,24 @@ ipcRenderer.on(portChannel, (event, metadata) => {
   for (const listener of portListeners) listener(activePortState.facade);
 });
 
+ipcRenderer.on(appShutdownChannel, (_event, value) => {
+  if (
+    shutdownEvent ||
+    !value ||
+    value.schemaVersion !== appLifecycleSchemaVersion ||
+    value.type !== 'shutdown-started' ||
+    !['app-quit', 'window-close'].includes(value.reason)
+  ) {
+    return;
+  }
+  shutdownEvent = Object.freeze({
+    schemaVersion: appLifecycleSchemaVersion,
+    type: 'shutdown-started',
+    reason: value.reason
+  });
+  for (const listener of shutdownListeners) listener(shutdownEvent);
+});
+
 const desktopGoon = Object.freeze({
   schemaVersion,
   role,
@@ -283,6 +305,17 @@ const desktopControls = Object.freeze({
   }
 });
 
+const lifecycle = Object.freeze({
+  isShuttingDown() {
+    return shutdownEvent !== null;
+  },
+  onShutdown(listener) {
+    const unsubscribe = subscribe(shutdownListeners, listener, 'App shutdown');
+    if (shutdownEvent) listener(shutdownEvent);
+    return unsubscribe;
+  }
+});
+
 const zero = role === 'desktop'
   ? Object.freeze({ desktopGoon })
   : role === 'controls'
@@ -297,7 +330,8 @@ const zero = role === 'desktop'
         }
       }),
       desktopGoon,
-      desktopControls
+      desktopControls,
+      lifecycle
     });
 
 contextBridge.exposeInMainWorld('zero', zero);
