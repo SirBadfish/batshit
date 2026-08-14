@@ -9,6 +9,7 @@ import {
 export type StandardKey = keyof RuntimeModelStandardSettings
 
 export const OPENROUTER_DEFAULT_MAX_OUTPUT_TOKENS = DEFAULT_MODEL_MAX_OUTPUT_TOKENS
+export const MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS = 131_072
 const OPENROUTER_CONTEXT_WINDOW_OUTPUT_RATIO = 0.8
 const OPENROUTER_UNKNOWN_CONTEXT_MAX_OUTPUT_TOKENS = 64_000
 const OPENROUTER_MIN_CLAMPED_MAX_OUTPUT_TOKENS = 1_024
@@ -178,6 +179,19 @@ export function normalizeRuntimeMaxTokens({
     return normalizedMaxTokens
   }
 
+  if (
+    isMimoV25TextModel(modelId) &&
+    normalizedMaxTokens > MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS
+  ) {
+    console.warn('[model-settings] Clamped MiMo V2.5 Xiaomi max output tokens', {
+      provider,
+      modelId,
+      requestedMaxOutputTokens: normalizedMaxTokens,
+      maxOutputTokens: MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS
+    })
+    return MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS
+  }
+
   if (!isOpenRouterRuntime(provider, connection)) {
     return normalizedMaxTokens
   }
@@ -195,6 +209,11 @@ export function normalizeRuntimeMaxTokens({
     maxOutputTokens: clampedMaxTokens
   })
   return clampedMaxTokens
+}
+
+function isMimoV25TextModel(modelId?: string | null) {
+  const normalizedModelId = modelId?.trim().toLowerCase() ?? ''
+  return /^(?:xiaomi\/)?mimo-v2\.5(?:-pro)?$/.test(normalizedModelId)
 }
 
 function isOpenRouterRuntime(provider?: string | null, connection?: ModelConnectionInfo | null) {

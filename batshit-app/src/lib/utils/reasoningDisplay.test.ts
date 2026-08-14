@@ -49,9 +49,9 @@ describe('reasoningDisplay utilities', () => {
     expect(text).toBe('Checking constraints...')
   })
 
-  it('explicitly requests structured MiMo thinking even when Display Reasoning is off', () => {
+  it('routes Gateway MiMo to Xiaomi without changing its reasoning mode', () => {
     const options = withReasoningProviderOptions(
-      { gateway: { only: ['xiaomi'] } },
+      { gateway: { caching: 'auto' } },
       {
         provider: 'xiaomi',
         modelId: 'xiaomi/mimo-v2.5',
@@ -65,9 +65,27 @@ describe('reasoningDisplay utilities', () => {
     )
 
     expect(options).toEqual({
-      gateway: { only: ['xiaomi'] },
-      xiaomi: { thinking: { type: 'enabled' } },
+      gateway: { caching: 'auto', only: ['xiaomi'] },
     })
+  })
+
+  it('preserves an explicit MiMo Gateway routing choice', () => {
+    const options = withReasoningProviderOptions(
+      { gateway: { order: ['xiaomi', 'deepinfra'] } },
+      {
+        provider: 'xiaomi',
+        modelId: 'xiaomi/mimo-v2.5',
+        connection: {
+          id: 'vercel-gateway',
+          type: 'vercel-gateway',
+        },
+        capabilities: { reasoning: true },
+        showReasoning: true,
+      },
+    )
+
+    expect(options?.gateway?.order).toEqual(['xiaomi', 'deepinfra'])
+    expect(options?.gateway?.only).toBeUndefined()
   })
 
   it('preserves an explicit MiMo thinking override', () => {

@@ -72,6 +72,18 @@ function looksReasoningCapable(args: ReasoningOptionsArgs): boolean {
   ])
 }
 
+function usesVercelGateway(args: ReasoningOptionsArgs): boolean {
+  return [
+    args.connection?.id,
+    args.connection?.type,
+    args.connection?.service,
+  ].some(
+    (value) =>
+      typeof value === 'string' &&
+      value.trim().toLowerCase() === 'vercel-gateway',
+  )
+}
+
 /**
  * Some reasoning-capable OpenAI-compatible models stream their reasoning inside
  * ordinary text using XML-style tags instead of a structured reasoning field.
@@ -94,20 +106,23 @@ export function withReasoningProviderOptions(
 
   const providerKey = inferProviderKey(args)
 
-  // MiMo defaults to thinking mode, but some OpenAI-compatible routes collapse
-  // the reasoning and final answer into one tagged text block when that default
-  // is left implicit. Explicitly requesting Xiaomi's thinking contract makes
-  // reasoning_content and content arrive as separate stream fields. Keep this
-  // independent of Display Reasoning so hiding the panel never changes model
-  // behavior or leaks reasoning back into ordinary assistant text.
+  // Gateway's DeepInfra MiMo route can emit one unterminated <think> block and
+  // no final answer. The creator-hosted Xiaomi route emits structured reasoning
+  // and text parts, so prefer it for Batshit's reasoning/display contract. Do
+  // not add a Xiaomi-specific thinking option: Xiaomi's default already emits
+  // the structured parts, and preserving the original request shape avoids
+  // coupling Display Reasoning to model behavior. Explicit user routing wins.
   if (providerKey === 'mimo') {
     const next = cloneProviderOptions(providerOptions)
-    const xiaomi = { ...(next.xiaomi ?? {}) }
-    if (xiaomi.thinking === undefined) {
-      xiaomi.thinking = { type: 'enabled' }
+    if (usesVercelGateway(args)) {
+      const gateway = { ...(next.gateway ?? {}) }
+      if (gateway.only === undefined && gateway.order === undefined) {
+        gateway.only = ['xiaomi']
+      }
+      next.gateway = gateway
     }
-    next.xiaomi = xiaomi
-    return next
+
+    return Object.keys(next).length > 0 ? next : providerOptions
   }
 
   if (!args.showReasoning) {
