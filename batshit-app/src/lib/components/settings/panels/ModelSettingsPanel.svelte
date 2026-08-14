@@ -75,6 +75,7 @@ import {
 } from '$lib/utils/modelOutputTokens'
 import type { CatalogModel, CatalogConnectionOption } from '$lib/types/modelCatalog'
 import {
+  CATALOG_ROLE_OPTIONS,
   almostEqual,
   formatCompatibilityLabel,
   formatCurrencyDisplay,
@@ -91,7 +92,8 @@ import {
   parseFormattedInteger,
   parseFormattedNumber,
   resolveConnectionIconKey,
-  toComparableNumber
+  toComparableNumber,
+  type CatalogRoleFilter
 } from '$lib/components/settings/models/modelSettingsFormatters'
 import { themeStore } from '$lib/stores/theme'
 	import * as savedModelsStore from '$lib/stores/savedModels.svelte'
@@ -248,14 +250,6 @@ type CatalogProviderOption = {
   value: string
   n8nSupported: boolean
 }
-
-const CATALOG_ROLE_OPTIONS = [
-  { value: 'all', label: 'All' },
-  { value: 'chat', label: 'Chat' },
-  { value: 'visual', label: 'Visual' },
-  { value: 'audio', label: 'Audio' },
-  { value: 'utility', label: 'Utility' }
-] as const
 
 const CAPABILITY_LABELS: { key: keyof ModelCapabilities; label: string }[] = [
   { key: 'streaming', label: 'Streaming' },
@@ -518,7 +512,7 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
   let catalogError = $state<string | null>(null)
   let selectedCatalogProvider = $state('')
   let selectedCatalogModelId = $state('')
-  let catalogRoleFilter = $state<'all' | 'chat' | 'visual' | 'audio' | 'utility'>('all')
+  let catalogRoleFilter = $state<CatalogRoleFilter>('all')
   let catalogSelectionDirty = $state(false)
   let lastAutomaticCatalogSyncSignature = ''
   let catalogViewerOpen = $state(false)
@@ -526,7 +520,7 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
   let wasActive = $state(false)
   let catalogViewerProvider = $state('all')
   let catalogViewerConnection = $state('all')
-  let catalogViewerRole = $state<'all' | 'chat' | 'visual' | 'audio' | 'utility'>('all')
+  let catalogViewerRole = $state<CatalogRoleFilter>('all')
   let catalogViewerSearch = $state('')
   let catalogViewerLimit = $state(100)
   let lastCatalogViewerFilterSignature = ''
@@ -639,7 +633,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
       }
     }
 
-    if (catalogRoleFilter !== 'all') {
+    if (catalogRoleFilter !== 'all' && catalogRoleFilter !== 'vision') {
       return catalogRoleFilter
     }
 
@@ -3217,7 +3211,7 @@ $effect(() => {
             variant="outline"
             size="sm"
             class="max-w-full"
-            aria-label="Catalog role filter"
+            aria-label="Catalog model type filter"
             disabled={catalogLoading || manualEntryConnectionActive}
           >
             {#each CATALOG_ROLE_OPTIONS as option (option.value)}
@@ -3460,6 +3454,9 @@ $effect(() => {
             modelId: selectedCatalogEntry?.modelId ?? selectedCatalogModel.name,
             idVariants: selectedCatalogModel.idVariants ?? null
           })}
+          {@const selectedCatalogCapabilities = catalogFeaturesToCapabilities(
+            selectedCatalogModel.features ?? null
+          )}
           <Collapsible.Root bind:open={catalogDetailsOpen}>
             <div class="batshit-settings-disclosure-row is-catalog-details">
               <Collapsible.Trigger class="batshit-settings-disclosure-trigger batshit-settings-catalog-details-trigger">
@@ -3541,6 +3538,20 @@ $effect(() => {
                       {/each}
                     </p>
                   {/if}
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="batshit-settings-inline-strong">Capabilities:</span>
+                    {#if selectedCatalogCapabilities}
+                      {#each CAPABILITY_LABELS as capability (capability.key)}
+                        {#if selectedCatalogCapabilities[capability.key]}
+                          <Badge variant="outline" class="batshit-settings-child-label">
+                            {capability.label}
+                          </Badge>
+                        {/if}
+                      {/each}
+                    {:else}
+                      <span>Not reported</span>
+                    {/if}
+                  </div>
                   {#if selectedCatalogModel.idVariants && Object.keys(selectedCatalogModel.idVariants).length > 1}
                     <div class="space-y-1">
                       <p class="batshit-settings-inline-strong">Known ID variants:</p>
