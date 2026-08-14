@@ -63,6 +63,12 @@ Give presets names you'll actually recognize:
 
 Because a preset pins the connection too, you can save the same model more than once on different routes — direct versus gateway versus OpenRouter — without them colliding. That's useful when you want, say, a cheap gateway version for everyday chat and a direct-provider version for a specific agent.
 
+### Reasoning from OpenAI-compatible models
+
+Reasoning-capable models do not all send their thinking the same way. Some providers return a dedicated reasoning field, while models such as MiMo or some DeepSeek/open-model routes may place it inside `<think>...</think>` tags in the ordinary text stream.
+
+For `API` agents, Batshit normalizes both formats into the same reasoning panel when the preset is marked reasoning-capable or the model/provider is a known MiMo or DeepSeek path. **Display Reasoning** controls whether that panel is shown, and **Preserve Reasoning** controls whether it remains after the live response. The tags and their contents do not become part of the normal assistant answer.
+
 ## How presets connect to keys and Local AI
 
 Presets sit in the middle of three things:

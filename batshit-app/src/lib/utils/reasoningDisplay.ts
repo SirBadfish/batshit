@@ -42,12 +42,15 @@ function inferProviderKey(args: ReasoningOptionsArgs): string {
   if (textIncludesAny(joined, ['google', 'gemini'])) return 'google'
   if (textIncludesAny(joined, ['zai', 'z.ai', 'glm'])) return 'zai'
   if (textIncludesAny(joined, ['deepseek', 'r1'])) return 'deepseek'
+  if (textIncludesAny(joined, ['xiaomi', 'mimo'])) return 'mimo'
   if (textIncludesAny(joined, ['openai', 'gpt-', 'gpt_', 'o1', 'o3', 'o4', 'o5'])) return 'openai'
   return ''
 }
 
 function looksReasoningCapable(args: ReasoningOptionsArgs): boolean {
   if (args.capabilities?.reasoning === true) return true
+  const providerKey = inferProviderKey(args)
+  if (providerKey === 'deepseek' || providerKey === 'mimo') return true
   const model = (args.modelId ?? '').toLowerCase()
   return textIncludesAny(model, [
     'gpt-5',
@@ -63,9 +66,22 @@ function looksReasoningCapable(args: ReasoningOptionsArgs): boolean {
     'claude-sonnet-4',
     'deepseek-reasoner',
     'deepseek-r1',
+    'mimo-v2.5',
     'glm-',
     'r1',
   ])
+}
+
+/**
+ * Some reasoning-capable OpenAI-compatible models stream their reasoning inside
+ * ordinary text using XML-style tags instead of a structured reasoning field.
+ * Resolve the tag at the request boundary so the AI SDK can normalize it before
+ * Batshit's normal reasoning display/persistence pipeline sees the stream.
+ */
+export function resolveTaggedReasoningTagName(
+  args: ReasoningOptionsArgs,
+): 'think' | null {
+  return looksReasoningCapable(args) ? 'think' : null
 }
 
 export function withReasoningDisplayProviderOptions(
