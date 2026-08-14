@@ -76,6 +76,7 @@ import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
 import {
   collectReasoningTextFromFinish,
   extractReasoningTextFromRawChunk,
+  resolveTaggedReasoningTagName,
   withReasoningDisplayProviderOptions,
 } from '$lib/utils/reasoningDisplay'
 import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
@@ -4740,6 +4741,13 @@ async function handleBatshitAgentStream({
         showReasoning,
       },
     )
+    const taggedReasoningTagName = resolveTaggedReasoningTagName({
+      provider: requestProviderId,
+      modelId,
+      connection,
+      capabilities,
+      showReasoning,
+    })
 
     return {
       sessionId,
@@ -4799,6 +4807,7 @@ async function handleBatshitAgentStream({
       reserveToolZipIdForCall({ toolCallId, toolName, zipId }),
     abortSignal: streamAbortSignal,
     simulateStreamingEffect: shouldSimulateStreamingEffect,
+    taggedReasoningTagName,
     onFinish: async ({
       text,
       steps,

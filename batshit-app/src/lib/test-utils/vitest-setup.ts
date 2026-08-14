@@ -467,6 +467,15 @@ const aiModuleMock = {
   tool: vi.fn((config: any) => config),
   dynamicTool: vi.fn((config: any) => config),
   stepCountIs: vi.fn((count: number) => ({ type: 'step-count', count })),
+  extractReasoningMiddleware: vi.fn((config: any) => ({
+    type: 'extract-reasoning-middleware',
+    ...config
+  })),
+  wrapLanguageModel: vi.fn(({ model, middleware }: any) => ({
+    type: 'wrapped-language-model',
+    model,
+    middleware
+  })),
   createGateway: vi.fn(() => (modelId: string) => ({ modelId })),
   jsonSchema: vi.fn((schema: any) => schema),
   asSchema: vi.fn((schema: any) => ({ jsonSchema: schema })),

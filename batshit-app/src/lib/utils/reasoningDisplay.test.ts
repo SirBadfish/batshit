@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   collectReasoningTextFromFinish,
   extractReasoningTextFromRawChunk,
+  resolveTaggedReasoningTagName,
   withReasoningDisplayProviderOptions,
 } from './reasoningDisplay'
 
@@ -46,6 +47,112 @@ describe('reasoningDisplay utilities', () => {
     })
 
     expect(text).toBe('Checking constraints...')
+  })
+
+  it('normalizes think-tag reasoning for MiMo even without catalog capability metadata', () => {
+    const tagName = resolveTaggedReasoningTagName({
+      provider: 'mimo',
+      modelId: 'mimo-v2.5-pro',
+      connection: {
+        id: 'direct:mimo',
+        type: 'direct',
+        service: 'mimo',
+      },
+      capabilities: null,
+      showReasoning: false,
+    })
+
+    expect(tagName).toBe('think')
+  })
+
+  it('normalizes think-tag reasoning for DeepSeek even without catalog capability metadata', () => {
+    const tagName = resolveTaggedReasoningTagName({
+      provider: 'deepseek',
+      modelId: 'deepseek-v4-pro',
+      connection: {
+        id: 'direct:deepseek',
+        type: 'direct',
+        service: 'deepseek',
+      },
+      capabilities: null,
+      showReasoning: true,
+    })
+
+    expect(tagName).toBe('think')
+  })
+
+  it('normalizes think-tag reasoning for custom models declared reasoning-capable', () => {
+    const tagName = resolveTaggedReasoningTagName({
+      provider: 'custom_local_runtime',
+      modelId: 'private-reasoning-model',
+      capabilities: { reasoning: true },
+      showReasoning: true,
+    })
+
+    expect(tagName).toBe('think')
+  })
+
+  it('leaves ordinary non-reasoning model text untouched', () => {
+    const tagName = resolveTaggedReasoningTagName({
+      provider: 'anthropic',
+      modelId: 'claude-3-5-haiku',
+      capabilities: { reasoning: false },
+      showReasoning: true,
+    })
+
+    expect(tagName).toBeNull()
+  })
+
+  it('uses the installed AI SDK to extract think tags split across stream chunks', async () => {
+    const { extractReasoningMiddleware } = await vi.importActual<typeof import('ai')>('ai')
+    const middleware = extractReasoningMiddleware({ tagName: 'think' })
+    const upstream = [
+      { type: 'text-start', id: 'text-0' },
+      { type: 'text-delta', id: 'text-0', delta: '<thi' },
+      { type: 'text-delta', id: 'text-0', delta: 'nk>Checking constraints' },
+      { type: 'text-delta', id: 'text-0', delta: ' carefully.</th' },
+      { type: 'text-delta', id: 'text-0', delta: 'ink>The final answer.' },
+      { type: 'text-end', id: 'text-0' },
+    ]
+
+    const transformed = await middleware.wrapStream!({
+      doStream: async () => ({
+        stream: new ReadableStream({
+          start(controller) {
+            for (const part of upstream) controller.enqueue(part as any)
+            controller.close()
+          },
+        }),
+        request: { body: null },
+      }),
+    } as any)
+
+    const parts: any[] = []
+    const reader = transformed.stream.getReader()
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      parts.push(value)
+    }
+
+    expect(
+      parts
+        .filter((part) => part.type === 'reasoning-delta')
+        .map((part) => part.delta)
+        .join(''),
+    ).toBe('Checking constraints carefully.')
+    expect(
+      parts
+        .filter((part) => part.type === 'text-delta')
+        .map((part) => part.delta)
+        .join(''),
+    ).toBe('The final answer.')
+    expect(parts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'reasoning-start' }),
+        expect.objectContaining({ type: 'reasoning-end' }),
+      ]),
+    )
   })
 
   it('collects final SDK reasoning parts into display text', () => {

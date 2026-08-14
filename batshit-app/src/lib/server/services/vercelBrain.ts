@@ -13,6 +13,8 @@ import {
   tool,
   dynamicTool,
   stepCountIs,
+  extractReasoningMiddleware,
+  wrapLanguageModel,
   type LanguageModel,
   type ModelMessage,
   type Experimental_DownloadFunction
@@ -235,6 +237,7 @@ export interface NativeModeRequest extends ThinkRequest {
   claudeSettings?: ClaudeRuntimeSettings | null
   projectPath?: string | null
   simulateStreamingEffect?: boolean
+  taggedReasoningTagName?: 'think' | null
   onFinish?: (params: {
     text: string
     usage?: any
@@ -372,7 +375,12 @@ export class VercelAIBrain {
       }
 
       // Get model instance from ProviderManager
-      const model = await this.getModel(request.model, request.connection, request.userId)
+      const model = await this.getModel(
+        request.model,
+        request.connection,
+        request.userId,
+        request.taggedReasoningTagName,
+      )
 
       // Convert messages - uses existing compilation!
       // NEW (SA-002): Pass sessionId and userId for clip resolution
@@ -1462,14 +1470,33 @@ export class VercelAIBrain {
   private async getModel(
     modelName: string,
     connection?: ModelConnectionInfo | null,
-    userId?: string | null
+    userId?: string | null,
+    taggedReasoningTagName?: NativeModeRequest['taggedReasoningTagName'],
   ): Promise<LanguageModel> {
     const manager = await this.getProviderManagerForUser(userId)
     const transport = connection?.type
     const service = connection?.service ?? undefined
-    return manager.getModel(modelName, {
+    const model = manager.getModel(modelName, {
       transport,
       service
+    })
+    if (!taggedReasoningTagName) return model
+
+    if (
+      typeof model !== 'object' ||
+      model === null ||
+      model.specificationVersion !== 'v3'
+    ) {
+      throw new Error(
+        `[VercelBrain API] Tagged reasoning extraction requires an AI SDK v3 model instance for "${modelName}"`,
+      )
+    }
+
+    return wrapLanguageModel({
+      model,
+      middleware: extractReasoningMiddleware({
+        tagName: taggedReasoningTagName,
+      }),
     })
   }
 
@@ -2449,7 +2476,12 @@ export class VercelAIBrain {
     })
 
     try {
-      const model = await this.getModel(request.model, request.connection, request.userId)
+      const model = await this.getModel(
+        request.model,
+        request.connection,
+        request.userId,
+        request.taggedReasoningTagName,
+      )
       // NEW (SA-002): Pass sessionId and userId for clip resolution
       const baseMessages = await this.convertMessages(
         request.messages,

@@ -7,14 +7,25 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { VercelAIBrain } from '../vercelBrain'
 import type { NativeModeRequest } from '../vercelBrain'
 import { compileManagedSubagentSystemPrompt } from '../subagentRunner'
-import { streamText, convertToModelMessages, tool, stepCountIs } from 'ai'
+import {
+  convertToModelMessages,
+  extractReasoningMiddleware,
+  stepCountIs,
+  streamText,
+  tool,
+  wrapLanguageModel,
+} from 'ai'
 import { redis } from '$lib/server/redis'
 
 const providerMocks = vi.hoisted(() => ({
   providerManagerFactory: () => ({
     getModel: vi.fn().mockReturnValue({
+      specificationVersion: 'v3',
       provider: 'anthropic',
-      modelId: 'claude-3-5-sonnet'
+      modelId: 'claude-3-5-sonnet',
+      supportedUrls: {},
+      doGenerate: vi.fn(),
+      doStream: vi.fn(),
     }),
     listAvailableModels: vi.fn().mockReturnValue([
       { id: 'anthropic/claude-3-5-sonnet', name: 'Claude 3.5 Sonnet' }
@@ -658,6 +669,41 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       ).toEqual({
         type: 'ephemeral'
       })
+    })
+
+    it('wraps think-tag reasoning models before streaming', async () => {
+      const request: NativeModeRequest = {
+        messages: [{ role: 'user', content: 'Reason through this' }],
+        model: 'mimo-v2.5-pro',
+        sessionId: 'test-session',
+        messageId: 'test-message',
+        taggedReasoningTagName: 'think'
+      }
+
+      await brain.streamNativeMode(request)
+
+      expect(extractReasoningMiddleware).toHaveBeenCalledWith({
+        tagName: 'think'
+      })
+      expect(wrapLanguageModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: expect.objectContaining({
+            modelId: 'claude-3-5-sonnet'
+          }),
+          middleware: expect.objectContaining({
+            type: 'extract-reasoning-middleware',
+            tagName: 'think'
+          })
+        })
+      )
+
+      const callArgs = vi.mocked(streamText).mock.calls.at(-1)?.[0] as any
+      expect(callArgs.model).toEqual(
+        expect.objectContaining({
+          type: 'wrapped-language-model',
+          middleware: expect.objectContaining({ tagName: 'think' })
+        })
+      )
     })
 
     it('forwards final SDK reasoning to the route onFinish callback', async () => {
