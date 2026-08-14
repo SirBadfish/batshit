@@ -1,10 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { describe, expect, it, vi } from 'vitest'
 
 import HairImportWizard from './HairImportWizard.svelte'
 import type { HairImportInspection, HairImportProposalSet } from './hairImportUiState'
-
-afterEach(cleanup)
 
 function inspection(): HairImportInspection {
   return {

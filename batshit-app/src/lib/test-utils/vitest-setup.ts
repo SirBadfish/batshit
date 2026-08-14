@@ -1,6 +1,12 @@
-import { vi } from 'vitest'
+import { afterEach, vi } from 'vitest'
 // Extend expect with DOM matchers (toBeInTheDocument, toBeDisabled, etc.)
 import '@testing-library/jest-dom/vitest'
+import { waitForDelayedBodyScrollCleanup } from './delayedBodyScrollCleanup'
+
+// Svelte Testing Library owns component cleanup. This earlier-registered global
+// hook runs after its per-file hook and lets Bits UI finish a delayed body unlock
+// before Vitest tears down jsdom.
+afterEach(waitForDelayedBodyScrollCleanup)
 
 // Force tests to use the test Redis DB (15) unless explicitly opting into real dev data.
 // This prevents accidental wipes of DB0 when suites bypass mocks.
