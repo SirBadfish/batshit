@@ -71,8 +71,7 @@ function colorFromSrgb(rgb: [number, number, number]) {
 function buildCanvasMaterial(
   source: THREE.Material,
   layerTexture: THREE.Texture,
-  layer: FacialArtworkArtworkLayer,
-  role: FacialArtworkRoleDefinition
+  layer: FacialArtworkArtworkLayer
 ) {
   const material = new MeshBasicNodeMaterial()
   applySharedMaterialProperties(material, source)
@@ -84,10 +83,10 @@ function buildCanvasMaterial(
   material.premultipliedAlpha = false
   material.depthTest = true
   material.depthWrite = false
-  material.side =
-    role.target.left.bindingKind === 'eye-aperture-liner'
-      ? THREE.FrontSide
-      : THREE.DoubleSide
+  // Brows and the eye-aperture liner are animated surface artwork. Blink can
+  // legitimately roll sections of the liner through their back side even
+  // when the authored neutral winding and face seating are correct.
+  material.side = THREE.DoubleSide
   material.alphaTest = 0
   material.alphaToCoverage = false
   material.blending = THREE.NormalBlending
@@ -275,7 +274,7 @@ export class FacialArtworkEngineRuntime {
             visible,
             material: visible
               ? this.buildMaterialSet(original.material, candidate.materials, (source) =>
-                  buildCanvasMaterial(source, textureValue!, eyeState.artwork!, role)
+                  buildCanvasMaterial(source, textureValue!, eyeState.artwork!)
                 )
               : original.material
           })

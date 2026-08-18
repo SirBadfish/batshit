@@ -184,7 +184,7 @@ describe('FacialArtworkEngineRuntime v4', () => {
     ).toBe(4)
   })
 
-  it('keeps the shared-seam liner FrontSide with ordinary depth testing', async () => {
+  it('keeps the animated shared-seam liner visible from both sides with ordinary depth testing', async () => {
     const value = runtimeFixture()
     const state = createDefaultFacialArtworkState(value.definitionValue)
     const role = state.roles.lashes_eye_outline
@@ -204,7 +204,7 @@ describe('FacialArtworkEngineRuntime v4', () => {
     )
     await runtime.apply(state)
     const liner = value.root.getObjectByName('left-liner') as THREE.Mesh
-    expect((liner.material as THREE.Material).side).toBe(THREE.FrontSide)
+    expect((liner.material as THREE.Material).side).toBe(THREE.DoubleSide)
     expect((liner.material as THREE.Material).depthTest).toBe(true)
     expect((liner.material as THREE.Material).depthWrite).toBe(false)
   })
