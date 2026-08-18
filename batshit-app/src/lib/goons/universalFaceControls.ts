@@ -81,6 +81,8 @@ const SECTION_LABELS: Record<UniversalFaceSectionId, string> = {
   'custom-morphs': 'Custom Morphs'
 }
 
+const CANONICAL_ARKIT_RAW_TARGET_NAMES = new Set<string>(ARKIT_52_CHANNEL_ORDER)
+
 const OVR_VISEME_LABELS: Record<string, string> = {
   PP: 'P / B / M',
   FF: 'F / V',
@@ -355,7 +357,10 @@ export function buildUniversalFaceControlModel(
     if (
       targets.length === 0 ||
       managedDefinitionIds.has(definition.id) ||
-      targets.some((target) => managedTargets.has(target))
+      targets.some(
+        (target) =>
+          managedTargets.has(target) || CANONICAL_ARKIT_RAW_TARGET_NAMES.has(target)
+      )
     ) continue
     append(
       'custom-morphs',
@@ -370,6 +375,12 @@ export function buildUniversalFaceControlModel(
         ? [{ id: sectionId, label: SECTION_LABELS[sectionId], controls }]
         : []
     }),
-    managedRawMorphTargetNames: [...managedTargets].sort((left, right) => left.localeCompare(right))
+    // Canonical ARKit names are reserved even when a review/legacy package
+    // declares only a partial channel map. Cue normalization rejects those
+    // names from raw-morph payloads, so exposing them as Custom Morphs would
+    // create sliders that can save a value but can never drive the Goon.
+    managedRawMorphTargetNames: [
+      ...new Set([...managedTargets, ...CANONICAL_ARKIT_RAW_TARGET_NAMES])
+    ].sort((left, right) => left.localeCompare(right))
   }
 }
