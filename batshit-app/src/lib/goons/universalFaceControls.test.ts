@@ -94,4 +94,35 @@ describe('universal face control model', () => {
       ])
     )
   })
+
+  it('never exposes canonical ARKit names as inert Custom Morphs for a partial map', () => {
+    const partialEyeDefinitions = [
+      'eyeBlinkLeft',
+      'eyeBlinkRight',
+      'eyeSquintLeft',
+      'eyeSquintRight',
+      'eyeWideLeft',
+      'eyeWideRight'
+    ].map((channel) => ({ id: channel, morphTargets: [channel] }))
+    const model = buildUniversalFaceControlModel({
+      arkitDefinitions: partialEyeDefinitions,
+      customMorphDefinitions: [
+        ...partialEyeDefinitions,
+        { id: 'earWiggle', morphTargets: ['BS_Custom_EarWiggle'] }
+      ],
+      classicSections: NORMAL_FACE_CONTROL_SECTIONS
+    })
+
+    expect(model.sections.find((section) => section.id === 'custom-morphs')?.controls).toEqual([
+      expect.objectContaining({ id: 'custom:earWiggle', morphTargets: ['BS_Custom_EarWiggle'] })
+    ])
+    expect(model.managedRawMorphTargetNames).toEqual(
+      expect.arrayContaining(partialEyeDefinitions.map((definition) => definition.id))
+    )
+    expect(
+      model.sections
+        .find((section) => section.id === 'eyes')
+        ?.controls.some((control) => control.faceControlId === 'eyelids_left')
+    ).toBe(true)
+  })
 })

@@ -52,7 +52,8 @@ Current truth:
 - if the optional face contract resolves to real morph targets, Batshit can now drive:
   - semantic expression targets
   - lip sync visemes
-  - raw morph overrides
+  - package-specific raw morph overrides; canonical ARKit target names stay in
+    the structured face-control lane and are not valid raw overrides
 - Advanced/Blender is the current mainstream Blender-authored path because it still rides the normal VRM runtime.
 - Supported first-party Advanced/GLB packages may declare exact-definition-bound Appearance Dials, Facial Artwork, and Eye Appearance. They prepare their first verified runtime version automatically; normal users do not manage the internal Recipe/build lifecycle.
 - **Body Appearance** and **Face Appearance** always show their complete package-authored control catalogs; there is no Core/All visibility filter. Body owns Stature, Head, Neck, Hands & Feet, Arms, Legs, Waist, Chest, Hips, Butt, and Advanced controls in their anatomical regions. Face owns Brows, Eyes, Nose, Mouth & Lips, Cheeks, Chin & Jaw, and Ears.
