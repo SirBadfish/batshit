@@ -53,13 +53,13 @@ function state(): RecipeStateSnapshot {
     stateSha256: SHA_C,
     appearanceDials: appearanceState(),
     siblings: [
-      sibling('facialArtwork', 'facial-artwork-state/v4', SHA_A, {
-        schemaVersion: 'facial-artwork-state/v4',
+      sibling('facialArtwork', 'facial-artwork-state/v6', SHA_A, {
+        schemaVersion: 'facial-artwork-state/v6',
         definitionSha256: SHA_A,
         roles: {}
       }),
-      sibling('eyeAppearance', 'eye-appearance-state/v3', SHA_B, {
-        schemaVersion: 'eye-appearance-state/v3',
+      sibling('eyeAppearance', 'eye-appearance-state/v5', SHA_B, {
+        schemaVersion: 'eye-appearance-state/v5',
         definitionSha256: SHA_B,
         values: {}
       }),
@@ -115,6 +115,21 @@ function state(): RecipeStateSnapshot {
       })
     ]
   }
+}
+
+function legacyMigrationPreviewState(): RecipeStateSnapshot {
+  const legacy = state()
+  legacy.siblings[0] = sibling('facialArtwork', 'facial-artwork-state/v5', SHA_A, {
+    schemaVersion: 'facial-artwork-state/v5',
+    definitionSha256: SHA_A,
+    roles: {}
+  })
+  legacy.siblings[1] = sibling('eyeAppearance', 'eye-appearance-state/v4', SHA_B, {
+    schemaVersion: 'eye-appearance-state/v4',
+    definitionSha256: SHA_B,
+    values: {}
+  })
+  return legacy
 }
 
 function recipeOwner(recipeState = state()): GoonRecipeV2 {
@@ -256,15 +271,21 @@ describe('Recipe runtime projection', () => {
     expect(() => findRetiredHairRecipeSibling(retired)).toThrow(/more than one Hair sibling/)
   })
 
-  it('projects immutable Recipe Source and all sibling state for the editor only', () => {
-    const liveGoon = goon()
-    const editorGoon = projectGoonRecipeSource(liveGoon)
+  it('projects exact legacy siblings only through the explicit migration Current preview', () => {
+    const legacy = legacyMigrationPreviewState()
+    const liveGoon = goon(legacy)
+    expect(() => projectGoonRecipeSource(liveGoon)).toThrow(
+      /must use facial-artwork-state\/v6/
+    )
+    const editorGoon = projectGoonRecipeSource(liveGoon, {
+      allowLegacyMigrationPreview: true
+    })
 
     expect(editorGoon.customAvatar?.model?.url).toBe('/source/avatar.glb')
     expect(editorGoon.customAvatar?.manifest?.url).toBe('/source/avatar.json')
     expect(editorGoon.appearanceDials?.values.head_size).toBe(0.4)
-    expect(editorGoon.facialArtwork?.schemaVersion).toBe('facial-artwork-state/v4')
-    expect(editorGoon.eyeAppearance?.schemaVersion).toBe('eye-appearance-state/v3')
+    expect(editorGoon.facialArtwork?.schemaVersion).toBe('facial-artwork-state/v5')
+    expect(editorGoon.eyeAppearance?.schemaVersion).toBe('eye-appearance-state/v4')
     expect(editorGoon.oralAppearance?.schemaVersion).toBe('oral-appearance-state/v1')
     expect(editorGoon.nailSurface?.schemaVersion).toBe('nail-surface-state/v1')
     expect(editorGoon.lipArtworkPresence?.enabled).toBe(false)
@@ -316,8 +337,8 @@ describe('Recipe runtime projection', () => {
   it('rejects an ambiguous sibling projection instead of mixing revisions', () => {
     const ambiguous = state()
     ambiguous.siblings.push(
-      sibling('facial-artwork', 'facial-artwork-state/v4', SHA_A, {
-        schemaVersion: 'facial-artwork-state/v4',
+      sibling('facial-artwork', 'facial-artwork-state/v6', SHA_A, {
+        schemaVersion: 'facial-artwork-state/v6',
         definitionSha256: SHA_A
       })
     )
@@ -332,7 +353,7 @@ describe('Recipe runtime projection', () => {
     }
 
     expect(() => projectGoonRecipeSource(goon(invalid))).toThrow(
-      /must use facial-artwork-state\/v4/
+      /must use facial-artwork-state\/v6/
     )
   })
 

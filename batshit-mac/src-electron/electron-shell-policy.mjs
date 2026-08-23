@@ -1,4 +1,4 @@
-import { resolve, sep } from 'node:path';
+import { basename, extname, isAbsolute, resolve, sep } from 'node:path';
 
 import {
   DESKTOP_GOON_WINDOW_ROLES
@@ -16,6 +16,9 @@ export const SUPERVISOR_COMMANDS = Object.freeze({
 
 const BASE_PORTS = Object.freeze([5620, 5640]);
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
+export const MAX_GOON_PACKAGE_SELECTION_BYTES = 1024 * 1024 * 1024;
+export const MAX_GOON_PACKAGE_READ_CHUNK_BYTES = 4 * 1024 * 1024;
+const GOON_PACKAGE_HANDLE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function normalizeLoopbackOrigin(value) {
   if (typeof value !== 'string' || !value.trim()) return null;
@@ -243,4 +246,67 @@ export function validateSaveFileOptions(value) {
     result[key] = entry;
   }
   return result;
+}
+
+export function validateGoonPackageFileSelection(filePath, stats) {
+  if (
+    typeof filePath !== 'string' ||
+    !filePath ||
+    filePath.includes('\0') ||
+    filePath.length > 4096 ||
+    !isAbsolute(filePath)
+  ) {
+    throw new Error('The selected Goon package path is invalid.');
+  }
+  const extension = extname(filePath).toLowerCase();
+  if (extension !== '.bgoon' && extension !== '.zip') {
+    throw new Error('Goon File Package must be a .bgoon or .zip archive.');
+  }
+  if (!stats || typeof stats.isFile !== 'function' || !stats.isFile()) {
+    throw new Error('The selected Goon package is not a regular file.');
+  }
+  if (!Number.isSafeInteger(stats.size) || stats.size <= 0) {
+    throw new Error('The selected Goon package is empty or has an invalid size.');
+  }
+  if (stats.size > MAX_GOON_PACKAGE_SELECTION_BYTES) {
+    throw new Error('The selected Goon package exceeds the 1 GB limit.');
+  }
+  return Object.freeze({
+    name: basename(filePath),
+    size: stats.size,
+    mimeType: 'application/zip'
+  });
+}
+
+export function validateGoonPackageHandleId(value) {
+  if (typeof value !== 'string' || !GOON_PACKAGE_HANDLE_ID.test(value)) {
+    throw new Error('Invalid Goon package selection handle.');
+  }
+  return value;
+}
+
+export function validateGoonPackageReadRequest(value, selectionSize) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Goon package read request must be an object.');
+  }
+  const allowed = new Set(['handleId', 'offset', 'length']);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`Unsupported Goon package read option: ${key}`);
+  }
+  const handleId = validateGoonPackageHandleId(value.handleId);
+  const { offset, length } = value;
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new Error('Invalid Goon package read offset.');
+  }
+  if (
+    !Number.isSafeInteger(length) ||
+    length <= 0 ||
+    length > MAX_GOON_PACKAGE_READ_CHUNK_BYTES
+  ) {
+    throw new Error('Invalid Goon package read length.');
+  }
+  if (!Number.isSafeInteger(selectionSize) || selectionSize <= 0 || offset + length > selectionSize) {
+    throw new Error('Goon package read exceeds the selected file.');
+  }
+  return Object.freeze({ handleId, offset, length });
 }

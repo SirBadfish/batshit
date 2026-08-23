@@ -11,7 +11,7 @@ import {
 export const ANATOMY_FIT_MANIFEST_CONTRACT =
   "anatomy-fit-manifest/v2" as const;
 export const SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT =
-  "socket-eye-anatomy-domain/v1" as const;
+  "socket-eye-anatomy-domain/v2" as const;
 export const ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT =
   "oral-cavity-anatomy-domain/v1" as const;
 
@@ -22,7 +22,7 @@ export type SocketEyeAnatomyFitDomain = {
   bodyTopologySha256: string;
   socketEyeSurfaceDefinitionSha256: string;
   apertureSeamDefinitionSha256: string;
-  compositeCapNodeId: string;
+  physicalEyeNodeId: string;
   lashesEyeOutlineNodeId: string;
 };
 
@@ -130,7 +130,7 @@ function parseDomain(value: unknown, index: number): AnatomyFitManifestDomain {
       "bodyTopologySha256",
       "socketEyeSurfaceDefinitionSha256",
       "apertureSeamDefinitionSha256",
-      "compositeCapNodeId",
+      "physicalEyeNodeId",
       "lashesEyeOutlineNodeId",
     ],
     context,
@@ -141,13 +141,13 @@ function parseDomain(value: unknown, index: number): AnatomyFitManifestDomain {
   if (raw.side !== "left" && raw.side !== "right") {
     fail(`${context}.side must be left or right`);
   }
-  const compositeCapNodeId = stableId(raw.compositeCapNodeId, `${context}.compositeCapNodeId`);
+  const physicalEyeNodeId = stableId(raw.physicalEyeNodeId, `${context}.physicalEyeNodeId`);
   const lashesEyeOutlineNodeId = stableId(
     raw.lashesEyeOutlineNodeId,
     `${context}.lashesEyeOutlineNodeId`,
   );
-  if (compositeCapNodeId === lashesEyeOutlineNodeId) {
-    fail(`${context} cap and liner node ids must differ`);
+  if (physicalEyeNodeId === lashesEyeOutlineNodeId) {
+    fail(`${context} physical-eye and treatment node ids must differ`);
   }
   return {
     contract: SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT,
@@ -165,7 +165,7 @@ function parseDomain(value: unknown, index: number): AnatomyFitManifestDomain {
       raw.apertureSeamDefinitionSha256,
       `${context}.apertureSeamDefinitionSha256`,
     ),
-    compositeCapNodeId,
+    physicalEyeNodeId,
     lashesEyeOutlineNodeId,
   };
 }
@@ -212,10 +212,12 @@ function parsePayload(value: unknown): AnatomyFitManifestPayload {
     fail("all domains must share one topology and bilateral sockets must share one surface and seam");
   }
   const nodes = socketDomains.flatMap((entry) => [
-    entry.compositeCapNodeId,
+    entry.physicalEyeNodeId,
     entry.lashesEyeOutlineNodeId,
   ]);
-  if (new Set(nodes).size !== nodes.length) fail("bilateral cap and liner node ids must be unique");
+  if (new Set(nodes).size !== nodes.length) {
+    fail("bilateral physical-eye and treatment node ids must be unique");
+  }
   return {
     contract: ANATOMY_FIT_MANIFEST_CONTRACT,
     stateSchemaVersion: ANATOMY_FIT_STATE_CONTRACT,

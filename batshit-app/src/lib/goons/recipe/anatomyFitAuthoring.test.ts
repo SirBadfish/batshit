@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AppearanceDialsManifest } from "../appearanceDials.contracts";
-import type { EyeApertureSeamDefinitionV1 } from "../eyeApertureSeam";
-import type { SocketEyeSurfaceDefinitionV1 } from "../socketEyeSurface";
+import type { EyeApertureSeamDefinitionV2 } from "../eyeApertureSeam";
+import type { SocketEyeSurfaceDefinitionV2 } from "../socketEyeSurface";
 import { parseAnatomyFitState } from "./anatomyFitContracts";
 import { computeAnatomyFitSiblingFromEvaluation } from "./anatomyFitAuthoring";
 import {
@@ -26,7 +26,7 @@ import {
 
 vi.mock("./socketEyeSurfaceFit", () => ({
   createSocketEyeAnatomyProof: vi.fn(async ({ surface }: { surface: { side: string } }) => ({
-    contract: "socket-eye-anatomy-proof/v1",
+    contract: "socket-eye-anatomy-proof/v2",
     domain: `socket-eye:${surface.side}`,
     socketEyeSurfaceDefinitionSha256: "d".repeat(64),
     apertureSeamDefinitionSha256: "e".repeat(64),
@@ -60,10 +60,10 @@ function source(): RecipeSourceIdentity {
   };
 }
 
-function surface(): SocketEyeSurfaceDefinitionV1 {
+function surface(): SocketEyeSurfaceDefinitionV2 {
   const side = (name: "left" | "right") => ({
     side: name,
-    nodes: { compositeCap: name === "left" ? "Cap_L" : "Cap_R" },
+    nodes: { physicalEye: name === "left" ? "Eye_L" : "Eye_R" },
     apertureSeamDefinitionSha256: sha("e"),
     cap: {
       minimumHiddenUnderlapMeters: 0.001,
@@ -72,13 +72,13 @@ function surface(): SocketEyeSurfaceDefinitionV1 {
   return {
     definitionSha256: sha("d"),
     runtimeBindings: { left: side("left"), right: side("right") },
-  } as unknown as SocketEyeSurfaceDefinitionV1;
+  } as unknown as SocketEyeSurfaceDefinitionV2;
 }
 
-function seam(): EyeApertureSeamDefinitionV1 {
+function seam(): EyeApertureSeamDefinitionV2 {
   const side = (name: "left" | "right") => ({
     side: name,
-    compositeCapNode: name === "left" ? "Cap_L" : "Cap_R",
+    physicalEyeNode: name === "left" ? "Eye_L" : "Eye_R",
     lashesEyeOutlineNode: name === "left" ? "Liner_L" : "Liner_R",
     capUnderlapMeters: 0.001,
     upperBoundary: { sampleCount: 24, bindingSha256: sha("5") },
@@ -87,7 +87,7 @@ function seam(): EyeApertureSeamDefinitionV1 {
   return {
     definitionSha256: sha("e"),
     runtimeBindings: { left: side("left"), right: side("right") },
-  } as unknown as EyeApertureSeamDefinitionV1;
+  } as unknown as EyeApertureSeamDefinitionV2;
 }
 
 async function definition() {
@@ -106,7 +106,7 @@ async function definition() {
     bodyTopologySha256: sha("c"),
     socketEyeSurfaceDefinitionSha256: sha("d"),
     apertureSeamDefinitionSha256: sha("e"),
-    compositeCapNodeId: side === "left" ? "Cap_L" : "Cap_R",
+    physicalEyeNodeId: side === "left" ? "Eye_L" : "Eye_R",
     lashesEyeOutlineNodeId: side === "left" ? "Liner_L" : "Liner_R",
     })),
   ]);
@@ -219,7 +219,7 @@ const evaluation = {
 } as unknown as AppearanceRecipePhysicalEvaluation;
 
 describe("Anatomy Fit v2 authoring orchestration", () => {
-  it("authors oral coefficients plus both verified cap/liner domains into one sibling", async () => {
+  it("authors all domains when whole-package topology differs from the shared body topology", async () => {
     const oralCavityFit = await oralPackage();
     const input = {
       definition: await definition(),
@@ -227,7 +227,7 @@ describe("Anatomy Fit v2 authoring orchestration", () => {
       eyeApertureSeam: seam(),
       oralCavityFit,
       modelBytes: new Uint8Array([1, 2, 3]),
-      source: source(),
+      source: { ...source(), topologySha256: sha("d") },
       appearanceManifest,
       appearanceDials: {
         contract: "appearance-dial-values/v1" as const,
@@ -258,6 +258,7 @@ describe("Anatomy Fit v2 authoring orchestration", () => {
       "socket-eye:right",
     ]);
     for (const fit of state.fits) {
+      expect(fit.input.source.topologySha256).toBe(sha("c"));
       expect(fit.input.parameters).toEqual([]);
       expect(fit.result.resolvedParameters).toEqual([]);
       if (fit.result.domain === "oral-cavity") {
@@ -270,7 +271,7 @@ describe("Anatomy Fit v2 authoring orchestration", () => {
     }
   });
 
-  it("fails closed when the manifest binds another cap or topology", async () => {
+  it("fails closed when the manifest binds another physical eye or body topology", async () => {
     const oralCavityFit = await oralPackage();
     const staleCap = await definition();
     const left = staleCap.domains.find(
@@ -279,7 +280,7 @@ describe("Anatomy Fit v2 authoring orchestration", () => {
     if (!left || left.contract !== SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT) {
       throw new Error("left test domain is missing");
     }
-    left.compositeCapNodeId = "OtherCap";
+    left.physicalEyeNodeId = "OtherEye";
     await expect(computeAnatomyFitSiblingFromEvaluation({
       definition: staleCap,
       socketEyeSurface: surface(),
@@ -299,7 +300,7 @@ describe("Anatomy Fit v2 authoring orchestration", () => {
       basis: {} as AppearanceRecipePhysicalBasis,
       evaluation,
       resolved: { influences: new Map([["identity.mouth_width", 0]]) } as never,
-    })).rejects.toThrow("another composite-cap node");
+    })).rejects.toThrow("another physical-eye node");
 
     const staleTopology = await definition();
     staleTopology.domains[0]!.bodyTopologySha256 = sha("0");
@@ -322,6 +323,6 @@ describe("Anatomy Fit v2 authoring orchestration", () => {
       basis: {} as AppearanceRecipePhysicalBasis,
       evaluation,
       resolved: { influences: new Map([["identity.mouth_width", 0]]) } as never,
-    })).rejects.toThrow("does not match the verified Recipe Source topology");
+    })).rejects.toThrow("oral-cavity domain references another body topology");
   });
 });

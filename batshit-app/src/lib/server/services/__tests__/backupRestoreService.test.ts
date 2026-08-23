@@ -16,6 +16,12 @@ import {
   createDefaultEyeAppearanceState,
   parseEyeAppearanceDefinition
 } from '$lib/goons/eyeAppearance'
+import { buildFacialArtworkV6DefinitionFixture } from '$lib/goons/__fixtures__/facialArtworkV6'
+import {
+  SOCKET_EYE_HIGHLIGHT_PROJECTION_CONTRACT,
+  SOCKET_EYE_INSET_IRIS_PUPIL_PROJECTION_CONTRACT,
+  SOCKET_EYE_SCLERA_PROJECTION_CONTRACT
+} from '$lib/goons/socketEyeArtworkProjection'
 import {
   GOON_LIVE_BUILD_CONTRACT,
   GOON_RECIPE_AUTHORING_REVISION_CONTRACT,
@@ -60,32 +66,41 @@ const ARTWORK_HASH = 'd'.repeat(64)
 
 function backupEyeDefinition() {
   const runtimeBinding = (side: 'L' | 'R') => ({
-    compositeCapNode: `BS_Eye_${side}_CompositeCap`,
-    irisNeutralRadiusMeters: 0.006,
-    pupilNeutralRadiusRatio: 0.35,
+    physicalEyeNode: `bs_f1_eye_${side.toLowerCase()}_physical`,
+    irisNeutralRadiusMeters: 0.0081,
+    pupilNeutralRadiusRatio: 0.49,
+    neutralPlacement: {
+      horizontalTravelFraction: -0.5,
+      verticalTravelFraction: -0.7
+    },
+    irisHorizontalTravelMeters: 0.002,
     irisVerticalTravelMeters: 0.003,
     edgeSoftnessMeters: 0.0002,
     artworkMappings: {
-      sclera: 'gaze-linked-carrier',
-      iris: 'radial-carrier',
-      pupil: 'radial-carrier',
-      highlight: 'iris-space'
+      sclera: SOCKET_EYE_SCLERA_PROJECTION_CONTRACT,
+      iris: SOCKET_EYE_INSET_IRIS_PUPIL_PROJECTION_CONTRACT,
+      pupil: SOCKET_EYE_INSET_IRIS_PUPIL_PROJECTION_CONTRACT,
+      highlight: SOCKET_EYE_HIGHLIGHT_PROJECTION_CONTRACT
     },
     cornea: { roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.08 }
   })
-  const control = (id: 'iris_size' | 'pupil_size' | 'iris_vertical_position') => ({
+  const control = (
+    id: 'iris_size' | 'pupil_size' | 'iris_horizontal_position' | 'iris_vertical_position'
+  ) => ({
     id,
     label:
       id === 'iris_size'
         ? 'Iris Size'
         : id === 'pupil_size'
           ? 'Pupil Size'
-          : 'Iris Vertical Position',
-    description: `${id} on the fixed cap`,
-    minimum: id === 'iris_size' ? 0.75 : id === 'pupil_size' ? 0 : -1,
-    maximum: id === 'iris_size' ? 1.35 : id === 'pupil_size' ? 2 : 1,
+          : id === 'iris_horizontal_position'
+            ? 'Iris Horizontal Position'
+            : 'Iris Vertical Position',
+    description: `${id} on the physical eye`,
+    minimum: id === 'iris_size' || id === 'pupil_size' ? 0.5 : -1,
+    maximum: id === 'iris_size' || id === 'pupil_size' ? 1.5 : 1,
     step: 0.01,
-    default: id === 'iris_vertical_position' ? 0 : 1,
+    default: id === 'iris_vertical_position' || id === 'iris_horizontal_position' ? 0 : 1,
     unit:
       id === 'iris_size'
         ? 'neutral-multiplier'
@@ -93,23 +108,27 @@ function backupEyeDefinition() {
           ? 'iris-relative-multiplier'
           : 'neutral-travel-fraction',
     linkedBilateral: true,
+    bilateralLaw:
+      id === 'iris_horizontal_position'
+        ? 'mirrored-convergence-divergence'
+        : 'linked-same-value',
     perEyeOverridesAllowed: false,
     runtimeClampingAllowed: false,
-    geometrySemantics: 'Moves artwork coordinates without rotating the cap.'
+    geometrySemantics: 'Moves artwork coordinates without deforming the sphere.'
   })
   return {
-    schemaVersion: 'eye-appearance/v3',
-    stateSchemaVersion: 'eye-appearance-state/v3',
+    schemaVersion: 'eye-appearance/v5',
+    stateSchemaVersion: 'eye-appearance-state/v5',
     status: 'product-export-approved',
     productExportApproved: true,
     definitionSha256: EYE_HASH,
     dependencies: {
       socketEyeSurface: {
-        schemaVersion: 'socket-eye-surface/v1',
+        schemaVersion: 'socket-eye-surface/v2',
         definitionSha256: SOCKET_HASH
       },
       eyeApertureSeam: {
-        schemaVersion: 'eye-aperture-seam/v1',
+        schemaVersion: 'eye-aperture-seam/v2',
         definitionSha256: SEAM_HASH
       }
     },
@@ -123,7 +142,7 @@ function backupEyeDefinition() {
       sclera: [0.92, 0.94, 0.96, 1]
     },
     runtimeBindings: {
-      coordinateSpace: 'socket-eye-surface',
+      coordinateSpace: 'physical-eye-sphere',
       left: runtimeBinding('L'),
       right: runtimeBinding('R'),
       geometryEvidence: {
@@ -132,9 +151,14 @@ function backupEyeDefinition() {
         apertureSeamSha256: '1'.repeat(64)
       }
     },
-    controls: [control('iris_size'), control('pupil_size'), control('iris_vertical_position')],
+    controls: [
+      control('iris_size'),
+      control('pupil_size'),
+      control('iris_horizontal_position'),
+      control('iris_vertical_position')
+    ],
     rangeEvidence: {
-      schemaVersion: 'eye-appearance-range-evidence/v3',
+      schemaVersion: 'eye-appearance-range-evidence/v5',
       sha256: '2'.repeat(64),
       canonicalSha256: '3'.repeat(64)
     }
@@ -142,21 +166,16 @@ function backupEyeDefinition() {
 }
 
 async function backupFacialDefinition() {
-  const definition = JSON.parse(
-    await fs.readFile(
-      path.resolve(process.cwd(), 'static/goons/facial-artwork/v4/facial-artwork-v4.json'),
-      'utf8'
-    )
-  )
+  const definition = structuredClone(buildFacialArtworkV6DefinitionFixture())
   definition.definitionSha256 = ARTWORK_HASH
   definition.dependencies = {
-    eyeAppearance: { schemaVersion: 'eye-appearance/v3', definitionSha256: EYE_HASH },
+    eyeAppearance: { schemaVersion: 'eye-appearance/v5', definitionSha256: EYE_HASH },
     socketEyeSurface: {
-      schemaVersion: 'socket-eye-surface/v1',
+      schemaVersion: 'socket-eye-surface/v2',
       definitionSha256: SOCKET_HASH
     },
     eyeApertureSeam: {
-      schemaVersion: 'eye-aperture-seam/v1',
+      schemaVersion: 'eye-aperture-seam/v2',
       definitionSha256: SEAM_HASH
     }
   }
@@ -563,7 +582,7 @@ describe('backupRestoreService', () => {
       '/uploads/goon_facial_artwork/brow-left.png'
     )
     expect(restoredGoon.eyeAppearance).toMatchObject({
-      schemaVersion: 'eye-appearance-state/v3',
+      schemaVersion: 'eye-appearance-state/v5',
       irisSize: 1.1
     })
   })

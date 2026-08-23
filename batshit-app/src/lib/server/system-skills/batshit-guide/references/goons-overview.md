@@ -32,7 +32,7 @@ The ordinary first-party Advanced/GLB flow is **upload, edit, and Save Goon**:
 - A failed update leaves the previously working Goon usable. **Retry** resumes verified stored work; **Discard** removes only unreferenced pending work.
 - **Restore Previous Version** swaps the complete prior package, appearance, artwork, eye state, and runtime version together.
 
-When a newer supported package is available, choose **Update Goon File**. Batshit offers **Update Goon** only when exact proof passes, **Reset Appearance and Update** only after a safe reset is proven and confirmed, or a clear blocked/ineligible result. **Keep Current** leaves the existing Goon untouched. Exact internal identities, stages, revisions, and proof remain available under **Technical Details** for support and authors.
+When a newer supported package is available, choose **Update Goon File**. Batshit offers **Update Goon** when exact proof passes, asks you to compare **Current / Updated** when a verified file intentionally changes visual presentation, offers **Reset Appearance and Update** only after a safe reset is proven and confirmed, or shows a clear blocked/ineligible result. **Keep Current** leaves the existing Goon untouched. Exact internal identities, stages, revisions, and proof remain available under **Technical Details** for support and authors.
 
 The first Blender-author update contract is limited to supported first-party Advanced/GLB exports. Loose GLBs, hand-patched packages, and independently authored Advanced/GLB updates are not assumed compatible from names or visual similarity. See [Goon setup and packages](setup-and-packages.md#advancedglb-preparation-and-updates) for the full flow and compatibility matrix.
 

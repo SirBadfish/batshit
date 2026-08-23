@@ -535,7 +535,7 @@ describe('Goon Recipe repository', () => {
       pendingAnalysis: {
         analysisId: 'analysis-1',
         analysisRef: {
-          contract: 'recipe-update-analysis-context/v1',
+          contract: 'recipe-update-analysis-context/v3',
           ref: `goon_recipe_document:${USER_ID}:${GOON_ID}:${sha('3')}`,
           sha256: sha('3')
         },

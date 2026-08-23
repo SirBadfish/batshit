@@ -27,6 +27,7 @@ import {
   RECIPE_STRICT_TOLERANCE_PROFILE,
   RECIPE_UPDATE_PROOF_CONTRACT,
   buildRecipeUpdateDirectEdgeKey,
+  recipeTopologyRebuildProofSha256,
   recipeUpdateEdgeSha256,
   type RecipeBehaviorKind,
   type RecipeControlIdentity,
@@ -88,6 +89,8 @@ export type RecipePhysicalMigrationFixtureOptions = {
   fitFamily?: string;
   /** Use the canonical Head Size id so generic Hair-import smoke can share this isolated fixture. */
   hairImportCompatible?: boolean;
+  /** Emit a target with a deliberately different exact mesh inventory. */
+  topologyRebuild?: boolean;
 };
 
 const ZERO_SHA256 = "0".repeat(64);
@@ -248,6 +251,7 @@ function physicalGlb(
   version: "source" | "target",
   runtimeMorphName?: string,
   hairImportCompatible = false,
+  topologyRebuild = false,
 ): Uint8Array {
   const accessors = new FixtureAccessors();
   const bodyPositions = hairImportCompatible
@@ -255,7 +259,9 @@ function physicalGlb(
         -0.3, 1.3, -0.2, 0.3, 1.3, -0.2, -0.3, 1.68, 0.2, 0.3, 1.3, -0.2,
         0.3, 1.68, 0.2, -0.3, 1.68, 0.2,
       ]
-    : [0, 0, 0, 1, 0, 0, 0, 1, 0];
+    : topologyRebuild
+      ? [0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]
+      : [0, 0, 0, 1, 0, 0, 0, 1, 0];
   const basePosition = accessors.floatVec3(bodyPositions);
   const morphNames = [
     ...MORPH_NAMES,
@@ -581,8 +587,14 @@ async function sourcePackageDraft(
   fitFamily = "sa090-r2-physical-fixture.v1",
   keepControlId = "keep_control",
   hairImportCompatible = false,
+  topologyRebuild = false,
 ) {
-  const glbBytes = physicalGlb(version, runtimeMorphName, hairImportCompatible);
+  const glbBytes = physicalGlb(
+    version,
+    runtimeMorphName,
+    hairImportCompatible,
+    topologyRebuild,
+  );
   const avatarManifest = appearanceManifest(
     version,
     runtimeMorphName,
@@ -679,6 +691,7 @@ async function updateEdge(
   to: RecipeSourceIdentity,
   siblingSubplans?: RecipeSiblingSubplan[],
   keepControlId = "keep_control",
+  topologyRebuild = false,
 ): Promise<RecipeUpdateEdge> {
   const fromIds = [
     "affine_control",
@@ -786,6 +799,32 @@ async function updateEdge(
     cases: allIds,
   });
   const directEdgeKey = buildRecipeUpdateDirectEdgeKey(from, to);
+  const affectedComponentIds = [
+    ...new Set(controls.map((control) => control.componentId)),
+  ].sort(compareText);
+  const topologyRebuildContent = topologyRebuild
+    ? {
+        contract: "recipe-topology-rebuild-proof/v1" as const,
+        mode: "rebuild-from-target-recipe-source" as const,
+        fromTopologySha256: from.topologySha256,
+        toTopologySha256: to.topologySha256,
+        affectedMeshNodeIds: ["Body"],
+        affectedComponentIds,
+        authorityBundleSha256: await canonicalRecipeSha256({
+          fixtureSha256,
+          kind: "topology-authority",
+        }),
+        sourceAuditSha256: await canonicalRecipeSha256({
+          fixtureSha256,
+          kind: "source-topology",
+        }),
+        targetAuditSha256: await canonicalRecipeSha256({
+          fixtureSha256,
+          kind: "target-topology",
+        }),
+        requiresPreview: true as const,
+      }
+    : null;
   const provisional: RecipeUpdateEdge = {
     id: "sa090-r2-physical-fixture.v1-to-v2",
     directEdgeKey,
@@ -812,7 +851,41 @@ async function updateEdge(
         reason: `${surface} is absent from both physical fixture packages.`,
         proofSha256: ZERO_SHA256,
       })),
-    warnings: [],
+    warnings: topologyRebuild
+      ? [
+          {
+            code: "material-changed",
+            message:
+              "The topology fixture also changes the exact semantic material projection.",
+            requiresPreview: true,
+            proofSha256: await canonicalRecipeSha256({
+              fixtureSha256,
+              kind: "material-warning",
+            }),
+          },
+          {
+            code: "topology-changed",
+            message:
+              "The target is rebuilt from its exact Recipe Source and requires Current/Updated preview.",
+            requiresPreview: true,
+            proofSha256: await canonicalRecipeSha256({
+              fixtureSha256,
+              kind: "topology-warning",
+            }),
+          },
+        ]
+      : [],
+    ...(topologyRebuildContent
+      ? {
+          topologyRebuild: {
+            ...topologyRebuildContent,
+            proofSha256:
+              await recipeTopologyRebuildProofSha256(
+                topologyRebuildContent,
+              ),
+          },
+        }
+      : {}),
     proof: {
       contract: RECIPE_UPDATE_PROOF_CONTRACT,
       toleranceProfile: RECIPE_STRICT_TOLERANCE_PROFILE,
@@ -948,6 +1021,7 @@ export async function createRecipePhysicalMigrationFixture(
         options.fitFamily,
         keepControlId,
         options.hairImportCompatible,
+        false,
       ),
       sourcePackageDraft(
         "target",
@@ -957,6 +1031,7 @@ export async function createRecipePhysicalMigrationFixture(
         options.fitFamily,
         keepControlId,
         options.hairImportCompatible,
+        options.topologyRebuild,
       ),
     ]);
     const edge = await updateEdge(
@@ -964,6 +1039,7 @@ export async function createRecipePhysicalMigrationFixture(
       targetDraft.identity,
       options.siblingSubplans,
       keepControlId,
+      options.topologyRebuild,
     );
     const [source, target] = await Promise.all([
       finalizeSourcePackage("source", sourceDraft, []),

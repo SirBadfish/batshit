@@ -30,7 +30,7 @@ export type AppearanceNodeRole =
   | "body"
   | "face"
   | "generic-follower"
-  | "socket-eye-composite-cap"
+  | "socket-eye-physical-eye"
   | "brow-canvas"
   | "eye-treatment-canvas"
   | "teeth-upper"

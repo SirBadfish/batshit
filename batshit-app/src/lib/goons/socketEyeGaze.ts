@@ -4,7 +4,7 @@ import type { SocketEyeContactSettingsV2 } from './socketEyeContact'
 import {
   projectTargetToSocketEyeSurface,
   type SocketEyeSide,
-  type SocketEyeSurfaceDefinitionV1,
+  type SocketEyeSurfaceDefinitionV2,
   type SocketEyeSurfaceProjection,
   type SocketEyeVec3
 } from './socketEyeSurface'
@@ -66,7 +66,7 @@ function clampToSafeDomain(
 function applyConvergence(
   side: SocketEyeSide,
   coordinates: SocketEyeCoordinates,
-  definition: SocketEyeSurfaceDefinitionV1,
+  definition: SocketEyeSurfaceDefinitionV2,
   convergence: number
 ): SocketEyeCoordinates {
   const gaze = definition.runtimeBindings[side].gaze
@@ -83,7 +83,7 @@ function applyConvergence(
 }
 
 function targetIsInFrontOfBothEyes(
-  definition: SocketEyeSurfaceDefinitionV1,
+  definition: SocketEyeSurfaceDefinitionV2,
   targetHeadLocal: SocketEyeVec3
 ) {
   const target = new THREE.Vector3(...targetHeadLocal)
@@ -95,7 +95,7 @@ function targetIsInFrontOfBothEyes(
 }
 
 export function resolveAuthoredSocketEyeCoordinates(
-  definition: SocketEyeSurfaceDefinitionV1,
+  definition: SocketEyeSurfaceDefinitionV2,
   direction: CustomPerformanceDirection
 ): Record<SocketEyeSide, SocketEyeCoordinates> {
   const left = definition.runtimeBindings.left.gaze
@@ -121,7 +121,7 @@ export function resolveAuthoredSocketEyeCoordinates(
 }
 
 export function resolveSocketEyeGaze(
-  definition: SocketEyeSurfaceDefinitionV1,
+  definition: SocketEyeSurfaceDefinitionV2,
   targetHeadLocal: SocketEyeVec3,
   authoredDirection: CustomPerformanceDirection,
   settings: SocketEyeContactSettingsV2,
@@ -175,12 +175,12 @@ export function resolveSocketEyeGaze(
 
 /**
  * Convert the final, already-smoothed socket coordinates into the exact
- * ARKit-52 Look channels used by the eyelids, face, and artwork liner. The
- * composite eye shader and the facial accommodation therefore share one
+ * ARKit-52 Look channels used by the eyelids, face, and eye treatment. The
+ * physical-eye shader and the facial accommodation therefore share one
  * resolved gaze instead of running competing look solvers.
  */
 export function resolveSocketEyeLookTargetWeights(
-  definition: SocketEyeSurfaceDefinitionV1,
+  definition: SocketEyeSurfaceDefinitionV2,
   gaze: Record<SocketEyeSide, SocketEyeCoordinates>
 ): Map<SocketEyeLookTarget, number> {
   const result = new Map<SocketEyeLookTarget, number>()

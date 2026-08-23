@@ -13,6 +13,7 @@ import {
   isPositiveVec3,
   normalizeFaceMorphCollisionName,
 } from "./appearanceDials.validation";
+import { sanitizeCustomRuntimeNodeName } from "./customRuntimeNames";
 
 export function getAppearanceRecipeBakeInventory(
   manifest: AppearanceDialsManifest,
@@ -203,7 +204,15 @@ export function validateAppearanceRuntimeInventory(
     const runtimeNode = runtimeByManifestNode.get(nodeId);
     if (!runtimeNode || !declaration.parent) continue;
     if (declaration.parent.kind === "bone") {
-      if (runtimeNode.parentBone !== declaration.parent.name) {
+      const sourceBoneName = declaration.parent.name;
+      const runtimeBoneNames = new Set([
+        sourceBoneName,
+        sanitizeCustomRuntimeNodeName(sourceBoneName),
+      ]);
+      if (
+        !runtimeNode.parentBone ||
+        !runtimeBoneNames.has(runtimeNode.parentBone)
+      ) {
         throw new Error(
           "appearance node " + nodeId + " has the wrong runtime bone parent",
         );

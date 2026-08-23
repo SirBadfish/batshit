@@ -13,6 +13,9 @@ import {
   parseRecipeMigrationReport,
   parseRecipeUpdateJob,
   parseRecipeUpdatesContract,
+  buildRecipeUpdateDirectEdgeKey,
+  recipeTopologyRebuildProofSha256,
+  recipeUpdateEdgeSha256,
   recipeMigrationReportSha256,
   verifyRecipeMigrationReport,
   verifyRecipePackageMetadata,
@@ -405,7 +408,69 @@ describe("recipe-updates/v1 parser", () => {
     const crossTopology = mutable(recipeUpdatesFixture);
     crossTopology.edges[0].to.topologySha256 = "ac".repeat(32);
     expect(() => parseRecipeUpdatesContract(crossTopology)).toThrow(
-      "crosses topology identities",
+      "crosses topology identities without a rebuild proof",
+    );
+  });
+
+  it("accepts only a hash-bound target-source rebuild for a topology-changing edge", async () => {
+    const edge = mutable(recipeUpdatesFixture.edges[0]);
+    edge.to.topologySha256 = "ac".repeat(32);
+    edge.directEdgeKey = buildRecipeUpdateDirectEdgeKey(edge.from, edge.to);
+    const topologyRebuild = {
+      contract: "recipe-topology-rebuild-proof/v1" as const,
+      mode: "rebuild-from-target-recipe-source" as const,
+      fromTopologySha256: edge.from.topologySha256,
+      toTopologySha256: edge.to.topologySha256,
+      affectedMeshNodeIds: ["Brow_R"],
+      affectedComponentIds: [edge.controls[0].componentId],
+      authorityBundleSha256: "ad".repeat(32),
+      sourceAuditSha256: "ae".repeat(32),
+      targetAuditSha256: "af".repeat(32),
+      requiresPreview: true as const,
+    };
+    edge.topologyRebuild = {
+      ...topologyRebuild,
+      proofSha256:
+        await recipeTopologyRebuildProofSha256(topologyRebuild),
+    };
+    edge.warnings.push({
+      code: "topology-changed",
+      message:
+        "Rebuild the exact target Recipe Source and review Current against Updated.",
+      requiresPreview: true,
+      proofSha256: "ba".repeat(32),
+    });
+    edge.edgeSha256 = await recipeUpdateEdgeSha256(edge);
+    const contract = {
+      contract: "recipe-updates/v1",
+      schemaVersion: 1,
+      edges: [edge],
+    };
+
+    await expect(verifyRecipeUpdatesContract(contract)).resolves.toMatchObject({
+      edges: [
+        {
+          topologyRebuild: {
+            mode: "rebuild-from-target-recipe-source",
+            affectedMeshNodeIds: ["Brow_R"],
+            requiresPreview: true,
+          },
+        },
+      ],
+    });
+
+    const tampered = mutable(contract);
+    tampered.edges[0].topologyRebuild.targetAuditSha256 = "bb".repeat(32);
+    await expect(verifyRecipeUpdatesContract(tampered)).rejects.toThrow(
+      "topology rebuild proof hash mismatch",
+    );
+
+    const noPreviewWarning = mutable(contract);
+    noPreviewWarning.edges[0].warnings = noPreviewWarning.edges[0].warnings.filter(
+      (warning: { code: string }) => warning.code !== "topology-changed",
+    );
+    expect(() => parseRecipeUpdatesContract(noPreviewWarning)).toThrow(
+      "topology rebuild must carry a topology-changed warning",
     );
   });
 

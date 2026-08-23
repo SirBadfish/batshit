@@ -38,8 +38,8 @@
     parseAppearanceDialsManifest,
     type AppearanceDialValueState
   } from '$lib/goons/appearanceDials'
-  import type { FacialArtworkStateV4 } from '$lib/goons/facialArtwork'
-  import type { EyeAppearanceStateV3 } from '$lib/goons/eyeAppearance'
+  import type { FacialArtworkState } from '$lib/goons/facialArtwork'
+  import type { EyeAppearanceState } from '$lib/goons/eyeAppearance'
   import type { OralAppearanceStateV1 } from '$lib/goons/oralAppearance'
   import type {
     LipArtworkPresenceStateV1,
@@ -57,6 +57,7 @@
     uploadCustomGoonPackage
   } from '$lib/services/goons'
   import type { GoonRecord } from '$lib/types/goons'
+  import { pickGoonPackageFile } from '$lib/goons/goonPackageFilePicker'
   import RecipeWorkflowPanel from './RecipeWorkflowPanel.svelte'
   import type {
     RecipeAuthorizedPreviewControl,
@@ -88,8 +89,8 @@
   type Props = {
     goon: GoonRecord
     appearanceDials: AppearanceDialValueState | null
-    facialArtwork: FacialArtworkStateV4 | null
-    eyeAppearance: EyeAppearanceStateV3 | null
+    facialArtwork: FacialArtworkState | null
+    eyeAppearance: EyeAppearanceState | null
     oralAppearance: OralAppearanceStateV1 | null
     lipArtwork: LipArtworkStateV2 | null
     lipArtworkPresence: LipArtworkPresenceStateV1 | null
@@ -487,7 +488,7 @@
     previewState = fittedPreviewState
     previewFitFreshStateSha256 = fittedPreviewState?.stateSha256 ?? null
     previewControls = controls
-    previewSide = 'current'
+    previewSide = 'updated'
     rollbackPreview = null
     await emitAnalysisPreview()
   }
@@ -796,7 +797,20 @@
       return false
     }
     pendingAnalysisIntent = { mode, boundary }
-    packageInput.click()
+    void pickGoonPackageFile()
+      .then((file) => {
+        if (file === undefined) {
+          packageInput?.click()
+        } else if (file) {
+          void analyzeUpdateFile(file)
+        } else {
+          pendingAnalysisIntent = null
+        }
+      })
+      .catch((error) => {
+        pendingAnalysisIntent = null
+        toast.error(errorMessage(error))
+      })
     return true
   }
 
@@ -805,6 +819,10 @@
     const file = input.files?.[0] ?? null
     input.value = ''
     if (!file) return
+    await analyzeUpdateFile(file)
+  }
+
+  async function analyzeUpdateFile(file: File) {
     const capturedBoundary = captureAnalysisBoundary()
     const intent = pendingAnalysisIntent ?? (capturedBoundary
       ? { mode: 'direct' as const, boundary: capturedBoundary }
@@ -1283,7 +1301,6 @@
 <input
   class="hidden"
   type="file"
-  accept=".bgoon,.zip"
   bind:this={packageInput}
   onchange={selectUpdateFile}
 />

@@ -1,0 +1,387 @@
+{
+  "schemaVersion": "facial-artwork/v5",
+  "stateSchemaVersion": "facial-artwork-state/v5",
+  "status": "product-export-approved",
+  "productExportApproved": true,
+  "definitionSha256": "9d15e8ddd048c01b7f0779d3b30766a6e4bc440905a05b4cad9d0799c9473080",
+  "dependencies": {
+    "eyeAppearance": {
+      "schemaVersion": "eye-appearance/v4",
+      "definitionSha256": "e1447221816fcd9e73bc0ac827de258977f005478b168697eb6e803c3eb9385a"
+    },
+    "socketEyeSurface": {
+      "schemaVersion": "socket-eye-surface/v2",
+      "definitionSha256": "003732374c733c3f0dd12ff8d9790d3b272f08e8e300cb6162fbd12e625fde21"
+    },
+    "eyeApertureSeam": {
+      "schemaVersion": "eye-aperture-seam/v2",
+      "definitionSha256": "201c043e71ab78967e8f259384699ee6a5e2c0679f22e7893dd0dc7715e26bbf"
+    }
+  },
+  "templateSet": {
+    "id": "batshit-base-f-rig2-v1",
+    "version": "1.0.0"
+  },
+  "ownership": {
+    "definition": "immutable-package-template",
+    "recipeState": "mutable-goon-record",
+    "artwork": "recipe-owned-upload",
+    "baseSkinContaminationAllowed": false,
+    "packageArchiveFiles": ["avatar.glb", "avatar.json"],
+    "uploadCategory": "goon_facial_artwork"
+  },
+  "stateModel": {
+    "roles": "exactly-six",
+    "bilateral": "one shared default plus optional left/right override states",
+    "sharedMirroring": "all six roles derive a visually mirrored anatomical-right presentation from canonical-left shared artwork",
+    "overrideOwnership": "per-eye overrides remain hash-bound to the selected orientation Guide and Mask; orientation-neutral right-eye overrides render as-authored",
+    "orientationLaw": "shared artwork applies the target projection mirror law; per-eye anatomical artwork additionally accounts for upload orientation while per-eye orientation-neutral artwork renders as-authored",
+    "cleanBreak": "all pre-v5 definition, state, upload proof, and composite-cap bindings are rejected"
+  },
+  "hashContract": {
+    "algorithm": "sha256",
+    "fileHashes": "exact-bytes",
+    "definitionHash": "canonical-utf8-json-with-definitionSha256-null",
+    "absolutePathsAllowed": false
+  },
+  "provenanceContract": {
+    "required": ["sourceKind", "author", "license", "rightsConfirmed"],
+    "allowedSourceKinds": [
+      "batshit-original",
+      "user-authored",
+      "comfyui-generated",
+      "approved-external"
+    ],
+    "rightsConfirmedMustBe": true
+  },
+  "rendering": {
+    "canvasAndHighlight": {
+      "transparent": true,
+      "depthTest": true,
+      "depthWrite": false,
+      "renderOrderWorkaroundAllowed": false,
+      "sideLaw": {
+        "brows": "double",
+        "eyeHighlight": "independent-physical-eye-layer",
+        "eyeApertureLinerSide": "double"
+      }
+    },
+    "irisPupilAndSclera": "independent accepted-physical-eye layers; no composite-cap binding",
+    "effectiveAlpha": "texture-alpha-times-tint-alpha-times-opacity",
+    "visibilityPrecedence": "hidden-mode-or-visible-false-disables-role",
+    "highlightComposition": "independent iris-space layer below cornea",
+    "cornea": "unchanged-and-outermost"
+  },
+  "topologyFreeze": {
+    "acceptedInputSha256": "0f2ba59808f343bd1d3b24cb711b70dfb28e1d9eb2a16b415ade2bacf62a9cfa",
+    "acceptedProofBlendSha256": "0f2ba59808f343bd1d3b24cb711b70dfb28e1d9eb2a16b415ade2bacf62a9cfa",
+    "acceptedProofReportSha256": "7dbe7cff3d2d86de0a9213ad8b03d0f45d85b227e666fbe2660d54509017408a",
+    "generatorDependencies": [
+      {
+        "id": "rig2-anatomical-right-build-receipt/v1",
+        "sha256": "2adb605a16cf167eb4668257cbbd45802a8c780272e8cfe5971d19400fb795cc"
+      },
+      {
+        "id": "rig2-template-set-receipt/v1",
+        "sha256": "9f3bf6ba6eae8ad7a1ab5cc484e8393b88bb12702b66cbb16a885fb8f308584c"
+      }
+    ],
+    "nodes": [
+      {"role": "brows", "left": "bs_f1_brow_canvas_l", "right": "bs_f1_brow_canvas_r"},
+      {"role": "lashes_eye_outline", "left": "bs_f1_eye_treatment_l", "right": "bs_f1_eye_treatment_r"},
+      {"role": "physical_eye_layers", "left": "bs_f1_eye_l_physical", "right": "bs_f1_eye_r_physical"}
+    ],
+    "openDependency": "The atomic v2/v4 production dependency tuple is closed and exact-hash-bound."
+  },
+  "trustedArtwork": {
+    "sourceReceiptSha256": "9f3bf6ba6eae8ad7a1ab5cc484e8393b88bb12702b66cbb16a885fb8f308584c",
+    "entries": [
+      {
+        "role": "brows",
+        "side": "left",
+        "asset": {
+          "path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/brows-left.png",
+          "sha256": "32b9d802ebd07fc57fe39577bfe29a60083dbbe5421c9c8297397fb881e06094"
+        },
+        "sourceSha256": "32b9d802ebd07fc57fe39577bfe29a60083dbbe5421c9c8297397fb881e06094",
+        "derivation": "exact-source-bytes"
+      },
+      {
+        "role": "brows",
+        "side": "right",
+        "asset": {
+          "path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/brows-right-mirrored-from-left.png",
+          "sha256": "3f11419c0a87b2a4d3614f8b95953497b2dac28f1beb482b1495192cd6349bc9"
+        },
+        "sourceSha256": "32b9d802ebd07fc57fe39577bfe29a60083dbbe5421c9c8297397fb881e06094",
+        "derivation": "horizontal-mirror-of-left",
+        "derivedFromSha256": "32b9d802ebd07fc57fe39577bfe29a60083dbbe5421c9c8297397fb881e06094"
+      },
+      {
+        "role": "lashes_eye_outline",
+        "side": "shared",
+        "asset": {
+          "path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/lashes-eye-outline.png",
+          "sha256": "38df96d825ae39a3a0477707e0c7a6523df45b8a88d0908a762398bd89f0105b"
+        },
+        "sourceSha256": "38df96d825ae39a3a0477707e0c7a6523df45b8a88d0908a762398bd89f0105b",
+        "derivation": "exact-source-bytes"
+      },
+      {
+        "role": "iris",
+        "side": "shared",
+        "asset": {
+          "path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/iris.png",
+          "sha256": "693515d140762f716fbd1c6f32672b6316d9201d44c33e183d2b7c34a9ac6ef7"
+        },
+        "sourceSha256": "693515d140762f716fbd1c6f32672b6316d9201d44c33e183d2b7c34a9ac6ef7",
+        "derivation": "exact-source-bytes"
+      },
+      {
+        "role": "pupil",
+        "side": "shared",
+        "asset": {
+          "path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/pupil.png",
+          "sha256": "50cbd657403e772e6970ec00672f9c47feb7dc224721b3dc62743c89f5c39fd4"
+        },
+        "sourceSha256": "50cbd657403e772e6970ec00672f9c47feb7dc224721b3dc62743c89f5c39fd4",
+        "derivation": "exact-source-bytes"
+      },
+      {
+        "role": "eye_highlight",
+        "side": "shared",
+        "asset": {
+          "path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/eye-highlight.png",
+          "sha256": "66d850ebc30ab1153293c9789035bbaafd4c16e7d08b0477d9f193dd449fdc88"
+        },
+        "sourceSha256": "66d850ebc30ab1153293c9789035bbaafd4c16e7d08b0477d9f193dd449fdc88",
+        "derivation": "exact-source-bytes"
+      },
+      {
+        "role": "sclera",
+        "side": "shared",
+        "asset": {
+          "path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/sclera-front-hemisphere.png",
+          "sha256": "8ccf8043c2da2f59a1a334dd8135e651053a3ed8ceb6512699929061a242f1cf"
+        },
+        "sourceSha256": "8ccf8043c2da2f59a1a334dd8135e651053a3ed8ceb6512699929061a242f1cf",
+        "derivation": "exact-source-bytes"
+      }
+    ]
+  },
+  "templates": [
+    {
+      "id": "brow-trimmed",
+      "version": "1.0.0",
+      "dimensions": [2048, 1024],
+      "pixelContract": {"format": "PNG", "channels": "RGBA8", "colorSpace": "sRGB", "alpha": "straight", "interlaced": false},
+      "guide": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/guides/brow-trimmed.png", "sha256": "96d3c30da53d71060ee3cd0d3cf0075fbe2dcd183d457616032c21ed10615b30"},
+      "safePaintMask": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/masks/brows.png", "sha256": "b3ccb33333e74c5a50b136dd8a7b61337337c81fc21851cb1eb999f90450f5bc", "channels": "L8", "paintThreshold": 1},
+      "transparentBlank": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/blanks/brows.png", "sha256": "d7088744990d7e93d5d00f4d11687ae0b891423a3ecb5ecca5204b88417a3a72"},
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [0.5, 0.5],
+      "landmarks": {"innerRootU": 0, "outerTipU": 1, "artworkScaleCalibration": 1},
+      "splits": null
+    },
+    {
+      "id": "lashes-eye-outline-split",
+      "version": "1.0.0",
+      "dimensions": [2048, 1024],
+      "pixelContract": {"format": "PNG", "channels": "RGBA8", "colorSpace": "sRGB", "alpha": "straight", "interlaced": false},
+      "guide": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/guides/lashes-eye-outline-split-anatomical-left.png", "sha256": "cdd20bde0d1187bc8effdc2ca263c8ada8bdb5d045026480f1994798de1b4fce"},
+      "safePaintMask": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/masks/lashes-eye-outline-anatomical-left.png", "sha256": "b3ccb33333e74c5a50b136dd8a7b61337337c81fc21851cb1eb999f90450f5bc", "channels": "L8", "paintThreshold": 1},
+      "transparentBlank": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/blanks/lashes-eye-outline.png", "sha256": "d7088744990d7e93d5d00f4d11687ae0b891423a3ecb5ecca5204b88417a3a72"},
+      "canonicalOrientation": "anatomical-left",
+      "transformOriginUv": [0.5, 0.5],
+      "mirroredHorizontalVariant": {
+        "orientation": "anatomical-right",
+        "label": "Goon's Right Eye (viewer's left)",
+        "guide": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/guides/lashes-eye-outline-split-anatomical-right.png", "sha256": "5473c5637332bacffaf056382e9b22691c4fee32192dd97f565ffaa9af272c52"},
+        "safePaintMask": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/masks/lashes-eye-outline-anatomical-right.png", "sha256": "cfe38b1b08fb0cdb51a369793d10c320c2102363b4a37320ade1509e99aabbf6", "channels": "L8", "paintThreshold": 1}
+      },
+      "orientationReference": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/trusted-artwork/lashes-eye-outline.png", "sha256": "38df96d825ae39a3a0477707e0c7a6523df45b8a88d0908a762398bd89f0105b"},
+      "landmarks": {"upperRegionV": [0.5, 1], "lowerRegionV": [0, 0.5]},
+      "splits": null
+    },
+    {
+      "id": "iris-radial",
+      "version": "1.0.0",
+      "dimensions": [1024, 1024],
+      "pixelContract": {"format": "PNG", "channels": "RGBA8", "colorSpace": "sRGB", "alpha": "straight", "interlaced": false},
+      "guide": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/guides/iris-radial.png", "sha256": "cf122ff7fdd04b51d2f2487c35bd3cee1928008a7cba6e6cee00c9a245dc0aa1"},
+      "safePaintMask": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/masks/iris.png", "sha256": "cf40be4489f1d773720dacb1fffdbaf773807b45c5f54b7f5bc262f413461e8c", "channels": "L8", "paintThreshold": 1},
+      "transparentBlank": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/blanks/iris.png", "sha256": "f12ddfea20dcca2fa350d75d5ed2ae76a4fffbcdfd2b8f2357558b90072dab9f"},
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [0.5, 0.5],
+      "landmarks": {"centerUv": [0.5, 0.5], "safeRadius": 0.485},
+      "splits": null
+    },
+    {
+      "id": "pupil-radial",
+      "version": "1.0.0",
+      "dimensions": [1024, 1024],
+      "pixelContract": {"format": "PNG", "channels": "RGBA8", "colorSpace": "sRGB", "alpha": "straight", "interlaced": false},
+      "guide": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/guides/pupil-radial.png", "sha256": "60df894de76d46874d3f10b37e4c240ab970b5f4f9226773a2cf8230ec559fbc"},
+      "safePaintMask": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/masks/pupil.png", "sha256": "cf40be4489f1d773720dacb1fffdbaf773807b45c5f54b7f5bc262f413461e8c", "channels": "L8", "paintThreshold": 1},
+      "transparentBlank": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/blanks/pupil.png", "sha256": "f12ddfea20dcca2fa350d75d5ed2ae76a4fffbcdfd2b8f2357558b90072dab9f"},
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [0.5, 0.5],
+      "landmarks": {"centerUv": [0.5, 0.5], "safeRadius": 0.485},
+      "splits": null
+    },
+    {
+      "id": "eye-highlight-radial",
+      "version": "1.0.0",
+      "dimensions": [1024, 1024],
+      "pixelContract": {"format": "PNG", "channels": "RGBA8", "colorSpace": "sRGB", "alpha": "straight", "interlaced": false},
+      "guide": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/guides/eye-highlight-radial.png", "sha256": "82737b1a23d62cfd63e70587b5acb53538273ac4306fcc9936a5b2450fa621ed"},
+      "safePaintMask": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/masks/eye-highlight.png", "sha256": "f578489bb7002e78abdf9ae455671463a6ee76b41c5630688176531a8aefbc95", "channels": "L8", "paintThreshold": 1},
+      "transparentBlank": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/blanks/eye-highlight.png", "sha256": "f12ddfea20dcca2fa350d75d5ed2ae76a4fffbcdfd2b8f2357558b90072dab9f"},
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [0.5, 0.5],
+      "landmarks": {"centerUv": [0.5, 0.5], "safeRadius": 0.46},
+      "splits": null
+    },
+    {
+      "id": "sclera-front-hemisphere",
+      "version": "1.0.0",
+      "dimensions": [2048, 1024],
+      "pixelContract": {"format": "PNG", "channels": "RGBA8", "colorSpace": "sRGB", "alpha": "straight", "interlaced": false},
+      "guide": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/guides/sclera-front-hemisphere.png", "sha256": "1ce71b4d901b8629f8524e8af176f60555f6af9ec22edd7aca0057e141414da2"},
+      "safePaintMask": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/masks/sclera-front-hemisphere.png", "sha256": "b3ccb33333e74c5a50b136dd8a7b61337337c81fc21851cb1eb999f90450f5bc", "channels": "L8", "paintThreshold": 1},
+      "transparentBlank": {"path": "goons/facial-artwork/v5/batshit-base-f-rig2-v1/blanks/sclera-front-hemisphere.png", "sha256": "d7088744990d7e93d5d00f4d11687ae0b891423a3ecb5ecca5204b88417a3a72"},
+      "canonicalOrientation": "orientation-neutral",
+      "transformOriginUv": [0.5, 0.5],
+      "landmarks": {"mapping": "accepted-sphere-front-hemisphere", "rearHemisphere": "neutral-unpainted"},
+      "splits": null
+    }
+  ],
+  "roles": [
+    {
+      "id": "brows",
+      "template": "brow-trimmed",
+      "ownership": "canvas",
+      "geometryOwnership": "trimmed-bilateral-brow-canvas",
+      "side": "bilateral-shared-with-overrides",
+      "modes": ["artwork", "hidden"],
+      "defaultState": {"mode": "hidden", "visible": false},
+      "symmetry": {"default": "shared-mirrored", "rightSharedOperation": "horizontal-mirror-from-canonical-left"},
+      "submissionBounds": {"translateU": [-0.24, 0.24], "translateV": [-0.36, 0.36], "scale": [0.6, 1.4], "rotationDegrees": [-40, 40]},
+      "mapping": "planar",
+      "artworkScaleCalibration": 1,
+      "alphaPolicy": {"emptyArtworkAllowed": false, "fullyOpaqueAllowed": false, "transparencyRequired": true},
+      "target": {
+        "left": {"runtimeNodes": ["bs_f1_brow_canvas_l"], "mirrorU": false, "mirrorV": false, "bindingKind": "face-conformal-canvas", "compositeLayer": null},
+        "right": {"runtimeNodes": ["bs_f1_brow_canvas_r"], "mirrorU": false, "mirrorV": false, "bindingKind": "face-conformal-canvas", "compositeLayer": null}
+      },
+      "defaultEyeState": {"visible": false, "baseColor": null, "artwork": null},
+      "defaultMode": "shared",
+      "bounds": {"translateU": [-0.24, 0.24], "translateV": [-0.36, 0.36], "scale": [0.6, 1.4], "rotationDegrees": [-40, 40]}
+    },
+    {
+      "id": "lashes_eye_outline",
+      "template": "lashes-eye-outline-split",
+      "ownership": "canvas",
+      "geometryOwnership": "bilateral-eye-treatment-liner",
+      "side": "bilateral-shared-with-overrides",
+      "modes": ["artwork", "hidden"],
+      "defaultState": {"mode": "hidden", "visible": false},
+      "symmetry": {"default": "shared-mirrored", "rightSharedOperation": "horizontal-texture-mirror"},
+      "submissionBounds": {"translateU": [-0.04, 0.04], "translateV": [-0.08, 0.08], "scale": [0.85, 1.15], "rotationDegrees": [-8, 8]},
+      "mapping": "planar",
+      "artworkScaleCalibration": 1,
+      "alphaPolicy": {"emptyArtworkAllowed": false, "fullyOpaqueAllowed": false, "transparencyRequired": true},
+      "target": {
+        "left": {"runtimeNodes": ["bs_f1_eye_treatment_l"], "mirrorU": false, "mirrorV": false, "bindingKind": "eye-aperture-liner", "compositeLayer": null},
+        "right": {"runtimeNodes": ["bs_f1_eye_treatment_r"], "mirrorU": false, "mirrorV": false, "bindingKind": "eye-aperture-liner", "compositeLayer": null}
+      },
+      "defaultEyeState": {"visible": false, "baseColor": null, "artwork": null},
+      "defaultMode": "shared",
+      "bounds": {"translateU": [-0.04, 0.04], "translateV": [-0.08, 0.08], "scale": [0.85, 1.15], "rotationDegrees": [-8, 8]}
+    },
+    {
+      "id": "iris",
+      "template": "iris-radial",
+      "ownership": "lit-surface",
+      "geometryOwnership": "accepted-physical-eye-iris-layer",
+      "side": "bilateral-shared-with-overrides",
+      "modes": ["solid", "artwork"],
+      "defaultState": {"mode": "solid", "visible": true},
+      "symmetry": {"default": "shared-mirrored", "rightSharedOperation": "horizontal-texture-mirror"},
+      "submissionBounds": {"translateU": [-0.15, 0.15], "translateV": [-0.15, 0.15], "scale": [0.5, 1.5], "rotationDegrees": [-180, 180]},
+      "mapping": "radial",
+      "artworkScaleCalibration": 1,
+      "alphaPolicy": {"emptyArtworkAllowed": false, "fullyOpaqueAllowed": false, "transparencyRequired": true},
+      "target": {
+        "left": {"runtimeNodes": ["bs_f1_eye_l_physical"], "mirrorU": false, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "iris"},
+        "right": {"runtimeNodes": ["bs_f1_eye_r_physical"], "mirrorU": true, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "iris"}
+      },
+      "defaultEyeState": {"visible": true, "baseColor": [0.035, 0.42, 0.34], "artwork": null},
+      "defaultMode": "shared",
+      "bounds": {"translateU": [-0.15, 0.15], "translateV": [-0.15, 0.15], "scale": [0.5, 1.5], "rotationDegrees": [-180, 180]}
+    },
+    {
+      "id": "pupil",
+      "template": "pupil-radial",
+      "ownership": "lit-surface",
+      "geometryOwnership": "accepted-physical-eye-pupil-layer",
+      "side": "bilateral-shared-with-overrides",
+      "modes": ["solid", "artwork"],
+      "defaultState": {"mode": "solid", "visible": true},
+      "symmetry": {"default": "shared-mirrored", "rightSharedOperation": "horizontal-texture-mirror"},
+      "submissionBounds": {"translateU": [-0.15, 0.15], "translateV": [-0.15, 0.15], "scale": [0.5, 1.5], "rotationDegrees": [-180, 180]},
+      "mapping": "radial",
+      "artworkScaleCalibration": 1,
+      "alphaPolicy": {"emptyArtworkAllowed": false, "fullyOpaqueAllowed": false, "transparencyRequired": true},
+      "target": {
+        "left": {"runtimeNodes": ["bs_f1_eye_l_physical"], "mirrorU": false, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "pupil"},
+        "right": {"runtimeNodes": ["bs_f1_eye_r_physical"], "mirrorU": true, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "pupil"}
+      },
+      "defaultEyeState": {"visible": true, "baseColor": [0.008, 0.009, 0.012], "artwork": null},
+      "defaultMode": "shared",
+      "bounds": {"translateU": [-0.15, 0.15], "translateV": [-0.15, 0.15], "scale": [0.5, 1.5], "rotationDegrees": [-180, 180]}
+    },
+    {
+      "id": "eye_highlight",
+      "template": "eye-highlight-radial",
+      "ownership": "lit-overlay",
+      "geometryOwnership": "accepted-physical-eye-highlight-layer",
+      "side": "bilateral-shared-with-overrides",
+      "modes": ["hidden", "artwork"],
+      "defaultState": {"mode": "hidden", "visible": false},
+      "symmetry": {"default": "shared-mirrored", "rightSharedOperation": "horizontal-texture-mirror"},
+      "submissionBounds": {"translateU": [-0.15, 0.15], "translateV": [-0.15, 0.15], "scale": [0.5, 1.5], "rotationDegrees": [-180, 180]},
+      "mapping": "radial",
+      "artworkScaleCalibration": 1,
+      "alphaPolicy": {"emptyArtworkAllowed": false, "fullyOpaqueAllowed": false, "transparencyRequired": true},
+      "target": {
+        "left": {"runtimeNodes": ["bs_f1_eye_l_physical"], "mirrorU": false, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "highlight"},
+        "right": {"runtimeNodes": ["bs_f1_eye_r_physical"], "mirrorU": true, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "highlight"}
+      },
+      "defaultEyeState": {"visible": false, "baseColor": null, "artwork": null},
+      "defaultMode": "shared",
+      "bounds": {"translateU": [-0.15, 0.15], "translateV": [-0.15, 0.15], "scale": [0.5, 1.5], "rotationDegrees": [-180, 180]}
+    },
+    {
+      "id": "sclera",
+      "template": "sclera-front-hemisphere",
+      "ownership": "lit-surface",
+      "geometryOwnership": "accepted-static-full-sphere-front-hemisphere-layer",
+      "side": "bilateral-shared-with-overrides",
+      "modes": ["solid", "artwork"],
+      "defaultState": {"mode": "solid", "visible": true, "rearHemisphere": "neutral-unpainted"},
+      "symmetry": {"default": "shared-mirrored"},
+      "submissionBounds": {"translateU": [-0.15, 0.15], "translateV": [-0.15, 0.15], "scale": [0.75, 1.25], "rotationDegrees": [-180, 180]},
+      "mapping": "longitude",
+      "artworkScaleCalibration": 1,
+      "alphaPolicy": {"emptyArtworkAllowed": false, "fullyOpaqueAllowed": true, "transparencyRequired": false},
+      "target": {
+        "left": {"runtimeNodes": ["bs_f1_eye_l_physical"], "mirrorU": false, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "scleraArtwork"},
+        "right": {"runtimeNodes": ["bs_f1_eye_r_physical"], "mirrorU": true, "mirrorV": false, "bindingKind": "physical-eye-layer", "compositeLayer": "scleraArtwork"}
+      },
+      "defaultEyeState": {"visible": true, "baseColor": [0.92, 0.94, 0.96], "artwork": null},
+      "defaultMode": "shared",
+      "bounds": {"longitudeDegrees": [-180, 180]}
+    }
+  ]
+}

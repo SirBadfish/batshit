@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
 import type { GoonRecord } from '$lib/types/goons'
-import { resolveGoonSettingsPreviewTarget } from './recipeEditorPreviewTarget'
+import {
+  resolveGoonSettingsPreviewTarget,
+  shouldAdmitGoonSettingsPreviewLoad
+} from './recipeEditorPreviewTarget'
 
 function goon(id: string, modelUrl: string): GoonRecord {
   return {
@@ -53,5 +56,20 @@ describe('Recipe editor preview target selection', () => {
       editorGoon: mountedLive,
       recipeSourceGoon: recipeSource
     })).toBe(mountedLive)
+  })
+
+  it('does not let an automatic editor refresh supersede a strict Recipe comparison load', () => {
+    expect(shouldAdmitGoonSettingsPreviewLoad({
+      activePriority: 'strict',
+      requestedPriority: 'automatic'
+    })).toBe(false)
+    expect(shouldAdmitGoonSettingsPreviewLoad({
+      activePriority: 'automatic',
+      requestedPriority: 'strict'
+    })).toBe(true)
+    expect(shouldAdmitGoonSettingsPreviewLoad({
+      activePriority: 'strict',
+      requestedPriority: 'strict'
+    })).toBe(true)
   })
 })

@@ -1,12 +1,20 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import FacialArtworkEditor from "./FacialArtworkEditor.svelte";
 import { downloadBlob } from "$lib/utils/download";
+import { buildFacialArtworkV6DefinitionFixture } from "$lib/goons/__fixtures__/facialArtworkV6";
 import {
-  FACIAL_ARTWORK_ROLE_IDS,
   createDefaultFacialArtworkState,
-  type FacialArtworkDefinitionV4,
-  type FacialArtworkRoleDefinition,
+  createFacialArtworkArtworkLayer,
+  resolveFacialArtworkTemplateVariant,
+  type FacialArtworkDefinition,
+  type FacialArtworkRoleId,
 } from "$lib/goons/facialArtwork";
 import { setFacialArtworkRoleMode } from "$lib/goons/facialArtwork.editor";
 import {
@@ -17,8 +25,12 @@ import {
   EYE_APPEARANCE_CONTROL_IDS,
   createDefaultEyeAppearanceState,
   type EyeAppearanceControlDefinition,
-  type EyeAppearanceDefinitionV3,
+  type EyeAppearanceDefinition,
 } from "$lib/goons/eyeAppearance";
+import {
+  SOCKET_EYE_HIGHLIGHT_PROJECTION_CONTRACT,
+  SOCKET_EYE_SCLERA_PROJECTION_CONTRACT,
+} from "$lib/goons/socketEyeArtworkProjection";
 
 vi.mock("$lib/utils/download", () => ({
   downloadBlob: vi.fn(),
@@ -40,7 +52,10 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   });
 }
 
-if (typeof Element !== "undefined" && typeof Element.prototype.animate !== "function") {
+if (
+  typeof Element !== "undefined" &&
+  typeof Element.prototype.animate !== "function"
+) {
   Object.defineProperty(Element.prototype, "animate", {
     configurable: true,
     value: () => ({
@@ -55,162 +70,39 @@ if (typeof Element !== "undefined" && typeof Element.prototype.animate !== "func
 
 const HASH = "a".repeat(64);
 
-function buildFacialArtworkDefinition(): FacialArtworkDefinitionV4 {
-  const roleDefinitions = FACIAL_ARTWORK_ROLE_IDS.map((id) => {
-    const mapping =
-      id === "sclera"
-        ? "longitude"
-        : id === "iris" || id === "pupil" || id === "eye_highlight"
-          ? "radial"
-          : "planar";
-    const baseColor =
-      id === "iris"
-        ? [0.1, 0.5, 0.6]
-        : id === "pupil"
-          ? [0.02, 0.02, 0.02]
-          : id === "sclera"
-            ? [0.92, 0.9, 0.86]
-            : null;
-    return {
-      id,
-      template: `${id}_template`,
-      ownership:
-        id === "eye_highlight"
-          ? "lit-overlay"
-          : id === "brows" || id === "lashes_eye_outline"
-            ? "canvas"
-            : "lit-surface",
-      mapping,
-      bindingKind:
-        id === "brows"
-          ? "face-conformal-canvas"
-          : id === "lashes_eye_outline"
-            ? "eye-aperture-liner"
-            : "socket-eye-composite-layer",
-      ...(id === "sclera"
-        ? { compositeLayer: "scleraArtwork" as const }
-        : id === "iris"
-          ? { compositeLayer: "iris" as const }
-          : id === "pupil"
-            ? { compositeLayer: "pupil" as const }
-            : id === "eye_highlight"
-              ? { compositeLayer: "highlight" as const }
-              : {}),
-      target: {
-        left: { runtimeNodes: [`${id}_left`], mirrorU: false, mirrorV: false },
-        right: {
-          runtimeNodes: [`${id}_right`],
-          mirrorU: id === "lashes_eye_outline",
-          mirrorV: false,
-        },
-      },
-      defaultEyeState: {
-        visible: baseColor !== null,
-        baseColor,
-        artwork: null,
-      },
-      defaultMode: "shared",
-      bounds:
-        mapping === "longitude"
-          ? { longitudeDegrees: [-180, 180] }
-          : {
-              translateU: [-1, 1],
-              translateV: [-1, 1],
-              scale: [0.25, 4],
-              rotationDegrees: [-180, 180],
-            },
-    } as FacialArtworkRoleDefinition;
-  });
-
-  return {
-    schemaVersion: "facial-artwork/v4",
-    stateSchemaVersion: "facial-artwork-state/v4",
-    status: "product-export-approved",
-    productExportApproved: true,
-    definitionSha256: HASH,
-    dependencies: {
-      eyeAppearance: { schemaVersion: "eye-appearance/v3", definitionSha256: HASH },
-      socketEyeSurface: { schemaVersion: "socket-eye-surface/v1", definitionSha256: HASH },
-      eyeApertureSeam: { schemaVersion: "eye-aperture-seam/v1", definitionSha256: HASH },
-    },
-    templateSet: { id: "test", version: "2.0.0" },
-    templates: FACIAL_ARTWORK_ROLE_IDS.map((id) => ({
-      id: `${id}_template`,
-      version: "2.0.0",
-      dimensions: [1024, 1024],
-      guide: {
-        path: `goons/facial-artwork/v4/${id}/guide-left.png`,
-        sha256: HASH,
-      },
-      safePaintMask: {
-        path: `goons/facial-artwork/v4/${id}/mask-left.png`,
-        sha256: HASH,
-      },
-      transparentBlank: {
-        path: `goons/facial-artwork/v4/${id}/blank.png`,
-        sha256: HASH,
-      },
-      canonicalOrientation:
-        id === "brows" || id === "lashes_eye_outline"
-          ? ("anatomical-left" as const)
-          : ("orientation-neutral" as const),
-      transformOriginUv: [0.39, 0.5] as [number, number],
-      ...(id === "brows" || id === "lashes_eye_outline"
-        ? {
-            mirroredHorizontalVariant: {
-              orientation: "anatomical-right" as const,
-              label: "Goon's Right Eye (viewer's left)",
-              guide: {
-                path: `goons/facial-artwork/v4/${id}/guide-right.png`,
-                sha256: HASH,
-              },
-              safePaintMask: {
-                path: `goons/facial-artwork/v4/${id}/mask-right.png`,
-                sha256: HASH,
-              },
-            },
-          }
-        : {}),
-      ...(id === "lashes_eye_outline"
-        ? {
-            orientationReference: {
-              path: "goons/facial-artwork/v4/lashes_eye_outline/open-eye-reference.png",
-              sha256: HASH,
-            },
-          }
-        : {}),
-    })),
-    roles: roleDefinitions,
-  };
+function buildFacialArtworkDefinition(): FacialArtworkDefinition {
+  return buildFacialArtworkV6DefinitionFixture();
 }
 
-function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV3 {
+function buildEyeAppearanceDefinition(): EyeAppearanceDefinition {
   const labels: Record<(typeof EYE_APPEARANCE_CONTROL_IDS)[number], string> = {
     iris_size: "Iris Size",
     pupil_size: "Pupil Size",
+    iris_horizontal_position: "Iris Horizontal Position",
     iris_vertical_position: "Iris Vertical Position",
   };
   const controls = EYE_APPEARANCE_CONTROL_IDS.map((id) => {
     const sizeRange =
-      id === "iris_size"
-        ? { minimum: 0.65, maximum: 1.35, default: 1 }
-        : id === "pupil_size"
-          ? { minimum: 0, maximum: 2, default: 1 }
-          : { minimum: -1, maximum: 1, default: 0 };
+      id === "iris_size" || id === "pupil_size"
+        ? { minimum: 0.5, maximum: 1.5, default: 1 }
+        : { minimum: -1, maximum: 1, default: 0 };
     return {
       id,
       label: labels[id],
       description: `${labels[id]} test description`,
       ...sizeRange,
       step: 0.01,
-      runtimeNeutralOffset: 0,
       unit:
         id === "pupil_size"
           ? "iris-relative-multiplier"
-          : id === "iris_vertical_position"
+          : id === "iris_vertical_position" || id === "iris_horizontal_position"
             ? "neutral-travel-fraction"
             : "neutral-multiplier",
       linkedBilateral: true,
+      bilateralLaw:
+        id === "iris_horizontal_position"
+          ? "mirrored-convergence-divergence"
+          : "linked-same-value",
       perEyeOverridesAllowed: false,
       runtimeClampingAllowed: false,
       geometrySemantics: `${labels[id]} test control`,
@@ -218,57 +110,74 @@ function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV3 {
   }) as EyeAppearanceControlDefinition[];
 
   return {
-    schemaVersion: "eye-appearance/v3",
-    stateSchemaVersion: "eye-appearance-state/v3",
+    schemaVersion: "eye-appearance/v5",
+    stateSchemaVersion: "eye-appearance-state/v5",
     status: "product-export-approved",
     productExportApproved: true,
     definitionSha256: HASH,
     dependencies: {
       socketEyeSurface: {
-        schemaVersion: "socket-eye-surface/v1",
+        schemaVersion: "socket-eye-surface/v2",
         definitionSha256: HASH,
       },
       eyeApertureSeam: {
-        schemaVersion: "eye-aperture-seam/v1",
+        schemaVersion: "eye-aperture-seam/v2",
         definitionSha256: HASH,
       },
     },
     ownership: "test",
     zeroLaw: "One keeps the package-authored iris and pupil size.",
     symmetryLaw: "Iris and pupil controls are linked bilaterally.",
-    compositionOrder: ["sclera", "scleraArtwork", "iris", "pupil", "highlight", "cornea"],
+    compositionOrder: [
+      "sclera",
+      "scleraArtwork",
+      "iris",
+      "pupil",
+      "highlight",
+      "cornea",
+    ],
     solidColorDefaults: {
       iris: [0.1, 0.5, 0.6, 1],
       pupil: [0.02, 0.02, 0.02, 1],
       sclera: [0.92, 0.9, 0.86, 1],
     },
     runtimeBindings: {
-      coordinateSpace: "socket-eye-surface",
+      coordinateSpace: "physical-eye-sphere",
       left: {
-        compositeCapNode: "EyeCompositeCap_L",
-        irisNeutralRadiusMeters: 0.01,
-        pupilNeutralRadiusRatio: 0.4,
+        physicalEyeNode: "bs_f1_eye_l_physical",
+        irisNeutralRadiusMeters: 0.0081,
+        pupilNeutralRadiusRatio: 0.49,
+        neutralPlacement: {
+          horizontalTravelFraction: -0.5,
+          verticalTravelFraction: -0.7,
+        },
+        irisHorizontalTravelMeters: 0.003,
         irisVerticalTravelMeters: 0.003,
         edgeSoftnessMeters: 0.0002,
         artworkMappings: {
-          sclera: "gaze-linked-carrier",
-          iris: "radial-carrier",
-          pupil: "radial-carrier",
-          highlight: "iris-space",
+          sclera: SOCKET_EYE_SCLERA_PROJECTION_CONTRACT,
+          iris: "sphere-tangent-radial",
+          pupil: "sphere-tangent-radial",
+          highlight: SOCKET_EYE_HIGHLIGHT_PROJECTION_CONTRACT,
         },
         cornea: { roughness: 0.2, clearcoat: 0.8, clearcoatRoughness: 0.1 },
       },
       right: {
-        compositeCapNode: "EyeCompositeCap_R",
-        irisNeutralRadiusMeters: 0.01,
-        pupilNeutralRadiusRatio: 0.4,
+        physicalEyeNode: "bs_f1_eye_r_physical",
+        irisNeutralRadiusMeters: 0.0081,
+        pupilNeutralRadiusRatio: 0.49,
+        neutralPlacement: {
+          horizontalTravelFraction: -0.5,
+          verticalTravelFraction: -0.7,
+        },
+        irisHorizontalTravelMeters: 0.003,
         irisVerticalTravelMeters: 0.003,
         edgeSoftnessMeters: 0.0002,
         artworkMappings: {
-          sclera: "gaze-linked-carrier",
-          iris: "radial-carrier",
-          pupil: "radial-carrier",
-          highlight: "iris-space",
+          sclera: SOCKET_EYE_SCLERA_PROJECTION_CONTRACT,
+          iris: "sphere-tangent-radial",
+          pupil: "sphere-tangent-radial",
+          highlight: SOCKET_EYE_HIGHLIGHT_PROJECTION_CONTRACT,
         },
         cornea: { roughness: 0.2, clearcoat: 0.8, clearcoatRoughness: 0.1 },
       },
@@ -278,19 +187,20 @@ function buildEyeAppearanceDefinition(): EyeAppearanceDefinitionV3 {
         apertureSeamSha256: HASH,
       },
     },
-    controls: controls as EyeAppearanceDefinitionV3["controls"],
+    controls: controls as EyeAppearanceDefinition["controls"],
     rangeEvidence: {
       schemaVersion: "test",
       sha256: HASH,
       canonicalSha256: HASH,
     },
-  } as EyeAppearanceDefinitionV3;
+  } as EyeAppearanceDefinition;
 }
 
 function renderEditor(
   options: {
     scope?: "brows" | "eyes";
     lashesPerEye?: boolean;
+    artworkRoles?: FacialArtworkRoleId[];
     creditDraft?: FacialArtworkUploadCreditDraft;
   } = {},
 ) {
@@ -304,6 +214,47 @@ function renderEditor(
       "per-eye",
     );
   }
+  for (const roleId of options.artworkRoles ?? []) {
+    const roleDefinition = definition.roles.find(
+      (entry) => entry.id === roleId,
+    )!;
+    const template = definition.templates.find(
+      (entry) => entry.id === roleDefinition.template,
+    )!;
+    const variant = resolveFacialArtworkTemplateVariant(
+      template,
+      template.canonicalOrientation,
+    );
+    const roleState = valueState.roles[roleId];
+    if (roleState.mode !== "shared")
+      throw new Error("fixture requires shared artwork");
+    roleState.shared.visible = true;
+    roleState.shared.artwork = createFacialArtworkArtworkLayer(
+      definition,
+      roleId,
+      {
+        role: roleId,
+        url: `/uploads/${roleId}.png`,
+        filename: `${roleId}.png`,
+        size: 100,
+        mimeType: "image/png",
+        sha256: HASH,
+        template: {
+          id: template.id,
+          version: template.version,
+          orientation: template.canonicalOrientation,
+          guideSha256: variant.guide.sha256,
+          maskSha256: variant.safePaintMask.sha256,
+        },
+        provenance: {
+          sourceKind: "user-authored",
+          author: "Josh",
+          license: "User-owned",
+          rightsConfirmed: true,
+        },
+      },
+    );
+  }
   const onCreditDraftChange = vi.fn();
   const props = {
     scope: options.scope ?? ("eyes" as const),
@@ -314,7 +265,8 @@ function renderEditor(
       eyeAppearanceDefinition,
     ),
     ownerDisplayName: "Josh",
-    creditDraft: options.creditDraft ?? createDefaultFacialArtworkUploadCreditDraft(),
+    creditDraft:
+      options.creditDraft ?? createDefaultFacialArtworkUploadCreditDraft(),
     onCreditDraftChange,
     onChange: vi.fn(),
     onEyeAppearanceChange: vi.fn(),
@@ -328,7 +280,9 @@ describe("FacialArtworkEditor", () => {
   it("uses the shared Select for upload credit and keeps brow artwork closed initially", async () => {
     renderEditor({ scope: "brows" });
 
-    expect(screen.getByRole("button", { name: "Source" })).toHaveTextContent("My artwork");
+    expect(screen.getByRole("button", { name: "Source" })).toHaveTextContent(
+      "My artwork",
+    );
     expect(screen.getByRole("button", { name: "Source" })).toHaveAttribute(
       "data-slot",
       "select-trigger",
@@ -340,7 +294,9 @@ describe("FacialArtworkEditor", () => {
     ).toBeInTheDocument();
     const browArtwork = screen.getByRole("button", { name: "Brow Artwork" });
     expect(browArtwork).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByRole("button", { name: "Upload PNG" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Upload PNG" }),
+    ).not.toBeInTheDocument();
 
     await fireEvent.click(browArtwork);
     expect(screen.getByRole("button", { name: "Upload PNG" })).toBeEnabled();
@@ -362,17 +318,23 @@ describe("FacialArtworkEditor", () => {
     await fireEvent.input(screen.getByLabelText("Artist or source"), {
       target: { value: "Example Artist" },
     });
-    creditDraft = editor.onCreditDraftChange.mock.calls.at(-1)?.[0] as FacialArtworkUploadCreditDraft;
+    creditDraft = editor.onCreditDraftChange.mock.calls.at(
+      -1,
+    )?.[0] as FacialArtworkUploadCreditDraft;
     await editor.rerender({ ...editor.props, creditDraft });
     await fireEvent.input(screen.getByLabelText("License or permission note"), {
       target: { value: "Licensed with permission" },
     });
-    creditDraft = editor.onCreditDraftChange.mock.calls.at(-1)?.[0] as FacialArtworkUploadCreditDraft;
+    creditDraft = editor.onCreditDraftChange.mock.calls.at(
+      -1,
+    )?.[0] as FacialArtworkUploadCreditDraft;
     await editor.rerender({ ...editor.props, creditDraft });
     await fireEvent.click(
       screen.getByLabelText("I confirm I have permission to use this artwork."),
     );
-    creditDraft = editor.onCreditDraftChange.mock.calls.at(-1)?.[0] as FacialArtworkUploadCreditDraft;
+    creditDraft = editor.onCreditDraftChange.mock.calls.at(
+      -1,
+    )?.[0] as FacialArtworkUploadCreditDraft;
     await editor.rerender({ ...editor.props, creditDraft });
     expect(screen.getByRole("button", { name: "Upload PNG" })).toBeEnabled();
   });
@@ -387,12 +349,14 @@ describe("FacialArtworkEditor", () => {
       "Eye Highlight Artwork",
       "Sclera Artwork",
     ]) {
-      expect(screen.getByRole("button", { name: new RegExp(`^${label}`) })).toHaveAttribute(
-        "aria-expanded",
-        "false",
-      );
+      expect(
+        screen.getByRole("button", { name: new RegExp(`^${label}`) }),
+      ).toHaveAttribute("aria-expanded", "false");
     }
-    expect(screen.getByText("0 changed")).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByText("0 changed")).toHaveAttribute(
+      "aria-live",
+      "polite",
+    );
 
     const iris = screen.getByRole("button", { name: /^Iris Artwork/ });
     const pupil = screen.getByRole("button", { name: /^Pupil Artwork/ });
@@ -406,18 +370,33 @@ describe("FacialArtworkEditor", () => {
   it("uses the shared segmented toggle and keeps guidance behind the info icon", async () => {
     renderEditor();
 
-    const headerInfo = screen.getByRole("button", { name: "About Lash & Outline Artwork" });
+    const headerInfo = screen.getByRole("button", {
+      name: "About Lash & Outline Artwork",
+    });
     expect(headerInfo).toBeInTheDocument();
-    await fireEvent.click(screen.getByRole("button", { name: /^Lash & Outline Artwork/ }));
-    expect(screen.getByRole("radio", { name: "Same for both" })).toHaveAttribute(
-      "data-state",
-      "on",
+    await fireEvent.click(
+      screen.getByRole("button", { name: /^Lash & Outline Artwork/ }),
     );
-    expect(screen.getByRole("radio", { name: "Customize each eye" })).toBeInTheDocument();
-    expect(screen.queryByText(/Canonical Goon Left artwork mirrors/)).not.toBeInTheDocument();
-    const panel = screen.getByRole("region", { name: /Lash & Outline Artwork/ });
-    expect(within(panel).queryByText("Lash & Outline Artwork")).not.toBeInTheDocument();
-    expect(within(panel).queryByRole("button", { name: "About Lash & Outline Artwork" })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("radio", { name: "Same for both" }),
+    ).toHaveAttribute("data-state", "on");
+    expect(
+      screen.getByRole("radio", { name: "Customize each eye" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Canonical Goon Left artwork mirrors/),
+    ).not.toBeInTheDocument();
+    const panel = screen.getByRole("region", {
+      name: /Lash & Outline Artwork/,
+    });
+    expect(
+      within(panel).queryByText("Lash & Outline Artwork"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(panel).queryByRole("button", {
+        name: "About Lash & Outline Artwork",
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("switches the one human Template by anatomical side and keeps machine assets hidden", async () => {
@@ -426,20 +405,32 @@ describe("FacialArtworkEditor", () => {
       screen.getByRole("button", { name: "Lash & Outline Artwork" }),
     );
 
-    const panel = screen.getByRole("region", { name: /Lash & Outline Artwork/ });
+    const panel = screen.getByRole("region", {
+      name: /Lash & Outline Artwork/,
+    });
     expect(
       within(panel).getByRole("link", {
         name: /Goon's Left Eye \(viewer's right\) Template/,
       }),
     ).toHaveAttribute(
       "href",
-      "/goons/facial-artwork/v4/lashes_eye_outline/guide-left.png",
+      "/goons/facial-artwork/v6/test-v6/lashes_eye_outline/guide-anatomical-left.png",
     );
-    expect(within(panel).queryByText(/pink is forbidden/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "About Lash & Outline Artwork" })).toBeInTheDocument();
-    expect(within(panel).queryByText("Lash & Outline Artwork")).not.toBeInTheDocument();
-    expect(within(panel).queryByRole("link", { name: /Mask/ })).not.toBeInTheDocument();
-    expect(within(panel).queryByRole("link", { name: /Blank/ })).not.toBeInTheDocument();
+    expect(
+      within(panel).queryByText(/pink is forbidden/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "About Lash & Outline Artwork" }),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).queryByText("Lash & Outline Artwork"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(panel).queryByRole("link", { name: /Mask/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(panel).queryByRole("link", { name: /Blank/ }),
+    ).not.toBeInTheDocument();
 
     await fireEvent.click(
       within(panel).getByRole("radio", {
@@ -453,7 +444,7 @@ describe("FacialArtworkEditor", () => {
       }),
     ).toHaveAttribute(
       "href",
-      "/goons/facial-artwork/v4/lashes_eye_outline/guide-right.png",
+      "/goons/facial-artwork/v6/test-v6/lashes_eye_outline/guide-anatomical-right.png",
     );
   });
 
@@ -475,7 +466,9 @@ describe("FacialArtworkEditor", () => {
     await fireEvent.click(
       screen.getByRole("button", { name: "Lash & Outline Artwork" }),
     );
-    const panel = screen.getByRole("region", { name: /Lash & Outline Artwork/ });
+    const panel = screen.getByRole("region", {
+      name: /Lash & Outline Artwork/,
+    });
     const leftTemplate = within(panel).getByRole("link", {
       name: /Goon's Left Eye \(viewer's right\) Template/,
     });
@@ -484,12 +477,15 @@ describe("FacialArtworkEditor", () => {
     await waitFor(() =>
       expect(downloadBlob).toHaveBeenCalledWith(
         blob,
-        "template-guide-left.png",
-        expect.objectContaining({ mimeType: "image/png", title: "Save Lash & Outline Artwork Template" }),
+        "template-guide-anatomical-left.png",
+        expect.objectContaining({
+          mimeType: "image/png",
+          title: "Save Lash & Outline Artwork Template",
+        }),
       ),
     );
     expect(fetchMock).toHaveBeenCalledWith(
-      "/goons/facial-artwork/v4/lashes_eye_outline/guide-left.png",
+      "/goons/facial-artwork/v6/test-v6/lashes_eye_outline/guide-anatomical-left.png",
     );
 
     await fireEvent.click(
@@ -505,7 +501,7 @@ describe("FacialArtworkEditor", () => {
     await waitFor(() =>
       expect(downloadBlob).toHaveBeenLastCalledWith(
         blob,
-        "template-guide-right.png",
+        "template-guide-anatomical-right.png",
         expect.objectContaining({ mimeType: "image/png" }),
       ),
     );
@@ -518,7 +514,9 @@ describe("FacialArtworkEditor", () => {
     );
     renderEditor();
 
-    await fireEvent.click(screen.getByRole("button", { name: /^Lash & Outline Artwork/ }));
+    await fireEvent.click(
+      screen.getByRole("button", { name: /^Lash & Outline Artwork/ }),
+    );
     await fireEvent.click(screen.getByRole("link", { name: /Template/ }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -527,31 +525,51 @@ describe("FacialArtworkEditor", () => {
     expect(downloadBlob).not.toHaveBeenCalled();
   });
 
-  it("keeps Iris and Pupil artwork separate while linking Iris, Pupil, and Highlight position", async () => {
+  it("keeps Iris and Pupil artwork separate while exposing the linked physical placement controls", async () => {
     renderEditor();
 
-    await fireEvent.click(screen.getByRole("button", { name: /^Iris Artwork/ }));
+    await fireEvent.click(
+      screen.getByRole("button", { name: /^Iris Artwork/ }),
+    );
     const irisPanel = screen.getByRole("region", { name: /^Iris Artwork/ });
-    expect(within(irisPanel).getByRole("slider", { name: "Iris Size" })).toBeInTheDocument();
+    expect(
+      within(irisPanel).getByRole("slider", { name: "Iris Size" }),
+    ).toBeInTheDocument();
+    const horizontalSlider = within(irisPanel).getByRole("slider", {
+      name: "Iris Horizontal Position",
+    });
+    expect(horizontalSlider).toHaveAttribute("aria-valuemin", "-1");
+    expect(horizontalSlider).toHaveAttribute("aria-valuemax", "1");
+    expect(horizontalSlider).toHaveAttribute("aria-valuenow", "0");
     const verticalSlider = within(irisPanel).getByRole("slider", {
       name: "Iris Vertical Position",
     });
     expect(verticalSlider).toHaveAttribute("aria-valuemin", "-1");
     expect(verticalSlider).toHaveAttribute("aria-valuemax", "1");
     expect(verticalSlider).toHaveAttribute("aria-valuenow", "0");
-    expect(within(irisPanel).getByRole("radio", { name: "Customize each eye" })).toBeInTheDocument();
+    expect(
+      within(irisPanel).getByRole("radio", { name: "Customize each eye" }),
+    ).toBeInTheDocument();
 
-    await fireEvent.click(screen.getByRole("button", { name: /^Pupil Artwork/ }));
+    await fireEvent.click(
+      screen.getByRole("button", { name: /^Pupil Artwork/ }),
+    );
     const pupilPanel = screen.getByRole("region", { name: /^Pupil Artwork/ });
-    expect(within(pupilPanel).getByRole("radio", { name: "Customize each eye" })).toBeInTheDocument();
-    const pupilSlider = within(pupilPanel).getByRole("slider", { name: "Pupil Size" });
-    expect(pupilSlider).toHaveAttribute("aria-valuemin", "0");
-    expect(pupilSlider).toHaveAttribute("aria-valuemax", "2");
+    expect(
+      within(pupilPanel).getByRole("radio", { name: "Customize each eye" }),
+    ).toBeInTheDocument();
+    const pupilSlider = within(pupilPanel).getByRole("slider", {
+      name: "Pupil Size",
+    });
+    expect(pupilSlider).toHaveAttribute("aria-valuemin", "0.5");
+    expect(pupilSlider).toHaveAttribute("aria-valuemax", "1.5");
   });
 
   it("keeps Sclera focused on surface artwork without retired globe geometry controls", async () => {
     renderEditor();
-    await fireEvent.click(screen.getByRole("button", { name: /^Sclera Artwork/ }));
+    await fireEvent.click(
+      screen.getByRole("button", { name: /^Sclera Artwork/ }),
+    );
 
     const panel = screen.getByRole("region", { name: /^Sclera Artwork/ });
     expect(within(panel).queryByText("Surface")).not.toBeInTheDocument();
@@ -572,5 +590,79 @@ describe("FacialArtworkEditor", () => {
       within(panel).queryByText("Artwork Vertical Position"),
     ).not.toBeInTheDocument();
     expect(within(panel).queryByText("Artwork Scale")).not.toBeInTheDocument();
+  });
+
+  it("renders only the transform controls owned by each v6 role definition", async () => {
+    const eyeEditor = renderEditor({
+      artworkRoles: [
+        "lashes_eye_outline",
+        "iris",
+        "pupil",
+        "eye_highlight",
+        "sclera",
+      ],
+    });
+
+    for (const label of ["Iris Artwork", "Pupil Artwork"]) {
+      await fireEvent.click(
+        screen.getByRole("button", { name: new RegExp(`^${label}`) }),
+      );
+      const panel = screen.getByRole("region", {
+        name: new RegExp(`^${label}`),
+      });
+      expect(within(panel).getByText("Artwork Rotation")).toBeInTheDocument();
+      expect(
+        within(panel).queryByText("Artwork Horizontal Position"),
+      ).not.toBeInTheDocument();
+      expect(
+        within(panel).queryByText("Artwork Vertical Position"),
+      ).not.toBeInTheDocument();
+      expect(
+        within(panel).queryByText("Artwork Scale"),
+      ).not.toBeInTheDocument();
+    }
+
+    for (const label of ["Lash & Outline Artwork", "Eye Highlight Artwork"]) {
+      await fireEvent.click(
+        screen.getByRole("button", { name: new RegExp(`^${label}`) }),
+      );
+      const panel = screen.getByRole("region", {
+        name: new RegExp(`^${label}`),
+      });
+      for (const control of [
+        "Artwork Horizontal Position",
+        "Artwork Vertical Position",
+        "Artwork Scale",
+        "Artwork Rotation",
+      ]) {
+        expect(within(panel).getByText(control)).toBeInTheDocument();
+      }
+    }
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: /^Sclera Artwork/ }),
+    );
+    const scleraPanel = screen.getByRole("region", { name: /^Sclera Artwork/ });
+    expect(
+      within(scleraPanel).getByText("Artwork Rotation"),
+    ).toBeInTheDocument();
+    expect(
+      within(scleraPanel).queryByText("Artwork Scale"),
+    ).not.toBeInTheDocument();
+
+    eyeEditor.unmount();
+    renderEditor({ scope: "brows", artworkRoles: ["brows"] });
+    await fireEvent.click(
+      screen.getByRole("button", { name: /^Brow Artwork/ }),
+    );
+    const browPanel = screen.getByRole("region", { name: /^Brow Artwork/ });
+    for (const control of [
+      "Artwork Horizontal Position",
+      "Artwork Vertical Position",
+      "Artwork Scale",
+      "Artwork Rotation",
+    ]) {
+      expect(within(browPanel).getByText(control)).toBeInTheDocument();
+    }
   });
 });

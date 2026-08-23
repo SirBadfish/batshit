@@ -6,10 +6,15 @@ import { fileURLToPath } from 'node:url';
 
 import {
   ELECTRON_SOURCE_FILES,
+  GOON_PACKAGE_UTI_DECLARATION,
   packageBasename,
   parsePackageArgs,
   signingOptionsForFile
 } from './package-mac-app.mjs';
+import {
+  HAIR_CATALOG_PACKAGE_CONTRACT,
+  validateHairCatalogPackageDefinition
+} from './hair-catalog-package-contract.mjs';
 
 const scriptsRoot = path.dirname(fileURLToPath(import.meta.url));
 
@@ -44,11 +49,59 @@ test('the immutable Electron staging inventory includes every required shell mod
     'desktop-goon-contract.mjs',
     'desktop-goon-window-policy.mjs',
     'desktop-goon-window-state.mjs',
-    'desktop-goon-window-controller.mjs'
+    'desktop-goon-window-controller.mjs',
+    'shutdown-lifecycle.mjs'
   ]);
   for (const file of ELECTRON_SOURCE_FILES) {
     assert.equal(fs.existsSync(path.join(scriptsRoot, '..', 'src-electron', file)), true, file);
   }
+});
+
+test('the Mac package declares the proprietary .bgoon archive type', () => {
+  assert.deepEqual(GOON_PACKAGE_UTI_DECLARATION, {
+    UTTypeIdentifier: 'ai.batshit.goon-package',
+    UTTypeDescription: 'Batshit Goon Package',
+    UTTypeConformsTo: ['public.zip-archive'],
+    UTTypeTagSpecification: {
+      'public.filename-extension': ['bgoon'],
+      'public.mime-type': ['application/vnd.batshit.goon+zip']
+    }
+  });
+});
+
+test('the Mac package contract carries the complete Hair v2 revision lineage', () => {
+  assert.deepEqual(HAIR_CATALOG_PACKAGE_CONTRACT, {
+    contract: 'hair-catalog/v2',
+    runtimeRoot: 'batshit-app/static/goon-assets/hair',
+    definition: 'v2/catalog.json',
+    schemaVersion: 'hair-catalog/v2'
+  });
+
+  const catalogPath = path.join(
+    scriptsRoot,
+    '..',
+    '..',
+    ...HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot.split('/'),
+    'v2',
+    'catalog.json'
+  );
+  const catalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
+  assert.equal(validateHairCatalogPackageDefinition(catalog), catalog);
+  assert.equal(catalog.currentRevisions.length, 2);
+  assert.equal(catalog.successorEdges.length, 2);
+  assert.deepEqual(
+    new Set(catalog.assets.map((asset) => asset.revision)),
+    new Set([1, 2])
+  );
+
+  assert.throws(
+    () =>
+      validateHairCatalogPackageDefinition({
+        schemaVersion: 'hair-catalog/v1',
+        assets: []
+      }),
+    /invalid hair-catalog\/v2 catalog/
+  );
 });
 
 test('release packaging honors the configured Developer ID signing identity', () => {
@@ -57,6 +110,10 @@ test('release packaging honors the configured Developer ID signing identity', ()
   const entitlements = fs.readFileSync(path.join(scriptsRoot, '..', 'macos.entitlements'), 'utf8');
   const localEntitlements = fs.readFileSync(
     path.join(scriptsRoot, '..', 'macos.local.entitlements'),
+    'utf8'
+  );
+  const nodeRuntimeEntitlements = fs.readFileSync(
+    path.join(scriptsRoot, '..', 'macos.node-runtime.entitlements'),
     'utf8'
   );
   assert.match(source, /process\.env\.MACOS_CODESIGN_IDENTITY/);
@@ -72,6 +129,32 @@ test('release packaging honors the configured Developer ID signing identity', ()
   assert.match(entitlements, /com\.apple\.security\.cs\.allow-jit/);
   assert.doesNotMatch(entitlements, /disable-library-validation/);
   assert.match(localEntitlements, /com\.apple\.security\.cs\.disable-library-validation/);
+  assert.match(nodeRuntimeEntitlements, /com\.apple\.security\.cs\.disable-library-validation/);
+  assert.match(nodeRuntimeEntitlements, /com\.apple\.security\.device\.audio-input/);
+});
+
+test('release signing grants third-party native-module loading only to managed Node', () => {
+  const appPath = '/tmp/Batshit.app';
+  const mainExecutable = `${appPath}/Contents/MacOS/Batshit`;
+  const managedNodeExecutable =
+    `${appPath}/Contents/Resources/runtime/vendor/node/bin/node`;
+  const packagedRedisExecutable =
+    `${appPath}/Contents/Resources/runtime/vendor/redis-stack/bin/redis-server`;
+
+  const nodeOptions = signingOptionsForFile(managedNodeExecutable, {
+    appPath,
+    mainExecutable,
+    adHoc: false
+  });
+  const redisOptions = signingOptionsForFile(packagedRedisExecutable, {
+    appPath,
+    mainExecutable,
+    adHoc: false
+  });
+
+  assert.equal(path.basename(nodeOptions.entitlements), 'macos.node-runtime.entitlements');
+  assert.equal(path.basename(redisOptions.entitlements), 'macos.child.entitlements');
+  assert.equal(nodeOptions.hardenedRuntime, true);
 });
 
 test('local signing gives every Electron process the same library-loading exception', () => {

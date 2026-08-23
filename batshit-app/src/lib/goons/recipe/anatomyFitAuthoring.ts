@@ -4,11 +4,11 @@ import type { GoonCustomAvatarManifest } from "../customAvatar";
 import {
   parseEyeApertureSeamDefinition,
   validateSocketEyeApertureOwnership,
-  type EyeApertureSeamDefinitionV1,
+  type EyeApertureSeamDefinitionV2,
 } from "../eyeApertureSeam";
 import {
   parseSocketEyeSurfaceDefinition,
-  type SocketEyeSurfaceDefinitionV1,
+  type SocketEyeSurfaceDefinitionV2,
 } from "../socketEyeSurface";
 import {
   SOCKET_EYE_ANATOMY_FIT_SOLVER,
@@ -61,8 +61,8 @@ import {
 
 export type AnatomyFitAuthoringEvaluationInput = {
   definition: AnatomyFitManifestDefinition;
-  socketEyeSurface: SocketEyeSurfaceDefinitionV1;
-  eyeApertureSeam: EyeApertureSeamDefinitionV1;
+  socketEyeSurface: SocketEyeSurfaceDefinitionV2;
+  eyeApertureSeam: EyeApertureSeamDefinitionV2;
   oralCavityFit: OralCavityFitPackageV1;
   modelBytes: Uint8Array;
   source: RecipeSourceIdentity;
@@ -92,8 +92,8 @@ function uint8View(value: Float32Array): Uint8Array {
 
 function validateDomainBindings(
   domain: SocketEyeAnatomyFitDomain,
-  socketEye: SocketEyeSurfaceDefinitionV1,
-  seam: EyeApertureSeamDefinitionV1,
+  socketEye: SocketEyeSurfaceDefinitionV2,
+  seam: EyeApertureSeamDefinitionV2,
 ) {
   const surfaceSide = socketEye.runtimeBindings[domain.side];
   const seamSide = seam.runtimeBindings[domain.side];
@@ -103,8 +103,8 @@ function validateDomainBindings(
   if (domain.apertureSeamDefinitionSha256 !== seam.definitionSha256) {
     fail(`domain socket-eye:${domain.side} references another aperture-seam definition`);
   }
-  if (domain.compositeCapNodeId !== surfaceSide.nodes.compositeCap) {
-    fail(`domain socket-eye:${domain.side} references another composite-cap node`);
+  if (domain.physicalEyeNodeId !== surfaceSide.nodes.physicalEye) {
+    fail(`domain socket-eye:${domain.side} references another physical-eye node`);
   }
   if (domain.lashesEyeOutlineNodeId !== seamSide.lashesEyeOutlineNode) {
     fail(`domain socket-eye:${domain.side} references another lashes/outline node`);
@@ -127,18 +127,14 @@ function validateOralDomainBindings(
   }
 }
 
-/** Verify every package-authored cap/liner surface against final identity geometry. */
+/** Verify every package-authored physical-eye/treatment surface against final identity geometry. */
 export async function computeAnatomyFitSiblingFromEvaluation(
   input: AnatomyFitAuthoringEvaluationInput,
 ): Promise<RecipeSiblingStateRecord> {
   validateSocketEyeApertureOwnership(input.socketEyeSurface, input.eyeApertureSeam);
-  if (
-    input.definition.domains.some(
-      (domain) => domain.bodyTopologySha256 !== input.source.topologySha256,
-    )
-  ) {
-    fail("the Anatomy Fit definition does not match the verified Recipe Source topology");
-  }
+  // Recipe Source topology covers the whole multi-mesh GLB. Anatomy Fit owns
+  // the shared body topology separately; the manifest parser and Oral Cavity
+  // package binding prove that exact body identity for all three domains.
   const meshById = new Map(input.evaluation.meshes.map((entry) => [entry.id, entry]));
   const previousByDomain = new Map(
     (input.previousState?.fits ?? []).map((entry) => [entry.result.domain, entry]),
@@ -155,9 +151,6 @@ export async function computeAnatomyFitSiblingFromEvaluation(
     const domainId = domain.contract === ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT
       ? "oral-cavity"
       : `socket-eye:${domain.side}`;
-    if (domain.bodyTopologySha256 !== input.source.topologySha256) {
-      fail(`domain ${domainId} targets another Recipe Source topology`);
-    }
     const body = meshById.get(domain.bodyMeshId);
     if (!body) fail(`domain ${domainId} body mesh ${domain.bodyMeshId} is missing`);
     if (domain.contract === ORAL_CAVITY_ANATOMY_DOMAIN_CONTRACT) {
@@ -173,7 +166,7 @@ export async function computeAnatomyFitSiblingFromEvaluation(
         source: {
           modelSha256: input.source.modelSha256,
           appearanceDefinitionSha256: input.appearanceManifest.definitionSha256,
-          topologySha256: input.source.topologySha256,
+          topologySha256: domain.bodyTopologySha256,
         },
         definition: input.oralCavityFit.definition,
         bodyMeshId: domain.bodyMeshId,
@@ -190,7 +183,7 @@ export async function computeAnatomyFitSiblingFromEvaluation(
             source: {
               modelSha256: input.source.modelSha256,
               appearanceDefinitionSha256: input.appearanceManifest.definitionSha256,
-              topologySha256: input.source.topologySha256,
+              topologySha256: domain.bodyTopologySha256,
             },
             definition: input.oralCavityFit.definition,
             bodyMeshId: domain.bodyMeshId,
@@ -235,7 +228,7 @@ export async function computeAnatomyFitSiblingFromEvaluation(
       source: {
         modelSha256: input.source.modelSha256,
         appearanceDefinitionSha256: input.appearanceManifest.definitionSha256,
-        topologySha256: input.source.topologySha256,
+        topologySha256: domain.bodyTopologySha256,
         positionsSha256: await sha256Hex(uint8View(body.positions)),
         positionsScalarCount: body.positions.length,
         physicalEvaluationSha256: proof.proofSha256,

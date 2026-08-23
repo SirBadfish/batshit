@@ -18,7 +18,6 @@ import {
 } from "./customAvatar";
 import { resolveCustomPerformanceRigManifest } from "./customPerformanceRig";
 import { parseFirstPartySocketEyePackage } from "./socketEyePackage";
-import { socketEyeCapRetainedDynamicMorphs } from "./socketEyeSurface";
 import {
   APPEARANCE_RECIPE_PHYSICAL_BASIS_CONTRACT,
   createAppearanceRecipePhysicalEvaluator,
@@ -89,18 +88,16 @@ function socketEyeSourceOnlyMorphRuntimeKeys(
     const nodeContracts = [
       {
         nodeName:
-          packageValue.socketEyeSurface.runtimeBindings[side].nodes
-            .compositeCap,
-        retained: new Set(socketEyeCapRetainedDynamicMorphs(side)),
-      },
-      {
-        nodeName:
           packageValue.eyeApertureSeam.runtimeBindings[side]
             .lashesEyeOutlineNode,
-        retained: new Set(
-          packageValue.eyeApertureSeam.runtimeBindings[side].liner
+        retained: new Set([
+          ...packageValue.eyeApertureSeam.runtimeBindings[side].treatment
             .retainedPerformanceMorphs,
-        ),
+          packageValue.eyeApertureSeam.runtimeBindings[side].treatment
+            .surfaceCorrection.blinkLinearMorph,
+          packageValue.eyeApertureSeam.runtimeBindings[side].treatment
+            .surfaceCorrection.blinkResidualMorph,
+        ]),
       },
     ];
     for (const { nodeName, retained } of nodeContracts) {
@@ -320,6 +317,7 @@ export class AppearanceDialsEngineRuntime {
   private values: unknown;
   private state: ResolvedAppearanceDialState;
   private anatomyFitResults: readonly AnatomyFitResult[] = [];
+  private currentFollowerMorphWeights = new Map<string, number>();
 
   constructor(
     root: THREE.Object3D,
@@ -970,10 +968,10 @@ export class AppearanceDialsEngineRuntime {
       for (const side of ["left", "right"] as const) {
         const declared = [
           {
-            id: `${side}.compositeCap`,
+            id: `${side}.physicalEye`,
             name: socketEyePackage.socketEyeSurface.runtimeBindings[side].nodes
-              .compositeCap,
-            path: `socketEyeSurface.runtimeBindings.${side}.nodes.compositeCap`,
+              .physicalEye,
+            path: `socketEyeSurface.runtimeBindings.${side}.nodes.physicalEye`,
           },
           {
             id: `${side}.lashesEyeOutline`,
@@ -1097,6 +1095,12 @@ export class AppearanceDialsEngineRuntime {
     const evaluated = this.physicalEvaluator.evaluate(state, {
       anatomyFitResults: this.anatomyFitResults,
     });
+    this.currentFollowerMorphWeights = new Map(
+      evaluated.followerMorphWeights.map((entry) => [
+        entry.node + "\u0000" + entry.morph,
+        entry.weight,
+      ]),
+    );
 
     for (const retained of evaluated.retainedTargetPositionBindings) {
       const binding = this.retainedPhysicalBindings.get(retained.id);
@@ -1205,6 +1209,27 @@ export class AppearanceDialsEngineRuntime {
       this.hipsRemap.lastOutput = this.hipsRemap.newRest.clone();
     }
     this.root.updateMatrixWorld(true);
+  }
+
+  /** Read one exact evaluated Recipe follower weight by physical node identity. */
+  getFollowerMorphWeight(nodeName: string, morph: string): number {
+    const nodeIds = Object.entries(this.manifest.nodes)
+      .filter(([, declaration]) => declaration.node === nodeName)
+      .map(([id]) => id);
+    if (nodeIds.length !== 1) {
+      throw new Error(
+        `appearance follower node ${nodeName} must resolve to exactly one manifest node`,
+      );
+    }
+    const weight = this.currentFollowerMorphWeights.get(
+      nodeIds[0] + "\u0000" + morph,
+    );
+    if (weight === undefined) {
+      throw new Error(
+        `appearance follower ${nodeName}/${morph} has no evaluated weight`,
+      );
+    }
+    return weight;
   }
 
   applyHipsClipRemap() {

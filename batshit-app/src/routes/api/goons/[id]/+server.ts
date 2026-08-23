@@ -202,8 +202,8 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     }
     if (
       error instanceof Error &&
-      (error.message.startsWith('[facial-artwork/v4]') ||
-        error.message.startsWith('[eye-appearance/v3]') ||
+      (error.message.startsWith('[facial-artwork/v6]') ||
+        error.message.startsWith('[eye-appearance/v5]') ||
         error.message.startsWith('[socket-eye-contact-settings/v2]') ||
         error.message.startsWith('[oral-appearance/v1]') ||
         error.message.startsWith('[lip-artwork/v2]') ||

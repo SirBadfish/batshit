@@ -27,7 +27,7 @@ function domain(side: "left" | "right"): SocketEyeAnatomyFitDomain {
     bodyTopologySha256: sha("c"),
     socketEyeSurfaceDefinitionSha256: sha("d"),
     apertureSeamDefinitionSha256: sha("e"),
-    compositeCapNodeId: `BS_Eye_${suffix}_CompositeCap`,
+    physicalEyeNodeId: `BS_Eye_${suffix}_Physical`,
     lashesEyeOutlineNodeId: `BS_Face_${suffix}_LashesEyeOutline`,
   };
 }
@@ -105,7 +105,7 @@ describe("Anatomy Fit v2 manifest definition", () => {
     if (!left || left.contract !== SOCKET_EYE_ANATOMY_DOMAIN_CONTRACT) {
       throw new Error("left test domain is missing");
     }
-    left.compositeCapNodeId = "BS_Eye_L_Other";
+    left.physicalEyeNodeId = "BS_Eye_L_Other";
     await expect(parseAnatomyFitManifestDefinition(tampered)).rejects.toThrow(
       "definitionSha256 does not match canonical content",
     );

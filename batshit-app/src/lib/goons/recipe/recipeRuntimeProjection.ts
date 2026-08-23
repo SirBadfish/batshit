@@ -71,52 +71,62 @@ type RecipeSiblingProjection = Pick<
 const SIBLING_PROJECTIONS = [
   {
     field: "facialArtwork",
-    contracts: ["facial-artwork-state/v4"],
+    contracts: ["facial-artwork-state/v6"],
+    migrationPreviewContracts: ["facial-artwork-state/v5"],
     ids: ["facialArtwork", "facial-artwork"],
   },
   {
     field: "eyeAppearance",
-    contracts: ["eye-appearance-state/v3"],
+    contracts: ["eye-appearance-state/v5"],
+    migrationPreviewContracts: ["eye-appearance-state/v4"],
     ids: ["eyeAppearance", "eye-appearance"],
   },
   {
     field: "oralAppearance",
     contracts: null,
+    migrationPreviewContracts: null,
     ids: ["oralAppearance", "oral-appearance"],
   },
   {
     field: "lipArtwork",
     contracts: ["lip-artwork-state/v2"],
+    migrationPreviewContracts: null,
     ids: ["lipArtwork", "lip-artwork"],
   },
   {
     field: "lipArtworkPresence",
     contracts: ["lip-artwork-presence-state/v1"],
+    migrationPreviewContracts: null,
     ids: ["lipArtworkPresence", "lip-artwork-presence"],
   },
   {
     field: "nailSurface",
     contracts: ["nail-surface-state/v1"],
+    migrationPreviewContracts: null,
     ids: ["nailSurface", "nail-surface"],
   },
   {
     field: "nailSurfacePresence",
     contracts: ["nail-surface-presence-state/v1"],
+    migrationPreviewContracts: null,
     ids: ["nailSurfacePresence", "nail-surface-presence"],
   },
   {
     field: "skinAppearance",
     contracts: ["skin-appearance-state/v1", "skin-appearance-state/v2"],
+    migrationPreviewContracts: null,
     ids: ["skinAppearance", "skin-appearance"],
   },
   {
     field: "skinMaterialArtwork",
     contracts: ["skin-material-artwork-state/v1", "skin-material-artwork-state/v2"],
+    migrationPreviewContracts: null,
     ids: ["skinMaterialArtwork", "skin-material-artwork"],
   },
   {
     field: "hairState",
     contracts: ["hair-state/v2"],
+    migrationPreviewContracts: null,
     ids: ["hairState", "hair-state"],
   },
 ] as const;
@@ -326,6 +336,7 @@ function sourceFileRef(
 
 function projectSiblingState(
   state: RecipeStateSnapshot,
+  allowLegacyMigrationPreview = false,
 ): RecipeSiblingProjection {
   const projection: RecipeSiblingProjection = {
     appearanceDials: cloneJson(state.appearanceDials),
@@ -348,12 +359,15 @@ function projectSiblingState(
     if (claimed.has(sibling.id)) {
       throw new Error(`Recipe sibling ${sibling.id} is bound to more than one surface.`);
     }
-    if (
-      descriptor.contracts !== null &&
-      !(descriptor.contracts as readonly string[]).includes(sibling.contract)
-    ) {
+    const currentContracts = descriptor.contracts as readonly string[] | null;
+    const legacyPreviewContracts = descriptor.migrationPreviewContracts as readonly string[] | null;
+    const current = currentContracts === null || currentContracts.includes(sibling.contract);
+    const previewLegacy = Boolean(
+      allowLegacyMigrationPreview && legacyPreviewContracts?.includes(sibling.contract),
+    );
+    if (!current && !previewLegacy) {
       throw new Error(
-        `Recipe sibling ${sibling.id} must use ${(descriptor.contracts as readonly string[]).join(" or ")}.`,
+        `Recipe sibling ${sibling.id} must use ${currentContracts?.join(" or ")}.`,
       );
     }
     const siblingState = requiredRecord(
@@ -382,8 +396,9 @@ function projectSiblingState(
 function applySiblingProjection(
   goon: GoonRecord,
   state: RecipeStateSnapshot,
+  allowLegacyMigrationPreview = false,
 ) {
-  const projection = projectSiblingState(state);
+  const projection = projectSiblingState(state, allowLegacyMigrationPreview);
   goon.appearanceDials = projection.appearanceDials;
   for (const field of [
     "facialArtwork",
@@ -422,6 +437,8 @@ export function projectGoonRecipeSource(
   options: {
     source?: RecipeSource;
     state?: RecipeStateSnapshot;
+    /** Exact old sibling contracts are accepted only for the Recipe Current preview. */
+    allowLegacyMigrationPreview?: boolean;
   } = {},
 ): GoonRecord {
   const owner = recipeOwnerV2(goon);
@@ -437,7 +454,7 @@ export function projectGoonRecipeSource(
   };
   delete projected.customAvatar.pending;
   delete projected.customAvatar.backup;
-  applySiblingProjection(projected, state);
+  applySiblingProjection(projected, state, options.allowLegacyMigrationPreview === true);
   return projected;
 }
 

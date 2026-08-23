@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { open as openFile, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -34,6 +35,7 @@ import {
 } from './desktop-goon-contract.mjs';
 import { DesktopGoonWindowController } from './desktop-goon-window-controller.mjs';
 import { resolveMainWindowSizePolicy } from './main-window-policy.mjs';
+import { settleShutdownPreparations } from './shutdown-lifecycle.mjs';
 
 import {
   SUPERVISOR_COMMANDS,
@@ -48,6 +50,9 @@ import {
   resolveDesktopGoonUrl,
   resolveShellAssetPath,
   validateElectronIpcSender,
+  validateGoonPackageFileSelection,
+  validateGoonPackageHandleId,
+  validateGoonPackageReadRequest,
   validateSaveFileOptions
 } from './electron-shell-policy.mjs';
 
@@ -62,6 +67,7 @@ const shellRoot = app.isPackaged
 const shellUrl = 'batshit-shell://app/index.html';
 const appLifecycleSchemaVersion = 'app-lifecycle/v1';
 const appShutdownChannel = 'batshit:lifecycle:shutdown-started';
+const goonPackageSelectionTtlMs = 5 * 60_000;
 const mimeTypes = new Map([
   ['.css', 'text/css; charset=utf-8'],
   ['.html', 'text/html; charset=utf-8'],
@@ -82,6 +88,7 @@ let shutdownStarted = false;
 let quittingAfterShutdown = false;
 let pendingShutdownReason = 'app-quit';
 const windowRoleRegistry = new Map();
+const goonPackageSelectionHandles = new Map();
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -174,6 +181,7 @@ function registerWindowRole(webContents, role) {
     if (windowRoleRegistry.get(webContents.id) === record) {
       windowRoleRegistry.delete(webContents.id);
     }
+    releaseGoonPackageSelectionsForSender(webContents.id);
   };
   webContents.on('did-start-navigation', resetSequence);
   webContents.once('destroyed', remove);
@@ -182,6 +190,21 @@ function registerWindowRole(webContents, role) {
     webContents.removeListener('destroyed', remove);
     remove();
   };
+}
+
+function releaseGoonPackageSelection(handleId) {
+  const selection = goonPackageSelectionHandles.get(handleId);
+  if (!selection) return false;
+  goonPackageSelectionHandles.delete(handleId);
+  clearTimeout(selection.expiryTimer);
+  void selection.fileHandle.close().catch(() => {});
+  return true;
+}
+
+function releaseGoonPackageSelectionsForSender(webContentsId) {
+  for (const [handleId, selection] of goonPackageSelectionHandles) {
+    if (selection.webContentsId === webContentsId) releaseGoonPackageSelection(handleId);
+  }
 }
 
 function validateIpcSender(event, allowedRoles) {
@@ -250,6 +273,71 @@ function installIpcHandlers() {
       defaultPath
     });
     return result.canceled ? null : result.filePath || null;
+  });
+
+  ipcMain.handle('batshit:open-goon-package', async (event) => {
+    const record = validateIpcSender(event, [DESKTOP_GOON_WINDOW_ROLES.main]);
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Select a Goon File Package',
+      // macOS disables otherwise valid proprietary-extension archives when an
+      // Electron filter is present, even when Finder identifies their bytes as
+      // ZIP. Keep the native chooser unfiltered and enforce the exact extension,
+      // regular-file, and size contract after selection in the trusted main process.
+      properties: ['openFile']
+    });
+    const filePath = result.canceled ? null : result.filePaths[0] || null;
+    if (!filePath) return null;
+
+    const fileHandle = await openFile(filePath, 'r');
+    try {
+      const metadata = validateGoonPackageFileSelection(filePath, await fileHandle.stat());
+      const handleId = randomUUID();
+      const expiryTimer = setTimeout(
+        () => releaseGoonPackageSelection(handleId),
+        goonPackageSelectionTtlMs
+      );
+      expiryTimer.unref();
+      goonPackageSelectionHandles.set(handleId, {
+        ...metadata,
+        fileHandle,
+        webContentsId: record.webContents.id,
+        expiryTimer
+      });
+      return { handleId, ...metadata };
+    } catch (error) {
+      await fileHandle.close().catch(() => {});
+      throw error;
+    }
+  });
+
+  ipcMain.handle('batshit:read-goon-package-chunk', async (event, rawRequest) => {
+    const record = validateIpcSender(event, [DESKTOP_GOON_WINDOW_ROLES.main]);
+    const handleId = validateGoonPackageHandleId(rawRequest?.handleId);
+    const selection = goonPackageSelectionHandles.get(handleId);
+    if (!selection || selection.webContentsId !== record.webContents.id) {
+      throw new Error('Goon package selection is unavailable or expired.');
+    }
+    const request = validateGoonPackageReadRequest(rawRequest, selection.size);
+    const buffer = Buffer.allocUnsafe(request.length);
+    const { bytesRead } = await selection.fileHandle.read(
+      buffer,
+      0,
+      request.length,
+      request.offset
+    );
+    if (bytesRead !== request.length) {
+      releaseGoonPackageSelection(handleId);
+      throw new Error('The selected Goon package changed before it could be read.');
+    }
+    return buffer;
+  });
+
+  ipcMain.handle('batshit:release-goon-package', async (event, rawHandleId) => {
+    const record = validateIpcSender(event, [DESKTOP_GOON_WINDOW_ROLES.main]);
+    const handleId = validateGoonPackageHandleId(rawHandleId);
+    const selection = goonPackageSelectionHandles.get(handleId);
+    if (!selection || selection.webContentsId !== record.webContents.id) return false;
+    return releaseGoonPackageSelection(handleId);
   });
 
   ipcMain.handle(DESKTOP_GOON_IPC_CHANNEL, async (event, rawEnvelope) => {
@@ -353,6 +441,10 @@ function configureRoleNavigation(contents, role) {
   contents.on('will-redirect', enforce);
 }
 
+function intentionalShutdownInProgress() {
+  return shutdownStarted || quittingAfterShutdown;
+}
+
 function createWindow() {
   const window = new BrowserWindow({
     ...resolveMainWindowSizePolicy(),
@@ -373,7 +465,7 @@ function createWindow() {
   configureRoleNavigation(window.webContents, DESKTOP_GOON_WINDOW_ROLES.main);
   window.once('ready-to-show', () => window.show());
   window.webContents.on('render-process-gone', (_event, details) => {
-    if (quittingAfterShutdown) return;
+    if (intentionalShutdownInProgress()) return;
     void desktopGoonController?.handleMainRendererFailure('main-renderer-stopped').finally(() => {
       void dialog.showMessageBox(window, {
         type: 'error',
@@ -385,6 +477,7 @@ function createWindow() {
     });
   });
   window.on('unresponsive', () => {
+    if (intentionalShutdownInProgress()) return;
     void desktopGoonController?.handleMainRendererFailure('main-renderer-unresponsive').finally(() => {
       void dialog.showMessageBox(window, {
         type: 'warning',
@@ -425,9 +518,17 @@ async function stopRuntimeBeforeQuit(reason = 'app-quit') {
   if (shutdownStarted) return;
   shutdownStarted = true;
   notifyRendererShutdown(reason);
+  await settleShutdownPreparations([
+    {
+      name: 'Desktop Goon',
+      run: () => desktopGoonController?.prepareForQuit()
+    },
+    {
+      name: 'Desktop Controls',
+      run: () => desktopControlsController?.prepareForQuit()
+    }
+  ]);
   try {
-    await desktopGoonController?.prepareForQuit();
-    await desktopControlsController?.prepareForQuit();
     await runSupervisor('stop');
   } catch (error) {
     console.error('[Batshit Mac] Runtime shutdown failed:', error);

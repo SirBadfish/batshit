@@ -25,6 +25,8 @@ import {
 export const RECIPE_UPDATES_CONTRACT = "recipe-updates/v1";
 export const RECIPE_UPDATE_PROOF_CONTRACT = "recipe-update-proof/v1";
 export const RECIPE_UPDATE_JOB_CONTRACT = "recipe-update-job/v1";
+export const RECIPE_TOPOLOGY_REBUILD_PROOF_CONTRACT =
+  "recipe-topology-rebuild-proof/v1";
 export const RECIPE_STRICT_TOLERANCE_PROFILE = "recipe-strict/v1";
 export const RECIPE_STRICT_TOLERANCES = {
   scalar: 1e-7,
@@ -66,7 +68,11 @@ const SIBLING_ACTIONS = [
   "blocked",
   "not-present",
 ] as const;
-const WARNING_CODES = ["neutral-changed", "material-changed"] as const;
+const WARNING_CODES = [
+  "neutral-changed",
+  "material-changed",
+  "topology-changed",
+] as const;
 const REPORT_CLASSIFICATIONS = [
   "kept",
   "presentation-updated",
@@ -196,6 +202,20 @@ export type RecipeUpdateProof = {
   wholeRecipeProofSha256: string;
 };
 
+export type RecipeTopologyRebuildProof = {
+  contract: typeof RECIPE_TOPOLOGY_REBUILD_PROOF_CONTRACT;
+  mode: "rebuild-from-target-recipe-source";
+  fromTopologySha256: string;
+  toTopologySha256: string;
+  affectedMeshNodeIds: string[];
+  affectedComponentIds: string[];
+  authorityBundleSha256: string;
+  sourceAuditSha256: string;
+  targetAuditSha256: string;
+  requiresPreview: true;
+  proofSha256: string;
+};
+
 export type RecipeUpdateEdge = {
   id: string;
   directEdgeKey: string;
@@ -206,6 +226,7 @@ export type RecipeUpdateEdge = {
   aliases: RecipeAliasProof[];
   siblingSubplans: RecipeSiblingSubplan[];
   warnings: RecipeUpdateWarning[];
+  topologyRebuild?: RecipeTopologyRebuildProof;
   proof: RecipeUpdateProof;
   edgeSha256: string;
 };
@@ -845,6 +866,88 @@ function parseWarning(value: unknown, index: number): RecipeUpdateWarning {
   };
 }
 
+function parseTopologyRebuildProof(
+  value: unknown,
+  from: RecipeSourceIdentity,
+  to: RecipeSourceIdentity,
+  context: string,
+): RecipeTopologyRebuildProof {
+  const raw = requireRecord(value, context);
+  requireExactKeys(
+    raw,
+    [
+      "contract",
+      "mode",
+      "fromTopologySha256",
+      "toTopologySha256",
+      "affectedMeshNodeIds",
+      "affectedComponentIds",
+      "authorityBundleSha256",
+      "sourceAuditSha256",
+      "targetAuditSha256",
+      "requiresPreview",
+      "proofSha256",
+    ],
+    context,
+  );
+  if (raw.contract !== RECIPE_TOPOLOGY_REBUILD_PROOF_CONTRACT) {
+    throw new Error(`${context} contract is invalid`);
+  }
+  if (raw.mode !== "rebuild-from-target-recipe-source") {
+    throw new Error(`${context} mode is invalid`);
+  }
+  if (raw.requiresPreview !== true) {
+    throw new Error(`${context} must require preview`);
+  }
+  const affectedMeshNodeIds = parseStableIdList(
+    raw.affectedMeshNodeIds,
+    `${context}.affectedMeshNodeIds`,
+  );
+  const affectedComponentIds = parseStableIdList(
+    raw.affectedComponentIds,
+    `${context}.affectedComponentIds`,
+  );
+  if (affectedMeshNodeIds.length === 0 || affectedComponentIds.length === 0) {
+    throw new Error(`${context} must name affected meshes and components`);
+  }
+  const parsed: RecipeTopologyRebuildProof = {
+    contract: RECIPE_TOPOLOGY_REBUILD_PROOF_CONTRACT,
+    mode: "rebuild-from-target-recipe-source",
+    fromTopologySha256: requireSha(
+      raw.fromTopologySha256,
+      `${context}.fromTopologySha256`,
+    ),
+    toTopologySha256: requireSha(
+      raw.toTopologySha256,
+      `${context}.toTopologySha256`,
+    ),
+    affectedMeshNodeIds,
+    affectedComponentIds,
+    authorityBundleSha256: requireSha(
+      raw.authorityBundleSha256,
+      `${context}.authorityBundleSha256`,
+    ),
+    sourceAuditSha256: requireSha(
+      raw.sourceAuditSha256,
+      `${context}.sourceAuditSha256`,
+    ),
+    targetAuditSha256: requireSha(
+      raw.targetAuditSha256,
+      `${context}.targetAuditSha256`,
+    ),
+    requiresPreview: true,
+    proofSha256: requireSha(raw.proofSha256, `${context}.proofSha256`),
+  };
+  if (
+    parsed.fromTopologySha256 !== from.topologySha256 ||
+    parsed.toTopologySha256 !== to.topologySha256 ||
+    parsed.fromTopologySha256 === parsed.toTopologySha256
+  ) {
+    throw new Error(`${context} does not bind the exact topology transition`);
+  }
+  return parsed;
+}
+
 function parseUpdateProof(value: unknown): RecipeUpdateProof {
   const context = "recipe update proof";
   const raw = requireRecord(value, context);
@@ -919,6 +1022,10 @@ function parseUpdateProof(value: unknown): RecipeUpdateProof {
 function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
   const context = `recipe update edge ${index}`;
   const raw = requireRecord(value, context);
+  const hasTopologyRebuild = Object.prototype.hasOwnProperty.call(
+    raw,
+    "topologyRebuild",
+  );
   requireExactKeys(
     raw,
     [
@@ -931,6 +1038,7 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
       "aliases",
       "siblingSubplans",
       "warnings",
+      ...(hasTopologyRebuild ? ["topologyRebuild"] : []),
       "proof",
       "edgeSha256",
     ],
@@ -944,9 +1052,22 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
   if (from.fitFamily !== to.fitFamily) {
     throw new Error(context + " crosses fit families");
   }
-  if (from.topologySha256 !== to.topologySha256) {
-    throw new Error(context + " crosses topology identities");
+  const topologyChanged = from.topologySha256 !== to.topologySha256;
+  if (topologyChanged !== hasTopologyRebuild) {
+    throw new Error(
+      topologyChanged
+        ? context + " crosses topology identities without a rebuild proof"
+        : context + " declares a rebuild proof without a topology change",
+    );
   }
+  const topologyRebuild = hasTopologyRebuild
+    ? parseTopologyRebuildProof(
+        raw.topologyRebuild,
+        from,
+        to,
+        `${context}.topologyRebuild`,
+      )
+    : undefined;
   if (from.skeletonHierarchySha256 !== to.skeletonHierarchySha256) {
     throw new Error(context + " crosses skeleton identities");
   }
@@ -970,6 +1091,16 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
   const ledgerIds = stableIdLedger.entries.map((entry) => entry.id);
   if (!sameSet(controlIds, ledgerIds)) {
     throw new Error(context + " controls do not exhaust the stable-id ledger");
+  }
+  if (
+    topologyRebuild?.affectedComponentIds.some(
+      (componentId) =>
+        !controls.some((control) => control.componentId === componentId),
+    )
+  ) {
+    throw new Error(
+      context + " topology rebuild references an unknown component",
+    );
   }
   const ledgerById = new Map(
     stableIdLedger.entries.map((entry) => [entry.id, entry]),
@@ -1029,6 +1160,16 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
     warnings.map((warning) => warning.code),
     context + ".warnings",
   );
+  const hasTopologyWarning = warnings.some(
+    (warning) => warning.code === "topology-changed",
+  );
+  if (hasTopologyWarning !== topologyChanged) {
+    throw new Error(
+      topologyChanged
+        ? context + " topology rebuild must carry a topology-changed warning"
+        : context + " topology-changed warning has no topology rebuild",
+    );
+  }
   return {
     id: requireStableId(raw.id, context + ".id"),
     directEdgeKey,
@@ -1039,6 +1180,7 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
     aliases,
     siblingSubplans: parseSiblingSubplans(raw.siblingSubplans),
     warnings,
+    ...(topologyRebuild ? { topologyRebuild } : {}),
     proof: parseUpdateProof(raw.proof),
     edgeSha256: requireSha(raw.edgeSha256, context + ".edgeSha256"),
   };
@@ -1662,6 +1804,17 @@ function recipeUpdateEdgeHashContent(
   return content;
 }
 
+export async function recipeTopologyRebuildProofSha256(
+  value:
+    | RecipeTopologyRebuildProof
+    | Omit<RecipeTopologyRebuildProof, "proofSha256">,
+): Promise<string> {
+  canonicalRecipeString(value);
+  const { proofSha256: _proofSha256, ...content } = value as
+    RecipeTopologyRebuildProof;
+  return canonicalRecipeSha256(content);
+}
+
 export async function recipeUpdateEdgeSha256(value: unknown): Promise<string> {
   canonicalRecipeString(value);
   const edge = parseUpdateEdge(value, 0);
@@ -1672,6 +1825,16 @@ export async function verifyRecipeUpdateEdge(
   value: unknown,
 ): Promise<RecipeUpdateEdge> {
   const edge = parseUpdateEdge(value, 0);
+  if (edge.topologyRebuild) {
+    const topologyProofSha256 = await recipeTopologyRebuildProofSha256(
+      edge.topologyRebuild,
+    );
+    if (topologyProofSha256 !== edge.topologyRebuild.proofSha256) {
+      throw new Error(
+        `recipe topology rebuild proof hash mismatch: expected ${edge.topologyRebuild.proofSha256}, got ${topologyProofSha256}`,
+      );
+    }
+  }
   const actual = await recipeUpdateEdgeSha256(edge);
   if (actual !== edge.edgeSha256) {
     throw new Error(

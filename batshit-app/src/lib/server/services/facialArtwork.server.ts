@@ -2,8 +2,8 @@ import {
   collectFacialArtworkUploads,
   parseFacialArtworkDefinition,
   parseFacialArtworkState,
-  type FacialArtworkDefinitionV4,
-  type FacialArtworkStateV4
+  type FacialArtworkDefinition,
+  type FacialArtworkState
 } from '$lib/goons/facialArtwork'
 import type { GoonRecord } from '$lib/types/goons'
 import { loadGoonEyeAppearanceDefinition } from './eyeAppearance.server'
@@ -16,7 +16,7 @@ import {
 type RedisJsonReader = StoredUploadJsonReader
 
 function fail(message: string): never {
-  throw new Error(`[facial-artwork/v4] ${message}`)
+  throw new Error(`[facial-artwork/v6] ${message}`)
 }
 
 function exactJson(left: unknown, right: unknown): boolean {
@@ -25,7 +25,7 @@ function exactJson(left: unknown, right: unknown): boolean {
 
 async function assertStoredArtworkOwnership(
   client: RedisJsonReader,
-  state: FacialArtworkStateV4
+  state: FacialArtworkState
 ): Promise<void> {
   for (const upload of collectFacialArtworkUploads(state)) {
     const stored = await client.json.get(`upload:goon_facial_artwork:${upload.filename}`)
@@ -56,7 +56,7 @@ async function assertStoredArtworkOwnership(
 export async function loadGoonFacialArtworkDefinition(
   client: RedisJsonReader,
   goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>
-): Promise<FacialArtworkDefinitionV4 | null> {
+): Promise<FacialArtworkDefinition | null> {
   const filename = goon.customAvatar?.manifest?.filename
   if (!filename) return null
 
@@ -74,10 +74,10 @@ export async function loadGoonFacialArtworkDefinition(
   const definition = parseFacialArtworkDefinition(value)
   const eyeAppearance = await loadGoonEyeAppearanceDefinition(client, goon)
   if (!eyeAppearance) {
-    fail('facial-artwork/v4 requires the complete eye-appearance/v3 socket-eye tuple')
+    fail('facial-artwork/v6 requires the complete eye-appearance/v5 physical-eye tuple')
   }
   if (definition.dependencies.eyeAppearance.definitionSha256 !== eyeAppearance.definitionSha256) {
-    fail('facial-artwork/v4 Eye Appearance dependency does not match the installed package')
+    fail('facial-artwork/v6 Eye Appearance dependency does not match the installed package')
   }
   return definition
 }
@@ -86,7 +86,7 @@ export async function validateGoonFacialArtworkState(
   client: RedisJsonReader,
   goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>,
   value: unknown
-): Promise<FacialArtworkStateV4 | null> {
+): Promise<FacialArtworkState | null> {
   if (value === null) return null
   const definition = await loadGoonFacialArtworkDefinition(client, goon)
   if (!definition) fail('current Goon package does not support facial artwork')

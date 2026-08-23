@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   RECIPE_MIGRATION_REPORT_CONTRACT,
   RECIPE_STRICT_TOLERANCE_PROFILE,
+  planAppearanceRecipeMigration,
   type RecipeMigrationReport,
   type RecipeMigrationReportEntry
 } from '$lib/goons/recipe'
@@ -444,6 +445,7 @@ describe('Recipe R5 Settings components', () => {
           })
         ]
       }),
+      classification: 'verified-preview-required',
       filter: 'all',
       canUpdateAndRebuild: true,
       canKeepCurrentPackage: true,
@@ -453,6 +455,12 @@ describe('Recipe R5 Settings components', () => {
     })
     expect(screen.queryByText('Your appearance can be preserved')).toBeNull()
     expect(screen.getByText('Your confirmation is required')).toBeTruthy()
+    expect(
+      screen.getByText(
+        'Compare Current and Updated, then approve the verified presentation change.'
+      )
+    ).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Update Goon' })).toBeTruthy()
   })
 
   it('renders Updated adjustments only from the server-verified new/reset allowlist', async () => {
@@ -508,6 +516,138 @@ describe('Recipe R5 Settings components', () => {
     expect(onControlCommit).toHaveBeenCalledTimes(1)
     await fireEvent.click(screen.getByRole('button', { name: 'Reset New Nose Width to neutral' }))
     expect(onResetControl).toHaveBeenCalledWith('new_nose_width')
+  })
+
+  it('opens and preserves the Updated preview while a reviewed package update starts', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      baseId: 'batshit-base-f-v1',
+      fitFamily: 'batshit-base-f-v1'
+    })
+    const plan = await planAppearanceRecipeMigration({
+      planId: 'migration.recipe-settings.updated-preview',
+      fromRecipeRevision: 1,
+      toRecipeRevision: 2,
+      edge: fixture.edge,
+      sourceState: fixture.sourceState,
+      sourcePackage: {
+        recipeSource: fixture.source.recipeSource,
+        packageBytes: fixture.source.packageBytes,
+        glbBytes: fixture.source.glbBytes,
+        manifestBytes: fixture.source.manifestBytes
+      },
+      targetPackage: {
+        recipeSource: fixture.target.recipeSource,
+        packageBytes: fixture.target.packageBytes,
+        glbBytes: fixture.target.glbBytes,
+        manifestBytes: fixture.target.manifestBytes
+      },
+      siblingInputs: fixture.siblingInputs,
+      componentMapBundle: fixture.componentMapBundle
+    })
+    const pendingAnalysis = {
+      analysisId: 'recipe_analysis_updated_preview',
+      analysisRef: { contract: 'recipe-update-analysis-context/v3', ref: 'analysis', sha256: HASH },
+      basePlan: { contract: 'recipe-migration-plan/v1', ref: 'base-plan', sha256: HASH },
+      selectedPlan: { contract: 'recipe-migration-plan/v1', ref: 'plan', sha256: HASH },
+      migrationReport: { contract: 'recipe-migration-report/v1', ref: 'report', sha256: HASH },
+      containmentReceipt: {
+        contract: 'recipe-archive-containment-receipt/v1',
+        ref: 'receipt',
+        sha256: HASH
+      },
+      reviewedState: null,
+      targetWriteVersion: 1
+    }
+    const owner = {
+      contract: 'goon-recipe/v2',
+      writeVersion: 1,
+      nextRecipeRevision: 2,
+      liveStatus: 'up_to_date',
+      authoringRevision: {
+        recipeRevision: 1,
+        revisionId: 'recipe_revision_1_updated_preview',
+        source: fixture.source.recipeSource,
+        state: fixture.sourceState,
+        updateReport: null
+      },
+      activeRevision: { ref: 'active-1' },
+      previousRevision: null,
+      pendingAnalysis,
+      pendingJob: null,
+      lastFailure: null
+    }
+    const goon = {
+      id: 'recipe-updated-preview-goon',
+      user_id: 'recipe-updated-preview-user',
+      name: 'Updated Preview Goon',
+      kind: 'custom',
+      sourceProfile: 'expert-custom-glb',
+      files: {},
+      recipe: owner,
+      appearanceDials: fixture.sourceState.appearanceDials,
+      created_at: '2026-08-20T00:00:00.000Z',
+      updated_at: '2026-08-20T00:00:00.000Z'
+    } as unknown as GoonRecord
+    const hydration = {
+      goon,
+      owner,
+      pendingAnalysis,
+      plan,
+      basePlan: plan,
+      report: report({
+        fromRecipeRevision: plan.fromRecipeRevision,
+        toRecipeRevision: plan.toRecipeRevision,
+        status: plan.outcome.readiness === 'preview-required' ? 'preview-required' : 'preserved'
+      }),
+      receipt: {},
+      reviewedState: null
+    }
+    let rejectBuild: ((reason?: unknown) => void) | null = null
+    const reviewedOwner = {
+      ...structuredClone(owner),
+      writeVersion: 2,
+      pendingAnalysis: {
+        ...structuredClone(pendingAnalysis),
+        targetWriteVersion: 2
+      }
+    }
+    const reviewedGoon = {
+      ...structuredClone(goon),
+      recipe: reviewedOwner
+    } as unknown as GoonRecord
+    const reviewedHydration = {
+      ...hydration,
+      goon: reviewedGoon,
+      owner: reviewedOwner,
+      pendingAnalysis: reviewedOwner.pendingAnalysis
+    }
+    const reviewAnalysisState = vi.fn(async () => reviewedHydration)
+    const buildUploadStageCommit = vi.fn(
+      () => new Promise<never>((_resolve, reject) => { rejectBuild = reject })
+    )
+    recipeServiceMocks.workflowClient = {
+      hydrateAnalysis: vi.fn(async () => hydration),
+      loadAnalysisTargetManifest: vi.fn(async () => fixture.target.avatarManifest),
+      reviewAnalysisState,
+      buildUploadStageCommit
+    }
+    recipeServiceMocks.loadGoons.mockResolvedValue([reviewedGoon])
+
+    render(RecipeWorkflowControllerHarness, {
+      goon,
+      appearanceDials: structuredClone(fixture.sourceState.appearanceDials)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('recipe-preview-side')).toHaveTextContent('updated')
+    })
+    await fireEvent.click(screen.getByRole('button', { name: 'Update Goon' }))
+    await waitFor(() => expect(reviewAnalysisState).toHaveBeenCalledOnce())
+    expect(screen.getByTestId('recipe-preview-side')).toHaveTextContent('updated')
+    await waitFor(() => expect(buildUploadStageCommit).toHaveBeenCalledOnce())
+    expect(rejectBuild).not.toBeNull()
+    rejectBuild!(new Error('stop after the reviewed preview assertion'))
+    await waitFor(() => expect(recipeServiceMocks.loadGoons).toHaveBeenCalled())
   })
 
   it('protects dirty edits with Save, Discard, and Cancel choices', async () => {

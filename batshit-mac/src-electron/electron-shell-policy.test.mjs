@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  MAX_GOON_PACKAGE_READ_CHUNK_BYTES,
+  MAX_GOON_PACKAGE_SELECTION_BYTES,
   SUPERVISOR_COMMANDS,
   collectAllowedOrigins,
   isAllowedAppUrl,
@@ -16,6 +18,9 @@ import {
   resolveDesktopGoonUrl,
   resolveShellAssetPath,
   validateElectronIpcSender,
+  validateGoonPackageFileSelection,
+  validateGoonPackageHandleId,
+  validateGoonPackageReadRequest,
   validateSaveFileOptions
 } from './electron-shell-policy.mjs';
 
@@ -78,6 +83,60 @@ test('save dialog bridge rejects capability expansion and malformed values', () 
   assert.throws(() => validateSaveFileOptions({ properties: ['createDirectory'] }), /Unsupported/);
   assert.throws(() => validateSaveFileOptions([]), /must be an object/);
   assert.throws(() => validateSaveFileOptions({ title: 'bad\0title' }), /Invalid/);
+});
+
+test('Goon package picker accepts only bounded regular .bgoon and .zip files', () => {
+  const regular = (size) => ({ size, isFile: () => true });
+  assert.deepEqual(
+    validateGoonPackageFileSelection('/tmp/Batshit Base.bgoon', regular(224_700_000)),
+    {
+      name: 'Batshit Base.bgoon',
+      size: 224_700_000,
+      mimeType: 'application/zip'
+    }
+  );
+  assert.equal(
+    validateGoonPackageFileSelection('/tmp/source.ZIP', regular(100)).name,
+    'source.ZIP'
+  );
+  assert.throws(
+    () => validateGoonPackageFileSelection('/tmp/source.glb', regular(100)),
+    /must be a \.bgoon or \.zip/
+  );
+  assert.throws(
+    () => validateGoonPackageFileSelection('relative.bgoon', regular(100)),
+    /path is invalid/
+  );
+  assert.throws(
+    () => validateGoonPackageFileSelection('/tmp/folder.bgoon', { size: 100, isFile: () => false }),
+    /not a regular file/
+  );
+  assert.throws(
+    () => validateGoonPackageFileSelection('/tmp/large.bgoon', regular(MAX_GOON_PACKAGE_SELECTION_BYTES + 1)),
+    /exceeds the 1 GB limit/
+  );
+});
+
+test('Goon package chunk reads are exact, bounded, and tied to opaque handles', () => {
+  const handleId = '123e4567-e89b-42d3-a456-426614174000';
+  assert.equal(validateGoonPackageHandleId(handleId), handleId);
+  assert.deepEqual(
+    validateGoonPackageReadRequest({ handleId, offset: 4, length: 8 }, 12),
+    { handleId, offset: 4, length: 8 }
+  );
+  assert.throws(() => validateGoonPackageHandleId('/tmp/source.bgoon'), /Invalid/);
+  assert.throws(
+    () => validateGoonPackageReadRequest({ handleId, offset: 0, length: MAX_GOON_PACKAGE_READ_CHUNK_BYTES + 1 }, 8_000_000),
+    /read length/
+  );
+  assert.throws(
+    () => validateGoonPackageReadRequest({ handleId, offset: 5, length: 8 }, 12),
+    /exceeds the selected file/
+  );
+  assert.throws(
+    () => validateGoonPackageReadRequest({ handleId, offset: 0, length: 1, path: '/tmp/secret' }, 12),
+    /Unsupported/
+  );
 });
 
 test('external links are limited to browser and email protocols', () => {

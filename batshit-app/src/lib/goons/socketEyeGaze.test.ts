@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { CustomPerformanceDirection } from './customPerformanceRig'
-import type { SocketEyeSurfaceDefinitionV1 } from './socketEyeSurface'
+import type { SocketEyeSurfaceDefinitionV2 } from './socketEyeSurface'
 import {
   resolveAuthoredSocketEyeCoordinates,
   resolveSocketEyeGaze,
@@ -22,69 +22,57 @@ const neutralDirection: CustomPerformanceDirection = {
 function side(side: 'left' | 'right', x: number) {
   return {
     side,
-    nodes: { compositeCap: `${side}-cap` },
+    nodes: { physicalEye: `${side}-physical-eye` },
     apertureSeamDefinitionSha256: 'b'.repeat(64),
     gazeAnchorHeadLocal: [x, 0, 0] as [number, number, number],
     surfaceCenterHeadLocal: [x, 0, 0.01] as [number, number, number],
     horizontalAxisHeadLocal: [1, 0, 0] as [number, number, number],
     verticalAxisHeadLocal: [0, 1, 0] as [number, number, number],
     forwardAxisHeadLocal: [0, 0, 1] as [number, number, number],
-    cap: {
-      frontGeometryLaw: 'aperture-normalized-shallow-patch/v1',
-      frontDepthRatio: 0.08,
-      maximumFrontDepthMeters: 0.0008,
-      artworkProjection: 'deformed-surface-meters/v1',
-      carrierHalfWidthMeters: 0.02,
-      carrierHalfHeightMeters: 0.015,
-      carrierDepthRadiusMeters: 0.015,
-      rearClosureDepthMeters: 0.005,
-      minimumHiddenUnderlapMeters: 0.001,
-      visibleFrontFaceGroup: 'visible-front',
-      hiddenClosureFaceGroup: 'hidden-closure',
-      primitiveFollowerMorphs: {
-        visibleFront: [
-          `eyeBlink${side === 'left' ? 'Left' : 'Right'}`,
-          `eyeWide${side === 'left' ? 'Left' : 'Right'}`,
-          `eyeSquint${side === 'left' ? 'Left' : 'Right'}`
-        ],
-        hiddenClosure: [
-          `eyeBlink${side === 'left' ? 'Left' : 'Right'}`,
-          `eyeWide${side === 'left' ? 'Left' : 'Right'}`,
-          `eyeSquint${side === 'left' ? 'Left' : 'Right'}`
-        ]
-      },
-      apertureFollowing: true as const,
-      closedManifold: true as const
+    sphere: {
+      geometryLaw: 'static-full-sphere/v1',
+      radiusMeters: 0.012,
+      artworkProjection: 'front-hemisphere-uv/v1',
+      stableNeutralRear: true,
+      surfaceMorphTargets: [],
+      physicalFit: {
+        mode: 'transform-only/v1',
+        translation: true,
+        rotation: true,
+        uniformScale: true,
+        nonUniformScale: false
+      }
     },
     gaze: { maximumHorizontal: 0.75, maximumVertical: 0.6, headFollowStart: 0.8 }
   }
 }
 
 const definition = {
-  schemaVersion: 'socket-eye-surface/v1',
+  schemaVersion: 'socket-eye-surface/v2',
   definitionSha256: 'a'.repeat(64),
-  status: 'test',
+  status: 'product-export-approved',
   productExportApproved: true,
   coordinateSpace: 'head-local',
-  surfaceKind: 'aperture-following-composite-cap',
+  surfaceKind: 'static-full-sphere',
   compositeLayers: ['sclera', 'scleraArtwork', 'iris', 'pupil', 'highlight', 'cornea'],
   rendering: {
-    meshOwnsApertureMask: true,
-    visibleFrontDepthTest: true,
-    visibleFrontDepthWrite: true,
-    visibleFrontSide: 'front',
-    renderOrder: 'after-face-before-liner'
+    eyelidsOwnApertureOcclusion: true,
+    sphereDepthTest: true,
+    sphereDepthWrite: true,
+    sphereSide: 'front',
+    renderOrder: 'after-face-before-treatment',
+    requiredMaxTextureArrayLayers: 6
   },
   artwork: {
     scleraOverlay: {
-      gazeLinked: true,
+      projection: 'front-hemisphere-only/v1',
       transparentRgba: true,
-      minimumOverscanHorizontal: 0.9,
-      minimumOverscanVertical: 0.8
+      rearPresentation: 'stable-neutral-base',
+      gazeLinked: false
     }
   },
   runtimeBindings: { left: side('left', 0.03), right: side('right', -0.03) }
-} as SocketEyeSurfaceDefinitionV1
+} as SocketEyeSurfaceDefinitionV2
 
 describe('socket-eye gaze composition', () => {
   it('projects one target independently so near targets converge automatically', () => {

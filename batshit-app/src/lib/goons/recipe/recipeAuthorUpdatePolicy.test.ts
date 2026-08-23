@@ -18,7 +18,10 @@ function policyPlan(
   } = {}
 ): RecipeMigrationPlan {
   const automatic =
-    classification === 'automatic-appearance-preserving' || classification === 'proven-remap'
+    classification === 'automatic-appearance-preserving' ||
+    classification === 'proven-remap' ||
+    classification === 'verified-preview-required'
+  const verifiedPreview = classification === 'verified-preview-required'
   const resetRequired = classification === 'reset-required'
   return {
     fromSource: { identities: { baseId: overrides.fromBaseId ?? 'batshit-base-f-v1' } },
@@ -26,8 +29,10 @@ function policyPlan(
     outcome: automatic
       ? {
           kind: 'automatic',
-          preservationClaim: 'appearance-preserved',
-          cleanResetEligibility: 'not-applicable'
+          readiness: verifiedPreview ? 'preview-required' : 'ready',
+          preservationClaim: verifiedPreview ? 'values-migrated-only' : 'appearance-preserved',
+          cleanResetEligibility: 'not-applicable',
+          rejectionCodes: []
         }
       : {
           kind: 'unsupported',
@@ -43,7 +48,7 @@ function policyPlan(
 }
 
 describe('Recipe Blender-author update policy', () => {
-  it('covers every required author change family exactly once with explicit four-way rules', () => {
+  it('covers every required author change family exactly once with explicit five-way rules', () => {
     expect(RECIPE_AUTHOR_CHANGE_FAMILY_RULES.map((entry) => entry.family)).toEqual(
       RECIPE_AUTHOR_CHANGE_FAMILIES
     )
@@ -58,12 +63,13 @@ describe('Recipe Blender-author update policy', () => {
       expect(entry.proofDomains).toContain('structural-eligibility')
       expect(entry.automaticWhen).not.toHaveLength(0)
       expect(entry.provenRemapWhen).not.toHaveLength(0)
+      expect(entry.verifiedPreviewWhen).not.toHaveLength(0)
       expect(entry.resetRequiredWhen).not.toHaveLength(0)
       expect(entry.blockedWhen).not.toHaveLength(0)
     }
   })
 
-  it('runs a fixture for every change family while covering all four exclusive classes', () => {
+  it('runs a fixture for every change family while covering all five exclusive classes', () => {
     const fixtures = RECIPE_AUTHOR_CHANGE_FAMILIES.map((family, index) => {
       const expected = RECIPE_AUTHOR_UPDATE_CLASSIFICATIONS[
         index % RECIPE_AUTHOR_UPDATE_CLASSIFICATIONS.length
@@ -109,5 +115,10 @@ describe('Recipe Blender-author update policy', () => {
     const plan = policyPlan('automatic-appearance-preserving')
     plan.outcome.preservationClaim = 'values-migrated-only'
     expect(classifyRecipeAuthorUpdatePlan(plan)).toBe('blocked-ineligible')
+  })
+
+  it('allows a verified visual presentation change only through explicit preview review', () => {
+    const plan = policyPlan('verified-preview-required')
+    expect(classifyRecipeAuthorUpdatePlan(plan)).toBe('verified-preview-required')
   })
 })

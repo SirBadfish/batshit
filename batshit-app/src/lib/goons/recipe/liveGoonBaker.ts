@@ -12,8 +12,7 @@ import {
   validateSocketEyeApertureOwnership
 } from '../eyeApertureSeam'
 import {
-  parseSocketEyeSurfaceDefinition,
-  socketEyeCapRetainedDynamicMorphs
+  parseSocketEyeSurfaceDefinition
 } from '../socketEyeSurface'
 import {
   LIVE_JOINT_CORRECTIVES_CONTRACT,
@@ -183,6 +182,7 @@ type MorphPlan = {
   originalNamesByMesh: Map<number, string[]>
   outputNamesByMesh: Map<number, string[]>
   retainedWeightByNodeMorph: Map<string, number>
+  socketEyeCorrectiveScaleByMeshMorph: Map<string, number>
   liveCorrectives: LiveJointCorrectivesSpec | null
 }
 
@@ -369,9 +369,6 @@ async function resolveBakedAnatomyFitResults(args: {
     if (fit.input.source.topologySha256 !== domain.bodyTopologySha256) {
       fail(`Anatomy Fit ${fit.result.domain} targets another body topology`)
     }
-    if (domain.bodyTopologySha256 !== args.input.source.identities.topologySha256) {
-      fail(`Anatomy Fit ${fit.result.domain} topology does not match the verified Recipe Source`)
-    }
     const mesh = meshById.get(domain.bodyMeshId)
     if (!mesh)
       fail(`Anatomy Fit ${fit.result.domain} body mesh is missing from the physical evaluation`)
@@ -399,7 +396,7 @@ async function resolveBakedAnatomyFitResults(args: {
         source: {
           modelSha256: args.input.source.model.sha256,
           appearanceDefinitionSha256: args.appearanceManifest.definitionSha256,
-          topologySha256: args.input.source.identities.topologySha256
+          topologySha256: domain.bodyTopologySha256
         },
         definition: oralCavityFit.definition,
         bodyMeshId: domain.bodyMeshId,
@@ -421,10 +418,10 @@ async function resolveBakedAnatomyFitResults(args: {
     if (
       domain.socketEyeSurfaceDefinitionSha256 !== socketEyeSurface.definitionSha256 ||
       domain.apertureSeamDefinitionSha256 !== eyeApertureSeam.definitionSha256 ||
-      domain.compositeCapNodeId !== surfaceSide.nodes.compositeCap ||
+      domain.physicalEyeNodeId !== surfaceSide.nodes.physicalEye ||
       domain.lashesEyeOutlineNodeId !== seamSide.lashesEyeOutlineNode
     ) {
-      fail(`Anatomy Fit ${fit.result.domain} cap/liner definition binding is stale`)
+      fail(`Anatomy Fit ${fit.result.domain} physical-eye/treatment definition binding is stale`)
     }
     const physicalProjection = await createSocketEyeAnatomyProof({
       modelBytes: args.input.modelBytes,
@@ -439,7 +436,7 @@ async function resolveBakedAnatomyFitResults(args: {
       fit.input.source.physicalEvaluationScalarCount !== physicalProjection.scalarCount
     ) {
       fail(
-        `Anatomy Fit ${fit.result.domain} generated cap/liner geometry or follower inventory is stale`
+        `Anatomy Fit ${fit.result.domain} generated physical-eye/treatment geometry or follower inventory is stale`
       )
     }
     const landmarkSet = {
@@ -723,12 +720,22 @@ function collectStrings(value: unknown, output: Set<string>): void {
 
 function socketEyeRuntimeMorphsByNode(
   parsed: SemanticGlbDocument,
-  rawManifest: JsonRecord
-): Map<number, Set<string>> {
-  const result = new Map<number, Set<string>>()
+  rawManifest: JsonRecord,
+  appearanceManifest: AppearanceManifest,
+  evaluation: AppearanceRecipePhysicalEvaluation
+): {
+  retainedByNode: Map<number, Set<string>>
+  correctiveScaleByMeshMorph: Map<string, number>
+  correctiveKeys: Set<string>
+} {
+  const retainedByNode = new Map<number, Set<string>>()
+  const correctiveScaleByMeshMorph = new Map<string, number>()
+  const correctiveKeys = new Set<string>()
   const rawSurface = rawManifest.socketEyeSurface
   const rawSeam = rawManifest.eyeApertureSeam
-  if (rawSurface === undefined && rawSeam === undefined) return result
+  if (rawSurface === undefined && rawSeam === undefined) {
+    return { retainedByNode, correctiveScaleByMeshMorph, correctiveKeys }
+  }
   if (rawSurface === undefined || rawSeam === undefined) {
     fail('Socket-eye Recipe Source must declare both socketEyeSurface and eyeApertureSeam')
   }
@@ -736,17 +743,52 @@ function socketEyeRuntimeMorphsByNode(
   const seam = parseEyeApertureSeamDefinition(rawSeam)
   validateSocketEyeApertureOwnership(surface, seam)
   for (const side of ['left', 'right'] as const) {
+    const treatment = seam.runtimeBindings[side].treatment
+    const correction = treatment.surfaceCorrection
+    const appearanceNodes = Object.entries(appearanceManifest.nodes).filter(
+      ([, declaration]) => declaration.node === seam.runtimeBindings[side].lashesEyeOutlineNode
+    )
+    if (appearanceNodes.length !== 1) {
+      fail(`socket-eye ${side} treatment must resolve exactly one Appearance node`)
+    }
+    const [appearanceNodeId] = appearanceNodes[0]!
+    const projectionWeights = evaluation.followerMorphWeights
+      .filter(
+        (entry) =>
+          entry.node === appearanceNodeId && entry.morph === correction.projectionMorph
+      )
+      .map((entry) => finite(entry.weight, `socket-eye ${side} projection follower weight`))
+    if (projectionWeights.length !== 1) {
+      fail(`socket-eye ${side} projection correction must resolve exactly one follower weight`)
+    }
+    const projectionWeight = projectionWeights[0]!
+    if (projectionWeight < 0 || projectionWeight > 1) {
+      fail(`socket-eye ${side} projection correction weight must be within [0, 1]`)
+    }
     const roots = [
       {
-        rootName: surface.runtimeBindings[side].nodes.compositeCap,
-        retained: new Set(socketEyeCapRetainedDynamicMorphs(side))
+        rootName: surface.runtimeBindings[side].nodes.physicalEye,
+        retained: new Set<string>(),
+        expectedSource: [] as string[],
+        correctiveMorphs: [] as string[]
       },
       {
         rootName: seam.runtimeBindings[side].lashesEyeOutlineNode,
-        retained: new Set(seam.runtimeBindings[side].liner.retainedPerformanceMorphs)
+        retained: new Set([
+          ...treatment.retainedPerformanceMorphs,
+          correction.blinkLinearMorph,
+          correction.blinkResidualMorph
+        ]),
+        expectedSource: [
+          ...treatment.followerMorphs,
+          correction.projectionMorph,
+          correction.blinkLinearMorph,
+          correction.blinkResidualMorph
+        ].sort(compareText),
+        correctiveMorphs: [correction.blinkLinearMorph, correction.blinkResidualMorph]
       }
     ]
-    for (const { rootName, retained } of roots) {
+    for (const { rootName, retained, expectedSource, correctiveMorphs } of roots) {
       const rootIndex = resolveSemanticGlbNode(
         parsed,
         rootName,
@@ -763,14 +805,34 @@ function socketEyeRuntimeMorphsByNode(
           nodeIndex,
           `socket-eye Recipe Source node ${rootName}`
         )
-        if (node.mesh !== undefined) result.set(nodeIndex, retained)
+        if (node.mesh !== undefined) {
+          const meshIndex = integer(node.mesh, `socket-eye Recipe Source node ${rootName}.mesh`)
+          const mesh = getSemanticGlbMesh(parsed, meshIndex, `socket-eye Recipe Source mesh ${rootName}`)
+          const actualSource = morphTargetNames(
+            mesh,
+            `socket-eye Recipe Source mesh ${rootName}`
+          ).sort(compareText)
+          if (canonicalRecipeString(actualSource) !== canonicalRecipeString(expectedSource)) {
+            fail(`socket-eye Recipe Source node ${rootName} has an invalid morph inventory`)
+          }
+          retainedByNode.set(nodeIndex, retained)
+          for (const morph of correctiveMorphs) {
+            correctiveKeys.add(`${nodeIndex}\u0000${morph}`)
+            const key = `${meshIndex}\u0000${morph}`
+            const prior = correctiveScaleByMeshMorph.get(key)
+            if (prior !== undefined && prior !== projectionWeight) {
+              fail(`shared socket-eye corrective ${morph} requires conflicting bake scales`)
+            }
+            correctiveScaleByMeshMorph.set(key, projectionWeight)
+          }
+        }
         for (const child of optionalArray(node.children, `${rootName}.children`)) {
           pending.push(integer(child, `${rootName}.children[]`))
         }
       }
     }
   }
-  return result
+  return { retainedByNode, correctiveScaleByMeshMorph, correctiveKeys }
 }
 
 function morphTargetNames(mesh: JsonRecord, context: string): string[] {
@@ -874,7 +936,8 @@ function buildMorphPlan(
   parsed: SemanticGlbDocument,
   rawManifest: JsonRecord,
   appearanceManifest: AppearanceManifest,
-  resolved: ReturnType<typeof resolveStrictAppearanceRecipeSnapshot>['resolved']
+  resolved: ReturnType<typeof resolveStrictAppearanceRecipeSnapshot>['resolved'],
+  evaluation: AppearanceRecipePhysicalEvaluation
 ): MorphPlan {
   const active = activeSceneOrder(parsed)
   const nodeIndices = resolveAppearanceNodeIndices(parsed, appearanceManifest)
@@ -935,7 +998,13 @@ function buildMorphPlan(
   collectStrings(rawManifest.skinAppearance, runtimeNames)
   const rig = rawManifest.rig === undefined ? null : record(rawManifest.rig, 'avatar.json#rig')
   collectStrings(rig?.performance, runtimeNames)
-  const socketEyeRuntimeMorphs = socketEyeRuntimeMorphsByNode(parsed, rawManifest)
+  const socketEyePlan = socketEyeRuntimeMorphsByNode(
+    parsed,
+    rawManifest,
+    appearanceManifest,
+    evaluation
+  )
+  const socketEyeRuntimeMorphs = socketEyePlan.retainedByNode
 
   const { spec: liveCorrectives, correctiveKeys } = createLiveCorrectives(
     rawManifest,
@@ -988,7 +1057,10 @@ function buildMorphPlan(
         const ref = morphRef(parsed, nodeIndex, name)
         if (keep) {
           keptRefs.push(ref)
-          if (correctiveKeys.has(`${nodeIndex}\u0000${name}`)) correctiveRefs.push(ref)
+          if (
+            correctiveKeys.has(`${nodeIndex}\u0000${name}`) ||
+            socketEyePlan.correctiveKeys.has(`${nodeIndex}\u0000${name}`)
+          ) correctiveRefs.push(ref)
           else dynamicRefs.push(ref)
         } else {
           removedRefs.push(ref)
@@ -1013,6 +1085,7 @@ function buildMorphPlan(
     originalNamesByMesh,
     outputNamesByMesh,
     retainedWeightByNodeMorph,
+    socketEyeCorrectiveScaleByMeshMorph: socketEyePlan.correctiveScaleByMeshMorph,
     liveCorrectives
   }
 }
@@ -1050,6 +1123,52 @@ function rewriteMorphTargets(
       )
       if (targets.length !== originalNames.length) {
         fail(`mesh ${meshIndex} primitive ${primitiveIndex} morph inventory drifted`)
+      }
+      for (const sourceIndex of keepIndexes) {
+        const morph = originalNames[sourceIndex]!
+        const scale = morphPlan.socketEyeCorrectiveScaleByMeshMorph.get(
+          `${meshIndex}\u0000${morph}`
+        )
+        if (scale === undefined || scale === 1) continue
+        const target = record(
+          targets[sourceIndex],
+          `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}].targets[${sourceIndex}]`
+        )
+        for (const [semantic, accessorValue] of Object.entries(target)) {
+          const accessorIndex = integer(
+            accessorValue,
+            `mesh ${meshIndex} morph ${morph}/${semantic}`
+          )
+          const accessor = decodeSemanticGlbAccessor(parsed, accessorIndex)
+          if (
+            accessor.componentType !== 5126 ||
+            accessor.type !== 'VEC3' ||
+            accessor.normalized
+          ) {
+            fail(`socket-eye corrective ${morph}/${semantic} must use a float VEC3 accessor`)
+          }
+          const values = Float32Array.from(accessor.values, (value) =>
+            finite(value * scale, `socket-eye corrective ${morph}/${semantic}`)
+          )
+          const previous = accessorOverrides.get(accessorIndex)
+          if (previous) {
+            if (
+              previous.type !== 'VEC3' ||
+              previous.count !== accessor.count ||
+              previous.values.length !== values.length ||
+              previous.values.some((value, index) => value !== values[index])
+            ) {
+              fail(`shared socket-eye corrective accessor ${accessorIndex} requires conflicting outputs`)
+            }
+            continue
+          }
+          accessorOverrides.set(accessorIndex, {
+            values,
+            type: 'VEC3',
+            count: accessor.count,
+            ...(semantic === 'POSITION' ? minMaxVec3(values) : {})
+          })
+        }
       }
       if (keepIndexes.length > 0) primitive.targets = keepIndexes.map((index) => targets[index])
       else delete primitive.targets
@@ -1695,7 +1814,13 @@ function buildStructuralLiveGlb(
   validateStructuralExtensions(parsed)
   const gltf = cloneJson(parsed.gltf)
   const accessorOverrides = new Map<number, AccessorOverride>()
-  const morphPlan = buildMorphPlan(parsed, rawManifest, appearanceManifest, resolved)
+  const morphPlan = buildMorphPlan(
+    parsed,
+    rawManifest,
+    appearanceManifest,
+    resolved,
+    evaluation
+  )
   rewriteMorphTargets(gltf, parsed, morphPlan, accessorOverrides)
   addPhysicalOverrides(gltf, parsed, evaluation, accessorOverrides)
   const binary = compactGlbResources(gltf, parsed, accessorOverrides)
@@ -1939,12 +2064,16 @@ function verifySocketEyeLiveMorphInventory(
   for (const side of ['left', 'right'] as const) {
     const nodes = [
       {
-        nodeName: surface.runtimeBindings[side].nodes.compositeCap,
-        expected: socketEyeCapRetainedDynamicMorphs(side).sort(compareText)
+        nodeName: surface.runtimeBindings[side].nodes.physicalEye,
+        expected: []
       },
       {
         nodeName: seam.runtimeBindings[side].lashesEyeOutlineNode,
-        expected: [...seam.runtimeBindings[side].liner.retainedPerformanceMorphs].sort(compareText)
+        expected: [
+          ...seam.runtimeBindings[side].treatment.retainedPerformanceMorphs,
+          seam.runtimeBindings[side].treatment.surfaceCorrection.blinkLinearMorph,
+          seam.runtimeBindings[side].treatment.surfaceCorrection.blinkResidualMorph
+        ].sort(compareText)
       }
     ]
     for (const { nodeName, expected } of nodes) {
@@ -2001,6 +2130,9 @@ async function retainedMorphProof(
       if (outputTargets.length !== keepIndexes.length)
         fail(`mesh ${meshIndex} retained target count changed`)
       for (const [outputIndex, sourceIndex] of keepIndexes.entries()) {
+        const morph = plan.originalNamesByMesh.get(meshIndex)![sourceIndex]!
+        const expectedScale =
+          plan.socketEyeCorrectiveScaleByMeshMorph.get(`${meshIndex}\u0000${morph}`) ?? 1
         const sourceTarget = record(sourceTargets[sourceIndex], 'source morph target')
         const outputTarget = record(outputTargets[outputIndex], 'output morph target')
         const semantics = Object.keys(sourceTarget).sort(compareText)
@@ -2024,12 +2156,22 @@ async function retainedMorphProof(
               `mesh ${meshIndex} retained morph ${sourceIndex}/${semantic} accessor shape changed`
             )
           }
-          maxError = Math.max(maxError, maximumArrayError(left.values, right.values))
+          if (left.values.length !== right.values.length) {
+            fail(`mesh ${meshIndex} retained morph ${sourceIndex}/${semantic} scalar count changed`)
+          }
+          for (let index = 0; index < left.values.length; index += 1) {
+            maxError = Math.max(
+              maxError,
+              Math.abs(left.values[index]! * expectedScale - right.values[index]!)
+            )
+          }
           entries.push({
             meshIndex,
             primitiveIndex,
             sourceIndex,
             outputIndex,
+            morph,
+            expectedScale,
             semantic,
             valuesSha256: await typedValuesSha256(right.values)
           })
@@ -2245,8 +2387,15 @@ async function auditStructuralLiveGlb(
   }
 
   const retained = await retainedMorphProof(source, output, rewrite.morphPlan)
+  const intentionallyScaledNames = new Set(
+    [...rewrite.morphPlan.socketEyeCorrectiveScaleByMeshMorph.keys()].map(
+      (key) => key.split('\u0000')[1]!
+    )
+  )
   const retainedNames = new Set(
-    [...rewrite.morphPlan.outputNamesByMesh.values()].flatMap((names) => names)
+    [...rewrite.morphPlan.outputNamesByMesh.values()]
+      .flatMap((names) => names)
+      .filter((name) => !intentionallyScaledNames.has(name))
   )
   const [sourceMaterials, outputMaterials] = await Promise.all([
     buildAppearanceRecipeSemanticMaterialProof(source),

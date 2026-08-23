@@ -32,6 +32,7 @@ export * from "./liveGoonBaker.workerProtocol";
 export * from "./liveManifestContracts";
 export * from "./migrationPlanContracts";
 export * from "./packageMetadata";
+export * from "./packageRecipeSiblingMigration";
 export * from "./recipeCanonical";
 export * from "./recipeAuthorUpdatePolicy";
 export * from "./recipeBuildDirtyDomains";

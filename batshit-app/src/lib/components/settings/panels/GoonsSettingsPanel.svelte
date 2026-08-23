@@ -92,8 +92,13 @@
   import GoonsPackDialogs from '$lib/components/settings/goons/GoonsPackDialogs.svelte'
   import GoonsUnsavedExitDialog from '$lib/components/settings/goons/GoonsUnsavedExitDialog.svelte'
   import RecipeWorkflowController from '$lib/components/settings/goons/recipe/RecipeWorkflowController.svelte'
-  import { resolveGoonSettingsPreviewTarget } from '$lib/components/settings/goons/recipe/recipeEditorPreviewTarget'
+  import {
+    resolveGoonSettingsPreviewTarget,
+    shouldAdmitGoonSettingsPreviewLoad,
+    type GoonSettingsPreviewLoadPriority
+  } from '$lib/components/settings/goons/recipe/recipeEditorPreviewTarget'
   import type { RecipeFittedPreviewState } from '$lib/components/settings/goons/recipe/types'
+  import { pickGoonPackageFile } from '$lib/goons/goonPackageFilePicker'
   import {
     normalizeGoonCueMap,
     normalizeDesktopGoonPreferences,
@@ -151,11 +156,11 @@
     parseFacialArtworkState,
     reconcileFacialArtworkState,
     resolveFacialArtworkTemplateVariant,
-    type FacialArtworkDefinitionV4,
+    type FacialArtworkDefinition,
     type FacialArtworkOrientation,
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
-    type FacialArtworkStateV4,
+    type FacialArtworkState,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import { restoreFacialArtworkDraft } from '$lib/goons/facialArtwork.editor'
@@ -168,8 +173,8 @@
     createDefaultEyeAppearanceState,
     parseEyeAppearanceState,
     reconcileEyeAppearanceState,
-    type EyeAppearanceDefinitionV3,
-    type EyeAppearanceStateV3
+    type EyeAppearanceDefinition,
+    type EyeAppearanceState
   } from '$lib/goons/eyeAppearance'
   import { parseFirstPartySocketEyePackage } from '$lib/goons/socketEyePackage'
   import {
@@ -1040,6 +1045,7 @@
   let previewFailedContextSignature = $state('')
   let previewSceneSignature = $state('none')
   let previewLoadInFlightSignature = $state('')
+  let previewLoadInFlightPriority = $state<GoonSettingsPreviewLoadPriority | null>(null)
   let previewVrmUrl = $state('')
   let previewSkyboxOffset = $state(0)
   const DEFAULT_PREVIEW_VIEW_FOV = 50
@@ -5926,6 +5932,7 @@
     previewFailedContextSignature = ''
     previewSceneSignature = 'none'
     previewLoadInFlightSignature = ''
+    previewLoadInFlightPriority = null
     motionLibraryPreviewSignature = ''
     previewAnimationActive = false
     previewAnimationRestore = null
@@ -7088,9 +7095,22 @@
       if (options.strict) throw error
       return false
     }
+    const requestedPriority: GoonSettingsPreviewLoadPriority = options.strict
+      ? 'strict'
+      : 'automatic'
+    if (
+      previewLoading &&
+      !shouldAdmitGoonSettingsPreviewLoad({
+        activePriority: previewLoadInFlightPriority,
+        requestedPriority
+      })
+    ) {
+      return false
+    }
     const token = ++previewToken
     previewLoading = true
     previewLoadInFlightSignature = contextSignature
+    previewLoadInFlightPriority = requestedPriority
     previewError = null
 
     try {
@@ -7213,6 +7233,7 @@
         previewLoading = false
         if (previewLoadInFlightSignature === contextSignature) {
           previewLoadInFlightSignature = ''
+          previewLoadInFlightPriority = null
         }
       }
     }
@@ -7670,6 +7691,7 @@
 
 
   $effect(() => {
+    if (recipePreviewTransitioning) return
     const goon = recipeEditorPreviewTarget?.goon ?? editorRecipeSourceGoon
     if (!goon) return
     const vrmUrl = resolveGoonAvatarUrl(goon)
@@ -7797,6 +7819,22 @@
       toast.error(error?.message || 'Advanced/GLB package upload failed')
     } finally {
       customUploadBusy = false
+    }
+  }
+
+  async function openGoonPackagePicker(
+    fallbackInput: HTMLInputElement | null,
+    onFile: (file: File) => void
+  ) {
+    try {
+      const file = await pickGoonPackageFile()
+      if (file === undefined) {
+        fallbackInput?.click()
+      } else if (file) {
+        onFile(file)
+      }
+    } catch (error: any) {
+      toast.error(error?.message || 'Goon File Package selection failed')
     }
   }
 
@@ -11074,10 +11112,10 @@
   }
 
   // ---------------- package-bound appearance surfaces (SA-090)
-  let editorFacialArtworkDefinition = $state<FacialArtworkDefinitionV4 | null>(null)
-  let editorFacialArtworkState = $state<FacialArtworkStateV4 | null>(null)
-  let editorEyeAppearanceDefinition = $state<EyeAppearanceDefinitionV3 | null>(null)
-  let editorEyeAppearanceState = $state<EyeAppearanceStateV3 | null>(null)
+  let editorFacialArtworkDefinition = $state<FacialArtworkDefinition | null>(null)
+  let editorFacialArtworkState = $state<FacialArtworkState | null>(null)
+  let editorEyeAppearanceDefinition = $state<EyeAppearanceDefinition | null>(null)
+  let editorEyeAppearanceState = $state<EyeAppearanceState | null>(null)
   let editorOralAppearanceDefinition = $state<OralAppearanceDefinitionV1 | null>(null)
   let editorOralAppearanceState = $state<OralAppearanceStateV1 | null>(null)
   let editorLipArtworkDefinition = $state<LipArtworkDefinitionV2 | null>(null)
@@ -11119,8 +11157,8 @@
   const editorSkinSurfaceDraftUploads = new Map<string, SkinSurfaceUploadV1>()
 
   function applyStoredFacialArtworkDraft(
-    definition: FacialArtworkDefinitionV4,
-    stored: FacialArtworkStateV4 | null | undefined
+    definition: FacialArtworkDefinition,
+    stored: FacialArtworkState | null | undefined
   ) {
     const restored = restoreFacialArtworkDraft(definition, stored)
     editorFacialArtworkState = restored.state
@@ -11131,8 +11169,8 @@
   }
 
   function applyStoredEyeAppearanceDraft(
-    definition: EyeAppearanceDefinitionV3,
-    stored: EyeAppearanceStateV3 | null | undefined
+    definition: EyeAppearanceDefinition,
+    stored: EyeAppearanceState | null | undefined
   ) {
     const reconciliation = reconcileEyeAppearanceState(definition, stored)
     editorEyeAppearanceState = reconciliation.state
@@ -11299,7 +11337,7 @@
     editorSkinAppearancePreviewTimer = null
   }
 
-  function resolveFacialArtworkDraftForSave(): FacialArtworkStateV4 | null {
+  function resolveFacialArtworkDraftForSave(): FacialArtworkState | null {
     if (!editorFacialArtworkHydrated || !editorFacialArtworkDefinition || !editorFacialArtworkState) {
       return null
     }
@@ -11311,7 +11349,7 @@
     return JSON.stringify(parsed) === JSON.stringify(defaults) ? null : parsed
   }
 
-  function resolveEyeAppearanceDraftForSave(): EyeAppearanceStateV3 | null {
+  function resolveEyeAppearanceDraftForSave(): EyeAppearanceState | null {
     if (!editorEyeAppearanceDefinition || !editorEyeAppearanceState) return null
     const parsed = parseEyeAppearanceState(
       editorEyeAppearanceDefinition,
@@ -11376,7 +11414,7 @@
     editorFacialArtworkDraftUploads.delete(upload.filename)
   }
 
-  async function pruneDetachedFacialArtworkDrafts(state: FacialArtworkStateV4 | null) {
+  async function pruneDetachedFacialArtworkDrafts(state: FacialArtworkState | null) {
     const referenced = new Set(collectFacialArtworkUploads(state).map((upload) => upload.filename))
     for (const upload of [...editorFacialArtworkDraftUploads.values()]) {
       if (referenced.has(upload.filename)) continue
@@ -11430,8 +11468,8 @@
   }
 
   async function reconcileFacialArtworkUploadsAfterSave(
-    previous: FacialArtworkStateV4 | null | undefined,
-    saved: FacialArtworkStateV4 | null | undefined
+    previous: FacialArtworkState | null | undefined,
+    saved: FacialArtworkState | null | undefined
   ) {
     const retained = new Set(collectFacialArtworkUploads(saved).map((upload) => upload.filename))
     const candidates = new Map<string, FacialArtworkUpload>()
@@ -11603,7 +11641,7 @@
     return upload
   }
 
-  function updateEditorFacialArtwork(state: FacialArtworkStateV4) {
+  function updateEditorFacialArtwork(state: FacialArtworkState) {
     if (!editorFacialArtworkDefinition) return
     const parsed = parseFacialArtworkState(editorFacialArtworkDefinition, state)
     if (JSON.stringify(editorFacialArtworkState) === JSON.stringify(parsed)) return
@@ -11614,7 +11652,7 @@
     void pruneDetachedFacialArtworkDrafts(parsed)
   }
 
-  function updateEditorEyeAppearance(state: EyeAppearanceStateV3) {
+  function updateEditorEyeAppearance(state: EyeAppearanceState) {
     if (!editorEyeAppearanceDefinition) return
     const parsed = parseEyeAppearanceState(editorEyeAppearanceDefinition, state)
     if (JSON.stringify(editorEyeAppearanceState) === JSON.stringify(parsed)) return
@@ -15675,11 +15713,16 @@
             <input
               class="hidden"
               type="file"
-              accept=".bgoon,.zip"
               bind:this={guidedUploadInput}
               onchange={handleGuidedUploadSelection}
             />
-            <Button onclick={() => guidedUploadInput?.click()} disabled={guidedUploadBusy}>
+            <Button
+              onclick={() => void openGoonPackagePicker(guidedUploadInput, (file) => {
+                guidedUploadFile = file
+                void handleGuidedUpload()
+              })}
+              disabled={guidedUploadBusy}
+            >
               {guidedUploadBusy ? 'Uploading…' : 'Create Advanced/Blender Goon'}
             </Button>
           </div>
@@ -15709,11 +15752,16 @@
             <input
               class="hidden"
               type="file"
-              accept=".bgoon,.zip"
               bind:this={customUploadInput}
               onchange={handleCustomUploadSelection}
             />
-            <Button onclick={() => customUploadInput?.click()} disabled={customUploadBusy}>
+            <Button
+              onclick={() => void openGoonPackagePicker(customUploadInput, (file) => {
+                customUploadFile = file
+                void handleCustomUpload()
+              })}
+              disabled={customUploadBusy}
+            >
               {customUploadBusy ? 'Uploading…' : 'Create Advanced/GLB Goon'}
             </Button>
           </div>
@@ -19884,13 +19932,15 @@
 	                  <input
 	                    class="hidden"
 	                    type="file"
-	                    accept=".bgoon,.zip"
 	                    bind:this={advancedPackageUpdateInput}
 	                    onchange={handleAdvancedPackageUpdateSelection}
 	                  />
 	                  <div class="flex flex-wrap items-center gap-2">
 	                    <Button
-	                      onclick={() => advancedPackageUpdateInput?.click()}
+	                      onclick={() => void openGoonPackagePicker(advancedPackageUpdateInput, (file) => {
+	                        advancedPackageUpdateFile = file
+	                        void handleAdvancedPackageUpdate()
+	                      })}
 	                      disabled={advancedPackageUpdateBusy || Boolean(editorPendingAdvancedPackageUpdate)}
 	                    >
 	                      {advancedPackageUpdateBusy ? 'Uploading…' : 'Update Goon File Package'}

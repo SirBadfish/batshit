@@ -1,5 +1,8 @@
-import { EYE_APPEARANCE_SCHEMA_VERSION } from "$lib/goons/eyeAppearance";
 import { FACIAL_ARTWORK_SCHEMA_VERSION } from "$lib/goons/facialArtwork";
+
+const REQUIRED_EYE_APPEARANCE_SCHEMA_VERSION = "eye-appearance/v5";
+const REQUIRED_SOCKET_EYE_SURFACE_SCHEMA_VERSION = "socket-eye-surface/v2";
+const REQUIRED_EYE_APERTURE_SEAM_SCHEMA_VERSION = "eye-aperture-seam/v2";
 
 type PackageAppearanceManifest = {
   facialArtwork?: unknown;
@@ -75,7 +78,9 @@ export function classifyFacialArtworkPackageCapability(
   if (
     schemaVersion === "facial-artwork/v1" ||
     schemaVersion === "facial-artwork/v2" ||
-    schemaVersion === "facial-artwork/v3"
+    schemaVersion === "facial-artwork/v3" ||
+    schemaVersion === "facial-artwork/v4" ||
+    schemaVersion === "facial-artwork/v5"
   ) {
     return {
       status: "retired",
@@ -92,23 +97,29 @@ export function classifyFacialArtworkPackageCapability(
 
   if (!isRecord(eyeAppearance)) {
     return malformed(
-      "The Goon package is missing the Eye Appearance definition required by Facial Artwork v4.",
+      "The Goon package is missing the Eye Appearance definition required by Facial Artwork v6.",
     );
   }
-  if (eyeAppearance.schemaVersion !== EYE_APPEARANCE_SCHEMA_VERSION) {
+  if (eyeAppearance.schemaVersion !== REQUIRED_EYE_APPEARANCE_SCHEMA_VERSION) {
     return malformed(
       "The Goon package has an unsupported Eye Appearance definition.",
     );
   }
 
-  if (!isRecord(socketEyeSurface) || socketEyeSurface.schemaVersion !== "socket-eye-surface/v1") {
+  if (
+    !isRecord(socketEyeSurface) ||
+    socketEyeSurface.schemaVersion !== REQUIRED_SOCKET_EYE_SURFACE_SCHEMA_VERSION
+  ) {
     return malformed(
-      "The Goon package is missing the socket-eye-surface/v1 definition required by Facial Artwork v4.",
+      "The Goon package is missing the socket-eye-surface/v2 definition required by Facial Artwork v6.",
     );
   }
-  if (!isRecord(eyeApertureSeam) || eyeApertureSeam.schemaVersion !== "eye-aperture-seam/v1") {
+  if (
+    !isRecord(eyeApertureSeam) ||
+    eyeApertureSeam.schemaVersion !== REQUIRED_EYE_APERTURE_SEAM_SCHEMA_VERSION
+  ) {
     return malformed(
-      "The Goon package is missing the eye-aperture-seam/v1 definition required by Facial Artwork v4.",
+      "The Goon package is missing the eye-aperture-seam/v2 definition required by Facial Artwork v6.",
     );
   }
 
@@ -122,12 +133,12 @@ export function classifyFacialArtworkPackageCapability(
     !eyeDependencies ||
     !dependencyMatches(
       eyeDependencies.socketEyeSurface,
-      "socket-eye-surface/v1",
+      REQUIRED_SOCKET_EYE_SURFACE_SCHEMA_VERSION,
       socketEyeSurface.definitionSha256,
     ) ||
     !dependencyMatches(
       eyeDependencies.eyeApertureSeam,
-      "eye-aperture-seam/v1",
+      REQUIRED_EYE_APERTURE_SEAM_SCHEMA_VERSION,
       eyeApertureSeam.definitionSha256,
     )
   ) {
@@ -139,17 +150,17 @@ export function classifyFacialArtworkPackageCapability(
     !artworkDependencies ||
     !dependencyMatches(
       artworkDependencies.eyeAppearance,
-      EYE_APPEARANCE_SCHEMA_VERSION,
+      REQUIRED_EYE_APPEARANCE_SCHEMA_VERSION,
       eyeAppearance.definitionSha256,
     ) ||
     !dependencyMatches(
       artworkDependencies.socketEyeSurface,
-      "socket-eye-surface/v1",
+      REQUIRED_SOCKET_EYE_SURFACE_SCHEMA_VERSION,
       socketEyeSurface.definitionSha256,
     ) ||
     !dependencyMatches(
       artworkDependencies.eyeApertureSeam,
-      "eye-aperture-seam/v1",
+      REQUIRED_EYE_APERTURE_SEAM_SCHEMA_VERSION,
       eyeApertureSeam.definitionSha256,
     )
   ) {

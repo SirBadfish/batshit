@@ -2,11 +2,11 @@ import {
   createDefaultFacialArtworkState,
   reconcileFacialArtworkState,
   resolveFacialArtworkEyeState,
-  type FacialArtworkDefinitionV4,
+  type FacialArtworkDefinition,
   type FacialArtworkEyeState,
   type FacialArtworkRoleId,
   type FacialArtworkSide,
-  type FacialArtworkStateV4
+  type FacialArtworkState
 } from './facialArtwork'
 
 export type FacialArtworkEyeTarget = {
@@ -14,12 +14,12 @@ export type FacialArtworkEyeTarget = {
   side: FacialArtworkSide
 }
 
-export function cloneFacialArtworkState(value: FacialArtworkStateV4): FacialArtworkStateV4 {
-  return JSON.parse(JSON.stringify(value)) as FacialArtworkStateV4
+export function cloneFacialArtworkState(value: FacialArtworkState): FacialArtworkState {
+  return JSON.parse(JSON.stringify(value)) as FacialArtworkState
 }
 
 export function restoreFacialArtworkDraft(
-  definition: FacialArtworkDefinitionV4,
+  definition: FacialArtworkDefinition,
   value: unknown
 ) {
   const reconciliation = reconcileFacialArtworkState(definition, value)
@@ -33,11 +33,11 @@ export function restoreFacialArtworkDraft(
 }
 
 export function setFacialArtworkRoleMode(
-  value: FacialArtworkStateV4,
+  value: FacialArtworkState,
   roleId: FacialArtworkRoleId,
   mode: 'shared' | 'per-eye',
   collapseSource?: FacialArtworkSide
-): FacialArtworkStateV4 {
+): FacialArtworkState {
   const next = cloneFacialArtworkState(value)
   const current = next.roles[roleId]
   if (current.mode === mode) return next
@@ -68,10 +68,10 @@ export function setFacialArtworkRoleMode(
 }
 
 export function updateFacialArtworkEyeState(
-  value: FacialArtworkStateV4,
+  value: FacialArtworkState,
   target: FacialArtworkEyeTarget,
   update: (state: FacialArtworkEyeState) => FacialArtworkEyeState
-): FacialArtworkStateV4 {
+): FacialArtworkState {
   const next = cloneFacialArtworkState(value)
   const role = next.roles[target.roleId]
   if (role.mode === 'shared') {

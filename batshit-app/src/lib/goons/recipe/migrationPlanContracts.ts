@@ -142,7 +142,11 @@ const MISMATCH_DOMAINS = [
   "attachment",
   "grounding",
 ] as const;
-const WARNING_CODES = ["neutral-changed", "material-changed"] as const;
+const WARNING_CODES = [
+  "neutral-changed",
+  "material-changed",
+  "topology-changed",
+] as const;
 
 export const RECIPE_MIGRATION_REJECTION_CODES = [
   "EDGE_SOURCE_MISMATCH",
@@ -357,6 +361,13 @@ export type RecipeMigrationSiblingBinding = {
   targetStateId: string | null;
 };
 
+export type RecipeMigrationExternalSiblingBinding = {
+  sourceStateId: string;
+  targetStateId: string;
+  targetStateSha256: string;
+  validationSha256: string;
+};
+
 export type RecipeMigrationPlanVerifierContext = {
   edge: RecipeUpdateEdge;
   fromSource: RecipeSource;
@@ -366,6 +377,7 @@ export type RecipeMigrationPlanVerifierContext = {
   targetControlRanges: Record<string, [number, number]>;
   componentMembership: Record<string, RecipeMigrationComponentMembership>;
   siblingBindings: Record<RecipeSiblingSurface, RecipeMigrationSiblingBinding>;
+  externalSiblingBindings?: RecipeMigrationExternalSiblingBinding[];
   componentMapBundle?: RecipeComponentMapBundle;
   eligibleUnsupportedPlan?: RecipeMigrationPlan;
 };
@@ -1501,18 +1513,39 @@ function assertSiblingCoverage(
   edge: RecipeUpdateEdge,
   sourceState: RecipeStateSnapshot,
   bindings: Record<RecipeSiblingSurface, RecipeMigrationSiblingBinding>,
+  externalBindings: RecipeMigrationExternalSiblingBinding[] = [],
 ): void {
-  const boundSourceIds = plan.siblingRows
-    .map((row) => bindings[row.surface]?.sourceStateId ?? null)
-    .filter((id): id is string => id !== null)
-    .sort();
+  const sortedExternalBindings = [...externalBindings].sort((left, right) =>
+    left.sourceStateId.localeCompare(right.sourceStateId),
+  );
+  if (
+    externalBindings.some(
+      (binding, index) =>
+        binding.sourceStateId !== sortedExternalBindings[index]?.sourceStateId,
+    ) ||
+    new Set(externalBindings.map((binding) => binding.sourceStateId)).size !==
+      externalBindings.length ||
+    new Set(externalBindings.map((binding) => binding.targetStateId)).size !==
+      externalBindings.length
+  ) {
+    fail("external sibling bindings must be sorted and unique");
+  }
+  const boundSourceIds = [
+    ...plan.siblingRows
+      .map((row) => bindings[row.surface]?.sourceStateId ?? null)
+      .filter((id): id is string => id !== null),
+    ...externalBindings.map((binding) => binding.sourceStateId),
+  ].sort();
   const sourceIds = sourceState.siblings.map((state) => state.id).sort();
   if (!sameStrings(boundSourceIds, sourceIds)) {
     fail("sibling bindings do not exhaust source Recipe state");
   }
-  const targetIds = plan.siblingRows
-    .map((row) => bindings[row.surface]?.targetStateId ?? null)
-    .filter((id): id is string => id !== null);
+  const targetIds = [
+    ...plan.siblingRows
+      .map((row) => bindings[row.surface]?.targetStateId ?? null)
+      .filter((id): id is string => id !== null),
+    ...externalBindings.map((binding) => binding.targetStateId),
+  ];
   if (new Set(targetIds).size !== targetIds.length) {
     fail("sibling bindings reuse a target state id");
   }
@@ -1525,6 +1558,31 @@ function assertSiblingCoverage(
   const subplans = new Map(
     edge.siblingSubplans.map((subplan) => [subplan.surface, subplan]),
   );
+  for (const binding of externalBindings) {
+    requireLowercaseSha256(
+      binding.validationSha256,
+      `external sibling ${binding.sourceStateId} validationSha256`,
+    );
+    requireLowercaseSha256(
+      binding.targetStateSha256,
+      `external sibling ${binding.sourceStateId} targetStateSha256`,
+    );
+    if (binding.sourceStateId !== binding.targetStateId) {
+      fail(`external sibling ${binding.sourceStateId} changed its state id`);
+    }
+    const source = sourceById.get(binding.sourceStateId);
+    if (!source) {
+      fail(`external sibling ${binding.sourceStateId} has no source state`);
+    }
+    if (plan.proposedState) {
+      const target = proposedById.get(binding.targetStateId);
+      if (!target || target.stateSha256 !== binding.targetStateSha256) {
+        fail(
+          `external sibling ${binding.sourceStateId} target state does not match its verified binding`,
+        );
+      }
+    }
+  }
   for (const row of plan.siblingRows) {
     const binding = bindings[row.surface];
     const subplan = subplans.get(row.surface);
@@ -1592,7 +1650,10 @@ function assertSiblingCoverage(
   }
 }
 
-function assertOutcomeProofConsistency(plan: RecipeMigrationPlan): void {
+function assertOutcomeProofConsistency(
+  plan: RecipeMigrationPlan,
+  externalSiblingStateChanged: boolean,
+): void {
   const assertVerifiedErrors = (
     errors: RecipePhysicalErrorSummary,
     context: string,
@@ -1711,6 +1772,7 @@ function assertOutcomeProofConsistency(plan: RecipeMigrationPlan): void {
     (proof) => proof.status === "failed",
   );
   const hasPreviewRequirement =
+    externalSiblingStateChanged ||
     plan.warnings.length > 0 ||
     plan.controlRows.some(
       (row) => row.requiresPreview || row.requiresConfirmation,
@@ -1801,6 +1863,10 @@ function assertOutcomeProofConsistency(plan: RecipeMigrationPlan): void {
       for (const warning of plan.warnings) {
         if (warning.code === "material-changed") {
           allowedDomains.add("material");
+          continue;
+        }
+        if (warning.code === "topology-changed") {
+          allowedDomains.add("geometry");
           continue;
         }
         allowedDomains.add("neutral");
@@ -2040,8 +2106,24 @@ export async function verifyRecipeMigrationPlan(
       }
     }
   }
-  assertSiblingCoverage(plan, edge, sourceState, verifier.siblingBindings);
-  assertOutcomeProofConsistency(plan);
+  assertSiblingCoverage(
+    plan,
+    edge,
+    sourceState,
+    verifier.siblingBindings,
+    verifier.externalSiblingBindings,
+  );
+  const sourceSiblingStateHashes = new Map(
+    sourceState.siblings.map((state) => [state.id, state.stateSha256]),
+  );
+  const externalSiblingStateChanged = (
+    verifier.externalSiblingBindings ?? []
+  ).some(
+    (binding) =>
+      sourceSiblingStateHashes.get(binding.sourceStateId) !==
+      binding.targetStateSha256,
+  );
+  assertOutcomeProofConsistency(plan, externalSiblingStateChanged);
 
   if (plan.outcome.kind === "clean-reset") {
     const unsupportedValue = verifier.eligibleUnsupportedPlan;
