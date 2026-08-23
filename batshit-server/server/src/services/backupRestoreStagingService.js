@@ -26,14 +26,22 @@ function assertStageId(stageId) {
   }
 }
 
-function stagePaths(stageId) {
+function stageStorageKey(stageId) {
   assertStageId(stageId);
+  // Route parameters never become filesystem names. A fixed-length digest is
+  // the shared app/server storage contract and remains safe even if an HTTP
+  // framework or future caller bypasses the UUID-format check.
+  return createHash('sha256').update(stageId, 'utf8').digest('hex');
+}
+
+function stagePaths(stageId) {
+  const storageKey = stageStorageKey(stageId);
   const root = path.resolve(config.backupStagingDir);
   return {
     root,
-    archivePath: path.join(root, `${stageId}.zip`),
-    partialPath: path.join(root, `${stageId}.part`),
-    metadataPath: path.join(root, `${stageId}.json`),
+    archivePath: path.join(root, `${storageKey}.zip`),
+    partialPath: path.join(root, `${storageKey}.part`),
+    metadataPath: path.join(root, `${storageKey}.json`),
   };
 }
 

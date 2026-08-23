@@ -2643,17 +2643,20 @@ function stagedRestorePaths(stageId: string) {
   assertStageId(stageId)
   const stagingRoot = resolveBackupStagingDir()
   const uploadRoot = resolveUploadsDir()
+  // Keep route-controlled identifiers out of filesystem names. This digest
+  // must match batshit-server's private staging contract.
+  const storageKey = createHash('sha256').update(stageId, 'utf8').digest('hex')
   return {
     stagingRoot,
-    archivePath: path.join(stagingRoot, `${stageId}.zip`),
-    metadataPath: path.join(stagingRoot, `${stageId}.json`),
-    journalPath: path.join(stagingRoot, `${stageId}.restore-journal.json`),
-    rollbackPath: path.join(stagingRoot, `${stageId}.rollback.ndjson`),
-    planPath: path.join(stagingRoot, `${stageId}.plan.ndjson`),
+    archivePath: path.join(stagingRoot, `${storageKey}.zip`),
+    metadataPath: path.join(stagingRoot, `${storageKey}.json`),
+    journalPath: path.join(stagingRoot, `${storageKey}.restore-journal.json`),
+    rollbackPath: path.join(stagingRoot, `${storageKey}.rollback.ndjson`),
+    planPath: path.join(stagingRoot, `${storageKey}.plan.ndjson`),
     lockPath: path.join(stagingRoot, RESTORE_LOCK_NAME),
     uploadRoot,
-    newUploadRoot: path.join(uploadRoot, `.restore-new-${stageId}`),
-    oldUploadRoot: path.join(uploadRoot, `.restore-old-${stageId}`)
+    newUploadRoot: path.join(uploadRoot, `.restore-new-${storageKey}`),
+    oldUploadRoot: path.join(uploadRoot, `.restore-old-${storageKey}`)
   }
 }
 

@@ -609,10 +609,11 @@ describe('backupRestoreService', () => {
     await seedRepresentativeData('source')
     const bundle = await createBackupBundle('source')
     const stageId = '11111111-2222-4333-8444-555555555555'
-    const archivePath = path.join(backupStagingRoot, `${stageId}.zip`)
+    const storageKey = createHash('sha256').update(stageId, 'utf8').digest('hex')
+    const archivePath = path.join(backupStagingRoot, `${storageKey}.zip`)
     await fs.writeFile(archivePath, bundle.bytes)
     await fs.writeFile(
-      path.join(backupStagingRoot, `${stageId}.json`),
+      path.join(backupStagingRoot, `${storageKey}.json`),
       `${JSON.stringify({
         contract: 'batshit-backup-stage/v1',
         stageId,
@@ -660,6 +661,7 @@ describe('backupRestoreService', () => {
 
   it('recovers Redis and uploaded files from an interrupted restore journal', async () => {
     const stageId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    const storageKey = createHash('sha256').update(stageId, 'utf8').digest('hex')
     const originalRecord = {
       key: 'user:target:settings',
       type: 'json' as const,
@@ -673,20 +675,20 @@ describe('backupRestoreService', () => {
     }
     await redis.json.set(originalRecord.key, '$', targetRecord.value)
 
-    const oldRoot = path.join(uploadRoot, `.restore-old-${stageId}`)
+    const oldRoot = path.join(uploadRoot, `.restore-old-${storageKey}`)
     await fs.mkdir(oldRoot, { recursive: true })
     await fs.writeFile(path.join(oldRoot, 'before.txt'), 'before restore')
     await fs.writeFile(path.join(uploadRoot, 'after.txt'), 'partial restore')
     await fs.writeFile(
-      path.join(backupStagingRoot, `${stageId}.plan.ndjson`),
+      path.join(backupStagingRoot, `${storageKey}.plan.ndjson`),
       `${JSON.stringify(targetRecord)}\n`
     )
     await fs.writeFile(
-      path.join(backupStagingRoot, `${stageId}.rollback.ndjson`),
+      path.join(backupStagingRoot, `${storageKey}.rollback.ndjson`),
       `${JSON.stringify(originalRecord)}\n`
     )
     await fs.writeFile(
-      path.join(backupStagingRoot, `${stageId}.restore-journal.json`),
+      path.join(backupStagingRoot, `${storageKey}.restore-journal.json`),
       `${JSON.stringify({
         contract: 'batshit-backup-restore-journal/v1',
         stageId,
@@ -708,7 +710,7 @@ describe('backupRestoreService', () => {
     )
     await expect(fs.stat(path.join(uploadRoot, 'after.txt'))).rejects.toThrow()
     await expect(
-      fs.stat(path.join(backupStagingRoot, `${stageId}.restore-journal.json`))
+      fs.stat(path.join(backupStagingRoot, `${storageKey}.restore-journal.json`))
     ).rejects.toThrow()
   })
 

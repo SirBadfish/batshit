@@ -20,6 +20,7 @@ const path = require('path');
 const net = require('net');
 const fs = require('fs/promises');
 const os = require('os');
+const { createHash } = require('crypto');
 
 jest.setTimeout(30000);
 
@@ -222,9 +223,10 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     expect(staged).toMatchObject({ staged: true, stageId: ticket.stageId, bytes: bytes.length });
     expect(staged.sha256).toMatch(/^[0-9a-f]{64}$/);
 
-    await expect(fs.readFile(path.join(backupStagingDir, `${ticket.stageId}.zip`))).resolves.toEqual(bytes);
+    const storageKey = createHash('sha256').update(ticket.stageId, 'utf8').digest('hex');
+    await expect(fs.readFile(path.join(backupStagingDir, `${storageKey}.zip`))).resolves.toEqual(bytes);
     const metadata = JSON.parse(
-      await fs.readFile(path.join(backupStagingDir, `${ticket.stageId}.json`), 'utf8'),
+      await fs.readFile(path.join(backupStagingDir, `${storageKey}.json`), 'utf8'),
     );
     expect(metadata).toMatchObject({
       contract: 'batshit-backup-stage/v1',
