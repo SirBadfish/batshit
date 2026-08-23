@@ -10,6 +10,7 @@ import {
   mkdir,
   open,
   readFile,
+  readlink,
   realpath,
   rename,
   rm,
@@ -17,13 +18,14 @@ import {
   writeFile
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   inspectManagedRuntimePortability,
   MAC_RUNTIME_MINIMUM_VERSION
 } from './managed-runtime-portability.mjs';
+import { HAIR_CATALOG_PACKAGE_CONTRACT } from './hair-catalog-package-contract.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
@@ -33,11 +35,11 @@ const packagedServerRoot = join(packagedRuntimeRoot, 'batshit-server', 'server')
 const packagedLiveKitSidecarSourceRoot = join(packagedRuntimeRoot, 'tools', 'livekit-agent-sidecar');
 const packagedRedisStackRoot = join(packagedRuntimeRoot, 'vendor', 'redis-stack');
 const packagedFfmpegRoot = join(packagedRuntimeRoot, 'vendor', 'ffmpeg');
-const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v4';
+const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v6';
+const FACIAL_ARTWORK_RUNTIME_FILE_COUNT = 161;
 const LIP_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/lip-artwork/v2';
 const NAIL_SURFACE_RUNTIME_RELATIVE_ROOT = 'assets/goons/nail-surface/v1';
 const SKIN_APPEARANCE_RUNTIME_RELATIVE_ROOT = 'assets/goons/skin-appearance/v1';
-const HAIR_CATALOG_RUNTIME_RELATIVE_ROOT = 'batshit-app/static/goon-assets/hair/v1';
 const packagedFacialArtworkRoot = join(
   packagedRuntimeRoot,
   ...FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
@@ -116,6 +118,11 @@ const MONITOR_MAX_RESTARTS_PER_WINDOW = 5;
 const MONITOR_MAX_BACKOFF_MS = 120_000;
 const MONITOR_ENVIRONMENT_RETRY_MS = 30_000;
 const MONITOR_SERVICE_START_GRACE_MS = 15_000;
+// Large authenticated operations such as Advanced/GLB Recipe analysis can
+// legitimately occupy Batshit App's Node event loop for well over one health
+// probe. A live process must miss health continuously for this full window
+// before the monitor replaces it; dead processes still restart immediately.
+const MONITOR_LIVE_UNHEALTHY_GRACE_MS = 3 * 60_000;
 const BATSHIT_SERVER_MIGRATION_START_GRACE_MS = 15 * 60_000;
 const REDIS_APPENDONLY_ENABLE_TIMEOUT_MS = 60_000;
 const REDIS_SHUTDOWN_COMMAND_TIMEOUT_MS = 60_000;
@@ -177,12 +184,13 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
-function createServiceDefinitions(env = null) {
+function createServiceDefinitions(env = null, options = {}) {
   const ports = runtimePorts(env);
   const appOrigin = loopbackOrigin(ports.app);
   const serverOrigin = loopbackOrigin(ports.server);
   const mcpOrigin = loopbackOrigin(ports.mcp);
-  const nodeCommand = nodeRuntimeCommand();
+  const nodeCommand = options.nodeCommand || nodeRuntimeCommand();
+  const productionApp = options.useProductionApp ?? useProductionApp;
   const packagedFfmpegPath = join(packagedFfmpegRoot, 'bin', 'ffmpeg');
   const packagedFfmpegEnv =
     usePackagedRuntime && existsSync(packagedFfmpegPath)
@@ -263,11 +271,11 @@ function createServiceDefinitions(env = null) {
       cwd: appRoot,
       healthUrl: `${appOrigin}/`,
       acceptableStatuses: [200, 303],
-      command: useProductionApp ? nodeCommand : 'npm',
-      args: useProductionApp
+      command: productionApp ? nodeCommand : 'npm',
+      args: productionApp
         ? ['build']
         : ['run', 'dev', '--', '--port', String(ports.app), '--strictPort'],
-      matchCommandFragments: useProductionApp
+      matchCommandFragments: productionApp
         ? ['build', appRoot]
         : ['vite', `--port ${ports.app}`, appRoot],
       env: {
@@ -275,7 +283,7 @@ function createServiceDefinitions(env = null) {
         BATSHIT_APP_VERSION: process.env.BATSHIT_APP_VERSION || DEFAULT_APP_VERSION,
         BATSHIT_APP_CHANNEL: process.env.BATSHIT_APP_CHANNEL || DEFAULT_APP_CHANNEL,
         BATSHIT_LOG_DIR: paths.logs,
-        ...(useProductionApp
+        ...(productionApp
           ? {
               NODE_ENV: 'production',
               HOST: '127.0.0.1',
@@ -2769,6 +2777,21 @@ function monitorBackoffDelay(attemptsInWindow) {
   return Math.min(MONITOR_MAX_BACKOFF_MS, 5_000 * 2 ** (attemptsInWindow - 1));
 }
 
+function evaluateLiveServiceUnhealthyGrace(
+  unhealthySince,
+  now = Date.now(),
+  graceMs = MONITOR_LIVE_UNHEALTHY_GRACE_MS
+) {
+  const firstUnhealthyAt = Number.isFinite(unhealthySince) ? unhealthySince : now;
+  const elapsedMs = Math.max(0, now - firstUnhealthyAt);
+  return {
+    unhealthySince: firstUnhealthyAt,
+    elapsedMs,
+    remainingMs: Math.max(0, graceMs - elapsedMs),
+    shouldRestart: elapsedMs >= graceMs
+  };
+}
+
 async function readMonitorState() {
   const raw = await readFile(monitorStateFile, 'utf8').catch(() => '');
   if (!raw) return null;
@@ -2876,7 +2899,8 @@ async function runMonitorDaemon() {
         nextAttemptAt: 0,
         lastExit: null,
         lastIssue: null,
-        lastRestartAt: null
+        lastRestartAt: null,
+        unhealthySince: null
       }
     ])
   );
@@ -2896,7 +2920,8 @@ async function runMonitorDaemon() {
         restartsInWindow: state.restartTimes.length,
         lastExit: state.lastExit,
         lastIssue: state.lastIssue,
-        lastRestartAt: state.lastRestartAt
+        lastRestartAt: state.lastRestartAt,
+        unhealthySince: state.unhealthySince
       };
     }
     await writeFile(
@@ -2938,6 +2963,10 @@ async function runMonitorDaemon() {
   };
 
   const markAlive = async (state) => {
+    if (state.unhealthySince !== null) {
+      state.unhealthySince = null;
+      stateDirty = true;
+    }
     if (state.failed) {
       state.failed = false;
       state.restartTimes = [];
@@ -2968,6 +2997,7 @@ async function runMonitorDaemon() {
   };
 
   const recordAttempt = (state, now) => {
+    state.unhealthySince = null;
     state.restartTimes.push(now);
     state.totalRestarts += 1;
     state.lastRestartAt = new Date().toISOString();
@@ -3178,6 +3208,18 @@ async function runMonitorDaemon() {
               await noteIssue(
                 state,
                 `pid ${pid} is alive but ${service.definition.healthUrl} is not ready yet; still inside startup grace.`
+              );
+              continue;
+            }
+            const grace = evaluateLiveServiceUnhealthyGrace(state.unhealthySince);
+            if (!grace.shouldRestart) {
+              if (state.unhealthySince === null) {
+                state.unhealthySince = grace.unhealthySince;
+                stateDirty = true;
+              }
+              await noteIssue(
+                state,
+                `pid ${pid} is alive but ${service.definition.healthUrl} did not answer; allowing up to ${Math.round(MONITOR_LIVE_UNHEALTHY_GRACE_MS / 1000)} seconds for an in-flight operation before restart.`
               );
               continue;
             }
@@ -3397,6 +3439,44 @@ async function auditElectronPackage(packageRoot) {
   return issues;
 }
 
+async function auditManagedNodeRuntime(nodeRuntimeRoot) {
+  const issues = [];
+  const nodeBinary = join(nodeRuntimeRoot, 'bin', 'node');
+  for (const command of ['npm', 'npx']) {
+    const commandPath = join(nodeRuntimeRoot, 'bin', command);
+    const commandInfo = await lstat(commandPath).catch(() => null);
+    if (!commandInfo?.isSymbolicLink()) {
+      issues.push(`Managed Node runtime must preserve the official bin/${command} symlink.`);
+      continue;
+    }
+    const target = await readlink(commandPath).catch(() => '');
+    const relativeTarget = target
+      ? relative(nodeRuntimeRoot, resolve(dirname(commandPath), target))
+      : '';
+    if (
+      !target ||
+      isAbsolute(target) ||
+      relativeTarget === '' ||
+      relativeTarget.startsWith('..') ||
+      isAbsolute(relativeTarget)
+    ) {
+      issues.push(
+        `Managed Node runtime bin/${command} must remain a relative link inside the app-owned Node runtime.`
+      );
+    }
+  }
+
+  if (issues.length === 0) {
+    const npmProbe = runCaptured(nodeBinary, [join(nodeRuntimeRoot, 'bin', 'npm'), '--version']);
+    if (!npmProbe.ok || !npmProbe.stdout.trim()) {
+      issues.push(
+        `Managed Node runtime npm launcher failed: ${npmProbe.stderr.trim() || npmProbe.error?.message || 'unknown error'}`
+      );
+    }
+  }
+  return issues;
+}
+
 async function packageAudit(packagePath) {
   const target = resolve(packagePath || join(macRoot, 'zig-out', 'package'));
   const realTarget = await realpath(target).catch(() => null);
@@ -3409,8 +3489,11 @@ async function packageAudit(packagePath) {
   const runtimeAssetIssues = [];
   const requiredRuntimeFiles = [
     'Contents/Resources/THIRD_PARTY_NOTICES.md',
+    'Contents/Resources/scripts/hair-catalog-package-contract.mjs',
     'Contents/Resources/scripts/managed-runtime-portability.mjs',
     'Contents/Resources/runtime/vendor/node/bin/node',
+    'Contents/Resources/runtime/vendor/node/bin/npm',
+    'Contents/Resources/runtime/vendor/node/bin/npx',
     'Contents/Resources/runtime/vendor/redis-stack/bin/redis-server',
     'Contents/Resources/runtime/vendor/redis-stack/bin/redis-cli',
     'Contents/Resources/runtime/vendor/redis-stack/lib/libssl.3.dylib',
@@ -3498,14 +3581,14 @@ async function packageAudit(packagePath) {
   }
   const facialArtworkAssets = runtimeManifest?.assets?.facialArtwork;
   if (
-    facialArtworkAssets?.contract !== 'facial-artwork/v4' ||
+    facialArtworkAssets?.contract !== 'facial-artwork/v6' ||
     facialArtworkAssets?.root !== FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT ||
-    facialArtworkAssets?.definition !== 'facial-artwork-v4.json' ||
+    facialArtworkAssets?.definition !== 'facial-artwork-v6.json' ||
     !Array.isArray(facialArtworkAssets?.files) ||
-    facialArtworkAssets.files.length < 22
+    facialArtworkAssets.files.length !== FACIAL_ARTWORK_RUNTIME_FILE_COUNT
   ) {
     runtimeAssetIssues.push(
-      'runtime-manifest.json is missing the complete facial-artwork/v4 trusted asset inventory.'
+      'runtime-manifest.json is missing the complete facial-artwork/v6 trusted asset inventory.'
     );
   } else {
     const seenPaths = new Set();
@@ -3544,7 +3627,7 @@ async function packageAudit(packagePath) {
       }
     }
     if (!seenPaths.has(facialArtworkAssets.definition)) {
-      runtimeAssetIssues.push('The facial-artwork/v4 definition is absent from its runtime asset inventory.');
+      runtimeAssetIssues.push('The facial-artwork/v6 definition is absent from its runtime asset inventory.');
     }
   }
   const lipArtworkAssets = runtimeManifest?.assets?.lipArtwork;
@@ -3702,14 +3785,14 @@ async function packageAudit(packagePath) {
   }
   const hairCatalogAssets = runtimeManifest?.assets?.hairCatalog;
   if (
-    hairCatalogAssets?.contract !== 'hair-catalog/v1' ||
-    hairCatalogAssets?.root !== HAIR_CATALOG_RUNTIME_RELATIVE_ROOT ||
-    hairCatalogAssets?.definition !== 'catalog.json' ||
+    hairCatalogAssets?.contract !== HAIR_CATALOG_PACKAGE_CONTRACT.contract ||
+    hairCatalogAssets?.root !== HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot ||
+    hairCatalogAssets?.definition !== HAIR_CATALOG_PACKAGE_CONTRACT.definition ||
     !Array.isArray(hairCatalogAssets?.files) ||
     hairCatalogAssets.files.length < 1
   ) {
     runtimeAssetIssues.push(
-      'runtime-manifest.json is missing the complete hair-catalog/v1 trusted asset inventory.'
+      'runtime-manifest.json is missing the complete hair-catalog/v2 trusted asset inventory.'
     );
   } else {
     const seenPaths = new Set();
@@ -3748,7 +3831,7 @@ async function packageAudit(packagePath) {
       }
     }
     if (!seenPaths.has(hairCatalogAssets.definition)) {
-      runtimeAssetIssues.push('The hair-catalog/v1 definition is absent from its runtime asset inventory.');
+      runtimeAssetIssues.push('The hair-catalog/v2 definition is absent from its runtime asset inventory.');
     }
   }
 
@@ -3760,6 +3843,47 @@ async function packageAudit(packagePath) {
     runtimeAssetIssues.push(
       ...portability.issues.map((issue) => `Managed runtime portability failure: ${issue}`)
     );
+  }
+  runtimeAssetIssues.push(
+    ...(await auditManagedNodeRuntime(join(managedRuntimeRoot, 'node')))
+  );
+
+  const mainExecutable = join(realTarget, 'Contents', 'MacOS', 'Batshit');
+  const managedNodeExecutable = join(managedRuntimeRoot, 'node', 'bin', 'node');
+  const signatureDetails = runCaptured('codesign', ['-dvvv', mainExecutable], {
+    timeoutMs: 5000
+  });
+  const signatureText = `${signatureDetails.stdout}\n${signatureDetails.stderr}`;
+  const stableSigned = /TeamIdentifier=(?!not set)[A-Z0-9]+/.test(signatureText);
+  const entitlementText = (executable) => {
+    const result = runCaptured('codesign', ['-d', '--entitlements', ':-', executable], {
+      timeoutMs: 5000
+    });
+    return result.ok ? `${result.stdout}\n${result.stderr}` : '';
+  };
+  const managedNodeEntitlements = entitlementText(managedNodeExecutable);
+  if (!managedNodeEntitlements.includes('com.apple.security.cs.disable-library-validation')) {
+    runtimeAssetIssues.push(
+      'The packaged Node runtime is missing its narrow third-party native-module loading entitlement.'
+    );
+  }
+  if (!managedNodeEntitlements.includes('com.apple.security.device.audio-input')) {
+    runtimeAssetIssues.push(
+      'The packaged Node runtime is missing the audio-input entitlement required by the LiveKit worker.'
+    );
+  }
+  if (stableSigned) {
+    for (const [label, executable] of [
+      ['Electron main executable', mainExecutable],
+      ['Redis Stack executable', join(managedRuntimeRoot, 'redis-stack', 'bin', 'redis-server')],
+      ['FFmpeg executable', join(managedRuntimeRoot, 'ffmpeg', 'bin', 'ffmpeg')]
+    ]) {
+      if (entitlementText(executable).includes('com.apple.security.cs.disable-library-validation')) {
+        runtimeAssetIssues.push(
+          `${label} must keep library validation enabled; only the managed Node plug-in host receives that exception.`
+        );
+      }
+    }
   }
 
   const infoPlist = await readFile(join(realTarget, 'Contents', 'Info.plist'), 'utf8').catch(
@@ -3890,12 +4014,14 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
 
 export {
   auditElectronPackage,
+  auditManagedNodeRuntime,
   attemptSafeRedisShutdown,
   cleanupAbandonedRedisTempSnapshots,
   chooseRedisShutdownMode,
   createServiceDefinitions,
   executeOrderedRuntimeStop,
   ensureDurableEncryptionKey,
+  evaluateLiveServiceUnhealthyGrace,
   isRedisTempSnapshotName,
   parseRedisInfo,
   publishJsonAtomically,

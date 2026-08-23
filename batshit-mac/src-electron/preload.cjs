@@ -327,6 +327,15 @@ const zero = role === 'desktop'
       dialogs: Object.freeze({
         saveFile(options = {}) {
           return ipcRenderer.invoke('batshit:save-file', options);
+        },
+        openGoonPackage() {
+          return ipcRenderer.invoke('batshit:open-goon-package');
+        },
+        readGoonPackageChunk(request) {
+          return ipcRenderer.invoke('batshit:read-goon-package-chunk', request);
+        },
+        releaseGoonPackage(handleId) {
+          return ipcRenderer.invoke('batshit:release-goon-package', handleId);
         }
       }),
       desktopGoon,

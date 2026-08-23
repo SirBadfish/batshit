@@ -10,11 +10,11 @@
   import FacialArtworkSurfaceEditor from './FacialArtworkSurfaceEditor.svelte'
   import {
     createDefaultFacialArtworkState,
-    type FacialArtworkDefinitionV4,
+    type FacialArtworkDefinition,
     type FacialArtworkOrientation,
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
-    type FacialArtworkStateV4,
+    type FacialArtworkState,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import { cloneFacialArtworkState } from '$lib/goons/facialArtwork.editor'
@@ -28,8 +28,8 @@
     readEyeAppearanceControl,
     updateEyeAppearanceControl,
     type EyeAppearanceControlId,
-    type EyeAppearanceDefinitionV3,
-    type EyeAppearanceStateV3
+    type EyeAppearanceDefinition,
+    type EyeAppearanceState
   } from '$lib/goons/eyeAppearance'
 
   export type FacialArtworkEditorScope = 'brows' | 'eyes'
@@ -37,16 +37,16 @@
 
   type Props = {
     scope: FacialArtworkEditorScope
-    definition: FacialArtworkDefinitionV4
-    eyeAppearanceDefinition: EyeAppearanceDefinitionV3
-    valueState: FacialArtworkStateV4
-    eyeAppearanceState: EyeAppearanceStateV3
+    definition: FacialArtworkDefinition
+    eyeAppearanceDefinition: EyeAppearanceDefinition
+    valueState: FacialArtworkState
+    eyeAppearanceState: EyeAppearanceState
     ownerDisplayName: string
     creditDraft: FacialArtworkUploadCreditDraft
     disabled?: boolean
     onCreditDraftChange: (draft: FacialArtworkUploadCreditDraft) => void
-    onChange: (state: FacialArtworkStateV4) => void
-    onEyeAppearanceChange: (state: EyeAppearanceStateV3) => void
+    onChange: (state: FacialArtworkState) => void
+    onEyeAppearanceChange: (state: EyeAppearanceState) => void
     onUpload: (
       roleId: FacialArtworkRoleId,
       file: File,
@@ -110,7 +110,7 @@
   }
 
   const sectionEyeControlIds: Partial<Record<SectionId, EyeAppearanceControlId[]>> = {
-    iris: ['iris_size', 'iris_vertical_position'],
+    iris: ['iris_size', 'iris_horizontal_position', 'iris_vertical_position'],
     pupil: ['pupil_size']
   }
 
@@ -170,6 +170,7 @@
   }
 
   const irisSizeControl = $derived(eyeControl('iris_size'))
+  const irisHorizontalPositionControl = $derived(eyeControl('iris_horizontal_position'))
   const irisVerticalPositionControl = $derived(eyeControl('iris_vertical_position'))
   const pupilSizeControl = $derived(eyeControl('pupil_size'))
 
@@ -362,7 +363,7 @@
           <div class="facial-artwork-physical-group">
             <GoonsFieldLabel
               label="Physical Size & Position"
-              info="Linked across both eyes. Position moves Iris, Pupil, and Highlight together without changing gaze."
+              info="Linked across both eyes. Position moves Iris and Pupil together while Highlight stays fixed on the front cornea."
               ariaLabel="About Iris Physical Size and Position"
             />
             <FacialArtworkPhysicalSlider
@@ -375,9 +376,22 @@
               onChange={(value) => updateEyeControl('iris_size', value)}
             />
             <FacialArtworkPhysicalSlider
+              id="facial-artwork-iris-horizontal-position"
+              label={irisHorizontalPositionControl.label}
+              description="Move both irises inward or outward together. Pupils stay centered; highlights remain independent and respond to the camera as corneal reflections."
+              value={eyeAppearanceState.irisHorizontalPosition}
+              range={[
+                irisHorizontalPositionControl.minimum,
+                irisHorizontalPositionControl.maximum
+              ]}
+              step={irisHorizontalPositionControl.step}
+              {disabled}
+              onChange={(value) => updateEyeControl('iris_horizontal_position', value)}
+            />
+            <FacialArtworkPhysicalSlider
               id="facial-artwork-iris-vertical-position"
               label={irisVerticalPositionControl.label}
-              description="Move both irises up or down. Pupils and highlights stay centered with them."
+              description="Move both irises up or down. Pupils stay centered; highlights remain independent and respond to the camera as corneal reflections."
               value={eyeAppearanceState.irisVerticalPosition}
               range={[
                 irisVerticalPositionControl.minimum,
@@ -416,7 +430,7 @@
           <div class="facial-artwork-physical-group">
             <GoonsFieldLabel
               label="Physical Size"
-              info="Relative to Iris Size. 1 keeps the neutral ratio; 0 hides the pupil."
+              info="Relative to Iris Size. 1 keeps the neutral ratio; the balanced size range is 0.5 to 1.5."
               ariaLabel="About Pupil Physical Size"
             />
             <FacialArtworkPhysicalSlider

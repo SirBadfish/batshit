@@ -10,7 +10,7 @@
     resolveFacialArtworkTemplateOrientation,
     resolveFacialArtworkTemplateVariant,
     type FacialArtworkArtworkLayer,
-    type FacialArtworkDefinitionV4,
+    type FacialArtworkDefinition,
     type FacialArtworkEyeState,
     type FacialArtworkLongitudeBounds,
     type FacialArtworkOrientation,
@@ -19,7 +19,7 @@
     type FacialArtworkProvenance,
     type FacialArtworkRoleId,
     type FacialArtworkSide,
-    type FacialArtworkStateV4,
+    type FacialArtworkState,
     type FacialArtworkUpload
   } from '$lib/goons/facialArtwork'
   import {
@@ -29,15 +29,15 @@
   } from '$lib/goons/facialArtwork.editor'
 
   type Props = {
-    definition: FacialArtworkDefinitionV4
-    valueState: FacialArtworkStateV4
+    definition: FacialArtworkDefinition
+    valueState: FacialArtworkState
     roleId: FacialArtworkRoleId
     label: string
     leftLabel?: string
     rightLabel?: string
     disabled?: boolean
     provenance: FacialArtworkProvenance | null
-    onChange: (state: FacialArtworkStateV4) => void
+    onChange: (state: FacialArtworkState) => void
     onUpload: (
       roleId: FacialArtworkRoleId,
       file: File,
@@ -80,6 +80,15 @@
   const hasBaseColor = $derived(eyeState.baseColor !== null)
   const fileInputId = $derived(`facial-artwork-file-${roleId}-${perEye ? activeSide : 'shared'}`)
   const collapseChoiceId = $derived(`facial-artwork-${roleId}-collapse-choice`)
+  const planarControlDefinitions = [
+    ['translateU', 'Artwork Horizontal Position', 0.005],
+    ['translateV', 'Artwork Vertical Position', 0.005],
+    ['scale', 'Artwork Scale', 0.01],
+    ['rotationDegrees', 'Artwork Rotation', 1]
+  ] as const
+  const editablePlanarControls = $derived(
+    planarControlDefinitions.filter(([key]) => role.editableTransforms.includes(key))
+  )
 
   function updateEye(update: (state: FacialArtworkEyeState) => FacialArtworkEyeState) {
     if (disabled && !uploadBusy) return
@@ -185,11 +194,11 @@
   }
 
   function longitudeBounds(): FacialArtworkLongitudeBounds {
-    return role.bounds as FacialArtworkLongitudeBounds
+    return role.transformBounds as FacialArtworkLongitudeBounds
   }
 
   function planarBounds(): FacialArtworkPlanarBounds {
-    return role.bounds as FacialArtworkPlanarBounds
+    return role.transformBounds as FacialArtworkPlanarBounds
   }
 
   function downloadFilename(path: string) {
@@ -427,12 +436,7 @@
           />
         </label>
       {:else if artwork.mapping !== 'longitude' && role.mapping !== 'longitude'}
-        {#each [
-          ['translateU', 'Artwork Horizontal Position', 0.005],
-          ['translateV', 'Artwork Vertical Position', 0.005],
-          ['scale', 'Artwork Scale', 0.01],
-          ['rotationDegrees', 'Artwork Rotation', 1]
-        ] as control (control[0])}
+        {#each editablePlanarControls as control (control[0])}
           {@const key = control[0] as keyof FacialArtworkPlanarTransform}
           {@const bounds = planarBounds()[key]}
           <label class="facial-artwork-slider-control">

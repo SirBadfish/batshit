@@ -902,9 +902,9 @@ export function buildAppearanceRecipePhysicalBasisFromGlb(
     for (const side of ["left", "right"] as const) {
       const declared = [
         {
-          id: `${side}.compositeCap`,
-          name: socketEyePackage.socketEyeSurface.runtimeBindings[side].nodes.compositeCap,
-          path: `socketEyeSurface.runtimeBindings.${side}.nodes.compositeCap`,
+          id: `${side}.physicalEye`,
+          name: socketEyePackage.socketEyeSurface.runtimeBindings[side].nodes.physicalEye,
+          path: `socketEyeSurface.runtimeBindings.${side}.nodes.physicalEye`,
         },
         {
           id: `${side}.lashesEyeOutline`,

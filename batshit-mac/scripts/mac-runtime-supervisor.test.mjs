@@ -6,16 +6,39 @@ import test from 'node:test';
 
 import {
   attemptSafeRedisShutdown,
+  auditManagedNodeRuntime,
   auditElectronPackage,
   cleanupAbandonedRedisTempSnapshots,
   chooseRedisShutdownMode,
   createServiceDefinitions,
   ensureDurableEncryptionKey,
+  evaluateLiveServiceUnhealthyGrace,
   executeOrderedRuntimeStop,
   isRedisTempSnapshotName,
   publishJsonAtomically,
   redisStatusProvesStopped
 } from './mac-runtime-supervisor.mjs';
+
+test('live services tolerate one long in-flight operation before restart', () => {
+  const first = evaluateLiveServiceUnhealthyGrace(null, 1_000, 180_000);
+  assert.deepEqual(first, {
+    unhealthySince: 1_000,
+    elapsedMs: 0,
+    remainingMs: 180_000,
+    shouldRestart: false
+  });
+
+  assert.deepEqual(evaluateLiveServiceUnhealthyGrace(first.unhealthySince, 180_999, 180_000), {
+    unhealthySince: 1_000,
+    elapsedMs: 179_999,
+    remainingMs: 1,
+    shouldRestart: false
+  });
+  assert.equal(
+    evaluateLiveServiceUnhealthyGrace(first.unhealthySince, 181_000, 180_000).shouldRestart,
+    true
+  );
+});
 
 async function writeElectronPackageFixture(root, { omit = null } = {}) {
   const resources = join(root, 'Contents', 'Resources');
@@ -65,6 +88,44 @@ test('Electron package audit fails when its pinned Chromium runtime is incomplet
 
   assert.deepEqual(await auditElectronPackage(root), [
     'The Electron package is missing required Chromium runtime file: Versions/A/Resources/icudtl.dat'
+  ]);
+});
+
+test('managed Node runtime audit proves preserved npm and npx launchers execute', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-managed-node-'));
+  await mkdir(join(root, 'bin'), { recursive: true });
+  await mkdir(join(root, 'lib'), { recursive: true });
+  await symlink(process.execPath, join(root, 'bin', 'node'));
+  await writeFile(join(root, 'lib', 'npm-cli.mjs'), "console.log('10.0.0')\n");
+  await symlink('../lib/npm-cli.mjs', join(root, 'bin', 'npm'));
+  await symlink('../lib/npm-cli.mjs', join(root, 'bin', 'npx'));
+
+  assert.deepEqual(await auditManagedNodeRuntime(root), []);
+});
+
+test('managed Node runtime audit rejects dereferenced npm launchers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-managed-node-flat-'));
+  await mkdir(join(root, 'bin'), { recursive: true });
+  await symlink(process.execPath, join(root, 'bin', 'node'));
+  await writeFile(join(root, 'bin', 'npm'), "console.log('10.0.0')\n");
+  await writeFile(join(root, 'bin', 'npx'), "console.log('10.0.0')\n");
+
+  assert.deepEqual(await auditManagedNodeRuntime(root), [
+    'Managed Node runtime must preserve the official bin/npm symlink.',
+    'Managed Node runtime must preserve the official bin/npx symlink.'
+  ]);
+});
+
+test('managed Node runtime audit rejects npm links that escape the app bundle', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-managed-node-external-link-'));
+  await mkdir(join(root, 'bin'), { recursive: true });
+  await symlink(process.execPath, join(root, 'bin', 'node'));
+  await symlink('/tmp/npm-cli.js', join(root, 'bin', 'npm'));
+  await symlink('/tmp/npx-cli.js', join(root, 'bin', 'npx'));
+
+  assert.deepEqual(await auditManagedNodeRuntime(root), [
+    'Managed Node runtime bin/npm must remain a relative link inside the app-owned Node runtime.',
+    'Managed Node runtime bin/npx must remain a relative link inside the app-owned Node runtime.'
   ]);
 });
 
@@ -119,6 +180,20 @@ test('Mac encryption key mismatch fails closed before provider keys appear missi
 test('packaged batshit-server is required to use the managed Redis service', () => {
   const definitions = createServiceDefinitions(new Map());
   assert.equal(definitions.batshitServer.env.BATSHIT_REDIS_REQUIRED, 'true');
+});
+
+test('packaged JavaScript services launch through the managed Node executable directly', () => {
+  const managedNode = '/Batshit.app/Contents/Resources/runtime/vendor/node/bin/node';
+  const definitions = createServiceDefinitions(new Map(), {
+    useProductionApp: true,
+    nodeCommand: managedNode
+  });
+
+  assert.equal(definitions.batshitApp.command, managedNode);
+  assert.equal(definitions.batshitServer.command, managedNode);
+  assert.equal(definitions.mcpProxy.command, managedNode);
+  assert.equal(definitions.batshitApp.args[0], 'build');
+  assert.ok(!Object.values(definitions).some((definition) => definition.command === 'npm'));
 });
 
 test('failed NOSAVE retries SAVE and never needs a force-kill path', async () => {

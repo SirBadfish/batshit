@@ -13,7 +13,7 @@ function action(name: string, time: number) {
 describe('GoonEngine mounted runtime continuity', () => {
   it('preserves socket-eye contact settings across a same-Goon Live revision swap', () => {
     const outgoing = new GoonEngine(document.createElement('div')) as any
-    outgoing.socketEyeSurfaceDefinition = { schemaVersion: 'socket-eye-surface/v1' }
+    outgoing.socketEyeSurfaceDefinition = { schemaVersion: 'socket-eye-surface/v2' }
     outgoing.socketEyeContact = {
       ...DEFAULT_SOCKET_EYE_CONTACT_SETTINGS,
       strength: 0.75,

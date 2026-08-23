@@ -1,12 +1,19 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { APPEARANCE_DIAL_VALUES_CONTRACT } from '../appearanceDials.contracts'
 import { parseAppearanceDialsManifest } from '../appearanceDials'
 import { createHairState } from '../hairAssets'
 import { hairFollowerDefinitionSha256 } from '../hairFollowers'
+import { createDefaultNailSurfaceState, parseNailSurfaceDefinition } from '../nailSurface'
 import {
   HAIR_ROOT_WEIGHTED_MOTION_TAG,
   secondaryMotionDefinitionSha256
 } from '../secondaryMotion'
+import {
+  createDefaultSkinAppearanceState,
+  parseSkinAppearanceDefinition
+} from '../skinAppearance'
 import {
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   createRecipeArchiveContainmentReceipt,
@@ -20,6 +27,8 @@ import {
 import { canonicalRecipeString, sha256Hex } from './recipeCanonical'
 import {
   GOON_RECIPE_STATE_CONTRACT,
+  recipeSiblingStateSha256,
+  recipeStateSnapshotSha256,
   type RecipeSource,
   type RecipeStateSnapshot
 } from './recipeContracts'
@@ -766,6 +775,97 @@ describe('Recipe workflow browser client', () => {
     ).toBe(true)
   })
 
+  it('derives package sibling bindings while retaining selected Hair as an external sibling', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const state = await buildRecipeStateSnapshot({
+      goon: minimalGoon({
+        hairState: {
+          schemaVersion: 'hair-state/v2',
+          definitionSha256: hash('9'),
+          selected: {
+            assetId: 'style-01',
+            assetRevisionId: 'style-01-r1',
+            assetRevision: 1,
+            assetRevisionSha256: hash('9'),
+            fitFamily: 'batshit-base-female-v1',
+            fitSha256: hash('8')
+          },
+          baseColor: '#2a1738',
+          highlightColor: '#6f4a8e',
+          motionSettings: { enabled: true, intensity: 1.1 }
+        }
+      }),
+      appearanceDials: fixture.sourceState.appearanceDials
+    })
+
+    await expect(
+      buildRecipeSiblingInputs({
+        state,
+        targetManifest: fixture.target.avatarManifest,
+        edge: fixture.edge
+      })
+    ).resolves.toMatchObject({
+      eyeAppearance: { sourceStateId: null },
+      facialArtwork: { sourceStateId: null },
+      oralAppearance: { sourceStateId: null }
+    })
+  })
+
+  it('recognizes exact Nail Surface and Skin Appearance state as package-managed siblings', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const nailRaw = JSON.parse(
+      readFileSync(
+        resolve(process.cwd(), 'static/goons/nail-surface/v1/nail-surface-v1.json'),
+        'utf8'
+      )
+    )
+    const skinRaw = JSON.parse(
+      readFileSync(
+        resolve(process.cwd(), 'static/goons/skin-appearance/v1/skin-appearance-v1.json'),
+        'utf8'
+      )
+    )
+    const nail = parseNailSurfaceDefinition(nailRaw)
+    const skin = parseSkinAppearanceDefinition(skinRaw)
+    const nailState = createDefaultNailSurfaceState(nail)
+    const skinState = createDefaultSkinAppearanceState(skin)
+    const state = structuredClone(fixture.sourceState)
+    state.siblings.push(
+      {
+        id: 'nailSurface',
+        contract: nailState.schemaVersion,
+        definitionSha256: nail.definitionSha256,
+        stateSha256: await recipeSiblingStateSha256(nailState),
+        state: nailState
+      },
+      {
+        id: 'skinAppearance',
+        contract: skinState.schemaVersion,
+        definitionSha256: skin.definitionSha256,
+        stateSha256: await recipeSiblingStateSha256(skinState),
+        state: skinState
+      }
+    )
+    state.siblings.sort((left, right) => left.id.localeCompare(right.id))
+    state.stateSha256 = await recipeStateSnapshotSha256(state)
+
+    await expect(
+      buildRecipeSiblingInputs({
+        state,
+        targetManifest: {
+          ...fixture.target.avatarManifest,
+          nailSurface: nailRaw,
+          skinAppearance: skinRaw
+        },
+        edge: fixture.edge
+      })
+    ).resolves.toMatchObject({
+      eyeAppearance: { sourceStateId: null },
+      facialArtwork: { sourceStateId: null },
+      oralAppearance: { sourceStateId: null }
+    })
+  })
+
   it('uses the server-authored proposed state for initial Analyze preview controls', async () => {
     const fixture = await createRecipePhysicalMigrationFixture()
     const plan = await planAppearanceRecipeMigration({
@@ -936,8 +1036,8 @@ describe('Recipe workflow browser client', () => {
       [hairAsset.material.highlightMask!.ref, HAIR_HIGHLIGHT_MASK_PNG_FIXTURE]
     ])
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input) === '/api/goons/hair-assets') {
-        return new Response(JSON.stringify({ assets: [hairAsset] }), {
+      if (String(input).startsWith('/api/goons/hair-assets/h1-test-hair/h1-test-hair-r1?sha256=')) {
+        return new Response(JSON.stringify({ asset: hairAsset }), {
           status: 200
         })
       }

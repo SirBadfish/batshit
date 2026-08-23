@@ -81,6 +81,19 @@ test('main preload retains existing narrow APIs and adds Desktop Goon commands',
   await zero.desktopGoon.invoke('desktopGoon.open', {});
   const invocation = ipcRenderer.listeners('batshit:desktop-goon:status');
   assert.equal(invocation.length, 1);
+  assert.equal(Object.isFrozen(zero.dialogs), true);
+  assert.deepEqual(await zero.dialogs.openGoonPackage(), ['batshit:open-goon-package']);
+  assert.deepEqual(
+    await zero.dialogs.readGoonPackageChunk({ handleId: 'selection', offset: 0, length: 4 }),
+    [
+      'batshit:read-goon-package-chunk',
+      { handleId: 'selection', offset: 0, length: 4 }
+    ]
+  );
+  assert.deepEqual(
+    await zero.dialogs.releaseGoonPackage('selection'),
+    ['batshit:release-goon-package', 'selection']
+  );
 });
 
 test('main preload exposes a frozen one-way intentional-shutdown lifecycle', () => {

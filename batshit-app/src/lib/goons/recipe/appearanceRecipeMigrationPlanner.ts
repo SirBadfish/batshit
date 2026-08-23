@@ -36,6 +36,7 @@ import {
   type RecipeMigrationControlRow,
   type RecipeMigrationPlan,
   type RecipeMigrationRejectionCode,
+  type RecipeMigrationExternalSiblingBinding,
   type RecipeMigrationSiblingBinding,
   type RecipeMigrationSiblingDefinitionRef,
   type RecipeMigrationSiblingRow,
@@ -91,6 +92,14 @@ export type AppearanceRecipeMigrationSiblingInput = {
   message?: string;
 };
 
+export type AppearanceRecipeMigrationExternalSiblingInput = {
+  sourceStateId: string;
+  targetStateId: string;
+  validationSha256: string;
+  message: string;
+  targetState: RecipeSiblingStateRecord;
+};
+
 export type AppearanceRecipeSiblingVerificationRequest = {
   surface: RecipeSiblingSurface;
   operation: "migrate" | "reset";
@@ -129,6 +138,7 @@ export type AppearanceRecipeMigrationPlannerInput = {
     RecipeSiblingSurface,
     AppearanceRecipeMigrationSiblingInput
   >;
+  externalSiblingInputs?: AppearanceRecipeMigrationExternalSiblingInput[];
   componentMapBundle?: RecipeComponentMapBundle;
   siblingVerifiers?: Partial<
     Record<RecipeSiblingSurface, AppearanceRecipeSiblingVerifier>
@@ -163,6 +173,8 @@ type SiblingPlanningResult = {
   rows: RecipeMigrationSiblingRow[];
   proposedStates: RecipeSiblingStateRecord[];
   bindings: Record<RecipeSiblingSurface, RecipeMigrationSiblingBinding>;
+  externalBindings: RecipeMigrationExternalSiblingBinding[];
+  externalStateChanged: boolean;
   rejectionCodes: RecipeMigrationRejectionCode[];
 };
 
@@ -178,6 +190,7 @@ type BuiltMigrationContext = {
   components: ComponentModel;
   targetInventory: ReturnType<typeof appearanceRecipeControlInventory>;
   siblingBindings: Record<RecipeSiblingSurface, RecipeMigrationSiblingBinding>;
+  externalSiblingBindings: RecipeMigrationExternalSiblingBinding[];
 };
 
 const ZERO_SHA256 = "0".repeat(64);
@@ -193,7 +206,9 @@ function plannedTargetRecipeRevision(
 ): number {
   const target = input.toRecipeRevision ?? input.fromRecipeRevision + 1;
   if (!Number.isSafeInteger(target) || target <= input.fromRecipeRevision) {
-    fail("toRecipeRevision must be a safe integer greater than fromRecipeRevision");
+    fail(
+      "toRecipeRevision must be a safe integer greater than fromRecipeRevision",
+    );
   }
   return target;
 }
@@ -554,16 +569,40 @@ async function buildComponentProofs(
           rejectionCodes.add("COMPONENT_PROOF_FAILED");
         }
       } catch (error) {
-        status = "failed";
-        mismatchDomains =
-          error instanceof AppearanceRecipePhysicalInventoryMismatchError
-            ? [...error.mismatchDomains].sort(compareText)
-            : [];
-        rejectionCodes.add(
-          error instanceof AppearanceRecipePhysicalInventoryMismatchError
-            ? "COMPONENT_MEMBERSHIP_MISMATCH"
-            : "COMPONENT_PROOF_FAILED",
-        );
+        const inventoryMismatch =
+          error instanceof AppearanceRecipePhysicalInventoryMismatchError;
+        const topologyRebuildExplainsMismatch =
+          inventoryMismatch &&
+          edge.topologyRebuild?.affectedComponentIds.includes(
+            candidate.componentId,
+          ) === true;
+        mismatchDomains = inventoryMismatch
+          ? [...error.mismatchDomains].sort(compareText)
+          : [];
+        if (topologyRebuildExplainsMismatch) {
+          const targetComponent = evaluateAppearance(
+            targetPrepared,
+            candidateAppearanceState(targetPrepared.manifest, candidate),
+          );
+          const targetProjection = await sourceComponentProjection(
+            targetNeutral,
+            targetComponent,
+          );
+          targetOutputSha256 = targetProjection.outputSha256;
+          comparedOutputKeysSha256 = await comparedKeysSha256(
+            sourceProjection.comparedKeysSha256,
+            targetProjection.comparedKeysSha256,
+          );
+          status = "not-preserved";
+          rejectionCodes.clear();
+        } else {
+          status = "failed";
+          rejectionCodes.add(
+            inventoryMismatch
+              ? "COMPONENT_MEMBERSHIP_MISMATCH"
+              : "COMPONENT_PROOF_FAILED",
+          );
+        }
       }
     }
 
@@ -764,6 +803,7 @@ async function runSiblingVerifier(
 function assertSiblingBindingsExhaustState(
   sourceState: RecipeStateSnapshot,
   inputs: AppearanceRecipeMigrationPlannerInput["siblingInputs"],
+  externalInputs: AppearanceRecipeMigrationExternalSiblingInput[] = [],
 ): void {
   const surfaces: RecipeSiblingSurface[] = [
     "eyeAppearance",
@@ -774,19 +814,38 @@ function assertSiblingBindingsExhaustState(
   if (!sameJson(inputSurfaces, [...surfaces].sort(compareText))) {
     fail("sibling inputs must contain exactly the three named surfaces");
   }
-  const boundSourceIds = surfaces
-    .map((surface) => inputs[surface].sourceStateId)
-    .filter((id): id is string => id !== null)
-    .sort(compareText);
+  const sortedExternalInputs = [...externalInputs].sort((left, right) =>
+    compareText(left.sourceStateId, right.sourceStateId),
+  );
+  if (!sameJson(sortedExternalInputs, externalInputs)) {
+    fail("external sibling inputs must be sorted by source state id");
+  }
+  if (
+    new Set(externalInputs.map((input) => input.sourceStateId)).size !==
+      externalInputs.length ||
+    new Set(externalInputs.map((input) => input.targetStateId)).size !==
+      externalInputs.length
+  ) {
+    fail("external sibling inputs must be unique");
+  }
+  const boundSourceIds = [
+    ...surfaces
+      .map((surface) => inputs[surface].sourceStateId)
+      .filter((id): id is string => id !== null),
+    ...externalInputs.map((input) => input.sourceStateId),
+  ].sort(compareText);
   const sourceIds = sourceState.siblings
     .map((state) => state.id)
     .sort(compareText);
   if (!sameJson(boundSourceIds, sourceIds)) {
     fail("sibling source bindings do not exhaust Recipe state siblings");
   }
-  const targetIds = surfaces
-    .map((surface) => inputs[surface].targetStateId)
-    .filter((id): id is string => id !== null);
+  const targetIds = [
+    ...surfaces
+      .map((surface) => inputs[surface].targetStateId)
+      .filter((id): id is string => id !== null),
+    ...externalInputs.map((input) => input.targetStateId),
+  ];
   if (new Set(targetIds).size !== targetIds.length) {
     fail("sibling target state ids must be unique");
   }
@@ -797,8 +856,9 @@ async function buildSiblingPlan(
   sourceState: RecipeStateSnapshot,
   inputs: AppearanceRecipeMigrationPlannerInput["siblingInputs"],
   verifiers: AppearanceRecipeMigrationPlannerInput["siblingVerifiers"],
+  externalInputs: AppearanceRecipeMigrationExternalSiblingInput[] = [],
 ): Promise<SiblingPlanningResult> {
-  assertSiblingBindingsExhaustState(sourceState, inputs);
+  assertSiblingBindingsExhaustState(sourceState, inputs, externalInputs);
   const sourceById = new Map(
     sourceState.siblings.map((state) => [state.id, state]),
   );
@@ -944,11 +1004,56 @@ async function buildSiblingPlan(
       requiresConfirmation,
     });
   }
+  for (const input of externalInputs) {
+    requireLowercaseSha256(
+      input.validationSha256,
+      `external sibling ${input.sourceStateId} validationSha256`,
+    );
+    if (input.sourceStateId !== input.targetStateId) {
+      fail(
+        `external sibling ${input.sourceStateId} must retain its exact state id`,
+      );
+    }
+    if (
+      typeof input.message !== "string" ||
+      input.message.trim() !== input.message ||
+      input.message.length === 0
+    ) {
+      fail(
+        `external sibling ${input.sourceStateId} must include a validation message`,
+      );
+    }
+    const source = sourceById.get(input.sourceStateId);
+    if (!source)
+      fail(`external sibling ${input.sourceStateId} has no source state`);
+    if (input.targetState.id !== input.targetStateId) {
+      fail(
+        `external sibling ${input.sourceStateId} target state id contradicts its binding`,
+      );
+    }
+    proposedStates.push(structuredClone(input.targetState));
+  }
   proposedStates.sort((left, right) => compareText(left.id, right.id));
   return {
     rows,
     proposedStates,
     bindings,
+    externalBindings: externalInputs.map(
+      ({ sourceStateId, targetStateId, validationSha256, targetState }) => ({
+        sourceStateId,
+        targetStateId,
+        targetStateSha256: targetState.stateSha256,
+        validationSha256,
+      }),
+    ),
+    externalStateChanged: externalInputs.some((input) => {
+      const source = sourceById.get(input.sourceStateId)!;
+      return (
+        source.contract !== input.targetState.contract ||
+        source.definitionSha256 !== input.targetState.definitionSha256 ||
+        source.stateSha256 !== input.targetState.stateSha256
+      );
+    }),
     rejectionCodes: sortedUniqueRejections(rejectionCodes),
   };
 }
@@ -958,8 +1063,9 @@ async function buildCleanResetSiblingPlan(
   sourceState: RecipeStateSnapshot,
   inputs: AppearanceRecipeMigrationPlannerInput["siblingInputs"],
   verifiers: AppearanceRecipeMigrationPlannerInput["siblingVerifiers"],
+  externalInputs: AppearanceRecipeMigrationExternalSiblingInput[] = [],
 ): Promise<SiblingPlanningResult> {
-  assertSiblingBindingsExhaustState(sourceState, inputs);
+  assertSiblingBindingsExhaustState(sourceState, inputs, externalInputs);
   const sourceById = new Map(
     sourceState.siblings.map((state) => [state.id, state]),
   );
@@ -1053,11 +1159,48 @@ async function buildCleanResetSiblingPlan(
     });
   }
 
+  for (const input of externalInputs) {
+    requireLowercaseSha256(
+      input.validationSha256,
+      `external sibling ${input.sourceStateId} validationSha256`,
+    );
+    if (input.sourceStateId !== input.targetStateId) {
+      fail(
+        `external sibling ${input.sourceStateId} must retain its exact state id`,
+      );
+    }
+    const source = sourceById.get(input.sourceStateId);
+    if (!source)
+      fail(`external sibling ${input.sourceStateId} has no source state`);
+    if (input.targetState.id !== input.targetStateId) {
+      fail(
+        `external sibling ${input.sourceStateId} target state id contradicts its binding`,
+      );
+    }
+    proposedStates.push(structuredClone(input.targetState));
+  }
+
   proposedStates.sort((left, right) => compareText(left.id, right.id));
   return {
     rows,
     proposedStates,
     bindings,
+    externalBindings: externalInputs.map(
+      ({ sourceStateId, targetStateId, validationSha256, targetState }) => ({
+        sourceStateId,
+        targetStateId,
+        targetStateSha256: targetState.stateSha256,
+        validationSha256,
+      }),
+    ),
+    externalStateChanged: externalInputs.some((input) => {
+      const source = sourceById.get(input.sourceStateId)!;
+      return (
+        source.contract !== input.targetState.contract ||
+        source.definitionSha256 !== input.targetState.definitionSha256 ||
+        source.stateSha256 !== input.targetState.stateSha256
+      );
+    }),
     rejectionCodes: [],
   };
 }
@@ -1110,6 +1253,7 @@ async function wholeProof(
   targetPrepared: PreparedPackage,
   componentProofs: RecipeMigrationComponentProof[],
   siblingRows: RecipeMigrationSiblingRow[],
+  externalStateChanged = false,
 ): Promise<RecipeMigrationWholeProof> {
   const sourceLogical = await projectAppearanceRecipeLogicalProof(
     source.proof.logical,
@@ -1166,6 +1310,7 @@ async function wholeProof(
     const permitsAppearancePreservedClaim =
       status === "verified" &&
       edge.warnings.length === 0 &&
+      !externalStateChanged &&
       componentProofs.every((proof) => proof.status === "verified") &&
       siblingRows.every(
         (row) =>
@@ -1196,12 +1341,30 @@ async function wholeProof(
       target.proof.absolute,
       target.proof.correspondence,
     );
-    const mismatchDomains =
+    const inventoryMismatch =
+      error instanceof AppearanceRecipePhysicalInventoryMismatchError;
+    const physicalMismatchDomains =
       error instanceof AppearanceRecipePhysicalInventoryMismatchError
         ? error.mismatchDomains
         : (["geometry"] as const);
+    const mismatchDomains = new Set<
+      RecipeMigrationWholeProof["mismatchDomains"][number]
+    >(physicalMismatchDomains);
+    if (!materialMatches) mismatchDomains.add("material");
+    const topologyRebuildExplainsMismatch =
+      inventoryMismatch &&
+      edge.topologyRebuild !== undefined &&
+      edge.warnings.some((warning) => warning.code === "topology-changed") &&
+      physicalMismatchDomains.every((domain) => domain === "geometry");
+    const materialExplained =
+      materialMatches ||
+      edge.warnings.some((warning) => warning.code === "material-changed");
+    const status: RecipeMigrationWholeProof["status"] =
+      topologyRebuildExplainsMismatch && materialExplained
+        ? "expected-mismatch"
+        : "unavailable";
     return {
-      status: "unavailable",
+      status,
       sourcePhysicalOutputSha256,
       targetPhysicalOutputSha256: targetLogical.projectionSha256,
       sourceAbsoluteOutputSha256,
@@ -1253,6 +1416,7 @@ async function buildCleanResetEvidence(input: {
   components: ComponentModel;
   siblingInputs: AppearanceRecipeMigrationPlannerInput["siblingInputs"];
   siblingVerifiers: AppearanceRecipeMigrationPlannerInput["siblingVerifiers"];
+  externalSiblingInputs: AppearanceRecipeMigrationPlannerInput["externalSiblingInputs"];
 }): Promise<{
   proposedState: RecipeStateSnapshot;
   controlRows: RecipeMigrationControlRow[];
@@ -1266,6 +1430,7 @@ async function buildCleanResetEvidence(input: {
     input.sourceState,
     input.siblingInputs,
     input.siblingVerifiers,
+    input.externalSiblingInputs,
   );
   const explicitReset = await buildExplicitResetComponentProofs(
     input.components,
@@ -1290,6 +1455,7 @@ async function buildCleanResetEvidence(input: {
     input.targetPrepared,
     explicitReset.proofs,
     siblings.rows,
+    siblings.externalStateChanged,
   );
   if (["failed", "unavailable"].includes(wholeRecipeProof.status)) {
     fail(
@@ -1530,6 +1696,7 @@ async function buildMigrationPlan(
     sourceState,
     input.siblingInputs,
     input.siblingVerifiers,
+    input.externalSiblingInputs,
   );
 
   const canBuildTarget =
@@ -1557,6 +1724,7 @@ async function buildMigrationPlan(
       targetPrepared,
       componentProofs,
       siblings.rows,
+      siblings.externalStateChanged,
     );
   } else {
     wholeRecipeProof = await failedWholeProof(sourceFull, sourcePrepared);
@@ -1583,6 +1751,7 @@ async function buildMigrationPlan(
         components,
         siblingInputs: input.siblingInputs,
         siblingVerifiers: input.siblingVerifiers,
+        externalSiblingInputs: input.externalSiblingInputs,
       });
       cleanResetEligibility = "eligible";
     } catch {
@@ -1602,6 +1771,8 @@ async function buildMigrationPlan(
     ) ||
     componentProofs.some((proof) => proof.status !== "verified") ||
     wholeRecipeProof.status === "expected-mismatch";
+  const externalPreviewRequired = siblings.externalStateChanged;
+  const hasPreviewWithExternal = hasPreview || externalPreviewRequired;
   const appearancePreserved =
     !unsupported && wholeRecipeProof.permitsAppearancePreservedClaim;
 
@@ -1629,7 +1800,7 @@ async function buildMigrationPlan(
         }
       : {
           kind: "automatic",
-          readiness: hasPreview ? "preview-required" : "ready",
+          readiness: hasPreviewWithExternal ? "preview-required" : "ready",
           preservationClaim: appearancePreserved
             ? "appearance-preserved"
             : "values-migrated-only",
@@ -1657,6 +1828,7 @@ async function buildMigrationPlan(
     targetControlRanges: targetInventory.ranges,
     componentMembership: components.verifierMembership,
     siblingBindings: siblings.bindings,
+    externalSiblingBindings: siblings.externalBindings,
     ...(input.componentMapBundle
       ? { componentMapBundle: input.componentMapBundle }
       : {}),
@@ -1673,6 +1845,7 @@ async function buildMigrationPlan(
     components,
     targetInventory,
     siblingBindings: siblings.bindings,
+    externalSiblingBindings: siblings.externalBindings,
   };
 }
 
@@ -1717,6 +1890,7 @@ export async function planAppearanceRecipeCleanReset(
     components: migration.components,
     siblingInputs: input.migrationInput.siblingInputs,
     siblingVerifiers: input.migrationInput.siblingVerifiers,
+    externalSiblingInputs: input.migrationInput.externalSiblingInputs,
   });
   const plan = await createRecipeMigrationPlan({
     contract: "recipe-migration-plan/v1",

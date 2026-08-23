@@ -10,43 +10,43 @@ function currentTuple(): any {
   const seamSha = "c".repeat(64);
   return {
     facialArtwork: {
-      schemaVersion: "facial-artwork/v4",
+      schemaVersion: "facial-artwork/v6",
       definitionSha256: "d".repeat(64),
       dependencies: {
         eyeAppearance: {
-          schemaVersion: "eye-appearance/v3",
+          schemaVersion: "eye-appearance/v5",
           definitionSha256: eyeSha,
         },
         socketEyeSurface: {
-          schemaVersion: "socket-eye-surface/v1",
+          schemaVersion: "socket-eye-surface/v2",
           definitionSha256: socketSha,
         },
         eyeApertureSeam: {
-          schemaVersion: "eye-aperture-seam/v1",
+          schemaVersion: "eye-aperture-seam/v2",
           definitionSha256: seamSha,
         },
       },
     },
     eyeAppearance: {
-      schemaVersion: "eye-appearance/v3",
+      schemaVersion: "eye-appearance/v5",
       definitionSha256: eyeSha,
       dependencies: {
         socketEyeSurface: {
-          schemaVersion: "socket-eye-surface/v1",
+          schemaVersion: "socket-eye-surface/v2",
           definitionSha256: socketSha,
         },
         eyeApertureSeam: {
-          schemaVersion: "eye-aperture-seam/v1",
+          schemaVersion: "eye-aperture-seam/v2",
           definitionSha256: seamSha,
         },
       },
     },
     socketEyeSurface: {
-      schemaVersion: "socket-eye-surface/v1",
+      schemaVersion: "socket-eye-surface/v2",
       definitionSha256: socketSha,
     },
     eyeApertureSeam: {
-      schemaVersion: "eye-aperture-seam/v1",
+      schemaVersion: "eye-aperture-seam/v2",
       definitionSha256: seamSha,
     },
   };
@@ -59,29 +59,29 @@ describe("Facial Artwork package capability", () => {
     });
   });
 
-  it("classifies the exact v4/v2/socket/seam tuple as current", () => {
+  it("classifies only the exact v6/v5/v2/v2 tuple as current", () => {
     expect(classifyFacialArtworkPackageCapability(currentTuple())).toEqual({
       status: "current",
     });
   });
 
-  it("quarantines the retired v3 capability without accepting it as current", () => {
+  it("quarantines the retired v4 capability without accepting it as current", () => {
     expect(
       classifyFacialArtworkPackageCapability({
-        facialArtwork: { schemaVersion: "facial-artwork/v3" },
-        eyeAppearance: { schemaVersion: "eye-appearance/v1" },
+        facialArtwork: { schemaVersion: "facial-artwork/v4" },
+        eyeAppearance: { schemaVersion: "eye-appearance/v3" },
       }),
     ).toEqual({
       status: "retired",
       notice: RETIRED_FACIAL_ARTWORK_PACKAGE_NOTICE,
-      schemaVersion: "facial-artwork/v3",
+      schemaVersion: "facial-artwork/v4",
     });
   });
 
   it("fails closed for any partial socket-eye tuple", () => {
     expect(
       classifyFacialArtworkPackageCapability({
-        eyeAppearance: { schemaVersion: "eye-appearance/v3" },
+        eyeAppearance: { schemaVersion: "eye-appearance/v5" },
       }),
     ).toMatchObject({
       status: "malformed",
@@ -92,20 +92,22 @@ describe("Facial Artwork package capability", () => {
     delete missingSeam.eyeApertureSeam;
     expect(classifyFacialArtworkPackageCapability(missingSeam)).toMatchObject({
       status: "malformed",
-      error: expect.stringMatching(/eye-aperture-seam\/v1/),
+      error: expect.stringMatching(/eye-aperture-seam\/v2/),
     });
   });
 
   it("fails closed when any package dependency hash drifts", () => {
     const staleEye = currentTuple();
-    staleEye.facialArtwork.dependencies.eyeAppearance.definitionSha256 = "f".repeat(64);
+    staleEye.facialArtwork.dependencies.eyeAppearance.definitionSha256 =
+      "f".repeat(64);
     expect(classifyFacialArtworkPackageCapability(staleEye)).toMatchObject({
       status: "malformed",
       error: expect.stringMatching(/does not match/),
     });
 
     const staleSocket = currentTuple();
-    staleSocket.eyeAppearance.dependencies.socketEyeSurface.definitionSha256 = "f".repeat(64);
+    staleSocket.eyeAppearance.dependencies.socketEyeSurface.definitionSha256 =
+      "f".repeat(64);
     expect(classifyFacialArtworkPackageCapability(staleSocket)).toMatchObject({
       status: "malformed",
       error: expect.stringMatching(/does not match/),

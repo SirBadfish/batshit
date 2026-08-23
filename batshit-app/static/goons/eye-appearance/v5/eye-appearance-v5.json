@@ -1,0 +1,169 @@
+{
+  "compositionOrder": [
+    "sclera",
+    "scleraArtwork",
+    "iris",
+    "pupil",
+    "highlight",
+    "cornea"
+  ],
+  "controls": [
+    {
+      "bilateralLaw": "linked-same-value",
+      "default": 1,
+      "description": "Scales Iris from the calibrated v38 physical baseline.",
+      "geometrySemantics": "Changes only the Iris layer radius on the static physical-eye sphere.",
+      "id": "iris_size",
+      "label": "Iris Size",
+      "linkedBilateral": true,
+      "maximum": 1.5,
+      "minimum": 0.5,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "step": 0.01,
+      "unit": "neutral-multiplier"
+    },
+    {
+      "bilateralLaw": "linked-same-value",
+      "default": 1,
+      "description": "Scales Pupil from the calibrated ratio to Iris.",
+      "geometrySemantics": "Changes only the Pupil layer radius relative to Iris.",
+      "id": "pupil_size",
+      "label": "Pupil Size",
+      "linkedBilateral": true,
+      "maximum": 1.5,
+      "minimum": 0.5,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "step": 0.01,
+      "unit": "iris-relative-multiplier"
+    },
+    {
+      "bilateralLaw": "mirrored-convergence-divergence",
+      "default": 0,
+      "description": "Moves Iris and Pupil horizontally around the calibrated v38 neutral placement.",
+      "geometrySemantics": "Moves Iris and Pupil together; view-responsive Highlight remains independent from Iris/Pupil gaze placement.",
+      "id": "iris_horizontal_position",
+      "label": "Iris Horizontal Position",
+      "linkedBilateral": true,
+      "maximum": 1,
+      "minimum": -1,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "step": 0.01,
+      "unit": "neutral-travel-fraction"
+    },
+    {
+      "bilateralLaw": "linked-same-value",
+      "default": 0,
+      "description": "Moves Iris and Pupil vertically around the calibrated v38 neutral placement.",
+      "geometrySemantics": "Moves Iris and Pupil together; view-responsive Highlight remains independent from Iris/Pupil gaze placement.",
+      "id": "iris_vertical_position",
+      "label": "Iris Vertical Position",
+      "linkedBilateral": true,
+      "maximum": 1,
+      "minimum": -1,
+      "perEyeOverridesAllowed": false,
+      "runtimeClampingAllowed": false,
+      "step": 0.01,
+      "unit": "neutral-travel-fraction"
+    }
+  ],
+  "definitionSha256": "f92c7b45c1d981c1acca0b1dbbdd165c1e7a28edc1bb38f831bea710c534194c",
+  "dependencies": {
+    "eyeApertureSeam": {
+      "definitionSha256": "201c043e71ab78967e8f259384699ee6a5e2c0679f22e7893dd0dc7715e26bbf",
+      "schemaVersion": "eye-aperture-seam/v2"
+    },
+    "socketEyeSurface": {
+      "definitionSha256": "003732374c733c3f0dd12ff8d9790d3b272f08e8e300cb6162fbd12e625fde21",
+      "schemaVersion": "socket-eye-surface/v2"
+    }
+  },
+  "ownership": "static physical-eye material presentation with Eye Appearance owning Iris/Pupil size and placement",
+  "productExportApproved": true,
+  "rangeEvidence": {
+    "canonicalSha256": "b00aa0aa84565d1c888c8a07da780efa7e05111b8cc9a1a07a95f2e90d4ffd3e",
+    "schemaVersion": "eye-appearance-range-evidence/v5",
+    "sha256": "b00aa0aa84565d1c888c8a07da780efa7e05111b8cc9a1a07a95f2e90d4ffd3e"
+  },
+  "runtimeBindings": {
+    "coordinateSpace": "physical-eye-sphere",
+    "geometryEvidence": {
+      "acceptedGlbSha256": "e93163af6ec86787f34b77dd31cda8aed9418aec0e9b27e8a221a2645c50bdcd",
+      "apertureSeamSha256": "201c043e71ab78967e8f259384699ee6a5e2c0679f22e7893dd0dc7715e26bbf",
+      "socketSurfaceSha256": "003732374c733c3f0dd12ff8d9790d3b272f08e8e300cb6162fbd12e625fde21"
+    },
+    "left": {
+      "artworkMappings": {
+        "highlight": "view-responsive-cornea-reflection-unmirrored/v1",
+        "iris": "constant-spherical-cap-radial-inset/v2",
+        "pupil": "constant-spherical-cap-radial-inset/v2",
+        "sclera": "full-sphere-equirectangular-gaze-linked/v1"
+      },
+      "cornea": {
+        "clearcoat": 1,
+        "clearcoatRoughness": 0.08,
+        "roughness": 0.12
+      },
+      "edgeSoftnessMeters": 0.0002,
+      "irisHorizontalTravelMeters": 0.002,
+      "irisNeutralRadiusMeters": 0.0081,
+      "irisVerticalTravelMeters": 0.003,
+      "neutralPlacement": {
+        "horizontalTravelFraction": -0.5,
+        "verticalTravelFraction": -0.7
+      },
+      "physicalEyeNode": "bs_f1_eye_l_physical",
+      "pupilNeutralRadiusRatio": 0.49
+    },
+    "right": {
+      "artworkMappings": {
+        "highlight": "view-responsive-cornea-reflection-unmirrored/v1",
+        "iris": "constant-spherical-cap-radial-inset/v2",
+        "pupil": "constant-spherical-cap-radial-inset/v2",
+        "sclera": "full-sphere-equirectangular-gaze-linked/v1"
+      },
+      "cornea": {
+        "clearcoat": 1,
+        "clearcoatRoughness": 0.08,
+        "roughness": 0.12
+      },
+      "edgeSoftnessMeters": 0.0002,
+      "irisHorizontalTravelMeters": 0.002,
+      "irisNeutralRadiusMeters": 0.0081,
+      "irisVerticalTravelMeters": 0.003,
+      "neutralPlacement": {
+        "horizontalTravelFraction": -0.5,
+        "verticalTravelFraction": -0.7
+      },
+      "physicalEyeNode": "bs_f1_eye_r_physical",
+      "pupilNeutralRadiusRatio": 0.49
+    }
+  },
+  "schemaVersion": "eye-appearance/v5",
+  "solidColorDefaults": {
+    "iris": [
+      0.2,
+      0.4,
+      0.6,
+      1
+    ],
+    "pupil": [
+      0.02,
+      0.02,
+      0.02,
+      1
+    ],
+    "sclera": [
+      0.9,
+      0.9,
+      0.9,
+      1
+    ]
+  },
+  "stateSchemaVersion": "eye-appearance-state/v5",
+  "status": "product-export-approved",
+  "symmetryLaw": "horizontal positive converges; other controls share one bilateral value",
+  "zeroLaw": "zero position is calibrated v38 neutral; size one is the calibrated physical baseline"
+}

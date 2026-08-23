@@ -1,69 +1,72 @@
-import {
-  socketEyeCapRetainedDynamicMorphs,
-  type SocketEyeSurfaceDefinitionV1,
-  type SocketEyeSide
+import type {
+  SocketEyeSide,
+  SocketEyeSurfaceDefinitionV2
 } from './socketEyeSurface'
 
-export const EYE_APERTURE_SEAM_SCHEMA_VERSION = 'eye-aperture-seam/v1' as const
-export const SOCKET_EYE_LINER_PERFORMANCE_MORPH_COUNT = 44
+export const EYE_APERTURE_SEAM_SCHEMA_VERSION = 'eye-aperture-seam/v2' as const
+export const SOCKET_EYE_TREATMENT_FOLLOWER_MORPH_COUNT = 84
+
+export type EyeTreatmentSurfaceCorrectionV1 = {
+  contract: 'head-projection-blink-surface-correction/v1'
+  projectionMorph: string
+  blinkLinearMorph: string
+  blinkResidualMorph: string
+  blinkMorph: string
+  projectionWeightLaw: 'appearance-follower-weight'
+  blinkLinearWeightLaw: 'blink-times-projection'
+  blinkResidualWeightLaw: 'four-blink-one-minus-blink-times-projection'
+}
 
 export type EyeApertureBoundaryDefinition = {
   sampleCount: number
   bindingSha256: string
 }
 
-export type EyeApertureSeamSideDefinition = {
+export type EyeApertureSeamSideDefinitionV2 = {
   side: SocketEyeSide
   sourceBodyNode: string
-  compositeCapNode: string
+  physicalEyeNode: string
   lashesEyeOutlineNode: string
   upperBoundary: EyeApertureBoundaryDefinition
   lowerBoundary: EyeApertureBoundaryDefinition
   innerCanthusVertexIndex: number
   outerCanthusVertexIndex: number
-  capUnderlapMeters: number
-  liner: {
-    innerOverlapMeters: number
-    surfaceClearanceMeters: number
-    baseForwardPitchDegrees: 0
-    faceConformal: true
-    visibleLidRimAllowed: false
-    ordinaryDepthTest: true
-    renderOrder: 'after-composite-cap'
+  treatment: {
+    geometryLaw: 'animated-upper-lower-thin-surface/v1'
+    upperMaterialName: string
+    lowerMaterialName: string
+    appearanceFollowerContract: 'appearance-followers/v2'
+    followerInventorySha256: string
+    followerMorphs: string[]
     retainedPerformanceMorphs: string[]
-    freeLashFlare: {
-      profile: 'geometry-derived-attachment-hinge/v1'
-      direction: 'model-forward'
-      attachmentBandNormalizedWidth: number
-      canthusTaperNormalizedWidth: number
-      upperMaximumForwardOffsetMeters: number
-      lowerMaximumForwardOffsetMeters: number
-    }
+    surfaceCorrection: EyeTreatmentSurfaceCorrectionV1
+    doubleSided: true
+    ordinaryDepthTest: true
+    depthWrite: false
+    renderOrder: 'after-physical-eye'
   }
 }
 
-export type EyeApertureSeamDefinitionV1 = {
+export type EyeApertureSeamDefinitionV2 = {
   schemaVersion: typeof EYE_APERTURE_SEAM_SCHEMA_VERSION
   definitionSha256: string
   status: 'product-export-approved'
   productExportApproved: true
   sharedCanthusRoots: true
   blinkClosure: {
-    composition: 'same-side-squint-floor/v1'
-    fullBlinkSquintFloor: 0.5
+    composition: 'authored-independent/v2'
+    fullBlinkSquintFloor: 0
   }
   runtimeBindings: {
-    left: EyeApertureSeamSideDefinition
-    right: EyeApertureSeamSideDefinition
+    left: EyeApertureSeamSideDefinitionV2
+    right: EyeApertureSeamSideDefinitionV2
   }
 }
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/
-const MAXIMUM_RASTER_SAFE_CLEARANCE_METERS = 0.00035
-const EPSILON = 1e-12
 
 function fail(message: string): never {
-  throw new Error(`[eye-aperture-seam/v1] ${message}`)
+  throw new Error(`[${EYE_APERTURE_SEAM_SCHEMA_VERSION}] ${message}`)
 }
 
 function record(value: unknown, context: string): Record<string, unknown> {
@@ -78,8 +81,8 @@ function rejectUnknownKeys(
   allowed: readonly string[],
   context: string
 ) {
-  const allowedKeys = new Set(allowed)
-  const extra = Object.keys(source).filter((key) => !allowedKeys.has(key))
+  const accepted = new Set(allowed)
+  const extra = Object.keys(source).filter((key) => !accepted.has(key))
   if (extra.length > 0) fail(`${context} contains unsupported fields: ${extra.join(', ')}`)
 }
 
@@ -96,13 +99,6 @@ function sha256(value: unknown, context: string): string {
   return parsed
 }
 
-function positive(value: unknown, context: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-    fail(`${context} must be a finite number greater than zero`)
-  }
-  return value
-}
-
 function nonNegativeInteger(value: unknown, context: string): number {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     fail(`${context} must be a non-negative integer`)
@@ -113,24 +109,6 @@ function nonNegativeInteger(value: unknown, context: string): number {
 function sampleCount(value: unknown, context: string): number {
   const parsed = nonNegativeInteger(value, context)
   if (parsed < 4) fail(`${context} must contain at least four ordered samples`)
-  return parsed
-}
-
-function unitInterval(value: unknown, context: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value >= 1) {
-    fail(`${context} must be inside (0, 1)`)
-  }
-  return value
-}
-
-function retainedPerformanceMorphs(value: unknown, context: string): string[] {
-  if (!Array.isArray(value) || value.length !== SOCKET_EYE_LINER_PERFORMANCE_MORPH_COUNT) {
-    fail(`${context} must contain exactly ${SOCKET_EYE_LINER_PERFORMANCE_MORPH_COUNT} morphs`)
-  }
-  const parsed = value.map((entry, index) => stringValue(entry, `${context}[${index}]`))
-  if (new Set(parsed).size !== parsed.length) fail(`${context} must not contain duplicates`)
-  const sorted = [...parsed].sort()
-  if (parsed.some((entry, index) => entry !== sorted[index])) fail(`${context} must be sorted`)
   return parsed
 }
 
@@ -148,65 +126,181 @@ function parseBoundary(value: unknown, context: string): EyeApertureBoundaryDefi
   }
 }
 
+function requiredTreatmentEyeMorphs(side: SocketEyeSide): string[] {
+  const suffix = side === 'left' ? 'Left' : 'Right'
+  return [
+    `eyeBlink${suffix}`,
+    `eyeLookDown${suffix}`,
+    `eyeLookIn${suffix}`,
+    `eyeLookOut${suffix}`,
+    `eyeLookUp${suffix}`,
+    `eyeSquint${suffix}`,
+    `eyeWide${suffix}`
+  ]
+}
+
+function sortedUniqueMorphs(value: unknown, context: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) fail(`${context} must be a non-empty array`)
+  const parsed = value.map((entry, index) => stringValue(entry, `${context}[${index}]`))
+  if (new Set(parsed).size !== parsed.length) fail(`${context} must not contain duplicates`)
+  const sorted = [...parsed].sort()
+  if (parsed.some((entry, index) => entry !== sorted[index])) fail(`${context} must be sorted`)
+  return parsed
+}
+
+function followerMorphs(value: unknown, context: string): string[] {
+  const parsed = sortedUniqueMorphs(value, context)
+  if (parsed.length !== SOCKET_EYE_TREATMENT_FOLLOWER_MORPH_COUNT) {
+    fail(`${context} must contain exactly ${SOCKET_EYE_TREATMENT_FOLLOWER_MORPH_COUNT} morphs`)
+  }
+  return parsed
+}
+
+function retainedPerformanceMorphs(value: unknown, side: SocketEyeSide, context: string): string[] {
+  const parsed = sortedUniqueMorphs(value, context)
+  for (const required of requiredTreatmentEyeMorphs(side)) {
+    if (!parsed.includes(required)) fail(`${context} must include ${required}`)
+  }
+  return parsed
+}
+
+function parseSurfaceCorrection(
+  value: unknown,
+  side: SocketEyeSide,
+  followerNames: readonly string[],
+  retainedNames: readonly string[],
+  context: string
+): EyeTreatmentSurfaceCorrectionV1 {
+  const source = record(value, context)
+  rejectUnknownKeys(
+    source,
+    [
+      'contract',
+      'projectionMorph',
+      'blinkLinearMorph',
+      'blinkResidualMorph',
+      'blinkMorph',
+      'projectionWeightLaw',
+      'blinkLinearWeightLaw',
+      'blinkResidualWeightLaw'
+    ],
+    context
+  )
+  const parsed: EyeTreatmentSurfaceCorrectionV1 = {
+    contract: literal(
+      source.contract,
+      'head-projection-blink-surface-correction/v1',
+      `${context}.contract`
+    ),
+    projectionMorph: stringValue(source.projectionMorph, `${context}.projectionMorph`),
+    blinkLinearMorph: stringValue(source.blinkLinearMorph, `${context}.blinkLinearMorph`),
+    blinkResidualMorph: stringValue(source.blinkResidualMorph, `${context}.blinkResidualMorph`),
+    blinkMorph: literal(
+      source.blinkMorph,
+      `eyeBlink${side === 'left' ? 'Left' : 'Right'}`,
+      `${context}.blinkMorph`
+    ),
+    projectionWeightLaw: literal(
+      source.projectionWeightLaw,
+      'appearance-follower-weight',
+      `${context}.projectionWeightLaw`
+    ),
+    blinkLinearWeightLaw: literal(
+      source.blinkLinearWeightLaw,
+      'blink-times-projection',
+      `${context}.blinkLinearWeightLaw`
+    ),
+    blinkResidualWeightLaw: literal(
+      source.blinkResidualWeightLaw,
+      'four-blink-one-minus-blink-times-projection',
+      `${context}.blinkResidualWeightLaw`
+    )
+  }
+  const correctionMorphs = [
+    parsed.projectionMorph,
+    parsed.blinkLinearMorph,
+    parsed.blinkResidualMorph
+  ]
+  if (new Set(correctionMorphs).size !== correctionMorphs.length) {
+    fail(`${context} correction morph identities must differ`)
+  }
+  if (correctionMorphs.some((name) => followerNames.includes(name))) {
+    fail(`${context} correction morphs must be separate from the 84 geometry followers`)
+  }
+  if (!retainedNames.includes(parsed.blinkMorph)) {
+    fail(`${context}.blinkMorph must be retained for Live performance`)
+  }
+  return parsed
+}
+
 function parseSide(
   value: unknown,
   expectedSide: SocketEyeSide,
   context: string
-): EyeApertureSeamSideDefinition {
+): EyeApertureSeamSideDefinitionV2 {
   const source = record(value, context)
   rejectUnknownKeys(
     source,
     [
       'side',
       'sourceBodyNode',
-      'compositeCapNode',
+      'physicalEyeNode',
       'lashesEyeOutlineNode',
       'upperBoundary',
       'lowerBoundary',
       'innerCanthusVertexIndex',
       'outerCanthusVertexIndex',
-      'capUnderlapMeters',
-      'liner'
+      'treatment'
     ],
     context
   )
   if (source.side !== expectedSide) fail(`${context}.side must be ${expectedSide}`)
-  const liner = record(source.liner, `${context}.liner`)
+  const treatment = record(source.treatment, `${context}.treatment`)
   rejectUnknownKeys(
-    liner,
+    treatment,
     [
-      'innerOverlapMeters',
-      'surfaceClearanceMeters',
-      'baseForwardPitchDegrees',
-      'faceConformal',
-      'visibleLidRimAllowed',
-      'ordinaryDepthTest',
-      'renderOrder',
+      'geometryLaw',
+      'upperMaterialName',
+      'lowerMaterialName',
+      'appearanceFollowerContract',
+      'followerInventorySha256',
+      'followerMorphs',
       'retainedPerformanceMorphs',
-      'freeLashFlare'
+      'surfaceCorrection',
+      'doubleSided',
+      'ordinaryDepthTest',
+      'depthWrite',
+      'renderOrder'
     ],
-    `${context}.liner`
+    `${context}.treatment`
   )
-  const freeLashFlare = record(
-    liner.freeLashFlare,
-    `${context}.liner.freeLashFlare`
+  const upperMaterialName = stringValue(
+    treatment.upperMaterialName,
+    `${context}.treatment.upperMaterialName`
   )
-  rejectUnknownKeys(
-    freeLashFlare,
-    [
-      'profile',
-      'direction',
-      'attachmentBandNormalizedWidth',
-      'canthusTaperNormalizedWidth',
-      'upperMaximumForwardOffsetMeters',
-      'lowerMaximumForwardOffsetMeters'
-    ],
-    `${context}.liner.freeLashFlare`
+  const lowerMaterialName = stringValue(
+    treatment.lowerMaterialName,
+    `${context}.treatment.lowerMaterialName`
   )
-  const parsed: EyeApertureSeamSideDefinition = {
+  if (upperMaterialName === lowerMaterialName) {
+    fail(`${context}.treatment upper and lower material identities must differ`)
+  }
+  const parsedFollowerMorphs = followerMorphs(
+    treatment.followerMorphs,
+    `${context}.treatment.followerMorphs`
+  )
+  const parsedRetainedPerformanceMorphs = retainedPerformanceMorphs(
+    treatment.retainedPerformanceMorphs,
+    expectedSide,
+    `${context}.treatment.retainedPerformanceMorphs`
+  )
+  if (parsedRetainedPerformanceMorphs.some((name) => !parsedFollowerMorphs.includes(name))) {
+    fail(`${context}.treatment retained performance morphs must be a subset of followerMorphs`)
+  }
+  const parsed: EyeApertureSeamSideDefinitionV2 = {
     side: expectedSide,
     sourceBodyNode: stringValue(source.sourceBodyNode, `${context}.sourceBodyNode`),
-    compositeCapNode: stringValue(source.compositeCapNode, `${context}.compositeCapNode`),
+    physicalEyeNode: stringValue(source.physicalEyeNode, `${context}.physicalEyeNode`),
     lashesEyeOutlineNode: stringValue(
       source.lashesEyeOutlineNode,
       `${context}.lashesEyeOutlineNode`
@@ -221,91 +315,53 @@ function parseSide(
       source.outerCanthusVertexIndex,
       `${context}.outerCanthusVertexIndex`
     ),
-    capUnderlapMeters: positive(source.capUnderlapMeters, `${context}.capUnderlapMeters`),
-    liner: {
-      innerOverlapMeters: positive(
-        liner.innerOverlapMeters,
-        `${context}.liner.innerOverlapMeters`
+    treatment: {
+      geometryLaw: literal(
+        treatment.geometryLaw,
+        'animated-upper-lower-thin-surface/v1',
+        `${context}.treatment.geometryLaw`
       ),
-      surfaceClearanceMeters: positive(
-        liner.surfaceClearanceMeters,
-        `${context}.liner.surfaceClearanceMeters`
+      upperMaterialName,
+      lowerMaterialName,
+      appearanceFollowerContract: literal(
+        treatment.appearanceFollowerContract,
+        'appearance-followers/v2',
+        `${context}.treatment.appearanceFollowerContract`
       ),
-      baseForwardPitchDegrees: literal(
-        liner.baseForwardPitchDegrees,
-        0,
-        `${context}.liner.baseForwardPitchDegrees`
+      followerInventorySha256: sha256(
+        treatment.followerInventorySha256,
+        `${context}.treatment.followerInventorySha256`
       ),
-      faceConformal: literal(liner.faceConformal, true, `${context}.liner.faceConformal`),
-      visibleLidRimAllowed: literal(
-        liner.visibleLidRimAllowed,
-        false,
-        `${context}.liner.visibleLidRimAllowed`
+      followerMorphs: parsedFollowerMorphs,
+      retainedPerformanceMorphs: parsedRetainedPerformanceMorphs,
+      surfaceCorrection: parseSurfaceCorrection(
+        treatment.surfaceCorrection,
+        expectedSide,
+        parsedFollowerMorphs,
+        parsedRetainedPerformanceMorphs,
+        `${context}.treatment.surfaceCorrection`
       ),
+      doubleSided: literal(treatment.doubleSided, true, `${context}.treatment.doubleSided`),
       ordinaryDepthTest: literal(
-        liner.ordinaryDepthTest,
+        treatment.ordinaryDepthTest,
         true,
-        `${context}.liner.ordinaryDepthTest`
+        `${context}.treatment.ordinaryDepthTest`
       ),
+      depthWrite: literal(treatment.depthWrite, false, `${context}.treatment.depthWrite`),
       renderOrder: literal(
-        liner.renderOrder,
-        'after-composite-cap',
-        `${context}.liner.renderOrder`
-      ),
-      retainedPerformanceMorphs: retainedPerformanceMorphs(
-        liner.retainedPerformanceMorphs,
-        `${context}.liner.retainedPerformanceMorphs`
-      ),
-      freeLashFlare: {
-        profile: literal(
-          freeLashFlare.profile,
-          'geometry-derived-attachment-hinge/v1',
-          `${context}.liner.freeLashFlare.profile`
-        ),
-        direction: literal(
-          freeLashFlare.direction,
-          'model-forward',
-          `${context}.liner.freeLashFlare.direction`
-        ),
-        attachmentBandNormalizedWidth: unitInterval(
-          freeLashFlare.attachmentBandNormalizedWidth,
-          `${context}.liner.freeLashFlare.attachmentBandNormalizedWidth`
-        ),
-        canthusTaperNormalizedWidth: unitInterval(
-          freeLashFlare.canthusTaperNormalizedWidth,
-          `${context}.liner.freeLashFlare.canthusTaperNormalizedWidth`
-        ),
-        upperMaximumForwardOffsetMeters: positive(
-          freeLashFlare.upperMaximumForwardOffsetMeters,
-          `${context}.liner.freeLashFlare.upperMaximumForwardOffsetMeters`
-        ),
-        lowerMaximumForwardOffsetMeters: positive(
-          freeLashFlare.lowerMaximumForwardOffsetMeters,
-          `${context}.liner.freeLashFlare.lowerMaximumForwardOffsetMeters`
-        )
-      }
+        treatment.renderOrder,
+        'after-physical-eye',
+        `${context}.treatment.renderOrder`
+      )
     }
   }
   if (parsed.innerCanthusVertexIndex === parsed.outerCanthusVertexIndex) {
     fail(`${context} inner and outer canthus vertices must differ`)
   }
-  if (parsed.liner.surfaceClearanceMeters > MAXIMUM_RASTER_SAFE_CLEARANCE_METERS) {
-    fail(
-      `${context}.liner.surfaceClearanceMeters exceeds the raster-safe micro-clearance limit`
-    )
-  }
-  if (parsed.liner.innerOverlapMeters <= parsed.liner.surfaceClearanceMeters) {
-    fail(`${context}.liner.innerOverlapMeters must exceed the presentation clearance`)
-  }
-  for (const required of socketEyeCapRetainedDynamicMorphs(expectedSide)) {
-    if (!parsed.liner.retainedPerformanceMorphs.includes(required)) {
-      fail(`${context}.liner.retainedPerformanceMorphs must include ${required}`)
-    }
-  }
   return parsed
 }
 
-export function parseEyeApertureSeamDefinition(value: unknown): EyeApertureSeamDefinitionV1 {
+export function parseEyeApertureSeamDefinition(value: unknown): EyeApertureSeamDefinitionV2 {
   const source = record(value, 'definition')
   rejectUnknownKeys(
     source,
@@ -323,24 +379,20 @@ export function parseEyeApertureSeamDefinition(value: unknown): EyeApertureSeamD
   if (source.schemaVersion !== EYE_APERTURE_SEAM_SCHEMA_VERSION) {
     fail(`definition.schemaVersion must be ${EYE_APERTURE_SEAM_SCHEMA_VERSION}`)
   }
-  const runtimeBindings = record(source.runtimeBindings, 'definition.runtimeBindings')
   const blinkClosure = record(source.blinkClosure, 'definition.blinkClosure')
-  rejectUnknownKeys(
-    blinkClosure,
-    ['composition', 'fullBlinkSquintFloor'],
-    'definition.blinkClosure'
-  )
+  rejectUnknownKeys(blinkClosure, ['composition', 'fullBlinkSquintFloor'], 'definition.blinkClosure')
+  const runtimeBindings = record(source.runtimeBindings, 'definition.runtimeBindings')
   rejectUnknownKeys(runtimeBindings, ['left', 'right'], 'definition.runtimeBindings')
   const left = parseSide(runtimeBindings.left, 'left', 'definition.runtimeBindings.left')
   const right = parseSide(runtimeBindings.right, 'right', 'definition.runtimeBindings.right')
   const uniqueNodes = [
-    left.compositeCapNode,
+    left.physicalEyeNode,
     left.lashesEyeOutlineNode,
-    right.compositeCapNode,
+    right.physicalEyeNode,
     right.lashesEyeOutlineNode
   ]
   if (new Set(uniqueNodes).size !== uniqueNodes.length) {
-    fail('definition composite-cap and eye-outline nodes must be unique')
+    fail('definition physical-eye and lashes/outline treatment nodes must be unique')
   }
   const canthusVertices = [
     left.innerCanthusVertexIndex,
@@ -360,20 +412,16 @@ export function parseEyeApertureSeamDefinition(value: unknown): EyeApertureSeamD
       true,
       'definition.productExportApproved'
     ),
-    sharedCanthusRoots: literal(
-      source.sharedCanthusRoots,
-      true,
-      'definition.sharedCanthusRoots'
-    ),
+    sharedCanthusRoots: literal(source.sharedCanthusRoots, true, 'definition.sharedCanthusRoots'),
     blinkClosure: {
       composition: literal(
         blinkClosure.composition,
-        'same-side-squint-floor/v1',
+        'authored-independent/v2',
         'definition.blinkClosure.composition'
       ),
       fullBlinkSquintFloor: literal(
         blinkClosure.fullBlinkSquintFloor,
-        0.5,
+        0,
         'definition.blinkClosure.fullBlinkSquintFloor'
       )
     },
@@ -382,23 +430,17 @@ export function parseEyeApertureSeamDefinition(value: unknown): EyeApertureSeamD
 }
 
 export function validateSocketEyeApertureOwnership(
-  socketEye: SocketEyeSurfaceDefinitionV1,
-  apertureSeam: EyeApertureSeamDefinitionV1
+  socketEye: SocketEyeSurfaceDefinitionV2,
+  apertureSeam: EyeApertureSeamDefinitionV2
 ) {
   for (const sideName of ['left', 'right'] as const) {
     const surfaceSide = socketEye.runtimeBindings[sideName]
     const seamSide = apertureSeam.runtimeBindings[sideName]
     if (surfaceSide.apertureSeamDefinitionSha256 !== apertureSeam.definitionSha256) {
-      fail(`${sideName} socket eye references a different aperture-seam definition`)
+      fail(`${sideName} physical eye references a different aperture-seam definition`)
     }
-    if (surfaceSide.nodes.compositeCap !== seamSide.compositeCapNode) {
-      fail(`${sideName} aperture seam references a different composite-cap node`)
-    }
-    if (
-      Math.abs(surfaceSide.cap.minimumHiddenUnderlapMeters - seamSide.capUnderlapMeters) >
-      EPSILON
-    ) {
-      fail(`${sideName} cap underlap drifted between the socket and aperture seam`)
+    if (surfaceSide.nodes.physicalEye !== seamSide.physicalEyeNode) {
+      fail(`${sideName} aperture seam references a different physical-eye node`)
     }
   }
 }

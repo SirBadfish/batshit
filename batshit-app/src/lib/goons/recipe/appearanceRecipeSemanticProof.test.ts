@@ -99,6 +99,7 @@ type FixtureOptions = {
   clearcoatFactor?: number;
   samplerWrapS?: number;
   duplicatePrimitive?: boolean;
+  duplicatePrimitiveWithDistinctMaterialRole?: boolean;
   unnamedBody?: boolean;
   invalidJointIndex?: boolean;
   invalidMaterialIndex?: boolean;
@@ -241,6 +242,8 @@ function fixture(options: FixtureOptions = {}): Uint8Array {
           extras: { targetNames: ["wrinkle_normal"] },
           primitives: options.duplicatePrimitive
             ? [activePrimitive, structuredClone(activePrimitive)]
+            : options.duplicatePrimitiveWithDistinctMaterialRole
+              ? [activePrimitive, { ...structuredClone(activePrimitive), material: 2 }]
             : [activePrimitive],
         },
         { primitives: [inactivePrimitive] },
@@ -252,7 +255,11 @@ function fixture(options: FixtureOptions = {}): Uint8Array {
           inverseBindMatrices: inverseBind,
         },
       ],
-      materials: [material, inactiveMaterial],
+      materials: [
+        material,
+        inactiveMaterial,
+        { ...structuredClone(material), name: "Second Visible Material" },
+      ],
       textures: options.reorderTextureAndImageArrays
         ? [
             { sampler: 1, source: 0 },
@@ -432,6 +439,11 @@ describe("Appearance Recipe semantic proof", () => {
   });
 
   it("rejects ambiguous semantic correspondence and unnamed active hierarchy nodes", async () => {
+    await expect(
+      buildAppearanceRecipeSemanticProof(
+        fixture({ duplicatePrimitiveWithDistinctMaterialRole: true }),
+      ),
+    ).resolves.toBeDefined();
     await expect(
       buildAppearanceRecipeSemanticProof(fixture({ duplicatePrimitive: true })),
     ).rejects.toThrow(/ambiguous primitive signatures/);

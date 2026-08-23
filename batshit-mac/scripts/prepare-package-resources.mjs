@@ -1,13 +1,17 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { cp, lstat, mkdir, readFile, readlink, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   inspectManagedRuntimePortability,
   MAC_RUNTIME_MINIMUM_VERSION
 } from './managed-runtime-portability.mjs';
+import {
+  HAIR_CATALOG_PACKAGE_CONTRACT,
+  validateHairCatalogPackageDefinition
+} from './hair-catalog-package-contract.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
@@ -19,19 +23,20 @@ const runtimePath = join(resourcesPath, 'runtime');
 const appSource = join(repoRoot, 'batshit-app');
 const serverSource = join(repoRoot, 'batshit-server', 'server');
 const liveKitSidecarSource = join(repoRoot, 'tools', 'livekit-agent-sidecar');
-const facialArtworkSource = join(appSource, 'static', 'goons', 'facial-artwork', 'v4');
+const facialArtworkSource = join(appSource, 'static', 'goons', 'facial-artwork', 'v6');
 const lipArtworkSource = join(appSource, 'static', 'goons', 'lip-artwork', 'v2');
 const nailSurfaceSource = join(appSource, 'static', 'goons', 'nail-surface', 'v1');
 const skinAppearanceSource = join(appSource, 'static', 'goons', 'skin-appearance', 'v1');
-const hairCatalogSource = join(appSource, 'static', 'goon-assets', 'hair', 'v1');
+const hairCatalogSource = join(repoRoot, ...HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot.split('/'));
 const appDest = join(runtimePath, 'batshit-app');
 const serverDest = join(runtimePath, 'batshit-server', 'server');
 const liveKitSidecarDest = join(runtimePath, 'tools', 'livekit-agent-sidecar');
-const facialArtworkDest = join(runtimePath, 'assets', 'goons', 'facial-artwork', 'v4');
+const facialArtworkDest = join(runtimePath, 'assets', 'goons', 'facial-artwork', 'v6');
+const FACIAL_ARTWORK_RUNTIME_FILE_COUNT = 161;
 const lipArtworkDest = join(runtimePath, 'assets', 'goons', 'lip-artwork', 'v2');
 const nailSurfaceDest = join(runtimePath, 'assets', 'goons', 'nail-surface', 'v1');
 const skinAppearanceDest = join(runtimePath, 'assets', 'goons', 'skin-appearance', 'v1');
-const hairCatalogDest = join(appDest, 'static', 'goon-assets', 'hair', 'v1');
+const hairCatalogDest = join(runtimePath, ...HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot.split('/'));
 const nodeRuntimeDest = join(runtimePath, 'vendor', 'node');
 const redisStackRuntimeDest = join(runtimePath, 'vendor', 'redis-stack');
 const ffmpegRuntimeDest = join(runtimePath, 'vendor', 'ffmpeg');
@@ -90,11 +95,12 @@ function setInfoPlistStringKey(plistPath, key, value) {
   runChecked('plutil', ['-insert', key, '-string', value, plistPath]);
 }
 
-async function copyRequired(source, dest) {
+async function copyRequired(source, dest, { dereference = true } = {}) {
   if (!(await exists(source))) throw new Error(`Missing package input: ${source}`);
   await cp(source, dest, {
     recursive: true,
-    dereference: true,
+    dereference,
+    verbatimSymlinks: !dereference,
     filter: (path) => {
       const relative = path.slice(source.length);
       if (shouldSkipCopiedPath(relative)) {
@@ -147,15 +153,18 @@ async function inventoryFiles(root, relativeRoot = '') {
 async function copyFacialArtworkAssets() {
   await copyRequired(facialArtworkSource, facialArtworkDest);
   const files = await inventoryFiles(facialArtworkSource);
-  if (files.length < 22 || !files.some((entry) => entry.path === 'facial-artwork-v4.json')) {
+  if (
+    files.length !== FACIAL_ARTWORK_RUNTIME_FILE_COUNT ||
+    !files.some((entry) => entry.path === 'facial-artwork-v6.json')
+  ) {
     throw new Error(
-      `Facial artwork package input is incomplete: expected the v4 definition plus at least 21 assets, found ${files.length}`
+      `Facial artwork package input is incomplete: expected the v6 definition plus retained r1/r2/r3/r4 and current r5 assets (${FACIAL_ARTWORK_RUNTIME_FILE_COUNT} files), found ${files.length}`
     );
   }
   return {
-    contract: 'facial-artwork/v4',
-    root: 'assets/goons/facial-artwork/v4',
-    definition: 'facial-artwork-v4.json',
+    contract: 'facial-artwork/v6',
+    root: 'assets/goons/facial-artwork/v6',
+    definition: 'facial-artwork-v6.json',
     files
   };
 }
@@ -211,22 +220,20 @@ async function copySkinAppearanceAssets() {
 async function copyHairCatalogAssets() {
   await copyRequired(hairCatalogSource, hairCatalogDest);
   const files = await inventoryFiles(hairCatalogSource);
-  const catalog = files.find((entry) => entry.path === 'catalog.json');
+  const catalog = files.find(
+    (entry) => entry.path === HAIR_CATALOG_PACKAGE_CONTRACT.definition
+  );
   if (!catalog) {
-    throw new Error('Hair Asset package input is incomplete: expected the hair-catalog/v1 catalog.');
+    throw new Error('Hair Asset package input is incomplete: expected the hair-catalog/v2 catalog.');
   }
-  const parsed = JSON.parse(await readFile(join(hairCatalogSource, 'catalog.json'), 'utf8'));
-  if (
-    parsed?.schemaVersion !== 'hair-catalog/v1' ||
-    !Array.isArray(parsed?.assets) ||
-    Object.keys(parsed).sort().join(',') !== 'assets,schemaVersion'
-  ) {
-    throw new Error('Hair Asset package input contains an invalid hair-catalog/v1 catalog.');
-  }
+  const parsed = JSON.parse(
+    await readFile(join(hairCatalogSource, HAIR_CATALOG_PACKAGE_CONTRACT.definition), 'utf8')
+  );
+  validateHairCatalogPackageDefinition(parsed);
   return {
-    contract: 'hair-catalog/v1',
-    root: 'batshit-app/static/goon-assets/hair/v1',
-    definition: 'catalog.json',
+    contract: HAIR_CATALOG_PACKAGE_CONTRACT.contract,
+    root: HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot,
+    definition: HAIR_CATALOG_PACKAGE_CONTRACT.definition,
     files
   };
 }
@@ -305,7 +312,35 @@ async function copyManagedNodeRuntime() {
   }
   const proof = await runtimeProofFiles(resolvedSource, 'BATSHIT_MAC_NODE_DIST_DIR');
 
-  await copyRequired(resolvedSource, nodeRuntimeDest);
+  await copyRequired(resolvedSource, nodeRuntimeDest, { dereference: false });
+  for (const command of ['npm', 'npx']) {
+    const commandPath = join(nodeRuntimeDest, 'bin', command);
+    const commandInfo = await lstat(commandPath).catch(() => null);
+    if (!commandInfo?.isSymbolicLink()) {
+      throw new Error(`Packaged Node runtime must preserve the official bin/${command} symlink.`);
+    }
+    const target = await readlink(commandPath);
+    const relativeTarget = relative(nodeRuntimeDest, resolve(dirname(commandPath), target));
+    if (
+      isAbsolute(target) ||
+      relativeTarget === '' ||
+      relativeTarget.startsWith('..') ||
+      isAbsolute(relativeTarget)
+    ) {
+      throw new Error(
+        `Packaged Node runtime bin/${command} must remain a relative link inside the app-owned Node runtime.`
+      );
+    }
+  }
+  const npmProbe = runCaptured(
+    join(nodeRuntimeDest, 'bin', 'node'),
+    [join(nodeRuntimeDest, 'bin', 'npm'), '--version']
+  );
+  if (!npmProbe.ok) {
+    throw new Error(
+      `Packaged Node runtime npm launcher failed: ${npmProbe.stderr.trim() || npmProbe.error?.message || 'unknown error'}`
+    );
+  }
   return {
     node: {
       distribution: 'Node.js official macOS arm64 runtime archive',
@@ -486,6 +521,10 @@ async function main() {
   await cp(
     join(macRoot, 'scripts', 'managed-runtime-portability.mjs'),
     join(resourcesPath, 'scripts', 'managed-runtime-portability.mjs')
+  );
+  await cp(
+    join(macRoot, 'scripts', 'hair-catalog-package-contract.mjs'),
+    join(resourcesPath, 'scripts', 'hair-catalog-package-contract.mjs')
   );
   await copyRequiredFile(thirdPartyNoticesSource, join(resourcesPath, 'THIRD_PARTY_NOTICES.md'));
 

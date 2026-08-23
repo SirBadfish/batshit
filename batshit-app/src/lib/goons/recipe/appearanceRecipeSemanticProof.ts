@@ -336,21 +336,72 @@ async function activePrimitives(
     );
     if (primitives.length === 0)
       fail(`active mesh node ${nodeIndex} has no primitives`);
-    const signatureHashes = new Set<string>();
-    for (const [primitiveIndex, primitiveValue] of primitives.entries()) {
+    const descriptors = await Promise.all(
+      primitives.map(async (primitiveValue, primitiveIndex) => {
       const primitive = record(
         primitiveValue,
         `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`,
       );
-      const signatureSha256 = await canonicalRecipeSha256(
+        return {
+          primitive,
+          primitiveIndex,
+          signatureSha256: await canonicalRecipeSha256(
         primitiveSignature(parsed, mesh, primitive, primitiveIndex),
+          ),
+        };
+      }),
+    );
+    const bySignature = new Map<string, typeof descriptors>();
+    for (const descriptor of descriptors) {
+      bySignature.set(descriptor.signatureSha256, [
+        ...(bySignature.get(descriptor.signatureSha256) ?? []),
+        descriptor,
+      ]);
+    }
+    for (const group of bySignature.values()) {
+      if (group.length === 1) continue;
+      const materialIdentities = await Promise.all(
+        group.map(async ({ primitive, primitiveIndex }) => {
+          if (primitive.material === undefined) {
+            return { materialSha256: null, roleName: null };
+          }
+          const materialIndex = integer(
+            primitive.material,
+            `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}].material`,
+          );
+          const materials = optionalArray(parsed.gltf.materials, "gltf.materials");
+          const material = record(
+            index(materials, materialIndex, `gltf.materials[${materialIndex}]`),
+            `gltf.materials[${materialIndex}]`,
+          );
+          return {
+            materialSha256: (await materialProofEntry(parsed, materialIndex))
+              .materialSha256,
+            roleName:
+              material.name === undefined
+                ? null
+                : string(material.name, `gltf.materials[${materialIndex}].name`),
+          };
+        }),
       );
-      if (signatureHashes.has(signatureSha256)) {
+      const materialIdentityHashes = await Promise.all(
+        materialIdentities.map((identity) => canonicalRecipeSha256(identity)),
+      );
+      if (
+        new Set(materialIdentityHashes).size !== materialIdentityHashes.length
+      ) {
         fail(
           `active mesh node ${nodeIndex} has ambiguous primitive signatures`,
         );
       }
-      signatureHashes.add(signatureSha256);
+      for (const [index, descriptor] of group.entries()) {
+        descriptor.signatureSha256 = await canonicalRecipeSha256({
+          geometrySha256: descriptor.signatureSha256,
+          material: materialIdentities[index],
+        });
+      }
+    }
+    for (const { primitiveIndex, primitive, signatureSha256 } of descriptors) {
       result.push({
         nodeIndex,
         primitiveIndex,

@@ -1,7 +1,18 @@
 version: 2
-# Launch posture: security alerts/updates are managed through repository
-# security settings; routine version-update PRs are intentionally disabled
-# to avoid noisy public prelaunch dependency churn.
+# This file is A material: authored here and exported verbatim to the public
+# repo (SirBadfish/batshit), which is the only repo where it actually runs.
+# The private dev repo has the whole Dependabot feature set switched off
+# (dependency graph, alerts, security updates), so this config is inert there.
+#
+# Routine version-update PRs stay disabled via open-pull-requests-limit: 0.
+# Security updates are NOT subject to that limit and are managed through the
+# public repo's security settings, so they still open PRs. The security-updates
+# group below bundles those into one PR per ecosystem+directory instead of one
+# PR per vulnerable package, which is what kept the maintainer inbox noisy.
+#
+# Team-only package roots cannot be listed here because they are not part of
+# the public repository. The private development workflow audits them
+# separately.
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -14,6 +25,11 @@ updates:
       - "dependencies"
       - "github-actions"
     open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/batshit-app"
@@ -27,6 +43,11 @@ updates:
       - "npm"
       - "batshit-app"
     open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/batshit-server/server"
@@ -40,6 +61,11 @@ updates:
       - "npm"
       - "batshit-server"
     open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/batshit-mac"
@@ -53,6 +79,11 @@ updates:
       - "npm"
       - "mac-app"
     open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/batshit-mac/frontend"
@@ -66,6 +97,11 @@ updates:
       - "npm"
       - "mac-app"
     open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directory: "/tools/livekit-agent-sidecar"
@@ -79,3 +115,8 @@ updates:
       - "npm"
       - "voice-runtime"
     open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"

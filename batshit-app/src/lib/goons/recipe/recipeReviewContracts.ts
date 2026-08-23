@@ -7,11 +7,14 @@ import { RECIPE_MIGRATION_PLAN_CONTRACT, type RecipeMigrationPlan } from './migr
 import {
   GOON_RECIPE_STATE_CONTRACT,
   parseRecipeStateSnapshot,
+  parseRecipeSiblingStateRecord,
   verifyRecipeStateSnapshot,
   type RecipeDocumentRef,
+  type RecipeSiblingStateRecord,
   type RecipeStateSnapshot
 } from './recipeContracts'
 import type {
+  AppearanceRecipeMigrationExternalSiblingInput,
   AppearanceRecipeMigrationSiblingInput
 } from './appearanceRecipeMigrationPlanner'
 import type { RecipeArchiveContainmentReceipt } from './archiveContainmentContracts'
@@ -27,15 +30,10 @@ import { RECIPE_MIGRATION_REPORT_CONTRACT } from './contractIds'
 import { canonicalRecipeString, requireLowercaseSha256 } from './recipeCanonical'
 import { type RecipeMigrationReport, type RecipeSiblingSurface } from './updateContracts'
 
-export const RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT =
-  'recipe-update-analysis-context/v1' as const
+export const RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT = 'recipe-update-analysis-context/v3' as const
 export const RECIPE_REVIEWED_STATE_CONTRACT = 'recipe-reviewed-state/v1' as const
 
-export const RECIPE_REVIEW_OPERATIONS = [
-  'first-bake',
-  'rebake',
-  'package-update'
-] as const
+export const RECIPE_REVIEW_OPERATIONS = ['first-bake', 'rebake', 'package-update'] as const
 
 export type RecipeReviewOperation = (typeof RECIPE_REVIEW_OPERATIONS)[number]
 
@@ -49,6 +47,14 @@ export type RecipeSerializableSiblingInput = {
   message: string | null
 }
 
+export type RecipeSerializableExternalSiblingInput = {
+  sourceStateId: string
+  targetStateId: string
+  validationSha256: string
+  message: string
+  targetState: RecipeSiblingStateRecord
+}
+
 export type RecipeUpdateAnalysisContext = {
   contract: typeof RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT
   analysisId: string
@@ -56,6 +62,7 @@ export type RecipeUpdateAnalysisContext = {
   containmentReceipt: RecipeDocumentRef
   basePlan: RecipeDocumentRef
   siblingInputs: Record<RecipeSiblingSurface, RecipeSerializableSiblingInput>
+  externalSiblingInputs: RecipeSerializableExternalSiblingInput[]
   componentMapBundle: RecipeComponentMapBundle | null
 }
 
@@ -150,8 +157,7 @@ export type RecipeJobStartResponse = {
 type UnknownRecord = Record<string, unknown>
 
 const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
-const VERSIONED_CONTRACT_PATTERN =
-  /^[a-z0-9][a-z0-9-]*(?:\/[a-z0-9][a-z0-9-]*)*\/v[1-9][0-9]*$/
+const VERSIONED_CONTRACT_PATTERN = /^[a-z0-9][a-z0-9-]*(?:\/[a-z0-9][a-z0-9-]*)*\/v[1-9][0-9]*$/
 const SIBLING_SURFACES: RecipeSiblingSurface[] = [
   'eyeAppearance',
   'facialArtwork',
@@ -205,7 +211,11 @@ function versionedContract(value: unknown, context: string) {
   return parsed
 }
 
-function documentRef(value: unknown, context: string, requiredContract?: string): RecipeDocumentRef {
+function documentRef(
+  value: unknown,
+  context: string,
+  requiredContract?: string
+): RecipeDocumentRef {
   const raw = record(value, context)
   exactKeys(raw, ['contract', 'ref', 'sha256'], context)
   const contract = versionedContract(raw.contract, `${context}.contract`)
@@ -258,6 +268,34 @@ function parseSiblingInput(value: unknown, context: string): RecipeSerializableS
   }
 }
 
+function parseExternalSiblingInput(
+  value: unknown,
+  context: string
+): RecipeSerializableExternalSiblingInput {
+  const raw = record(value, context)
+  exactKeys(
+    raw,
+    ['sourceStateId', 'targetStateId', 'validationSha256', 'message', 'targetState'],
+    context
+  )
+  const sourceStateId = stableId(raw.sourceStateId, `${context}.sourceStateId`)
+  const targetStateId = stableId(raw.targetStateId, `${context}.targetStateId`)
+  if (sourceStateId !== targetStateId) {
+    fail(context, 'must retain the exact external sibling state id')
+  }
+  const targetState = parseRecipeSiblingStateRecord(raw.targetState, `${context}.targetState`)
+  if (targetState.id !== targetStateId) {
+    fail(context, 'targetState.id must match targetStateId')
+  }
+  return {
+    sourceStateId,
+    targetStateId,
+    validationSha256: requireLowercaseSha256(raw.validationSha256, `${context}.validationSha256`),
+    message: text(raw.message, `${context}.message`),
+    targetState
+  }
+}
+
 export function serializeRecipeSiblingInputs(
   inputs: Record<RecipeSiblingSurface, AppearanceRecipeMigrationSiblingInput>
 ): Record<RecipeSiblingSurface, RecipeSerializableSiblingInput> {
@@ -265,12 +303,15 @@ export function serializeRecipeSiblingInputs(
     SIBLING_SURFACES.map((surface) => {
       const input = inputs[surface]
       if (!input) fail(`siblingInputs.${surface}`, 'is required')
-      return [surface, {
-        sourceStateId: input.sourceStateId,
-        targetStateId: input.targetStateId,
-        targetDefinition: input.targetDefinition,
-        message: input.message ?? null
-      }]
+      return [
+        surface,
+        {
+          sourceStateId: input.sourceStateId,
+          targetStateId: input.targetStateId,
+          targetDefinition: input.targetDefinition,
+          message: input.message ?? null
+        }
+      ]
     })
   ) as Record<RecipeSiblingSurface, RecipeSerializableSiblingInput>
 }
@@ -281,14 +322,46 @@ export function deserializeRecipeSiblingInputs(
   return Object.fromEntries(
     SIBLING_SURFACES.map((surface) => {
       const input = inputs[surface]
-      return [surface, {
-        sourceStateId: input.sourceStateId,
-        targetStateId: input.targetStateId,
-        targetDefinition: input.targetDefinition,
-        ...(input.message ? { message: input.message } : {})
-      }]
+      return [
+        surface,
+        {
+          sourceStateId: input.sourceStateId,
+          targetStateId: input.targetStateId,
+          targetDefinition: input.targetDefinition,
+          ...(input.message ? { message: input.message } : {})
+        }
+      ]
     })
   ) as Record<RecipeSiblingSurface, AppearanceRecipeMigrationSiblingInput>
+}
+
+export function serializeRecipeExternalSiblingInputs(
+  inputs: AppearanceRecipeMigrationExternalSiblingInput[]
+): RecipeSerializableExternalSiblingInput[] {
+  const serialized = inputs.map((input, index) =>
+    parseExternalSiblingInput(input, `externalSiblingInputs[${index}]`)
+  )
+  serialized.sort((left, right) => left.sourceStateId.localeCompare(right.sourceStateId))
+  if (new Set(serialized.map((input) => input.sourceStateId)).size !== serialized.length) {
+    fail('externalSiblingInputs', 'must contain unique source state ids')
+  }
+  return serialized
+}
+
+export function deserializeRecipeExternalSiblingInputs(
+  inputs: RecipeSerializableExternalSiblingInput[]
+): AppearanceRecipeMigrationExternalSiblingInput[] {
+  const parsed = inputs.map((input, index) =>
+    parseExternalSiblingInput(input, `externalSiblingInputs[${index}]`)
+  )
+  const sourceIds = parsed.map((input) => input.sourceStateId)
+  if (
+    new Set(sourceIds).size !== sourceIds.length ||
+    sourceIds.some((id, index) => index > 0 && sourceIds[index - 1]! >= id)
+  ) {
+    fail('externalSiblingInputs', 'must be sorted and unique')
+  }
+  return parsed
 }
 
 export function parseRecipeUpdateAnalysisContext(value: unknown): RecipeUpdateAnalysisContext {
@@ -303,6 +376,7 @@ export function parseRecipeUpdateAnalysisContext(value: unknown): RecipeUpdateAn
       'containmentReceipt',
       'basePlan',
       'siblingInputs',
+      'externalSiblingInputs',
       'componentMapBundle'
     ],
     'analysis context'
@@ -312,6 +386,19 @@ export function parseRecipeUpdateAnalysisContext(value: unknown): RecipeUpdateAn
   }
   const siblingInputRecord = record(raw.siblingInputs, 'analysis context.siblingInputs')
   exactKeys(siblingInputRecord, SIBLING_SURFACES, 'analysis context.siblingInputs')
+  if (!Array.isArray(raw.externalSiblingInputs)) {
+    fail('analysis context.externalSiblingInputs', 'must be an array')
+  }
+  const externalSiblingInputs = raw.externalSiblingInputs.map((entry, index) =>
+    parseExternalSiblingInput(entry, `analysis context.externalSiblingInputs[${index}]`)
+  )
+  const externalSourceIds = externalSiblingInputs.map((entry) => entry.sourceStateId)
+  if (
+    new Set(externalSourceIds).size !== externalSourceIds.length ||
+    externalSourceIds.some((id, index) => index > 0 && externalSourceIds[index - 1]! >= id)
+  ) {
+    fail('analysis context.externalSiblingInputs', 'must be sorted and unique')
+  }
   return {
     contract: RECIPE_UPDATE_ANALYSIS_CONTEXT_CONTRACT,
     analysisId: stableId(raw.analysisId, 'analysis context.analysisId'),
@@ -321,13 +408,18 @@ export function parseRecipeUpdateAnalysisContext(value: unknown): RecipeUpdateAn
       'analysis context.containmentReceipt',
       RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT
     ),
-    basePlan: documentRef(raw.basePlan, 'analysis context.basePlan', RECIPE_MIGRATION_PLAN_CONTRACT),
+    basePlan: documentRef(
+      raw.basePlan,
+      'analysis context.basePlan',
+      RECIPE_MIGRATION_PLAN_CONTRACT
+    ),
     siblingInputs: Object.fromEntries(
       SIBLING_SURFACES.map((surface) => [
         surface,
         parseSiblingInput(siblingInputRecord[surface], `analysis context.siblingInputs.${surface}`)
       ])
     ) as Record<RecipeSiblingSurface, RecipeSerializableSiblingInput>,
+    externalSiblingInputs,
     componentMapBundle:
       raw.componentMapBundle === null ? null : parseRecipeComponentMapBundle(raw.componentMapBundle)
   }
@@ -370,10 +462,12 @@ export async function verifyRecipeReviewedState(value: unknown): Promise<RecipeR
     fail('reviewed state.state.contract', `must equal ${GOON_RECIPE_STATE_CONTRACT}`)
   }
   const operation = raw.operation as RecipeReviewOperation
-  const analysisId = raw.analysisId === null ? null : stableId(raw.analysisId, 'reviewed state.analysisId')
-  const planSha256 = raw.planSha256 === null
-    ? null
-    : requireLowercaseSha256(raw.planSha256, 'reviewed state.planSha256')
+  const analysisId =
+    raw.analysisId === null ? null : stableId(raw.analysisId, 'reviewed state.analysisId')
+  const planSha256 =
+    raw.planSha256 === null
+      ? null
+      : requireLowercaseSha256(raw.planSha256, 'reviewed state.planSha256')
   if (operation === 'package-update' ? !analysisId || !planSha256 : analysisId || planSha256) {
     fail('reviewed state', 'analysis and plan bindings must exist exactly for package updates')
   }

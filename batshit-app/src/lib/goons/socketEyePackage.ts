@@ -38,15 +38,15 @@ export function parseFirstPartySocketEyePackage(manifest: GoonCustomAvatarManife
   }
 
   for (const side of ['left', 'right'] as const) {
-    const capNode = socketEyeSurface.runtimeBindings[side].nodes.compositeCap
-    if (eyeAppearance.runtimeBindings[side].compositeCapNode !== capNode) {
-      throw new Error(`[socket-eye-package] Eye Appearance ${side} cap node does not match the socket surface.`)
+    const physicalEyeNode = socketEyeSurface.runtimeBindings[side].nodes.physicalEye
+    if (eyeAppearance.runtimeBindings[side].physicalEyeNode !== physicalEyeNode) {
+      throw new Error(`[socket-eye-package] Eye Appearance ${side} physical-eye node does not match the socket surface.`)
     }
     const compositeTargets = facialArtwork.roles
-      .filter((role) => role.target[side].bindingKind === 'socket-eye-composite-layer')
+      .filter((role) => role.target[side].bindingKind === 'physical-eye-layer')
       .map((role) => role.target[side].runtimeNodes[0])
-    if (compositeTargets.some((node) => node !== capNode)) {
-      throw new Error(`[socket-eye-package] Facial Artwork ${side} composite layers do not share the socket cap.`)
+    if (compositeTargets.some((node) => node !== physicalEyeNode)) {
+      throw new Error(`[socket-eye-package] Facial Artwork ${side} composite layers do not share the physical eye.`)
     }
   }
 

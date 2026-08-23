@@ -1,14 +1,15 @@
 import {
   resolveEyeAppearanceRuntimeControlValue,
   resolveEyeAppearanceState,
-  type EyeAppearanceDefinitionV3,
-  type EyeAppearanceStateV3
+  type EyeAppearanceDefinition,
+  type EyeAppearanceState
 } from './eyeAppearance'
 import type { SocketEyeSide } from './socketEyeSurface'
 
 export type SocketEyePhysicalVisualState = {
   irisRadiusMeters: number
   pupilRadiusRatio: number
+  irisHorizontalOffsetMeters: number
   irisVerticalOffsetMeters: number
   edgeSoftnessMeters: number
   cornea: {
@@ -19,31 +20,31 @@ export type SocketEyePhysicalVisualState = {
 }
 
 function fail(message: string): never {
-  throw new Error(`[eye-appearance/runtime-v3] ${message}`)
+  throw new Error(`[eye-appearance/runtime-v5] ${message}`)
 }
 
 /**
- * Eye Appearance v3 owns presentation values only. It never moves geometry,
- * eye bones, inverse binds, or Recipe output; the socket-eye material consumes
- * this resolved state together with Facial Artwork v4.
+ * Eye Appearance v5 owns presentation values only. The physical sphere remains
+ * transform-fitted, while Iris/Pupil move in gaze-linked material coordinates.
+ * Eye Highlight is independently fixed in front/cornea space.
  */
 export class EyeAppearanceEngineRuntime {
-  private state: EyeAppearanceStateV3
+  private state: EyeAppearanceState
   private disposed = false
 
   constructor(
-    readonly definition: EyeAppearanceDefinitionV3,
-    initialState: EyeAppearanceStateV3 | null,
+    readonly definition: EyeAppearanceDefinition,
+    initialState: EyeAppearanceState | null,
     private readonly onChange?: () => void
   ) {
     this.state = resolveEyeAppearanceState(definition, initialState)
   }
 
-  getState(): EyeAppearanceStateV3 {
+  getState(): EyeAppearanceState {
     return { ...this.state }
   }
 
-  setState(value: EyeAppearanceStateV3 | null) {
+  setState(value: EyeAppearanceState | null) {
     if (this.disposed) fail('cannot update state after disposal')
     this.state = resolveEyeAppearanceState(this.definition, value)
     this.onChange?.()
@@ -67,11 +68,24 @@ export class EyeAppearanceEngineRuntime {
       'iris_vertical_position',
       this.state.irisVerticalPosition
     )
+    const irisHorizontalPosition = resolveEyeAppearanceRuntimeControlValue(
+      this.definition,
+      'iris_horizontal_position',
+      this.state.irisHorizontalPosition
+    )
+    // Batshit Head-local anatomy places the Goon's left eye on +X and right on -X.
+    // Positive user state therefore converges by moving left toward -X and right toward +X.
+    const inwardSign = side === 'left' ? -1 : 1
     return {
       irisRadiusMeters: binding.irisNeutralRadiusMeters * irisMultiplier,
       pupilRadiusRatio: binding.pupilNeutralRadiusRatio * pupilMultiplier,
+      irisHorizontalOffsetMeters:
+        inwardSign *
+        binding.irisHorizontalTravelMeters *
+        (binding.neutralPlacement.horizontalTravelFraction + irisHorizontalPosition),
       irisVerticalOffsetMeters:
-        binding.irisVerticalTravelMeters * irisVerticalPosition,
+        binding.irisVerticalTravelMeters *
+        (binding.neutralPlacement.verticalTravelFraction + irisVerticalPosition),
       edgeSoftnessMeters: binding.edgeSoftnessMeters,
       cornea: { ...binding.cornea }
     }

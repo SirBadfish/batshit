@@ -16,6 +16,7 @@ test('intentional shutdown notifies and hides the renderer before service teardo
   assert.notEqual(notify, -1);
   assert.notEqual(stop, -1);
   assert.ok(notify < stop);
+  assert.ok(mainSource.indexOf('settleShutdownPreparations', stopStart) < stop);
   assert.match(mainSource, /window\.webContents\.send\(appShutdownChannel/);
   assert.match(mainSource, /window\.hide\(\);/);
 });
@@ -23,4 +24,27 @@ test('intentional shutdown notifies and hides the renderer before service teardo
 test('red-X close is identified separately from other application quit paths', () => {
   assert.match(mainSource, /pendingShutdownReason = 'window-close';/);
   assert.match(mainSource, /stopRuntimeBeforeQuit\(pendingShutdownReason\)/);
+});
+
+test('intentional shutdown cannot surface renderer failure dialogs during teardown', () => {
+  assert.match(
+    mainSource,
+    /function intentionalShutdownInProgress\(\) \{\s+return shutdownStarted \|\| quittingAfterShutdown;\s+\}/
+  );
+
+  const rendererGoneStart = mainSource.indexOf("window.webContents.on('render-process-gone'");
+  const unresponsiveStart = mainSource.indexOf("window.on('unresponsive'");
+  const closeStart = mainSource.indexOf("window.on('close'");
+
+  assert.notEqual(rendererGoneStart, -1);
+  assert.notEqual(unresponsiveStart, -1);
+  assert.notEqual(closeStart, -1);
+  assert.match(
+    mainSource.slice(rendererGoneStart, unresponsiveStart),
+    /if \(intentionalShutdownInProgress\(\)\) return;/
+  );
+  assert.match(
+    mainSource.slice(unresponsiveStart, closeStart),
+    /if \(intentionalShutdownInProgress\(\)\) return;/
+  );
 });

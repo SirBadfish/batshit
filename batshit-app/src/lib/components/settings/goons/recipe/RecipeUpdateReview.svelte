@@ -88,7 +88,9 @@
     if (counts.remapped > 0) return 'proven-remap'
     return report.status === 'preserved'
       ? 'automatic-appearance-preserving'
-      : 'blocked-ineligible'
+      : report.status === 'preview-required'
+        ? 'verified-preview-required'
+        : 'blocked-ineligible'
   })
 
   function setFilter(nextFilter: RecipeUpdateFilter) {
@@ -152,7 +154,9 @@
         </p>
       </div>
     </div>
-  {:else if effectiveClassification === 'reset-required' || report.status === 'preview-required'}
+  {:else if effectiveClassification === 'reset-required' ||
+    effectiveClassification === 'verified-preview-required' ||
+    report.status === 'preview-required'}
     <div class="batshit-settings-muted-panel recipe-review-callout is-warning">
       <TriangleAlert aria-hidden="true" />
       <div class="min-w-0">
@@ -160,7 +164,7 @@
         <p class="batshit-settings-caption mt-1 break-words">
           {effectiveClassification === 'reset-required'
             ? 'Compare Current and Updated, then choose whether to reset appearance and apply this file.'
-            : 'Compare Current and Updated before applying this verified conversion.'}
+            : 'Compare Current and Updated, then approve the verified presentation change.'}
         </p>
       </div>
     </div>

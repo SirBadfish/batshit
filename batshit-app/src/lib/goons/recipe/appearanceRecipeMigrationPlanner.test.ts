@@ -12,6 +12,7 @@ import fixtureOracle from "./fixtures/recipePhysicalMigrationOracle.json";
 import { recipeMigrationPlanSha256 } from "./migrationPlanContracts";
 import { canonicalRecipeSha256 } from "./recipeCanonical";
 import {
+  recipeStateSnapshotSha256,
   recipeSiblingStateSha256,
   type RecipeSiblingStateRecord,
 } from "./recipeContracts";
@@ -20,8 +21,11 @@ const mutable = <T>(value: T): any => structuredClone(value);
 
 async function plannerInput(
   includeComponentMap = true,
+  topologyRebuild = false,
 ): Promise<AppearanceRecipeMigrationPlannerInput> {
-  const fixture = await createRecipePhysicalMigrationFixture();
+  const fixture = await createRecipePhysicalMigrationFixture({
+    topologyRebuild,
+  });
   return {
     planId: includeComponentMap
       ? "migration.r2-fixture.automatic"
@@ -189,7 +193,10 @@ async function plannerInputWithSiblingCases(blockOral = false) {
     verifierVersion: 1,
     verify: async () => ({
       proposedState,
-      domainEvidenceSha256: await canonicalRecipeSha256({ verifierId, proposedState }),
+      domainEvidenceSha256: await canonicalRecipeSha256({
+        verifierId,
+        proposedState,
+      }),
       message: `${verifierId} supplied exact domain evidence.`,
     }),
   });
@@ -202,7 +209,70 @@ async function plannerInputWithSiblingCases(blockOral = false) {
   return input;
 }
 
+async function withExternalSibling(
+  input: AppearanceRecipeMigrationPlannerInput,
+): Promise<AppearanceRecipeMigrationPlannerInput> {
+  const external = await siblingState(
+    "hairState",
+    "hair-state/v2",
+    "9".repeat(64),
+    4,
+  );
+  const sourceState = structuredClone(input.sourceState);
+  sourceState.siblings.push(external);
+  sourceState.siblings.sort((left, right) => left.id.localeCompare(right.id));
+  sourceState.stateSha256 = await recipeStateSnapshotSha256(sourceState);
+  return {
+    ...input,
+    sourceState,
+    externalSiblingInputs: [
+      {
+        sourceStateId: external.id,
+        targetStateId: external.id,
+        validationSha256: "8".repeat(64),
+        message:
+          "The exact selected Hair revision remains compatible with the target Recipe source.",
+        targetState: structuredClone(external),
+      },
+    ],
+  };
+}
+
 describe("Appearance Recipe migration planner", () => {
+  it("migrates values through an explicit target-source topology rebuild and requires preview", async () => {
+    const input = await plannerInput(true, true);
+    const plan = await planAppearanceRecipeMigration(input);
+
+    expect(plan.outcome).toMatchObject({
+      kind: "automatic",
+      readiness: "preview-required",
+      preservationClaim: "values-migrated-only",
+    });
+    expect(plan.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "topology-changed" }),
+      ]),
+    );
+    expect(plan.componentProofs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: "not-preserved",
+          mismatchDomains: expect.arrayContaining(["geometry"]),
+        }),
+      ]),
+    );
+    expect(plan.wholeRecipeProof).toMatchObject({
+      status: "expected-mismatch",
+      permitsAppearancePreservedClaim: false,
+    });
+    await expect(
+      verifyPlannedAppearanceRecipeMigration(plan, input),
+    ).resolves.toMatchObject({
+      planSha256: plan.planSha256,
+      outcome: { readiness: "preview-required" },
+    });
+  });
+
   it("produces one deterministic exhaustive automatic plan with complete physical proof", async () => {
     const input = await plannerInput();
     const first = await planAppearanceRecipeMigration(input);
@@ -257,10 +327,81 @@ describe("Appearance Recipe migration planner", () => {
     ).resolves.toEqual(plan);
   });
 
+  it("carries an externally validated Hair sibling exactly through automatic migration and verification", async () => {
+    const input = await withExternalSibling(await plannerInput());
+    const sourceHair = input.sourceState.siblings.find(
+      (sibling) => sibling.id === "hairState",
+    );
+    const plan = await planAppearanceRecipeMigration(input);
+
+    expect(plan.outcome).toMatchObject({
+      kind: "automatic",
+      readiness: "ready",
+    });
+    expect(
+      plan.proposedState?.siblings.find(
+        (sibling) => sibling.id === "hairState",
+      ),
+    ).toEqual(sourceHair);
+    expect(plan.fromStateSha256).toBe(input.sourceState.stateSha256);
+    await expect(
+      verifyPlannedAppearanceRecipeMigration(plan, input),
+    ).resolves.toEqual(plan);
+  });
+
+  it("requires Current/Updated preview when a validated external Hair sibling changes revision", async () => {
+    const input = await withExternalSibling(await plannerInput());
+    const sourceHair = input.sourceState.siblings.find(
+      (sibling) => sibling.id === "hairState",
+    )!;
+    const targetHair = structuredClone(sourceHair);
+    targetHair.state = { ...targetHair.state, fixtureValue: 5 };
+    targetHair.definitionSha256 = "7".repeat(64);
+    targetHair.stateSha256 = await recipeSiblingStateSha256(targetHair.state);
+    input.externalSiblingInputs![0]!.targetState = targetHair;
+    input.externalSiblingInputs![0]!.validationSha256 = "6".repeat(64);
+    input.externalSiblingInputs![0]!.message =
+      "The selected built-in Hair style migrates to its current-head successor.";
+
+    const plan = await planAppearanceRecipeMigration(input);
+
+    expect(plan.outcome).toMatchObject({
+      kind: "automatic",
+      readiness: "preview-required",
+      preservationClaim: "values-migrated-only",
+    });
+    expect(
+      plan.proposedState?.siblings.find(
+        (sibling) => sibling.id === "hairState",
+      ),
+    ).toEqual(targetHair);
+    expect(plan.proposedState?.siblings).not.toContainEqual(sourceHair);
+    expect(plan.wholeRecipeProof.permitsAppearancePreservedClaim).toBe(false);
+    await expect(
+      verifyPlannedAppearanceRecipeMigration(plan, input),
+    ).resolves.toEqual(plan);
+  });
+
+  it("rejects an external sibling binding that changes identity or lacks exact validation", async () => {
+    const changedId = await withExternalSibling(await plannerInput());
+    changedId.externalSiblingInputs![0]!.targetStateId = "hairState-v2";
+    await expect(planAppearanceRecipeMigration(changedId)).rejects.toThrow(
+      /retain its exact state id/,
+    );
+
+    const invalidValidation = await withExternalSibling(await plannerInput());
+    invalidValidation.externalSiblingInputs![0]!.validationSha256 = "INVALID";
+    await expect(
+      planAppearanceRecipeMigration(invalidValidation),
+    ).rejects.toThrow(/lowercase SHA-256/);
+  });
+
   it("runs keep, migrate, and reset-required sibling decisions through the production planner", async () => {
     const input = await plannerInputWithSiblingCases();
     const plan = await planAppearanceRecipeMigration(input);
-    const rows = Object.fromEntries(plan.siblingRows.map((row) => [row.surface, row]));
+    const rows = Object.fromEntries(
+      plan.siblingRows.map((row) => [row.surface, row]),
+    );
 
     expect(rows.facialArtwork).toMatchObject({
       action: "keep",
@@ -286,7 +427,9 @@ describe("Appearance Recipe migration planner", () => {
       "facialArtwork",
       "oralAppearance-v2",
     ]);
-    await expect(verifyPlannedAppearanceRecipeMigration(plan, input)).resolves.toEqual(plan);
+    await expect(
+      verifyPlannedAppearanceRecipeMigration(plan, input),
+    ).resolves.toEqual(plan);
   });
 
   it("blocks the full production plan when one sibling surface has no verified proof", async () => {
@@ -295,13 +438,17 @@ describe("Appearance Recipe migration planner", () => {
 
     expect(plan.outcome).toMatchObject({ readiness: "blocked" });
     expect(plan.outcome.rejectionCodes).toContain("SIBLING_PROOF_FAILED");
-    expect(plan.siblingRows.find((row) => row.surface === "oralAppearance")).toMatchObject({
+    expect(
+      plan.siblingRows.find((row) => row.surface === "oralAppearance"),
+    ).toMatchObject({
       action: "blocked",
       resolution: "blocked",
       proofStatus: "failed",
     });
     expect(plan.proposedState).toBeNull();
-    await expect(verifyPlannedAppearanceRecipeMigration(plan, input)).resolves.toEqual(plan);
+    await expect(
+      verifyPlannedAppearanceRecipeMigration(plan, input),
+    ).resolves.toEqual(plan);
   });
 
   it("returns unsupported without the required coupled map, then permits only a separately cited clean reset", async () => {
@@ -340,6 +487,28 @@ describe("Appearance Recipe migration planner", () => {
         (row) => row.requiresPreview && row.requiresConfirmation,
       ),
     ).toBe(true);
+    await expect(
+      verifyPlannedAppearanceRecipeCleanReset(reset, resetInput),
+    ).resolves.toEqual(reset);
+  });
+
+  it("carries an externally validated Hair sibling exactly through an explicit clean reset", async () => {
+    const input = await withExternalSibling(await plannerInput(false));
+    const unsupported = await planAppearanceRecipeMigration(input);
+    const resetInput = {
+      planId: "migration.r2-fixture.external-clean-reset",
+      migrationInput: input,
+      eligibleUnsupportedPlan: unsupported,
+    };
+    const reset = await planAppearanceRecipeCleanReset(resetInput);
+
+    expect(
+      reset.proposedState?.siblings.find(
+        (sibling) => sibling.id === "hairState",
+      ),
+    ).toEqual(
+      input.sourceState.siblings.find((sibling) => sibling.id === "hairState"),
+    );
     await expect(
       verifyPlannedAppearanceRecipeCleanReset(reset, resetInput),
     ).resolves.toEqual(reset);

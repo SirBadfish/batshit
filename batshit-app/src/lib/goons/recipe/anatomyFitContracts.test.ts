@@ -291,7 +291,7 @@ describe("Anatomy Fit v2 content-addressed contracts", () => {
     ).resolves.toEqual(fitResult);
   });
 
-  it("invalidates changed final body or cap/liner proofs", async () => {
+  it("invalidates changed final body or physical-eye/treatment proofs", async () => {
     const current = await input();
     const changedBody = await input(0.9963701302315507, sha("9"));
     expect(changedBody.inputSha256).not.toBe(current.inputSha256);

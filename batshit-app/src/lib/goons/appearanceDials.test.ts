@@ -168,10 +168,10 @@ function buildManifest(): Record<string, any> {
           parent: { kind: "bone", name: "Head" },
           exactNodeMatches: 1,
         },
-        composite_cap_left: {
-          node: "BS_Eye_L_CompositeCap",
+        physical_eye_left: {
+          node: "BS_Eye_L_Physical",
           kind: "mesh",
-          role: "socket-eye-composite-cap",
+          role: "socket-eye-physical-eye",
           side: "left",
           required: true,
           scalePolicy: "any",
@@ -365,7 +365,7 @@ function buildManifest(): Record<string, any> {
             ...provenance("head-assets"),
             license: "LicenseRef-Batshit-First-Party",
           },
-          nodeIds: ["eyes", "composite_cap_left"],
+          nodeIds: ["eyes", "physical_eye_left"],
           drivers: [
             {
               driver: { kind: "target", id: "head_forward" },
@@ -379,7 +379,7 @@ function buildManifest(): Record<string, any> {
                 {
                   id: "sclera-deform",
                   kind: "morph-weight",
-                  node: "composite_cap_left",
+                  node: "physical_eye_left",
                   morph: "follow_head_forward",
                   weightRange: [-1, 1],
                   runtimeRetention: "recipe-only",
@@ -455,7 +455,7 @@ function runtimeInventory(): AppearanceRuntimeInventory {
       },
       {
         runtimeId: "sclera-left-0",
-        node: "BS_Eye_L_CompositeCap",
+        node: "BS_Eye_L_Physical",
         kind: "mesh",
         parentBone: "Head",
         localScale: [1, 1, 1],
@@ -583,7 +583,7 @@ describe("appearance-dials/v2 parser and provenance", () => {
 
   it("enforces exact node roles, sides, and acyclic hierarchy", () => {
     const wrongEyeSide = buildManifest();
-    wrongEyeSide.appearanceDials.nodes.composite_cap_left.side = "none";
+    wrongEyeSide.appearanceDials.nodes.physical_eye_left.side = "none";
     expect(() => parseAppearanceDialsManifest(wrongEyeSide)).toThrow(
       "requires a left/right side",
     );
@@ -611,9 +611,9 @@ describe("appearance-dials/v2 parser and provenance", () => {
         "eye-treatment-canvas",
         "right",
       ),
-      composite_cap_right: appearanceNode(
-        "BS_Eye_R_CompositeCap",
-        "socket-eye-composite-cap",
+      physical_eye_right: appearanceNode(
+        "BS_Eye_R_Physical",
+        "socket-eye-physical-eye",
         "right",
         { parent: { kind: "bone", name: "Head" } },
       ),
@@ -638,19 +638,19 @@ describe("appearance-dials/v2 parser and provenance", () => {
     );
 
     const duplicateEyeSide = structuredClone(perSide);
-    duplicateEyeSide.appearanceDials.nodes.composite_cap_left_second = appearanceNode(
-      "BS_Eye_Second_L_CompositeCap",
-      "socket-eye-composite-cap",
+    duplicateEyeSide.appearanceDials.nodes.physical_eye_left_second = appearanceNode(
+      "BS_Eye_Second_L_Physical",
+      "socket-eye-physical-eye",
       "left",
     );
     expect(() => parseAppearanceDialsManifest(duplicateEyeSide)).toThrow(
-      "role/side socket-eye-composite-cap/left is duplicated",
+      "role/side socket-eye-physical-eye/left is duplicated",
     );
 
     const retiredGlobeRole = structuredClone(perSide);
-    retiredGlobeRole.appearanceDials.nodes.composite_cap_left.role = "eye-sclera";
+    retiredGlobeRole.appearanceDials.nodes.physical_eye_left.role = "eye-sclera";
     expect(() => parseAppearanceDialsManifest(retiredGlobeRole)).toThrow(
-      "appearance node composite_cap_left is malformed",
+      "appearance node physical_eye_left is malformed",
     );
 
     const duplicateOralRole = structuredClone(perSide);
@@ -727,7 +727,7 @@ describe("target usages, corrective ownership, and Recipe retention", () => {
     expect(inventory.bakeAndRemoveFollowerMorphs).toContainEqual({
       follower: "head-assets",
       channel: "sclera-deform",
-      node: "composite_cap_left",
+      node: "physical_eye_left",
       morph: "follow_head_forward",
     });
     expect(inventory.bakeFollowerNodeTransforms).toContainEqual({
@@ -825,6 +825,21 @@ describe("runtime node/index ownership", () => {
     expect(() =>
       validateAppearanceRuntimeInventory(parse(), nonUniform),
     ).toThrow("violates uniform-only scale");
+  });
+
+  it("accepts the exact Three.js runtime spelling of a raw glTF bone name", () => {
+    const manifest = parse();
+    manifest.nodes.eyes.parent = {
+      kind: "bone",
+      name: "mixamorig:LeftEye",
+    };
+    const inventory = runtimeInventory();
+    inventory.nodes.find((node) => node.node === "Eyes")!.parentBone =
+      "mixamorigLeftEye";
+
+    expect(() =>
+      validateAppearanceRuntimeInventory(manifest, inventory),
+    ).not.toThrow();
   });
 
   it("requires complete parser-derived runtime face binding evidence", () => {
@@ -1077,7 +1092,7 @@ describe("typed follower contract", () => {
     follower.drivers[0].channels.push({
       id: "aaa-sclera-trs",
       kind: "node-trs",
-      node: "composite_cap_left",
+      node: "physical_eye_left",
       samples: followerSamples(),
     });
     const manifest = parse(raw);
@@ -1107,7 +1122,7 @@ describe("typed follower contract", () => {
       expect.objectContaining({
         follower: "head-assets",
         channel: "sclera-deform",
-        node: "composite_cap_left",
+        node: "physical_eye_left",
         weight: 0.5,
       }),
     ]);

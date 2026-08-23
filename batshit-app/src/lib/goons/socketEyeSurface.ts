@@ -1,4 +1,4 @@
-export const SOCKET_EYE_SURFACE_SCHEMA_VERSION = 'socket-eye-surface/v1' as const
+export const SOCKET_EYE_SURFACE_SCHEMA_VERSION = 'socket-eye-surface/v2' as const
 
 export type SocketEyeSide = 'left' | 'right'
 export type SocketEyeVec3 = [number, number, number]
@@ -19,35 +19,28 @@ export const SOCKET_EYE_COMPOSITE_LAYER_ORDER = [
   'cornea'
 ] as const satisfies readonly SocketEyeCompositeLayer[]
 
-export type SocketEyeSurfaceSideDefinition = {
+export type SocketEyeSurfaceSideDefinitionV2 = {
   side: SocketEyeSide
-  nodes: {
-    compositeCap: string
-  }
+  nodes: { physicalEye: string }
   apertureSeamDefinitionSha256: string
   gazeAnchorHeadLocal: SocketEyeVec3
   surfaceCenterHeadLocal: SocketEyeVec3
   horizontalAxisHeadLocal: SocketEyeVec3
   verticalAxisHeadLocal: SocketEyeVec3
   forwardAxisHeadLocal: SocketEyeVec3
-  cap: {
-    frontGeometryLaw: 'aperture-normalized-shallow-patch/v1'
-    frontDepthRatio: number
-    maximumFrontDepthMeters: number
-    artworkProjection: 'deformed-surface-meters/v1'
-    carrierHalfWidthMeters: number
-    carrierHalfHeightMeters: number
-    carrierDepthRadiusMeters: number
-    rearClosureDepthMeters: number
-    minimumHiddenUnderlapMeters: number
-    visibleFrontFaceGroup: string
-    hiddenClosureFaceGroup: string
-    primitiveFollowerMorphs: {
-      visibleFront: string[]
-      hiddenClosure: string[]
+  sphere: {
+    geometryLaw: 'static-full-sphere/v1'
+    radiusMeters: number
+    artworkProjection: 'front-hemisphere-uv/v1'
+    stableNeutralRear: true
+    surfaceMorphTargets: []
+    physicalFit: {
+      mode: 'transform-only/v1'
+      translation: true
+      rotation: true
+      uniformScale: true
+      nonUniformScale: false
     }
-    apertureFollowing: true
-    closedManifold: true
   }
   gaze: {
     maximumHorizontal: number
@@ -56,33 +49,33 @@ export type SocketEyeSurfaceSideDefinition = {
   }
 }
 
-export type SocketEyeSurfaceDefinitionV1 = {
+export type SocketEyeSurfaceDefinitionV2 = {
   schemaVersion: typeof SOCKET_EYE_SURFACE_SCHEMA_VERSION
   definitionSha256: string
   status: 'product-export-approved'
   productExportApproved: true
   coordinateSpace: 'head-local'
-  surfaceKind: 'aperture-following-composite-cap'
+  surfaceKind: 'static-full-sphere'
   compositeLayers: typeof SOCKET_EYE_COMPOSITE_LAYER_ORDER
   rendering: {
-    meshOwnsApertureMask: true
-    visibleFrontDepthTest: true
-    visibleFrontDepthWrite: true
-    visibleFrontSide: 'front'
-    renderOrder: 'after-face-before-liner'
+    eyelidsOwnApertureOcclusion: true
+    sphereDepthTest: true
+    sphereDepthWrite: true
+    sphereSide: 'front'
+    renderOrder: 'after-face-before-treatment'
     requiredMaxTextureArrayLayers: number
   }
   artwork: {
     scleraOverlay: {
-      gazeLinked: true
+      projection: 'front-hemisphere-only/v1'
       transparentRgba: true
-      minimumOverscanHorizontal: number
-      minimumOverscanVertical: number
+      rearPresentation: 'stable-neutral-base'
+      gazeLinked: false
     }
   }
   runtimeBindings: {
-    left: SocketEyeSurfaceSideDefinition
-    right: SocketEyeSurfaceSideDefinition
+    left: SocketEyeSurfaceSideDefinitionV2
+    right: SocketEyeSurfaceSideDefinitionV2
   }
 }
 
@@ -96,22 +89,12 @@ export type SocketEyeSurfaceProjection = {
   surfacePointHeadLocal: SocketEyeVec3
 }
 
-/**
- * Live composite caps retain only the three socket-aperture expression followers.
- * The package's primitiveFollowerMorphs inventory is intentionally broader:
- * it also proves every authoring-only identity morph present on the cap.
- */
-export function socketEyeCapRetainedDynamicMorphs(side: SocketEyeSide): string[] {
-  const suffix = side === 'left' ? 'Left' : 'Right'
-  return [`eyeBlink${suffix}`, `eyeSquint${suffix}`, `eyeWide${suffix}`]
-}
-
 const HASH_PATTERN = /^[a-f0-9]{64}$/
 const EPSILON = 1e-9
 const AXIS_TOLERANCE = 1e-5
 
 function fail(message: string): never {
-  throw new Error(`[socket-eye-surface/v1] ${message}`)
+  throw new Error(`[${SOCKET_EYE_SURFACE_SCHEMA_VERSION}] ${message}`)
 }
 
 function record(value: unknown, context: string): Record<string, unknown> {
@@ -126,8 +109,8 @@ function rejectUnknownKeys(
   allowed: readonly string[],
   context: string
 ) {
-  const allowedKeys = new Set(allowed)
-  const extra = Object.keys(source).filter((key) => !allowedKeys.has(key))
+  const accepted = new Set(allowed)
+  const extra = Object.keys(source).filter((key) => !accepted.has(key))
   if (extra.length > 0) fail(`${context} contains unsupported fields: ${extra.join(', ')}`)
 }
 
@@ -136,6 +119,12 @@ function stringValue(value: unknown, context: string): string {
     fail(`${context} must be a non-empty trimmed string`)
   }
   return value
+}
+
+function sha256(value: unknown, context: string): string {
+  const parsed = stringValue(value, context)
+  if (!HASH_PATTERN.test(parsed)) fail(`${context} must be lowercase SHA-256`)
+  return parsed
 }
 
 function finite(value: unknown, context: string): number {
@@ -155,7 +144,7 @@ function positiveInteger(value: unknown, context: string): number {
   return parsed
 }
 
-function unitInterval(value: unknown, context: string): number {
+function openUnitInterval(value: unknown, context: string): number {
   const parsed = finite(value, context)
   if (parsed <= 0 || parsed >= 1) fail(`${context} must be inside (0, 1)`)
   return parsed
@@ -166,46 +155,16 @@ function literal<T extends boolean | string>(value: unknown, expected: T, contex
   return expected
 }
 
+function emptyArray(value: unknown, context: string): [] {
+  if (!Array.isArray(value) || value.length !== 0) {
+    fail(`${context} must be an empty array because the physical eye is static`)
+  }
+  return []
+}
+
 function vec3(value: unknown, context: string): SocketEyeVec3 {
   if (!Array.isArray(value) || value.length !== 3) fail(`${context} must contain three numbers`)
   return value.map((entry, index) => finite(entry, `${context}[${index}]`)) as SocketEyeVec3
-}
-
-function followerMorphInventory(value: unknown, context: string): string[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    fail(`${context} must be a non-empty array`)
-  }
-  const parsed = value.map((entry, index) => stringValue(entry, `${context}[${index}]`))
-  if (new Set(parsed).size !== parsed.length) fail(`${context} must not contain duplicates`)
-  const sorted = [...parsed].sort()
-  if (parsed.some((entry, index) => entry !== sorted[index])) {
-    fail(`${context} must be sorted`)
-  }
-  return parsed
-}
-
-function primitiveFollowerMorphs(
-  value: unknown,
-  side: SocketEyeSide,
-  context: string
-): { visibleFront: string[]; hiddenClosure: string[] } {
-  const source = record(value, context)
-  rejectUnknownKeys(source, ['visibleFront', 'hiddenClosure'], context)
-  const visibleFront = followerMorphInventory(source.visibleFront, `${context}.visibleFront`)
-  const hiddenClosure = followerMorphInventory(source.hiddenClosure, `${context}.hiddenClosure`)
-  if (
-    visibleFront.length !== hiddenClosure.length ||
-    visibleFront.some((entry, index) => entry !== hiddenClosure[index])
-  ) {
-    fail(`${context} must declare the same exact inventory for both cap primitives`)
-  }
-  const required = socketEyeCapRetainedDynamicMorphs(side)
-  for (const key of required) {
-    if (!visibleFront.includes(key)) {
-      fail(`${context} must include ${key} on both cap primitives`)
-    }
-  }
-  return { visibleFront, hiddenClosure }
 }
 
 function compositeLayers(value: unknown): typeof SOCKET_EYE_COMPOSITE_LAYER_ORDER {
@@ -213,9 +172,7 @@ function compositeLayers(value: unknown): typeof SOCKET_EYE_COMPOSITE_LAYER_ORDE
     fail('definition.compositeLayers must declare the complete ordered layer stack')
   }
   for (const [index, expected] of SOCKET_EYE_COMPOSITE_LAYER_ORDER.entries()) {
-    if (value[index] !== expected) {
-      fail(`definition.compositeLayers[${index}] must be ${expected}`)
-    }
+    if (value[index] !== expected) fail(`definition.compositeLayers[${index}] must be ${expected}`)
   }
   return SOCKET_EYE_COMPOSITE_LAYER_ORDER
 }
@@ -254,7 +211,7 @@ function normalized(value: SocketEyeVec3, context: string): SocketEyeVec3 {
   return scale(value, 1 / magnitude)
 }
 
-function validateAxes(side: SocketEyeSurfaceSideDefinition, context: string) {
+function validateAxes(side: SocketEyeSurfaceSideDefinitionV2, context: string) {
   const axes = [
     ['horizontalAxisHeadLocal', side.horizontalAxisHeadLocal],
     ['verticalAxisHeadLocal', side.verticalAxisHeadLocal],
@@ -273,10 +230,7 @@ function validateAxes(side: SocketEyeSurfaceSideDefinition, context: string) {
     fail(`${context} vertical and forward axes must be orthogonal`)
   }
   const handedness = dot(
-    normalized(
-      cross(side.horizontalAxisHeadLocal, side.verticalAxisHeadLocal),
-      `${context} axes`
-    ),
+    normalized(cross(side.horizontalAxisHeadLocal, side.verticalAxisHeadLocal), `${context} axes`),
     side.forwardAxisHeadLocal
   )
   if (handedness < 1 - AXIS_TOLERANCE) fail(`${context} axes must form a right-handed frame`)
@@ -286,7 +240,7 @@ function parseSide(
   value: unknown,
   expectedSide: SocketEyeSide,
   context: string
-): SocketEyeSurfaceSideDefinition {
+): SocketEyeSurfaceSideDefinitionV2 {
   const source = record(value, context)
   rejectUnknownKeys(
     source,
@@ -299,7 +253,7 @@ function parseSide(
       'horizontalAxisHeadLocal',
       'verticalAxisHeadLocal',
       'forwardAxisHeadLocal',
-      'cap',
+      'sphere',
       'gaze'
     ],
     context
@@ -307,152 +261,85 @@ function parseSide(
   if (source.side !== expectedSide) fail(`${context}.side must be ${expectedSide}`)
 
   const nodes = record(source.nodes, `${context}.nodes`)
-  rejectUnknownKeys(nodes, ['compositeCap'], `${context}.nodes`)
-
-  const cap = record(source.cap, `${context}.cap`)
+  rejectUnknownKeys(nodes, ['physicalEye'], `${context}.nodes`)
+  const sphere = record(source.sphere, `${context}.sphere`)
   rejectUnknownKeys(
-    cap,
+    sphere,
     [
-      'frontGeometryLaw',
-      'frontDepthRatio',
-      'maximumFrontDepthMeters',
+      'geometryLaw',
+      'radiusMeters',
       'artworkProjection',
-      'carrierHalfWidthMeters',
-      'carrierHalfHeightMeters',
-      'carrierDepthRadiusMeters',
-      'rearClosureDepthMeters',
-      'minimumHiddenUnderlapMeters',
-      'visibleFrontFaceGroup',
-      'hiddenClosureFaceGroup',
-      'primitiveFollowerMorphs',
-      'apertureFollowing',
-      'closedManifold'
+      'stableNeutralRear',
+      'surfaceMorphTargets',
+      'physicalFit'
     ],
-    `${context}.cap`
+    `${context}.sphere`
   )
-
-  const gaze = record(source.gaze, `${context}.gaze`)
+  const physicalFit = record(sphere.physicalFit, `${context}.sphere.physicalFit`)
   rejectUnknownKeys(
-    gaze,
-    ['maximumHorizontal', 'maximumVertical', 'headFollowStart'],
-    `${context}.gaze`
+    physicalFit,
+    ['mode', 'translation', 'rotation', 'uniformScale', 'nonUniformScale'],
+    `${context}.sphere.physicalFit`
   )
+  const gaze = record(source.gaze, `${context}.gaze`)
+  rejectUnknownKeys(gaze, ['maximumHorizontal', 'maximumVertical', 'headFollowStart'], `${context}.gaze`)
 
-  const parsed: SocketEyeSurfaceSideDefinition = {
+  const parsed: SocketEyeSurfaceSideDefinitionV2 = {
     side: expectedSide,
-    nodes: {
-      compositeCap: stringValue(nodes.compositeCap, `${context}.nodes.compositeCap`)
-    },
-    apertureSeamDefinitionSha256: stringValue(
+    nodes: { physicalEye: stringValue(nodes.physicalEye, `${context}.nodes.physicalEye`) },
+    apertureSeamDefinitionSha256: sha256(
       source.apertureSeamDefinitionSha256,
       `${context}.apertureSeamDefinitionSha256`
     ),
     gazeAnchorHeadLocal: vec3(source.gazeAnchorHeadLocal, `${context}.gazeAnchorHeadLocal`),
-    surfaceCenterHeadLocal: vec3(
-      source.surfaceCenterHeadLocal,
-      `${context}.surfaceCenterHeadLocal`
-    ),
-    horizontalAxisHeadLocal: vec3(
-      source.horizontalAxisHeadLocal,
-      `${context}.horizontalAxisHeadLocal`
-    ),
-    verticalAxisHeadLocal: vec3(
-      source.verticalAxisHeadLocal,
-      `${context}.verticalAxisHeadLocal`
-    ),
-    forwardAxisHeadLocal: vec3(
-      source.forwardAxisHeadLocal,
-      `${context}.forwardAxisHeadLocal`
-    ),
-    cap: {
-      frontGeometryLaw: literal(
-        cap.frontGeometryLaw,
-        'aperture-normalized-shallow-patch/v1',
-        `${context}.cap.frontGeometryLaw`
-      ),
-      frontDepthRatio: positive(cap.frontDepthRatio, `${context}.cap.frontDepthRatio`),
-      maximumFrontDepthMeters: positive(
-        cap.maximumFrontDepthMeters,
-        `${context}.cap.maximumFrontDepthMeters`
-      ),
+    surfaceCenterHeadLocal: vec3(source.surfaceCenterHeadLocal, `${context}.surfaceCenterHeadLocal`),
+    horizontalAxisHeadLocal: vec3(source.horizontalAxisHeadLocal, `${context}.horizontalAxisHeadLocal`),
+    verticalAxisHeadLocal: vec3(source.verticalAxisHeadLocal, `${context}.verticalAxisHeadLocal`),
+    forwardAxisHeadLocal: vec3(source.forwardAxisHeadLocal, `${context}.forwardAxisHeadLocal`),
+    sphere: {
+      geometryLaw: literal(sphere.geometryLaw, 'static-full-sphere/v1', `${context}.sphere.geometryLaw`),
+      radiusMeters: positive(sphere.radiusMeters, `${context}.sphere.radiusMeters`),
       artworkProjection: literal(
-        cap.artworkProjection,
-        'deformed-surface-meters/v1',
-        `${context}.cap.artworkProjection`
+        sphere.artworkProjection,
+        'front-hemisphere-uv/v1',
+        `${context}.sphere.artworkProjection`
       ),
-      carrierHalfWidthMeters: positive(
-        cap.carrierHalfWidthMeters,
-        `${context}.cap.carrierHalfWidthMeters`
-      ),
-      carrierHalfHeightMeters: positive(
-        cap.carrierHalfHeightMeters,
-        `${context}.cap.carrierHalfHeightMeters`
-      ),
-      carrierDepthRadiusMeters: positive(
-        cap.carrierDepthRadiusMeters,
-        `${context}.cap.carrierDepthRadiusMeters`
-      ),
-      rearClosureDepthMeters: positive(
-        cap.rearClosureDepthMeters,
-        `${context}.cap.rearClosureDepthMeters`
-      ),
-      minimumHiddenUnderlapMeters: positive(
-        cap.minimumHiddenUnderlapMeters,
-        `${context}.cap.minimumHiddenUnderlapMeters`
-      ),
-      visibleFrontFaceGroup: stringValue(
-        cap.visibleFrontFaceGroup,
-        `${context}.cap.visibleFrontFaceGroup`
-      ),
-      hiddenClosureFaceGroup: stringValue(
-        cap.hiddenClosureFaceGroup,
-        `${context}.cap.hiddenClosureFaceGroup`
-      ),
-      primitiveFollowerMorphs: primitiveFollowerMorphs(
-        cap.primitiveFollowerMorphs,
-        expectedSide,
-        `${context}.cap.primitiveFollowerMorphs`
-      ),
-      apertureFollowing: literal(
-        cap.apertureFollowing,
-        true,
-        `${context}.cap.apertureFollowing`
-      ),
-      closedManifold: literal(cap.closedManifold, true, `${context}.cap.closedManifold`)
+      stableNeutralRear: literal(sphere.stableNeutralRear, true, `${context}.sphere.stableNeutralRear`),
+      surfaceMorphTargets: emptyArray(sphere.surfaceMorphTargets, `${context}.sphere.surfaceMorphTargets`),
+      physicalFit: {
+        mode: literal(physicalFit.mode, 'transform-only/v1', `${context}.sphere.physicalFit.mode`),
+        translation: literal(physicalFit.translation, true, `${context}.sphere.physicalFit.translation`),
+        rotation: literal(physicalFit.rotation, true, `${context}.sphere.physicalFit.rotation`),
+        uniformScale: literal(physicalFit.uniformScale, true, `${context}.sphere.physicalFit.uniformScale`),
+        nonUniformScale: literal(
+          physicalFit.nonUniformScale,
+          false,
+          `${context}.sphere.physicalFit.nonUniformScale`
+        )
+      }
     },
     gaze: {
-      maximumHorizontal: unitInterval(
-        gaze.maximumHorizontal,
-        `${context}.gaze.maximumHorizontal`
-      ),
-      maximumVertical: unitInterval(gaze.maximumVertical, `${context}.gaze.maximumVertical`),
-      headFollowStart: unitInterval(gaze.headFollowStart, `${context}.gaze.headFollowStart`)
+      maximumHorizontal: openUnitInterval(gaze.maximumHorizontal, `${context}.gaze.maximumHorizontal`),
+      maximumVertical: openUnitInterval(gaze.maximumVertical, `${context}.gaze.maximumVertical`),
+      headFollowStart: openUnitInterval(gaze.headFollowStart, `${context}.gaze.headFollowStart`)
     }
   }
-  if (!HASH_PATTERN.test(parsed.apertureSeamDefinitionSha256)) {
-    fail(`${context}.apertureSeamDefinitionSha256 must be lowercase SHA-256`)
-  }
-  if (parsed.cap.visibleFrontFaceGroup === parsed.cap.hiddenClosureFaceGroup) {
-    fail(`${context} visible front and hidden closure face groups must differ`)
-  }
+
   validateAxes(parsed, context)
   const anchorFromCenter = subtract(parsed.gazeAnchorHeadLocal, parsed.surfaceCenterHeadLocal)
-  const anchorDepthFromCenter = dot(anchorFromCenter, parsed.forwardAxisHeadLocal)
-  if (anchorDepthFromCenter > EPSILON) {
-    fail(`${context} gaze anchor must stay on or behind the carrier perimeter plane`)
+  if (dot(anchorFromCenter, parsed.forwardAxisHeadLocal) > EPSILON) {
+    fail(`${context} gaze anchor must stay on or behind the sphere center plane`)
   }
-  const anchorHorizontalFromCenter = dot(anchorFromCenter, parsed.horizontalAxisHeadLocal)
-  const anchorVerticalFromCenter = dot(anchorFromCenter, parsed.verticalAxisHeadLocal)
   if (
-    Math.abs(anchorHorizontalFromCenter) > EPSILON ||
-    Math.abs(anchorVerticalFromCenter) > EPSILON
+    Math.abs(dot(anchorFromCenter, parsed.horizontalAxisHeadLocal)) > EPSILON ||
+    Math.abs(dot(anchorFromCenter, parsed.verticalAxisHeadLocal)) > EPSILON
   ) {
-    fail(`${context} gaze anchor must stay centered behind the virtual carrier`)
+    fail(`${context} gaze anchor must stay centered behind the physical eye`)
   }
   return parsed
 }
 
-export function parseSocketEyeSurfaceDefinition(value: unknown): SocketEyeSurfaceDefinitionV1 {
+export function parseSocketEyeSurfaceDefinition(value: unknown): SocketEyeSurfaceDefinitionV2 {
   const source = record(value, 'definition')
   rejectUnknownKeys(
     source,
@@ -473,42 +360,29 @@ export function parseSocketEyeSurfaceDefinition(value: unknown): SocketEyeSurfac
   if (source.schemaVersion !== SOCKET_EYE_SURFACE_SCHEMA_VERSION) {
     fail(`schemaVersion must be ${SOCKET_EYE_SURFACE_SCHEMA_VERSION}`)
   }
-  const definitionSha256 = stringValue(source.definitionSha256, 'definition.definitionSha256')
-  if (!HASH_PATTERN.test(definitionSha256)) {
-    fail('definition.definitionSha256 must be lowercase SHA-256')
-  }
-  if (source.coordinateSpace !== 'head-local') {
-    fail('definition.coordinateSpace must be head-local')
-  }
-  if (source.surfaceKind !== 'aperture-following-composite-cap') {
-    fail('definition.surfaceKind must be aperture-following-composite-cap')
-  }
+  const definitionSha256 = sha256(source.definitionSha256, 'definition.definitionSha256')
+  literal(source.coordinateSpace, 'head-local', 'definition.coordinateSpace')
+  literal(source.surfaceKind, 'static-full-sphere', 'definition.surfaceKind')
 
   const rendering = record(source.rendering, 'definition.rendering')
   rejectUnknownKeys(
     rendering,
     [
-      'meshOwnsApertureMask',
-      'visibleFrontDepthTest',
-      'visibleFrontDepthWrite',
-      'visibleFrontSide',
+      'eyelidsOwnApertureOcclusion',
+      'sphereDepthTest',
+      'sphereDepthWrite',
+      'sphereSide',
       'renderOrder',
       'requiredMaxTextureArrayLayers'
     ],
     'definition.rendering'
   )
-
   const artwork = record(source.artwork, 'definition.artwork')
   rejectUnknownKeys(artwork, ['scleraOverlay'], 'definition.artwork')
   const scleraOverlay = record(artwork.scleraOverlay, 'definition.artwork.scleraOverlay')
   rejectUnknownKeys(
     scleraOverlay,
-    [
-      'gazeLinked',
-      'transparentRgba',
-      'minimumOverscanHorizontal',
-      'minimumOverscanVertical'
-    ],
+    ['projection', 'transparentRgba', 'rearPresentation', 'gazeLinked'],
     'definition.artwork.scleraOverlay'
   )
 
@@ -516,76 +390,30 @@ export function parseSocketEyeSurfaceDefinition(value: unknown): SocketEyeSurfac
   rejectUnknownKeys(runtimeBindings, ['left', 'right'], 'definition.runtimeBindings')
   const left = parseSide(runtimeBindings.left, 'left', 'definition.runtimeBindings.left')
   const right = parseSide(runtimeBindings.right, 'right', 'definition.runtimeBindings.right')
-
-  const overlay = {
-    gazeLinked: literal(
-      scleraOverlay.gazeLinked,
-      true,
-      'definition.artwork.scleraOverlay.gazeLinked'
-    ),
-    transparentRgba: literal(
-      scleraOverlay.transparentRgba,
-      true,
-      'definition.artwork.scleraOverlay.transparentRgba'
-    ),
-    minimumOverscanHorizontal: unitInterval(
-      scleraOverlay.minimumOverscanHorizontal,
-      'definition.artwork.scleraOverlay.minimumOverscanHorizontal'
-    ),
-    minimumOverscanVertical: unitInterval(
-      scleraOverlay.minimumOverscanVertical,
-      'definition.artwork.scleraOverlay.minimumOverscanVertical'
-    )
-  }
-  const maximumHorizontal = Math.max(left.gaze.maximumHorizontal, right.gaze.maximumHorizontal)
-  const maximumVertical = Math.max(left.gaze.maximumVertical, right.gaze.maximumVertical)
-  if (overlay.minimumOverscanHorizontal <= maximumHorizontal) {
-    fail('sclera artwork horizontal overscan must exceed every safe gaze endpoint')
-  }
-  if (overlay.minimumOverscanVertical <= maximumVertical) {
-    fail('sclera artwork vertical overscan must exceed every safe gaze endpoint')
-  }
-
-  if (left.nodes.compositeCap === right.nodes.compositeCap) {
-    fail('left/right composite-cap nodes must be unique')
+  if (left.nodes.physicalEye === right.nodes.physicalEye) {
+    fail('left/right physical-eye nodes must be unique')
   }
 
   return {
     schemaVersion: SOCKET_EYE_SURFACE_SCHEMA_VERSION,
     definitionSha256,
     status: literal(source.status, 'product-export-approved', 'definition.status'),
-    productExportApproved: literal(
-      source.productExportApproved,
-      true,
-      'definition.productExportApproved'
-    ),
+    productExportApproved: literal(source.productExportApproved, true, 'definition.productExportApproved'),
     coordinateSpace: 'head-local',
-    surfaceKind: 'aperture-following-composite-cap',
+    surfaceKind: 'static-full-sphere',
     compositeLayers: compositeLayers(source.compositeLayers),
     rendering: {
-      meshOwnsApertureMask: literal(
-        rendering.meshOwnsApertureMask,
+      eyelidsOwnApertureOcclusion: literal(
+        rendering.eyelidsOwnApertureOcclusion,
         true,
-        'definition.rendering.meshOwnsApertureMask'
+        'definition.rendering.eyelidsOwnApertureOcclusion'
       ),
-      visibleFrontDepthTest: literal(
-        rendering.visibleFrontDepthTest,
-        true,
-        'definition.rendering.visibleFrontDepthTest'
-      ),
-      visibleFrontDepthWrite: literal(
-        rendering.visibleFrontDepthWrite,
-        true,
-        'definition.rendering.visibleFrontDepthWrite'
-      ),
-      visibleFrontSide: literal(
-        rendering.visibleFrontSide,
-        'front',
-        'definition.rendering.visibleFrontSide'
-      ),
+      sphereDepthTest: literal(rendering.sphereDepthTest, true, 'definition.rendering.sphereDepthTest'),
+      sphereDepthWrite: literal(rendering.sphereDepthWrite, true, 'definition.rendering.sphereDepthWrite'),
+      sphereSide: literal(rendering.sphereSide, 'front', 'definition.rendering.sphereSide'),
       renderOrder: literal(
         rendering.renderOrder,
-        'after-face-before-liner',
+        'after-face-before-treatment',
         'definition.rendering.renderOrder'
       ),
       requiredMaxTextureArrayLayers: positiveInteger(
@@ -593,7 +421,30 @@ export function parseSocketEyeSurfaceDefinition(value: unknown): SocketEyeSurfac
         'definition.rendering.requiredMaxTextureArrayLayers'
       )
     },
-    artwork: { scleraOverlay: overlay },
+    artwork: {
+      scleraOverlay: {
+        projection: literal(
+          scleraOverlay.projection,
+          'front-hemisphere-only/v1',
+          'definition.artwork.scleraOverlay.projection'
+        ),
+        transparentRgba: literal(
+          scleraOverlay.transparentRgba,
+          true,
+          'definition.artwork.scleraOverlay.transparentRgba'
+        ),
+        rearPresentation: literal(
+          scleraOverlay.rearPresentation,
+          'stable-neutral-base',
+          'definition.artwork.scleraOverlay.rearPresentation'
+        ),
+        gazeLinked: literal(
+          scleraOverlay.gazeLinked,
+          false,
+          'definition.artwork.scleraOverlay.gazeLinked'
+        )
+      }
+    },
     runtimeBindings: { left, right }
   }
 }
@@ -605,28 +456,26 @@ function smoothstep(edge0: number, edge1: number, value: number) {
 }
 
 function surfacePoint(
-  side: SocketEyeSurfaceSideDefinition,
+  side: SocketEyeSurfaceSideDefinitionV2,
   horizontal: number,
   vertical: number
 ): SocketEyeVec3 {
   const radialSquared = horizontal * horizontal + vertical * vertical
-  if (radialSquared > 1 + EPSILON) fail('resolved eye coordinate left the carrier domain')
-  const depth =
-    side.cap.carrierDepthRadiusMeters * Math.sqrt(Math.max(0, 1 - radialSquared))
+  if (radialSquared > 1 + EPSILON) fail('resolved eye coordinate left the sphere domain')
+  const radius = side.sphere.radiusMeters
+  const depth = radius * Math.sqrt(Math.max(0, 1 - radialSquared))
   return add(
     add(
-      add(
-        side.surfaceCenterHeadLocal,
-        scale(side.horizontalAxisHeadLocal, horizontal * side.cap.carrierHalfWidthMeters)
-      ),
-      scale(side.verticalAxisHeadLocal, vertical * side.cap.carrierHalfHeightMeters)
+      add(side.surfaceCenterHeadLocal, scale(side.horizontalAxisHeadLocal, horizontal * radius)),
+      scale(side.verticalAxisHeadLocal, vertical * radius)
     ),
     scale(side.forwardAxisHeadLocal, depth)
   )
 }
 
+/** Preserve the accepted gaze/contact law on the real static physical sphere. */
 export function projectTargetToSocketEyeSurface(
-  side: SocketEyeSurfaceSideDefinition,
+  side: SocketEyeSurfaceSideDefinitionV2,
   targetHeadLocal: SocketEyeVec3
 ): SocketEyeSurfaceProjection {
   const target = vec3(targetHeadLocal, 'targetHeadLocal')
@@ -637,44 +486,31 @@ export function projectTargetToSocketEyeSurface(
   const dx = dot(direction, side.horizontalAxisHeadLocal)
   const dy = dot(direction, side.verticalAxisHeadLocal)
   const dz = dot(direction, side.forwardAxisHeadLocal)
-  if (dz <= EPSILON) fail('targetHeadLocal must be in front of the eye surface')
+  if (dz <= EPSILON) fail('targetHeadLocal must be in front of the physical eye')
 
   const anchorFromCenter = subtract(side.gazeAnchorHeadLocal, side.surfaceCenterHeadLocal)
   const ax = dot(anchorFromCenter, side.horizontalAxisHeadLocal)
   const ay = dot(anchorFromCenter, side.verticalAxisHeadLocal)
   const az = dot(anchorFromCenter, side.forwardAxisHeadLocal)
-  const width = side.cap.carrierHalfWidthMeters
-  const height = side.cap.carrierHalfHeightMeters
-  const depth = side.cap.carrierDepthRadiusMeters
-  const quadratic =
-    (dx * dx) / (width * width) +
-    (dy * dy) / (height * height) +
-    (dz * dz) / (depth * depth)
-  const linear =
-    2 *
-    ((ax * dx) / (width * width) +
-      (ay * dy) / (height * height) +
-      (az * dz) / (depth * depth))
-  const constant =
-    (ax * ax) / (width * width) +
-    (ay * ay) / (height * height) +
-    (az * az) / (depth * depth) -
-    1
+  const radius = side.sphere.radiusMeters
+  const quadratic = (dx * dx + dy * dy + dz * dz) / (radius * radius)
+  const linear = (2 * (ax * dx + ay * dy + az * dz)) / (radius * radius)
+  const constant = (ax * ax + ay * ay + az * az) / (radius * radius) - 1
   const discriminant = linear * linear - 4 * quadratic * constant
-  if (discriminant < 0) fail('target ray does not intersect the eye carrier')
+  if (discriminant < 0) fail('target ray does not intersect the physical eye sphere')
   const root = Math.sqrt(discriminant)
   const candidates = [
     (-linear - root) / (2 * quadratic),
     (-linear + root) / (2 * quadratic)
   ].filter((candidate) => candidate > EPSILON && az + candidate * dz >= -EPSILON)
-  if (candidates.length === 0) fail('target ray intersects only outside the front eye carrier')
+  if (candidates.length === 0) fail('target ray intersects only the rear eye hemisphere')
   const distanceAlongRay = Math.min(...candidates)
   if (!Number.isFinite(distanceAlongRay) || distanceAlongRay <= EPSILON) {
-    fail('target ray produced an invalid eye-carrier intersection')
+    fail('target ray produced an invalid eye-sphere intersection')
   }
 
-  const requestedHorizontal = (ax + distanceAlongRay * dx) / width
-  const requestedVertical = (ay + distanceAlongRay * dy) / height
+  const requestedHorizontal = (ax + distanceAlongRay * dx) / radius
+  const requestedVertical = (ay + distanceAlongRay * dy) / radius
   const safeDomainRadius = Math.sqrt(
     (requestedHorizontal * requestedHorizontal) /
       (side.gaze.maximumHorizontal * side.gaze.maximumHorizontal) +

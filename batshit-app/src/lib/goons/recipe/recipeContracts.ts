@@ -407,6 +407,14 @@ function parseSiblingState(
   };
 }
 
+export function parseRecipeSiblingStateRecord(
+  value: unknown,
+  context = "recipe sibling state",
+): RecipeSiblingStateRecord {
+  canonicalRecipeString(value);
+  return parseSiblingState(value, context);
+}
+
 function parseRecipeState(
   value: unknown,
   context: string,

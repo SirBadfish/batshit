@@ -45,6 +45,7 @@ import {
 import { duplicateRecipeGoon } from '../goonRecipeDuplicationService.server'
 import {
   analyzeRecipePackageUpdate,
+  buildExternalRecipeSiblingInputs,
   bootstrapRecipeV2,
   discardRecipeJob,
   recoverInterruptedRecipeJob,
@@ -167,6 +168,82 @@ async function migrationReport(plan: RecipeMigrationPlan, edge: Awaited<ReturnTy
 
 describe('Goon Recipe lifecycle service', () => {
   useRedisTestServer()
+
+  it('proposes an explicit current-head successor for stale built-in Hair without changing its state id', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture()
+    const hairBytes = createRigidHairGlbFixture()
+    const sourceAsset = await createHairAssetFixture({
+      recipeSource: fixture.source.recipeSource,
+      mainBytes: hairBytes,
+      headNode: 'HeadAnchor',
+      sourceClass: 'builtin'
+    })
+    const targetAsset = await createHairAssetFixture({
+      recipeSource: fixture.target.recipeSource,
+      mainBytes: hairBytes,
+      headNode: 'HeadAnchor',
+      sourceClass: 'builtin'
+    })
+    const sourceHairState = createHairState(sourceAsset, {
+      baseColor: '#142536',
+      highlightColor: '#abcdef'
+    })
+    const targetHairState = createHairState(targetAsset, {
+      baseColor: sourceHairState.baseColor,
+      highlightColor: sourceHairState.highlightColor
+    })
+    const sourceState = structuredClone(fixture.sourceState)
+    sourceState.siblings.push({
+      id: 'hairState',
+      contract: sourceHairState.schemaVersion,
+      definitionSha256: sourceHairState.definitionSha256!,
+      stateSha256: await recipeSiblingStateSha256(sourceHairState),
+      state: sourceHairState
+    })
+    sourceState.siblings.sort((left, right) => left.id.localeCompare(right.id))
+    sourceState.stateSha256 = await recipeStateSnapshotSha256(sourceState)
+
+    const bindings = await buildExternalRecipeSiblingInputs({
+      userId: USER_ID,
+      state: sourceState,
+      source: fixture.source.recipeSource,
+      target: fixture.target.recipeSource,
+      sourceManifest: fixture.source.avatarManifest,
+      targetManifest: fixture.target.avatarManifest,
+      resolveAsset: async () => sourceAsset,
+      migrateBuiltinState: async () => ({
+        status: 'migrated',
+        state: targetHairState,
+        sourceAsset,
+        targetAsset,
+        path: []
+      })
+    })
+
+    const binding = bindings.find((entry) => entry.sourceStateId === 'hairState')
+    expect(binding).toMatchObject({
+      sourceStateId: 'hairState',
+      targetStateId: 'hairState',
+      targetState: {
+        id: 'hairState',
+        contract: 'hair-state/v2',
+        definitionSha256: targetHairState.definitionSha256,
+        state: {
+          selected: {
+            assetRevisionSha256: targetAsset.revisionSha256,
+            fitSha256: targetAsset.attachment.fitReceipt.fitSha256
+          },
+          baseColor: sourceHairState.baseColor,
+          highlightColor: sourceHairState.highlightColor,
+          motionSettings: null
+        }
+      }
+    })
+    expect(binding?.targetState.stateSha256).toBe(
+      await recipeSiblingStateSha256(targetHairState)
+    )
+    expect(binding?.validationSha256).toMatch(/^[a-f0-9]{64}$/)
+  })
 
   it.runIf(REAL_REDIS_LANE)(
     'resets only retired Hair state while preserving the Goon and every unrelated Recipe surface',
@@ -573,13 +650,26 @@ describe('Goon Recipe lifecycle service', () => {
       }, { readAsset })
       expect(reviewed.reviewedState?.state.siblings.some((entry) => entry.id === 'anatomy-fit'))
         .toBe(false)
+      const replayedReview = await reviewRecipePackageState({
+        userId: USER_ID,
+        goonId: GOON_ID,
+        expectedWriteVersion: reviewed.owner.writeVersion,
+        analysisId: reviewed.pendingAnalysis.analysisId,
+        state: submittedState,
+        confirmedControlIds: [],
+        cleanResetConfirmed: false
+      }, { readAsset })
+      expect(replayedReview.owner.writeVersion).toBe(reviewed.owner.writeVersion)
+      expect(replayedReview.pendingAnalysis.reviewedState).toEqual(
+        reviewed.pendingAnalysis.reviewedState
+      )
 
       const started = await startRecipePackageUpdate({
         userId: USER_ID,
         goonId: GOON_ID,
-        expectedWriteVersion: reviewed.owner.writeVersion,
+        expectedWriteVersion: replayedReview.owner.writeVersion,
         idempotencyKey: 'fixture-update-1',
-        analysisId: reviewed.pendingAnalysis.analysisId
+        analysisId: replayedReview.pendingAnalysis.analysisId
       }, {
         readAsset,
         now: () => new Date('2026-07-17T00:00:00.000Z'),
@@ -913,6 +1003,67 @@ describe('Goon Recipe lifecycle service', () => {
         authoringRevision: { state: rebakeState }
       })
       expect(rebakeStarted.goon.customAvatar).toEqual(liveBeforeRebake)
+
+      const corruptStoredGoon = structuredClone(rebakeStarted.goon)
+      const corruptOwner = (corruptStoredGoon.recipe as any)
+      corruptOwner.authoringRevision.state.appearanceDials.values.keep_control = 238 / 255
+      corruptOwner.authoringRevision.state.stateSha256 = ZERO_SHA256
+      corruptOwner.authoringRevision.state.stateSha256 = await recipeStateSnapshotSha256(
+        corruptOwner.authoringRevision.state
+      )
+      corruptOwner.authoringRevision.revisionSha256 = ZERO_SHA256
+      corruptOwner.authoringRevision.revisionSha256 = await recipeAuthoringRevisionSha256(
+        corruptOwner.authoringRevision
+      )
+      const corruptStoredJob = structuredClone(rebakeStarted.job)
+      corruptStoredJob.lease = {
+        ...corruptStoredJob.lease!,
+        expiresAt: '2026-07-17T00:00:12.500Z'
+      }
+      await redis.json.set(`goon:${GOON_ID}`, '$', corruptStoredGoon)
+      await redis.json.set(
+        recipeJobRedisKey(USER_ID, GOON_ID, corruptStoredJob.jobId),
+        '$',
+        corruptStoredJob
+      )
+      const integrityRecovered = await recoverInterruptedRecipeJob(
+        {
+          userId: USER_ID,
+          goonId: GOON_ID,
+          jobId: corruptStoredJob.jobId
+        },
+        { now: () => new Date('2026-07-17T00:00:13.000Z') }
+      )
+      const activeBeforeRecovery = await getRecipeRevisionEnvelope(
+        USER_ID,
+        GOON_ID,
+        activeBeforeRebake.ref.split(':').pop()!
+      )
+      expect(integrityRecovered).toMatchObject({
+        recovered: true,
+        job: {
+          status: 'failed',
+          failure: {
+            stage: 'restart',
+            reason: expect.stringContaining('restored the last verified active revision')
+          }
+        },
+        goon: {
+          recipe: {
+            liveStatus: 'failed',
+            activeRevision: activeBeforeRebake,
+            authoringRevision: { state: activeBeforeRecovery.revision.state }
+          },
+          customAvatar: liveBeforeRebake
+        }
+      })
+
+      await redis.json.set(`goon:${GOON_ID}`, '$', rebakeStarted.goon)
+      await redis.json.set(
+        recipeJobRedisKey(USER_ID, GOON_ID, rebakeStarted.job.jobId),
+        '$',
+        rebakeStarted.job
+      )
       const rebakeFailed = await failRecipeJob({
         userId: USER_ID,
         goonId: GOON_ID,

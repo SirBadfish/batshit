@@ -676,7 +676,7 @@ function parsePendingAnalysis(value: unknown): RecipePendingAnalysisV2 {
     analysisRef: parseDocumentRef(
       raw.analysisRef,
       "Recipe owner.pendingAnalysis.analysisRef",
-      "recipe-update-analysis-context/v1",
+      "recipe-update-analysis-context/v3",
     ),
     basePlan: parseDocumentRef(
       raw.basePlan,

@@ -11,8 +11,16 @@ import {
   type HairAssetFileRefV1,
   type HairRefitSourceV1,
   type HairAssetSelectionV1,
-  type HairAssetV1
+  type HairAssetV1,
+  type HairStateV2
 } from '$lib/goons/hairAssets'
+import {
+  listCurrentHairBuiltinAssets,
+  migrateHairBuiltinStateToCurrent,
+  parseHairBuiltinCatalog,
+  type HairBuiltinCatalogV2,
+  type HairBuiltinStateMigration
+} from '$lib/goons/hairBuiltinCatalog'
 import { canonicalRecipeString, sha256Hex } from '$lib/goons/recipe/recipeCanonical'
 import { redis } from '$lib/server/redis'
 
@@ -25,7 +33,6 @@ import {
   hairImportJobRedisKey
 } from './hairImportJobRepository.server'
 
-const HAIR_CATALOG_CONTRACT = 'hair-catalog/v1' as const
 const USER_HAIR_ASSET_PREFIX = '/uploads/goon_hair_assets/'
 const USER_HAIR_UPLOAD_TYPE = 'goon_hair_assets'
 
@@ -54,11 +61,6 @@ export type HairAssetDependency = {
   redisKey: string
   assetId: string
   assetRevisionId: string
-}
-
-type HairCatalog = {
-  schemaVersion: typeof HAIR_CATALOG_CONTRACT
-  assets: HairAssetV1[]
 }
 
 type RepositoryDependencies = {
@@ -180,7 +182,7 @@ redis.call('SREM', KEYS[4], ARGV[7])
 return { 'INSERTED' }
 `
 
-let builtinCatalogPromise: Promise<HairCatalog> | null = null
+let builtinCatalogPromise: Promise<HairBuiltinCatalogV2> | null = null
 
 function stableSegment(value: string, context: string) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)) {
@@ -220,32 +222,18 @@ function parseIndexMember(value: string) {
   }
 }
 
-async function loadBuiltinCatalog(): Promise<HairCatalog> {
+export async function loadHairBuiltinCatalog(): Promise<HairBuiltinCatalogV2> {
   if (!builtinCatalogPromise) {
     builtinCatalogPromise = (async () => {
-      const path = resolve(process.cwd(), 'static/goon-assets/hair/v1/catalog.json')
-      const raw = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
-      if (
-        raw.schemaVersion !== HAIR_CATALOG_CONTRACT ||
-        !Array.isArray(raw.assets) ||
-        Object.keys(raw).sort().join(',') !== 'assets,schemaVersion'
-      ) {
-        throw new Error(`[${HAIR_CATALOG_CONTRACT}] built-in catalog is invalid`)
-      }
-      const assets = await Promise.all(raw.assets.map((asset) => verifyHairAsset(asset)))
-      if (assets.some((asset) => asset.sourceClass !== 'builtin')) {
-        throw new Error(`[${HAIR_CATALOG_CONTRACT}] built-in catalog contains a non-built-in asset`)
-      }
+      const path = resolve(process.cwd(), 'static/goon-assets/hair/v2/catalog.json')
+      const raw = JSON.parse(await readFile(path, 'utf8')) as unknown
+      const catalog = await parseHairBuiltinCatalog(raw)
       await Promise.all(
-        assets.flatMap((asset) =>
+        catalog.assets.flatMap((asset) =>
           collectHairAssetFileRefs(asset).map((ref) => readHairAssetFileBytes(asset, ref))
         )
       )
-      const identities = assets.map((asset) => indexMember(asset.assetId, asset.revisionId))
-      if (new Set(identities).size !== identities.length) {
-        throw new Error(`[${HAIR_CATALOG_CONTRACT}] built-in catalog contains duplicate revisions`)
-      }
-      return { schemaVersion: HAIR_CATALOG_CONTRACT, assets }
+      return catalog
     })().catch((error) => {
       builtinCatalogPromise = null
       throw error
@@ -264,7 +252,28 @@ async function builtins(dependencies: RepositoryDependencies): Promise<HairAsset
     }
     return assets
   }
-  return (await loadBuiltinCatalog()).assets
+  return listCurrentHairBuiltinAssets(await loadHairBuiltinCatalog())
+}
+
+async function builtinRevisionHistory(
+  dependencies: RepositoryDependencies
+): Promise<HairAssetV1[]> {
+  if (dependencies.builtinAssets) {
+    const assets = await Promise.all(
+      dependencies.builtinAssets.map((asset) => verifyHairAsset(asset))
+    )
+    if (assets.some((asset) => asset.sourceClass !== 'builtin')) {
+      throw new Error('Injected built-in Hair Asset inventory contains a user asset.')
+    }
+    return assets
+  }
+  return (await loadHairBuiltinCatalog()).assets
+}
+
+export async function migrateSavedHairBuiltinState(
+  state: HairStateV2
+): Promise<HairBuiltinStateMigration> {
+  return migrateHairBuiltinStateToCurrent(state, await loadHairBuiltinCatalog())
 }
 
 async function listUserAssetsForClient(
@@ -317,7 +326,7 @@ export async function resolveHairAssetRevision(
   selection: Pick<HairAssetSelectionV1, 'assetId' | 'assetRevisionId' | 'assetRevisionSha256'>,
   dependencies: RepositoryDependencies = {}
 ): Promise<HairAssetV1> {
-  const builtin = (await builtins(dependencies)).find(
+  const builtin = (await builtinRevisionHistory(dependencies)).find(
     (asset) => asset.assetId === selection.assetId && asset.revisionId === selection.assetRevisionId
   )
   if (builtin) {
@@ -499,7 +508,9 @@ export async function putUserHairAssetRevision(
       400
     )
   }
-  const builtinCollision = (await builtins({})).some((entry) => entry.assetId === asset.assetId)
+  const builtinCollision = (await builtinRevisionHistory({})).some(
+    (entry) => entry.assetId === asset.assetId
+  )
   if (builtinCollision) {
     throw new HairAssetRepositoryError(
       'BUILTIN_COLLISION',

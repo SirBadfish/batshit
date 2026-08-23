@@ -29,6 +29,7 @@
     saveRecipeDraftIfNeeded: () => Promise<boolean>
   } | null>(null)
   let lastSaveResult = $state<string>('not-run')
+  let previewSide = $state<string>('none')
 
   function mutateNestedDial() {
     draft.values.affine_control = (draft.values.affine_control ?? 0) + 0.1
@@ -59,6 +60,7 @@
 {/if}
 <button onclick={saveGoon}>Save Goon</button>
 <span data-testid="save-result">{lastSaveResult}</span>
+<span data-testid="recipe-preview-side">{previewSide}</span>
 
 <RecipeWorkflowController
   bind:this={controller}
@@ -76,7 +78,7 @@
   onSaveEditorDraft={async () => true}
   onDiscardEditorDraft={discardDraft}
   onRecipeGoonChanged={(next) => { activeGoon = structuredClone(next) }}
-  onPreviewTargetChange={() => {}}
+  onPreviewTargetChange={(target) => { previewSide = target?.side ?? 'none' }}
   onPreviewLiveCandidate={async () => {}}
   {autoPrepare}
 />

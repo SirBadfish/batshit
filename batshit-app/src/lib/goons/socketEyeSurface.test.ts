@@ -1,264 +1,139 @@
 import { describe, expect, it } from 'vitest'
-
 import {
   parseSocketEyeSurfaceDefinition,
-  projectTargetToSocketEyeSurface,
-  type SocketEyeSurfaceDefinitionV1
+  projectTargetToSocketEyeSurface
 } from './socketEyeSurface'
 
-function definitionFixture(): unknown {
-  const side = (name: 'left' | 'right', x: number) => ({
-    side: name,
-    nodes: {
-      compositeCap: `${name}-composite-cap`
-    },
-    apertureSeamDefinitionSha256: 'b'.repeat(64),
-    gazeAnchorHeadLocal: [x, 0, 0] as [number, number, number],
-    surfaceCenterHeadLocal: [x, 0, 0] as [number, number, number],
-    horizontalAxisHeadLocal: [1, 0, 0] as [number, number, number],
-    verticalAxisHeadLocal: [0, 1, 0] as [number, number, number],
-    forwardAxisHeadLocal: [0, 0, 1] as [number, number, number],
-    cap: {
-      frontGeometryLaw: 'aperture-normalized-shallow-patch/v1',
-      frontDepthRatio: 0.08,
-      maximumFrontDepthMeters: 0.0008,
-      artworkProjection: 'deformed-surface-meters/v1',
-      carrierHalfWidthMeters: 0.016,
-      carrierHalfHeightMeters: 0.012,
-      carrierDepthRadiusMeters: 0.014,
-      rearClosureDepthMeters: 0.004,
-      minimumHiddenUnderlapMeters: 0.002,
-      visibleFrontFaceGroup: `${name}-visible-front`,
-      hiddenClosureFaceGroup: `${name}-hidden-closure`,
-      primitiveFollowerMorphs: {
-        visibleFront: [
-          `eyeBlink${name === 'left' ? 'Left' : 'Right'}`,
-          `eyeSquint${name === 'left' ? 'Left' : 'Right'}`,
-          `eyeWide${name === 'left' ? 'Left' : 'Right'}`
-        ],
-        hiddenClosure: [
-          `eyeBlink${name === 'left' ? 'Left' : 'Right'}`,
-          `eyeSquint${name === 'left' ? 'Left' : 'Right'}`,
-          `eyeWide${name === 'left' ? 'Left' : 'Right'}`
-        ]
-      },
-      apertureFollowing: true,
-      closedManifold: true
-    },
-    gaze: {
-      maximumHorizontal: 0.58,
-      maximumVertical: 0.45,
-      headFollowStart: 0.72
-    }
-  })
+const HASH = {
+  surface: 'a'.repeat(64),
+  seam: 'b'.repeat(64)
+}
+
+function side(side: 'left' | 'right') {
+  const x = side === 'left' ? -0.03 : 0.03
   return {
-    schemaVersion: 'socket-eye-surface/v1',
-    definitionSha256: 'a'.repeat(64),
+    side,
+    nodes: { physicalEye: `physical_eye_${side}` },
+    apertureSeamDefinitionSha256: HASH.seam,
+    gazeAnchorHeadLocal: [x, 0, -0.02],
+    surfaceCenterHeadLocal: [x, 0, 0],
+    horizontalAxisHeadLocal: [1, 0, 0],
+    verticalAxisHeadLocal: [0, 1, 0],
+    forwardAxisHeadLocal: [0, 0, 1],
+    sphere: {
+      geometryLaw: 'static-full-sphere/v1',
+      radiusMeters: 0.012,
+      artworkProjection: 'front-hemisphere-uv/v1',
+      stableNeutralRear: true,
+      surfaceMorphTargets: [],
+      physicalFit: {
+        mode: 'transform-only/v1',
+        translation: true,
+        rotation: true,
+        uniformScale: true,
+        nonUniformScale: false
+      }
+    },
+    gaze: { maximumHorizontal: 0.35, maximumVertical: 0.28, headFollowStart: 0.75 }
+  }
+}
+
+function fixture() {
+  return {
+    schemaVersion: 'socket-eye-surface/v2',
+    definitionSha256: HASH.surface,
     status: 'product-export-approved',
     productExportApproved: true,
     coordinateSpace: 'head-local',
-    surfaceKind: 'aperture-following-composite-cap',
+    surfaceKind: 'static-full-sphere',
     compositeLayers: ['sclera', 'scleraArtwork', 'iris', 'pupil', 'highlight', 'cornea'],
     rendering: {
-      meshOwnsApertureMask: true,
-      visibleFrontDepthTest: true,
-      visibleFrontDepthWrite: true,
-      visibleFrontSide: 'front',
-      renderOrder: 'after-face-before-liner',
+      eyelidsOwnApertureOcclusion: true,
+      sphereDepthTest: true,
+      sphereDepthWrite: true,
+      sphereSide: 'front',
+      renderOrder: 'after-face-before-treatment',
       requiredMaxTextureArrayLayers: 501
     },
     artwork: {
       scleraOverlay: {
-        gazeLinked: true,
+        projection: 'front-hemisphere-only/v1',
         transparentRgba: true,
-        minimumOverscanHorizontal: 0.8,
-        minimumOverscanVertical: 0.75
+        rearPresentation: 'stable-neutral-base',
+        gazeLinked: false
       }
     },
-    runtimeBindings: {
-      left: side('left', 0.03),
-      right: side('right', -0.03)
-    }
+    runtimeBindings: { left: side('left'), right: side('right') }
   }
 }
 
-function parsedDefinition() {
-  return parseSocketEyeSurfaceDefinition(definitionFixture())
-}
-
-describe('socket-eye-surface/v1', () => {
-  it('parses a strict bilateral aperture-following composite-cap contract', () => {
-    const definition = parsedDefinition()
-
-    expect(definition.surfaceKind).toBe('aperture-following-composite-cap')
-    expect(definition.runtimeBindings.left.cap.closedManifold).toBe(true)
-    expect(definition.runtimeBindings.left.cap.apertureFollowing).toBe(true)
-    expect(definition.rendering.renderOrder).toBe('after-face-before-liner')
-    expect(definition.rendering.visibleFrontDepthTest).toBe(true)
-    expect(definition.rendering.requiredMaxTextureArrayLayers).toBe(501)
-    expect(definition.coordinateSpace).toBe('head-local')
-    expect(definition.productExportApproved).toBe(true)
-    expect(definition.runtimeBindings.right.gazeAnchorHeadLocal).toEqual([-0.03, 0, 0])
-    expect(definition.artwork.scleraOverlay.gazeLinked).toBe(true)
+describe('socket-eye-surface/v2', () => {
+  it('parses a strict bilateral zero-morph static-sphere contract', () => {
+    const definition = parseSocketEyeSurfaceDefinition(fixture())
+    expect(definition.surfaceKind).toBe('static-full-sphere')
+    expect(definition.runtimeBindings.left.nodes.physicalEye).toBe('physical_eye_left')
+    expect(definition.runtimeBindings.left.sphere).toMatchObject({
+      artworkProjection: 'front-hemisphere-uv/v1',
+      stableNeutralRear: true,
+      surfaceMorphTargets: [],
+      physicalFit: { mode: 'transform-only/v1', nonUniformScale: false }
+    })
+    expect(definition.artwork.scleraOverlay).toEqual({
+      projection: 'front-hemisphere-only/v1',
+      transparentRgba: true,
+      rearPresentation: 'stable-neutral-base',
+      gazeLinked: false
+    })
   })
 
-  it('requires an exact positive integer renderer texture-array capacity', () => {
-    for (const value of [0, 501.5]) {
-      const fixture = definitionFixture() as any
-      fixture.rendering.requiredMaxTextureArrayLayers = value
-      expect(() => parseSocketEyeSurfaceDefinition(fixture)).toThrow(
-        /requiredMaxTextureArrayLayers/
-      )
+  it('rejects the retired cap contract and any physical-eye morph target', () => {
+    const retired = fixture() as any
+    retired.schemaVersion = 'socket-eye-surface/v1'
+    expect(() => parseSocketEyeSurfaceDefinition(retired)).toThrow(/socket-eye-surface\/v2/)
+
+    const deformed = fixture() as any
+    deformed.runtimeBindings.left.sphere.surfaceMorphTargets = ['eyeBlinkLeft']
+    expect(() => parseSocketEyeSurfaceDefinition(deformed)).toThrow(/physical eye is static/)
+  })
+
+  it('rejects non-transform fitting, rear artwork, and non-uniform scale', () => {
+    for (const mutate of [
+      (value: any) => (value.runtimeBindings.left.sphere.physicalFit.mode = 'morph-followers/v1'),
+      (value: any) => (value.artwork.scleraOverlay.gazeLinked = true),
+      (value: any) => (value.runtimeBindings.left.sphere.physicalFit.nonUniformScale = true)
+    ]) {
+      const value = fixture() as any
+      mutate(value)
+      expect(() => parseSocketEyeSurfaceDefinition(value)).toThrow()
     }
   })
 
-  it('derives automatic near-target convergence from one shared target', () => {
-    const definition = parsedDefinition()
-    const farLeft = projectTargetToSocketEyeSurface(
-      definition.runtimeBindings.left,
-      [0, 0, 1]
-    )
-    const farRight = projectTargetToSocketEyeSurface(
-      definition.runtimeBindings.right,
-      [0, 0, 1]
-    )
-    const nearLeft = projectTargetToSocketEyeSurface(
-      definition.runtimeBindings.left,
-      [0, 0, 0.25]
-    )
-    const nearRight = projectTargetToSocketEyeSurface(
-      definition.runtimeBindings.right,
-      [0, 0, 0.25]
-    )
-
-    expect(farLeft.resolved.horizontal).toBeLessThan(0)
-    expect(farRight.resolved.horizontal).toBeGreaterThan(0)
-    expect(farLeft.resolved.horizontal).toBeCloseTo(-farRight.resolved.horizontal, 10)
-    expect(Math.abs(nearLeft.resolved.horizontal)).toBeGreaterThan(
-      Math.abs(farLeft.resolved.horizontal)
-    )
-    expect(nearLeft.resolved.horizontal).toBeCloseTo(-nearRight.resolved.horizontal, 10)
+  it('preserves independent physical target projection and near-target convergence', () => {
+    const definition = parseSocketEyeSurfaceDefinition(fixture())
+    const target: [number, number, number] = [0, 0, 0.4]
+    const left = projectTargetToSocketEyeSurface(definition.runtimeBindings.left, target)
+    const right = projectTargetToSocketEyeSurface(definition.runtimeBindings.right, target)
+    expect(left.resolved.horizontal).toBeGreaterThan(0)
+    expect(right.resolved.horizontal).toBeLessThan(0)
+    expect(left.surfacePointHeadLocal[2]).toBeGreaterThan(0)
+    expect(right.surfacePointHeadLocal[2]).toBeGreaterThan(0)
   })
 
-  it('projects vertical and horizontal camera movement onto the cap without moving its base', () => {
-    const definition = parsedDefinition()
-    const result = projectTargetToSocketEyeSurface(
+  it('clamps gaze to the package ellipse and rejects rear targets', () => {
+    const definition = parseSocketEyeSurfaceDefinition(fixture())
+    const projected = projectTargetToSocketEyeSurface(
       definition.runtimeBindings.left,
-      [0.15, 0.08, 0.8]
+      [0.02, 0, 0.1]
     )
-
-    expect(result.requested.horizontal).toBeGreaterThan(0)
-    expect(result.requested.vertical).toBeGreaterThan(0)
-    expect(result.clamped).toBe(false)
-    expect(result.surfacePointHeadLocal[2]).toBeGreaterThan(
-      definition.runtimeBindings.left.surfaceCenterHeadLocal[2]
-    )
-  })
-
-  it('clamps to the elliptical safe domain and reports head-follow pressure', () => {
-    const definition = parsedDefinition()
-    const result = projectTargetToSocketEyeSurface(
-      definition.runtimeBindings.left,
-      [1.5, 0.6, 0.4]
-    )
-    const side = definition.runtimeBindings.left
-    const resolvedRadius = Math.sqrt(
-      (result.resolved.horizontal / side.gaze.maximumHorizontal) ** 2 +
-        (result.resolved.vertical / side.gaze.maximumVertical) ** 2
-    )
-
-    expect(result.clamped).toBe(true)
-    expect(resolvedRadius).toBeCloseTo(1, 10)
-    expect(result.headFollowPressure).toBe(1)
-  })
-
-  it('rejects targets behind the fixed eye surface', () => {
-    const definition = parsedDefinition()
+    expect(projected.clamped).toBe(true)
+    expect(
+      Math.hypot(
+        projected.resolved.horizontal / definition.runtimeBindings.left.gaze.maximumHorizontal,
+        projected.resolved.vertical / definition.runtimeBindings.left.gaze.maximumVertical
+      )
+    ).toBeCloseTo(1)
     expect(() =>
-      projectTargetToSocketEyeSurface(definition.runtimeBindings.left, [0, 0, -1])
-    ).toThrow(/must be in front/)
-  })
-
-  it('rejects open or static caps, non-orthonormal frames, duplicate nodes, and insufficient artwork overscan', () => {
-    const openCap = definitionFixture() as any
-    openCap.runtimeBindings.left.cap.closedManifold = false
-    expect(() => parseSocketEyeSurfaceDefinition(openCap)).toThrow(/closedManifold must be true/)
-
-    const staticCap = definitionFixture() as any
-    staticCap.runtimeBindings.left.cap.apertureFollowing = false
-    expect(() => parseSocketEyeSurfaceDefinition(staticCap)).toThrow(/apertureFollowing must be true/)
-
-    const badAxes = definitionFixture() as any
-    badAxes.runtimeBindings.left.verticalAxisHeadLocal = [0.2, 1, 0]
-    expect(() => parseSocketEyeSurfaceDefinition(badAxes)).toThrow(/must be unit length/)
-
-    const duplicate = definitionFixture() as any
-    duplicate.runtimeBindings.right.nodes.compositeCap =
-      duplicate.runtimeBindings.left.nodes.compositeCap
-    expect(() => parseSocketEyeSurfaceDefinition(duplicate)).toThrow(/must be unique/)
-
-    const croppedArtwork = definitionFixture() as any
-    croppedArtwork.artwork.scleraOverlay.minimumOverscanHorizontal = 0.5
-    expect(() => parseSocketEyeSurfaceDefinition(croppedArtwork)).toThrow(
-      /horizontal overscan must exceed/
-    )
-  })
-
-  it('rejects prototype approval, legacy coordinate names, and incomplete primitive follower inventories', () => {
-    const prototype = definitionFixture() as any
-    prototype.productExportApproved = false
-    expect(() => parseSocketEyeSurfaceDefinition(prototype)).toThrow(
-      /productExportApproved must be true/
-    )
-
-    const legacyCoordinates = definitionFixture() as any
-    legacyCoordinates.runtimeBindings.left.gazeAnchorParent = [0.03, 0, 0]
-    expect(() => parseSocketEyeSurfaceDefinition(legacyCoordinates)).toThrow(/unsupported fields/)
-
-    const incomplete = definitionFixture() as any
-    incomplete.runtimeBindings.left.cap.primitiveFollowerMorphs.hiddenClosure = [
-      'eyeBlinkLeft',
-      'eyeSquintLeft'
-    ]
-    expect(() => parseSocketEyeSurfaceDefinition(incomplete)).toThrow(/same exact inventory/)
-
-    const missingRequired = definitionFixture() as any
-    missingRequired.runtimeBindings.right.cap.primitiveFollowerMorphs.visibleFront = [
-      'identityFaceRight',
-      'eyeBlinkRight',
-      'eyeSquintRight'
-    ].sort()
-    missingRequired.runtimeBindings.right.cap.primitiveFollowerMorphs.hiddenClosure = [
-      ...missingRequired.runtimeBindings.right.cap.primitiveFollowerMorphs.visibleFront
-    ]
-    expect(() => parseSocketEyeSurfaceDefinition(missingRequired)).toThrow(/eyeWideRight/)
-  })
-
-  it('rejects separate globe layers or depth-tested front rendering', () => {
-    const oldNodes = definitionFixture() as any
-    oldNodes.runtimeBindings.left.nodes.scleraCap = 'legacy-sclera'
-    expect(() => parseSocketEyeSurfaceDefinition(oldNodes)).toThrow(/unsupported fields/)
-
-    const depthTestDisabled = definitionFixture() as any
-    depthTestDisabled.rendering.visibleFrontDepthTest = false
-    expect(() => parseSocketEyeSurfaceDefinition(depthTestDisabled)).toThrow(
-      /visibleFrontDepthTest must be true/
-    )
-
-    const wrongOrder = definitionFixture() as any
-    wrongOrder.compositeLayers = ['sclera', 'iris', 'scleraArtwork', 'pupil', 'highlight', 'cornea']
-    expect(() => parseSocketEyeSurfaceDefinition(wrongOrder)).toThrow(/compositeLayers\[1\]/)
-  })
-
-  it('returns data that remains exact across a JSON boundary', () => {
-    const definition = parsedDefinition()
-    const roundTripped = parseSocketEyeSurfaceDefinition(
-      JSON.parse(JSON.stringify(definition))
-    ) as SocketEyeSurfaceDefinitionV1
-    const target: [number, number, number] = [0.1, -0.04, 0.9]
-
-    expect(projectTargetToSocketEyeSurface(roundTripped.runtimeBindings.left, target)).toEqual(
-      projectTargetToSocketEyeSurface(definition.runtimeBindings.left, target)
-    )
+      projectTargetToSocketEyeSurface(definition.runtimeBindings.left, [-0.03, 0, -1])
+    ).toThrow(/in front/)
   })
 })

@@ -1,3 +1,5 @@
+import type { EyeApertureSeamSideDefinitionV2 } from "../eyeApertureSeam";
+import type { SocketEyeSurfaceSideDefinitionV2 } from "../socketEyeSurface";
 import type { AppearanceRecipePhysicalEvaluation } from "./appearanceRecipePhysicalEvaluator";
 import {
   getSemanticGlbMesh,
@@ -8,27 +10,21 @@ import {
   type SemanticGlbDocument,
   type SemanticJsonRecord,
 } from "./semanticGlb";
-import {
-  canonicalRecipeSha256,
-  sha256Hex,
-} from "./recipeCanonical";
-import {
-  socketEyeCapRetainedDynamicMorphs,
-  type SocketEyeSurfaceSideDefinition,
-} from "../socketEyeSurface";
-import type { EyeApertureSeamSideDefinition } from "../eyeApertureSeam";
+import { canonicalRecipeSha256, sha256Hex } from "./recipeCanonical";
 
 export const SOCKET_EYE_ANATOMY_PROOF_CONTRACT =
-  "socket-eye-anatomy-proof/v1" as const;
+  "socket-eye-anatomy-proof/v2" as const;
 
 export type SocketEyePrimitiveProof = {
-  role: "composite-cap-visible" | "composite-cap-hidden" | "lashes-eye-outline";
+  role: "physical-eye" | "treatment-upper" | "treatment-lower";
   nodeId: string;
   primitiveId: string;
+  materialName: string | null;
   positionsScalarCount: number;
   positionsSha256: string;
   identityFollowerMorphs: string[];
   retainedDynamicMorphs: string[];
+  surfaceCorrectiveMorphs: string[];
   followerInventorySha256: string;
 };
 
@@ -37,6 +33,8 @@ export type SocketEyeAnatomyProof = {
   domain: `socket-eye:${"left" | "right"}`;
   socketEyeSurfaceDefinitionSha256: string;
   apertureSeamDefinitionSha256: string;
+  physicalEyeRootRelativeMatrix: number[];
+  physicalEyeTransformSha256: string;
   primitives: SocketEyePrimitiveProof[];
   geometrySha256: string;
   followerInventorySha256: string;
@@ -74,6 +72,16 @@ function stringValue(value: unknown, context: string): string {
   return value;
 }
 
+function finiteMatrix(value: readonly number[], context: string): number[] {
+  if (!Array.isArray(value) || value.length !== 16) {
+    fail(`${context} must contain exactly 16 scalars`);
+  }
+  return value.map((entry, index) => {
+    if (!Number.isFinite(entry)) fail(`${context}[${index}] must be finite`);
+    return entry;
+  });
+}
+
 function sortedUnique(values: string[], context: string): string[] {
   const sorted = [...values].sort((left, right) => left.localeCompare(right));
   if (new Set(sorted).size !== sorted.length) fail(`${context} contains duplicate morph names`);
@@ -88,7 +96,10 @@ function descendantNodeIndexes(parsed: SemanticGlbDocument, rootIndex: number): 
     visiting.add(nodeIndex);
     result.push(nodeIndex);
     const node = getSemanticGlbNode(parsed, nodeIndex, `gltf.nodes[${nodeIndex}]`);
-    for (const [index, child] of (node.children === undefined ? [] : array(node.children, `gltf.nodes[${nodeIndex}].children`)).entries()) {
+    const children = node.children === undefined
+      ? []
+      : array(node.children, `gltf.nodes[${nodeIndex}].children`);
+    for (const [index, child] of children.entries()) {
       visit(integer(child, `gltf.nodes[${nodeIndex}].children[${index}]`));
     }
     visiting.delete(nodeIndex);
@@ -106,13 +117,14 @@ function materialName(
   const materials = array(parsed.gltf.materials, "gltf.materials");
   const materialIndex = integer(primitive.material, `${context}.material`);
   if (materialIndex >= materials.length) fail(`${context}.material is out of range`);
-  return stringValue(record(materials[materialIndex], `gltf.materials[${materialIndex}]`).name, `gltf.materials[${materialIndex}].name`);
+  return stringValue(
+    record(materials[materialIndex], `gltf.materials[${materialIndex}]`).name,
+    `gltf.materials[${materialIndex}].name`,
+  );
 }
 
 type PrimitiveCandidate = {
-  nodeIndex: number;
   nodeId: string;
-  primitiveIndex: number;
   primitiveId: string;
   materialName: string | null;
   targetNames: string[];
@@ -123,22 +135,31 @@ function primitiveCandidates(
   parsed: SemanticGlbDocument,
   evaluation: AppearanceRecipePhysicalEvaluation,
   rootNodeName: string,
-): PrimitiveCandidate[] {
+): { rootIndex: number; candidates: PrimitiveCandidate[] } {
   const rootIndex = resolveSemanticGlbNode(parsed, rootNodeName, "socket-eye node");
   const evaluatedById = new Map(evaluation.meshes.map((entry) => [entry.id, entry.positions]));
-  const result: PrimitiveCandidate[] = [];
+  const candidates: PrimitiveCandidate[] = [];
   for (const nodeIndex of descendantNodeIndexes(parsed, rootIndex)) {
     const node = getSemanticGlbNode(parsed, nodeIndex, `gltf.nodes[${nodeIndex}]`);
     if (node.mesh === undefined) continue;
     const meshIndex = integer(node.mesh, `gltf.nodes[${nodeIndex}].mesh`);
     const mesh = getSemanticGlbMesh(parsed, meshIndex, `gltf.meshes[${meshIndex}]`);
-    const extras = mesh.extras === undefined ? {} : record(mesh.extras, `gltf.meshes[${meshIndex}].extras`);
+    const extras = mesh.extras === undefined
+      ? {}
+      : record(mesh.extras, `gltf.meshes[${meshIndex}].extras`);
     const targetNames = sortedUnique(
-      (extras.targetNames === undefined ? [] : array(extras.targetNames, `gltf.meshes[${meshIndex}].extras.targetNames`))
-        .map((entry, index) => stringValue(entry, `gltf.meshes[${meshIndex}].extras.targetNames[${index}]`)),
+      (extras.targetNames === undefined
+        ? []
+        : array(extras.targetNames, `gltf.meshes[${meshIndex}].extras.targetNames`)
+      ).map((entry, index) =>
+        stringValue(entry, `gltf.meshes[${meshIndex}].extras.targetNames[${index}]`),
+      ),
       `gltf.meshes[${meshIndex}].extras.targetNames`,
     );
-    for (const [primitiveIndex, primitiveValue] of array(mesh.primitives, `gltf.meshes[${meshIndex}].primitives`).entries()) {
+    for (const [primitiveIndex, primitiveValue] of array(
+      mesh.primitives,
+      `gltf.meshes[${meshIndex}].primitives`,
+    ).entries()) {
       const context = `gltf.meshes[${meshIndex}].primitives[${primitiveIndex}]`;
       const primitive = record(primitiveValue, context);
       const targets = primitive.targets === undefined ? [] : array(primitive.targets, `${context}.targets`);
@@ -148,10 +169,8 @@ function primitiveCandidates(
       const primitiveId = `mesh:${nodeIndex}:${primitiveIndex}`;
       const positions = evaluatedById.get(primitiveId);
       if (!positions) fail(`${primitiveId} is missing from the final physical evaluation`);
-      result.push({
-        nodeIndex,
+      candidates.push({
         nodeId: stableSemanticGlbNodeName(parsed, nodeIndex, `gltf.nodes[${nodeIndex}]`),
-        primitiveIndex,
         primitiveId,
         materialName: materialName(parsed, primitive, context),
         targetNames,
@@ -159,38 +178,32 @@ function primitiveCandidates(
       });
     }
   }
-  if (result.length === 0) fail(`${rootNodeName} has no physical mesh primitives`);
-  return result.sort((left, right) => left.primitiveId.localeCompare(right.primitiveId));
+  if (candidates.length === 0) fail(`${rootNodeName} has no physical mesh primitives`);
+  candidates.sort((left, right) => left.primitiveId.localeCompare(right.primitiveId));
+  return { rootIndex, candidates };
 }
 
 async function primitiveProof(
   candidate: PrimitiveCandidate,
   role: SocketEyePrimitiveProof["role"],
+  identityFollowerMorphs: readonly string[],
   retainedDynamicMorphs: readonly string[],
-  expectedIdentityFollowerMorphs?: readonly string[],
+  surfaceCorrectiveMorphs: readonly string[],
 ): Promise<SocketEyePrimitiveProof> {
+  const identity = sortedUnique([...identityFollowerMorphs], `${candidate.primitiveId} identity inventory`);
   const dynamic = sortedUnique([...retainedDynamicMorphs], `${candidate.primitiveId} dynamic inventory`);
-  for (const morph of dynamic) {
-    if (!candidate.targetNames.includes(morph)) {
-      fail(`${candidate.primitiveId} is missing retained dynamic morph ${morph}`);
-    }
+  const correctives = sortedUnique(
+    [...surfaceCorrectiveMorphs],
+    `${candidate.primitiveId} surface-corrective inventory`,
+  );
+  const expected = [...identity, ...dynamic, ...correctives].sort((left, right) => left.localeCompare(right));
+  if (
+    candidate.targetNames.length !== expected.length ||
+    candidate.targetNames.some((entry, index) => entry !== expected[index])
+  ) {
+    fail(`${candidate.primitiveId} morph inventory does not exactly match its Recipe/Live contract`);
   }
-  const identity =
-    expectedIdentityFollowerMorphs === undefined
-      ? candidate.targetNames.filter((morph) => !dynamic.includes(morph))
-      : sortedUnique(
-          [...expectedIdentityFollowerMorphs],
-          `${candidate.primitiveId} expected identity inventory`,
-        );
-  for (const morph of identity) {
-    if (!candidate.targetNames.includes(morph)) {
-      fail(`${candidate.primitiveId} is missing identity follower morph ${morph}`);
-    }
-  }
-  if (identity.length === 0) {
-    fail(`${candidate.primitiveId} has no identity follower morphs`);
-  }
-  const followerInventory = { identityFollowerMorphs: identity, retainedDynamicMorphs: dynamic };
+  const followerInventory = { identityFollowerMorphs: identity };
   const bytes = new Uint8Array(
     candidate.positions.buffer,
     candidate.positions.byteOffset,
@@ -200,81 +213,133 @@ async function primitiveProof(
     role,
     nodeId: candidate.nodeId,
     primitiveId: candidate.primitiveId,
+    materialName: candidate.materialName,
     positionsScalarCount: candidate.positions.length,
     positionsSha256: await sha256Hex(bytes),
-    ...followerInventory,
+    identityFollowerMorphs: identity,
+    retainedDynamicMorphs: dynamic,
+    surfaceCorrectiveMorphs: correctives,
     followerInventorySha256: await canonicalRecipeSha256(followerInventory),
   };
 }
 
-/**
- * Prove the exact identity-resolved cap/liner geometry and the split between
- * authoring-only identity followers and each node's exact Live performance inventory.
- */
+/** Prove the exact static eye transform plus identity-resolved treatment geometry. */
 export async function createSocketEyeAnatomyProof(args: {
   modelBytes: Uint8Array;
   evaluation: AppearanceRecipePhysicalEvaluation;
   surfaceDefinitionSha256: string;
   seamDefinitionSha256: string;
-  surface: SocketEyeSurfaceSideDefinition;
-  seam: EyeApertureSeamSideDefinition;
+  surface: SocketEyeSurfaceSideDefinitionV2;
+  seam: EyeApertureSeamSideDefinitionV2;
 }): Promise<SocketEyeAnatomyProof> {
   const parsed = parseSemanticGlb(args.modelBytes, {
     diagnosticPrefix: SOCKET_EYE_ANATOMY_PROOF_CONTRACT,
   });
-  const capDynamic = socketEyeCapRetainedDynamicMorphs(args.surface.side);
-  const linerDynamic = args.seam.liner.retainedPerformanceMorphs;
-  const cap = primitiveCandidates(parsed, args.evaluation, args.surface.nodes.compositeCap);
-  const visible = cap.filter((entry) => entry.materialName === args.surface.cap.visibleFrontFaceGroup);
-  const hidden = cap.filter((entry) => entry.materialName === args.surface.cap.hiddenClosureFaceGroup);
-  if (visible.length !== 1 || hidden.length !== 1 || cap.length !== 2) {
-    fail(`${args.surface.side} composite cap must contain exactly one visible and one hidden primitive`);
+  const physical = primitiveCandidates(
+    parsed,
+    args.evaluation,
+    args.surface.nodes.physicalEye,
+  );
+  if (physical.candidates.length !== 1) {
+    fail(`${args.surface.side} physical eye must contain exactly one static full-sphere primitive`);
   }
-  const liner = primitiveCandidates(parsed, args.evaluation, args.seam.lashesEyeOutlineNode);
-  const capPrimitives = await Promise.all([
-    primitiveProof(visible[0]!, "composite-cap-visible", capDynamic),
-    primitiveProof(hidden[0]!, "composite-cap-hidden", capDynamic),
+  if (physical.candidates[0]!.targetNames.length !== 0) {
+    fail(`${args.surface.side} physical eye must contain zero morph targets`);
+  }
+  const evaluatedPhysicalNode = args.evaluation.nodes.find(
+    (entry) => entry.id === `node:${physical.rootIndex}`,
+  );
+  if (!evaluatedPhysicalNode) {
+    fail(`${args.surface.side} physical eye transform is missing from the final physical evaluation`);
+  }
+  const physicalEyeRootRelativeMatrix = finiteMatrix(
+    evaluatedPhysicalNode.rootRelativeMatrix,
+    `${args.surface.side} physical eye root-relative transform`,
+  );
+  const physicalEyeTransformSha256 = await canonicalRecipeSha256({
+    node: args.surface.nodes.physicalEye,
+    rootRelativeMatrix: physicalEyeRootRelativeMatrix,
+  });
+  const physicalProof = await primitiveProof(
+    physical.candidates[0]!,
+    "physical-eye",
+    [],
+    [],
+    [],
+  );
+
+  const treatment = primitiveCandidates(
+    parsed,
+    args.evaluation,
+    args.seam.lashesEyeOutlineNode,
+  ).candidates;
+  if (treatment.length !== 2) {
+    fail(`${args.surface.side} treatment must contain exactly one upper and one lower primitive`);
+  }
+  const upper = treatment.filter(
+    (entry) => entry.materialName === args.seam.treatment.upperMaterialName,
+  );
+  const lower = treatment.filter(
+    (entry) => entry.materialName === args.seam.treatment.lowerMaterialName,
+  );
+  if (upper.length !== 1 || lower.length !== 1) {
+    fail(`${args.surface.side} treatment material identities must resolve one upper and one lower primitive`);
+  }
+  const retained = args.seam.treatment.retainedPerformanceMorphs;
+  const followers = args.seam.treatment.followerMorphs;
+  const identityFollowers = followers.filter((morph) => !retained.includes(morph));
+  if (identityFollowers.length === 0) {
+    fail(`${args.surface.side} treatment must contain geometry-derived identity followers`);
+  }
+  const correction = args.seam.treatment.surfaceCorrection;
+  const surfaceCorrectives = [
+    correction.projectionMorph,
+    correction.blinkLinearMorph,
+    correction.blinkResidualMorph,
+  ];
+  const treatmentFollowerInventorySha256 = await canonicalRecipeSha256({
+    identityFollowerMorphs: identityFollowers,
+  });
+  if (treatmentFollowerInventorySha256 !== args.seam.treatment.followerInventorySha256) {
+    fail(`${args.surface.side} treatment identity follower inventory hash is stale`);
+  }
+  const treatmentProofs = await Promise.all([
+    primitiveProof(upper[0]!, "treatment-upper", identityFollowers, retained, surfaceCorrectives),
+    primitiveProof(lower[0]!, "treatment-lower", identityFollowers, retained, surfaceCorrectives),
   ]);
-  const capIdentityInventories = capPrimitives.map((entry) =>
-    entry.identityFollowerMorphs.join("\u0000"),
+  const primitives = [physicalProof, ...treatmentProofs];
+  const geometrySha256 = await canonicalRecipeSha256({
+    physicalEyeRootRelativeMatrix,
+    primitives: primitives.map((entry) => ({
+      role: entry.role,
+      nodeId: entry.nodeId,
+      primitiveId: entry.primitiveId,
+      materialName: entry.materialName,
+      positionsScalarCount: entry.positionsScalarCount,
+      positionsSha256: entry.positionsSha256,
+    })),
+  });
+  const followerInventorySha256 = await canonicalRecipeSha256(
+    primitives.map((entry) => ({
+      role: entry.role,
+      primitiveId: entry.primitiveId,
+      identityFollowerMorphs: entry.identityFollowerMorphs,
+      retainedDynamicMorphs: entry.retainedDynamicMorphs,
+      surfaceCorrectiveMorphs: entry.surfaceCorrectiveMorphs,
+      followerInventorySha256: entry.followerInventorySha256,
+    })),
   );
-  if (new Set(capIdentityInventories).size !== 1) {
-    fail(`${args.surface.side} cap primitives must share one exact identity follower inventory`);
-  }
-  const identityFollowerMorphs = capPrimitives[0]!.identityFollowerMorphs;
-  const linerPrimitives = await Promise.all(
-    liner.map((entry) =>
-      primitiveProof(
-        entry,
-        "lashes-eye-outline",
-        linerDynamic,
-        identityFollowerMorphs,
-      ),
-    ),
-  );
-  const primitives = [...capPrimitives, ...linerPrimitives];
-  const geometry = primitives.map((entry) => ({
-    role: entry.role,
-    primitiveId: entry.primitiveId,
-    positionsScalarCount: entry.positionsScalarCount,
-    positionsSha256: entry.positionsSha256,
-  }));
-  const inventories = primitives.map((entry) => ({
-    role: entry.role,
-    primitiveId: entry.primitiveId,
-    identityFollowerMorphs: entry.identityFollowerMorphs,
-    retainedDynamicMorphs: entry.retainedDynamicMorphs,
-    followerInventorySha256: entry.followerInventorySha256,
-  }));
   const payload = {
     contract: SOCKET_EYE_ANATOMY_PROOF_CONTRACT,
     domain: `socket-eye:${args.surface.side}` as const,
     socketEyeSurfaceDefinitionSha256: args.surfaceDefinitionSha256,
     apertureSeamDefinitionSha256: args.seamDefinitionSha256,
+    physicalEyeRootRelativeMatrix,
+    physicalEyeTransformSha256,
     primitives,
-    geometrySha256: await canonicalRecipeSha256(geometry),
-    followerInventorySha256: await canonicalRecipeSha256(inventories),
-    scalarCount: primitives.reduce((sum, entry) => sum + entry.positionsScalarCount, 0),
+    geometrySha256,
+    followerInventorySha256,
+    scalarCount: primitives.reduce((sum, entry) => sum + entry.positionsScalarCount, 0) + 16,
   };
   return { ...payload, proofSha256: await canonicalRecipeSha256(payload) };
 }

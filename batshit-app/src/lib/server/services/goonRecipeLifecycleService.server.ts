@@ -1,6 +1,9 @@
 import type { GoonRecord } from '$lib/types/goons'
 import { parseHairState, validateHairStateBinding } from '$lib/goons/hairAssets'
 import { parseAppearanceDialsManifest } from '$lib/goons/appearanceDials.schema'
+import { createFacialArtworkRecipeSiblingVerifier } from '$lib/goons/recipe/facialArtworkRecipeMigration'
+import { createEyeAppearanceRecipeSiblingVerifier } from '$lib/goons/recipe/eyeAppearanceRecipeMigration'
+import { buildPackageRecipeSiblingMigrationInputs } from '$lib/goons/recipe/packageRecipeSiblingMigration'
 import type { GoonCustomAvatarManifest } from '$lib/goons/customAvatar'
 import { redis } from '$lib/server/redis'
 import {
@@ -35,10 +38,12 @@ import {
   recipeDocumentRedisKey,
   recipeJobRedisKey,
   recipeRevisionBundleSha256,
+  recipeSiblingStateSha256,
   recipeStateSnapshotSha256,
   recipeRevisionRedisKey,
   recipeMigrationReportSha256,
   sha256Hex,
+  parseGoonRecipeV2,
   verifyGoonLiveBuildReceipt,
   verifyLiveGoonBakeArtifacts,
   verifyGoonRecipeV2,
@@ -47,11 +52,14 @@ import {
   verifyRecipeReviewedState,
   verifyRecipeUpdateAnalysisContext,
   deserializeRecipeSiblingInputs,
+  deserializeRecipeExternalSiblingInputs,
   serializeRecipeSiblingInputs,
+  serializeRecipeExternalSiblingInputs,
   verifyRecipePackageMetadata,
   verifyRecipeStateSnapshot,
   findRetiredHairRecipeSibling,
   withoutAnatomyFitRecipeSibling,
+  type AppearanceRecipeMigrationExternalSiblingInput,
   type AppearanceRecipeMigrationPlannerInput,
   type AppearanceRecipeMigrationSiblingInput,
   type GoonLiveBuildReceipt,
@@ -103,7 +111,11 @@ import {
   validateGoonLegacySkinMaterialArtworkState,
   validateGoonSkinAppearanceState
 } from './skinAppearance.server'
-import { readHairAssetFileBytes, resolveHairAssetRevision } from './hairAssetRepository.server'
+import {
+  migrateSavedHairBuiltinState,
+  readHairAssetFileBytes,
+  resolveHairAssetRevision
+} from './hairAssetRepository.server'
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000
 const ZERO_SHA256 = '0'.repeat(64)
@@ -205,6 +217,132 @@ async function validateHairSiblingOwnership(input: {
   }
 }
 
+export async function buildExternalRecipeSiblingInputs(input: {
+  userId: string
+  state: RecipeStateSnapshot
+  source: RecipeSource
+  target: RecipeSource
+  sourceManifest: GoonCustomAvatarManifest | Record<string, unknown>
+  targetManifest: GoonCustomAvatarManifest | Record<string, unknown>
+  resolveAsset: typeof resolveHairAssetRevision
+  migrateBuiltinState?: typeof migrateSavedHairBuiltinState
+}): Promise<AppearanceRecipeMigrationExternalSiblingInput[]> {
+  let bindings: AppearanceRecipeMigrationExternalSiblingInput[]
+  try {
+    bindings = await buildPackageRecipeSiblingMigrationInputs({
+      state: input.state,
+      sourceManifest: input.sourceManifest,
+      targetManifest: input.targetManifest,
+      sourceRecipeIdentities: input.source.identities,
+      targetRecipeIdentities: input.target.identities
+    })
+  } catch (error) {
+    throw new GoonRecipeLifecycleError(
+      'EXTERNAL_SIBLING_INCOMPATIBLE',
+      `Package-managed appearance state cannot be carried into this Goon file update: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      409
+    )
+  }
+
+  const hairMatches = input.state.siblings.filter(
+    (entry) =>
+      entry.id === 'hairState' || entry.id === 'hair-state' || entry.contract === 'hair-state/v2'
+  )
+  if (hairMatches.length > 1) {
+    throw new GoonRecipeLifecycleError(
+      'INVALID_STATE',
+      'Recipe State contains more than one external Hair sibling.',
+      400
+    )
+  }
+  if (hairMatches[0]) {
+    try {
+      const sibling = hairMatches[0]
+      const state = parseHairState(sibling.state)
+      if (!state.selected) {
+        throw new Error('Recipe State cannot retain an empty external Hair sibling.')
+      }
+      const asset = await input.resolveAsset(input.userId, state.selected)
+      await validateHairStateBinding({
+        asset,
+        state,
+        recipeSource: input.source.identities
+      })
+      let targetState = state
+      let targetAsset = asset
+      let migrated = false
+      try {
+        await validateHairStateBinding({
+          asset,
+          state,
+          recipeSource: input.target.identities
+        })
+      } catch (targetError) {
+        if (asset.sourceClass !== 'builtin') throw targetError
+        const migration = await (input.migrateBuiltinState ?? migrateSavedHairBuiltinState)(state)
+        if (migration.status !== 'migrated' || !migration.targetAsset) {
+          throw new Error(
+            `built-in revision ${asset.assetId}@${asset.revisionId} is stale for the target head but has no exact current successor.`
+          )
+        }
+        targetState = migration.state
+        targetAsset = migration.targetAsset
+        await validateHairStateBinding({
+          asset: targetAsset,
+          state: targetState,
+          recipeSource: input.target.identities
+        })
+        migrated = true
+      }
+      const targetSibling = {
+        id: sibling.id,
+        contract: targetState.schemaVersion,
+        definitionSha256: targetState.definitionSha256!,
+        stateSha256: await recipeSiblingStateSha256(targetState),
+        state: targetState
+      }
+      const validationSha256 = await canonicalRecipeSha256({
+        contract: 'recipe-external-sibling-validation/v2',
+        sourceStateId: sibling.id,
+        sourceStateSha256: sibling.stateSha256,
+        targetStateId: sibling.id,
+        targetStateSha256: targetSibling.stateSha256,
+        sourceRecipeIdentities: input.source.identities,
+        targetRecipeIdentities: input.target.identities,
+        assetId: state.selected.assetId,
+        assetRevisionId: state.selected.assetRevisionId,
+        assetRevisionSha256: state.selected.assetRevisionSha256,
+        fitSha256: state.selected.fitSha256,
+        targetAssetId: targetState.selected!.assetId,
+        targetAssetRevisionId: targetState.selected!.assetRevisionId,
+        targetAssetRevisionSha256: targetState.selected!.assetRevisionSha256,
+        targetFitSha256: targetState.selected!.fitSha256
+      })
+      bindings.push({
+        sourceStateId: sibling.id,
+        targetStateId: sibling.id,
+        validationSha256,
+        message: migrated
+          ? `The selected built-in Hair style migrates from immutable revision ${asset.revisionId} to its current-head successor ${targetAsset.revisionId}; colors and motion settings are preserved.`
+          : 'The exact selected Hair revision remains compatible with the target Recipe source.',
+        targetState: targetSibling
+      })
+    } catch (error) {
+      throw new GoonRecipeLifecycleError(
+        'EXTERNAL_SIBLING_INCOMPATIBLE',
+        `The selected Hair cannot be carried into this Goon file update: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        409
+      )
+    }
+  }
+
+  return bindings.sort((left, right) => left.sourceStateId.localeCompare(right.sourceStateId))
+}
+
 async function resolveHairBakeInput(input: {
   userId: string
   state: RecipeStateSnapshot
@@ -297,6 +435,7 @@ export type RecipeLifecycleDependencies = {
   leaseOwnerId?: string
   leaseMs?: number
   resolveHairAsset?: typeof resolveHairAssetRevision
+  migrateBuiltinHairState?: typeof migrateSavedHairBuiltinState
 }
 
 export type AnalyzeRecipePackageUpdateInput = {
@@ -1105,6 +1244,34 @@ export async function analyzeRecipePackageUpdate(
     })
   ).slice(0, 48)}`
   const sourceMigrationState = await withoutAnatomyFitRecipeSibling(owner.authoringRevision.state)
+  const externalSiblingInputs = await buildExternalRecipeSiblingInputs({
+    userId: input.userId,
+    state: sourceMigrationState,
+    source: source.source,
+    target: target.source,
+    sourceManifest: source.manifest,
+    targetManifest: target.manifest,
+    resolveAsset: dependencies.resolveHairAsset ?? resolveHairAssetRevision,
+    migrateBuiltinState: dependencies.migrateBuiltinHairState ?? migrateSavedHairBuiltinState
+  })
+  const siblingVerifiers = {
+    ...(target.manifest.eyeAppearance
+      ? {
+          eyeAppearance: createEyeAppearanceRecipeSiblingVerifier(
+            source.manifest.eyeAppearance ?? null,
+            target.manifest.eyeAppearance
+          )
+        }
+      : {}),
+    ...(target.manifest.facialArtwork
+      ? {
+          facialArtwork: createFacialArtworkRecipeSiblingVerifier(
+            source.manifest.facialArtwork ?? null,
+            target.manifest.facialArtwork
+          )
+        }
+      : {})
+  }
   const plannerInput: AppearanceRecipeMigrationPlannerInput = {
     planId,
     fromRecipeRevision: owner.authoringRevision.recipeRevision,
@@ -1124,6 +1291,8 @@ export async function analyzeRecipePackageUpdate(
       manifestBytes: target.manifestBytes
     },
     siblingInputs: input.siblingInputs,
+    ...(Object.keys(siblingVerifiers).length > 0 ? { siblingVerifiers } : {}),
+    externalSiblingInputs,
     ...(input.componentMapBundle ? { componentMapBundle: input.componentMapBundle } : {})
   }
   const plan = await (dependencies.planMigration ?? planAppearanceRecipeMigration)(plannerInput)
@@ -1159,6 +1328,7 @@ export async function analyzeRecipePackageUpdate(
       containmentReceipt: targetReceiptRef,
       basePlan: planRef,
       siblingInputs: serializeRecipeSiblingInputs(input.siblingInputs),
+      externalSiblingInputs: serializeRecipeExternalSiblingInputs(externalSiblingInputs),
       componentMapBundle: input.componentMapBundle ?? null
     }
   })
@@ -1351,6 +1521,7 @@ async function analysisPlannerInput(input: {
         manifestBytes: target.manifestBytes
       },
       siblingInputs: deserializeRecipeSiblingInputs(context.siblingInputs),
+      externalSiblingInputs: deserializeRecipeExternalSiblingInputs(context.externalSiblingInputs),
       ...(context.componentMapBundle ? { componentMapBundle: context.componentMapBundle } : {})
     } satisfies AppearanceRecipeMigrationPlannerInput
   }
@@ -1645,6 +1816,21 @@ export async function reviewRecipePackageState(
     goonId: input.goonId,
     content: reviewedState
   })
+  if (pending.reviewedState) {
+    const existingReviewedState = await loadReviewedState(
+      input.userId,
+      input.goonId,
+      pending.reviewedState
+    )
+    if (
+      canonicalRecipeString(existingReviewedState) === canonicalRecipeString(reviewedState)
+    ) {
+      return getRecipePackageAnalysis({
+        userId: input.userId,
+        goonId: input.goonId
+      })
+    }
+  }
   const now = (dependencies.now ?? (() => new Date()))().toISOString()
   const nextGoon = cloneGoon(goon)
   nextGoon.updated_at = now
@@ -1731,12 +1917,15 @@ export async function startRecipePackageUpdate(
       500
     )
   }
+  const activeMigrationState = await withoutAnatomyFitRecipeSibling(
+    owner.authoringRevision.state
+  )
   if (
     plan.fromRecipeRevision !== owner.authoringRevision.recipeRevision ||
     plan.toRecipeRevision !== owner.nextRecipeRevision ||
     canonicalRecipeString(plan.fromSource) !==
       canonicalRecipeString(owner.authoringRevision.source) ||
-    plan.fromStateSha256 !== owner.authoringRevision.state.stateSha256
+    plan.fromStateSha256 !== activeMigrationState.stateSha256
   ) {
     throw new GoonRecipeLifecycleError(
       'STALE_PLAN',
@@ -2703,6 +2892,161 @@ const LEASED_STATUSES = new Set([
 ])
 const FAILABLE_STATUSES = new Set([...LEASED_STATUSES, 'ready'])
 
+async function recoverExpiredJobFromCorruptAuthoringState(input: {
+  userId: string
+  goonId: string
+  goon: GoonRecord
+  owner: GoonRecipeV2
+  job: GoonRecipeJob
+  now: Date
+}) {
+  const { userId, goonId, goon, owner, job, now } = input
+  if (!owner.activeRevision) {
+    throw new GoonRecipeLifecycleError(
+      'CORRUPT_RECIPE',
+      'The interrupted Recipe has no verified active revision to restore.',
+      500
+    )
+  }
+  if (owner.pendingJob?.jobId !== job.jobId) {
+    throw new GoonRecipeLifecycleError(
+      'CORRUPT_JOB',
+      'Expired Recipe job is not owned by the Goon.',
+      500
+    )
+  }
+
+  let originalReview: Record<string, unknown> = {}
+  if (job.operation === 'package-update') {
+    const expectedReviewKey = recipeDocumentRedisKey(userId, goonId, job.reviewedState.sha256)
+    if (
+      job.reviewedState.contract !== RECIPE_REVIEWED_STATE_CONTRACT ||
+      job.reviewedState.ref !== expectedReviewKey
+    ) {
+      throw new GoonRecipeLifecycleError(
+        'CORRUPT_REVIEW',
+        'The interrupted package-update review is outside its owner namespace.',
+        500
+      )
+    }
+    // This path exists specifically because RedisJSON may have changed one
+    // insignificant numeric decimal and thereby invalidated the immutable
+    // document hash. Read only the two package-analysis bindings from the raw
+    // record; the replacement state comes exclusively from the verified active
+    // revision below.
+    const rawDocument = asRecord(
+      await redis.get(job.reviewedState.ref),
+      'stored reviewed Recipe document'
+    )
+    if (
+      rawDocument.userId !== userId ||
+      rawDocument.goonId !== goonId ||
+      rawDocument.documentContract !== RECIPE_REVIEWED_STATE_CONTRACT ||
+      rawDocument.sha256 !== job.reviewedState.sha256
+    ) {
+      throw new GoonRecipeLifecycleError(
+        'CORRUPT_REVIEW',
+        'The interrupted package-update review has an invalid owner binding.',
+        500
+      )
+    }
+    originalReview = asRecord(rawDocument.content, 'stored reviewed Recipe State')
+  }
+
+  const [active, candidate] = await Promise.all([
+    loadEnvelopeByRef(userId, goonId, owner.activeRevision),
+    job.candidateRevision
+      ? loadEnvelopeByRef(userId, goonId, job.candidateRevision)
+      : Promise.resolve(null)
+  ])
+  const receiptDocument = await loadDocumentByRef(
+    userId,
+    goonId,
+    active.sourceContainmentReceipt
+  )
+  const receipt = await verifyRecipeArchiveContainmentReceipt(receiptDocument.content)
+  const packageAnalysisId = job.operation === 'package-update' ? originalReview.analysisId : null
+  const packagePlanSha256 = job.operation === 'package-update' ? originalReview.planSha256 : null
+  const recoveryHash = await canonicalRecipeSha256({
+    contract: 'recipe-authoring-integrity-recovery/v1',
+    jobId: job.jobId,
+    activeRevisionSha256: active.envelopeSha256,
+    rejectedReviewSha256: job.reviewedState.sha256
+  })
+  const reviewedState = await verifyRecipeReviewedState({
+    contract: RECIPE_REVIEWED_STATE_CONTRACT,
+    reviewId: `recipe_recovery_${recoveryHash.slice(0, 40)}`,
+    operation: job.operation,
+    analysisId: packageAnalysisId,
+    planSha256: packagePlanSha256,
+    containmentReceiptSha256: receipt.receiptSha256,
+    state: active.revision.state,
+    adjustedControlIds: [],
+    confirmedControlIds: [],
+    cleanResetConfirmed: false
+  })
+  const recoveryReviewDocument = await createGoonRecipeDocument({
+    userId,
+    goonId,
+    content: reviewedState
+  })
+  const recoveryReviewRef = documentRef(recoveryReviewDocument)
+  const authoringRevision = await createAuthoringRevision(active.revision)
+  const nextWriteVersion = owner.writeVersion + 1
+  const failure = {
+    stage: 'restart' as const,
+    reason:
+      'Recipe authoring evidence failed its integrity check after storage. Batshit rejected the unfinished changes and restored the last verified active revision.',
+    reportRef: job.reviewedState
+  }
+  const nextJob: GoonRecipeJob = {
+    ...job,
+    status: 'failed',
+    stateVersion: job.stateVersion + 1,
+    targetWriteVersion: nextWriteVersion,
+    reviewedState: recoveryReviewRef,
+    lease: null,
+    failure,
+    updatedAt: now.toISOString()
+  }
+  const nextGoon = cloneGoon(goon)
+  applyRevisionToGoon(nextGoon, active)
+  nextGoon.updated_at = now.toISOString()
+  nextGoon.recipe = {
+    ...owner,
+    writeVersion: nextWriteVersion,
+    liveStatus: 'failed',
+    authoringRevision,
+    authoringSourceContainmentReceipt: active.sourceContainmentReceipt,
+    pendingAnalysis: null,
+    pendingJob: pendingJob(nextJob),
+    latestUpdateReport: active.revision.updateReport,
+    lastFailure: failure
+  }
+  await verifyGoonRecipeV2(nextGoon.recipe)
+  const stored = await compareAndSwapRecipeJobState({
+    userId,
+    goonId,
+    expectedWriteVersion: owner.writeVersion,
+    expectedJobStateVersion: job.stateVersion,
+    nextGoon,
+    nextJob,
+    records: [
+      {
+        key: recipeDocumentRedisKey(userId, goonId, recoveryReviewDocument.sha256),
+        value: recoveryReviewDocument
+      }
+    ]
+  })
+  return {
+    goon: stored,
+    job: nextJob,
+    reviewedState,
+    candidate,
+    recovered: true
+  }
+}
+
 export async function recoverInterruptedRecipeJob(
   input: {
     userId: string
@@ -2713,8 +3057,28 @@ export async function recoverInterruptedRecipeJob(
 ) {
   const now = (dependencies.now ?? (() => new Date()))()
   const goon = await getOwnedRecipeGoon(input.userId, input.goonId)
-  const owner = await verifyGoonRecipeV2(goon.recipe)
+  const parsedOwner = parseGoonRecipeV2(goon.recipe)
   const job = await getGoonRecipeJob(input.userId, input.goonId, input.jobId)
+  let owner: GoonRecipeV2
+  try {
+    owner = await verifyGoonRecipeV2(parsedOwner)
+  } catch (error) {
+    if (
+      LEASED_STATUSES.has(job.status) &&
+      job.lease &&
+      Date.parse(job.lease.expiresAt) <= now.getTime()
+    ) {
+      return recoverExpiredJobFromCorruptAuthoringState({
+        userId: input.userId,
+        goonId: input.goonId,
+        goon,
+        owner: parsedOwner,
+        job,
+        now
+      })
+    }
+    throw error
+  }
   const [reviewedState, candidate] = await Promise.all([
     loadReviewedState(input.userId, input.goonId, job.reviewedState),
     job.candidateRevision

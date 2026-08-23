@@ -1,8 +1,8 @@
 import {
   parseEyeAppearanceDefinition,
   parseEyeAppearanceState,
-  type EyeAppearanceDefinitionV3,
-  type EyeAppearanceStateV3
+  type EyeAppearanceDefinition,
+  type EyeAppearanceState
 } from '$lib/goons/eyeAppearance'
 import { APPEARANCE_DIAL_VALUES_CONTRACT } from '$lib/goons/appearanceDials.contracts'
 import { parseFacialArtworkDefinition } from '$lib/goons/facialArtwork'
@@ -21,7 +21,7 @@ import {
 type RedisJsonReader = StoredUploadJsonReader
 
 function fail(message: string): never {
-  throw new Error(`[eye-appearance/v3] ${message}`)
+  throw new Error(`[eye-appearance/v5] ${message}`)
 }
 
 async function loadStoredManifest(
@@ -43,7 +43,7 @@ async function loadStoredManifest(
 export async function loadGoonEyeAppearanceDefinition(
   client: RedisJsonReader,
   goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>
-): Promise<EyeAppearanceDefinitionV3 | null> {
+): Promise<EyeAppearanceDefinition | null> {
   const manifest = await loadStoredManifest(client, goon)
   if (!manifest || manifest.eyeAppearance === undefined) return null
   const recipeAppearanceDials = goon.recipe?.authoringRevision.state.appearanceDials
@@ -53,11 +53,11 @@ export async function loadGoonEyeAppearanceDefinition(
     (manifest.appearanceDials === undefined || manifest.appearanceDials === null) &&
     !hasRecipeAppearanceOwnership
   ) {
-    fail('eye-appearance/v3 requires the package Recipe appearance-dials/v2 definition')
+    fail('eye-appearance/v5 requires the package Recipe appearance-dials/v2 definition')
   }
   const definition = parseEyeAppearanceDefinition(manifest.eyeAppearance)
   if (manifest.socketEyeSurface === undefined || manifest.eyeApertureSeam === undefined) {
-    fail('eye-appearance/v3 requires socket-eye-surface/v1 and eye-aperture-seam/v1')
+    fail('eye-appearance/v5 requires socket-eye-surface/v2 and eye-aperture-seam/v2')
   }
   const socketEyeSurface = parseSocketEyeSurfaceDefinition(manifest.socketEyeSurface)
   const eyeApertureSeam = parseEyeApertureSeamDefinition(manifest.eyeApertureSeam)
@@ -68,48 +68,56 @@ export async function loadGoonEyeAppearanceDefinition(
     definition.dependencies.eyeApertureSeam.definitionSha256 !==
       eyeApertureSeam.definitionSha256
   ) {
-    fail('eye-appearance/v3 dependencies do not match the installed socket-eye definitions')
+    fail('eye-appearance/v5 dependencies do not match the installed socket-eye definitions')
   }
   for (const side of ['left', 'right'] as const) {
     if (
-      definition.runtimeBindings[side].compositeCapNode !==
-      socketEyeSurface.runtimeBindings[side].nodes.compositeCap
+      definition.runtimeBindings[side].physicalEyeNode !==
+      socketEyeSurface.runtimeBindings[side].nodes.physicalEye
     ) {
-      fail(`eye-appearance/v3 ${side} composite-cap binding does not match socket-eye-surface/v1`)
+      fail(`eye-appearance/v5 ${side} physical-eye binding does not match socket-eye-surface/v2`)
     }
     if (
       definition.runtimeBindings[side].irisNeutralRadiusMeters *
         definition.controls[0].maximum >=
-      Math.min(
-        socketEyeSurface.runtimeBindings[side].cap.carrierHalfWidthMeters,
-        socketEyeSurface.runtimeBindings[side].cap.carrierHalfHeightMeters
-      )
+      socketEyeSurface.runtimeBindings[side].sphere.radiusMeters
     ) {
-      fail(`eye-appearance/v3 ${side} Iris Size range exceeds the virtual carrier`)
+      fail(`eye-appearance/v5 ${side} Iris Size range exceeds the physical eye sphere`)
     }
     if (
       definition.runtimeBindings[side].pupilNeutralRadiusRatio *
         definition.controls[1].maximum >=
       1
     ) {
-      fail(`eye-appearance/v3 ${side} Pupil Size range exceeds the iris surface`)
+      fail(`eye-appearance/v5 ${side} Pupil Size range exceeds the iris surface`)
     }
-    const verticalControl = definition.controls[2]
+    const horizontalControl = definition.controls[2]
+    const verticalControl = definition.controls[3]
+    const neutralPlacement = definition.runtimeBindings[side].neutralPlacement
+    const maximumHorizontalTravel =
+      definition.runtimeBindings[side].irisHorizontalTravelMeters *
+      Math.max(
+        Math.abs(neutralPlacement.horizontalTravelFraction + horizontalControl.minimum),
+        Math.abs(neutralPlacement.horizontalTravelFraction + horizontalControl.maximum)
+      )
     const maximumVerticalTravel =
       definition.runtimeBindings[side].irisVerticalTravelMeters *
-      Math.max(Math.abs(verticalControl.minimum), Math.abs(verticalControl.maximum))
+      Math.max(
+        Math.abs(neutralPlacement.verticalTravelFraction + verticalControl.minimum),
+        Math.abs(neutralPlacement.verticalTravelFraction + verticalControl.maximum)
+      )
     const maximumIrisRadius =
       definition.runtimeBindings[side].irisNeutralRadiusMeters *
       definition.controls[0].maximum
     if (
-      maximumVerticalTravel + maximumIrisRadius >=
-      socketEyeSurface.runtimeBindings[side].cap.carrierHalfHeightMeters
+      Math.hypot(maximumHorizontalTravel, maximumVerticalTravel) + maximumIrisRadius >=
+      socketEyeSurface.runtimeBindings[side].sphere.radiusMeters
     ) {
-      fail(`eye-appearance/v3 ${side} Iris Vertical Position range exceeds the virtual carrier`)
+      fail(`eye-appearance/v5 ${side} Iris Position range exceeds the physical eye sphere`)
     }
   }
   if (manifest.facialArtwork === undefined) {
-    fail('eye-appearance/v3 requires the matching facial-artwork/v4 package definition')
+    fail('eye-appearance/v5 requires the matching facial-artwork/v6 package definition')
   }
   const facialArtwork = parseFacialArtworkDefinition(manifest.facialArtwork)
   if (
@@ -119,24 +127,24 @@ export async function loadGoonEyeAppearanceDefinition(
     facialArtwork.dependencies.eyeApertureSeam.definitionSha256 !==
       eyeApertureSeam.definitionSha256
   ) {
-    fail('facial-artwork/v4 dependencies do not match the installed socket-eye tuple')
+    fail('facial-artwork/v6 dependencies do not match the installed socket-eye tuple')
   }
   for (const side of ['left', 'right'] as const) {
-    const compositeNode = socketEyeSurface.runtimeBindings[side].nodes.compositeCap
-    const linerNode = eyeApertureSeam.runtimeBindings[side].lashesEyeOutlineNode
+    const physicalEyeNode = socketEyeSurface.runtimeBindings[side].nodes.physicalEye
+    const treatmentNode = eyeApertureSeam.runtimeBindings[side].lashesEyeOutlineNode
     for (const role of facialArtwork.roles) {
       const target = role.target[side]
       if (
-        target.bindingKind === 'socket-eye-composite-layer' &&
-        target.runtimeNodes[0] !== compositeNode
+        target.bindingKind === 'physical-eye-layer' &&
+        target.runtimeNodes[0] !== physicalEyeNode
       ) {
-        fail(`facial-artwork/v4 ${role.id} ${side} target does not match the composite cap`)
+        fail(`facial-artwork/v6 ${role.id} ${side} target does not match the physical eye`)
       }
       if (
         role.id === 'lashes_eye_outline' &&
-        target.runtimeNodes[0] !== linerNode
+        target.runtimeNodes[0] !== treatmentNode
       ) {
-        fail(`facial-artwork/v4 ${side} liner target does not match eye-aperture-seam/v1`)
+        fail(`facial-artwork/v6 ${side} treatment target does not match eye-aperture-seam/v2`)
       }
     }
   }
@@ -147,7 +155,7 @@ export async function validateGoonEyeAppearanceState(
   client: RedisJsonReader,
   goon: Pick<GoonRecord, 'customAvatar' | 'recipe'>,
   value: unknown
-): Promise<EyeAppearanceStateV3 | null> {
+): Promise<EyeAppearanceState | null> {
   if (value === null) return null
   const definition = await loadGoonEyeAppearanceDefinition(client, goon)
   if (!definition) fail('current Goon package does not support Eye Appearance')

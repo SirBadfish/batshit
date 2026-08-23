@@ -1,20 +1,33 @@
 import { describe, expect, it } from "vitest";
-import type { EyeApertureSeamSideDefinition } from "../eyeApertureSeam";
-import type { SocketEyeSurfaceSideDefinition } from "../socketEyeSurface";
+import type { EyeApertureSeamSideDefinitionV2 } from "../eyeApertureSeam";
+import type { SocketEyeSurfaceSideDefinitionV2 } from "../socketEyeSurface";
 import type { AppearanceRecipePhysicalEvaluation } from "./appearanceRecipePhysicalEvaluator";
+import { canonicalRecipeSha256 } from "./recipeCanonical";
 import { createSocketEyeAnatomyProof } from "./socketEyeSurfaceFit";
 
 const sha = (character: string) => character.repeat(64);
 const encoder = new TextEncoder();
-const followerMorphs = ["faceWidth", "eyeBlinkLeft", "eyeSquintLeft", "eyeWideLeft"];
-const linerPerformanceMorphs = [
+const identityFollowerMorphs = Array.from(
+  { length: 46 },
+  (_, index) => `identityLeft${index}`,
+).sort();
+const treatmentPerformanceMorphs = [
   "eyeBlinkLeft",
+  "eyeLookDownLeft",
+  "eyeLookInLeft",
+  "eyeLookOutLeft",
+  "eyeLookUpLeft",
   "eyeSquintLeft",
   "eyeWideLeft",
-  "browInnerUp",
-  "cheekSquintLeft",
-  ...Array.from({ length: 39 }, (_, index) => `performanceLeft${index}`),
+  ...Array.from({ length: 31 }, (_, index) => `performanceLeft${index}`),
 ].sort();
+const surfaceCorrectiveMorphs = [
+  "surfaceBlinkLinearLeft",
+  "surfaceBlinkResidualLeft",
+  "surfaceProjectionLeft",
+].sort();
+const treatmentFollowerMorphs = [...identityFollowerMorphs, ...treatmentPerformanceMorphs].sort();
+const treatmentMorphs = [...treatmentFollowerMorphs, ...surfaceCorrectiveMorphs].sort();
 
 function pad4(bytes: Uint8Array, fill: number): Uint8Array {
   const output = new Uint8Array((bytes.length + 3) & ~3);
@@ -41,21 +54,31 @@ function glb() {
     });
     return accessors.length - 1;
   };
-  const mesh = (material: number, offset: number, morphs = followerMorphs) => {
+  const primitive = (material: number, offset: number, morphs: string[]) => {
     const base = addAccessor([offset, 0, 0, offset + 0.1, 0, 0, offset, 0.1, 0]);
     const targets = morphs.map((_, index) => ({
-      POSITION: addAccessor([0, 0, index * 0.001, 0, 0, 0, 0, 0, 0]),
+      POSITION: addAccessor([0, 0, index * 0.00001, 0, 0, 0, 0, 0, 0]),
     }));
     return {
-      extras: { targetNames: morphs },
-      primitives: [{ attributes: { POSITION: base }, material, targets }],
-      weights: morphs.map(() => 0),
+      attributes: { POSITION: base },
+      material,
+      ...(targets.length === 0 ? {} : { targets }),
     };
   };
   const meshes = [
-    mesh(0, 0),
-    mesh(1, 1),
-    mesh(2, 2, ["faceWidth", ...linerPerformanceMorphs]),
+    {
+      extras: { targetNames: [] },
+      primitives: [primitive(0, 0, [])],
+      weights: [],
+    },
+    {
+      extras: { targetNames: treatmentMorphs },
+      primitives: [
+        primitive(1, 1, treatmentMorphs),
+        primitive(2, 2, treatmentMorphs),
+      ],
+      weights: treatmentMorphs.map(() => 0),
+    },
   ];
   const binary = new Uint8Array(chunks.reduce((sum, entry) => sum + entry.byteLength, 0));
   let binaryOffset = 0;
@@ -68,16 +91,14 @@ function glb() {
     scene: 0,
     scenes: [{ nodes: [0] }],
     nodes: [
-      { name: "Root", children: [1, 4] },
-      { name: "Cap_L", children: [2, 3] },
-      { name: "Cap_L_Visible", mesh: 0 },
-      { name: "Cap_L_Hidden", mesh: 1 },
-      { name: "Liner_L", mesh: 2 },
+      { name: "Root", children: [1, 2] },
+      { name: "PhysicalEye_L", mesh: 0 },
+      { name: "Treatment_L", mesh: 1 },
     ],
     materials: [
-      { name: "VisibleFront" },
-      { name: "HiddenClosure" },
-      { name: "Liner" },
+      { name: "PhysicalEye" },
+      { name: "TreatmentUpper" },
+      { name: "TreatmentLower" },
     ],
     meshes,
     accessors,
@@ -103,109 +124,134 @@ function glb() {
 
 const surface = {
   side: "left",
-  nodes: { compositeCap: "Cap_L" },
-  cap: {
-    visibleFrontFaceGroup: "VisibleFront",
-    hiddenClosureFaceGroup: "HiddenClosure",
-    primitiveFollowerMorphs: {
-      visibleFront: [...followerMorphs].sort(),
-      hiddenClosure: [...followerMorphs].sort(),
+  nodes: { physicalEye: "PhysicalEye_L" },
+} as SocketEyeSurfaceSideDefinitionV2;
+
+async function seam(): Promise<EyeApertureSeamSideDefinitionV2> {
+  return {
+    side: "left",
+    lashesEyeOutlineNode: "Treatment_L",
+    treatment: {
+      upperMaterialName: "TreatmentUpper",
+      lowerMaterialName: "TreatmentLower",
+      followerMorphs: treatmentFollowerMorphs,
+      retainedPerformanceMorphs: treatmentPerformanceMorphs,
+      surfaceCorrection: {
+        contract: "head-projection-blink-surface-correction/v1",
+        projectionMorph: "surfaceProjectionLeft",
+        blinkLinearMorph: "surfaceBlinkLinearLeft",
+        blinkResidualMorph: "surfaceBlinkResidualLeft",
+        blinkMorph: "eyeBlinkLeft",
+        projectionWeightLaw: "appearance-follower-weight",
+        blinkLinearWeightLaw: "blink-times-projection",
+        blinkResidualWeightLaw: "four-blink-one-minus-blink-times-projection",
+      },
+      followerInventorySha256: await canonicalRecipeSha256({
+        identityFollowerMorphs,
+      }),
     },
-  },
-} as unknown as SocketEyeSurfaceSideDefinition;
+  } as EyeApertureSeamSideDefinitionV2;
+}
 
-const seam = {
-  side: "left",
-  lashesEyeOutlineNode: "Liner_L",
-  liner: { retainedPerformanceMorphs: linerPerformanceMorphs },
-} as unknown as EyeApertureSeamSideDefinition;
-
-function evaluation(offset = 0): AppearanceRecipePhysicalEvaluation {
+function evaluation(positionOffset = 0, transformOffset = 0): AppearanceRecipePhysicalEvaluation {
   const positions = (base: number) => new Float32Array([
-    base + offset, 0, 0,
+    base + positionOffset, 0, 0,
     base + 0.1, 0, 0,
     base, 0.1, 0,
   ]);
   return {
     contract: "appearance-recipe-physical-evaluation/v1",
     meshes: [
-      { id: "mesh:2:0", nodeId: "node:2", positions: positions(0) },
-      { id: "mesh:3:0", nodeId: "node:3", positions: positions(1) },
-      { id: "mesh:4:0", nodeId: "node:4", positions: positions(2) },
+      { id: "mesh:1:0", nodeId: "node:1", positions: positions(0) },
+      { id: "mesh:2:0", nodeId: "node:2", positions: positions(1) },
+      { id: "mesh:2:1", nodeId: "node:2", positions: positions(2) },
     ],
+    nodes: [{
+      id: "node:1",
+      rootRelativeMatrix: [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        transformOffset, 0, 0, 1,
+      ],
+    }],
   } as AppearanceRecipePhysicalEvaluation;
 }
 
 describe("socket-eye Anatomy Fit geometry proof", () => {
-  it("hash-binds evaluated cap/liner geometry and exact identity/dynamic inventories", async () => {
+  it("hash-binds the static eye transform and exact treatment geometry/inventories", async () => {
+    const treatment = await seam();
     const proof = await createSocketEyeAnatomyProof({
       modelBytes: glb(),
       evaluation: evaluation(),
       surfaceDefinitionSha256: sha("d"),
       seamDefinitionSha256: sha("e"),
       surface,
-      seam,
+      seam: treatment,
     });
-    expect(proof.domain).toBe("socket-eye:left");
+    expect(proof.contract).toBe("socket-eye-anatomy-proof/v2");
     expect(proof.primitives.map((entry) => entry.role)).toEqual([
-      "composite-cap-visible",
-      "composite-cap-hidden",
-      "lashes-eye-outline",
+      "physical-eye",
+      "treatment-upper",
+      "treatment-lower",
     ]);
-    for (const primitive of proof.primitives.slice(0, 2)) {
-      expect(primitive.identityFollowerMorphs).toEqual(["faceWidth"]);
-      expect(primitive.retainedDynamicMorphs).toEqual([
-        "eyeBlinkLeft",
-        "eyeSquintLeft",
-        "eyeWideLeft",
-      ]);
+    expect(proof.primitives[0]).toMatchObject({
+      identityFollowerMorphs: [],
+      retainedDynamicMorphs: [],
+    });
+    for (const primitive of proof.primitives.slice(1)) {
+      expect(primitive.identityFollowerMorphs).toEqual(identityFollowerMorphs);
+      expect(primitive.retainedDynamicMorphs).toEqual(treatmentPerformanceMorphs);
+      expect(primitive.surfaceCorrectiveMorphs).toEqual(surfaceCorrectiveMorphs);
     }
-    expect(proof.primitives.at(-1)?.identityFollowerMorphs).toEqual(["faceWidth"]);
-    expect(proof.primitives.at(-1)?.retainedDynamicMorphs).toEqual(
-      linerPerformanceMorphs,
-    );
 
-    const changed = await createSocketEyeAnatomyProof({
+    const changedGeometry = await createSocketEyeAnatomyProof({
       modelBytes: glb(),
       evaluation: evaluation(0.01),
       surfaceDefinitionSha256: sha("d"),
       seamDefinitionSha256: sha("e"),
       surface,
-      seam,
+      seam: treatment,
     });
-    expect(changed.geometrySha256).not.toBe(proof.geometrySha256);
-    expect(changed.proofSha256).not.toBe(proof.proofSha256);
+    expect(changedGeometry.geometrySha256).not.toBe(proof.geometrySha256);
+
+    const changedTransform = await createSocketEyeAnatomyProof({
+      modelBytes: glb(),
+      evaluation: evaluation(0, 0.01),
+      surfaceDefinitionSha256: sha("d"),
+      seamDefinitionSha256: sha("e"),
+      surface,
+      seam: treatment,
+    });
+    expect(changedTransform.physicalEyeTransformSha256).not.toBe(
+      proof.physicalEyeTransformSha256,
+    );
+    expect(changedTransform.proofSha256).not.toBe(proof.proofSha256);
   });
 
-  it("fails closed when any generated primitive is absent", async () => {
+  it("fails closed when a generated treatment primitive is absent", async () => {
     const missing = evaluation();
-    missing.meshes = missing.meshes.filter((entry) => entry.id !== "mesh:3:0");
+    missing.meshes = missing.meshes.filter((entry) => entry.id !== "mesh:2:1");
     await expect(createSocketEyeAnatomyProof({
       modelBytes: glb(),
       evaluation: missing,
       surfaceDefinitionSha256: sha("d"),
       seamDefinitionSha256: sha("e"),
       surface,
-      seam,
+      seam: await seam(),
     })).rejects.toThrow("missing from the final physical evaluation");
   });
 
-  it("does not misclassify liner-only facial performance channels as identity followers", async () => {
-    const proof = await createSocketEyeAnatomyProof({
+  it("rejects a stale treatment follower inventory hash", async () => {
+    const stale = await seam();
+    stale.treatment.followerInventorySha256 = sha("0");
+    await expect(createSocketEyeAnatomyProof({
       modelBytes: glb(),
       evaluation: evaluation(),
       surfaceDefinitionSha256: sha("d"),
       seamDefinitionSha256: sha("e"),
       surface,
-      seam,
-    });
-    expect(proof.primitives.at(-1)?.identityFollowerMorphs).toEqual([
-      "faceWidth",
-    ]);
-    expect(proof.primitives.at(-1)?.retainedDynamicMorphs).toEqual(
-      linerPerformanceMorphs,
-    );
-    expect(proof.primitives.at(-1)?.retainedDynamicMorphs).toContain("browInnerUp");
-    expect(proof.primitives.at(-1)?.retainedDynamicMorphs).toContain("cheekSquintLeft");
+      seam: stale,
+    })).rejects.toThrow("identity follower inventory hash is stale");
   });
 });

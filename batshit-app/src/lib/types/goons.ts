@@ -1,6 +1,6 @@
 import type { AppearanceDialValueState } from "$lib/goons/appearanceDials";
-import type { FacialArtworkStateV4 } from "$lib/goons/facialArtwork";
-import type { EyeAppearanceStateV3 } from "$lib/goons/eyeAppearance";
+import type { FacialArtworkState } from "$lib/goons/facialArtwork";
+import type { EyeAppearanceState } from "$lib/goons/eyeAppearance";
 import type { HairStateV2 } from "$lib/goons/hairAssets";
 import type {
   LipArtworkPresenceStateV1,
@@ -665,9 +665,9 @@ export interface GoonRecord {
   /** Versioned first-party appearance state (avatar.json#appearanceDials contract). */
   appearanceDials?: AppearanceDialValueState | null;
   /** Recipe-owned facial artwork state, bound to avatar.json#facialArtwork. */
-  facialArtwork?: FacialArtworkStateV4 | null;
+  facialArtwork?: FacialArtworkState | null;
   /** Package-owned linked physical eye state, bound to avatar.json#eyeAppearance. */
-  eyeAppearance?: EyeAppearanceStateV3 | null;
+  eyeAppearance?: EyeAppearanceState | null;
   /** Package-owned oral material state, bound to avatar.json#oralAppearance. */
   oralAppearance?: OralAppearanceStateV1 | null;
   /** Recipe-owned lip artwork state, bound to avatar.json#lipArtwork. Null inherits package art. */

@@ -12,12 +12,21 @@ const {
 const ROOT = path.resolve(__dirname, '../../../../..');
 const CONTRACT = require(path.join(
   ROOT,
-  'batshit-app/static/goons/facial-artwork/v4/facial-artwork-v4.json'
+  'batshit-app/static/goons/facial-artwork/v6/facial-artwork-v6.json'
 ));
-const TEMPLATE = CONTRACT.templates.find((item) => item.id === 'brow-canvas');
+const TEMPLATE = CONTRACT.templates.find((item) => item.id === 'brows-template-v6');
 const LASHES_TEMPLATE = CONTRACT.templates.find(
-  (item) => item.id === 'lashes-eye-outline-canvas'
+  (item) => item.id === 'lashes_eye_outline-template-v6'
 );
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(',')}}`;
+}
 
 function input(buffer, overrides = {}) {
   const orientation = overrides.orientation || TEMPLATE.canonicalOrientation;
@@ -60,17 +69,22 @@ function lashesInput(buffer, orientation = LASHES_TEMPLATE.canonicalOrientation)
   };
 }
 
-function roleInput(roleId, buffer) {
+function roleInput(roleId, buffer, orientation) {
   const role = CONTRACT.roles.find((item) => item.id === roleId);
   const template = CONTRACT.templates.find((item) => item.id === role.template);
+  const selectedOrientation = orientation || template.canonicalOrientation;
+  const variant =
+    selectedOrientation === template.canonicalOrientation
+      ? template
+      : template.mirroredHorizontalVariant;
   return {
     ...input(buffer),
     role: roleId,
     templateId: template.id,
     templateVersion: template.version,
-    orientation: template.canonicalOrientation,
-    guideSha256: template.guide.sha256,
-    maskSha256: template.safePaintMask.sha256
+    orientation: selectedOrientation,
+    guideSha256: variant.guide.sha256,
+    maskSha256: variant.safePaintMask.sha256
   };
 }
 
@@ -127,15 +141,20 @@ async function createPaintedTemplateFixture(template) {
   }
 
   const rgba = Buffer.alloc(width * height * 4, 0);
+  let transparentPixels = 0;
   for (let pixel = 0; pixel < width * height; pixel += 1) {
     const alpha = mask.data[pixel * mask.info.channels];
-    if (alpha === 0) continue;
+    if (alpha === 0) {
+      transparentPixels += 1;
+      continue;
+    }
     const offset = pixel * 4;
     rgba[offset] = 79;
     rgba[offset + 1] = 43;
     rgba[offset + 2] = 33;
     rgba[offset + 3] = alpha;
   }
+  if (transparentPixels === 0) rgba.fill(0, 0, 4);
   return encodeCanonicalRgba(rgba, width, height);
 }
 
@@ -166,21 +185,50 @@ describe('facialArtworkValidator', () => {
     expect(chunkTypes(prepared.buffer)).not.toContain('iCCP');
   });
 
-  test('accepts a package-specific definition when its trusted template identity is exact', async () => {
+  test('accepts the trusted v6 artwork source for every upload role', async () => {
+    for (const role of CONTRACT.roles) {
+      const trusted = CONTRACT.trustedArtwork.entries.find(
+        (entry) => entry.role === role.id && entry.side !== 'right'
+      );
+      const buffer = fs.readFileSync(
+        path.join(ROOT, 'batshit-app/static', trusted.asset.path)
+      );
+      await expect(prepareFacialArtworkUpload(roleInput(role.id, buffer))).resolves.toMatchObject({
+        artwork: {
+          role: role.id,
+          definitionSha256: CONTRACT.definitionSha256,
+          mimeType: 'image/png'
+        }
+      });
+    }
+
+    const trustedRightBrow = CONTRACT.trustedArtwork.entries.find(
+      (entry) => entry.role === 'brows' && entry.side === 'right'
+    );
+    const rightBrowBuffer = fs.readFileSync(
+      path.join(ROOT, 'batshit-app/static', trustedRightBrow.asset.path)
+    );
+    await expect(
+      prepareFacialArtworkUpload(roleInput('brows', rightBrowBuffer, 'anatomical-right'))
+    ).resolves.toMatchObject({
+      artwork: { role: 'brows', template: { orientation: 'anatomical-right' } }
+    });
+  }, 30000);
+
+  test('rejects package-specific definition drift even when template identity is exact', async () => {
     const buffer = await createPaintedTemplateFixture(TEMPLATE);
     const packageDefinitionSha256 = 'f'.repeat(64);
-    const prepared = await prepareFacialArtworkUpload(
-      input(buffer, { definitionSha256: packageDefinitionSha256 })
-    );
-    expect(prepared.artwork.definitionSha256).toBe(packageDefinitionSha256);
+    await expect(
+      prepareFacialArtworkUpload(input(buffer, { definitionSha256: packageDefinitionSha256 }))
+    ).rejects.toThrow(/does not match the trusted facial-artwork\/v6 contract/);
   });
 
   test('reloads the trusted definition when its file changes without a server restart', async () => {
     const temporaryParent = fs.mkdtempSync(path.join(os.tmpdir(), 'batshit-facial-artwork-'));
-    const temporaryRoot = path.join(temporaryParent, 'v4');
+    const temporaryRoot = path.join(temporaryParent, 'v6');
     const sourceRoot = path.join(
       ROOT,
-      'batshit-app/static/goons/facial-artwork/v4'
+      'batshit-app/static/goons/facial-artwork/v6'
     );
     const previousRoot = process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT;
     fs.cpSync(sourceRoot, temporaryRoot, { recursive: true });
@@ -191,14 +239,20 @@ describe('facialArtworkValidator', () => {
       const buffer = await createPaintedTemplateFixture(TEMPLATE);
       await expect(prepareFacialArtworkUpload(input(buffer))).resolves.toBeTruthy();
 
-      const contractPath = path.join(temporaryRoot, 'facial-artwork-v4.json');
+      const contractPath = path.join(temporaryRoot, 'facial-artwork-v6.json');
       const changedContract = JSON.parse(fs.readFileSync(contractPath, 'utf8'));
       changedContract.templates.find((item) => item.id === TEMPLATE.id).version = 'cache-reloaded';
+      changedContract.definitionSha256 = crypto
+        .createHash('sha256')
+        .update(canonicalJson({ ...changedContract, definitionSha256: null }))
+        .digest('hex');
       fs.writeFileSync(contractPath, `${JSON.stringify(changedContract, null, 2)}\n`);
 
-      await expect(prepareFacialArtworkUpload(input(buffer))).rejects.toThrow(
-        /template identity/
-      );
+      await expect(
+        prepareFacialArtworkUpload(
+          input(buffer, { definitionSha256: changedContract.definitionSha256 })
+        )
+      ).rejects.toThrow(/template identity/);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT;
@@ -214,7 +268,7 @@ describe('facialArtworkValidator', () => {
     const buffer = await createPaintedTemplateFixture(TEMPLATE);
     await expect(
       prepareFacialArtworkUpload(input(buffer, { definitionSha256: 'not-a-sha256' }))
-    ).rejects.toThrow(/must be a lowercase SHA-256 hash/);
+    ).rejects.toThrow(/does not match the trusted facial-artwork\/v6 contract/);
     await expect(
       prepareFacialArtworkUpload(input(buffer, { guideSha256: 'e'.repeat(64) }))
     ).rejects.toThrow(/template identity/);
@@ -224,12 +278,12 @@ describe('facialArtworkValidator', () => {
     await expect(
       prepareFacialArtworkUpload(
         input(buffer, {
-          orientation: 'anatomical-right',
+          orientation: 'orientation-neutral',
           guideSha256: TEMPLATE.guide.sha256,
           maskSha256: TEMPLATE.safePaintMask.sha256
         })
       )
-    ).rejects.toThrow(/does not support orientation anatomical-right/);
+    ).rejects.toThrow(/does not support orientation orientation-neutral/);
   });
 
   test('accepts left- and right-authored eye treatment variants as canonical bytes', async () => {
@@ -271,9 +325,23 @@ describe('facialArtworkValidator', () => {
     );
   });
 
-  test('normalizes AI-style PNG color metadata, hidden RGB, and safe-mask overflow', async () => {
-    const irisTemplate = CONTRACT.templates.find((item) => item.id === 'iris-radial');
+  test('normalizes AI-style PNG color metadata while applying the trusted padded Iris mask', async () => {
+    const irisTemplate = CONTRACT.templates.find((item) => item.id === 'iris-template-v6');
     const [width, height] = irisTemplate.dimensions;
+    const mask = await sharp(
+      path.join(ROOT, 'batshit-app/static', irisTemplate.safePaintMask.path)
+    )
+      .greyscale()
+      .raw()
+      .toBuffer();
+    const expectedClippedPixels = mask.reduce(
+      (count, alpha) => count + (alpha < 255 ? 1 : 0),
+      0
+    );
+    const expectedClearedPixels = mask.reduce(
+      (count, alpha) => count + (alpha === 0 ? 1 : 0),
+      0
+    );
     const rgba = Buffer.alloc(width * height * 4, 0);
     for (let pixel = 0; pixel < width * height; pixel += 1) {
       const offset = pixel * 4;
@@ -293,47 +361,123 @@ describe('facialArtworkValidator', () => {
     expect(chunkTypes(prepared.buffer)).toContain('sRGB');
     expect(chunkTypes(prepared.buffer)).not.toContain('iCCP');
     expect(prepared.preparation.colorSpaceNormalized).toBe(true);
-    expect(prepared.preparation.clippedAlphaPixels).toBeGreaterThan(0);
-    expect(prepared.preparation.clearedTransparentRgbPixels).toBeGreaterThan(0);
+    expect(prepared.preparation.clippedAlphaPixels).toBe(expectedClippedPixels);
+    expect(prepared.preparation.clearedTransparentRgbPixels).toBe(expectedClearedPixels);
     const decoded = await sharp(prepared.buffer).raw().toBuffer({ resolveWithObject: true });
     expect(decoded.info).toMatchObject({ width, height, channels: 4, depth: 'uchar' });
-    for (let offset = 0; offset < decoded.data.length; offset += 4) {
-      if (decoded.data[offset + 3] === 0) {
-        expect(decoded.data.subarray(offset, offset + 3)).toEqual(Buffer.alloc(3));
-      }
+    const decodedAlpha = Buffer.alloc(width * height);
+    for (let pixel = 0; pixel < width * height; pixel += 1) {
+      decodedAlpha[pixel] = decoded.data[pixel * 4 + 3];
     }
+    expect(decodedAlpha).toEqual(mask);
   });
 
-  test('rejects a discontinuous upper/lower eye-treatment join', async () => {
-    const buffer = await createPaintedTemplateFixture(LASHES_TEMPLATE);
-    const decoded = await sharp(buffer).raw().toBuffer({ resolveWithObject: true });
-    const rgba = Buffer.from(decoded.data);
-    const { width, height } = decoded.info;
-    const semanticBytes = fs.readFileSync(
-      path.join(ROOT, 'batshit-app/static', LASHES_TEMPLATE.semanticMap.path)
-    );
-    const semantic = await sharp(semanticBytes).greyscale().raw().toBuffer();
-    const lowerOuter = LASHES_TEMPLATE.semanticMap.palette.outer_lower_transition;
-    for (let pixel = 0; pixel < semantic.length; pixel += 1) {
-      if (semantic[pixel] === lowerOuter) {
-        rgba.fill(0, pixel * 4, pixel * 4 + 4);
+  test('accepts a fully opaque 1024-square and fills the complete trusted Iris/Pupil disk', async () => {
+    const edgeToEdgeBlack = await sharp({
+      create: {
+        width: 1024,
+        height: 1024,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 1 }
       }
+    })
+      .png()
+      .toBuffer();
+    for (const role of ['iris', 'pupil']) {
+      const roleDefinition = CONTRACT.roles.find((item) => item.id === role);
+      const template = CONTRACT.templates.find((item) => item.id === roleDefinition.template);
+      const mask = await sharp(path.join(ROOT, 'batshit-app/static', template.safePaintMask.path))
+        .greyscale()
+        .raw()
+        .toBuffer();
+      const expectedClippedPixels = mask.reduce(
+        (count, alpha) => count + (alpha < 255 ? 1 : 0),
+        0
+      );
+      const prepared = await prepareFacialArtworkUpload(roleInput(role, edgeToEdgeBlack));
+      expect(prepared.artwork).toMatchObject({ role, width: 1024, height: 1024 });
+      expect(prepared.preparation.clippedAlphaPixels).toBe(expectedClippedPixels);
+      const decoded = await sharp(prepared.buffer).ensureAlpha().raw().toBuffer();
+      const decodedAlpha = Buffer.alloc(1024 * 1024);
+      for (let pixel = 0; pixel < 1024 * 1024; pixel += 1) {
+        decodedAlpha[pixel] = decoded[pixel * 4 + 3];
+      }
+      expect(decodedAlpha).toEqual(mask);
     }
-    const discontinuous = await encodeCanonicalRgba(rgba, width, height);
-    await expect(prepareFacialArtworkUpload(lashesInput(discontinuous))).rejects.toThrow(
-      /discontinuous outer canthus upper\/lower join/
+  }, 30000);
+
+  test('pins the trusted right brow to an exact pixel mirror of the accepted left brow', async () => {
+    const artwork = Object.fromEntries(
+      CONTRACT.trustedArtwork.entries
+        .filter((entry) => entry.role === 'brows')
+        .map((entry) => [entry.side, entry])
     );
+    const left = await sharp(
+      path.join(ROOT, 'batshit-app/static', artwork.left.asset.path)
+    )
+      .flop()
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const right = await sharp(
+      path.join(ROOT, 'batshit-app/static', artwork.right.asset.path)
+    )
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    expect(right.info).toMatchObject({
+      width: left.info.width,
+      height: left.info.height,
+      channels: left.info.channels
+    });
+    expect(right.data.equals(left.data)).toBe(true);
   });
 
-  test('rejects transparent blanks, malformed provenance, and non-PNG bytes', async () => {
-    const blank = fs.readFileSync(
-      path.join(
-        ROOT,
-        'batshit-app/static',
-        TEMPLATE.transparentBlank.path
-      )
-    );
-    await expect(prepareFacialArtworkUpload(input(blank))).rejects.toThrow(/alpha is empty/);
+  test('allows fully opaque Sclera by declaration and clips opaque non-Sclera art to its safe mask', async () => {
+    const scleraRole = CONTRACT.roles.find((item) => item.id === 'sclera');
+    const scleraTemplate = CONTRACT.templates.find((item) => item.id === scleraRole.template);
+    const [scleraWidth, scleraHeight] = scleraTemplate.dimensions;
+    const opaqueSclera = await sharp({
+      create: {
+        width: scleraWidth,
+        height: scleraHeight,
+        channels: 4,
+        background: { r: 244, g: 238, b: 224, alpha: 1 }
+      }
+    })
+      .png()
+      .toBuffer();
+    await expect(
+      prepareFacialArtworkUpload(roleInput('sclera', opaqueSclera))
+    ).resolves.toMatchObject({ artwork: { role: 'sclera' } });
+
+    const [browWidth, browHeight] = TEMPLATE.dimensions;
+    const opaqueBrows = await sharp({
+      create: {
+        width: browWidth,
+        height: browHeight,
+        channels: 4,
+        background: { r: 79, g: 43, b: 33, alpha: 1 }
+      }
+    })
+      .png()
+      .toBuffer();
+    const preparedBrows = await prepareFacialArtworkUpload(input(opaqueBrows));
+    expect(preparedBrows.preparation.clippedAlphaPixels).toBeGreaterThan(0);
+    const canonicalBrows = await sharp(preparedBrows.buffer).ensureAlpha().raw().toBuffer();
+    expect(canonicalBrows.some((channel, index) => index % 4 === 3 && channel === 0)).toBe(true);
+  }, 30000);
+
+  test('rejects transparent blanks for all six roles, malformed provenance, and non-PNG bytes', async () => {
+    for (const role of CONTRACT.roles) {
+      const template = CONTRACT.templates.find((item) => item.id === role.template);
+      const blank = fs.readFileSync(
+        path.join(ROOT, 'batshit-app/static', template.transparentBlank.path)
+      );
+      await expect(prepareFacialArtworkUpload(roleInput(role.id, blank))).rejects.toThrow(
+        new RegExp(`${role.id} artwork alpha is empty`)
+      );
+    }
 
     const fixture = await createPaintedTemplateFixture(TEMPLATE);
     await expect(
@@ -351,7 +495,7 @@ describe('facialArtworkValidator', () => {
     await expect(prepareFacialArtworkUpload(input(Buffer.from('not a png')))).rejects.toThrow(
       /not a PNG/
     );
-  });
+  }, 30000);
 
   test('keeps template dimensions strict instead of silently resampling artwork', async () => {
     const wrongSize = await sharp({

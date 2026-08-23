@@ -49,6 +49,7 @@ import {
   type RecipeRevisionEnvelope
 } from './recipeLifecycleContracts'
 import { parseRecipeMigrationPlan } from './migrationPlanContracts'
+import { collectPackageRecipeSiblingRecords } from './packageRecipeSiblingMigration'
 import {
   verifyRecipeReviewedState,
   type AnalyzeRecipePackageUpdateRequest,
@@ -365,7 +366,11 @@ export async function buildRecipeStateSnapshot(
     currentAuthoringSiblings(input.goon).map((sibling) => [sibling.id, sibling])
   )
 
-  removeSiblingSurface(siblings, ['facialArtwork', 'facial-artwork'], 'facial-artwork-state/v4')
+  removeSiblingSurface(
+    siblings,
+    ['facialArtwork', 'facial-artwork'],
+    ['facial-artwork-state/v5', 'facial-artwork-state/v6']
+  )
   if (input.goon.facialArtwork) {
     const state = cloneRecipeJson(input.goon.facialArtwork)
     const next = await siblingRecord({
@@ -377,7 +382,11 @@ export async function buildRecipeStateSnapshot(
     siblings.set(next.id, next)
   }
 
-  removeSiblingSurface(siblings, ['eyeAppearance', 'eye-appearance'], 'eye-appearance-state/v3')
+  removeSiblingSurface(
+    siblings,
+    ['eyeAppearance', 'eye-appearance'],
+    ['eye-appearance-state/v4', 'eye-appearance-state/v5']
+  )
   if (input.goon.eyeAppearance) {
     const state = cloneRecipeJson(input.goon.eyeAppearance)
     const next = await siblingRecord({
@@ -628,6 +637,30 @@ export async function buildRecipeSiblingInputs(
       targetDefinition,
       message: subplan.reason
     }
+  }
+
+  for (const sibling of collectPackageRecipeSiblingRecords({
+    state,
+    targetManifest: input.targetManifest
+  })) {
+    remaining.delete(sibling.id)
+  }
+
+  const externalHair = [...remaining.values()].filter(
+    (sibling) =>
+      sibling.id === 'hairState' ||
+      sibling.id === 'hair-state' ||
+      sibling.contract === 'hair-state/v2'
+  )
+  if (externalHair.length > 1) {
+    throw new Error('Recipe State ambiguously binds more than one external Hair sibling.')
+  }
+  if (externalHair[0]) {
+    const hairState = parseHairState(externalHair[0].state)
+    if (!hairState.selected) {
+      throw new Error('Recipe State cannot retain an empty external Hair sibling.')
+    }
+    remaining.delete(externalHair[0].id)
   }
 
   if (remaining.size > 0) {
@@ -1509,7 +1542,12 @@ export class RecipeWorkflowClient {
     if (!hairState.selected) return undefined
     const selection = hairState.selected
 
-    const response = await this.fetchImpl('/api/goons/hair-assets', { signal })
+    const response = await this.fetchImpl(
+      `/api/goons/hair-assets/${encodeURIComponent(selection.assetId)}/${encodeURIComponent(
+        selection.assetRevisionId
+      )}?sha256=${selection.assetRevisionSha256}`,
+      { signal }
+    )
     const payload = await response.json().catch(() => null)
     if (!response.ok) {
       const body = payload && typeof payload === 'object' ? (payload as UnknownRecord) : null
@@ -1520,21 +1558,16 @@ export class RecipeWorkflowClient {
       )
     }
     const body = record(payload, 'Hair Asset lookup')
-    if (!Array.isArray(body.assets)) throw new Error('Hair Asset lookup returned no asset list.')
-    const matches = body.assets.filter((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
-      const candidate = entry as UnknownRecord
-      return (
-        candidate.assetId === selection.assetId &&
-        candidate.revisionId === selection.assetRevisionId
-      )
-    })
-    if (matches.length !== 1) {
+    const asset = await verifyHairAsset(body.asset)
+    if (
+      asset.assetId !== selection.assetId ||
+      asset.revisionId !== selection.assetRevisionId ||
+      asset.revisionSha256 !== selection.assetRevisionSha256
+    ) {
       throw new Error(
-        `Hair Asset ${selection.assetId}@${selection.assetRevisionId} is missing or ambiguous.`
+        `Hair Asset ${selection.assetId}@${selection.assetRevisionId} does not match its exact saved revision.`
       )
     }
-    const asset = await verifyHairAsset(matches[0])
     await validateHairStateBinding({
       asset,
       state: hairState,

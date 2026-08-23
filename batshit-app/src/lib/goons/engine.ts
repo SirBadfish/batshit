@@ -253,9 +253,13 @@ import { AppearanceDialsEngineRuntime } from '$lib/goons/appearanceDials.engine'
 import type { AppearanceDialValueState, AppearanceDialsManifest } from '$lib/goons/appearanceDials'
 import type { AnatomyFitResult } from '$lib/goons/recipe/anatomyFitContracts'
 import { FacialArtworkEngineRuntime } from '$lib/goons/facialArtwork.engine'
-import { type FacialArtworkDefinitionV4, type FacialArtworkStateV4 } from '$lib/goons/facialArtwork'
+import {
+  resolveFacialArtworkSocketProjectionMode,
+  type FacialArtworkDefinition,
+  type FacialArtworkState
+} from '$lib/goons/facialArtwork'
 import { EyeAppearanceEngineRuntime } from '$lib/goons/eyeAppearance.engine'
-import { type EyeAppearanceDefinitionV3, type EyeAppearanceStateV3 } from '$lib/goons/eyeAppearance'
+import { type EyeAppearanceDefinition, type EyeAppearanceState } from '$lib/goons/eyeAppearance'
 import { OralAppearanceEngineRuntime } from '$lib/goons/oralAppearance.engine'
 import {
   parseOralAppearanceDefinition,
@@ -286,8 +290,8 @@ import {
   SocketEyeSurfaceEngineRuntime,
   type SocketEyeCompositeVisualState
 } from '$lib/goons/socketEyeSurface.engine'
-import type { SocketEyeSurfaceDefinitionV1 } from '$lib/goons/socketEyeSurface'
-import type { EyeApertureSeamDefinitionV1 } from '$lib/goons/eyeApertureSeam'
+import type { SocketEyeSurfaceDefinitionV2 } from '$lib/goons/socketEyeSurface'
+import type { EyeApertureSeamDefinitionV2 } from '$lib/goons/eyeApertureSeam'
 import {
   resolveSocketEyeLookTargetWeights,
   resolveSocketEyeGaze,
@@ -1200,14 +1204,14 @@ export class GoonEngine implements GoonStageHost {
   private appearanceDialsValues: AppearanceDialValueState | null = null
   private appearanceDialsOwnedTargets = new Set<string>()
   private facialArtworkRuntime: FacialArtworkEngineRuntime | null = null
-  private facialArtworkDefinition: FacialArtworkDefinitionV4 | null = null
-  private facialArtworkState: FacialArtworkStateV4 | null = null
+  private facialArtworkDefinition: FacialArtworkDefinition | null = null
+  private facialArtworkState: FacialArtworkState | null = null
   private eyeAppearanceRuntime: EyeAppearanceEngineRuntime | null = null
-  private eyeAppearanceDefinition: EyeAppearanceDefinitionV3 | null = null
-  private eyeAppearanceState: EyeAppearanceStateV3 | null = null
+  private eyeAppearanceDefinition: EyeAppearanceDefinition | null = null
+  private eyeAppearanceState: EyeAppearanceState | null = null
   private socketEyeSurfaceRuntime: SocketEyeSurfaceEngineRuntime | null = null
-  private socketEyeSurfaceDefinition: SocketEyeSurfaceDefinitionV1 | null = null
-  private eyeApertureSeamDefinition: EyeApertureSeamDefinitionV1 | null = null
+  private socketEyeSurfaceDefinition: SocketEyeSurfaceDefinitionV2 | null = null
+  private eyeApertureSeamDefinition: EyeApertureSeamDefinitionV2 | null = null
   private socketEyeContact: SocketEyeContactSettingsV2
   private socketEyeGaze: Record<'left' | 'right', SocketEyeCoordinates> = {
     left: { horizontal: 0, vertical: 0 },
@@ -2052,8 +2056,8 @@ export class GoonEngine implements GoonStageHost {
     options: {
       bodyDialValues?: Record<string, number> | null
       appearanceDialValues?: AppearanceDialValueState | null
-      facialArtworkState?: FacialArtworkStateV4 | null
-      eyeAppearanceState?: EyeAppearanceStateV3 | null
+      facialArtworkState?: FacialArtworkState | null
+      eyeAppearanceState?: EyeAppearanceState | null
       oralAppearanceState?: OralAppearanceStateV1 | null
       lipArtworkState?: LipArtworkStateV2 | null
       lipArtworkEnabled?: boolean
@@ -4095,7 +4099,7 @@ export class GoonEngine implements GoonStageHost {
     return this.facialArtworkDefinition
   }
 
-  async setFacialArtworkState(value: FacialArtworkStateV4 | null) {
+  async setFacialArtworkState(value: FacialArtworkState | null) {
     const runtime = this.facialArtworkRuntime
     if (!runtime) {
       if (value) throw new Error('The loaded Goon package does not support facial artwork.')
@@ -4113,7 +4117,7 @@ export class GoonEngine implements GoonStageHost {
     return this.socketEyeSurfaceDefinition
   }
 
-  setEyeAppearanceState(value: EyeAppearanceStateV3 | null) {
+  setEyeAppearanceState(value: EyeAppearanceState | null) {
     const runtime = this.eyeAppearanceRuntime
     if (!runtime) {
       if (value) throw new Error('The loaded Goon package does not support Eye Appearance.')
@@ -4125,7 +4129,7 @@ export class GoonEngine implements GoonStageHost {
 
   private setupSocketEyeAppearance(
     packageValue: NonNullable<ReturnType<typeof parseFirstPartySocketEyePackage>>,
-    initialState: EyeAppearanceStateV3 | null
+    initialState: EyeAppearanceState | null
   ) {
     const root = this.customAvatarRoot
     if (!root) throw new Error('Custom avatar root is missing during socket-eye setup.')
@@ -4142,6 +4146,7 @@ export class GoonEngine implements GoonStageHost {
         pupilColor: packageValue.eyeAppearance.solidColorDefaults.pupil,
         irisRadiusMeters: physical.irisRadiusMeters,
         pupilRadiusRatio: physical.pupilRadiusRatio,
+        irisHorizontalOffsetMeters: physical.irisHorizontalOffsetMeters,
         irisVerticalOffsetMeters: physical.irisVerticalOffsetMeters,
         edgeSoftnessMeters: physical.edgeSoftnessMeters,
         scleraArtwork: { texture: null, tint: [1, 1, 1, 0], opacity: 0 },
@@ -4155,7 +4160,8 @@ export class GoonEngine implements GoonStageHost {
       root,
       packageValue.socketEyeSurface,
       packageValue.eyeApertureSeam,
-      { left: initialVisualState('left'), right: initialVisualState('right') }
+      { left: initialVisualState('left'), right: initialVisualState('right') },
+      resolveFacialArtworkSocketProjectionMode(packageValue.facialArtwork)
     )
     this.eyeAppearanceRuntime = eyeRuntime
     this.eyeAppearanceDefinition = packageValue.eyeAppearance
@@ -4392,15 +4398,15 @@ export class GoonEngine implements GoonStageHost {
   }
 
   private async setupFacialArtwork(
-    definition: FacialArtworkDefinitionV4,
-    initialState: FacialArtworkStateV4 | null
+    definition: FacialArtworkDefinition,
+    initialState: FacialArtworkState | null
   ) {
     const root = this.customAvatarRoot
     if (!root) throw new Error('Custom avatar root is missing during facial artwork setup.')
     const socketEyes = this.socketEyeSurfaceRuntime
     const eyeAppearance = this.eyeAppearanceRuntime
     if (!socketEyes || !eyeAppearance) {
-      throw new Error('Facial Artwork v4 requires the active socket-eye runtime.')
+      throw new Error('Facial Artwork v5 requires the active socket-eye runtime.')
     }
     const runtime = new FacialArtworkEngineRuntime(root, definition, socketEyes, eyeAppearance)
     try {
@@ -10762,6 +10768,24 @@ export class GoonEngine implements GoonStageHost {
     this.clearMorphTargetWeights(SOCKET_EYE_LOOK_TARGETS)
     for (const target of SOCKET_EYE_LOOK_TARGETS) {
       this.applyMorphTargetWeight(target, lookWeights.get(target) ?? 0, 'set')
+    }
+    const apertureSeam = this.eyeApertureSeamDefinition
+    if (!apertureSeam) {
+      throw new Error('[socket-eye-runtime] treatment correction requires the aperture seam.')
+    }
+    for (const side of ['left', 'right'] as const) {
+      const treatment = apertureSeam.runtimeBindings[side]
+      const projectionWeight = this.appearanceDialsRuntime
+        ? this.appearanceDialsRuntime.getFollowerMorphWeight(
+            treatment.lashesEyeOutlineNode,
+            treatment.treatment.surfaceCorrection.projectionMorph
+          )
+        : 1
+      socketEyes.setTreatmentSurfaceCorrection(
+        side,
+        this.customPerformanceTargetWeights.get(side === 'left' ? 'eyeBlinkLeft' : 'eyeBlinkRight') ?? 0,
+        projectionWeight
+      )
     }
   }
 

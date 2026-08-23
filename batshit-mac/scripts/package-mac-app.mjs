@@ -14,6 +14,7 @@ const electronVersion = '43.3.0';
 const entitlementsPath = join(macRoot, 'macos.entitlements');
 const localEntitlementsPath = join(macRoot, 'macos.local.entitlements');
 const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');
+const nodeRuntimeEntitlementsPath = join(macRoot, 'macos.node-runtime.entitlements');
 
 export const ELECTRON_SOURCE_FILES = Object.freeze([
   'main.mjs',
@@ -27,8 +28,19 @@ export const ELECTRON_SOURCE_FILES = Object.freeze([
   'desktop-goon-contract.mjs',
   'desktop-goon-window-policy.mjs',
   'desktop-goon-window-state.mjs',
-  'desktop-goon-window-controller.mjs'
+  'desktop-goon-window-controller.mjs',
+  'shutdown-lifecycle.mjs'
 ]);
+
+export const GOON_PACKAGE_UTI_DECLARATION = Object.freeze({
+  UTTypeIdentifier: 'ai.batshit.goon-package',
+  UTTypeDescription: 'Batshit Goon Package',
+  UTTypeConformsTo: ['public.zip-archive'],
+  UTTypeTagSpecification: {
+    'public.filename-extension': ['bgoon'],
+    'public.mime-type': ['application/vnd.batshit.goon+zip']
+  }
+});
 
 export function parsePackageArgs(argv) {
   let artifactSuffix = '';
@@ -100,6 +112,23 @@ export function signingOptionsForFile(filePath, { appPath, mainExecutable, adHoc
   if (filePath === appPath || filePath === mainExecutable) {
     return {
       entitlements: entitlementsPath,
+      hardenedRuntime: true,
+      timestamp
+    };
+  }
+  const managedNodeExecutable = join(
+    appPath,
+    'Contents',
+    'Resources',
+    'runtime',
+    'vendor',
+    'node',
+    'bin',
+    'node'
+  );
+  if (filePath === managedNodeExecutable) {
+    return {
+      entitlements: nodeRuntimeEntitlementsPath,
       hardenedRuntime: true,
       timestamp
     };
@@ -188,6 +217,7 @@ export async function packageMacApp(argv = process.argv.slice(2)) {
       CFBundleDisplayName: 'Batshit',
       CFBundleName: 'Batshit',
       LSApplicationCategoryType: 'public.app-category.productivity',
+      UTExportedTypeDeclarations: [GOON_PACKAGE_UTI_DECLARATION],
       NSMicrophoneUsageDescription:
         'Batshit uses your microphone for speech-to-text, voice mode, and LiveKit voice sessions when you turn voice features on.',
       NSSpeechRecognitionUsageDescription:

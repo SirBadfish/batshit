@@ -41,6 +41,62 @@ export type HairImportRecipeContext = {
   authoredRootMatrix: number[];
 };
 
+export function buildHairImportRecipeContext(input: {
+  recipeSourceGlb: Uint8Array;
+  appearanceManifest: Record<string, unknown>;
+  recipeSource: HairImportRecipeContext["recipeSource"];
+}): HairImportRecipeContext {
+  const appearance = parseAppearanceDialsManifest(input.appearanceManifest);
+  if (!appearance)
+    throw new Error("Recipe source manifest is missing appearance-dials/v2.");
+  if (appearance.definitionSha256 !== input.recipeSource.definitionSha256) {
+    throw new Error(
+      "Recipe source manifest does not match the active Appearance definition.",
+    );
+  }
+  const bodyNodes = Object.entries(appearance.nodes).filter(
+    ([, declaration]) =>
+      declaration.kind === "mesh" && declaration.role === "body",
+  );
+  if (bodyNodes.length !== 1) {
+    throw new Error(
+      "Recipe source must declare exactly one Appearance body mesh for Hair import.",
+    );
+  }
+  const rawRig = record(input.appearanceManifest.rig, "Recipe rig");
+  const performance = resolveCustomPerformanceRigManifest(rawRig.performance);
+  if (performance.issues.length > 0 || !performance.manifest) {
+    throw new Error(
+      performance.issues[0] ??
+        "Recipe source has no complete performance rig for Hair import.",
+    );
+  }
+  const headRigNode = resolveRequiredRigNode(performance.manifest, "head");
+  const neckRigNode = resolveRequiredRigNode(performance.manifest, "neck");
+  const parsed = parseSemanticGlb(input.recipeSourceGlb, {
+    diagnosticPrefix: "hair-import-recipe-context/v1",
+  });
+  resolveSemanticGlbNode(parsed, bodyNodes[0]![1].node, "Appearance body mesh");
+  const headIndex = resolveSemanticGlbNode(
+    parsed,
+    headRigNode,
+    "performance head node",
+  );
+  resolveSemanticGlbNode(parsed, neckRigNode, "performance neck node");
+  const authoredRootMatrix = nodeWorldMatrix(parsed, headIndex)
+    .invert()
+    .elements.map((value) => (Object.is(value, -0) ? 0 : value));
+  return {
+    recipeSourceGlb: input.recipeSourceGlb,
+    appearanceManifest: input.appearanceManifest,
+    recipeSource: input.recipeSource,
+    bodyManifestNodeId: bodyNodes[0]![0],
+    headRigNode,
+    neckRigNode,
+    authoredRootMatrix,
+  };
+}
+
 function record(value: unknown, context: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${context} must be one JSON object.`);
@@ -125,55 +181,11 @@ export async function loadHairImportRecipeContext(
     JSON.parse(UTF8.decode(manifestBytes)) as unknown,
     "Recipe source manifest",
   );
-  const appearance = parseAppearanceDialsManifest(appearanceManifest);
-  if (!appearance)
-    throw new Error("Recipe source manifest is missing appearance-dials/v2.");
-  if (appearance.definitionSha256 !== source.identities.definitionSha256) {
-    throw new Error(
-      "Recipe source manifest does not match the active Appearance definition.",
-    );
-  }
-  const bodyNodes = Object.entries(appearance.nodes).filter(
-    ([, declaration]) =>
-      declaration.kind === "mesh" && declaration.role === "body",
-  );
-  if (bodyNodes.length !== 1) {
-    throw new Error(
-      "Recipe source must declare exactly one Appearance body mesh for Hair import.",
-    );
-  }
-  const rawRig = record(appearanceManifest.rig, "Recipe rig");
-  const performance = resolveCustomPerformanceRigManifest(rawRig.performance);
-  if (performance.issues.length > 0 || !performance.manifest) {
-    throw new Error(
-      performance.issues[0] ??
-        "Recipe source has no complete performance rig for Hair import.",
-    );
-  }
-  const headRigNode = resolveRequiredRigNode(performance.manifest, "head");
-  const neckRigNode = resolveRequiredRigNode(performance.manifest, "neck");
-  const parsed = parseSemanticGlb(recipeSourceGlb, {
-    diagnosticPrefix: "hair-import-recipe-context/v1",
-  });
-  resolveSemanticGlbNode(parsed, bodyNodes[0]![1].node, "Appearance body mesh");
-  const headIndex = resolveSemanticGlbNode(
-    parsed,
-    headRigNode,
-    "performance head node",
-  );
-  resolveSemanticGlbNode(parsed, neckRigNode, "performance neck node");
-  const authoredRootMatrix = nodeWorldMatrix(parsed, headIndex)
-    .invert()
-    .elements.map((value) => (Object.is(value, -0) ? 0 : value));
-  return {
+  return buildHairImportRecipeContext({
     recipeSourceGlb,
     appearanceManifest,
     recipeSource: source.identities,
-    bodyManifestNodeId: bodyNodes[0]![0],
-    headRigNode,
-    neckRigNode,
-    authoredRootMatrix,
-  };
+  });
 }
 
 function dialDrivers(

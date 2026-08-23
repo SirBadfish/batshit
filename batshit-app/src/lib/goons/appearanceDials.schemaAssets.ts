@@ -51,7 +51,7 @@ const ALLOWED_NODE_ROLES = new Set<AppearanceDialNode["role"]>([
   "body",
   "face",
   "generic-follower",
-  "socket-eye-composite-cap",
+  "socket-eye-physical-eye",
   "brow-canvas",
   "eye-treatment-canvas",
   "teeth-upper",
@@ -63,7 +63,7 @@ const ALLOWED_NODE_ROLES = new Set<AppearanceDialNode["role"]>([
 ]);
 
 const EYE_NODE_ROLES = new Set<AppearanceDialNode["role"]>([
-  "socket-eye-composite-cap",
+  "socket-eye-physical-eye",
 ]);
 
 function parseApprovedProvenance(

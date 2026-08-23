@@ -4,8 +4,10 @@ const path = require('path');
 const sharp = require('sharp');
 const zlib = require('zlib');
 
-const CONTRACT = 'facial-artwork/v4';
-const PUBLIC_PREFIX = 'goons/facial-artwork/v4/';
+const CONTRACT = 'facial-artwork/v6';
+const STATE_CONTRACT = 'facial-artwork-state/v6';
+const DEFINITION_FILE = 'facial-artwork-v6.json';
+const PUBLIC_PREFIX = 'goons/facial-artwork/v6/';
 const ROLE_IDS = [
   'brows',
   'lashes_eye_outline',
@@ -22,12 +24,21 @@ const SOURCE_KINDS = new Set([
 ]);
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const TRUSTED_ARTWORK_OWNERS = [
+  'brows:left',
+  'brows:right',
+  'lashes_eye_outline:shared',
+  'iris:shared',
+  'pupil:shared',
+  'eye_highlight:shared',
+  'sclera:shared'
+];
 
 let cachedContract = null;
 
 class FacialArtworkValidationError extends Error {
   constructor(message) {
-    super(`[facial-artwork/v4] ${message}`);
+    super(`[${CONTRACT}] ${message}`);
     this.name = 'FacialArtworkValidationError';
     this.statusCode = 400;
   }
@@ -44,9 +55,112 @@ function sha256(buffer) {
 function resolveAssetRoot() {
   const candidates = [
     process.env.BATSHIT_FACIAL_ARTWORK_ASSET_ROOT,
-    path.resolve(__dirname, '../../../../batshit-app/static/goons/facial-artwork/v4')
+    path.resolve(__dirname, '../../../../batshit-app/static/goons/facial-artwork/v6')
   ].filter(Boolean);
   return candidates[0];
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(',')}}`;
+}
+
+function canonicalDefinitionSha256(contract) {
+  return sha256(canonicalJson({ ...contract, definitionSha256: null }));
+}
+
+function validateRoleAlphaPolicies(contract) {
+  for (const role of contract.roles) {
+    const correctedEdgeToEdgeRadialArtwork =
+      (role.id === 'iris' || role.id === 'pupil') &&
+      role.projection === 'constant-spherical-cap-radial/v1';
+    const expected =
+      role.id === 'sclera' || correctedEdgeToEdgeRadialArtwork
+        ? {
+            emptyArtworkAllowed: false,
+            fullyOpaqueAllowed: true,
+            transparencyRequired: false
+          }
+        : {
+            emptyArtworkAllowed: false,
+            fullyOpaqueAllowed: false,
+            transparencyRequired: true
+          };
+    if (JSON.stringify(role.alphaPolicy) !== JSON.stringify(expected)) {
+      throw new Error(
+        `[${CONTRACT}] trusted alpha policy drifted for ${role.id}`
+      );
+    }
+  }
+}
+
+async function validateTrustedArtwork(root, contract) {
+  const entries = contract?.trustedArtwork?.entries;
+  if (
+    !Array.isArray(entries) ||
+    entries.map((entry) => `${entry?.role}:${entry?.side}`).join('|') !==
+      TRUSTED_ARTWORK_OWNERS.join('|')
+  ) {
+    throw new Error(`[${CONTRACT}] trusted artwork owner inventory drifted`);
+  }
+
+  for (const entry of entries) {
+    const assetPath = resolveContractAsset(root, entry?.asset?.path);
+    const bytes = await fs.readFile(assetPath);
+    if (!HASH_PATTERN.test(entry?.asset?.sha256 || '') || sha256(bytes) !== entry.asset.sha256) {
+      throw new Error(
+        `[${CONTRACT}] trusted artwork hash drifted for ${entry.role}:${entry.side}`
+      );
+    }
+    if (entry.derivation === 'exact-source-bytes') {
+      if (entry.sourceSha256 !== entry.asset.sha256) {
+        throw new Error(
+          `[${CONTRACT}] trusted exact-source ownership drifted for ${entry.role}:${entry.side}`
+        );
+      }
+    }
+    if (
+      entry.derivation === 'piecewise-affine-uv-remap' &&
+      entry.derivedFromSha256 !== entry.sourceSha256
+    ) {
+      throw new Error(
+        `[${CONTRACT}] trusted UV-remap source ownership drifted for ${entry.role}:${entry.side}`
+      );
+    }
+  }
+
+  const left = entries.find((entry) => entry.role === 'brows' && entry.side === 'left');
+  const right = entries.find((entry) => entry.role === 'brows' && entry.side === 'right');
+  if (
+    right?.derivation !== 'horizontal-mirror-of-left' ||
+    right?.sourceSha256 !== left?.asset?.sha256 ||
+    right?.derivedFromSha256 !== left?.asset?.sha256
+  ) {
+    throw new Error(`[${CONTRACT}] trusted right brow derivation drifted`);
+  }
+  const leftBytes = await fs.readFile(resolveContractAsset(root, left.asset.path));
+  const rightBytes = await fs.readFile(resolveContractAsset(root, right.asset.path));
+  const mirrored = await sharp(leftBytes, { failOn: 'error' })
+    .flop()
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const decodedRight = await sharp(rightBytes, { failOn: 'error' })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  if (
+    mirrored.info.width !== decodedRight.info.width ||
+    mirrored.info.height !== decodedRight.info.height ||
+    mirrored.info.channels !== decodedRight.info.channels ||
+    !mirrored.data.equals(decodedRight.data)
+  ) {
+    throw new Error(`[${CONTRACT}] trusted right brow is not an exact horizontal mirror`);
+  }
 }
 
 function resolveContractAsset(root, publicPath) {
@@ -69,13 +183,13 @@ function resolveContractAsset(root, publicPath) {
 
 async function loadContract() {
   const root = resolveAssetRoot();
-  const contractPath = path.join(root, 'facial-artwork-v4.json');
+  const contractPath = path.join(root, DEFINITION_FILE);
   let raw;
   try {
     raw = await fs.readFile(contractPath, 'utf8');
   } catch (error) {
     throw new Error(
-      `[facial-artwork/v4] trusted validator assets are unavailable at ${contractPath}: ${error.message}`
+      `[${CONTRACT}] trusted validator assets are unavailable at ${contractPath}: ${error.message}`
     );
   }
   const sourceSha256 = sha256(raw);
@@ -89,17 +203,26 @@ async function loadContract() {
   try {
     contract = JSON.parse(raw);
   } catch {
-    throw new Error('[facial-artwork/v4] trusted validator definition is invalid JSON');
+    throw new Error(`[${CONTRACT}] trusted validator definition is invalid JSON`);
   }
-  if (contract?.schemaVersion !== CONTRACT || !HASH_PATTERN.test(contract?.definitionSha256 || '')) {
-    throw new Error('[facial-artwork/v4] trusted validator definition has an unsupported contract');
+  if (
+    contract?.schemaVersion !== CONTRACT ||
+    contract?.stateSchemaVersion !== STATE_CONTRACT ||
+    !HASH_PATTERN.test(contract?.definitionSha256 || '')
+  ) {
+    throw new Error(`[${CONTRACT}] trusted validator definition has an unsupported contract`);
+  }
+  if (contract.definitionSha256 !== canonicalDefinitionSha256(contract)) {
+    throw new Error(`[${CONTRACT}] trusted validator definition hash drifted`);
   }
   if (
     !Array.isArray(contract.roles) ||
     contract.roles.map((role) => role?.id).join('|') !== ROLE_IDS.join('|')
   ) {
-    throw new Error('[facial-artwork/v4] trusted validator role inventory drifted');
+    throw new Error(`[${CONTRACT}] trusted validator role inventory drifted`);
   }
+  validateRoleAlphaPolicies(contract);
+  await validateTrustedArtwork(root, contract);
   cachedContract = { root, contractPath, sourceSha256, contract };
   return cachedContract;
 }
@@ -206,7 +329,8 @@ function resolveTemplateVariant(template, orientation) {
   fail(`template ${template?.id || 'unknown'} does not support orientation ${String(orientation)}`);
 }
 
-function validateAlpha(roleId, rgba, mask, width, height) {
+function validateAlpha(role, rgba, mask, width, height) {
+  const roleId = role.id;
   let painted = 0;
   let transparent = 0;
   let minX = width;
@@ -233,64 +357,19 @@ function validateAlpha(roleId, rgba, mask, width, height) {
       maxY = Math.max(maxY, y);
     }
   }
-  if (painted === 0) fail(`${roleId} artwork alpha is empty`);
-  if (transparent === 0) fail(`${roleId} artwork must retain transparent pixels`);
+  if (painted === 0 && role.alphaPolicy.emptyArtworkAllowed !== true) {
+    fail(`${roleId} artwork alpha is empty`);
+  }
+  if (
+    transparent === 0 &&
+    (role.alphaPolicy.transparencyRequired === true ||
+      role.alphaPolicy.fullyOpaqueAllowed !== true)
+  ) {
+    fail(`${roleId} artwork must retain transparent pixels`);
+  }
   if (roleId === 'brows') {
     if (maxX - minX + 1 < width * 0.08 || maxY - minY + 1 < height * 0.02) {
       fail(`${roleId} alpha footprint is too small`);
-    }
-  }
-}
-
-function validateEyeSeams(roleId, rgba, width, height, template, semanticMap, palette) {
-  if (roleId !== 'lashes_eye_outline') return;
-  const tolerance = template.splits?.maximumJoinAlphaDelta;
-  if (
-    !Number.isInteger(tolerance) ||
-    tolerance < 0 ||
-    !Buffer.isBuffer(semanticMap) ||
-    semanticMap.length !== width * height ||
-    !palette ||
-    !Number.isInteger(palette.inner_upper_transition) ||
-    !Number.isInteger(palette.inner_lower_transition) ||
-    !Number.isInteger(palette.outer_upper_transition) ||
-    !Number.isInteger(palette.outer_lower_transition)
-  ) {
-    throw new Error('[facial-artwork/v4] trusted lashes/outline seam contract is malformed');
-  }
-
-  const joins = [
-    {
-      upper: palette.inner_upper_transition,
-      lower: palette.inner_lower_transition,
-      label: 'inner canthus'
-    },
-    {
-      upper: palette.outer_upper_transition,
-      lower: palette.outer_lower_transition,
-      label: 'outer canthus'
-    }
-  ];
-  const maximumAlpha = (region) => {
-    let maximum = 0;
-    let samples = 0;
-    for (let pixel = 0; pixel < semanticMap.length; pixel += 1) {
-      if (semanticMap[pixel] === region) {
-        maximum = Math.max(maximum, rgba[pixel * 4 + 3]);
-        samples += 1;
-      }
-    }
-    if (samples === 0) {
-      throw new Error(`[facial-artwork/v4] trusted lashes semantic region ${region} is empty`);
-    }
-    return maximum;
-  };
-
-  for (const join of joins) {
-    const upper = maximumAlpha(join.upper);
-    const lower = maximumAlpha(join.lower);
-    if ((upper === 0) !== (lower === 0) || Math.abs(upper - lower) > tolerance) {
-      fail(`${roleId} has a discontinuous ${join.label} upper/lower join`);
     }
   }
 }
@@ -299,32 +378,14 @@ async function loadTrustedMask(root, template, variant) {
   const maskPath = resolveContractAsset(root, variant.safePaintMask.path);
   const maskBytes = await fs.readFile(maskPath);
   if (sha256(maskBytes) !== variant.safePaintMask.sha256) {
-    throw new Error(`[facial-artwork/v4] trusted safe mask hash drifted for ${template.id}`);
+    throw new Error(`[${CONTRACT}] trusted safe mask hash drifted for ${template.id}`);
   }
   const mask = await sharp(maskBytes, { failOn: 'error' }).greyscale().raw().toBuffer();
   const [width, height] = template.dimensions;
   if (mask.length !== width * height) {
-    throw new Error(`[facial-artwork/v4] trusted safe mask channels drifted for ${template.id}`);
+    throw new Error(`[${CONTRACT}] trusted safe mask channels drifted for ${template.id}`);
   }
   return mask;
-}
-
-async function loadTrustedSemanticMap(root, template, variant) {
-  const record = variant.semanticMap;
-  if (!record?.path || !record?.sha256 || record.channels !== 'L8' || !record.palette) {
-    throw new Error(`[facial-artwork/v4] trusted semantic map is missing for ${template.id}`);
-  }
-  const semanticPath = resolveContractAsset(root, record.path);
-  const semanticBytes = await fs.readFile(semanticPath);
-  if (sha256(semanticBytes) !== record.sha256) {
-    throw new Error(`[facial-artwork/v4] trusted semantic map hash drifted for ${template.id}`);
-  }
-  const semanticMap = await sharp(semanticBytes, { failOn: 'error' }).greyscale().raw().toBuffer();
-  const [width, height] = template.dimensions;
-  if (semanticMap.length !== width * height) {
-    throw new Error(`[facial-artwork/v4] trusted semantic map channels drifted for ${template.id}`);
-  }
-  return { semanticMap, palette: record.palette };
 }
 
 async function prepareFacialArtworkUpload(input) {
@@ -332,8 +393,8 @@ async function prepareFacialArtworkUpload(input) {
   const roleId = String(input.role || '');
   const role = contract.roles.find((candidate) => candidate.id === roleId);
   if (!role) fail('role is unknown');
-  if (!HASH_PATTERN.test(input.definitionSha256 || '')) {
-    fail('definitionSha256 must be a lowercase SHA-256 hash');
+  if (input.definitionSha256 !== contract.definitionSha256) {
+    fail(`definitionSha256 does not match the trusted ${CONTRACT} contract`);
   }
   const template = contract.templates.find((candidate) => candidate.id === role.template);
   const variant = resolveTemplateVariant(template, input.orientation);
@@ -384,10 +445,6 @@ async function prepareFacialArtworkUpload(input) {
   }
 
   const mask = await loadTrustedMask(root, template, variant);
-  const semantic =
-    roleId === 'lashes_eye_outline'
-      ? await loadTrustedSemanticMap(root, template, variant)
-      : null;
   const rgba = Buffer.from(decoded.data);
   let clippedAlphaPixels = 0;
   let clearedTransparentRgbPixels = 0;
@@ -419,7 +476,7 @@ async function prepareFacialArtworkUpload(input) {
     !png.types.includes('sRGB') ||
     png.types.includes('iCCP')
   ) {
-    throw new Error(`[facial-artwork/v4] canonical PNG preparation drifted for ${roleId}`);
+    throw new Error(`[${CONTRACT}] canonical PNG preparation drifted for ${roleId}`);
   }
   const canonicalMetadata = await sharp(buffer, {
     failOn: 'error',
@@ -431,18 +488,9 @@ async function prepareFacialArtworkUpload(input) {
     canonicalMetadata.depth !== 'uchar' ||
     canonicalMetadata.hasProfile === true
   ) {
-    throw new Error(`[facial-artwork/v4] canonical decoder metadata drifted for ${roleId}`);
+    throw new Error(`[${CONTRACT}] canonical decoder metadata drifted for ${roleId}`);
   }
-  validateAlpha(roleId, rgba, mask, png.width, png.height);
-  validateEyeSeams(
-    roleId,
-    rgba,
-    png.width,
-    png.height,
-    template,
-    semantic?.semanticMap,
-    semantic?.palette
-  );
+  validateAlpha(role, rgba, mask, png.width, png.height);
   const provenance = parseProvenance(input.provenance);
   const artwork = {
     role: roleId,
