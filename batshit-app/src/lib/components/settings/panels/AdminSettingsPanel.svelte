@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte'
   import { debounce } from '$lib/utils/debounce'
-  import { downloadBlob } from '$lib/utils/download'
+  import { downloadBlob, exportBackupNatively } from '$lib/utils/download'
   import * as Collapsible from '$lib/components/ui/collapsible'
   import * as Select from '$lib/components/ui/select'
   import { Badge } from '$lib/components/ui/badge'
@@ -1375,6 +1375,14 @@
     backupExportBusy = true
     backupError = null
     try {
+      const nativeResult = await exportBackupNatively(includeSecrets)
+      if (nativeResult) {
+        if (!nativeResult.canceled) {
+          toast.success(includeSecrets ? 'Backup with secrets exported' : 'Backup exported')
+        }
+        return
+      }
+
       const response = await fetch('/api/admin/backup/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

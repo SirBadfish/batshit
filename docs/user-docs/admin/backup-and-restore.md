@@ -43,7 +43,8 @@ Use normal Export Backup for most situations.
 1. Open Settings → Admin.
 2. Find Backup and Restore.
 3. Click Export Backup.
-4. Store the `.zip` somewhere safe.
+4. In the Mac app, choose the destination when the Save dialog opens. Batshit then streams the backup directly to that file.
+5. Store the `.zip` somewhere safe.
 
 Normal backups exclude saved provider keys, tokens, and other secrets. After restoring a normal backup, re-enter missing provider keys and reconnect external services as needed.
 
@@ -128,6 +129,8 @@ Mac app backups include Batshit-owned uploads when those uploads are in the conf
 
 Back those up with normal host backup tools. Advanced source-checkout repair setups follow the same host-backup boundary.
 
+The Mac app does not impose its 1 GiB incoming-request limit on backup exports. Export streams to a temporary file beside the destination and replaces the destination only after the complete backup finishes. Available disk space and the actual included assets are the practical concerns for large exports.
+
 ## Good backup habits
 
 - Export a normal backup after your first working setup.
@@ -158,7 +161,7 @@ Mac app/source-checkout repair and Docker use different file paths. Docker users
 
 ### Backup file is huge
 
-Large Goons, Motion Vault assets, Clips, and uploaded files make backups large. Use Settings → Admin → Goon Asset Cleanup to inspect orphaned Goon upload records before export.
+Large source packages and Live Goons can each contribute hundreds of megabytes. Retained Goon Recipe revisions, Hair assets, Motion Vault assets, Closet items, scenes, Clips, and other uploaded files can also make backups large. That size is expected when the data is active. Use Settings → Admin → Goon Asset Cleanup to inspect orphaned Goon upload records before export; it does not delete referenced assets just to make a backup smaller.
 
 ## Related docs
 

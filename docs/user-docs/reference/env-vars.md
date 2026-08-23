@@ -49,7 +49,7 @@ These apply when Batshit runs through `Batshit.app` or directly from source on t
 | `BATSHIT_UPDATE_LATEST_VERSION` | blank | Optional local/test override for the latest available version. Leave blank for normal installs. |
 | `BATSHIT_UPDATE_RELEASE_URL` / `BATSHIT_UPDATE_DOWNLOAD_URL` | blank | Optional local/test links used with `BATSHIT_UPDATE_LATEST_VERSION`. |
 | `N8N_BATSHIT_FRONTEND_URL` | Mac app: `http://127.0.0.1:5620`; Docker: the app/container-reachable Batshit URL | Server-to-server Batshit app URL that n8n workflows call for native-tool dispatch and callbacks. |
-| `BODY_SIZE_LIMIT` | Mac app: `1G`; source checkout: unset/SvelteKit default unless you set it | SvelteKit request body limit. The Mac app sets this so large Admin restores and Goon imports can reach batshit-server's route-specific upload handlers. |
+| `BODY_SIZE_LIMIT` | Mac app: `1G`; source checkout: unset/SvelteKit default unless you set it | SvelteKit incoming request body limit. The Mac app sets this so large Admin restores and Goon imports can reach route-specific handlers. It does not limit packaged-Mac backup export, which streams directly to the selected file. |
 | `REDIS_URL` | Mac app: `redis://127.0.0.1:5639/0`; source checkout: `redis://localhost:6379/0` | Redis Stack connection string. |
 | `REDIS_HOST` | Mac app: `127.0.0.1`; source checkout: `localhost` | Redis host when not using `REDIS_URL`. |
 | `REDIS_PORT` | Mac app: `5639`; source checkout: `6379` | Redis port when not using `REDIS_URL`. |
@@ -86,7 +86,7 @@ These live in `.env.docker`.
 | `BATSHIT_ARTIFACT_COMPLETE_URL` | blank | Leave blank for Docker's internal default `http://app:3000/api/artifacts/complete`. |
 | `BATSHIT_SESSION_COOKIE_SECURE` | blank | Leave blank for automatic local HTTP vs HTTPS behavior. |
 | `BATSHIT_SESSION_COOKIE_NAME` | `batshit_session_docker` | Lets Docker stay logged in beside another local Batshit instance. |
-| `BODY_SIZE_LIMIT` | `1G` | SvelteKit request body limit for large Admin restore and trusted local import requests. batshit-server still applies narrower Goon-specific caps. |
+| `BODY_SIZE_LIMIT` | `1G` | SvelteKit incoming request body limit for large Admin restore and trusted local import requests. It is not a generated-backup size limit. Current restore still needs memory proportional to the archive, and batshit-server applies narrower Goon-specific caps. |
 | `BATSHIT_APP_VERSION` | `0.1.0-alpha.1` | Current installed Batshit version shown by the in-app update check. |
 | `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
 | `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks. |

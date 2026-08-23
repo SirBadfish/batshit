@@ -34,6 +34,10 @@ import {
   validateDesktopGoonCommandEnvelope
 } from './desktop-goon-contract.mjs';
 import { DesktopGoonWindowController } from './desktop-goon-window-controller.mjs';
+import {
+  createBackupExportFilename,
+  streamBackupExportToFile
+} from './backup-export-download.mjs';
 import { resolveMainWindowSizePolicy } from './main-window-policy.mjs';
 import { settleShutdownPreparations } from './shutdown-lifecycle.mjs';
 
@@ -46,10 +50,12 @@ import {
   isExactDesktopControlsUrl,
   isExactDesktopGoonUrl,
   isSafeExternalUrl,
+  resolveBackupExportUrl,
   resolveDesktopControlsUrl,
   resolveDesktopGoonUrl,
   resolveShellAssetPath,
   validateElectronIpcSender,
+  validateBackupExportOptions,
   validateGoonPackageFileSelection,
   validateGoonPackageHandleId,
   validateGoonPackageReadRequest,
@@ -273,6 +279,34 @@ function installIpcHandlers() {
       defaultPath
     });
     return result.canceled ? null : result.filePath || null;
+  });
+
+  ipcMain.handle('batshit:export-backup', async (event, rawOptions) => {
+    const record = validateIpcSender(event, [DESKTOP_GOON_WINDOW_ROLES.main]);
+    const options = validateBackupExportOptions(rawOptions);
+    const exportUrl = resolveBackupExportUrl(
+      event.senderFrame.url,
+      allowedOrigins,
+      desktopGoonUrl,
+      desktopControlsUrl
+    );
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Batshit Backup',
+      defaultPath: join(app.getPath('downloads'), createBackupExportFilename()),
+      filters: [{ name: 'Batshit backup', extensions: ['zip'] }]
+    });
+    const targetPath = result.canceled ? null : result.filePath || null;
+    if (!targetPath) {
+      return { completed: false, native: true, canceled: true };
+    }
+
+    await streamBackupExportToFile({
+      electronSession: record.webContents.session,
+      exportUrl,
+      includeSecrets: options.includeSecrets,
+      targetPath
+    });
+    return { completed: true, native: true, canceled: false, path: targetPath };
   });
 
   ipcMain.handle('batshit:open-goon-package', async (event) => {

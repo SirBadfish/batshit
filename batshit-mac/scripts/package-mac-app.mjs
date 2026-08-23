@@ -18,6 +18,7 @@ const nodeRuntimeEntitlementsPath = join(macRoot, 'macos.node-runtime.entitlemen
 
 export const ELECTRON_SOURCE_FILES = Object.freeze([
   'main.mjs',
+  'backup-export-download.mjs',
   'main-window-policy.mjs',
   'preload.cjs',
   'electron-shell-policy.mjs',

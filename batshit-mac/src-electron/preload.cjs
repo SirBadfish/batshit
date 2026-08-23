@@ -338,6 +338,11 @@ const zero = role === 'desktop'
           return ipcRenderer.invoke('batshit:release-goon-package', handleId);
         }
       }),
+      downloads: Object.freeze({
+        exportBackup(options = {}) {
+          return ipcRenderer.invoke('batshit:export-backup', options);
+        }
+      }),
       desktopGoon,
       desktopControls,
       lifecycle

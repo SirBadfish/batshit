@@ -16,7 +16,9 @@ import {
   normalizeLoopbackOrigin,
   resolveDesktopControlsUrl,
   resolveDesktopGoonUrl,
+  resolveBackupExportUrl,
   resolveShellAssetPath,
+  validateBackupExportOptions,
   validateElectronIpcSender,
   validateGoonPackageFileSelection,
   validateGoonPackageHandleId,
@@ -83,6 +85,34 @@ test('save dialog bridge rejects capability expansion and malformed values', () 
   assert.throws(() => validateSaveFileOptions({ properties: ['createDirectory'] }), /Unsupported/);
   assert.throws(() => validateSaveFileOptions([]), /must be an object/);
   assert.throws(() => validateSaveFileOptions({ title: 'bad\0title' }), /Invalid/);
+});
+
+test('backup export bridge accepts only its boolean option and exact local app route', () => {
+  assert.deepEqual(validateBackupExportOptions(), { includeSecrets: false });
+  assert.deepEqual(validateBackupExportOptions({ includeSecrets: true }), { includeSecrets: true });
+  assert.throws(() => validateBackupExportOptions({ url: 'http://localhost:9999' }), /Unsupported/);
+  assert.throws(() => validateBackupExportOptions({ includeSecrets: 'yes' }), /must be a boolean/);
+
+  const origins = collectAllowedOrigins({ BATSHIT_FRONTEND_PORT: '5650' });
+  const desktopUrl = resolveDesktopGoonUrl({ BATSHIT_FRONTEND_PORT: '5650' });
+  const controlsUrl = resolveDesktopControlsUrl({ BATSHIT_FRONTEND_PORT: '5650' });
+  assert.equal(
+    resolveBackupExportUrl(
+      'http://127.0.0.1:5650/settings/admin?tab=backup',
+      origins,
+      desktopUrl,
+      controlsUrl
+    ),
+    'http://127.0.0.1:5650/api/admin/backup/export'
+  );
+  assert.throws(
+    () => resolveBackupExportUrl('http://localhost:9999/', origins, desktopUrl, controlsUrl),
+    /authenticated main Batshit window/
+  );
+  assert.throws(
+    () => resolveBackupExportUrl('batshit-shell://app/index.html', origins, desktopUrl, controlsUrl),
+    /local Batshit app origin/
+  );
 });
 
 test('Goon package picker accepts only bounded regular .bgoon and .zip files', () => {

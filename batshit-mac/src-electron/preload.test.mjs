@@ -74,6 +74,7 @@ test('main preload retains existing narrow APIs and adds Desktop Goon commands',
     'desktopControls',
     'desktopGoon',
     'dialogs',
+    'downloads',
     'invoke',
     'lifecycle'
   ]);
@@ -82,6 +83,11 @@ test('main preload retains existing narrow APIs and adds Desktop Goon commands',
   const invocation = ipcRenderer.listeners('batshit:desktop-goon:status');
   assert.equal(invocation.length, 1);
   assert.equal(Object.isFrozen(zero.dialogs), true);
+  assert.equal(Object.isFrozen(zero.downloads), true);
+  assert.deepEqual(
+    await zero.downloads.exportBackup({ includeSecrets: true }),
+    ['batshit:export-backup', { includeSecrets: true }]
+  );
   assert.deepEqual(await zero.dialogs.openGoonPackage(), ['batshit:open-goon-package']);
   assert.deepEqual(
     await zero.dialogs.readGoonPackageChunk({ handleId: 'selection', offset: 0, length: 4 }),

@@ -248,6 +248,35 @@ export function validateSaveFileOptions(value) {
   return result;
 }
 
+export function validateBackupExportOptions(value) {
+  if (value === undefined || value === null) return { includeSecrets: false };
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Backup export options must be an object.');
+  }
+  const allowed = new Set(['includeSecrets']);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`Unsupported backup export option: ${key}`);
+  }
+  if (value.includeSecrets !== undefined && typeof value.includeSecrets !== 'boolean') {
+    throw new Error('Backup export includeSecrets must be a boolean.');
+  }
+  return { includeSecrets: value.includeSecrets === true };
+}
+
+export function resolveBackupExportUrl(value, allowedOrigins, desktopUrl, controlsUrl) {
+  if (!isAllowedMainWindowUrl(value, allowedOrigins, desktopUrl, controlsUrl)) {
+    throw new Error('Backup export requires the authenticated main Batshit window.');
+  }
+  const parsed = new URL(value);
+  if (parsed.protocol !== 'http:' || !LOOPBACK_HOSTS.has(parsed.hostname)) {
+    throw new Error('Backup export requires the local Batshit app origin.');
+  }
+  parsed.pathname = '/api/admin/backup/export';
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString();
+}
+
 export function validateGoonPackageFileSelection(filePath, stats) {
   if (
     typeof filePath !== 'string' ||
