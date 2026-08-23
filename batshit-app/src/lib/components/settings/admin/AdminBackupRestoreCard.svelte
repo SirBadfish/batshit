@@ -14,6 +14,7 @@
   interface Props {
     exportBusy: boolean
     preflightBusy: boolean
+    stageProgress: number | null
     restoreBusy: boolean
     selectedFile: File | null
     preflight: BackupPreflightSummary | null
@@ -29,6 +30,7 @@
   let {
     exportBusy,
     preflightBusy,
+    stageProgress,
     restoreBusy,
     selectedFile,
     preflight,
@@ -149,6 +151,9 @@
               >
                 {selectedFile?.name ?? 'No file chosen'}
               </span>
+              {#if selectedFile}
+                <span class="batshit-settings-form-help">{formatBackupBytes(selectedFile.size)}</span>
+              {/if}
             </div>
             <div class="batshit-backup-action-row">
               <Button
@@ -160,7 +165,9 @@
               >
                 {#if preflightBusy}
                   <Loader2 class="animate-spin" aria-hidden="true" />
-                  Inspecting
+                  {stageProgress !== null && stageProgress < 100
+                    ? `Staging ${stageProgress}%`
+                    : 'Inspecting'}
                 {:else}
                   <RefreshCw aria-hidden="true" />
                   Inspect
@@ -171,7 +178,7 @@
                 size="sm"
                 variant="destructive"
                 onclick={onRestore}
-                disabled={!selectedFile || !preflight || restoreBusy || preflightBusy}
+                disabled={!selectedFile || !preflight || !preflight.disk.sufficient || restoreBusy || preflightBusy}
               >
                 {#if restoreBusy}
                   <Loader2 class="animate-spin" aria-hidden="true" />
@@ -199,11 +206,23 @@
           <Badge variant="outline">
             Secrets {preflight.manifest.secrets.included ? 'Included' : 'Excluded'}
           </Badge>
+          <Badge variant="outline">Archive {formatBackupBytes(preflight.stage.archiveBytes)}</Badge>
           {#if preflight.userRemapRequired}
             <Badge variant="outline">
               {preflight.sourceUserId} -> {preflight.targetUserId}
             </Badge>
           {/if}
+        </div>
+        <div class="mt-3 rounded border border-border/70 bg-background/60 px-2.5 py-2">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <span class="batshit-settings-form-label">Restore Disk Space</span>
+            <span class={`batshit-settings-form-help ${preflight.disk.sufficient ? '' : 'is-danger'}`}>
+              {formatBackupBytes(preflight.disk.requiredBytes)} required / {formatBackupBytes(preflight.disk.availableBytes)} available
+            </span>
+          </div>
+          <p class="batshit-settings-form-help mt-1">
+            Required space covers restored upload files, the validated Redis plan, and a disk-backed copy of current Redis data for rollback.
+          </p>
         </div>
         <div class="mt-3 grid gap-2 sm:grid-cols-2">
           {#each preflight.manifest.contents.groups.filter((group) => group.recordCount > 0 || group.fileAssetCount > 0) as group}

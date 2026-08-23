@@ -1,9 +1,11 @@
 const express = require('express');
 const taskRoutes = require('./task');
+const backupRestoreStagingRoutes = require('./backup-restore-staging').router;
 
 const router = express.Router();
 
 router.use('/task', taskRoutes);
+router.use('/backup-restore', backupRestoreStagingRoutes);
 
 // API information
 router.get('/', (req, res) => {

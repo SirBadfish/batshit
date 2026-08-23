@@ -4,7 +4,8 @@
  * surface:
  *
  * - health checks stay public
- * - every /api and /api/v1 route requires the service token (G-0162/G-0238)
+ * - every /api and /api/v1 control route requires the service token (G-0162/G-0238)
+ * - the one raw backup-stage stream requires its separate one-use upload ticket
  * - the task dispatcher only accepts allow-listed tool names (G-0162)
  * - the unauthenticated .env settings route family is gone (G-0163)
  * - the Express server does not expose the streamable MCP endpoint directly
@@ -17,6 +18,8 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const net = require('net');
+const fs = require('fs/promises');
+const os = require('os');
 
 jest.setTimeout(30000);
 
@@ -25,6 +28,7 @@ const TEST_TOKEN = 'gauntlet-security-wave-test-token';
 
 let child;
 let baseUrl;
+let backupStagingDir;
 
 async function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -56,6 +60,7 @@ async function waitForHealth(url, timeoutMs = 20000) {
 }
 
 beforeAll(async () => {
+  backupStagingDir = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-server-backup-stage-test-'));
   const port = await findFreePort();
   baseUrl = `http://127.0.0.1:${port}`;
   child = spawn(process.execPath, ['src/index.js'], {
@@ -73,6 +78,7 @@ beforeAll(async () => {
       REDIS_URL: 'redis://127.0.0.1:1/0',
       LOG_LEVEL: 'error',
       BATSHIT_HTTP_LOGS: 'false',
+      BATSHIT_BACKUP_STAGING_DIR: backupStagingDir,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -95,6 +101,7 @@ afterAll(async () => {
       });
     });
   }
+  if (backupStagingDir) await fs.rm(backupStagingDir, { recursive: true, force: true });
 });
 
 const tokenHeaders = { 'x-batshit-service-token': TEST_TOKEN };
@@ -124,6 +131,24 @@ describe('public surface', () => {
     expect(status).not.toBe(401);
     expect(status).not.toBe(403);
   });
+
+  it('allows the trusted Batshit browser origin to preflight a ticketed backup stream', async () => {
+    const response = await fetch(
+      `${baseUrl}/api/v1/backup-restore/stages/11111111-2222-4333-8444-555555555555/content`,
+      {
+        method: 'OPTIONS',
+        headers: {
+          origin: 'http://127.0.0.1:5620',
+          'access-control-request-method': 'PUT',
+          'access-control-request-headers': 'content-type,x-batshit-upload-ticket',
+        },
+      },
+    );
+    expect(response.status).toBe(204);
+    expect(response.headers.get('access-control-allow-origin')).toBe('http://127.0.0.1:5620');
+    expect(response.headers.get('access-control-allow-methods')).toContain('PUT');
+    expect(response.headers.get('access-control-allow-headers')).toContain('x-batshit-upload-ticket');
+  });
 });
 
 describe('token gate on the API surface (G-0162/G-0238)', () => {
@@ -137,6 +162,7 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     { method: 'POST', path: '/api/upload/goon-hair-asset' },
     { method: 'POST', path: '/api/upload/goon-hair-import-source' },
     { method: 'GET', path: '/api/v1/' },
+    { method: 'POST', path: '/api/v1/backup-restore/stages', body: { userId: 'user', filename: 'backup.zip', expectedBytes: 3 } },
   ];
 
   for (const probe of protectedProbes) {
@@ -164,6 +190,58 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.taskId).toBe('some-task-id');
+  });
+
+  it('streams a ticket-bound backup into private staging with exact size and hash', async () => {
+    const bytes = Buffer.from('large-backup-fixture');
+    const ticketResponse = await fetch(`${baseUrl}/api/v1/backup-restore/stages`, {
+      method: 'POST',
+      headers: { ...tokenHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        userId: 'restore-user',
+        filename: 'batshit-backup.zip',
+        expectedBytes: bytes.length,
+      }),
+    });
+    expect(ticketResponse.status).toBe(201);
+    const ticket = await ticketResponse.json();
+
+    const uploadResponse = await fetch(
+      `${baseUrl}/api/v1/backup-restore/stages/${ticket.stageId}/content`,
+      {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/zip',
+          'x-batshit-upload-ticket': ticket.ticket,
+        },
+        body: bytes,
+      },
+    );
+    expect(uploadResponse.status).toBe(201);
+    const staged = await uploadResponse.json();
+    expect(staged).toMatchObject({ staged: true, stageId: ticket.stageId, bytes: bytes.length });
+    expect(staged.sha256).toMatch(/^[0-9a-f]{64}$/);
+
+    await expect(fs.readFile(path.join(backupStagingDir, `${ticket.stageId}.zip`))).resolves.toEqual(bytes);
+    const metadata = JSON.parse(
+      await fs.readFile(path.join(backupStagingDir, `${ticket.stageId}.json`), 'utf8'),
+    );
+    expect(metadata).toMatchObject({
+      contract: 'batshit-backup-stage/v1',
+      userId: 'restore-user',
+      bytes: bytes.length,
+      sha256: staged.sha256,
+    });
+
+    const replay = await fetch(
+      `${baseUrl}/api/v1/backup-restore/stages/${ticket.stageId}/content`,
+      {
+        method: 'PUT',
+        headers: { 'x-batshit-upload-ticket': ticket.ticket },
+        body: bytes,
+      },
+    );
+    expect(replay.status).toBe(401);
   });
 
   it('rejects a Hair artifact without exact immutable-owner IDs before storage', async () => {

@@ -33,6 +33,7 @@ services:
       SESSION_STORAGE_PATH: /data/sessions
       SESSIONS_DIR: /data/sessions
       UPLOADS_DIR: /data/uploads
+      BATSHIT_BACKUP_STAGING_DIR: /data/backup-restore-staging
       BATSHIT_SERVER_LOG_DIR: /data/logs
       BATSHIT_ARTIFACT_COMPLETE_URL: ${BATSHIT_ARTIFACT_COMPLETE_URL:-http://app:3000/api/artifacts/complete}
       CORS_ORIGIN: ${ORIGIN:-http://localhost:5620}
@@ -44,6 +45,7 @@ services:
     volumes:
       - batshit_server_sessions:/data/sessions
       - batshit_uploads:/data/uploads
+      - batshit_backup_restore_staging:/data/backup-restore-staging
       - batshit_logs:/data/logs
       - ${BATSHIT_WORKSPACE_MOUNT:-batshit_workspace}:/workspace
     depends_on:
@@ -101,6 +103,7 @@ services:
       BATSHIT_WORKSPACE_MOUNT: ${BATSHIT_WORKSPACE_MOUNT:-}
       BATSHIT_WORKSPACE_CONTAINER_PATH: /workspace
       UPLOADS_DIR: /data/uploads
+      BATSHIT_BACKUP_STAGING_DIR: /data/backup-restore-staging
       BATSHIT_LOG_DIR: /data/logs
       BATSHIT_SERVER_LOG_DIR: /data/logs
       BATSHIT_SERVER_URL: http://batshit-server:5600
@@ -142,6 +145,7 @@ services:
         condition: service_healthy
     volumes:
       - batshit_uploads:/data/uploads
+      - batshit_backup_restore_staging:/data/backup-restore-staging
       - batshit_logs:/data/logs
       - ${BATSHIT_WORKSPACE_MOUNT:-batshit_workspace}:/workspace
       - batshit_codex_home:/root/.codex
@@ -495,6 +499,7 @@ volumes:
   batshit_redis_data:
   batshit_server_sessions:
   batshit_uploads:
+  batshit_backup_restore_staging:
   batshit_logs:
   batshit_workspace:
   batshit_codex_home:

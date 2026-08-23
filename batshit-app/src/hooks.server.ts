@@ -21,9 +21,14 @@ import {
   shouldBlockHostedVercelAppRequest
 } from '$lib/server/services/hostedAppGuard'
 import { applyBaselineSecurityHeaders } from '$lib/server/services/securityHeaders'
+import {
+  ensureBackupRestoreRecovery,
+  enterBackupRestoreHttpRequest
+} from '$lib/server/services/backupRestoreService'
 import { sequence } from '@sveltejs/kit/hooks'
 
 let startupIntegrityInitialized = false
+let startupIntegrityPromise: Promise<void> | null = null
 
 type BatshitRuntimeShutdownGlobal = typeof globalThis & {
   __batshitRuntimeShutdownRegistered?: boolean
@@ -101,17 +106,52 @@ export function assertInternalServiceTokenConfigured() {
 }
 
 function ensureStartupIntegrityPass() {
-  if (startupIntegrityInitialized) return
-  startupIntegrityInitialized = true
-  assertApiKeyEncryptionConfigured()
-  assertInternalServiceTokenConfigured()
-  void ensureSkillFilesystemStartup()
-  void listCoreSystemPrompts().catch((error) => {
-    console.error('[Startup] Failed to seed core system prompt defaults:', error)
-  })
-  void removeRetiredSystemClips().catch((error) => {
-    console.error('[Startup] Failed to remove retired system clips:', error)
-  })
+  if (!startupIntegrityInitialized) {
+    startupIntegrityInitialized = true
+    assertApiKeyEncryptionConfigured()
+    assertInternalServiceTokenConfigured()
+    startupIntegrityPromise = (async () => {
+      await ensureBackupRestoreRecovery()
+      void ensureSkillFilesystemStartup()
+      void listCoreSystemPrompts().catch((error) => {
+        console.error('[Startup] Failed to seed core system prompt defaults:', error)
+      })
+      void removeRetiredSystemClips().catch((error) => {
+        console.error('[Startup] Failed to remove retired system clips:', error)
+      })
+    })()
+  }
+  return startupIntegrityPromise ?? Promise.resolve()
+}
+
+const startupIntegrityHandler: Handle = async ({ event, resolve }) => {
+  try {
+    await ensureStartupIntegrityPass()
+  } catch (error) {
+    console.error('[Startup] Backup restore recovery failed:', error)
+    return new Response(
+      JSON.stringify({
+        error: 'Batshit could not safely recover an interrupted backup restore. Check the app logs before retrying.'
+      }),
+      { status: 503, headers: { 'Content-Type': 'application/json' } }
+    )
+  }
+  return resolve(event)
+}
+
+const backupRestoreMaintenanceHandler: Handle = async ({ event, resolve }) => {
+  const releaseRequest = enterBackupRestoreHttpRequest()
+  if (!releaseRequest) {
+    return new Response(
+      JSON.stringify({ error: 'Batshit is finishing a backup restore. Try again after the app reloads.' }),
+      { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '2' } }
+    )
+  }
+  try {
+    return await resolve(event)
+  } finally {
+    releaseRequest()
+  }
 }
 
 const hostedVercelAppGuardHandler: Handle = async ({ event, resolve }) => {
@@ -124,7 +164,6 @@ const hostedVercelAppGuardHandler: Handle = async ({ event, resolve }) => {
 
 // Rate limiting handler
 const rateLimitHandler: Handle = async ({ event, resolve }) => {
-  ensureStartupIntegrityPass()
   const path = event.url.pathname;
   const rateLimitingDisabled = env.BATSHIT_DISABLE_API_RATE_LIMITS === '1'
   const isAuthenticatedUser = Boolean(event.locals.user?.id)
@@ -255,6 +294,8 @@ const securityHeadersHandler: Handle = async ({ event, resolve }) => {
 export const handle = sequence(
   securityHeadersHandler,
   hostedVercelAppGuardHandler,
+  startupIntegrityHandler,
+  backupRestoreMaintenanceHandler,
   sessionHandler,
   rateLimitHandler
 );

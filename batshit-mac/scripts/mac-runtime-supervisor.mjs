@@ -509,6 +509,7 @@ async function ensureRuntimeEnv() {
   setIfMissing('DOCKER_MCP_PROFILE', process.env.DOCKER_MCP_PROFILE || process.env.DOCKER_MCP_GATEWAY_PROFILE || 'default');
   setIfMissing('BODY_SIZE_LIMIT', '1G');
   setIfMissing('UPLOADS_DIR', join(paths.data, 'uploads'));
+  setIfMissing('BATSHIT_BACKUP_STAGING_DIR', join(paths.data, 'backup-restore-staging'));
   setIfMissing('SESSION_STORAGE_PATH', join(paths.data, 'sessions'));
   setIfMissing('SESSIONS_DIR', join(paths.data, 'sessions'));
   setIfMissing('BATSHIT_RUNTIME_DATA_DIR', runtimeDir);

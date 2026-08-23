@@ -379,6 +379,8 @@
   let backupPreflightBusy = $state(false)
   let backupRestoreBusy = $state(false)
   let backupSelectedFile = $state<File | null>(null)
+  let backupStageId = $state<string | null>(null)
+  let backupStageProgress = $state<number | null>(null)
   let backupPreflight = $state<BackupPreflightSummary | null>(null)
   let backupError = $state<string | null>(null)
   let backupConfirmReplace = $state(false)
@@ -1501,6 +1503,8 @@
     const input = event.target as HTMLInputElement
     backupSelectedFile = input.files?.[0] ?? null
     backupPreflight = null
+    backupStageId = null
+    backupStageProgress = null
     backupConfirmReplace = false
     backupError = null
 
@@ -1509,16 +1513,62 @@
     }
   }
 
+  async function stageBackupFile(file: File) {
+    const ticketResponse = await fetch('/api/admin/backup/stage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, bytes: file.size })
+    })
+    if (!ticketResponse.ok) {
+      throw new Error(await extractError(ticketResponse, 'Failed to prepare backup staging'))
+    }
+    const ticket = await ticketResponse.json()
+    if (!ticket?.stageId || !ticket?.ticket || !ticket?.uploadUrl) {
+      throw new Error('Backup staging did not return a usable upload ticket')
+    }
+
+    backupStageProgress = 0
+    await new Promise<void>((resolve, reject) => {
+      const request = new XMLHttpRequest()
+      request.open('PUT', ticket.uploadUrl)
+      request.setRequestHeader('Content-Type', 'application/zip')
+      request.setRequestHeader('x-batshit-upload-ticket', ticket.ticket)
+      request.upload.onprogress = (event) => {
+        if (!event.lengthComputable) return
+        backupStageProgress = Math.min(99, Math.round((event.loaded / event.total) * 100))
+      }
+      request.onerror = () => reject(new Error('Backup staging connection failed'))
+      request.onabort = () => reject(new Error('Backup staging was canceled'))
+      request.onload = () => {
+        if (request.status >= 200 && request.status < 300) {
+          backupStageProgress = 100
+          resolve()
+          return
+        }
+        let message = 'Failed to stage backup'
+        try {
+          message = JSON.parse(request.responseText)?.error || message
+        } catch {
+          // Keep the stable fallback when the server did not return JSON.
+        }
+        reject(new Error(message))
+      }
+      request.send(file)
+    })
+    backupStageId = ticket.stageId
+    return ticket.stageId as string
+  }
+
   async function handleBackupPreflight() {
     if (!backupSelectedFile || backupPreflightBusy) return
     backupPreflightBusy = true
     backupError = null
     try {
-      const form = new FormData()
-      form.set('backup', backupSelectedFile)
+      const stageId = backupStageId ?? (await stageBackupFile(backupSelectedFile))
       const response = await fetch('/api/admin/backup/preflight', {
         method: 'POST',
-        body: form
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stageId })
       })
       if (!response.ok) {
         const message = await extractError(response, 'Failed to inspect backup')
@@ -1532,11 +1582,12 @@
       toast.error(message)
     } finally {
       backupPreflightBusy = false
+      if (backupStageProgress === 100) backupStageProgress = null
     }
   }
 
-	  async function handleBackupRestore() {
-	    if (!backupSelectedFile || backupRestoreBusy) return
+  async function handleBackupRestore() {
+    if (!backupSelectedFile || !backupStageId || backupRestoreBusy) return
     if (backupPreflight?.requiresDestructiveConfirmation && !backupConfirmReplace) {
       backupError = 'Confirm replace-current-data before restoring this backup.'
       return
@@ -1545,12 +1596,13 @@
     backupRestoreBusy = true
     backupError = null
     try {
-      const form = new FormData()
-      form.set('backup', backupSelectedFile)
-      form.set('confirmReplace', backupConfirmReplace ? 'true' : 'false')
       const response = await fetch('/api/admin/backup/restore', {
         method: 'POST',
-        body: form
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          stageId: backupStageId,
+          confirmReplace: backupConfirmReplace
+        })
       })
       if (!response.ok) {
         const message = await extractError(response, 'Failed to restore backup')
@@ -1566,9 +1618,9 @@
       backupError = message
       toast.error(message)
     } finally {
-	      backupRestoreBusy = false
-	    }
-	  }
+      backupRestoreBusy = false
+    }
+  }
 
 	  async function loadGoonAssetAudit(showToast = true) {
 	    if (goonAssetAuditBusy || goonAssetCleanupBusy) return
@@ -1771,6 +1823,7 @@
     <AdminBackupRestoreCard
       exportBusy={backupExportBusy}
       preflightBusy={backupPreflightBusy}
+      stageProgress={backupStageProgress}
       restoreBusy={backupRestoreBusy}
       selectedFile={backupSelectedFile}
       preflight={backupPreflight}

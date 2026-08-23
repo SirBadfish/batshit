@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 
 import { unzipSync, zipSync } from 'fflate/node'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
@@ -40,13 +41,19 @@ import {
   recipeAuthoringRevisionSha256,
   recipeRevisionBundleSha256,
   recipeRevisionIdentity,
+  recipeSiblingStateSha256,
   recipeStateSnapshotSha256
 } from '$lib/goons/recipe'
 import {
   BackupRestoreError,
+  beginBackupRestoreMaintenance,
   createBackupBundle,
   createBackupBundleStream,
+  ensureBackupRestoreRecovery,
+  enterBackupRestoreHttpRequest,
   preflightBackupRestore,
+  preflightStagedBackupRestore,
+  restoreStagedBackup,
   restoreBackupBundle
 } from '../backupRestoreService'
 
@@ -58,6 +65,8 @@ let previousPublicServerUrl: string | undefined
 let previousContainerized: string | undefined
 let previousRuntimeEnv: string | undefined
 let previousCodexWorkdir: string | undefined
+let previousBackupStagingDir: string | undefined
+let backupStagingRoot: string
 
 const EYE_HASH = 'a'.repeat(64)
 const SOCKET_HASH = 'b'.repeat(64)
@@ -410,8 +419,11 @@ describe('backupRestoreService', () => {
     previousContainerized = process.env.BATSHIT_CONTAINERIZED
     previousRuntimeEnv = process.env.BATSHIT_RUNTIME_ENV
     previousCodexWorkdir = process.env.BATSHIT_CODEX_WORKDIR
+    previousBackupStagingDir = process.env.BATSHIT_BACKUP_STAGING_DIR
     uploadRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-backup-test-'))
+    backupStagingRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'batshit-restore-stage-test-'))
     process.env.UPLOADS_DIR = uploadRoot
+    process.env.BATSHIT_BACKUP_STAGING_DIR = backupStagingRoot
     process.env.PUBLIC_BATSHIT_SERVER_URL = 'http://localhost:5614'
     delete process.env.BATSHIT_CONTAINERIZED
     delete process.env.BATSHIT_RUNTIME_ENV
@@ -444,7 +456,13 @@ describe('backupRestoreService', () => {
     } else {
       process.env.BATSHIT_CODEX_WORKDIR = previousCodexWorkdir
     }
+    if (previousBackupStagingDir === undefined) {
+      delete process.env.BATSHIT_BACKUP_STAGING_DIR
+    } else {
+      process.env.BATSHIT_BACKUP_STAGING_DIR = previousBackupStagingDir
+    }
     await fs.rm(uploadRoot, { recursive: true, force: true })
+    await fs.rm(backupStagingRoot, { recursive: true, force: true })
   })
 
   it('exports a structured backup that excludes secrets by default', async () => {
@@ -585,6 +603,140 @@ describe('backupRestoreService', () => {
       schemaVersion: 'eye-appearance-state/v5',
       irisSize: 1.1
     })
+  })
+
+  it('preflights and restores a disk-staged archive without buffering upload assets', async () => {
+    await seedRepresentativeData('source')
+    const bundle = await createBackupBundle('source')
+    const stageId = '11111111-2222-4333-8444-555555555555'
+    const archivePath = path.join(backupStagingRoot, `${stageId}.zip`)
+    await fs.writeFile(archivePath, bundle.bytes)
+    await fs.writeFile(
+      path.join(backupStagingRoot, `${stageId}.json`),
+      `${JSON.stringify({
+        contract: 'batshit-backup-stage/v1',
+        stageId,
+        userId: 'target',
+        filename: 'batshit-backup.zip',
+        bytes: bundle.bytes.byteLength,
+        sha256: createHash('sha256').update(bundle.bytes).digest('hex'),
+        stagedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        archivePath
+      })}\n`
+    )
+    await redis.json.set('user:target:settings', '$', {
+      id: 'settings_target',
+      user_id: 'target',
+      displayName: 'Old Target'
+    })
+    await fs.writeFile(path.join(uploadRoot, 'old-target-only.txt'), 'old target')
+
+    const preflight = await preflightStagedBackupRestore('target', stageId)
+    expect(preflight.stage).toMatchObject({ id: stageId, archiveBytes: bundle.bytes.byteLength })
+    expect(preflight.disk?.sufficient).toBe(true)
+    expect(preflight.fileAssetCount).toBe(3)
+
+    const tamperedBytes = new Uint8Array(bundle.bytes)
+    tamperedBytes[Math.floor(tamperedBytes.byteLength / 2)] ^= 0xff
+    await fs.writeFile(archivePath, tamperedBytes)
+    await expect(
+      restoreStagedBackup('target', stageId, { confirmReplace: true })
+    ).rejects.toThrow(/verified SHA-256 identity/)
+    await fs.writeFile(archivePath, bundle.bytes)
+
+    const result = await restoreStagedBackup('target', stageId, { confirmReplace: true })
+    expect(result).toMatchObject({ restored: true, fileAssetCount: 3, targetUserId: 'target' })
+    await expect(fs.readFile(path.join(uploadRoot, 'images', 'photo.png'), 'utf8')).resolves.toBe(
+      'image-bytes'
+    )
+    await expect(fs.stat(path.join(uploadRoot, 'old-target-only.txt'))).rejects.toThrow()
+    await expect(fs.stat(archivePath)).rejects.toThrow()
+    await expect(redis.json.get('user:target:settings')).resolves.toMatchObject({
+      user_id: 'target',
+      displayName: 'Source User'
+    })
+  })
+
+  it('recovers Redis and uploaded files from an interrupted restore journal', async () => {
+    const stageId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    const originalRecord = {
+      key: 'user:target:settings',
+      type: 'json' as const,
+      value: { id: 'settings_target', user_id: 'target', displayName: 'Before Restore' },
+      ttlSeconds: null,
+      groupId: 'settings' as const
+    }
+    const targetRecord = {
+      ...originalRecord,
+      value: { id: 'settings_target', user_id: 'target', displayName: 'Interrupted Target' }
+    }
+    await redis.json.set(originalRecord.key, '$', targetRecord.value)
+
+    const oldRoot = path.join(uploadRoot, `.restore-old-${stageId}`)
+    await fs.mkdir(oldRoot, { recursive: true })
+    await fs.writeFile(path.join(oldRoot, 'before.txt'), 'before restore')
+    await fs.writeFile(path.join(uploadRoot, 'after.txt'), 'partial restore')
+    await fs.writeFile(
+      path.join(backupStagingRoot, `${stageId}.plan.ndjson`),
+      `${JSON.stringify(targetRecord)}\n`
+    )
+    await fs.writeFile(
+      path.join(backupStagingRoot, `${stageId}.rollback.ndjson`),
+      `${JSON.stringify(originalRecord)}\n`
+    )
+    await fs.writeFile(
+      path.join(backupStagingRoot, `${stageId}.restore-journal.json`),
+      `${JSON.stringify({
+        contract: 'batshit-backup-restore-journal/v1',
+        stageId,
+        userId: 'target',
+        phase: 'redis-replacing',
+        hadOriginalUploads: true,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      })}\n`
+    )
+
+    await ensureBackupRestoreRecovery()
+
+    await expect(redis.json.get(originalRecord.key)).resolves.toMatchObject({
+      displayName: 'Before Restore'
+    })
+    await expect(fs.readFile(path.join(uploadRoot, 'before.txt'), 'utf8')).resolves.toBe(
+      'before restore'
+    )
+    await expect(fs.stat(path.join(uploadRoot, 'after.txt'))).rejects.toThrow()
+    await expect(
+      fs.stat(path.join(backupStagingRoot, `${stageId}.restore-journal.json`))
+    ).rejects.toThrow()
+  })
+
+  it('drains active HTTP work and blocks new requests during restore maintenance', async () => {
+    const releaseRestoreRequest = enterBackupRestoreHttpRequest()
+    const releaseOtherRequest = enterBackupRestoreHttpRequest()
+    expect(releaseRestoreRequest).toBeTypeOf('function')
+    expect(releaseOtherRequest).toBeTypeOf('function')
+
+    let maintenanceStarted = false
+    const maintenancePromise = beginBackupRestoreMaintenance().then((endMaintenance) => {
+      maintenanceStarted = true
+      return endMaintenance
+    })
+    await Promise.resolve()
+    expect(maintenanceStarted).toBe(false)
+    expect(enterBackupRestoreHttpRequest()).toBeNull()
+
+    releaseOtherRequest?.()
+    const endMaintenance = await maintenancePromise
+    expect(maintenanceStarted).toBe(true)
+    expect(enterBackupRestoreHttpRequest()).toBeNull()
+
+    endMaintenance()
+    const releaseAfterMaintenance = enterBackupRestoreHttpRequest()
+    expect(releaseAfterMaintenance).toBeTypeOf('function')
+    releaseAfterMaintenance?.()
+    releaseRestoreRequest?.()
   })
 
   it('keeps user-owned seeded agents and models restorable', async () => {
@@ -747,6 +899,10 @@ describe('backupRestoreService', () => {
         skeletonHierarchySha256: sha('b')
       }
     }
+    const previewState = {
+      schemaVersion: 'backup-preview-state/v1',
+      displayUrl: 'http://localhost:5606/uploads/goons/recipe-preview.png'
+    }
     const state = {
       contract: GOON_RECIPE_STATE_CONTRACT,
       stateSha256: sha('0'),
@@ -758,7 +914,13 @@ describe('backupRestoreService', () => {
         values: { body_height: 0 },
         unlockedDialIds: []
       },
-      siblings: []
+      siblings: [{
+        id: 'backupPreview',
+        contract: previewState.schemaVersion,
+        definitionSha256: sha('5'),
+        stateSha256: await recipeSiblingStateSha256(previewState),
+        state: previewState
+      }]
     }
     state.stateSha256 = await recipeStateSnapshotSha256(state)
     const receiptDocument = await createGoonRecipeDocument({
@@ -1062,6 +1224,15 @@ describe('backupRestoreService', () => {
     expect(restoredGoon.recipe.activeRevision.ref).toBe(targetRevisionKey)
     expect(restoredGoon.recipe.activeRevision.sha256).not.toBe(envelope.envelopeSha256)
     expect(restoredGoon.recipe.pendingJob.jobRef).toBe(targetJobKey)
+    expect(restoredGoon.recipe.authoringRevision.state.siblings[0]).toMatchObject({
+      stateSha256: await recipeSiblingStateSha256({
+        ...previewState,
+        displayUrl: '/uploads/goons/recipe-preview.png'
+      }),
+      state: {
+        displayUrl: '/uploads/goons/recipe-preview.png'
+      }
+    })
 
     const restoredRevision = (await redis.json.get(targetRevisionKey)) as Record<string, any>
     expect(restoredRevision.sourceContainmentReceipt.ref).toBe(targetReceiptKey)

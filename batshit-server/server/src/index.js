@@ -20,6 +20,7 @@ const {
   enforceTrustedOrigin,
 } = require('./utils/httpSecurity');
 const { requireServiceToken } = require('./utils/serviceTokenAuth');
+const { uploadStageContent } = require('./api/backup-restore-staging');
 
 // Create Express app
 const app = express();
@@ -107,6 +108,12 @@ function healthHandler(req, res) {
 app.get('/health', healthHandler);
 app.get('/api/v1/health', healthHandler);
 
+// This one large-file route intentionally sits outside the shared service-token
+// gate. It accepts only a raw byte stream carrying a short-lived, one-use,
+// high-entropy ticket minted by the authenticated app route. Trusted-origin
+// enforcement above still applies; all stage management remains service-token gated.
+app.put('/api/v1/backup-restore/stages/:stageId/content', uploadStageContent);
+
 // Every API route below requires the shared service token. Browser features
 // reach these through session-authed batshit-app proxy routes; n8n custom
 // nodes and app server services attach the token directly. Only the health
@@ -171,6 +178,7 @@ async function startServers() {
   }
 
   logger.info(`Upload directory: ${config.uploadsDir}`);
+  logger.info(`Backup restore staging directory: ${config.backupStagingDir}`);
 
   if (shutdownRequested) return;
 

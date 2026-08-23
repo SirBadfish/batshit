@@ -220,7 +220,7 @@ Docker defaults to:
 BODY_SIZE_LIMIT=1G
 ```
 
-If a trusted local import is larger and your machine has enough memory, raise `BODY_SIZE_LIMIT` in `.env.docker`, then recreate containers. Large Goon files and backup restores can take time — don't refresh the browser mid-restore unless the app clearly failed.
+This setting applies to app-front-door imports such as Goons, not backup restore. Backup restore streams directly into Batshit's private shared staging volume and shows its own disk-capacity preflight. If restore staging fails, recreate both current app/server containers together and verify `PUBLIC_BATSHIT_SERVER_URL`, `CORS_ORIGIN`, and free disk space. Raise `BODY_SIZE_LIMIT` only for a trusted product import whose own documented cap also permits it.
 
 ## Where to look for logs
 
