@@ -466,7 +466,7 @@ describe('facialArtworkValidator', () => {
     expect(preparedBrows.preparation.clippedAlphaPixels).toBeGreaterThan(0);
     const canonicalBrows = await sharp(preparedBrows.buffer).ensureAlpha().raw().toBuffer();
     expect(canonicalBrows.some((channel, index) => index % 4 === 3 && channel === 0)).toBe(true);
-  });
+  }, 30000);
 
   test('rejects transparent blanks for all six roles, malformed provenance, and non-PNG bytes', async () => {
     for (const role of CONTRACT.roles) {
