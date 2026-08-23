@@ -28,7 +28,9 @@ Use each external tool's own backup/export process for those.
 
 Check that you're signed in as Admin, the app can reach Redis, batshit-server upload storage is reachable, the browser didn't block the download, and there's enough disk space.
 
-If the backup is very large, wait for the download to start — active Goons, Motion Vault clips, Closet textures, and scene assets can make backups large. Before exporting, you can use Settings → Admin → Goon Asset Cleanup to inspect and delete orphaned Goon upload records/files.
+In the Mac app, the Save dialog opens before export starts. Choose a destination and leave the app running while Batshit streams the archive there. Active Goons, retained source packages and Recipe revisions, Motion Vault clips, Closet textures, Hair assets, scenes, Clips, and other uploads can make a valid backup several gigabytes. Before exporting, you can use Settings → Admin → Goon Asset Cleanup to inspect and delete orphaned Goon upload records/files.
+
+If the Mac app reports that the backup's `Content-length` exceeds `1073741824` bytes, that build is using the old blob re-upload path. Update or rebuild the Mac app; increasing `BODY_SIZE_LIMIT` is not the export fix.
 
 ## Should I use With Secrets?
 
@@ -129,7 +131,7 @@ Docker app request bodies default to:
 BODY_SIZE_LIMIT=1G
 ```
 
-If a trusted local backup is larger and your host has enough memory, raise `BODY_SIZE_LIMIT` in `.env.docker`, recreate the containers, and try again. batshit-server still applies upload-specific caps after the request reaches the server.
+This limit applies to the incoming restore upload, not backup export. If a trusted local backup is larger and your host has enough memory, raise `BODY_SIZE_LIMIT` in `.env.docker`, recreate the containers, and try again. Current restore materializes and parses the archive in memory, so do not set an enormous or unlimited value casually; batshit-server still applies upload-specific caps after the request reaches the server.
 
 ## Restore into Mac app vs Docker
 

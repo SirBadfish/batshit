@@ -39,6 +39,7 @@ test('unsafe or unknown package arguments fail closed', () => {
 test('the immutable Electron staging inventory includes every required shell module', () => {
   assert.deepEqual(ELECTRON_SOURCE_FILES, [
     'main.mjs',
+    'backup-export-download.mjs',
     'main-window-policy.mjs',
     'preload.cjs',
     'electron-shell-policy.mjs',

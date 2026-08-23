@@ -10,6 +10,9 @@ type ZeroNativeApi = {
   dialogs?: {
     saveFile?: (options?: ZeroNativeSaveFileOptions) => Promise<string | null>
   }
+  downloads?: {
+    exportBackup?: (options: { includeSecrets: boolean }) => Promise<DownloadResult>
+  }
 }
 
 type DownloadOptions = {
@@ -55,8 +58,25 @@ function encodePathForHeader(path: string): string {
 function resolveZeroNative(): ZeroNativeApi | null {
   if (!browser) return null
   const maybeZero = (window as typeof window & { zero?: ZeroNativeApi }).zero
-  if (typeof maybeZero?.dialogs?.saveFile !== 'function') return null
-  return maybeZero
+  return maybeZero && typeof maybeZero === 'object' ? maybeZero : null
+}
+
+export async function exportBackupNatively(
+  includeSecrets: boolean
+): Promise<DownloadResult | null> {
+  const zero = resolveZeroNative()
+  if (typeof zero?.downloads?.exportBackup !== 'function') return null
+  const result = await zero.downloads.exportBackup({ includeSecrets })
+  if (
+    !result ||
+    typeof result.completed !== 'boolean' ||
+    result.native !== true ||
+    typeof result.canceled !== 'boolean' ||
+    (result.path !== undefined && typeof result.path !== 'string')
+  ) {
+    throw new Error('The Mac backup export returned an invalid result.')
+  }
+  return result
 }
 
 async function tryNativeDownload(
