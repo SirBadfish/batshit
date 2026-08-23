@@ -131,7 +131,7 @@ BATSHIT_WORKSPACE_MOUNT=
 
 `BATSHIT_WORKSPACE_MOUNT` controls what host folder appears as `/workspace` inside Docker. To let agents work on real project files, mount the project or repo folder there.
 
-The default `BODY_SIZE_LIMIT=1G` applies to incoming requests and allows large Admin backup restores and multi-hundred-MB Advanced/Blender Goon imports through the app front door. It does not limit generated backup exports. batshit-server still applies upload-specific caps afterward, and current restore still needs memory proportional to the uploaded archive.
+The default `BODY_SIZE_LIMIT=1G` protects ordinary incoming app requests and allows multi-hundred-MB Advanced/Blender Goon imports through the app front door. It does not limit backup export or restore. Exports stream out; restore uses a ticket-bound raw stream into the private shared staging volume and reads large assets from disk.
 
 ## Settings and API keys
 

@@ -19,6 +19,8 @@ const defaultConfig = {
     process.env.BATSHIT_REDIS_REQUIRED === 'true' || process.env.NODE_ENV === 'production',
   pluginsDir: path.join(__dirname, 'plugins'),
   uploadsDir: process.env.UPLOADS_DIR || path.join(__dirname, '../uploads'),
+  backupStagingDir:
+    process.env.BATSHIT_BACKUP_STAGING_DIR || path.join(__dirname, '../data/backup-restore-staging'),
   cors: {
     origin: process.env.CORS_ORIGIN || '*'
   }
@@ -49,6 +51,14 @@ if (!fs.existsSync(config.uploadsDir)) {
     fs.mkdirSync(config.uploadsDir, { recursive: true });
   } catch (error) {
     console.error(`Failed to create uploads directory: ${error.message}`);
+  }
+}
+
+if (!fs.existsSync(config.backupStagingDir)) {
+  try {
+    fs.mkdirSync(config.backupStagingDir, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    console.error(`Failed to create backup staging directory: ${error.message}`);
   }
 }
 

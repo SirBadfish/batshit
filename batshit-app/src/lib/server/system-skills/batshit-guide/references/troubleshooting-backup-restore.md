@@ -115,7 +115,11 @@ Fix: check the restore result for file-asset warnings, open the Goon record in S
 
 ## Restore seems stuck
 
-Large restores take time because Batshit may be writing Redis records and upload files. Wait if progress is still active, check app logs if there's no progress for a long time, and check disk space and Redis health. Don't refresh during the critical restore step unless the app clearly failed. If Redis writes fail, Batshit's restore path is rollback-aware: it tries to remove imported records and restore previous ones.
+Large restores first stream the selected archive into private disk staging, then inspect it entry by entry. The button shows staging progress before inspection. Restore itself prepares a separate upload tree and disk-backed Redis rollback before replacing anything, so a multi-gigabyte backup can legitimately take time even when memory stays stable.
+
+Wait if progress is still active, check the preflight disk row, and check app logs if there is no progress for a long time. If Redis or file replacement fails, Batshit restores the previous Redis records and upload tree. If the app stops during the critical step, restart it normally; startup resolves the durable restore journal before Batshit serves ordinary requests.
+
+If Batshit says restore is waiting for active work, stop the current chat send or other long-running task and retry. No restore data has been changed at that point.
 
 ## Backup file is too large
 
@@ -123,15 +127,11 @@ Common size sources: active Advanced/Blender Goons, Motion Vault previews, Close
 
 Use Settings → Admin → Goon Asset Cleanup to remove orphaned Goon upload records/files before export. Also remove unneeded old sessions, clips, and artifacts from inside Batshit when appropriate. Don't manually delete upload files from disk behind Batshit's back unless you're intentionally repairing a broken instance and understand the references.
 
-## Docker restore upload is rejected
+## Docker restore staging fails
 
-Docker app request bodies default to:
+Backup restore does not use Docker's `BODY_SIZE_LIMIT`; that limit still protects ordinary app requests and large product imports. Restore streams directly into the private shared `batshit_backup_restore_staging` volume with a short-lived one-use ticket.
 
-```env
-BODY_SIZE_LIMIT=1G
-```
-
-This limit applies to the incoming restore upload, not backup export. If a trusted local backup is larger and your host has enough memory, raise `BODY_SIZE_LIMIT` in `.env.docker`, recreate the containers, and try again. Current restore materializes and parses the archive in memory, so do not set an enormous or unlimited value casually; batshit-server still applies upload-specific caps after the request reaches the server.
+If staging fails, confirm both `app` and `batshit-server` were recreated from the same current Compose file, `PUBLIC_BATSHIT_SERVER_URL` is reachable from the browser, the host has enough free disk space, and the Batshit app origin matches `CORS_ORIGIN`. Do not raise `BODY_SIZE_LIMIT` as a restore fix.
 
 ## Restore into Mac app vs Docker
 

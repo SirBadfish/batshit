@@ -46,6 +46,7 @@
 		"@types/bcrypt": "^6.0.0",
 		"@types/prismjs": "^1.26.6",
 		"@types/three": "^0.183.1",
+		"@types/yauzl": "^2.10.3",
 		"@vitest/coverage-v8": "^4.1.2",
 		"@vitest/ui": "^4.1.2",
 		"autoprefixer": "^10.4.27",
@@ -101,6 +102,7 @@
 		"svelte-dnd-action": "^0.9.69",
 		"svelte-sonner": "^1.0.5",
 		"uuid": "^13.0.1",
+		"yauzl": "^3.4.0",
 		"zod": "^4.4.3"
 	},
 	"overrides": {

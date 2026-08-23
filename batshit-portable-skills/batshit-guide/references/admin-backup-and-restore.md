@@ -74,10 +74,10 @@ Restore is a replace operation, not a merge. Always inspect first.
 1. Open Settings → Admin.
 2. Find Backup and Restore.
 3. Choose the backup zip file.
-4. Click Inspect.
-5. Review the created date, record counts, file counts, secrets status, user remap notes, and warnings.
+4. Batshit stages that file once with visible progress, then inspects the staged copy. Click Inspect again only if you need to repeat validation.
+5. Review the archive size, created date, record counts, file counts, secrets status, user remap notes, disk-space requirement, and warnings.
 
-Inspect validates the bundle before Batshit changes the instance.
+Inspect validates the bundle before Batshit changes the instance. Large file assets stream to private disk staging rather than being loaded into browser or app memory. The disk row includes the new upload tree, validated Redis plan, and a rollback copy of current restorable Redis data; Restore stays disabled when available space is insufficient.
 
 ## Restore
 
@@ -93,6 +93,10 @@ Restore replaces current Batshit-owned data with the backup data.
 8. Let Batshit reload.
 
 Restore keeps the current auth account/session alive and remaps backup user-owned data to the current single-user instance.
+
+Batshit reuses the exact content-hashed file that Inspect validated. It prepares files and rollback data before replacement, keeps a durable recovery journal during the critical step, and resolves an interrupted journal before serving normal requests after restart.
+
+When restore starts, Batshit briefly pauses new app requests while already-running work finishes. If a chat send or another long-running task does not finish within 30 seconds, restore stops before changing data and asks you to stop that task and try again.
 
 ## After restore
 
@@ -130,6 +134,8 @@ Mac app backups include Batshit-owned uploads when those uploads are in the conf
 Back those up with normal host backup tools. Advanced source-checkout repair setups follow the same host-backup boundary.
 
 The Mac app does not impose its 1 GiB incoming-request limit on backup exports. Export streams to a temporary file beside the destination and replaces the destination only after the complete backup finishes. Available disk space and the actual included assets are the practical concerns for large exports.
+
+Restore also does not send the complete archive through the app's 1 GiB request boundary. The chosen file streams once to Batshit's private staging directory and is read from disk for Inspect and Restore.
 
 ## Good backup habits
 

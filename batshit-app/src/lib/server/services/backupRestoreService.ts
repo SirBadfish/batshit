@@ -1,10 +1,15 @@
-import { createReadStream } from 'node:fs'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { createInterface } from 'node:readline'
 import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { createDeflateRaw, deflateRawSync } from 'node:zlib'
 
 import { unzipSync } from 'fflate/node'
+import * as yauzl from 'yauzl'
+import type { Entry, ZipFile } from 'yauzl'
 
 import { redis } from '$lib/server/redis'
 import {
@@ -20,6 +25,8 @@ import {
   recipeRevisionBundleSha256,
   recipeRevisionEnvelopeSha256,
   recipeRevisionRedisKey,
+  recipeSiblingStateSha256,
+  recipeStateSnapshotSha256,
   reconcileGoonRecipeFitReceipts,
   verifyGoonRecipeDocument,
   verifyGoonRecipeV2,
@@ -245,6 +252,21 @@ export interface BackupPreflightSummary {
   targetUserId: string
   userRemapRequired: boolean
   warnings: string[]
+  stage?: {
+    id: string
+    filename: string
+    archiveBytes: number
+    sha256: string
+    expiresAt: string
+  }
+  disk?: {
+    requiredBytes: number
+    availableBytes: number
+    sufficient: boolean
+    restoredFileBytes: number
+    rollbackBytes: number
+    restorePlanBytes: number
+  }
 }
 
 export interface RestoreResult {
@@ -323,6 +345,14 @@ function resolveUploadsDir() {
   const explicit = process.env.UPLOADS_DIR?.trim()
   if (explicit) return path.resolve(explicit)
   return path.resolve(process.cwd(), '../batshit-server/server/uploads')
+}
+
+function resolveBackupStagingDir() {
+  const explicit = process.env.BATSHIT_BACKUP_STAGING_DIR?.trim()
+  if (explicit) return path.resolve(explicit)
+  const runtimeRoot = process.env.BATSHIT_RUNTIME_DATA_DIR?.trim()
+  if (runtimeRoot) return path.resolve(runtimeRoot, 'backup-restore-staging')
+  return path.resolve(process.cwd(), '../batshit-server/server/data/backup-restore-staging')
 }
 
 function toPosixPath(input: string) {
@@ -1993,9 +2023,7 @@ export async function preflightBackupRestore(
   const bundle = parseBackupBundle(bytes)
   await validateRecipeRestoreGraph(bundle.records, bundle.manifest.source.userId)
   const preflightTargetRecords = buildTargetRecords(bundle, userId)
-  if (bundle.manifest.source.userId !== userId) {
-    await rehashRemappedRecipeGraph(preflightTargetRecords, userId)
-  }
+  await rehashTransformedRecipeGraph(preflightTargetRecords, userId)
   await validateRecipeRestoreGraph(preflightTargetRecords, userId)
   const currentRecordCount = await countCurrentRecords(userId)
   const fileAssetNames = Object.keys(bundle.zipEntries).filter((name) => name.startsWith(UPLOAD_FILE_ROOT))
@@ -2263,7 +2291,20 @@ async function validateRecipeRestoreGraph(records: BackupRedisRecord[], userId: 
   }
 }
 
-async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: string) {
+async function rehashRecipeStateSnapshot(value: unknown) {
+  if (!isPlainObject(value) || !Array.isArray(value.siblings)) {
+    throw new Error('Recipe state snapshot is missing its sibling collection.')
+  }
+  for (const sibling of value.siblings) {
+    if (!isPlainObject(sibling) || !isPlainObject(sibling.state)) {
+      throw new Error('Recipe state snapshot contains an invalid sibling state.')
+    }
+    sibling.stateSha256 = await recipeSiblingStateSha256(sibling.state)
+  }
+  value.stateSha256 = await recipeStateSnapshotSha256(value)
+}
+
+async function rehashTransformedRecipeGraph(records: BackupRedisRecord[], userId: string) {
   const revisionHashByKey = new Map<string, string>()
   const revisionIdentityByKey = new Map<
     string,
@@ -2277,6 +2318,7 @@ async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: s
     if (record.type !== 'json' || !record.key.startsWith(`goon_recipe_revision:${userId}:`)) continue
     try {
       const envelope = parseRecipeRevisionEnvelope(record.value)
+      await rehashRecipeStateSnapshot(envelope.revision.state)
       envelope.revision.revisionSha256 = await recipeRevisionBundleSha256(envelope.revision)
       envelope.envelopeSha256 = await recipeRevisionEnvelopeSha256(envelope)
       record.value = envelope
@@ -2290,7 +2332,7 @@ async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: s
       )
     } catch (error) {
       recipeRestoreError(
-        `${record.key} could not be rehashed after user remapping: ${error instanceof Error ? error.message : String(error)}`
+        `${record.key} could not be rehashed after restore transformation: ${error instanceof Error ? error.message : String(error)}`
       )
     }
   }
@@ -2308,6 +2350,7 @@ async function rehashRemappedRecipeGraph(records: BackupRedisRecord[], userId: s
       updateRevisionRef(owner.previousRevision)
       if (isPlainObject(owner.authoringRevision)) {
         try {
+          await rehashRecipeStateSnapshot(owner.authoringRevision.state)
           owner.authoringRevision.revisionSha256 = await recipeAuthoringRevisionSha256(
             owner.authoringRevision
           )
@@ -2433,9 +2476,7 @@ export async function restoreBackupBundle(
   }
 
   const targetRecords = buildTargetRecords(bundle, userId)
-  if (bundle.manifest.source.userId !== userId) {
-    await rehashRemappedRecipeGraph(targetRecords, userId)
-  }
+  await rehashTransformedRecipeGraph(targetRecords, userId)
   await validateRecipeRestoreGraph(targetRecords, userId)
   const uploadedFiles = await writeUploadFileAssets(bundle)
 
@@ -2477,6 +2518,769 @@ export async function restoreBackupBundle(
     secretsIncluded: bundle.manifest.secrets.included,
     redactedFieldCount: bundle.manifest.secrets.redactedFieldCount,
     replacedExistingRecordCount: currentRecordCount
+  }
+}
+
+type AsyncZipFile = ZipFile & {
+  eachEntry: () => AsyncIterable<Entry>
+  openReadStreamPromise: (entry: Entry) => Promise<Readable>
+}
+
+interface BackupStageMetadata {
+  contract: 'batshit-backup-stage/v1'
+  stageId: string
+  userId: string
+  filename: string
+  bytes: number
+  sha256: string
+  stagedAt: string
+  expiresAt: string
+  archivePath: string
+}
+
+interface StagedFileAsset {
+  name: string
+  relativePath: string
+  byteLength: number
+}
+
+interface StagedBackupBundle {
+  stage: BackupStageMetadata
+  archivePath: string
+  manifest: BackupManifest
+  records: BackupRedisRecord[]
+  fileAssets: StagedFileAsset[]
+}
+
+interface RestoreJournal {
+  contract: 'batshit-backup-restore-journal/v1'
+  stageId: string
+  userId: string
+  phase: 'prepared' | 'files-old-moved' | 'files-swapped' | 'redis-replacing' | 'redis-complete'
+  hadOriginalUploads: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+const MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+const MAX_REDIS_RECORD_BYTES = 64 * 1024 * 1024
+const MAX_LEGACY_RECORDS_BYTES = 512 * 1024 * 1024
+const RESTORE_LOCK_NAME = 'active-restore.lock'
+const RESTORE_REQUEST_DRAIN_TIMEOUT_MS = 30_000
+
+let backupRestoreMaintenanceActive = false
+let backupRestoreHttpRequestCount = 0
+const backupRestoreRequestDrainWaiters = new Set<() => void>()
+
+function notifyBackupRestoreRequestDrainWaiters() {
+  for (const waiter of backupRestoreRequestDrainWaiters) waiter()
+  backupRestoreRequestDrainWaiters.clear()
+}
+
+export function enterBackupRestoreHttpRequest() {
+  if (backupRestoreMaintenanceActive) return null
+  backupRestoreHttpRequestCount += 1
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    backupRestoreHttpRequestCount = Math.max(0, backupRestoreHttpRequestCount - 1)
+    notifyBackupRestoreRequestDrainWaiters()
+  }
+}
+
+function waitForBackupRestoreRequestDrain(timeoutMs: number) {
+  return new Promise<void>((resolve) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout>
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      backupRestoreRequestDrainWaiters.delete(finish)
+      resolve()
+    }
+    timer = setTimeout(finish, timeoutMs)
+    backupRestoreRequestDrainWaiters.add(finish)
+  })
+}
+
+export async function beginBackupRestoreMaintenance() {
+  if (backupRestoreMaintenanceActive) {
+    throw new BackupRestoreError('Another backup restore is already running.', 409)
+  }
+  backupRestoreMaintenanceActive = true
+  const deadline = Date.now() + RESTORE_REQUEST_DRAIN_TIMEOUT_MS
+  while (backupRestoreHttpRequestCount > 1) {
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      backupRestoreMaintenanceActive = false
+      notifyBackupRestoreRequestDrainWaiters()
+      throw new BackupRestoreError(
+        'Restore is waiting for active Batshit work to finish. Stop the current task and try again.',
+        409
+      )
+    }
+    await waitForBackupRestoreRequestDrain(remainingMs)
+  }
+
+  let ended = false
+  return () => {
+    if (ended) return
+    ended = true
+    backupRestoreMaintenanceActive = false
+    notifyBackupRestoreRequestDrainWaiters()
+  }
+}
+
+function assertStageId(stageId: string) {
+  if (!/^[0-9a-f-]{36}$/i.test(stageId)) {
+    throw new BackupRestoreError('Backup stage id is invalid.', 400)
+  }
+}
+
+function stagedRestorePaths(stageId: string) {
+  assertStageId(stageId)
+  const stagingRoot = resolveBackupStagingDir()
+  const uploadRoot = resolveUploadsDir()
+  // Keep route-controlled identifiers out of filesystem names. This digest
+  // must match batshit-server's private staging contract.
+  const storageKey = createHash('sha256').update(stageId, 'utf8').digest('hex')
+  return {
+    stagingRoot,
+    archivePath: path.join(stagingRoot, `${storageKey}.zip`),
+    metadataPath: path.join(stagingRoot, `${storageKey}.json`),
+    journalPath: path.join(stagingRoot, `${storageKey}.restore-journal.json`),
+    rollbackPath: path.join(stagingRoot, `${storageKey}.rollback.ndjson`),
+    planPath: path.join(stagingRoot, `${storageKey}.plan.ndjson`),
+    lockPath: path.join(stagingRoot, RESTORE_LOCK_NAME),
+    uploadRoot,
+    newUploadRoot: path.join(uploadRoot, `.restore-new-${storageKey}`),
+    oldUploadRoot: path.join(uploadRoot, `.restore-old-${storageKey}`)
+  }
+}
+
+async function pathExists(targetPath: string) {
+  return await fs.stat(targetPath).then(() => true).catch(() => false)
+}
+
+async function writeJsonAtomic(targetPath: string, value: unknown) {
+  const temporaryPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`
+  await fs.writeFile(temporaryPath, `${JSON.stringify(value)}\n`, { mode: 0o600 })
+  await fs.rename(temporaryPath, targetPath)
+}
+
+async function loadBackupStage(userId: string, stageId: string) {
+  const paths = stagedRestorePaths(stageId)
+  let stage: BackupStageMetadata
+  try {
+    stage = JSON.parse(await fs.readFile(paths.metadataPath, 'utf8')) as BackupStageMetadata
+  } catch {
+    throw new BackupRestoreError('The staged backup is missing or no longer available.', 404)
+  }
+  if (
+    stage.contract !== 'batshit-backup-stage/v1' ||
+    stage.stageId !== stageId ||
+    stage.userId !== userId ||
+    !Number.isSafeInteger(stage.bytes) ||
+    stage.bytes <= 0 ||
+    !/^[0-9a-f]{64}$/i.test(stage.sha256)
+  ) {
+    throw new BackupRestoreError('The staged backup metadata is invalid.', 400)
+  }
+  if (!Number.isFinite(Date.parse(stage.expiresAt)) || Date.parse(stage.expiresAt) <= Date.now()) {
+    throw new BackupRestoreError('The staged backup has expired. Choose the file again.', 410)
+  }
+  const archiveStat = await fs.stat(paths.archivePath).catch(() => null)
+  if (!archiveStat?.isFile() || archiveStat.size !== stage.bytes) {
+    throw new BackupRestoreError('The staged backup file does not match its verified size.', 409)
+  }
+  const hash = createHash('sha256')
+  for await (const chunk of createReadStream(paths.archivePath)) {
+    hash.update(chunk)
+  }
+  if (hash.digest('hex') !== stage.sha256.toLowerCase()) {
+    throw new BackupRestoreError('The staged backup file no longer matches its verified SHA-256 identity.', 409)
+  }
+  return { stage, paths }
+}
+
+async function openLazyZip(archivePath: string): Promise<AsyncZipFile> {
+  return await new Promise((resolve, reject) => {
+    yauzl.open(
+      archivePath,
+      {
+        lazyEntries: true,
+        autoClose: false,
+        decodeStrings: true,
+        validateEntrySizes: true,
+        strictFileNames: true
+      },
+      (error, zipFile) => {
+        if (error || !zipFile) {
+          reject(error ?? new Error('Zip reader did not open the archive'))
+          return
+        }
+        resolve(zipFile as AsyncZipFile)
+      }
+    )
+  })
+}
+
+function assertReadableBackupEntry(entry: Entry) {
+  assertSafeZipPath(entry.fileName)
+  if (entry.isEncrypted()) {
+    throw new BackupRestoreError(`Backup entry "${entry.fileName}" is encrypted and cannot be restored.`, 400)
+  }
+  if (entry.compressionMethod !== 0 && entry.compressionMethod !== DEFLATE_METHOD) {
+    throw new BackupRestoreError(
+      `Backup entry "${entry.fileName}" uses unsupported compression method ${entry.compressionMethod}.`,
+      400
+    )
+  }
+  const unixMode = (entry.externalFileAttributes >>> 16) & 0xffff
+  if ((unixMode & 0o170000) === 0o120000) {
+    throw new BackupRestoreError(`Backup entry "${entry.fileName}" cannot be a symbolic link.`, 400)
+  }
+}
+
+async function readZipEntryBuffer(zipFile: AsyncZipFile, entry: Entry, maxBytes: number) {
+  if (entry.uncompressedSize > maxBytes) {
+    throw new BackupRestoreError(`Backup entry "${entry.fileName}" is too large to validate safely.`, 400)
+  }
+  const stream = await zipFile.openReadStreamPromise(entry)
+  const chunks: Buffer[] = []
+  let bytes = 0
+  for await (const rawChunk of stream) {
+    const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk as Uint8Array)
+    bytes += chunk.length
+    if (bytes > maxBytes) {
+      stream.destroy()
+      throw new BackupRestoreError(`Backup entry "${entry.fileName}" exceeded its validated size.`, 400)
+    }
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks, bytes)
+}
+
+async function readStagedBackup(userId: string, stageId: string): Promise<StagedBackupBundle> {
+  const { stage, paths } = await loadBackupStage(userId, stageId)
+  let zipFile: AsyncZipFile | null = null
+  try {
+    zipFile = await openLazyZip(paths.archivePath)
+    const seen = new Set<string>()
+    let manifest: BackupManifest | null = null
+    let legacyRecords: BackupRedisRecord[] | null = null
+    const records: BackupRedisRecord[] = []
+    const fileAssets: StagedFileAsset[] = []
+
+    for await (const entry of zipFile.eachEntry()) {
+      if (entry.fileName.endsWith('/')) continue
+      assertReadableBackupEntry(entry)
+      if (seen.has(entry.fileName)) {
+        throw new BackupRestoreError(`Backup contains duplicate entry "${entry.fileName}".`, 400)
+      }
+      seen.add(entry.fileName)
+
+      if (entry.fileName === MANIFEST_PATH) {
+        const bytes = await readZipEntryBuffer(zipFile, entry, MAX_MANIFEST_BYTES)
+        try {
+          manifest = JSON.parse(bytes.toString('utf8')) as BackupManifest
+        } catch {
+          throw new BackupRestoreError('Backup contains invalid manifest JSON.', 400)
+        }
+      } else if (entry.fileName === LEGACY_REDIS_RECORDS_PATH) {
+        const bytes = await readZipEntryBuffer(zipFile, entry, MAX_LEGACY_RECORDS_BYTES)
+        legacyRecords = parseLegacyRedisRecords(bytes)
+      } else if (entry.fileName.startsWith(REDIS_RECORDS_DIR) && entry.fileName.endsWith('.json')) {
+        const bytes = await readZipEntryBuffer(zipFile, entry, MAX_REDIS_RECORD_BYTES)
+        try {
+          records.push(JSON.parse(bytes.toString('utf8')) as BackupRedisRecord)
+        } catch {
+          throw new BackupRestoreError(`Backup contains invalid Redis record JSON at ${entry.fileName}.`, 400)
+        }
+      } else if (entry.fileName.startsWith(UPLOAD_FILE_ROOT)) {
+        const relativePath = entry.fileName.slice(UPLOAD_FILE_ROOT.length)
+        if (!relativePath) throw new BackupRestoreError('Backup contains an empty upload path.', 400)
+        fileAssets.push({
+          name: entry.fileName,
+          relativePath,
+          byteLength: entry.uncompressedSize
+        })
+      }
+    }
+
+    if (!manifest) throw new BackupRestoreError('Backup is missing manifest.json.', 400)
+    validateManifest(manifest)
+    const resolvedRecords = legacyRecords ?? records
+    if (!legacyRecords && resolvedRecords.length === 0) {
+      throw new BackupRestoreError('Backup is missing Redis record entries.', 400)
+    }
+    validateRecords(resolvedRecords)
+    if (resolvedRecords.length !== manifest.contents.redisRecordCount) {
+      throw new BackupRestoreError('Backup record count does not match the manifest.', 400)
+    }
+    const fileBytes = fileAssets.reduce((sum, asset) => sum + asset.byteLength, 0)
+    if (
+      fileAssets.length !== manifest.contents.fileAssetCount ||
+      fileBytes !== manifest.contents.fileAssetBytes
+    ) {
+      throw new BackupRestoreError('Backup file inventory does not match the manifest.', 400)
+    }
+
+    return {
+      stage,
+      archivePath: paths.archivePath,
+      manifest,
+      records: resolvedRecords,
+      fileAssets
+    }
+  } catch (error) {
+    if (error instanceof BackupRestoreError) throw error
+    throw new BackupRestoreError(
+      error instanceof Error ? `Backup file is not a readable zip bundle: ${error.message}` : 'Backup file is not a readable zip bundle.',
+      400
+    )
+  } finally {
+    zipFile?.close()
+  }
+}
+
+function asBackupBundle(bundle: StagedBackupBundle): BackupBundle {
+  return {
+    manifest: bundle.manifest,
+    records: bundle.records,
+    zipEntries: {}
+  }
+}
+
+async function measureCurrentRestoreState(userId: string) {
+  return await redis.execute(async (client) => {
+    const keys = await collectCandidateKeys(client, userId)
+    let rollbackBytes = 0
+    for (const key of keys) {
+      const record = await readRedisRecord(client, key, groupForKey(key, userId))
+      if (record) rollbackBytes += Buffer.byteLength(JSON.stringify(record), 'utf8') + 1
+    }
+    return { currentRecordCount: keys.length, rollbackBytes }
+  })
+}
+
+async function getDiskCapacity(targetPath: string) {
+  await fs.mkdir(targetPath, { recursive: true, mode: 0o700 })
+  const stats = await fs.statfs(targetPath)
+  return {
+    availableBytes: stats.bavail * stats.bsize,
+    blockSize: stats.bsize
+  }
+}
+
+function estimateRestoreDiskBytes(
+  fileAssets: StagedFileAsset[],
+  rollbackBytes: number,
+  restorePlanBytes: number,
+  blockSize: number
+) {
+  const allocate = (bytes: number) => Math.ceil(Math.max(bytes, 1) / blockSize) * blockSize
+  const directories = new Set<string>()
+  for (const asset of fileAssets) {
+    let directory = path.posix.dirname(asset.relativePath)
+    while (directory !== '.' && directory !== '/') {
+      directories.add(directory)
+      const parent = path.posix.dirname(directory)
+      if (parent === directory) break
+      directory = parent
+    }
+  }
+  const fileBytes = fileAssets.reduce((sum, asset) => sum + allocate(asset.byteLength), 0)
+  // Each new directory and the small journal/lock/metadata files need at least
+  // one filesystem block. This is structural allocation, not a guessed size cap.
+  const transactionMetadataBytes = (directories.size + 8) * blockSize
+  return fileBytes + allocate(rollbackBytes) + allocate(restorePlanBytes) + transactionMetadataBytes
+}
+
+export async function preflightStagedBackupRestore(
+  userId: string,
+  stageId: string
+): Promise<BackupPreflightSummary> {
+  await ensureBackupRestoreRecovery()
+  const bundle = await readStagedBackup(userId, stageId)
+  await validateRecipeRestoreGraph(bundle.records, bundle.manifest.source.userId)
+  const targetRecords = buildTargetRecords(asBackupBundle(bundle), userId)
+  await rehashTransformedRecipeGraph(targetRecords, userId)
+  await validateRecipeRestoreGraph(targetRecords, userId)
+
+  const { currentRecordCount, rollbackBytes } = await measureCurrentRestoreState(userId)
+  const fileAssetBytes = bundle.fileAssets.reduce((sum, asset) => sum + asset.byteLength, 0)
+  const restorePlanBytes = targetRecords.reduce(
+    (sum, record) => sum + Buffer.byteLength(JSON.stringify(record), 'utf8') + 1,
+    0
+  )
+  const { availableBytes, blockSize } = await getDiskCapacity(resolveUploadsDir())
+  const requiredBytes = estimateRestoreDiskBytes(
+    bundle.fileAssets,
+    rollbackBytes,
+    restorePlanBytes,
+    blockSize
+  )
+  const legacyBundle = asBackupBundle(bundle)
+  const warnings = buildPreflightWarnings(legacyBundle, currentRecordCount)
+  if (availableBytes < requiredBytes) {
+    warnings.unshift('This restore needs more free disk space before Batshit can safely stage files and preserve rollback data.')
+  }
+
+  return {
+    ok: true,
+    manifest: bundle.manifest,
+    redisRecordCount: bundle.records.length,
+    fileAssetCount: bundle.fileAssets.length,
+    fileAssetBytes,
+    requiresDestructiveConfirmation: currentRecordCount > 0,
+    currentRecordCount,
+    sourceUserId: bundle.manifest.source.userId,
+    targetUserId: userId,
+    userRemapRequired: bundle.manifest.source.userId !== userId,
+    warnings,
+    stage: {
+      id: bundle.stage.stageId,
+      filename: bundle.stage.filename,
+      archiveBytes: bundle.stage.bytes,
+      sha256: bundle.stage.sha256,
+      expiresAt: bundle.stage.expiresAt
+    },
+    disk: {
+      requiredBytes,
+      availableBytes,
+      sufficient: availableBytes >= requiredBytes,
+      restoredFileBytes: fileAssetBytes,
+      rollbackBytes,
+      restorePlanBytes
+    }
+  }
+}
+
+async function writeRecordsNdjson(filePath: string, records: BackupRedisRecord[]) {
+  const handle = await fs.open(filePath, 'w', 0o600)
+  try {
+    for (const record of records) {
+      await handle.write(`${JSON.stringify(record)}\n`)
+    }
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function writeCurrentRollbackNdjson(filePath: string, userId: string) {
+  await redis.execute(async (client) => {
+    const handle = await fs.open(filePath, 'w', 0o600)
+    try {
+      const keys = await collectCandidateKeys(client, userId)
+      for (const key of keys) {
+        const record = await readRedisRecord(client, key, groupForKey(key, userId))
+        if (record) await handle.write(`${JSON.stringify(record)}\n`)
+      }
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  })
+}
+
+async function forEachNdjsonRecord(
+  filePath: string,
+  callback: (record: BackupRedisRecord) => Promise<void>
+) {
+  const stream = createReadStream(filePath, { encoding: 'utf8' })
+  const lines = createInterface({ input: stream, crlfDelay: Infinity })
+  for await (const line of lines) {
+    if (!line.trim()) continue
+    const record = JSON.parse(line) as BackupRedisRecord
+    validateRecords([record])
+    await callback(record)
+  }
+}
+
+async function deleteRecordKeysFromPlan(client: any, planPath: string) {
+  let batch: string[] = []
+  await forEachNdjsonRecord(planPath, async (record) => {
+    batch.push(record.key)
+    if (batch.length >= 250) {
+      await deleteRecords(client, batch)
+      batch = []
+    }
+  })
+  await deleteRecords(client, batch)
+}
+
+async function restoreRedisFromRollback(planPath: string, rollbackPath: string) {
+  await redis.execute(async (client) => {
+    if (await pathExists(planPath)) await deleteRecordKeysFromPlan(client, planPath)
+    if (await pathExists(rollbackPath)) {
+      await forEachNdjsonRecord(rollbackPath, async (record) => {
+        await writeRecord(client, record)
+      })
+    }
+  })
+}
+
+async function extractStagedUploadFiles(bundle: StagedBackupBundle, targetRoot: string) {
+  await fs.rm(targetRoot, { recursive: true, force: true })
+  await fs.mkdir(targetRoot, { recursive: true, mode: 0o700 })
+  let zipFile: AsyncZipFile | null = null
+  let count = 0
+  let bytes = 0
+  try {
+    zipFile = await openLazyZip(bundle.archivePath)
+    for await (const entry of zipFile.eachEntry()) {
+      if (entry.fileName.endsWith('/') || !entry.fileName.startsWith(UPLOAD_FILE_ROOT)) continue
+      assertReadableBackupEntry(entry)
+      const relativePath = entry.fileName.slice(UPLOAD_FILE_ROOT.length)
+      const targetPath = safeJoin(targetRoot, relativePath)
+      await fs.mkdir(path.dirname(targetPath), { recursive: true })
+      const input = await zipFile.openReadStreamPromise(entry)
+      await pipeline(input, createWriteStream(targetPath, { flags: 'wx', mode: 0o600 }))
+      count += 1
+      bytes += entry.uncompressedSize
+    }
+  } finally {
+    zipFile?.close()
+  }
+  if (count !== bundle.fileAssets.length || bytes !== bundle.manifest.contents.fileAssetBytes) {
+    throw new BackupRestoreError('Extracted upload inventory does not match the validated backup.', 400)
+  }
+  return { count, bytes }
+}
+
+async function saveRestoreJournal(paths: ReturnType<typeof stagedRestorePaths>, journal: RestoreJournal) {
+  journal.updatedAt = new Date().toISOString()
+  await writeJsonAtomic(paths.journalPath, journal)
+}
+
+function isRestoreTransactionEntry(name: string) {
+  return name.startsWith('.restore-new-') || name.startsWith('.restore-old-')
+}
+
+async function listLiveUploadEntries(uploadRoot: string) {
+  return (await fs.readdir(uploadRoot).catch(() => [])).filter((name) => !isRestoreTransactionEntry(name))
+}
+
+async function moveDirectoryContents(sourceRoot: string, targetRoot: string) {
+  await fs.mkdir(targetRoot, { recursive: true, mode: 0o700 })
+  for (const name of await fs.readdir(sourceRoot).catch(() => [])) {
+    await fs.rename(path.join(sourceRoot, name), path.join(targetRoot, name))
+  }
+}
+
+async function restoreUploadTree(
+  paths: ReturnType<typeof stagedRestorePaths>,
+  hadOriginalUploads: boolean,
+  removeLiveFirst: boolean
+) {
+  if (removeLiveFirst) {
+    for (const name of await listLiveUploadEntries(paths.uploadRoot)) {
+      await fs.rm(path.join(paths.uploadRoot, name), { recursive: true, force: true })
+    }
+  }
+  if (hadOriginalUploads && await pathExists(paths.oldUploadRoot)) {
+    await moveDirectoryContents(paths.oldUploadRoot, paths.uploadRoot)
+  }
+  await fs.rm(paths.newUploadRoot, { recursive: true, force: true })
+  await fs.rm(paths.oldUploadRoot, { recursive: true, force: true })
+}
+
+async function cleanupRestoreOperation(paths: ReturnType<typeof stagedRestorePaths>, removeStage: boolean) {
+  await Promise.all([
+    fs.rm(paths.oldUploadRoot, { recursive: true, force: true }),
+    fs.rm(paths.newUploadRoot, { recursive: true, force: true }),
+    fs.rm(paths.rollbackPath, { force: true }),
+    fs.rm(paths.planPath, { force: true }),
+    fs.rm(paths.journalPath, { force: true }),
+    ...(removeStage
+      ? [fs.rm(paths.archivePath, { force: true }), fs.rm(paths.metadataPath, { force: true })]
+      : [])
+  ])
+}
+
+async function recoverRestoreJournal(journalPath: string) {
+  const raw = JSON.parse(await fs.readFile(journalPath, 'utf8')) as RestoreJournal
+  if (
+    raw.contract !== 'batshit-backup-restore-journal/v1' ||
+    typeof raw.userId !== 'string'
+  ) {
+    throw new BackupRestoreError('An interrupted restore journal is invalid and requires manual recovery.', 500)
+  }
+  const paths = stagedRestorePaths(raw.stageId)
+  if (paths.journalPath !== journalPath) {
+    throw new BackupRestoreError('An interrupted restore journal path is invalid.', 500)
+  }
+
+  if (raw.phase === 'redis-complete') {
+    await cleanupRestoreOperation(paths, true)
+    return
+  }
+
+  if (raw.phase === 'redis-replacing') {
+    await restoreRedisFromRollback(paths.planPath, paths.rollbackPath)
+  }
+  await restoreUploadTree(paths, raw.hadOriginalUploads, raw.phase !== 'prepared')
+  await cleanupRestoreOperation(paths, false)
+}
+
+let restoreRecoveryPromise: Promise<void> | null = null
+
+export function ensureBackupRestoreRecovery() {
+  if (!restoreRecoveryPromise) {
+    restoreRecoveryPromise = (async () => {
+      const stagingRoot = resolveBackupStagingDir()
+      await fs.mkdir(stagingRoot, { recursive: true, mode: 0o700 })
+      const journals = (await fs.readdir(stagingRoot))
+        .filter((name) => name.endsWith('.restore-journal.json'))
+        .sort()
+      for (const name of journals) {
+        await recoverRestoreJournal(path.join(stagingRoot, name))
+      }
+      await fs.rm(path.join(stagingRoot, RESTORE_LOCK_NAME), { force: true })
+    })().finally(() => {
+      restoreRecoveryPromise = null
+    })
+  }
+  return restoreRecoveryPromise
+}
+
+async function acquireRestoreLock(paths: ReturnType<typeof stagedRestorePaths>) {
+  await fs.mkdir(paths.stagingRoot, { recursive: true, mode: 0o700 })
+  try {
+    const handle = await fs.open(paths.lockPath, 'wx', 0o600)
+    await handle.writeFile(`${JSON.stringify({ pid: process.pid, stageId: path.basename(paths.archivePath, '.zip'), startedAt: new Date().toISOString() })}\n`)
+    return handle
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new BackupRestoreError('Another backup restore is already running.', 409)
+    }
+    throw error
+  }
+}
+
+export async function restoreStagedBackup(
+  userId: string,
+  stageId: string,
+  options?: { confirmReplace?: boolean }
+): Promise<RestoreResult> {
+  await ensureBackupRestoreRecovery()
+  const paths = stagedRestorePaths(stageId)
+  const lock = await acquireRestoreLock(paths)
+  try {
+    const bundle = await readStagedBackup(userId, stageId)
+    await validateRecipeRestoreGraph(bundle.records, bundle.manifest.source.userId)
+    const { currentRecordCount, rollbackBytes } = await measureCurrentRestoreState(userId)
+    if (currentRecordCount > 0 && options?.confirmReplace !== true) {
+      throw new BackupRestoreError(
+        'Restore would replace existing Batshit data. Confirm destructive restore first.',
+        409,
+        { currentRecordCount }
+      )
+    }
+
+    const targetRecords = buildTargetRecords(asBackupBundle(bundle), userId)
+    await rehashTransformedRecipeGraph(targetRecords, userId)
+    await validateRecipeRestoreGraph(targetRecords, userId)
+
+    const restorePlanBytes = targetRecords.reduce(
+      (sum, record) => sum + Buffer.byteLength(JSON.stringify(record), 'utf8') + 1,
+      0
+    )
+    const { availableBytes, blockSize } = await getDiskCapacity(paths.uploadRoot)
+    const requiredBytes = estimateRestoreDiskBytes(
+      bundle.fileAssets,
+      rollbackBytes,
+      restorePlanBytes,
+      blockSize
+    )
+    if (availableBytes < requiredBytes) {
+      throw new BackupRestoreError(
+        'Restore cannot start because there is not enough free disk space for restored files and rollback data.',
+        409,
+        { requiredBytes, availableBytes }
+      )
+    }
+
+    const uploadedFiles = await extractStagedUploadFiles(bundle, paths.newUploadRoot)
+    await writeRecordsNdjson(paths.planPath, targetRecords)
+    await writeCurrentRollbackNdjson(paths.rollbackPath, userId)
+    const journal: RestoreJournal = {
+      contract: 'batshit-backup-restore-journal/v1',
+      stageId,
+      userId,
+      phase: 'prepared',
+      hadOriginalUploads: (await listLiveUploadEntries(paths.uploadRoot)).length > 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+    await saveRestoreJournal(paths, journal)
+
+    try {
+      await fs.mkdir(paths.oldUploadRoot, { recursive: true, mode: 0o700 })
+      for (const name of await listLiveUploadEntries(paths.uploadRoot)) {
+        await fs.rename(path.join(paths.uploadRoot, name), path.join(paths.oldUploadRoot, name))
+      }
+      journal.phase = 'files-old-moved'
+      await saveRestoreJournal(paths, journal)
+      await moveDirectoryContents(paths.newUploadRoot, paths.uploadRoot)
+      await fs.rm(paths.newUploadRoot, { recursive: true, force: true })
+      journal.phase = 'files-swapped'
+      await saveRestoreJournal(paths, journal)
+
+      journal.phase = 'redis-replacing'
+      await saveRestoreJournal(paths, journal)
+      await redis.execute(async (client) => {
+        const currentKeys = await collectCandidateKeys(client, userId)
+        await deleteRecords(client, [...currentKeys, ...targetRecords.map((record) => record.key)])
+        for (const record of targetRecords) await writeRecord(client, record)
+      })
+      journal.phase = 'redis-complete'
+      await saveRestoreJournal(paths, journal)
+    } catch (error) {
+      try {
+        if (journal.phase === 'redis-replacing') {
+          await restoreRedisFromRollback(paths.planPath, paths.rollbackPath)
+        }
+        await restoreUploadTree(paths, journal.hadOriginalUploads, journal.phase !== 'prepared')
+        await cleanupRestoreOperation(paths, false)
+      } catch (rollbackError) {
+        throw new BackupRestoreError(
+          'Restore failed and automatic rollback could not finish. Batshit kept the recovery journal for startup recovery.',
+          500,
+          {
+            restoreError: error instanceof Error ? error.message : String(error),
+            rollbackError: rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+          }
+        )
+      }
+      throw error
+    }
+
+    await cleanupRestoreOperation(paths, true)
+    return {
+      restored: true,
+      redisRecordCount: targetRecords.length,
+      fileAssetCount: uploadedFiles.count,
+      fileAssetBytes: uploadedFiles.bytes,
+      sourceUserId: bundle.manifest.source.userId,
+      targetUserId: userId,
+      secretsIncluded: bundle.manifest.secrets.included,
+      redactedFieldCount: bundle.manifest.secrets.redactedFieldCount,
+      replacedExistingRecordCount: currentRecordCount
+    }
+  } catch (error) {
+    if (error instanceof BackupRestoreError) throw error
+    throw new BackupRestoreError(
+      error instanceof Error ? error.message : 'Restore failed.',
+      500
+    )
+  } finally {
+    await lock.close().catch(() => undefined)
+    await fs.rm(paths.lockPath, { force: true }).catch(() => undefined)
   }
 }
 

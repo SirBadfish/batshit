@@ -86,6 +86,21 @@ export type BackupPreflightSummary = {
   targetUserId: string
   userRemapRequired: boolean
   warnings: string[]
+  stage: {
+    id: string
+    filename: string
+    archiveBytes: number
+    sha256: string
+    expiresAt: string
+  }
+  disk: {
+    requiredBytes: number
+    availableBytes: number
+    sufficient: boolean
+    restoredFileBytes: number
+    rollbackBytes: number
+    restorePlanBytes: number
+  }
 }
 
 export type DiagnosticsPreviewSummary = {
