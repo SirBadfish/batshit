@@ -3,7 +3,7 @@ const redisService = require('../redisService');
 describe('redisService connection config', () => {
   const { resolveRedisConnectionConfig } = redisService;
 
-  test('defaults to the normal local Redis Stack port when no env override is set', () => {
+  test('defaults to the normal local Redis port when no env override is set', () => {
     expect(resolveRedisConnectionConfig({})).toEqual({
       socket: {
         host: 'localhost',

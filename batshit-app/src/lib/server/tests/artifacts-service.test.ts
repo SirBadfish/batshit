@@ -7,7 +7,7 @@ vi.mock('$lib/server/redis', async () => {
 })
 
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
-import { ArtifactsService } from '$lib/server/artifacts/artifactsService'
+import { ArtifactsService, isRedisJsonMissingPathError } from '$lib/server/artifacts/artifactsService'
 import { RedisService } from '$lib/server/redis'
 import { DEFAULT_ARTIFACT_SCAFFOLD_CONTENT } from '$lib/artifacts/structureEnforcement'
 import {
@@ -346,6 +346,38 @@ describe.runIf(REAL_REDIS_LANE)('ArtifactsService legacy cleanup', () => {
     expect(withoutVersionBodies[0]?.content).toBe('<div>updated html</div>')
     expect((withoutVersionBodies[0]?.versions?.[0] as any)?.content).toBeUndefined()
     expect(withoutVersionBodies[0]?.versions?.[0]?.version).toBe(1)
+  })
+
+  // SA-101: both real ReJSON message formats, captured from live servers.
+  //   Redis Stack 7.4.5 -> ERR Path '.widget_position' does not exist
+  //   Redis 8.10.1      -> ERR Path does not exist
+  // If a future ReJSON rewording breaks the classifier, this fails loudly here
+  // instead of silently hiding artifacts from the user's list.
+  describe('isRedisJsonMissingPathError', () => {
+    it.each([
+      ["ERR Path '.widget_position' does not exist", 'Redis Stack 7.4.x legacy-path form'],
+      ['ERR Path \'$.nope\' does not exist', 'Redis Stack 7.4.x JSONPath form'],
+      ['ERR Path "widget_position" does not exist', 'double-quoted variant'],
+      ['ERR Path does not exist', 'Redis 8.x unquoted form']
+    ])('classifies %s as a missing path (%s)', (message) => {
+      expect(isRedisJsonMissingPathError(new Error(message))).toBe(true)
+    })
+
+    it.each([
+      ['WRONGTYPE Operation against a key holding the wrong kind of value'],
+      ['ERR unknown command \'JSON.GET\''],
+      ['NOSCRIPT No matching script. Please use EVAL.'],
+      ['LOADING Redis is loading the dataset in memory'],
+      ['Connection timeout']
+    ])('does not classify %s as a missing path', (message) => {
+      expect(isRedisJsonMissingPathError(new Error(message))).toBe(false)
+    })
+
+    it('requires an Error instance', () => {
+      expect(isRedisJsonMissingPathError('ERR Path does not exist')).toBe(false)
+      expect(isRedisJsonMissingPathError(null)).toBe(false)
+      expect(isRedisJsonMissingPathError(undefined)).toBe(false)
+    })
   })
 
   it('lists artifacts when legacy projection fields are absent', async () => {

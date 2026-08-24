@@ -1,6 +1,6 @@
 # Install Docker
 
-Docker Batshit runs the core stack in Docker Compose: the Batshit app, batshit-server, and Redis Stack. n8n is an optional Compose profile.
+Docker Batshit runs the core stack in Docker Compose: the Batshit app, batshit-server, and Redis 8. n8n is an optional Compose profile.
 
 Docker is a peer setup path — not a lesser fallback and not the only correct path. It's more contained and reproducible than the Mac app path, while the Mac app stays the richer local workstation path on macOS.
 
@@ -10,7 +10,7 @@ Docker is a peer setup path — not a lesser fallback and not the only correct p
 | --- | --- | --- |
 | Batshit app | Yes | `http://localhost:5620` |
 | batshit-server | Yes | `http://localhost:5600` |
-| Redis Stack | Yes, internal only | Not published to host |
+| Redis 8 | Yes, internal only | Not published to host |
 | n8n | Optional profile | `http://localhost:5678` |
 
 The Docker app runs internally at:

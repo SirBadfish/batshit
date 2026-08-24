@@ -15,7 +15,7 @@ This package stays separate from `batshit-app` and `batshit-server`: Electron ow
 - One optional Desktop Goon companion window: exact authenticated route, isolated role-scoped preload/state port, transparent frameless policy, no microphone permission, and deterministic return-to-main lifecycle.
 - Runtime Doctor starts the packaged SvelteKit app, batshit-server, streamable MCP helper, and Mac-owned Redis before opening the real UI.
 - The runtime/data contract remains under `~/Library/Application Support/Batshit`, `~/Library/Logs/Batshit`, and `~/Library/Caches/Batshit` unless an isolated test lane supplies overrides.
-- Release runtime target: Apple Silicon on macOS 14 or newer. Node, Redis Stack, OpenSSL, and FFmpeg are package-owned; the build and final package audits reject Homebrew paths, missing loader-relative libraries, unresolved runtime search paths, and native files with a newer deployment target.
+- Release runtime target: Apple Silicon on macOS 14 or newer. Node, Redis 8, OpenSSL, and FFmpeg are package-owned; the build and final package audits reject Homebrew paths, missing loader-relative libraries, unresolved runtime search paths, and native files with a newer deployment target.
 
 The packaged startup UI is served from the privileged `batshit-shell://app` scheme instead of `file://`. The main preload bridge exposes only exact runtime actions, the native save dialog, and the narrow Desktop Goon controller. The Desktop preload exposes only its role-scoped Desktop API; raw Electron and raw `MessagePort` objects never enter app code. Renderer crashes, readiness timeouts, port/schema failures, and unresponsive states remain visible; the shell does not silently reload and discard editor state.
 

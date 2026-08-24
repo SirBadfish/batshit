@@ -2,7 +2,7 @@ import { beforeAll, afterAll, beforeEach } from 'vitest'
 import { createClient, type RedisClientType } from 'redis'
 
 /**
- * Lightweight Redis Stack test harness.
+ * Lightweight real-Redis test harness.
  *
  * Lane-aware (G-0228): under the default test lane (`npm test`), the code under test
  * reads the in-memory RedisJSON fake from vitest-setup.ts, so this harness does NOT
@@ -10,11 +10,18 @@ import { createClient, type RedisClientType } from 'redis'
  * `npm test` runnable on machines with no Redis (CI runners, fresh clones).
  *
  * Under the real lane (`npm run test:redis`, which sets VITEST_USE_REAL_REDIS=true),
- * we attach to an already running Redis Stack instance and isolate tests by using a
+ * we attach to an already running Redis 8 instance and isolate tests by using a
  * dedicated database (defaults to DB 15, spread across DB 15..1 per worker).
  *
+ * The instance must provide the JSON module — Batshit stores every record as RedisJSON.
+ * Redis 8 bundles it; the retired Redis Stack product is no longer used.
+ *
+ * Known constraint: RediSearch's FT.CREATE only works on database 0, and this harness
+ * never uses DB 0 (it refuses, to protect real data). Search-index tests therefore
+ * cannot run under this harness and need a dedicated instance or db-0 prefix isolation.
+ *
  * Configure the real lane with either:
- *   - REDIS_STACK_TEST_URL
+ *   - BATSHIT_REDIS_TEST_URL
  *   - VITEST_REDIS_URL
  *   - REDIS_URL (will be overridden during the test run)
  */
@@ -27,8 +34,16 @@ export function useRedisTestServer() {
   beforeAll(async () => {
     if (!useRealRedis) return
 
+    // SA-101 renamed REDIS_STACK_TEST_URL. Fail loudly rather than silently ignoring a
+    // stale export and pointing the suite at the wrong instance.
+    if (process.env.REDIS_STACK_TEST_URL) {
+      throw new Error(
+        'REDIS_STACK_TEST_URL is no longer read. Rename it to BATSHIT_REDIS_TEST_URL.'
+      )
+    }
+
     redisUrl =
-      process.env.REDIS_STACK_TEST_URL ||
+      process.env.BATSHIT_REDIS_TEST_URL ||
       process.env.VITEST_REDIS_URL ||
       process.env.REDIS_URL ||
       'redis://127.0.0.1:6379/15'
@@ -90,9 +105,9 @@ export function useRedisTestServer() {
       await adminClient.ping()
     } catch (error) {
       throw new Error(
-        `Failed to connect to Redis Stack at ${redisUrl}. ` +
-          'Make sure Redis Stack is running locally ' +
-          'or set REDIS_STACK_TEST_URL to an accessible instance.'
+        `Failed to connect to Redis at ${redisUrl}. ` +
+          'Start a local Redis 8 that provides the JSON module, or set BATSHIT_REDIS_TEST_URL ' +
+          'to an accessible instance. Docker users can run: docker run -p 6379:6379 redis:8-alpine'
       )
     }
   }, 30000)

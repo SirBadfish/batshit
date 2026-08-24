@@ -50,7 +50,7 @@ These apply when Batshit runs through `Batshit.app` or directly from source on t
 | `BATSHIT_UPDATE_RELEASE_URL` / `BATSHIT_UPDATE_DOWNLOAD_URL` | blank | Optional local/test links used with `BATSHIT_UPDATE_LATEST_VERSION`. |
 | `N8N_BATSHIT_FRONTEND_URL` | Mac app: `http://127.0.0.1:5620`; Docker: the app/container-reachable Batshit URL | Server-to-server Batshit app URL that n8n workflows call for native-tool dispatch and callbacks. |
 | `BODY_SIZE_LIMIT` | Mac app: `1G`; source checkout: unset/SvelteKit default unless you set it | SvelteKit incoming request body limit for ordinary app requests and large imports. Backup export and restore use dedicated disk streams instead. |
-| `REDIS_URL` | Mac app: `redis://127.0.0.1:5639/0`; source checkout: `redis://localhost:6379/0` | Redis Stack connection string. |
+| `REDIS_URL` | Mac app: `redis://127.0.0.1:5639/0`; source checkout: `redis://localhost:6379/0` | Redis connection string. |
 | `REDIS_HOST` | Mac app: `127.0.0.1`; source checkout: `localhost` | Redis host when not using `REDIS_URL`. |
 | `REDIS_PORT` | Mac app: `5639`; source checkout: `6379` | Redis port when not using `REDIS_URL`. |
 | `BATSHIT_MAC_REDIS_PORT` | `5639` | Override for the Mac-app-owned Redis port before Runtime Doctor creates the runtime config. |
@@ -261,7 +261,7 @@ LiveKit is a voice runtime, not a TTS/STT engine.
 
 | Variable | Default example | Purpose |
 | --- | --- | --- |
-| `LIVEKIT_SERVER_IMAGE` | `livekit/livekit-server:v1.12.0` | Docker LiveKit image. |
+| `LIVEKIT_SERVER_IMAGE` | `livekit/livekit-server:v1.13.5` | Docker LiveKit image tested with this Batshit release. |
 | `LIVEKIT_SERVER_INSTALL_ROOT` | `~/.batshit/installs/livekit-server` | Native managed LiveKit Server install root override. |
 | `BATSHIT_DOCKER_LIVEKIT_PORT` | `7880` | Browser/API/WebSocket port. |
 | `BATSHIT_DOCKER_LIVEKIT_RTC_TCP_PORT` | `7881` | WebRTC TCP port. |

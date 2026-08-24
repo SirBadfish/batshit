@@ -1,11 +1,53 @@
 services:
+  # Prepares batshit_redis_data for the official Redis 8 image, which runs redis-server
+  # as the unprivileged `redis` user. The retired redis-stack-server image ran as root
+  # and left two empty directories (`redis/`, `redisinsight/`) in the volume. The Redis 8
+  # entrypoint refuses to chown a data dir containing anything other than *.rdb and
+  # appendonlydir, so on an upgraded volume it silently skips the fix and every save then
+  # fails with "Permission denied" while reads keep working: silent data loss behind a
+  # server that still reports healthy. This removes those empty legacy directories and
+  # takes ownership of the data directory.
+  # Runs to completion before redis starts, and fails loudly rather than guessing.
+  redis-init:
+    image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
+    restart: "no"
+    user: root
+    volumes:
+      - batshit_redis_data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for legacy in redis redisinsight; do
+          dir="/data/$$legacy"
+          [ -d "$$dir" ] || continue
+          if [ -n "$$(ls -A "$$dir" 2>/dev/null)" ]; then
+            echo "ERROR: $$dir exists and is not empty." >&2
+            echo "Batshit expected an empty leftover directory from the retired Redis Stack image." >&2
+            echo "Inspect it yourself before starting Batshit; refusing to modify it." >&2
+            exit 1
+          fi
+          rmdir "$$dir"
+          echo "Removed empty legacy Redis Stack directory: $$dir"
+        done
+        chown -R redis:redis /data
+        echo "Redis data directory prepared for the redis user."
+
   redis:
-    image: redis/redis-stack-server:7.4.0-v8
+    # Redis 8 (Redis Open Source). Pinned by multi-architecture manifest digest so
+    # Apple Silicon and amd64 hosts resolve the identical release. Redis Stack is a
+    # retired product; Redis 8 bundles JSON, Search, TimeSeries and Bloom.
+    image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
     restart: unless-stopped
+    depends_on:
+      redis-init:
+        condition: service_completed_successfully
     volumes:
       - batshit_redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # PING alone would report healthy on a Redis without the JSON module, and every
+      # Batshit write path needs it. Prove both, so a JSON-less Redis fails loudly.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG && redis-cli command info json.get | grep -q json.get"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -357,7 +399,7 @@ services:
   livekit:
     profiles:
       - livekit
-    image: ${LIVEKIT_SERVER_IMAGE:-livekit/livekit-server:v1.12.0}
+    image: ${LIVEKIT_SERVER_IMAGE:-livekit/livekit-server:v1.13.5}
     restart: unless-stopped
     command:
       - --dev

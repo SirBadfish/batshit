@@ -125,7 +125,7 @@ Docker restores rewrite some host-only Project paths to `/workspace` so containe
 
 Mac app backups include Batshit-owned uploads when those uploads are in the configured upload store. They do not include:
 
-- The Redis Stack installation itself
+- The Redis installation itself
 - n8n's database or credentials
 - Host-installed Local AI or voice runtimes
 - Host project source folders
@@ -140,7 +140,7 @@ Restore also does not send the complete archive through the app's 1 GiB request 
 ## Good backup habits
 
 - Export a normal backup after your first working setup.
-- Export before upgrades.
+- Export before upgrades. The alpha update that moves Batshit to Redis 8 is one-way once it launches, so read the [Redis 8 release note](../installation/updating-batshit.md#alpha-release-note-batshit-now-runs-redis-8) before you update.
 - Export before restoring someone else's backup into a disposable test instance.
 - Keep With-Secrets backups rare and private.
 - Keep your project code in Git.

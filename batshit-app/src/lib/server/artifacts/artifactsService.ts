@@ -84,8 +84,15 @@ type ArtifactListOptions = {
   includeVersionContents?: boolean
 }
 
-function isRedisJsonMissingPathError(error: unknown): boolean {
-  return error instanceof Error && /ERR Path ['"].+['"] does not exist/.test(error.message)
+// ReJSON reports a missing projection path differently across Redis versions:
+//   Redis Stack 7.4.x -> ERR Path '.widget_position' does not exist
+//   Redis 8.x         -> ERR Path does not exist
+// Both must classify as "missing path" or `listByUser` rethrows, the outer catch
+// logs a warning, and the artifact silently disappears from the user's list.
+// The quoted path segment is therefore optional. Covered by
+// `artifacts-service.test.ts > isRedisJsonMissingPathError`.
+export function isRedisJsonMissingPathError(error: unknown): boolean {
+  return error instanceof Error && /ERR Path (?:['"][^'"]*['"] )?does not exist/.test(error.message)
 }
 
 const ARTIFACT_MODEL_ROLES: ArtifactModelRole[] = ['primary', 'visual', 'audio', 'utility']

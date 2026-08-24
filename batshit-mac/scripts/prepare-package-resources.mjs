@@ -28,6 +28,7 @@ const lipArtworkSource = join(appSource, 'static', 'goons', 'lip-artwork', 'v2')
 const nailSurfaceSource = join(appSource, 'static', 'goons', 'nail-surface', 'v1');
 const skinAppearanceSource = join(appSource, 'static', 'goons', 'skin-appearance', 'v1');
 const hairCatalogSource = join(repoRoot, ...HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot.split('/'));
+const clothingCatalogSource = join(appSource, 'static', 'goon-assets', 'clothing', 'v1');
 const appDest = join(runtimePath, 'batshit-app');
 const serverDest = join(runtimePath, 'batshit-server', 'server');
 const liveKitSidecarDest = join(runtimePath, 'tools', 'livekit-agent-sidecar');
@@ -37,8 +38,9 @@ const lipArtworkDest = join(runtimePath, 'assets', 'goons', 'lip-artwork', 'v2')
 const nailSurfaceDest = join(runtimePath, 'assets', 'goons', 'nail-surface', 'v1');
 const skinAppearanceDest = join(runtimePath, 'assets', 'goons', 'skin-appearance', 'v1');
 const hairCatalogDest = join(runtimePath, ...HAIR_CATALOG_PACKAGE_CONTRACT.runtimeRoot.split('/'));
+const clothingCatalogDest = join(appDest, 'static', 'goon-assets', 'clothing', 'v1');
 const nodeRuntimeDest = join(runtimePath, 'vendor', 'node');
-const redisStackRuntimeDest = join(runtimePath, 'vendor', 'redis-stack');
+const redisRuntimeDest = join(runtimePath, 'vendor', 'redis');
 const ffmpegRuntimeDest = join(runtimePath, 'vendor', 'ffmpeg');
 const thirdPartyNoticesSource = join(repoRoot, 'THIRD_PARTY_NOTICES.md');
 
@@ -238,6 +240,31 @@ async function copyHairCatalogAssets() {
   };
 }
 
+async function copyClothingCatalogAssets() {
+  await copyRequired(clothingCatalogSource, clothingCatalogDest);
+  const files = await inventoryFiles(clothingCatalogSource);
+  const catalog = files.find((entry) => entry.path === 'catalog.json');
+  if (!catalog) {
+    throw new Error(
+      'Clothing Asset package input is incomplete: expected the clothing-catalog/v1 catalog.'
+    );
+  }
+  const parsed = JSON.parse(await readFile(join(clothingCatalogSource, 'catalog.json'), 'utf8'));
+  if (
+    parsed?.schemaVersion !== 'clothing-catalog/v1' ||
+    !Array.isArray(parsed?.assets) ||
+    Object.keys(parsed).sort().join(',') !== 'assets,schemaVersion'
+  ) {
+    throw new Error('Clothing Asset package input contains an invalid clothing-catalog/v1 catalog.');
+  }
+  return {
+    contract: 'clothing-catalog/v1',
+    root: 'batshit-app/static/goon-assets/clothing/v1',
+    definition: 'catalog.json',
+    files
+  };
+}
+
 async function firstExistingPath(base, candidates) {
   for (const candidate of candidates) {
     const target = join(base, candidate);
@@ -353,56 +380,59 @@ async function copyManagedNodeRuntime() {
   };
 }
 
-async function copyManagedRedisStackRuntime() {
-  const source =
-    process.env.BATSHIT_MAC_REDIS_STACK_DIST_DIR ||
-    process.env.BATSHIT_MAC_REDIS_STACK_RUNTIME_DIR;
+async function copyManagedRedisRuntime() {
+  const source = process.env.BATSHIT_MAC_REDIS_DIST_DIR || process.env.BATSHIT_MAC_REDIS_RUNTIME_DIR;
   if (!source) return null;
 
   const resolvedSource = resolve(source);
+  // Every binary and module the supervisor actually launches must be present at packaging
+  // time. The previous list covered only two of the six modules it loaded, so a missing
+  // module reached users as a runtime failure instead of a build failure.
   const requiredFiles = [
     'bin/redis-server',
     'bin/redis-cli',
+    'bin/redis-check-aof',
+    'bin/redis-check-rdb',
     'lib/redisearch.so',
     'lib/rejson.so',
     'lib/libssl.3.dylib',
     'lib/libcrypto.3.dylib',
-    'share/RSALv2.txt',
-    'share/SSPLv1.txt',
+    'share/redis/LICENSE.txt',
+    'share/redis/REDISCONTRIBUTIONS.txt',
     'share/openssl/LICENSE.txt',
     'share/openssl/SOURCE.txt',
     'share/openssl/CHECKSUMS.txt'
   ];
   for (const relative of requiredFiles) {
     if (!(await exists(join(resolvedSource, relative)))) {
-      throw new Error(`BATSHIT_MAC_REDIS_STACK_DIST_DIR is missing ${relative}: ${resolvedSource}`);
+      throw new Error(`BATSHIT_MAC_REDIS_DIST_DIR is missing ${relative}: ${resolvedSource}`);
     }
   }
   const portability = await inspectManagedRuntimePortability(resolvedSource);
   if (!portability.ok) {
     throw new Error(
-      `BATSHIT_MAC_REDIS_STACK_DIST_DIR is not clean-machine portable:\n- ${portability.issues.join('\n- ')}`
+      `BATSHIT_MAC_REDIS_DIST_DIR is not clean-machine portable:\n- ${portability.issues.join('\n- ')}`
     );
   }
-  const proof = await runtimeProofFiles(resolvedSource, 'BATSHIT_MAC_REDIS_STACK_DIST_DIR');
+  const proof = await runtimeProofFiles(resolvedSource, 'BATSHIT_MAC_REDIS_DIST_DIR');
 
-  await copyRequired(resolvedSource, redisStackRuntimeDest);
+  await copyRequired(resolvedSource, redisRuntimeDest);
   return {
-    redisStack: {
-      distribution: 'Redis Stack Server macOS arm64 runtime archive',
-      appBundlePath: 'Contents/Resources/runtime/vendor/redis-stack',
+    redis: {
+      distribution: 'Redis Open Source macOS arm64 runtime archive',
+      appBundlePath: 'Contents/Resources/runtime/vendor/redis',
+      // Redis 8 is tri-licensed (RSALv2 / SSPLv1 / AGPLv3) in a single LICENSE.txt, replacing
+      // the separate RSALv2.txt + SSPLv1.txt the retired Redis Stack archive shipped.
       licenses: [
-        'Contents/Resources/runtime/vendor/redis-stack/share/RSALv2.txt',
-        'Contents/Resources/runtime/vendor/redis-stack/share/SSPLv1.txt',
-        'Contents/Resources/runtime/vendor/redis-stack/share/openssl/LICENSE.txt'
+        'Contents/Resources/runtime/vendor/redis/share/redis/LICENSE.txt',
+        'Contents/Resources/runtime/vendor/redis/share/redis/REDISCONTRIBUTIONS.txt',
+        'Contents/Resources/runtime/vendor/redis/share/openssl/LICENSE.txt'
       ],
-      bundledOpenSslSource:
-        'Contents/Resources/runtime/vendor/redis-stack/share/openssl/SOURCE.txt',
-      bundledOpenSslChecksums:
-        'Contents/Resources/runtime/vendor/redis-stack/share/openssl/CHECKSUMS.txt',
+      bundledOpenSslSource: 'Contents/Resources/runtime/vendor/redis/share/openssl/SOURCE.txt',
+      bundledOpenSslChecksums: 'Contents/Resources/runtime/vendor/redis/share/openssl/CHECKSUMS.txt',
       minimumMacosVersion: MAC_RUNTIME_MINIMUM_VERSION,
-      sourceReference: `Contents/Resources/runtime/vendor/redis-stack/${proof.sourceReference}`,
-      checksums: `Contents/Resources/runtime/vendor/redis-stack/${proof.checksums}`
+      sourceReference: `Contents/Resources/runtime/vendor/redis/${proof.sourceReference}`,
+      checksums: `Contents/Resources/runtime/vendor/redis/${proof.checksums}`
     }
   };
 }
@@ -567,10 +597,11 @@ async function main() {
   const nailSurfaceAssets = await copyNailSurfaceAssets();
   const skinAppearanceAssets = await copySkinAppearanceAssets();
   const hairCatalogAssets = await copyHairCatalogAssets();
+  const clothingCatalogAssets = await copyClothingCatalogAssets();
   await copyLiveKitSidecarSourcePackage();
   const managedRuntimeEntries = await Promise.all([
     copyManagedNodeRuntime(),
-    copyManagedRedisStackRuntime(),
+    copyManagedRedisRuntime(),
     copyManagedFfmpegRuntime()
   ]);
   const managedRuntimes = Object.assign({}, ...managedRuntimeEntries.filter(Boolean));
@@ -590,7 +621,8 @@ async function main() {
           lipArtwork: lipArtworkAssets,
           nailSurface: nailSurfaceAssets,
           skinAppearance: skinAppearanceAssets,
-          hairCatalog: hairCatalogAssets
+          hairCatalog: hairCatalogAssets,
+          clothingCatalog: clothingCatalogAssets
         },
         managedRuntimes
       },

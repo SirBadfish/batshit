@@ -11,7 +11,7 @@ Manual source-checkout setup is advanced repair/development material now, not th
 
 | Choose | Good fit when | Tradeoff |
 | --- | --- | --- |
-| Mac app | You're on a supported Mac and want the most Mac-like setup: open the app, let Runtime Doctor check the Mac app runtime, then use Batshit. | Local alpha/dev builds without curated managed runtime assets may still need repair fallbacks; release packages are intended to own Node, Redis Stack, and ffmpeg. |
+| Mac app | You're on a supported Mac and want the most Mac-like setup: open the app, let Runtime Doctor check the Mac app runtime, then use Batshit. | Local alpha/dev builds without curated managed runtime assets may still need repair fallbacks; release packages are intended to own Node, Redis, and ffmpeg. |
 | Docker | You want the Batshit app, batshit-server, and Redis in a repeatable Compose stack, or you're not on macOS. | Cleaner core-stack boundaries, but local engines, sidecars, and host services need caller-aware URLs and sometimes a host operator. |
 
 Windows and Linux users should start with Docker. The Mac app is macOS-only.
@@ -25,7 +25,7 @@ Windows and Linux users should start with Docker. The Mac app is macOS-only.
 - Batshit app on `http://127.0.0.1:5620`
 - batshit-server on `http://localhost:5600`
 - streamable MCP helper on `http://localhost:5601/mcp`
-- Mac-app-owned Redis Stack on `localhost:5639`
+- Mac-app-owned Redis 8 on `localhost:5639`
 
 Runtime Doctor refuses to attach to an unrelated Redis process on the Mac app Redis port. If something else is already listening there, Batshit reports the conflict instead of quietly using the wrong data store.
 
@@ -34,7 +34,7 @@ After `Batshit.app` starts the runtime, you can also open `http://127.0.0.1:5620
 Inside the Mac app, Settings → Admin → Runtimes shows **Mac App Required Runtime** for viewing Runtime Doctor checks later. Docker installs do not show Mac-only Apple Container/runtime requirement cards.
 
 The Mac app stores durable state under `~/Library/Application Support/Batshit`, logs under `~/Library/Logs/Batshit`, and cache/scratch under `~/Library/Caches/Batshit`.
-When you save settings, agents, chats, Goons, scenes, or other app data, Batshit writes that change to the Mac-app-owned Redis Stack process immediately. The Mac app also runs Redis with append-only persistence so recent saves are written to disk quickly and survive app restarts or Mac reboots.
+When you save settings, agents, chats, Goons, scenes, or other app data, Batshit writes that change to the Mac-app-owned Redis process immediately. The Mac app also runs Redis with append-only persistence so recent saves are written to disk quickly and survive app restarts or Mac reboots.
 
 n8n is connect-existing for the Mac app. Run your own n8n instance when you want `n8n` Primary Agents or workflow tools.
 
@@ -46,7 +46,7 @@ Docker Batshit runs the core stack in Compose:
 
 - `app` container, published to `http://localhost:5620`
 - `batshit-server` container, published to `http://localhost:5600`
-- internal-only Redis Stack
+- internal-only Redis 8
 - optional `n8n` profile, published to `http://localhost:5678`
 
 Inside Docker, services use Docker names: the app calls batshit-server at `http://batshit-server:5600`, batshit-server and n8n call the app at `http://app:3000`, the app calls the optional Docker n8n at `http://n8n:5678`, and the app reaches host services through `host.docker.internal`.
