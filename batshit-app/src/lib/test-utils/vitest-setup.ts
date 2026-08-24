@@ -47,6 +47,7 @@ vi.mock('@ai-sdk/openai', () => ({
 }))
 
 vi.mock('@ai-sdk/google', () => ({
+  createGoogle: googleFactory.createFn,
   createGoogleGenerativeAI: googleFactory.createFn
 }))
 
@@ -461,12 +462,18 @@ vi.mock('$lib/server/redis', async () => {
   }
 })
 
+const isStepCountMock = vi.fn((count: number) => ({ type: 'step-count', count }))
+
+// Mirrors the AI SDK 7 surface Batshit imports (SA-098). `stepCountIs` is kept
+// as the SDK's own deprecated alias of `isStepCount`.
 const aiModuleMock = {
   streamText: vi.fn(),
+  generateText: vi.fn(),
   convertToModelMessages: vi.fn(async (messages: any) => messages),
   tool: vi.fn((config: any) => config),
   dynamicTool: vi.fn((config: any) => config),
-  stepCountIs: vi.fn((count: number) => ({ type: 'step-count', count })),
+  isStepCount: isStepCountMock,
+  stepCountIs: isStepCountMock,
   extractReasoningMiddleware: vi.fn((config: any) => ({
     type: 'extract-reasoning-middleware',
     ...config
@@ -481,6 +488,17 @@ const aiModuleMock = {
   asSchema: vi.fn((schema: any) => ({ jsonSchema: schema })),
   generateImage: vi.fn(),
   generateSpeech: vi.fn(),
+  transcribe: vi.fn(),
+  InvalidToolInputError: class InvalidToolInputError extends Error {
+    static isInstance(error: unknown): boolean {
+      return error instanceof this
+    }
+  },
+  NoSuchToolError: class NoSuchToolError extends Error {
+    static isInstance(error: unknown): boolean {
+      return error instanceof this
+    }
+  },
   Output: {
     object: vi.fn((config: any) => ({ ...config, type: 'output.object' }))
   },

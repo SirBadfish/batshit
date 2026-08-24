@@ -353,7 +353,7 @@ describe('nativeToolService hardening', () => {
   })
 
   it('enforces Agent Settings bash policy mode for Mode 3 native tool calls', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -743,7 +743,7 @@ PATCH`
   })
 
   it('uses Agent allow list to skip approval prompts when Approval Policy is On Failure', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools, toolApprovals } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -763,21 +763,22 @@ PATCH`
 
     const bashTool = (tools as any).native_bash_execute
     expect(bashTool).toBeTruthy()
-    expect(typeof bashTool.needsApproval).toBe('function')
+    const bashApproval = toolApprovals.native_bash_execute
+    expect(typeof bashApproval).toBe('function')
 
-    expect(await bashTool.needsApproval({ command: 'npm run check' })).toBe(false)
-    expect(await bashTool.needsApproval({ command: 'npm run build' })).toBe(true)
-    expect(await bashTool.needsApproval('{"command":"mkdir scratch"}')).toBe(true)
-    expect(await bashTool.needsApproval("cat > NOTES.md <<'EOF'\nhello\nEOF")).toBe(false)
+    expect(await bashApproval({ command: 'npm run check' })).toBeUndefined()
+    expect(await bashApproval({ command: 'npm run build' })).toBe('user-approval')
+    expect(await bashApproval('{"command":"mkdir scratch"}')).toBe('user-approval')
+    expect(await bashApproval("cat > NOTES.md <<'EOF'\nhello\nEOF")).toBeUndefined()
     expect(
-      await bashTool.needsApproval(
+      await bashApproval(
         "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: NOTES.md\n+hello\n*** End Patch\nPATCH"
       )
-    ).toBe(false)
+    ).toBeUndefined()
   })
 
   it('disables Agent-mode approval prompts by default (policy-only)', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools, toolApprovals } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -795,7 +796,7 @@ PATCH`
 
     const bashTool = (tools as any).native_bash_execute
     expect(bashTool).toBeTruthy()
-    expect(bashTool.needsApproval).toBe(false)
+    expect(toolApprovals.native_bash_execute).toBeUndefined()
 
     const blockedResult = await bashTool.execute({ command: 'mkdir scratch' })
     expect(blockedResult.success).toBe(false)
@@ -901,7 +902,7 @@ PATCH`
       user_id: 'josh'
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_zip',
       agentId: 'agent_main',
@@ -960,7 +961,7 @@ PATCH`
   })
 
   it('hides brokered Fetch Zip search result when Fetch Zip is disabled', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_zip_disabled',
       agentId: 'agent_main',
@@ -1220,7 +1221,7 @@ PATCH`
       ) as any
     )
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       providerSettings: {
         nativeTools: {
@@ -1396,7 +1397,7 @@ PATCH`
       ])
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_ctx'],
       providerSettings: {
@@ -1448,7 +1449,7 @@ PATCH`
       ])
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_ctx'],
       providerSettings: {
@@ -1493,7 +1494,7 @@ PATCH`
       metadata: new Map()
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_ctx'],
       providerSettings: {
@@ -1552,7 +1553,7 @@ PATCH`
       ])
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       agentId: 'agent_main',
       selectedGateways: ['gw_ctx'],
@@ -1592,7 +1593,7 @@ PATCH`
   })
 
   it('Mode 3 Batshit tool use rejects malformed refs with a clear error', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_ctx'],
       providerSettings: {
@@ -1616,7 +1617,7 @@ PATCH`
   })
 
   it('Mode 3 Batshit tool search reports unavailable families for unsupported actors', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_subagent_api_artifacts',
       agentId: 'agent_sub_api',
@@ -1654,7 +1655,7 @@ PATCH`
   })
 
   it('Mode 3 Batshit tool search blocks Agent Browser family in unsupported API actor context', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_ctx'],
       providerSettings: {
@@ -1710,7 +1711,7 @@ PATCH`
       ])
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_visible'],
       providerSettings: {
@@ -1787,7 +1788,7 @@ PATCH`
       })
     })
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedCliToolIds: ['visible_tool'],
       providerSettings: {
@@ -1829,7 +1830,7 @@ PATCH`
       result: { ok: true }
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_ctx'],
       providerSettings: {
@@ -1909,7 +1910,7 @@ PATCH`
         output: { ok: true }
       } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       selectedGateways: ['gw_ctx'],
       providerSettings: {
@@ -1952,7 +1953,7 @@ PATCH`
       }
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session-runtime-addon-prepare',
       selectedGateways: ['gw_ctx'],
@@ -2012,7 +2013,7 @@ PATCH`
       }
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session-model-catalog-search',
       selectedGateways: ['gw_ctx'],
@@ -2077,7 +2078,7 @@ PATCH`
         ) as any
       )
 
-      const tools = await nativeToolService.buildMode3NativeTools({
+      const { tools } = await nativeToolService.buildMode3NativeTools({
         userId: 'josh',
         providerSettings: {
           nativeTools: {
@@ -2186,7 +2187,7 @@ PATCH`
         }
       }))
 
-      const tools = await nativeToolService.buildMode3NativeTools({
+      const { tools } = await nativeToolService.buildMode3NativeTools({
         userId: 'josh',
         sessionId: `session-parity-${executionBackend}`,
         selectedGateways: ['gw_ctx'],
@@ -2298,7 +2299,7 @@ PATCH`
         result: { ok: true }
       } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session-risk-retry',
       selectedGateways: ['gw_ctx'],
@@ -2355,7 +2356,7 @@ PATCH`
         }
       } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session-voice-local-setup-risk-retry',
       providerSettings: {
@@ -2403,7 +2404,7 @@ PATCH`
         }
       } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session-risk-retry-mismatch',
       providerSettings: {
@@ -3862,7 +3863,7 @@ PATCH`
   })
 
   it('keeps bash tool enabled and does not expose Agent Browser wrapper tools by default', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: null
@@ -3874,7 +3875,7 @@ PATCH`
   })
 
   it('auto-allowlists agent-browser commands in Agent mode when Agent Browser is enabled', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -3902,7 +3903,7 @@ PATCH`
   })
 
   it('blocks agent-browser commands in Agent mode when Agent Browser is disabled', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -3931,7 +3932,7 @@ PATCH`
   })
 
   it('allows explicit regex patterns for npx agent-browser commands when Agent Browser is enabled', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -3965,7 +3966,7 @@ PATCH`
   })
 
   it('applies Agent Browser runtime defaults to native_bash_execute commands', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -4171,7 +4172,7 @@ printf '{"success":true,"data":{},"error":null}\\n'
     process.env.PATH = `${tempWorkspace}:${originalPath ?? ''}`
 
     try {
-      const tools = await nativeToolService.buildMode3NativeTools({
+      const { tools } = await nativeToolService.buildMode3NativeTools({
         userId: 'josh',
         projectPath: tempWorkspace,
         providerSettings: {
@@ -4227,7 +4228,7 @@ printf 'ok\\n'
     process.env.PATH = `${tempWorkspace}:${originalPath ?? ''}`
 
     try {
-      const tools = await nativeToolService.buildMode3NativeTools({
+      const { tools } = await nativeToolService.buildMode3NativeTools({
         userId: 'josh',
         projectPath: tempWorkspace,
         providerSettings: {
@@ -4266,7 +4267,7 @@ printf 'ok\\n'
   })
 
   it('native_bash_execute maps Agent Browser screenshot URLs to image-url model output content', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -4315,7 +4316,7 @@ printf 'ok\\n'
     const screenshotPath = path.join(tempWorkspace, 'test-shot.png')
     await writeFile(screenshotPath, Buffer.from('iVBORw0KGgo=', 'base64'))
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -4362,7 +4363,7 @@ printf 'ok\\n'
   })
 
   it('returns a clear API key error when agent-browser bash command uses Browserbase without credentials', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
       providerSettings: {
@@ -4409,7 +4410,7 @@ printf 'ok\\n'
     await chmod(fakeAgentBrowserPath, 0o755)
 
     try {
-      const tools = await nativeToolService.buildMode3NativeTools({
+      const { tools } = await nativeToolService.buildMode3NativeTools({
         userId: 'josh',
         projectPath: process.cwd(),
         providerSettings: {
@@ -6885,7 +6886,7 @@ PY`
   })
 
   it('can expose artifact runtime tools without broad Fabric control tools', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_subagent_api_artifacts',
       agentId: 'agent_sub_api',
@@ -6956,7 +6957,7 @@ PY`
       warnings: []
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_skill',
       agentId: 'agent_main',
@@ -7075,7 +7076,7 @@ PY`
       }
     })
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_skill',
       agentId: 'agent_main',
@@ -7141,7 +7142,7 @@ PY`
     vi.mocked(resolveBundleFileAbsolutePath).mockReturnValue('/tmp/skill-alpha/scripts/run.sh')
     vi.mocked(buildSkillScriptCommand).mockReturnValue("printf 'skill-script-ok'")
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_skill',
       agentId: 'agent_main',
@@ -7199,7 +7200,7 @@ PY`
       error: null
     } as any)
 
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_skill',
       agentId: 'agent_main',
@@ -7448,7 +7449,7 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
       const registrations: boolean[] = []
 
       for (const nativeTools of cases) {
-        const tools = await nativeToolService.buildMode3NativeTools({
+        const { tools } = await nativeToolService.buildMode3NativeTools({
           userId: 'josh',
           sessionId: 'session_sa096_p5',
           providerSettings: { nativeTools },
@@ -7499,7 +7500,7 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
       providerSettings,
       selectedCliToolIds: []
     } as any)
-    expect((withoutSelection as any).native_batshit_tool_search).toBeUndefined()
+    expect((withoutSelection.tools as any).native_batshit_tool_search).toBeUndefined()
 
     const withSelection = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
@@ -7507,7 +7508,7 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
       providerSettings,
       selectedCliToolIds: ['cli_tool_alpha']
     } as any)
-    expect((withSelection as any).native_batshit_tool_search).toBeTruthy()
+    expect((withSelection.tools as any).native_batshit_tool_search).toBeTruthy()
   })
 
   it('exposes the mode 4 broker helpers exactly when a family is reachable', () => {
@@ -7555,7 +7556,7 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
     ref: string,
     allowFabricControlTools = true
   ): Promise<string | undefined> {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       sessionId: 'session_sa096_p4_fabric_scope',
       providerSettings: { nativeTools },

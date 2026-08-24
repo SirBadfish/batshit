@@ -971,9 +971,9 @@ describe('voiceService engine defaults', () => {
         listVoices: true,
         streaming: true
       },
-      defaultModel: 's2-pro',
-      defaultTtsModel: 's2-pro',
-      ttsModels: ['s2-pro', 's1'],
+      defaultModel: 's2.1-pro',
+      defaultTtsModel: 's2.1-pro',
+      ttsModels: ['s2.1-pro', 's2.1-pro-free', 's2-pro', 's1'],
       sttCapabilities: {
         recorded: true,
         realtime: false,

@@ -400,6 +400,9 @@ export class ClaudeBridge {
     })
 
     return {
+      // Canonical AI SDK 7 name plus the legacy alias, mirroring the SDK's own
+      // deprecated fullStream alias so no reader silently diverges.
+      stream: wrappedStream,
       fullStream: wrappedStream,
       __transport: runner.transport,
       __detectToolSource: adapter.getToolMetadataResolver(),

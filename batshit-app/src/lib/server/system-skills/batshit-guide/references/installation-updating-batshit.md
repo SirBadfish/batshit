@@ -26,6 +26,18 @@ Batshit used to run a version called Redis Stack 7.4. That product is retired, s
 
 Nothing about how you reach Batshit changes. Same ports, same URLs, same setup.
 
+## Alpha release note: upgraded AI engine (AI SDK 7)
+
+Batshit's direct AI connections run on Vercel's AI SDK, and Batshit now uses major version 7 of it. This is internal plumbing — your chats, agents, settings, Goons, and files are untouched, and there is no data reset.
+
+What you might notice:
+
+- **Every provider path was re-verified live** after the upgrade: OpenAI, Anthropic, Gemini, OpenRouter, Z.ai, Vercel AI Gateway, local runtimes, plus tools, subagents, and tool approvals.
+- **A tool approval that is waiting when you update does not carry over.** Approvals already expire on their own after 3 minutes, so in practice this only matters if you update at the exact moment one is pending. Just ask the agent again.
+- **Very old approval cards in past chats may look plainer** than they did. The conversation text itself is unchanged.
+
+Export a backup before updating, same as always.
+
 ## Mac app updates
 
 1. Quit Batshit.

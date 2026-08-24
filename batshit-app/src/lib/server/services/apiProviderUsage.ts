@@ -217,12 +217,16 @@ function normalizeFlatUsage(usage: Record<string, any>): ApiUsageLike {
     plainObject(usage.prompt_tokens_details) ??
     plainObject(usage.promptTokensDetails) ??
     plainObject(usage.input_tokens_details) ??
-    plainObject(usage.inputTokensDetails)
+    plainObject(usage.inputTokensDetails) ??
+    // AI SDK 7 core usage: flat numeric tokens + inputTokenDetails/outputTokenDetails
+    // (the legacy flat cachedInputTokens/reasoningTokens duplicates were removed).
+    plainObject(usage.inputTokenDetails)
   const completionDetails =
     plainObject(usage.completion_tokens_details) ??
     plainObject(usage.completionTokensDetails) ??
     plainObject(usage.output_tokens_details) ??
-    plainObject(usage.outputTokensDetails)
+    plainObject(usage.outputTokensDetails) ??
+    plainObject(usage.outputTokenDetails)
   const input = firstTokenCount(
     usage.prompt_tokens,
     usage.promptTokens,
@@ -261,6 +265,7 @@ function normalizeFlatUsage(usage: Record<string, any>): ApiUsageLike {
     usage.cache_read_tokens,
     promptDetails?.cached_tokens,
     promptDetails?.cachedTokens,
+    promptDetails?.cacheReadTokens,
   )
   const cacheCreationInput = firstTokenCount(
     usage.cacheCreationInputTokens,
