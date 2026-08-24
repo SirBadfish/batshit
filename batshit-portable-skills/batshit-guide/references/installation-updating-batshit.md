@@ -13,6 +13,19 @@ Before updating, export a normal backup:
 
 Normal backups exclude saved API keys and tokens by default. That is usually what you want before an update. If you ever use With Secrets, protect that file like a password vault because the zip itself is not encrypted.
 
+## Alpha release note: Batshit now runs Redis 8
+
+Redis is the local database Batshit keeps your chats, agents, settings, and everything else in. It runs on your own machine, and that hasn't changed.
+
+Batshit used to run a version called Redis Stack 7.4. That product is retired, so Batshit now runs **Redis 8** instead. Everything Redis Stack did for Batshit is built into Redis 8.
+
+- **Your data carries over automatically.** The first time you open the updated Batshit, Redis 8 picks up your existing data and keeps going. This was tested against real Batshit data — real chats, agents, and settings, not an empty test install.
+- **Export a backup before you update anyway.** Use the steps above. It is the one habit that makes everything else recoverable.
+- **There is no going back after the first launch.** Once Redis 8 has opened your data and written to it, the older Redis Stack 7.4 can no longer read it. That applies to going back to an older Mac app release and to going back to an older Docker image. If you need to return to an older Batshit, restore the backup you exported — putting the old app or old image back on its own will not work.
+- **The Docker download is much smaller.** The Redis image drops from roughly 267 MB to roughly 39 MB.
+
+Nothing about how you reach Batshit changes. Same ports, same URLs, same setup.
+
 ## Mac app updates
 
 1. Quit Batshit.

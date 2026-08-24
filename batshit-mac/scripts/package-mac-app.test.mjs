@@ -140,7 +140,7 @@ test('release signing grants third-party native-module loading only to managed N
   const managedNodeExecutable =
     `${appPath}/Contents/Resources/runtime/vendor/node/bin/node`;
   const packagedRedisExecutable =
-    `${appPath}/Contents/Resources/runtime/vendor/redis-stack/bin/redis-server`;
+    `${appPath}/Contents/Resources/runtime/vendor/redis/bin/redis-server`;
 
   const nodeOptions = signingOptionsForFile(managedNodeExecutable, {
     appPath,
@@ -165,7 +165,7 @@ test('local signing gives every Electron process the same library-loading except
     `${appPath}/Contents/Frameworks/Batshit Helper (Renderer).app/Contents/MacOS/` +
     'Batshit Helper (Renderer)';
   const packagedRedisExecutable =
-    `${appPath}/Contents/Resources/runtime/vendor/redis-stack/bin/redis-server`;
+    `${appPath}/Contents/Resources/runtime/vendor/redis/bin/redis-server`;
 
   for (const filePath of [appPath, mainExecutable, helperExecutable, packagedRedisExecutable]) {
     const options = signingOptionsForFile(filePath, { appPath, mainExecutable, adHoc: true });

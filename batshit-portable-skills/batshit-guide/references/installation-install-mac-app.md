@@ -24,7 +24,7 @@ The Mac app release path is a Developer ID signed, notarized DMG. Local developm
 | --- | --- |
 | App shell | Zero-native-system WebView app with a packaged Runtime Doctor |
 | Local runtime | Packaged Batshit app/server code launched with app-owned runtime binaries when the release package includes them |
-| Redis | Mac-app-owned Redis Stack on a Batshit port and Batshit data directory; Runtime Doctor refuses to attach to an unrelated Redis process on that port |
+| Redis | Mac-app-owned Redis 8 on a Batshit port and Batshit data directory; Runtime Doctor refuses to attach to an unrelated Redis process on that port |
 | n8n | Connect existing; not bundled into the Mac app |
 | Signing | Public release DMGs are Developer ID signed, notarized, and stapled. Local development `.app` builds may still use local/ad-hoc signing. |
 | Distribution | Public release target is a DMG. Local alpha/dev builds may be raw `.app` packages; ZIP is not the default public Mac install path. |
@@ -39,7 +39,7 @@ Runtime Doctor checks the Mac app's required runtime and reports anything missin
 | --- | --- |
 | macOS on Apple Silicon | Current Mac app and Apple Container proof target |
 | App-owned Node 24 runtime | Runs the packaged SvelteKit app/server payload |
-| App-owned Redis Stack 7.4+ with RedisJSON and `redis-cli` | Stores chats, agents, settings, zips, clips, prompts, and sessions |
+| App-owned Redis 8 with the JSON module and `redis-cli` | Stores chats, agents, settings, zips, clips, prompts, and sessions |
 | App-owned ffmpeg | Needed by batshit-server for media and Goon preview workflows |
 | Apple Container | Default Mac app command sandbox backend on supported Macs |
 
@@ -150,7 +150,7 @@ The source-checkout pieces are:
 
 - `batshit-app/` for the SvelteKit app
 - `batshit-server/server/` for batshit-server
-- Redis Stack on `localhost:5639` for the Mac app, or `localhost:6379` for advanced source-checkout repair
+- Redis on `localhost:5639` for the Mac app, or `localhost:6379` for advanced source-checkout repair
 - optional n8n on `localhost:5678`
 
 The source-checkout dev/repair ports are intentionally offset from the Mac app's launch-facing ports so both can run on the same Mac:
@@ -172,7 +172,7 @@ Don't run source-checkout Batshit against the same ports already published by Do
 
 ### Runtime Doctor shows a missing requirement
 
-Use **Refresh**, **Restart**, or Settings → Admin → Runtimes → **Mac App Required Runtime** after fixing the named issue. For a normal release package, missing Node, Redis Stack, or ffmpeg usually means the package is incomplete or damaged, so reinstall Batshit or use a newer package. Advanced source-checkout repair can still use host-installed fallbacks.
+Use **Refresh**, **Restart**, or Settings → Admin → Runtimes → **Mac App Required Runtime** after fixing the named issue. For a normal release package, missing Node, Redis, or ffmpeg usually means the package is incomplete or damaged, so reinstall Batshit or use a newer package. Advanced source-checkout repair can still use host-installed fallbacks.
 
 ### Port already in use
 

@@ -10,7 +10,7 @@ The core Docker stack is small:
 
 - `app`: Batshit web app and app APIs, published on `http://localhost:5620` by default
 - `batshit-server`: upload and helper service, published on `http://localhost:5600` by default
-- `redis`: Redis Stack with RedisJSON, internal-only by default
+- `redis`: Redis 8, which includes the JSON support Batshit stores records with, internal-only by default
 
 Optional services aren't part of the core app container. That includes n8n, Cloudflared, FBX-to-VRMA, Agent Browser, LiveKit, ComfyUI-style services, Local AI runtimes, and voice engines.
 

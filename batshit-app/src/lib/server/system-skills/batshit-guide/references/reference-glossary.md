@@ -252,7 +252,9 @@ Structured guidance attached to a Project. Project rules guide agents but are no
 
 ### Redis
 
-Batshit's main data store for user settings, agents, messages, zips, clips, artifacts, Goons, and other app records. Docker uses internal-only Redis Stack by default.
+Batshit's main data store for user settings, agents, messages, zips, clips, artifacts, Goons, and other app records. Batshit runs Redis 8, which builds in the JSON support Batshit needs. Docker keeps Redis internal-only by default.
+
+The full product name is Redis Open Source, distributed under a choice of three licenses: RSALv2, SSPLv1, or AGPLv3. Batshit used the older Redis Stack 7.4 before the alpha Redis 8 update; Redis Stack is retired, and Redis 8 replaced it.
 
 ### Rhubarb WASM
 

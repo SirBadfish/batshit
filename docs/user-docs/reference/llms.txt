@@ -74,7 +74,7 @@ Setup posture:
 - Do not tell public users to run private development launchers as install steps.
 
 Docker core:
-- Core services: app, batshit-server, Redis Stack.
+- Core services: app, batshit-server, Redis 8.
 - Optional profiles/add-ons: n8n, cloudflared, fbx2vrma, agent-browser, livekit, comfyui-validation.
 - Core app container does not get the host Docker socket.
 - Docker Sandbox and approved add-on start/stop use a host operator prepared by ./start-docker.sh.

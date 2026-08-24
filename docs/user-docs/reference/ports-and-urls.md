@@ -10,7 +10,7 @@ This page explains which URLs to use for Batshit, batshit-server, n8n, Docker si
 | batshit-server | Mac/Docker host: `http://localhost:5600`; source dev: `http://localhost:5610` | `http://batshit-server:5600` | Uploads, helper APIs, and batshit-server health. |
 | batshit-server API | Mac/Docker host: `http://localhost:5600/api/v1`; source dev: `http://localhost:5610/api/v1` | `http://batshit-server:5600/api/v1` | Used by helper tooling. |
 | n8n | `http://localhost:5678` | `http://n8n:5678` | `http://n8n:5678` only works inside the optional Docker n8n profile network. |
-| Redis Stack | Mac app: `localhost:5639`; source-checkout repair: `localhost:6379` | `redis://redis:6379/0` | Docker Redis is internal-only by default. |
+| Redis | Mac app: `localhost:5639`; source-checkout repair: `localhost:6379` | `redis://redis:6379/0` | Docker Redis is internal-only by default. |
 | Artifact Complete callback | Mac app: `http://127.0.0.1:5620/api/artifacts/complete`; source dev: `http://127.0.0.1:5621/api/artifacts/complete` | `http://app:3000/api/artifacts/complete` | Server-to-app callback, not a page users open. |
 | Mac app streamable MCP helper | `http://localhost:5601/mcp` | not public Docker core | Managed by Runtime Doctor for the Mac app path. |
 
@@ -59,7 +59,7 @@ These are the launch-facing Mac app defaults:
 | `5600` | batshit-server | `BATSHIT_SERVER_PORT` |
 | `5601` | streamable MCP helper for Mac app helper tooling | `BATSHIT_MCP_STREAMABLE_PORT` |
 | `5678` | n8n editor/webhooks | `N8N_PORT` |
-| `5639` | Mac-app-owned Redis Stack | `BATSHIT_MAC_REDIS_PORT`, `REDIS_URL`, `REDIS_HOST`, `REDIS_PORT` |
+| `5639` | Mac-app-owned Redis | `BATSHIT_MAC_REDIS_PORT`, `REDIS_URL`, `REDIS_HOST`, `REDIS_PORT` |
 | `8080` | optional Docker MCP Gateway default for Mac app; source/Docker leave it blank unless configured | `DOCKER_MCP_GATEWAY_PORT` or `DOCKER_MCP_GATEWAY_URL` |
 
 The Mac app Runtime Doctor owns normal Mac startup and status. After `Batshit.app` starts the runtime, `http://127.0.0.1:5620` is also a normal browser companion into that same Mac app instance and data. Public install docs should not send users through private local development launchers.
@@ -76,7 +76,7 @@ Manual source-checkout setup is advanced repair/development material, not a norm
 | `5678` | n8n editor/webhooks | `N8N_PORT` |
 | `5681` | n8n task-runner broker in the local dev stack | `N8N_RUNNERS_BROKER_PORT` |
 | `5682` | n8n task-runner health in the local dev stack | `N8N_RUNNERS_LAUNCHER_HEALTH_CHECK_PORT` |
-| `6379` | source-checkout Redis Stack | `REDIS_URL`, `REDIS_HOST`, `REDIS_PORT` |
+| `6379` | source-checkout Redis | `REDIS_URL`, `REDIS_HOST`, `REDIS_PORT` |
 
 Source-checkout defaults are intentionally offset from the Mac app's launch-facing ports, so a developer can run Native BS beside `Batshit.app` without fighting for the same listeners or browser cookies. Keep Mac app URLs on `127.0.0.1:5620`; keep source-checkout browser URLs on `localhost:5621` unless you intentionally override them.
 
@@ -92,11 +92,11 @@ Source-checkout defaults are intentionally offset from the Mac app's launch-faci
 
 Removing the app bundle does not remove these folders.
 
-Mac app saves write to the Mac-app-owned Redis Stack process immediately. Redis runs with append-only persistence, so recent saved changes are written to disk quickly instead of depending only on delayed snapshot timing.
+Mac app saves write to the Mac-app-owned Redis process immediately. Redis runs with append-only persistence, so recent saved changes are written to disk quickly instead of depending only on delayed snapshot timing.
 
 ## Docker core ports
 
-Docker core services are Batshit app, batshit-server, and internal Redis Stack.
+Docker core services are Batshit app, batshit-server, and internal Redis.
 
 | Port | Purpose | Override |
 | --- | --- | --- |

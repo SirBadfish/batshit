@@ -360,7 +360,7 @@
     return [
       { key: 'node', label: 'Node.js', status: tools.node },
       { key: 'npm', label: 'npm', status: tools.npm },
-      { key: 'redis', label: 'Redis Stack', status: services.redis },
+      { key: 'redis', label: 'Redis', status: services.redis },
       { key: 'redisCli', label: 'redis-cli', status: tools.redisCli },
       { key: 'ffmpeg', label: 'FFmpeg', status: tools.ffmpeg },
       { key: 'appleContainer', label: 'Apple Container', optional: true, status: tools.appleContainer }

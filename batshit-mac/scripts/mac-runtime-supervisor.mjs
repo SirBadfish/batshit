@@ -33,13 +33,20 @@ const packagedRuntimeRoot = resolve(__dirname, '..', 'runtime');
 const packagedAppRoot = join(packagedRuntimeRoot, 'batshit-app');
 const packagedServerRoot = join(packagedRuntimeRoot, 'batshit-server', 'server');
 const packagedLiveKitSidecarSourceRoot = join(packagedRuntimeRoot, 'tools', 'livekit-agent-sidecar');
-const packagedRedisStackRoot = join(packagedRuntimeRoot, 'vendor', 'redis-stack');
+const packagedRedisRoot = join(packagedRuntimeRoot, 'vendor', 'redis');
+// The two modules Batshit requires. redis-server aborts on a --loadmodule it cannot
+// load, so a missing module fails loudly instead of degrading to a Redis without JSON.
+const REDIS_REQUIRED_MODULES = ['rejson.so', 'redisearch.so'];
+// The packaged bundle flattens modules into lib/; a Homebrew `redis` cask install keeps
+// them at lib/redis/modules/. Probe both rather than assuming one layout.
+const REDIS_MODULE_DIR_CANDIDATES = [['lib'], ['lib', 'redis', 'modules']];
 const packagedFfmpegRoot = join(packagedRuntimeRoot, 'vendor', 'ffmpeg');
 const FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/facial-artwork/v6';
 const FACIAL_ARTWORK_RUNTIME_FILE_COUNT = 161;
 const LIP_ARTWORK_RUNTIME_RELATIVE_ROOT = 'assets/goons/lip-artwork/v2';
 const NAIL_SURFACE_RUNTIME_RELATIVE_ROOT = 'assets/goons/nail-surface/v1';
 const SKIN_APPEARANCE_RUNTIME_RELATIVE_ROOT = 'assets/goons/skin-appearance/v1';
+const CLOTHING_CATALOG_RUNTIME_RELATIVE_ROOT = 'batshit-app/static/goon-assets/clothing/v1';
 const packagedFacialArtworkRoot = join(
   packagedRuntimeRoot,
   ...FACIAL_ARTWORK_RUNTIME_RELATIVE_ROOT.split('/')
@@ -582,7 +589,7 @@ function withMacLaunchPath(source) {
 function mergePathEntries(existing) {
   const packagedEntries = [];
   const packagedNodeBin = join(packagedRuntimeRoot, 'vendor', 'node', 'bin');
-  const packagedRedisBin = join(packagedRedisStackRoot, 'bin');
+  const packagedRedisBin = join(packagedRedisRoot, 'bin');
   const packagedFfmpegBin = join(packagedFfmpegRoot, 'bin');
   for (const candidate of [packagedNodeBin, packagedRedisBin, packagedFfmpegBin]) {
     if (usePackagedRuntime && existsSync(candidate)) packagedEntries.push(candidate);
@@ -855,39 +862,57 @@ async function detectNpmRuntime() {
   return await detectCommand('npm');
 }
 
-async function resolvePackagedRedisStackRuntime() {
-  const serverBin = join(packagedRedisStackRoot, 'bin', 'redis-server');
-  const moduleDir = join(packagedRedisStackRoot, 'lib');
+async function resolveRedisModuleDir(baseDir) {
+  for (const segments of REDIS_MODULE_DIR_CANDIDATES) {
+    const candidate = join(baseDir, ...segments);
+    try {
+      await Promise.all(REDIS_REQUIRED_MODULES.map((name) => access(join(candidate, name))));
+      return candidate;
+    } catch {
+      // try the next layout
+    }
+  }
+  return null;
+}
+
+async function resolvePackagedRedisRuntime() {
+  const serverBin = join(packagedRedisRoot, 'bin', 'redis-server');
   try {
     await access(serverBin);
-    await access(join(moduleDir, 'redisearch.so'));
-    await access(join(moduleDir, 'rejson.so'));
-    return { serverBin, moduleDir, source: 'packaged' };
   } catch {
     return null;
   }
+  const moduleDir = await resolveRedisModuleDir(packagedRedisRoot);
+  if (!moduleDir) return null;
+  return { serverBin, moduleDir, source: 'packaged' };
 }
 
-async function resolveRedisStackRuntime() {
+async function resolveRedisRuntime() {
   if (usePackagedRuntime) {
-    const packaged = await resolvePackagedRedisStackRuntime();
+    const packaged = await resolvePackagedRedisRuntime();
     if (packaged) return packaged;
   }
 
-  const found = await run('/bin/sh', ['-lc', 'command -v redis-stack-server'], { timeoutMs: 5000 });
-  const script = found.stdout.trim().split('\n')[0];
-  if (!found.ok || !script) {
-    throw new Error('redis-stack-server is not installed or not on PATH.');
+  const found = await run('/bin/sh', ['-lc', 'command -v redis-server'], { timeoutMs: 5000 });
+  const binary = found.stdout.trim().split('\n')[0];
+  if (!found.ok || !binary) {
+    throw new Error(
+      'redis-server is not installed or not on PATH. Install Redis 8 with: brew tap redis/redis && brew install --cask redis'
+    );
   }
 
-  const resolvedScript = await realpath(script);
-  const baseDir = dirname(dirname(resolvedScript));
-  const serverBin = join(baseDir, 'bin', 'redis-server');
-  const moduleDir = join(baseDir, 'lib');
-  await access(serverBin);
-  await access(join(moduleDir, 'redisearch.so'));
-  await access(join(moduleDir, 'rejson.so'));
-  return { serverBin, moduleDir, source: 'host' };
+  const resolvedBinary = await realpath(binary);
+  const baseDir = dirname(dirname(resolvedBinary));
+  await access(resolvedBinary);
+  const moduleDir = await resolveRedisModuleDir(baseDir);
+  if (!moduleDir) {
+    throw new Error(
+      `Found redis-server at ${resolvedBinary}, but ${REDIS_REQUIRED_MODULES.join(' and ')} are not installed beside it. ` +
+        'Batshit stores JSON records and cannot run on a Redis without the JSON module. ' +
+        'Install Redis 8 with: brew tap redis/redis && brew install --cask redis'
+    );
+  }
+  return { serverBin: resolvedBinary, moduleDir, source: 'host' };
 }
 
 function stripRedisCliValue(value) {
@@ -1166,15 +1191,15 @@ async function redisStatus(env) {
   const unhealthyReason = !listenerInspectionOk
     ? `Could not inspect Redis port ${port}: ${listenerInspectionError || 'listener inspection failed'}.`
     : portOccupied
-    ? `Port ${port} is already in use by pid ${listener.pid}${listener.command ? ` (${listener.command})` : ''}, but it is not Batshit's Redis Stack runtime. Stop that process or change REDIS_PORT before starting Batshit.`
+    ? `Port ${port} is already in use by pid ${listener.pid}${listener.command ? ` (${listener.command})` : ''}, but it is not Batshit's managed Redis. Stop that process or change REDIS_PORT before starting Batshit.`
     : pingHealthy && !redisJson.available
-      ? `Redis answered PING on ${url}, but RedisJSON is not available. Batshit needs Redis Stack 7.x or Redis with JSON support on this port.`
+      ? `Redis answered PING on ${url}, but RedisJSON is not available. Batshit stores JSON records and needs a Redis with the JSON module on this port.`
       : external
         ? `Redis answered on ${url}, but it is not managed by this Mac app runtime. Expected data dir ${redisDir}; actual data dir ${configuredDataDir || 'unknown'}. Stop the other Redis process or change REDIS_PORT before starting Batshit.`
         : null;
 
   return {
-    label: 'Redis Stack',
+    label: 'Redis',
     healthy,
     response: result.stdout.trim(),
     error:
@@ -1887,8 +1912,8 @@ function doctorAdvice(report) {
       title: 'Redis CLI is missing',
       detail:
         usePackagedRuntime
-          ? 'The packaged Mac app is missing app-owned redis-cli. Reinstall Batshit or use a package built with the managed Redis Stack runtime.'
-          : 'The Mac runtime doctor uses redis-cli to verify Redis Stack readiness.'
+          ? 'The packaged Mac app is missing app-owned redis-cli. Reinstall Batshit or use a package built with the managed Redis runtime.'
+          : 'The Mac runtime doctor uses redis-cli to verify Redis readiness.'
     });
   }
   if (!report.services.redis.healthy) {
@@ -1898,18 +1923,18 @@ function doctorAdvice(report) {
       title:
         report.services.redis.portOccupied || report.services.redis.external
           ? 'Redis port is not Batshit-owned'
-          : 'Redis Stack is not ready',
+          : 'Redis is not ready',
       detail:
         report.services.redis.error ||
         (usePackagedRuntime
-          ? 'Start Runtime will try to launch Batshit-managed Redis Stack with app-owned data storage.'
-          : 'Start Runtime will try to launch redis-stack-server with Batshit-owned data storage.')
+          ? 'Start Runtime will try to launch Batshit-managed Redis with app-owned data storage.'
+          : 'Start Runtime will try to launch redis-server with Batshit-owned data storage.')
     });
   } else if (report.services.redis.external) {
     actions.push({
       id: 'redis-external',
       severity: 'blocker',
-      title: 'Redis Stack is external',
+      title: 'Redis is external',
       detail:
         report.services.redis.error ||
         'Runtime Doctor reached Redis, but this Mac app did not start it. Stop the other Redis process or change the Mac runtime Redis port before starting Batshit.'
@@ -2052,7 +2077,7 @@ async function startRedis(env) {
       ok: false,
       error:
         redis.error ||
-        `Redis port ${redis.port} is already in use by a process that is not Batshit's managed Redis Stack runtime.`,
+        `Redis port ${redis.port} is already in use by a process that is not Batshit's managed Redis runtime.`,
       status: redis
     };
   }
@@ -2075,7 +2100,7 @@ async function startRedis(env) {
     };
   }
   await mkdir(redisDir, { recursive: true });
-  const redisRuntime = await resolveRedisStackRuntime();
+  const redisRuntime = await resolveRedisRuntime();
   const redisHost = env.get('REDIS_HOST') || '127.0.0.1';
   const redisPort = env.get('REDIS_PORT') || String(DEFAULT_PORTS.redis);
   const config = [
@@ -2102,24 +2127,21 @@ async function startRedis(env) {
       'yes',
       '--daemonize',
       'yes',
-      '--loadmodule',
-      join(redisRuntime.moduleDir, 'rediscompat.so'),
-      '--loadmodule',
-      join(redisRuntime.moduleDir, 'redisearch.so'),
-      'MAXSEARCHRESULTS',
+      // Batshit only stores JSON, and Search is loaded because any data file written by a
+      // Redis Stack server carries a RediSearch marker that Redis 8 refuses to load without
+      // it. RedisGears and rediscompat do not exist in Redis 8; Bloom and TimeSeries are
+      // unused. redis-server aborts startup on a --loadmodule it cannot load, which is the
+      // loud failure we want (DL-101-04).
+      ...REDIS_REQUIRED_MODULES.flatMap((name) => [
+        '--loadmodule',
+        join(redisRuntime.moduleDir, name)
+      ]),
+      // Redis 8 deprecated RediSearch's positional module arguments in favour of these
+      // config directives. The positional form still starts but logs a deprecation warning.
+      '--search-max-search-results',
       '10000',
-      'MAXAGGREGATERESULTS',
-      '10000',
-      '--loadmodule',
-      join(redisRuntime.moduleDir, 'redistimeseries.so'),
-      '--loadmodule',
-      join(redisRuntime.moduleDir, 'rejson.so'),
-      '--loadmodule',
-      join(redisRuntime.moduleDir, 'redisbloom.so'),
-      '--loadmodule',
-      join(redisRuntime.moduleDir, 'redisgears.so'),
-      'v8-plugin-path',
-      join(redisRuntime.moduleDir, 'libredisgears_v8_plugin.so')
+      '--search-max-aggregate-results',
+      '10000'
     ],
     { timeoutMs: 10000 }
   );
@@ -2131,7 +2153,7 @@ async function startRedis(env) {
       error:
         after.error ||
         (result.stderr || result.stdout).trim() ||
-        'redis-stack-server did not start. Install Redis Stack or use Docker.'
+        'Redis did not start. Reinstall Batshit, or install Redis 8 and try again, or use Docker.'
       };
   }
   const persistence = await ensureRedisPersistence(env);
@@ -2878,7 +2900,7 @@ async function runMonitorDaemon() {
     { key: 'batshitServer', kind: 'service', definition: serviceDefinitions.batshitServer },
     { key: 'mcpProxy', kind: 'service', definition: serviceDefinitions.mcpProxy },
     { key: 'batshitApp', kind: 'service', definition: serviceDefinitions.batshitApp },
-    { key: 'redis', kind: 'redis', label: 'Redis Stack', logFile: redisLogFile },
+    { key: 'redis', kind: 'redis', label: 'Redis', logFile: redisLogFile },
     {
       key: 'dockerMcpGateway',
       kind: 'docker-mcp-gateway',
@@ -3495,13 +3517,20 @@ async function packageAudit(packagePath) {
     'Contents/Resources/runtime/vendor/node/bin/node',
     'Contents/Resources/runtime/vendor/node/bin/npm',
     'Contents/Resources/runtime/vendor/node/bin/npx',
-    'Contents/Resources/runtime/vendor/redis-stack/bin/redis-server',
-    'Contents/Resources/runtime/vendor/redis-stack/bin/redis-cli',
-    'Contents/Resources/runtime/vendor/redis-stack/lib/libssl.3.dylib',
-    'Contents/Resources/runtime/vendor/redis-stack/lib/libcrypto.3.dylib',
-    'Contents/Resources/runtime/vendor/redis-stack/share/openssl/LICENSE.txt',
-    'Contents/Resources/runtime/vendor/redis-stack/share/openssl/SOURCE.txt',
-    'Contents/Resources/runtime/vendor/redis-stack/share/openssl/CHECKSUMS.txt',
+    'Contents/Resources/runtime/vendor/redis/bin/redis-server',
+    'Contents/Resources/runtime/vendor/redis/bin/redis-cli',
+    'Contents/Resources/runtime/vendor/redis/bin/redis-check-aof',
+    'Contents/Resources/runtime/vendor/redis/bin/redis-check-rdb',
+    // Every module startRedis loads must be audited, not just the runtime binaries.
+    'Contents/Resources/runtime/vendor/redis/lib/rejson.so',
+    'Contents/Resources/runtime/vendor/redis/lib/redisearch.so',
+    'Contents/Resources/runtime/vendor/redis/lib/libssl.3.dylib',
+    'Contents/Resources/runtime/vendor/redis/lib/libcrypto.3.dylib',
+    'Contents/Resources/runtime/vendor/redis/share/redis/LICENSE.txt',
+    'Contents/Resources/runtime/vendor/redis/share/redis/REDISCONTRIBUTIONS.txt',
+    'Contents/Resources/runtime/vendor/redis/share/openssl/LICENSE.txt',
+    'Contents/Resources/runtime/vendor/redis/share/openssl/SOURCE.txt',
+    'Contents/Resources/runtime/vendor/redis/share/openssl/CHECKSUMS.txt',
     'Contents/Resources/runtime/vendor/ffmpeg/bin/ffmpeg',
     'Contents/Resources/runtime/vendor/ffmpeg/BUILD-CONFIG.txt',
     'Contents/Resources/runtime/batshit-app/package.json',
@@ -3836,6 +3865,62 @@ async function packageAudit(packagePath) {
     }
   }
 
+  const clothingCatalogAssets = runtimeManifest?.assets?.clothingCatalog;
+  if (
+    clothingCatalogAssets?.contract !== 'clothing-catalog/v1' ||
+    clothingCatalogAssets?.root !== CLOTHING_CATALOG_RUNTIME_RELATIVE_ROOT ||
+    clothingCatalogAssets?.definition !== 'catalog.json' ||
+    !Array.isArray(clothingCatalogAssets?.files) ||
+    clothingCatalogAssets.files.length < 1
+  ) {
+    runtimeAssetIssues.push(
+      'runtime-manifest.json is missing the complete clothing-catalog/v1 trusted asset inventory.'
+    );
+  } else {
+    const seenPaths = new Set();
+    for (const entry of clothingCatalogAssets.files) {
+      const relative = entry?.path;
+      if (
+        typeof relative !== 'string' ||
+        relative.startsWith('/') ||
+        relative.includes('\\') ||
+        relative.split('/').includes('..') ||
+        seenPaths.has(relative) ||
+        !/^[a-f0-9]{64}$/.test(entry?.sha256 || '')
+      ) {
+        runtimeAssetIssues.push(
+          `Invalid Clothing Asset runtime manifest entry: ${JSON.stringify(entry)}`
+        );
+        continue;
+      }
+      seenPaths.add(relative);
+      const assetPath = join(
+        realTarget,
+        'Contents',
+        'Resources',
+        'runtime',
+        clothingCatalogAssets.root,
+        relative
+      );
+      const bytes = await readFile(assetPath).catch(() => null);
+      if (!bytes) {
+        runtimeAssetIssues.push(`Missing Clothing Asset runtime file: ${relative}`);
+        continue;
+      }
+      const actualSha256 = createHash('sha256').update(bytes).digest('hex');
+      if (actualSha256 !== entry.sha256) {
+        runtimeAssetIssues.push(
+          `Clothing Asset runtime file hash mismatch: ${relative} (${actualSha256} != ${entry.sha256})`
+        );
+      }
+    }
+    if (!seenPaths.has(clothingCatalogAssets.definition)) {
+      runtimeAssetIssues.push(
+        'The clothing-catalog/v1 definition is absent from its runtime asset inventory.'
+      );
+    }
+  }
+
   const managedRuntimeRoot = join(realTarget, 'Contents', 'Resources', 'runtime', 'vendor');
   const portability = await inspectManagedRuntimePortability(managedRuntimeRoot, {
     maximumMinimumVersion: MAC_RUNTIME_MINIMUM_VERSION
@@ -3876,7 +3961,7 @@ async function packageAudit(packagePath) {
   if (stableSigned) {
     for (const [label, executable] of [
       ['Electron main executable', mainExecutable],
-      ['Redis Stack executable', join(managedRuntimeRoot, 'redis-stack', 'bin', 'redis-server')],
+      ['Redis executable', join(managedRuntimeRoot, 'redis', 'bin', 'redis-server')],
       ['FFmpeg executable', join(managedRuntimeRoot, 'ffmpeg', 'bin', 'ffmpeg')]
     ]) {
       if (entitlementText(executable).includes('com.apple.security.cs.disable-library-validation')) {

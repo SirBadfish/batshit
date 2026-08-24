@@ -16,18 +16,20 @@ The Mac app can include app-owned runtime binaries under `Batshit.app/Contents/R
 - License: Node.js `LICENSE` from the official distribution.
 - Packaging rule: include the unmodified official `LICENSE` file with the copied Node distribution and verify the official `SHASUMS256.txt` entry before release packaging.
 
-### Redis Stack / Redis
+### Redis
 
 - Purpose: stores chats, agents, settings, zips, clips, prompts, sessions, and RedisJSON-backed records.
-- Launch target: Redis Stack 7.4.x for the alpha Mac app; Redis 8 migration is intentionally deferred.
-- Current Docker baseline: `redis/redis-stack-server:7.4.0-v8`.
-- Official Redis Stack release: <https://github.com/redis-stack/redis-stack/releases/tag/v7.4.0-v8>
+- Distribution: Redis Open Source 8. Redis 8 merged Redis Stack into the main distribution and bundles the JSON and Search modules; Redis Stack is a retired product and is no longer used.
+- Mac app baseline: `redis-oss-8.10.1-arm64.zip` from <https://packages.redis.io/homebrew/>, pinned by SHA-256 and verified at asset-preparation time. Only `rejson.so` and `redisearch.so` are bundled.
+- Docker baseline: `redis:8.10.1-alpine`, pinned by multi-architecture manifest digest in `compose.yaml`.
+- Official source: <https://github.com/redis/redis/releases/tag/8.10.1>
+- License: tri-licensed under your choice of the Redis Source Available License v2 (RSALv2), the Server Side Public License v1 (SSPLv1), or the GNU Affero General Public License v3 (AGPLv3).
 - Redis license overview: <https://redis.io/legal/licenses/>
-- Packaging rule: include the Redis Stack package's `RSALv2.txt` and `SSPLv1.txt` notices, do not remove Redis licensing/copyright notices, and keep Redis bound to Batshit's private loopback port/data directory.
+- Packaging rule: the Redis 8 macOS archive ships no license files, so include Redis's own `LICENSE.txt` (which carries all three licenses) and `REDISCONTRIBUTIONS.txt` from the matching release tag, do not remove Redis licensing/copyright notices, and keep Redis bound to Batshit's private loopback port/data directory.
 
 ### OpenSSL
 
-- Purpose: provides the TLS/cryptography dynamic libraries required by the packaged Redis Stack binaries and modules.
+- Purpose: provides the TLS/cryptography dynamic libraries required by the packaged Redis binaries and modules.
 - Launch target: OpenSSL 3.5 LTS for macOS arm64.
 - Official source and license: <https://www.openssl.org/source/> and <https://www.openssl.org/source/license-openssl-3.0.txt>.
 - Packaging rule: build from the checksum-verified official source archive, include `LICENSE.txt`, the source/checksum record, and both package-owned dynamic libraries with loader-relative references. Redis must never resolve OpenSSL through Homebrew or another build-machine path.
@@ -50,4 +52,4 @@ The Mac app can include app-owned runtime binaries under `Batshit.app/Contents/R
 
 ## Docker Runtime
 
-Docker installs use Compose-managed images instead of Mac app vendor binaries for the core app runtime. The Docker Redis baseline is the Redis Stack image declared in `compose.yaml`; Docker image notices and upstream image metadata remain part of the Docker distribution boundary.
+Docker installs use Compose-managed images instead of Mac app vendor binaries for the core app runtime. The Docker Redis baseline is the digest-pinned Redis 8 image declared in `compose.yaml`; Docker image notices and upstream image metadata remain part of the Docker distribution boundary.
