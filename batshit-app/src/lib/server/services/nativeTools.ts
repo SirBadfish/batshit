@@ -11201,7 +11201,21 @@ export function normalizeNativeControlUseInput(
   return Object.keys(mergedInput).length > 0 ? mergedInput : undefined
 }
 
-export async function buildMode3NativeTools(context: NativeToolContext): Promise<Record<string, any>> {
+export type NativeToolApprovalPolicy = (
+  input: unknown
+) => Promise<'user-approval' | undefined>
+
+export interface Mode3NativeToolSet {
+  tools: Record<string, any>
+  /**
+   * AI SDK 7 call-level tool approval policies keyed by registered tool name.
+   * Passed to streamText/generateText as `toolApproval` (the v6 tool-level
+   * `needsApproval` option is deprecated in v7).
+   */
+  toolApprovals: Record<string, NativeToolApprovalPolicy>
+}
+
+export async function buildMode3NativeTools(context: NativeToolContext): Promise<Mode3NativeToolSet> {
   const settings = resolveNativeToolSettings(context.providerSettings)
   const selectedGateways = normalizeStringArray(context.selectedGateways)
   const cliToolScope = await resolveCliToolSelectionScope({
@@ -11212,6 +11226,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const selectedCliToolIds = cliToolScope.toolIds
 
   const tools: Record<string, any> = {}
+  const toolApprovals: Record<string, NativeToolApprovalPolicy> = {}
   const resolvedSessionId = normalizeOptionalString(context.sessionId)
   const resolvedAgentId = normalizeOptionalString(context.agentId)
   const gatewayToolsCache: GatewayToolsCache = new Map()
@@ -11403,6 +11418,9 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     return action === 'script_run' && bashApprovalRequestsEnabled
   }
 
+  toolApprovals.native_skill = async (input) =>
+    (await nativeSkillNeedsApproval(input)) ? 'user-approval' : undefined
+
   tools.native_skill = tool({
     description:
       'Invoke/list/read skill docs and list/read/run bundled skill scripts. Script runs are mediated through native bash safety policy.',
@@ -11416,7 +11434,6 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       timeoutMs: z.number().int().min(MIN_BASH_TIMEOUT_MS).max(MAX_BASH_TIMEOUT_MS).optional(),
       maxOutputChars: z.number().int().min(1_000).max(MAX_BASH_OUTPUT_CHARS).optional()
     }),
-    needsApproval: nativeSkillNeedsApproval,
     execute: async (input) =>
       executeNativeSkillToolAction({
         userId: context.userId,
@@ -11725,6 +11742,11 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           }
         : false
 
+    if (typeof bashNeedsApproval === 'function') {
+      toolApprovals.native_bash_execute = async (input) =>
+        (await bashNeedsApproval(input)) ? 'user-approval' : undefined
+    }
+
     tools.native_bash_execute = tool({
       description:
         'Execute bash commands using Agent Settings access mode (Plan, Agent, Dangerous) with policy guards and renderer mapping.',
@@ -11734,7 +11756,6 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         timeoutMs: z.number().int().min(MIN_BASH_TIMEOUT_MS).max(MAX_BASH_TIMEOUT_MS).optional(),
         maxOutputChars: z.number().int().min(1_000).max(MAX_BASH_OUTPUT_CHARS).optional()
       }),
-      needsApproval: bashNeedsApproval,
       execute: async (input) => {
         const command = typeof input.command === 'string' ? input.command.trim() : ''
         const agentModePolicyOnly =
@@ -11803,7 +11824,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     })
   }
 
-  return tools
+  return { tools, toolApprovals }
 }
 
 export const nativeToolService = {

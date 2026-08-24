@@ -43,9 +43,13 @@ vi.mock('@ai-sdk/openai', () => ({
   })
 }))
 
-vi.mock('@ai-sdk/google', () => ({
-  createGoogleGenerativeAI: vi.fn(() => vi.fn((modelId, options) => ({ modelId, provider: 'google' })))
-}))
+vi.mock('@ai-sdk/google', () => {
+  const factory = vi.fn(() => vi.fn((modelId, options) => ({ modelId, provider: 'google' })))
+  return {
+    createGoogle: factory,
+    createGoogleGenerativeAI: factory
+  }
+})
 
 vi.mock('@ai-sdk/groq', () => ({
   createGroq: vi.fn(() => vi.fn((modelId, options) => ({ modelId, provider: 'groq' })))

@@ -280,7 +280,7 @@ async function collectCliSubagentStreamResult(
       ? (streamResult as any).__detectToolSource
       : () => ({})
 
-  for await (const chunk of (streamResult as any).fullStream as AsyncIterable<any>) {
+  for await (const chunk of (streamResult as any).stream as AsyncIterable<any>) {
     if (!chunk || typeof chunk !== 'object') continue
 
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {

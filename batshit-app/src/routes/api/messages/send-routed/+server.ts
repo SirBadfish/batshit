@@ -4062,28 +4062,6 @@ async function handleBatshitAgentStream({
     resolveOnFinish = resolve
   })
 
-  const updateSessionUsageTotals = async (totals: Record<string, any>) => {
-    await redis.execute(async (client) => {
-      const usageKey = `session:${sessionId}:usage`
-      const sessionUsage = (await client.json.get(usageKey)) as any
-      const updatedUsage = {
-        inputTokens:
-          (sessionUsage?.inputTokens || 0) + (totals.inputTokens || 0),
-        outputTokens:
-          (sessionUsage?.outputTokens || 0) + (totals.outputTokens || 0),
-        totalTokens:
-          (sessionUsage?.totalTokens || 0) + (totals.totalTokens || 0),
-        cachedInputTokens:
-          (sessionUsage?.cachedInputTokens || 0) + (totals.cachedInputTokens || 0),
-        cacheCreationInputTokens:
-          (sessionUsage?.cacheCreationInputTokens || 0) +
-          (totals.cacheCreationInputTokens || 0),
-      }
-
-      await client.json.set(usageKey, '$', updatedUsage)
-    })
-  }
-
   const finalizeAssistantMessage = async (
     context: 'onFinish' | 'postStream' | 'error' = 'onFinish',
   ) => {
@@ -4201,9 +4179,6 @@ async function handleBatshitAgentStream({
       }
 
       await redis.saveMessage(finalMessage)
-
-      const totals = finishSummary.usage ?? streamAdapter.getUsage() ?? {}
-      await updateSessionUsageTotals(totals)
 
       zipDetection.deleteSessionBuffers(sessionId)
       finalMessagePersisted = true
@@ -5586,7 +5561,7 @@ async function handleBatshitAgentStream({
     }
 
     shouldBreakStream = false
-    for await (const chunk of result.fullStream) {
+    for await (const chunk of result.stream) {
       switch (chunk.type) {
         case 'text-delta': {
           const textChunk = stripRepeatedLeadingGroupControls((chunk as any).text || '')
@@ -6501,10 +6476,6 @@ async function handleBatshitAgentStream({
 
     if (silentResponse) {
       await emitThinkingIndicatorStop()
-      const totals = finishSummary.usage ?? streamAdapter.getUsage() ?? {}
-      if (Object.keys(totals).length > 0) {
-        await updateSessionUsageTotals(totals)
-      }
       await streamAdapter.emitComplete({
         metadata: {
           silent: true,
@@ -6757,16 +6728,6 @@ async function handleBatshitAgentStream({
         status: errorStatus,
         metadata: failureRuntimeMetadata,
       })
-      if (hasUsageValues(failureUsage)) {
-        try {
-          await updateSessionUsageTotals(failureUsage as UsageLike)
-        } catch (usageError) {
-          console.error(
-            '[Send-Routed] Failed to record usage for failed response:',
-            usageError,
-          )
-        }
-      }
     }
 
     if (errorCode === 'PROVIDER_EMPTY_RESPONSE') {

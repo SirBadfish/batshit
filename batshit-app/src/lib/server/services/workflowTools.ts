@@ -12,8 +12,9 @@
 import { tool, dynamicTool } from 'ai'
 import { logger } from '$lib/utils/logger'
 
-// Infer tool type from the tool function return
-type AITool = ReturnType<typeof tool<any, any>>
+// Infer tool types from the tool/dynamicTool helper returns (AI SDK 7 splits
+// DynamicTool from the static Tool type)
+type AITool = ReturnType<typeof tool<any, any>> | ReturnType<typeof dynamicTool>
 
 // Import new services from Story 5.11
 import { workflowDiscovery } from './workflowDiscovery'

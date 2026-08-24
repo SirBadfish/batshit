@@ -120,7 +120,7 @@ describe('executeManagedSubagent - CLI subagents', () => {
   it('routes Codex CLI subagents through the managed Codex bridge', async () => {
     const abortController = new AbortController()
     cliSubagentMocks.codexStreamNativeMode.mockResolvedValue({
-      fullStream: streamFromChunks([
+      stream: streamFromChunks([
         { type: 'text-delta', text: 'Codex says hi.' },
         {
           type: 'tool-result',
@@ -200,7 +200,7 @@ describe('executeManagedSubagent - CLI subagents', () => {
 
   it('treats codex-cli saved-model sentinels as lane selectors, not runnable models', async () => {
     cliSubagentMocks.codexStreamNativeMode.mockResolvedValue({
-      fullStream: streamFromChunks([{ type: 'text-delta', text: 'Codex fixed it.' }]),
+      stream: streamFromChunks([{ type: 'text-delta', text: 'Codex fixed it.' }]),
       __detectToolSource: vi.fn(() => ({})),
     })
 
@@ -251,7 +251,7 @@ describe('executeManagedSubagent - CLI subagents', () => {
 
   it('routes Claude CLI subagents through the managed Claude bridge', async () => {
     cliSubagentMocks.claudeStreamNativeMode.mockResolvedValue({
-      fullStream: streamFromChunks([
+      stream: streamFromChunks([
         { type: 'text-delta', text: 'Claude reviewed it.' },
         {
           type: 'tool-result',

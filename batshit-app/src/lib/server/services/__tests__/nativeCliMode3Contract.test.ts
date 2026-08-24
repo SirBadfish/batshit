@@ -85,7 +85,7 @@ describe.runIf(REAL_REDIS_LANE)('Mode 3 CLI tool contract', () => {
   })
 
   it('shows schema details and an exact nested-input example in Batshit tool search model output', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId,
       selectedCliToolIds: [toolId]
     } as any)
@@ -107,7 +107,7 @@ describe.runIf(REAL_REDIS_LANE)('Mode 3 CLI tool contract', () => {
   })
 
   it('repairs top-level manifest fields when using an exact cli: ref through Batshit tool use', async () => {
-    const tools = await nativeToolService.buildMode3NativeTools({
+    const { tools } = await nativeToolService.buildMode3NativeTools({
       userId,
       selectedCliToolIds: [toolId]
     } as any)

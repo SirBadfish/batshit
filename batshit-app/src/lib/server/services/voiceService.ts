@@ -46,7 +46,7 @@ import {
   normalizeVoiceTtsConfig
 } from '$lib/utils/voiceSchema'
 import { createOpenAI } from '@ai-sdk/openai'
-import { experimental_generateSpeech as generateSpeech, experimental_transcribe as transcribe } from 'ai'
+import { generateSpeech, transcribe } from 'ai'
 import type { AgentRow, UserSettingsRow } from '$lib/types/database'
 import type {
   AgentVoiceProfile,
@@ -153,8 +153,11 @@ const DEFAULT_ELEVENLABS_STT_MODEL = 'scribe_v2'
 const ELEVENLABS_STT_MODELS = ['scribe_v2']
 const DEFAULT_ELEVENLABS_REALTIME_STT_MODEL = 'scribe_v2_realtime'
 const ELEVENLABS_REALTIME_STT_MODELS = [DEFAULT_ELEVENLABS_REALTIME_STT_MODEL]
-const DEFAULT_FISH_TTS_MODEL = 's2-pro'
-const FISH_TTS_MODELS = ['s2-pro', 's1']
+// `s2.1-pro` is Fish Audio's current recommended production TTS model; `s2.1-pro-free`
+// is the same model under fair-use limits with no service guarantees. Both S2 generations
+// share the `[bracket]` emotion syntax; legacy `s1` uses `(parentheses)` instead.
+const DEFAULT_FISH_TTS_MODEL = 's2.1-pro'
+const FISH_TTS_MODELS = ['s2.1-pro', 's2.1-pro-free', 's2-pro', 's1']
 const DEFAULT_FISH_STT_MODEL = 'transcribe-1'
 const FISH_STT_MODELS = [DEFAULT_FISH_STT_MODEL]
 const DEFAULT_MISTRAL_TTS_MODEL = 'voxtral-mini-tts-2603'

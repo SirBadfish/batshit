@@ -2104,7 +2104,9 @@ async function startRedis(env) {
   const redisHost = env.get('REDIS_HOST') || '127.0.0.1';
   const redisPort = env.get('REDIS_PORT') || String(DEFAULT_PORTS.redis);
   const config = [
-    `bind ${redisHost}`,
+    // Non-fatal IPv6 loopback listener alongside the primary host: node-redis
+    // clients resolve `localhost` to ::1 first (matches retired redis-stack behavior).
+    `bind ${redisHost} -::1`,
     `port ${redisPort}`,
     'protected-mode yes',
     `dir ${redisConfigValue(redisDir)}`,

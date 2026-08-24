@@ -12,7 +12,7 @@ import { apiKeyService } from '$lib/services/apiKey.server'
 // SA-011 Phase 1: Image generation support
 import { generateImage } from 'ai'
 // SA-011 Phase 3: Speech/TTS generation support
-import { experimental_generateSpeech as generateSpeech } from 'ai'
+import { generateSpeech } from 'ai'
 // SA-011 Phase 4: Structured object streaming support
 import { streamText, Output, jsonSchema } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
@@ -1206,7 +1206,7 @@ async function streamViaMode3({
   let usage: Record<string, any> | undefined
   let emittedFileCount = 0
 
-  for await (const rawChunk of result.fullStream as any) {
+  for await (const rawChunk of result.stream as any) {
     const chunkType = String(rawChunk?.type || '')
     switch (chunkType) {
       case 'text-delta': {
@@ -1809,6 +1809,8 @@ async function generateViaObjectStream({
         { role: 'system', content: systemContent },
         { role: 'user', content: userContent }
       ],
+      // The system entry is Batshit's own compiled artifact prompt (SA-098 D1).
+      allowSystemInMessages: true,
       output: Output.object({
         schema: schemaWrapper,
         name: schemaName,

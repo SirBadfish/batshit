@@ -12,7 +12,7 @@ import {
   streamText,
   tool,
   dynamicTool,
-  stepCountIs,
+  isStepCount,
   extractReasoningMiddleware,
   wrapLanguageModel,
   type LanguageModel,
@@ -37,7 +37,7 @@ import { v4 as uuidv4 } from 'uuid'
 import type { GatewayMetadata, ToolMetadataMap } from './mcpGatewayTypes'
 import { getSubagentByWorkflowName } from './subagentRegistry' // Story 6.7c: Subagent registry lookup
 import { redis } from '$lib/server/redis' // Story 6.8: Load agent assigned workflows
-import { nativeToolService } from './nativeTools'
+import { nativeToolService, type NativeToolApprovalPolicy } from './nativeTools'
 import { isNativeToolName } from './nativeToolConstants'
 import {
   resolveClipDataUrlFromStoredUpload,
@@ -399,7 +399,7 @@ export class VercelAIBrain {
       // Build tools from both regular tools and workflows
       // Story 6.4: Also get metadata maps for tool source detection
       // Story 6.8: Now includes agentId for loading assigned workflows
-      const { tools, maps: toolMaps } = await this.buildToolsForMode3(
+      const { tools, maps: toolMaps, toolApprovals } = await this.buildToolsForMode3(
         request.availableTools,
         request.availableWorkflows,
         request.sessionId,
@@ -454,8 +454,14 @@ export class VercelAIBrain {
       const result = await streamText({
         model,
         messages: cachePolicy.messages,
+        // Every system-role entry in `messages` originates from Batshit's own
+        // server-side compiler, never from untrusted content (SA-098 D1), so the
+        // v7 system-in-messages guard is relaxed to preserve Batshit's prompt
+        // order and provider cache anchoring on the compiled payload.
+        allowSystemInMessages: true,
         tools: cachePolicy.tools,
-        stopWhen: stepCountIs(request.maxToolRounds || 10), // Multi-round tool execution
+        ...(Object.keys(toolApprovals).length > 0 ? { toolApproval: toolApprovals } : {}),
+        stopWhen: isStepCount(request.maxToolRounds || 10), // Multi-round tool execution
         ...this.buildGenerationSettings(request),
         providerOptions: cachePolicy.providerOptions,
         ...(downloadGuard ? { experimental_download: downloadGuard } : {})
@@ -465,8 +471,8 @@ export class VercelAIBrain {
       let content = ''
       const intermediateSteps: ThoughtResponse['intermediateSteps'] = []
 
-      // Collect the full response
-      for await (const part of result.fullStream) {
+      // Collect the full response (AI SDK 7: `stream` replaces `fullStream`)
+      for await (const part of result.stream) {
         switch (part.type) {
           case 'text-delta':
             content += part.text
@@ -1059,8 +1065,13 @@ export class VercelAIBrain {
       reserveToolZipId?: NativeModeRequest['reserveToolZipId']
       abortSignal?: AbortSignal
     }
-  ): Promise<{ tools: Record<string, any> | undefined; maps: ToolSourceMaps }> {
+  ): Promise<{
+    tools: Record<string, any> | undefined
+    maps: ToolSourceMaps
+    toolApprovals: Record<string, NativeToolApprovalPolicy>
+  }> {
     const tools: Record<string, any> = {}
+    const toolApprovals: Record<string, NativeToolApprovalPolicy> = {}
 
     // Story 6.4, 6.7c, SA-005: Track metadata for O(1) detection
     const toolMaps: ToolSourceMaps = {
@@ -1073,7 +1084,7 @@ export class VercelAIBrain {
     // These do not require user MCP setup and are available whenever tools are enabled.
     if (userId) {
       try {
-        const nativeTools = await nativeToolService.buildMode3NativeTools({
+        const nativeToolSet = await nativeToolService.buildMode3NativeTools({
           userId,
           agentId: agentId ?? null,
           sessionId,
@@ -1087,7 +1098,8 @@ export class VercelAIBrain {
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode
         })
-        Object.assign(tools, nativeTools)
+        Object.assign(tools, nativeToolSet.tools)
+        Object.assign(toolApprovals, nativeToolSet.toolApprovals)
       } catch (error) {
         console.error('[VercelBrain API] Failed to build native tools:', error)
       }
@@ -1366,7 +1378,8 @@ export class VercelAIBrain {
     // Story 6.4: Return both tools and metadata maps for detection
     return {
       tools: Object.keys(wrappedTools).length > 0 ? wrappedTools : undefined,
-      maps: toolMaps
+      maps: toolMaps,
+      toolApprovals
     }
   }
 
@@ -1485,10 +1498,10 @@ export class VercelAIBrain {
     if (
       typeof model !== 'object' ||
       model === null ||
-      model.specificationVersion !== 'v3'
+      model.specificationVersion !== 'v4'
     ) {
       throw new Error(
-        `[VercelBrain API] Tagged reasoning extraction requires an AI SDK v3 model instance for "${modelName}"`,
+        `[VercelBrain API] Tagged reasoning extraction requires an AI SDK provider specification v4 model instance for "${modelName}" (got "${(model as any)?.specificationVersion ?? 'unknown'}"). A mixed AI SDK major / provider-package tree is not supported — every @ai-sdk provider must be on its AI SDK 7 major.`,
       )
     }
 
@@ -2496,6 +2509,7 @@ export class VercelAIBrain {
       this.logGeminiPayloadSummary('stream', messages, request, geminiFileUris)
       const toolsEnabled = request.toolsEnabled !== false
       let toolsForRequest: Record<string, any> | undefined
+      let toolApprovalsForRequest: Record<string, NativeToolApprovalPolicy> = {}
       let toolMaps: ToolSourceMaps = {
         workflowTools: new Map<string, { webhookUrl: string }>(),
         gatewayTools: new Map<string, GatewayMetadata>(),
@@ -2505,7 +2519,7 @@ export class VercelAIBrain {
       if (toolsEnabled) {
         // Story 6.4: Get BOTH tools AND toolMaps for metadata injection
         // Story 6.8: Now includes agentId for loading assigned workflows
-        const { tools, maps } = await this.buildToolsForMode3(
+        const { tools, maps, toolApprovals } = await this.buildToolsForMode3(
           request.availableTools,
           request.availableWorkflows,
           request.sessionId,
@@ -2535,6 +2549,7 @@ export class VercelAIBrain {
         )
         toolMaps = maps
         toolsForRequest = tools
+        toolApprovalsForRequest = toolApprovals
 
         const openaiTools = await this.buildOpenAITools(request)
         if (openaiTools) {
@@ -2544,12 +2559,17 @@ export class VercelAIBrain {
         logger.debug('[VercelBrain API] Tools disabled for this request')
       }
 
-      // Story 6.4: Wrap the original onFinish to inject metadata into steps
-      const wrappedOnFinish = request.onFinish ? async ({ text, steps, totalUsage, response, finishReason, usage, reasoning, reasoningText }: any) => {
+      // Story 6.4: Wrap the SDK onEnd callback to inject metadata into steps.
+      // AI SDK 7 semantics: event.usage is the AGGREGATE across all steps (what
+      // v6 called totalUsage); last-step numbers live on event.finalStep.usage.
+      // Batshit's internal onFinish contract keeps totalUsage = run aggregate.
+      const wrappedOnEnd = request.onFinish ? async ({ text, steps, usage, totalUsage, responseMessages: eventResponseMessages, finalStep }: any) => {
         const responseMessages =
-          Array.isArray(response?.messages) && response.messages.length > 0
-            ? response.messages
-            : undefined
+          Array.isArray(eventResponseMessages) && eventResponseMessages.length > 0
+            ? eventResponseMessages
+            : Array.isArray(finalStep?.response?.messages) && finalStep.response.messages.length > 0
+              ? finalStep.response.messages
+              : undefined
 
         // Inject metadata into each step
         const enhancedSteps = steps?.map((step: any) => {
@@ -2570,12 +2590,15 @@ export class VercelAIBrain {
         })
 
         // Call original onFinish with only the parameters defined in NativeModeRequest
-        const finishReasoning = collectReasoningTextFromFinish(reasoningText || reasoning)
+        const finishReasoning = collectReasoningTextFromFinish(
+          finalStep?.reasoningText ?? finalStep?.reasoning
+        )
+        const aggregateUsage = usage ?? totalUsage
         await request.onFinish!({
           text,
           steps: enhancedSteps,
-          totalUsage: totalUsage || usage,
-          usage: usage || totalUsage,
+          totalUsage: aggregateUsage,
+          usage: aggregateUsage,
           reasoning: finishReasoning ? [finishReasoning] : undefined,
           responseMessages
         })
@@ -2599,19 +2622,28 @@ export class VercelAIBrain {
       this.logPromptCachePolicy(cachePolicy.metadata)
 
       const downloadGuard = await this.resolveDownloadHandler(request, geminiFileUris)
-      const includeRawChunks = true
 
       const result = await streamText({
         model,
         messages: cachePolicy.messages,
+        // Every system-role entry in `messages` originates from Batshit's own
+        // server-side compiler, never from untrusted content (SA-098 D1), so the
+        // v7 system-in-messages guard is relaxed to preserve Batshit's prompt
+        // order and provider cache anchoring on the compiled payload.
+        allowSystemInMessages: true,
         tools: cachePolicy.tools,
-        stopWhen: stepCountIs(request.maxToolRounds || 10),
+        ...(Object.keys(toolApprovalsForRequest).length > 0
+          ? { toolApproval: toolApprovalsForRequest }
+          : {}),
+        stopWhen: isStepCount(request.maxToolRounds || 10),
         ...this.buildGenerationSettings(request),
         providerOptions: cachePolicy.providerOptions,
         abortSignal: request.abortSignal, // Forward abort signal
-        includeRawChunks,
+        // Raw chunks feed the OpenAI-compatible reasoning_content lane; request
+        // bodies feed Execution Viewer evidence (v7 excludes them by default).
+        include: { rawChunks: true, requestBody: true },
         ...(downloadGuard ? { experimental_download: downloadGuard } : {}),
-        onStepFinish: ({ text, toolCalls, toolResults, finishReason }) => {
+        onStepEnd: ({ text, toolCalls, toolResults, finishReason }) => {
           logger.debug('[VercelBrain API] Step completed', {
             hasText: !!text,
             toolCallCount: toolCalls?.length || 0,
@@ -2634,7 +2666,7 @@ export class VercelAIBrain {
             })
           }
         },
-        onFinish: wrappedOnFinish,
+        onEnd: wrappedOnEnd,
         onAbort: request.onAbort
       })
 

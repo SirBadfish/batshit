@@ -15,7 +15,7 @@
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { logger } from '$lib/utils/logger'
 import { createOpenAI } from '@ai-sdk/openai'
-import { createGoogleGenerativeAI } from '@ai-sdk/google'
+import { createGoogle } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
 import { createMistral } from '@ai-sdk/mistral'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
@@ -365,7 +365,7 @@ export class ProviderManager {
     // Google Provider (Priority 3)
     const googleKey = this.apiKeys.google ?? env.GOOGLE_GENERATIVE_AI_API_KEY
     if (googleKey && this.validateApiKey(googleKey, 'Google')) {
-      const google = createGoogleGenerativeAI({
+      const google = createGoogle({
         apiKey: googleKey
       })
       this.providers.set('google', {

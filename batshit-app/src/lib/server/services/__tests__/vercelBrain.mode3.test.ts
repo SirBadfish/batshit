@@ -20,7 +20,7 @@ import { redis } from '$lib/server/redis'
 const providerMocks = vi.hoisted(() => ({
   providerManagerFactory: () => ({
     getModel: vi.fn().mockReturnValue({
-      specificationVersion: 'v3',
+      specificationVersion: 'v4',
       provider: 'anthropic',
       modelId: 'claude-3-5-sonnet',
       supportedUrls: {},
@@ -123,10 +123,13 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
         }
       }
 
+      const streamIterable = {
+        [Symbol.asyncIterator]: iterator
+      }
+
       return {
-        fullStream: {
-          [Symbol.asyncIterator]: iterator
-        },
+        stream: streamIterable,
+        fullStream: streamIterable,
         steps: Promise.resolve([]),
         usage: Promise.resolve({
           inputTokens: 765,
@@ -517,6 +520,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
 
       const stream = await brain.streamNativeMode(request)
       expect(stream).toBeDefined()
+      expect(typeof stream.stream?.[Symbol.asyncIterator]).toBe('function')
       expect(typeof stream.fullStream?.[Symbol.asyncIterator]).toBe('function')
     })
 
@@ -660,7 +664,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
           seed: 42,
           stopSequences: ['END'],
           providerOptions,
-          includeRawChunks: true
+          include: { rawChunks: true, requestBody: true }
         })
       )
       const callArgs = vi.mocked(streamText).mock.calls.at(-1)?.[0] as any
@@ -719,11 +723,13 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       await brain.streamNativeMode(request)
 
       const callArgs = vi.mocked(streamText).mock.calls.at(-1)?.[0] as any
-      await callArgs.onFinish({
+      await callArgs.onEnd({
         text: 'Done',
         steps: [],
         usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-        reasoning: [{ type: 'reasoning', text: 'Checked the options.' }]
+        finalStep: {
+          reasoning: [{ type: 'reasoning', text: 'Checked the options.' }]
+        }
       })
 
       expect(onFinish).toHaveBeenCalledWith(

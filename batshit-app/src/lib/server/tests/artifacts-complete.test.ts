@@ -221,12 +221,14 @@ describe.runIf(REAL_REDIS_LANE)('POST /api/artifacts/complete', () => {
     aiMocks.generateSpeech.mockResolvedValue({
       audio: new Uint8Array([1, 2, 3])
     })
+    const mode3Stream = (async function* () {
+      yield { type: 'text-delta', text: 'Hello ' }
+      yield { type: 'text-delta', text: 'world' }
+      yield { type: 'finish', usage: { totalTokens: 5 } }
+    })()
     aiMocks.streamNativeMode.mockResolvedValue({
-      fullStream: (async function* () {
-        yield { type: 'text-delta', text: 'Hello ' }
-        yield { type: 'text-delta', text: 'world' }
-        yield { type: 'finish', usage: { totalTokens: 5 } }
-      })()
+      stream: mode3Stream,
+      fullStream: mode3Stream
     })
     providerMocks.getModel.mockReturnValue({ id: 'mock-language-model' })
     providerMocks.createForUser.mockResolvedValue({
