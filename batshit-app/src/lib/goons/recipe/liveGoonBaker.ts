@@ -1,5 +1,9 @@
 import * as THREE from 'three'
 import { parseAppearanceDialsManifest } from '../appearanceDials.schema'
+import {
+  bakeSkinArtworkProjectionDefinition,
+  verifySkinArtworkProjectionDefinition
+} from '../skinArtworkProjection'
 import { parseHairState, validateHairStateBinding, type HairAssetV1 } from '../hairAssets'
 import { verifyHairFollowerDefinitionBytes } from '../hairFollowers'
 import {
@@ -2478,12 +2482,19 @@ async function auditStructuralLiveGlb(
   }
 }
 
-function createLiveAvatarManifest(
+async function createLiveAvatarManifest(
   sourceManifest: JsonRecord,
   liveManifest: GoonLiveManifest,
-  liveCorrectives: LiveJointCorrectivesSpec | null
-): JsonRecord {
+  liveCorrectives: LiveJointCorrectivesSpec | null,
+  nippleSizeValue: number
+): Promise<JsonRecord> {
   const output = cloneJson(sourceManifest)
+  if (output.skinArtworkProjection !== undefined) {
+    output.skinArtworkProjection = await bakeSkinArtworkProjectionDefinition(
+      output.skinArtworkProjection,
+      nippleSizeValue
+    )
+  }
   delete output.appearanceDials
   delete output.anatomyFit
   delete output.oralCavityFit
@@ -2752,6 +2763,17 @@ export async function verifyLiveGoonBakeArtifacts(input: LiveGoonBakeArtifactInp
     fail('Live package entries differ from the independently supplied model or manifest')
   }
   const manifest = parseJsonManifestBytes(input.manifestBytes)
+  if (manifest.skinArtworkProjection !== undefined) {
+    if (manifest.skinAppearance === undefined) {
+      fail('Live Skin Artwork Projection has no Skin Appearance owner')
+    }
+    const projection = await verifySkinArtworkProjectionDefinition(
+      manifest.skinArtworkProjection
+    )
+    if (projection.radiusResponse.bakedDriverValue === null) {
+      fail('Live Skin Artwork Projection has no baked nipple_size value')
+    }
+  }
   const liveManifest = await verifyGoonLiveAvatarManifestAgainstReceipt(manifest, receipt)
   if (
     manifest.appearanceDials !== undefined ||
@@ -2807,6 +2829,17 @@ export async function bakeLiveGoon(
   const hair = await resolveSelectedHair(input, state)
   const appearanceManifest = parseAppearanceDialsManifest(verifiedAssets.manifest)
   if (!appearanceManifest) fail('Recipe Source does not contain appearance-dials/v2')
+  if (verifiedAssets.manifest.skinArtworkProjection !== undefined) {
+    if (verifiedAssets.manifest.skinAppearance === undefined) {
+      fail('Recipe Skin Artwork Projection has no Skin Appearance owner')
+    }
+    const projection = await verifySkinArtworkProjectionDefinition(
+      verifiedAssets.manifest.skinArtworkProjection
+    )
+    if (projection.radiusResponse.bakedDriverValue !== null) {
+      fail('Recipe Skin Artwork Projection must not contain a baked nipple_size value')
+    }
+  }
   onStage('evaluating-recipe')
   const strict = resolveStrictAppearanceRecipeSnapshot(appearanceManifest, state.appearanceDials)
   const basis: AppearanceRecipePhysicalBasis = buildAppearanceRecipePhysicalBasisFromGlb(
@@ -2912,10 +2945,11 @@ export async function bakeLiveGoon(
     counts
   })
   onStage('packaging-live-goon')
-  const manifest = createLiveAvatarManifest(
+  const manifest = await createLiveAvatarManifest(
     verifiedAssets.manifest,
     liveManifest,
-    rewrite.morphPlan.liveCorrectives
+    rewrite.morphPlan.liveCorrectives,
+    state.appearanceDials.values.nipple_size ?? 0
   )
   const manifestBytes = canonicalRecipeUtf8(manifest)
   const packageBytes = deterministicStoredZip([

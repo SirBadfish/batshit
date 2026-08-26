@@ -91,6 +91,9 @@ export type RecipePhysicalMigrationFixtureOptions = {
   hairImportCompatible?: boolean;
   /** Emit a target with a deliberately different exact mesh inventory. */
   topologyRebuild?: boolean;
+  /** Preserve a valid Skin Appearance owner and its geometry-bound artwork projection. */
+  skinAppearance?: JsonRecord;
+  skinArtworkProjection?: JsonRecord;
 };
 
 const ZERO_SHA256 = "0".repeat(64);
@@ -372,6 +375,8 @@ function appearanceManifest(
   baseId = "sa090-r2-physical-fixture",
   fitFamily = "sa090-r2-physical-fixture.v1",
   keepControlId = "keep_control",
+  skinAppearance?: JsonRecord,
+  skinArtworkProjection?: JsonRecord,
 ): JsonRecord {
   const source = version === "source";
   const targets: JsonRecord = {
@@ -576,6 +581,12 @@ function appearanceManifest(
     ...(runtimeMorphName
       ? { face: { expressions: { blink: runtimeMorphName } } }
       : {}),
+    ...(skinAppearance
+      ? { skinAppearance: structuredClone(skinAppearance) }
+      : {}),
+    ...(skinArtworkProjection
+      ? { skinArtworkProjection: structuredClone(skinArtworkProjection) }
+      : {}),
   };
 }
 
@@ -588,6 +599,8 @@ async function sourcePackageDraft(
   keepControlId = "keep_control",
   hairImportCompatible = false,
   topologyRebuild = false,
+  skinAppearance?: JsonRecord,
+  skinArtworkProjection?: JsonRecord,
 ) {
   const glbBytes = physicalGlb(
     version,
@@ -602,6 +615,8 @@ async function sourcePackageDraft(
     baseId,
     fitFamily,
     keepControlId,
+    skinAppearance,
+    skinArtworkProjection,
   );
   const appearance = avatarManifest.appearanceDials as JsonRecord;
   const neutral = appearance.neutral as JsonRecord;
@@ -1022,6 +1037,8 @@ export async function createRecipePhysicalMigrationFixture(
         keepControlId,
         options.hairImportCompatible,
         false,
+        options.skinAppearance,
+        options.skinArtworkProjection,
       ),
       sourcePackageDraft(
         "target",
@@ -1032,6 +1049,8 @@ export async function createRecipePhysicalMigrationFixture(
         keepControlId,
         options.hairImportCompatible,
         options.topologyRebuild,
+        options.skinAppearance,
+        options.skinArtworkProjection,
       ),
     ]);
     const edge = await updateEdge(

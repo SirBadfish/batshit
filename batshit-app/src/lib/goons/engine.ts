@@ -279,6 +279,7 @@ import {
   type SkinAppearanceStateV2
 } from '$lib/goons/skinAppearance'
 import { SkinAppearanceEngineRuntime } from '$lib/goons/skinAppearance.engine'
+import { verifySkinArtworkProjectionDefinition } from '$lib/goons/skinArtworkProjection'
 import {
   parseNailSurfaceDefinition,
   type NailSurfaceDefinitionV1,
@@ -4058,6 +4059,9 @@ export class GoonEngine implements GoonStageHost {
     this.customPerformanceRigRuntime?.removeOverlay()
     this.appearanceDialsValues = values
     runtime.setValues(values)
+    this.skinAppearanceRuntime?.syncSurfaceGeometry(
+      values?.values.nipple_size ?? 0
+    )
     this.hairPreviewFollowerRuntime?.apply(runtime.getState())
     if (this.hairPreviewSecondaryMotionRuntime && this.hairPreviewSecondaryMotionDefinition) {
       this.hairPreviewSecondaryMotionRuntime.setResolvedState(
@@ -4081,6 +4085,9 @@ export class GoonEngine implements GoonStageHost {
     this.customPerformanceRigRuntime?.removeOverlay()
     this.appearanceDialsValues = values
     runtime.setFittedValues(values, anatomyFitResults)
+    this.skinAppearanceRuntime?.syncSurfaceGeometry(
+      values?.values.nipple_size ?? 0
+    )
     this.hairPreviewFollowerRuntime?.apply(runtime.getState())
     if (this.hairPreviewSecondaryMotionRuntime && this.hairPreviewSecondaryMotionDefinition) {
       this.hairPreviewSecondaryMotionRuntime.setResolvedState(
@@ -4380,11 +4387,26 @@ export class GoonEngine implements GoonStageHost {
       throw new Error('skin-appearance/v1 requires a Recipe Source or verified Live Goon package.')
     }
     const definition = parseSkinAppearanceDefinition(rawDefinition)
+    const artworkProjection =
+      manifest.skinArtworkProjection === undefined ||
+      manifest.skinArtworkProjection === null
+        ? null
+        : await verifySkinArtworkProjectionDefinition(
+            manifest.skinArtworkProjection
+          )
     const root = this.customAvatarRoot
     if (!root) {
       throw new Error('Custom avatar root is missing during Skin Appearance setup.')
     }
-    const runtime = new SkinAppearanceEngineRuntime(root, definition)
+    const runtime = new SkinAppearanceEngineRuntime(
+      root,
+      definition,
+      undefined,
+      artworkProjection,
+      this.appearanceDialsRuntime
+        ? (this.appearanceDialsValues?.values.nipple_size ?? 0)
+        : null
+    )
     try {
       await runtime.apply(initialState, initialMaterialArtwork)
     } catch (error) {
