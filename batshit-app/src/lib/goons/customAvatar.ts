@@ -127,6 +127,8 @@ export type GoonCustomAvatarManifest = {
   nailSurface?: unknown;
   /** Immutable first-party regional skin pigment definition. */
   skinAppearance?: unknown;
+  /** Geometry-bound Base Color projection for deformation-stable body artwork. */
+  skinArtworkProjection?: unknown;
   /** Exact hidden-landmark and rigid-assembly Oral Cavity Fit authoring package. */
   oralCavityFit?: unknown;
   /** Authoring-time final-geometry fit definitions; stripped from Live output. */

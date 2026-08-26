@@ -9,6 +9,11 @@ import {
   type SkinAppearanceStateV2
 } from './skinAppearance'
 import type { SkinSurfaceUploadV1 } from './skinSurface'
+import {
+  SkinArtworkProjectionRuntime,
+  type SkinArtworkPreparedProjection,
+  type SkinArtworkProjectionDefinitionV8
+} from './skinArtworkProjection'
 
 type RuntimeMesh = THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>
 type DrawableTexture = THREE.Texture & { image: CanvasImageSource }
@@ -16,6 +21,7 @@ type DrawableTexture = THREE.Texture & { image: CanvasImageSource }
 type PreparedRuntime = {
   material: THREE.MeshStandardMaterial
   ownedTextures: THREE.Texture[]
+  projection: SkinArtworkPreparedProjection | null
 }
 
 function fail(message: string): never {
@@ -174,13 +180,18 @@ export class SkinAppearanceEngineRuntime {
   private masksPromise: Promise<DrawableTexture[]> | null = null
   private generation = 0
   private disposed = false
+  private readonly artworkProjection: SkinArtworkProjectionRuntime | null
+  private projectionNippleSizeValue: number | null
 
   constructor(
     root: THREE.Object3D,
     readonly definition: SkinAppearanceDefinitionV1,
     private readonly textureLoader: Pick<THREE.TextureLoader, 'loadAsync'> =
-      new THREE.TextureLoader()
+      new THREE.TextureLoader(),
+    artworkProjectionDefinition: SkinArtworkProjectionDefinitionV8 | null = null,
+    projectionNippleSizeValue: number | null = null
   ) {
+    this.projectionNippleSizeValue = projectionNippleSizeValue
     this.mesh = exactMesh(root, definition.runtimeBinding.node)
     if (this.mesh.material.name !== definition.runtimeBinding.material) {
       fail(
@@ -195,6 +206,22 @@ export class SkinAppearanceEngineRuntime {
       this.originalMaterial.map,
       'package base-color texture'
     )
+    if (
+      artworkProjectionDefinition &&
+      (artworkProjectionDefinition.runtimeBinding.node !==
+        definition.runtimeBinding.node ||
+        artworkProjectionDefinition.runtimeBinding.material !==
+          definition.runtimeBinding.material)
+    ) {
+      fail('Skin Artwork Projection must bind the same body node and material')
+    }
+    this.artworkProjection = artworkProjectionDefinition
+      ? new SkinArtworkProjectionRuntime(
+          root,
+          artworkProjectionDefinition,
+          projectionNippleSizeValue
+        )
+      : null
     const { width, height } = definition.canvas
     if (
       imageDimension(this.originalTexture.image, 'width') !== width ||
@@ -220,24 +247,32 @@ export class SkinAppearanceEngineRuntime {
   ) {
     if (this.disposed) fail('cannot apply state after disposal')
     const generation = ++this.generation
-    if (!value && !legacyMaterialArtwork) {
+    await this.artworkProjection?.initialize()
+    if (!value && !legacyMaterialArtwork && !this.artworkProjection) {
       this.restoreOriginal()
       return true
     }
-    const state = migrateSkinAppearanceState(
-      this.definition,
-      value,
-      legacyMaterialArtwork
-    )
+    const state =
+      !value && !legacyMaterialArtwork
+        ? createDefaultSkinAppearanceState(this.definition)
+        : migrateSkinAppearanceState(
+            this.definition,
+            value,
+            legacyMaterialArtwork
+          )
     const prepared = await this.prepare(state)
     if (this.disposed || generation !== this.generation) {
       prepared.material.dispose()
       for (const texture of prepared.ownedTextures) texture.dispose()
+      this.artworkProjection?.disposePrepared(prepared.projection)
       return false
     }
     const previousMaterial = this.ownedMaterial
     const previousTextures = this.ownedTextures
     this.mesh.material = prepared.material
+    if (prepared.projection) {
+      this.artworkProjection?.commitPrepared(prepared.projection)
+    }
     this.ownedMaterial = prepared.material
     this.ownedTextures = prepared.ownedTextures
     previousMaterial?.dispose()
@@ -289,6 +324,10 @@ export class SkinAppearanceEngineRuntime {
     const state = parseSkinAppearanceState(this.definition, stateValue)
     const ownedTextures: THREE.Texture[] = []
     let uploadedBaseColor: DrawableTexture | null = null
+    let baseColorCanvas: HTMLCanvasElement | null = null
+    let nipplePigmentCanvas: HTMLCanvasElement | null = null
+    let nippleMaskCanvas: HTMLCanvasElement | null = null
+    let preparedProjection: SkinArtworkPreparedProjection | null = null
     try {
       if (state.surface.baseColor.mode === 'custom') {
         uploadedBaseColor = await this.loadCustomMap(
@@ -325,7 +364,7 @@ export class SkinAppearanceEngineRuntime {
       material.name = `${this.definition.runtimeBinding.material}__skin_appearance_runtime_v2`
       material.color.setRGB(1, 1, 1)
 
-      if (needsBaseComposition(state)) {
+      if (needsBaseComposition(state) || this.artworkProjection) {
         const { width, height } = this.definition.canvas
         const [nipplesAreolae, palmsSoles, cheekBlush] = await this.loadMasks()
         const maskDefinitions = [
@@ -349,6 +388,7 @@ export class SkinAppearanceEngineRuntime {
         }
 
         const { canvas, context } = canvas2d(width, height)
+        baseColorCanvas = canvas
         const { context: scratch } = canvas2d(width, height)
         const inheritedBase =
           uploadedBaseColor?.image ?? this.originalTexture.image
@@ -361,30 +401,57 @@ export class SkinAppearanceEngineRuntime {
         )
 
         const customBase = state.surface.baseColor.mode === 'custom'
-        const applyRegion = (
+        const resolveRegionColor = (
           region: SkinAppearanceStateV2['regions']['nipplesAreolae'],
-          mask: CanvasImageSource,
           defaultColor: SkinAppearanceRgb
-        ) => {
-          if (region.mode === 'custom') {
-            drawMaskedLayer(width, height, context, scratch, mask, region.color)
-          } else if (customBase) {
-            drawMaskedLayer(width, height, context, scratch, mask, defaultColor)
-          }
+        ): SkinAppearanceRgb | null => {
+          if (region.mode === 'custom') return region.color
+          return customBase ? defaultColor : null
         }
-        applyRegion(
+        const nippleColor = resolveRegionColor(
           state.regions.nipplesAreolae,
-          nipplesAreolae.image,
           this.definition.controls.find(
             (control) => control.id === 'nipplesAreolae'
           )!.defaultColor
         )
-        applyRegion(
+        if (this.artworkProjection) {
+          const pigment = canvas2d(width, height)
+          nipplePigmentCanvas = pigment.canvas
+          if (nippleColor) {
+            drawMaskedLayer(
+              width,
+              height,
+              pigment.context,
+              scratch,
+              nipplesAreolae.image,
+              nippleColor
+            )
+          }
+        } else if (nippleColor) {
+          drawMaskedLayer(
+            width,
+            height,
+            context,
+            scratch,
+            nipplesAreolae.image,
+            nippleColor
+          )
+        }
+        const palmsSolesColor = resolveRegionColor(
           state.regions.palmsSoles,
-          palmsSoles.image,
           this.definition.controls.find((control) => control.id === 'palmsSoles')!
             .defaultColor
         )
+        if (palmsSolesColor) {
+          drawMaskedLayer(
+            width,
+            height,
+            context,
+            scratch,
+            palmsSoles.image,
+            palmsSolesColor
+          )
+        }
 
         const cheek = state.regions.cheekBlush
         if (cheek.mode === 'custom') {
@@ -421,6 +488,11 @@ export class SkinAppearanceEngineRuntime {
           )
         }
 
+        scratch.clearRect(0, 0, width, height)
+        scratch.globalCompositeOperation = 'source-over'
+        scratch.drawImage(nipplesAreolae.image, 0, 0, width, height)
+        nippleMaskCanvas = scratch.canvas
+
         const texture = new THREE.CanvasTexture(canvas)
         texture.name = 'skin-appearance-base-color-runtime-v2'
         copyTextureSampling(
@@ -428,6 +500,7 @@ export class SkinAppearanceEngineRuntime {
           texture,
           THREE.SRGBColorSpace
         )
+        texture.channel = this.originalTexture.channel
         material.map = texture
         ownedTextures.push(texture)
       } else {
@@ -489,9 +562,26 @@ export class SkinAppearanceEngineRuntime {
         material.metalness = this.originalMaterial.metalness
       }
 
+      if (
+        this.artworkProjection &&
+        (!baseColorCanvas || !nipplePigmentCanvas || !nippleMaskCanvas)
+      ) {
+        fail(
+          'Skin Artwork Projection requires its clean Base Color, isolated nipple pigment, and nipple mask'
+        )
+      }
+      preparedProjection =
+        this.artworkProjection && nipplePigmentCanvas && nippleMaskCanvas
+          ? this.artworkProjection.prepareArtwork(
+            nipplePigmentCanvas,
+            material,
+            nippleMaskCanvas
+          )
+          : null
       material.needsUpdate = true
-      return { material, ownedTextures }
+      return { material, ownedTextures, projection: preparedProjection }
     } catch (error) {
+      this.artworkProjection?.disposePrepared(preparedProjection)
       for (const texture of ownedTextures) texture.dispose()
       throw error
     } finally {
@@ -507,6 +597,11 @@ export class SkinAppearanceEngineRuntime {
     this.ownedTextures = []
   }
 
+  syncSurfaceGeometry(nippleSizeValue: number | null = this.projectionNippleSizeValue) {
+    this.projectionNippleSizeValue = nippleSizeValue
+    this.artworkProjection?.syncSurfaceGeometry(nippleSizeValue)
+  }
+
   dispose() {
     if (this.disposed) return
     this.generation += 1
@@ -515,6 +610,7 @@ export class SkinAppearanceEngineRuntime {
       for (const texture of textures) texture.dispose()
     })
     this.masksPromise = null
+    this.artworkProjection?.dispose()
     this.disposed = true
   }
 }

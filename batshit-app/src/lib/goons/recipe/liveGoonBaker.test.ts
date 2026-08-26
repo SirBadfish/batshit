@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { createHairState } from '../hairAssets'
 import { hairFollowerDefinitionSha256 } from '../hairFollowers'
@@ -20,7 +22,11 @@ import {
   HAIR_HIGHLIGHT_MASK_PNG_FIXTURE,
   HAIR_NEUTRAL_VALUE_PNG_FIXTURE
 } from './fixtures/hairAssetFixture'
-import { canonicalRecipeString, sha256Hex } from './recipeCanonical'
+import {
+  canonicalRecipeSha256,
+  canonicalRecipeString,
+  sha256Hex
+} from './recipeCanonical'
 import { recipeSiblingStateSha256, recipeStateSnapshotSha256 } from './recipeContracts'
 import {
   bakeLiveGoon,
@@ -33,6 +39,81 @@ async function input(runtimeMorphName?: string): Promise<LiveGoonBakeInput> {
   const fixture = await createRecipePhysicalMigrationFixture({
     runtimeMorphName
   })
+  return {
+    source: fixture.source.recipeSource,
+    sourceRevision: { revisionId: 'recipe-revision-7', revision: 7 },
+    state: fixture.sourceState,
+    packageBytes: fixture.source.packageBytes,
+    modelBytes: fixture.source.glbBytes,
+    manifestBytes: fixture.source.manifestBytes
+  }
+}
+
+async function skinArtworkProjectionFixture() {
+  const point = {
+    triangle: 0,
+    barycentric: [1, 0, 0] as [number, number, number]
+  }
+  const circle = (side: 'left' | 'right', surfaceCenterUv: [number, number]) => ({
+    side,
+    sourceArtworkCenterUv: surfaceCenterUv,
+    surfaceCenterUv,
+    deformationCenterUv: surfaceCenterUv,
+    sourceOuterRadiusUv: 0.006,
+    deformationFrameRadiusUv: 0.01,
+    supportRadiusUv: 0.014,
+    neutralOuterRadiusMeters: 0.013,
+    neutralSizeFrameMeters: [0.02, 0.02] as [number, number],
+    neutralCenterFrameRatios: [0, 0, 0] as [number, number, number],
+    anchors: {
+      ownershipSeed: point,
+      outerBoundary: Array.from({ length: 8 }, () => point),
+      deformationFrame: {
+        uMinus: point,
+        uPlus: point,
+        vMinus: point,
+        vPlus: point
+      }
+    }
+  })
+  const definition = {
+    schemaVersion: 'skin-artwork-projection/v8',
+    status: 'ready-review',
+    productExportApproved: true,
+    definitionSha256: '0'.repeat(64),
+    metric: 'nipple-base-ring-single-surface-circle/v3',
+    projectionOrigin: 'selected-outer-boundary-stable-frame/v1',
+    pigmentExtraction: 'isolated-skin-appearance-region-layer/v1',
+    surfaceOwnership: 'center-connected-projection-island/v1',
+    radiusResponse: {
+      driver: 'appearance-dial/nipple_size-positive/v1',
+      positiveMaximumMultiplier: 2,
+      maximumOuterRadiusMeters: 0.04,
+      bakedDriverValue: null
+    },
+    runtimeBinding: {
+      node: 'Body',
+      material: 'FixtureMaterial',
+      vertexCount: 3,
+      indexCount: 3,
+      indexSha256: 'b'.repeat(64),
+      uvSha256: 'c'.repeat(64),
+      surfaceOffsetMeters: 0,
+      overlayTextureSize: 64,
+      overlayTextureRadiusUv: 0.4
+    },
+    circles: [
+      circle('left', [0.3, 0.3]),
+      circle('right', [0.7, 0.3])
+    ]
+  }
+  definition.definitionSha256 = await canonicalRecipeSha256(definition)
+  return definition
+}
+
+function liveInputFromFixture(
+  fixture: Awaited<ReturnType<typeof createRecipePhysicalMigrationFixture>>
+): LiveGoonBakeInput {
   return {
     source: fixture.source.recipeSource,
     sourceRevision: { revisionId: 'recipe-revision-7', revision: 7 },
@@ -214,6 +295,42 @@ describe('deterministic Live Goon baker', () => {
     })
     expect((parsed.meshes[0]?.primitives as Array<Record<string, unknown>>)[0]).toHaveProperty(
       'targets'
+    )
+  })
+
+  it('preserves the geometry-bound Skin Artwork Projection in deterministic Live output', async () => {
+    const skinAppearance = JSON.parse(
+      readFileSync(
+        resolve(process.cwd(), 'static/goons/skin-appearance/v1/skin-appearance-v1.json'),
+        'utf8'
+      )
+    ) as Record<string, unknown>
+    const skinArtworkProjection = await skinArtworkProjectionFixture()
+    const fixture = await createRecipePhysicalMigrationFixture({
+      skinAppearance,
+      skinArtworkProjection
+    })
+
+    const output = await bakeLiveGoon(liveInputFromFixture(fixture))
+
+    expect(output.manifest.skinAppearance).toEqual(skinAppearance)
+    expect(skinArtworkProjection.radiusResponse.bakedDriverValue).toBeNull()
+    expect(
+      (output.manifest.skinArtworkProjection as typeof skinArtworkProjection)
+        .radiusResponse.bakedDriverValue
+    ).toBe(0)
+    expect(output.manifest.skinArtworkProjection).not.toEqual(
+      skinArtworkProjection
+    )
+  })
+
+  it('rejects a Skin Artwork Projection with no Skin Appearance owner', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      skinArtworkProjection: await skinArtworkProjectionFixture()
+    })
+
+    await expect(bakeLiveGoon(liveInputFromFixture(fixture))).rejects.toThrow(
+      'Recipe Skin Artwork Projection has no Skin Appearance owner'
     )
   })
 
