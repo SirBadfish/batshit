@@ -204,7 +204,7 @@ jobs:
         run: npx --yes madge@8 --circular --extensions js,cjs,mjs src
 
   guardrails:
-    name: Guardrails (audit + docs + branding + $derived)
+    name: Guardrails (audit + branding + $derived)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
