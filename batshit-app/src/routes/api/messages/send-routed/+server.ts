@@ -7491,8 +7491,29 @@ export const POST: RequestHandler = async ({
       console.error('[send-routed] Failed to load user zip settings:', error)
     }
 
-    // Story 6.8d: Use agentType from request or fall back to agent's agentType (default: n8n)
+    // Resolve the primary-agent type from the request override, else the stored record.
     const finalAgentType = normalizePrimaryAgentType(agent, agentType)
+
+    // SA-106 DL-106-03: the `n8n` primary-agent type is retired. Any send that resolves
+    // to it fails loudly here — before the session-turn lock, clip consumption, memory
+    // commit, or any compile — so a stray record can never half-run. Both the resolved
+    // type AND the stored record are checked: `agentType` arrives from the request body
+    // and outranks the record (primaryAgentType.ts), so checking only the resolved value
+    // would let a client override its way past the guard on a retired agent.
+    if (
+      isN8nPrimaryAgentType(finalAgentType) ||
+      isN8nPrimaryAgentType(normalizePrimaryAgentType(agent))
+    ) {
+      return json(
+        {
+          error: 'The n8n Primary Agent type was removed from Batshit.',
+          code: 'primary_agent_type_retired',
+          details:
+            'This agent uses the retired n8n Primary Agent type. Delete this agent and create an API or CLI agent instead. n8n is still fully supported as a tool platform: n8n tool workflows and n8n Workflow Subagents are unchanged.',
+        },
+        { status: 409 },
+      )
+    }
 
     // Load session metadata for group chat configuration
     const session = await redis.getSession(sessionId)
