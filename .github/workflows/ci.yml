@@ -164,7 +164,7 @@ jobs:
         ports:
           - 6390:6379
         options: >-
-          --health-cmd "redis-cli ping | grep -q PONG && redis-cli command info ft.create | grep -q ft.create"
+          --health-cmd "redis-cli ping | grep -q PONG && redis-cli command info json.get | grep -q json.get"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
