@@ -420,6 +420,7 @@ export function suggestEmbeddingPrefixes(
 interface SavedPresetRecordLike {
   id?: string
   modelId?: string
+  effectiveModelId?: string
   modelName?: string
   provider?: string
   purpose?: string
@@ -452,7 +453,7 @@ export function resolvePresetEmbeddingTarget(input: {
     )
   }
   const provider = String(preset.provider ?? '').trim().toLowerCase()
-  const modelId = String(preset.modelId ?? '').trim()
+  const modelId = String(preset.effectiveModelId ?? preset.modelId ?? '').trim()
   if (
     provider !== snapshot.provider.trim().toLowerCase() ||
     modelId !== snapshot.modelName.trim()

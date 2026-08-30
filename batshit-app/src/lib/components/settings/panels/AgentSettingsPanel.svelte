@@ -4150,7 +4150,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
         savedModels.find((model) => {
           if (
             model.provider !== basicForm.primary_model_provider ||
-            model.modelId !== basicForm.primary_model_name
+            model.modelId !== basicForm.primary_model_name &&
+            model.effectiveModelId !== basicForm.primary_model_name
           ) {
             return false;
           }
@@ -4191,7 +4192,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       primary_model_preset_id: model.id,
       primary_model_connection: resolveSavedModelConnection(model),
       primary_model_provider: model.provider,
-      primary_model_name: model.modelId,
+      primary_model_name: model.effectiveModelId ?? model.modelId,
       provider_specific_settings: hasSettings ? settings : null,
       primary_model_temperature:
         typeof settings.temperature === "number" ? settings.temperature : null,
@@ -4356,7 +4357,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     const match = savedModels.find(
       (model) =>
         model.provider === subagentForm.primary_model_provider &&
-        model.modelId === subagentForm.primary_model_name,
+        (model.modelId === subagentForm.primary_model_name ||
+          model.effectiveModelId === subagentForm.primary_model_name),
     );
 
     if (match) {
@@ -4403,7 +4405,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     subagentForm = {
       ...subagentForm,
       primary_model_provider: model.provider,
-      primary_model_name: model.modelId,
+      primary_model_name: model.effectiveModelId ?? model.modelId,
     };
     seedCliSubagentFormsFromSavedModel(model);
   }

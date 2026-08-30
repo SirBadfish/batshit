@@ -94,7 +94,7 @@ export function inferModelPurpose({
   if (normalizedType.includes('embedding')) return 'utility'
   if (normalizedType.includes('rerank') || normalizedType.includes('ranker')) return 'utility'
   if (normalizedType.includes('classifier') || normalizedType.includes('classification')) return 'utility'
-  if (hasAnyTag(tagSet, ['embedding', 'embeddings', 'text-embedding', 'textembedding', 'rerank', 'reranker', 'ranker', 'classifier', 'classification', 'moderation', 'ocr'])) {
+  if (hasAnyTag(tagSet, ['embedding', 'embeddings', 'text-embedding', 'textembedding', 'rerank', 'reranker', 'ranker', 'classifier', 'classification', 'moderation'])) {
     return 'utility'
   }
   if (looksLikeUtilityModel(normalizedId) || looksLikeUtilityModel(normalizedName)) return 'utility'

@@ -870,13 +870,14 @@ async function resolveModelForRole({
   if (roleConfig.source === 'preset' && roleConfig.presetId) {
     const preset = (await redis.get(`model:${roleConfig.presetId}`)) as SavedModel | null
     if (preset?.modelId) {
+      const effectiveModelId = preset.effectiveModelId ?? preset.modelId
       const catalogMetadata = await resolveModelMetadataFromCatalog(
-        preset.modelId,
+        effectiveModelId,
         role,
         preset.connection ?? null
       )
       return {
-        modelId: preset.modelId,
+        modelId: effectiveModelId,
         connection: preset.connection ?? catalogMetadata.connection ?? null,
         providerSettings: preset.settings ?? null,
         purpose: preset.purpose ?? catalogMetadata.purpose ?? null,

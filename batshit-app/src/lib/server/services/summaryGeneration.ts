@@ -136,6 +136,7 @@ async function resolveSummaryModel(params: {
   const resolvedIds = resolveModelIds({
     developerId: selection.provider,
     modelId: selection.modelId,
+    effectiveModelId: selection.effectiveModelId,
     connection: selection.connection
   })
 

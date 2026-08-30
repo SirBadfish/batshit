@@ -30,34 +30,6 @@ function splitDeveloperModel(value: string): { developerId: string; modelId: str
   return { developerId: developerId.trim(), modelId }
 }
 
-/**
- * 2026-08-28: router namespaces disagree on a few developer slugs (found live when an
- * OpenRouter preset built from a gateway-shaped catalog id sent `zai/glm-5.3-flash`
- * and OpenRouter 404ed — it wants `z-ai/`). When we CONSTRUCT a router id ourselves
- * (no exact catalog variant for that connection), translate known divergent slugs to
- * the target router's convention. Slugs already in the target convention pass through.
- */
-const ROUTER_DEVELOPER_SLUG_OVERRIDES: Record<string, Record<string, string>> = {
-  openrouter: {
-    zai: 'z-ai',
-    xai: 'x-ai',
-    mistral: 'mistralai',
-    meta: 'meta-llama'
-  },
-  'vercel-gateway': {
-    'z-ai': 'zai',
-    'x-ai': 'xai',
-    mistralai: 'mistral',
-    'meta-llama': 'meta'
-  }
-}
-
-function routerDeveloperSlug(routerId: string, developerId: string): string {
-  const overrides = ROUTER_DEVELOPER_SLUG_OVERRIDES[routerId]
-  if (!overrides) return developerId
-  return overrides[developerId.toLowerCase()] ?? developerId
-}
-
 const DIRECT_OWNER_PREFIX_SERVICES = new Set([
   'fal',
   'replicate',
@@ -125,16 +97,19 @@ function inferCatalogConnectionContext(
 export function resolveModelIds({
   developerId: rawDeveloperId,
   modelId: rawModelId,
+  effectiveModelId: rawEffectiveModelId,
   connection
 }: {
   developerId?: string | null
   modelId?: string | null
+  effectiveModelId?: string | null
   connection?: ModelConnectionInfo | null
 }): ResolvedModelIds | null {
   let developerId = normalize(rawDeveloperId)
   let modelId = normalize(rawModelId)
+  const authoritativeEffectiveModelId = normalize(rawEffectiveModelId)
 
-  if (!developerId && !modelId) return null
+  if (!developerId && !modelId && !authoritativeEffectiveModelId) return null
 
   const transport = connection?.type ?? null
   const service = normalize(connection?.service ?? null)
@@ -155,7 +130,8 @@ export function resolveModelIds({
     ((serviceLower.startsWith('custom_') && !connection?.useDeveloperPrefix) ||
       (serviceLower === 'fal' && developerId && developerId.toLowerCase() !== serviceLower))
   )
-  const parsed = shouldParseDeveloperModel && modelId ? splitDeveloperModel(modelId) : null
+  const parsedInput = modelId || authoritativeEffectiveModelId
+  const parsed = shouldParseDeveloperModel && parsedInput ? splitDeveloperModel(parsedInput) : null
   if (parsed) {
     const isRouterTransport = transport === 'openrouter' || transport === 'vercel-gateway'
     const shouldOverrideDeveloper =
@@ -166,7 +142,9 @@ export function resolveModelIds({
     if (shouldOverrideDeveloper) {
       developerId = parsed.developerId
     }
-    modelId = parsed.modelId
+    if (!modelId || modelId === parsedInput) {
+      modelId = parsed.modelId
+    }
   }
 
   const providerId =
@@ -190,14 +168,14 @@ export function resolveModelIds({
       DIRECT_OWNER_PREFIX_SERVICES.has(serviceLower) ||
       (LOCAL_PREFIX_SERVICES.has(serviceLower) && hasParsedDeveloper) ||
       (connection?.useDeveloperPrefix && serviceLower.startsWith('custom_')))
-  let effectiveModelId =
-    providerId === 'openrouter' || providerId === 'vercel-gateway'
-      ? `${routerDeveloperSlug(providerId, developerId)}/${modelId}`
+  let effectiveModelId = authoritativeEffectiveModelId ||
+    (providerId === 'openrouter' || providerId === 'vercel-gateway'
+      ? `${developerId}/${modelId}`
       : shouldPrefixOwner
         ? `${developerId}/${modelId}`
-        : modelId
+        : modelId)
 
-  if (isFalDirect) {
+  if (isFalDirect && !authoritativeEffectiveModelId) {
     effectiveModelId = `fal-ai/${developerId}/${modelId}`
   }
 
@@ -233,6 +211,13 @@ export function resolveCatalogIds({
     }
   }
 
+  // A catalog row with variants is an authoritative identity record. If the selected
+  // connection has no compatible variant, fail closed instead of borrowing another
+  // provider's namespace and reconstructing an identifier that may 404.
+  if (selectedConnectionId && idVariants && Object.keys(idVariants).length > 0) {
+    return null
+  }
+
   const directService = selectedConnectionId.startsWith('direct:')
     ? (resolveConnectionServiceFromId(selectedConnectionId) ?? '').toLowerCase()
     : ''
@@ -242,7 +227,7 @@ export function resolveCatalogIds({
   )
   let effectiveModelId =
     selectedConnectionId === 'openrouter' || selectedConnectionId === 'vercel-gateway'
-      ? `${routerDeveloperSlug(selectedConnectionId, baseDeveloper)}/${baseModel}`
+      ? `${baseDeveloper}/${baseModel}`
       : shouldPrefixOwner
         ? `${baseDeveloper}/${baseModel}`
         : baseModel

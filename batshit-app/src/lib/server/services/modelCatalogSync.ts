@@ -1627,8 +1627,61 @@ function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
   return merged
 }
 
+type CatalogIdentityIssue = {
+  catalogId: string
+  connectionId: string
+  reason: 'missing-variant' | 'incomplete-variant'
+}
+
+function findCatalogIdentityIssues(models: CatalogEntry[]): CatalogIdentityIssue[] {
+  const issues: CatalogIdentityIssue[] = []
+
+  for (const model of models) {
+    const connectionIds = new Set(
+      [
+        ...(model.availableConnections ?? []),
+        model.connectionId
+      ].filter((value): value is string => Boolean(value))
+    )
+
+    for (const connectionId of connectionIds) {
+      const variant = model.idVariants?.[connectionId]
+      if (!variant) {
+        issues.push({ catalogId: model.id, connectionId, reason: 'missing-variant' })
+        continue
+      }
+      if (
+        !variant.developerId?.trim() ||
+        !variant.modelId?.trim() ||
+        !variant.effectiveId?.trim()
+      ) {
+        issues.push({ catalogId: model.id, connectionId, reason: 'incomplete-variant' })
+      }
+    }
+  }
+
+  return issues
+}
+
+function assertCatalogIdentityIntegrity(models: CatalogEntry[]) {
+  const issues = findCatalogIdentityIssues(models)
+  if (!issues.length) return
+
+  const sample = issues
+    .slice(0, 8)
+    .map((issue) => `${issue.catalogId} @ ${issue.connectionId} (${issue.reason})`)
+    .join(', ')
+  throw new Error(
+    `Catalog identity integrity failed for ${issues.length} connection variant(s): ${sample}`
+  )
+}
+
 export function _mergeCatalogEntriesForTest(entries: CatalogEntry[]): CatalogEntry[] {
   return mergeCatalogEntries(entries)
+}
+
+export function _findCatalogIdentityIssuesForTest(models: CatalogEntry[]): CatalogIdentityIssue[] {
+  return findCatalogIdentityIssues(models)
 }
 
 export function _mapOpenRouterModelToCatalogEntryForTest(raw: OpenRouterModel): CatalogEntry {
@@ -2461,6 +2514,7 @@ export async function runModelCatalogSync(
   ]
 
   const merged = mergeCatalogEntries(allEntries).sort((a, b) => a.displayName.localeCompare(b.displayName))
+  assertCatalogIdentityIntegrity(merged)
 
   const payload: CatalogPayload = {
     version: 2,

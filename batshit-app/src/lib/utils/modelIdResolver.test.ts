@@ -33,30 +33,29 @@ describe('modelIdResolver', () => {
       })
     })
 
-    it('translates divergent developer slugs to the target router convention (2026-08-28)', () => {
-      // A gateway-shaped `zai` slug must become OpenRouter's `z-ai` (live 404 otherwise).
+    it('does not guess or translate developer namespaces for manually entered router IDs', () => {
       const openrouter = resolveModelIds({
         developerId: 'zai',
         modelId: 'glm-5.3-flash',
         connection: { type: 'openrouter', service: 'openrouter' }
       })
-      expect(openrouter?.effectiveModelId).toBe('z-ai/glm-5.3-flash')
+      expect(openrouter?.effectiveModelId).toBe('zai/glm-5.3-flash')
+    })
 
-      // And the reverse: an OpenRouter-shaped slug on the Vercel gateway.
-      const gateway = resolveModelIds({
-        developerId: 'z-ai',
-        modelId: 'glm-5.3-flash',
-        connection: { type: 'vercel-gateway', service: 'vercel' }
+    it('uses a provider-authoritative effective ID verbatim', () => {
+      const resolved = resolveModelIds({
+        developerId: 'zai-org',
+        modelId: 'GLM-5.3-Flash',
+        effectiveModelId: 'zai-org/GLM-5.3-Flash',
+        connection: { type: 'direct', service: 'deepinfra' }
       })
-      expect(gateway?.effectiveModelId).toBe('zai/glm-5.3-flash')
 
-      // Slugs already in the target convention pass through untouched.
-      const untouched = resolveModelIds({
-        developerId: 'z-ai',
-        modelId: 'glm-5.3-flash',
-        connection: { type: 'openrouter', service: 'openrouter' }
+      expect(resolved).toEqual({
+        providerId: 'deepinfra',
+        developerId: 'zai-org',
+        modelId: 'GLM-5.3-Flash',
+        effectiveModelId: 'zai-org/GLM-5.3-Flash'
       })
-      expect(untouched?.effectiveModelId).toBe('z-ai/glm-5.3-flash')
     })
 
     it('prefixes developer/model for vercel gateway', () => {
@@ -279,7 +278,7 @@ describe('modelIdResolver', () => {
       })
     })
 
-    it('ignores incompatible direct variants and falls back to base ids', () => {
+    it('fails closed for an incompatible selected catalog variant', () => {
       const resolved = resolveCatalogIds({
         connectionId: 'direct:anthropic',
         connection: {
@@ -300,11 +299,7 @@ describe('modelIdResolver', () => {
         }
       })
 
-      expect(resolved).toEqual({
-        developerId: 'anthropic',
-        modelId: 'claude-sonnet-4-5',
-        effectiveModelId: 'claude-sonnet-4-5'
-      })
+      expect(resolved).toBeNull()
     })
 
     it('keeps multi-tenant direct variants for owner-prefixed providers', () => {
