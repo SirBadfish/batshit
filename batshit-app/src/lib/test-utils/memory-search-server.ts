@@ -112,6 +112,9 @@ export interface MemorySearchTestContext {
   adminClient(): RedisClientType
 }
 
+/** Stamped into the disposable instance so later suite files know it is harness-owned. */
+const HARNESS_CLAIM_KEY = 'batshit:memory_test_harness_claim'
+
 export function useMemorySearchTestServer(): MemorySearchTestContext {
   let child: ChildProcess | null = null
   let dataDir: string | null = null
@@ -122,6 +125,13 @@ export function useMemorySearchTestServer(): MemorySearchTestContext {
   const setEnv = (key: string, value: string) => {
     if (!previousEnv.has(key)) previousEnv.set(key, process.env[key])
     process.env[key] = value
+  }
+
+  /** Full clean slate (FLUSHALL drops keys AND FT indexes), then re-stamp the claim. */
+  const claimAndFlush = async () => {
+    if (!admin) return
+    await admin.flushAll()
+    await admin.set(HARNESS_CLAIM_KEY, new Date().toISOString())
   }
 
   beforeAll(async () => {
@@ -166,13 +176,22 @@ export function useMemorySearchTestServer(): MemorySearchTestContext {
     admin.on('error', (error) => console.error('[memory-search harness] Redis error:', error))
     await admin.connect()
 
-    // Belt and suspenders: a real Batshit instance always has user records.
-    const userKeys = await admin.keys('user:*')
-    if (userKeys.length > 0) {
-      throw new Error(
-        'Memory-search harness refuses this instance: it contains user:* keys and therefore looks like real Batshit data.'
-      )
+    // Belt and suspenders: a real Batshit instance always has user records. The
+    // claim marker distinguishes THIS harness's own leftovers from real data: in CI
+    // every suite file shares one service container, and earlier files legitimately
+    // write user:* fixtures — without the marker, file two's guard mistook those
+    // leftovers for live data and refused (found on the job's first flight,
+    // 2026-08-29). An unclaimed instance with user:* keys still refuses loudly.
+    const alreadyClaimed = (await admin.exists(HARNESS_CLAIM_KEY)) > 0
+    if (!alreadyClaimed) {
+      const userKeys = await admin.keys('user:*')
+      if (userKeys.length > 0) {
+        throw new Error(
+          'Memory-search harness refuses this instance: it contains user:* keys and therefore looks like real Batshit data.'
+        )
+      }
     }
+    await claimAndFlush()
 
     setEnv('MEMORY_TEST_REDIS_URL', redisUrl)
     setEnv('REDIS_URL', redisUrl)
@@ -190,8 +209,9 @@ export function useMemorySearchTestServer(): MemorySearchTestContext {
   beforeEach(async () => {
     if (!memorySearchLaneActive() || !admin?.isOpen) return
     // The instance is disposable and harness-owned; FLUSHALL also drops FT indexes,
-    // giving every test a fully clean slate.
-    await admin.flushAll()
+    // giving every test a fully clean slate. Re-stamping the claim keeps the next
+    // suite file's guard aware the instance is harness-owned (shared CI container).
+    await claimAndFlush()
   })
 
   afterAll(async () => {
