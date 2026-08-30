@@ -3,6 +3,7 @@
   import { Download, Loader2, RefreshCw, Trash2 } from '@lucide/svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import { dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
+  import { onDestroy } from 'svelte'
 
   type CliRuntimeId = 'codex' | 'claude'
 
@@ -15,6 +16,11 @@
       supported: boolean
       unsupportedReason: string | null
       displayName: string
+      operation: {
+        operation: 'install' | 'reinstall' | 'uninstall'
+        phase: string
+        startedAt: string
+      } | null
     }
     resolution: {
       executable: string
@@ -37,8 +43,10 @@
 
   let summary = $state<CliRuntimeSummary | null>(null)
   let loading = $state(true)
-  let busyOperation = $state<'install' | 'uninstall' | null>(null)
+  let busyOperation = $state<'install' | 'reinstall' | 'uninstall' | null>(null)
   let errorMessage = $state<string | null>(null)
+  let canManage = $state(false)
+  let pollTimer: ReturnType<typeof setTimeout> | null = null
 
   const sourceLabel = $derived.by(() => {
     if (!summary) return null
@@ -66,15 +74,18 @@
         throw new Error(payload?.error || `Failed to check ${displayName} status.`)
       }
       summary = payload?.runtimes?.[runtime] ?? null
+      canManage = payload?.canManage === true
     } catch (error) {
       summary = null
       errorMessage = error instanceof Error ? error.message : `Failed to check ${displayName} status.`
     } finally {
       loading = false
+      if (pollTimer) clearTimeout(pollTimer)
+      pollTimer = summary?.managed.operation ? setTimeout(() => void refresh(), 1000) : null
     }
   }
 
-  async function runOperation(operation: 'install' | 'uninstall') {
+  async function runOperation(operation: 'install' | 'reinstall' | 'uninstall') {
     busyOperation = operation
     errorMessage = null
     try {
@@ -85,6 +96,14 @@
       })
       const payload = await response.json().catch(() => null)
       if (!response.ok) {
+        if (response.status === 409 && payload?.operation && summary) {
+          summary = {
+            ...summary,
+            managed: { ...summary.managed, operation: payload.operation }
+          }
+          if (pollTimer) clearTimeout(pollTimer)
+          pollTimer = setTimeout(() => void refresh(), 1000)
+        }
         throw new Error(
           payload?.error || `Failed to ${operation === 'install' ? 'install' : 'remove'} ${displayName}.`
         )
@@ -94,7 +113,7 @@
         resolution: payload.resolution
       }
       toast.success(
-        operation === 'install'
+        operation === 'install' || operation === 'reinstall'
           ? `${displayName} installed. Next step: sign in.`
           : `${displayName} managed install removed.`
       )
@@ -113,6 +132,10 @@
   $effect(() => {
     void runtime
     void refresh()
+  })
+
+  onDestroy(() => {
+    if (pollTimer) clearTimeout(pollTimer)
   })
 </script>
 
@@ -153,17 +176,24 @@
     </p>
   {:else if summary}
     <div class="flex flex-wrap items-center gap-2">
-      {#if busyOperation === 'install'}
+      {#if busyOperation === 'install' || busyOperation === 'reinstall'}
         <Button type="button" size="sm" disabled>
           <Loader2 class="mr-1.5 h-3.5 w-3.5 animate-spin" />
           Downloading ({approxDownload})…
         </Button>
+      {:else if summary.managed.operation}
+        <Button type="button" size="sm" disabled>
+          <Loader2 class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          {summary.managed.operation.operation === 'uninstall' ? 'Removing' : 'Installing'} ({summary.managed.operation.phase})…
+        </Button>
+      {:else if !canManage}
+        <span class="batshit-settings-caption">An administrator manages this shared runtime.</span>
       {:else if summary.managed.installed}
         <Button
           type="button"
           size="sm"
           variant="outline"
-          onclick={() => runOperation('install')}
+          onclick={() => runOperation('reinstall')}
           disabled={busyOperation !== null}
         >
           <Download class="mr-1.5 h-3.5 w-3.5" />

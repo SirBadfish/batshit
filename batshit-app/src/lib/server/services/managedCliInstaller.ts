@@ -1,8 +1,11 @@
-import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { accessSync, constants, readdirSync, readFileSync } from 'node:fs'
-import { access, chmod, mkdir, readdir, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { execFile, spawnSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { accessSync, constants, createWriteStream, readdirSync, readFileSync } from 'node:fs'
+import { access, chmod, mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
+import { Readable, Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 
 import { resolveManagedInstallsRoot } from '$lib/server/services/voiceLocalEngineSetup'
@@ -46,6 +49,7 @@ const REGISTRY_METADATA_TIMEOUT_MS = 30_000
 const DOWNLOAD_TIMEOUT_MS = 600_000
 const VERSION_PROBE_TIMEOUT_MS = 20_000
 const LEGACY_DOCKER_MANAGED_INSTALLS_ROOT = '/root/.batshit/installs'
+const MANAGED_CLI_OPERATION_DIR = '.operations'
 
 export type ManagedCliInstallManifest = {
   runtime: ManagedCliRuntimeId
@@ -71,6 +75,41 @@ export type ManagedCliInstallStatus = {
   executablePath: string | null
   installRoot: string
   manifest: ManagedCliInstallManifest | null
+  operation: ManagedCliOperationStatus | null
+}
+
+export type ManagedCliOperationKind = 'install' | 'reinstall' | 'uninstall'
+export type ManagedCliOperationPhase =
+  | 'starting'
+  | 'metadata'
+  | 'downloading'
+  | 'verifying'
+  | 'extracting'
+  | 'validating'
+  | 'activating'
+  | 'cleaning-up'
+
+export type ManagedCliOperationStatus = {
+  runtime: ManagedCliRuntimeId
+  operation: ManagedCliOperationKind
+  phase: ManagedCliOperationPhase
+  startedAt: string
+}
+
+type ManagedCliOperationRecord = ManagedCliOperationStatus & {
+  ownerId: string
+  pid: number
+  hostname: string
+}
+
+export class ManagedCliOperationInProgressError extends Error {
+  readonly code = 'CLI_RUNTIME_OPERATION_IN_PROGRESS'
+  constructor(readonly operationStatus: ManagedCliOperationStatus) {
+    super(
+      `${MANAGED_CLI_DISPLAY_NAMES[operationStatus.runtime]} already has a ${operationStatus.operation} operation in progress (${operationStatus.phase}).`,
+    )
+    this.name = 'ManagedCliOperationInProgressError'
+  }
 }
 
 export type ManagedCliTarget = {
@@ -111,11 +150,205 @@ export function resolveManagedCliShimPath(runtime: ManagedCliRuntimeId): string 
   return path.join(resolveManagedCliBinDir(), runtime)
 }
 
-function detectLinuxMusl(): boolean {
-  if (process.platform !== 'linux') return false
-  const report =
-    typeof process.report?.getReport === 'function' ? (process.report.getReport() as any) : null
-  return report != null && report.header?.glibcVersionRuntime === undefined
+function resolveOperationPaths(runtime: ManagedCliRuntimeId, cliRoot = resolveManagedCliRoot()) {
+  const operationsRoot = path.join(cliRoot, MANAGED_CLI_OPERATION_DIR)
+  return {
+    operationsRoot,
+    lockPath: path.join(operationsRoot, `${runtime}.lock`),
+    statusPath: path.join(operationsRoot, `${runtime}.status.json`),
+  }
+}
+
+function operationRecordToStatus(record: ManagedCliOperationRecord): ManagedCliOperationStatus {
+  return {
+    runtime: record.runtime,
+    operation: record.operation,
+    phase: record.phase,
+    startedAt: record.startedAt,
+  }
+}
+
+async function readOperationRecord(filePath: string): Promise<ManagedCliOperationRecord | null> {
+  try {
+    const parsed = JSON.parse(await readFile(filePath, 'utf8')) as ManagedCliOperationRecord
+    if (
+      !isManagedCliRuntimeId(parsed.runtime) ||
+      !['install', 'reinstall', 'uninstall'].includes(parsed.operation) ||
+      typeof parsed.ownerId !== 'string' ||
+      typeof parsed.pid !== 'number' ||
+      typeof parsed.hostname !== 'string' ||
+      typeof parsed.startedAt !== 'string'
+    ) {
+      return null
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error: any) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function writeOperationStatus(
+  statusPath: string,
+  record: ManagedCliOperationRecord,
+): Promise<void> {
+  const tempPath = `${statusPath}.tmp-${record.ownerId}`
+  await writeFile(tempPath, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 })
+  await rename(tempPath, statusPath)
+}
+
+export async function getManagedCliOperationStatus(
+  runtime: ManagedCliRuntimeId,
+  cliRoot = resolveManagedCliRoot(),
+): Promise<ManagedCliOperationStatus | null> {
+  const { lockPath, statusPath } = resolveOperationPaths(runtime, cliRoot)
+  if (!(await stat(lockPath).catch(() => null))) return null
+  const record = (await readOperationRecord(statusPath)) ?? (await readOperationRecord(lockPath))
+  return record ? operationRecordToStatus(record) : {
+    runtime,
+    operation: 'install',
+    phase: 'starting',
+    startedAt: new Date(0).toISOString(),
+  }
+}
+
+async function acquireManagedCliOperation(
+  runtime: ManagedCliRuntimeId,
+  operation: ManagedCliOperationKind,
+  cliRoot: string,
+): Promise<{
+  update: (phase: ManagedCliOperationPhase) => Promise<void>
+  release: () => Promise<void>
+}> {
+  const paths = resolveOperationPaths(runtime, cliRoot)
+  await mkdir(paths.operationsRoot, { recursive: true })
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const ownerId = randomUUID()
+    const record: ManagedCliOperationRecord = {
+      runtime,
+      operation,
+      phase: 'starting',
+      startedAt: new Date().toISOString(),
+      ownerId,
+      pid: process.pid,
+      hostname: os.hostname(),
+    }
+    let acquired = false
+    try {
+      const handle = await open(paths.lockPath, 'wx', 0o600)
+      acquired = true
+      try {
+        await handle.writeFile(`${JSON.stringify(record)}\n`, 'utf8')
+      } finally {
+        await handle.close()
+      }
+      await writeOperationStatus(paths.statusPath, record)
+
+      return {
+        update: async (phase) => {
+          record.phase = phase
+          await writeOperationStatus(paths.statusPath, record)
+        },
+        release: async () => {
+          const current = await readOperationRecord(paths.lockPath)
+          if (current?.ownerId !== ownerId) return
+          await rm(paths.statusPath, { force: true })
+          await rm(paths.lockPath, { force: true })
+        },
+      }
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') {
+        if (acquired) {
+          await rm(paths.statusPath, { force: true }).catch(() => undefined)
+          await rm(paths.lockPath, { force: true }).catch(() => undefined)
+        }
+        throw error
+      }
+      const current = await readOperationRecord(paths.lockPath)
+      if (
+        attempt === 0 &&
+        current?.hostname === os.hostname() &&
+        !processIsAlive(current.pid)
+      ) {
+        await rm(paths.statusPath, { force: true })
+        await rm(paths.lockPath, { force: true })
+        continue
+      }
+      const currentStatus = await getManagedCliOperationStatus(runtime, cliRoot)
+      throw new ManagedCliOperationInProgressError(
+        currentStatus ?? {
+          runtime,
+          operation,
+          phase: 'starting',
+          startedAt: new Date(0).toISOString(),
+        },
+      )
+    }
+  }
+  throw new Error(`Failed to acquire ${MANAGED_CLI_DISPLAY_NAMES[runtime]} operation lock.`)
+}
+
+export type LinuxLibc = 'glibc' | 'musl' | 'unknown'
+
+export function classifyLinuxLibcEvidence(evidence: {
+  glibcVersionRuntime?: unknown
+  sharedObjects?: unknown
+  lddOutput?: unknown
+  alpineReleasePresent?: boolean
+}): LinuxLibc {
+  const glibc = typeof evidence.glibcVersionRuntime === 'string' && evidence.glibcVersionRuntime.trim()
+  const sharedObjects = Array.isArray(evidence.sharedObjects)
+    ? evidence.sharedObjects.filter((value): value is string => typeof value === 'string')
+    : []
+  const lddOutput = typeof evidence.lddOutput === 'string' ? evidence.lddOutput : ''
+  const musl =
+    evidence.alpineReleasePresent === true ||
+    sharedObjects.some((value) => /(?:^|[/_-])(?:ld-)?musl(?:[-_.]|$)/i.test(value)) ||
+    /\bmusl\b/i.test(lddOutput)
+  const gnu = Boolean(glibc) || /\bglibc\b|GNU C Library|GNU libc/i.test(lddOutput)
+
+  if (musl && gnu) return 'unknown'
+  if (musl) return 'musl'
+  if (gnu) return 'glibc'
+  return 'unknown'
+}
+
+export function detectLinuxLibc(): LinuxLibc {
+  if (process.platform !== 'linux') return 'unknown'
+  let report: any = null
+  try {
+    report = typeof process.report?.getReport === 'function' ? process.report.getReport() : null
+  } catch {
+    report = null
+  }
+  const ldd = spawnSync('ldd', ['--version'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 5_000,
+  })
+  let alpineReleasePresent = false
+  try {
+    accessSync('/etc/alpine-release', constants.F_OK)
+    alpineReleasePresent = true
+  } catch {
+    // Non-Alpine hosts are expected to lack this marker.
+  }
+  return classifyLinuxLibcEvidence({
+    glibcVersionRuntime: report?.header?.glibcVersionRuntime,
+    sharedObjects: report?.sharedObjects,
+    lddOutput: `${ldd.stdout ?? ''}\n${ldd.stderr ?? ''}`,
+    alpineReleasePresent,
+  })
 }
 
 /**
@@ -127,7 +360,7 @@ export function resolveManagedCliTarget(
   options: {
     platform?: NodeJS.Platform
     arch?: string
-    musl?: boolean
+    libc?: LinuxLibc
   } = {}
 ): ManagedCliTarget {
   const platform = options.platform ?? process.platform
@@ -182,9 +415,18 @@ export function resolveManagedCliTarget(
 
   // Claude Code publishes real per-platform packages containing a native
   // `claude` binary at the package root. Linux needs the musl variants on
-  // musl-based distros (e.g. Alpine, which the Batshit Docker image uses).
-  const musl = options.musl ?? detectLinuxMusl()
-  const key = platform === 'linux' ? `linux-${arch}${musl ? '-musl' : ''}` : `${platform}-${arch}`
+  // musl-based distros such as Alpine. Batshit's current Docker image is
+  // Debian/glibc, but the public installer supports both libc families.
+  let libc = options.libc
+  if (platform === 'linux') {
+    libc ??= detectLinuxLibc()
+    if (libc === 'unknown') {
+      throw new Error(
+        'Claude Code managed install could not positively identify this Linux host as glibc or musl. Set up a supported libc runtime instead of installing a guessed binary.',
+      )
+    }
+  }
+  const key = platform === 'linux' ? `linux-${arch}${libc === 'musl' ? '-musl' : ''}` : `${platform}-${arch}`
   return {
     key,
     packageName: `@anthropic-ai/claude-code-${key}`,
@@ -241,7 +483,7 @@ async function fetchRegistryMetadata(target: ManagedCliTarget): Promise<{
   return { tarballUrl, integrity }
 }
 
-async function downloadTarball(url: string): Promise<Buffer> {
+async function downloadTarball(url: string, destination: string, integrity: string): Promise<void> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS)
   try {
@@ -249,7 +491,28 @@ async function downloadTarball(url: string): Promise<Buffer> {
     if (!response.ok) {
       throw new Error(`Download failed with HTTP ${response.status} for ${url}.`)
     }
-    return Buffer.from(await response.arrayBuffer())
+    if (!response.body) {
+      throw new Error(`Download returned no response body for ${url}.`)
+    }
+    const hash = createHash('sha512')
+    const hashingStream = new Transform({
+      transform(chunk, _encoding, callback) {
+        hash.update(chunk)
+        callback(null, chunk)
+      },
+    })
+    await pipeline(
+      Readable.fromWeb(response.body as any),
+      hashingStream,
+      createWriteStream(destination, { flags: 'wx', mode: 0o600 }),
+    )
+    const expected = integrity.replace(/^sha512-/, '').trim()
+    const actual = hash.digest('base64')
+    if (actual !== expected) {
+      throw new Error(
+        `Downloaded file failed sha512 integrity verification (expected ${expected}, got ${actual}). The download may be corrupted or tampered with — nothing was installed.`,
+      )
+    }
   } finally {
     clearTimeout(timeout)
   }
@@ -390,8 +653,13 @@ async function refreshShim(runtime: ManagedCliRuntimeId, executablePath: string)
   const binDir = resolveManagedCliBinDir()
   await mkdir(binDir, { recursive: true })
   const shimPath = resolveManagedCliShimPath(runtime)
-  await rm(shimPath, { force: true })
-  await symlink(executablePath, shimPath)
+  const temporaryShimPath = path.join(binDir, `.${runtime}.tmp-${randomUUID()}`)
+  try {
+    await symlink(executablePath, temporaryShimPath)
+    await rename(temporaryShimPath, shimPath)
+  } finally {
+    await rm(temporaryShimPath, { force: true }).catch(() => undefined)
+  }
 }
 
 async function removeShim(runtime: ManagedCliRuntimeId): Promise<void> {
@@ -418,6 +686,7 @@ export async function getManagedCliInstallStatus(
   const runtimeRoot = resolveManagedCliRuntimeRoot(runtime)
   const pinnedVersion = MANAGED_CLI_PINNED_VERSIONS[runtime]
   const unsupportedReason = buildUnsupportedReason(runtime)
+  const operation = await getManagedCliOperationStatus(runtime)
 
   let installedManifest: ManagedCliInstallManifest | null = null
   const entries = await readdir(runtimeRoot, { withFileTypes: true }).catch(() => [])
@@ -450,7 +719,8 @@ export async function getManagedCliInstallStatus(
     pinnedVersion,
     executablePath: installedManifest?.executablePath ?? null,
     installRoot: runtimeRoot,
-    manifest: installedManifest
+    manifest: installedManifest,
+    operation,
   }
 }
 
@@ -498,6 +768,7 @@ export type ManagedCliInstallResult = {
   installedVersion: string
   executablePath: string
   sourceUrl: string
+  reused: boolean
 }
 
 /**
@@ -511,30 +782,47 @@ export async function installManagedCli(
     installRootOverride?: string
     /** Skip stable-shim creation (used with installRootOverride). */
     skipShim?: boolean
+    /** Explicitly replace an already-healthy pinned install. */
+    force?: boolean
   } = {}
 ): Promise<ManagedCliInstallResult> {
-  const target = resolveManagedCliTarget(runtime)
   const version = MANAGED_CLI_PINNED_VERSIONS[runtime]
-  const { tarballUrl, integrity } = await fetchRegistryMetadata(target)
-
-  const data = await downloadTarball(tarballUrl)
-  verifySha512Integrity(data, integrity)
-
-  const versionRoot = options.installRootOverride
-    ? path.join(options.installRootOverride, runtime, version)
-    : resolveManagedCliVersionRoot(runtime, version)
-  const stagingRoot = `${versionRoot}.tmp-${Date.now()}`
-  await rm(stagingRoot, { recursive: true, force: true })
-  await mkdir(stagingRoot, { recursive: true })
-
+  const cliRoot = options.installRootOverride ?? resolveManagedCliRoot()
+  const versionRoot = path.join(cliRoot, runtime, version)
+  const operation = await acquireManagedCliOperation(
+    runtime,
+    options.force ? 'reinstall' : 'install',
+    cliRoot,
+  )
+  let stagingRoot: string | null = null
   try {
+    if (!options.force && !options.installRootOverride) {
+      const current = await getManagedCliInstallStatus(runtime)
+      if (current.installed && current.version === version && current.manifest) {
+        return {
+          status: current,
+          installedVersion: version,
+          executablePath: current.executablePath!,
+          sourceUrl: current.manifest.sourceUrl,
+          reused: true,
+        }
+      }
+    }
+
+    const target = resolveManagedCliTarget(runtime)
+    await operation.update('metadata')
+    const { tarballUrl, integrity } = await fetchRegistryMetadata(target)
+    const { operationsRoot } = resolveOperationPaths(runtime, cliRoot)
+    stagingRoot = await mkdtemp(path.join(operationsRoot, `${runtime}-${version}-staging-`))
     const archivePath = path.join(stagingRoot, `${runtime}-${version}.tgz`)
-    // The managed CLI tarball is verified against npm integrity before this private staging write.
+    await operation.update('downloading')
     // codeql[js/http-to-file-access]
-    await writeFile(archivePath, data)
+    await downloadTarball(tarballUrl, archivePath, integrity)
+    await operation.update('extracting')
     await extractTarGz(archivePath, stagingRoot)
     await rm(archivePath, { force: true })
 
+    await operation.update('validating')
     const stagedExecutable = path.join(stagingRoot, target.executableRelativePath)
     if (!(await fileExists(stagedExecutable))) {
       throw new Error(
@@ -572,9 +860,31 @@ export async function installManagedCli(
       'utf8'
     )
 
-    await rm(versionRoot, { recursive: true, force: true })
     await mkdir(path.dirname(versionRoot), { recursive: true })
-    await rename(stagingRoot, versionRoot)
+    const rollbackRoot = path.join(
+      resolveOperationPaths(runtime, cliRoot).operationsRoot,
+      `${runtime}-${version}-rollback-${randomUUID()}`,
+    )
+    const hadExistingInstall = Boolean(await stat(versionRoot).catch(() => null))
+    let promoted = false
+    await operation.update('activating')
+    try {
+      if (hadExistingInstall) await rename(versionRoot, rollbackRoot)
+      await rename(stagingRoot, versionRoot)
+      stagingRoot = null
+      promoted = true
+
+      if (!options.skipShim && !options.installRootOverride) {
+        await refreshShim(runtime, executablePath)
+      }
+    } catch (error) {
+      if (promoted) await rm(versionRoot, { recursive: true, force: true }).catch(() => undefined)
+      if (hadExistingInstall && (await stat(rollbackRoot).catch(() => null))) {
+        await rename(rollbackRoot, versionRoot).catch(() => undefined)
+      }
+      throw error
+    }
+    await rm(rollbackRoot, { recursive: true, force: true }).catch(() => undefined)
 
     if (!options.installRootOverride) {
       // Remove any stale sibling versions so old ~190MB trees do not pile up.
@@ -589,26 +899,50 @@ export async function installManagedCli(
       }
     }
 
-    if (!options.skipShim && !options.installRootOverride) {
-      await refreshShim(runtime, executablePath)
-    }
-
     const status = await getManagedCliInstallStatus(runtime)
 
     return {
       status,
       installedVersion: version,
       executablePath,
-      sourceUrl: tarballUrl
+      sourceUrl: tarballUrl,
+      reused: false,
     }
   } finally {
-    await rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined)
+    await operation.update('cleaning-up').catch(() => undefined)
+    if (stagingRoot) {
+      await rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined)
+    }
+    await operation.release()
   }
 }
 
 /** Removes the managed install (all versions) and the stable shim for a runtime. */
 export async function uninstallManagedCli(runtime: ManagedCliRuntimeId): Promise<ManagedCliInstallStatus> {
-  await rm(resolveManagedCliRuntimeRoot(runtime), { recursive: true, force: true })
-  await removeShim(runtime)
-  return getManagedCliInstallStatus(runtime)
+  const cliRoot = resolveManagedCliRoot()
+  const operation = await acquireManagedCliOperation(runtime, 'uninstall', cliRoot)
+  const runtimeRoot = resolveManagedCliRuntimeRoot(runtime)
+  const trashRoot = path.join(
+    resolveOperationPaths(runtime, cliRoot).operationsRoot,
+    `${runtime}-uninstall-${randomUUID()}`,
+  )
+  let moved = false
+  try {
+    await operation.update('activating')
+    if (await stat(runtimeRoot).catch(() => null)) {
+      await rename(runtimeRoot, trashRoot)
+      moved = true
+    }
+    try {
+      await removeShim(runtime)
+    } catch (error) {
+      if (moved) await rename(trashRoot, runtimeRoot).catch(() => undefined)
+      throw error
+    }
+    await operation.update('cleaning-up')
+    await rm(trashRoot, { recursive: true, force: true })
+    return getManagedCliInstallStatus(runtime)
+  } finally {
+    await operation.release()
+  }
 }

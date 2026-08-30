@@ -285,6 +285,15 @@ describe('CodexBridge', () => {
     expect(promptPackage.prompt).not.toContain('Stable Batshit system prompt')
   })
 
+  it('refuses an app-server run when compiled developer instructions are empty', async () => {
+    const bridge = new CodexBridgeClass()
+    await expect(
+      (bridge as any).runViaAppServer('Current user payload', {
+        developerInstructions: '   '
+      })
+    ).rejects.toThrow(/compiled developer instructions are empty/)
+  })
+
   it('uses documented JSON output and ephemeral mode when history persistence is none', () => {
     const args = buildCodexCliArgs({
       model: 'gpt-5.4',
@@ -588,5 +597,39 @@ describe('CodexBridge', () => {
     expect(args).not.toContain('--add-dir')
     expect(args).not.toContain('--enable')
     expect(args).not.toContain('mcp_servers.example.disabled=false')
+  })
+
+  it('routes hidden summary generation through the guarded app-server lane', async () => {
+    const bridge = new CodexBridgeClass()
+    const runViaAppServer = vi.spyOn(bridge as any, 'runViaAppServer').mockResolvedValue({
+      transport: 'app-server',
+      events: (async function* () {
+        yield { type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'Summary' } }
+        yield { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }
+      })()
+    })
+
+    await expect(
+      bridge.generateHiddenText({
+        prompt: 'Summarize this transcript.',
+        userId: 'user-123',
+        model: 'gpt-5.5',
+        codexSettings: buildCodexRuntimeSettings()
+      })
+    ).resolves.toMatchObject({ text: 'Summary', transport: 'cli' })
+
+    expect(runViaAppServer).toHaveBeenCalledOnce()
+    const options = runViaAppServer.mock.calls[0]?.[1]
+    expect(options).toMatchObject({
+      sandboxMode: 'read-only',
+      allowFileEdits: false,
+      allowNetwork: false,
+      approvalPolicy: 'never',
+      webSearchEnabled: false,
+      historyPersistence: 'none',
+      ignoreUserConfig: true,
+      ignoreRules: true
+    })
+    expect(options.developerInstructions).toContain('hidden maintenance summarizer')
   })
 })

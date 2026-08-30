@@ -3923,13 +3923,16 @@ async function packageAudit(packagePath) {
     }
   }
 
-  const managedRuntimeRoot = join(realTarget, 'Contents', 'Resources', 'runtime', 'vendor');
-  const portability = await inspectManagedRuntimePortability(managedRuntimeRoot, {
-    maximumMinimumVersion: MAC_RUNTIME_MINIMUM_VERSION
+  const packagedRuntimeAuditRoot = join(realTarget, 'Contents', 'Resources', 'runtime');
+  const managedRuntimeRoot = join(packagedRuntimeAuditRoot, 'vendor');
+  const portability = await inspectManagedRuntimePortability(packagedRuntimeAuditRoot, {
+    maximumMinimumVersion: MAC_RUNTIME_MINIMUM_VERSION,
+    requiredArchitecture: 'arm64',
+    requireSignature: true
   });
   if (!portability.ok) {
     runtimeAssetIssues.push(
-      ...portability.issues.map((issue) => `Managed runtime portability failure: ${issue}`)
+      ...portability.issues.map((issue) => `Packaged runtime portability failure: ${issue}`)
     );
   }
   runtimeAssetIssues.push(
@@ -4029,7 +4032,13 @@ async function packageAudit(packagePath) {
     invalidIcons,
     electronPackageIssues,
     privacyIssues,
-    runtimeAssetIssues
+    runtimeAssetIssues,
+    runtimeNativeFiles: portability.records.map((record) => ({
+      path: relative(packagedRuntimeAuditRoot, record.path),
+      architectures: record.architectures,
+      minimumVersion: record.minimumVersion,
+      signatureValid: record.signatureValid
+    }))
   };
 }
 

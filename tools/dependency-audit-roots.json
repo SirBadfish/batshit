@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "roots": [
+    "batshit-app",
+    "batshit-server/server",
+    "batshit-mac",
+    "batshit-mac/frontend",
+    "tools/livekit-agent-sidecar"
+  ]
+}
