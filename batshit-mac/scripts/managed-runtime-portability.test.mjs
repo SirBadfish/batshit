@@ -9,8 +9,10 @@ import {
   isMachOFile,
   isMachOFileSync,
   parseMacosMinimumVersion,
+  parseOtoolRpaths,
   parseOtoolInstallName,
   parseOtoolLibraries,
+  inspectManagedRuntimePortability,
   shouldIgnoreNonCodeSigningPath,
   validateMachOPortabilityRecord
 } from './managed-runtime-portability.mjs';
@@ -46,6 +48,35 @@ test('parses Mach-O dependencies, install names, and both minimum-version comman
   );
   assert.equal(compareVersions('14.0', '14'), 0);
   assert.equal(compareVersions('14.1', '14.0'), 1);
+  assert.deepEqual(
+    parseOtoolRpaths(
+      'Load command 1\n          cmd LC_RPATH\n      cmdsize 56\n         path @loader_path/../../lib (offset 12)\n'
+    ),
+    ['@loader_path/../../lib']
+  );
+});
+
+test('resolves @rpath dependencies through package-owned LC_RPATH entries', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-runtime-rpath-'));
+  const addon = join(root, 'app', 'node_modules', 'binding', 'native.node');
+  const library = join(root, 'app', 'node_modules', 'native-libs', 'libfixture.dylib');
+  await mkdir(join(addon, '..'), { recursive: true });
+  await mkdir(join(library, '..'), { recursive: true });
+  await writeFile(addon, 'fixture');
+  await writeFile(library, 'fixture');
+
+  const issues = await validateMachOPortabilityRecord(
+    {
+      path: addon,
+      dependencies: ['@rpath/libfixture.dylib'],
+      installName: null,
+      minimumVersion: '14.0',
+      rpaths: ['@loader_path/../native-libs']
+    },
+    { runtimeRoot: root }
+  );
+
+  assert.deepEqual(issues, []);
 });
 
 test('accepts only Apple system libraries and package-owned loader-path dependencies', async () => {
@@ -95,4 +126,41 @@ test('rejects Homebrew, missing, unresolved, escaping, and newer-mac dependencie
   assert.match(issues.join('\n'), /missing bundled library/);
   assert.match(issues.join('\n'), /resolves outside/);
   assert.match(issues.join('\n'), /unresolved runtime dependency/);
+});
+
+test('enforces packaged-runtime architecture and signature expectations', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-runtime-signature-'));
+  const addon = join(root, 'batshit-app', 'node_modules', 'fixture', 'native.node');
+  await mkdir(join(addon, '..'), { recursive: true });
+  await writeFile(addon, Buffer.from('cffaedfe00000000', 'hex'));
+
+  const issues = await validateMachOPortabilityRecord(
+    {
+      path: addon,
+      dependencies: ['/usr/lib/libSystem.B.dylib'],
+      installName: null,
+      minimumVersion: '14.0',
+      architectures: ['x86_64'],
+      signatureValid: false
+    },
+    { runtimeRoot: root, requiredArchitecture: 'arm64', requireSignature: true }
+  );
+
+  assert.deepEqual(issues, [
+    'batshit-app/node_modules/fixture/native.node does not contain the required arm64 architecture.',
+    'batshit-app/node_modules/fixture/native.node does not have a valid code signature.'
+  ]);
+});
+
+test('discovers native add-ons nested under packaged runtime node_modules', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'batshit-runtime-node-modules-'));
+  const addon = join(root, 'batshit-app', 'node_modules', 'fixture', 'native.node');
+  await mkdir(join(addon, '..'), { recursive: true });
+  await writeFile(addon, Buffer.from('cffaedfe00000000', 'hex'));
+
+  const result = await inspectManagedRuntimePortability(root);
+
+  assert.equal(result.ok, false);
+  assert.match(result.issues.join('\n'), /batshit-app\/node_modules\/fixture\/native\.node/);
+  assert.match(result.issues.join('\n'), /does not declare a macOS minimum deployment version/);
 });

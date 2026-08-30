@@ -21,18 +21,21 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import readline from 'node:readline'
 import type { ThreadEvent, ThreadItem, Usage } from '$lib/types/codexProtocol'
 import { logger } from '$lib/utils/logger'
+import {
+  CONTEXT_GUARD_CLASSIFIER_MARKER,
+  DEFAULT_CONTEXT_GUARD_THRESHOLD,
+  resolveManagedContextGuardThreshold,
+} from './contextGuardPolicy'
 
-export const DEFAULT_CONTEXT_GUARD_THRESHOLD = 0.8
+export { DEFAULT_CONTEXT_GUARD_THRESHOLD }
 const CONTEXT_GUARD_ENV_VAR = 'BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD'
 const RPC_RESPONSE_TIMEOUT_MS = 120_000
 const INTERRUPT_GRACE_MS = 10_000
 
 export function resolveContextGuardThreshold(
   env: NodeJS.ProcessEnv = process.env,
-): number {
-  const raw = Number(env[CONTEXT_GUARD_ENV_VAR])
-  if (Number.isFinite(raw) && raw >= 0.5 && raw < 1) return raw
-  return DEFAULT_CONTEXT_GUARD_THRESHOLD
+): number | null {
+  return resolveManagedContextGuardThreshold(env, CONTEXT_GUARD_ENV_VAR)
 }
 
 export function buildContextGuardStopMessage(details: {
@@ -43,7 +46,7 @@ export function buildContextGuardStopMessage(details: {
     (details.usedTokens / details.modelContextWindow) * 100,
   )
   return (
-    `Batshit context guard: Codex context window usage reached ${pct}% ` +
+    `${CONTEXT_GUARD_CLASSIFIER_MARKER}: Codex context window usage reached ${pct}% ` +
     `(${details.usedTokens.toLocaleString()} of ${details.modelContextWindow.toLocaleString()} tokens) mid-task. ` +
     `The run was stopped gracefully before the model ran out of room.`
   )
@@ -83,6 +86,9 @@ export function mapAppServerUsage(usage: AppServerTokenUsage | null): Usage {
  */
 export function computeContextUsedTokens(usage: AppServerTokenUsage): number {
   const last = usage.last ?? {}
+  if (typeof last.totalTokens === 'number' && Number.isFinite(last.totalTokens)) {
+    return Math.max(0, last.totalTokens)
+  }
   return (last.inputTokens ?? 0) + (last.outputTokens ?? 0)
 }
 
@@ -209,6 +215,7 @@ export type CodexAppServerThreadParams = {
 
 export type CodexAppServerRunInput = {
   executable: string
+  spawnArgs?: string[]
   env: NodeJS.ProcessEnv
   cwd?: string
   threadParams: CodexAppServerThreadParams
@@ -284,7 +291,21 @@ class AsyncEventQueue<T> {
 export function startCodexAppServerRun(
   input: CodexAppServerRunInput,
 ): CodexAppServerRun {
-  const child: ChildProcess = spawn(input.executable, ['app-server'], {
+  const guardThreshold = (() => {
+    if (input.contextGuardEnabled === false) return null
+    if (input.contextGuardThreshold !== undefined) {
+      if (
+        !Number.isFinite(input.contextGuardThreshold) ||
+        input.contextGuardThreshold < 0.5 ||
+        input.contextGuardThreshold >= 1
+      ) {
+        throw new Error('Codex context guard threshold must be from 0.5 (inclusive) to 1 (exclusive).')
+      }
+      return input.contextGuardThreshold
+    }
+    return resolveContextGuardThreshold(input.env)
+  })()
+  const child: ChildProcess = spawn(input.executable, input.spawnArgs ?? ['app-server'], {
     cwd: input.cwd,
     env: input.env,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -294,10 +315,6 @@ export function startCodexAppServerRun(
   const pending = new Map<number, PendingRpc>()
   const agentTextById = new Map<string, string>()
   const itemTypeById = new Map<string, string>()
-
-  const guardEnabled = input.contextGuardEnabled !== false
-  const guardThreshold =
-    input.contextGuardThreshold ?? resolveContextGuardThreshold(input.env)
 
   let nextRpcId = 1
   let threadId: string | null = null
@@ -354,7 +371,7 @@ export function startCodexAppServerRun(
 
   const maybeRequestContextGuardInterrupt = () => {
     if (
-      !guardEnabled ||
+      guardThreshold === null ||
       guardTripped ||
       !latestUsage ||
       typeof latestUsage.modelContextWindow !== 'number' ||

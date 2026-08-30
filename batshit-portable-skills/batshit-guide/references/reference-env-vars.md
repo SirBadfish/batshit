@@ -122,7 +122,7 @@ On Windows, Claude Code may print `Paste code here if prompted >` after the brow
 
 Optional overrides: `BATSHIT_CODEX_CLI_PATH` / `CODEX_CLI_PATH` and `BATSHIT_CLAUDE_CLI_PATH` / `CLAUDE_CLI_PATH` point Batshit at a specific CLI executable and win over the managed install and PATH lookup.
 
-Advanced tuning: `BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD` and `BATSHIT_CLAUDE_CONTEXT_GUARD_THRESHOLD` adjust when Batshit gracefully stops a long managed CLI run to relay it before the model's context window fills (default `0.8`, valid `0.5`–`0.99`; the Claude variable also accepts `off` to disable the guard). `BATSHIT_CODEX_TRANSPORT=exec` reverts managed Codex runs to the one-shot exec transport, which has no live token feed and therefore no proactive guard.
+Advanced tuning: `BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD` and `BATSHIT_CLAUDE_CONTEXT_GUARD_THRESHOLD` adjust when Batshit gracefully stops a long managed CLI run to relay it before the model's context window fills (default `0.8`, valid from `0.5` inclusive to `1` exclusive). Either variable accepts `off`, `false`, `disabled`, `none`, or `0` to disable its guard. Invalid values fail the run before the CLI starts instead of silently using a different threshold. `BATSHIT_CODEX_TRANSPORT=exec` reverts normal managed Codex chat runs to the one-shot exec transport, which has no live token feed and therefore no proactive guard; Batshit's hidden Codex maintenance summarizer remains on the guarded app-server lane.
 
 ## Docker Sandbox and runtime add-on operator
 

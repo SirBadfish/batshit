@@ -219,38 +219,20 @@ jobs:
         # the runtime artifact) from turning main red while upstream absorbs fixes.
         run: |
           set -e
-          roots=(
-            batshit-app
-            batshit-server/server
-            batshit-server/client
-            batshit-mac
-            tools/livekit-agent-sidecar
-          )
-          for dir in "${roots[@]}"; do
-            if [ -f "${dir}/package-lock.json" ]; then
-              echo "=== audit (prod deps): ${dir} ==="
-              (cd "${dir}" && npm audit --omit=dev --audit-level=high)
-            else
-              echo "=== audit: ${dir} skipped (no lockfile) ==="
-            fi
+          node tools/validate-dependency-audit-roots.mjs
+          node tools/validate-dependency-audit-roots.mjs --lines | while IFS= read -r dir; do
+            echo "=== audit (prod deps): ${dir} ==="
+            (cd "${dir}" && npm audit --omit=dev --audit-level=high)
           done
       - name: npm audit — full report (informational, never blocks)
         continue-on-error: true
         run: |
-          roots=(
-            batshit-app
-            batshit-server/server
-            batshit-server/client
-            batshit-mac
-            tools/livekit-agent-sidecar
-          )
+          node tools/validate-dependency-audit-roots.mjs
           failed=0
-          for dir in "${roots[@]}"; do
-            if [ -f "${dir}/package-lock.json" ]; then
-              echo "=== full audit: ${dir} ==="
-              (cd "${dir}" && npm audit --audit-level=high) || failed=1
-            fi
-          done
+          while IFS= read -r dir; do
+            echo "=== full audit: ${dir} ==="
+            (cd "${dir}" && npm audit --audit-level=high) || failed=1
+          done < <(node tools/validate-dependency-audit-roots.mjs --lines)
           if [ "$failed" = "1" ]; then
             echo "::warning::High/critical advisories exist in dev/build dependency chains (see log above). Non-blocking by design — review during dependency maintenance."
           fi

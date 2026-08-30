@@ -160,6 +160,11 @@ describe('usage mapping and guard math', () => {
     expect(
       computeContextUsedTokens({ last: { inputTokens: 9916, outputTokens: 607 } }),
     ).toBe(10523)
+    expect(
+      computeContextUsedTokens({
+        last: { inputTokens: 100, cachedInputTokens: 60, outputTokens: 20, totalTokens: 120 },
+      }),
+    ).toBe(120)
   })
 
   it('guard stop message is classified as context exhaustion', () => {
@@ -171,17 +176,18 @@ describe('usage mapping and guard math', () => {
     expect(isContextExhaustionError(message)).toBe(true)
   })
 
-  it('resolves threshold from env with sane bounds', () => {
+  it('uses the shared threshold and disable policy and rejects invalid configuration', () => {
     expect(resolveContextGuardThreshold({})).toBe(DEFAULT_CONTEXT_GUARD_THRESHOLD)
     expect(
       resolveContextGuardThreshold({ BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD: '0.7' }),
     ).toBe(0.7)
-    expect(
+    expect(resolveContextGuardThreshold({ BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD: 'off' })).toBeNull()
+    expect(() =>
       resolveContextGuardThreshold({ BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD: '1.5' }),
-    ).toBe(DEFAULT_CONTEXT_GUARD_THRESHOLD)
-    expect(
+    ).toThrow(/BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD must be/)
+    expect(() =>
       resolveContextGuardThreshold({ BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD: '0.1' }),
-    ).toBe(DEFAULT_CONTEXT_GUARD_THRESHOLD)
+    ).toThrow(/BATSHIT_CODEX_CONTEXT_GUARD_THRESHOLD must be/)
   })
 })
 
@@ -205,6 +211,8 @@ describe('bridge lane helpers', () => {
         'model=gpt-5.3-codex-spark',
         '--config',
         'default_tools_enabled=false',
+        '--config',
+        'developer_instructions="Batshit instructions"',
         '--ephemeral',
         '--enable',
         'foo',
@@ -230,6 +238,7 @@ describe('bridge lane helpers', () => {
         model: 'gpt-5.3-codex-spark',
         permissionMode: 'agent',
         configScope: 'managed',
+        developerInstructions: 'Stable\nBatshit "instructions"',
       } as any),
     ).toEqual({
       ephemeral: true,
@@ -237,6 +246,7 @@ describe('bridge lane helpers', () => {
       model: 'gpt-5.3-codex-spark',
       approvalPolicy: 'on-failure',
       sandbox: 'workspace-write',
+      developerInstructions: 'Stable\nBatshit "instructions"',
     })
     expect(
       buildCodexAppServerThreadParams({
@@ -248,6 +258,27 @@ describe('bridge lane helpers', () => {
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
     })
+  })
+
+  it('delivers large developer instructions exactly once through thread params', () => {
+    const developerInstructions = `Header\n${'large "instruction" line\n'.repeat(10_000)}`
+    const spawnArgs = extractAppServerSpawnArgs([
+      'exec',
+      '--config',
+      `developer_instructions=${JSON.stringify(developerInstructions)}`,
+      '--config',
+      'default_tools_enabled=false',
+    ])
+    const threadParams = buildCodexAppServerThreadParams({
+      historyPersistence: 'none',
+      workingDirectory: '/tmp/work',
+      permissionMode: 'chat',
+      configScope: 'managed',
+      developerInstructions,
+    } as any)
+
+    expect(spawnArgs.join('\n')).not.toContain('developer_instructions=')
+    expect(threadParams.developerInstructions).toBe(developerInstructions)
   })
 })
 
@@ -395,6 +426,7 @@ describe('startCodexAppServerRun', () => {
 
     const run = startCodexAppServerRun({
       executable: 'codex',
+      spawnArgs: ['app-server', '--config', 'default_tools_enabled=false'],
       env: {},
       cwd: '/tmp/work',
       threadParams: { ephemeral: true, cwd: '/tmp/work', model: 'gpt-5.3-codex-spark' },
@@ -414,6 +446,11 @@ describe('startCodexAppServerRun', () => {
     ])
     expect(events.at(-1).usage).toMatchObject({ input_tokens: 10_000 })
     expect(fake.interruptCalls).toHaveLength(0)
+    expect(spawnMock).toHaveBeenCalledWith(
+      'codex',
+      ['app-server', '--config', 'default_tools_enabled=false'],
+      expect.objectContaining({ cwd: '/tmp/work' }),
+    )
   })
 
   it('trips the context guard, interrupts, and surfaces a classified turn.failed', async () => {

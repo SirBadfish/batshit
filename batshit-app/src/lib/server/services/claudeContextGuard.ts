@@ -16,7 +16,13 @@
  * usage source because the CLI has no app-server equivalent.
  */
 
-export const DEFAULT_CLAUDE_CONTEXT_GUARD_THRESHOLD = 0.8
+import {
+  CONTEXT_GUARD_CLASSIFIER_MARKER,
+  DEFAULT_CONTEXT_GUARD_THRESHOLD,
+  resolveManagedContextGuardThreshold,
+} from './contextGuardPolicy'
+
+export const DEFAULT_CLAUDE_CONTEXT_GUARD_THRESHOLD = DEFAULT_CONTEXT_GUARD_THRESHOLD
 
 /**
  * Every model Claude Code exposes ships a 200k context window unless the
@@ -27,7 +33,6 @@ export const DEFAULT_CLAUDE_CONTEXT_WINDOW = 200_000
 const CLAUDE_1M_CONTEXT_WINDOW = 1_000_000
 
 const CONTEXT_GUARD_ENV_VAR = 'BATSHIT_CLAUDE_CONTEXT_GUARD_THRESHOLD'
-const GUARD_DISABLED_VALUES = new Set(['off', 'false', 'disabled', 'none', '0'])
 
 export interface ClaudeContextGuardConfig {
   contextWindow: number
@@ -36,19 +41,13 @@ export interface ClaudeContextGuardConfig {
 
 /**
  * Resolves the guard threshold from `BATSHIT_CLAUDE_CONTEXT_GUARD_THRESHOLD`.
- * Valid range is 0.5 ≤ t < 1; invalid values fall back to the default.
+ * Valid range is 0.5 ≤ t < 1; invalid values fail loudly.
  * Returns null (guard disabled) for explicit opt-out values like `off` or `0`.
  */
 export function resolveClaudeContextGuardThreshold(
   env: NodeJS.ProcessEnv = process.env,
 ): number | null {
-  const raw = (env[CONTEXT_GUARD_ENV_VAR] ?? '').trim().toLowerCase()
-  if (GUARD_DISABLED_VALUES.has(raw)) return null
-  const parsed = Number(raw)
-  if (raw.length > 0 && Number.isFinite(parsed) && parsed >= 0.5 && parsed < 1) {
-    return parsed
-  }
-  return DEFAULT_CLAUDE_CONTEXT_GUARD_THRESHOLD
+  return resolveManagedContextGuardThreshold(env, CONTEXT_GUARD_ENV_VAR)
 }
 
 /**
@@ -81,7 +80,7 @@ export function buildClaudeContextGuardStopMessage(details: {
 }): string {
   const pct = Math.round((details.usedTokens / details.contextWindow) * 100)
   return (
-    `Batshit context guard: Claude context window usage reached ${pct}% ` +
+    `${CONTEXT_GUARD_CLASSIFIER_MARKER}: Claude context window usage reached ${pct}% ` +
     `(${details.usedTokens.toLocaleString()} of ${details.contextWindow.toLocaleString()} tokens) mid-task. ` +
     `The run was stopped gracefully before the model ran out of room.`
   )

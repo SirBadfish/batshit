@@ -58,11 +58,11 @@ describe('resolveClaudeContextGuardThreshold', () => {
     ).toBe(0.95)
   })
 
-  it('falls back to the default for out-of-range or junk values', () => {
+  it('fails loudly for out-of-range or junk values', () => {
     for (const raw of ['0.2', '1', '1.5', '-0.8', 'abc']) {
-      expect(
+      expect(() =>
         resolveClaudeContextGuardThreshold({ BATSHIT_CLAUDE_CONTEXT_GUARD_THRESHOLD: raw }),
-      ).toBe(DEFAULT_CLAUDE_CONTEXT_GUARD_THRESHOLD)
+      ).toThrow(/BATSHIT_CLAUDE_CONTEXT_GUARD_THRESHOLD must be/)
     }
   })
 

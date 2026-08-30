@@ -44,6 +44,22 @@ export function parseMacosMinimumVersion(output) {
   return legacyVersion?.[1] || null;
 }
 
+export function parseOtoolRpaths(output) {
+  const lines = String(output).split(/\r?\n/);
+  const rpaths = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/\bcmd LC_RPATH\b/.test(lines[index])) continue;
+    for (let cursor = index + 1; cursor < Math.min(index + 6, lines.length); cursor += 1) {
+      const match = lines[cursor].trim().match(/^path\s+(.+?)\s+\(offset\s+\d+\)$/);
+      if (match) {
+        rpaths.push(match[1]);
+        break;
+      }
+    }
+  }
+  return rpaths;
+}
+
 export function compareVersions(left, right) {
   const leftParts = String(left).split('.').map(Number);
   const rightParts = String(right).split('.').map(Number);
@@ -65,9 +81,23 @@ function isInside(root, candidate) {
   return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${sep}`);
 }
 
+function resolveRuntimePathBase(recordPath, runtimePath) {
+  if (runtimePath === '@loader_path') return dirname(recordPath);
+  if (runtimePath.startsWith('@loader_path/')) {
+    return resolve(dirname(recordPath), runtimePath.slice('@loader_path/'.length));
+  }
+  if (runtimePath.startsWith('/')) return resolve(runtimePath);
+  return null;
+}
+
 export async function validateMachOPortabilityRecord(
   record,
-  { runtimeRoot, maximumMinimumVersion = MAC_RUNTIME_MINIMUM_VERSION }
+  {
+    runtimeRoot,
+    maximumMinimumVersion = MAC_RUNTIME_MINIMUM_VERSION,
+    requiredArchitecture = null,
+    requireSignature = false
+  }
 ) {
   const issues = [];
   const label = relative(runtimeRoot, record.path) || record.path;
@@ -77,6 +107,16 @@ export async function validateMachOPortabilityRecord(
     issues.push(
       `${label} requires macOS ${record.minimumVersion}; the Batshit Mac runtime target is ${maximumMinimumVersion}.`
     );
+  }
+
+  if (
+    requiredArchitecture &&
+    (!Array.isArray(record.architectures) || !record.architectures.includes(requiredArchitecture))
+  ) {
+    issues.push(`${label} does not contain the required ${requiredArchitecture} architecture.`);
+  }
+  if (requireSignature && record.signatureValid !== true) {
+    issues.push(`${label} does not have a valid code signature.`);
   }
 
   for (const dependency of record.dependencies) {
@@ -89,6 +129,30 @@ export async function validateMachOPortabilityRecord(
       }
       if (!(await stat(target).catch(() => null))) {
         issues.push(`${label} references a missing bundled library: ${dependency}`);
+      }
+      continue;
+    }
+    if (dependency.startsWith('@rpath/')) {
+      const suffix = dependency.slice('@rpath/'.length);
+      const candidates = (record.rpaths || [])
+        .map((runtimePath) => resolveRuntimePathBase(record.path, runtimePath))
+        .filter(Boolean)
+        .map((base) => resolve(base, suffix));
+      const packagedCandidates = candidates.filter((candidate) => isInside(runtimeRoot, candidate));
+      let resolvedInsidePackage = false;
+      for (const candidate of packagedCandidates) {
+        if (await stat(candidate).catch(() => null)) {
+          resolvedInsidePackage = true;
+          break;
+        }
+      }
+      if (resolvedInsidePackage) continue;
+      if (candidates.length > 0 && packagedCandidates.length === 0) {
+        issues.push(`${label} resolves outside the packaged runtime: ${dependency}`);
+      } else if (packagedCandidates.length > 0) {
+        issues.push(`${label} references a missing bundled library: ${dependency}`);
+      } else {
+        issues.push(`${label} uses an unresolved runtime dependency: ${dependency}`);
       }
       continue;
     }
@@ -166,7 +230,11 @@ export function shouldIgnoreNonCodeSigningPath(path) {
 
 export async function inspectManagedRuntimePortability(
   runtimeRoot,
-  { maximumMinimumVersion = MAC_RUNTIME_MINIMUM_VERSION } = {}
+  {
+    maximumMinimumVersion = MAC_RUNTIME_MINIMUM_VERSION,
+    requiredArchitecture = null,
+    requireSignature = false
+  } = {}
 ) {
   const resolvedRoot = resolve(runtimeRoot);
   const rootInfo = await lstat(resolvedRoot).catch(() => null);
@@ -185,6 +253,10 @@ export async function inspectManagedRuntimePortability(
     const libraries = runCaptured('otool', ['-L', path]);
     const installName = runCaptured('otool', ['-D', path]);
     const loadCommands = runCaptured('otool', ['-l', path]);
+    const architectureProbe = requiredArchitecture ? runCaptured('lipo', ['-archs', path]) : null;
+    const signatureProbe = requireSignature
+      ? runCaptured('codesign', ['--verify', '--strict', path])
+      : null;
     if (!libraries.ok || !loadCommands.ok) {
       issues.push(
         `${relative(resolvedRoot, path)} could not be inspected with otool: ${
@@ -197,13 +269,20 @@ export async function inspectManagedRuntimePortability(
       path,
       dependencies: parseOtoolLibraries(libraries.stdout),
       installName: installName.ok ? parseOtoolInstallName(installName.stdout) : null,
-      minimumVersion: parseMacosMinimumVersion(loadCommands.stdout)
+      minimumVersion: parseMacosMinimumVersion(loadCommands.stdout),
+      rpaths: parseOtoolRpaths(loadCommands.stdout),
+      architectures: architectureProbe?.ok
+        ? architectureProbe.stdout.trim().split(/\s+/).filter(Boolean)
+        : [],
+      signatureValid: signatureProbe ? signatureProbe.ok : null
     };
     records.push(record);
     issues.push(
       ...(await validateMachOPortabilityRecord(record, {
         runtimeRoot: resolvedRoot,
-        maximumMinimumVersion
+        maximumMinimumVersion,
+        requiredArchitecture,
+        requireSignature
       }))
     );
   }

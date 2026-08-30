@@ -549,6 +549,23 @@ async function pruneOnnxRuntimeDeadWeight(packageRoot) {
   }
 }
 
+export async function pruneForeignBcryptPrebuilds(packageRoot, targetArch = process.arch) {
+  const prebuildsRoot = join(packageRoot, 'node_modules', 'bcrypt', 'prebuilds');
+  const target = `darwin-${targetArch}`;
+  for (const candidate of ['darwin-arm64', 'darwin-x64']) {
+    if (candidate !== target) {
+      await rm(join(prebuildsRoot, candidate), { recursive: true, force: true });
+    }
+  }
+  const keptBinding = join(prebuildsRoot, target, 'bcrypt.node');
+  if (!(await exists(keptBinding))) {
+    throw new Error(
+      `bcrypt prune expected the ${target} binding to remain at ${keptBinding}; ` +
+        'the bcrypt prebuild layout changed - re-verify the prune before packaging'
+    );
+  }
+}
+
 async function main() {
   if (!(await exists(resourcesPath))) {
     throw new Error(`Package resources path does not exist: ${resourcesPath}`);
@@ -602,6 +619,7 @@ async function main() {
     cwd: serverDest
   });
   await pruneOnnxRuntimeDeadWeight(appDest);
+  await pruneForeignBcryptPrebuilds(appDest);
 
   const systemPrompts = join(repoRoot, 'docs', 'batshit_System_Prompts');
   if (await exists(systemPrompts)) {
@@ -668,4 +686,7 @@ async function main() {
 
 }
 
-await main();
+const invokedPath = process.argv[1] ? resolve(process.argv[1]) : '';
+if (invokedPath === fileURLToPath(import.meta.url)) {
+  await main();
+}

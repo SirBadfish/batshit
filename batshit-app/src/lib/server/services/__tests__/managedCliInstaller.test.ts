@@ -8,10 +8,13 @@ import { promisify } from 'node:util'
 
 import {
   buildManagedCliRegistryMetadataUrl,
+  classifyLinuxLibcEvidence,
   getManagedCliExecutableSync,
   getManagedCliInstallStatus,
+  getManagedCliOperationStatus,
   installManagedCli,
   MANAGED_CLI_PINNED_VERSIONS,
+  ManagedCliOperationInProgressError,
   resolveManagedCliShimPath,
   resolveManagedCliTarget,
   uninstallManagedCli,
@@ -73,14 +76,14 @@ describe('resolveManagedCliTarget', () => {
     const muslLinux = resolveManagedCliTarget('claude', {
       platform: 'linux',
       arch: 'x64',
-      musl: true
+      libc: 'musl'
     })
     expect(muslLinux.packageName).toBe('@anthropic-ai/claude-code-linux-x64-musl')
 
     const glibcLinux = resolveManagedCliTarget('claude', {
       platform: 'linux',
       arch: 'arm64',
-      musl: false
+      libc: 'glibc'
     })
     expect(glibcLinux.packageName).toBe('@anthropic-ai/claude-code-linux-arm64')
   })
@@ -92,6 +95,25 @@ describe('resolveManagedCliTarget', () => {
     expect(() =>
       resolveManagedCliTarget('claude', { platform: 'linux', arch: 'ia32' as any })
     ).toThrow(/arm64 and x64 only/)
+  })
+
+  it('requires positive Linux libc evidence for Claude package selection', () => {
+    expect(
+      classifyLinuxLibcEvidence({ glibcVersionRuntime: '2.36', sharedObjects: [] }),
+    ).toBe('glibc')
+    expect(
+      classifyLinuxLibcEvidence({ sharedObjects: ['/lib/ld-musl-x86_64.so.1'] }),
+    ).toBe('musl')
+    expect(classifyLinuxLibcEvidence({ sharedObjects: [] })).toBe('unknown')
+    expect(
+      classifyLinuxLibcEvidence({
+        glibcVersionRuntime: '2.36',
+        sharedObjects: ['/lib/ld-musl-x86_64.so.1'],
+      }),
+    ).toBe('unknown')
+    expect(() =>
+      resolveManagedCliTarget('claude', { platform: 'linux', arch: 'x64', libc: 'unknown' }),
+    ).toThrow(/could not positively identify/)
   })
 
   it('builds version-specific registry metadata URLs', () => {
@@ -219,6 +241,10 @@ describe('installManagedCli', () => {
     const managed = getManagedCliExecutableSync('codex')
     expect(managed?.executablePath).toBe(result.executablePath)
 
+    const second = await installManagedCli('codex')
+    expect(second.reused).toBe(true)
+    expect(fetch).toHaveBeenCalledTimes(2)
+
     // Stable shim symlink resolves to the versioned executable.
     const shim = resolveManagedCliShimPath('codex')
     const { stdout } = await execFileAsync(shim, [])
@@ -284,5 +310,50 @@ describe('installManagedCli', () => {
     )
 
     await expect(installManagedCli('claude')).rejects.toThrow(/HTTP 404/)
+  })
+
+  platformInstallIt('serializes install and uninstall through a filesystem operation lock', async () => {
+    const target = resolveManagedCliTarget('codex')
+    const tarball = await buildFixtureTarball({
+      executableRelativePath: target.executableRelativePath,
+      versionOutput: 'codex-cli locked',
+    })
+    const integrity = `sha512-${createHash('sha512').update(tarball).digest('base64')}`
+    const metadataUrl = buildManagedCliRegistryMetadataUrl(target)
+    const tarballUrl = 'https://registry.example/codex-lock.tgz'
+    let releaseMetadata!: () => void
+    const metadataGate = new Promise<void>((resolve) => {
+      releaseMetadata = resolve
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: any) => {
+        const url = typeof input === 'string' ? input : input?.url
+        if (url === metadataUrl) {
+          await metadataGate
+          return new Response(
+            JSON.stringify({ dist: { tarball: tarballUrl, integrity } }),
+            { status: 200 },
+          )
+        }
+        if (url === tarballUrl) return new Response(new Uint8Array(tarball), { status: 200 })
+        throw new Error(`Unexpected fetch in test: ${url}`)
+      }),
+    )
+
+    const first = installManagedCli('codex')
+    await vi.waitFor(async () => {
+      expect((await getManagedCliOperationStatus('codex'))?.phase).toBe('metadata')
+    })
+    await expect(installManagedCli('codex')).rejects.toBeInstanceOf(
+      ManagedCliOperationInProgressError,
+    )
+    await expect(uninstallManagedCli('codex')).rejects.toBeInstanceOf(
+      ManagedCliOperationInProgressError,
+    )
+
+    releaseMetadata()
+    await expect(first).resolves.toMatchObject({ reused: false })
+    await expect(getManagedCliOperationStatus('codex')).resolves.toBeNull()
   })
 })
