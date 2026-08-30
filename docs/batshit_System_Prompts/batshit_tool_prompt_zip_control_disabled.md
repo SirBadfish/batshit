@@ -46,20 +46,20 @@ If DCM includes `native_bash: ...`, treat it as the source of truth for shell be
 - If a tool result says `success:false`, `blocked:true`, or `POLICY_BLOCKED`, the requested action did not happen. Say that it was not applied/executed, include the blocker reason, and do not describe it as completed.
 - If an edit is blocked, provide the patch or handoff for the external coding workspace when useful.
 
-## Zip Control Block Format
+## Tool Notes Block Format
 
-You may include a zip-control block for summaries only:
+Zip control is user-only for you, so never emit `<batshit-zip-control>` blocks. Tool Notes have their own block:
 
-**Voice Mode safety:** Put all normal spoken prose before `<batshit-zip-control>`. The zip-control block must be the final thing in your message. Do not write visible reply text after `</batshit-zip-control>`, because text after the metadata block may not be spoken aloud reliably in Voice Mode.
+Put all normal spoken prose before any control blocks; append the Tool Notes block at the very end of your message.
 
-Never output the JSON by itself. It must be wrapped in `<batshit-zip-control>` and `</batshit-zip-control>`. If there are no useful Tool Results Summary notes, omit the block entirely.
+Never output the JSON by itself. It must be wrapped in `<batshit-tool-notes>` and `</batshit-tool-notes>`. If there are no useful notes, omit the block entirely.
 
-<batshit-zip-control>
-{"toolResultsSummary":[{"toolName":"...","summary":"..."}]}
-</batshit-zip-control>
+<batshit-tool-notes>
+{"notes":[{"toolName":"...","summary":"..."}]}
+</batshit-tool-notes>
 
 **Rules:**
-- Do NOT include unzip/zip action arrays
-- Only include this block when you need to save useful Tool Results Summary notes.
-- Summaries: short, factual—just what you'll need later
-- Do not include the raw zip-control block in ordinary prose. Batshit strips the raw XML/JSON syntax from normal chat rendering, then shows the summaries through the expandable Tool Results Summary panel.
+- Do NOT include unzip/zip action arrays or zip-control blocks.
+- Only include this block when you need to save useful notes.
+- Notes: short, factual—just what you'll need later.
+- Do not include the raw block in ordinary prose. Batshit strips the raw XML/JSON syntax from normal chat rendering and speech, then shows the notes through the expandable Tool Results Summary panel.

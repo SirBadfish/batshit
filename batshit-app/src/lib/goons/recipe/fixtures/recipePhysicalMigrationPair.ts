@@ -14,7 +14,11 @@ import {
   createRecipeSourceIdentity,
   type RecipeSourceIdentity,
 } from "../packageMetadata";
-import { canonicalRecipeSha256, sha256Hex } from "../recipeCanonical";
+import {
+  canonicalRecipeSha256,
+  canonicalRecipeString,
+  sha256Hex,
+} from "../recipeCanonical";
 import {
   GOON_RECIPE_STATE_CONTRACT,
   recipeStateSnapshotSha256,
@@ -27,6 +31,7 @@ import {
   RECIPE_STRICT_TOLERANCE_PROFILE,
   RECIPE_UPDATE_PROOF_CONTRACT,
   buildRecipeUpdateDirectEdgeKey,
+  recipeSameTopologyGeometryChangeProofSha256,
   recipeTopologyRebuildProofSha256,
   recipeUpdateEdgeSha256,
   type RecipeBehaviorKind,
@@ -91,6 +96,16 @@ export type RecipePhysicalMigrationFixtureOptions = {
   hairImportCompatible?: boolean;
   /** Emit a target with a deliberately different exact mesh inventory. */
   topologyRebuild?: boolean;
+  /** Emit an exact same-topology target whose kept component changes geometry. */
+  sameTopologyGeometryChange?: boolean;
+  /** Emit an exact same-topology target whose neutral base changes while relative control effects stay exact. */
+  sameTopologyNeutralGeometryChange?: boolean;
+  /** Negative fixture: add an unrelated node-rest change beside the geometry change. */
+  sameTopologyRestChange?: boolean;
+  /** Negative fixture: keep the changed target geometry but omit its author proof. */
+  omitSameTopologyGeometryProof?: boolean;
+  /** Negative fixture: authorize one extra, unobserved geometry channel. */
+  extraAuthorizedGeometryChannel?: boolean;
   /** Preserve a valid Skin Appearance owner and its geometry-bound artwork projection. */
   skinAppearance?: JsonRecord;
   skinArtworkProjection?: JsonRecord;
@@ -255,6 +270,9 @@ function physicalGlb(
   runtimeMorphName?: string,
   hairImportCompatible = false,
   topologyRebuild = false,
+  sameTopologyGeometryChange = false,
+  sameTopologyNeutralGeometryChange = false,
+  sameTopologyRestChange = false,
 ): Uint8Array {
   const accessors = new FixtureAccessors();
   const bodyPositions = hairImportCompatible
@@ -265,13 +283,26 @@ function physicalGlb(
     : topologyRebuild
       ? [0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]
       : [0, 0, 0, 1, 0, 0, 0, 1, 0];
+  if (version === "target" && sameTopologyNeutralGeometryChange) {
+    bodyPositions[2] = 0.025;
+  }
   const basePosition = accessors.floatVec3(bodyPositions);
   const morphNames = [
     ...MORPH_NAMES,
     ...(runtimeMorphName ? [runtimeMorphName] : []),
   ];
   const morphs = morphNames.map((name, index) =>
-    accessors.floatVec3(morphDelta(0.1, index, bodyPositions.length / 3)),
+    accessors.floatVec3(
+      morphDelta(
+        version === "target" &&
+          sameTopologyGeometryChange &&
+          name === "keep_shape"
+          ? 0.125
+          : 0.1,
+        index,
+        bodyPositions.length / 3,
+      ),
+    ),
   );
   const binary = Uint8Array.from(accessors.bytes);
   return makeGlb(
@@ -281,13 +312,32 @@ function physicalGlb(
         generator: `SA-090 R2 physical fixture ${version}`,
       },
       scene: 0,
-      scenes: [{ nodes: [0] }],
+      scenes: [
+        {
+          nodes:
+            sameTopologyGeometryChange || sameTopologyNeutralGeometryChange
+              ? [0, 1, 2, 3, 4]
+              : [0],
+        },
+      ],
       buffers: [{ byteLength: binary.byteLength }],
       bufferViews: accessors.bufferViews,
       accessors: accessors.accessors,
       nodes: [
-        { name: "FixtureRoot", children: [1, 2, 3, 4] },
-        { name: "Body", mesh: 0 },
+        {
+          name: "FixtureRoot",
+          ...(!sameTopologyGeometryChange &&
+          !sameTopologyNeutralGeometryChange
+            ? { children: [1, 2, 3, 4] }
+            : {}),
+        },
+        {
+          name: "Body",
+          mesh: 0,
+          ...(version === "target" && sameTopologyRestChange
+            ? { translation: [0.01, 0, 0] }
+            : {}),
+        },
         {
           name: "HeadAnchor",
           ...(hairImportCompatible ? { translation: [0, 1.48, 0] } : {}),
@@ -375,10 +425,11 @@ function appearanceManifest(
   baseId = "sa090-r2-physical-fixture",
   fitFamily = "sa090-r2-physical-fixture.v1",
   keepControlId = "keep_control",
+  sameTopologyGeometryChange = false,
   skinAppearance?: JsonRecord,
   skinArtworkProjection?: JsonRecord,
 ): JsonRecord {
-  const source = version === "source";
+  const source = version === "source" || sameTopologyGeometryChange;
   const targets: JsonRecord = {
     affine_target: targetDefinition("affine_shape", "component.affine"),
     complex_target: targetDefinition("complex_shape", "component.complex"),
@@ -599,6 +650,9 @@ async function sourcePackageDraft(
   keepControlId = "keep_control",
   hairImportCompatible = false,
   topologyRebuild = false,
+  sameTopologyGeometryChange = false,
+  sameTopologyNeutralGeometryChange = false,
+  sameTopologyRestChange = false,
   skinAppearance?: JsonRecord,
   skinArtworkProjection?: JsonRecord,
 ) {
@@ -607,6 +661,9 @@ async function sourcePackageDraft(
     runtimeMorphName,
     hairImportCompatible,
     topologyRebuild,
+    sameTopologyGeometryChange,
+    sameTopologyNeutralGeometryChange,
+    sameTopologyRestChange,
   );
   const avatarManifest = appearanceManifest(
     version,
@@ -615,6 +672,7 @@ async function sourcePackageDraft(
     baseId,
     fitFamily,
     keepControlId,
+    sameTopologyGeometryChange || sameTopologyNeutralGeometryChange,
     skinAppearance,
     skinArtworkProjection,
   );
@@ -707,6 +765,10 @@ async function updateEdge(
   siblingSubplans?: RecipeSiblingSubplan[],
   keepControlId = "keep_control",
   topologyRebuild = false,
+  sameTopologyGeometryChange = false,
+  sameTopologyNeutralGeometryChange = false,
+  omitSameTopologyGeometryProof = false,
+  extraAuthorizedGeometryChannel = false,
 ): Promise<RecipeUpdateEdge> {
   const fromIds = [
     "affine_control",
@@ -716,14 +778,18 @@ async function updateEdge(
     "piecewise_control",
     "removed_control",
   ].sort(compareText);
-  const toIds = [
-    "affine_control",
-    "complex_a",
-    "complex_b",
-    keepControlId,
-    "new_control",
-    "piecewise_control",
-  ].sort(compareText);
+  const intentionalGeometryChange =
+    sameTopologyGeometryChange || sameTopologyNeutralGeometryChange;
+  const toIds = intentionalGeometryChange
+    ? [...fromIds]
+    : [
+        "affine_control",
+        "complex_a",
+        "complex_b",
+        keepControlId,
+        "new_control",
+        "piecewise_control",
+      ].sort(compareText);
   const allIds = [...new Set([...fromIds, ...toIds])].sort(compareText);
   const sharedKeep = await controlIdentity(keepControlId, "shared");
   const sharedComplexB = await controlIdentity("complex_b", "shared");
@@ -747,9 +813,10 @@ async function updateEdge(
   };
   const controls = await Promise.all(
     allIds.map(async (id): Promise<RecipeControlUpdatePlan> => {
-      const action = actionById[id]!;
-      const shared =
-        id === keepControlId
+      const action = intentionalGeometryChange ? "keep" : actionById[id]!;
+      const shared = intentionalGeometryChange
+        ? await controlIdentity(id, "shared")
+        : id === keepControlId
           ? sharedKeep
           : id === "complex_b"
             ? sharedComplexB
@@ -771,8 +838,9 @@ async function updateEdge(
             : ["track"],
         from: fromIdentity,
         to: toIdentity,
-        mapping:
-          id === "affine_control"
+        mapping: intentionalGeometryChange
+          ? null
+          : id === "affine_control"
             ? {
                 kind: "affine",
                 scale: 1.5,
@@ -840,6 +908,60 @@ async function updateEdge(
         requiresPreview: true as const,
       }
     : null;
+  const sameTopologyGeometryChangeContent =
+    intentionalGeometryChange && !omitSameTopologyGeometryProof
+    ? {
+        contract:
+          "recipe-same-topology-geometry-change-proof/v1" as const,
+        mode: sameTopologyNeutralGeometryChange
+          ? ("author-intentional-neutral-geometry" as const)
+          : ("author-intentional-target-geometry" as const),
+        topologySha256: from.topologySha256,
+        skeletonHierarchySha256: from.skeletonHierarchySha256,
+        fromPhysicalBasisSha256: from.physicalBasisSha256,
+        toPhysicalBasisSha256: to.physicalBasisSha256,
+        fromBehaviorSha256: from.behaviorSha256,
+        toBehaviorSha256: to.behaviorSha256,
+        fromComponentGraphSha256: from.componentGraphSha256,
+        toComponentGraphSha256: to.componentGraphSha256,
+        affectedMeshNodeIds: ["Body"],
+        affectedComponentIds: ["component.keep"],
+        authorizedGeometryChannelKeys: [
+          canonicalRecipeString([
+            "absolute",
+            "mesh",
+            "node/v1/Body/primitive/v1/4de4e2ae593f092e4c536a903f21c78966d432fb977aef29edea6ba46112b4e5",
+            "node/v1/Body",
+            "POSITION",
+          ]),
+          ...(extraAuthorizedGeometryChannel
+            ? [
+                canonicalRecipeString([
+                  "absolute",
+                  "mesh",
+                  "node/v1/Body/primitive/v1/extra",
+                  "node/v1/Body",
+                  "POSITION",
+                ]),
+              ]
+            : []),
+        ],
+        authorityBundleSha256: await canonicalRecipeSha256({
+          fixtureSha256,
+          kind: "same-topology-geometry-authority",
+        }),
+        sourceAuditSha256: await canonicalRecipeSha256({
+          fixtureSha256,
+          kind: "source-geometry",
+        }),
+        targetAuditSha256: await canonicalRecipeSha256({
+          fixtureSha256,
+          kind: "target-geometry",
+        }),
+        requiresPreview: true as const,
+        requiresConfirmation: true as const,
+      }
+    : null;
   const provisional: RecipeUpdateEdge = {
     id: "sa090-r2-physical-fixture.v1-to-v2",
     directEdgeKey,
@@ -889,7 +1011,20 @@ async function updateEdge(
             }),
           },
         ]
-      : [],
+      : intentionalGeometryChange && !omitSameTopologyGeometryProof
+        ? [
+            {
+              code: "geometry-changed" as const,
+              message:
+                "The target intentionally changes same-topology geometry and requires Current/Updated review.",
+              requiresPreview: true as const,
+              proofSha256: await canonicalRecipeSha256({
+                fixtureSha256,
+                kind: "geometry-warning",
+              }),
+            },
+          ]
+        : [],
     ...(topologyRebuildContent
       ? {
           topologyRebuild: {
@@ -897,6 +1032,17 @@ async function updateEdge(
             proofSha256:
               await recipeTopologyRebuildProofSha256(
                 topologyRebuildContent,
+              ),
+          },
+        }
+      : {}),
+    ...(sameTopologyGeometryChangeContent
+      ? {
+          sameTopologyGeometryChange: {
+            ...sameTopologyGeometryChangeContent,
+            proofSha256:
+              await recipeSameTopologyGeometryChangeProofSha256(
+                sameTopologyGeometryChangeContent,
               ),
           },
         }
@@ -1037,6 +1183,9 @@ export async function createRecipePhysicalMigrationFixture(
         keepControlId,
         options.hairImportCompatible,
         false,
+        options.sameTopologyGeometryChange,
+        options.sameTopologyNeutralGeometryChange,
+        false,
         options.skinAppearance,
         options.skinArtworkProjection,
       ),
@@ -1049,6 +1198,9 @@ export async function createRecipePhysicalMigrationFixture(
         keepControlId,
         options.hairImportCompatible,
         options.topologyRebuild,
+        options.sameTopologyGeometryChange,
+        options.sameTopologyNeutralGeometryChange,
+        options.sameTopologyRestChange,
         options.skinAppearance,
         options.skinArtworkProjection,
       ),
@@ -1059,6 +1211,10 @@ export async function createRecipePhysicalMigrationFixture(
       options.siblingSubplans,
       keepControlId,
       options.topologyRebuild,
+      options.sameTopologyGeometryChange,
+      options.sameTopologyNeutralGeometryChange,
+      options.omitSameTopologyGeometryProof,
+      options.extraAuthorizedGeometryChannel,
     );
     const [source, target] = await Promise.all([
       finalizeSourcePackage("source", sourceDraft, []),

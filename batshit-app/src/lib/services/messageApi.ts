@@ -13,6 +13,21 @@ import {
 import { getMatrixEntries } from '$lib/stores/compatibilityMatrix.svelte'
 import { extractN8nWebhookError } from '$lib/utils/n8nWebhookResponse'
 import { resolveSubagentSlug } from '$lib/utils/subagentSlug'
+import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+
+/**
+ * SA-104 P5: chat-surface "memory inserted" stamps for the native n8n lane, keyed by
+ * assistant messageId. `sendMessage` awaits the turn-commit BEFORE consuming the
+ * webhook response body, so the stamp is always here before the end-event finalize
+ * (which can only run after body consumption) asks for it.
+ */
+const pendingMemoryInsertedByMessageId = new Map<string, Record<string, any>>()
+
+export function consumePendingMemoryInserted(messageId: string): Record<string, any> | null {
+  const stamp = pendingMemoryInsertedByMessageId.get(messageId) ?? null
+  pendingMemoryInsertedByMessageId.delete(messageId)
+  return stamp
+}
 
 export interface SendMessagePayload {
   user_message: string
@@ -350,6 +365,86 @@ export class MessageApiService {
     }
 
     return resolved as Partial<SendMessagePayload>
+  }
+
+  /**
+   * The native n8n lane's clip send-duration consumption — the exact state transition
+   * send-routed's consumePostCompileSessionClips applies on managed lanes, through the
+   * existing session-authed decrement_durations route action. A failure is loud in the
+   * console but never fails the send: the model already received the clip, and an
+   * unburned countdown for one turn is the safe direction (the same posture as the
+   * memory commit below).
+   */
+  private async consumePostSendClipDurations(sessionId: string): Promise<void> {
+    if (!sessionId) return
+    try {
+      const response = await fetch('/api/session-clips/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, action: 'decrement_durations' }),
+      })
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null)
+        console.error(
+          '[MessageAPI] Failed to consume post-send clip durations:',
+          payload?.error ?? `HTTP ${response.status}`,
+        )
+      }
+    } catch (error) {
+      console.error('[MessageAPI] Failed to consume post-send clip durations:', error)
+    }
+  }
+
+  /**
+   * SA-104 P5 (packet doc §1.9): the native n8n lane's accepted-send memory commit.
+   * Runs the same `commitMemoryTurnState` the managed lanes run in send-routed, via
+   * the session-authed turn-commit route, and stashes the result for the finalize
+   * site's "memory inserted" stamp. A failed commit is loud in the console but never
+   * fails the send — the model already has its context; the linger window simply
+   * under-ticks one turn (the safe direction).
+   */
+  private async commitMemoryTurn(
+    sessionId: string,
+    agentId: string | null,
+    currentUserMessage: string,
+    assistantMessageId: string,
+  ): Promise<void> {
+    if (!agentId || !currentUserMessage?.trim()) return
+    try {
+      const response = await fetch('/api/memory/turn-commit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, agentId, currentUserMessage }),
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) {
+        console.error(
+          '[MessageAPI] Memory turn commit failed:',
+          payload?.error ?? `HTTP ${response.status}`,
+        )
+        return
+      }
+      const insertedNew = Array.isArray(payload?.insertedNewIds) ? payload.insertedNewIds : []
+      const refreshed = Array.isArray(payload?.refreshedIds) ? payload.refreshedIds : []
+      const held = Array.isArray(payload?.heldIds) ? payload.heldIds : []
+      const items = Array.isArray(payload?.items) ? payload.items : []
+      if (
+        payload?.committed === true &&
+        insertedNew.length + refreshed.length + held.length > 0
+      ) {
+        pendingMemoryInsertedByMessageId.set(assistantMessageId, {
+          version: 1,
+          new: insertedNew.length,
+          refreshed: refreshed.length,
+          held: held.length,
+          ids: [...insertedNew, ...refreshed, ...held],
+          // Per-item rows (2026-08-28) power the chip's click-open detail popover.
+          ...(items.length > 0 ? { items } : {}),
+        })
+      }
+    } catch (error) {
+      console.error('[MessageAPI] Memory turn commit request failed:', error)
+    }
   }
 
   private async createN8nCallbackAuth(
@@ -1317,6 +1412,24 @@ export class MessageApiService {
       if (!response.ok) {
         const responseText = await response.text().catch(() => '')
         throw this.buildN8nWebhookHttpError(response.status, responseText)
+      }
+
+      // Clip send-duration consumption for the native n8n lane. Native n8n sends never
+      // pass through send-routed, so its consumePostCompileSessionClips sites cannot run
+      // here — commit aa2117b81 moved consumption server-side and orphaned this lane
+      // (clip-lifecycle.md "Native n8n send-duration consumption"). Same accepted-send
+      // boundary as send-routed: the compile already happened and the webhook accepted
+      // the send, while n8n run-lock rejection and webhook errors bail out above and
+      // never burn a countdown. Ordering matches send-routed: clips first, then memory.
+      await this.consumePostSendClipDurations(sessionId)
+
+      // SA-104 P5: accepted-send memory commit for the native n8n lane (the webhook
+      // POST was accepted; send-routed never sees native n8n sends — packet doc
+      // §1.9). Awaited BEFORE the response body is consumed, so the commit result
+      // is always stashed before the end-event finalize can read it. Memory-disabled
+      // agents skip the round-trip entirely.
+      if (resolveAgentMemoryEnabled(agent)) {
+        await this.commitMemoryTurn(sessionId, agentId ?? agent?.id ?? null, content, messageId)
       }
 
       // Check if response is JSON based on Content-Type header

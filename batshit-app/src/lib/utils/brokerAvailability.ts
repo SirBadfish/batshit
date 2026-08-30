@@ -125,6 +125,13 @@ export interface BrokerAvailabilityInput {
   /** Subagent scoping. Subagents may keep artifact runtime while losing Fabric control. */
   allowArtifactRuntimeTools?: boolean
   allowFabricControlTools?: boolean
+  /**
+   * SA-104 P3: true only for PRIMARY actors whose agent has `memory_enabled`. Memory
+   * controls (`sys.memory.*`) are a scoped first-party allowance on every runtime —
+   * the `sys.zip.fetch` precedent — so they can open the fabric family even where the
+   * broad control plane stays closed (n8n). Default false: memory is opt-in.
+   */
+  memoryControlsEnabled?: boolean
 }
 
 /**
@@ -137,6 +144,9 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   const allowArtifact = input.allowArtifactRuntimeTools !== false
   const allowFabric = input.allowFabricControlTools !== false
   const cliReachable = toggles.cliToolsEnabled && input.hasCliTools !== false
+  // Memory controls ride the Batshit Tools toggle but not the broad-control-plane gate,
+  // so a memory-enabled n8n primary reaches the fabric family even with fetch-zip off.
+  const memoryReachable = toggles.batshitToolsEnabled && input.memoryControlsEnabled === true
 
   const families: BrokerToolFamily[] = []
 
@@ -147,7 +157,7 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
     if (toggles.cliToolsEnabled) families.push('cli')
     if (toggles.artifactRuntimeEnabled) families.push('artifact')
     if (toggles.agentBrowserEnabled) families.push('agent_browser')
-    if (toggles.fetchZipEnabled) families.push('fabric')
+    if (toggles.fetchZipEnabled || memoryReachable) families.push('fabric')
     return families
   }
 
@@ -167,7 +177,7 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   if (toggles.dynamicMcpEnabled) families.push('mcp')
   if (cliReachable) families.push('cli')
   if (toggles.artifactRuntimeEnabled && allowArtifact) families.push('artifact')
-  if (toggles.fetchZipEnabled || (toggles.batshitToolsEnabled && allowFabric)) {
+  if (toggles.fetchZipEnabled || (toggles.batshitToolsEnabled && allowFabric) || memoryReachable) {
     families.push('fabric')
   }
   return families
@@ -202,6 +212,14 @@ export const BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS = [
   'sys.voice.engine.delete'
 ] as const
 
+/**
+ * SA-104 P3: the memory tool family. A scoped first-party allowance for PRIMARY actors on
+ * every runtime (n8n included) when the agent has memory enabled — deliberately outside
+ * the broad-control-plane gate, like `sys.zip.fetch`. Subagents never receive these
+ * (subagent memory access is a deferred product decision; memory is PA-owned state).
+ */
+export const BROKER_FABRIC_MEMORY_CONTROL_IDS = ['sys.memory.*'] as const
+
 export interface BrokerFabricScopeInput {
   toggles: BrokerToolToggles
   /**
@@ -214,6 +232,8 @@ export interface BrokerFabricScopeInput {
    * lane only opens it for primary actors; mode 3 opens it whenever the toggle is on.
    */
   allowFetchZip?: boolean
+  /** SA-104 P3: PRIMARY actor + agent `memory_enabled`. Default false (opt-in). */
+  memoryControlsEnabled?: boolean
 }
 
 /**
@@ -238,6 +258,14 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
       allowed.add('sys.mcp.dynamic.use')
     }
     for (const controlId of BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS) {
+      allowed.add(controlId)
+    }
+  }
+
+  // SA-104 P3: memory controls follow the Batshit Tools toggle plus per-agent memory
+  // enablement, independent of the broad-control-plane gate (n8n primaries included).
+  if (input.toggles.batshitToolsEnabled && input.memoryControlsEnabled === true) {
+    for (const controlId of BROKER_FABRIC_MEMORY_CONTROL_IDS) {
       allowed.add(controlId)
     }
   }

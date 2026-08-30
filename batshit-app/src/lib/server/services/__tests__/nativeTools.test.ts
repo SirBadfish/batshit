@@ -1483,6 +1483,48 @@ PATCH`
     expect(result.results[0].hint).toContain('query')
   })
 
+  it('Mode 3 memory scope: sys.memory.* refs appear only for memory-enabled primary contexts (SA-104 P3)', async () => {
+    const baseContext = {
+      userId: 'josh',
+      providerSettings: {
+        nativeTools: {
+          dynamicMcpEnabled: false,
+          cliToolsEnabled: false,
+          artifactRuntimeEnabled: false,
+          batshitToolsEnabled: true,
+          webSearchEnabled: false,
+          bashEnabled: false,
+          fetchZipEnabled: false
+        }
+      }
+    }
+
+    // Subagent-style caller (broad Fabric closed, memory off): no family is reachable,
+    // so the broker pair is not even registered — memory tools are structurally inert.
+    const subagentBuild = await nativeToolService.buildMode3NativeTools({
+      ...baseContext,
+      allowFabricControlTools: false,
+      memoryControlsEnabled: false
+    } as any)
+    expect((subagentBuild.tools as any).native_batshit_tool_search).toBeFalsy()
+
+    // Memory-enabled primary with the broad control plane still closed: the fabric family
+    // opens with ONLY the memory scope.
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      ...baseContext,
+      allowFabricControlTools: false,
+      memoryControlsEnabled: true
+    } as any)
+    const brokerFind = (tools as any).native_batshit_tool_search
+    expect(brokerFind).toBeTruthy()
+
+    const result = await brokerFind.execute({ query: 'memory', family: 'fabric' } as any)
+    const refs = (result.results ?? []).map((row: any) => row.ref)
+    expect(refs).toContain('fabric:sys.memory.save')
+    expect(refs).toContain('fabric:sys.memory.search')
+    expect(refs.some((ref: string) => ref.startsWith('fabric:sys.artifact.'))).toBe(false)
+  })
+
   it('Mode 3 Batshit tool use routes typed MCP refs through Dynamic MCP use metadata', async () => {
     const executeMock = vi.fn().mockResolvedValue({ ok: true })
     vi.mocked(mcpGatewayDiscovery.loadToolsForUser).mockResolvedValue({

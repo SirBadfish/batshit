@@ -1,13 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { FolderPlus, X } from '@lucide/svelte'
+  import { FolderPlus, Infinity as InfinityIcon, X } from '@lucide/svelte'
   import { Button } from '$lib/components/ui/button'
   import FolderItem from './FolderItem.svelte'
+  import SessionItem from '$lib/components/batshit-sidebar/SessionItem.svelte'
+  import * as Sidebar from '$lib/components/ui/sidebar'
   import type { ChatSessionRow } from '$lib/types/database'
   import { foldersStore } from '$lib/stores/folders.svelte'
+  import { isFixedSession } from '$lib/utils/fixedSession'
   import { toast } from 'svelte-sonner'
   import { confirmDialog } from '$lib/stores/confirmDialog'
-  
+
   interface Props {
     sessions: ChatSessionRow[]
     currentSessionId?: string
@@ -15,19 +18,31 @@
     onSessionSelect: (session: ChatSessionRow) => void
     onCreateSession: (folderId?: string, source?: string) => void
   }
-  
-  let { 
+
+  let {
     sessions = [],
     currentSessionId,
     sessionService,
     onSessionSelect,
     onCreateSession
   }: Props = $props()
-  
+
   let isCreatingFolder = $state(false)
   let newFolderName = $state('')
   let foldersForDisplay = $derived(
     foldersStore.sortFoldersForDisplay(foldersStore.folders, sessions)
+  )
+  // SA-104 P5: Infinite Sessions render in one pinned section above the folders.
+  // It is deliberately NOT a dndzone: Infinite Sessions cannot be dragged out and
+  // nothing can be dropped in — the exclusion is structural in both directions.
+  let fixedSessions = $derived(
+    sessions
+      .filter((session) => !session.archived && isFixedSession(session))
+      .sort((a, b) => {
+        const aTime = new Date(a.last_modified_at || a.created_at).getTime()
+        const bTime = new Date(b.last_modified_at || b.created_at).getTime()
+        return bTime - aTime
+      })
   )
   
   // Load folders on mount
@@ -139,6 +154,29 @@
 </script>
 
 <div class="folder-tree">
+  {#if fixedSessions.length > 0}
+    <div class="folder-tree-fixed-section" data-testid="fixed-sessions-section">
+      <div class="folder-tree-header">
+        <span class="folder-tree-title folder-tree-fixed-title">
+          <InfinityIcon class="folder-tree-fixed-icon" aria-hidden="true" />
+          Infinite Sessions
+        </span>
+      </div>
+      <Sidebar.SidebarMenu class="folder-tree-fixed-list">
+        {#each fixedSessions as session (session.id)}
+          {#if sessionService}
+            <SessionItem
+              {session}
+              isSelected={session.id === currentSessionId}
+              {sessionService}
+              isArchived={false}
+            />
+          {/if}
+        {/each}
+      </Sidebar.SidebarMenu>
+    </div>
+  {/if}
+
   <div class="folder-tree-header">
     <span class="folder-tree-title">Folders</span>
     <Button
@@ -226,6 +264,28 @@
     justify-content: space-between;
     margin-bottom: 0.25rem;
     padding: 0.25rem 0.5rem;
+  }
+
+  .folder-tree-fixed-section {
+    margin-bottom: 0.5rem;
+  }
+
+  .folder-tree-fixed-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .folder-tree-fixed-section :global(.folder-tree-fixed-icon) {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+  }
+
+  :global(.folder-tree-fixed-list) {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
   }
 
   .folder-tree-title {

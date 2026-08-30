@@ -167,4 +167,15 @@ describe('Recipe build dirty-domain classifier', () => {
       classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
     ).toEqual(['hair'])
   })
+
+  it('classifies exact first-party garment changes as Clothing work', () => {
+    const saved = state({ siblings: [] })
+    const draft = state({
+      stateSha256: HASH_B,
+      siblings: [sibling('clothingState', 'clothing-state/v1', 1, HASH_B)]
+    })
+    expect(
+      classifyRecipeBuildDirtyDomains({ savedState: saved, draftState: draft }).dirtyDomains
+    ).toEqual(['clothing'])
+  })
 })

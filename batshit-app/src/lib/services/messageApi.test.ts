@@ -205,6 +205,65 @@ describe('MessageApiService – SA-013 follow-up payload + snapshot trims', () =
     })
   })
 
+  it('consumes clip send-durations through the decrement_durations route action (native n8n accepted-send boundary)', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('/api/session-clips/state')
+      expect(init?.method).toBe('POST')
+      expect(JSON.parse(String(init?.body))).toEqual({
+        sessionId: 'sess-clips',
+        action: 'decrement_durations',
+      })
+      return {
+        ok: true,
+        json: async () => ({ sessionId: 'sess-clips', clips: [] }),
+        text: async () => '',
+      } as Response
+    })
+    global.fetch = fetchMock as typeof fetch
+
+    const service = new MessageApiService('http://example.com/webhook')
+    await (service as any).consumePostSendClipDurations('sess-clips')
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('clip consumption failures are loud but never fail the send, and no session means no call', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      // Non-ok response: logged, not thrown.
+      global.fetch = vi.fn(async () => ({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: 'boom' }),
+        text: async () => '',
+      })) as unknown as typeof fetch
+      const service = new MessageApiService('http://example.com/webhook')
+      await expect(
+        (service as any).consumePostSendClipDurations('sess-clips'),
+      ).resolves.toBeUndefined()
+      expect(consoleError).toHaveBeenCalledWith(
+        '[MessageAPI] Failed to consume post-send clip durations:',
+        'boom',
+      )
+
+      // Network error: logged, not thrown.
+      global.fetch = vi.fn(async () => {
+        throw new Error('offline')
+      }) as unknown as typeof fetch
+      await expect(
+        (service as any).consumePostSendClipDurations('sess-clips'),
+      ).resolves.toBeUndefined()
+
+      // Missing session id: no request at all.
+      const fetchMock = vi.fn()
+      global.fetch = fetchMock as unknown as typeof fetch
+      await (service as any).consumePostSendClipDurations('')
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
   it('strips n8n LangChain tool invocation traces from assistant text', () => {
     const input = [
       'Calling Batshit_Tools with input: {"action":"batshit_tool_use","input":{"ref":"mcp:read_text_file","input":{"path":"/Users/example/batshit/README.md"}},"id":"call_abc"}',

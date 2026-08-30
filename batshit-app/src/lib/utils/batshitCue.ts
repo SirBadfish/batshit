@@ -1,3 +1,9 @@
+import {
+  EMOTE_TAG_REGEX_SOURCE,
+  GOON_STAGE_DIRECTION_REGEX_SOURCE,
+  controlTag
+} from './controlTags'
+
 export type VisibleBatshitCueNote = {
   kind: 'mood'
   label: string
@@ -9,10 +15,10 @@ export type BatshitCuePayload = {
   cues: string[]
 }
 
-const CONTROL_TAG_REGEX = /<batshit-cue\b[^>]*>([\s\S]*?)<\/batshit-cue>/gi
-const EMOTE_TAG_REGEX =
-  /<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*\/>[ \t]*|<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*>[\s\S]*?<\/(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?>[ \t]*/gi
-const GOON_STAGE_DIRECTION_REGEX = /\*goon:\s*[a-zA-Z0-9 _-]+\s*\*[ \t]*/gi
+const CUE_TAG = controlTag('cue').tag
+const CONTROL_TAG_REGEX = new RegExp(`<${CUE_TAG}\\b[^>]*>([\\s\\S]*?)<\\/${CUE_TAG}>`, 'gi')
+const EMOTE_TAG_REGEX = new RegExp(EMOTE_TAG_REGEX_SOURCE, 'gi')
+const GOON_STAGE_DIRECTION_REGEX = new RegExp(GOON_STAGE_DIRECTION_REGEX_SOURCE, 'gi')
 
 function normalizeControlString(value: unknown): string | null {
   if (typeof value !== 'string') return null

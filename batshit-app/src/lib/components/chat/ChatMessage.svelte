@@ -8,6 +8,7 @@
   import MessageHeader from './MessageHeader.svelte'
   import LoadingIndicator from './LoadingIndicator.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
+  import * as DropdownMenu from '$lib/components/ui/dropdown-menu'
   import * as agentStore from '$lib/stores/agents.svelte'
   import { page } from '$app/state'
   import { Button } from '$lib/components/ui/button'
@@ -35,7 +36,7 @@
     getProviderOptionsFor,
     normalizeAgentVoiceProfile
   } from '$lib/utils/voiceSchema'
-  import { Archive, ChevronDown, TriangleAlert } from '@lucide/svelte'
+  import { Archive, Brain, ChevronDown, TriangleAlert } from '@lucide/svelte'
   import { DEFAULT_AGENT_ICON_REF } from '$lib/icons/iconCatalog'
   import { normalizeIconRef } from '$lib/icons/iconLegacy'
 
@@ -86,6 +87,10 @@
     return typeof kind === 'string' ? kind : ''
   })
   const isCompactSummary = $derived(Boolean((message.metadata as any)?.contextCompactSummary))
+  // SA-104 P6: graduation splices reuse the compact-summary row with their own label.
+  const isGraduationSummary = $derived(
+    Boolean((message.metadata as any)?.fixedSessionGraduation)
+  )
   const compactSummaryMessageCount = $derived.by(() => {
     const value = (message.metadata as any)?.compactedMessageCount
     return typeof value === 'number' && Number.isFinite(value)
@@ -194,8 +199,96 @@
         ? (message.metadata as any).zipControl.toolNotes
         : []
   )
+  const controlErrors = $derived(
+    isAI && Array.isArray((message.metadata as any)?.controlErrors)
+      ? ((message.metadata as any).controlErrors as Array<{
+          tag?: string
+          error?: string
+          hint?: string
+        }>)
+      : []
+  )
+  const hasControlErrors = $derived(controlErrors.length > 0)
   const hasToolResultsSummary = $derived(isAI && toolResultsSummary.length > 0)
   let showToolResultsSummary = $state(false)
+
+  // SA-104 P5: subtle memory affordances — saves (metadata.memorySaves, P3) and the
+  // accepted-send insert stamp (metadata.memoryInserted). Quiet chips, detail in the
+  // title tooltip; the Execution Viewer and Memory Panel own the full picture.
+  const memorySaves = $derived(
+    isAI && Array.isArray((message.metadata as any)?.memorySaves)
+      ? ((message.metadata as any).memorySaves as Array<{
+          id?: string
+          lane?: string
+          gist?: string
+          trigger_terms?: string[]
+        }>)
+      : []
+  )
+  const memoryInserted = $derived.by(() => {
+    if (!isAI) return null
+    const stamp = (message.metadata as any)?.memoryInserted
+    if (!stamp || typeof stamp !== 'object') return null
+    const total =
+      (Number(stamp.new) || 0) + (Number(stamp.refreshed) || 0) + (Number(stamp.held) || 0)
+    return total > 0 ? { ...stamp, total } : null
+  })
+  // Per-item rows (2026-08-28) for the chip's click-open popover; older messages
+  // carry counts only and fall back to the summary line.
+  const memoryInsertedItems = $derived.by(() => {
+    const items = memoryInserted?.items
+    if (!Array.isArray(items)) return []
+    return items.filter((item: any) => item && typeof item === 'object') as Array<{
+      id?: string
+      lane?: string
+      source?: string
+      status?: string
+      gist?: string
+      segment?: boolean
+      matchedTerms?: string[]
+      triggerTerms?: string[]
+      turnsRemaining?: number
+      holdEpisode?: boolean
+    }>
+  })
+  const memoryInsertedSummary = $derived.by(() => {
+    if (!memoryInserted) return ''
+    const parts: string[] = []
+    if (memoryInserted.new) parts.push(`${memoryInserted.new} new`)
+    if (memoryInserted.refreshed) parts.push(`${memoryInserted.refreshed} refreshed`)
+    if (memoryInserted.held) parts.push(`${memoryInserted.held} still lingering`)
+    return parts.join(', ')
+  })
+  function memoryLaneLabel(lane: string | undefined): string {
+    return lane === 'awareness' ? 'Awareness' : lane === 'stm' ? 'STM' : 'LTM'
+  }
+  /** The trigger word shown as a little badge on STM rows (first matched, else first stored). */
+  function memoryItemTriggerWord(item: { matchedTerms?: string[]; triggerTerms?: string[] }): string | null {
+    return item.matchedTerms?.[0] ?? item.triggerTerms?.[0] ?? null
+  }
+  function memoryItemStatusLabel(item: {
+    source?: string
+    segment?: boolean
+    status?: string
+    turnsRemaining?: number
+    holdEpisode?: boolean
+  }): string {
+    const status =
+      item.status === 'new'
+        ? 'new this turn'
+        : item.status === 'refreshed'
+          ? 'refreshed'
+          : item.holdEpisode
+            ? 'lingering for the rest of this episode'
+            : typeof item.turnsRemaining === 'number'
+              ? `lingering, ${item.turnsRemaining} message${item.turnsRemaining === 1 ? '' : 's'} left`
+              : 'lingering'
+    if (item.source === 'recall') {
+      return `${item.segment ? 'recalled episode summary' : 'recalled by search'} · ${status}`
+    }
+    return status
+  }
+  const hasMemoryAffordances = $derived(memorySaves.length > 0 || memoryInserted !== null)
 
   const showPlan = $derived(
     isAI && (planItems.length > 0 || Boolean(planSummary))
@@ -857,14 +950,22 @@
     <details class="compact-summary-event">
       <summary class="compact-summary-trigger">
         <span class="compact-summary-icon" aria-hidden="true">
-          <Archive />
+          {#if isGraduationSummary}
+            <Brain />
+          {:else}
+            <Archive />
+          {/if}
         </span>
         <span class="compact-summary-copy">
-          <span class="compact-summary-title">Context Compact Summary</span>
+          <span class="compact-summary-title">
+            {isGraduationSummary ? 'Graduated Episode' : 'Context Compact Summary'}
+          </span>
           <span class="compact-summary-meta">
             {compactSummaryMessageCount > 0
-              ? `${compactSummaryMessageCount} message${compactSummaryMessageCount === 1 ? '' : 's'} summarized`
-              : 'Older context summarized'}
+              ? `${compactSummaryMessageCount} message${compactSummaryMessageCount === 1 ? '' : 's'} ${isGraduationSummary ? 'graduated to memory' : 'summarized'}`
+              : isGraduationSummary
+                ? 'Episode graduated to memory'
+                : 'Older context summarized'}
             · {timestamp}
           </span>
         </span>
@@ -1009,6 +1110,24 @@
           </div>
         {/if}
 
+        {#if hasControlErrors && !shouldShowLoading}
+          <div class="message-control-error-banner" data-testid="message-control-error-banner">
+            <div class="message-control-error-heading">
+              <TriangleAlert class="message-control-error-icon" aria-hidden="true" />
+              <span>
+                {controlErrors.length === 1
+                  ? 'A control block in this response was malformed and did not apply'
+                  : 'Control blocks in this response were malformed and did not apply'}
+              </span>
+            </div>
+            {#each controlErrors as entry, idx (idx)}
+              <p class="message-control-error-detail">
+                <span class="message-control-error-tag">{`<${entry.tag || 'unknown'}>`}</span>: {entry.error || 'malformed control block'}
+              </p>
+            {/each}
+          </div>
+        {/if}
+
         {#if hasToolResultsSummary && !shouldShowLoading}
           <div class="message-tool-summary">
             {#if showToolResultsSummary}
@@ -1048,6 +1167,76 @@
             >
               <ChevronDown class={`message-tool-summary-chevron ${showToolResultsSummary ? 'is-open' : ''}`} />
             </button>
+          </div>
+        {/if}
+
+        {#if hasMemoryAffordances && !shouldShowLoading}
+          <div class="message-memory-affordances" data-testid="message-memory-affordances">
+            {#if memorySaves.length > 0}
+              <DropdownMenu.Root>
+                <DropdownMenu.Trigger class="message-memory-chip" aria-label="Show saved memories">
+                  <Brain class="message-memory-chip-icon" aria-hidden="true" />
+                  {memorySaves.length === 1 ? 'Memory saved' : `${memorySaves.length} memories saved`}
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Content
+                  align="start"
+                  side="top"
+                  class="batshit-settings-info-content batshit-settings-card-elevated batshit-settings-card-info-callout z-[var(--z-popover)] w-96 message-memory-popover"
+                >
+                  <p class="message-memory-popover-title">Saved this turn:</p>
+                  {#each memorySaves as save, idx (save.id ?? idx)}
+                    <div class="message-memory-popover-row">
+                      <span class="message-memory-popover-lane">{memoryLaneLabel(save.lane)}</span>
+                      <span class="message-memory-popover-gist">
+                        <span>
+                          {#if save.trigger_terms?.[0]}
+                            <span class="batshit-settings-status-badge is-accent message-memory-popover-trigger">{save.trigger_terms[0]}</span>
+                          {/if}
+                          {save.gist ?? save.id ?? 'saved'}
+                        </span>
+                      </span>
+                    </div>
+                  {/each}
+                </DropdownMenu.Content>
+              </DropdownMenu.Root>
+            {/if}
+            {#if memoryInserted}
+              <DropdownMenu.Root>
+                <DropdownMenu.Trigger class="message-memory-chip" aria-label="Show surfaced memories">
+                  <Brain class="message-memory-chip-icon" aria-hidden="true" />
+                  {memoryInserted.total === 1
+                    ? '1 memory surfaced'
+                    : `${memoryInserted.total} memories surfaced`}
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Content
+                  align="start"
+                  side="top"
+                  class="batshit-settings-info-content batshit-settings-card-elevated batshit-settings-card-info-callout z-[var(--z-popover)] w-96 message-memory-popover"
+                >
+                  <p class="message-memory-popover-title">Surfaced this turn:</p>
+                  {#if memoryInsertedItems.length > 0}
+                    {#each memoryInsertedItems as item, idx (item.id ?? idx)}
+                      <div class="message-memory-popover-row">
+                        <span class="message-memory-popover-lane">{item.segment ? 'History' : memoryLaneLabel(item.lane)}</span>
+                        <span class="message-memory-popover-gist">
+                          <span>
+                            {#if memoryItemTriggerWord(item)}
+                              <span class="batshit-settings-status-badge is-accent message-memory-popover-trigger">{memoryItemTriggerWord(item)}</span>
+                            {/if}
+                            {item.gist ?? item.id}
+                          </span>
+                          <span class="message-memory-popover-status">
+                            {memoryItemStatusLabel(item)}
+                          </span>
+                        </span>
+                      </div>
+                    {/each}
+                  {:else}
+                    <p class="message-memory-popover-status">{memoryInsertedSummary}</p>
+                  {/if}
+                </DropdownMenu.Content>
+              </DropdownMenu.Root>
+            {/if}
           </div>
         {/if}
 
@@ -1315,6 +1504,127 @@
     line-height: 1.4;
     color: oklch(from var(--foreground) l c h / 0.75);
     overflow-wrap: anywhere;
+  }
+
+  .message-control-error-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-top: 0.75rem;
+    border: 1px solid oklch(from var(--destructive) l c h / 0.3);
+    border-radius: var(--radius);
+    background: oklch(from var(--destructive) l c h / 0.05);
+    padding: 0.5rem 0.75rem;
+  }
+
+  .message-control-error-heading {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--destructive);
+  }
+
+  .message-control-error-banner :global(.message-control-error-icon) {
+    width: 0.8125rem;
+    height: 0.8125rem;
+    flex-shrink: 0;
+  }
+
+  .message-control-error-detail {
+    margin: 0;
+    font-size: 0.71875rem;
+    line-height: 1.4;
+    color: oklch(from var(--foreground) l c h / 0.7);
+    overflow-wrap: anywhere;
+  }
+
+  .message-control-error-tag {
+    font-family: var(--font-mono, 'Geist Mono', monospace);
+    font-size: 0.6875rem;
+  }
+
+  .message-memory-affordances {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+    margin-top: 0.5rem;
+  }
+
+  /* The chips are DropdownMenu triggers (click-open detail popovers, 2026-08-28),
+     so the class rides a component prop and needs :global. */
+  .message-memory-affordances :global(.message-memory-chip) {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    height: 1.25rem;
+    padding: 0 0.5rem;
+    border: 1px solid oklch(from var(--muted-foreground) l c h / 0.25);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 0.6875rem;
+    font-weight: 500;
+    line-height: 1.25rem;
+    cursor: pointer;
+  }
+
+  .message-memory-affordances :global(.message-memory-chip:hover) {
+    background: oklch(from var(--muted-foreground) l c h / 0.08);
+  }
+
+  .message-memory-affordances :global(.message-memory-chip .message-memory-chip-icon) {
+    width: 0.75rem;
+    height: 0.75rem;
+    flex-shrink: 0;
+  }
+
+  :global(.message-memory-popover) {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+
+  :global(.message-memory-popover .message-memory-popover-title) {
+    margin: 0;
+    font-size: 0.74rem;
+    font-weight: 500;
+    color: var(--foreground);
+  }
+
+  :global(.message-memory-popover .message-memory-popover-trigger) {
+    margin-right: 0.3rem;
+    vertical-align: 0.06rem;
+  }
+
+  :global(.message-memory-popover .message-memory-popover-row) {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.45rem;
+  }
+
+  :global(.message-memory-popover .message-memory-popover-lane) {
+    flex-shrink: 0;
+    min-width: 3.6rem;
+    font-size: 0.68rem;
+    font-weight: 500;
+    color: var(--muted-foreground);
+  }
+
+  :global(.message-memory-popover .message-memory-popover-gist) {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    font-size: 0.78rem;
+    font-weight: 300;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  :global(.message-memory-popover .message-memory-popover-status) {
+    font-size: 0.68rem;
+    color: var(--muted-foreground);
   }
 
   .message-tool-summary-heading {

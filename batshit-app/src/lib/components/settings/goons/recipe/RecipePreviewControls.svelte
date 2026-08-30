@@ -75,11 +75,11 @@
   </div>
 
   {#if view === 'current'}
-    <div class="batshit-settings-empty-state min-h-0 py-5">
+    <div class="batshit-settings-empty-state is-compact">
       Updated-side adjustments become available after you switch to Updated.
     </div>
   {:else if safeControls.length === 0}
-    <div class="batshit-settings-empty-state min-h-0 py-5">
+    <div class="batshit-settings-empty-state is-compact">
       This verified update has no new or reset controls to adjust.
     </div>
   {:else}

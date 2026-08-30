@@ -1,4 +1,13 @@
 import { normalizeId } from './idNormalizer'
+import {
+  EMOTE_TAG_REGEX_SOURCE,
+  GOON_STAGE_DIRECTION_REGEX_SOURCE,
+  INCOMPLETE_EMOTE_TAG_REGEX_SOURCE,
+  closeTagRegex,
+  controlTag,
+  renderHiddenOpenRegex,
+  splitTrailingPartialControlPrefix
+} from './controlTags'
 
 export type ZipControlToolSummary = {
   toolCallId?: string
@@ -9,7 +18,21 @@ export type ZipControlToolSummary = {
 export type ZipControlPayload = {
   unzip: string[]
   zip: string[]
+  /**
+   * SA-104 P1 clean break: Tool Notes have their own `<batshit-tool-notes>` tag
+   * and no longer ride the zip-control payload. This field stays as the parsed
+   * NOTES payload shape (the storage location `metadata.zipControl` is
+   * unchanged), but `extractZipControl` no longer fills it — see
+   * `extractToolNotes` and `legacyNotesDropped`.
+   */
   toolResultsSummary: ZipControlToolSummary[]
+  /** Legacy note keys were present in the zip-control payload and were dropped (loudly). */
+  legacyNotesDropped?: boolean
+  parseError?: string
+}
+
+export type ToolNotesPayload = {
+  notes: ZipControlToolSummary[]
   parseError?: string
 }
 
@@ -17,11 +40,22 @@ export type ZipControlResolveOptions = {
   currentToolZipIds?: string[]
 }
 
-const ZIP_CONTROL_TAG = 'batshit-zip-control'
+const ZIP_CONTROL_TAG = controlTag('zip-control').tag
+const TOOL_NOTES_TAG = controlTag('tool-notes').tag
+const MEMORY_CONTROL_TAG = controlTag('memory').tag
 const ZIP_CONTROL_REGEX = new RegExp(`<${ZIP_CONTROL_TAG}>([\\s\\S]*?)<\\/${ZIP_CONTROL_TAG}>`, 'gi')
-const BARE_ZIP_CONTROL_KEYS = new Set([
-  'unzip',
-  'zip',
+const TOOL_NOTES_REGEX = new RegExp(`<${TOOL_NOTES_TAG}>([\\s\\S]*?)<\\/${TOOL_NOTES_TAG}>`, 'gi')
+// SA-104 P3: compileForAI strips consumed memory-save blocks with the other bulky
+// control blocks so saved-tag payloads never re-enter AI history. Parsing lives in
+// $lib/utils/memoryControl.ts.
+const MEMORY_CONTROL_REGEX = new RegExp(
+  `<${MEMORY_CONTROL_TAG}\\b[^>]*>[\\s\\S]*?<\\/${MEMORY_CONTROL_TAG}>`,
+  'gi'
+)
+// Zip-action keys only. Legacy note keys are recognized separately so old
+// content still hides and the drop is loud, never silent.
+const BARE_ZIP_CONTROL_KEYS = new Set(['unzip', 'zip'])
+const LEGACY_NOTE_KEYS = new Set([
   'toolResultsSummary',
   'tool_results_summary',
   'toolNotes',
@@ -54,13 +88,12 @@ const BARE_CUE_CONTROL_KEYS = new Set([
 const BARE_CUE_SPECIFIC_KEYS = new Set(
   Array.from(BARE_CUE_CONTROL_KEYS).filter((key) => key !== 'mood')
 )
-const STREAMING_HIDDEN_BLOCK_OPEN_REGEX =
-  /<(batshit-zip-control|batshit-cue|batshit-group)\b[^>]*>/i
-const STREAMING_EMOTE_TAG_REGEX =
-  /<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*\/>[ \t]*|<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*>[\s\S]*?<\/(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?>[ \t]*/gi
-const STREAMING_INCOMPLETE_EMOTE_REGEX =
-  /<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*$/i
-const STREAMING_GOON_STAGE_DIRECTION_REGEX = /\*goon:\s*[a-zA-Z0-9 _-]+\s*\*[ \t]*/gi
+// Derived from the control-tag registry (SA-104 P1): registering a tag there is
+// enough to hide it here — no per-site list to update.
+const STREAMING_HIDDEN_BLOCK_OPEN_REGEX = renderHiddenOpenRegex()
+const STREAMING_EMOTE_TAG_REGEX = new RegExp(EMOTE_TAG_REGEX_SOURCE, 'gi')
+const STREAMING_INCOMPLETE_EMOTE_REGEX = new RegExp(INCOMPLETE_EMOTE_TAG_REGEX_SOURCE, 'i')
+const STREAMING_GOON_STAGE_DIRECTION_REGEX = new RegExp(GOON_STAGE_DIRECTION_REGEX_SOURCE, 'gi')
 
 function normalizeStringList(value: unknown): string[] {
   if (!value) return []
@@ -190,15 +223,30 @@ export function normalizeZipControlPayload(raw: unknown): ZipControlPayload | nu
   const record = raw as Record<string, any>
   const unzip = normalizeStringList(record.unzip)
   const zip = normalizeStringList(record.zip)
-  const toolResultsSummary = normalizeToolResultsSummary(
-    record.toolResultsSummary ??
+  // SA-104 P1 clean break: zip-control payloads no longer carry Tool Notes.
+  // Legacy note keys are detected (so the drop can surface loudly) but never
+  // silently absorbed into the payload.
+  const hadLegacyNotes = Object.keys(record).some((key) => LEGACY_NOTE_KEYS.has(key))
+  return {
+    unzip,
+    zip,
+    toolResultsSummary: [],
+    ...(hadLegacyNotes ? { legacyNotesDropped: true as const } : {})
+  }
+}
+
+export function normalizeToolNotesPayload(raw: unknown): ToolNotesPayload | null {
+  if (!raw || typeof raw !== 'object') return null
+  const record = raw as Record<string, any>
+  const notes = normalizeToolResultsSummary(
+    record.notes ??
+      record.toolResultsSummary ??
       record.tool_results_summary ??
       record.toolNotes ??
       record.tool_notes ??
-      record.notes ??
       record.toolNotesList
   )
-  return { unzip, zip, toolResultsSummary }
+  return { notes }
 }
 
 function isBareZipControlRecord(value: unknown): value is Record<string, any> {
@@ -206,21 +254,27 @@ function isBareZipControlRecord(value: unknown): value is Record<string, any> {
   const record = value as Record<string, any>
   const keys = Object.keys(record)
   if (keys.length === 0) return false
-  if (keys.some((key) => !BARE_ZIP_CONTROL_KEYS.has(key))) return false
+  // Legacy note keys still count as zip-control-shaped so old bare payloads
+  // keep hiding from render; extraction routes/drops them loudly.
+  if (keys.some((key) => !BARE_ZIP_CONTROL_KEYS.has(key) && !LEGACY_NOTE_KEYS.has(key))) {
+    return false
+  }
 
   return (
     Object.prototype.hasOwnProperty.call(record, 'unzip') ||
-    Object.prototype.hasOwnProperty.call(record, 'toolResultsSummary') ||
-    Object.prototype.hasOwnProperty.call(record, 'tool_results_summary') ||
-    Object.prototype.hasOwnProperty.call(record, 'toolNotes') ||
-    Object.prototype.hasOwnProperty.call(record, 'tool_notes') ||
-    Object.prototype.hasOwnProperty.call(record, 'notes') ||
-    Object.prototype.hasOwnProperty.call(record, 'toolNotesList') ||
-    Array.isArray(record.zip)
+    Array.isArray(record.zip) ||
+    keys.some((key) => LEGACY_NOTE_KEYS.has(key))
   )
 }
 
-type BareHiddenControlKind = 'zip' | 'cue' | 'group'
+function isBareToolNotesRecord(value: unknown): value is Record<string, any> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, any>
+  const keys = Object.keys(record)
+  return keys.length === 1 && keys[0] === 'notes' && Array.isArray(record.notes)
+}
+
+type BareHiddenControlKind = 'zip' | 'tool-notes' | 'cue' | 'group'
 
 function isBareCueControlRecord(value: unknown): value is Record<string, any> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -247,6 +301,11 @@ function parseBareHiddenControlRecord(
 ): { kind: BareHiddenControlKind; payload?: ZipControlPayload } | null {
   try {
     const parsed = JSON.parse(raw)
+    // Notes-only records are the tool-notes kind; check before zip because the
+    // zip matcher tolerates legacy note keys for hiding purposes.
+    if ((!allowedKind || allowedKind === 'tool-notes') && isBareToolNotesRecord(parsed)) {
+      return { kind: 'tool-notes' }
+    }
     if ((!allowedKind || allowedKind === 'zip') && isBareZipControlRecord(parsed)) {
       const normalized = normalizeZipControlPayload(parsed)
       if (normalized) return { kind: 'zip', payload: normalized }
@@ -331,6 +390,38 @@ function extractTrailingBareZipControl(content: string): {
   return extractTrailingBareHiddenControl(content, 'zip')
 }
 
+function extractTrailingBareToolNotes(content: string): {
+  cleaned: string
+  payload?: ToolNotesPayload
+} | null {
+  const starts: number[] = []
+  for (let index = content.indexOf('{'); index >= 0; index = content.indexOf('{', index + 1)) {
+    starts.push(index)
+  }
+
+  for (const start of starts) {
+    const prefix = content.slice(0, start)
+    if (prefix.trim().length > 0 && !/\n\s*$/.test(prefix)) continue
+
+    const raw = content.slice(start).trim()
+    if (!raw.endsWith('}')) continue
+
+    try {
+      const parsed = JSON.parse(raw)
+      if (isBareToolNotesRecord(parsed)) {
+        const normalized = normalizeToolNotesPayload(parsed)
+        if (normalized) {
+          return { cleaned: prefix.replace(/\n{3,}/g, '\n\n').trim(), payload: normalized }
+        }
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return null
+}
+
 function stripBareHiddenControlPayloads(content: string): string {
   let output = content
   let guard = 0
@@ -355,14 +446,17 @@ function stripBareHiddenControlPayloads(content: string): string {
 
 export function stripZipControlBlocks(content: string): string {
   if (!content) return content
-  const stripped = content.replace(ZIP_CONTROL_REGEX, '').replace(/\n{3,}/g, '\n\n').trim()
+  const stripped = content
+    .replace(ZIP_CONTROL_REGEX, '')
+    .replace(TOOL_NOTES_REGEX, '')
+    .replace(MEMORY_CONTROL_REGEX, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
   return stripBareHiddenControlPayloads(stripped)
 }
 
 function closeRegexForStreamingHiddenTag(tag: string): RegExp {
-  if (tag === ZIP_CONTROL_TAG) return /<\/batshit-zip-control>/i
-  if (tag === 'batshit-group') return /<\/batshit-group>/i
-  return /<\/batshit-cue>/i
+  return closeTagRegex(tag)
 }
 
 function normalizeHiddenControlWhitespace(content: string): string {
@@ -397,6 +491,11 @@ export function hideStreamingHiddenControlBlocks(content: string): string {
     output = `${output.slice(0, openMatch.index)}${output.slice(blockEndIndex)}`
   }
 
+  // Chunk-split safety (SA-104 P1): a trailing partial opening tag such as
+  // `<batshit-cu` must never flash as literal text between chunks. Hold it back;
+  // the next accumulated pass sees the completed tag and hides the whole block.
+  output = splitTrailingPartialControlPrefix(output).visible
+
   const cleaned = normalizeHiddenControlWhitespace(
     output
       .replace(STREAMING_EMOTE_TAG_REGEX, '')
@@ -404,6 +503,57 @@ export function hideStreamingHiddenControlBlocks(content: string): string {
       .replace(STREAMING_GOON_STAGE_DIRECTION_REGEX, '')
   )
   return stripBareHiddenControlPayloads(cleaned)
+}
+
+/**
+ * Extract the last `<batshit-tool-notes>` block (or a trailing bare
+ * `{"notes":[...]}` payload) from a message. `cleaned` removes only tool-notes
+ * blocks so callers can chain zip-control extraction afterwards.
+ */
+export function extractToolNotes(content: string): {
+  cleaned: string
+  payload?: ToolNotesPayload
+  parseError?: string
+  hadBlock: boolean
+} {
+  if (!content) {
+    return { cleaned: content, hadBlock: false }
+  }
+
+  const matches = Array.from(content.matchAll(TOOL_NOTES_REGEX))
+  if (matches.length === 0) {
+    const bare = extractTrailingBareToolNotes(content)
+    if (bare) {
+      return { cleaned: bare.cleaned, payload: bare.payload, hadBlock: true }
+    }
+    return { cleaned: content, hadBlock: false }
+  }
+
+  const raw = matches[matches.length - 1]?.[1]?.trim() || ''
+  const cleaned = content.replace(TOOL_NOTES_REGEX, '').replace(/\n{3,}/g, '\n\n').trim()
+
+  if (!raw) {
+    return { cleaned, hadBlock: true }
+  }
+
+  try {
+    const parsed = JSON.parse(raw)
+    const normalized = normalizeToolNotesPayload(parsed)
+    if (!normalized || (Array.isArray((parsed as any)?.notes) === false && normalized.notes.length === 0)) {
+      return {
+        cleaned,
+        hadBlock: true,
+        parseError: 'Tool Notes block must be a JSON object like {"notes":[{"toolName":"...","summary":"..."}]}.'
+      }
+    }
+    return { cleaned, payload: normalized, hadBlock: true }
+  } catch (error) {
+    return {
+      cleaned,
+      hadBlock: true,
+      parseError: error instanceof Error ? error.message : 'Failed to parse Tool Notes block.'
+    }
+  }
 }
 
 export function extractZipControl(content: string): {

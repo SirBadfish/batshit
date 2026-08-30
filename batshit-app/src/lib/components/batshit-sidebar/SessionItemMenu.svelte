@@ -5,6 +5,7 @@
     Check,
     Edit2,
     FileText,
+    Infinity as InfinityIcon,
     Lock,
     MoreHorizontal,
     Save,
@@ -30,10 +31,22 @@
     isSessionLocked: boolean
     lockUpdatePending: boolean
     isArchived: boolean
+    isSessionFixed: boolean
+    canBecomeFixed: boolean
+    fixedUpdatePending: boolean
+    groupChatEnabled: boolean
+    episodeSummary: {
+      openedAt: string | null
+      holdUntil: string | null
+      closedCount: number
+      hasWhiteboard: boolean
+      whiteboardUpdatedAt: string | null
+    } | null
     onMenuOpenChange: (open: boolean) => void | Promise<void>
     onNameSave: () => void | Promise<void>
     onIdSave: () => void | Promise<void>
     onLockToggle: (checked: boolean) => void | Promise<void>
+    onFixedRequest: () => void
     onViewMarkdown: (mode: MarkdownViewMode) => void | Promise<void>
     onArchive: () => void | Promise<void>
     onUnarchive: () => void | Promise<void>
@@ -53,15 +66,28 @@
     isSessionLocked,
     lockUpdatePending,
     isArchived,
+    isSessionFixed,
+    canBecomeFixed,
+    fixedUpdatePending,
+    groupChatEnabled,
+    episodeSummary,
     onMenuOpenChange,
     onNameSave,
     onIdSave,
     onLockToggle,
+    onFixedRequest,
     onViewMarkdown,
     onArchive,
     onUnarchive,
     onDelete
   }: Props = $props()
+
+  function formatEpisodeDate(value: string | null): string {
+    if (!value) return ''
+    const parsed = new Date(value)
+    if (!Number.isFinite(parsed.getTime())) return ''
+    return parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+  }
 </script>
 
 <DropdownMenu.Root onOpenChange={onMenuOpenChange}>
@@ -166,6 +192,61 @@
           checked={isSessionLocked}
           disabled={lockUpdatePending}
           onCheckedChange={(checked) => onLockToggle(Boolean(checked))}
+        />
+      </div>
+    </div>
+
+    <DropdownMenu.Separator />
+
+    <div class="session-menu-section">
+      <div class="session-menu-lock-row">
+        <div class="session-menu-lock-copy">
+          <div class="session-menu-label-row">
+            <InfinityIcon class="session-menu-icon" />
+            <span>Infinite Session</span>
+          </div>
+          {#if isSessionFixed}
+            <p class="session-menu-note">Infinite Sessions cannot convert back to regular chats.</p>
+            {#if episodeSummary}
+              <p class="session-menu-note">
+                {#if episodeSummary.openedAt}
+                  Episode open since {formatEpisodeDate(episodeSummary.openedAt)}{episodeSummary.holdUntil
+                    ? `, continuing (held until ${formatEpisodeDate(episodeSummary.holdUntil)})`
+                    : ''}.
+                {:else}
+                  No open episode yet.
+                {/if}
+                {#if episodeSummary.closedCount > 0}
+                  {episodeSummary.closedCount} earlier episode{episodeSummary.closedCount === 1 ? '' : 's'}.
+                {/if}
+                {#if episodeSummary.hasWhiteboard}
+                  Whiteboard active{episodeSummary.whiteboardUpdatedAt
+                    ? ` (updated ${formatEpisodeDate(episodeSummary.whiteboardUpdatedAt)})`
+                    : ''}.
+                {/if}
+              </p>
+            {/if}
+          {:else if checkingMessageState}
+            <p class="session-menu-note">Checking if this chat can become an Infinite Session...</p>
+          {:else if canBecomeFixed}
+            <p class="session-menu-note">
+              One agent, one ongoing conversation. One-way: it cannot go back to a regular chat.
+            </p>
+          {:else if groupChatEnabled}
+            <p class="session-menu-note">Group chats cannot become Infinite Sessions.</p>
+          {:else}
+            <p class="session-menu-note">
+              Only a chat with no messages yet can become an Infinite Session.
+            </p>
+          {/if}
+        </div>
+        <Switch.Root
+          checked={isSessionFixed}
+          disabled={isSessionFixed || !canBecomeFixed || checkingMessageState || fixedUpdatePending}
+          onCheckedChange={(checked) => {
+            if (checked && !isSessionFixed) onFixedRequest()
+          }}
+          data-testid={`session-fixed-toggle-${sessionId}`}
         />
       </div>
     </div>

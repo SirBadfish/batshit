@@ -715,7 +715,7 @@
                       </SettingsInfoMenu>
                     </div>
                   </div>
-                  <div class="batshit-settings-form-control">
+                  <div class="batshit-settings-form-control is-wide">
                     <Input
                       id="tunnel-url"
                       bind:value={clipSettings.tunnelUrl}
@@ -818,7 +818,7 @@
                         </SettingsInfoMenu>
                       </div>
                     </div>
-                    <div class="batshit-settings-form-control">
+                    <div class="batshit-settings-form-control is-wide">
                       <Input
                         id="cloudflared-target-url"
                         bind:value={clipSettings.cloudflaredTargetUrl}

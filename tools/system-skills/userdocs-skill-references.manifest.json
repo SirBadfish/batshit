@@ -23,6 +23,7 @@
         { "source": "chat/clips-manager.md", "reference": "chat-clips-manager.md" },
         { "source": "chat/compact-and-trim.md", "reference": "chat-compact-and-trim.md" },
         { "source": "chat/execution-viewer.md", "reference": "chat-execution-viewer.md" },
+        { "source": "chat/memory-and-infinite-sessions.md", "reference": "chat-memory-and-infinite-sessions.md" },
         { "source": "chat/overview.md", "reference": "chat-overview.md" },
         { "source": "chat/sessions-sidebar.md", "reference": "chat-sessions-sidebar.md" },
         { "source": "chat/zip-manager.md", "reference": "chat-zip-manager.md" },

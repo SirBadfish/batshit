@@ -1,24 +1,14 @@
 import { GOON_RECIPE_OWNER_V2_CONTRACT } from '$lib/goons/recipe'
+import { RECIPE_MANAGED_GOON_FIELDS } from '$lib/goons/recipe/recipeManagedGoonFields'
 import type { GoonRecord } from '$lib/types/goons'
 
-export const RECIPE_MANAGED_GOON_FIELDS = [
-  'recipe',
-  'customAvatar',
-  'appearanceDials',
-  'facialArtwork',
-  'eyeAppearance',
-  'oralAppearance',
-  'lipArtwork',
-  'lipArtworkPresence',
-  'nailSurface',
-  'nailSurfacePresence',
-  'skinAppearance',
-  'skinMaterialArtwork',
-  'hairState',
-  'recipeFitReceipts'
-] as const
+export { RECIPE_MANAGED_GOON_FIELDS }
 
 const IDENTITY_FIELDS = ['id', 'user_id', 'created_at', 'updated_at'] as const
+const RECIPE_MANAGED_FIELD_LUA_CONDITION = RECIPE_MANAGED_GOON_FIELDS
+  .slice(1)
+  .map((field) => `field == '${field}'`)
+  .join(' or ')
 
 export type GoonMutationErrorCode =
   | 'NOT_FOUND'
@@ -65,7 +55,7 @@ for index = 3, #ARGV, 2 do
     return 'RESERVED_FIELD'
   end
   if recipeManaged then
-    if field == 'customAvatar' or field == 'appearanceDials' or field == 'facialArtwork' or field == 'eyeAppearance' or field == 'oralAppearance' or field == 'lipArtwork' or field == 'lipArtworkPresence' or field == 'nailSurface' or field == 'nailSurfacePresence' or field == 'skinAppearance' or field == 'skinMaterialArtwork' or field == 'hairState' or field == 'recipeFitReceipts' then
+    if ${RECIPE_MANAGED_FIELD_LUA_CONDITION} then
       return 'RECIPE_MANAGED_FIELD'
     end
   end

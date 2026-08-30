@@ -201,6 +201,9 @@
     activeJobs?: number | null
     logPath?: string | null
     pid?: number | null
+    updateAvailable?: boolean
+    installedVersion?: string | null
+    targetVersion?: string | null
     server?: {
       managed: boolean
       status: 'ready' | 'not-managed' | 'not-installed' | 'unreachable' | 'starting' | 'error'
@@ -215,6 +218,8 @@
       pid?: number | null
       started?: boolean
       alreadyRunning?: boolean
+      updateAvailable?: boolean
+      targetVersion?: string | null
     }
     started?: boolean
     alreadyRunning?: boolean
@@ -433,6 +438,7 @@
     if (liveKitRuntimeLoading && liveKitRuntimeAction === 'refresh') return 'Checking'
     if (liveKitRuntimeLoading && liveKitRuntimeAction === 'install') return 'Installing'
     if (!runtime) return 'Unknown'
+    if (runtime.updateAvailable) return 'Update available'
     if (runtime.status === 'ready') return 'Ready'
     if (runtime.status === 'not-installed') return 'Not installed'
     if (runtime.status === 'not-configured') return 'Needs setup'
@@ -443,8 +449,13 @@
 
   function getLiveKitRuntimeBadgeClass(runtime: LiveKitRuntimeManagerStatus | null) {
     if (liveKitRuntimeLoading && liveKitRuntimeAction === 'refresh') return 'batshit-settings-pill'
+    if (runtime?.updateAvailable) return 'batshit-settings-pill is-warning'
     if (runtime?.status === 'ready') return 'batshit-settings-pill is-success'
-    if (runtime?.status === 'not-installed' || runtime?.status === 'not-configured') {
+    if (
+      runtime?.updateAvailable ||
+      runtime?.status === 'not-installed' ||
+      runtime?.status === 'not-configured'
+    ) {
       return 'batshit-settings-pill is-warning'
     }
     if (runtime?.status === 'error') return 'batshit-settings-pill is-danger'
@@ -465,10 +476,11 @@
 
   function shouldShowLiveKitSetupPanel(runtime: LiveKitRuntimeManagerStatus | null) {
     if (liveKitRuntimeLoading && !runtime) return false
-    return !runtime || runtime.status !== 'ready'
+    return !runtime || runtime.status !== 'ready' || runtime.updateAvailable === true
   }
 
   function getLiveKitRuntimeStartLabel(runtime: LiveKitRuntimeManagerStatus | null) {
+    if (runtime?.updateAvailable) return 'Update & Restart'
     if (runtime?.status === 'ready') return 'Restart'
     if (isDockerLiveKitRuntime(runtime)) return 'Start Add-on'
     if (runtime?.status === 'not-installed' || runtime?.status === 'not-configured') {
@@ -481,7 +493,9 @@
     return (
       runtime !== null &&
       !isDockerLiveKitRuntime(runtime) &&
-      (runtime.status === 'not-installed' || runtime.status === 'not-configured')
+      (runtime.updateAvailable === true ||
+        runtime.status === 'not-installed' ||
+        runtime.status === 'not-configured')
     )
   }
 
@@ -491,6 +505,7 @@
 
   function getLiveKitSetupTitle(runtime: LiveKitRuntimeManagerStatus | null) {
     if (isDockerLiveKitRuntime(runtime)) return 'Optional Docker add-on'
+    if (runtime?.updateAvailable) return 'Tested update available'
     if (runtime?.status === 'not-installed') return 'Native local install'
     if (runtime?.status === 'not-configured') return 'Native local install or external server'
     return 'LiveKit needs attention'
@@ -499,6 +514,19 @@
   function getLiveKitSetupBody(runtime: LiveKitRuntimeManagerStatus | null) {
     if (isDockerLiveKitRuntime(runtime)) {
       return 'LiveKit runs outside the core Batshit app container. Use Start Add-on when the Docker operator is available, or start Docker with the LiveKit profile.'
+    }
+    if (runtime?.updateAvailable) {
+      const sidecarVersions =
+        runtime.installedVersion &&
+        runtime.targetVersion &&
+        runtime.installedVersion !== runtime.targetVersion
+        ? `Agent ${runtime.installedVersion} -> ${runtime.targetVersion}. `
+        : ''
+      const serverVersions =
+        runtime.server?.updateAvailable && runtime.server.version && runtime.server.targetVersion
+          ? `Server ${runtime.server.version} -> ${runtime.server.targetVersion}. `
+          : ''
+      return `${sidecarVersions}${serverVersions}Update installs the LiveKit versions tested with this Batshit build, verifies the bundled sidecar source, and restarts the managed runtime.`
     }
     if (runtime?.status === 'not-installed') {
       return 'Install downloads the verified LiveKit Server runtime, installs the Batshit sidecar under the managed runtime folder, saves local Voice Runtime credentials, and starts both services.'
@@ -2010,7 +2038,8 @@
 
   async function startLiveKitRuntime() {
     const install = shouldInstallNativeLiveKitRuntime(liveKitRuntime)
-    const forceRestart = liveKitRuntime?.status === 'ready'
+    const update = liveKitRuntime?.updateAvailable === true
+    const forceRestart = liveKitRuntime?.status === 'ready' || liveKitRuntime?.updateAvailable === true
     liveKitRuntimeLoading = true
     liveKitRuntimeError = null
     liveKitRuntimeAction = install ? 'install' : 'start'
@@ -2037,7 +2066,9 @@
       const restarted = liveKitRuntime?.restarted === true
       let successMessage = 'LiveKit runtime is already running'
       if (install) {
-        successMessage = 'LiveKit native runtime installed'
+        successMessage = update
+          ? 'LiveKit native runtime updated and restarted'
+          : 'LiveKit native runtime installed'
       } else if (restarted) {
         successMessage = 'LiveKit runtime restarted'
       } else if (started) {
@@ -3376,8 +3407,8 @@
                     </div>
                   </div>
                   <div class="batshit-settings-form-control">
-                    <div class="flex items-center gap-2">
-                      <div class="min-w-0 flex-1">
+                    <div class="batshit-settings-field-cluster">
+                      <div class="batshit-settings-field-lane">
                         <Select.Root
                           type="single"
                           value={(settings.inputDeviceId ?? '') as unknown as string}
@@ -3420,7 +3451,7 @@
                       {/if}
                     </div>
                     {#if inputDevicesError}
-                      <div class="batshit-settings-form-meta text-destructive">
+                      <div class="batshit-settings-form-meta is-error">
                         {inputDevicesError}
                       </div>
                     {/if}
@@ -3608,8 +3639,8 @@
                         </div>
                       </div>
                       <div class="batshit-settings-form-control">
-                        <div class="flex items-center gap-2">
-                          <div class="min-w-0 flex-1">
+                        <div class="batshit-settings-field-cluster">
+                          <div class="batshit-settings-field-lane">
                             {#if sttHasSingleModelOption}
                               <div class="flex min-w-0 items-center gap-2">
                                 <Input class="min-w-0 flex-1" value={sttDisplayedModel} disabled />
@@ -3926,8 +3957,8 @@
                           </div>
                         </div>
                         <div class="batshit-settings-form-control">
-                          <div class="flex items-center gap-2">
-                            <div class="min-w-0 flex-1">
+                          <div class="batshit-settings-field-cluster">
+                            <div class="batshit-settings-field-lane">
                               {#if realtimeSttHasSingleModelOption}
                                 <div class="flex min-w-0 items-center gap-2">
                                   <Input class="min-w-0 flex-1" value={realtimeSttDisplayedModel} disabled />
@@ -4190,8 +4221,8 @@
                         </div>
                       </div>
                       <div class="batshit-settings-form-control">
-                        <div class="flex items-center gap-2">
-                          <div class="min-w-0 flex-1">
+                        <div class="batshit-settings-field-cluster">
+                          <div class="batshit-settings-field-lane">
                             {#if ttsHasSingleModelOption}
                               <div class="flex min-w-0 items-center gap-2">
                                 <Input class="min-w-0 flex-1" value={ttsDisplayedModel} disabled />
@@ -4344,7 +4375,7 @@
                           {/if}
                         </div>
                         {#if voicesError}
-                          <p class="batshit-settings-form-help text-amber-600">{voicesError}</p>
+                          <p class="batshit-settings-form-help is-warning">{voicesError}</p>
                         {/if}
                       </div>
                     </div>
@@ -4393,7 +4424,7 @@
                         </div>
                       </div>
                       <div class="batshit-settings-form-control">
-                        <div class="flex items-center gap-2 no-lastpass">
+                        <div class="batshit-settings-field-cluster no-lastpass">
                           <Input
                             id="global-voice-preview"
                             name="voice-preview-phrase"
@@ -4622,7 +4653,8 @@
                   <SettingsInfoMenu ariaLabel="About LiveKit Start with Batshit" contentClass="w-80">
                     <p>
                       When this is on, native Batshit starts the managed local LiveKit server and
-                      sidecar after you sign in. In Docker installs, this uses the approved LiveKit
+                      sidecar after you sign in, refreshing them to the versions tested with this
+                      Batshit build when needed. In Docker installs, this uses the approved LiveKit
                       runtime add-on.
                     </p>
                   </SettingsInfoMenu>
@@ -4639,7 +4671,9 @@
               {#if liveKitRuntime?.statusHint || liveKitRuntimeError}
                 <p
                   class={`batshit-settings-inline-alert ${
-                    liveKitRuntime?.status === 'ready' ? 'is-info' : 'is-warning'
+                    liveKitRuntime?.status === 'ready' && !liveKitRuntime?.updateAvailable
+                      ? 'is-info'
+                      : 'is-warning'
                   }`}
                 >
                   {liveKitRuntimeError ?? liveKitRuntime?.statusHint}
@@ -4652,7 +4686,9 @@
                     <p class="batshit-settings-child-label">
                       {getLiveKitSetupTitle(liveKitRuntime)}
                     </p>
-                    <Badge variant="outline" class="batshit-settings-pill">Optional</Badge>
+                    <Badge variant="outline" class="batshit-settings-pill">
+                      {liveKitRuntime?.updateAvailable ? 'Recommended' : 'Optional'}
+                    </Badge>
                   </div>
                   <p class="text-xs leading-5 text-muted-foreground">
                     {getLiveKitSetupBody(liveKitRuntime)}
@@ -5346,7 +5382,7 @@
                           Base URL
                         </Label.Label>
                       </div>
-                      <div class="batshit-settings-form-control">
+                      <div class="batshit-settings-form-control is-wide">
                         <Input
                           id="existing-engine-base-url"
                           bind:value={existingEngineForm.baseUrl}
@@ -5361,14 +5397,14 @@
                       </div>
                       <div class="batshit-settings-form-control">
                         <div class="flex flex-wrap gap-2">
-                          <div class="flex items-center gap-2 batshit-settings-pill">
+                          <div class="batshit-settings-pill is-control">
                             <span class="batshit-settings-form-label">TTS</span>
                             <Switch.Root
                               checked={existingEngineForm.supportsTts}
                               onCheckedChange={(value) => toggleExistingEngineCapability('tts', value === true)}
                             />
                           </div>
-                          <div class="flex items-center gap-2 batshit-settings-pill">
+                          <div class="batshit-settings-pill is-control">
                             <span class="batshit-settings-form-label">STT</span>
                             <Switch.Root
                               checked={existingEngineForm.supportsStt}
@@ -5637,7 +5673,7 @@
                               Delete
                             </Button>
                             {#if canDeleteLocalFiles}
-                              <label class="flex items-center gap-2 batshit-settings-pill">
+                              <label class="batshit-settings-pill is-control">
                                 <input
                                   type="checkbox"
                                   class="h-4 w-4"
@@ -5659,7 +5695,7 @@
                                 </SettingsInfoMenu>
                               </label>
                             {/if}
-                            <div class="flex items-center gap-2 batshit-settings-pill">
+                            <div class="batshit-settings-pill is-control">
                               <span class="batshit-settings-form-label">Enabled</span>
                               <Switch.Root
                                 checked={provider.enabled !== false}
@@ -5670,7 +5706,7 @@
                                   }))}
                               />
                             </div>
-                            <div class="flex items-center gap-2 batshit-settings-pill">
+                            <div class="batshit-settings-pill is-control">
                               <span class="batshit-settings-form-label">Start with Batshit</span>
                               <SettingsInfoMenu ariaLabel="About Start with Batshit" contentClass="w-80">
                                 <p>

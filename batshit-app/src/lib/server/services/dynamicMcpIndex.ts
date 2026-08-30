@@ -40,6 +40,7 @@ import {
   type BrokerRuntime,
   type BrokerToolToggles
 } from '$lib/utils/brokerAvailability'
+import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import {
   ARTIFACT_TOOL_GRID_GROUP_NAME,
   ARTIFACT_TOOL_GRID_ID,
@@ -148,6 +149,11 @@ interface DynamicMcpIndexOptions {
   providerSettings?: unknown
   allowArtifactRuntimeTools?: boolean
   allowFabricControlTools?: boolean
+  /**
+   * SA-104 P3: PRIMARY actor + agent `memory_enabled`. When omitted the index resolves it
+   * from `agent:{agentId}` (route callers); subagent callers pass explicit false.
+   */
+  memoryControlsEnabled?: boolean
 }
 
 interface WorkingGroup extends DynamicMcpIndexGroup {
@@ -442,6 +448,27 @@ async function resolveEnabledTools(
   }
 }
 
+/**
+ * SA-104 P3: mirrors `resolveIndexBrokerToggles` — explicit caller value wins, otherwise
+ * the agent record decides. Callers for subagent scopes pass explicit false.
+ */
+async function resolveIndexMemoryControlsEnabled(
+  options: DynamicMcpIndexOptions
+): Promise<boolean> {
+  if (typeof options.memoryControlsEnabled === 'boolean') {
+    return options.memoryControlsEnabled
+  }
+  const agentId = options.agentId?.trim()
+  if (!agentId) return false
+  try {
+    const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
+    return resolveAgentMemoryEnabled(agent)
+  } catch (error) {
+    console.warn('[Dynamic MCP DCM] Failed to resolve memory enablement:', error)
+    return false
+  }
+}
+
 async function resolveIndexBrokerToggles(
   options: DynamicMcpIndexOptions
 ): Promise<BrokerToolToggles> {
@@ -538,12 +565,14 @@ export async function buildDynamicMcpIndex(
     options.runtime ?? (options.isCodexMode === true ? 'cli' : 'api')
   const controlRuntimeMode: ControlRuntimeMode = brokerRuntime === 'cli' ? 'mode4' : 'mode3'
   const allowFabricControlTools = options.allowFabricControlTools !== false
+  const memoryControlsEnabled = await resolveIndexMemoryControlsEnabled(options)
   const brokerFamilies = resolveBrokerFamilies({
     runtime: brokerRuntime,
     toggles: brokerToggles,
     hasCliTools: selectedCliToolIds.size > 0,
     allowArtifactRuntimeTools: options.allowArtifactRuntimeTools,
-    allowFabricControlTools: options.allowFabricControlTools
+    allowFabricControlTools: options.allowFabricControlTools,
+    memoryControlsEnabled
   })
   const fabricReachable = brokerFamilies.includes('fabric')
   const artifactReachable = brokerFamilies.includes('artifact')
@@ -747,7 +776,8 @@ export async function buildDynamicMcpIndex(
   const fabricAllowedControlIds = fabricReachable
     ? resolveBrokerFabricAllowedControlIds({
         toggles: brokerToggles,
-        allowFabricControlTools: options.allowFabricControlTools
+        allowFabricControlTools: options.allowFabricControlTools,
+        memoryControlsEnabled
       })
     : []
   const fabricControls = fabricReachable

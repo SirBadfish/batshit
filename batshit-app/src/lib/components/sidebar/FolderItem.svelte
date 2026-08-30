@@ -5,6 +5,7 @@
   import * as Collapsible from '$lib/components/ui/collapsible'
   import type { ChatFolderRow, ChatSessionRow } from '$lib/types/database'
   import { foldersStore } from '$lib/stores/folders.svelte'
+  import { isFixedSession } from '$lib/utils/fixedSession'
   import SessionItem from '$lib/components/batshit-sidebar/SessionItem.svelte'
   import { SessionService } from '$lib/services/sessions'
   import { dndzone, TRIGGERS } from 'svelte-dnd-action'
@@ -49,9 +50,11 @@ let folderSettingsLabel = $derived(
   folder.is_default ? `${folder.name} default chat folder settings` : `${folder.name} chat folder settings`
 )
   
-  // Filter sessions for this folder
+  // Filter sessions for this folder. Infinite Sessions never render in folder lists —
+  // they live in the pinned Infinite Sessions section and stay out of every dndzone,
+  // so drag-and-drop exclusion is structural in both directions (SA-104 P5).
   let folderSessions = $derived(
-    sessions.filter(s => s.folder_id === folder.id && !s.archived)
+    sessions.filter(s => s.folder_id === folder.id && !s.archived && !isFixedSession(s))
       .sort((a, b) => {
         // Sort by last modified, most recent first
         const aTime = new Date(a.last_modified_at || a.created_at).getTime()

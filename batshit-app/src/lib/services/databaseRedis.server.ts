@@ -35,9 +35,15 @@ import {
 } from '$lib/goons/dcm'
 import {
   buildDynamicMcpPromptBlock,
+  buildMemoryPromptBlock,
   buildToolGuidanceZipPromptBlock,
   normalizeDynamicMcpPromptContent
 } from '$lib/utils/toolPromptInjection'
+import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+import {
+  computeMemoryCompileContext,
+  type MemoryCompileContext
+} from '$lib/server/services/memory/memoryRecall'
 import {
   applyPromptRuntimeScope,
   brokerToolNamesForScope,
@@ -66,6 +72,8 @@ import {
   applyContextCompactionToMessages,
   getContextCompactionState
 } from '$lib/utils/contextCompaction'
+import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
+import { buildControlErrorDcmLines } from '$lib/utils/controlTags'
 import { summarizeControlInputSchema } from '$lib/services/controlSchemaSummary'
 import {
   appendManagedSubagentDynamicInfo,
@@ -1489,6 +1497,26 @@ export class DatabaseService {
     return false
   }
 
+  /**
+   * SA-104 P3: the Memory guidance block for memory-enabled agents. Mirrored in the
+   * client twin (`databaseRedis.client.ts`) — keep both call sites and gating identical.
+   */
+  private async resolveMemoryGuidancePrompt(
+    agent: any,
+    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+  ) {
+    const storedPrompt = await this.getRedisStringValue('batshit:tool_guidance_memory_prompt')
+    const fallbackPrompt = buildMemoryPromptBlock({ runtimeFlavor })
+    const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
+    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
+    return replacePromptVariables(prompt, agent, {
+      ...(agent?.settings ?? {}),
+      runtime_flavor: runtimeFlavor,
+      tool_search_tool: brokerNames.search,
+      tool_use_tool: brokerNames.use
+    })
+  }
+
   private async resolveDynamicMcpPrompt(
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
@@ -2144,6 +2172,9 @@ export class DatabaseService {
     zipControlPermission?: boolean
     zipAiViewMode?: 'inline' | 'appended'
     isCodexMode?: boolean
+    controlErrorLines?: string[]
+    /** SA-104 P4: preformatted "Memory context:" lines from the recall engine. */
+    memoryDcmLines?: string[]
   }) {
     const statusIcons = {
       new: '\u2705',
@@ -2286,6 +2317,10 @@ export class DatabaseService {
 
     lines.push(statusKey, '')
 
+    if (options.controlErrorLines && options.controlErrorLines.length > 0) {
+      lines.push(...options.controlErrorLines, '')
+    }
+
     const agentId = options.agentId?.trim()
     if (agentId) {
       lines.push(`${statusIcons.current} agent_id: ${agentId}`)
@@ -2398,6 +2433,13 @@ export class DatabaseService {
         lines.push(`${fileRefsStatus} file_refs:`)
         lines.push(...refLines)
       }
+    }
+
+    // SA-104 P4: the recall engine's memory-insert section (time awareness, Current /
+    // Lingering grouping, more-available honesty) — preformatted server-side so both
+    // twins render byte-identical lines (DL-104-17).
+    if (options.memoryDcmLines && options.memoryDcmLines.length > 0) {
+      lines.push('', ...options.memoryDcmLines)
     }
 
     const zipState = options.zipState
@@ -2515,6 +2557,22 @@ export class DatabaseService {
     // 2. Get user's custom system prompt from agent
     const userSystemPrompt = agent?.system_prompt || ''
 
+    // SA-104 P4: the recall engine computes everything prompt-visible about memory in
+    // one server-side call (on-my-mind block, DCM insert lines, time awareness, memory
+    // clip ids). Read-only — the linger commit happens in send-routed. Group runs get
+    // no recall lanes in v1 (recorded limitation, p4-recall-engine.md §1.5). Failures
+    // propagate: memory recall for an enabled agent must never silently degrade.
+    let memoryCompileContext: MemoryCompileContext | null = null
+    if (!options?.groupContext && agent?.id && userId && resolveAgentMemoryEnabled(agent)) {
+      memoryCompileContext = await computeMemoryCompileContext({
+        userId,
+        agentId: agent.id,
+        sessionId,
+        currentUserMessage: currentUserMessage ?? '',
+        historyMessageIds: messages.map((message) => message?.id).filter(Boolean) as string[]
+      })
+    }
+
     // CRITICAL: Ensure unzip state is loaded BEFORE compiling history so compileForAI
     // can expand user-unzipped zips for the server-side API/CLI compilation path.
     const { zippingService } = await import('$lib/services/zipping')
@@ -2528,7 +2586,13 @@ export class DatabaseService {
 
     const sessionRecord = await redis.getSession(sessionId).catch(() => null)
     const compactionState = getContextCompactionState(sessionRecord?.metadata ?? null)
-    const contextMessages = applyContextCompactionToMessages(messages, compactionState.events)
+    // SA-104 P6: Infinite-Session graduation applies at the same site as compaction
+    // (idempotent; regular sessions pass through unchanged — DL-104-12). This server
+    // application is load-bearing for approval resumes, which reload raw messages.
+    const contextMessages = applyFixedSessionGraduationToMessages(
+      applyContextCompactionToMessages(messages, compactionState.events),
+      sessionRecord
+    )
     const precompiledHistory = options?.precompiledHistory
     const speakerMap = this.buildSpeakerMap(contextMessages, options?.groupContext)
 
@@ -2701,6 +2765,108 @@ export class DatabaseService {
       return deduped
     })()
 
+    // SA-104 P4: clip media carried by inserted memories rides the same structured
+    // image path as session clips (DL-104-17 single channel; Maggie's photo). A memory
+    // clip that no longer resolves degrades to a loud DCM note instead of failing the
+    // send — a deleted clip is stale memory media, not broken infrastructure.
+    const memoryClipNotes: string[] = []
+    if (memoryCompileContext?.memoryClipIds?.length) {
+      const presentClipIds = new Set(dedupedClippedContent.map((item) => item?.clipId))
+      const clipUserSettings = userId ? await this.getUserSettings(userId).catch(() => null) : null
+      for (const memoryClipId of memoryCompileContext.memoryClipIds) {
+        if (presentClipIds.has(memoryClipId)) continue
+        const sourceMemoryId = memoryCompileContext.memoryClipSources[memoryClipId] ?? 'unknown'
+        try {
+          const clip = await this.getClipData(userId, memoryClipId, fetchImpl)
+          if (!clip) {
+            throw new Error('clip record not found')
+          }
+          const isText =
+            clip.mimeType?.startsWith('text/') ||
+            clip.fileType === 'text' ||
+            clip.mimeType === 'application/json'
+          const isImage = clip.mimeType?.startsWith('image/')
+          const tokenEstimate = isImage
+            ? clip.externalTokens ?? 765
+            : clip.localTokens ??
+              clip.externalTokens ??
+              (clip.content ? Math.ceil(clip.content.length / 4) : undefined)
+          const preferredUrl = await resolveClipPreferredUrl(clip as ClipRow, clipUserSettings, {
+            allowAutoStart: true
+          })
+          if (isImage) {
+            const dataUrl = await resolveClipDataUrlFromStoredUpload(clip as ClipRow)
+            if (!dataUrl) {
+              throw new Error('image payload could not be resolved from local upload storage')
+            }
+            dedupedClippedContent.push({
+              clipId: clip.id,
+              content: dataUrl,
+              contentType: 'image',
+              description: clip.filename,
+              tokens: tokenEstimate,
+              storageMode: 'local',
+              url: preferredUrl,
+              filename: clip.filename,
+              fileSize: clip.fileSize,
+              mimeType: clip.mimeType,
+              memorySource: sourceMemoryId
+            } as (typeof dedupedClippedContent)[number])
+          } else if (isText) {
+            const decoded =
+              clip.content ??
+              (clip.localBase64
+                ? this.decodeBase64ToText(
+                    clip.localBase64.startsWith('data:')
+                      ? clip.localBase64.split(',')[1] || ''
+                      : clip.localBase64
+                  )
+                : '')
+            dedupedClippedContent.push({
+              clipId: clip.id,
+              content: decoded,
+              contentType: 'text',
+              description: clip.filename,
+              tokens: tokenEstimate,
+              storageMode: 'local',
+              url: preferredUrl,
+              filename: clip.filename,
+              fileSize: clip.fileSize,
+              mimeType: clip.mimeType,
+              memorySource: sourceMemoryId
+            } as (typeof dedupedClippedContent)[number])
+          } else if (preferredUrl) {
+            dedupedClippedContent.push({
+              clipId: clip.id,
+              content: preferredUrl,
+              contentType: clip.fileType || 'file',
+              description: clip.filename,
+              tokens: tokenEstimate,
+              storageMode: 'local',
+              url: preferredUrl,
+              filename: clip.filename,
+              fileSize: clip.fileSize,
+              mimeType: clip.mimeType,
+              memorySource: sourceMemoryId
+            } as (typeof dedupedClippedContent)[number])
+          }
+          presentClipIds.add(memoryClipId)
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'unavailable'
+          memoryClipNotes.push(
+            `- Media unavailable: clip ${memoryClipId} (from memory ${sourceMemoryId}) could not be loaded (${reason}).`
+          )
+        }
+      }
+    }
+    const memoryDcmLines = (() => {
+      const base = memoryCompileContext?.dcmLines ?? []
+      if (memoryClipNotes.length === 0) return base
+      return base.length > 0
+        ? [...base, ...memoryClipNotes]
+        : ['Memory context:', ...memoryClipNotes]
+    })()
+
     // 6. Create clean structured input for Chat Model
     // This will be passed directly to the AI without any parsing needed
     
@@ -2780,6 +2946,36 @@ export class DatabaseService {
       }
     }
 
+    // SA-104 P3: memory guidance is gated on per-agent memory enablement alone — the
+    // inline <batshit-memory> save works without any broker family. Part of the stable
+    // compiled prefix (DL-104-04): it changes only when enablement or the stored prompt
+    // changes. Mirrored in the client twin.
+    if (resolveAgentMemoryEnabled(agent)) {
+      const memoryPrompt = await this.resolveMemoryGuidancePrompt(agent, runtimeFlavor)
+      if (memoryPrompt.trim()) {
+        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+        mergedSystemPrompt += `==== MEMORY (AGENT MEMORY ENABLED) ====\n\n${memoryPrompt}`
+      }
+    }
+
+    // SA-104 P4: the agent-authored on-my-mind section compiles at the END of the
+    // stable prefix, directly after the memory guidance (DL-104-04 / P0 §1.2 locked
+    // position). Byte-stable ordering inside the recall engine keeps provider cache
+    // anchoring; entry edits/expiry are bounded deliberate resets. Mirrored in the
+    // client twin.
+    if (memoryCompileContext?.onMyMindBlock) {
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      mergedSystemPrompt += memoryCompileContext.onMyMindBlock
+    }
+
+    // SA-104 P6: the open episode's whiteboard (Infinite Sessions) rides directly after
+    // AWARENESS — awareness-layer working facts, byte-stable between deliberate
+    // edits. Mirrored in the client twin.
+    if (memoryCompileContext?.whiteboardBlock) {
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      mergedSystemPrompt += memoryCompileContext.whiteboardBlock
+    }
+
     // Artifact guidance is now skill-led.
     // Build context still controls tool availability and DCM visibility,
     // but artifact prompt addons are retired and no longer injected here.
@@ -2788,9 +2984,9 @@ export class DatabaseService {
     const subagentPrompts: Record<string, string> = {}
     const subagentDescription: Record<string, string> = {}
     const subagentModels: Record<string, { provider?: string | null; model?: string | null }> = {}
-    
+
     if (assignedSubagents && assignedSubagents.length > 0) {
-      
+
       const subAgentPrompt = await this.getRedisStringValue('batshit:sub_system_prompt')
 
       // SA-008 Phase 5: Simplified SA compilation
@@ -2877,7 +3073,7 @@ export class DatabaseService {
     const compiledMainSystemPrompt = mergedSystemPrompt
 
     // User message - build content array for vision support
-    const userContent = []
+    const userContent: any[] = []
     
     // Text content (previous conversation + current message)
     let textContent = ''
@@ -2901,9 +3097,11 @@ export class DatabaseService {
       agentDefaultProjectPath?.trim() ||
       defaultWorkspacePath?.trim() ||
       null
+    const controlErrorLines = buildControlErrorDcmLines(contextMessages as any[])
     const dynamicInfo = currentMessageFormatted
         ? await this.buildDynamicInfoBlock({
           userId: userId ?? null,
+          controlErrorLines,
           currentUserMessage: currentUserMessage ?? null,
           agentRecord: agent,
           agentId: agent?.id ?? null,
@@ -2927,7 +3125,8 @@ export class DatabaseService {
           autoZipTools: autoZipSummary.autoZipTools,
           zipControlPermission: zipPermission,
           zipAiViewMode: zipViewMode,
-          isCodexMode: options?.runtimeFlavor === 'codex' || options?.runtimeFlavor === 'claude'
+          isCodexMode: options?.runtimeFlavor === 'codex' || options?.runtimeFlavor === 'claude',
+          memoryDcmLines
         })
       : ''
     const currentMessageForLLM = currentMessageFormatted
@@ -2957,13 +3156,20 @@ export class DatabaseService {
     // User-managed zips expand inline during compileForAI.
     
     // Add clipped items (user uploads) - KEEP THIS!
-    if (dedupedClippedContent.length > 0) {
-      // Add a section header for clipped items
+    // SA-104 P4: memory-carried clips (memorySource set) render under their own
+    // REMEMBERED MEDIA header — they are recalled media, not this message's uploads.
+    const sessionClippedItems = dedupedClippedContent.filter(
+      (item) => !(item as Record<string, any>).memorySource
+    )
+    const memoryClippedItems = dedupedClippedContent.filter(
+      (item) => (item as Record<string, any>).memorySource
+    )
+    const appendClippedItems = (items: typeof dedupedClippedContent, header: string) => {
+      if (items.length === 0) return
       if (userContent[0].text) {
-        userContent[0].text += '\n\n==== CLIPPED ITEMS (USER UPLOADS) ===='
+        userContent[0].text += `\n\n==== ${header} ====`
       }
-      
-      for (const item of dedupedClippedContent) {
+      for (const item of items) {
         // For text clips, inline the content for the AI
         if (item.contentType === 'text' && typeof item.content === 'string') {
           userContent[0].text += `\n\nCONTENT:\n${item.content}`
@@ -2980,14 +3186,16 @@ export class DatabaseService {
         }
       }
     }
-    
+    appendClippedItems(sessionClippedItems, 'CLIPPED ITEMS (USER UPLOADS)')
+    appendClippedItems(memoryClippedItems, 'REMEMBERED MEDIA (MEMORY)')
+
     // Add user message with proper content format
     chatMessages.push({
       role: 'user',
       // If only text (no images), just send the string. Otherwise send array.
       content: userContent.length === 1 ? userContent[0].text : userContent
     })
-    
+
     const assignedSubagentMetadata = Array.isArray(assignedSubagents)
       ? assignedSubagents.map((subagent) => ({
           id: subagent?.id,
@@ -3024,6 +3232,11 @@ export class DatabaseService {
         resolvedProjectPath,
         assignedSubagents: assignedSubagentMetadata,
         subagentModels,
+        // SA-104 P4: inserted-memory visibility for the Execution Viewer (rides the
+        // recorded snapshot's structuredInput untouched on every lane).
+        ...(memoryCompileContext?.memoryContext
+          ? { memoryContext: memoryCompileContext.memoryContext }
+          : {}),
         messageStructure: {
           systemMessages: chatMessages.filter(m => m.role === 'system').length,
           userMessages: chatMessages.filter(m => m.role === 'user').length,

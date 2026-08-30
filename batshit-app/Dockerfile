@@ -1,4 +1,6 @@
-FROM node:24-alpine AS deps
+# glibc base (not alpine): onnxruntime-node — the built-in memory embedder runtime —
+# ships glibc-only Linux binaries that musl cannot dlopen.
+FROM node:24-slim AS deps
 
 WORKDIR /opt/batshit/batshit-app
 
@@ -12,16 +14,27 @@ COPY batshit-app ./
 COPY docs/batshit_System_Prompts ../docs/batshit_System_Prompts
 ENV BATSHIT_SVELTE_ADAPTER=node
 RUN npm run generate:brand-icons && npm run build
-RUN npm prune --omit=dev
+# Server code only ever loads onnxruntime-node's linux/<arch> binaries; the browser/wasm
+# build and foreign-platform binaries are ~310MB of dead weight. The trailing test fails
+# the build loudly if an onnxruntime-node layout change ever invalidates this prune.
+RUN npm prune --omit=dev \
+    && rm -rf node_modules/onnxruntime-web \
+        node_modules/onnxruntime-node/bin/napi-v6/win32 \
+        node_modules/onnxruntime-node/bin/napi-v6/darwin \
+    && find node_modules/onnxruntime-node/bin/napi-v6/linux -mindepth 1 -maxdepth 1 -type d \
+        ! -name "$(node -p process.arch)" -exec rm -rf {} + \
+    && test -e "node_modules/onnxruntime-node/bin/napi-v6/linux/$(node -p process.arch)/onnxruntime_binding.node"
 
-FROM node:24-alpine AS runtime
+FROM node:24-slim AS runtime
 
 WORKDIR /opt/batshit/batshit-app
 
-RUN apk add --no-cache bash bubblewrap curl git openssh-client py3-pip python3 zsh \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash bubblewrap ca-certificates curl git openssh-client python3 python3-pip zsh \
+    && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python \
-    && addgroup -S -g 10001 batshit-cli \
-    && adduser -S -D -u 10001 -G batshit-cli -h /home/batshit-cli -s /bin/sh batshit-cli \
+    && groupadd --system --gid 10001 batshit-cli \
+    && useradd --system --uid 10001 --gid 10001 --home-dir /home/batshit-cli --shell /bin/sh batshit-cli \
     && mkdir -p /home/batshit-cli \
     && chown -R 10001:10001 /home/batshit-cli
 

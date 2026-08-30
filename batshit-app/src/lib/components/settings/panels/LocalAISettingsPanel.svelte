@@ -487,7 +487,7 @@
                         </SettingsInfoMenu>
                       </div>
                     </div>
-                    <div class="batshit-settings-form-control">
+                    <div class="batshit-settings-form-control is-wide">
                       <Input
                         value={server.baseUrl}
                         oninput={(event) => {
@@ -584,7 +584,7 @@
                         </SettingsInfoMenu>
                       </div>
                     </div>
-                    <div class="batshit-settings-form-control">
+                    <div class="batshit-settings-form-control is-wide">
                       <Input
                         value={server.imageBaseUrl}
                         oninput={(event) => {

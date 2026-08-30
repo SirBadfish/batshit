@@ -264,7 +264,7 @@
             <label class="batshit-settings-form-label" for="custom-provider-base-url">Base URL</label>
           </div>
         </div>
-        <div class="batshit-settings-form-control">
+        <div class="batshit-settings-form-control is-wide">
           <Input
             id="custom-provider-base-url"
             value={form.baseUrl}

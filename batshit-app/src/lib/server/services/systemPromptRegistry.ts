@@ -13,6 +13,7 @@ export type CoreSystemPromptId =
   | 'subagent_addon'
   | 'tool_guidance_zip_enabled'
   | 'tool_guidance_zip_disabled'
+  | 'tool_guidance_memory'
   | 'dynamic_mcp'
 
 type PromptDefinition = {
@@ -119,6 +120,15 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_zip_control_disabled.md',
     defaultVersion: '2026-08-13'
+  },
+  {
+    id: 'tool_guidance_memory',
+    redisKey: 'batshit:tool_guidance_memory_prompt',
+    label: 'Tool Prompt: Memory',
+    description: 'Injected for memory-enabled agents: lanes, inline saves, supersession discipline, and the sys.memory.* operations.',
+    warning: COMMON_CORE_PROMPT_WARNING,
+    defaultFile: 'batshit_tool_prompt_memory.md',
+    defaultVersion: '2026-08-25'
   },
   {
     id: 'dynamic_mcp',

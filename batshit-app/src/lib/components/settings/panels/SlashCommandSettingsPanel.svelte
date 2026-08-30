@@ -1523,7 +1523,7 @@ async function deleteCommand(command: SlashCommandRow) {
 
             <div class="space-y-2">
               <p class="batshit-settings-form-label">Agent Access</p>
-              <div class="batshit-settings-action-row min-h-10">
+              <div class="batshit-settings-action-row">
                 <span class="batshit-settings-form-label">
                   {skillSourceEnableForAllAgents ? 'All Agents' : 'Selected Agents'}
                 </span>
@@ -1796,7 +1796,7 @@ async function deleteCommand(command: SlashCommandRow) {
                     <div class="batshit-settings-list-band is-active">
                       <Collapsible.Root bind:open={systemSkillsOpen}>
                         <div class="flex items-center gap-2 pr-2">
-                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                             <div class="batshit-settings-form-label flex items-center gap-2">
                               Batshit Skills
                               <span class="batshit-settings-pill">
@@ -1816,7 +1816,7 @@ async function deleteCommand(command: SlashCommandRow) {
                             {#each systemSkillCommands as command (command.id)}
                               <button
                                 type="button"
-                                class="settings-sidebar-item py-2.5"
+                                class="settings-sidebar-item"
                                 data-state={selectedCommandId === command.id ? 'active' : 'inactive'}
                                 onclick={() => selectCommand(command)}
                               >
@@ -1849,7 +1849,7 @@ async function deleteCommand(command: SlashCommandRow) {
                     <div class="batshit-settings-list-band">
                       <Collapsible.Root bind:open={yourSkillsOpen}>
                         <div class="flex items-center gap-2 pr-2">
-                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                             <div class="batshit-settings-form-label flex items-center gap-2">
                               Your Skills
                               <span class="batshit-settings-pill">
@@ -1864,7 +1864,7 @@ async function deleteCommand(command: SlashCommandRow) {
                             {#each userSkillCommands as command (command.id)}
                               <button
                                 type="button"
-                                class="settings-sidebar-item py-2.5"
+                                class="settings-sidebar-item"
                                 data-state={selectedCommandId === command.id ? 'active' : 'inactive'}
                                 onclick={() => selectCommand(command)}
                               >
@@ -1892,7 +1892,7 @@ async function deleteCommand(command: SlashCommandRow) {
                     <div class="batshit-settings-list-band is-active">
                       <Collapsible.Root bind:open={systemPromptsOpen}>
                         <div class="flex items-center gap-2 pr-2">
-                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                             <div class="batshit-settings-form-label flex items-center gap-2">
                               Batshit Prompts
                               <span class="batshit-settings-pill">
@@ -1912,7 +1912,7 @@ async function deleteCommand(command: SlashCommandRow) {
                             {#each systemPromptCommands as command (command.id)}
                               <button
                                 type="button"
-                                class="settings-sidebar-item py-2.5"
+                                class="settings-sidebar-item"
                                 data-state={selectedCommandId === command.id ? 'active' : 'inactive'}
                                 onclick={() => selectCommand(command)}
                               >
@@ -1945,7 +1945,7 @@ async function deleteCommand(command: SlashCommandRow) {
                     <div class="batshit-settings-list-band">
                       <Collapsible.Root bind:open={yourPromptsOpen}>
                         <div class="flex items-center gap-2 pr-2">
-                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                          <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                             <div class="batshit-settings-form-label flex items-center gap-2">
                               Your Prompts
                               <span class="batshit-settings-pill">
@@ -1960,7 +1960,7 @@ async function deleteCommand(command: SlashCommandRow) {
                             {#each userPromptCommands as command (command.id)}
                               <button
                                 type="button"
-                                class="settings-sidebar-item py-2.5"
+                                class="settings-sidebar-item"
                                 data-state={selectedCommandId === command.id ? 'active' : 'inactive'}
                                 onclick={() => selectCommand(command)}
                               >

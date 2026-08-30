@@ -13,6 +13,8 @@ import {
   getNativeLiveKitInstallStatus,
   inspectLocalLiveKitPortOwner,
   installNativeLiveKitRuntime,
+  installLiveKitServerBinary,
+  installLiveKitSidecarPackage,
   liveKitServerHttpUrl,
   resolveNativeLiveKitSidecarInstallRoot,
   startNativeLiveKitServerRuntime,
@@ -34,7 +36,7 @@ import { normalizeVoiceSettings } from '$lib/utils/voiceSchema'
 export const LIVEKIT_SIDECAR_RUNTIME_ID = 'livekit' as const
 const LIVEKIT_SIDECAR_ENGINE_ID = 'livekit-sidecar'
 const DEFAULT_LIVEKIT_AGENT_PORT = 7899
-const DEFAULT_LIVEKIT_SERVER_IMAGE = 'livekit/livekit-server:v1.12.0'
+const DEFAULT_LIVEKIT_SERVER_IMAGE = 'livekit/livekit-server:v1.13.5'
 const DEFAULT_DOCKER_LIVEKIT_AGENT_HEALTH_URL = 'http://livekit-agent:7899/worker'
 const START_READY_TIMEOUT_MS = 20_000
 const START_READY_POLL_INTERVAL_MS = 750
@@ -68,6 +70,9 @@ export type LiveKitSidecarRuntimeSummary = {
   logPath?: string | null
   pid?: number | null
   server?: LiveKitLocalServerSummary
+  updateAvailable?: boolean
+  installedVersion?: string | null
+  targetVersion?: string | null
 }
 
 export type LiveKitSidecarStartResult = LiveKitSidecarRuntimeSummary & {
@@ -90,6 +95,8 @@ export type LiveKitLocalServerSummary = {
   pid?: number | null
   started?: boolean
   alreadyRunning?: boolean
+  updateAvailable?: boolean
+  targetVersion?: string | null
 }
 
 function sleep(ms: number): Promise<void> {
@@ -330,7 +337,9 @@ async function inspectManagedLocalLiveKitServer(config: {
       containerName: null,
       image: null,
       installScope: 'native-managed',
-      version: nativeStatus.version,
+      version: nativeStatus.serverVersion,
+      targetVersion: nativeStatus.version,
+      updateAvailable: nativeStatus.serverUpdateAvailable,
       binaryPath: nativeStatus.serverBinaryPath,
       pid: portOwner.pids[0] ?? null,
       alreadyRunning: false
@@ -347,7 +356,9 @@ async function inspectManagedLocalLiveKitServer(config: {
       containerName: null,
       image: null,
       installScope: 'native-managed',
-      version: nativeStatus.version,
+      version: nativeStatus.serverVersion,
+      targetVersion: nativeStatus.version,
+      updateAvailable: nativeStatus.serverUpdateAvailable,
       binaryPath: nativeStatus.serverBinaryPath,
       alreadyRunning: ready
     }
@@ -363,7 +374,9 @@ async function inspectManagedLocalLiveKitServer(config: {
     containerName: null,
     image: null,
     installScope: 'native-managed',
-    version: nativeStatus.version,
+    version: nativeStatus.serverVersion,
+    targetVersion: nativeStatus.version,
+    updateAvailable: nativeStatus.serverUpdateAvailable,
     binaryPath: nativeStatus.serverBinaryPath,
     alreadyRunning: ready
   }
@@ -374,16 +387,18 @@ async function ensureManagedLocalLiveKitServer(config: {
   serverUrl: string
   apiKey: string
   apiSecret: string
+  forceRestart?: boolean
 }): Promise<LiveKitLocalServerSummary> {
   const inspected = await inspectManagedLocalLiveKitServer(config)
-  if (!inspected.managed || inspected.status === 'ready') return inspected
+  if (!inspected.managed || (inspected.status === 'ready' && !config.forceRestart)) return inspected
 
   try {
     const started = await startNativeLiveKitServerRuntime({
       userId: config.userId,
       serverUrl: config.serverUrl,
       apiKey: config.apiKey,
-      apiSecret: config.apiSecret
+      apiSecret: config.apiSecret,
+      forceRestart: config.forceRestart
     })
     return {
       ...inspected,
@@ -504,6 +519,17 @@ export async function getLiveKitSidecarRuntimeSummary(
 ): Promise<LiveKitSidecarRuntimeSummary> {
   const installRoot = resolveSidecarInstallRoot()
   const installed = sidecarPackageInstalled(installRoot)
+  const nativeStatus =
+    !isContainerizedRuntime() && resolveSidecarInstallOwnership() === 'batshit-managed'
+      ? await getNativeLiveKitInstallStatus()
+      : null
+  const versionStatus = nativeStatus
+    ? {
+        updateAvailable: nativeStatus.updateAvailable,
+        installedVersion: nativeStatus.sidecarVersion,
+        targetVersion: nativeStatus.targetSidecarVersion
+      }
+    : {}
   const port = resolveAgentHealthPort()
   const healthUrl = `http://127.0.0.1:${port}/worker`
 
@@ -528,7 +554,8 @@ export async function getLiveKitSidecarRuntimeSummary(
       agentName: null,
       activeJobs: null,
       logPath: null,
-      pid: null
+      pid: null,
+      ...versionStatus
     }
   }
 
@@ -551,7 +578,8 @@ export async function getLiveKitSidecarRuntimeSummary(
       agentName: health.agentName,
       activeJobs: health.activeJobs,
       logPath: null,
-      pid: null
+      pid: null,
+      ...versionStatus
     }
   }
   const pids = health.ready ? await findListenerPids(port) : []
@@ -580,7 +608,8 @@ export async function getLiveKitSidecarRuntimeSummary(
     activeJobs: health.activeJobs,
     logPath: null,
     pid: pids[0] ?? null,
-    server: server ?? undefined
+    server: server ?? undefined,
+    ...versionStatus
   }
 }
 
@@ -598,10 +627,10 @@ async function waitForSidecarReady(
 
 export async function startLiveKitSidecarRuntime(
   userId: string,
-  options: { forceRestart?: boolean } = {}
+  options: { forceRestart?: boolean; forceServerRestart?: boolean } = {}
 ): Promise<LiveKitSidecarStartResult> {
   const installRoot = resolveSidecarInstallRoot()
-  const installed = sidecarPackageInstalled(installRoot)
+  let installed = sidecarPackageInstalled(installRoot)
   const port = resolveAgentHealthPort()
   const healthUrl = `http://127.0.0.1:${port}/worker`
 
@@ -630,6 +659,14 @@ export async function startLiveKitSidecarRuntime(
   }
 
   const preferences = await resolveRuntimePreferences(userId)
+
+  if (resolveSidecarInstallOwnership() === 'batshit-managed') {
+    const nativeStatus = await getNativeLiveKitInstallStatus()
+    if (!nativeStatus.sidecarInstalled || nativeStatus.sidecarUpdateAvailable) {
+      await installLiveKitSidecarPackage()
+      installed = true
+    }
+  }
 
   if (!installed) {
     return {
@@ -675,8 +712,29 @@ export async function startLiveKitSidecarRuntime(
     }
   }
 
+  let forceServerRestart = options.forceServerRestart === true
+  if (
+    resolveSidecarInstallOwnership() === 'batshit-managed' &&
+    isBatshitManagedLocalLiveKitServerConfig(liveKitConfig)
+  ) {
+    const nativeStatus = await getNativeLiveKitInstallStatus()
+    if (!nativeStatus.serverInstalled || nativeStatus.serverUpdateAvailable) {
+      const serverPort = getLocalLiveKitServerPort(liveKitConfig.serverUrl)
+      const serverWasRunning = serverPort
+        ? await fetchLiveKitServerReady(liveKitServerHttpUrl(liveKitConfig.serverUrl, serverPort))
+        : false
+      await installLiveKitServerBinary()
+      forceServerRestart =
+        forceServerRestart || (nativeStatus.serverUpdateAvailable && serverWasRunning)
+    }
+  }
+
   const currentHealth = await inspectLiveKitSidecarHealth(port)
-  const server = await ensureManagedLocalLiveKitServer({ userId, ...liveKitConfig })
+  const server = await ensureManagedLocalLiveKitServer({
+    userId,
+    ...liveKitConfig,
+    forceRestart: forceServerRestart
+  })
   const serverBlocksRuntime = server.managed && server.status !== 'ready'
   if (serverBlocksRuntime) {
     return {
@@ -762,10 +820,12 @@ export async function startLiveKitSidecarRuntime(
       installRoot,
       installOwnership: resolveSidecarInstallOwnership(),
       launch: {
-        command: 'npm',
-        args: ['run', 'start'],
+        command: process.execPath,
+        args: ['node_modules/tsx/dist/cli.mjs', 'src/livekit-agent-sidecar.ts', 'start'],
         cwd: '.',
         env: {
+          NODE_OPTIONS: '--no-warnings',
+          NODE_NO_WARNINGS: '1',
           LIVEKIT_URL: liveKitConfig.serverUrl,
           LIVEKIT_API_KEY: liveKitConfig.apiKey,
           LIVEKIT_API_SECRET: liveKitConfig.apiSecret,
@@ -832,8 +892,12 @@ export async function installLiveKitSidecarRuntime(userId: string): Promise<{
   install: LiveKitNativeInstallResult
   runtime: LiveKitSidecarStartResult
 }> {
+  const before = await getNativeLiveKitInstallStatus()
   const install = await installNativeLiveKitRuntime(userId)
-  const runtime = await startLiveKitSidecarRuntime(userId, { forceRestart: true })
+  const runtime = await startLiveKitSidecarRuntime(userId, {
+    forceRestart: true,
+    forceServerRestart: before.serverUpdateAvailable
+  })
   return { install, runtime }
 }
 

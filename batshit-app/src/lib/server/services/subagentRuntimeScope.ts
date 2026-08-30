@@ -147,6 +147,8 @@ export async function buildManagedSubagentDynamicInfo(options: {
       agentBrowserEnabled: scope.nativeToolSettings.agentBrowserEnabled,
     },
     allowFabricControlTools: false,
+    // SA-104 P3: memory tools are PA-only in v1 (deferred subagent-memory decision).
+    memoryControlsEnabled: false,
   })
   if (mcpIndex.text.trim()) {
     lines.push('', mcpIndex.text.trim())

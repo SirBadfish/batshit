@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { RecipeMigrationPlan } from './migrationPlanContracts'
+import { planAppearanceRecipeMigration } from './appearanceRecipeMigrationPlanner'
+import { createRecipePhysicalMigrationFixture } from './fixtures/recipePhysicalMigrationPair'
 import {
   RECIPE_AUTHOR_CHANGE_FAMILIES,
   RECIPE_AUTHOR_CHANGE_FAMILY_RULES,
@@ -119,6 +121,35 @@ describe('Recipe Blender-author update policy', () => {
 
   it('allows a verified visual presentation change only through explicit preview review', () => {
     const plan = policyPlan('verified-preview-required')
+    expect(classifyRecipeAuthorUpdatePlan(plan)).toBe('verified-preview-required')
+  })
+
+  it('classifies a production-planned same-topology geometry change as verified preview required', async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      baseId: 'batshit-base-f-v1',
+      sameTopologyGeometryChange: true
+    })
+    const plan = await planAppearanceRecipeMigration({
+      planId: 'migration.author-policy.same-topology-geometry',
+      fromRecipeRevision: 1,
+      edge: fixture.edge,
+      sourceState: fixture.sourceState,
+      sourcePackage: {
+        recipeSource: fixture.source.recipeSource,
+        packageBytes: fixture.source.packageBytes,
+        glbBytes: fixture.source.glbBytes,
+        manifestBytes: fixture.source.manifestBytes
+      },
+      targetPackage: {
+        recipeSource: fixture.target.recipeSource,
+        packageBytes: fixture.target.packageBytes,
+        glbBytes: fixture.target.glbBytes,
+        manifestBytes: fixture.target.manifestBytes
+      },
+      siblingInputs: fixture.siblingInputs,
+      componentMapBundle: fixture.componentMapBundle
+    })
+
     expect(classifyRecipeAuthorUpdatePlan(plan)).toBe('verified-preview-required')
   })
 })

@@ -23,6 +23,7 @@ describe('atomic Goon mutation repository', () => {
       'nailSurface',
       'skinAppearance',
       'hairState',
+      'clothingState',
       'recipeFitReceipts'
     ]) {
       expect(() => assertGenericGoonPatchAllowed(existing, { [field]: null })).toThrowError(

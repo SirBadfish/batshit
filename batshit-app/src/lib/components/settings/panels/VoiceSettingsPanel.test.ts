@@ -339,6 +339,102 @@ describe('VoiceSettingsPanel external engine refresh', () => {
     expect(previewInput).toHaveValue('Hey! This is a quick voice test from Batshit.')
   })
 
+  it('offers the tested managed LiveKit update and installs it before restart', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+
+      if (url.includes('/api/user/settings')) {
+        return jsonResponse({ settings: { voice_settings: baseVoiceSettings } })
+      }
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/providers')) {
+        return jsonResponse({ providers: [browserProvider] })
+      }
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      if (url.includes('/api/voice/runtime/livekit')) {
+        if (init?.method === 'POST') {
+          return jsonResponse({
+            runtime: {
+              id: 'livekit',
+              name: 'LiveKit',
+              installed: true,
+              selected: false,
+              autoStartOnLaunch: false,
+              status: 'ready',
+              statusHint: 'Sidecar worker is ready.',
+              healthUrl: 'http://127.0.0.1:7899/worker',
+              agentName: 'batshit-livekit-agent',
+              updateAvailable: false,
+              installedVersion: '1.6.3',
+              targetVersion: '1.6.3',
+              started: true,
+              restarted: true
+            }
+          })
+        }
+        return jsonResponse({
+          runtime: {
+            id: 'livekit',
+            name: 'LiveKit',
+            installed: true,
+            selected: false,
+            autoStartOnLaunch: false,
+            status: 'unreachable',
+            statusHint: 'A tested LiveKit runtime update is available.',
+            healthUrl: 'http://127.0.0.1:7899/worker',
+            agentName: null,
+            updateAvailable: true,
+            installedVersion: '1.4.3',
+            targetVersion: '1.6.3',
+            server: {
+              managed: true,
+              status: 'ready',
+              statusHint: 'Local LiveKit server is reachable.',
+              url: 'http://127.0.0.1:7880',
+              containerName: null,
+              image: null,
+              installScope: 'native-managed',
+              version: '1.12.0',
+              targetVersion: '1.13.5',
+              updateAvailable: true
+            }
+          }
+        })
+      }
+
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+    render(VoiceSettingsPanel, {
+      props: {
+        data: {
+          user: { id: 'josh' },
+          userSettings: { voice_settings: baseVoiceSettings }
+        }
+      }
+    })
+
+    await openVoiceTab('Voice Engines')
+    expect(await screen.findByText('Update available')).toBeInTheDocument()
+    expect(screen.getByText(/Agent 1\.4\.3 -> 1\.6\.3/)).toBeInTheDocument()
+    expect(screen.getByText(/Server 1\.12\.0 -> 1\.13\.5/)).toBeInTheDocument()
+    await fireEvent.click(screen.getByRole('button', { name: 'Update & Restart' }))
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([input, init]) =>
+          resolveUrl(input).includes('/api/voice/runtime/livekit') && init?.method === 'POST'
+      )
+      expect(post).toBeTruthy()
+      expect(JSON.parse(String(post?.[1]?.body))).toMatchObject({
+        operation: 'install',
+        forceRestart: true
+      })
+    })
+  })
+
   it('refreshes Voice Engines when an external voice-engine event is dispatched', async () => {
     let byoLoadCount = 0
 

@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   hostedVercelAppDisabledResponse,
   isHostedAppExemptPath,
-  shouldBlockHostedVercelAppRequest
+  shouldBlockHostedVercelAppRequest,
+  isHostedVercelRegistryDeployment
 } from './hostedAppGuard'
 
 function request(pathname: string, env: Record<string, string | undefined> = {}) {
@@ -35,6 +36,19 @@ describe('hosted app guard', () => {
 
     expect(request('/registry/catalog.json', { VERCEL: '1' })).toBe(false)
     expect(request('/api/admin/cron/model-catalog', { VERCEL: '1' })).toBe(false)
+  })
+
+  it('treats Vercel without the hosted-app opt-in as a registry-only deployment', () => {
+    expect(isHostedVercelRegistryDeployment({ VERCEL: '1' })).toBe(true)
+    expect(isHostedVercelRegistryDeployment({ VERCEL: 'true' })).toBe(true)
+  })
+
+  it('does not treat self-hosted or opted-in hosted runtimes as registry-only', () => {
+    expect(isHostedVercelRegistryDeployment({})).toBe(false)
+    expect(isHostedVercelRegistryDeployment({ NODE_ENV: 'production' })).toBe(false)
+    expect(
+      isHostedVercelRegistryDeployment({ VERCEL: '1', BATSHIT_ENABLE_HOSTED_APP: '1' })
+    ).toBe(false)
   })
 
   it('returns a non-indexable disabled response', () => {

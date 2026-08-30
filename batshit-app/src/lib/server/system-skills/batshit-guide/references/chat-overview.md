@@ -75,6 +75,7 @@ The conversation is the center, but several panels frame it. Each has its own pa
 ## Related docs
 
 - [Sessions sidebar](sessions-sidebar.md)
+- [Memory & Infinite Sessions](memory-and-infinite-sessions.md)
 - [Zips and context](../tools/zips.md)
 - [Clips](../clips/overview.md)
 - [Primary Agents](../primary-agents/overview.md)

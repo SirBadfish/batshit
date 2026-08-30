@@ -1,0 +1,10 @@
+{
+  "comment": "Conflicts that already existed when the style-conflict check landed. This list may shrink, never grow. Fix an entry, then rerun with --write-baseline.",
+  "generated": 12,
+  "entries": {
+    "src/lib/components/settings/panels/GoonsSettingsPanel.svelte|batshit-settings-action-row-title|leading-none|line-height": 3,
+    "src/lib/components/settings/panels/GoonsSettingsPanel.svelte|batshit-settings-action-row|justify-end|justify-content": 1,
+    "src/lib/components/settings/panels/GoonsSettingsPanel.svelte|batshit-settings-l1-card|flex|display": 4,
+    "src/lib/components/settings/panels/GoonsSettingsPanel.svelte|batshit-settings-l1-card|overflow-hidden|overflow-x": 4
+  }
+}

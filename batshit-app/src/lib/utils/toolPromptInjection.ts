@@ -37,6 +37,25 @@ export function buildToolGuidanceZipPromptBlock(options?: {
     '- If an edit is blocked, provide the patch or handoff for the external coding workspace when useful.'
   ]
 
+  // SA-104 P1: Tool Notes have their own control tag, decoupled from zip
+  // control, so agents without zip permission never see zip-control syntax just
+  // to save notes. End-of-message stays the documented convention for bulky
+  // control blocks; the strip layer makes any position safe.
+  const toolNotesGuidance = toolNotesEnabled
+    ? [
+        '',
+        'Tool Notes (your lightweight memory):',
+        '- Save short factual notes about tool results you will need after the raw output is zipped.',
+        '- Tool Notes are Batshit app metadata, not private reasoning and not a place for private instructions. They are user-visible through an expandable Tool Results Summary panel on your message.',
+        '- Append the block at the end of your message. Never output the JSON by itself; wrap it in the tag.',
+        '- Omit the block entirely when you have no useful notes.',
+        'Tool Notes block example:',
+        '<batshit-tool-notes>',
+        '{"notes":[{"toolName":"...","summary":"exact fact(s) to retain"}]}',
+        '</batshit-tool-notes>'
+      ]
+    : []
+
   if (zipPermission === 'agent') {
     return [
       `Runtime: ${runtimeFlavor} | ${viewLine}`,
@@ -49,8 +68,7 @@ export function buildToolGuidanceZipPromptBlock(options?: {
       toolNotesEnabled
         ? '- Tool Notes are lightweight memory. Save only the exact facts you will need after the raw result disappears.'
         : '- Tool Notes are disabled for this agent/session.',
-      '- Tool Results Summary is Batshit app metadata, not private reasoning and not a place for private instructions. Keep it short, factual, and limited to information the user could inspect from the tool result.',
-      '- Transparency: Tool Results Summary notes are user-visible in Batshit through an expandable summary panel on the assistant message. Zip/unzip controls also leave visible state through zip badges and expanded/collapsed content. Use these features for token management and continuity, not to hide information from the user.',
+      '- Zip/unzip controls leave visible state through zip badges and expanded/collapsed content. Use these features for token management and continuity, not to hide information from the user.',
       '',
       'Zip control (permission ON):',
       '- Treat natural-language requests as zip-control requests. If the user or their custom instructions say things like "keep this unzipped," "unzip these memory files," "leave this tool output available," or "pin this context," use the `unzip` control when zip control is enabled; the user does not need to mention Batshit zip control or the control-block syntax.',
@@ -58,24 +76,22 @@ export function buildToolGuidanceZipPromptBlock(options?: {
       '- Never use `tool_result_0`; numbering starts at 1.',
       '- For older zips already visible in chat history, use the actual zip ID from the zip index/reference.',
       '- `zip`: use zip IDs for content you are done with and want compressed again. Do not zip user-locked items.',
-      '- Use `toolResultsSummary` for short factual notes when a summary is enough.',
       toolNotesEnabled
         ? `- Need to read a zip right now? ${fetchZipInstruction} It peeks without changing zip state. If it should stay available after this response, also put its zip ID in \`unzip\` and save important facts in Tool Notes.`
         : `- Need to read a zip right now? ${fetchZipInstruction} It peeks without changing zip state. If it should stay available after this response, also put its zip ID in \`unzip\`.`,
       '- Changes apply on the next user message.',
+      '- Do not put Tool Notes inside the zip-control block; notes have their own `<batshit-tool-notes>` block.',
       '',
-      'Only append a zip-control block when you actually need to change zip state or save Tool Notes.',
-      'Do not append an empty zip-control block. If there are no zip changes and no useful Tool Notes, omit the block entirely.',
-      'Put all normal spoken prose before `<batshit-zip-control>`; the zip-control block must be the final thing in your message.',
+      'Only append a zip-control block when you actually need to change zip state.',
+      'Do not append an empty zip-control block. If there are no zip changes, omit the block entirely.',
+      'Put all normal spoken prose before any control blocks; append control blocks at the very end of your message.',
       'Never output the JSON by itself; it must be wrapped in `<batshit-zip-control>` and `</batshit-zip-control>`.',
-      'Do not write any visible reply text after `</batshit-zip-control>`, especially in Voice Mode because later text may not be spoken aloud reliably.',
       'Batshit strips the raw XML/JSON syntax from normal chat rendering, but its effects are visible in the UI.',
-      'Zip-control block examples (append after your normal response):',
+      'Zip-control block example (append after your normal response):',
       '<batshit-zip-control>',
-      toolNotesEnabled
-        ? '{"unzip":["tool_result_1","tool_result_3"],"zip":["zipId"],"toolResultsSummary":[{"toolName":"...","summary":"exact fact(s) to retain"}]}'
-        : '{"unzip":["tool_result_1","tool_result_3"],"zip":["zipId"]}',
-      '</batshit-zip-control>'
+      '{"unzip":["tool_result_1","tool_result_3"],"zip":["zipId"]}',
+      '</batshit-zip-control>',
+      ...toolNotesGuidance
     ].join('\n')
   }
 
@@ -90,31 +106,84 @@ export function buildToolGuidanceZipPromptBlock(options?: {
     toolNotesEnabled
       ? '- Tool Notes are your lightweight memory. Save only the exact facts you will need later.'
       : '- Tool Notes are disabled for this agent/session.',
-    '- Tool Results Summary is Batshit app metadata, not private reasoning and not a place for private instructions. Keep it short, factual, and limited to information the user could inspect from the tool result.',
-    '- Transparency: Tool Results Summary notes are user-visible in Batshit through an expandable summary panel on the assistant message. Use summaries for token management and continuity, not to hide information from the user.',
     '',
     'Zip control (user-only):',
-    '- Do NOT include unzip/zip actions.',
+    '- Do NOT include unzip/zip actions or zip-control blocks.',
     `- Ask the user to unzip content if needed, or fetch it when available: ${fetchZipInstruction}`,
     toolNotesEnabled
       ? `- Auto-zipped tools/content can be manually unzipped by the user; you can revisit it with Fetch Zip or your Tool Notes.`
       : `- Auto-zipped tools/content can be manually unzipped by the user; you can revisit it with Fetch Zip.`,
     '- Treat natural-language requests such as "keep this unzipped" or "unzip these memory files" as zip-state requests. Because zip control is disabled for you here, do not include unzip/zip actions; ask the user to unzip from the UI or fetch the zip when you need to re-check it.',
-    ...(toolNotesEnabled
-      ? [
-          '',
-          'Only append a zip-control block when you need to save Tool Notes.',
-          'Do not append an empty zip-control block. If there are no useful Tool Notes, omit the block entirely.',
-          'Put all normal spoken prose before `<batshit-zip-control>`; the zip-control block must be the final thing in your message.',
-          'Never output the JSON by itself; it must be wrapped in `<batshit-zip-control>` and `</batshit-zip-control>`.',
-          'Do not write any visible reply text after `</batshit-zip-control>`, especially in Voice Mode because later text may not be spoken aloud reliably.',
-          'Batshit strips the raw XML/JSON syntax from normal chat rendering, then shows the summaries through the expandable Tool Results Summary panel.',
-          'Zip-control block example (summaries only):',
-          '<batshit-zip-control>',
-          '{"toolResultsSummary":[{"toolName":"...","summary":"exact fact(s) to retain"}]}',
-          '</batshit-zip-control>'
-        ]
-      : [])
+    ...toolNotesGuidance
+  ].join('\n')
+}
+
+/**
+ * Code fallback for the Memory guidance block (SA-104 P3), used only when the Redis
+ * prompt key (`batshit:tool_guidance_memory_prompt`) is empty — packaged defaults
+ * normally seed it on boot. Injected by BOTH compilation twins for memory-enabled
+ * agents only; keep the two call sites and this text in sync with the packaged
+ * `batshit_tool_prompt_memory.md`.
+ */
+export function buildMemoryPromptBlock(options?: {
+  runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+}): string {
+  const runtimeFlavor = options?.runtimeFlavor ?? 'vercel'
+  const searchTool = runtimeFlavor === 'vercel' ? 'native_batshit_tool_search' : 'batshit_tool_search'
+  const useTool = runtimeFlavor === 'vercel' ? 'native_batshit_tool_use' : 'batshit_tool_use'
+
+  return [
+    'You have a persistent memory. What you save now is available in future conversations with you.',
+    '',
+    'The Three Memory Lanes (types)',
+    '(Note: You are responsible for *saving* all three types, but you are only responsible for *surfacing* one type)',
+    'Every memory lives in one of three lanes, chosen at save time. Saving is always your job; the lane decides how the memory comes back to you:',
+    '1. `awareness` — (Addendum to your main System Prompt)',
+    '- Things you should never lose sight of. Surfaces itself, instantly: from your very next message it is compiled into your system prompt, every turn — no tool call, no recall, ever. Saving it IS surfacing it. Supports expiry (expired entries demote, they are never erased). Great for stuff you really need to know (stay aware of) at all times.',
+    '2. `stm` — (Short-Term-Memory)',
+    '- Trigger Memories (requires trigger_terms). Surfaces itself on cue: the moment a USER message mentions a trigger word, the memory is inserted into your DYNAMIC INFO block automatically — no tool call. (Your own use of the word does not fire it; the scan reads the user\'s messages.) Great for people, pets, projects, and recurring topics.',
+    '3. `ltm` — (Long-Term-Memory)',
+    '- Searchable memory, the default lane for most facts. The one lane you surface yourself: it comes back only when you go looking with your memory tools (search, then recall). Save here freely — it costs nothing until you fetch it.',
+    '',
+    'Saving:',
+    '- Hot path: append an inline save block at the END of your message (zero tool round-trip):',
+    '<batshit-memory>',
+    '{"lane":"ltm","content":"the fact, compact and self-contained","importance":6}',
+    '</batshit-memory>',
+    '- One block per memory; several blocks are fine. Put all normal prose before any control blocks.',
+    '- stm saves need trigger_terms, e.g. {"lane":"stm","content":"Maggie is the user\'s Irish Setter","trigger_terms":["maggie"],"importance":7}.',
+    '- stm saves may set "linger": how long the memory stays in context after its trigger was last mentioned — turns 0-30, or "episode" to hold for the rest of the current episode; omit for the user-set default.',
+    '- Save compact facts, not transcripts. Include when the fact was true via event_at if it differs from now. When the content runs long, add a gist — it becomes the headline in search results.',
+    '- A malformed save fails visibly and you get a correction note next turn — fix it then.',
+    '- Saying is not saving. "I\'ll keep that in mind" stores nothing — when a fact deserves to survive this conversation, write the save block (or call the save tool) in that same reply. The visible "Memory saved" chip is the proof.',
+    '',
+    'Keeping memory honest (supersession discipline):',
+    '- When a fact CHANGES, do not pile up contradictions: save the new fact with "supersedes":["old_memory_id"], or call the supersede tool. Superseded memories stay stored and flagged, never deleted.',
+    '- Delete only what is outright wrong or unwanted; prefer supersede so history keeps its receipts.',
+    '',
+    `Deliberate operations (through \`${searchTool}\` / \`${useTool}\`, family "fabric"):`,
+    '- `fabric:sys.memory.search` — hybrid search with lane and time-range filters; returns summary references only, ranked by relevance × recency × importance (rows marked linked_from rode in via another result\'s links).',
+    '- `fabric:sys.memory.recall` — read chosen memory ids in full. The complete content returns immediately in the tool result — use it in this same reply. That tool result never enters chat history; the same memories then ride your Memory context from the next message onward and linger (that is the handoff). Attached photos arrive with the next message.',
+    '- `fabric:sys.memory.list` / `update` / `supersede` / `unsupersede` / `move_lane` / `delete` — maintenance operations.',
+    '- Search results alone are just references; recall is the read.',
+    '',
+    'Episodes, naps, and the whiteboard (Infinite Sessions only):',
+    '- `fabric:sys.memory.close_episode` — mark the current work chapter finished at a real boundary; a new episode opens on the next message, and closed episodes graduate later (nothing is deleted).',
+    '- `fabric:sys.memory.hold_episode` — keep the current episode open across idle gaps ("continue tomorrow"): pass hold_until (ISO) or null to clear. Without a hold, a long break closes the episode on its own.',
+    '- `fabric:sys.memory.whiteboard` — rewrite your EPISODE WHITEBOARD: working facts (goal, decisions, live state, open items) kept in your system prompt until the episode closes. Pass the complete new content, or null to clear. All three controls error outside Infinite Sessions.',
+    '- When the window grows near its limit, Batshit naps between turns: closed episodes graduate to searchable memory (a gist stays in the window), stale tool bulk compresses, and if needed the oldest open-episode narrative is summarized with your whiteboard refreshed. Recent conversation never graduates — the floor is guaranteed.',
+    '- Between conversations your memory dreams: near-duplicates consolidate (provenance kept), supersession chains get repaired, expiries demote (never erase), and closed episodes graduate overnight — every action logged for the user with its reason. Do not spend live turns on bulk memory reorganization; maintenance happens while you rest.',
+    '- Never claim a memory or episode action you did not perform — the tool call is the act, and the visible records (chips, the episode line, nap and dreaming logs) are what the user checks.',
+    '',
+    'How remembered content reaches you:',
+    '- Inserted memories appear in the `Memory context:` section of your DYNAMIC INFO block, grouped as Current (new this message) and Lingering (from earlier messages). Inserts linger after their last relevance, then drop out (✅ new, ✳️ refreshed, 🟢 lingering). Trigger and recall inserts have separate user-set linger defaults; a Trigger Memory\'s own "linger" setting beats the default.',
+    '- Your awareness entries compile into the AWARENESS section of your system prompt instead; entries with Clip media list the media textually — recall the memory when you need to see it.',
+    '- Need something recalled to stay around for a stretch of work? Promote it: move it to awareness (`sys.memory.move_lane`), pin it on the episode whiteboard, or give the Trigger Memory "linger":"episode" rather than re-recalling forever.',
+    '- Insert lanes are budgeted; a `More available:` line tells you when matches were left out.',
+    '- Search results may include a `segments` group: graduated conversation stretches. Recall a segment id (memseg_…) exactly like a memory id to receive that episode\'s full summary.',
+    '- In group chats your saves and memory tools work, but automatic inserts (triggers, recalls, Awareness) are active only in single-agent sessions for now.',
+    '',
+    'Everything you store is fully visible to the user in their Memory Panel — memory is shared ground truth, never a private notebook.'
   ].join('\n')
 }
 

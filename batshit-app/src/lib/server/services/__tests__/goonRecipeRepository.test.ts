@@ -17,6 +17,7 @@ import {
   createAnatomyFitResult,
   createAnatomyFitState,
   createGoonRecipeDocument,
+  createRecipeMigrationPlan,
   verifyRecipeStateSnapshot
 } from '$lib/goons/recipe'
 import type { GoonRecord } from '$lib/types/goons'
@@ -280,6 +281,121 @@ function goonWithPendingJob(stateVersion = 1, writeVersion = 2): GoonRecord {
   }
 }
 
+async function storageStableMigrationPlanDocument() {
+  const owner = recipeOwner()
+  const source = owner.authoringRevision.source
+  const state = owner.authoringRevision.state
+  const errors = {
+    scalarMaximum: 0,
+    positionMaximumMeters: 0,
+    positionRmsMeters: 0,
+    scaleMaximum: 0,
+    quaternionMaximumRadians: 0,
+    matrixMaximum: 0,
+    bakedPositionMaximumMeters: 4.470348358154297e-8,
+    bakedPositionRmsMeters: 3.3219461576257802e-9
+  }
+  const componentId = 'component.body'
+  const plan = await createRecipeMigrationPlan({
+    contract: RECIPE_MIGRATION_PLAN_CONTRACT,
+    schemaVersion: 1,
+    planId: 'migration.redisjson.storage-stability',
+    directEdgeKey: 'recipe.redisjson.v1-to-v2',
+    edgeSha256: sha('1'),
+    fromSource: source,
+    toSource: source,
+    fromRecipeRevision: 1,
+    toRecipeRevision: 2,
+    fromStateSha256: state.stateSha256,
+    toleranceProfile: 'recipe-strict/v1',
+    componentMapBundleSha256: null,
+    outcome: {
+      kind: 'automatic',
+      readiness: 'ready',
+      preservationClaim: 'appearance-preserved',
+      rejectionCodes: [],
+      cleanResetEligibility: 'not-applicable',
+      basedOnUnsupportedPlanSha256: null
+    },
+    controlRows: [
+      {
+        ledgerId: 'body_height',
+        sourceControl: { id: 'body_height', kind: 'dial', value: 0 },
+        targetControl: { id: 'body_height', kind: 'dial', value: 0 },
+        edgeAction: 'keep',
+        componentId,
+        resolution: 'kept',
+        aliasId: null,
+        candidateOrigin: 'identity',
+        candidateProofSha256: sha('2'),
+        componentProofSha256: sha('0'),
+        maximumScalarError: 0,
+        proofStatus: 'verified',
+        reasonCode: 'UNCHANGED_IDENTITY',
+        message: 'The saved value remains exact.',
+        requiresPreview: false,
+        requiresConfirmation: false
+      }
+    ],
+    siblingRows: ['eyeAppearance', 'facialArtwork', 'oralAppearance'].map((surface) => ({
+      surface: surface as 'eyeAppearance' | 'facialArtwork' | 'oralAppearance',
+      sourceState: null,
+      targetDefinition: null,
+      action: 'not-present' as const,
+      resolution: 'not-present' as const,
+      proposedState: null,
+      proofStatus: 'not-required' as const,
+      proofSha256: sha('3'),
+      reasonCode: 'SIBLING_NOT_PRESENT' as const,
+      message: 'This sibling surface is not present.',
+      requiresPreview: false,
+      requiresConfirmation: false
+    })),
+    componentProofs: [
+      {
+        componentId,
+        sourceControlIds: ['body_height'],
+        targetControlIds: ['body_height'],
+        solver: 'identity',
+        authorizedCandidateCount: 1,
+        selectedCandidateSha256: sha('4'),
+        uniquenessMethod: 'identity',
+        uniquenessProofSha256: sha('5'),
+        componentMapSha256: null,
+        sourcePhysicalOutputSha256: sha('6'),
+        targetPhysicalOutputSha256: sha('6'),
+        comparedOutputKeysSha256: sha('7'),
+        mismatchDomains: [],
+        status: 'verified',
+        errors,
+        rejectionCodes: [],
+        proofSha256: sha('0')
+      }
+    ],
+    wholeRecipeProof: {
+      status: 'verified',
+      sourcePhysicalOutputSha256: sha('6'),
+      targetPhysicalOutputSha256: sha('6'),
+      sourceAbsoluteOutputSha256: sha('8'),
+      targetAbsoluteOutputSha256: sha('8'),
+      sourceMaterialSha256: sha('9'),
+      targetMaterialSha256: sha('9'),
+      materialMatches: true,
+      errors: { ...errors, bakedPositionMaximumMeters: 0, bakedPositionRmsMeters: 0 },
+      mismatchDomains: [],
+      permitsAppearancePreservedClaim: true,
+      proofSha256: sha('0')
+    },
+    warnings: [],
+    proposedState: state
+  })
+  return createGoonRecipeDocument({
+    userId: USER_ID,
+    goonId: GOON_ID,
+    content: plan as unknown as Record<string, unknown>
+  })
+}
+
 describe('Goon Recipe repository', () => {
   useRedisTestServer()
 
@@ -430,6 +546,19 @@ describe('Goon Recipe repository', () => {
     await expect(
       verifyRecipeStateSnapshot(stored.recipe!.authoringRevision.state)
     ).resolves.toEqual(snapshot)
+  })
+
+  it.runIf(REAL_REDIS_LANE)('preserves migration-plan proof hashes through RedisJSON', async () => {
+    const document = await storageStableMigrationPlanDocument()
+    const proof = (document.content.componentProofs as Array<{ errors: Record<string, number> }>)[0]
+    expect(proof.errors.bakedPositionMaximumMeters).toBe(4.4703483581543e-8)
+    expect(proof.errors.bakedPositionRmsMeters).toBe(3.32194615762578e-9)
+
+    await putGoonRecipeDocument(document)
+
+    await expect(
+      getGoonRecipeDocument(USER_ID, GOON_ID, document.sha256)
+    ).resolves.toEqual(document)
   })
 
   it.runIf(REAL_REDIS_LANE)('never replaces an existing immutable transaction record', async () => {

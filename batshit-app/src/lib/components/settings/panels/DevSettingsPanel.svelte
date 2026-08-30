@@ -837,9 +837,9 @@
 
                       <div class="flex flex-wrap items-center justify-between gap-2">
                         <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                          <span>fetchedAt: <code class="rounded bg-muted/40 px-1 py-0.5">{report.fetchedAt}</code></span>
+                          <span>fetchedAt: <code class="rounded px-1 py-0.5">{report.fetchedAt}</code></span>
                           {#if report.previousFetchedAt}
-                            <span>prev: <code class="rounded bg-muted/40 px-1 py-0.5">{report.previousFetchedAt}</code></span>
+                            <span>prev: <code class="rounded px-1 py-0.5">{report.previousFetchedAt}</code></span>
                           {/if}
                         </div>
                         <Button

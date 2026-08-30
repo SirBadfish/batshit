@@ -30,6 +30,34 @@ function splitDeveloperModel(value: string): { developerId: string; modelId: str
   return { developerId: developerId.trim(), modelId }
 }
 
+/**
+ * 2026-08-28: router namespaces disagree on a few developer slugs (found live when an
+ * OpenRouter preset built from a gateway-shaped catalog id sent `zai/glm-5.3-flash`
+ * and OpenRouter 404ed — it wants `z-ai/`). When we CONSTRUCT a router id ourselves
+ * (no exact catalog variant for that connection), translate known divergent slugs to
+ * the target router's convention. Slugs already in the target convention pass through.
+ */
+const ROUTER_DEVELOPER_SLUG_OVERRIDES: Record<string, Record<string, string>> = {
+  openrouter: {
+    zai: 'z-ai',
+    xai: 'x-ai',
+    mistral: 'mistralai',
+    meta: 'meta-llama'
+  },
+  'vercel-gateway': {
+    'z-ai': 'zai',
+    'x-ai': 'xai',
+    mistralai: 'mistral',
+    'meta-llama': 'meta'
+  }
+}
+
+function routerDeveloperSlug(routerId: string, developerId: string): string {
+  const overrides = ROUTER_DEVELOPER_SLUG_OVERRIDES[routerId]
+  if (!overrides) return developerId
+  return overrides[developerId.toLowerCase()] ?? developerId
+}
+
 const DIRECT_OWNER_PREFIX_SERVICES = new Set([
   'fal',
   'replicate',
@@ -163,9 +191,11 @@ export function resolveModelIds({
       (LOCAL_PREFIX_SERVICES.has(serviceLower) && hasParsedDeveloper) ||
       (connection?.useDeveloperPrefix && serviceLower.startsWith('custom_')))
   let effectiveModelId =
-    providerId === 'openrouter' || providerId === 'vercel-gateway' || shouldPrefixOwner
-      ? `${developerId}/${modelId}`
-      : modelId
+    providerId === 'openrouter' || providerId === 'vercel-gateway'
+      ? `${routerDeveloperSlug(providerId, developerId)}/${modelId}`
+      : shouldPrefixOwner
+        ? `${developerId}/${modelId}`
+        : modelId
 
   if (isFalDirect) {
     effectiveModelId = `fal-ai/${developerId}/${modelId}`
@@ -211,11 +241,11 @@ export function resolveCatalogIds({
     shouldPrefixGroq || (directService && DIRECT_OWNER_PREFIX_SERVICES.has(directService))
   )
   let effectiveModelId =
-    selectedConnectionId === 'openrouter' ||
-    selectedConnectionId === 'vercel-gateway' ||
-    shouldPrefixOwner
-      ? `${baseDeveloper}/${baseModel}`
-      : baseModel
+    selectedConnectionId === 'openrouter' || selectedConnectionId === 'vercel-gateway'
+      ? `${routerDeveloperSlug(selectedConnectionId, baseDeveloper)}/${baseModel}`
+      : shouldPrefixOwner
+        ? `${baseDeveloper}/${baseModel}`
+        : baseModel
 
   if (selectedConnectionId === 'direct:fal') {
     effectiveModelId = `fal-ai/${baseDeveloper}/${baseModel}`

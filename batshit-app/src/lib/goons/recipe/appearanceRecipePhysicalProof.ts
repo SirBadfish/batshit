@@ -125,6 +125,7 @@ export type AppearanceRecipePhysicalProofComparison = {
   matches: boolean;
   errors: AppearanceRecipePhysicalProofErrorSummary;
   mismatchDomains: AppearanceRecipePhysicalMismatchDomain[];
+  mismatchChannelKeys: string[];
   sourceLogicalOutputSha256: string;
   targetLogicalOutputSha256: string;
   sourceAbsoluteOutputSha256: string;
@@ -137,6 +138,7 @@ export type AppearanceRecipeRelativeComponentEffectComparison = {
   matches: boolean;
   errors: AppearanceRecipePhysicalProofErrorSummary;
   mismatchDomains: AppearanceRecipePhysicalMismatchDomain[];
+  mismatchChannelKeys: string[];
   sourceLogicalEffectSha256: string;
   targetLogicalEffectSha256: string;
   sourceAbsoluteEffectSha256: string;
@@ -1314,6 +1316,7 @@ function compareChannels(
   tolerances: AppearanceRecipePhysicalProofTolerances,
   errors: ErrorAccumulator,
   domains: Set<AppearanceRecipePhysicalMismatchDomain>,
+  mismatchChannelKeys: Set<string>,
   context: string,
 ): void {
   assertSameInventory(left, right, context);
@@ -1384,7 +1387,10 @@ function compareChannels(
         measured.matrix > tolerances.matrix ||
         measured.scalar > tolerances.scalar;
     }
-    if (mismatch) domains.add(entry.domain);
+    if (mismatch) {
+      domains.add(entry.domain);
+      mismatchChannelKeys.add(entry.key);
+    }
   }
 }
 
@@ -1468,12 +1474,14 @@ export async function compareAppearanceRecipePhysicalProof(
   );
   const errors = emptyErrors();
   const mismatchDomains = new Set<AppearanceRecipePhysicalMismatchDomain>();
+  const mismatchChannelKeys = new Set<string>();
   compareChannels(
     sourceLogical,
     targetLogical,
     tolerances,
     errors,
     mismatchDomains,
+    mismatchChannelKeys,
     "logical proof",
   );
   compareChannels(
@@ -1482,6 +1490,7 @@ export async function compareAppearanceRecipePhysicalProof(
     tolerances,
     errors,
     mismatchDomains,
+    mismatchChannelKeys,
     "absolute proof",
   );
   const sourceLogicalProjection = await canonicalProjection(
@@ -1504,6 +1513,7 @@ export async function compareAppearanceRecipePhysicalProof(
     matches: mismatchDomains.size === 0,
     errors: finishErrors(errors),
     mismatchDomains: [...mismatchDomains].sort(),
+    mismatchChannelKeys: [...mismatchChannelKeys].sort(),
     sourceLogicalOutputSha256: sourceLogicalProjection.projectionSha256,
     targetLogicalOutputSha256: targetLogicalProjection.projectionSha256,
     sourceAbsoluteOutputSha256: sourceAbsoluteProjection.projectionSha256,
@@ -1554,12 +1564,14 @@ export async function compareAppearanceRecipeRelativeComponentEffects(
   target.logical = alignedLogical.right;
   const errors = emptyErrors();
   const mismatchDomains = new Set<AppearanceRecipePhysicalMismatchDomain>();
+  const mismatchChannelKeys = new Set<string>();
   compareChannels(
     source.logical,
     target.logical,
     tolerances,
     errors,
     mismatchDomains,
+    mismatchChannelKeys,
     "relative logical effect proof",
   );
   compareChannels(
@@ -1568,6 +1580,7 @@ export async function compareAppearanceRecipeRelativeComponentEffects(
     tolerances,
     errors,
     mismatchDomains,
+    mismatchChannelKeys,
     "relative absolute effect proof",
   );
   const sourceLogical = await canonicalProjection(
@@ -1590,6 +1603,7 @@ export async function compareAppearanceRecipeRelativeComponentEffects(
     matches: mismatchDomains.size === 0,
     errors: finishErrors(errors),
     mismatchDomains: [...mismatchDomains].sort(),
+    mismatchChannelKeys: [...mismatchChannelKeys].sort(),
     sourceLogicalEffectSha256: sourceLogical.projectionSha256,
     targetLogicalEffectSha256: targetLogical.projectionSha256,
     sourceAbsoluteEffectSha256: sourceAbsolute.projectionSha256,

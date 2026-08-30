@@ -33,6 +33,7 @@ import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
 		| 'tools'
 		| 'mcp'
 		| 'slash-commands'
+		| 'memory'
 		| 'voice'
 		| '3d-goons'
 		| 'theme'

@@ -13,13 +13,15 @@
 		"preview": "vite preview",
 		"postinstall": "patch-package",
 		"prepare": "svelte-kit sync || echo ''",
-		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && node scripts/check-style-conflicts.mjs",
+		"check:styles": "node scripts/check-style-conflicts.mjs",
 		"lint": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"test": "vitest",
 		"test:ui": "vitest --ui",
 		"test:coverage": "vitest --coverage",
 		"test:redis": "VITEST_REDIS_URL=redis://127.0.0.1:6379/15 VITEST_USE_REAL_REDIS=true vitest run --pool=threads --maxWorkers=1",
+		"test:memory": "VITEST_MEMORY_SEARCH=true VITEST_USE_REAL_REDIS=true vitest run --pool=threads --maxWorkers=1 src/lib/server/services/memory",
 		"generate:brand-icons": "tsx scripts/generate-brand-icons.ts",
 		"generate:file-icons": "tsx scripts/generate-file-icons.ts",
 		"compare:model-catalog-sources": "tsx scripts/compare-model-catalog-sources.ts",
@@ -81,6 +83,7 @@
 		"@ai-sdk/mistral": "^4.0.32",
 		"@ai-sdk/openai": "^4.0.46",
 		"@ai-sdk/replicate": "^3.0.30",
+		"@huggingface/transformers": "4.2.0",
 		"@iarna/toml": "^2.2.5",
 		"@lobehub/icons-static-svg": "^1.90.0",
 		"@modelcontextprotocol/sdk": "^1.30.0",
@@ -106,6 +109,10 @@
 		"zod": "^4.4.3"
 	},
 	"overrides": {
+		"@huggingface/transformers": {
+			"onnxruntime-node": "1.29.0",
+			"sharp": "0.35.4"
+		},
 		"jsdom": {
 			"lru-cache": "^11.2.7"
 		},

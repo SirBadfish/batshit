@@ -238,6 +238,29 @@ export class SessionService {
     }
   }
 
+  /**
+   * SA-104 P5: the one-way Infinite Session transition. The dedicated route owns every
+   * rule (pre-first-message, no group, not archived, metadata merge, auto-lock);
+   * the client only reflects the returned record into the store.
+   */
+  async makeSessionFixed(sessionId: string): Promise<ChatSession | null> {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/fixed`, {
+      method: 'POST'
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      throw new Error(payload?.error || 'Failed to make this an Infinite Session.')
+    }
+    const updated = payload?.session as ChatSession | undefined
+    if (updated) {
+      sessionStore.updateSession(sessionId, {
+        metadata: updated.metadata,
+        locked: updated.locked
+      })
+    }
+    return updated ?? null
+  }
+
   async sessionHasMessages(sessionId: string): Promise<boolean> {
     try {
       const messages = await this.db.getMessages(sessionId, 1)
@@ -254,6 +277,19 @@ export class SessionService {
     try {
       await this.db.archiveSession(sessionId)
       sessionStore.deleteSession(sessionId) // Remove from active sessions list
+
+      // SA-104 P6: archiving is the closest thing a regular session has to "closing" —
+      // offer its tail to the memory graduation writer (DL-104-16). Fire-and-forget:
+      // the server no-ops for fixed/group sessions, memory-disabled agents, and
+      // too-small tails; failures never block the archive.
+      fetch('/api/memory/graduate-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, reason: 'close' })
+      }).catch((error) => {
+        console.warn('[SessionService] Close-time memory graduation request failed:', error)
+      })
+
       return true
     } catch (error) {
       console.error('Error archiving session:', error)

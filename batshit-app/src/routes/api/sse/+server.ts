@@ -1293,12 +1293,24 @@ async function processNDJSONLine(
       // Canonical error events are flat ({ type, error, metadata }), so the
       // eventData remap above resolves to data.metadata and would lose the
       // error text — read the flat fields first, legacy nested shapes second.
+      // n8n native-stream error events carry their text in `content` (the same
+      // field its item/chunk events use), so that is the final fallback.
+      const contentErrorText = (value: unknown): string => {
+        if (typeof value === 'string') return value.trim()
+        if (value && typeof value === 'object') {
+          const message = (value as Record<string, unknown>).message
+          if (typeof message === 'string') return message.trim()
+        }
+        return ''
+      }
       const errorEvent = await adapter.emitError({
         error:
           data.error ||
           data.message ||
           eventData.error ||
           eventData.message ||
+          contentErrorText(data.content) ||
+          contentErrorText(eventData.content) ||
           'Unknown error',
         metadata: data.metadata || eventData.metadata || {}
       })

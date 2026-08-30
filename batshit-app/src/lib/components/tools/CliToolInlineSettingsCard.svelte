@@ -463,7 +463,7 @@
             placeholder="/path/to/workspace&#10;/tmp"
           />
           {#if allowWrite && splitLines(allowedPathsText).length === 0}
-            <p class="batshit-settings-caption text-amber-500">
+            <p class="batshit-settings-caption is-warning">
               Add at least one allowed path before write access can save.
             </p>
           {/if}
@@ -553,7 +553,7 @@
               {/each}
             </div>
             {#if !envRefsValid}
-              <p class="batshit-settings-caption text-amber-500">
+              <p class="batshit-settings-caption is-warning">
                 Complete both fields for each env ref before changes can save.
               </p>
             {/if}
@@ -581,7 +581,7 @@
                 </div>
               </div>
               <div class="batshit-settings-form-control">
-                <code class="block min-w-0 overflow-x-auto whitespace-nowrap rounded bg-background/80 px-2 py-1 text-[11px]">
+                <code class="block min-w-0 overflow-x-auto whitespace-nowrap rounded px-2 py-1 text-[11px]">
                   {tool.executable}
                 </code>
               </div>
@@ -594,7 +594,7 @@
                 </div>
               </div>
               <div class="batshit-settings-form-control">
-                <code class="block min-w-0 overflow-x-auto whitespace-nowrap rounded bg-background/80 px-2 py-1 text-[11px]">
+                <code class="block min-w-0 overflow-x-auto whitespace-nowrap rounded px-2 py-1 text-[11px]">
                   {tool.toolId}
                 </code>
               </div>

@@ -24,6 +24,16 @@ export function isHostedAppExemptPath(pathname: string): boolean {
   return PUBLIC_REGISTRY_PATHS.has(normalized) || PROTECTED_CRON_PATHS.has(normalized)
 }
 
+// The hosted Vercel deployment serves ONLY the public registry JSON and protected cron
+// endpoints. It has no batshit-server, no uploads volume, and a read-only filesystem, so
+// single-user-instance startup work (backup-restore recovery, skill filesystem sync,
+// prompt/clip seeding) must not run there.
+export function isHostedVercelRegistryDeployment(
+  env: Record<string, string | undefined>
+): boolean {
+  return isTruthy(env.VERCEL) && !isTruthy(env.BATSHIT_ENABLE_HOSTED_APP)
+}
+
 export function shouldBlockHostedVercelAppRequest(input: {
   env: Record<string, string | undefined>
   url: URL

@@ -3,6 +3,9 @@ import { randomInt } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { json } from '@sveltejs/kit'
+import { commitMemoryTurnState } from '$lib/server/services/memory/memoryRecall'
+import { ensureFixedSessionOpenEpisode } from '$lib/server/services/memory/memoryEpisodes'
+import { isFixedSession } from '$lib/utils/fixedSession'
 import { logger } from '$lib/utils/logger'
 import type { RequestHandler } from './$types'
 import { messageRouter } from '$lib/server/services/messageRouter'
@@ -90,6 +93,7 @@ import type { CodexRuntimeSettings } from '$lib/types/codex'
 import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
 import type { ClaudeRuntimeSettings } from '$lib/types/claude'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
+import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { THINKING_INDICATOR } from '$lib/utils/thinkingIndicator'
 import { resolveMCPSelections } from '$lib/server/services/mcpSelectionResolver'
 import type { MCPSelectionResolution } from '$lib/server/services/mcpSelectionResolver'
@@ -2918,6 +2922,8 @@ interface BatshitStreamParams {
   eventFetch: typeof fetch
   request: Request
   consumeSessionClips?: boolean
+  /** SA-104 P5: the already-loaded session record (Infinite Session episode opening). */
+  sessionRecord?: Record<string, any> | null
 }
 
 interface BatshitStreamResult {
@@ -2953,10 +2959,15 @@ async function handleBatshitAgentStream({
   eventFetch,
   request,
   consumeSessionClips = true,
+  sessionRecord = null,
 }: BatshitStreamParams): Promise<BatshitStreamResult> {
   const zipDetection = new ZipDetectionService()
   let zipSettingsAgent: Record<string, unknown> | null =
     agent as unknown as Record<string, unknown>
+  // SA-104 P5: the accepted-send memory commit result, merged into the finalized
+  // assistant message metadata as the chat-surface "memory inserted" affordance.
+  let memoryTurnCommit: import('$lib/server/services/memory/memoryRecall').MemoryTurnCommitResult | null =
+    null
 
   let messageId = providedMessageId ?? null
   if (!messageId) {
@@ -4142,6 +4153,29 @@ async function handleBatshitAgentStream({
           endMetadataBase.zipReferences = finishSummary.zipReferences
         }
       }
+      // SA-104 P5: chat-surface "memory inserted" affordance — the accepted-send
+      // commit result rides the finalized assistant message. On-my-mind presence is
+      // deliberately not stamped (ambient every turn; EV owns that visibility).
+      if (
+        memoryTurnCommit?.committed &&
+        (memoryTurnCommit.insertedNewIds.length > 0 ||
+          memoryTurnCommit.refreshedIds.length > 0 ||
+          memoryTurnCommit.heldIds.length > 0)
+      ) {
+        endMetadataBase.memoryInserted = {
+          version: 1,
+          new: memoryTurnCommit.insertedNewIds.length,
+          refreshed: memoryTurnCommit.refreshedIds.length,
+          held: memoryTurnCommit.heldIds.length,
+          ids: [
+            ...memoryTurnCommit.insertedNewIds,
+            ...memoryTurnCommit.refreshedIds,
+            ...memoryTurnCommit.heldIds,
+          ],
+          // Per-item rows (2026-08-28) power the chip's click-open detail popover.
+          ...(memoryTurnCommit.items.length > 0 ? { items: memoryTurnCommit.items } : {}),
+        }
+      }
       const sanitizedEndMetadata = sanitizePayloadForLogs(endMetadataBase)
       const sanitizedIntermediateSteps = sanitizePayloadForLogs(
         finishSummary.intermediateSteps.length > 0
@@ -4729,6 +4763,8 @@ async function handleBatshitAgentStream({
     messageId,
     agentId,
     agentSlug: agent.slug ?? null,
+    // SA-104 P3: primary-agent sends of memory-enabled agents get the sys.memory.* refs.
+    memoryControlsEnabled: resolveAgentMemoryEnabled(agent),
     messages: streamMessages,
     model: modelId,
     mode4Style: mode4Style ?? undefined,
@@ -5339,6 +5375,30 @@ async function handleBatshitAgentStream({
 
   if (consumeSessionClips) {
     await consumePostCompileSessionClips(sessionId)
+
+    // SA-104 P4: the memory linger commit rides the same accepted-send boundary as
+    // clip consumption and the same continuation flag (no double-tick on
+    // context-exhaustion auto-continues). Approval resumes and continuation runs have
+    // no compiled current user message, so they commit nothing; group member sends
+    // arrive with consumeSessionClips=false and group recall stays inert in v1.
+    // Failures propagate loudly, exactly like clip consumption above.
+    if (messageForCompilation && !groupContext) {
+      // SA-104 P5: an Infinite (fixed) session keeps one open episode while it is
+      // lived in; the accepted send opens it lazily (regular sessions return null
+      // untouched). Episode upkeep runs BEFORE the commit so 'episode' linger holds
+      // bind to the episode this send belongs to (2026-08-28).
+      await ensureFixedSessionOpenEpisode({
+        session: sessionRecord,
+        sessionId,
+        agentId,
+      })
+      memoryTurnCommit = await commitMemoryTurnState({
+        userId,
+        agentId,
+        sessionId,
+        currentUserMessage: messageForCompilation,
+      })
+    }
   }
 
   registerStreamAbort(sessionId, messageId, streamAbortController)
@@ -7479,6 +7539,20 @@ export const POST: RequestHandler = async ({
       }
     }
 
+    // SA-104 P5 (DL-104-12): Infinite Sessions refuse group entry — the server-side
+    // backstop behind the group-picker guard and the fixed-transition group check.
+    if (groupConfig && isFixedSession(session)) {
+      return json(
+        {
+          error: 'Infinite Sessions do not support group chat.',
+          code: 'FIXED_SESSION_GROUP_UNSUPPORTED',
+          details:
+            'This chat is an Infinite Session (one agent, one ongoing conversation). Use a regular session for group chat.',
+        },
+        { status: 409 },
+      )
+    }
+
 	    let n8nPrimaryRunRegistered = false
 	    const sessionTurnKind = groupConfig ? 'group' : 'single'
     const activeSessionTurn = getActiveSessionTurn(sessionId)
@@ -7816,6 +7890,7 @@ export const POST: RequestHandler = async ({
             userId: resolvedUserId,
             eventFetch,
             request,
+            sessionRecord: session,
           })
 
           // Auto-continue after mid-run context-window exhaustion: the failed
@@ -7969,6 +8044,24 @@ export const POST: RequestHandler = async ({
       )
 
       await consumePostCompileSessionClips(sessionId)
+
+      // SA-104 P4: the n8n lane compiles in the browser (read-only recall context via
+      // /api/memory/compile-context); its linger commit happens HERE, server-side, at
+      // the same accepted-send boundary as clip consumption (P0 §9 answered). n8n has
+      // no group or continuation runs on this path. Failures propagate loudly.
+      if (typeof content === 'string' && content.trim()) {
+        // SA-104 P5: Infinite (fixed) sessions keep one open episode (lazy open,
+        // same boundary); upkeep runs BEFORE the commit so 'episode' linger holds
+        // bind to the right episode. The native n8n lane does this in
+        // /api/memory/turn-commit.
+        await ensureFixedSessionOpenEpisode({ session, sessionId, agentId })
+        await commitMemoryTurnState({
+          userId: resolvedUserId,
+          agentId,
+          sessionId,
+          currentUserMessage: content,
+        })
+      }
 
       // n8n Primary Agents use the existing non-streaming router path.
       const result = await messageRouter.route({

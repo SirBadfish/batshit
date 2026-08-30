@@ -41,6 +41,7 @@ const GOON_ANIMATION_MAX_FILE_SIZE = 350 * MIB;
 const GOON_IMAGE_UPLOAD_MAX_FILE_SIZE = 25 * MIB;
 const GOON_SKIN_SURFACE_UPLOAD_MAX_FILE_SIZE = 100 * MIB;
 const GOON_HAIR_ASSET_MAX_FILE_SIZE = 64 * MIB;
+const GOON_CLOTHING_ASSET_MAX_FILE_SIZE = 128 * MIB;
 const GOON_SCENE_UPLOAD_MAX_FILE_SIZE = 50 * MIB;
 const GOON_SCENE_MODEL_UPLOAD_MAX_FILE_SIZE = 200 * MIB;
 const GOON_ANIMATION_PREVIEW_MAX_FILE_SIZE = 40 * MIB;
@@ -137,6 +138,10 @@ const goonSkinSurfaceArtworkUpload = multer({
 const goonHairAssetUpload = multer({
   storage,
   limits: { fileSize: GOON_HAIR_ASSET_MAX_FILE_SIZE }
+});
+const goonClothingAssetUpload = multer({
+  storage,
+  limits: { fileSize: GOON_CLOTHING_ASSET_MAX_FILE_SIZE }
 });
 
 // Goon scene uploads (skybox images can be larger)
@@ -467,6 +472,8 @@ function getUploadLimitForPath(reqPath) {
       return GOON_ANIMATION_PREVIEW_MAX_FILE_SIZE;
     case '/upload/goon-hair-asset':
       return GOON_HAIR_ASSET_MAX_FILE_SIZE;
+    case '/upload/goon-clothing-asset':
+      return GOON_CLOTHING_ASSET_MAX_FILE_SIZE;
     default:
       return null;
   }
@@ -2518,6 +2525,81 @@ router.post('/upload/goon-hair-import-source', goonHairAssetUpload.single('file'
   } catch (error) {
     writeErrorLog(logger, 'Goon Hair import source upload error', error);
     sendUploadError(res, 'Hair import source upload failed', error);
+  }
+});
+
+const GOON_CLOTHING_ASSET_ROLES = new Map([
+  ['geometry', { ext: '.glb', signature: 'glb', mimetype: 'model/gltf-binary' }],
+  ['auxiliary-geometry', { ext: '.glb', signature: 'glb', mimetype: 'model/gltf-binary' }],
+  ['motion-definition', { ext: '.json', signature: 'json', mimetype: 'application/json' }],
+  ['base-color', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['normal', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['metallic-roughness', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['preview', { ext: '.png', signature: 'png', mimetype: 'image/png' }],
+  ['source-receipt', { ext: '.json', signature: 'json', mimetype: 'application/json' }],
+  ['fit-receipt', { ext: '.json', signature: 'json', mimetype: 'application/json' }]
+]);
+
+function validateClothingAssetArtifact(file, role) {
+  const spec = GOON_CLOTHING_ASSET_ROLES.get(role);
+  if (!spec) throw uploadValidationError('Clothing Asset artifact role is unsupported.');
+  const originalName = file?.originalname || `clothing${spec.ext}`;
+  if (path.extname(originalName).toLowerCase() !== spec.ext) {
+    throw uploadValidationError(`Clothing Asset ${role} must use the ${spec.ext} extension.`);
+  }
+  if (!file?.buffer?.length) throw uploadValidationError(`Clothing Asset ${role} is empty.`);
+  if (spec.signature === 'json') {
+    if (!bufferLooksText(file.buffer)) {
+      throw uploadValidationError(`Clothing Asset ${role} must be strict UTF-8 JSON.`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(file.buffer));
+    } catch {
+      throw uploadValidationError(`Clothing Asset ${role} must be strict UTF-8 JSON.`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw uploadValidationError(`Clothing Asset ${role} must contain one JSON object.`);
+    }
+  } else if (detectUploadSignature(file.buffer) !== spec.signature) {
+    throw uploadValidationError(`Clothing Asset ${role} content does not match ${spec.ext}.`);
+  }
+  return spec;
+}
+
+function validateClothingAssetOwnerSegment(value, label) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  const safe = sanitizeFilenameSegment(raw, '').slice(0, 80);
+  if (!raw || raw.length > 80 || safe !== raw) {
+    throw uploadValidationError(`Clothing Asset ${label} must be a 1-80 character stable ID using letters, numbers, hyphens, or underscores.`);
+  }
+  return safe;
+}
+
+router.post('/upload/goon-clothing-asset', goonClothingAssetUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No Clothing Asset artifact uploaded' });
+    const role = typeof req.body?.role === 'string' ? req.body.role.trim() : '';
+    const assetId = validateClothingAssetOwnerSegment(req.body?.assetId, 'assetId');
+    const revisionId = validateClothingAssetOwnerSegment(req.body?.revisionId, 'revisionId');
+    const spec = validateClothingAssetArtifact(req.file, role);
+    const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+    const filename = `${assetId}_${revisionId}_${sanitizeFilenameSegment(role, 'artifact')}_${sha256}${spec.ext}`;
+    const file = await storeFilesystemUploadAsset(req, {
+      uploadType: 'goon_clothing_assets',
+      originalName: req.file.originalname || filename,
+      filename,
+      mimetype: spec.mimetype,
+      buffer: req.file.buffer,
+      size: req.file.buffer.length,
+      metadata: {
+        clothingAssetArtifact: { assetId, revisionId, role, sha256 }
+      }
+    });
+    return res.json({ success: true, file, role });
+  } catch (error) {
+    writeErrorLog(logger, 'Goon Clothing Asset artifact upload error', error);
+    sendUploadError(res, 'Clothing Asset artifact upload failed', error);
   }
 });
 

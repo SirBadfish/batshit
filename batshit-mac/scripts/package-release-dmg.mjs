@@ -15,6 +15,7 @@ const defaultDmgPath = join(packageRoot, 'Batshit-0.1.0-macos-ReleaseSafe.dmg');
 const defaultStagingRoot = join(packageRoot, 'release-dmg-staging');
 const entitlementsPath = join(macRoot, 'macos.entitlements');
 const childEntitlementsPath = join(macRoot, 'macos.child.entitlements');
+const nodeRuntimeEntitlementsPath = join(macRoot, 'macos.node-runtime.entitlements');
 
 function usage() {
   console.log(`Usage: npm run package:dmg -- [options]
@@ -179,6 +180,16 @@ function verifyCodesign(path) {
 
 async function signAppBundle(appPath, identity) {
   const mainExecutable = join(appPath, 'Contents', 'MacOS', 'Batshit');
+  const managedNodeExecutable = join(
+    appPath,
+    'Contents',
+    'Resources',
+    'runtime',
+    'vendor',
+    'node',
+    'bin',
+    'node'
+  );
   await sign({
     app: appPath,
     platform: 'darwin',
@@ -191,6 +202,9 @@ async function signAppBundle(appPath, identity) {
     optionsForFile(filePath) {
       if (filePath === appPath || filePath === mainExecutable) {
         return { entitlements: entitlementsPath, hardenedRuntime: true };
+      }
+      if (filePath === managedNodeExecutable) {
+        return { entitlements: nodeRuntimeEntitlementsPath, hardenedRuntime: true };
       }
       if (/\((?:GPU|Plugin|Renderer)\)\.app(?:\/|$)/.test(filePath)) return null;
       return { entitlements: childEntitlementsPath, hardenedRuntime: true };

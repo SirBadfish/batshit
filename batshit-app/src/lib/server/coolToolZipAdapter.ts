@@ -29,6 +29,8 @@ import {
   shouldPreferRawSidecarForAiExpansion
 } from '$lib/utils/coolToolAiContent'
 import { isBrokerToolUseName } from '$lib/utils/toolNameNormalization'
+import { isMemoryControlToolStep } from '$lib/utils/memoryControl'
+import { logger } from '$lib/utils/logger'
 import {
   normalizeToolPayload,
   parseJsonIfLikely,
@@ -1150,6 +1152,17 @@ export async function adaptCoolToolsToZipSystem(
   intermediateSteps.forEach((step, index) => {
     const validStep = normalizeIntermediateStep(step)
     if (!validStep) return
+    // SA-104 P3 (DL-104-17): memory tools are exempt from zip-first treatment. Their
+    // responses are summary-first references by contract, and remembered content is
+    // persisted across turns only through the DCM insert channel — a cool-tool zip here would double-store
+    // memory content as tool output. Tradeoff: memory broker calls render no persistent
+    // cool-tool card (Execution Viewer still records them).
+    if (isMemoryControlToolStep(validStep)) {
+      logger.debug('[CoolToolZipAdapter] Skipping zip for memory control step (DL-104-17)', {
+        toolName: validStep?.toolName ?? validStep?.tool ?? null
+      })
+      return
+    }
     const prepared = prepareCoolTool(validStep)
     validSteps.push({ index, prepared })
   })

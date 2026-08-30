@@ -23,6 +23,7 @@
 	} from '$lib/components/ui/alert-dialog';
 	import type { ChatSession } from '$lib/stores/session.svelte';
 	import { SessionService } from '$lib/services/sessions';
+	import { isFixedSession } from '$lib/utils/fixedSession';
 	
 	interface Props {
 		session: ChatSession;
@@ -107,6 +108,64 @@
 	let lockUpdatePending = $state(false);
 	const isIdEditingDisabled = $derived(Boolean(isSessionLocked || hasSessionMessages))
 
+	// SA-104 P5: Infinite Session state + the one-way transition flow.
+	const isSessionFixed = $derived(isFixedSession(session))
+	const canBecomeFixed = $derived(
+		!isSessionFixed && !hasSessionMessages && !session.archived && !groupChatEnabled
+	)
+	let showFixedConfirmDialog = $state(false)
+	let fixedUpdatePending = $state(false)
+	let episodeSummary = $state<{
+		openedAt: string | null
+		holdUntil: string | null
+		closedCount: number
+		hasWhiteboard: boolean
+		whiteboardUpdatedAt: string | null
+	} | null>(null)
+
+	function requestFixedSession() {
+		if (!canBecomeFixed || fixedUpdatePending) return
+		showFixedConfirmDialog = true
+	}
+
+	async function confirmFixedSession() {
+		if (!sessionService || fixedUpdatePending) return
+		fixedUpdatePending = true
+		try {
+			await sessionService.makeSessionFixed(session.id)
+			showFixedConfirmDialog = false
+			const { toast } = await import('svelte-sonner')
+			toast.success('This chat is now an Infinite Session. It is locked and pinned to the top of the sidebar.')
+		} catch (error) {
+			console.error('Failed to make session fixed:', error)
+			const { toast } = await import('svelte-sonner')
+			toast.error(error instanceof Error ? error.message : 'Failed to make this an Infinite Session.')
+		} finally {
+			fixedUpdatePending = false
+		}
+	}
+
+	async function refreshEpisodeSummary() {
+		if (!isSessionFixed) {
+			episodeSummary = null
+			return
+		}
+		try {
+			const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/episodes`)
+			if (!response.ok) return
+			const payload = await response.json()
+			episodeSummary = {
+				openedAt: payload?.open?.opened_at ?? null,
+				holdUntil: payload?.open?.hold_until ?? null,
+				closedCount: Number(payload?.closedCount) || 0,
+				hasWhiteboard: Boolean(payload?.open?.whiteboard),
+				whiteboardUpdatedAt: payload?.open?.whiteboard_updated_at ?? null
+			}
+		} catch (error) {
+			console.warn('Failed to load episode state:', error)
+		}
+	}
+
 	function readString(...values: unknown[]): string | null {
 		for (const value of values) {
 			if (typeof value !== 'string') continue
@@ -120,7 +179,7 @@
 		if (!open) return;
 		currentEditName = session.name || session.id;
 		currentEditId = session.id;
-		await refreshSessionMessageState();
+		await Promise.all([refreshSessionMessageState(), refreshEpisodeSummary()]);
 	}
 
 	async function refreshSessionMessageState() {
@@ -478,6 +537,11 @@
 						Group
 					</span>
 				{/if}
+				{#if isSessionFixed}
+					<span class="session-item-group-badge session-item-fixed-badge" title="Infinite Session: one agent, one ongoing conversation">
+						Infinite
+					</span>
+				{/if}
 				{#if sessionRunLabel}
 					<span
 						class="session-item-run-status"
@@ -502,10 +566,16 @@
 				{isSessionLocked}
 				{lockUpdatePending}
 				{isArchived}
+				{isSessionFixed}
+				{canBecomeFixed}
+				{fixedUpdatePending}
+				{groupChatEnabled}
+				{episodeSummary}
 				onMenuOpenChange={handleMenuOpenChange}
 				onNameSave={handleNameSave}
 				onIdSave={handleIdSave}
 				onLockToggle={handleLockToggle}
+				onFixedRequest={requestFixedSession}
 				onViewMarkdown={handleViewMarkdown}
 				onArchive={handleArchive}
 				onUnarchive={handleUnarchive}
@@ -531,6 +601,27 @@
 			<AlertDialogCancel onclick={() => (showDeleteDialog = false)}>Cancel</AlertDialogCancel>
 			<AlertDialogAction onclick={confirmDelete} class="session-delete-action" disabled={isSessionLocked}>
 				Delete Session
+			</AlertDialogAction>
+		</AlertDialogFooter>
+	</AlertDialogContent>
+</AlertDialog>
+
+<AlertDialog bind:open={showFixedConfirmDialog}>
+	<AlertDialogContent>
+		<AlertDialogHeader>
+			<AlertDialogTitle>Make This an Infinite Session?</AlertDialogTitle>
+			<AlertDialogDescription>
+				An Infinite Session is one agent living in one ongoing conversation. It is locked
+				against deletion, pinned to the top of the sidebar, and cannot go back to being a
+				regular chat. Group chat is not available in Infinite Sessions. Tip: set a custom
+				Session ID in this menu first, because the ID cannot change after the first
+				message.
+			</AlertDialogDescription>
+		</AlertDialogHeader>
+		<AlertDialogFooter>
+			<AlertDialogCancel onclick={() => (showFixedConfirmDialog = false)}>Cancel</AlertDialogCancel>
+			<AlertDialogAction onclick={confirmFixedSession} disabled={fixedUpdatePending}>
+				Make Infinite Session
 			</AlertDialogAction>
 		</AlertDialogFooter>
 	</AlertDialogContent>

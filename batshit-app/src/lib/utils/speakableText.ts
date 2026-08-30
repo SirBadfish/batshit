@@ -1,3 +1,9 @@
+import {
+  pairedBlockRegexGlobal,
+  ttsHiddenTagNames,
+  unclosedTailRegexGlobal
+} from './controlTags'
+
 const SPEAKABLE_HTML_TAGS = new Set([
   'a',
   'abbr',
@@ -61,6 +67,12 @@ const EMOJI_COMBO_JOINER_PATTERN = new RegExp(
   `(${EMOJI_CLUSTER_SOURCE})\\s*\\+\\s*(${EMOJI_CLUSTER_SOURCE})`,
   'gu'
 )
+
+// Markdown reference definitions (`[label]: https://example.com`). The label is
+// captured so reference-link collapsing can require a definition that actually
+// exists in the same text; bracket TTS cues share the `[a][b]` shape and must not
+// be mistaken for links. See `collectMarkdownReferenceLabels`.
+const MARKDOWN_REFERENCE_DEFINITION_PATTERN = /^\s{0,3}\[([^\]]+)\]:\s+\S+.*$/gm
 
 export type SpeakableItalicBehavior = 'speak' | 'silent'
 
@@ -237,6 +249,18 @@ function stripMarkdownItalicNarrationForSpeech(text: string): string {
   return output
 }
 
+// A Markdown reference link only resolves when its label is defined somewhere in
+// the same text. Collecting the defined labels first lets `[a][b]` collapse for
+// real links while leaving adjacent bracket TTS cues (`[sad][whispering]`) alone.
+function collectMarkdownReferenceLabels(text: string): Set<string> {
+  const labels = new Set<string>()
+  for (const match of text.matchAll(MARKDOWN_REFERENCE_DEFINITION_PATTERN)) {
+    const label = match[1]?.trim().toLowerCase()
+    if (label) labels.add(label)
+  }
+  return labels
+}
+
 function stripMarkdownForSpeech(text: string, options: SpeakableTextOptions = {}): string {
   let output = text
 
@@ -244,11 +268,22 @@ function stripMarkdownForSpeech(text: string, options: SpeakableTextOptions = {}
   output = output.replace(/```[\s\S]*?```/g, '')
   output = output.replace(/~~~[\s\S]*?~~~/g, '')
 
+  // Capture reference labels before their definitions are removed below.
+  const referenceLabels = collectMarkdownReferenceLabels(output)
+
   // Remove reference definitions and image/link URLs while preserving useful labels.
-  output = output.replace(/^\s{0,3}\[[^\]]+\]:\s+\S+.*$/gm, '')
+  output = output.replace(MARKDOWN_REFERENCE_DEFINITION_PATTERN, '')
   output = output.replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
   output = output.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-  output = output.replace(/\[([^\]]+)\]\[[^\]]*\]/g, '$1')
+
+  // Collapse full (`[text][label]`) and collapsed (`[label][]`) reference links only
+  // when the label was defined. Bracket-cue TTS engines (Fish Audio S2, Inworld) emit
+  // adjacent cues such as `[excited][laughing]`, which are the same shape but must
+  // reach the engine intact instead of being spoken as the literal word "excited".
+  output = output.replace(/\[([^\]]+)\]\[([^\]]*)\]/g, (match, label: string, reference: string) => {
+    const target = (reference.trim() || label.trim()).toLowerCase()
+    return referenceLabels.has(target) ? label : match
+  })
 
   // Strip block-level Markdown markers that should not be spoken.
   output = output.replace(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/gm, '$1')
@@ -317,11 +352,17 @@ function stripToolResultsSummarySections(text: string): string {
 }
 
 function stripKnownControlTails(text: string): string {
-  return text
-    .replace(/<batshit-zip-control\b[\s\S]*?<\/batshit-zip-control>/gi, '')
-    .replace(/<batshit-zip-control\b[\s\S]*$/gi, '')
-    .replace(/<(batshit-group|batshit-cue)\b[\s\S]*?<\/\1>/gi, '')
-    .replace(/<batshit-(?:group|cue)\b[\s\S]*$/gi, '')
+  // Registry-driven (SA-104 P1): every TTS-hidden control tag is stripped in
+  // both its closed form and its unclosed trailing form. The unclosed form is
+  // load-bearing — realtime TTS can see a message end mid-block, and without
+  // this the generic tag stripper would keep the payload text and speak it.
+  let output = text
+  for (const tag of ttsHiddenTagNames()) {
+    output = output
+      .replace(pairedBlockRegexGlobal(tag), '')
+      .replace(unclosedTailRegexGlobal(tag), '')
+  }
+  return output
     .replace(/<tool[-_ ]?results(?:[-_ ]?summary)?\b[\s\S]*?<\/tool[-_ ]?results(?:[-_ ]?summary)?>/gi, '')
     .replace(/<tool[-_ ]?results(?:[-_ ]?summary)?\b[\s\S]*$/gi, '')
     .replace(/\btoolResultsSummary\b[\s\S]*$/i, '')
@@ -338,12 +379,8 @@ export function extractSpeakableText(content: string, options: SpeakableTextOpti
   // Remove mute blocks entirely (never read aloud).
   text = text.replace(/<mute[\s\S]*?>[\s\S]*?<\/mute>/gi, '')
 
-  // Remove control tags entirely (group chat metadata + presentation cues).
-  text = text
-    .replace(/<batshit-group[\s\S]*?>[\s\S]*?<\/batshit-group>/gi, '')
-    .replace(/<batshit-cue[\s\S]*?>[\s\S]*?<\/batshit-cue>/gi, '')
-
-  // Remove zip/tool note controls, including partial tails seen by realtime TTS.
+  // Remove every registered control tag (closed and unclosed trailing forms),
+  // including partial tails seen by realtime TTS.
   text = stripKnownControlTails(text)
 
   // Remove Tool Results Summary blocks from speech; they remain visible app metadata in chat.

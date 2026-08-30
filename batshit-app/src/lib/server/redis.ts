@@ -48,6 +48,23 @@ async function resolveRuntimeRedisUrl(): Promise<string> {
   })
 }
 
+// Every port a real Batshit Redis can listen on across install types (developer
+// default, Mac app, and isolated smoke/first-run test instances). The memory-search
+// test escape below must never match them.
+const BATSHIT_KNOWN_RUNTIME_REDIS_PORTS = new Set(['6379', '5639', '6380', '5649'])
+
+function isDesignatedMemorySearchTestUrl(redisUrl: string): boolean {
+  if (process.env.VITEST_MEMORY_SEARCH !== 'true') return false
+  const designated = process.env.MEMORY_TEST_REDIS_URL?.trim()
+  if (!designated || redisUrl !== designated) return false
+  try {
+    const port = new URL(redisUrl).port || '6379'
+    return !BATSHIT_KNOWN_RUNTIME_REDIS_PORTS.has(port)
+  } catch {
+    return false
+  }
+}
+
 function isProjectPreferences(value: unknown): value is ProjectPreferences {
   if (!value || typeof value !== 'object') return false
   const prefs = value as Partial<ProjectPreferences>
@@ -158,7 +175,13 @@ export class RedisService {
 
       // Test-safety: never allow Vitest to hit DB0. If no DB is specified,
       // or it points at /0, force it to DB15 so we don't wipe dev/prod data.
-      if (process.env.VITEST === 'true') {
+      //
+      // Single narrow exception (SA-104, testing-architecture.md §3): the memory-search
+      // test lane runs against a DEDICATED DISPOSABLE Redis whose db 0 it owns, because
+      // FT.CREATE only works on db 0. The escape applies only when the lane env is on,
+      // the URL is exactly the harness-designated MEMORY_TEST_REDIS_URL, and the port is
+      // not one of Batshit's known runtime ports — real instances can never qualify.
+      if (process.env.VITEST === 'true' && !isDesignatedMemorySearchTestUrl(redisUrl)) {
         const hasDb = /\/\d+$/.test(redisUrl)
         if (!hasDb) {
           redisUrl = `${redisUrl}/15`
@@ -483,6 +506,18 @@ export class RedisService {
           await client.del(`session:${id}:active_clips`)
         } catch (clipError) {
           console.error(`[deleteSession] Error deleting clip data:`, clipError)
+        }
+
+        // Delete the session's episode ledger + recall/linger state (SA-104, DL-104-13)
+        try {
+          const episodeKeys = await client.keys(`episode:${id}:*`)
+          if (episodeKeys.length > 0) {
+            await client.del(episodeKeys as [string, ...string[]])
+          }
+          await client.del(`session:${id}:episodes`)
+          await client.del(`memlinger:${id}`)
+        } catch (episodeError) {
+          console.error(`[deleteSession] Error deleting episode ledger:`, episodeError)
         }
         
         // Delete all session_clip associations
@@ -1180,6 +1215,27 @@ export class RedisService {
       // Delete agent
       await client.del(`agent:${id}`)
       await client.del(`agent:${id}:subagents`)
+
+      // Delete the agent's memory store (SA-104, DL-104-13). Memories, graduated
+      // segments, and the dreaming log are agent-scoped and survive session deletion;
+      // agent deletion is the explicit lifecycle end for them. KEYS is blocking but
+      // safe at single-user scale.
+      for (const pattern of [`memory:${id}:*`, `memseg:${id}:*`, `memdream:${id}:*`]) {
+        try {
+          const memoryKeys = await client.keys(pattern)
+          if (memoryKeys.length > 0) {
+            await client.del(memoryKeys as [string, ...string[]])
+            logger.debug(`[deleteAgent] Deleted ${memoryKeys.length} keys for ${pattern}`)
+          }
+        } catch (memoryError) {
+          console.error(`[deleteAgent] Error deleting memory keys for ${pattern}:`, memoryError)
+        }
+      }
+      try {
+        await client.del(`memdream_index:${id}`)
+      } catch (dreamIndexError) {
+        console.error(`[deleteAgent] Error deleting dreaming-log index:`, dreamIndexError)
+      }
 
       // Remove from user's agent list
       const agentObj = agent as any

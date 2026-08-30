@@ -9,6 +9,7 @@ import {
   recipeUpdatesFixture,
 } from "./fixtures/recipeUpdatePair";
 import { canonicalRecipeSha256 } from "./recipeCanonical";
+import { createRecipePhysicalMigrationFixture } from "./fixtures/recipePhysicalMigrationPair";
 import {
   parseRecipeMigrationReport,
   parseRecipeUpdateJob,
@@ -152,6 +153,28 @@ describe("recipe update v1/v2 fixture corpus", () => {
       fromRecipeRevision: 1,
       toRecipeRevision: 3,
     });
+  });
+
+  it("normalizes migration-report measurements across RedisJSON decimal drift", async () => {
+    const edge = parseRecipeUpdatesContract(recipeUpdatesFixture).edges[0];
+    const report = mutable(recipeMigrationReportFixture);
+    report.proof.wholeRecipeMaximumError = 4.470348358154297e-8;
+    report.proof.wholeRecipeRmsError = 3.3219461576257802e-9;
+    report.proof.reportSha256 = await recipeMigrationReportSha256(report, edge);
+    const normalized = await verifyRecipeMigrationReport(report, edge);
+    expect(normalized.proof.wholeRecipeMaximumError).toBe(
+      4.4703483581543e-8,
+    );
+    expect(normalized.proof.wholeRecipeRmsError).toBe(
+      3.32194615762578e-9,
+    );
+
+    const stored = mutable(normalized);
+    stored.proof.wholeRecipeMaximumError = 4.4703483581542975e-8;
+    stored.proof.wholeRecipeRmsError = 3.32194615762578e-9;
+    await expect(verifyRecipeMigrationReport(stored, edge)).resolves.toEqual(
+      normalized,
+    );
   });
 
   it("distinguishes removed-zero, removed-active, new, reset, and blocked report rows", () => {
@@ -474,6 +497,101 @@ describe("recipe-updates/v1 parser", () => {
     );
   });
 
+  it("accepts only a hash-bound, explicitly reviewed same-topology geometry change", async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      sameTopologyGeometryChange: true,
+    });
+    const contract = {
+      contract: "recipe-updates/v1" as const,
+      schemaVersion: 1 as const,
+      edges: [fixture.edge],
+    };
+
+    await expect(verifyRecipeUpdatesContract(contract)).resolves.toMatchObject({
+      edges: [
+        {
+          sameTopologyGeometryChange: {
+            mode: "author-intentional-target-geometry",
+            affectedMeshNodeIds: ["Body"],
+            affectedComponentIds: ["component.keep"],
+            requiresPreview: true,
+            requiresConfirmation: true,
+          },
+        },
+      ],
+    });
+
+    const missingWarning = mutable(contract);
+    missingWarning.edges[0].warnings = [];
+    expect(() => parseRecipeUpdatesContract(missingWarning)).toThrow(
+      "same-topology geometry change must carry a geometry-changed warning",
+    );
+
+    const unknownComponent = mutable(contract);
+    unknownComponent.edges[0].sameTopologyGeometryChange.affectedComponentIds = [
+      "component.unknown",
+    ];
+    expect(() => parseRecipeUpdatesContract(unknownComponent)).toThrow(
+      "same-topology geometry change references an unknown component",
+    );
+
+    const wrongAffectedMesh = mutable(contract);
+    wrongAffectedMesh.edges[0].sameTopologyGeometryChange.affectedMeshNodeIds = [
+      "OtherBody",
+    ];
+    expect(() => parseRecipeUpdatesContract(wrongAffectedMesh)).toThrow(
+      "affected meshes do not exactly match its authorized geometry channels",
+    );
+
+    const changedBehavior = mutable(contract);
+    changedBehavior.edges[0].sameTopologyGeometryChange.toBehaviorSha256 =
+      "bc".repeat(32);
+    expect(() => parseRecipeUpdatesContract(changedBehavior)).toThrow(
+      "does not bind one exact same-topology geometry transition",
+    );
+
+    const tampered = mutable(contract);
+    tampered.edges[0].sameTopologyGeometryChange.targetAuditSha256 =
+      "ab".repeat(32);
+    await expect(verifyRecipeUpdatesContract(tampered)).rejects.toThrow(
+      "same-topology geometry change proof hash mismatch",
+    );
+  });
+
+  it("accepts a hash-bound neutral geometry change with preserved relative controls", async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      sameTopologyNeutralGeometryChange: true,
+    });
+    const contract = {
+      contract: "recipe-updates/v1" as const,
+      schemaVersion: 1 as const,
+      edges: [fixture.edge],
+    };
+
+    await expect(verifyRecipeUpdatesContract(contract)).resolves.toMatchObject({
+      edges: [
+        {
+          sameTopologyGeometryChange: {
+            mode: "author-intentional-neutral-geometry",
+            affectedMeshNodeIds: ["Body"],
+            affectedComponentIds: ["component.keep"],
+            requiresPreview: true,
+            requiresConfirmation: true,
+          },
+        },
+      ],
+    });
+  });
+
+  it("rejects topology inventory drift from the same-topology geometry lane", async () => {
+    await expect(
+      createRecipePhysicalMigrationFixture({
+        topologyRebuild: true,
+        sameTopologyGeometryChange: true,
+      }),
+    ).rejects.toThrow("same-topology geometry transition");
+  });
+
   it("rejects incomplete or duplicate stable-id ledgers and control plans", () => {
     const missingLedgerEntry = mutable(recipeUpdatesFixture);
     missingLedgerEntry.edges[0].stableIdLedger.entries.pop();
@@ -613,6 +731,67 @@ describe("recipe-migration-report/v1 parser", () => {
     expect(parsed.warnings).toHaveLength(2);
   });
 
+  it("accepts preview-required neutral geometry with verified relative component rows", async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      sameTopologyNeutralGeometryChange: true,
+    });
+    const neutralEdge = fixture.edge;
+    const report: any = {
+      contract: "recipe-migration-report/v1",
+      reportId: "report_neutral_geometry",
+      directEdgeKey: neutralEdge.directEdgeKey,
+      edgeSha256: neutralEdge.edgeSha256,
+      fromRecipeRevision: 1,
+      toRecipeRevision: 2,
+      status: "preview-required",
+      entries: neutralEdge.controls
+        .map((control) => ({
+          id: control.id,
+          classification: "kept",
+          componentId: control.componentId,
+          oldValue:
+            fixture.sourceState.appearanceDials.values[control.id] ?? 0,
+          proposedValue:
+            fixture.sourceState.appearanceDials.values[control.id] ?? 0,
+          reason: "The relative control effect remains exact.",
+          proofStatus: "verified",
+          maximumError: 0,
+          tolerance: 1e-7,
+          proofSha256: "aa".repeat(32),
+          requiresPreview: false,
+          requiresConfirmation: false,
+        }))
+        .sort((left, right) => left.id.localeCompare(right.id)),
+      warnings: neutralEdge.warnings,
+      proof: {
+        toleranceProfile: "recipe-strict/v1",
+        wholeRecipeMaximumError: 0.025,
+        wholeRecipeRmsError: 0.01,
+        wholeRecipeTolerance: 1e-6,
+        wholeRecipeProofSha256: "bb".repeat(32),
+        reportSha256: "0".repeat(64),
+      },
+    };
+    report.proof.reportSha256 = await recipeMigrationReportSha256(
+      report,
+      neutralEdge,
+    );
+
+    await expect(
+      verifyRecipeMigrationReport(report, neutralEdge),
+    ).resolves.toMatchObject({
+      status: "preview-required",
+      entries: expect.arrayContaining([
+        expect.objectContaining({
+          componentId: "component.keep",
+          proofStatus: "verified",
+          requiresPreview: false,
+          requiresConfirmation: false,
+        }),
+      ]),
+    });
+  });
+
   it("rejects duplicate, incomplete, or contradictory rows", () => {
     const duplicate = mutable(recipeMigrationReportFixture);
     duplicate.entries.push(duplicate.entries.at(-1));
@@ -677,6 +856,32 @@ describe("recipe-migration-report/v1 parser", () => {
     );
     await expect(verifyRecipeMigrationReport(tampered, edge)).rejects.toThrow(
       "recipe migration report hash mismatch",
+    );
+  });
+
+  it("binds the report proof to the exact migration-plan whole proof", () => {
+    const report = mutable(recipeMigrationReportFixture);
+    const expectation: RecipeMigrationReportExpectation = {
+      classifications: Object.fromEntries(
+        edge.controls.map((control) => [
+          control.id,
+          report.entries.find(
+            (entry: { id: string }) => entry.id === control.id,
+          ).classification,
+        ]),
+      ),
+      status: report.status,
+      wholeRecipeProof: {
+        proofSha256: report.proof.wholeRecipeProofSha256,
+        maximumError: report.proof.wholeRecipeMaximumError,
+        rmsError: report.proof.wholeRecipeRmsError,
+      },
+    };
+    expect(() => parseRecipeMigrationReport(report, edge, expectation)).not.toThrow();
+
+    expectation.wholeRecipeProof!.proofSha256 = "cd".repeat(32);
+    expect(() => parseRecipeMigrationReport(report, edge, expectation)).toThrow(
+      "proof contradicts its migration plan",
     );
   });
 

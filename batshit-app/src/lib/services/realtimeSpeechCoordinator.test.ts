@@ -205,6 +205,59 @@ describe('RealtimeSpeechCoordinator', () => {
     })
   })
 
+  it('does not speak tool-notes payloads during realtime TTS (SA-104 P1 tag)', async () => {
+    coordinator.append(
+      'message-1',
+      'agent-1',
+      { tts: true },
+      'Reply before notes. <batshit-tool-notes>{"notes":[{"toolName":"voice_test","summary":"Visible UI note, not spoken"}]}</batshit-tool-notes>'
+    )
+
+    await expect(coordinator.finish('message-1', 'agent-1', { tts: true })).resolves.toBe(true)
+
+    expect(speak).toHaveBeenCalledTimes(1)
+    expect(speak).toHaveBeenCalledWith('Reply before notes.', {
+      voice: fishVoice,
+      agentId: 'agent-1',
+      messageId: 'message-1:realtime-tts:0',
+      manual: true
+    })
+  })
+
+  it('withholds a tool-notes block split across streaming chunks', async () => {
+    coordinator.append('message-1', 'agent-1', { tts: true }, 'Spoken part. <batshit-tool-no')
+    coordinator.append(
+      'message-1',
+      'agent-1',
+      { tts: true },
+      'tes>{"notes":[{"summary":"chunk-split note"}]}</batshit-tool-notes> After.'
+    )
+
+    await expect(coordinator.finish('message-1', 'agent-1', { tts: true })).resolves.toBe(true)
+
+    const spokenTexts = speak.mock.calls.map((call) => call[0] as string)
+    expect(spokenTexts.join(' ')).not.toContain('chunk-split note')
+    expect(spokenTexts.join(' ')).toContain('Spoken part.')
+    expect(spokenTexts.join(' ')).toContain('After.')
+  })
+
+  it('does not speak an inline memory save, including chunk-split delivery (SA-104 P3 tag)', async () => {
+    coordinator.append('message-1', 'agent-1', { tts: true }, 'I will remember that. <batshit-mem')
+    coordinator.append(
+      'message-1',
+      'agent-1',
+      { tts: true },
+      'ory>{"lane":"ltm","content":"spoken-leak canary fact"}</batshit-memory> Anything else?'
+    )
+
+    await expect(coordinator.finish('message-1', 'agent-1', { tts: true })).resolves.toBe(true)
+
+    const spokenTexts = speak.mock.calls.map((call) => call[0] as string)
+    expect(spokenTexts.join(' ')).not.toContain('spoken-leak canary fact')
+    expect(spokenTexts.join(' ')).toContain('I will remember that.')
+    expect(spokenTexts.join(' ')).toContain('Anything else?')
+  })
+
   it('does not speak group or cue control payloads during realtime TTS', async () => {
     coordinator.append(
       'message-1',

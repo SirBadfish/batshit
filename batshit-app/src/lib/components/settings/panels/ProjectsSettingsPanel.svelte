@@ -613,7 +613,7 @@
 </script>
 
 {#if listLoading}
-  <div class="flex items-center justify-center batshit-settings-empty-state">
+  <div class="batshit-settings-empty-state">
     <Loader2 class="mr-2 h-4 w-4 animate-spin" />
     Loading projects…
   </div>
@@ -693,7 +693,7 @@
                   <Label.Label class="batshit-settings-form-label">Path</Label.Label>
                 </div>
               </div>
-              <div class="batshit-settings-form-control">
+              <div class="batshit-settings-form-control is-wide">
                 <Input
                   placeholder="/Users/me/projects/my-app"
                   value={defaultWorkspacePath}
@@ -807,7 +807,7 @@
                         </SettingsInfoMenu>
                       </div>
                     </div>
-                    <div class="batshit-settings-form-control">
+                    <div class="batshit-settings-form-control is-wide">
                       <Input
                         id="create-root"
                         placeholder="/path/to/my-app"
@@ -1002,7 +1002,7 @@
                         </SettingsInfoMenu>
                       </div>
                     </div>
-                    <div class="batshit-settings-form-control">
+                    <div class="batshit-settings-form-control is-wide">
                       <Input
                         id="project-root"
                         placeholder="/path/to/my-app"
@@ -1171,7 +1171,7 @@
                       </SettingsInfoMenu>
                   {/snippet}
                     {#each DEFAULT_EXCLUSIONS as pattern}
-                      <code class="rounded bg-background px-2 py-1">{pattern}</code>
+                      <code class="rounded px-2 py-1">{pattern}</code>
                     {/each}
                 </SettingsAccordionCard>
               {/if}
@@ -1191,7 +1191,7 @@
                   </SettingsInfoMenu>
               {/snippet}
                 {#each SECURITY_EXCLUSIONS as pattern}
-                  <code class="rounded bg-background px-2 py-1">{pattern}</code>
+                  <code class="rounded px-2 py-1">{pattern}</code>
                 {/each}
             </SettingsAccordionCard>
 

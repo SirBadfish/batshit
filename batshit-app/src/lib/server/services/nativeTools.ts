@@ -32,6 +32,7 @@ import {
   resolveBrokerFamilies,
   resolveBrokerToolToggles
 } from '$lib/utils/brokerAvailability'
+import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
 import { findControls, useControl, type ControlRuntimeMode, type ControlUseErrorCode } from './fabricRegistry'
 import {
@@ -187,6 +188,8 @@ export interface NativeToolContext {
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
   allowArtifactRuntimeTools?: boolean
   allowFabricControlTools?: boolean
+  /** SA-104 P3: PRIMARY actor + agent `memory_enabled`. Default false (memory is opt-in). */
+  memoryControlsEnabled?: boolean
   projectPath?: string | null
   providerSettings?: Record<string, any> | null
   toolApprovalMode?: ToolApprovalMode
@@ -9397,7 +9400,8 @@ function resolveNativeAutomationToggleState(
 
 function resolveBatshitToolBrokerFamiliesForAutomation(
   settings: ResolvedNativeToolSettings,
-  context: NativeAutomationDispatchContext
+  context: NativeAutomationDispatchContext,
+  options?: { memoryControlsEnabled?: boolean }
 ): BatshitToolFamily[] {
   const families: BatshitToolFamily[] = []
   if (settings.dynamicMcpEnabled) families.push('mcp')
@@ -9409,6 +9413,16 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
     settings.batshitToolsEnabled &&
     context.actor_type === 'primary' &&
     (context.mode === 'mode3' || context.mode === 'mode4')
+  ) {
+    if (!families.includes('fabric')) families.push('fabric')
+  }
+  // SA-104 P3: memory controls open the fabric family for PRIMARY actors on every mode
+  // (n8n mode1/mode2 included) — the sys.zip.fetch precedent, scoped by the per-agent
+  // memory_enabled flag resolved by the caller from the governing agent record.
+  if (
+    settings.batshitToolsEnabled &&
+    context.actor_type === 'primary' &&
+    options?.memoryControlsEnabled === true
   ) {
     if (!families.includes('fabric')) families.push('fabric')
   }
@@ -10267,7 +10281,14 @@ export async function dispatchNativeAutomationPackAction(input: {
             selectedToolIds: parsedInput.value.selectedToolIds
           })
         : null
-    const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context)
+    // SA-104 P3: per-agent memory enablement, PRIMARY actors only. Subagents never get
+    // memory refs — subagent memory access is a deferred product decision and memory is
+    // PA-owned state (see BROKER_FABRIC_MEMORY_CONTROL_IDS).
+    const brokerMemoryControlsEnabled =
+      context.actor_type === 'primary' && resolveAgentMemoryEnabled(agentRecord)
+    const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context, {
+      memoryControlsEnabled: brokerMemoryControlsEnabled
+    })
     // SA-096 P4: same source as mode 3 registration and the DCM capability index's Fabric
     // count. This lane keeps its own actor/mode conditions, expressed as the two flags.
     const brokerFabricAllowedControlIds = new Set<string>(
@@ -10283,7 +10304,8 @@ export async function dispatchNativeAutomationPackAction(input: {
         allowFetchZip: context.actor_type === 'primary',
         allowFabricControlTools:
           context.actor_type === 'primary' &&
-          (context.mode === 'mode3' || context.mode === 'mode4')
+          (context.mode === 'mode3' || context.mode === 'mode4'),
+        memoryControlsEnabled: brokerMemoryControlsEnabled
       })
     )
     const brokerSelectedGateways =
@@ -11607,6 +11629,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
 
   const allowArtifactRuntimeTools = context.allowArtifactRuntimeTools !== false
   const allowFabricControlTools = context.allowFabricControlTools !== false
+  // SA-104 P3: opt-in per agent; subagent callers leave this unset/false.
+  const memoryControlsEnabled = context.memoryControlsEnabled === true
 
   // SA-096: shared with the compile twins' broker-guidance gate so registered tools and
   // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
@@ -11616,13 +11640,15 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     toggles: brokerToggles,
     hasCliTools: selectedCliToolIds.length > 0,
     allowArtifactRuntimeTools,
-    allowFabricControlTools
+    allowFabricControlTools,
+    memoryControlsEnabled
   })
   // SA-096 P4: same source as the DCM capability index's Fabric count.
   const apiBrokerFabricAllowedControlIds = new Set<string>(
     resolveBrokerFabricAllowedControlIds({
       toggles: brokerToggles,
-      allowFabricControlTools
+      allowFabricControlTools,
+      memoryControlsEnabled
     })
   )
 

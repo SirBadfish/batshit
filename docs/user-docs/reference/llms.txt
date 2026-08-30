@@ -17,7 +17,7 @@ Project:
 Canonical terms:
 - Primary Agents: n8n, API, CLI.
 - Subagents: API Subagents, CLI Subagents, n8n Workflow Subagents, n8n Subnode Subagents.
-- Batshit-original concepts (little or no outside equivalent; teach from zero): Zips, Clips, Tool Grid, DCM (Dynamic Current Message), Schema Hints, Group Chat single-speaker queue, Execution Viewer, Artifact Zones, Goons/Goon Dock.
+- Batshit-original concepts (little or no outside equivalent; teach from zero): Zips, Clips, Tool Grid, DCM (Dynamic Current Message), Schema Hints, Group Chat single-speaker queue, Execution Viewer, Artifact Zones, Goons/Goon Dock, Memory & Infinite Sessions (Awareness/STM/LTM lanes, episodes, naps, dreaming).
 - Do not use retired numbered primary-agent labels in public docs.
 - Use Batshit in prose. All-caps brand spelling appears only inside literal env var names.
 - Zip buffer counts previous agent/assistant responses, not user messages or individual tool calls. `Off` never zips; `Normal` uses buffer/threshold; `Auto` zips immediately by default. Very large tool transcripts may stay compressed even inside the buffer to protect model request size.
@@ -114,6 +114,7 @@ Useful public UserDocs sources for verification:
 - docs/user-docs/primary-agents/connect-n8n.md
 - docs/user-docs/groups/overview.md
 - docs/user-docs/chat/execution-viewer.md
+- docs/user-docs/chat/memory-and-infinite-sessions.md
 - docs/user-docs/security/overview.md
 - docs/user-docs/troubleshooting/bug-reports-and-diagnostics.md
 - docs/user-docs/skills/portable-skills.md

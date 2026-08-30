@@ -68,7 +68,6 @@ temp/
 batshit-app/static/ai-branding-generated/
 
 # Workspace/editor files
-.impeccable/
 .rgignore
 batshit.code-workspace
 *.code-workspace

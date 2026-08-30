@@ -217,6 +217,12 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length && left.every((entry) => right.includes(entry))
+  );
+}
+
 function record(value: unknown, context: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     fail(`${context} must be an object`);
@@ -559,7 +565,39 @@ async function buildComponentProofs(
         );
         errors = physicalErrors(comparison.errors);
         mismatchDomains = [...comparison.mismatchDomains].sort(compareText);
-        if (candidate.status === "non-preserved") {
+        const geometryChangeDeclared =
+          edge.sameTopologyGeometryChange?.affectedComponentIds.includes(
+            candidate.componentId,
+          ) === true;
+        const neutralGeometryChangeDeclared =
+          geometryChangeDeclared &&
+          edge.sameTopologyGeometryChange?.mode ===
+            "author-intentional-neutral-geometry";
+        const geometryChangeExplainsMismatch =
+          geometryChangeDeclared &&
+          comparison.mismatchDomains.length === 1 &&
+          comparison.mismatchDomains[0] === "geometry" &&
+          comparison.mismatchChannelKeys.length > 0 &&
+          sameStringSet(
+            comparison.mismatchChannelKeys,
+            edge.sameTopologyGeometryChange!.authorizedGeometryChannelKeys,
+          );
+        if (geometryChangeDeclared) {
+          if (neutralGeometryChangeDeclared && comparison.matches) {
+            status = "verified";
+            rejectionCodes.clear();
+          } else if (
+            !neutralGeometryChangeDeclared &&
+            !comparison.matches &&
+            geometryChangeExplainsMismatch
+          ) {
+            status = "not-preserved";
+            rejectionCodes.clear();
+          } else {
+            status = "failed";
+            rejectionCodes.add("COMPONENT_PROOF_FAILED");
+          }
+        } else if (candidate.status === "non-preserved") {
           status = "not-preserved";
         } else if (comparison.matches) {
           status = "verified";
@@ -1280,6 +1318,42 @@ async function wholeProof(
     const hasMaterialWarning = edge.warnings.some(
       (warning) => warning.code === "material-changed",
     );
+    const hasGeometryWarning = edge.warnings.some(
+      (warning) => warning.code === "geometry-changed",
+    );
+    const geometryChange = edge.sameTopologyGeometryChange;
+    const declaredGeometryComponents = new Set(
+      geometryChange?.affectedComponentIds ?? [],
+    );
+    const observedGeometryComponents = new Set(
+      componentProofs
+        .filter((proof) => proof.status === "not-preserved")
+        .map((proof) => proof.componentId),
+    );
+    const geometryChangeExplainsMismatch =
+      geometryChange !== undefined &&
+      hasGeometryWarning &&
+      comparison.mismatchDomains.length === 1 &&
+      comparison.mismatchDomains[0] === "geometry" &&
+      comparison.mismatchChannelKeys.length > 0 &&
+      sameStringSet(
+        comparison.mismatchChannelKeys,
+        geometryChange.authorizedGeometryChannelKeys,
+      ) &&
+      (geometryChange.mode === "author-intentional-neutral-geometry"
+        ? observedGeometryComponents.size === 0 &&
+          [...declaredGeometryComponents].every((componentId) =>
+            componentProofs.some(
+              (proof) =>
+                proof.componentId === componentId &&
+                proof.status === "verified",
+            ),
+          )
+        : declaredGeometryComponents.size ===
+            observedGeometryComponents.size &&
+          [...declaredGeometryComponents].every((componentId) =>
+            observedGeometryComponents.has(componentId),
+          ));
     const explainedPhysicalDomains = new Set(
       componentProofs
         .filter((proof) => proof.status === "not-preserved")
@@ -1295,11 +1369,13 @@ async function wholeProof(
       if (hasNeutralWarning) mismatchDomains.add("neutral");
     }
     if (!materialMatches) mismatchDomains.add("material");
-    const unexplainedPhysicalDomains = comparison.mismatchDomains.filter(
-      (domain) => !hasNeutralWarning && !explainedPhysicalDomains.has(domain),
-    );
     const physicalExplained =
-      comparison.matches || unexplainedPhysicalDomains.length === 0;
+      comparison.matches ||
+      (geometryChange !== undefined
+        ? geometryChangeExplainsMismatch
+        : comparison.mismatchDomains.every((domain) =>
+            explainedPhysicalDomains.has(domain),
+          ));
     const materialExplained = materialMatches || hasMaterialWarning;
     const status: RecipeMigrationWholeProof["status"] =
       comparison.matches && materialMatches
@@ -1506,6 +1582,11 @@ function controlRows(
       if (!found || !ledger) fail(`candidate row ${edgeControl.id} is missing`);
       const { component, control } = found;
       const proof = proofByComponent.get(component.componentId)!;
+      const intentionalGeometryChange =
+        proof.status === "not-preserved" &&
+        edge.sameTopologyGeometryChange?.affectedComponentIds.includes(
+          component.componentId,
+        ) === true;
       const proofStatus: RecipeMigrationControlRow["proofStatus"] =
         proof.status === "failed"
           ? "failed"
@@ -1539,10 +1620,15 @@ function controlRows(
         componentProofSha256: proof.proofSha256,
         maximumScalarError: proof.errors.scalarMaximum,
         proofStatus,
-        reasonCode: control.reasonCode,
-        message: control.message,
-        requiresPreview: control.requiresPreview,
-        requiresConfirmation: control.requiresConfirmation,
+        reasonCode: intentionalGeometryChange
+          ? "INTENTIONAL_GEOMETRY_CHANGE"
+          : control.reasonCode,
+        message: intentionalGeometryChange
+          ? "The author intentionally changed this component's target geometry. Your exact saved value is retained; review Current and Updated before saving."
+          : control.message,
+        requiresPreview: control.requiresPreview || intentionalGeometryChange,
+        requiresConfirmation:
+          control.requiresConfirmation || intentionalGeometryChange,
       };
     })
     .sort((left, right) => compareText(left.ledgerId, right.ledgerId));

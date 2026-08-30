@@ -27,7 +27,7 @@
 
 {#if visible}
   <div
-    class={`batshit-settings-save-status inline-flex max-w-full items-center gap-1.5 self-start ${sticky ? 'sticky top-2 z-[2]' : ''} ${isError ? 'is-error' : state === 'saved' ? 'is-saved' : ''} ${className}`}
+    class={`batshit-settings-save-status max-w-full self-start ${sticky ? 'sticky top-2 z-[2]' : ''} ${isError ? 'is-error' : state === 'saved' ? 'is-saved' : ''} ${className}`}
   >
     {#if isError}
       <AlertCircle class="h-3.5 w-3.5 shrink-0" />

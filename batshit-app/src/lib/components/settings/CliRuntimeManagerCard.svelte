@@ -148,7 +148,7 @@
   </div>
 
   {#if summary && !summary.managed.supported}
-    <p class="batshit-settings-form-meta text-amber-600 dark:text-amber-400">
+    <p class="batshit-settings-form-meta is-warning">
       {summary.managed.unsupportedReason}
     </p>
   {:else if summary}
@@ -209,13 +209,13 @@
       {/if}
     </div>
     {#if summary.managed.installed && summary.resolution.source !== 'managed'}
-      <p class="batshit-settings-form-meta text-amber-600 dark:text-amber-400">
+      <p class="batshit-settings-form-meta is-warning">
         A Batshit-managed install exists, but an explicit environment override is being used instead.
       </p>
     {/if}
   {/if}
 
   {#if errorMessage}
-    <p class="batshit-settings-form-meta text-destructive">{errorMessage}</p>
+    <p class="batshit-settings-form-meta is-error">{errorMessage}</p>
   {/if}
 </div>

@@ -534,6 +534,73 @@ describe('controlRegistry artifact capability controls', () => {
     ])
   })
 
+  it('publishes the SA-104 P3 sys.memory.* control family through findControls', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const result = await findControls({
+      query: 'sys.memory.',
+      includeDraft: true,
+      limit: 200
+    })
+
+    const memoryIds = result.results
+      .filter((item) => item.controlId.startsWith('sys.memory.'))
+      .map((item) => item.controlId)
+      .sort()
+
+    expect(memoryIds).toEqual([
+      'sys.memory.close_episode',
+      'sys.memory.delete',
+      'sys.memory.hold_episode',
+      'sys.memory.list',
+      'sys.memory.move_lane',
+      'sys.memory.recall',
+      'sys.memory.save',
+      'sys.memory.search',
+      'sys.memory.supersede',
+      'sys.memory.unsupersede',
+      'sys.memory.update',
+      'sys.memory.whiteboard'
+    ])
+
+    const deleteControl = result.results.find((item) => item.controlId === 'sys.memory.delete')
+    expect(deleteControl?.riskLevel).toBe('confirm')
+    const saveControl = result.results.find((item) => item.controlId === 'sys.memory.save')
+    expect(saveControl?.riskLevel).toBe('safe')
+    // SA-104 P5: episode boundary controls ride the same wildcard scope, risk safe.
+    const closeControl = result.results.find((item) => item.controlId === 'sys.memory.close_episode')
+    expect(closeControl?.riskLevel).toBe('safe')
+    const holdControl = result.results.find((item) => item.controlId === 'sys.memory.hold_episode')
+    expect(holdControl?.riskLevel).toBe('safe')
+    // SA-104 P6: the whiteboard control joins the family, risk safe.
+    const whiteboardControl = result.results.find(
+      (item) => item.controlId === 'sys.memory.whiteboard'
+    )
+    expect(whiteboardControl?.riskLevel).toBe('safe')
+  })
+
+  it('excludes sys.memory.* from a broker allowlist without the memory scope', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const withoutMemory = await findControls({
+      query: 'memory',
+      limit: 200,
+      allowedControlIds: ['sys.artifact.*', 'sys.zip.fetch']
+    })
+    expect(
+      withoutMemory.results.some((item) => item.controlId.startsWith('sys.memory.'))
+    ).toBe(false)
+
+    const withMemory = await findControls({
+      query: 'memory',
+      limit: 200,
+      allowedControlIds: ['sys.memory.*']
+    })
+    expect(
+      withMemory.results.filter((item) => item.controlId.startsWith('sys.memory.')).length
+    ).toBe(12)
+  })
+
   it('matches multi-token artifact control queries in findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 

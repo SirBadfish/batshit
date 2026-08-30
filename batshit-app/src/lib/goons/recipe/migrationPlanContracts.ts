@@ -145,6 +145,7 @@ const MISMATCH_DOMAINS = [
 const WARNING_CODES = [
   "neutral-changed",
   "material-changed",
+  "geometry-changed",
   "topology-changed",
 ] as const;
 
@@ -197,6 +198,7 @@ export const RECIPE_MIGRATION_REASON_CODES = [
   "REMOVED_ACTIVE",
   "RESET_REQUIRED",
   "BLOCKED_BY_EDGE",
+  "INTENTIONAL_GEOMETRY_CHANGE",
   "SIBLING_KEEP",
   "SIBLING_MIGRATE",
   "SIBLING_RESET",
@@ -445,7 +447,11 @@ function finite(value: unknown, context: string): number {
 function nonNegative(value: unknown, context: string): number {
   const parsed = finite(value, context);
   if (parsed < 0) fail(`${context} must be non-negative`);
-  return parsed;
+  // RedisJSON may serialize an IEEE-754 double with an adjacent shortest
+  // decimal. Migration error measurements are proof evidence, so normalize
+  // them before every nested/document hash while retaining far more precision
+  // than the strict Recipe tolerances require.
+  return parsed === 0 ? 0 : Number(parsed.toPrecision(15));
 }
 
 function integer(value: unknown, minimum: number, context: string): number {
@@ -1238,8 +1244,9 @@ export async function createRecipeMigrationPlan(
 ): Promise<RecipeMigrationPlan> {
   canonicalRecipeString(value);
   const componentProofs = await Promise.all(
-    value.componentProofs.map(async (proof) => {
-      const content = componentProofHashContent(proof);
+    value.componentProofs.map(async (proof, index) => {
+      const parsedProof = parseComponentProof(proof, index);
+      const content = componentProofHashContent(parsedProof);
       const proofSha256 = await canonicalRecipeSha256(content);
       if (
         proof.proofSha256 !== "0".repeat(64) &&
@@ -1256,7 +1263,7 @@ export async function createRecipeMigrationPlan(
   const proofShaByComponent = new Map(
     componentProofs.map((proof) => [proof.componentId, proof.proofSha256]),
   );
-  const controlRows = value.controlRows.map((row) => {
+  const controlRows = value.controlRows.map(parseControlRow).map((row) => {
     const componentProofSha256 = proofShaByComponent.get(row.componentId);
     if (!componentProofSha256) {
       fail(`control row ${row.ledgerId} references a missing component proof`);
@@ -1269,7 +1276,8 @@ export async function createRecipeMigrationPlan(
     }
     return { ...row, componentProofSha256 };
   });
-  const wholeContent = wholeProofHashContent(value.wholeRecipeProof);
+  const parsedWholeProof = parseWholeProof(value.wholeRecipeProof);
+  const wholeContent = wholeProofHashContent(parsedWholeProof);
   const wholeProofSha256 = await canonicalRecipeSha256(wholeContent);
   if (
     value.wholeRecipeProof.proofSha256 !== "0".repeat(64) &&
@@ -1866,6 +1874,10 @@ function assertOutcomeProofConsistency(
           continue;
         }
         if (warning.code === "topology-changed") {
+          allowedDomains.add("geometry");
+          continue;
+        }
+        if (warning.code === "geometry-changed") {
           allowedDomains.add("geometry");
           continue;
         }
