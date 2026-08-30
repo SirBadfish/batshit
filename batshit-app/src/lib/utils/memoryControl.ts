@@ -11,8 +11,10 @@
  *     inline route and the `sys.memory.save` Fabric control so both paths produce
  *     identical records (P3 parity requirement).
  *
- * No `$lib/server` imports allowed here — the n8n compile twin and `+page.svelte` load
- * this module in the browser.
+ * No `$lib/server` imports allowed here — `+page.svelte`, `AgentSettingsPanel.svelte`,
+ * `MemorySettingsPanel.svelte` and `AgentMemorySettingsCard.svelte` load this module in
+ * the browser. (SA-106 retired the n8n compile twin, which was the original reason; the
+ * constraint stands on the surviving client consumers.)
  */
 
 import { controlTag, pairedBlockRegexGlobal } from '$lib/utils/controlTags'
@@ -341,7 +343,7 @@ export function resolveEffectiveMemoryWindow(
 /**
  * SA-104 P5 — the Agent Settings memory draft: one bundle over the four stored
  * per-agent memory fields, read through THE resolvers so Settings display, compile
- * twins, and the recall engine can never disagree about effective values.
+ * compile path, and the recall engine can never disagree about effective values.
  */
 export interface AgentMemorySettingsDraft {
   enabled: boolean

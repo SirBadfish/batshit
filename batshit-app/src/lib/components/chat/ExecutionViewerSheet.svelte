@@ -65,7 +65,7 @@
   ) as Array<{ id: string; label: string }>
 
   // SA-104 P4: inserted-memory visibility (structuredInput.metadata.memoryContext,
-  // written by both compilation twins for memory-enabled agents).
+  // written by the compilation path for memory-enabled agents).
   const memoryContextMeta = $derived.by<Record<string, any> | null>(() => {
     const meta = (currentSnapshot?.structuredInput as Record<string, any> | undefined)?.metadata
       ?.memoryContext

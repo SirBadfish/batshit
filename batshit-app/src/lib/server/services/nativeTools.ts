@@ -111,7 +111,7 @@ type AgentBrowserBashSettings = {
 }
 
 // SA-096: the family list and the rules deciding which families the broker serves live in
-// $lib/utils/brokerAvailability so the compile twins can gate their broker guidance on the
+// $lib/utils/brokerAvailability so the compile path can gate its broker guidance on the
 // same truth this file registers tools from.
 export const BATSHIT_TOOL_FAMILIES = BROKER_TOOL_FAMILIES
 export type BatshitToolFamily = (typeof BATSHIT_TOOL_FAMILIES)[number]
@@ -2984,7 +2984,7 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
       'nativeBashApprovalCardsEnabled'
     ) ?? false
   // SA-096: the six broker-relevant toggles are resolved by the shared util so the compile
-  // twins read agent settings exactly the way tool registration does.
+  // the compile path reads agent settings exactly the way tool registration does.
   const brokerToggles = resolveBrokerToolToggles(providerSettings)
   const agentBrowserEnabled = brokerToggles.agentBrowserEnabled
   const agentBrowserRuntimeMode = normalizeAgentBrowserRuntimeMode(
@@ -11632,7 +11632,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   // SA-104 P3: opt-in per agent; subagent callers leave this unset/false.
   const memoryControlsEnabled = context.memoryControlsEnabled === true
 
-  // SA-096: shared with the compile twins' broker-guidance gate so registered tools and
+  // SA-096: shared with the compile path's broker-guidance gate so registered tools and
   // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
   const brokerToggles = resolveBrokerToolToggles(context.providerSettings)
   const apiBrokerAllowedFamilies: BatshitToolFamily[] = resolveBrokerFamilies({

@@ -1499,7 +1499,7 @@ export class DatabaseService {
 
   /**
    * SA-104 P3: the Memory guidance block for memory-enabled agents. Mirrored in the
-   * client twin (`databaseRedis.client.ts`) — keep both call sites and gating identical.
+   * one compile path (SA-106 retired the second, n8n-only implementation).
    */
   private async resolveMemoryGuidancePrompt(
     agent: any,
@@ -2437,7 +2437,7 @@ export class DatabaseService {
 
     // SA-104 P4: the recall engine's memory-insert section (time awareness, Current /
     // Lingering grouping, more-available honesty) — preformatted server-side so both
-    // twins render byte-identical lines (DL-104-17).
+    // compiled lines stay byte-stable (DL-104-17).
     if (options.memoryDcmLines && options.memoryDcmLines.length > 0) {
       lines.push('', ...options.memoryDcmLines)
     }
@@ -2949,7 +2949,7 @@ export class DatabaseService {
     // SA-104 P3: memory guidance is gated on per-agent memory enablement alone — the
     // inline <batshit-memory> save works without any broker family. Part of the stable
     // compiled prefix (DL-104-04): it changes only when enablement or the stored prompt
-    // changes. Mirrored in the client twin.
+    // changes.
     if (resolveAgentMemoryEnabled(agent)) {
       const memoryPrompt = await this.resolveMemoryGuidancePrompt(agent, runtimeFlavor)
       if (memoryPrompt.trim()) {

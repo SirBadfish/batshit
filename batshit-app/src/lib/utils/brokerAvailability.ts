@@ -18,8 +18,15 @@
  * guidance cannot drift. Re-implementing any of these conditions elsewhere reintroduces a
  * Fragility-Map-class divergence — extend this module instead.
  *
- * This file must stay pure and free of `$lib/server` imports: `databaseRedis.client.ts`
- * (the n8n compile twin) is client-reachable and imports it.
+ * This file must stay pure and free of `$lib/server` imports. SA-106 retired the n8n
+ * compile twin that first imposed that rule, but the constraint DID NOT lift: the Tool
+ * Grid reaches this module from the browser (`toolGridConfig.ts`, `GlobalToolGrid.svelte`,
+ * `AgentMcpDefaultsCard.svelte`). Adding a server import here breaks the client bundle.
+ *
+ * SA-106 note: `BROKER_RUNTIMES` still has three members. `n8n` is no longer a PRIMARY
+ * agent type, but it is still a live TOOL HOST — `AgentMcpDefaultsCard` derives
+ * `runtime: 'n8n'` for Category 2 `n8n Workflow Subagent` tool grids, whose tools really
+ * are advertised by the Batshit Tools node inside n8n. Do not narrow this union.
  */
 
 export const BROKER_TOOL_FAMILIES = [
@@ -117,7 +124,7 @@ export interface BrokerAvailabilityInput {
    *
    * `undefined` means "not resolved here". The `api` and `cli` runtimes require a real
    * selection before registering the `cli` family, but a caller that cannot reach the CLI
-   * tool registry (the n8n compile twin is client-side) must not be able to make the gate
+   * tool registry (the Tool Grid runs in the browser) must not be able to make the gate
    * narrower than registration. Unresolved therefore counts as reachable: over-shipping
    * guidance is recoverable, withholding it from an agent that has the tools is not.
    */

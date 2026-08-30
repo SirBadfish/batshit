@@ -121,7 +121,7 @@ export function buildToolGuidanceZipPromptBlock(options?: {
 /**
  * Code fallback for the Memory guidance block (SA-104 P3), used only when the Redis
  * prompt key (`batshit:tool_guidance_memory_prompt`) is empty — packaged defaults
- * normally seed it on boot. Injected by BOTH compilation twins for memory-enabled
+ * normally seed it on boot. Injected by the compilation path for memory-enabled
  * agents only; keep the two call sites and this text in sync with the packaged
  * `batshit_tool_prompt_memory.md`.
  */

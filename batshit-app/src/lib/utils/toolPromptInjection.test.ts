@@ -15,7 +15,7 @@ function readPackaged(file: string): string {
   return readFileSync(resolve(process.cwd(), `${PACKAGED_DIR}/${file}`), 'utf8')
 }
 
-/** Compiles the packaged blocks the way both twins merge them, for one runtime. */
+/** Compiles the packaged blocks the way the compile path merges them, for one runtime. */
 function compilePackagedPrompt(scope: PromptRuntimeScope, basePromptFile: string): string {
   const names = brokerToolNamesForScope(scope)
   const render = (file: string) =>
