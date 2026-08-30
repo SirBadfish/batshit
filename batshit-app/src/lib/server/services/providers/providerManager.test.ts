@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { ProviderManager } from './index'
 import { env as testEnv } from '$env/dynamic/private'
+import { createDeepInfra } from '@ai-sdk/deepinfra'
 
 // Mock environment variables for testing
 vi.mock('$env/dynamic/private', () => ({
@@ -25,7 +26,9 @@ vi.mock('$env/dynamic/private', () => ({
     MIMO_API_KEY: 'mimo-placeholder',
     ALIBABA_CLOUD_API_KEY: 'alibaba-placeholder',
     STEPFUN_API_KEY: 'stepfun-test-key-123456789',
-    OPENROUTER_API_KEY: 'sk-or-placeholder'
+    OPENROUTER_API_KEY: 'sk-or-placeholder',
+    DEEPINFRA_API_KEY: 'placeholder',
+    DEEPINFRA_API_BASE_URL: 'https://api.deepinfra.com/v1/openai'
   }
 }))
 
@@ -57,6 +60,10 @@ vi.mock('@ai-sdk/groq', () => ({
 
 vi.mock('@ai-sdk/mistral', () => ({
   createMistral: vi.fn(() => vi.fn((modelId, options) => ({ modelId, provider: 'mistral' })))
+}))
+
+vi.mock('@ai-sdk/deepinfra', () => ({
+  createDeepInfra: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'deepinfra' })))
 }))
 
 ;(vi as any).mock(
@@ -271,6 +278,23 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(model).toMatchObject({
         modelId: 'anthropic/claude-sonnet-4.5',
         provider: 'openrouter'
+      })
+    })
+
+    it('registers DeepInfra with its dedicated AI SDK provider and preserves namespaced model IDs', () => {
+      expect(providerManager.hasProvider('deepinfra')).toBe(true)
+      expect(createDeepInfra).toHaveBeenCalledWith({
+        apiKey: 'placeholder',
+        baseURL: 'https://api.deepinfra.com/v1'
+      })
+
+      const model = providerManager.getModel('zai-org/GLM-5.3-Flash', {
+        transport: 'direct',
+        service: 'deepinfra'
+      })
+      expect(model).toMatchObject({
+        modelId: 'zai-org/GLM-5.3-Flash',
+        provider: 'deepinfra'
       })
     })
 

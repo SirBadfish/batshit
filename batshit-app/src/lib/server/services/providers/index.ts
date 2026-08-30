@@ -18,6 +18,7 @@ import { createOpenAI } from '@ai-sdk/openai'
 import { createGoogle } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
 import { createMistral } from '@ai-sdk/mistral'
+import { createDeepInfra } from '@ai-sdk/deepinfra'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { env } from '$env/dynamic/private'
 import { createGateway, type LanguageModel } from 'ai'
@@ -143,6 +144,13 @@ export interface ProviderAccessResolution {
     baseURL?: string | null
     availability: GatewayAvailability
   }
+}
+
+function normalizeDeepInfraBaseURL(baseURL?: string | null) {
+  const normalized = (baseURL || 'https://api.deepinfra.com/v1').trim().replace(/\/+$/, '')
+  return normalized.endsWith('/openai')
+    ? normalized.slice(0, -'/openai'.length)
+    : normalized
 }
 
 /**
@@ -602,13 +610,31 @@ export class ProviderManager {
       registeredCount++
     }
 
-    registerOpenAICompatibleProvider({
-      id: 'deepinfra',
-      label: 'DeepInfra',
-      apiKey: this.apiKeys.deepinfra ?? env.DEEPINFRA_API_KEY,
-      baseURL: env.DEEPINFRA_API_BASE_URL || 'https://api.deepinfra.com/v1/openai',
-      priority: 16
-    })
+    const deepInfraKey = this.apiKeys.deepinfra ?? env.DEEPINFRA_API_KEY
+    if (deepInfraKey && this.validateApiKey(deepInfraKey, 'DeepInfra')) {
+      const deepInfra = createDeepInfra({
+        apiKey: deepInfraKey,
+        baseURL: normalizeDeepInfraBaseURL(env.DEEPINFRA_API_BASE_URL)
+      })
+      this.providers.set('deepinfra', {
+        client: (modelId: string) => deepInfra(modelId),
+        models: ['zai-org/GLM-5.3-Flash'],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 1_048_576,
+          cacheControl: true,
+          reasoning: true,
+          longContext: true,
+          code: true
+        },
+        displayName: 'DeepInfra',
+        priority: 16
+      })
+      logger.debug('[ProviderManager] DeepInfra API key validated')
+      registeredCount++
+    }
 
     registerOpenAICompatibleProvider({
       id: 'togetherai',
