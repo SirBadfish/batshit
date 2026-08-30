@@ -53,7 +53,7 @@ Reference filenames are flattened UserDocs paths: `<section>-<page>.md`. List th
 
 ## Batshit Terminology Rules
 
-- The Primary Agent types are exactly **n8n**, **API**, and **CLI**. Never use retired numbered "mode" labels.
+- The live Primary Agent types are exactly **API** and **CLI**. n8n is not a Primary Agent type; describe it only as a workflow-tool and `n8n Workflow Subagent` platform. Never use retired numbered "mode" labels or revive the retired n8n Primary lane.
 - Teach Batshit-original concepts from zero instead of assuming outside equivalents: Zips, Clips, Tool Grid, DCM (Dynamic Current Message), Schema Hints, Group Chat's single-speaker queue, Execution Viewer, Artifact Zones, Goons/Goon Dock.
 - Write **Batshit** (or lowercase `batshit` in code/paths). Never "BATSHIT" or "bat shit".
 - Batshit is single-user-per-instance and self-hosted; "users" means people running their own instances.

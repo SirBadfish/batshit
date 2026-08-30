@@ -14,7 +14,7 @@ Batshit has three Subagent types:
 | `API Subagent` | A Batshit-managed direct-provider specialist run. | `API` and `CLI` Primary Agents. |
 | `CLI Subagent` | A Batshit-managed one-shot Codex or Claude Code specialist run. | `API` and `CLI` Primary Agents. |
 
-All three types can be assigned to either live Primary Agent type.
+Each n8n Workflow, API, and CLI Subagent can be assigned to either live Primary Agent type.
 
 ## When to use a Subagent
 

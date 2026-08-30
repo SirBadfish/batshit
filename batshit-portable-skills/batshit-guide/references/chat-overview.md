@@ -33,12 +33,12 @@ Batshit can also run more than one chat at once — a long task in one session k
 
 This is the control that decides *who* you're talking to, and it's worth understanding because Batshit isn't limited to one assistant.
 
-The selector sits in the middle of the composer row. It shows the current agent's name and a small badge for its type — `n8n`, `API`, or `CLI`. (Those are Batshit's three [Primary Agent](../primary-agents/overview.md) types: an `n8n` agent runs inside an n8n workflow, an `API` agent talks straight to a provider, and a `CLI` agent drives a coding CLI like Codex or Claude Code.) Open the selector to switch agents, and it lists your agents and any Groups you've built, plus shortcuts to create or manage them.
+The selector sits in the middle of the composer row. It shows the current agent's name and a small badge for its type — `API` or `CLI`. Those are Batshit's two [Primary Agent](../primary-agents/overview.md) types: an `API` agent talks straight to a provider, and a `CLI` agent drives a coding CLI like Codex or Claude Code. n8n is not a Primary Agent type; it remains available through workflow tools and n8n Workflow Subagents. Open the selector to switch agents, and it lists your agents and any Groups you've built, plus shortcuts to create or manage them.
 
 A few behaviors that matter:
 
 - **One speaker per chat, but you can switch any time.** A single chat is handled by one agent at a time. Switch agents mid-conversation and the new one picks up the same thread. Batshit remembers which agent last handled a session and reselects it when you reopen that chat — though if you manually change agents after opening it, your choice stands.
-- **Unavailable agents are shown honestly.** If an agent can't run right now — say an `n8n` agent when n8n isn't connected — it appears greyed out with the reason, instead of silently failing when you hit Send.
+- **Unavailable agents are shown honestly.** If an `API` or `CLI` agent cannot run because its provider, model, or CLI runtime is unavailable, it appears greyed out with the reason instead of silently failing when you hit Send. Retired n8n Primary Agent records can be deleted but cannot be selected for new sends.
 - **Groups are a different mode.** Choosing a Group puts several agents in the same conversation with a single-speaker queue, so they take turns instead of talking over each other. A Group shows a "Group" badge in the selector. This is its own feature with its own page: [Group Chat](../groups/overview.md).
 
 If an agent ever does something you didn't expect — ignores a file, says it can't see a Subagent — the [Execution Viewer](execution-viewer.md) shows you exactly what that agent was actually sent.
@@ -52,6 +52,10 @@ The Token Panel shows:
 - **A context meter** — a ring that fills up as the window fills, with the percent used. It shifts color as you approach the limit (calm when there's plenty of room, a warning tone in the high range, and a clear danger state near full), so you can see trouble coming.
 - **A running cost indicator** for the chat.
 - **Tokens used and remaining**, on hover.
+- **A cache readout** — how much of the latest response's input the provider read from its prompt cache, as a percent (cached input is billed far cheaper on most providers). Hover for the token math, tokens newly written to cache, and the whole chat's overall rate across every response that reported cache data.
+- **A speed readout** — output tokens per second for the latest response. Hover for time to first output and total model time. API agents show the AI SDK's own measurements; managed Codex and Claude CLI agents show timings Batshit measured live (first output includes CLI startup time).
+
+Both readouts are honest by design: they only ever show numbers the provider or runtime actually reported or Batshit actually measured. When a lane doesn't report a metric, you see a dash — never a guess.
 
 It also hosts the controls for taming a long conversation:
 

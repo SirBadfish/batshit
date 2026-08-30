@@ -30,7 +30,7 @@ For a first install, read:
 2. [Install Mac app](docs/user-docs/installation/install-mac-app.md) or [Install Docker](docs/user-docs/installation/install-docker.md)
 3. [First run](docs/user-docs/installation/first-run.md)
 4. [API keys and models](docs/user-docs/providers/api-keys-and-models.md)
-5. [Connect n8n](docs/user-docs/primary-agents/connect-n8n.md)
+5. [Connect n8n tools and Workflow Subagents](docs/user-docs/primary-agents/connect-n8n.md)
 6. [Backup and restore](docs/user-docs/admin/backup-and-restore.md)
 
 Mac app and Docker are peer setup paths. The Mac app is the normal Mac path for host-local runtimes and direct local tooling. Docker is the cross-platform Compose path with clearer package boundaries, explicit sidecars, and the host-operator path for sandbox/add-on control.
