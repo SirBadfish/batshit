@@ -3,6 +3,7 @@ import {
   _buildSourceFallbackWarningForTest,
   _buildCatalogSyncDiffForTest,
   _getManualDirectModelsForTest,
+  _findCatalogIdentityIssuesForTest,
   _mapDeepInfraModelsForTest,
   _mapDirectProviderEntriesForTest,
   _mapOpenRouterModelToCatalogEntryForTest,
@@ -12,6 +13,43 @@ import {
 } from './modelCatalogSync'
 
 describe('modelCatalogSync merge', () => {
+  it('requires an exact identity variant for every advertised catalog connection', () => {
+    const issues = _findCatalogIdentityIssuesForTest([
+      {
+        id: 'zai/glm-5.3-flash',
+        canonicalId: 'zai/glm-5.3-flash',
+        provider: 'zai',
+        upstreamProvider: 'vercel',
+        name: 'glm-5.3-flash',
+        displayName: 'GLM 5.3 Flash',
+        tags: [],
+        purpose: 'chat',
+        features: { streaming: true, tools: true, vision: false, maxTokens: 128000 },
+        category: 'balanced',
+        source: 'vercel',
+        transport: 'vercel-gateway',
+        connectionId: 'vercel-gateway',
+        availableConnections: ['vercel-gateway', 'direct:deepinfra'],
+        idVariants: {
+          'vercel-gateway': {
+            developerId: 'zai',
+            modelId: 'glm-5.3-flash',
+            effectiveId: 'zai/glm-5.3-flash',
+            source: 'vercel'
+          }
+        }
+      }
+    ])
+
+    expect(issues).toEqual([
+      {
+        catalogId: 'zai/glm-5.3-flash',
+        connectionId: 'direct:deepinfra',
+        reason: 'missing-variant'
+      }
+    ])
+  })
+
   it('merges gateway + openrouter entries by AA slug and attaches idVariants', () => {
     const merged = _mergeCatalogEntriesForTest([
       {

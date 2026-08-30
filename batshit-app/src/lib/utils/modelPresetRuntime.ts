@@ -11,6 +11,7 @@ export interface RuntimeModelSelectionArgs {
   presetId?: string | null
   provider?: string | null
   modelId?: string | null
+  effectiveModelId?: string | null
   connection?: ModelConnectionInfo | null
   contextWindow?: number | null
   capabilities?: ModelCapabilities | null
@@ -22,6 +23,7 @@ export interface RuntimeModelSelection {
   presetId: string | null
   provider: string | null
   modelId: string | null
+  effectiveModelId: string | null
   connection: ModelConnectionInfo | null
   contextWindow: number | null
   capabilities: ModelCapabilities | null
@@ -60,6 +62,7 @@ export function resolveRuntimeModelSelection({
   presetId = null,
   provider = null,
   modelId = null,
+  effectiveModelId = null,
   connection = null,
   contextWindow = null,
   capabilities = null,
@@ -70,6 +73,8 @@ export function resolveRuntimeModelSelection({
     presetId: normalizeString(preset?.id) ?? normalizeString(presetId),
     provider: normalizeString(preset?.provider) ?? normalizeString(provider),
     modelId: normalizeString(preset?.modelId) ?? normalizeString(modelId),
+    effectiveModelId:
+      normalizeString(preset?.effectiveModelId) ?? normalizeString(effectiveModelId),
     connection: preset?.connection ?? connection ?? null,
     contextWindow:
       typeof preset?.contextWindow === 'number'

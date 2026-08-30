@@ -12,6 +12,8 @@ import {
   type VercelCatalogEntry
 } from '$lib/server/services/vercelModelCatalog'
 import { resolvePresetMaxOutputTokenResolution } from '$lib/utils/modelOutputTokens'
+import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
+import { resolveConnectionServiceFromId } from '$lib/utils/modelConnections'
 
 export const POST: RequestHandler = async ({ request, locals }) => {
   if (!locals.user) {
@@ -34,6 +36,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     }
 
     const vercelModel = await findVercelCatalogEntryById(vercelModelId)
+    const selectedConnectionId = String(
+      body.connectionId || vercelModel?.connectionId || ''
+    ).trim()
 
     let info: (ModelInfo & { pricing?: any; contextWindow?: number }) | VercelCatalogEntry | null =
       vercelModel ??
@@ -42,6 +47,45 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     if (!info) {
       return json({ error: 'Model not found in catalog' }, { status: 404 })
+    }
+
+    const selectedTransport =
+      selectedConnectionId === 'vercel-gateway'
+        ? 'vercel-gateway'
+        : selectedConnectionId === 'openrouter'
+          ? 'openrouter'
+          : 'direct'
+    const selectedService =
+      selectedConnectionId === 'vercel-gateway'
+        ? 'vercel'
+        : selectedConnectionId === 'openrouter'
+          ? 'openrouter'
+          : resolveConnectionServiceFromId(selectedConnectionId)
+    const catalogIdentity = vercelModel
+      ? resolveCatalogIds({
+          connectionId: selectedConnectionId,
+          connection: selectedConnectionId
+            ? {
+                id: selectedConnectionId,
+                transport: selectedTransport,
+                service: selectedService,
+                providers: selectedService ? [selectedService] : undefined
+              }
+            : null,
+          developerId: vercelModel.provider,
+          modelId: vercelModel.name,
+          idVariants: vercelModel.idVariants ?? null
+        })
+      : null
+
+    if (vercelModel && selectedConnectionId && !catalogIdentity?.source) {
+      return json(
+        {
+          error: `The Model Catalog does not have an exact provider identifier for ${selectedConnectionId}. Refresh the catalog before applying this model.`,
+          code: 'invalid_model_identity'
+        },
+        { status: 409 }
+      )
     }
 
     let enrichment = null
@@ -86,8 +130,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const response = {
       modelName: info.displayName,
-      modelId: info.name,
-      provider: info.provider,
+      modelId: catalogIdentity?.modelId ?? info.name,
+      provider: catalogIdentity?.developerId ?? info.provider,
+      catalogModelId: vercelModel?.id,
+      effectiveModelId: catalogIdentity?.effectiveModelId,
       contextWindow,
       pricing: {
         input: enrichment?.pricing?.input ?? fallbackPricing.input ?? 0,
@@ -96,8 +142,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       },
       capabilities,
       compatibility,
-      isVercelImport: Boolean(vercelModel),
-      vercelSourceId: info.id,
+      isVercelImport: Boolean(vercelModel && selectedConnectionId === 'vercel-gateway'),
+      vercelSourceId:
+        vercelModel && selectedConnectionId === 'vercel-gateway' ? vercelModel.id : undefined,
       vercelDisplayName: info.displayName,
       settings: {
         maxTokens: maxOutputTokens

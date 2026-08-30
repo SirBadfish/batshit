@@ -46,7 +46,8 @@ import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
     ModelCapabilities,
     ModelEnrichmentSnapshot,
     ModelVoiceSessionConfig,
-    ImageTransport
+    ImageTransport,
+    ModelPurpose
   } from '$lib/types/savedModels'
 import type { ParameterDefinition, ParameterValue } from '$lib/data/parameter-schemas'
 import { isTieredPricing } from '$lib/types/savedModels'
@@ -135,6 +136,10 @@ import {
     modelName: string
     modelId: string
     provider: string
+    catalogModelId: string | null
+    effectiveModelId: string | null
+    purpose: ModelPurpose
+    purposeOverride: ModelPurpose | null
     contextWindow: string
     pricingInputMode: 'flat' | 'tiered'
     pricingInput: string
@@ -222,6 +227,10 @@ const EMPTY_FORM: ModelFormState = {
     modelName: '',
     modelId: '',
     provider: '',
+    catalogModelId: null,
+    effectiveModelId: null,
+    purpose: 'chat',
+    purposeOverride: null,
     contextWindow: '',
     pricingInputMode: 'flat',
     pricingInput: '',
@@ -263,6 +272,16 @@ const CAPABILITY_LABELS: { key: keyof ModelCapabilities; label: string }[] = [
   { key: 'fast', label: 'Fast' },
   { key: 'audio', label: 'Audio' },
   { key: 'image', label: 'Image' }
+]
+const MODEL_PURPOSE_OPTIONS: Array<{
+  value: ModelPurpose
+  label: string
+  helper: string
+}> = [
+  { value: 'chat', label: 'Chat (Agents)', helper: 'Available to API agents and chat model pickers' },
+  { value: 'visual', label: 'Media', helper: 'Image, video, and 3D generation presets' },
+  { value: 'audio', label: 'Audio', helper: 'Speech, transcription, and audio-only presets' },
+  { value: 'utility', label: 'Utility', helper: 'Embeddings, reranking, classification, and similar tasks' }
 ]
 
 const IMAGE_TRANSPORT_OPTIONS: Array<{ value: ImageTransport; label: string; helper: string }> = [
@@ -613,7 +632,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
     if (!catalogModels.length) return
     const provider = editingForm.provider?.trim() ?? ''
     const modelId = editingForm.modelId?.trim() ?? ''
-    const sourceId = editingForm.vercelSourceId?.trim() ?? ''
+    const sourceId = editingForm.catalogModelId?.trim() || editingForm.vercelSourceId?.trim() || ''
     if (!provider && !modelId && !sourceId) return
     const signature = `${sourceId}|${provider}|${modelId}`
     if (signature === lastAutomaticCatalogSyncSignature) return
@@ -625,11 +644,8 @@ let lastInvalidModelSignature = $state<string | null>(null)
   let selectedCatalogEntry = $state<ConnectionScopedCatalogModel | null>(null)
   let selectedCatalogModel = $state<CatalogModel | null>(null)
   const activePresetRole = $derived.by<'chat' | 'visual' | 'audio' | 'utility'>(() => {
-    if (!creatingNew && selectedModelId) {
-      const selectedPreset = models.find((model) => model.id === selectedModelId) ?? null
-      if (selectedPreset) {
-        return resolvePresetType(selectedPreset)
-      }
+    if (creatingNew || selectedModelId) {
+      return editingForm.purpose
     }
 
     if (catalogRoleFilter !== 'all' && catalogRoleFilter !== 'vision') {
@@ -902,7 +918,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
   $effect(() => {
     const provider = editingForm.provider || selectedCatalogEntry?.developerId || ''
     const modelId = editingForm.modelId || selectedCatalogEntry?.modelId || ''
-    const vercelId = editingForm.vercelSourceId || selectedCatalogModel?.id || ''
+    const vercelId = editingForm.catalogModelId || editingForm.vercelSourceId || selectedCatalogModel?.id || ''
 
     activeParameterDefinitions = filterParameters({
       provider,
@@ -1511,6 +1527,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
     if (!catalogSelectionDirty) {
       selectedCatalogProvider = presetProvider
       const presetModelId =
+        model.catalogModelId ??
         model.vercelSourceId ??
         (presetProvider && model.modelId ? `${presetProvider}/${model.modelId}` : model.modelId ?? '')
       selectedCatalogModelId = presetModelId ?? ''
@@ -1806,6 +1823,7 @@ $effect(() => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             vercelModelId: sourceModel.id,
+            connectionId: activeConnectionId,
             forceRefresh: false
           })
         })
@@ -2026,7 +2044,7 @@ $effect(() => {
     const definitions = filterParameters({
       provider: model.provider,
       modelId: model.modelId,
-      vercelId: model.vercelSourceId ?? undefined,
+      vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
       capabilities: model.capabilities ?? null,
       connection: model.connection?.type ?? undefined,
       purpose: resolvePresetType(model),
@@ -2114,7 +2132,7 @@ $effect(() => {
     const definitions = filterParameters({
       provider: model.provider,
       modelId: model.modelId,
-      vercelId: model.vercelSourceId ?? undefined,
+      vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
       capabilities: model.capabilities ?? null,
       connection: model.connection?.type ?? undefined,
       purpose: resolvePresetType(model),
@@ -2130,7 +2148,7 @@ $effect(() => {
         isParameterSuppressedForModel(key, {
           provider: model.provider,
           modelId: model.modelId,
-          vercelId: model.vercelSourceId
+          vercelId: model.catalogModelId ?? model.vercelSourceId
         })
       ) {
         continue
@@ -2192,6 +2210,10 @@ $effect(() => {
       modelName: model.modelName ?? '',
       modelId: model.modelId ?? '',
       provider: model.provider ?? '',
+      catalogModelId: model.catalogModelId ?? null,
+      effectiveModelId: model.effectiveModelId ?? null,
+      purpose: resolvePresetType(model),
+      purposeOverride: model.purposeOverride ?? null,
       contextWindow: contextWindow ? formatGroupedIntegerDisplay(contextWindow) : '',
       pricingInputMode,
       pricingInput,
@@ -2266,7 +2288,7 @@ $effect(() => {
     const definitions = filterParameters({
       provider: form.provider || selectedCatalogEntry?.developerId || undefined,
       modelId: form.modelId || selectedCatalogEntry?.modelId || undefined,
-      vercelId: form.vercelSourceId || selectedCatalogModel?.id || undefined,
+      vercelId: form.catalogModelId || form.vercelSourceId || selectedCatalogModel?.id || undefined,
       capabilities: form.capabilities ?? null,
       connection: form.connectionType ?? undefined,
       purpose: activePresetRole,
@@ -2403,6 +2425,10 @@ $effect(() => {
       modelName: form.modelName.trim(),
       modelId: form.modelId.trim(),
       provider: form.provider.trim(),
+      catalogModelId: form.catalogModelId ?? undefined,
+      effectiveModelId: form.effectiveModelId ?? undefined,
+      purpose: form.purpose,
+      purposeOverride: form.purposeOverride ?? undefined,
       contextWindow,
       pricing: {
         input: pricingInput,
@@ -2487,13 +2513,23 @@ $effect(() => {
       modelId: model.name,
       idVariants: model.idVariants ?? null
     })
+    if (!resolvedIds) {
+      formValidationError = `The Model Catalog is missing the exact identifier for ${connectionIdForVariant || 'this connection'}. Refresh the catalog before using this model.`
+      return
+    }
+    const hostedCatalogIdentity = !['local', 'n8n-only', 'codex', 'claude-cli'].includes(model.source ?? '')
+    const isGatewaySelection = connectionForVariant?.transport === 'vercel-gateway'
     editingForm = {
       ...editingForm,
-      provider: resolvedIds?.developerId ?? model.provider,
-      modelId: resolvedIds?.modelId ?? model.name,
+      provider: resolvedIds.developerId,
+      modelId: resolvedIds.modelId,
+      catalogModelId: hostedCatalogIdentity ? model.id : null,
+      effectiveModelId: resolvedIds.effectiveModelId,
+      purpose: normalizeCatalogRole(model.purpose ?? null),
+      purposeOverride: null,
       modelName: editingForm.modelName || model.displayName,
-      isVercelImport: model.source === 'vercel',
-      vercelSourceId: model.source === 'vercel' ? model.id : null
+      isVercelImport: isGatewaySelection,
+      vercelSourceId: isGatewaySelection ? model.id : null
     }
   }
 
@@ -2530,6 +2566,8 @@ $effect(() => {
       pricingInputMode: 'flat',
       pricingInputTiers: [],
       isVercelImport: false,
+      catalogModelId: null,
+      effectiveModelId: null,
       vercelSourceId: null,
       vercelDisplayName: null,
       enrichment: null,
@@ -2584,6 +2622,7 @@ $effect(() => {
     }
 
     const targetId =
+      editingForm.catalogModelId ||
       editingForm.vercelSourceId ||
       (editingForm.provider && editingForm.modelId ? `${editingForm.provider}/${editingForm.modelId}` : null)
 
@@ -2698,9 +2737,23 @@ $effect(() => {
 
   function buildCatalogEnrichmentFromModel(model: CatalogModel) {
     const baselineModelName = editingForm.modelName?.trim() || model.displayName
-    const baselineModelId = editingForm.modelId?.trim() || model.name
-    const baselineProvider = editingForm.provider?.trim() || model.provider
     const baselineConnectionId = editingForm.connectionId ?? selectedConnectionId ?? undefined
+    const resolvedIds = resolveCatalogIds({
+      connectionId: baselineConnectionId,
+      connection: selectedConnection,
+      developerId: model.provider,
+      modelId: model.name,
+      idVariants: model.idVariants ?? null
+    })
+    if (!resolvedIds) {
+      throw new Error(
+        `The Model Catalog is missing the exact identifier for ${baselineConnectionId || 'this connection'}.`
+      )
+    }
+    const baselineModelId = resolvedIds.modelId
+    const baselineProvider = resolvedIds.developerId
+    const hostedCatalogIdentity = !['local', 'n8n-only', 'codex', 'claude-cli'].includes(model.source ?? '')
+    const isGatewaySelection = selectedConnection?.transport === 'vercel-gateway'
     const rawMaxOutputTokens = toCatalogNumber(model.maxOutputTokens)
     const pricingInput = toCatalogNumber(model.pricing?.input)
     const pricingOutput = toCatalogNumber(model.pricing?.output)
@@ -2747,12 +2800,7 @@ $effect(() => {
       capabilities: capabilities ?? undefined,
       provider: baselineProvider || undefined,
       connectionId: baselineConnectionId,
-      identifier:
-        model.source === 'vercel'
-          ? model.id
-          : baselineProvider && baselineModelId
-            ? `${baselineProvider}/${baselineModelId}`
-            : undefined
+      identifier: resolvedIds.effectiveModelId
     }
 
     const pricingPayload =
@@ -2768,12 +2816,15 @@ $effect(() => {
       modelName: baselineModelName,
       modelId: baselineModelId,
       provider: baselineProvider,
+      catalogModelId: hostedCatalogIdentity ? model.id : undefined,
+      effectiveModelId: resolvedIds.effectiveModelId,
+      purpose: normalizeCatalogRole(model.purpose ?? null),
       contextWindow: contextWindow ?? undefined,
       pricing: pricingPayload,
       capabilities: capabilities ?? undefined,
       compatibility,
-      isVercelImport: model.source === 'vercel',
-      vercelSourceId: model.source === 'vercel' ? model.id : undefined,
+      isVercelImport: isGatewaySelection,
+      vercelSourceId: isGatewaySelection ? model.id : undefined,
       vercelDisplayName: model.displayName,
       settings: {
         maxTokens: baselineMaxOutputTokens
@@ -2894,6 +2945,9 @@ $effect(() => {
 
     next.capabilities = data.capabilities ?? next.capabilities
     next.compatibility = data.compatibility ?? next.compatibility
+    next.catalogModelId = data.catalogModelId ?? next.catalogModelId
+    next.effectiveModelId = data.effectiveModelId ?? next.effectiveModelId
+    if (data.purpose && !next.purposeOverride) next.purpose = data.purpose
     next.isVercelImport = data.isVercelImport ?? next.isVercelImport
     next.vercelSourceId = data.vercelSourceId ?? next.vercelSourceId
     next.vercelDisplayName = data.vercelDisplayName ?? next.vercelDisplayName
@@ -3081,6 +3135,7 @@ $effect(() => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           vercelModelId: selectedCatalogModel.id,
+          connectionId: selectedConnectionId,
           forceRefresh
         })
       })
@@ -3873,6 +3928,67 @@ $effect(() => {
 		                />
 		              </div>
 		            </div>
+
+                <div class="batshit-settings-form-row">
+                  <div class="batshit-settings-form-copy">
+                    <div class="batshit-settings-form-label-line">
+                      <Label.Root class="batshit-settings-form-label">Preset Category</Label.Root>
+                      <SettingsInfoMenu ariaLabel="About Preset Category">
+                        <p>
+                          Automatic uses the Model Catalog classification. Choose a category manually
+                          when a provider reports the model incorrectly. Chat presets are available to
+                          API agents; Utility is intended for embeddings, reranking, and similar tasks.
+                        </p>
+                      </SettingsInfoMenu>
+                    </div>
+                  </div>
+                  <div class="batshit-settings-form-control">
+                    <Select.Root
+                      type="single"
+                      value={editingForm.purposeOverride ?? 'auto'}
+                      onValueChange={(value) => {
+                        const nextValue = Array.isArray(value) ? value[0] : value
+                        if (!nextValue) return
+                        if (nextValue === 'auto') {
+                          editingForm = { ...editingForm, purposeOverride: null }
+                          return
+                        }
+                        const purpose = nextValue as ModelPurpose
+                        editingForm = {
+                          ...editingForm,
+                          purpose,
+                          purposeOverride: purpose
+                        }
+                      }}
+                    >
+                      <Select.Trigger>
+                        <span>
+                          {#if editingForm.purposeOverride}
+                            {MODEL_PURPOSE_OPTIONS.find((option) => option.value === editingForm.purpose)?.label ?? 'Chat (Agents)'}
+                          {:else}
+                            Automatic ({MODEL_PURPOSE_OPTIONS.find((option) => option.value === editingForm.purpose)?.label ?? 'Chat (Agents)'})
+                          {/if}
+                        </span>
+                      </Select.Trigger>
+                      <Select.Content>
+                        <Select.Item value="auto">
+                          <div class="flex flex-col">
+                            <span>Automatic</span>
+                            <span class="batshit-settings-form-label">Use the Model Catalog category</span>
+                          </div>
+                        </Select.Item>
+                        {#each MODEL_PURPOSE_OPTIONS as option (option.value)}
+                          <Select.Item value={option.value}>
+                            <div class="flex flex-col">
+                              <span>{option.label}</span>
+                              <span class="batshit-settings-form-label">{option.helper}</span>
+                            </div>
+                          </Select.Item>
+                        {/each}
+                      </Select.Content>
+                    </Select.Root>
+                  </div>
+                </div>
 
                 {#if activeVoiceSessionConfig}
                   <div class="batshit-settings-form-row is-tall">

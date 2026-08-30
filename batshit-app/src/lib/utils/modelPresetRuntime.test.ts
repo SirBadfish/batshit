@@ -29,6 +29,7 @@ function buildPreset(overrides: Partial<SavedModel> = {}): SavedModel {
       thinkingBudget: 2000,
       temperature: 0.7,
     },
+    effectiveModelId: 'gemini-3.5-flash',
     createdAt: '2026-05-21T00:00:00.000Z',
     updatedAt: '2026-05-21T00:00:00.000Z',
     ...overrides,
@@ -80,6 +81,7 @@ describe('modelPresetRuntime utilities', () => {
 
     expect(selection.provider).toBe('google')
     expect(selection.modelId).toBe('gemini-3.5-flash')
+    expect(selection.effectiveModelId).toBe('gemini-3.5-flash')
     expect(selection.connection).toEqual({
       type: 'direct',
       service: 'google',

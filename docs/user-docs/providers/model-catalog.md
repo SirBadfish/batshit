@@ -14,7 +14,7 @@ The Model Catalog solves that. It's one combined, searchable list that pulls tog
 
 Instead of memorizing model IDs, you browse the catalog, filter to what you want, and let Batshit fill in the exact identifiers. It lives in Settings → Models, with a toggleable catalog viewer for browsing and searching the full normalized list.
 
-The catalog's model-type filters are **Text**, **Vision**, **Media**, **Audio**, and **Utility**. Vision sits immediately after Text because it narrows the text models to those that can inspect images; Media covers image and video generation models. A vision-capable text model therefore appears under both Text and Vision. Open **View Details** on the selected model to see every capability the catalog reports, such as streaming, vision, tool calling, reasoning, cache control, and long context.
+The catalog's model-type filters are **Text**, **Vision**, **Media**, **Audio**, and **Utility**. Vision sits immediately after Text because it narrows the text models to those that can inspect images; Media covers image and video generation models. A vision-capable text model therefore appears under both Text and Vision. The same distinction applies to OCR: a chat model that can read text in images stays a Text model, while a dedicated OCR endpoint can be Utility. Open **View Details** on the selected model to see every capability the catalog reports, such as streaming, vision, tool calling, reasoning, cache control, and long context.
 
 When catalog data includes a trustworthy max output token limit, Batshit fills it into the preset. If the catalog does not provide that limit, or reports a value that would reserve nearly the whole context window for output, Batshit fills a conservative safe default instead. In that case the Max Output Tokens row shows an **Estimated** badge so you know the value is a Batshit default, not confirmed provider metadata.
 
@@ -30,6 +30,8 @@ Batshit describes every model with three parts, because "the OpenAI model on Ope
 
 The same model can show up on more than one route. A single catalog entry can advertise every transport it works with, so you pick the model first, then choose which connection carries it.
 
+The provider may spell the developer namespace differently on each route. For example, one Z.AI model can use `zai/...` through one connection, `z-ai/...` through OpenRouter, and `zai-org/...` through DeepInfra. Batshit preserves the exact request ID published by each provider, including capitalization such as DeepInfra's `Qwen/...`; it does not guess these names from the combined catalog row.
+
 This matters because the provider/connection is what decides which saved key gets used. A Google-made model reached through a gateway uses that gateway's key, not your direct Google key.
 
 ## How catalog content stays current
@@ -39,6 +41,7 @@ The catalog isn't a hardcoded list baked into the app. Batshit refreshes a share
 A few honest notes:
 
 - New models show up and retired ones drop off as providers change their lists.
+- Every connection attached to a shared catalog row must include its own complete provider request ID. Batshit refuses to publish or save a catalog selection whose connection-specific identity is missing rather than trying a likely-looking name.
 - If a provider's list is briefly unreachable, Batshit keeps the last known set for that provider rather than wiping it, so a provider hiccup doesn't make your models vanish.
 - Catalog freshness isn't instant. A model a provider added minutes ago may not appear until the next refresh.
 - DeepInfra's active chat models come from its public model feed, so the shared catalog can stay current without putting your personal DeepInfra key in Batshit's Vercel project. Your saved key is still required locally when you actually send a message through DeepInfra.
@@ -51,7 +54,8 @@ A Model Preset is a saved bundle: one model, on one connection, with its setting
 
 A preset captures things like:
 
-- The provider connection and the exact model ID.
+- The provider connection, the stable catalog entry, and that provider's exact model request ID.
+- Its preset category: Chat, Media, Audio, or Utility.
 - Whether tools are enabled.
 - Image transport, reasoning, and context settings where the model supports them.
 - Pricing and other provider-specific options.
@@ -88,6 +92,10 @@ So the normal flow is: add a key (or enable a local runtime) → find the model 
 
 Agent and chat-bar pickers only show chat-capable presets on purpose. The catalog also carries non-chat models — image, audio, and utility models — and those presets stay available in Settings → Models for Artifacts and advanced workflows, but they won't clutter the list when you're choosing a model for an agent to talk with.
 
+Batshit normally fills the category from the catalog. If a provider's metadata is incomplete or wrong, open the preset in Settings → Models and change **Preset Category** yourself. A manual category choice is saved with that preset and wins over future automatic guesses. Choose **Automatic** to remove your override and return to the catalog's category (or Batshit's best inference for a manual model).
+
+Existing catalog-backed presets are checked again when Batshit loads them. If an older preset was accidentally classified from a capability tag — for example, a chat model with OCR support being placed under Utility — Batshit repairs it from the catalog unless you deliberately chose a manual category.
+
 ## How each Primary Agent type uses models
 
 Model Presets are an `API` concept. The other Primary Agent types pick models differently:
@@ -111,6 +119,14 @@ Confirm the provider key is saved and the connection is Ready, or that the local
 ### My agent uses the wrong model
 
 Check which preset the agent has selected, and that the preset pins the connection you intended. The same model on two routes is two different presets.
+
+### A chat model appears under Utility
+
+Open the preset in Settings → Models and check **Preset Category**. **Automatic** uses the current catalog classification; choosing **Chat (Agents)** saves a manual override and makes the preset available to agents and the chat bar. Chat models that merely support OCR should remain Chat — Utility is for dedicated non-chat endpoints such as embeddings or standalone OCR.
+
+### A manually entered model says “not found”
+
+Manual entries are sent using the Developer ID and Model ID you enter. Copy the exact request identifier from that provider's documentation or model list, including punctuation and capitalization. Catalog-backed presets do this automatically.
 
 ## Related docs
 

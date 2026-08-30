@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
-import { type SavedModel, isTieredPricing, type ModelConnectionInfo, type ImageTransport } from '$lib/types/savedModels'
+import { type SavedModel, isTieredPricing, type ModelConnectionInfo, type ImageTransport, type ModelPurpose } from '$lib/types/savedModels'
 import { sanitizeId } from '$lib/utils/idSanitizer'
 import { determineModelCompatibility } from '$lib/data/model-compatibility-registry'
 import { ProviderManager, type ModelInfo } from '$lib/server/services/providers'
@@ -20,6 +20,15 @@ import {
   findVercelCatalogEntryById
 } from '$lib/server/services/vercelModelCatalog'
 import { inferModelPurpose } from '$lib/utils/modelPurpose'
+import { resolveCatalogIds, resolveModelIds } from '$lib/utils/modelIdResolver'
+import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+
+class ModelPresetValidationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ModelPresetValidationError'
+  }
+}
 
 async function findModelPresetAgentReferences(userId: string, modelId: string) {
   const agents = await redis.getAgents(userId)
@@ -51,12 +60,12 @@ async function getProviderModel(
   manager: ProviderManager,
   modelId?: string | null,
   provider?: string,
-  vercelSourceId?: string | null
+  catalogModelId?: string | null
 ) {
   if (!modelId) return null
 
   const vercelMatch =
-    (await findVercelCatalogEntryById(vercelSourceId)) ??
+    (await findVercelCatalogEntryById(catalogModelId)) ??
     (await findVercelCatalogEntry(provider, modelId))
 
   if (vercelMatch) {
@@ -74,11 +83,54 @@ async function getProviderModel(
   const targetId = provider ? `${provider}/${modelId}` : undefined
 
   return (
-    (vercelSourceId ? catalog.find((model) => model.id === vercelSourceId) : null) ||
+    (catalogModelId ? catalog.find((model) => model.id === catalogModelId) : null) ||
     (targetId ? catalog.find((model) => model.id === targetId) : null) ||
     catalog.find((model) => model.provider === provider && model.name === modelId) ||
     null
   )
+}
+
+function resolveConnectionId(connection: ModelConnectionInfo): string | null {
+  const explicit = connection.id?.trim()
+  if (explicit) return explicit
+  if (connection.type === 'vercel-gateway') return 'vercel-gateway'
+  if (connection.type === 'openrouter') return 'openrouter'
+  const service = connection.service?.trim()
+  return service ? `direct:${service}` : null
+}
+
+function resolveCatalogPresetIdentity(
+  catalogEntry: Awaited<ReturnType<typeof findVercelCatalogEntryById>>,
+  connection: ModelConnectionInfo
+) {
+  if (!catalogEntry) return null
+  const connectionId = resolveConnectionId(connection)
+  if (!connectionId) {
+    throw new ModelPresetValidationError(
+      'This catalog model is missing a provider connection. Select the connection again before saving.'
+    )
+  }
+
+  const identity = resolveCatalogIds({
+    connectionId,
+    connection: {
+      id: connectionId,
+      transport: connection.type,
+      service: connection.service,
+      providers: connection.service ? [connection.service] : undefined
+    },
+    developerId: catalogEntry.provider,
+    modelId: catalogEntry.name,
+    idVariants: catalogEntry.idVariants ?? null
+  })
+
+  if (!identity?.source) {
+    throw new ModelPresetValidationError(
+      `The Model Catalog does not have an exact provider identifier for ${connectionId}. Refresh the catalog before saving this preset.`
+    )
+  }
+
+  return identity
 }
 
 function toNumber(value: unknown): number | undefined {
@@ -99,6 +151,12 @@ function normalizeImageTransport(value: unknown): ImageTransport | undefined {
   return undefined
 }
 
+function normalizeModelPurpose(value: unknown): ModelPurpose | null {
+  return value === 'chat' || value === 'visual' || value === 'audio' || value === 'utility'
+    ? value
+    : null
+}
+
 function stripInternalModelSettings(settings: SavedModel['settings'] | undefined): SavedModel['settings'] | undefined {
   if (!settings || typeof settings !== 'object') return settings
   const next = { ...settings }
@@ -108,10 +166,47 @@ function stripInternalModelSettings(settings: SavedModel['settings'] | undefined
 
 async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager): Promise<SavedModel> {
   const trimmedName = payload.modelName?.trim() || ''
-  const trimmedProvider = payload.provider?.trim().toLowerCase() || ''
-  const trimmedModelId = payload.modelId?.trim() || ''
+  let trimmedProvider = payload.provider?.trim() || ''
+  let trimmedModelId = payload.modelId?.trim() || ''
   const rawId = typeof payload.id === 'string' ? payload.id.trim() : ''
   const resolvedConnection = normalizeConnection(payload.connection, trimmedProvider, payload.isVercelImport)
+  const requestedCatalogModelId =
+    payload.catalogModelId?.trim() || payload.vercelSourceId?.trim() || undefined
+  const catalogEntry = requestedCatalogModelId
+    ? await findVercelCatalogEntryById(requestedCatalogModelId)
+    : null
+
+  if (requestedCatalogModelId && !catalogEntry) {
+    throw new ModelPresetValidationError(
+      'This catalog model is no longer available. Refresh the Model Catalog and choose it again.'
+    )
+  }
+
+  const catalogIdentity = resolveCatalogPresetIdentity(catalogEntry, resolvedConnection)
+  const manualIdentity = catalogIdentity
+    ? null
+    : resolveModelIds({
+        developerId: trimmedProvider,
+        modelId: trimmedModelId,
+        connection: resolvedConnection
+      })
+
+  if (catalogIdentity) {
+    trimmedProvider = catalogIdentity.developerId
+    trimmedModelId = catalogIdentity.modelId
+  } else if (manualIdentity) {
+    trimmedProvider = manualIdentity.developerId
+    trimmedModelId = manualIdentity.modelId
+  }
+
+  const effectiveModelId =
+    catalogIdentity?.effectiveModelId ?? manualIdentity?.effectiveModelId ?? ''
+  if (!trimmedProvider || !trimmedModelId || !effectiveModelId) {
+    throw new ModelPresetValidationError(
+      'Developer ID and Model ID are required to save a model preset.'
+    )
+  }
+
   const generatedId =
     rawId ||
     buildModelPresetId({
@@ -121,25 +216,29 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
       connection: resolvedConnection
     }) ||
     `model_${Date.now()}`
-  const vercelSourceId =
-    payload.vercelSourceId ||
-    (payload.isVercelImport ? `${trimmedProvider}/${trimmedModelId}` : undefined)
+  const catalogModelId = catalogEntry?.id
+  const isVercelImport = resolvedConnection.type === 'vercel-gateway' && Boolean(catalogEntry)
+  const vercelSourceId = isVercelImport ? catalogModelId : undefined
 
   const vercelCatalogEntry =
-    (await findVercelCatalogEntryById(vercelSourceId)) ??
+    catalogEntry ??
     (trimmedProvider && trimmedModelId
       ? await findVercelCatalogEntry(trimmedProvider, trimmedModelId)
       : null)
 
-  const purpose = inferModelPurpose({
-    id:
-      vercelCatalogEntry?.id ??
-      vercelSourceId ??
-      (trimmedProvider && trimmedModelId ? `${trimmedProvider}/${trimmedModelId}` : trimmedModelId),
-    name: vercelCatalogEntry?.name || trimmedModelId || trimmedName,
-    modelType: vercelCatalogEntry?.modelType ?? null,
-    tags: vercelCatalogEntry?.tags ?? null
-  })
+  const inferredPurpose =
+    normalizeModelPurpose(vercelCatalogEntry?.purpose) ??
+    inferModelPurpose({
+      id:
+        vercelCatalogEntry?.id ??
+        vercelSourceId ??
+        (trimmedProvider && trimmedModelId ? `${trimmedProvider}/${trimmedModelId}` : trimmedModelId),
+      name: vercelCatalogEntry?.name || trimmedModelId || trimmedName,
+      modelType: vercelCatalogEntry?.modelType ?? null,
+      tags: vercelCatalogEntry?.tags ?? null
+    })
+  const purposeOverride = normalizeModelPurpose(payload.purposeOverride)
+  const purpose = purposeOverride ?? inferredPurpose
 
   const model: SavedModel = {
     ...payload,
@@ -147,11 +246,14 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
     modelName: trimmedName || trimmedModelId || generatedId,
     modelId: trimmedModelId,
     provider: trimmedProvider,
+    catalogModelId,
+    effectiveModelId,
     purpose,
+    purposeOverride: purposeOverride ?? undefined,
     contextWindow: toNumber(payload.contextWindow) ?? 0,
     pricing: payload.pricing ?? { input: 0, output: 0 },
     settings: stripInternalModelSettings(payload.settings) ?? {},
-    isVercelImport: payload.isVercelImport ?? false,
+    isVercelImport,
     vercelSourceId,
     voiceSession:
       normalizeModelVoiceSessionConfig(payload.voiceSession) ??
@@ -162,18 +264,11 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
     imageTransport: normalizeImageTransport(payload.imageTransport)
   }
 
-  if (model.connection?.type && model.connection.type !== 'vercel-gateway') {
-    model.isVercelImport = false
-    if (model.connection.type === 'openrouter') {
-      model.vercelSourceId = undefined
-    }
-  }
-
   const providerModel: ModelInfo | null = await getProviderModel(
     manager,
     model.modelId,
     model.provider,
-    payload.vercelSourceId
+    model.catalogModelId
   )
   const providerCapabilities = providerFeaturesToCapabilities(providerModel?.features)
 
@@ -205,7 +300,7 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
     settings: model.settings ?? undefined,
     provider: model.provider,
     modelId: model.modelId,
-    vercelId: model.vercelSourceId ?? undefined,
+    vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
     capabilities: model.capabilities ?? null,
     purpose: model.purpose ?? null
   }) ?? undefined
@@ -299,6 +394,78 @@ async function loadUserModelsWithPurge(userId: string, vercelIds: Set<string>) {
   return { models: filtered, purged }
 }
 
+function repairSavedModelIdentity(
+  model: SavedModel,
+  catalogEntry: Awaited<ReturnType<typeof findVercelCatalogEntryById>>
+) {
+  const connection = resolveSavedModelConnection(model)
+  let changed = false
+
+  const connectionId = resolveConnectionId(connection)
+  const hasCatalogVariant = Boolean(
+    connectionId && catalogEntry?.idVariants?.[connectionId]
+  )
+  if (catalogEntry && hasCatalogVariant) {
+    const identity = resolveCatalogPresetIdentity(catalogEntry, connection)
+    if (identity) {
+      if (model.catalogModelId !== catalogEntry.id) {
+        model.catalogModelId = catalogEntry.id
+        changed = true
+      }
+      if (model.provider !== identity.developerId) {
+        model.provider = identity.developerId
+        changed = true
+      }
+      if (model.modelId !== identity.modelId) {
+        model.modelId = identity.modelId
+        changed = true
+      }
+      if (model.effectiveModelId !== identity.effectiveModelId) {
+        model.effectiveModelId = identity.effectiveModelId
+        changed = true
+      }
+    }
+  }
+
+  if (!model.effectiveModelId) {
+    const identity = resolveModelIds({
+      developerId: model.provider,
+      modelId: model.modelId,
+      connection
+    })
+    if (identity?.effectiveModelId) {
+      model.effectiveModelId = identity.effectiveModelId
+      changed = true
+    }
+  }
+
+  return changed
+}
+
+function repairSavedModelPurpose(
+  model: SavedModel,
+  catalogEntry: Awaited<ReturnType<typeof findVercelCatalogEntryById>>
+) {
+  const purposeOverride = normalizeModelPurpose(model.purposeOverride)
+  const nextPurpose =
+    purposeOverride ??
+    normalizeModelPurpose(catalogEntry?.purpose) ??
+    inferModelPurpose({
+      id:
+        catalogEntry?.id ??
+        model.catalogModelId ??
+        model.vercelSourceId ??
+        (model.provider && model.modelId ? `${model.provider}/${model.modelId}` : model.modelId),
+      name: catalogEntry?.name ?? model.modelId ?? model.modelName,
+      modelType: catalogEntry?.modelType ?? null,
+      tags: catalogEntry?.tags ?? null
+    })
+
+  if (model.purpose === nextPurpose) return false
+  model.purpose = nextPurpose
+  return true
+}
+
 // GET /api/user/saved-models
 export const GET: RequestHandler = async ({ locals }) => {
   if (!locals.user) {
@@ -323,21 +490,22 @@ export const GET: RequestHandler = async ({ locals }) => {
     }
 
     let purposeBackfilledCount = 0
+    let identityBackfilledCount = 0
     for (const model of models) {
       const lookupKey =
+        model.catalogModelId?.toLowerCase() ||
         model.vercelSourceId?.toLowerCase() ||
         (model.provider && model.modelId ? `${model.provider}/${model.modelId}`.toLowerCase() : null)
       const match = lookupKey ? catalogLookup.get(lookupKey) ?? null : null
-      const nextPurpose = inferModelPurpose({
-        id: match?.id ?? model.vercelSourceId ?? (model.provider && model.modelId ? `${model.provider}/${model.modelId}` : model.modelId),
-        name: match?.name ?? model.modelId ?? model.modelName,
-        modelType: match?.modelType ?? null,
-        tags: match?.tags ?? null
-      })
-
-      if (model.purpose !== nextPurpose) {
-        model.purpose = nextPurpose
+      const identityChanged = repairSavedModelIdentity(model, match)
+      if (identityChanged) {
+        identityBackfilledCount += 1
+      }
+      const purposeChanged = repairSavedModelPurpose(model, match)
+      if (purposeChanged) {
         purposeBackfilledCount += 1
+      }
+      if (identityChanged || purposeChanged) {
         await redis.set(`model:${model.id}`, model)
       }
     }
@@ -347,6 +515,7 @@ export const GET: RequestHandler = async ({ locals }) => {
       meta: {
         purged,
         purposeBackfilledCount,
+        identityBackfilledCount,
         vercelCatalogCount: vercelIds.size,
         vercelCatalogFetchedAt: catalog.fetchedAt
       }
@@ -357,7 +526,11 @@ export const GET: RequestHandler = async ({ locals }) => {
   }
 }
 
-export { normaliseSavedModel as _normaliseSavedModel, loadUserModelsWithPurge as _loadUserModelsWithPurge }
+export {
+  normaliseSavedModel as _normaliseSavedModel,
+  loadUserModelsWithPurge as _loadUserModelsWithPurge,
+  repairSavedModelPurpose as _repairSavedModelPurpose
+}
 
 // POST /api/user/saved-models
 export const POST: RequestHandler = async ({ request, locals }) => {
@@ -390,6 +563,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     return json({ success: true, model })
   } catch (error) {
     console.error('Failed to save model:', error)
+    if (error instanceof ModelPresetValidationError) {
+      return json({ error: error.message, code: 'invalid_model_identity' }, { status: 400 })
+    }
     return json({ error: 'Failed to save model' }, { status: 500 })
   }
 }

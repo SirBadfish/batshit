@@ -38,6 +38,27 @@ describe('inferModelPurpose', () => {
     ).toBe('chat')
   })
 
+  it('treats OCR as a chat capability when the model itself is a language model', () => {
+    expect(
+      inferModelPurpose({
+        id: 'anthropic/claude-sonnet-5',
+        name: 'claude-sonnet-5',
+        modelType: 'language',
+        tags: ['reasoning', 'vision', 'ocr', 'chat']
+      })
+    ).toBe('chat')
+  })
+
+  it('still treats dedicated OCR endpoints as utility models', () => {
+    expect(
+      inferModelPurpose({
+        id: 'provider/document-ocr',
+        name: 'document-ocr',
+        tags: ['ocr']
+      })
+    ).toBe('utility')
+  })
+
   it('does not treat audio-preview chat models as non-chat', () => {
     expect(
       inferModelPurpose({

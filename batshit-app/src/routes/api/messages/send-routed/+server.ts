@@ -3590,6 +3590,7 @@ async function handleBatshitAgentStream({
   const fallbackResolvedIds = resolveModelIds({
     developerId: fallbackSelection.provider,
     modelId: fallbackSelection.modelId,
+    effectiveModelId: fallbackSelection.effectiveModelId,
     connection: fallbackConnection,
   })
   const fallbackEffectiveModelId = fallbackResolvedIds?.effectiveModelId ?? null
@@ -3740,6 +3741,7 @@ async function handleBatshitAgentStream({
   const resolvedModelIds = resolveModelIds({
     developerId: primarySelection.provider,
     modelId: primarySelection.modelId,
+    effectiveModelId: primarySelection.effectiveModelId,
     connection: primarySelection.connection,
   })
   const effectiveModelId =
@@ -5328,6 +5330,7 @@ async function handleBatshitAgentStream({
   const primaryResolvedForImages = resolveModelIds({
     developerId: primarySelection.provider,
     modelId: primarySelection.modelId,
+    effectiveModelId: primarySelection.effectiveModelId,
     connection: primaryConnection,
   })
   const primaryProviderIdForImages =

@@ -112,7 +112,7 @@ export const PUT: RequestHandler = async ({ locals, request }) => {
         )
       }
       const provider = String(preset.provider ?? '').trim().toLowerCase()
-      const modelName = String(preset.modelId ?? '').trim()
+      const modelName = String(preset.effectiveModelId ?? preset.modelId ?? '').trim()
       if (!provider || !modelName) {
         return json(
           { error: `Model preset '${presetId}' has no provider/model to embed with.` },

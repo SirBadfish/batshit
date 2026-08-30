@@ -105,7 +105,13 @@ export interface SavedModel {
   modelId: string; // The actual model ID like "claude-3-sonnet-20240229"
   modelName: string; // Display name/nickname like "Claude 3 Sonnet"
   provider: string; // Provider like "anthropic", "openai", etc.
+  /** Stable row ID in Batshit's hosted model catalog. Absent for manual/local-only presets. */
+  catalogModelId?: string;
+  /** Exact model identifier sent to the selected provider connection. Never reconstructed at runtime. */
+  effectiveModelId?: string;
   purpose?: ModelPurpose; // chat | visual | audio | utility
+  /** User-selected category override. When absent, purpose follows catalog/inference. */
+  purposeOverride?: ModelPurpose;
   contextWindow: number; // Context window size in tokens
   iconPath?: string; // Optional custom icon path for the model
   
@@ -142,6 +148,7 @@ export interface SavedModel {
   compatibility?: ModelCompatibility;
   enrichment?: ModelEnrichmentSnapshot;
   isVercelImport?: boolean;
+  /** Vercel Gateway import identity only. Generic catalog identity lives in catalogModelId. */
   vercelSourceId?: string;
   vercelDisplayName?: string;
   connection?: ModelConnectionInfo;

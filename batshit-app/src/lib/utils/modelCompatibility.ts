@@ -55,7 +55,7 @@ export function listUnsupportedN8NParameters(
   return listUnsupportedParameters({
     provider,
     modelId: model.modelId,
-    vercelId: model.vercelSourceId ?? undefined,
+    vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
     capabilities: model.capabilities ?? null,
     settings: model.settings,
     matrixEntries: options?.matrixEntries ?? null

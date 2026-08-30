@@ -232,26 +232,26 @@ onMount(() => {
 				const suppressTemperature = isParameterSuppressedForModel('temperature', {
 					provider: selectedModel.provider,
 					modelId: selectedModel.modelId,
-					vercelId: selectedModel.vercelSourceId
+					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
 				});
 				const suppressTopP = isParameterSuppressedForModel('topP', {
 					provider: selectedModel.provider,
 					modelId: selectedModel.modelId,
-					vercelId: selectedModel.vercelSourceId
+					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
 				});
 				const suppressFrequencyPenalty = isParameterSuppressedForModel('frequencyPenalty', {
 					provider: selectedModel.provider,
 					modelId: selectedModel.modelId,
-					vercelId: selectedModel.vercelSourceId
+					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
 				});
 				const suppressPresencePenalty = isParameterSuppressedForModel('presencePenalty', {
 					provider: selectedModel.provider,
 					modelId: selectedModel.modelId,
-					vercelId: selectedModel.vercelSourceId
+					vercelId: selectedModel.catalogModelId ?? selectedModel.vercelSourceId
 				});
 				await agentStore.updateAgentSettings(currentAgent.id, {
 					primary_model_preset_id: selectedModel.id,
-					primary_model_name: selectedModel.modelId,
+					primary_model_name: selectedModel.effectiveModelId ?? selectedModel.modelId,
 					primary_model_provider: selectedModel.provider,
 					primary_model_temperature: suppressTemperature ? undefined : selectedModel.settings?.temperature,
 					primary_model_max_tokens: selectedModel.settings?.maxTokens,
