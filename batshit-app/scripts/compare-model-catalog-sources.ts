@@ -101,12 +101,11 @@ async function getCatalog(): Promise<CatalogModel[]> {
     throw new Error('Missing KV env for catalog compare')
   }
 
-  const payload = await fetchJson<{ result?: string | { models?: CatalogModel[] } }>(
-    `${url}/get/catalog:v1`,
-    {
-      headers: { Authorization: `Bearer ${token}` }
-    }
-  )
+  const payload = await fetchJson<{
+    result?: string | { models?: CatalogModel[] }
+  }>(`${url}/get/catalog:v1`, {
+    headers: { Authorization: `Bearer ${token}` }
+  })
 
   const raw = payload.result
   const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
@@ -164,12 +163,9 @@ async function fetchOpenAIIds() {
   const key = process.env.OPENAI_API_KEY
   if (!key) return null
 
-  const payload = await fetchJson<{ data?: Array<{ id: string }> }>(
-    'https://api.openai.com/v1/models',
-    {
-      headers: { Authorization: `Bearer ${key}` }
-    }
-  )
+  const payload = await fetchJson<{ data?: Array<{ id: string }> }>('https://api.openai.com/v1/models', {
+    headers: { Authorization: `Bearer ${key}` }
+  })
 
   return normalize((payload.data ?? []).map((entry) => entry.id))
 }
@@ -253,21 +249,24 @@ async function fetchDeepSeekIds() {
 }
 
 async function fetchDeepInfraIds() {
-  const payload = await fetchJson<Array<{
-    model_name?: string
-    reported_type?: string
-    deprecated?: number | null
-    replaced_by?: string | null
-    private?: number | null
-  }>>('https://api.deepinfra.com/models/list')
+  const payload = await fetchJson<
+    Array<{
+      model_name?: string
+      reported_type?: string
+      deprecated?: number | null
+      replaced_by?: string | null
+      private?: number | null
+    }>
+  >('https://api.deepinfra.com/models/list')
 
   return normalize(
     payload
-      .filter((model) =>
-        model?.reported_type === 'text-generation' &&
-        model.private !== 1 &&
-        model.deprecated == null &&
-        !model.replaced_by
+      .filter(
+        (model) =>
+          model?.reported_type === 'text-generation' &&
+          model.private !== 1 &&
+          model.deprecated == null &&
+          !model.replaced_by
       )
       .map((model) => String(model.model_name ?? ''))
   )
@@ -280,12 +279,58 @@ async function fetchZaiIds() {
 }
 
 async function fetchZaiCodingIds() {
-  const key = process.env.ZAI_CODING_API_KEY || process.env.ZAI_API_KEY
+  const key = process.env.ZAI_CODING_API_KEY
   if (!key) return null
-  return fetchOpenAICompatibleIds(
-    process.env.ZAI_CODING_API_BASE_URL || 'https://api.z.ai/api/coding/paas/v4',
-    key
+  return fetchOpenAICompatibleIds(process.env.ZAI_CODING_API_BASE_URL || 'https://api.z.ai/api/coding/paas/v4', key)
+}
+
+async function fetchTogetherIds() {
+  const key = process.env.TOGETHER_API_KEY
+  if (!key) return null
+
+  const payload = await fetchJson<Array<{ id?: string; type?: string; running?: boolean }>>(
+    buildOpenAICompatibleModelsUrl(process.env.TOGETHER_API_BASE_URL || 'https://api.together.xyz/v1'),
+    { headers: { Authorization: `Bearer ${key}` } }
   )
+  return normalize(payload.filter((entry) => entry.type === 'chat').map((entry) => String(entry.id ?? '')))
+}
+
+async function fetchFireworksIds() {
+  const key = process.env.FIREWORKS_API_KEY
+  if (!key) return null
+
+  const ids: string[] = []
+  let pageToken: string | null = null
+  do {
+    const url = new URL('https://api.fireworks.ai/v1/accounts/fireworks/models')
+    url.searchParams.set('filter', 'supports_serverless=true')
+    url.searchParams.set('pageSize', '200')
+    if (pageToken) url.searchParams.set('pageToken', pageToken)
+
+    const payload = await fetchJson<{
+      models?: Array<{ name?: string; public?: boolean; state?: string }>
+      nextPageToken?: string | null
+    }>(url.toString(), { headers: { Authorization: `Bearer ${key}` } })
+
+    ids.push(
+      ...(payload.models ?? [])
+        .filter((entry) => entry.public !== false && entry.state !== 'DELETING' && entry.state !== 'FAILED')
+        .map((entry) => String(entry.name ?? ''))
+    )
+    pageToken = String(payload.nextPageToken ?? '').trim() || null
+  } while (pageToken)
+
+  return normalize(ids)
+}
+
+async function fetchCohereIds() {
+  const key = process.env.COHERE_API_KEY
+  if (!key) return null
+
+  const payload = await fetchJson<{ models?: Array<{ name?: string }> }>('https://api.cohere.ai/v1/models', {
+    headers: { Authorization: `Bearer ${key}` }
+  })
+  return normalize((payload.models ?? []).map((entry) => String(entry.name ?? '')))
 }
 
 async function fetchMistralIds() {
@@ -312,7 +357,10 @@ async function fetchFalIds() {
     url.searchParams.set('limit', '200')
     if (cursor) url.searchParams.set('cursor', cursor)
 
-    const payload = await fetchJson<{ models?: any[]; next_cursor?: string | null }>(url.toString(), {
+    const payload = await fetchJson<{
+      models?: any[]
+      next_cursor?: string | null
+    }>(url.toString(), {
       headers: { Authorization: `Key ${key}` }
     })
 
@@ -333,12 +381,9 @@ async function fetchReplicateIds() {
   const key = process.env.REPLICATE_API_KEY
   if (!key) return null
 
-  const payload = await fetchJson<{ models?: any[] }>(
-    'https://api.replicate.com/v1/collections/official',
-    {
-      headers: { Authorization: `Bearer ${key}` }
-    }
-  )
+  const payload = await fetchJson<{ models?: any[] }>('https://api.replicate.com/v1/collections/official', {
+    headers: { Authorization: `Bearer ${key}` }
+  })
 
   const ids: string[] = []
   for (const model of payload.models ?? []) {
@@ -352,17 +397,104 @@ async function fetchReplicateIds() {
 }
 
 const COMPARISONS: ComparisonDefinition[] = [
-  { provider: 'openai', connectionId: 'direct:openai', fetcher: fetchOpenAIIds },
-  { provider: 'anthropic', connectionId: 'direct:anthropic', fetcher: fetchAnthropicIds },
-  { provider: 'google', connectionId: 'direct:google', fetcher: fetchGoogleIds },
+  {
+    provider: 'openai',
+    connectionId: 'direct:openai',
+    fetcher: fetchOpenAIIds
+  },
+  {
+    provider: 'anthropic',
+    connectionId: 'direct:anthropic',
+    fetcher: fetchAnthropicIds
+  },
+  {
+    provider: 'google',
+    connectionId: 'direct:google',
+    fetcher: fetchGoogleIds
+  },
   { provider: 'groq', connectionId: 'direct:groq', fetcher: fetchGroqIds },
-  { provider: 'deepseek', connectionId: 'direct:deepseek', fetcher: fetchDeepSeekIds },
-  { provider: 'deepinfra', connectionId: 'direct:deepinfra', fetcher: fetchDeepInfraIds },
+  {
+    provider: 'deepseek',
+    connectionId: 'direct:deepseek',
+    fetcher: fetchDeepSeekIds
+  },
+  {
+    provider: 'deepinfra',
+    connectionId: 'direct:deepinfra',
+    fetcher: fetchDeepInfraIds
+  },
+  {
+    provider: 'moonshot',
+    connectionId: 'direct:moonshot',
+    fetcher: async () => {
+      const key = process.env.MOONSHOT_API_KEY
+      if (!key) return null
+      return fetchOpenAICompatibleIds(process.env.MOONSHOT_API_BASE_URL || 'https://api.moonshot.ai/v1', key)
+    }
+  },
+  {
+    provider: 'minimax',
+    connectionId: 'direct:minimax',
+    fetcher: async () => {
+      const key = process.env.MINIMAX_API_KEY
+      if (!key) return null
+      return fetchOpenAICompatibleIds(process.env.MINIMAX_API_BASE_URL || 'https://api.minimax.io/v1', key)
+    }
+  },
+  {
+    provider: 'mimo',
+    connectionId: 'direct:mimo',
+    fetcher: async () => {
+      const key = process.env.MIMO_API_KEY
+      if (!key) return null
+      return fetchOpenAICompatibleIds(process.env.MIMO_API_BASE_URL || 'https://api.xiaomimimo.com/v1', key)
+    }
+  },
   { provider: 'zai', connectionId: 'direct:zai', fetcher: fetchZaiIds },
-  { provider: 'zai_coding', connectionId: 'direct:zai_coding', fetcher: fetchZaiCodingIds },
-  { provider: 'mistral', connectionId: 'direct:mistral', fetcher: fetchMistralIds },
+  {
+    provider: 'zai_coding',
+    connectionId: 'direct:zai_coding',
+    fetcher: fetchZaiCodingIds
+  },
+  {
+    provider: 'togetherai',
+    connectionId: 'direct:togetherai',
+    fetcher: fetchTogetherIds
+  },
+  {
+    provider: 'fireworks',
+    connectionId: 'direct:fireworks',
+    fetcher: fetchFireworksIds
+  },
+  {
+    provider: 'baseten',
+    connectionId: 'direct:baseten',
+    fetcher: async () => {
+      const key = process.env.BASETEN_API_KEY
+      if (!key) return null
+      return fetchOpenAICompatibleIds(process.env.BASETEN_API_BASE_URL || 'https://inference.baseten.co/v1', key)
+    }
+  },
+  {
+    provider: 'cerebras',
+    connectionId: 'direct:cerebras',
+    fetcher: async () => {
+      const key = process.env.CEREBRAS_API_KEY
+      if (!key) return null
+      return fetchOpenAICompatibleIds(process.env.CEREBRAS_API_BASE_URL || 'https://api.cerebras.ai/v1', key)
+    }
+  },
+  {
+    provider: 'mistral',
+    connectionId: 'direct:mistral',
+    fetcher: fetchMistralIds
+  },
   { provider: 'fal', connectionId: 'direct:fal', fetcher: fetchFalIds },
-  { provider: 'replicate', connectionId: 'direct:replicate', fetcher: fetchReplicateIds },
+  {
+    provider: 'replicate',
+    connectionId: 'direct:replicate',
+    fetcher: fetchReplicateIds
+  },
   {
     provider: 'luma',
     connectionId: 'direct:luma',
@@ -390,15 +522,11 @@ const COMPARISONS: ComparisonDefinition[] = [
   {
     provider: 'cohere',
     connectionId: 'direct:cohere',
-    fetcher: async () => null,
-    note: 'Sync currently uses a curated manual list, not a live model-list API call.'
+    fetcher: fetchCohereIds
   }
 ]
 
-async function compareProvider(
-  definition: ComparisonDefinition,
-  catalog: CatalogModel[]
-): Promise<ComparisonResult> {
+async function compareProvider(definition: ComparisonDefinition, catalog: CatalogModel[]): Promise<ComparisonResult> {
   const catalogIds = getCatalogIdsForConnection(catalog, definition.connectionId)
 
   try {
@@ -458,9 +586,7 @@ function printPretty(results: ComparisonResult[]) {
           : 'OK'
 
     console.log(`${result.provider} [${result.connectionId}] -> ${status}`)
-    console.log(
-      `  source=${result.sourceCount} catalog=${result.catalogCount} mode=${result.fetchMode}`
-    )
+    console.log(`  source=${result.sourceCount} catalog=${result.catalogCount} mode=${result.fetchMode}`)
 
     if (result.provider === 'openai') {
       console.log(

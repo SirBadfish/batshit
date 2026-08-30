@@ -490,6 +490,13 @@
     return date.toLocaleString()
   }
 
+  function countDirectCatalogModels(counts: Record<string, number>) {
+    return Object.entries(counts).reduce((total, [source, count]) => {
+      if (source === 'vercel' || source === 'openrouter') return total
+      return total + (Number.isFinite(count) ? count : 0)
+    }, 0)
+  }
+
   async function extractError(response: Response, fallback: string) {
     try {
       const result = await response.json()
@@ -753,23 +760,7 @@
                       {/if}
                     </div>
                     <div class="batshit-settings-form-label">
-                      vercel {entry.counts.vercel ?? 0} · openrouter {entry.counts.openrouter ?? 0} · direct {(
-                        (entry.counts.openai ?? 0) +
-                        (entry.counts.anthropic ?? 0) +
-                        (entry.counts.google ?? 0) +
-                        (entry.counts.mistral ?? 0) +
-                        (entry.counts.groq ?? 0) +
-                        (entry.counts.deepseek ?? 0) +
-                        (entry.counts.zai ?? 0) +
-                        (entry.counts.zai_coding ?? 0) +
-                        (entry.counts.fal ?? 0) +
-                        (entry.counts.luma ?? 0) +
-                        (entry.counts.replicate ?? 0) +
-                        (entry.counts.elevenlabs ?? 0) +
-                        (entry.counts.deepgram ?? 0) +
-                        (entry.counts.assemblyai ?? 0) +
-                        (entry.counts.cohere ?? 0)
-                      )}
+                      vercel {entry.counts.vercel ?? 0} · openrouter {entry.counts.openrouter ?? 0} · direct {countDirectCatalogModels(entry.counts)}
                     </div>
                   </div>
 

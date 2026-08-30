@@ -666,12 +666,6 @@ function buildConnectionOptions(
     'cerebras'
   ]
   const MANUAL_ENTRY_DIRECT_PROVIDERS = new Set<KnownProviderId>([
-    'togetherai',
-    'fireworks',
-    'baseten',
-    'cerebras',
-    'minimax',
-    'mimo',
     'alibaba',
     'stepfun'
   ])
@@ -713,7 +707,7 @@ function buildConnectionOptions(
     elevenlabs: 'Use ElevenLabs speech + transcription models with your API key.',
     deepgram: 'Use Deepgram transcription models with your API key.',
     assemblyai: 'Use AssemblyAI transcription models with your API key.',
-    cohere: 'Use Cohere embeddings + rerank models with your API key.',
+    cohere: 'Use Cohere chat, embeddings, rerank, and transcription models with your API key.',
     deepinfra: 'Use DeepInfra hosted chat models through the built-in live model catalog.'
   }
   for (const provider of directProviders) {
