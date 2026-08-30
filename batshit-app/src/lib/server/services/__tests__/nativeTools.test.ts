@@ -4623,6 +4623,47 @@ printf 'ok\\n'
     expect(result.error?.message).toContain('n8n Primary Agent')
   })
 
+  it("keeps primary_agent_type 'n8n' as the Category 2 subagent wire value (SA-106)", async () => {
+    // SA-106 DL-106-01. The n8n PRIMARY agent type is retired, but BOTH surviving
+    // official `n8n Workflow Subagent` templates hardcode `primary_agent_type: 'n8n'`
+    // with `actor_type: 'subagent'`, and PUBLIC_PRIMARY_AGENT_TYPE_TO_NATIVE_MODE maps
+    // that value to 'mode2'. Dropping 'n8n' from the dispatch context vocabulary reads
+    // like obvious retired-lane cleanup and would break every already-imported
+    // Workflow Subagent workflow in every user's n8n instance.
+    //
+    // It costs nothing to keep: every mode3/mode4 gate is scoped to
+    // `actor_type === 'primary'`, so a subagent caller never reaches them.
+    vi.mocked(redis.get).mockResolvedValue({
+      user_id: 'josh',
+      provider_specific_settings: {
+        nativeTools: {
+          fetchZipEnabled: true
+        }
+      }
+    } as any)
+
+    const result = await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: 'fetch_zip',
+      payloadInput: { zipId: 'zip_demo' },
+      context: {
+        session_id: 'session_demo',
+        agent_id: 'subagent_workflow',
+        primary_agent_type: 'n8n',
+        actor_type: 'subagent',
+        // Required for subagent actors by NATIVE_AUTOMATION_CONTEXT_SCHEMA; both
+        // official Workflow Subagent templates send it.
+        parent_agent_id: 'agent_parent_api'
+      }
+    })
+
+    // The context parsed and resolved rather than being rejected as an unknown type:
+    // that is the whole point of this test.
+    expect(result.context.mode).toBe('mode2')
+    expect(result.context.actor_type).toBe('subagent')
+    expect(result.error?.code).not.toBe('INVALID_CONTEXT')
+  })
+
   it('dispatches agent_browser_find through the native automation pack for primary agents', async () => {
     const runner = vi.fn(async ({ args }) => {
       if (Array.isArray(args) && args[0] === '--version') {
