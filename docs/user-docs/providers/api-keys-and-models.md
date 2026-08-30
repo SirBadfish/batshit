@@ -10,11 +10,12 @@ To use an `API` Primary Agent:
 2. Create a saved model preset in Settings → Models.
 3. Select that preset on an `API` Primary Agent.
 
-To use an `n8n` Primary Agent:
+To use an n8n Workflow Subagent:
 
 1. Add provider credentials inside n8n.
 2. Configure the workflow's model/provider nodes.
-3. Paste the workflow webhook URL into Batshit.
+3. Paste the workflow webhook URL into an `n8n Workflow Subagent` in Batshit.
+4. Assign it to an `API` or `CLI` Primary Agent.
 
 To use a `CLI` Primary Agent:
 
@@ -98,7 +99,7 @@ Batshit Settings → API Keys and n8n credentials are separate.
 | Where the key lives | Used by |
 | --- | --- |
 | Batshit Settings → API Keys | `API` agents, Batshit features, voice providers, Local AI integrations, some CLI-adjacent setup checks |
-| n8n Credentials | `n8n` Primary Agents and n8n workflows |
+| n8n Credentials | n8n workflow tools and n8n Workflow Subagents |
 | CLI login | `CLI` Primary Agents and CLI Subagents |
 
 Batshit does not copy provider API keys into n8n. If an n8n workflow uses OpenAI, Anthropic, OpenRouter, Vercel AI Gateway, or another provider, create that credential in n8n.

@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   clearRunRegistryForTest,
   getRunState,
-  hasActiveN8nPrimaryRun,
   isSessionBusy,
   markComplete,
   markStreaming,
@@ -35,29 +34,6 @@ describe('chatRunRegistry', () => {
     expect(getRunState('session-b').activeMessageId).toBe('msg-b')
     expect(isSessionBusy('session-a')).toBe(true)
     expect(isSessionBusy('session-b')).toBe(true)
-  })
-
-  it('tracks the active n8n run separately from API run state', () => {
-    startRun({
-      sessionId: 'n8n-session',
-      transport: 'n8n',
-      activeMessageId: 'msg-n8n'
-    })
-
-    expect(hasActiveN8nPrimaryRun('api-session')?.sessionId).toBe('n8n-session')
-
-    startRun({
-      sessionId: 'api-session',
-      transport: 'api',
-      activeMessageId: 'msg-api'
-    })
-
-    expect(hasActiveN8nPrimaryRun('api-session')?.sessionId).toBe('n8n-session')
-    expect(hasActiveN8nPrimaryRun('n8n-session')).toBeNull()
-
-    markComplete('n8n-session')
-
-    expect(hasActiveN8nPrimaryRun('api-session')).toBeNull()
   })
 
   it('uses abort controllers per session', () => {

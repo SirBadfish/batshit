@@ -51,7 +51,6 @@ import {
 } from '$lib/utils/promptRuntimeScope'
 import {
   isBrokerAvailable,
-  resolveBrokerFamilies,
   resolveBrokerToolToggles
 } from '$lib/utils/brokerAvailability'
 import {
@@ -128,7 +127,6 @@ type NativeBashDcmState = {
   enabled: boolean
   mode: NativeBashAccessMode
   backend: NativeExecutionBackend
-  isN8n: boolean
   allowListCount: number
   neverAllowCount: number
   automationAllowListCount: number
@@ -527,7 +525,7 @@ export class DatabaseService {
     agent: AgentRow,
     userId?: string,
     promptOptions?: {
-      runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+      runtimeFlavor?: 'codex' | 'claude' | 'vercel'
     }
   ) {
     let primarySystemPrompt = ''
@@ -557,6 +555,10 @@ export class DatabaseService {
     }
 
     const primaryAgentType = normalizePrimaryAgentType(agent)
+
+    if (!isManagedPrimaryAgentType(primaryAgentType)) {
+      throw new Error('The n8n Primary Agent type was removed from Batshit.')
+    }
 
     const runtimeFlavor = promptOptions?.runtimeFlavor ?? 'vercel'
 
@@ -910,7 +912,7 @@ export class DatabaseService {
     notesEnabled: boolean
     agent: any
     zipViewMode: 'inline' | 'appended'
-    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+    runtimeFlavor: 'codex' | 'claude' | 'vercel'
   }): Promise<string> {
     const promptKey = options.hasPermission
       ? 'batshit:tool_guidance_zip_enabled_prompt'
@@ -1102,7 +1104,6 @@ export class DatabaseService {
       enabled,
       mode,
       backend,
-      isN8n: isN8nPrimaryAgentType(primaryAgentType),
       allowListCount: allowList.length,
       neverAllowCount: neverAllowList.length,
       automationAllowListCount: automationAllowList.length,
@@ -1114,16 +1115,6 @@ export class DatabaseService {
     const state = this.resolveNativeBashDcmState(agent)
     if (!state) return null
     if (!state.enabled) return 'native_bash: disabled'
-
-    if (state.isN8n) {
-      const policyHint =
-        state.mode === 'plan'
-          ? 'Plan-mode bash policy enforced'
-          : state.mode === 'dangerous'
-            ? 'Dangerous mode skips agent allow-list prompts; hard-deny rules remain enforced'
-            : 'Agent-mode allow-list policy enforced'
-      return `native_bash: enabled | mode=non_interactive | access_mode=${state.mode} | backend=${state.backend} | ${policyHint} | allow_list_rules=${state.automationAllowListCount} (+defaults) | deny_list_rules=${state.automationDenyListCount} | hard_deny_rules=enforced`
-    }
 
     if (state.mode === 'plan') {
       return `native_bash: enabled | mode=plan | backend=${state.backend} | read/search + .md edits only | command chaining blocked | prefer apply_patch when available; otherwise use safe native edit commands`
@@ -1146,86 +1137,6 @@ export class DatabaseService {
     }
 
     return 'runtime_network: backend=local | localhost is this Batshit runtime; feature tools resolve runtime aliases internally.'
-  }
-
-  private buildNativeAutomationPackDcmLines(agent: any): string[] {
-    const agentType =
-      typeof agent?.agentType === 'string'
-        ? agent.agentType.trim().toLowerCase()
-        : typeof agent?.agent_type === 'string'
-          ? agent.agent_type.trim().toLowerCase()
-          : ''
-    if (agentType !== 'n8n') return []
-
-    const providerSettings = this.getAgentProviderSettings(agent)
-    const nested =
-      providerSettings?.nativeTools && typeof providerSettings.nativeTools === 'object'
-        ? providerSettings.nativeTools
-        : providerSettings?.batshitNativeTools && typeof providerSettings.batshitNativeTools === 'object'
-          ? providerSettings.batshitNativeTools
-          : {}
-
-    // SA-096: broker toggles and families come from the shared rules so this DCM block, the
-    // broker-guidance gate, and n8n's registered actions cannot disagree.
-    const brokerToggles = resolveBrokerToolToggles(providerSettings)
-    const { fetchZipEnabled, batshitToolsEnabled } = brokerToggles
-    const webSearchEnabled =
-      this.parseBooleanSetting(
-        nested.webSearchEnabled ??
-          nested.nativeWebSearchEnabled ??
-          providerSettings.webSearchEnabled ??
-          providerSettings.nativeWebSearchEnabled
-      ) ?? true
-    const bashEnabled =
-      this.parseBooleanSetting(
-        nested.bashEnabled ??
-          nested.nativeBashEnabled ??
-          providerSettings.bashEnabled ??
-          providerSettings.nativeBashEnabled
-      ) ?? true
-
-    const enabledActions: string[] = []
-    const brokerFamilies: string[] = resolveBrokerFamilies({
-      runtime: 'n8n',
-      toggles: brokerToggles
-    })
-    if (bashEnabled) enabledActions.push('bash_execute')
-    enabledActions.push('native_skill')
-    if (brokerFamilies.length > 0) enabledActions.push('batshit_tool_search', 'batshit_tool_use')
-    if (batshitToolsEnabled) {
-      enabledActions.push(
-        'runtime_addon_list',
-        'runtime_addon_status',
-        'runtime_addon_prepare',
-        'runtime_addon_start',
-        'runtime_addon_stop'
-      )
-    }
-    if (webSearchEnabled) enabledActions.push('web_search')
-
-    const actionHints: string[] = []
-    if (webSearchEnabled) {
-      actionHints.push('web_search input: required query:string; optional maxResults:number')
-    }
-    if (fetchZipEnabled) {
-      actionHints.push('fabric:sys.zip.fetch input: required zipId:string; optional includeContent:boolean, maxChars:number')
-    }
-    if (brokerFamilies.length > 0) {
-      actionHints.push('batshit_tool_search input: optional family/query/limit/schemaMode; batshit_tool_use input: exact ref + input object')
-    }
-
-    return [
-      'native_tools_pack: required node="Batshit Tools" | request shape=action + input + context',
-      `native_tools_actions_enabled: ${
-        enabledActions.length > 0 ? enabledActions.join(', ') : '(none)'
-      }`,
-      `native_tools_broker_families: ${brokerFamilies.length > 0 ? brokerFamilies.join(', ') : '(none)'}`,
-      `native_tools_action_hints: ${actionHints.length > 0 ? actionHints.join(' | ') : '(none)'}`,
-      'native_tools_broker_usage: call batshit_tool_search with optional family, then batshit_tool_use with the exact returned ref; refs look like mcp:..., cli:..., artifact:..., fabric:..., agent_browser:...',
-      fetchZipEnabled
-        ? 'native_tools_fetch_zip: use batshit_tool_use ref="fabric:sys.zip.fetch" from n8n primary calls; blocked for subagent calls'
-        : ''
-    ].filter((line) => line.length > 0)
   }
 
   private resolveNativeAgentBrowserDcmState(agent: any): NativeAgentBrowserDcmState | null {
@@ -1365,10 +1276,7 @@ export class DatabaseService {
 
   private resolveNativeDynamicMcpEnabled(agent: any): boolean | null {
     const primaryAgentType = normalizePrimaryAgentType(agent)
-    if (
-      !isN8nPrimaryAgentType(primaryAgentType) &&
-      !isManagedPrimaryAgentType(primaryAgentType)
-    ) {
+    if (!isManagedPrimaryAgentType(primaryAgentType)) {
       return null
     }
 
@@ -1395,10 +1303,7 @@ export class DatabaseService {
 
   private resolveNativeCliToolsEnabled(agent: any): boolean | null {
     const primaryAgentType = normalizePrimaryAgentType(agent)
-    if (
-      !isN8nPrimaryAgentType(primaryAgentType) &&
-      !isManagedPrimaryAgentType(primaryAgentType)
-    ) {
+    if (!isManagedPrimaryAgentType(primaryAgentType)) {
       return null
     }
 
@@ -1430,16 +1335,12 @@ export class DatabaseService {
   private resolveDynamicMcpEnabled(agent: any): boolean {
     const nativeToggle = this.resolveNativeDynamicMcpEnabled(agent)
     if (typeof nativeToggle === 'boolean') return nativeToggle
-    const primaryAgentType = normalizePrimaryAgentType(agent)
-    if (isN8nPrimaryAgentType(primaryAgentType)) return true
     return this.isBatshitPrimaryAgent(agent)
   }
 
   private resolveCliToolsEnabled(agent: any): boolean {
     const nativeToggle = this.resolveNativeCliToolsEnabled(agent)
     if (typeof nativeToggle === 'boolean') return nativeToggle
-    const primaryAgentType = normalizePrimaryAgentType(agent)
-    if (isN8nPrimaryAgentType(primaryAgentType)) return true
     return this.isBatshitPrimaryAgent(agent)
   }
 
@@ -1453,14 +1354,14 @@ export class DatabaseService {
    * the same shared rules the registration sites use (`$lib/utils/brokerAvailability`).
    *
    * `hasCliTools` is intentionally left unresolved. The saved CLI Tool selection can be
-   * overridden per chat and the n8n twin is client-side, so neither twin can read it
+   * overridden per chat, so compilation cannot read it
    * reliably. Unresolved counts as reachable, which keeps this gate from ever being
    * narrower than registration — withholding guidance from an agent that has the tools is
    * the failure this packet exists to prevent.
    */
   private hasBrokerAccess(
     agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+    runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ): boolean {
     return isBrokerAvailable({
       runtime: runtimeFlavorToScope(runtimeFlavor),
@@ -1481,29 +1382,19 @@ export class DatabaseService {
   private hasAnyToolAccess(context: {
     agent: any
     assignedSubagents?: any[]
-    runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+    runtimeFlavor?: 'codex' | 'claude' | 'vercel'
   }): boolean {
     const runtimeFlavor = context.runtimeFlavor ?? 'vercel'
-    if (runtimeFlavor === 'codex' || runtimeFlavor === 'claude') return true
-    if (runtimeFlavor === 'vercel') return true
-
-    const selections = this.getMcpToolSelections(context.agent)
-    if (selections.length > 0) return true
-
-    if (Array.isArray(context.assignedSubagents) && context.assignedSubagents.length > 0) {
-      return true
-    }
-
-    return false
+    return runtimeFlavor === 'codex' || runtimeFlavor === 'claude' || runtimeFlavor === 'vercel'
   }
 
   /**
    * SA-104 P3: the Memory guidance block for memory-enabled agents. Mirrored in the
-   * client twin (`databaseRedis.client.ts`) — keep both call sites and gating identical.
+   * one compile path (SA-106 retired the second, n8n-only implementation).
    */
   private async resolveMemoryGuidancePrompt(
     agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+    runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ) {
     const storedPrompt = await this.getRedisStringValue('batshit:tool_guidance_memory_prompt')
     const fallbackPrompt = buildMemoryPromptBlock({ runtimeFlavor })
@@ -1519,7 +1410,7 @@ export class DatabaseService {
 
   private async resolveDynamicMcpPrompt(
     agent: any,
-    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+    runtimeFlavor: 'codex' | 'claude' | 'vercel'
   ) {
     const storedPrompt = await this.getRedisStringValue('batshit:dynamic_mcp_prompt')
     const fallbackPrompt = buildDynamicMcpPromptBlock({ runtimeFlavor })
@@ -1541,7 +1432,7 @@ export class DatabaseService {
   private shouldInjectToolGuidance(context: {
     agent: any
     assignedSubagents?: any[]
-    runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+    runtimeFlavor?: 'codex' | 'claude' | 'vercel'
   }): boolean {
     return this.hasAnyToolAccess({
       agent: context.agent,
@@ -1556,7 +1447,7 @@ export class DatabaseService {
     globalZipSettings?: Record<string, any>,
     context?: {
       assignedSubagents?: any[]
-      runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+      runtimeFlavor?: 'codex' | 'claude' | 'vercel'
     }
   ): boolean {
     const hasPermission = this.resolveZipControlPermission(agent, globalZipSettings)
@@ -2392,15 +2283,6 @@ export class DatabaseService {
         lines.push(`  ${detailLine}`)
       }
     }
-    const nativeAutomationPackLines = this.buildNativeAutomationPackDcmLines(options.agentRecord)
-    if (nativeAutomationPackLines.length > 0) {
-      lines.push(
-        ...nativeAutomationPackLines.map((entry, index) =>
-          index === 0 ? `${statusIcons.current} ${entry}` : `  ${entry}`
-        )
-      )
-    }
-
     const skillsCommandsLines = await this.buildSkillsCommandsDcm({
       userId: options.userId,
       agentId: options.agentId
@@ -2437,7 +2319,7 @@ export class DatabaseService {
 
     // SA-104 P4: the recall engine's memory-insert section (time awareness, Current /
     // Lingering grouping, more-available honesty) — preformatted server-side so both
-    // twins render byte-identical lines (DL-104-17).
+    // compiled lines stay byte-stable (DL-104-17).
     if (options.memoryDcmLines && options.memoryDcmLines.length > 0) {
       lines.push('', ...options.memoryDcmLines)
     }
@@ -2523,7 +2405,7 @@ export class DatabaseService {
     userId?: string,
     options?: {
       fetch?: typeof fetch
-      runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+      runtimeFlavor?: 'codex' | 'claude' | 'vercel'
       projectPath?: string | null
       projectRules?: Record<string, any> | null
       fileReferences?: FileReferencePayload[]
@@ -2537,7 +2419,6 @@ export class DatabaseService {
   ): Promise<{
     structuredInput: any
     primarySystemPrompt?: string
-    subagentPrompts?: Record<string, string>
     subagentDescription?: Record<string, string>
     resolvedProjectPath?: string | null
   }> {
@@ -2884,7 +2765,7 @@ export class DatabaseService {
     if (primarySystemPrompt) {
       const processedPrimary = replacePromptVariables(primarySystemPrompt, agent, agent?.settings)
       const promptLabel = getPrimaryAgentSystemPromptLabel(
-        normalizePrimaryAgentType(agent)
+        normalizePrimaryAgentType(agent) as 'api' | 'cli'
       )
       mergedSystemPrompt += `==== ${promptLabel} ====\n\n${processedPrimary}`
     }
@@ -2949,7 +2830,7 @@ export class DatabaseService {
     // SA-104 P3: memory guidance is gated on per-agent memory enablement alone — the
     // inline <batshit-memory> save works without any broker family. Part of the stable
     // compiled prefix (DL-104-04): it changes only when enablement or the stored prompt
-    // changes. Mirrored in the client twin.
+    // changes.
     if (resolveAgentMemoryEnabled(agent)) {
       const memoryPrompt = await this.resolveMemoryGuidancePrompt(agent, runtimeFlavor)
       if (memoryPrompt.trim()) {
@@ -2981,7 +2862,6 @@ export class DatabaseService {
     // but artifact prompt addons are retired and no longer injected here.
 
     // Compile system prompts and instructions for each subagent
-    const subagentPrompts: Record<string, string> = {}
     const subagentDescription: Record<string, string> = {}
     const subagentModels: Record<string, { provider?: string | null; model?: string | null }> = {}
 
@@ -3048,10 +2928,6 @@ export class DatabaseService {
         )
 
         const safeKey = resolveSubagentSlug(swf)
-
-        if (subagentSystemPrompt) {
-          subagentPrompts[safeKey] = subagentSystemPrompt
-        }
 
         const saDescription = swf.description || `Subagent ${swf.displayName || swf.name || safeKey}`
         subagentDescription[safeKey] = saDescription
@@ -3247,7 +3123,6 @@ export class DatabaseService {
     return {
       structuredInput,  // The actual structured data
       primarySystemPrompt: compiledMainSystemPrompt || undefined,
-      subagentPrompts: subagentPrompts,
       subagentDescription: subagentDescription,
       resolvedProjectPath
     }

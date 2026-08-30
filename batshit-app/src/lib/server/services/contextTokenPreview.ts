@@ -40,7 +40,7 @@ import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
 import type { SavedModel } from '$lib/types/savedModels'
 
 export type AgentRow = Record<string, any>
-export type RuntimeFlavor = 'codex' | 'claude' | 'vercel' | 'n8n'
+export type RuntimeFlavor = 'codex' | 'claude' | 'vercel'
 export const CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES = 32_000
 export const CODEX_NATIVE_BASE_OVERHEAD_TOKENS = 10_000
 
@@ -184,7 +184,6 @@ export function resolveRuntimeFlavor(agent: AgentRow, agentTypeHint?: string): R
     ...(agentTypeHint ? { agentType: agentTypeHint } : {})
   })
 
-  if (primaryAgentType === 'n8n') return 'n8n'
   if (!isCliPrimaryAgentType(primaryAgentType)) return 'vercel'
 
   const provider = String(agent.primary_model_provider ?? '').toLowerCase()

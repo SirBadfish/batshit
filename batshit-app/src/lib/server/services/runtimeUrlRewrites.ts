@@ -152,41 +152,6 @@ export const rewriteN8nWebhookUrlForRuntime = (
   )
 }
 
-export const resolveBrowserN8nWebhookBaseUrl = (
-  runtimeEnv: Partial<Record<string, string | undefined>> = env
-): string | null => {
-  if (!isContainerizedRuntime(runtimeEnv)) return null
-
-  const explicitWebhookUrl = runtimeEnv.N8N_WEBHOOK_URL?.trim()
-  if (explicitWebhookUrl) return explicitWebhookUrl
-
-  const publicWebhookUrl = runtimeEnv.WEBHOOK_URL?.trim()
-  if (publicWebhookUrl) return publicWebhookUrl
-
-  const editorUrl = runtimeEnv.N8N_EDITOR_BASE_URL?.trim()
-  if (editorUrl) return editorUrl
-
-  return null
-}
-
-export const rewriteN8nWebhookUrlForBrowserRuntime = (
-  rawWebhookUrl: string | undefined | null,
-  runtimeEnv: Partial<Record<string, string | undefined>> = env
-): string | undefined => {
-  if (!rawWebhookUrl) return rawWebhookUrl ?? undefined
-  if (!isContainerizedRuntime(runtimeEnv)) return rawWebhookUrl
-  if (!isLoopbackUrl(rawWebhookUrl)) return rawWebhookUrl
-
-  const browserWebhookBase = normalizeBaseUrl(resolveBrowserN8nWebhookBaseUrl(runtimeEnv))
-  if (!browserWebhookBase) return rawWebhookUrl
-
-  try {
-    return replaceOrigin(rawWebhookUrl, browserWebhookBase)
-  } catch {
-    return rawWebhookUrl
-  }
-}
-
 export const rewriteLoopbackUrlToDockerHostForRuntime = (
   rawUrl: string | undefined | null,
   runtimeEnv: Partial<Record<string, string | undefined>> = env

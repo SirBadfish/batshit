@@ -268,7 +268,7 @@
     --batshit-border: oklab(31.53% 0.007 -0.064);
 
     /* n8n brand colors */
-    --n8n-primary: #ff6f5c; /* logo */
+    --n8n-brand: #ff6f5c; /* logo */
     --n8n-secondary: #2d2d2e; /* base gray */
     --n8n-border: #414243; /* light gray */
   }
@@ -4925,7 +4925,7 @@
   .batshit-settings-agent-type-pill.is-n8n {
     border-color: var(--n8n-border);
     background: var(--n8n-secondary);
-    color: var(--n8n-primary);
+    color: var(--n8n-brand);
   }
 
   .batshit-settings-agent-type-pill,

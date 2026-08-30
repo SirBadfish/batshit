@@ -1228,7 +1228,7 @@ let contextBadgeTitle = $derived(totalToolsSelected > 0 ? `${totalToolsSelected}
 				{:else}
 					<AgentMcpDefaultsCard
 						agentId={currentAgent?.id ?? null}
-						agentType={normalizePrimaryAgentType(currentAgent)}
+						toolHostScope={isCliPrimaryAgentType(normalizePrimaryAgentType(currentAgent)) ? 'cli' : 'api'}
 						userId={userId ?? null}
 						defaultMCPGateways={Array.from(selectedGateways)}
 						defaultMCPToolSelections={normalizeToolSelections(currentAgent?.defaultMCPToolSelections)}

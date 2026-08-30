@@ -17,7 +17,6 @@ import {
   type VisualIndicatorEvent
 } from '$lib/server/visualIndicatorService'
 import { randomUUID } from 'crypto'
-import { adaptCoolToolsToZipSystem } from '$lib/server/coolToolZipAdapter'
 import { ZipDetectionService } from '$lib/server/services/zipDetection'
 import { createClient } from 'redis'
 import { env } from '$env/dynamic/private'
@@ -26,7 +25,6 @@ import { stripLeadingSubagentEchoText } from '$lib/server/services/finalAssistan
 import {
   canonicalizePrimaryAgentRecord,
   isManagedPrimaryAgentType,
-  isN8nPrimaryAgentType,
   normalizePrimaryAgentType,
 } from '$lib/utils/primaryAgentType'
 import {
@@ -1116,7 +1114,6 @@ async function processNDJSONLine(
         eventData.metadata?.agentType ?? data.metadata?.agentType,
       )
       const isManagedAgent = isManagedPrimaryAgentType(effectiveAgentType)
-      const isN8nAgent = isN8nPrimaryAgentType(effectiveAgentType)
 
       // Build fallback intermediate steps from streamed tool_result events when n8n omits intermediateSteps
       const activeState = activeStreams.get(sessionId)
@@ -1137,16 +1134,12 @@ async function processNDJSONLine(
           }))
         : data.intermediateSteps
 
-      // Integrate Cool Tools via adapter
-      const coolToolZips = hasIncomingCoolToolZips || isManagedAgent
-        ? []
-        : await adaptCoolToolsToZipSystem(
-            reconstructedSteps,
-            sessionId,
-            messageId,
-            agentSettings,
-            options.globalZipSettings
-          )
+      // SA-106: the cool-tool zip adapter ran here only for NON-managed agents, i.e.
+      // the retired n8n Primary lane, which reconstructed its tool steps at end. Every
+      // surviving producer is managed and creates its zips inline during the stream, so
+      // this was already a no-op for them. `reconstructedSteps` itself STAYS — it still
+      // feeds subagent-echo stripping and the end event's `intermediateSteps`.
+      const coolToolZips: typeof incomingZipReferences = []
 
       // Recompute streamingContent after we may have added tool_result-derived zips above
       const streamEvents = (activeState?.events ?? [])
@@ -1159,7 +1152,7 @@ async function processNDJSONLine(
           typeof ref?.reference === 'string' &&
           ref.reference.includes('batshit-zip:cool_tool_')
       )
-      const supportsInlineToolReplay = isManagedAgent || isN8nAgent
+      const supportsInlineToolReplay = isManagedAgent
       const streamingContentResult = buildEndStreamingContent({
         streamEvents: streamEvents as any,
         inlineCapable: supportsInlineToolReplay,
@@ -1292,25 +1285,18 @@ async function processNDJSONLine(
     case 'error': {
       // Canonical error events are flat ({ type, error, metadata }), so the
       // eventData remap above resolves to data.metadata and would lose the
-      // error text — read the flat fields first, legacy nested shapes second.
-      // n8n native-stream error events carry their text in `content` (the same
-      // field its item/chunk events use), so that is the final fallback.
-      const contentErrorText = (value: unknown): string => {
-        if (typeof value === 'string') return value.trim()
-        if (value && typeof value === 'object') {
-          const message = (value as Record<string, unknown>).message
-          if (typeof message === 'string') return message.trim()
-        }
-        return ''
-      }
+      // error text — read the flat fields FIRST, legacy nested shapes second.
+      // That ordering is a Fragility-Map pin; do not reverse it.
+      //
+      // SA-106 removed the two trailing `content` fallbacks: they existed only for the
+      // n8n native-stream error shape, which carried its text in the same `content`
+      // field its item/chunk events used. No surviving producer emits that shape.
       const errorEvent = await adapter.emitError({
         error:
           data.error ||
           data.message ||
           eventData.error ||
           eventData.message ||
-          contentErrorText(data.content) ||
-          contentErrorText(eventData.content) ||
           'Unknown error',
         metadata: data.metadata || eventData.metadata || {}
       })

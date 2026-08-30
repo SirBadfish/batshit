@@ -20,14 +20,14 @@ function buildRuntimeSpecificLines(type: ReturnType<typeof normalizeSubagentType
   switch (type) {
     case 'n8n-subnode':
       return [
-        'runtime: n8n AI Agent Tool node attached inside an n8n Primary Agent workflow.',
-        'tool_surface: use the tools connected to this n8n AI Agent Tool, including Batshit Subagent Tools when wired. Do not use fetch_zip from subagent context.',
-        'limits: n8n AI Agent Tool nodes default to 10 max iterations. Treat the 10th iteration as the danger line; keep model/tool loops to 9 or fewer and return progress before the node hits the limit.',
+        'runtime: retired n8n Subnode Subagent record.',
+        'tool_surface: unavailable. This record must be deleted from Agent Settings.',
+        'limits: execution is not supported.',
       ]
     case 'n8n-workflow':
       return [
         'runtime: dedicated n8n workflow called by a Batshit-managed Primary Agent as a subagent tool.',
-        'tool_surface: use this workflow\'s connected tools, including Batshit Subagent Tools when wired. Do not use fetch_zip from subagent context.',
+        'tool_surface: use this workflow\'s connected tools, including Batshit Subagent Tools when wired.',
         'limits: n8n AI Agent nodes default to 10 max iterations. Treat the 10th iteration as the danger line; keep model/tool loops to 9 or fewer and return progress before the node hits the limit.',
       ]
     case 'api':

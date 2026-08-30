@@ -18,8 +18,15 @@
  * guidance cannot drift. Re-implementing any of these conditions elsewhere reintroduces a
  * Fragility-Map-class divergence — extend this module instead.
  *
- * This file must stay pure and free of `$lib/server` imports: `databaseRedis.client.ts`
- * (the n8n compile twin) is client-reachable and imports it.
+ * This file must stay pure and free of `$lib/server` imports. SA-106 retired the n8n
+ * compile twin that first imposed that rule, but the constraint DID NOT lift: the Tool
+ * Grid reaches this module from the browser (`toolGridConfig.ts`, `GlobalToolGrid.svelte`,
+ * `AgentMcpDefaultsCard.svelte`). Adding a server import here breaks the client bundle.
+ *
+ * SA-106 note: `BROKER_RUNTIMES` still has three members. `n8n` is no longer a PRIMARY
+ * agent type, but it is still a live TOOL HOST — `AgentMcpDefaultsCard` derives
+ * `runtime: 'n8n'` for Category 2 `n8n Workflow Subagent` tool grids, whose tools really
+ * are advertised by the Batshit Tools node inside n8n. Do not narrow this union.
  */
 
 export const BROKER_TOOL_FAMILIES = [
@@ -33,9 +40,18 @@ export const BROKER_TOOL_FAMILIES = [
 export type BrokerToolFamily = (typeof BROKER_TOOL_FAMILIES)[number]
 
 /** Which runtime's registration rules to apply. Matches `PromptRuntimeScope`. */
-export const BROKER_RUNTIMES = ['api', 'cli', 'n8n'] as const
+export const TOOL_HOST_SCOPES = ['api', 'cli', 'n8n'] as const
 
-export type BrokerRuntime = (typeof BROKER_RUNTIMES)[number]
+/**
+ * Runtime boundary for Tool Grid and model-compatibility decisions. This deliberately
+ * includes n8n because Category 2 workflow subagents are still live even though n8n is
+ * no longer a Primary Agent type.
+ */
+export type ToolHostScope = (typeof TOOL_HOST_SCOPES)[number]
+
+export const BROKER_RUNTIMES = TOOL_HOST_SCOPES
+
+export type BrokerRuntime = ToolHostScope
 
 /**
  * The six agent toggles that decide broker reachability, already resolved to definite
@@ -117,7 +133,7 @@ export interface BrokerAvailabilityInput {
    *
    * `undefined` means "not resolved here". The `api` and `cli` runtimes require a real
    * selection before registering the `cli` family, but a caller that cannot reach the CLI
-   * tool registry (the n8n compile twin is client-side) must not be able to make the gate
+   * tool registry (the Tool Grid runs in the browser) must not be able to make the gate
    * narrower than registration. Unresolved therefore counts as reachable: over-shipping
    * guidance is recoverable, withholding it from an agent that has the tools is not.
    */
@@ -127,9 +143,8 @@ export interface BrokerAvailabilityInput {
   allowFabricControlTools?: boolean
   /**
    * SA-104 P3: true only for PRIMARY actors whose agent has `memory_enabled`. Memory
-   * controls (`sys.memory.*`) are a scoped first-party allowance on every runtime —
-   * the `sys.zip.fetch` precedent — so they can open the fabric family even where the
-   * broad control plane stays closed (n8n). Default false: memory is opt-in.
+   * controls (`sys.memory.*`) are a scoped first-party allowance for memory-enabled
+   * API/CLI Primary Agents. Default false: memory is opt-in.
    */
   memoryControlsEnabled?: boolean
 }
@@ -144,8 +159,7 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   const allowArtifact = input.allowArtifactRuntimeTools !== false
   const allowFabric = input.allowFabricControlTools !== false
   const cliReachable = toggles.cliToolsEnabled && input.hasCliTools !== false
-  // Memory controls ride the Batshit Tools toggle but not the broad-control-plane gate,
-  // so a memory-enabled n8n primary reaches the fabric family even with fetch-zip off.
+  // Memory controls ride the Batshit Tools toggle but not the broad-control-plane gate.
   const memoryReachable = toggles.batshitToolsEnabled && input.memoryControlsEnabled === true
 
   const families: BrokerToolFamily[] = []

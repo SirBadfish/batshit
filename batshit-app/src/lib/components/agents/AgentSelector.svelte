@@ -8,7 +8,6 @@
 	import * as agentStore from '$lib/stores/agents.svelte';
 	import * as sessionStore from '$lib/stores/session.svelte';
 	import * as groupStore from '$lib/stores/groups.svelte';
-	import * as n8nRuntimeStatusStore from '$lib/stores/n8nRuntimeStatus.svelte';
 	import { GroupService } from '$lib/services/groups';
 	import { DatabaseService } from '$lib/services/databaseRedis.client';
 	import { onMount } from 'svelte';
@@ -22,7 +21,7 @@
 		getPrimaryAgentDisplayLabel,
 		normalizePrimaryAgentType
 	} from '$lib/utils/primaryAgentType';
-	import { isFixedSession } from '$lib/utils/fixedSession';
+	import { isFixedSession, resolveFixedSessionAgentId } from '$lib/utils/fixedSession';
 	
 const { data } = $props();
 const AGENT_CREATE_SENTINEL = '__create__';
@@ -37,6 +36,7 @@ let groupsReady = $state(false);
 let agentsReady = $state(false);
 let clearedGroupId = $state<string | null>(null);
 let lastAutoSyncedSessionId = $state<string | null>(null);
+let missingFixedAgentNoticeSessionId = $state<string | null>(null);
 	
 	// Get reactive values
 const agents = $derived(agentStore.getAgents());
@@ -50,7 +50,6 @@ const activeGroupId = $derived(currentSession?.metadata?.group_chat?.group_id ||
 const activeGroup = $derived(
 	activeGroupId ? groups.find((group) => group.id === activeGroupId) || null : null
 );
-const n8nRuntimeUnavailable = $derived(n8nRuntimeStatusStore.isUnavailable());
 const onboardingSettings = $derived(data?.userSettings?.onboarding_settings ?? null);
 const firstRunSetupFinished = $derived(
 	Boolean(onboardingSettings?.setup_completed_at || onboardingSettings?.setup_skipped_at)
@@ -64,20 +63,8 @@ function isGroupRunnable(group: { agent_ids?: string[] | null }) {
 	return getValidGroupAgentIds(group).length >= 2;
 }
 
-function isN8nPrimaryAgent(agent: agentStore.Agent) {
-	return normalizePrimaryAgentType(agent) === 'n8n';
-}
-
-function isAgentUnavailable(agent: agentStore.Agent) {
-	return n8nRuntimeUnavailable && isN8nPrimaryAgent(agent);
-}
-
-function getAgentUnavailableReason(agent: agentStore.Agent) {
-	return isAgentUnavailable(agent) ? 'n8n is not connected' : null;
-}
-
 function getFirstAvailableAgent(agentList: agentStore.Agent[]) {
-	return agentList.find((agent) => !isAgentUnavailable(agent)) ?? null;
+	return agentList[0] ?? null;
 }
 
 $effect(() => {
@@ -101,7 +88,18 @@ $effect(() => {
 	const sessionId = currentSession?.id ?? null;
 	if (!sessionId) {
 		lastAutoSyncedSessionId = null;
+		missingFixedAgentNoticeSessionId = null;
 		return;
+	}
+	const fixedSessionAgentId = resolveFixedSessionAgentId(currentSession);
+	const fixedSessionAgentMissing = Boolean(
+		fixedSessionAgentId && !agents.some((agent) => agent.id === fixedSessionAgentId)
+	);
+	if (fixedSessionAgentMissing && missingFixedAgentNoticeSessionId !== sessionId) {
+		missingFixedAgentNoticeSessionId = sessionId;
+		toast.error("This Infinite Session's saved agent no longer exists. Delete the session or restore that agent before continuing.");
+	} else if (!fixedSessionAgentMissing) {
+		missingFixedAgentNoticeSessionId = null;
 	}
 	if (!shouldAutoSyncSessionTarget(sessionId, lastAutoSyncedSessionId)) return;
 
@@ -137,7 +135,6 @@ async function loadGroups() {
 				await Promise.all([
 					agentStore.loadAgents(data.user.id),
 					loadGroups(),
-					n8nRuntimeStatusStore.refreshN8nRuntimeStatus()
 				]);
 				agentsReady = true;
 
@@ -154,7 +151,7 @@ async function loadGroups() {
 					const lastSelectedAgentId = localStorage.getItem('lastSelectedAgent');
 					const lastSelectedAgent = loadedAgents.find(a => a.id === lastSelectedAgentId);
 
-					if (lastSelectedAgentId && lastSelectedAgent && !isAgentUnavailable(lastSelectedAgent)) {
+					if (lastSelectedAgentId && lastSelectedAgent) {
 						// Restore last selected agent if it still exists
 						agentStore.setCurrentAgentId(lastSelectedAgentId);
 					} else if (firstAvailableAgent) {
@@ -170,22 +167,6 @@ async function loadGroups() {
 			}
 		}
 	});
-
-$effect(() => {
-	if (!open) return;
-	void n8nRuntimeStatusStore.refreshN8nRuntimeStatus({ force: true });
-});
-
-$effect(() => {
-	if (!agentsReady || !n8nRuntimeUnavailable || !currentAgent) return;
-	if (!isN8nPrimaryAgent(currentAgent)) return;
-
-	const fallback = getFirstAvailableAgent(agents);
-	agentStore.setCurrentAgentId(fallback?.id ?? null);
-	if (activeGroupId) {
-		void persistGroupSelection(null);
-	}
-});
 
 $effect(() => {
 	if (!groupsReady || !agentsReady) return;
@@ -216,12 +197,6 @@ $effect(() => {
 	// Handle agent selection
 	async function handleSelect(agentId: string) {
 		const agent = agents.find((item) => item.id === agentId);
-		if (agent && isAgentUnavailable(agent)) {
-			toast.warning('n8n is not connected', {
-				description: 'Start n8n before selecting an n8n Primary Agent.'
-			});
-			return;
-		}
 		// 2026-08-29: an Infinite Session is one agent's life — the picker is frozen
 		// to that agent (the group-refusal pattern; a server-side episode guard backstops).
 		if (isFixedSession(currentSession) && currentAgent && agentId !== currentAgent.id) {
@@ -592,7 +567,7 @@ function handleEditClick(e: Event, agentId: string) {
 					isFixedSession(currentSession) && currentAgent && agent.id !== currentAgent.id
 						? 'Infinite Session'
 						: null}
-				{@const unavailableReason = getAgentUnavailableReason(agent) ?? frozenReason}
+				{@const unavailableReason = frozenReason}
 				<div class="agent-selector-menu-row flex items-center gap-2 {agent.id === currentAgent?.id ? 'border-l-2 border-r-2 border-primary pl-2 pr-2' : 'pl-3 pr-3'}" class:is-unavailable={Boolean(unavailableReason)}>
 					<DropdownMenu.Item
 						onSelect={() => handleSelect(agent.id)}

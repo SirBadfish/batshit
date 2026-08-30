@@ -8,7 +8,6 @@
     Pause,
     PhoneOff,
     CircleDot,
-    FlaskConical,
     FileText,
     ChevronDown,
     MessageCircle,
@@ -128,8 +127,6 @@
   let {
     onSend = (message: string, metadata?: any) => {},
     disabled = false,
-    testMode = $bindable(false),
-    onOpenN8nSheet = () => {},
     voiceMode = $bindable(false),
     onVoiceModeChange = (enabled: boolean) => {},
     sessionId = null,
@@ -144,8 +141,6 @@
   } = $props<{
     onSend?: (message: string, metadata?: any) => boolean | void | Promise<boolean | void>
     disabled?: boolean
-    testMode?: boolean
-    onOpenN8nSheet?: () => void
     voiceMode?: boolean
     onVoiceModeChange?: (enabled: boolean) => void
     sessionId?: string | null
@@ -3490,44 +3485,6 @@ $effect(() => {
           </div>
         {/if}
 
-        {#if !isManagedAgent}
-          <!-- n8n split button -->
-          <div class="chatbar-split-button n8n-split-button">
-            <!-- Left side: Open n8n sheet -->
-            <button
-              class="chatbar-split-action"
-              onclick={onOpenN8nSheet}
-              {disabled}
-              aria-label="Open n8n agent"
-              title="Open n8n agent"
-              data-testid="open-n8n-agent-button"
-              data-ab-control="open-n8n-agent"
-            >
-              <img
-                src="https://n8n.io/favicon.ico"
-                alt="n8n"
-                class="chatbar-n8n-icon"
-              />
-            </button>
-
-            <!-- Divider -->
-            <div class="chatbar-divider"></div>
-
-            <!-- Right side: Test mode toggle -->
-            <button
-              class="chatbar-split-action {testMode ? 'is-test-active' : ''}"
-              onclick={() => testMode = !testMode}
-              {disabled}
-              aria-label={testMode ? 'Disable test mode' : 'Enable test mode'}
-              title={testMode ? 'Test mode ON (click to disable)' : 'Test mode OFF (click to enable)'}
-              data-testid="toggle-test-mode-button"
-              data-ab-control="toggle-test-mode"
-            >
-              <FlaskConical class="chatbar-icon" />
-            </button>
-          </div>
-        {/if}
-
         {#if sessionId && showExecutionViewer}
           <div class="chatbar-tool-shell execution-viewer-button">
             <button
@@ -4171,20 +4128,6 @@ $effect(() => {
     opacity: 0.5;
   }
 
-  .chatbar-split-action.is-test-active {
-    background: oklch(0.72 0.13 64 / 0.2);
-    color: oklch(0.68 0.16 58);
-  }
-
-  .chatbar-split-action.is-test-active:hover {
-    background: oklch(0.72 0.13 64 / 0.3);
-  }
-
-  .chatbar-n8n-icon {
-    width: 1.25rem;
-    height: 1.25rem;
-  }
-
   :global(.chatbar-icon),
   :global(.chat-input-action-icon) {
     width: 1rem;
@@ -4565,8 +4508,5 @@ $effect(() => {
         display: none;
       }
 
-	    :global(.n8n-split-button) {
-      display: none;
-    }
   }
 </style>

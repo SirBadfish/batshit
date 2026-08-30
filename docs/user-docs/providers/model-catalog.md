@@ -101,7 +101,7 @@ Existing catalog-backed presets are checked again when Batshit loads them. If an
 Model Presets are an `API` concept. The other Primary Agent types pick models differently:
 
 - **`API` Primary Agents** select a saved Model Preset directly. This is the path this page is about.
-- **`n8n` Primary Agents** use whatever model and provider nodes you configure inside the n8n workflow. Their credentials live in n8n, so Batshit doesn't gate them on Batshit-side keys.
+- **n8n Workflow Subagents** use whatever model and provider nodes you configure inside the n8n workflow. Their credentials live in n8n, while the saved Batshit model preset records compatibility and presentation.
 - **`CLI` Primary Agents** use their CLI runtime's own model selection (the Codex or Claude Code login), not an `API` Model Preset.
 
 If you connect more than one Primary Agent type, expect models to be configured in more than one place — that's by design, not a bug.

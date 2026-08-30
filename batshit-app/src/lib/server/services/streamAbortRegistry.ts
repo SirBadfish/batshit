@@ -19,30 +19,12 @@ type SessionTurnEntry = {
   messageId?: string | null
 }
 
-type N8nPrimaryRunEntry = {
-  userId: string
-  sessionId: string
-  messageId?: string | null
-  agentId?: string | null
-  startedAt: number
-}
-
 const activeStreams = new Map<string, StreamAbortEntry>()
 const activeGroupTurns = new Map<string, GroupAbortEntry>()
 const activeSessionTurns = new Map<string, SessionTurnEntry>()
-const activeN8nPrimaryRuns = new Map<string, N8nPrimaryRunEntry>()
-const N8N_PRIMARY_RUN_STALE_MS = 6 * 60 * 60 * 1000
 const SESSION_TURN_STALE_MS = 6 * 60 * 60 * 1000
 const ABORTED_TURN_RELEASE_MS = 5 * 1000
 const ORPHANED_TURN_RELEASE_MS = 2 * 60 * 1000
-
-function pruneStaleN8nPrimaryRuns(now = Date.now()) {
-  for (const [userId, entry] of activeN8nPrimaryRuns.entries()) {
-    if (now - entry.startedAt > N8N_PRIMARY_RUN_STALE_MS) {
-      activeN8nPrimaryRuns.delete(userId)
-    }
-  }
-}
 
 function pruneStaleSessionTurns(now = Date.now()) {
   for (const [sessionId, stream] of activeStreams.entries()) {
@@ -174,47 +156,6 @@ export function clearSessionTurn(sessionId: string, messageId?: string | null) {
 export function getActiveSessionTurn(sessionId: string) {
   pruneStaleSessionTurns()
   return activeSessionTurns.get(sessionId) ?? null
-}
-
-export function registerN8nPrimaryRun(params: {
-  userId: string
-  sessionId: string
-  messageId?: string | null
-  agentId?: string | null
-}) {
-  pruneStaleN8nPrimaryRuns()
-  const existing = activeN8nPrimaryRuns.get(params.userId)
-  if (existing && existing.sessionId !== params.sessionId) {
-    return {
-      ok: false,
-      existing
-    } as const
-  }
-
-  const entry: N8nPrimaryRunEntry = {
-    userId: params.userId,
-    sessionId: params.sessionId,
-    messageId: params.messageId ?? null,
-    agentId: params.agentId ?? null,
-    startedAt: Date.now()
-  }
-  activeN8nPrimaryRuns.set(params.userId, entry)
-  return {
-    ok: true,
-    entry
-  } as const
-}
-
-export function clearN8nPrimaryRun(userId: string, sessionId?: string | null) {
-  const entry = activeN8nPrimaryRuns.get(userId)
-  if (!entry) return
-  if (sessionId && entry.sessionId !== sessionId) return
-  activeN8nPrimaryRuns.delete(userId)
-}
-
-export function getActiveN8nPrimaryRun(userId: string) {
-  pruneStaleN8nPrimaryRuns()
-  return activeN8nPrimaryRuns.get(userId) ?? null
 }
 
 export function registerGroupAbort(sessionId: string, controller: AbortController) {

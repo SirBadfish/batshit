@@ -37,12 +37,10 @@
     DEFAULT_DCM_SCHEMA_HINT_REQUIRED_LIMIT,
     DEFAULT_DCM_TOOL_NAME_THRESHOLD,
     DEFAULT_GOON_LIP_SYNC_LAB_ENABLED,
-    DEFAULT_N8N_EXECUTION_SEARCH_LIMIT,
     DEFAULT_WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE,
     MAX_DCM_SCHEMA_HINT_LIMIT,
     MAX_DCM_SCHEMA_HINT_MAX_CHARS,
     MAX_DCM_TOOL_NAME_THRESHOLD,
-    MAX_N8N_EXECUTION_SEARCH_LIMIT,
     MIN_DCM_SCHEMA_HINT_MAX_CHARS,
     WEB_SEARCH_PERPLEXITY_MAX_TOKENS_PER_PAGE_OPTIONS,
     WEB_SEARCH_PROVIDER_LABELS,
@@ -617,7 +615,6 @@
 
     debouncedSave({
       admin_settings: {
-        n8n_execution_search_limit: adminSettings.n8nExecutionSearchLimit,
         dcm_schema_hint_required_limit: adminSettings.dcmSchemaHintRequiredLimit,
         dcm_schema_hint_optional_limit: adminSettings.dcmSchemaHintOptionalLimit,
         dcm_schema_hint_max_chars: adminSettings.dcmSchemaHintMaxChars,
@@ -1711,11 +1708,6 @@
   function normaliseAdminSettings(settings?: UserSettingsRow | null): AdminSettingsState {
     const admin = (settings?.admin_settings as Record<string, any>) ?? {}
     return {
-      n8nExecutionSearchLimit: clampNumber(
-        admin.n8n_execution_search_limit ?? DEFAULT_N8N_EXECUTION_SEARCH_LIMIT,
-        1,
-        MAX_N8N_EXECUTION_SEARCH_LIMIT
-      ),
       dcmSchemaHintRequiredLimit: clampNumber(
         admin.dcm_schema_hint_required_limit ?? DEFAULT_DCM_SCHEMA_HINT_REQUIRED_LIMIT,
         1,
@@ -1860,12 +1852,9 @@
 
     <AdminUtilityCards
       goonLipSyncLabEnabled={adminSettings.goonLipSyncLabEnabled}
-      n8nExecutionSearchLimit={adminSettings.n8nExecutionSearchLimit}
       disabled={isLoading}
       onGoonLipSyncLabEnabledChange={(checked) =>
         (adminSettings.goonLipSyncLabEnabled = checked)}
-      onN8nExecutionSearchLimitChange={(value) =>
-        (adminSettings.n8nExecutionSearchLimit = value)}
     />
 
     <AdminWebSearchCard

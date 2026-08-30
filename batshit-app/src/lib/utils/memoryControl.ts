@@ -11,8 +11,10 @@
  *     inline route and the `sys.memory.save` Fabric control so both paths produce
  *     identical records (P3 parity requirement).
  *
- * No `$lib/server` imports allowed here — the n8n compile twin and `+page.svelte` load
- * this module in the browser.
+ * No `$lib/server` imports allowed here — `+page.svelte`, `AgentSettingsPanel.svelte`,
+ * `MemorySettingsPanel.svelte` and `AgentMemorySettingsCard.svelte` load this module in
+ * the browser. (SA-106 retired the n8n compile twin, which was the original reason; the
+ * constraint stands on the surviving client consumers.)
  */
 
 import { controlTag, pairedBlockRegexGlobal } from '$lib/utils/controlTags'
@@ -341,7 +343,7 @@ export function resolveEffectiveMemoryWindow(
 /**
  * SA-104 P5 — the Agent Settings memory draft: one bundle over the four stored
  * per-agent memory fields, read through THE resolvers so Settings display, compile
- * twins, and the recall engine can never disagree about effective values.
+ * compile path, and the recall engine can never disagree about effective values.
  */
 export interface AgentMemorySettingsDraft {
   enabled: boolean
@@ -709,10 +711,12 @@ function extractCandidateRefs(value: unknown): string[] {
  * through the DCM insert channel and must never be double-stored as tool-output zips).
  *
  * The `fabric:sys.memory.` / `sys.memory.` ref string in the step's args is the
- * authority: only the memory Fabric family produces those refs, on every lane. The
- * broker tool NAME alone is not required — the n8n lane's steps carry the workflow's
- * tool-node name (e.g. `Batshit_Tools`), which P8 proved evades a name-only gate and
- * re-zipped memory search results on n8n while API/CLI stayed exempt.
+ * authority, NOT the broker tool name. SA-104 P8 proved a name-only gate fails: n8n
+ * steps arrive carrying the workflow's tool-node name (e.g. `Batshit_Tools`) instead of
+ * the broker's, so memory search results were re-zipped there while API/CLI stayed
+ * exempt. SA-106 retired the n8n PRIMARY lane but NOT that hazard — `n8n Workflow
+ * Subagent` steps still reach the cool-tool adapter with workflow-authored names. Do
+ * not relax this back to a name gate.
  * Still strict: with no matching ref, the step is NOT a memory step and zips normally.
  */
 export function isMemoryControlToolStep(step: unknown): boolean {

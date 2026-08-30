@@ -1,7 +1,7 @@
 /**
  * Runtime-scoped sections for admin-editable Batshit system prompts.
  *
- * Batshit compiles one prompt body for three primary-agent runtimes. Before SA-096 the
+ * Batshit compiles one prompt body for two primary-agent runtimes. Before SA-096 the
  * packaged prompts listed every runtime's tool names, call shapes, and examples at once,
  * so an API agent was taught call shapes for managed CLI and n8n, and every Bad/Good
  * example used a tool name that agent did not have.
@@ -15,11 +15,11 @@
  *   ...content only API Primary Agents should see...
  *   <!-- /runtime -->
  *
- *   <!-- runtime:cli,n8n -->
- *   ...content shared by managed CLI and n8n agents...
+ *   <!-- runtime:cli -->
+ *   ...content only managed CLI agents should see...
  *   <!-- /runtime -->
  *
- * Scope names are the user-facing primary-agent types (`api`, `cli`, `n8n`), not the
+ * Scope names are the user-facing primary-agent types (`api`, `cli`), not the
  * internal runtime flavors, because that is the vocabulary the Admin prompt editor and the
  * product docs use.
  *
@@ -28,11 +28,17 @@
  * creed a bad admin edit should fail loudly rather than drift.
  */
 
-export type PromptRuntimeScope = 'api' | 'cli' | 'n8n'
+export type PromptRuntimeScope = 'api' | 'cli'
+type StoredPromptRuntimeScope = PromptRuntimeScope | 'n8n'
 
-export type PromptRuntimeFlavor = 'codex' | 'claude' | 'vercel' | 'n8n'
+export type PromptRuntimeFlavor = 'codex' | 'claude' | 'vercel'
 
-const VALID_SCOPES: readonly PromptRuntimeScope[] = ['api', 'cli', 'n8n']
+const VALID_SCOPES: readonly PromptRuntimeScope[] = ['api', 'cli']
+const RETIRED_SCOPES = ['n8n'] as const
+const ACCEPTED_STORED_SCOPES: readonly StoredPromptRuntimeScope[] = [
+  ...VALID_SCOPES,
+  ...RETIRED_SCOPES
+]
 
 const OPEN_MARKER = /^[ \t]*<!--[ \t]*runtime:([a-zA-Z0-9_,\s-]+?)[ \t]*-->[ \t]*$/
 const CLOSE_MARKER = /^[ \t]*<!--[ \t]*\/runtime[ \t]*-->[ \t]*$/
@@ -42,12 +48,11 @@ const CLOSE_MARKER = /^[ \t]*<!--[ \t]*\/runtime[ \t]*-->[ \t]*$/
  * `vercel` is the API/direct Vercel AI SDK lane; `codex` and `claude` are both managed CLI.
  */
 export function runtimeFlavorToScope(runtimeFlavor: PromptRuntimeFlavor): PromptRuntimeScope {
-  if (runtimeFlavor === 'n8n') return 'n8n'
   if (runtimeFlavor === 'vercel') return 'api'
   return 'cli'
 }
 
-function parseScopeList(raw: string, lineNumber: number): PromptRuntimeScope[] {
+function parseScopeList(raw: string, lineNumber: number): StoredPromptRuntimeScope[] {
   const parts = raw
     .split(',')
     .map((part) => part.trim().toLowerCase())
@@ -61,15 +66,15 @@ function parseScopeList(raw: string, lineNumber: number): PromptRuntimeScope[] {
   }
 
   for (const part of parts) {
-    if (!VALID_SCOPES.includes(part as PromptRuntimeScope)) {
+    if (!ACCEPTED_STORED_SCOPES.includes(part as StoredPromptRuntimeScope)) {
       throw new Error(
         `Prompt runtime scope marker on line ${lineNumber} names an unknown runtime "${part}". ` +
-          `Expected one or more of: ${VALID_SCOPES.join(', ')}.`
+          `Expected one or more of: ${ACCEPTED_STORED_SCOPES.join(', ')}.`
       )
     }
   }
 
-  return parts as PromptRuntimeScope[]
+  return parts as StoredPromptRuntimeScope[]
 }
 
 /**
@@ -85,7 +90,7 @@ export function applyPromptRuntimeScope(prompt: string, scope: PromptRuntimeScop
   const lines = prompt.split('\n')
   const kept: string[] = []
 
-  let openScopes: PromptRuntimeScope[] | null = null
+  let openScopes: StoredPromptRuntimeScope[] | null = null
   let openLineNumber = 0
   let keepingCurrentBlock = false
   // Set when a non-matching block was just dropped. Dropping a block leaves the blank line
@@ -148,7 +153,7 @@ export function applyPromptRuntimeScope(prompt: string, scope: PromptRuntimeScop
 
 /**
  * Model-facing broker tool names for a runtime. API agents get the `native_`-prefixed Vercel
- * AI SDK tools; managed CLI and n8n agents get the bridge/node names.
+ * AI SDK tools; managed CLI agents get the bridge names.
  */
 export function brokerToolNamesForScope(scope: PromptRuntimeScope): {
   search: string

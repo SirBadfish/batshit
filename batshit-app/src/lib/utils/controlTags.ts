@@ -240,8 +240,7 @@ export function buildControlErrorRecord(
 /**
  * Next-turn surfacing (DL-104-05): correction lines for the DCM, read from the
  * MOST RECENT assistant message only — control errors are one-turn correction
- * hints, not persistent state. Both compilation twins call this with their
- * message list; keep the output byte-identical across twins.
+ * hints, not persistent state. The compilation path calls this with its message list.
  */
 export function buildControlErrorDcmLines(
   messages: Array<{ role?: string; metadata?: Record<string, any> | null }>

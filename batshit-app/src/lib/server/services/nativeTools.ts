@@ -111,7 +111,7 @@ type AgentBrowserBashSettings = {
 }
 
 // SA-096: the family list and the rules deciding which families the broker serves live in
-// $lib/utils/brokerAvailability so the compile twins can gate their broker guidance on the
+// $lib/utils/brokerAvailability so the compile path can gate its broker guidance on the
 // same truth this file registers tools from.
 export const BATSHIT_TOOL_FAMILIES = BROKER_TOOL_FAMILIES
 export type BatshitToolFamily = (typeof BATSHIT_TOOL_FAMILIES)[number]
@@ -218,8 +218,7 @@ const NATIVE_AUTOMATION_ACTIONS = [
   'runtime_addon_prepare',
   'runtime_addon_start',
   'runtime_addon_stop',
-  'web_search',
-  'fetch_zip'
+  'web_search'
 ] as const
 type NativeAutomationAction = (typeof NATIVE_AUTOMATION_ACTIONS)[number]
 type NativeAutomationMode = 'mode1' | 'mode2' | 'mode3' | 'mode4'
@@ -2984,7 +2983,7 @@ export function resolveNativeToolSettings(providerSettings?: Record<string, any>
       'nativeBashApprovalCardsEnabled'
     ) ?? false
   // SA-096: the six broker-relevant toggles are resolved by the shared util so the compile
-  // twins read agent settings exactly the way tool registration does.
+  // the compile path reads agent settings exactly the way tool registration does.
   const brokerToggles = resolveBrokerToolToggles(providerSettings)
   const agentBrowserEnabled = brokerToggles.agentBrowserEnabled
   const agentBrowserRuntimeMode = normalizeAgentBrowserRuntimeMode(
@@ -9347,11 +9346,6 @@ const NATIVE_AUTOMATION_INPUT_SCHEMAS = {
     region: z.string().optional(),
     safeSearch: z.enum(['strict', 'moderate', 'off']).optional(),
     timeoutMs: z.number().int().min(1_000).max(MAX_WEB_SEARCH_TIMEOUT_MS).optional()
-  }),
-  fetch_zip: z.object({
-    zipId: z.string().trim().min(1),
-    includeContent: z.boolean().optional(),
-    maxChars: z.number().int().min(64).max(MAX_ZIP_CHARS).optional()
   })
 } as const
 
@@ -9391,8 +9385,6 @@ function resolveNativeAutomationToggleState(
       )
     case 'web_search':
       return settings.webSearchEnabled
-    case 'fetch_zip':
-      return settings.fetchZipEnabled
     default:
       return false
   }
@@ -9416,9 +9408,10 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
   ) {
     if (!families.includes('fabric')) families.push('fabric')
   }
-  // SA-104 P3: memory controls open the fabric family for PRIMARY actors on every mode
-  // (n8n mode1/mode2 included) — the sys.zip.fetch precedent, scoped by the per-agent
-  // memory_enabled flag resolved by the caller from the governing agent record.
+  // SA-104 P3: memory controls open the fabric family for PRIMARY actors. After
+  // SA-106, live Primary Agents are mode3/mode4 only; mode1/mode2 remain Category 2
+  // n8n wire values for subagent/tool callers. The per-agent memory_enabled flag is
+  // resolved by the caller from the governing agent record.
   if (
     settings.batshitToolsEnabled &&
     context.actor_type === 'primary' &&
@@ -10216,33 +10209,6 @@ export async function dispatchNativeAutomationPackAction(input: {
     })
   }
 
-  if (action === 'fetch_zip') {
-    if (context.actor_type === 'subagent') {
-      return buildNativeAutomationResult({
-        success: false,
-        action,
-        backend,
-        context,
-        error: {
-          code: 'ACTION_DISABLED',
-          message: 'fetch_zip is unavailable in subagent runs.'
-        }
-      })
-    }
-    if (context.mode !== 'mode1' && context.mode !== 'mode2') {
-      return buildNativeAutomationResult({
-        success: false,
-        action,
-        backend,
-        context,
-        error: {
-          code: 'ACTION_DISABLED',
-          message: 'fetch_zip is only available to n8n Primary Agent calls.'
-        }
-      })
-    }
-  }
-
   const parsedInput = parseNativeAutomationInput(action, input.payloadInput)
   if (!parsedInput.ok) {
     return buildNativeAutomationResult({
@@ -10975,18 +10941,15 @@ export async function dispatchNativeAutomationPackAction(input: {
     })
   }
 
-  const result = await nativeFetchZip({
-    userId: input.userId,
-    zipId: parsedInput.value.zipId,
-    includeContent: parsedInput.value.includeContent,
-    maxChars: parsedInput.value.maxChars
-  })
   return buildNativeAutomationResult({
-    success: true,
+    success: false,
     action,
     backend,
     context,
-    data: result
+    error: {
+      code: 'INVALID_ACTION',
+      message: `Unsupported native automation action "${action}".`
+    }
   })
 }
 
@@ -11632,7 +11595,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   // SA-104 P3: opt-in per agent; subagent callers leave this unset/false.
   const memoryControlsEnabled = context.memoryControlsEnabled === true
 
-  // SA-096: shared with the compile twins' broker-guidance gate so registered tools and
+  // SA-096: shared with the compile path's broker-guidance gate so registered tools and
   // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
   const brokerToggles = resolveBrokerToolToggles(context.providerSettings)
   const apiBrokerAllowedFamilies: BatshitToolFamily[] = resolveBrokerFamilies({

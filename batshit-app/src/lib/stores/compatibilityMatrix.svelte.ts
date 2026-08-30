@@ -1,6 +1,20 @@
 import type { CompatibilityMatrixSnapshot } from '$lib/types/compatibilityMatrix'
+import type { N8nCompatibilitySyncStatus } from '$lib/server/services/n8nParameterCompatibility'
+
+export type N8nCompatibilityState = {
+  hasWorkflowSubagents: boolean
+  localSnapshotAvailable: boolean
+  fetchedAt: string | null
+  syncStatus: N8nCompatibilitySyncStatus | null
+}
 
 let matrix = $state<CompatibilityMatrixSnapshot | null>(null)
+let n8nState = $state<N8nCompatibilityState>({
+  hasWorkflowSubagents: false,
+  localSnapshotAvailable: false,
+  fetchedAt: null,
+  syncStatus: null
+})
 let isLoading = $state(false)
 let initialized = false
 
@@ -23,6 +37,16 @@ export async function loadCompatibilityMatrix() {
       } else {
         setMatrix(null)
       }
+      const nextN8nState = payload?.n8n
+      n8nState = {
+        hasWorkflowSubagents: nextN8nState?.hasWorkflowSubagents === true,
+        localSnapshotAvailable: nextN8nState?.localSnapshotAvailable === true,
+        fetchedAt: typeof nextN8nState?.fetchedAt === 'string' ? nextN8nState.fetchedAt : null,
+        syncStatus:
+          nextN8nState?.syncStatus && typeof nextN8nState.syncStatus === 'object'
+            ? nextN8nState.syncStatus
+            : null
+      }
     } else {
       console.error('[CompatibilityMatrix Store] Failed response:', response.status, response.statusText)
       setMatrix(null)
@@ -43,6 +67,10 @@ export function getMatrixEntries() {
   return matrix?.entries ?? []
 }
 
+export function getN8nState(): N8nCompatibilityState {
+  return n8nState
+}
+
 export function getIsLoading(): boolean {
   return isLoading
 }
@@ -55,6 +83,7 @@ export const compatibilityMatrixStore = {
   loadCompatibilityMatrix,
   getCompatibilityMatrix,
   getMatrixEntries,
+  getN8nState,
   getIsLoading,
   isInitialized,
   setMatrix

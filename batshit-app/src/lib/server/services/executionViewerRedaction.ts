@@ -1,3 +1,11 @@
+/**
+ * Execution Viewer redaction.
+ *
+ * SA-106: the webhook-body/webhook-style-input helpers retired with the n8n Primary
+ * lane's execution-log POST handler. `redactHeaders` stays — `executionViewerLlmCapture`
+ * uses it on every captured provider response, so this remains a live security boundary.
+ */
+
 const SENSITIVE_HEADER_KEYS = new Set([
   'authorization',
   'cookie',
@@ -17,25 +25,6 @@ const SENSITIVE_HEADER_KEYS = new Set([
   'x-csrf-token',
   'x-csrftoken',
   'x-mcp-gateway-auth-token'
-])
-
-const SENSITIVE_BODY_KEYS = new Set([
-  'batshit_sse_callback_token',
-  'batshitSseCallbackToken',
-  'batshit_native_tool_token',
-  'batshitNativeToolToken',
-  'batshit_native_tool_header',
-  'batshitNativeToolHeader',
-  'batshit_sse_callback_header',
-  'batshitSseCallbackHeader',
-  'batshit_sse_callback_expires_at',
-  'batshitSseCallbackExpiresAt',
-  'sse_callback_token',
-  'sseCallbackToken',
-  'callback_token',
-  'callbackToken',
-  'callback_auth_token',
-  'callbackAuthToken'
 ])
 
 function normalizeHeaderKey(key: string): string {
@@ -70,47 +59,4 @@ export function redactHeaders(headers: unknown): unknown {
     output[key] = value
   }
   return output
-}
-
-function shouldRedactBodyKey(key: string): boolean {
-  if (SENSITIVE_BODY_KEYS.has(key)) return true
-  const normalized = key.trim().toLowerCase()
-
-  if (normalized.includes('callback') && normalized.includes('token')) return true
-  if (normalized.includes('secret')) return true
-  if (normalized.includes('password')) return true
-
-  return false
-}
-
-export function redactWebhookBody(body: unknown): unknown {
-  if (!body || typeof body !== 'object') return body
-
-  if (Array.isArray(body)) {
-    return body.map((item) => redactWebhookBody(item))
-  }
-
-  const output: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
-    if (shouldRedactBodyKey(key)) {
-      output[key] = '[REDACTED]'
-      continue
-    }
-    output[key] = redactWebhookBody(value)
-  }
-  return output
-}
-
-export function redactWebhookStyleInput(input: unknown): unknown {
-  if (!Array.isArray(input)) return input
-
-  return input.map((entry) => {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry
-    const record = entry as Record<string, unknown>
-    return {
-      ...record,
-      headers: redactHeaders(record.headers),
-      body: redactWebhookBody(record.body)
-    }
-  })
 }

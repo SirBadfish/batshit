@@ -5,7 +5,6 @@ import {
   rewriteBatshitCallbackUrlsForN8nRuntime,
   rewriteLoopbackUrlToDockerHostForRuntime,
   rewriteLoopbackUrlForRuntimeBase,
-  rewriteN8nWebhookUrlForBrowserRuntime,
   rewriteN8nGatewayUrlForRuntime,
   rewriteN8nWebhookUrlForRuntime,
   shouldUseInternalBatshitCallbacksForN8n
@@ -132,30 +131,6 @@ describe('runtimeUrlRewrites', () => {
         {}
       )
     ).toBe('http://localhost:5678/webhook/subagent')
-  })
-
-  it('rewrites browser-facing n8n primary webhooks to the Docker published n8n port', () => {
-    expect(
-      rewriteN8nWebhookUrlForBrowserRuntime(
-        'http://localhost:5678/webhook/sample_n8n_primary',
-        {
-          BATSHIT_CONTAINERIZED: '1',
-          N8N_WEBHOOK_URL: 'http://127.0.0.1:5679/webhook'
-        }
-      )
-    ).toBe('http://127.0.0.1:5679/webhook/sample_n8n_primary')
-  })
-
-  it('does not rewrite external browser-facing n8n primary webhooks in Docker', () => {
-    expect(
-      rewriteN8nWebhookUrlForBrowserRuntime(
-        'https://n8n.example.test/webhook/primary',
-        {
-          BATSHIT_CONTAINERIZED: '1',
-          N8N_WEBHOOK_URL: 'http://127.0.0.1:5679/webhook'
-        }
-      )
-    ).toBe('https://n8n.example.test/webhook/primary')
   })
 
   it('rewrites generic loopback runtime URLs to the Docker host gateway while preserving port', () => {

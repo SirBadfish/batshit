@@ -8,19 +8,14 @@ import type { SavedModel } from '$lib/types/savedModels';
 import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte';
 import * as agentStore from '$lib/stores/agents.svelte';
 import * as savedModelsStore from '$lib/stores/savedModels.svelte';
-import * as compatibilityMatrixStore from '$lib/stores/compatibilityMatrix.svelte';
 import SettingsPanel from '$lib/components/settings/SettingsPanel.svelte';
-import { listUnsupportedN8NParameters } from '$lib/utils/modelCompatibility';
 import { getSavedModelBadgeProvider, resolveSavedModelConnection } from '$lib/utils/modelConnections';
 import type { CatalogConnectionOption } from '$lib/types/modelCatalog';
 import { getModelPresetAvailability } from '$lib/utils/modelPresetAvailability';
 import { isParameterSuppressedForModel } from '$lib/utils/parameterFilter';
 import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents';
-import {
-	isManagedPrimaryAgentType,
-	isN8nPrimaryAgentType,
-	normalizePrimaryAgentType
-} from '$lib/utils/primaryAgentType';
+import { isCliPrimaryAgentType, normalizePrimaryAgentType } from '$lib/utils/primaryAgentType';
+import type { PrimaryAgentType } from '$lib/utils/primaryAgentType';
 	
 	// Props
 let {
@@ -38,7 +33,6 @@ let open = $state(false);
 let settingsPanelOpen = $state(false);
 let settingsPanelInitialTab = $state<'models' | 'agents' | 'user'>('models');
 let settingsPanelInitialModelId = $state<string | null>(null);
-let lastWarningModelId = $state<string | null>(null);
 
 // Get saved models from shared store (reactive)
 	const savedModels = $derived(savedModelsStore.getSavedModels());
@@ -47,16 +41,13 @@ let lastWarningModelId = $state<string | null>(null);
 	
 // Get current agent to determine default model
 const currentAgent = $derived(agentStore.getCurrentAgent());
-let agentTypeForFiltering = $state<'n8n' | 'api' | 'cli'>('n8n');
+let agentTypeForFiltering = $state<PrimaryAgentType>('api');
 let connectionOptions = $state<CatalogConnectionOption[] | null>(null);
 let connectionOptionsLoading = $state(false);
 let connectionOptionsError = $state<string | null>(null);
 
 $effect(() => {
-	agentTypeForFiltering = normalizePrimaryAgentType(currentAgent);
-	if (isManagedPrimaryAgentType(agentTypeForFiltering)) {
-		lastWarningModelId = null;
-	}
+	agentTypeForFiltering = isCliPrimaryAgentType(normalizePrimaryAgentType(currentAgent)) ? 'cli' : 'api';
 });
 
 const modelMenuItems = $derived.by(() => {
@@ -93,7 +84,6 @@ async function loadConnectionOptions(options: { force?: boolean } = {}) {
 }
 
 $effect(() => {
-	if (!isManagedPrimaryAgentType(agentTypeForFiltering)) return;
 	void loadConnectionOptions();
 });
 	
@@ -151,16 +141,12 @@ $effect(() => {
 	}
 });
 		
-const matrixEntries = $derived(compatibilityMatrixStore.getMatrixEntries());
-
 // Load saved models on mount
 onMount(() => {
 	const handleModelConnectionsUpdated = () => {
 		connectionOptions = null;
 		connectionOptionsError = null;
-		if (isManagedPrimaryAgentType(agentTypeForFiltering)) {
-			void loadConnectionOptions({ force: true });
-		}
+		void loadConnectionOptions({ force: true });
 	};
 
 	window.addEventListener(
@@ -168,10 +154,7 @@ onMount(() => {
 		handleModelConnectionsUpdated
 	);
 
-	void Promise.all([
-		savedModelsStore.loadSavedModels(),
-		compatibilityMatrixStore.loadCompatibilityMatrix()
-	]);
+	void savedModelsStore.loadSavedModels();
 
 	return () => {
 		window.removeEventListener(
@@ -277,18 +260,6 @@ onMount(() => {
 			}
 		}
 
-		if (selectedModel && isN8nPrimaryAgentType(agentTypeForFiltering)) {
-			const unsupported = listUnsupportedN8NParameters(selectedModel, { matrixEntries });
-			if (unsupported.length && lastWarningModelId !== selectedModel.id) {
-				toast.info(`Ignored in n8n: ${unsupported.join(', ')}`, {
-					description: 'Those parameters only apply to API agents.'
-				});
-				lastWarningModelId = selectedModel.id;
-			} else if (!unsupported.length) {
-				lastWarningModelId = null;
-			}
-		}
-		
 		open = false;
 }
 	
@@ -416,11 +387,11 @@ function handleEditClick(e: Event, presetId: string) {
 	<DropdownMenu.Content align="start" class="model-selector-dropdown">
 		<DropdownMenu.Label>Available Models</DropdownMenu.Label>
 
-		{#if isManagedPrimaryAgentType(agentTypeForFiltering) && connectionOptionsLoading}
+		{#if connectionOptionsLoading}
 			<DropdownMenu.Item disabled>
 				<span class="text-muted-foreground">Loading connection status…</span>
 			</DropdownMenu.Item>
-		{:else if isManagedPrimaryAgentType(agentTypeForFiltering) && connectionOptionsError}
+		{:else if connectionOptionsError}
 			<DropdownMenu.Item disabled>
 				<span class="text-muted-foreground">{connectionOptionsError}</span>
 			</DropdownMenu.Item>

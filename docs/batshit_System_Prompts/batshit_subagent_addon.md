@@ -9,9 +9,8 @@ This addon is not a global chat system prompt. Main Batshit prompt compilers use
 
 ## How to Identify Your AI Subagents
 
-Batshit currently has four launch-facing subagent types:
+Batshit currently has three launch-facing subagent types:
 
-- `n8n Subnode Subagent` — an n8n AI Agent Tool node inside an `n8n` primary-agent workflow
 - `n8n Workflow Subagent` — a dedicated n8n webhook workflow used by managed primary agents
 - `API Subagent` — a Batshit-managed direct-AI subagent used by `API` primary agents
 - `CLI Subagent` — a Batshit-managed Codex or Claude CLI subagent used by `API` primary agents
@@ -69,7 +68,7 @@ Your assigned subagents have access to:
 
 If the user enables Dynamic Tool Search for a subagent, it can discover and use allowed Batshit capabilities through one search/use pair:
 - API subagents may see `native_batshit_tool_search` / `native_batshit_tool_use`
-- Managed CLI and n8n-backed lanes may see `batshit_tool_search` / `batshit_tool_use`
+- Managed CLI and n8n Workflow Subagent lanes may see `batshit_tool_search` / `batshit_tool_use`
 - Search results return exact typed refs such as `mcp:tool_name`, `cli:tool_id`, or `artifact:use.artifact.slug`
 
 Tips:

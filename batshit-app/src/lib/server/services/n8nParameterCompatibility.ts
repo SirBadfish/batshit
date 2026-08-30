@@ -2,9 +2,32 @@ import type { CompatibilityMatrixEntry, CompatibilityMatrixSnapshot } from '$lib
 import { getParameterSchema } from '$lib/data/parameter-schemas'
 import { redis } from '$lib/server/redis'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
+
+/**
+ * Category 2 n8n tool-platform compatibility.
+ *
+ * This service answers whether a saved model preset can be represented by n8n's
+ * current chat-model nodes for n8n Workflow Subagents. It is not a Primary Agent
+ * runtime registry: the retired n8n Primary lane must never be reintroduced here.
+ */
 const CACHE_KEY = 'compatibility:matrix:v1'
 
 const N8N_MATRIX_KEY = 'compatibility:matrix:n8n:v1'
+const N8N_SYNC_STATUS_KEY = 'compatibility:matrix:n8n:sync-status:v1'
+
+export type N8nCompatibilitySyncTrigger =
+  | 'workflow-subagent-save'
+  | 'model-card-open'
+  | 'model-card-manual'
+
+export type N8nCompatibilitySyncStatus = {
+  status: 'ok' | 'error'
+  trigger: N8nCompatibilitySyncTrigger
+  attemptedAt: string
+  completedAt: string
+  entries: number
+  error: string | null
+}
 
 type NodeTypeDescription = {
   name?: string
@@ -423,4 +446,51 @@ export async function loadN8nCompatibilitySnapshot(): Promise<CompatibilityMatri
     return null
   }
   return snapshot
+}
+
+async function storeN8nCompatibilitySyncStatus(
+  status: N8nCompatibilitySyncStatus
+): Promise<void> {
+  try {
+    await redis.json.set(N8N_SYNC_STATUS_KEY, '$', status)
+  } catch (error) {
+    console.warn('[n8n-parameter-compatibility] failed to store sync status', error)
+  }
+}
+
+export async function runTrackedN8nCompatibilitySync(options: {
+  userId: string
+  trigger: N8nCompatibilitySyncTrigger
+}): Promise<CompatibilityMatrixSnapshot> {
+  const attemptedAt = new Date().toISOString()
+
+  try {
+    const snapshot = await runN8nCompatibilitySync({ userId: options.userId })
+    await storeN8nCompatibilitySyncStatus({
+      status: 'ok',
+      trigger: options.trigger,
+      attemptedAt,
+      completedAt: new Date().toISOString(),
+      entries: snapshot.entries.length,
+      error: null
+    })
+    return snapshot
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to sync n8n compatibility'
+    await storeN8nCompatibilitySyncStatus({
+      status: 'error',
+      trigger: options.trigger,
+      attemptedAt,
+      completedAt: new Date().toISOString(),
+      entries: 0,
+      error: message
+    })
+    throw error
+  }
+}
+
+export async function loadN8nCompatibilitySyncStatus(): Promise<N8nCompatibilitySyncStatus | null> {
+  const status = (await redis.json.get(N8N_SYNC_STATUS_KEY)) as N8nCompatibilitySyncStatus | null
+  if (!status || (status.status !== 'ok' && status.status !== 'error')) return null
+  return status
 }

@@ -7,7 +7,10 @@ import { getClaudeConfigOverrideValidationError } from '$lib/server/services/cla
 import { sanitizeId } from '$lib/utils/idSanitizer' // Story 6.9c
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
-import { presentAgentForRuntime } from '$lib/server/services/agentRuntimePresentation'
+import {
+  isManagedPrimaryAgentType,
+  normalizePrimaryAgentType
+} from '$lib/utils/primaryAgentType'
 
 // GET /api/agents - List all agents for the current user
 export const GET: RequestHandler = async ({ locals }) => {
@@ -16,9 +19,7 @@ export const GET: RequestHandler = async ({ locals }) => {
   }
   
   try {
-    const agents = (await redis.getAgents(locals.user.id)).map((agent) =>
-      presentAgentForRuntime(agent as Record<string, any>)
-    )
+    const agents = await redis.getAgents(locals.user.id)
     return json({ agents })
   } catch (error) {
     console.error('Error getting agents:', error)
@@ -34,6 +35,31 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   
   try {
     const body = await request.json()
+    const requestedAgentType =
+      typeof body.agentType === 'string' ? body.agentType.trim().toLowerCase() : ''
+    if (
+      Object.prototype.hasOwnProperty.call(body, 'agentType') &&
+      requestedAgentType !== 'api' &&
+      requestedAgentType !== 'cli'
+    ) {
+      return json(
+        {
+          error: 'Primary Agent type must be API or CLI.',
+          code: 'primary_agent_type_invalid'
+        },
+        { status: 400 }
+      )
+    }
+    const agentType = normalizePrimaryAgentType(undefined, body.agentType)
+    if (!isManagedPrimaryAgentType(agentType)) {
+      return json(
+        {
+          error: 'Primary Agent type must be API or CLI.',
+          code: 'primary_agent_type_invalid'
+        },
+        { status: 400 }
+      )
+    }
     const codexValidationError = getCodexConfigOverrideValidationError(body.codex_settings ?? null)
     if (codexValidationError) {
       return json({ error: codexValidationError }, { status: 400 })
@@ -56,6 +82,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const agent = await redis.createAgent({
       ...body,
+      agentType,
       ...(Object.prototype.hasOwnProperty.call(body, 'avatar_icon_ref')
         ? { avatar_icon_ref: normalizeOptionalIconRefInput(body.avatar_icon_ref, 'avatar_icon_ref') }
         : {}),

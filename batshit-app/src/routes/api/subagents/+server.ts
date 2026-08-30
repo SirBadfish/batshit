@@ -8,6 +8,7 @@ import {
 	getCodexConfigOverrideValidationError,
 } from '$lib/server/services/codexSettings'
 import { syncManagedCliSubagentProfile } from '$lib/server/services/cliSubagentProfileSync'
+import { runTrackedN8nCompatibilitySync } from '$lib/server/services/n8nParameterCompatibility'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import type { SubagentRow } from '$lib/types/database'
@@ -19,6 +20,7 @@ import {
 import {
 		canonicalizeSubagentRecord,
 		isCliSubagentType,
+	isN8nSubnodeSubagentType,
 	isWorkflowBackedSubagentType,
 	normalizeSubagentType,
 } from '$lib/utils/subagentType'
@@ -81,7 +83,27 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			return json({ error: 'Display name is required' }, { status: 400 })
 		}
 
+		const requestedSubagentType =
+			typeof body.subagentType === 'string' ? body.subagentType.trim().toLowerCase() : ''
+		if (
+			Object.prototype.hasOwnProperty.call(body, 'subagentType') &&
+			!['n8n-workflow', 'api', 'cli'].includes(requestedSubagentType)
+		) {
+			return json(
+				{ error: 'Subagent type must be n8n Workflow, API, or CLI.', code: 'subagent_type_invalid' },
+				{ status: 400 }
+			)
+		}
 		const subagentType = normalizeSubagentType(undefined, body.subagentType)
+		if (isN8nSubnodeSubagentType(subagentType)) {
+			return json(
+				{
+					error: 'n8n Subnode Subagents were removed from Batshit.',
+					code: 'subagent_type_retired'
+				},
+				{ status: 400 }
+			)
+		}
 		const webhookUrl =
 			typeof body.webhook_url === 'string'
 				? body.webhook_url.trim()
@@ -152,7 +174,24 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			await syncManagedCliSubagentProfile(locals.user.id, storageSubagent)
 		}
 
-		return json({ subagent: resolveUploadUrlsForBrowserInPayload(storageSubagent) })
+		let compatibilityWarning: string | null = null
+		if (isWorkflowBackedSubagentType(storageSubagent.subagentType)) {
+			try {
+				await runTrackedN8nCompatibilitySync({
+					userId: locals.user.id,
+					trigger: 'workflow-subagent-save'
+				})
+			} catch (error) {
+				compatibilityWarning =
+					error instanceof Error ? error.message : 'Failed to sync n8n parameter support'
+				console.warn('[subagents] saved workflow subagent but parameter sync failed', error)
+			}
+		}
+
+		return json({
+			subagent: resolveUploadUrlsForBrowserInPayload(storageSubagent),
+			compatibilityWarning
+		})
 	} catch (error) {
 		console.error('Failed to create subagent:', error)
 		return json(

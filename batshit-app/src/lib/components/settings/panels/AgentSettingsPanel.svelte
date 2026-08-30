@@ -103,12 +103,14 @@ import {
 } from "$lib/icons/iconTypes";
 import {
   type PrimaryAgentType,
+  type StoredPrimaryAgentType,
   getPrimaryAgentDisplayLabel,
   isCliPrimaryAgentType,
   isManagedPrimaryAgentType,
   normalizePrimaryAgentType,
   shouldShowReasoningByDefaultForPrimaryAgent
 } from "$lib/utils/primaryAgentType";
+import type { ToolHostScope } from "$lib/utils/brokerAvailability";
 import {
   getCompatibleSubagentTypesForPrimaryAgent,
   getSubagentTypeBadgeTone,
@@ -118,6 +120,7 @@ import {
   isWorkflowBackedSubagentType,
   normalizeSubagentType,
   type SubagentType,
+  type StoredSubagentType,
 } from "$lib/utils/subagentType";
 import { validateN8nProductionWebhookUrl } from "$lib/utils/n8nWebhookValidation";
 import { ProjectService } from "$lib/services/projects";
@@ -168,7 +171,6 @@ import {
   Shield,
   ShieldPlus,
   Brain,
-  Settings2,
   TerminalSquare,
   Lock,
   Mic,
@@ -320,7 +322,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
   interface BasicForm {
     displayName: string;
-    agentType: PrimaryAgentType;
+    agentType: StoredPrimaryAgentType;
     show_reasoning: boolean;
     preserve_reasoning: boolean;
     tool_approval_mode: "off" | "all";
@@ -1276,8 +1278,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
   let modelConnectionOptions = $state<CatalogConnectionOption[] | null>(null);
   let modelConnectionOptionsLoading = $state(false);
   let modelConnectionOptionsError = $state<string | null>(null);
-  let modelConnectionOptionsLoadedForAgentType = $state<PrimaryAgentType | null>(null);
-  let unsupportedDefaultModelParams = $state<string[]>([]);
+  let modelConnectionOptionsLoadedForAgentType = $state<StoredPrimaryAgentType | null>(null);
   let unsupportedSubagentModelParams = $state<string[]>([]);
   let voiceProfiles = $state<VoiceProfileRecord[]>([]);
   let voiceProfilesLoading = $state(false);
@@ -1832,7 +1833,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       model,
       availability: getModelPresetAvailability({
         model,
-        agentType: basicForm.agentType,
+        agentType: getPrimaryToolHostScope(basicForm.agentType),
         connectionOptions: modelConnectionOptions,
       }),
     }));
@@ -1900,7 +1901,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       model,
       availability: getModelPresetAvailability({
         model,
-        agentType: getSubagentPresetAgentType(subagentForm.subagentType),
+        agentType: getSubagentToolHostScope(subagentForm.subagentType),
         connectionOptions: null,
       }),
     }));
@@ -1924,23 +1925,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     if (supportsCodexFastMode(codexForm.model)) return;
     codexForm = { ...codexForm, serviceTier: "standard" };
   });
-  $effect(() => {
-    if (basicForm.agentType !== "n8n") {
-      unsupportedDefaultModelParams = [];
-      return;
-    }
-    if (!selectedModelId) {
-      unsupportedDefaultModelParams = [];
-      return;
-    }
-    const selectedModel = savedModels.find(
-      (model) => model.id === selectedModelId,
-    );
-    unsupportedDefaultModelParams = selectedModel
-      ? listUnsupportedN8NParameters(selectedModel, { matrixEntries })
-      : [];
-  });
-
   function updateProviderSpecificSetting(key: string, value: unknown) {
     untrack(() => {
       const current = basicForm.provider_specific_settings ?? {};
@@ -2023,8 +2007,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     | "cli"
     | "artifact"
     | "web-search"
-    | "fabric"
-    | "fetch-zip";
+    | "fabric";
 
   type NativeToolUiRuntime = "n8n" | "api" | "cli";
 
@@ -2036,7 +2019,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     }
     if (basicForm.agentType === "api") return "api";
     if (basicForm.agentType === "cli") return "cli";
-    return "n8n";
+    return "api";
   }
 
   function isNativeToolUiAvailable(
@@ -2050,8 +2033,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
         return runtime !== "cli";
       case "fabric":
         return scope === "agent" && runtime !== "n8n";
-      case "fetch-zip":
-        return scope === "agent";
       case "mcp":
       case "cli":
       case "artifact":
@@ -2078,13 +2059,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
         if (scope === "subagent") {
           return "Fabric Controls are not available for Subagents.";
         }
-        return runtime === "n8n"
-          ? "Fabric Controls are not available for n8n Primary Agents."
-          : null;
-      case "fetch-zip":
-        return scope === "subagent"
-          ? "Zips are not used for Subagent sessions, so this tool does not apply to Subagents."
-          : null;
+        return null;
       default:
         return null;
     }
@@ -2102,14 +2077,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     if (runtime === "api") return "native_web_search";
     if (runtime === "n8n") return "web_search";
     return null;
-  }
-
-  function getFetchZipToolName(scope: NativeToolsScope = "agent"): string | null {
-    const runtime = getNativeToolUiRuntime(scope);
-    if (scope === "subagent") return null;
-    if (runtime === "cli") return "batshit_server_fetch_zip";
-    if (runtime === "api") return "native_batshit_tool_use (fabric:sys.zip.fetch)";
-    return "batshit_tool_use (fabric:sys.zip.fetch)";
   }
 
   function normalizeNativeExecutionBackend(
@@ -2771,25 +2738,16 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       (model) => model.id === selectedSubagentModelId,
     );
     unsupportedSubagentModelParams = selectedModel
-      ? getSubagentPresetAgentType(subagentForm.subagentType) !== "n8n"
+      ? getSubagentToolHostScope(subagentForm.subagentType) !== "n8n"
         ? []
         : listUnsupportedN8NParameters(selectedModel, { matrixEntries })
       : [];
   });
 
-  function getN8nAgentUnavailableReason(agent: AgentRow | null | undefined) {
-    if (!agent) return null;
-    return n8nRuntimeUnavailable && normalizePrimaryAgentType(agent) === "n8n"
-      ? "n8n is not connected"
-      : null;
-  }
-
   function getN8nSubagentUnavailableReason(subagent: SubagentRow | null | undefined) {
     if (!subagent || !n8nRuntimeUnavailable) return null;
     const type = normalizeSubagentType(subagent, subagent.subagentType);
-    return type === "n8n-subnode" || type === "n8n-workflow"
-      ? "n8n is not connected"
-      : null;
+    return type === "n8n-workflow" ? "n8n is not connected" : null;
   }
 
   const primaryAgentOptions = $derived(
@@ -2804,7 +2762,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
         defaultModelProvider: agent.primary_model_provider ?? null,
         defaultModelName: agent.primary_model_name ?? agent.model ?? null,
         specialty: null,
-        disabledReason: getN8nAgentUnavailableReason(agent),
+        disabledReason: null,
       };
     }),
   );
@@ -2813,7 +2771,9 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     subagents.map((subagent) => ({
       id: `subagent:${subagent.id}`,
       displayName: subagent.displayName ?? "Unnamed subagent",
-      agentType: normalizePrimaryAgentType(undefined, "n8n"),
+      agentType: normalizeSubagentType(subagent, subagent.subagentType) === "cli"
+        ? ("cli" as const)
+        : ("api" as const),
       avatarUrl: subagent.avatar ?? null,
       avatarIconRef: normalizeIconRef(subagent.avatar_icon_ref, DEFAULT_AGENT_ICON_REF),
       avatarIconFit: normalizeAvatarIconFit(subagent.avatar_icon_fit),
@@ -2856,7 +2816,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
   interface SubagentForm {
     displayName: string;
-    subagentType: SubagentType;
+    subagentType: StoredSubagentType;
     specialty: "general" | "n8n-specialist" | "claude-code" | "artifact";
     webhook_url: string;
     include_global_prompt: boolean;
@@ -2869,9 +2829,13 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     provider_specific_settings: Record<string, any> | null;
   }
 
+  type LiveSubagentUpdate = Partial<Omit<SubagentRow, "subagentType">> & {
+    subagentType?: SubagentType;
+  };
+
   let subagentForm = $state<SubagentForm>({
     displayName: "",
-    subagentType: "n8n-subnode",
+    subagentType: "n8n-workflow",
     specialty: "general",
     webhook_url: "",
     include_global_prompt: false,
@@ -2963,7 +2927,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     webhook_url: "",
     workflow_url: "",
     include_global_prompt: true,
-    subagentType: "n8n-subnode",
+    subagentType: "n8n-workflow",
     specialty: "general",
   });
   let createEntityBusy = $state(false);
@@ -2985,7 +2949,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       webhook_url: "",
       workflow_url: "",
       include_global_prompt: true,
-      subagentType: "n8n-subnode",
+      subagentType: "n8n-workflow",
       specialty: "general",
     };
     createEntityError = null;
@@ -3024,45 +2988,15 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
           return;
         }
 
-        if (createEntityForm.agentType === "n8n") {
-          if (!createEntityForm.webhook_url.trim()) {
-            createEntityError =
-              "Webhook URL is required for n8n primary agents.";
-            createEntityBusy = false;
-            return;
-          }
-          const webhookValidation = validateN8nProductionWebhookUrl(
-            createEntityForm.webhook_url,
-            "primary-agent",
-          );
-          if (webhookValidation) {
-            createEntityError = webhookValidation;
-            createEntityBusy = false;
-            return;
-          }
-          if (!createEntityForm.workflow_url.trim()) {
-            createEntityError =
-              "Workflow URL is required for n8n primary agents.";
-            createEntityBusy = false;
-            return;
-          }
-        }
-
         const payload = {
           id: generatedSlug,
           displayName: name,
           agentType: createEntityForm.agentType,
-          show_reasoning: createEntityForm.agentType !== "n8n",
+          show_reasoning: true,
           preserve_reasoning: false,
           include_global_prompt: createEntityForm.include_global_prompt,
-          webhook_url:
-            createEntityForm.agentType === "n8n"
-              ? createEntityForm.webhook_url.trim() || null
-              : null,
-          agent_url:
-            createEntityForm.agentType === "n8n"
-              ? createEntityForm.workflow_url.trim() || null
-              : null,
+          webhook_url: null,
+          agent_url: null,
         };
 
         const response = await fetch("/api/agents", {
@@ -3115,7 +3049,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
         if (isWorkflowBackedSubagentType(createEntityForm.subagentType)) {
           const webhookValidation = validateN8nProductionWebhookUrl(
             createEntityForm.webhook_url,
-            "workflow-subagent",
           );
           if (webhookValidation) {
             createEntityError = webhookValidation;
@@ -3309,10 +3242,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
   $effect(() => {
     if (createEntityMode && createEntityForm.kind === "agent") {
-      if (
-        createEntityForm.agentType !== "n8n" &&
-        (createEntityForm.webhook_url || createEntityForm.workflow_url)
-      ) {
+      if (createEntityForm.webhook_url || createEntityForm.workflow_url) {
         createEntityForm = {
           ...createEntityForm,
           webhook_url: "",
@@ -3337,16 +3267,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
   });
 
   $effect(() => {
-    if (
-      basicForm.agentType !== "n8n" &&
-      (basicForm.webhook_url || basicForm.agent_url)
-    ) {
-      basicForm = {
-        ...basicForm,
-        webhook_url: "",
-        agent_url: "",
-      };
-    }
+    // API and CLI agents do not own n8n workflow URLs. Retired stored records remain
+    // untouched so the user can delete them without an auto-save mutation.
   });
 
   $effect(() => {
@@ -3505,7 +3427,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
           selectedEditableSubagentId = null;
           subagentForm = {
             displayName: "",
-            subagentType: "n8n-subnode",
+            subagentType: "n8n-workflow",
             specialty: "general",
             webhook_url: "",
             include_global_prompt: false,
@@ -3555,7 +3477,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
         selectedEditableSubagentId = null;
         subagentForm = {
           displayName: "",
-          subagentType: "n8n-subnode",
+          subagentType: "n8n-workflow",
           specialty: "general",
           webhook_url: "",
           include_global_prompt: false,
@@ -4364,7 +4286,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     if (match) {
       const availability = getModelPresetAvailability({
         model: match,
-        agentType: getSubagentPresetAgentType(subagentForm.subagentType),
+        agentType: getSubagentToolHostScope(subagentForm.subagentType),
         connectionOptions: null,
       });
       if (availability.disabled) {
@@ -4393,7 +4315,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
     const availability = getModelPresetAvailability({
       model,
-      agentType: getSubagentPresetAgentType(subagentForm.subagentType),
+      agentType: getSubagentToolHostScope(subagentForm.subagentType),
       connectionOptions: null,
     });
     if (availability.disabled) {
@@ -5479,7 +5401,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
   );
 
   async function persistSubagentDetails(
-    payload: { id: string; body: Partial<SubagentRow> },
+    payload: { id: string; body: LiveSubagentUpdate },
     nextForm: SubagentForm = subagentForm,
   ) {
     try {
@@ -5512,7 +5434,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
   }
 
   const saveSubagentDetails = debounce(
-    (payload: { id: string; body: Partial<SubagentRow> }) => {
+    (payload: { id: string; body: LiveSubagentUpdate }) => {
       void persistSubagentDetails(payload);
     },
     700,
@@ -5674,6 +5596,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       hydrationInProgress
     )
       return;
+    if (subagentForm.subagentType === "n8n-subnode") return;
 
     const signature = makeMcpSignature(
       subagentDefaultMCPGateways,
@@ -5725,6 +5648,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       hydrationInProgress
     )
       return;
+    if (subagentForm.subagentType === "n8n-subnode") return;
 
     const signature = makeSubagentFormSignature(subagentForm);
     if (
@@ -5796,44 +5720,30 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       return "Selected Default Project no longer exists. Pick another project or set None.";
     }
     if (form.agentType === "n8n") {
-      if (!form.webhook_url.trim()) {
-        return "Webhook URL is required for n8n primary agents.";
-      }
-      const webhookValidation = validateN8nProductionWebhookUrl(
-        form.webhook_url,
-        "primary-agent",
-      );
-      if (webhookValidation) {
-        return webhookValidation;
-      }
-      if (!form.agent_url.trim()) {
-        return "Workflow URL is required for n8n primary agents.";
-      }
+      return "This Primary Agent uses the retired n8n type and can only be deleted.";
     }
-    if (form.agentType !== "n8n") {
-      const provider = form.primary_model_provider.trim().toLowerCase();
-      const modelName = form.primary_model_name.trim().toLowerCase();
-      const connectionHint =
-        form.primary_model_connection?.id ??
-        form.primary_model_connection?.service ??
-        "";
-      const hasModelSelection = Boolean(provider || modelName || connectionHint);
-      const isCodexPreset =
-        provider.includes("codex") ||
-        modelName.includes("codex") ||
-        connectionHint.toLowerCase().includes("codex");
-      const isClaudeCliPreset =
-        provider.includes("claude-cli") ||
-        modelName.includes("claude-cli") ||
-        connectionHint.toLowerCase().includes("claude-cli");
-      const isCliPreset = isCodexPreset || isClaudeCliPreset;
+    const provider = form.primary_model_provider.trim().toLowerCase();
+    const modelName = form.primary_model_name.trim().toLowerCase();
+    const connectionHint =
+      form.primary_model_connection?.id ??
+      form.primary_model_connection?.service ??
+      "";
+    const hasModelSelection = Boolean(provider || modelName || connectionHint);
+    const isCodexPreset =
+      provider.includes("codex") ||
+      modelName.includes("codex") ||
+      connectionHint.toLowerCase().includes("codex");
+    const isClaudeCliPreset =
+      provider.includes("claude-cli") ||
+      modelName.includes("claude-cli") ||
+      connectionHint.toLowerCase().includes("claude-cli");
+    const isCliPreset = isCodexPreset || isClaudeCliPreset;
 
-      if (isCliPrimaryAgentType(form.agentType) && hasModelSelection && !isCliPreset) {
-        return "CLI agents only support CLI presets.";
-      }
-      if (!isCliPrimaryAgentType(form.agentType) && isCliPreset) {
-        return "CLI presets are only available for CLI agents.";
-      }
+    if (isCliPrimaryAgentType(form.agentType) && hasModelSelection && !isCliPreset) {
+      return "CLI agents only support CLI presets.";
+    }
+    if (!isCliPrimaryAgentType(form.agentType) && isCliPreset) {
+      return "CLI presets are only available for CLI agents.";
     }
     return null;
   }
@@ -5965,7 +5875,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     if (isWorkflowBackedSubagentType(form.subagentType)) {
       const webhookValidation = validateN8nProductionWebhookUrl(
         form.webhook_url,
-        "workflow-subagent",
       );
       if (webhookValidation) {
         return webhookValidation;
@@ -5992,7 +5901,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
   function getSubagentType(
     subagent: SubagentRow | null | undefined,
-  ): SubagentType {
+  ): StoredSubagentType {
     return normalizeSubagentType(subagent, subagent?.subagentType);
   }
 
@@ -6347,13 +6256,15 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
   }
 
   function buildBasicPayload(form: BasicForm): BasicPayloadBody {
+    if (form.agentType === "n8n") {
+      throw new Error("This Primary Agent uses the retired n8n type and can only be deleted.");
+    }
     return {
       displayName: form.displayName.trim(),
       agentType: form.agentType,
       show_reasoning: form.show_reasoning,
       preserve_reasoning: form.show_reasoning ? form.preserve_reasoning : false,
-      tool_approval_mode:
-        form.agentType !== "n8n" ? form.tool_approval_mode : null,
+      tool_approval_mode: form.tool_approval_mode,
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
       ...buildAgentMemoryRecordFields(form.memory_settings),
       webhook_url: normaliseStringOrNull(form.webhook_url),
@@ -6483,7 +6394,12 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     });
   }
 
-  function buildSubagentPayload(form: SubagentForm): Partial<SubagentRow> {
+  function buildSubagentPayload(form: SubagentForm): LiveSubagentUpdate {
+    if (form.subagentType === "n8n-subnode") {
+      throw new Error(
+        "n8n Subnode Subagents were removed from Batshit. Delete this record from Agent Settings.",
+      );
+    }
     return {
       displayName: form.displayName.trim(),
       subagentType: form.subagentType,
@@ -7735,30 +7651,34 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     "batshit-agent-type-badge";
 
   function formatPrimaryAgentTypeLabel(
-    type: PrimaryAgentType,
+    type: StoredPrimaryAgentType,
   ) {
     return `${getPrimaryAgentDisplayLabel(type)} Primary Agent`;
   }
 
-  function formatSubagentTypeLabel(type: SubagentType) {
+  function formatSubagentTypeLabel(type: StoredSubagentType) {
     return getSubagentTypeDisplayLabel(type);
   }
 
-  function primaryTypeBadgeClass(type: PrimaryAgentType) {
+  function primaryTypeBadgeClass(type: StoredPrimaryAgentType) {
     return `${TYPE_BADGE_BASE} is-agent-type-${type}`;
   }
 
-  function subagentTypeBadgeClass(type: SubagentType) {
+  function subagentTypeBadgeClass(type: StoredSubagentType) {
     return `${TYPE_BADGE_BASE} is-agent-type-${getSubagentTypeBadgeTone(type)}`;
   }
 
-  function formatCompatibleSubagentTypes(primaryAgentType: PrimaryAgentType) {
+  function formatCompatibleSubagentTypes(primaryAgentType: StoredPrimaryAgentType) {
     return getCompatibleSubagentTypesForPrimaryAgent(primaryAgentType)
       .map((type) => getSubagentTypeDisplayLabel(type))
       .join(" or ");
   }
 
-  function getSubagentPresetAgentType(type: SubagentType): PrimaryAgentType {
+  function getPrimaryToolHostScope(type: StoredPrimaryAgentType): ToolHostScope {
+    return type === "cli" ? "cli" : "api";
+  }
+
+  function getSubagentToolHostScope(type: StoredSubagentType): ToolHostScope {
     if (type === "cli") return "cli";
     return type === "api" ? "api" : "n8n";
   }
@@ -7985,7 +7905,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
               {#if activeAgentSettingsTab === "tools"}
               <AgentMcpDefaultsCard
                 agentId={selectedAgentId === CREATE_AGENT_SENTINEL ? null : selectedAgentId}
-                agentType={basicForm.agentType}
+                toolHostScope={getPrimaryToolHostScope(basicForm.agentType)}
                 userId={data?.user?.id ?? null}
                 accordionName="agent-tools-cards"
                 toolGridTitle="Agent Tool Grid Settings"
@@ -8112,23 +8032,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   This model is used automatically for this Primary Agent, but it can be updated in the chat bar too.
                                 </DropdownMenu.Content>
                               </DropdownMenu.Root>
-                              {#if basicForm.agentType === "n8n" && unsupportedDefaultModelParams.length}
-                                <DropdownMenu.Root>
-                                  <DropdownMenu.Trigger
-                                    class="batshit-settings-info-trigger is-amber inline-flex shrink-0 items-center justify-center"
-                                    aria-label="About Ignored n8n Model Settings"
-                                  >
-                                    <Info class="h-3.5 w-3.5" />
-                                  </DropdownMenu.Trigger>
-                                  <DropdownMenu.Content
-                                    align="start"
-                                    side="bottom"
-                                    class="batshit-settings-info-content batshit-settings-card-elevated is-amber z-[var(--z-popover)] w-72"
-                                  >
-                                    {unsupportedDefaultModelParams.join(", ")} will be ignored for n8n agents.
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Root>
-                              {/if}
                             </div>
                           </div>
                           <div class="batshit-settings-form-control">
@@ -8423,71 +8326,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                             })}
                         />
 
-                        {#if basicForm.agentType === "n8n"}
-                          <div class="batshit-settings-form-row">
-                            <div class="batshit-settings-form-copy">
-                              <div class="batshit-settings-form-label-line">
-                                <Label.Label class="batshit-settings-form-label" for="agent-webhook">
-                                  Production Webhook URL
-                                </Label.Label>
-                                <DropdownMenu.Root>
-                                  <DropdownMenu.Trigger
-                                    class={SETTINGS_INFO_TRIGGER_CLASS}
-                                    aria-label="About Production Webhook URL"
-                                  >
-                                    <Info class="h-3.5 w-3.5" />
-                                  </DropdownMenu.Trigger>
-                                  <DropdownMenu.Content
-                                    align="start"
-                                    side="bottom"
-                                    class={SETTINGS_INFO_CONTENT_CLASS}
-                                  >
-                                    Use the Production Webhook URL, not the Test Webhook URL.
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Root>
-                              </div>
-                            </div>
-                            <div class="batshit-settings-form-control is-wide">
-                              <Input
-                                id="agent-webhook"
-                                placeholder="http://localhost:5678/webhook/batshit_n8n_primary"
-                                bind:value={basicForm.webhook_url}
-                              />
-                            </div>
-                          </div>
-
-                          <div class="batshit-settings-form-row">
-                            <div class="batshit-settings-form-copy">
-                              <div class="batshit-settings-form-label-line">
-                                <Label.Label class="batshit-settings-form-label" for="agent-workflow">
-                                  Workflow URL
-                                </Label.Label>
-                                <DropdownMenu.Root>
-                                  <DropdownMenu.Trigger
-                                    class={SETTINGS_INFO_TRIGGER_CLASS}
-                                    aria-label="About Workflow URL"
-                                  >
-                                    <Info class="h-3.5 w-3.5" />
-                                  </DropdownMenu.Trigger>
-                                  <DropdownMenu.Content
-                                    align="start"
-                                    side="bottom"
-                                    class={SETTINGS_INFO_CONTENT_CLASS}
-                                  >
-                                    Used for the embedded workflow viewer in the n8n sheet.
-                                  </DropdownMenu.Content>
-                                </DropdownMenu.Root>
-                              </div>
-                            </div>
-                            <div class="batshit-settings-form-control is-wide">
-                              <Input
-                                id="agent-workflow"
-                                placeholder="http://localhost:5678/workflow/..."
-                                bind:value={basicForm.agent_url}
-                              />
-                            </div>
-                          </div>
-                        {/if}
                       </div>
                     </div>
 
@@ -8738,7 +8576,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
             </SettingsAccordionCard>
           {/if}
 
-          {#if basicForm.agentType === "n8n" || basicForm.agentType === "api"}
+          {#if basicForm.agentType === "api"}
             <SettingsAccordionCard
               name="agent-access-cards"
               title="Batshit Permissions & Boundaries"
@@ -8763,7 +8601,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                   />
                 {/if}
               {/snippet}
-                {@const n8nAutomationContext = basicForm.agentType === "n8n"}
                 {#if getNativeToolToggle("bashEnabled", true)}
                   <div class="space-y-2">
                     <div class="flex items-center gap-1.5">
@@ -8776,11 +8613,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                             <span class="batshit-settings-inline-strong">{option.label}</span>: {option.helper}
                           </span>
                         {/each}
-                        {#if n8nAutomationContext}
-                          <span class="mt-2 block">
-                            n8n automation runs are non-interactive, so approval prompts stay off.
-                          </span>
-                        {/if}
                       </SettingsInfoMenu>
                     </div>
                     <ToggleGroup.Root
@@ -8800,7 +8632,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                           getBashBackendForPermissionMode(mode),
                         );
                         updateNativeToolSetting("bashPolicyMode", null);
-                        if (mode !== "agent" || n8nAutomationContext) {
+                        if (mode !== "agent") {
                           updateNativeToolSetting("bashAgentApprovalCardsEnabled", false);
                         }
                       }}
@@ -10692,7 +10524,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                   </div>
                 </div>
           </SettingsAccordionCard>
-          {#if basicForm.agentType === "n8n" || isManagedPrimaryAgentType(basicForm.agentType)}
+          {#if isManagedPrimaryAgentType(basicForm.agentType)}
             <SettingsAccordionCard
               name="agent-tools-cards"
               title="Batshit Tools"
@@ -10705,11 +10537,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                 {#snippet info()}
                   <SettingsInfoMenu ariaLabel="About Batshit Tools">
                     Configure Batshit built-in tools and dynamic tool families for this agent.
-                    {#if basicForm.agentType === "n8n"}
-                      n8n plus subagent automation use native tools through one HTTP Request Tool
-                    node:
-                    <code>Batshit Tools</code> with <code>action + input + context</code>.
-                  {:else if basicForm.agentType === "api"}
+                    {#if basicForm.agentType === "api"}
                     API agents use native Batshit tools directly.
                   {:else}
                     CLI agents use managed Batshit MCP helper tools.
@@ -10826,22 +10654,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                       onCheckedChange={(checked) =>
                         updateNativeToolSetting("batshitToolsEnabled", checked === true)}
                       disabled={!primaryFabricAvailable}
-                    />
-                  </div>
-
-                  <div class="batshit-settings-toggle-row">
-                    <div class="min-w-0">
-                      <div class="flex items-center gap-1.5">
-                        <p class="batshit-settings-parent-label">Fetch Zip</p>
-                        <SettingsInfoMenu ariaLabel="About Fetch Zip">
-                          Enables <code>{getFetchZipToolName()}</code> for zip lookup without state changes.
-                        </SettingsInfoMenu>
-                      </div>
-                    </div>
-                    <Switch.Root
-                      checked={getNativeToolToggle("fetchZipEnabled", true)}
-                      onCheckedChange={(checked) =>
-                        updateNativeToolSetting("fetchZipEnabled", checked === true)}
                     />
                   </div>
 
@@ -12342,8 +12154,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
             sectionClass={hiddenUnless("core")}
             title="Delete Primary Agent"
             paragraphs={[
-              "Permanently removes this Primary Agent’s settings, zip overrides, MCP defaults, and avatar reference. Chat sessions remain stored.",
-              "Use this when you want to rebuild an agent from scratch. Subagent assignments and MCP selections are cleared during deletion."
+              basicForm.agentType === "n8n"
+                ? "This saved record uses the retired n8n Primary Agent type. Deleting it is the only supported action; create an API or CLI agent for chat."
+                : "Permanently removes this Primary Agent’s settings, zip overrides, MCP defaults, and avatar reference. Chat sessions remain stored.",
+              "Subagent assignments and MCP selections are cleared during deletion."
             ]}
             error={agentDeleteError}
             busy={agentDeleteState === "deleting"}
@@ -12400,7 +12214,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
               {#if activeSubagentSettingsTab === "tools"}
                 <AgentMcpDefaultsCard
                   agentId={selectedEditableSubagentId}
-                  agentType={getSubagentPresetAgentType(subagentForm.subagentType)}
+                  toolHostScope={getSubagentToolHostScope(subagentForm.subagentType)}
                   userId={data?.user?.id ?? null}
                   accordionName="subagent-tools-cards"
                   toolGridTitle="Tool Settings Grid"
@@ -12634,7 +12448,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                 {@const availability = selected
                                   ? getModelPresetAvailability({
                                       model: selected,
-                                      agentType: getSubagentPresetAgentType(subagentForm.subagentType),
+                                      agentType: getSubagentToolHostScope(subagentForm.subagentType),
                                       connectionOptions: null,
                                     })
                                   : null}
@@ -13634,12 +13448,12 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     <SettingsInfoMenu ariaLabel="About Subagent Native Tools">
                         {#if subagentForm.subagentType === "cli"}
                           Configure Batshit built-in tools and dynamic tool families for this CLI Subagent. Codex or Claude built-ins live in the dedicated CLI cards above.
-                        Permission boundaries are managed by the CLI runtime itself, and <code>fetch_zip</code> plus broad Fabric controls stay unavailable for subagent runs.
+                        Permission boundaries are managed by the CLI runtime itself, and broad Fabric controls stay unavailable for subagent runs.
                       {:else}
                       Configure native tool behavior for this subagent when it runs.
                       Workflow-backed subagents use these helpers through
                       <code>Batshit Tools</code>, and managed subagents use the same helpers directly through their runtime lane.
-                        Permission boundaries live in <code>Access</code>. <code>fetch_zip</code> is always unavailable for subagent runs.
+                        Permission boundaries live in <code>Access</code>.
                       {/if}
                     </SettingsInfoMenu>
             {/snippet}
@@ -13656,7 +13470,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
               {@const subagentBashAvailable = isNativeToolUiAvailable("bash", "subagent")}
                 {@const subagentWebSearchAvailable = isNativeToolUiAvailable("web-search", "subagent")}
                 {@const subagentFabricAvailable = isNativeToolUiAvailable("fabric", "subagent")}
-                {@const subagentFetchZipAvailable = isNativeToolUiAvailable("fetch-zip", "subagent")}
 
                 <div class="batshit-settings-form-stack">
                 <div class="batshit-settings-toggle-row">
@@ -13752,27 +13565,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     onCheckedChange={(checked) =>
                       updateNativeToolSetting("batshitToolsEnabled", checked === true, "subagent")}
                     disabled={!subagentFabricAvailable}
-                  />
-                </div>
-
-                <div class="batshit-settings-toggle-row">
-                  <div>
-                    <div class="flex items-center gap-1.5">
-                      <p class="batshit-settings-parent-label">Fetch Zip</p>
-                      <SettingsInfoMenu ariaLabel="About Subagent Fetch Zip">
-                        {#if subagentFetchZipAvailable}
-                          Enables <code>{getFetchZipToolName("subagent")}</code> for zip lookup without state changes.
-                        {:else}
-                          {getNativeToolUiUnavailableMessage("fetch-zip", "subagent")}
-                        {/if}
-                      </SettingsInfoMenu>
-                    </div>
-                  </div>
-                  <Switch.Root
-                    checked={subagentFetchZipAvailable && getNativeToolToggle("fetchZipEnabled", true, "subagent")}
-                    onCheckedChange={(checked) =>
-                      updateNativeToolSetting("fetchZipEnabled", checked === true, "subagent")}
-                    disabled={!subagentFetchZipAvailable}
                   />
                 </div>
 
@@ -14882,8 +14674,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
             sectionClass={hiddenUnlessSubagent("core")}
             title="Delete Subagent"
             paragraphs={[
-              "Removes this Subagent, its avatar reference, and any assignments from every Primary Agent. Conversations remain in Redis.",
-              "Use this when the Subagent is obsolete. Primary Agents will immediately stop referencing it."
+              subagentForm.subagentType === "n8n-subnode"
+                ? "This saved record uses the retired n8n Subnode Subagent type. Deleting it is the only supported action; n8n Workflow Subagents remain supported."
+                : "Removes this Subagent, its avatar reference, and any assignments from every Primary Agent. Conversations remain in Redis.",
+              "Primary Agents will immediately stop referencing it."
             ]}
             error={subagentDeleteError}
             busy={subagentDeleteState === "deleting"}
@@ -15144,59 +14938,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                   <TerminalSquare aria-hidden="true" />
                   CLI agent
                 </Button>
-                <Button
-                  type="button"
-                  variant={createEntityForm.agentType === "n8n" ? "default" : "outline"}
-                  size="sm"
-                  onclick={() =>
-                    (createEntityForm = {
-                      ...createEntityForm,
-                      agentType: "n8n",
-                    })}
-                >
-                  <Settings2 aria-hidden="true" />
-                  n8n workflow agent
-                </Button>
               </div>
             </div>
-
-            {#if createEntityForm.agentType === "n8n"}
-              <div class="batshit-settings-form-row">
-                <div class="batshit-settings-form-copy">
-                  <div class="batshit-settings-form-label-line">
-                    <Label.Label class="batshit-settings-form-label" for="create-webhook">Production Webhook URL</Label.Label>
-                    <SettingsInfoMenu ariaLabel="About Create Agent Webhook URL">
-                      Use the Production Webhook URL, not the Test Webhook URL.
-                    </SettingsInfoMenu>
-                  </div>
-                </div>
-                <div class="batshit-settings-form-control is-wide">
-                  <Input
-                    id="create-webhook"
-                    placeholder="http://localhost:5678/webhook/batshit_n8n_primary"
-                    bind:value={createEntityForm.webhook_url}
-                  />
-                </div>
-              </div>
-
-              <div class="batshit-settings-form-row">
-                <div class="batshit-settings-form-copy">
-                  <div class="batshit-settings-form-label-line">
-                    <Label.Label class="batshit-settings-form-label" for="create-workflow">Workflow URL</Label.Label>
-                    <SettingsInfoMenu ariaLabel="About Create Workflow URL">
-                      Used by the n8n Window to preview the workflow.
-                    </SettingsInfoMenu>
-                  </div>
-                </div>
-                <div class="batshit-settings-form-control is-wide">
-                  <Input
-                    id="create-workflow"
-                    placeholder="http://localhost:5678/workflow/..."
-                    bind:value={createEntityForm.workflow_url}
-                  />
-                </div>
-              </div>
-            {/if}
 
             <div class="batshit-settings-toggle-row">
               <div class="min-w-0">
@@ -15215,19 +14958,6 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                 <Label.Label class="batshit-settings-form-label">Subagent Type</Label.Label>
               </div>
               <div class="batshit-settings-form-inline-actions">
-                <Button
-                  type="button"
-                  variant={createEntityForm.subagentType === "n8n-subnode" ? "default" : "outline"}
-                  size="sm"
-                  onclick={() =>
-                    (createEntityForm = {
-                      ...createEntityForm,
-                      subagentType: "n8n-subnode",
-                    })}
-                >
-                  <ShieldPlus aria-hidden="true" />
-                  n8n Subnode
-                </Button>
                 <Button
                   type="button"
                   variant={createEntityForm.subagentType === "n8n-workflow" ? "default" : "outline"}

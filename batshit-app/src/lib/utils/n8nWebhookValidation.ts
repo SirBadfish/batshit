@@ -1,13 +1,6 @@
-export type N8nWebhookTarget = 'primary-agent' | 'workflow-subagent';
-
 const KNOWN_PRIMARY_WEBHOOK_PATHS = new Set([
   'batshit',
   'batshit_n8n_primary'
-]);
-
-const KNOWN_WORKFLOW_SUBAGENT_WEBHOOK_PATHS = new Set([
-  'batshit_subagent',
-  'batshit_n8n_workflow_subagent'
 ]);
 
 function normalizeWebhookPath(path: string) {
@@ -26,7 +19,7 @@ function getWebhookPathFromUrl(rawUrl: string) {
   } catch {
     return {
       error:
-        'Enter a full n8n Production Webhook URL, for example http://localhost:5678/webhook/batshit_n8n_primary.'
+        'Enter a full n8n Production Webhook URL, for example http://localhost:5678/webhook/batshit_n8n_workflow_subagent.'
     };
   }
 
@@ -54,7 +47,7 @@ function getWebhookPathFromUrl(rawUrl: string) {
   if (segments[webhookIndex] === 'webhook-test') {
     return {
       error:
-        "Paste the Production Webhook URL. Batshit's test-mode button switches it to the test webhook automatically."
+        'Test webhook URLs are not supported. Activate the workflow and paste its Production Webhook URL.'
     };
   }
 
@@ -69,8 +62,7 @@ function getWebhookPathFromUrl(rawUrl: string) {
 }
 
 export function validateN8nProductionWebhookUrl(
-  rawUrl: string,
-  target: N8nWebhookTarget
+  rawUrl: string
 ) {
   if (!rawUrl.trim()) return null;
 
@@ -79,18 +71,8 @@ export function validateN8nProductionWebhookUrl(
 
   const normalizedPath = normalizeWebhookPath(parsed.webhookPath);
 
-  if (
-    target === 'primary-agent' &&
-    KNOWN_WORKFLOW_SUBAGENT_WEBHOOK_PATHS.has(normalizedPath)
-  ) {
-    return 'This is the n8n Workflow Subagent webhook. Primary Agents need the n8n Primary Agent production webhook.';
-  }
-
-  if (
-    target === 'workflow-subagent' &&
-    KNOWN_PRIMARY_WEBHOOK_PATHS.has(normalizedPath)
-  ) {
-    return 'This is the n8n Primary Agent webhook. Workflow Subagents need the n8n Workflow Subagent production webhook.';
+  if (KNOWN_PRIMARY_WEBHOOK_PATHS.has(normalizedPath)) {
+    return 'This is a retired Category 1 webhook. n8n Workflow Subagents need their own production webhook.';
   }
 
   return null;

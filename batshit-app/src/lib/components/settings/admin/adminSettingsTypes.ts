@@ -1,5 +1,3 @@
-export const DEFAULT_N8N_EXECUTION_SEARCH_LIMIT = 60
-export const MAX_N8N_EXECUTION_SEARCH_LIMIT = 250
 export const DEFAULT_DCM_SCHEMA_HINT_REQUIRED_LIMIT = 6
 export const DEFAULT_DCM_SCHEMA_HINT_OPTIONAL_LIMIT = 6
 export const DEFAULT_DCM_SCHEMA_HINT_MAX_CHARS = 240
@@ -40,7 +38,6 @@ export const WEB_SEARCH_PROVIDER_ALIASES: Record<string, NativeWebSearchProvider
 }
 
 export type AdminSettingsState = {
-  n8nExecutionSearchLimit: number
   dcmSchemaHintRequiredLimit: number
   dcmSchemaHintOptionalLimit: number
   dcmSchemaHintMaxChars: number

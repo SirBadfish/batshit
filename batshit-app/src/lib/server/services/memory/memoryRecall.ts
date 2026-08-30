@@ -5,14 +5,15 @@
  * trigger scanning over the current user message, pending-recall consumption, linger
  * classification with three-way dedup, per-lane budgets with visible "more available"
  * honesty, the on-my-mind system-prompt block, agent-level time awareness, and the
- * formatted DCM "Memory context" section. The server compilation twin calls
- * `computeMemoryCompileContext` directly; the n8n client twin receives the identical
- * strings from `POST /api/memory/compile-context`. Presentation is formatted HERE so the
- * twins cannot drift (P0 §1.1: never implement ranking twice).
+ * formatted DCM "Memory context" section. The one compilation path calls
+ * `computeMemoryCompileContext` directly (SA-106 retired the second, n8n-only twin and
+ * its `POST /api/memory/compile-context` route). Presentation is formatted HERE, not at
+ * the call site (P0 §1.1: never implement ranking twice).
  *
  * Compile-time computation is strictly READ-ONLY. State changes happen only in
  * `commitMemoryTurnState`, called from send-routed at the accepted-send boundary — the
- * same place session clips consume — and gated by the same continuation flag so
+ * same place session clips consume, and since SA-106 the only such boundary — gated by
+ * the same continuation flag so
  * context-exhaustion auto-continues never double-tick the linger window.
  *
  * The automatic lanes deliberately read records directly (listMemories house pattern)
@@ -111,12 +112,12 @@ export interface MemoryCompileContext {
   onMyMindBlock: string
   /**
    * SA-104 P6: the open episode's whiteboard as a system-prompt block (Infinite Sessions
-   * only), appended directly after AWARENESS in both twins. '' when absent.
+   * only), appended directly after AWARENESS. '' when absent.
    */
   whiteboardBlock: string
   /** Formatted "Memory context:" lines for the DCM, or [] when there is nothing. */
   dcmLines: string[]
-  /** Clip ids carried by inserted memories, for the twins' structured image path. */
+  /** Clip ids carried by inserted memories, for the structured image path. */
   memoryClipIds: string[]
   /** clipId → memoryId, for REMEMBERED MEDIA labeling. */
   memoryClipSources: Record<string, string>

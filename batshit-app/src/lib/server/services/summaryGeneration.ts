@@ -335,7 +335,7 @@ export async function generateModelSummary(params: {
     }
     if (runtime === 'n8n') {
       throw new Error(
-        'Current-model compacting is not available for n8n Primary Agents. Choose an API-compatible saved compact model preset.'
+        'Current-model compacting cannot run for a record that uses the retired n8n Primary Agent type. Delete that agent and create an API or CLI agent.'
       )
     }
   }

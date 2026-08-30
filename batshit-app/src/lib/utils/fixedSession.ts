@@ -29,6 +29,25 @@ export function isFixedSession(session: unknown): boolean {
   return Boolean(fixed && typeof fixed === 'object' && (fixed as Record<string, any>).enabled === true)
 }
 
+/** The one agent an Infinite Session was saved with, including legacy metadata fields. */
+export function resolveFixedSessionAgentId(session: unknown): string | null {
+  if (!isFixedSession(session)) return null
+  const record = session as Record<string, any>
+  const metadata = record.metadata as Record<string, any>
+  for (const value of [
+    record.agent_id,
+    metadata.last_agent_id,
+    metadata.lastAgentId,
+    metadata.agent_id,
+    metadata.agentId
+  ]) {
+    if (typeof value !== 'string') continue
+    const id = value.trim()
+    if (id) return id
+  }
+  return null
+}
+
 /** The stored block written exactly once by the one-way transition route. */
 export function buildFixedSessionMetadata(now: Date = new Date()): FixedSessionMetadata {
   return {

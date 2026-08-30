@@ -5,6 +5,7 @@ import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { resolveModelVoiceSessionConfig } from '$lib/utils/modelVoiceSession'
 import type { PrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { isCliPrimaryAgentType } from '$lib/utils/primaryAgentType'
+import type { ToolHostScope } from '$lib/utils/brokerAvailability'
 
 const LOCAL_PROVIDER_IDS = new Set(['ollama', 'dmr', 'lmstudio', 'llama-cpp', 'vllm'])
 
@@ -79,7 +80,7 @@ export function getModelPresetAvailability({
   connectionOptions
 }: {
   model: SavedModel
-  agentType: PrimaryAgentType
+  agentType: ToolHostScope
   connectionOptions?: CatalogConnectionOption[] | null
 }): ModelPresetAvailability {
   const voiceSession = resolveModelVoiceSessionConfig(model)

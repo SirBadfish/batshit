@@ -76,7 +76,7 @@ export function resolveEnabledMode4InternalHelperTools(settings: {
     }
   }
 
-  // SA-096: the managed-CLI broker condition is shared with the compile twins' guidance
+  // SA-096: the managed-CLI broker condition is shared with the compile path's guidance
   // gate. Rules live in $lib/utils/brokerAvailability — do not restate them here.
   const brokerToggles: BrokerToolToggles = {
     fetchZipEnabled: settings.fetchZipEnabled === true,

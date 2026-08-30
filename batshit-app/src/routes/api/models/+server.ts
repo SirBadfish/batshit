@@ -27,66 +27,6 @@ import type { CustomProviderSummary } from '$lib/types/customProviders'
 import { listLocalAiServers, resolveLocalAiRuntimeBaseUrl } from '$lib/server/services/localAiServers'
 import type { LocalAiServerSummary } from '$lib/types/localAi'
 
-type N8NOnlyProviderDefinition = {
-  id: string
-  provider: string
-  label: string
-  modelName: string
-  displayName: string
-  description: string
-  providers?: string[]
-  features?: Record<string, boolean | number>
-  mirrorProvider?: string
-  manualOnly?: boolean
-}
-
-const N8N_ONLY_PROVIDERS: N8NOnlyProviderDefinition[] = [
-  {
-    id: 'direct:huggingface',
-    provider: 'huggingface',
-    label: 'HuggingFace Inference',
-    modelName: 'inference-endpoint',
-    displayName: 'HuggingFace Inference (n8n)',
-    description: 'Call HuggingFace Inference Endpoints through n8n tool nodes.',
-    providers: ['huggingface'],
-    features: { streaming: true, tools: true },
-    manualOnly: true
-  },
-  {
-    id: 'azure-openai',
-    provider: 'azure-openai',
-    label: 'Azure OpenAI',
-    modelName: 'managed-deployment',
-    displayName: 'Azure OpenAI (n8n)',
-    description: 'Map OpenAI models to your Azure OpenAI deployment via n8n.',
-    providers: ['openai'],
-    features: { streaming: true, tools: true, vision: true },
-    mirrorProvider: 'openai'
-  },
-  {
-    id: 'aws-bedrock',
-    provider: 'aws-bedrock',
-    label: 'AWS Bedrock',
-    modelName: 'bedrock-endpoint',
-    displayName: 'AWS Bedrock (n8n)',
-    description: 'Call Bedrock-hosted Anthropic, Meta, Cohere, or Mistral models through n8n.',
-    providers: ['anthropic', 'meta', 'meta-llama', 'mistral', 'cohere', 'ai21'],
-    features: { streaming: true, tools: true },
-    mirrorProvider: 'anthropic'
-  },
-  {
-    id: 'google-vertex',
-    provider: 'google-vertex',
-    label: 'Google Vertex AI',
-    modelName: 'vertex-endpoint',
-    displayName: 'Google Vertex AI (n8n)',
-    description: 'Use Gemini and Vertex endpoints managed in Google Cloud.',
-    providers: ['google'],
-    features: { streaming: true, tools: true, vision: true },
-    mirrorProvider: 'google'
-  }
-]
-
 const CODEX_PROVIDER_ENABLED = env.BATSHIT_CODEX_PROVIDER_ENABLED !== 'false'
 const CODEX_PROVIDER_ID = 'openai-codex'
 const CODEX_CONNECTION_ID = 'codex-cli'
@@ -158,7 +98,7 @@ export const GET: RequestHandler = async ({ locals, url }) => {
       CODEX_PROVIDER_ENABLED ? detectCodexCliStatus() : Promise.resolve(null),
       CLAUDE_PROVIDER_ENABLED ? detectClaudeCliStatus() : Promise.resolve(null)
     ])
-    const supplementalModels: CatalogModel[] = await buildN8NOnlyCatalogModels(catalog.models)
+    const supplementalModels: CatalogModel[] = []
     const localModels = await buildLocalCatalogModels(enabledLocalServers)
     supplementalModels.push(...localModels)
 
@@ -355,7 +295,7 @@ function mergeCatalogs(vercelModels: CatalogModel[], supplementalModels: Catalog
     const transport = supplemental.transport ?? 'local'
     upsert({
       ...supplemental,
-      source: supplemental.source ?? 'n8n-only',
+      source: supplemental.source ?? 'local',
       transport,
       canonicalId: supplemental.canonicalId ?? supplemental.id,
       connectionId: resolveConnectionId(supplemental, transport)
@@ -363,28 +303,6 @@ function mergeCatalogs(vercelModels: CatalogModel[], supplementalModels: Catalog
   }
 
   return Array.from(merged.values())
-}
-
-async function buildN8NOnlyCatalogModels(sourceCatalog: CatalogModel[]): Promise<CatalogModel[]> {
-  const supplemental: CatalogModel[] = []
-
-  for (const entry of N8N_ONLY_PROVIDERS) {
-    if (entry.manualOnly) {
-      continue
-    }
-
-    if (entry.mirrorProvider) {
-      const mirrorModels = sourceCatalog.filter((model) => model.provider === entry.mirrorProvider)
-      if (mirrorModels.length) {
-        supplemental.push(...mirrorModels.map((model) => cloneModelForN8NProvider(model, entry)))
-        continue
-      }
-    }
-
-    supplemental.push(buildManualPlaceholder(entry))
-  }
-
-  return supplemental
 }
 
 type LmStudioModelEntry = {
@@ -687,45 +605,6 @@ function buildClaudeCliCatalogModels(): CatalogModel[] {
   ]
 }
 
-function cloneModelForN8NProvider(model: CatalogModel, target: N8NOnlyProviderDefinition): CatalogModel {
-  const canonicalId = `${target.provider}/${model.name}`
-  return {
-    ...model,
-    id: canonicalId,
-    canonicalId,
-    provider: target.provider,
-    displayName: model.displayName,
-    source: 'n8n-only',
-    transport: 'local',
-    connectionId: target.id,
-    availableConnections: [target.id],
-    idVariants: undefined,
-    tags: Array.from(new Set([...(model.tags ?? []), 'n8n-only'])),
-    upstreamProvider: 'n8n',
-    purpose: model.purpose ?? 'chat'
-  }
-}
-
-function buildManualPlaceholder(entry: N8NOnlyProviderDefinition): CatalogModel {
-  const canonicalId = `${entry.provider}/${entry.modelName}`
-  return {
-    id: canonicalId,
-    canonicalId,
-    provider: entry.provider,
-    name: entry.modelName,
-    displayName: entry.displayName,
-    description: `${entry.description} (enter values manually)`,
-    tags: ['n8n-only', 'manual-entry'],
-    features: entry.features ?? { tools: true },
-    source: 'n8n-only',
-    transport: 'local',
-    connectionId: entry.id,
-    availableConnections: [entry.id],
-    upstreamProvider: 'n8n',
-    purpose: 'chat'
-  }
-}
-
 function buildConnectionOptions(
   access: ProviderAccessResolution,
   extras?: {
@@ -737,7 +616,6 @@ function buildConnectionOptions(
 ): CatalogConnectionOption[] {
   const options: CatalogConnectionOption[] = []
   const n8nHint = 'Manage credentials in n8n for Modes 1 & 2 plus subagents.'
-  const n8nOnlyLockedReason = 'Configure this connection inside n8n. Batshit direct support is coming soon.'
 
   const addOption = (option: CatalogConnectionOption) => {
     options.push(option)
@@ -914,22 +792,6 @@ function buildConnectionOptions(
         requiredN8NCredentials: CONNECTION_CREDENTIAL_MAP[`direct:${server.id}`] ?? []
       })
     }
-  }
-
-  for (const entry of N8N_ONLY_PROVIDERS) {
-    addOption({
-      id: entry.id,
-      label: entry.label,
-      transport: 'direct',
-      service: entry.id,
-      providers: entry.providers ?? null,
-      description: entry.description,
-      status: 'locked',
-      lockedReason: n8nOnlyLockedReason,
-      n8nStatus: 'unknown',
-      n8nDescription: `${entry.description} (n8n-only for now.)`,
-      requiredN8NCredentials: CONNECTION_CREDENTIAL_MAP[entry.id]
-    })
   }
 
   if (CODEX_PROVIDER_ENABLED) {

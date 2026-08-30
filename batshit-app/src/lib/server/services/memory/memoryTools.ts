@@ -646,7 +646,7 @@ export interface MemoryRecallResult {
   /**
    * 2026-08-29: recall now returns FULL CONTENT in-turn (Josh's call — the agent
    * reads what it recalls immediately). Memory tool results leave no compiled-
-   * history footprint (the DL-104-17 zip exemption + its client twin), so this
+   * history footprint (the DL-104-17 zip exemption), so this
    * costs context only in the turn that asked; persistence across later turns
    * stays exclusively the DCM linger channel the queue below arms.
    */

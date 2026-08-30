@@ -38,7 +38,7 @@ If you're installing Batshit for the first time:
 2. Read either [Install Mac app](installation/install-mac-app.md) or [Install Docker](installation/install-docker.md), depending on the path you chose.
 3. Continue with [First run](installation/first-run.md).
 4. Add [API keys and models](providers/api-keys-and-models.md).
-5. Connect [n8n](primary-agents/connect-n8n.md) when you want n8n agents or workflow tools.
+5. Connect [n8n](primary-agents/connect-n8n.md) when you want workflow tools or n8n Workflow Subagents.
 6. Read [Backup and restore](admin/backup-and-restore.md) before you depend on the instance.
 7. Read [Updating Batshit](installation/updating-batshit.md) before installing a newer alpha release.
 
@@ -76,7 +76,7 @@ These docs are grouped by subject — everything about a feature lives in one pl
 
 **Agents and orchestration**
 
-- [Primary Agents](primary-agents/overview.md) — the `n8n`, `API`, and `CLI` agent types, plus [connecting n8n](primary-agents/connect-n8n.md).
+- [Primary Agents](primary-agents/overview.md) — the `API` and `CLI` agent types, plus [connecting n8n](primary-agents/connect-n8n.md) for workflow tools and Workflow Subagents.
 - [Subagents](subagents/overview.md) — specialist helpers a Primary Agent can call.
 - [Groups](groups/overview.md) — multi-agent group chat with a single-speaker queue.
 - [Projects](projects/overview.md) — project-aware work and file mentions.
@@ -127,11 +127,12 @@ For checking exact terms, ports, template locations, and configuration names:
 
 ## Core concepts at a glance
 
-Batshit has three Primary Agent types — peer choices, not quality tiers:
+Batshit has two Primary Agent types—peer choices, not quality tiers:
 
-- **`n8n`** — the main agent runs inside an n8n workflow (needs n8n, a workflow, a webhook URL).
 - **`API`** — Batshit talks directly to model providers (needs a provider key or Local AI runtime). The simplest first path.
 - **`CLI`** — Batshit runs a managed CLI agent like Codex or Claude Code (needs the CLI installed and logged in).
+
+n8n is the workflow automation and tool platform: `API` and `CLI` agents call n8n workflows as tools or n8n Workflow Subagents.
 
 Subagents are specialist helpers a Primary Agent can call. Full detail in [Primary Agents](primary-agents/overview.md) and [Subagents](subagents/overview.md).
 

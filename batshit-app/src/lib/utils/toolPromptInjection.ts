@@ -1,5 +1,5 @@
 export function buildToolGuidanceZipPromptBlock(options?: {
-  runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+  runtimeFlavor?: 'codex' | 'claude' | 'vercel'
   zipControlPermission?: 'agent' | 'user'
   zipAiViewMode?: 'inline' | 'appended'
   toolNotesEnabled?: boolean
@@ -121,12 +121,12 @@ export function buildToolGuidanceZipPromptBlock(options?: {
 /**
  * Code fallback for the Memory guidance block (SA-104 P3), used only when the Redis
  * prompt key (`batshit:tool_guidance_memory_prompt`) is empty — packaged defaults
- * normally seed it on boot. Injected by BOTH compilation twins for memory-enabled
+ * normally seed it on boot. Injected by the compilation path for memory-enabled
  * agents only; keep the two call sites and this text in sync with the packaged
  * `batshit_tool_prompt_memory.md`.
  */
 export function buildMemoryPromptBlock(options?: {
-  runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+  runtimeFlavor?: 'codex' | 'claude' | 'vercel'
 }): string {
   const runtimeFlavor = options?.runtimeFlavor ?? 'vercel'
   const searchTool = runtimeFlavor === 'vercel' ? 'native_batshit_tool_search' : 'batshit_tool_search'
@@ -207,21 +207,16 @@ export function normalizeDynamicMcpPromptContent(prompt: string): string {
  * not have.
  */
 export function buildDynamicMcpPromptBlock(options?: {
-  runtimeFlavor?: 'codex' | 'claude' | 'vercel' | 'n8n'
+  runtimeFlavor?: 'codex' | 'claude' | 'vercel'
 }): string {
   const runtimeFlavor = options?.runtimeFlavor ?? 'vercel'
-  const isN8n = runtimeFlavor === 'n8n'
   const searchTool = runtimeFlavor === 'vercel' ? 'native_batshit_tool_search' : 'batshit_tool_search'
   const useTool = runtimeFlavor === 'vercel' ? 'native_batshit_tool_use' : 'batshit_tool_use'
 
   return [
     'Dynamic Tool Search lets you discover and use Batshit capabilities without loading huge tool lists into context.',
     '',
-    ...(isN8n
-      ? [
-          `Your broker lives on the \`Batshit Tools\` node. Use \`action="${searchTool}"\` and \`action="${useTool}"\`. These are action names for that node, not standalone skills.`
-        ]
-      : [`Your broker pair is \`${searchTool}\` / \`${useTool}\`.`]),
+    `Your broker pair is \`${searchTool}\` / \`${useTool}\`.`,
     `Do not call \`native_skill\` with \`skillId="${searchTool}"\` or \`skillId="${useTool}"\`; these are tools, not skills.`,
     '',
     'Families (the ref prefix matters):',
@@ -239,9 +234,6 @@ export function buildDynamicMcpPromptBlock(options?: {
     '- Keep capability-specific arguments inside `input`; never flatten required fields to the top level. If the schema says `inputFile`, pass `input.inputFile`.',
     '- Compact schema hints are the default; request the full schema only when they are not enough or the action may be destructive.',
     '- If a call fails because a required field is missing, inspect the schema/result and retry with the exact field names.',
-    ...(isN8n
-      ? ['- When CLI scope is available, pass/retain `selectedToolIds` so the backend can enforce the discoverable CLI lane.']
-      : []),
     '',
     'Hints are guidance, not authorization: backend validation, scope checks, risk gates, and artifact allowlists remain authoritative.',
     'Bash, Web Search, Fetch Zip, and `native_skill` are separate primitives. Do not route them through Dynamic Tool Search.'

@@ -28,7 +28,7 @@ The behavior is honest about each environment. For example, the n8n runtime entr
 
 ## Instance-wide defaults
 
-A few instance-level defaults live in Admin because they apply across the instance rather than to a single agent. These include defaults for the Execution Viewer, Web Search, and Dynamic Schema Hints (shared caps on how large compact tool-schema summaries get — they affect prompt size and clarity, not permissions).
+A few instance-level defaults live in Admin because they apply across the instance rather than to a single agent. These include Web Search and Dynamic Schema Hints (shared caps on how large compact tool-schema summaries get — they affect prompt size and clarity, not permissions).
 
 ## Cleanup utilities
 

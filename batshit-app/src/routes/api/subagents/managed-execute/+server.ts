@@ -173,7 +173,7 @@ export const POST: RequestHandler = async ({ request }) => {
     return jsonError(
       400,
       'invalid_subagent_type',
-      'This route only executes API, CLI, and n8n Workflow Subagents. n8n Subnode Subagents run inside n8n Primary workflows.'
+      'This route only executes API, CLI, and n8n Workflow Subagents. n8n Subnode Subagents were removed.'
     )
   }
 

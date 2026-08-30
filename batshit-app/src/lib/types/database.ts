@@ -6,8 +6,8 @@ import type { GroupChatAgentSettings, GroupChatZipSettings } from '$lib/types/gr
 import type { AgentVoiceProfile, VoiceSettings } from '$lib/types/voice'
 import type { GoonsSettings, GoonRecord } from '$lib/types/goons'
 import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
-import type { PrimaryAgentType } from '$lib/utils/primaryAgentType'
-import type { SubagentType } from '$lib/utils/subagentType'
+import type { StoredPrimaryAgentType } from '$lib/utils/primaryAgentType'
+import type { StoredSubagentType } from '$lib/utils/subagentType'
 import type {
   AgentAutoCompactSettings,
   GlobalAutoCompactSettings
@@ -119,7 +119,7 @@ export interface AgentRow {
   model?: string
 
   // Canonical primary-agent contract (SA-061)
-  agentType?: PrimaryAgentType
+  agentType?: StoredPrimaryAgentType
   slug?: string
 
   // System prompt toggles
@@ -308,7 +308,6 @@ export interface UserSettingsRow {
   ui_settings?: Record<string, any>
   upload_settings?: Record<string, any>
   admin_settings?: {
-    n8n_execution_search_limit?: number
     dcm_schema_hint_required_limit?: number
     dcm_schema_hint_optional_limit?: number
     dcm_schema_hint_max_chars?: number
@@ -422,7 +421,7 @@ export interface SubagentRow {
   description?: string
 
   // Canonical subagent contract (SA-062)
-  subagentType?: SubagentType
+  subagentType?: StoredSubagentType
 
   // RENAMED: type → specialty (clearer purpose - Story 6.8a)
   specialty?: 'general' | 'n8n-specialist' | 'claude-code' | 'artifact'

@@ -1,4 +1,6 @@
-export type PrimaryAgentType = 'n8n' | 'api' | 'cli'
+/** Live Primary Agent types. `n8n` is retained only as a stored retirement marker. */
+export type PrimaryAgentType = 'api' | 'cli'
+export type StoredPrimaryAgentType = PrimaryAgentType | 'n8n'
 
 type PrimaryModelConnectionLike =
   | {
@@ -48,7 +50,7 @@ function hasCliProviderHint(agent?: PrimaryAgentLike | null): boolean {
 export function normalizePrimaryAgentType(
   agent?: PrimaryAgentLike | null,
   explicitType?: unknown
-): PrimaryAgentType {
+): StoredPrimaryAgentType {
   const normalizedExplicit = normalizeString(explicitType)
   if (normalizedExplicit === 'n8n' || normalizedExplicit === 'api' || normalizedExplicit === 'cli') {
     return normalizedExplicit
@@ -79,7 +81,11 @@ export function normalizePrimaryAgentType(
     return 'cli'
   }
 
-  return 'n8n'
+  // SA-106 DL-106-02: an unrecognised record must resolve to a LIVE type, never to the
+  // retired lane. Records that genuinely name n8n (explicitly, or through the legacy
+  // `n8n-native` / `batshit-enhanced` modes above) still return `'n8n'` so the send guard
+  // can reject them loudly; only this catch-all changed.
+  return 'api'
 }
 
 export function isN8nPrimaryAgentType(value: unknown): value is 'n8n' {
@@ -100,24 +106,23 @@ export function isManagedPrimaryAgentType(
   return isApiPrimaryAgentType(value) || isCliPrimaryAgentType(value)
 }
 
-export function requiresWebhookUrlForPrimaryAgent(value: unknown): boolean {
-  return isN8nPrimaryAgentType(value)
-}
-
 export function primaryAgentAllowsNativeBash(value: unknown): boolean {
-  const type = normalizeString(value)
-  return type === 'n8n' || type === 'api'
+  return isApiPrimaryAgentType(value)
 }
 
 export function primaryAgentAllowsAgentBrowser(value: unknown): boolean {
-  const type = normalizeString(value)
-  return type === 'n8n' || type === 'api'
+  return isApiPrimaryAgentType(value)
 }
 
-export function getPrimaryAgentDisplayLabel(value: unknown): 'n8n' | 'API' | 'CLI' {
-  if (isApiPrimaryAgentType(value)) return 'API'
+export function getPrimaryAgentDisplayLabel(
+  value: unknown
+): 'n8n (retired)' | 'API' | 'CLI' {
   if (isCliPrimaryAgentType(value)) return 'CLI'
-  return 'n8n'
+  // SA-106: only a record that actually names the retired type gets the retired label.
+  // Everything else — including malformed records — reads as API, matching what
+  // `normalizePrimaryAgentType` resolves it to.
+  if (isN8nPrimaryAgentType(value)) return 'n8n (retired)'
+  return 'API'
 }
 
 export function getPrimaryAgentSystemPromptRedisKey(type: PrimaryAgentType): string {
@@ -126,9 +131,6 @@ export function getPrimaryAgentSystemPromptRedisKey(type: PrimaryAgentType): str
       return 'batshit:batshit_mode3_system_prompt'
     case 'cli':
       return 'batshit:batshit_mode4_system_prompt'
-    case 'n8n':
-    default:
-      return 'batshit:n8n_mode2_system_prompt'
   }
 }
 
@@ -138,9 +140,6 @@ export function getPrimaryAgentSystemPromptLabel(type: PrimaryAgentType): string
       return 'API PRIMARY SYSTEM PROMPT'
     case 'cli':
       return 'CLI PRIMARY SYSTEM PROMPT'
-    case 'n8n':
-    default:
-      return 'N8N PRIMARY SYSTEM PROMPT'
   }
 }
 
@@ -163,7 +162,7 @@ export function hasLegacyPrimaryAgentFields(agent: Record<string, any> | null | 
 }
 
 export function canonicalizePrimaryAgentRecord<T extends Record<string, any>>(agent: T): T & {
-  agentType: PrimaryAgentType
+  agentType: StoredPrimaryAgentType
 } {
   const next = { ...agent } as Record<string, any>
   next.agentType = normalizePrimaryAgentType(next)
@@ -174,5 +173,5 @@ export function canonicalizePrimaryAgentRecord<T extends Record<string, any>>(ag
   delete next.n8nImplementation
   delete next.mode
 
-  return next as T & { agentType: PrimaryAgentType }
+  return next as T & { agentType: StoredPrimaryAgentType }
 }

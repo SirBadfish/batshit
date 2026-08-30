@@ -1,42 +1,39 @@
 /**
- * DL-5 parity harness for the buildFormattedChatInput twins (Gauntlet G-0001).
+ * Compile contract suite for `buildFormattedChatInput` (was the DL-5 twins parity
+ * harness, Gauntlet G-0001).
  *
- * Runs IDENTICAL scenarios through both implementations and diffs the output:
- *   - server twin: databaseRedis.server.ts (API/CLI path, direct Redis)
- *   - client twin: databaseRedis.client.ts (n8n path, HTTP fetch)
+ * SA-106 P2: the client compiler is retired and `databaseRedis.server.ts` is now the
+ * ONE compile path, so this suite no longer diffs two implementations. Every scenario
+ * that used to assert parity is re-pinned as a direct contract on the surviving
+ * implementation — the harness, the fixtures, and the guarded behaviours are unchanged;
+ * only the second lane is gone.
  *
- * Feeding identical state:
- *   - One fixture store backs a vi.mock of $lib/server/redis. The server twin reads it
- *     directly. The client twin's fetch router serves the REAL SvelteKit route handlers
- *     (/api/redis/get, /api/users/.../settings, /api/projects, /api/zips, /api/unzipping,
- *     /api/session-clips/state, /api/clips, /api/slash-commands/agent-capabilities,
- *     /api/skills/session-context, /api/controls/find, /api/mcp/tools/dcm) — which import
- *     the same mocked redis. Any twin divergence the harness finds is real drift, not
- *     fixture skew, because both lanes consume one seeded state through production code.
+ * Retired with the n8n Primary lane (their premise was the n8n automation pack, which no
+ * longer exists): S7, S7b and S15, plus the n8n-flavor halves of S17, S18 and S19.
  *
- * KNOWN DRIFTS — ALL FIXED in the Wave 2 twins cluster (2026-06-12) and flipped to
- * equality scenarios per the original harness contract:
- *   - G-0026  (S7/S7b)  both lanes teach the broker fabric:sys.zip.fetch contract, and
- *             the trailing native_tools_fetch_zip line is conditional in both.
- *   - G-0027  (S8)      the default sandbox backend is a single server fact
- *             (resolveDefaultNativeExecutionBackend) delivered to the client lane on the
- *             settings envelope's runtime_defaults rider — never guessed in the browser.
- *   - G-0063  (S5)      both lanes resolve clip URLs late via resolveClipPreferredUrl —
- *             the client lane through /api/clips/[id]?resolve_model_url=1.
- *   - G-0148  (S6)      userStore.getProjects unwraps the {projects} wrapper; agent
- *             default projects resolve identically in both lanes.
- *   - G-0031 / G-0152a  (S9)  settings-source failure now REJECTS the compile loudly in
- *             both lanes (USER_SETTINGS_UNAVAILABLE) instead of fabricating defaults;
- *             the 60s error caches are gone.
- *   - G-0032  (S4b)     the base64 decoder is one identical implementation in both twins
- *             (globalThis.Buffer fallback, loud CLIP_DECODE_FAILED instead of '').
- *   - Structural (intentional per context-pipeline.md): server-only managed-subagent
- *     dynamic info appendix; server-side compaction (n8n pre-compacts upstream);
- *     send-routed addenda are OUTSIDE both twins and out of scope.
+ * What each surviving scenario still guards — these are the reasons the suite exists,
+ * and every one of them is a Gauntlet finding or a locked decision:
+ *   - S1/S2  merge order (base -> global -> user) and literal pass-through of
+ *            unresolved `{{ $variable }}` placeholders.
+ *   - S3     zip-bearing history with manual unzip state.
+ *   - S4/S4b clip compilation, including the loud `CLIP_DECODE_FAILED` path for
+ *            non-UTF8 base64 (G-0032) rather than a silent ''.
+ *   - S5     late tunnel resolution of clip URLs via `resolveClipPreferredUrl` (G-0063).
+ *   - S6     agent `default_project_id` resolution through the `{projects}` unwrap (G-0148).
+ *   - S8     the sandbox default is a server fact, never guessed (G-0027).
+ *   - S9     a settings-source failure REJECTS the compile loudly with
+ *            `USER_SETTINGS_UNAVAILABLE` (G-0031 / G-0152a) — no fabricated defaults,
+ *            no error cache. This is the single most important pin in the file.
+ *   - S10    the subagent slug contract, one entry per assigned subagent.
+ *   - S11/S12 voice-state and Goon presentation DCM lines.
+ *   - S13/S14/S16 the SA-096 broker-guidance gate: shipped when any family is reachable,
+ *            withheld when none is, and never duplicated across two prompt blocks.
+ *   - S17/S18/S19 the SA-104 memory contract: guidance block presence, the byte-stable
+ *            Awareness block, DCM recall inserts, and Infinite-Session graduation plus
+ *            the episode whiteboard.
  *
- * Platform note: equality scenarios still pin process.platform to 'darwin' for
- * determinism, but the sandbox default now flows through the shared helper in BOTH
- * lanes, so parity holds on any platform.
+ * The fetch router still serves the real SvelteKit route handlers off the same seeded
+ * fixture store, so an accidental network call fails loudly instead of reaching out.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -245,7 +242,6 @@ vi.mock('$env/dynamic/public', () => ({
 }))
 
 import { DatabaseService as ServerDatabaseService, invalidateUserSettingsCache as invalidateServerSettingsCache } from './databaseRedis.server'
-import { DatabaseService as ClientDatabaseService, invalidateUserSettingsCache as invalidateClientSettingsCache } from './databaseRedis.client'
 import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
 
 const USER_ID = 'josh'
@@ -255,7 +251,6 @@ function freshState(sessionId: string): FixtureState {
     kv: new Map<string, any>([
       ['batshit:batshit_mode3_system_prompt', 'API PRIMARY PROMPT BODY'],
       ['batshit:batshit_mode4_system_prompt', 'CLI PRIMARY PROMPT BODY'],
-      ['batshit:n8n_mode2_system_prompt', 'N8N PRIMARY PROMPT BODY'],
       ['batshit:sub_system_prompt', 'SUBAGENT BASE PROMPT BODY']
     ]),
     sets: new Map<string, Set<string>>(),
@@ -286,17 +281,6 @@ function apiAgent(overrides: Record<string, any> = {}) {
   }
 }
 
-function n8nAgent(overrides: Record<string, any> = {}) {
-  return {
-    id: 'agent-n8n-parity',
-    name: 'Enn',
-    primary_agent_type: 'n8n',
-    agentType: 'n8n',
-    include_global_prompt: true,
-    system_prompt: 'N8N AGENT USER PROMPT BODY',
-    ...overrides
-  }
-}
 
 function baseMessages() {
   return [
@@ -331,8 +315,7 @@ const routeImports: Record<string, () => Promise<RouteModule>> = {
   agentCapabilities: () => import('../../routes/api/slash-commands/agent-capabilities/+server'),
   skillSessionContext: () => import('../../routes/api/skills/session-context/+server'),
   controlsFind: () => import('../../routes/api/controls/find/+server'),
-  mcpToolsDcm: () => import('../../routes/api/mcp/tools/dcm/+server'),
-  memoryCompileContext: () => import('../../routes/api/memory/compile-context/+server')
+  mcpToolsDcm: () => import('../../routes/api/mcp/tools/dcm/+server')
 } as any
 
 function buildLocals() {
@@ -417,10 +400,7 @@ function createFetchRouter() {
     if (path === '/api/mcp/tools/dcm') {
       return invokeRoute('mcpToolsDcm', method, url, {}, init)
     }
-    if (path === '/api/memory/compile-context') {
-      return invokeRoute('memoryCompileContext', method, url, {}, init)
-    }
-    return new Response(`parity-harness: unrouted fetch ${method} ${path}`, { status: 501 })
+    return new Response(`compile-contract harness: unrouted fetch ${method} ${path}`, { status: 501 })
   }
 }
 
@@ -433,25 +413,15 @@ type TwinArgs = {
   options?: Record<string, any>
 }
 
-async function runBothTwins(args: TwinArgs) {
+async function runServerCompile(args: TwinArgs) {
+  // SA-106 P2: this was `runBothTwins`. The client compile twin is retired, so the
+  // harness now drives the ONE remaining implementation. The fetch router stays: it
+  // serves the real SvelteKit route handlers off the same seeded fixture store, so an
+  // accidental network call still fails loudly instead of silently reaching out.
   const router = createFetchRouter()
   vi.stubGlobal('fetch', router)
 
-  // Client first: zippingService is a shared singleton — the client lane loads honestly
-  // over HTTP, then the server lane's hydrate() overwrites with the same seeded state.
-  const clientService = new ClientDatabaseService(router as any)
-  const clientResult = await clientService.buildFormattedChatInput(
-    args.sessionId,
-    args.messages,
-    args.agent,
-    args.currentUserMessage,
-    args.assignedSubagents ?? [],
-    USER_ID,
-    { ...(args.options ?? {}), fetch: router }
-  )
-
   invalidateServerSettingsCache(USER_ID)
-  invalidateClientSettingsCache(USER_ID)
 
   const serverService = new ServerDatabaseService()
   const serverResult = await serverService.buildFormattedChatInput(
@@ -464,7 +434,7 @@ async function runBothTwins(args: TwinArgs) {
     { ...(args.options ?? {}) }
   )
 
-  return { server: serverResult, client: clientResult }
+  return { server: serverResult }
 }
 
 function normalize(result: any) {
@@ -511,12 +481,12 @@ afterEach(() => {
   delete process.env.BATSHIT_CONTAINERIZED
 })
 
-describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
-  it('S1: baseline API-agent compile is identical across twins', async () => {
+describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
+  it('S1: baseline API-agent compile', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: baseMessages(),
       agent: apiAgent(),
@@ -524,7 +494,6 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    expect(normalize(server)).toEqual(normalize(client))
     expect(server.primarySystemPrompt).toContain('API PRIMARY PROMPT BODY')
   })
 
@@ -532,7 +501,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -540,7 +509,6 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    expect(server.primarySystemPrompt).toBe(client.primarySystemPrompt)
     const prompt = server.primarySystemPrompt ?? ''
     const primaryIndex = prompt.indexOf('API PRIMARY PROMPT BODY')
     const globalIndex = prompt.indexOf('==== GLOBAL CUSTOM SYSTEM PROMPT ====')
@@ -583,7 +551,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       metadata: { zipIds: ['zip-001'] }
     }
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages,
       agent: apiAgent(),
@@ -591,12 +559,11 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    expect(normalize(server)).toEqual(normalize(client))
-    // Observed behavior pinned as-is (identical in both twins): in the default
+    // Observed behavior pinned as-is in the canonical compiler: in the default
     // appended view mode the compact ref stays inline and the manual-unzip state
     // surfaces through the DCM zip-state line. Whether the unzipped BODY should
     // also reach the model here is a zip-system question for the approved zip
-    // cluster (G-0057+), not a twins-parity question.
+    // cluster (G-0057+), not a compiler-contract question.
     const history = JSON.stringify(server.structuredInput.messages)
     expect(history).toContain('{{batshit-zip:zip-001:::2 lines of terminal output}}')
     expect(history).toContain('2 lines of terminal output | zip-001 | user-locked')
@@ -629,7 +596,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       clips: [{ clipId: 'clip-text-1' }, { clipId: 'clip-image-1' }]
     })
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -637,7 +604,6 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    expect(normalize(server)).toEqual(normalize(client))
     const clipped = JSON.stringify(server.structuredInput)
     expect(clipped).toContain('clip text body line')
     expect(clipped).toContain('data:image/png;base64,')
@@ -661,7 +627,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       clips: [{ clipId: 'clip-bad-utf8' }]
     })
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -669,7 +635,6 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    expect(normalize(server)).toEqual(normalize(client))
     // Buffer's utf-8 decode replaces the invalid byte with U+FFFD and keeps '(' — the
     // same bytes in both lanes, never a silently-dropped empty string (G-0032).
     const clipped = JSON.stringify(server.structuredInput)
@@ -700,7 +665,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       clips: [{ clipId: 'clip-doc-1' }]
     })
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -710,12 +675,8 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
 
     // Both lanes run the same late tunnel resolution (server inline, client via the
     // clip route's resolve_model_url lane) — byte-equal output, tunnel URL present.
-    expect(normalize(server)).toEqual(normalize(client))
     const serverClip = JSON.stringify(server.structuredInput)
-    const clientClip = JSON.stringify(client.structuredInput)
     expect(serverClip).toContain('https://tunnel.example.com/uploads/documents/spec.pdf')
-    expect(clientClip).toContain('https://tunnel.example.com/uploads/documents/spec.pdf')
-    expect(clientClip).not.toContain('http://localhost:5600/uploads/documents/spec.pdf')
   })
 
   it('S6 FIXED G-0148: agent default_project_id resolves identically in both lanes', async () => {
@@ -730,7 +691,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       }
     ]
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent({ default_project_id: 'proj-1' }),
@@ -741,70 +702,14 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     // Both lanes resolve the agent default project; the client lane unwraps the
     // route's {projects} envelope correctly now (G-0148).
     expect(server.resolvedProjectPath).toBe('/Users/example/proj-one')
-    expect(client.resolvedProjectPath).toBe('/Users/example/proj-one')
-    expect(normalize(server)).toEqual(normalize(client))
   })
 
-  it('S7 FIXED G-0026: n8n automation pack teaches the broker fetch-zip contract in both lanes', async () => {
-    const sessionId = nextSessionId()
-    state.current = freshState(sessionId)
-
-    const { server, client } = await runBothTwins({
-      sessionId,
-      messages: [],
-      agent: n8nAgent(),
-      currentUserMessage: 'n8n turn with native tools',
-      options: { runtimeFlavor: 'n8n' }
-    })
-
-    const serverDcm = currentUserMessageContent(server)
-    const clientDcm = currentUserMessageContent(client)
-
-    // Both lanes teach exactly the broker fabric lane — no standalone fetch_zip action.
-    for (const dcm of [serverDcm, clientDcm]) {
-      expect(dcm).toContain('native_tools_broker_families: mcp, cli, artifact, agent_browser, fabric')
-      expect(dcm).toContain('fabric:sys.zip.fetch input:')
-      expect(dcm).toContain(
-        'native_tools_fetch_zip: use batshit_tool_use ref="fabric:sys.zip.fetch" from n8n primary calls; blocked for subagent calls'
-      )
-      expect(dcm).not.toContain('fetch_zip input:')
-      expect(dcm).not.toMatch(/native_tools_actions_enabled:.*\bfetch_zip\b/)
-    }
-    expect(normalize(server)).toEqual(normalize(client))
-  })
-
-  it('S7b FIXED G-0026: with fetch-zip disabled, neither lane advertises fetch-zip', async () => {
-    const sessionId = nextSessionId()
-    state.current = freshState(sessionId)
-
-    const { server, client } = await runBothTwins({
-      sessionId,
-      messages: [],
-      agent: n8nAgent({
-        provider_specific_settings: { nativeTools: { fetchZipEnabled: false } }
-      }),
-      currentUserMessage: 'n8n turn with fetch-zip disabled',
-      options: { runtimeFlavor: 'n8n' }
-    })
-
-    const serverDcm = currentUserMessageContent(server)
-    const clientDcm = currentUserMessageContent(client)
-
-    // The trailing fetch-zip line is conditional in BOTH lanes now (the client used to
-    // emit it unconditionally — the sharpest pre-fix G-0026 pin).
-    expect(serverDcm).not.toContain('native_tools_fetch_zip')
-    expect(clientDcm).not.toContain('native_tools_fetch_zip')
-    expect(serverDcm).not.toContain('fabric:sys.zip.fetch')
-    expect(clientDcm).not.toContain('fabric:sys.zip.fetch')
-    expect(normalize(server)).toEqual(normalize(client))
-  })
-
-  it('S8 FIXED G-0027: BATSHIT_CONTAINERIZED=1 yields docker_sandbox in BOTH lanes', async () => {
+  it('S8 FIXED G-0027: BATSHIT_CONTAINERIZED=1 yields docker_sandbox ', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
     process.env.BATSHIT_CONTAINERIZED = '1'
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -813,16 +718,13 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     })
 
     const serverDcm = currentUserMessageContent(server)
-    const clientDcm = currentUserMessageContent(client)
 
     // The backend is one server fact (shared helper → settings envelope rider): the
     // client no longer guesses apple_container while commands run in docker_sandbox.
     expect(serverDcm).toContain('runtime_network: backend=docker_sandbox')
-    expect(clientDcm).toContain('runtime_network: backend=docker_sandbox')
-    expect(normalize(server)).toEqual(normalize(client))
   })
 
-  it('S9 FIXED G-0031/G-0152a: settings-source failure rejects the compile loudly in BOTH lanes', async () => {
+  it('S9 FIXED G-0031/G-0152a: settings-source failure rejects the compile loudly', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
     state.current.failUserSettings = true
@@ -831,25 +733,8 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     const router = createFetchRouter()
     vi.stubGlobal('fetch', router)
     invalidateServerSettingsCache(USER_ID)
-    invalidateClientSettingsCache(USER_ID)
 
-    // runBothTwins is not usable here: both lanes must REJECT, not return output.
-    const clientService = new ClientDatabaseService(router as any)
-    await expect(
-      clientService.buildFormattedChatInput(
-        sessionId,
-        [],
-        apiAgent(),
-        'turn during settings outage',
-        [],
-        USER_ID,
-        { runtimeFlavor: 'vercel', fetch: router }
-      )
-    ).rejects.toThrow(/USER_SETTINGS_UNAVAILABLE/)
-
-    invalidateServerSettingsCache(USER_ID)
-    invalidateClientSettingsCache(USER_ID)
-
+    // Not usable through runServerCompile: the compile must REJECT, not return output.
     const serverService = new ServerDatabaseService()
     await expect(
       serverService.buildFormattedChatInput(
@@ -864,7 +749,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     ).rejects.toThrow(/USER_SETTINGS_UNAVAILABLE/)
   })
 
-  it('S10: subagent roster compiles to the same slugs; server may append managed dynamic info only', async () => {
+  it('S10: the primary compile keeps the subagent roster but no longer emits the Category 1 prompt map', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
@@ -883,7 +768,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       }
     ]
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -892,29 +777,21 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    expect(Object.keys(server.subagentPrompts ?? {}).sort()).toEqual(
-      Object.keys(client.subagentPrompts ?? {}).sort()
-    )
-    expect(Object.keys(server.subagentPrompts ?? {})).toEqual(
-      expect.arrayContaining(['api_helper', 'display_only_slug'])
-    )
-    expect(server.subagentDescription).toEqual(client.subagentDescription)
-
-    // Structural asymmetry (intentional, context-pipeline.md): the server twin appends
-    // managed-subagent dynamic info AFTER the shared compilation; the client never does.
-    // The shared prefix must stay byte-identical.
-    for (const key of Object.keys(client.subagentPrompts ?? {})) {
-      const serverPrompt = server.subagentPrompts?.[key] ?? ''
-      const clientPrompt = client.subagentPrompts?.[key] ?? ''
-      expect(serverPrompt.startsWith(clientPrompt)).toBe(true)
-    }
+    // The DCM roster remains the primary agent's routing surface. The old
+    // `subagentPrompts` map existed only for the retired Category 1 webhook payload;
+    // workflow-subagent and CLI slug contracts are pinned in their runner suites.
+    expect(server.subagentDescription).toMatchObject({
+      api_helper: 'API slice coverage',
+      display_only_slug: 'Display-name slug edge'
+    })
+    expect(server.subagentPrompts).toBeUndefined()
   })
 
-  it('S11: voice-state DCM lines are identical across twins', async () => {
+  it('S11: voice-state DCM lines', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -925,12 +802,11 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       }
     })
 
-    expect(normalize(server)).toEqual(normalize(client))
     const dcm = currentUserMessageContent(server)
     expect(dcm).toContain('Voice runtime context:')
   })
 
-  it('S12: Desktop Goon presentation DCM is identical across twins', async () => {
+  it('S12: Desktop Goon presentation DCM', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
     state.current.userSettings.goons_settings = {
@@ -968,7 +844,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       updated_at: '2026-08-12T00:00:00.000Z'
     })
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent({ goon_id: 'desktop-parity' }),
@@ -982,7 +858,6 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       }
     })
 
-    expect(normalize(server)).toEqual(normalize(client))
     const dcm = currentUserMessageContent(server)
     expect(dcm).toContain('Presentation: Desktop Mode')
     expect(dcm).toContain('does not give you screen vision')
@@ -993,7 +868,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
 
   const DISCOVERY_BLOCK_HEADER = '==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ===='
 
-  it('S13 SA-096 P5: Dynamic MCP off but Fabric live still ships broker guidance in BOTH lanes', async () => {
+  it('S13 SA-096 P5: Dynamic MCP off but Fabric live still ships broker guidance ', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
@@ -1008,7 +883,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       fetchZipEnabled: true
     }
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent({ provider_specific_settings: { nativeTools } }),
@@ -1017,11 +892,9 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     })
 
     expect(server.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
-    expect(client.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
-    expect(normalize(server)).toEqual(normalize(client))
   })
 
-  it('S14 SA-096 P5: no reachable family withholds broker guidance in BOTH lanes', async () => {
+  it('S14 SA-096 P5: no reachable family withholds broker guidance ', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
@@ -1034,7 +907,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       agentBrowserEnabled: false
     }
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent({ provider_specific_settings: { nativeTools } }),
@@ -1045,49 +918,15 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     // The broker is not registered for this agent, so ~900 tokens explaining it would be
     // an instruction for a tool that does not exist.
     expect(server.primarySystemPrompt).not.toContain(DISCOVERY_BLOCK_HEADER)
-    expect(client.primarySystemPrompt).not.toContain(DISCOVERY_BLOCK_HEADER)
     // The surrounding tool + zip guidance is unaffected — only the broker block is gated.
     expect(server.primarySystemPrompt).toContain('==== TOOL + ZIP GUIDANCE')
-    expect(client.primarySystemPrompt).toContain('==== TOOL + ZIP GUIDANCE')
-    expect(normalize(server)).toEqual(normalize(client))
-  })
-
-  it('S15 SA-096 P5: an n8n agent with only fetch-zip left on still ships broker guidance', async () => {
-    const sessionId = nextSessionId()
-    state.current = freshState(sessionId)
-
-    // The n8n automation pack opens its Fabric family from fetch-zip, so the gate must
-    // follow the pack's rules rather than the API lane's.
-    const { server, client } = await runBothTwins({
-      sessionId,
-      messages: [],
-      agent: n8nAgent({
-        provider_specific_settings: {
-          nativeTools: {
-            dynamicMcpEnabled: false,
-            cliToolsEnabled: false,
-            artifactRuntimeEnabled: false,
-            batshitToolsEnabled: false,
-            agentBrowserEnabled: false,
-            fetchZipEnabled: true
-          }
-        }
-      }),
-      currentUserMessage: 'n8n turn with only fetch-zip',
-      options: { runtimeFlavor: 'n8n' }
-    })
-
-    expect(server.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
-    expect(client.primarySystemPrompt).toContain(DISCOVERY_BLOCK_HEADER)
-    expect(currentUserMessageContent(server)).toContain('native_tools_broker_families: fabric')
-    expect(normalize(server)).toEqual(normalize(client))
   })
 
   it('S16 SA-096 P1: no instruction appears in two blocks of the same compiled prompt', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
-    const { server, client } = await runBothTwins({
+    const { server } = await runServerCompile({
       sessionId,
       messages: [],
       agent: apiAgent(),
@@ -1095,7 +934,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    for (const prompt of [server.primarySystemPrompt ?? '', client.primarySystemPrompt ?? '']) {
+    for (const prompt of [server.primarySystemPrompt ?? '']) {
       // A default API agent receives all three blocks, which is exactly when the
       // duplication used to bite.
       expect(prompt).toContain('==== API PRIMARY SYSTEM PROMPT ====')
@@ -1125,7 +964,6 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_search\b/)
     }
 
-    expect(normalize(server)).toEqual(normalize(client))
   })
 
   it('S17 SA-104 P3: memory guidance ships for memory-enabled agents in BOTH lanes and stays absent otherwise', async () => {
@@ -1135,7 +973,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     {
       const sessionId = nextSessionId()
       state.current = freshState(sessionId)
-      const { server, client } = await runBothTwins({
+      const { server } = await runServerCompile({
         sessionId,
         messages: [],
         agent: apiAgent(),
@@ -1143,51 +981,30 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
         options: { runtimeFlavor: 'vercel' }
       })
       expect(server.primarySystemPrompt).not.toContain(MEMORY_BLOCK_HEADER)
-      expect(client.primarySystemPrompt).not.toContain(MEMORY_BLOCK_HEADER)
-      expect(normalize(server)).toEqual(normalize(client))
     }
 
-    // Memory-enabled API agent: block present in both lanes, API tool names only (DL-4).
+    // Memory-enabled API agent: block present with API tool names only (DL-4).
     {
       const sessionId = nextSessionId()
       state.current = freshState(sessionId)
-      const { server, client } = await runBothTwins({
+      const { server } = await runServerCompile({
         sessionId,
         messages: [],
         agent: apiAgent({ memory_enabled: true }),
         currentUserMessage: 'remember things for me',
         options: { runtimeFlavor: 'vercel' }
       })
-      for (const prompt of [server.primarySystemPrompt ?? '', client.primarySystemPrompt ?? '']) {
+      for (const prompt of [server.primarySystemPrompt ?? '']) {
         expect(prompt).toContain(MEMORY_BLOCK_HEADER)
         expect(prompt).toContain('<batshit-memory>')
         expect(prompt).toContain('fabric:sys.memory.search')
         expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_use\b/)
         expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_search\b/)
       }
-      expect(normalize(server)).toEqual(normalize(client))
-    }
-
-    // Memory-enabled n8n agent: block present with the n8n broker action names.
-    {
-      const sessionId = nextSessionId()
-      state.current = freshState(sessionId)
-      const { server, client } = await runBothTwins({
-        sessionId,
-        messages: [],
-        agent: n8nAgent({ memory_enabled: true }),
-        currentUserMessage: 'n8n memory turn',
-        options: { runtimeFlavor: 'n8n' }
-      })
-      for (const prompt of [server.primarySystemPrompt ?? '', client.primarySystemPrompt ?? '']) {
-        expect(prompt).toContain(MEMORY_BLOCK_HEADER)
-        expect(prompt).toContain('batshit_tool_search')
-      }
-      expect(normalize(server)).toEqual(normalize(client))
     }
   })
 
-  it('S18 SA-104 P4: recall-engine context (on-my-mind, DCM inserts, time awareness) is identical across twins', async () => {
+  it('S18 SA-104 P4: recall-engine context (on-my-mind, DCM inserts, time awareness)', async () => {
     const ON_MY_MIND_HEADER = '==== AWARENESS (AGENT MEMORY) ===='
 
     const seedMemoryFixtures = (agentId: string, sessionId: string) => {
@@ -1272,15 +1089,14 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       const sessionId = nextSessionId()
       state.current = freshState(sessionId)
       seedMemoryFixtures('agent-api-parity', sessionId)
-      const { server, client } = await runBothTwins({
+      const { server } = await runServerCompile({
         sessionId,
         messages: baseMessages(),
         agent: apiAgent({ memory_enabled: true }),
         currentUserMessage: 'How is Maggie doing today?',
         options: { runtimeFlavor: 'vercel' }
       })
-      expect(normalize(server)).toEqual(normalize(client))
-      for (const result of [server, client]) {
+      for (const result of [server]) {
         const prompt = result.primarySystemPrompt ?? ''
         expect(prompt).toContain(ON_MY_MIND_HEADER)
         expect(prompt.indexOf(ON_MY_MIND_HEADER)).toBeGreaterThan(
@@ -1303,30 +1119,13 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       }
     }
 
-    // n8n-flavor pair: same engine output through the client route, still identical.
-    {
-      const sessionId = nextSessionId()
-      state.current = freshState(sessionId)
-      seedMemoryFixtures('agent-n8n-parity', sessionId)
-      const { server, client } = await runBothTwins({
-        sessionId,
-        messages: baseMessages(),
-        agent: n8nAgent({ memory_enabled: true }),
-        currentUserMessage: 'Any news about maggie?',
-        options: { runtimeFlavor: 'n8n' }
-      })
-      expect(normalize(server)).toEqual(normalize(client))
-      expect(server.primarySystemPrompt ?? '').toContain(ON_MY_MIND_HEADER)
-      expect(currentUserMessageContent(server)).toContain('trigger "maggie" | stm | mem_trigger_1')
-    }
-
     // Group runs get no recall lanes in v1 (recorded limitation): guidance block stays,
     // recall context is absent, twins stay identical.
     {
       const sessionId = nextSessionId()
       state.current = freshState(sessionId)
       seedMemoryFixtures('agent-api-parity', sessionId)
-      const { server, client } = await runBothTwins({
+      const { server } = await runServerCompile({
         sessionId,
         messages: baseMessages(),
         agent: apiAgent({ memory_enabled: true }),
@@ -1340,8 +1139,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
           }
         }
       })
-      expect(normalize(server)).toEqual(normalize(client))
-      for (const result of [server, client]) {
+      for (const result of [server]) {
         expect(result.primarySystemPrompt ?? '').not.toContain(ON_MY_MIND_HEADER)
         expect(currentUserMessageContent(result)).not.toContain('Memory context:')
         expect(result.structuredInput?.metadata?.memoryContext).toBeUndefined()
@@ -1352,15 +1150,14 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     {
       const sessionId = nextSessionId()
       state.current = freshState(sessionId)
-      const { server, client } = await runBothTwins({
+      const { server } = await runServerCompile({
         sessionId,
         messages: baseMessages(),
         agent: apiAgent(),
         currentUserMessage: 'maggie without memory',
         options: { runtimeFlavor: 'vercel' }
       })
-      expect(normalize(server)).toEqual(normalize(client))
-      for (const result of [server, client]) {
+      for (const result of [server]) {
         expect(result.primarySystemPrompt ?? '').not.toContain(ON_MY_MIND_HEADER)
         expect(currentUserMessageContent(result)).not.toContain('Memory context:')
         expect(result.structuredInput?.metadata?.memoryContext).toBeUndefined()
@@ -1368,7 +1165,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     }
   })
 
-  it('S19 SA-104 P6: graduation splices and the episode whiteboard are identical across twins; regular sessions stay untouched', async () => {
+  it('S19 SA-104 P6: graduation splices and the episode whiteboard are identical ; regular sessions stay untouched', async () => {
     const WHITEBOARD_HEADER = '==== EPISODE WHITEBOARD (CURRENT EPISODE) ===='
     const allCompiledContent = (result: any): string =>
       (result?.structuredInput?.messages ?? [])
@@ -1389,7 +1186,7 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
 
     const seedFixedSessionFixtures = (agentId: string, sessionId: string) => {
       // The session record carries the Infinite Session block + graduation bookmark; the
-      // engine reads it from kv, the twins via getSession — keep both in sync.
+      // engine reads it from kv, while the compiler uses getSession — keep both in sync.
       const sessionRecord = {
         id: sessionId,
         user_id: USER_ID,
@@ -1427,16 +1224,13 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       })
     }
 
-    // Fixed-session pair: the production client shape pre-splices via the shared
-    // applier; the server twin re-applies idempotently — byte-equal output with the
-    // gist spliced, the graduated message gone, and the whiteboard block present.
-    for (const flavor of ['vercel', 'n8n'] as const) {
+    // Infinite Session: callers may pre-splice via the shared applier, and the compile
+    // re-applies it idempotently — the gist spliced, the graduated message gone, and
+    // the whiteboard block present.
+    for (const flavor of ['vercel'] as const) {
       const sessionId = nextSessionId()
       state.current = freshState(sessionId)
-      const agent =
-        flavor === 'vercel'
-          ? apiAgent({ memory_enabled: true })
-          : n8nAgent({ memory_enabled: true })
+      const agent = apiAgent({ memory_enabled: true })
       seedFixedSessionFixtures(agent.id, sessionId)
       const windowMessages = applyFixedSessionGraduationToMessages(
         baseMessages() as never,
@@ -1444,15 +1238,14 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
       )
       expect(windowMessages.map((message: any) => message.id)).not.toContain('msg-1')
 
-      const { server, client } = await runBothTwins({
+      const { server } = await runServerCompile({
         sessionId,
         messages: windowMessages,
         agent,
         currentUserMessage: 'Where were we?',
         options: { runtimeFlavor: flavor }
       })
-      expect(normalize(server)).toEqual(normalize(client))
-      for (const result of [server, client]) {
+      for (const result of [server]) {
         expect(allCompiledContent(result)).toContain('Graduated episode summary:')
         expect(allCompiledContent(result)).toContain('lake trip was planned')
         const prompt = result.primarySystemPrompt ?? ''
@@ -1496,15 +1289,14 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
         embedding_model: 'test',
         schema_version: 1
       })
-      const { server, client } = await runBothTwins({
+      const { server } = await runServerCompile({
         sessionId,
         messages: baseMessages(),
         agent: apiAgent({ memory_enabled: true }),
         currentUserMessage: 'Regular chat continues',
         options: { runtimeFlavor: 'vercel' }
       })
-      expect(normalize(server)).toEqual(normalize(client))
-      for (const result of [server, client]) {
+      for (const result of [server]) {
         expect(allCompiledContent(result)).not.toContain('Graduated episode summary:')
         expect(result.primarySystemPrompt ?? '').not.toContain(WHITEBOARD_HEADER)
       }

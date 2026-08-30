@@ -11,8 +11,8 @@ describe('AB home control labels', () => {
     const source = readSource('src/lib/components/chat/ChatInput.svelte')
 
     expect(source).toContain('data-ab-control="message-input"')
-    expect(source).toContain('data-ab-control="open-n8n-agent"')
-    expect(source).toContain('data-ab-control="toggle-test-mode"')
+    expect(source).not.toContain('data-ab-control="open-n8n-agent"')
+    expect(source).not.toContain('data-ab-control="toggle-test-mode"')
     expect(source).toContain('data-ab-control="open-execution-viewer"')
     expect(source).toContain('data-ab-control="work-mode"')
     expect(source).toContain('data-ab-control="codex-permission-mode"')

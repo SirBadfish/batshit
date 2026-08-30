@@ -1126,13 +1126,14 @@ export class VercelAIBrain {
       if (managedSubagents.length !== candidates.length) {
         const filtered = candidates.length - managedSubagents.length
         if (filtered > 0) {
-          console.warn(`[API Runtime] Filtered ${filtered} incompatible subagents (n8n-subnode)`)
+          console.warn(`[API Runtime] Filtered ${filtered} retired n8n Subnode Subagent record(s).`)
         }
       }
 
       for (const subagent of managedSubagents) {
         try {
           const subagentType = normalizeSubagentType(subagent, subagent?.subagentType)
+          if (subagentType === 'n8n-subnode') continue
           const webhookUrl = subagent.webhookUrl || subagent.webhook_url || subagent.workflowName
 
           const baseName = subagent.id || subagent.name || subagent.displayName || 'subagent'

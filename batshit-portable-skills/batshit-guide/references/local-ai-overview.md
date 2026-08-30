@@ -148,7 +148,7 @@ llama.cpp and vLLM are connect-existing runtimes. Batshit expects an OpenAI-comp
 
 Local AI is currently for `API` Primary Agents.
 
-`n8n` Primary Agents use whatever model/provider nodes you configure in n8n — if you want n8n to call a local model, configure that inside n8n. `CLI` Primary Agents use their CLI runtime's own model/provider setup; a CLI agent can still call Batshit tools and local services when configured, but local AI model selection isn't the same control path as an `API` model preset.
+n8n Workflow Subagents use whatever model/provider nodes you configure in n8n—if you want a workflow specialist to call a local model, configure that inside n8n. `CLI` Primary Agents use their CLI runtime's own model/provider setup; a CLI agent can still call Batshit tools and local services when configured, but local AI model selection isn't the same control path as an `API` model preset.
 
 ## Backup boundary
 

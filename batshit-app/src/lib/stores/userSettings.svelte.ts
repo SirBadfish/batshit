@@ -45,7 +45,6 @@ interface UserSettings {
   } | Record<string, any>  // Allow for flexible ui_settings format
 
   admin_settings?: {
-    n8n_execution_search_limit?: number
     dcm_schema_hint_required_limit?: number
     dcm_schema_hint_optional_limit?: number
     dcm_schema_hint_max_chars?: number

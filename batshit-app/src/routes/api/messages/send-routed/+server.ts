@@ -5,10 +5,9 @@ import path from 'node:path'
 import { json } from '@sveltejs/kit'
 import { commitMemoryTurnState } from '$lib/server/services/memory/memoryRecall'
 import { ensureFixedSessionOpenEpisode } from '$lib/server/services/memory/memoryEpisodes'
-import { isFixedSession } from '$lib/utils/fixedSession'
+import { isFixedSession, resolveFixedSessionAgentId } from '$lib/utils/fixedSession'
 import { logger } from '$lib/utils/logger'
 import type { RequestHandler } from './$types'
-import { messageRouter } from '$lib/server/services/messageRouter'
 import {
   DatabaseService,
   type PrecompiledHistory,
@@ -102,8 +101,6 @@ import {
 	  getActiveSessionTurn,
 	  registerSessionTurn,
 	  clearSessionTurn,
-	  registerN8nPrimaryRun,
-	  clearN8nPrimaryRun,
 	  registerStreamAbort,
   clearStreamAbort,
   registerGroupAbort,
@@ -173,9 +170,6 @@ import {
 } from '$lib/server/services/internalRequestAuth'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import {
-  resolveRuntimeN8nBaseUrl,
-  rewriteBatshitCallbackUrlsForN8nRuntime,
-  rewriteLoopbackUrlForRuntimeBase,
 } from '$lib/server/services/runtimeUrlRewrites'
 import {
   collectTrustedClipIdsFromMetadata,
@@ -3524,8 +3518,8 @@ async function handleBatshitAgentStream({
       response: json(
         {
           error:
-            'This model preset is limited to n8n agents. Switch the Primary Agent to n8n mode or pick a different model.',
-          code: 'n8n_only_model',
+            'This model preset has no direct Batshit connection and cannot run on an API or CLI agent. Pick a different model, or use it from an n8n tool workflow.',
+          code: 'model_not_directly_connectable',
         },
         { status: 400 },
       ),
@@ -3933,7 +3927,6 @@ async function handleBatshitAgentStream({
       userMessage: content,
       structuredInput: formattedInput.structuredInput,
       primarySystemPrompt: formattedInput.primarySystemPrompt,
-      subagentPrompts: formattedInput.subagentPrompts,
       subagentDescription: formattedInput.subagentDescription,
       compiledMessages,
       compileMetadata,
@@ -7435,7 +7428,6 @@ export const POST: RequestHandler = async ({
       messageId: requestedMessageId = null,
       messages,
       agentType, // Story 6.8d: Extract agentType instead of mode
-      webhookUrl,
       batshitInput = null,
       metadata = null,
       userId: requestedUserId = null,
@@ -7499,8 +7491,29 @@ export const POST: RequestHandler = async ({
       console.error('[send-routed] Failed to load user zip settings:', error)
     }
 
-    // Story 6.8d: Use agentType from request or fall back to agent's agentType (default: n8n)
+    // Resolve the primary-agent type from the request override, else the stored record.
     const finalAgentType = normalizePrimaryAgentType(agent, agentType)
+
+    // SA-106 DL-106-03: the `n8n` primary-agent type is retired. Any send that resolves
+    // to it fails loudly here — before the session-turn lock, clip consumption, memory
+    // commit, or any compile — so a stray record can never half-run. Both the resolved
+    // type AND the stored record are checked: `agentType` arrives from the request body
+    // and outranks the record (primaryAgentType.ts), so checking only the resolved value
+    // would let a client override its way past the guard on a retired agent.
+    if (
+      isN8nPrimaryAgentType(finalAgentType) ||
+      isN8nPrimaryAgentType(normalizePrimaryAgentType(agent))
+    ) {
+      return json(
+        {
+          error: 'The n8n Primary Agent type was removed from Batshit.',
+          code: 'primary_agent_type_retired',
+          details:
+            'This agent uses the retired n8n Primary Agent type. Delete this agent and create an API or CLI agent instead. n8n is still fully supported as a tool platform: n8n tool workflows and n8n Workflow Subagents are unchanged.',
+        },
+        { status: 409 },
+      )
+    }
 
     // Load session metadata for group chat configuration
     const session = await redis.getSession(sessionId)
@@ -7508,6 +7521,24 @@ export const POST: RequestHandler = async ({
       return json(
         { error: 'Session not found or unauthorized' },
         { status: 404 },
+      )
+    }
+    const fixedSessionAgentId = resolveFixedSessionAgentId(session)
+    if (fixedSessionAgentId && fixedSessionAgentId !== agentId) {
+      const fixedAgentExists = agents.some((candidate) => candidate.id === fixedSessionAgentId)
+      return json(
+        {
+          error: fixedAgentExists
+            ? 'This Infinite Session belongs to a different agent.'
+            : 'This Infinite Session\'s saved agent no longer exists.',
+          code: fixedAgentExists
+            ? 'FIXED_SESSION_AGENT_MISMATCH'
+            : 'FIXED_SESSION_AGENT_MISSING',
+          details: fixedAgentExists
+            ? `Switch back to agent ${fixedSessionAgentId} before continuing this Infinite Session.`
+            : 'Delete this Infinite Session or restore its saved agent before continuing. Batshit will not silently attach a different agent.'
+        },
+        { status: 409 }
       )
     }
     if (typeof content === 'string') {
@@ -7556,7 +7587,6 @@ export const POST: RequestHandler = async ({
       )
     }
 
-	    let n8nPrimaryRunRegistered = false
 	    const sessionTurnKind = groupConfig ? 'group' : 'single'
     const activeSessionTurn = getActiveSessionTurn(sessionId)
     if (activeSessionTurn) {
@@ -7592,29 +7622,6 @@ export const POST: RequestHandler = async ({
         },
         { status: 409 },
 	      )
-	    }
-
-	    if (isN8nPrimaryAgentType(finalAgentType)) {
-	      const n8nPrimaryRegistration = registerN8nPrimaryRun({
-	        userId: resolvedUserId,
-	        sessionId,
-	        messageId: typeof requestedMessageId === 'string' ? requestedMessageId : null,
-	        agentId,
-	      })
-	      if (!n8nPrimaryRegistration.ok) {
-	        clearSessionTurn(sessionId)
-	        return json(
-	          {
-	            error: 'An n8n agent is already running in another chat.',
-	            code: 'n8n_primary_in_progress',
-	            details:
-	              'n8n Primary Agent chats need to run by themselves right now. Stop or finish the active chat first, then send this n8n message.',
-	            activeRun: n8nPrimaryRegistration.existing,
-	          },
-	          { status: 409 },
-	        )
-	      }
-	      n8nPrimaryRunRegistered = true
 	    }
 
     try {
@@ -8021,77 +8028,14 @@ export const POST: RequestHandler = async ({
         }
       }
 
-      const rawN8nWebhookUrl = webhookUrl || agent.webhook_url
-      let routedN8nWebhookUrl = rawN8nWebhookUrl
-      let n8nRuntimeBaseUrl: string | null = null
-      if (rawN8nWebhookUrl) {
-        let savedN8nApiUrl: string | null = null
-        try {
-          savedN8nApiUrl = await apiKeyService.retrieve(
-            'n8n_api_url',
-            resolvedUserId,
-          )
-        } catch (error) {
-          console.warn('[send-routed] Failed to load n8n API URL', error)
-        }
-        n8nRuntimeBaseUrl = resolveRuntimeN8nBaseUrl(savedN8nApiUrl)
-        routedN8nWebhookUrl = rewriteLoopbackUrlForRuntimeBase(
-          rawN8nWebhookUrl,
-          n8nRuntimeBaseUrl,
-        )
-      }
-
-      const routedBatshitInput = rewriteBatshitCallbackUrlsForN8nRuntime(
-        batshitInput,
-        n8nRuntimeBaseUrl,
+      // SA-106: the n8n Primary Agent lane is retired. Every agent that reaches this
+      // point is `api` or `cli` and returned from the managed branch above; the
+      // retired-type guard near the top of this handler rejects the rest before any
+      // side effect runs. Falling through here means the type contract drifted, so
+      // fail loudly rather than returning an empty 200.
+      throw new Error(
+        `send-routed reached an unsupported primary agent type: ${finalAgentType}`,
       )
-
-      await consumePostCompileSessionClips(sessionId)
-
-      // SA-104 P4: the n8n lane compiles in the browser (read-only recall context via
-      // /api/memory/compile-context); its linger commit happens HERE, server-side, at
-      // the same accepted-send boundary as clip consumption (P0 §9 answered). n8n has
-      // no group or continuation runs on this path. Failures propagate loudly.
-      if (typeof content === 'string' && content.trim()) {
-        // SA-104 P5: Infinite (fixed) sessions keep one open episode (lazy open,
-        // same boundary); upkeep runs BEFORE the commit so 'episode' linger holds
-        // bind to the right episode. The native n8n lane does this in
-        // /api/memory/turn-commit.
-        await ensureFixedSessionOpenEpisode({ session, sessionId, agentId })
-        await commitMemoryTurnState({
-          userId: resolvedUserId,
-          agentId,
-          sessionId,
-          currentUserMessage: content,
-        })
-      }
-
-      // n8n Primary Agents use the existing non-streaming router path.
-      const result = await messageRouter.route({
-        sessionId,
-        agentId,
-        agent, // Pass the full agent object (Story 6.8d - router needs agentType field)
-        messages: messages as ChatMessage[],
-        webhookUrl: routedN8nWebhookUrl,
-        batshitInput: routedBatshitInput,
-      })
-
-      if (!result.success) {
-        return json(
-          {
-            error: result.error || 'Failed to process message',
-            agentType: result.agentType,
-          },
-          { status: 500 },
-        )
-      }
-
-      return json({
-        success: true,
-        data: result.data,
-        agentType: result.agentType,
-        message: 'Message routed successfully',
-      })
     } finally {
       try {
         const sandboxCleanupWarnings =
@@ -8112,9 +8056,6 @@ export const POST: RequestHandler = async ({
         )
       }
 	      clearSessionTurn(sessionId)
-	      if (n8nPrimaryRunRegistered) {
-	        clearN8nPrimaryRun(resolvedUserId, sessionId)
-	      }
 	    }
   } catch (error) {
     console.error('Error in send-routed endpoint:', error)

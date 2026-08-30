@@ -1,7 +1,12 @@
-import type { PrimaryAgentLike, PrimaryAgentType } from '$lib/utils/primaryAgentType'
+import type {
+  PrimaryAgentLike,
+  PrimaryAgentType,
+  StoredPrimaryAgentType
+} from '$lib/utils/primaryAgentType'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 
-export type SubagentType = 'n8n-subnode' | 'n8n-workflow' | 'api' | 'cli'
+export type SubagentType = 'n8n-workflow' | 'api' | 'cli'
+export type StoredSubagentType = SubagentType | 'n8n-subnode'
 
 export type SubagentLike = {
   subagentType?: string | null
@@ -26,7 +31,7 @@ function hasWorkflowTarget(subagent?: SubagentLike | null): boolean {
 export function normalizeSubagentType(
   subagent?: SubagentLike | null,
   explicitType?: unknown
-): SubagentType {
+): StoredSubagentType {
   const normalizedExplicit = normalizeString(explicitType)
   if (
     normalizedExplicit === 'n8n-subnode' ||
@@ -47,6 +52,9 @@ export function normalizeSubagentType(
     return rawType
   }
 
+  // SA-106: the legacy bare `'n8n'` alias still maps to the RETIRED subnode type so a
+  // stored record stays recognisable and can be surfaced for deletion (DL-106-04). It is
+  // deliberately not remapped to a live type.
   if (normalizedExplicit === 'n8n' || rawType === 'n8n') {
     return 'n8n-subnode'
   }
@@ -60,7 +68,11 @@ export function normalizeSubagentType(
     return 'n8n-workflow'
   }
 
-  return hasWorkflowTarget(subagent) ? 'n8n-workflow' : 'n8n-subnode'
+  // SA-106 DL-106-02: a record carrying a workflow target is a Category 2
+  // `n8n-workflow` subagent and keeps that resolution untouched. Everything else used to
+  // fall through to the retired subnode type; an unrecognised record now resolves to a
+  // LIVE type instead.
+  return hasWorkflowTarget(subagent) ? 'n8n-workflow' : 'api'
 }
 
 export function isApiSubagentType(value: unknown): value is 'api' {
@@ -84,7 +96,7 @@ export function isN8nSubnodeSubagentType(
 }
 
 export function getCompatibleSubagentTypesForPrimaryAgent(
-  value: PrimaryAgentLike | PrimaryAgentType | null | undefined
+  value: PrimaryAgentLike | StoredPrimaryAgentType | null | undefined
 ): SubagentType[] {
   const type =
     typeof value === 'string'
@@ -97,27 +109,26 @@ export function getCompatibleSubagentTypesForPrimaryAgent(
     case 'cli':
       return ['n8n-workflow', 'api', 'cli']
     case 'n8n':
-    default:
-      return ['n8n-subnode']
+      return []
   }
 }
 
 export function isSubagentCompatibleWithPrimaryAgent(
-  primaryAgent: PrimaryAgentLike | PrimaryAgentType | null | undefined,
-  subagent: SubagentLike | SubagentType | null | undefined
+  primaryAgent: PrimaryAgentLike | StoredPrimaryAgentType | null | undefined,
+  subagent: SubagentLike | StoredSubagentType | null | undefined
 ): boolean {
   const compatibleTypes = getCompatibleSubagentTypesForPrimaryAgent(primaryAgent)
   const subagentType =
     typeof subagent === 'string'
       ? normalizeSubagentType(undefined, subagent)
       : normalizeSubagentType(subagent)
-  return compatibleTypes.includes(subagentType)
+  return subagentType !== 'n8n-subnode' && compatibleTypes.includes(subagentType)
 }
 
-export function getSubagentTypeDisplayLabel(type: SubagentType): string {
+export function getSubagentTypeDisplayLabel(type: StoredSubagentType): string {
   switch (type) {
     case 'n8n-subnode':
-      return 'n8n Subnode Subagent'
+      return 'n8n Subnode Subagent (retired)'
     case 'n8n-workflow':
       return 'n8n Workflow Subagent'
     case 'api':
@@ -129,10 +140,10 @@ export function getSubagentTypeDisplayLabel(type: SubagentType): string {
   }
 }
 
-export function getSubagentTypeShortLabel(type: SubagentType): string {
+export function getSubagentTypeShortLabel(type: StoredSubagentType): string {
   switch (type) {
     case 'n8n-subnode':
-      return 'n8n subnode'
+      return 'n8n subnode (retired)'
     case 'n8n-workflow':
       return 'n8n workflow'
     case 'api':
@@ -144,16 +155,16 @@ export function getSubagentTypeShortLabel(type: SubagentType): string {
   }
 }
 
-export function getSubagentTypeBadgeTone(type: SubagentType): 'n8n' | 'api' | 'cli' {
+export function getSubagentTypeBadgeTone(type: StoredSubagentType): 'n8n' | 'api' | 'cli' {
   if (type === 'api' || type === 'cli') return type
   return 'n8n'
 }
 
 export function canonicalizeSubagentRecord<T extends Record<string, any>>(
   subagent: T
-): T & { subagentType: SubagentType } {
+): T & { subagentType: StoredSubagentType } {
   const next = { ...subagent } as Record<string, any>
   next.subagentType = normalizeSubagentType(next)
   delete next.subagent_type
-  return next as T & { subagentType: SubagentType }
+  return next as T & { subagentType: StoredSubagentType }
 }

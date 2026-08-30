@@ -232,15 +232,7 @@ A persistent Goon expression or motion state that stays active until changed.
 
 ### n8n
 
-A workflow automation platform. Batshit uses n8n for workflow-first Primary Agents, workflow tools, subagents, MCP gateways, uploads, and Artifact workflows.
-
-### n8n Primary Agent
-
-A Primary Agent where the main assistant is an n8n workflow.
-
-### n8n Subnode Subagent
-
-A Subagent attached inside an n8n Primary Agent workflow as an AI Agent Tool node.
+A workflow automation platform. Batshit uses n8n for workflow tools, Workflow Subagents, MCP gateways, uploads, and Artifact workflows.
 
 ### n8n Workflow Subagent
 
@@ -254,7 +246,7 @@ An Infinite Session's between-turns context relief: graduate finished episodes, 
 
 ### Primary Agent
 
-The main AI agent you chat with directly. Batshit has `n8n`, `API`, and `CLI` Primary Agent types.
+The main AI agent you chat with directly. Batshit has `API` and `CLI` Primary Agent types.
 
 ### Project
 
@@ -354,7 +346,7 @@ VRM Animation, a reusable animation format for Goons.
 
 ### Webhook
 
-A URL that receives a request from Batshit or another service. n8n Primary Agents, n8n Workflow Subagents, and webhook-backed Artifacts all use webhooks.
+A URL that receives a request from Batshit or another service. n8n Workflow Subagents and webhook-backed Artifacts use webhooks.
 
 ### Workspace
 

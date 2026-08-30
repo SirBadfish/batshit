@@ -7,6 +7,7 @@ import {
   getCodexConfigOverrideValidationError,
 } from '$lib/server/services/codexSettings'
 import { syncManagedCliSubagentProfile } from '$lib/server/services/cliSubagentProfileSync'
+import { runTrackedN8nCompatibilitySync } from '$lib/server/services/n8nParameterCompatibility'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { redis } from '$lib/server/redis'
@@ -18,6 +19,7 @@ import {
 import {
   canonicalizeSubagentRecord,
   isCliSubagentType,
+  isN8nSubnodeSubagentType,
   isWorkflowBackedSubagentType,
   normalizeSubagentType,
 } from '$lib/utils/subagentType'
@@ -76,7 +78,37 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 		}
 
 		const updates = await request.json()
+		if (isN8nSubnodeSubagentType(existing.subagentType)) {
+			return json(
+				{
+					error: 'This Subagent uses the retired n8n Subnode type and can only be deleted.',
+					code: 'subagent_type_retired'
+				},
+				{ status: 409 }
+			)
+		}
+		if (Object.prototype.hasOwnProperty.call(updates, 'subagentType')) {
+			const requestedSubagentType =
+				typeof updates.subagentType === 'string'
+					? updates.subagentType.trim().toLowerCase()
+					: ''
+			if (!['n8n-workflow', 'api', 'cli'].includes(requestedSubagentType)) {
+				return json(
+					{ error: 'Subagent type must be n8n Workflow, API, or CLI.', code: 'subagent_type_invalid' },
+					{ status: 400 }
+				)
+			}
+		}
 		const nextType = normalizeSubagentType(existing, updates.subagentType)
+		if (isN8nSubnodeSubagentType(nextType)) {
+			return json(
+				{
+					error: 'n8n Subnode Subagents were removed from Batshit.',
+					code: 'subagent_type_retired'
+				},
+				{ status: 400 }
+			)
+		}
 		const webhookUrl =
 			typeof updates.webhook_url === 'string'
 				? updates.webhook_url.trim()
@@ -134,7 +166,24 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 			await syncManagedCliSubagentProfile(locals.user.id, storageUpdated)
 		}
 
-		return json({ subagent: resolveUploadUrlsForBrowserInPayload(storageUpdated) })
+		let compatibilityWarning: string | null = null
+		if (isWorkflowBackedSubagentType(storageUpdated.subagentType)) {
+			try {
+				await runTrackedN8nCompatibilitySync({
+					userId: locals.user.id,
+					trigger: 'workflow-subagent-save'
+				})
+			} catch (error) {
+				compatibilityWarning =
+					error instanceof Error ? error.message : 'Failed to sync n8n parameter support'
+				console.warn('[subagents] updated workflow subagent but parameter sync failed', error)
+			}
+		}
+
+		return json({
+			subagent: resolveUploadUrlsForBrowserInPayload(storageUpdated),
+			compatibilityWarning
+		})
 	} catch (error) {
 		console.error('Failed to update subagent:', error)
 		return json(

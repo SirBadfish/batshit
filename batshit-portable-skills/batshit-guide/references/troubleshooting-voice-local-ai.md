@@ -159,7 +159,7 @@ Many local models don't support tool calling well. Prove plain text chat works f
 
 ## Local AI works in n8n but not Batshit
 
-n8n and Batshit may be calling different URLs or using different model/provider nodes. For `n8n` Primary Agents, configure the local provider inside n8n. For `API` Primary Agents, configure Settings → Local AI and a Batshit model preset. These are separate setup paths.
+n8n and Batshit may be calling different URLs or using different model/provider nodes. For n8n Workflow Subagents, configure the local provider inside n8n. For `API` Primary Agents, configure Settings → Local AI and a Batshit model preset. These are separate setup paths.
 
 ## Backup restore didn't restore voice or Local AI runtime
 
