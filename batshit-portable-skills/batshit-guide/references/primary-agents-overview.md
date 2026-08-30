@@ -2,7 +2,7 @@
 
 A Primary Agent is the AI you chat with directly in Batshit. It owns the conversation turn, decides when to answer or use tools, and can call Subagents you've assigned to it.
 
-Batshit has two Primary Agent types:
+Batshit has two Primary Agent types: `API` and `CLI`.
 
 | Type | What it means | Best when you want | Usually requires |
 | --- | --- | --- | --- |

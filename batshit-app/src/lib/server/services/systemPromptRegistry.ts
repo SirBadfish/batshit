@@ -64,7 +64,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for API-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_api_system_prompt.md',
-    defaultVersion: '2026-08-13'
+    defaultVersion: '2026-08-30'
   },
   {
     id: 'cli_primary',
@@ -73,7 +73,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for CLI-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_cli_system_prompt.md',
-    defaultVersion: '2026-07-14'
+    defaultVersion: '2026-08-30'
   },
   {
     id: 'subagent_base',

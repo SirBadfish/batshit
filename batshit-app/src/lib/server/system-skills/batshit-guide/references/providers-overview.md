@@ -49,5 +49,5 @@ The install cards and login steps are covered in the install guides: [Install Ma
 ## Related
 
 - [Local AI](../local-ai/overview.md) — run models on your own machine or network.
-- [Primary Agents](../primary-agents/overview.md) — how `API`, `n8n`, and `CLI` agents use these providers.
+- [Primary Agents](../primary-agents/overview.md) — how `API` and `CLI` agents use these providers, and how n8n Workflow Subagents keep their provider setup inside n8n.
 - [Connect n8n](../primary-agents/connect-n8n.md) — provider credentials for `n8n` agents live inside n8n, not Batshit's API Keys.

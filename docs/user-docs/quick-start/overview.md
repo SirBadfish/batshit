@@ -34,10 +34,9 @@ That's it. You now have a working Batshit chat.
 
 Batshit has two Primary Agent types—`API` and `CLI`—and they're peer choices, not quality tiers. For a first message, `API` is the shortest route because Batshit talks straight to a model provider or Local AI runtime. It does not need a CLI installed and logged in; n8n can be added later as a tool and Workflow Subagent platform.
 
-You can add the other types later when you want them:
+You can add the other Primary type later when you want a managed Codex or Claude Code agent inside Batshit: `CLI`.
 
-- `n8n` when you want the main agent to run inside an n8n workflow — see [Connect n8n](../primary-agents/connect-n8n.md).
-- `CLI` when you want a managed Codex or Claude Code agent inside Batshit.
+When you want n8n automation, [connect n8n](../primary-agents/connect-n8n.md) as a workflow-tool and Workflow Subagent platform. n8n is not a Primary Agent type.
 
 The full picture lives in [Primary Agents](../primary-agents/overview.md).
 

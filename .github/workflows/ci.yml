@@ -255,6 +255,8 @@ jobs:
             exit 1
           fi
           echo "Branding clean."
+      - name: Primary Agent documentation contract
+        run: node tools/validate-primary-agent-docs.mjs
       - name: Svelte $derived(fn) bug-pattern gate (zero tolerance)
         run: |
           if rg -n --pcre2 '\$derived\(\s*(async\s*)?\(\)?[a-zA-Z0-9_,\s]*\)?\s*=>' batshit-app/src -g '*.svelte' -g '*.svelte.ts' -g '*.ts' | rg -v '\$derived\.by'; then
