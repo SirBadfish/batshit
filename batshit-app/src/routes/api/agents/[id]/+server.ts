@@ -13,7 +13,6 @@ import {
 } from '$lib/utils/primaryAgentType'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
-import { presentAgentForRuntime } from '$lib/server/services/agentRuntimePresentation'
 import { resolveUploadUrlsForBrowserInPayload } from '$lib/server/services/batshitServerUrls'
 import { isGoonRuntimeReady } from '$lib/goons/recipe/recipeProductLifecycle'
 
@@ -37,10 +36,10 @@ export const GET: RequestHandler = async ({ params, locals }) => {
     if (hasLegacyPrimaryAgentFields(agent as Record<string, any>)) {
       const canonicalAgent = canonicalizePrimaryAgentRecord(agent as Record<string, any>)
       await redis.updateAgent(params.id!, canonicalAgent)
-      return json(resolveUploadUrlsForBrowserInPayload(presentAgentForRuntime(canonicalAgent)))
+      return json(resolveUploadUrlsForBrowserInPayload(canonicalAgent))
     }
     
-    return json(resolveUploadUrlsForBrowserInPayload(presentAgentForRuntime(agent as Record<string, any>)))
+    return json(resolveUploadUrlsForBrowserInPayload(agent as Record<string, any>))
   } catch (error) {
     console.error('Error getting agent:', error)
     return json({ error: 'Failed to get agent' }, { status: 500 })

@@ -47,6 +47,9 @@ export function normalizeSubagentType(
     return rawType
   }
 
+  // SA-106: the legacy bare `'n8n'` alias still maps to the RETIRED subnode type so a
+  // stored record stays recognisable and can be surfaced for deletion (DL-106-04). It is
+  // deliberately not remapped to a live type.
   if (normalizedExplicit === 'n8n' || rawType === 'n8n') {
     return 'n8n-subnode'
   }
@@ -60,7 +63,11 @@ export function normalizeSubagentType(
     return 'n8n-workflow'
   }
 
-  return hasWorkflowTarget(subagent) ? 'n8n-workflow' : 'n8n-subnode'
+  // SA-106 DL-106-02: a record carrying a workflow target is a Category 2
+  // `n8n-workflow` subagent and keeps that resolution untouched. Everything else used to
+  // fall through to the retired subnode type; an unrecognised record now resolves to a
+  // LIVE type instead.
+  return hasWorkflowTarget(subagent) ? 'n8n-workflow' : 'api'
 }
 
 export function isApiSubagentType(value: unknown): value is 'api' {
@@ -96,8 +103,10 @@ export function getCompatibleSubagentTypesForPrimaryAgent(
       return ['n8n-workflow', 'api', 'cli']
     case 'cli':
       return ['n8n-workflow', 'api', 'cli']
+    // SA-106: explicit rather than a `default:` catch-all. A retired n8n primary can only
+    // ever have paired with subnode subagents, and saying so honestly beats silently
+    // handing that list to an unrecognised type.
     case 'n8n':
-    default:
       return ['n8n-subnode']
   }
 }

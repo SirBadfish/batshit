@@ -61,4 +61,33 @@ describe('subagentType utilities', () => {
     expect(record.subagentType).toBe('n8n-workflow')
     expect('subagent_type' in record).toBe(false)
   })
+  // SA-106 DL-106-02: only the retired half of the terminal default changed. The
+  // Category 2 halves (`n8n-workflow` via workflow target, and the legacy
+  // batshit/mcp_agent mapping) must stay exactly as they were — a literal edit at the
+  // wrong line here would delete a live Category 2 path.
+  describe('SA-106 retirement (DL-106-02)', () => {
+    it('resolves an unrecognised subagent record to a LIVE type', () => {
+      expect(normalizeSubagentType({})).toBe('api')
+      expect(normalizeSubagentType(null)).toBe('api')
+      expect(normalizeSubagentType(undefined, 'not-a-type')).toBe('api')
+    })
+
+    it('KEEPS the Category 2 workflow-target resolution untouched', () => {
+      expect(
+        normalizeSubagentType({ webhook_url: 'http://localhost:5678/webhook/sub' })
+      ).toBe('n8n-workflow')
+      expect(normalizeSubagentType({ workflow_name: 'Some Workflow' })).toBe(
+        'n8n-workflow'
+      )
+      expect(normalizeSubagentType(undefined, 'batshit')).toBe('n8n-workflow')
+      expect(normalizeSubagentType(undefined, 'mcp_agent')).toBe('n8n-workflow')
+    })
+
+    it('KEEPS the legacy bare n8n alias pointing at the retired subnode type', () => {
+      // A stored record must stay recognisable so it can be surfaced for deletion
+      // (DL-106-04) rather than silently becoming a live subagent.
+      expect(normalizeSubagentType(undefined, 'n8n')).toBe('n8n-subnode')
+      expect(normalizeSubagentType({ subagentType: 'n8n' })).toBe('n8n-subnode')
+    })
+  })
 })

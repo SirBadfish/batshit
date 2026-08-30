@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   canonicalizePrimaryAgentRecord,
+  getPrimaryAgentDisplayLabel,
+  getPrimaryAgentSystemPromptRedisKey,
   normalizePrimaryAgentType,
 } from './primaryAgentType'
 
@@ -66,5 +68,61 @@ describe('primaryAgentType utilities', () => {
     expect('batshitMode' in record).toBe(false)
     expect('n8nImplementation' in record).toBe(false)
     expect('mode' in record).toBe(false)
+  })
+  // SA-106 DL-106-02: the retirement flip. These are the highest-risk lines in the
+  // story — before SA-106 every one of these cases silently resolved to the dead lane.
+  describe('SA-106 retirement (DL-106-02)', () => {
+    it('resolves an unrecognised record to a LIVE type, never to the retired lane', () => {
+      expect(normalizePrimaryAgentType({})).toBe('api')
+      expect(normalizePrimaryAgentType(null)).toBe('api')
+      expect(normalizePrimaryAgentType(undefined)).toBe('api')
+      expect(normalizePrimaryAgentType({ agentType: 'something-unknown' })).toBe('api')
+      expect(normalizePrimaryAgentType(undefined, 'not-a-type')).toBe('api')
+    })
+
+    it('still resolves an unrecognised record with CLI hints to cli', () => {
+      expect(
+        normalizePrimaryAgentType({ primary_model_provider: 'codex' })
+      ).toBe('cli')
+    })
+
+    it('KEEPS resolving a genuine n8n record to the retired marker so the send guard fires', () => {
+      expect(normalizePrimaryAgentType({ agentType: 'n8n' })).toBe('n8n')
+      expect(normalizePrimaryAgentType(undefined, 'n8n')).toBe('n8n')
+      expect(normalizePrimaryAgentType({ mode: 'n8n-native' })).toBe('n8n')
+      expect(normalizePrimaryAgentType({ mode: 'batshit-enhanced' })).toBe('n8n')
+    })
+
+    it('does not let the getAgents canonicalize-on-read write-back convert a retired record', () => {
+      // lib/server/redis.ts getAgents() json.set()s the canonicalized record back
+      // whenever hasLegacyPrimaryAgentFields is true. A retired record must survive
+      // that round trip as 'n8n' so DL-106-03's delete-not-convert posture holds.
+      const record = canonicalizePrimaryAgentRecord({
+        agentType: 'n8n',
+        mode: 'n8n-native',
+        webhook_url: 'http://localhost:5678/webhook/batshit_n8n_primary',
+      })
+      expect(record.agentType).toBe('n8n')
+    })
+
+    it('labels a retired record honestly and never paints an unknown record as n8n', () => {
+      expect(getPrimaryAgentDisplayLabel('n8n')).toBe('n8n (retired)')
+      expect(getPrimaryAgentDisplayLabel('api')).toBe('API')
+      expect(getPrimaryAgentDisplayLabel('cli')).toBe('CLI')
+      expect(getPrimaryAgentDisplayLabel('mystery')).toBe('API')
+      expect(getPrimaryAgentDisplayLabel(undefined)).toBe('API')
+    })
+
+    it('never hands the retired base system prompt to a live type', () => {
+      expect(getPrimaryAgentSystemPromptRedisKey('api')).toBe(
+        'batshit:batshit_mode3_system_prompt'
+      )
+      expect(getPrimaryAgentSystemPromptRedisKey('cli')).toBe(
+        'batshit:batshit_mode4_system_prompt'
+      )
+      expect(getPrimaryAgentSystemPromptRedisKey('n8n')).toBe(
+        'batshit:n8n_mode2_system_prompt'
+      )
+    })
   })
 })

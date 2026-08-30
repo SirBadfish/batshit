@@ -1,3 +1,10 @@
+/**
+ * SA-106: `n8n` is RETIRED as a primary-agent type. It stays in this union only because
+ * stored records can still carry the string and every runtime that meets one must be able
+ * to recognise it and fail loudly (DL-106-03) — never silently treat it as a live type.
+ * `api` and `cli` are the only types Batshit creates, selects, or sends with.
+ * P4 narrows the union itself; until then, treat `'n8n'` as a retirement marker.
+ */
 export type PrimaryAgentType = 'n8n' | 'api' | 'cli'
 
 type PrimaryModelConnectionLike =
@@ -79,7 +86,11 @@ export function normalizePrimaryAgentType(
     return 'cli'
   }
 
-  return 'n8n'
+  // SA-106 DL-106-02: an unrecognised record must resolve to a LIVE type, never to the
+  // retired lane. Records that genuinely name n8n (explicitly, or through the legacy
+  // `n8n-native` / `batshit-enhanced` modes above) still return `'n8n'` so the send guard
+  // can reject them loudly; only this catch-all changed.
+  return 'api'
 }
 
 export function isN8nPrimaryAgentType(value: unknown): value is 'n8n' {
@@ -114,10 +125,15 @@ export function primaryAgentAllowsAgentBrowser(value: unknown): boolean {
   return type === 'n8n' || type === 'api'
 }
 
-export function getPrimaryAgentDisplayLabel(value: unknown): 'n8n' | 'API' | 'CLI' {
-  if (isApiPrimaryAgentType(value)) return 'API'
+export function getPrimaryAgentDisplayLabel(
+  value: unknown
+): 'n8n (retired)' | 'API' | 'CLI' {
   if (isCliPrimaryAgentType(value)) return 'CLI'
-  return 'n8n'
+  // SA-106: only a record that actually names the retired type gets the retired label.
+  // Everything else — including malformed records — reads as API, matching what
+  // `normalizePrimaryAgentType` resolves it to.
+  if (isN8nPrimaryAgentType(value)) return 'n8n (retired)'
+  return 'API'
 }
 
 export function getPrimaryAgentSystemPromptRedisKey(type: PrimaryAgentType): string {
@@ -126,8 +142,10 @@ export function getPrimaryAgentSystemPromptRedisKey(type: PrimaryAgentType): str
       return 'batshit:batshit_mode3_system_prompt'
     case 'cli':
       return 'batshit:batshit_mode4_system_prompt'
+    // SA-106: explicit rather than a `default:` catch-all. The old shape silently handed
+    // the retired n8n base prompt to any unrecognised type — the most dangerous of the
+    // five silent n8n defaults this file used to carry.
     case 'n8n':
-    default:
       return 'batshit:n8n_mode2_system_prompt'
   }
 }
@@ -139,7 +157,6 @@ export function getPrimaryAgentSystemPromptLabel(type: PrimaryAgentType): string
     case 'cli':
       return 'CLI PRIMARY SYSTEM PROMPT'
     case 'n8n':
-    default:
       return 'N8N PRIMARY SYSTEM PROMPT'
   }
 }

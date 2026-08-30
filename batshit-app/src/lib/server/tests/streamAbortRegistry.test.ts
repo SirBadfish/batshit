@@ -2,13 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   abortStream,
-  clearN8nPrimaryRun,
   clearSessionTurn,
   clearStreamAbort,
-  getActiveN8nPrimaryRun,
   getActiveSessionTurn,
   getActiveStream,
-  registerN8nPrimaryRun,
   registerSessionTurn,
   registerStreamAbort
 } from '../services/streamAbortRegistry'
@@ -20,8 +17,6 @@ describe('streamAbortRegistry', () => {
     clearSessionTurn('session-2')
     clearStreamAbort('session-1')
     clearStreamAbort('session-2')
-    clearN8nPrimaryRun('user-1')
-    clearN8nPrimaryRun('user-2')
   })
 
   it('allows only one active session turn per session', () => {
@@ -104,44 +99,4 @@ describe('streamAbortRegistry', () => {
     expect(getActiveSessionTurn('session-2')?.kind).toBe('single')
   })
 
-  it('blocks only a second n8n primary run for the same user', () => {
-    const first = registerN8nPrimaryRun({
-      userId: 'user-1',
-      sessionId: 'session-1',
-      messageId: 'msg-1',
-      agentId: 'agent-1'
-    })
-    const duplicate = registerN8nPrimaryRun({
-      userId: 'user-1',
-      sessionId: 'session-2',
-      messageId: 'msg-2',
-      agentId: 'agent-2'
-    })
-    const otherUser = registerN8nPrimaryRun({
-      userId: 'user-2',
-      sessionId: 'session-3',
-      messageId: 'msg-3',
-      agentId: 'agent-3'
-    })
-
-    expect(first.ok).toBe(true)
-    expect(duplicate.ok).toBe(false)
-    if (!duplicate.ok) {
-      expect(duplicate.existing.sessionId).toBe('session-1')
-    }
-    expect(otherUser.ok).toBe(true)
-    expect(getActiveN8nPrimaryRun('user-1')?.sessionId).toBe('session-1')
-
-    clearN8nPrimaryRun('user-1', 'session-1')
-
-    const retry = registerN8nPrimaryRun({
-      userId: 'user-1',
-      sessionId: 'session-2',
-      messageId: 'msg-2',
-      agentId: 'agent-2'
-    })
-
-    expect(retry.ok).toBe(true)
-    expect(getActiveN8nPrimaryRun('user-1')?.sessionId).toBe('session-2')
-  })
 })

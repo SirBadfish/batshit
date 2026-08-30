@@ -183,7 +183,11 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
         '- /artifact-creator | skill | skillId=artifact_creator — Build artifacts'
       )
       expect(compiled.systemPrompt).toContain('==== SUBAGENT RUNTIME CONTEXT ====')
-      expect(compiled.systemPrompt).toContain('type: n8n-subnode (n8n Subnode Subagent)')
+      // SA-106 DL-106-02: this fixture carries no subagentType and no workflow target.
+      // It used to fall through the silent default to the retired `n8n-subnode` type;
+      // it now resolves to a LIVE type, which is also the correct one here — this is
+      // `compileManagedSubagentSystemPrompt`, the API/CLI managed subagent lane.
+      expect(compiled.systemPrompt).toContain('type: api (API Subagent)')
     })
   })
 

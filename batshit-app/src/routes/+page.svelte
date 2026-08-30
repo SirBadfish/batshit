@@ -28,7 +28,7 @@
   import * as groupStore from '$lib/stores/groups.svelte'
   import { foldersStore } from '$lib/stores/folders.svelte'
   import { generateSessionId } from '$lib/utils/sessionId'
-  import { ApiService, api } from '$lib/services/api'
+  import { api } from '$lib/services/api'
   import { SSEService } from '$lib/services/sse'
   import {
     parseParameterError,
@@ -141,7 +141,6 @@
     isManagedPrimaryAgentType,
     isN8nPrimaryAgentType,
     normalizePrimaryAgentType,
-    requiresWebhookUrlForPrimaryAgent,
     shouldShowReasoningByDefaultForPrimaryAgent
   } from '$lib/utils/primaryAgentType'
   import { setUserSettings, getUserSettings } from '$lib/stores/userSettings.svelte'
@@ -176,10 +175,6 @@
     shouldRetryInterruptedSendAfterSessionTurnInProgress,
     shouldBlockSendWhileInFlight
   } from '$lib/utils/sendInFlightGuards'
-  import {
-    evaluateN8nPrimaryExclusivity,
-    N8N_PRIMARY_EXCLUSIVE_MESSAGE
-  } from '$lib/utils/n8nPrimaryExclusivity'
   import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity'
   import { dispatchVoiceEnginesUpdated } from '$lib/utils/voiceEngineEvents'
   import { extractToolNotes, extractZipControl, resolveZipControlZipIds, stripZipControlBlocks } from '$lib/utils/zipControl'
@@ -192,7 +187,6 @@
     resolveEffectiveMemoryWindow,
     resolveMemoryWindowSettings
   } from '$lib/utils/memoryControl'
-  import { consumePendingMemoryInserted } from '$lib/services/messageApi'
   import { stripLeadingSubagentZipEcho } from '$lib/utils/subagentEchoSanitizer'
   import { RealtimeSpeechCoordinator } from '$lib/services/realtimeSpeechCoordinator'
   import { resolveSseEventSessionId } from '$lib/utils/sseSessionGuard'
@@ -440,7 +434,6 @@
 
 	  let realtimeSpeechSessionScopeId = sessionStore.getCurrentSessionId()
 
-	  let apiService: ApiService | null = null
 	  const sseServices = new Map<string, SSEService>()
 	  const sseDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
 	  const missingSessionIds = new Set<string>()
@@ -1290,32 +1283,6 @@ const immersiveActive = $derived.by(
     return true
   }
 
-	  async function finalizeN8nWebhookWithoutTerminalEvent(messageId: string | null) {
-	    if (!messageId || !isMessageActive(messageId)) {
-	      return
-	    }
-
-    await waitForStreamCompletion(messageId, 1500)
-    await tick()
-
-	    if (!isMessageActive(messageId)) {
-	      return
-	    }
-
-    const message =
-      'n8n finished the webhook call, but Batshit did not receive a final native streaming event. Check that the workflow Webhook response mode is Streaming and that the native AI Agent node has streaming enabled.'
-    const finalized = await finalizeActiveAssistantMessageAsError(messageId, message, {
-      n8n_callback_missing: true,
-      runtimeId: 'n8n'
-    })
-
-    if (finalized) {
-      toast.error('n8n response did not reach Batshit', {
-        description: 'The workflow completed, but the final native stream event did not reach Batshit.'
-      })
-    }
-  }
-
   async function finalizeActiveAssistantMessageAsInterrupted(messageId: string | null) {
     if (!messageId) return false
 
@@ -1493,7 +1460,7 @@ const immersiveActive = $derived.by(
     syncActiveToolProcessingState()
   }
 
-	  // Abort controller for cancelling the selected session's managed API/CLI or native n8n send.
+	  // Abort controller for cancelling the selected session's managed API/CLI send.
 	  const currentAbortController = $derived(currentRunState.abortController ?? null)
 	  const chatWorkBusy = $derived(chatRunRegistry.isSessionBusy(currentSessionId))
 	  const sendInFlightBySession = new Map<string, boolean>()
@@ -1921,12 +1888,6 @@ const immersiveActive = $derived.by(
         if (lastAgent) {
           agentStore.setCurrentAgent(lastAgentId)
         }
-      }
-
-      // Initialize services
-      const agent = agentStore.getCurrentAgent()
-      if (agent && data.user) {
-        apiService = new ApiService(agent.webhook_url || '')
       }
 
       // Load projects
@@ -3580,14 +3541,6 @@ const immersiveActive = $derived.by(
         }
       }
 
-      // SA-104 P5: native n8n "memory inserted" stamp — the accepted-send commit
-      // result stashed by messageApi rides the finalized assistant message
-      // (managed lanes stamp the same shape server-side in send-routed).
-      const pendingMemoryInserted = consumePendingMemoryInserted(targetMessageId)
-      if (pendingMemoryInserted) {
-        metadata.memoryInserted = pendingMemoryInserted
-      }
-
       if (Array.isArray(data.metadata?.imageZipIds)) {
         metadata.imageZipIds = data.metadata.imageZipIds
       }
@@ -4413,50 +4366,6 @@ const immersiveActive = $derived.by(
 	    }
 	  }
 
-		  async function registerN8nPrimaryRunForSend(params: {
-		    sessionId: string
-		    agentId: string
-		    messageId?: string | null
-	  }) {
-	    const response = await fetch('/api/messages/n8n-primary-run', {
-	      method: 'POST',
-	      headers: { 'Content-Type': 'application/json' },
-	      body: JSON.stringify({
-	        action: 'register',
-	        sessionId: params.sessionId,
-	        agentId: params.agentId,
-	        messageId: params.messageId ?? null
-	      })
-	    })
-	    const payload = await response.json().catch(() => ({}))
-	    if (!response.ok) {
-	      const error = new Error(payload?.error || 'Failed to reserve n8n Primary Agent run') as Error & {
-	        code?: string
-	        details?: string
-	        status?: number
-	      }
-	      error.code = typeof payload?.code === 'string' ? payload.code : undefined
-	      error.details = typeof payload?.details === 'string' ? payload.details : undefined
-	      error.status = response.status
-	      throw error
-	    }
-		  }
-
-		  async function clearN8nPrimaryRunForSend(sessionId: string) {
-		    try {
-		      await fetch('/api/messages/n8n-primary-run', {
-	        method: 'POST',
-	        headers: { 'Content-Type': 'application/json' },
-	        body: JSON.stringify({
-	          action: 'clear',
-	          sessionId
-	        })
-	      })
-	    } catch (error) {
-	      console.warn('[handleSendMessage] Failed to clear n8n Primary Agent run lock', error)
-	    }
-	  }
-
 		  async function handleSendMessage(content: string, metadata: any = {}) {
 		    const goonPresentationMode: DesktopGoonPresentationMode | null = goonDcmPresentationMode
 		    metadata = {
@@ -4493,8 +4402,6 @@ const immersiveActive = $derived.by(
 	    setSendInFlight(sendSessionId, true)
 	    const sendRunId = nextSendSerial(sendSessionId)
 	    let managedAssistantMessageId: string | null = null
-	    let n8nPrimaryRunLocked = false
-	    let n8nPrimaryRunSessionId: string | null = null
 
 	    try {
       if (!content.trim()) return false
@@ -4568,19 +4475,7 @@ const immersiveActive = $derived.by(
       }
 
 	    const agentType = normalizePrimaryAgentType(currentAgentForSend)
-	    const webhookRequired = requiresWebhookUrlForPrimaryAgent(agentType)
 	    const activeRunsBeforeSend = chatRunRegistry.getActiveRunStates()
-	    const n8nExclusivity = evaluateN8nPrimaryExclusivity({
-	      activeRuns: activeRunsBeforeSend,
-	      currentSessionId,
-	      transport: agentType
-	    })
-	    if (!n8nExclusivity.allowed) {
-	      toast.info(n8nExclusivity.title, {
-	        description: n8nExclusivity.description
-	      })
-	      return false
-	    }
 
 	    const activeChatCapacity = evaluateActiveChatCapacity({
 	      activeRuns: activeRunsBeforeSend,
@@ -4745,11 +4640,6 @@ const immersiveActive = $derived.by(
       }
     }
 
-	    if (webhookRequired && !currentAgentForSend.webhook_url) {
-	      toast.error('Selected agent has no webhook URL')
-	      return false
-	    }
-
 	    const pendingZipControl = currentSessionId ? zipControlPendingBySession.get(currentSessionId) : null
 	    if (pendingZipControl) {
 	      try {
@@ -4759,37 +4649,8 @@ const immersiveActive = $derived.by(
 	      }
 	    }
 
-	    // Get webhook URL, applying test mode transformation if needed
-    let webhookUrl = currentAgentForSend.webhook_url || ''
-    if (testMode) {
-      // Transform /webhook/Batshit to /webhook-test/batshit
-      webhookUrl = webhookUrl.replace('/webhook/', '/webhook-test/')
-    }
-
-    // Initialize API service for the n8n Primary send path.
-    const apiService = new ApiService(webhookUrl)
-
 	    // Generate standardized message ID (Story 6.9b)
 	    let userId = await generateClientMessageId(currentSessionId, 'msg_user_client')
-
-	    if (isN8nPrimaryAgentType(agentType)) {
-	      try {
-	        await registerN8nPrimaryRunForSend({
-	          sessionId: currentSessionId,
-	          agentId: currentAgentForSend.id,
-	          messageId: userId
-	        })
-	        n8nPrimaryRunLocked = true
-	        n8nPrimaryRunSessionId = currentSessionId
-	      } catch (error) {
-	        const details =
-	          typeof (error as any)?.details === 'string' && (error as any).details.trim()
-	            ? (error as any).details.trim()
-	            : N8N_PRIMARY_EXCLUSIVE_MESSAGE
-	        toast.info('An n8n agent is already running', { description: details })
-	        return false
-	      }
-	    }
 
 	    // Create user message with agent_id for consistency
     const userMessage = {
@@ -4868,7 +4729,7 @@ const immersiveActive = $derived.by(
     }))
 
     try {
-      logger.debug('[handleSendMessage] Sending to n8n with session ID:', currentSessionId)
+      logger.debug('[handleSendMessage] Sending with session ID:', currentSessionId)
 
 	      // Set waiting state
 	      isWaitingForResponse = true
@@ -4880,9 +4741,11 @@ const immersiveActive = $derived.by(
 
       const agentWithOverride = currentAgentForSend
 
-      const shouldUseRouter = isManagedPrimaryAgentType(agentType);
-
-      if (shouldUseRouter) {
+      // SA-106: `api` and `cli` are the only primary-agent types, and both use the
+      // managed send-routed lane. A stored agent still carrying the retired `n8n`
+      // type comes through here too and is rejected loudly by send-routed's
+      // retirement guard — the browser no longer owns a second send path.
+      {
         const groupChatSendId = getGroupChatIdForSession(currentSessionId)
         managedAssistantMessageId = groupChatSendId
           ? null
@@ -4943,7 +4806,6 @@ const immersiveActive = $derived.by(
               }))
             })(),
             agentType,
-            webhookUrl,
             metadata: requestMetadata
           }
           const routedSend = await postSendRoutedWithInterruptRetry({
@@ -4988,54 +4850,6 @@ const immersiveActive = $derived.by(
 	            isWaitingForResponse = false
 	          }
         }
-      } else {
-        // n8n agents still use the webhook route.
-        const webhookMetadata = {
-          ...metadata,
-        }
-	        const abortController = new AbortController()
-	        chatRunRegistry.startRun({
-	          sessionId: currentSessionId,
-	          transport: agentType,
-	          activeMessageId: null,
-	          abortController
-	        })
-
-        try {
-          const n8nResult = await apiService.sendMessage(
-            content,
-            currentSessionId,
-            data.user?.id || 'anonymous',
-	            getMessagesForSend(currentSessionId, sendManualTrimProtections),
-            agentWithOverride.id,
-            100000,  // maxTokens (default)
-            agentWithOverride,  // Pass the agent with override applied
-            webhookMetadata,
-            abortController.signal
-          )
-          const activeN8nState = chatRunRegistry.getRunState(currentSessionId)
-          const n8nResultMessageId =
-            typeof n8nResult?.message_id === 'string' && n8nResult.message_id.trim()
-              ? n8nResult.message_id.trim()
-              : activeN8nState.activeMessageId ?? activeN8nState.activeStreamMessageIds[0] ?? null
-          await finalizeN8nWebhookWithoutTerminalEvent(
-            n8nResultMessageId
-          )
-        } catch (error: any) {
-          if (error?.name === 'AbortError') {
-            logger.debug('[handleSendMessage] n8n webhook request aborted by user')
-            return true
-          }
-          throw error
-        } finally {
-	          if (chatRunRegistry.getRunState(currentSessionId).abortController === abortController) {
-	            chatRunRegistry.setAbortController(currentSessionId, null)
-	          }
-	          const n8nRunState = chatRunRegistry.getRunState(currentSessionId)
-	          if (n8nRunState.activeStreamMessageIds.length === 0) {
-	            chatRunRegistry.markComplete(currentSessionId)
-	          }
-        }
       }
       return true
 	    } catch (error) {
@@ -5045,12 +4859,10 @@ const immersiveActive = $derived.by(
 	        typeof (error as any)?.details === 'string' ? String((error as any).details).trim() : ''
 	      const errorCode =
 	        typeof (error as any)?.code === 'string' ? String((error as any).code).trim() : ''
-	      const isN8nUnavailable = errorCode === 'N8N_UNAVAILABLE'
 	      const isImageDataUrlContextError =
 	        errorCode === 'IMAGE_DATA_URL_IN_TEXT' ||
 	        /Image data URLs are not allowed in text context/i.test(message)
 		      const isSessionTurnInProgress = errorCode === 'session_turn_in_progress'
-		      const isN8nPrimaryInProgress = errorCode === 'n8n_primary_in_progress'
 
 		      if (isSessionTurnInProgress) {
 	        toast.info('Response already in progress', {
@@ -5070,41 +4882,6 @@ const immersiveActive = $derived.by(
 	        }
 		        return false
 		      }
-
-		      if (isN8nPrimaryInProgress) {
-		        toast.info('An n8n agent is already running', {
-		          description:
-		            details ||
-		            N8N_PRIMARY_EXCLUSIVE_MESSAGE
-		        })
-		        markAssistantWaitingPlaceholderError(
-		          managedAssistantMessageId,
-		          details || 'An n8n Primary Agent is already running in another chat.'
-		        )
-		        isWaitingForResponse = false
-		        if (isSessionCreating(currentSessionId)) {
-		          clearCreatingSession(currentSessionId)
-		        }
-		        return false
-		      }
-
-		      if (isN8nUnavailable) {
-	        toast.error('n8n is not running or connected', {
-	          description:
-	            details ||
-	            'Start n8n, make sure the n8n Primary Agent workflow is active, then try again.'
-	        })
-	        markAssistantWaitingPlaceholderError(
-	          managedAssistantMessageId,
-	          details || message || 'n8n is not running or connected.'
-	        )
-	        isWaitingForResponse = false
-	        if (isSessionCreating(currentSessionId)) {
-	          logger.debug('[handleSendMessage] Clearing creating-session flag due to n8n unavailable error')
-	          clearCreatingSession(currentSessionId)
-	        }
-	        return false
-	      }
 
 	      if (isImageDataUrlContextError) {
 	        toast.error('Inline image detected', {
@@ -5174,71 +4951,10 @@ const immersiveActive = $derived.by(
 	      return false
 	    }
 	    } finally {
-	      if (n8nPrimaryRunLocked && n8nPrimaryRunSessionId) {
-	        await clearN8nPrimaryRunForSend(n8nPrimaryRunSessionId)
-	        n8nPrimaryRunLocked = false
-	        n8nPrimaryRunSessionId = null
-	      }
 	      if (isLatestSendSerial(sendSessionId, sendRunId)) {
 	        setSendInFlight(sendSessionId, false)
 	      }
 	    }
-  }
-
-  async function cancelRunningN8nExecution(sessionId: string, messageId: string) {
-    const currentAgent = agentStore.getCurrentAgent()
-    if (!currentAgent || !isN8nPrimaryAgentType(normalizePrimaryAgentType(currentAgent))) return
-
-    try {
-      const response = await fetch('/api/messages/n8n-cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          messageId,
-          webhookUrl: currentAgent.webhook_url ?? (currentAgent as any).webhookUrl ?? null
-        })
-      })
-      const payload = await response.json().catch(() => ({}))
-
-      if (!response.ok) {
-        throw new Error(payload?.error || 'Failed to stop n8n execution')
-      }
-
-      if (payload?.reason === 'n8n_api_not_configured') {
-        toast.warning('n8n execution was not stopped', {
-          description:
-            'Batshit stopped the visible response, but n8n API access is not configured, so the workflow may keep running.'
-        })
-        return
-      }
-
-      if (payload?.reason === 'matching_execution_stop_failed') {
-        toast.warning('n8n execution stop failed', {
-          description:
-            'Batshit found the matching n8n execution but n8n did not accept the stop request.'
-        })
-        return
-      }
-
-      if (payload?.reason === 'n8n_execution_stop_forbidden') {
-        toast.warning('n8n execution stop was denied', {
-          description:
-            'Batshit found the n8n execution, but the saved n8n API key does not have permission to stop executions.'
-        })
-        return
-      }
-
-      logger.debug('[handleStopStream] n8n cancellation result', payload)
-    } catch (error) {
-      console.error('[handleStopStream] Failed to stop n8n execution:', error)
-      toast.warning('n8n cancellation could not be confirmed', {
-        description:
-          error instanceof Error
-            ? error.message
-            : 'Batshit stopped the visible response, but could not confirm the n8n workflow stopped.'
-      })
-    }
   }
 
   // Stop the current stream
@@ -5253,10 +4969,6 @@ const immersiveActive = $derived.by(
 
 	    stopRealtimeSpeechPlayback(previousMessageId)
 	    chatRunRegistry.markStopping(sessionId)
-
-    if (previousMessageId) {
-      void cancelRunningN8nExecution(sessionId, previousMessageId)
-    }
 
     try {
       await fetch('/api/messages/interrupt', {

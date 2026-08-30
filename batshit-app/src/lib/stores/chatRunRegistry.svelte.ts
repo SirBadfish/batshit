@@ -257,14 +257,6 @@ export function isSessionBusy(sessionId?: string | null) {
   return normalized ? isRunActive(getRunState(normalized)) : false
 }
 
-export function hasActiveN8nPrimaryRun(exceptSessionId?: string | null) {
-  const except = normalizeSessionId(exceptSessionId)
-  return Object.values(runStateBySession).find((state) => {
-    if (except && state.sessionId === except) return false
-    return state.transport === 'n8n' && isRunActive(state)
-  }) ?? null
-}
-
 export function clearRunRegistryForTest() {
   if (typeof process !== 'undefined' && process.env.VITEST !== 'true') return
   runStateBySession = {}

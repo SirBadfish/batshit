@@ -7,7 +7,6 @@ import { getClaudeConfigOverrideValidationError } from '$lib/server/services/cla
 import { sanitizeId } from '$lib/utils/idSanitizer' // Story 6.9c
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
-import { presentAgentForRuntime } from '$lib/server/services/agentRuntimePresentation'
 
 // GET /api/agents - List all agents for the current user
 export const GET: RequestHandler = async ({ locals }) => {
@@ -16,9 +15,7 @@ export const GET: RequestHandler = async ({ locals }) => {
   }
   
   try {
-    const agents = (await redis.getAgents(locals.user.id)).map((agent) =>
-      presentAgentForRuntime(agent as Record<string, any>)
-    )
+    const agents = await redis.getAgents(locals.user.id)
     return json({ agents })
   } catch (error) {
     console.error('Error getting agents:', error)
