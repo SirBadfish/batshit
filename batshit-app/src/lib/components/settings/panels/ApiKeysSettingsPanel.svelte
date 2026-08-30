@@ -411,7 +411,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
   {
     id: 'deepinfra',
     label: 'DeepInfra',
-    description: 'DeepInfra hosted models (manual entry only for now).',
+    description: 'DeepInfra hosted chat models through the built-in model catalog.',
     scope: 'provider',
     connectionHint: 'Direct',
     iconRef: { kind: 'brand', slug: 'deepinfra-color' }

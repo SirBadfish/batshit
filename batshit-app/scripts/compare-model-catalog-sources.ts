@@ -252,6 +252,27 @@ async function fetchDeepSeekIds() {
   return fetchOpenAICompatibleIds(process.env.DEEPSEEK_API_BASE_URL || 'https://api.deepseek.com', key)
 }
 
+async function fetchDeepInfraIds() {
+  const payload = await fetchJson<Array<{
+    model_name?: string
+    reported_type?: string
+    deprecated?: number | null
+    replaced_by?: string | null
+    private?: number | null
+  }>>('https://api.deepinfra.com/models/list')
+
+  return normalize(
+    payload
+      .filter((model) =>
+        model?.reported_type === 'text-generation' &&
+        model.private !== 1 &&
+        model.deprecated == null &&
+        !model.replaced_by
+      )
+      .map((model) => String(model.model_name ?? ''))
+  )
+}
+
 async function fetchZaiIds() {
   const key = process.env.ZAI_API_KEY
   if (!key) return null
@@ -336,6 +357,7 @@ const COMPARISONS: ComparisonDefinition[] = [
   { provider: 'google', connectionId: 'direct:google', fetcher: fetchGoogleIds },
   { provider: 'groq', connectionId: 'direct:groq', fetcher: fetchGroqIds },
   { provider: 'deepseek', connectionId: 'direct:deepseek', fetcher: fetchDeepSeekIds },
+  { provider: 'deepinfra', connectionId: 'direct:deepinfra', fetcher: fetchDeepInfraIds },
   { provider: 'zai', connectionId: 'direct:zai', fetcher: fetchZaiIds },
   { provider: 'zai_coding', connectionId: 'direct:zai_coding', fetcher: fetchZaiCodingIds },
   { provider: 'mistral', connectionId: 'direct:mistral', fetcher: fetchMistralIds },

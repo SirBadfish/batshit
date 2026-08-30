@@ -20,6 +20,7 @@ vi.unmock('ai')
 vi.unmock('@ai-sdk/anthropic')
 vi.unmock('@ai-sdk/openai')
 vi.unmock('@ai-sdk/google')
+vi.unmock('@ai-sdk/deepinfra')
 vi.unmock('@openrouter/ai-sdk-provider')
 
 import {
@@ -45,6 +46,7 @@ import { z } from 'zod'
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { createGoogle } from '@ai-sdk/google'
 import { createOpenAI } from '@ai-sdk/openai'
+import { createDeepInfra } from '@ai-sdk/deepinfra'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { applyApiPromptCachePolicy } from '$lib/server/services/apiPromptCachePolicy'
 import { normalizeUsageLike } from '$lib/server/services/apiProviderUsage'
@@ -482,6 +484,37 @@ describe('AI SDK contract (real installed package)', () => {
     expect(openrouterBody.model).toBe('test/model')
     expect(JSON.stringify(openrouterBody.messages[0])).toContain('Stable system prompt.')
     expect(openrouterBody.messages[0].role).toBe('system')
+  })
+
+  it('pins DeepInfra to its OpenAI-compatible chat-completions route', async () => {
+    let capturedUrl = ''
+    let capturedBody: any = null
+    const deepInfra = createDeepInfra({
+      apiKey: 'test-key',
+      fetch: (async (url: any, init: any) => {
+        capturedUrl = String(url)
+        capturedBody = JSON.parse(init.body)
+        return new Response(JSON.stringify({ error: { message: 'wire captured' } }), {
+          status: 400,
+          headers: { 'content-type': 'application/json' }
+        })
+      }) as any
+    })
+
+    await expect(
+      generateText({
+        model: deepInfra('zai-org/GLM-5.3-Flash'),
+        allowSystemInMessages: true,
+        messages: [
+          { role: 'system', content: 'Stable system prompt.' },
+          { role: 'user', content: 'hello' }
+        ]
+      })
+    ).rejects.toThrow()
+
+    expect(capturedUrl).toBe('https://api.deepinfra.com/v1/openai/chat/completions')
+    expect(capturedBody.model).toBe('zai-org/GLM-5.3-Flash')
+    expect(capturedBody.messages[0]).toEqual({ role: 'system', content: 'Stable system prompt.' })
   })
 })
 

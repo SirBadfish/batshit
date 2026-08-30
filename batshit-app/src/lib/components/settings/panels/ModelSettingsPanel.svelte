@@ -464,7 +464,6 @@ const connectionProviderHints = new Map([
 const n8nOnlyConnections = new Set(['azure-openai', 'aws-bedrock', 'google-vertex', 'direct:huggingface'])
 const manualEntryConnections = new Set([
   'direct:huggingface',
-  'direct:deepinfra',
   'direct:togetherai',
   'direct:fireworks',
   'direct:baseten',
@@ -3436,7 +3435,7 @@ $effect(() => {
           <div class="batshit-settings-note is-dashed">
             <p>No catalog available yet. Choose a connection, then copy its provider defaults into the preset and enter the developer and model ID manually below.</p>
             <p class="mt-2">
-              Tip: For multi-tenant providers (Together.ai, Fireworks, DeepInfra, Baseten, Cerebras), use
+              Tip: For multi-tenant providers (Together.ai, Fireworks, Baseten, Cerebras), use
               <code>developer/model</code> so Batshit can route correctly. Custom providers can either use the toggle below
               or put <code>developer/model</code> directly in the Model ID field.
             </p>

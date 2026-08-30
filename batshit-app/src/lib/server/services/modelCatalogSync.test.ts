@@ -3,6 +3,8 @@ import {
   _buildSourceFallbackWarningForTest,
   _buildCatalogSyncDiffForTest,
   _getManualDirectModelsForTest,
+  _mapDeepInfraModelsForTest,
+  _mapDirectProviderEntriesForTest,
   _mapOpenRouterModelToCatalogEntryForTest,
   _mergeDirectProviderEntriesForTest,
   _mergeCatalogEntriesForTest,
@@ -238,5 +240,71 @@ describe('modelCatalogSync merge', () => {
 
     expect(merged.some((model) => model.id === 'glm-5.2')).toBe(true)
     expect(merged.find((model) => model.id === 'glm-4.7')?.displayName).toBe('GLM-4.7')
+  })
+
+  it('imports active DeepInfra chat models with exact namespaced IDs and normalized metadata', () => {
+    const directEntries = _mapDeepInfraModelsForTest([
+      {
+        model_name: 'zai-org/GLM-5.3-Flash',
+        reported_type: 'text-generation',
+        description: 'A long-context multimodal coding model.',
+        tags: ['openai', 'tools', 'multimodal', 'reasoning'],
+        pricing: {
+          cents_per_input_token: 0.000015,
+          cents_per_output_token: 0.00005,
+          rate_per_input_token_cached: 0.2
+        },
+        max_tokens: 1_048_576,
+        replaced_by: null,
+        deprecated: null,
+        private: 0
+      },
+      {
+        model_name: 'old-owner/Old-Model',
+        reported_type: 'text-generation',
+        deprecated: 1,
+        private: 0
+      },
+      {
+        model_name: 'sentence-transformers/embed-model',
+        reported_type: 'embeddings',
+        deprecated: null,
+        private: 0
+      }
+    ])
+
+    expect(directEntries).toHaveLength(1)
+    expect(directEntries[0]).toMatchObject({
+      id: 'zai-org/GLM-5.3-Flash',
+      displayName: 'GLM-5.3-Flash',
+      contextWindow: 1_048_576,
+      modelType: 'chat',
+      pricing: {
+        input: 0.15,
+        output: 0.5,
+        cachedInput: 0.03
+      }
+    })
+
+    const [catalogEntry] = _mapDirectProviderEntriesForTest('deepinfra', directEntries)
+    expect(catalogEntry).toMatchObject({
+      id: 'zai-org/GLM-5.3-Flash',
+      provider: 'zai-org',
+      upstreamProvider: 'deepinfra',
+      connectionId: 'direct:deepinfra',
+      purpose: 'chat',
+      pricing: {
+        input: 0.15,
+        output: 0.5,
+        cachedInput: 0.03
+      },
+      features: {
+        tools: true,
+        vision: true,
+        reasoning: true,
+        cacheControl: true,
+        longContext: true
+      }
+    })
   })
 })

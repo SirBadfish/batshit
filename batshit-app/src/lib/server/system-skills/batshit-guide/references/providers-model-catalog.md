@@ -41,6 +41,7 @@ A few honest notes:
 - New models show up and retired ones drop off as providers change their lists.
 - If a provider's list is briefly unreachable, Batshit keeps the last known set for that provider rather than wiping it, so a provider hiccup doesn't make your models vanish.
 - Catalog freshness isn't instant. A model a provider added minutes ago may not appear until the next refresh.
+- DeepInfra's active chat models come from its public model feed, so the shared catalog can stay current without putting your personal DeepInfra key in Batshit's Vercel project. Your saved key is still required locally when you actually send a message through DeepInfra.
 
 If a model you expect is missing, confirm the relevant provider key is saved and the connection shows Ready before assuming the catalog is broken.
 

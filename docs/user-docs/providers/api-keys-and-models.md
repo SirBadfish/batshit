@@ -60,6 +60,7 @@ Common provider and connection types include:
 - OpenRouter
 - Vercel AI Gateway
 - DeepSeek
+- DeepInfra
 - Z.ai, including the Z.ai Coding Plan endpoint for GLM coding models such as GLM-5.2
 - media, web-search, voice, and Agent Browser cloud providers where supported, including Fish Audio, Inworld, Cartesia, Async, and Microsoft Azure Speech
 

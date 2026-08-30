@@ -22,6 +22,7 @@ const GOOGLE_GEMINI_MODELS_ENDPOINT = 'https://generativelanguage.googleapis.com
 const MISTRAL_MODELS_ENDPOINT = 'https://api.mistral.ai/v1/models'
 const FAL_MODELS_ENDPOINT = 'https://api.fal.ai/v1/models'
 const REPLICATE_OFFICIAL_COLLECTION_ENDPOINT = 'https://api.replicate.com/v1/collections/official'
+const DEEPINFRA_MODELS_ENDPOINT = 'https://api.deepinfra.com/models/list'
 // NOTE: Groq uses an OpenAI-compatible endpoint at https://api.groq.com/openai/v1
 
 type CatalogTransport = 'vercel-gateway' | 'openrouter' | 'direct'
@@ -130,6 +131,7 @@ type DirectProviderId =
   | 'groq'
   | 'xai'
   | 'deepseek'
+  | 'deepinfra'
   | 'moonshot'
   | 'zai'
   | 'zai_coding'
@@ -151,7 +153,28 @@ type DirectProviderEntry = {
   tags?: string[]
   contextWindow?: number
   maxOutputTokens?: number
+  pricing?: {
+    input: number | undefined
+    output: number | undefined
+    cachedInput: number | undefined
+  }
   modelType?: string | null
+}
+
+type DeepInfraCatalogModel = {
+  model_name?: string
+  reported_type?: string
+  description?: string | null
+  tags?: string[]
+  pricing?: {
+    cents_per_input_token?: number | null
+    cents_per_output_token?: number | null
+    rate_per_input_token_cached?: number | null
+  } | null
+  max_tokens?: number | null
+  replaced_by?: string | null
+  deprecated?: number | null
+  private?: number | null
 }
 
 const MANUAL_DIRECT_MODELS: Partial<Record<DirectProviderId, DirectProviderEntry[]>> = {
@@ -671,7 +694,7 @@ function asDirectConnectionId(provider: DirectProviderId): CatalogConnectionId {
   return `direct:${provider}`
 }
 
-const OWNER_PREFIX_PROVIDERS = new Set<DirectProviderId>(['fal', 'replicate'])
+const OWNER_PREFIX_PROVIDERS = new Set<DirectProviderId>(['fal', 'replicate', 'deepinfra'])
 
 function resolveFalDeveloperSlug(endpointId: string, displayName?: string | null) {
   const normalizedEndpoint = endpointId.trim().toLowerCase()
@@ -774,7 +797,7 @@ function mapDirectProviderEntries(
       const canonicalId = buildCanonicalId(developerId, modelId)
       const tags = (entry.tags ?? []).map((tag) => tag.toLowerCase())
       const contextWindow = entry.contextWindow ?? undefined
-      const pricing = undefined
+      const pricing = entry.pricing
       const purpose = inferModelPurpose({
         modelType: entry.modelType ?? null,
         id: effectiveId,
@@ -829,6 +852,7 @@ function mergeDirectProviderEntries(
         maxOutputTokens: liveEntry.maxOutputTokens ?? curated?.maxOutputTokens,
         contextWindow: liveEntry.contextWindow ?? curated?.contextWindow
       }),
+      pricing: liveEntry.pricing ?? curated?.pricing,
       modelType: liveEntry.modelType ?? curated?.modelType
     })
     seen.add(liveEntry.id)
@@ -928,6 +952,58 @@ async function fetchDeepSeekEntries(options: SourceFetchOptions = {}): Promise<D
   })
 
   return ids.map((id) => ({ id }))
+}
+
+function mapDeepInfraModels(models: DeepInfraCatalogModel[]): DirectProviderEntry[] {
+  return models
+    .filter((model) =>
+      model?.reported_type === 'text-generation' &&
+      model.private !== 1 &&
+      model.deprecated == null &&
+      !model.replaced_by
+    )
+    .map((model) => {
+      const id = safeString(model.model_name).trim()
+      const tags = Array.from(new Set([...(model.tags ?? []), 'chat'])).map((tag) => tag.toLowerCase())
+      const input = model.pricing?.cents_per_input_token
+      const output = model.pricing?.cents_per_output_token
+      const cachedRate = model.pricing?.rate_per_input_token_cached
+      const inputPerMillion = typeof input === 'number' && Number.isFinite(input)
+        ? input * 10_000
+        : undefined
+      const outputPerMillion = typeof output === 'number' && Number.isFinite(output)
+        ? output * 10_000
+        : undefined
+      const cachedInputPerMillion =
+        inputPerMillion !== undefined && typeof cachedRate === 'number' && Number.isFinite(cachedRate)
+          ? inputPerMillion * cachedRate
+          : undefined
+      const pricing = inputPerMillion !== undefined || outputPerMillion !== undefined || cachedInputPerMillion !== undefined
+        ? {
+            input: inputPerMillion,
+            output: outputPerMillion,
+            cachedInput: cachedInputPerMillion
+          }
+        : undefined
+
+      return {
+        id,
+        displayName: id.split('/').pop() || id,
+        description: model.description ?? undefined,
+        tags,
+        contextWindow: normalizePositiveInteger(model.max_tokens),
+        pricing,
+        modelType: 'chat'
+      }
+    })
+    .filter((model) => Boolean(model.id))
+}
+
+async function fetchDeepInfraEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const payload = await fetchJson<DeepInfraCatalogModel[]>(DEEPINFRA_MODELS_ENDPOINT, {
+    signal: options.signal
+  })
+  return mapDeepInfraModels(Array.isArray(payload) ? payload : [])
 }
 
 async function fetchMoonshotEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1570,6 +1646,17 @@ export function _mergeDirectProviderEntriesForTest(
   return mergeDirectProviderEntries(liveEntries, curatedEntries)
 }
 
+export function _mapDeepInfraModelsForTest(models: DeepInfraCatalogModel[]): DirectProviderEntry[] {
+  return mapDeepInfraModels(models)
+}
+
+export function _mapDirectProviderEntriesForTest(
+  provider: DirectProviderId,
+  entries: DirectProviderEntry[]
+): CatalogEntry[] {
+  return mapDirectProviderEntries(provider, entries)
+}
+
 export function _buildCatalogSyncDiffForTest({
   previous,
   next
@@ -2012,6 +2099,14 @@ export async function runModelCatalogSync(
           transport: 'direct'
         }).length
       : 0,
+    deepinfra: existing
+      ? buildFallbackEntriesFromExisting({
+          existing,
+          connectionId: asDirectConnectionId('deepinfra'),
+          source: 'direct',
+          transport: 'direct'
+        }).length
+      : 0,
     moonshot: existing
       ? buildFallbackEntriesFromExisting({
           existing,
@@ -2136,7 +2231,7 @@ export async function runModelCatalogSync(
 
   const resolvedFalKey = falKey || falLegacyKey
   const resolvedZaiCodingKey = zaiCodingKey || zaiKey
-  const directKeyPresent: Record<DirectProviderId, boolean> = {
+  const directSourceConfigured: Record<DirectProviderId, boolean> = {
     openai: Boolean(openaiKey),
     anthropic: Boolean(anthropicKey),
     google: Boolean(googleKey),
@@ -2144,6 +2239,7 @@ export async function runModelCatalogSync(
     groq: Boolean(groqKey),
     xai: Boolean(xaiKey),
     deepseek: Boolean(deepseekKey),
+    deepinfra: true,
     moonshot: Boolean(moonshotKey),
     zai: Boolean(zaiKey),
     zai_coding: Boolean(resolvedZaiCodingKey),
@@ -2167,6 +2263,7 @@ export async function runModelCatalogSync(
     groqResult,
     xaiResult,
     deepseekResult,
+    deepinfraResult,
     moonshotResult,
     zaiResult,
     zaiCodingResult,
@@ -2188,6 +2285,7 @@ export async function runModelCatalogSync(
     fetchGroqEntries(createSourceOptions()),
     fetchXAIEntries(createSourceOptions()),
     fetchDeepSeekEntries(createSourceOptions()),
+    fetchDeepInfraEntries(createSourceOptions()),
     fetchMoonshotEntries(createSourceOptions()),
     fetchZaiEntries(createSourceOptions()),
     fetchZaiCodingEntries(createSourceOptions()),
@@ -2274,7 +2372,7 @@ export async function runModelCatalogSync(
     result: PromiseSettledResult<DirectProviderEntry[]>
   }) {
     const connectionId = asDirectConnectionId(provider)
-    const apiKeyPresent = directKeyPresent[provider]
+    const sourceConfigured = directSourceConfigured[provider]
 
     const fresh = result.status === 'fulfilled' ? mapDirectProviderEntries(provider, result.value) : null
     const error = result.status === 'rejected' ? normalizeError(result.reason) : undefined
@@ -2297,10 +2395,10 @@ export async function runModelCatalogSync(
       connectionId,
       ok: Boolean(fresh) && !useFallback,
       usedFallback: useFallback,
-      skipped: !apiKeyPresent,
+      skipped: !sourceConfigured,
       fetchedCount: fresh?.length ?? 0,
       error,
-      warning: !apiKeyPresent
+      warning: !sourceConfigured
         ? `API key not configured; ${previousCount ? 'preserving previous list' : 'skipping import'}`
         : buildSourceFallbackWarning({
             useFallback,
@@ -2319,6 +2417,7 @@ export async function runModelCatalogSync(
   const groqEntries = resolveDirectSource({ provider: 'groq', result: groqResult })
   const xaiEntries = resolveDirectSource({ provider: 'xai', result: xaiResult })
   const deepseekEntries = resolveDirectSource({ provider: 'deepseek', result: deepseekResult })
+  const deepinfraEntries = resolveDirectSource({ provider: 'deepinfra', result: deepinfraResult })
   const moonshotEntries = resolveDirectSource({ provider: 'moonshot', result: moonshotResult })
   const zaiEntries = resolveDirectSource({ provider: 'zai', result: zaiResult })
   const zaiCodingEntries = resolveDirectSource({ provider: 'zai_coding', result: zaiCodingResult })
@@ -2348,6 +2447,7 @@ export async function runModelCatalogSync(
     ...groqEntries.map((entry) => enrichWithAA(entry, aaMap)),
     ...xaiEntries.map((entry) => enrichWithAA(entry, aaMap)),
     ...deepseekEntries.map((entry) => enrichWithAA(entry, aaMap)),
+    ...deepinfraEntries.map((entry) => enrichWithAA(entry, aaMap)),
     ...moonshotEntries.map((entry) => enrichWithAA(entry, aaMap)),
     ...zaiEntries.map((entry) => enrichWithAA(entry, aaMap)),
     ...zaiCodingEntries.map((entry) => enrichWithAA(entry, aaMap)),
@@ -2375,6 +2475,7 @@ export async function runModelCatalogSync(
       groq: groqEntries.length,
       xai: xaiEntries.length,
       deepseek: deepseekEntries.length,
+      deepinfra: deepinfraEntries.length,
       moonshot: moonshotEntries.length,
       zai: zaiEntries.length,
       zai_coding: zaiCodingEntries.length,
@@ -2398,6 +2499,7 @@ export async function runModelCatalogSync(
     groqEntries.length +
     xaiEntries.length +
     deepseekEntries.length +
+    deepinfraEntries.length +
     moonshotEntries.length +
     zaiEntries.length +
     zaiCodingEntries.length +
