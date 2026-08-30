@@ -1,5 +1,9 @@
 import type { VoiceConfig } from '$lib/services/voice'
 import type { VoiceSettings } from '$lib/types/voice'
+import {
+  realtimeHiddenTagNames,
+  realtimeHiddenTagOpenPrefixes
+} from '$lib/utils/controlTags'
 import { splitRealtimeSpeechBuffer } from '$lib/utils/realtimeSpeechChunker'
 import type { SpeakableTextOptions } from '$lib/utils/speakableText'
 
@@ -56,24 +60,12 @@ export type RealtimeSpeechCoordinatorOptions = {
 
 const DEFAULT_LATENCY_FLUSH_MS = 900
 const DEFAULT_FORCE_MIN_SPEAKABLE_CHARS = 48
-const HIDDEN_CONTROL_TAGS = new Set([
-  'batshit-cue',
-  'batshit-group',
-  'batshit-zip-control',
-  'tool-results',
-  'tool-results-summary',
-  'tool_results',
-  'tool_results_summary'
-])
-const HIDDEN_CONTROL_TAG_OPEN_PREFIXES = [
-  '<batshit-cue',
-  '<batshit-group',
-  '<batshit-zip-control',
-  '<tool-results',
-  '<tool-results-summary',
-  '<tool_results',
-  '<tool_results_summary'
-]
+// Registry-driven (SA-104 P1): registering a control tag in
+// `$lib/utils/controlTags` automatically extends the realtime hold-back —
+// partial `<batshit-*` prefixes and open blocks are withheld from the speech
+// chunker until the tag resolves.
+const HIDDEN_CONTROL_TAGS = new Set(realtimeHiddenTagNames())
+const HIDDEN_CONTROL_TAG_OPEN_PREFIXES = realtimeHiddenTagOpenPrefixes()
 const PLAIN_CONTROL_SECTION_PATTERN = /(^|\n)\s*#{0,6}\s*tool results summary\b[^\n]*(?:\n|$)/i
 
 type HiddenControlOpener =

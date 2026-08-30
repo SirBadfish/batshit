@@ -64,6 +64,14 @@
     })()
   ) as Array<{ id: string; label: string }>
 
+  // SA-104 P4: inserted-memory visibility (structuredInput.metadata.memoryContext,
+  // written by both compilation twins for memory-enabled agents).
+  const memoryContextMeta = $derived.by<Record<string, any> | null>(() => {
+    const meta = (currentSnapshot?.structuredInput as Record<string, any> | undefined)?.metadata
+      ?.memoryContext
+    return meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : null
+  })
+
   const groupMeta = $derived.by<Record<string, any> | null>(() => {
     const meta = currentSnapshot?.executionMetadata?.groupChat
     return meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : null
@@ -1107,6 +1115,7 @@
   let openLlmCalls = $state(true)
   let openWebhookInput = $state(false)
   let openPrimaryPrompt = $state(false)
+  let openMemoryContext = $state(false)
   let openSubagentPrompts = $state(false)
   let openCompiledMessages = $state(false)
   let openResponse = $state(false)
@@ -1870,6 +1879,63 @@
                 <pre class="execution-viewer-pre execution-viewer-pre-tall">
 {displayViewerText(currentSnapshot.primarySystemPrompt)}
                 </pre>
+              {/if}
+            </Collapsible.Content>
+          </Collapsible.Root>
+
+          <Collapsible.Root bind:open={openMemoryContext} disabled={!memoryContextMeta}>
+            <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
+              <div class="execution-viewer-section-label">
+                <span class="execution-viewer-section-heading">Memory Context</span>
+                <span class="execution-viewer-helper">Memories inserted into this run</span>
+              </div>
+              <ChevronDown class="execution-viewer-section-chevron" data-open={openMemoryContext} />
+            </Collapsible.Trigger>
+            <Collapsible.Content class="execution-viewer-section-content">
+              {#if memoryContextMeta}
+                <div class="execution-viewer-card execution-viewer-stack-md">
+                  <div class="execution-viewer-grid-2">
+                    <div class="execution-viewer-stack-xs">
+                      <div class="execution-viewer-eyebrow">Awareness</div>
+                      <div class="execution-viewer-value-row">
+                        {memoryContextMeta.onMyMind?.count ?? 0} entr{(memoryContextMeta.onMyMind?.count ?? 0) === 1 ? 'y' : 'ies'} (~{memoryContextMeta.onMyMind?.tokenEstimate ?? 0} tokens{(memoryContextMeta.onMyMind?.truncatedCount ?? 0) > 0 ? `, ${memoryContextMeta.onMyMind.truncatedCount} over budget` : ''})
+                      </div>
+                    </div>
+                    <div class="execution-viewer-stack-xs">
+                      <div class="execution-viewer-eyebrow">Linger Window</div>
+                      <div class="execution-viewer-value-row">
+                        {memoryContextMeta.lingerWindowTurns ?? 0} turn{(memoryContextMeta.lingerWindowTurns ?? 0) === 1 ? '' : 's'}
+                      </div>
+                    </div>
+                  </div>
+                  {#if memoryContextMeta.timeAwareness}
+                    <div class="execution-viewer-stack-xs">
+                      <div class="execution-viewer-eyebrow">Time Awareness</div>
+                      <div class="execution-viewer-helper">{memoryContextMeta.timeAwareness}</div>
+                    </div>
+                  {/if}
+                  <div class="execution-viewer-stack-xs">
+                    <div class="execution-viewer-eyebrow">Inserted Memories</div>
+                    {#if Array.isArray(memoryContextMeta.inserts) && memoryContextMeta.inserts.length > 0}
+                      {#each memoryContextMeta.inserts as insert}
+                        <div class="execution-viewer-value-row">
+                          {insert.status === 'new' ? '✅' : insert.status === 'refreshed' ? '✳️' : '🟢'}
+                          [{insert.source}{Array.isArray(insert.matchedTerms) && insert.matchedTerms.length > 0 ? ` "${insert.matchedTerms.join('", "')}"` : ''} | {insert.lane} | {insert.id} | importance {insert.importance}] {insert.gist}
+                        </div>
+                      {/each}
+                    {:else}
+                      <div class="execution-viewer-helper">No memories were inserted for this run.</div>
+                    {/if}
+                  </div>
+                  {#if Array.isArray(memoryContextMeta.moreAvailable) && memoryContextMeta.moreAvailable.length > 0}
+                    <div class="execution-viewer-stack-xs">
+                      <div class="execution-viewer-eyebrow">More Available</div>
+                      {#each memoryContextMeta.moreAvailable as note}
+                        <div class="execution-viewer-helper">{note}</div>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
               {/if}
             </Collapsible.Content>
           </Collapsible.Root>

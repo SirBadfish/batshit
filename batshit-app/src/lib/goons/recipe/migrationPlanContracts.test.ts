@@ -25,6 +25,10 @@ import {
   type RecipeUpdateEdge,
 } from "./updateContracts";
 import {
+  createGoonRecipeDocument,
+  verifyGoonRecipeDocument,
+} from "./recipeLifecycleContracts";
+import {
   RECIPE_UPDATE_PAIR_FIXTURE_SHA256,
   recipeMigrationReportFixture,
   recipeUpdateV1Fixture,
@@ -589,6 +593,65 @@ describe("Recipe migration plan v1", () => {
         verifierContext(edge, sourceState),
       ),
     ).resolves.toEqual(confirmedResetGeometry);
+  });
+
+  it("keeps nested migration and document hashes stable across RedisJSON decimal drift", async () => {
+    const { plan, sourceState } = await unsupportedPlan();
+    const withHighPrecisionEvidence = mutable(plan);
+    const proof = withHighPrecisionEvidence.componentProofs.find(
+      (entry: RecipeMigrationComponentProof) => entry.status === "verified",
+    );
+    proof.errors.bakedPositionMaximumMeters = 4.470348358154297e-8;
+    proof.errors.bakedPositionRmsMeters = 3.3219461576257802e-9;
+    proof.proofSha256 = sha("0");
+    for (const row of withHighPrecisionEvidence.controlRows) {
+      if (row.componentId === proof.componentId) {
+        row.componentProofSha256 = sha("0");
+      }
+    }
+    const { planSha256: _planSha256, ...content } =
+      withHighPrecisionEvidence;
+    const stablePlan = await createRecipeMigrationPlan(content);
+    const stableProof = stablePlan.componentProofs.find(
+      (entry) => entry.componentId === proof.componentId,
+    )!;
+    expect(stableProof.errors.bakedPositionMaximumMeters).toBe(
+      4.4703483581543e-8,
+    );
+    expect(stableProof.errors.bakedPositionRmsMeters).toBe(
+      3.32194615762578e-9,
+    );
+
+    const storedPlan = mutable(stablePlan);
+    const storedProof = storedPlan.componentProofs.find(
+      (entry: RecipeMigrationComponentProof) =>
+        entry.componentId === proof.componentId,
+    );
+    storedProof.errors.bakedPositionMaximumMeters = 4.4703483581542975e-8;
+    storedProof.errors.bakedPositionRmsMeters = 3.32194615762578e-9;
+    await expect(
+      verifyRecipeMigrationPlan(
+        storedPlan,
+        verifierContext(recipeUpdatesFixture.edges[0], sourceState),
+      ),
+    ).resolves.toEqual(stablePlan);
+
+    const document = await createGoonRecipeDocument({
+      userId: "user-1",
+      goonId: "goon-1",
+      content: stablePlan as unknown as Record<string, unknown>,
+    });
+    const storedDocument = mutable(document);
+    const documentProof = storedDocument.content.componentProofs.find(
+      (entry: RecipeMigrationComponentProof) =>
+        entry.componentId === proof.componentId,
+    );
+    documentProof.errors.bakedPositionMaximumMeters =
+      4.4703483581542975e-8;
+    documentProof.errors.bakedPositionRmsMeters = 3.32194615762578e-9;
+    await expect(verifyGoonRecipeDocument(storedDocument)).resolves.toEqual(
+      document,
+    );
   });
 
   it("allows a clean reset only from the cited eligible unsupported plan", async () => {

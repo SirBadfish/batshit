@@ -493,6 +493,9 @@ async function runApiSubagent(
     providerSettings: params.subagent.provider_specific_settings ?? null,
     allowArtifactRuntimeTools: true,
     allowFabricControlTools: false,
+    // SA-104 P3: memory tools are PA-only in v1 — subagent memory access is a deferred
+    // product decision and memory is PA-owned agent-scoped state (see story Out of Scope).
+    memoryControlsEnabled: false,
     abortSignal: params.abortSignal,
   })
 

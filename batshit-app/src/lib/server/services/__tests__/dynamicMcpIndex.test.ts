@@ -336,6 +336,50 @@ describe('buildDynamicMcpIndex', () => {
       expect(result.text).toContain('  - sys.zip.fetch — Fetch Zip — zipId (required)')
     })
 
+    it('opens a memory-only Fabric row for a memory-enabled n8n agent, resolved from the agent record (SA-104 P3)', async () => {
+      redisMock.get.mockImplementation(async (key: string) =>
+        key === 'agent:agent_mem'
+          ? { id: 'agent_mem', user_id: 'josh', memory_enabled: true }
+          : null
+      )
+      listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) => {
+        if (allowedControlIds?.includes('use.artifact.*')) return []
+        if (allowedControlIds?.includes('sys.memory.*')) {
+          return [
+            fabricControl('sys.memory.save', 'Memory Save'),
+            fabricControl('sys.memory.search', 'Memory Search'),
+            fabricControl('sys.memory.recall', 'Memory Recall')
+          ]
+        }
+        return []
+      })
+
+      // fetch-zip off + broad control plane closed on n8n: without memory the family is
+      // gone; with the agent's memory_enabled it opens carrying only sys.memory.*.
+      const withoutMemory = await buildDynamicMcpIndex({
+        userId: 'josh',
+        runtime: 'n8n',
+        brokerToggles: { ...ALL_BROKER_OFF, batshitToolsEnabled: true },
+        allowFabricControlTools: false,
+        memoryControlsEnabled: false
+      })
+      expect(withoutMemory.text).not.toContain(FABRIC_TOOL_GRID_GROUP_NAME)
+
+      const withMemory = await buildDynamicMcpIndex({
+        userId: 'josh',
+        agentId: 'agent_mem',
+        runtime: 'n8n',
+        brokerToggles: { ...ALL_BROKER_OFF, batshitToolsEnabled: true },
+        allowFabricControlTools: false
+      })
+      expect(withMemory.text).toContain(`- ${FABRIC_TOOL_GRID_GROUP_NAME} (3 tools)`)
+
+      const memoryCall = listVisibleControlsMock.mock.calls.find((call: any[]) =>
+        call[0]?.allowedControlIds?.includes('sys.memory.*')
+      )
+      expect(memoryCall?.[0].allowedControlIds).toEqual(['sys.memory.*'])
+    })
+
     it('lists artifact refs with field hints and a config-control count', async () => {
       listVisibleControlsMock.mockImplementation(async ({ allowedControlIds }: any) => {
         if (allowedControlIds?.includes('use.artifact.*')) {

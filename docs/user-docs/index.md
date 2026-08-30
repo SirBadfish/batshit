@@ -87,6 +87,7 @@ These docs are grouped by subject — everything about a feature lives in one pl
 - [Tools](tools/overview.md) — tools, MCPs, CLI Tools, the Tool Grid, and [Zips](tools/zips.md).
 - [Artifacts](artifacts/overview.md) — persistent workspace tools, including [agent use](artifacts/agent-use.md).
 - [Clips](clips/overview.md) — reusable file and image uploads.
+- [Memory & Infinite Sessions](chat/memory-and-infinite-sessions.md) — agents that remember you across chats, and sessions that live as one ongoing conversation.
 
 **Voice and presence**
 

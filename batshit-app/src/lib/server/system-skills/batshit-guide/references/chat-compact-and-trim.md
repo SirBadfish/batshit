@@ -2,6 +2,8 @@
 
 Long, tool-heavy conversations eventually strain the model's context window. Batshit gives you two manual controls in the Token Panel — Manual Trim and Compact — plus automatic recovery when an agent runs out of room mid-task. This page covers all three. The Zip system that keeps individual results small is covered in [Zips](../tools/zips.md).
 
+One exception up front: inside a [Infinite Session](memory-and-infinite-sessions.md), Compact and Auto Compact are intentionally disabled — Infinite Sessions relieve context with **naps** (which graduate finished episodes into memory instead of summarizing over nothing). Manual Trim still works there.
+
 ## Manual Trim and Compact
 
 The Token Panel under the chat has two tools for long conversations:

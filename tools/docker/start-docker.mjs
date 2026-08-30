@@ -331,7 +331,7 @@ function prepareEnvFile(profiles = []) {
   updateEnvValue(
     state,
     'LIVEKIT_SERVER_IMAGE',
-    'livekit/livekit-server:v1.12.0',
+    'livekit/livekit-server:v1.13.5',
     (current) => !current,
     'Set LiveKit server image for the optional Docker voice runtime add-on.'
   )

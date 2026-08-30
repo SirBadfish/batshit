@@ -128,6 +128,10 @@ Batshit's search-then-use pattern for discoverable MCP tools, saved CLI Tools, p
 
 The Voice Settings area for managing BYO TTS/STT engines and related local/external speech services.
 
+### Episode
+
+A natural stretch of conversation inside an Infinite Session (for example, one afternoon of work). Finished episodes graduate: they are summarized into the agent's memory while the original messages stay stored and searchable.
+
 ### Execution Viewer
 
 Batshit's inspection panel for request and runtime evidence. Use it when you need to understand what an agent sent, received, or called.
@@ -180,6 +184,10 @@ An Artifact that embeds a HuggingFace Space. Current HuggingFace embeds are user
 
 ## I
 
+### Infinite Session
+
+An opt-in, one-way session type where one agent lives in one ongoing conversation. Infinite Sessions auto-lock, pin to their own sidebar section, organize life into episodes, and use naps instead of Compact. See [Memory & Infinite Sessions](../chat/memory-and-infinite-sessions.md).
+
 ### Inworld
 
 One of Batshit's direct realtime TTS providers when an Inworld API key and voice are configured. Batshit uses Inworld for speech output only; Batshit still owns chat context, tools, Zips, message storage, and playback events.
@@ -208,6 +216,10 @@ Model Context Protocol, a standard for exposing tools to AI agents.
 
 A source of MCP tools. Examples include Docker MCP Gateway, n8n MCP Trigger gateways, n8n Instance MCP, custom streamable HTTP gateways, and STDIO gateways.
 
+### Memory (Agent Memory)
+
+Batshit's per-agent memory system: Awareness (what the agent knows right now, including its Awareness list), STM (Trigger Memories that fire when their words come up, optionally with photos), and LTM (searchable long-term memory). Off by default; managed in the Memory Panel (Settings → Memory). See [Memory & Infinite Sessions](../chat/memory-and-infinite-sessions.md).
+
 ### Model Preset
 
 A saved provider/model configuration Batshit can reuse for agents, Artifacts, or other model-powered features.
@@ -233,6 +245,10 @@ A Subagent attached inside an n8n Primary Agent workflow as an AI Agent Tool nod
 ### n8n Workflow Subagent
 
 A separate n8n workflow with its own webhook, called by an `API` or `CLI` Primary Agent as a specialist.
+
+### Nap
+
+An Infinite Session's between-turns context relief: graduate finished episodes, compress stale tool output, and condense the oldest open-episode narrative while promoting key working facts onto the episode whiteboard. Replaces Compact inside Infinite Sessions; every nap leaves a visible record.
 
 ## P
 

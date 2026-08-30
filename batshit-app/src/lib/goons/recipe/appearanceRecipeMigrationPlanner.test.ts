@@ -22,9 +22,13 @@ const mutable = <T>(value: T): any => structuredClone(value);
 async function plannerInput(
   includeComponentMap = true,
   topologyRebuild = false,
+  sameTopologyGeometryChange = false,
+  extraAuthorizedGeometryChannel = false,
 ): Promise<AppearanceRecipeMigrationPlannerInput> {
   const fixture = await createRecipePhysicalMigrationFixture({
     topologyRebuild,
+    sameTopologyGeometryChange,
+    extraAuthorizedGeometryChannel,
   });
   return {
     planId: includeComponentMap
@@ -239,6 +243,212 @@ async function withExternalSibling(
 }
 
 describe("Appearance Recipe migration planner", () => {
+  it("retains exact values through a declared same-topology geometry change and requires review", async () => {
+    const input = await plannerInput(true, false, true);
+    const plan = await planAppearanceRecipeMigration(input);
+
+    expect(plan.outcome).toMatchObject({
+      kind: "automatic",
+      readiness: "preview-required",
+      preservationClaim: "values-migrated-only",
+      rejectionCodes: [],
+    });
+    expect(plan.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "geometry-changed" }),
+      ]),
+    );
+    expect(plan.componentProofs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          componentId: "component.keep",
+          status: "not-preserved",
+          mismatchDomains: ["geometry"],
+          rejectionCodes: [],
+        }),
+      ]),
+    );
+    expect(
+      plan.controlRows.find((row) => row.ledgerId === "keep_control"),
+    ).toMatchObject({
+      sourceControl: { value: 0.2 },
+      targetControl: { value: 0.2 },
+      proofStatus: "not-preserved",
+      reasonCode: "INTENTIONAL_GEOMETRY_CHANGE",
+      requiresPreview: true,
+      requiresConfirmation: true,
+    });
+    expect(plan.wholeRecipeProof).toMatchObject({
+      status: "expected-mismatch",
+      mismatchDomains: ["geometry"],
+      permitsAppearancePreservedClaim: false,
+    });
+    await expect(
+      verifyPlannedAppearanceRecipeMigration(plan, input),
+    ).resolves.toEqual(plan);
+  });
+
+  it("retains exact relative behavior through an intentional neutral geometry change", async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      sameTopologyNeutralGeometryChange: true,
+    });
+    const input: AppearanceRecipeMigrationPlannerInput = {
+      planId: "migration.r2-fixture.neutral-geometry",
+      fromRecipeRevision: 1,
+      edge: fixture.edge,
+      sourceState: fixture.sourceState,
+      sourcePackage: {
+        recipeSource: fixture.source.recipeSource,
+        packageBytes: fixture.source.packageBytes,
+        glbBytes: fixture.source.glbBytes,
+        manifestBytes: fixture.source.manifestBytes,
+      },
+      targetPackage: {
+        recipeSource: fixture.target.recipeSource,
+        packageBytes: fixture.target.packageBytes,
+        glbBytes: fixture.target.glbBytes,
+        manifestBytes: fixture.target.manifestBytes,
+      },
+      siblingInputs: fixture.siblingInputs,
+      componentMapBundle: fixture.componentMapBundle,
+    };
+
+    const plan = await planAppearanceRecipeMigration(input);
+    expect(plan.outcome).toMatchObject({
+      kind: "automatic",
+      readiness: "preview-required",
+      preservationClaim: "values-migrated-only",
+      rejectionCodes: [],
+    });
+    expect(
+      plan.componentProofs.find(
+        (proof) => proof.componentId === "component.keep",
+      ),
+    ).toMatchObject({
+      status: "verified",
+      mismatchDomains: [],
+      rejectionCodes: [],
+    });
+    expect(
+      plan.controlRows.find((row) => row.ledgerId === "keep_control"),
+    ).toMatchObject({
+      sourceControl: { value: 0.2 },
+      targetControl: { value: 0.2 },
+      proofStatus: "verified",
+      reasonCode: "UNCHANGED_IDENTITY",
+      requiresPreview: false,
+      requiresConfirmation: false,
+    });
+    expect(plan.wholeRecipeProof).toMatchObject({
+      status: "expected-mismatch",
+      mismatchDomains: ["geometry"],
+      permitsAppearancePreservedClaim: false,
+    });
+    expect(
+      plan.wholeRecipeProof.errors.bakedPositionMaximumMeters,
+    ).toBeCloseTo(0.025, 7);
+    await expect(
+      verifyPlannedAppearanceRecipeMigration(plan, input),
+    ).resolves.toEqual(plan);
+  });
+
+  it("blocks the same target geometry when the exact author proof is absent", async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      sameTopologyGeometryChange: true,
+      omitSameTopologyGeometryProof: true,
+    });
+    const input: AppearanceRecipeMigrationPlannerInput = {
+      planId: "migration.r2-fixture.unexplained-geometry",
+      fromRecipeRevision: 1,
+      edge: fixture.edge,
+      sourceState: fixture.sourceState,
+      sourcePackage: {
+        recipeSource: fixture.source.recipeSource,
+        packageBytes: fixture.source.packageBytes,
+        glbBytes: fixture.source.glbBytes,
+        manifestBytes: fixture.source.manifestBytes,
+      },
+      targetPackage: {
+        recipeSource: fixture.target.recipeSource,
+        packageBytes: fixture.target.packageBytes,
+        glbBytes: fixture.target.glbBytes,
+        manifestBytes: fixture.target.manifestBytes,
+      },
+      siblingInputs: fixture.siblingInputs,
+      componentMapBundle: fixture.componentMapBundle,
+    };
+
+    const plan = await planAppearanceRecipeMigration(input);
+    expect(plan.outcome).toMatchObject({
+      kind: "unsupported",
+      readiness: "blocked",
+      rejectionCodes: expect.arrayContaining([
+        "COMPONENT_PROOF_FAILED",
+        "WHOLE_RECIPE_MISMATCH_UNEXPLAINED",
+      ]),
+    });
+    expect(
+      plan.componentProofs.find(
+        (proof) => proof.componentId === "component.keep",
+      ),
+    ).toMatchObject({ status: "failed", mismatchDomains: ["geometry"] });
+  });
+
+  it("blocks a geometry proof that authorizes any channel beyond the observed change", async () => {
+    const input = await plannerInput(true, false, true, true);
+    const plan = await planAppearanceRecipeMigration(input);
+    expect(plan.outcome).toMatchObject({
+      readiness: "blocked",
+      preservationClaim: "none",
+      rejectionCodes: expect.arrayContaining([
+        "WHOLE_RECIPE_MISMATCH_UNEXPLAINED",
+      ]),
+    });
+    expect(
+      plan.componentProofs.find(
+        (proof) => proof.componentId === "component.keep",
+      ),
+    ).toMatchObject({ status: "failed", mismatchDomains: ["geometry"] });
+  });
+
+  it("does not let a geometry proof conceal an unrelated node-rest mismatch", async () => {
+    const fixture = await createRecipePhysicalMigrationFixture({
+      sameTopologyGeometryChange: true,
+      sameTopologyRestChange: true,
+    });
+    const input: AppearanceRecipeMigrationPlannerInput = {
+      ...(await plannerInput(true, false, true)),
+      edge: fixture.edge,
+      sourceState: fixture.sourceState,
+      sourcePackage: {
+        recipeSource: fixture.source.recipeSource,
+        packageBytes: fixture.source.packageBytes,
+        glbBytes: fixture.source.glbBytes,
+        manifestBytes: fixture.source.manifestBytes,
+      },
+      targetPackage: {
+        recipeSource: fixture.target.recipeSource,
+        packageBytes: fixture.target.packageBytes,
+        glbBytes: fixture.target.glbBytes,
+        manifestBytes: fixture.target.manifestBytes,
+      },
+      siblingInputs: fixture.siblingInputs,
+      componentMapBundle: fixture.componentMapBundle,
+    };
+
+    const plan = await planAppearanceRecipeMigration(input);
+    expect(plan.outcome).toMatchObject({
+      readiness: "blocked",
+      preservationClaim: "none",
+      rejectionCodes: expect.arrayContaining([
+        "WHOLE_RECIPE_MISMATCH_UNEXPLAINED",
+      ]),
+    });
+    expect(plan.wholeRecipeProof.mismatchDomains).toEqual(
+      expect.arrayContaining(["rest"]),
+    );
+  });
+
   it("migrates values through an explicit target-source topology rebuild and requires preview", async () => {
     const input = await plannerInput(true, true);
     const plan = await planAppearanceRecipeMigration(input);

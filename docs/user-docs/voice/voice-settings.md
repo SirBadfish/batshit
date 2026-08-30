@@ -173,7 +173,7 @@ Native Mac/Linux users can install the local LiveKit runtime from:
 Settings → Voice → Voice Engines → Voice Runtimes → LiveKit → Install
 ```
 
-The install button downloads Batshit's pinned LiveKit Server runtime, installs the Batshit sidecar under the managed runtime folder, saves local Voice Runtime credentials when needed, and starts both services.
+The install button downloads the LiveKit Server version tested with your Batshit build, installs the matching Batshit sidecar under the managed runtime folder, saves local Voice Runtime credentials when needed, and starts both services. If a later Batshit build carries a newer tested runtime, this row shows **Update available** and changes the action to **Update & Restart**. **Start with Batshit** also refreshes stale Batshit-managed sidecar code before auto-start; it does not chase untested upstream releases on its own.
 
 Docker users can start the local LiveKit add-on with:
 

@@ -153,6 +153,10 @@ export interface AgentRow {
   // Per-type buffer settings
   buffer_size_error?: number
 
+  // SA-104: per-agent memory enablement (DL-104-16). Default false; resolved only
+  // through resolveAgentMemoryEnabled(). The Settings toggle ships in P5.
+  memory_enabled?: boolean | null
+
   // Reasoning / thinking rendering (SA-018)
   show_reasoning?: boolean
   preserve_reasoning?: boolean

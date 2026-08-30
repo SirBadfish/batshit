@@ -826,7 +826,7 @@
   <div class="batshit-settings-surface">
     <div class="space-y-4">
       {#if artifactsLoading}
-        <div class="flex items-center justify-center batshit-settings-empty-state">
+        <div class="batshit-settings-empty-state">
           <Loader2 class="mr-2 h-4 w-4 animate-spin" />
           Loading artifacts…
         </div>
@@ -928,7 +928,7 @@
                     {#if selectedPowerSourcePreviewArtifact}
                       <ArtifactSourceBadge artifact={selectedPowerSourcePreviewArtifact} showLabel size="sm" />
                     {/if}
-                    <span class="inline-flex items-center batshit-settings-pill is-strong">
+                    <span class="batshit-settings-pill is-strong">
                       {getArtifactStatusBadgeLabel(zone)}
                     </span>
                     <SettingsSaveStatus
@@ -1043,7 +1043,7 @@
                             <Label.Root class="batshit-settings-form-label">Webhook URL</Label.Root>
                           </div>
                         </div>
-                        <div class="batshit-settings-form-control">
+                        <div class="batshit-settings-form-control is-wide">
                           <Input
                             placeholder="https://your-endpoint/webhook"
                             bind:value={webhookUrl}

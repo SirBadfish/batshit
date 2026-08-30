@@ -101,7 +101,7 @@ If only one Goon fails, it's likely a Goon rig/morph issue. If every Goon fails,
 
 LiveKit is a Voice Runtime, not a TTS/STT engine.
 
-Native local LiveKit: open Settings → Voice → Voice Engines → Voice Runtimes and use the LiveKit row's Install button. If it still fails, check whether ports `7880`, `7881`, or `7882/udp` are already in use. If the installer says the `LIVEKIT_AGENT_SOURCE_ROOT` source package is missing, reinstall or rebuild Batshit because the packaged LiveKit sidecar source wasn't bundled correctly. If voice session start says no LiveKit agent name is configured, update/rebuild Batshit; managed native dispatch should default to `batshit-livekit-agent`.
+Native local LiveKit: open Settings → Voice → Voice Engines → Voice Runtimes and use **Install**, or **Update & Restart** when Batshit reports that its managed copy is stale. If it still fails, check whether ports `7880`, `7881`, or `7882/udp` are already in use. Batshit only restarts a server process it launched itself; stop any externally owned server before applying a managed server update. If the installer says the `LIVEKIT_AGENT_SOURCE_ROOT` source package or npm CLI is missing, reinstall or rebuild Batshit because the packaged managed runtime is incomplete. If voice session start says no LiveKit agent name is configured, update/rebuild Batshit; managed native dispatch should default to `batshit-livekit-agent`.
 
 Docker local LiveKit:
 

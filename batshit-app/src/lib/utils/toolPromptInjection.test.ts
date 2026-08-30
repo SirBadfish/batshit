@@ -54,7 +54,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     expect(prompt).toContain('Never use `tool_result_0`')
     expect(prompt).toContain('"unzip":["tool_result_1","tool_result_3"],"zip":["zipId"]')
     expect(prompt).toContain('not private reasoning and not a place for private instructions')
-    expect(prompt).toContain('Tool Results Summary notes are user-visible')
+    expect(prompt).toContain('user-visible through an expandable Tool Results Summary panel')
     expect(prompt).toContain('Batshit strips the raw XML/JSON syntax')
     expect(prompt).not.toContain('keepUnzipped')
     expect(prompt).not.toContain('rezip')
@@ -104,7 +104,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     expect(prompt).toContain('Do NOT include unzip/zip action arrays')
     expect(prompt).toContain('not private reasoning and not a place for private instructions')
     expect(prompt).toContain('Tool Results Summary notes are user-visible')
-    expect(prompt).toContain('shows the summaries through the expandable Tool Results Summary panel')
+    expect(prompt).toContain('the user can expand that panel')
     expect(prompt).not.toContain('Never show this block to the user')
   })
 

@@ -134,7 +134,7 @@
       </div>
     </div>
   {:else if actionsLoading}
-    <div class="batshit-settings-empty-state min-h-0 py-4" role="status">
+    <div class="batshit-settings-empty-state is-compact" role="status">
       <span class="inline-flex items-center gap-2">
         <Loader2 class="animate-spin" aria-hidden="true" /> Preparing Goon…
       </span>

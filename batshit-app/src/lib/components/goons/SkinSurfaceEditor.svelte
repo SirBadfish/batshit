@@ -264,7 +264,7 @@
       {#if selfAuthored}
         <div class="space-y-1 text-[0.625rem] text-muted-foreground">
           <span>Credited to</span>
-          <div class="bs-input flex items-center justify-between gap-2">
+          <div class="bs-input items-center justify-between gap-2">
             <span>{ownerDisplayName.trim() || 'Your display name is missing'}</span>
             <SettingsInfoMenu ariaLabel="About Skin Surface Credit" align="end">
               <p>Uploading confirms you created this map and may use it.</p>

@@ -2114,7 +2114,7 @@
                       />
                       <span class="batshit-settings-tool-grid-name block truncate" title={`MCP Source: ${gateway.name}`}>{gateway.name}</span>
                       {#if !gateway.enabled}
-                        <span class="shrink-0 batshit-settings-pill text-muted-foreground">
+                        <span class="shrink-0 batshit-settings-pill">
                           Disabled Globally
                         </span>
                       {/if}
@@ -2335,7 +2335,7 @@
                                           <tr class={`batshit-settings-table-row `}>
                                             <td class="batshit-settings-table-cell is-muted is-nested">
                                               <div class="flex min-w-0 items-center gap-2">
-                                                <span class="batshit-settings-tool-grid-name min-w-0 truncate font-mono text-[11px]" title={tool.name}>
+                                                <span class="batshit-settings-tool-grid-name truncate font-mono text-[11px]" title={tool.name}>
                                                   {tool.name}
                                                 </span>
                                                 {#if toolDisableReason}

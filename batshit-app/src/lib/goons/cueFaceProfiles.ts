@@ -196,7 +196,12 @@ export function selectCueFacePayload(
 export function prepareCueForPortablePack(
   cue: GoonCueDefinition
 ): GoonCueDefinition {
-  const portable = structuredClone(cue)
+  // Settings state can arrive here through a Svelte reactive Proxy. WebKit's
+  // structuredClone rejects Proxy objects, which used to break packaged-Mac
+  // pack export before the native save dialog opened. Portable-pack cues are
+  // a JSON contract, so materialize that contract as detached plain data at
+  // this boundary before removing package-owned raw morph targets.
+  const portable = JSON.parse(JSON.stringify(cue)) as GoonCueDefinition
   delete portable.rawMorphTargets
   for (const step of portable.steps ?? []) delete step.rawMorphTargets
   return portable

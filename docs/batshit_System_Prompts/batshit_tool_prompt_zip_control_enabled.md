@@ -33,7 +33,7 @@ Use them only when helpful:
 - Never use `tool_result_0`; numbering starts at 1.
 - For older zips already visible in chat history, use the actual zip ID from the zip index/reference.
 - `zip`: use zip IDs for content you are done with and want compressed again. Do not zip user-locked items.
-- `toolResultsSummary`: use short factual notes when a summary is enough.
+- Do not put Tool Notes inside the zip-control block; notes have their own `<batshit-tool-notes>` block (see below).
 
 **Fetch Zip** is how you read a zip right now. Call `{{ $tool_use_tool }}` with ref `fabric:sys.zip.fetch`, or `batshit_server_fetch_zip` when a managed CLI exposes that direct helper. It peeks at any zip without changing its state. If that content should also stay available after this response, put its zip ID in `unzip` as well.
 
@@ -58,21 +58,25 @@ If DCM includes `native_bash: ...`, treat it as the source of truth for what she
 - If a tool result says `success:false`, `blocked:true`, or `POLICY_BLOCKED`, the requested action did not happen. Say that it was not applied/executed, include the blocker reason, and do not describe it as completed.
 - If an edit is blocked, provide the patch or handoff for the external coding workspace when useful.
 
-## Zip Control Block Format
+## Control Block Format
 
-Append this Batshit zip-control metadata block at the end of your response only when needed. The raw XML/JSON syntax is stripped from normal chat rendering, but its effects are visible in the UI: Tool Results Summary entries appear in the expandable summary panel, and zip/unzip actions update visible zip state.
+Append control metadata blocks at the end of your response only when needed. The raw XML/JSON syntax is stripped from normal chat rendering and from spoken audio, but the effects are visible in the UI: Tool Notes appear in the expandable Tool Results Summary panel, and zip/unzip actions update visible zip state.
 
-**Voice Mode safety:** Put all normal spoken prose before `<batshit-zip-control>`. The zip-control block must be the final thing in your message. Do not write visible reply text after `</batshit-zip-control>`, because text after the metadata block may not be spoken aloud reliably in Voice Mode.
+Put all normal spoken prose before any control blocks; append control blocks at the very end of your message.
 
-Never output the JSON by itself. It must be wrapped in `<batshit-zip-control>` and `</batshit-zip-control>`. If there are no zip changes and no useful Tool Results Summary notes, omit the block entirely.
+Never output the JSON by itself. Zip actions must be wrapped in `<batshit-zip-control>` and `</batshit-zip-control>`; Tool Notes must be wrapped in `<batshit-tool-notes>` and `</batshit-tool-notes>`. If a block would be empty, omit it entirely.
 
 **Timing:** You cannot prevent zip creation. For tool results from the current response, reference them by their response order with `tool_result_N`. For older zips, use the actual zip ID from chat history or the UNZIP INDEX. Never use a tool-call ID, Codex chunk ID, or `tool_result_0` for zip control.
 
 <batshit-zip-control>
-{"unzip":["tool_result_1","tool_result_3"],"zip":["zipId"],"toolResultsSummary":[{"toolName":"...","summary":"..."}]}
+{"unzip":["tool_result_1","tool_result_3"],"zip":["zipId"]}
 </batshit-zip-control>
 
+<batshit-tool-notes>
+{"notes":[{"toolName":"...","summary":"exact fact(s) to retain"}]}
+</batshit-tool-notes>
+
 **Rules:**
-- Only include this block when you actually need to change zip state or save useful Tool Results Summary notes.
-- Summaries: short, factual—just what you'll need later
+- Only include the zip-control block when you actually need to change zip state; only include the Tool Notes block when you have useful notes to save.
+- Notes: short, factual—just what you'll need later.
 - Never include literal Batshit zip-reference examples in visible text.

@@ -161,6 +161,7 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     { method: 'POST', path: '/api/upload/avatar' },
     { method: 'DELETE', path: '/api/upload/asset', body: { uploadType: 'images', filename: 'x.png' } },
     { method: 'POST', path: '/api/upload/goon-hair-asset' },
+    { method: 'POST', path: '/api/upload/goon-clothing-asset' },
     { method: 'POST', path: '/api/upload/goon-hair-import-source' },
     { method: 'GET', path: '/api/v1/' },
     { method: 'POST', path: '/api/v1/backup-restore/stages', body: { userId: 'user', filename: 'backup.zip', expectedBytes: 3 } },
@@ -258,6 +259,67 @@ describe('token gate on the API surface (G-0162/G-0238)', () => {
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual(
       expect.objectContaining({ error: expect.stringContaining('assetId must be') }),
+    );
+  });
+
+  it('rejects a Clothing artifact without exact immutable-owner IDs before storage', async () => {
+    const form = new FormData();
+    form.set('role', 'motion-definition');
+    form.set('file', new Blob(['{}'], { type: 'application/json' }), 'motion.json');
+    const response = await fetch(`${baseUrl}/api/upload/goon-clothing-asset`, {
+      method: 'POST',
+      headers: tokenHeaders,
+      body: form,
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(
+      expect.objectContaining({ error: expect.stringContaining('assetId must be') }),
+    );
+  });
+
+  it.each([
+    {
+      label: 'unknown role',
+      role: 'archive',
+      filename: 'garment.zip',
+      bytes: Uint8Array.from([0x50, 0x4b, 0x03, 0x04]),
+      error: 'role is unsupported',
+    },
+    {
+      label: 'spoofed GLB',
+      role: 'geometry',
+      filename: 'garment.glb',
+      bytes: new TextEncoder().encode('{}'),
+      error: 'content does not match .glb',
+    },
+    {
+      label: 'non-object JSON',
+      role: 'motion-definition',
+      filename: 'motion.json',
+      bytes: new TextEncoder().encode('[]'),
+      error: 'must contain one JSON object',
+    },
+    {
+      label: 'spoofed PNG',
+      role: 'base-color',
+      filename: 'base-color.png',
+      bytes: new TextEncoder().encode('not a png'),
+      error: 'content does not match .png',
+    },
+  ])('rejects Clothing $label bytes before storage', async ({ role, filename, bytes, error }) => {
+    const form = new FormData();
+    form.set('assetId', 'fixture-top');
+    form.set('revisionId', 'fixture-top-r1');
+    form.set('role', role);
+    form.set('file', new Blob([bytes]), filename);
+    const response = await fetch(`${baseUrl}/api/upload/goon-clothing-asset`, {
+      method: 'POST',
+      headers: tokenHeaders,
+      body: form,
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(
+      expect.objectContaining({ error: expect.stringContaining(error) }),
     );
   });
 

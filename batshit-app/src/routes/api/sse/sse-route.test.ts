@@ -360,4 +360,60 @@ describe('/api/sse route streaming contract', () => {
 
     await reader.cancel()
   })
+
+  it('reads error text from n8n-style content when flat error fields are absent', async () => {
+    const route = await import('./+server')
+    const locals = { user: { id: 'user-1' } }
+    const url = new URL('http://localhost/api/sse?sessionId=session-1')
+    const response = await route.GET({ url, locals } as any)
+    const reader = response.body!.getReader()
+
+    expect(await readSsePayload(reader)).toMatchObject({ type: 'connected' })
+
+    await route.POST({
+      request: buildJsonRequest({
+        sessionId: 'session-1',
+        type: 'error',
+        messageId: 'message-1',
+        content: 'Error in sub-node Anthropic Chat Model'
+      }),
+      locals
+    } as any)
+
+    expect(await readSsePayload(reader)).toMatchObject({
+      type: 'error',
+      error: 'Error in sub-node Anthropic Chat Model'
+    })
+
+    await reader.cancel()
+  })
+
+  it('keeps flat error text authoritative over content and metadata remaps', async () => {
+    const route = await import('./+server')
+    const locals = { user: { id: 'user-1' } }
+    const url = new URL('http://localhost/api/sse?sessionId=session-1')
+    const response = await route.GET({ url, locals } as any)
+    const reader = response.body!.getReader()
+
+    expect(await readSsePayload(reader)).toMatchObject({ type: 'connected' })
+
+    await route.POST({
+      request: buildJsonRequest({
+        sessionId: 'session-1',
+        type: 'error',
+        messageId: 'message-1',
+        error: 'Provider rejected the request',
+        content: { message: 'should not win' },
+        metadata: { provider: 'openai' }
+      }),
+      locals
+    } as any)
+
+    expect(await readSsePayload(reader)).toMatchObject({
+      type: 'error',
+      error: 'Provider rejected the request'
+    })
+
+    await reader.cancel()
+  })
 })

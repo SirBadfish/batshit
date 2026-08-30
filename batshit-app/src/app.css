@@ -117,6 +117,12 @@
     --bs-app-raised: oklch(0.16 0.024 281);
     --bs-app-display-surface: oklch(0.23 0.02 285);
     --bs-app-count-badge-bg: oklch(0.23 0.02 285);
+    /* Inline `code` treatment (2026-08-29, Josh's spec): a quiet violet chip that
+       reads on every surface — chat bubbles both colors, settings, info popovers.
+       Border + background + 5px corners + tinted text; NOT a pill, NOT a badge. */
+    --bs-inline-code-bg: oklch(0.24 0.035 286 / 0.55);
+    --bs-inline-code-line: oklch(0.6 0.06 286 / 0.3);
+    --bs-inline-code-text: oklch(0.85 0.045 288);
     --bs-app-badge-height: 1.28rem;
     --bs-app-badge-line-height: calc(var(--bs-app-badge-height) - 2px);
     --bs-app-field: oklch(0.54 0.044 281 / 0.22);
@@ -1118,7 +1124,9 @@
       --radix-dropdown-menu-content-available-height,
       var(--bits-dropdown-menu-content-available-height, min(32rem, calc(100vh - 2rem)))
     );
-    overflow: hidden;
+    /* max-height above means long menus must scroll, not clip. */
+    overflow-x: hidden;
+    overflow-y: auto;
     border: 1px solid var(--bs-app-popover-line);
     border-radius: 8px;
     background: var(--bs-app-inset-surface);
@@ -1936,6 +1944,12 @@
     opacity: 0.5;
   }
 
+  .bs-switch-thumb.is-centered {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
   .bs-switch-thumb {
     pointer-events: none;
     display: block;
@@ -2034,6 +2048,7 @@
     --bs-settings-popover: oklch(0.11 0.014 278 / 0.96);
     --bs-settings-field-line: var(--bs-app-field-line);
     --bs-settings-field-line-hover: var(--bs-app-field-line-hover);
+    --bs-settings-field-max: 18.75rem;
     --bs-settings-line: oklch(0.62 0.024 282 / 0.2);
     --bs-settings-inner-line: oklch(0.62 0.024 282 / 0.12);
     --bs-settings-separator-line: oklch(0.96 0.006 289.95 / 0.1);
@@ -2098,6 +2113,13 @@
     --bs-settings-danger: oklch(0.72 0.265 358);
     --bs-settings-danger-line: oklch(0.72 0.265 358 / 0.42);
     --bs-settings-danger-bg: oklch(0.17 0.075 358 / 0.38);
+    /* Warning status TEXT. Settings had no warning token, so warning messages
+       reached for Tailwind's amber scale and rendered in three different
+       ambers across the panels. Josh picked this one (2026-08-28): it is
+       exactly Tailwind amber-600, the orange four of those sites already
+       shipped. Deliberately more saturated than the warning badge/pill text,
+       which reads amber already because it has an amber chip behind it. */
+    --bs-settings-warning: oklch(0.666 0.179 58.318);
     --bs-settings-radius-sm: 5px;
     --bs-settings-radius-md: 7px;
     --bs-settings-radius-lg: 8px;
@@ -2530,6 +2552,14 @@
     border-top: 1px solid var(--bs-settings-line);
   }
 
+  /* Concentric-radius correction (2026-08-26): an inset box sitting 1rem inside an
+     8px-radius card shell reads wrong at the same 8px radius, so inset surfaces
+     nested in accordion content step down to the small radius. */
+  .batshit-settings-accordion-card-content .batshit-settings-form-stack,
+  .batshit-settings-accordion-card-content .batshit-settings-action-row {
+    border-radius: var(--bs-settings-radius-sm);
+  }
+
   .batshit-settings-sheet .batshit-settings-tool-grid-dropdown-card {
     overflow: visible;
     border: 0;
@@ -2553,6 +2583,11 @@
     overflow: clip;
     border: 1px solid var(--bs-settings-card-rim);
     background: var(--bs-settings-accordion-content);
+  }
+
+  .batshit-settings-l1-card.is-column {
+    display: flex;
+    flex-direction: column;
   }
 
   .batshit-settings-l1-card > [data-slot='card-header'],
@@ -2752,6 +2787,14 @@
     border-color: oklch(0.62 0.08 235 / 0.26);
     background: oklch(0.2 0.055 235 / 0.28);
     color: oklch(0.78 0.055 235);
+  }
+
+  /* Violet accent tone (2026-08-29): trigger-word badges — visually distinct from
+     is-info importance badges and the neutral date badges. */
+  .batshit-settings-status-badge.is-accent {
+    border-color: oklch(0.58 0.07 286 / 0.34);
+    background: oklch(0.3 0.06 286 / 0.3);
+    color: oklch(0.8 0.06 288);
   }
 
   .batshit-goon-brand-strip {
@@ -4113,6 +4156,11 @@
     color: var(--bs-app-success-text);
   }
 
+  .batshit-settings-empty-state.is-compact {
+    min-height: 0;
+    padding: 1rem;
+  }
+
   .batshit-settings-inline-alert.is-dashed,
   .batshit-settings-empty-state.is-dashed {
     border-style: solid;
@@ -4293,6 +4341,12 @@
     border-color: oklch(0.78 0.08 62 / 0.28);
     background: oklch(0.16 0.05 62 / 0.3);
     color: oklch(0.84 0.07 68);
+  }
+
+  /* A pill wrapping an interactive control (switch, checkbox) rather than plain
+     text. The text gap is too tight once a control sits next to the label. */
+  .batshit-settings-pill.is-control {
+    gap: 0.5rem;
   }
 
   .batshit-settings-save-status {
@@ -5238,6 +5292,10 @@
     padding: 0.68rem 0.78rem;
   }
 
+  .batshit-settings-action-row.is-end {
+    justify-content: flex-end;
+  }
+
   .batshit-settings-action-row-title {
     color: var(--bs-settings-title);
     font-size: 0.8rem;
@@ -5518,6 +5576,53 @@
     width: 100%;
   }
 
+  /* Bounded Fields rule: Settings inputs, select triggers, and field-like
+     buttons cap at --bs-settings-field-max (Josh's 300px field rule) instead
+     of spanning the whole form column. Textareas (prompt/JSON editors) stay
+     full width by design. `is-wide` on the control opts out the few fields
+     that genuinely need width: URLs and filesystem paths. */
+  .batshit-settings-form-control :where(input, [data-slot='select-trigger']),
+  .batshit-settings-form-control-group :where(input, [data-slot='select-trigger']),
+  .batshit-settings-form-control > :where(button),
+  .batshit-settings-form-control-group > :where(button) {
+    max-width: var(--bs-settings-field-max);
+  }
+
+  /* A field with companion buttons (refresh, test, manual toggle). The cap
+     belongs to the field, not the cluster: capping the cluster would make the
+     companion eat into the field, and a wide text button crushes the field to
+     an unreadable sliver. The field still stops at the field max, so field
+     right edges line up down the column, and companions sit just past it. */
+  .batshit-settings-field-cluster {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  /* When a cluster wraps its field in a lane div, that lane owns the width.
+     Left to stretch, the lane shoves the companion out to the far column edge,
+     so pin it to the field max: the field lands on the same right edge as a
+     lone field above and below it, and the companion sits just past it. Use
+     this class instead of `min-w-0 flex-1` on a cluster's field wrapper. */
+  .batshit-settings-field-lane {
+    min-width: 0;
+    width: var(--bs-settings-field-max);
+    max-width: 100%;
+    flex: 0 1 var(--bs-settings-field-max);
+  }
+
+  .batshit-settings-form-control.is-wide .batshit-settings-field-lane,
+  .batshit-settings-form-control-group.is-wide .batshit-settings-field-lane {
+    width: auto;
+    flex: 1 1 auto;
+  }
+
+  .batshit-settings-form-control.is-wide :where(input, [data-slot='select-trigger'], button),
+  .batshit-settings-form-control-group.is-wide :where(input, [data-slot='select-trigger'], button) {
+    max-width: none;
+  }
+
   .batshit-settings-form-control.is-compact-action > :where(button) {
     width: auto;
     min-width: 4rem;
@@ -5686,6 +5791,46 @@
     color: var(--bs-settings-muted-text);
     font-size: 0.7rem;
     line-height: 1.2;
+  }
+
+  /* Status text. These four classes all default to muted text; a message that
+     needs to read as an error, warning, or success says so with a modifier
+     instead of a Tailwind color utility. A utility would win anyway (utilities
+     resolve after this layer), leaving two owners on `color` -- and it lands
+     off Batshit's palette, which is how warning text ended up rendering in
+     three different ambers. `npm run check:styles` guards this.
+
+     Scoped to the sheet/dialog on purpose: the later
+     `.batshit-settings-sheet .batshit-settings-form-label` rule is also two
+     classes, so an unscoped modifier would tie and lose on source order. */
+  :is(.batshit-settings-sheet, .batshit-settings-dialog)
+    :is(
+      .batshit-settings-form-meta,
+      .batshit-settings-form-help,
+      .batshit-settings-form-label,
+      .batshit-settings-caption
+    ).is-error {
+    color: var(--bs-settings-danger);
+  }
+
+  :is(.batshit-settings-sheet, .batshit-settings-dialog)
+    :is(
+      .batshit-settings-form-meta,
+      .batshit-settings-form-help,
+      .batshit-settings-form-label,
+      .batshit-settings-caption
+    ).is-warning {
+    color: var(--bs-settings-warning);
+  }
+
+  :is(.batshit-settings-sheet, .batshit-settings-dialog)
+    :is(
+      .batshit-settings-form-meta,
+      .batshit-settings-form-help,
+      .batshit-settings-form-label,
+      .batshit-settings-caption
+    ).is-success {
+    color: var(--bs-app-success-text);
   }
 
   .batshit-settings-collapsible-trigger {
@@ -6087,9 +6232,10 @@
   }
 
   .batshit-settings-sheet code.rounded {
-    border: 1px solid var(--bs-settings-line);
-    background: oklch(0.048 0.007 250 / 0.88);
-    color: var(--bs-settings-label);
+    border: 1px solid var(--bs-inline-code-line);
+    border-radius: 0.3125rem;
+    background: var(--bs-inline-code-bg);
+    color: var(--bs-inline-code-text);
     font-size: 0.7rem;
     letter-spacing: 0;
   }
@@ -6648,6 +6794,11 @@
     letter-spacing: 0;
   }
 
+  .batshit-settings-sheet .batshit-settings-child-label.is-strong,
+  .batshit-settings-sheet [data-slot='label'].batshit-settings-child-label.is-strong {
+    color: var(--bs-settings-title);
+  }
+
   .batshit-settings-sheet .batshit-settings-child-label.is-disabled,
   .batshit-settings-sheet [data-slot='label'].batshit-settings-child-label.is-disabled {
     color: var(--bs-settings-disabled-text);
@@ -6768,11 +6919,11 @@
   }
 
   .batshit-settings-info-content code {
-    border: 1px solid var(--bs-settings-line, var(--bs-settings-info-line));
-    border-radius: var(--bs-settings-radius-sm, var(--bs-settings-info-radius-sm));
-    background: oklch(0.035 0.006 250 / 0.78);
+    border: 1px solid var(--bs-inline-code-line);
+    border-radius: 0.3125rem;
+    background: var(--bs-inline-code-bg);
     padding: 0.03rem 0.24rem;
-    color: var(--bs-settings-label, var(--bs-settings-info-label));
+    color: var(--bs-inline-code-text);
     font-size: 0.68rem;
   }
 
@@ -7039,6 +7190,10 @@
       background-color 150ms ease-out,
       border-color 150ms ease-out,
       color 150ms ease-out;
+  }
+
+  .settings-sidebar-item.is-row {
+    display: flex;
   }
 
   .settings-sidebar-item:last-child {

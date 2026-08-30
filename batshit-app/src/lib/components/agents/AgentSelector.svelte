@@ -22,6 +22,7 @@
 		getPrimaryAgentDisplayLabel,
 		normalizePrimaryAgentType
 	} from '$lib/utils/primaryAgentType';
+	import { isFixedSession } from '$lib/utils/fixedSession';
 	
 const { data } = $props();
 const AGENT_CREATE_SENTINEL = '__create__';
@@ -221,6 +222,16 @@ $effect(() => {
 			});
 			return;
 		}
+		// 2026-08-29: an Infinite Session is one agent's life — the picker is frozen
+		// to that agent (the group-refusal pattern; a server-side episode guard backstops).
+		if (isFixedSession(currentSession) && currentAgent && agentId !== currentAgent.id) {
+			const ownerName = getAgentDisplayName(currentAgent);
+			toast.error(`This Infinite Session is ${ownerName}'s.`, {
+				description:
+					'Infinite Sessions stay with one agent for life. Start a regular chat to talk to someone else.'
+			});
+			return;
+		}
 		agentStore.setCurrentAgentId(agentId);
 		await persistGroupSelection(null);
 		open = false;
@@ -229,6 +240,15 @@ $effect(() => {
 	async function handleSelectGroup(groupId: string) {
 		const group = groups.find((item) => item.id === groupId);
 		if (!group) return;
+
+		// SA-104 P5 (DL-104-12): Infinite Sessions are single-agent; group entry is refused
+		// here, at the fixed-transition route, and at send-routed's group config load.
+		if (isFixedSession(currentSession)) {
+			toast.error('Infinite Sessions do not support group chat.', {
+				description: 'This chat is one agent living in one ongoing conversation. Use a regular session for groups.'
+			});
+			return;
+		}
 
 		const validAgentIds = getValidGroupAgentIds(group);
 
@@ -568,7 +588,11 @@ function handleEditClick(e: Event, agentId: string) {
 
 		{#if agents.length > 0}
 			{#each agents as agent (agent.id)}
-				{@const unavailableReason = getAgentUnavailableReason(agent)}
+				{@const frozenReason =
+					isFixedSession(currentSession) && currentAgent && agent.id !== currentAgent.id
+						? 'Infinite Session'
+						: null}
+				{@const unavailableReason = getAgentUnavailableReason(agent) ?? frozenReason}
 				<div class="agent-selector-menu-row flex items-center gap-2 {agent.id === currentAgent?.id ? 'border-l-2 border-r-2 border-primary pl-2 pr-2' : 'pl-3 pr-3'}" class:is-unavailable={Boolean(unavailableReason)}>
 					<DropdownMenu.Item
 						onSelect={() => handleSelect(agent.id)}
@@ -621,10 +645,11 @@ function handleEditClick(e: Event, agentId: string) {
 				{#each groups as group (group.id)}
 					{@const validAgentIds = getValidGroupAgentIds(group)}
 					{@const isRunnable = validAgentIds.length >= 2}
-					<div class="agent-selector-menu-row flex items-center gap-2 {group.id === activeGroupId ? 'border-l-2 border-r-2 border-primary pl-2 pr-2' : 'pl-3 pr-3'}">
+					{@const groupFrozen = isFixedSession(currentSession)}
+					<div class="agent-selector-menu-row flex items-center gap-2 {group.id === activeGroupId ? 'border-l-2 border-r-2 border-primary pl-2 pr-2' : 'pl-3 pr-3'}" class:is-unavailable={groupFrozen}>
 						<DropdownMenu.Item
 							onSelect={() => handleSelectGroup(group.id)}
-							disabled={!isRunnable}
+							disabled={!isRunnable || groupFrozen}
 							class="agent-selector-menu-item flex items-center gap-2 flex-1"
 							aria-label={`Switch chat target to group ${getGroupDisplayName(group)}`}
 							title={`Switch chat target to group ${getGroupDisplayName(group)}`}
@@ -642,7 +667,9 @@ function handleEditClick(e: Event, agentId: string) {
 								<span class="agent-selector-group-badge">
 									Group
 								</span>
-								{#if !isRunnable}
+								{#if groupFrozen}
+									<span class="agent-selector-unavailable-reason">Infinite Session</span>
+								{:else if !isRunnable}
 									<span class="text-[10px] text-muted-foreground">(Need 2 agents)</span>
 								{/if}
 							</span>

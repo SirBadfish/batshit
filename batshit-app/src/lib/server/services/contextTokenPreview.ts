@@ -402,7 +402,7 @@ async function loadPrimarySavedModel(agent: AgentRow): Promise<SavedModel | null
   return model && typeof model === 'object' ? model as SavedModel : null
 }
 
-async function resolveAgentBudgetSettings(agent: AgentRow) {
+export async function resolveAgentBudgetSettings(agent: AgentRow) {
   const preset = await loadPrimarySavedModel(agent)
   const selection = resolveRuntimeModelSelection({
     preset,

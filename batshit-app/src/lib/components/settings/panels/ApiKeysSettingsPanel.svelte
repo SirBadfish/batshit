@@ -1222,7 +1222,7 @@ function getServiceIconRef(row: ApiKeyServiceDefinition): IconRef {
                   </Badge>
                 {/if}
                 <ChevronDown
-                  class={`batshit-settings-accordion-card-chevron h-4 w-4 shrink-0 transition-transform ${openGroupId === group.id ? 'rotate-180' : ''}`}
+                  class={`batshit-settings-accordion-card-chevron h-4 w-4 shrink-0 ${openGroupId === group.id ? 'rotate-180' : ''}`}
                 />
               </span>
             </button>

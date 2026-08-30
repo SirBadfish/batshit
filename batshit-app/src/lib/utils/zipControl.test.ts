@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  extractToolNotes,
   extractZipControl,
   hideStreamingHiddenControlBlocks,
   resolveZipControlZipIds,
@@ -190,5 +191,152 @@ describe('resolveZipControlZipIds', () => {
         }
       )
     ).toEqual([first])
+  })
+})
+
+describe('extractToolNotes (SA-104 P1 tag split)', () => {
+  it('extracts notes from a tagged tool-notes block and cleans the content', () => {
+    const content = [
+      'Here is my answer.',
+      '<batshit-tool-notes>',
+      '{"notes":[{"toolName":"web_search","summary":"Redis 8.10.1 is latest"}]}',
+      '</batshit-tool-notes>'
+    ].join('\n')
+
+    const result = extractToolNotes(content)
+    expect(result.hadBlock).toBe(true)
+    expect(result.payload?.notes).toEqual([
+      { toolName: 'web_search', summary: 'Redis 8.10.1 is latest' }
+    ])
+    expect(result.cleaned).toBe('Here is my answer.')
+    expect(result.parseError).toBeUndefined()
+  })
+
+  it('accepts a tool-notes block anywhere in the message (position-flexible)', () => {
+    const content = [
+      'Intro.',
+      '<batshit-tool-notes>{"notes":[{"summary":"mid-message note"}]}</batshit-tool-notes>',
+      'Outro.'
+    ].join('\n')
+
+    const result = extractToolNotes(content)
+    expect(result.payload?.notes).toEqual([{ summary: 'mid-message note' }])
+    expect(result.cleaned).toBe('Intro.\n\nOutro.')
+  })
+
+  it('extracts a trailing bare notes payload', () => {
+    const content = 'Answer text.\n{"notes":[{"summary":"bare note"}]}'
+    const result = extractToolNotes(content)
+    expect(result.hadBlock).toBe(true)
+    expect(result.payload?.notes).toEqual([{ summary: 'bare note' }])
+    expect(result.cleaned).toBe('Answer text.')
+  })
+
+  it('reports a parse error for malformed JSON instead of silently dropping', () => {
+    const content = 'Text.\n<batshit-tool-notes>{"notes":[oops]}</batshit-tool-notes>'
+    const result = extractToolNotes(content)
+    expect(result.hadBlock).toBe(true)
+    expect(result.payload).toBeUndefined()
+    expect(result.parseError).toBeTruthy()
+    expect(result.cleaned).toBe('Text.')
+  })
+
+  it('reports a parse error when the payload has no notes shape', () => {
+    const content = '<batshit-tool-notes>{"wrong":"shape"}</batshit-tool-notes>'
+    const result = extractToolNotes(content)
+    expect(result.hadBlock).toBe(true)
+    expect(result.parseError).toContain('notes')
+  })
+
+  it('leaves zip-control blocks alone so extraction can chain', () => {
+    const content = [
+      'Answer.',
+      '<batshit-tool-notes>{"notes":[{"summary":"n1"}]}</batshit-tool-notes>',
+      '<batshit-zip-control>{"unzip":["z1"]}</batshit-zip-control>'
+    ].join('\n')
+
+    const notes = extractToolNotes(content)
+    expect(notes.payload?.notes).toEqual([{ summary: 'n1' }])
+    expect(notes.cleaned).toContain('<batshit-zip-control>')
+
+    const zip = extractZipControl(notes.cleaned)
+    expect(zip.payload?.unzip).toEqual(['z1'])
+    expect(zip.cleaned).toBe('Answer.')
+  })
+})
+
+describe('zip-control clean break (notes moved to their own tag)', () => {
+  it('no longer absorbs legacy note fields and flags the drop loudly', () => {
+    const content =
+      '<batshit-zip-control>{"unzip":["z1"],"toolResultsSummary":[{"summary":"legacy"}]}</batshit-zip-control>'
+    const result = extractZipControl(content)
+    expect(result.payload?.unzip).toEqual(['z1'])
+    expect(result.payload?.toolResultsSummary).toEqual([])
+    expect(result.payload?.legacyNotesDropped).toBe(true)
+  })
+
+  it('does not flag payloads without legacy note keys', () => {
+    const content = '<batshit-zip-control>{"unzip":["z1"],"zip":[]}</batshit-zip-control>'
+    const result = extractZipControl(content)
+    expect(result.payload?.legacyNotesDropped).toBeUndefined()
+  })
+
+  it('strips tool-notes blocks in stripZipControlBlocks so compiled views never show them', () => {
+    const content = [
+      'Visible.',
+      '<batshit-tool-notes>{"notes":[{"summary":"n"}]}</batshit-tool-notes>',
+      '<batshit-zip-control>{"unzip":[]}</batshit-zip-control>'
+    ].join('\n')
+    expect(stripZipControlBlocks(content)).toBe('Visible.')
+  })
+})
+
+describe('hideStreamingHiddenControlBlocks (registry-driven additions)', () => {
+  it('hides tool-notes blocks at start, middle, and end positions', () => {
+    const block = '<batshit-tool-notes>{"notes":[{"summary":"n"}]}</batshit-tool-notes>'
+    expect(hideStreamingHiddenControlBlocks(`${block}\nAfter.`)).toBe('After.')
+    expect(hideStreamingHiddenControlBlocks(`Before.\n${block}\nAfter.`)).toBe('Before.\n\nAfter.')
+    expect(hideStreamingHiddenControlBlocks(`Before.\n${block}`)).toBe('Before.')
+  })
+
+  it('withholds an unclosed tool-notes block from render', () => {
+    const content = 'Visible.\n<batshit-tool-notes>{"notes":['
+    expect(hideStreamingHiddenControlBlocks(content)).toBe('Visible.')
+  })
+
+  it('holds back a trailing partial control-tag prefix so it never flashes', () => {
+    expect(hideStreamingHiddenControlBlocks('Streaming text <batshit-cu')).toBe('Streaming text')
+    expect(hideStreamingHiddenControlBlocks('Streaming text <batshit-tool-no')).toBe(
+      'Streaming text'
+    )
+  })
+
+  it('hides a bare notes-only payload from render', () => {
+    const content = 'Visible.\n{"notes":[{"summary":"bare"}]}'
+    expect(hideStreamingHiddenControlBlocks(content)).toBe('Visible.')
+  })
+})
+
+describe('memory save blocks (SA-104 P3 registry addition)', () => {
+  const memoryBlock = '<batshit-memory>{"lane":"ltm","content":"a fact"}</batshit-memory>'
+
+  it('hides memory blocks from streaming render at start, middle, and end', () => {
+    expect(hideStreamingHiddenControlBlocks(`${memoryBlock}\nAfter.`)).toBe('After.')
+    expect(hideStreamingHiddenControlBlocks(`Before.\n${memoryBlock}\nAfter.`)).toBe(
+      'Before.\n\nAfter.'
+    )
+    expect(hideStreamingHiddenControlBlocks(`Before.\n${memoryBlock}`)).toBe('Before.')
+  })
+
+  it('withholds an unclosed memory block and a partial memory-tag prefix from render', () => {
+    expect(hideStreamingHiddenControlBlocks('Visible.\n<batshit-memory>{"lane":"ltm"')).toBe(
+      'Visible.'
+    )
+    expect(hideStreamingHiddenControlBlocks('Streaming text <batshit-mem')).toBe('Streaming text')
+  })
+
+  it('strips memory blocks in stripZipControlBlocks so compiled AI views never re-see saves', () => {
+    const content = ['Visible.', memoryBlock, memoryBlock].join('\n')
+    expect(stripZipControlBlocks(content)).toBe('Visible.')
   })
 })

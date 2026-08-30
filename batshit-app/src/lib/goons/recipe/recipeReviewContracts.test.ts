@@ -6,37 +6,41 @@ import {
 
 const hash = (character: string) => character.repeat(64)
 
-const hairTargetState = (id: string, definitionCharacter: string, stateCharacter: string) => ({
-  id,
-  contract: 'hair-state/v2',
-  definitionSha256: hash(definitionCharacter),
-  stateSha256: hash(stateCharacter),
-  state: { schemaVersion: 'hair-state/v2' }
-})
-
 describe('Recipe review external sibling contracts', () => {
   it('serializes external sibling validation in deterministic source-id order', () => {
     expect(
       serializeRecipeExternalSiblingInputs([
         {
-          sourceStateId: 'hairStateB',
-          targetStateId: 'hairStateB',
+          sourceStateId: 'hairState',
+          targetStateId: 'hairState',
           validationSha256: hash('2'),
-          message: 'Hair B remains exactly compatible.',
-          targetState: hairTargetState('hairStateB', 'a', 'b')
+          message: 'Hair remains exactly compatible.',
+          targetState: {
+            id: 'hairState',
+            contract: 'hair-state/v2',
+            definitionSha256: hash('a'),
+            stateSha256: hash('b'),
+            state: { schemaVersion: 'hair-state/v2' }
+          }
         },
         {
-          sourceStateId: 'hairStateA',
-          targetStateId: 'hairStateA',
+          sourceStateId: 'clothingState',
+          targetStateId: 'clothingState',
           validationSha256: hash('1'),
-          message: 'Hair A remains exactly compatible.',
-          targetState: hairTargetState('hairStateA', 'c', 'd')
+          message: 'Clothing remains exactly compatible.',
+          targetState: {
+            id: 'clothingState',
+            contract: 'clothing-state/v1',
+            definitionSha256: hash('c'),
+            stateSha256: hash('d'),
+            state: { schemaVersion: 'clothing-state/v1' }
+          }
         },
       ]).map((input) => input.sourceStateId),
-    ).toEqual(['hairStateA', 'hairStateB'])
+    ).toEqual(['clothingState', 'hairState'])
   })
 
-  it('rejects identity-changing or unsorted external bindings', () => {
+  it('rejects duplicate, unsorted, or identity-changing external bindings', () => {
     expect(() =>
       serializeRecipeExternalSiblingInputs([
         {
@@ -44,7 +48,13 @@ describe('Recipe review external sibling contracts', () => {
           targetStateId: 'hairState-v2',
           validationSha256: hash('2'),
           message: 'Identity changed.',
-          targetState: hairTargetState('hairState-v2', 'a', 'b')
+          targetState: {
+            id: 'hairState-v2',
+            contract: 'hair-state/v2',
+            definitionSha256: hash('a'),
+            stateSha256: hash('b'),
+            state: { schemaVersion: 'hair-state/v2' }
+          }
         },
       ]),
     ).toThrow(/retain the exact external sibling state id/)
@@ -52,18 +62,30 @@ describe('Recipe review external sibling contracts', () => {
     expect(() =>
       deserializeRecipeExternalSiblingInputs([
         {
-          sourceStateId: 'hairStateB',
-          targetStateId: 'hairStateB',
+          sourceStateId: 'hairState',
+          targetStateId: 'hairState',
           validationSha256: hash('2'),
-          message: 'Hair B remains exactly compatible.',
-          targetState: hairTargetState('hairStateB', 'a', 'b')
+          message: 'Hair remains exactly compatible.',
+          targetState: {
+            id: 'hairState',
+            contract: 'hair-state/v2',
+            definitionSha256: hash('a'),
+            stateSha256: hash('b'),
+            state: { schemaVersion: 'hair-state/v2' }
+          }
         },
         {
-          sourceStateId: 'hairStateA',
-          targetStateId: 'hairStateA',
+          sourceStateId: 'clothingState',
+          targetStateId: 'clothingState',
           validationSha256: hash('1'),
-          message: 'Hair A remains exactly compatible.',
-          targetState: hairTargetState('hairStateA', 'c', 'd')
+          message: 'Clothing remains exactly compatible.',
+          targetState: {
+            id: 'clothingState',
+            contract: 'clothing-state/v1',
+            definitionSha256: hash('c'),
+            stateSha256: hash('d'),
+            state: { schemaVersion: 'clothing-state/v1' }
+          }
         },
       ]),
     ).toThrow(/sorted and unique/)

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button'
   import * as Tooltip from '$lib/components/ui/tooltip'
-  import { Archive, Bug, Coins, FileText, RotateCcw, Scissors } from '@lucide/svelte'
+  import { Archive, Bug, Coins, FileText, Moon, RotateCcw, Scissors } from '@lucide/svelte'
 
   let {
     currentTokens = 0,
@@ -22,8 +22,14 @@
     compactBusy = false,
     compactStatus = null,
     compactedTokens = 0,
+    napMode = false,
+    napAvailable = false,
+    napUnavailableReason = 'Nap is unavailable.',
+    napBusy = false,
+    napStatus = null,
     onTrim = () => {},
     onCompact = () => {},
+    onNap = () => {},
     onResetTrim = () => {},
     onOpenDiagnostics = () => {},
     onOpenExecutionViewer = () => {}
@@ -46,8 +52,15 @@
     compactBusy?: boolean
     compactStatus?: string | null
     compactedTokens?: number
+    /** SA-104 P6: Infinite Sessions replace Compact with the nap. */
+    napMode?: boolean
+    napAvailable?: boolean
+    napUnavailableReason?: string
+    napBusy?: boolean
+    napStatus?: string | null
     onTrim?: (tokensToTrim: number) => void | Promise<void>
     onCompact?: () => void | Promise<void>
+    onNap?: () => void | Promise<void>
     onResetTrim?: () => void
     onOpenDiagnostics?: () => void
     onOpenExecutionViewer?: () => void
@@ -101,6 +114,11 @@
   function handleCompactClick() {
     if (!compactAvailable || compactBusy) return
     onCompact()
+  }
+
+  function handleNapClick() {
+    if (!napAvailable || napBusy) return
+    onNap()
   }
 
   function formatTrimmed(value: number): string {
@@ -221,24 +239,45 @@
         <RotateCcw class="token-panel-icon-button-icon" />
       </Button>
 
-      <Button
-        size="sm"
-        variant="outline"
-        onclick={handleCompactClick}
-        disabled={!compactAvailable || compactBusy}
-        class="token-panel-trim-button"
-        aria-label="Compact older chat context"
-        title={compactBusy ? (compactStatus || 'Compacting context') : compactAvailable ? 'Compact older chat context' : compactUnavailableReason}
-        data-testid="token-compact-button"
-        data-ab-control="token-compact"
-      >
-        {#if compactBusy}
-          <span class="token-panel-spinner" aria-hidden="true"></span>
-        {:else}
-          <Archive class="token-panel-button-icon" />
-        {/if}
-        {compactBusy ? 'Compacting...' : 'Compact'}
-      </Button>
+      {#if napMode}
+        <Button
+          size="sm"
+          variant="outline"
+          onclick={handleNapClick}
+          disabled={!napAvailable || napBusy}
+          class="token-panel-trim-button"
+          aria-label="Nap: graduate episodes and tidy context"
+          title={napBusy ? (napStatus || 'Napping') : napAvailable ? 'Nap: graduate closed episodes, compress stale bulk, and refresh the whiteboard' : napUnavailableReason}
+          data-testid="token-nap-button"
+          data-ab-control="token-nap"
+        >
+          {#if napBusy}
+            <span class="token-panel-spinner" aria-hidden="true"></span>
+          {:else}
+            <Moon class="token-panel-button-icon" />
+          {/if}
+          {napBusy ? 'Napping...' : 'Nap'}
+        </Button>
+      {:else}
+        <Button
+          size="sm"
+          variant="outline"
+          onclick={handleCompactClick}
+          disabled={!compactAvailable || compactBusy}
+          class="token-panel-trim-button"
+          aria-label="Compact older chat context"
+          title={compactBusy ? (compactStatus || 'Compacting context') : compactAvailable ? 'Compact older chat context' : compactUnavailableReason}
+          data-testid="token-compact-button"
+          data-ab-control="token-compact"
+        >
+          {#if compactBusy}
+            <span class="token-panel-spinner" aria-hidden="true"></span>
+          {:else}
+            <Archive class="token-panel-button-icon" />
+          {/if}
+          {compactBusy ? 'Compacting...' : 'Compact'}
+        </Button>
+      {/if}
 
       <span class="token-panel-trimmed">{formatCompacted(compactedTokens)}</span>
 
@@ -274,6 +313,12 @@
       <div class="token-panel-compact-status" role="status" aria-live="polite">
         <span class="token-panel-spinner is-inline" aria-hidden="true"></span>
         <span>{compactStatus || 'Compacting context...'}</span>
+      </div>
+    {/if}
+    {#if napBusy}
+      <div class="token-panel-compact-status" role="status" aria-live="polite">
+        <span class="token-panel-spinner is-inline" aria-hidden="true"></span>
+        <span>{napStatus || 'Napping...'}</span>
       </div>
     {/if}
   </div>

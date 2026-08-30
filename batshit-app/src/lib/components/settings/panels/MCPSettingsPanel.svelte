@@ -347,7 +347,7 @@
                 <DropdownMenu.Trigger
                   class={cn(
                     buttonVariants({ size: 'sm' }),
-                    'batshit-button batshit-button-medium batshit-button-medium-primary gap-2'
+                    'batshit-button batshit-button-medium batshit-button-medium-primary'
                   )}
                 >
                   <Plus class="h-4 w-4" />
@@ -380,7 +380,7 @@
           </div>
 
           {#if loading && gateways.length === 0}
-            <div class="flex items-center justify-center batshit-settings-empty-state">
+            <div class="batshit-settings-empty-state">
               <RefreshCw class="mr-2 h-4 w-4 animate-spin" />
               Loading MCP sources…
             </div>
@@ -396,7 +396,7 @@
                     <DropdownMenu.Trigger
                       class={cn(
                         buttonVariants(),
-                        'batshit-button batshit-button-large batshit-button-large-primary gap-2'
+                        'batshit-button batshit-button-large batshit-button-large-primary'
                       )}
                     >
                       <Plus class="h-4 w-4" />

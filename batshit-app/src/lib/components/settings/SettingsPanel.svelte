@@ -3,6 +3,7 @@ import { onMount } from 'svelte'
 import type { Component } from 'svelte'
 import {
   AudioLines,
+  Brain,
   Code2,
   KeyRound,
   Palette,
@@ -311,6 +312,13 @@ const tabs: TabDefinition[] = [
     content: { kind: 'component', loader: () => import('./panels/SlashCommandSettingsPanel.svelte'), props: () => ({ data }) }
   },
   {
+    value: 'memory',
+    label: 'Memory',
+    section: 2,
+    icon: { type: 'lucide', component: Brain },
+    content: { kind: 'component', loader: () => import('./panels/MemorySettingsPanel.svelte') }
+  },
+  {
     value: '3d-goons',
     label: '3D Goons',
     section: 3,
@@ -494,10 +502,10 @@ $effect(() => {
 
     <form
       id="batshit-settings-form"
-      class="batshit-settings-form flex flex-col gap-0 min-h-0"
+      class="batshit-settings-form flex flex-col gap-0"
       onsubmit={(event) => event.preventDefault()}
     >
-      <Tabs.Root value={activeTab} onValueChange={handleSettingsTabChange} class="batshit-settings-tabs flex flex-col gap-0 min-h-0">
+      <Tabs.Root value={activeTab} onValueChange={handleSettingsTabChange} class="batshit-settings-tabs flex flex-col gap-0">
       <!-- Mobile grid (below 768px) -->
       <h5 class="batshit-settings-mobile-title md:hidden text-center">SETTINGS</h5>
       <TabsPrimitive.List class="batshit-settings-mobile-grid relative z-[var(--z-surface)] p-2 grid w-full grid-cols-2 gap-2 sm:grid-cols-3 md:hidden">
@@ -506,7 +514,7 @@ $effect(() => {
             {#each section as tab}
               <TabsPrimitive.Trigger
                 value={tab.value}
-                class="batshit-settings-mobile-tab inline-flex w-full items-center gap-2 text-left transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                class="batshit-settings-mobile-tab inline-flex w-full items-center gap-2 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
               >
                 <span class="batshit-settings-nav-icon inline-flex size-5 shrink-0 items-center justify-center" aria-hidden="true">
                   {#if tab.icon.type === 'lucide'}
@@ -544,7 +552,7 @@ $effect(() => {
               {#each section as tab}
                 <TabsPrimitive.Trigger
                   value={tab.value}
-                  class="batshit-settings-rail-item inline-flex items-center justify-start gap-2 transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  class="batshit-settings-rail-item inline-flex items-center justify-start gap-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
                 >
                   <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center" aria-hidden="true">
                     {#if tab.icon.type === 'lucide'}
@@ -576,7 +584,7 @@ $effect(() => {
           </TabsPrimitive.List>
 
           <TabsPrimitive.List
-            class={`batshit-settings-nav-overlay absolute left-[72px] top-0 z-[var(--z-controls)] flex min-h-screen max-h-screen min-w-[240px] flex-col gap-2 border px-3 pt-0 pb-3 text-sm shadow-2xl backdrop-blur transition-opacity duration-150 overflow-y-auto ${
+            class={`batshit-settings-nav-overlay absolute left-[72px] top-0 z-[var(--z-controls)] flex min-h-screen max-h-screen min-w-[240px] flex-col gap-2 border px-3 pt-0 pb-3 text-sm backdrop-blur transition-opacity duration-150 overflow-y-auto ${
               isOverlayVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
             }`}
           >
@@ -585,7 +593,7 @@ $effect(() => {
               {#each section as tab}
                 <TabsPrimitive.Trigger
                   value={tab.value}
-                  class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
                 >
                   <span>{tab.label}</span>
                 </TabsPrimitive.Trigger>
@@ -606,7 +614,7 @@ $effect(() => {
             {#each section as tab}
               <TabsPrimitive.Trigger
                 value={tab.value}
-                class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
               >
                 <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center">
                   {#if tab.icon.type === 'lucide'}

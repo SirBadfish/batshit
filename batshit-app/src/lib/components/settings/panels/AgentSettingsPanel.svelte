@@ -135,6 +135,12 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
   import AgentDeleteDisclosure from "$lib/components/settings/agent/AgentDeleteDisclosure.svelte";
   import AgentSelectorSection from "$lib/components/settings/agent/AgentSelectorSection.svelte";
   import AgentAutoCompactSettingsCard from "$lib/components/settings/agent/AgentAutoCompactSettingsCard.svelte";
+  import AgentMemorySettingsCard from "$lib/components/settings/agent/AgentMemorySettingsCard.svelte";
+  import {
+    buildAgentMemoryRecordFields,
+    resolveAgentMemorySettingsDraft,
+    type AgentMemorySettingsDraft,
+  } from "$lib/utils/memoryControl";
   import AgentWebSearchDefaultsDisclosure from "$lib/components/settings/agent/AgentWebSearchDefaultsDisclosure.svelte";
   import SubagentAccessAssignmentsSection from "$lib/components/settings/agent/SubagentAccessAssignmentsSection.svelte";
   import {
@@ -319,6 +325,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     preserve_reasoning: boolean;
     tool_approval_mode: "off" | "all";
     auto_compact_settings: AgentAutoCompactSettings;
+    memory_settings: AgentMemorySettingsDraft;
     webhook_url: string;
     agent_url: string;
     default_project_id: string | null;
@@ -689,6 +696,11 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     show_reasoning: boolean;
     preserve_reasoning: boolean;
     tool_approval_mode?: "off" | "all" | null;
+    memory_enabled?: boolean;
+    memory_linger_turns?: number;
+    memory_recall_linger_turns?: number;
+    memory_lane_budgets?: Record<string, number>;
+    memory_window?: Record<string, any>;
     webhook_url: string | null;
     webhookUrl: string | null;
     agent_url: string | null;
@@ -4663,6 +4675,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       preserve_reasoning: false,
       tool_approval_mode: "off",
       auto_compact_settings: normalizeAgentAutoCompactSettings(null),
+      memory_settings: resolveAgentMemorySettingsDraft(null),
       webhook_url: "",
       agent_url: "",
       default_project_id: null,
@@ -4709,6 +4722,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
           ? "all"
           : "off",
       auto_compact_settings: normalizeAgentAutoCompactSettings(agent.auto_compact_settings),
+      memory_settings: resolveAgentMemorySettingsDraft(agent),
       webhook_url: agent.webhook_url ?? agent.webhookUrl ?? "",
       agent_url: agent.agent_url ?? "",
       default_project_id:
@@ -6196,6 +6210,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       preserve_reasoning: form.show_reasoning ? form.preserve_reasoning : false,
       tool_approval_mode: form.tool_approval_mode,
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
+      memory_settings: buildAgentMemoryRecordFields(form.memory_settings),
       webhook_url: form.webhook_url.trim(),
       agent_url: form.agent_url.trim(),
       default_project_id: form.default_project_id ?? null,
@@ -6234,6 +6249,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       auto_compact_settings: normalizeAgentAutoCompactSettings(
         form.auto_compact_settings,
       ),
+      memory_settings: cloneJsonValue(form.memory_settings),
       primary_model_connection: cloneJsonValue(form.primary_model_connection),
       provider_specific_settings: cloneJsonValue(form.provider_specific_settings),
       primary_model_stop_sequences: form.primary_model_stop_sequences
@@ -6337,6 +6353,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       tool_approval_mode:
         form.agentType !== "n8n" ? form.tool_approval_mode : null,
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
+      ...buildAgentMemoryRecordFields(form.memory_settings),
       webhook_url: normaliseStringOrNull(form.webhook_url),
       webhookUrl: normaliseStringOrNull(form.webhook_url),
       agent_url: normaliseStringOrNull(form.agent_url),
@@ -7850,7 +7867,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
 {#if listLoading}
   <div
-    class="flex items-center justify-center batshit-settings-empty-state"
+    class="batshit-settings-empty-state"
   >
     <div class="batshit-settings-caption flex items-center gap-3">
       <Loader2 class="h-4 w-4 animate-spin" />
@@ -8096,7 +8113,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                               {#if basicForm.agentType === "n8n" && unsupportedDefaultModelParams.length}
                                 <DropdownMenu.Root>
                                   <DropdownMenu.Trigger
-                                    class="batshit-settings-info-trigger is-amber inline-flex h-5 w-5 shrink-0 items-center justify-center"
+                                    class="batshit-settings-info-trigger is-amber inline-flex shrink-0 items-center justify-center"
                                     aria-label="About Ignored n8n Model Settings"
                                   >
                                     <Info class="h-3.5 w-3.5" />
@@ -8114,8 +8131,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                           </div>
                           <div class="batshit-settings-form-control">
                             <div class="batshit-settings-form-control-group">
-                              <div class="flex min-w-0 items-center gap-2">
-                                <div class="min-w-0 flex-1">
+                              <div class="batshit-settings-field-cluster">
+                                <div class="batshit-settings-field-lane">
                                   <Select.Root
                                     type="single"
                                     value={(selectedModelId ?? "") as unknown as string}
@@ -8212,7 +8229,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
                               {#if selectedModelId}
                                 {#if selectedPrimaryModelAvailability?.disabled}
-                                  <p class="batshit-settings-form-meta text-amber-600 dark:text-amber-400">
+                                  <p class="batshit-settings-form-meta is-warning">
                                     {selectedPrimaryModelAvailability.reason}
                                   </p>
                                 {/if}
@@ -8232,19 +8249,19 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                     {#if cliConnectionSetup.setupContext === "docker" && cliConnectionSetup.setupWorkingDirectory}
                                       <p class="batshit-settings-form-meta">
                                         Run from:
-                                        <code class="break-all rounded bg-background/80 px-1 py-0.5">
+                                        <code class="break-all rounded px-1 py-0.5">
                                           {cliConnectionSetup.setupWorkingDirectory}
                                         </code>
                                       </p>
                                     {/if}
                                     {#if cliLoginNote}
-                                      <p class="batshit-settings-form-meta text-amber-600 dark:text-amber-400">
+                                      <p class="batshit-settings-form-meta is-warning">
                                         {cliLoginNote}
                                       </p>
                                     {/if}
                                   </div>
                                   <div class="flex items-center gap-2">
-                                    <code class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded bg-background/80 px-2 py-1 text-[11px]">
+                                    <code class="min-w-0 flex-1 overflow-x-auto whitespace-nowrap rounded px-2 py-1 text-[11px]">
                                       {cliConnectionSetup.setupCommand}
                                     </code>
                                     <Button
@@ -8284,10 +8301,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   Loading connection status…
                                 </p>
                               {:else if isManagedPrimaryAgentType(basicForm.agentType) && modelConnectionOptionsError}
-                                <p class="batshit-settings-form-meta text-destructive">{modelConnectionOptionsError}</p>
+                                <p class="batshit-settings-form-meta is-error">{modelConnectionOptionsError}</p>
                               {/if}
                               {#if savedModelsError}
-                                <p class="batshit-settings-form-meta text-destructive">{savedModelsError}</p>
+                                <p class="batshit-settings-form-meta is-error">{savedModelsError}</p>
                               {/if}
                             </div>
                           </div>
@@ -8394,6 +8411,16 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                             })}
                         />
 
+                        <AgentMemorySettingsCard
+                          draft={basicForm.memory_settings}
+                          {savedModels}
+                          onChange={(nextDraft) =>
+                            (basicForm = {
+                              ...basicForm,
+                              memory_settings: nextDraft,
+                            })}
+                        />
+
                         {#if basicForm.agentType === "n8n"}
                           <div class="batshit-settings-form-row">
                             <div class="batshit-settings-form-copy">
@@ -8418,7 +8445,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                 </DropdownMenu.Root>
                               </div>
                             </div>
-                            <div class="batshit-settings-form-control">
+                            <div class="batshit-settings-form-control is-wide">
                               <Input
                                 id="agent-webhook"
                                 placeholder="http://localhost:5678/webhook/batshit_n8n_primary"
@@ -8450,7 +8477,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                 </DropdownMenu.Root>
                               </div>
                             </div>
-                            <div class="batshit-settings-form-control">
+                            <div class="batshit-settings-form-control is-wide">
                               <Input
                                 id="agent-workflow"
                                 placeholder="http://localhost:5678/workflow/..."
@@ -9686,7 +9713,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     {/each}
                   </ToggleGroup.Root>
                   {#if isDockerNativeRuntime()}
-                    <p class="batshit-settings-form-meta text-amber-600 dark:text-amber-400">
+                    <p class="batshit-settings-form-meta is-warning">
                       Docker runs Claude Code as non-root batshit-cli so Bypass Permissions can
                       work. If you see a root-runtime warning, rebuild the Docker app image and
                       rerun the Claude login command shown above.
@@ -11124,7 +11151,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   </SettingsInfoMenu>
                                 </div>
                               </div>
-                              <div class="batshit-settings-form-control">
+                              <div class="batshit-settings-form-control is-wide">
                                 <Input
                                   placeholder="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
                                   value={getNativeAgentBrowserExecutablePath()}
@@ -11170,7 +11197,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   </SettingsInfoMenu>
                                 </div>
                               </div>
-                              <div class="batshit-settings-form-control">
+                              <div class="batshit-settings-form-control is-wide">
                                 <Input
                                   placeholder="~/.batshit/ab-profile"
                                   value={getNativeAgentBrowserProfilePath()}
@@ -11543,10 +11570,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
 
             {#if voiceModeLockedBySpeechToSpeech}
               <div class="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3">
-                <p class="batshit-settings-form-label text-emerald-800 dark:text-emerald-200">
+                <p class="batshit-settings-form-label is-success">
                   Handled by selected speech-to-speech model
                 </p>
-                <p class="batshit-settings-form-meta text-emerald-700 dark:text-emerald-300">
+                <p class="batshit-settings-form-meta is-success">
                   {voiceModeLockLabel}
                 </p>
               </div>
@@ -11944,7 +11971,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                         </Select.Content>
                       </Select.Root>
                       {#if voiceProvidersError}
-                        <p class="batshit-settings-form-meta text-amber-600">{voiceProvidersError}</p>
+                        <p class="batshit-settings-form-meta is-warning">{voiceProvidersError}</p>
                       {/if}
                     </div>
                   </div>
@@ -11957,7 +11984,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     </div>
                   </div>
                   <div class="batshit-settings-form-control">
-                    <div class="flex min-w-0 items-center gap-2">
+                    <div class="batshit-settings-field-cluster">
                       {#if !voiceModelManual}
                         <Select.Root
                           type="single"
@@ -12004,7 +12031,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                           </Select.Content>
                         </Select.Root>
                       {:else}
-                        <div class="flex min-w-0 flex-1 items-center gap-2">
+                        <div class="batshit-settings-field-lane flex items-center gap-2">
                           <Input
                             id="voice-model"
                             class="min-w-0 flex-1"
@@ -12049,7 +12076,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                   </div>
                   <div class="batshit-settings-form-control">
                     <div class="batshit-settings-form-control-group">
-                      <div class="flex min-w-0 items-center gap-2">
+                      <div class="batshit-settings-field-cluster">
                         {#if canSelectAgentVoices && !voiceIdManual}
                           <Select.Root
                             type="single"
@@ -12160,10 +12187,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                         {/if}
                       </div>
                       {#if voiceOptionsError}
-                        <p class="batshit-settings-form-meta text-amber-600">{voiceOptionsError}</p>
+                        <p class="batshit-settings-form-meta is-warning">{voiceOptionsError}</p>
                       {/if}
                       {#if voiceProfilesError}
-                        <p class="batshit-settings-form-meta text-amber-600">{voiceProfilesError}</p>
+                        <p class="batshit-settings-form-meta is-warning">{voiceProfilesError}</p>
                       {/if}
                     </div>
                   </div>
@@ -12232,7 +12259,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     </div>
                   </div>
                   <div class="batshit-settings-form-control">
-                    <div class="flex min-w-0 items-center gap-2">
+                    <div class="batshit-settings-field-cluster">
                       <Input
                         id="agent-voice-test"
                         class="min-w-0 flex-1"
@@ -12498,7 +12525,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                               {#if unsupportedSubagentModelParams.length}
                                 <DropdownMenu.Root>
                                   <DropdownMenu.Trigger
-                                    class="batshit-settings-info-trigger is-amber inline-flex h-5 w-5 shrink-0 items-center justify-center"
+                                    class="batshit-settings-info-trigger is-amber inline-flex shrink-0 items-center justify-center"
                                     aria-label="About Ignored Subagent Model Settings"
                                   >
                                     <Info class="h-3.5 w-3.5" />
@@ -12516,8 +12543,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                           </div>
                           <div class="batshit-settings-form-control">
                             <div class="batshit-settings-form-control-group">
-                              <div class="flex min-w-0 items-center gap-2">
-                                <div class="min-w-0 flex-1">
+                              <div class="batshit-settings-field-cluster">
+                                <div class="batshit-settings-field-lane">
                                   <Select.Root
                                     type="single"
                                     value={(selectedSubagentModelId ?? "") as unknown as string}
@@ -12610,7 +12637,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                     })
                                   : null}
                                 {#if availability?.disabled}
-                                  <p class="batshit-settings-form-meta text-amber-600 dark:text-amber-400">
+                                  <p class="batshit-settings-form-meta is-warning">
                                     {availability.reason}
                                   </p>
                                 {/if}
@@ -12643,7 +12670,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                 </DropdownMenu.Root>
                               </div>
                             </div>
-                            <div class="batshit-settings-form-control">
+                            <div class="batshit-settings-form-control is-wide">
                               <Input
                                 id="subagent-webhook"
                                 placeholder="https://localhost:5678/webhook/..."
@@ -14053,7 +14080,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   <Label.Label class="batshit-settings-form-label">Browser Executable Path (Optional)</Label.Label>
                                 </div>
                               </div>
-                              <div class="batshit-settings-form-control">
+                              <div class="batshit-settings-form-control is-wide">
                                 <Input
                                   placeholder="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
                                   value={getNativeAgentBrowserExecutablePath("subagent")}
@@ -14093,7 +14120,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   <Label.Label class="batshit-settings-form-label">Default Profile Path (Optional)</Label.Label>
                                 </div>
                               </div>
-                              <div class="batshit-settings-form-control">
+                              <div class="batshit-settings-form-control is-wide">
                                 <Input
                                   placeholder="~/.batshit/ab-profile"
                                   value={getNativeAgentBrowserProfilePath("subagent")}
@@ -14216,7 +14243,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                           {/each}
                         </ToggleGroup.Root>
                         {#if isDockerNativeRuntime()}
-                          <p class="batshit-settings-form-meta text-amber-600 dark:text-amber-400">
+                          <p class="batshit-settings-form-meta is-warning">
                             Docker runs Claude Code as non-root batshit-cli so Bypass Permissions can
                             work. If you see a root-runtime warning, rebuild the Docker app image and
                             rerun the Claude login command shown above.
@@ -15141,7 +15168,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     </SettingsInfoMenu>
                   </div>
                 </div>
-                <div class="batshit-settings-form-control">
+                <div class="batshit-settings-form-control is-wide">
                   <Input
                     id="create-webhook"
                     placeholder="http://localhost:5678/webhook/batshit_n8n_primary"
@@ -15159,7 +15186,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     </SettingsInfoMenu>
                   </div>
                 </div>
-                <div class="batshit-settings-form-control">
+                <div class="batshit-settings-form-control is-wide">
                   <Input
                     id="create-workflow"
                     placeholder="http://localhost:5678/workflow/..."
@@ -15251,7 +15278,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                     </SettingsInfoMenu>
                   </div>
                 </div>
-                <div class="batshit-settings-form-control">
+                <div class="batshit-settings-form-control is-wide">
                   <Input
                     id="create-subagent-webhook"
                     placeholder="http://localhost:5678/webhook/batshit_n8n_workflow_subagent"

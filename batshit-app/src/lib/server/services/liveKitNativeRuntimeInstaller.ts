@@ -17,6 +17,7 @@ import { promisify } from 'node:util'
 
 import { apiKeyService } from '$lib/services/apiKey.server'
 import {
+  resolveLocalVoiceRuntimeLaunchRecordPath,
   resolveManagedInstallsRoot,
   startLocalVoiceRuntime
 } from '$lib/server/services/voiceLocalEngineSetup'
@@ -25,7 +26,8 @@ const execFileAsync = promisify(execFile)
 
 export const LIVEKIT_NATIVE_SERVER_ENGINE_ID = 'livekit-server'
 export const LIVEKIT_NATIVE_SIDECAR_ENGINE_ID = 'livekit-sidecar'
-export const LIVEKIT_NATIVE_RUNTIME_VERSION = '1.12.0'
+export const LIVEKIT_NATIVE_RUNTIME_VERSION = '1.13.5'
+export const LIVEKIT_NATIVE_SIDECAR_VERSION = '1.6.3'
 const LIVEKIT_HOMEBREW_FORMULA_URL = 'https://formulae.brew.sh/api/formula/livekit.json'
 const LIVEKIT_DEFAULT_LOCAL_URL = 'ws://127.0.0.1:7880'
 const LIVEKIT_DEFAULT_LOCAL_API_KEY = 'batshit-local'
@@ -60,6 +62,7 @@ export type LiveKitNativeInstallManifest = {
   checksumVerified?: boolean
   binaryPath?: string
   packageManager?: 'npm'
+  sourceFingerprint?: string
 }
 
 export type LiveKitNativeInstallStatus = {
@@ -67,8 +70,14 @@ export type LiveKitNativeInstallStatus = {
   installed: boolean
   serverInstalled: boolean
   sidecarInstalled: boolean
+  updateAvailable: boolean
+  serverUpdateAvailable: boolean
+  sidecarUpdateAvailable: boolean
   reason: string | null
   version: string
+  serverVersion: string | null
+  sidecarVersion: string | null
+  targetSidecarVersion: string
   serverInstallRoot: string
   sidecarInstallRoot: string
   serverBinaryPath: string | null
@@ -181,9 +190,9 @@ async function resolveBundledSidecarSourceRoot(): Promise<string | null> {
   const repoRoot = resolveOptionalEnvPath(process.env.BATSHIT_REPO_ROOT)
   const candidates = Array.from(new Set([
     resolveOptionalEnvPath(process.env.LIVEKIT_AGENT_SOURCE_ROOT),
-    packagedRuntimeRoot ? path.join(packagedRuntimeRoot, 'tools', 'livekit-agent-sidecar') : null,
-    macRepoRoot ? path.join(macRepoRoot, 'tools', 'livekit-agent-sidecar') : null,
     repoRoot ? path.join(repoRoot, 'tools', 'livekit-agent-sidecar') : null,
+    macRepoRoot ? path.join(macRepoRoot, 'tools', 'livekit-agent-sidecar') : null,
+    packagedRuntimeRoot ? path.join(packagedRuntimeRoot, 'tools', 'livekit-agent-sidecar') : null,
     path.resolve(process.cwd(), '..', 'tools', 'livekit-agent-sidecar'),
     path.resolve(process.cwd(), 'tools', 'livekit-agent-sidecar')
   ].filter((entry): entry is string => Boolean(entry))))
@@ -195,6 +204,66 @@ async function resolveBundledSidecarSourceRoot(): Promise<string | null> {
   }
 
   return null
+}
+
+async function listSidecarSourceFiles(root: string, relativeRoot = ''): Promise<string[]> {
+  const directory = path.join(root, relativeRoot)
+  const entries = await readdir(directory, { withFileTypes: true })
+  const files: string[] = []
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const relative = path.join(relativeRoot, entry.name)
+    if (entry.isDirectory()) {
+      files.push(...(await listSidecarSourceFiles(root, relative)))
+    } else if (entry.isFile()) {
+      files.push(relative)
+    }
+  }
+  return files
+}
+
+export async function getBundledLiveKitSidecarMetadata(): Promise<{
+  sourceRoot: string
+  version: string
+  sourceFingerprint: string
+}> {
+  const sourceRoot = await resolveBundledSidecarSourceRoot()
+  if (!sourceRoot) {
+    throw new Error(
+      'Batshit could not find the bundled LiveKit sidecar source package. Rebuild or reinstall Batshit, or configure LIVEKIT_AGENT_SOURCE_ROOT.'
+    )
+  }
+
+  const packageLock = await readJsonFile<{
+    packages?: Record<string, { version?: string }>
+  }>(path.join(sourceRoot, 'package-lock.json'))
+  const version = cleanString(packageLock?.packages?.['node_modules/@livekit/agents']?.version)
+  if (version !== LIVEKIT_NATIVE_SIDECAR_VERSION) {
+    throw new Error(
+      `Bundled LiveKit sidecar resolved @livekit/agents ${version || 'unknown'}, expected ${LIVEKIT_NATIVE_SIDECAR_VERSION}. Refresh the sidecar lockfile before packaging Batshit.`
+    )
+  }
+
+  const sourceFiles = [
+    'package.json',
+    'package-lock.json',
+    'tsconfig.json',
+    ...(await listSidecarSourceFiles(path.join(sourceRoot, 'src'))).map((relative) =>
+      path.join('src', relative)
+    )
+  ]
+  const hash = createHash('sha256')
+  for (const relative of sourceFiles) {
+    hash.update(relative.split(path.sep).join('/'))
+    hash.update('\0')
+    hash.update(await readFile(path.join(sourceRoot, relative)))
+    hash.update('\0')
+  }
+
+  return {
+    sourceRoot,
+    version,
+    sourceFingerprint: hash.digest('hex')
+  }
 }
 
 async function findFileByName(root: string, basename: string): Promise<string | null> {
@@ -252,22 +321,47 @@ export async function getNativeLiveKitInstallStatus(): Promise<LiveKitNativeInst
   )
   const serverBinaryPath = await resolveNativeLiveKitServerBinaryPath(serverInstallRoot)
   const serverVersion = serverBinaryPath ? await getLiveKitServerVersion(serverBinaryPath) : null
-  const serverInstalled = Boolean(serverBinaryPath && serverVersion === LIVEKIT_NATIVE_RUNTIME_VERSION)
+  const serverInstalled = Boolean(serverBinaryPath)
   const sidecarInstalled = await sidecarPackageInstalled(sidecarInstallRoot)
+  const bundledSidecar = await getBundledLiveKitSidecarMetadata().catch(() => null)
+  const sidecarVersion = sidecarInstalled
+    ? cleanString(
+        (
+          await readJsonFile<{ version?: string }>(
+            path.join(sidecarInstallRoot, 'node_modules', '@livekit', 'agents', 'package.json')
+          )
+        )?.version
+      ) || cleanString(sidecarManifest?.version) || null
+    : null
+  const serverUpdateAvailable = serverInstalled && serverVersion !== LIVEKIT_NATIVE_RUNTIME_VERSION
+  const sidecarUpdateAvailable =
+    sidecarInstalled &&
+    (sidecarVersion !== LIVEKIT_NATIVE_SIDECAR_VERSION ||
+      !bundledSidecar ||
+      sidecarManifest?.sourceFingerprint !== bundledSidecar.sourceFingerprint)
+  const updateAvailable = serverUpdateAvailable || sidecarUpdateAvailable
   const supported = !isContainerizedRuntime() && process.platform !== 'win32'
   const reason = !supported
     ? 'Native LiveKit install is only supported in native macOS/Linux Batshit. Docker Batshit uses the optional LiveKit runtime add-on.'
-    : serverInstalled && sidecarInstalled
-      ? null
-      : 'Native LiveKit runtime is not installed yet.'
+    : !serverInstalled || !sidecarInstalled
+      ? 'Native LiveKit runtime is not installed yet.'
+      : updateAvailable
+        ? 'A tested LiveKit runtime update is available from this Batshit build.'
+        : null
 
   return {
     supported,
     installed: serverInstalled && sidecarInstalled,
     serverInstalled,
     sidecarInstalled,
+    updateAvailable,
+    serverUpdateAvailable,
+    sidecarUpdateAvailable,
     reason,
     version: LIVEKIT_NATIVE_RUNTIME_VERSION,
+    serverVersion,
+    sidecarVersion,
+    targetSidecarVersion: LIVEKIT_NATIVE_SIDECAR_VERSION,
     serverInstallRoot,
     sidecarInstallRoot,
     serverBinaryPath,
@@ -382,7 +476,7 @@ async function extractTarGz(archivePath: string, destination: string): Promise<v
   await execFileAsync('tar', ['-xzf', archivePath, '-C', destination], { timeout: 120_000 })
 }
 
-async function installLiveKitServerBinary(): Promise<void> {
+export async function installLiveKitServerBinary(): Promise<void> {
   const formula = await fetchJson<HomebrewFormula>(LIVEKIT_HOMEBREW_FORMULA_URL)
   const formulaVersion = cleanString(formula.versions?.stable)
   if (formulaVersion && formulaVersion !== LIVEKIT_NATIVE_RUNTIME_VERSION) {
@@ -460,13 +554,26 @@ async function installLiveKitServerBinary(): Promise<void> {
   }
 }
 
-async function installLiveKitSidecarPackage(): Promise<void> {
-  const sourceRoot = await resolveBundledSidecarSourceRoot()
-  if (!sourceRoot) {
-    throw new Error(
-      'Batshit could not find the bundled LiveKit sidecar source package. Rebuild or reinstall Batshit, or configure LIVEKIT_AGENT_SOURCE_ROOT.'
+async function resolveNpmCliPath(): Promise<string> {
+  const candidates = Array.from(
+    new Set(
+      [
+        process.env.npm_execpath?.trim(),
+        path.resolve(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')
+      ].filter((entry): entry is string => Boolean(entry))
     )
+  )
+  for (const candidate of candidates) {
+    if (await fileExists(candidate)) return candidate
   }
+  throw new Error(
+    `Batshit could not find npm's CLI beside its Node.js runtime at ${process.execPath}. Rebuild or reinstall Batshit.`
+  )
+}
+
+export async function installLiveKitSidecarPackage(): Promise<void> {
+  const bundledSidecar = await getBundledLiveKitSidecarMetadata()
+  const sourceRoot = bundledSidecar.sourceRoot
 
   const installRoot = resolveNativeLiveKitSidecarInstallRoot()
   const stagingRoot = `${installRoot}.tmp-${Date.now()}`
@@ -481,19 +588,26 @@ async function installLiveKitSidecarPackage(): Promise<void> {
     await cp(path.join(sourceRoot, 'tsconfig.json'), path.join(stagingRoot, 'tsconfig.json'))
     await cp(path.join(sourceRoot, 'src'), path.join(stagingRoot, 'src'), { recursive: true })
 
-    await execFileAsync('npm', ['ci'], {
+    const npmCliPath = await resolveNpmCliPath()
+    await execFileAsync(process.execPath, [npmCliPath, 'ci'], {
       cwd: stagingRoot,
-      timeout: NPM_INSTALL_TIMEOUT_MS
+      timeout: NPM_INSTALL_TIMEOUT_MS,
+      env: {
+        ...process.env,
+        NODE_OPTIONS: '--no-warnings',
+        NODE_NO_WARNINGS: '1'
+      }
     })
 
     const installedAt = new Date().toISOString()
     const manifest: LiveKitNativeInstallManifest = {
       kind: 'livekit-sidecar',
-      version: LIVEKIT_NATIVE_RUNTIME_VERSION,
+      version: bundledSidecar.version,
       installedAt,
       installRoot,
       source: 'batshit-bundled-sidecar',
-      packageManager: 'npm'
+      packageManager: 'npm',
+      sourceFingerprint: bundledSidecar.sourceFingerprint
     }
     await writeFile(
       manifestPath(stagingRoot, 'batshit-livekit-sidecar-manifest.json'),
@@ -558,10 +672,10 @@ export async function installNativeLiveKitRuntime(
     throw new Error(before.reason ?? 'Native LiveKit runtime install is not supported here.')
   }
 
-  if (!before.serverInstalled) {
+  if (!before.serverInstalled || before.serverUpdateAvailable) {
     await installLiveKitServerBinary()
   }
-  if (!before.sidecarInstalled) {
+  if (!before.sidecarInstalled || before.sidecarUpdateAvailable) {
     await installLiveKitSidecarPackage()
   }
 
@@ -676,6 +790,7 @@ export async function startNativeLiveKitServerRuntime(options: {
   serverUrl: string
   apiKey: string
   apiSecret: string
+  forceRestart?: boolean
 }): Promise<LiveKitNativeServerStartResult> {
   if (isContainerizedRuntime()) {
     throw new Error('Dockerized Batshit starts LiveKit through the runtime add-on operator.')
@@ -701,12 +816,54 @@ export async function startNativeLiveKitServerRuntime(options: {
       )
     }
 
-    return {
-      started: false,
-      alreadyRunning: true,
-      pid: null,
-      logPath: null,
-      statusHint: `Local LiveKit server is reachable at ${url}.`
+    if (options.forceRestart) {
+      const launchRecord = await readJsonFile<{
+        engineId?: string
+        pid?: number
+        command?: string
+      }>(resolveLocalVoiceRuntimeLaunchRecordPath(LIVEKIT_NATIVE_SERVER_ENGINE_ID))
+      const recordedPid = launchRecord?.pid
+      const recordedCommand = cleanString(launchRecord?.command)
+      const commandWithinManagedRoot = recordedCommand
+        ? !path.relative(resolveNativeLiveKitServerInstallRoot(), path.resolve(recordedCommand)).startsWith('..')
+        : false
+      if (
+        launchRecord?.engineId !== LIVEKIT_NATIVE_SERVER_ENGINE_ID ||
+        !recordedPid ||
+        !owner.pids.includes(recordedPid) ||
+        !commandWithinManagedRoot
+      ) {
+        throw new Error(
+          `LiveKit is already listening on port ${port}, but Batshit did not start that process. Stop the external LiveKit server before applying the managed runtime update.`
+        )
+      }
+
+      try {
+        process.kill(recordedPid, 'SIGTERM')
+      } catch (error) {
+        const code = typeof error === 'object' && error && 'code' in error ? error.code : null
+        if (code !== 'ESRCH') throw error
+      }
+
+      const stopDeadline = Date.now() + 5_000
+      let stopped = !(await fetchLiveKitServerReady(url))
+      while (!stopped && Date.now() < stopDeadline) {
+        await sleep(250)
+        stopped = !(await fetchLiveKitServerReady(url))
+      }
+      if (!stopped) {
+        throw new Error(
+          `Batshit's managed LiveKit server on port ${port} did not stop before the restart timeout.`
+        )
+      }
+    } else {
+      return {
+        started: false,
+        alreadyRunning: true,
+        pid: null,
+        logPath: null,
+        statusHint: `Local LiveKit server is reachable at ${url}.`
+      }
     }
   }
 

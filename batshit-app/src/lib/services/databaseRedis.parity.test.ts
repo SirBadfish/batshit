@@ -43,6 +43,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 type FixtureState = {
   kv: Map<string, any>
   sets: Map<string, Set<string>>
+  /** SA-104 P6: redis LIST fixtures (the episode ledger uses lRange). */
+  lists: Map<string, string[]>
   session: any
   userSettings: any
   projects: any[]
@@ -56,14 +58,32 @@ const state = vi.hoisted(() => ({
 }))
 
 const redisFake = vi.hoisted(() => {
+  // SA-104 P4: the recall engine lists memory records via the KEYS house pattern, so
+  // the fake serves glob patterns from the fixture map instead of always-empty.
+  const keysMatching = (pattern: string) => {
+    const regex = new RegExp(
+      `^${pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`
+    )
+    return Array.from(state.current.kv.keys()).filter((key) => regex.test(key))
+  }
+
   // Raw node-redis-style client used by execute()/getClient() consumers
   // (fabricRegistry, mcpSelectionResolver, artifactsService, goon reads).
   const makeRawClient = () => ({
     json: {
       get: async (key: string) =>
         state.current.kv.has(key) ? state.current.kv.get(key) : null,
-      set: async (key: string, _path: string, value: any) => {
-        state.current.kv.set(key, value)
+      set: async (key: string, path: string, value: any) => {
+        // Root writes replace the record; the recall engine's last-interaction stamp
+        // uses field-level paths on the agent record.
+        if (path === '$') {
+          state.current.kv.set(key, value)
+        } else if (path.startsWith('$.')) {
+          const existing = state.current.kv.get(key)
+          if (existing && typeof existing === 'object') {
+            existing[path.slice(2)] = value
+          }
+        }
         return 'OK'
       }
     },
@@ -74,11 +94,30 @@ const redisFake = vi.hoisted(() => {
       return 'OK'
     },
     del: async () => 1,
-    keys: async () => [],
+    keys: async (pattern: string) => keysMatching(pattern),
     sMembers: async (key: string) => Array.from(state.current.sets.get(key) ?? []),
+    lRange: async (key: string, start: number, stop: number) => {
+      const list = state.current.lists.get(key) ?? []
+      return list.slice(start, stop === -1 ? undefined : stop + 1)
+    },
     sendCommand: async () => null
   })
   const base = {
+    json: {
+      get: async (key: string) =>
+        state.current.kv.has(key) ? state.current.kv.get(key) : null,
+      set: async (key: string, path: string, value: any) => {
+        if (path === '$') {
+          state.current.kv.set(key, value)
+        } else if (path.startsWith('$.')) {
+          const existing = state.current.kv.get(key)
+          if (existing && typeof existing === 'object') {
+            ;(existing as Record<string, any>)[path.slice(2)] = value
+          }
+        }
+        return 'OK'
+      }
+    },
     async get(key: string) {
       return state.current.kv.has(key) ? state.current.kv.get(key) : null
     },
@@ -90,8 +129,8 @@ const redisFake = vi.hoisted(() => {
       state.current.kv.delete(key)
       return 1
     },
-    async keys() {
-      return []
+    async keys(pattern: string) {
+      return keysMatching(pattern)
     },
     async sMembers(key: string) {
       return Array.from(state.current.sets.get(key) ?? [])
@@ -141,8 +180,9 @@ const redisFake = vi.hoisted(() => {
     async hGet() {
       return null
     },
-    async lRange() {
-      return []
+    async lRange(key: string, start: number, stop: number) {
+      const list = state.current.lists.get(key) ?? []
+      return list.slice(start, stop === -1 ? undefined : stop + 1)
     },
     async exists() {
       return 0
@@ -206,6 +246,7 @@ vi.mock('$env/dynamic/public', () => ({
 
 import { DatabaseService as ServerDatabaseService, invalidateUserSettingsCache as invalidateServerSettingsCache } from './databaseRedis.server'
 import { DatabaseService as ClientDatabaseService, invalidateUserSettingsCache as invalidateClientSettingsCache } from './databaseRedis.client'
+import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
 
 const USER_ID = 'josh'
 
@@ -218,6 +259,7 @@ function freshState(sessionId: string): FixtureState {
       ['batshit:sub_system_prompt', 'SUBAGENT BASE PROMPT BODY']
     ]),
     sets: new Map<string, Set<string>>(),
+    lists: new Map<string, string[]>(),
     session: { id: sessionId, user_id: USER_ID, name: 'Parity Session', metadata: {} },
     userSettings: {
       id: USER_ID,
@@ -289,7 +331,8 @@ const routeImports: Record<string, () => Promise<RouteModule>> = {
   agentCapabilities: () => import('../../routes/api/slash-commands/agent-capabilities/+server'),
   skillSessionContext: () => import('../../routes/api/skills/session-context/+server'),
   controlsFind: () => import('../../routes/api/controls/find/+server'),
-  mcpToolsDcm: () => import('../../routes/api/mcp/tools/dcm/+server')
+  mcpToolsDcm: () => import('../../routes/api/mcp/tools/dcm/+server'),
+  memoryCompileContext: () => import('../../routes/api/memory/compile-context/+server')
 } as any
 
 function buildLocals() {
@@ -373,6 +416,9 @@ function createFetchRouter() {
     }
     if (path === '/api/mcp/tools/dcm') {
       return invokeRoute('mcpToolsDcm', method, url, {}, init)
+    }
+    if (path === '/api/memory/compile-context') {
+      return invokeRoute('memoryCompileContext', method, url, {}, init)
     }
     return new Response(`parity-harness: unrouted fetch ${method} ${path}`, { status: 501 })
   }
@@ -1080,5 +1126,388 @@ describe('buildFormattedChatInput twins parity (DL-5 / G-0001)', () => {
     }
 
     expect(normalize(server)).toEqual(normalize(client))
+  })
+
+  it('S17 SA-104 P3: memory guidance ships for memory-enabled agents in BOTH lanes and stays absent otherwise', async () => {
+    const MEMORY_BLOCK_HEADER = '==== MEMORY (AGENT MEMORY ENABLED) ===='
+
+    // Default agent: memory is opt-in, so the block must be absent.
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: [],
+        agent: apiAgent(),
+        currentUserMessage: 'no memory here',
+        options: { runtimeFlavor: 'vercel' }
+      })
+      expect(server.primarySystemPrompt).not.toContain(MEMORY_BLOCK_HEADER)
+      expect(client.primarySystemPrompt).not.toContain(MEMORY_BLOCK_HEADER)
+      expect(normalize(server)).toEqual(normalize(client))
+    }
+
+    // Memory-enabled API agent: block present in both lanes, API tool names only (DL-4).
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: [],
+        agent: apiAgent({ memory_enabled: true }),
+        currentUserMessage: 'remember things for me',
+        options: { runtimeFlavor: 'vercel' }
+      })
+      for (const prompt of [server.primarySystemPrompt ?? '', client.primarySystemPrompt ?? '']) {
+        expect(prompt).toContain(MEMORY_BLOCK_HEADER)
+        expect(prompt).toContain('<batshit-memory>')
+        expect(prompt).toContain('fabric:sys.memory.search')
+        expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_use\b/)
+        expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_search\b/)
+      }
+      expect(normalize(server)).toEqual(normalize(client))
+    }
+
+    // Memory-enabled n8n agent: block present with the n8n broker action names.
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: [],
+        agent: n8nAgent({ memory_enabled: true }),
+        currentUserMessage: 'n8n memory turn',
+        options: { runtimeFlavor: 'n8n' }
+      })
+      for (const prompt of [server.primarySystemPrompt ?? '', client.primarySystemPrompt ?? '']) {
+        expect(prompt).toContain(MEMORY_BLOCK_HEADER)
+        expect(prompt).toContain('batshit_tool_search')
+      }
+      expect(normalize(server)).toEqual(normalize(client))
+    }
+  })
+
+  it('S18 SA-104 P4: recall-engine context (on-my-mind, DCM inserts, time awareness) is identical across twins', async () => {
+    const ON_MY_MIND_HEADER = '==== AWARENESS (AGENT MEMORY) ===='
+
+    const seedMemoryFixtures = (agentId: string, sessionId: string) => {
+      state.current.kv.set(`agent:${agentId}`, {
+        id: agentId,
+        user_id: USER_ID,
+        name: 'Memory Twin',
+        memory_enabled: true,
+        memory_last_interaction_at: '2026-06-09T10:00:00.000Z',
+        memory_last_interaction_ts: new Date('2026-06-09T10:00:00.000Z').getTime()
+      })
+      state.current.kv.set(`memory:${agentId}:mem_awareness_1`, {
+        id: 'mem_awareness_1',
+        agent_id: agentId,
+        user_id: USER_ID,
+        lane: 'awareness',
+        content: 'The user prefers plain-English explanations.',
+        importance: 9,
+        event_at: null,
+        event_ts: null,
+        saved_at: '2026-06-01T09:00:00.000Z',
+        saved_ts: new Date('2026-06-01T09:00:00.000Z').getTime(),
+        is_superseded: 'n',
+        provenance: [{ session_id: 'older-session', source: 'agent' }],
+        visibility: 'normal',
+        embedding: [],
+        embedding_model: 'test',
+        schema_version: 1
+      })
+      state.current.kv.set(`memory:${agentId}:mem_trigger_1`, {
+        id: 'mem_trigger_1',
+        agent_id: agentId,
+        user_id: USER_ID,
+        lane: 'stm',
+        content: 'Maggie is the user’s Irish Setter.',
+        trigger_terms: ['maggie'],
+        importance: 7,
+        event_at: '2026-05-01T12:00:00.000Z',
+        event_ts: new Date('2026-05-01T12:00:00.000Z').getTime(),
+        saved_at: '2026-05-01T12:00:00.000Z',
+        saved_ts: new Date('2026-05-01T12:00:00.000Z').getTime(),
+        is_superseded: 'n',
+        provenance: [{ session_id: 'older-session', source: 'agent' }],
+        visibility: 'normal',
+        embedding: [],
+        embedding_model: 'test',
+        schema_version: 1
+      })
+      state.current.kv.set(`memory:${agentId}:mem_recall_1`, {
+        id: 'mem_recall_1',
+        agent_id: agentId,
+        user_id: USER_ID,
+        lane: 'ltm',
+        content: 'The lake house trip is planned for July.',
+        importance: 5,
+        event_at: null,
+        event_ts: null,
+        saved_at: '2026-06-05T09:00:00.000Z',
+        saved_ts: new Date('2026-06-05T09:00:00.000Z').getTime(),
+        is_superseded: 'n',
+        provenance: [{ session_id: sessionId, source: 'agent' }],
+        visibility: 'normal',
+        embedding: [],
+        embedding_model: 'test',
+        schema_version: 1
+      })
+      state.current.kv.set(`memlinger:${sessionId}`, {
+        pending: [
+          {
+            memory_id: 'mem_recall_1',
+            agent_id: agentId,
+            requested_at: '2026-06-12T09:59:00.000Z',
+            source: 'tool'
+          }
+        ],
+        schema_version: 1
+      })
+    }
+
+    // API-flavor pair: full recall context, byte-identical.
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      seedMemoryFixtures('agent-api-parity', sessionId)
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: baseMessages(),
+        agent: apiAgent({ memory_enabled: true }),
+        currentUserMessage: 'How is Maggie doing today?',
+        options: { runtimeFlavor: 'vercel' }
+      })
+      expect(normalize(server)).toEqual(normalize(client))
+      for (const result of [server, client]) {
+        const prompt = result.primarySystemPrompt ?? ''
+        expect(prompt).toContain(ON_MY_MIND_HEADER)
+        expect(prompt.indexOf(ON_MY_MIND_HEADER)).toBeGreaterThan(
+          prompt.indexOf('==== MEMORY (AGENT MEMORY ENABLED) ====')
+        )
+        expect(prompt).toContain('The user prefers plain-English explanations.')
+
+        const userMessage = currentUserMessageContent(result)
+        expect(userMessage).toContain('Memory context:')
+        expect(userMessage).toContain('- Last interaction with the user: 3 days ago')
+        expect(userMessage).toContain('- Current (new this message):')
+        expect(userMessage).toContain('trigger "maggie" | stm | mem_trigger_1')
+        expect(userMessage).toContain('recalled | ltm | mem_recall_1')
+        expect(userMessage).toContain('this chat')
+        expect(userMessage).toContain('another chat,')
+
+        const memoryContext = result.structuredInput?.metadata?.memoryContext
+        expect(memoryContext?.inserts).toHaveLength(2)
+        expect(memoryContext?.onMyMind?.count).toBe(1)
+      }
+    }
+
+    // n8n-flavor pair: same engine output through the client route, still identical.
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      seedMemoryFixtures('agent-n8n-parity', sessionId)
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: baseMessages(),
+        agent: n8nAgent({ memory_enabled: true }),
+        currentUserMessage: 'Any news about maggie?',
+        options: { runtimeFlavor: 'n8n' }
+      })
+      expect(normalize(server)).toEqual(normalize(client))
+      expect(server.primarySystemPrompt ?? '').toContain(ON_MY_MIND_HEADER)
+      expect(currentUserMessageContent(server)).toContain('trigger "maggie" | stm | mem_trigger_1')
+    }
+
+    // Group runs get no recall lanes in v1 (recorded limitation): guidance block stays,
+    // recall context is absent, twins stay identical.
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      seedMemoryFixtures('agent-api-parity', sessionId)
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: baseMessages(),
+        agent: apiAgent({ memory_enabled: true }),
+        currentUserMessage: 'maggie in a group chat',
+        options: {
+          runtimeFlavor: 'vercel',
+          groupContext: {
+            agentOrder: ['agent-api-parity'],
+            agentDisplayNames: { 'agent-api-parity': 'Cody' },
+            currentAgentId: 'agent-api-parity'
+          }
+        }
+      })
+      expect(normalize(server)).toEqual(normalize(client))
+      for (const result of [server, client]) {
+        expect(result.primarySystemPrompt ?? '').not.toContain(ON_MY_MIND_HEADER)
+        expect(currentUserMessageContent(result)).not.toContain('Memory context:')
+        expect(result.structuredInput?.metadata?.memoryContext).toBeUndefined()
+      }
+    }
+
+    // Default agents (memory off) stay byte-identical to pre-P4 output: no recall surfaces.
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: baseMessages(),
+        agent: apiAgent(),
+        currentUserMessage: 'maggie without memory',
+        options: { runtimeFlavor: 'vercel' }
+      })
+      expect(normalize(server)).toEqual(normalize(client))
+      for (const result of [server, client]) {
+        expect(result.primarySystemPrompt ?? '').not.toContain(ON_MY_MIND_HEADER)
+        expect(currentUserMessageContent(result)).not.toContain('Memory context:')
+        expect(result.structuredInput?.metadata?.memoryContext).toBeUndefined()
+      }
+    }
+  })
+
+  it('S19 SA-104 P6: graduation splices and the episode whiteboard are identical across twins; regular sessions stay untouched', async () => {
+    const WHITEBOARD_HEADER = '==== EPISODE WHITEBOARD (CURRENT EPISODE) ===='
+    const allCompiledContent = (result: any): string =>
+      (result?.structuredInput?.messages ?? [])
+        .map((message: any) => (typeof message?.content === 'string' ? message.content : ''))
+        .join('\n')
+
+    const graduationEvent = {
+      id: 'grad_parity_1',
+      createdAt: '2026-06-09T22:00:00.000Z',
+      source: 'nap' as const,
+      episodeId: 'ep_done',
+      segmentId: 'memseg_parity_1',
+      sourceMessageIds: ['msg-1'],
+      compactedMessageCount: 1,
+      summary: 'Earlier stretch: the lake trip was planned and booked.',
+      summaryTokenEstimate: 12
+    }
+
+    const seedFixedSessionFixtures = (agentId: string, sessionId: string) => {
+      // The session record carries the Infinite Session block + graduation bookmark; the
+      // engine reads it from kv, the twins via getSession — keep both in sync.
+      const sessionRecord = {
+        id: sessionId,
+        user_id: USER_ID,
+        name: 'Parity Infinite Session',
+        metadata: {
+          fixedSession: {
+            version: 1,
+            enabled: true,
+            created_at: '2026-06-01T00:00:00.000Z',
+            graduation: { version: 1, events: [graduationEvent] }
+          }
+        }
+      }
+      state.current.session = sessionRecord
+      state.current.kv.set(`session:${sessionId}`, sessionRecord)
+      state.current.kv.set(`agent:${agentId}`, {
+        id: agentId,
+        user_id: USER_ID,
+        name: 'Memory Twin',
+        memory_enabled: true
+      })
+      // Open episode with a whiteboard (the ledger is a LIST + JSON records).
+      state.current.lists.set(`session:${sessionId}:episodes`, ['ep_open'])
+      state.current.kv.set(`episode:${sessionId}:ep_open`, {
+        id: 'ep_open',
+        session_id: sessionId,
+        agent_id: agentId,
+        state: 'open',
+        opened_at: '2026-06-10T08:00:00.000Z',
+        whiteboard: {
+          content: 'Current goal: finish the garage shelving order.',
+          updated_at: '2026-06-10T09:00:00.000Z'
+        },
+        schema_version: 1
+      })
+    }
+
+    // Fixed-session pair: the production client shape pre-splices via the shared
+    // applier; the server twin re-applies idempotently — byte-equal output with the
+    // gist spliced, the graduated message gone, and the whiteboard block present.
+    for (const flavor of ['vercel', 'n8n'] as const) {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      const agent =
+        flavor === 'vercel'
+          ? apiAgent({ memory_enabled: true })
+          : n8nAgent({ memory_enabled: true })
+      seedFixedSessionFixtures(agent.id, sessionId)
+      const windowMessages = applyFixedSessionGraduationToMessages(
+        baseMessages() as never,
+        state.current.session
+      )
+      expect(windowMessages.map((message: any) => message.id)).not.toContain('msg-1')
+
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: windowMessages,
+        agent,
+        currentUserMessage: 'Where were we?',
+        options: { runtimeFlavor: flavor }
+      })
+      expect(normalize(server)).toEqual(normalize(client))
+      for (const result of [server, client]) {
+        expect(allCompiledContent(result)).toContain('Graduated episode summary:')
+        expect(allCompiledContent(result)).toContain('lake trip was planned')
+        const prompt = result.primarySystemPrompt ?? ''
+        expect(prompt).toContain(WHITEBOARD_HEADER)
+        expect(prompt).toContain('Current goal: finish the garage shelving order.')
+        expect(prompt.indexOf(WHITEBOARD_HEADER)).toBeGreaterThan(
+          prompt.indexOf('==== MEMORY (AGENT MEMORY ENABLED) ====')
+        )
+        expect(result.structuredInput?.metadata?.memoryContext?.whiteboard?.present).toBe(true)
+      }
+    }
+
+    // Regular session of the same memory-enabled agent: no splices, no whiteboard —
+    // compile stays byte-identical even with memsegs stored (DL-104-12).
+    {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+      state.current.kv.set(`agent:agent-api-parity`, {
+        id: 'agent-api-parity',
+        user_id: USER_ID,
+        name: 'Memory Twin',
+        memory_enabled: true
+      })
+      state.current.kv.set(`session:${sessionId}`, state.current.session)
+      // Fixture Redis key; 'agent-api-parity' trips the generic-api-key scanner rule.
+      state.current.kv.set(`memseg:agent-api-parity:memseg_parity_1`, { // gitleaks:allow
+        id: 'memseg_parity_1',
+        agent_id: 'agent-api-parity',
+        user_id: USER_ID,
+        session_id: 'some-old-session',
+        message_ids: ['x'],
+        summary: 'Old graduated stretch.',
+        first_message_at: '2026-06-01T08:00:00.000Z',
+        first_message_ts: 0,
+        last_message_at: '2026-06-01T09:00:00.000Z',
+        last_message_ts: 0,
+        token_count: 10,
+        graduated_at: '2026-06-02T00:00:00.000Z',
+        graduated_by: 'idle',
+        embedding: [],
+        embedding_model: 'test',
+        schema_version: 1
+      })
+      const { server, client } = await runBothTwins({
+        sessionId,
+        messages: baseMessages(),
+        agent: apiAgent({ memory_enabled: true }),
+        currentUserMessage: 'Regular chat continues',
+        options: { runtimeFlavor: 'vercel' }
+      })
+      expect(normalize(server)).toEqual(normalize(client))
+      for (const result of [server, client]) {
+        expect(allCompiledContent(result)).not.toContain('Graduated episode summary:')
+        expect(result.primarySystemPrompt ?? '').not.toContain(WHITEBOARD_HEADER)
+      }
+    }
   })
 })

@@ -531,6 +531,24 @@ async function copyManagedFfmpegRuntime() {
   };
 }
 
+async function pruneOnnxRuntimeDeadWeight(packageRoot) {
+  // The built-in memory embedder dependency (@huggingface/transformers) installs
+  // onnxruntime binaries for every platform plus a browser/wasm build; the packaged
+  // app only ever loads darwin/arm64 onnxruntime-node. The rest is ~300MB of dead
+  // weight and package-audit noise.
+  const onnxNodeBin = join(packageRoot, 'node_modules', 'onnxruntime-node', 'bin', 'napi-v6');
+  await rm(join(packageRoot, 'node_modules', 'onnxruntime-web'), { recursive: true, force: true });
+  await rm(join(onnxNodeBin, 'win32'), { recursive: true, force: true });
+  await rm(join(onnxNodeBin, 'linux'), { recursive: true, force: true });
+  const keptBinding = join(onnxNodeBin, 'darwin', 'arm64', 'onnxruntime_binding.node');
+  if (!(await exists(keptBinding))) {
+    throw new Error(
+      `onnxruntime prune expected the darwin/arm64 binding to remain at ${keptBinding}; ` +
+        'the onnxruntime-node layout changed - re-verify the prune before packaging'
+    );
+  }
+}
+
 async function main() {
   if (!(await exists(resourcesPath))) {
     throw new Error(`Package resources path does not exist: ${resourcesPath}`);
@@ -583,6 +601,7 @@ async function main() {
   runChecked('npm', ['prune', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {
     cwd: serverDest
   });
+  await pruneOnnxRuntimeDeadWeight(appDest);
 
   const systemPrompts = join(repoRoot, 'docs', 'batshit_System_Prompts');
   if (await exists(systemPrompts)) {

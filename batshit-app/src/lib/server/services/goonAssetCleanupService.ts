@@ -28,6 +28,7 @@ export const GOON_UPLOAD_TYPES = [
   'goon_nail_artwork',
   'goon_skin_artwork',
   'goon_hair_assets',
+  'goon_clothing_assets',
   'goon_scenes',
   'goon_scene_thumbs',
   'goon_room_shells',
@@ -426,6 +427,15 @@ export async function collectGoonUploadReferencesForClient(
       throw new Error(`Hair refit source metadata key ${key} disappeared during reference audit.`)
     }
     collectUploadUrlsFromValue(references, source, `Hair refit source ${key}`)
+  }
+
+  const clothingAssetKeys = await client.keys(`clothing_asset:${userId}:*`)
+  for (const key of clothingAssetKeys.sort((left, right) => left.localeCompare(right))) {
+    const asset = await client.json.get(key)
+    if (!asset) {
+      throw new Error(`Clothing Asset metadata key ${key} disappeared during reference audit.`)
+    }
+    collectUploadUrlsFromValue(references, asset, `Clothing Asset revision ${key}`)
   }
 
   const settings = (await client.json.get(`user:${userId}:settings`)) as

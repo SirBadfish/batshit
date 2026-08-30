@@ -11,13 +11,13 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@livekit/agents": "^1.6.0",
-    "@livekit/agents-plugin-deepgram": "^1.6.0",
-    "@livekit/agents-plugin-google": "^1.6.0",
-    "@livekit/agents-plugin-openai": "^1.6.0",
-    "@livekit/agents-plugin-xai": "^1.6.0",
-    "@livekit/rtc-node": "^0.13.32",
-    "tsx": "^4.22.4"
+    "@livekit/agents": "^1.6.3",
+    "@livekit/agents-plugin-deepgram": "^1.6.3",
+    "@livekit/agents-plugin-google": "^1.6.3",
+    "@livekit/agents-plugin-openai": "^1.6.3",
+    "@livekit/agents-plugin-xai": "^1.6.3",
+    "@livekit/rtc-node": "^0.13.33",
+    "tsx": "^4.23.12"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",

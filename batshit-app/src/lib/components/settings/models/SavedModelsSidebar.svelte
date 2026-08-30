@@ -62,7 +62,7 @@
   </Card.Header>
   <Card.Content class="batshit-settings-card-content-flush">
     {#if isLoading}
-      <div class="batshit-settings-empty-state flex items-center justify-center">
+      <div class="batshit-settings-empty-state">
         <Loader2 class="mr-2 h-4 w-4 animate-spin" />
         Loading models…
       </div>
@@ -80,7 +80,7 @@
           <div class="batshit-settings-list-band is-active">
             <Collapsible.Root bind:open={chatSectionOpen}>
               <div class="batshit-settings-list-band-row pr-2">
-                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                   <div class="batshit-settings-form-label flex items-center gap-2">
                     Chat (Agents)
                     <Badge variant="outline" class="text-[11px] font-normal">{chatModels.length}</Badge>
@@ -100,7 +100,7 @@
                   <div class="settings-sidebar-items">
                     {#each chatModels as model}
                       <button
-                        class="settings-sidebar-item flex items-center gap-3"
+                        class="settings-sidebar-item is-row items-center gap-3"
                         data-state={selectedModelId === model.id && !creatingNew ? 'active' : 'inactive'}
                         onclick={() => onSelectModel(model)}
                       >
@@ -126,7 +126,7 @@
           <div class="batshit-settings-list-band">
             <Collapsible.Root bind:open={visualSectionOpen}>
               <div class="batshit-settings-list-band-row pr-2">
-                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                   <div class="batshit-settings-form-label flex items-center gap-2">
                     Visual
                     <Badge variant="outline" class="text-[11px] font-normal">{visualModels.length}</Badge>
@@ -146,7 +146,7 @@
                   <div class="settings-sidebar-items">
                     {#each visualModels as model}
                       <button
-                        class="settings-sidebar-item flex items-center gap-3"
+                        class="settings-sidebar-item is-row items-center gap-3"
                         data-state={selectedModelId === model.id && !creatingNew ? 'active' : 'inactive'}
                         onclick={() => onSelectModel(model)}
                       >
@@ -172,7 +172,7 @@
           <div class="batshit-settings-list-band">
             <Collapsible.Root bind:open={audioSectionOpen}>
               <div class="batshit-settings-list-band-row pr-2">
-                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                   <div class="batshit-settings-form-label flex items-center gap-2">
                     Audio
                     <Badge variant="outline" class="text-[11px] font-normal">{audioModels.length}</Badge>
@@ -192,7 +192,7 @@
                   <div class="settings-sidebar-items">
                     {#each audioModels as model}
                       <button
-                        class="settings-sidebar-item flex items-center gap-3"
+                        class="settings-sidebar-item is-row items-center gap-3"
                         data-state={selectedModelId === model.id && !creatingNew ? 'active' : 'inactive'}
                         onclick={() => onSelectModel(model)}
                       >
@@ -218,7 +218,7 @@
           <div class="batshit-settings-list-band">
             <Collapsible.Root bind:open={utilitySectionOpen}>
               <div class="batshit-settings-list-band-row pr-2">
-                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex w-full flex-1 items-center justify-between">
+                <Collapsible.Trigger class="batshit-settings-list-band-trigger flex items-center justify-between">
                   <div class="batshit-settings-form-label flex items-center gap-2">
                     Utility
                     <Badge variant="outline" class="text-[11px] font-normal">{utilityModels.length}</Badge>
@@ -238,7 +238,7 @@
                   <div class="settings-sidebar-items">
                     {#each utilityModels as model}
                       <button
-                        class="settings-sidebar-item flex items-center gap-3"
+                        class="settings-sidebar-item is-row items-center gap-3"
                         data-state={selectedModelId === model.id && !creatingNew ? 'active' : 'inactive'}
                         onclick={() => onSelectModel(model)}
                       >

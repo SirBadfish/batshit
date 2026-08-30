@@ -220,7 +220,7 @@
               {formatBackupBytes(preflight.disk.requiredBytes)} required / {formatBackupBytes(preflight.disk.availableBytes)} available
             </span>
           </div>
-          <p class="batshit-settings-form-help mt-1">
+          <p class="batshit-settings-form-help">
             Required space covers restored upload files, the validated Redis plan, and a disk-backed copy of current Redis data for rollback.
           </p>
         </div>

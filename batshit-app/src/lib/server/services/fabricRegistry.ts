@@ -48,6 +48,22 @@ import {
 } from '$lib/server/services/vercelModelCatalog'
 import { detectImageModel } from '$lib/server/services/imageModelDetection'
 import {
+  closeEpisodeOp,
+  deleteMemoryOp,
+  holdEpisodeOp,
+  listMemoriesOp,
+  MemoryToolError,
+  moveMemoryLaneOp,
+  recallMemoriesOp,
+  saveMemoryOp,
+  searchMemoriesOp,
+  supersedeMemoryOp,
+  unsupersedeMemoryOp,
+  updateMemoryOp,
+  updateWhiteboardOp,
+  type MemoryToolContext
+} from '$lib/server/services/memory/memoryTools'
+import {
   DEFAULT_SKILL_ICON_REF
 } from '$lib/icons/iconCatalog'
 import { isIconRef, parseIconRef, type IconRef } from '$lib/icons/iconTypes'
@@ -1095,7 +1111,415 @@ async function executeRuntimeAddonControl(
   }
 }
 
+// ---------------------------------------------------------------------------
+// SA-104 P3: memory tool family (`sys.memory.*`).
+//
+// One shared ops layer (`memory/memoryTools.ts`) serves these handlers AND the inline
+// `<batshit-memory>` save route, so tool saves and inline saves produce identical
+// records. Responses are summary-first references (DL-104-17); `sys.memory.recall`
+// routes content toward the DCM insert channel instead of echoing it here. Broker
+// exposure is gated per agent (`memory_enabled`) and PRIMARY-only through
+// `resolveBrokerFabricAllowedControlIds` — subagents never receive these refs
+// (subagent memory is a deferred product decision; memory is PA-owned state).
+// ---------------------------------------------------------------------------
+
+function memoryControlContext(context: ControlExecutionContext): MemoryToolContext {
+  return {
+    userId: context.userId,
+    agentId: typeof context.agentId === 'string' ? context.agentId : '',
+    sessionId: context.sessionId ?? null
+  }
+}
+
+async function runMemoryControl<T extends Record<string, any>>(
+  operation: () => Promise<T>
+): Promise<Record<string, any>> {
+  try {
+    return await operation()
+  } catch (error) {
+    if (error instanceof MemoryToolError) {
+      throw new Error(error.hint ? `${error.message} | fix: ${error.hint}` : error.message)
+    }
+    throw error
+  }
+}
+
+const memorySaveControlSchema = z
+  .object({
+    lane: z.string().trim().min(1),
+    content: z.string().trim().min(1)
+  })
+  .passthrough()
+
+const memorySearchControlSchema = z
+  .object({
+    query: z.string().trim().min(2),
+    lane: z.string().optional(),
+    include_superseded: z.boolean().optional(),
+    event_from: z.string().optional(),
+    event_to: z.string().optional(),
+    saved_from: z.string().optional(),
+    saved_to: z.string().optional(),
+    limit: z.number().int().min(1).max(25).optional()
+  })
+  .passthrough()
+
+const memoryListControlSchema = z
+  .object({
+    lane: z.string().optional(),
+    include_superseded: z.boolean().optional(),
+    limit: z.number().int().min(1).max(100).optional()
+  })
+  .passthrough()
+
+const memoryUpdateControlSchema = z
+  .object({
+    memoryId: z.string().trim().min(1)
+  })
+  .passthrough()
+
+const memorySupersedeControlSchema = z
+  .object({
+    memoryId: z.string().trim().min(1),
+    supersedes: z.array(z.string().trim().min(1)).min(1)
+  })
+  .passthrough()
+
+const memoryMoveLaneControlSchema = z
+  .object({
+    memoryId: z.string().trim().min(1),
+    lane: z.string().trim().min(1)
+  })
+  .passthrough()
+
+const memoryRecallControlSchema = z
+  .object({
+    memoryIds: z.array(z.string().trim().min(1)).min(1).max(8)
+  })
+  .passthrough()
+
+const memoryByIdControlSchema = z
+  .object({
+    memoryId: z.string().trim().min(1)
+  })
+  .passthrough()
+
+const MEMORY_LANE_SCHEMA_DESCRIPTION =
+  'Memory lane: "awareness" (kept deliberately in mind, compiled into your system prompt), "stm" (Trigger Memory — fires when trigger terms come up), or "ltm" (searchable long-term memory).'
+
+const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
+  {
+    controlId: 'sys.memory.save',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Save',
+    description:
+      'Save one memory to your agent memory store. Choose the lane deliberately; stm saves need trigger_terms. Supports supersedes for save-and-replace in one act. Returns a summary reference plus near-duplicate warnings. Equivalent to the inline <batshit-memory> block.',
+    inputSchema: memorySaveControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        lane: { type: 'string', enum: ['awareness', 'stm', 'ltm'], description: MEMORY_LANE_SCHEMA_DESCRIPTION },
+        content: { type: 'string', description: 'The fact to remember, compact and self-contained (max 4000 chars).' },
+        gist: { type: 'string', description: 'Optional one-line summary shown in search results (max 200 chars).' },
+        trigger_terms: { type: 'array', items: { type: 'string' }, description: 'Required for stm: the words that fire this memory (synonyms belong here too).' },
+        linger: { type: ['integer', 'string'], description: 'stm only: turns this memory stays inserted after its last trigger mention (0-30), or "episode" to hold for the rest of the current episode. Omit to use the agent\'s trigger linger default.' },
+        importance: { type: 'number', minimum: 1, maximum: 10, description: 'Placement + ranking weight (default 5).' },
+        event_at: { type: 'string', description: 'ISO timestamp of when the fact was true (if different from now).' },
+        expires_at: { type: 'string', description: 'ISO timestamp when this memory should stop being inserted (it demotes, never erases).' },
+        links: { type: 'array', items: { type: 'string' }, description: 'Related memory ids.' },
+        clip_ids: { type: 'array', items: { type: 'string' }, description: 'Clip ids for media-carrying memories.' },
+        supersedes: { type: 'array', items: { type: 'string' }, description: 'Memory ids this save replaces (they stay visible, flagged superseded).' }
+      },
+      required: ['lane', 'content']
+    },
+    outputSchema: null,
+    schemaHint: 'lane + content (required); stm needs trigger_terms; optional importance/expiry/supersedes',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'save', 'awareness', 'stm', 'ltm'],
+    handler: async (context, input) =>
+      runMemoryControl(() => saveMemoryOp(memoryControlContext(context), input))
+  },
+  {
+    controlId: 'sys.memory.search',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Search',
+    description:
+      'Hybrid (meaning + keyword) search over your saved memories with lane, supersession, and time-range filters. Returns summary references only — use sys.memory.recall with chosen ids to bring full content into your context.',
+    inputSchema: memorySearchControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        lane: { type: 'string', enum: ['awareness', 'stm', 'ltm'] },
+        include_superseded: { type: 'boolean', description: 'Default true (superseded results are flagged and demoted, never hidden).' },
+        event_from: { type: 'string', description: 'ISO lower bound on when the remembered fact was true.' },
+        event_to: { type: 'string' },
+        saved_from: { type: 'string', description: 'ISO lower bound on when the memory was saved.' },
+        saved_to: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: 25 }
+      },
+      required: ['query']
+    },
+    outputSchema: null,
+    schemaHint: 'query (required) + optional lane/time-range/limit filters',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'search', 'recall', 'ltm'],
+    handler: async (context, input) =>
+      runMemoryControl(() => searchMemoriesOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.list',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory List',
+    description: 'List your saved memories newest-first as summary references, optionally filtered by lane.',
+    inputSchema: memoryListControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        lane: { type: 'string', enum: ['awareness', 'stm', 'ltm'] },
+        include_superseded: { type: 'boolean' },
+        limit: { type: 'integer', minimum: 1, maximum: 100 }
+      }
+    },
+    outputSchema: null,
+    schemaHint: 'optional lane/include_superseded/limit',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'list'],
+    handler: async (context, input) =>
+      runMemoryControl(() => listMemoriesOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.update',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Update',
+    description:
+      'Update fields of one memory (content, gist, trigger terms, importance, event/expiry timestamps, links, clips). Content changes re-embed automatically. To change the lane, use sys.memory.move_lane.',
+    inputSchema: memoryUpdateControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        memoryId: { type: 'string' },
+        content: { type: 'string' },
+        gist: { type: ['string', 'null'] },
+        trigger_terms: { type: ['array', 'null'], items: { type: 'string' } },
+        linger: { type: ['integer', 'string', 'null'], description: 'Per-memory linger override: turns (0-30), "episode", or null to clear back to the agent default.' },
+        importance: { type: 'number', minimum: 1, maximum: 10 },
+        event_at: { type: ['string', 'null'] },
+        expires_at: { type: ['string', 'null'] },
+        links: { type: ['array', 'null'], items: { type: 'string' } },
+        clip_ids: { type: ['array', 'null'], items: { type: 'string' } }
+      },
+      required: ['memoryId']
+    },
+    outputSchema: null,
+    schemaHint: 'memoryId (required) + fields to change',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'update'],
+    handler: async (context, input) =>
+      runMemoryControl(() => updateMemoryOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.supersede',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Supersede',
+    description:
+      'Mark older memories as replaced by a newer one. Superseded memories stay stored and visible with a pointer to the successor — supersession invalidates, it never deletes.',
+    inputSchema: memorySupersedeControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        memoryId: { type: 'string', description: 'The newer memory that replaces the others.' },
+        supersedes: { type: 'array', items: { type: 'string' }, description: 'Older memory ids being replaced.' }
+      },
+      required: ['memoryId', 'supersedes']
+    },
+    outputSchema: null,
+    schemaHint: 'memoryId + supersedes[] (both required)',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'supersede'],
+    handler: async (context, input) =>
+      runMemoryControl(() => supersedeMemoryOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.unsupersede',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Unsupersede',
+    description: 'Undo a mistaken supersession: restore one memory to current status and detach it from its successor.',
+    inputSchema: memoryByIdControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        memoryId: { type: 'string' }
+      },
+      required: ['memoryId']
+    },
+    outputSchema: null,
+    schemaHint: 'memoryId (required)',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'supersede', 'undo'],
+    handler: async (context, input) =>
+      runMemoryControl(() => unsupersedeMemoryOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.move_lane',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Move Lane',
+    description:
+      'Deliberately move one memory to a different lane (awareness / stm / ltm). Moving to stm requires the memory to have trigger terms.',
+    inputSchema: memoryMoveLaneControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        memoryId: { type: 'string' },
+        lane: { type: 'string', enum: ['awareness', 'stm', 'ltm'], description: MEMORY_LANE_SCHEMA_DESCRIPTION }
+      },
+      required: ['memoryId', 'lane']
+    },
+    outputSchema: null,
+    schemaHint: 'memoryId + lane (both required)',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'lane', 'move'],
+    handler: async (context, input) =>
+      runMemoryControl(() => moveMemoryLaneOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.recall',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Recall',
+    description:
+      'Read chosen memories in full: the complete content returns immediately in this tool result (which never enters chat history), and the same memories then ride your Memory context from the next message onward, lingering per the linger settings. Search hits alone are just references; recall is the read.',
+    inputSchema: memoryRecallControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        memoryIds: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 8 }
+      },
+      required: ['memoryIds']
+    },
+    outputSchema: null,
+    schemaHint: 'memoryIds[] (1-8, required)',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'recall', 'context'],
+    handler: async (context, input) =>
+      runMemoryControl(() => recallMemoriesOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.delete',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Memory Delete',
+    description:
+      'Permanently delete one memory. This is the only true delete in the memory system — prefer supersede (keeps history) unless the memory is wrong or unwanted outright.',
+    inputSchema: memoryByIdControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        memoryId: { type: 'string' }
+      },
+      required: ['memoryId']
+    },
+    outputSchema: null,
+    schemaHint: 'memoryId (required)',
+    riskLevel: 'confirm',
+    status: 'published',
+    tags: ['memory', 'delete'],
+    handler: async (context, input) =>
+      runMemoryControl(() => deleteMemoryOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.close_episode',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Close Episode',
+    description:
+      'Infinite Sessions only: mark the current work chapter (episode) as finished. Use it when a stretch of work or life is clearly done ("we finished that"). A new episode opens on the next message; closed episodes graduate later during naps and dreaming — nothing is deleted.',
+    inputSchema: z.object({}).passthrough(),
+    inputSchemaJson: { type: 'object', properties: {} },
+    outputSchema: null,
+    schemaHint: 'no input',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'episode', 'fixed-session'],
+    handler: async (context) => runMemoryControl(() => closeEpisodeOp(memoryControlContext(context)))
+  },
+  {
+    controlId: 'sys.memory.hold_episode',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Hold Episode',
+    description:
+      'Infinite Sessions only: keep the current episode open across idle gaps ("let\'s continue this tomorrow"). Pass hold_until as an ISO timestamp, or null to clear the hold.',
+    inputSchema: z
+      .object({
+        hold_until: z.string().nullable().optional()
+      })
+      .passthrough(),
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        hold_until: {
+          type: ['string', 'null'],
+          description: 'ISO timestamp to hold the episode open until; null clears the hold.'
+        }
+      }
+    },
+    outputSchema: null,
+    schemaHint: 'hold_until (ISO timestamp or null)',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'episode', 'fixed-session'],
+    handler: async (context, input) =>
+      runMemoryControl(() => holdEpisodeOp(memoryControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.memory.whiteboard',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Episode Whiteboard',
+    description:
+      'Infinite Sessions only: rewrite the episode whiteboard — the working-facts block (current goal, key decisions, live state, open items) that stays in your system prompt until the episode closes. Pass the complete new content (it replaces the whole whiteboard), or null to clear it. When the episode closes, the whiteboard dissolves but its final content is kept on the episode record.',
+    inputSchema: z
+      .object({
+        content: z.string().nullable().optional()
+      })
+      .passthrough(),
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        content: {
+          type: ['string', 'null'],
+          description: 'The complete new whiteboard content; null clears the whiteboard.'
+        }
+      }
+    },
+    outputSchema: null,
+    schemaHint: 'content (full replacement text, or null to clear)',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['memory', 'episode', 'whiteboard', 'fixed-session'],
+    handler: async (context, input) =>
+      runMemoryControl(() => updateWhiteboardOp(memoryControlContext(context), input as never))
+  }
+]
+
 const CONTROL_DEFINITIONS: ControlDefinition[] = [
+  ...MEMORY_CONTROL_DEFINITIONS,
   {
     controlId: 'sys.model_catalog.search',
     sourceType: 'core',

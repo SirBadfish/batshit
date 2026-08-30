@@ -166,6 +166,8 @@
     resolveEffectiveAutoCompactSettings,
     selectMessagesForCompaction
   } from '$lib/utils/contextCompaction'
+  import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
+  import { isFixedSession } from '$lib/utils/fixedSession'
   import { buildSessionMessagesForSend } from '$lib/utils/sessionSendMessages'
   import {
     hasInterruptibleActiveResponse,
@@ -180,7 +182,17 @@
   } from '$lib/utils/n8nPrimaryExclusivity'
   import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity'
   import { dispatchVoiceEnginesUpdated } from '$lib/utils/voiceEngineEvents'
-  import { extractZipControl, resolveZipControlZipIds, stripZipControlBlocks } from '$lib/utils/zipControl'
+  import { extractToolNotes, extractZipControl, resolveZipControlZipIds, stripZipControlBlocks } from '$lib/utils/zipControl'
+  import { buildControlErrorRecord } from '$lib/utils/controlTags'
+  import {
+    extractMemoryControls,
+    isMemoryControlToolStep,
+    memorySaveHint,
+    resolveAgentMemoryEnabled,
+    resolveEffectiveMemoryWindow,
+    resolveMemoryWindowSettings
+  } from '$lib/utils/memoryControl'
+  import { consumePendingMemoryInserted } from '$lib/services/messageApi'
   import { stripLeadingSubagentZipEcho } from '$lib/utils/subagentEchoSanitizer'
   import { RealtimeSpeechCoordinator } from '$lib/services/realtimeSpeechCoordinator'
   import { resolveSseEventSessionId } from '$lib/utils/sseSessionGuard'
@@ -393,6 +405,13 @@
   let compactBusy = $state(false)
   let compactStatus = $state<string | null>(null)
   let autoCompactLastPromptKeyBySession = $state<Record<string, string>>({})
+  // SA-104 P6: Infinite-Session nap state (the compact-state pattern).
+  let napBusy = $state(false)
+  let napStatus = $state<string | null>(null)
+  let napLastAttemptKeyBySession = $state<Record<string, string>>({})
+  // One actionable graduation-config warning per session per app run (packet doc §1.7).
+  const graduationWarnedSessions = new Set<string>()
+  const graduationCheckedSessions = new Set<string>()
   let executionSnapshots = $state<ExecutionSnapshot[]>([])
   let executionSnapshotsLoading = $state(false)
   let executionSnapshotsError = $state<string | null>(null)
@@ -646,7 +665,13 @@ const currentCompactedMessageIds = $derived.by(() =>
 )
 const currentCompactedMessageIdSet = $derived.by(() => new Set(currentCompactedMessageIds))
 const compactedMessages = $derived.by<Message[]>(() =>
-  applyContextCompactionToMessages(messages, currentCompactionEvents)
+  // SA-104 P6: Infinite-Session graduation joins the compaction application so the chat
+  // view, token math, and every send path see the graduated window (no-op for
+  // regular sessions — DL-104-12).
+  applyFixedSessionGraduationToMessages(
+    applyContextCompactionToMessages(messages, currentCompactionEvents),
+    currentSession
+  )
 )
 const currentEffectiveTrimmedMessageIds = $derived.by(() => {
   if (currentTrimmedMessageIds.length === 0) return []
@@ -741,8 +766,35 @@ const contextLimit = $derived(contextUsage.contextLimit)
 const autoCompactTriggerTokens = $derived(
   resolveAutoCompactTriggerTokens(effectiveAutoCompactSettings, contextLimit)
 )
+// SA-104 P6: Infinite Sessions replace Compact with the nap (DL-104-07).
+const currentSessionFixed = $derived(isFixedSession(currentSession))
+const currentMemoryWindow = $derived.by(() => {
+  if (!currentSessionFixed) return null
+  const agent = agentStore.getCurrentAgent()
+  if (!agent || !resolveAgentMemoryEnabled(agent)) return null
+  return resolveEffectiveMemoryWindow(resolveMemoryWindowSettings(agent), contextLimit)
+})
+const napAvailable = $derived.by(() =>
+  Boolean(
+    currentSessionFixed &&
+      currentSessionId &&
+      agentStore.getCurrentAgent()?.id &&
+      resolveAgentMemoryEnabled(agentStore.getCurrentAgent())
+  )
+)
+const napUnavailableReason = $derived.by(() => {
+  if (!currentSessionFixed) return 'Naps run only in Infinite Sessions.'
+  if (!resolveAgentMemoryEnabled(agentStore.getCurrentAgent())) {
+    return 'Naps need agent memory enabled (Agent Settings → Memory).'
+  }
+  if (!currentMemoryWindow) {
+    return 'Batshit could not resolve a model context limit for this agent, so the nap threshold is unknown. Manual naps still work.'
+  }
+  return 'Nap is available.'
+})
 const compactAvailable = $derived.by(() => {
   if (!currentSessionId || !agentStore.getCurrentAgent()?.id) return false
+  if (currentSessionFixed) return false
   const selection = selectMessagesForCompaction(messages, currentCompactionEvents, {
     protections: currentManualTrimProtections
   })
@@ -751,6 +803,9 @@ const compactAvailable = $derived.by(() => {
 const compactUnavailableReason = $derived.by(() => {
   if (!currentSessionId || !agentStore.getCurrentAgent()?.id) {
     return 'Compact needs an active chat session and agent.'
+  }
+  if (currentSessionFixed) {
+    return 'Infinite Sessions do not use Compact — context relief happens through episode graduation and naps.'
   }
   const selection = selectMessagesForCompaction(messages, currentCompactionEvents, {
     protections: currentManualTrimProtections
@@ -1772,6 +1827,8 @@ const immersiveActive = $derived.by(
     const busy = Boolean(isWaitingForResponse || isWaitingForToolCall || activeStreamCount > 0 || compactBusy)
 
     if (!sessionId || !currentAgent?.id || busy || settings.mode === 'off') return
+    // SA-104 P6: Infinite Sessions never auto-compact — the nap owns context relief.
+    if (currentSessionFixed) return
     if (!limit || typeof tokens !== 'number' || !Number.isFinite(tokens)) return
 
     const remaining = limit - tokens
@@ -1799,6 +1856,43 @@ const immersiveActive = $derived.by(
       mode: 'auto',
       confirmFirst: settings.mode === 'ask'
     })
+  })
+
+  // SA-104 P6: on opening a regular session of a memory-enabled agent, offer its idle
+  // tail to the graduation writer (server verifies the idle gap; cheap no-op
+  // otherwise). Once per session per app run.
+  $effect(() => {
+    const sessionId = currentSessionId
+    if (!sessionId || graduationCheckedSessions.has(sessionId)) return
+    graduationCheckedSessions.add(sessionId)
+    void requestRegularSessionGraduation(sessionId, 'idle')
+  })
+
+  // SA-104 P6: the Infinite-Session nap trigger — the auto-compact pattern (busy guard,
+  // per-session dedup key). Fires the nap route when the compiled window crosses the
+  // configured threshold; the server re-verifies the threshold and the between-turns
+  // interlock (DL-104-15).
+  $effect(() => {
+    const sessionId = currentSessionId
+    const currentAgent = agentStore.getCurrentAgent()
+    const window = currentMemoryWindow
+    const tokens = currentTokens
+    const busy = Boolean(
+      isWaitingForResponse || isWaitingForToolCall || activeStreamCount > 0 || compactBusy || napBusy
+    )
+
+    if (!sessionId || !currentAgent?.id || busy || !currentSessionFixed || !window) return
+    if (typeof tokens !== 'number' || !Number.isFinite(tokens)) return
+    if (tokens < window.napAtTokens) return
+
+    const attemptKey = [currentAgent.id, Math.round(tokens), window.napAtTokens].join(':')
+    if (napLastAttemptKeyBySession[sessionId] === attemptKey) return
+    napLastAttemptKeyBySession = {
+      ...napLastAttemptKeyBySession,
+      [sessionId]: attemptKey
+    }
+
+    void handleNap({ trigger: 'threshold' })
   })
 
   // Initialize on mount
@@ -3155,9 +3249,22 @@ const immersiveActive = $derived.by(
         finalContent = replaceCoolToolMarkersWithZipRefs(finalContent, data.zipReferences)
       }
 
+      // Tool Notes ride their own tag (SA-104 P1); extract them first so the
+      // zip-control pass sees a notes-free message.
+      const toolNotesExtraction = extractToolNotes(finalContent)
+      if (toolNotesExtraction.hadBlock) {
+        finalContent = toolNotesExtraction.cleaned
+      }
       const zipControlExtraction = extractZipControl(finalContent)
       if (zipControlExtraction.hadBlock) {
         finalContent = zipControlExtraction.cleaned
+      }
+      // SA-104 P3: inline memory saves ride their own tag; every block is one save.
+      // Processing happens below through /api/memory/inline-saves (the same server path
+      // as the sys.memory.save tool); here we only extract and clean the content.
+      const memoryExtraction = extractMemoryControls(finalContent)
+      if (memoryExtraction.hadBlock) {
+        finalContent = memoryExtraction.cleaned
       }
 
       // Sanitize content (removes duplicates, cleans up whitespace)
@@ -3227,17 +3334,61 @@ const immersiveActive = $derived.by(
         : agentStore.getCurrentAgent()
       const zipPermissionEnabled = resolveZipControlPermission(zipControlAgent, userSettings)
       const zipToolNotesEnabled = resolveZipToolNotesEnabled(zipControlAgent, userSettings)
+      // Tool Notes come from their own tag now; storage stays at
+      // metadata.zipControl.toolResultsSummary so downstream readers are unchanged.
       const resolvedToolResultsSummary = zipToolNotesEnabled
-        ? zipControlExtraction.payload?.toolResultsSummary ?? []
+        ? toolNotesExtraction.payload?.notes ?? []
         : []
 
-      if (zipControlExtraction.payload || zipControlExtraction.parseError || zipControlExtraction.hadBlock) {
+      const hadAnyControlBlock =
+        zipControlExtraction.hadBlock || toolNotesExtraction.hadBlock
+      if (
+        zipControlExtraction.payload ||
+        zipControlExtraction.parseError ||
+        toolNotesExtraction.parseError ||
+        hadAnyControlBlock
+      ) {
         metadata.zipControl = {
           unzip: zipControlExtraction.payload?.unzip ?? [],
           zip: zipControlExtraction.payload?.zip ?? [],
           toolResultsSummary: resolvedToolResultsSummary,
           ...(zipControlExtraction.parseError ? { parseError: zipControlExtraction.parseError } : {})
         }
+      }
+
+      // DL-104-05 loud-failure surface: malformed or deprecated control blocks
+      // become machine-readable metadata; the next turn's compile inserts a
+      // correction line from these records.
+      const controlErrors: Array<ReturnType<typeof buildControlErrorRecord>> = []
+      if (zipControlExtraction.parseError) {
+        controlErrors.push(
+          buildControlErrorRecord(
+            'batshit-zip-control',
+            zipControlExtraction.parseError,
+            'Wrap valid JSON like {"unzip":["tool_result_1"],"zip":["zipId"]} inside <batshit-zip-control>...</batshit-zip-control>.'
+          )
+        )
+      }
+      if (zipControlExtraction.payload?.legacyNotesDropped) {
+        controlErrors.push(
+          buildControlErrorRecord(
+            'batshit-zip-control',
+            'Tool Notes fields inside the zip-control block were dropped.',
+            'Tool Notes moved to their own block: <batshit-tool-notes>{"notes":[{"toolName":"...","summary":"..."}]}</batshit-tool-notes>.'
+          )
+        )
+      }
+      if (toolNotesExtraction.parseError) {
+        controlErrors.push(
+          buildControlErrorRecord(
+            'batshit-tool-notes',
+            toolNotesExtraction.parseError,
+            'Use <batshit-tool-notes>{"notes":[{"toolName":"...","summary":"exact fact(s)"}]}</batshit-tool-notes>.'
+          )
+        )
+      }
+      if (controlErrors.length > 0) {
+        metadata.controlErrors = controlErrors
       }
       const requestedUnzip = Array.isArray(zipControlExtraction.payload?.unzip)
         ? zipControlExtraction.payload?.unzip ?? []
@@ -3347,6 +3498,94 @@ const immersiveActive = $derived.by(
           zipControlPendingBySession.set(sessionId, pendingZipControl)
           await pendingZipControl
         }
+      }
+
+      // SA-104 P3: process inline memory saves through the shared server path
+      // (/api/memory/inline-saves → the same ops layer as sys.memory.save). All
+      // failures surface loudly through metadata.controlErrors (DL-104-05);
+      // successes land in metadata.memorySaves for the chat-surface affordance.
+      if (memoryExtraction.hadBlock) {
+        const appendMemoryControlError = (error: string, hint?: string) => {
+          const list = Array.isArray(metadata.controlErrors) ? metadata.controlErrors : []
+          list.push(buildControlErrorRecord('batshit-memory', error, hint ?? memorySaveHint()))
+          metadata.controlErrors = list
+        }
+        const memoryAgent = zipControlAgent
+        const memorySessionId = eventSessionContext
+
+        if (!resolveAgentMemoryEnabled(memoryAgent)) {
+          appendMemoryControlError(
+            'Memory is not enabled for this agent; the memory save block(s) were not stored.',
+            'Do not emit <batshit-memory> blocks unless memory is enabled for you.'
+          )
+        } else {
+          for (const block of memoryExtraction.blocks) {
+            if (block.parseError) {
+              appendMemoryControlError(block.parseError)
+            }
+          }
+          const validMemoryPayloads = memoryExtraction.blocks
+            .filter((block) => block.payload)
+            .map((block) => block.payload)
+          if (validMemoryPayloads.length > 0 && memorySessionId) {
+            try {
+              const response = await fetch('/api/memory/inline-saves', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  sessionId: memorySessionId,
+                  messageId: targetMessageId,
+                  agentId: memoryAgent?.id ?? currentMessage.agent_id ?? null,
+                  payloads: validMemoryPayloads
+                })
+              })
+              const payload = await response.json().catch(() => null)
+              if (!response.ok) {
+                appendMemoryControlError(
+                  `Memory save failed: ${payload?.error ?? `HTTP ${response.status}`}`,
+                  'The save was not stored. Fix the payload or ask the user to check memory setup, then save again.'
+                )
+              } else {
+                const results = Array.isArray(payload?.results) ? payload.results : []
+                const saves: any[] = []
+                for (const result of results) {
+                  if (result?.error) {
+                    appendMemoryControlError(result.error, result.hint)
+                  } else if (result?.saved) {
+                    saves.push({
+                      id: result.saved.id,
+                      lane: result.saved.lane,
+                      gist: result.saved.gist,
+                      ...(Array.isArray(result.saved.trigger_terms) && result.saved.trigger_terms.length > 0
+                        ? { trigger_terms: result.saved.trigger_terms }
+                        : {}),
+                      ...(result.superseded ? { superseded: result.superseded } : {}),
+                      ...(result.nearDuplicates?.length
+                        ? { nearDuplicates: result.nearDuplicates }
+                        : {})
+                    })
+                  }
+                }
+                if (saves.length > 0) {
+                  metadata.memorySaves = saves
+                }
+              }
+            } catch (error) {
+              appendMemoryControlError(
+                `Memory save request failed: ${error instanceof Error ? error.message : 'network error'}`,
+                'The save was not stored; retry the save in your next message.'
+              )
+            }
+          }
+        }
+      }
+
+      // SA-104 P5: native n8n "memory inserted" stamp — the accepted-send commit
+      // result stashed by messageApi rides the finalized assistant message
+      // (managed lanes stamp the same shape server-side in send-routed).
+      const pendingMemoryInserted = consumePendingMemoryInserted(targetMessageId)
+      if (pendingMemoryInserted) {
+        metadata.memoryInserted = pendingMemoryInserted
       }
 
       if (Array.isArray(data.metadata?.imageZipIds)) {
@@ -3968,36 +4207,48 @@ const immersiveActive = $derived.by(
         .filter((ref: any) => typeof ref === 'string' && ref.length > 0)
 
       // Always prefer zip references. If none arrive, insert a missing-zip
-      // placeholder so we never fall back to inline markers.
+      // placeholder so we never fall back to inline markers — EXCEPT for memory
+      // tool steps (DL-104-17): those are deliberately zip-free (summary-first;
+      // remembered content rides the DCM channel), so "no zip" is their healthy
+      // state. Without this guard the fallback minted an untrusted ref that
+      // flashed "[zip reference omitted]" mid-stream and glued the surrounding
+      // text together when cleanup removed it (found live 2026-08-29).
       const toolState = getOrCreateToolStreamState(messageId, targetMessage.content || '')
       const toolKey = resolveToolKey(data, messageId)
-      const insertionPosition = toolKey && toolState.toolPositions.has(toolKey)
-        ? toolState.toolPositions.get(toolKey)?.pos ?? toolState.textBuffer.length
-        : toolState.textBuffer.length
-      const toolBlock = toolZipStrings.length > 0
-        ? toolZipStrings.join('\n\n')
-        : (() => {
-            const fallbackToolName = cleanToolName || 'tool'
-            const fallbackIdBase =
-              typeof data.toolCallId === 'string' && data.toolCallId.length > 0
-                ? data.toolCallId
-                : `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-            const fallbackZipId = `cool_tool_missing_${fallbackIdBase}`
-            const fallbackReference = `{{batshit-zip:${fallbackZipId}:::Tool execution: ${fallbackToolName}}}`
-            return fallbackReference
-          })()
+      const isZipFreeMemoryStep = toolZipStrings.length === 0 && isMemoryControlToolStep(data)
+      if (isZipFreeMemoryStep) {
+        if (toolKey) {
+          toolState.toolPositions.delete(toolKey)
+        }
+      } else {
+        const insertionPosition = toolKey && toolState.toolPositions.has(toolKey)
+          ? toolState.toolPositions.get(toolKey)?.pos ?? toolState.textBuffer.length
+          : toolState.textBuffer.length
+        const toolBlock = toolZipStrings.length > 0
+          ? toolZipStrings.join('\n\n')
+          : (() => {
+              const fallbackToolName = cleanToolName || 'tool'
+              const fallbackIdBase =
+                typeof data.toolCallId === 'string' && data.toolCallId.length > 0
+                  ? data.toolCallId
+                  : `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+              const fallbackZipId = `cool_tool_missing_${fallbackIdBase}`
+              const fallbackReference = `{{batshit-zip:${fallbackZipId}:::Tool execution: ${fallbackToolName}}}`
+              return fallbackReference
+            })()
 
-      if (toolKey) {
-        toolState.toolPositions.delete(toolKey)
-      }
+        if (toolKey) {
+          toolState.toolPositions.delete(toolKey)
+        }
 
-      const toolRefs = toolZipStrings.length > 0 ? toolZipStrings : [toolBlock]
-      for (const ref of toolRefs) {
-        toolState.insertions.push({
-          pos: insertionPosition,
-          ref,
-          order: toolInsertionSequence++
-        })
+        const toolRefs = toolZipStrings.length > 0 ? toolZipStrings : [toolBlock]
+        for (const ref of toolRefs) {
+          toolState.insertions.push({
+            pos: insertionPosition,
+            ref,
+            order: toolInsertionSequence++
+          })
+        }
       }
 
       const updatedContent = composeToolStreamContent(toolState)
@@ -5128,6 +5379,8 @@ const immersiveActive = $derived.by(
         return 'Reset Trim'
       case 'compact':
         return 'Compact'
+      case 'nap':
+        return 'the nap'
       default:
         return 'context controls'
     }
@@ -5395,6 +5648,15 @@ const immersiveActive = $derived.by(
       return
     }
 
+    // SA-104 P6 (DL-104-07): Infinite Sessions relieve context through graduation/naps.
+    if (currentSessionFixed) {
+      toast.info('Infinite Sessions do not use Compact', {
+        description:
+          'Context relief happens through episode graduation and naps, which keep the originals searchable.'
+      })
+      return
+    }
+
     const currentMessages = messageStore.getMessages()
     const localSelection = selectMessagesForCompaction(currentMessages, currentCompactionEvents, {
       protections: currentManualTrimProtections
@@ -5577,6 +5839,138 @@ const immersiveActive = $derived.by(
       if (shouldRefreshContextAfterCompact) {
         scheduleLiveContextPreview('compact', 0)
       }
+    }
+  }
+
+  /**
+   * SA-104 P6 — run the Infinite-Session nap (threshold-triggered or the Token Panel's
+   * manual button). The route re-verifies the threshold, ownership, and the
+   * between-turns interlock; the local session store picks up the fresh metadata
+   * (graduation events + nap record) from the response.
+   */
+  async function handleNap(options: { trigger?: 'threshold' | 'manual' } = {}) {
+    const trigger = options.trigger ?? 'manual'
+    if (napBusy) return
+
+    const sessionId = currentSessionId
+    const currentAgent = agentStore.getCurrentAgent()
+    if (!sessionId || !currentAgent?.id) {
+      toast.error('Nap needs an active chat session and agent')
+      return
+    }
+    if (!currentSessionFixed) {
+      toast.info('Naps run only in Infinite Sessions')
+      return
+    }
+
+    napBusy = true
+    napStatus = 'Napping: graduating episodes and tidying context...'
+    if (trigger === 'threshold') {
+      toast.info('Batshit is napping', {
+        description:
+          'The context window crossed the nap threshold. Closed episodes graduate to memory and stale bulk compresses — originals stay searchable.'
+      })
+    }
+    try {
+      const response = await fetch('/api/memory/nap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, agentId: currentAgent.id, trigger })
+      })
+      const payload = await response.json().catch(() => null)
+
+      if (payload?.metadata) {
+        sessionStore.updateSession(sessionId, { metadata: payload.metadata })
+      }
+      if (!response.ok) {
+        if (payload?.code === 'session_turn_in_progress') {
+          // A turn started while we queued the nap; the next idle threshold check retries.
+          return
+        }
+        throw new Error(payload?.error || 'Nap failed')
+      }
+      if (payload?.status === 'not_needed') {
+        if (trigger === 'manual') {
+          toast.info('No nap needed', {
+            description: `The window is below the nap threshold (${formatTokenCount(payload?.napAtTokens)} tokens).`
+          })
+        }
+        return
+      }
+
+      const record = payload?.record
+      const graduated = Array.isArray(record?.graduatedEpisodeIds)
+        ? record.graduatedEpisodeIds.length
+        : 0
+      const rezipped = typeof record?.rezippedZipCount === 'number' ? record.rezippedZipCount : 0
+      const compacted = record?.compaction?.compactedMessageCount ?? 0
+      const parts: string[] = []
+      if (graduated > 0) parts.push(`${graduated} episode${graduated === 1 ? '' : 's'} graduated`)
+      if (rezipped > 0) parts.push(`${rezipped} zip${rezipped === 1 ? '' : 's'} compressed`)
+      if (compacted > 0) parts.push(`${compacted} older message${compacted === 1 ? '' : 's'} summarized with a whiteboard refresh`)
+      const tokensLine =
+        typeof payload?.tokensBefore === 'number' && typeof payload?.tokensAfter === 'number'
+          ? `Context: ${formatTokenCount(payload.tokensBefore)} → ${formatTokenCount(payload.tokensAfter)}.`
+          : null
+      toast.success('Nap complete', {
+        description: [parts.length > 0 ? parts.join(', ') + '.' : 'Nothing needed relief.', tokensLine]
+          .filter(Boolean)
+          .join(' ')
+      })
+      scheduleLiveContextPreview('nap', 0)
+    } catch (error) {
+      console.error('[Nap] Failed:', error)
+      toast.error('Nap failed', {
+        description: error instanceof Error ? error.message : 'Nap failed'
+      })
+    } finally {
+      napBusy = false
+      napStatus = null
+    }
+  }
+
+  /**
+   * SA-104 P6 — regular-session graduation hooks (DL-104-12/-16: strictly additive).
+   * Called on session open (`reason: 'idle'` — the server verifies the idle gap and
+   * no-ops otherwise) and on archive (`reason: 'close'`). Failures surface one
+   * actionable toast per session per app run; a missing summary-model preset names
+   * the Agent Settings fix.
+   */
+  async function requestRegularSessionGraduation(sessionId: string, reason: 'idle' | 'close') {
+    if (!sessionId) return
+    const session = sessionStore.getSessions().find((entry) => entry.id === sessionId) ?? null
+    if (!session || isFixedSession(session)) return
+    if (session.metadata?.group_chat) return
+    const agentId = session.agent_id || agentStore.getCurrentAgent()?.id || ''
+    const agent = agentId ? agentStore.getAgentById(agentId) : null
+    if (!agent?.id || !resolveAgentMemoryEnabled(agent)) return
+
+    try {
+      const response = await fetch('/api/memory/graduate-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, agentId: agent.id, reason })
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) {
+        const message = payload?.error || 'Session graduation failed'
+        if (!graduationWarnedSessions.has(sessionId)) {
+          graduationWarnedSessions.add(sessionId)
+          toast.warning('Memory graduation needs attention', {
+            description: `${message} You can pick a summary model in Agent Settings → Memory.`
+          })
+        } else {
+          console.warn('[Memory] Session graduation failed:', message)
+        }
+        return
+      }
+      if (payload?.status === 'graduated') {
+        toast.success('Session graduated to memory', {
+          description: `${payload.messageCount ?? ''} message${payload?.messageCount === 1 ? '' : 's'} summarized into searchable memory.`.trim()
+        })
+      }
+    } catch (error) {
+      console.warn('[Memory] Session graduation request failed:', error)
     }
   }
 
@@ -6956,6 +7350,12 @@ const immersiveActive = $derived.by(
           compactBusy={compactBusy}
           compactStatus={compactStatus}
           compactedTokens={compactedTokens}
+          napMode={currentSessionFixed}
+          napAvailable={napAvailable}
+          napUnavailableReason={napUnavailableReason}
+          napBusy={napBusy}
+          napStatus={napStatus}
+          onNap={() => handleNap({ trigger: 'manual' })}
           costLabel={
             runningCost.cost === null
               ? 'Unknown'

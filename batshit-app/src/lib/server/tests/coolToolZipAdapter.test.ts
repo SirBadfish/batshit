@@ -110,6 +110,35 @@ describe('CoolToolZipAdapter', () => {
       expect(result[0].placeholder).toBe('{{ZIP_COOL_TOOL_0}}')
     })
 
+    // SA-104 P3 (DL-104-17): memory broker calls are exempt from zip-first treatment —
+    // summary-first references only; remembered content rides the DCM insert channel.
+    it('skips zip creation for broker steps targeting sys.memory.* and still zips the rest', async () => {
+      const memoryStep = {
+        toolName: 'native_batshit_tool_use',
+        toolInput: { ref: 'fabric:sys.memory.search', input: { query: 'dog' } },
+        toolResult: { results: [{ id: 'mem_1', gist: 'Maggie is the dog' }] },
+        toolCallId: 'call-memory-1',
+        timestamp: Date.now()
+      }
+      const settings: Partial<AgentRow> = {
+        buffer_size_all_other_tools: 0,
+        zip_threshold_all_other_tools: 0
+      }
+
+      const memoryOnly = await adaptCoolToolsToZipSystem([memoryStep], sessionId, messageId, settings)
+      expect(memoryOnly).toHaveLength(0)
+      expect(vi.mocked(createZipFromContent)).not.toHaveBeenCalled()
+
+      const mixed = await adaptCoolToolsToZipSystem(
+        [memoryStep, testToolResults.simple],
+        sessionId,
+        messageId,
+        settings
+      )
+      expect(mixed).toHaveLength(1)
+      expect(mixed[0].zipId).toContain('cool_tool')
+    })
+
     it('passes a reserved zipId to the main cool_tool zip writer by toolCallId', async () => {
       const step = {
         toolName: 'read_file',

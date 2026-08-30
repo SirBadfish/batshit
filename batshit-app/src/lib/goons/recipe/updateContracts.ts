@@ -27,6 +27,8 @@ export const RECIPE_UPDATE_PROOF_CONTRACT = "recipe-update-proof/v1";
 export const RECIPE_UPDATE_JOB_CONTRACT = "recipe-update-job/v1";
 export const RECIPE_TOPOLOGY_REBUILD_PROOF_CONTRACT =
   "recipe-topology-rebuild-proof/v1";
+export const RECIPE_SAME_TOPOLOGY_GEOMETRY_CHANGE_PROOF_CONTRACT =
+  "recipe-same-topology-geometry-change-proof/v1";
 export const RECIPE_STRICT_TOLERANCE_PROFILE = "recipe-strict/v1";
 export const RECIPE_STRICT_TOLERANCES = {
   scalar: 1e-7,
@@ -71,6 +73,7 @@ const SIBLING_ACTIONS = [
 const WARNING_CODES = [
   "neutral-changed",
   "material-changed",
+  "geometry-changed",
   "topology-changed",
 ] as const;
 const REPORT_CLASSIFICATIONS = [
@@ -216,6 +219,30 @@ export type RecipeTopologyRebuildProof = {
   proofSha256: string;
 };
 
+export type RecipeSameTopologyGeometryChangeProof = {
+  contract: typeof RECIPE_SAME_TOPOLOGY_GEOMETRY_CHANGE_PROOF_CONTRACT;
+  mode:
+    | "author-intentional-target-geometry"
+    | "author-intentional-neutral-geometry";
+  topologySha256: string;
+  skeletonHierarchySha256: string;
+  fromPhysicalBasisSha256: string;
+  toPhysicalBasisSha256: string;
+  fromBehaviorSha256: string;
+  toBehaviorSha256: string;
+  fromComponentGraphSha256: string;
+  toComponentGraphSha256: string;
+  affectedMeshNodeIds: string[];
+  affectedComponentIds: string[];
+  authorizedGeometryChannelKeys: string[];
+  authorityBundleSha256: string;
+  sourceAuditSha256: string;
+  targetAuditSha256: string;
+  requiresPreview: true;
+  requiresConfirmation: true;
+  proofSha256: string;
+};
+
 export type RecipeUpdateEdge = {
   id: string;
   directEdgeKey: string;
@@ -227,6 +254,7 @@ export type RecipeUpdateEdge = {
   siblingSubplans: RecipeSiblingSubplan[];
   warnings: RecipeUpdateWarning[];
   topologyRebuild?: RecipeTopologyRebuildProof;
+  sameTopologyGeometryChange?: RecipeSameTopologyGeometryChangeProof;
   proof: RecipeUpdateProof;
   edgeSha256: string;
 };
@@ -277,6 +305,11 @@ export type RecipeMigrationReport = {
 export type RecipeMigrationReportExpectation = {
   classifications: Readonly<Record<string, RecipeMigrationClassification>>;
   status: RecipeMigrationReportStatus;
+  wholeRecipeProof?: {
+    proofSha256: string;
+    maximumError: number;
+    rmsError: number;
+  };
 };
 
 export type RecipeUpdateJobFailure = {
@@ -399,6 +432,17 @@ function requireNonNegativeFinite(value: unknown, context: string): number {
   return parsed;
 }
 
+function requireStorageStableNonNegativeFinite(
+  value: unknown,
+  context: string,
+): number {
+  const parsed = requireNonNegativeFinite(value, context);
+  // Migration-report measurements participate in immutable hashes. Fifteen
+  // significant digits survive RedisJSON's adjacent shortest-decimal output
+  // while remaining substantially finer than every locked Recipe tolerance.
+  return parsed === 0 ? 0 : Number(parsed.toPrecision(15));
+}
+
 function requirePositiveFinite(value: unknown, context: string): number {
   const parsed = requireFinite(value, context);
   if (parsed <= 0) throw new Error(context + " must be positive");
@@ -445,6 +489,45 @@ function sameSet(left: readonly string[], right: readonly string[]): boolean {
   );
 }
 
+function meshNodeIdFromGeometryChannelKey(
+  key: string,
+  context: string,
+): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(key);
+  } catch {
+    throw new Error(`${context} must be a canonical geometry channel key`);
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 5 ||
+    parsed.some((entry) => typeof entry !== "string") ||
+    parsed[0] !== "absolute" ||
+    parsed[1] !== "mesh" ||
+    parsed[4] !== "POSITION"
+  ) {
+    throw new Error(
+      `${context} must identify one absolute mesh POSITION channel`,
+    );
+  }
+  const [, , semanticMeshId, semanticNodeId] = parsed as string[];
+  const nodePrefix = "node/v1/";
+  if (!semanticNodeId.startsWith(nodePrefix)) {
+    throw new Error(`${context} has an invalid semantic node id`);
+  }
+  const meshNodeId = semanticNodeId.slice(nodePrefix.length);
+  if (
+    meshNodeId.length === 0 ||
+    !semanticMeshId.startsWith(`${semanticNodeId}/primitive/`) ||
+    semanticMeshId.length === `${semanticNodeId}/primitive/`.length ||
+    JSON.stringify(parsed) !== key
+  ) {
+    throw new Error(`${context} does not bind one canonical mesh primitive`);
+  }
+  return meshNodeId;
+}
+
 const SOURCE_IDENTITY_KEY_ORDER: (keyof RecipeSourceIdentity)[] = [
   "contract",
   "schemaVersion",
@@ -480,6 +563,15 @@ function parseStableIdList(value: unknown, context: string): string[] {
   assertUnique(ids, context);
   assertSorted(ids, context);
   return ids;
+}
+
+function parseSortedStringList(value: unknown, context: string): string[] {
+  const entries = requireArray(value, context).map((entry, index) =>
+    requireString(entry, `${context}[${index}]`),
+  );
+  assertUnique(entries, context);
+  assertSorted(entries, context);
+  return entries;
 }
 
 function parseStableIdLedger(value: unknown): RecipeStableIdLedger {
@@ -948,6 +1040,159 @@ function parseTopologyRebuildProof(
   return parsed;
 }
 
+function parseSameTopologyGeometryChangeProof(
+  value: unknown,
+  from: RecipeSourceIdentity,
+  to: RecipeSourceIdentity,
+  context: string,
+): RecipeSameTopologyGeometryChangeProof {
+  const raw = requireRecord(value, context);
+  requireExactKeys(
+    raw,
+    [
+      "contract",
+      "mode",
+      "topologySha256",
+      "skeletonHierarchySha256",
+      "fromPhysicalBasisSha256",
+      "toPhysicalBasisSha256",
+      "fromBehaviorSha256",
+      "toBehaviorSha256",
+      "fromComponentGraphSha256",
+      "toComponentGraphSha256",
+      "affectedMeshNodeIds",
+      "affectedComponentIds",
+      "authorizedGeometryChannelKeys",
+      "authorityBundleSha256",
+      "sourceAuditSha256",
+      "targetAuditSha256",
+      "requiresPreview",
+      "requiresConfirmation",
+      "proofSha256",
+    ],
+    context,
+  );
+  if (raw.contract !== RECIPE_SAME_TOPOLOGY_GEOMETRY_CHANGE_PROOF_CONTRACT) {
+    throw new Error(`${context} contract is invalid`);
+  }
+  if (
+    raw.mode !== "author-intentional-target-geometry" &&
+    raw.mode !== "author-intentional-neutral-geometry"
+  ) {
+    throw new Error(`${context} mode is invalid`);
+  }
+  if (raw.requiresPreview !== true || raw.requiresConfirmation !== true) {
+    throw new Error(`${context} must require preview and confirmation`);
+  }
+  const parsed: RecipeSameTopologyGeometryChangeProof = {
+    contract: RECIPE_SAME_TOPOLOGY_GEOMETRY_CHANGE_PROOF_CONTRACT,
+    mode: raw.mode,
+    topologySha256: requireSha(
+      raw.topologySha256,
+      `${context}.topologySha256`,
+    ),
+    skeletonHierarchySha256: requireSha(
+      raw.skeletonHierarchySha256,
+      `${context}.skeletonHierarchySha256`,
+    ),
+    fromPhysicalBasisSha256: requireSha(
+      raw.fromPhysicalBasisSha256,
+      `${context}.fromPhysicalBasisSha256`,
+    ),
+    toPhysicalBasisSha256: requireSha(
+      raw.toPhysicalBasisSha256,
+      `${context}.toPhysicalBasisSha256`,
+    ),
+    fromBehaviorSha256: requireSha(
+      raw.fromBehaviorSha256,
+      `${context}.fromBehaviorSha256`,
+    ),
+    toBehaviorSha256: requireSha(
+      raw.toBehaviorSha256,
+      `${context}.toBehaviorSha256`,
+    ),
+    fromComponentGraphSha256: requireSha(
+      raw.fromComponentGraphSha256,
+      `${context}.fromComponentGraphSha256`,
+    ),
+    toComponentGraphSha256: requireSha(
+      raw.toComponentGraphSha256,
+      `${context}.toComponentGraphSha256`,
+    ),
+    affectedMeshNodeIds: parseStableIdList(
+      raw.affectedMeshNodeIds,
+      `${context}.affectedMeshNodeIds`,
+    ),
+    affectedComponentIds: parseStableIdList(
+      raw.affectedComponentIds,
+      `${context}.affectedComponentIds`,
+    ),
+    authorizedGeometryChannelKeys: parseSortedStringList(
+      raw.authorizedGeometryChannelKeys,
+      `${context}.authorizedGeometryChannelKeys`,
+    ),
+    authorityBundleSha256: requireSha(
+      raw.authorityBundleSha256,
+      `${context}.authorityBundleSha256`,
+    ),
+    sourceAuditSha256: requireSha(
+      raw.sourceAuditSha256,
+      `${context}.sourceAuditSha256`,
+    ),
+    targetAuditSha256: requireSha(
+      raw.targetAuditSha256,
+      `${context}.targetAuditSha256`,
+    ),
+    requiresPreview: true,
+    requiresConfirmation: true,
+    proofSha256: requireSha(raw.proofSha256, `${context}.proofSha256`),
+  };
+  if (
+    parsed.affectedMeshNodeIds.length === 0 ||
+    parsed.affectedComponentIds.length === 0 ||
+    parsed.authorizedGeometryChannelKeys.length === 0
+  ) {
+    throw new Error(
+      `${context} must name affected meshes, components, and geometry channels`,
+    );
+  }
+  const channelMeshNodeIds = [
+    ...new Set(
+      parsed.authorizedGeometryChannelKeys.map((key, index) =>
+        meshNodeIdFromGeometryChannelKey(
+          key,
+          `${context}.authorizedGeometryChannelKeys[${index}]`,
+        ),
+      ),
+    ),
+  ].sort();
+  if (!sameSet(channelMeshNodeIds, parsed.affectedMeshNodeIds)) {
+    throw new Error(
+      `${context} affected meshes do not exactly match its authorized geometry channels`,
+    );
+  }
+  if (
+    from.topologySha256 !== to.topologySha256 ||
+    parsed.topologySha256 !== from.topologySha256 ||
+    from.skeletonHierarchySha256 !== to.skeletonHierarchySha256 ||
+    parsed.skeletonHierarchySha256 !== from.skeletonHierarchySha256 ||
+    parsed.fromPhysicalBasisSha256 !== from.physicalBasisSha256 ||
+    parsed.toPhysicalBasisSha256 !== to.physicalBasisSha256 ||
+    parsed.fromPhysicalBasisSha256 === parsed.toPhysicalBasisSha256 ||
+    parsed.fromBehaviorSha256 !== from.behaviorSha256 ||
+    parsed.toBehaviorSha256 !== to.behaviorSha256 ||
+    parsed.fromBehaviorSha256 !== parsed.toBehaviorSha256 ||
+    parsed.fromComponentGraphSha256 !== from.componentGraphSha256 ||
+    parsed.toComponentGraphSha256 !== to.componentGraphSha256 ||
+    parsed.fromComponentGraphSha256 !== parsed.toComponentGraphSha256
+  ) {
+    throw new Error(
+      `${context} does not bind one exact same-topology geometry transition`,
+    );
+  }
+  return parsed;
+}
+
 function parseUpdateProof(value: unknown): RecipeUpdateProof {
   const context = "recipe update proof";
   const raw = requireRecord(value, context);
@@ -1026,6 +1271,10 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
     raw,
     "topologyRebuild",
   );
+  const hasSameTopologyGeometryChange = Object.prototype.hasOwnProperty.call(
+    raw,
+    "sameTopologyGeometryChange",
+  );
   requireExactKeys(
     raw,
     [
@@ -1039,6 +1288,9 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
       "siblingSubplans",
       "warnings",
       ...(hasTopologyRebuild ? ["topologyRebuild"] : []),
+      ...(hasSameTopologyGeometryChange
+        ? ["sameTopologyGeometryChange"]
+        : []),
       "proof",
       "edgeSha256",
     ],
@@ -1068,6 +1320,19 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
         `${context}.topologyRebuild`,
       )
     : undefined;
+  const sameTopologyGeometryChange = hasSameTopologyGeometryChange
+    ? parseSameTopologyGeometryChangeProof(
+        raw.sameTopologyGeometryChange,
+        from,
+        to,
+        `${context}.sameTopologyGeometryChange`,
+      )
+    : undefined;
+  if (topologyRebuild && sameTopologyGeometryChange) {
+    throw new Error(
+      context + " cannot combine topology rebuild and same-topology geometry change proofs",
+    );
+  }
   if (from.skeletonHierarchySha256 !== to.skeletonHierarchySha256) {
     throw new Error(context + " crosses skeleton identities");
   }
@@ -1100,6 +1365,16 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
   ) {
     throw new Error(
       context + " topology rebuild references an unknown component",
+    );
+  }
+  if (
+    sameTopologyGeometryChange?.affectedComponentIds.some(
+      (componentId) =>
+        !controls.some((control) => control.componentId === componentId),
+    )
+  ) {
+    throw new Error(
+      context + " same-topology geometry change references an unknown component",
     );
   }
   const ledgerById = new Map(
@@ -1170,6 +1445,16 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
         : context + " topology-changed warning has no topology rebuild",
     );
   }
+  const hasGeometryWarning = warnings.some(
+    (warning) => warning.code === "geometry-changed",
+  );
+  if (hasGeometryWarning !== hasSameTopologyGeometryChange) {
+    throw new Error(
+      hasSameTopologyGeometryChange
+        ? context + " same-topology geometry change must carry a geometry-changed warning"
+        : context + " geometry-changed warning has no same-topology geometry proof",
+    );
+  }
   return {
     id: requireStableId(raw.id, context + ".id"),
     directEdgeKey,
@@ -1181,6 +1466,9 @@ function parseUpdateEdge(value: unknown, index: number): RecipeUpdateEdge {
     siblingSubplans: parseSiblingSubplans(raw.siblingSubplans),
     warnings,
     ...(topologyRebuild ? { topologyRebuild } : {}),
+    ...(sameTopologyGeometryChange
+      ? { sameTopologyGeometryChange }
+      : {}),
     proof: parseUpdateProof(raw.proof),
     edgeSha256: requireSha(raw.edgeSha256, context + ".edgeSha256"),
   };
@@ -1260,7 +1548,7 @@ function parseReportEntry(
     REPORT_PROOF_STATUSES,
     context + ".proofStatus",
   );
-  const maximumError = requireNonNegativeFinite(
+  const maximumError = requireStorageStableNonNegativeFinite(
     raw.maximumError,
     context + ".maximumError",
   );
@@ -1283,13 +1571,19 @@ function parseReportEntry(
   );
 
   if (["kept", "presentation-updated", "remapped"].includes(classification)) {
+    const verifiedPreservation =
+      proofStatus === "verified" &&
+      maximumError <= tolerance &&
+      !requiresPreview &&
+      !requiresConfirmation;
+    const reviewedNonPreservation =
+      proofStatus === "not-preserved" &&
+      requiresPreview &&
+      requiresConfirmation;
     if (
       oldValue === null ||
       proposedValue === null ||
-      proofStatus !== "verified" ||
-      maximumError > tolerance ||
-      requiresPreview ||
-      requiresConfirmation
+      (!verifiedPreservation && !reviewedNonPreservation)
     ) {
       throw new Error(
         `migration report entry ${id} has invalid preservation proof`,
@@ -1370,11 +1664,11 @@ function parseReportProof(value: unknown): RecipeMigrationReportProof {
   if (raw.toleranceProfile !== RECIPE_STRICT_TOLERANCE_PROFILE) {
     throw new Error("recipe migration report tolerance profile is invalid");
   }
-  const wholeRecipeMaximumError = requireNonNegativeFinite(
+  const wholeRecipeMaximumError = requireStorageStableNonNegativeFinite(
     raw.wholeRecipeMaximumError,
     context + ".wholeRecipeMaximumError",
   );
-  const wholeRecipeRmsError = requireNonNegativeFinite(
+  const wholeRecipeRmsError = requireStorageStableNonNegativeFinite(
     raw.wholeRecipeRmsError,
     context + ".wholeRecipeRmsError",
   );
@@ -1537,8 +1831,58 @@ export function parseRecipeMigrationReport(
 
   const proof = parseReportProof(raw.proof);
   if (
+    expectation?.wholeRecipeProof &&
+    (proof.wholeRecipeProofSha256 !==
+      expectation.wholeRecipeProof.proofSha256 ||
+      proof.wholeRecipeMaximumError !==
+        expectation.wholeRecipeProof.maximumError ||
+      proof.wholeRecipeRmsError !== expectation.wholeRecipeProof.rmsError)
+  ) {
+    throw new Error(
+      "recipe migration report proof contradicts its migration plan",
+    );
+  }
+  const geometryChange = validatedEdge.sameTopologyGeometryChange;
+  const declaredGeometryComponents = new Set(
+    geometryChange?.affectedComponentIds ?? [],
+  );
+  const reviewedGeometryComponents = new Set(
+    entries
+      .filter(
+        (entry) =>
+          entry.proofStatus === "not-preserved" &&
+          entry.requiresPreview &&
+          entry.requiresConfirmation,
+      )
+      .map((entry) => entry.componentId),
+  );
+  const authorizedGeometryPreview =
+    status === "preview-required" &&
+    geometryChange !== undefined &&
+    warnings.some((warning) => warning.code === "geometry-changed") &&
+    (geometryChange.mode === "author-intentional-neutral-geometry"
+      ? reviewedGeometryComponents.size === 0 &&
+        entries.every((entry) =>
+          declaredGeometryComponents.has(entry.componentId)
+            ? entry.proofStatus === "verified"
+            : entry.proofStatus !== "not-preserved",
+        )
+      : declaredGeometryComponents.size ===
+          reviewedGeometryComponents.size &&
+        [...declaredGeometryComponents].every((componentId) =>
+          reviewedGeometryComponents.has(componentId),
+        ) &&
+        entries.every((entry) =>
+          declaredGeometryComponents.has(entry.componentId)
+            ? entry.proofStatus === "not-preserved" &&
+              entry.requiresPreview &&
+              entry.requiresConfirmation
+            : entry.proofStatus !== "not-preserved",
+        ));
+  if (
     status !== "blocked" &&
-    proof.wholeRecipeMaximumError > proof.wholeRecipeTolerance
+    proof.wholeRecipeMaximumError > proof.wholeRecipeTolerance &&
+    !authorizedGeometryPreview
   ) {
     throw new Error("recipe migration report exceeds whole-Recipe tolerance");
   }
@@ -1815,6 +2159,17 @@ export async function recipeTopologyRebuildProofSha256(
   return canonicalRecipeSha256(content);
 }
 
+export async function recipeSameTopologyGeometryChangeProofSha256(
+  value:
+    | RecipeSameTopologyGeometryChangeProof
+    | Omit<RecipeSameTopologyGeometryChangeProof, "proofSha256">,
+): Promise<string> {
+  canonicalRecipeString(value);
+  const { proofSha256: _proofSha256, ...content } = value as
+    RecipeSameTopologyGeometryChangeProof;
+  return canonicalRecipeSha256(content);
+}
+
 export async function recipeUpdateEdgeSha256(value: unknown): Promise<string> {
   canonicalRecipeString(value);
   const edge = parseUpdateEdge(value, 0);
@@ -1832,6 +2187,17 @@ export async function verifyRecipeUpdateEdge(
     if (topologyProofSha256 !== edge.topologyRebuild.proofSha256) {
       throw new Error(
         `recipe topology rebuild proof hash mismatch: expected ${edge.topologyRebuild.proofSha256}, got ${topologyProofSha256}`,
+      );
+    }
+  }
+  if (edge.sameTopologyGeometryChange) {
+    const geometryProofSha256 =
+      await recipeSameTopologyGeometryChangeProofSha256(
+        edge.sameTopologyGeometryChange,
+      );
+    if (geometryProofSha256 !== edge.sameTopologyGeometryChange.proofSha256) {
+      throw new Error(
+        `recipe same-topology geometry change proof hash mismatch: expected ${edge.sameTopologyGeometryChange.proofSha256}, got ${geometryProofSha256}`,
       );
     }
   }

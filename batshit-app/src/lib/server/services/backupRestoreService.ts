@@ -12,6 +12,7 @@ import * as yauzl from 'yauzl'
 import type { Entry, ZipFile } from 'yauzl'
 
 import { redis } from '$lib/server/redis'
+import { reconcileMemoryIndexesAfterRestore } from '$lib/server/services/memory/memoryIndex'
 import {
   GOON_RECIPE_OWNER_V2_CONTRACT,
   GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
@@ -119,6 +120,13 @@ const GROUP_DEFINITIONS = [
     label: 'Agents, subagents, and groups',
     classification: 'required',
     description: 'Primary agents, subagents, group chats, and agent/subagent assignments.'
+  },
+  {
+    id: 'memory',
+    label: 'Agent memory',
+    classification: 'required',
+    description:
+      'Agent memories, graduated history segments, and memory configuration. Search indexes are derived and rebuild automatically after restore.'
   },
   {
     id: 'models',
@@ -1016,6 +1024,7 @@ function remapUserKey(key: string, sourceUserId: string, targetUserId: string) {
     [`goon_recipe_job:${sourceUserId}:`, `goon_recipe_job:${targetUserId}:`],
     [`hair_asset:${sourceUserId}:`, `hair_asset:${targetUserId}:`],
     [`hair_refit_source:${sourceUserId}:`, `hair_refit_source:${targetUserId}:`],
+    [`clothing_asset:${sourceUserId}:`, `clothing_asset:${targetUserId}:`],
     [`voice_engine_registry:${sourceUserId}`, `voice_engine_registry:${targetUserId}`],
     [`user_artifact_usage:${sourceUserId}`, `user_artifact_usage:${targetUserId}`]
   ]
@@ -1155,9 +1164,11 @@ function groupForKey(key: string, userId: string): BackupGroupId {
   if (
     key === `user:${userId}:goons` ||
     key === `user:${userId}:hair_assets` ||
+    key === `user:${userId}:clothing_assets` ||
     key.startsWith('goon:') ||
     key.startsWith(`hair_asset:${userId}:`) ||
     key.startsWith(`hair_refit_source:${userId}:`) ||
+    key.startsWith(`clothing_asset:${userId}:`) ||
     key.startsWith(`goon_recipe_revision:${userId}:`) ||
     key.startsWith(`goon_recipe_document:${userId}:`) ||
     key.startsWith(`goon_recipe_job:${userId}:`)
@@ -1186,12 +1197,26 @@ function groupForKey(key: string, userId: string): BackupGroupId {
   ) {
     return 'tools'
   }
+  if (
+    key.startsWith('memory:') ||
+    key.startsWith('memseg:') ||
+    key.startsWith('memdream:') ||
+    key.startsWith('memdream_index:') ||
+    key.startsWith('episode:') ||
+    key.startsWith('memlinger:') ||
+    /^session:[^:]+:episodes$/.test(key) ||
+    key === 'batshit:memory_config' ||
+    key === 'batshit:memory_index_meta'
+  ) {
+    return 'memory'
+  }
   return 'chats'
 }
 
 function isRestorableKeyForUser(key: string, userId: string) {
   if (SYSTEM_PROMPT_KEYS.includes(key as (typeof SYSTEM_PROMPT_KEYS)[number])) return true
   if (key === 'system:settings:docker-mcp') return true
+  if (key === 'batshit:memory_config' || key === 'batshit:memory_index_meta') return true
 
   const exactKeys = new Set([
     `user:${userId}:settings`,
@@ -1205,6 +1230,7 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `user:${userId}:clips`,
     `user:${userId}:goons`,
     `user:${userId}:hair_assets`,
+    `user:${userId}:clothing_assets`,
     `user:${userId}:icons`,
     `user:${userId}:artifacts`,
     `user:${userId}:voice_profiles`,
@@ -1235,7 +1261,8 @@ function isRestorableKeyForUser(key: string, userId: string) {
     `goon_recipe_document:${userId}:`,
     `goon_recipe_job:${userId}:`,
     `hair_asset:${userId}:`,
-    `hair_refit_source:${userId}:`
+    `hair_refit_source:${userId}:`,
+    `clothing_asset:${userId}:`
   ]
   if (userPrefixes.some((prefix) => key.startsWith(prefix))) return true
 
@@ -1263,7 +1290,13 @@ function isRestorableKeyForUser(key: string, userId: string) {
     'artifact:',
     'artifact_usage:',
     'goon:',
-    'voice_profile:'
+    'voice_profile:',
+    'memory:',
+    'memseg:',
+    'memdream:',
+    'memdream_index:',
+    'episode:',
+    'memlinger:'
   ]
 
   return globalEntityPrefixes.some((prefix) => key.startsWith(prefix))
@@ -1360,6 +1393,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     `user:${userId}:clips`,
     `user:${userId}:goons`,
     `user:${userId}:hair_assets`,
+    `user:${userId}:clothing_assets`,
     `user:${userId}:icons`,
     `user:${userId}:artifacts`,
     `user:${userId}:voice_profiles`,
@@ -1373,6 +1407,8 @@ async function collectCandidateKeys(client: any, userId: string) {
     `user_artifact_usage:${userId}`,
     'user:system:clips',
     'system:settings:docker-mcp',
+    'batshit:memory_config',
+    'batshit:memory_index_meta',
     ...SYSTEM_PROMPT_KEYS
   ]) {
     await addExistingKey(keys, client, key)
@@ -1390,10 +1426,13 @@ async function collectCandidateKeys(client: any, userId: string) {
       `session:${sessionId}:active_clips`,
       `unzipped:${sessionId}`,
       `rezipped:${sessionId}`,
-      `pins:${sessionId}`
+      `pins:${sessionId}`,
+      `session:${sessionId}:episodes`,
+      `memlinger:${sessionId}`
     ]) {
       await addExistingKey(keys, client, key)
     }
+    await addPatternKeys(keys, client, `episode:${sessionId}:*`)
     await addPatternKeys(keys, client, `message:${sessionId}:*`)
     await addPatternKeys(keys, client, `session_clip:${sessionId}:*`)
     await addPatternKeys(keys, client, `subagent_sessions:${sessionId}:subagent:*`)
@@ -1411,6 +1450,10 @@ async function collectCandidateKeys(client: any, userId: string) {
   for (const agentId of agentIds) {
     await addExistingKey(keys, client, `agent:${agentId}`)
     await addExistingKey(keys, client, `agent:${agentId}:subagents`)
+    await addPatternKeys(keys, client, `memory:${agentId}:*`)
+    await addPatternKeys(keys, client, `memseg:${agentId}:*`)
+    await addPatternKeys(keys, client, `memdream:${agentId}:*`)
+    await addExistingKey(keys, client, `memdream_index:${agentId}`)
   }
 
   for (const subagentId of subagentIds) {
@@ -1456,6 +1499,7 @@ async function collectCandidateKeys(client: any, userId: string) {
   await addPatternKeys(keys, client, `goon_recipe_job:${userId}:*`)
   await addPatternKeys(keys, client, `hair_asset:${userId}:*`)
   await addPatternKeys(keys, client, `hair_refit_source:${userId}:*`)
+  await addPatternKeys(keys, client, `clothing_asset:${userId}:*`)
   await addPatternKeys(keys, client, 'clip:system:*')
   await addPatternKeys(keys, client, 'upload:*')
   await addPatternKeys(keys, client, 'zip:*')
@@ -2508,6 +2552,17 @@ export async function restoreBackupBundle(
     )
   }
 
+  // Same post-restore memory index reconciliation as restoreStagedBackup: indexes are
+  // not Redis keys, so the replace above left them in the pre-restore shape.
+  try {
+    await reconcileMemoryIndexesAfterRestore()
+  } catch (memoryIndexError) {
+    console.error(
+      '[BackupRestore] Restore completed but memory index reconciliation failed; memory search stays unavailable until re-indexed:',
+      memoryIndexError
+    )
+  }
+
   return {
     restored: true,
     redisRecordCount: targetRecords.length,
@@ -3261,6 +3316,21 @@ export async function restoreStagedBackup(
     }
 
     await cleanupRestoreOperation(paths, true)
+
+    // Memory search indexes are not Redis keys, so they survived the destructive replace
+    // with the pre-restore shape. Rebuild them from the restored config/records (SA-104).
+    // A failure here does not undo the completed restore: it logs loudly, every memory
+    // recall path keeps failing loudly with the same cause, and the startup bootstrap
+    // retries the reconcile on the next boot.
+    try {
+      await reconcileMemoryIndexesAfterRestore()
+    } catch (memoryIndexError) {
+      console.error(
+        '[BackupRestore] Restore completed but memory index reconciliation failed; memory search stays unavailable until re-indexed:',
+        memoryIndexError
+      )
+    }
+
     return {
       restored: true,
       redisRecordCount: targetRecords.length,

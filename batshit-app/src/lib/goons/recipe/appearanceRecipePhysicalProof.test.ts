@@ -475,6 +475,7 @@ describe("appearance Recipe physical proof", () => {
     );
     expect(different.matches).toBe(false);
     expect(different.mismatchDomains).toEqual(["geometry"]);
+    expect(different.mismatchChannelKeys).toEqual([absoluteMesh]);
     expect(different.errors.bakedPositionMaximumMeters).toBeGreaterThan(1e-6);
   });
 

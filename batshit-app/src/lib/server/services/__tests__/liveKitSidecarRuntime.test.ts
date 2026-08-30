@@ -1,8 +1,41 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 const mockGetRuntimeAddonStatus = vi.fn()
 const mockControlRuntimeAddon = vi.fn()
 const mockInspectLocalLiveKitPortOwner = vi.fn()
+const mockFetchLiveKitServerReady = vi.fn()
+const mockGetNativeLiveKitInstallStatus = vi.fn()
+const mockInstallLiveKitSidecarPackage = vi.fn()
+const mockInstallLiveKitServerBinary = vi.fn()
+const mockStartLocalVoiceRuntime = vi.fn()
+let mockSidecarInstallRoot = ''
+
+function nativeInstallStatus(overrides: Record<string, unknown> = {}) {
+  return {
+    supported: true,
+    installed: true,
+    serverInstalled: true,
+    sidecarInstalled: true,
+    updateAvailable: false,
+    serverUpdateAvailable: false,
+    sidecarUpdateAvailable: false,
+    reason: null,
+    version: '1.13.5',
+    serverVersion: '1.13.5',
+    sidecarVersion: '1.6.3',
+    targetSidecarVersion: '1.6.3',
+    serverInstallRoot: '/tmp/livekit-server',
+    sidecarInstallRoot: '/tmp/livekit-sidecar',
+    serverBinaryPath: '/tmp/livekit-server/livekit-server',
+    sidecarPackagePath: '/tmp/livekit-sidecar',
+    serverManifest: null,
+    sidecarManifest: null,
+    ...overrides
+  }
+}
 
 function dockerAddonStatus() {
   return {
@@ -59,22 +92,9 @@ vi.mock('$lib/server/services/liveKitVoiceRuntime', () => ({
 }))
 
 vi.mock('$lib/server/services/liveKitNativeRuntimeInstaller', () => ({
-  fetchLiveKitServerReady: vi.fn(async () => false),
+  fetchLiveKitServerReady: (...args: any[]) => mockFetchLiveKitServerReady(...args),
   getLocalLiveKitPort: vi.fn(() => 7880),
-  getNativeLiveKitInstallStatus: vi.fn(async () => ({
-    supported: true,
-    installed: false,
-    serverInstalled: false,
-    sidecarInstalled: false,
-    reason: 'Native LiveKit runtime is not installed yet.',
-    version: '1.12.0',
-    serverInstallRoot: '/tmp/livekit-server',
-    sidecarInstallRoot: '/tmp/livekit-sidecar',
-    serverBinaryPath: null,
-    sidecarPackagePath: null,
-    serverManifest: null,
-    sidecarManifest: null
-  })),
+  getNativeLiveKitInstallStatus: (...args: any[]) => mockGetNativeLiveKitInstallStatus(...args),
   inspectLocalLiveKitPortOwner: (...args: any[]) => mockInspectLocalLiveKitPortOwner(...args),
   installNativeLiveKitRuntime: vi.fn(async () => ({
     installed: true,
@@ -87,7 +107,13 @@ vi.mock('$lib/server/services/liveKitNativeRuntimeInstaller', () => ({
       serverInstalled: true,
       sidecarInstalled: true,
       reason: null,
-      version: '1.12.0',
+      updateAvailable: false,
+      serverUpdateAvailable: false,
+      sidecarUpdateAvailable: false,
+      version: '1.13.5',
+      serverVersion: '1.13.5',
+      sidecarVersion: '1.6.3',
+      targetSidecarVersion: '1.6.3',
       serverInstallRoot: '/tmp/livekit-server',
       sidecarInstallRoot: '/tmp/livekit-sidecar',
       serverBinaryPath: '/tmp/livekit-server/livekit-server',
@@ -96,8 +122,10 @@ vi.mock('$lib/server/services/liveKitNativeRuntimeInstaller', () => ({
       sidecarManifest: null
     }
   })),
+  installLiveKitSidecarPackage: (...args: any[]) => mockInstallLiveKitSidecarPackage(...args),
+  installLiveKitServerBinary: (...args: any[]) => mockInstallLiveKitServerBinary(...args),
   liveKitServerHttpUrl: vi.fn(() => 'http://127.0.0.1:7880'),
-  resolveNativeLiveKitSidecarInstallRoot: vi.fn(() => '/tmp/livekit-sidecar'),
+  resolveNativeLiveKitSidecarInstallRoot: vi.fn(() => mockSidecarInstallRoot),
   startNativeLiveKitServerRuntime: vi.fn(async () => ({
     started: false,
     alreadyRunning: false,
@@ -105,6 +133,10 @@ vi.mock('$lib/server/services/liveKitNativeRuntimeInstaller', () => ({
     logPath: null,
     statusHint: 'Native LiveKit server is not installed yet.'
   }))
+}))
+
+vi.mock('$lib/server/services/voiceLocalEngineSetup', () => ({
+  startLocalVoiceRuntime: (...args: any[]) => mockStartLocalVoiceRuntime(...args)
 }))
 
 import {
@@ -116,12 +148,16 @@ describe('liveKitSidecarRuntime', () => {
   let originalContainerized: string | undefined
   let originalRuntimeEnv: string | undefined
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks()
     originalContainerized = process.env.BATSHIT_CONTAINERIZED
     originalRuntimeEnv = process.env.BATSHIT_RUNTIME_ENV
     delete process.env.BATSHIT_CONTAINERIZED
     delete process.env.BATSHIT_RUNTIME_ENV
+    mockSidecarInstallRoot = await mkdtemp(path.join(tmpdir(), 'batshit-livekit-sidecar-'))
+    await mkdir(path.join(mockSidecarInstallRoot, 'node_modules', '.bin'), { recursive: true })
+    await writeFile(path.join(mockSidecarInstallRoot, 'package.json'), '{}\n')
+    await writeFile(path.join(mockSidecarInstallRoot, 'node_modules', '.bin', 'tsx'), '')
     mockGetRuntimeAddonStatus.mockResolvedValue(dockerAddonStatus())
     mockControlRuntimeAddon.mockResolvedValue({
       success: false,
@@ -132,6 +168,14 @@ describe('liveKitSidecarRuntime', () => {
       pids: [],
       commands: [],
       dockerOwned: false
+    })
+    mockFetchLiveKitServerReady.mockResolvedValue(true)
+    mockGetNativeLiveKitInstallStatus.mockResolvedValue(nativeInstallStatus())
+    mockInstallLiveKitSidecarPackage.mockResolvedValue(undefined)
+    mockInstallLiveKitServerBinary.mockResolvedValue(undefined)
+    mockStartLocalVoiceRuntime.mockResolvedValue({
+      pid: 4242,
+      logPath: '/tmp/livekit-sidecar.log'
     })
   })
 
@@ -184,5 +228,75 @@ describe('liveKitSidecarRuntime', () => {
       restarted: true,
       statusHint: expect.stringContaining('Runtime add-on operator is not configured')
     })
+  })
+
+  it('launches the native sidecar directly with Batshit\'s current Node runtime', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn()
+        .mockRejectedValueOnce(new Error('sidecar offline'))
+        .mockResolvedValue({
+          ok: true,
+          json: async () => ({ agent_name: 'batshit-livekit-agent', active_jobs: 0 })
+        })
+    )
+
+    await expect(startLiveKitSidecarRuntime('user-1')).resolves.toMatchObject({
+      status: 'ready',
+      started: true,
+      pid: 4242
+    })
+    expect(mockStartLocalVoiceRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        engineId: 'livekit-sidecar',
+        launch: expect.objectContaining({
+          command: process.execPath,
+          args: ['node_modules/tsx/dist/cli.mjs', 'src/livekit-agent-sidecar.ts', 'start']
+        })
+      })
+    )
+  })
+
+  it('refreshes a stale Batshit-managed sidecar before launching it', async () => {
+    mockGetNativeLiveKitInstallStatus.mockResolvedValue(
+      nativeInstallStatus({ updateAvailable: true, sidecarUpdateAvailable: true })
+    )
+    vi.stubGlobal(
+      'fetch',
+      vi.fn()
+        .mockRejectedValueOnce(new Error('sidecar offline'))
+        .mockResolvedValue({
+          ok: true,
+          json: async () => ({ agent_name: 'batshit-livekit-agent', active_jobs: 0 })
+        })
+    )
+
+    await expect(startLiveKitSidecarRuntime('user-1')).resolves.toMatchObject({ status: 'ready' })
+    expect(mockInstallLiveKitSidecarPackage).toHaveBeenCalledOnce()
+    expect(mockInstallLiveKitSidecarPackage.mock.invocationCallOrder[0]).toBeLessThan(
+      mockStartLocalVoiceRuntime.mock.invocationCallOrder[0]
+    )
+  })
+
+  it('refreshes a stale managed LiveKit server before auto-start', async () => {
+    mockGetNativeLiveKitInstallStatus.mockResolvedValue(
+      nativeInstallStatus({ updateAvailable: true, serverUpdateAvailable: true })
+    )
+    mockFetchLiveKitServerReady.mockResolvedValueOnce(false).mockResolvedValue(true)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn()
+        .mockRejectedValueOnce(new Error('sidecar offline'))
+        .mockResolvedValue({
+          ok: true,
+          json: async () => ({ agent_name: 'batshit-livekit-agent', active_jobs: 0 })
+        })
+    )
+
+    await expect(startLiveKitSidecarRuntime('user-1')).resolves.toMatchObject({ status: 'ready' })
+    expect(mockInstallLiveKitServerBinary).toHaveBeenCalledOnce()
+    expect(mockInstallLiveKitServerBinary.mock.invocationCallOrder[0]).toBeLessThan(
+      mockStartLocalVoiceRuntime.mock.invocationCallOrder[0]
+    )
   })
 })

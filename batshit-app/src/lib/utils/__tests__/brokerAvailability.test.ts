@@ -310,6 +310,70 @@ describe('resolveBrokerFabricAllowedControlIds', () => {
   it('returns nothing when every relevant toggle is off', () => {
     expect(resolveBrokerFabricAllowedControlIds({ toggles: ALL_OFF })).toEqual([])
   })
+
+  // SA-104 P3 — memory controls are a scoped first-party allowance (PA + memory_enabled),
+  // outside the broad-control-plane gate, like sys.zip.fetch.
+  describe('memory controls (SA-104 P3)', () => {
+    it('never includes sys.memory.* by default (memory is opt-in)', () => {
+      expect(resolveBrokerFabricAllowedControlIds({ toggles: ALL_ON })).not.toContain('sys.memory.*')
+    })
+
+    it('adds sys.memory.* for a memory-enabled primary even when the broad control plane is closed (n8n case)', () => {
+      const allowed = resolveBrokerFabricAllowedControlIds({
+        toggles: ALL_ON,
+        allowFabricControlTools: false,
+        memoryControlsEnabled: true
+      })
+      expect(allowed).toContain('sys.memory.*')
+      expect(allowed).not.toContain('sys.artifact.*')
+      expect(isControlIdAllowedByList('sys.memory.search', allowed)).toBe(true)
+    })
+
+    it('memory controls still require the Batshit Tools toggle', () => {
+      const allowed = resolveBrokerFabricAllowedControlIds({
+        toggles: { ...ALL_OFF, fetchZipEnabled: true },
+        memoryControlsEnabled: true
+      })
+      expect(allowed).toEqual([BROKER_FABRIC_FETCH_ZIP_CONTROL_ID])
+    })
+
+    it('a subagent-style caller (memoryControlsEnabled false/omitted) never sees memory refs', () => {
+      const allowed = resolveBrokerFabricAllowedControlIds({
+        toggles: ALL_ON,
+        allowFabricControlTools: false,
+        memoryControlsEnabled: false
+      })
+      expect(isControlIdAllowedByList('sys.memory.save', allowed)).toBe(false)
+    })
+  })
+})
+
+describe('resolveBrokerFamilies — memory reachability (SA-104 P3)', () => {
+  it('opens the fabric family on n8n for a memory-enabled primary with fetch-zip off', () => {
+    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
+    expect(resolveBrokerFamilies({ runtime: 'n8n', toggles })).toEqual([])
+    expect(
+      resolveBrokerFamilies({ runtime: 'n8n', toggles, memoryControlsEnabled: true })
+    ).toEqual(['fabric'])
+  })
+
+  it('opens the fabric family on api for a memory-enabled agent with fetch-zip and broad Fabric off', () => {
+    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
+    expect(
+      resolveBrokerFamilies({
+        runtime: 'api',
+        toggles,
+        allowFabricControlTools: false,
+        memoryControlsEnabled: true
+      })
+    ).toEqual(['fabric'])
+  })
+
+  it('memory alone opens nothing when Batshit Tools is off', () => {
+    expect(
+      resolveBrokerFamilies({ runtime: 'n8n', toggles: ALL_OFF, memoryControlsEnabled: true })
+    ).toEqual([])
+  })
 })
 
 describe('isControlIdAllowedByList', () => {

@@ -38,6 +38,43 @@ describe('extractSpeakableText', () => {
     expect(result).toBe('Say [sad] hello')
   })
 
+  it('preserves adjacent bracket TTS cues instead of collapsing them into spoken words', () => {
+    // Fish Audio S2 and Inworld combine cues with no separator. The pair looks like a
+    // Markdown reference link, so it previously became the literal word "sad".
+    expect(extractSpeakableText('[sad][whispering] I miss you so much.')).toBe(
+      '[sad][whispering] I miss you so much.'
+    )
+    expect(extractSpeakableText('[excited][laughing] We won! Ha ha!')).toBe(
+      '[excited][laughing] We won! Ha ha!'
+    )
+    expect(extractSpeakableText('[soft tone][slightly breathless] hey you')).toBe(
+      '[soft tone][slightly breathless] hey you'
+    )
+  })
+
+  it('preserves space-separated and triple-stacked bracket TTS cues', () => {
+    expect(extractSpeakableText('[sad] [whispering] I miss you so much.')).toBe(
+      '[sad] [whispering] I miss you so much.'
+    )
+    expect(extractSpeakableText('[hopeful][soft tone][breathless] Maybe.')).toBe(
+      '[hopeful][soft tone][breathless] Maybe.'
+    )
+  })
+
+  it('still collapses Markdown reference links whose label is defined', () => {
+    const full = extractSpeakableText('See the [setup guide][docs] for details.\n[docs]: https://example.com')
+    expect(full).toBe('See the setup guide for details.')
+
+    const collapsed = extractSpeakableText('See the [docs][] for details.\n[docs]: https://example.com')
+    expect(collapsed).toBe('See the docs for details.')
+  })
+
+  it('leaves undefined reference-style brackets intact rather than speaking the label', () => {
+    const result = extractSpeakableText('Read the [manual][missing] later.')
+
+    expect(result).toBe('Read the [manual][missing] later.')
+  })
+
   it('preserves line separation for br/hr tags', () => {
     const result = extractSpeakableText('Line 1<br/>Line 2<hr>Line 3')
 
@@ -178,5 +215,44 @@ describe('extractSpeakableText', () => {
     )
 
     expect(result).toBe('Open file_name_here.ts, then skip before speaking.')
+  })
+})
+
+describe('extractSpeakableText control-tag registry coverage (SA-104 P1)', () => {
+  it('never speaks tool-notes blocks, closed or unclosed', () => {
+    expect(
+      extractSpeakableText(
+        'Done. <batshit-tool-notes>{"notes":[{"summary":"secret fact"}]}</batshit-tool-notes>'
+      )
+    ).toBe('Done.')
+
+    expect(
+      extractSpeakableText('Done. <batshit-tool-notes>{"notes":[{"summary":"cut off')
+    ).toBe('Done.')
+  })
+
+  it('never speaks any registered control tag in unclosed trailing form', () => {
+    expect(extractSpeakableText('Okay. <batshit-zip-control>{"unzip":["z1"')).toBe('Okay.')
+    expect(extractSpeakableText('Okay. <batshit-cue>{"goon_mood":"hap')).toBe('Okay.')
+    expect(extractSpeakableText('Okay. <batshit-group>{"mode":"listen')).toBe('Okay.')
+  })
+
+  it('never speaks memory save blocks, closed or unclosed (SA-104 P3 tag)', () => {
+    expect(
+      extractSpeakableText(
+        'Noted. <batshit-memory>{"lane":"ltm","content":"private-sounding fact"}</batshit-memory>'
+      )
+    ).toBe('Noted.')
+    expect(extractSpeakableText('Noted. <batshit-memory>{"lane":"stm","content":"cut off')).toBe(
+      'Noted.'
+    )
+  })
+
+  it('strips control tags appearing mid-message, keeping surrounding speech', () => {
+    expect(
+      extractSpeakableText(
+        'First part. <batshit-cue>{"goon_mood":"excited"}</batshit-cue> Second part.'
+      )
+    ).toBe('First part. Second part.')
   })
 })

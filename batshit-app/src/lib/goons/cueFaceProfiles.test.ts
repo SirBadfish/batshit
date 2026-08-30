@@ -5,6 +5,7 @@ import {
   prepareCueForPortablePack,
   selectCueFacePayload
 } from '$lib/goons/cueFaceProfiles'
+import type { GoonCueDefinition } from '$lib/types/goons'
 
 describe('cue face profiles', () => {
   it('moves legacy controls into the portable profile and initializes Emotes with neutral ARKit', () => {
@@ -146,5 +147,36 @@ describe('cue face profiles', () => {
         channels: [{ channel: 'eyeLookUpLeft', value: 1 }]
       }
     })
+  })
+
+  it('materializes reactive cue proxies as clone-safe portable pack data', () => {
+    const target: GoonCueDefinition = {
+      name: 'reactive_smile',
+      kind: 'emote',
+      faceProfiles: {
+        portable: {
+          expressionTargets: [{ preset: 'happy', weight: 0.8 }]
+        }
+      },
+      rawMorphTargets: [{ target: 'PackageOnlySmile', value: 1 }],
+      steps: [
+        {
+          faceProfiles: { portable: {} },
+          rawMorphTargets: [{ target: 'PackageOnlyStep', value: 0.5 }]
+        }
+      ]
+    }
+    const proxy = new Proxy(target, {})
+
+    expect(() => structuredClone(proxy)).toThrow()
+
+    const portable = prepareCueForPortablePack(proxy)
+
+    expect(portable.rawMorphTargets).toBeUndefined()
+    expect(portable.steps?.[0]?.rawMorphTargets).toBeUndefined()
+    expect(portable.faceProfiles?.portable.expressionTargets).toEqual([
+      { preset: 'happy', weight: 0.8 }
+    ])
+    expect(() => structuredClone(portable)).not.toThrow()
   })
 })

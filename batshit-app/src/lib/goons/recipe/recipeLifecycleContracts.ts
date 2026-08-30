@@ -1,4 +1,7 @@
-import { RECIPE_MIGRATION_PLAN_CONTRACT } from "./migrationPlanContracts";
+import {
+  RECIPE_MIGRATION_PLAN_CONTRACT,
+  parseRecipeMigrationPlan,
+} from "./migrationPlanContracts";
 import {
   RECIPE_ARCHIVE_CONTAINMENT_RECEIPT_CONTRACT,
   parseRecipeStoredAssetRef,
@@ -426,6 +429,12 @@ function normalizedRecipeDocumentContent(
 ): Record<string, unknown> {
   if (documentContract === GOON_LIVE_BUILD_CONTRACT) {
     return parseGoonLiveBuildReceipt(content) as unknown as Record<
+      string,
+      unknown
+    >;
+  }
+  if (documentContract === RECIPE_MIGRATION_PLAN_CONTRACT) {
+    return parseRecipeMigrationPlan(content) as unknown as Record<
       string,
       unknown
     >;

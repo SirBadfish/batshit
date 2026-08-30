@@ -55,7 +55,7 @@
 	{...restProps}
 >
 	<div
-		class="bs-switch-thumb flex items-center justify-center"
+		class="bs-switch-thumb is-centered"
 	>
 		{#if isIndeterminate}
 			<Minus class="size-3 text-primary dark:text-primary" />

@@ -207,6 +207,8 @@ export interface NativeModeRequest extends ThinkRequest {
   dcmDisplaySettings?: AgentDcmDisplaySettings | null
   allowArtifactRuntimeTools?: boolean
   allowFabricControlTools?: boolean
+  /** SA-104 P3: PRIMARY runs of memory-enabled agents; subagent runner leaves it false. */
+  memoryControlsEnabled?: boolean
   gatewayToolMap?: Record<string, string[]> | null
   preloadedGatewayTools?: ToolMetadataMap['tools']
   preloadedGatewayMetadata?: ToolMetadataMap['metadata']
@@ -418,6 +420,7 @@ export class VercelAIBrain {
           providerSettings: request.providerSettings ?? null,
           projectPath: request.projectPath ?? null,
           selectedCliToolIds: request.selectedCliToolIds,
+          memoryControlsEnabled: request.memoryControlsEnabled,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
           reserveToolZipId: request.reserveToolZipId,
@@ -1060,6 +1063,7 @@ export class VercelAIBrain {
       dcmDisplaySettings?: AgentDcmDisplaySettings | null
       allowArtifactRuntimeTools?: boolean
       allowFabricControlTools?: boolean
+      memoryControlsEnabled?: boolean
       parentModelId?: string | null
       parentConnection?: ModelConnectionInfo | null
       reserveToolZipId?: NativeModeRequest['reserveToolZipId']
@@ -1094,6 +1098,7 @@ export class VercelAIBrain {
           dcmDisplaySettings: nativeContext?.dcmDisplaySettings ?? null,
           allowArtifactRuntimeTools: nativeContext?.allowArtifactRuntimeTools,
           allowFabricControlTools: nativeContext?.allowFabricControlTools,
+          memoryControlsEnabled: nativeContext?.memoryControlsEnabled,
           projectPath: nativeContext?.projectPath ?? null,
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode
@@ -2541,6 +2546,7 @@ export class VercelAIBrain {
             dcmDisplaySettings: request.dcmDisplaySettings ?? null,
             allowArtifactRuntimeTools: request.allowArtifactRuntimeTools,
             allowFabricControlTools: request.allowFabricControlTools,
+            memoryControlsEnabled: request.memoryControlsEnabled,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,
             reserveToolZipId: request.reserveToolZipId,

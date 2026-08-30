@@ -1,5 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
+import { resolveFixedSessionMetadataUpdate } from '$lib/utils/fixedSession'
 
 // GET /api/sessions/[id] - Get a specific session
 export const GET: RequestHandler = async ({ params, locals }) => {
@@ -39,7 +40,19 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     if (!session) {
       return json({ error: 'Session not found or unauthorized' }, { status: 404 })
     }
-    
+
+    // SA-104 P5: Infinite Session state is one-way and owned by the dedicated fixed
+    // route. Generic updates cannot add/remove/alter it, and a stale
+    // read-spread-write metadata payload gets the stored block re-attached
+    // instead of silently stripping it (updateSession replaces metadata wholesale).
+    const fixedResolution = resolveFixedSessionMetadataUpdate(session.metadata, updates.metadata)
+    if (!fixedResolution.ok) {
+      return json({ error: fixedResolution.error, code: 'FIXED_SESSION_IMMUTABLE' }, { status: 409 })
+    }
+    if (fixedResolution.metadata !== undefined) {
+      updates.metadata = fixedResolution.metadata
+    }
+
     await redis.updateSession(params.id!, updates)
     return json({ success: true })
   } catch (error) {

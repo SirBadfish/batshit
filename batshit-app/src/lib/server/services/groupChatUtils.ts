@@ -4,6 +4,7 @@ import {
   normalizeGroupMaxAgents,
   normalizeGroupMaxFollowupsTotal
 } from '$lib/types/groupChat'
+import { EMOTE_TAG_REGEX_SOURCE, controlTag } from '$lib/utils/controlTags'
 
 export type GroupControlMode = 'responding' | 'listening'
 
@@ -17,17 +18,27 @@ export type LeadingGroupControlParseResult =
       remaining: string
     }
 
-const GROUP_CONTROL_TAG_PREFIX = '<batshit-group'
-const GROUP_CONTROL_TAG_BLOCK_REGEX =
-  /^\s*<batshit-group\b[^>]*>([\s\S]*?)<\/batshit-group>/i
+// Tag identity comes from the shared control-tag registry (SA-104 P1); the
+// group-protocol lead-parsing and presentation-strip mechanics stay here.
+const GROUP_TAG = controlTag('group').tag
+const CUE_TAG = controlTag('cue').tag
+const GROUP_CONTROL_TAG_PREFIX = `<${GROUP_TAG}`
+const GROUP_CONTROL_TAG_BLOCK_REGEX = new RegExp(
+  `^\\s*<${GROUP_TAG}\\b[^>]*>([\\s\\S]*?)<\\/${GROUP_TAG}>`,
+  'i'
+)
 const GROUP_CONTROL_BUFFER_LIMIT = 2000
-const GROUP_PRESENTATION_CUE_BLOCK_REGEX = /<batshit-cue\b[^>]*>[\s\S]*?<\/batshit-cue>/gi
-const GROUP_PRESENTATION_CUE_TAIL_REGEX = /<batshit-cue\b[\s\S]*$/gi
-const GROUP_LEADING_PRESENTATION_CUE_BLOCK_REGEX =
-  /^\s*<batshit-cue\b[^>]*>[\s\S]*?<\/batshit-cue>/i
-const GROUP_LEADING_PRESENTATION_CUE_START_REGEX = /^\s*<batshit-cue\b/i
-const GROUP_EMOTE_TAG_REGEX =
-  /<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*\/>[ \t]*|<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*>[\s\S]*?<\/(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?>[ \t]*/gi
+const GROUP_PRESENTATION_CUE_BLOCK_REGEX = new RegExp(
+  `<${CUE_TAG}\\b[^>]*>[\\s\\S]*?<\\/${CUE_TAG}>`,
+  'gi'
+)
+const GROUP_PRESENTATION_CUE_TAIL_REGEX = new RegExp(`<${CUE_TAG}\\b[\\s\\S]*$`, 'gi')
+const GROUP_LEADING_PRESENTATION_CUE_BLOCK_REGEX = new RegExp(
+  `^\\s*<${CUE_TAG}\\b[^>]*>[\\s\\S]*?<\\/${CUE_TAG}>`,
+  'i'
+)
+const GROUP_LEADING_PRESENTATION_CUE_START_REGEX = new RegExp(`^\\s*<${CUE_TAG}\\b`, 'i')
+const GROUP_EMOTE_TAG_REGEX = new RegExp(EMOTE_TAG_REGEX_SOURCE, 'gi')
 const GROUP_LEADING_EMOTE_TAG_REGEX =
   /^\s*<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*\/>[ \t]*|^\s*<(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?\b[^>]*>[\s\S]*?<\/(?:emote|goon-emote)(?:-[a-zA-Z0-9_-]+)?>[ \t]*/i
 const GROUP_GOON_STAGE_DIRECTION_REGEX = /\*goon:\s*[^*]*\*[ \t]*/gi

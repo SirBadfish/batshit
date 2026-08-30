@@ -340,7 +340,7 @@
           </div>
         </div>
         <div class="batshit-settings-form-control">
-          <div class="flex min-w-0 items-center gap-2">
+          <div class="batshit-settings-field-cluster">
             <Select.Root
               type="single"
               value={modelSelectionValue}
@@ -384,7 +384,7 @@
             </Button>
           </div>
           {#if savedModelsError}
-            <p class="batshit-settings-form-meta text-destructive">{savedModelsError}</p>
+            <p class="batshit-settings-form-meta is-error">{savedModelsError}</p>
           {/if}
         </div>
       </div>

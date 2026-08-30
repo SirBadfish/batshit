@@ -151,6 +151,39 @@ jobs:
           src/lib/server/tests/cliToolRegistry.test.ts
           src/lib/server/tests/groupAgentCleanup.test.ts
 
+  app-memory:
+    name: App memory lane (Redis 8 db0 vector/hybrid search)
+    runs-on: ubuntu-latest
+    services:
+      # Second dedicated Redis 8 container (testing-architecture.md §3): DB 0 belongs
+      # exclusively to the memory suites. Mapped to a NON-standard host port — the
+      # harness refuses Batshit's known runtime ports (6379, 5639, 6380, 5649) and any
+      # instance that already holds a `user:` key.
+      redis-memory:
+        image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping | grep -q PONG && redis-cli command info json.get | grep -q json.get"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        working-directory: batshit-app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: batshit-app/package-lock.json
+      - run: npm ci
+      - name: vitest (memory lane, dedicated Redis 8 db0)
+        env:
+          MEMORY_TEST_REDIS_URL: redis://127.0.0.1:6390/0
+        run: npm run test:memory
+
   server:
     name: batshit-server (jest + madge)
     runs-on: ubuntu-latest

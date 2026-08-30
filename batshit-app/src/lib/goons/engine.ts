@@ -960,13 +960,8 @@ export class GoonEngine implements GoonStageHost {
   private sceneRootOffsetY = 0
   private lookActive = false
   private peekState: { position: THREE.Vector3; target: THREE.Vector3 } | null = null
-  private dragMode:
-    | 'none'
-    | 'view'
-    | 'goon'
-    | 'pan'
-    | 'camera-pan'
-    | 'desktop-vertical-orbit' = 'none'
+  private dragMode: 'none' | 'view' | 'goon' | 'pan' | 'camera-pan' | 'desktop-vertical-orbit' =
+    'none'
   private dragLast = new THREE.Vector2()
   private dragPointerId: number | null = null
   private goonRotation = 0
@@ -7823,10 +7818,7 @@ export class GoonEngine implements GoonStageHost {
     }
   }
 
-  setDesktopSpeechVisualFrame(
-    frame: GoonSpeechFaceFrame | null,
-    audioLevel: number | null
-  ) {
+  setDesktopSpeechVisualFrame(frame: GoonSpeechFaceFrame | null, audioLevel: number | null) {
     if (this.rendererSurfaceProfile !== 'desktop-transparent') return false
     this.desktopSpeechFaceFrame = frame ? structuredClone(frame) : null
     this.desktopSpeechAudioLevel =
@@ -10805,7 +10797,9 @@ export class GoonEngine implements GoonStageHost {
         : 1
       socketEyes.setTreatmentSurfaceCorrection(
         side,
-        this.customPerformanceTargetWeights.get(side === 'left' ? 'eyeBlinkLeft' : 'eyeBlinkRight') ?? 0,
+        this.customPerformanceTargetWeights.get(
+          side === 'left' ? 'eyeBlinkLeft' : 'eyeBlinkRight'
+        ) ?? 0,
         projectionWeight
       )
     }

@@ -22,6 +22,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
             // Tool + zip guidance prompts
             'batshit:tool_guidance_zip_enabled_prompt',
             'batshit:tool_guidance_zip_disabled_prompt',
+            'batshit:tool_guidance_memory_prompt',
             'batshit:dynamic_mcp_prompt',
             // Legacy keys (kept for backward compatibility)
             'batshit:batshit_primary_system_prompt',

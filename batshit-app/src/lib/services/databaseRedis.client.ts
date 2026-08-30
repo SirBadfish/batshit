@@ -33,9 +33,11 @@ import {
 } from '$lib/goons/dcm'
 import {
   buildDynamicMcpPromptBlock,
+  buildMemoryPromptBlock,
   buildToolGuidanceZipPromptBlock,
   normalizeDynamicMcpPromptContent
 } from '$lib/utils/toolPromptInjection'
+import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import {
   applyPromptRuntimeScope,
   brokerToolNamesForScope,
@@ -47,6 +49,7 @@ import {
   resolveBrokerToolToggles
 } from '$lib/utils/brokerAvailability'
 import { appendSkillsCommandsUsageLines } from '$lib/utils/skillsCommandsDcm'
+import { buildControlErrorDcmLines } from '$lib/utils/controlTags'
 import {
   getToolSettings,
   getTypeZipSettings,
@@ -83,6 +86,22 @@ export type PrecompiledHistory = {
   currentDay: string | null
   chatHistory: string
   globalZipSettings?: Record<string, any>
+}
+
+/**
+ * SA-104 P4: response shape of POST /api/memory/compile-context (the server-side recall
+ * engine's `MemoryCompileContext`). Declared locally because this browser-safe module
+ * must not import from `$lib/server` — the parity harness pins both lanes byte-equal.
+ */
+type MemoryClientCompileContext = {
+  enabled: boolean
+  onMyMindBlock: string
+  /** SA-104 P6: preformatted EPISODE WHITEBOARD block (Infinite Sessions), '' when absent. */
+  whiteboardBlock?: string
+  dcmLines: string[]
+  memoryClipIds: string[]
+  memoryClipSources: Record<string, string>
+  memoryContext: Record<string, any> | null
 }
 
 type GroupChatDcmContext = {
@@ -1337,6 +1356,26 @@ export class DatabaseService {
     return false
   }
 
+  /**
+   * SA-104 P3: the Memory guidance block for memory-enabled agents. Mirrors the server
+   * twin's `resolveMemoryGuidancePrompt` — keep both call sites and gating identical.
+   */
+  private async resolveMemoryGuidancePrompt(
+    agent: any,
+    runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
+  ) {
+    const storedPrompt = await this.getRedisStringValue('batshit:tool_guidance_memory_prompt')
+    const fallbackPrompt = buildMemoryPromptBlock({ runtimeFlavor })
+    const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
+    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
+    return replacePromptVariables(prompt, agent, {
+      ...(agent?.settings ?? {}),
+      runtime_flavor: runtimeFlavor,
+      tool_search_tool: brokerNames.search,
+      tool_use_tool: brokerNames.use
+    })
+  }
+
   private async resolveDynamicMcpPrompt(
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel' | 'n8n'
@@ -2039,6 +2078,9 @@ export class DatabaseService {
     zipControlPermission?: boolean
     zipAiViewMode?: 'inline' | 'appended'
     isCodexMode?: boolean
+    controlErrorLines?: string[]
+    /** SA-104 P4: preformatted "Memory context:" lines from the recall engine route. */
+    memoryDcmLines?: string[]
     fetcher?: typeof fetch
   }) {
     const statusIcons = {
@@ -2182,6 +2224,10 @@ export class DatabaseService {
 
     lines.push(statusKey, '')
 
+    if (options.controlErrorLines && options.controlErrorLines.length > 0) {
+      lines.push(...options.controlErrorLines, '')
+    }
+
     const agentId = options.agentId?.trim()
     if (agentId) {
       lines.push(`${statusIcons.current} agent_id: ${agentId}`)
@@ -2297,6 +2343,13 @@ export class DatabaseService {
       }
     }
 
+    // SA-104 P4: the recall engine's memory-insert section (time awareness, Current /
+    // Lingering grouping, more-available honesty) — preformatted server-side so both
+    // twins render byte-identical lines (DL-104-17).
+    if (options.memoryDcmLines && options.memoryDcmLines.length > 0) {
+      lines.push('', ...options.memoryDcmLines)
+    }
+
     const zipState = options.zipState
     const autoZipContent = Array.isArray(options.autoZipContent) ? options.autoZipContent : []
     const autoZipTools = Array.isArray(options.autoZipTools) ? options.autoZipTools : []
@@ -2410,6 +2463,38 @@ export class DatabaseService {
 
     // 2. Get user's custom system prompt from agent
     const userSystemPrompt = agent?.system_prompt || ''
+
+    // SA-104 P4: memory compile context is computed ONCE server-side by the recall
+    // engine; this twin fetches the identical preformatted strings from the
+    // session-authed route (P0 §1.1: never implement ranking twice). Read-only — the
+    // linger commit happens in send-routed. Group runs get no recall lanes in v1.
+    // A non-OK response fails the compile loudly: memory recall for an enabled agent
+    // must never silently degrade (DL-104-05).
+    let memoryCompileContext: MemoryClientCompileContext | null = null
+    if (!options?.groupContext && agent?.id && userId && resolveAgentMemoryEnabled(agent)) {
+      if (!fetchImpl) {
+        throw new Error(
+          'MEMORY_COMPILE_CONTEXT_UNAVAILABLE: no fetch implementation for the memory compile-context route.'
+        )
+      }
+      const memoryResponse = await fetchImpl('/api/memory/compile-context', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId,
+          agentId: agent.id,
+          currentUserMessage: currentUserMessage ?? '',
+          historyMessageIds: messages.map((message) => message?.id).filter(Boolean)
+        })
+      })
+      if (!memoryResponse.ok) {
+        const detail = await memoryResponse.text().catch(() => '')
+        throw new Error(
+          `MEMORY_COMPILE_CONTEXT_UNAVAILABLE: /api/memory/compile-context returned ${memoryResponse.status}${detail ? ` — ${detail.slice(0, 300)}` : ''}`
+        )
+      }
+      memoryCompileContext = (await memoryResponse.json()) as MemoryClientCompileContext
+    }
 
     // CRITICAL: Load unzip state BEFORE compiling so compileForAI expands user-unzipped zips
     const { zippingService } = await import('$lib/services/zipping')
@@ -2616,9 +2701,142 @@ export class DatabaseService {
       return deduped
     })()
 
+    // SA-104 P4: clip media carried by inserted memories rides the same structured
+    // image path as session clips (DL-104-17 single channel). A memory clip that no
+    // longer resolves degrades to a loud DCM note instead of failing the send —
+    // deleted memory media is stale content, not broken infrastructure. Mirrors the
+    // server twin.
+    const memoryClipNotes: string[] = []
+    if (memoryCompileContext?.memoryClipIds?.length) {
+      const presentClipIds = new Set(dedupedClippedContent.map((item) => item?.clipId))
+      for (const memoryClipId of memoryCompileContext.memoryClipIds) {
+        if (presentClipIds.has(memoryClipId)) continue
+        const sourceMemoryId = memoryCompileContext.memoryClipSources?.[memoryClipId] ?? 'unknown'
+        try {
+          const clip = await this.getClipData(userId, memoryClipId, fetchImpl)
+          if (!clip) {
+            throw new Error('clip record not found')
+          }
+          const isText =
+            clip.mimeType?.startsWith('text/') ||
+            clip.fileType === 'text' ||
+            clip.mimeType === 'application/json'
+          const isImage = clip.mimeType?.startsWith('image/')
+          const tokenEstimate = isImage
+            ? clip.externalTokens ?? 765
+            : clip.localTokens ??
+              clip.externalTokens ??
+              (clip.content ? Math.ceil(clip.content.length / 4) : undefined)
+          if (!('modelFacingUrl' in clip)) {
+            throw new Error(
+              `CLIP_URL_RESOLUTION_UNAVAILABLE: clip ${clip.id} response carried no modelFacingUrl`
+            )
+          }
+          const preferredUrl = (clip.modelFacingUrl ?? null) as string | null
+          if (isImage) {
+            let dataUrl: string | null = null
+            if (clip.localBase64) {
+              dataUrl = clip.localBase64.startsWith('data:')
+                ? clip.localBase64
+                : `data:${clip.mimeType || 'image/jpeg'};base64,${clip.localBase64}`
+            } else {
+              const fetchUrl = clip.localUrl || clip.displayUrl
+              if (fetchImpl && fetchUrl) {
+                const imageResponse = await fetchImpl(fetchUrl)
+                if (!imageResponse.ok) {
+                  throw new Error(
+                    `Clip image fetch failed: ${imageResponse.status} ${imageResponse.statusText}`
+                  )
+                }
+                const blob = await imageResponse.blob()
+                const arrayBuffer = await blob.arrayBuffer()
+                const bytes = new Uint8Array(arrayBuffer)
+                let binary = ''
+                for (const byte of bytes) binary += String.fromCharCode(byte)
+                const base64 =
+                  typeof btoa === 'function'
+                    ? btoa(binary)
+                    : (globalThis as any)?.Buffer?.from(bytes).toString('base64')
+                if (!base64) {
+                  throw new Error('No base64 encoder is available for clip image payload')
+                }
+                dataUrl = `data:${clip.mimeType || 'image/jpeg'};base64,${base64}`
+              }
+            }
+            if (!dataUrl) {
+              throw new Error(`Clip image payload could not be resolved: ${clip.id}`)
+            }
+            dedupedClippedContent.push({
+              clipId: clip.id,
+              content: dataUrl,
+              contentType: 'image',
+              description: clip.filename,
+              tokens: tokenEstimate,
+              storageMode: 'local',
+              url: preferredUrl,
+              filename: clip.filename,
+              fileSize: clip.fileSize,
+              mimeType: clip.mimeType,
+              memorySource: sourceMemoryId
+            } as (typeof dedupedClippedContent)[number])
+          } else if (isText) {
+            const decoded =
+              clip.content ??
+              (clip.localBase64
+                ? this.decodeBase64ToText(
+                    clip.localBase64.startsWith('data:')
+                      ? clip.localBase64.split(',')[1] || ''
+                      : clip.localBase64
+                  )
+                : '')
+            dedupedClippedContent.push({
+              clipId: clip.id,
+              content: decoded,
+              contentType: 'text',
+              description: clip.filename,
+              tokens: tokenEstimate,
+              storageMode: 'local',
+              url: preferredUrl,
+              filename: clip.filename,
+              fileSize: clip.fileSize,
+              mimeType: clip.mimeType,
+              memorySource: sourceMemoryId
+            } as (typeof dedupedClippedContent)[number])
+          } else if (preferredUrl) {
+            dedupedClippedContent.push({
+              clipId: clip.id,
+              content: preferredUrl,
+              contentType: clip.fileType || 'file',
+              description: clip.filename,
+              tokens: tokenEstimate,
+              storageMode: 'local',
+              url: preferredUrl,
+              filename: clip.filename,
+              fileSize: clip.fileSize,
+              mimeType: clip.mimeType,
+              memorySource: sourceMemoryId
+            } as (typeof dedupedClippedContent)[number])
+          }
+          presentClipIds.add(memoryClipId)
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'unavailable'
+          memoryClipNotes.push(
+            `- Media unavailable: clip ${memoryClipId} (from memory ${sourceMemoryId}) could not be loaded (${reason}).`
+          )
+        }
+      }
+    }
+    const memoryDcmLines = (() => {
+      const base = memoryCompileContext?.dcmLines ?? []
+      if (memoryClipNotes.length === 0) return base
+      return base.length > 0
+        ? [...base, ...memoryClipNotes]
+        : ['Memory context:', ...memoryClipNotes]
+    })()
+
     // 6. Create clean structured input for Chat Model
     // This will be passed directly to the AI without any parsing needed
-    
+
     // Build the messages array exactly as the Chat Model expects
     const chatMessages: any[] = []
     
@@ -2693,6 +2911,34 @@ export class DatabaseService {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         mergedSystemPrompt += `==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====\n\n${dynamicMcpPrompt}`
       }
+    }
+
+    // SA-104 P3: memory guidance is gated on per-agent memory enablement alone — the
+    // inline <batshit-memory> save works without any broker family. Part of the stable
+    // compiled prefix (DL-104-04). Mirrors the server twin.
+    if (resolveAgentMemoryEnabled(agent)) {
+      const memoryPrompt = await this.resolveMemoryGuidancePrompt(agent, runtimeFlavor)
+      if (memoryPrompt.trim()) {
+        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+        mergedSystemPrompt += `==== MEMORY (AGENT MEMORY ENABLED) ====\n\n${memoryPrompt}`
+      }
+    }
+
+    // SA-104 P4: the agent-authored on-my-mind section compiles at the END of the
+    // stable prefix, directly after the memory guidance (DL-104-04 / P0 §1.2 locked
+    // position). The block text comes preformatted from the recall engine route, so
+    // both twins stay byte-identical. Mirrors the server twin.
+    if (memoryCompileContext?.onMyMindBlock) {
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      mergedSystemPrompt += memoryCompileContext.onMyMindBlock
+    }
+
+    // SA-104 P6: the open episode's whiteboard (Infinite Sessions) rides directly after
+    // AWARENESS — preformatted by the recall engine route so both twins stay
+    // byte-identical. Mirrors the server twin.
+    if (memoryCompileContext?.whiteboardBlock) {
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      mergedSystemPrompt += memoryCompileContext.whiteboardBlock
     }
 
     // Artifact guidance is now skill-led.
@@ -2781,7 +3027,7 @@ export class DatabaseService {
     const compiledMainSystemPrompt = mergedSystemPrompt
 
     // User message - build content array for vision support
-    const userContent = []
+    const userContent: any[] = []
     
     // Text content (previous conversation + current message)
     let textContent = ''
@@ -2805,8 +3051,10 @@ export class DatabaseService {
       agentDefaultProjectPath?.trim() ||
       defaultWorkspacePath?.trim() ||
       null
+    const controlErrorLines = buildControlErrorDcmLines(messages as any[])
     const dynamicInfo = currentMessageFormatted
       ? await this.buildDynamicInfoBlock({
+          controlErrorLines,
           currentUserMessage: currentUserMessage ?? null,
           agentRecord: agent,
           agentId: agent?.id ?? null,
@@ -2831,6 +3079,7 @@ export class DatabaseService {
           zipControlPermission: zipPermission,
           zipAiViewMode: zipViewMode,
           isCodexMode: options?.runtimeFlavor === 'codex' || options?.runtimeFlavor === 'claude',
+          memoryDcmLines,
           fetcher: options?.fetch
         })
       : ''
@@ -2861,13 +3110,20 @@ export class DatabaseService {
     // User-managed zips expand inline during compileForAI.
     
     // Add clipped items (user uploads) - KEEP THIS!
-    if (dedupedClippedContent.length > 0) {
-      // Add a section header for clipped items
+    // SA-104 P4: memory-carried clips (memorySource set) render under their own
+    // REMEMBERED MEDIA header — they are recalled media, not this message's uploads.
+    const sessionClippedItems = dedupedClippedContent.filter(
+      (item) => !(item as Record<string, any>).memorySource
+    )
+    const memoryClippedItems = dedupedClippedContent.filter(
+      (item) => (item as Record<string, any>).memorySource
+    )
+    const appendClippedItems = (items: typeof dedupedClippedContent, header: string) => {
+      if (items.length === 0) return
       if (userContent[0].text) {
-        userContent[0].text += '\n\n==== CLIPPED ITEMS (USER UPLOADS) ===='
+        userContent[0].text += `\n\n==== ${header} ====`
       }
-      
-      for (const item of dedupedClippedContent) {
+      for (const item of items) {
         // For text clips, inline the content for the AI
         if (item.contentType === 'text' && typeof item.content === 'string') {
           userContent[0].text += `\n\nCONTENT:\n${item.content}`
@@ -2884,14 +3140,16 @@ export class DatabaseService {
         }
       }
     }
-    
+    appendClippedItems(sessionClippedItems, 'CLIPPED ITEMS (USER UPLOADS)')
+    appendClippedItems(memoryClippedItems, 'REMEMBERED MEDIA (MEMORY)')
+
     // Add user message with proper content format
     chatMessages.push({
       role: 'user',
       // If only text (no images), just send the string. Otherwise send array.
       content: userContent.length === 1 ? userContent[0].text : userContent
     })
-    
+
     const assignedSubagentMetadata = Array.isArray(assignedSubagents)
       ? assignedSubagents.map((subagent) => ({
           id: subagent?.id,
@@ -2928,6 +3186,11 @@ export class DatabaseService {
         resolvedProjectPath,
         assignedSubagents: assignedSubagentMetadata,
         subagentModels,
+        // SA-104 P4: inserted-memory visibility for the Execution Viewer (rides the
+        // recorded snapshot's structuredInput untouched on every lane).
+        ...(memoryCompileContext?.memoryContext
+          ? { memoryContext: memoryCompileContext.memoryContext }
+          : {}),
         messageStructure: {
           systemMessages: chatMessages.filter(m => m.role === 'system').length,
           userMessages: chatMessages.filter(m => m.role === 'user').length,

@@ -37,6 +37,7 @@ import {
   RECIPE_SOURCE_CONTRACT,
   createGoonLiveBuildReceipt,
   createGoonRecipeDocument,
+  createRecipeMigrationPlan,
   createRecipeRevisionEnvelope,
   recipeAuthoringRevisionSha256,
   recipeRevisionBundleSha256,
@@ -410,6 +411,97 @@ async function seedRepresentativeData(userId: string) {
     created_at: '2026-05-22T00:00:00.000Z',
     updated_at: '2026-05-22T00:00:00.000Z'
   })
+
+  // SA-104 agent-memory records: agent-scoped memory + graduated segment plus the
+  // instance-level memory config/meta keys, all part of the `memory` backup group.
+  await redis.json.set('memory:agent_1:mem_1', '$', {
+    id: 'mem_1',
+    agent_id: 'agent_1',
+    user_id: userId,
+    lane: 'ltm',
+    content: 'Josh has an Irish Setter named Maggie',
+    importance: 7,
+    event_at: null,
+    event_ts: null,
+    saved_at: '2026-08-25T00:00:00.000Z',
+    saved_ts: 1787961600000,
+    is_superseded: 'n',
+    provenance: [{ session_id: 'sess_1', message_id: 'msg_1', source: 'agent' }],
+    visibility: 'normal',
+    embedding: [0.1, 0.2, 0.3, 0.4],
+    embedding_model: 'local-ai:test-embedder@4',
+    schema_version: 1
+  })
+  await redis.json.set('memseg:agent_1:memseg_1', '$', {
+    id: 'memseg_1',
+    agent_id: 'agent_1',
+    user_id: userId,
+    session_id: 'sess_1',
+    episode_id: null,
+    message_ids: ['msg_1'],
+    summary: 'Introduced Maggie the Irish Setter',
+    first_message_at: '2026-08-25T00:00:00.000Z',
+    first_message_ts: 1787961600000,
+    last_message_at: '2026-08-25T00:05:00.000Z',
+    last_message_ts: 1787961900000,
+    token_count: 120,
+    graduated_at: '2026-08-25T01:00:00.000Z',
+    graduated_by: 'session_close',
+    embedding: [0.1, 0.2, 0.3, 0.4],
+    embedding_model: 'local-ai:test-embedder@4',
+    schema_version: 1
+  })
+  await redis.json.set('episode:sess_1:ep_1', '$', {
+    id: 'ep_1',
+    session_id: 'sess_1',
+    agent_id: 'agent_1',
+    state: 'closed',
+    opened_at: '2026-08-25T00:00:00.000Z',
+    closed_at: '2026-08-25T01:00:00.000Z',
+    boundary_signal: 'agent_mark',
+    hold_until: null,
+    first_message_id: 'msg_1',
+    last_message_id: 'msg_1',
+    whiteboard: { content: 'Maggie vet appointment Friday', updated_at: '2026-08-25T00:30:00.000Z' },
+    schema_version: 1
+  })
+  await redis.rPush('session:sess_1:episodes', 'ep_1')
+  // SA-104 P7: the dreaming log (agent-scoped JSON run + capped LIST index).
+  await redis.json.set('memdream:agent_1:dream_1', '$', {
+    id: 'dream_1',
+    agent_id: 'agent_1',
+    user_id: userId,
+    trigger: 'manual',
+    started_at: '2026-08-25T02:00:00.000Z',
+    finished_at: '2026-08-25T02:00:05.000Z',
+    status: 'completed',
+    actions: [
+      {
+        at: '2026-08-25T02:00:01.000Z',
+        kind: 'expire_demote',
+        status: 'done',
+        why: 'expired — demoted awareness → ltm so it stops compiling but stays searchable'
+      }
+    ],
+    counts: { expiriesDemoted: 1, failures: 0, modelCalls: 0 },
+    schema_version: 1
+  })
+  await redis.rPush('memdream_index:agent_1', 'dream_1')
+  await redis.json.set('batshit:memory_config', '$', {
+    embedding: {
+      lane: 'local-ai',
+      modelId: 'local-ai:test-embedder',
+      localAi: { baseUrl: 'http://127.0.0.1:9/v1', modelName: 'test-embedder', dims: 4 }
+    },
+    schema_version: 1
+  })
+  await redis.json.set('batshit:memory_index_meta', '$', {
+    embedding_model: 'local-ai:test-embedder@4',
+    dims: 4,
+    index_schema_version: 1,
+    last_rebuilt_at: '2026-08-25T00:00:00.000Z',
+    schema_version: 1
+  })
 }
 
 describe('backupRestoreService', () => {
@@ -603,6 +695,26 @@ describe('backupRestoreService', () => {
       schemaVersion: 'eye-appearance-state/v5',
       irisSize: 1.1
     })
+
+    const restoredMemory = (await redis.json.get('memory:agent_1:mem_1')) as Record<string, any>
+    expect(restoredMemory.user_id).toBe('target')
+    expect(restoredMemory.content).toContain('Maggie')
+    expect(restoredMemory.embedding).toEqual([0.1, 0.2, 0.3, 0.4])
+    const restoredSegment = (await redis.json.get('memseg:agent_1:memseg_1')) as Record<string, any>
+    expect(restoredSegment.user_id).toBe('target')
+    expect(restoredSegment.session_id).toBe('sess_1')
+    const restoredMemoryConfig = (await redis.json.get('batshit:memory_config')) as Record<string, any>
+    expect(restoredMemoryConfig.embedding.lane).toBe('local-ai')
+    const restoredMemoryMeta = (await redis.json.get('batshit:memory_index_meta')) as Record<string, any>
+    expect(restoredMemoryMeta.dims).toBe(4)
+    const restoredEpisode = (await redis.json.get('episode:sess_1:ep_1')) as Record<string, any>
+    expect(restoredEpisode.state).toBe('closed')
+    expect(restoredEpisode.whiteboard.content).toContain('vet appointment')
+    expect(await redis.lRange('session:sess_1:episodes', 0, -1)).toEqual(['ep_1'])
+    const restoredDream = (await redis.json.get('memdream:agent_1:dream_1')) as Record<string, any>
+    expect(restoredDream.user_id).toBe('target')
+    expect(restoredDream.actions[0].why).toContain('demoted')
+    expect(await redis.lRange('memdream_index:agent_1', 0, -1)).toEqual(['dream_1'])
   })
 
   it('preflights and restores a disk-staged archive without buffering upload assets', async () => {
@@ -935,10 +1047,77 @@ describe('backupRestoreService', () => {
       goonId: 'goon_recipe',
       content: await createBackupRecipeLiveBuildReceipt()
     })
+    const plan = await createRecipeMigrationPlan({
+      contract: RECIPE_MIGRATION_PLAN_CONTRACT,
+      schemaVersion: 1,
+      planId: 'migration.backup-restore-fixture',
+      directEdgeKey: 'recipe.backup.v1-to-v2',
+      edgeSha256: sha('c'),
+      fromSource: source,
+      toSource: source,
+      fromRecipeRevision: 1,
+      toRecipeRevision: 2,
+      fromStateSha256: state.stateSha256,
+      toleranceProfile: 'recipe-strict/v1',
+      componentMapBundleSha256: null,
+      outcome: {
+        kind: 'unsupported',
+        readiness: 'blocked',
+        preservationClaim: 'none',
+        rejectionCodes: ['COMPONENT_PROOF_FAILED'],
+        cleanResetEligibility: 'eligible',
+        basedOnUnsupportedPlanSha256: null
+      },
+      controlRows: [],
+      siblingRows: [
+        'eyeAppearance',
+        'facialArtwork',
+        'oralAppearance'
+      ].map((surface) => ({
+        surface: surface as 'eyeAppearance' | 'facialArtwork' | 'oralAppearance',
+        sourceState: null,
+        targetDefinition: null,
+        action: 'not-present' as const,
+        resolution: 'not-present' as const,
+        proposedState: null,
+        proofStatus: 'not-required' as const,
+        proofSha256: sha('d'),
+        reasonCode: 'SIBLING_NOT_PRESENT' as const,
+        message: 'This sibling surface is not present.',
+        requiresPreview: false,
+        requiresConfirmation: false
+      })),
+      componentProofs: [],
+      wholeRecipeProof: {
+        status: 'failed',
+        sourcePhysicalOutputSha256: sha('e'),
+        targetPhysicalOutputSha256: null,
+        sourceAbsoluteOutputSha256: null,
+        targetAbsoluteOutputSha256: null,
+        sourceMaterialSha256: sha('f'),
+        targetMaterialSha256: sha('0'),
+        materialMatches: false,
+        errors: {
+          scalarMaximum: 0,
+          positionMaximumMeters: 0,
+          positionRmsMeters: 0,
+          scaleMaximum: 0,
+          quaternionMaximumRadians: 0,
+          matrixMaximum: 0,
+          bakedPositionMaximumMeters: 0,
+          bakedPositionRmsMeters: 0
+        },
+        mismatchDomains: [],
+        permitsAppearancePreservedClaim: false,
+        proofSha256: sha('0')
+      },
+      warnings: [],
+      proposedState: null
+    })
     const planDocument = await createGoonRecipeDocument({
       userId: 'source',
       goonId: 'goon_recipe',
-      content: { contract: RECIPE_MIGRATION_PLAN_CONTRACT }
+      content: plan as unknown as Record<string, unknown>
     })
     const reportDocument = await createGoonRecipeDocument({
       userId: 'source',

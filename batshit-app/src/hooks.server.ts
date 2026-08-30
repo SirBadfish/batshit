@@ -5,6 +5,8 @@ import { authRateLimiter, apiRateLimiter } from '$lib/middleware/rateLimiter'
 import { ensureSkillFilesystemStartup } from '$lib/server/services/skillRegistry'
 import { listCoreSystemPrompts } from '$lib/server/services/systemPromptRegistry'
 import { removeRetiredSystemClips } from '$lib/server/services/retiredSystemClips'
+import { ensureMemoryIndexes } from '$lib/server/services/memory/memoryIndex'
+import { startMemoryDreamingScheduler } from '$lib/server/services/memory/memoryDreamingScheduler'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
 import { assertApiKeyEncryptionConfigured } from '$lib/services/encryption.server'
 import { isAuthRateLimitedPath, shouldApplyBroadApiRateLimit } from '$lib/middleware/rateLimitPolicy'
@@ -18,6 +20,7 @@ import {
 } from '$lib/server/services/artifactRuntimeAuth'
 import {
   hostedVercelAppDisabledResponse,
+  isHostedVercelRegistryDeployment,
   shouldBlockHostedVercelAppRequest
 } from '$lib/server/services/hostedAppGuard'
 import { applyBaselineSecurityHeaders } from '$lib/server/services/securityHeaders'
@@ -110,6 +113,15 @@ function ensureStartupIntegrityPass() {
     startupIntegrityInitialized = true
     assertApiKeyEncryptionConfigured()
     assertInternalServiceTokenConfigured()
+    if (isHostedVercelRegistryDeployment(env)) {
+      // Registry-only deployment: no batshit-server, no uploads, read-only filesystem.
+      // Backup-restore recovery and instance seeding are single-user-instance work.
+      console.info(
+        '[Startup] Hosted Vercel registry deployment detected; skipping single-instance startup (backup-restore recovery, skill filesystem, prompt/clip seeding).'
+      )
+      startupIntegrityPromise = Promise.resolve()
+      return startupIntegrityPromise
+    }
     startupIntegrityPromise = (async () => {
       await ensureBackupRestoreRecovery()
       void ensureSkillFilesystemStartup()
@@ -119,6 +131,21 @@ function ensureStartupIntegrityPass() {
       void removeRetiredSystemClips().catch((error) => {
         console.error('[Startup] Failed to remove retired system clips:', error)
       })
+      void ensureMemoryIndexes()
+        .then((result) => {
+          if (result.status !== 'ready') {
+            console.info(
+              `[Startup] Memory search indexes ${result.status} for ${result.embeddingModel} (${result.dims}d).`
+            )
+          }
+        })
+        .catch((error) => {
+          // Loud by contract (DL-104-10): recall paths also hard-fail until this is fixed.
+          console.error('[Startup] Memory index bootstrap failed:', error)
+        })
+      // SA-104 P7: the between-conversation dreaming scheduler (DL-104-15). Arms on
+      // the first request after boot; each pass re-checks eligibility and live turns.
+      startMemoryDreamingScheduler()
     })()
   }
   return startupIntegrityPromise ?? Promise.resolve()

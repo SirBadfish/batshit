@@ -27,6 +27,10 @@ Each Session has two names worth knowing about:
 
 The practical takeaway: rename the *title* whenever you want a chat to be easy to find. The ID is mostly plumbing.
 
+## Infinite Sessions section
+
+If you create any [Infinite Sessions](memory-and-infinite-sessions.md) — ongoing one-agent conversations with long-term memory — they get their own pinned section above the folders. Infinite Sessions live there permanently: they can't be dragged into folders, and nothing can be dragged into their section. Each shows a **Fixed** badge.
+
 ## Folders
 
 When you accumulate chats, folders keep them sorted. You can create folders in the sidebar and file Sessions into them — a folder per project, per topic, per client, however you think.
@@ -61,6 +65,7 @@ The Session menu includes **View Chat as Markdown** — a clean, read-only trans
 ## Related docs
 
 - [The chat workspace](overview.md)
+- [Memory & Infinite Sessions](memory-and-infinite-sessions.md)
 - [Backup and restore](../admin/backup-and-restore.md)
 - [Execution Viewer](execution-viewer.md)
 - [Primary Agents](../primary-agents/overview.md)
