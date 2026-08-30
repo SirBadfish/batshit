@@ -87,7 +87,7 @@
     return policy.replace(/_/g, ' ')
   }
 
-  type ExecutionViewerModeKind = 'n8n' | 'vercel' | 'codex' | 'claude' | 'unknown'
+  type ExecutionViewerModeKind = 'vercel' | 'codex' | 'claude' | 'unknown'
   type UsageDetailEntry = {
     key: string
     label: string
@@ -100,7 +100,6 @@
   )
   const modeKind = $derived.by<ExecutionViewerModeKind>(() => {
     const primaryAgentType = normalizePrimaryAgentType(undefined, currentSnapshot?.agentType)
-    if (primaryAgentType === 'n8n') return 'n8n'
     if (runtimeDetails?.runtimeId === 'codex') return 'codex'
     if (runtimeDetails?.runtimeId === 'claude') return 'claude'
     if (primaryAgentType === 'api') return 'vercel'
@@ -149,27 +148,12 @@
     Array.isArray(currentSnapshot?.intermediateSteps) ? currentSnapshot?.intermediateSteps : null,
   )
   const responseSummary = $derived(currentSnapshot?.responseSummary ?? null)
+  // SA-106: webhook input was an n8n-Primary-only snapshot surface. Old stored
+  // snapshots may still carry an explicit availability record, so it is still read;
+  // nothing produces a new one.
   const webhookInputAvailability = $derived.by<ExecutionFieldAvailability | null>(() => {
     const explicit = currentSnapshot?.webhookInputAvailability
-    if (explicit && typeof explicit === 'object') {
-      return explicit
-    }
-    if (currentSnapshot?.agentType !== 'n8n') {
-      return null
-    }
-    if (Array.isArray(currentSnapshot?.webhookStyleInput) && currentSnapshot.webhookStyleInput.length > 0) {
-      return {
-        state: 'unavailable',
-        source: 'batshit-webhook-wrapper',
-        note:
-          'Exact webhook input is not loaded yet. Use Refresh to replace this stored wrapper with the exact n8n Webhook node output when the matching execution is available.'
-      }
-    }
-    return {
-      state: 'unavailable',
-      source: 'execution-viewer',
-      note: 'No webhook payload was captured for this n8n run.'
-    }
+    return explicit && typeof explicit === 'object' ? explicit : null
   })
 
   let selectedCallIndex = $state<number | null>(null)
@@ -225,27 +209,8 @@
 	    })
 	  })
 
-		  let n8nToolDefinitions = $state<Record<string, any[]>>({})
-		  let n8nToolLoading = $state(false)
-		  let n8nToolError = $state<string | null>(null)
 
 		  const userSettings = $derived(getUserSettings())
-		  const n8nExecutionSearchLimit = $derived.by<number>(() => {
-		    const raw = (userSettings as any)?.admin_settings?.n8n_execution_search_limit
-		    const parsed =
-		      typeof raw === 'number'
-		        ? raw
-		        : typeof raw === 'string'
-		          ? Number.parseInt(raw, 10)
-		          : NaN
-
-		    const fallback = 60
-		    const resolved = Number.isFinite(parsed) ? parsed : fallback
-		    return Math.max(1, Math.min(250, Math.trunc(resolved)))
-		  })
-		  let n8nWebhookHydrationLoading = $state(false)
-		  let n8nWebhookHydrationError = $state<string | null>(null)
-		  let n8nWebhookHydrationAttempted = $state<Record<string, true>>({})
 
 	  function emptyTokenUsage(
 	    confidence: ExecutionConfidenceLevel,
@@ -362,12 +327,6 @@
 	    if (toolActivityEntries.length > 0) return null
 
 	    if (typeof toolCallsCountFromSummary === 'number' && toolCallsCountFromSummary > 0) {
-	      if (modeKind === 'n8n') {
-	        return `n8n reported ${toolCallsCountFromSummary} tool call${
-	          toolCallsCountFromSummary === 1 ? '' : 's'
-	        }, but no intermediateSteps were captured for this run.`
-	      }
-
 	      return `This run reported ${toolCallsCountFromSummary} tool call${
 	        toolCallsCountFromSummary === 1 ? '' : 's'
 	      }, but no per-tool payloads were captured for the viewer.`
@@ -376,197 +335,12 @@
 	    return null
 	  })
 
+		  // SA-106: the n8n synthesis branch is gone. n8n Primary runs executed inside n8n,
+		  // so the viewer reconstructed per-call rows from execution data; API and CLI runs
+		  // capture real per-call payloads, so the stored calls are used as-is.
 		  const effectiveLlmCalls = $derived.by<ExecutionLlmCall[] | null>(() => {
 	    const calls = Array.isArray(snapshotLlmCalls) ? snapshotLlmCalls : null
-	    const isNoteOnlyN8n =
-	      currentSnapshot?.agentType === 'n8n' &&
-	      calls?.length === 1 &&
-	      calls[0]?.requestPayload &&
-	      typeof calls[0].requestPayload === 'object' &&
-	      'note' in calls[0].requestPayload &&
-	      Object.keys(calls[0].requestPayload).length === 1
-
-	    if (calls && calls.length > 0 && !isNoteOnlyN8n) {
-	      if (currentSnapshot?.agentType === 'n8n') {
-	        const toolsForSnapshot = n8nToolDefinitions[currentSnapshot.id] ?? null
-	        if (Array.isArray(toolsForSnapshot) && toolsForSnapshot.length > 0) {
-	          return calls.map((call) => {
-	            const requestPayload = call?.requestPayload
-	            if (
-	              requestPayload &&
-	              typeof requestPayload === 'object' &&
-	              !Array.isArray(requestPayload) &&
-	              'tools' in requestPayload
-	            ) {
-	              return call
-	            }
-
-	            const basePayload =
-	              requestPayload && typeof requestPayload === 'object' && !Array.isArray(requestPayload)
-	                ? requestPayload
-	                : {
-	                    systemPrompt: currentSnapshot.primarySystemPrompt ?? null,
-	                    messages: currentSnapshot.compiledMessages ?? null
-	                  }
-
-	            return {
-	              ...call,
-	              requestPayload: { ...basePayload, tools: toolsForSnapshot }
-	            }
-	          })
-	        }
-	      }
-
-	      return calls
-	    }
-
-		    if (currentSnapshot?.agentType !== 'n8n') {
-		      return null
-		    }
-
-		    const usage = llmSummary?.totalUsage ?? emptyTokenUsage('speculative', 'n8n')
-		    const toolsForSnapshot = n8nToolDefinitions[currentSnapshot.id] ?? null
-		    const hasSystemPrompt = typeof currentSnapshot.primarySystemPrompt === 'string'
-		    const hasMessages = Array.isArray(currentSnapshot.compiledMessages)
-
-		    const requestConfidence: ExecutionConfidenceLevel =
-		      hasMessages && hasSystemPrompt ? 'near' : toolsForSnapshot ? 'near' : 'estimated'
-
-		    const requestPayload: Record<string, any> = {
-		      systemPrompt: currentSnapshot.primarySystemPrompt ?? null,
-		      messages: currentSnapshot.compiledMessages ?? null,
-		      ...(Array.isArray(toolsForSnapshot) ? { tools: toolsForSnapshot } : {})
-		    }
-
-		    const notes = [
-		      'This is a best-effort reconstruction for n8n runs; Batshit cannot capture the exact provider payload byte-for-byte.',
-		      'Tools attached directly to n8n nodes may be missing from the tool list.'
-		    ]
-
-		    const responseText =
-		      typeof responseSummary?.content?.value === 'string' ? responseSummary.content.value : null
-		    const estimatedUsage = (() => {
-		      try {
-		        const inputTokens = approximateTokenCount(JSON.stringify(requestPayload))
-		        const outputTokens = responseText ? approximateTokenCount(responseText) : null
-		        const totalTokens = typeof outputTokens === 'number' ? inputTokens + outputTokens : null
-		        const outputConfidence = typeof outputTokens === 'number' ? 'estimated' : 'speculative'
-		        const totalConfidence = typeof totalTokens === 'number' ? 'estimated' : 'speculative'
-
-		        return {
-		          inputTokens: { value: inputTokens, confidence: 'estimated', source: 'batshit' },
-		          outputTokens: { value: outputTokens, confidence: outputConfidence, source: 'batshit' },
-		          totalTokens: { value: totalTokens, confidence: totalConfidence, source: 'batshit' }
-		        } satisfies ExecutionTokenUsage
-		      } catch {
-		        return emptyTokenUsage('speculative', 'batshit')
-		      }
-		    })()
-
-		    const callsCountFromSummary =
-		      typeof llmSummary?.callsCount?.value === 'number' &&
-		      Number.isFinite(llmSummary.callsCount.value)
-		        ? Math.max(1, Math.trunc(llmSummary.callsCount.value))
-		        : null
-
-		    const toolCallsCount =
-		      typeof responseSummary?.toolCallsCount?.value === 'number' &&
-		      Number.isFinite(responseSummary.toolCallsCount.value)
-		        ? Math.max(0, Math.trunc(responseSummary.toolCallsCount.value))
-		        : null
-
-		    const inferredCallsCount =
-		      typeof toolCallsCount === 'number' && toolCallsCount > 0 ? toolCallsCount + 1 : 1
-
-		    const callsCount = callsCountFromSummary ?? inferredCallsCount
-
-		    const perCallUsage =
-		      callsCount === 1 && hasAnyToken(usage)
-		        ? usage
-		        : callsCount === 1
-		          ? estimatedUsage
-		          : emptyTokenUsage('speculative', 'n8n')
-
-		    const perCallNotes =
-		      callsCount > 1
-		        ? [
-		            ...notes,
-		            'Per-call token usage is not available for n8n runs; totals above reflect all calls.'
-		          ]
-		        : notes
-
-		    const syntheticCalls: ExecutionLlmCall[] = Array.from({ length: callsCount }).map(
-		      (_, idx) => {
-		        const index = idx + 1
-		        const isFinalCall = index === callsCount
-
-		        return {
-		          index,
-		          runtime: 'n8n',
-		          usage: perCallUsage,
-		          requestPayload,
-		          requestConfidence: index === 1 ? requestConfidence : 'estimated',
-		          responsePayload: isFinalCall
-		            ? { response: responseText }
-		            : { response: '' },
-		          responseConfidence: 'speculative',
-		          finishReason: null,
-		          toolCallsCount: index === 1 ? toolCallsCount ?? undefined : undefined,
-		          toolResultsCount: undefined,
-		          notes: perCallNotes
-		        }
-		      }
-		    )
-
-		    return syntheticCalls
-	  })
-
-	  $effect(() => {
-	    const snapshot = currentSnapshot
-	    if (!open || !snapshot || snapshot.agentType !== 'n8n') {
-	      n8nToolError = null
-	      return
-	    }
-	    if (!snapshot.agentId) return
-	    if (n8nToolDefinitions[snapshot.id]) return
-	    if (n8nToolLoading) return
-
-	    n8nToolLoading = true
-	    n8nToolError = null
-
-	    void (async () => {
-	      try {
-	        const response = await fetch('/api/mcp/selections/resolve', {
-	          method: 'POST',
-	          headers: { 'Content-Type': 'application/json' },
-	          body: JSON.stringify({
-	            agentId: snapshot.agentId,
-	            selectedGateways: snapshot.selectedGateways ?? null,
-	            mcpToolSelections: snapshot.mcpToolSelections ?? null,
-	            includeToolSchemas: true
-	          })
-	        })
-
-	        if (!response.ok) {
-	          const errorText = await response.text().catch(() => '')
-	          throw new Error(errorText || 'Failed to load tool definitions')
-	        }
-
-	        const data = await response.json().catch(() => null)
-	        const toolDefinitions = Array.isArray(data?.toolDefinitions)
-	          ? data.toolDefinitions
-	          : []
-
-	        n8nToolDefinitions = {
-	          ...n8nToolDefinitions,
-	          [snapshot.id]: toolDefinitions
-	        }
-	      } catch (err: any) {
-	        n8nToolError = err?.message || 'Failed to load tool definitions'
-	      } finally {
-	        n8nToolLoading = false
-	      }
-	    })()
+	    return calls && calls.length > 0 ? calls : null
 	  })
 
 	  const selectedCall = $derived.by(() => {
@@ -654,8 +428,6 @@
 
   function llmCoverageSummary(kind: ExecutionViewerModeKind): string {
     switch (kind) {
-      case 'n8n':
-        return 'n8n runs execute inside n8n. Batshit can reconstruct billed payloads and hydrate totals from execution data, but it cannot capture the exact on-wire provider request byte-for-byte.'
       case 'vercel':
         return 'API-agent runs capture the strongest per-call truth surface: exact provider request/response metadata when the SDK exposes it, with explicit near labels when Batshit has to backfill totals from raw stream chunks.'
       case 'codex':
@@ -669,8 +441,6 @@
 
   function llmCallUnavailableMessage(kind: ExecutionViewerModeKind): string {
     switch (kind) {
-      case 'n8n':
-        return 'Per-call billed payload details are unavailable because this n8n run did not expose enough execution data to reconstruct them.'
       case 'codex':
         return 'Per-call billed payload details are unavailable because Codex CLI did not expose a reconstructable provider-call breakdown for this run.'
       case 'claude':
@@ -684,8 +454,6 @@
 
   function runtimeSectionNote(kind: ExecutionViewerModeKind): string {
     switch (kind) {
-      case 'n8n':
-        return 'n8n runtime execution happens inside n8n, so Batshit can show webhook/execution hydration but not direct sandbox, working-directory, or provider-session telemetry.'
       case 'vercel':
         return 'API-agent runs use the Vercel AI SDK. Provider/model metadata is captured directly, while shell-style runtime fields only appear when the runtime actually exposes them.'
       case 'codex':
@@ -699,8 +467,6 @@
 
   function runtimeUnavailableMessage(kind: ExecutionViewerModeKind): string {
     switch (kind) {
-      case 'n8n':
-        return 'No direct runtime telemetry is available for n8n-managed runs.'
       case 'vercel':
         return 'This API-agent run did not record runtime metadata.'
       case 'codex':
@@ -714,8 +480,6 @@
 
   function rawProviderResponsesUnavailableMessage(kind: ExecutionViewerModeKind): string {
     switch (kind) {
-      case 'n8n':
-        return 'n8n-managed runs do not expose raw provider response objects to Batshit.'
       case 'codex':
         return 'Codex CLI does not expose raw provider response objects for this run.'
       case 'claude':
@@ -731,9 +495,6 @@
     kind: ExecutionViewerModeKind,
     detail: 'cachedInputTokens' | 'cacheCreationInputTokens' | 'reasoningTokens'
   ): string {
-    if (kind === 'n8n') {
-      return 'Not exposed by n8n execution data.'
-    }
     if (kind === 'codex' || kind === 'claude') {
       return 'Not reported by the CLI for this run.'
     }
@@ -819,27 +580,21 @@
   ): string {
     switch (field) {
       case 'transport':
-        if (kind === 'n8n') return 'Managed inside n8n workflow.'
         return 'Not reported by the runtime.'
       case 'sandbox':
-        if (kind === 'n8n') return 'Not exposed for n8n-managed runs.'
         if (kind === 'vercel') return 'Not applicable to Vercel SDK runs.'
         return 'Not reported by the CLI runtime.'
       case 'fileEdits':
       case 'network':
-        if (kind === 'n8n') return 'Not exposed for n8n-managed runs.'
         if (kind === 'vercel') return 'Not applicable to Vercel SDK runs.'
         return 'Not reported by the CLI runtime.'
       case 'workingDirectory':
-        if (kind === 'n8n') return 'Not exposed for n8n-managed runs.'
         if (kind === 'vercel') return 'Not used by Vercel SDK runs.'
         return 'Not reported by the CLI runtime.'
       case 'providerSession':
-        if (kind === 'n8n') return 'n8n runs do not expose a direct provider CLI session.'
         if (kind === 'vercel') return 'Vercel SDK runs do not use a provider CLI session.'
         return 'Provider session details were not reported for this run.'
       case 'runtimeEvents':
-        if (kind === 'n8n') return 'No direct runtime event log exists for n8n-managed runs.'
         return 'No runtime event log was captured for this run.'
       default:
         return 'Unavailable for this run.'
@@ -925,54 +680,12 @@
     return truncateExecutionViewerBase64InValue(value, { enabled: truncateBase64 })
   }
 
-		  async function refreshWebhookInputFromN8n() {
-		    if (!sessionId || !currentSnapshot?.id) return
-		    if (currentSnapshot.agentType !== 'n8n') return
-		    if (n8nWebhookHydrationLoading) return
-
-		    n8nWebhookHydrationLoading = true
-		    n8nWebhookHydrationError = null
-
-		    try {
-		      const resolvedLimit = n8nExecutionSearchLimit
-
-		      const response = await fetch(`/api/sessions/${sessionId}/execution-log`, {
-		        method: 'PATCH',
-		        headers: { 'Content-Type': 'application/json' },
-		        body: JSON.stringify({
-		          id: currentSnapshot.id,
-		          hydrateN8nWebhookInput: true,
-		          n8nExecutionSearchLimit: resolvedLimit,
-		          patch: {}
-		        })
-		      })
-
-		      if (!response.ok) {
-		        const text = await response.text().catch(() => '')
-		        throw new Error(text || `Hydration failed (${response.status})`)
-		      }
-
-		      const data = await response.json().catch(() => null)
-		      const hydrated = data?.hydratedWebhookInput === true
-		      const hydrationError = typeof data?.hydrationError === 'string' ? data.hydrationError : null
-
-		      await loadSnapshots()
-
-		      if (hydrationError) {
-		        n8nWebhookHydrationError = hydrationError
-		      } else if (!hydrated) {
-		        n8nWebhookHydrationError = `No matching n8n execution found in the last ${resolvedLimit} executions.`
-		      }
-		    } catch (err: any) {
-		      n8nWebhookHydrationError = err?.message || 'Failed to refresh webhook input from n8n'
-		    } finally {
-		      n8nWebhookHydrationLoading = false
-		    }
-		  }
-
 	  function formatRuntimeName(runtime: ExecutionRuntimeDetails): string {
-	    if (runtime.runtimeId === 'n8n') {
-	      return 'n8n Workflow'
+	    // SA-106: `n8n` left ExecutionRuntimeId, but snapshots recorded before the
+	    // retirement are still valid stored data. Label them honestly rather than
+	    // letting them fall through and claim to be a Vercel run.
+	    if ((runtime.runtimeId as string) === 'n8n') {
+	      return 'n8n Workflow (retired)'
 	    }
 	    if (runtime.runtimeId === 'codex') {
 	      return 'Codex CLI (GPT Plus/Pro)'
@@ -985,8 +698,6 @@
 
 	  function formatTransport(runtime: ExecutionRuntimeDetails): string | null {
 	    switch (runtime.transport) {
-	      case 'n8n-webhook':
-	        return 'Webhook'
 	      case 'codex-sdk':
 	        return 'SDK'
 	      case 'codex-cli':
@@ -1124,24 +835,6 @@
   let openRawProviderResponses = $state(false)
 
   let wasOpen = $state(false)
-
-  $effect(() => {
-    const snapshotId = currentSnapshot?.id
-    if (!snapshotId) return
-    n8nWebhookHydrationError = null
-  })
-
-  $effect(() => {
-    if (!open || !openWebhookInput) return
-
-    const snapshot = currentSnapshot
-    if (!snapshot || snapshot.agentType !== 'n8n') return
-    if (webhookInputAvailability?.state === 'exact') return
-    if (n8nWebhookHydrationAttempted[snapshot.id]) return
-
-    n8nWebhookHydrationAttempted = { ...n8nWebhookHydrationAttempted, [snapshot.id]: true }
-    refreshWebhookInputFromN8n()
-  })
 
   $effect(() => {
     if (open && !wasOpen) {
@@ -1476,7 +1169,7 @@
                   {/if}
                 </div>
                 <span class="execution-viewer-helper">
-                  Exact for API agents (Vercel). Best-effort for n8n and CLI agents.
+                  Exact for API agents (Vercel). Best-effort for CLI agents.
                 </span>
               </div>
               <div class="execution-viewer-inline-row">
@@ -1516,17 +1209,6 @@
                 <div class="execution-viewer-note execution-viewer-note-raised">
                   {llmCoverageSummary(modeKind)}
                 </div>
-
-                {#if currentSnapshot.agentType === 'n8n'}
-                  <div class="execution-viewer-warning-note">
-                    n8n runs execute inside workflows. Tool definitions for tools attached directly to n8n nodes may not be visible here unless they flow through Batshit gateways.
-                  </div>
-                  {#if n8nToolLoading}
-                    <div class="execution-viewer-helper">Loading tool definitions…</div>
-                  {:else if n8nToolError}
-                    <div class="execution-viewer-error-text">Tool definitions unavailable: {n8nToolError}</div>
-                  {/if}
-                {/if}
 
                 {#if llmSummary}
                   <div class="execution-viewer-stats-grid execution-viewer-stats-grid-six">
@@ -1793,78 +1475,6 @@
 
         <div class="execution-viewer-stack-lg">
           <div class="execution-viewer-eyebrow">Request</div>
-
-	          {#if currentSnapshot.agentType === 'n8n'}
-	            <Collapsible.Root bind:open={openWebhookInput}>
-	              <Collapsible.Trigger class="execution-viewer-section-trigger">
-	                <div class="execution-viewer-section-label">
-	                  <div class="execution-viewer-inline-row">
-		                  <span class="execution-viewer-section-heading">n8n Webhook Input</span>
-		                  {#if webhookInputAvailability}
-		                    <Badge
-		                      variant="outline"
-		                      class={`execution-viewer-confidence-badge ${availabilityClasses(webhookInputAvailability.state)}`}
-		                    >
-		                      {availabilityLabel(webhookInputAvailability.state)}
-		                    </Badge>
-		                  {/if}
-	                  </div>
-                  <span class="execution-viewer-helper">
-                    Exact n8n webhook input from matching executions, with explicit unavailable states until hydration succeeds
-                  </span>
-	                </div>
-	                <ChevronDown class="execution-viewer-section-chevron" data-open={openWebhookInput} />
-	              </Collapsible.Trigger>
-	              <Collapsible.Content class="execution-viewer-section-content">
-	                <div class="execution-viewer-hydration-panel">
-                  <div class="execution-viewer-hydration-row">
-                    <div class="execution-viewer-helper">
-                      Pull exact webhook input from n8n (searching last {n8nExecutionSearchLimit} executions). Change in
-                      Settings → Admin.
-                    </div>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      onclick={refreshWebhookInputFromN8n}
-                      disabled={n8nWebhookHydrationLoading}
-                    >
-                      <RefreshCcw class="execution-viewer-button-icon-leading" />
-                      {n8nWebhookHydrationLoading ? 'Refreshing…' : 'Refresh'}
-                    </Button>
-                  </div>
-
-	                  {#if n8nWebhookHydrationError}
-	                    <div class="execution-viewer-error-text">{n8nWebhookHydrationError}</div>
-	                  {/if}
-                    {#if webhookInputAvailability?.note}
-                      <div class="execution-viewer-helper">{webhookInputAvailability.note}</div>
-                    {/if}
-	                </div>
-
-	                <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
-                  {#if webhookInputAvailability?.state === 'exact' && currentSnapshot.webhookStyleInput}
-                    <JSONViewer data={displayViewerData(currentSnapshot.webhookStyleInput)} />
-                  {:else if n8nWebhookHydrationLoading}
-                    <div class="execution-viewer-muted-copy">Loading exact webhook input from n8n…</div>
-	                  {:else}
-	                    <div class="execution-viewer-stack-sm execution-viewer-muted-copy">
-	                      <div>{webhookInputAvailability?.note ?? 'Exact webhook input is unavailable for this run.'}</div>
-	                      <div class="execution-viewer-helper">
-	                        Check Settings → API Keys for your n8n API key, then click Refresh.
-	                      </div>
-	                    </div>
-                  {/if}
-                </div>
-                <div class="execution-viewer-helper execution-viewer-helper-offset">
-                  Sensitive headers are redacted before storage.
-                </div>
-              </Collapsible.Content>
-            </Collapsible.Root>
-          {:else}
-            <div class="execution-viewer-note">
-              n8n Webhook Input is not applicable to this mode. Batshit only records that payload surface for n8n runs.
-            </div>
-          {/if}
 
           <Collapsible.Root bind:open={openPrimaryPrompt} disabled={!currentSnapshot.primarySystemPrompt}>
             <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
@@ -2172,7 +1782,6 @@
   .execution-viewer-stack-xs,
   .execution-viewer-section-label,
   .execution-viewer-provider-session,
-  .execution-viewer-hydration-panel,
   .execution-viewer-muted-copy {
     display: flex;
     flex-direction: column;
@@ -2236,21 +1845,11 @@
     padding: 8px 12px;
   }
 
-  .execution-viewer-error-text {
-    color: var(--destructive);
-    font-size: 0.75rem;
-  }
-
   .execution-viewer-run-row,
   .execution-viewer-wrap-row,
   .execution-viewer-inline-row,
   .execution-viewer-value-row,
   .execution-viewer-stat-row,
-  .execution-viewer-hydration-row {
-    display: flex;
-    align-items: center;
-  }
-
   .execution-viewer-run-row {
     flex-wrap: wrap;
     gap: 12px;
@@ -2361,13 +1960,8 @@
   .execution-viewer-table-muted-cell,
   .execution-viewer-stat-unavailable,
   .execution-viewer-note,
-  .execution-viewer-warning-note {
-    color: var(--muted-foreground);
-  }
-
   .execution-viewer-helper,
   .execution-viewer-note,
-  .execution-viewer-warning-note,
   .execution-viewer-stat-unavailable {
     font-size: 0.75rem;
   }
@@ -2389,40 +1983,25 @@
   .execution-viewer-card,
   .execution-viewer-panel,
   .execution-viewer-note,
-  .execution-viewer-warning-note,
   .execution-viewer-message-preview,
   .execution-viewer-code-block,
   .execution-viewer-stat-card,
   .execution-viewer-table-wrap,
   .execution-viewer-json-pane,
   .execution-viewer-pre,
-  .execution-viewer-hydration-panel {
-    border-radius: 6px;
-  }
-
   .execution-viewer-card,
   .execution-viewer-panel,
   .execution-viewer-note,
-  .execution-viewer-warning-note,
   .execution-viewer-stat-card,
   .execution-viewer-table-wrap,
   .execution-viewer-json-pane,
   .execution-viewer-pre,
-  .execution-viewer-hydration-panel {
-    border: 1px solid var(--border);
-  }
-
   .execution-viewer-card {
     background: oklch(from var(--background) l c h / 0.4);
     padding: 12px;
   }
 
   .execution-viewer-panel,
-  .execution-viewer-hydration-panel {
-    background: oklch(from var(--muted) l c h / 0.1);
-    padding: 12px;
-  }
-
   .execution-viewer-note {
     border-color: oklch(from var(--border) l c h / 0.6);
     background: oklch(from var(--muted) l c h / 0.1);
@@ -2437,12 +2016,6 @@
   .execution-viewer-text-sm,
   .execution-viewer-muted-copy {
     font-size: 0.875rem;
-  }
-
-  .execution-viewer-warning-note {
-    border-color: oklch(0.72 0.12 85 / 0.3);
-    background: oklch(0.72 0.12 85 / 0.1);
-    padding: 8px 12px;
   }
 
   .execution-viewer-grid-2,
@@ -2590,33 +2163,13 @@
     line-height: 1.6;
   }
 
-  .execution-viewer-hydration-panel {
-    gap: 8px;
-    margin-bottom: 12px;
-  }
-
-  .execution-viewer-hydration-row {
-    flex-direction: column;
-    align-items: stretch;
-    justify-content: space-between;
-    gap: 8px;
-  }
-
   @media (min-width: 640px) {
-    .execution-viewer-hydration-row {
-      flex-direction: row;
-      align-items: center;
-    }
   }
 
   :global(.execution-viewer-button-icon-leading) {
     width: 14px;
     height: 14px;
     margin-right: 8px;
-  }
-
-  .execution-viewer-helper-offset {
-    padding-top: 8px;
   }
 
   .execution-viewer-section-block {

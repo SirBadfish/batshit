@@ -1,7 +1,12 @@
-export type ExecutionRuntimeId = 'vercel' | 'codex' | 'claude' | 'n8n'
+/**
+ * SA-106: `n8n` retired with the n8n Primary Agent type. Execution snapshots recorded
+ * before the retirement may still carry it as stored data — the Execution Viewer renders
+ * those honestly as "n8n Workflow (retired)" via a raw-string check — but nothing writes
+ * it any more, so it is out of the live union.
+ */
+export type ExecutionRuntimeId = 'vercel' | 'codex' | 'claude'
 
 export type ExecutionRuntimeTransport =
-  | 'n8n-webhook'
   | 'vercel-sdk'
   | 'codex-sdk'
   | 'codex-cli'

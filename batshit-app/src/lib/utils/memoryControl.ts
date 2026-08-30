@@ -711,10 +711,12 @@ function extractCandidateRefs(value: unknown): string[] {
  * through the DCM insert channel and must never be double-stored as tool-output zips).
  *
  * The `fabric:sys.memory.` / `sys.memory.` ref string in the step's args is the
- * authority: only the memory Fabric family produces those refs, on every lane. The
- * broker tool NAME alone is not required — the n8n lane's steps carry the workflow's
- * tool-node name (e.g. `Batshit_Tools`), which P8 proved evades a name-only gate and
- * re-zipped memory search results on n8n while API/CLI stayed exempt.
+ * authority, NOT the broker tool name. SA-104 P8 proved a name-only gate fails: n8n
+ * steps arrive carrying the workflow's tool-node name (e.g. `Batshit_Tools`) instead of
+ * the broker's, so memory search results were re-zipped there while API/CLI stayed
+ * exempt. SA-106 retired the n8n PRIMARY lane but NOT that hazard — `n8n Workflow
+ * Subagent` steps still reach the cool-tool adapter with workflow-authored names. Do
+ * not relax this back to a name gate.
  * Still strict: with no matching ref, the step is NOT a memory step and zips normally.
  */
 export function isMemoryControlToolStep(step: unknown): boolean {

@@ -139,7 +139,6 @@
   import { logger } from '$lib/utils/logger'
   import {
     isManagedPrimaryAgentType,
-    isN8nPrimaryAgentType,
     normalizePrimaryAgentType,
     shouldShowReasoningByDefaultForPrimaryAgent
   } from '$lib/utils/primaryAgentType'
@@ -3639,130 +3638,6 @@ const immersiveActive = $derived.by(
 
       // Save to database after updating
       await saveMessageToDatabase(targetMessageId)
-
-	      // Update Execution Viewer snapshot with response + usage for n8n sends.
-	      // The primary n8n finalization now happens in messageApi from the final end event;
-	      // this remains as a client-side fallback/supplement after SSE completes.
-	      try {
-		        const currentSessionId = currentMessage.session_id ?? eventSessionContext
-	        const agentForMessage = agentStore.getAgentById(currentMessage.agent_id)
-	        const isN8nAgent = isN8nPrimaryAgentType(
-	          normalizePrimaryAgentType(agentForMessage as any)
-	        )
-	        if (currentSessionId && isN8nAgent) {
-	          const inputTokens =
-	            existingUsage?.inputTokens ??
-	            existingUsage?.promptTokens ??
-	            existingUsage?.prompt_tokens ??
-	            null
-	          const outputTokens =
-	            existingUsage?.outputTokens ??
-	            existingUsage?.completionTokens ??
-	            existingUsage?.completion_tokens ??
-	            null
-	          const totalTokensRaw =
-	            existingUsage?.totalTokens ??
-	            existingUsage?.total_tokens ??
-	            null
-	          const totalTokens =
-	            typeof totalTokensRaw === 'number'
-	              ? totalTokensRaw
-	              : (typeof inputTokens === 'number' && typeof outputTokens === 'number'
-	                  ? inputTokens + outputTokens
-	                  : null)
-
-	          const intermediateStepsForStats = Array.isArray(data.intermediateSteps)
-	            ? data.intermediateSteps
-	            : Array.isArray(currentMessage.intermediateSteps)
-	              ? currentMessage.intermediateSteps
-	              : null
-
-	          const toolCallsCount = intermediateStepsForStats ? intermediateStepsForStats.length : null
-	          const toolCallsConfidence = intermediateStepsForStats
-	            ? (toolCallsCount > 0 ? 'near' : 'exact')
-	            : 'speculative'
-
-	          const tokenStat = (value: any, confidence: any, source?: string) => ({
-	            value: typeof value === 'number' ? value : null,
-	            confidence,
-	            ...(source ? { source } : {})
-	          })
-
-	          const inputConfidence = typeof inputTokens === 'number' ? 'exact' : 'speculative'
-	          const outputConfidence = typeof outputTokens === 'number' ? 'exact' : 'speculative'
-	          const totalConfidence =
-	            typeof totalTokensRaw === 'number'
-	              ? 'exact'
-	              : (typeof inputTokens === 'number' && typeof outputTokens === 'number'
-	                  ? 'near'
-	                  : 'speculative')
-
-	          const usageObj = {
-	            inputTokens: tokenStat(inputTokens, inputConfidence, 'n8n'),
-	            outputTokens: tokenStat(outputTokens, outputConfidence, 'n8n'),
-	            totalTokens: tokenStat(totalTokens, totalConfidence, 'n8n')
-	          }
-
-	          const estimatedCallsCount =
-	            typeof toolCallsCount === 'number'
-	              ? toolCallsCount > 0
-	                ? toolCallsCount + 1
-	                : 1
-	              : null
-	          const callsConfidence =
-	            typeof toolCallsCount === 'number'
-	              ? toolCallsCount > 0
-	                ? 'estimated'
-	                : 'near'
-	              : 'speculative'
-
-	          const responseNotes: string[] = [
-	            'n8n runs execute inside n8n, so Batshit cannot capture per-step provider payloads byte-for-byte.'
-	          ]
-	          if (!intermediateStepsForStats) {
-	            responseNotes.unshift(
-	              'Tool-call details are unavailable for this run (no intermediateSteps were provided by n8n).'
-	            )
-	          }
-	          if (
-	            typeof inputTokens !== 'number' &&
-	            typeof outputTokens !== 'number' &&
-	            typeof totalTokens !== 'number'
-	          ) {
-	            responseNotes.unshift('n8n did not provide usage totals for this run; token counts are unavailable.')
-	          }
-
-		          await fetch(`/api/sessions/${currentSessionId}/execution-log`, {
-		            method: 'PATCH',
-		            headers: { 'Content-Type': 'application/json' },
-		            body: JSON.stringify({
-		              id: targetMessageId,
-		              hydrateN8nWebhookInput: true,
-		              n8nExecutionSearchLimit: userSettings?.admin_settings?.n8n_execution_search_limit,
-	              patch: {
-	                llmSummary: {
-	                  callsCount: tokenStat(estimatedCallsCount, callsConfidence, 'n8n'),
-	                  totalUsage: usageObj,
-	                  breakdownConfidence:
-	                    typeof toolCallsCount === 'number' ? 'estimated' : 'speculative'
-	                },
-                  intermediateSteps: intermediateStepsForStats ?? null,
-	                responseSummary: {
-	                  content: { value: finalContent, confidence: 'exact' },
-	                  usage: usageObj,
-	                  toolCallsCount: tokenStat(toolCallsCount, toolCallsConfidence, 'n8n'),
-	                  notes: responseNotes
-	                },
-                  runtime: {
-                    status: 'succeeded'
-                  }
-	              }
-	            })
-	          })
-	        }
-	      } catch (snapshotPatchError) {
-        logger.warn('[SSE End] Failed to patch execution snapshot:', snapshotPatchError)
-      }
 
 	      resolveStreamCompletion(targetMessageId)
       unregisterActiveMessage(targetMessageId)
