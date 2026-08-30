@@ -1,8 +1,7 @@
 # Agents and tools troubleshooting
 
-Batshit has three Primary Agent types:
+Batshit has two Primary Agent types:
 
-- `n8n`: chat runs through an n8n workflow.
 - `API`: chat runs directly through Batshit using saved provider connections.
 - `CLI`: chat runs through a managed CLI runtime such as Codex or Claude Code.
 
@@ -11,8 +10,6 @@ Many tool problems are really agent-type, permission, or runtime-boundary proble
 ## The agent doesn't respond
 
 First identify the agent type.
-
-For `n8n`: the workflow is active in n8n, the Webhook URL is correct, n8n provider credentials are configured, and n8n can call back to Batshit with the correct token.
 
 For `API`: the provider API key is saved in Settings → API Keys, the selected model preset is available, the provider/model supports the requested features, and rate limits or provider errors are visible.
 
@@ -131,15 +128,15 @@ Current user-only panel artifacts don't become agent tools: HuggingFace embeds, 
 
 ## `fetch_zip` fails
 
-For `n8n` Primary Agents, zip lookup goes through the tool broker: `batshit_tool_use` with ref `fabric:sys.zip.fetch`. That's what current prompts, official templates, and runtime guidance teach.
+Primary Agents fetch a saved Zip through the tool broker: `batshit_tool_use` with ref `fabric:sys.zip.fetch`.
 
 Fetch Zip is not available for subagent runs in either form. If a subagent needs prior zipped content, have the Primary Agent fetch or summarize it, then call the subagent with the relevant context.
 
-If an `n8n` Primary Agent can't fetch a zip, verify the zip ID exists in the session, the current agent/session can access it, and the message was saved with trusted zip references.
+If a Primary Agent cannot fetch a Zip, verify the Zip ID exists in the session, the current agent/session can access it, and the message was saved with trusted Zip references.
 
 ## Group Chat behaves oddly
 
-[Group Chat](../groups/overview.md) is API/CLI-only at launch. Check that:
+[Group Chat](../groups/overview.md) uses the two live Primary Agent types. Check that:
 
 - the group contains supported agent types
 - the Group driver is set intentionally if using Goons

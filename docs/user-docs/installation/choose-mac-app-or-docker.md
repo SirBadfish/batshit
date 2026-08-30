@@ -36,7 +36,7 @@ Inside the Mac app, Settings → Admin → Runtimes shows **Mac App Required Run
 The Mac app stores durable state under `~/Library/Application Support/Batshit`, logs under `~/Library/Logs/Batshit`, and cache/scratch under `~/Library/Caches/Batshit`.
 When you save settings, agents, chats, Goons, scenes, or other app data, Batshit writes that change to the Mac-app-owned Redis process immediately. The Mac app also runs Redis with append-only persistence so recent saves are written to disk quickly and survive app restarts or Mac reboots.
 
-n8n is connect-existing for the Mac app. Run your own n8n instance when you want `n8n` Primary Agents or workflow tools.
+n8n is connect-existing for the Mac app. Run your own n8n instance when you want workflow tools or n8n Workflow Subagents.
 
 Apple Container is the Mac app's default sandbox backend for agent command execution on supported Macs. It is not the whole app runtime; it is the isolated command backend used when agents run sandboxed commands. Docker Sandbox remains selectable for Mac users and remains the cross-platform sandbox path.
 
@@ -70,7 +70,7 @@ Don't expose a local alpha Batshit instance to the public internet unless you kn
 | Feature area | Mac app | Docker |
 | --- | --- | --- |
 | Basic chat with `API` agents | Good | Good |
-| n8n Primary Agents | Good with an existing local n8n using the native official template | Good with the optional Docker n8n profile or existing n8n |
+| n8n workflow tools and Workflow Subagents | Good with an existing local n8n using the official Workflow Subagent template | Good with the optional Docker n8n profile or existing n8n |
 | `CLI` agents | Host CLI login and tools | Container-side CLI login, persistent Docker volume |
 | Local AI | Direct `localhost` URLs usually work | Use `host.docker.internal` for host runtimes or service names for sidecars |
 | Voice cloud providers | Good with saved keys | Good with saved keys |

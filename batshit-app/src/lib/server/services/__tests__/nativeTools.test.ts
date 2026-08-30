@@ -4595,34 +4595,6 @@ printf 'ok\\n'
     expect(result.error?.code).toBe('INVALID_CONTEXT')
   })
 
-  it('accepts public primary_agent_type context values for native automation dispatch', async () => {
-    vi.mocked(redis.get).mockResolvedValue({
-      user_id: 'josh',
-      provider_specific_settings: {
-        nativeTools: {
-          fetchZipEnabled: true
-        }
-      }
-    } as any)
-
-    const result = await nativeToolService.dispatchNativeAutomationPackAction({
-      userId: 'josh',
-      action: 'fetch_zip',
-      payloadInput: { zipId: 'zip_demo' },
-      context: {
-        session_id: 'session_demo',
-        agent_id: 'agent_primary',
-        primary_agent_type: 'api',
-        actor_type: 'primary'
-      }
-    })
-
-    expect(result.success).toBe(false)
-    expect(result.context.mode).toBe('mode3')
-    expect(result.error?.code).toBe('ACTION_DISABLED')
-    expect(result.error?.message).toContain('n8n Primary Agent')
-  })
-
   it("keeps primary_agent_type 'n8n' as the Category 2 subagent wire value (SA-106)", async () => {
     // SA-106 DL-106-01. The n8n PRIMARY agent type is retired, but BOTH surviving
     // official `n8n Workflow Subagent` templates hardcode `primary_agent_type: 'n8n'`
@@ -4644,8 +4616,8 @@ printf 'ok\\n'
 
     const result = await nativeToolService.dispatchNativeAutomationPackAction({
       userId: 'josh',
-      action: 'fetch_zip',
-      payloadInput: { zipId: 'zip_demo' },
+      action: 'batshit_tool_search',
+      payloadInput: { query: 'workflow tools' },
       context: {
         session_id: 'session_demo',
         agent_id: 'subagent_workflow',
@@ -5184,35 +5156,6 @@ PATCH`
     } finally {
       await rm(tempWorkspace, { recursive: true, force: true })
     }
-  })
-
-  it('blocks fetch_zip for subagent dispatch requests even when enabled', async () => {
-    vi.mocked(redis.get).mockResolvedValue({
-      user_id: 'josh',
-      provider_specific_settings: {
-        nativeTools: {
-          fetchZipEnabled: true
-        }
-      }
-    } as any)
-
-    const result = await nativeToolService.dispatchNativeAutomationPackAction({
-      userId: 'josh',
-      action: 'fetch_zip',
-      payloadInput: { zipId: 'zip_demo_1' },
-      context: {
-        session_id: 'session_demo',
-        agent_id: 'agent_sub',
-        mode: 'mode1',
-        actor_type: 'subagent',
-        parent_agent_id: 'agent_parent'
-      }
-    })
-
-    expect(redis.get).toHaveBeenCalledWith('agent:agent_parent')
-    expect(result.success).toBe(false)
-    expect(result.error?.code).toBe('ACTION_DISABLED')
-    expect(result.error?.message).toMatch(/subagent runs/i)
   })
 
   it('returns SANDBOX_UNAVAILABLE when docker sandbox backend is selected but docker is unavailable', async () => {

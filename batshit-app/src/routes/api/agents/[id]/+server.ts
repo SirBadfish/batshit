@@ -9,6 +9,7 @@ import {
   hasLegacyPrimaryAgentFields,
   isApiPrimaryAgentType,
   isCliPrimaryAgentType,
+  isManagedPrimaryAgentType,
   normalizePrimaryAgentType
 } from '$lib/utils/primaryAgentType'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
@@ -73,6 +74,30 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       return json({ error: 'Unauthorized' }, { status: 403 })
     }
 
+    if (!isManagedPrimaryAgentType(normalizePrimaryAgentType(agent))) {
+      return json(
+        {
+          error: 'This Primary Agent uses the retired n8n type and can only be deleted.',
+          code: 'primary_agent_type_retired'
+        },
+        { status: 409 }
+      )
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updates, 'agentType')) {
+      const requestedAgentType =
+        typeof updates.agentType === 'string' ? updates.agentType.trim().toLowerCase() : ''
+      if (requestedAgentType !== 'api' && requestedAgentType !== 'cli') {
+        return json(
+          {
+            error: 'Primary Agent type must be API or CLI.',
+            code: 'primary_agent_type_invalid'
+          },
+          { status: 400 }
+        )
+      }
+    }
+
     if (Object.prototype.hasOwnProperty.call(updates, 'goon_id') && updates.goon_id) {
       const goon = await redis.get(`goon:${String(updates.goon_id)}`)
       if (!goon || goon.user_id !== locals.user.id) {
@@ -117,7 +142,7 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
       )
     }
 
-    if ((isApiPrimaryAgentType(resolvedAgentType) || resolvedAgentType === 'n8n') && isCliPreset) {
+    if (isApiPrimaryAgentType(resolvedAgentType) && isCliPreset) {
       return json(
         { error: 'CLI model presets are only available for CLI agents.' },
         { status: 400 }

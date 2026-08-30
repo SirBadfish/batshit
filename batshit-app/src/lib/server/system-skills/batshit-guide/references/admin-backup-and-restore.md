@@ -157,7 +157,7 @@ The file may not be a Batshit backup zip, may be corrupt, may be missing `manife
 
 Normal backups exclude keys — re-enter them in Settings → API Keys. If you used With Secrets, confirm the target instance has the same `ENCRYPTION_KEY`.
 
-### Restored n8n agents don't work
+### Restored n8n Workflow Subagents don't work
 
 Check n8n separately: workflows still exist and are active, n8n credentials still exist, current templates still forward `x-batshit-native-tool-token`, and webhook URLs are reachable from the caller.
 

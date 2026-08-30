@@ -8,11 +8,6 @@ Your broker pair is `native_batshit_tool_search` / `native_batshit_tool_use`.
 <!-- runtime:cli -->
 Your broker pair is `batshit_tool_search` / `batshit_tool_use`.
 <!-- /runtime -->
-<!-- runtime:n8n -->
-Your broker lives on the `Batshit Tools` node. Use `action="batshit_tool_search"` and `action="batshit_tool_use"`.
-
-These are action names for that node, not standalone skills.
-<!-- /runtime -->
 
 Do not call `native_skill` with `skillId="{{ $tool_search_tool }}"` or `skillId="{{ $tool_use_tool }}"`; these are tools, not skills.
 
@@ -62,7 +57,7 @@ native_batshit_tool_use({
 })
 ```
 <!-- /runtime -->
-<!-- runtime:cli,n8n -->
+<!-- runtime:cli -->
 ```json
 batshit_tool_search({
   "family": "cli",
@@ -127,7 +122,7 @@ Then copy the exact `results[0].ref` into `{{ $tool_use_tool }}`.
 
 - Hints are guidance, not authorization. Backend validation, scope checks, risk gates, artifact allowlists, and runtime placement checks remain authoritative.
 - For write/edit/delete/deploy/payment/account-changing tools, request fuller details or ask the user before execution when the side effects are unclear.
-- Broad Fabric controls are not available to all actors. n8n agents and subagents must not assume they can use `fabric:` refs unless search actually returns them.
+- Broad Fabric controls are not available to all actors. Subagents must not assume they can use `fabric:` refs unless search actually returns them.
 - Bash, Web Search, Fetch Zip, and `native_skill` are separate primitives. Do not route them through Dynamic Tool Search.
 
 ## Recommended Flow

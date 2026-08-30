@@ -558,6 +558,8 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
 
 let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
 let saveError = $state<string | null>(null)
+let n8nCompatibilitySyncing = $state(false)
+let n8nCompatibilitySyncError = $state<string | null>(null)
   let deleteBusy = $state(false)
   let deleteDisclosureOpen = $state(false)
 
@@ -1412,9 +1414,53 @@ let lastInvalidModelSignature = $state<string | null>(null)
   }
 
   const matrixEntries = $derived.by(() => compatibilityMatrixStore.getMatrixEntries())
+  const n8nCompatibilityState = $derived.by(() => compatibilityMatrixStore.getN8nState())
+  const showN8nParameterSupport = $derived(
+    n8nCompatibilityState.hasWorkflowSubagents && n8nCompatibilityState.localSnapshotAvailable
+  )
+
+  async function refreshN8nParameterCompatibility(
+    trigger: 'model-card-open' | 'model-card-manual'
+  ) {
+    n8nCompatibilitySyncing = true
+    n8nCompatibilitySyncError = null
+    try {
+      const response = await fetch('/api/admin/compatibility-matrix/n8n-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trigger })
+      })
+      if (!response.ok) {
+        throw new Error(await extractError(response, 'Failed to refresh n8n parameter support'))
+      }
+      await compatibilityMatrixStore.loadCompatibilityMatrix()
+      if (trigger === 'model-card-manual') {
+        toast.success('n8n parameter support refreshed')
+      }
+    } catch (error) {
+      n8nCompatibilitySyncError =
+        error instanceof Error ? error.message : 'Failed to refresh n8n parameter support'
+      if (trigger === 'model-card-manual') toast.error(n8nCompatibilitySyncError)
+    } finally {
+      n8nCompatibilitySyncing = false
+    }
+  }
+
+  async function refreshN8nParameterCompatibilityOnOpen() {
+    const state = compatibilityMatrixStore.getN8nState()
+    n8nCompatibilitySyncError = state.syncStatus?.status === 'error'
+      ? state.syncStatus.error
+      : null
+    if (!state.hasWorkflowSubagents) return
+    const fetchedAtMs = state.fetchedAt ? new Date(state.fetchedAt).getTime() : 0
+    const fresh = Number.isFinite(fetchedAtMs) && Date.now() - fetchedAtMs < 24 * 60 * 60 * 1000
+    if (fresh) return
+    await refreshN8nParameterCompatibility('model-card-open')
+  }
 
   onMount(async () => {
     await Promise.all([loadModels(), loadCatalog(), compatibilityMatrixStore.loadCompatibilityMatrix()])
+    await refreshN8nParameterCompatibilityOnOpen()
   })
 
   async function loadModels() {
@@ -3774,15 +3820,10 @@ $effect(() => {
                     </p>
                   </SettingsInfoMenu>
                 {/if}
-		            <SettingsInfoMenu ariaLabel="About Model Presets">
-		              <p>
-		                Model presets give your favorite models friendly names plus saved defaults for
+	            <SettingsInfoMenu ariaLabel="About Model Presets">
+	              <p>
+	                Model presets give your favorite models friendly names plus saved defaults for
 	                pricing, compatibility, and parameter behavior.
-	              </p>
-	              <p class="mt-2">
-	                <span class="batshit-settings-inline-strong is-success">✓</span> means the preset works in
-	                both n8n and Batshit. <span class="batshit-settings-inline-strong is-danger">*</span> means it
-	                is Batshit direct only.
 	              </p>
 	            </SettingsInfoMenu>
             {/snippet}
@@ -4336,26 +4377,49 @@ $effect(() => {
                   set them unless you change them here yourself.
                 </p>
               </SettingsInfoMenu>
-              <Tooltip.Root>
-                <Tooltip.Trigger>
-                  <button
-                    type="button"
-                    class="batshit-settings-model-support-legend-trigger"
-                    aria-label="About API and n8n parameter support markers"
-                  >
-                    <CheckCircle2 class="h-3.5 w-3.5 text-[var(--batshit-primary)]" />
-                    <CheckCircle2 class="h-3.5 w-3.5 text-[var(--n8n-primary)]" />
-                  </button>
-                </Tooltip.Trigger>
-                <Tooltip.Content class="max-w-[240px] text-left">
-                  <p>A Batshit-colored check means the parameter works in API presets.</p>
-                  <p class="mt-2">
-                    When a second n8n-colored check appears, that same parameter also works in n8n
-                    Chat Model nodes.
-                  </p>
-                </Tooltip.Content>
-              </Tooltip.Root>
+              {#if showN8nParameterSupport}
+                <Tooltip.Root>
+                  <Tooltip.Trigger>
+                    <button
+                      type="button"
+                      class="batshit-settings-model-support-legend-trigger"
+                      aria-label="About API and n8n parameter support markers"
+                    >
+                      <CheckCircle2 class="h-3.5 w-3.5 text-[var(--batshit-primary)]" />
+                      <CheckCircle2 class="h-3.5 w-3.5 text-[var(--n8n-brand)]" />
+                    </button>
+                  </Tooltip.Trigger>
+                  <Tooltip.Content class="max-w-[240px] text-left">
+                    <p>A Batshit-colored check means the parameter works in API presets.</p>
+                    <p class="mt-2">
+                      A second n8n-colored check means the same parameter also works in n8n Chat
+                      Model nodes used by Workflow Subagents.
+                    </p>
+                  </Tooltip.Content>
+                </Tooltip.Root>
+              {/if}
+              {#if n8nCompatibilityState.hasWorkflowSubagents}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onclick={() => void refreshN8nParameterCompatibility('model-card-manual')}
+                  disabled={n8nCompatibilitySyncing}
+                >
+                  {#if n8nCompatibilitySyncing}
+                    <Loader2 class="animate-spin" />
+                  {:else}
+                    <RefreshCcw />
+                  {/if}
+                  Refresh n8n
+                </Button>
+              {/if}
           {/snippet}
+	        {#if n8nCompatibilitySyncError && n8nCompatibilityState.hasWorkflowSubagents}
+	          <div class="batshit-settings-inline-alert is-danger">
+	            n8n parameter support could not refresh: {n8nCompatibilitySyncError}
+	          </div>
+	        {/if}
 		          <div class="batshit-settings-form-stack">
 		            <div class="batshit-settings-toggle-row is-spine-toggle">
 		              <div>
@@ -4479,12 +4543,12 @@ $effect(() => {
                                     </SettingsInfoMenu>
                                     <span
                                       class="batshit-settings-parameter-support-icons"
-                                      title={parameterSupportLabel(parameterSupportsN8N)}
-                                      aria-label={parameterSupportLabel(parameterSupportsN8N)}
+                                      title={parameterSupportLabel(showN8nParameterSupport && parameterSupportsN8N)}
+                                      aria-label={parameterSupportLabel(showN8nParameterSupport && parameterSupportsN8N)}
                                     >
                                       <Check class="h-3 w-3 text-[var(--batshit-primary)]" />
-                                      {#if parameterSupportsN8N}
-                                        <Check class="h-3 w-3 text-[var(--n8n-primary)]" />
+                                      {#if showN8nParameterSupport && parameterSupportsN8N}
+                                        <Check class="h-3 w-3 text-[var(--n8n-brand)]" />
                                       {/if}
                                     </span>
                                     {#if responseFormatWarningVisible}

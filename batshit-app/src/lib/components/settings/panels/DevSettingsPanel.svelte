@@ -124,9 +124,6 @@
   let matrixPublishing = $state(false)
   let matrixError = $state<string | null>(null)
 
-  let n8nMatrixSnapshot = $state<CompatibilityMatrixSnapshot | null>(null)
-  let n8nMatrixSyncing = $state(false)
-  let n8nMatrixError = $state<string | null>(null)
 
   onMount(async () => {
     await loadSystemClips()
@@ -443,7 +440,6 @@
 
       const result = await response.json()
       const published = result?.published ?? null
-      n8nMatrixSnapshot = result?.n8n ?? null
       matrixPublished = published
       formatMatrixJson(published)
     } catch (err) {
@@ -484,42 +480,6 @@
       toast.error(matrixError)
     } finally {
       matrixPublishing = false
-    }
-  }
-
-  async function runN8nMatrixSync() {
-    n8nMatrixSyncing = true
-    n8nMatrixError = null
-
-    try {
-      const response = await fetch('/api/admin/compatibility-matrix/n8n-sync', {
-        method: 'POST'
-      })
-
-      if (!response.ok) {
-        const message = await extractError(response, 'Failed to sync n8n parameters')
-        throw new Error(message)
-      }
-
-      const result = await response.json()
-      n8nMatrixSnapshot = result?.snapshot ?? null
-      const entryCount =
-        typeof result?.entries === 'number'
-          ? result.entries
-          : result?.snapshot?.entries?.length ?? 0
-      if (entryCount > 0) {
-        toast.success(`n8n parameter sync complete (${entryCount} entries)`)
-      } else {
-        n8nMatrixError =
-          'No chat model parameters were detected. Check N8N_API_URL, N8N_API_KEY, and provider mappings.'
-        toast.error(n8nMatrixError)
-      }
-    } catch (err) {
-      console.error('n8n compatibility sync failed:', err)
-      n8nMatrixError = err instanceof Error ? err.message : 'Failed to sync n8n parameters'
-      toast.error(n8nMatrixError)
-    } finally {
-      n8nMatrixSyncing = false
     }
   }
 
@@ -1016,9 +976,6 @@
             {#if matrixPublished?.entries}
               <span>· Entries {matrixPublished.entries.length}</span>
             {/if}
-            {#if n8nMatrixSnapshot?.fetchedAt}
-              <span>· n8n sync {formatTimestamp(n8nMatrixSnapshot.fetchedAt)}</span>
-            {/if}
           </div>
           <div class="flex items-center gap-2">
             <Button size="sm" onclick={publishMatrix} disabled={matrixPublishing}>
@@ -1027,34 +984,14 @@
               {/if}
               Publish
             </Button>
-            <Button
-              size="sm"
-              variant="secondary"
-              onclick={runN8nMatrixSync}
-              disabled={n8nMatrixSyncing}
-            >
-              {#if n8nMatrixSyncing}
-                <Loader2 class="animate-spin" />
-              {/if}
-              Sync n8n params
-            </Button>
           </div>
         </div>
 
-        {#if n8nMatrixError}
-          <div class="batshit-settings-inline-alert is-danger">
-            {n8nMatrixError}
-          </div>
-        {/if}
-
         <div class="batshit-settings-muted-panel batshit-settings-caption">
-          <div class="batshit-settings-inline-strong">Manual vs automatic refresh</div>
+          <div class="batshit-settings-inline-strong">Published registry snapshot</div>
           <div class="mt-1">
-            <code>Sync n8n params</code> uses the n8n credentials saved in this Batshit instance for the current admin user.
-            <code class="ml-1">Publish</code> pushes whatever is in the editor to the hosted Upstash registry.
-          </div>
-          <div class="mt-2">
-            The daily automatic refresh is a separate Vercel cron on <code>api.batshit.ai</code>. That hosted job does not use your local Dev tab session, so it only works when the hosted deployment has its own <code>N8N_API_URL</code> plus n8n auth configured.
+            <code>Publish</code> pushes the reviewed matrix in this editor to the hosted Upstash registry.
+            Local n8n parameter support refreshes from the Model Preset surface when Workflow Subagents use it.
           </div>
         </div>
       </Card.Content>

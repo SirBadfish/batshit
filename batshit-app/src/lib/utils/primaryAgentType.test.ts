@@ -113,15 +113,12 @@ describe('primaryAgentType utilities', () => {
       expect(getPrimaryAgentDisplayLabel(undefined)).toBe('API')
     })
 
-    it('never hands the retired base system prompt to a live type', () => {
+    it('only exposes base-system-prompt keys for the two live types', () => {
       expect(getPrimaryAgentSystemPromptRedisKey('api')).toBe(
         'batshit:batshit_mode3_system_prompt'
       )
       expect(getPrimaryAgentSystemPromptRedisKey('cli')).toBe(
         'batshit:batshit_mode4_system_prompt'
-      )
-      expect(getPrimaryAgentSystemPromptRedisKey('n8n')).toBe(
-        'batshit:n8n_mode2_system_prompt'
       )
     })
   })

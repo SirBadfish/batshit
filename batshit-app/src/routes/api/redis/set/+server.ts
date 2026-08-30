@@ -19,7 +19,6 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             // Primary-agent prompts
             'batshit:batshit_mode3_system_prompt',
             'batshit:batshit_mode4_system_prompt',
-            'batshit:n8n_mode2_system_prompt',
             // Base SA prompts
             'batshit:sub_system_prompt',
             'batshit:subagent_instructions',
@@ -29,20 +28,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             'batshit:dynamic_mcp_prompt',
             // Legacy keys (kept for backward compatibility)
             'batshit:batshit_primary_system_prompt',
-            'batshit:n8n_primary_system_prompt',
             'batshit:primary_system_prompt',
             'batshit:system_prompt',
             // Last updated timestamps
             'batshit:batshit_mode3_system_prompt:last_updated',
             'batshit:batshit_mode4_system_prompt:last_updated',
-            'batshit:n8n_mode2_system_prompt:last_updated',
             'batshit:sub_system_prompt:last_updated',
             'batshit:subagent_instructions:last_updated',
             'batshit:tool_guidance_zip_enabled_prompt:last_updated',
             'batshit:tool_guidance_zip_disabled_prompt:last_updated',
             'batshit:dynamic_mcp_prompt:last_updated',
             'batshit:batshit_primary_system_prompt:last_updated',
-            'batshit:n8n_primary_system_prompt:last_updated',
             'batshit:primary_system_prompt:last_updated',
             'batshit:system_prompt:last_updated'
         ];

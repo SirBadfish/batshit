@@ -17,7 +17,7 @@ If you just want one assistant that delegates to helpers behind the scenes, that
 
 ## Which agents can join
 
-Group Chat is launch-supported for `API` and `CLI` Primary Agents. `n8n` Primary Agents don't join normal Groups, because the group runtime relies on the direct provider/CLI conversation path.
+Group Chat uses `API` and `CLI` Primary Agents—the two live Primary Agent types.
 
 Each agent in a Group keeps its own model, system prompt, personality, voice, and tool access. That's the point — a Group is a room full of *different* agents, not one agent wearing hats.
 
@@ -59,7 +59,7 @@ Get each agent working solo before grouping them. A Group can only be as healthy
 
 | Symptom | Likely cause | What to check |
 | --- | --- | --- |
-| An agent can't be added to a Group | It's an `n8n` Primary Agent. | Groups are launch-supported for `API` and `CLI` agents. |
+| An agent can't be added to a Group | The saved record is missing or uses a retired type. | Delete the retired record and create an `API` or `CLI` agent. |
 | The group feels stuck | Turns are sequential, so one agent's slow or stuck tool call holds the line. | Check that agent's model/provider and tools on their own. |
 | The wrong agent keeps answering | Speak policies, or you didn't name a specific agent. | Address an agent by name, or adjust speak policies. |
 | Agents ignore each other | Tool results aren't shared, so they're missing each other's context. | Turn on tool sharing for the results the group should see. |

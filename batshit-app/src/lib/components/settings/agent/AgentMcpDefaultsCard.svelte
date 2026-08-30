@@ -49,7 +49,11 @@
 	    TOOL_GRID_ARTIFACT_ICON_REF,
 	    TOOL_GRID_FABRIC_ICON_REF
 	  } from '$lib/utils/toolGridBrokerFamilies'
-	  import { resolveBrokerFamilies, resolveBrokerToolToggles } from '$lib/utils/brokerAvailability'
+	  import {
+    resolveBrokerFamilies,
+    resolveBrokerToolToggles,
+    type ToolHostScope
+  } from '$lib/utils/brokerAvailability'
 	  import BrokerFamilyToolGridRow from '$lib/components/tools/BrokerFamilyToolGridRow.svelte'
   import type { BrokerFamilyRowControls } from '$lib/components/tools/brokerFamilyRowControls'
 	  import {
@@ -99,8 +103,6 @@
     SignalMedium,
     Zap
   } from '@lucide/svelte'
-  import type { PrimaryAgentType } from '$lib/utils/primaryAgentType'
-  import { isManagedPrimaryAgentType } from '$lib/utils/primaryAgentType'
 
   interface PreviewTokenEstimates {
     enabled?: number
@@ -203,7 +205,7 @@
 
   interface Props {
     agentId?: string | null
-    agentType?: PrimaryAgentType
+    toolHostScope?: ToolHostScope
     userId?: string | null
     defaultMCPGateways: string[]
     defaultMCPToolSelections: MCPToolSelections
@@ -257,7 +259,7 @@
 
   let {
     agentId = null,
-    agentType = 'n8n',
+    toolHostScope = 'api',
     userId = null,
     defaultMCPGateways = [],
     defaultMCPToolSelections = [],
@@ -485,9 +487,7 @@
   // SA-096 P3: which broker families this agent can actually reach. Derived from the one
   // shared rule set, never restated here, so the grid cannot offer a row for a family the
   // broker would refuse on this runtime.
-  const brokerRuntime = $derived(
-    isCodexMode ? 'cli' : agentType === 'n8n' ? 'n8n' : ('api' as const)
-  )
+  const brokerRuntime = $derived(isCodexMode ? 'cli' : toolHostScope)
   const brokerFamilies = $derived.by(() =>
     resolveBrokerFamilies({
       runtime: brokerRuntime,
@@ -1417,9 +1417,9 @@
 
     {#if !dynamicMcpEnabled}
       <div class="batshit-settings-inline-alert is-warning">
-        {#if isManagedPrimaryAgentType(agentType) && typeof nativeDynamicMcpEnabled === 'boolean'}
+        {#if toolHostScope !== 'n8n' && typeof nativeDynamicMcpEnabled === 'boolean'}
           Dynamic MCP is disabled for this agent. MCP rows stay read-only until you turn it on in Agent Settings <code>Batshit Tools</code>, but CLI tool rows can still be managed here.
-        {:else if isManagedPrimaryAgentType(agentType) && isCodexMode}
+        {:else if toolHostScope !== 'n8n' && isCodexMode}
           Dynamic MCP is disabled for this agent. MCP rows stay read-only until you turn it on in Agent Settings <code>Batshit Tools</code>, but CLI tool rows can still be managed here.
         {:else}
           Dynamic MCP is disabled for this agent. Enable the native Dynamic MCP toggle in Agent Settings to edit MCP discoverability controls; CLI tool rows can still be managed here.

@@ -1,11 +1,6 @@
-/**
- * SA-106: `n8n` is RETIRED as a primary-agent type. It stays in this union only because
- * stored records can still carry the string and every runtime that meets one must be able
- * to recognise it and fail loudly (DL-106-03) — never silently treat it as a live type.
- * `api` and `cli` are the only types Batshit creates, selects, or sends with.
- * P4 narrows the union itself; until then, treat `'n8n'` as a retirement marker.
- */
-export type PrimaryAgentType = 'n8n' | 'api' | 'cli'
+/** Live Primary Agent types. `n8n` is retained only as a stored retirement marker. */
+export type PrimaryAgentType = 'api' | 'cli'
+export type StoredPrimaryAgentType = PrimaryAgentType | 'n8n'
 
 type PrimaryModelConnectionLike =
   | {
@@ -55,7 +50,7 @@ function hasCliProviderHint(agent?: PrimaryAgentLike | null): boolean {
 export function normalizePrimaryAgentType(
   agent?: PrimaryAgentLike | null,
   explicitType?: unknown
-): PrimaryAgentType {
+): StoredPrimaryAgentType {
   const normalizedExplicit = normalizeString(explicitType)
   if (normalizedExplicit === 'n8n' || normalizedExplicit === 'api' || normalizedExplicit === 'cli') {
     return normalizedExplicit
@@ -111,18 +106,12 @@ export function isManagedPrimaryAgentType(
   return isApiPrimaryAgentType(value) || isCliPrimaryAgentType(value)
 }
 
-export function requiresWebhookUrlForPrimaryAgent(value: unknown): boolean {
-  return isN8nPrimaryAgentType(value)
-}
-
 export function primaryAgentAllowsNativeBash(value: unknown): boolean {
-  const type = normalizeString(value)
-  return type === 'n8n' || type === 'api'
+  return isApiPrimaryAgentType(value)
 }
 
 export function primaryAgentAllowsAgentBrowser(value: unknown): boolean {
-  const type = normalizeString(value)
-  return type === 'n8n' || type === 'api'
+  return isApiPrimaryAgentType(value)
 }
 
 export function getPrimaryAgentDisplayLabel(
@@ -142,11 +131,6 @@ export function getPrimaryAgentSystemPromptRedisKey(type: PrimaryAgentType): str
       return 'batshit:batshit_mode3_system_prompt'
     case 'cli':
       return 'batshit:batshit_mode4_system_prompt'
-    // SA-106: explicit rather than a `default:` catch-all. The old shape silently handed
-    // the retired n8n base prompt to any unrecognised type — the most dangerous of the
-    // five silent n8n defaults this file used to carry.
-    case 'n8n':
-      return 'batshit:n8n_mode2_system_prompt'
   }
 }
 
@@ -156,8 +140,6 @@ export function getPrimaryAgentSystemPromptLabel(type: PrimaryAgentType): string
       return 'API PRIMARY SYSTEM PROMPT'
     case 'cli':
       return 'CLI PRIMARY SYSTEM PROMPT'
-    case 'n8n':
-      return 'N8N PRIMARY SYSTEM PROMPT'
   }
 }
 
@@ -180,7 +162,7 @@ export function hasLegacyPrimaryAgentFields(agent: Record<string, any> | null | 
 }
 
 export function canonicalizePrimaryAgentRecord<T extends Record<string, any>>(agent: T): T & {
-  agentType: PrimaryAgentType
+  agentType: StoredPrimaryAgentType
 } {
   const next = { ...agent } as Record<string, any>
   next.agentType = normalizePrimaryAgentType(next)
@@ -191,5 +173,5 @@ export function canonicalizePrimaryAgentRecord<T extends Record<string, any>>(ag
   delete next.n8nImplementation
   delete next.mode
 
-  return next as T & { agentType: PrimaryAgentType }
+  return next as T & { agentType: StoredPrimaryAgentType }
 }

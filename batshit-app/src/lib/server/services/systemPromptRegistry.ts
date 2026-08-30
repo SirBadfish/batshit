@@ -6,7 +6,6 @@ import { redis } from '$lib/server/redis'
 import { getRuntimeEnv } from '$lib/server/services/runtimeEnv'
 
 export type CoreSystemPromptId =
-  | 'n8n_primary'
   | 'api_primary'
   | 'cli_primary'
   | 'subagent_base'
@@ -58,15 +57,6 @@ const COMMON_CORE_PROMPT_WARNING =
   'Changing this core prompt can break agent behavior, tools, zips, skills, artifacts, voice, and runtime installs. Keep a copy of your edits and use Reset to Batshit Default if behavior gets weird.'
 
 const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
-  {
-    id: 'n8n_primary',
-    redisKey: 'batshit:n8n_mode2_system_prompt',
-    label: 'n8n Primary Agent System Prompt',
-    description: 'Baseline instructions for the live n8n primary-agent path.',
-    warning: COMMON_CORE_PROMPT_WARNING,
-    defaultFile: 'batshit_primary_agent_n8n_system_prompt.md',
-    defaultVersion: '2026-07-14'
-  },
   {
     id: 'api_primary',
     redisKey: 'batshit:batshit_mode3_system_prompt',

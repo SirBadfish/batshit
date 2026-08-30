@@ -28,7 +28,7 @@ describe('subagentType utilities', () => {
   })
 
   it('returns the full SA-062 compatibility matrix', () => {
-    expect(getCompatibleSubagentTypesForPrimaryAgent('n8n')).toEqual(['n8n-subnode'])
+    expect(getCompatibleSubagentTypesForPrimaryAgent('n8n')).toEqual([])
     expect(getCompatibleSubagentTypesForPrimaryAgent('api')).toEqual([
       'n8n-workflow',
       'api',
@@ -42,7 +42,7 @@ describe('subagentType utilities', () => {
   })
 
   it('checks compatibility against canonicalized types', () => {
-    expect(isSubagentCompatibleWithPrimaryAgent('n8n', 'n8n-subnode')).toBe(true)
+    expect(isSubagentCompatibleWithPrimaryAgent('n8n', 'n8n-subnode')).toBe(false)
     expect(isSubagentCompatibleWithPrimaryAgent('n8n', 'n8n-workflow')).toBe(false)
     expect(isSubagentCompatibleWithPrimaryAgent('api', 'n8n-workflow')).toBe(true)
     expect(isSubagentCompatibleWithPrimaryAgent('api', 'api')).toBe(true)

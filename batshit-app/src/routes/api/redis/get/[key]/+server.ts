@@ -15,7 +15,6 @@ export const GET: RequestHandler = async ({ params, locals }) => {
             // Primary-agent prompts
             'batshit:batshit_mode3_system_prompt',
             'batshit:batshit_mode4_system_prompt',
-            'batshit:n8n_mode2_system_prompt',
             // Base SA prompts
             'batshit:sub_system_prompt',
             'batshit:subagent_instructions',
@@ -26,7 +25,6 @@ export const GET: RequestHandler = async ({ params, locals }) => {
             'batshit:dynamic_mcp_prompt',
             // Legacy keys (kept for backward compatibility)
             'batshit:batshit_primary_system_prompt',
-            'batshit:n8n_primary_system_prompt',
             'batshit:primary_system_prompt',
             'batshit:system_prompt'
         ];

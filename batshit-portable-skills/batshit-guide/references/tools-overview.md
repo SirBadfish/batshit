@@ -218,7 +218,7 @@ In Docker, raw app-container Bash commands like `agent-browser ...` are blocked.
 
 n8n can participate in several ways:
 
-- An `n8n` Primary Agent workflow can call tools inside n8n.
+- An n8n Workflow Subagent can call its n8n-native nodes and its assigned Batshit Subagent Tools.
 - `API` and `CLI` Primary Agents can call n8n workflows as tools.
 - n8n Instance MCP can expose workflows and workflow inspection through n8n's MCP server.
 - n8n MCP Trigger workflows can expose curated MCP tool sets.

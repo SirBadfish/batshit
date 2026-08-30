@@ -5,7 +5,7 @@ import type { ClaudeAgentSettings } from '$lib/types/claude'
 import type { AgentVoiceProfile } from '$lib/types/voice'
 import type { AgentDcmDisplaySettings } from '$lib/types/database'
 import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
-import type { PrimaryAgentType } from '$lib/utils/primaryAgentType'
+import type { StoredPrimaryAgentType } from '$lib/utils/primaryAgentType'
 import type { AgentAutoCompactSettings } from '$lib/utils/contextCompaction'
 export interface Agent {
   id: string
@@ -19,7 +19,7 @@ export interface Agent {
   avatar_url?: string | null  // Mapped from avatar for frontend use
   avatar_icon_ref?: IconRef | null
   avatar_icon_fit?: AvatarIconFit | null
-  agentType?: PrimaryAgentType
+  agentType?: StoredPrimaryAgentType
   show_reasoning?: boolean  // Display model reasoning summaries in chat
   preserve_reasoning?: boolean  // Persist reasoning summaries in chat history (Redis)
   tool_approval_mode?: 'off' | 'all'

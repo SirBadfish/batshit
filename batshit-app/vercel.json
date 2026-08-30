@@ -4,10 +4,6 @@
     {
       "path": "/api/admin/cron/model-catalog",
       "schedule": "0 6 * * *"
-    },
-    {
-      "path": "/api/admin/cron/compatibility-matrix",
-      "schedule": "10 6 * * *"
     }
   ]
 }

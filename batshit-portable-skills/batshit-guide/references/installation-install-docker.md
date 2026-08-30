@@ -155,7 +155,7 @@ Open n8n at:
 http://localhost:5678
 ```
 
-The n8n profile starts an official pinned n8n image and a matching task-runner sidecar. It still requires normal n8n setup: create credentials, import the Batshit workflow templates, configure provider nodes, and create matching n8n agent records in Batshit.
+The n8n profile starts an official pinned n8n image and a matching task-runner sidecar. It still requires normal n8n setup: create credentials, import the Batshit Workflow Subagent templates, configure provider nodes, and create matching Workflow Subagent records in Batshit.
 
 The n8n profile needs one Docker-internal app setting:
 

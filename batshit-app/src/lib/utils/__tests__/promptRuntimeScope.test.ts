@@ -35,9 +35,6 @@ describe('runtimeFlavorToScope', () => {
     expect(runtimeFlavorToScope('claude')).toBe('cli')
   })
 
-  it('maps n8n to its own scope', () => {
-    expect(runtimeFlavorToScope('n8n')).toBe('n8n')
-  })
 })
 
 describe('applyPromptRuntimeScope', () => {
@@ -60,17 +57,22 @@ describe('applyPromptRuntimeScope', () => {
     const prompt = ['before', '<!-- runtime:api -->', 'api only', '<!-- /runtime -->', 'after'].join(
       '\n'
     )
-    const result = applyPromptRuntimeScope(prompt, 'n8n')
+    const result = applyPromptRuntimeScope(prompt, 'cli')
     expect(result).not.toContain('api only')
     expect(result).toContain('before')
     expect(result).toContain('after')
   })
 
-  it('supports multi-runtime scope lists', () => {
+  it('tolerates the retired n8n marker while preserving live scopes in customized prompts', () => {
     const prompt = ['<!-- runtime:cli,n8n -->', 'shared', '<!-- /runtime -->'].join('\n')
     expect(applyPromptRuntimeScope(prompt, 'cli')).toContain('shared')
-    expect(applyPromptRuntimeScope(prompt, 'n8n')).toContain('shared')
     expect(applyPromptRuntimeScope(prompt, 'api')).not.toContain('shared')
+  })
+
+  it('silently drops a stored n8n-only block for both live runtimes', () => {
+    const prompt = ['before', '<!-- runtime:n8n -->', 'retired', '<!-- /runtime -->', 'after'].join('\n')
+    expect(applyPromptRuntimeScope(prompt, 'api')).not.toContain('retired')
+    expect(applyPromptRuntimeScope(prompt, 'cli')).not.toContain('retired')
   })
 
   it('throws on an unclosed block rather than shipping partial content', () => {
@@ -124,20 +126,12 @@ describe('packaged Dynamic Tool Search prompt (SA-096)', () => {
     expect(compiled).not.toMatch(/(?<!native_)\bbatshit_tool_use\b/)
   })
 
-  it('teaches managed CLI and n8n agents only the bridge broker names', () => {
-    for (const scope of ['cli', 'n8n'] as const) {
-      const compiled = compilePackagedPrompt(scope)
-      expect(compiled).toContain('batshit_tool_search')
-      expect(compiled).toContain('batshit_tool_use')
-      expect(compiled).not.toContain('native_batshit_tool_search')
-      expect(compiled).not.toContain('native_batshit_tool_use')
-    }
-  })
-
-  it('gives n8n the Batshit Tools node framing and withholds it from the others', () => {
-    expect(compilePackagedPrompt('n8n')).toContain('Batshit Tools')
-    expect(compilePackagedPrompt('api')).not.toContain('Batshit Tools')
-    expect(compilePackagedPrompt('cli')).not.toContain('Batshit Tools')
+  it('teaches managed CLI agents only the bridge broker names', () => {
+    const compiled = compilePackagedPrompt('cli')
+    expect(compiled).toContain('batshit_tool_search')
+    expect(compiled).toContain('batshit_tool_use')
+    expect(compiled).not.toContain('native_batshit_tool_search')
+    expect(compiled).not.toContain('native_batshit_tool_use')
   })
 
   it('shows each runtime exactly one set of preferred call shapes', () => {

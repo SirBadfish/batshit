@@ -8,7 +8,12 @@ import {
 import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelectionResolver'
 import { resolveCliToolSelectionScope } from '$lib/server/services/cliToolRegistry'
 import { resolveNativeToolSettings } from '$lib/server/services/nativeTools'
-import { isApiSubagentType, normalizeSubagentType, type SubagentType } from '$lib/utils/subagentType'
+import {
+  isApiSubagentType,
+  isN8nSubnodeSubagentType,
+  normalizeSubagentType,
+  type SubagentType,
+} from '$lib/utils/subagentType'
 
 function normalizeStringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null
@@ -64,6 +69,12 @@ export async function resolveManagedSubagentScope(options: {
   sessionId?: string | null
   projectPath?: string | null
 }): Promise<SubagentResolvedScope> {
+  const subagentType = normalizeSubagentType(options.subagent, options.subagent.subagentType)
+  if (isN8nSubnodeSubagentType(subagentType)) {
+    throw new Error(
+      'n8n Subnode Subagents were removed from Batshit. Delete this record from Agent Settings.'
+    )
+  }
   const defaultMcpGateways =
     normalizeStringArray(options.subagent.defaultMCPGateways) ??
     normalizeStringArray((options.subagent as Record<string, any>).default_mcp_gateways)
@@ -96,7 +107,7 @@ export async function resolveManagedSubagentScope(options: {
       : (await resolveSessionProjectPath(options.sessionId)) ?? null
 
   return {
-    subagentType: normalizeSubagentType(options.subagent, options.subagent.subagentType),
+    subagentType,
     nativeToolSettings: resolveNativeToolSettings(
       options.subagent.provider_specific_settings ?? null,
     ),

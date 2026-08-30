@@ -2,7 +2,7 @@
  * SA-104 P3 — inline `<batshit-memory>` save processing (DL-104-05 hot path).
  *
  * The single finalize path in `+page.svelte` extracts memory blocks from the finished
- * assistant message (all three primary-agent types finalize there) and POSTs the parsed
+ * assistant message (both Primary Agent types finalize there) and POSTs the parsed
  * payloads here. Each payload runs through the SAME ops layer as the `sys.memory.save`
  * Fabric control, so inline saves and tool saves produce identical records. Per-block
  * failures come back loudly and land in `metadata.controlErrors`; successes land in

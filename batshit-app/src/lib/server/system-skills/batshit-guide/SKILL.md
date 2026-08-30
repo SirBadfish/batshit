@@ -20,7 +20,7 @@ Use this skill when the user asks:
 - what something in Batshit is or how it works ("what are Zips?", "what's a Subagent?", "what does Fabric do?");
 - how to set something up or change a setting ("how do I add API keys?", "how do I connect n8n?", "how do I give my agent a voice?");
 - which option to pick ("which agent type should I use?", "Mac app or Docker?");
-- why something is behaving unexpectedly, before diving into logs ("my n8n agent won't respond", "voice stopped working");
+- why something is behaving unexpectedly, before diving into logs ("my n8n Workflow Subagent won't respond", "voice stopped working");
 - anything about tokens, context, compression, or cost behavior in Batshit.
 
 ## How To Answer
@@ -58,9 +58,9 @@ Load only what the question needs. Names are `references/<file>`.
 - `security-overview.md` — trust model, boundaries, what to be careful with.
 
 **Agents**
-- `primary-agents-overview.md` — the three Primary Agent types (n8n, API, CLI) and how to choose.
-- `primary-agents-connect-n8n.md` — wiring an n8n Primary Agent to a workflow.
-- `subagents-overview.md` — the four subagent lanes and when delegation helps.
+- `primary-agents-overview.md` — the two Primary Agent types (API and CLI) and how to choose.
+- `primary-agents-connect-n8n.md` — connecting n8n workflow tools and Workflow Subagents.
+- `subagents-overview.md` — the three Subagent lanes and when delegation helps.
 - `groups-overview.md` — Group Chat: multi-agent sessions with a single-speaker queue.
 
 **Chat workspace**

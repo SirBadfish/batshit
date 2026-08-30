@@ -32,7 +32,7 @@ That's it. You now have a working Batshit chat.
 
 ## Why `API` first
 
-Batshit has three Primary Agent types — `n8n`, `API`, and `CLI` — and they're peer choices, not quality tiers. For a first message, `API` is the shortest route because Batshit talks straight to a model provider (or a Local AI runtime). It doesn't need an n8n workflow wired up or a CLI installed and logged in.
+Batshit has two Primary Agent types—`API` and `CLI`—and they're peer choices, not quality tiers. For a first message, `API` is the shortest route because Batshit talks straight to a model provider or Local AI runtime. It does not need a CLI installed and logged in; n8n can be added later as a tool and Workflow Subagent platform.
 
 You can add the other types later when you want them:
 

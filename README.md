@@ -1,6 +1,6 @@
 # Batshit
 
-Batshit is an alpha self-hosted AI workspace for n8n orchestration, direct API agents, CLI-powered agents, tools, artifacts, voice, local runtimes, and project-aware work.
+Batshit is an alpha self-hosted AI workspace with API agents, CLI-powered agents, n8n workflow tools and Workflow Subagents, artifacts, voice, local runtimes, and project-aware work.
 
 Batshit is open source under **AGPL-3.0-only**. See [LICENSE](LICENSE) for code terms and [TRADEMARKS.md](TRADEMARKS.md) for Batshit brand-use rules.
 

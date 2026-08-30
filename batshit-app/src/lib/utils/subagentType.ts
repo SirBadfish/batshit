@@ -1,7 +1,12 @@
-import type { PrimaryAgentLike, PrimaryAgentType } from '$lib/utils/primaryAgentType'
+import type {
+  PrimaryAgentLike,
+  PrimaryAgentType,
+  StoredPrimaryAgentType
+} from '$lib/utils/primaryAgentType'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 
-export type SubagentType = 'n8n-subnode' | 'n8n-workflow' | 'api' | 'cli'
+export type SubagentType = 'n8n-workflow' | 'api' | 'cli'
+export type StoredSubagentType = SubagentType | 'n8n-subnode'
 
 export type SubagentLike = {
   subagentType?: string | null
@@ -26,7 +31,7 @@ function hasWorkflowTarget(subagent?: SubagentLike | null): boolean {
 export function normalizeSubagentType(
   subagent?: SubagentLike | null,
   explicitType?: unknown
-): SubagentType {
+): StoredSubagentType {
   const normalizedExplicit = normalizeString(explicitType)
   if (
     normalizedExplicit === 'n8n-subnode' ||
@@ -91,7 +96,7 @@ export function isN8nSubnodeSubagentType(
 }
 
 export function getCompatibleSubagentTypesForPrimaryAgent(
-  value: PrimaryAgentLike | PrimaryAgentType | null | undefined
+  value: PrimaryAgentLike | StoredPrimaryAgentType | null | undefined
 ): SubagentType[] {
   const type =
     typeof value === 'string'
@@ -103,30 +108,27 @@ export function getCompatibleSubagentTypesForPrimaryAgent(
       return ['n8n-workflow', 'api', 'cli']
     case 'cli':
       return ['n8n-workflow', 'api', 'cli']
-    // SA-106: explicit rather than a `default:` catch-all. A retired n8n primary can only
-    // ever have paired with subnode subagents, and saying so honestly beats silently
-    // handing that list to an unrecognised type.
     case 'n8n':
-      return ['n8n-subnode']
+      return []
   }
 }
 
 export function isSubagentCompatibleWithPrimaryAgent(
-  primaryAgent: PrimaryAgentLike | PrimaryAgentType | null | undefined,
-  subagent: SubagentLike | SubagentType | null | undefined
+  primaryAgent: PrimaryAgentLike | StoredPrimaryAgentType | null | undefined,
+  subagent: SubagentLike | StoredSubagentType | null | undefined
 ): boolean {
   const compatibleTypes = getCompatibleSubagentTypesForPrimaryAgent(primaryAgent)
   const subagentType =
     typeof subagent === 'string'
       ? normalizeSubagentType(undefined, subagent)
       : normalizeSubagentType(subagent)
-  return compatibleTypes.includes(subagentType)
+  return subagentType !== 'n8n-subnode' && compatibleTypes.includes(subagentType)
 }
 
-export function getSubagentTypeDisplayLabel(type: SubagentType): string {
+export function getSubagentTypeDisplayLabel(type: StoredSubagentType): string {
   switch (type) {
     case 'n8n-subnode':
-      return 'n8n Subnode Subagent'
+      return 'n8n Subnode Subagent (retired)'
     case 'n8n-workflow':
       return 'n8n Workflow Subagent'
     case 'api':
@@ -138,10 +140,10 @@ export function getSubagentTypeDisplayLabel(type: SubagentType): string {
   }
 }
 
-export function getSubagentTypeShortLabel(type: SubagentType): string {
+export function getSubagentTypeShortLabel(type: StoredSubagentType): string {
   switch (type) {
     case 'n8n-subnode':
-      return 'n8n subnode'
+      return 'n8n subnode (retired)'
     case 'n8n-workflow':
       return 'n8n workflow'
     case 'api':
@@ -153,16 +155,16 @@ export function getSubagentTypeShortLabel(type: SubagentType): string {
   }
 }
 
-export function getSubagentTypeBadgeTone(type: SubagentType): 'n8n' | 'api' | 'cli' {
+export function getSubagentTypeBadgeTone(type: StoredSubagentType): 'n8n' | 'api' | 'cli' {
   if (type === 'api' || type === 'cli') return type
   return 'n8n'
 }
 
 export function canonicalizeSubagentRecord<T extends Record<string, any>>(
   subagent: T
-): T & { subagentType: SubagentType } {
+): T & { subagentType: StoredSubagentType } {
   const next = { ...subagent } as Record<string, any>
   next.subagentType = normalizeSubagentType(next)
   delete next.subagent_type
-  return next as T & { subagentType: SubagentType }
+  return next as T & { subagentType: StoredSubagentType }
 }

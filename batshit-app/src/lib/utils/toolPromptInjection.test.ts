@@ -111,7 +111,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
   it('SA-096 P1: the fallback tool prompt no longer restates broker guidance', () => {
     // Broker guidance lives in the discovery block alone. Both blocks normally ship
     // together, so restating it here was the duplication P1 removed.
-    for (const runtimeFlavor of ['vercel', 'codex', 'claude', 'n8n'] as const) {
+    for (const runtimeFlavor of ['vercel', 'codex', 'claude'] as const) {
       const prompt = buildToolGuidanceZipPromptBlock({ runtimeFlavor })
 
       expect(prompt).not.toContain('family="cli"')
@@ -198,8 +198,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     // checks the same property on the code-fallback path, which uses different text.
     const CASES: Array<{ scope: PromptRuntimeScope; base: string }> = [
       { scope: 'api', base: 'batshit_primary_agent_api_system_prompt.md' },
-      { scope: 'cli', base: 'batshit_primary_agent_cli_system_prompt.md' },
-      { scope: 'n8n', base: 'batshit_primary_agent_n8n_system_prompt.md' }
+      { scope: 'cli', base: 'batshit_primary_agent_cli_system_prompt.md' }
     ]
 
     const SINGLE_OCCURRENCE = [
@@ -227,8 +226,7 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     expect(api).not.toMatch(/(^|[^_])\bbatshit_tool_use\b/)
 
     for (const [scope, base] of [
-      ['cli', 'batshit_primary_agent_cli_system_prompt.md'],
-      ['n8n', 'batshit_primary_agent_n8n_system_prompt.md']
+      ['cli', 'batshit_primary_agent_cli_system_prompt.md']
     ] as Array<[PromptRuntimeScope, string]>) {
       const merged = compilePackagedPrompt(scope, base)
       expect(merged).not.toContain('native_batshit_tool_search')
@@ -261,15 +259,12 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     expect(api).not.toMatch(/(^|[^_])\bbatshit_tool_search\b/)
     expect(api).not.toMatch(/(^|[^_])\bbatshit_tool_use\b/)
 
-    for (const runtimeFlavor of ['codex', 'claude', 'n8n'] as const) {
+    for (const runtimeFlavor of ['codex', 'claude'] as const) {
       const prompt = buildDynamicMcpPromptBlock({ runtimeFlavor })
       expect(prompt).toContain('batshit_tool_search')
       expect(prompt).not.toContain('native_batshit_tool_search')
       expect(prompt).not.toContain('native_batshit_tool_use')
     }
-
-    // Only the n8n lane frames the pair as node actions.
-    expect(buildDynamicMcpPromptBlock({ runtimeFlavor: 'n8n' })).toContain('Batshit Tools')
     expect(buildDynamicMcpPromptBlock({ runtimeFlavor: 'codex' })).not.toContain('Batshit Tools')
   })
 })

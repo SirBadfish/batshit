@@ -36,7 +36,7 @@ Reference filenames are flattened UserDocs paths: `<section>-<page>.md`. List th
 - `installation-*` — choosing Mac app vs Docker, installing either, first run, Docker add-ons, updating.
 - `providers-*` — AI providers, API keys, models, Model Catalog/Presets.
 - `security-overview.md` — trust model and boundaries.
-- `primary-agents-*`, `subagents-overview.md`, `groups-overview.md` — the three Primary Agent types (n8n, API, CLI), subagent lanes, Group Chat.
+- `primary-agents-*`, `subagents-overview.md`, `groups-overview.md` — the two Primary Agent types (API and CLI), the three Subagent lanes, and Group Chat.
 - `chat-*` — the chat workspace: sessions, Execution Viewer, Compact/Trim, Zip Manager, Clips Manager, Artifact Zones.
 - `tools-zips.md`, `clips-overview.md`, `architecture-zips-and-clips.md`, `architecture-context-caching-tokens.md` — Zips, Clips, and token behavior.
 - `tools-overview.md`, `architecture-tools-without-bloat.md`, `fabric-overview.md` — tools, MCPs, Dynamic Tool Search, Fabric.

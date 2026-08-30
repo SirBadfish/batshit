@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildFixedSessionMetadata,
   isFixedSession,
+  resolveFixedSessionAgentId,
   resolveFixedSessionMetadataUpdate
 } from './fixedSession'
 
@@ -27,6 +28,23 @@ describe('fixedSession (SA-104 P5)', () => {
         enabled: true,
         created_at: '2026-08-25T12:00:00.000Z'
       })
+    })
+  })
+
+  describe('resolveFixedSessionAgentId', () => {
+    it('reads the fixed session owner and returns null for regular sessions', () => {
+      expect(
+        resolveFixedSessionAgentId({
+          agent_id: 'retired-agent',
+          metadata: { fixedSession: fixedBlock }
+        })
+      ).toBe('retired-agent')
+      expect(
+        resolveFixedSessionAgentId({
+          metadata: { fixedSession: fixedBlock, last_agent_id: 'legacy-agent' }
+        })
+      ).toBe('legacy-agent')
+      expect(resolveFixedSessionAgentId({ agent_id: 'regular', metadata: {} })).toBeNull()
     })
   })
 

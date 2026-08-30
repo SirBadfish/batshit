@@ -1,197 +1,132 @@
 # n8n troubleshooting
 
-This page covers Batshit and n8n integration problems.
+This page covers Batshit workflow tools and n8n Workflow Subagents.
 
-Default launch-facing URLs:
+Default URLs:
 
-- Batshit app, Mac app browser companion: `http://127.0.0.1:5620`
-- Batshit app, Docker host: `http://localhost:5620`
-- Batshit app, source-checkout dev host: `http://localhost:5621`
-- batshit-server, Mac/Docker host: `http://localhost:5600`
-- batshit-server, source-checkout dev host: `http://localhost:5610`
-- n8n: `http://localhost:5678`
-- Docker internal app URL: `http://app:3000`
-- Docker optional n8n profile internal URL: `http://n8n:5678`
+- Mac app Batshit: `http://127.0.0.1:5620`
+- Docker Batshit from the host: `http://localhost:5620`
+- Source-checkout Batshit: `http://localhost:5621`
+- n8n editor: `http://localhost:5678`
+- Docker internal Batshit app: `http://app:3000`
+- Optional Docker n8n service: `http://n8n:5678`
 
 ## Workflow import fails
 
 Try the n8n UI import first. If it fails:
 
-- Make sure you're importing a workflow JSON file, not a README.
-- Check that the file is from `docs/user-docs/user-templates/`.
-- Use the official Primary/Subagent templates first.
-- If using CLI import, use an n8n version that supports current workflow imports.
-
-Advanced CLI shape:
+- Make sure you selected a workflow JSON file.
+- Use one of the two official Workflow Subagent templates.
+- Check that your n8n version supports the current workflow format.
+- For CLI import, use:
 
 ```sh
 n8n import:workflow --input /path/to/template.json
 ```
 
-After CLI import, still open the workflow in n8n and configure credentials manually.
+After import, open the workflow and configure credentials manually.
 
-## Workflow runs in n8n but Batshit doesn't stream
+## Workflow Subagent does not answer
 
-First, confirm the workflow uses the current native official Primary template:
+Check:
 
-- Webhook node Response Mode is `Streaming`.
-- The native AI Agent node has streaming enabled.
-- The Batshit agent uses the Production webhook URL, not the Test URL.
-- n8n can reach the Batshit URL the workflow uses.
+1. The workflow is active.
+2. The Batshit Subagent uses the Production webhook URL, not a temporary Test URL.
+3. The Subagent type is `n8n Workflow Subagent`.
+4. The Subagent is assigned to an `API` or `CLI` Primary Agent.
+5. The model/provider node has a valid credential.
+6. n8n execution history shows the webhook request.
+7. The workflow returns a result rather than waiting on an unconnected branch.
 
-Native n8n may not show true provider-token time-to-first-token streaming in Batshit. It can buffer until the workflow response is ready, then Batshit replays the returned chunks. If the final response appears normally after the workflow finishes, that's not by itself a broken setup.
+Give the Subagent a specific description so the Primary Agent knows when to call it. For a first test, explicitly ask the Primary Agent to delegate to that specialist.
 
-Then check the scoped native-tool token path:
+## Batshit Subagent Tools returns authentication errors
 
-1. Open the Batshit Tools node in n8n.
-2. Confirm it does not use a saved Header Auth credential.
-3. Confirm it sends `x-batshit-native-tool-token`.
-4. Confirm the header value reads `batshit_native_tool_token` from the webhook payload.
+Open the `Batshit Subagent Tools` HTTP Request Tool and confirm:
 
-Then check the Batshit Tools URL:
+- Authentication is not a saved Batshit Header Auth credential.
+- It sends `x-batshit-native-tool-token`.
+- The header value reads `batshit_native_tool_token` from the webhook payload.
+- The request context keeps `actor_type: subagent`.
+- `parent_agent_id`, `subagent_id`, `session_id`, and `message_id` are present.
 
-| n8n placement | Batshit Tools URL |
+If `parent_agent_id` is missing, Batshit refuses the call instead of guessing a broader parent scope.
+
+## Batshit Subagent Tools cannot reach Batshit
+
+| n8n placement | Dispatch URL |
 | --- | --- |
 | Local n8n calling Mac app Batshit | `http://127.0.0.1:5620/api/native-tools/dispatch` |
-| Local n8n calling source-checkout dev Batshit | `http://127.0.0.1:5621/api/native-tools/dispatch` |
-| Optional Docker n8n profile calling the Docker app | `http://app:3000/api/native-tools/dispatch` |
+| Local n8n calling source-checkout Batshit | `http://127.0.0.1:5621/api/native-tools/dispatch` |
+| Optional Docker n8n profile | `http://app:3000/api/native-tools/dispatch` |
 | Existing host n8n calling Docker Batshit | `http://127.0.0.1:5620/api/native-tools/dispatch` |
 
-If the n8n execution says `ECONNREFUSED ::1:5620` or `ECONNREFUSED ::1:5621`, n8n resolved `localhost` to IPv6 loopback. Use `127.0.0.1` for n8n server-side Batshit callback/tool URLs, or restart n8n through Batshit's launcher so it receives that callback base automatically. If n8n calls the wrong URL successfully but Batshit never receives the stream or tool calls, it may be calling a different Batshit instance.
+If n8n reports `ECONNREFUSED ::1:5620` or `::1:5621`, it resolved `localhost` to IPv6. Use `127.0.0.1` for local server-to-server calls, or launch n8n through Batshit's launcher so it receives the correct callback base.
 
-## Mac app n8n sheet shows a secure-cookie warning
+The official templates prefer `batshit_frontend_url` from the call payload, then `BATSHIT_FRONTEND_URL`, then their platform-specific fallback. If a request succeeds against the wrong Batshit instance, check those values before changing credentials.
 
-Local n8n may reject secure cookies inside the Mac app's embedded browser and warn about an insecure local URL. Open n8n in a normal browser from the sheet instead — Batshit can still call the webhook from the Mac app, and the browser window can run test-mode executions.
+## Provider node fails
 
-For a local-only n8n you own, setting `N8N_SECURE_COOKIE=false` can also remove that warning. Don't use that setting for a public or HTTPS n8n instance.
+Provider credentials for n8n workflows live in n8n:
 
-## Webhook URL doesn't work in Batshit
-
-Use the n8n Production URL, not the Test URL, for active Batshit agents. Check that:
-
-- the workflow is active
-- the Webhook node has the expected path
-- the Batshit agent type is `n8n`
-- the Webhook URL is pasted into the Batshit agent's Webhook URL field
-- if the Docker n8n profile publishes on a custom host port, the browser-facing webhook URL uses that host port
-
-For the optional Docker n8n profile, Batshit may show browser-facing webhook URLs using `N8N_WEBHOOK_URL`, `WEBHOOK_URL`, or `N8N_EDITOR_BASE_URL`, while server-side calls use `http://n8n:5678`. That split is expected.
-
-## n8n Primary Agent responds but tools don't render
-
-Common causes:
-
-- The workflow isn't using the current native Primary template.
-- The workflow is missing the Batshit Tools HTTP Request Tool.
-- The Batshit Tools node is missing `x-batshit-native-tool-token`.
-- The Native Tools URL is wrong for the caller.
-- The tool action name is wrong.
-- `fetch_zip` is being attempted from a subagent run or a non-`n8n` Primary Agent context.
-
-Current n8n Primary templates use n8n's native AI Agent node. Batshit hydrates execution details after the run when the live stream doesn't include every intermediate-step detail.
-
-## n8n Primary Agent can't call a Subagent
-
-An `n8n` Primary Agent can only call an assigned in-workflow Subnode Subagent that you explicitly wired into the Primary workflow. It cannot use the standalone n8n Workflow Subagent webhook. If no matching subnode subagent is assigned and wired, the Primary Agent should answer that it has no subagents to call.
-
-Assigned Subnode Subagents execute through n8n's native AI Agent Tool node. The default Primary template intentionally doesn't ship with a connected Subnode Subagent tool, because connected tools are visible to the model.
-
-For the add-on snippet, the example assigned subnode subagent slug is `n8n_subnode_subagent` unless you intentionally edited the workflow and every matching expression. The slug in n8n must match the current exact Batshit subagent slug. Batshit won't silently rewrite duplicate slugs; if one is already taken, choose another or delete/rename the original.
-
-## Provider node fails in n8n
-
-Provider credentials for n8n workflows live in n8n. Fix checklist:
-
-- Open the failing model/provider node in n8n.
-- Select a valid n8n credential.
-- Test that credential in n8n if the node supports it.
+- Open the failing model node.
+- Select or create a valid n8n credential.
 - Confirm the model ID exists for that provider.
-- Confirm the workflow's Model Selector routes to a node with credentials.
 - Run the workflow directly in n8n with a small input.
 
-Saving a provider key in Batshit doesn't automatically create an n8n credential.
+Saving a provider key in Batshit does not create an n8n credential.
 
-## n8n Workflow Subagent isn't called
+## Model parameters show n8n compatibility warnings
 
-Check the pairing: `n8n` Primary Agents use n8n Subnode Subagents inside the Primary workflow, while `API` and `CLI` Primary Agents use n8n Workflow Subagents.
+Batshit keeps a local snapshot of the parameters exposed by your n8n chat-model nodes. It refreshes that snapshot when you create or edit an n8n Workflow Subagent, and when you open that Subagent's model card after the snapshot has been stale for about a day.
 
-If the parent is `API` or `CLI`:
+If refresh fails:
 
-1. Create a Subagent with type `n8n Workflow Subagent`.
-2. Paste the Production webhook URL.
-3. Assign that Subagent to the Primary Agent.
-4. Give the Subagent a clear description so the Primary Agent knows when to call it.
-5. Send a prompt that explicitly asks for that specialty.
+- Confirm the n8n API URL is reachable from Batshit.
+- Replace an expired n8n API key.
+- Check the visible error on the model card.
+- Use the model card's manual n8n refresh button after fixing the connection.
 
-If the parent is `n8n`, use the subnode/tool-node pattern inside the Primary workflow instead of a separate workflow subagent.
+Compatibility marks appear only when at least one n8n Workflow Subagent exists and a local n8n matrix snapshot is available.
 
-## n8n Subagent has no tools
+## Workflow Subagent has no tools
 
-Check the `Batshit Subagent Tools` node:
+Subagents use their own Tool Grid. They do not inherit every tool from the parent Primary Agent.
 
-- The Native Tools URL matches the caller.
-- `x-batshit-native-tool-token` forwards the scoped token from the webhook payload.
-- `x-batshit-user-id` is present.
-- `actor_type` is `subagent` in the request body context.
-- `parent_agent_id` is present when needed.
+Check:
 
-Subagents have their own tool scope. They don't automatically inherit every Tool Grid choice from the Primary Agent.
+- The Subagent's Tool Grid enables the needed family.
+- The relevant MCP gateway or saved CLI Tool is healthy.
+- `Batshit Subagent Tools` is connected to the n8n agent node.
+- The request preserves the scoped native-tool token and parent context.
+- The Subagent is not trying to fetch a prior Batshit Zip directly; Fetch Zip is Primary-only.
 
-## n8n API key or Instance MCP doesn't work
+## n8n API key or Instance MCP does not work
 
-Batshit's n8n API/MCP settings are optional and separate from basic webhook chat. Use them when you want Batshit to inspect workflows, hydrate Execution Viewer details, stop running n8n executions from Batshit's Stop button, or use n8n's instance-level MCP features.
+Batshit's n8n API/MCP settings are optional and separate from workflow execution. Use them for workflow discovery, model-node compatibility refresh, and n8n Instance MCP features.
 
 Check:
 
 - The n8n API URL is reachable from Batshit.
 - In Docker, host n8n is usually `http://host.docker.internal:5678` from the app container; the optional Docker n8n profile is `http://n8n:5678`.
-- The n8n API key is current.
-- If your n8n instance asks for API-key scopes, include `execution:list`, `execution:read`, `execution:stop`, `workflow:list`, and `workflow:read`.
-- The n8n Instance MCP token is current if using that feature.
+- The n8n API key is current and has workflow/node-type read access.
+- The n8n Instance MCP token is current if you use that feature.
 
-Webhook chat can work even when n8n API/MCP features aren't configured.
+A Workflow Subagent webhook can work even when optional n8n API/MCP features are not configured.
 
-## Batshit Stop button doesn't stop n8n
+## Optional Docker n8n cookie or login confusion
 
-For native `n8n` Primary Agents, Batshit first stops the visible chat stream, then uses the saved n8n API key to find the matching running execution and ask n8n to stop it.
+n8n cookies can collide if two n8n instances are opened as `localhost` in the same browser. Stop one instance, change one host-published port, open one as `127.0.0.1`, or use a separate browser profile.
 
-If Batshit says n8n denied the stop request, the saved n8n API key can read executions but can't stop them — create or replace the key with `execution:stop` permission, then save it again in Batshit Settings → API Keys. If Batshit says no matching running execution was found, the workflow may have already finished, the saved webhook URL may not match the active workflow path, or execution data may not be available yet.
+## Backups did not restore n8n workflows
 
-## Optional Docker n8n profile cookie/login confusion
+Batshit backups do not include external n8n workflows or credentials. After restoring Batshit:
 
-n8n cookies can collide if two n8n instances are both opened as `localhost` in the same browser. Fix options: stop one instance, use a different host-published port, open one as `127.0.0.1` instead of `localhost`, or use a separate browser profile. This is a browser cookie issue, not a Batshit auth issue.
-
-## Existing host n8n calling Docker Batshit
-
-Use the host-published Batshit app URL:
-
-```text
-http://127.0.0.1:5620
-```
-
-For current official templates, make sure host n8n forwards `batshit_native_tool_token` as `x-batshit-native-tool-token`.
-
-## n8n executions succeed but the Batshit agent record is wrong
-
-Check the Batshit agent settings:
-
-- Agent type is `n8n`.
-- Webhook URL is the current Production URL.
-- Workflow/editor URL points to the current n8n workflow.
-- Agent ID or webhook path values match what the template expects.
-- Assigned subagents match the workflow shape.
-
-If you duplicated an n8n workflow, copy the new Production URL into Batshit. Don't assume the old agent record follows the duplicate.
-
-## Backups didn't restore n8n workflows
-
-Batshit backups don't silently include external n8n workflows or credentials. After restoring Batshit:
-
-1. Restore or re-import your workflows in n8n.
+1. Restore or re-import workflows in n8n.
 2. Recreate n8n credentials if needed.
-3. Confirm workflow URLs.
-4. Update Batshit agent/subagent webhook URLs if they changed.
-5. Re-test the restored workflow from Batshit.
+3. Confirm the Production webhook URLs.
+4. Update Batshit Workflow Subagent records if those URLs changed.
+5. Re-test from an `API` or `CLI` Primary Agent.
 
 Use n8n's own export/backup process for n8n data.
 
@@ -200,5 +135,5 @@ Use n8n's own export/backup process for n8n data.
 - Read imported workflows from untrusted sources before activating them.
 - Keep provider credentials in n8n for n8n workflows.
 - Keep Batshit provider keys in Batshit for `API` agents.
-- Don't expose n8n webhooks publicly without auth/rate-limit thinking.
-- Test each imported workflow with a small prompt before using it for real work.
+- Do not expose n8n webhooks publicly without authentication and rate-limit planning.
+- Test each imported workflow with a small task before using it for real work.

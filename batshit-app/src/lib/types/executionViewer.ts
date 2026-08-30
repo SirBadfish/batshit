@@ -111,7 +111,6 @@ export interface ExecutionSnapshot {
   userMessage?: string
   structuredInput: any
   primarySystemPrompt?: string
-  subagentPrompts?: Record<string, string>
   subagentDescription?: Record<string, string>
   compiledMessages?: Array<{ role: string; content: any }>
   compileMetadata?: Record<string, any>

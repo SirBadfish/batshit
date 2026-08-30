@@ -99,7 +99,7 @@ Deleting `Batshit.app` does not delete your data. To fully reset a local alpha i
 
 ## n8n
 
-Start with an `API` Primary Agent before setting up n8n. Connect n8n when you want `n8n` Primary Agents or workflow tools.
+Start with an `API` Primary Agent. Connect n8n when you want workflow tools or n8n Workflow Subagents.
 
 For a local n8n instance, use:
 
@@ -182,9 +182,9 @@ Batshit expects app `5620`, batshit-server `5600`, streamable MCP helper `5601`,
 
 Check the generated `ENCRYPTION_KEY` in the Mac app runtime config. It must stay stable. If you change it after saving keys, re-enter the keys in Settings → API Keys.
 
-### n8n agent doesn't stream back
+### An n8n Workflow Subagent does not return
 
-Check that the workflow is the current official native template, that the Batshit Tools node sends `x-batshit-native-tool-token` from `batshit_native_tool_token`, and that the Batshit URL is reachable from the n8n process.
+Check that the workflow is the current official Workflow Subagent template, that the Batshit Subagent Tools node sends `x-batshit-native-tool-token` from `batshit_native_tool_token`, and that the Batshit URL is reachable from the n8n process.
 
 ### Goon or media preview fails
 

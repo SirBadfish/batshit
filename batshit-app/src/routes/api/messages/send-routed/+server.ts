@@ -5,7 +5,7 @@ import path from 'node:path'
 import { json } from '@sveltejs/kit'
 import { commitMemoryTurnState } from '$lib/server/services/memory/memoryRecall'
 import { ensureFixedSessionOpenEpisode } from '$lib/server/services/memory/memoryEpisodes'
-import { isFixedSession } from '$lib/utils/fixedSession'
+import { isFixedSession, resolveFixedSessionAgentId } from '$lib/utils/fixedSession'
 import { logger } from '$lib/utils/logger'
 import type { RequestHandler } from './$types'
 import {
@@ -3927,7 +3927,6 @@ async function handleBatshitAgentStream({
       userMessage: content,
       structuredInput: formattedInput.structuredInput,
       primarySystemPrompt: formattedInput.primarySystemPrompt,
-      subagentPrompts: formattedInput.subagentPrompts,
       subagentDescription: formattedInput.subagentDescription,
       compiledMessages,
       compileMetadata,
@@ -7501,6 +7500,24 @@ export const POST: RequestHandler = async ({
       return json(
         { error: 'Session not found or unauthorized' },
         { status: 404 },
+      )
+    }
+    const fixedSessionAgentId = resolveFixedSessionAgentId(session)
+    if (fixedSessionAgentId && fixedSessionAgentId !== agentId) {
+      const fixedAgentExists = agents.some((candidate) => candidate.id === fixedSessionAgentId)
+      return json(
+        {
+          error: fixedAgentExists
+            ? 'This Infinite Session belongs to a different agent.'
+            : 'This Infinite Session\'s saved agent no longer exists.',
+          code: fixedAgentExists
+            ? 'FIXED_SESSION_AGENT_MISMATCH'
+            : 'FIXED_SESSION_AGENT_MISSING',
+          details: fixedAgentExists
+            ? `Switch back to agent ${fixedSessionAgentId} before continuing this Infinite Session.`
+            : 'Delete this Infinite Session or restore its saved agent before continuing. Batshit will not silently attach a different agent.'
+        },
+        { status: 409 }
       )
     }
     if (typeof content === 'string') {

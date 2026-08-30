@@ -21,7 +21,7 @@ Whichever path you choose, a few cooperating services run locally for you:
 - **The Batshit app** — the web UI plus the server routes behind it. This is what your browser talks to.
 - **batshit-server** — the helper service for file operations, uploads, and MCP tool plumbing. It's a separate process from the app on purpose (more on why below).
 - **An internal Redis** — where your data lives: chats, agents, prompts, sessions, settings, and the records that tie everything together.
-- **n8n** — optional, and only in play when you use n8n Primary Agents or workflow tools. You can connect an existing n8n instance or run one alongside Batshit.
+- **n8n** — optional, and only in play when you use workflow tools or n8n Workflow Subagents. You can connect an existing n8n instance or run one alongside Batshit.
 
 In the Mac app these run as host processes the app supervises. In Docker they run as Compose services that find each other by service name on a private network. That second detail is why "localhost" is slippery in Docker: inside a container, `localhost` means *that container*, not your computer, so different callers — your browser, the app container, batshit-server, n8n, a sidecar, a host service — each need the URL that's correct *from where they're calling*. The full caller-by-caller table lives in [Ports and URLs](../reference/ports-and-urls.md); the takeaway here is just that the boundary between "your machine" and "a container" is a real line that URLs have to respect.
 

@@ -6,9 +6,7 @@ import { env } from '$env/dynamic/private'
  *
  * Single source of truth shared by native tool dispatch (nativeTools.ts), the
  * server-side prompt compiler (databaseRedis.server.ts), and the user-settings
- * route, which exposes it to the browser so the client-side compiler
- * (databaseRedis.client.ts) emits DCM lines that match where commands actually
- * run.
+ * route, which exposes the current runtime default to Settings.
  *
  * Containerized installs always sandbox via Docker; native installs default to
  * Apple Container on macOS and Docker Sandbox elsewhere.

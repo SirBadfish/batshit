@@ -2,9 +2,9 @@
  * Compile contract suite for `buildFormattedChatInput` (was the DL-5 twins parity
  * harness, Gauntlet G-0001).
  *
- * SA-106 P2: the client compile twin is retired and `databaseRedis.server.ts` is now the
- * ONE compile path, so this suite no longer diffs two lanes. Every scenario that used to
- * assert "the twins agree" is re-pinned as a direct contract on the surviving
+ * SA-106 P2: the client compiler is retired and `databaseRedis.server.ts` is now the
+ * ONE compile path, so this suite no longer diffs two implementations. Every scenario
+ * that used to assert parity is re-pinned as a direct contract on the surviving
  * implementation — the harness, the fixtures, and the guarded behaviours are unchanged;
  * only the second lane is gone.
  *
@@ -251,7 +251,6 @@ function freshState(sessionId: string): FixtureState {
     kv: new Map<string, any>([
       ['batshit:batshit_mode3_system_prompt', 'API PRIMARY PROMPT BODY'],
       ['batshit:batshit_mode4_system_prompt', 'CLI PRIMARY PROMPT BODY'],
-      ['batshit:n8n_mode2_system_prompt', 'N8N PRIMARY PROMPT BODY'],
       ['batshit:sub_system_prompt', 'SUBAGENT BASE PROMPT BODY']
     ]),
     sets: new Map<string, Set<string>>(),
@@ -560,11 +559,11 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    // Observed behavior pinned as-is (identical in both twins): in the default
+    // Observed behavior pinned as-is in the canonical compiler: in the default
     // appended view mode the compact ref stays inline and the manual-unzip state
     // surfaces through the DCM zip-state line. Whether the unzipped BODY should
     // also reach the model here is a zip-system question for the approved zip
-    // cluster (G-0057+), not a twins-parity question.
+    // cluster (G-0057+), not a compiler-contract question.
     const history = JSON.stringify(server.structuredInput.messages)
     expect(history).toContain('{{batshit-zip:zip-001:::2 lines of terminal output}}')
     expect(history).toContain('2 lines of terminal output | zip-001 | user-locked')
@@ -750,7 +749,7 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     ).rejects.toThrow(/USER_SETTINGS_UNAVAILABLE/)
   })
 
-  it('S10: subagent roster compiles to the same slugs; server may append managed dynamic info only', async () => {
+  it('S10: the primary compile keeps the subagent roster but no longer emits the Category 1 prompt map', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
@@ -778,21 +777,14 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
       options: { runtimeFlavor: 'vercel' }
     })
 
-    // The slug contract this scenario guards (subagentSlug.ts): display names and
-    // explicit slugs both normalize, and every assigned subagent gets exactly one entry.
-    expect(Object.keys(server.subagentPrompts ?? {})).toEqual(
-      expect.arrayContaining(['api_helper', 'display_only_slug'])
-    )
-    expect(Object.keys(server.subagentPrompts ?? {}).length).toBe(
-      assignedSubagents.length
-    )
-    expect(server.subagentDescription).toBeTruthy()
-
-    // Each compiled subagent prompt starts from the shared base+custom compilation
-    // before the server appends its managed dynamic-info appendix.
-    for (const prompt of Object.values(server.subagentPrompts ?? {})) {
-      expect(String(prompt).length).toBeGreaterThan(0)
-    }
+    // The DCM roster remains the primary agent's routing surface. The old
+    // `subagentPrompts` map existed only for the retired Category 1 webhook payload;
+    // workflow-subagent and CLI slug contracts are pinned in their runner suites.
+    expect(server.subagentDescription).toMatchObject({
+      api_helper: 'API slice coverage',
+      display_only_slug: 'Display-name slug edge'
+    })
+    expect(server.subagentPrompts).toBeUndefined()
   })
 
   it('S11: voice-state DCM lines', async () => {
@@ -991,7 +983,7 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
       expect(server.primarySystemPrompt).not.toContain(MEMORY_BLOCK_HEADER)
     }
 
-    // Memory-enabled API agent: block present in both lanes, API tool names only (DL-4).
+    // Memory-enabled API agent: block present with API tool names only (DL-4).
     {
       const sessionId = nextSessionId()
       state.current = freshState(sessionId)
@@ -1010,8 +1002,6 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
         expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_search\b/)
       }
     }
-
-    // Memory-enabled n8n agent: block present with the n8n broker action names.
   })
 
   it('S18 SA-104 P4: recall-engine context (on-my-mind, DCM inserts, time awareness)', async () => {
@@ -1196,7 +1186,7 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
 
     const seedFixedSessionFixtures = (agentId: string, sessionId: string) => {
       // The session record carries the Infinite Session block + graduation bookmark; the
-      // engine reads it from kv, the twins via getSession — keep both in sync.
+      // engine reads it from kv, while the compiler uses getSession — keep both in sync.
       const sessionRecord = {
         id: sessionId,
         user_id: USER_ID,

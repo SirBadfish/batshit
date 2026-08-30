@@ -1,15 +1,15 @@
 # Connect n8n
 
-Batshit is built around n8n. You can use n8n as the runtime for a Primary Agent, or as a workflow/tool system that `API` and `CLI` agents call.
+Batshit is built to work with n8n as an automation and tool platform. `API` and `CLI` Primary Agents can call n8n workflows as ordinary tools or as specialist n8n Workflow Subagents.
 
-## The two main n8n uses
+## The two n8n uses
 
-| Use | What it means | Batshit agent type |
+| Use | What it means | Batshit setup |
 | --- | --- | --- |
-| n8n Primary Agent | The main chat agent runs inside a Batshit n8n workflow. | `n8n` |
-| n8n workflow as tool or subagent | A direct Batshit agent calls an n8n workflow. | `API` or `CLI` |
+| n8n workflow tool | A Primary Agent calls a published workflow for a focused action. | Add the workflow through Batshit's n8n/MCP tooling and enable it for the agent. |
+| n8n Workflow Subagent | A Primary Agent delegates a task to a separate workflow that has its own model, prompt, and tools. | Create an `n8n Workflow Subagent`, paste its production webhook URL, and assign it to an `API` or `CLI` Primary Agent. |
 
-Batshit has three Primary Agent types: `n8n`, `API`, and `CLI`. For subagents, `n8n Subnode Subagents` attach inside an n8n Primary Agent workflow, while `n8n Workflow Subagents` are separate workflows used by `API` and `CLI` Primary Agents.
+n8n is not a Primary Agent type. Batshit Primary Agents are `API` and `CLI`.
 
 ## Choose existing or the optional Docker n8n profile
 
@@ -21,18 +21,7 @@ Batshit has three Primary Agent types: `n8n`, `API`, and `CLI`. For subagents, `
 
 The Docker n8n profile is opt-in. Existing self-hosted n8n is first-class.
 
-## Required n8n pieces
-
-An n8n Primary Agent needs:
-
-- An imported Batshit Primary Agent workflow template.
-- The official Batshit Tools node, which forwards Batshit's per-message native-tool token as `x-batshit-native-tool-token`.
-- Provider credentials in n8n.
-- A model/provider node configuration in n8n.
-- A production webhook URL pasted into the matching Batshit agent.
-- The workflow activated in n8n.
-
-The default Primary Agent response stream uses n8n's native Webhook streaming response.
+## Official Workflow Subagent templates
 
 The official template source lives at:
 
@@ -40,44 +29,39 @@ The official template source lives at:
 docs/user-docs/user-templates/batshit-official-n8n-workflow-templates/
 ```
 
-Main template files:
+The supported templates are:
 
-- `batshit-n8n-primary-agent.json`
 - `batshit-n8n-workflow-subagent.json`
-- `batshit-n8n-subnode-subagent-addon.json`
-- `batshit-docker-n8n-primary-agent.json`
 - `batshit-docker-n8n-workflow-subagent.json`
-- `batshit-docker-n8n-subnode-subagent-addon.json`
 
-## Optional Docker n8n profile
+Use the first template for a host/local n8n instance. Use the Docker version when n8n runs in Batshit's optional Docker profile.
 
-If you start Docker Batshit with:
+## What an n8n Workflow Subagent needs
 
-```sh
-./start-docker.sh --profile n8n
-```
+- The matching official Workflow Subagent template imported into n8n.
+- Provider credentials and a model node configured in n8n.
+- A production webhook URL pasted into the Batshit Subagent.
+- The workflow activated in n8n.
+- The official Batshit Subagent Tools HTTP Request Tool node if the workflow needs Batshit tools.
+- A parent `API` or `CLI` Primary Agent assignment.
 
-the n8n profile starts an official pinned n8n image by default. You still need to open n8n, create credentials, import templates, configure provider nodes, and activate workflows.
+## Native tool authentication
 
-## Existing self-hosted n8n
-
-For existing self-hosted n8n, import the official templates, then configure credentials, provider nodes, and webhook URLs for that n8n instance.
-
-## Native tool auth
-
-Current official n8n agent templates don't need a saved Header Auth credential for Batshit Tools. Batshit sends each n8n chat request a short-lived, per-message native-tool token, and the workflow forwards it with this dynamic header:
+Current official Workflow Subagent templates do not need a saved Batshit Header Auth credential. Batshit sends a short-lived, per-message native-tool token in the webhook payload, and the workflow forwards it with this dynamic header:
 
 | Header name | Header value expression |
 | --- | --- |
 | `x-batshit-native-tool-token` | `{{$json.body.batshit_native_tool_token}}` |
 
+The workflow also forwards the parent agent ID, Subagent ID, session ID, message ID, and the caller's Primary Agent type. Those fields keep tool permissions scoped to the exact parent/Subagent call.
+
 ## Create provider credentials in n8n
 
-Provider credentials for n8n workflows belong in n8n — for example an OpenAI, Anthropic, OpenRouter, or Vercel AI Gateway credential. Batshit Settings → API Keys does not copy provider keys into n8n.
+Provider credentials for n8n workflows belong in n8n—for example an OpenAI, Anthropic, OpenRouter, or Vercel AI Gateway credential. Batshit Settings → API Keys does not copy provider keys into n8n.
 
 ## Configure Redis memory if the template uses it
 
-The official template can use Redis-backed memory. Use a Redis host the n8n process can reach:
+Use a Redis host the n8n process can reach:
 
 | n8n location | Redis host guidance |
 | --- | --- |
@@ -86,38 +70,37 @@ The official template can use Redis-backed memory. Use a Redis host the n8n proc
 | Optional Docker n8n profile | `redis`, port `6379` |
 | Existing host n8n connected to Docker Batshit | A Redis reachable from that host n8n, or adjust the workflow memory path intentionally |
 
-Docker Batshit's Redis is internal-only by default. Don't assume an external host n8n can reach the Docker `redis` service unless you deliberately expose or route it.
+Docker Batshit's Redis is internal-only by default. Do not assume an external host n8n can reach the Docker `redis` service unless you deliberately expose or route it.
 
-## Import the Primary Agent template
+## Import the Workflow Subagent template
 
 In n8n:
 
 1. Open Workflows.
 2. Import from file.
-3. Choose `batshit-n8n-primary-agent.json`.
-4. Configure missing credentials.
-5. Confirm each Batshit Tools HTTP Request Tool URL matches the n8n caller. The official templates prefer the Batshit URL sent in the webhook payload, then `BATSHIT_FRONTEND_URL` from the n8n environment, then `http://127.0.0.1:5620` for Mac app local server-to-server calls. Source-checkout dev should receive or set `http://127.0.0.1:5621` through the launcher/env path.
-6. Configure provider/model nodes.
-7. Save.
-8. Activate the workflow.
-9. Copy the Production webhook URL.
+3. Choose `batshit-n8n-workflow-subagent.json`, or the Docker version for the optional Docker n8n profile.
+4. Configure missing provider and Redis credentials.
+5. Confirm the Batshit Subagent Tools URL matches the caller. The template prefers the Batshit URL sent in the webhook payload, then `BATSHIT_FRONTEND_URL` from the n8n environment, then `http://127.0.0.1:5620`.
+6. Configure the model node.
+7. Save and activate the workflow.
+8. Copy the Production webhook URL.
 
 Use the production webhook URL, not a temporary test URL.
 
 ## URL rules
 
-Most n8n headaches are URL problems. Use the URL from the point of view of the service making the request.
+Use the URL from the point of view of the service making the request.
 
 ### Mac app Batshit and local n8n
 
 | Purpose | URL |
 | --- | --- |
-| Batshit app browser companion | `http://127.0.0.1:5620` |
+| Batshit app | `http://127.0.0.1:5620` |
 | n8n browser/editor | `http://localhost:5678` |
-| Batshit native tool dispatch from n8n | `http://127.0.0.1:5620/api/native-tools/dispatch` |
+| n8n calls Batshit native tool dispatch | `http://127.0.0.1:5620/api/native-tools/dispatch` |
 | batshit-server | `http://localhost:5600` |
 
-Prefer `127.0.0.1` for Mac app Batshit URLs, including the browser companion window and local n8n server-to-server calls. This avoids collisions with source-checkout/development runtimes, and cases where Node/n8n resolves `localhost` to IPv6 `::1` while the packaged Mac app listens on IPv4 loopback.
+Prefer `127.0.0.1` for Mac app server-to-server calls. This avoids cases where Node/n8n resolves `localhost` to IPv6 while the packaged app listens on IPv4 loopback.
 
 ### Source-checkout Batshit and local n8n
 
@@ -127,7 +110,7 @@ Prefer `127.0.0.1` for Mac app Batshit URLs, including the browser companion win
 | Browser opens n8n | `http://localhost:5678` |
 | Host n8n calls source-checkout Batshit | `http://127.0.0.1:5621` |
 
-Source-checkout Batshit binds its Vite dev server to IPv4 loopback by default so local n8n can call `http://127.0.0.1:5621/api/native-tools/dispatch`. The source-checkout default is intentionally offset from the Mac app's `127.0.0.1:5620` user-like lane. If you override `BATSHIT_FRONTEND_HOST` to IPv6 or another host, also set `N8N_BATSHIT_FRONTEND_URL` to a URL n8n can actually reach.
+If you override `BATSHIT_FRONTEND_HOST`, also set `N8N_BATSHIT_FRONTEND_URL` to a URL n8n can actually reach.
 
 ### Optional Docker n8n profile
 
@@ -139,7 +122,7 @@ Source-checkout Batshit binds its Vite dev server to IPv4 loopback by default so
 | n8n container calls native tool dispatch | `http://app:3000/api/native-tools/dispatch` |
 | App container calls n8n API | `http://n8n:5678` |
 
-Batshit's Docker n8n profile sets `BATSHIT_FRONTEND_URL=http://app:3000`, so the official templates can call the app through the Compose network after import. For the app container to call the n8n profile server-side, `.env.docker` must use `N8N_API_URL=http://n8n:5678`. Keep `N8N_EDITOR_BASE_URL`, `WEBHOOK_URL`, and `N8N_WEBHOOK_URL` browser-facing.
+Batshit's Docker n8n profile sets `BATSHIT_FRONTEND_URL=http://app:3000`. Keep `N8N_EDITOR_BASE_URL`, `WEBHOOK_URL`, and `N8N_WEBHOOK_URL` browser-facing.
 
 ### Docker Batshit with existing host n8n
 
@@ -152,59 +135,49 @@ Batshit's Docker n8n profile sets `BATSHIT_FRONTEND_URL=http://app:3000`, so the
 
 If your n8n runs in a separate container stack, use the URL reachable from that container.
 
-## Connect the workflow in Batshit
+## Connect the Workflow Subagent in Batshit
 
 1. Open Settings → Agents.
-2. Create or edit a Primary Agent.
-3. Set the agent type to `n8n`.
-4. Paste the n8n production webhook URL.
-5. Paste the n8n workflow/editor URL if you want the workflow sheet link.
-6. Save.
-7. Select the agent in chat.
-8. Send a simple message.
+2. Create a Subagent.
+3. Choose `n8n Workflow Subagent`.
+4. Paste the production webhook URL.
+5. Choose the model preset that represents the workflow's model node.
+6. Save the Subagent.
+7. Assign it to an `API` or `CLI` Primary Agent.
+8. Ask the Primary Agent to delegate a small test task.
 
-If the workflow runs in n8n but Batshit doesn't show the streamed response, check that the Webhook node Response Mode is `Streaming`, the native AI Agent node has streaming enabled, the agent uses the Production webhook URL, and n8n can reach Batshit at the saved URL.
+Saving an n8n Workflow Subagent refreshes Batshit's local n8n parameter-compatibility snapshot. Opening its model card refreshes a stale snapshot at most once per day, and the model card has a manual refresh button. A sync failure appears on that surface; it does not silently hide the problem.
 
-## n8n Workflow Subagents
+## Use n8n workflows as tools
 
-Use `batshit-n8n-workflow-subagent.json` when an `API` or `CLI` Primary Agent should call an n8n workflow as a subagent. In Batshit, create a Subagent with the `n8n Workflow Subagent` type, paste its webhook URL, and assign it to an `API` or `CLI` Primary Agent.
+Use a workflow tool when the operation has a clear input/output contract and does not need a separate specialist conversation. Publish the workflow through your configured n8n/MCP integration, enable it in the Primary Agent's Tool Grid, and use Batshit Tool Search/Use to discover it on demand.
 
-Don't use an n8n Primary Agent workflow as an n8n Workflow Subagent — Primary workflows and tool/subagent workflows have different contracts.
+Use an n8n Workflow Subagent when the workflow should have its own system prompt, model, memory, or collection of tools.
 
 ## Optional n8n API key in Batshit
 
-Batshit can store an n8n API key in Settings → API Keys for Batshit-side n8n API integrations: workflow discovery, Execution Viewer hydration, and stopping a running n8n execution when you press Stop in chat. This is optional for basic webhook chat.
-
-For the full native `n8n` Primary experience, create an n8n API key with these scopes when your instance offers scoped keys:
-
-- `execution:list`
-- `execution:read`
-- `execution:stop`
-- `workflow:list`
-- `workflow:read`
-
-Without `execution:stop`, Batshit can stop the visible response stream, but n8n may keep running the workflow until it finishes naturally. Provider credentials still stay in n8n.
+Batshit can store an n8n API key in Settings → API Keys for workflow discovery, model-node compatibility refresh, and other Batshit-side n8n API integrations. This key is separate from provider credentials stored inside n8n.
 
 ## Troubleshooting
 
-### Workflow doesn't appear in Batshit
+### Workflow Subagent does not answer
 
-Check that the workflow is active, you pasted the production webhook URL, the Batshit agent type is `n8n`, and the workflow was imported from the native official Primary template.
+Check that the workflow is active, the Batshit Subagent uses the Production webhook URL, the workflow was imported from the current Workflow Subagent template, and its provider/model credentials work.
 
-### n8n returns auth errors to Batshit
+### Batshit Subagent Tools returns an authentication error
 
-Check that the workflow was imported from the current official template, the Batshit Tools node sends `x-batshit-native-tool-token`, and the header value reads `batshit_native_tool_token` from the webhook payload.
+Check that the node sends `x-batshit-native-tool-token`, the value reads `batshit_native_tool_token` from the webhook payload, and the template still forwards `parent_agent_id`.
 
-### Docker URL works in browser but fails in workflow
+### Docker URL works in a browser but fails in the workflow
 
-Check who's calling: browsers use `localhost`, Docker containers use service names like `app`, `batshit-server`, and `n8n`, and the Docker app calling host services uses `host.docker.internal`.
+Check who is calling: browsers use `localhost`, Docker containers use service names like `app`, `batshit-server`, and `n8n`, and the Docker app calling host services uses `host.docker.internal`.
 
-### Provider credential missing
+### Provider credential is missing
 
-Create the provider credential in n8n. Batshit API Keys don't appear inside n8n automatically.
+Create the provider credential in n8n. Batshit API Keys do not appear inside n8n automatically.
 
 ### Imported workflow has stale credential IDs
 
 Use the sanitized Batshit templates when possible. Raw exports from another n8n instance can carry source credential IDs, owner metadata, and old local URLs.
 
-Next: [Backup and restore](../admin/backup-and-restore.md)
+Next: [n8n workflow templates](../resources/n8n-workflow-templates.md)

@@ -142,7 +142,7 @@ If the optional Docker n8n profile must run beside another n8n on the same machi
 
 ## n8n callback rules
 
-n8n Primary Agents return to Batshit through n8n's streaming webhook response. In practice, native n8n workflows may buffer until the workflow response is ready, then Batshit replays the returned chunks and hydrates tool details from the completed execution. This is normal for the launch `n8n` path; Batshit does not promise provider-token time-to-first-token streaming for n8n Primary Agents. Callback/tool URLs must use a URL reachable from the n8n process. Current official Native Tools calls authenticate with Batshit's short-lived `x-batshit-native-tool-token` payload header, not a static `BATSHIT_TOKEN` credential.
+n8n Workflow Subagent callbacks and tool calls must use a Batshit URL reachable from the n8n process. Current official Batshit Subagent Tools calls authenticate with Batshit's short-lived `x-batshit-native-tool-token` payload header, not a static `BATSHIT_TOKEN` credential.
 
 | n8n process | Callback base |
 | --- | --- |

@@ -827,7 +827,6 @@
   let openWebhookInput = $state(false)
   let openPrimaryPrompt = $state(false)
   let openMemoryContext = $state(false)
-  let openSubagentPrompts = $state(false)
   let openCompiledMessages = $state(false)
   let openResponse = $state(false)
   let openRawEvents = $state(false)
@@ -1550,30 +1549,6 @@
             </Collapsible.Content>
           </Collapsible.Root>
 
-          <Collapsible.Root bind:open={openSubagentPrompts} disabled={!currentSnapshot.subagentPrompts || Object.keys(currentSnapshot.subagentPrompts).length === 0}>
-            <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
-              <div class="execution-viewer-section-label">
-                <span class="execution-viewer-section-heading">SA System Prompts</span>
-                <span class="execution-viewer-helper">Compiled prompts per Subagent</span>
-              </div>
-              <ChevronDown class="execution-viewer-section-chevron" data-open={openSubagentPrompts} />
-            </Collapsible.Trigger>
-            <Collapsible.Content class="execution-viewer-section-content">
-              {#if currentSnapshot.subagentPrompts && Object.keys(currentSnapshot.subagentPrompts).length > 0}
-                <div class="execution-viewer-panel execution-viewer-stack-md">
-                  {#each Object.entries(currentSnapshot.subagentPrompts) as [key, prompt]}
-                    <div class="execution-viewer-stack-xs">
-                      <div class="execution-viewer-eyebrow">{key}</div>
-                      <pre class="execution-viewer-pre execution-viewer-pre-short">
-{displayViewerText(typeof prompt === 'string' ? prompt : String(prompt ?? ''))}
-                      </pre>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-            </Collapsible.Content>
-          </Collapsible.Root>
-
           <Collapsible.Root bind:open={openCompiledMessages} disabled={!currentSnapshot.compiledMessages || currentSnapshot.compiledMessages.length === 0}>
             <Collapsible.Trigger class="execution-viewer-section-trigger execution-viewer-section-trigger-disabled">
               <div class="execution-viewer-section-label">
@@ -2139,12 +2114,6 @@
     white-space: pre-wrap;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     line-height: 1.6;
-  }
-
-  .execution-viewer-pre-short {
-    max-height: 14rem;
-    border: 0;
-    background: oklch(from var(--muted) l c h / 0.2);
   }
 
   .execution-viewer-pre-tall {

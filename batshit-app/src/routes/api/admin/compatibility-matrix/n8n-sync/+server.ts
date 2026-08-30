@@ -1,9 +1,12 @@
 import { error, json } from '@sveltejs/kit'
 import { apiError } from '$lib/server/services/apiResponses'
 import type { RequestHandler } from './$types'
-import { runN8nCompatibilitySync } from '$lib/server/services/n8nParameterCompatibility'
+import {
+  runTrackedN8nCompatibilitySync,
+  type N8nCompatibilitySyncTrigger
+} from '$lib/server/services/n8nParameterCompatibility'
 
-export const POST: RequestHandler = async ({ locals }) => {
+export const POST: RequestHandler = async ({ locals, request }) => {
   if (!locals.user) {
     return apiError('Unauthorized', 401)
   }
@@ -12,7 +15,14 @@ export const POST: RequestHandler = async ({ locals }) => {
   }
 
   try {
-    const snapshot = await runN8nCompatibilitySync({ userId: locals.user.id })
+    const body = await request.json().catch(() => ({}))
+    const requestedTrigger = typeof body?.trigger === 'string' ? body.trigger : ''
+    const trigger: N8nCompatibilitySyncTrigger =
+      requestedTrigger === 'model-card-open' ? 'model-card-open' : 'model-card-manual'
+    const snapshot = await runTrackedN8nCompatibilitySync({
+      userId: locals.user.id,
+      trigger
+    })
     return json({
       snapshot,
       entries: snapshot.entries.length

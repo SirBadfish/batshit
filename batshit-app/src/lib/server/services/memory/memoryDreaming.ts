@@ -199,7 +199,8 @@ function randomIdSuffix(): string {
  * At most one dream per idle period per agent: memory enabled, a last interaction
  * exists, the agent has been idle past its idle gap, and no run has started since
  * that interaction. `memory_last_interaction_ts` is stamped at every accepted send —
- * including native n8n via the turn-commit route — so "idle" is lane-complete.
+ * Every live Primary Agent send passes through send-routed's accepted-send commit
+ * boundary, so "idle" is lane-complete.
  */
 export function shouldRunScheduledDream(
   agent: AgentRecord | null | undefined,

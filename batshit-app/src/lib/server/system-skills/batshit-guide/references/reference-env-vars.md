@@ -160,7 +160,7 @@ When `DOCKER_MCP_GATEWAY_PORT` or `DOCKER_MCP_GATEWAY_URL` is set in `.env.docke
 | Variable | Default example | Purpose |
 | --- | --- | --- |
 | `N8N_API_URL` | native: `http://localhost:5678`; Docker host-managed: `http://host.docker.internal:5678`; optional Docker n8n profile: `http://n8n:5678` | n8n API URL Batshit should call server-side. |
-| `N8N_API_KEY` | blank | Optional n8n API key for Batshit-side n8n API/MCP integrations. For native `n8n` Primary hydration and Stop-button cancellation, scoped keys need execution list/read/stop plus workflow list/read. This is not Docker MCP Gateway auth. |
+| `N8N_API_KEY` | blank | Optional n8n API key for Batshit-side workflow discovery, node-parameter compatibility refresh, and n8n API/MCP integrations. This is not Docker MCP Gateway auth. |
 | `N8N_UI_EMAIL` | blank | Optional n8n UI login for parameter discovery/automation where supported. |
 | `N8N_UI_PASSWORD` | blank | Optional n8n UI login password. |
 | `BATSHIT_N8N_CALLBACK_BASE_URL` | Docker default `http://app:3000` | Callback base optional Docker n8n profile can use to reach Batshit. |

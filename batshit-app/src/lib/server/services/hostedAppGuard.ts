@@ -6,8 +6,7 @@ const PUBLIC_REGISTRY_PATHS = new Set([
 ])
 
 const PROTECTED_CRON_PATHS = new Set([
-  '/api/admin/cron/model-catalog',
-  '/api/admin/cron/compatibility-matrix'
+  '/api/admin/cron/model-catalog'
 ])
 
 function isTruthy(value: string | undefined): boolean {

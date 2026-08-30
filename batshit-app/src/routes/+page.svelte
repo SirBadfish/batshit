@@ -6,7 +6,6 @@
   import TokenPanel from '$lib/components/tokens/TokenPanel.svelte'
   import CompactArtifactShelf from '$lib/components/artifacts/CompactArtifactShelf.svelte'
   import ProjectsSidebar from '$lib/components/projects/ProjectsSidebar.svelte'
-  import N8nSheet from '$lib/components/n8n/N8nSheet.svelte'
   import ArtifactsSidebar from '$lib/components/artifacts/ArtifactsSidebar.svelte'
   import IconColumn from '$lib/components/artifacts/IconColumn.svelte'
   import GoonDock from '$lib/components/goons/GoonDock.svelte'
@@ -441,8 +440,6 @@
 	  let connectingSseSessionIds = $state<string[]>([])
 	  let eventSessionContext: string | null = null
 	  let lastConversationLoadToastAt = 0
-	  let n8nSheetOpen = $state(false)
-  let testMode = $state(false)
   let voiceMode = $state(false)
   let activeComposerClipIds = $state<string[]>([])
   let activeComposerClipScopeId = $state<string | null>(null)
@@ -3796,7 +3793,7 @@ const immersiveActive = $derived.by(
               : (existingSummary?.source ?? 'vercel')
           const nextApprovals = [
             ...existingApprovals,
-            {
+	      {
               approvalId: details.approvalId,
               status: 'pending',
               submitted: false,
@@ -4621,6 +4618,7 @@ const immersiveActive = $derived.by(
       // type comes through here too and is rejected loudly by send-routed's
       // retirement guard — the browser no longer owns a second send path.
       {
+	        const liveAgentType: 'api' | 'cli' = agentType === 'cli' ? 'cli' : 'api'
         const groupChatSendId = getGroupChatIdForSession(currentSessionId)
         managedAssistantMessageId = groupChatSendId
           ? null
@@ -4640,7 +4638,7 @@ const immersiveActive = $derived.by(
 	        const abortController = new AbortController();
 	        chatRunRegistry.startRun({
 	          sessionId: currentSessionId,
-	          transport: agentType,
+	          transport: liveAgentType,
 	          activeMessageId: managedAssistantMessageId,
 	          abortController
 	        })
@@ -6906,9 +6904,7 @@ const immersiveActive = $derived.by(
           <ChatInput
             bind:this={chatInputRef}
             onSend={handleSendMessage}
-            bind:testMode
             bind:voiceMode
-            onOpenN8nSheet={() => n8nSheetOpen = true}
             sessionId={currentSessionId}
             goonsPanelOpen={goonPresentationVisible}
             goonPresentationMode={goonDcmPresentationMode}
@@ -7117,13 +7113,6 @@ const immersiveActive = $derived.by(
 
 <!-- Header Overlay for header/trigger widgets -->
 <HeaderOverlay bind:open={headerOverlayOpen} bind:artifact={headerOverlayArtifact} />
-
-<!-- n8n Sheet (outside main flex container) -->
-<N8nSheet
-  bind:open={n8nSheetOpen}
-  {testMode}
-  onSendMessage={handleSendMessage}
-/>
 
 <style>
   .chat-workspace,

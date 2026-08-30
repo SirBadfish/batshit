@@ -64,15 +64,14 @@ For your first successful chat:
 
 `API` is the simplest first chat path — it doesn't require n8n workflow wiring or CLI login.
 
-## Understand the three Primary Agent types
+## Understand the two Primary Agent types
 
 | Agent type | Best first use | Needs |
 | --- | --- | --- |
 | `API` | Direct model-provider chat, tools, voice features, and normal first setup | Provider API key or Local AI runtime |
-| `n8n` | You want the main agent to run inside n8n | n8n workflow, webhook URL, n8n credentials |
 | `CLI` | You want Codex or Claude Code style CLI work inside Batshit | CLI installed and logged in |
 
-You can use all three over time. You don't need all three on day one.
+You can use both over time. You only need one on day one.
 
 ## Create a simple `API` Primary Agent
 
@@ -92,12 +91,11 @@ If the model responds, your core provider path is working.
 
 n8n is one of Batshit's most important parts, but it adds another runtime and credentials surface. Use it when you want:
 
-- Primary Agents powered by n8n workflows
 - n8n workflow tools called by `API` or `CLI` agents
 - n8n-managed provider credentials, workflow logic, or integrations
 - n8n Workflow Subagents
 
-Read [Connect n8n](../primary-agents/connect-n8n.md) before creating n8n Primary Agents.
+Read [Connect n8n](../primary-agents/connect-n8n.md) before creating n8n Workflow Subagents or adding n8n workflow tools.
 
 ## Add CLI agents after install and login work
 
