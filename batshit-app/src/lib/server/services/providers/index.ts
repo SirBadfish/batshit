@@ -506,7 +506,7 @@ export class ProviderManager {
     registerOpenAICompatibleProvider({
       id: 'zai_coding',
       label: 'Z.ai Coding Plan',
-      apiKey: this.apiKeys.zai_coding ?? env.ZAI_CODING_API_KEY ?? env.ZAI_API_KEY,
+      apiKey: this.apiKeys.zai_coding ?? env.ZAI_CODING_API_KEY,
       baseURL: env.ZAI_CODING_API_BASE_URL || 'https://api.z.ai/api/coding/paas/v4',
       priority: 9,
       apiMode: 'chat',
@@ -641,7 +641,8 @@ export class ProviderManager {
       label: 'Together.ai',
       apiKey: this.apiKeys.togetherai ?? env.TOGETHER_API_KEY,
       baseURL: env.TOGETHER_API_BASE_URL || 'https://api.together.xyz/v1',
-      priority: 17
+      priority: 17,
+      apiMode: 'chat'
     })
 
     registerOpenAICompatibleProvider({
@@ -649,7 +650,8 @@ export class ProviderManager {
       label: 'Fireworks AI',
       apiKey: this.apiKeys.fireworks ?? env.FIREWORKS_API_KEY,
       baseURL: env.FIREWORKS_API_BASE_URL || 'https://api.fireworks.ai/inference/v1',
-      priority: 18
+      priority: 18,
+      apiMode: 'chat'
     })
 
     registerOpenAICompatibleProvider({
@@ -657,7 +659,8 @@ export class ProviderManager {
       label: 'Baseten',
       apiKey: this.apiKeys.baseten ?? env.BASETEN_API_KEY,
       baseURL: env.BASETEN_API_BASE_URL || 'https://inference.baseten.co/v1',
-      priority: 19
+      priority: 19,
+      apiMode: 'chat'
     })
 
     registerOpenAICompatibleProvider({
@@ -665,7 +668,17 @@ export class ProviderManager {
       label: 'Cerebras',
       apiKey: this.apiKeys.cerebras ?? env.CEREBRAS_API_KEY,
       baseURL: env.CEREBRAS_API_BASE_URL || 'https://api.cerebras.ai/v1',
-      priority: 20
+      priority: 20,
+      apiMode: 'chat'
+    })
+
+    registerOpenAICompatibleProvider({
+      id: 'cohere',
+      label: 'Cohere',
+      apiKey: this.apiKeys.cohere ?? env.COHERE_API_KEY,
+      baseURL: env.COHERE_API_BASE_URL || 'https://api.cohere.ai/compatibility/v1',
+      priority: 21,
+      apiMode: 'chat'
     })
 
     if (this.customProviders.length) {
@@ -830,6 +843,7 @@ export class ProviderManager {
       'fireworks',
       'baseten',
       'cerebras',
+      'cohere',
       'fal',
       'replicate',
       'ollama',
@@ -1180,9 +1194,6 @@ export async function resolveProviderAccess(userId?: string | null): Promise<Pro
     let envKey = envMap[config.envVar] ?? undefined
     if (!envKey && config.id === 'fal') {
       envKey = envMap.FAL_KEY ?? undefined
-    }
-    if (!envKey && config.id === 'zai_coding') {
-      envKey = envMap.ZAI_API_KEY ?? undefined
     }
     if (!envKey && config.id === 'alibaba') {
       envKey = envMap.DASHSCOPE_API_KEY ?? undefined

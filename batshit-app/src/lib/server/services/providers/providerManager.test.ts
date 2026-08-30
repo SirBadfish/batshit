@@ -1,7 +1,7 @@
 /**
  * Provider Management System Tests
  * Story 5.3 - Test Design Implementation
- * 
+ *
  * Tests based on QA requirements:
  * - Provider registration with various configs
  * - Model selection and routing
@@ -40,8 +40,16 @@ vi.mock('@ai-sdk/anthropic', () => ({
 vi.mock('@ai-sdk/openai', () => ({
   createOpenAI: vi.fn((options?: { baseURL?: string }) => {
     const provider = options?.baseURL?.includes('openrouter') ? 'openrouter' : 'openai'
-    const client = vi.fn((modelId) => ({ modelId, provider }))
-    ;(client as any).chat = vi.fn((modelId) => ({ modelId, provider }))
+    const client = vi.fn((modelId) => ({
+      modelId,
+      provider,
+      mode: 'responses'
+    }))
+    ;(client as any).chat = vi.fn((modelId) => ({
+      modelId,
+      provider,
+      mode: 'chat'
+    }))
     return client
   })
 }))
@@ -71,7 +79,10 @@ vi.mock('@ai-sdk/deepinfra', () => ({
   () => ({
     createOpenRouter: vi.fn(() => {
       const client = vi.fn((modelId) => ({ modelId, provider: 'openrouter' }))
-      ;(client as any).chat = vi.fn((modelId) => ({ modelId, provider: 'openrouter' }))
+      ;(client as any).chat = vi.fn((modelId) => ({
+        modelId,
+        provider: 'openrouter'
+      }))
       return client
     })
   }),
@@ -86,7 +97,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     vi.spyOn(console, 'error').mockImplementation(() => {})
-    
+
     // Create new instance for each test
     providerManager = new ProviderManager()
   })
@@ -126,7 +137,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       // Verify that console logs don't contain actual API keys
       const consoleLogCalls = (console.log as any).mock.calls
       const consoleWarnCalls = (console.warn as any).mock.calls
-      
+
       for (const call of [...consoleLogCalls, ...consoleWarnCalls]) {
         const message = call.join(' ')
         expect(message).not.toContain('sk-ant-placeholder')
@@ -147,7 +158,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       const models = providerManager.listAvailableModels()
       expect(Array.isArray(models)).toBe(true)
       expect(models.length).toBeGreaterThan(0)
-      
+
       // Check model structure
       const firstModel = models[0]
       expect(firstModel).toHaveProperty('id')
@@ -160,12 +171,12 @@ describe('ProviderManager - Story 5.3 Tests', () => {
 
     it('5.3-UNIT-008: Model sorting algorithm', () => {
       const models = providerManager.listAvailableModels()
-      
+
       // Verify models are sorted by provider priority
-      const anthropicIndex = models.findIndex(m => m.provider === 'anthropic')
-      const openaiIndex = models.findIndex(m => m.provider === 'openai')
-      const googleIndex = models.findIndex(m => m.provider === 'google')
-      
+      const anthropicIndex = models.findIndex((m) => m.provider === 'anthropic')
+      const openaiIndex = models.findIndex((m) => m.provider === 'openai')
+      const googleIndex = models.findIndex((m) => m.provider === 'google')
+
       if (anthropicIndex !== -1 && openaiIndex !== -1) {
         expect(anthropicIndex).toBeLessThan(openaiIndex)
       }
@@ -176,8 +187,8 @@ describe('ProviderManager - Story 5.3 Tests', () => {
 
     it('5.3-UNIT-009: Model metadata structure', () => {
       const models = providerManager.listAvailableModels()
-      const claudeModel = models.find(m => m.name.includes('claude'))
-      
+      const claudeModel = models.find((m) => m.name.includes('claude'))
+
       expect(claudeModel).toBeDefined()
       expect(claudeModel?.features.streaming).toBe(true)
       expect(claudeModel?.features.tools).toBe(true)
@@ -192,7 +203,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       const model = providerManager.getModel('nonexistent-model', {
         allowAutoFallback: true
       })
-      
+
       // Should return a model from fallback provider (anthropic is priority 1)
       expect(model).toBeDefined()
       expect(model).toHaveProperty('modelId')
@@ -204,15 +215,13 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       const model = providerManager.getModel('invalid-provider/invalid-model', {
         allowAutoFallback: true
       })
-      
+
       // Should fallback gracefully
       expect(model).toBeDefined()
-      
+
       // Verify console.warn was called for fallback
       const warnCalls = (console.warn as any).mock.calls
-      expect(warnCalls.some((call: any[]) => 
-        call[0].includes('Using fallback')
-      )).toBe(true)
+      expect(warnCalls.some((call: any[]) => call[0].includes('Using fallback'))).toBe(true)
     })
 
     it('5.3-UNIT-015: Infinite loop prevention', () => {
@@ -314,14 +323,42 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         service: 'minimax'
       })
       expect(minimaxModel).toMatchObject({
-        modelId: 'MiniMax-M3'
+        modelId: 'MiniMax-M3',
+        mode: 'chat'
       })
+    })
+
+    it('uses Chat Completions for multi-tenant and Cohere compatibility providers', () => {
+      const compatibleManager = new ProviderManager({
+        apiKeys: {
+          togetherai: 'together-test-key-123456789',
+          fireworks: 'fireworks-test-key-123456789',
+          baseten: 'baseten-test-key-123456789',
+          cerebras: 'cerebras-test-key-123456789',
+          cohere: 'cohere-test-key-123456789'
+        }
+      })
+
+      for (const [service, modelId] of [
+        ['togetherai', 'zai-org/GLM-5.3'],
+        ['fireworks', 'accounts/fireworks/models/kimi-k3-instruct'],
+        ['baseten', 'openai/gpt-oss-120b'],
+        ['cerebras', 'gpt-oss-120b'],
+        ['cohere', 'command-a-plus']
+      ] as const) {
+        expect(
+          compatibleManager.getModel(modelId, {
+            transport: 'direct',
+            service
+          })
+        ).toMatchObject({ modelId, mode: 'chat' })
+      }
     })
 
     it('5.3-INT-014: All 5+ providers active simultaneously', () => {
       const providers = providerManager.getConfiguredProviders()
       expect(providers.length).toBeGreaterThanOrEqual(5)
-      
+
       // Verify each provider has distinct features
       for (const provider of providers) {
         const info = providerManager.getProviderInfo(provider)
@@ -340,7 +377,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         ...(console.warn as any).mock.calls,
         ...(console.error as any).mock.calls
       ]
-      
+
       // Check that no API keys appear in any logs
       for (const call of allCalls) {
         const message = JSON.stringify(call)
@@ -352,13 +389,13 @@ describe('ProviderManager - Story 5.3 Tests', () => {
 
     it('SEC-002: Provider info does not expose sensitive data', () => {
       const providers = providerManager.getConfiguredProviders()
-      
+
       for (const provider of providers) {
         const info = providerManager.getProviderInfo(provider)
-        
+
         // Should not have client function (contains API key)
         expect(info).not.toHaveProperty('client')
-        
+
         // Should only have safe metadata
         expect(info).toHaveProperty('models')
         expect(info).toHaveProperty('features')
@@ -373,7 +410,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       const start = performance.now()
       const models = providerManager.listAvailableModels()
       const duration = performance.now() - start
-      
+
       // Should complete within 100ms
       expect(duration).toBeLessThan(100)
       expect(models.length).toBeGreaterThan(0)
@@ -383,7 +420,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       const start = performance.now()
       new ProviderManager()
       const duration = performance.now() - start
-      
+
       // Should initialize within 50ms
       expect(duration).toBeLessThan(50)
     })
@@ -400,7 +437,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         'gemini-2.5-pro',
         'google/gemini-2.5-pro'
       ]
-      
+
       for (const modelName of variations) {
         const model = providerManager.getModel(modelName)
         expect(model).toBeDefined()
@@ -412,13 +449,13 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       // Get same model twice
       const model1 = providerManager.getModel('claude-sonnet-4-5-latest')
       const model2 = providerManager.getModel('claude-sonnet-4-5-latest')
-      
+
       // Should return same cached instance
       expect(model1).toBe(model2)
-      
+
       // Clear cache
       providerManager.clearCache()
-      
+
       // Should get new instance
       const model3 = providerManager.getModel('claude-sonnet-4-5-latest')
       expect(model3).not.toBe(model1)

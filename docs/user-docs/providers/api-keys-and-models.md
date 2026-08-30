@@ -56,16 +56,23 @@ Common provider and connection types include:
 - Moonshot AI
 - MiniMax
 - MiMo
+- Together.ai
+- Fireworks AI
+- Baseten
+- Cerebras
+- Cohere
 - Alibaba Cloud Model Studio
 - StepFun
 - OpenRouter
 - Vercel AI Gateway
 - DeepSeek
 - DeepInfra
-- Z.ai, including the Z.ai Coding Plan endpoint for GLM coding models such as GLM-5.2
+- Z.ai, including a separate Z.ai Coding Plan connection for accounts that have that plan
 - media, web-search, voice, and Agent Browser cloud providers where supported, including Fish Audio, Inworld, Cartesia, Async, and Microsoft Azure Speech
 
 The exact provider list can change as the model catalog evolves.
+
+Regular Z.ai and Z.ai Coding Plan use separate keys and endpoints. Saving `ZAI_API_KEY` enables the regular pay-as-you-go connection only; it does not silently route requests through the Coding Plan endpoint.
 
 ## Create a saved model preset
 

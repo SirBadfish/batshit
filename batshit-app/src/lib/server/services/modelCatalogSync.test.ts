@@ -4,9 +4,14 @@ import {
   _buildCatalogSyncDiffForTest,
   _getManualDirectModelsForTest,
   _findCatalogIdentityIssuesForTest,
+  _mapBasetenModelsForTest,
+  _mapCohereModelsForTest,
   _mapDeepInfraModelsForTest,
   _mapDirectProviderEntriesForTest,
+  _mapFireworksModelsForTest,
+  _mapOpenAICompatibleCatalogModelsForTest,
   _mapOpenRouterModelToCatalogEntryForTest,
+  _mapTogetherModelsForTest,
   _mergeDirectProviderEntriesForTest,
   _mergeCatalogEntriesForTest,
   _shouldUseFallbackForTest
@@ -24,7 +29,12 @@ describe('modelCatalogSync merge', () => {
         displayName: 'GLM 5.3 Flash',
         tags: [],
         purpose: 'chat',
-        features: { streaming: true, tools: true, vision: false, maxTokens: 128000 },
+        features: {
+          streaming: true,
+          tools: true,
+          vision: false,
+          maxTokens: 128000
+        },
         category: 'balanced',
         source: 'vercel',
         transport: 'vercel-gateway',
@@ -64,7 +74,12 @@ describe('modelCatalogSync merge', () => {
         maxOutputTokens: 8192,
         purpose: 'chat',
         aaSlug: 'claude-sonnet-4-5',
-        features: { streaming: true, tools: true, vision: true, maxTokens: 200000 },
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 200000
+        },
         category: 'balanced',
         source: 'vercel',
         transport: 'vercel-gateway',
@@ -82,7 +97,12 @@ describe('modelCatalogSync merge', () => {
         maxOutputTokens: 8192,
         purpose: 'chat',
         aaSlug: 'claude-sonnet-4-5',
-        features: { streaming: true, tools: true, vision: true, maxTokens: 200000 },
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 200000
+        },
         category: 'balanced',
         source: 'openrouter',
         transport: 'openrouter',
@@ -113,7 +133,13 @@ describe('modelCatalogSync merge', () => {
         maxOutputTokens: 8192,
         purpose: 'chat',
         aaSlug: 'gpt-5.2',
-        features: { streaming: true, tools: true, vision: true, maxTokens: 200000, reasoning: true },
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 200000,
+          reasoning: true
+        },
         category: 'reasoning',
         source: 'vercel',
         transport: 'vercel-gateway',
@@ -129,7 +155,12 @@ describe('modelCatalogSync merge', () => {
         tags: [],
         purpose: 'chat',
         aaSlug: 'gpt-5.2',
-        features: { streaming: true, tools: false, vision: false, maxTokens: 0 },
+        features: {
+          streaming: true,
+          tools: false,
+          vision: false,
+          maxTokens: 0
+        },
         category: 'balanced',
         source: 'direct',
         transport: 'direct',
@@ -154,7 +185,12 @@ describe('modelCatalogSync merge', () => {
       contextWindow: 128000,
       maxOutputTokens: 4096,
       purpose: 'chat' as const,
-      features: { streaming: true, tools: true, vision: false, maxTokens: 128000 },
+      features: {
+        streaming: true,
+        tools: true,
+        vision: false,
+        maxTokens: 128000
+      },
       category: 'balanced' as const,
       source: 'vercel' as const,
       transport: 'vercel-gateway' as const,
@@ -268,13 +304,7 @@ describe('modelCatalogSync merge', () => {
 
   it('merges curated Z.ai coding-plan entries into lagging live discovery results', () => {
     const curated = _getManualDirectModelsForTest('zai_coding')
-    const merged = _mergeDirectProviderEntriesForTest(
-      [
-        { id: 'glm-4.7' },
-        { id: 'glm-5.1' }
-      ],
-      curated
-    )
+    const merged = _mergeDirectProviderEntriesForTest([{ id: 'glm-4.7' }, { id: 'glm-5.1' }], curated)
 
     expect(merged.some((model) => model.id === 'glm-5.2')).toBe(true)
     expect(merged.find((model) => model.id === 'glm-4.7')?.displayName).toBe('GLM-4.7')
@@ -344,5 +374,146 @@ describe('modelCatalogSync merge', () => {
         longContext: true
       }
     })
+  })
+
+  it('keeps Together developer-prefixed runtime IDs while filtering non-chat models', () => {
+    const directEntries = _mapTogetherModelsForTest([
+      {
+        id: 'zai-org/GLM-5.3',
+        type: 'chat',
+        running: false,
+        display_name: 'GLM 5.3',
+        context_length: 131_072,
+        pricing: { input: 0.5, output: 1.5 }
+      },
+      { id: 'black-forest-labs/FLUX.1-schnell', type: 'image', running: true }
+    ])
+
+    expect(directEntries).toHaveLength(1)
+    expect(directEntries[0]).toMatchObject({
+      id: 'zai-org/GLM-5.3',
+      effectiveId: 'zai-org/GLM-5.3',
+      contextWindow: 131_072,
+      pricing: { input: 0.5, output: 1.5 },
+      modelType: 'chat'
+    })
+
+    const [catalogEntry] = _mapDirectProviderEntriesForTest('togetherai', directEntries)
+    expect(catalogEntry).toMatchObject({
+      id: 'zai-org/GLM-5.3',
+      provider: 'zai-org',
+      name: 'GLM-5.3',
+      connectionId: 'direct:togetherai'
+    })
+  })
+
+  it('preserves Fireworks runtime IDs and records the developer identity from Hugging Face', () => {
+    const directEntries = _mapFireworksModelsForTest([
+      {
+        name: 'accounts/fireworks/models/kimi-k3',
+        displayName: 'Kimi K3',
+        public: true,
+        state: 'READY',
+        contextLength: 262_144,
+        supportsTools: true,
+        huggingFaceUrl: 'https://huggingface.co/moonshotai/Kimi-K3'
+      },
+      {
+        name: 'accounts/fireworks/models/kimi-k3-max',
+        displayName: 'Kimi K3 Max',
+        public: true,
+        state: 'READY',
+        huggingFaceUrl: 'https://huggingface.co/moonshotai/Kimi-K3'
+      }
+    ])
+
+    expect(directEntries[0]).toMatchObject({
+      id: 'accounts/fireworks/models/kimi-k3',
+      developerId: 'moonshotai',
+      modelId: 'Kimi-K3',
+      effectiveId: 'accounts/fireworks/models/kimi-k3',
+      tags: expect.arrayContaining(['chat', 'tools']),
+      modelType: 'chat'
+    })
+    expect(directEntries[1]).toMatchObject({
+      id: 'accounts/fireworks/models/kimi-k3-max',
+      developerId: 'fireworks',
+      modelId: 'kimi-k3-max',
+      effectiveId: 'accounts/fireworks/models/kimi-k3-max'
+    })
+  })
+
+  it('maps Baseten metadata without changing its exact model identifier', () => {
+    const directEntries = _mapBasetenModelsForTest([
+      {
+        id: 'openai/gpt-oss-120b',
+        name: 'GPT OSS 120B',
+        context_length: 131_072,
+        max_completion_tokens: 65_536,
+        supported_features: ['tools'],
+        input_modalities: ['text'],
+        output_modalities: ['text'],
+        pricing: { input: 0.0000001, output: 0.0000002 }
+      }
+    ])
+
+    expect(directEntries[0]).toMatchObject({
+      id: 'openai/gpt-oss-120b',
+      effectiveId: 'openai/gpt-oss-120b',
+      contextWindow: 131_072,
+      maxOutputTokens: 65_536,
+      tags: expect.arrayContaining(['chat', 'tools'])
+    })
+  })
+
+  it('classifies MiMo audio endpoints separately from chat models', () => {
+    const directEntries = _mapOpenAICompatibleCatalogModelsForTest('mimo', [
+      { id: 'mimo-v2.5-pro', owned_by: 'xiaomi' },
+      { id: 'mimo-v2.5-asr', owned_by: 'xiaomi' },
+      { id: 'mimo-v2.5-tts-voiceclone', owned_by: 'xiaomi' }
+    ])
+
+    expect(directEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'mimo-v2.5-pro', modelType: 'chat' }),
+        expect.objectContaining({
+          id: 'mimo-v2.5-asr',
+          modelType: 'audio',
+          tags: expect.arrayContaining(['stt'])
+        }),
+        expect.objectContaining({
+          id: 'mimo-v2.5-tts-voiceclone',
+          modelType: 'audio',
+          tags: expect.arrayContaining(['tts'])
+        })
+      ])
+    )
+  })
+
+  it('classifies Cohere chat, embedding, rerank, and transcription models from advertised endpoints', () => {
+    const directEntries = _mapCohereModelsForTest([
+      {
+        name: 'command-a-plus',
+        endpoints: ['chat'],
+        features: ['tools'],
+        context_length: 256_000
+      },
+      { name: 'embed-v4.0', endpoints: ['embed'], features: null },
+      { name: 'rerank-v3.5', endpoints: ['rerank'], features: null },
+      { name: 'transcribe-v2', endpoints: ['transcribe'], features: null }
+    ])
+
+    expect(directEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'command-a-plus',
+          modelType: 'chat',
+          contextWindow: 256_000
+        }),
+        expect.objectContaining({ id: 'embed-v4.0', modelType: 'embedding' }),
+        expect.objectContaining({ id: 'rerank-v3.5', modelType: 'rerank' }),
+        expect.objectContaining({ id: 'transcribe-v2', modelType: 'audio' })
+      ])
+    )
   })
 })

@@ -292,7 +292,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
   {
     id: 'cohere',
     label: 'Cohere',
-    description: 'Cohere embeddings + rerank models.',
+    description: 'Cohere chat, embeddings, rerank, and transcription models.',
     scope: 'provider',
     connectionHint: 'Direct',
     iconRef: { kind: 'brand', slug: 'cohere-color' }
@@ -419,7 +419,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
   {
     id: 'togetherai',
     label: 'Together.ai',
-    description: 'Together.ai hosted models (manual entry only for now).',
+    description: 'Together.ai hosted chat models through the built-in model catalog.',
     scope: 'provider',
     connectionHint: 'Direct',
     iconRef: { kind: 'brand', slug: 'together-color' }
@@ -427,7 +427,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
   {
     id: 'fireworks',
     label: 'Fireworks AI',
-    description: 'Fireworks hosted models (manual entry only for now).',
+    description: 'Fireworks serverless models through the built-in model catalog.',
     scope: 'provider',
     connectionHint: 'Direct',
     iconRef: { kind: 'brand', slug: 'fireworks-color' }
@@ -435,7 +435,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
   {
     id: 'baseten',
     label: 'Baseten',
-    description: 'Baseten hosted models (manual entry only for now).',
+    description: 'Baseten Model API models through the built-in model catalog.',
     scope: 'provider',
     connectionHint: 'Direct',
     iconRef: { kind: 'brand', slug: 'baseten-mono' }
@@ -443,7 +443,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
   {
     id: 'cerebras',
     label: 'Cerebras',
-    description: 'Cerebras hosted models (manual entry only for now).',
+    description: 'Cerebras inference models through the built-in model catalog.',
     scope: 'provider',
     connectionHint: 'Direct',
     iconRef: { kind: 'brand', slug: 'cerebras-color' }

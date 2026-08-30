@@ -23,15 +23,14 @@ const MISTRAL_MODELS_ENDPOINT = 'https://api.mistral.ai/v1/models'
 const FAL_MODELS_ENDPOINT = 'https://api.fal.ai/v1/models'
 const REPLICATE_OFFICIAL_COLLECTION_ENDPOINT = 'https://api.replicate.com/v1/collections/official'
 const DEEPINFRA_MODELS_ENDPOINT = 'https://api.deepinfra.com/models/list'
+const FIREWORKS_SERVERLESS_MODELS_ENDPOINT = 'https://api.fireworks.ai/v1/accounts/fireworks/models'
+const COHERE_MODELS_ENDPOINT = 'https://api.cohere.ai/v1/models'
 // NOTE: Groq uses an OpenAI-compatible endpoint at https://api.groq.com/openai/v1
 
 type CatalogTransport = 'vercel-gateway' | 'openrouter' | 'direct'
 type CatalogSource = 'vercel' | 'openrouter' | 'direct'
 
-type CatalogConnectionId =
-  | 'vercel-gateway'
-  | 'openrouter'
-  | `direct:${string}`
+type CatalogConnectionId = 'vercel-gateway' | 'openrouter' | `direct:${string}`
 
 interface GatewayModel {
   id: string
@@ -80,12 +79,15 @@ interface CatalogEntry {
   availableConnections?: string[]
   purpose: ModelPurpose
   aaSlug?: string
-  idVariants?: Record<string /* connectionId */, {
-    developerId: string
-    modelId: string
-    effectiveId: string
-    source: 'vercel' | 'openrouter' | 'manual' | 'direct'
-  }>
+  idVariants?: Record<
+    string /* connectionId */,
+    {
+      developerId: string
+      modelId: string
+      effectiveId: string
+      source: 'vercel' | 'openrouter' | 'manual' | 'direct'
+    }
+  >
   pricing?: {
     input?: number
     output?: number
@@ -123,25 +125,34 @@ type SourceFetchOptions = {
   signal?: AbortSignal
 }
 
-type DirectProviderId =
-  | 'openai'
-  | 'anthropic'
-  | 'google'
-  | 'mistral'
-  | 'groq'
-  | 'xai'
-  | 'deepseek'
-  | 'deepinfra'
-  | 'moonshot'
-  | 'zai'
-  | 'zai_coding'
-  | 'fal'
-  | 'luma'
-  | 'replicate'
-  | 'elevenlabs'
-  | 'deepgram'
-  | 'assemblyai'
-  | 'cohere'
+const DIRECT_PROVIDER_IDS = [
+  'openai',
+  'anthropic',
+  'google',
+  'mistral',
+  'groq',
+  'xai',
+  'deepseek',
+  'deepinfra',
+  'moonshot',
+  'minimax',
+  'mimo',
+  'zai',
+  'zai_coding',
+  'togetherai',
+  'fireworks',
+  'baseten',
+  'cerebras',
+  'fal',
+  'luma',
+  'replicate',
+  'elevenlabs',
+  'deepgram',
+  'assemblyai',
+  'cohere'
+] as const
+
+type DirectProviderId = (typeof DIRECT_PROVIDER_IDS)[number]
 
 type DirectProviderEntry = {
   id: string
@@ -175,6 +186,55 @@ type DeepInfraCatalogModel = {
   replaced_by?: string | null
   deprecated?: number | null
   private?: number | null
+}
+
+type TogetherCatalogModel = {
+  id?: string
+  type?: string
+  running?: boolean
+  display_name?: string
+  context_length?: number | null
+  pricing?: {
+    input?: number | null
+    output?: number | null
+    cached_input?: number | null
+  } | null
+}
+
+type FireworksCatalogModel = {
+  name?: string
+  displayName?: string
+  description?: string
+  state?: string
+  public?: boolean
+  contextLength?: number | null
+  supportsImageInput?: boolean
+  supportsTools?: boolean
+  huggingFaceUrl?: string
+}
+
+type BasetenCatalogModel = {
+  id?: string
+  name?: string
+  description?: string
+  context_length?: number | null
+  max_completion_tokens?: number | null
+  pricing?: Record<string, string | number>
+  supported_features?: string[]
+  input_modalities?: string[]
+  output_modalities?: string[]
+}
+
+type OpenAICompatibleCatalogModel = {
+  id?: string
+  owned_by?: string
+}
+
+type CohereCatalogModel = {
+  name?: string
+  endpoints?: string[]
+  features?: string[] | null
+  context_length?: number | null
 }
 
 const MANUAL_DIRECT_MODELS: Partial<Record<DirectProviderId, DirectProviderEntry[]>> = {
@@ -442,50 +502,6 @@ const MANUAL_DIRECT_MODELS: Partial<Record<DirectProviderId, DirectProviderEntry
       tags: ['audio', 'stt', 'transcription'],
       modelType: 'audio'
     }
-  ],
-  cohere: [
-    {
-      id: 'embed-english-v3.0',
-      displayName: 'Embed English v3',
-      tags: ['embedding'],
-      modelType: 'embedding'
-    },
-    {
-      id: 'embed-multilingual-v3.0',
-      displayName: 'Embed Multilingual v3',
-      tags: ['embedding'],
-      modelType: 'embedding'
-    },
-    {
-      id: 'embed-english-light-v3.0',
-      displayName: 'Embed English Light v3',
-      tags: ['embedding'],
-      modelType: 'embedding'
-    },
-    {
-      id: 'embed-multilingual-light-v3.0',
-      displayName: 'Embed Multilingual Light v3',
-      tags: ['embedding'],
-      modelType: 'embedding'
-    },
-    {
-      id: 'embed-english-v2.0',
-      displayName: 'Embed English v2',
-      tags: ['embedding'],
-      modelType: 'embedding'
-    },
-    {
-      id: 'embed-english-light-v2.0',
-      displayName: 'Embed English Light v2',
-      tags: ['embedding'],
-      modelType: 'embedding'
-    },
-    {
-      id: 'embed-multilingual-v2.0',
-      displayName: 'Embed Multilingual v2',
-      tags: ['embedding'],
-      modelType: 'embedding'
-    }
   ]
 }
 
@@ -558,7 +574,13 @@ function mapFalCategoryToModelType(category?: string, tags: string[] = []): stri
 
   if (normalizedCategory.includes('video') || tagSet.has('video')) return 'video'
   if (normalizedCategory.includes('image') || tagSet.has('image')) return 'image'
-  if (normalizedCategory.includes('speech') || normalizedCategory.includes('audio') || tagSet.has('audio') || tagSet.has('tts') || tagSet.has('stt')) {
+  if (
+    normalizedCategory.includes('speech') ||
+    normalizedCategory.includes('audio') ||
+    tagSet.has('audio') ||
+    tagSet.has('tts') ||
+    tagSet.has('stt')
+  ) {
     return 'audio'
   }
   if (normalizedCategory.includes('embedding') || tagSet.has('embedding') || tagSet.has('rerank')) {
@@ -584,10 +606,29 @@ function inferTagsFromIdentifier(id: string, description?: string | null): strin
       haystack.includes('imagen'),
     'image'
   )
-  addIf(haystack.includes('video') || haystack.includes('animation') || haystack.includes('kling') || haystack.includes('sora'), 'video')
-  addIf(haystack.includes('audio') || haystack.includes('speech') || haystack.includes('tts') || haystack.includes('whisper') || haystack.includes('transcribe'), 'audio')
+  addIf(
+    haystack.includes('video') ||
+      haystack.includes('animation') ||
+      haystack.includes('kling') ||
+      haystack.includes('sora'),
+    'video'
+  )
+  addIf(
+    haystack.includes('audio') ||
+      haystack.includes('speech') ||
+      haystack.includes('tts') ||
+      haystack.includes('whisper') ||
+      haystack.includes('transcribe'),
+    'audio'
+  )
   addIf(haystack.includes('tts') || haystack.includes('text-to-speech'), 'tts')
-  addIf(haystack.includes('whisper') || haystack.includes('transcribe') || haystack.includes('stt') || haystack.includes('speech-to-text'), 'stt')
+  addIf(
+    haystack.includes('whisper') ||
+      haystack.includes('transcribe') ||
+      haystack.includes('stt') ||
+      haystack.includes('speech-to-text'),
+    'stt'
+  )
   addIf(haystack.includes('embedding') || haystack.includes('embed'), 'embedding')
   addIf(haystack.includes('rerank') || haystack.includes('ranker') || haystack.includes('rank'), 'rerank')
   addIf(haystack.includes('fast') || haystack.includes('turbo') || haystack.includes('flash'), 'fast')
@@ -617,13 +658,225 @@ function mapPricing(pricing?: Record<string, string | number>) {
   return mapped
 }
 
+function asFiniteNumber(value: unknown) {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function mapTogetherModels(models: TogetherCatalogModel[]): DirectProviderEntry[] {
+  return models
+    .filter((model) => model?.type === 'chat')
+    .map((model) => {
+      const id = safeString(model.id).trim()
+      const pricing = {
+        input: asFiniteNumber(model.pricing?.input),
+        output: asFiniteNumber(model.pricing?.output),
+        cachedInput: asFiniteNumber(model.pricing?.cached_input)
+      }
+      const hasPricing = Object.values(pricing).some((value) => value !== undefined)
+
+      return {
+        id,
+        effectiveId: id,
+        displayName: safeString(model.display_name).trim() || undefined,
+        tags: Array.from(new Set(['chat', ...inferTagsFromIdentifier(id)])),
+        contextWindow: normalizePositiveInteger(model.context_length),
+        pricing: hasPricing ? pricing : undefined,
+        modelType: 'chat'
+      }
+    })
+    .filter((model) => Boolean(model.id))
+}
+
+function parseHuggingFaceModelUrl(value?: string | null) {
+  if (!value) return null
+  try {
+    const url = new URL(value)
+    if (url.hostname !== 'huggingface.co') return null
+    const [developerId, modelId] = url.pathname.split('/').filter(Boolean)
+    if (!developerId || !modelId) return null
+    return { developerId, modelId }
+  } catch {
+    return null
+  }
+}
+
+function mapFireworksModels(models: FireworksCatalogModel[]): DirectProviderEntry[] {
+  const huggingFaceIdentityCounts = new Map<string, number>()
+  for (const model of models) {
+    const identity = parseHuggingFaceModelUrl(model.huggingFaceUrl)
+    if (!identity) continue
+    const key = `${identity.developerId.toLowerCase()}/${identity.modelId.toLowerCase()}`
+    huggingFaceIdentityCounts.set(key, (huggingFaceIdentityCounts.get(key) ?? 0) + 1)
+  }
+
+  return models
+    .filter((model) => model.public !== false && model.state !== 'DELETING' && model.state !== 'FAILED')
+    .map((model) => {
+      const effectiveId = safeString(model.name).trim()
+      const fallbackModelId = effectiveId.split('/').pop() || effectiveId
+      const huggingFaceIdentity = parseHuggingFaceModelUrl(model.huggingFaceUrl)
+      const huggingFaceIdentityKey = huggingFaceIdentity
+        ? `${huggingFaceIdentity.developerId.toLowerCase()}/${huggingFaceIdentity.modelId.toLowerCase()}`
+        : null
+      const huggingFaceIdentityIsUnique = huggingFaceIdentityKey
+        ? huggingFaceIdentityCounts.get(huggingFaceIdentityKey) === 1
+        : false
+      const runtimeSlugMatchesHuggingFace = huggingFaceIdentity
+        ? normalizeName(fallbackModelId) === normalizeName(huggingFaceIdentity.modelId)
+        : false
+      const useHuggingFaceIdentity = Boolean(
+        huggingFaceIdentity && (huggingFaceIdentityIsUnique || runtimeSlugMatchesHuggingFace)
+      )
+      const description = safeString(model.description).trim()
+      const identifierTags = inferTagsFromIdentifier(`${effectiveId} ${safeString(model.displayName)}`, description)
+      const utilityModel = /(?:^|[-_/])(embedding|embed|reranker|rerank)(?:$|[-_/])/i.test(effectiveId)
+      const tags = Array.from(
+        new Set([
+          ...(utilityModel ? ['embedding'] : ['chat']),
+          ...identifierTags,
+          ...(model.supportsTools ? ['tools'] : []),
+          ...(model.supportsImageInput ? ['vision'] : [])
+        ])
+      )
+
+      return {
+        id: effectiveId,
+        developerId: useHuggingFaceIdentity ? huggingFaceIdentity!.developerId : 'fireworks',
+        modelId: useHuggingFaceIdentity ? huggingFaceIdentity!.modelId : fallbackModelId,
+        effectiveId,
+        displayName: safeString(model.displayName).trim() || undefined,
+        description: description || undefined,
+        tags,
+        contextWindow: normalizePositiveInteger(model.contextLength),
+        modelType: utilityModel ? 'embedding' : 'chat'
+      }
+    })
+    .filter((model) => Boolean(model.id))
+}
+
+function mapBasetenModels(models: BasetenCatalogModel[]): DirectProviderEntry[] {
+  return models
+    .map((model) => {
+      const id = safeString(model.id).trim()
+      const description = safeString(model.description).trim()
+      const inputModalities = (model.input_modalities ?? []).map(normalizeTag)
+      const outputModalities = (model.output_modalities ?? []).map(normalizeTag)
+      const tags = Array.from(
+        new Set([
+          'chat',
+          ...inferTagsFromIdentifier(id, description),
+          ...(model.supported_features ?? []).map(normalizeTag),
+          ...inputModalities,
+          ...outputModalities,
+          ...(inputModalities.includes('image') ? ['vision'] : [])
+        ])
+      )
+
+      return {
+        id,
+        effectiveId: id,
+        displayName: safeString(model.name).trim() || undefined,
+        description: description || undefined,
+        tags,
+        contextWindow: normalizePositiveInteger(model.context_length),
+        maxOutputTokens: normalizePositiveInteger(model.max_completion_tokens),
+        pricing: mapPricing(model.pricing),
+        modelType: 'chat'
+      }
+    })
+    .filter((model) => Boolean(model.id))
+}
+
+function normalizeDeveloperId(value: unknown, fallback: string) {
+  const normalized = safeString(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return normalized || fallback
+}
+
+function mapOpenAICompatibleCatalogModels(
+  provider: 'cerebras' | 'minimax' | 'mimo',
+  models: OpenAICompatibleCatalogModel[]
+): DirectProviderEntry[] {
+  return models
+    .map((model) => {
+      const id = safeString(model.id).trim()
+      const isAsr = provider === 'mimo' && /(?:^|[-_])asr(?:$|[-_])/i.test(id)
+      const isTts = provider === 'mimo' && /(?:^|[-_])tts(?:$|[-_])/i.test(id)
+      const isAudio = isAsr || isTts
+      const tags = Array.from(
+        new Set([
+          ...(isAudio ? ['audio'] : ['chat']),
+          ...(isAsr ? ['stt', 'transcription'] : []),
+          ...(isTts ? ['tts'] : []),
+          ...inferTagsFromIdentifier(id)
+        ])
+      )
+
+      return {
+        id,
+        developerId: normalizeDeveloperId(model.owned_by, provider),
+        modelId: id,
+        effectiveId: id,
+        displayName: id,
+        tags,
+        modelType: isAudio ? 'audio' : 'chat'
+      }
+    })
+    .filter((model) => Boolean(model.id))
+}
+
+function mapCohereModels(models: CohereCatalogModel[]): DirectProviderEntry[] {
+  return models
+    .map((model) => {
+      const id = safeString(model.name).trim()
+      const endpoints = (model.endpoints ?? []).map(normalizeTag)
+      const features = (model.features ?? []).map(normalizeTag)
+      const isChat = endpoints.includes('chat') || endpoints.includes('generate')
+      const isAudio =
+        endpoints.includes('transcribe') || endpoints.includes('transcription') || endpoints.includes('transcriptions')
+      const isEmbedding = endpoints.includes('embed') || endpoints.includes('embed_image')
+      const isRerank = endpoints.includes('rerank')
+      const modelType = isChat ? 'chat' : isAudio ? 'audio' : isEmbedding ? 'embedding' : isRerank ? 'rerank' : null
+      const tags = Array.from(
+        new Set([
+          ...(isChat ? ['chat'] : []),
+          ...(isAudio ? ['audio', 'stt', 'transcription'] : []),
+          ...(isEmbedding ? ['embedding'] : []),
+          ...(isRerank ? ['rerank'] : []),
+          ...features,
+          ...inferTagsFromIdentifier(id)
+        ])
+      )
+
+      return {
+        id,
+        developerId: 'cohere',
+        modelId: id,
+        effectiveId: id,
+        displayName: id,
+        tags,
+        contextWindow: normalizePositiveInteger(model.context_length),
+        modelType
+      }
+    })
+    .filter((model) => Boolean(model.id) && Boolean(model.modelType))
+}
+
 function deriveFeatures(tags: string[], contextWindow?: number | null, pricing?: ReturnType<typeof mapPricing>) {
   const normalized = new Set(tags.map((tag) => tag.toLowerCase()))
 
   return {
     streaming: true,
     tools: normalized.has('tool-use') || normalized.has('tool') || normalized.has('tools'),
-    vision: normalized.has('vision') || normalized.has('image') || normalized.has('image-input') || normalized.has('multimodal'),
+    vision:
+      normalized.has('vision') ||
+      normalized.has('image') ||
+      normalized.has('image-input') ||
+      normalized.has('multimodal'),
     maxTokens: contextWindow ?? 0,
     reasoning: normalized.has('reasoning'),
     cacheControl: pricing?.cachedInput !== undefined,
@@ -649,10 +902,7 @@ function normalizeProvider(id: string) {
 
 function buildCanonicalId(provider: string, name: string) {
   const normalizedProvider = provider.toLowerCase().trim()
-  const normalizedName = name
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, '-')
+  const normalizedName = name.toLowerCase().trim().replace(/\s+/g, '-')
   return `${normalizedProvider}/${normalizedName}`
 }
 
@@ -675,8 +925,14 @@ function normalizeOpenRouterDisplayName(displayName: string, providerId: string)
 
   const matchesProvider =
     prefixKey === providerKey ||
-    (providerKey.length > 5 && providerKey.endsWith('ai') && prefixKey.length >= 5 && `${prefixKey}ai` === providerKey) ||
-    (providerKey.length > 5 && providerKey.endsWith('tech') && prefixKey.length >= 3 && `${prefixKey}tech` === providerKey) ||
+    (providerKey.length > 5 &&
+      providerKey.endsWith('ai') &&
+      prefixKey.length >= 5 &&
+      `${prefixKey}ai` === providerKey) ||
+    (providerKey.length > 5 &&
+      providerKey.endsWith('tech') &&
+      prefixKey.length >= 3 &&
+      `${prefixKey}tech` === providerKey) ||
     (providerKey === 'metallama' && prefixKey === 'meta')
 
   const matchesKnownAlias =
@@ -784,10 +1040,7 @@ function resolveDirectEntryIdentifiers(provider: DirectProviderId, entry: Direct
   return { developerId, modelId, effectiveId }
 }
 
-function mapDirectProviderEntries(
-  provider: DirectProviderId,
-  entries: DirectProviderEntry[]
-): CatalogEntry[] {
+function mapDirectProviderEntries(provider: DirectProviderId, entries: DirectProviderEntry[]): CatalogEntry[] {
   const connectionId = asDirectConnectionId(provider)
   return entries
     .filter((entry) => Boolean(entry?.id))
@@ -875,7 +1128,7 @@ function buildOpenAICompatibleModelsUrl(baseUrl: string) {
   return `${trimmed}/v1/models`
 }
 
-async function fetchOpenAICompatibleModelIds({
+async function fetchOpenAICompatibleModels({
   baseUrl,
   apiKey,
   signal
@@ -883,7 +1136,7 @@ async function fetchOpenAICompatibleModelIds({
   baseUrl: string
   apiKey: string
   signal?: AbortSignal
-}): Promise<string[]> {
+}): Promise<any[]> {
   const url = buildOpenAICompatibleModelsUrl(baseUrl)
   const payload = await fetchJson<any>(url, {
     headers: {
@@ -901,8 +1154,16 @@ async function fetchOpenAICompatibleModelIds({
         : []
 
   return data
-    .map((entry: any) => safeString(entry?.id))
-    .filter((id: string) => Boolean(id))
+}
+
+async function fetchOpenAICompatibleModelIds(options: {
+  baseUrl: string
+  apiKey: string
+  signal?: AbortSignal
+}): Promise<string[]> {
+  const data = await fetchOpenAICompatibleModels(options)
+
+  return data.map((entry: any) => safeString(entry?.id)).filter((id: string) => Boolean(id))
 }
 
 async function fetchOpenAIEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -918,9 +1179,7 @@ async function fetchOpenAIEntries(options: SourceFetchOptions = {}): Promise<Dir
     signal: options.signal
   })
 
-  return (payload.data ?? [])
-    .map((model) => ({ id: model.id }))
-    .filter((model) => Boolean(model.id))
+  return (payload.data ?? []).map((model) => ({ id: model.id })).filter((model) => Boolean(model.id))
 }
 
 async function fetchGroqEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -956,11 +1215,12 @@ async function fetchDeepSeekEntries(options: SourceFetchOptions = {}): Promise<D
 
 function mapDeepInfraModels(models: DeepInfraCatalogModel[]): DirectProviderEntry[] {
   return models
-    .filter((model) =>
-      model?.reported_type === 'text-generation' &&
-      model.private !== 1 &&
-      model.deprecated == null &&
-      !model.replaced_by
+    .filter(
+      (model) =>
+        model?.reported_type === 'text-generation' &&
+        model.private !== 1 &&
+        model.deprecated == null &&
+        !model.replaced_by
     )
     .map((model) => {
       const id = safeString(model.model_name).trim()
@@ -968,23 +1228,20 @@ function mapDeepInfraModels(models: DeepInfraCatalogModel[]): DirectProviderEntr
       const input = model.pricing?.cents_per_input_token
       const output = model.pricing?.cents_per_output_token
       const cachedRate = model.pricing?.rate_per_input_token_cached
-      const inputPerMillion = typeof input === 'number' && Number.isFinite(input)
-        ? input * 10_000
-        : undefined
-      const outputPerMillion = typeof output === 'number' && Number.isFinite(output)
-        ? output * 10_000
-        : undefined
+      const inputPerMillion = typeof input === 'number' && Number.isFinite(input) ? input * 10_000 : undefined
+      const outputPerMillion = typeof output === 'number' && Number.isFinite(output) ? output * 10_000 : undefined
       const cachedInputPerMillion =
         inputPerMillion !== undefined && typeof cachedRate === 'number' && Number.isFinite(cachedRate)
           ? inputPerMillion * cachedRate
           : undefined
-      const pricing = inputPerMillion !== undefined || outputPerMillion !== undefined || cachedInputPerMillion !== undefined
-        ? {
-            input: inputPerMillion,
-            output: outputPerMillion,
-            cachedInput: cachedInputPerMillion
-          }
-        : undefined
+      const pricing =
+        inputPerMillion !== undefined || outputPerMillion !== undefined || cachedInputPerMillion !== undefined
+          ? {
+              input: inputPerMillion,
+              output: outputPerMillion,
+              cachedInput: cachedInputPerMillion
+            }
+          : undefined
 
       return {
         id,
@@ -1004,6 +1261,99 @@ async function fetchDeepInfraEntries(options: SourceFetchOptions = {}): Promise<
     signal: options.signal
   })
   return mapDeepInfraModels(Array.isArray(payload) ? payload : [])
+}
+
+async function fetchTogetherEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = await getRuntimeEnv('TOGETHER_API_KEY')
+  if (!apiKey) return []
+
+  const baseUrl = (await getRuntimeEnv('TOGETHER_API_BASE_URL')) || 'https://api.together.xyz/v1'
+  const models = await fetchOpenAICompatibleModels({
+    baseUrl,
+    apiKey,
+    signal: options.signal
+  })
+  return mapTogetherModels(models)
+}
+
+async function fetchFireworksEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = await getRuntimeEnv('FIREWORKS_API_KEY')
+  if (!apiKey) return []
+
+  const collected: FireworksCatalogModel[] = []
+  let pageToken: string | null = null
+
+  do {
+    const url = new URL(FIREWORKS_SERVERLESS_MODELS_ENDPOINT)
+    url.searchParams.set('filter', 'supports_serverless=true')
+    url.searchParams.set('pageSize', '200')
+    if (pageToken) url.searchParams.set('pageToken', pageToken)
+
+    const payload = await fetchJson<{
+      models?: FireworksCatalogModel[]
+      nextPageToken?: string | null
+    }>(url.toString(), {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: options.signal
+    })
+
+    collected.push(...(payload.models ?? []))
+    pageToken = safeString(payload.nextPageToken).trim() || null
+  } while (pageToken)
+
+  return mapFireworksModels(collected)
+}
+
+async function fetchBasetenEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = await getRuntimeEnv('BASETEN_API_KEY')
+  if (!apiKey) return []
+
+  const baseUrl = (await getRuntimeEnv('BASETEN_API_BASE_URL')) || 'https://inference.baseten.co/v1'
+  const models = await fetchOpenAICompatibleModels({
+    baseUrl,
+    apiKey,
+    signal: options.signal
+  })
+  return mapBasetenModels(models)
+}
+
+async function fetchCerebrasEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = await getRuntimeEnv('CEREBRAS_API_KEY')
+  if (!apiKey) return []
+
+  const baseUrl = (await getRuntimeEnv('CEREBRAS_API_BASE_URL')) || 'https://api.cerebras.ai/v1'
+  const models = await fetchOpenAICompatibleModels({
+    baseUrl,
+    apiKey,
+    signal: options.signal
+  })
+  return mapOpenAICompatibleCatalogModels('cerebras', models)
+}
+
+async function fetchMiniMaxEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = await getRuntimeEnv('MINIMAX_API_KEY')
+  if (!apiKey) return []
+
+  const baseUrl = (await getRuntimeEnv('MINIMAX_API_BASE_URL')) || 'https://api.minimax.io/v1'
+  const models = await fetchOpenAICompatibleModels({
+    baseUrl,
+    apiKey,
+    signal: options.signal
+  })
+  return mapOpenAICompatibleCatalogModels('minimax', models)
+}
+
+async function fetchMimoEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = await getRuntimeEnv('MIMO_API_KEY')
+  if (!apiKey) return []
+
+  const baseUrl = (await getRuntimeEnv('MIMO_API_BASE_URL')) || 'https://api.xiaomimimo.com/v1'
+  const models = await fetchOpenAICompatibleModels({
+    baseUrl,
+    apiKey,
+    signal: options.signal
+  })
+  return mapOpenAICompatibleCatalogModels('mimo', models)
 }
 
 async function fetchMoonshotEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1061,15 +1411,13 @@ async function fetchZaiEntries(options: SourceFetchOptions = {}): Promise<Direct
 }
 
 async function fetchZaiCodingEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
-  const apiKey =
-    (await getRuntimeEnv('ZAI_CODING_API_KEY')) || (await getRuntimeEnv('ZAI_API_KEY'))
+  const apiKey = await getRuntimeEnv('ZAI_CODING_API_KEY')
   const curated = MANUAL_DIRECT_MODELS.zai_coding ?? []
   if (!apiKey) {
     return curated
   }
 
-  const baseUrl =
-    (await getRuntimeEnv('ZAI_CODING_API_BASE_URL')) || 'https://api.z.ai/api/coding/paas/v4'
+  const baseUrl = (await getRuntimeEnv('ZAI_CODING_API_BASE_URL')) || 'https://api.z.ai/api/coding/paas/v4'
 
   try {
     const ids = await fetchOpenAICompatibleModelIds({
@@ -1233,12 +1581,15 @@ async function fetchAssemblyAiEntries(_options: SourceFetchOptions = {}): Promis
   return MANUAL_DIRECT_MODELS.assemblyai ?? []
 }
 
-async function fetchCohereEntries(_options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+async function fetchCohereEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
   const apiKey = await getRuntimeEnv('COHERE_API_KEY')
-  if (!apiKey) {
-    return []
-  }
-  return MANUAL_DIRECT_MODELS.cohere ?? []
+  if (!apiKey) return []
+
+  const payload = await fetchJson<{ models?: CohereCatalogModel[] }>(COHERE_MODELS_ENDPOINT, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: options.signal
+  })
+  return mapCohereModels(payload.models ?? [])
 }
 
 async function fetchMistralEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1254,19 +1605,13 @@ async function fetchMistralEntries(options: SourceFetchOptions = {}): Promise<Di
     signal: options.signal
   })
 
-  const data = Array.isArray(payload?.data)
-    ? payload.data
-    : Array.isArray(payload)
-      ? payload
-      : []
+  const data = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : []
 
   return data
     .map((model: any) => ({
       id: safeString(model?.id),
       description: safeString(model?.description) || undefined,
-      contextWindow: typeof model?.max_context_length === 'number'
-        ? model.max_context_length
-        : undefined,
+      contextWindow: typeof model?.max_context_length === 'number' ? model.max_context_length : undefined,
       modelType: safeString(model?.TYPE || model?.type || null) || null
     }))
     .filter((model: DirectProviderEntry) => Boolean(model.id))
@@ -1297,7 +1642,10 @@ async function fetchGoogleEntries(options: SourceFetchOptions = {}): Promise<Dir
       url.searchParams.set('pageToken', pageToken)
     }
 
-    const payload = await fetchJson<{ models?: GoogleGeminiModel[]; nextPageToken?: string }>(url.toString(), {
+    const payload = await fetchJson<{
+      models?: GoogleGeminiModel[]
+      nextPageToken?: string
+    }>(url.toString(), {
       headers: {
         'x-goog-api-key': apiKey
       },
@@ -1350,7 +1698,11 @@ async function fetchAnthropicEntries(options: SourceFetchOptions = {}): Promise<
       url.searchParams.set('after_id', afterId)
     }
 
-    const payload = await fetchJson<{ data: AnthropicModelInfo[]; has_more: boolean; last_id?: string | null }>(url.toString(), {
+    const payload = await fetchJson<{
+      data: AnthropicModelInfo[]
+      has_more: boolean
+      last_id?: string | null
+    }>(url.toString(), {
       headers: {
         'x-api-key': apiKey,
         'anthropic-version': (await getRuntimeEnv('ANTHROPIC_VERSION')) || '2023-06-01'
@@ -1375,10 +1727,13 @@ async function fetchAnthropicEntries(options: SourceFetchOptions = {}): Promise<
 }
 
 async function fetchGatewayEntries(options: SourceFetchOptions = {}): Promise<CatalogEntry[]> {
-  const payload = await fetchJson<{ data?: GatewayModel[]; models?: GatewayModel[] }>(GATEWAY_ENDPOINT, {
+  const payload = await fetchJson<{
+    data?: GatewayModel[]
+    models?: GatewayModel[]
+  }>(GATEWAY_ENDPOINT, {
     signal: options.signal
   })
-  const rawModels = Array.isArray(payload?.data) ? payload!.data! : payload?.models ?? []
+  const rawModels = Array.isArray(payload?.data) ? payload!.data! : (payload?.models ?? [])
   return rawModels.map((raw) => {
     const provider = normalizeProvider(raw.id)
     const name = raw.id.split('/').slice(1).join('/') || raw.name
@@ -1386,7 +1741,12 @@ async function fetchGatewayEntries(options: SourceFetchOptions = {}): Promise<Ca
     const tags = (raw.tags ?? []).map((tag) => tag.toLowerCase())
     const contextWindow = raw.context_window ?? raw.max_tokens
     const pricing = mapPricing(raw.pricing)
-    const purpose = inferModelPurpose({ modelType: raw.type ?? null, id: raw.id, name, tags })
+    const purpose = inferModelPurpose({
+      modelType: raw.type ?? null,
+      id: raw.id,
+      name,
+      tags
+    })
 
     return {
       id: raw.id,
@@ -1417,9 +1777,7 @@ async function fetchGatewayEntries(options: SourceFetchOptions = {}): Promise<Ca
 async function fetchOpenRouterEntries(options: SourceFetchOptions = {}): Promise<CatalogEntry[]> {
   const apiKey = await getRuntimeEnv('OPENROUTER_API_KEY')
   const payload = await fetchJson<{ data: OpenRouterModel[] }>(OPENROUTER_ENDPOINT, {
-    headers: apiKey
-      ? { Authorization: `Bearer ${apiKey}` }
-      : undefined,
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
     signal: options.signal
   })
 
@@ -1434,7 +1792,12 @@ function mapOpenRouterModelToCatalogEntry(raw: OpenRouterModel): CatalogEntry {
   const provider = normalizeProvider(raw.id)
   const name = raw.id.split('/').slice(1).join('/') || raw.name
   const canonicalId = buildCanonicalId(provider, name)
-  const purpose = inferModelPurpose({ modelType: null, id: raw.id, name, tags })
+  const purpose = inferModelPurpose({
+    modelType: null,
+    id: raw.id,
+    name,
+    tags
+  })
 
   return {
     id: raw.id,
@@ -1536,12 +1899,8 @@ function enrichWithAA(entry: CatalogEntry, aaMap: Map<string, any>) {
     : entry.pricing
   const contextWindow =
     normalizePositiveInteger(
-      match.context_window ??
-      match.context_window_tokens ??
-      match.context ??
-      match.max_context
-    ) ??
-    entry.contextWindow
+      match.context_window ?? match.context_window_tokens ?? match.context ?? match.max_context
+    ) ?? entry.contextWindow
 
   return {
     ...entry,
@@ -1601,10 +1960,7 @@ function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
 
     const idVariants = buildIdVariants(group) ?? base.idVariants
     const availableConnections = Array.from(
-      new Set([
-        ...group.map((entry) => entry.connectionId),
-        ...Object.keys(idVariants ?? {})
-      ].filter(Boolean))
+      new Set([...group.map((entry) => entry.connectionId), ...Object.keys(idVariants ?? {})].filter(Boolean))
     )
 
     const purpose = mergePurpose(group.map((entry) => entry.purpose))
@@ -1638,24 +1994,25 @@ function findCatalogIdentityIssues(models: CatalogEntry[]): CatalogIdentityIssue
 
   for (const model of models) {
     const connectionIds = new Set(
-      [
-        ...(model.availableConnections ?? []),
-        model.connectionId
-      ].filter((value): value is string => Boolean(value))
+      [...(model.availableConnections ?? []), model.connectionId].filter((value): value is string => Boolean(value))
     )
 
     for (const connectionId of connectionIds) {
       const variant = model.idVariants?.[connectionId]
       if (!variant) {
-        issues.push({ catalogId: model.id, connectionId, reason: 'missing-variant' })
+        issues.push({
+          catalogId: model.id,
+          connectionId,
+          reason: 'missing-variant'
+        })
         continue
       }
-      if (
-        !variant.developerId?.trim() ||
-        !variant.modelId?.trim() ||
-        !variant.effectiveId?.trim()
-      ) {
-        issues.push({ catalogId: model.id, connectionId, reason: 'incomplete-variant' })
+      if (!variant.developerId?.trim() || !variant.modelId?.trim() || !variant.effectiveId?.trim()) {
+        issues.push({
+          catalogId: model.id,
+          connectionId,
+          reason: 'incomplete-variant'
+        })
       }
     }
   }
@@ -1671,9 +2028,7 @@ function assertCatalogIdentityIntegrity(models: CatalogEntry[]) {
     .slice(0, 8)
     .map((issue) => `${issue.catalogId} @ ${issue.connectionId} (${issue.reason})`)
     .join(', ')
-  throw new Error(
-    `Catalog identity integrity failed for ${issues.length} connection variant(s): ${sample}`
-  )
+  throw new Error(`Catalog identity integrity failed for ${issues.length} connection variant(s): ${sample}`)
 }
 
 export function _mergeCatalogEntriesForTest(entries: CatalogEntry[]): CatalogEntry[] {
@@ -1703,6 +2058,29 @@ export function _mapDeepInfraModelsForTest(models: DeepInfraCatalogModel[]): Dir
   return mapDeepInfraModels(models)
 }
 
+export function _mapTogetherModelsForTest(models: TogetherCatalogModel[]): DirectProviderEntry[] {
+  return mapTogetherModels(models)
+}
+
+export function _mapFireworksModelsForTest(models: FireworksCatalogModel[]): DirectProviderEntry[] {
+  return mapFireworksModels(models)
+}
+
+export function _mapBasetenModelsForTest(models: BasetenCatalogModel[]): DirectProviderEntry[] {
+  return mapBasetenModels(models)
+}
+
+export function _mapOpenAICompatibleCatalogModelsForTest(
+  provider: 'cerebras' | 'minimax' | 'mimo',
+  models: OpenAICompatibleCatalogModel[]
+): DirectProviderEntry[] {
+  return mapOpenAICompatibleCatalogModels(provider, models)
+}
+
+export function _mapCohereModelsForTest(models: CohereCatalogModel[]): DirectProviderEntry[] {
+  return mapCohereModels(models)
+}
+
 export function _mapDirectProviderEntriesForTest(
   provider: DirectProviderId,
   entries: DirectProviderEntry[]
@@ -1721,7 +2099,9 @@ export function _buildCatalogSyncDiffForTest({
 }
 
 async function uploadCatalog(payload: CatalogPayload) {
-  await upstashKvSet('catalog:v1', payload, { timeoutMs: CATALOG_FETCH_TIMEOUT_MS })
+  await upstashKvSet('catalog:v1', payload, {
+    timeoutMs: CATALOG_FETCH_TIMEOUT_MS
+  })
 }
 
 type CatalogSyncSourceStatus = {
@@ -1828,10 +2208,11 @@ function buildFallbackEntriesFromExisting({
   const results: CatalogEntry[] = []
 
   for (const model of models) {
-    const availableConnections = Array.isArray(model?.availableConnections) ? (model.availableConnections as string[]) : []
-    const variants = model?.idVariants && typeof model.idVariants === 'object'
-      ? (model.idVariants as Record<string, any>)
-      : null
+    const availableConnections = Array.isArray(model?.availableConnections)
+      ? (model.availableConnections as string[])
+      : []
+    const variants =
+      model?.idVariants && typeof model.idVariants === 'object' ? (model.idVariants as Record<string, any>) : null
 
     const hasConnection =
       safeString(model?.connectionId) === connectionId ||
@@ -1856,9 +2237,7 @@ function buildFallbackEntriesFromExisting({
     const purpose = normalizePurpose(model?.purpose, inferredPurpose)
     const effectiveId =
       safeString(variant?.effectiveId) ||
-      (connectionId === 'openrouter' || connectionId === 'vercel-gateway'
-        ? `${provider}/${name}`
-        : name)
+      (connectionId === 'openrouter' || connectionId === 'vercel-gateway' ? `${provider}/${name}` : name)
 
     results.push({
       id: effectiveId,
@@ -1873,9 +2252,10 @@ function buildFallbackEntriesFromExisting({
       maxOutputTokens: typeof model?.maxOutputTokens === 'number' ? model.maxOutputTokens : undefined,
       purpose,
       pricing: typeof model?.pricing === 'object' ? model.pricing : undefined,
-      features: typeof model?.features === 'object'
-        ? model.features
-        : deriveFeatures(tags, typeof model?.contextWindow === 'number' ? model.contextWindow : undefined, undefined),
+      features:
+        typeof model?.features === 'object'
+          ? model.features
+          : deriveFeatures(tags, typeof model?.contextWindow === 'number' ? model.contextWindow : undefined, undefined),
       category: model?.category,
       source,
       transport,
@@ -1891,13 +2271,7 @@ function normalizeError(error: unknown) {
   return safeString(error) || 'unknown error'
 }
 
-function shouldUseFallback({
-  fetchedCount,
-  previousCount
-}: {
-  fetchedCount: number
-  previousCount: number
-}) {
+function shouldUseFallback({ fetchedCount, previousCount }: { fetchedCount: number; previousCount: number }) {
   if (!previousCount) {
     return fetchedCount === 0
   }
@@ -2028,8 +2402,12 @@ function buildCatalogSyncDiff({
     const prevConnections = extractConnectionSet(previousModel)
     const nextConnections = extractConnectionSet(nextModel)
 
-    const addedConnections = Array.from(nextConnections).filter((conn) => !prevConnections.has(conn)).sort()
-    const removedConnections = Array.from(prevConnections).filter((conn) => !nextConnections.has(conn)).sort()
+    const addedConnections = Array.from(nextConnections)
+      .filter((conn) => !prevConnections.has(conn))
+      .sort()
+    const removedConnections = Array.from(prevConnections)
+      .filter((conn) => !nextConnections.has(conn))
+      .sort()
 
     if (!addedConnections.length && !removedConnections.length) continue
 
@@ -2066,6 +2444,71 @@ function computeCatalogSyncStatus(sources: CatalogSyncSourceStatus[]): 'ok' | 'd
   return 'ok'
 }
 
+const DIRECT_SOURCE_FETCHERS: Record<
+  DirectProviderId,
+  (options?: SourceFetchOptions) => Promise<DirectProviderEntry[]>
+> = {
+  openai: fetchOpenAIEntries,
+  anthropic: fetchAnthropicEntries,
+  google: fetchGoogleEntries,
+  mistral: fetchMistralEntries,
+  groq: fetchGroqEntries,
+  xai: fetchXAIEntries,
+  deepseek: fetchDeepSeekEntries,
+  deepinfra: fetchDeepInfraEntries,
+  moonshot: fetchMoonshotEntries,
+  minimax: fetchMiniMaxEntries,
+  mimo: fetchMimoEntries,
+  zai: fetchZaiEntries,
+  zai_coding: fetchZaiCodingEntries,
+  togetherai: fetchTogetherEntries,
+  fireworks: fetchFireworksEntries,
+  baseten: fetchBasetenEntries,
+  cerebras: fetchCerebrasEntries,
+  fal: fetchFalEntries,
+  luma: fetchLumaEntries,
+  replicate: fetchReplicateEntries,
+  elevenlabs: fetchElevenLabsEntries,
+  deepgram: fetchDeepgramEntries,
+  assemblyai: fetchAssemblyAiEntries,
+  cohere: fetchCohereEntries
+}
+
+const DIRECT_SOURCE_ENV_VARS: Record<DirectProviderId, string[]> = {
+  openai: ['OPENAI_API_KEY'],
+  anthropic: ['ANTHROPIC_API_KEY'],
+  google: ['GOOGLE_GENERATIVE_AI_API_KEY'],
+  mistral: ['MISTRAL_API_KEY'],
+  groq: ['GROQ_API_KEY'],
+  xai: ['XAI_API_KEY'],
+  deepseek: ['DEEPSEEK_API_KEY'],
+  deepinfra: [],
+  moonshot: ['MOONSHOT_API_KEY'],
+  minimax: ['MINIMAX_API_KEY'],
+  mimo: ['MIMO_API_KEY'],
+  zai: ['ZAI_API_KEY'],
+  zai_coding: [],
+  togetherai: ['TOGETHER_API_KEY'],
+  fireworks: ['FIREWORKS_API_KEY'],
+  baseten: ['BASETEN_API_KEY'],
+  cerebras: ['CEREBRAS_API_KEY'],
+  fal: ['FAL_API_KEY', 'FAL_KEY'],
+  luma: ['LUMA_API_KEY'],
+  replicate: ['REPLICATE_API_KEY'],
+  elevenlabs: ['ELEVENLABS_API_KEY'],
+  deepgram: ['DEEPGRAM_API_KEY'],
+  assemblyai: ['ASSEMBLYAI_API_KEY'],
+  cohere: ['COHERE_API_KEY']
+}
+
+async function isDirectSourceConfigured(provider: DirectProviderId) {
+  const environmentVariables = DIRECT_SOURCE_ENV_VARS[provider]
+  if (!environmentVariables.length) return true
+
+  const configuredValues = await Promise.all(environmentVariables.map((name) => getRuntimeEnv(name)))
+  return configuredValues.some(Boolean)
+}
+
 export async function runModelCatalogSync(
   options: RunModelCatalogSyncOptions = {}
 ): Promise<RunModelCatalogSyncResult> {
@@ -2095,261 +2538,34 @@ export async function runModelCatalogSync(
       }).length
     : 0
 
-  const previousDirectCounts: Record<DirectProviderId, number> = {
-    openai: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('openai'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    anthropic: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('anthropic'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    google: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('google'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    mistral: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('mistral'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    groq: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('groq'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    xai: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('xai'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    deepseek: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('deepseek'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    deepinfra: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('deepinfra'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    moonshot: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('moonshot'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    zai: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('zai'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    zai_coding: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('zai_coding'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    fal: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('fal'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    luma: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('luma'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    replicate: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('replicate'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    elevenlabs: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('elevenlabs'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    deepgram: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('deepgram'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    assemblyai: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('assemblyai'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0,
-    cohere: existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId: asDirectConnectionId('cohere'),
-          source: 'direct',
-          transport: 'direct'
-        }).length
-      : 0
-  }
+  const previousDirectCounts = Object.fromEntries(
+    DIRECT_PROVIDER_IDS.map((provider) => [
+      provider,
+      existing
+        ? buildFallbackEntriesFromExisting({
+            existing,
+            connectionId: asDirectConnectionId(provider),
+            source: 'direct',
+            transport: 'direct'
+          }).length
+        : 0
+    ])
+  ) as Record<DirectProviderId, number>
 
-  const [
-    openaiKey,
-    anthropicKey,
-    googleKey,
-    mistralKey,
-    groqKey,
-    xaiKey,
-    deepseekKey,
-    moonshotKey,
-    zaiKey,
-    zaiCodingKey,
-    falKey,
-    falLegacyKey,
-    lumaKey,
-    replicateKey,
-    elevenlabsKey,
-    deepgramKey,
-    assemblyAiKey,
-    cohereKey
-  ] = await Promise.all([
-    getRuntimeEnv('OPENAI_API_KEY'),
-    getRuntimeEnv('ANTHROPIC_API_KEY'),
-    getRuntimeEnv('GOOGLE_GENERATIVE_AI_API_KEY'),
-    getRuntimeEnv('MISTRAL_API_KEY'),
-    getRuntimeEnv('GROQ_API_KEY'),
-    getRuntimeEnv('XAI_API_KEY'),
-    getRuntimeEnv('DEEPSEEK_API_KEY'),
-    getRuntimeEnv('MOONSHOT_API_KEY'),
-    getRuntimeEnv('ZAI_API_KEY'),
-    getRuntimeEnv('ZAI_CODING_API_KEY'),
-    getRuntimeEnv('FAL_API_KEY'),
-    getRuntimeEnv('FAL_KEY'),
-    getRuntimeEnv('LUMA_API_KEY'),
-    getRuntimeEnv('REPLICATE_API_KEY'),
-    getRuntimeEnv('ELEVENLABS_API_KEY'),
-    getRuntimeEnv('DEEPGRAM_API_KEY'),
-    getRuntimeEnv('ASSEMBLYAI_API_KEY'),
-    getRuntimeEnv('COHERE_API_KEY')
-  ])
+  const directSourceConfigured = Object.fromEntries(
+    await Promise.all(DIRECT_PROVIDER_IDS.map(async (provider) => [provider, await isDirectSourceConfigured(provider)]))
+  ) as Record<DirectProviderId, boolean>
 
-  const resolvedFalKey = falKey || falLegacyKey
-  const resolvedZaiCodingKey = zaiCodingKey || zaiKey
-  const directSourceConfigured: Record<DirectProviderId, boolean> = {
-    openai: Boolean(openaiKey),
-    anthropic: Boolean(anthropicKey),
-    google: Boolean(googleKey),
-    mistral: Boolean(mistralKey),
-    groq: Boolean(groqKey),
-    xai: Boolean(xaiKey),
-    deepseek: Boolean(deepseekKey),
-    deepinfra: true,
-    moonshot: Boolean(moonshotKey),
-    zai: Boolean(zaiKey),
-    zai_coding: Boolean(resolvedZaiCodingKey),
-    fal: Boolean(resolvedFalKey),
-    luma: Boolean(lumaKey),
-    replicate: Boolean(replicateKey),
-    elevenlabs: Boolean(elevenlabsKey),
-    deepgram: Boolean(deepgramKey),
-    assemblyai: Boolean(assemblyAiKey),
-    cohere: Boolean(cohereKey)
-  }
-
-  const [
-    gatewayResult,
-    openRouterResult,
-    aaResult,
-    openaiResult,
-    anthropicResult,
-    googleResult,
-    mistralResult,
-    groqResult,
-    xaiResult,
-    deepseekResult,
-    deepinfraResult,
-    moonshotResult,
-    zaiResult,
-    zaiCodingResult,
-    falResult,
-    lumaResult,
-    replicateResult,
-    elevenlabsResult,
-    deepgramResult,
-    assemblyAiResult,
-    cohereResult
-  ] = await Promise.allSettled([
+  const [gatewayResult, openRouterResult, aaResult, ...directSourceResults] = await Promise.allSettled([
     fetchGatewayEntries(createSourceOptions()),
     fetchOpenRouterEntries(createSourceOptions()),
     fetchArtificialAnalysis(createSourceOptions()),
-    fetchOpenAIEntries(createSourceOptions()),
-    fetchAnthropicEntries(createSourceOptions()),
-    fetchGoogleEntries(createSourceOptions()),
-    fetchMistralEntries(createSourceOptions()),
-    fetchGroqEntries(createSourceOptions()),
-    fetchXAIEntries(createSourceOptions()),
-    fetchDeepSeekEntries(createSourceOptions()),
-    fetchDeepInfraEntries(createSourceOptions()),
-    fetchMoonshotEntries(createSourceOptions()),
-    fetchZaiEntries(createSourceOptions()),
-    fetchZaiCodingEntries(createSourceOptions()),
-    fetchFalEntries(createSourceOptions()),
-    fetchLumaEntries(createSourceOptions()),
-    fetchReplicateEntries(createSourceOptions()),
-    fetchElevenLabsEntries(createSourceOptions()),
-    fetchDeepgramEntries(createSourceOptions()),
-    fetchAssemblyAiEntries(createSourceOptions()),
-    fetchCohereEntries(createSourceOptions())
+    ...DIRECT_PROVIDER_IDS.map((provider) => DIRECT_SOURCE_FETCHERS[provider](createSourceOptions()))
   ])
+
+  const directSourceResultsByProvider = Object.fromEntries(
+    DIRECT_PROVIDER_IDS.map((provider, index) => [provider, directSourceResults[index]])
+  ) as Record<DirectProviderId, PromiseSettledResult<DirectProviderEntry[]>>
 
   const sources: CatalogSyncSourceStatus[] = []
 
@@ -2363,10 +2579,12 @@ export async function runModelCatalogSync(
         transport: 'vercel-gateway'
       })
     : []
-  const useGatewayFallback = !gatewayEntriesFresh || shouldUseFallback({
-    fetchedCount: gatewayEntriesFresh.length,
-    previousCount: previousGatewayCount
-  })
+  const useGatewayFallback =
+    !gatewayEntriesFresh ||
+    shouldUseFallback({
+      fetchedCount: gatewayEntriesFresh.length,
+      previousCount: previousGatewayCount
+    })
 
   const gatewayEntries = useGatewayFallback ? gatewayFallback : gatewayEntriesFresh
   if (!hasExisting && (!gatewayEntriesFresh || gatewayEntriesFresh.length === 0)) {
@@ -2397,10 +2615,12 @@ export async function runModelCatalogSync(
         transport: 'openrouter'
       })
     : []
-  const useOpenRouterFallback = !openRouterEntriesFresh || shouldUseFallback({
-    fetchedCount: openRouterEntriesFresh.length,
-    previousCount: previousOpenRouterCount
-  })
+  const useOpenRouterFallback =
+    !openRouterEntriesFresh ||
+    shouldUseFallback({
+      fetchedCount: openRouterEntriesFresh.length,
+      previousCount: previousOpenRouterCount
+    })
 
   const openRouterEntries = useOpenRouterFallback ? openRouterFallback : openRouterEntriesFresh
 
@@ -2438,10 +2658,12 @@ export async function runModelCatalogSync(
         })
       : []
     const previousCount = previousDirectCounts[provider] ?? 0
-    const useFallback = !fresh || shouldUseFallback({
-      fetchedCount: fresh.length,
-      previousCount
-    })
+    const useFallback =
+      !fresh ||
+      shouldUseFallback({
+        fetchedCount: fresh.length,
+        previousCount
+      })
 
     const entries = useFallback ? fallback : fresh
     sources.push({
@@ -2463,54 +2685,31 @@ export async function runModelCatalogSync(
     return entries
   }
 
-  const openaiEntries = resolveDirectSource({ provider: 'openai', result: openaiResult })
-  const anthropicEntries = resolveDirectSource({ provider: 'anthropic', result: anthropicResult })
-  const googleEntries = resolveDirectSource({ provider: 'google', result: googleResult })
-  const mistralEntries = resolveDirectSource({ provider: 'mistral', result: mistralResult })
-  const groqEntries = resolveDirectSource({ provider: 'groq', result: groqResult })
-  const xaiEntries = resolveDirectSource({ provider: 'xai', result: xaiResult })
-  const deepseekEntries = resolveDirectSource({ provider: 'deepseek', result: deepseekResult })
-  const deepinfraEntries = resolveDirectSource({ provider: 'deepinfra', result: deepinfraResult })
-  const moonshotEntries = resolveDirectSource({ provider: 'moonshot', result: moonshotResult })
-  const zaiEntries = resolveDirectSource({ provider: 'zai', result: zaiResult })
-  const zaiCodingEntries = resolveDirectSource({ provider: 'zai_coding', result: zaiCodingResult })
-  const falEntries = resolveDirectSource({ provider: 'fal', result: falResult })
-  const lumaEntries = resolveDirectSource({ provider: 'luma', result: lumaResult })
-  const replicateEntries = resolveDirectSource({ provider: 'replicate', result: replicateResult })
-  const elevenlabsEntries = resolveDirectSource({ provider: 'elevenlabs', result: elevenlabsResult })
-  const deepgramEntries = resolveDirectSource({ provider: 'deepgram', result: deepgramResult })
-  const assemblyAiEntries = resolveDirectSource({ provider: 'assemblyai', result: assemblyAiResult })
-  const cohereEntries = resolveDirectSource({ provider: 'cohere', result: cohereResult })
+  const directEntriesByProvider = Object.fromEntries(
+    DIRECT_PROVIDER_IDS.map((provider) => [
+      provider,
+      resolveDirectSource({
+        provider,
+        result: directSourceResultsByProvider[provider]
+      })
+    ])
+  ) as Record<DirectProviderId, CatalogEntry[]>
 
-  const aaMap = aaResult.status === 'fulfilled'
-    ? aaResult.value
-    : new Map<string, any>()
+  const aaMap = aaResult.status === 'fulfilled' ? aaResult.value : new Map<string, any>()
 
   if (aaResult.status === 'rejected') {
-    console.warn('[catalog] AA enrichment fetch failed; continuing without enrichment:', normalizeError(aaResult.reason))
+    console.warn(
+      '[catalog] AA enrichment fetch failed; continuing without enrichment:',
+      normalizeError(aaResult.reason)
+    )
   }
 
   const allEntries = [
     ...gatewayEntries.map((entry) => enrichWithAA(entry, aaMap)),
     ...openRouterEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...openaiEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...anthropicEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...googleEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...mistralEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...groqEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...xaiEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...deepseekEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...deepinfraEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...moonshotEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...zaiEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...zaiCodingEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...falEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...lumaEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...replicateEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...elevenlabsEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...deepgramEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...assemblyAiEntries.map((entry) => enrichWithAA(entry, aaMap)),
-    ...cohereEntries.map((entry) => enrichWithAA(entry, aaMap))
+    ...DIRECT_PROVIDER_IDS.flatMap((provider) =>
+      directEntriesByProvider[provider].map((entry) => enrichWithAA(entry, aaMap))
+    )
   ]
 
   const merged = mergeCatalogEntries(allEntries).sort((a, b) => a.displayName.localeCompare(b.displayName))
@@ -2522,48 +2721,16 @@ export async function runModelCatalogSync(
     counts: {
       vercel: gatewayEntries.length,
       openrouter: openRouterEntries.length,
-      openai: openaiEntries.length,
-      anthropic: anthropicEntries.length,
-      google: googleEntries.length,
-      mistral: mistralEntries.length,
-      groq: groqEntries.length,
-      xai: xaiEntries.length,
-      deepseek: deepseekEntries.length,
-      deepinfra: deepinfraEntries.length,
-      moonshot: moonshotEntries.length,
-      zai: zaiEntries.length,
-      zai_coding: zaiCodingEntries.length,
-      fal: falEntries.length,
-      luma: lumaEntries.length,
-      replicate: replicateEntries.length,
-      elevenlabs: elevenlabsEntries.length,
-      deepgram: deepgramEntries.length,
-      assemblyai: assemblyAiEntries.length,
-      cohere: cohereEntries.length
+      ...Object.fromEntries(DIRECT_PROVIDER_IDS.map((provider) => [provider, directEntriesByProvider[provider].length]))
     },
     models: merged
   }
 
   await uploadCatalog(payload)
-  const directTotal =
-    openaiEntries.length +
-    anthropicEntries.length +
-    googleEntries.length +
-    mistralEntries.length +
-    groqEntries.length +
-    xaiEntries.length +
-    deepseekEntries.length +
-    deepinfraEntries.length +
-    moonshotEntries.length +
-    zaiEntries.length +
-    zaiCodingEntries.length +
-    falEntries.length +
-    lumaEntries.length +
-    replicateEntries.length +
-    elevenlabsEntries.length +
-    deepgramEntries.length +
-    assemblyAiEntries.length +
-    cohereEntries.length
+  const directTotal = DIRECT_PROVIDER_IDS.reduce(
+    (total, provider) => total + directEntriesByProvider[provider].length,
+    0
+  )
   logger.debug(
     `[catalog] Uploaded ${merged.length} models (vercel=${gatewayEntries.length}, openrouter=${openRouterEntries.length}, direct=${directTotal})`
   )
