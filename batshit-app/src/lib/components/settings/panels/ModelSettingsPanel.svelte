@@ -75,6 +75,7 @@ import {
   resolvePresetMaxOutputTokens
 } from '$lib/utils/modelOutputTokens'
 import type { CatalogModel, CatalogConnectionOption } from '$lib/types/modelCatalog'
+import { isManualEntryCatalogConnection } from '$lib/utils/modelCatalogConnectionMode'
 import {
   CATALOG_ROLE_OPTIONS,
   almostEqual,
@@ -481,13 +482,6 @@ const connectionProviderHints = new Map([
   ['direct:vllm', 'vllm']
 ])
 const n8nOnlyConnections = new Set(['azure-openai', 'aws-bedrock', 'google-vertex', 'direct:huggingface'])
-const manualEntryConnections = new Set([
-  'direct:huggingface',
-  'direct:togetherai',
-  'direct:fireworks',
-  'direct:baseten',
-  'direct:cerebras'
-])
 function allowModelForConnection(model: CatalogModel, connection: CatalogConnectionOption) {
   if (!n8nOnlyConnections.has(connection.id)) return true
   const explicitConnections = new Set(
@@ -749,7 +743,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
   })
   const manualEntryConnectionActive = $derived.by(() => {
     if (!selectedConnection) return false
-    return manualEntryConnections.has(selectedConnection.id) || isCustomConnection
+    return isManualEntryCatalogConnection(selectedConnection.id)
   })
   const connectionNeedsManualModel = $derived.by(() => {
     if (!selectedConnection) return false
@@ -3536,9 +3530,9 @@ $effect(() => {
           <div class="batshit-settings-note is-dashed">
             <p>No catalog available yet. Choose a connection, then copy its provider defaults into the preset and enter the developer and model ID manually below.</p>
             <p class="mt-2">
-              Tip: For multi-tenant providers (Together.ai, Fireworks, Baseten, Cerebras), use
-              <code>developer/model</code> so Batshit can route correctly. Custom providers can either use the toggle below
-              or put <code>developer/model</code> directly in the Model ID field.
+              Tip: When a manual connection expects a namespaced identifier, use
+              <code>developer/model</code> exactly as the provider documents it. Custom providers can either use the toggle below
+              or put the full identifier directly in the Model ID field.
             </p>
           </div>
         {:else if connectionNeedsManualModel}

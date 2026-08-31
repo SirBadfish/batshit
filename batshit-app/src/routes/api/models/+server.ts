@@ -26,6 +26,7 @@ import { listCustomProviders } from '$lib/server/services/customProviders'
 import type { CustomProviderSummary } from '$lib/types/customProviders'
 import { listLocalAiServers, resolveLocalAiRuntimeBaseUrl } from '$lib/server/services/localAiServers'
 import type { LocalAiServerSummary } from '$lib/types/localAi'
+import { isManualEntryDirectProvider } from '$lib/utils/modelCatalogConnectionMode'
 
 const CODEX_PROVIDER_ENABLED = env.BATSHIT_CODEX_PROVIDER_ENABLED !== 'false'
 const CODEX_PROVIDER_ID = 'openai-codex'
@@ -665,10 +666,6 @@ function buildConnectionOptions(
     'baseten',
     'cerebras'
   ]
-  const MANUAL_ENTRY_DIRECT_PROVIDERS = new Set<KnownProviderId>([
-    'alibaba',
-    'stepfun'
-  ])
   const DIRECT_PROVIDER_LABELS: Partial<Record<KnownProviderId, string>> = {
     deepseek: 'DeepSeek',
     zai: 'Z.ai General',
@@ -712,7 +709,7 @@ function buildConnectionOptions(
   }
   for (const provider of directProviders) {
     const status = access.availability[provider]
-    const manualEntry = MANUAL_ENTRY_DIRECT_PROVIDERS.has(provider)
+    const manualEntry = isManualEntryDirectProvider(provider)
     const providerLabel = DIRECT_PROVIDER_LABELS[provider] ?? titleCase(provider)
     const providerDescription =
       DIRECT_PROVIDER_DESCRIPTIONS[provider] ??
