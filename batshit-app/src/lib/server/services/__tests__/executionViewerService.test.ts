@@ -175,6 +175,11 @@ describe('executionViewerService retention', () => {
       runtime: {
         runtimeId: 'vercel',
         status: 'succeeded'
+      },
+      reasoningPersistence: {
+        status: 'saved',
+        characterCount: 24,
+        source: 'message.metadata.reasoningSummary'
       }
     })
 
@@ -182,6 +187,11 @@ describe('executionViewerService retention', () => {
     const snapshots = await executionViewerService.getSnapshots('session-ev')
     expect(snapshots[0]?.responseSummary?.content.value).toBe('Done')
     expect(snapshots[0]?.runtime?.status).toBe('succeeded')
+    expect(snapshots[0]?.reasoningPersistence).toEqual({
+      status: 'saved',
+      characterCount: 24,
+      source: 'message.metadata.reasoningSummary'
+    })
   })
 
   it('bounds oversized debug strings during snapshot updates', async () => {

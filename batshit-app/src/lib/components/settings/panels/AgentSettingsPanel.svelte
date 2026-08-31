@@ -8258,7 +8258,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                     side="bottom"
                                     class={SETTINGS_INFO_CONTENT_CLASS}
                                   >
-                                    When enabled, the reasoning summary is saved with the message in Redis and still appears after refresh. When disabled, it only appears during the live response.
+                                    When enabled, the reasoning summary is saved with the message in Redis and still appears after refresh. It is not added to later model requests. When disabled, it only appears during the live response.
                                   </DropdownMenu.Content>
                                 </DropdownMenu.Root>
                               </div>

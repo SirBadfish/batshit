@@ -82,6 +82,12 @@ export interface ExecutionResponseSummary {
   notes?: string[]
 }
 
+export interface ExecutionReasoningPersistence {
+  status: 'saved' | 'not-requested' | 'not-emitted'
+  characterCount: number
+  source: 'message.metadata.reasoningSummary'
+}
+
 export interface ExecutionRuntimeDetails {
   runtimeId: ExecutionRuntimeId
   providerId?: string | null
@@ -126,6 +132,7 @@ export interface ExecutionSnapshot {
   intermediateSteps?: any[] | null
   /** Final response summary (assistant output, tool counts, usage) */
   responseSummary?: ExecutionResponseSummary | null
+  reasoningPersistence?: ExecutionReasoningPersistence | null
   selectedGateways?: string[] | null
   selectedTools?: string[] | null
   mcpToolSelections?: import('$lib/types/database').MCPToolSelections | null

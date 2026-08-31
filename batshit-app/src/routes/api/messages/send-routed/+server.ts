@@ -76,8 +76,10 @@ import {
 import { generateMessageId } from '$lib/utils/messageId'
 import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
 import {
+  buildReasoningPersistenceEvidence,
   collectReasoningTextFromFinish,
   extractReasoningTextFromRawChunk,
+  ReasoningStreamSourceArbiter,
   resolveTaggedReasoningTagName,
   withReasoningProviderOptions,
 } from '$lib/utils/reasoningDisplay'
@@ -4209,6 +4211,24 @@ async function handleBatshitAgentStream({
 
       await redis.saveMessage(finalMessage)
 
+      try {
+        await executionViewerService.updateSnapshot(sessionId, messageId, {
+          reasoningPersistence: buildReasoningPersistenceEvidence({
+            showReasoning,
+            preserveReasoning,
+            reasoningSummary:
+              typeof (finalMessage.metadata as any)?.reasoningSummary === 'string'
+                ? (finalMessage.metadata as any).reasoningSummary
+                : null,
+          }),
+        })
+      } catch (reasoningEvidenceError) {
+        console.warn(
+          '[Send-Routed] Failed to record reasoning persistence evidence:',
+          reasoningEvidenceError,
+        )
+      }
+
       zipDetection.deleteSessionBuffers(sessionId)
       finalMessagePersisted = true
     })()
@@ -4224,6 +4244,7 @@ async function handleBatshitAgentStream({
   let streamedMessageContent = ''
   let reasoningActive = false
   let reasoningCaptured = ''
+  const reasoningStreamSource = new ReasoningStreamSourceArbiter()
   let thinkingIndicatorEmitted = false
   let planItems: PlanItem[] = []
   let planSummary = ''
@@ -4652,6 +4673,24 @@ async function handleBatshitAgentStream({
     })
   }
 
+  const appendReasoningDelta = async (content: string) => {
+    if (!showReasoning || !content) return
+    if (!reasoningActive && reasoningCaptured) {
+      reasoningCaptured += '\n\n'
+      await emitReasoningAppend('\n\n')
+    }
+    reasoningActive = true
+    reasoningCaptured += content
+    await emitReasoningAppend(content)
+  }
+
+  const flushRawReasoningFallback = async () => {
+    const pending = reasoningStreamSource.flushRawFallback()
+    if (pending) {
+      await appendReasoningDelta(pending)
+    }
+  }
+
   const ensureReasoningSegmentBoundary = async () => {
     if (!showReasoning) return
     if (!reasoningActive) return
@@ -4880,6 +4919,7 @@ async function handleBatshitAgentStream({
       if (showReasoning && !reasoningCaptured) {
         const finishReasoning = collectReasoningTextFromFinish(reasoning)
         if (finishReasoning) {
+          reasoningStreamSource.noteNormalizedReasoning()
           reasoningCaptured = finishReasoning
           await emitReasoningReplace(finishReasoning)
         }
@@ -4916,6 +4956,7 @@ async function handleBatshitAgentStream({
 
         const combined = collected.join('\n\n').trim()
         if (combined) {
+          reasoningStreamSource.noteNormalizedReasoning()
           reasoningCaptured = combined
           await emitReasoningReplace(combined)
         }
@@ -5622,6 +5663,7 @@ async function handleBatshitAgentStream({
         case 'text-delta': {
           const textChunk = stripRepeatedLeadingGroupControls((chunk as any).text || '')
           if (textChunk) {
+            await flushRawReasoningFallback()
             if (controlsEnabled && !controlsResolved) {
               controlsBuffer += textChunk
               resolveControlsFromBuffer()
@@ -5669,13 +5711,8 @@ async function handleBatshitAgentStream({
             (chunk as any).content ??
             ''
           if (typeof delta === 'string' && delta) {
-            if (!reasoningActive && reasoningCaptured) {
-              reasoningCaptured += '\n\n'
-              await emitReasoningAppend('\n\n')
-            }
-            reasoningActive = true
-            reasoningCaptured += delta
-            await emitReasoningAppend(delta)
+            reasoningStreamSource.noteNormalizedReasoning()
+            await appendReasoningDelta(delta)
           }
           break
         }
@@ -5692,6 +5729,7 @@ async function handleBatshitAgentStream({
             pendingControlText = ''
           }
           await ensureStartEmitted()
+          reasoningStreamSource.noteNormalizedReasoning()
           if (!reasoningActive && reasoningCaptured) {
             reasoningCaptured += '\n\n'
             await emitReasoningAppend('\n\n')
@@ -5723,19 +5761,15 @@ async function handleBatshitAgentStream({
             (chunk as any).content ??
             ''
           if (typeof delta === 'string' && delta) {
-            if (!reasoningActive && reasoningCaptured) {
-              reasoningCaptured += '\n\n'
-              await emitReasoningAppend('\n\n')
-            }
-            reasoningActive = true
-            reasoningCaptured += delta
-            await emitReasoningAppend(delta)
+            reasoningStreamSource.noteNormalizedReasoning()
+            await appendReasoningDelta(delta)
           }
           break
         }
         case 'reasoning-end':
         case 'reasoning_end': {
           if (!showReasoning) break
+          reasoningStreamSource.noteNormalizedReasoning()
           reasoningActive = false
           break
         }
@@ -5759,12 +5793,14 @@ async function handleBatshitAgentStream({
           if (!content) break
 
           // Codex emits full reasoning content on each update. Stream as replace events.
+          reasoningStreamSource.noteNormalizedReasoning()
           reasoningCaptured = content
           reasoningActive = Boolean(!thinkingChunk?.final)
           await emitReasoningReplace(content)
           break
         }
         case 'tool-call': {
+          await flushRawReasoningFallback()
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true
@@ -6292,18 +6328,17 @@ async function handleBatshitAgentStream({
           const rawReasoning = extractReasoningTextFromRawChunk(
             rawChunk?.rawValue,
           )
-          if (showReasoning && rawReasoning) {
-            if (!reasoningActive && reasoningCaptured) {
-              reasoningCaptured += '\n\n'
-              await emitReasoningAppend('\n\n')
+          if (showReasoning) {
+            const readyRawFallback =
+              reasoningStreamSource.queueRawFallback(rawReasoning)
+            if (readyRawFallback) {
+              await appendReasoningDelta(readyRawFallback)
             }
-            reasoningActive = true
-            reasoningCaptured += rawReasoning
-            await emitReasoningAppend(rawReasoning)
           }
           break
         }
         case 'error': {
+          await flushRawReasoningFallback()
           const errorChunk = chunk as any
           const rawError =
             errorChunk?.error ??
@@ -6332,6 +6367,7 @@ async function handleBatshitAgentStream({
           break
         }
         case 'finish': {
+          await flushRawReasoningFallback()
           await ensureReasoningSegmentBoundary()
           const finishChunk = chunk as any
           const usage =
@@ -6353,6 +6389,11 @@ async function handleBatshitAgentStream({
         break
       }
     }
+
+    // Keep the raw fallback consumer-owned. The SDK finish callback can run
+    // ahead of queued stream parts; flushing there could append raw reasoning
+    // before the matching normalized part reaches this loop.
+    await flushRawReasoningFallback()
 
     if (!onFinishResolved) {
       await Promise.race([
