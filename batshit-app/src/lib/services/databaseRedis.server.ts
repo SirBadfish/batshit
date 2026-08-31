@@ -23,7 +23,11 @@ import type { GoonRecord, GoonsSettings } from '$lib/types/goons'
 import type { DesktopGoonPresentationMode } from '$lib/goons/desktopGoonPresentation'
 import type { Message } from '$lib/stores/messages.svelte'
 import type { GroupChatAgentSettings } from '$lib/types/groupChat'
-import { compileForAI, type ZipExposure } from '$lib/services/messageCompiler'
+import {
+  buildPreservedReasoningHistory,
+  compileForAI,
+  type ZipExposure
+} from '$lib/services/messageCompiler'
 import { normalizeId } from '$lib/utils/idNormalizer'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
 import { createReference, extractAllReferences } from '$lib/services/universalResolver'
@@ -1617,7 +1621,8 @@ export class DatabaseService {
       if (
         message.role === 'assistant' &&
         !message.content?.trim() &&
-        (!message.toolResults || message.toolResults.length === 0)
+        (!message.toolResults || message.toolResults.length === 0) &&
+        !buildPreservedReasoningHistory(agent, message)
       ) {
         continue
       }

@@ -1302,4 +1302,49 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
       }
     }
   })
+
+  it('S20: Preserve Reasoning matches the Execution Viewer Compiled Messages contract', async () => {
+    const reasoningText = 'I checked the provider stream and the stored message before answering.'
+    const messages = [
+      {
+        id: 'msg-reasoning-user',
+        role: 'user',
+        content: 'Why did this happen?',
+        timestamp: '2026-06-12T09:00:00.000Z',
+        metadata: {}
+      },
+      {
+        id: 'msg-reasoning-assistant',
+        role: 'assistant',
+        agent_id: 'agent-api-parity',
+        content: 'Because two equivalent reasoning streams were emitted.',
+        timestamp: '2026-06-12T09:00:30.000Z',
+        metadata: { reasoningSummary: reasoningText }
+      }
+    ]
+
+    const excludedSessionId = nextSessionId()
+    state.current = freshState(excludedSessionId)
+    const { server: excluded } = await runServerCompile({
+      sessionId: excludedSessionId,
+      messages,
+      agent: apiAgent({ preserve_reasoning: false }),
+      currentUserMessage: 'What should we test next?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    expect(JSON.stringify(excluded.structuredInput.messages)).not.toContain(reasoningText)
+
+    const includedSessionId = nextSessionId()
+    state.current = freshState(includedSessionId)
+    const { server: included } = await runServerCompile({
+      sessionId: includedSessionId,
+      messages,
+      agent: apiAgent({ preserve_reasoning: true }),
+      currentUserMessage: 'What should we test next?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    const compiledMessages = JSON.stringify(included.structuredInput.messages)
+    expect(compiledMessages).toContain('==== PRESERVED REASONING FROM THIS RESPONSE ====')
+    expect(compiledMessages).toContain(reasoningText)
+  })
 })

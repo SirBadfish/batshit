@@ -832,4 +832,48 @@ describe('messageCompiler – cool_tool inline payloads', () => {
     expect(healthy).not.toContain('cut short by an error')
   })
 
+  it('includes saved reasoning in model history only when Preserve Reasoning is on', async () => {
+    const message = {
+      agent_id: 'agent-a',
+      metadata: {
+        reasoningSummary: 'I compared both implementation paths.',
+        planSummary: '- [x] Verify the compiler contract'
+      }
+    }
+
+    const excluded = await compileForAI(
+      'The final answer.',
+      0,
+      1,
+      { id: 'agent-a', preserve_reasoning: false },
+      message,
+      {}
+    )
+    expect(excluded).toBe('The final answer.')
+
+    const included = await compileForAI(
+      'The final answer.',
+      0,
+      1,
+      { id: 'agent-a', preserve_reasoning: true },
+      message,
+      {}
+    )
+    expect(included).toContain('==== PRESERVED REASONING FROM THIS RESPONSE ====')
+    expect(included).toContain('I compared both implementation paths.')
+    expect(included).toContain('==== PRESERVED PLAN FROM THIS RESPONSE ====')
+    expect(included).toContain('- [x] Verify the compiler contract')
+    expect(included).toContain('The final answer.')
+
+    const otherAgent = await compileForAI(
+      'The final answer.',
+      0,
+      1,
+      { id: 'agent-b', preserve_reasoning: true },
+      message,
+      {}
+    )
+    expect(otherAgent).toBe('The final answer.')
+  })
+
 })

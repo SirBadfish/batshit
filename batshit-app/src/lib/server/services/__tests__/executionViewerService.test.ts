@@ -177,7 +177,8 @@ describe('executionViewerService retention', () => {
         status: 'succeeded'
       },
       reasoningPersistence: {
-        status: 'saved',
+        userHistoryStatus: 'saved',
+        agentHistoryStatus: 'included',
         characterCount: 24,
         source: 'message.metadata.reasoningSummary'
       }
@@ -188,7 +189,8 @@ describe('executionViewerService retention', () => {
     expect(snapshots[0]?.responseSummary?.content.value).toBe('Done')
     expect(snapshots[0]?.runtime?.status).toBe('succeeded')
     expect(snapshots[0]?.reasoningPersistence).toEqual({
-      status: 'saved',
+      userHistoryStatus: 'saved',
+      agentHistoryStatus: 'included',
       characterCount: 24,
       source: 'message.metadata.reasoningSummary'
     })

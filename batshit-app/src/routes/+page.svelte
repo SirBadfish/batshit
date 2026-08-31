@@ -2973,7 +2973,7 @@ const immersiveActive = $derived.by(
         return
       }
 
-      const { showReasoning, preserveReasoning } = resolveReasoningFlags(targetMessageId)
+      const { showReasoning } = resolveReasoningFlags(targetMessageId)
       if (!showReasoning) {
         return
       }
@@ -2995,7 +2995,7 @@ const immersiveActive = $derived.by(
       }
 
       const targetMessage = resolveMessage(targetMessageId)
-      if (targetMessage && preserveReasoning) {
+      if (targetMessage && showReasoning) {
         messageStore.updateMessage(targetMessageId, {
           metadata: {
             ...(targetMessage.metadata || {}),
@@ -3541,7 +3541,7 @@ const immersiveActive = $derived.by(
         metadata.imageZipIds = data.metadata.imageZipIds
       }
 
-      const { preserveReasoning } = resolveReasoningFlags(targetMessageId)
+      const { showReasoning } = resolveReasoningFlags(targetMessageId)
       const planPayload = planSubjects[targetMessageId]
       const fallbackPlanSummary =
         typeof (currentMessage.metadata as any)?.planSummary === 'string'
@@ -3559,7 +3559,7 @@ const immersiveActive = $derived.by(
       const resolvedPlanItems =
         planPayload?.items && planPayload.items.length > 0 ? planPayload.items : fallbackPlanItems
 
-      if (preserveReasoning) {
+      if (showReasoning) {
         if (resolvedPlanSummary) {
           metadata.planSummary = resolvedPlanSummary
         }

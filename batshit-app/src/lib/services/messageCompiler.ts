@@ -52,6 +52,52 @@ export interface ZipExposure {
   message?: any
 }
 
+const PRESERVED_REASONING_HEADER = '==== PRESERVED REASONING FROM THIS RESPONSE ===='
+const PRESERVED_PLAN_HEADER = '==== PRESERVED PLAN FROM THIS RESPONSE ===='
+
+function resolveMessageAgentId(message?: any): string | null {
+  const value =
+    message?.agent_id ??
+    message?.agentId ??
+    message?.metadata?.agentId ??
+    message?.metadata?.agent_id
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
+}
+
+/**
+ * Builds the exact prior-reasoning block that enters the canonical model history.
+ * The saved metadata remains user-visible regardless of this setting; this function
+ * is only the model-context gate for the agent that authored the response.
+ */
+export function buildPreservedReasoningHistory(agent: any, message?: any): string {
+  if (agent?.preserve_reasoning !== true) return ''
+
+  const currentAgentId =
+    typeof agent?.id === 'string' && agent.id.trim().length > 0 ? agent.id.trim() : null
+  const messageAgentId = resolveMessageAgentId(message)
+  if (currentAgentId && messageAgentId && currentAgentId !== messageAgentId) {
+    return ''
+  }
+
+  const reasoningSummary =
+    typeof message?.metadata?.reasoningSummary === 'string'
+      ? message.metadata.reasoningSummary.trim()
+      : ''
+  const planSummary =
+    typeof message?.metadata?.planSummary === 'string'
+      ? message.metadata.planSummary.trim()
+      : ''
+
+  const blocks: string[] = []
+  if (reasoningSummary) {
+    blocks.push(`${PRESERVED_REASONING_HEADER}\n${reasoningSummary}`)
+  }
+  if (planSummary) {
+    blocks.push(`${PRESERVED_PLAN_HEADER}\n${planSummary}`)
+  }
+  return blocks.join('\n\n')
+}
+
 const escapeScriptContent = (value: string) => value.replace(/<\/script/gi, '<\\/script')
 
 function getCoolToolRawSidecarZipId(zipData: ZipData, payload: Record<string, any> | null): string | null {
@@ -431,6 +477,13 @@ export async function compileForAI(
       ? `[This response was cut short by an error before completing: ${reason}]`
       : '[This response was cut short by an error before completing.]'
     compiled = compiled.trim().length > 0 ? `${compiled}\n\n${note}` : note
+  }
+
+  const preservedReasoningHistory = buildPreservedReasoningHistory(agent, _message)
+  if (preservedReasoningHistory) {
+    compiled = compiled.trim().length > 0
+      ? `${preservedReasoningHistory}\n\n${compiled}`
+      : preservedReasoningHistory
   }
 
   return compiled

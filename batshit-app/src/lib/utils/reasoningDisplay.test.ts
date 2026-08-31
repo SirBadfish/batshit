@@ -71,7 +71,7 @@ describe('reasoningDisplay utilities', () => {
     expect(arbiter.flushRawFallback()).toBe('')
   })
 
-  it('records exact reasoning persistence outcomes without storing another preview', () => {
+  it('separates user-visible reasoning persistence from later agent history', () => {
     expect(
       buildReasoningPersistenceEvidence({
         showReasoning: true,
@@ -79,7 +79,8 @@ describe('reasoningDisplay utilities', () => {
         reasoningSummary: 'Checked the constraints.',
       }),
     ).toEqual({
-      status: 'saved',
+      userHistoryStatus: 'saved',
+      agentHistoryStatus: 'included',
       characterCount: 24,
       source: 'message.metadata.reasoningSummary',
     })
@@ -89,7 +90,7 @@ describe('reasoningDisplay utilities', () => {
         showReasoning: true,
         preserveReasoning: true,
         reasoningSummary: '',
-      }).status,
+      }).userHistoryStatus,
     ).toBe('not-emitted')
 
     expect(
@@ -98,7 +99,23 @@ describe('reasoningDisplay utilities', () => {
         preserveReasoning: false,
         reasoningSummary: 'Live only',
       }),
-    ).toMatchObject({ status: 'not-requested', characterCount: 0 })
+    ).toMatchObject({
+      userHistoryStatus: 'saved',
+      agentHistoryStatus: 'excluded',
+      characterCount: 9,
+    })
+
+    expect(
+      buildReasoningPersistenceEvidence({
+        showReasoning: false,
+        preserveReasoning: true,
+        reasoningSummary: '',
+      }),
+    ).toMatchObject({
+      userHistoryStatus: 'not-requested',
+      agentHistoryStatus: 'not-applicable',
+      characterCount: 0,
+    })
   })
 
   it('routes Gateway MiMo to Xiaomi without changing its reasoning mode', () => {
