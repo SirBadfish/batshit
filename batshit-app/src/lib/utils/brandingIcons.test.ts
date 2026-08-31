@@ -8,6 +8,7 @@ describe('branding icon dark-mode inversion', () => {
     expect(needsDarkModeInvert('/ai-branding-generated/adobe-mono.svg')).toBe(true)
     expect(needsDarkModeInvert('/ai-branding/codex-mono.svg')).toBe(true)
     expect(needsDarkModeInvert('/brand-icons/mcp-mono.svg')).toBe(true)
+    expect(needsDarkModeInvert('/ai-branding/mimo-color.svg')).toBe(true)
   })
 
   it('leaves bundled color brand icons unchanged', () => {
@@ -25,6 +26,13 @@ describe('branding icon resolution', () => {
     expect(getProviderIconEntry('deepgram').icon).toBe('/ai-branding/deepgram-color.svg')
     expect(getProviderIconEntry('async').icon).toBe('/ai-branding/async-color.svg')
     expect(getProviderIconEntry('cartesia').icon).toBe('/ai-branding/cartesia-color.svg')
+    expect(getProviderIconEntry('fish').icon).toBe('/ai-branding-generated/fishaudio-mono.svg')
+    expect(getProviderIconEntry('minimax').icon).toBe('/ai-branding/minimax-color.svg')
+    expect(getProviderIconEntry('alibaba').icon).toBe('/ai-branding/alibaba-color.svg')
+    expect(getProviderIconEntry('stepfun').icon).toBe('/ai-branding/stepfun-color.svg')
+    expect(getProviderIconEntry('livekit').icon).toBe('/ai-branding/livekit-color.svg')
+    expect(getProviderIconEntry('inworld').icon).toBe('/ai-branding/inworld-mono.svg')
+    expect(getProviderIconEntry('azure-speech').icon).toBe('/ai-branding/azure-color.svg')
   })
 
   it('uses Batshit for an unknown provider and never OpenRouter as a generic fallback', () => {

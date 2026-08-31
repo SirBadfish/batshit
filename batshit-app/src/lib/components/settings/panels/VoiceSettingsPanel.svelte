@@ -16,6 +16,7 @@
   import SettingsTextEditor from '$lib/components/settings/SettingsTextEditor.svelte'
   import CreateVoiceCloneCard from '$lib/components/settings/voice/CreateVoiceCloneCard.svelte'
   import SavedVoiceClonesPanel from '$lib/components/settings/voice/SavedVoiceClonesPanel.svelte'
+  import VoiceProviderIcon from '$lib/components/settings/voice/VoiceProviderIcon.svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import IconPicker from '$lib/components/icons/IconPicker.svelte'
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
@@ -3575,15 +3576,24 @@
                             handleSttProviderChange((Array.isArray(value) ? value[0] : value) as string)}
                         >
                           <Select.Trigger class="w-full justify-between">
-                            <span class="truncate">
-                              {selectedSttProvider?.label ?? 'Browser (Web Speech API)'}
+                            <span class="flex min-w-0 items-center gap-2">
+                              <VoiceProviderIcon
+                                providerId={selectedSttProvider?.id}
+                                label={selectedSttProvider?.label}
+                              />
+                              <span class="truncate">
+                                {selectedSttProvider?.label ?? 'Browser (Web Speech API)'}
+                              </span>
                             </span>
                           </Select.Trigger>
                           <Select.Content>
                             {#each sttProviderOptions as provider (provider.id)}
                               <Select.Item value={provider.id}>
                                 <div class="flex items-center justify-between gap-2">
-                                  <span>{provider.label}</span>
+                                  <span class="flex min-w-0 items-center gap-2">
+                                    <VoiceProviderIcon providerId={provider.id} label={provider.label} />
+                                    <span class="truncate">{provider.label}</span>
+                                  </span>
                                   <div class="flex shrink-0 items-center gap-1.5">
                                     {#if provider.ready === false}
                                       <Badge variant="outline" class="batshit-settings-pill is-warning">
@@ -3878,15 +3888,24 @@
                           disabled={!voiceModeUsesSttInput}
                         >
                           <Select.Trigger class="w-full justify-between">
-                            <span class="truncate">
-                              {selectedRealtimeSttProvider?.label ?? 'Browser (Web Speech API)'}
+                            <span class="flex min-w-0 items-center gap-2">
+                              <VoiceProviderIcon
+                                providerId={selectedRealtimeSttProvider?.id}
+                                label={selectedRealtimeSttProvider?.label}
+                              />
+                              <span class="truncate">
+                                {selectedRealtimeSttProvider?.label ?? 'Browser (Web Speech API)'}
+                              </span>
                             </span>
                           </Select.Trigger>
                           <Select.Content>
                             {#each realtimeSttProviderOptions as provider (provider.id)}
                               <Select.Item value={provider.id}>
                                 <div class="flex items-center justify-between gap-2">
-                                  <span>{provider.label}</span>
+                                  <span class="flex min-w-0 items-center gap-2">
+                                    <VoiceProviderIcon providerId={provider.id} label={provider.label} />
+                                    <span class="truncate">{provider.label}</span>
+                                  </span>
                                   <div class="flex shrink-0 items-center gap-1.5">
                                     {#if provider.ready === false}
                                       <Badge variant="outline" class="batshit-settings-pill is-warning">
@@ -4185,15 +4204,24 @@
                             handleTtsProviderChange((Array.isArray(value) ? value[0] : value) as string)}
                         >
                           <Select.Trigger class="w-full justify-between">
-                            <span class="truncate">
-                              {selectedTtsProvider?.label ?? 'Browser (Web Speech API)'}
+                            <span class="flex min-w-0 items-center gap-2">
+                              <VoiceProviderIcon
+                                providerId={selectedTtsProvider?.id}
+                                label={selectedTtsProvider?.label}
+                              />
+                              <span class="truncate">
+                                {selectedTtsProvider?.label ?? 'Browser (Web Speech API)'}
+                              </span>
                             </span>
                           </Select.Trigger>
                           <Select.Content>
                             {#each ttsProviderOptions as provider (provider.id)}
                               <Select.Item value={provider.id}>
                                 <div class="flex items-center justify-between gap-2">
-                                  <span>{provider.label}</span>
+                                  <span class="flex min-w-0 items-center gap-2">
+                                    <VoiceProviderIcon providerId={provider.id} label={provider.label} />
+                                    <span class="truncate">{provider.label}</span>
+                                  </span>
                                   <div class="flex shrink-0 items-center gap-1.5">
                                     {#if provider.ready === false}
                                       <Badge variant="outline" class="batshit-settings-pill is-warning">
@@ -4592,7 +4620,12 @@
               <div class="flex flex-wrap items-center justify-between gap-3">
                 <div class="flex min-w-0 items-center gap-3">
                   <div class="batshit-settings-icon-frame h-9 w-9 shrink-0">
-                    <Radio class="h-5 w-5" />
+                    <VoiceProviderIcon
+                      providerId="livekit"
+                      label="LiveKit"
+                      class="h-5 w-5"
+                      fallback="runtime"
+                    />
                   </div>
                   <div class="min-w-0">
                     <div class="flex flex-wrap items-center gap-2">
@@ -4782,7 +4815,12 @@
                         <div class="flex items-center justify-between gap-3">
                           <div class="flex min-w-0 items-center gap-3">
                             <div class="batshit-settings-icon-frame h-9 w-9 shrink-0">
-                              <AudioLines class="h-5 w-5" />
+                              <VoiceProviderIcon
+                                providerId={provider.id}
+                                label={provider.label}
+                                class="h-5 w-5"
+                                fallback="tts"
+                              />
                             </div>
                             <div class="min-w-0">
                               <div class="flex flex-wrap items-center gap-2">
@@ -5080,7 +5118,12 @@
                         <div class="flex items-center justify-between gap-3">
                           <div class="flex min-w-0 items-center gap-3">
                             <div class="batshit-settings-icon-frame h-9 w-9 shrink-0">
-                              <Mic class="h-5 w-5" />
+                              <VoiceProviderIcon
+                                providerId={provider.id}
+                                label={provider.label}
+                                class="h-5 w-5"
+                                fallback="stt"
+                              />
                             </div>
                             <div class="min-w-0">
                               <div class="flex flex-wrap items-center gap-2">

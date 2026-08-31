@@ -61,9 +61,18 @@ const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   huggingface: 'huggingface-color',
   deepseek: 'deepseek-color',
   deepgram: 'deepgram-color',
+  fish: 'fishaudio-mono',
+  fishaudio: 'fishaudio-mono',
   cartesia: 'cartesia-color',
   async: 'async-color',
   mimo: 'mimo-color',
+  minimax: 'minimax-color',
+  alibaba: 'alibaba-color',
+  alibabacloud: 'alibaba-color',
+  stepfun: 'stepfun-color',
+  livekit: 'livekit-color',
+  inworld: 'inworld-mono',
+  azurespeech: 'azure-color',
   zai: 'zai-mono',
   zai_coding: 'zai-mono',
   'x-ai': 'xai-mono',
@@ -115,6 +124,8 @@ export const darkModeInvertIcons = [
   'mcp-mono.svg',
   'elevenlabs-mono.svg',
   'fishaudio-mono.svg',
+  'inworld-mono.svg',
+  'mimo-color.svg',
   'vercel-mono.svg'
 ]
 

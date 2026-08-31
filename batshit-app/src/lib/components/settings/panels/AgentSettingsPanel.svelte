@@ -82,6 +82,7 @@ import { CLAUDE_CLI_MODEL_CHOICES } from "$lib/data/claude-cli-models";
   import * as Dialog from "$lib/components/ui/dialog";
   import * as DropdownMenu from "$lib/components/ui/dropdown-menu";
 import ModelProviderIcon from "$lib/components/models/ModelProviderIcon.svelte";
+import VoiceProviderIcon from "$lib/components/settings/voice/VoiceProviderIcon.svelte";
 import BatshitIcon from "$lib/components/icons/BatshitIcon.svelte";
 import IconPicker from "$lib/components/icons/IconPicker.svelte";
 import EntityAvatar from "$lib/components/avatar/EntityAvatar.svelte";
@@ -11268,11 +11269,14 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                       }}
                     >
                       <Select.Trigger class="justify-between">
-                        <span class="truncate">
-                          {basicForm.voice_profile.sttProvider
-                            ? sttProviderOptions.find((option) =>
-                                option.id === basicForm.voice_profile.sttProvider)?.label ?? "Custom STT provider"
-                            : "Use Global Default"}
+                        <span class="flex min-w-0 items-center gap-2">
+                          <VoiceProviderIcon providerId={basicForm.voice_profile.sttProvider} />
+                          <span class="truncate">
+                            {basicForm.voice_profile.sttProvider
+                              ? sttProviderOptions.find((option) =>
+                                  option.id === basicForm.voice_profile.sttProvider)?.label ?? "Custom STT provider"
+                              : "Use Global Default"}
+                          </span>
                         </span>
                       </Select.Trigger>
                       <Select.Content>
@@ -11282,7 +11286,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                         {#each sttProviderOptions as option (option.id)}
                           <Select.Item value={option.id}>
                             <div class="flex items-center justify-between gap-2">
-                              <span>{option.label}</span>
+                              <span class="flex min-w-0 items-center gap-2">
+                                <VoiceProviderIcon providerId={option.id} label={option.label} />
+                                <span class="truncate">{option.label}</span>
+                              </span>
                               <div class="flex shrink-0 items-center gap-1.5">
                                 {#if option.ready === false}
                                   <Badge variant="outline" class="batshit-settings-pill is-warning">
@@ -11642,11 +11649,14 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                       disabled={voiceModeLockedBySpeechToSpeech || !agentVoiceModeUsesSttInput}
                     >
                       <Select.Trigger class="justify-between">
-                        <span class="truncate">
-                          {basicForm.voice_profile.realtimeSttProvider
-                            ? realtimeSttProviderOptions.find((option) =>
-                                option.id === basicForm.voice_profile.realtimeSttProvider)?.label ?? "Custom realtime STT provider"
-                            : "Use Global Default"}
+                        <span class="flex min-w-0 items-center gap-2">
+                          <VoiceProviderIcon providerId={basicForm.voice_profile.realtimeSttProvider} />
+                          <span class="truncate">
+                            {basicForm.voice_profile.realtimeSttProvider
+                              ? realtimeSttProviderOptions.find((option) =>
+                                  option.id === basicForm.voice_profile.realtimeSttProvider)?.label ?? "Custom realtime STT provider"
+                              : "Use Global Default"}
+                          </span>
                         </span>
                       </Select.Trigger>
                       <Select.Content>
@@ -11656,7 +11666,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                         {#each realtimeSttProviderOptions as option (option.id)}
                           <Select.Item value={option.id}>
                             <div class="flex items-center justify-between gap-2">
-                              <span>{option.label}</span>
+                              <span class="flex min-w-0 items-center gap-2">
+                                <VoiceProviderIcon providerId={option.id} label={option.label} />
+                                <span class="truncate">{option.label}</span>
+                              </span>
                               <div class="flex shrink-0 items-center gap-1.5">
                                 {#if option.ready === false}
                                   <Badge variant="outline" class="batshit-settings-pill is-warning">
@@ -11757,11 +11770,14 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                         disabled={voiceModeLockedBySpeechToSpeech}
                       >
                         <Select.Trigger class="justify-between">
-                          <span class="truncate">
-                            {basicForm.voice_profile.provider
-                              ? voiceProviderOptions.find((option) =>
-                                  option.id === basicForm.voice_profile.provider)?.label ?? "Custom provider"
-                              : "Use Global Default"}
+                          <span class="flex min-w-0 items-center gap-2">
+                            <VoiceProviderIcon providerId={basicForm.voice_profile.provider} />
+                            <span class="truncate">
+                              {basicForm.voice_profile.provider
+                                ? voiceProviderOptions.find((option) =>
+                                    option.id === basicForm.voice_profile.provider)?.label ?? "Custom provider"
+                                : "Use Global Default"}
+                            </span>
                           </span>
                         </Select.Trigger>
                         <Select.Content>
@@ -11771,7 +11787,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                           {#each voiceProviderOptions as option (option.id)}
                             <Select.Item value={option.id}>
                               <div class="flex items-center justify-between gap-2">
-                                <span>{option.label}</span>
+                                <span class="flex min-w-0 items-center gap-2">
+                                  <VoiceProviderIcon providerId={option.id} label={option.label} />
+                                  <span class="truncate">{option.label}</span>
+                                </span>
                                 <div class="flex shrink-0 items-center gap-1.5">
                                   {#if option.ready === false}
                                     <Badge variant="outline" class="batshit-settings-pill is-warning">

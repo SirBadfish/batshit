@@ -143,6 +143,29 @@ describe('modelConnections utilities', () => {
 
       expect(isModelAllowedForConnection(model, connection)).toBe(true)
     })
+
+    it('treats Qwen Cloud as a multi-developer direct provider', () => {
+      const model = baseModel({
+        provider: 'wan',
+        availableConnections: ['direct:qwencloud'],
+        idVariants: {
+          'direct:qwencloud': {
+            developerId: 'wan',
+            modelId: 'wan2.2-t2v-plus',
+            effectiveId: 'wan2.2-t2v-plus',
+            source: 'direct'
+          }
+        }
+      })
+      const connection = baseConnection({
+        id: 'direct:qwencloud',
+        label: 'Qwen Cloud Direct',
+        transport: 'direct',
+        providers: ['qwencloud']
+      })
+
+      expect(isModelAllowedForConnection(model, connection)).toBe(true)
+    })
   })
 
   describe('autoSelectConnectionForModel', () => {
