@@ -42,6 +42,7 @@ function providerAccess(
     'moonshot',
     'minimax',
     'mimo',
+    'qwencloud',
     'alibaba',
     'stepfun',
     'zai',

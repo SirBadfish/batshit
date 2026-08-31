@@ -16,6 +16,7 @@ const CHAT_PROVIDER_LABELS = new Map<string, string>([
   ['moonshot', 'Moonshot AI'],
   ['minimax', 'MiniMax'],
   ['mimo', 'MiMo'],
+  ['qwencloud', 'Qwen Cloud'],
   ['alibaba', 'Alibaba Cloud'],
   ['stepfun', 'StepFun'],
   ['zai', 'Z.ai General'],

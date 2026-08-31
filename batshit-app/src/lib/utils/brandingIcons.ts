@@ -11,17 +11,14 @@ type IconResolution = {
   usesCurrentColor: boolean
 }
 
-const DEFAULT_ICON_SLUG =
-  (['openrouter-mono', 'openrouter', 'huggingface-color'].find((candidate) =>
-    Object.prototype.hasOwnProperty.call(BRAND_ICON_MAP, candidate)
-  ) as BrandIconSlug | undefined) ?? (Object.keys(BRAND_ICON_MAP)[0] as BrandIconSlug)
-const DEFAULT_ICON = BRAND_ICON_MAP[DEFAULT_ICON_SLUG]
+const DEFAULT_ICON_SLUG: null = null
+const DEFAULT_ICON = '/batshit-icon-dark-ios.png'
 
 const COMMON_SUFFIXES = ['ai', 'org', 'labs', 'lab', 'inc', 'tech', 'team', 'research', 'group', 'cloud', 'studio', 'systems']
 
 const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   '@n8n/n8n-nodes-langchain.lmchatopenai': 'openai-mono',
-  '@n8n/n8n-nodes-langchain.lmchatanthropic': 'anthropic-mono',
+  '@n8n/n8n-nodes-langchain.lmchatanthropic': 'claude-color',
   '@n8n/n8n-nodes-langchain.lmchatazureopenai': 'azure-color',
   '@n8n/n8n-nodes-langchain.lmchatawsbedrock': 'bedrock-color',
   '@n8n/n8n-nodes-langchain.lmchatcohere': 'cohere-color',
@@ -31,7 +28,7 @@ const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   '@n8n/n8n-nodes-langchain.lmchatmistralai': 'mistral-color',
   '@n8n/n8n-nodes-langchain.lmchatollama': 'ollama-mono',
   '@n8n/n8n-nodes-langchain.lmchatollamamodel': 'ollama-mono',
-  '@n8n/n8n-nodes-langchain.lmchatopenrouter': 'openrouter-mono',
+  '@n8n/n8n-nodes-langchain.lmchatopenrouter': 'openrouter-color',
   '@n8n/n8n-nodes-langchain.lmchatxaigrok': 'grok-mono',
   '@n8n/n8n-nodes-langchain.lmcohere': 'cohere-color',
   '@n8n/n8n-nodes-langchain.lmollamamodel': 'ollama-mono',
@@ -42,15 +39,16 @@ const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   azureopenaicredentialsapi: 'azure-color',
   'aws-bedrock': 'bedrock-color',
   awsbedrock: 'bedrock-color',
-  anthropic: 'anthropic-mono',
-  openrouter: 'openrouter-mono',
-  openroutergateway: 'openrouter-mono',
+  anthropic: 'claude-color',
+  claude: 'claude-color',
+  openrouter: 'openrouter-color',
+  openroutergateway: 'openrouter-color',
   openai: 'openai-mono',
   fal: 'fal-color',
   'fal-ai': 'fal-color',
-  codex: 'codex-mono',
-  'codex-cli': 'codex-mono',
-  'openai-codex': 'codex-mono',
+  codex: 'codex-color',
+  'codex-cli': 'codex-color',
+  'openai-codex': 'codex-color',
   google: 'google-color',
   'google-gemini': 'gemini-color',
   googlegemini: 'gemini-color',
@@ -62,6 +60,10 @@ const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   cohere: 'cohere-color',
   huggingface: 'huggingface-color',
   deepseek: 'deepseek-color',
+  deepgram: 'deepgram-color',
+  cartesia: 'cartesia-color',
+  async: 'async-color',
+  mimo: 'mimo-color',
   zai: 'zai-mono',
   zai_coding: 'zai-mono',
   'x-ai': 'xai-mono',
@@ -88,6 +90,7 @@ const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   togetherai: 'together-color',
   perplexity: 'perplexity-color',
   qwen: 'qwen-color',
+  qwencloud: 'qwen-color',
   kimi: 'kimi-color',
   hailuo: 'hailuo-color',
   baidu: 'baidu-color',

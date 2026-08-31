@@ -52,7 +52,9 @@ const LUCIDE_NAME_MAP: Record<string, string> = {
 }
 
 const BRAND_NAME_MAP: Record<string, string> = {
-  anthropic: 'anthropic-mono',
+  anthropic: 'claude-color',
+  claude: 'claude-color',
+  codex: 'codex-color',
   comfyui: 'comfyui-color',
   docker: 'docker-color',
   elevenlabs: 'elevenlabs-mono',
@@ -64,6 +66,7 @@ const BRAND_NAME_MAP: Record<string, string> = {
   n8n: 'n8n-color',
   ollama: 'ollama-mono',
   openai: 'openai-mono',
+  openrouter: 'openrouter-color',
   qwen: 'qwen-color',
   vercel: 'vercel-mono',
   vllm: 'vllm-color',

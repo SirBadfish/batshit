@@ -137,6 +137,7 @@ const DIRECT_PROVIDER_IDS = [
   'moonshot',
   'minimax',
   'mimo',
+  'qwencloud',
   'zai',
   'zai_coding',
   'togetherai',
@@ -798,14 +799,16 @@ function normalizeDeveloperId(value: unknown, fallback: string) {
 }
 
 function mapOpenAICompatibleCatalogModels(
-  provider: 'cerebras' | 'minimax' | 'mimo',
+  provider: 'cerebras' | 'minimax' | 'mimo' | 'qwencloud',
   models: OpenAICompatibleCatalogModel[]
 ): DirectProviderEntry[] {
   return models
     .map((model) => {
       const id = safeString(model.id).trim()
-      const isAsr = provider === 'mimo' && /(?:^|[-_])asr(?:$|[-_])/i.test(id)
-      const isTts = provider === 'mimo' && /(?:^|[-_])tts(?:$|[-_])/i.test(id)
+      const isAsr =
+        (provider === 'mimo' || provider === 'qwencloud') && /(?:^|[-_])asr(?:$|[-_])/i.test(id)
+      const isTts =
+        (provider === 'mimo' || provider === 'qwencloud') && /(?:^|[-_])tts(?:$|[-_])/i.test(id)
       const isAudio = isAsr || isTts
       const tags = Array.from(
         new Set([
@@ -1354,6 +1357,21 @@ async function fetchMimoEntries(options: SourceFetchOptions = {}): Promise<Direc
     signal: options.signal
   })
   return mapOpenAICompatibleCatalogModels('mimo', models)
+}
+
+async function fetchQwenCloudEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const apiKey = await getRuntimeEnv('DASHSCOPE_API_KEY')
+  if (!apiKey) return []
+
+  const baseUrl =
+    (await getRuntimeEnv('DASHSCOPE_API_BASE_URL')) ||
+    'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+  const models = await fetchOpenAICompatibleModels({
+    baseUrl,
+    apiKey,
+    signal: options.signal
+  })
+  return mapOpenAICompatibleCatalogModels('qwencloud', models)
 }
 
 async function fetchMoonshotEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -2071,7 +2089,7 @@ export function _mapBasetenModelsForTest(models: BasetenCatalogModel[]): DirectP
 }
 
 export function _mapOpenAICompatibleCatalogModelsForTest(
-  provider: 'cerebras' | 'minimax' | 'mimo',
+  provider: 'cerebras' | 'minimax' | 'mimo' | 'qwencloud',
   models: OpenAICompatibleCatalogModel[]
 ): DirectProviderEntry[] {
   return mapOpenAICompatibleCatalogModels(provider, models)
@@ -2459,6 +2477,7 @@ const DIRECT_SOURCE_FETCHERS: Record<
   moonshot: fetchMoonshotEntries,
   minimax: fetchMiniMaxEntries,
   mimo: fetchMimoEntries,
+  qwencloud: fetchQwenCloudEntries,
   zai: fetchZaiEntries,
   zai_coding: fetchZaiCodingEntries,
   togetherai: fetchTogetherEntries,
@@ -2486,6 +2505,7 @@ const DIRECT_SOURCE_ENV_VARS: Record<DirectProviderId, string[]> = {
   moonshot: ['MOONSHOT_API_KEY'],
   minimax: ['MINIMAX_API_KEY'],
   mimo: ['MIMO_API_KEY'],
+  qwencloud: ['DASHSCOPE_API_KEY'],
   zai: ['ZAI_API_KEY'],
   zai_coding: [],
   togetherai: ['TOGETHER_API_KEY'],

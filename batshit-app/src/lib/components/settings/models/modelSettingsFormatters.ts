@@ -126,7 +126,7 @@ export function resolveConnectionIconKey(option: CatalogConnectionOption): strin
     CONNECTION_ICON_OVERRIDES[option.id] ??
     option.service ??
     option.providers?.[0] ??
-    'openrouter'
+    'batshit-icon'
   )
 }
 

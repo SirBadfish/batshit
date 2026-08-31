@@ -13,6 +13,14 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { ProviderManager } from './index'
 import { env as testEnv } from '$env/dynamic/private'
 import { createDeepInfra } from '@ai-sdk/deepinfra'
+import { createXai } from '@ai-sdk/xai'
+import { createDeepSeek } from '@ai-sdk/deepseek'
+import { createTogetherAI } from '@ai-sdk/togetherai'
+import { createFireworks } from '@ai-sdk/fireworks'
+import { createBaseten } from '@ai-sdk/baseten'
+import { createCerebras } from '@ai-sdk/cerebras'
+import { createCohere } from '@ai-sdk/cohere'
+import { createAlibaba } from '@ai-sdk/alibaba'
 
 // Mock environment variables for testing
 vi.mock('$env/dynamic/private', () => ({
@@ -22,10 +30,13 @@ vi.mock('$env/dynamic/private', () => ({
     GOOGLE_GENERATIVE_AI_API_KEY: 'test-google-key-123456789',
     GROQ_API_KEY: 'gsk_placeholder',
     MISTRAL_API_KEY: 'mistralplaceholder',
-    MINIMAX_API_KEY: 'minimax-test-key-123456789',
+    XAI_API_KEY: 'xai-placeholder',
+    DEEPSEEK_API_KEY: 'deepseek-placeholder',
+    MINIMAX_API_KEY: 'minimax-placeholder',
     MIMO_API_KEY: 'mimo-placeholder',
+    DASHSCOPE_API_KEY: 'dashscope-placeholder',
     ALIBABA_CLOUD_API_KEY: 'alibaba-placeholder',
-    STEPFUN_API_KEY: 'stepfun-test-key-123456789',
+    STEPFUN_API_KEY: 'stepfun-placeholder',
     OPENROUTER_API_KEY: 'sk-or-placeholder',
     DEEPINFRA_API_KEY: 'placeholder',
     DEEPINFRA_API_BASE_URL: 'https://api.deepinfra.com/v1/openai'
@@ -72,6 +83,38 @@ vi.mock('@ai-sdk/mistral', () => ({
 
 vi.mock('@ai-sdk/deepinfra', () => ({
   createDeepInfra: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'deepinfra' })))
+}))
+
+vi.mock('@ai-sdk/xai', () => ({
+  createXai: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'xai' })))
+}))
+
+vi.mock('@ai-sdk/deepseek', () => ({
+  createDeepSeek: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'deepseek' })))
+}))
+
+vi.mock('@ai-sdk/togetherai', () => ({
+  createTogetherAI: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'togetherai' })))
+}))
+
+vi.mock('@ai-sdk/fireworks', () => ({
+  createFireworks: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'fireworks' })))
+}))
+
+vi.mock('@ai-sdk/baseten', () => ({
+  createBaseten: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'baseten' })))
+}))
+
+vi.mock('@ai-sdk/cerebras', () => ({
+  createCerebras: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'cerebras' })))
+}))
+
+vi.mock('@ai-sdk/cohere', () => ({
+  createCohere: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'cohere' })))
+}))
+
+vi.mock('@ai-sdk/alibaba', () => ({
+  createAlibaba: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'qwencloud' })))
 }))
 
 ;(vi as any).mock(
@@ -322,6 +365,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
     it('registers new OpenAI-compatible direct model providers', () => {
       expect(providerManager.hasProvider('minimax')).toBe(true)
       expect(providerManager.hasProvider('mimo')).toBe(true)
+      expect(providerManager.hasProvider('qwencloud')).toBe(true)
       expect(providerManager.hasProvider('alibaba')).toBe(true)
       expect(providerManager.hasProvider('stepfun')).toBe(true)
 
@@ -329,6 +373,17 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(providerManager.getProviderInfo('mimo')?.models).toContain('mimo-v2.5-pro')
       expect(providerManager.getProviderInfo('alibaba')?.models).toContain('qwen3-max')
       expect(providerManager.getProviderInfo('stepfun')?.models).toContain('step-3.7-flash')
+
+      expect(
+        providerManager.getModel('qwen-plus', {
+          transport: 'direct',
+          service: 'qwencloud'
+        })
+      ).toMatchObject({ modelId: 'qwen-plus', provider: 'qwencloud' })
+      expect(createAlibaba).toHaveBeenCalledWith({
+        apiKey: 'dashscope-placeholder',
+        baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+      })
 
       const minimaxModel = providerManager.getModel('MiniMax-M3', {
         transport: 'direct',
@@ -340,31 +395,78 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       })
     })
 
-    it('uses Chat Completions for multi-tenant and Cohere compatibility providers', () => {
+    it('uses dedicated AI SDK providers for supported direct model services', () => {
       const compatibleManager = new ProviderManager({
         apiKeys: {
-          togetherai: 'together-test-key-123456789',
-          fireworks: 'fireworks-test-key-123456789',
-          baseten: 'baseten-test-key-123456789',
-          cerebras: 'cerebras-test-key-123456789',
-          cohere: 'cohere-test-key-123456789'
+          togetherai: 'together-placeholder',
+          fireworks: 'fireworks-placeholder',
+          baseten: 'baseten-placeholder',
+          cerebras: 'cerebras-placeholder',
+          cohere: 'cohere-placeholder'
         }
       })
 
-      for (const [service, modelId] of [
+      for (const [service, modelId, provider] of [
         ['togetherai', 'zai-org/GLM-5.3'],
         ['fireworks', 'accounts/fireworks/models/kimi-k3-instruct'],
         ['baseten', 'openai/gpt-oss-120b'],
         ['cerebras', 'gpt-oss-120b'],
         ['cohere', 'command-a-plus']
-      ] as const) {
+      ].map(([service, modelId]) => [service, modelId, service]) as Array<
+        readonly [string, string, string]
+      >) {
         expect(
           compatibleManager.getModel(modelId, {
             transport: 'direct',
             service
           })
-        ).toMatchObject({ modelId, mode: 'chat' })
+        ).toMatchObject({ modelId, provider })
       }
+
+      expect(createTogetherAI).toHaveBeenCalledWith({
+        apiKey: 'together-placeholder',
+        baseURL: undefined
+      })
+      expect(createFireworks).toHaveBeenCalledWith({
+        apiKey: 'fireworks-placeholder',
+        baseURL: undefined
+      })
+      expect(createBaseten).toHaveBeenCalledWith({
+        apiKey: 'baseten-placeholder',
+        baseURL: undefined
+      })
+      expect(createCerebras).toHaveBeenCalledWith({
+        apiKey: 'cerebras-placeholder',
+        baseURL: undefined
+      })
+      expect(createCohere).toHaveBeenCalledWith({
+        apiKey: 'cohere-placeholder',
+        baseURL: undefined
+      })
+    })
+
+    it('uses dedicated AI SDK providers for xAI and DeepSeek', () => {
+      expect(createXai).toHaveBeenCalledWith({
+        apiKey: 'xai-placeholder',
+        baseURL: undefined
+      })
+      expect(createDeepSeek).toHaveBeenCalledWith({
+        apiKey: 'deepseek-placeholder',
+        baseURL: undefined
+      })
+
+      expect(
+        providerManager.getModel('grok-4.3', {
+          transport: 'direct',
+          service: 'xai'
+        })
+      ).toMatchObject({ modelId: 'grok-4.3', provider: 'xai' })
+      expect(
+        providerManager.getModel('deepseek-chat', {
+          transport: 'direct',
+          service: 'deepseek'
+        })
+      ).toMatchObject({ modelId: 'deepseek-chat', provider: 'deepseek' })
     })
 
     it('5.3-INT-014: All 5+ providers active simultaneously', () => {

@@ -19,6 +19,14 @@ import { createGoogle } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
 import { createMistral } from '@ai-sdk/mistral'
 import { createDeepInfra } from '@ai-sdk/deepinfra'
+import { createXai } from '@ai-sdk/xai'
+import { createDeepSeek } from '@ai-sdk/deepseek'
+import { createTogetherAI } from '@ai-sdk/togetherai'
+import { createFireworks } from '@ai-sdk/fireworks'
+import { createBaseten } from '@ai-sdk/baseten'
+import { createCerebras } from '@ai-sdk/cerebras'
+import { createCohere } from '@ai-sdk/cohere'
+import { createAlibaba } from '@ai-sdk/alibaba'
 import { createOpenRouter } from '@openrouter/ai-sdk-provider'
 import { env } from '$env/dynamic/private'
 import { createGateway, type LanguageModel } from 'ai'
@@ -93,6 +101,7 @@ export type KnownProviderId =
   | 'moonshot'
   | 'minimax'
   | 'mimo'
+  | 'qwencloud'
   | 'alibaba'
   | 'stepfun'
   | 'zai'
@@ -453,9 +462,9 @@ export class ProviderManager {
     // DeepSeek Provider (Priority 6)
     const deepseekKey = this.apiKeys.deepseek ?? env.DEEPSEEK_API_KEY
     if (deepseekKey && this.validateApiKey(deepseekKey, 'DeepSeek')) {
-      const deepseek = createOpenAI({
+      const deepseek = createDeepSeek({
         apiKey: deepseekKey,
-        baseURL: env.DEEPSEEK_API_BASE_URL || 'https://api.deepseek.com'
+        baseURL: env.DEEPSEEK_API_BASE_URL || undefined
       })
       this.providers.set('deepseek', {
         client: (modelId: string) => deepseek(modelId),
@@ -480,19 +489,32 @@ export class ProviderManager {
       registeredCount++
     }
 
-    registerOpenAICompatibleProvider({
-      id: 'xai',
-      label: 'xAI',
-      apiKey: this.apiKeys.xai ?? env.XAI_API_KEY,
-      baseURL: env.XAI_API_BASE_URL || 'https://api.x.ai/v1',
-      priority: 7,
-      apiMode: 'chat',
-      models: [
-        'grok-4.3',
-        'grok-4.20-non-reasoning',
-        'grok-4.20-reasoning'
-      ]
-    })
+    const xaiKey = this.apiKeys.xai ?? env.XAI_API_KEY
+    if (xaiKey && this.validateApiKey(xaiKey, 'xAI')) {
+      const xai = createXai({
+        apiKey: xaiKey,
+        baseURL: env.XAI_API_BASE_URL || undefined
+      })
+      this.providers.set('xai', {
+        client: (modelId: string) => xai(modelId),
+        models: [
+          'grok-4.3',
+          'grok-4.20-non-reasoning',
+          'grok-4.20-reasoning'
+        ],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 128000,
+          reasoning: true
+        },
+        displayName: 'xAI',
+        priority: 7
+      })
+      logger.debug('[ProviderManager] xAI API key validated')
+      registeredCount++
+    }
 
     registerOpenAICompatibleProvider({
       id: 'zai',
@@ -561,7 +583,7 @@ export class ProviderManager {
     registerOpenAICompatibleProvider({
       id: 'alibaba',
       label: 'Alibaba Cloud Model Studio',
-      apiKey: this.apiKeys.alibaba ?? env.ALIBABA_CLOUD_API_KEY ?? env.DASHSCOPE_API_KEY,
+      apiKey: this.apiKeys.alibaba ?? env.ALIBABA_CLOUD_API_KEY,
       baseURL:
         env.ALIBABA_CLOUD_API_BASE_URL ??
         env.DASHSCOPE_API_BASE_URL ??
@@ -570,6 +592,33 @@ export class ProviderManager {
       apiMode: 'chat',
       models: ['qwen3-max', 'qwen-plus', 'qwen-flash', 'qwen3-coder-plus', 'qwq-plus']
     })
+
+    const qwenCloudKey = this.apiKeys.qwencloud ?? env.DASHSCOPE_API_KEY
+    if (qwenCloudKey && this.validateApiKey(qwenCloudKey, 'Qwen Cloud')) {
+      const qwenCloud = createAlibaba({
+        apiKey: qwenCloudKey,
+        baseURL:
+          env.DASHSCOPE_API_BASE_URL ||
+          'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+      })
+      this.providers.set('qwencloud', {
+        client: (modelId: string) => qwenCloud(modelId),
+        models: ['qwen-plus'],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 1_000_000,
+          reasoning: true,
+          longContext: true,
+          code: true
+        },
+        displayName: 'Qwen Cloud',
+        priority: 13
+      })
+      logger.debug('[ProviderManager] Qwen Cloud API key validated')
+      registeredCount++
+    }
 
     registerOpenAICompatibleProvider({
       id: 'stepfun',
@@ -636,50 +685,118 @@ export class ProviderManager {
       registeredCount++
     }
 
-    registerOpenAICompatibleProvider({
-      id: 'togetherai',
-      label: 'Together.ai',
-      apiKey: this.apiKeys.togetherai ?? env.TOGETHER_API_KEY,
-      baseURL: env.TOGETHER_API_BASE_URL || 'https://api.together.xyz/v1',
-      priority: 17,
-      apiMode: 'chat'
-    })
+    const togetherKey = this.apiKeys.togetherai ?? env.TOGETHER_API_KEY
+    if (togetherKey && this.validateApiKey(togetherKey, 'Together.ai')) {
+      const together = createTogetherAI({
+        apiKey: togetherKey,
+        baseURL: env.TOGETHER_API_BASE_URL || undefined
+      })
+      this.providers.set('togetherai', {
+        client: (modelId: string) => together(modelId),
+        models: [],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 128000
+        },
+        displayName: 'Together.ai',
+        priority: 17
+      })
+      logger.debug('[ProviderManager] Together.ai API key validated')
+      registeredCount++
+    }
 
-    registerOpenAICompatibleProvider({
-      id: 'fireworks',
-      label: 'Fireworks AI',
-      apiKey: this.apiKeys.fireworks ?? env.FIREWORKS_API_KEY,
-      baseURL: env.FIREWORKS_API_BASE_URL || 'https://api.fireworks.ai/inference/v1',
-      priority: 18,
-      apiMode: 'chat'
-    })
+    const fireworksKey = this.apiKeys.fireworks ?? env.FIREWORKS_API_KEY
+    if (fireworksKey && this.validateApiKey(fireworksKey, 'Fireworks AI')) {
+      const fireworks = createFireworks({
+        apiKey: fireworksKey,
+        baseURL: env.FIREWORKS_API_BASE_URL || undefined
+      })
+      this.providers.set('fireworks', {
+        client: (modelId: string) => fireworks(modelId),
+        models: [],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 128000
+        },
+        displayName: 'Fireworks AI',
+        priority: 18
+      })
+      logger.debug('[ProviderManager] Fireworks AI API key validated')
+      registeredCount++
+    }
 
-    registerOpenAICompatibleProvider({
-      id: 'baseten',
-      label: 'Baseten',
-      apiKey: this.apiKeys.baseten ?? env.BASETEN_API_KEY,
-      baseURL: env.BASETEN_API_BASE_URL || 'https://inference.baseten.co/v1',
-      priority: 19,
-      apiMode: 'chat'
-    })
+    const basetenKey = this.apiKeys.baseten ?? env.BASETEN_API_KEY
+    if (basetenKey && this.validateApiKey(basetenKey, 'Baseten')) {
+      const baseten = createBaseten({
+        apiKey: basetenKey,
+        baseURL: env.BASETEN_API_BASE_URL || undefined
+      })
+      this.providers.set('baseten', {
+        client: (modelId: string) => baseten(modelId),
+        models: [],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 128000
+        },
+        displayName: 'Baseten',
+        priority: 19
+      })
+      logger.debug('[ProviderManager] Baseten API key validated')
+      registeredCount++
+    }
 
-    registerOpenAICompatibleProvider({
-      id: 'cerebras',
-      label: 'Cerebras',
-      apiKey: this.apiKeys.cerebras ?? env.CEREBRAS_API_KEY,
-      baseURL: env.CEREBRAS_API_BASE_URL || 'https://api.cerebras.ai/v1',
-      priority: 20,
-      apiMode: 'chat'
-    })
+    const cerebrasKey = this.apiKeys.cerebras ?? env.CEREBRAS_API_KEY
+    if (cerebrasKey && this.validateApiKey(cerebrasKey, 'Cerebras')) {
+      const cerebras = createCerebras({
+        apiKey: cerebrasKey,
+        baseURL: env.CEREBRAS_API_BASE_URL || undefined
+      })
+      this.providers.set('cerebras', {
+        client: (modelId: string) => cerebras(modelId),
+        models: [],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: false,
+          maxTokens: 128000,
+          reasoning: true,
+          fast: true
+        },
+        displayName: 'Cerebras',
+        priority: 20
+      })
+      logger.debug('[ProviderManager] Cerebras API key validated')
+      registeredCount++
+    }
 
-    registerOpenAICompatibleProvider({
-      id: 'cohere',
-      label: 'Cohere',
-      apiKey: this.apiKeys.cohere ?? env.COHERE_API_KEY,
-      baseURL: env.COHERE_API_BASE_URL || 'https://api.cohere.ai/compatibility/v1',
-      priority: 21,
-      apiMode: 'chat'
-    })
+    const cohereKey = this.apiKeys.cohere ?? env.COHERE_API_KEY
+    if (cohereKey && this.validateApiKey(cohereKey, 'Cohere')) {
+      const cohere = createCohere({
+        apiKey: cohereKey,
+        baseURL: env.COHERE_API_BASE_URL || undefined
+      })
+      this.providers.set('cohere', {
+        client: (modelId: string) => cohere(modelId),
+        models: [],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: false,
+          maxTokens: 128000,
+          reasoning: true
+        },
+        displayName: 'Cohere',
+        priority: 21
+      })
+      logger.debug('[ProviderManager] Cohere API key validated')
+      registeredCount++
+    }
 
     if (this.customProviders.length) {
       const customPriorityBase = 50
@@ -843,6 +960,7 @@ export class ProviderManager {
       'fireworks',
       'baseten',
       'cerebras',
+      'qwencloud',
       'groq',
       'cohere',
       'fal',
@@ -1138,6 +1256,7 @@ const PROVIDER_KEY_CONFIG = [
   { id: 'moonshot', envVar: 'MOONSHOT_API_KEY' },
   { id: 'minimax', envVar: 'MINIMAX_API_KEY' },
   { id: 'mimo', envVar: 'MIMO_API_KEY' },
+  { id: 'qwencloud', envVar: 'DASHSCOPE_API_KEY' },
   { id: 'alibaba', envVar: 'ALIBABA_CLOUD_API_KEY' },
   { id: 'stepfun', envVar: 'STEPFUN_API_KEY' },
   { id: 'zai', envVar: 'ZAI_API_KEY' },
@@ -1195,9 +1314,6 @@ export async function resolveProviderAccess(userId?: string | null): Promise<Pro
     let envKey = envMap[config.envVar] ?? undefined
     if (!envKey && config.id === 'fal') {
       envKey = envMap.FAL_KEY ?? undefined
-    }
-    if (!envKey && config.id === 'alibaba') {
-      envKey = envMap.DASHSCOPE_API_KEY ?? undefined
     }
     if (!envKey && config.id === 'stepfun') {
       envKey = envMap.STEP_API_KEY ?? undefined

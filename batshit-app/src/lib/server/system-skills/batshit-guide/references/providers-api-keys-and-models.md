@@ -56,6 +56,7 @@ Common provider and connection types include:
 - Moonshot AI
 - MiniMax
 - MiMo
+- Qwen Cloud
 - Together.ai
 - Fireworks AI
 - Baseten

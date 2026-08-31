@@ -102,4 +102,15 @@ describe('modelSettingsFormatters', () => {
 
     expect(resolveConnectionIconKey(option)).toBe('dmr')
   })
+
+  it('uses the Batshit icon key when a connection has no provider identity', () => {
+    const option = {
+      id: 'custom:unknown',
+      label: 'Unknown',
+      transport: 'direct',
+      status: 'ready'
+    } as CatalogConnectionOption
+
+    expect(resolveConnectionIconKey(option)).toBe('batshit-icon')
+  })
 })

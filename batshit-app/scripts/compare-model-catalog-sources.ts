@@ -450,6 +450,19 @@ const COMPARISONS: ComparisonDefinition[] = [
       return fetchOpenAICompatibleIds(process.env.MIMO_API_BASE_URL || 'https://api.xiaomimimo.com/v1', key)
     }
   },
+  {
+    provider: 'qwencloud',
+    connectionId: 'direct:qwencloud',
+    fetcher: async () => {
+      const key = process.env.DASHSCOPE_API_KEY
+      if (!key) return null
+      return fetchOpenAICompatibleIds(
+        process.env.DASHSCOPE_API_BASE_URL ||
+          'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+        key
+      )
+    }
+  },
   { provider: 'zai', connectionId: 'direct:zai', fetcher: fetchZaiIds },
   {
     provider: 'zai_coding',
