@@ -122,7 +122,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://platform.minimax.io/docs/api-reference/text-openai-api',
-    iconRef: { kind: 'lucide', id: 'sparkles' }
+    iconRef: { kind: 'brand', slug: 'minimax-color' }
   },
   {
     id: 'mimo',
@@ -149,7 +149,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope',
-    iconRef: { kind: 'lucide', id: 'cloud' }
+    iconRef: { kind: 'brand', slug: 'alibaba-color' }
   },
   {
     id: 'stepfun',
@@ -158,7 +158,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://platform.stepfun.ai/docs/en/quickstart/overview',
-    iconRef: { kind: 'lucide', id: 'zap' }
+    iconRef: { kind: 'brand', slug: 'stepfun-color' }
   },
   {
     id: 'zai',
@@ -210,7 +210,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech-stream-with-timestamps',
-    iconRef: { kind: 'lucide', id: 'fish' }
+    iconRef: { kind: 'brand', slug: 'fishaudio-mono' }
   },
   {
     id: 'inworld',
@@ -219,7 +219,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://docs.inworld.ai/api-reference/ttsAPI/texttospeech/synthesize-speech',
-    iconRef: { kind: 'lucide', id: 'audio-lines' }
+    iconRef: { kind: 'brand', slug: 'inworld-mono' }
   },
   {
     id: 'cartesia',
@@ -246,7 +246,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Voice provider',
     docsUrl: 'https://learn.microsoft.com/en-us/azure/ai-services/speech-service/rest-text-to-speech',
-    iconRef: { kind: 'brand', slug: 'azure' }
+    iconRef: { kind: 'brand', slug: 'azure-color' }
   },
   {
     id: 'azure_speech_region',
@@ -256,7 +256,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     connectionHint: 'Voice provider',
     inputType: 'text',
     docsUrl: 'https://learn.microsoft.com/en-us/azure/ai-services/speech-service/regions',
-    iconRef: { kind: 'brand', slug: 'azure' }
+    iconRef: { kind: 'brand', slug: 'azure-color' }
   },
   {
     id: 'luma',

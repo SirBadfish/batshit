@@ -7,6 +7,7 @@
   import * as Select from '$lib/components/ui/select'
   import * as Switch from '$lib/components/ui/switch'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
+  import VoiceProviderIcon from '$lib/components/settings/voice/VoiceProviderIcon.svelte'
   import type { VoiceProviderSummary } from '$lib/types/voice'
 
   interface Props {
@@ -77,15 +78,24 @@
           onValueChange={(value) => (cloneProvider = Array.isArray(value) ? (value[0] ?? '') : (value ?? ''))}
         >
           <Select.Trigger class="w-full justify-between">
-            <span class="truncate">
-              {cloneProviderReady?.label ?? 'Choose a clone-capable provider'}
+            <span class="flex min-w-0 items-center gap-2">
+              <VoiceProviderIcon
+                providerId={cloneProviderReady?.id}
+                label={cloneProviderReady?.label}
+              />
+                    <span class="truncate">
+                      {cloneProviderReady?.label ?? 'Choose a clone-capable provider'}
+              </span>
             </span>
           </Select.Trigger>
           <Select.Content>
             {#each cloneProviderOptions as provider (provider.id)}
               <Select.Item value={provider.id}>
                 <div class="flex items-center justify-between gap-2">
-                  <span>{provider.label}</span>
+                  <span class="flex min-w-0 items-center gap-2">
+                    <VoiceProviderIcon providerId={provider.id} label={provider.label} />
+                    <span class="truncate">{provider.label}</span>
+                  </span>
                   {#if provider.ready === false}
                     <Badge variant="outline" class="batshit-settings-pill is-warning">
                       {provider.statusHint ?? 'Not ready'}
@@ -178,15 +188,24 @@
                   (cloneTranscribeProvider = Array.isArray(value) ? (value[0] ?? '') : (value ?? ''))}
               >
                 <Select.Trigger class="w-full">
-                  <span class="truncate">
-                    {selectedCloneTranscribeProvider?.label ?? 'Choose STT provider'}
+                  <span class="flex min-w-0 items-center gap-2">
+                    <VoiceProviderIcon
+                      providerId={selectedCloneTranscribeProvider?.id}
+                      label={selectedCloneTranscribeProvider?.label}
+                    />
+                    <span class="truncate">
+                      {selectedCloneTranscribeProvider?.label ?? 'Choose STT provider'}
+                    </span>
                   </span>
                 </Select.Trigger>
                 <Select.Content>
                   {#each cloneTranscribeProviderOptions as provider (provider.id)}
                     <Select.Item value={provider.id}>
                       <div class="flex items-center justify-between gap-2">
-                        <span>{provider.label}</span>
+                        <span class="flex min-w-0 items-center gap-2">
+                          <VoiceProviderIcon providerId={provider.id} label={provider.label} />
+                          <span class="truncate">{provider.label}</span>
+                        </span>
                         {#if provider.ready === false}
                           <Badge variant="outline" class="batshit-settings-pill is-warning">
                             {provider.statusHint ?? 'Not ready'}

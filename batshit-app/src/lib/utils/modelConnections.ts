@@ -27,6 +27,7 @@ const DIRECT_MULTI_DEVELOPER_SERVICES = new Set([
   'fireworks',
   'baseten',
   'cerebras',
+  'qwencloud',
   'ollama',
   'dmr',
   'lmstudio',
