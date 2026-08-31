@@ -36,8 +36,7 @@ const DIRECT_OWNER_PREFIX_SERVICES = new Set([
   'deepinfra',
   'togetherai',
   'fireworks',
-  'baseten',
-  'cerebras'
+  'baseten'
 ])
 const LOCAL_PREFIX_SERVICES = new Set([
   'ollama',

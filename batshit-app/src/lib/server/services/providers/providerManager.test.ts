@@ -274,6 +274,18 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(info?.models.length).toBeGreaterThan(0)
     })
 
+    it('preserves Groq owner-prefixed model IDs at the final provider handoff', () => {
+      const model = providerManager.getModel('openai/gpt-oss-120b', {
+        transport: 'direct',
+        service: 'groq'
+      })
+
+      expect(model).toMatchObject({
+        modelId: 'openai/gpt-oss-120b',
+        provider: 'groq'
+      })
+    })
+
     it('5.3-UNIT-021: OpenRouter provider registration and routing', () => {
       expect(providerManager.hasProvider('openrouter')).toBe(true)
       const info = providerManager.getProviderInfo('openrouter')
