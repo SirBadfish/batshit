@@ -843,6 +843,7 @@ export class ProviderManager {
       'fireworks',
       'baseten',
       'cerebras',
+      'groq',
       'cohere',
       'fal',
       'replicate',

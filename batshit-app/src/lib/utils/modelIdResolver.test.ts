@@ -208,6 +208,21 @@ describe('modelIdResolver', () => {
       })
     })
 
+    it('keeps bare ids for direct cerebras models even when the catalog developer differs', () => {
+      const resolved = resolveModelIds({
+        developerId: 'openai',
+        modelId: 'gpt-oss-120b',
+        connection: { type: 'direct', service: 'cerebras' }
+      })
+
+      expect(resolved).toEqual({
+        providerId: 'cerebras',
+        developerId: 'openai',
+        modelId: 'gpt-oss-120b',
+        effectiveModelId: 'gpt-oss-120b'
+      })
+    })
+
     it('prefixes developer/model for custom providers when enabled', () => {
       const resolved = resolveModelIds({
         developerId: 'zai',
@@ -371,6 +386,20 @@ describe('modelIdResolver', () => {
         developerId: 'groq',
         modelId: 'whisper-large-v3',
         effectiveModelId: 'whisper-large-v3'
+      })
+    })
+
+    it('keeps bare cerebras catalog ids when no variant is present', () => {
+      const resolved = resolveCatalogIds({
+        connectionId: 'direct:cerebras',
+        developerId: 'openai',
+        modelId: 'gpt-oss-120b'
+      })
+
+      expect(resolved).toEqual({
+        developerId: 'openai',
+        modelId: 'gpt-oss-120b',
+        effectiveModelId: 'gpt-oss-120b'
       })
     })
 
