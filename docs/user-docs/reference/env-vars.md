@@ -191,8 +191,8 @@ These can be env fallbacks, but Settings -> API Keys is preferred for normal use
 | `MOONSHOT_API_KEY` / `MOONSHOT_API_BASE_URL` | Moonshot AI/Kimi provider key and optional OpenAI-compatible base URL override. |
 | `MINIMAX_API_KEY` / `MINIMAX_API_BASE_URL` | MiniMax key and optional OpenAI-compatible base URL override. The same key also powers MiniMax TTS. |
 | `MIMO_API_KEY` / `MIMO_API_BASE_URL` | MiMo key and optional OpenAI-compatible base URL override. The same key also powers MiMo TTS. |
-| `ALIBABA_CLOUD_API_KEY` / `DASHSCOPE_API_KEY` | Alibaba Cloud Model Studio / DashScope key for Qwen-compatible model presets and Alibaba TTS. |
-| `ALIBABA_CLOUD_API_BASE_URL` / `DASHSCOPE_API_BASE_URL` | Optional Alibaba OpenAI-compatible chat base URL override. |
+| `DASHSCOPE_API_KEY` / `DASHSCOPE_API_BASE_URL` | Qwen Cloud model-catalog and direct-inference key, plus an optional OpenAI-compatible base URL override. The default is the international DashScope endpoint. The Alibaba voice lane may also use this key. |
+| `ALIBABA_CLOUD_API_KEY` / `ALIBABA_CLOUD_API_BASE_URL` | Alibaba Cloud manual model-preset key and optional OpenAI-compatible base URL override. |
 | `ALIBABA_CLOUD_TTS_BASE_URL` / `DASHSCOPE_TTS_BASE_URL` | Optional Alibaba TTS base URL override. |
 | `STEPFUN_API_KEY` / `STEP_API_KEY` / `STEPFUN_API_BASE_URL` | StepFun key and optional OpenAI-compatible base URL override. The same key also powers StepFun TTS. |
 | `OPENROUTER_API_KEY` | OpenRouter provider key. |

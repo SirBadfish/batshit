@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { needsDarkModeInvert } from './brandingIcons'
+import { getModelProviderIcons, getProviderIconEntry, needsDarkModeInvert } from './brandingIcons'
 
 describe('branding icon dark-mode inversion', () => {
   it('treats bundled mono brand icons as light-on-dark regardless of source paint', () => {
@@ -13,5 +13,27 @@ describe('branding icon dark-mode inversion', () => {
   it('leaves bundled color brand icons unchanged', () => {
     expect(needsDarkModeInvert('/ai-branding/adobe-color.svg')).toBe(false)
     expect(needsDarkModeInvert('/ai-branding/ai302-color.svg')).toBe(false)
+  })
+})
+
+describe('branding icon resolution', () => {
+  it('uses the refreshed color assets for the requested providers', () => {
+    expect(getProviderIconEntry('anthropic').icon).toBe('/ai-branding/claude-color.svg')
+    expect(getProviderIconEntry('openrouter').icon).toBe('/ai-branding/openrouter-color.svg')
+    expect(getProviderIconEntry('codex-cli').icon).toBe('/ai-branding/codex-color.svg')
+    expect(getProviderIconEntry('mimo').icon).toBe('/ai-branding/mimo-color.svg')
+    expect(getProviderIconEntry('deepgram').icon).toBe('/ai-branding/deepgram-color.svg')
+    expect(getProviderIconEntry('async').icon).toBe('/ai-branding/async-color.svg')
+    expect(getProviderIconEntry('cartesia').icon).toBe('/ai-branding/cartesia-color.svg')
+  })
+
+  it('uses Batshit for an unknown provider and never OpenRouter as a generic fallback', () => {
+    expect(getProviderIconEntry('provider-without-a-logo').icon).toBe('/batshit-icon-dark-ios.png')
+  })
+
+  it('falls an unknown model back to its provider icon', () => {
+    const icons = getModelProviderIcons('unknown-model', 'deepgram')
+    expect(icons.providerIcon).toBe('/ai-branding/deepgram-color.svg')
+    expect(icons.modelIcon).toBe('/ai-branding/deepgram-color.svg')
   })
 })

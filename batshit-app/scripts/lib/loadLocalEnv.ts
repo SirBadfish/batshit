@@ -1,33 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-
-function parseEnvFile(contents: string) {
-  const vars: Record<string, string> = {}
-
-  for (const rawLine of contents.split(/\r?\n/)) {
-    const line = rawLine.trim()
-    if (!line || line.startsWith('#')) continue
-
-    const normalized = line.startsWith('export ') ? line.slice('export '.length).trim() : line
-    const equalsIndex = normalized.indexOf('=')
-    if (equalsIndex <= 0) continue
-
-    const key = normalized.slice(0, equalsIndex).trim()
-    if (!key) continue
-
-    let value = normalized.slice(equalsIndex + 1).trim()
-    const quoted =
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    if (quoted) {
-      value = value.slice(1, -1)
-    }
-
-    vars[key] = value
-  }
-
-  return vars
-}
+import { parse as parseDotenv } from 'dotenv'
 
 export function loadLocalEnvFiles(options?: { cwd?: string; label?: string }) {
   const cwd = options?.cwd ?? process.cwd()
@@ -40,7 +13,7 @@ export function loadLocalEnvFiles(options?: { cwd?: string; label?: string }) {
     if (!fs.existsSync(fullPath)) continue
 
     try {
-      const vars = parseEnvFile(fs.readFileSync(fullPath, 'utf8'))
+      const vars = parseDotenv(fs.readFileSync(fullPath, 'utf8'))
       for (const [key, value] of Object.entries(vars)) {
         if (process.env[key] === undefined) {
           process.env[key] = value

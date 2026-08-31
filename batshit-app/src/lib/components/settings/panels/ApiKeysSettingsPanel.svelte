@@ -96,7 +96,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     description: 'Claude (Sonnet, Opus, Haiku) direct connections.',
     scope: 'provider',
     connectionHint: 'Direct',
-    iconRef: { kind: 'brand', slug: 'anthropic-mono' }
+    iconRef: { kind: 'brand', slug: 'claude-color' }
   },
   {
     id: 'openai',
@@ -131,7 +131,16 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://mimo.mi.com/docs/en-US/api/chat/openai-api',
-    iconRef: { kind: 'lucide', id: 'bot' }
+    iconRef: { kind: 'brand', slug: 'mimo-color' }
+  },
+  {
+    id: 'qwencloud',
+    label: 'Qwen Cloud',
+    description: 'Qwen and other DashScope-hosted models through Alibaba Cloud Model Studio.',
+    scope: 'provider',
+    connectionHint: 'Direct',
+    docsUrl: 'https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope',
+    iconRef: { kind: 'brand', slug: 'qwen-color' }
   },
   {
     id: 'alibaba',
@@ -219,7 +228,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://docs.cartesia.ai/api-reference/tts/bytes',
-    iconRef: { kind: 'lucide', id: 'audio-lines' }
+    iconRef: { kind: 'brand', slug: 'cartesia-color' }
   },
   {
     id: 'async',
@@ -228,7 +237,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://docs.async.com/text-to-speech-18760785e0',
-    iconRef: { kind: 'lucide', id: 'audio-lines' }
+    iconRef: { kind: 'brand', slug: 'async-color' }
   },
   {
     id: 'azure_speech_key',
@@ -470,7 +479,7 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     description: 'Route through OpenRouter to hundreds of community models.',
     scope: 'provider',
     connectionHint: 'Router',
-    iconRef: { kind: 'brand', slug: 'openrouter-mono' }
+    iconRef: { kind: 'brand', slug: 'openrouter-color' }
   },
   {
     id: 'deepseek',
@@ -595,6 +604,7 @@ const GROUPS: ApiKeyGroup[] = [
       'openai',
       'openrouter',
       'perplexity',
+      'qwencloud',
       'replicate',
       'stepfun',
       'togetherai',

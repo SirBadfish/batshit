@@ -11,6 +11,7 @@ export const CONNECTION_CREDENTIAL_MAP: Record<string, string[]> = {
   'direct:moonshot': [],
   'direct:minimax': [],
   'direct:mimo': [],
+  'direct:qwencloud': [],
   'direct:alibaba': [],
   'direct:stepfun': [],
   'direct:zai': [],

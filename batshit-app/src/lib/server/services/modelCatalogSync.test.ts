@@ -490,6 +490,26 @@ describe('modelCatalogSync merge', () => {
     )
   })
 
+  it('preserves exact Qwen Cloud model IDs and classifies advertised audio endpoints', () => {
+    const directEntries = _mapOpenAICompatibleCatalogModelsForTest('qwencloud', [
+      { id: 'qwen-plus', owned_by: 'qwen' },
+      { id: 'qwen-image-3.0', owned_by: 'qwen' },
+      { id: 'qwen-audio-3.0-asr-flash', owned_by: 'qwen' }
+    ])
+
+    expect(directEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'qwen-plus', effectiveId: 'qwen-plus' }),
+        expect.objectContaining({ id: 'qwen-image-3.0', effectiveId: 'qwen-image-3.0' }),
+        expect.objectContaining({
+          id: 'qwen-audio-3.0-asr-flash',
+          modelType: 'audio',
+          tags: expect.arrayContaining(['stt'])
+        })
+      ])
+    )
+  })
+
   it('classifies Cohere chat, embedding, rerank, and transcription models from advertised endpoints', () => {
     const directEntries = _mapCohereModelsForTest([
       {
