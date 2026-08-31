@@ -21,7 +21,7 @@ export interface Agent {
   avatar_icon_fit?: AvatarIconFit | null
   agentType?: StoredPrimaryAgentType
   show_reasoning?: boolean  // Display model reasoning summaries in chat
-  preserve_reasoning?: boolean  // Persist reasoning summaries in chat history (Redis)
+  preserve_reasoning?: boolean  // Include saved reasoning in this agent's later compiled model history
   tool_approval_mode?: 'off' | 'all'
   auto_compact_settings?: AgentAutoCompactSettings | null
   voice_profile?: AgentVoiceProfile

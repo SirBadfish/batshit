@@ -257,10 +257,16 @@ export function buildReasoningPersistenceEvidence(args: {
 }): ExecutionReasoningPersistence {
   const summary =
     typeof args.reasoningSummary === 'string' ? args.reasoningSummary : ''
-  const requested = args.showReasoning && args.preserveReasoning
+  const requested = args.showReasoning
 
   return {
-    status: !requested ? 'not-requested' : summary ? 'saved' : 'not-emitted',
+    userHistoryStatus: !requested ? 'not-requested' : summary ? 'saved' : 'not-emitted',
+    agentHistoryStatus:
+      !requested || !summary
+        ? 'not-applicable'
+        : args.preserveReasoning
+          ? 'included'
+          : 'excluded',
     characterCount: requested ? summary.length : 0,
     source: 'message.metadata.reasoningSummary',
   }

@@ -847,13 +847,17 @@
   })
 
   const reasoningPersistenceText = (value: ExecutionReasoningPersistence) => {
-    if (value.status === 'saved') {
-      return `Reasoning history: Saved with this message (${value.characterCount.toLocaleString()} characters). It survives refresh and is not included in Compiled Messages.`
+    if (value.userHistoryStatus === 'saved') {
+      const agentHistoryText =
+        value.agentHistoryStatus === 'included'
+          ? 'Preserve Reasoning was on for this run. If it remains on, later Compiled Messages for this agent include the saved reasoning.'
+          : 'Preserve Reasoning was off, so it stays out of later Compiled Messages.'
+      return `Reasoning: Saved for chat display (${value.characterCount.toLocaleString()} characters) and survives refresh. ${agentHistoryText}`
     }
-    if (value.status === 'not-emitted') {
-      return 'Reasoning history: Preserve Reasoning was on, but this model emitted no visible reasoning summary.'
+    if (value.userHistoryStatus === 'not-emitted') {
+      return 'Reasoning: Display Reasoning was on, but this model emitted no visible reasoning summary.'
     }
-    return 'Reasoning history: Not saved for this run. Preserved reasoning is UI history and is not included in Compiled Messages.'
+    return 'Reasoning: Display Reasoning was off, so no visible reasoning summary was requested or saved.'
   }
 </script>
 

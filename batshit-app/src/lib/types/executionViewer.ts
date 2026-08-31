@@ -83,7 +83,8 @@ export interface ExecutionResponseSummary {
 }
 
 export interface ExecutionReasoningPersistence {
-  status: 'saved' | 'not-requested' | 'not-emitted'
+  userHistoryStatus: 'saved' | 'not-requested' | 'not-emitted'
+  agentHistoryStatus: 'included' | 'excluded' | 'not-applicable'
   characterCount: number
   source: 'message.metadata.reasoningSummary'
 }

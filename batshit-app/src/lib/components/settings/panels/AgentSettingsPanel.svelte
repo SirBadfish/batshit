@@ -8232,7 +8232,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   side="bottom"
                                   class={SETTINGS_INFO_CONTENT_CLASS}
                                 >
-                                  When enabled, Batshit streams reasoning summaries into chat in a collapsed section whenever the model provides them.
+                                  When enabled, Batshit streams reasoning summaries into chat in a collapsed section whenever the model provides them, then saves them with the message so they remain visible after refresh.
                                 </DropdownMenu.Content>
                               </DropdownMenu.Root>
                             </div>
@@ -8258,7 +8258,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                     side="bottom"
                                     class={SETTINGS_INFO_CONTENT_CLASS}
                                   >
-                                    When enabled, the reasoning summary is saved with the message in Redis and still appears after refresh. It is not added to later model requests. When disabled, it only appears during the live response.
+                                    Reasoning shown in chat is always saved and still appears after refresh. Turn this on to also include this agent's prior reasoning in later model requests and in the Execution Viewer's Compiled Messages. Leaving it off keeps the reasoning visible to you but hidden from the agent's later context, which saves tokens.
                                   </DropdownMenu.Content>
                                 </DropdownMenu.Root>
                               </div>

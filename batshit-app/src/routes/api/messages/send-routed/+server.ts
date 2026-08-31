@@ -4066,6 +4066,7 @@ async function handleBatshitAgentStream({
   let finalizePromise: Promise<void> | null = null
   let onFinishResolved = false
   let resolveOnFinish: (() => void) | null = null
+  let syncVisibleReasoningMetadata = () => {}
   const onFinishPromise = new Promise<void>((resolve) => {
     resolveOnFinish = resolve
   })
@@ -4088,6 +4089,7 @@ async function handleBatshitAgentStream({
     }
 
     finalizePromise = (async () => {
+      syncVisibleReasoningMetadata()
       logger.debug('[Send-Routed] Finalizing assistant message', {
         sessionId,
         messageId,
@@ -4248,6 +4250,16 @@ async function handleBatshitAgentStream({
   let thinkingIndicatorEmitted = false
   let planItems: PlanItem[] = []
   let planSummary = ''
+  syncVisibleReasoningMetadata = () => {
+    if (!showReasoning) return
+    if (!reasoningCaptured && !planSummary && planItems.length === 0) return
+    finishSummary.metadata = {
+      ...finishSummary.metadata,
+      ...(reasoningCaptured ? { reasoningSummary: reasoningCaptured } : {}),
+      ...(planSummary ? { planSummary } : {}),
+      ...(planItems.length > 0 ? { planItems } : {}),
+    }
+  }
   const streamedToolSteps: any[] = []
   const streamedApprovalRequests = new Map<string, ToolApprovalEntry>()
   const streamedToolCallIds = new Set<string>()
@@ -5121,21 +5133,6 @@ async function handleBatshitAgentStream({
         finishSummary.metadata = {
           ...finishSummary.metadata,
           controls: controlsMeta,
-        }
-      }
-
-      if (preserveReasoning && (planSummary || planItems.length > 0)) {
-        finishSummary.metadata = {
-          ...finishSummary.metadata,
-          ...(planSummary ? { planSummary } : {}),
-          ...(planItems.length > 0 ? { planItems } : {}),
-        }
-      }
-
-      if (showReasoning && preserveReasoning && reasoningCaptured) {
-        finishSummary.metadata = {
-          ...finishSummary.metadata,
-          reasoningSummary: reasoningCaptured,
         }
       }
 
@@ -6741,6 +6738,7 @@ async function handleBatshitAgentStream({
         : null
     const hasPartialStreamedWork =
       Boolean(streamedMessageContent.trim()) ||
+      Boolean(showReasoning && (reasoningCaptured.trim() || planSummary.trim())) ||
       streamedToolZipReferences.length > 0 ||
       Boolean(finishSummary.content) ||
       Boolean(finishSummary.text) ||
