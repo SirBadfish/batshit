@@ -1,4 +1,5 @@
 import type { ModelCapabilities } from '$lib/types/savedModels'
+import type { ExecutionReasoningPersistence } from '$lib/types/executionViewer'
 
 type ReasoningOptionsArgs = {
   provider?: string | null
@@ -206,6 +207,63 @@ export function extractReasoningTextFromRawChunk(rawValue: unknown): string {
   }
 
   return parts.join('')
+}
+
+/**
+ * Raw provider chunks are diagnostic/fallback evidence. Current AI SDK provider
+ * adapters can emit the same reasoning_content value again as a normalized
+ * reasoning event, so the normalized lane becomes authoritative as soon as it
+ * appears. Raw-only providers still stream with a one-raw-chunk delay.
+ */
+export class ReasoningStreamSourceArbiter {
+  private normalizedReasoningObserved = false
+  private pendingRawReasoning = ''
+
+  noteNormalizedReasoning(): void {
+    this.normalizedReasoningObserved = true
+    this.pendingRawReasoning = ''
+  }
+
+  queueRawFallback(content: string): string {
+    if (this.normalizedReasoningObserved) {
+      this.pendingRawReasoning = ''
+      return ''
+    }
+    if (!content) {
+      return ''
+    }
+
+    const ready = this.pendingRawReasoning
+    this.pendingRawReasoning = content
+    return ready
+  }
+
+  flushRawFallback(): string {
+    if (this.normalizedReasoningObserved) {
+      this.pendingRawReasoning = ''
+      return ''
+    }
+
+    const ready = this.pendingRawReasoning
+    this.pendingRawReasoning = ''
+    return ready
+  }
+}
+
+export function buildReasoningPersistenceEvidence(args: {
+  showReasoning: boolean
+  preserveReasoning: boolean
+  reasoningSummary?: string | null
+}): ExecutionReasoningPersistence {
+  const summary =
+    typeof args.reasoningSummary === 'string' ? args.reasoningSummary : ''
+  const requested = args.showReasoning && args.preserveReasoning
+
+  return {
+    status: !requested ? 'not-requested' : summary ? 'saved' : 'not-emitted',
+    characterCount: requested ? summary.length : 0,
+    source: 'message.metadata.reasoningSummary',
+  }
 }
 
 function collectReasoningText(value: unknown, out: string[]) {

@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  buildReasoningPersistenceEvidence,
   collectReasoningTextFromFinish,
   extractReasoningTextFromRawChunk,
+  ReasoningStreamSourceArbiter,
   resolveTaggedReasoningTagName,
   withReasoningProviderOptions,
 } from './reasoningDisplay'
@@ -47,6 +49,56 @@ describe('reasoningDisplay utilities', () => {
     })
 
     expect(text).toBe('Checking constraints...')
+  })
+
+  it('prefers normalized reasoning when one provider chunk emits raw and normalized copies', () => {
+    const arbiter = new ReasoningStreamSourceArbiter()
+
+    expect(arbiter.queueRawFallback('Checking constraints...')).toBe('')
+    arbiter.noteNormalizedReasoning()
+
+    expect(arbiter.flushRawFallback()).toBe('')
+    expect(arbiter.queueRawFallback('ignored duplicate')).toBe('')
+  })
+
+  it('keeps raw-only reasoning available as a delayed fallback', () => {
+    const arbiter = new ReasoningStreamSourceArbiter()
+
+    expect(arbiter.queueRawFallback('First raw delta.')).toBe('')
+    expect(arbiter.queueRawFallback('')).toBe('')
+    expect(arbiter.queueRawFallback('Second raw delta.')).toBe('First raw delta.')
+    expect(arbiter.flushRawFallback()).toBe('Second raw delta.')
+    expect(arbiter.flushRawFallback()).toBe('')
+  })
+
+  it('records exact reasoning persistence outcomes without storing another preview', () => {
+    expect(
+      buildReasoningPersistenceEvidence({
+        showReasoning: true,
+        preserveReasoning: true,
+        reasoningSummary: 'Checked the constraints.',
+      }),
+    ).toEqual({
+      status: 'saved',
+      characterCount: 24,
+      source: 'message.metadata.reasoningSummary',
+    })
+
+    expect(
+      buildReasoningPersistenceEvidence({
+        showReasoning: true,
+        preserveReasoning: true,
+        reasoningSummary: '',
+      }).status,
+    ).toBe('not-emitted')
+
+    expect(
+      buildReasoningPersistenceEvidence({
+        showReasoning: true,
+        preserveReasoning: false,
+        reasoningSummary: 'Live only',
+      }),
+    ).toMatchObject({ status: 'not-requested', characterCount: 0 })
   })
 
   it('routes Gateway MiMo to Xiaomi without changing its reasoning mode', () => {

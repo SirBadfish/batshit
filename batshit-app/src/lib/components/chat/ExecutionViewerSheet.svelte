@@ -23,6 +23,7 @@
     ExecutionRuntimeDetails,
     ExecutionConfidenceLevel,
     ExecutionLlmCall,
+    ExecutionReasoningPersistence,
     ExecutionTokenStat,
     ExecutionTokenUsage,
     ExecutionSnapshot
@@ -148,6 +149,7 @@
     Array.isArray(currentSnapshot?.intermediateSteps) ? currentSnapshot?.intermediateSteps : null,
   )
   const responseSummary = $derived(currentSnapshot?.responseSummary ?? null)
+  const reasoningPersistence = $derived(currentSnapshot?.reasoningPersistence ?? null)
   // SA-106: webhook input was an n8n-Primary-only snapshot surface. Old stored
   // snapshots may still carry an explicit availability record, so it is still read;
   // nothing produces a new one.
@@ -843,6 +845,16 @@
       wasOpen = false
     }
   })
+
+  const reasoningPersistenceText = (value: ExecutionReasoningPersistence) => {
+    if (value.status === 'saved') {
+      return `Reasoning history: Saved with this message (${value.characterCount.toLocaleString()} characters). It survives refresh and is not included in Compiled Messages.`
+    }
+    if (value.status === 'not-emitted') {
+      return 'Reasoning history: Preserve Reasoning was on, but this model emitted no visible reasoning summary.'
+    }
+    return 'Reasoning history: Not saved for this run. Preserved reasoning is UI history and is not included in Compiled Messages.'
+  }
 </script>
 
 <Sheet.Root bind:open>
@@ -1635,6 +1647,12 @@
                       </div>
                     {/each}
                   </div>
+
+                  {#if reasoningPersistence}
+                    <div class="execution-viewer-note execution-viewer-note-sm">
+                      {reasoningPersistenceText(reasoningPersistence)}
+                    </div>
+                  {/if}
 
                   <div class="execution-viewer-json-pane execution-viewer-json-pane-tall">
                     {#if typeof responseSummary.content?.value === 'string'}
