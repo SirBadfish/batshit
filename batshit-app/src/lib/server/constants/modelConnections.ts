@@ -12,6 +12,7 @@ export const CONNECTION_CREDENTIAL_MAP: Record<string, string[]> = {
   'direct:minimax': [],
   'direct:mimo': [],
   'direct:qwencloud': [],
+  'direct:qwen_token_plan': [],
   'direct:alibaba': [],
   'direct:stepfun': [],
   'direct:zai': [],

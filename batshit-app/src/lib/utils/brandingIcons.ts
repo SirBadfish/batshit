@@ -100,6 +100,7 @@ const PROVIDER_SLUG_OVERRIDES: Record<string, BrandIconSlug | string> = {
   perplexity: 'perplexity-color',
   qwen: 'qwen-color',
   qwencloud: 'qwen-color',
+  qwen_token_plan: 'qwen-color',
   kimi: 'kimi-color',
   hailuo: 'hailuo-color',
   baidu: 'baidu-color',

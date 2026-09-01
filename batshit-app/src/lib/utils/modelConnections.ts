@@ -28,6 +28,7 @@ const DIRECT_MULTI_DEVELOPER_SERVICES = new Set([
   'baseten',
   'cerebras',
   'qwencloud',
+  'qwen_token_plan',
   'ollama',
   'dmr',
   'lmstudio',

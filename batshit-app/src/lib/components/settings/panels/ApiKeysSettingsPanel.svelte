@@ -143,6 +143,16 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     iconRef: { kind: 'brand', slug: 'qwen-color' }
   },
   {
+    id: 'qwen_token_plan',
+    label: 'Qwen Token Plan',
+    description:
+      'Alibaba Token Plan subscription key for interactive Batshit chats and agents. Alibaba excludes workflow, batch, and generic backend use.',
+    scope: 'provider',
+    connectionHint: 'Direct',
+    docsUrl: 'https://www.alibabacloud.com/help/en/model-studio/token-plan-personal-quick-start',
+    iconRef: { kind: 'brand', slug: 'qwen-color' }
+  },
+  {
     id: 'alibaba',
     label: 'Alibaba Cloud',
     description: 'Alibaba Cloud Model Studio Qwen models plus Qwen cloud text-to-speech.',
@@ -605,6 +615,7 @@ const GROUPS: ApiKeyGroup[] = [
       'openrouter',
       'perplexity',
       'qwencloud',
+      'qwen_token_plan',
       'replicate',
       'stepfun',
       'togetherai',

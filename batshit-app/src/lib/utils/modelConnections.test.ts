@@ -166,6 +166,29 @@ describe('modelConnections utilities', () => {
 
       expect(isModelAllowedForConnection(model, connection)).toBe(true)
     })
+
+    it('treats Qwen Token Plan as a multi-developer direct provider', () => {
+      const model = baseModel({
+        provider: 'deepseek',
+        availableConnections: ['direct:qwen_token_plan'],
+        idVariants: {
+          'direct:qwen_token_plan': {
+            developerId: 'deepseek',
+            modelId: 'deepseek-v4-pro',
+            effectiveId: 'deepseek-v4-pro',
+            source: 'direct'
+          }
+        }
+      })
+      const connection = baseConnection({
+        id: 'direct:qwen_token_plan',
+        label: 'Qwen Token Plan Direct',
+        transport: 'direct',
+        providers: ['qwen_token_plan']
+      })
+
+      expect(isModelAllowedForConnection(model, connection)).toBe(true)
+    })
   })
 
   describe('autoSelectConnectionForModel', () => {

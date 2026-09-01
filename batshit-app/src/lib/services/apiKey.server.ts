@@ -47,6 +47,7 @@ const API_KEY_PATTERNS: Record<string, RegExp> = {
   minimax: GENERIC_SECRET_PATTERN,
   mimo: GENERIC_SECRET_PATTERN,
   qwencloud: GENERIC_SECRET_PATTERN,
+  qwen_token_plan: GENERIC_SECRET_PATTERN,
   alibaba: GENERIC_SECRET_PATTERN,
   stepfun: GENERIC_SECRET_PATTERN,
   mistral: GENERIC_SECRET_PATTERN,

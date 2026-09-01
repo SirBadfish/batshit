@@ -17,6 +17,7 @@ describe('modelCatalogConnectionMode', () => {
       'cerebras',
       'minimax',
       'mimo',
+      'qwen_token_plan',
       'cohere'
     ]) {
       expect(isManualEntryDirectProvider(provider)).toBe(false)
@@ -30,6 +31,7 @@ describe('modelCatalogConnectionMode', () => {
     expect(isManualEntryCatalogConnection('direct:fireworks')).toBe(false)
     expect(isManualEntryCatalogConnection('direct:baseten')).toBe(false)
     expect(isManualEntryCatalogConnection('direct:cerebras')).toBe(false)
+    expect(isManualEntryCatalogConnection('direct:qwen_token_plan')).toBe(false)
   })
 
   it('keeps custom provider connections manual without adding them to the provider catalog', () => {
