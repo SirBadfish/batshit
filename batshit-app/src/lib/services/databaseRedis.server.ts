@@ -61,6 +61,14 @@ import {
   resolveClipDataUrlFromStoredUpload,
   resolveClipPreferredUrl
 } from '$lib/server/services/clipUploadPayload'
+import {
+  buildClipRosterDcmLines,
+  buildClipRosterLines,
+  compileClipReferencesForAiView,
+  EMPTY_COMPILED_MESSAGE_TEXT,
+  type ClipRosterEntryInput
+} from '$lib/utils/clipAiView'
+import { normalizeSessionClipState } from '$lib/server/services/sessionClipState'
 import { resolveDefaultNativeExecutionBackend } from '$lib/server/services/nativeExecutionDefaults'
 import {
   getToolSettings,
@@ -791,6 +799,64 @@ export class DatabaseService {
     }
 
     return null
+  }
+
+  /**
+   * SA-109: one clip-state read per compile, shared by the history rewrite, the
+   * DCM roster, and content delivery so all three can never disagree.
+   *
+   * `attached` deliberately excludes `temporarilyUnclipped` entries: a
+   * temporarily-unclipped clip is departed on every surface, including content
+   * (DL-109-09). Before SA-109 the compiler still shipped its bytes while the
+   * marker and the roster line were suppressed elsewhere.
+   */
+  private async resolveSessionClipCompileState(
+    sessionId: string,
+    userId?: string,
+    fetcher?: typeof fetch
+  ): Promise<{
+    entries: ClipRosterEntryInput[]
+    attachedIds: string[]
+    activeClipIds: Set<string>
+    clipNames: Map<string, string>
+  }> {
+    const empty = {
+      entries: [] as ClipRosterEntryInput[],
+      attachedIds: [] as string[],
+      activeClipIds: new Set<string>(),
+      clipNames: new Map<string, string>()
+    }
+    if (!sessionId) return empty
+
+    const raw = await this.getSessionClipState(sessionId, fetcher)
+    const stateEntries = normalizeSessionClipState(sessionId, raw).clips
+    if (stateEntries.length === 0) return empty
+
+    const clipNames = new Map<string, string>()
+    for (const entry of stateEntries) {
+      // Clip records are user- or system-scoped (`clip:{userId}:{id}` /
+      // `clip:system:{id}`); a bare `clip:{id}` read never resolves.
+      const clip = await this.getClipData(userId, entry.clipId, fetcher).catch(() => null)
+      const filename = typeof clip?.filename === 'string' ? clip.filename.trim() : ''
+      if (filename) clipNames.set(entry.clipId, filename)
+    }
+
+    const attachedIds = stateEntries
+      .filter((entry) => entry.temporarilyUnclipped !== true)
+      .map((entry) => entry.clipId)
+
+    return {
+      entries: stateEntries.map((entry) => ({
+        clipId: entry.clipId,
+        name: clipNames.get(entry.clipId) ?? null,
+        attachedToMessageId: entry.attachedToMessageId ?? null,
+        messagesUntilUnclip: entry.messagesUntilUnclip ?? null,
+        temporarilyUnclipped: entry.temporarilyUnclipped === true
+      })),
+      attachedIds,
+      activeClipIds: new Set(attachedIds),
+      clipNames
+    }
   }
 
   private async getClipData(
@@ -1600,6 +1666,10 @@ export class DatabaseService {
         currentAgentId?: string | null
         sharedTools?: string[]
       }
+      /** SA-109: clips attached right now — theirs get no history marker. */
+      activeClipIds?: Set<string> | null
+      /** SA-109: id → filename, for Clip Logs whose placeholder lost its name. */
+      clipNames?: Map<string, string> | null
     },
     speakerMap?: SpeakerMap
   ) {
@@ -1673,6 +1743,19 @@ export class DatabaseService {
           if (toolSummaryBlock) {
             compiled = `${compiled}\n\n${toolSummaryBlock}`.trim()
           }
+        }
+
+        // SA-109: the ONE history site where clip placeholders reached the AI
+        // view. Attached clips lose their marker (their content ships with the
+        // send); departed clips leave a Clip Log where they rode. Runs for both
+        // roles because artifact share-to-chat can write clip syntax too.
+        const clipCompiled = compileClipReferencesForAiView(
+          compiled,
+          options?.activeClipIds,
+          { clipNames: options?.clipNames }
+        )
+        if (clipCompiled !== compiled) {
+          compiled = clipCompiled || EMPTY_COMPILED_MESSAGE_TEXT
         }
 
         const timestamp = message.timestamp
@@ -1779,11 +1862,23 @@ export class DatabaseService {
 
     const speakerMap = this.buildSpeakerMap(messages, options?.groupContext)
 
+    // SA-109: group runs compile history once and reuse it per speaker, so the
+    // clip rewrite has to happen here too — no lane keeps raw clip syntax.
+    const clipCompileState = await this.resolveSessionClipCompileState(
+      sessionId,
+      userId,
+      fetchImpl
+    )
+
     const { formattedMessages, currentDay, chatHistory } = await this.compileChatHistory(
       messages,
       agentForHistory,
       globalZipSettings,
-      options,
+      {
+        ...options,
+        activeClipIds: clipCompileState.activeClipIds,
+        clipNames: clipCompileState.clipNames
+      },
       speakerMap
     )
 
@@ -2084,6 +2179,8 @@ export class DatabaseService {
     controlErrorLines?: string[]
     /** SA-104 P4: preformatted "Memory context:" lines from the recall engine. */
     memoryDcmLines?: string[]
+    /** SA-109 (DL-109-04): the general clip roster — all agents, groups included. */
+    clipRosterDcmLines?: string[]
   }) {
     const statusIcons = {
       new: '\u2705',
@@ -2335,6 +2432,13 @@ export class DatabaseService {
       }
     }
 
+    // SA-109 (DL-109-04): the clip roster sits immediately ahead of the memory
+    // section as its sibling, using the same Current / Lingering vocabulary.
+    // Omitted entirely when nothing is attached, so clip-free sends pay nothing.
+    if (options.clipRosterDcmLines && options.clipRosterDcmLines.length > 0) {
+      lines.push('', ...options.clipRosterDcmLines)
+    }
+
     // SA-104 P4: the recall engine's memory-insert section (time awareness, Current /
     // Lingering grouping, more-available honesty) — preformatted server-side so both
     // compiled lines stay byte-stable (DL-104-17).
@@ -2467,8 +2571,7 @@ export class DatabaseService {
         userId,
         agentId: agent.id,
         sessionId,
-        currentUserMessage: currentUserMessage ?? '',
-        historyMessageIds: messages.map((message) => message?.id).filter(Boolean) as string[]
+        currentUserMessage: currentUserMessage ?? ''
       })
     }
 
@@ -2495,6 +2598,14 @@ export class DatabaseService {
     const precompiledHistory = options?.precompiledHistory
     const speakerMap = this.buildSpeakerMap(contextMessages, options?.groupContext)
 
+    // SA-109: resolved once, before the history compile, because the history
+    // rewrite, the DCM roster, and content delivery all read the same answer.
+    const clipCompileState = await this.resolveSessionClipCompileState(
+      sessionId,
+      userId,
+      fetchImpl
+    )
+
     const { formattedMessages, currentDay, chatHistory } = precompiledHistory
       ? {
           formattedMessages: precompiledHistory.formattedMessages,
@@ -2505,17 +2616,29 @@ export class DatabaseService {
           contextMessages,
           agent,
           globalZipSettings,
-          options,
+          {
+            ...options,
+            activeClipIds: clipCompileState.activeClipIds,
+            clipNames: clipCompileState.clipNames
+          },
           speakerMap
         )
 
     const resolvedChatHistory =
       chatHistory ?? formattedMessages.join('\n\n---\n\n').trim()
 
-    // 4. Format current user message if provided
+    // 4. Format current user message if provided.
+    // SA-109: the current turn carries the just-attached clip's placeholder too
+    // (ChatInput appends it), so it runs through the same rewrite — one clip
+    // vocabulary across history and the current message.
+    const currentUserMessageForAi = currentUserMessage
+      ? compileClipReferencesForAiView(currentUserMessage, clipCompileState.activeClipIds, {
+          clipNames: clipCompileState.clipNames
+        })
+      : currentUserMessage
     const currentMessageFormatted = currentUserMessage
       ? this.formatCurrentUserMessage(
-          currentUserMessage,
+          currentUserMessageForAi || EMPTY_COMPILED_MESSAGE_TEXT,
           currentDay,
           formattedMessages.length > 0,
           speakerMap
@@ -2532,17 +2655,13 @@ export class DatabaseService {
     const clipsFromMessage: string[] = []
     const trustedClipIds = new Set<string>()
     
-    // NEW: Check session state for clips instead of parsing from message
-    // This eliminates the need to embed clips in every message, saving 43 tokens per message!
-    if (sessionId) {
-      const sessionState = await this.getSessionClipState(sessionId, fetchImpl)
-      if (sessionState?.clips && sessionState.clips.length > 0) {
-        for (const clipState of sessionState.clips) {
-          if (clipState?.clipId && !clipsFromMessage.includes(clipState.clipId)) {
-            clipsFromMessage.push(clipState.clipId)
-            trustedClipIds.add(clipState.clipId)
-          }
-        }
+    // Session state is the authority on what is attached — clips are not embedded
+    // in every message. SA-109 (DL-109-09): `attachedIds` already excludes
+    // temporarily-unclipped entries, so a departed clip no longer ships bytes.
+    for (const clipId of clipCompileState.attachedIds) {
+      if (!clipsFromMessage.includes(clipId)) {
+        clipsFromMessage.push(clipId)
+        trustedClipIds.add(clipId)
       }
     }
     
@@ -2765,6 +2884,22 @@ export class DatabaseService {
         ? [...base, ...memoryClipNotes]
         : ['Memory context:', ...memoryClipNotes]
     })()
+
+    // SA-109 (DL-109-04): the general clip roster — every agent gets it,
+    // including memory-off agents and group runs. It is the SOLE owner of clip
+    // lines; the memory section no longer emits any, so there is never a double
+    // listing. Newness is stated here rather than inferred from repeated syntax.
+    const clipRosterDcmLines = buildClipRosterDcmLines(
+      buildClipRosterLines({
+        entries: clipCompileState.entries,
+        // RAW (pre-compaction) ids on purpose: a clip must not flip back to
+        // "new this message" just because the message it rode was compacted or
+        // graduated out of the compiled window.
+        historyMessageIds: new Set(
+          messages.map((message) => message?.id).filter(Boolean) as string[]
+        )
+      })
+    )
 
     // 6. Create clean structured input for Chat Model
     // This will be passed directly to the AI without any parsing needed
@@ -3020,7 +3155,8 @@ export class DatabaseService {
           zipControlPermission: zipPermission,
           zipAiViewMode: zipViewMode,
           isCodexMode: options?.runtimeFlavor === 'codex' || options?.runtimeFlavor === 'claude',
-          memoryDcmLines
+          memoryDcmLines,
+          clipRosterDcmLines
         })
       : ''
     const currentMessageForLLM = currentMessageFormatted
@@ -3062,11 +3198,20 @@ export class DatabaseService {
       if (items.length === 0) return
       if (userContent[0].text) {
         userContent[0].text += `\n\n==== ${header} ====`
+        // SA-109 (DL-109-05): one named manifest in delivery order replaces the
+        // per-history `[CLIPPED ITEM: batshit-clip-id: …]` markers. It is what
+        // actually correlates the image parts below with their filenames — the
+        // old marker only ever existed on the no-image text path.
+        for (const item of items) {
+          const label = item.filename || item.description || item.clipId
+          userContent[0].text += `\n- ${label} — ${item.contentType}`
+        }
       }
       for (const item of items) {
         // For text clips, inline the content for the AI
         if (item.contentType === 'text' && typeof item.content === 'string') {
-          userContent[0].text += `\n\nCONTENT:\n${item.content}`
+          const label = item.filename || item.description || item.clipId
+          userContent[0].text += `\n\nCONTENT (${label}):\n${item.content}`
         }
 
         // Images go as separate content items for vision models

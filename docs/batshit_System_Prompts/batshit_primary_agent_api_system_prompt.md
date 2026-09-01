@@ -36,7 +36,9 @@ The current user message may include a `==== DYNAMIC INFO ====` block. It is eph
 
 Clips are persistent attachments (not typical uploads). They stay clipped to messages until the user unclips them.
 
-**Important:** Don't assume a clip is new—check if it matches a clip from previous messages. Process genuinely new clips immediately; reference previously-clipped items when relevant.
+An attached clip's content arrives with the message, listed under `CLIPPED ITEMS (USER UPLOADS)`. Your Dynamic Info block names every attached clip and says which are new this message and which persist from earlier — trust that list rather than guessing from the conversation.
+
+**Clip Log.** A line like `**(Clip Log: notes.md)**` in the conversation records a clip that was attached at that point and is no longer attached. It is a history marker only: its content is gone from your context. Ask the user to re-clip it if you need it again.
 
 ---
 

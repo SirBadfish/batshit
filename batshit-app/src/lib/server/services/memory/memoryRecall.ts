@@ -47,10 +47,6 @@ import {
   type MemoryLingerSource
 } from './memoryLinger'
 import { MEMORY_SCHEMA_VERSION } from './memoryTypes'
-import {
-  normalizeSessionClipState,
-  type SessionClipStateEntry
-} from '$lib/server/services/sessionClipState'
 import { isFixedSession } from '$lib/utils/fixedSession'
 import { getOpenEpisode } from './memoryEpisodes'
 
@@ -585,38 +581,6 @@ function formatInsertLine(
   return lines
 }
 
-interface ClipPresentation {
-  currentLines: string[]
-  lingeringLines: string[]
-}
-
-function formatClipStateLines(options: {
-  entries: SessionClipStateEntry[]
-  historyMessageIds: Set<string>
-  clipNames: Map<string, string>
-}): ClipPresentation {
-  const currentLines: string[] = []
-  const lingeringLines: string[] = []
-  for (const entry of options.entries) {
-    if (entry.temporarilyUnclipped) continue
-    const name = options.clipNames.get(entry.clipId)
-    const label = name ? `"${name}" (${entry.clipId})` : entry.clipId
-    const countdown =
-      typeof entry.messagesUntilUnclip === 'number' && entry.messagesUntilUnclip > 0
-        ? `, ${entry.messagesUntilUnclip} message${entry.messagesUntilUnclip === 1 ? '' : 's'} left`
-        : ''
-    const attachedToKnownHistory = entry.attachedToMessageId
-      ? options.historyMessageIds.has(entry.attachedToMessageId)
-      : true
-    if (attachedToKnownHistory) {
-      lingeringLines.push(`  - ${ICON_HELD} clip ${label} — attached earlier, still active${countdown}`)
-    } else {
-      currentLines.push(`  - ${ICON_NEW} clip ${label} — attached with this message${countdown}`)
-    }
-  }
-  return { currentLines, lingeringLines }
-}
-
 /**
  * SA-104 P6 — the episode whiteboard block (design §1.3): the agent-maintained
  * working-facts block for the OPEN episode, kept in awareness until the episode
@@ -704,17 +668,6 @@ async function loadEpisodeContext(options: {
   }
 }
 
-async function loadClipNames(clipIds: string[]): Promise<Map<string, string>> {
-  const names = new Map<string, string>()
-  for (const clipId of clipIds) {
-    const clip = (await redis.get(`clip:${clipId}`).catch(() => null)) as Record<string, any> | null
-    if (clip && typeof clip.filename === 'string' && clip.filename.trim()) {
-      names.set(clipId, clip.filename.trim())
-    }
-  }
-  return names
-}
-
 // ---------------------------------------------------------------------------
 // Compile-time context (read-only)
 // ---------------------------------------------------------------------------
@@ -724,8 +677,6 @@ export async function computeMemoryCompileContext(options: {
   agentId: string
   sessionId: string
   currentUserMessage: string
-  /** Raw (pre-compaction) history message ids, for clip Current/Lingering grouping. */
-  historyMessageIds: string[]
 }): Promise<MemoryCompileContext> {
   const agentId = options.agentId?.trim()
   const sessionId = options.sessionId?.trim()
@@ -763,15 +714,9 @@ export async function computeMemoryCompileContext(options: {
     nowTs
   })
 
-  // Session clip state joins the Current/Lingering grouping (presentation only).
-  const clipStateRaw = await redis.get(`session:${sessionId}:clip_state`).catch(() => null)
-  const clipEntries = normalizeSessionClipState(sessionId, clipStateRaw).clips
-  const clipNames = await loadClipNames(clipEntries.map((entry) => entry.clipId))
-  const clipPresentation = formatClipStateLines({
-    entries: clipEntries,
-    historyMessageIds: new Set(options.historyMessageIds),
-    clipNames
-  })
+  // SA-109 (DL-109-04): session clips are NOT listed here any more. The general
+  // DCM clip roster owns every clip line for every agent, memory-on or not, so
+  // a memory-enabled agent never sees the same clip twice.
 
   // Time awareness (agent-level, DL-104-16): gap since the previous interaction.
   const lastInteractionAt =
@@ -789,14 +734,12 @@ export async function computeMemoryCompileContext(options: {
 
   // --- DCM section assembly ---
   const inserted = [...selection.current, ...selection.lingering]
-  const currentLines = [
-    ...selection.current.flatMap((candidate) => formatInsertLine(candidate, sessionId, nowTs)),
-    ...clipPresentation.currentLines
-  ]
-  const lingeringLines = [
-    ...selection.lingering.flatMap((candidate) => formatInsertLine(candidate, sessionId, nowTs)),
-    ...clipPresentation.lingeringLines
-  ]
+  const currentLines = selection.current.flatMap((candidate) =>
+    formatInsertLine(candidate, sessionId, nowTs)
+  )
+  const lingeringLines = selection.lingering.flatMap((candidate) =>
+    formatInsertLine(candidate, sessionId, nowTs)
+  )
 
   const dcmLines: string[] = []
   if (timeAwarenessLine || currentLines.length > 0 || lingeringLines.length > 0 || selection.moreAvailable.length > 0) {

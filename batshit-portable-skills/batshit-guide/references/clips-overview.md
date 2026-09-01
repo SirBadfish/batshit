@@ -43,6 +43,18 @@ Text-like Clips can contribute their text to the model when appropriate. Binary 
 
 To have an agent read a text file from a Project, a [file mention](../projects/overview.md#file-mentions) is often better than a Clip. For a binary, image, PDF, or reusable media file, a Clip is the right tool.
 
+## What the agent sees
+
+Your chat bubbles are unchanged — a Clip shows as a chip you can click.
+
+What the *agent* sees is deliberately simpler:
+
+- **While a Clip is attached**, the agent gets the file itself, listed by filename with the message. There is no reference code cluttering the conversation.
+- **Every message tells the agent which Clips are attached right now**, which arrived with this message, and which have been carried over from earlier — stated plainly, so it never has to guess whether something is new.
+- **When you unclip something**, the spot where it was attached keeps a short record line: **(Clip Log: report.pdf)**. The agent can see that a file *used to be there* and what it was called, but the file itself is gone from its context. Ask it to work from a Clip you removed and it will tell you it needs the file re-clipped.
+
+A Clip Log is a record, not a file. Re-clip the file if the agent needs to read it again.
+
 ## Clips vs Zips
 
 These two are easy to mix up. Clips hold things *you* bring in; Zips compress things the *agent* produces.
@@ -68,6 +80,7 @@ For example: you upload a screenshot — that's a Clip. The agent runs a tool an
 | Clip works in browser but not for the model | The URL isn't reachable from the model/runtime. | Local/tunnel/data-URL strategy and the caller URL. |
 | Docker agent cannot reach a `localhost` Clip URL | Inside Docker, `localhost` means the container. | Use service names or `host.docker.internal`; see [Ports and URLs](../reference/ports-and-urls.md). |
 | Image Clip is blocked before sending | The selected model preset has Vision off. | Switch to a vision-capable preset or remove the image. |
+| Agent says a file is no longer available | The Clip was unclipped, expired, or hidden — the agent sees only a Clip Log record. | Re-clip the file from the Clip Vault. |
 
 ## Related docs
 

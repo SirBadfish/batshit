@@ -64,7 +64,7 @@ export function buildToolGuidanceZipPromptBlock(options?: {
       '',
       'How Batshit handles tool results:',
       '- Tool outputs are often zipped quickly to save tokens.',
-      '- Never write visible Batshit zip or clip reference syntax in your reply. Refer to "a zip reference", "a clip reference", or the visible badge in prose instead.',
+      '- Never write visible Batshit zip reference syntax, clip reference syntax, or `**(Clip Log: ...)**` lines in your reply — those are Batshit record marks. Refer to "a zip reference", "a clip", or the visible badge in prose instead.',
       toolNotesEnabled
         ? '- Tool Notes are lightweight memory. Save only the exact facts you will need after the raw result disappears.'
         : '- Tool Notes are disabled for this agent/session.',
@@ -102,7 +102,7 @@ export function buildToolGuidanceZipPromptBlock(options?: {
     '',
     'How Batshit handles tool results:',
     '- Tool outputs are often zipped quickly to save tokens.',
-    '- Never write visible Batshit zip or clip reference syntax in your reply. Refer to "a zip reference", "a clip reference", or the visible badge in prose instead.',
+    '- Never write visible Batshit zip reference syntax, clip reference syntax, or `**(Clip Log: ...)**` lines in your reply — those are Batshit record marks. Refer to "a zip reference", "a clip", or the visible badge in prose instead.',
     toolNotesEnabled
       ? '- Tool Notes are your lightweight memory. Save only the exact facts you will need later.'
       : '- Tool Notes are disabled for this agent/session.',

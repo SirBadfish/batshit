@@ -612,6 +612,172 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     expect(clipped).toContain('data:image/png;base64,')
   })
 
+  it('S4c SA-109 (DL-109-02/03): attached clips lose their marker, departed clips leave a Clip Log', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    state.current.kv.set(`clip:${USER_ID}:clip-live-1`, {
+      id: 'clip-live-1',
+      filename: 'live.txt',
+      fileType: 'text',
+      mimeType: 'text/plain',
+      content: 'still attached body',
+      fileSize: 19
+    })
+    // Only the live clip is in session state; clip-gone-1 was unclipped.
+    state.current.kv.set(`session:${sessionId}:clip_state`, {
+      sessionId,
+      clips: [{ clipId: 'clip-live-1', attachedToMessageId: 'msg-1' }]
+    })
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content:
+            'Earlier question\n\n{{batshit-clip:clip-live-1:::live.txt}}\n{{batshit-clip:clip-gone-1:::gone.png}}',
+          timestamp: '2026-06-12T09:00:00.000Z',
+          metadata: {}
+        },
+        {
+          id: 'msg-2',
+          role: 'assistant',
+          content: 'Earlier answer',
+          timestamp: '2026-06-12T09:00:30.000Z',
+          metadata: {}
+        }
+      ],
+      agent: apiAgent(),
+      currentUserMessage: 'Follow up',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    const compiled = currentUserMessageContent(server)
+    // No raw clip syntax survives anywhere in the AI view (DL-109-05).
+    expect(compiled).not.toContain('{{batshit-clip')
+    // The attached clip leaves no marker; its body arrives structurally instead.
+    expect(compiled).not.toContain('Clip Log: live.txt')
+    expect(compiled).toContain('still attached body')
+    // The departed clip leaves its only remaining trace, where it rode.
+    expect(compiled).toContain('**(Clip Log: gone.png)**')
+  })
+
+  it('S4d SA-109 (DL-109-04): the clip roster reaches EVERY agent through the DCM', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    state.current.kv.set(`clip:${USER_ID}:clip-old-1`, {
+      id: 'clip-old-1',
+      filename: 'old-notes.txt',
+      fileType: 'text',
+      mimeType: 'text/plain',
+      content: 'old body',
+      fileSize: 8
+    })
+    state.current.kv.set(`clip:${USER_ID}:clip-new-1`, {
+      id: 'clip-new-1',
+      filename: 'new-notes.txt',
+      fileType: 'text',
+      mimeType: 'text/plain',
+      content: 'new body',
+      fileSize: 8
+    })
+    state.current.kv.set(`session:${sessionId}:clip_state`, {
+      sessionId,
+      clips: [
+        { clipId: 'clip-old-1', attachedToMessageId: 'msg-1', messagesUntilUnclip: 3 },
+        { clipId: 'clip-new-1', attachedToMessageId: 'msg-unsaved' }
+      ]
+    })
+
+    // A memory-OFF agent: before SA-109 this roster existed only for memory-enabled
+    // agents, so this send had no statement of what was attached at all.
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent(),
+      currentUserMessage: 'What did I attach?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    const compiled = currentUserMessageContent(server)
+    expect(compiled).toContain('Clips attached (their content is delivered with this message):')
+    expect(compiled).toContain('- Current (new this message):')
+    expect(compiled).toContain('clip "new-notes.txt" (clip-new-1) — attached with this message')
+    expect(compiled).toContain('- Lingering (from earlier messages):')
+    expect(compiled).toContain(
+      'clip "old-notes.txt" (clip-old-1) — attached earlier, still active, 3 messages left'
+    )
+    // DL-109-05: the named manifest replaces the per-history CLIPPED ITEM markers.
+    expect(compiled).toContain('- old-notes.txt — text')
+    expect(compiled).not.toContain('[CLIPPED ITEM: batshit-clip-id:')
+  })
+
+  it('S4e SA-109 (DL-109-09): a temporarily-unclipped clip is departed, bytes included', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    state.current.kv.set(`clip:${USER_ID}:clip-hidden-1`, {
+      id: 'clip-hidden-1',
+      filename: 'hidden.txt',
+      fileType: 'text',
+      mimeType: 'text/plain',
+      content: 'SHOULD-NOT-SHIP',
+      fileSize: 15
+    })
+    state.current.kv.set(`session:${sessionId}:clip_state`, {
+      sessionId,
+      clips: [
+        {
+          clipId: 'clip-hidden-1',
+          attachedToMessageId: 'msg-1',
+          temporarilyUnclipped: true,
+          reattachAt: 4
+        }
+      ]
+    })
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: 'Here it is\n\n{{batshit-clip:clip-hidden-1:::hidden.txt}}',
+          timestamp: '2026-06-12T09:00:00.000Z',
+          metadata: {}
+        }
+      ],
+      agent: apiAgent(),
+      currentUserMessage: 'Follow up',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    const compiled = JSON.stringify(server.structuredInput)
+    // Before SA-109 the marker and roster line were suppressed while the body still
+    // shipped. Departed now means departed on every surface.
+    expect(compiled).not.toContain('SHOULD-NOT-SHIP')
+    expect(compiled).not.toContain('Clips attached (')
+    expect(currentUserMessageContent(server)).toContain('**(Clip Log: hidden.txt)**')
+  })
+
+  it('S4f SA-109: a clip-free chat compiles byte-identically to before the clip pass', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent(),
+      currentUserMessage: 'Nothing attached here',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    const compiled = currentUserMessageContent(server)
+    expect(compiled).not.toContain('Clips attached (')
+    expect(compiled).not.toContain('Clip Log')
+    expect(compiled).toContain('Earlier question about the project')
+  })
+
   it('S4b FIXED G-0032: non-UTF8 base64 text clips decode identically (loud, never a silent "")', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
