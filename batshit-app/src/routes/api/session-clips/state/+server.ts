@@ -7,8 +7,6 @@ import {
   detachSessionClip,
   listActiveClipIds,
   normalizeSessionClipState,
-  temporarilyUnclipSessionClip,
-  tickTemporaryClipReattach,
   updateSessionClipDuration
 } from '$lib/server/services/sessionClipState'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
@@ -62,14 +60,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         break
 
       case 'decrement_durations':
-        state = tickTemporaryClipReattach(decrementSessionClipDurations(state))
-        break
-
-      case 'temporary_unclip':
-        if (!clipId) {
-          return json({ error: 'Clip ID required for temporary_unclip action' }, { status: 400 })
-        }
-        state = temporarilyUnclipSessionClip(state, clipId, unclipAfter ?? null)
+        state = decrementSessionClipDurations(state)
         break
     }
 

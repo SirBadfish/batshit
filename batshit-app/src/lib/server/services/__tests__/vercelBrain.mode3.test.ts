@@ -344,11 +344,8 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
     it('5.7-UNIT-006c SA-109: a departed clip leaves a Clip Log, not a silent gap', async () => {
       vi.mocked(redis.get).mockImplementation(async (key: string) => {
         if (key === 'session:test-session:clip_state') {
-          return {
-            clips: [
-              { clipId: 'clip123', temporarilyUnclipped: true }
-            ]
-          }
+          // clip123 is NOT in session state — it was unclipped.
+          return { clips: [] }
         }
         return null
       })

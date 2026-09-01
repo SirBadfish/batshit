@@ -713,22 +713,25 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     expect(compiled).not.toContain('[CLIPPED ITEM: batshit-clip-id:')
   })
 
-  it('S4e SA-109 (DL-109-09): a temporarily-unclipped clip is departed, bytes included', async () => {
+  it('S4e SA-109 P4: a stale temporarilyUnclipped field cannot resurrect ghost hiding', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
-    state.current.kv.set(`clip:${USER_ID}:clip-hidden-1`, {
-      id: 'clip-hidden-1',
-      filename: 'hidden.txt',
+    state.current.kv.set(`clip:${USER_ID}:clip-legacy-1`, {
+      id: 'clip-legacy-1',
+      filename: 'legacy.txt',
       fileType: 'text',
       mimeType: 'text/plain',
-      content: 'SHOULD-NOT-SHIP',
-      fileSize: 15
+      content: 'LEGACY CLIP BODY',
+      fileSize: 16
     })
+    // The half-built temporary-unclip lane was removed in SA-109 P4 — nothing
+    // could ever set this flag, so no real record carries it. A stale one must
+    // not make the clip behave as departed while it is still in session state.
     state.current.kv.set(`session:${sessionId}:clip_state`, {
       sessionId,
       clips: [
         {
-          clipId: 'clip-hidden-1',
+          clipId: 'clip-legacy-1',
           attachedToMessageId: 'msg-1',
           temporarilyUnclipped: true,
           reattachAt: 4
@@ -742,7 +745,7 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
         {
           id: 'msg-1',
           role: 'user',
-          content: 'Here it is\n\n{{batshit-clip:clip-hidden-1:::hidden.txt}}',
+          content: 'Here it is\n\n{{batshit-clip:clip-legacy-1:::legacy.txt}}',
           timestamp: '2026-06-12T09:00:00.000Z',
           metadata: {}
         }
@@ -753,11 +756,10 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     })
 
     const compiled = JSON.stringify(server.structuredInput)
-    // Before SA-109 the marker and roster line were suppressed while the body still
-    // shipped. Departed now means departed on every surface.
-    expect(compiled).not.toContain('SHOULD-NOT-SHIP')
-    expect(compiled).not.toContain('Clips attached (')
-    expect(currentUserMessageContent(server)).toContain('**(Clip Log: hidden.txt)**')
+    expect(compiled).toContain('LEGACY CLIP BODY')
+    expect(compiled).toContain('Clips attached (')
+    expect(currentUserMessageContent(server)).not.toContain('Clip Log')
+    expect(currentUserMessageContent(server)).not.toContain('{{batshit-clip')
   })
 
   it('S4f SA-109: a clip-free chat compiles byte-identically to before the clip pass', async () => {
