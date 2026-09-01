@@ -69,6 +69,7 @@ import {
   resolveConnectionScopedCatalogModel,
   type ConnectionScopedCatalogModel
 } from '$lib/utils/catalogConnectionScope'
+import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
 import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
 import {
   resolvePresetMaxOutputTokenResolution,
@@ -604,11 +605,11 @@ let lastInvalidModelSignature = $state<string | null>(null)
     )
     const unique = new Map<string, CatalogProviderOption>()
     for (const scopedModel of scopedModels) {
-      if (!unique.has(scopedModel.developerId)) {
-        unique.set(scopedModel.developerId, {
-          label: formatDeveloperLabel(scopedModel.developerId),
-          value: scopedModel.developerId,
-          n8nSupported: isN8NSupported(scopedModel.developerId)
+      if (!unique.has(scopedModel.canonicalDeveloperId)) {
+        unique.set(scopedModel.canonicalDeveloperId, {
+          label: formatDeveloperLabel(scopedModel.canonicalDeveloperId),
+          value: scopedModel.canonicalDeveloperId,
+          n8nSupported: isN8NSupported(scopedModel.canonicalDeveloperId)
         })
       }
     }
@@ -682,7 +683,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
     const set = new Set<string>()
     for (const model of catalogViewerBaseModels) {
       if (model.provider) {
-        set.add(model.provider)
+        set.add(canonicalizeCatalogDeveloperId(model.provider))
       }
     }
     return Array.from(set).sort((a, b) =>
@@ -710,11 +711,13 @@ let lastInvalidModelSignature = $state<string | null>(null)
 
     let rows = catalogViewerBaseModels
     if (providerFilter !== 'all') {
-      rows = rows.filter((model) => model.provider === providerFilter)
+      rows = rows.filter(
+        (model) => canonicalizeCatalogDeveloperId(model.provider) === providerFilter
+      )
     }
     if (query.length) {
       rows = rows.filter((model) => {
-        const haystack = `${model.displayName} ${model.name} ${model.provider} ${model.connectionId ?? ''}`.toLowerCase()
+        const haystack = `${model.displayName} ${model.name} ${model.provider} ${canonicalizeCatalogDeveloperId(model.provider)} ${model.connectionId ?? ''}`.toLowerCase()
         return haystack.includes(query)
       })
     }
@@ -787,7 +790,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
     const scopedModels = buildConnectionScopedCatalogModels(roleScoped, selectedConnection)
 
     filteredCatalogEntries = selectedCatalogProvider
-      ? scopedModels.filter((model) => model.developerId === selectedCatalogProvider)
+      ? scopedModels.filter((model) => model.canonicalDeveloperId === selectedCatalogProvider)
       : scopedModels
   })
 
@@ -1565,7 +1568,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
     lastSyncedConnectionSignature = null
     const presetProvider = model.provider?.trim().toLowerCase() ?? ''
     if (!catalogSelectionDirty) {
-      selectedCatalogProvider = presetProvider
+      selectedCatalogProvider = canonicalizeCatalogDeveloperId(presetProvider)
       const presetModelId =
         model.catalogModelId ??
         model.vercelSourceId ??
@@ -2653,7 +2656,7 @@ $effect(() => {
     if (providerModified || modelModified) {
       suppressCatalogAutoModelSelection = true
       if (!providerModified && editingForm.provider) {
-        selectedCatalogProvider = editingForm.provider
+        selectedCatalogProvider = canonicalizeCatalogDeveloperId(editingForm.provider)
       } else {
         selectedCatalogProvider = ''
       }
@@ -2683,7 +2686,9 @@ $effect(() => {
           )
       ) ??
       catalogModels.find(
-        (model) => model.provider === editingForm.provider && model.name === editingForm.modelId
+        (model) =>
+          canonicalizeCatalogDeveloperId(model.provider) ===
+            canonicalizeCatalogDeveloperId(editingForm.provider) && model.name === editingForm.modelId
       ) ??
       catalogModels.find((model) =>
         Object.values(model.idVariants ?? {}).some(
@@ -2694,7 +2699,7 @@ $effect(() => {
     if (match) {
       const scopedMatch = resolveConnectionScopedCatalogModel(match, selectedConnection)
       suppressCatalogAutoModelSelection = false
-      selectedCatalogProvider = scopedMatch.developerId
+      selectedCatalogProvider = scopedMatch.canonicalDeveloperId
       selectedCatalogModelId = match.id
     } else {
       suppressCatalogAutoModelSelection = false
@@ -2803,7 +2808,9 @@ $effect(() => {
     const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(rawMaxOutputTokens, contextWindow)
     const baselineMaxOutputTokens = maxOutputResolution.maxOutputTokens
     const capabilities = catalogFeaturesToCapabilities(model.features ?? null)
-    const compatibility = determineModelCompatibility(model.provider)
+    const compatibility = determineModelCompatibility(
+      canonicalizeCatalogDeveloperId(model.provider)
+    )
 
     const pricing: { input?: number; output?: number; cachedInput?: number } = {}
     if (pricingInput !== undefined) pricing.input = pricingInput

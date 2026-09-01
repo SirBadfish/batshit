@@ -6,6 +6,7 @@ import {
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
 import type { ModelCapabilities, ModelCompatibility } from '$lib/types/savedModels'
 import type { ThemeMode } from '$lib/types/theme'
+import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
 
 const DEVELOPER_LABEL_OVERRIDES: Record<string, string> = {
   openai: 'OpenAI',
@@ -13,7 +14,6 @@ const DEVELOPER_LABEL_OVERRIDES: Record<string, string> = {
   'fal-ai': 'fal.ai',
   deepseek: 'DeepSeek',
   zai: 'Z.ai',
-  zai_coding: 'Z.ai Coding Plan',
   qwen_token_plan: 'Qwen Token Plan',
   'black-forest-labs': 'Black Forest Labs',
   'stability-ai': 'Stability AI',
@@ -100,7 +100,7 @@ export function parameterSupportLabel(supportedInN8N: boolean) {
 
 export function formatDeveloperLabel(developerId?: string | null) {
   if (!developerId) return 'Unknown'
-  const normalized = developerId.trim().toLowerCase()
+  const normalized = canonicalizeCatalogDeveloperId(developerId)
   if (!normalized) return 'Unknown'
   const override = DEVELOPER_LABEL_OVERRIDES[normalized]
   if (override) return override

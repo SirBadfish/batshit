@@ -1,4 +1,8 @@
 import { loadLocalEnvFiles } from './lib/loadLocalEnv'
+import {
+  ZAI_CODING_PLAN_LEGACY_MODEL_IDS,
+  ZAI_CODING_PLAN_OPENAI_BASE_URL
+} from '../src/lib/server/constants/zaiCodingPlan'
 
 loadLocalEnvFiles({ cwd: process.cwd(), label: 'catalog-compare' })
 
@@ -281,7 +285,12 @@ async function fetchZaiIds() {
 async function fetchZaiCodingIds() {
   const key = process.env.ZAI_CODING_API_KEY
   if (!key) return null
-  return fetchOpenAICompatibleIds(process.env.ZAI_CODING_API_BASE_URL || 'https://api.z.ai/api/coding/paas/v4', key)
+  const ids = await fetchOpenAICompatibleIds(
+    process.env.ZAI_CODING_API_BASE_URL || ZAI_CODING_PLAN_OPENAI_BASE_URL,
+    key
+  )
+  const legacyIds = new Set<string>(ZAI_CODING_PLAN_LEGACY_MODEL_IDS)
+  return ids.filter((id) => !legacyIds.has(id))
 }
 
 async function fetchTogetherIds() {
@@ -481,7 +490,8 @@ const COMPARISONS: ComparisonDefinition[] = [
   {
     provider: 'zai_coding',
     connectionId: 'direct:zai_coding',
-    fetcher: fetchZaiCodingIds
+    fetcher: fetchZaiCodingIds,
+    note: 'Known compatibility-only model aliases are intentionally excluded; unknown future IDs remain visible.'
   },
   {
     provider: 'togetherai',
@@ -582,6 +592,7 @@ async function compareProvider(definition: ComparisonDefinition, catalog: Catalo
       catalogCount: catalogIds.length,
       onlyInSource: sourceIds.filter((id) => !catalogSet.has(id)).slice(0, 25),
       onlyInCatalog: catalogIds.filter((id) => !sourceSet.has(id)).slice(0, 25),
+      note: definition.note,
       hasGpt4oInSource: definition.provider === 'openai' ? sourceSet.has('gpt-4o') : undefined,
       hasGpt4oInCatalog: definition.provider === 'openai' ? catalogSet.has('gpt-4o') : undefined
     }

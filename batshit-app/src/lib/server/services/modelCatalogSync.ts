@@ -15,6 +15,12 @@ import {
   QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
   QWEN_TOKEN_PLAN_TEXT_MODELS
 } from '$lib/server/constants/qwenTokenPlan'
+import {
+  ZAI_CODING_PLAN_LEGACY_MODEL_IDS,
+  ZAI_CODING_PLAN_MODELS,
+  ZAI_CODING_PLAN_OPENAI_BASE_URL
+} from '$lib/server/constants/zaiCodingPlan'
+import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
 
 const GATEWAY_ENDPOINT = 'https://ai-gateway.vercel.sh/v1/models'
 const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/models'
@@ -258,6 +264,17 @@ const MANUAL_DIRECT_MODELS: Partial<Record<DirectProviderId, DirectProviderEntry
     modelType: 'chat'
   })),
   zai: [
+    ...ZAI_CODING_PLAN_MODELS.map((model) => ({
+      id: model.id,
+      developerId: model.developerId,
+      modelId: model.id,
+      effectiveId: model.id,
+      displayName: model.displayName,
+      tags: [...model.tags],
+      contextWindow: model.contextWindow,
+      maxOutputTokens: model.maxOutputTokens,
+      modelType: model.modelType
+    })),
     {
       id: 'glm-5.2',
       displayName: 'GLM-5.2',
@@ -278,22 +295,17 @@ const MANUAL_DIRECT_MODELS: Partial<Record<DirectProviderId, DirectProviderEntry
     { id: 'glm-4.6v-flash', displayName: 'GLM-4.6V-Flash', tags: ['vision'] },
     { id: 'glm-4.5-flash', displayName: 'GLM-4.5-Flash' }
   ],
-  zai_coding: [
-    {
-      id: 'glm-5.2',
-      displayName: 'GLM-5.2',
-      tags: ['reasoning', 'code'],
-      contextWindow: 1_000_000,
-      maxOutputTokens: 131_072
-    },
-    { id: 'glm-4.5', displayName: 'GLM-4.5' },
-    { id: 'glm-4.7', displayName: 'GLM-4.7' },
-    { id: 'glm-4.5-air', displayName: 'GLM-4.5-Air' },
-    { id: 'glm-4.6', displayName: 'GLM-4.6' },
-    { id: 'glm-5', displayName: 'GLM-5' },
-    { id: 'glm-5-turbo', displayName: 'GLM-5-Turbo' },
-    { id: 'glm-5.1', displayName: 'GLM-5.1' }
-  ],
+  zai_coding: ZAI_CODING_PLAN_MODELS.map((model) => ({
+    id: model.id,
+    developerId: model.developerId,
+    modelId: model.id,
+    effectiveId: model.id,
+    displayName: model.displayName,
+    tags: [...model.tags],
+    contextWindow: model.contextWindow,
+    maxOutputTokens: model.maxOutputTokens,
+    modelType: model.modelType
+  })),
   fal: [
     {
       id: 'fal-ai/flux/dev',
@@ -918,7 +930,7 @@ function normalizeProvider(id: string) {
 }
 
 function buildCanonicalId(provider: string, name: string) {
-  const normalizedProvider = provider.toLowerCase().trim()
+  const normalizedProvider = canonicalizeCatalogDeveloperId(provider)
   const normalizedName = name.toLowerCase().trim().replace(/\s+/g, '-')
   return `${normalizedProvider}/${normalizedName}`
 }
@@ -1495,7 +1507,7 @@ async function fetchZaiCodingEntries(options: SourceFetchOptions = {}): Promise<
     return curated
   }
 
-  const baseUrl = (await getRuntimeEnv('ZAI_CODING_API_BASE_URL')) || 'https://api.z.ai/api/coding/paas/v4'
+  const baseUrl = (await getRuntimeEnv('ZAI_CODING_API_BASE_URL')) || ZAI_CODING_PLAN_OPENAI_BASE_URL
 
   try {
     const ids = await fetchOpenAICompatibleModelIds({
@@ -1504,9 +1516,10 @@ async function fetchZaiCodingEntries(options: SourceFetchOptions = {}): Promise<
       signal: options.signal
     })
 
-    if (ids.length) {
+    const currentAndFutureIds = filterZaiCodingPlanModelIds(ids)
+    if (currentAndFutureIds.length) {
       return mergeDirectProviderEntries(
-        ids.map((id) => ({ id })),
+        currentAndFutureIds.map((id) => ({ id, developerId: 'zai', modelId: id, effectiveId: id })),
         curated
       )
     }
@@ -1518,6 +1531,26 @@ async function fetchZaiCodingEntries(options: SourceFetchOptions = {}): Promise<
   }
 
   return curated
+}
+
+const ZAI_CODING_PLAN_LEGACY_MODEL_ID_SET = new Set<string>(ZAI_CODING_PLAN_LEGACY_MODEL_IDS)
+
+function filterZaiCodingPlanModelIds(ids: string[]): string[] {
+  return ids.filter((id) => !ZAI_CODING_PLAN_LEGACY_MODEL_ID_SET.has(id.trim().toLowerCase()))
+}
+
+function applyDirectSourceCatalogPolicy(
+  provider: DirectProviderId,
+  entries: CatalogEntry[]
+): CatalogEntry[] {
+  if (provider !== 'zai_coding') return entries
+  return entries.filter(
+    (entry) => !ZAI_CODING_PLAN_LEGACY_MODEL_ID_SET.has(entry.name.trim().toLowerCase())
+  )
+}
+
+export function _filterZaiCodingPlanModelIdsForTest(ids: string[]): string[] {
+  return filterZaiCodingPlanModelIds(ids)
 }
 
 async function fetchFalEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1994,6 +2027,16 @@ function enrichWithAA(entry: CatalogEntry, aaMap: Map<string, any>) {
 
 type CatalogMergeKey = string
 
+function buildCatalogMergeKey(entry: Pick<CatalogEntry, 'provider' | 'canonicalId' | 'aaSlug'>): CatalogMergeKey {
+  const developerId = canonicalizeCatalogDeveloperId(entry.provider)
+  const aaSlug = entry.aaSlug?.trim().toLowerCase()
+  if (developerId && aaSlug) return `${developerId}::aa:${aaSlug}`
+  const [, ...modelParts] = entry.canonicalId.split('/')
+  return developerId && modelParts.length
+    ? `${developerId}/${modelParts.join('/')}`
+    : entry.canonicalId
+}
+
 function buildIdVariants(entries: CatalogEntry[]) {
   const variants: NonNullable<CatalogEntry['idVariants']> = {}
 
@@ -2018,7 +2061,7 @@ function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
   const groups = new Map<CatalogMergeKey, CatalogEntry[]>()
 
   for (const entry of entries) {
-    const key = entry.aaSlug?.trim() || entry.canonicalId
+    const key = buildCatalogMergeKey(entry)
     if (!key) continue
     if (!groups.has(key)) {
       groups.set(key, [])
@@ -2045,6 +2088,8 @@ function mergeCatalogEntries(entries: CatalogEntry[]): CatalogEntry[] {
 
     const mergedEntry: CatalogEntry = {
       ...base,
+      canonicalId: buildCanonicalId(base.provider, base.name),
+      provider: canonicalizeCatalogDeveloperId(base.provider),
       pricing: base.pricing ?? group.find((entry) => entry.pricing)?.pricing,
       contextWindow: base.contextWindow ?? group.find((entry) => entry.contextWindow)?.contextWindow,
       maxOutputTokens: base.maxOutputTokens ?? group.find((entry) => entry.maxOutputTokens)?.maxOutputTokens,
@@ -2164,6 +2209,13 @@ export function _mapDirectProviderEntriesForTest(
   entries: DirectProviderEntry[]
 ): CatalogEntry[] {
   return mapDirectProviderEntries(provider, entries)
+}
+
+export function _applyDirectSourceCatalogPolicyForTest(
+  provider: DirectProviderId,
+  entries: CatalogEntry[]
+): CatalogEntry[] {
+  return applyDirectSourceCatalogPolicy(provider, entries)
 }
 
 export function _buildCatalogSyncDiffForTest({
@@ -2393,10 +2445,18 @@ export function _buildSourceFallbackWarningForTest(args: {
 }
 
 function buildModelKey(model: any): string {
+  const provider = canonicalizeCatalogDeveloperId(safeString(model?.provider))
   const aaSlug = safeString(model?.aaSlug).trim()
-  if (aaSlug) return aaSlug
+  if (aaSlug && provider) return `${provider}::aa:${aaSlug.toLowerCase()}`
   const canonical = safeString(model?.canonicalId).trim()
-  if (canonical) return canonical
+  if (canonical) {
+    const [developerId, ...modelParts] = canonical.split('/')
+    if (developerId && modelParts.length) {
+      return `${canonicalizeCatalogDeveloperId(developerId)}/${modelParts.join('/')}`
+    }
+    return canonical
+  }
+  if (aaSlug) return aaSlug.toLowerCase()
   return safeString(model?.id).trim()
 }
 
@@ -2624,12 +2684,15 @@ export async function runModelCatalogSync(
     DIRECT_PROVIDER_IDS.map((provider) => [
       provider,
       existing
-        ? buildFallbackEntriesFromExisting({
-            existing,
-            connectionId: asDirectConnectionId(provider),
-            source: 'direct',
-            transport: 'direct'
-          }).length
+        ? applyDirectSourceCatalogPolicy(
+            provider,
+            buildFallbackEntriesFromExisting({
+              existing,
+              connectionId: asDirectConnectionId(provider),
+              source: 'direct',
+              transport: 'direct'
+            })
+          ).length
         : 0
     ])
   ) as Record<DirectProviderId, number>
@@ -2732,12 +2795,15 @@ export async function runModelCatalogSync(
     const fresh = result.status === 'fulfilled' ? mapDirectProviderEntries(provider, result.value) : null
     const error = result.status === 'rejected' ? normalizeError(result.reason) : undefined
     const fallback = existing
-      ? buildFallbackEntriesFromExisting({
-          existing,
-          connectionId,
-          source: 'direct',
-          transport: 'direct'
-        })
+      ? applyDirectSourceCatalogPolicy(
+          provider,
+          buildFallbackEntriesFromExisting({
+            existing,
+            connectionId,
+            source: 'direct',
+            transport: 'direct'
+          })
+        )
       : []
     const previousCount = previousDirectCounts[provider] ?? 0
     const useFallback =

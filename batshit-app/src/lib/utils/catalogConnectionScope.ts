@@ -1,9 +1,11 @@
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
+import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
 import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
 
 export type ConnectionScopedCatalogModel = {
   catalogId: string
   developerId: string
+  canonicalDeveloperId: string
   modelId: string
   effectiveModelId: string
   displayName: string
@@ -29,6 +31,9 @@ export function resolveConnectionScopedCatalogModel(
   return {
     catalogId: model.id,
     developerId: resolvedIds?.developerId ?? model.provider,
+    canonicalDeveloperId: canonicalizeCatalogDeveloperId(
+      resolvedIds?.developerId ?? model.provider
+    ),
     modelId: resolvedIds?.modelId ?? model.name,
     effectiveModelId: resolvedIds?.effectiveModelId ?? model.name,
     displayName: model.displayName,
@@ -44,7 +49,7 @@ export function buildConnectionScopedCatalogModels(
 
   for (const model of models) {
     const scoped = resolveConnectionScopedCatalogModel(model, connection)
-    const key = `${normalizeScopeValue(scoped.developerId)}::${normalizeScopeValue(
+    const key = `${normalizeScopeValue(scoped.canonicalDeveloperId)}::${normalizeScopeValue(
       scoped.effectiveModelId
     )}`
     if (!unique.has(key)) {

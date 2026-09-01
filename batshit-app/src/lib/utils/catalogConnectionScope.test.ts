@@ -47,6 +47,7 @@ describe('catalogConnectionScope', () => {
     )
 
     expect(scoped.developerId).toBe('google')
+    expect(scoped.canonicalDeveloperId).toBe('google')
     expect(scoped.modelId).toBe('gemini-2.5-pro-preview-05-06')
     expect(scoped.effectiveModelId).toBe('gemini-2.5-pro-preview-05-06')
   })
@@ -86,5 +87,30 @@ describe('catalogConnectionScope', () => {
     expect(rows[0]?.catalogId).toBe('google/gemini-2.5-pro')
     expect(rows[0]?.developerId).toBe('google')
     expect(rows[0]?.effectiveModelId).toBe('gemini-2.5-pro')
+  })
+
+  it('keeps an exact provider namespace while exposing one canonical Z.ai developer', () => {
+    const scoped = resolveConnectionScopedCatalogModel(
+      baseModel({
+        id: 'zai/glm-5.3',
+        canonicalId: 'zai/glm-5.3',
+        provider: 'zai',
+        name: 'glm-5.3',
+        displayName: 'GLM-5.3',
+        idVariants: {
+          'direct:deepinfra': {
+            developerId: 'zai-org',
+            modelId: 'GLM-5.3',
+            effectiveId: 'zai-org/GLM-5.3',
+            source: 'direct'
+          }
+        }
+      }),
+      baseConnection({ id: 'direct:deepinfra', label: 'DeepInfra (Direct)', providers: ['deepinfra'] })
+    )
+
+    expect(scoped.canonicalDeveloperId).toBe('zai')
+    expect(scoped.developerId).toBe('zai-org')
+    expect(scoped.effectiveModelId).toBe('zai-org/GLM-5.3')
   })
 })

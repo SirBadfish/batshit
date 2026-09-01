@@ -694,7 +694,7 @@ function buildConnectionOptions(
     cerebras: 'Cerebras'
   }
   const DIRECT_PROVIDER_DESCRIPTIONS: Partial<Record<KnownProviderId, string>> = {
-    zai_coding: 'Use Z.ai Coding Plan GLM models, including GLM-5.2, through the OpenAI-compatible coding endpoint.',
+    zai_coding: 'Use current Z.ai Coding Plan models, including GLM-5.3 and GLM-5.3-Flash, through the OpenAI-compatible coding endpoint.',
     xai: 'Use xAI Grok models through the OpenAI-compatible xAI API.',
     moonshot: 'Use Moonshot AI Kimi models through the OpenAI-compatible Kimi API.',
     minimax: 'Use MiniMax M-series models through the OpenAI-compatible MiniMax API.',

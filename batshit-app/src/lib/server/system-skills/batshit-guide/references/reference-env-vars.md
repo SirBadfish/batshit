@@ -199,7 +199,8 @@ These can be env fallbacks, but Settings -> API Keys is preferred for normal use
 | `OPENROUTER_API_KEY` | OpenRouter provider key. |
 | `AI_GATEWAY_API_KEY` | Vercel AI Gateway key. |
 | `DEEPSEEK_API_KEY` | DeepSeek provider key in app env examples. |
-| `ZAI_API_KEY` / `ZAI_CODING_API_KEY` | Separate Z.ai regular pay-as-you-go and Coding Plan keys. The regular key never activates the Coding Plan endpoint. |
+| `ZAI_API_KEY` / `ZAI_API_BASE_URL` | Z.ai regular pay-as-you-go key and optional OpenAI-compatible base URL override. |
+| `ZAI_CODING_API_KEY` / `ZAI_CODING_API_BASE_URL` | Separate Z.ai Coding Plan key and optional coding-endpoint override. The regular key never activates this connection. |
 | `DEEPINFRA_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `BASETEN_API_KEY`, `CEREBRAS_API_KEY` | Optional OpenAI-compatible direct provider keys. |
 | `COHERE_API_KEY` / `COHERE_API_BASE_URL` | Cohere key and optional OpenAI compatibility API base URL override. Default `https://api.cohere.ai/compatibility/v1`. |
 | `FISH_AUDIO_API_KEY` | Optional Fish Audio key for direct realtime TTS. Fish also needs a voice/reference ID in Voice Settings or the request. |

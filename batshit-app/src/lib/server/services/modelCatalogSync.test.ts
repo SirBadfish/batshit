@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  _applyDirectSourceCatalogPolicyForTest,
   _buildSourceFallbackWarningForTest,
   _buildCatalogSyncDiffForTest,
+  _filterZaiCodingPlanModelIdsForTest,
   _getManualDirectModelsForTest,
   _findCatalogIdentityIssuesForTest,
   _mapBasetenModelsForTest,
@@ -117,6 +119,83 @@ describe('modelCatalogSync merge', () => {
     expect(merged[0]?.idVariants?.['vercel-gateway']?.effectiveId).toBe('anthropic/claude-sonnet-4-5')
     expect(merged[0]?.idVariants?.openrouter?.effectiveId).toBe('anthropic/claude-sonnet-4.5')
     expect(merged[0]?.availableConnections).toEqual(expect.arrayContaining(['vercel-gateway', 'openrouter']))
+  })
+
+  it('merges reviewed Z.ai developer aliases while preserving exact connection variants', () => {
+    const merged = _mergeCatalogEntriesForTest([
+      {
+        id: 'z-ai/glm-5.3',
+        canonicalId: 'z-ai/glm-5.3',
+        provider: 'z-ai',
+        name: 'glm-5.3',
+        displayName: 'GLM-5.3',
+        tags: ['reasoning'],
+        purpose: 'chat',
+        features: { streaming: true, tools: true, vision: false, maxTokens: 1_000_000 },
+        source: 'openrouter',
+        transport: 'openrouter',
+        connectionId: 'openrouter'
+      },
+      {
+        id: 'zai-org/GLM-5.3',
+        canonicalId: 'zai-org/glm-5.3',
+        provider: 'zai-org',
+        upstreamProvider: 'deepinfra',
+        name: 'glm-5.3',
+        displayName: 'GLM-5.3',
+        tags: ['reasoning'],
+        purpose: 'chat',
+        features: { streaming: true, tools: true, vision: false, maxTokens: 1_000_000 },
+        source: 'direct',
+        transport: 'direct',
+        connectionId: 'direct:deepinfra'
+      }
+    ])
+
+    expect(merged).toHaveLength(1)
+    expect(merged[0]).toMatchObject({
+      canonicalId: 'zai/glm-5.3',
+      provider: 'zai'
+    })
+    expect(merged[0]?.idVariants?.openrouter).toMatchObject({
+      developerId: 'z-ai',
+      effectiveId: 'z-ai/glm-5.3'
+    })
+    expect(merged[0]?.idVariants?.['direct:deepinfra']).toMatchObject({
+      developerId: 'zai-org',
+      effectiveId: 'zai-org/GLM-5.3'
+    })
+  })
+
+  it('does not merge different developers solely because Artificial Analysis uses the same slug', () => {
+    const base = {
+      name: 'shared-model',
+      displayName: 'Shared Model',
+      tags: [],
+      purpose: 'chat' as const,
+      aaSlug: 'shared-model',
+      features: { streaming: true, tools: false, vision: false, maxTokens: 8_192 },
+      source: 'direct' as const,
+      transport: 'direct' as const
+    }
+    const merged = _mergeCatalogEntriesForTest([
+      {
+        ...base,
+        id: 'alpha/shared-model',
+        canonicalId: 'alpha/shared-model',
+        provider: 'alpha',
+        connectionId: 'direct:alpha'
+      },
+      {
+        ...base,
+        id: 'beta/shared-model',
+        canonicalId: 'beta/shared-model',
+        provider: 'beta',
+        connectionId: 'direct:beta'
+      }
+    ])
+
+    expect(merged).toHaveLength(2)
   })
 
   it('attaches direct provider variants when present', () => {
@@ -291,12 +370,14 @@ describe('modelCatalogSync merge', () => {
     ).toBe('Suspicious drop detected (prev=405, fetched=180); preserving previous list')
   })
 
-  it('keeps GLM-5.2 in the Z.ai coding-plan fallback list', () => {
+  it('keeps only current models in the Z.ai Coding Plan fallback list', () => {
     const models = _getManualDirectModelsForTest('zai_coding')
-    const glm52 = models.find((model) => model.id === 'glm-5.2')
+    const glm53 = models.find((model) => model.id === 'glm-5.3')
 
-    expect(glm52).toMatchObject({
-      displayName: 'GLM-5.2',
+    expect(models.map((model) => model.id)).toEqual(['glm-5.3', 'glm-5.3-flash'])
+    expect(glm53).toMatchObject({
+      developerId: 'zai',
+      displayName: 'GLM-5.3',
       contextWindow: 1_000_000,
       maxOutputTokens: 131_072
     })
@@ -304,10 +385,36 @@ describe('modelCatalogSync merge', () => {
 
   it('merges curated Z.ai coding-plan entries into lagging live discovery results', () => {
     const curated = _getManualDirectModelsForTest('zai_coding')
-    const merged = _mergeDirectProviderEntriesForTest([{ id: 'glm-4.7' }, { id: 'glm-5.1' }], curated)
+    const merged = _mergeDirectProviderEntriesForTest([{ id: 'glm-5.3' }], curated)
 
-    expect(merged.some((model) => model.id === 'glm-5.2')).toBe(true)
-    expect(merged.find((model) => model.id === 'glm-4.7')?.displayName).toBe('GLM-4.7')
+    expect(merged.some((model) => model.id === 'glm-5.3-flash')).toBe(true)
+    expect(merged.find((model) => model.id === 'glm-5.3')?.displayName).toBe('GLM-5.3')
+  })
+
+  it('filters known Coding Plan compatibility aliases but preserves unknown future models', () => {
+    expect(
+      _filterZaiCodingPlanModelIdsForTest([
+        'glm-4.7',
+        'glm-5.2',
+        'glm-5.3',
+        'glm-5.3-flash',
+        'glm-6-preview'
+      ])
+    ).toEqual(['glm-5.3', 'glm-5.3-flash', 'glm-6-preview'])
+  })
+
+  it('removes legacy Coding Plan rows before outage-fallback counts preserve them', () => {
+    const entries = _mapDirectProviderEntriesForTest('zai_coding', [
+      { id: 'glm-4.7' },
+      { id: 'glm-5.2' },
+      { id: 'glm-5.3' },
+      { id: 'glm-5.3-flash' },
+      { id: 'glm-6-preview' }
+    ])
+
+    expect(
+      _applyDirectSourceCatalogPolicyForTest('zai_coding', entries).map((entry) => entry.name)
+    ).toEqual(['glm-5.3', 'glm-5.3-flash', 'glm-6-preview'])
   })
 
   it('imports active DeepInfra chat models with exact namespaced IDs and normalized metadata', () => {
