@@ -132,17 +132,6 @@ describe('buildClipRosterLines / buildClipRosterDcmLines', () => {
     ])
   })
 
-  it('DL-109-09: a temporarily-unclipped clip is departed and never listed', () => {
-    const roster = buildClipRosterLines({
-      entries: [
-        { clipId: 'clip_hidden', name: 'hidden.png', temporarilyUnclipped: true }
-      ],
-      historyMessageIds: new Set()
-    })
-    expect(roster.currentLines).toEqual([])
-    expect(roster.lingeringLines).toEqual([])
-  })
-
   it('falls back to the bare id when no filename resolved', () => {
     const roster = buildClipRosterLines({
       entries: [{ clipId: 'clip_x', attachedToMessageId: 'msg_1' }],

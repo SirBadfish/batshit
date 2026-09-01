@@ -12,8 +12,8 @@
  *      which are new this message, and which persist from earlier. The
  *      new-vs-persisting question is answered by statement, not by noticing
  *      repeated syntax (DL-109-04).
- *   3. CLIP LOGS — a departed clip (unclipped, expired next-message-only, or
- *      temporarily unclipped) leaves `**(Clip Log: <filename>)**` where it
+ *   3. CLIP LOGS — a departed clip (unclipped, or an expired
+ *      next-message-only clip) leaves `**(Clip Log: <filename>)**` where it
  *      rode. For a departed clip the marker is the ONLY remaining trace, the
  *      same record role zip syntax plays for hidden tool results (DL-109-03).
  *
@@ -119,7 +119,6 @@ export interface ClipRosterEntryInput {
   name?: string | null
   attachedToMessageId?: string | null
   messagesUntilUnclip?: number | null
-  temporarilyUnclipped?: boolean
 }
 
 export interface ClipRosterLines {
@@ -131,8 +130,7 @@ export interface ClipRosterLines {
  * Groups attached clips into the established Current / Lingering vocabulary.
  *
  * A clip counts as Current when the message it was attached to is not in the
- * compiled history yet — i.e. it rode in with this send. Temporarily-unclipped
- * clips are departed and never appear here (DL-109-09).
+ * compiled history yet — i.e. it rode in with this send.
  */
 export function buildClipRosterLines(options: {
   entries: ClipRosterEntryInput[]
@@ -142,7 +140,7 @@ export function buildClipRosterLines(options: {
   const lingeringLines: string[] = []
 
   for (const entry of options.entries) {
-    if (!entry?.clipId || entry.temporarilyUnclipped) continue
+    if (!entry?.clipId) continue
     const name = normalizeName(entry.name)
     const label = name ? `"${name}" (${entry.clipId})` : entry.clipId
     const countdown =

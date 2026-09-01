@@ -87,7 +87,6 @@ type SessionClipEntry = {
   clipId: string
   unclipAfter: number | null
   messagesUntilUnclip: number | null
-  temporarilyUnclipped: boolean
 }
 
 type SessionClipRecord = {
@@ -226,8 +225,7 @@ function parseSessionClipRecord(value: unknown, sessionId: string): SessionClipR
     return {
       clipId: requiredString(candidate.clipId, 'Session clip id'),
       unclipAfter: countdown(candidate.unclipAfter),
-      messagesUntilUnclip: countdown(candidate.messagesUntilUnclip ?? candidate.unclipAfter),
-      temporarilyUnclipped: candidate.temporarilyUnclipped === true
+      messagesUntilUnclip: countdown(candidate.messagesUntilUnclip ?? candidate.unclipAfter)
     }
   })
   return { sessionId, clips }
@@ -237,11 +235,7 @@ function applySessionState(
   clips: DesktopControlsClip[],
   record: SessionClipRecord
 ): DesktopControlsClip[] {
-  const stateByClip = new Map(
-    record.clips
-      .filter((entry) => !entry.temporarilyUnclipped)
-      .map((entry) => [entry.clipId, entry])
-  )
+  const stateByClip = new Map(record.clips.map((entry) => [entry.clipId, entry]))
   const knownClipIds = new Set(clips.map((clip) => clip.id))
   const brokenReference = [...stateByClip.keys()].find((clipId) => !knownClipIds.has(clipId))
   if (brokenReference) {

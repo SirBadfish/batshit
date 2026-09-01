@@ -1436,7 +1436,7 @@ export class VercelAIBrain {
         return new Set()
       }
       const active = (state as any).clips
-        .filter((clip: any) => clip?.clipId && clip.temporarilyUnclipped !== true)
+        .filter((clip: any) => clip?.clipId)
         .map((clip: any) => clip.clipId)
       return new Set(active)
     } catch (error) {

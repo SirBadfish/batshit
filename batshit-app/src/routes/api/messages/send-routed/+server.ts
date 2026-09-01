@@ -177,7 +177,6 @@ import {
   decrementSessionClipDurations,
   listActiveClipIds,
   normalizeSessionClipState,
-  tickTemporaryClipReattach,
 } from '$lib/server/services/sessionClipState'
 import { stripLeadingSubagentEchoText } from '$lib/server/services/finalAssistantTextSanitizer'
 import { selectFinishZipInput } from '$lib/server/services/managedStreamFinalization'
@@ -234,8 +233,8 @@ async function consumePostCompileSessionClips(sessionId: string) {
   const existingState = await redis.get(stateKey)
   if (!existingState) return
 
-  const nextState = tickTemporaryClipReattach(
-    decrementSessionClipDurations(normalizeSessionClipState(sessionId, existingState))
+  const nextState = decrementSessionClipDurations(
+    normalizeSessionClipState(sessionId, existingState)
   )
 
   await redis.set(stateKey, nextState)

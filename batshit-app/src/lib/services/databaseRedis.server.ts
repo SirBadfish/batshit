@@ -805,10 +805,9 @@ export class DatabaseService {
    * SA-109: one clip-state read per compile, shared by the history rewrite, the
    * DCM roster, and content delivery so all three can never disagree.
    *
-   * `attached` deliberately excludes `temporarilyUnclipped` entries: a
-   * temporarily-unclipped clip is departed on every surface, including content
-   * (DL-109-09). Before SA-109 the compiler still shipped its bytes while the
-   * marker and the roster line were suppressed elsewhere.
+   * A clip is attached exactly while it is present in session clip state. There
+   * is no third "hidden but still stored" state — the half-built temporary-
+   * unclip lane was removed in SA-109 P4 because nothing could ever trigger it.
    */
   private async resolveSessionClipCompileState(
     sessionId: string,
@@ -841,17 +840,14 @@ export class DatabaseService {
       if (filename) clipNames.set(entry.clipId, filename)
     }
 
-    const attachedIds = stateEntries
-      .filter((entry) => entry.temporarilyUnclipped !== true)
-      .map((entry) => entry.clipId)
+    const attachedIds = stateEntries.map((entry) => entry.clipId)
 
     return {
       entries: stateEntries.map((entry) => ({
         clipId: entry.clipId,
         name: clipNames.get(entry.clipId) ?? null,
         attachedToMessageId: entry.attachedToMessageId ?? null,
-        messagesUntilUnclip: entry.messagesUntilUnclip ?? null,
-        temporarilyUnclipped: entry.temporarilyUnclipped === true
+        messagesUntilUnclip: entry.messagesUntilUnclip ?? null
       })),
       attachedIds,
       activeClipIds: new Set(attachedIds),
@@ -2656,8 +2652,8 @@ export class DatabaseService {
     const trustedClipIds = new Set<string>()
     
     // Session state is the authority on what is attached — clips are not embedded
-    // in every message. SA-109 (DL-109-09): `attachedIds` already excludes
-    // temporarily-unclipped entries, so a departed clip no longer ships bytes.
+    // in every message. A clip leaves state when it is unclipped or when its
+    // next-message-only countdown burns; either way it stops shipping bytes.
     for (const clipId of clipCompileState.attachedIds) {
       if (!clipsFromMessage.includes(clipId)) {
         clipsFromMessage.push(clipId)

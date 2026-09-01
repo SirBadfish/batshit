@@ -56,7 +56,6 @@
     clipId: string
     unclipAfter?: number | null
     messagesUntilUnclip?: number | null
-    temporarilyUnclipped?: boolean
   }
 
   interface ManagedTunnelStatus {
@@ -146,7 +145,7 @@
   ) {
     const stateMap = new Map(
       stateEntries
-        .filter((entry) => entry?.clipId && entry.temporarilyUnclipped !== true)
+        .filter((entry) => entry?.clipId)
         .map((entry) => [entry.clipId, entry])
     )
 

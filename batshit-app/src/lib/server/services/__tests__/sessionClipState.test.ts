@@ -5,8 +5,6 @@ import {
   decrementSessionClipDurations,
   listActiveClipIds,
   normalizeSessionClipState,
-  temporarilyUnclipSessionClip,
-  tickTemporaryClipReattach,
   updateSessionClipDuration,
 } from '../sessionClipState'
 
@@ -40,20 +38,17 @@ describe('sessionClipState', () => {
     expect(listActiveClipIds(afterTick)).toEqual(['clip-2'])
   })
 
-  it('restores temporarily unclipped items after the reattach countdown finishes', () => {
-    const initial = normalizeSessionClipState('sess-3', null)
-    const attached = attachSessionClip(initial, {
-      clipId: 'clip-3',
+  it('ignores a stale temporarilyUnclipped field left in stored state', () => {
+    // SA-109 P4 removed the half-built temporary-unclip lane: nothing could ever
+    // set this flag, so no real record carries it. If one somehow does, the clip
+    // is simply attached — the user never asked for it to be hidden.
+    const state = normalizeSessionClipState('sess-3', {
+      sessionId: 'sess-3',
+      clips: [{ clipId: 'clip-3', temporarilyUnclipped: true, reattachAt: 4 }]
     })
-    const tempHidden = temporarilyUnclipSessionClip(attached, 'clip-3', 2)
 
-    expect(listActiveClipIds(tempHidden)).toEqual([])
-
-    const firstTick = tickTemporaryClipReattach(tempHidden)
-    expect(firstTick.clips[0]?.temporarilyUnclipped).toBe(true)
-
-    const secondTick = tickTemporaryClipReattach(firstTick)
-    expect(secondTick.clips[0]?.temporarilyUnclipped).toBe(false)
-    expect(listActiveClipIds(secondTick)).toEqual(['clip-3'])
+    expect(listActiveClipIds(state)).toEqual(['clip-3'])
+    expect(state.clips[0]).not.toHaveProperty('temporarilyUnclipped')
+    expect(state.clips[0]).not.toHaveProperty('reattachAt')
   })
 })

@@ -5,8 +5,6 @@ export interface SessionClipStateEntry {
   unclipAfter?: number | null
   messagesUntilUnclip?: number | null
   firstAppearanceMessageId?: string
-  temporarilyUnclipped?: boolean
-  reattachAt?: number
 }
 
 export interface SessionClipStateRecord {
@@ -49,9 +47,7 @@ export function normalizeSessionClipState(
             typeof entry.firstAppearanceMessageId === 'string' &&
             entry.firstAppearanceMessageId.trim().length > 0
               ? entry.firstAppearanceMessageId
-              : undefined,
-          temporarilyUnclipped: entry.temporarilyUnclipped === true,
-          reattachAt: clampCountdown(entry.reattachAt) ?? undefined
+              : undefined
         }))
     : []
 
@@ -62,9 +58,7 @@ export function normalizeSessionClipState(
 }
 
 export function listActiveClipIds(state: SessionClipStateRecord): string[] {
-  return state.clips
-    .filter((entry) => entry.temporarilyUnclipped !== true)
-    .map((entry) => entry.clipId)
+  return state.clips.map((entry) => entry.clipId)
 }
 
 export function attachSessionClip(
@@ -104,8 +98,7 @@ export function attachSessionClip(
             ...entry,
             attachedToMessageId: options.messageId ?? entry.attachedToMessageId,
             unclipAfter: nextCountdown,
-            messagesUntilUnclip: nextCountdown,
-            temporarilyUnclipped: false
+            messagesUntilUnclip: nextCountdown
           }
         : entry
     )
@@ -136,8 +129,7 @@ export function updateSessionClipDuration(
         ? {
             ...entry,
             unclipAfter: nextCountdown,
-            messagesUntilUnclip: nextCountdown,
-            temporarilyUnclipped: false
+            messagesUntilUnclip: nextCountdown
           }
         : entry
     )
@@ -169,49 +161,5 @@ export function decrementSessionClipDurations(
   return {
     ...state,
     clips
-  }
-}
-
-export function temporarilyUnclipSessionClip(
-  state: SessionClipStateRecord,
-  clipId: string,
-  reattachAfter?: number | null
-): SessionClipStateRecord {
-  const nextReattach = clampCountdown(reattachAfter) ?? 6
-
-  return {
-    ...state,
-    clips: state.clips.map((entry) =>
-      entry.clipId === clipId
-        ? {
-            ...entry,
-            temporarilyUnclipped: true,
-            reattachAt: nextReattach
-          }
-        : entry
-    )
-  }
-}
-
-export function tickTemporaryClipReattach(
-  state: SessionClipStateRecord
-): SessionClipStateRecord {
-  return {
-    ...state,
-    clips: state.clips.map((entry) => {
-      const reattachAt = clampCountdown(entry.reattachAt)
-      if (!reattachAt) return entry
-      if (reattachAt <= 1) {
-        return {
-          ...entry,
-          temporarilyUnclipped: false,
-          reattachAt: undefined
-        }
-      }
-      return {
-        ...entry,
-        reattachAt: reattachAt - 1
-      }
-    })
   }
 }
