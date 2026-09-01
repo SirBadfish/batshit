@@ -423,6 +423,7 @@ export class VercelAIBrain {
           memoryControlsEnabled: request.memoryControlsEnabled,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
+          parentMessageId: request.messageId ?? null,
           reserveToolZipId: request.reserveToolZipId,
           abortSignal: request.abortSignal
         }
@@ -467,6 +468,8 @@ export class VercelAIBrain {
         stopWhen: isStepCount(request.maxToolRounds || 10), // Multi-round tool execution
         ...this.buildGenerationSettings(request),
         providerOptions: cachePolicy.providerOptions,
+        // SA-107: per-session cache-affinity headers (xAI/Baseten/Fireworks direct lanes).
+        ...(cachePolicy.headers ? { headers: cachePolicy.headers } : {}),
         ...(downloadGuard ? { experimental_download: downloadGuard } : {})
       })
 
@@ -537,7 +540,13 @@ export class VercelAIBrain {
           promptTokens,
           completionTokens,
           totalTokens,
-          imageTokens: request.images?.length ? request.images.length * 765 : undefined
+          imageTokens: request.images?.length ? request.images.length * 765 : undefined,
+          ...(typeof usage?.cachedInputTokens === 'number'
+            ? { cachedInputTokens: usage.cachedInputTokens }
+            : {}),
+          ...(typeof usage?.cacheCreationInputTokens === 'number'
+            ? { cacheCreationInputTokens: usage.cacheCreationInputTokens }
+            : {})
         },
         metadata: {
           provider: this.getProviderName(request.model),
@@ -1066,6 +1075,8 @@ export class VercelAIBrain {
       memoryControlsEnabled?: boolean
       parentModelId?: string | null
       parentConnection?: ModelConnectionInfo | null
+      /** SA-093 P4: parent send's message id so subagent forensics can land on its snapshot. */
+      parentMessageId?: string | null
       reserveToolZipId?: NativeModeRequest['reserveToolZipId']
       abortSignal?: AbortSignal
     }
@@ -1181,6 +1192,7 @@ export class VercelAIBrain {
                   subagentType
                 },
                 parentAgentId: normalizedParentAgentId,
+                parentMessageId: nativeContext?.parentMessageId ?? null,
                 projectPath: nativeContext?.projectPath ?? null,
                 selectedGateways,
                 toolSelections,
@@ -2550,6 +2562,7 @@ export class VercelAIBrain {
             memoryControlsEnabled: request.memoryControlsEnabled,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,
+            parentMessageId: request.messageId ?? null,
             reserveToolZipId: request.reserveToolZipId,
             abortSignal: request.abortSignal
           }
@@ -2645,6 +2658,8 @@ export class VercelAIBrain {
         stopWhen: isStepCount(request.maxToolRounds || 10),
         ...this.buildGenerationSettings(request),
         providerOptions: cachePolicy.providerOptions,
+        // SA-107: per-session cache-affinity headers (xAI/Baseten/Fireworks direct lanes).
+        ...(cachePolicy.headers ? { headers: cachePolicy.headers } : {}),
         abortSignal: request.abortSignal, // Forward abort signal
         // Raw chunks feed the OpenAI-compatible reasoning_content lane; request
         // bodies feed Execution Viewer evidence (v7 excludes them by default).

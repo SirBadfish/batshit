@@ -57,6 +57,8 @@ The Token Panel shows:
 
 Both readouts are honest by design: they only ever show numbers the provider or runtime actually reported or Batshit actually measured. When a lane doesn't report a metric, you see a dash — never a guess.
 
+One honest caveat about the cache readout: a few providers report a small, constant cached number (for example, 128 or 144 tokens) on every response — even the very first one, when nothing could possibly have been reused. That's a quirk of how those providers count, not real savings. Treat a tiny cached percent that never changes as noise; real cache reuse shows up as a large share of the input that drops when you change the start of the conversation.
+
 It also hosts the controls for taming a long conversation:
 
 - **Trim** temporarily drops older messages from what gets *sent* to the model, without deleting anything from the visible chat. It's fully reversible.

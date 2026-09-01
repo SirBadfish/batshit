@@ -50,6 +50,15 @@ import {
   buildManagedSubagentDynamicInfo,
   resolveManagedSubagentScope,
 } from '$lib/server/services/subagentRuntimeScope'
+import { resolveCacheForensicsExperimentGroup } from '$lib/server/services/cacheForensics/apiAdapter'
+import {
+  buildManagedSubagentCacheForensicsRecord,
+  type ManagedSubagentForensicsLane,
+} from '$lib/server/services/cacheForensics/subagentAdapter'
+import {
+  appendSubagentCacheForensicsRecord,
+  isCacheForensicsEnabled,
+} from '$lib/server/services/cacheForensics/evIntegration'
 
 const MAX_SUBAGENT_MEMORY_MESSAGES = 24
 
@@ -64,6 +73,8 @@ export type ManagedSubagentExecutionParams = {
   chatInput: string
   subagent: SubagentRow
   parentAgentId?: string | null
+  /** Parent send's message id — enables SA-093 forensics on the parent snapshot. */
+  parentMessageId?: string | null
   projectPath?: string | null
   selectedGateways?: string[] | null
   toolSelections?: MCPToolSelections | null
@@ -272,9 +283,10 @@ function shouldSkipCliSubagentToolResult(toolName?: string | null, dynamic?: boo
 
 async function collectCliSubagentStreamResult(
   streamResult: Awaited<ReturnType<CodexBridge['streamNativeMode']>> | Awaited<ReturnType<ClaudeBridge['streamNativeMode']>>
-): Promise<{ output: string; intermediateSteps: any[] }> {
+): Promise<{ output: string; intermediateSteps: any[]; usage: unknown }> {
   const outputChunks: string[] = []
   const intermediateSteps: any[] = []
+  let usage: unknown = null
   const detectToolSource =
     typeof (streamResult as any).__detectToolSource === 'function'
       ? (streamResult as any).__detectToolSource
@@ -285,6 +297,11 @@ async function collectCliSubagentStreamResult(
 
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
       outputChunks.push(chunk.text)
+      continue
+    }
+
+    if (chunk.type === 'finish') {
+      usage = chunk.totalUsage ?? chunk.usage ?? usage
       continue
     }
 
@@ -312,6 +329,52 @@ async function collectCliSubagentStreamResult(
   return {
     output: outputChunks.join(''),
     intermediateSteps,
+    usage,
+  }
+}
+
+/**
+ * SA-093 P4: opt-in forensics for a completed managed subagent run. The record
+ * fingerprints the subagent's OWN compiled contract and lands on the parent
+ * send's Execution Viewer snapshot. Fire-and-forget and never throws — a
+ * missing parent message id or snapshot means honest absence, not invention.
+ */
+function captureManagedSubagentForensics(args: {
+  lane: ManagedSubagentForensicsLane
+  params: ManagedSubagentExecutionParams
+  messages: unknown[]
+  usage: unknown
+  connectionId: string | null
+  modelId: string | null
+  runMessageId: string
+}): void {
+  try {
+    if (!isCacheForensicsEnabled()) return
+    const parentMessageId = args.params.parentMessageId?.trim()
+    if (!parentMessageId) return
+
+    const record = buildManagedSubagentCacheForensicsRecord({
+      lane: args.lane,
+      messages: args.messages,
+      usage: args.usage,
+      subagentId: args.params.subagent.id ?? null,
+      connectionId: args.connectionId,
+      modelId: args.modelId,
+      runMessageId: args.runMessageId,
+      parentMessageId,
+      experimentGroup: resolveCacheForensicsExperimentGroup(),
+    })
+
+    void appendSubagentCacheForensicsRecord({
+      sessionId: args.params.sessionId,
+      parentMessageId,
+      record,
+    })
+  } catch (error) {
+    console.error(
+      '[SubagentRunner] Cache-forensics capture failed (run unaffected):',
+      error instanceof Error ? error.message : error,
+    )
   }
 }
 
@@ -470,9 +533,10 @@ async function runApiSubagent(
 
   const { VercelAIBrain } = await import('./vercelBrain')
   const brain = new VercelAIBrain()
+  const runMessageId = `subagent-${params.subagent.id}-${randomUUID()}`
   const response = await brain.processNativeMode({
     sessionId: params.sessionId,
-    messageId: `subagent-${params.subagent.id}-${randomUUID()}`,
+    messageId: runMessageId,
     userId: params.userId,
     agentId: params.parentAgentId ?? undefined,
     model: modelId,
@@ -503,6 +567,18 @@ async function runApiSubagent(
     ? response.intermediateSteps
     : []
   const output = stripLeadingSubagentEchoText(response.content ?? '', intermediateSteps)
+
+  captureManagedSubagentForensics({
+    lane: 'api',
+    params,
+    messages,
+    usage: response.usage ?? null,
+    connectionId: params.subagent.primary_model_name?.trim()
+      ? null
+      : params.parentConnection?.id ?? params.parentConnection?.service ?? null,
+    modelId,
+    runMessageId,
+  })
 
   await persistSubagentMemory(params.sessionId, subagentSlug, memory, [
     { role: 'user', content: params.chatInput },
@@ -553,6 +629,8 @@ async function runCliSubagent(
 
   let output = ''
   let intermediateSteps: any[] = []
+  let collectedUsage: unknown = null
+  const runMessageId = `subagent-${params.subagent.id}-${randomUUID()}`
 
   if (runtime === 'codex') {
     const codexSettings = buildCodexRuntimeSettings(
@@ -581,7 +659,7 @@ async function runCliSubagent(
     const bridge = new CodexBridge()
     const result = await bridge.streamNativeMode({
       sessionId: params.sessionId,
-      messageId: `subagent-${params.subagent.id}-${randomUUID()}`,
+      messageId: runMessageId,
       userId: params.userId,
       agentId: runtimeId,
       agentSlug: subagentSlug,
@@ -603,6 +681,7 @@ async function runCliSubagent(
     const collected = await collectCliSubagentStreamResult(result)
     output = stripLeadingSubagentEchoText(collected.output, collected.intermediateSteps)
     intermediateSteps = collected.intermediateSteps
+    collectedUsage = collected.usage
   } else {
     const claudeSettings = buildClaudeRuntimeSettings(
       params.subagent.claude_settings ?? runtimeProviderSettings
@@ -628,7 +707,7 @@ async function runCliSubagent(
     const bridge = new ClaudeBridge()
     const result = await bridge.streamNativeMode({
       sessionId: params.sessionId,
-      messageId: `subagent-${params.subagent.id}-${randomUUID()}`,
+      messageId: runMessageId,
       userId: params.userId,
       agentId: runtimeId,
       agentSlug: subagentSlug,
@@ -650,7 +729,18 @@ async function runCliSubagent(
     const collected = await collectCliSubagentStreamResult(result)
     output = stripLeadingSubagentEchoText(collected.output, collected.intermediateSteps)
     intermediateSteps = collected.intermediateSteps
+    collectedUsage = collected.usage
   }
+
+  captureManagedSubagentForensics({
+    lane: runtime,
+    params,
+    messages,
+    usage: collectedUsage,
+    connectionId: null,
+    modelId,
+    runMessageId,
+  })
 
   await persistSubagentMemory(params.sessionId, subagentSlug, memory, [
     { role: 'user', content: params.chatInput },

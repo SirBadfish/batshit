@@ -50,6 +50,19 @@ import {
   buildVercelLlmCapture,
 } from '$lib/server/services/executionViewerLlmCapture'
 import {
+  buildMeasuredMessagePerformance,
+  buildMessagePerformanceFromSteps,
+} from '$lib/server/services/messagePerformance'
+import {
+  buildApiCacheForensicsRecords,
+  resolveCacheForensicsExperimentGroup,
+} from '$lib/server/services/cacheForensics/apiAdapter'
+import { buildCliCacheForensicsRecord } from '$lib/server/services/cacheForensics/cliAdapter'
+import {
+  attachCacheForensicsToSnapshot,
+  isCacheForensicsEnabled,
+} from '$lib/server/services/cacheForensics/evIntegration'
+import {
   StreamEventAdapter,
   type CanonicalStreamEvent,
   type VoiceMetadata,
@@ -64,6 +77,7 @@ import {
   hasUsageValues,
   mergeUsageLike,
   outputTokensForUsage,
+  resolveMessageUsage,
   type ApiUsageLike,
 } from '$lib/server/services/apiProviderUsage'
 import type { NativeModeRequest } from '$lib/server/services/vercelBrain'
@@ -4814,6 +4828,54 @@ async function handleBatshitAgentStream({
     stopSequences?: string[] | null
   }
 
+  // SA-093 P7: Batshit-measured wall-clock stream timings for the managed CLI
+  // lanes, whose fabricated streams carry no SDK performance data. Marks come
+  // from the canonical stream loop; the synthetic Codex "thinking" indicator
+  // is emitted outside that loop and never counts as first output.
+  const measuredStreamTiming = {
+    startedAt: null as number | null,
+    firstOutputAt: null as number | null,
+    toolActiveMs: 0,
+    toolWindowStartedAt: null as number | null,
+    activeToolCalls: 0,
+  }
+  const resetMeasuredStreamTiming = () => {
+    measuredStreamTiming.startedAt = Date.now()
+    measuredStreamTiming.firstOutputAt = null
+    measuredStreamTiming.toolActiveMs = 0
+    measuredStreamTiming.toolWindowStartedAt = null
+    measuredStreamTiming.activeToolCalls = 0
+  }
+  const markMeasuredFirstOutput = () => {
+    if (measuredStreamTiming.firstOutputAt === null) {
+      measuredStreamTiming.firstOutputAt = Date.now()
+    }
+  }
+  const markMeasuredToolCallStart = () => {
+    markMeasuredFirstOutput()
+    measuredStreamTiming.activeToolCalls += 1
+    if (measuredStreamTiming.activeToolCalls === 1) {
+      measuredStreamTiming.toolWindowStartedAt = Date.now()
+    }
+  }
+  const markMeasuredToolCallEnd = () => {
+    if (measuredStreamTiming.activeToolCalls <= 0) return
+    measuredStreamTiming.activeToolCalls -= 1
+    if (
+      measuredStreamTiming.activeToolCalls === 0 &&
+      measuredStreamTiming.toolWindowStartedAt !== null
+    ) {
+      measuredStreamTiming.toolActiveMs +=
+        Date.now() - measuredStreamTiming.toolWindowStartedAt
+      measuredStreamTiming.toolWindowStartedAt = null
+    }
+  }
+  const measuredToolActiveMsTotal = (at: number) =>
+    measuredStreamTiming.toolActiveMs +
+    (measuredStreamTiming.toolWindowStartedAt !== null
+      ? Math.max(0, at - measuredStreamTiming.toolWindowStartedAt)
+      : 0)
+
   const buildStreamRequest = (
     modelId: string,
     connection: NativeModeRequest['connection'],
@@ -4915,10 +4977,21 @@ async function handleBatshitAgentStream({
       reasoning,
       responseMessages,
     }) => {
+      // SA-093 P7: stamp finish time immediately — the zip/EV work below can
+      // take real time and must not inflate measured stream timings.
+      const measuredFinishedAt = Date.now()
       const sanitizedFinishText = stripToolPartOnlyText(text)
 
+      // SA-107 (DL-107-06/07): SDK usage stays authoritative; raw-chunk cache
+      // fields fill gaps (flat cached_tokens lanes), and the gateway lane can
+      // derive inclusive cache usage from step providerMetadata.
       const resolvedUsage =
-        (totalUsage || usage || rawUsageFromStream) ?? undefined
+        resolveMessageUsage({
+          sdkUsage: totalUsage || usage || undefined,
+          rawStreamUsage: rawUsageFromStream ?? undefined,
+          steps,
+          isGatewayLane: connection?.type === 'vercel-gateway',
+        }) ?? undefined
       lastStreamSteps = Array.isArray(steps) ? steps : []
       lastResolvedUsage = resolvedUsage ?? null
 
@@ -5133,7 +5206,8 @@ async function handleBatshitAgentStream({
       finishSummary.metadata = {
         model: usedModelId,
         agentType: primaryAgentType,
-        usage: totalUsage || usage,
+        // SA-107: the chat strip reads this — same resolved value as finishSummary.usage.
+        usage: resolvedUsage,
         steps: steps?.length || 0,
         voice: voiceMetadata,
         selectedTools,
@@ -5179,6 +5253,31 @@ async function handleBatshitAgentStream({
       }
 
       finishSummary.usage = resolvedUsage
+
+      // SA-093 P7: persist per-send stream performance for the chat-bar strip.
+      // `API` uses the SDK's own measurements; the managed CLI lanes fall back
+      // to Batshit-measured wall-clock timings (DL-093-14 per-lane sources).
+      // Anything not measured stays absent so the strip renders honest unknowns.
+      const performanceMetadata =
+        buildMessagePerformanceFromSteps(Array.isArray(steps) ? steps : []) ??
+        (isCodexProvider || isClaudeProvider
+          ? buildMeasuredMessagePerformance({
+              startedAt: measuredStreamTiming.startedAt,
+              firstOutputAt: measuredStreamTiming.firstOutputAt,
+              finishedAt: measuredFinishedAt,
+              toolActiveMs: measuredToolActiveMsTotal(measuredFinishedAt),
+              outputTokens:
+                typeof resolvedUsage?.outputTokens === 'number'
+                  ? resolvedUsage.outputTokens
+                  : null,
+            })
+          : null)
+      if (performanceMetadata) {
+        finishSummary.metadata = {
+          ...finishSummary.metadata,
+          performance: performanceMetadata,
+        }
+      }
 
       onFinishResolved = true
       resolveOnFinish?.()
@@ -5274,6 +5373,32 @@ async function handleBatshitAgentStream({
               notes: responseNotes,
             },
           })
+
+          // SA-093 P4 (managed CLI lanes): opt-in batshit-compiled-boundary
+          // forensics. Uses the RAW compiled messages/images/tools — never the
+          // log-sanitized copies above, whose lossy redaction could collapse
+          // two different requests into one fingerprint.
+          if (isCacheForensicsEnabled()) {
+            const forensicRecord = buildCliCacheForensicsRecord({
+              runtime: isCodexProvider ? 'codex' : 'claude',
+              messages: Array.isArray(streamMessages) ? streamMessages : [],
+              images: Array.isArray(streamImages)
+                ? (streamImages as Array<{ url: string; alt?: string }>)
+                : [],
+              tools: preloadedGatewayTools ?? null,
+              usage: resolvedUsage ?? null,
+              agentId,
+              connectionId: connection?.id ?? connection?.service ?? null,
+              modelId: runtimeSnapshot.modelName ?? usedModelId ?? null,
+              messageId,
+              experimentGroup: resolveCacheForensicsExperimentGroup(),
+            })
+            await attachCacheForensicsToSnapshot({
+              sessionId,
+              snapshotId: messageId,
+              records: [forensicRecord],
+            })
+          }
         } else {
           const sanitizedSteps = sanitizePayloadForLogs(
             Array.isArray(steps) ? steps : [],
@@ -5317,6 +5442,25 @@ async function handleBatshitAgentStream({
               ),
             },
           })
+
+          // SA-093 P4 (`API` lane): opt-in provider-request forensics. Uses the
+          // RAW steps (never log-sanitized copies — redaction is lossy and
+          // could collapse two different requests into one fingerprint).
+          if (isCacheForensicsEnabled()) {
+            const forensicRecords = buildApiCacheForensicsRecords({
+              steps: Array.isArray(steps) ? steps : [],
+              agentId,
+              connectionId: connection?.id ?? connection?.service ?? null,
+              modelId: usedModelId ?? null,
+              messageId,
+              experimentGroup: resolveCacheForensicsExperimentGroup(),
+            })
+            await attachCacheForensicsToSnapshot({
+              sessionId,
+              snapshotId: messageId,
+              records: forensicRecords,
+            })
+          }
         }
       } catch (viewerPatchError) {
         console.error(
@@ -5488,6 +5632,7 @@ async function handleBatshitAgentStream({
       imageBaseUrl: primaryImageConfig.imageBaseUrl,
       preferRemoteUrl: !isLocalProviderId(primaryProviderIdForImages),
     })
+    resetMeasuredStreamTiming()
     streamResult = await nativeRuntime.streamNativeMode(
       buildStreamRequest(
         primaryModelId,
@@ -5529,6 +5674,7 @@ async function handleBatshitAgentStream({
         imageBaseUrl: fallbackImageConfig.imageBaseUrl,
         preferRemoteUrl: !isLocalProviderId(fallbackProviderIdForImages),
       })
+      resetMeasuredStreamTiming()
       streamResult = await nativeRuntime.streamNativeMode(
         buildStreamRequest(
           usedModelId,
@@ -5700,6 +5846,7 @@ async function handleBatshitAgentStream({
     for await (const chunk of result.stream) {
       switch (chunk.type) {
         case 'text-delta': {
+          if ((chunk as any).text) markMeasuredFirstOutput()
           const textChunk = stripRepeatedLeadingGroupControls((chunk as any).text || '')
           if (textChunk) {
             await flushRawReasoningFallback()
@@ -5732,6 +5879,7 @@ async function handleBatshitAgentStream({
         case 'reasoning': {
           // OpenAI reasoning summaries stream via `part.type === 'reasoning'`
           // with `textDelta` (Vercel AI SDK).
+          markMeasuredFirstOutput()
           const handledAsIndicator = await handleReasoningIndicator()
           const delta =
             (chunk as any).textDelta ??
@@ -5764,6 +5912,7 @@ async function handleBatshitAgentStream({
         }
         case 'reasoning-start':
         case 'reasoning_start': {
+          markMeasuredFirstOutput()
           const initial = (chunk as any).text || (chunk as any).content || ''
           const handledAsIndicator = await handleReasoningIndicator()
           if (handledAsIndicator) {
@@ -5847,6 +5996,7 @@ async function handleBatshitAgentStream({
         }
         case 'tool-call': {
           await flushRawReasoningFallback()
+          markMeasuredToolCallStart()
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true
@@ -6023,6 +6173,7 @@ async function handleBatshitAgentStream({
           break
         }
         case 'tool-result': {
+          markMeasuredToolCallEnd()
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true

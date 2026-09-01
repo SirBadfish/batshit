@@ -27,6 +27,7 @@
   import * as groupStore from '$lib/stores/groups.svelte'
   import { foldersStore } from '$lib/stores/folders.svelte'
   import { generateSessionId } from '$lib/utils/sessionId'
+  import { computeCacheHitRatePercent, computeSessionCacheAggregate } from '$lib/utils/cacheHitRate'
   import { api } from '$lib/services/api'
   import { SSEService } from '$lib/services/sse'
   import {
@@ -807,6 +808,61 @@ const compactUnavailableReason = $derived.by(() => {
 const runningCost = $derived.by(() =>
   summarizeRunningCost(executionSnapshots, activeModelPreset, agentStore.getCurrentAgent())
 )
+// SA-093 P7: cache/speed strip stats from the LATEST assistant message only.
+// Older responses never stand in for the latest one (DL-093-14 honesty rule);
+// a missing metric renders as an explicit unknown in TokenPanel.
+const latestResponseStats = $derived.by(() => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index] as { role?: string; metadata?: Record<string, any> }
+    if (message?.role !== 'assistant') continue
+    const metadata =
+      message.metadata && typeof message.metadata === 'object' ? message.metadata : {}
+    const usage =
+      metadata.usage && typeof metadata.usage === 'object' ? metadata.usage : null
+    const performance =
+      metadata.performance && typeof metadata.performance === 'object'
+        ? metadata.performance
+        : null
+    return { found: true, usage, performance }
+  }
+  return { found: false, usage: null, performance: null }
+})
+const latestCacheHitPercent = $derived(
+  computeCacheHitRatePercent(latestResponseStats.usage)
+)
+const latestCacheCachedTokens = $derived.by(() => {
+  const usage = latestResponseStats.usage
+  const cached = usage?.cachedInputTokens ?? usage?.inputTokenDetails?.cacheReadTokens
+  return typeof cached === 'number' && Number.isFinite(cached) ? cached : null
+})
+const latestCacheInputTokens = $derived.by(() => {
+  const inputTokens = latestResponseStats.usage?.inputTokens
+  return typeof inputTokens === 'number' && Number.isFinite(inputTokens) ? inputTokens : null
+})
+const latestCacheCreationTokens = $derived.by(() => {
+  const created = latestResponseStats.usage?.cacheCreationInputTokens
+  return typeof created === 'number' && Number.isFinite(created) ? created : null
+})
+const latestPerformanceStat = (key: 'outputTokensPerSecond' | 'timeToFirstOutputMs' | 'responseTimeMs' | 'modelCalls') => {
+  const value = latestResponseStats.performance?.[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+// SA-093 P7: whole-chat token-weighted cache aggregate for the strip popover.
+// Only responses that reported cache usage count; the popover names the count.
+const sessionCacheStats = $derived.by(() => {
+  const usages: Array<Record<string, any>> = []
+  for (const message of messages) {
+    const entry = message as { role?: string; metadata?: Record<string, any> }
+    if (entry?.role !== 'assistant') continue
+    const usage =
+      entry.metadata && typeof entry.metadata === 'object' && entry.metadata.usage &&
+      typeof entry.metadata.usage === 'object'
+        ? entry.metadata.usage
+        : null
+    if (usage) usages.push(usage)
+  }
+  return computeSessionCacheAggregate(usages)
+})
 const activeGoon = $derived.by(() => {
   const goonId = dockAgent?.goon_id
   if (!goonId) return null
@@ -6939,6 +6995,23 @@ const immersiveActive = $derived.by(
           napBusy={napBusy}
           napStatus={napStatus}
           onNap={() => handleNap({ trigger: 'manual' })}
+          hasLatestResponse={latestResponseStats.found}
+          cacheHitPercent={latestCacheHitPercent}
+          cacheCachedTokens={latestCacheCachedTokens}
+          cacheInputTokens={latestCacheInputTokens}
+          cacheCreationTokens={latestCacheCreationTokens}
+          sessionCacheHitPercent={sessionCacheStats?.percent ?? null}
+          sessionCacheCachedTokens={sessionCacheStats?.cachedTokens ?? null}
+          sessionCacheInputTokens={sessionCacheStats?.inputTokens ?? null}
+          sessionCacheResponseCount={sessionCacheStats?.responseCount ?? null}
+          outputTokensPerSecond={latestPerformanceStat('outputTokensPerSecond')}
+          timeToFirstOutputMs={latestPerformanceStat('timeToFirstOutputMs')}
+          responseTimeMs={latestPerformanceStat('responseTimeMs')}
+          responseModelCalls={latestPerformanceStat('modelCalls')}
+          performanceSource={latestResponseStats.performance?.source === 'measured' ||
+          latestResponseStats.performance?.source === 'ai-sdk'
+            ? latestResponseStats.performance.source
+            : null}
           costLabel={
             runningCost.cost === null
               ? 'Unknown'

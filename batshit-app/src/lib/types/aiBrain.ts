@@ -94,6 +94,10 @@ export interface ThoughtResponse {
     totalTokens: number
     /** Structured image-input token estimate; raw data URLs must not appear in text context. */
     imageTokens?: number
+    /** Provider-reported prompt-cache read tokens, when the provider reported them. */
+    cachedInputTokens?: number
+    /** Provider-reported prompt-cache creation tokens, when reported. */
+    cacheCreationInputTokens?: number
   }
 
   /** Cost tracking from provider */

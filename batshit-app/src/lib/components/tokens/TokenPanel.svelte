@@ -1,7 +1,17 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button'
   import * as Tooltip from '$lib/components/ui/tooltip'
-  import { Archive, Bug, Coins, FileText, Moon, RotateCcw, Scissors } from '@lucide/svelte'
+  import {
+    Archive,
+    Bug,
+    Coins,
+    Database,
+    FileText,
+    Gauge,
+    Moon,
+    RotateCcw,
+    Scissors
+  } from '@lucide/svelte'
 
   let {
     currentTokens = 0,
@@ -27,6 +37,20 @@
     napUnavailableReason = 'Nap is unavailable.',
     napBusy = false,
     napStatus = null,
+    hasLatestResponse = false,
+    cacheHitPercent = null,
+    cacheCachedTokens = null,
+    cacheInputTokens = null,
+    cacheCreationTokens = null,
+    sessionCacheHitPercent = null,
+    sessionCacheCachedTokens = null,
+    sessionCacheInputTokens = null,
+    sessionCacheResponseCount = null,
+    outputTokensPerSecond = null,
+    timeToFirstOutputMs = null,
+    responseTimeMs = null,
+    responseModelCalls = null,
+    performanceSource = null,
     onTrim = () => {},
     onCompact = () => {},
     onNap = () => {},
@@ -58,6 +82,23 @@
     napUnavailableReason?: string
     napBusy?: boolean
     napStatus?: string | null
+    /** SA-093 P7: latest-response cache and speed readouts (DL-093-14). */
+    hasLatestResponse?: boolean
+    cacheHitPercent?: number | null
+    cacheCachedTokens?: number | null
+    cacheInputTokens?: number | null
+    cacheCreationTokens?: number | null
+    /** Whole-chat token-weighted cache aggregate over responses that reported cache usage. */
+    sessionCacheHitPercent?: number | null
+    sessionCacheCachedTokens?: number | null
+    sessionCacheInputTokens?: number | null
+    sessionCacheResponseCount?: number | null
+    outputTokensPerSecond?: number | null
+    timeToFirstOutputMs?: number | null
+    responseTimeMs?: number | null
+    responseModelCalls?: number | null
+    /** 'ai-sdk' = SDK-measured (API lane); 'measured' = Batshit wall-clock (CLI lanes). */
+    performanceSource?: 'ai-sdk' | 'measured' | null
     onTrim?: (tokensToTrim: number) => void | Promise<void>
     onCompact?: () => void | Promise<void>
     onNap?: () => void | Promise<void>
@@ -125,6 +166,48 @@
     if (value <= 0) return '0 trimmed'
     return `${formatRoundedThousands(value)} trimmed`
   }
+
+  // SA-093 P7 display rules (DL-093-14): a metric the runtime did not report
+  // renders as an explicit em dash, never a guess.
+  const cacheHitLabel = $derived.by(() => {
+    if (typeof cacheHitPercent !== 'number' || !Number.isFinite(cacheHitPercent)) return '—'
+    return `${Math.round(cacheHitPercent)}%`
+  })
+
+  const sessionCacheHitLabel = $derived.by(() => {
+    if (
+      typeof sessionCacheHitPercent !== 'number' ||
+      !Number.isFinite(sessionCacheHitPercent)
+    ) {
+      return '—'
+    }
+    return `${Math.round(sessionCacheHitPercent)}%`
+  })
+
+  const speedLabel = $derived.by(() => {
+    if (
+      typeof outputTokensPerSecond !== 'number' ||
+      !Number.isFinite(outputTokensPerSecond)
+    ) {
+      return '—'
+    }
+    const rounded =
+      outputTokensPerSecond >= 10
+        ? Math.round(outputTokensPerSecond).toString()
+        : (Math.round(outputTokensPerSecond * 10) / 10).toString()
+    return `${rounded} t/s`
+  })
+
+  function formatMs(value: number): string {
+    if (value < 1000) return `${Math.round(value)} ms`
+    return `${(Math.round(value / 100) / 10).toFixed(1)} s`
+  }
+
+  const unknownStatsNote = $derived.by(() =>
+    hasLatestResponse
+      ? 'The provider or runtime did not report this for the latest response.'
+      : 'No responses in this chat yet.'
+  )
 
   function formatCompacted(value: number): string {
     if (value <= 0) return '0 compacted'
@@ -204,6 +287,91 @@
             <div>
               {formatRoundedThousands(currentTokens)} / {formatRoundedThousands(contextLimit)} tokens used
             </div>
+          </div>
+        </Tooltip.Content>
+      </Tooltip.Root>
+
+      <Tooltip.Root>
+        <Tooltip.Trigger
+          class="token-panel-trigger"
+          aria-label="View prompt cache hit rate for the latest response"
+          data-testid="token-cache-hit-trigger"
+          data-ab-control="token-cache-hit"
+        >
+          <Database class="token-panel-trigger-icon" />
+          <span>{cacheHitLabel}</span>
+        </Tooltip.Trigger>
+        <Tooltip.Content side="top" class="token-panel-tooltip is-context">
+          <div class="token-panel-tooltip-stack">
+            <div class="token-panel-tooltip-section">
+              <div class="token-panel-tooltip-title">Prompt cache (latest response)</div>
+              {#if typeof cacheHitPercent === 'number'}
+                <div class="token-panel-tooltip-emphasis">{cacheHitLabel} of input read from cache</div>
+                {#if typeof cacheCachedTokens === 'number' && typeof cacheInputTokens === 'number'}
+                  <div>
+                    {formatRoundedThousands(cacheCachedTokens)} cached / {formatRoundedThousands(cacheInputTokens)} input tokens
+                  </div>
+                {/if}
+                {#if typeof cacheCreationTokens === 'number' && cacheCreationTokens > 0}
+                  <div>{formatRoundedThousands(cacheCreationTokens)} tokens newly written to cache</div>
+                {/if}
+              {:else}
+                <div>{unknownStatsNote}</div>
+              {/if}
+            </div>
+            {#if typeof sessionCacheHitPercent === 'number'}
+              <div class="token-panel-tooltip-section">
+                <div class="token-panel-tooltip-title">Prompt cache (whole chat)</div>
+                <div class="token-panel-tooltip-emphasis">{sessionCacheHitLabel} of input read from cache</div>
+                {#if typeof sessionCacheCachedTokens === 'number' && typeof sessionCacheInputTokens === 'number'}
+                  <div>
+                    {formatRoundedThousands(sessionCacheCachedTokens)} cached / {formatRoundedThousands(sessionCacheInputTokens)} input tokens
+                  </div>
+                {/if}
+                {#if typeof sessionCacheResponseCount === 'number' && sessionCacheResponseCount > 0}
+                  <div>
+                    Across {sessionCacheResponseCount} response{sessionCacheResponseCount === 1 ? '' : 's'} that reported cache data
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        </Tooltip.Content>
+      </Tooltip.Root>
+
+      <Tooltip.Root>
+        <Tooltip.Trigger
+          class="token-panel-trigger"
+          aria-label="View speed stats for the latest response"
+          data-testid="token-speed-trigger"
+          data-ab-control="token-speed"
+        >
+          <Gauge class="token-panel-trigger-icon" />
+          <span>{speedLabel}</span>
+        </Tooltip.Trigger>
+        <Tooltip.Content side="top" class="token-panel-tooltip is-context">
+          <div class="token-panel-tooltip-stack">
+            <div class="token-panel-tooltip-title">Speed (latest response)</div>
+            {#if typeof outputTokensPerSecond === 'number' || typeof timeToFirstOutputMs === 'number' || typeof responseTimeMs === 'number'}
+              {#if typeof outputTokensPerSecond === 'number'}
+                <div class="token-panel-tooltip-emphasis">{speedLabel.replace(' t/s', '')} output tokens per second</div>
+              {/if}
+              {#if typeof timeToFirstOutputMs === 'number'}
+                <div>First output after {formatMs(timeToFirstOutputMs)}</div>
+              {/if}
+              {#if typeof responseTimeMs === 'number'}
+                <div>
+                  Model time {formatMs(responseTimeMs)}{typeof responseModelCalls === 'number' && responseModelCalls > 1
+                    ? ` across ${responseModelCalls} calls`
+                    : ''}
+                </div>
+              {/if}
+              {#if performanceSource === 'measured'}
+                <div>Measured live by Batshit; first output includes CLI startup time.</div>
+              {/if}
+            {:else}
+              <div>{unknownStatsNote}</div>
+            {/if}
           </div>
         </Tooltip.Content>
       </Tooltip.Root>

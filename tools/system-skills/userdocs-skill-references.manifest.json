@@ -49,6 +49,7 @@
         { "source": "reference/env-vars.md", "reference": "reference-env-vars.md" },
         { "source": "reference/glossary.md", "reference": "reference-glossary.md" },
         { "source": "reference/portable-skills.md", "reference": "reference-portable-skills.md" },
+        { "source": "reference/provider-prompt-caching.md", "reference": "reference-provider-prompt-caching.md" },
         { "source": "reference/ports-and-urls.md", "reference": "reference-ports-and-urls.md" },
         { "source": "reference/templates.md", "reference": "reference-templates.md" },
         { "source": "resources/n8n-workflow-templates.md", "reference": "resources-n8n-workflow-templates.md" },

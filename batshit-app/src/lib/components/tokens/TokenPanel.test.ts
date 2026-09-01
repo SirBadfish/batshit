@@ -199,4 +199,206 @@ describe('TokenPanel', () => {
     expect(screen.getByRole('button', { name: 'Compact older chat context' })).toBeDisabled()
     expect(screen.getByRole('status')).toHaveTextContent('Generating compact summary...')
   })
+
+  it('renders explicit unknown cache/speed readouts when nothing was reported (SA-093 P7)', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: false,
+      },
+    })
+
+    const cacheTrigger = screen.getByRole('button', {
+      name: 'View prompt cache hit rate for the latest response',
+    })
+    const speedTrigger = screen.getByRole('button', {
+      name: 'View speed stats for the latest response',
+    })
+    expect(cacheTrigger).toHaveTextContent('—')
+    expect(speedTrigger).toHaveTextContent('—')
+
+    await fireEvent.pointerEnter(cacheTrigger)
+    await fireEvent.mouseEnter(cacheTrigger)
+    await fireEvent.focus(cacheTrigger)
+    expect(await screen.findByText('Prompt cache (latest response)')).toBeInTheDocument()
+    expect(screen.getByText('No responses in this chat yet.')).toBeInTheDocument()
+  })
+
+  it('says the runtime did not report stats once a response exists without them', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+      },
+    })
+
+    const cacheTrigger = screen.getByRole('button', {
+      name: 'View prompt cache hit rate for the latest response',
+    })
+    await fireEvent.pointerEnter(cacheTrigger)
+    await fireEvent.mouseEnter(cacheTrigger)
+    await fireEvent.focus(cacheTrigger)
+    expect(
+      await screen.findByText(
+        'The provider or runtime did not report this for the latest response.',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('renders cache hit rate and cache token detail for the latest response', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+        cacheHitPercent: 86.1,
+        cacheCachedTokens: 6888,
+        cacheInputTokens: 8000,
+        cacheCreationTokens: 112,
+      },
+    })
+
+    const cacheTrigger = screen.getByRole('button', {
+      name: 'View prompt cache hit rate for the latest response',
+    })
+    expect(cacheTrigger).toHaveTextContent('86%')
+
+    await fireEvent.pointerEnter(cacheTrigger)
+    await fireEvent.mouseEnter(cacheTrigger)
+    await fireEvent.focus(cacheTrigger)
+    expect(await screen.findByText('86% of input read from cache')).toBeInTheDocument()
+    expect(screen.getByText('7K cached / 8K input tokens')).toBeInTheDocument()
+    expect(screen.getByText('112 tokens newly written to cache')).toBeInTheDocument()
+  })
+
+  it('adds a whole-chat cache section to the cache popover when session data exists', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+        cacheHitPercent: 86.1,
+        cacheCachedTokens: 6888,
+        cacheInputTokens: 8000,
+        sessionCacheHitPercent: 72.4,
+        sessionCacheCachedTokens: 121000,
+        sessionCacheInputTokens: 167000,
+        sessionCacheResponseCount: 14,
+      },
+    })
+
+    const cacheTrigger = screen.getByRole('button', {
+      name: 'View prompt cache hit rate for the latest response',
+    })
+    expect(cacheTrigger).toHaveTextContent('86%')
+
+    await fireEvent.pointerEnter(cacheTrigger)
+    await fireEvent.mouseEnter(cacheTrigger)
+    await fireEvent.focus(cacheTrigger)
+    expect(await screen.findByText('Prompt cache (whole chat)')).toBeInTheDocument()
+    expect(screen.getByText('72% of input read from cache')).toBeInTheDocument()
+    expect(screen.getByText('121K cached / 167K input tokens')).toBeInTheDocument()
+    expect(
+      screen.getByText('Across 14 responses that reported cache data'),
+    ).toBeInTheDocument()
+  })
+
+  it('omits the whole-chat cache section when no response reported cache data', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+        sessionCacheHitPercent: null,
+      },
+    })
+
+    const cacheTrigger = screen.getByRole('button', {
+      name: 'View prompt cache hit rate for the latest response',
+    })
+    await fireEvent.pointerEnter(cacheTrigger)
+    await fireEvent.mouseEnter(cacheTrigger)
+    await fireEvent.focus(cacheTrigger)
+    expect(await screen.findByText('Prompt cache (latest response)')).toBeInTheDocument()
+    expect(screen.queryByText('Prompt cache (whole chat)')).not.toBeInTheDocument()
+  })
+
+  it('renders tokens/sec, first-output time, and model time for the latest response', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+        outputTokensPerSecond: 88.46,
+        timeToFirstOutputMs: 413,
+        responseTimeMs: 3600,
+        responseModelCalls: 2,
+      },
+    })
+
+    const speedTrigger = screen.getByRole('button', {
+      name: 'View speed stats for the latest response',
+    })
+    expect(speedTrigger).toHaveTextContent('88 t/s')
+
+    await fireEvent.pointerEnter(speedTrigger)
+    await fireEvent.mouseEnter(speedTrigger)
+    await fireEvent.focus(speedTrigger)
+    expect(await screen.findByText('88 output tokens per second')).toBeInTheDocument()
+    expect(screen.getByText('First output after 413 ms')).toBeInTheDocument()
+    expect(screen.getByText('Model time 3.6 s across 2 calls')).toBeInTheDocument()
+  })
+
+  it('keeps one decimal for slow generation speeds', () => {
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+        outputTokensPerSecond: 8.46,
+      },
+    })
+
+    expect(
+      screen.getByRole('button', { name: 'View speed stats for the latest response' }),
+    ).toHaveTextContent('8.5 t/s')
+  })
 })
