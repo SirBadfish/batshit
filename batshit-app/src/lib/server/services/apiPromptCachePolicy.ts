@@ -9,6 +9,9 @@ type ProviderKind =
   | 'google'
   | 'openrouter'
   | 'vercel-gateway'
+  | 'xai'
+  | 'baseten'
+  | 'fireworks'
   | 'unknown'
 
 export type ApiPromptCachePolicyMetadata = {
@@ -28,6 +31,8 @@ export type ApiPromptCachePolicyMetadata = {
     reason: string
   }>
   providerOptionKeys: Record<string, string[]>
+  /** Names of session-affinity request headers added to this call (values are pseudonymous hashes and stay out of metadata/logs). */
+  requestHeaderNames: string[]
 }
 
 export type ApiPromptCachePolicyInput = {
@@ -46,6 +51,8 @@ export type ApiPromptCachePolicyResult = {
   messages: ModelMessage[]
   tools?: Record<string, any> | undefined
   providerOptions?: ProviderOptions | undefined
+  /** Per-call HTTP headers (session cache-affinity hints); pass to streamText/generateText, never to provider construction. */
+  headers?: Record<string, string> | undefined
   metadata: ApiPromptCachePolicyMetadata
 }
 
@@ -83,11 +90,68 @@ function cloneProviderOptions(options?: ProviderOptions): ProviderOptions {
   return clone
 }
 
+/**
+ * SA-107 (DL-107-03): exact service ids that map to a cache-policy provider
+ * kind. When a connection names its service, that id is authoritative — a
+ * model NAMED `gpt-oss` hosted on Fireworks is not OpenAI, so fuzzy
+ * model-name inference only runs when no service is known.
+ */
+const EXACT_PROVIDER_KINDS: Record<string, ProviderKind> = {
+  'vercel-gateway': 'vercel-gateway',
+  openrouter: 'openrouter',
+  anthropic: 'anthropic',
+  openai: 'openai',
+  google: 'google',
+  xai: 'xai',
+  baseten: 'baseten',
+  fireworks: 'fireworks',
+}
+
+function normalizeServiceId(value: string | null | undefined): string | null {
+  const trimmed = (value ?? '').trim().toLowerCase()
+  if (!trimmed) return null
+  return trimmed.startsWith('direct:') ? trimmed.slice('direct:'.length) : trimmed
+}
+
+function resolveExactProviderKind(args: {
+  providerId?: string | null
+  connection?: ModelConnectionInfo | null
+}): ProviderKind | null {
+  const connectionType = args.connection?.type ?? null
+  const connectionId = normalizeServiceId(args.connection?.id)
+  if (connectionType === 'vercel-gateway' || connectionId === 'vercel-gateway') {
+    return 'vercel-gateway'
+  }
+  if (connectionType === 'openrouter' || connectionId === 'openrouter') {
+    return 'openrouter'
+  }
+
+  // A direct connection's service id is authoritative: exact kind when we
+  // have one, otherwise 'unknown' so fuzzy model-name inference cannot
+  // misclassify a hosted model (e.g. gpt-oss on Fireworks as OpenAI).
+  const service =
+    normalizeServiceId(args.connection?.service) ??
+    (connectionType === 'direct' ? connectionId : null)
+  if (service) {
+    return EXACT_PROVIDER_KINDS[service] ?? 'unknown'
+  }
+
+  const providerId = normalizeServiceId(args.providerId)
+  if (providerId && EXACT_PROVIDER_KINDS[providerId]) {
+    return EXACT_PROVIDER_KINDS[providerId]
+  }
+
+  return null
+}
+
 function inferProvider(args: {
   modelId?: string | null
   providerId?: string | null
   connection?: ModelConnectionInfo | null
 }): ProviderKind {
+  const exact = resolveExactProviderKind(args)
+  if (exact) return exact
+
   const values = [
     args.connection?.type,
     args.connection?.service,
@@ -270,6 +334,40 @@ function buildOpenRouterSessionId(args: {
   )}`
 }
 
+/**
+ * SA-107 (DL-107-02): pseudonymous per-session cache-affinity value. Same
+ * recipe class as the OpenRouter session id — raw user/agent/session ids
+ * never go on the wire, and the value is stable for a session so the
+ * provider can pin a replica across turns.
+ */
+function buildSessionAffinityValue(args: {
+  userId?: string | null
+  agentId?: string | null
+  sessionId?: string | null
+  modelId?: string | null
+}): string {
+  return `bs-aff-v1-${hashText(
+    [
+      args.userId ?? 'single-user',
+      args.agentId ?? 'no-agent',
+      args.sessionId ?? 'no-session',
+      args.modelId ?? 'unknown-model',
+    ].join('|'),
+    32,
+  )}`
+}
+
+/**
+ * SA-107 (DL-107-04): documented session-affinity request headers, direct
+ * lanes only. xAI documents `x-grok-conv-id`; Baseten and Fireworks document
+ * `x-session-affinity` (official docs fetched 2026-08-31).
+ */
+const SESSION_AFFINITY_HEADER_BY_PROVIDER: Partial<Record<ProviderKind, string>> = {
+  xai: 'x-grok-conv-id',
+  baseten: 'x-session-affinity',
+  fireworks: 'x-session-affinity',
+}
+
 function providerOptionKeys(options: ProviderOptions): Record<string, string[]> {
   const output: Record<string, string[]> = {}
   for (const [provider, providerOptions] of Object.entries(options)) {
@@ -448,6 +546,19 @@ export function applyApiPromptCachePolicy(
     }
   }
 
+  // SA-107: per-session cache-affinity hint for providers that document one.
+  const requestHeaders: Record<string, string> = {}
+  const affinityHeaderName = SESSION_AFFINITY_HEADER_BY_PROVIDER[provider]
+  if (affinityHeaderName) {
+    requestHeaders[affinityHeaderName] = buildSessionAffinityValue({
+      userId: input.userId,
+      agentId: input.agentId,
+      sessionId: input.sessionId,
+      modelId,
+    })
+    applied.push(`${provider}.${affinityHeaderName}`)
+  }
+
   const providerOptions = deepMerge(defaults, existingOptions)
 
   const retention = providerOptions.openai?.promptCacheRetention
@@ -480,6 +591,7 @@ export function applyApiPromptCachePolicy(
     preserved,
     omitted,
     providerOptionKeys: providerOptionKeys(providerOptions),
+    requestHeaderNames: Object.keys(requestHeaders).sort(),
   }
 
   return {
@@ -488,6 +600,7 @@ export function applyApiPromptCachePolicy(
     providerOptions: isEmptyProviderOptions(providerOptions)
       ? undefined
       : providerOptions,
+    headers: Object.keys(requestHeaders).length > 0 ? requestHeaders : undefined,
     metadata,
   }
 }

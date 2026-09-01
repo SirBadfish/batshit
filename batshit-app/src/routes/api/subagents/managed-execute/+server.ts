@@ -22,6 +22,8 @@ type ManagedExecuteBody = {
   chatInput?: unknown
   projectPath?: unknown
   timeoutMs?: unknown
+  /** Optional parent send message id (SA-093 forensics correlation). */
+  messageId?: unknown
 }
 
 function readString(value: unknown): string {
@@ -121,6 +123,7 @@ export const POST: RequestHandler = async ({ request }) => {
   const sessionId = readString(body.sessionId)
   const chatInput = typeof body.chatInput === 'string' ? body.chatInput : ''
   const projectPath = readString(body.projectPath) || null
+  const parentMessageId = readString(body.messageId) || null
   const timeoutMs = normalizeTimeoutMs(body.timeoutMs)
 
   if (!agentId || !subagentId || !sessionId || typeof body.chatInput !== 'string') {
@@ -190,6 +193,7 @@ export const POST: RequestHandler = async ({ request }) => {
           chatInput,
           subagent,
           parentAgentId: agentId,
+          parentMessageId,
           projectPath,
           abortSignal,
         }),

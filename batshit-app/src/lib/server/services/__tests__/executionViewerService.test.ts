@@ -196,6 +196,43 @@ describe('executionViewerService retention', () => {
     })
   })
 
+  it('stores SA-093 cache-forensics records on the existing snapshot key intact', async () => {
+    await executionViewerService.recordSnapshot(
+      buildSnapshot('run-1', '2026-05-14T12:00:00.000Z')
+    )
+
+    const record = {
+      schemaVersion: 1 as const,
+      capturedAt: '2026-08-30T05:00:00.000Z',
+      comparisonId: 'a'.repeat(64),
+      runtime: 'vercel' as const,
+      boundary: 'batshit-compiled' as const,
+      confidence: 'exact' as const,
+      runId: 'b'.repeat(64),
+      segments: [
+        {
+          index: 0,
+          type: 'system-prompt' as const,
+          label: 'system',
+          hmac: 'c'.repeat(64),
+          bytes: 128,
+          chars: 128,
+          confidence: 'exact' as const
+        }
+      ],
+      divergence: { state: 'not-comparable' as const, reason: 'first run in session' }
+    }
+
+    await executionViewerService.updateSnapshot('session-ev', 'run-1', {
+      cacheForensics: [record]
+    })
+
+    // Same per-session key — no new Redis namespace for forensic records.
+    expect(redisMock.store.has('session:session-ev:execution_log')).toBe(true)
+    const snapshots = await executionViewerService.getSnapshots('session-ev')
+    expect(snapshots[0]?.cacheForensics).toEqual([record])
+  })
+
   it('bounds oversized debug strings during snapshot updates', async () => {
     await executionViewerService.recordSnapshot(
       buildSnapshot('run-1', '2026-05-14T12:00:00.000Z')

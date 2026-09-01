@@ -1,3 +1,5 @@
+import type { CacheForensicsRecord } from '$lib/types/cacheForensics'
+
 /**
  * SA-106: `n8n` retired with the n8n Primary Agent type. Execution snapshots recorded
  * before the retirement may still carry it as stored data — the Execution Viewer renders
@@ -148,4 +150,11 @@ export interface ExecutionSnapshot {
   assignedSubagents?: any[]
   availableWorkflows?: string[]
   runtime?: ExecutionRuntimeDetails
+  /**
+   * SA-093 opt-in cache-forensics records, one per model call in the run
+   * (tool loops keep every call separate). HMAC fingerprints of ordered
+   * request sections plus first-divergence evidence — hashes and counts
+   * only, never raw content (DL-093-05/06/10).
+   */
+  cacheForensics?: CacheForensicsRecord[] | null
 }

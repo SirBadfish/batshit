@@ -266,6 +266,11 @@ function normalizeFlatUsage(usage: Record<string, any>): ApiUsageLike {
     promptDetails?.cached_tokens,
     promptDetails?.cachedTokens,
     promptDetails?.cacheReadTokens,
+    // SA-107 (DL-107-05), fallback-last: flat `usage.cached_tokens` — the
+    // Together non-reasoning and Cohere native v2 wire shapes. The nested
+    // prompt-details shapes above stay authoritative when both appear.
+    usage.cached_tokens,
+    usage.cachedTokens,
   )
   const cacheCreationInput = firstTokenCount(
     usage.cacheCreationInputTokens,
@@ -356,5 +361,227 @@ export function extractUsageFromRawPayload(rawValue: unknown): ApiUsageLike {
     if (gemini) return gemini
   }
 
+  // SA-107: Cohere native v2 reports final usage inside a `delta` wrapper
+  // (`message-end` event: { delta: { usage: { ..., cached_tokens } } }).
+  const delta = plainObject(record.delta)
+  if (delta) {
+    const deltaUsage = normalizeUsageLike(delta)
+    if (deltaUsage) return deltaUsage
+  }
+
   return normalizeUsageLike(record)
+}
+
+/**
+ * SA-107 (DL-107-07): true only for the raw Anthropic accounting shape, where
+ * flat `input_tokens` EXCLUDES cache reads/writes reported beside it. Detection
+ * is deliberately strict (snake_case wire shape only) so already-normalized
+ * v7 usage objects — whose flat cache fields ride an INCLUSIVE input — are
+ * never summed twice.
+ */
+function isAnthropicExclusiveUsageShape(usageRecord: Record<string, any>): boolean {
+  if (usageRecord.input_tokens === undefined) return false
+  return (
+    usageRecord.cache_read_input_tokens !== undefined ||
+    usageRecord.cache_creation_input_tokens !== undefined
+  )
+}
+
+/**
+ * SA-107 (DL-107-07): normalize a step's `providerMetadata` usage entry into
+ * v7-inclusive semantics. Returns a usage object ONLY when it carries cache
+ * evidence (cache read or creation counts); anything else returns null so the
+ * caller never replaces trustworthy SDK usage with weaker data.
+ */
+export function normalizeProviderMetadataUsageInclusive(
+  providerMetadata: unknown,
+): ApiUsageLike {
+  const metadata = plainObject(providerMetadata)
+  if (!metadata) return null
+
+  for (const entryValue of Object.values(metadata)) {
+    const entry = plainObject(entryValue)
+    if (!entry) continue
+    const usageRecord = plainObject(entry.usage)
+    if (!usageRecord) continue
+    const normalized = normalizeUsageLike(usageRecord)
+    if (!normalized) continue
+    const hasCacheEvidence =
+      typeof normalized.cachedInputTokens === 'number' ||
+      typeof normalized.cacheCreationInputTokens === 'number'
+    if (!hasCacheEvidence) continue
+
+    if (isAnthropicExclusiveUsageShape(usageRecord)) {
+      const rawInput = coerceTokenCount(usageRecord.input_tokens) ?? 0
+      const cacheRead = normalized.cachedInputTokens ?? 0
+      const cacheWrite = normalized.cacheCreationInputTokens ?? 0
+      const inclusiveInput = rawInput + cacheRead + cacheWrite
+      const output = normalized.outputTokens
+      return buildUsageLike({
+        inputTokens: inclusiveInput,
+        outputTokens: output,
+        totalTokens:
+          typeof output === 'number' ? inclusiveInput + output : undefined,
+        reasoningTokens: normalized.reasoningTokens,
+        cachedInputTokens: normalized.cachedInputTokens,
+        cacheCreationInputTokens: normalized.cacheCreationInputTokens,
+      })
+    }
+
+    return normalized
+  }
+
+  return null
+}
+
+/**
+ * SA-107 (DL-107-07): aggregate cache-bearing providerMetadata usage across
+ * AI SDK steps. Steps without cache-bearing metadata usage contribute nothing,
+ * keeping numerator and denominator consistent. Returns null when no step
+ * carried cache evidence.
+ */
+export function deriveUsageFromStepsProviderMetadata(steps: unknown): ApiUsageLike {
+  if (!Array.isArray(steps) || steps.length === 0) return null
+
+  const addTo = (base: number | undefined, value: number | undefined) =>
+    value === undefined ? base : (base ?? 0) + value
+
+  let sawCache = false
+  let inputTotal: number | undefined
+  let outputTotal: number | undefined
+  let cachedTotal: number | undefined
+  let cacheCreationTotal: number | undefined
+  let reasoningTotal: number | undefined
+
+  for (const step of steps) {
+    const usage = normalizeProviderMetadataUsageInclusive(
+      (step as any)?.providerMetadata,
+    )
+    if (!usage) continue
+    sawCache = true
+    inputTotal = addTo(inputTotal, usage.inputTokens)
+    outputTotal = addTo(outputTotal, usage.outputTokens)
+    cachedTotal = addTo(cachedTotal, usage.cachedInputTokens)
+    cacheCreationTotal = addTo(cacheCreationTotal, usage.cacheCreationInputTokens)
+    reasoningTotal = addTo(reasoningTotal, usage.reasoningTokens)
+  }
+
+  if (!sawCache) return null
+
+  return buildUsageLike({
+    inputTokens: inputTotal,
+    outputTokens: outputTotal,
+    totalTokens:
+      inputTotal !== undefined && outputTotal !== undefined
+        ? inputTotal + outputTotal
+        : undefined,
+    reasoningTokens: reasoningTotal,
+    cachedInputTokens: cachedTotal,
+    cacheCreationInputTokens: cacheCreationTotal,
+  })
+}
+
+/**
+ * SA-107 (DL-107-07 amended): gateway-lane guard against RAW Anthropic
+ * exclusive accounting reaching the strip. Under true v7-inclusive semantics
+ * `cachedInputTokens + cacheCreationInputTokens` can never exceed
+ * `inputTokens`, so when it does the numbers are provably exclusive and the
+ * inclusive input/total are rebuilt. Live 2026-08-31 evidence: the gateway
+ * SDK now delivers cache fields on usage itself but keeps `inputTokens: 3`
+ * exclusive — without this guard the strip would compute >100% and clamp.
+ */
+function correctExclusiveGatewayUsage(
+  usage: NonNullable<ApiUsageLike>,
+): NonNullable<ApiUsageLike> {
+  const input = usage.inputTokens
+  if (typeof input !== 'number') return usage
+  const cacheRead = usage.cachedInputTokens ?? 0
+  const cacheWrite = usage.cacheCreationInputTokens ?? 0
+  if (cacheRead + cacheWrite <= input) return usage
+
+  const inclusiveInput = input + cacheRead + cacheWrite
+  return {
+    ...usage,
+    inputTokens: inclusiveInput,
+    totalTokens:
+      typeof usage.outputTokens === 'number'
+        ? inclusiveInput + usage.outputTokens
+        : usage.totalTokens,
+    ...(typeof usage.cachedInputTokens === 'number'
+      ? { inputTokenDetails: { cacheReadTokens: usage.cachedInputTokens } }
+      : {}),
+  }
+}
+
+/**
+ * SA-107 (DL-107-06/07): resolve the usage object persisted on the assistant
+ * message (`metadata.usage`, the chat-strip source).
+ *
+ * Precedence:
+ * 1. Gateway lane: step providerMetadata derivation is preferred whenever it
+ *    exists (raw shapes are the authority on exclusive vs inclusive input);
+ *    whatever usage results is then passed through the arithmetic
+ *    exclusive-accounting guard above.
+ * 2. SDK finish usage that already carries cache fields → returned AS-IS on
+ *    non-gateway lanes, so every healthy lane stays byte-identical.
+ * 3. SDK usage without cache fields + raw-stream usage with them → SDK numbers
+ *    stay authoritative, raw-chunk cache fields fill the gaps (Together
+ *    non-reasoning, Cohere native v2).
+ * 4. Otherwise the base usage is returned unchanged.
+ */
+export function resolveMessageUsage(args: {
+  sdkUsage?: unknown
+  rawStreamUsage?: ApiUsageLike
+  steps?: unknown
+  isGatewayLane?: boolean
+}): ApiUsageLike {
+  const base = args.sdkUsage ?? args.rawStreamUsage ?? undefined
+  const normalizedBase = normalizeUsageLike(base)
+  const baseHasCache =
+    typeof normalizedBase?.cachedInputTokens === 'number' ||
+    typeof normalizedBase?.cacheCreationInputTokens === 'number'
+
+  if (args.isGatewayLane) {
+    const derived = deriveUsageFromStepsProviderMetadata(args.steps)
+    if (derived) {
+      const merged = normalizedBase
+        ? mergeUsageLike(normalizedBase, derived)
+        : { ...derived }
+      if (
+        typeof merged.inputTokens === 'number' &&
+        typeof merged.outputTokens === 'number'
+      ) {
+        merged.totalTokens = merged.inputTokens + merged.outputTokens
+      }
+      return correctExclusiveGatewayUsage(merged)
+    }
+
+    const raw = args.rawStreamUsage
+    const rawHasCache =
+      typeof raw?.cachedInputTokens === 'number' ||
+      typeof raw?.cacheCreationInputTokens === 'number'
+    const merged = baseHasCache
+      ? normalizedBase
+      : raw && rawHasCache
+        ? normalizedBase
+          ? mergeUsageLike(raw, normalizedBase)
+          : raw
+        : normalizedBase
+    if (merged) {
+      return correctExclusiveGatewayUsage(merged)
+    }
+    return base as ApiUsageLike
+  }
+
+  if (baseHasCache) return base as ApiUsageLike
+
+  const raw = args.rawStreamUsage
+  const rawHasCache =
+    typeof raw?.cachedInputTokens === 'number' ||
+    typeof raw?.cacheCreationInputTokens === 'number'
+  if (raw && rawHasCache) {
+    return normalizedBase ? mergeUsageLike(raw, normalizedBase) : raw
+  }
+
+  return base as ApiUsageLike
 }

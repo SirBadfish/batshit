@@ -116,6 +116,7 @@
         "references/reference-glossary.md",
         "references/reference-portable-skills.md",
         "references/reference-ports-and-urls.md",
+        "references/reference-provider-prompt-caching.md",
         "references/reference-templates.md",
         "references/resources-n8n-workflow-templates.md",
         "references/security-overview.md",
