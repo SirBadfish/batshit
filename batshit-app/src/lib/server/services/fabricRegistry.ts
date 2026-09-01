@@ -77,6 +77,10 @@ import type {
 } from '$lib/types/database'
 import { sanitizeId } from '$lib/utils/idSanitizer'
 import { normalizeArtifactModelConfig } from '$lib/utils/artifactModelConfig'
+import {
+  canonicalizeCatalogDeveloperId,
+  catalogDeveloperIdsMatch
+} from '$lib/utils/catalogDeveloperIdentity'
 import { buildCompactEditPreview } from '$lib/utils/editDiff'
 import {
   getArtifactRunLog,
@@ -3848,12 +3852,16 @@ function catalogEntryMatchesProvider(entry: VercelCatalogEntry, provider: string
 
 function catalogEntryMatchesDeveloper(entry: VercelCatalogEntry, developer: string): boolean {
   if (!developer) return true
-  const variants = catalogTermVariants(developer)
   const candidates = [
     entry.provider,
     entry.upstreamProvider,
     ...catalogVariantEntries(entry).map(({ variant }) => variant.developerId)
   ]
+  if (candidates.some((candidate) => catalogDeveloperIdsMatch(candidate, developer))) {
+    return true
+  }
+
+  const variants = catalogTermVariants(developer)
   const normalizedCandidates = candidates.flatMap((candidate) => catalogTermVariants(candidate))
   return variants.some((variant) =>
     normalizedCandidates.some(
@@ -4081,6 +4089,7 @@ function toModelCatalogResult(
       transport: entry.transport ?? null,
       availableConnections: entry.availableConnections ?? []
     },
+    canonicalDeveloper: canonicalizeCatalogDeveloperId(entry.provider),
     developer: selected.variant?.developerId ?? entry.upstreamProvider ?? entry.provider,
     catalogModelId: selected.variant?.modelId ?? entry.name,
     modelIdForArtifact,
@@ -4166,7 +4175,7 @@ async function executeModelCatalogSearch(input: Record<string, any>): Promise<Re
           provider:
             'Provider is the API key or connection route Batshit will call, such as direct Google, OpenAI direct, or OpenRouter.',
           developer:
-            'Developer is the model maker namespace, such as Google, OpenAI, Anthropic, or Black Forest Labs.',
+            'Developer is the model maker. Batshit groups reviewed provider aliases under one canonical developer while preserving exact provider-specific namespaces in each variant.',
           modelId:
             'Model ID is the exact provider/developer model string. For artifact manual model_config, use modelIdForArtifact from the chosen result.'
         },

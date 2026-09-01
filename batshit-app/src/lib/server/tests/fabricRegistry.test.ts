@@ -1216,6 +1216,57 @@ describe('controlRegistry artifact capability controls', () => {
     })
   })
 
+  it('matches canonical Z.ai developer searches without rewriting the selected runtime ID', async () => {
+    mockFetchVercelModelCatalog.mockResolvedValueOnce({
+      fetchedAt: '2026-09-01T00:00:00.000Z',
+      models: [
+        {
+          id: 'zai/glm-5.3',
+          canonicalId: 'zai/glm-5.3',
+          provider: 'zai',
+          upstreamProvider: 'deepinfra',
+          name: 'glm-5.3',
+          displayName: 'GLM-5.3',
+          tags: ['chat', 'reasoning'],
+          features: { reasoning: true },
+          purpose: 'chat',
+          idVariants: {
+            'direct:deepinfra': {
+              developerId: 'zai-org',
+              modelId: 'GLM-5.3',
+              effectiveId: 'zai-org/GLM-5.3',
+              source: 'direct'
+            }
+          },
+          source: 'direct',
+          transport: 'direct',
+          connectionId: 'direct:deepinfra',
+          availableConnections: ['direct:deepinfra']
+        }
+      ]
+    })
+
+    const { useControl } = await import('../services/fabricRegistry')
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.model_catalog.search',
+      input: {
+        developer: 'z-ai',
+        provider: 'deepinfra',
+        modelId: 'glm-5.3'
+      }
+    })
+
+    expect(result.success).toBe(true)
+    if (!result.success) return
+
+    expect((result.result as any).results[0]).toMatchObject({
+      canonicalDeveloper: 'zai',
+      developer: 'zai-org',
+      modelIdForArtifact: 'zai-org/GLM-5.3'
+    })
+  })
+
   it('executes sys.artifact.create via ArtifactsService (no legacy MCP adapter)', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 

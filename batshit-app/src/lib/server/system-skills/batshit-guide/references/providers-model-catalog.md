@@ -25,12 +25,12 @@ Batshit describes every model with three parts, because "the OpenAI model on Ope
 | Part | What it means | Example |
 | --- | --- | --- |
 | Provider / connection | The route and key Batshit uses to reach the model | `direct:anthropic`, `openrouter`, `vercel-gateway` |
-| Developer | The company that made the model | `openai`, `anthropic`, `google` |
+| Developer | Batshit's canonical identity for the company that made the model | `openai`, `anthropic`, `zai` |
 | Model ID | The developer's specific model | `gpt-5.2`, `claude-sonnet-4-5` |
 
 The same model can show up on more than one route. A single catalog entry can advertise every transport it works with, so you pick the model first, then choose which connection carries it.
 
-The provider may spell the developer namespace differently on each route. For example, one Z.AI model can use `zai/...` through one connection, `z-ai/...` through OpenRouter, and `zai-org/...` through DeepInfra. Batshit preserves the exact request ID published by each provider, including capitalization such as DeepInfra's `Qwen/...`; it does not guess these names from the combined catalog row.
+The provider may spell the developer namespace differently on each route. For example, one Z.ai model can use `zai/...` through one connection, `z-ai/...` through OpenRouter, and `zai-org/...` through DeepInfra. Batshit groups those reviewed aliases under one **Z.ai** developer in catalog filters and search, while preserving the exact request ID published by each provider, including capitalization such as DeepInfra's `Qwen/...`. It never rewrites a request ID from the combined catalog row.
 
 This matters because the provider/connection is what decides which saved key gets used. A Google-made model reached through a gateway uses that gateway's key, not your direct Google key.
 

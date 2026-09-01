@@ -16,6 +16,8 @@ describe('modelSettingsFormatters', () => {
   it('formats known developer identifiers for display', () => {
     expect(formatDeveloperLabel('openai')).toBe('OpenAI')
     expect(formatDeveloperLabel('black-forest-labs')).toBe('Black Forest Labs')
+    expect(formatDeveloperLabel('zai-org')).toBe('Z.ai')
+    expect(formatDeveloperLabel('zai_coding')).toBe('Z.ai')
     expect(formatDeveloperLabel('made-up-ai')).toBe('Made Up AI')
   })
 

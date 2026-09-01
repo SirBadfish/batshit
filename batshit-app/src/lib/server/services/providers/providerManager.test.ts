@@ -39,6 +39,7 @@ vi.mock('$env/dynamic/private', () => ({
     ALIBABA_CLOUD_API_KEY: 'alibaba-placeholder',
     STEPFUN_API_KEY: 'stepfun-placeholder',
     OPENROUTER_API_KEY: 'sk-or-placeholder',
+    ZAI_CODING_API_KEY: 'zai-coding-placeholder',
     DEEPINFRA_API_KEY: 'placeholder',
     DEEPINFRA_API_BASE_URL: 'https://api.deepinfra.com/v1/openai'
   }
@@ -243,6 +244,13 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(claudeModel?.features.tools).toBe(true)
       expect(claudeModel?.features.vision).toBe(true)
       expect(claudeModel?.features.maxTokens).toBeGreaterThan(0)
+    })
+
+    it('registers only current Z.ai Coding Plan models', () => {
+      expect(providerManager.getProviderInfo('zai_coding')?.models).toEqual([
+        'glm-5.3',
+        'glm-5.3-flash'
+      ])
     })
   })
 

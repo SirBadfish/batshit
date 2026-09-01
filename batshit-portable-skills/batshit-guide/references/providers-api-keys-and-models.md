@@ -74,7 +74,7 @@ Common provider and connection types include:
 
 The exact provider list can change as the model catalog evolves.
 
-Regular Z.ai and Z.ai Coding Plan use separate keys and endpoints. Saving `ZAI_API_KEY` enables the regular pay-as-you-go connection only; it does not silently route requests through the Coding Plan endpoint.
+Regular Z.ai and Z.ai Coding Plan use separate keys and endpoints. Saving `ZAI_API_KEY` enables the regular pay-as-you-go connection only; it does not silently route requests through the Coding Plan endpoint. The Coding Plan connection uses Z.ai's OpenAI-compatible coding endpoint and currently offers **GLM-5.3** and **GLM-5.3-Flash** in Batshit. Older compatibility aliases are hidden so a preset names the model that will actually run; newly advertised future models can still enter the live catalog.
 
 Qwen Cloud and Qwen Token Plan also use separate keys and endpoints. Keep your normal pay-as-you-go key in **Qwen Cloud**, and save the subscription key that starts with `sk-sp-` in **Qwen Token Plan**. Batshit uses Alibaba's OpenAI-compatible Token Plan endpoint automatically; the `ap-southeast-1` hostname is fixed because Token Plan is currently available only in Singapore, not because Batshit guessed your physical location.
 

@@ -42,6 +42,10 @@ import {
   QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
   QWEN_TOKEN_PLAN_TEXT_MODELS
 } from '$lib/server/constants/qwenTokenPlan'
+import {
+  ZAI_CODING_PLAN_MODEL_IDS,
+  ZAI_CODING_PLAN_OPENAI_BASE_URL
+} from '$lib/server/constants/zaiCodingPlan'
 
 /**
  * Provider configuration interface
@@ -534,19 +538,10 @@ export class ProviderManager {
       id: 'zai_coding',
       label: 'Z.ai Coding Plan',
       apiKey: this.apiKeys.zai_coding ?? env.ZAI_CODING_API_KEY,
-      baseURL: env.ZAI_CODING_API_BASE_URL || 'https://api.z.ai/api/coding/paas/v4',
+      baseURL: env.ZAI_CODING_API_BASE_URL || ZAI_CODING_PLAN_OPENAI_BASE_URL,
       priority: 9,
       apiMode: 'chat',
-      models: [
-        'glm-5.2',
-        'glm-5.1',
-        'glm-5',
-        'glm-5-turbo',
-        'glm-4.7',
-        'glm-4.6',
-        'glm-4.5',
-        'glm-4.5-air'
-      ]
+      models: [...ZAI_CODING_PLAN_MODEL_IDS]
     })
 
     registerOpenAICompatibleProvider({
@@ -1116,8 +1111,8 @@ export class ProviderManager {
       stepfun: 'step-3.7-flash',
       openrouter: 'anthropic/claude-3.5-sonnet',
       deepseek: 'deepseek-chat',
-      zai: 'glm-4.7',
-      zai_coding: 'glm-4.7'
+      zai: 'glm-5.3',
+      zai_coding: 'glm-5.3-flash'
     }
     
     const providerConfig = this.providers.get(provider)
@@ -1220,7 +1215,9 @@ export class ProviderManager {
       'glm-5': 'GLM-5',
       'glm-5-turbo': 'GLM-5 Turbo',
       'glm-5.1': 'GLM-5.1',
-      'glm-5.2': 'GLM-5.2'
+      'glm-5.2': 'GLM-5.2',
+      'glm-5.3': 'GLM-5.3',
+      'glm-5.3-flash': 'GLM-5.3-Flash'
     }
     
     return displayNames[model] || model
