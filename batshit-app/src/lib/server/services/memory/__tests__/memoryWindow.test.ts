@@ -641,8 +641,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       userId: USER,
       agentId: AGENT,
       sessionId: FIXED_SESSION,
-      currentUserMessage: 'hello',
-      historyMessageIds: []
+      currentUserMessage: 'hello'
     })
     expect(compiled.whiteboardBlock).toContain('==== EPISODE WHITEBOARD (CURRENT EPISODE) ====')
     expect(compiled.whiteboardBlock).toContain('Current goal: ship P6.')
@@ -653,8 +652,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       userId: USER,
       agentId: AGENT,
       sessionId: REGULAR_SESSION,
-      currentUserMessage: 'hello',
-      historyMessageIds: []
+      currentUserMessage: 'hello'
     })
     expect(regularCompiled.whiteboardBlock).toBe('')
 
@@ -668,8 +666,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       userId: USER,
       agentId: AGENT,
       sessionId: FIXED_SESSION,
-      currentUserMessage: 'hello',
-      historyMessageIds: []
+      currentUserMessage: 'hello'
     })
     expect(afterClose.whiteboardBlock).toBe('')
 
@@ -729,8 +726,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       userId: USER,
       agentId: AGENT,
       sessionId: FIXED_SESSION,
-      currentUserMessage: 'What about that trip?',
-      historyMessageIds: []
+      currentUserMessage: 'What about that trip?'
     })
     const dcm = compiled.dcmLines.join('\n')
     expect(dcm).toContain('graduated episode')

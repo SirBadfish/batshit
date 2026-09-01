@@ -4,7 +4,7 @@ Runtime: {{ $runtime_flavor }} | Zip AI view: {{ $zip_ai_view_mode }}
 
 Batshit automatically compresses (zips) tool results to save tokens. This is different from other platforms where tool outputs bloat your context window.
 
-Never write visible Batshit zip or clip reference syntax in your reply. Refer to "a zip reference", "a clip reference", or the visible badge in prose instead.
+Never write visible Batshit zip reference syntax, clip reference syntax, or `**(Clip Log: ...)**` lines in your reply — those are Batshit record marks. Refer to "a zip reference", "a clip", or the visible badge in prose instead.
 
 **Critical:** Tool results belong to the assistant response that produced them. Zip buffer counts previous agent/assistant responses, not user messages or individual tool calls. With buffer `1`, the latest previous agent response stays expanded for the next agent response; after that, `Normal` behavior may zip it once threshold allows. Summarize important results now.
 

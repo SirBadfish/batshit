@@ -108,13 +108,12 @@ async function patchMemoryField(memoryId: string, path: string, value: unknown):
   })
 }
 
-function compileArgs(message: string, historyMessageIds: string[] = []) {
+function compileArgs(message: string) {
   return {
     userId: USER,
     agentId: AGENT,
     sessionId: SESSION,
-    currentUserMessage: message,
-    historyMessageIds
+    currentUserMessage: message
   }
 }
 
@@ -351,7 +350,7 @@ describe.runIf(memorySearchLaneActive())('memory recall engine (dedicated Redis 
       expect(context.dcmLines.join('\n')).toContain('media attached below: clip_photo_1')
     })
 
-    it('groups session clip state into Current vs Lingering by history membership', async () => {
+    it('SA-109: leaves session clip lines to the general DCM roster', async () => {
       await redis.set(`session:${SESSION}:clip_state`, {
         sessionId: SESSION,
         clips: [
@@ -360,23 +359,13 @@ describe.runIf(memorySearchLaneActive())('memory recall engine (dedicated Redis 
             attachedAt: '2026-08-01T00:00:00.000Z',
             attachedToMessageId: 'msg_history_1',
             messagesUntilUnclip: 3
-          },
-          {
-            clipId: 'clip_new',
-            attachedAt: new Date().toISOString(),
-            attachedToMessageId: 'msg_current_unsaved'
           }
         ]
       })
-      await redis.set('clip:clip_old', { id: 'clip_old', filename: 'old-notes.txt' })
-      const context = await computeMemoryCompileContext(
-        compileArgs('no triggers here', ['msg_history_1'])
-      )
-      const text = context.dcmLines.join('\n')
-      expect(text).toContain('- Current (new this message):')
-      expect(text).toContain('clip clip_new — attached with this message')
-      expect(text).toContain('- Lingering (from earlier messages):')
-      expect(text).toContain('clip "old-notes.txt" (clip_old) — attached earlier, still active, 3 messages left')
+      const context = await computeMemoryCompileContext(compileArgs('no triggers here'))
+      // Clip rows moved to the general roster (DL-109-04) so memory-enabled
+      // agents never get the same clip listed twice.
+      expect(context.dcmLines.join('\n')).not.toContain('clip clip_old')
     })
 
     it('adds the agent-level time-awareness line from the last-interaction stamp', async () => {

@@ -341,7 +341,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       expect(callArgs.experimental_download).toBeUndefined()
     })
 
-    it('5.7-UNIT-006c: Ignores clip placeholders when clip state is inactive', async () => {
+    it('5.7-UNIT-006c SA-109: a departed clip leaves a Clip Log, not a silent gap', async () => {
       vi.mocked(redis.get).mockImplementation(async (key: string) => {
         if (key === 'session:test-session:clip_state') {
           return {
@@ -368,7 +368,11 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       const callArgs = vi.mocked(streamText).mock.calls.at(-1)?.[0] as any
       const userMessage = callArgs.messages[0]
       expect(typeof userMessage.content).toBe('string')
-      expect(userMessage.content).toBe('See this ')
+      // Before SA-109 an inactive clip's placeholder was replaced with '' and the
+      // agent lost every trace of it. A departed clip is hidden content, so it now
+      // keeps the same kind of record zip syntax keeps (DL-109-03).
+      expect(userMessage.content).toBe('See this **(Clip Log: file.png)**')
+      expect(userMessage.content).not.toContain('{{batshit-clip')
     })
   })
 

@@ -26,7 +26,7 @@ import { createHash } from 'crypto'
 import { z } from 'zod'
 import { ProviderManager, resolveProviderAccess } from '$lib/server/services/providers'
 import type { ThinkRequest, ThoughtResponse } from '$lib/types/aiBrain'
-import type { AgentDcmDisplaySettings, UserSettingsRow } from '$lib/types/database'
+import type { AgentDcmDisplaySettings } from '$lib/types/database'
 import type { ModelConnectionInfo } from '$lib/types/savedModels'
 import type { CodexRuntimeSettings } from '$lib/types/codex'
 import type { ClaudeRuntimeSettings } from '$lib/types/claude'
@@ -39,11 +39,7 @@ import { getSubagentByWorkflowName } from './subagentRegistry' // Story 6.7c: Su
 import { redis } from '$lib/server/redis' // Story 6.8: Load agent assigned workflows
 import { nativeToolService, type NativeToolApprovalPolicy } from './nativeTools'
 import { isNativeToolName } from './nativeToolConstants'
-import {
-  resolveClipDataUrlFromStoredUpload,
-  resolveClipPreferredRemoteUrl,
-  resolveClipPreferredUrl
-} from './clipUploadPayload'
+import { compileClipReferencesForAiView } from '$lib/utils/clipAiView'
 import { toOwnedBytes } from '$lib/utils/binary'
 import {
   compileManagedSubagentSystemPrompt,
@@ -788,11 +784,18 @@ export class VercelAIBrain {
       // Handle multimodal content for user messages
       if (msg.role === 'user' && Array.isArray(msg.content)) {
         const normalizedContent: any[] = []
+        // SA-109: this array branch wins whenever an image clip is attached, so
+        // before SA-109 it was the one path that shipped raw `{{batshit-clip:…}}`
+        // to the model verbatim. Text parts are normalized here too.
+        const normalizeClipSyntax = (text: string) =>
+          text.includes('{{batshit-clip')
+            ? compileClipReferencesForAiView(text, activeClipIds)
+            : text
         for (const part of msg.content as any[]) {
           if (typeof part === 'string') {
-            normalizedContent.push({ type: 'text', text: part })
+            normalizedContent.push({ type: 'text', text: normalizeClipSyntax(part) })
           } else if (part?.type === 'text') {
-            normalizedContent.push({ type: 'text', text: part.text ?? '' })
+            normalizedContent.push({ type: 'text', text: normalizeClipSyntax(part.text ?? '') })
           } else if (part?.type === 'image_url' && part.image_url?.url) {
             normalizedContent.push({ type: 'image', image: part.image_url.url })
           } else if (part?.type === 'image' && part.image) {
@@ -826,50 +829,22 @@ export class VercelAIBrain {
 
         imagesProcessed = true // Only add images to first user message
       } else if (msg.role === 'user' && sessionId && userId) {
-        // NEW (SA-002): Check for clip placeholders in user messages
+        // SA-109 (DL-109-10): clip CONTENT is delivered once, by the canonical
+        // compiler, under `CLIPPED ITEMS (USER UPLOADS)`. This lane used to
+        // resolve the same placeholders a second time and append every text
+        // clip's body again, so every text clip reached the model twice on the
+        // no-image path. It is now syntax normalization only — defense in depth
+        // for message shapes that never went through `buildFormattedChatInput`
+        // (e.g. a managed subagent's task text), using the same rules as the
+        // compiler: attached clips leave no marker, departed clips leave a Clip
+        // Log. Raw `{{batshit-clip:…}}` must never reach a model on any lane.
         const textContent = typeof msg.content === 'string' ? msg.content : ''
-        const { extractAllReferences } = await import('$lib/services/universalResolver')
-        const references = extractAllReferences(textContent)
-        const clipRefs = references.filter(ref => ref.type === 'clip')
-
-        if (clipRefs.length > 0) {
-          let filteredTextContent = textContent
-          const seenClipIds = new Set<string>()
-          const uniqueClipRefs = clipRefs.filter((ref) => {
-            if (!ref?.id || seenClipIds.has(ref.id)) return false
-            seenClipIds.add(ref.id)
-            return true
-          })
-          let activeClipRefs = uniqueClipRefs
-
-          if (activeClipIds) {
-            activeClipRefs = uniqueClipRefs.filter(ref => activeClipIds.has(ref.id))
-            for (const clipRef of uniqueClipRefs) {
-              if (!activeClipIds.has(clipRef.id)) {
-                const clipRegex = new RegExp(`\\{\\{batshit-clip:${clipRef.id}(?::::[^}]+)?\\}\\}`, 'g')
-                filteredTextContent = filteredTextContent.replace(clipRegex, '')
-              }
-            }
-          }
-
-          if (activeClipRefs.length > 0) {
-            // User message has active clips - build multimodal content array
-            const content = await this.buildMultimodalContent(filteredTextContent, activeClipRefs, sessionId, userId)
-            coreMessages.push({ role: 'user', content })
-          } else {
-            // No active clips - fall back to text with placeholders removed
-            coreMessages.push({
-              role: 'user',
-              content: filteredTextContent
-            })
-          }
-        } else {
-          // No clips - regular text message
-          coreMessages.push({
-            role: 'user',
-            content: msg.content
-          })
-        }
+        coreMessages.push({
+          role: 'user',
+          content: textContent.includes('{{batshit-clip')
+            ? compileClipReferencesForAiView(textContent, activeClipIds)
+            : msg.content
+        })
       } else if (msg.role === 'tool') {
         // Tool result message
         if (Array.isArray((msg as any).content)) {
@@ -915,128 +890,6 @@ export class VercelAIBrain {
     }
 
     return coreMessages
-  }
-
-  /**
-   * NEW (SA-002): Build multimodal content array with clips resolved to images
-   * Matches n8n pattern from databaseRedis.ts lines 430-836
-   */
-  private async buildMultimodalContent(
-    textContent: string,
-    clipRefs: Array<{ id: string; type: string; fullMatch: string }>,
-    sessionId: string,
-    userId: string
-  ): Promise<any[]> {
-    const content: any[] = []
-    let userSettingsPromise: Promise<UserSettingsRow | null> | null = null
-    const getUserSettings = () => {
-      if (!userSettingsPromise) {
-        userSettingsPromise = redis.getUserSettings(userId)
-      }
-      return userSettingsPromise
-    }
-
-    // 1. Replace placeholders with text references (dedupe by clip id)
-    let processedText = textContent
-    const uniqueClipRefs: Array<{ id: string; type: string; fullMatch: string }> = []
-    const seenClipIds = new Set<string>()
-    for (const clipRef of clipRefs) {
-      if (!clipRef?.id || seenClipIds.has(clipRef.id)) continue
-      seenClipIds.add(clipRef.id)
-      uniqueClipRefs.push(clipRef)
-      const reference = `[CLIPPED ITEM: batshit-clip-id: ${clipRef.id}]`
-      const clipRegex = new RegExp(`\\{\\{batshit-clip:${clipRef.id}(?::::[^}]+)?\\}\\}`, 'g')
-      processedText = processedText.replace(clipRegex, reference)
-    }
-
-    // 2. Add text content first
-    content.push({ type: 'text', text: processedText })
-
-    // 3. Fetch and add each clip with type-aware handling
-    for (const clipRef of uniqueClipRefs) {
-      try {
-        const clip = await this.fetchClipData(clipRef.id, userId)
-        const mime = clip?.mimeType || ''
-        const isImage = mime.startsWith('image/')
-        const isText = mime.startsWith('text/')
-
-        if (isImage) {
-          const settings = await getUserSettings()
-          const imageUrl = await this.clipToImageUrl(clip, settings)
-          content.push({ type: 'image', image: imageUrl })
-        } else if (isText) {
-          const decoded = clip?.content || this.decodeBase64ToText(clip?.localBase64)
-          const label = clip?.filename || clipRef.id
-          content[0].text += `\n\n[CLIPPED TEXT: ${label}]\n${decoded || '[empty text]'}`
-        } else {
-          const settings = await getUserSettings()
-          const fileUrl = await resolveClipPreferredUrl(clip, settings, {
-            allowAutoStart: true
-          })
-          const label = clip?.filename || clipRef.id
-          content[0].text += `\n\n[CLIPPED FILE: ${label}]${fileUrl ? `\nURL: ${fileUrl}` : ''}`
-        }
-      } catch (error) {
-        console.error(`[VercelBrain] Failed to load clip ${clipRef.id}:`, error)
-        // Graceful degradation: Add error message to text, continue with other clips
-        content[0].text += `\n[CLIPPED ITEM ERROR: Unable to load clip ${clipRef.id}]`
-      }
-    }
-
-    return content
-  }
-
-  /**
-   * NEW (SA-002): Fetch clip data directly from Redis
-   * Uses same pattern as API endpoint: clip:{userId}:{clipId}
-   */
-  private async fetchClipData(clipId: string, userId: string): Promise<any> {
-    const userKey = `clip:${userId}:${clipId}`
-    const systemKey = `clip:system:${clipId}`
-
-    const userClip = await redis.get(userKey)
-    const clipData = userClip || (await redis.get(systemKey))
-
-    if (!clipData) {
-      throw new Error(`Clip not found: ${clipId}`)
-    }
-
-    if (userClip) {
-      return clipData
-    }
-
-    return clipData
-  }
-
-  /**
-   * NEW (SA-002): Convert clip to model-facing image input.
-   * Prefer a live remote tunnel URL, then fall back to structured data URL bytes.
-   */
-  private async clipToImageUrl(
-    clip: any,
-    settings?: UserSettingsRow | null
-  ): Promise<string> {
-    const remoteUrl = await resolveClipPreferredRemoteUrl(clip, settings, {
-      allowAutoStart: true
-    })
-    if (remoteUrl) return remoteUrl
-
-    const dataUrl = await resolveClipDataUrlFromStoredUpload(clip)
-    if (!dataUrl) {
-      throw new Error(`Clip image payload could not be resolved from local upload storage: ${clip?.id || 'unknown'}`)
-    }
-    return dataUrl
-  }
-
-  private decodeBase64ToText(base64?: string): string {
-    if (!base64) return ''
-    try {
-      const { Buffer } = require('buffer')
-      const raw = base64.startsWith('data:') ? base64.split(',')[1] || '' : base64
-      return Buffer.from(raw, 'base64').toString('utf-8')
-    } catch (err) {
-      return ''
-    }
   }
 
   /**
