@@ -31,6 +31,8 @@
  *   - S17/S18/S19 the SA-104 memory contract: guidance block presence, the byte-stable
  *            Awareness block, DCM recall inserts, and Infinite-Session graduation plus
  *            the episode whiteboard.
+ *   - S20/S21 reasoning-history policy: opt-in standing preservation plus the exact-agent,
+ *            one-success interruption recovery override.
  *
  * The fetch router still serves the real SvelteKit route handlers off the same seeded
  * fixture store, so an accidental network call fails loudly instead of reaching out.
@@ -243,6 +245,7 @@ vi.mock('$env/dynamic/public', () => ({
 
 import { DatabaseService as ServerDatabaseService, invalidateUserSettingsCache as invalidateServerSettingsCache } from './databaseRedis.server'
 import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
+import { buildInterruptedReasoningRecovery } from '$lib/utils/reasoningRecovery'
 
 const USER_ID = 'josh'
 
@@ -1346,5 +1349,113 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     const compiledMessages = JSON.stringify(included.structuredInput.messages)
     expect(compiledMessages).toContain('==== PRESERVED REASONING FROM THIS RESPONSE ====')
     expect(compiledMessages).toContain(reasoningText)
+  })
+
+  it('S21: interrupted reasoning replays once to the exact agent and expires after success', async () => {
+    const recovery = buildInterruptedReasoningRecovery({
+      agentId: 'agent-api-parity',
+      reasoningSummary: 'I was tracing the interrupted stream boundary.',
+      planSummary: '- Confirm the recovery lifecycle'
+    })
+    expect(recovery).not.toBeNull()
+
+    const interruptedTurn = {
+      id: 'msg-interrupted-assistant',
+      role: 'assistant',
+      agent_id: 'agent-api-parity',
+      content: '',
+      status: 'error',
+      timestamp: '2026-06-12T09:00:30.000Z',
+      metadata: {
+        interrupted: true,
+        interruptionReason: 'user',
+        interruptedReasoningRecovery: recovery
+      }
+    }
+    const messages = [
+      {
+        id: 'msg-interrupted-user',
+        role: 'user',
+        content: 'Trace the stream boundary.',
+        timestamp: '2026-06-12T09:00:00.000Z',
+        metadata: {}
+      },
+      interruptedTurn,
+      {
+        id: 'msg-other-agent',
+        role: 'assistant',
+        agent_id: 'agent-b',
+        content: 'A different agent finished a response.',
+        timestamp: '2026-06-12T09:00:45.000Z',
+        metadata: {}
+      },
+      {
+        id: 'msg-failed-retry',
+        role: 'assistant',
+        agent_id: 'agent-api-parity',
+        content: 'A retry also stopped early.',
+        status: 'error',
+        timestamp: '2026-06-12T09:01:00.000Z',
+        metadata: { response_failed: true }
+      }
+    ]
+
+    const activeSessionId = nextSessionId()
+    state.current = freshState(activeSessionId)
+    const { server: active } = await runServerCompile({
+      sessionId: activeSessionId,
+      messages,
+      agent: apiAgent({ preserve_reasoning: false, show_reasoning: false }),
+      currentUserMessage: 'Continue from where you were interrupted.',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    const activeCompiled = (active.structuredInput.messages ?? [])
+      .map((message: any) => message.content ?? '')
+      .join('\n')
+    expect(activeCompiled).toContain(recovery?.renderedBlock)
+    expect(activeCompiled.match(/RECOVERY REASONING FROM INTERRUPTED RESPONSE/g)).toHaveLength(1)
+
+    const otherAgentSessionId = nextSessionId()
+    state.current = freshState(otherAgentSessionId)
+    const { server: otherAgent } = await runServerCompile({
+      sessionId: otherAgentSessionId,
+      messages,
+      agent: apiAgent({
+        id: 'agent-b',
+        preserve_reasoning: true,
+        show_reasoning: true
+      }),
+      currentUserMessage: 'What did you see?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    const otherAgentCompiled = (otherAgent.structuredInput.messages ?? [])
+      .map((message: any) => message.content ?? '')
+      .join('\n')
+    expect(otherAgentCompiled).not.toContain(recovery?.renderedBlock)
+
+    const completedMessages = [
+      ...messages,
+      {
+        id: 'msg-recovery-success',
+        role: 'assistant',
+        agent_id: 'agent-api-parity',
+        content: 'The recovered response completed successfully.',
+        timestamp: '2026-06-12T09:02:00.000Z',
+        metadata: {}
+      }
+    ]
+    const expiredSessionId = nextSessionId()
+    state.current = freshState(expiredSessionId)
+    const { server: expired } = await runServerCompile({
+      sessionId: expiredSessionId,
+      messages: completedMessages,
+      agent: apiAgent({ preserve_reasoning: false, show_reasoning: false }),
+      currentUserMessage: 'Start the next task.',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    const expiredCompiled = (expired.structuredInput.messages ?? [])
+      .map((message: any) => message.content ?? '')
+      .join('\n')
+    expect(expiredCompiled).not.toContain(recovery?.renderedBlock)
   })
 })

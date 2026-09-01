@@ -876,4 +876,66 @@ describe('messageCompiler – cool_tool inline payloads', () => {
     expect(otherAgent).toBe('The final answer.')
   })
 
+  it('tail-anchors active interrupted reasoning regardless of Display or Preserve settings', async () => {
+    const renderedBlock = [
+      'The previous response was interrupted before it finished. Continue from this unfinished work, verify it against the current request, and do not treat it as a final conclusion.',
+      '==== RECOVERY REASONING FROM INTERRUPTED RESPONSE ====\nI was checking the stream boundary.'
+    ].join('\n\n')
+    const message = {
+      role: 'assistant',
+      agent_id: 'agent-a',
+      metadata: {
+        interrupted: true,
+        response_failed: false,
+        reasoningSummary: 'I was checking the stream boundary.',
+        interruptedReasoningRecovery: {
+          schemaVersion: 1,
+          trigger: 'user-interrupt',
+          agentId: 'agent-a',
+          renderedBlock,
+          reasoningCharacterCount: 35,
+          planCharacterCount: 0
+        }
+      }
+    }
+
+    for (const preserve_reasoning of [false, true]) {
+      const compiled = await compileForAI(
+        'Partial visible answer.',
+        0,
+        1,
+        { id: 'agent-a', preserve_reasoning },
+        message,
+        {},
+        { interruptedReasoningRecoveryActive: true }
+      )
+
+      expect(compiled).toBe(`Partial visible answer.\n\n${renderedBlock}`)
+      expect(compiled.match(/RECOVERY REASONING/g)).toHaveLength(1)
+      expect(compiled).not.toContain('PRESERVED REASONING')
+    }
+
+    const expired = await compileForAI(
+      'Partial visible answer.',
+      0,
+      1,
+      { id: 'agent-a', preserve_reasoning: false },
+      message,
+      {},
+      { interruptedReasoningRecoveryActive: false }
+    )
+    expect(expired).toBe('Partial visible answer.')
+
+    const otherAgent = await compileForAI(
+      'Partial visible answer.',
+      0,
+      1,
+      { id: 'agent-b', preserve_reasoning: false },
+      message,
+      {},
+      { interruptedReasoningRecoveryActive: true }
+    )
+    expect(otherAgent).toBe('Partial visible answer.')
+  })
+
 })

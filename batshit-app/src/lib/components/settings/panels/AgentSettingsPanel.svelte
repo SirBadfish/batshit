@@ -8232,7 +8232,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                   side="bottom"
                                   class={SETTINGS_INFO_CONTENT_CLASS}
                                 >
-                                  When enabled, Batshit streams reasoning summaries into chat in a collapsed section whenever the model provides them, then saves them with the message so they remain visible after refresh.
+                                  When enabled, Batshit streams reasoning summaries into chat in a collapsed section whenever the model provides them, then saves them with the message so they remain visible after refresh. When disabled, supported runtimes may still capture reasoning internally only to recover an unfinished response after you interrupt it.
                                 </DropdownMenu.Content>
                               </DropdownMenu.Root>
                             </div>
@@ -8258,7 +8258,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                     side="bottom"
                                     class={SETTINGS_INFO_CONTENT_CLASS}
                                   >
-                                    Reasoning shown in chat is always saved and still appears after refresh. Turn this on to also include this agent's prior reasoning in later model requests and in the Execution Viewer's Compiled Messages. Leaving it off keeps the reasoning visible to you but hidden from the agent's later context, which saves tokens.
+                                    Reasoning shown in chat is always saved and still appears after refresh. Turn this on to also include this agent's prior reasoning in later model requests and in the Execution Viewer's Compiled Messages. Leaving it off keeps completed-turn reasoning visible to you but hidden from the agent's later context, which saves tokens. If you interrupt a response, Batshit temporarily gives that unfinished reasoning back to the same agent until it completes one successful response, regardless of this setting.
                                   </DropdownMenu.Content>
                                 </DropdownMenu.Root>
                               </div>

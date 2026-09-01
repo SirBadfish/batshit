@@ -1,5 +1,6 @@
 import type { ModelCapabilities } from '$lib/types/savedModels'
 import type { ExecutionReasoningPersistence } from '$lib/types/executionViewer'
+import type { InterruptedReasoningRecovery } from '$lib/utils/reasoningRecovery'
 
 type ReasoningOptionsArgs = {
   provider?: string | null
@@ -126,10 +127,6 @@ export function withReasoningProviderOptions(
     return Object.keys(next).length > 0 ? next : providerOptions
   }
 
-  if (!args.showReasoning) {
-    return providerOptions
-  }
-
   const next = cloneProviderOptions(providerOptions)
 
   if (providerKey === 'openai') {
@@ -254,6 +251,7 @@ export function buildReasoningPersistenceEvidence(args: {
   showReasoning: boolean
   preserveReasoning: boolean
   reasoningSummary?: string | null
+  interruptedReasoningRecovery?: InterruptedReasoningRecovery | null
 }): ExecutionReasoningPersistence {
   const summary =
     typeof args.reasoningSummary === 'string' ? args.reasoningSummary : ''
@@ -269,6 +267,15 @@ export function buildReasoningPersistenceEvidence(args: {
           : 'excluded',
     characterCount: requested ? summary.length : 0,
     source: 'message.metadata.reasoningSummary',
+    recoveryStatus: args.interruptedReasoningRecovery ? 'pending' : 'not-applicable',
+    recoveryTrigger: args.interruptedReasoningRecovery?.trigger ?? null,
+    recoveryCharacterCount: args.interruptedReasoningRecovery
+      ? args.interruptedReasoningRecovery.reasoningCharacterCount +
+        args.interruptedReasoningRecovery.planCharacterCount
+      : 0,
+    recoverySource: args.interruptedReasoningRecovery
+      ? 'message.metadata.interruptedReasoningRecovery.renderedBlock'
+      : null,
   }
 }
 

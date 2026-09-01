@@ -72,6 +72,10 @@ import {
   calculateRecoveryHoldByIndex
 } from '$lib/utils/zipMessageAge'
 import {
+  calculateInterruptedReasoningRecoveryActiveByIndex,
+  getActiveInterruptedReasoningRecoveryBlock
+} from '$lib/utils/reasoningRecovery'
+import {
   applyContextCompactionToMessages,
   getContextCompactionState
 } from '$lib/utils/contextCompaction'
@@ -1606,6 +1610,8 @@ export class DatabaseService {
     const zipToolNotesEnabled = this.resolveZipToolNotesEnabled(agent, globalZipSettings)
     const agentMessagesFromEndByIndex = calculateAgentMessagesFromEndByIndex(messages)
     const recoveryHoldByIndex = calculateRecoveryHoldByIndex(messages)
+    const interruptedReasoningRecoveryActiveByIndex =
+      calculateInterruptedReasoningRecoveryActiveByIndex(messages)
     const zipExposures: ZipExposure[] = []
     const zipCompilationCache = new Map<string, Promise<any | null>>()
     const resolveZipForCompilation = (zipId: string) => {
@@ -1622,7 +1628,12 @@ export class DatabaseService {
         message.role === 'assistant' &&
         !message.content?.trim() &&
         (!message.toolResults || message.toolResults.length === 0) &&
-        !buildPreservedReasoningHistory(agent, message)
+        !buildPreservedReasoningHistory(agent, message) &&
+        !getActiveInterruptedReasoningRecoveryBlock({
+          message,
+          currentAgentId: typeof agent?.id === 'string' ? agent.id : null,
+          active: interruptedReasoningRecoveryActiveByIndex[i] ?? false
+        })
       ) {
         continue
       }
@@ -1644,6 +1655,8 @@ export class DatabaseService {
               ...options,
               agentMessagesFromEnd: agentMessagesFromEndByIndex[i] ?? 0,
               recoveryHold: recoveryHoldByIndex[i] ?? false,
+              interruptedReasoningRecoveryActive:
+                interruptedReasoningRecoveryActiveByIndex[i] ?? false,
               zipResolver: resolveZipForCompilation,
               zipViewMode,
               onZipExposure:
