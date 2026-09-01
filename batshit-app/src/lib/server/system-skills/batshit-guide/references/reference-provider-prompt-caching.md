@@ -31,7 +31,7 @@ Numbers on this page come from our own measurements (August 2026), not provider 
 | Anthropic | Excellent — textbook cache writes and reads (≈88% of input on repeats), persists across sessions | Best-in-class behavior |
 | OpenAI | Excellent — ≈77% credited on repeats | |
 | Google Gemini | Works in real chats (≈70%) | Google's cache needs a large prompt before it starts crediting — short test prompts show zero by design |
-| Alibaba Cloud (Qwen) | Works — ≈67–70% verified in live Batshit use | Automatic; cached input billed at 20% of normal |
+| Alibaba Cloud (Qwen) | Works — ≈67–70% verified in live Batshit pay-as-you-go use; Token Plan uses the same Alibaba provider/cache path | Automatic; Alibaba says Token Plan cache hits consume fewer Credits, but the exact reduction varies by model |
 | Vercel AI Gateway | Works (≈84%) with honest Token Panel numbers | |
 | xAI | Works with Batshit's conversation header — credits are real (up to ≈88% measured) but come and go with xAI's routing | Without the header it never credited reuse; some sends credit only xAI's 128-token floor |
 | OpenRouter | Works (≈92% measured in full conversations) | With Batshit's session routing id |

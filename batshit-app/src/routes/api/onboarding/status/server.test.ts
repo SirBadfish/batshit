@@ -43,6 +43,7 @@ function providerAccess(
     'minimax',
     'mimo',
     'qwencloud',
+    'qwen_token_plan',
     'alibaba',
     'stepfun',
     'zai',

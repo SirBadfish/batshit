@@ -57,6 +57,7 @@ Common provider and connection types include:
 - MiniMax
 - MiMo
 - Qwen Cloud
+- Qwen Token Plan
 - Together.ai
 - Fireworks AI
 - Baseten
@@ -74,6 +75,12 @@ Common provider and connection types include:
 The exact provider list can change as the model catalog evolves.
 
 Regular Z.ai and Z.ai Coding Plan use separate keys and endpoints. Saving `ZAI_API_KEY` enables the regular pay-as-you-go connection only; it does not silently route requests through the Coding Plan endpoint.
+
+Qwen Cloud and Qwen Token Plan also use separate keys and endpoints. Keep your normal pay-as-you-go key in **Qwen Cloud**, and save the subscription key that starts with `sk-sp-` in **Qwen Token Plan**. Batshit uses Alibaba's OpenAI-compatible Token Plan endpoint automatically; the `ap-southeast-1` hostname is fixed because Token Plan is currently available only in Singapore, not because Batshit guessed your physical location.
+
+Alibaba limits Token Plan to interactive coding and agent tools. Use the Batshit connection for interactive chats and agents only. Do not use that plan key for n8n workflows, automation, batch calls, automated scripts, or generic application-backend work; Alibaba says out-of-scope use can suspend the subscription or key. The pay-as-you-go Qwen Cloud connection remains the unrestricted Batshit route for those other uses.
+
+Token Plan Personal is also licensed for one device at a time. Do not run the same subscription key simultaneously from Batshit on multiple computers; keep the pay-as-you-go Qwen Cloud key available on the other machine instead.
 
 ## Create a saved model preset
 
@@ -96,7 +103,7 @@ Saved presets make agent setup easier: agents pick a preset instead of repeating
 
 ## Prompt caching on API agents
 
-For `API` Primary Agents, Batshit automatically uses provider-side prompt/input caching options where they are supported. OpenAI gets a Batshit-generated cache key, Anthropic gets cache control, OpenRouter gets sticky session routing plus usage reporting, Vercel AI Gateway gets automatic caching, and direct Gemini relies on Google's implicit prompt caching. Advanced provider settings can still override supported provider options, but normal users should not need to configure prompt caching by hand.
+For `API` Primary Agents, Batshit automatically uses provider-side prompt/input caching options where they are supported. OpenAI gets a Batshit-generated cache key, Anthropic gets cache control, OpenRouter gets sticky session routing plus usage reporting, Vercel AI Gateway gets automatic caching, direct Gemini relies on Google's implicit prompt caching, and both Qwen Cloud connections use the official Alibaba provider's cache support. Advanced provider settings can still override supported provider options, but normal users should not need to configure prompt caching by hand.
 
 Cache hits depend on provider rules. Very short prompts may not be eligible, cache entries can expire, and some providers only report cache evidence after a repeated eligible request. Batshit does not use Google's explicit cached-content resources for normal direct Gemini API-agent sends because Google does not allow that cache option to be combined with the live system/tool fields Batshit agents normally use. Image Clips are sent as structured image inputs rather than prompt text, but multimodal turns can still change how a provider applies prompt caching. Some implicit-cache providers may miss, restart, or report smaller cache reads after image turns even when Batshit reuses the same Clip URL or provider file URI. Check the Execution Viewer if you want to see whether a run reported cached input or cache-write tokens.
 

@@ -463,6 +463,20 @@ const COMPARISONS: ComparisonDefinition[] = [
       )
     }
   },
+  {
+    provider: 'qwen_token_plan',
+    connectionId: 'direct:qwen_token_plan',
+    fetcher: async () => {
+      const key = process.env.QWEN_TOKEN_PLAN_API_KEY
+      if (!key) return null
+      return fetchOpenAICompatibleIds(
+        process.env.QWEN_TOKEN_PLAN_API_BASE_URL ||
+          'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1',
+        key
+      )
+    },
+    note: 'Without a Token Plan env key, sync uses the current official docs-backed text-model list.'
+  },
   { provider: 'zai', connectionId: 'direct:zai', fetcher: fetchZaiIds },
   {
     provider: 'zai_coding',

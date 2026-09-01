@@ -35,6 +35,7 @@ vi.mock('$env/dynamic/private', () => ({
     MINIMAX_API_KEY: 'minimax-placeholder',
     MIMO_API_KEY: 'mimo-placeholder',
     DASHSCOPE_API_KEY: 'dashscope-placeholder',
+    QWEN_TOKEN_PLAN_API_KEY: 'qwen-token-plan-placeholder',
     ALIBABA_CLOUD_API_KEY: 'alibaba-placeholder',
     STEPFUN_API_KEY: 'stepfun-placeholder',
     OPENROUTER_API_KEY: 'sk-or-placeholder',
@@ -114,7 +115,12 @@ vi.mock('@ai-sdk/cohere', () => ({
 }))
 
 vi.mock('@ai-sdk/alibaba', () => ({
-  createAlibaba: vi.fn(() => vi.fn((modelId) => ({ modelId, provider: 'qwencloud' })))
+  createAlibaba: vi.fn((options?: { baseURL?: string }) =>
+    vi.fn((modelId) => ({
+      modelId,
+      provider: options?.baseURL?.includes('token-plan') ? 'qwen_token_plan' : 'qwencloud'
+    }))
+  )
 }))
 
 ;(vi as any).mock(
@@ -366,6 +372,7 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(providerManager.hasProvider('minimax')).toBe(true)
       expect(providerManager.hasProvider('mimo')).toBe(true)
       expect(providerManager.hasProvider('qwencloud')).toBe(true)
+      expect(providerManager.hasProvider('qwen_token_plan')).toBe(true)
       expect(providerManager.hasProvider('alibaba')).toBe(true)
       expect(providerManager.hasProvider('stepfun')).toBe(true)
 
@@ -385,6 +392,17 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
       })
 
+      expect(
+        providerManager.getModel('qwen3.8-max', {
+          transport: 'direct',
+          service: 'qwen_token_plan'
+        })
+      ).toMatchObject({ modelId: 'qwen3.8-max', provider: 'qwen_token_plan' })
+      expect(createAlibaba).toHaveBeenCalledWith({
+        apiKey: 'qwen-token-plan-placeholder',
+        baseURL: 'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1'
+      })
+
       const minimaxModel = providerManager.getModel('MiniMax-M3', {
         transport: 'direct',
         service: 'minimax'
@@ -393,6 +411,27 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         modelId: 'MiniMax-M3',
         mode: 'chat'
       })
+    })
+
+    it('honors the advanced Qwen Token Plan base URL override', () => {
+      const originalBaseUrl = testEnv.QWEN_TOKEN_PLAN_API_BASE_URL
+      testEnv.QWEN_TOKEN_PLAN_API_BASE_URL = 'https://token-plan.example.test/compatible-mode/v1'
+      vi.mocked(createAlibaba).mockClear()
+
+      try {
+        new ProviderManager()
+
+        expect(createAlibaba).toHaveBeenCalledWith({
+          apiKey: 'qwen-token-plan-placeholder',
+          baseURL: 'https://token-plan.example.test/compatible-mode/v1'
+        })
+      } finally {
+        if (originalBaseUrl === undefined) {
+          delete testEnv.QWEN_TOKEN_PLAN_API_BASE_URL
+        } else {
+          testEnv.QWEN_TOKEN_PLAN_API_BASE_URL = originalBaseUrl
+        }
+      }
     })
 
     it('uses dedicated AI SDK providers for supported direct model services', () => {

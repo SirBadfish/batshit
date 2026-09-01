@@ -510,6 +510,42 @@ describe('modelCatalogSync merge', () => {
     )
   })
 
+  it('publishes the current Qwen Token Plan text-model set with provider-authoritative developers', () => {
+    const curated = _getManualDirectModelsForTest('qwen_token_plan')
+    const directEntries = _mapDirectProviderEntriesForTest('qwen_token_plan', curated)
+
+    expect(curated.map((model) => model.id)).toEqual([
+      'qwen3.8-max',
+      'qwen3.8-flash',
+      'qwen3.7-max',
+      'qwen3.7-plus',
+      'qwen3.6-flash',
+      'deepseek-v4-pro',
+      'deepseek-v4-pro-0813',
+      'deepseek-v4-flash-0731',
+      'glm-5.2'
+    ])
+    expect(directEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'qwen3.8-max',
+          provider: 'qwen',
+          connectionId: 'direct:qwen_token_plan'
+        }),
+        expect.objectContaining({
+          id: 'deepseek-v4-pro',
+          provider: 'deepseek',
+          connectionId: 'direct:qwen_token_plan'
+        }),
+        expect.objectContaining({
+          id: 'glm-5.2',
+          provider: 'zai',
+          connectionId: 'direct:qwen_token_plan'
+        })
+      ])
+    )
+  })
+
   it('classifies Cohere chat, embedding, rerank, and transcription models from advertised endpoints', () => {
     const directEntries = _mapCohereModelsForTest([
       {

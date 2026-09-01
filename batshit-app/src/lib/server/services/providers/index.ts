@@ -38,6 +38,10 @@ import {
   listLocalAiServers,
   resolveLocalAiRuntimeBaseUrl
 } from '$lib/server/services/localAiServers'
+import {
+  QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
+  QWEN_TOKEN_PLAN_TEXT_MODELS
+} from '$lib/server/constants/qwenTokenPlan'
 
 /**
  * Provider configuration interface
@@ -102,6 +106,7 @@ export type KnownProviderId =
   | 'minimax'
   | 'mimo'
   | 'qwencloud'
+  | 'qwen_token_plan'
   | 'alibaba'
   | 'stepfun'
   | 'zai'
@@ -620,6 +625,32 @@ export class ProviderManager {
       registeredCount++
     }
 
+    const qwenTokenPlanKey = this.apiKeys.qwen_token_plan ?? env.QWEN_TOKEN_PLAN_API_KEY
+    if (qwenTokenPlanKey && this.validateApiKey(qwenTokenPlanKey, 'Qwen Token Plan')) {
+      const qwenTokenPlan = createAlibaba({
+        apiKey: qwenTokenPlanKey,
+        baseURL: env.QWEN_TOKEN_PLAN_API_BASE_URL || QWEN_TOKEN_PLAN_OPENAI_BASE_URL
+      })
+      this.providers.set('qwen_token_plan', {
+        client: (modelId: string) => qwenTokenPlan(modelId),
+        models: QWEN_TOKEN_PLAN_TEXT_MODELS.map((model) => model.id),
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 1_000_000,
+          cacheControl: true,
+          reasoning: true,
+          longContext: true,
+          code: true
+        },
+        displayName: 'Qwen Token Plan',
+        priority: 14
+      })
+      logger.debug('[ProviderManager] Qwen Token Plan API key validated')
+      registeredCount++
+    }
+
     registerOpenAICompatibleProvider({
       id: 'stepfun',
       label: 'StepFun',
@@ -961,6 +992,7 @@ export class ProviderManager {
       'baseten',
       'cerebras',
       'qwencloud',
+      'qwen_token_plan',
       'groq',
       'cohere',
       'fal',
@@ -1079,6 +1111,7 @@ export class ProviderManager {
       moonshot: 'kimi-k2.6',
       minimax: 'MiniMax-M3',
       mimo: 'mimo-v2.5-pro',
+      qwen_token_plan: 'qwen3.8-max',
       alibaba: 'qwen3-max',
       stepfun: 'step-3.7-flash',
       openrouter: 'anthropic/claude-3.5-sonnet',
@@ -1257,6 +1290,7 @@ const PROVIDER_KEY_CONFIG = [
   { id: 'minimax', envVar: 'MINIMAX_API_KEY' },
   { id: 'mimo', envVar: 'MIMO_API_KEY' },
   { id: 'qwencloud', envVar: 'DASHSCOPE_API_KEY' },
+  { id: 'qwen_token_plan', envVar: 'QWEN_TOKEN_PLAN_API_KEY' },
   { id: 'alibaba', envVar: 'ALIBABA_CLOUD_API_KEY' },
   { id: 'stepfun', envVar: 'STEPFUN_API_KEY' },
   { id: 'zai', envVar: 'ZAI_API_KEY' },

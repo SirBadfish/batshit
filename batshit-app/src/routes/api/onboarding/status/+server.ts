@@ -17,6 +17,7 @@ const CHAT_PROVIDER_LABELS = new Map<string, string>([
   ['minimax', 'MiniMax'],
   ['mimo', 'MiMo'],
   ['qwencloud', 'Qwen Cloud'],
+  ['qwen_token_plan', 'Qwen Token Plan'],
   ['alibaba', 'Alibaba Cloud'],
   ['stepfun', 'StepFun'],
   ['zai', 'Z.ai General'],

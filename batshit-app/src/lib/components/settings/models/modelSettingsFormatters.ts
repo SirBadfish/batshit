@@ -14,6 +14,7 @@ const DEVELOPER_LABEL_OVERRIDES: Record<string, string> = {
   deepseek: 'DeepSeek',
   zai: 'Z.ai',
   zai_coding: 'Z.ai Coding Plan',
+  qwen_token_plan: 'Qwen Token Plan',
   'black-forest-labs': 'Black Forest Labs',
   'stability-ai': 'Stability AI',
   huggingface: 'Hugging Face',

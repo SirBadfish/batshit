@@ -11,6 +11,10 @@ import {
   FAL_DEVELOPER_OVERRIDE_KEYWORDS,
   FAL_DEVELOPER_OVERRIDE_PREFIX
 } from '$lib/data/fal-developer-overrides'
+import {
+  QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
+  QWEN_TOKEN_PLAN_TEXT_MODELS
+} from '$lib/server/constants/qwenTokenPlan'
 
 const GATEWAY_ENDPOINT = 'https://ai-gateway.vercel.sh/v1/models'
 const OPENROUTER_ENDPOINT = 'https://openrouter.ai/api/v1/models'
@@ -138,6 +142,7 @@ const DIRECT_PROVIDER_IDS = [
   'minimax',
   'mimo',
   'qwencloud',
+  'qwen_token_plan',
   'zai',
   'zai_coding',
   'togetherai',
@@ -243,6 +248,15 @@ const MANUAL_DIRECT_MODELS: Partial<Record<DirectProviderId, DirectProviderEntry
     { id: 'kimi-k2.6', displayName: 'Kimi K2.6' },
     { id: 'kimi-latest', displayName: 'Kimi Latest' }
   ],
+  qwen_token_plan: QWEN_TOKEN_PLAN_TEXT_MODELS.map((model) => ({
+    id: model.id,
+    developerId: model.developerId,
+    modelId: model.id,
+    effectiveId: model.id,
+    displayName: model.displayName,
+    tags: [...model.tags],
+    modelType: 'chat'
+  })),
   zai: [
     {
       id: 'glm-5.2',
@@ -1374,6 +1388,52 @@ async function fetchQwenCloudEntries(options: SourceFetchOptions = {}): Promise<
   return mapOpenAICompatibleCatalogModels('qwencloud', models)
 }
 
+async function fetchQwenTokenPlanEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const curated = MANUAL_DIRECT_MODELS.qwen_token_plan ?? []
+  const apiKey = await getRuntimeEnv('QWEN_TOKEN_PLAN_API_KEY')
+  if (!apiKey) return curated
+
+  const baseUrl =
+    (await getRuntimeEnv('QWEN_TOKEN_PLAN_API_BASE_URL')) ||
+    QWEN_TOKEN_PLAN_OPENAI_BASE_URL
+
+  try {
+    const models = (await fetchOpenAICompatibleModels({
+      baseUrl,
+      apiKey,
+      signal: options.signal
+    })) as OpenAICompatibleCatalogModel[]
+    const curatedById = new Map(curated.map((entry) => [entry.id, entry]))
+    const live = models.flatMap((model): DirectProviderEntry[] => {
+      const id = safeString(model.id).trim()
+      if (!id) return []
+      const curatedEntry = curatedById.get(id)
+      const ownedBy = safeString(model.owned_by).trim()
+      return [
+        {
+          id,
+          developerId: ownedBy
+            ? normalizeDeveloperId(ownedBy, 'qwen_token_plan')
+            : curatedEntry?.developerId,
+          modelId: id,
+          effectiveId: id
+        }
+      ]
+    })
+
+    if (live.length) {
+      return mergeDirectProviderEntries(live, curated)
+    }
+  } catch (error) {
+    console.warn(
+      '[catalog] Qwen Token Plan model list fetch failed; falling back to the docs-backed list:',
+      normalizeError(error)
+    )
+  }
+
+  return curated
+}
+
 async function fetchMoonshotEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
   const apiKey = await getRuntimeEnv('MOONSHOT_API_KEY')
   if (!apiKey) {
@@ -2478,6 +2538,7 @@ const DIRECT_SOURCE_FETCHERS: Record<
   minimax: fetchMiniMaxEntries,
   mimo: fetchMimoEntries,
   qwencloud: fetchQwenCloudEntries,
+  qwen_token_plan: fetchQwenTokenPlanEntries,
   zai: fetchZaiEntries,
   zai_coding: fetchZaiCodingEntries,
   togetherai: fetchTogetherEntries,
@@ -2506,6 +2567,7 @@ const DIRECT_SOURCE_ENV_VARS: Record<DirectProviderId, string[]> = {
   minimax: ['MINIMAX_API_KEY'],
   mimo: ['MIMO_API_KEY'],
   qwencloud: ['DASHSCOPE_API_KEY'],
+  qwen_token_plan: [],
   zai: ['ZAI_API_KEY'],
   zai_coding: [],
   togetherai: ['TOGETHER_API_KEY'],
