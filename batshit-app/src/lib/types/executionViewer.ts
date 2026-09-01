@@ -87,6 +87,11 @@ export interface ExecutionReasoningPersistence {
   agentHistoryStatus: 'included' | 'excluded' | 'not-applicable'
   characterCount: number
   source: 'message.metadata.reasoningSummary'
+  /** Optional on historical snapshots; current interrupted runs always stamp these fields. */
+  recoveryStatus?: 'pending' | 'not-applicable'
+  recoveryTrigger?: 'user-interrupt' | null
+  recoveryCharacterCount?: number
+  recoverySource?: 'message.metadata.interruptedReasoningRecovery.renderedBlock' | null
 }
 
 export interface ExecutionRuntimeDetails {

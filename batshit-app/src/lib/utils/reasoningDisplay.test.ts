@@ -7,6 +7,7 @@ import {
   resolveTaggedReasoningTagName,
   withReasoningProviderOptions,
 } from './reasoningDisplay'
+import { buildInterruptedReasoningRecovery } from './reasoningRecovery'
 
 describe('reasoningDisplay utilities', () => {
   it('requests OpenAI reasoning summaries when Display Reasoning is enabled', () => {
@@ -35,6 +36,31 @@ describe('reasoningDisplay utilities', () => {
       thinkingBudget: 8192,
       includeThoughts: true,
     })
+  })
+
+  it('keeps reasoning summaries available internally when Display Reasoning is off', () => {
+    const openai = withReasoningProviderOptions(undefined, {
+      provider: 'openai',
+      modelId: 'gpt-5.5',
+      capabilities: { reasoning: true },
+      showReasoning: false,
+    })
+    const google = withReasoningProviderOptions(undefined, {
+      provider: 'google',
+      modelId: 'gemini-2.5-pro',
+      capabilities: { reasoning: true },
+      showReasoning: false,
+    })
+    const anthropic = withReasoningProviderOptions(undefined, {
+      provider: 'anthropic',
+      modelId: 'claude-4-sonnet',
+      capabilities: { reasoning: true },
+      showReasoning: false,
+    })
+
+    expect(openai?.openai?.reasoningSummary).toBe('auto')
+    expect(google?.google?.thinkingConfig?.includeThoughts).toBe(true)
+    expect(anthropic?.anthropic?.sendReasoning).toBe(true)
   })
 
   it('extracts OpenAI-compatible raw reasoning deltas', () => {
@@ -83,6 +109,10 @@ describe('reasoningDisplay utilities', () => {
       agentHistoryStatus: 'included',
       characterCount: 24,
       source: 'message.metadata.reasoningSummary',
+      recoveryStatus: 'not-applicable',
+      recoveryTrigger: null,
+      recoveryCharacterCount: 0,
+      recoverySource: null,
     })
 
     expect(
@@ -115,6 +145,31 @@ describe('reasoningDisplay utilities', () => {
       userHistoryStatus: 'not-requested',
       agentHistoryStatus: 'not-applicable',
       characterCount: 0,
+    })
+  })
+
+  it('reports hidden interruption recovery separately from visible reasoning history', () => {
+    const recovery = buildInterruptedReasoningRecovery({
+      agentId: 'agent-a',
+      reasoningSummary: 'Unfinished reasoning.',
+      planSummary: '- Resume the check',
+    })
+
+    expect(
+      buildReasoningPersistenceEvidence({
+        showReasoning: false,
+        preserveReasoning: false,
+        interruptedReasoningRecovery: recovery,
+      }),
+    ).toMatchObject({
+      userHistoryStatus: 'not-requested',
+      agentHistoryStatus: 'not-applicable',
+      characterCount: 0,
+      recoveryStatus: 'pending',
+      recoveryTrigger: 'user-interrupt',
+      recoveryCharacterCount: 39,
+      recoverySource:
+        'message.metadata.interruptedReasoningRecovery.renderedBlock',
     })
   })
 

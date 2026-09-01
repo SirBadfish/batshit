@@ -7,6 +7,7 @@ import {
 } from './universalResolver'
 import { normalizeId } from '$lib/utils/idNormalizer'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
+import { getActiveInterruptedReasoningRecoveryBlock } from '$lib/utils/reasoningRecovery'
 import { isConcreteZipId } from '$lib/utils/zipReferenceSafety'
 import {
   buildCoolToolAiContent,
@@ -294,6 +295,8 @@ export async function compileForAI(
     onZipExposure?: (exposure: ZipExposure) => void
     /** See calculateRecoveryHoldByIndex — blocks automatic zip compression for failed/interrupted trailing runs. */
     recoveryHold?: boolean
+    /** Replays one stored, byte-stable reasoning block until the same agent completes a later successful turn. */
+    interruptedReasoningRecoveryActive?: boolean
   }
 ): Promise<string> {
   // Import zipping service to check unzipped status
@@ -479,11 +482,23 @@ export async function compileForAI(
     compiled = compiled.trim().length > 0 ? `${compiled}\n\n${note}` : note
   }
 
-  const preservedReasoningHistory = buildPreservedReasoningHistory(agent, _message)
+  const interruptedReasoningRecovery = getActiveInterruptedReasoningRecoveryBlock({
+    message: _message,
+    currentAgentId: typeof agent?.id === 'string' ? agent.id : null,
+    active: options?.interruptedReasoningRecoveryActive === true
+  })
+  const preservedReasoningHistory = interruptedReasoningRecovery
+    ? ''
+    : buildPreservedReasoningHistory(agent, _message)
   if (preservedReasoningHistory) {
     compiled = compiled.trim().length > 0
       ? `${preservedReasoningHistory}\n\n${compiled}`
       : preservedReasoningHistory
+  }
+  if (interruptedReasoningRecovery) {
+    compiled = compiled.trim().length > 0
+      ? `${compiled}\n\n${interruptedReasoningRecovery}`
+      : interruptedReasoningRecovery
   }
 
   return compiled

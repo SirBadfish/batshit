@@ -83,6 +83,10 @@ import {
   resolveTaggedReasoningTagName,
   withReasoningProviderOptions,
 } from '$lib/utils/reasoningDisplay'
+import {
+  buildInterruptedReasoningRecovery,
+  readInterruptedReasoningRecovery,
+} from '$lib/utils/reasoningRecovery'
 import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
 import { resolveModelIds } from '$lib/utils/modelIdResolver'
 import { N8N_ONLY_CONNECTION_IDS } from '$lib/server/constants/modelConnections'
@@ -3694,7 +3698,7 @@ async function handleBatshitAgentStream({
   if (codexRuntimeSettings && agent?.id) {
     codexRuntimeSettings.profileId = buildAgentProfileId(agent.id)
   }
-  if (codexRuntimeSettings && showReasoning) {
+  if (codexRuntimeSettings) {
     codexRuntimeSettings.reasoningSummary = 'auto'
     codexRuntimeSettings.modelSupportsReasoningSummaries = true
   }
@@ -4066,7 +4070,7 @@ async function handleBatshitAgentStream({
   let finalizePromise: Promise<void> | null = null
   let onFinishResolved = false
   let resolveOnFinish: (() => void) | null = null
-  let syncVisibleReasoningMetadata = () => {}
+  let syncReasoningMetadata = () => {}
   const onFinishPromise = new Promise<void>((resolve) => {
     resolveOnFinish = resolve
   })
@@ -4089,7 +4093,7 @@ async function handleBatshitAgentStream({
     }
 
     finalizePromise = (async () => {
-      syncVisibleReasoningMetadata()
+      syncReasoningMetadata()
       logger.debug('[Send-Routed] Finalizing assistant message', {
         sessionId,
         messageId,
@@ -4222,6 +4226,7 @@ async function handleBatshitAgentStream({
               typeof (finalMessage.metadata as any)?.reasoningSummary === 'string'
                 ? (finalMessage.metadata as any).reasoningSummary
                 : null,
+            interruptedReasoningRecovery: readInterruptedReasoningRecovery(finalMessage),
           }),
         })
       } catch (reasoningEvidenceError) {
@@ -4250,14 +4255,31 @@ async function handleBatshitAgentStream({
   let thinkingIndicatorEmitted = false
   let planItems: PlanItem[] = []
   let planSummary = ''
-  syncVisibleReasoningMetadata = () => {
-    if (!showReasoning) return
-    if (!reasoningCaptured && !planSummary && planItems.length === 0) return
+  syncReasoningMetadata = () => {
+    const visibleMetadata = showReasoning
+      ? {
+          ...(reasoningCaptured ? { reasoningSummary: reasoningCaptured } : {}),
+          ...(planSummary ? { planSummary } : {}),
+          ...(planItems.length > 0 ? { planItems } : {}),
+        }
+      : {}
+    const interruptedReasoningRecovery =
+      finishSummary.metadata?.interrupted === true
+        ? buildInterruptedReasoningRecovery({
+            agentId,
+            reasoningSummary: reasoningCaptured,
+            planSummary,
+          })
+        : null
+
+    if (Object.keys(visibleMetadata).length === 0 && !interruptedReasoningRecovery) {
+      return
+    }
+
     finishSummary.metadata = {
       ...finishSummary.metadata,
-      ...(reasoningCaptured ? { reasoningSummary: reasoningCaptured } : {}),
-      ...(planSummary ? { planSummary } : {}),
-      ...(planItems.length > 0 ? { planItems } : {}),
+      ...visibleMetadata,
+      ...(interruptedReasoningRecovery ? { interruptedReasoningRecovery } : {}),
     }
   }
   const streamedToolSteps: any[] = []
@@ -4686,7 +4708,7 @@ async function handleBatshitAgentStream({
   }
 
   const appendReasoningDelta = async (content: string) => {
-    if (!showReasoning || !content) return
+    if (!content) return
     if (!reasoningActive && reasoningCaptured) {
       reasoningCaptured += '\n\n'
       await emitReasoningAppend('\n\n')
@@ -4704,10 +4726,30 @@ async function handleBatshitAgentStream({
   }
 
   const ensureReasoningSegmentBoundary = async () => {
-    if (!showReasoning) return
     if (!reasoningActive) return
     // Treat any boundary (text/tool/finish) as the end of a reasoning segment.
     reasoningActive = false
+  }
+
+  const startReasoningSegment = async (initial: string) => {
+    reasoningStreamSource.noteNormalizedReasoning()
+    if (!reasoningActive && reasoningCaptured) {
+      reasoningCaptured += '\n\n'
+      await emitReasoningAppend('\n\n')
+    }
+    reasoningActive = true
+    if (initial) {
+      reasoningCaptured += initial
+      await emitReasoningAppend(initial)
+    }
+  }
+
+  const replaceReasoningSnapshot = async (content: string, final: boolean) => {
+    if (!content) return
+    reasoningStreamSource.noteNormalizedReasoning()
+    reasoningCaptured = content
+    reasoningActive = !final
+    await emitReasoningReplace(content)
   }
 
   const emitThinkingIndicator = async () => {
@@ -4928,7 +4970,7 @@ async function handleBatshitAgentStream({
       reasoningActive = false
 
       // Some providers expose reasoning only in the final SDK result.
-      if (showReasoning && !reasoningCaptured) {
+      if (!reasoningCaptured) {
         const finishReasoning = collectReasoningTextFromFinish(reasoning)
         if (finishReasoning) {
           reasoningStreamSource.noteNormalizedReasoning()
@@ -4939,7 +4981,7 @@ async function handleBatshitAgentStream({
 
       // Some providers expose reasoning summaries via steps rather than streaming events.
       // If we didn't capture anything in-stream, try to collect and emit once here.
-      if (showReasoning && !reasoningCaptured && Array.isArray(steps)) {
+      if (!reasoningCaptured && Array.isArray(steps)) {
         const collected: string[] = []
 
         for (const step of steps) {
@@ -5690,7 +5732,20 @@ async function handleBatshitAgentStream({
         case 'reasoning': {
           // OpenAI reasoning summaries stream via `part.type === 'reasoning'`
           // with `textDelta` (Vercel AI SDK).
-          if (await handleReasoningIndicator()) break
+          const handledAsIndicator = await handleReasoningIndicator()
+          const delta =
+            (chunk as any).textDelta ??
+            (chunk as any).text ??
+            (chunk as any).delta ??
+            (chunk as any).content ??
+            ''
+          if (handledAsIndicator) {
+            if (typeof delta === 'string' && delta) {
+              reasoningStreamSource.noteNormalizedReasoning()
+              await appendReasoningDelta(delta)
+            }
+            break
+          }
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true
@@ -5701,12 +5756,6 @@ async function handleBatshitAgentStream({
             pendingControlText = ''
           }
           await ensureStartEmitted()
-          const delta =
-            (chunk as any).textDelta ??
-            (chunk as any).text ??
-            (chunk as any).delta ??
-            (chunk as any).content ??
-            ''
           if (typeof delta === 'string' && delta) {
             reasoningStreamSource.noteNormalizedReasoning()
             await appendReasoningDelta(delta)
@@ -5715,7 +5764,12 @@ async function handleBatshitAgentStream({
         }
         case 'reasoning-start':
         case 'reasoning_start': {
-          if (await handleReasoningIndicator()) break
+          const initial = (chunk as any).text || (chunk as any).content || ''
+          const handledAsIndicator = await handleReasoningIndicator()
+          if (handledAsIndicator) {
+            await startReasoningSegment(typeof initial === 'string' ? initial : '')
+            break
+          }
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true
@@ -5726,37 +5780,34 @@ async function handleBatshitAgentStream({
             pendingControlText = ''
           }
           await ensureStartEmitted()
-          reasoningStreamSource.noteNormalizedReasoning()
-          if (!reasoningActive && reasoningCaptured) {
-            reasoningCaptured += '\n\n'
-            await emitReasoningAppend('\n\n')
-          }
-          reasoningActive = true
-          const initial = (chunk as any).text || (chunk as any).content || ''
-          if (typeof initial === 'string' && initial) {
-            reasoningCaptured += initial
-            await emitReasoningAppend(initial)
-          }
+          await startReasoningSegment(typeof initial === 'string' ? initial : '')
           break
         }
         case 'reasoning-delta':
         case 'reasoning_delta': {
-          if (await handleReasoningIndicator()) break
-          if (controlsMode === 'listening') {
-            silentResponse = true
-            shouldBreakStream = true
-            break
-          }
-          if (pendingControlText) {
-            await emitTextChunk(pendingControlText)
-            pendingControlText = ''
-          }
-          await ensureStartEmitted()
           const delta =
             (chunk as any).text ??
             (chunk as any).delta ??
             (chunk as any).content ??
             ''
+          const handledAsIndicator = await handleReasoningIndicator()
+          if (handledAsIndicator) {
+            if (typeof delta === 'string' && delta) {
+              reasoningStreamSource.noteNormalizedReasoning()
+              await appendReasoningDelta(delta)
+            }
+            break
+          }
+          if (controlsMode === 'listening') {
+            silentResponse = true
+            shouldBreakStream = true
+            break
+          }
+          if (pendingControlText) {
+            await emitTextChunk(pendingControlText)
+            pendingControlText = ''
+          }
+          await ensureStartEmitted()
           if (typeof delta === 'string' && delta) {
             reasoningStreamSource.noteNormalizedReasoning()
             await appendReasoningDelta(delta)
@@ -5765,14 +5816,19 @@ async function handleBatshitAgentStream({
         }
         case 'reasoning-end':
         case 'reasoning_end': {
-          if (!showReasoning) break
           reasoningStreamSource.noteNormalizedReasoning()
           reasoningActive = false
           break
         }
         case 'thinking': {
           const thinkingChunk = chunk as any
-          if (await handleReasoningIndicator()) break
+          const content =
+            typeof thinkingChunk?.content === 'string' ? thinkingChunk.content : ''
+          const handledAsIndicator = await handleReasoningIndicator()
+          if (handledAsIndicator) {
+            await replaceReasoningSnapshot(content, Boolean(thinkingChunk?.final))
+            break
+          }
           if (controlsMode === 'listening') {
             silentResponse = true
             shouldBreakStream = true
@@ -5783,17 +5839,10 @@ async function handleBatshitAgentStream({
             pendingControlText = ''
           }
           await ensureStartEmitted()
-          const content =
-            typeof thinkingChunk?.content === 'string'
-              ? thinkingChunk.content
-              : ''
           if (!content) break
 
           // Codex emits full reasoning content on each update. Stream as replace events.
-          reasoningStreamSource.noteNormalizedReasoning()
-          reasoningCaptured = content
-          reasoningActive = Boolean(!thinkingChunk?.final)
-          await emitReasoningReplace(content)
+          await replaceReasoningSnapshot(content, Boolean(thinkingChunk?.final))
           break
         }
         case 'tool-call': {
@@ -6325,12 +6374,9 @@ async function handleBatshitAgentStream({
           const rawReasoning = extractReasoningTextFromRawChunk(
             rawChunk?.rawValue,
           )
-          if (showReasoning) {
-            const readyRawFallback =
-              reasoningStreamSource.queueRawFallback(rawReasoning)
-            if (readyRawFallback) {
-              await appendReasoningDelta(readyRawFallback)
-            }
+          const readyRawFallback = reasoningStreamSource.queueRawFallback(rawReasoning)
+          if (readyRawFallback) {
+            await appendReasoningDelta(readyRawFallback)
           }
           break
         }
@@ -6635,6 +6681,9 @@ async function handleBatshitAgentStream({
         if (ensureStartEmitted) {
           await ensureStartEmitted()
         }
+        // A raw-only provider may have one delayed fallback chunk waiting when
+        // the user stops the stream. Capture it before the recovery block is rendered.
+        await flushRawReasoningFallback()
 
         if (
           !finishSummary.content &&

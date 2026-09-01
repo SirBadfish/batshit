@@ -847,17 +847,21 @@
   })
 
   const reasoningPersistenceText = (value: ExecutionReasoningPersistence) => {
+    const recoveryText =
+      value.recoveryStatus === 'pending'
+        ? ` Batshit captured ${Math.max(0, value.recoveryCharacterCount ?? 0).toLocaleString()} characters of unfinished reasoning/plan for interruption recovery. The same agent receives that exact block on its next request regardless of Display or Preserve, and it expires after that agent completes a successful turn.`
+        : ''
     if (value.userHistoryStatus === 'saved') {
       const agentHistoryText =
         value.agentHistoryStatus === 'included'
           ? 'Preserve Reasoning was on for this run. If it remains on, later Compiled Messages for this agent include the saved reasoning.'
           : 'Preserve Reasoning was off, so it stays out of later Compiled Messages.'
-      return `Reasoning: Saved for chat display (${value.characterCount.toLocaleString()} characters) and survives refresh. ${agentHistoryText}`
+      return `Reasoning: Saved for chat display (${value.characterCount.toLocaleString()} characters) and survives refresh. ${agentHistoryText}${recoveryText}`
     }
     if (value.userHistoryStatus === 'not-emitted') {
-      return 'Reasoning: Display Reasoning was on, but this model emitted no visible reasoning summary.'
+      return `Reasoning: Display Reasoning was on, but this model emitted no visible reasoning summary.${recoveryText}`
     }
-    return 'Reasoning: Display Reasoning was off, so no visible reasoning summary was requested or saved.'
+    return `Reasoning: Display Reasoning was off, so no reasoning summary was shown or saved in the visible chat.${recoveryText}`
   }
 </script>
 
