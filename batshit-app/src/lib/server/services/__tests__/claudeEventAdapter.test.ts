@@ -150,6 +150,54 @@ describe('ClaudeEventAdapter', () => {
     })
   })
 
+  it('keeps MCP image bytes out of the stored tool result (SA-105 P3)', async () => {
+    // Batshit's own bridge never sends image content to this runtime — Claude
+    // Code stores MCP ImageContent as text at 10-20x the token cost — but a
+    // user-installed MCP server can, and this result becomes an intermediate
+    // step, a zip and compiled history.
+    const adapter = new ClaudeEventAdapter({
+      request: buildRequest(),
+      transport: 'cli'
+    })
+
+    async function* mockEvents() {
+      yield {
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              id: 'mcp-img-1',
+              name: 'mcp__some_server__screenshot',
+              input: {}
+            }
+          ]
+        }
+      }
+      yield {
+        type: 'user',
+        tool_use_result: {
+          content: [
+            { type: 'text', text: 'Captured the page.' },
+            { type: 'image', data: 'THIRDPARTYIMAGEBASE64', mimeType: 'image/png' }
+          ]
+        },
+        message: {
+          content: [{ type: 'tool_result', tool_use_id: 'mcp-img-1', content: 'ok' }]
+        }
+      }
+      yield { type: 'result', usage: { input_tokens: 4, output_tokens: 6 } }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents()))
+    const toolResult = chunks.find((chunk) => chunk.type === 'tool-result')
+
+    expect(toolResult).toBeDefined()
+    expect(JSON.stringify(toolResult)).not.toContain('THIRDPARTYIMAGEBASE64')
+    expect(JSON.stringify(toolResult)).toContain('Image omitted from persisted provider context')
+    expect(JSON.stringify(toolResult)).toContain('Captured the page.')
+  })
+
   it('flattens Claude tool_result web search payloads into real result rows', async () => {
     let finished: any = null
     const adapter = new ClaudeEventAdapter({

@@ -143,6 +143,10 @@ describe('codexProfileManager dynamic-only managed config', () => {
     expect(config).toContain('[mcp_servers.batshit_gateway_managed-codex-mode4-controls]')
     expect(config).toContain('enabled_tools = ["batshit_server_bash_execute", "native_skill"]')
     expect(mode4Server?.args).toContain('--url=http://localhost:5620')
+    // SA-105 P3 (AMD-105-09): the bridge must be told which CLI consumes its
+    // results, because that alone decides whether a recalled memory image can
+    // ride back as MCP image content. Codex renders those blocks.
+    expect(mode4Server?.args).toContain('--runtime=codex')
     expect(mode4Server?.env_vars).toEqual([
       'BATSHIT_TOKEN',
       'BATSHIT_SESSION_ID',

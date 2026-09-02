@@ -20,6 +20,7 @@ import {
 import * as runtimeAddons from '../runtimeAddons'
 import { resolveEnabledMode4InternalHelperTools } from '../mode4InternalTools'
 import { isBrokerAvailable, resolveBrokerToolToggles } from '$lib/utils/brokerAvailability'
+import { createEphemeralImageRegistry } from '../toolResultImageDelivery'
 
 const skillRuntimeToolMocks = vi.hoisted(() => ({
   resolveSkillRuntimeForTool: vi.fn(),
@@ -39,6 +40,17 @@ const skillRegistryMocks = vi.hoisted(() => ({
 const nativeToolEnv = vi.hoisted(() => ({
   BATSHIT_ENABLE_AGENT_BROWSER: 'false'
 } as Record<string, string | undefined>))
+
+// SA-105 P2: recall delivery reads bytes at delivery time. The loader is mocked
+// so these tests exercise the DELIVERY decision, not Redis or the upload store.
+const memoryMediaMocks = vi.hoisted(() => ({
+  loadMemoryMedia: vi.fn()
+}))
+
+vi.mock('../memory/memoryMedia', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../memory/memoryMedia')>()),
+  loadMemoryMedia: memoryMediaMocks.loadMemoryMedia
+}))
 
 const appleContainerSandboxMocks = vi.hoisted(() => ({
   cleanupAppleContainerSandboxesForSession: vi.fn(),
@@ -4308,10 +4320,15 @@ printf 'ok\\n'
     }
   })
 
-  it('native_bash_execute maps Agent Browser screenshot URLs to image-url model output content', async () => {
+  // SA-105 P1 (DL-105-11, AMD-105-12): these two tests previously pinned the
+  // DEPRECATED `image-url` / `image-data` shapes with toEqual, which made them a
+  // tripwire for the helper migration rather than coverage of it. They now pin
+  // the current `file` shape AND the lane the run resolved.
+  it('native_bash_execute maps Agent Browser screenshot URLs to a current file part on a tool_result lane', async () => {
     const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
+      imageDelivery: { lane: 'tool_result', reason: 'test_anthropic' },
       providerSettings: {
         nativeTools: {
           fetchZipEnabled: false,
@@ -4345,15 +4362,21 @@ printf 'ok\\n'
     expect(modelOutput).toEqual({
       type: 'content',
       value: [
+        { type: 'text', text: 'Agent Browser screenshot:' },
         {
-          type: 'image-url',
-          url: 'https://tunnel.example/uploads/agent-browser-shot.png'
+          type: 'file',
+          mediaType: 'image/png',
+          data: { type: 'url', url: new URL('https://tunnel.example/uploads/agent-browser-shot.png') }
         }
       ]
     })
+    // The deprecated shims logged an AI SDK warning on every call.
+    const serialized = JSON.stringify(modelOutput)
+    expect(serialized).not.toContain('image-url')
+    expect(serialized).not.toContain('image-data')
   })
 
-  it('native_bash_execute maps local Agent Browser screenshots to image-data model output and cleans up temp files', async () => {
+  it('native_bash_execute maps local Agent Browser screenshots to a current file data part and cleans up temp files', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-ab-shot-'))
     const screenshotPath = path.join(tempWorkspace, 'test-shot.png')
     await writeFile(screenshotPath, Buffer.from('iVBORw0KGgo=', 'base64'))
@@ -4361,6 +4384,7 @@ printf 'ok\\n'
     const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
       projectPath: process.cwd(),
+      imageDelivery: { lane: 'tool_result', reason: 'test_anthropic' },
       providerSettings: {
         nativeTools: {
           fetchZipEnabled: false,
@@ -4394,14 +4418,106 @@ printf 'ok\\n'
 
       expect(modelOutput?.type).toBe('content')
       expect(Array.isArray(modelOutput?.value)).toBe(true)
-      expect(modelOutput?.value?.[0]?.type).toBe('image-data')
-      expect(modelOutput?.value?.[0]?.mediaType).toBe('image/png')
-      expect(typeof modelOutput?.value?.[0]?.data).toBe('string')
+      expect(modelOutput?.value?.[0]).toEqual({ type: 'text', text: 'Agent Browser screenshot:' })
+      expect(modelOutput?.value?.[1]?.type).toBe('file')
+      expect(modelOutput?.value?.[1]?.mediaType).toBe('image/png')
+      expect(modelOutput?.value?.[1]?.data?.type).toBe('data')
+      expect(typeof modelOutput?.value?.[1]?.data?.data).toBe('string')
 
       await expect(stat(screenshotPath)).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await rm(tempWorkspace, { recursive: true, force: true })
     }
+  })
+
+  // SA-105 P1 (DL-105-11): the actual defect fix. On a provider whose tool
+  // results serialize as text, the old path handed the model a JSON-stringified
+  // base64 blob — one measured screenshot cost ~141,125 tokens of text and the
+  // model replied "RECEIVED TEXT NOT IMAGE". It must now say so plainly instead.
+  it('native_bash_execute does not send screenshot bytes on a text-only tool-result lane', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-ab-lane-'))
+    const screenshotPath = path.join(tempWorkspace, 'text-lane-shot.png')
+    await writeFile(screenshotPath, Buffer.from('iVBORw0KGgo=', 'base64'))
+
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      projectPath: process.cwd(),
+      imageDelivery: {
+        lane: 'synthetic_user',
+        reason: 'provider_togetherai_serializes_tool_results_as_text'
+      },
+      providerSettings: {
+        nativeTools: {
+          fetchZipEnabled: false,
+          dynamicMcpEnabled: false,
+          webSearchEnabled: false,
+          bashEnabled: true,
+          agentBrowserEnabled: true
+        }
+      },
+      toolApprovalMode: 'none'
+    } as any)
+
+    const bashTool = (tools as any).native_bash_execute
+
+    try {
+      const modelOutput = await bashTool.toModelOutput({
+        toolCallId: 'tool_call_text_lane',
+        input: { command: 'agent-browser screenshot' },
+        output: {
+          agentBrowser: {
+            command: 'screenshot',
+            screenshot: { command: 'screenshot', path: screenshotPath, mediaType: 'image/png' }
+          }
+        }
+      })
+
+      expect(modelOutput?.type).toBe('text')
+      expect(modelOutput?.value).toContain('not shown to you')
+      // The whole point: no bytes, in any encoding, anywhere in the payload.
+      expect(JSON.stringify(modelOutput)).not.toContain('iVBORw0KGgo')
+      // Temp file is still cleaned up on the lane that cannot use it.
+      await expect(stat(screenshotPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it('native_bash_execute withholds a screenshot when the model cannot accept images at all', async () => {
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      projectPath: process.cwd(),
+      imageDelivery: { lane: 'none', reason: 'model_capabilities_vision_false' },
+      providerSettings: {
+        nativeTools: {
+          fetchZipEnabled: false,
+          dynamicMcpEnabled: false,
+          webSearchEnabled: false,
+          bashEnabled: true,
+          agentBrowserEnabled: true
+        }
+      },
+      toolApprovalMode: 'none'
+    } as any)
+
+    const modelOutput = await (tools as any).native_bash_execute.toModelOutput({
+      toolCallId: 'tool_call_no_vision',
+      input: { command: 'agent-browser screenshot' },
+      output: {
+        agentBrowser: {
+          command: 'screenshot',
+          screenshot: {
+            command: 'screenshot',
+            modelImageUrl: 'https://tunnel.example/uploads/shot.png',
+            mediaType: 'image/png'
+          }
+        }
+      }
+    })
+
+    expect(modelOutput?.type).toBe('text')
+    expect(modelOutput?.value).toContain('cannot accept image input')
+    expect(JSON.stringify(modelOutput)).not.toContain('tunnel.example')
   })
 
   it('returns a clear API key error when agent-browser bash command uses Browserbase without credentials', async () => {
@@ -7255,6 +7371,205 @@ PY`
     expect(String(runResult.error || '')).toMatch(/native_bash_execute is disabled/i)
     expect(buildSkillScriptCommand).not.toHaveBeenCalled()
   })
+
+  // ---------------------------------------------------------------------
+  // SA-105 P2 — in-turn delivery of recalled memory images
+  // ---------------------------------------------------------------------
+  describe('SA-105 P2 recall media delivery', () => {
+    const PNG_BYTES = Buffer.from('iVBORw0KGgo=', 'base64')
+
+    function recallOutput(media: Array<Record<string, any>>, memoryId = 'mem_maggie') {
+      return {
+        success: true,
+        controlId: 'sys.memory.recall',
+        target: 'sys.memory.recall',
+        ref: 'fabric:sys.memory.recall',
+        family: 'fabric',
+        result: {
+          recalled: [
+            {
+              id: memoryId,
+              lane: 'ltm',
+              gist: 'Maggie the dog',
+              content: 'Maggie is my dog.',
+              ...(media.length ? { media } : {})
+            }
+          ],
+          note: 'Full content above.'
+        }
+      }
+    }
+
+    const oneImage = [
+      { media_id: 'md_1', filename: 'maggie.png', mime_type: 'image/png', bytes: 1024 }
+    ]
+
+    async function brokerUseWith(imageDelivery: any, ephemeralImages?: any) {
+      const { tools } = await nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        agentId: 'agent_1',
+        projectPath: process.cwd(),
+        imageDelivery,
+        ephemeralImages,
+        memoryControlsEnabled: true,
+        providerSettings: { nativeTools: { fabricEnabled: true } },
+        toolApprovalMode: 'none'
+      } as any)
+      return (tools as any).native_batshit_tool_use
+    }
+
+    beforeEach(() => {
+      memoryMediaMocks.loadMemoryMedia.mockReset()
+      memoryMediaMocks.loadMemoryMedia.mockResolvedValue({
+        media: { id: 'md_1', mime_type: 'image/png' },
+        bytes: PNG_BYTES,
+        dataUrl: `data:image/png;base64,${PNG_BYTES.toString('base64')}`,
+        url: '/uploads/memory-media/agent_1/mem_maggie/md_1.png'
+      })
+    })
+
+    it('attaches the recalled image to the same tool result on a tool_result lane', async () => {
+      const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
+      const modelOutput = await brokerUse.toModelOutput({
+        toolCallId: 'call_1',
+        output: recallOutput(oneImage)
+      })
+
+      expect(modelOutput.type).toBe('content')
+      const file = modelOutput.value.find((p: any) => p.type === 'file')
+      expect(file?.mediaType).toBe('image/png')
+      expect(file?.data?.type).toBe('data')
+      expect(file?.data?.data).toBe(PNG_BYTES.toString('base64'))
+
+      // The note the model reads must match what it actually received.
+      const text = modelOutput.value.find((p: any) => p.type === 'text')?.text ?? ''
+      expect(text).toContain('available during THIS reply')
+      expect(text).not.toContain('arrives in your REMEMBERED MEDIA')
+      expect(text).toContain('"delivery": "in_turn"')
+    })
+
+    it('hands images to the synthetic registry, not the tool result, on a text-only lane', async () => {
+      const registry = createEphemeralImageRegistry()
+      const brokerUse = await brokerUseWith(
+        { lane: 'synthetic_user', reason: 'test' },
+        registry
+      )
+      const modelOutput = await brokerUse.toModelOutput({
+        toolCallId: 'call_2',
+        output: recallOutput(oneImage)
+      })
+
+      // A content output here would be JSON.stringify'd into base64 text.
+      expect(modelOutput.type).toBe('text')
+      expect(String(modelOutput.value)).not.toContain(PNG_BYTES.toString('base64'))
+
+      const taken = registry.take('call_2')
+      expect(taken?.source).toBe('sys.memory.recall')
+      expect(taken?.images).toHaveLength(1)
+      expect(taken?.images[0]?.data).toBe(PNG_BYTES.toString('base64'))
+      // take() clears, so a delivery can only be injected once.
+      expect(registry.take('call_2')).toBeUndefined()
+    })
+
+    it('defers to the next message when the model cannot take images at all', async () => {
+      const brokerUse = await brokerUseWith({ lane: 'none', reason: 'model_capabilities_vision_false' })
+      const modelOutput = await brokerUse.toModelOutput({
+        toolCallId: 'call_3',
+        output: recallOutput(oneImage)
+      })
+
+      expect(modelOutput.type).toBe('text')
+      expect(String(modelOutput.value)).toContain('REMEMBERED MEDIA')
+      expect(String(modelOutput.value)).toContain('"delivery": "next_message"')
+      expect(String(modelOutput.value)).toContain('lane_none')
+      expect(memoryMediaMocks.loadMemoryMedia).not.toHaveBeenCalled()
+    })
+
+    it('caps in-turn images at four and explains the overflow', async () => {
+      const six = Array.from({ length: 6 }, (_, i) => ({
+        media_id: `md_${i}`,
+        filename: `img_${i}.png`,
+        mime_type: 'image/png',
+        bytes: 10
+      }))
+      const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
+      const modelOutput = await brokerUse.toModelOutput({
+        toolCallId: 'call_4',
+        output: recallOutput(six)
+      })
+
+      expect(modelOutput.value.filter((p: any) => p.type === 'file')).toHaveLength(4)
+      const text = modelOutput.value.find((p: any) => p.type === 'text')?.text ?? ''
+      expect(text).toContain('over_count')
+    })
+
+    it('defers an unsupported image type instead of sending it', async () => {
+      const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
+      const modelOutput = await brokerUse.toModelOutput({
+        toolCallId: 'call_5',
+        output: recallOutput([
+          { media_id: 'md_svg', filename: 'a.svg', mime_type: 'image/svg+xml', bytes: 10 }
+        ])
+      })
+
+      expect(modelOutput.type).toBe('text')
+      expect(String(modelOutput.value)).toContain('unsupported_mime')
+    })
+
+    it('degrades to a next-message note when the image can no longer be loaded', async () => {
+      // A memory deleted between execute and render must not fail the send.
+      memoryMediaMocks.loadMemoryMedia.mockRejectedValue(new Error('gone'))
+      const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
+      const modelOutput = await brokerUse.toModelOutput({
+        toolCallId: 'call_6',
+        output: recallOutput(oneImage)
+      })
+
+      expect(modelOutput.type).toBe('text')
+      expect(String(modelOutput.value)).toContain('source_unavailable')
+    })
+
+    it('DL-105-13 parity: a recall with no media is untouched on every lane', async () => {
+      const plain = recallOutput([])
+      const before = JSON.stringify(plain)
+
+      for (const lane of ['tool_result', 'synthetic_user', 'none'] as const) {
+        const brokerUse = await brokerUseWith({ lane, reason: 'test' })
+        const modelOutput = await brokerUse.toModelOutput({ toolCallId: 'c', output: plain })
+        expect(modelOutput.type).toBe('text')
+        expect(String(modelOutput.value)).not.toContain('media_note')
+        expect(String(modelOutput.value)).not.toContain('recallMedia')
+      }
+      // The output object itself is never mutated.
+      expect(JSON.stringify(plain)).toBe(before)
+    })
+
+    it('AMD-105-14 guard: the plan stays nested and byte-free at the top level', async () => {
+      const brokerUse = await brokerUseWith({ lane: 'tool_result', reason: 'test' })
+      const modelOutput = await brokerUse.toModelOutput({
+        toolCallId: 'call_7',
+        output: recallOutput(oneImage)
+      })
+      const text = modelOutput.value.find((p: any) => p.type === 'text')?.text ?? ''
+      const json = JSON.parse(text.slice(text.indexOf('{')))
+
+      // send-routed's looksLikeImagePayload sniffs these top-level keys; any of
+      // them would route a recall through the image-zip path by mistake.
+      for (const key of ['data', 'image', 'images', 'base64', 'b64_json']) {
+        expect(json).not.toHaveProperty(key)
+      }
+      expect(json.result.recalled[0].media[0]).toHaveProperty('media_id')
+      // Byte-free: the EV record names the image, it does not carry it.
+      expect(json.recallMedia.inTurn[0]).toEqual({
+        memoryId: 'mem_maggie',
+        mediaId: 'md_1',
+        filename: 'maggie.png',
+        bytes: 1024
+      })
+      expect(JSON.stringify(json)).not.toContain(PNG_BYTES.toString('base64'))
+    })
+  })
+
 })
 
 describe('protected Batshit repo write guardrail', () => {
@@ -7650,5 +7965,6 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
       )
     ).resolves.not.toBe('OUT_OF_SCOPE')
   })
+
 
 })

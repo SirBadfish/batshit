@@ -312,6 +312,7 @@ interface BackupFileAssetBase {
   zipPath: string
   relativePath: string
   byteLength: number
+  groupId: BackupGroupId
 }
 
 interface FilesystemBackupFileAsset extends BackupFileAssetBase {
@@ -1107,6 +1108,7 @@ function rewriteContainerProjectPaths(key: string, value: unknown, targetUserId:
 
 function groupForKey(key: string, userId: string): BackupGroupId {
   if (SYSTEM_PROMPT_KEYS.includes(key as (typeof SYSTEM_PROMPT_KEYS)[number])) return 'prompts'
+  if (key.startsWith('upload:memory-media:')) return 'memory'
   if (
     key === `user:${userId}:settings` ||
     key === `project_prefs:${userId}` ||
@@ -1203,7 +1205,8 @@ function groupForKey(key: string, userId: string): BackupGroupId {
     key.startsWith('memlinger:') ||
     /^session:[^:]+:episodes$/.test(key) ||
     key === 'batshit:memory_config' ||
-    key === 'batshit:memory_index_meta'
+    key === 'batshit:memory_index_meta' ||
+    key === 'batshit:memory_media_migration:v1'
   ) {
     return 'memory'
   }
@@ -1213,7 +1216,11 @@ function groupForKey(key: string, userId: string): BackupGroupId {
 function isRestorableKeyForUser(key: string, userId: string) {
   if (SYSTEM_PROMPT_KEYS.includes(key as (typeof SYSTEM_PROMPT_KEYS)[number])) return true
   if (key === 'system:settings:docker-mcp') return true
-  if (key === 'batshit:memory_config' || key === 'batshit:memory_index_meta') return true
+  if (
+    key === 'batshit:memory_config' ||
+    key === 'batshit:memory_index_meta' ||
+    key === 'batshit:memory_media_migration:v1'
+  ) return true
 
   const exactKeys = new Set([
     `user:${userId}:settings`,
@@ -1407,6 +1414,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     'system:settings:docker-mcp',
     'batshit:memory_config',
     'batshit:memory_index_meta',
+    'batshit:memory_media_migration:v1',
     ...SYSTEM_PROMPT_KEYS
   ]) {
     await addExistingKey(keys, client, key)
@@ -1453,6 +1461,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     await addPatternKeys(keys, client, `memdream:${agentId}:*`)
     await addExistingKey(keys, client, `memdream_index:${agentId}`)
     await addExistingKey(keys, client, `memfold:${agentId}`)
+    await addPatternKeys(keys, client, `upload:memory-media:${agentId}/*`)
   }
 
   for (const subagentId of subagentIds) {
@@ -1726,6 +1735,7 @@ function normalizeUploadRecordForExport(record: BackupRedisRecord): {
     },
     redisBase64Asset: {
       source: 'redis-base64',
+      groupId: record.groupId,
       redisKey: record.key,
       zipPath: `${UPLOAD_FILE_ROOT}${relativePath}`,
       relativePath,
@@ -1768,6 +1778,7 @@ async function collectUploadFileAssets(
     if (!assets.has(relativePath)) {
       assets.set(relativePath, {
         source: 'filesystem',
+        groupId: record.groupId,
         zipPath: `${UPLOAD_FILE_ROOT}${relativePath}`,
         sourcePath,
         relativePath,
@@ -1803,7 +1814,7 @@ function buildManifest(params: {
   includeSecrets: boolean
   records: BackupRedisRecord[]
   redactions: RedactionState
-  fileAssetCount: number
+  fileAssets: BackupFileAsset[]
   fileAssetBytes: number
 }): BackupManifest {
   const groupCounts = new Map<BackupGroupId, { records: number; files: number }>()
@@ -1814,9 +1825,9 @@ function buildManifest(params: {
     const counts = groupCounts.get(record.groupId)
     if (counts) counts.records += 1
   }
-  if (params.fileAssetCount > 0) {
-    const counts = groupCounts.get('clips')
-    if (counts) counts.files += params.fileAssetCount
+  for (const asset of params.fileAssets) {
+    const counts = groupCounts.get(asset.groupId)
+    if (counts) counts.files += 1
   }
 
   return {
@@ -1834,7 +1845,7 @@ function buildManifest(params: {
     },
     contents: {
       redisRecordCount: params.records.length,
-      fileAssetCount: params.fileAssetCount,
+      fileAssetCount: params.fileAssets.length,
       fileAssetBytes: params.fileAssetBytes,
       groups: GROUP_DEFINITIONS.map((group) => {
         const counts = groupCounts.get(group.id) ?? { records: 0, files: 0 }
@@ -1888,7 +1899,7 @@ async function collectBackupBundleParts(userId: string, options?: { includeSecre
     includeSecrets,
     records,
     redactions,
-    fileAssetCount: fileAssets.fileAssetCount,
+    fileAssets: fileAssets.assets,
     fileAssetBytes: fileAssets.fileAssetBytes
   })
   const entries: Record<string, Uint8Array> = {}

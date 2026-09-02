@@ -344,28 +344,81 @@ describe.runIf(memorySearchLaneActive())('memory recall engine (dedicated Redis 
       expect(context.onMyMindBlock).not.toContain('Duplicate standing fact')
     })
 
-    it('references awareness clip media textually instead of attaching bytes', async () => {
+    it('keeps on-recall Awareness media textual and exposes standing media separately', async () => {
       await seedMemory({
         lane: 'awareness',
         content: 'Maggie portrait memory',
-        clip_ids: ['clip_maggie']
+        media: [{
+          id: 'media_maggie',
+          filename: `${AGENT}/mem_placeholder/media_maggie.png`,
+          display_name: 'maggie.png',
+          mime_type: 'image/png',
+          bytes: 123,
+          width: 64,
+          height: 48,
+          token_estimate: 6,
+          sha256: 'a'.repeat(64)
+        }]
       })
       const context = await computeMemoryCompileContext(compileArgs('hi'))
-      expect(context.onMyMindBlock).toContain('has media: 1 clip')
-      expect(context.memoryClipIds).toEqual([])
+      expect(context.onMyMindBlock).toContain('has media: 1 owned image')
+      expect(context.standingMedia).toEqual([])
     })
 
-    it('surfaces clip ids for inserted trigger memories (structured image path)', async () => {
+    it('keeps eligible standing media even when its Awareness text is outside the text budget', async () => {
+      await seedAgent(AGENT, { memory_lane_budgets: { on_my_mind: 8 } })
+      await seedMemory({
+        lane: 'awareness',
+        content: 'The highest-priority Awareness fact consumes the text budget by itself.',
+        importance: 10
+      })
+      const standingMemoryId = await seedMemory({
+        lane: 'awareness',
+        content: 'Lower-priority portrait text is budget-truncated but its standing image remains.',
+        importance: 1,
+        media_mode: 'always',
+        media: [{
+          id: 'media_budget_standing',
+          filename: `${AGENT}/mem_placeholder/media_budget_standing.png`,
+          display_name: 'standing.png',
+          mime_type: 'image/png',
+          bytes: 123,
+          width: 64,
+          height: 48,
+          token_estimate: 6,
+          sha256: 'c'.repeat(64)
+        }]
+      })
+
+      const context = await computeMemoryCompileContext(compileArgs('hi'))
+      expect(context.onMyMindBlock).not.toContain('Lower-priority portrait text')
+      expect(context.standingMedia).toMatchObject([
+        { memoryId: standingMemoryId, media: { id: 'media_budget_standing' } }
+      ])
+    })
+
+    it('surfaces owned media for inserted trigger memories (structured image path)', async () => {
       const memoryId = await seedMemory({
         lane: 'stm',
         content: 'Maggie with her photo',
         trigger_terms: ['maggie'],
-        clip_ids: ['clip_photo_1']
+        media: [{
+          id: 'media_photo_1',
+          filename: `${AGENT}/mem_placeholder/media_photo_1.png`,
+          display_name: 'photo.png',
+          mime_type: 'image/png',
+          bytes: 123,
+          width: 64,
+          height: 48,
+          token_estimate: 6,
+          sha256: 'b'.repeat(64)
+        }]
       })
       const context = await computeMemoryCompileContext(compileArgs('maggie'))
-      expect(context.memoryClipIds).toEqual(['clip_photo_1'])
-      expect(context.memoryClipSources).toEqual({ clip_photo_1: memoryId })
-      expect(context.dcmLines.join('\n')).toContain('media attached below: clip_photo_1')
+      expect(context.rememberedMedia).toMatchObject([
+        { memoryId, media: { id: 'media_photo_1' } }
+      ])
+      expect(context.dcmLines.join('\n')).toContain('1 owned image attached below')
     })
 
     it('SA-109: leaves session clip lines to the general DCM roster', async () => {

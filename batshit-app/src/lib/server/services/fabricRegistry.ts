@@ -1120,8 +1120,9 @@ async function executeRuntimeAddonControl(
 //
 // One shared ops layer (`memory/memoryTools.ts`) serves these handlers AND the inline
 // `<batshit-memory>` save route, so tool saves and inline saves produce identical
-// records. Responses are summary-first references (DL-104-17); `sys.memory.recall`
-// routes content toward the DCM insert channel instead of echoing it here. Broker
+// records. Search is summary-first; recall returns full content in-turn plus a
+// byte-free media plan. Later turns use DCM linger; memory tool results never
+// enter compiled tool history (DL-104-17). Broker
 // exposure is gated per agent (`memory_enabled`) and PRIMARY-only through
 // `resolveBrokerFabricAllowedControlIds` — subagents never receive these refs
 // (subagent memory is a deferred product decision; memory is PA-owned state).
@@ -1232,7 +1233,8 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
         event_at: { type: 'string', description: 'ISO timestamp of when the fact was true (if different from now).' },
         expires_at: { type: 'string', description: 'ISO timestamp when this memory should stop being inserted (it demotes, never erases).' },
         links: { type: 'array', items: { type: 'string' }, description: 'Related memory ids.' },
-        clip_ids: { type: 'array', items: { type: 'string' }, description: 'Clip ids for media-carrying memories.' },
+        clip_ids: { type: 'array', items: { type: 'string' }, description: 'Clip ids to copy into memory-owned images at save time.' },
+        media_mode: { type: 'string', enum: ['on_recall', 'always'], description: 'Image delivery: on_recall (default), or always for Awareness only.' },
         supersedes: { type: 'array', items: { type: 'string' }, description: 'Memory ids this save replaces (they stay visible, flagged superseded).' }
       },
       required: ['lane', 'content']
@@ -1304,7 +1306,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Memory Update',
     description:
-      'Update fields of one memory (content, gist, trigger terms, importance, event/expiry timestamps, links, clips). Content changes re-embed automatically. To change the lane, use sys.memory.move_lane.',
+      'Update fields of one memory (content, gist, trigger terms, importance, event/expiry timestamps, links, memory-owned images). clip_ids replace the owned images with fresh copies. Content changes re-embed automatically. To change the lane, use sys.memory.move_lane.',
     inputSchema: memoryUpdateControlSchema,
     inputSchemaJson: {
       type: 'object',
@@ -1318,7 +1320,8 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
         event_at: { type: ['string', 'null'] },
         expires_at: { type: ['string', 'null'] },
         links: { type: ['array', 'null'], items: { type: 'string' } },
-        clip_ids: { type: ['array', 'null'], items: { type: 'string' } }
+        clip_ids: { type: ['array', 'null'], items: { type: 'string' }, description: 'Clip ids to copy as the new owned image set; null clears images.' },
+        media_mode: { type: ['string', 'null'], enum: ['on_recall', 'always', null], description: 'always is Awareness-only; null resets to on_recall.' }
       },
       required: ['memoryId']
     },
@@ -1406,7 +1409,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Memory Recall',
     description:
-      'Read chosen memories in full: the complete content returns immediately in this tool result (which never enters chat history), and the same memories then ride your Memory context from the next message onward, lingering per the linger settings. Search hits alone are just references; recall is the read.',
+      'Read chosen memories in full: the complete content returns immediately in this tool result (which never enters chat history), and the same memories then ride your Memory context from the next message onward, lingering per the linger settings. Supported API models and Codex CLI receive recalled images during this same reply, either in the tool result or in a follow-up model input within this reply — look at them now. Claude CLI and other deferred images use the next-message REMEMBERED MEDIA path. Each row\'s media_note says which happened. Search hits alone are just references; recall is the read.',
     inputSchema: memoryRecallControlSchema,
     inputSchemaJson: {
       type: 'object',

@@ -243,6 +243,19 @@ vi.mock('$env/dynamic/public', () => ({
   env: {}
 }))
 
+vi.mock('$lib/server/services/memory/memoryMedia', async (importOriginal) => {
+  const original = await importOriginal<typeof import('$lib/server/services/memory/memoryMedia')>()
+  return {
+    ...original,
+    loadMemoryMedia: async (_agentId: string, _memoryId: string, media: Record<string, any>) => ({
+      media,
+      bytes: new Uint8Array([1, 2, 3]),
+      dataUrl: `data:${media.mime_type};base64,AQID`,
+      url: `/uploads/memory-media/${encodeURIComponent(media.filename)}`
+    })
+  }
+})
+
 import { DatabaseService as ServerDatabaseService, invalidateUserSettingsCache as invalidateServerSettingsCache } from './databaseRedis.server'
 import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
 import { buildInterruptedReasoningRecovery } from '$lib/utils/reasoningRecovery'
@@ -1406,6 +1419,84 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
         expect(result.structuredInput?.metadata?.memoryContext).toBeUndefined()
       }
     }
+  })
+
+  it('S18b SA-105 P0b: standing Awareness images occupy the constant head lane only', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    const agent = apiAgent({ memory_enabled: true })
+    state.current.kv.set(`agent:${agent.id}`, { ...agent, user_id: USER_ID })
+    state.current.kv.set(`memory:${agent.id}:mem_portrait`, {
+      id: 'mem_portrait',
+      agent_id: agent.id,
+      user_id: USER_ID,
+      lane: 'awareness',
+      content: 'My standing portrait.',
+      importance: 9,
+      event_at: null,
+      event_ts: null,
+      saved_at: '2026-09-01T12:00:00.000Z',
+      saved_ts: new Date('2026-09-01T12:00:00.000Z').getTime(),
+      is_superseded: 'n',
+      media_mode: 'always',
+      media: [{
+        id: 'media_portrait',
+        filename: `${agent.id}/mem_portrait/media_portrait.png`,
+        display_name: 'portrait.png',
+        mime_type: 'image/png',
+        bytes: 3,
+        width: 56,
+        height: 56,
+        token_estimate: 4,
+        sha256: 'a'.repeat(64)
+      }],
+      provenance: [{ session_id: 'old', source: 'agent' }],
+      visibility: 'normal',
+      embedding: [],
+      embedding_model: 'test',
+      schema_version: 1
+    })
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent,
+      currentUserMessage: 'hello',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    const content = server.structuredInput.messages[0].content
+    expect(Array.isArray(content)).toBe(true)
+    expect(content[0].text).toBe(
+      '==== AWARENESS MEDIA (STANDING) ====\n- portrait.png — image'
+    )
+    expect(content[1]).toEqual({ type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } })
+    expect(content[2].text).toContain('==== PREVIOUS CONVERSATION ====')
+    expect(server.structuredInput.metadata.memoryContext.awarenessMedia).toEqual([
+      {
+        memoryId: 'mem_portrait',
+        mediaId: 'media_portrait',
+        filename: 'portrait.png',
+        bytes: 3,
+        tokenEstimate: 4
+      }
+    ])
+
+    const grouped = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent,
+      currentUserMessage: 'hello group',
+      options: {
+        runtimeFlavor: 'vercel',
+        groupContext: {
+          agentOrder: [agent.id],
+          agentDisplayNames: { [agent.id]: agent.name },
+          currentAgentId: agent.id
+        }
+      }
+    })
+    expect(Array.isArray(grouped.server.structuredInput.messages[0].content)).toBe(false)
+    expect(grouped.server.structuredInput.metadata.standingMediaCount).toBe(0)
   })
 
   it('S19 SA-104 P6 / SA-110: graduation splices apply and the whiteboard rides the DCM, never the system prompt; regular sessions stay untouched', async () => {

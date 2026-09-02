@@ -10,6 +10,7 @@ A Batshit backup is a structured `.zip` file created by the app. It is not a raw
 - Core prompt edits
 - Agents, Subagents, Groups, assignments, and model presets
 - Sessions, folders, messages, zips, clips, and Execution Viewer records
+- Agent memories, graduated history, and memory-owned photos
 - MCP gateways, CLI tools, slash commands, skill metadata, and related settings
 - Artifacts and artifact ordering/runtime data
 - Goons, custom icons, voice profiles, and voice engine registry references

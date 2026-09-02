@@ -1,4 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import {
   memorySearchLaneActive,
   useMemorySearchTestServer
@@ -152,6 +155,65 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
 
     expect(await deleteMemory('agent_test', created.id)).toBe(true)
     expect(await getMemory('agent_test', created.id)).toBeNull()
+  })
+
+  it('refuses always-on media outside the Awareness lane at the storage boundary', async () => {
+    await expect(
+      createMemory(
+        memoryInput({
+          lane: 'ltm',
+          media_mode: 'always',
+          media: [
+            {
+              id: 'media_test',
+              filename: 'agent_test/mem_test/media_test.png',
+              display_name: 'test.png',
+              mime_type: 'image/png',
+              bytes: 3,
+              width: 1,
+              height: 1,
+              token_estimate: 1,
+              sha256: 'a'.repeat(64)
+            }
+          ]
+        }),
+        { embedder: fakeEmbedder }
+      )
+    ).rejects.toThrow(/only valid in the awareness lane/)
+  })
+
+  it('refuses a fifth active standing image at the storage boundary', async () => {
+    const media = (id: string) => ({
+      id,
+      filename: `agent_test/mem_cap/${id}.png`,
+      display_name: `${id}.png`,
+      mime_type: 'image/png' as const,
+      bytes: 3,
+      width: 1,
+      height: 1,
+      token_estimate: 1,
+      sha256: id.padEnd(64, 'a').slice(0, 64)
+    })
+    await createMemory(
+      memoryInput({
+        lane: 'awareness',
+        content: 'Four standing images',
+        media_mode: 'always',
+        media: ['one', 'two', 'three', 'four'].map(media)
+      }),
+      { embedder: fakeEmbedder }
+    )
+    await expect(
+      createMemory(
+        memoryInput({
+          lane: 'awareness',
+          content: 'Fifth standing image',
+          media_mode: 'always',
+          media: [media('five')]
+        }),
+        { embedder: fakeEmbedder }
+      )
+    ).rejects.toThrow(/capped at 4 images/)
   })
 
   it('refuses any write that leaves an stm record without trigger terms (2026-08-28)', async () => {
@@ -581,12 +643,35 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     )
 
     const { redis } = await import('$lib/server/redis')
-    await redis.deleteAgent('agent_test')
+    const previousUploadsDir = process.env.UPLOADS_DIR
+    const uploadRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-memory-agent-delete-'))
+    const mediaFilename = `agent_test/${mine.id}/media_delete.png`
+    const mediaPath = path.join(uploadRoot, 'memory-media', mediaFilename)
+    await mkdir(path.dirname(mediaPath), { recursive: true })
+    await writeFile(mediaPath, 'owned-memory-image')
+    await redis.json.set(`upload:memory-media:${mediaFilename}`, '$', {
+      filename: mediaFilename,
+      uploadType: 'memory-media',
+      storage: 'filesystem',
+      relativePath: `memory-media/${mediaFilename}`,
+      filePath: mediaPath
+    } as never)
+    process.env.UPLOADS_DIR = uploadRoot
 
-    const admin = harness.adminClient()
-    expect(await admin.keys('memory:agent_test:*')).toHaveLength(0)
-    expect(await admin.keys('memseg:agent_test:*')).toHaveLength(0)
-    expect(await getMemory('agent_other', other.id)).not.toBeNull()
-    expect(await getMemory('agent_test', mine.id)).toBeNull()
+    try {
+      await redis.deleteAgent('agent_test')
+
+      const admin = harness.adminClient()
+      expect(await admin.keys('memory:agent_test:*')).toHaveLength(0)
+      expect(await admin.keys('memseg:agent_test:*')).toHaveLength(0)
+      expect(await admin.keys('upload:memory-media:agent_test/*')).toHaveLength(0)
+      await expect(stat(mediaPath)).rejects.toThrow()
+      expect(await getMemory('agent_other', other.id)).not.toBeNull()
+      expect(await getMemory('agent_test', mine.id)).toBeNull()
+    } finally {
+      if (previousUploadsDir === undefined) delete process.env.UPLOADS_DIR
+      else process.env.UPLOADS_DIR = previousUploadsDir
+      await rm(uploadRoot, { recursive: true, force: true })
+    }
   })
 })

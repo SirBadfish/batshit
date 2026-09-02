@@ -334,7 +334,13 @@ async function buildManagedMcpServers(params: {
           scriptPath,
           `--agent=${params.agent.id}`,
           `--user=${params.userId}`,
-          `--url=${resolveCliHelperBatshitBaseUrl()}`
+          `--url=${resolveCliHelperBatshitBaseUrl()}`,
+          // SA-105 P3 (AMD-105-09): the symmetric half of the Codex flag. Claude
+          // Code stores MCP ImageContent as text at 10-20x the token cost
+          // (anthropic/claude-code#31208, closed not-planned), so this runtime
+          // deliberately receives no image blocks — the recall plan says
+          // `next_message` and the note tells the agent so honestly.
+          '--runtime=claude'
         ],
         env: {
           BATSHIT_TOKEN: '${BATSHIT_TOKEN}',

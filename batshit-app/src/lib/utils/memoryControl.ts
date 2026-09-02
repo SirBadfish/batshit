@@ -411,6 +411,8 @@ export interface MemorySavePayload {
   expires_at?: string | null
   links?: string[]
   clip_ids?: string[]
+  /** Awareness-only delivery mode for the memory-owned images created from clip_ids. */
+  media_mode?: 'on_recall' | 'always'
   /** Save-and-replace in one act: ids this new memory supersedes. */
   supersedes?: string[]
   /**
@@ -564,6 +566,16 @@ export function validateMemorySavePayload(raw: unknown): MemorySaveValidation {
   if (!links.ok) return fail(links.error)
   const clipIds = normalizeStringList(payload.clip_ids, 'clip_ids', 8)
   if (!clipIds.ok) return fail(clipIds.error)
+  let mediaMode: 'on_recall' | 'always' | undefined
+  if (payload.media_mode !== undefined && payload.media_mode !== null) {
+    if (payload.media_mode !== 'on_recall' && payload.media_mode !== 'always') {
+      return fail('"media_mode" must be "on_recall" or "always".')
+    }
+    mediaMode = payload.media_mode
+    if (mediaMode === 'always' && lane !== 'awareness') {
+      return fail('"media_mode":"always" is only valid for an awareness memory.')
+    }
+  }
   const supersedes = normalizeStringList(payload.supersedes, 'supersedes', 12)
   if (!supersedes.ok) return fail(supersedes.error)
 
@@ -600,6 +612,7 @@ export function validateMemorySavePayload(raw: unknown): MemorySaveValidation {
       ...(expiresAt.value ? { expires_at: expiresAt.value } : {}),
       ...(links.value ? { links: links.value } : {}),
       ...(clipIds.value ? { clip_ids: clipIds.value } : {}),
+      ...(mediaMode ? { media_mode: mediaMode } : {}),
       ...(supersedes.value ? { supersedes: supersedes.value } : {}),
       ...(linger !== undefined ? { linger } : {})
     }

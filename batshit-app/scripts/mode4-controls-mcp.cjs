@@ -31,6 +31,12 @@ const { Server } = require(path.join(sdkRoot, 'server', 'index.js'))
 const { StdioServerTransport } = require(path.join(sdkRoot, 'server', 'stdio.js'))
 const { CallToolRequestSchema, ListToolsRequestSchema } = require(path.join(sdkRoot, 'types.js'))
 const fetchFn = globalThis.fetch || require('node-fetch')
+const {
+  normalizeCliRuntime,
+  isRecallPayloadWithMedia,
+  buildCallToolContent,
+  attachMediaDeliveryError
+} = require(path.join(__dirname, 'lib', 'cli-tool-result-content.cjs'))
 
 const TOOL_NAMES = {
   fetchZip: 'batshit_server_fetch_zip',
@@ -310,6 +316,15 @@ if (!userId) {
 }
 const agentId = args.agent || args['agent-id'] || process.env.BATSHIT_AGENT_ID || null
 const sessionId = args.session || args['session-id'] || process.env.BATSHIT_SESSION_ID || null
+/**
+ * SA-105 P3 (AMD-105-09): which managed CLI launched this bridge. Both profile
+ * managers pass it explicitly rather than the bridge inferring it, because env
+ * plumbing is structurally different between them (Codex passes an allow-list of
+ * variables to forward; Claude writes a literal env map with `${VAR}`
+ * interpolation), so one argv flag costs one line on each side and is visible in
+ * `ps`. Missing or unrecognised means no in-turn image delivery at all.
+ */
+const cliRuntime = normalizeCliRuntime(args.runtime || process.env.BATSHIT_CLI_RUNTIME)
 const projectPath =
   args['project-path'] ||
   args.projectPath ||
@@ -1046,6 +1061,47 @@ async function callSkillRuntime(rawArgs) {
   return response.body
 }
 
+/**
+ * SA-105 P3 — deliver recalled memory images in THIS turn on the managed CLI
+ * lanes (DL-105-09).
+ *
+ * The control result that just came back is byte-free by design (DL-105-04), so
+ * bytes are fetched here, at delivery time, through one narrow service-token app
+ * route in the same `resolveNativeToolUser` family the bridge already uses
+ * (AMD-105-10). No new transport, no new secret.
+ *
+ * The route — not this bridge — owns the lane decision, the per-image
+ * `delivery`/`reason`, and the per-memory `media_note`, so the CLI lanes and the
+ * API lanes cannot drift into saying different things about the same image. The
+ * bridge stays a pipe: it forwards the plan, splices the finished plan back, and
+ * turns the returned bytes into MCP image blocks.
+ */
+async function deliverRecalledImages(payload) {
+  if (!cliRuntime || !agentId) return { payload, images: [] }
+  if (!isRecallPayloadWithMedia(payload)) return { payload, images: [] }
+
+  const response = await postJson(
+    '/api/memory/recall-media',
+    { userId, agentId, runtime: cliRuntime, recall: payload },
+    60000
+  )
+
+  const body = response.body
+  if (!response.ok || !body || body.success !== true || !body.recall) {
+    // Loud, not silent: the agent is told in its own payload that images it may
+    // be expecting are not attached, instead of receiving an unexplained plan.
+    const message =
+      (body && typeof body.error === 'string' && body.error) ||
+      `delivery request failed with status ${response.status}`
+    return { payload: attachMediaDeliveryError(payload, message), images: [] }
+  }
+
+  return {
+    payload: body.recall,
+    images: Array.isArray(body.images) ? body.images : []
+  }
+}
+
 async function executeTool(name, args) {
   if (name === TOOL_NAMES.fetchZip) return await callFetchZip(args)
   if (name === TOOL_NAMES.batshitToolSearch) return await callBatshitToolSearch(args)
@@ -1084,11 +1140,13 @@ async function main() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const name = request?.params?.name || ''
     const args = request?.params?.arguments || {}
-    const payload = attachZipControlNotice(await executeTool(name, args))
+    const delivery = await deliverRecalledImages(await executeTool(name, args))
+    const payload = attachZipControlNotice(delivery.payload)
 
-    return {
-      content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }]
-    }
+    // `buildCallToolContent` never sets `structuredContent` — Codex drops
+    // `content[]` when it is present (openai/codex#10334), which would delete
+    // both the JSON text and the images.
+    return buildCallToolContent(payload, delivery.images)
   })
 
   const transport = new StdioServerTransport()

@@ -118,7 +118,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected for memory-enabled agents: lanes, inline saves, supersession discipline, and the sys.memory.* operations.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_memory.md',
-    defaultVersion: '2026-09-01'
+    defaultVersion: '2026-09-02c'
   },
   {
     id: 'dynamic_mcp',

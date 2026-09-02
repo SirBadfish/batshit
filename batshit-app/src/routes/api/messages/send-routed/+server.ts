@@ -48,6 +48,7 @@ import {
   buildTokenStat,
   buildTokenUsage,
   buildVercelLlmCapture,
+  sanitizeRuntimeEventLogForCapture,
 } from '$lib/server/services/executionViewerLlmCapture'
 import {
   buildMeasuredMessagePerformance,
@@ -173,6 +174,7 @@ import {
   classifyImageInputUnsupportedRuntimeFailure,
   modelAllowsImageInput,
 } from '$lib/server/services/modelInputCapabilities'
+import { stripEphemeralImagesFromProviderMessages } from '$lib/server/services/toolResultImageDelivery'
 import {
   decrementSessionClipDurations,
   listActiveClipIds,
@@ -1538,73 +1540,26 @@ function buildProviderContinuation(
   return continuation
 }
 
+/**
+ * SA-105 P1 (DL-105-05a, AMD-105-04): keep in-turn image bytes out of persisted
+ * provider context.
+ *
+ * The body now lives in the shared `toolResultImageDelivery` helper, which keys
+ * on PART SHAPE and the ephemeral marker instead of on tool names. The previous
+ * version matched only `native_bash_execute` / `native_agent_browser_use` plus
+ * the deprecated `image-*` part types, and that had two teeth: changing Agent
+ * Browser's output shape without changing this in the same commit would have
+ * silently started persisting screenshot base64, and memory recall — which
+ * arrives as `batshit_tool_use` — would never have matched at all.
+ *
+ * This is the load-bearing boundary, not a nicety: persisted provider messages
+ * are replayed into later provider calls on tool-approval resume and on
+ * context continuation.
+ */
 function sanitizeProviderMessagesForPersistence(
   providerMessages: ModelMessage[],
 ): ModelMessage[] {
-  let hasChanges = false
-
-  const sanitized = providerMessages.map((message) => {
-    if (
-      !message ||
-      typeof message !== 'object' ||
-      !Array.isArray((message as any).content)
-    ) {
-      return message
-    }
-
-    const rawContent = (message as any).content as any[]
-    let messageChanged = false
-    const nextContent = rawContent.map((part) => {
-      if (!part || typeof part !== 'object' || part.type !== 'tool-result') {
-        return part
-      }
-
-      const toolName = typeof part.toolName === 'string' ? part.toolName : null
-      if (
-        !isNativeBashExecuteToolName(toolName) &&
-        !isNativeAgentBrowserUseToolName(toolName)
-      ) {
-        return part
-      }
-
-      const output = part.output
-      const outputParts = Array.isArray(output?.value) ? output.value : null
-      const hasImagePayload =
-        output?.type === 'content' &&
-        Array.isArray(outputParts) &&
-        outputParts.some((entry: any) => {
-          const type = typeof entry?.type === 'string' ? entry.type : ''
-          return (
-            type === 'image-data' ||
-            type === 'image-url' ||
-            type === 'image-file-id'
-          )
-        })
-
-      if (!hasImagePayload) {
-        return part
-      }
-
-      messageChanged = true
-      hasChanges = true
-      return {
-        ...part,
-        output: {
-          type: 'text',
-          value:
-            '[Agent Browser screenshot omitted from persisted provider context after this loop.]',
-        },
-      }
-    })
-
-    if (!messageChanged) return message
-    return {
-      ...message,
-      content: nextContent,
-    } as ModelMessage
-  })
-
-  return hasChanges ? sanitized : providerMessages
+  return stripEphemeralImagesFromProviderMessages(providerMessages)
 }
 
 function normalizeToolResult(
@@ -3918,7 +3873,11 @@ async function handleBatshitAgentStream({
     runtimeSnapshot.error = errorMessage ?? null
 
     if (runtimeEventLogBuffer) {
-      runtimeSnapshot.eventLog = runtimeEventLogBuffer
+      // SA-105 P3: the raw CLI transport trace is persisted, so it gets the same
+      // redaction the LLM captures get. An MCP tool result can now carry image
+      // bytes, and the P3 live probe found a delivered recall photo in a real
+      // execution log with every other boundary already clean.
+      runtimeSnapshot.eventLog = sanitizeRuntimeEventLogForCapture(runtimeEventLogBuffer)
       runtimeSnapshot.eventCount = runtimeEventLogBuffer.length
     }
 
@@ -4918,6 +4877,11 @@ async function handleBatshitAgentStream({
     model: modelId,
     mode4Style: mode4Style ?? undefined,
     connection,
+    // SA-105 P2 (DL-105-06): the saved model's capabilities travel with the run so
+    // the tool-result image lane uses the SAME vision rule as attached clips
+    // rather than inventing a second one. Unknown stays allowed; a genuinely
+    // text-only model then fails loudly through IMAGE_INPUT_UNSUPPORTED.
+    modelCapabilities: capabilities ?? null,
     images: streamImages,
     availableTools: selectedTools?.map((name: string) => ({
       name,

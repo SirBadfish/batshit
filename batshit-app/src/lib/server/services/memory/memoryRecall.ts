@@ -40,7 +40,8 @@ import {
   touchMemoryRecall,
   touchMemorySegmentRecall
 } from './memoryStore'
-import type { MemoryRecord, MemorySegmentRecord } from './memoryTypes'
+import type { MemoryMediaRecord, MemoryRecord, MemorySegmentRecord } from './memoryTypes'
+import { MEMORY_STANDING_MEDIA_CAP } from './memoryMedia'
 import {
   getMemoryLingerState,
   setMemoryLingerState,
@@ -94,6 +95,8 @@ export interface MemorySelection {
   deferredPendingIds: string[]
   moreAvailable: string[]
   onMyMind: {
+    /** Every eligible Awareness record in deterministic compile order, before text-budget truncation. */
+    eligibleEntries: MemoryRecord[]
     entries: MemoryRecord[]
     truncatedCount: number
     tokenEstimate: number
@@ -124,10 +127,10 @@ export interface MemoryCompileContext {
   awarenessPendingDcmLines: string[]
   /** Formatted "Memory context:" lines for the DCM, or [] when there is nothing. */
   dcmLines: string[]
-  /** Clip ids carried by inserted memories, for the structured image path. */
-  memoryClipIds: string[]
-  /** clipId → memoryId, for REMEMBERED MEDIA labeling. */
-  memoryClipSources: Record<string, string>
+  /** Per-send remembered images. Bytes load later from memory-owned uploads. */
+  rememberedMedia: Array<{ memoryId: string; media: MemoryMediaRecord }>
+  /** Constant-byte Awareness images placed at the head of the user message. */
+  standingMedia: Array<{ memoryId: string; media: MemoryMediaRecord }>
   /** Execution Viewer metadata (structuredInput.metadata.memoryContext). */
   memoryContext: Record<string, any> | null
 }
@@ -138,8 +141,8 @@ const EMPTY_CONTEXT: MemoryCompileContext = {
   whiteboardDcmLines: [],
   awarenessPendingDcmLines: [],
   dcmLines: [],
-  memoryClipIds: [],
-  memoryClipSources: {},
+  rememberedMedia: [],
+  standingMedia: [],
   memoryContext: null
 }
 
@@ -276,7 +279,12 @@ export function selectAwarenessState(
   records: MemoryRecord[],
   budgets: MemoryLaneBudgets,
   nowTs: number
-): { entries: MemoryRecord[]; truncatedCount: number; tokenEstimate: number } {
+): {
+  eligibleEntries: MemoryRecord[]
+  entries: MemoryRecord[]
+  truncatedCount: number
+  tokenEstimate: number
+} {
   const awarenessSorted = records
     .filter(
       (record) =>
@@ -294,7 +302,12 @@ export function selectAwarenessState(
     entries.push(record)
     tokenEstimate += cost
   }
-  return { entries, truncatedCount: awarenessSorted.length - entries.length, tokenEstimate }
+  return {
+    eligibleEntries: awarenessSorted,
+    entries,
+    truncatedCount: awarenessSorted.length - entries.length,
+    tokenEstimate
+  }
 }
 
 function selectMemoryInserts(options: {
@@ -474,6 +487,7 @@ function selectMemoryInserts(options: {
     deferredPendingIds,
     moreAvailable,
     onMyMind: {
+      eligibleEntries: awarenessState.eligibleEntries,
       entries: onMyMindEntries,
       truncatedCount: onMyMindTruncated,
       tokenEstimate: onMyMindTokens
@@ -601,9 +615,9 @@ function formatInsertLine(
       `    SUPERSEDED${record.superseded_by ? ` by ${record.superseded_by}` : ''} — prefer the current version.`
     )
   }
-  if (record.clip_ids?.length) {
+  if (record.media?.length) {
     lines.push(
-      `    [media attached below: ${record.clip_ids.join(', ')} — see REMEMBERED MEDIA]`
+      `    [${record.media.length} owned image${record.media.length === 1 ? '' : 's'} attached below — see REMEMBERED MEDIA]`
     )
   }
   return lines
@@ -630,10 +644,18 @@ function formatOnMyMindEntryLines(record: MemoryRecord): string[] {
   if (record.event_at) parts.push(`event ${fmtDate(record.event_at)}`)
   if (record.expires_at) parts.push(`expires ${fmtDate(record.expires_at)}`)
   const lines = [`- [${parts.join(' | ')}] ${record.content}`]
-  if (record.clip_ids?.length) {
-    lines.push(
-      `  (has media: ${record.clip_ids.length} clip${record.clip_ids.length === 1 ? '' : 's'} — recall ${record.id} to view)`
-    )
+  if (record.media?.length) {
+    if (record.media_mode === 'always') {
+      for (const media of record.media) {
+        lines.push(
+          `  image: ${media.display_name} — arrives under AWARENESS MEDIA with every message. Standing awareness, not a new upload; do not mention it unless it matters.`
+        )
+      }
+    } else {
+      lines.push(
+        `  (has media: ${record.media.length} owned image${record.media.length === 1 ? '' : 's'} — recall ${record.id} to view)`
+      )
+    }
   }
   return lines
 }
@@ -790,17 +812,16 @@ function computeAwarenessPending(options: {
     const foldHash = foldHashById.get(record.id)
     if (foldHash === undefined) {
       counts.new += 1
-      entryLines.push(`  - ${ICON_NEW} new ${formatOnMyMindEntryLines(record)[0].replace(/^- /, '')}`)
-      if (record.clip_ids?.length) {
-        entryLines.push(
-          `    (has media: ${record.clip_ids.length} clip${record.clip_ids.length === 1 ? '' : 's'} — recall ${record.id} to view)`
-        )
-      }
+      const [headline, ...details] = formatOnMyMindEntryLines(record)
+      entryLines.push(`  - ${ICON_NEW} new ${headline.replace(/^- /, '')}`)
+      entryLines.push(...details.map((line) => `  ${line}`))
     } else if (foldHash !== awarenessEntryLineHash(record)) {
       counts.updated += 1
+      const [headline, ...details] = formatOnMyMindEntryLines(record)
       entryLines.push(
-        `  - ${ICON_REFRESHED} updated (replaces the AWARENESS version) ${formatOnMyMindEntryLines(record)[0].replace(/^- /, '')}`
+        `  - ${ICON_REFRESHED} updated (replaces the AWARENESS version) ${headline.replace(/^- /, '')}`
       )
+      entryLines.push(...details.map((line) => `  ${line}`))
     }
   }
 
@@ -980,16 +1001,27 @@ export async function computeMemoryCompileContext(options: {
     }
   }
 
-  // Clip media carried by inserted memories rides the structured image path.
-  const memoryClipIds: string[] = []
-  const memoryClipSources: Record<string, string> = {}
+  // Memory-owned recalled media rides the live tail. It never dereferences Clips.
+  const rememberedMedia: Array<{ memoryId: string; media: MemoryMediaRecord }> = []
   for (const candidate of inserted) {
-    for (const clipId of candidate.record.clip_ids ?? []) {
-      if (!memoryClipIds.includes(clipId)) {
-        memoryClipIds.push(clipId)
-        memoryClipSources[clipId] = candidate.record.id
+    for (const media of candidate.record.media ?? []) {
+      if (!rememberedMedia.some((entry) => entry.media.id === media.id)) {
+        rememberedMedia.push({ memoryId: candidate.record.id, media })
       }
     }
+  }
+
+  // Standing media follows the live Awareness order, never the folded snapshot:
+  // superseded/expired/deleted records must disappear immediately.
+  const standingMedia = selection.onMyMind.eligibleEntries.flatMap((record) =>
+    record.media_mode === 'always'
+      ? (record.media ?? []).map((media) => ({ memoryId: record.id, media }))
+      : []
+  )
+  if (standingMedia.length > MEMORY_STANDING_MEDIA_CAP) {
+    throw new Error(
+      `Always-on Awareness media exceeds the ${MEMORY_STANDING_MEDIA_CAP}-image agent cap; fix the records in the Memory panel.`
+    )
   }
 
   // SA-110 P2 (DL-110-05): the SP's AWARENESS block compiles from the stored fold
@@ -1023,8 +1055,8 @@ export async function computeMemoryCompileContext(options: {
     whiteboardDcmLines,
     awarenessPendingDcmLines: awarenessPending.lines,
     dcmLines,
-    memoryClipIds,
-    memoryClipSources,
+    rememberedMedia,
+    standingMedia,
     memoryContext: {
       lingerWindowTurns: lingerWindow,
       recallLingerWindowTurns: recallLingerWindow,
@@ -1044,6 +1076,13 @@ export async function computeMemoryCompileContext(options: {
         truncatedCount: fold ? fold.truncated_count : selection.onMyMind.truncatedCount,
         tokenEstimate: fold ? estimateTokens(fold.block) : selection.onMyMind.tokenEstimate
       },
+      awarenessMedia: standingMedia.map(({ memoryId, media }) => ({
+        memoryId,
+        mediaId: media.id,
+        filename: media.display_name,
+        bytes: media.bytes,
+        tokenEstimate: media.token_estimate
+      })),
       inserts: inserted.map((candidate) => ({
         id: candidate.record.id,
         lane: candidate.record.lane,
@@ -1061,7 +1100,9 @@ export async function computeMemoryCompileContext(options: {
           ? { turnsRemaining: candidate.turnsRemaining }
           : {}),
         ...(candidate.holdEpisode ? { holdEpisode: true } : {}),
-        ...(candidate.record.clip_ids?.length ? { clipIds: candidate.record.clip_ids } : {}),
+        ...(candidate.record.media?.length
+          ? { mediaIds: candidate.record.media.map((media) => media.id) }
+          : {}),
         ...(candidate.record.is_superseded === 'y' ? { superseded: true } : {})
       })),
       moreAvailable: selection.moreAvailable,

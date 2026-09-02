@@ -13,11 +13,30 @@ export const MEMORY_LANES: readonly MemoryLane[] = ['awareness', 'stm', 'ltm']
 
 export type MemorySupersededFlag = 'n' | 'y'
 
+export type MemoryMediaMode = 'on_recall' | 'always'
+
+export interface MemoryMediaRecord {
+  id: string
+  /** Upload-store filename: {agentId}/{memoryId}/{mediaId}.{ext}. */
+  filename: string
+  /** Original user-facing filename where available. */
+  display_name: string
+  mime_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
+  bytes: number
+  width: number
+  height: number
+  token_estimate: number
+  sha256: string
+  /** Provenance only; readers never dereference the source Clip. */
+  source_clip_id?: string
+}
+
 export interface MemoryProvenanceEntry {
   session_id: string
   message_id?: string
   quote?: string
   source: 'agent' | 'user' | 'dreaming'
+  note?: string
   /** Set lazily when the source session no longer exists; recall says "original unavailable". */
   source_deleted?: boolean
 }
@@ -59,8 +78,10 @@ export interface MemoryRecord {
   is_superseded: MemorySupersededFlag
   /** [[links]] to other memory ids — 1-hop expansion in recall. */
   links?: string[]
-  /** Clip ids for media-carrying memories. */
-  clip_ids?: string[]
+  /** Memory-owned images. Clip ids are accepted only as save/update inputs. */
+  media?: MemoryMediaRecord[]
+  /** `always` is valid only on Awareness records and is capped per agent. */
+  media_mode?: MemoryMediaMode
   provenance: MemoryProvenanceEntry[]
   /** Reserved for the deferred Private Reflections feature. */
   visibility: 'normal'

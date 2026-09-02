@@ -109,6 +109,60 @@ function redactDataImageUrlsInString(value: string): string {
   )
 }
 
+/**
+ * SA-105 P1 (DL-105-12): redact in-turn image bytes carried as AI SDK 7 parts.
+ *
+ * The data-URL regex above and the base64 key heuristic below both miss these.
+ * A tool-result image part is `{ type: 'file', mediaType: 'image/png',
+ * data: { type: 'data', data: '<raw base64>' } }` — the base64 has no
+ * `data:image/` prefix, and the key is plain `data`. The same shape is used by
+ * the synthetic user-message parts on text-only lanes, so one structural rule
+ * covers both delivery channels. Without it, every recall or screenshot turn
+ * would write megabytes of base64 into the execution log and the cache
+ * forensics records.
+ */
+function redactImagePartInPlace(node: Record<string, unknown>): boolean {
+  const mediaType = typeof node.mediaType === 'string' ? node.mediaType.toLowerCase() : ''
+
+  // Current shape: a `file` part whose nested data payload holds the bytes.
+  if (node.type === 'file' && mediaType.startsWith('image/')) {
+    const data = node.data
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      const inner = data as Record<string, unknown>
+      if (inner.type === 'data' && typeof inner.data === 'string') {
+        const approxBytes = Math.max(0, Math.floor((inner.data.length * 3) / 4))
+        inner.data = `[redacted ${mediaType || 'image'} bytes (${approxBytes} bytes)]`
+        return true
+      }
+    }
+    return false
+  }
+
+  // Deprecated shims. `ai` converts these before they reach a provider, but a
+  // captured payload can still hold one if a caller has not migrated yet.
+  if (node.type === 'image-data' && typeof node.data === 'string') {
+    const approxBytes = Math.max(0, Math.floor((node.data.length * 3) / 4))
+    node.data = `[redacted ${mediaType || 'image'} bytes (${approxBytes} bytes)]`
+    return true
+  }
+
+  // SA-105 P3: the managed CLI shape. MCP content blocks are
+  // `{ type: 'image', data: '<raw base64>', mimeType: 'image/png' }` — a
+  // different type, a different key for the MIME (`mimeType`, not `mediaType`)
+  // and, like the `file` shape above, base64 with no `data:` prefix under a
+  // plain `data` key. Every existing heuristic here misses it, which is exactly
+  // how a delivered recall photo turned up in a real execution log during the
+  // P3 live probe.
+  if (node.type === 'image' && typeof node.data === 'string') {
+    const mimeType = typeof node.mimeType === 'string' ? node.mimeType.toLowerCase() : ''
+    const approxBytes = Math.max(0, Math.floor((node.data.length * 3) / 4))
+    node.data = `[redacted ${mimeType || mediaType || 'image'} bytes (${approxBytes} bytes)]`
+    return true
+  }
+
+  return false
+}
+
 function sanitizePayloadForCapture<T>(value: T, keyHint?: string): T {
   const seen = new WeakSet<object>()
 
@@ -143,10 +197,31 @@ function sanitizePayloadForCapture<T>(value: T, keyHint?: string): T {
     )) {
       output[childKey] = visit(childValue, childKey)
     }
+    // Applied after the children are copied so the redaction lands on this
+    // capture's own object, never on the live payload being captured.
+    redactImagePartInPlace(output)
     return output
   }
 
   return visit(value, keyHint) as T
+}
+
+/**
+ * SA-105 P3 — sanitize the managed CLI runtimes' RAW transport event trace
+ * before it is persisted into the Execution Viewer snapshot.
+ *
+ * `__rawEvents` is the untouched Codex/Claude event stream, and it was being
+ * stored verbatim. That was invisible until this packet, because nothing in a
+ * CLI event carried image bytes — now an MCP tool result can, and the P3 live
+ * probe found a delivered recall photo sitting in a real execution log even
+ * though every other boundary had stripped it. Running the trace through the
+ * same sanitizer the LLM captures use fixes that and, more usefully, closes the
+ * whole class: data URLs, base64-keyed fields and provider thought signatures
+ * in any future raw event are covered by one rule instead of a new patch each
+ * time.
+ */
+export function sanitizeRuntimeEventLogForCapture<T>(value: T): T {
+  return sanitizePayloadForCapture(value)
 }
 
 export function buildVercelLlmCapture(params: {

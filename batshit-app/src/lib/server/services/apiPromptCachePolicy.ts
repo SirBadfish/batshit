@@ -434,6 +434,42 @@ function annotateLastSystemMessageCacheControl(args: {
   return { messages, applied: true, preserved: false }
 }
 
+const STANDING_MEDIA_HEADER = '==== AWARENESS MEDIA (STANDING) ===='
+
+function annotateLastStandingPartCacheControl(args: {
+  messages: ModelMessage[]
+  provider: 'anthropic'
+  cacheControl: Record<string, any>
+}): { messages: ModelMessage[]; applied: boolean; preserved: boolean } {
+  for (let messageIndex = 0; messageIndex < args.messages.length; messageIndex += 1) {
+    const message = args.messages[messageIndex] as ModelMessage & { content?: unknown[] }
+    if (message?.role !== 'user' || !Array.isArray(message.content)) continue
+    const headerIndex = message.content.findIndex(
+      (part: any) => part?.type === 'text' && part?.text?.startsWith(STANDING_MEDIA_HEADER)
+    )
+    if (headerIndex === -1) continue
+    let lastStandingIndex = headerIndex
+    for (let index = headerIndex + 1; index < message.content.length; index += 1) {
+      const part = message.content[index] as any
+      if (part?.type === 'text') break
+      lastStandingIndex = index
+    }
+    const part = message.content[lastStandingIndex] as any
+    const options = cloneProviderOptions(part?.providerOptions)
+    const providerOptions = getProviderOptionObject(options, args.provider)
+    if (hasCacheControl(providerOptions)) {
+      return { messages: args.messages, applied: false, preserved: true }
+    }
+    providerOptions.cacheControl = { ...args.cacheControl }
+    const content = [...message.content]
+    content[lastStandingIndex] = { ...part, providerOptions: options }
+    const messages = [...args.messages]
+    messages[messageIndex] = { ...message, content } as ModelMessage
+    return { messages, applied: true, preserved: false }
+  }
+  return { messages: args.messages, applied: false, preserved: false }
+}
+
 export function applyApiPromptCachePolicy(
   input: ApiPromptCachePolicyInput,
 ): ApiPromptCachePolicyResult {
@@ -484,6 +520,17 @@ export function applyApiPromptCachePolicy(
       }
     } else {
       preserved.push('anthropic.cacheControl')
+    }
+    const standingAnnotation = annotateLastStandingPartCacheControl({
+      messages,
+      provider: 'anthropic',
+      cacheControl: { type: 'ephemeral' }
+    })
+    messages = standingAnnotation.messages
+    if (standingAnnotation.applied) {
+      applied.push('anthropic.standingMedia.cacheControl')
+    } else if (standingAnnotation.preserved) {
+      preserved.push('anthropic.standingMedia.cacheControl')
     }
   }
 

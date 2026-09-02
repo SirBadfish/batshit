@@ -36,6 +36,60 @@ afterEach(() => {
 })
 
 describe('CodexEventAdapter', () => {
+  it('keeps in-turn image bytes out of the stored MCP tool result (SA-105 P3)', async () => {
+    // The helper bridge now returns MCP image blocks on this runtime so a
+    // recalled memory photo reaches the model in-turn. The model sees it in its
+    // own turn; what Batshit stores becomes an intermediate step, then a zip,
+    // then compiled history — so the bytes must not survive this boundary.
+    const adapter = new CodexEventAdapter({
+      request: buildRequest(),
+      transport: 'sdk'
+    })
+
+    async function* mockEvents() {
+      yield {
+        type: 'item.started',
+        item: {
+          id: 'mcp-1',
+          type: 'mcp_tool_call',
+          server: 'batshit_gateway_managed-codex-mode4-controls',
+          tool: 'batshit_tool_use',
+          arguments: { ref: 'fabric:sys.memory.recall' }
+        }
+      }
+      yield {
+        type: 'item.completed',
+        item: {
+          id: 'mcp-1',
+          type: 'mcp_tool_call',
+          server: 'batshit_gateway_managed-codex-mode4-controls',
+          tool: 'batshit_tool_use',
+          arguments: { ref: 'fabric:sys.memory.recall' },
+          result: {
+            content: [
+              { type: 'text', text: '{"result":{"recalled":[{"id":"mem-1"}]}}' },
+              { type: 'image', data: 'RECALLEDPHOTOBASE64', mimeType: 'image/png' }
+            ]
+          }
+        }
+      }
+      yield { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 5 } }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents()))
+    const toolResult = chunks.find((chunk) => chunk.type === 'tool-result')
+
+    expect(toolResult).toBeDefined()
+    expect(JSON.stringify(toolResult)).not.toContain('RECALLEDPHOTOBASE64')
+    expect(JSON.stringify(adapter.getIntermediateSteps())).not.toContain('RECALLEDPHOTOBASE64')
+
+    // The text half of the result — the recall summary the agent reasons over —
+    // is untouched, and the removed image is explained rather than vanished.
+    const content = (toolResult as any).result.content
+    expect(content[0]).toEqual({ type: 'text', text: '{"result":{"recalled":[{"id":"mem-1"}]}}' })
+    expect(content[1].text).toContain('Image omitted from persisted provider context')
+  })
+
   it('emits thinking chunks for reasoning events', async () => {
     const adapter = new CodexEventAdapter({
       request: buildRequest(),

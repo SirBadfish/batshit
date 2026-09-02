@@ -192,6 +192,29 @@ describe('apiPromptCachePolicy', () => {
     expect((manual.messages[0] as any).providerOptions).toBeUndefined()
   })
 
+  it('adds a second Anthropic breakpoint to the last standing Awareness media part', () => {
+    const result = applyApiPromptCachePolicy({
+      modelId: 'claude-sonnet-4-5',
+      providerId: 'anthropic',
+      connection: { type: 'direct', service: 'anthropic' },
+      messages: [
+        { role: 'system', content: 'stable system' },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '==== AWARENESS MEDIA (STANDING) ====\n- portrait.png — image' },
+            { type: 'image', image: 'data:image/png;base64,AAAA' },
+            { type: 'text', text: '==== CURRENT USER MESSAGE ====\n\nhello' }
+          ]
+        }
+      ] as any
+    })
+
+    expect((result.messages[0] as any).providerOptions.anthropic.cacheControl).toEqual({ type: 'ephemeral' })
+    expect((result.messages[1] as any).content[1].providerOptions.anthropic.cacheControl).toEqual({ type: 'ephemeral' })
+    expect(result.metadata.applied).toContain('anthropic.standingMedia.cacheControl')
+  })
+
   it('enables Vercel AI Gateway automatic caching while preserving provider options', () => {
     const result = applyApiPromptCachePolicy({
       modelId: 'openai/gpt-5.5',

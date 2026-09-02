@@ -28,6 +28,7 @@ import {
   getInternalBatshitServerAuthHeaders,
 } from "./batshitServerUrls";
 import { extractAndStripToolZipControl } from "./toolZipControlNotice";
+import { stripMcpImageContentBlocks } from "./toolResultImageDelivery";
 
 type CodexTransport = "sdk" | "cli";
 const execFileAsync = promisify(execFile);
@@ -1216,7 +1217,15 @@ export class CodexEventAdapter {
         }
       }
     } else if (item.type === "mcp_tool_call") {
-      toolResult = item.result ?? (item.error ? { error: item.error } : null);
+      // SA-105 P3: an MCP result can now carry image content blocks (the helper
+      // bridge delivers recalled memory photos that way on this runtime). The
+      // object below becomes an intermediate step, then a zip, then compiled
+      // history — so the bytes come out here, at the same boundary the API lanes
+      // strip them from `providerMessages`. The model already saw the image in
+      // its own turn; what persists is the note.
+      toolResult = stripMcpImageContentBlocks(
+        item.result ?? (item.error ? { error: item.error } : null),
+      );
 
       const isSubagentCall = hasSubagentToolSegment(tracked.toolName);
       if (isSubagentCall) {

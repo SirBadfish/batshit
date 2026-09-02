@@ -3,6 +3,7 @@ import {
   buildClaudeLlmCapture,
   buildCodexLlmCapture,
   buildVercelLlmCapture,
+  sanitizeRuntimeEventLogForCapture,
 } from '../executionViewerLlmCapture'
 
 describe('executionViewerLlmCapture redaction', () => {
@@ -59,6 +60,90 @@ describe('executionViewerLlmCapture redaction', () => {
     const serialized = JSON.stringify(capture)
     expect(serialized).toContain('redacted image/png data URL')
     expect(serialized).not.toContain(rawBase64)
+  })
+
+  // SA-105 P1 (DL-105-12). In-turn images ride AI SDK 7 `file` parts, whose
+  // base64 has no `data:image/` prefix and sits under a plain `data` key — so
+  // neither the data-URL regex nor the base64 key heuristic above catches it.
+  // Without a structural rule every recall or screenshot turn would write
+  // megabytes of base64 into the execution log and the forensics records.
+  it('redacts tool-result image file parts in Vercel capture payloads', () => {
+    const rawBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
+    const capture = buildVercelLlmCapture({
+      steps: [
+        {
+          request: {
+            body: {
+              messages: [
+                {
+                  role: 'tool',
+                  content: [
+                    {
+                      type: 'tool-result',
+                      toolName: 'batshit_tool_use',
+                      output: {
+                        type: 'content',
+                        value: [
+                          { type: 'text', text: 'Recalled photo.' },
+                          {
+                            type: 'file',
+                            mediaType: 'image/png',
+                            data: { type: 'data', data: rawBase64 },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          response: { id: 'r', modelId: 'm', timestamp: new Date().toISOString(), headers: {} },
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        },
+      ],
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      finalText: 'done',
+    })
+
+    const serialized = JSON.stringify(capture)
+    expect(serialized).not.toContain(rawBase64)
+    expect(serialized).toContain('redacted image/png bytes')
+    // The surrounding structure must survive so the record stays readable.
+    expect(serialized).toContain('Recalled photo.')
+    expect(serialized).toContain('batshit_tool_use')
+  })
+
+  it('redacts marked synthetic user image parts in Vercel capture payloads', () => {
+    const rawBase64 = 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5'
+    const capture = buildVercelLlmCapture({
+      steps: [
+        {
+          request: {
+            body: {
+              messages: [
+                {
+                  role: 'user',
+                  content: [
+                    { type: 'text', text: '[batshit:ephemeral-images] Images returned by sys.memory.recall:' },
+                    { type: 'file', mediaType: 'image/jpeg', data: { type: 'data', data: rawBase64 } },
+                  ],
+                },
+              ],
+            },
+          },
+          response: { id: 'r', modelId: 'm', timestamp: new Date().toISOString(), headers: {} },
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        },
+      ],
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      finalText: 'done',
+    })
+
+    const serialized = JSON.stringify(capture)
+    expect(serialized).not.toContain(rawBase64)
+    expect(serialized).toContain('redacted image/jpeg bytes')
   })
 
   it('redacts provider thought signatures from captured Vercel payloads', () => {
@@ -263,5 +348,63 @@ describe('executionViewerLlmCapture redaction', () => {
     expect(capture.llmCalls[0]?.usage.cachedInputTokens?.value).toBe(120)
     expect(capture.llmCalls[0]?.usage.cacheCreationInputTokens?.value).toBe(30)
     expect(capture.llmCalls[0]?.usage.reasoningTokens?.value).toBe(5)
+  })
+})
+
+describe('sanitizeRuntimeEventLogForCapture (SA-105 P3)', () => {
+  const rawBase64 =
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='
+
+  it('redacts MCP image content blocks in the raw CLI transport trace', () => {
+    // The exact shape the P3 live probe found sitting in a real execution log:
+    // an untouched Codex `item.completed` carrying the delivered recall photo.
+    const events = [
+      {
+        type: 'item.completed',
+        item: {
+          id: 'call_1',
+          type: 'mcp_tool_call',
+          tool: 'batshit_tool_use',
+          result: {
+            content: [
+              { type: 'text', text: '{"result":{"recalled":[]}}' },
+              { type: 'image', data: rawBase64, mimeType: 'image/png' },
+            ],
+          },
+        },
+      },
+    ]
+
+    const sanitized = sanitizeRuntimeEventLogForCapture(events)
+    const serialized = JSON.stringify(sanitized)
+
+    expect(serialized).not.toContain(rawBase64)
+    expect(serialized).toContain('[redacted image/png bytes')
+    // Everything else in the trace survives — this is a redaction, not a drop.
+    expect(sanitized[0].item.result.content[0]).toEqual({
+      type: 'text',
+      text: '{"result":{"recalled":[]}}',
+    })
+    expect(sanitized[0].item.tool).toBe('batshit_tool_use')
+  })
+
+  it('does not mutate the live event array it was handed', () => {
+    const events = [
+      { item: { result: { content: [{ type: 'image', data: rawBase64, mimeType: 'image/png' }] } } },
+    ]
+    sanitizeRuntimeEventLogForCapture(events)
+    expect(events[0].item.result.content[0].data).toBe(rawBase64)
+  })
+
+  it('still covers the older shapes any raw event could carry', () => {
+    const sanitized = sanitizeRuntimeEventLogForCapture([
+      { note: `inline data:image/png;base64,${rawBase64}` },
+      { base64: rawBase64 },
+    ])
+    const serialized = JSON.stringify(sanitized)
+
+    expect(serialized).not.toContain(rawBase64)
+    expect(serialized).toContain('[redacted image/png data URL')
+    expect(serialized).toContain('[redacted base64 payload')
   })
 })

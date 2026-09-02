@@ -19,6 +19,8 @@ import {
   MEMORY_LANES,
   MEMORY_SCHEMA_VERSION,
   type MemoryLane,
+  type MemoryMediaMode,
+  type MemoryMediaRecord,
   type MemoryProvenanceEntry,
   type MemoryRecord,
   type MemorySegmentRecord,
@@ -26,14 +28,50 @@ import {
 } from './memoryTypes'
 import { createMemoryEmbedder, type MemoryEmbedder } from './memoryEmbedder'
 import { getMemoryConfig, requireReadyMemoryIndexes } from './memoryIndex'
+import { deleteMemoryMedia, MEMORY_STANDING_MEDIA_CAP } from './memoryMedia'
 
 function randomIdSuffix(): string {
   return Math.random().toString(36).slice(2, 8)
 }
 
+export function createMemoryId(nowTs = Date.now()): string {
+  return `mem_${nowTs}_${randomIdSuffix()}`
+}
+
 function nowStamps(): { iso: string; ts: number } {
   const now = new Date()
   return { iso: now.toISOString(), ts: now.getTime() }
+}
+
+function activeStandingMediaCount(records: MemoryRecord[], excludeMemoryId?: string): number {
+  const nowTs = Date.now()
+  return records
+    .filter(
+      (record) =>
+        record.id !== excludeMemoryId &&
+        record.lane === 'awareness' &&
+        record.media_mode === 'always' &&
+        record.is_superseded !== 'y' &&
+        !(typeof record.expires_ts === 'number' && record.expires_ts <= nowTs)
+    )
+    .reduce((sum, record) => sum + (record.media?.length ?? 0), 0)
+}
+
+async function assertStoreStandingMediaCapacity(options: {
+  agentId: string
+  media: MemoryMediaRecord[] | undefined
+  mediaMode: MemoryMediaMode | undefined
+  excludeMemoryId?: string
+}): Promise<void> {
+  if (options.mediaMode !== 'always' || !options.media?.length) return
+  const count =
+    activeStandingMediaCount(await listMemories(options.agentId), options.excludeMemoryId) +
+    options.media.length
+  if (count > MEMORY_STANDING_MEDIA_CAP) {
+    throw new Error(
+      `Always-on Awareness media is capped at ${MEMORY_STANDING_MEDIA_CAP} images per agent; this change would make ${count}.`
+    )
+  }
 }
 
 /** Batch contexts (graduation, dreaming, tests) may supply one embedder for many writes. */
@@ -77,6 +115,7 @@ function assertLingerOverride(value: number | 'episode'): void {
 }
 
 export interface CreateMemoryInput {
+  id?: string
   agent_id: string
   user_id: string
   lane: MemoryLane
@@ -90,7 +129,8 @@ export interface CreateMemoryInput {
   event_at?: string | null
   expires_at?: string | null
   links?: string[]
-  clip_ids?: string[]
+  media?: MemoryMediaRecord[]
+  media_mode?: MemoryMediaMode
   provenance: MemoryProvenanceEntry[]
 }
 
@@ -100,6 +140,16 @@ export async function createMemory(
 ): Promise<MemoryRecord> {
   assertLane(input.lane)
   assertImportance(input.importance)
+  if (
+    input.media_mode !== undefined &&
+    input.media_mode !== 'on_recall' &&
+    input.media_mode !== 'always'
+  ) {
+    throw new Error('Memory media_mode must be "on_recall" or "always".')
+  }
+  if (input.media_mode === 'always' && input.lane !== 'awareness') {
+    throw new Error('Always-on memory media is only valid in the awareness lane.')
+  }
   if (input.linger_override !== undefined) assertLingerOverride(input.linger_override)
   if (!input.agent_id?.trim()) throw new Error('Memory records require agent_id.')
   if (!input.user_id?.trim()) throw new Error('Memory records require user_id.')
@@ -107,6 +157,11 @@ export async function createMemory(
   if (!Array.isArray(input.provenance) || input.provenance.length === 0) {
     throw new Error('Memory records require at least one provenance entry (DL-104-08).')
   }
+  await assertStoreStandingMediaCapacity({
+    agentId: input.agent_id,
+    media: input.media,
+    mediaMode: input.media_mode
+  })
 
   const embedder = await resolveWriteEmbedder(options?.embedder)
   const [embedding] = await embedder.embedDocuments([input.content])
@@ -123,7 +178,7 @@ export async function createMemory(
   }
 
   const record: MemoryRecord = {
-    id: `mem_${ts}_${randomIdSuffix()}`,
+    id: input.id ?? createMemoryId(ts),
     agent_id: input.agent_id,
     user_id: input.user_id,
     lane: input.lane,
@@ -140,7 +195,8 @@ export async function createMemory(
     ...(expiresAt ? { expires_at: expiresAt, expires_ts: expiresTs } : {}),
     is_superseded: 'n',
     ...(input.links?.length ? { links: input.links } : {}),
-    ...(input.clip_ids?.length ? { clip_ids: input.clip_ids } : {}),
+    ...(input.media?.length ? { media: input.media } : {}),
+    ...(input.media?.length ? { media_mode: input.media_mode ?? 'on_recall' } : {}),
     provenance: input.provenance,
     visibility: 'normal',
     embedding,
@@ -193,7 +249,8 @@ export interface UpdateMemoryInput {
   event_at?: string | null
   expires_at?: string | null
   links?: string[] | null
-  clip_ids?: string[] | null
+  media?: MemoryMediaRecord[] | null
+  media_mode?: MemoryMediaMode | null
 }
 
 export async function updateMemory(
@@ -207,6 +264,14 @@ export async function updateMemory(
 
   if (updates.lane !== undefined) assertLane(updates.lane)
   if (updates.importance !== undefined) assertImportance(updates.importance)
+  if (
+    updates.media_mode !== undefined &&
+    updates.media_mode !== null &&
+    updates.media_mode !== 'on_recall' &&
+    updates.media_mode !== 'always'
+  ) {
+    throw new Error('Memory media_mode must be "on_recall" or "always".')
+  }
   if (updates.content !== undefined && !updates.content.trim()) {
     throw new Error('Memory content cannot be updated to empty; delete the memory explicitly instead.')
   }
@@ -258,10 +323,29 @@ export async function updateMemory(
     if (updates.links === null || updates.links.length === 0) delete next.links
     else next.links = updates.links
   }
-  if (updates.clip_ids !== undefined) {
-    if (updates.clip_ids === null || updates.clip_ids.length === 0) delete next.clip_ids
-    else next.clip_ids = updates.clip_ids
+  if (updates.media !== undefined) {
+    if (updates.media === null || updates.media.length === 0) {
+      delete next.media
+      delete next.media_mode
+    } else {
+      next.media = updates.media
+      next.media_mode ??= 'on_recall'
+    }
   }
+  if (updates.media_mode !== undefined) {
+    if (updates.media_mode === null) next.media_mode = 'on_recall'
+    else next.media_mode = updates.media_mode
+  }
+
+  if (next.media_mode === 'always' && next.lane !== 'awareness') {
+    throw new Error('Always-on memory media is only valid in the awareness lane.')
+  }
+  await assertStoreStandingMediaCapacity({
+    agentId,
+    media: next.media,
+    mediaMode: next.media_mode,
+    excludeMemoryId: memoryId
+  })
 
   // A Trigger Memory without trigger words can never fire — refuse the dead state
   // loudly instead of storing it (2026-08-28; matches save + move_lane validation).
@@ -285,10 +369,15 @@ export async function updateMemory(
 
 /** The only true delete (DL-104-02) — explicit user/agent action, never housekeeping. */
 export async function deleteMemory(agentId: string, memoryId: string): Promise<boolean> {
-  return redis.execute(async (client) => {
-    const removed = await client.del(memoryKey(agentId, memoryId))
-    return removed > 0
-  })
+  const record = await getMemory(agentId, memoryId)
+  if (!record) return false
+  const removed = await redis.execute(async (client) => client.del(memoryKey(agentId, memoryId)))
+  if (removed > 0) {
+    for (const media of record.media ?? []) {
+      await deleteMemoryMedia(media)
+    }
+  }
+  return removed > 0
 }
 
 // ---------------------------------------------------------------------------

@@ -30,6 +30,13 @@ import { createMemoryEmbedder } from './memoryEmbedder'
 import { awarenessEntryLineHash, getMemoryFold } from './memoryRecall'
 import { refoldAwarenessAfterDelete, toMemorySummary, type MemorySummary } from './memoryTools'
 import type { MemoryLane, MemoryRecord, MemorySegmentRecord } from './memoryTypes'
+import type { MemoryMediaMode, MemoryMediaRecord } from './memoryTypes'
+import {
+  deleteMemoryMedia,
+  loadMemoryMedia,
+  saveMemoryMediaBytes
+} from './memoryMedia'
+import { assertStandingMediaCapacity } from './memoryTools'
 import { MEMORY_LANES } from './memoryTypes'
 
 export class MemoryManageError extends Error {
@@ -170,6 +177,7 @@ export async function searchManagedMemories(
 
 export interface MemoryManageDetail {
   record: MemoryRecordView
+  standingMediaCount: number
   chain: {
     predecessors: MemorySummary[]
     successors: MemorySummary[]
@@ -188,8 +196,19 @@ export async function getManagedMemoryDetail(
     throw new MemoryManageError(`Memory "${normalized}" was not found for this agent.`, 404)
   }
   const chain = await getSupersessionChain(context.agentId, normalized)
+  const allRecords = await listMemories(context.agentId)
+  const standingMediaCount = allRecords
+    .filter(
+      (entry) =>
+        entry.lane === 'awareness' &&
+        entry.media_mode === 'always' &&
+        entry.is_superseded !== 'y' &&
+        !(typeof entry.expires_ts === 'number' && entry.expires_ts <= Date.now())
+    )
+    .reduce((sum, entry) => sum + (entry.media?.length ?? 0), 0)
   return {
     record: toRecordView(record),
+    standingMediaCount,
     chain: {
       predecessors: chain.predecessors.map(toMemorySummary),
       successors: chain.successors.map(toMemorySummary)
@@ -208,11 +227,105 @@ export async function updateManagedMemory(
   if (!updates || Object.keys(updates).length === 0) {
     throw new MemoryManageError('At least one field to update is required.', 400)
   }
+  const existing = await getMemory(context.agentId, normalized)
+  if (!existing) throw new MemoryManageError(`Memory "${normalized}" was not found for this agent.`, 404)
+  if (updates.media_mode !== undefined || updates.lane !== undefined) {
+    const mode = (updates.media_mode ?? existing.media_mode ?? 'on_recall') as MemoryMediaMode
+    if (mode !== 'on_recall' && mode !== 'always') {
+      throw new MemoryManageError('media_mode must be "on_recall" or "always".', 400)
+    }
+    const lane = updates.lane ?? existing.lane
+    if (mode === 'always' && lane !== 'awareness') {
+      throw new MemoryManageError(
+        'Turn off "Show this image every message" before moving this memory out of Awareness.',
+        400
+      )
+    }
+    try {
+      await assertStandingMediaCapacity({
+        agentId: context.agentId,
+        mode,
+        mediaCount: existing.media?.length ?? 0,
+        excludeMemoryId: existing.id
+      })
+    } catch (error) {
+      throw new MemoryManageError(error instanceof Error ? error.message : 'Standing media cap exceeded.', 400)
+    }
+  }
   const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
   const record = await updateMemory(context.agentId, normalized, updates, { embedder })
   return toRecordView(record)
+}
+
+function requireOwnedMedia(record: MemoryRecord, mediaId: string): MemoryMediaRecord {
+  const media = record.media?.find((entry) => entry.id === mediaId)
+  if (!media) throw new MemoryManageError(`Memory image "${mediaId}" was not found.`, 404)
+  return media
+}
+
+export async function loadManagedMemoryMedia(
+  context: MemoryManageContext,
+  memoryId: string,
+  mediaId: string
+) {
+  await requireOwnedAgent(context.userId, context.agentId)
+  const record = await getMemory(context.agentId, memoryId)
+  if (!record) throw new MemoryManageError(`Memory "${memoryId}" was not found for this agent.`, 404)
+  return loadMemoryMedia(context.agentId, memoryId, requireOwnedMedia(record, mediaId))
+}
+
+export async function replaceManagedMemoryMedia(
+  context: MemoryManageContext,
+  memoryId: string,
+  mediaId: string,
+  input: { bytes: Uint8Array; mimeType: string; filename?: string }
+): Promise<MemoryRecordView> {
+  await requireOwnedAgent(context.userId, context.agentId)
+  const record = await getMemory(context.agentId, memoryId)
+  if (!record) throw new MemoryManageError(`Memory "${memoryId}" was not found for this agent.`, 404)
+  const oldMedia = requireOwnedMedia(record, mediaId)
+  let replacement: MemoryMediaRecord
+  try {
+    replacement = await saveMemoryMediaBytes({
+      agentId: context.agentId,
+      memoryId,
+      bytes: input.bytes,
+      mimeType: input.mimeType,
+      filename: input.filename,
+      source: { kind: 'upload', label: 'memory-panel-replacement' }
+    })
+  } catch (error) {
+    throw new MemoryManageError(error instanceof Error ? error.message : 'Replacement image failed.', 400)
+  }
+  const media = (record.media ?? []).map((entry) => (entry.id === mediaId ? replacement : entry))
+  let updated: MemoryRecord
+  try {
+    updated = await updateMemory(context.agentId, memoryId, { media })
+  } catch (error) {
+    await deleteMemoryMedia(replacement).catch(() => {})
+    throw error
+  }
+  // The memory now owns the replacement. A failure cleaning the retired file
+  // must never delete the replacement and leave the committed record dangling.
+  await deleteMemoryMedia(oldMedia)
+  return toRecordView(updated)
+}
+
+export async function deleteManagedMemoryMedia(
+  context: MemoryManageContext,
+  memoryId: string,
+  mediaId: string
+): Promise<MemoryRecordView> {
+  await requireOwnedAgent(context.userId, context.agentId)
+  const record = await getMemory(context.agentId, memoryId)
+  if (!record) throw new MemoryManageError(`Memory "${memoryId}" was not found for this agent.`, 404)
+  const oldMedia = requireOwnedMedia(record, mediaId)
+  const media = (record.media ?? []).filter((entry) => entry.id !== mediaId)
+  const updated = await updateMemory(context.agentId, memoryId, { media })
+  await deleteMemoryMedia(oldMedia)
+  return toRecordView(updated)
 }
 
 export async function deleteManagedMemory(

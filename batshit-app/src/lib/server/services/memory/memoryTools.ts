@@ -23,6 +23,7 @@ import {
 } from '$lib/utils/memoryControl'
 import {
   createMemory,
+  createMemoryId,
   deleteMemory,
   fetchMemoriesByKeys,
   fetchMemorySegmentsByIds,
@@ -36,7 +37,13 @@ import {
   updateMemory,
   type UpdateMemoryInput
 } from './memoryStore'
-import type { MemoryLane, MemoryRecord, MemorySegmentRecord } from './memoryTypes'
+import type {
+  MemoryLane,
+  MemoryMediaMode,
+  MemoryMediaRecord,
+  MemoryRecord,
+  MemorySegmentRecord
+} from './memoryTypes'
 import { MEMORY_LANES } from './memoryTypes'
 import { createMemoryEmbedder } from './memoryEmbedder'
 import {
@@ -58,6 +65,12 @@ import {
   type EpisodeRecord
 } from './memoryEpisodes'
 import { isFixedSession } from '$lib/utils/fixedSession'
+import {
+  copyClipToMemoryMedia,
+  deleteMemoryMedia,
+  MEMORY_STANDING_MEDIA_CAP,
+  MemoryMediaError
+} from './memoryMedia'
 
 /** Cosine-distance ceiling for the dedup-on-save assist (records ≤ this are "near"). */
 export const MEMORY_NEAR_DUPLICATE_MAX_DISTANCE = 0.1
@@ -126,7 +139,8 @@ export interface MemorySummary {
   /** Per-memory linger override (turns or 'episode'), when set. */
   linger_override?: number | 'episode'
   links?: string[]
-  clip_count?: number
+  media_count?: number
+  media_mode?: MemoryMediaMode
   last_recalled_at?: string | null
   /** P4 1-hop link expansion: set when this row rode in via another result's [[links]]. */
   linked_from?: string
@@ -153,7 +167,8 @@ export function toMemorySummary(record: MemoryRecord): MemorySummary {
     ...(record.trigger_terms?.length ? { trigger_terms: record.trigger_terms } : {}),
     ...(record.linger_override !== undefined ? { linger_override: record.linger_override } : {}),
     ...(record.links?.length ? { links: record.links } : {}),
-    ...(record.clip_ids?.length ? { clip_count: record.clip_ids.length } : {}),
+    ...(record.media?.length ? { media_count: record.media.length } : {}),
+    ...(record.media?.length ? { media_mode: record.media_mode ?? 'on_recall' } : {}),
     ...(record.last_recalled_at ? { last_recalled_at: record.last_recalled_at } : {})
   }
 }
@@ -204,6 +219,67 @@ export interface MemorySaveContext extends MemoryToolContext {
   messageId?: string | null
 }
 
+function memoryIsExpired(record: MemoryRecord, nowTs = Date.now()): boolean {
+  return typeof record.expires_ts === 'number' && record.expires_ts <= nowTs
+}
+
+export async function assertStandingMediaCapacity(options: {
+  agentId: string
+  mode: MemoryMediaMode
+  mediaCount: number
+  excludeMemoryId?: string
+}): Promise<void> {
+  if (options.mode !== 'always' || options.mediaCount === 0) return
+  const records = await listMemories(options.agentId)
+  const existingCount = records
+    .filter(
+      (record) =>
+        record.id !== options.excludeMemoryId &&
+        record.lane === 'awareness' &&
+        record.media_mode === 'always' &&
+        record.is_superseded !== 'y' &&
+        !memoryIsExpired(record)
+    )
+    .reduce((sum, record) => sum + (record.media?.length ?? 0), 0)
+  if (existingCount + options.mediaCount > MEMORY_STANDING_MEDIA_CAP) {
+    throw new MemoryToolError(
+      `Always-on Awareness media is capped at ${MEMORY_STANDING_MEDIA_CAP} images per agent; this change would make ${existingCount + options.mediaCount}.`,
+      'Turn off "Show this image every message" for another Awareness memory, or keep this image on recall.'
+    )
+  }
+}
+
+async function copyClipInputs(options: {
+  userId: string
+  agentId: string
+  memoryId: string
+  clipIds: string[]
+}): Promise<MemoryMediaRecord[]> {
+  const copied: MemoryMediaRecord[] = []
+  try {
+    for (const clipId of options.clipIds) {
+      copied.push(
+        await copyClipToMemoryMedia({
+          userId: options.userId,
+          agentId: options.agentId,
+          memoryId: options.memoryId,
+          clipId
+        })
+      )
+    }
+    return copied
+  } catch (error) {
+    for (const media of copied) await deleteMemoryMedia(media).catch(() => {})
+    if (error instanceof MemoryMediaError) {
+      throw new MemoryToolError(
+        `Memory media could not be copied: ${error.message}`,
+        'Attach an existing JPEG, PNG, GIF, or WebP Clip and retry the memory save.'
+      )
+    }
+    throw error
+  }
+}
+
 /**
  * The single save path (tool + inline). Validates through the shared payload contract,
  * writes through the data layer, chains save-time supersession, and surfaces
@@ -250,30 +326,59 @@ export async function saveMemoryOp(
     userId: context.userId
   })
 
-  const record = await createMemory(
-    {
-      agent_id: context.agentId,
-      user_id: context.userId,
-      lane: payload.lane,
-      content: payload.content,
-      gist: payload.gist,
-      trigger_terms: payload.trigger_terms,
-      linger_override: payload.linger,
-      importance: payload.importance,
-      event_at: payload.event_at ?? null,
-      expires_at: payload.expires_at ?? null,
-      links: payload.links,
-      clip_ids: payload.clip_ids,
-      provenance: [
-        {
-          session_id: sessionId,
-          ...(context.messageId ? { message_id: context.messageId } : {}),
-          source: 'agent'
-        }
-      ]
-    },
-    { embedder }
-  )
+  const memoryId = createMemoryId()
+  const mediaMode = payload.media_mode ?? 'on_recall'
+  const media = payload.clip_ids?.length
+    ? await copyClipInputs({
+        userId: context.userId,
+        agentId: context.agentId,
+        memoryId,
+        clipIds: payload.clip_ids
+      })
+    : []
+  try {
+    await assertStandingMediaCapacity({
+      agentId: context.agentId,
+      mode: mediaMode,
+      mediaCount: media.length
+    })
+  } catch (error) {
+    for (const item of media) await deleteMemoryMedia(item).catch(() => {})
+    throw error
+  }
+
+  let record: MemoryRecord
+  try {
+    record = await createMemory(
+      {
+        id: memoryId,
+        agent_id: context.agentId,
+        user_id: context.userId,
+        lane: payload.lane,
+        content: payload.content,
+        gist: payload.gist,
+        trigger_terms: payload.trigger_terms,
+        linger_override: payload.linger,
+        importance: payload.importance,
+        event_at: payload.event_at ?? null,
+        expires_at: payload.expires_at ?? null,
+        links: payload.links,
+        media,
+        media_mode: mediaMode,
+        provenance: [
+          {
+            session_id: sessionId,
+            ...(context.messageId ? { message_id: context.messageId } : {}),
+            source: 'agent'
+          }
+        ]
+      },
+      { embedder }
+    )
+  } catch (error) {
+    for (const item of media) await deleteMemoryMedia(item).catch(() => {})
+    throw error
+  }
 
   let superseded: string[] | undefined
   if (payload.supersedes?.length) {
@@ -557,6 +662,7 @@ export interface MemoryUpdateInput {
   expires_at?: string | null
   links?: string[] | null
   clip_ids?: string[] | null
+  media_mode?: MemoryMediaMode | null
 }
 
 export async function updateMemoryOp(
@@ -564,6 +670,16 @@ export async function updateMemoryOp(
   input: MemoryUpdateInput
 ): Promise<{ updated: MemorySummary }> {
   await requireMemoryEnabledAgent(context.userId, context.agentId)
+  const existing = await getMemory(context.agentId, input.memoryId)
+  if (!existing) throw new MemoryToolError(`Memory "${input.memoryId}" was not found for this agent.`)
+  if (
+    input.media_mode !== undefined &&
+    input.media_mode !== null &&
+    input.media_mode !== 'on_recall' &&
+    input.media_mode !== 'always'
+  ) {
+    throw new MemoryToolError('media_mode must be "on_recall" or "always".')
+  }
   const updates: UpdateMemoryInput = {}
   if (input.content !== undefined) updates.content = input.content
   if (input.gist !== undefined) updates.gist = input.gist
@@ -574,14 +690,53 @@ export async function updateMemoryOp(
   if (input.event_at !== undefined) updates.event_at = input.event_at
   if (input.expires_at !== undefined) updates.expires_at = input.expires_at
   if (input.links !== undefined) updates.links = input.links
-  if (input.clip_ids !== undefined) updates.clip_ids = input.clip_ids
+  let replacementMedia: MemoryMediaRecord[] | null | undefined
+  if (input.clip_ids !== undefined) {
+    replacementMedia = input.clip_ids?.length
+      ? await copyClipInputs({
+          userId: context.userId,
+          agentId: context.agentId,
+          memoryId: input.memoryId,
+          clipIds: input.clip_ids
+        })
+      : null
+    updates.media = replacementMedia
+  }
+  if (input.media_mode !== undefined) updates.media_mode = input.media_mode
   if (Object.keys(updates).length === 0) {
+    for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
     throw new MemoryToolError('Memory update needs at least one field to change.')
+  }
+  const nextMode = input.media_mode === null ? 'on_recall' : input.media_mode ?? existing.media_mode ?? 'on_recall'
+  const nextMedia = replacementMedia === undefined ? existing.media ?? [] : replacementMedia ?? []
+  if (nextMode === 'always' && existing.lane !== 'awareness') {
+    for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
+    throw new MemoryToolError('Always-on media is only valid for an awareness memory.')
+  }
+  try {
+    await assertStandingMediaCapacity({
+      agentId: context.agentId,
+      mode: nextMode,
+      mediaCount: nextMedia.length,
+      excludeMemoryId: existing.id
+    })
+  } catch (error) {
+    for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
+    throw error
   }
   const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
-  const record = await updateMemory(context.agentId, input.memoryId, updates, { embedder })
+  let record: MemoryRecord
+  try {
+    record = await updateMemory(context.agentId, input.memoryId, updates, { embedder })
+  } catch (error) {
+    for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
+    throw error
+  }
+  if (replacementMedia !== undefined) {
+    for (const item of existing.media ?? []) await deleteMemoryMedia(item)
+  }
   return { updated: toMemorySummary(record) }
 }
 
@@ -602,6 +757,11 @@ export async function moveMemoryLaneOp(
   if (lane === 'stm' && !existing.trigger_terms?.length) {
     throw new MemoryToolError(
       'Moving a memory to stm requires trigger terms. Update the memory with trigger_terms first (or in the same update call).'
+    )
+  }
+  if (lane !== 'awareness' && existing.media_mode === 'always') {
+    throw new MemoryToolError(
+      'Turn off always-on media before moving this memory out of the awareness lane.'
     )
   }
   const record = await updateMemory(context.agentId, input.memoryId, { lane })
@@ -681,15 +841,32 @@ export interface MemoryRecallResult {
    * costs context only in the turn that asked; persistence across later turns
    * stays exclusively the DCM linger channel the queue below arms.
    */
-  recalled: Array<MemorySummary & { content: string; media_note?: string }>
+  recalled: Array<
+    MemorySummary & {
+      content: string
+      /**
+       * SA-105 P2: byte-free media plan. `delivery`/`reason`/`media_note` are
+       * filled in at render time, where the run's lane is known.
+       */
+      media?: Array<{
+        media_id: string
+        filename: string
+        mime_type: string
+        bytes: number
+        delivery?: 'in_turn' | 'next_message'
+        reason?: string
+      }>
+      media_note?: string
+    }
+  >
   recalledSegments?: Array<MemorySegmentSummary & { summary: string }>
   note: string
 }
 
 /**
- * DL-104-17: recall routes chosen memories toward the single DCM insert channel instead
- * of echoing content in the tool result. P3 queues the ids (`memlinger:{sessionId}`) and
- * bumps recall-refresh; the P4 recall engine performs the actual DCM insertion.
+ * Recall returns full content in-turn and queues ids (`memlinger:{sessionId}`)
+ * for the single DCM insert channel on later sends. DL-104-17 keeps memory tool
+ * results out of compiled history; linger owns their cross-turn persistence.
  * P6: graduated segment ids (`memseg_…`, from search's segments group) recall through
  * the same queue and channel — the inserted content is the episode summary.
  */
@@ -720,7 +897,7 @@ export async function recallMemoriesOp(
     throw new MemoryToolError('Memory recall needs a chat session context.')
   }
 
-  const recalled: Array<MemorySummary & { content: string; media_note?: string }> = []
+  const recalled: MemoryRecallResult['recalled'] = []
   const recalledSegments: Array<MemorySegmentSummary & { summary: string }> = []
   const entries: Array<{ id: string; kind: 'memory' | 'segment' }> = []
   for (const memoryId of memoryIds) {
@@ -746,9 +923,25 @@ export async function recallMemoriesOp(
     recalled.push({
       ...toMemorySummary(record),
       content: record.content,
-      ...(record.clip_ids?.length
+      // SA-105 P2 (DL-105-04): a BYTE-FREE media plan. Bytes are loaded later,
+      // at delivery time, from the media id — never here, because this object
+      // rides into intermediate steps, the Execution Viewer and the persisted
+      // step payload, which is exactly the pile-up the story exists to prevent.
+      //
+      // Delivery is deliberately NOT decided here. This op has no provider
+      // knowledge (its context is userId/agentId/sessionId), and the honest
+      // answer depends on the run's lane. `applyRecallMediaDelivery` in
+      // memoryRecallDelivery.ts fills in `delivery`, `reason` and the per-memory
+      // `media_note` where the lane IS known, so the model never reads a note
+      // that contradicts what it actually received.
+      ...(record.media?.length
         ? {
-            media_note: `Has ${record.clip_ids.length} attached media clip${record.clip_ids.length === 1 ? '' : 's'} — the image${record.clip_ids.length === 1 ? '' : 's'} arrive in your REMEMBERED MEDIA on the next message.`
+            media: record.media.map((entry) => ({
+              media_id: entry.id,
+              filename: entry.display_name,
+              mime_type: entry.mime_type,
+              bytes: entry.bytes
+            }))
           }
         : {})
     })

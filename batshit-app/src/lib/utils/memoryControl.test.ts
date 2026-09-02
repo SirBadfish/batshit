@@ -136,6 +136,32 @@ describe('validateMemorySavePayload', () => {
       expect(result.value.trigger_terms).toEqual(['maggie', 'Maggie2'])
     }
   })
+
+  it('accepts owned-image source ids and restricts always-on media to Awareness', () => {
+    const awareness = validateMemorySavePayload({
+      lane: 'awareness',
+      content: 'My portrait',
+      clip_ids: ['clip_portrait', 'clip_portrait'],
+      media_mode: 'always'
+    })
+    expect(awareness.ok).toBe(true)
+    if (awareness.ok) {
+      expect(awareness.value.clip_ids).toEqual(['clip_portrait'])
+      expect(awareness.value.media_mode).toBe('always')
+    }
+
+    expect(
+      validateMemorySavePayload({
+        lane: 'ltm',
+        content: 'My portrait',
+        clip_ids: ['clip_portrait'],
+        media_mode: 'always'
+      }).ok
+    ).toBe(false)
+    expect(
+      validateMemorySavePayload({ lane: 'awareness', content: 'My portrait', media_mode: 'later' }).ok
+    ).toBe(false)
+  })
 })
 
 describe('extractMemoryControls', () => {
