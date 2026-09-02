@@ -90,7 +90,9 @@ import {
 } from '$lib/utils/nativeExecutionBackend'
 import {
   buildToolResultImageContentOutput,
+  buildToolResultImageDeliveryPayload,
   isSupportedToolResultImageMimeType,
+  type EphemeralImageDelivery,
   type EphemeralImageRegistry,
   type ToolResultImageContentOutput,
   type ToolResultImageDeliveryDecision
@@ -1718,7 +1720,11 @@ function resolveAgentBrowserBashScreenshotModelPayload(output: any): {
  */
 async function buildAgentBrowserBashScreenshotModelOutput(
   output: any,
-  delivery?: ToolResultImageDeliveryDecision | null
+  delivery?: ToolResultImageDeliveryDecision | null,
+  options?: {
+    toolCallId?: string | null
+    ephemeralImages?: EphemeralImageRegistry | null
+  }
 ): Promise<ToolResultImageContentOutput | { type: 'text'; value: string } | null> {
   const payload = resolveAgentBrowserBashScreenshotModelPayload(output)
   if (!payload) return null
@@ -1736,19 +1742,49 @@ async function buildAgentBrowserBashScreenshotModelOutput(
     }
   }
 
-  if (decision.lane !== 'tool_result') {
-    // Honest, cheap, and strictly better than the base64 blob this used to send.
-    // P2 (DL-105-03) upgrades text-only lanes to a real synthetic image message;
-    // until then the model is told plainly that it cannot see the picture rather
-    // than being handed something that looks like data and is not.
+  if (decision.lane === 'none') {
+    // The one honest withhold: the model cannot take images on any channel.
     await cleanupAgentBrowserScreenshotFile(payload.screenshotPath)
-    const why =
-      decision.lane === 'none'
-        ? 'this model cannot accept image input'
-        : "this provider serializes tool results as text, so an image cannot ride a tool result"
     return {
       type: 'text',
-      value: `[Screenshot captured but not shown to you: ${why}. Describe what you need from the page and use another Agent Browser command to read it as text.]`
+      value:
+        '[Screenshot captured but not shown to you: this model cannot accept image input. Describe what you need from the page and use another Agent Browser command to read it as text.]'
+    }
+  }
+
+  if (decision.lane === 'synthetic_user') {
+    // SA-105 P5 (DL-105-11): the same synthetic channel memory recall uses. This
+    // provider serializes a tool result's `content` as text, so the screenshot
+    // is handed to the per-run registry and `prepareStep` appends it as one
+    // user image message before the next model call — inside this run only.
+    const registry = options?.ephemeralImages ?? null
+    const toolCallId = typeof options?.toolCallId === 'string' ? options.toolCallId : ''
+    if (!registry || !toolCallId) {
+      // No registry means the brain did not open the synthetic channel for this
+      // run (only the brain creates one, and only on text lanes). Say so rather
+      // than sending bytes that would arrive as base64 text.
+      await cleanupAgentBrowserScreenshotFile(payload.screenshotPath)
+      return {
+        type: 'text',
+        value:
+          '[Screenshot captured but not shown to you: this run has no in-turn image channel for a provider that serializes tool results as text. Describe what you need from the page and use another Agent Browser command to read it as text.]'
+      }
+    }
+
+    const image = await loadAgentBrowserScreenshotForSyntheticDelivery(payload)
+    if (!image) {
+      return {
+        type: 'text',
+        value:
+          '[Screenshot captured but not shown to you: the screenshot file could not be read (missing, empty, or over the 15 MiB cap). Take it again, or use another Agent Browser command to read the page as text.]'
+      }
+    }
+
+    registry.register(toolCallId, 'native_bash_execute', [image], 'Agent Browser screenshot')
+    return {
+      type: 'text',
+      value:
+        'Agent Browser screenshot captured. The image arrives as a separate image input within this same reply — look at it now.'
     }
   }
 
@@ -1771,6 +1807,39 @@ async function buildAgentBrowserBashScreenshotModelOutput(
       text: 'Agent Browser screenshot:',
       images: [{ mediaType: payload.mediaType, data: bytes.toString('base64') }]
     })
+  } catch {
+    return null
+  } finally {
+    await cleanupAgentBrowserScreenshotFile(payload.screenshotPath)
+  }
+}
+
+/**
+ * SA-105 P5: resolve what the synthetic user message carries for one screenshot.
+ *
+ * When the screenshot was already uploaded for the model through the user's
+ * configured upload strategy, the local file is gone and the message carries
+ * the model-visible URL — the same source the `tool_result` lane uses. Otherwise
+ * the bytes are read under Agent Browser's own 15 MiB cap and the temp file is
+ * removed, exactly like the `tool_result` path.
+ */
+async function loadAgentBrowserScreenshotForSyntheticDelivery(payload: {
+  modelImageUrl: string | null
+  screenshotPath: string | null
+  mediaType: string
+}): Promise<EphemeralImageDelivery | null> {
+  if (payload.modelImageUrl) {
+    return { mediaType: payload.mediaType, url: payload.modelImageUrl }
+  }
+  if (!payload.screenshotPath) return null
+
+  try {
+    const bytes = await readFileWithinLimit(
+      payload.screenshotPath,
+      MAX_AGENT_BROWSER_SCREENSHOT_BYTES
+    )
+    if (!bytes) return null
+    return { mediaType: payload.mediaType, data: bytes.toString('base64') }
   } catch {
     return null
   } finally {
@@ -6832,7 +6901,8 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
           context.ephemeralImages.register(
             typeof toolCallId === 'string' ? toolCallId : '',
             MEMORY_RECALL_CONTROL_ID,
-            recall.images
+            recall.images,
+            'recalled memory media'
           )
         }
       }
@@ -8082,6 +8152,13 @@ async function nativeBashExecute(input: {
   maxOutputChars?: number
   backend?: NativeExecutionBackend | null
   agentBrowserSettings?: AgentBrowserBashSettings | null
+  /**
+   * SA-105 P5: the run's tool-result image lane, when the caller is a model run.
+   * It makes the persisted screenshot payload's `modelVisibleInLoop` honest
+   * (a `none` lane never shows the image). Absent for Workflow Subagent
+   * dispatch, where the flag keeps meaning "an image payload exists".
+   */
+  imageDelivery?: ToolResultImageDeliveryDecision | null
 }): Promise<Record<string, any>> {
   const command = input.command?.trim() || ''
   const accessMode =
@@ -8722,6 +8799,20 @@ async function nativeBashExecute(input: {
   }
 
   if (isAgentBrowserScreenshot) {
+    const screenshotAvailable = Boolean(modelImageUrl || screenshotReadyForModel)
+    // SA-105 P5 (AMD-105-14): the helper owns the visibility vocabulary and this
+    // payload adapts to it. With a resolved lane the flag is honest per lane —
+    // `tool_result` and `synthetic_user` both show the image during the run,
+    // `none` never does. Without a lane (Workflow Subagent dispatch, no model
+    // loop here) it keeps its older meaning: an image payload exists.
+    const deliveryPayload = input.imageDelivery
+      ? buildToolResultImageDeliveryPayload(input.imageDelivery, {
+          modelVisibleInLoop:
+            screenshotAvailable &&
+            input.imageDelivery.lane !== 'none' &&
+            isSupportedToolResultImageMimeType(screenshotMediaType)
+        })
+      : { modelVisibleInLoop: screenshotAvailable, historyRetention: 'none' as const }
     agentBrowserMetadata = {
       ...(agentBrowserMetadata ?? {}),
       command: 'screenshot',
@@ -8730,9 +8821,8 @@ async function nativeBashExecute(input: {
         path: screenshotReadyForModel ? screenshotPath : null,
         mediaType: screenshotMediaType,
         modelImageUrl,
-        modelVisibleInLoop: Boolean(modelImageUrl || screenshotReadyForModel),
         ephemeral: true,
-        historyRetention: 'none'
+        ...deliveryPayload
       }
     }
   }
@@ -11871,13 +11961,18 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
             executablePath: settings.agentBrowserExecutablePath,
             extraFlags: settings.agentBrowserExtraFlags,
             timeoutMs: settings.agentBrowserTimeoutMs
-          }
+          },
+          imageDelivery: context.imageDelivery ?? null
         })
       },
-      toModelOutput: async ({ output }) => {
+      toModelOutput: async ({ output, toolCallId }) => {
         const screenshotOutput = await buildAgentBrowserBashScreenshotModelOutput(
           output,
-          context.imageDelivery ?? null
+          context.imageDelivery ?? null,
+          {
+            toolCallId: typeof toolCallId === 'string' ? toolCallId : null,
+            ephemeralImages: context.ephemeralImages ?? null
+          }
         )
         if (screenshotOutput) return screenshotOutput
 

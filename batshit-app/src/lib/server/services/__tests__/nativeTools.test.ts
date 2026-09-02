@@ -4430,14 +4430,18 @@ printf 'ok\\n'
     }
   })
 
-  // SA-105 P1 (DL-105-11): the actual defect fix. On a provider whose tool
-  // results serialize as text, the old path handed the model a JSON-stringified
-  // base64 blob — one measured screenshot cost ~141,125 tokens of text and the
-  // model replied "RECEIVED TEXT NOT IMAGE". It must now say so plainly instead.
-  it('native_bash_execute does not send screenshot bytes on a text-only tool-result lane', async () => {
+  // SA-105 P1 → P5 (DL-105-11): the actual defect fix, completed. On a provider
+  // whose tool results serialize as text, the old path handed the model a
+  // JSON-stringified base64 blob — one measured screenshot cost ~141,125 tokens
+  // of text and the model replied "RECEIVED TEXT NOT IMAGE". P1 made it withhold
+  // honestly; P5 delivers the screenshot through the same per-run synthetic
+  // registry memory recall uses, so `prepareStep` appends it as a user image
+  // message within the run. The tool result itself must stay byte-free.
+  it('native_bash_execute hands a local screenshot to the synthetic registry on a text-only lane', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-ab-lane-'))
     const screenshotPath = path.join(tempWorkspace, 'text-lane-shot.png')
     await writeFile(screenshotPath, Buffer.from('iVBORw0KGgo=', 'base64'))
+    const registry = createEphemeralImageRegistry()
 
     const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',
@@ -4446,6 +4450,7 @@ printf 'ok\\n'
         lane: 'synthetic_user',
         reason: 'provider_togetherai_serializes_tool_results_as_text'
       },
+      ephemeralImages: registry,
       providerSettings: {
         nativeTools: {
           fetchZipEnabled: false,
@@ -4472,13 +4477,170 @@ printf 'ok\\n'
         }
       })
 
+      // A content output here would be JSON.stringify'd into base64 text.
       expect(modelOutput?.type).toBe('text')
-      expect(modelOutput?.value).toContain('not shown to you')
-      // The whole point: no bytes, in any encoding, anywhere in the payload.
+      expect(modelOutput?.value).toContain('within this same reply')
       expect(JSON.stringify(modelOutput)).not.toContain('iVBORw0KGgo')
-      // Temp file is still cleaned up on the lane that cannot use it.
+
+      // The bytes went to the registry, keyed by this call, labelled as a
+      // screenshot rather than as recalled memory media.
+      const taken = registry.take('tool_call_text_lane')
+      expect(taken?.source).toBe('native_bash_execute')
+      expect(taken?.purpose).toBe('Agent Browser screenshot')
+      expect(taken?.images).toHaveLength(1)
+      expect(taken?.images[0]?.mediaType).toBe('image/png')
+      expect(taken?.images[0]?.data).toBe('iVBORw0KGgo=')
+      // take() clears, so the screenshot is injected exactly once.
+      expect(registry.take('tool_call_text_lane')).toBeUndefined()
+      // Temp file is cleaned up once the bytes are in the registry.
       await expect(stat(screenshotPath)).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it('native_bash_execute hands an uploaded screenshot URL to the synthetic registry on a text-only lane', async () => {
+    const registry = createEphemeralImageRegistry()
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      projectPath: process.cwd(),
+      imageDelivery: { lane: 'synthetic_user', reason: 'provider_openrouter_serializes_tool_results_as_text' },
+      ephemeralImages: registry,
+      providerSettings: {
+        nativeTools: {
+          fetchZipEnabled: false,
+          dynamicMcpEnabled: false,
+          webSearchEnabled: false,
+          bashEnabled: true,
+          agentBrowserEnabled: true
+        }
+      },
+      toolApprovalMode: 'none'
+    } as any)
+
+    const modelOutput = await (tools as any).native_bash_execute.toModelOutput({
+      toolCallId: 'tool_call_text_lane_url',
+      input: { command: 'agent-browser screenshot' },
+      output: {
+        agentBrowser: {
+          command: 'screenshot',
+          screenshot: {
+            command: 'screenshot',
+            modelImageUrl: 'https://tunnel.example/uploads/text-lane-shot.png',
+            mediaType: 'image/png'
+          }
+        }
+      }
+    })
+
+    expect(modelOutput?.type).toBe('text')
+    expect(modelOutput?.value).toContain('within this same reply')
+    // The uploaded file is gone by delivery time, so the registry carries the
+    // model-visible URL rather than bytes — the same source the tool_result
+    // lane would have used.
+    const taken = registry.take('tool_call_text_lane_url')
+    expect(taken?.images).toEqual([
+      { mediaType: 'image/png', url: 'https://tunnel.example/uploads/text-lane-shot.png' }
+    ])
+  })
+
+  it('native_bash_execute withholds a screenshot on a text-only lane when no synthetic channel was opened', async () => {
+    // Only the brain opens the synthetic channel, and only on text lanes. A
+    // caller that resolved a text lane but passed no registry must not send
+    // bytes that would arrive as base64 text.
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-ab-noreg-'))
+    const screenshotPath = path.join(tempWorkspace, 'no-registry-shot.png')
+    await writeFile(screenshotPath, Buffer.from('iVBORw0KGgo=', 'base64'))
+
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      projectPath: process.cwd(),
+      imageDelivery: { lane: 'synthetic_user', reason: 'image_delivery_context_missing' },
+      providerSettings: {
+        nativeTools: {
+          fetchZipEnabled: false,
+          dynamicMcpEnabled: false,
+          webSearchEnabled: false,
+          bashEnabled: true,
+          agentBrowserEnabled: true
+        }
+      },
+      toolApprovalMode: 'none'
+    } as any)
+
+    try {
+      const modelOutput = await (tools as any).native_bash_execute.toModelOutput({
+        toolCallId: 'tool_call_no_registry',
+        input: { command: 'agent-browser screenshot' },
+        output: {
+          agentBrowser: {
+            command: 'screenshot',
+            screenshot: { command: 'screenshot', path: screenshotPath, mediaType: 'image/png' }
+          }
+        }
+      })
+
+      expect(modelOutput?.type).toBe('text')
+      expect(modelOutput?.value).toContain('not shown to you')
+      expect(JSON.stringify(modelOutput)).not.toContain('iVBORw0KGgo')
+      await expect(stat(screenshotPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  // SA-105 P5: the PERSISTED screenshot payload (what send-routed reads for the
+  // sanitized tool card) must tell the same truth the model was told.
+  it('nativeBashExecute records a lane-aware modelVisibleInLoop on the screenshot payload', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-ab-lane-flag-'))
+    const fakeAgentBrowserPath = path.join(tempWorkspace, 'agent-browser')
+    // The fake CLI writes a tiny PNG to the screenshot path Batshit injected as
+    // the final argument, so the payload sees a real file.
+    const script = `#!/bin/zsh
+set -euo pipefail
+printf 'iVBORw0KGgo=' | base64 -d > "\${@[-1]}"
+printf 'ok\n'
+`
+    await writeFile(fakeAgentBrowserPath, script, 'utf8')
+    await chmod(fakeAgentBrowserPath, 0o755)
+    const originalPath = process.env.PATH
+    process.env.PATH = `${tempWorkspace}:${originalPath ?? ''}`
+
+    const runScreenshot = (imageDelivery: any) =>
+      nativeToolService.nativeBashExecute({
+        userId: 'josh',
+        projectPath: tempWorkspace,
+        command: 'agent-browser screenshot',
+        accessMode: 'dangerous',
+        backend: 'local',
+        agentBrowserSettings: {
+          enabled: true,
+          runtimeMode: 'chromium',
+          provider: 'local'
+        } as any,
+        imageDelivery
+      })
+
+    try {
+      const blind = await runScreenshot({ lane: 'none', reason: 'model_capabilities_vision_false' })
+      expect(blind.agentBrowser?.screenshot?.modelVisibleInLoop).toBe(false)
+      expect(blind.agentBrowser?.screenshot?.lane).toBe('none')
+      expect(blind.agentBrowser?.screenshot?.historyRetention).toBe('none')
+
+      const synthetic = await runScreenshot({
+        lane: 'synthetic_user',
+        reason: 'provider_openrouter_serializes_tool_results_as_text'
+      })
+      expect(synthetic.agentBrowser?.screenshot?.modelVisibleInLoop).toBe(true)
+      expect(synthetic.agentBrowser?.screenshot?.lane).toBe('synthetic_user')
+
+      // No lane at all (Workflow Subagent dispatch): the flag keeps its older
+      // meaning — an image payload exists — and carries no lane fields.
+      const dispatch = await runScreenshot(undefined)
+      expect(dispatch.agentBrowser?.screenshot?.modelVisibleInLoop).toBe(true)
+      expect(dispatch.agentBrowser?.screenshot?.lane).toBeUndefined()
+    } finally {
+      process.env.PATH = originalPath
       await rm(tempWorkspace, { recursive: true, force: true })
     }
   })

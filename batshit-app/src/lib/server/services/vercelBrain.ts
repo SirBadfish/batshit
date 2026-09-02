@@ -29,7 +29,8 @@ import {
   buildEphemeralImageUserMessage,
   createEphemeralImageRegistry,
   resolveToolResultImageDelivery,
-  type EphemeralImageRegistry
+  type EphemeralImageRegistry,
+  type EphemeralImageRegistryEntry
 } from '$lib/server/services/toolResultImageDelivery'
 import type { ThinkRequest, ThoughtResponse } from '$lib/types/aiBrain'
 import type { AgentDcmDisplaySettings } from '$lib/types/database'
@@ -1479,7 +1480,7 @@ export class VercelAIBrain {
       const previous = steps[steps.length - 1]
       if (!previous) return undefined
 
-      const pending: Array<{ source: string; images: any[] }> = []
+      const pending: EphemeralImageRegistryEntry[] = []
       for (const part of previous.content ?? []) {
         if (part?.type !== 'tool-result') continue
         const entry = registry.take(part.toolCallId)
@@ -1487,18 +1488,21 @@ export class VercelAIBrain {
       }
       if (pending.length === 0) return undefined
 
-      return {
-        messages: [
-          ...messages,
-          ...pending.map((entry) =>
-            buildEphemeralImageUserMessage({
-              source: entry.source,
-              purpose: 'recalled memory media',
-              images: entry.images
-            })
-          )
-        ]
-      }
+      // Each entry names its own purpose (recalled memory media, an Agent
+      // Browser screenshot, …): the hook is feature-neutral and must not
+      // describe every image as a memory (SA-105 P5, DL-105-11).
+      const injected = pending
+        .map((entry) =>
+          buildEphemeralImageUserMessage({
+            source: entry.source,
+            purpose: entry.purpose ?? null,
+            images: entry.images
+          })
+        )
+        .filter((message): message is NonNullable<typeof message> => message !== null)
+      if (injected.length === 0) return undefined
+
+      return { messages: [...messages, ...injected] }
     }
   }
 

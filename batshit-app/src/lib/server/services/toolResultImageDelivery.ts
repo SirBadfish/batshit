@@ -337,9 +337,24 @@ export function buildEphemeralImageMessageText(source: string, purpose?: string 
 
 export interface EphemeralImageDelivery {
   mediaType: string
-  /** Base64 bytes. */
-  data: string
+  /** Base64 bytes. Mutually exclusive with `url`. */
+  data?: string | null
+  /**
+   * A model-visible URL. Mutually exclusive with `data`. Used when the caller
+   * already uploaded the image for the model through the user's configured
+   * upload strategy (an Agent Browser screenshot with a tunnel) and the local
+   * bytes are gone by delivery time.
+   */
+  url?: string | null
   filename?: string | null
+}
+
+export interface EphemeralImageRegistryEntry {
+  /** The tool that produced the images, named in the synthetic message text. */
+  source: string
+  /** Short human label for the synthetic message text (`recalled memory media`). */
+  purpose?: string | null
+  images: EphemeralImageDelivery[]
 }
 
 /**
@@ -353,18 +368,23 @@ export interface EphemeralImageDelivery {
  * the images cannot outlive or escape the run that loaded them.
  */
 export interface EphemeralImageRegistry {
-  register(toolCallId: string, source: string, images: EphemeralImageDelivery[]): void
+  register(
+    toolCallId: string,
+    source: string,
+    images: EphemeralImageDelivery[],
+    purpose?: string | null,
+  ): void
   /** Reads AND clears, so a delivery is injected exactly once. */
-  take(toolCallId: string): { source: string; images: EphemeralImageDelivery[] } | undefined
+  take(toolCallId: string): EphemeralImageRegistryEntry | undefined
   pending(): number
 }
 
 export function createEphemeralImageRegistry(): EphemeralImageRegistry {
-  const entries = new Map<string, { source: string; images: EphemeralImageDelivery[] }>()
+  const entries = new Map<string, EphemeralImageRegistryEntry>()
   return {
-    register(toolCallId, source, images) {
+    register(toolCallId, source, images, purpose) {
       if (!toolCallId || !images.length) return
-      entries.set(toolCallId, { source, images })
+      entries.set(toolCallId, { source, purpose: purpose ?? null, images })
     },
     take(toolCallId) {
       const entry = entries.get(toolCallId)
@@ -381,22 +401,44 @@ export function createEphemeralImageRegistry(): EphemeralImageRegistry {
  * The single user message that carries images on a text-only lane. Uses the
  * current `file` part shape — `{ type: 'image', image }` still works but logs a
  * deprecation warning on every call (AMD-105-05).
+ *
+ * A URL-sourced image rides as a `URL` instance in `data`, which the SDK maps to
+ * the provider's image-URL form; bytes ride as base64. An image carrying neither
+ * is skipped rather than emitted as a broken part, and a message with no usable
+ * image returns `null` so the caller injects nothing — never a text line that
+ * announces images that are not there.
  */
 export function buildEphemeralImageUserMessage(options: {
   source: string
   purpose?: string | null
   images: EphemeralImageDelivery[]
-}): { role: 'user'; content: Array<Record<string, any>> } {
+}): { role: 'user'; content: Array<Record<string, any>> } | null {
+  const parts: Array<Record<string, any>> = []
+  for (const image of options.images) {
+    const filename = image.filename ? { filename: image.filename } : {}
+    if (typeof image.data === 'string' && image.data.length > 0) {
+      parts.push({ type: 'file', mediaType: image.mediaType, ...filename, data: image.data })
+      continue
+    }
+    if (typeof image.url === 'string' && image.url.trim().length > 0) {
+      try {
+        parts.push({
+          type: 'file',
+          mediaType: image.mediaType,
+          ...filename,
+          data: new URL(image.url.trim())
+        })
+      } catch {
+        // Malformed URL: skip this image rather than fail the whole step.
+      }
+    }
+  }
+  if (parts.length === 0) return null
   return {
     role: 'user',
     content: [
       { type: 'text', text: buildEphemeralImageMessageText(options.source, options.purpose) },
-      ...options.images.map((image) => ({
-        type: 'file',
-        mediaType: image.mediaType,
-        ...(image.filename ? { filename: image.filename } : {}),
-        data: image.data
-      }))
+      ...parts
     ]
   }
 }
