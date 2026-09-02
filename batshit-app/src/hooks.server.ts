@@ -7,6 +7,7 @@ import { listCoreSystemPrompts } from '$lib/server/services/systemPromptRegistry
 import { removeRetiredSystemClips } from '$lib/server/services/retiredSystemClips'
 import { ensureMemoryIndexes } from '$lib/server/services/memory/memoryIndex'
 import { startMemoryDreamingScheduler } from '$lib/server/services/memory/memoryDreamingScheduler'
+import { ensureMemoryMediaMigration } from '$lib/server/services/memory/memoryMediaMigration'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
 import { assertApiKeyEncryptionConfigured } from '$lib/services/encryption.server'
 import { isAuthRateLimitedPath, shouldApplyBroadApiRateLimit } from '$lib/middleware/rateLimitPolicy'
@@ -142,6 +143,17 @@ function ensureStartupIntegrityPass() {
         .catch((error) => {
           // Loud by contract (DL-104-10): recall paths also hard-fail until this is fixed.
           console.error('[Startup] Memory index bootstrap failed:', error)
+        })
+      void ensureMemoryMediaMigration()
+        .then((result) => {
+          if (result.status === 'migrated' && (result.records > 0 || result.unresolved > 0)) {
+            console.info(
+              `[Startup] Migrated ${result.records} memory records to ${result.media} owned media files (${result.unresolved} unresolved source clips).`
+            )
+          }
+        })
+        .catch((error) => {
+          console.error('[Startup] Memory-media migration failed and will retry next boot:', error)
         })
       // SA-104 P7: the between-conversation dreaming scheduler (DL-104-15). Arms on
       // the first request after boot; each pass re-checks eligibility and live turns.

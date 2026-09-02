@@ -25,9 +25,15 @@ import { createOpenAI } from '@ai-sdk/openai'
 import { createHash } from 'crypto'
 import { z } from 'zod'
 import { ProviderManager, resolveProviderAccess } from '$lib/server/services/providers'
+import {
+  buildEphemeralImageUserMessage,
+  createEphemeralImageRegistry,
+  resolveToolResultImageDelivery,
+  type EphemeralImageRegistry
+} from '$lib/server/services/toolResultImageDelivery'
 import type { ThinkRequest, ThoughtResponse } from '$lib/types/aiBrain'
 import type { AgentDcmDisplaySettings } from '$lib/types/database'
-import type { ModelConnectionInfo } from '$lib/types/savedModels'
+import type { ModelCapabilities, ModelConnectionInfo } from '$lib/types/savedModels'
 import type { CodexRuntimeSettings } from '$lib/types/codex'
 import type { ClaudeRuntimeSettings } from '$lib/types/claude'
 import type { ToolApprovalMode } from '$lib/types/tool-approvals'
@@ -191,6 +197,12 @@ function buildDefaultToolModelOutput(output: unknown): any {
 }
 
 export interface NativeModeRequest extends ThinkRequest {
+  /**
+   * SA-105 P2 (DL-105-06): the saved model's capabilities, so the tool-result
+   * image lane uses the same vision rule as attached clips. Optional and
+   * unknown-means-allowed, matching the clip posture.
+   */
+  modelCapabilities?: ModelCapabilities | null
   mode4Style?: Mode4Style
   agentId?: string // Story 6.8: Agent ID for loading assigned workflows
   agentSlug?: string | null
@@ -397,7 +409,7 @@ export class VercelAIBrain {
       // Build tools from both regular tools and workflows
       // Story 6.4: Also get metadata maps for tool source detection
       // Story 6.8: Now includes agentId for loading assigned workflows
-      const { tools, maps: toolMaps, toolApprovals } = await this.buildToolsForMode3(
+      const { tools, maps: toolMaps, toolApprovals, ephemeralImages } = await this.buildToolsForMode3(
         request.availableTools,
         request.availableWorkflows,
         request.sessionId,
@@ -419,6 +431,7 @@ export class VercelAIBrain {
           memoryControlsEnabled: request.memoryControlsEnabled,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
+          parentCapabilities: request.modelCapabilities ?? null,
           parentMessageId: request.messageId ?? null,
           reserveToolZipId: request.reserveToolZipId,
           abortSignal: request.abortSignal
@@ -466,7 +479,14 @@ export class VercelAIBrain {
         providerOptions: cachePolicy.providerOptions,
         // SA-107: per-session cache-affinity headers (xAI/Baseten/Fireworks direct lanes).
         ...(cachePolicy.headers ? { headers: cachePolicy.headers } : {}),
-        ...(downloadGuard ? { experimental_download: downloadGuard } : {})
+        ...(downloadGuard ? { experimental_download: downloadGuard } : {}),
+        // SA-105 P2 (DL-105-03): on lanes whose tool results serialize as text,
+        // images recalled during this run are appended as ONE user message for
+        // the next step. Present only when a registry exists — i.e. only on
+        // `synthetic_user` lanes — so no other run's call shape changes.
+        ...(ephemeralImages
+          ? { prepareStep: this.buildEphemeralImagePrepareStep(ephemeralImages) }
+          : {})
       })
 
       // Process the full response
@@ -928,6 +948,8 @@ export class VercelAIBrain {
       memoryControlsEnabled?: boolean
       parentModelId?: string | null
       parentConnection?: ModelConnectionInfo | null
+      /** SA-105 P2 (DL-105-06): saved-model capabilities for the image lane gate. */
+      parentCapabilities?: ModelCapabilities | null
       /** SA-093 P4: parent send's message id so subagent forensics can land on its snapshot. */
       parentMessageId?: string | null
       reserveToolZipId?: NativeModeRequest['reserveToolZipId']
@@ -937,9 +959,15 @@ export class VercelAIBrain {
     tools: Record<string, any> | undefined
     maps: ToolSourceMaps
     toolApprovals: Record<string, NativeToolApprovalPolicy>
+    /** SA-105 P2: non-null only on `synthetic_user` lanes. */
+    ephemeralImages: EphemeralImageRegistry | null
   }> {
     const tools: Record<string, any> = {}
     const toolApprovals: Record<string, NativeToolApprovalPolicy> = {}
+    // SA-105 P2: resolved below when native tools are built, then handed back to
+    // the caller so the streamText call can register `prepareStep` for exactly
+    // the runs that need it.
+    let ephemeralImages: EphemeralImageRegistry | null = null
 
     // Story 6.4, 6.7c, SA-005: Track metadata for O(1) detection
     const toolMaps: ToolSourceMaps = {
@@ -952,6 +980,33 @@ export class VercelAIBrain {
     // These do not require user MCP setup and are available whenever tools are enabled.
     if (userId) {
       try {
+        // SA-105 (DL-105-06): resolve the run's tool-result image delivery lane
+        // ONCE, here, where the provider id and model id are already known, and
+        // hand it to the tool layer. `nativeTools` otherwise knows nothing about
+        // which provider it is talking to, which is why an Agent Browser
+        // screenshot used to be serialized as base64 TEXT on providers whose
+        // tool results cannot carry an image.
+        //
+        // Capabilities are deliberately not threaded yet: `modelAllowsImageInput`
+        // treats unknown capabilities as allowed (the same posture attached clips
+        // use), so omitting them cannot widen the lane. P2 threads them when the
+        // recall path needs the full DL-105-06 resolution.
+        const imageDelivery = resolveToolResultImageDelivery({
+          providerId: this.resolveRuntimeProviderId(
+            nativeContext?.parentModelId ?? '',
+            nativeContext?.parentConnection ?? null
+          ),
+          modelId: nativeContext?.parentModelId ?? null,
+          capabilities: nativeContext?.parentCapabilities ?? null
+        })
+        // Only a text-only lane needs the synthetic channel, so only it gets a
+        // registry — and therefore only it gets `prepareStep` registered on the
+        // streamText call below. Every other run's SDK call shape stays exactly
+        // as it was (DL-105-13 parity).
+        if (imageDelivery.lane === 'synthetic_user') {
+          ephemeralImages = createEphemeralImageRegistry()
+        }
+
         const nativeToolSet = await nativeToolService.buildMode3NativeTools({
           userId,
           agentId: agentId ?? null,
@@ -965,7 +1020,9 @@ export class VercelAIBrain {
           memoryControlsEnabled: nativeContext?.memoryControlsEnabled,
           projectPath: nativeContext?.projectPath ?? null,
           providerSettings: nativeContext?.providerSettings ?? null,
-          toolApprovalMode
+          toolApprovalMode,
+          imageDelivery,
+          ephemeralImages
         })
         Object.assign(tools, nativeToolSet.tools)
         Object.assign(toolApprovals, nativeToolSet.toolApprovals)
@@ -1250,7 +1307,8 @@ export class VercelAIBrain {
     return {
       tools: Object.keys(wrappedTools).length > 0 ? wrappedTools : undefined,
       maps: toolMaps,
-      toolApprovals
+      toolApprovals,
+      ephemeralImages
     }
   }
 
@@ -1400,6 +1458,48 @@ export class VercelAIBrain {
       : 'anthropic' // Default fallback
 
     return parsed
+  }
+
+  /**
+   * SA-105 P2 (DL-105-03) — the synthetic image lane.
+   *
+   * Some providers serialize a tool result's `content` output with
+   * `JSON.stringify`, which turns an image into base64 TEXT: expensive, and
+   * unreadable to the model. On those lanes `toModelOutput` registers the bytes
+   * instead of returning them, and this hook appends them as one ordinary user
+   * message before the next step — the shape every vision model already reads.
+   *
+   * Three properties were confirmed live on ai@7.0.77: the injected message
+   * reaches the model, it carries forward to later steps, and it never appears
+   * in `response.messages` — so it cannot reach the persistence write on its own.
+   * The strip in `send-routed` still covers it as defence in depth.
+   */
+  private buildEphemeralImagePrepareStep(registry: EphemeralImageRegistry) {
+    return ({ messages, steps }: { messages: any[]; steps: any[] }) => {
+      const previous = steps[steps.length - 1]
+      if (!previous) return undefined
+
+      const pending: Array<{ source: string; images: any[] }> = []
+      for (const part of previous.content ?? []) {
+        if (part?.type !== 'tool-result') continue
+        const entry = registry.take(part.toolCallId)
+        if (entry) pending.push(entry)
+      }
+      if (pending.length === 0) return undefined
+
+      return {
+        messages: [
+          ...messages,
+          ...pending.map((entry) =>
+            buildEphemeralImageUserMessage({
+              source: entry.source,
+              purpose: 'recalled memory media',
+              images: entry.images
+            })
+          )
+        ]
+      }
+    }
   }
 
   private resolveRuntimeProviderId(
@@ -2386,11 +2486,16 @@ export class VercelAIBrain {
         gatewayTools: new Map<string, GatewayMetadata>(),
         subagentTools: new Map<string, SubagentToolMetadata>()
       }
+      // SA-105 P2: this is the STREAMING path — the one real chat sends take.
+      // Wiring only the non-streaming `processNativeMode` left the synthetic
+      // lane dead in production, which is exactly what the live recall probe
+      // caught before this was fixed.
+      let ephemeralImagesForRequest: EphemeralImageRegistry | null = null
 
       if (toolsEnabled) {
         // Story 6.4: Get BOTH tools AND toolMaps for metadata injection
         // Story 6.8: Now includes agentId for loading assigned workflows
-        const { tools, maps, toolApprovals } = await this.buildToolsForMode3(
+        const { tools, maps, toolApprovals, ephemeralImages } = await this.buildToolsForMode3(
           request.availableTools,
           request.availableWorkflows,
           request.sessionId,
@@ -2415,6 +2520,7 @@ export class VercelAIBrain {
             memoryControlsEnabled: request.memoryControlsEnabled,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,
+            parentCapabilities: request.modelCapabilities ?? null,
             parentMessageId: request.messageId ?? null,
             reserveToolZipId: request.reserveToolZipId,
             abortSignal: request.abortSignal
@@ -2423,6 +2529,7 @@ export class VercelAIBrain {
         toolMaps = maps
         toolsForRequest = tools
         toolApprovalsForRequest = toolApprovals
+        ephemeralImagesForRequest = ephemeralImages
 
         const openaiTools = await this.buildOpenAITools(request)
         if (openaiTools) {
@@ -2542,7 +2649,11 @@ export class VercelAIBrain {
           }
         },
         onEnd: wrappedOnEnd,
-        onAbort: request.onAbort
+        onAbort: request.onAbort,
+        // SA-105 P2 (DL-105-03): the synthetic image lane on the streaming path.
+        ...(ephemeralImagesForRequest
+          ? { prepareStep: this.buildEphemeralImagePrepareStep(ephemeralImagesForRequest) }
+          : {})
       })
 
       // Return the full result for SSE conversion

@@ -634,7 +634,13 @@ async function buildManagedServers(params: {
         scriptPath,
         `--agent=${params.agent.id}`,
         `--user=${params.userId}`,
-        `--url=${helperBaseUrl}`
+        `--url=${helperBaseUrl}`,
+        // SA-105 P3 (AMD-105-09): tells the bridge which CLI is consuming its
+        // results, which is what decides whether a recalled memory image can
+        // ride back as MCP image content this turn. Codex renders those blocks;
+        // Claude stores them as text, so the flag is symmetric and explicit
+        // rather than inferred.
+        '--runtime=codex'
       ],
       envVars: [
         BATSHIT_TOKEN_ENV_VAR,

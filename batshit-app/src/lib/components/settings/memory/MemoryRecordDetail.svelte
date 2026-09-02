@@ -4,9 +4,9 @@
   import { Input } from '$lib/components/ui/input'
   import * as Label from '$lib/components/ui/label'
   import * as Select from '$lib/components/ui/select'
+  import * as Switch from '$lib/components/ui/switch'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import SettingsTextEditor from '$lib/components/settings/SettingsTextEditor.svelte'
-  import ClipThumbnailTile from '$lib/components/clips/ClipThumbnailTile.svelte'
   import {
     AlertDialog,
     AlertDialogAction,
@@ -17,13 +17,14 @@
     AlertDialogHeader,
     AlertDialogTitle
   } from '$lib/components/ui/alert-dialog'
-  import { Edit3, Trash2 } from '@lucide/svelte'
+  import { Edit3, ImageUp, Trash2 } from '@lucide/svelte'
   import { toast } from 'svelte-sonner'
 
   interface Props {
     agentId: string
     detail: {
       record: Record<string, any>
+      standingMediaCount?: number
       chain: { predecessors: Array<Record<string, any>>; successors: Array<Record<string, any>> }
     }
     onChanged: () => void | Promise<void>
@@ -46,7 +47,7 @@
   let saving = $state(false)
   let contentEditorOpen = $state(false)
   let showDeleteConfirm = $state(false)
-  let clips = $state<Array<Record<string, any>>>([])
+  let mediaDeleteTarget = $state<string | null>(null)
 
   $effect(() => {
     if (record.id === hydratedId) return
@@ -72,7 +73,6 @@
       draftLingerTurns = 2
     }
     draftExpiresAt = record.expires_at ? String(record.expires_at).slice(0, 10) : ''
-    void loadClips()
   })
 
   // Per-lane form (2026-08-28, Josh's model): each field appears where it matters —
@@ -84,25 +84,57 @@
   const showExpires = $derived(draftLane === 'awareness' || draftExpiresAt.trim().length > 0)
   const stmMissingTriggers = $derived(draftLane === 'stm' && !parseTermList(draftTriggerTerms))
 
-  async function loadClips() {
-    const clipIds: string[] = Array.isArray(record.clip_ids) ? record.clip_ids : []
-    if (clipIds.length === 0) {
-      clips = []
-      return
+  const media = $derived(Array.isArray(record.media) ? record.media : [])
+
+  function mediaUrl(mediaId: string): string {
+    const query = new URLSearchParams({ agentId, memoryId: record.id, mediaId })
+    return `/api/memory/manage/media?${query}`
+  }
+
+  async function handleMediaReplacement(mediaId: string, event: Event) {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (!file) return
+    saving = true
+    try {
+      const form = new FormData()
+      form.set('file', file)
+      const response = await fetch(mediaUrl(mediaId), { method: 'POST', body: form })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(payload?.error || `Replace failed (HTTP ${response.status}).`)
+      toast.success('Memory image replaced.')
+      hydratedId = null
+      await onChanged()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Memory image replacement failed.')
+    } finally {
+      saving = false
     }
-    const loaded: Array<Record<string, any>> = []
-    for (const clipId of clipIds) {
-      try {
-        const response = await fetch(`/api/clips/${encodeURIComponent(clipId)}`)
-        if (!response.ok) continue
-        const payload = await response.json()
-        if (payload?.clip) loaded.push(payload.clip)
-        else if (payload?.id) loaded.push(payload)
-      } catch {
-        // A missing clip renders as absent; the record itself stays editable.
-      }
+  }
+
+  async function handleMediaDelete(mediaId: string) {
+    saving = true
+    try {
+      const response = await fetch(mediaUrl(mediaId), { method: 'DELETE' })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(payload?.error || `Delete failed (HTTP ${response.status}).`)
+      toast.success('Memory image deleted.')
+      mediaDeleteTarget = null
+      hydratedId = null
+      await onChanged()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Memory image deletion failed.')
+    } finally {
+      saving = false
     }
-    clips = loaded
+  }
+
+  async function handleStandingToggle(checked: boolean) {
+    await patchRecord(
+      { media_mode: checked ? 'always' : 'on_recall' },
+      checked ? 'This Awareness image will be shown every message.' : 'This image will arrive only when recalled.'
+    )
   }
 
   function parseTermList(value: string): string[] | null {
@@ -361,12 +393,51 @@
     {/if}
   </div>
 
-  {#if clips.length > 0}
+  {#if media.length > 0}
     <div class="memory-detail-media">
       <Label.Root class="batshit-settings-form-label">Media</Label.Root>
-      <div class="memory-detail-media-row">
-        {#each clips as clip (clip.id)}
-          <ClipThumbnailTile {clip} size="md" />
+      <div class="memory-detail-media-grid">
+        {#each media as image (image.id)}
+          <div class="memory-detail-media-card">
+            <img src={mediaUrl(image.id)} alt={image.display_name ?? image.filename} />
+            <div class="memory-detail-media-copy">
+              <span class="memory-detail-media-name">{image.display_name ?? image.filename}</span>
+              <span class="batshit-settings-form-meta">
+                {image.width}×{image.height} · about {image.token_estimate ?? Math.ceil(image.width / 28) * Math.ceil(image.height / 28)} image tokens per model call
+              </span>
+            </div>
+            {#if record.lane === 'awareness'}
+              <div class="memory-detail-standing-row">
+                <div>
+                  <span class="batshit-settings-form-label">Show this image every message</span>
+                  <span class="batshit-settings-form-meta">
+                    {detail.standingMediaCount ?? 0} of 4 standing images currently used
+                  </span>
+                </div>
+                <Switch.Root
+                  checked={record.media_mode === 'always'}
+                  disabled={saving}
+                  onCheckedChange={(value) => void handleStandingToggle(value === true)}
+                />
+              </div>
+            {/if}
+            <div class="memory-detail-media-actions">
+              <label class="memory-detail-media-replace">
+                <ImageUp class="h-4 w-4" />
+                Replace
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,image/gif,image/webp"
+                  disabled={saving}
+                  onchange={(event) => void handleMediaReplacement(image.id, event)}
+                />
+              </label>
+              <Button variant="outline" size="sm" onclick={() => (mediaDeleteTarget = image.id)} disabled={saving}>
+                <Trash2 class="h-4 w-4" />
+                Delete
+              </Button>
+            </div>
+          </div>
         {/each}
       </div>
     </div>
@@ -380,6 +451,7 @@
           {entry.source} · chat <span class="memory-detail-code">{entry.session_id}</span>
           {#if entry.source_deleted}(original chat deleted){/if}
           {#if entry.quote}— "{entry.quote}"{/if}
+          {#if entry.note}— {entry.note}{/if}
         </p>
       {/each}
     </div>
@@ -428,6 +500,28 @@
       <AlertDialogCancel onclick={() => (showDeleteConfirm = false)}>Cancel</AlertDialogCancel>
       <AlertDialogAction onclick={handleDelete} class="memory-detail-delete-action" disabled={saving}>
         Delete Memory
+      </AlertDialogAction>
+    </AlertDialogFooter>
+  </AlertDialogContent>
+</AlertDialog>
+
+<AlertDialog open={mediaDeleteTarget !== null} onOpenChange={(open) => { if (!open) mediaDeleteTarget = null }}>
+  <AlertDialogContent>
+    <AlertDialogHeader>
+      <AlertDialogTitle>Delete This Memory Image?</AlertDialogTitle>
+      <AlertDialogDescription>
+        This permanently removes the memory-owned copy. The memory itself and the original
+        Clip, if it still exists, are not changed.
+      </AlertDialogDescription>
+    </AlertDialogHeader>
+    <AlertDialogFooter>
+      <AlertDialogCancel onclick={() => (mediaDeleteTarget = null)}>Cancel</AlertDialogCancel>
+      <AlertDialogAction
+        onclick={() => mediaDeleteTarget && void handleMediaDelete(mediaDeleteTarget)}
+        class="memory-detail-delete-action"
+        disabled={saving}
+      >
+        Delete Image
       </AlertDialogAction>
     </AlertDialogFooter>
   </AlertDialogContent>
@@ -505,10 +599,73 @@
     gap: 0.25rem;
   }
 
-  .memory-detail-media-row {
-    display: flex;
-    flex-wrap: wrap;
+  .memory-detail-media-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
     gap: 0.5rem;
+  }
+
+  .memory-detail-media-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.625rem;
+    border: 1px solid var(--bs-settings-inner-line);
+    border-radius: 0.625rem;
+    background: var(--bs-settings-inset-bg);
+    padding: 0.625rem;
+  }
+
+  .memory-detail-media-card img {
+    width: 100%;
+    max-height: 16rem;
+    border-radius: 0.4375rem;
+    object-fit: contain;
+    background: var(--bs-settings-stage-bg);
+  }
+
+  .memory-detail-media-copy,
+  .memory-detail-standing-row > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 0.125rem;
+  }
+
+  .memory-detail-media-name {
+    overflow: hidden;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .memory-detail-standing-row,
+  .memory-detail-media-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .memory-detail-media-actions {
+    justify-content: flex-end;
+  }
+
+  .memory-detail-media-replace {
+    display: inline-flex;
+    height: 2rem;
+    cursor: pointer;
+    align-items: center;
+    gap: 0.375rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0 0.75rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+  }
+
+  .memory-detail-media-replace input {
+    display: none;
   }
 
   .memory-linger-line {

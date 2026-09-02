@@ -987,6 +987,19 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
         ).filter((member) => member.is_superseded !== 'y')
         if (members.length < 2) continue
 
+        // SA-105 P0b: a merge cannot silently orphan owned image memories. Dreaming
+        // leaves media-bearing clusters intact until a later packet defines an
+        // explicit owned-media merge policy.
+        if (members.some((member) => (member.media?.length ?? 0) > 0)) {
+          act(
+            'consolidation_review',
+            'skipped',
+            'near-duplicate cluster includes owned memory media — left separate because dreaming has no image merge policy',
+            { memoryIds: members.map((member) => member.id) }
+          )
+          continue
+        }
+
         try {
           const listing = members
             .map((member, index) =>
@@ -1044,7 +1057,6 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           const links = Array.from(
             new Set(members.flatMap((member) => member.links ?? []))
           ).filter((id) => !memberIds.has(id))
-          const clipIds = Array.from(new Set(members.flatMap((member) => member.clip_ids ?? [])))
           const eventTimes = members
             .map((member) => (member.event_at ? new Date(member.event_at).getTime() : Number.NaN))
             .filter((ts) => Number.isFinite(ts))
@@ -1072,7 +1084,6 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
               event_at: eventAt,
               expires_at: expiresAt,
               ...(links.length ? { links } : {}),
-              ...(clipIds.length ? { clip_ids: clipIds } : {}),
               provenance
             },
             { embedder }

@@ -1,6 +1,7 @@
 import path from 'node:path'
 import type { NativeModeRequest } from './vercelBrain'
 import { extractAndStripToolZipControl } from './toolZipControlNotice'
+import { stripMcpImageContentBlocks } from './toolResultImageDelivery'
 import { mapBashCommandToMode4Tool } from './bashCommandMapper'
 import { hasSubagentToolSegment } from '$lib/utils/toolNameNormalization'
 import {
@@ -809,7 +810,14 @@ export class ClaudeEventAdapter {
   ): ClaudeStreamChunk | null {
     const state = this.toolStates.get(toolId)
     const toolName = state?.toolName ?? state?.originalName ?? 'tool'
-    let result = buildToolResult(toolName, rawToolResult, fallbackContent)
+    // SA-105 P3: the symmetric half of the Codex strip. Batshit's own bridge
+    // never sends image content to this runtime (Claude Code stores MCP
+    // ImageContent as text at 10-20x tokens), but a user-installed MCP server
+    // can, and this result becomes an intermediate step, a zip and compiled
+    // history. Keyed on block shape, so it holds for any server.
+    let result = stripMcpImageContentBlocks(
+      buildToolResult(toolName, rawToolResult, fallbackContent)
+    )
     const zipControl = extractAndStripToolZipControl(result)
     if (zipControl.zipId) {
       result = zipControl.value

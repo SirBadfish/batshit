@@ -475,7 +475,7 @@
       {#if row.superseded}
         <Badge variant="outline" class="batshit-settings-spine-badge">superseded</Badge>
       {/if}
-      {#if row.clip_count}
+      {#if row.media_count}
         <Badge variant="outline" class="batshit-settings-spine-badge">media</Badge>
       {/if}
       {#if row.linger_override !== undefined}

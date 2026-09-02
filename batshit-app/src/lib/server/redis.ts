@@ -1208,6 +1208,10 @@ export class RedisService {
   }
 
   async deleteAgent(id: string): Promise<void> {
+    // Dynamic import avoids a redis.ts <-> memoryMedia.ts module cycle. Media cleanup
+    // is part of the destructive contract: fail before deleting the agent if it fails.
+    const { sweepAgentMemoryMedia } = await import('$lib/server/services/memory/memoryMedia')
+    await sweepAgentMemoryMedia(id)
     return this.execute(async (client) => {
       // Get agent to find user_id
       const agent = await client.json.get(`agent:${id}`)

@@ -426,11 +426,41 @@ async function seedRepresentativeData(userId: string) {
     saved_at: '2026-08-25T00:00:00.000Z',
     saved_ts: 1787961600000,
     is_superseded: 'n',
+    media_mode: 'on_recall',
+    media: [
+      {
+        id: 'media_1',
+        filename: 'agent_1/mem_1/media_1.png',
+        display_name: 'maggie.png',
+        mime_type: 'image/png',
+        bytes: 18,
+        width: 64,
+        height: 64,
+        token_estimate: 9,
+        sha256: '9'.repeat(64),
+        source_clip_id: 'clip_old'
+      }
+    ],
     provenance: [{ session_id: 'sess_1', message_id: 'msg_1', source: 'agent' }],
     visibility: 'normal',
     embedding: [0.1, 0.2, 0.3, 0.4],
     embedding_model: 'local-ai:test-embedder@4',
     schema_version: 1
+  })
+  await fs.mkdir(path.join(uploadRoot, 'memory-media', 'agent_1', 'mem_1'), { recursive: true })
+  await fs.writeFile(
+    path.join(uploadRoot, 'memory-media', 'agent_1', 'mem_1', 'media_1.png'),
+    'memory-image-bytes'
+  )
+  await redis.json.set('upload:memory-media:agent_1/mem_1/media_1.png', '$', {
+    filename: 'agent_1/mem_1/media_1.png',
+    uploadType: 'memory-media',
+    mimetype: 'image/png',
+    size: 18,
+    storage: 'filesystem',
+    relativePath: 'memory-media/agent_1/mem_1/media_1.png',
+    filePath: path.join(uploadRoot, 'memory-media', 'agent_1', 'mem_1', 'media_1.png'),
+    uploadedAt: '2026-08-25T00:00:00.000Z'
   })
   await redis.json.set('memseg:agent_1:memseg_1', '$', {
     id: 'memseg_1',
@@ -565,7 +595,7 @@ describe('backupRestoreService', () => {
     expect(bundle.manifest.secrets.included).toBe(false)
     expect(bundle.manifest.secrets.excludedRecordCount).toBe(1)
     expect(bundle.manifest.secrets.redactedFieldCount).toBeGreaterThan(0)
-    expect(bundle.manifest.contents.fileAssetCount).toBe(3)
+    expect(bundle.manifest.contents.fileAssetCount).toBe(4)
 
     const preflight = await preflightBackupRestore('target', bundle.bytes)
     expect(preflight.ok).toBe(true)
@@ -591,11 +621,12 @@ describe('backupRestoreService', () => {
     const bytes = new Uint8Array(await new Response(bundle.stream).arrayBuffer())
     const entries = unzipSync(bytes)
 
-    expect(bundle.manifest.contents.fileAssetCount).toBe(3)
+    expect(bundle.manifest.contents.fileAssetCount).toBe(4)
     expect(Object.keys(entries)).toContain('manifest.json')
     expect(Object.keys(entries)).toContain('files/uploads/images/photo.png')
     expect(Object.keys(entries)).toContain('files/uploads/avatars/agent/legacy-avatar.png')
     expect(Object.keys(entries)).toContain('files/uploads/goon_facial_artwork/brow-left.png')
+    expect(Object.keys(entries)).toContain('files/uploads/memory-media/agent_1/mem_1/media_1.png')
     expect(Buffer.from(entries['files/uploads/images/photo.png']).toString('utf8')).toBe('image-bytes')
     expect(Buffer.from(entries['files/uploads/avatars/agent/legacy-avatar.png']).toString('utf8')).toBe(
       'legacy-avatar-bytes'
@@ -603,6 +634,9 @@ describe('backupRestoreService', () => {
     expect(
       Buffer.from(entries['files/uploads/goon_facial_artwork/brow-left.png']).toString('utf8')
     ).toBe('facial-artwork-bytes')
+    expect(
+      Buffer.from(entries['files/uploads/memory-media/agent_1/mem_1/media_1.png']).toString('utf8')
+    ).toBe('memory-image-bytes')
     expect(
       Object.keys(entries).filter((name) => name.startsWith('redis/records/') && name.endsWith('.json'))
         .length
@@ -642,7 +676,7 @@ describe('backupRestoreService', () => {
 
     expect(result.restored).toBe(true)
     expect(result.targetUserId).toBe('target')
-    expect(result.fileAssetCount).toBe(3)
+    expect(result.fileAssetCount).toBe(4)
 
     const settings = (await redis.json.get('user:target:settings')) as Record<string, any>
     expect(settings.user_id).toBe('target')
@@ -700,6 +734,14 @@ describe('backupRestoreService', () => {
     expect(restoredMemory.user_id).toBe('target')
     expect(restoredMemory.content).toContain('Maggie')
     expect(restoredMemory.embedding).toEqual([0.1, 0.2, 0.3, 0.4])
+    expect(restoredMemory.media).toHaveLength(1)
+    expect(await redis.json.get('upload:memory-media:agent_1/mem_1/media_1.png')).toMatchObject({
+      storage: 'filesystem',
+      relativePath: 'memory-media/agent_1/mem_1/media_1.png'
+    })
+    await expect(
+      fs.readFile(path.join(uploadRoot, 'memory-media', 'agent_1', 'mem_1', 'media_1.png'), 'utf8')
+    ).resolves.toBe('memory-image-bytes')
     const restoredSegment = (await redis.json.get('memseg:agent_1:memseg_1')) as Record<string, any>
     expect(restoredSegment.user_id).toBe('target')
     expect(restoredSegment.session_id).toBe('sess_1')
@@ -748,7 +790,7 @@ describe('backupRestoreService', () => {
     const preflight = await preflightStagedBackupRestore('target', stageId)
     expect(preflight.stage).toMatchObject({ id: stageId, archiveBytes: bundle.bytes.byteLength })
     expect(preflight.disk?.sufficient).toBe(true)
-    expect(preflight.fileAssetCount).toBe(3)
+    expect(preflight.fileAssetCount).toBe(4)
 
     const tamperedBytes = new Uint8Array(bundle.bytes)
     tamperedBytes[Math.floor(tamperedBytes.byteLength / 2)] ^= 0xff
@@ -759,7 +801,7 @@ describe('backupRestoreService', () => {
     await fs.writeFile(archivePath, bundle.bytes)
 
     const result = await restoreStagedBackup('target', stageId, { confirmReplace: true })
-    expect(result).toMatchObject({ restored: true, fileAssetCount: 3, targetUserId: 'target' })
+    expect(result).toMatchObject({ restored: true, fileAssetCount: 4, targetUserId: 'target' })
     await expect(fs.readFile(path.join(uploadRoot, 'images', 'photo.png'), 'utf8')).resolves.toBe(
       'image-bytes'
     )

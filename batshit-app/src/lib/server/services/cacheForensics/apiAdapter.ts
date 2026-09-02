@@ -79,7 +79,29 @@ function expandMessageElement(
   if (Array.isArray(content)) {
     const expanded: CacheForensicsSegmentInput[] = []
     let splitAnyPart = false
-    content.forEach((part, partIndex) => {
+    let startIndex = 0
+    const standingHeader = content[0] as Record<string, unknown> | undefined
+    if (
+      standingHeader?.type === 'text' &&
+      typeof standingHeader.text === 'string' &&
+      standingHeader.text.startsWith('==== AWARENESS MEDIA (STANDING) ====')
+    ) {
+      let standingEnd = 1
+      while (standingEnd < content.length) {
+        const part = content[standingEnd] as Record<string, unknown> | undefined
+        if (part?.type === 'text') break
+        standingEnd += 1
+      }
+      expanded.push({
+        type: 'attachment',
+        label: `${label}#standing`,
+        content: content.slice(0, standingEnd)
+      })
+      startIndex = standingEnd
+      splitAnyPart = true
+    }
+    content.slice(startIndex).forEach((part, relativePartIndex) => {
+      const partIndex = startIndex + relativePartIndex
       const partRecord = part && typeof part === 'object' ? (part as Record<string, unknown>) : null
       const partText = partRecord?.type === 'text' ? partRecord.text : undefined
       const partSegments =

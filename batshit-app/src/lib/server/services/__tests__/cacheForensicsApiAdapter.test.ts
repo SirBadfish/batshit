@@ -77,6 +77,25 @@ describe('cacheForensics API adapter (P4)', () => {
       expect(segments).toHaveLength(1)
       expect(segments[0].label).toBe('body.raw')
     })
+
+    it('fingerprints leading standing Awareness media as one stable #standing segment', () => {
+      const { segments } = segmentProviderRequestBody({
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: '==== AWARENESS MEDIA (STANDING) ====\n- portrait.png — image' },
+              { type: 'image', source: { type: 'base64', data: 'AAAA' } },
+              { type: 'text', text: '==== CURRENT USER MESSAGE ====\n\nhello' }
+            ]
+          }
+        ]
+      })
+      expect(segments.map((segment) => segment.label)).toEqual([
+        'body.messages[0]:user#standing',
+        'body.messages[0]:user#current'
+      ])
+    })
   })
 
   describe('buildApiCacheForensicsRecords', () => {

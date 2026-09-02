@@ -61,6 +61,8 @@ import {
   resolveClipDataUrlFromStoredUpload,
   resolveClipPreferredUrl
 } from '$lib/server/services/clipUploadPayload'
+import { loadClipRow } from '$lib/server/services/clipService'
+import { loadMemoryMedia } from '$lib/server/services/memory/memoryMedia'
 import {
   buildClipRosterDcmLines,
   buildClipRosterLines,
@@ -861,25 +863,8 @@ export class DatabaseService {
     fetcher?: typeof fetch
   ) {
     try {
-      const redisClient = await this.getRedisClient()
-      const userKey = userId ? `clip:${userId}:${clipId}` : null
-      const systemKey = `clip:system:${clipId}`
-
-      if (redisClient) {
-        if (userKey) {
-          const userClip = await redisClient.get(userKey)
-          if (userClip) {
-            const enriched = await this.ensureTextContent(userClip as any, userKey, redisClient)
-            return enriched
-          }
-        }
-
-        const systemClip = await redisClient.get(systemKey)
-        if (systemClip) {
-          const enriched = await this.ensureTextContent(systemClip as any, systemKey, redisClient)
-          return { ...(enriched as any), systemClip: true }
-        }
-      }
+      const stored = await loadClipRow(userId, clipId)
+      if (stored) return stored
 
       // Fallback to API (browser/client)
       return await this.apiCall(`/clips/${clipId}`, { fetcher })
@@ -887,34 +872,6 @@ export class DatabaseService {
       console.error('[databaseRedis] Failed to load clip:', error)
       return null
     }
-  }
-
-  /**
-   * For text-like clips created before text-first storage, decode base64 once
-   * and persist a `content` field to Redis to avoid repeated decoding.
-   */
-  private async ensureTextContent(clip: any, redisKey?: string, redisClient?: any) {
-    const isText = (clip?.mimeType?.startsWith('text/') || clip?.fileType === 'text' || clip?.mimeType === 'application/json')
-    if (!isText) return clip
-
-    if (!clip?.content && clip?.localBase64) {
-      const base64Part = clip.localBase64.startsWith('data:')
-        ? clip.localBase64.split(',')[1] || ''
-        : clip.localBase64
-      const decoded = this.decodeBase64ToText(base64Part)
-      const updatedTokens = clip.localTokens ?? (decoded ? Math.ceil(decoded.length / 4) : undefined)
-      const updated = { ...clip, content: decoded, localTokens: updatedTokens }
-      if (redisKey && redisClient) {
-        try {
-          await redisClient.set(redisKey, updated)
-        } catch (err) {
-          console.warn('[databaseRedis] Failed to persist decoded clip content', redisKey, err)
-        }
-      }
-      return updated
-    }
-
-    return clip
   }
 
   private resolveZipControlPermission(
@@ -2797,106 +2754,57 @@ export class DatabaseService {
       return deduped
     })()
 
-    // SA-104 P4: clip media carried by inserted memories rides the same structured
-    // image path as session clips (DL-104-17 single channel; Maggie's photo). A memory
-    // clip that no longer resolves degrades to a loud DCM note instead of failing the
-    // send — a deleted clip is stale memory media, not broken infrastructure.
-    const memoryClipNotes: string[] = []
-    if (memoryCompileContext?.memoryClipIds?.length) {
-      const presentClipIds = new Set(dedupedClippedContent.map((item) => item?.clipId))
-      const clipUserSettings = userId ? await this.getUserSettings(userId).catch(() => null) : null
-      for (const memoryClipId of memoryCompileContext.memoryClipIds) {
-        if (presentClipIds.has(memoryClipId)) continue
-        const sourceMemoryId = memoryCompileContext.memoryClipSources[memoryClipId] ?? 'unknown'
-        try {
-          const clip = await this.getClipData(userId, memoryClipId, fetchImpl)
-          if (!clip) {
-            throw new Error('clip record not found')
-          }
-          const isText =
-            clip.mimeType?.startsWith('text/') ||
-            clip.fileType === 'text' ||
-            clip.mimeType === 'application/json'
-          const isImage = clip.mimeType?.startsWith('image/')
-          const tokenEstimate = isImage
-            ? clip.externalTokens ?? 765
-            : clip.localTokens ??
-              clip.externalTokens ??
-              (clip.content ? Math.ceil(clip.content.length / 4) : undefined)
-          const preferredUrl = await resolveClipPreferredUrl(clip as ClipRow, clipUserSettings, {
-            allowAutoStart: true
-          })
-          if (isImage) {
-            const dataUrl = await resolveClipDataUrlFromStoredUpload(clip as ClipRow)
-            if (!dataUrl) {
-              throw new Error('image payload could not be resolved from local upload storage')
-            }
-            dedupedClippedContent.push({
-              clipId: clip.id,
-              content: dataUrl,
-              contentType: 'image',
-              description: clip.filename,
-              tokens: tokenEstimate,
-              storageMode: 'local',
-              url: preferredUrl,
-              filename: clip.filename,
-              fileSize: clip.fileSize,
-              mimeType: clip.mimeType,
-              memorySource: sourceMemoryId
-            } as (typeof dedupedClippedContent)[number])
-          } else if (isText) {
-            const decoded =
-              clip.content ??
-              (clip.localBase64
-                ? this.decodeBase64ToText(
-                    clip.localBase64.startsWith('data:')
-                      ? clip.localBase64.split(',')[1] || ''
-                      : clip.localBase64
-                  )
-                : '')
-            dedupedClippedContent.push({
-              clipId: clip.id,
-              content: decoded,
-              contentType: 'text',
-              description: clip.filename,
-              tokens: tokenEstimate,
-              storageMode: 'local',
-              url: preferredUrl,
-              filename: clip.filename,
-              fileSize: clip.fileSize,
-              mimeType: clip.mimeType,
-              memorySource: sourceMemoryId
-            } as (typeof dedupedClippedContent)[number])
-          } else if (preferredUrl) {
-            dedupedClippedContent.push({
-              clipId: clip.id,
-              content: preferredUrl,
-              contentType: clip.fileType || 'file',
-              description: clip.filename,
-              tokens: tokenEstimate,
-              storageMode: 'local',
-              url: preferredUrl,
-              filename: clip.filename,
-              fileSize: clip.fileSize,
-              mimeType: clip.mimeType,
-              memorySource: sourceMemoryId
-            } as (typeof dedupedClippedContent)[number])
-          }
-          presentClipIds.add(memoryClipId)
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : 'unavailable'
-          memoryClipNotes.push(
-            `- Media unavailable: clip ${memoryClipId} (from memory ${sourceMemoryId}) could not be loaded (${reason}).`
-          )
-        }
+    // Named media lanes (DL-105-18): standing = constant bytes at the head;
+    // live = per-send media at the tail. Both read only memory-owned uploads.
+    const memoryMediaNotes: string[] = []
+    for (const entry of memoryCompileContext?.rememberedMedia ?? []) {
+      try {
+        const loaded = await loadMemoryMedia(agent?.id ?? '', entry.memoryId, entry.media)
+        dedupedClippedContent.push({
+          clipId: `memory:${entry.memoryId}:${entry.media.id}`,
+          content: loaded.dataUrl,
+          contentType: 'image',
+          description: entry.media.display_name,
+          tokens: entry.media.token_estimate,
+          storageMode: 'local',
+          url: loaded.url,
+          filename: entry.media.display_name,
+          fileSize: entry.media.bytes,
+          mimeType: entry.media.mime_type,
+          memorySource: entry.memoryId
+        } as (typeof dedupedClippedContent)[number])
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'unavailable'
+        memoryMediaNotes.push(
+          `- Media unavailable: image ${entry.media.id} from memory ${entry.memoryId} could not be loaded (${reason}).`
+        )
       }
+    }
+    const standingMediaItems = [] as Array<{
+      memoryId: string
+      mediaId: string
+      filename: string
+      dataUrl: string
+      bytes: number
+      tokenEstimate: number
+    }>
+    for (const entry of memoryCompileContext?.standingMedia ?? []) {
+      const loaded = await loadMemoryMedia(agent?.id ?? '', entry.memoryId, entry.media)
+      standingMediaItems.push({
+        memoryId: entry.memoryId,
+        mediaId: entry.media.id,
+        filename: entry.media.display_name,
+        dataUrl: loaded.dataUrl,
+        bytes: entry.media.bytes,
+        tokenEstimate: entry.media.token_estimate
+      })
     }
     const memoryDcmLines = (() => {
       const base = memoryCompileContext?.dcmLines ?? []
-      if (memoryClipNotes.length === 0) return base
+      if (memoryMediaNotes.length === 0) return base
       return base.length > 0
-        ? [...base, ...memoryClipNotes]
-        : ['Memory context:', ...memoryClipNotes]
+        ? [...base, ...memoryMediaNotes]
+        : ['Memory context:', ...memoryMediaNotes]
     })()
 
     // SA-109 (DL-109-04): the general clip roster — every agent gets it,
@@ -3129,7 +3037,21 @@ export class DatabaseService {
     const compiledMainSystemPrompt = mergedSystemPrompt
 
     // User message - build content array for vision support
-    const userContent: any[] = []
+    const standing: any[] = []
+    const live: any[] = []
+    if (standingMediaItems.length > 0) {
+      standing.push({
+        type: 'text',
+        text: [
+          '==== AWARENESS MEDIA (STANDING) ====',
+          ...standingMediaItems.map((item) => `- ${item.filename} — image`)
+        ].join('\n')
+      })
+      for (const item of standingMediaItems) {
+        standing.push({ type: 'image_url', image_url: { url: item.dataUrl } })
+      }
+    }
+    const userContent: any[] = live
     
     // Text content (previous conversation + current message)
     let textContent = ''
@@ -3206,7 +3128,7 @@ export class DatabaseService {
     }
     
     // Add text as first content item
-    userContent.push({
+    live.push({
       type: 'text',
       text: textContent
     })
@@ -3258,10 +3180,11 @@ export class DatabaseService {
     appendClippedItems(memoryClippedItems, 'REMEMBERED MEDIA (MEMORY)')
 
     // Add user message with proper content format
+    const compiledUserContent = standing.length > 0 ? [...standing, ...live] : live
     chatMessages.push({
       role: 'user',
       // If only text (no images), just send the string. Otherwise send array.
-      content: userContent.length === 1 ? userContent[0].text : userContent
+      content: compiledUserContent.length === 1 ? compiledUserContent[0].text : compiledUserContent
     })
 
     const assignedSubagentMetadata = Array.isArray(assignedSubagents)
@@ -3297,6 +3220,7 @@ export class DatabaseService {
         currentMessageLength: currentMessageForLLM?.length || 0,
         unzippedItemsCount,
         clippedItemsCount: dedupedClippedContent.length,
+        standingMediaCount: standingMediaItems.length,
         resolvedProjectPath,
         assignedSubagents: assignedSubagentMetadata,
         subagentModels,

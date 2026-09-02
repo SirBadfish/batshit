@@ -294,6 +294,23 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     expect(fallback).toContain('Never call `native_batshit_tool_search` for memory operations')
   })
 
+  it('SA-105 P2: recall guidance teaches in-turn photos and points at media_note', () => {
+    // Both surfaces move together — the packaged default and the code fallback.
+    // Before P2 both said images "cannot ride a tool result yet", which becomes
+    // false the moment the delivery lane ships.
+    const packaged = readPackaged('batshit_tool_prompt_memory.md')
+    const fallback = buildMemoryPromptBlock({ runtimeFlavor: 'vercel' })
+
+    for (const prompt of [packaged, fallback]) {
+      expect(prompt).toContain('media_note')
+      expect(prompt).toContain('during this same reply')
+      expect(prompt).toContain('in the tool result or in a follow-up model input within this reply')
+      expect(prompt).toContain('Claude CLI and other deferred images use the next-message REMEMBERED MEDIA path')
+      // The retired claim must not survive in either place.
+      expect(prompt).not.toContain('images cannot ride a tool result')
+    }
+  })
+
   it('SA-110 P4: Dynamic Tool Search guidance calls listed tools and hinted refs directly', () => {
     const packaged = readPackaged('batshit_dynamic_mcp.md')
     const fallback = buildDynamicMcpPromptBlock({ runtimeFlavor: 'vercel' })

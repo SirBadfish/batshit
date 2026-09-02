@@ -18,6 +18,12 @@ export const MEMORY_DREAM_INDEX_KEY_PREFIX = 'memdream_index:'
 export const MEMORY_FOLD_KEY_PREFIX = 'memfold:'
 export const MEMORY_CONFIG_KEY = 'batshit:memory_config'
 export const MEMORY_INDEX_META_KEY = 'batshit:memory_index_meta'
+export const MEMORY_MEDIA_MIGRATION_KEY = 'batshit:memory_media_migration:v1'
+export const MEMORY_MEDIA_UPLOAD_KEY_PREFIX = 'upload:memory-media:'
+
+export function memoryMediaUploadAgentPattern(agentId: string): string {
+  return `${MEMORY_MEDIA_UPLOAD_KEY_PREFIX}${agentId}/*`
+}
 
 export function memoryKey(agentId: string, memoryId: string): string {
   return `${MEMORY_KEY_PREFIX}${agentId}:${memoryId}`

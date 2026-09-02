@@ -99,11 +99,22 @@ async function serveFileBackedUpload(fileData, filename, req, res, headOnly = fa
 /**
  * Serve uploaded files from Redis metadata.
  * URL format: /uploads/:type/:filename
+ * Memory-owned media uses: /uploads/memory-media/:agentId/:memoryId/:filename
  * Example: /uploads/images/1234567890_photo.jpg
  */
-router.get('/:type/:filename', async (req, res) => {
+function routeUploadIdentity(req) {
+  if (req.params.agentId && req.params.memoryId) {
+    return {
+      type: 'memory-media',
+      filename: `${req.params.agentId}/${req.params.memoryId}/${req.params.filename}`
+    };
+  }
+  return { type: req.params.type, filename: req.params.filename };
+}
+
+async function serveUpload(req, res) {
   try {
-    const { type, filename } = req.params;
+    const { type, filename } = routeUploadIdentity(req);
     let redisKey = `upload:${type}:${filename}`;
     
     logger.debug('Serving file from Redis upload metadata');
@@ -181,15 +192,18 @@ router.get('/:type/:filename', async (req, res) => {
     logger.error('Error serving file from Redis:', error);
     res.status(500).json({ error: 'Failed to serve file' });
   }
-});
+}
+
+router.get('/memory-media/:agentId/:memoryId/:filename', serveUpload);
+router.get('/:type/:filename', serveUpload);
 
 /**
  * Get file metadata without serving the file
  * Useful for checking if a file exists or getting its size
  */
-router.head('/:type/:filename', async (req, res) => {
+async function headUpload(req, res) {
   try {
-    const { type, filename } = req.params;
+    const { type, filename } = routeUploadIdentity(req);
     const redisKey = `upload:${type}:${filename}`;
     
     const fileData = await redisService.get(redisKey);
@@ -219,6 +233,9 @@ router.head('/:type/:filename', async (req, res) => {
     logger.error('Error checking file in Redis:', error);
     res.status(500).end();
   }
-});
+}
+
+router.head('/memory-media/:agentId/:memoryId/:filename', headUpload);
+router.head('/:type/:filename', headUpload);
 
 module.exports = router;

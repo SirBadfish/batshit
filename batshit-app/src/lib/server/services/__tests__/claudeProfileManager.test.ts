@@ -132,6 +132,10 @@ describe('claudeProfileManager stdio config', () => {
         GITHUB_TOKEN: '${BATSHIT_MCP_STDIO_GW_STDIO_GITHUB_TOKEN}'
       }
     })
+    // SA-105 P3 (AMD-105-09): the symmetric half of the Codex flag. Claude Code
+    // stores MCP ImageContent as text at 10-20x the token cost, so this runtime
+    // deliberately receives no image blocks and the recall note says so.
+    expect(mode4Server?.args).toContain('--runtime=claude')
     expect(mode4Server?.env).toEqual({
       BATSHIT_TOKEN: '${BATSHIT_TOKEN}',
       BATSHIT_SESSION_ID: '${BATSHIT_SESSION_ID}',

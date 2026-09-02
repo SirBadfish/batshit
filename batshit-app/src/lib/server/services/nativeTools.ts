@@ -88,6 +88,18 @@ import {
   normalizeNativeExecutionBackend,
   type NativeExecutionBackend
 } from '$lib/utils/nativeExecutionBackend'
+import {
+  buildToolResultImageContentOutput,
+  isSupportedToolResultImageMimeType,
+  type EphemeralImageRegistry,
+  type ToolResultImageContentOutput,
+  type ToolResultImageDeliveryDecision
+} from './toolResultImageDelivery'
+import { loadMemoryMedia } from './memory/memoryMedia'
+import {
+  applyRecallMediaDelivery as applyRecallMediaDeliveryForLane,
+  MEMORY_RECALL_CONTROL_ID
+} from './memory/memoryRecallDelivery'
 
 type LegacyNativeToolPolicyMode = 'workspace' | 'read_only'
 type NativeBashAccessMode = 'plan' | 'agent' | 'dangerous'
@@ -193,6 +205,19 @@ export interface NativeToolContext {
   projectPath?: string | null
   providerSettings?: Record<string, any> | null
   toolApprovalMode?: ToolApprovalMode
+  /**
+   * SA-105 (DL-105-06): the run's tool-result image delivery lane, resolved ONCE
+   * by the brain where provider id, model id and capabilities are already known.
+   * Absent means "assume the text-safe lane" — a wrong `tool_result` guess would
+   * put base64 in the model's text context, so this never defaults optimistically.
+   */
+  imageDelivery?: ToolResultImageDeliveryDecision | null
+  /**
+   * SA-105 (DL-105-03): per-run store used only on `synthetic_user` lanes, where
+   * a tool result cannot carry an image. Created by the brain per run — never
+   * module-level — so one run's images can never surface in another's step.
+   */
+  ephemeralImages?: EphemeralImageRegistry | null
 }
 
 export interface NativeToolExecutionResult {
@@ -1676,38 +1701,62 @@ function resolveAgentBrowserBashScreenshotModelPayload(output: any): {
   }
 }
 
+/**
+ * SA-105 P1 (DL-105-11): Agent Browser screenshots now go out through the shared
+ * `toolResultImageDelivery` helper.
+ *
+ * Two things changed. The shape is current (`file` parts, not the deprecated
+ * `image-data` / `image-url` shims that logged a warning on every call), and the
+ * path is lane-aware — which is the actual defect fix. On a provider that
+ * serializes tool results as text this used to hand the model a JSON-stringified
+ * base64 blob: one 423 KB screenshot measured at roughly 141,125 tokens of text,
+ * with the model itself answering "RECEIVED TEXT NOT IMAGE".
+ *
+ * Note the direction of dependency: this function adapts to the helper's neutral
+ * vocabulary, never the reverse, so deleting Agent Browser cannot take the
+ * shared delivery path with it (AMD-105-14).
+ */
 async function buildAgentBrowserBashScreenshotModelOutput(
-  output: any
-): Promise<
-  | {
-      type: 'content'
-      value: Array<
-        | {
-            type: 'image-url'
-            url: string
-          }
-        | {
-            type: 'image-data'
-            data: string
-            mediaType: string
-          }
-      >
-    }
-  | null
-> {
+  output: any,
+  delivery?: ToolResultImageDeliveryDecision | null
+): Promise<ToolResultImageContentOutput | { type: 'text'; value: string } | null> {
   const payload = resolveAgentBrowserBashScreenshotModelPayload(output)
   if (!payload) return null
 
-  if (payload.modelImageUrl) {
+  const decision: ToolResultImageDeliveryDecision =
+    delivery ?? { lane: 'synthetic_user', reason: 'image_delivery_context_missing' }
+
+  // Agent Browser keeps its own 15 MiB read cap (a screenshot is legitimately
+  // larger than a recalled memory photo) but shares the helper's MIME gate.
+  if (!isSupportedToolResultImageMimeType(payload.mediaType)) {
+    await cleanupAgentBrowserScreenshotFile(payload.screenshotPath)
     return {
-      type: 'content',
-      value: [
-        {
-          type: 'image-url',
-          url: payload.modelImageUrl
-        }
-      ]
+      type: 'text',
+      value: `[Screenshot not shown to you: ${payload.mediaType} is not an image type this model accepts. Take the screenshot as PNG or JPEG.]`
     }
+  }
+
+  if (decision.lane !== 'tool_result') {
+    // Honest, cheap, and strictly better than the base64 blob this used to send.
+    // P2 (DL-105-03) upgrades text-only lanes to a real synthetic image message;
+    // until then the model is told plainly that it cannot see the picture rather
+    // than being handed something that looks like data and is not.
+    await cleanupAgentBrowserScreenshotFile(payload.screenshotPath)
+    const why =
+      decision.lane === 'none'
+        ? 'this model cannot accept image input'
+        : "this provider serializes tool results as text, so an image cannot ride a tool result"
+    return {
+      type: 'text',
+      value: `[Screenshot captured but not shown to you: ${why}. Describe what you need from the page and use another Agent Browser command to read it as text.]`
+    }
+  }
+
+  if (payload.modelImageUrl) {
+    return buildToolResultImageContentOutput({
+      text: 'Agent Browser screenshot:',
+      images: [{ mediaType: payload.mediaType, url: payload.modelImageUrl }]
+    })
   }
 
   if (!payload.screenshotPath) return null
@@ -1718,16 +1767,10 @@ async function buildAgentBrowserBashScreenshotModelOutput(
       MAX_AGENT_BROWSER_SCREENSHOT_BYTES
     )
     if (!bytes) return null
-    return {
-      type: 'content',
-      value: [
-        {
-          type: 'image-data',
-          data: bytes.toString('base64'),
-          mediaType: payload.mediaType
-        }
-      ]
-    }
+    return buildToolResultImageContentOutput({
+      text: 'Agent Browser screenshot:',
+      images: [{ mediaType: payload.mediaType, data: bytes.toString('base64') }]
+    })
   } catch {
     return null
   } finally {
@@ -6664,8 +6707,29 @@ function formatSpecializedBrokerUseModelValue(output: Record<string, any>): stri
   )
 }
 
-function formatBatshitToolUseModelOutput() {
-  return async ({ output }: { output: any }) => {
+/**
+ * SA-105 — bind the shared recall-media finalizer to the API path.
+ *
+ * The lane decision, the per-memory notes and the byte-free Execution Viewer
+ * record all live in `memory/memoryRecallDelivery.ts` so the managed CLI route
+ * (P3) produces identical wording from the same code. Only two things differ per
+ * caller: where the lane comes from, and how bytes are authorized. Here the lane
+ * is the resolved provider/model pair and bytes come straight from
+ * `loadMemoryMedia`, because the run is already inside an authorized send.
+ */
+async function applyRecallMediaDelivery(output: any, context: NativeToolContext) {
+  const agentId = typeof context.agentId === 'string' ? context.agentId : ''
+  return applyRecallMediaDeliveryForLane(output, {
+    lane: context.imageDelivery?.lane ?? 'synthetic_user',
+    loadBytes: ({ memoryId, mediaId }) => loadMemoryMedia(agentId, memoryId, mediaId)
+  })
+}
+
+function formatBatshitToolUseModelOutput(context: NativeToolContext) {
+  return async ({ output: rawOutput, toolCallId }: { output: any; toolCallId?: string }) => {
+    const recall = await applyRecallMediaDelivery(rawOutput, context).catch(() => null)
+    const output = recall?.output ?? rawOutput
+
     if (output && typeof output === 'object') {
       const specialized = formatSpecializedBrokerUseModelValue(output as Record<string, any>)
       if (specialized) {
@@ -6745,19 +6809,35 @@ function formatBatshitToolUseModelOutput() {
         }
       }
 
-      return {
-        type: 'text' as const,
-        value: [
-          `batshit_tool_use succeeded: ${ref}`,
-          `family: ${family}`,
-          ...((output as any).retryPayloadReused === true
-            ? ['retry_payload: reused cached payload for this allowRisky retry.']
-            : []),
-          '',
-          'result:',
-          JSON.stringify(output, null, 2)
-        ].join('\n')
+      const text = [
+        `batshit_tool_use succeeded: ${ref}`,
+        `family: ${family}`,
+        ...((output as any).retryPayloadReused === true
+          ? ['retry_payload: reused cached payload for this allowRisky retry.']
+          : []),
+        '',
+        'result:',
+        JSON.stringify(output, null, 2)
+      ].join('\n')
+
+      // SA-105 P2: two delivery channels for recalled memory images.
+      if (recall && recall.images.length > 0) {
+        if (context.imageDelivery?.lane === 'tool_result') {
+          return buildToolResultImageContentOutput({ text, images: recall.images })
+        }
+        if (context.imageDelivery?.lane === 'synthetic_user' && context.ephemeralImages) {
+          // This lane's tool results serialize as text, so the images cannot
+          // ride here. They are handed to `prepareStep`, which appends them as
+          // one user message within this run only (DL-105-03).
+          context.ephemeralImages.register(
+            typeof toolCallId === 'string' ? toolCallId : '',
+            MEMORY_RECALL_CONTROL_ID,
+            recall.images
+          )
+        }
       }
+
+      return { type: 'text' as const, value: text }
     }
 
     return {
@@ -11658,7 +11738,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           executionBackend: settings.executionBackend,
           executeControlUse: executeBrokerScopedControlUse
         }),
-      toModelOutput: formatBatshitToolUseModelOutput()
+      toModelOutput: formatBatshitToolUseModelOutput(context)
     })
   }
 
@@ -11795,7 +11875,10 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         })
       },
       toModelOutput: async ({ output }) => {
-        const screenshotOutput = await buildAgentBrowserBashScreenshotModelOutput(output)
+        const screenshotOutput = await buildAgentBrowserBashScreenshotModelOutput(
+          output,
+          context.imageDelivery ?? null
+        )
         if (screenshotOutput) return screenshotOutput
 
         if (typeof output === 'string') {
