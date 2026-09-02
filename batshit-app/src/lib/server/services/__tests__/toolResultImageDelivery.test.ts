@@ -7,6 +7,8 @@ import {
   buildEphemeralImageMessageText,
   buildOmittedImageNote,
   buildToolResultImageContentOutput,
+  buildEphemeralImageUserMessage,
+  createEphemeralImageRegistry,
   buildToolResultImageDeliveryPayload,
   isSupportedToolResultImageMimeType,
   resolveToolResultImageDelivery,
@@ -456,6 +458,47 @@ describe('neutral delivery vocabulary', () => {
     })
     expect(payload.modelVisibleInLoop).toBe(false)
     expect(payload.historyRetention).toBe('none')
+  })
+
+  it('keeps each registry entry\'s own purpose label so the hook never mislabels a screenshot as memory', () => {
+    const registry = createEphemeralImageRegistry()
+    registry.register('call_a', 'sys.memory.recall', [{ mediaType: 'image/png', data: 'AAAA' }], 'recalled memory media')
+    registry.register('call_b', 'native_bash_execute', [{ mediaType: 'image/png', data: 'BBBB' }], 'Agent Browser screenshot')
+    expect(registry.pending()).toBe(2)
+    expect(registry.take('call_a')?.purpose).toBe('recalled memory media')
+    expect(registry.take('call_b')?.purpose).toBe('Agent Browser screenshot')
+    expect(registry.pending()).toBe(0)
+  })
+
+  it('builds a URL-sourced ephemeral image part as a real URL instance', () => {
+    const message = buildEphemeralImageUserMessage({
+      source: 'native_bash_execute',
+      purpose: 'Agent Browser screenshot',
+      images: [{ mediaType: 'image/png', url: 'https://tunnel.example/uploads/shot.png' }]
+    })
+    expect(message?.content[0]).toEqual({
+      type: 'text',
+      text: expect.stringContaining('native_bash_execute (Agent Browser screenshot)')
+    })
+    expect(message?.content[1]?.type).toBe('file')
+    expect(message?.content[1]?.mediaType).toBe('image/png')
+    expect(message?.content[1]?.data).toBeInstanceOf(URL)
+    expect(String(message?.content[1]?.data)).toBe('https://tunnel.example/uploads/shot.png')
+  })
+
+  it('returns null instead of an image-less message when no image is usable', () => {
+    expect(
+      buildEphemeralImageUserMessage({
+        source: 'native_bash_execute',
+        images: [{ mediaType: 'image/png', url: 'not a url' }, { mediaType: 'image/png' }]
+      })
+    ).toBeNull()
+    // A usable sibling keeps the message; the broken one is skipped.
+    const mixed = buildEphemeralImageUserMessage({
+      source: 'native_bash_execute',
+      images: [{ mediaType: 'image/png', url: 'not a url' }, { mediaType: 'image/png', data: 'AAAA' }]
+    })
+    expect(mixed?.content).toHaveLength(2)
   })
 
   it('names the source in the ephemeral message text and carries the marker', () => {

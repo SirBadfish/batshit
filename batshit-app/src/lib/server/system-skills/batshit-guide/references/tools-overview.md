@@ -213,6 +213,8 @@ Agent Browser is Batshit's browser automation runtime.
 
 Mac app Batshit can use the host Agent Browser path where configured. Docker Batshit uses an optional `agent-browser` sidecar/controller that runs its own headless Chromium — it does not use your host Chrome profile, cookies, or visible browser window.
 
+When an agent takes a screenshot, a vision-capable model sees it during the same reply on every supported API provider. Providers that can carry an image inside a tool result get it there; providers whose tool results are text-only get the screenshot as a follow-up image input within the same reply. A model that cannot take images gets a clear note instead of a wall of image bytes. Screenshot bytes are never kept in chat history.
+
 In Docker, raw app-container Bash commands like `agent-browser ...` are blocked. Use Batshit's Agent Browser tools/settings so the request routes through the sidecar.
 
 ## n8n tools
