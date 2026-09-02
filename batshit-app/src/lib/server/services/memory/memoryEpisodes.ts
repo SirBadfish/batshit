@@ -9,6 +9,13 @@
  * Lifecycle obligations (DL-104-13): `episode:{sessionId}:{episodeId}` and
  * `session:{sessionId}:episodes` are enumerated by `redis.deleteSession` and belong to
  * the Backup/Restore `memory` group.
+ *
+ * Write contract (SA-110 DL-110-04): only `openEpisode` may write the whole document.
+ * Every updater writes ONLY its own field(s) via path-scoped JSON.SET, because episode
+ * updaters are broker tools that models emit as PARALLEL tool calls — Bob's overnight
+ * drift was `hold_episode` full-doc-writing a pre-rewrite read 52 ms after
+ * `sys.memory.whiteboard` landed, silently restoring the old board. A full-document
+ * read-modify-write here is a data-loss bug, not a style choice.
  */
 
 import { redis } from '$lib/server/redis'
@@ -130,14 +137,18 @@ export async function updateEpisodeBounds(
   if (record.state !== 'open') {
     throw new Error(`Episode ${episodeId} is ${record.state}; only open episodes accept bound updates.`)
   }
-  if (updates.last_message_id !== undefined) record.last_message_id = updates.last_message_id
+  const key = episodeKey(sessionId, episodeId)
+  if (updates.last_message_id !== undefined) {
+    record.last_message_id = updates.last_message_id
+    await redis.json.set(key, '$.last_message_id', updates.last_message_id as never)
+  }
   if (updates.hold_until !== undefined) {
     if (updates.hold_until !== null && !Number.isFinite(new Date(updates.hold_until).getTime())) {
       throw new Error(`Episode hold_until is not a valid timestamp: '${updates.hold_until}'.`)
     }
     record.hold_until = updates.hold_until
+    await redis.json.set(key, '$.hold_until', updates.hold_until as never)
   }
-  await redis.json.set(episodeKey(sessionId, episodeId), '$', record as never)
   return record
 }
 
@@ -152,7 +163,7 @@ export async function updateEpisodeWhiteboard(
     throw new Error(`Episode ${episodeId} is ${record.state}; the whiteboard belongs to the open episode.`)
   }
   record.whiteboard = content === null ? null : { content, updated_at: new Date().toISOString() }
-  await redis.json.set(episodeKey(sessionId, episodeId), '$', record as never)
+  await redis.json.set(episodeKey(sessionId, episodeId), '$.whiteboard', record.whiteboard as never)
   return record
 }
 
@@ -169,7 +180,18 @@ export async function closeEpisode(
   record.closed_at = new Date().toISOString()
   record.boundary_signal = boundarySignal
   record.hold_until = null
-  await redis.json.set(episodeKey(sessionId, episodeId), '$', record as never)
+  // One MULTI so the close transition lands whole — a crash between field writes
+  // must not leave a closed episode still carrying its hold.
+  const key = episodeKey(sessionId, episodeId)
+  await redis.execute(async (client) => {
+    await client
+      .multi()
+      .json.set(key, '$.state', 'closed' as never)
+      .json.set(key, '$.closed_at', record.closed_at as never)
+      .json.set(key, '$.boundary_signal', boundarySignal as never)
+      .json.set(key, '$.hold_until', null as never)
+      .exec()
+  })
   return record
 }
 
@@ -235,7 +257,11 @@ export async function ensureFixedSessionOpenEpisode(options: {
   }
 
   open.last_activity_at = now.toISOString()
-  await redis.json.set(episodeKey(options.sessionId, open.id), '$', open as never)
+  await redis.json.set(
+    episodeKey(options.sessionId, open.id),
+    '$.last_activity_at',
+    open.last_activity_at as never
+  )
   return open
 }
 
@@ -248,6 +274,6 @@ export async function markEpisodeGraduated(sessionId: string, episodeId: string)
     )
   }
   record.state = 'graduated'
-  await redis.json.set(episodeKey(sessionId, episodeId), '$', record as never)
+  await redis.json.set(episodeKey(sessionId, episodeId), '$.state', 'graduated' as never)
   return record
 }

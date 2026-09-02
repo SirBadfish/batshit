@@ -118,16 +118,16 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected for memory-enabled agents: lanes, inline saves, supersession discipline, and the sys.memory.* operations.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_memory.md',
-    defaultVersion: '2026-08-25'
+    defaultVersion: '2026-09-01'
   },
   {
     id: 'dynamic_mcp',
     redisKey: 'batshit:dynamic_mcp_prompt',
-    label: 'Dynamic MCP Prompt',
-    description: 'Injected when Dynamic MCP capability is enabled for the current agent.',
+    label: 'Dynamic Tool Search Prompt',
+    description: 'Injected when Dynamic Tool Search is available for the current agent.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_dynamic_mcp.md',
-    defaultVersion: '2026-08-13'
+    defaultVersion: '2026-09-01'
   }
 ]
 

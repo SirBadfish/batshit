@@ -158,6 +158,12 @@ describe('packaged Dynamic Tool Search prompt (SA-096)', () => {
       expect(compiled).toContain('input.inputFile')
       expect(compiled).toContain('are separate primitives')
       expect(compiled).toContain('tool_discovery')
+      expect(compiled).toContain(
+        'If a tool is already in your tool list, call it directly — never search for it'
+      )
+      expect(compiled).toContain('Web Search: call the Web Search tool directly')
+      expect(compiled).toContain('The Dynamic Tool Search/Use pair itself: call it directly')
+      expect(compiled).toContain('A prior search is not required')
     }
   })
 

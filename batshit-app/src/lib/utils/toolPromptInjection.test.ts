@@ -2,7 +2,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-import { buildDynamicMcpPromptBlock, buildToolGuidanceZipPromptBlock } from './toolPromptInjection'
+import {
+  buildDynamicMcpPromptBlock,
+  buildMemoryPromptBlock,
+  buildToolGuidanceZipPromptBlock
+} from './toolPromptInjection'
 import {
   applyPromptRuntimeScope,
   brokerToolNamesForScope,
@@ -266,5 +270,44 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       expect(prompt).not.toContain('native_batshit_tool_use')
     }
     expect(buildDynamicMcpPromptBlock({ runtimeFlavor: 'codex' })).not.toContain('Batshit Tools')
+  })
+
+  it('SA-110 P4: memory guidance teaches direct use, explicit mutation, and timestamp-neutral supersession', () => {
+    const packaged = readPackaged('batshit_tool_prompt_memory.md')
+    const fallback = buildMemoryPromptBlock({ runtimeFlavor: 'vercel' })
+
+    for (const prompt of [packaged, fallback]) {
+      expect(prompt).toContain('Nothing happens to a stored memory unless you explicitly act on it')
+      expect(prompt).toContain('A new save never edits, replaces, supersedes, or deletes')
+      expect(prompt).toContain('when the same fact needs correction or expansion')
+      expect(prompt).toContain('The agent chooses which memory remains current; timestamps do not decide')
+      expect(prompt).toContain('An older canonical memory may supersede a newer duplicate')
+      expect(prompt).toContain('refuses supersession cycles loudly')
+      expect(prompt).toContain('Superseded and expired Awareness entries stop being active immediately')
+      expect(prompt).toContain('requires the exact id of every memory being replaced')
+      expect(prompt).toContain('crashed write left B')
+    }
+
+    expect(packaged).toContain('Call `{{ $tool_use_tool }}` directly')
+    expect(packaged).toContain('Never call `{{ $tool_search_tool }}` for memory operations')
+    expect(fallback).toContain('call `native_batshit_tool_use` directly')
+    expect(fallback).toContain('Never call `native_batshit_tool_search` for memory operations')
+  })
+
+  it('SA-110 P4: Dynamic Tool Search guidance calls listed tools and hinted refs directly', () => {
+    const packaged = readPackaged('batshit_dynamic_mcp.md')
+    const fallback = buildDynamicMcpPromptBlock({ runtimeFlavor: 'vercel' })
+
+    for (const prompt of [packaged, fallback]) {
+      expect(prompt).toContain(
+        'If a tool is already in your tool list, call it directly — never search for it'
+      )
+      expect(prompt).toContain('Web Search: call the Web Search tool directly')
+      expect(prompt).toContain('Bash: call the Bash tool directly')
+      expect(prompt).toContain('Skills: call `native_skill` directly')
+      expect(prompt).toContain('Your named subagents: call their tools directly')
+      expect(prompt).toContain('The Dynamic Tool Search/Use pair itself: call it directly')
+      expect(prompt).toMatch(/exact typed ref[\s\S]+prior search is not required/)
+    }
   })
 })

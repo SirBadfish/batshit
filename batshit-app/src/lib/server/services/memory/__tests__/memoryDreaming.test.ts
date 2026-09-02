@@ -309,6 +309,12 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     expect(mergeAction?.status).toBe('done')
     expect(mergeAction?.why).toContain('same dog fact')
 
+    // SA-110 P2 (DL-110-06b): the awareness fold is the run's final logged step —
+    // 'done' when the run changed what awareness compiles to, 'skipped' otherwise.
+    const foldAction = run.actions.at(-1)
+    expect(foldAction?.kind).toBe('awareness_fold')
+    expect(['done', 'skipped']).toContain(foldAction?.status)
+
     const memories = await listMemories(AGENT)
     const merged = memories.find(
       (memory) => memory.is_superseded !== 'y' && memory.content.includes('Maggie')
@@ -489,6 +495,11 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     flaggedRecord.is_superseded = 'y'
     await redis.json.set(`memory:${AGENT}:${flagged.id}`, '$', flaggedRecord as never)
 
+    // (e) valid reverse-age direction: the older record is deliberately canonical.
+    const olderWinner = await seedMemory({ content: '[vec6] Canonical original decision' })
+    const newerDuplicate = await seedMemory({ content: '[vec7] Later duplicate decision' })
+    await supersedeMemory(AGENT, olderWinner.id, [newerDuplicate.id])
+
     const run = await runDreamingPass({
       userId: USER,
       agent: agentRecord(),
@@ -511,6 +522,8 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
     expect((await getMemory(AGENT, restored.id))?.is_superseded).toBe('n')
 
     expect((await getMemory(AGENT, flagged.id))?.is_superseded).toBe('n')
+    expect((await getMemory(AGENT, newerDuplicate.id))?.superseded_by).toBe(olderWinner.id)
+    expect((await getMemory(AGENT, olderWinner.id))?.supersedes).toContain(newerDuplicate.id)
   })
 
   // -------------------------------------------------------------------------

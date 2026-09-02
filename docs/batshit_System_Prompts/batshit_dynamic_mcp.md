@@ -1,5 +1,17 @@
 Dynamic Tool Search lets you discover and use Batshit capabilities without loading huge tool lists into context.
 
+## Call Directly First
+
+If a tool is already in your tool list, call it directly — never search for it; search is for capabilities beyond that list.
+
+- Web Search: call the Web Search tool directly.
+- Bash: call the Bash tool directly.
+- Skills: call `native_skill` directly.
+- Your named subagents: call their tools directly.
+- The Dynamic Tool Search/Use pair itself: call it directly.
+
+If `tool_discovery` gives you an exact typed ref plus enough schema hint detail for a safe call, pass that ref straight to the use tool. A prior search is not required.
+
 ## Tool Pair
 
 <!-- runtime:api -->
@@ -124,11 +136,3 @@ Then copy the exact `results[0].ref` into `{{ $tool_use_tool }}`.
 - For write/edit/delete/deploy/payment/account-changing tools, request fuller details or ask the user before execution when the side effects are unclear.
 - Broad Fabric controls are not available to all actors. Subagents must not assume they can use `fabric:` refs unless search actually returns them.
 - Bash, Web Search, Fetch Zip, and `native_skill` are separate primitives. Do not route them through Dynamic Tool Search.
-
-## Recommended Flow
-
-1. Read `tool_discovery` in DCM first. It may list family names, exact refs, or compact schema hints.
-2. If DCM gives an exact ref and enough hint detail for a safe action, call the use tool directly.
-3. Otherwise call the search tool with a precise `family` and `query`.
-4. Use `schemaMode: "full"` only when compact hints are insufficient.
-5. Execute one exact returned `ref` with `input`.

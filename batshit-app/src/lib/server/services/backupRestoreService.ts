@@ -1198,6 +1198,7 @@ function groupForKey(key: string, userId: string): BackupGroupId {
     key.startsWith('memseg:') ||
     key.startsWith('memdream:') ||
     key.startsWith('memdream_index:') ||
+    key.startsWith('memfold:') ||
     key.startsWith('episode:') ||
     key.startsWith('memlinger:') ||
     /^session:[^:]+:episodes$/.test(key) ||
@@ -1291,6 +1292,7 @@ function isRestorableKeyForUser(key: string, userId: string) {
     'memseg:',
     'memdream:',
     'memdream_index:',
+    'memfold:',
     'episode:',
     'memlinger:'
   ]
@@ -1450,6 +1452,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     await addPatternKeys(keys, client, `memseg:${agentId}:*`)
     await addPatternKeys(keys, client, `memdream:${agentId}:*`)
     await addExistingKey(keys, client, `memdream_index:${agentId}`)
+    await addExistingKey(keys, client, `memfold:${agentId}`)
   }
 
   for (const subagentId of subagentIds) {

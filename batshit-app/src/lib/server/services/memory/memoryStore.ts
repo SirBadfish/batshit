@@ -309,16 +309,44 @@ export async function supersedeMemory(
   const successor = await getMemory(agentId, newMemoryId)
   if (!successor) throw new Error(`Memory ${newMemoryId} not found for agent ${agentId}.`)
 
+  // Validate the complete operation before the first write. The selected winner may be
+  // older or newer than the records it replaces, but it cannot already point through a
+  // supersession chain to one of them: reversing that live edge would create a cycle in
+  // which every record is simultaneously current and superseded.
+  const targets: MemoryRecord[] = []
   for (const oldId of supersededIds) {
     const old = await getMemory(agentId, oldId)
     if (!old) throw new Error(`Cannot supersede missing memory ${oldId} (agent ${agentId}).`)
+    targets.push(old)
+
+    const seen = new Set<string>([newMemoryId])
+    let cursor: MemoryRecord | null = successor
+    while (cursor?.superseded_by) {
+      const nextId = cursor.superseded_by
+      if (nextId === oldId) {
+        throw new Error(
+          `Cannot make memory ${newMemoryId} supersede ${oldId}: this would create a supersession cycle. ` +
+            'Unsupersede the chosen winner first, then apply the new direction.'
+        )
+      }
+      if (seen.has(nextId)) {
+        throw new Error(
+          `Cannot supersede memories from ${newMemoryId}: its existing supersession chain contains a cycle.`
+        )
+      }
+      seen.add(nextId)
+      cursor = await getMemory(agentId, nextId)
+    }
+  }
+
+  for (const old of targets) {
     old.superseded_by = newMemoryId
     old.is_superseded = 'y'
     old.updated_at = nowStamps().iso
-    await redis.json.set(memoryKey(agentId, oldId), '$', old as never)
+    await redis.json.set(memoryKey(agentId, old.id), '$', old as never)
   }
 
-  const merged = new Set([...(successor.supersedes ?? []), ...supersededIds])
+  const merged = new Set([...(successor.supersedes ?? []), ...targets.map((record) => record.id)])
   successor.supersedes = Array.from(merged)
   successor.updated_at = nowStamps().iso
   await redis.json.set(memoryKey(agentId, newMemoryId), '$', successor as never)

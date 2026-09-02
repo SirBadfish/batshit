@@ -66,6 +66,7 @@ import {
   listMemorySegments
 } from './memoryStore'
 import type { MemoryEmbedder } from './memoryEmbedder'
+import { foldAwarenessState } from './memoryRecall'
 import {
   getOpenEpisode,
   listEpisodes,
@@ -704,6 +705,18 @@ export async function runFixedSessionNap(options: {
     tokensAfter: number | null,
     error?: string
   ): Promise<FixedSessionNapOutcome> => {
+    // SA-110 P2 (DL-110-06a): the awareness fold rides every nap that actually ran
+    // — the nap already resets the provider cache (or runs between turns anyway),
+    // so the fold is free here. A failed fold never fails the nap: the SP keeps
+    // compiling the previous snapshot and the pending notes stay honest.
+    let awarenessFold: string
+    try {
+      const fold = await foldAwarenessState({ agentId, reason: 'nap', now })
+      awarenessFold = fold.changed ? 'folded' : 'unchanged'
+    } catch (foldError) {
+      awarenessFold = `failed: ${foldError instanceof Error ? foldError.message : 'unknown error'}`
+      console.error('[memoryGraduation] Awareness fold during the nap failed:', foldError)
+    }
     const record: FixedSessionNapRecord = {
       id: napId,
       at: now.toISOString(),
@@ -717,6 +730,7 @@ export async function runFixedSessionNap(options: {
       skippedEpisodes,
       rezippedZipCount,
       compaction,
+      awarenessFold,
       ...(error ? { error } : {})
     }
     const metadata = await appendNapRecord(sessionId, record)
