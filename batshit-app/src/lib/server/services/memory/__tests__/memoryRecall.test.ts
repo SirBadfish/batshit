@@ -317,13 +317,31 @@ describe.runIf(memorySearchLaneActive())('memory recall engine (dedicated Redis 
         expires_at: '2020-01-01T00:00:00.000Z'
       })
       const first = await computeMemoryCompileContext(compileArgs('hello'))
-      expect(first.onMyMindBlock).toContain('==== AWARENESS (AGENT MEMORY) ====')
+      expect(first.onMyMindBlock).toContain('==== AWARENESS (YOUR MEMORIES) ====')
       expect(first.onMyMindBlock).toContain(topId)
       expect(first.onMyMindBlock).not.toContain('Expired awareness entry')
       expect(first.onMyMindBlock).toContain('1 more awareness entry exceeds the Awareness budget')
       // Byte-stability (DL-104-04 cache anchoring): identical across compiles.
       const second = await computeMemoryCompileContext(compileArgs('different message'))
       expect(second.onMyMindBlock).toBe(first.onMyMindBlock)
+    })
+
+    it('keeps an older chosen Awareness winner and excludes the newer superseded duplicate', async () => {
+      const olderCanonicalId = await seedMemory({
+        lane: 'awareness',
+        content: 'Canonical standing fact',
+        importance: 9
+      })
+      const newerDuplicateId = await seedMemory({
+        lane: 'awareness',
+        content: 'Duplicate standing fact',
+        importance: 10
+      })
+      await supersedeMemory(AGENT, olderCanonicalId, [newerDuplicateId])
+
+      const context = await computeMemoryCompileContext(compileArgs('hello'))
+      expect(context.onMyMindBlock).toContain('Canonical standing fact')
+      expect(context.onMyMindBlock).not.toContain('Duplicate standing fact')
     })
 
     it('references awareness clip media textually instead of attaching bytes', async () => {

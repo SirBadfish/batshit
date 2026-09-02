@@ -267,6 +267,35 @@ describe.runIf(memorySearchLaneActive())('memory tool ops (dedicated Redis 8 db0
       expect(currentOnly.results.map((summary) => summary.id)).not.toContain(old.saved.id)
     })
 
+    it('keeps an older chosen winner ahead of a newer superseded duplicate', async () => {
+      const agentId = await freshAgent()
+      const olderCanonical = await saveMemoryOp(toolContext({ agentId }), {
+        lane: 'ltm',
+        content: 'Josh has an Irish Setter named Maggie'
+      })
+      const newerDuplicate = await saveMemoryOp(toolContext({ agentId }), {
+        lane: 'ltm',
+        content: 'what dog does Josh have'
+      })
+      await supersedeMemoryOp(toolContext({ agentId }), {
+        memoryId: olderCanonical.saved.id,
+        supersedes: [newerDuplicate.saved.id]
+      })
+
+      const result = await searchMemoriesOp(toolContext({ agentId }), {
+        query: 'what dog does Josh have'
+      })
+      const ids = result.results.map((summary) => summary.id)
+      expect(ids.indexOf(olderCanonical.saved.id)).toBeLessThan(
+        ids.indexOf(newerDuplicate.saved.id)
+      )
+      expect(result.results.find((row) => row.id === newerDuplicate.saved.id)).toMatchObject({
+        superseded: true,
+        superseded_by: olderCanonical.saved.id
+      })
+      expect(result.note).toContain('timestamps do not decide the winner')
+    })
+
     it('applies lane and saved-time range filters and validates inputs loudly', async () => {
       const agentId = await freshAgent()
       await saveMemoryOp(toolContext({ agentId }), {

@@ -224,6 +224,32 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     expect(successorAfterUndo?.supersedes ?? []).not.toContain(oldFact.id)
   })
 
+  it('supports an older chosen winner but loudly refuses a cyclic reversal', async () => {
+    const olderCanonical = await createMemory(
+      memoryInput({ content: 'Maggie prefers the original blue leash' }),
+      { embedder: fakeEmbedder }
+    )
+    const newerDuplicate = await createMemory(
+      memoryInput({ content: 'Duplicate note: Maggie prefers the original blue leash' }),
+      { embedder: fakeEmbedder }
+    )
+
+    await supersedeMemory('agent_test', olderCanonical.id, [newerDuplicate.id])
+    expect((await getMemory('agent_test', newerDuplicate.id))?.superseded_by).toBe(
+      olderCanonical.id
+    )
+
+    await expect(
+      supersedeMemory('agent_test', newerDuplicate.id, [olderCanonical.id])
+    ).rejects.toThrow(/supersession cycle.*Unsupersede the chosen winner first/i)
+
+    // The rejected operation validates before writing, so the supported direction survives.
+    expect((await getMemory('agent_test', newerDuplicate.id))?.superseded_by).toBe(
+      olderCanonical.id
+    )
+    expect((await getMemory('agent_test', olderCanonical.id))?.is_superseded).toBe('n')
+  })
+
   it('demotes expired memories without erasing them', async () => {
     const expiring = await createMemory(
       memoryInput({
@@ -494,6 +520,29 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     const second = await openEpisode({ session_id: 'sess_ep', agent_id: 'agent_test' })
     const ledger = await listEpisodes('sess_ep')
     expect(ledger.map((entry) => entry.id)).toEqual([episode.id, second.id])
+  })
+
+  it('parallel episode field updaters cannot erase each other (SA-110 whiteboard drift race)', async () => {
+    const { openEpisode, updateEpisodeWhiteboard, updateEpisodeBounds, getEpisode } =
+      await import('../memoryEpisodes')
+
+    // Bob's goodnight interleaving, deterministically: Promise.all starts both
+    // await-chains, so both read the episode before either writes. With the old
+    // full-document writes the bounds write restored the pre-rewrite board every
+    // time; path-scoped field writes must keep BOTH fields on every round.
+    // Round 0 also pins that `$.hold_until` path-creation works on a fresh
+    // record that never carried the field.
+    const episode = await openEpisode({ session_id: 'sess_race', agent_id: 'agent_test' })
+    for (let round = 0; round < 5; round++) {
+      const hold = `2026-09-0${round + 2}T09:00:00.000Z`
+      await Promise.all([
+        updateEpisodeWhiteboard('sess_race', episode.id, `board r${round}`),
+        updateEpisodeBounds('sess_race', episode.id, { hold_until: hold })
+      ])
+      const stored = await getEpisode('sess_race', episode.id)
+      expect(stored?.whiteboard?.content).toBe(`board r${round}`)
+      expect(stored?.hold_until).toBe(hold)
+    }
   })
 
   it('deleteSession removes the episode ledger', async () => {

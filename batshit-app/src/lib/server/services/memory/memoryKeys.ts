@@ -15,6 +15,7 @@ export const MEMORY_SEGMENT_KEY_PREFIX = 'memseg:'
 export const MEMORY_LINGER_KEY_PREFIX = 'memlinger:'
 export const MEMORY_DREAM_RUN_KEY_PREFIX = 'memdream:'
 export const MEMORY_DREAM_INDEX_KEY_PREFIX = 'memdream_index:'
+export const MEMORY_FOLD_KEY_PREFIX = 'memfold:'
 export const MEMORY_CONFIG_KEY = 'batshit:memory_config'
 export const MEMORY_INDEX_META_KEY = 'batshit:memory_index_meta'
 
@@ -59,6 +60,19 @@ export function memoryDreamRunAgentPattern(agentId: string): string {
 
 export function memoryDreamIndexKey(agentId: string): string {
   return `${MEMORY_DREAM_INDEX_KEY_PREFIX}${agentId}`
+}
+
+/**
+ * SA-110 P2 — the agent's folded AWARENESS snapshot (DL-110-05/06): the exact
+ * rendered system-prompt block plus per-entry line fingerprints. The SP compiles
+ * this snapshot verbatim; mid-session awareness changes ride the DCM as pending
+ * notes until the next fold (nap, dreaming, new-session first commit, or an
+ * immediate re-fold on awareness deletion). Cleanup: `deleteAgent`. Backup:
+ * `memory` group (restore-missing acceptable — the compile bootstraps from live
+ * records and the next commit re-folds).
+ */
+export function memoryFoldKey(agentId: string): string {
+  return `${MEMORY_FOLD_KEY_PREFIX}${agentId}`
 }
 
 /**

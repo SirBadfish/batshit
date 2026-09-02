@@ -49,7 +49,7 @@ import {
 } from './memoryIndex'
 import { MEMORY_SEGMENT_KEY_PREFIX } from './memoryKeys'
 import { queuePendingMemoryRecalls } from './memoryLinger'
-import { blendMemoryRanking } from './memoryRecall'
+import { blendMemoryRanking, foldAwarenessState, getMemoryFold } from './memoryRecall'
 import {
   closeEpisode,
   getOpenEpisode,
@@ -507,8 +507,8 @@ export async function searchMemoriesOp(
     totalReturned: results.length + segments.length,
     note:
       'These are summary references, not full memories. To bring chosen memories into your context, call ' +
-      'sys.memory.recall with their ids. Entries marked superseded have a newer version — prefer the current ' +
-      'one. Rows with linked_from rode in via another result’s [[links]]. Rows under segments are graduated ' +
+      'sys.memory.recall with their ids. Entries marked superseded point to the chosen current memory — timestamps ' +
+      'do not decide the winner. Rows with linked_from rode in via another result’s [[links]]. Rows under segments are graduated ' +
       'conversation stretches — recall their ids to receive the full episode summary.'
   }
 }
@@ -639,7 +639,38 @@ export async function deleteMemoryOp(
     throw new MemoryToolError(`Memory "${input.memoryId}" was not found for this agent.`)
   }
   const deleted = await deleteMemory(context.agentId, input.memoryId)
+  if (deleted) {
+    await refoldAwarenessAfterDelete(context.agentId, input.memoryId, existing.lane)
+  }
   return { deleted, memoryId: input.memoryId }
+}
+
+/**
+ * SA-110 P2 (DL-110-05): deleting an awareness record (or a record the stored fold
+ * still shows) is the ONE immediate re-fold — showing deleted content in the SP
+ * until a fold boundary would lie. One bounded cache reset, rare and deliberate.
+ * A failed re-fold is logged loudly but never fails the delete: the compile's
+ * pending diff renders a "removed — disregard it" note for a fold entry with no
+ * live record, so the SP stays honest either way.
+ */
+export async function refoldAwarenessAfterDelete(
+  agentId: string,
+  memoryId: string,
+  deletedLane: string | undefined
+): Promise<void> {
+  try {
+    const needsRefold =
+      deletedLane === 'awareness' ||
+      Boolean((await getMemoryFold(agentId))?.records.some((entry) => entry.id === memoryId))
+    if (needsRefold) {
+      await foldAwarenessState({ agentId, reason: 'delete' })
+    }
+  } catch (error) {
+    console.error(
+      '[memoryTools] Awareness re-fold after delete failed (the pending "removed" note keeps the SP honest):',
+      error
+    )
+  }
 }
 
 export interface MemoryRecallResult {
@@ -799,12 +830,12 @@ export async function closeEpisodeOp(
   }
 }
 
-/** Whiteboards compile into the system prompt every turn — keep them compact. */
+/** Whiteboards compile into the current-message DCM every turn — keep them compact. */
 export const WHITEBOARD_MAX_CHARS = 6_000
 
 /**
  * SA-104 P6 — update (or clear) the open episode's whiteboard: the agent-maintained
- * working-facts block that stays in awareness until the episode closes (DL-104-07).
+ * working-facts block that rides the current-message DCM until the episode closes (DL-104-07).
  * Content replaces the whole whiteboard (the agent rewrites it deliberately); null or
  * empty clears it. Closing an episode keeps the final content on the record
  * (dissolved = kept, no longer compiled — DL-104-02).
@@ -819,7 +850,7 @@ export async function updateWhiteboardOp(
   const rawContent = typeof input.content === 'string' ? input.content.trim() : ''
   if (rawContent.length > WHITEBOARD_MAX_CHARS) {
     throw new MemoryToolError(
-      `The whiteboard is capped at ${WHITEBOARD_MAX_CHARS} characters (it compiles into every turn). Keep only load-bearing working facts; move durable knowledge into memories instead.`
+      `The whiteboard is capped at ${WHITEBOARD_MAX_CHARS} characters (it arrives with every current message). Keep only load-bearing working facts; move durable knowledge into memories instead.`
     )
   }
 
@@ -829,7 +860,7 @@ export async function updateWhiteboardOp(
     episode: episodeSummary(updated),
     whiteboard: updated.whiteboard?.content ?? null,
     note: content
-      ? 'Whiteboard updated. It stays in your system prompt (EPISODE WHITEBOARD) until this episode closes.'
+      ? 'Whiteboard updated. It arrives with every current message (Episode whiteboard section) until this episode closes.'
       : 'Whiteboard cleared.'
   }
 }

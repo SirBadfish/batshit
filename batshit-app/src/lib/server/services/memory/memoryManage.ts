@@ -27,7 +27,8 @@ import {
   type MemorySearchFilters
 } from './memoryIndex'
 import { createMemoryEmbedder } from './memoryEmbedder'
-import { toMemorySummary, type MemorySummary } from './memoryTools'
+import { awarenessEntryLineHash, getMemoryFold } from './memoryRecall'
+import { refoldAwarenessAfterDelete, toMemorySummary, type MemorySummary } from './memoryTools'
 import type { MemoryLane, MemoryRecord, MemorySegmentRecord } from './memoryTypes'
 import { MEMORY_LANES } from './memoryTypes'
 
@@ -226,6 +227,11 @@ export async function deleteManagedMemory(
     throw new MemoryManageError(`Memory "${normalized}" was not found for this agent.`, 404)
   }
   const deleted = await deleteMemory(context.agentId, normalized)
+  if (deleted) {
+    // SA-110 P2 (DL-110-05): panel deletion is as destructive as the tool's — the
+    // same immediate re-fold rule applies so the SP never shows deleted content.
+    await refoldAwarenessAfterDelete(context.agentId, normalized, existing.lane)
+  }
   return { deleted }
 }
 
@@ -238,7 +244,7 @@ export async function deleteManagedMemory(
  */
 export async function getManagedAwareness(
   context: MemoryManageContext
-): Promise<{ entries: Array<MemoryRecordView & { expired: boolean }> }> {
+): Promise<{ entries: Array<MemoryRecordView & { expired: boolean; pending: 'new' | 'updated' | null }> }> {
   await requireOwnedAgent(context.userId, context.agentId)
   const nowTs = Date.now()
   const records = (await listMemories(context.agentId)).filter(
@@ -248,10 +254,24 @@ export async function getManagedAwareness(
     (a, b) =>
       b.importance - a.importance || a.saved_ts - b.saved_ts || a.id.localeCompare(b.id)
   )
+  // SA-110 P2 honesty: rows newer than the stored fold snapshot are flagged so the
+  // panel can say the entry is active via chat context but not yet in the permanent
+  // AWARENESS block (display only). No fold record = nothing pending (live compile).
+  const fold = await getMemoryFold(context.agentId)
+  const foldHashById = fold
+    ? new Map(fold.records.map((entry) => [entry.id, entry.line_hash]))
+    : null
   return {
     entries: records.map((record) => ({
       ...toRecordView(record),
-      expired: Boolean(record.expires_ts && record.expires_ts <= nowTs)
+      expired: Boolean(record.expires_ts && record.expires_ts <= nowTs),
+      pending: !foldHashById
+        ? null
+        : !foldHashById.has(record.id)
+          ? 'new'
+          : foldHashById.get(record.id) !== awarenessEntryLineHash(record)
+            ? 'updated'
+            : null
     }))
   }
 }

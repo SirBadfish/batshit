@@ -39,14 +39,15 @@ An MCP gateway is a source of MCP tools. Batshit works with several gateway type
 - Custom streamable HTTP gateways.
 - STDIO gateways launched from an explicit command.
 
-Each gateway can expose many tools, and you rarely want every tool dumped into every prompt. So Batshit exposes MCP tools through Dynamic Tool Search: the agent gets a compact discovery path, searches for the specific tool it needs, then calls the result.
+Each gateway can expose many tools, and you rarely want every tool dumped into every prompt. So Batshit exposes MCP tools through Dynamic Tool Search: the agent gets a compact discovery path for capabilities beyond the tools already in its tool list.
 
 ## Dynamic Tool Search and Use
 
-Dynamic Tool Search is a two-step pattern:
+Dynamic Tool Search is an on-demand pattern:
 
-1. **Search** — the agent searches discoverable capabilities by query, family, group, or exact name.
-2. **Use** — the agent calls the selected result with the required input.
+1. **Call listed tools directly** — if the needed tool is already in the agent's tool list, the agent calls it without searching.
+2. **Use an exact capability hint directly** — if Batshit's current-message context already provides an exact ref and enough input hints, the agent can call that ref without repeating the search.
+3. **Search when needed** — otherwise, the agent searches discoverable capabilities by query, family, group, or exact name, then calls the selected result.
 
 Search results are labeled by family so the agent knows what it found:
 
@@ -56,7 +57,7 @@ Search results are labeled by family so the agent knows what it found:
 - `fabric:` for Batshit-native controls.
 - `agent_browser:` for Agent Browser capabilities, where that runtime supports them.
 
-The key habit is exactness: the agent uses the exact ref that search returned. If search returns `mcp:github.search_issues` or `artifact:use.artifact.storyboard`, the use step calls that exact ref with the required input. The backend validates every call, so compact schema hints help the agent but don't replace permissions or safety checks.
+The key habit is exactness: the agent uses the exact ref that Batshit provided, whether it came from a search result or a current-message capability hint. If Batshit provides `mcp:github.search_issues` or `artifact:use.artifact.storyboard`, the use step calls that exact ref with the required input. The backend validates every call, so compact schema hints help the agent but don't replace permissions or safety checks.
 
 Why it works this way:
 

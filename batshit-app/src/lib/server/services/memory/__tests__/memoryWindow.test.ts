@@ -60,8 +60,19 @@ import {
   sessionEpisodesKey,
   type EpisodeRecord
 } from '../memoryEpisodes'
-import { updateWhiteboardOp, searchMemoriesOp, recallMemoriesOp, MemoryToolError } from '../memoryTools'
-import { computeMemoryCompileContext, commitMemoryTurnState } from '../memoryRecall'
+import {
+  deleteMemoryOp,
+  updateWhiteboardOp,
+  searchMemoriesOp,
+  recallMemoriesOp,
+  MemoryToolError
+} from '../memoryTools'
+import {
+  commitMemoryTurnState,
+  computeMemoryCompileContext,
+  foldAwarenessState,
+  getMemoryFold
+} from '../memoryRecall'
 import { getMemoryLingerState } from '../memoryLinger'
 import {
   applyFixedSessionGraduationToMessages,
@@ -628,7 +639,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
   // Whiteboard lifecycle (packet §1.9)
   // -------------------------------------------------------------------------
 
-  it('whiteboard: tool-edited, compiled into awareness, dissolved (kept) at close', async () => {
+  it('whiteboard: tool-edited, compiled as DCM lines (SA-110), dissolved (kept) at close', async () => {
     await seedEpisode({ id: 'epw', state: 'open', opened_at: '2026-06-10T08:00:00.000Z' })
 
     const updated = await updateWhiteboardOp(
@@ -643,9 +654,12 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       sessionId: FIXED_SESSION,
       currentUserMessage: 'hello'
     })
-    expect(compiled.whiteboardBlock).toContain('==== EPISODE WHITEBOARD (CURRENT EPISODE) ====')
-    expect(compiled.whiteboardBlock).toContain('Current goal: ship P6.')
+    // SA-110 (DL-110-01): the board is DCM lines now — never a system-prompt block.
+    expect(compiled.whiteboardDcmLines[0]).toContain('Episode whiteboard (')
+    expect(compiled.whiteboardDcmLines.join('\n')).toContain('Current goal: ship P6.')
+    expect(compiled.whiteboardDcmLines.join('\n')).toContain('sys.memory.whiteboard')
     expect(compiled.memoryContext?.whiteboard?.present).toBe(true)
+    expect(compiled.memoryContext?.whiteboard?.placement).toBe('dcm')
 
     // Regular sessions never compile a whiteboard.
     const regularCompiled = await computeMemoryCompileContext({
@@ -654,9 +668,9 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       sessionId: REGULAR_SESSION,
       currentUserMessage: 'hello'
     })
-    expect(regularCompiled.whiteboardBlock).toBe('')
+    expect(regularCompiled.whiteboardDcmLines).toEqual([])
 
-    // Close dissolves: content kept on the record, block no longer compiled.
+    // Close dissolves: content kept on the record, section no longer compiled.
     const { closeEpisode } = await import('../memoryEpisodes')
     await closeEpisode(FIXED_SESSION, 'epw', 'agent_mark')
     expect((await getEpisode(FIXED_SESSION, 'epw'))?.whiteboard?.content).toBe(
@@ -668,7 +682,7 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       sessionId: FIXED_SESSION,
       currentUserMessage: 'hello'
     })
-    expect(afterClose.whiteboardBlock).toBe('')
+    expect(afterClose.whiteboardDcmLines).toEqual([])
 
     // With no open episode left, the whiteboard control refuses loudly.
     await expect(
@@ -677,6 +691,188 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
         { content: 'anything' }
       )
     ).rejects.toBeInstanceOf(MemoryToolError)
+  })
+
+  // -------------------------------------------------------------------------
+  // SA-110 P2 — the awareness fold (DL-110-05/06)
+  // -------------------------------------------------------------------------
+
+  async function seedAwarenessRecord(
+    id: string,
+    content: string,
+    overrides: Record<string, any> = {}
+  ) {
+    await redis.json.set(`memory:${AGENT}:${id}`, '$', {
+      id,
+      agent_id: AGENT,
+      user_id: USER,
+      lane: 'awareness',
+      content,
+      importance: 7,
+      saved_at: '2026-06-09T00:00:00.000Z',
+      saved_ts: Date.parse('2026-06-09T00:00:00.000Z'),
+      is_superseded: 'n',
+      provenance: [{ session_id: FIXED_SESSION, source: 'agent' }],
+      visibility: 'normal',
+      embedding: [],
+      embedding_model: 'test',
+      schema_version: 1,
+      ...overrides
+    } as never)
+  }
+
+  const compileFixed = () =>
+    computeMemoryCompileContext({
+      userId: USER,
+      agentId: AGENT,
+      sessionId: FIXED_SESSION,
+      currentUserMessage: 'hello'
+    })
+
+  it('awareness fold: bootstrap at first commit, byte-stable SP across edits, pending notes, trigger refresh', async () => {
+    await seedAwarenessRecord('mem_fold_a', 'Fact A version one.')
+
+    // No fold record yet: live render (byte-identical to the pre-fold world), no pending.
+    const live = await compileFixed()
+    expect(live.onMyMindBlock).toContain('Fact A version one.')
+    expect(live.awarenessPendingDcmLines).toEqual([])
+    expect(live.memoryContext?.awarenessFold?.source).toBe('live-bootstrap')
+
+    // The session's first accepted-send commit bootstraps the fold from the same bytes.
+    await commitMemoryTurnState({
+      userId: USER,
+      agentId: AGENT,
+      sessionId: FIXED_SESSION,
+      currentUserMessage: 'hello'
+    })
+    const fold = await getMemoryFold(AGENT)
+    expect(fold?.reason).toBe('bootstrap')
+    expect(fold?.block).toBe(live.onMyMindBlock)
+
+    // Mid-session edit + new entry: the SP block must not move a byte.
+    await redis.json.set(`memory:${AGENT}:mem_fold_a`, '$.content', 'Fact A version two.' as never)
+    await seedAwarenessRecord('mem_fold_b', 'Fact B is brand new.')
+    const gated = await compileFixed()
+    expect(gated.onMyMindBlock).toBe(live.onMyMindBlock)
+    expect(gated.memoryContext?.awarenessFold?.source).toBe('fold')
+    const pending = gated.awarenessPendingDcmLines.join('\n')
+    expect(pending).toContain('Awareness updates (active NOW')
+    expect(pending).toContain('Fact B is brand new.')
+    expect(pending).toContain('Fact A version two.')
+    expect(pending).toContain('replaces the AWARENESS version')
+    expect(gated.memoryContext?.awarenessFold?.pending).toMatchObject({ new: 1, updated: 1 })
+
+    // A later commit in the SAME session is not a fold boundary.
+    await commitMemoryTurnState({
+      userId: USER,
+      agentId: AGENT,
+      sessionId: FIXED_SESSION,
+      currentUserMessage: 'again'
+    })
+    expect((await getMemoryFold(AGENT))?.folded_at).toBe(fold?.folded_at)
+
+    // A fold trigger adopts both changes and clears the pending section.
+    const folded = await foldAwarenessState({ agentId: AGENT, reason: 'nap' })
+    expect(folded.changed).toBe(true)
+    const after = await compileFixed()
+    expect(after.onMyMindBlock).toContain('Fact A version two.')
+    expect(after.onMyMindBlock).toContain('Fact B is brand new.')
+    expect(after.awarenessPendingDcmLines).toEqual([])
+
+    // Byte-identical refolds are no-ops.
+    expect((await foldAwarenessState({ agentId: AGENT, reason: 'dreaming' })).changed).toBe(false)
+  })
+
+  it('awareness fold: a NEW session first commit is a fold boundary (DL-110-06c)', async () => {
+    await seedAwarenessRecord('mem_fold_c', 'Fact C.')
+    await commitMemoryTurnState({
+      userId: USER,
+      agentId: AGENT,
+      sessionId: FIXED_SESSION,
+      currentUserMessage: 'hello'
+    })
+    await redis.json.set(`memory:${AGENT}:mem_fold_c`, '$.content', 'Fact C revised.' as never)
+
+    // Another session of the same agent: ITS first commit refolds the shared state.
+    await commitMemoryTurnState({
+      userId: USER,
+      agentId: AGENT,
+      sessionId: REGULAR_SESSION,
+      currentUserMessage: 'new session'
+    })
+    const fold = await getMemoryFold(AGENT)
+    expect(fold?.reason).toBe('new-session')
+    expect(fold?.block).toContain('Fact C revised.')
+  })
+
+  it('awareness fold: superseded/expired/moved entries get disregard notes while the SP stays frozen', async () => {
+    await seedAwarenessRecord('mem_fold_d', 'Fact D.')
+    await seedAwarenessRecord('mem_fold_e', 'Fact E.')
+    await seedAwarenessRecord('mem_fold_f', 'Fact F.')
+    await foldAwarenessState({ agentId: AGENT, reason: 'nap' })
+
+    await redis.json.set(`memory:${AGENT}:mem_fold_d`, '$.is_superseded', 'y' as never)
+    await redis.json.set(
+      `memory:${AGENT}:mem_fold_e`,
+      '$.expires_at',
+      new Date(Date.now() - 1000).toISOString() as never
+    )
+    await redis.json.set(`memory:${AGENT}:mem_fold_e`, '$.expires_ts', (Date.now() - 1000) as never)
+    await redis.json.set(`memory:${AGENT}:mem_fold_f`, '$.lane', 'ltm' as never)
+
+    const ctx = await compileFixed()
+    // The frozen view still shows all three; the pending notes carry the truth.
+    expect(ctx.onMyMindBlock).toContain('Fact D.')
+    expect(ctx.onMyMindBlock).toContain('Fact E.')
+    expect(ctx.onMyMindBlock).toContain('Fact F.')
+    const pending = ctx.awarenessPendingDcmLines.join('\n')
+    expect(pending).toContain('superseded [mem_fold_d]')
+    expect(pending).toContain('expired [mem_fold_e')
+    expect(pending).toContain('moved [mem_fold_f → ltm]')
+    expect(ctx.memoryContext?.awarenessFold?.pending).toMatchObject({
+      superseded: 1,
+      expired: 1,
+      moved: 1
+    })
+  })
+
+  it('awareness fold: deleting an awareness record re-folds immediately (DL-110-05)', async () => {
+    await seedAwarenessRecord('mem_fold_g', 'Fact G.')
+    await seedAwarenessRecord('mem_fold_h', 'Fact H.')
+    await foldAwarenessState({ agentId: AGENT, reason: 'nap' })
+
+    await deleteMemoryOp(
+      { userId: USER, agentId: AGENT, sessionId: FIXED_SESSION },
+      { memoryId: 'mem_fold_g' }
+    )
+    const fold = await getMemoryFold(AGENT)
+    expect(fold?.reason).toBe('delete')
+    expect(fold?.block).not.toContain('Fact G.')
+    expect(fold?.block).toContain('Fact H.')
+
+    const ctx = await compileFixed()
+    expect(ctx.onMyMindBlock).not.toContain('Fact G.')
+    expect(ctx.awarenessPendingDcmLines).toEqual([])
+  })
+
+  it('nap: the awareness fold rides the nap tail (DL-110-06a)', async () => {
+    await seedAwarenessRecord('mem_fold_i', 'Fact I.')
+    await seedMessage(FIXED_SESSION, 'mw_fold_1', 'user', 'hello', '2026-06-10T09:00:00.000Z')
+
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      generateSummary: async () => 'SUMMARY:\nunused\nWHITEBOARD:\nunused',
+      estimateTokens: estimateQueue([10]),
+      now: NOW
+    })
+    expect(outcome.record?.awarenessFold).toBe('folded')
+    const fold = await getMemoryFold(AGENT)
+    expect(fold?.reason).toBe('nap')
+    expect(fold?.block).toContain('Fact I.')
   })
 
   // -------------------------------------------------------------------------

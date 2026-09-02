@@ -2177,6 +2177,10 @@ export class DatabaseService {
     memoryDcmLines?: string[]
     /** SA-109 (DL-109-04): the general clip roster — all agents, groups included. */
     clipRosterDcmLines?: string[]
+    /** SA-110 (DL-110-01): the episode whiteboard section (Infinite Sessions only). */
+    whiteboardDcmLines?: string[]
+    /** SA-110 P2 (DL-110-05): awareness changes newer than the stored fold snapshot. */
+    awarenessPendingDcmLines?: string[]
   }) {
     const statusIcons = {
       new: '\u2705',
@@ -2440,6 +2444,20 @@ export class DatabaseService {
     // compiled lines stay byte-stable (DL-104-17).
     if (options.memoryDcmLines && options.memoryDcmLines.length > 0) {
       lines.push('', ...options.memoryDcmLines)
+    }
+
+    // SA-110 P2 (DL-110-05): awareness changes newer than the stored fold snapshot
+    // ride here — active immediately, folding into the SP block only at cache-dead
+    // boundaries so mid-session awareness work never resets the prefix cache.
+    if (options.awarenessPendingDcmLines && options.awarenessPendingDcmLines.length > 0) {
+      lines.push('', ...options.awarenessPendingDcmLines)
+    }
+
+    // SA-110 (DL-110-01): the episode whiteboard rides here — a sibling directly
+    // after the memory section, present even when that section is empty. Tail bytes
+    // are cache-free by construction, so the board's by-design churn costs nothing.
+    if (options.whiteboardDcmLines && options.whiteboardDcmLines.length > 0) {
+      lines.push('', ...options.whiteboardDcmLines)
     }
 
     const zipState = options.zipState
@@ -2907,9 +2925,20 @@ export class DatabaseService {
     // Do NOT add system prompts to the messages array
     
     // Merge all system prompts into one message (for Anthropic compatibility)
+    //
+    // SA-110 P3 (DL-110-07): the merged prompt is two zones, in this order.
+    //   BATSHIT ZONE   — how to operate here: base prompt, tool + zip guidance,
+    //                    dynamic tool search, memory instructions, shared insert.
+    //   IDENTITY ZONE  — who you are: the user's global prompt, this agent's own
+    //                    prompt, and the agent's own AWARENESS memories LAST,
+    //                    sitting directly against the conversation that follows.
+    // NOTHING may compile after AWARENESS (the episode whiteboard left for the
+    // DCM in P1). Every conditional gate below is unchanged from the pre-P3
+    // order — only position moved, which inside the SP is cache-free.
     let mergedSystemPrompt = ''
-    
-    
+
+    // ---------- Batshit zone ----------
+
     // Add primary Batshit system prompt (with variable replacement)
     if (primarySystemPrompt) {
       const processedPrimary = replacePromptVariables(primarySystemPrompt, agent, agent?.settings)
@@ -2917,20 +2946,6 @@ export class DatabaseService {
         normalizePrimaryAgentType(agent) as 'api' | 'cli'
       )
       mergedSystemPrompt += `==== ${promptLabel} ====\n\n${processedPrimary}`
-    }
-
-    // Add global custom prompt if enabled (with variable replacement)
-    if (globalCustomPrompt) {
-      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
-      const processedGlobal = replacePromptVariables(globalCustomPrompt, agent, agent?.settings)
-      mergedSystemPrompt += `==== GLOBAL CUSTOM SYSTEM PROMPT ====\n\n${processedGlobal}`
-    }
-    
-    // Add user's agent-specific prompt (with variable replacement)
-    if (userSystemPrompt) {
-      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
-      const processedUser = replacePromptVariables(userSystemPrompt, agent, agent?.settings)
-      mergedSystemPrompt += `==== USER SYSTEM PROMPT ====\n\n${processedUser}`
     }
 
     const runtimeFlavor = options?.runtimeFlavor ?? 'vercel'
@@ -2984,27 +2999,49 @@ export class DatabaseService {
       const memoryPrompt = await this.resolveMemoryGuidancePrompt(agent, runtimeFlavor)
       if (memoryPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
-        mergedSystemPrompt += `==== MEMORY (AGENT MEMORY ENABLED) ====\n\n${memoryPrompt}`
+        mergedSystemPrompt += `==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ====\n\n${memoryPrompt}`
       }
     }
 
-    // SA-104 P4: the agent-authored on-my-mind section compiles at the END of the
-    // stable prefix, directly after the memory guidance (DL-104-04 / P0 §1.2 locked
-    // position). Byte-stable ordering inside the recall engine keeps provider cache
-    // anchoring; entry edits/expiry are bounded deliberate resets. Mirrored in the
-    // client twin.
+    // Hook for future shared inserts (voice/SST/TTS, buffer summaries, agent setting
+    // notes, etc.). SA-110 P3: it closes the BATSHIT ZONE. It used to append after
+    // AWARENESS, which DL-110-07 forbids; it returns '' today so the move is
+    // byte-invisible, but whoever fills this hook must land here, not at the end.
+    const sharedInsert = this.buildSharedInsert()
+    if (sharedInsert) {
+      mergedSystemPrompt += sharedInsert
+    }
+
+    // ---------- Identity zone ----------
+
+    // Add global custom prompt if enabled (with variable replacement)
+    if (globalCustomPrompt) {
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      const processedGlobal = replacePromptVariables(globalCustomPrompt, agent, agent?.settings)
+      mergedSystemPrompt += `==== GLOBAL CUSTOM SYSTEM PROMPT ====\n\n${processedGlobal}`
+    }
+
+    // Add user's agent-specific prompt (with variable replacement)
+    if (userSystemPrompt) {
+      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+      const processedUser = replacePromptVariables(userSystemPrompt, agent, agent?.settings)
+      mergedSystemPrompt += `==== USER SYSTEM PROMPT ====\n\n${processedUser}`
+    }
+
+    // SA-104 P4 / SA-110 P3 (DL-110-07): the agent's own awareness memories are the
+    // LAST thing in the system prompt — the close of the identity zone, sitting
+    // directly against the conversation. Its bytes come verbatim from the stored
+    // fold snapshot (SA-110 P2), so mid-session awareness churn never moves them.
+    // Nothing may be appended to mergedSystemPrompt after this point.
     if (memoryCompileContext?.onMyMindBlock) {
       if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
       mergedSystemPrompt += memoryCompileContext.onMyMindBlock
     }
 
-    // SA-104 P6: the open episode's whiteboard (Infinite Sessions) rides directly after
-    // AWARENESS — awareness-layer working facts, byte-stable between deliberate
-    // edits. Mirrored in the client twin.
-    if (memoryCompileContext?.whiteboardBlock) {
-      if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
-      mergedSystemPrompt += memoryCompileContext.whiteboardBlock
-    }
+    // SA-110 (DL-110-01): the episode whiteboard no longer compiles into the system
+    // prompt. It rides the DCM (`whiteboardDcmLines` below) because it churns by
+    // design and SP bytes sit ahead of the entire packed history — nothing may
+    // compile after AWARENESS here.
 
     // Artifact guidance is now skill-led.
     // Build context still controls tool availability and DCM visibility,
@@ -3088,12 +3125,6 @@ export class DatabaseService {
 
     }
 
-    // Hook for future shared inserts (voice/SST/TTS, buffer summaries, etc.)
-    const sharedInsert = this.buildSharedInsert()
-    if (sharedInsert) {
-      mergedSystemPrompt += sharedInsert
-    }
-
     // Store the compiled system prompt separately (not in messages anymore)
     const compiledMainSystemPrompt = mergedSystemPrompt
 
@@ -3152,7 +3183,9 @@ export class DatabaseService {
           zipAiViewMode: zipViewMode,
           isCodexMode: options?.runtimeFlavor === 'codex' || options?.runtimeFlavor === 'claude',
           memoryDcmLines,
-          clipRosterDcmLines
+          clipRosterDcmLines,
+          whiteboardDcmLines: memoryCompileContext?.whiteboardDcmLines ?? [],
+          awarenessPendingDcmLines: memoryCompileContext?.awarenessPendingDcmLines ?? []
         })
       : ''
     const currentMessageForLLM = currentMessageFormatted

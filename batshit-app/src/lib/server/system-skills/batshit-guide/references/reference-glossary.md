@@ -120,7 +120,7 @@ An ephemeral context block Batshit adds to the current user message before sendi
 
 ### Dynamic Tool Search
 
-Batshit's search-then-use pattern for discoverable MCP tools, saved CLI Tools, published Artifact runtime tools, Fabric controls, and Agent Browser capabilities. The agent searches only when needed, then calls the selected result.
+Batshit's on-demand path for discoverable MCP tools, saved CLI Tools, published Artifact runtime tools, Fabric controls, and Agent Browser capabilities. The agent calls tools already in its list directly, can use exact capability-hint refs directly, and searches only when it still needs discovery.
 
 ## E
 

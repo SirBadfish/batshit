@@ -1236,6 +1236,11 @@ export class RedisService {
       } catch (dreamIndexError) {
         console.error(`[deleteAgent] Error deleting dreaming-log index:`, dreamIndexError)
       }
+      try {
+        await client.del(`memfold:${id}`)
+      } catch (foldError) {
+        console.error(`[deleteAgent] Error deleting awareness fold:`, foldError)
+      }
 
       // Remove from user's agent list
       const agentObj = agent as any

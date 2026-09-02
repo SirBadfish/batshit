@@ -1336,13 +1336,13 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Memory Supersede',
     description:
-      'Mark older memories as replaced by a newer one. Superseded memories stay stored and visible with a pointer to the successor — supersession invalidates, it never deletes.',
+      'Choose which memory remains current and mark the others as replaced. Timestamps do not decide the winner. Superseded memories stay stored and visible with a pointer to the selected successor — supersession invalidates, it never deletes.',
     inputSchema: memorySupersedeControlSchema,
     inputSchemaJson: {
       type: 'object',
       properties: {
-        memoryId: { type: 'string', description: 'The newer memory that replaces the others.' },
-        supersedes: { type: 'array', items: { type: 'string' }, description: 'Older memory ids being replaced.' }
+        memoryId: { type: 'string', description: 'The memory that should remain current.' },
+        supersedes: { type: 'array', items: { type: 'string' }, description: 'Memory ids being replaced.' }
       },
       required: ['memoryId', 'supersedes']
     },
@@ -1497,7 +1497,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'Episode Whiteboard',
     description:
-      'Infinite Sessions only: rewrite the episode whiteboard — the working-facts block (current goal, key decisions, live state, open items) that stays in your system prompt until the episode closes. Pass the complete new content (it replaces the whole whiteboard), or null to clear it. When the episode closes, the whiteboard dissolves but its final content is kept on the episode record.',
+      'Infinite Sessions only: rewrite the episode whiteboard — the working-facts block (current goal, key decisions, live state, open items) that arrives with every current message until the episode closes. Pass the complete new content (it replaces the whole whiteboard), or null to clear it. When the episode closes, the whiteboard dissolves but its final content is kept on the episode record.',
     inputSchema: z
       .object({
         content: z.string().nullable().optional()

@@ -60,6 +60,7 @@ import {
   type SummaryGenerator
 } from './memoryGraduation'
 import { closeEpisode, getOpenEpisode } from './memoryEpisodes'
+import { foldAwarenessState } from './memoryRecall'
 import {
   createMemory,
   createMemorySegment,
@@ -118,6 +119,7 @@ export type DreamingActionKind =
   | 'consolidation_review'
   | 'consolidate_merge'
   | 'era_consolidation'
+  | 'awareness_fold'
   | 'skip_session'
 
 export interface DreamingActionRecord {
@@ -1244,6 +1246,29 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           error instanceof Error ? error.message : 'unknown error'
         )
       }
+    }
+
+    // SA-110 P2 (DL-110-06b): the awareness fold is dreaming's final bounded step —
+    // dreaming's idle-gap eligibility means provider caches are already expired, so
+    // folding here is free. It runs LAST so the snapshot captures everything this
+    // run changed (expiry demotions, supersession repairs, consolidation merges).
+    try {
+      const fold = await foldAwarenessState({ agentId, reason: 'dreaming', now })
+      act(
+        'awareness_fold',
+        fold.changed ? 'done' : 'skipped',
+        fold.changed
+          ? 'awareness changes since the last fold now compile in the system-prompt block (idle caches were already expired)'
+          : 'awareness unchanged since the last fold — nothing to fold'
+      )
+    } catch (foldError) {
+      act(
+        'awareness_fold',
+        'failed',
+        'the awareness fold failed; the system-prompt block keeps compiling the previous snapshot and pending notes stay visible',
+        undefined,
+        foldError instanceof Error ? foldError.message : 'unknown error'
+      )
     }
 
     record.finished_at = options.now ? now.toISOString() : new Date().toISOString()

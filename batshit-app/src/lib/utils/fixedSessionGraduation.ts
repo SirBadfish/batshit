@@ -70,6 +70,11 @@ export interface FixedSessionNapRecord {
   skippedEpisodes: Array<{ episodeId: string; reason: string }>
   rezippedZipCount: number
   compaction: FixedSessionNapStep3Record | null
+  /**
+   * SA-110 P2 (DL-110-06a): the awareness fold riding the nap — 'folded',
+   * 'unchanged', or 'failed: <why>'. Absent on pre-SA-110 nap records.
+   */
+  awarenessFold?: string
   error?: string
 }
 

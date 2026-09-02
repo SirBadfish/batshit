@@ -21,8 +21,10 @@
  * and the loud index guards stay where DL-104-10 put them (boot, saves, search).
  */
 
+import { createHash } from 'node:crypto'
 import { redis } from '$lib/server/redis'
 import { estimateTokens } from '$lib/utils/tokens'
+import { memoryFoldKey } from './memoryKeys'
 import {
   resolveAgentMemoryEnabled,
   resolveMemoryIdleGapHours,
@@ -107,10 +109,19 @@ export interface MemoryCompileContext {
    */
   onMyMindBlock: string
   /**
-   * SA-104 P6: the open episode's whiteboard as a system-prompt block (Infinite Sessions
-   * only), appended directly after AWARENESS. '' when absent.
+   * SA-110 (DL-110-01): the open episode's whiteboard as DCM lines (Infinite Sessions
+   * only), rendered directly after the DCM `Memory context:` section. The board moved
+   * out of the system prompt because it churns by design and SP bytes sit ahead of the
+   * whole packed history — every rewrite was resetting the provider prefix cache.
+   * Tail bytes are cache-free by construction. [] when absent; no SP fallback exists.
    */
-  whiteboardBlock: string
+  whiteboardDcmLines: string[]
+  /**
+   * SA-110 P2 (DL-110-05): the DCM "Awareness updates" section — awareness changes
+   * newer than the stored fold snapshot, riding the cache-free tail until the next
+   * fold boundary. [] when a fold does not exist yet or nothing changed since it.
+   */
+  awarenessPendingDcmLines: string[]
   /** Formatted "Memory context:" lines for the DCM, or [] when there is nothing. */
   dcmLines: string[]
   /** Clip ids carried by inserted memories, for the structured image path. */
@@ -124,7 +135,8 @@ export interface MemoryCompileContext {
 const EMPTY_CONTEXT: MemoryCompileContext = {
   enabled: false,
   onMyMindBlock: '',
-  whiteboardBlock: '',
+  whiteboardDcmLines: [],
+  awarenessPendingDcmLines: [],
   dcmLines: [],
   memoryClipIds: [],
   memoryClipSources: {},
@@ -255,6 +267,36 @@ function episodeHoldAlive(
   return !episode.stretchEnded
 }
 
+/**
+ * SA-110 P2 — the ONE awareness selection rule (eligibility, deterministic order,
+ * budget), shared by the live compile, the fold writer, and the Memory Panel's
+ * pending computation so all three agree byte-for-byte on what the block holds.
+ */
+export function selectAwarenessState(
+  records: MemoryRecord[],
+  budgets: MemoryLaneBudgets,
+  nowTs: number
+): { entries: MemoryRecord[]; truncatedCount: number; tokenEstimate: number } {
+  const awarenessSorted = records
+    .filter(
+      (record) =>
+        record.lane === 'awareness' && record.is_superseded !== 'y' && !isExpired(record, nowTs)
+    )
+    .sort(
+      (a, b) =>
+        b.importance - a.importance || a.saved_ts - b.saved_ts || a.id.localeCompare(b.id)
+    )
+  const entries: MemoryRecord[] = []
+  let tokenEstimate = 0
+  for (const record of awarenessSorted) {
+    const cost = insertTokenCost(record)
+    if (entries.length > 0 && tokenEstimate + cost > budgets.onMyMind) continue
+    entries.push(record)
+    tokenEstimate += cost
+  }
+  return { entries, truncatedCount: awarenessSorted.length - entries.length, tokenEstimate }
+}
+
 function selectMemoryInserts(options: {
   agentId: string
   currentUserMessage: string
@@ -268,25 +310,11 @@ function selectMemoryInserts(options: {
   const byId = new Map(records.map((record) => [record.id, record]))
 
   // --- On-my-mind compile (also the DL-104-17 rule-2 dedup set) ---
-  const awarenessSorted = records
-    .filter(
-      (record) =>
-        record.lane === 'awareness' && record.is_superseded !== 'y' && !isExpired(record, nowTs)
-    )
-    .sort(
-      (a, b) =>
-        b.importance - a.importance || a.saved_ts - b.saved_ts || a.id.localeCompare(b.id)
-    )
-  const onMyMindEntries: MemoryRecord[] = []
-  let onMyMindTokens = 0
-  for (const record of awarenessSorted) {
-    const cost = insertTokenCost(record)
-    if (onMyMindEntries.length > 0 && onMyMindTokens + cost > budgets.onMyMind) continue
-    onMyMindEntries.push(record)
-    onMyMindTokens += cost
-  }
+  const awarenessState = selectAwarenessState(records, budgets, nowTs)
+  const onMyMindEntries = awarenessState.entries
+  const onMyMindTokens = awarenessState.tokenEstimate
   const onMyMindIds = new Set(onMyMindEntries.map((record) => record.id))
-  const onMyMindTruncated = awarenessSorted.length - onMyMindEntries.length
+  const onMyMindTruncated = awarenessState.truncatedCount
 
   // --- Raw buckets ---
   const lingerEntries = (linger?.lingering ?? []).filter(
@@ -582,38 +610,43 @@ function formatInsertLine(
 }
 
 /**
- * SA-104 P6 — the episode whiteboard block (design §1.3): the agent-maintained
- * working-facts block for the OPEN episode, kept in awareness until the episode
- * closes. Byte-stable across turns; changes only through deliberate edits
- * (sys.memory.whiteboard), nap extraction, or episode close (DL-104-04 posture).
+ * SA-110 (DL-110-01) — the episode whiteboard as a DCM section: the agent-maintained
+ * working-facts block for the OPEN episode, rendered with the current message where
+ * its by-design churn costs no cache. Content changes through deliberate edits
+ * (sys.memory.whiteboard), nap extraction, or episode close. The stamp uses full
+ * date+time — tail bytes are free, and freshness awareness is the point of the board.
  */
-function formatWhiteboardBlock(whiteboard: { content: string; updated_at: string }): string {
+function formatWhiteboardDcmLines(whiteboard: { content: string; updated_at: string }): string[] {
   return [
-    '==== EPISODE WHITEBOARD (CURRENT EPISODE) ====',
-    '',
-    `Working facts you keep in front of yourself for the current episode (updated ${fmtDate(whiteboard.updated_at)}). Rewrite with sys.memory.whiteboard; it dissolves when the episode closes.`,
-    '',
-    whiteboard.content
-  ].join('\n')
+    `Episode whiteboard (working facts you maintain for the current episode; updated ${fmtDateTime(whiteboard.updated_at)}):`,
+    whiteboard.content,
+    '(Rewrite it with sys.memory.whiteboard — full replacement. It dissolves when the episode closes.)'
+  ]
+}
+
+/** One awareness entry's exact rendered lines — the unit the fold fingerprints. */
+function formatOnMyMindEntryLines(record: MemoryRecord): string[] {
+  const parts = [record.id, `importance ${record.importance}`, `saved ${fmtDate(record.saved_at)}`]
+  if (record.event_at) parts.push(`event ${fmtDate(record.event_at)}`)
+  if (record.expires_at) parts.push(`expires ${fmtDate(record.expires_at)}`)
+  const lines = [`- [${parts.join(' | ')}] ${record.content}`]
+  if (record.clip_ids?.length) {
+    lines.push(
+      `  (has media: ${record.clip_ids.length} clip${record.clip_ids.length === 1 ? '' : 's'} — recall ${record.id} to view)`
+    )
+  }
+  return lines
 }
 
 function formatOnMyMindBlock(entries: MemoryRecord[], truncatedCount: number): string {
   if (entries.length === 0 && truncatedCount === 0) return ''
   const lines: string[] = [
-    '==== AWARENESS (AGENT MEMORY) ====',
+    '==== AWARENESS (YOUR MEMORIES) ====',
     '',
     'Entries you deliberately keep in mind (lane: awareness). You wrote these; edit or reorganize them with your memory tools (sys.memory.update / move_lane / supersede).'
   ]
   for (const record of entries) {
-    const parts = [record.id, `importance ${record.importance}`, `saved ${fmtDate(record.saved_at)}`]
-    if (record.event_at) parts.push(`event ${fmtDate(record.event_at)}`)
-    if (record.expires_at) parts.push(`expires ${fmtDate(record.expires_at)}`)
-    lines.push(`- [${parts.join(' | ')}] ${record.content}`)
-    if (record.clip_ids?.length) {
-      lines.push(
-        `  (has media: ${record.clip_ids.length} clip${record.clip_ids.length === 1 ? '' : 's'} — recall ${record.id} to view)`
-      )
-    }
+    lines.push(...formatOnMyMindEntryLines(record))
   }
   if (truncatedCount > 0) {
     lines.push(
@@ -621,6 +654,195 @@ function formatOnMyMindBlock(entries: MemoryRecord[], truncatedCount: number): s
     )
   }
   return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// SA-110 P2 — the awareness fold (DL-110-05/06)
+//
+// The SP's AWARENESS block compiles from a stored SNAPSHOT of its rendered
+// bytes, not from live records: awareness edits mid-session would otherwise
+// mutate the first wire segment and reset the provider prefix cache for the
+// entire conversation. Neither a per-record flag nor a fold watermark can
+// reproduce pre-edit bytes after an edit — only a snapshot can (the DL-110-06
+// representation decision). Mid-session changes ride the DCM as pending notes
+// (computed as a diff against the snapshot's per-entry line fingerprints) and
+// fold into the snapshot only at cache-dead boundaries: a session's first
+// accepted-send commit (bootstrap / new-session), the nap tail, dreaming's
+// final step, and an immediate re-fold when an awareness record is deleted
+// (showing deleted content until a fold would lie). Compile stays read-only:
+// with no snapshot stored it renders live records — byte-identical to the
+// pre-fold world — and the next commit writes the first snapshot from the
+// same bytes, so the deploy transition itself causes no divergence.
+// ---------------------------------------------------------------------------
+
+export type MemoryFoldReason = 'bootstrap' | 'new-session' | 'nap' | 'dreaming' | 'delete'
+
+export interface MemoryFoldRecord {
+  schema_version: typeof MEMORY_SCHEMA_VERSION
+  folded_at: string
+  folded_ts: number
+  reason: MemoryFoldReason
+  /** The exact `==== AWARENESS … ====` block bytes ('' when no entries). */
+  block: string
+  /** What the block contains: entry id + fingerprint of its rendered lines. */
+  records: Array<{ id: string; line_hash: string }>
+  truncated_count: number
+}
+
+/** Fingerprint of one entry's exact rendered lines (edit detection, no false positives). */
+export function awarenessEntryLineHash(record: MemoryRecord): string {
+  return createHash('sha256')
+    .update(formatOnMyMindEntryLines(record).join('\n'))
+    .digest('hex')
+    .slice(0, 16)
+}
+
+export async function getMemoryFold(agentId: string): Promise<MemoryFoldRecord | null> {
+  const record = (await redis.json.get(memoryFoldKey(agentId))) as MemoryFoldRecord | null
+  return record && typeof record === 'object' && typeof record.block === 'string' ? record : null
+}
+
+/**
+ * Renders the CURRENT awareness state and stores it as the new fold snapshot.
+ * Byte-identical re-folds are skipped (`changed: false`) so no-change triggers
+ * never touch the stored state. Callers own failure semantics: nap and dreaming
+ * record a failed fold in their visible logs; the commit trigger logs loudly and
+ * never fails the send (a failed fold changes nothing — the SP keeps compiling
+ * the previous snapshot and the pending notes stay honest).
+ */
+export async function foldAwarenessState(options: {
+  agentId: string
+  reason: MemoryFoldReason
+  now?: Date
+}): Promise<{ folded: boolean; changed: boolean; block: string }> {
+  const agentId = options.agentId?.trim()
+  if (!agentId) throw new Error('foldAwarenessState requires an agentId.')
+  const agent = await loadAgentRecord(agentId)
+  if (!agent || !resolveAgentMemoryEnabled(agent)) {
+    return { folded: false, changed: false, block: '' }
+  }
+  const now = options.now ?? new Date()
+  const budgets = resolveMemoryLaneBudgets(agent)
+  const records = await listMemories(agentId)
+  const selection = selectAwarenessState(records, budgets, now.getTime())
+  const block = formatOnMyMindBlock(selection.entries, selection.truncatedCount)
+
+  const existing = await getMemoryFold(agentId)
+  if (existing && existing.block === block) {
+    return { folded: false, changed: false, block }
+  }
+
+  const record: MemoryFoldRecord = {
+    schema_version: MEMORY_SCHEMA_VERSION,
+    folded_at: now.toISOString(),
+    folded_ts: now.getTime(),
+    reason: options.reason,
+    block,
+    records: selection.entries.map((entry) => ({
+      id: entry.id,
+      line_hash: awarenessEntryLineHash(entry)
+    })),
+    truncated_count: selection.truncatedCount
+  }
+  await redis.json.set(memoryFoldKey(agentId), '$', record as never)
+  return { folded: true, changed: true, block }
+}
+
+export interface AwarenessPendingCounts {
+  new: number
+  updated: number
+  superseded: number
+  expired: number
+  moved: number
+  removed: number
+}
+
+/**
+ * The DCM "Awareness updates" section: everything the stored fold does not show
+ * yet. New/updated entries carry their full content (they are ACTIVE now — the
+ * fold only decides where the bytes ride); state changes to fold-visible entries
+ * (superseded/expired/moved/removed) get one-line disregard notes so the SP's
+ * frozen view can never quietly lie.
+ */
+function computeAwarenessPending(options: {
+  fold: MemoryFoldRecord
+  memoryRecords: MemoryRecord[]
+  nowTs: number
+}): { lines: string[]; counts: AwarenessPendingCounts } {
+  const { fold, memoryRecords, nowTs } = options
+  const counts: AwarenessPendingCounts = {
+    new: 0,
+    updated: 0,
+    superseded: 0,
+    expired: 0,
+    moved: 0,
+    removed: 0
+  }
+  const byId = new Map(memoryRecords.map((record) => [record.id, record]))
+  const foldHashById = new Map(fold.records.map((entry) => [entry.id, entry.line_hash]))
+  const entryLines: string[] = []
+
+  const eligible = memoryRecords.filter(
+    (record) =>
+      record.lane === 'awareness' && record.is_superseded !== 'y' && !isExpired(record, nowTs)
+  )
+  for (const record of eligible) {
+    const foldHash = foldHashById.get(record.id)
+    if (foldHash === undefined) {
+      counts.new += 1
+      entryLines.push(`  - ${ICON_NEW} new ${formatOnMyMindEntryLines(record)[0].replace(/^- /, '')}`)
+      if (record.clip_ids?.length) {
+        entryLines.push(
+          `    (has media: ${record.clip_ids.length} clip${record.clip_ids.length === 1 ? '' : 's'} — recall ${record.id} to view)`
+        )
+      }
+    } else if (foldHash !== awarenessEntryLineHash(record)) {
+      counts.updated += 1
+      entryLines.push(
+        `  - ${ICON_REFRESHED} updated (replaces the AWARENESS version) ${formatOnMyMindEntryLines(record)[0].replace(/^- /, '')}`
+      )
+    }
+  }
+
+  for (const foldEntry of fold.records) {
+    const live = byId.get(foldEntry.id)
+    if (!live) {
+      counts.removed += 1
+      entryLines.push(
+        `  - removed [${foldEntry.id}]: this AWARENESS entry was deleted — disregard it.`
+      )
+      continue
+    }
+    if (live.lane !== 'awareness') {
+      counts.moved += 1
+      entryLines.push(
+        `  - moved [${foldEntry.id} → ${live.lane}]: this AWARENESS entry now lives in the ${live.lane} lane.`
+      )
+      continue
+    }
+    if (live.is_superseded === 'y') {
+      counts.superseded += 1
+      entryLines.push(
+        `  - superseded [${foldEntry.id}]: this AWARENESS entry is outdated — prefer ${live.superseded_by ?? 'its successor'}.`
+      )
+      continue
+    }
+    if (isExpired(live, nowTs)) {
+      counts.expired += 1
+      entryLines.push(
+        `  - expired [${foldEntry.id} | expired ${fmtDate(live.expires_at)}]: treat this AWARENESS entry as no longer in effect.`
+      )
+    }
+  }
+
+  if (entryLines.length === 0) return { lines: [], counts }
+  return {
+    lines: [
+      'Awareness updates (active NOW; they fold into your AWARENESS block at the next nap, dream, or new session):',
+      ...entryLines
+    ],
+    counts
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -770,19 +992,27 @@ export async function computeMemoryCompileContext(options: {
     }
   }
 
-  const onMyMindBlock = formatOnMyMindBlock(
-    selection.onMyMind.entries,
-    selection.onMyMind.truncatedCount
-  )
+  // SA-110 P2 (DL-110-05): the SP's AWARENESS block compiles from the stored fold
+  // snapshot when one exists — byte-stable across mid-session awareness changes.
+  // No snapshot yet (pre-fold agent) = live render, byte-identical to the pre-fold
+  // world; the next accepted-send commit writes the bootstrap fold from these same
+  // bytes. Changes newer than the fold ride the DCM as pending notes.
+  const fold = await getMemoryFold(agentId)
+  const onMyMindBlock = fold
+    ? fold.block
+    : formatOnMyMindBlock(selection.onMyMind.entries, selection.onMyMind.truncatedCount)
+  const awarenessPending = fold
+    ? computeAwarenessPending({ fold, memoryRecords, nowTs })
+    : { lines: [], counts: null }
 
-  // SA-104 P6: the open episode's whiteboard joins awareness for Infinite Sessions
-  // (already loaded by the shared episode-context loader above).
-  let whiteboardBlock = ''
+  // SA-110 (DL-110-01): the open episode's whiteboard compiles as a DCM section for
+  // Infinite Sessions (already loaded by the shared episode-context loader above).
+  let whiteboardDcmLines: string[] = []
   let whiteboardTokens = 0
   if (episode.isFixedSession) {
     const whiteboard = openEpisode?.whiteboard
     if (whiteboard?.content?.trim()) {
-      whiteboardBlock = formatWhiteboardBlock(whiteboard)
+      whiteboardDcmLines = formatWhiteboardDcmLines(whiteboard)
       whiteboardTokens = estimateTokens(whiteboard.content)
     }
   }
@@ -790,7 +1020,8 @@ export async function computeMemoryCompileContext(options: {
   return {
     enabled: true,
     onMyMindBlock,
-    whiteboardBlock,
+    whiteboardDcmLines,
+    awarenessPendingDcmLines: awarenessPending.lines,
     dcmLines,
     memoryClipIds,
     memoryClipSources,
@@ -798,11 +1029,20 @@ export async function computeMemoryCompileContext(options: {
       lingerWindowTurns: lingerWindow,
       recallLingerWindowTurns: recallLingerWindow,
       budgets,
-      whiteboard: { present: whiteboardBlock.length > 0, tokenEstimate: whiteboardTokens },
+      whiteboard: {
+        present: whiteboardDcmLines.length > 0,
+        placement: 'dcm',
+        tokenEstimate: whiteboardTokens
+      },
+      awarenessFold: {
+        source: fold ? 'fold' : 'live-bootstrap',
+        foldedAt: fold?.folded_at ?? null,
+        ...(awarenessPending.counts ? { pending: awarenessPending.counts } : {})
+      },
       onMyMind: {
-        count: selection.onMyMind.entries.length,
-        truncatedCount: selection.onMyMind.truncatedCount,
-        tokenEstimate: selection.onMyMind.tokenEstimate
+        count: fold ? fold.records.length : selection.onMyMind.entries.length,
+        truncatedCount: fold ? fold.truncated_count : selection.onMyMind.truncatedCount,
+        tokenEstimate: fold ? estimateTokens(fold.block) : selection.onMyMind.tokenEstimate
       },
       inserts: inserted.map((candidate) => ({
         id: candidate.record.id,
@@ -1064,6 +1304,26 @@ export async function commitMemoryTurnState(options: {
     schema_version: MEMORY_SCHEMA_VERSION
   }
   await setMemoryLingerState(sessionId, nextRecord)
+
+  // SA-110 P2 (DL-110-06c): a session's FIRST accepted-send commit is a fold
+  // boundary — no provider cache exists for this session yet. A missing fold
+  // record bootstraps on ANY commit (freezing the exact bytes this send's live
+  // compile just used, so the transition itself diverges nothing). Byte-identical
+  // re-folds are skipped inside foldAwarenessState. A failed fold never fails the
+  // send: the SP keeps compiling the previous snapshot and pending notes stay
+  // honest — but it is logged loudly.
+  const isFirstSessionCommit = typeof linger?.last_commit_ts !== 'number'
+  try {
+    const existingFold = await getMemoryFold(agentId)
+    if (!existingFold || isFirstSessionCommit) {
+      await foldAwarenessState({
+        agentId,
+        reason: existingFold ? 'new-session' : 'bootstrap'
+      })
+    }
+  } catch (error) {
+    console.error('[memoryRecall] Awareness fold at the accepted-send commit failed:', error)
+  }
 
   // Recall-refresh fires on delivery (new + refreshed), never on mere search hits.
   for (const memoryId of [...insertedNewIds, ...refreshedIds]) {

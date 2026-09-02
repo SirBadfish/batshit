@@ -500,27 +500,82 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     expect(server.primarySystemPrompt).toContain('API PRIMARY PROMPT BODY')
   })
 
-  it('S2: system prompt merge order and unresolved variables are identical', async () => {
+  it('S2 SA-110 P3: the merged prompt runs Batshit zone then identity zone (DL-110-07)', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
 
     const { server } = await runServerCompile({
       sessionId,
       messages: [],
-      agent: apiAgent(),
+      agent: apiAgent({ memory_enabled: true }),
       currentUserMessage: 'hello',
       options: { runtimeFlavor: 'vercel' }
     })
 
     const prompt = server.primarySystemPrompt ?? ''
+    // Batshit zone: how to operate here.
     const primaryIndex = prompt.indexOf('API PRIMARY PROMPT BODY')
+    const toolZipIndex = prompt.indexOf('==== TOOL + ZIP GUIDANCE')
+    const discoveryIndex = prompt.indexOf('==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====')
+    const memoryIndex = prompt.indexOf('==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ====')
+    // Identity zone: who you are, ending on the agent's own memories.
     const globalIndex = prompt.indexOf('==== GLOBAL CUSTOM SYSTEM PROMPT ====')
     const userIndex = prompt.indexOf('==== USER SYSTEM PROMPT ====')
-    expect(primaryIndex).toBeGreaterThanOrEqual(0)
-    expect(globalIndex).toBeGreaterThan(primaryIndex)
+
+    for (const index of [primaryIndex, toolZipIndex, discoveryIndex, memoryIndex, globalIndex, userIndex]) {
+      expect(index).toBeGreaterThanOrEqual(0)
+    }
+    expect(toolZipIndex).toBeGreaterThan(primaryIndex)
+    expect(discoveryIndex).toBeGreaterThan(toolZipIndex)
+    expect(memoryIndex).toBeGreaterThan(discoveryIndex)
+    // The zone boundary: every Batshit instruction block precedes the user's prompts.
+    expect(globalIndex).toBeGreaterThan(memoryIndex)
     expect(userIndex).toBeGreaterThan(globalIndex)
     // Unresolved {{ $variable }} placeholders pass through as literals in BOTH lanes.
     expect(prompt).toContain('{{ $unresolved_var }}')
+  })
+
+  it('S2b SA-110 P3: the managed CLI lanes compile the same zone order (one compiler)', async () => {
+    // DL-110-07 CLI spot-proof. API and CLI primaries share the single canonical
+    // compiler, so a reorder that held for `vercel` must hold for the managed Codex
+    // and Claude runtime flavors too — this pins that it stayed one implementation.
+    for (const runtimeFlavor of ['codex', 'claude'] as const) {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+
+      const { server } = await runServerCompile({
+        sessionId,
+        messages: [],
+        agent: apiAgent({
+          primary_agent_type: 'cli',
+          agentType: 'cli',
+          memory_enabled: true
+        }),
+        currentUserMessage: 'hello',
+        options: { runtimeFlavor }
+      })
+
+      const prompt = server.primarySystemPrompt ?? ''
+      const ordered = [
+        '==== CLI PRIMARY SYSTEM PROMPT ====',
+        '==== TOOL + ZIP GUIDANCE',
+        '==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====',
+        '==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ====',
+        '==== GLOBAL CUSTOM SYSTEM PROMPT ====',
+        '==== USER SYSTEM PROMPT ===='
+      ]
+      let previous = -1
+      for (const header of ordered) {
+        const index = prompt.indexOf(header)
+        expect({ runtimeFlavor, header, found: index >= 0 }).toEqual({
+          runtimeFlavor,
+          header,
+          found: true
+        })
+        expect(index).toBeGreaterThan(previous)
+        previous = index
+      }
+    }
   })
 
   it('S3: zip-bearing history with manual unzip state compiles identically', async () => {
@@ -1119,6 +1174,13 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
         .toEqual({ needle: 'Never invent placeholder refs', n: 1 })
       expect({ needle: 'Prefer the broker over bash', n: occurrences('Prefer the broker over bash') })
         .toEqual({ needle: 'Prefer the broker over bash', n: 1 })
+      expect({
+        needle: 'If a tool is already in your tool list, call it directly — never search for it',
+        n: occurrences('If a tool is already in your tool list, call it directly — never search for it')
+      }).toEqual({
+        needle: 'If a tool is already in your tool list, call it directly — never search for it',
+        n: 1
+      })
 
       // Bash policy: tool + zip block only.
       expect({ needle: 'POLICY_BLOCKED', n: occurrences('POLICY_BLOCKED') })
@@ -1138,7 +1200,7 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
   })
 
   it('S17 SA-104 P3: memory guidance ships for memory-enabled agents in BOTH lanes and stays absent otherwise', async () => {
-    const MEMORY_BLOCK_HEADER = '==== MEMORY (AGENT MEMORY ENABLED) ===='
+    const MEMORY_BLOCK_HEADER = '==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ===='
 
     // Default agent: memory is opt-in, so the block must be absent.
     {
@@ -1169,6 +1231,10 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
         expect(prompt).toContain(MEMORY_BLOCK_HEADER)
         expect(prompt).toContain('<batshit-memory>')
         expect(prompt).toContain('fabric:sys.memory.search')
+        expect(prompt).toContain('which memory remains current')
+        expect(prompt).toContain('timestamps do not decide')
+        expect(prompt).toContain('refuses supersession cycles loudly')
+        expect(prompt).toContain('Direct memory operations: call `native_batshit_tool_use` directly')
         expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_use\b/)
         expect(prompt).not.toMatch(/(^|[^_])\bbatshit_tool_search\b/)
       }
@@ -1176,7 +1242,7 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
   })
 
   it('S18 SA-104 P4: recall-engine context (on-my-mind, DCM inserts, time awareness)', async () => {
-    const ON_MY_MIND_HEADER = '==== AWARENESS (AGENT MEMORY) ===='
+    const ON_MY_MIND_HEADER = '==== AWARENESS (YOUR MEMORIES) ===='
 
     const seedMemoryFixtures = (agentId: string, sessionId: string) => {
       state.current.kv.set(`agent:${agentId}`, {
@@ -1270,9 +1336,15 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
       for (const result of [server]) {
         const prompt = result.primarySystemPrompt ?? ''
         expect(prompt).toContain(ON_MY_MIND_HEADER)
-        expect(prompt.indexOf(ON_MY_MIND_HEADER)).toBeGreaterThan(
-          prompt.indexOf('==== MEMORY (AGENT MEMORY ENABLED) ====')
+        // SA-110 P3 (DL-110-07): AWARENESS closes the identity zone — it follows the
+        // Batshit instruction blocks AND the user's own prompts, and NOTHING compiles
+        // after it in the system prompt.
+        const awarenessIndex = prompt.indexOf(ON_MY_MIND_HEADER)
+        expect(awarenessIndex).toBeGreaterThan(
+          prompt.indexOf('==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ====')
         )
+        expect(awarenessIndex).toBeGreaterThan(prompt.indexOf('==== USER SYSTEM PROMPT ===='))
+        expect(prompt.indexOf('====', awarenessIndex + ON_MY_MIND_HEADER.length)).toBe(-1)
         expect(prompt).toContain('The user prefers plain-English explanations.')
 
         const userMessage = currentUserMessageContent(result)
@@ -1336,8 +1408,11 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     }
   })
 
-  it('S19 SA-104 P6: graduation splices and the episode whiteboard are identical ; regular sessions stay untouched', async () => {
-    const WHITEBOARD_HEADER = '==== EPISODE WHITEBOARD (CURRENT EPISODE) ===='
+  it('S19 SA-104 P6 / SA-110: graduation splices apply and the whiteboard rides the DCM, never the system prompt; regular sessions stay untouched', async () => {
+    // SA-110 (DL-110-01): the retired SP header must never come back, and the board
+    // now renders as the DCM's `Episode whiteboard (` section.
+    const RETIRED_WHITEBOARD_SP_HEADER = '==== EPISODE WHITEBOARD (CURRENT EPISODE) ===='
+    const WHITEBOARD_DCM_MARKER = 'Episode whiteboard ('
     const allCompiledContent = (result: any): string =>
       (result?.structuredInput?.messages ?? [])
         .map((message: any) => (typeof message?.content === 'string' ? message.content : ''))
@@ -1420,12 +1495,16 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
         expect(allCompiledContent(result)).toContain('Graduated episode summary:')
         expect(allCompiledContent(result)).toContain('lake trip was planned')
         const prompt = result.primarySystemPrompt ?? ''
-        expect(prompt).toContain(WHITEBOARD_HEADER)
-        expect(prompt).toContain('Current goal: finish the garage shelving order.')
-        expect(prompt.indexOf(WHITEBOARD_HEADER)).toBeGreaterThan(
-          prompt.indexOf('==== MEMORY (AGENT MEMORY ENABLED) ====')
-        )
+        // The board left the system prompt entirely (no fallback path).
+        expect(prompt).not.toContain(RETIRED_WHITEBOARD_SP_HEADER)
+        expect(prompt).not.toContain('Current goal: finish the garage shelving order.')
+        // It rides the current message's DCM instead, inside the #current segment.
+        const currentMessage = currentUserMessageContent(result)
+        expect(currentMessage).toContain(WHITEBOARD_DCM_MARKER)
+        expect(currentMessage).toContain('Current goal: finish the garage shelving order.')
+        expect(currentMessage).toContain('sys.memory.whiteboard')
         expect(result.structuredInput?.metadata?.memoryContext?.whiteboard?.present).toBe(true)
+        expect(result.structuredInput?.metadata?.memoryContext?.whiteboard?.placement).toBe('dcm')
       }
     }
 
@@ -1469,7 +1548,8 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
       })
       for (const result of [server]) {
         expect(allCompiledContent(result)).not.toContain('Graduated episode summary:')
-        expect(result.primarySystemPrompt ?? '').not.toContain(WHITEBOARD_HEADER)
+        expect(result.primarySystemPrompt ?? '').not.toContain(RETIRED_WHITEBOARD_SP_HEADER)
+        expect(allCompiledContent(result)).not.toContain(WHITEBOARD_DCM_MARKER)
       }
     }
   })

@@ -637,7 +637,10 @@
                     Memories the agent keeps present at all times: they compile into its
                     system prompt on every message, in exactly this order. Permanent
                     unless edited, or temporary with an expiry the agent sets. Expired
-                    and superseded entries stop compiling but stay stored.
+                    and superseded entries stop compiling but stay stored. Changes are
+                    active immediately via chat context; a "pending fold" badge means
+                    the entry folds into the permanent system-prompt block at the next
+                    nap, dream, or new session.
                   </p>
                 </SettingsInfoMenu>
               {/snippet}
@@ -666,6 +669,14 @@
                       <span class="memory-omm-meta">
                         <span class="batshit-settings-status-badge is-info">imp {entry.importance}</span>
                         <span class="batshit-settings-status-badge">{formatShortDate(entry.saved_at)}</span>
+                        {#if entry.pending}
+                          <span
+                            class="batshit-settings-status-badge"
+                            title="Active now via chat context; folds into the permanent AWARENESS block at the next nap, dream, or new session."
+                          >
+                            pending fold
+                          </span>
+                        {/if}
                         {#if entry.expires_at}
                           <span class="batshit-settings-form-meta">
                             {entry.expired ? 'expired' : `expires ${formatShortDate(entry.expires_at)}`}
