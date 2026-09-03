@@ -49,7 +49,27 @@ Numbers on this page come from our own measurements (August 2026), not provider 
 | Mistral | No cache reporting at all | Their API returns no cache fields, so nothing can be shown |
 | Cohere | Reports a counter, but it read a constant 144 even on first messages in our tests | Treat it as noise; Cohere documents no cache pricing |
 
-Local AI runtimes (Ollama, LM Studio, llama.cpp, vLLM, Docker Model Runner) are not in the table: you run those yourself, so there is no per-token bill and no provider cache counter to audit.
+## Local AI programs cache too — for speed, not money
+
+Local AI programs aren't in the table above, because you run them yourself and there is no per-token bill to discount. But they absolutely do cache, and it matters more than you might expect: on a home computer, reading the prompt is usually the slow part, so a cache hit is the difference between waiting 27 seconds and waiting 0.05.
+
+Four of the seven report the number, and three don't:
+
+| Program | Reports cached tokens? |
+| --- | --- |
+| llama.cpp | Yes |
+| Docker Model Runner | Yes |
+| SGLang | Yes |
+| oMLX | Yes |
+| Ollama | No |
+| vLLM | No |
+| LM Studio | No, on the endpoint Batshit uses |
+
+**"No" means no counter, not no cache.** Ollama went from 27 seconds to 0.05 seconds on a repeat send while reporting nothing at all. Batshit says so plainly in the Token Panel instead of showing a zero it never received — and it will never turn a fast response into a cache verdict.
+
+Where a program does report, Batshit shows the real number. Some caches work in fixed blocks — oMLX uses 4,096 tokens — so a short conversation honestly reports zero until it grows past one block. That's correct behavior, and the tooltip explains it rather than leaving you guessing.
+
+For the whole story, including what resets a local cache and how to read the speed numbers instead, see [Why your local model gets faster on the second message](../local-ai/speed-and-caching.md).
 
 ## Reading your own numbers
 

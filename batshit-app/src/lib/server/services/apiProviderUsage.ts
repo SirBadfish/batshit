@@ -585,3 +585,49 @@ export function resolveMessageUsage(args: {
 
   return base as ApiUsageLike
 }
+
+/**
+ * SA-102 P4 (DL-102-13): strip a cached-token count a local program never
+ * actually reported.
+ *
+ * `@ai-sdk/openai-compatible` maps an ABSENT `prompt_tokens_details.cached_tokens`
+ * to **0**, so Ollama, vLLM and LM Studio's chat endpoint all arrive here
+ * claiming a confident zero. Measured on the Ollama lane through Batshit's real
+ * send path: time-to-first-output fell 43,085 ms -> 1,268 ms across three sends
+ * while `cachedInputTokens` read 0 every time. The cache plainly worked; the
+ * number was fiction.
+ *
+ * Zero is displayed only when a program that DOES report reported zero. For the
+ * rest the field becomes `undefined`, which every readout already renders as
+ * "not reported" rather than as a miss.
+ *
+ * This never touches cloud lanes, and it never invents a number — it only
+ * refuses to pass one along.
+ */
+export function withHonestLocalCacheUsage(
+  usage: ApiUsageLike,
+  reporting: 'reports' | 'never-reports' | null | undefined
+): ApiUsageLike {
+  if (!usage || reporting !== 'never-reports') return usage
+  // Normalize FIRST. The AI SDK can hand back either a flat
+  // `cachedInputTokens` or a nested `inputTokens.cacheRead`, and a flat delete
+  // on the un-normalized object leaves the nested one to be re-extracted
+  // downstream by `buildTokenUsage`.
+  const normalized = normalizeUsageLike(usage) ?? usage
+  if (
+    normalized.cachedInputTokens === undefined &&
+    normalized.cacheCreationInputTokens === undefined &&
+    normalized.inputTokenDetails?.cacheReadTokens === undefined
+  ) {
+    return usage
+  }
+  const next: NonNullable<ApiUsageLike> = { ...normalized }
+  delete next.cachedInputTokens
+  delete next.cacheCreationInputTokens
+  if (next.inputTokenDetails) {
+    const details = { ...next.inputTokenDetails }
+    delete (details as Record<string, unknown>).cacheReadTokens
+    next.inputTokenDetails = Object.keys(details).length ? details : undefined
+  }
+  return next
+}

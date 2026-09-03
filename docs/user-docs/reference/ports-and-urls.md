@@ -151,16 +151,23 @@ n8n Workflow Subagent callbacks and tool calls must use a Batshit URL reachable 
 | Optional Docker n8n profile | `http://app:3000` |
 | Host-managed n8n calling Docker Batshit | `http://127.0.0.1:5620` |
 
-## Local AI and voice runtime URLs
+## Local AI and voice service URLs
 
 For Docker installs, host-local services usually need `host.docker.internal` when Batshit server-side code calls them.
 
-| Runtime | Mac app URL example | Docker server-side URL example |
+| Service | Mac app URL example | Docker server-side URL example |
 | --- | --- | --- |
 | Ollama | `http://localhost:11434` | `http://host.docker.internal:11434` |
+| Docker Model Runner | `http://localhost:12434` | `http://host.docker.internal:12434` |
 | LM Studio | `http://localhost:1234` | `http://host.docker.internal:1234` |
+| llama.cpp | `http://localhost:8080` | `http://host.docker.internal:8080` |
+| vLLM | `http://localhost:8000` | `http://host.docker.internal:8000` |
+| SGLang | `http://localhost:30000` | `http://host.docker.internal:30000` |
+| oMLX | `http://localhost:8000` | `http://host.docker.internal:8000` |
 | whisper.cpp uploaded-audio STT | `http://localhost:8077` | `http://host.docker.internal:8077` |
 | Host BYO TTS engine | `http://localhost:<port>` | `http://host.docker.internal:<port>` |
+
+vLLM and oMLX both default to port 8000. Batshit warns when both are enabled rather than blocking; move one of them and update its Base URL.
 
 Realtime browser-direct STT is the exception because the microphone stream starts in the browser. A browser-direct WebSocket for a host service usually stays `ws://localhost:<port>` or `ws://127.0.0.1:<port>`.
 

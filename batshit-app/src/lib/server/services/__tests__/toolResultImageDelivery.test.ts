@@ -508,3 +508,46 @@ describe('neutral delivery vocabulary', () => {
     expect(text).toContain('recalled memory media')
   })
 })
+
+/**
+ * SA-102 P2 (DL-102-02): moving local runtimes from `createOpenAI` to
+ * `@ai-sdk/openai-compatible` must not move their image lane. Both providers
+ * serialize a tool result's `content` output with `JSON.stringify`, so every
+ * local runtime stays on the synthetic-user lane — this pins that, and pins the
+ * two runtimes P5 adds so they cannot land on the wrong lane by omission.
+ */
+describe('SA-102 local runtimes keep the synthetic-user image lane', () => {
+  const LOCAL_RUNTIME_IDS = [
+    'ollama',
+    'dmr',
+    'lmstudio',
+    'llama-cpp',
+    'vllm',
+    // added in P5; asserted here so a new runtime cannot silently inherit
+    // `tool_result` by being forgotten
+    'sglang',
+    'omlx'
+  ]
+
+  it('resolves every local runtime id to synthetic_user', () => {
+    for (const providerId of LOCAL_RUNTIME_IDS) {
+      const decision = resolveToolResultImageDelivery({
+        providerId,
+        modelId: 'some-local-model',
+        capabilities: { vision: true } as any,
+        runtime: 'api'
+      })
+      expect(decision.lane, `${providerId} lane`).toBe('synthetic_user')
+    }
+  })
+
+  it('keeps a local model NAMED like an OpenAI model off the tool_result lane', () => {
+    const decision = resolveToolResultImageDelivery({
+      providerId: 'llama-cpp',
+      modelId: 'gpt-5-local-gguf',
+      capabilities: { vision: true } as any,
+      runtime: 'api'
+    })
+    expect(decision.lane).toBe('synthetic_user')
+  })
+})

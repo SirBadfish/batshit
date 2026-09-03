@@ -110,7 +110,10 @@ Load only what the question needs. Names are `references/<file>`.
 - `voice-voice-clones.md` — voice clones and Voice Studio.
 
 **Local AI**
-- `local-ai-overview.md` — Ollama, LM Studio, llama.cpp, vLLM, Docker Model Runner.
+- `local-ai-overview.md` — connecting the seven local AI programs: Ollama, Docker Model Runner, LM Studio, llama.cpp, vLLM, SGLang, oMLX.
+- `local-ai-model-settings.md` — what Batshit sends, why blank means blank, per-program settings, the Ollama context trap, model formats.
+- `local-ai-speed-and-caching.md` — local prompt caching, what resets it, and reading the speed numbers.
+- `local-ai-sglang-and-omlx.md` — setting up SGLang and oMLX, local API keys, the shared port 8000.
 
 **n8n resources**
 - `resources-n8n-workflow-templates.md` — the official Batshit n8n workflow templates.

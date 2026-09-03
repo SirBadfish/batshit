@@ -39,6 +39,16 @@ data/
 **/data/postgres/
 **/data/redis/
 
+# ...but batshit-app/src/lib/data is SOURCE, not runtime data. The bare `data/`
+# above matches it at any depth, and git will not re-include a file whose parent
+# directory is excluded, so the directory has to be un-ignored before its
+# contents. Without both lines a NEW file under src/lib/data never reaches the
+# public repo and nothing says so — already-tracked files there stay tracked,
+# which is why this hid until SA-102 added the first new ones. Mirrors the
+# private repo's own .gitignore.
+!batshit-app/src/lib/data/
+!batshit-app/src/lib/data/**
+
 # Local-only workspace data
 _local/
 @ignore/

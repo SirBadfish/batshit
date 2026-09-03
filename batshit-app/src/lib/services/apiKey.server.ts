@@ -92,7 +92,19 @@ const API_KEY_PATTERNS: Record<string, RegExp> = {
   n8n_api_url: /^https?:\/\/.+/i,
   n8n_instance_mcp_token: GENERIC_SECRET_PATTERN,
   batshit_token: INTERNAL_SECRET_PATTERN,
-  batshit_artifact_complete_url: /^https?:\/\/.+/i
+  batshit_artifact_complete_url: /^https?:\/\/.+/i,
+  // SA-102 P5 (DL-102-09, DL-102-14): local AI programs that can require a key.
+  // ONE store per program, encrypted through the same AES-256-GCM path as every
+  // other Batshit credential, shared by the chat transport and the memory
+  // embedder. Josh's oMLX answered 401 until he turned its key check off; LM
+  // Studio 0.4 tokens, `vllm --api-key` and `sglang --api-key` are the same gap.
+  ollama: GENERIC_SECRET_PATTERN,
+  dmr: GENERIC_SECRET_PATTERN,
+  lmstudio: GENERIC_SECRET_PATTERN,
+  'llama-cpp': GENERIC_SECRET_PATTERN,
+  vllm: GENERIC_SECRET_PATTERN,
+  sglang: GENERIC_SECRET_PATTERN,
+  omlx: GENERIC_SECRET_PATTERN
 };
 
 const UNMASKED_SERVICES = new Set([

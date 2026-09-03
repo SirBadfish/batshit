@@ -45,7 +45,7 @@ Local-first does not mean nothing ever leaves your machine. The moment you use a
 
 When you call a hosted model, your request and your saved API key go to that provider, under your own account with them. Batshit does not proxy those calls through a Batshit-operated cloud and does not route your keys through one — your key is stored encrypted on your instance and used to talk to the provider directly. That's good for trust (no Batshit middleman holding your traffic) and it's also the plain truth: an external provider is external. Your prompt content, and whatever context Batshit compiled for that request, goes to them and is governed by their terms, not Batshit's.
 
-If you want to keep even that on your machine, that's exactly what **Local AI** and **local voice engines** are for. A model running in Ollama, LM Studio, or a similar local runtime, or a voice engine running on your host, means the request never leaves your computer. In Docker, those host runtimes are reached through the host-gateway URL rather than `localhost`, since the call originates inside a container — again, a boundary the URL has to account for, covered in [Ports and URLs](../reference/ports-and-urls.md).
+If you want to keep even that on your machine, that's exactly what **Local AI** and **local voice engines** are for. A model running in Ollama, LM Studio, oMLX, or a similar local program, or a voice engine running on your host, means the request never leaves your computer. In Docker, those host services are reached through the host-gateway URL rather than `localhost`, since the call originates inside a container — again, a boundary the URL has to account for, covered in [Ports and URLs](../reference/ports-and-urls.md).
 
 ## The short version
 

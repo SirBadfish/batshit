@@ -89,6 +89,7 @@
 		"@ai-sdk/mcp": "^2.0.36",
 		"@ai-sdk/mistral": "^4.0.32",
 		"@ai-sdk/openai": "^4.0.46",
+		"@ai-sdk/openai-compatible": "^3.0.43",
 		"@ai-sdk/replicate": "^3.0.30",
 		"@ai-sdk/togetherai": "^3.0.42",
 		"@ai-sdk/xai": "^4.0.50",

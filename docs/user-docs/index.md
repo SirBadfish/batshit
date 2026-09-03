@@ -96,7 +96,7 @@ These docs are grouped by subject — everything about a feature lives in one pl
 
 **Runtimes and operations**
 
-- [Local AI](local-ai/overview.md) — Ollama, LM Studio, and other local runtimes.
+- [Local AI](local-ai/overview.md) — Ollama, LM Studio, oMLX, and the other programs that run models on your own hardware.
 - [Chat](chat/execution-viewer.md) — the chat workspace, including the Execution Viewer.
 - [Admin](admin/backup-and-restore.md) — backup and restore.
 - [Resources](resources/n8n-workflow-templates.md) — n8n workflow templates and downloads.

@@ -34,6 +34,7 @@ import {
 import {
   canonicalEmbeddingModelId,
   createMemoryEmbedder,
+  createMemoryEmbedderAsync,
   DEFAULT_MEMORY_EMBEDDING_CONFIG
 } from './memoryEmbedder'
 
@@ -572,8 +573,12 @@ export async function rebuildMemoryIndexes(options: {
   let dims = resolveConfiguredDims(config)
 
   if (options.reembed) {
+    // SA-102 P5 (DL-102-14): async door for the same reason as every other
+    // write path. `resolveConfiguredDims` above keeps the sync door because its
+    // call is guarded to the builtin lane, which has no key.
     const embedder =
-      options.embedder ?? createMemoryEmbedder(config, { userId: options.userId ?? null })
+      options.embedder ??
+      (await createMemoryEmbedderAsync(config, { userId: options.userId ?? null }))
     if (embedder.modelId !== embeddingModel) {
       throw new Error(
         `Memory re-index refused: supplied embedder (${embedder.modelId}) does not match the configured model (${embeddingModel}).`

@@ -204,7 +204,7 @@ An add-on listed in `compose.yaml` is an opt-in recipe. It's not automatically r
 | LiveKit | Optional `livekit` voice runtime profile with LiveKit server plus Batshit agent worker. |
 | `comfyui-validation` | Optional validation sidecar for ComfyUI-shaped artifact routing. Not full GPU ComfyUI. |
 | Real ComfyUI/Gradio-style runtimes | Connect existing for launch unless a future approved sidecar ships. |
-| Local AI | Connect existing. Batshit doesn't bundle Ollama, LM Studio, Docker Model Runner, llama.cpp, or vLLM. |
+| Local AI | Connect existing. Batshit doesn't bundle Ollama, Docker Model Runner, LM Studio, llama.cpp, vLLM, SGLang, or oMLX. |
 | Voice engines | Connect existing, or saved host-runtime launch through the operator. No arbitrary speech-engine containers at launch. |
 | Docker MCP Gateway | Optional host-side gateway. Not part of the core Compose app. |
 
@@ -270,7 +270,7 @@ Local AI runtimes aren't bundled in the core Docker image. If Ollama runs on you
 http://host.docker.internal:11434
 ```
 
-The same idea applies to LM Studio, Docker Model Runner, llama.cpp, and vLLM. Save the URL the Batshit app container can reach, then use Settings → Local AI to check status and list models.
+The same idea applies to LM Studio, Docker Model Runner, llama.cpp, vLLM, SGLang, and oMLX. Save the URL the Batshit app container can reach, then use Settings → Local AI to check status and list models.
 
 ## Voice engines from Docker
 
