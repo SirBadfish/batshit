@@ -1,13 +1,19 @@
 import type { CatalogConnectionOption } from '$lib/types/modelCatalog'
 import type { SavedModel } from '$lib/types/savedModels'
 import { determineModelCompatibility } from '$lib/data/model-compatibility-registry'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { resolveModelVoiceSessionConfig } from '$lib/utils/modelVoiceSession'
 import type { PrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { isCliPrimaryAgentType } from '$lib/utils/primaryAgentType'
 import type { ToolHostScope } from '$lib/utils/brokerAvailability'
 
-const LOCAL_PROVIDER_IDS = new Set(['ollama', 'dmr', 'lmstudio', 'llama-cpp', 'vllm'])
+/**
+ * SA-102 P6: derived, never hand-listed — see localImageTransportPolicy.ts.
+ * Hardcoded, `sglang` and `omlx` presets resolved their compatibility as cloud,
+ * so the availability chip in the preset picker could mis-label or lock them.
+ */
+const LOCAL_PROVIDER_IDS: ReadonlySet<string> = LOCAL_AI_SERVER_IDS
 
 export type ModelPresetAvailability = {
   disabled: boolean

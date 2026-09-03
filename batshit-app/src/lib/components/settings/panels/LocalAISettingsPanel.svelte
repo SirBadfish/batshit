@@ -28,7 +28,7 @@
   import OllamaModelManager from '../OllamaModelManager.svelte'
   import DmrModelManager from '../DmrModelManager.svelte'
   import type { UserSettingsRow } from '$lib/types/database'
-  import { dispatchLocalAiSettingsUpdated, dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
+  import { dispatchLocalAiSettingsUpdated } from '$lib/utils/liveSettingsEvents'
 
   const SAVE_DEBOUNCE_MS = 600
   const IMAGE_TRANSPORT_OPTIONS: Array<{ value: LocalAiImageTransport; label: string; helper: string }> = [

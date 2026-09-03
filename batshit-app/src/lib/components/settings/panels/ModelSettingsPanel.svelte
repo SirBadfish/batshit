@@ -4818,7 +4818,18 @@ $effect(() => {
                                           </span>
                                         </Select.Trigger>
                                         <Select.Content>
-                                          <Select.Item value="">Use provider default</Select.Item>
+                                          <!--
+                                            SA-102 follow-up: only render the built-in empty option when the
+                                            schema does not already carry one. The tri-state booleans
+                                            (parallelToolCalls, store, strictJsonSchema,
+                                            openaiWebSearchExternalAccess, includeThoughts) ship their own
+                                            { label: 'Default', value: '' }, and two Select.Items sharing
+                                            value="" both highlight as selected while switching between them
+                                            does nothing.
+                                          -->
+                                          {#if !(parameter.options ?? []).some((option) => option.value === '')}
+                                            <Select.Item value="">Use provider default</Select.Item>
+                                          {/if}
                                           {#each parameter.options ?? [] as option (option.value)}
                                             <Select.Item value={option.value}>{option.label}</Select.Item>
                                           {/each}

@@ -22,6 +22,8 @@ import { apiKeyService } from '$lib/services/apiKey.server'
 import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import { listLocalAiServers } from '$lib/server/services/localAiServers'
 import type { LocalAiServerId } from '$lib/types/localAi'
+import { redis } from '$lib/server/redis'
+import { MEMORY_CONFIG_KEY } from '$lib/server/services/memory/memoryKeys'
 import { logger } from '$lib/utils/logger'
 
 export function isLocalProgramKeyService(service: string | null | undefined): boolean {
@@ -83,12 +85,45 @@ export async function resolveLocalProgramIdForBaseUrl(
 }
 
 /**
+ * Strip a plaintext `localAi.apiKey` out of `batshit:memory_config`.
+ *
+ * Full-document `JSON.SET`, never `json.del(key, path)` — node-redis v5 can
+ * ignore the positional path and delete the WHOLE document (see shared agent
+ * memory, 2026-06-09). Best-effort: the caller already has a working key, and
+ * failing a send because a cleanup write did not land would be worse than
+ * leaving the redundant copy for the next attempt.
+ */
+async function stripMemoryConfigApiKey(): Promise<boolean> {
+  try {
+    const stored = (await redis.json.get(MEMORY_CONFIG_KEY)) as
+      | { embedding?: { localAi?: { apiKey?: string | null } } }
+      | null
+    if (!stored?.embedding?.localAi || !('apiKey' in stored.embedding.localAi)) return false
+
+    const { apiKey: _dropped, ...localAiWithoutKey } = stored.embedding.localAi
+    const next = {
+      ...stored,
+      embedding: { ...stored.embedding, localAi: localAiWithoutKey }
+    }
+    await redis.json.set(MEMORY_CONFIG_KEY, '$', next as never)
+    return true
+  } catch (error) {
+    logger.debug('[local-key] could not strip the memory-config key', { error })
+    return false
+  }
+}
+
+/**
  * The key the memory embedder's `local-ai` lane should use, and a one-time
  * migration of any key still sitting in `batshit:memory_config`.
  *
- * Returns the key to use plus whether the caller should now strip the plaintext
- * copy out of the memory config. The caller owns the write so this stays a pure
- * resolver on the read path.
+ * SA-102 P6: this function performs the strip itself. It used to return a
+ * `migratedFromMemoryConfig` flag for the caller to act on, on the theory that
+ * a read-path resolver should not write — but it already writes
+ * (`apiKeyService.store`), and the one caller dropped the flag, so the
+ * plaintext copy survived forever beside the encrypted one. DL-102-14 says the
+ * memory config's key "stops being an independent secret"; a half-done
+ * migration is exactly the two-stores drift the lock exists to prevent.
  */
 export async function resolveMemoryLocalAiApiKey(args: {
   baseUrl: string | null | undefined
@@ -100,8 +135,10 @@ export async function resolveMemoryLocalAiApiKey(args: {
 
   const stored = await readLocalProgramApiKey(programId, args.userId)
   if (stored) {
-    // The shared store wins. A leftover copy in the memory config is redundant.
-    return { apiKey: stored, migratedFromMemoryConfig: configured.length > 0 }
+    // The shared store wins, so a leftover copy in the memory config is a
+    // redundant plaintext secret. Remove it.
+    const migrated = configured.length > 0 ? await stripMemoryConfigApiKey() : false
+    return { apiKey: stored, migratedFromMemoryConfig: migrated }
   }
 
   if (!configured.length) {
@@ -113,10 +150,12 @@ export async function resolveMemoryLocalAiApiKey(args: {
   if (programId && args.userId) {
     try {
       await apiKeyService.store(programId, configured, args.userId)
+      const migrated = await stripMemoryConfigApiKey()
       logger.debug('[local-key] migrated memory-config key into the shared store', {
-        programId
+        programId,
+        strippedPlaintext: migrated
       })
-      return { apiKey: configured, migratedFromMemoryConfig: true }
+      return { apiKey: configured, migratedFromMemoryConfig: migrated }
     } catch (error) {
       logger.debug('[local-key] migration failed; using the configured key as-is', {
         programId,

@@ -1,4 +1,15 @@
-const LOCAL_PROVIDER_IDS = new Set(['ollama', 'dmr', 'lmstudio', 'llama-cpp', 'vllm'])
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
+
+/**
+ * SA-102 P6: derived, never hand-listed.
+ *
+ * This was a hardcoded five-id set and SA-102 grew the program list to seven,
+ * so `sglang` and `omlx` silently classified as CLOUD here — no local image URL
+ * rewriting through `imageBaseUrl`, and `shouldEnableTools` took the non-local
+ * branch. Deriving from the definitions is the whole point of the "adding a
+ * program is one row" rule; two copies had escaped it.
+ */
+const LOCAL_PROVIDER_IDS: ReadonlySet<string> = LOCAL_AI_SERVER_IDS
 
 export type ImageTransportOverride = 'auto' | 'url'
 

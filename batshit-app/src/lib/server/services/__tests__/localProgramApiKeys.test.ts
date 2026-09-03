@@ -31,6 +31,27 @@ vi.mock('$lib/server/services/localAiServers', () => ({
   listLocalAiServers: vi.fn(async () => servers)
 }))
 
+/**
+ * SA-102 P6: the memory config document, so the plaintext strip can be asserted.
+ *
+ * The migration used to return a `migratedFromMemoryConfig` flag and leave the
+ * write to its caller — which dropped it, so the plaintext key survived beside
+ * the encrypted one forever. The strip now happens at the source, and these
+ * tests hold it there.
+ */
+let memoryConfigDoc: Record<string, any> | null = null
+
+vi.mock('$lib/server/redis', () => ({
+  redis: {
+    json: {
+      get: vi.fn(async () => memoryConfigDoc),
+      set: vi.fn(async (_key: string, _path: string, value: unknown) => {
+        memoryConfigDoc = value as Record<string, any>
+      })
+    }
+  }
+}))
+
 const {
   isLocalProgramKeyService,
   readLocalProgramApiKey,
@@ -40,7 +61,20 @@ const {
 
 beforeEach(() => {
   store.clear()
+  memoryConfigDoc = null
 })
+
+/** A memory config carrying the legacy plaintext key for the oMLX base URL. */
+function seedMemoryConfigWithPlaintextKey(apiKey: string) {
+  memoryConfigDoc = {
+    embedding: {
+      lane: 'local-ai',
+      modelId: 'local-ai:nomic@768',
+      localAi: { baseUrl: 'http://localhost:8000/v1', modelName: 'nomic', dims: 768, apiKey }
+    },
+    schema_version: 4
+  }
+}
 
 describe('SA-102 local program API keys', () => {
   it('recognises every local program id and nothing else', () => {
@@ -71,8 +105,10 @@ describe('SA-102 local program API keys', () => {
     expect(await resolveLocalProgramIdForBaseUrl('http://localhost:9999/v1', 'u')).toBeNull()
   })
 
-  it('prefers the shared store over a legacy memory-config key', async () => {
+  it('prefers the shared store over a legacy memory-config key, and strips the plaintext copy', async () => {
     store.set('omlx', 'sk-from-the-shared-store')
+    seedMemoryConfigWithPlaintextKey('sk-legacy-in-memory-config')
+
     const result = await resolveMemoryLocalAiApiKey({
       baseUrl: 'http://localhost:8000/v1',
       configuredApiKey: 'sk-legacy-in-memory-config',
@@ -80,9 +116,17 @@ describe('SA-102 local program API keys', () => {
     })
     expect(result.apiKey).toBe('sk-from-the-shared-store')
     expect(result.migratedFromMemoryConfig).toBe(true)
+
+    // The redundant plaintext secret is GONE, and the rest of the config survives.
+    expect(memoryConfigDoc?.embedding?.localAi).not.toHaveProperty('apiKey')
+    expect(memoryConfigDoc?.embedding?.localAi?.modelName).toBe('nomic')
+    expect(memoryConfigDoc?.embedding?.lane).toBe('local-ai')
+    expect(memoryConfigDoc?.schema_version).toBe(4)
   })
 
-  it('migrates a legacy memory-config key into the encrypted store', async () => {
+  it('migrates a legacy memory-config key into the encrypted store and removes the plaintext', async () => {
+    seedMemoryConfigWithPlaintextKey('sk-legacy-in-memory-config')
+
     const result = await resolveMemoryLocalAiApiKey({
       baseUrl: 'http://localhost:8000/v1',
       configuredApiKey: 'sk-legacy-in-memory-config',
@@ -90,8 +134,28 @@ describe('SA-102 local program API keys', () => {
     })
     expect(result.apiKey).toBe('sk-legacy-in-memory-config')
     expect(result.migratedFromMemoryConfig).toBe(true)
-    // and it is now in the one shared store
+    // in the one shared store...
     expect(store.get('omlx')).toBe('sk-legacy-in-memory-config')
+    // ...and no longer in plaintext beside it. A half-done migration leaves two
+    // stores of one secret, which is the drift DL-102-14 exists to prevent.
+    expect(memoryConfigDoc?.embedding?.localAi).not.toHaveProperty('apiKey')
+  })
+
+  it('leaves a memory config that never carried a key untouched', async () => {
+    memoryConfigDoc = {
+      embedding: { lane: 'local-ai', localAi: { baseUrl: 'http://localhost:8000/v1' } },
+      schema_version: 4
+    }
+    const before = JSON.stringify(memoryConfigDoc)
+
+    const result = await resolveMemoryLocalAiApiKey({
+      baseUrl: 'http://localhost:8000/v1',
+      configuredApiKey: null,
+      userId: 'u'
+    })
+    expect(result.apiKey).toBeNull()
+    expect(result.migratedFromMemoryConfig).toBe(false)
+    expect(JSON.stringify(memoryConfigDoc)).toBe(before)
   })
 
   it('keeps working when the memory URL is not a configured program', async () => {

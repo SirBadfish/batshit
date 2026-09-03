@@ -3829,14 +3829,28 @@ async function handleBatshitAgentStream({
    * here corrects all of them. When the program cannot report, the preset
    * stands and `source` says why; nothing quietly falls back to the ceiling.
    */
+  /**
+   * SA-102 P6: one read of the local program records per send, not two.
+   *
+   * `listLocalAiServers` issues a Redis `json.get` per definition — seven now —
+   * and this handler needs the same list twice: here for the context reading and
+   * later for image transport. Memoized so the second consumer reuses the first
+   * result instead of paying another seven round-trips on the hot path.
+   */
+  let localAiServersPromise: Promise<Awaited<ReturnType<typeof listLocalAiServers>> | null> | null =
+    null
+  const loadLocalAiServersOnce = () => {
+    localAiServersPromise ??= listLocalAiServers(userId).catch(() => null)
+    return localAiServersPromise
+  }
+
   const localContextReading = isLocalProviderId(primaryProviderId)
     ? await readLocalRuntimeContext({
         providerId: primaryProviderId,
         modelId: primarySelection.modelId,
         baseUrl:
-          (await listLocalAiServers(userId).catch(() => null))?.find(
-            (entry) => entry.id === primaryProviderId,
-          )?.baseUrl ?? null,
+          (await loadLocalAiServersOnce())?.find((entry) => entry.id === primaryProviderId)
+            ?.baseUrl ?? null,
       })
     : null
   const effectiveContext = resolveEffectiveContextLimit({
@@ -5518,9 +5532,7 @@ async function handleBatshitAgentStream({
   const needsLocalImageConfig =
     isLocalProviderId(primaryProviderIdForImages) ||
     isLocalProviderId(fallbackProviderIdForImages)
-  const localServerConfigs = needsLocalImageConfig
-    ? await listLocalAiServers(userId).catch(() => null)
-    : null
+  const localServerConfigs = needsLocalImageConfig ? await loadLocalAiServersOnce() : null
   const primaryImageConfig = await resolveImageTransportConfig({
     userId,
     providerId: primaryProviderIdForImages,
@@ -7010,7 +7022,7 @@ async function handleBatshitAgentStream({
           (connectionInfo?.service ?? primarySelection.provider ?? '').trim().toLowerCase(),
       )
       const apiKeyErrorMessage = localProgram
-        ? `${localProgram.label} refused the request because of its API key. Add or correct the key for ${localProgram.label} in Settings -> Local AI (or under API Keys), or turn its key check off in ${localProgram.label}.`
+        ? `${localProgram.label} refused the request because of its API key. Add or correct the key for ${localProgram.label} under Settings -> API Keys -> Local AI, or turn its key check off in ${localProgram.label}.`
         : 'AI provider API key not configured for API or CLI agents'
       return {
         response: json(
