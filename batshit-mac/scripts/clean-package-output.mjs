@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
-const packageRoot = resolve(macRoot, 'zig-out', 'package');
+const packageRoot = resolve(macRoot, 'electron-out', 'package');
 const target = resolve(macRoot, process.argv[2] || '');
 
 if (!target.startsWith(`${packageRoot}${sep}`)) {

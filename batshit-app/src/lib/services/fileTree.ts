@@ -13,8 +13,12 @@ export const FILE_TREE_MAX_ENTRIES = 50_000;
 // Build-artifact folders that can balloon a recursive walk. Always excluded
 // from the Projects file tree on top of the project's configured exclusions.
 const FILE_TREE_BUILD_ARTIFACT_EXCLUSIONS = [
-  '**/zig-out/**',
-  '**/.zig-cache/**',
+  // Batshit's own packaged Mac app output — 1.4 GB, and walking it was what made
+  // the tree take ~10s over ~34k entries. Named `electron-out` on purpose rather
+  // than the conventional `dist`, so this stays safe to exclude globally: a user's
+  // project may well have a `dist/` they want to SEE. (It was `zig-out` until the
+  // Mac shell moved from Vercel Native Zero to Electron; Zig is gone entirely.)
+  '**/electron-out/**',
   '**/.svelte-kit/**',
   '**/.turbo/**',
   '**/.pytest_cache/**',

@@ -21,8 +21,8 @@
     "package:mac": "node scripts/package-mac-app.mjs",
     "package:dmg": "node scripts/package-release-dmg.mjs",
     "package:dmg:check": "node scripts/package-release-dmg.mjs --check",
-    "package:zip": "ditto -c -k --sequesterRsrc --keepParent zig-out/package/Batshit.app zig-out/package/Batshit-0.1.0-macos-ReleaseSafe.zip",
-    "package:audit": "node scripts/mac-runtime-supervisor.mjs package-audit zig-out/package/Batshit.app",
+    "package:zip": "ditto -c -k --sequesterRsrc --keepParent electron-out/package/Batshit.app electron-out/package/Batshit-0.1.0-macos-ReleaseSafe.zip",
+    "package:audit": "node scripts/mac-runtime-supervisor.mjs package-audit electron-out/package/Batshit.app",
     "proof:apple-container-sandbox": "node scripts/prove-apple-container-sandbox.mjs"
   },
   "devDependencies": {

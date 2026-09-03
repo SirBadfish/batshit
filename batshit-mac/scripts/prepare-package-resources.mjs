@@ -16,7 +16,7 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
 const repoRoot = resolve(macRoot, '..');
-const packagePath = resolve(process.argv[2] || join(macRoot, 'zig-out/package/Batshit.app'));
+const packagePath = resolve(process.argv[2] || join(macRoot, 'electron-out/package/Batshit.app'));
 const resourcesPath = join(packagePath, 'Contents', 'Resources');
 const runtimePath = join(resourcesPath, 'runtime');
 

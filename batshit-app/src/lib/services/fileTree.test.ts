@@ -26,7 +26,7 @@ describe('FileTreeService.loadDirectoryChildren', () => {
     expect(requestBody.input.lite).toBe(true)
     expect(requestBody.input.maxEntries).toBe(FILE_TREE_MAX_ENTRIES)
     expect(requestBody.input.customExcludePattern).toContain('**/my-custom/**')
-    expect(requestBody.input.customExcludePattern).toContain('**/zig-out/**')
+    expect(requestBody.input.customExcludePattern).toContain('**/electron-out/**')
     expect(requestBody.params.projectPath).toBe('/workspace')
   })
 
@@ -162,7 +162,7 @@ describe('FileTreeService.loadFileTree', () => {
     expect(requestBody.input.lite).toBe(true)
     expect(requestBody.input.maxEntries).toBe(FILE_TREE_MAX_ENTRIES)
     expect(requestBody.input.customExcludePattern).toContain('**/my-custom/**')
-    expect(requestBody.input.customExcludePattern).toContain('**/zig-out/**')
+    expect(requestBody.input.customExcludePattern).toContain('**/electron-out/**')
     expect(requestBody.input.customExcludePattern).toContain('**/.svelte-kit/**')
     expect(result).toMatchObject({ tree: [], flat: [], truncated: false })
   })

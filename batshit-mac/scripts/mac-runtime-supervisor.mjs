@@ -3503,7 +3503,7 @@ async function auditManagedNodeRuntime(nodeRuntimeRoot) {
 }
 
 async function packageAudit(packagePath) {
-  const target = resolve(packagePath || join(macRoot, 'zig-out', 'package'));
+  const target = resolve(packagePath || join(macRoot, 'electron-out', 'package'));
   const realTarget = await realpath(target).catch(() => null);
   const foundSecrets = [];
   const suspiciousPaths = [];
