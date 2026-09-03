@@ -136,15 +136,17 @@ Provider keys are still normal user-entered keys in all installs.
 
 ## Local AI
 
-Local AI runtimes — Ollama, LM Studio, Docker Model Runner, llama.cpp, vLLM — aren't normal hosted-provider API keys. Configure them in Settings → Local AI, then create model presets that use those connections.
+Local AI programs — Ollama, LM Studio, Docker Model Runner, llama.cpp, vLLM, SGLang, oMLX — aren't normal hosted-provider API keys. Configure them in Settings → Local AI, then create model presets that use those connections.
 
-Mac app or host runtime:
+They **can** carry a key, though, if the program asks for one — oMLX with its key check on, LM Studio 0.4 with tokens, or vLLM or SGLang started with `--api-key`. All seven appear in Settings → API Keys alongside your cloud keys, and it's the same single stored value you'd see on that program's card in Settings → Local AI. Leave it blank if your program doesn't ask.
 
-- A local runtime URL often looks like `http://localhost:11434`.
+Mac app or host program:
+
+- A local program URL often looks like `http://localhost:11434`.
 
 Docker:
 
-- A host runtime usually needs `http://host.docker.internal:11434` from the app container.
+- A host program usually needs `http://host.docker.internal:11434` from the app container.
 - A same-Compose sidecar uses its service name.
 
 If a Local AI URL works in your browser but fails from Docker Batshit, check the caller URL.

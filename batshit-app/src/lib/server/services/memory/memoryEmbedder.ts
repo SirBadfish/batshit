@@ -271,15 +271,26 @@ class LocalAiMemoryEmbedder implements MemoryEmbedder {
   private readonly queryPrefix: string
   private readonly model: ReturnType<ReturnType<typeof createOpenAI>['embeddingModel']>
 
-  constructor(localAi: NonNullable<MemoryEmbeddingConfig['localAi']>) {
+  constructor(
+    localAi: NonNullable<MemoryEmbeddingConfig['localAi']>,
+    // SA-102 P5 (DL-102-14): the key from the ONE shared encrypted store. It
+    // wins over the legacy `localAi.apiKey` in `batshit:memory_config`, which
+    // was a second place for the same secret.
+    sharedApiKey: string | null = null
+  ) {
     this.modelId = `local-ai:${localAi.modelName}@${localAi.dims}`
     this.dims = localAi.dims
     this.documentPrefix = localAi.documentPrefix ?? ''
     this.queryPrefix = localAi.queryPrefix ?? ''
+    const resolvedKey =
+      sharedApiKey?.trim() ||
+      (localAi.apiKey && localAi.apiKey.trim().length > 0 ? localAi.apiKey.trim() : '')
     const client = createOpenAI({
       baseURL: localAi.baseUrl,
-      // Local OpenAI-compatible runtimes require the header but ignore the value.
-      apiKey: localAi.apiKey && localAi.apiKey.trim().length > 0 ? localAi.apiKey : 'local-ai'
+      // Most local programs require the header but ignore the value; the ones
+      // that check it (oMLX, LM Studio 0.4 tokens, vLLM/SGLang --api-key) get
+      // the user's stored key.
+      apiKey: resolvedKey || 'local-ai'
     })
     this.model = client.embeddingModel(localAi.modelName)
   }
@@ -618,6 +629,12 @@ export async function detectPresetEmbeddingDims(
 export interface CreateMemoryEmbedderOptions {
   /** User context for api-lane key resolution (saved keys before env). */
   userId?: string | null
+  /**
+   * SA-102 P5 (DL-102-14): the local program's key from the one shared
+   * encrypted store. Resolved by the caller because the store read is async and
+   * this factory is deliberately synchronous.
+   */
+  localAiApiKey?: string | null
 }
 
 export function createMemoryEmbedder(
@@ -630,10 +647,37 @@ export function createMemoryEmbedder(
     case 'preset':
       return new PresetMemoryEmbedder(requirePresetConfig(config), options?.userId ?? undefined)
     case 'local-ai':
-      return new LocalAiMemoryEmbedder(requireLocalAiConfig(config))
+      return new LocalAiMemoryEmbedder(requireLocalAiConfig(config), options?.localAiApiKey ?? null)
     case 'api':
       return new ApiMemoryEmbedder(requireApiConfig(config), options?.userId ?? undefined)
     default:
       throw new Error(`Unknown memory embedding lane '${(config as MemoryEmbeddingConfig).lane}'.`)
   }
+}
+
+/**
+ * SA-102 P5 (DL-102-14): the async front door for the `local-ai` lane.
+ *
+ * `createMemoryEmbedder` stays synchronous — most lanes need nothing async —
+ * but the local lane's key now lives in the shared encrypted store, and reading
+ * it is async. This resolves that one value (migrating a legacy
+ * `batshit:memory_config` key into the store on the way) and then calls the
+ * factory. Every caller that may hit the local lane should use this.
+ */
+export async function createMemoryEmbedderAsync(
+  config: MemoryEmbeddingConfig,
+  options?: CreateMemoryEmbedderOptions
+): Promise<MemoryEmbedder> {
+  if (config.lane !== 'local-ai') {
+    return createMemoryEmbedder(config, options)
+  }
+  const { resolveMemoryLocalAiApiKey } = await import(
+    '$lib/server/services/localProgramApiKeys'
+  )
+  const resolved = await resolveMemoryLocalAiApiKey({
+    baseUrl: config.localAi?.baseUrl ?? null,
+    configuredApiKey: config.localAi?.apiKey ?? null,
+    userId: options?.userId ?? null
+  })
+  return createMemoryEmbedder(config, { ...options, localAiApiKey: resolved.apiKey })
 }

@@ -15,6 +15,7 @@
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { logger } from '$lib/utils/logger'
 import { createOpenAI } from '@ai-sdk/openai'
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import { createGoogle } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
 import { createMistral } from '@ai-sdk/mistral'
@@ -142,6 +143,13 @@ interface ProviderManagerOptions {
   }
   customProviders?: CustomProviderRuntime[]
   localProviders?: LocalAiServerSummary[]
+  /**
+   * SA-102 P5 (DL-102-09/DL-102-14): one stored key per local program, by
+   * program id. Kept separate from `apiKeys` because those carry cloud
+   * env-var/availability semantics a local program has no use for, but stored
+   * through the SAME encrypted `apiKeyService` so there is one secret, not two.
+   */
+  localApiKeys?: Record<string, string>
 }
 
 type ProviderAvailability = {
@@ -184,6 +192,7 @@ export class ProviderManager {
   private gatewayConfig: { apiKey: string | null; baseURL: string | null }
   private customProviders: CustomProviderRuntime[]
   private localProviders: LocalAiServerSummary[]
+  private localApiKeys: Record<string, string>
 
   constructor(options: ProviderManagerOptions = {}) {
     logger.debug('[ProviderManager] Initializing provider management system')
@@ -194,6 +203,7 @@ export class ProviderManager {
     }
     this.customProviders = options.customProviders ?? []
     this.localProviders = options.localProviders ?? []
+    this.localApiKeys = options.localApiKeys ?? {}
     this.registerProviders()
     this.setupFallbackChain()
     this.setupGatewayClient()
@@ -203,6 +213,7 @@ export class ProviderManager {
     const resolved = await resolveProviderAccess(userId)
     let customProviders: CustomProviderRuntime[] = []
     let localProviders: LocalAiServerSummary[] = []
+    const localApiKeys: Record<string, string> = {}
     if (userId) {
       try {
         customProviders = await listCustomProvidersForRuntime(userId)
@@ -215,6 +226,16 @@ export class ProviderManager {
       } catch (error) {
         console.warn('[ProviderManager] Failed to load local AI servers:', error)
       }
+      // SA-102 P5: only for the programs actually enabled, so a disabled entry
+      // never causes a key read.
+      for (const provider of localProviders) {
+        try {
+          const key = await apiKeyService.retrieve(provider.id, userId)
+          if (key) localApiKeys[provider.id] = key
+        } catch (error) {
+          console.warn(`[ProviderManager] Failed to read ${provider.id} key:`, error)
+        }
+      }
     }
     return new ProviderManager({
       apiKeys: resolved.apiKeys,
@@ -223,7 +244,8 @@ export class ProviderManager {
         baseURL: resolved.gateway.baseURL ?? null
       },
       customProviders,
-      localProviders
+      localProviders,
+      localApiKeys
     })
   }
 
@@ -231,6 +253,14 @@ export class ProviderManager {
    * Register all available providers based on environment variables
    * SECURITY: Never log API keys, only validation status
    */
+  /**
+   * SA-102 P2: the placeholder key local runtimes send when the user has not
+   * configured one. Most local servers ignore the Authorization header
+   * entirely; P5 replaces this with a real stored credential for the ones that
+   * do not (oMLX, LM Studio 0.4 tokens, vLLM/SGLang `--api-key`).
+   */
+  private static readonly LOCAL_RUNTIME_PLACEHOLDER_API_KEY = 'local-ai'
+
   private registerProviders() {
     let registeredCount = 0
     const registerOpenAICompatibleProvider = ({
@@ -310,21 +340,62 @@ export class ProviderManager {
       registeredCount++
     }
 
+    /**
+     * SA-102 P2 (DL-102-02): local runtimes talk through
+     * `@ai-sdk/openai-compatible`, NOT the strict `createOpenAI` provider.
+     *
+     * Three things follow from that choice, and all three are load-bearing:
+     *
+     * 1. `providerOptions[<runtime id>]` is spread into the request body
+     *    verbatim (minus the four keys that provider's own options schema owns:
+     *    user, reasoningEffort, textVerbosity, strictJsonSchema). That is the
+     *    ONLY way `top_k`, `min_p`, `repeat_penalty` and friends reach a local
+     *    engine — both providers drop the SDK's generic `topK` argument.
+     * 2. `includeUsage: true` is required. The strict OpenAI provider always
+     *    sends `stream_options: {include_usage: true}`; this one does not, and
+     *    without it every local usage number, cached-token readout included,
+     *    silently disappears.
+     * 3. `createOpenAI` decides "is this a reasoning model" by prefix-matching
+     *    the model id, so a local model served as `gpt-5-something` had its
+     *    temperature, top_p and both penalties stripped and its `system` role
+     *    rewritten to `developer` — a chat template many local models do not
+     *    handle. The compatible provider does none of that.
+     */
     const registerLocalProvider = (provider: LocalAiServerSummary, priority: number) => {
       const baseUrl = resolveLocalAiRuntimeBaseUrl(provider.baseUrl)?.replace(/\/+$/, '')
       const openaiPath = provider.openaiPath?.replace(/\/+$/, '')
       const openaiBaseUrl = baseUrl && openaiPath ? `${baseUrl}${openaiPath}` : baseUrl
 
-      registerOpenAICompatibleProvider({
-        id: provider.id,
-        label: provider.label,
-        apiKey: null,
-        baseURL: openaiBaseUrl ?? undefined,
-        priority,
-        apiMode: 'chat',
-        models: [],
-        allowNoKey: true
+      const client = createOpenAICompatible({
+        // The name becomes the providerOptions key the request body is built
+        // from, so it must equal the Batshit runtime id that
+        // `buildRuntimeModelSettings` routes settings under.
+        name: provider.id,
+        baseURL: openaiBaseUrl ?? '',
+        // SA-102 P5 (DL-102-09): the user's stored key when they have one.
+        // Programs with no key keep working exactly as before — most ignore the
+        // Authorization header entirely, and the placeholder is what they saw
+        // before this existed.
+        apiKey:
+          this.localApiKeys[provider.id] ??
+          ProviderManager.LOCAL_RUNTIME_PLACEHOLDER_API_KEY,
+        includeUsage: true
       })
+
+      this.providers.set(provider.id, {
+        client: (modelId: string) => client.chatModel(modelId),
+        models: [],
+        features: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          maxTokens: 128000
+        },
+        displayName: provider.label,
+        priority
+      })
+      logger.debug(`[ProviderManager] ${provider.label} configured (openai-compatible)`)
+      registeredCount++
     }
 
     // Anthropic Provider (Priority 1)

@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest'
 import { LOCAL_AI_SERVER_DEFINITIONS, LOCAL_AI_SERVER_IDS } from './localAiServers'
 
 describe('local AI server definitions smoke', () => {
-  it('includes the full expected runtime set', () => {
+  it('includes the full expected program set', () => {
+    // SA-102 P5 (DL-102-07) added SGLang and oMLX, each proven against a real
+    // running server of that kind before shipping.
     expect(Array.from(LOCAL_AI_SERVER_IDS).sort()).toEqual([
       'dmr',
       'llama-cpp',
       'lmstudio',
       'ollama',
+      'omlx',
+      'sglang',
       'vllm'
     ])
-    expect(LOCAL_AI_SERVER_DEFINITIONS).toHaveLength(5)
+    expect(LOCAL_AI_SERVER_DEFINITIONS).toHaveLength(7)
   })
 
   it('has valid defaults required by Local AI settings/runtime routing', () => {

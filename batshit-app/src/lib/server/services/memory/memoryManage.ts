@@ -26,7 +26,7 @@ import {
   hybridSearchSegments,
   type MemorySearchFilters
 } from './memoryIndex'
-import { createMemoryEmbedder } from './memoryEmbedder'
+import { createMemoryEmbedderAsync } from './memoryEmbedder'
 import { awarenessEntryLineHash, getMemoryFold } from './memoryRecall'
 import { refoldAwarenessAfterDelete, toMemorySummary, type MemorySummary } from './memoryTools'
 import type { MemoryLane, MemoryRecord, MemorySegmentRecord } from './memoryTypes'
@@ -160,7 +160,7 @@ export async function searchManagedMemories(
   const limitRaw = typeof input.limit === 'number' ? Math.floor(input.limit) : 25
   const limit = Math.min(Math.max(limitRaw, 1), 100)
 
-  const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
+  const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
   const vector = await embedder.embedQuery(query)
@@ -252,7 +252,7 @@ export async function updateManagedMemory(
       throw new MemoryManageError(error instanceof Error ? error.message : 'Standing media cap exceeded.', 400)
     }
   }
-  const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
+  const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
   const record = await updateMemory(context.agentId, normalized, updates, { embedder })
@@ -417,7 +417,7 @@ export async function listManagedSegments(
   const query = typeof input.query === 'string' ? input.query.trim() : ''
 
   if (query.length >= 2) {
-    const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
+    const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
       userId: context.userId
     })
     const vector = await embedder.embedQuery(query)

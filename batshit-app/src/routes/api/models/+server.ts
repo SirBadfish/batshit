@@ -17,7 +17,11 @@ import {
   type KnownProviderId
 } from '$lib/server/services/providers'
 import { fetchVercelModelCatalog } from '$lib/server/services/vercelModelCatalog'
-import type { CatalogModel, CatalogConnectionOption } from '$lib/types/modelCatalog'
+import type {
+  CatalogModel,
+  CatalogConnectionOption,
+  LocalContextReading
+} from '$lib/types/modelCatalog'
 import { CONNECTION_CREDENTIAL_MAP, gatherCredentialTypes } from '$lib/server/constants/modelConnections'
 import { getN8NCredentialStatuses, type N8NCredentialStatusResult } from '$lib/server/services/n8nCredentials'
 import { detectCodexCliStatus, type CodexCliStatus } from '$lib/server/services/codexCliStatus'
@@ -315,6 +319,16 @@ type LmStudioModelEntry = {
   quantization?: string | null
   state?: string | null
   max_context_length?: number | null
+  /** SA-102 P4: what the model is loaded WITH, not its ceiling. */
+  loaded_context_length?: number | null
+  /** Absent when the model was loaded without a TTL. */
+  remaining_ttl_seconds?: number | null
+  is_loaded?: boolean
+  /** DL-102-11: open-ended text as the program reports it. */
+  format?: string | null
+  display_name?: string | null
+  params_string?: string | null
+  size_bytes?: number | null
   capabilities?: string[] | null
 }
 
@@ -355,10 +369,39 @@ async function fetchLocalOpenAiModels(server: LocalAiServerSummary): Promise<str
   }
 }
 
+/**
+ * SA-102 P4 (DL-102-04): read what LM Studio is ACTUALLY running, not just the
+ * model's ceiling.
+ *
+ * `/api/v1/models` (LM Studio 0.4+) is materially richer than the `/api/v0`
+ * endpoint Batshit used to call. Verified live on 0.4.23, 2026-09-02:
+ *
+ *   max_context_length: 262144                     <- the ceiling
+ *   loaded_instances[0].config.context_length: 208384   <- what it is running
+ *   format: "mlx"                                  <- GGUF vs MLX, DL-102-11
+ *   display_name: "Qwen3.8 27B"                    <- human-readable
+ *   capabilities: { vision, trained_for_tool_use, reasoning: {...} }
+ *
+ * Three shapes that a naive reader gets wrong, all seen on Josh's machine:
+ *   - `loaded_instances` is EMPTY until the model is loaded. That is
+ *     "unknown until loaded", not "use the ceiling".
+ *   - `remaining_ttl_seconds` is ABSENT when the model was loaded without a
+ *     TTL. Optional, not merely transient.
+ *   - `capabilities` can be absent entirely (the embedding model row has no
+ *     such key) as well as `null`.
+ *
+ * `/api/v0/models` remains the fallback for older LM Studio builds.
+ */
 async function fetchLmStudioModels(server: LocalAiServerSummary): Promise<LmStudioModelEntry[]> {
   const baseUrl = (resolveLocalAiRuntimeBaseUrl(server.baseUrl) ?? server.baseUrl).replace(/\/+$/, '')
-  const url = `${baseUrl}/api/v0/models`
 
+  const v1 = await fetchLmStudioModelList(`${baseUrl}/api/v1/models`)
+  if (v1.length) return v1
+
+  return fetchLmStudioModelList(`${baseUrl}/api/v0/models`)
+}
+
+async function fetchLmStudioModelList(url: string): Promise<LmStudioModelEntry[]> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 4000)
 
@@ -379,33 +422,157 @@ async function fetchLmStudioModels(server: LocalAiServerSummary): Promise<LmStud
     return list
       .map((entry: any) => {
         if (!entry) return null
-        const id = entry.id || entry.name || entry.model
+        // v1 keys on `key`; v0 keys on `id`.
+        const id = entry.key || entry.id || entry.name || entry.model
         if (!id || typeof id !== 'string') return null
-        const rawContext = entry.max_context_length
-        const parsedContext =
-          typeof rawContext === 'number'
-            ? rawContext
-            : typeof rawContext === 'string'
-              ? Number(rawContext)
-              : null
+
+        const loadedInstance = Array.isArray(entry.loaded_instances)
+          ? entry.loaded_instances.find((instance: any) => instance && typeof instance === 'object')
+          : null
+
         return {
           id,
           type: entry.type ?? null,
           publisher: entry.publisher ?? null,
-          arch: entry.arch ?? null,
+          // v1 renames `arch` to `architecture`.
+          arch: entry.architecture ?? entry.arch ?? null,
           compatibility_type: entry.compatibility_type ?? null,
-          quantization: entry.quantization ?? null,
+          // v0 gives a string; v1 gives `{ name, bits_per_weight }`.
+          quantization: normalizeLmStudioQuantization(entry.quantization),
           state: entry.state ?? null,
-          max_context_length: Number.isFinite(parsedContext ?? NaN) ? parsedContext : null,
-          capabilities: Array.isArray(entry.capabilities) ? entry.capabilities : null
+          max_context_length: coerceFiniteNumber(entry.max_context_length),
+          loaded_context_length: coerceFiniteNumber(loadedInstance?.config?.context_length),
+          // Absent when the model was loaded without a TTL — optional, not just transient.
+          remaining_ttl_seconds: coerceFiniteNumber(loadedInstance?.remaining_ttl_seconds),
+          is_loaded: Boolean(loadedInstance),
+          // DL-102-11: open-ended text, never a two-value enum.
+          format: typeof entry.format === 'string' && entry.format.trim() ? entry.format.trim() : null,
+          display_name:
+            typeof entry.display_name === 'string' && entry.display_name.trim()
+              ? entry.display_name.trim()
+              : null,
+          params_string:
+            typeof entry.params_string === 'string' && entry.params_string.trim()
+              ? entry.params_string.trim()
+              : null,
+          size_bytes: coerceFiniteNumber(entry.size_bytes),
+          // v0 gives a loose string array; v1 gives a structured object that may
+          // be null OR absent. Both shapes are normalized to a flat name list.
+          capabilities: normalizeLmStudioCapabilities(entry.capabilities)
         } satisfies LmStudioModelEntry
       })
       .filter((value: LmStudioModelEntry | null): value is LmStudioModelEntry => Boolean(value))
   } catch (error) {
-    console.warn(`[Models API] Failed to list LM Studio models:`, error)
+    console.warn(`[Models API] Failed to list LM Studio models from ${url}:`, error)
     return []
   } finally {
     clearTimeout(timeout)
+  }
+}
+
+function coerceFiniteNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function normalizeLmStudioQuantization(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() || null
+  if (value && typeof value === 'object') {
+    const name = (value as any).name
+    if (typeof name === 'string' && name.trim()) return name.trim()
+  }
+  return null
+}
+
+/**
+ * v0: `["tool_use", "vision"]`. v1: `{ vision: true, trained_for_tool_use: true,
+ * reasoning: { allowed_options, default } }`, which may be `null` or missing.
+ */
+function normalizeLmStudioCapabilities(value: unknown): string[] | null {
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string')
+  if (!value || typeof value !== 'object') return null
+
+  const names: string[] = []
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (raw === true) names.push(key)
+    else if (raw && typeof raw === 'object') names.push(key)
+  }
+  return names.length ? names : null
+}
+
+/**
+ * SA-102 P4 (DL-102-04): Ollama's effective context.
+ *
+ * `GET /api/ps` reports `context_length` for each LOADED model — the honest
+ * read of what a prompt is actually being measured against (verified live:
+ * `llama3.2:latest` at 131072 on Josh's Mac). It is only available while the
+ * model is loaded. `/api/show` gives the model's own maximum, which is a
+ * different number and must be labelled as such.
+ *
+ * Ollama's `/v1` endpoint cannot set `num_ctx` at all, and it TRUNCATES a
+ * prompt that exceeds the loaded context from the front, silently — no error,
+ * no warning, nothing in the response. That is the single worst failure mode in
+ * this story, and it is also a cache miss on every later turn.
+ */
+async function fetchOllamaContextReadings(
+  server: LocalAiServerSummary
+): Promise<Map<string, LocalContextReading>> {
+  const baseUrl = (resolveLocalAiRuntimeBaseUrl(server.baseUrl) ?? server.baseUrl).replace(/\/+$/, '')
+  const readings = new Map<string, LocalContextReading>()
+
+  const loaded = await fetchJsonWithTimeout(`${baseUrl}/api/ps`)
+  const loadedList = Array.isArray(loaded?.models) ? loaded.models : []
+  for (const entry of loadedList) {
+    const name = typeof entry?.name === 'string' ? entry.name : typeof entry?.model === 'string' ? entry.model : null
+    const contextLength = coerceFiniteNumber(entry?.context_length)
+    if (!name || contextLength === null) continue
+    readings.set(name, {
+      source: 'loaded',
+      loadedContextWindow: contextLength,
+      maxContextWindow: null,
+      remainingTtlSeconds: null
+    })
+  }
+
+  return readings
+}
+
+async function fetchJsonWithTimeout(url: string, timeoutMs = 4000): Promise<any | null> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    if (!response.ok) return null
+    return await response.json().catch(() => null)
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+/**
+ * SA-102 P4 (DL-102-04): turn an LM Studio row into an honest context reading.
+ * An empty `loaded_instances` means "unknown until loaded" — never the ceiling.
+ */
+function buildLmStudioContextReading(model: LmStudioModelEntry): LocalContextReading {
+  if (model.is_loaded && typeof model.loaded_context_length === 'number') {
+    return {
+      source: 'loaded',
+      loadedContextWindow: model.loaded_context_length,
+      maxContextWindow: model.max_context_length ?? null,
+      remainingTtlSeconds: model.remaining_ttl_seconds ?? null
+    }
+  }
+  return {
+    source: 'unknown-until-loaded',
+    loadedContextWindow: null,
+    maxContextWindow: model.max_context_length ?? null,
+    remainingTtlSeconds: null
   }
 }
 
@@ -497,12 +664,16 @@ async function buildLocalCatalogModels(servers: LocalAiServerSummary[]): Promise
               canonicalId,
               provider: server.id,
               name: model.id,
-              displayName: model.id,
+              displayName: model.display_name || model.id,
               description: buildLmStudioDescription(server, model),
               tags: buildLmStudioTags(server, model),
               features: buildLmStudioFeatures(model),
               contextWindow:
                 typeof model.max_context_length === 'number' ? model.max_context_length : undefined,
+              // SA-102 P4 (DL-102-04): what it is running with, separately from
+              // the ceiling above, and honestly absent when it is not loaded.
+              localContext: buildLmStudioContextReading(model),
+              format: model.format ?? null,
               source: 'local',
               transport: 'local',
               connectionId: `direct:${server.id}`,
@@ -519,6 +690,11 @@ async function buildLocalCatalogModels(servers: LocalAiServerSummary[]): Promise
       if (!modelIds.length) {
         return [buildLocalPlaceholder(server)]
       }
+
+      // SA-102 P4: Ollama is the one plain-list runtime that can tell us what a
+      // loaded model is actually running with.
+      const ollamaContext =
+        server.id === 'ollama' ? await fetchOllamaContextReadings(server) : null
 
       return modelIds.map((modelId) => {
         const canonicalId = `${server.id}/${modelId}`
@@ -538,7 +714,17 @@ async function buildLocalCatalogModels(servers: LocalAiServerSummary[]): Promise
           connectionId: `direct:${server.id}`,
           availableConnections: [`direct:${server.id}`],
           upstreamProvider: 'local',
-          purpose: 'chat'
+          purpose: 'chat',
+          localContext: ollamaContext
+            ? (ollamaContext.get(modelId) ?? {
+                // Ollama CAN report this, but only while the model is loaded.
+                // "Not loaded" is a state, not the ceiling and not an error.
+                source: 'unknown-until-loaded',
+                loadedContextWindow: null,
+                maxContextWindow: null,
+                remainingTtlSeconds: null
+              })
+            : null
         }
         return entry
       })

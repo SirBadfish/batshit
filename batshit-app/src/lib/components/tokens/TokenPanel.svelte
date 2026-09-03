@@ -39,6 +39,8 @@
     napStatus = null,
     hasLatestResponse = false,
     cacheHitPercent = null,
+    localProgramLabel = null,
+    localCacheReporting = null,
     cacheCachedTokens = null,
     cacheInputTokens = null,
     cacheCreationTokens = null,
@@ -85,6 +87,20 @@
     /** SA-093 P7: latest-response cache and speed readouts (DL-093-14). */
     hasLatestResponse?: boolean
     cacheHitPercent?: number | null
+    /**
+     * SA-102 P4 (DL-102-13): the local AI program's NAME, so the readout can
+     * say "LM Studio does not report this" instead of "the runtime".
+     */
+    localProgramLabel?: string | null
+    /**
+     * SA-102 P4 (DL-102-13): whether that program reports cached prompt tokens
+     * at all. This is a property of the PROGRAM, not of the number, because a
+     * program that never reports and a program that reported a genuine miss
+     * both arrive as "no number" — and before this, both were shown the same
+     * way. Measured: Ollama went 43,085 ms -> 1,268 ms with no cache number at
+     * any point. The cache was working; Batshit simply could not see it.
+     */
+    localCacheReporting?: 'reports' | 'never-reports' | null
     cacheCachedTokens?: number | null
     cacheInputTokens?: number | null
     cacheCreationTokens?: number | null
@@ -205,9 +221,25 @@
 
   const unknownStatsNote = $derived.by(() =>
     hasLatestResponse
-      ? 'The provider or runtime did not report this for the latest response.'
+      ? 'The provider did not report this for the latest response.'
       : 'No responses in this chat yet.'
   )
+
+  /**
+   * SA-102 P4 (DL-102-13): the three-way truth about a local prompt cache.
+   * Never inferred from timing, and never a zero the program did not send.
+   */
+  const cacheNote = $derived.by(() => {
+    if (!hasLatestResponse) return 'No responses in this chat yet.'
+    const program = localProgramLabel ?? 'This program'
+    if (localCacheReporting === 'never-reports') {
+      return `${program} does not report cache numbers, so Batshit will not show one. Its cache is still working, and you can see it in the speed: a repeat answer starts much sooner than the first one did.`
+    }
+    if (localCacheReporting === 'reports' && cacheHitPercent === 0) {
+      return `${program} reported no cached tokens this time. Some programs only cache in large blocks, so a short conversation honestly reports none until it grows.`
+    }
+    return unknownStatsNote
+  })
 
   function formatCompacted(value: number): string {
     if (value <= 0) return '0 compacted'
@@ -307,6 +339,9 @@
               <div class="token-panel-tooltip-title">Prompt cache (latest response)</div>
               {#if typeof cacheHitPercent === 'number'}
                 <div class="token-panel-tooltip-emphasis">{cacheHitLabel} of input read from cache</div>
+                {#if cacheHitPercent === 0 && localCacheReporting === 'reports'}
+                  <div>{cacheNote}</div>
+                {/if}
                 {#if typeof cacheCachedTokens === 'number' && typeof cacheInputTokens === 'number'}
                   <div>
                     {formatRoundedThousands(cacheCachedTokens)} cached / {formatRoundedThousands(cacheInputTokens)} input tokens
@@ -316,7 +351,7 @@
                   <div>{formatRoundedThousands(cacheCreationTokens)} tokens newly written to cache</div>
                 {/if}
               {:else}
-                <div>{unknownStatsNote}</div>
+                <div>{cacheNote}</div>
               {/if}
             </div>
             {#if typeof sessionCacheHitPercent === 'number'}

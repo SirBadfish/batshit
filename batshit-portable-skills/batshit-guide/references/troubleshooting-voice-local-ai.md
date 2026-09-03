@@ -129,23 +129,29 @@ External LiveKit: save URL/API credentials in Settings → API Keys → Voice Ru
 
 ## Local AI models don't appear
 
-Check that the runtime is running, the runtime's own model list works, the runtime is enabled in Settings → Local AI, the Base URL and OpenAI path are correct, Docker uses `host.docker.internal` for host runtimes, and a remote URL is reachable from the Batshit app runtime.
+Check that the program is running, its own model list works, it's enabled in Settings → Local AI, the Base URL and OpenAI path are correct, Docker uses `host.docker.internal` for host programs, and a remote URL is reachable from Batshit.
 
 Common defaults:
 
-| Runtime | Native URL | Docker-to-host URL |
+| Program | Native URL | Docker-to-host URL |
 | --- | --- | --- |
 | Ollama | `http://localhost:11434` | `http://host.docker.internal:11434` |
 | Docker Model Runner | `http://localhost:12434` | `http://host.docker.internal:12434` |
 | LM Studio | `http://localhost:1234` | `http://host.docker.internal:1234` |
 | llama.cpp | `http://localhost:8080` | `http://host.docker.internal:8080` |
 | vLLM | `http://localhost:8000` | `http://host.docker.internal:8000` |
+| SGLang | `http://localhost:30000` | `http://host.docker.internal:30000` |
+| oMLX | `http://localhost:8000` | `http://host.docker.internal:8000` |
+
+oMLX and vLLM share port 8000 by default. If you enable both, Batshit warns you and names them — change the port on one of them and update the Base URL to match.
+
+If the program answers but Batshit reports a 401, it wants an API key. Save it on that program's card in Settings → Local AI, or under Settings → API Keys — same value either way.
 
 ## Local AI text works but images fail
 
-First check the selected model preset. If its Vision capability is off, Batshit treats it as text-only and blocks image clips before calling the runtime — switch to a vision-capable preset or remove the image clip.
+First check the selected model preset. If its Vision capability is off, Batshit treats it as text-only and blocks image clips before calling the program — switch to a vision-capable preset or remove the image clip.
 
-Then check image transport. Automatic sends local image clips as structured data URLs when possible (better for some local vision runtimes). Force URL makes the runtime fetch images through a URL, which needs an image base URL the runtime can reach. For Docker, a forced image URL base often needs:
+Then check image transport. Automatic sends local image clips as structured data URLs when possible (better for some local vision models). Force URL makes the program fetch images through a URL, which needs an image base URL the program can reach. For Docker, a forced image URL base often needs:
 
 ```text
 http://host.docker.internal:5600
@@ -163,7 +169,7 @@ n8n and Batshit may be calling different URLs or using different model/provider 
 
 ## Backup restore didn't restore voice or Local AI runtime
 
-Batshit backups can restore settings and references. They don't include Local AI model weights, the Ollama/LM Studio/llama.cpp/vLLM installs, voice engine installs, local TTS/STT model files, or LiveKit servers/workers.
+Batshit backups can restore settings and references. They don't include Local AI model weights, the programs themselves, voice engine installs, local TTS/STT model files, or LiveKit servers/workers.
 
 After restore: reinstall or restart the external runtime, reconnect the URL in Batshit, re-enter provider keys if the backup excluded secrets, run health checks, and run one real text/TTS/STT test before trusting the restored setup.
 

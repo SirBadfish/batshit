@@ -16,12 +16,21 @@ import { ProviderManager } from '$lib/server/services/providers'
 import type { AgentRow } from '$lib/types/database'
 import type { SavedModel, ModelConnectionInfo, ModelCapabilities } from '$lib/types/savedModels'
 import type { ParameterValue } from '$lib/data/parameter-schemas'
-import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
+import {
+  buildRuntimeModelSettings,
+  normalizeRuntimeMaxTokens
+} from '$lib/utils/modelSettingsMapper'
 import { resolveModelIds } from '$lib/utils/modelIdResolver'
 import { resolveRuntimeModelSelection } from '$lib/utils/modelPresetRuntime'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { resolveCurrentModelCompactRuntime } from '$lib/utils/contextCompaction'
+
+/**
+ * SA-102 P1: Batshit's own bound on a summary/compact run's output length.
+ * Not a user preset default — see the comment at its use site.
+ */
+const BATSHIT_SUMMARY_OUTPUT_TOKEN_BOUND = 6_000
 
 type AgentRecord = AgentRow & Record<string, any>
 
@@ -208,7 +217,22 @@ async function resolveSummaryModel(params: {
         ? runtimeSettings.providerOptions
         : undefined,
     generationSettings: {
-      maxOutputTokens: runtimeSettings.standard.maxTokens ?? 6_000,
+      // SA-102 P1 (DL-102-01): this is deliberately NOT the invented default the
+      // story removed from send-routed. A summary/compact run is Batshit's own
+      // operation, not a user message, so it is not "a parameter left empty in a
+      // Model Preset" — and it must stay bounded, because an unbounded summary
+      // can be larger than the context window compaction exists to relieve.
+      // Kept as an explicit, named, context-clamped operational bound.
+      maxOutputTokens:
+        runtimeSettings.standard.maxTokens ??
+        normalizeRuntimeMaxTokens({
+          maxTokens: BATSHIT_SUMMARY_OUTPUT_TOKEN_BOUND,
+          provider: resolvedIds?.developerId ?? selection.provider,
+          modelId: resolvedIds?.modelId ?? selection.modelId,
+          connection: selection.connection,
+          contextWindow: selection.contextWindow
+        }) ??
+        BATSHIT_SUMMARY_OUTPUT_TOKEN_BOUND,
       ...(runtimeSettings.standard.temperature !== undefined
         ? { temperature: runtimeSettings.standard.temperature }
         : {}),

@@ -4,6 +4,7 @@
   import ChatArea from '$lib/components/chat/ChatArea.svelte'
   import ChatInput from '$lib/components/chat/ChatInput.svelte'
   import TokenPanel from '$lib/components/tokens/TokenPanel.svelte'
+  import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
   import CompactArtifactShelf from '$lib/components/artifacts/CompactArtifactShelf.svelte'
   import ProjectsSidebar from '$lib/components/projects/ProjectsSidebar.svelte'
   import ArtifactsSidebar from '$lib/components/artifacts/ArtifactsSidebar.svelte'
@@ -829,6 +830,27 @@ const latestResponseStats = $derived.by(() => {
 })
 const latestCacheHitPercent = $derived(
   computeCacheHitRatePercent(latestResponseStats.usage)
+)
+/**
+ * SA-102 P4 (DL-102-13): which local AI program this chat is talking to, by
+ * name, and whether it reports cached prompt tokens at all. The Token Panel
+ * needs both so it can say "LM Studio does not report this" instead of showing
+ * a dash that reads like a cache miss.
+ */
+const activeLocalProgramDefinition = $derived.by(() => {
+  const provider = (
+    activeModelPreset?.connection?.service ??
+    activeModelPreset?.provider ??
+    ''
+  )
+    .trim()
+    .toLowerCase()
+  if (!provider) return null
+  return LOCAL_AI_SERVER_DEFINITIONS.find((entry) => entry.id === provider) ?? null
+})
+const activeLocalProgramLabel = $derived(activeLocalProgramDefinition?.label ?? null)
+const activeLocalCacheReporting = $derived(
+  activeLocalProgramDefinition?.supports.promptCacheReporting ?? null
 )
 const latestCacheCachedTokens = $derived.by(() => {
   const usage = latestResponseStats.usage
@@ -6997,6 +7019,8 @@ const immersiveActive = $derived.by(
           onNap={() => handleNap({ trigger: 'manual' })}
           hasLatestResponse={latestResponseStats.found}
           cacheHitPercent={latestCacheHitPercent}
+          localProgramLabel={activeLocalProgramLabel}
+          localCacheReporting={activeLocalCacheReporting}
           cacheCachedTokens={latestCacheCachedTokens}
           cacheInputTokens={latestCacheInputTokens}
           cacheCreationTokens={latestCacheCreationTokens}

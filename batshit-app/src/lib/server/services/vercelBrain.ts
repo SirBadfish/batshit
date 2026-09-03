@@ -1730,11 +1730,33 @@ export class VercelAIBrain {
     })
   }
 
+  /**
+   * SA-102 P2: the OTHER half of the reasoning-model prefix trap.
+   *
+   * This used to infer the provider from the MODEL NAME alone
+   * (`getProviderName`, which returns 'openai' for anything containing "gpt"),
+   * so a local model served as `gpt-5-local-gguf` on a direct llama.cpp
+   * connection was treated as OpenAI: `buildGenerationSettings` dropped its
+   * temperature, top_p and both penalties, and `buildOpenAITools` tried to
+   * attach OpenAI's hosted tools to it. Moving local runtimes off
+   * `createOpenAI` fixed the SDK's half of the trap (the `system` role is no
+   * longer rewritten to `developer`); this fixes Batshit's half.
+   *
+   * The connection's service is authoritative when it names one — a model
+   * NAMED gpt-5 served by llama.cpp is not OpenAI. Model-name inference
+   * survives only as the last resort, for a direct connection that names
+   * neither a service nor a `direct:<service>` id, which is how legacy presets
+   * behaved before and after.
+   */
   private isOpenAIDirect(request: NativeModeRequest): boolean {
     const transport = request.connection?.type ?? 'direct'
     if (transport !== 'direct') return false
-    const provider = this.getProviderName(request.model ?? '').toLowerCase()
-    return provider === 'openai'
+    return (
+      this.resolveRuntimeProviderId(
+        request.model ?? '',
+        request.connection ?? null
+      ).toLowerCase() === 'openai'
+    )
   }
 
   private buildGenerationSettings(request: NativeModeRequest): Record<string, unknown> {
