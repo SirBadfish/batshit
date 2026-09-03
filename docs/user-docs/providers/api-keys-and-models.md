@@ -138,7 +138,7 @@ Provider keys are still normal user-entered keys in all installs.
 
 Local AI programs — Ollama, LM Studio, Docker Model Runner, llama.cpp, vLLM, SGLang, oMLX — aren't normal hosted-provider API keys. Configure them in Settings → Local AI, then create model presets that use those connections.
 
-They **can** carry a key, though, if the program asks for one — oMLX with its key check on, LM Studio 0.4 with tokens, or vLLM or SGLang started with `--api-key`. All seven appear in Settings → API Keys alongside your cloud keys, and it's the same single stored value you'd see on that program's card in Settings → Local AI. Leave it blank if your program doesn't ask.
+They **can** carry a key, though, if the program asks for one — oMLX with its key check on, LM Studio 0.4 with tokens, or vLLM or SGLang started with `--api-key`. All seven are listed here under **Local AI**, alongside your cloud keys, and that is the only place they live. Leave it blank if your program doesn't ask; most local setups need no key at all.
 
 Mac app or host program:
 

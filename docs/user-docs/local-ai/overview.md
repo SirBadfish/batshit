@@ -43,7 +43,7 @@ Local connection IDs use shapes like `direct:ollama`, `direct:dmr`, `direct:lmst
 
 Every program here can carry an optional API key. You need one if your program is asking for one — oMLX with its key check on, LM Studio 0.4 with tokens, or vLLM or SGLang started with `--api-key`.
 
-Save it in **Settings → Local AI** on that program's card, or in **Settings → API Keys** alongside your cloud keys. It's the same single value either way, encrypted before storage and never shown back to you. Batshit's memory embeddings read the same key, so there's nothing to keep in sync.
+Save it in **Settings → API Keys → Local AI**, alongside your cloud keys. That's the one place — there's no second field on this page, on purpose. It's encrypted before storage and never shown back to you. Batshit's memory embeddings read the same key, so there's nothing to keep in sync.
 
 Leave it blank if your program doesn't ask for one. Nothing changes.
 

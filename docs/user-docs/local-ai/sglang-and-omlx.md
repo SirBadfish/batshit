@@ -111,12 +111,15 @@ Since vLLM ships disabled in Batshit, most people never see this warning at all.
 
 Every local AI program in Batshit can carry an optional API key. You need one if you run oMLX with its key check on, LM Studio 0.4 with tokens, or vLLM or SGLang started with `--api-key`.
 
-**There is one key per program, stored once.** You can edit it in either of two places, and they're the same value:
+**One key per program, and one place to put it:**
 
-- **Settings → Local AI**, on that program's card, next to its URL.
-- **Settings → API Keys**, where all seven local programs sit alongside your cloud provider keys.
+> Settings → API Keys → **Local AI**
+
+All seven programs are listed there, alongside your cloud provider keys. There is deliberately no second field on the Local AI page — one secret with two edit boxes is how they drift apart.
 
 It's encrypted with AES-256-GCM before it touches storage, exactly like every other key in Batshit. It's never shown back to you after saving and never written to a log.
+
+If a program is running but Batshit reports a 401, the Local AI page says so and points you here.
 
 **Memory embeddings use the same key.** If you point Batshit's memory system at a local program for embeddings, it reads the key you already saved. There's no second field to keep in sync — there used to be, and that's now one store.
 

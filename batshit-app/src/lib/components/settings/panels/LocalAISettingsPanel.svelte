@@ -13,7 +13,7 @@
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
-  import type { IconRef } from '$lib/icons/iconTypes'
+  import { getLocalAiIconRef } from '$lib/data/localAiIcons'
   import {
     AlertCircle,
     Boxes,
@@ -63,94 +63,6 @@
 
   let servers = $state<LocalAiServerSummary[]>([...defaultServers])
 
-  /**
-   * SA-102 P5 (DL-102-09/DL-102-14): the program's API key.
-   *
-   * Stored through the ORDINARY encrypted API key store under the program's own
-   * id, so it is AES-256-GCM encrypted like every other Batshit credential,
-   * appears in the API Keys panel too, and is the same single secret the memory
-   * embedder's local lane reads. It is never returned to the browser in full —
-   * only the masked form the key store hands back.
-   */
-  let programKeyMasked = $state<Record<string, string | null>>({})
-  let programKeyInput = $state<Record<string, string>>({})
-  let programKeySaving = $state<Record<string, boolean>>({})
-  let programKeyError = $state<Record<string, string | null>>({})
-
-  async function loadProgramKeys() {
-    try {
-      const response = await fetch('/api/settings/api-keys')
-      if (!response.ok) return
-      const payload = await response.json().catch(() => null)
-      const rows = Array.isArray(payload?.keys)
-        ? payload.keys
-        : Array.isArray(payload?.apiKeys)
-          ? payload.apiKeys
-          : []
-      const next: Record<string, string | null> = {}
-      for (const row of rows) {
-        const service = typeof row?.service === 'string' ? row.service : null
-        if (!service) continue
-        if (defaultServers.some((server) => server.id === service)) {
-          next[service] = typeof row?.masked === 'string' ? row.masked : null
-        }
-      }
-      programKeyMasked = next
-    } catch {
-      // A key list failure must not break the panel; the field simply shows empty.
-    }
-  }
-
-  async function saveProgramKey(server: LocalAiServerSummary) {
-    const value = (programKeyInput[server.id] ?? '').trim()
-    if (!value.length) return
-    programKeySaving = { ...programKeySaving, [server.id]: true }
-    programKeyError = { ...programKeyError, [server.id]: null }
-    try {
-      const response = await fetch('/api/settings/api-keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ service: server.id, apiKey: value })
-      })
-      const payload = await response.json().catch(() => null)
-      if (!response.ok) throw new Error(payload?.error || 'Failed to save the key')
-      programKeyMasked = { ...programKeyMasked, [server.id]: payload?.masked ?? '****' }
-      programKeyInput = { ...programKeyInput, [server.id]: '' }
-      dispatchModelConnectionsUpdated('local-ai')
-    } catch (error) {
-      programKeyError = {
-        ...programKeyError,
-        [server.id]: error instanceof Error ? error.message : 'Failed to save the key'
-      }
-    } finally {
-      programKeySaving = { ...programKeySaving, [server.id]: false }
-    }
-  }
-
-  async function clearProgramKey(server: LocalAiServerSummary) {
-    programKeySaving = { ...programKeySaving, [server.id]: true }
-    programKeyError = { ...programKeyError, [server.id]: null }
-    try {
-      const response = await fetch('/api/settings/api-keys', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ service: server.id })
-      })
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null)
-        throw new Error(payload?.error || 'Failed to remove the key')
-      }
-      programKeyMasked = { ...programKeyMasked, [server.id]: null }
-      dispatchModelConnectionsUpdated('local-ai')
-    } catch (error) {
-      programKeyError = {
-        ...programKeyError,
-        [server.id]: error instanceof Error ? error.message : 'Failed to remove the key'
-      }
-    } finally {
-      programKeySaving = { ...programKeySaving, [server.id]: false }
-    }
-  }
   let isLoading = $state(true)
   let loadError = $state<string | null>(null)
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
@@ -170,17 +82,6 @@
     error?: string
   }
 
-  const LOCAL_AI_ICON_REFS: Partial<Record<string, IconRef>> = {
-    ollama: { kind: 'brand', slug: 'ollama-mono', fixed: true },
-    dmr: { kind: 'brand', slug: 'docker-color', fixed: true },
-    lmstudio: { kind: 'brand', slug: 'lmstudio-mono', fixed: true },
-    'llama-cpp': { kind: 'brand', slug: 'llamacpp-color', fixed: true },
-    vllm: { kind: 'brand', slug: 'vllm-color', fixed: true }
-  }
-
-  function getLocalAiIconRef(serverId: string): IconRef {
-    return LOCAL_AI_ICON_REFS[serverId] ?? { kind: 'lucide', id: 'server' }
-  }
   let modelListState = $state<Record<string, ModelListState>>({})
 
   function toggleServerOpen(id: string) {
@@ -189,7 +90,6 @@
 
   onMount(async () => {
     await loadServers()
-    await loadProgramKeys()
   })
 
   async function loadServers() {
@@ -239,7 +139,7 @@
         // must not read as "offline". Josh's oMLX answered 401 for weeks.
         updateStatus(server.id, {
           state: 'offline',
-          message: `${server.label} is running but needs an API key. Add one below, or turn its key check off in ${server.label}.`
+          message: `${server.label} is running but needs an API key. Add one under Settings -> API Keys -> Local AI, or turn its key check off in ${server.label}.`
         })
       } else {
         updateStatus(server.id, { state: 'offline', message: `HTTP ${response.status}` })
@@ -628,64 +528,6 @@
                           )
                         }}
                       />
-                    </div>
-                  </div>
-
-                  <div class="batshit-settings-form-row">
-                    <div class="batshit-settings-form-copy">
-                      <div class="batshit-settings-form-label-line">
-                        <Label.Root class="batshit-settings-form-label">API Key</Label.Root>
-                        <SettingsInfoMenu ariaLabel={`About the ${server.label} API key`}>
-                          <p>
-                            Only needed if {server.label} asks for one. Most local programs
-                            ignore it. Leave it blank unless {server.label} answers with
-                            "401" or "API key required".
-                          </p>
-                          <p class="mt-2">
-                            Batshit stores it encrypted, in the same place as every other key,
-                            and uses the same one for chat and for memory search. You can also
-                            edit it under API Keys.
-                          </p>
-                        </SettingsInfoMenu>
-                      </div>
-                    </div>
-                    <div class="batshit-settings-form-control">
-                      <div class="batshit-settings-field-cluster">
-                        <Input
-                          type="password"
-                          autocomplete="off"
-                          placeholder={programKeyMasked[server.id] ?? 'Not set'}
-                          value={programKeyInput[server.id] ?? ''}
-                          oninput={(event) => {
-                            const target = event.currentTarget as HTMLInputElement
-                            programKeyInput = { ...programKeyInput, [server.id]: target.value }
-                          }}
-                        />
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={
-                            programKeySaving[server.id] === true ||
-                            !(programKeyInput[server.id] ?? '').trim().length
-                          }
-                          onclick={() => saveProgramKey(server)}
-                        >
-                          Save
-                        </Button>
-                        {#if programKeyMasked[server.id]}
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={programKeySaving[server.id] === true}
-                            onclick={() => clearProgramKey(server)}
-                          >
-                            Remove
-                          </Button>
-                        {/if}
-                      </div>
-                      {#if programKeyError[server.id]}
-                        <p class="batshit-settings-form-meta is-error">{programKeyError[server.id]}</p>
-                      {/if}
                     </div>
                   </div>
 
