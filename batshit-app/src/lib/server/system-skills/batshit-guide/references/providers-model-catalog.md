@@ -10,7 +10,7 @@ The Model Catalog solves that. It's one combined, searchable list that pulls tog
 
 - Hosted gateway models (Vercel AI Gateway, OpenRouter, and the providers they front).
 - Direct provider models for providers you've connected — OpenAI, Anthropic, Google, xAI, Mistral, Groq, DeepSeek, Together.ai, Fireworks AI, Baseten, Cerebras, MiniMax, MiMo, Cohere, and more.
-- Your own [Local AI](../local-ai/overview.md) models, once a local runtime is enabled and reachable.
+- Your own [Local AI](../local-ai/overview.md) models, once a local program is enabled and reachable.
 
 Instead of memorizing model IDs, you browse the catalog, filter to what you want, and let Batshit fill in the exact identifiers. It lives in Settings → Models, with a toggleable catalog viewer for browsing and searching the full normalized list.
 
@@ -36,7 +36,7 @@ This matters because the provider/connection is what decides which saved key get
 
 ## How catalog content stays current
 
-The catalog isn't a hardcoded list baked into the app. Batshit refreshes a shared model snapshot from a hosted registry and from live provider model lists, then merges in your local runtime models on the fly.
+The catalog isn't a hardcoded list baked into the app. Batshit refreshes a shared model snapshot from a hosted registry and from live provider model lists, then merges in your local models on the fly.
 
 A few honest notes:
 
@@ -87,9 +87,9 @@ Presets sit in the middle of three things:
 
 - **Provider keys** decide whether a connection is usable. A preset on a connection with no saved key shows as locked for `API` agents until you add the key. Keys live in Settings → API Keys — see [API keys and models](api-keys-and-models.md).
 - **The Model Catalog** is where the preset's model comes from. You browse the catalog, apply a selection into the preset form, and save.
-- **[Local AI](../local-ai/overview.md) runtimes** feed the catalog too. Once a local runtime like Ollama or LM Studio is enabled and reachable, its models appear in the catalog and you can save a local preset exactly like a hosted one. Local presets aren't blocked the way cloud presets are when a key is missing, since local runtimes don't use hosted-provider keys.
+- **[Local AI](../local-ai/overview.md) programs** feed the catalog too. Once a program like Ollama or LM Studio is enabled and reachable, its models appear in the catalog and you can save a local preset exactly like a hosted one. Local presets aren't blocked the way cloud presets are when a key is missing, since most local programs don't need one. Where a program reports them, a local catalog entry also carries the model's format tag and the context size it's actually loaded with.
 
-So the normal flow is: add a key (or enable a local runtime) → find the model in the catalog → save a preset → select that preset on an agent.
+So the normal flow is: add a key (or enable a local program) → find the model in the catalog → save a preset → select that preset on an agent.
 
 ## Chat presets vs other presets
 
@@ -117,7 +117,7 @@ The connection it uses probably has no saved key, or the key was deleted. Add or
 
 ### A model isn't in the catalog
 
-Confirm the provider key is saved and the connection is Ready, or that the local runtime is enabled and reachable. Remember catalog refresh isn't instant, so a brand-new provider model may not have synced yet.
+Confirm the provider key is saved and the connection is Ready, or that the local program is enabled and reachable. Remember catalog refresh isn't instant, so a brand-new provider model may not have synced yet.
 
 ### My agent uses the wrong model
 

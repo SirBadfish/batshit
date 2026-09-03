@@ -200,7 +200,7 @@ An optional realtime voice runtime for room-based audio and sidecar voice agents
 
 ### Local AI
 
-Local model runtimes such as Ollama, LM Studio, Docker Model Runner, llama.cpp, or vLLM. Docker Batshit usually reaches host Local AI runtimes through `host.docker.internal`.
+AI programs running models on your own computer or network: Ollama, Docker Model Runner, LM Studio, llama.cpp, vLLM, SGLang, and oMLX. Docker Batshit usually reaches host Local AI programs through `host.docker.internal`.
 
 ## M
 

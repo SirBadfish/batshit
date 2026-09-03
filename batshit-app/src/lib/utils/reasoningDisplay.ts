@@ -1,4 +1,5 @@
 import type { ModelCapabilities } from '$lib/types/savedModels'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import type { ExecutionReasoningPersistence } from '$lib/types/executionViewer'
 import type { InterruptedReasoningRecovery } from '$lib/utils/reasoningRecovery'
 
@@ -74,6 +75,27 @@ function looksReasoningCapable(args: ReasoningOptionsArgs): boolean {
   ])
 }
 
+/**
+ * SA-102 P3: is this model served by one of Batshit's local AI programs?
+ *
+ * Uses the connection's own identity, never the model name — a local model may
+ * legitimately be called `gpt-oss-20b` or `glm-4-9b`, and name inference is
+ * exactly the trap SA-102 P2 removed from two other places.
+ */
+function isLocalRuntime(args: ReasoningOptionsArgs): boolean {
+  const candidates = [args.provider, args.connection?.service, args.connection?.provider]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && LOCAL_AI_SERVER_IDS.has(candidate.trim().toLowerCase() as any)) {
+      return true
+    }
+  }
+  const connectionId = args.connection?.id
+  if (typeof connectionId === 'string' && connectionId.startsWith('direct:')) {
+    return LOCAL_AI_SERVER_IDS.has(connectionId.slice('direct:'.length).trim().toLowerCase() as any)
+  }
+  return false
+}
+
 function usesVercelGateway(args: ReasoningOptionsArgs): boolean {
   return [
     args.connection?.id,
@@ -95,7 +117,20 @@ function usesVercelGateway(args: ReasoningOptionsArgs): boolean {
 export function resolveTaggedReasoningTagName(
   args: ReasoningOptionsArgs,
 ): 'think' | null {
-  return looksReasoningCapable(args) ? 'think' : null
+  // SA-102 P3: local thinking models are the common case, and their names match
+  // none of the cloud substrings above — a `Qwen3.8-27B-MLX-4bit` matched
+  // nothing, so its <think> block rendered as raw text unless the user knew to
+  // tick the preset's Reasoning capability by hand. Detection is enabled for
+  // every local program: a model that never emits the tag is unaffected, and a
+  // model that does was previously showing the user its private thinking as
+  // part of its answer.
+  //
+  // Deliberately NOT widened to `withReasoningProviderOptions`. That function
+  // injects cloud-shaped options (`openai.reasoningSummary`,
+  // `google.thinkingConfig`, `anthropic.sendReasoning`) which mean nothing to a
+  // local engine.
+  if (looksReasoningCapable(args) || isLocalRuntime(args)) return 'think'
+  return null
 }
 
 export function withReasoningProviderOptions(

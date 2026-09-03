@@ -26,7 +26,7 @@ import {
   type MemorySegmentRecord,
   type GraduationSource
 } from './memoryTypes'
-import { createMemoryEmbedder, type MemoryEmbedder } from './memoryEmbedder'
+import { createMemoryEmbedderAsync, type MemoryEmbedder } from './memoryEmbedder'
 import { getMemoryConfig, requireReadyMemoryIndexes } from './memoryIndex'
 import { deleteMemoryMedia, MEMORY_STANDING_MEDIA_CAP } from './memoryMedia'
 
@@ -81,7 +81,7 @@ export interface MemoryWriteOptions {
 
 async function resolveWriteEmbedder(override?: MemoryEmbedder): Promise<MemoryEmbedder> {
   const meta = await requireReadyMemoryIndexes()
-  const embedder = override ?? createMemoryEmbedder((await getMemoryConfig()).embedding)
+  const embedder = override ?? await createMemoryEmbedderAsync((await getMemoryConfig()).embedding)
   if (embedder.modelId !== meta.embedding_model || embedder.dims !== meta.dims) {
     throw new Error(
       `Memory write refused: configured embedder (${embedder.modelId}, ${embedder.dims}d) does not match the ` +

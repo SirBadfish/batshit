@@ -46,6 +46,17 @@ export function fromInputValue(
       if (trimmed === 'true') return true
       if (trimmed === 'false') return false
       return undefined
+    case 'select':
+      // SA-102 follow-up: a three-state boolean is a select so it can express
+      // "not set" (''), which the empty-string guard above already returns as
+      // undefined. Its two real values must come back as REAL booleans, or the
+      // provider option would carry the string "false".
+      if (definition.booleanTriState) {
+        if (trimmed === 'true') return true
+        if (trimmed === 'false') return false
+        return undefined
+      }
+      return trimmed
     case 'number': {
       const parsed = Number(stripNumericFormatting(trimmed))
       return Number.isFinite(parsed) ? parsed : undefined

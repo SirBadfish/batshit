@@ -1,12 +1,62 @@
 import { filterParameters, isParameterSuppressedForModel } from '$lib/utils/parameterFilter'
+import {
+  LOCAL_AI_SERVER_IDS,
+  resolveLocalProviderOptionsSegment
+} from '$lib/data/localAiServers'
 import type { ModelCapabilities, ModelConnectionInfo, ModelPurpose } from '$lib/types/savedModels'
-import type { ParameterValue } from '$lib/data/parameter-schemas'
+import {
+  ALL_DEFINED_PARAMETER_NAMES,
+  type ParameterValue
+} from '$lib/data/parameter-schemas'
 import {
   DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
   normalizeRuntimeMaxOutputTokens
 } from '$lib/utils/modelOutputTokens'
 
 export type StandardKey = keyof RuntimeModelStandardSettings
+
+/**
+ * SA-102 P2: the `providerOptions` segment a LOCAL runtime's settings travel
+ * under.
+ *
+ * `@ai-sdk/openai-compatible` reads both `providerOptions[name]` and
+ * `providerOptions[camelCase(name)]`, but it marks the raw hyphenated form
+ * DEPRECATED — measured on 3.0.43: `Deprecated: "providerOptions key
+ * 'llama-cpp'". Use 'llamaCpp' instead.` `llama-cpp` is Batshit's only
+ * hyphenated runtime id, so without this every llama.cpp send would ship a
+ * deprecation warning today and break outright when the SDK drops the alias.
+ *
+ * Narrow on purpose: cloud provider ids are not touched, because their
+ * providerOptions keys are an external contract (`openai`, `anthropic`, …) and
+ * some carry underscores that must stay literal.
+ */
+export function resolveProviderOptionsSegment(provider: string): string {
+  if (!LOCAL_AI_SERVER_IDS.has(provider as any)) return provider
+  return resolveLocalProviderOptionsSegment(provider)
+}
+
+/**
+ * SA-102 P2: Batshit-internal runtime settings that live in the same bag as
+ * model parameters and must never reach a provider's request body.
+ *
+ * `provider_specific_settings` on an agent carries `nativeTools` (execution
+ * backend, bash access mode) and the whole `codex_*` / `claude_*` managed-CLI
+ * configuration. That bag is merged with the preset's settings before it
+ * reaches this mapper. The strict OpenAI provider used to hide the problem by
+ * validating `providerOptions.openai` against a closed schema; the
+ * openai-compatible transport local runtimes now use spreads providerOptions
+ * into the body verbatim, so an unguarded catch-all would ship Batshit's
+ * internal configuration to a third-party server. Measured on the wire during
+ * P2: a local send carried `"nativeTools":{"executionBackend":"local",
+ * "bashAccessMode":"plan"}` in the chat-completions body.
+ */
+const INTERNAL_SETTING_PREFIXES = ['codex_', 'claude_', 'batshit_'] as const
+const INTERNAL_SETTING_NAMES: ReadonlySet<string> = new Set(['nativeTools'])
+
+function isInternalRuntimeSetting(key: string): boolean {
+  if (INTERNAL_SETTING_NAMES.has(key)) return true
+  return INTERNAL_SETTING_PREFIXES.some((prefix) => key.startsWith(prefix))
+}
 
 export const OPENROUTER_DEFAULT_MAX_OUTPUT_TOKENS = DEFAULT_MODEL_MAX_OUTPUT_TOKENS
 export const MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS = 131_072
@@ -87,6 +137,12 @@ export function buildRuntimeModelSettings({
     for (const [key, value] of Object.entries(settings)) {
       if (knownKeys.has(key)) continue
       if (value === undefined || value === null) continue
+      // SA-102 P2: Batshit's own runtime configuration is not a model parameter.
+      if (isInternalRuntimeSetting(key)) continue
+      // SA-102 P2: a parameter Batshit defines but did NOT offer for this model
+      // was excluded on purpose. Only genuine user-authored Custom Parameters
+      // reach the passthrough below.
+      if (ALL_DEFINED_PARAMETER_NAMES.has(key)) continue
       if (isParameterSuppressedForModel(key, { provider, modelId, vercelId })) {
         continue
       }
@@ -107,7 +163,11 @@ export function buildRuntimeModelSettings({
       }
 
       if (provider) {
-        assignProviderOption(providerOptions, `${provider}.${key}`, value)
+        assignProviderOption(
+          providerOptions,
+          `${resolveProviderOptionsSegment(provider)}.${key}`,
+          value
+        )
       }
     }
   }

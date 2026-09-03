@@ -13,7 +13,7 @@
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import IconRenderer from '$lib/components/icons/IconRenderer.svelte'
-  import type { IconRef } from '$lib/icons/iconTypes'
+  import { getLocalAiIconRef } from '$lib/data/localAiIcons'
   import {
     AlertCircle,
     Boxes,
@@ -62,6 +62,7 @@
   }))
 
   let servers = $state<LocalAiServerSummary[]>([...defaultServers])
+
   let isLoading = $state(true)
   let loadError = $state<string | null>(null)
   let saveState = $state<'idle' | 'saving' | 'saved'>('idle')
@@ -81,17 +82,6 @@
     error?: string
   }
 
-  const LOCAL_AI_ICON_REFS: Partial<Record<string, IconRef>> = {
-    ollama: { kind: 'brand', slug: 'ollama-mono', fixed: true },
-    dmr: { kind: 'brand', slug: 'docker-color', fixed: true },
-    lmstudio: { kind: 'brand', slug: 'lmstudio-mono', fixed: true },
-    'llama-cpp': { kind: 'brand', slug: 'llamacpp-color', fixed: true },
-    vllm: { kind: 'brand', slug: 'vllm-color', fixed: true }
-  }
-
-  function getLocalAiIconRef(serverId: string): IconRef {
-    return LOCAL_AI_ICON_REFS[serverId] ?? { kind: 'lucide', id: 'server' }
-  }
   let modelListState = $state<Record<string, ModelListState>>({})
 
   function toggleServerOpen(id: string) {
@@ -144,6 +134,13 @@
       const response = await fetch(target, { signal: controller.signal })
       if (response.ok) {
         updateStatus(server.id, { state: 'online' })
+      } else if (response.status === 401 || response.status === 403) {
+        // SA-102 P5 (DL-102-09): a program that is running fine but wants a key
+        // must not read as "offline". Josh's oMLX answered 401 for weeks.
+        updateStatus(server.id, {
+          state: 'offline',
+          message: `${server.label} is running but needs an API key. Add one under Settings -> API Keys -> Local AI, or turn its key check off in ${server.label}.`
+        })
       } else {
         updateStatus(server.id, { state: 'offline', message: `HTTP ${response.status}` })
       }
@@ -221,6 +218,31 @@
       )
       .join('|')
   }
+
+  /**
+   * SA-102 P5 (DL-102-10): two enabled programs on the same address.
+   *
+   * oMLX and vLLM both default to port 8000, and Batshit merges models from
+   * every enabled program — so with stock defaults the same models appear twice
+   * under two different program names, with nothing saying why. Josh's call:
+   * WARN and point at the fix. Do not block; every one of these accepts a
+   * custom port, and blocking a working setup would be worse than explaining it.
+   */
+  const duplicateBaseUrlWarning = $derived.by(() => {
+    const byAddress = new Map<string, string[]>()
+    for (const server of servers) {
+      if (server.enabled === false) continue
+      const address = `${server.baseUrl.trim().toLowerCase().replace(/\/+$/, '')}`
+      if (!address) continue
+      byAddress.set(address, [...(byAddress.get(address) ?? []), server.label])
+    }
+    for (const [address, labels] of byAddress) {
+      if (labels.length > 1) {
+        return `${labels.join(' and ')} are both set to ${address}, so the same models will show up twice. Give one of them a different port, then update its address here.`
+      }
+    }
+    return null
+  })
 
   function validateServers(list: LocalAiServerSummary[]): string | null {
     for (const server of list) {
@@ -344,6 +366,15 @@
         </p>
       </SettingsInfoMenu>
     </div>
+
+    {#if duplicateBaseUrlWarning}
+      <Card.Root class="batshit-settings-card-info-callout">
+        <Card.Content class="batshit-settings-card-content-spacious flex items-center gap-2">
+          <AlertCircle class="h-4 w-4 shrink-0" />
+          <span>{duplicateBaseUrlWarning}</span>
+        </Card.Content>
+      </Card.Root>
+    {/if}
 
     {#if loadError}
       <Card.Root class="batshit-settings-card-danger">
@@ -483,7 +514,7 @@
                       <div class="batshit-settings-form-label-line">
                         <Label.Root class="batshit-settings-form-label">Base URL</Label.Root>
                         <SettingsInfoMenu ariaLabel={`About ${server.label} Base URL`}>
-                          <p>The root URL for this runtime’s local API.</p>
+                          <p>The root URL for {server.label}’s local API.</p>
                         </SettingsInfoMenu>
                       </div>
                     </div>
@@ -611,8 +642,8 @@
                     <div class="batshit-settings-form-label">Management</div>
                     <div class="pt-1">
                       {server.supports.management
-                        ? 'Batshit can manage models for this runtime.'
-                        : 'Manage models in the runtime itself.'}
+                        ? `Batshit can manage models for ${server.label}.`
+                        : `Manage models in ${server.label} itself.`}
                     </div>
                   </div>
                 </div>
@@ -741,8 +772,8 @@
                     {:else}
                       <p class="batshit-settings-caption">
                         {server.enabled
-                          ? 'Load models when the server is running.'
-                          : 'Enable this runtime to load models.'}
+                          ? `Load models when ${server.label} is running.`
+                          : `Turn ${server.label} on to load models.`}
                       </p>
                     {/if}
                   </Card.Content>

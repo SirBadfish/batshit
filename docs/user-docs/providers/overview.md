@@ -2,7 +2,7 @@
 
 Providers are how Batshit gets access to AI models — the API keys you save, the Model Presets you build on top of them, the Model Catalog that helps you create those presets, and the CLI providers (Codex and Claude Code) that run as their own managed agents. This page explains how those pieces fit together so the detail pages make sense.
 
-In Batshit, "provider" mostly means a source of model intelligence. Most of the time that's a hosted AI provider you reach with an API key. But CLI tools and Local AI runtimes are also ways to bring models in, and it helps to know where each one lives.
+In Batshit, "provider" mostly means a source of model intelligence. Most of the time that's a hosted AI provider you reach with an API key. But CLI tools and Local AI programs are also ways to bring models in, and it helps to know where each one lives.
 
 ## The pieces
 
@@ -23,12 +23,12 @@ The payoff is reuse: set a model up once as a preset, then select it anywhere. C
 
 For the full walkthrough — adding keys, the provider list, prompt caching behavior, and how Batshit keys differ from n8n credentials and CLI login — see [API keys and models](api-keys-and-models.md).
 
-## Provider keys versus Local AI runtimes
+## Provider keys versus Local AI programs
 
 These are two different ways to reach a model, and Batshit keeps them in separate places:
 
 - **Provider keys (API)** are for hosted models you reach over the internet. They live in Settings → API Keys. You're sending requests to someone else's servers, billed by that provider.
-- **Local AI runtimes** are models running on your own computer or network — through Ollama, LM Studio, Docker Model Runner, llama.cpp, or vLLM. They live in Settings → Local AI, not API Keys, because they're a URL to a local engine rather than a hosted-provider secret. After connecting one, you still create a Model Preset that uses it.
+- **Local AI programs** are models running on your own computer or network — through Ollama, LM Studio, Docker Model Runner, llama.cpp, vLLM, SGLang, or oMLX. They live in Settings → Local AI, not API Keys, because they're mostly a URL to a local engine rather than a hosted-provider secret. (They can carry a key too, if your program asks for one.) After connecting one, you still create a Model Preset that uses it.
 
 If you want models that run on your own hardware, start with [Local AI](../local-ai/overview.md). If you want hosted models, start with the API key flow.
 

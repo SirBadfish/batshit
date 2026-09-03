@@ -50,6 +50,7 @@ import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
     ModelPurpose
   } from '$lib/types/savedModels'
 import type { ParameterDefinition, ParameterValue } from '$lib/data/parameter-schemas'
+import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import { isTieredPricing } from '$lib/types/savedModels'
 import { determineModelCompatibility, isN8NSupported } from '$lib/data/model-compatibility-registry'
 import {
@@ -149,6 +150,13 @@ import {
     pricingOutput: string
     pricingCachedInput: string
     parameterValues: Record<string, string>
+    /**
+     * SA-102 P1 (DL-102-01): names the user deliberately emptied in THIS editing
+     * session. UI-only — never saved, never part of the auto-save signature. It
+     * exists so the default-seeding effect below can tell "never set" (seed it)
+     * from "cleared on purpose" (leave it blank so the request omits it).
+     */
+    clearedParameterNames: string[]
     customParameterRows: CustomParamRow[]
     customParametersJson: string
     compatibility: ModelCompatibility | null
@@ -240,6 +248,7 @@ const EMPTY_FORM: ModelFormState = {
   pricingOutput: '',
   pricingCachedInput: '',
   parameterValues: {},
+  clearedParameterNames: [],
   customParameterRows: [],
   customParametersJson: '',
   compatibility: null,
@@ -287,7 +296,7 @@ const MODEL_PURPOSE_OPTIONS: Array<{
 ]
 
 const IMAGE_TRANSPORT_OPTIONS: Array<{ value: ImageTransport; label: string; helper: string }> = [
-  { value: 'auto', label: 'Use runtime default', helper: 'Follow the Local AI runtime transport.' },
+  { value: 'auto', label: 'Automatic', helper: 'Let Batshit pick the image format this program accepts.' },
   { value: 'url', label: 'Force URL', helper: 'Use fetchable image URLs instead of data URLs.' }
 ]
 
@@ -353,13 +362,32 @@ const HIDDEN_INLINE_COMPATIBILITY_NOTES = new Set([
   'Available only for Batshit direct mode (no n8n webhook support yet)'
 ])
 
-const LOCAL_PROVIDER_IDS = new Set(['ollama', 'dmr', 'lmstudio', 'llama-cpp', 'vllm'])
+// SA-102 P1: derived from the ONE runtime definition list, so a runtime added
+// to LOCAL_AI_SERVER_DEFINITIONS is local here too without a second edit.
+const LOCAL_PROVIDER_LABELS = new Map<string, string>(
+  LOCAL_AI_SERVER_DEFINITIONS.map((definition) => [definition.id, definition.label])
+)
+
+function resolveLocalProviderId(form: ModelFormState): string | null {
+  const connectionService = form.connectionService?.trim().toLowerCase() ?? ''
+  if (connectionService && LOCAL_PROVIDER_LABELS.has(connectionService)) return connectionService
+  const provider = form.provider?.trim().toLowerCase() ?? ''
+  if (provider && LOCAL_PROVIDER_LABELS.has(provider)) return provider
+  return null
+}
 
 function isLocalProvider(form: ModelFormState): boolean {
-  const connectionService = form.connectionService?.trim().toLowerCase() ?? ''
-  if (connectionService && LOCAL_PROVIDER_IDS.has(connectionService)) return true
-  const provider = form.provider?.trim().toLowerCase() ?? ''
-  return provider ? LOCAL_PROVIDER_IDS.has(provider) : false
+  return resolveLocalProviderId(form) !== null
+}
+
+/**
+ * SA-102 P1 (DL-102-16): user-facing copy names the PROGRAM, never "runtime".
+ * Josh's rule: a local-AI user knows what LM Studio is; "runtime" is a word he
+ * did not know three months ago and most local-AI users will not either.
+ */
+function resolveLocalProgramLabel(form: ModelFormState): string | null {
+  const id = resolveLocalProviderId(form)
+  return id ? (LOCAL_PROVIDER_LABELS.get(id) ?? null) : null
 }
 
 function resolveToolsToggleValue(form: ModelFormState): boolean {
@@ -767,6 +795,71 @@ let lastInvalidModelSignature = $state<string | null>(null)
   let parameterSectionOpen = $state<Record<string, boolean>>({})
   let customParametersJsonError = $state<string | null>(null)
   const isCodexModel = $derived.by(() => isCodexForm(editingForm))
+  // SA-102 P1 (DL-102-16): the program that owns this model's defaults, by name.
+  const localProgramLabel = $derived.by(() => resolveLocalProgramLabel(editingForm))
+  const localProviderId = $derived.by(() => resolveLocalProviderId(editingForm))
+
+  /**
+   * SA-102 P4 (DL-102-04): what the local program says it is ACTUALLY running
+   * this model with, next to the ceiling the preset stores.
+   *
+   * Three states, all of them said out loud: a real loaded number, "not loaded
+   * yet" for a program that would tell us once it is, and nothing at all for a
+   * program that never reports. Batshit never quietly presents the ceiling as
+   * the truth — Josh's own 27B loads at 208,384 under a 262,144 ceiling.
+   */
+  const localContextStatus = $derived.by(() => {
+    const program = localProgramLabel
+    const reading = selectedCatalogEntry?.model?.localContext
+    if (!program || !reading) return null
+
+    const preset = parseFormattedInteger(editingForm.contextWindow) || null
+    if (reading.source === 'loaded' && typeof reading.loadedContextWindow === 'number') {
+      const loaded = reading.loadedContextWindow
+      return {
+        tone: preset && preset !== loaded ? 'is-warning' : '',
+        text:
+          preset && preset !== loaded
+            ? `${program} is running this model at ${loaded.toLocaleString()} tokens, not the ${preset.toLocaleString()} above. Batshit plans against ${loaded.toLocaleString()}.`
+            : `${program} is running this model at ${loaded.toLocaleString()} tokens.`,
+        ttl:
+          typeof reading.remainingTtlSeconds === 'number'
+            ? `${program} unloads it in about ${Math.max(1, Math.round(reading.remainingTtlSeconds / 60))} minutes, after which this becomes unknown again.`
+            : null
+      }
+    }
+    return {
+      tone: '',
+      text: `${program} can tell Batshit the real size, but only while the model is loaded. Load it and reopen this to see the number.`,
+      ttl: null
+    }
+  })
+
+  /** SA-102 P4 (DL-102-11): open-ended text, never a two-value enum. */
+  const localModelFormat = $derived.by(() => {
+    const raw = selectedCatalogEntry?.model?.format
+    return typeof raw === 'string' && raw.trim() ? raw.trim() : null
+  })
+  /**
+   * SA-102 P3 (DL-102-15): Ollama's OpenAI-compatible endpoint silently ignores
+   * top_k, min_p, repeat_penalty, mirostat and num_ctx (measured: top_k 1 at
+   * temperature 2 still produced different answers). Those live in a Modelfile
+   * instead — which is a recipe the user writes, not a file Ollama keeps on
+   * disk, so the only useful help is the exact commands, prefilled with this
+   * model's name.
+   */
+  const ollamaModelfileCommands = $derived.by(() => {
+    if (localProviderId !== 'ollama') return null
+    const model = (editingForm.modelId || 'your-model').trim()
+    const base = model.split(':')[0] || model
+    return {
+      model,
+      show: `ollama show --modelfile ${model} > Modelfile`,
+      parameter: 'PARAMETER top_k 40',
+      create: `ollama create ${base}-custom -f Modelfile`,
+      contextEnv: 'OLLAMA_CONTEXT_LENGTH=32768 ollama serve'
+    }
+  })
   const activeVoiceSessionConfig = $derived(resolveLiveKitSpeechToSpeechFormConfig(editingForm))
   const activeVoiceSessionVoiceOptions = $derived(
     getSpeechToSpeechVoiceOptions(activeVoiceSessionConfig)
@@ -1128,9 +1221,12 @@ let lastInvalidModelSignature = $state<string | null>(null)
     const nextValues = { ...editingForm.parameterValues }
     let changed = false
 
+    const clearedNames = new Set(editingForm.clearedParameterNames)
     for (const definition of activeParameterDefinitions) {
       if (nextValues[definition.name] !== undefined) continue
       if (definition.defaultValue === undefined) continue
+      // SA-102 P1 (DL-102-01): never refill a field the user emptied on purpose.
+      if (clearedNames.has(definition.name)) continue
       const formatted = formatParameterDisplayValue(definition, formatDefaultInput(definition))
       if (!formatted.length) continue
       nextValues[definition.name] = formatted
@@ -1962,12 +2058,21 @@ $effect(() => {
   }
 
   function updateParameterValue(name: string, value: string) {
+    // SA-102 P1 (DL-102-01): emptying a field is a decision, not an absence.
+    // Record it so the seeding effect stops refilling it from defaultValue.
+    const cleared = new Set(editingForm.clearedParameterNames)
+    if (value.trim().length === 0) {
+      cleared.add(name)
+    } else {
+      cleared.delete(name)
+    }
     editingForm = {
       ...editingForm,
       parameterValues: {
         ...editingForm.parameterValues,
         [name]: value
-      }
+      },
+      clearedParameterNames: [...cleared]
     }
   }
 
@@ -1980,6 +2085,21 @@ $effect(() => {
     const formatted = formatParameterDisplayValue(definition, current)
     if (formatted === current) return
     updateParameterValue(definition.name, formatted)
+  }
+
+  /**
+   * SA-102 P1 (DL-102-16): a blank local field must never imply a value. It says
+   * which program decides instead, by name.
+   */
+  function resolveParameterPlaceholder(definition: ParameterDefinition): string {
+    if (localProgramLabel) {
+      return `Not sent, ${localProgramLabel} decides`
+    }
+    return (
+      formatParameterDisplayValue(definition, definition.placeholder ?? '') ||
+      definition.placeholder ||
+      ''
+    )
   }
 
   function getParameterHint(definition: ParameterDefinition) {
@@ -2264,6 +2384,7 @@ $effect(() => {
       pricingOutput: extractPrice(model.pricing?.output),
       pricingCachedInput: extractPrice(model.pricing?.cachedInput),
       parameterValues,
+      clearedParameterNames: [],
       customParameterRows: buildCustomParameterRows(model),
       customParametersJson: '',
       compatibility: model.compatibility ?? null,
@@ -2618,6 +2739,7 @@ $effect(() => {
       capabilities: null,
       compatibility: providerHint ? determineModelCompatibility(providerHint) : null,
       parameterValues: {},
+      clearedParameterNames: [],
       connectionUseDeveloperPrefix: false
     }
   }
@@ -3218,6 +3340,8 @@ $effect(() => {
   function makeFormSignature(form: ModelFormState) {
     return JSON.stringify({
       ...form,
+      // SA-102 P1: UI-only editing state, never persisted and never a change.
+      clearedParameterNames: undefined,
       parameterValues: Object.fromEntries(
         Object.entries(form.parameterValues).sort(([a], [b]) => a.localeCompare(b))
       ),
@@ -4321,8 +4445,48 @@ $effect(() => {
                       applySafeMaxOutputToEditingForm(getParameterValue('maxTokens'))
                     }}
 	                />
+	                {#if localContextStatus}
+	                  <p class={`batshit-settings-form-meta ${localContextStatus.tone}`}>
+	                    {localContextStatus.text}
+	                  </p>
+	                  {#if localContextStatus.ttl}
+	                    <p class="batshit-settings-form-meta">{localContextStatus.ttl}</p>
+	                  {/if}
+	                {/if}
+	                {#if localProviderId === 'ollama'}
+	                  <p class="batshit-settings-form-meta is-warning">
+	                    Ollama cannot be told a context size by Batshit, and it drops the oldest part
+	                    of a long conversation without saying so. Set it in a Modelfile, or start
+	                    Ollama with OLLAMA_CONTEXT_LENGTH. The exact commands are in the
+	                    Managed by Ollama note below.
+	                  </p>
+	                {/if}
 	              </div>
 	            </div>
+
+	            {#if localModelFormat}
+	              <div class="batshit-settings-form-row">
+	                <div class="batshit-settings-form-copy">
+	                  <div class="batshit-settings-form-label-line">
+	                    <Label.Root class="batshit-settings-form-label">Model Format</Label.Root>
+	                    <SettingsInfoMenu ariaLabel="About Model Format">
+	                      <p>
+	                        The file format this model is in, exactly as {localProgramLabel ?? 'the program'}
+	                        reports it. On an Apple Silicon Mac an MLX build of a model usually runs
+	                        faster than the same model in GGUF.
+	                      </p>
+	                      <p class="mt-2">
+	                        Batshit shows whatever it is told here, so a format other than MLX or GGUF
+	                        appears under its own name.
+	                      </p>
+	                    </SettingsInfoMenu>
+	                  </div>
+	                </div>
+	                <div class="batshit-settings-form-control is-inline-status">
+	                  <Badge variant="outline" class="batshit-settings-child-label">{localModelFormat}</Badge>
+	                </div>
+	              </div>
+	            {/if}
 
 	            <div class="batshit-settings-form-row">
 	              <div class="batshit-settings-form-copy">
@@ -4448,7 +4612,7 @@ $effect(() => {
 		                  <p class="batshit-settings-form-label">Image Transport</p>
 		                  <SettingsInfoMenu ariaLabel="About Image Transport">
 		                    <p>
-		                      Use the runtime default unless a specific model needs fetchable image
+		                      Leave this on Automatic unless a specific model needs fetchable image
 		                      URLs. Automatic data URLs are still structured image inputs, not prompt
 		                      text.
 		                    </p>
@@ -4468,7 +4632,7 @@ $effect(() => {
 		                  <Select.Trigger>
 		                    <span>
 		                      {IMAGE_TRANSPORT_OPTIONS.find((option) => option.value === editingForm.imageTransport)?.label ||
-		                        'Use runtime default'}
+		                        'Automatic'}
 		                    </span>
 		                  </Select.Trigger>
 		                  <Select.Content>
@@ -4491,7 +4655,7 @@ $effect(() => {
 		              <div class="flex items-center justify-between gap-4">
 		                <div class="space-y-1">
 		                  <div class="flex items-center gap-1">
-		                    <p class="batshit-settings-form-label">Model Parameters</p>
+		                    <p class="batshit-settings-form-label">{localProgramLabel ? `Managed by ${localProgramLabel}` : 'Model Parameters'}</p>
 		                    <SettingsInfoMenu ariaLabel="About Model Parameters">
 		                      <p>
 		                        Settings auto-filter based on provider support, connection rules, and
@@ -4503,8 +4667,45 @@ $effect(() => {
 		                        <span class="batshit-settings-inline-strong"> OpenAI Options</span> when they apply.
 		                      </p>
 		                      <p class="mt-2">
-		                        Leave any field blank to use the provider default instead.
+		                        {localProgramLabel
+                          ? `Every field here is optional. Leave a field blank and ${localProgramLabel} decides that value, using its own per-model setting. Fill a field in and this preset wins for that value, on this request only.`
+                          : 'Leave any field blank to use the provider default instead.'}
 		                      </p>
+		                      {#if localProgramLabel}
+		                        <p class="mt-2">
+		                          Changing any of these does not throw away {localProgramLabel}'s memory of
+		                          your conversation, so a second message still starts faster than the first.
+		                          Editing the agent's system prompt does, and so does a conversation
+		                          growing past the size the model was loaded with.
+		                        </p>
+		                      {/if}
+		                      {#if ollamaModelfileCommands}
+		                        <p class="mt-2">
+		                          Ollama accepts fewer settings here than the other programs. Top K, Min P,
+		                          repeat penalty, Mirostat and the context length are not settings Ollama
+		                          reads from a request, so Batshit does not offer them. They live in a
+		                          Modelfile, which you write yourself. To set one for
+		                          <code>{ollamaModelfileCommands.model}</code>:
+		                        </p>
+		                        <p>1. <code>{ollamaModelfileCommands.show}</code></p>
+		                        <p>
+		                          2. Open the new <code>Modelfile</code> and add a line such as
+		                          <code>{ollamaModelfileCommands.parameter}</code>
+		                        </p>
+		                        <p>3. <code>{ollamaModelfileCommands.create}</code></p>
+		                        <p>4. Pick the new model in Batshit.</p>
+		                        <p class="mt-2">
+		                          For context length only, you can instead start Ollama with
+		                          <code>{ollamaModelfileCommands.contextEnv}</code>.
+		                        </p>
+		                        <p class="mt-2">
+		                          <a
+		                            href="https://docs.ollama.com/modelfile"
+		                            target="_blank"
+		                            rel="noreferrer noopener"
+		                          >Ollama's Modelfile reference</a>
+		                        </p>
+		                      {/if}
 		                    </SettingsInfoMenu>
 		                  </div>
 		                </div>
@@ -4617,7 +4818,18 @@ $effect(() => {
                                           </span>
                                         </Select.Trigger>
                                         <Select.Content>
-                                          <Select.Item value="">Use provider default</Select.Item>
+                                          <!--
+                                            SA-102 follow-up: only render the built-in empty option when the
+                                            schema does not already carry one. The tri-state booleans
+                                            (parallelToolCalls, store, strictJsonSchema,
+                                            openaiWebSearchExternalAccess, includeThoughts) ship their own
+                                            { label: 'Default', value: '' }, and two Select.Items sharing
+                                            value="" both highlight as selected while switching between them
+                                            does nothing.
+                                          -->
+                                          {#if !(parameter.options ?? []).some((option) => option.value === '')}
+                                            <Select.Item value="">Use provider default</Select.Item>
+                                          {/if}
                                           {#each parameter.options ?? [] as option (option.value)}
                                             <Select.Item value={option.value}>{option.label}</Select.Item>
                                           {/each}
@@ -4627,7 +4839,7 @@ $effect(() => {
                                       <Textarea
                                         rows={parameter.inputType === 'json' ? 6 : 3}
                                         value={getParameterValue(parameter.name)}
-                                        placeholder={parameter.placeholder}
+                                        placeholder={resolveParameterPlaceholder(parameter)}
                                         oninput={(event) =>
                                           updateParameterValue(
                                             parameter.name,
@@ -4640,7 +4852,7 @@ $effect(() => {
                                         type="text"
                                         inputmode={parameter.inputType === 'integer' ? 'numeric' : 'decimal'}
                                         value={getParameterValue(parameter.name)}
-                                        placeholder={formatParameterDisplayValue(parameter, parameter.placeholder ?? '') || parameter.placeholder}
+                                        placeholder={resolveParameterPlaceholder(parameter)}
                                         oninput={(event) =>
                                           updateParameterValue(
                                             parameter.name,
@@ -4726,6 +4938,12 @@ $effect(() => {
 			                            Add provider-specific parameters not listed above. Values entered in Custom JSON
 			                            override matching keys from the row-based editor.
 			                          </p>
+			                          {#if localProgramLabel}
+			                            <p class="mt-2">
+			                              These now reach {localProgramLabel} exactly as you type them. Before, they
+			                              were silently dropped before the request left Batshit.
+			                            </p>
+			                          {/if}
 			                        </SettingsInfoMenu>
 		                          <button
 		                            type="button"

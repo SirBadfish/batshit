@@ -265,3 +265,43 @@ describe('apiPromptCachePolicy', () => {
     expect(result.metadata.enabled).toBe(false)
   })
 })
+
+/**
+ * SA-102 P2 (DL-102-02): no local lane may ever receive a `prompt_cache_key` or
+ * a session-affinity header. Every local runtime carries
+ * `connection.service = <runtime id>`, which misses EXACT_PROVIDER_KINDS and
+ * resolves to `unknown` BEFORE fuzzy model-name inference can run — which
+ * matters because a local model can legitimately be named `gpt-oss-20b` or
+ * `gpt-5-local-gguf`.
+ */
+describe('SA-102 local lanes stay out of the cache policy', () => {
+  const LOCAL_RUNTIME_IDS = ['ollama', 'dmr', 'lmstudio', 'llama-cpp', 'vllm', 'sglang', 'omlx']
+
+  it('classifies every local runtime as unknown and adds nothing', () => {
+    for (const service of LOCAL_RUNTIME_IDS) {
+      const result = applyApiPromptCachePolicy({
+        modelId: 'qwen3.8-27b',
+        providerId: service,
+        connection: { type: 'direct', service, id: `direct:${service}` },
+        messages: baseMessages('hello'),
+      })
+      expect(result.metadata.provider, `${service} kind`).toBe('unknown')
+      expect(result.metadata.enabled, `${service} enabled`).toBe(false)
+      expect(result.providerOptions, `${service} providerOptions`).toBeUndefined()
+      expect(result.headers, `${service} headers`).toBeUndefined()
+    }
+  })
+
+  it('does not treat an OpenAI-NAMED local model as OpenAI', () => {
+    for (const modelId of ['gpt-oss-20b', 'gpt-5-local-gguf', 'o1-mini-local']) {
+      const result = applyApiPromptCachePolicy({
+        modelId,
+        providerId: 'llama-cpp',
+        connection: { type: 'direct', service: 'llama-cpp', id: 'direct:llama-cpp' },
+        messages: baseMessages('hello'),
+      })
+      expect(result.metadata.provider, modelId).toBe('unknown')
+      expect(result.providerOptions, modelId).toBeUndefined()
+    }
+  })
+})

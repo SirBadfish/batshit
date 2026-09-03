@@ -45,7 +45,7 @@ import type {
   MemorySegmentRecord
 } from './memoryTypes'
 import { MEMORY_LANES } from './memoryTypes'
-import { createMemoryEmbedder } from './memoryEmbedder'
+import { createMemoryEmbedderAsync } from './memoryEmbedder'
 import {
   getMemoryConfig,
   hybridSearchMemories,
@@ -321,8 +321,11 @@ export async function saveMemoryOp(
   }
 
   // SA-104 P5: the embedder is built with the caller's user context so the api lane
-  // can resolve the user's saved provider key (builtin/local-ai lanes ignore it).
-  const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
+  // can resolve the user's saved provider key.
+  // SA-102 P5 (DL-102-14): async door, because the local lane's key lives in the
+  // shared encrypted store and reading it is async. The sync door would hand a
+  // key-protected local program the old `local-ai` placeholder and 401.
+  const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
 
@@ -527,7 +530,7 @@ export async function searchMemoriesOp(
   if (savedFrom !== undefined) filters.savedTsMin = savedFrom
   if (savedTo !== undefined) filters.savedTsMax = savedTo
 
-  const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
+  const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
   const vector = await embedder.embedQuery(query)
@@ -724,7 +727,7 @@ export async function updateMemoryOp(
     for (const item of replacementMedia ?? []) await deleteMemoryMedia(item).catch(() => {})
     throw error
   }
-  const embedder = createMemoryEmbedder((await getMemoryConfig()).embedding, {
+  const embedder = await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
     userId: context.userId
   })
   let record: MemoryRecord

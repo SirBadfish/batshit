@@ -80,6 +80,7 @@ import {
   outputTokensForUsage,
   resolveMessageUsage,
   type ApiUsageLike,
+  withHonestLocalCacheUsage,
 } from '$lib/server/services/apiProviderUsage'
 import type { NativeModeRequest } from '$lib/server/services/vercelBrain'
 import {
@@ -90,6 +91,14 @@ import {
 } from '$lib/server/visualIndicatorService'
 import { generateMessageId } from '$lib/utils/messageId'
 import { buildRuntimeModelSettings } from '$lib/utils/modelSettingsMapper'
+import {
+  readLocalRuntimeContext,
+  resolveEffectiveContextLimit
+} from '$lib/server/services/localRuntimeContext'
+import {
+  LOCAL_AI_SERVER_DEFINITIONS,
+  resolveLocalPromptCacheReporting
+} from '$lib/data/localAiServers'
 import {
   buildReasoningPersistenceEvidence,
   collectReasoningTextFromFinish,
@@ -3809,7 +3818,54 @@ async function handleBatshitAgentStream({
     global: userSettings?.global_auto_compact_settings,
     agent: (agent as any)?.auto_compact_settings,
   })
-  const promptBudgetContextLimit = primarySelection.contextWindow ?? null
+  /**
+   * SA-102 P4 (DL-102-04): budget against what the local program is ACTUALLY
+   * running, not the preset's ceiling.
+   *
+   * LM Studio held Josh's 27B at 208,384 under a 262,144 ceiling, and Ollama
+   * truncates a prompt past its loaded context silently. Every consumer below
+   * — the auto-compact trigger, the output reserve, the prompt budget report,
+   * and the send-blocking preflight — reads this one number, so correcting it
+   * here corrects all of them. When the program cannot report, the preset
+   * stands and `source` says why; nothing quietly falls back to the ceiling.
+   */
+  /**
+   * SA-102 P6: one read of the local program records per send, not two.
+   *
+   * `listLocalAiServers` issues a Redis `json.get` per definition — seven now —
+   * and this handler needs the same list twice: here for the context reading and
+   * later for image transport. Memoized so the second consumer reuses the first
+   * result instead of paying another seven round-trips on the hot path.
+   */
+  let localAiServersPromise: Promise<Awaited<ReturnType<typeof listLocalAiServers>> | null> | null =
+    null
+  const loadLocalAiServersOnce = () => {
+    localAiServersPromise ??= listLocalAiServers(userId).catch(() => null)
+    return localAiServersPromise
+  }
+
+  const localContextReading = isLocalProviderId(primaryProviderId)
+    ? await readLocalRuntimeContext({
+        providerId: primaryProviderId,
+        modelId: primarySelection.modelId,
+        baseUrl:
+          (await loadLocalAiServersOnce())?.find((entry) => entry.id === primaryProviderId)
+            ?.baseUrl ?? null,
+      })
+    : null
+  const effectiveContext = resolveEffectiveContextLimit({
+    presetContextWindow: primarySelection.contextWindow ?? null,
+    reading: localContextReading,
+  })
+  if (effectiveContext.mismatch) {
+    console.warn('[Send-Routed] Local context differs from the saved preset', {
+      provider: primaryProviderId,
+      model: primarySelection.modelId,
+      presetContextWindow: effectiveContext.presetContextWindow,
+      loadedContextWindow: effectiveContext.loadedContextWindow,
+    })
+  }
+  const promptBudgetContextLimit = effectiveContext.contextLimit
   const promptBudgetAutoCompactTriggerTokens = resolveAutoCompactTriggerTokens(
     effectiveAutoCompactForPreflight,
     promptBudgetContextLimit,
@@ -4775,16 +4831,6 @@ async function handleBatshitAgentStream({
   }
 
   type StreamRuntimeSettings = ReturnType<typeof buildRuntimeModelSettings>
-  type StreamOverrideSettings = {
-    temperature?: number | null
-    maxTokens?: number | null
-    topP?: number | null
-    topK?: number | null
-    presencePenalty?: number | null
-    frequencyPenalty?: number | null
-    seed?: number | null
-    stopSequences?: string[] | null
-  }
 
   // SA-093 P7: Batshit-measured wall-clock stream timings for the managed CLI
   // lanes, whose fabricated streams carry no SDK performance data. Marks come
@@ -4841,7 +4887,6 @@ async function handleBatshitAgentStream({
     settings: StreamRuntimeSettings,
     providerSettingsOverride: Record<string, any> | null,
     capabilities: ModelCapabilities | null,
-    overrides: StreamOverrideSettings,
     toolsEnabled: boolean,
     streamMessages: any[] = compiledMessages,
     streamImages: Array<{ url: string }> = images,
@@ -4889,21 +4934,26 @@ async function handleBatshitAgentStream({
       schema: {},
     })),
     maxToolRounds: 100,
-    temperature: settings.standard.temperature ?? overrides.temperature ?? 0.7,
-    maxTokens: settings.standard.maxTokens ?? overrides.maxTokens ?? 16384,
-    topP: settings.standard.topP ?? overrides.topP ?? undefined,
-    topK: settings.standard.topK ?? overrides.topK ?? undefined,
-    presencePenalty:
-      settings.standard.presencePenalty ??
-      overrides.presencePenalty ??
-      undefined,
-    frequencyPenalty:
-      settings.standard.frequencyPenalty ??
-      overrides.frequencyPenalty ??
-      undefined,
-    seed: settings.standard.seed ?? overrides.seed ?? undefined,
-    stopSequences:
-      settings.standard.stopSequences ?? overrides.stopSequences ?? undefined,
+    // SA-102 P1 (DL-102-01): blank means "do not send". A parameter the user
+    // left empty is absent from the request body — no substituted default at
+    // any layer, so the model's own default applies.
+    //
+    // `settings.standard` is already the FULL merge: buildRuntimeModelSettings
+    // receives the agent-level `primary_model_*` / `fallback_model_*` values as
+    // its `fallbacks`, applies them only where the preset left a gap, honours
+    // isParameterSuppressedForModel, and runs every surviving maxTokens through
+    // normalizeRuntimeMaxTokens. A second `?? overrides.x` chain here used to
+    // re-add exactly those agent values AFTER suppression had removed them and
+    // AFTER the context clamp had run — so it could smuggle a sampler onto a
+    // model that rejects it, and `?? 16384` escaped the clamp entirely.
+    temperature: settings.standard.temperature,
+    maxTokens: settings.standard.maxTokens,
+    topP: settings.standard.topP,
+    topK: settings.standard.topK,
+    presencePenalty: settings.standard.presencePenalty,
+    frequencyPenalty: settings.standard.frequencyPenalty,
+    seed: settings.standard.seed,
+    stopSequences: settings.standard.stopSequences,
     providerOptions,
     providerSettings: providerSettingsOverride ?? null,
     codexSettings: codexRuntimeSettings ?? undefined,
@@ -4948,13 +4998,21 @@ async function handleBatshitAgentStream({
       // SA-107 (DL-107-06/07): SDK usage stays authoritative; raw-chunk cache
       // fields fill gaps (flat cached_tokens lanes), and the gateway lane can
       // derive inclusive cache usage from step providerMetadata.
+      // SA-102 P4 (DL-102-13): and a local program that never reports cached
+      // tokens must not arrive here claiming a confident zero — the SDK maps an
+      // absent `prompt_tokens_details.cached_tokens` to 0.
       const resolvedUsage =
-        resolveMessageUsage({
-          sdkUsage: totalUsage || usage || undefined,
-          rawStreamUsage: rawUsageFromStream ?? undefined,
-          steps,
-          isGatewayLane: connection?.type === 'vercel-gateway',
-        }) ?? undefined
+        withHonestLocalCacheUsage(
+          resolveMessageUsage({
+            sdkUsage: totalUsage || usage || undefined,
+            rawStreamUsage: rawUsageFromStream ?? undefined,
+            steps,
+            isGatewayLane: connection?.type === 'vercel-gateway',
+          }),
+          resolveLocalPromptCacheReporting(
+            connection?.service ?? requestProviderId ?? null,
+          ),
+        ) ?? undefined
       lastStreamSteps = Array.isArray(steps) ? steps : []
       lastResolvedUsage = resolvedUsage ?? null
 
@@ -5448,62 +5506,10 @@ async function handleBatshitAgentStream({
     : isClaudeProvider
       ? 'claude/claude-cli'
       : effectiveModelId || 'claude-3-5-sonnet-20241022'
-  const primaryOverrides: StreamOverrideSettings = {
-    temperature:
-      agentMetadata.primary_model_temperature ??
-      agent.primary_model_temperature ??
-      null,
-    maxTokens:
-      agentMetadata.primary_model_max_tokens ??
-      agent.primary_model_max_tokens ??
-      null,
-    topP:
-      agentMetadata.primary_model_top_p ?? agent.primary_model_top_p ?? null,
-    topK:
-      agentMetadata.primary_model_top_k ?? agent.primary_model_top_k ?? null,
-    presencePenalty:
-      agentMetadata.primary_model_presence_penalty ??
-      agent.primary_model_presence_penalty ??
-      null,
-    frequencyPenalty:
-      agentMetadata.primary_model_frequency_penalty ??
-      agent.primary_model_frequency_penalty ??
-      null,
-    seed: agentMetadata.primary_model_seed ?? agent.primary_model_seed ?? null,
-    stopSequences:
-      agentMetadata.primary_model_stop_sequences ??
-      agent.primary_model_stop_sequences ??
-      null,
-  }
-
-  const fallbackOverrides: StreamOverrideSettings = {
-    temperature:
-      agentMetadata.fallback_model_temperature ??
-      agent.fallback_model_temperature ??
-      null,
-    maxTokens:
-      agentMetadata.fallback_model_max_tokens ??
-      agent.fallback_model_max_tokens ??
-      null,
-    topP:
-      agentMetadata.fallback_model_top_p ?? agent.fallback_model_top_p ?? null,
-    topK:
-      agentMetadata.fallback_model_top_k ?? agent.fallback_model_top_k ?? null,
-    presencePenalty:
-      agentMetadata.fallback_model_presence_penalty ??
-      agent.fallback_model_presence_penalty ??
-      null,
-    frequencyPenalty:
-      agentMetadata.fallback_model_frequency_penalty ??
-      agent.fallback_model_frequency_penalty ??
-      null,
-    seed:
-      agentMetadata.fallback_model_seed ?? agent.fallback_model_seed ?? null,
-    stopSequences:
-      agentMetadata.fallback_model_stop_sequences ??
-      agent.fallback_model_stop_sequences ??
-      null,
-  }
+  // SA-102 P1 (DL-102-01): the agent-level primary_model_* / fallback_model_*
+  // values are NOT applied a second time here. They already reach the request
+  // as `fallbacks` on buildRuntimeModelSettings above, which is the one place
+  // that also honours parameter suppression and the context-window clamp.
 
   const clippedItemsForImages =
     formattedInput.structuredInput?.clippedItems ?? []
@@ -5526,9 +5532,7 @@ async function handleBatshitAgentStream({
   const needsLocalImageConfig =
     isLocalProviderId(primaryProviderIdForImages) ||
     isLocalProviderId(fallbackProviderIdForImages)
-  const localServerConfigs = needsLocalImageConfig
-    ? await listLocalAiServers(userId).catch(() => null)
-    : null
+  const localServerConfigs = needsLocalImageConfig ? await loadLocalAiServersOnce() : null
   const primaryImageConfig = await resolveImageTransportConfig({
     userId,
     providerId: primaryProviderIdForImages,
@@ -5604,7 +5608,6 @@ async function handleBatshitAgentStream({
         runtimeSettings,
         providerSpecificSettings ?? null,
         primaryCapabilities,
-        primaryOverrides,
         primaryToolsEnabled,
         primaryImagePayload.messages,
         primaryImagePayload.images,
@@ -5648,7 +5651,6 @@ async function handleBatshitAgentStream({
           fallbackResolvedIds
             ? fallbackCapabilities
             : null,
-          fallbackOverrides,
           fallbackToolsEnabled,
           fallbackImagePayload.messages,
           fallbackImagePayload.images,
@@ -7011,9 +7013,20 @@ async function handleBatshitAgentStream({
 
     if (error instanceof Error && error.message?.includes('API key')) {
       await persistRuntimeSnapshot('failed', normalizedErrorMessage)
+      // SA-102 P5 (DL-102-09): a local program refusing a key is a different
+      // problem from a missing cloud provider key, and the generic message sent
+      // users hunting in the wrong place. Josh's oMLX answered 401 for weeks.
+      const localProgram = LOCAL_AI_SERVER_DEFINITIONS.find(
+        (definition) =>
+          definition.id ===
+          (connectionInfo?.service ?? primarySelection.provider ?? '').trim().toLowerCase(),
+      )
+      const apiKeyErrorMessage = localProgram
+        ? `${localProgram.label} refused the request because of its API key. Add or correct the key for ${localProgram.label} under Settings -> API Keys -> Local AI, or turn its key check off in ${localProgram.label}.`
+        : 'AI provider API key not configured for API or CLI agents'
       return {
         response: json(
-        { error: 'AI provider API key not configured for API or CLI agents' },
+        { error: apiKeyErrorMessage },
           { status: 500 },
         ),
         messageId,

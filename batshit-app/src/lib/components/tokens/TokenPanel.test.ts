@@ -231,7 +231,7 @@ describe('TokenPanel', () => {
     expect(screen.getByText('No responses in this chat yet.')).toBeInTheDocument()
   })
 
-  it('says the runtime did not report stats once a response exists without them', async () => {
+  it('says the provider did not report stats once a response exists without them', async () => {
     ;(window as any).ResizeObserver ??= class ResizeObserver {
       observe() {}
       unobserve() {}
@@ -254,7 +254,7 @@ describe('TokenPanel', () => {
     await fireEvent.focus(cacheTrigger)
     expect(
       await screen.findByText(
-        'The provider or runtime did not report this for the latest response.',
+        'The provider did not report this for the latest response.',
       ),
     ).toBeInTheDocument()
   })
@@ -400,5 +400,69 @@ describe('TokenPanel', () => {
     expect(
       screen.getByRole('button', { name: 'View speed stats for the latest response' }),
     ).toHaveTextContent('8.5 t/s')
+  })
+
+  // SA-102 P4 (DL-102-13): a local program that never reports cached tokens
+  // must SAY so by name, not show a dash that reads like a cache miss. Measured
+  // on the Ollama lane: 43,085 ms -> 1,268 ms time-to-first-output with no
+  // cache number at any point.
+  it('names the local program when it never reports cache numbers', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+        localProgramLabel: 'Ollama',
+        localCacheReporting: 'never-reports' as const,
+      },
+    })
+
+    const cacheTrigger = screen.getByRole('button', {
+      name: 'View prompt cache hit rate for the latest response',
+    })
+    await fireEvent.pointerEnter(cacheTrigger)
+    await fireEvent.mouseEnter(cacheTrigger)
+    await fireEvent.focus(cacheTrigger)
+    expect(
+      await screen.findByText(/Ollama does not report cache numbers/),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/you can see it in the speed/)).toBeInTheDocument()
+  })
+
+  it('explains a genuine zero from a program that does report', async () => {
+    ;(window as any).ResizeObserver ??= class ResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+
+    render(TokenPanel, {
+      props: {
+        currentTokens: 12000,
+        contextLimit: 128000,
+        hasLatestResponse: true,
+        cacheHitPercent: 0,
+        cacheCachedTokens: 0,
+        cacheInputTokens: 2140,
+        localProgramLabel: 'oMLX',
+        localCacheReporting: 'reports' as const,
+      },
+    })
+
+    const cacheTrigger = screen.getByRole('button', {
+      name: 'View prompt cache hit rate for the latest response',
+    })
+    await fireEvent.pointerEnter(cacheTrigger)
+    await fireEvent.mouseEnter(cacheTrigger)
+    await fireEvent.focus(cacheTrigger)
+    // oMLX caches in 4,096-token blocks, so a short conversation honestly
+    // reports none until it grows past one block.
+    expect(await screen.findByText(/only cache in large blocks/)).toBeInTheDocument()
   })
 })

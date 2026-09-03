@@ -13,7 +13,7 @@
  */
 
 import {
-  createMemoryEmbedder,
+  createMemoryEmbedderAsync,
   ensureBuiltinModelReady,
   type BuiltinModelProgress
 } from './memoryEmbedder'
@@ -85,7 +85,7 @@ export async function startMemoryEmbedderPreparation(): Promise<MemoryEmbedderPr
         await ensureBuiltinModelReady(config.modelId, progressCallback)
       } else {
         // Validates the stored config shape loudly (missing fields throw here).
-        createMemoryEmbedder(config)
+        await createMemoryEmbedderAsync(config)
       }
       status = {
         ...status,

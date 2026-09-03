@@ -11,6 +11,8 @@ import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
 import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
 import CustomProvidersSettingsPanel from './CustomProvidersSettingsPanel.svelte'
 import type { IconRef } from '$lib/icons/iconTypes'
+import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
+import { LOCAL_AI_KEY_SERVICES } from '$lib/data/localAiKeyServices'
 import { Loader2, KeyRound, ShieldAlert, CheckCircle2, Trash2, ChevronDown, Pencil, Save, X, Copy, Sparkles, Plus } from '@lucide/svelte'
 import { toast } from '$lib/components/ui/sonner/settings-toast'
 import { dispatchModelConnectionsUpdated } from '$lib/utils/liveSettingsEvents'
@@ -535,7 +537,8 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     connectionHint: 'batshit-server',
     inputType: 'text',
     iconRef: BATSHIT_ICON_REF
-  }
+  },
+  ...LOCAL_AI_KEY_SERVICES
 ]
 
 type ApiKeyGroup = {
@@ -625,6 +628,23 @@ const GROUPS: ApiKeyGroup[] = [
       'zai'
     ],
     allowAdd: true
+  },
+  {
+    id: 'local-ai',
+    label: 'Local AI',
+    // SA-102 P6: its own group rather than seven more rows buried among fifty
+    // cloud providers.
+    //
+    // `showAllRows`, not `allowAdd`: with the add-picker the group opens EMPTY
+    // and every program hides inside a closed dropdown, which defeats the point
+    // of having somewhere obvious to put an oMLX key. Seven rows is a short
+    // list, the group description says most people need none, and the header
+    // already carries a "0 Saved" badge. Same posture as Core Infrastructure
+    // and Voice Runtime.
+    description:
+      'Only needed when a program running on your computer asks for a key — oMLX with its key check on, LM Studio 0.4 tokens, or vLLM/SGLang started with --api-key. Most local setups need none of these. The same key is used for chat and for memory search.',
+    serviceIds: LOCAL_AI_SERVER_DEFINITIONS.map((definition) => definition.id),
+    showAllRows: true
   },
   {
     id: 'custom',
