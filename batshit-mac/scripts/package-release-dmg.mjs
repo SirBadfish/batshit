@@ -9,7 +9,7 @@ import { sign } from '@electron/osx-sign';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
-const packageRoot = resolve(macRoot, 'zig-out', 'package');
+const packageRoot = resolve(macRoot, 'electron-out', 'package');
 const defaultAppPath = join(packageRoot, 'Batshit.app');
 const defaultDmgPath = join(packageRoot, 'Batshit-0.1.0-macos-ReleaseSafe.dmg');
 const defaultStagingRoot = join(packageRoot, 'release-dmg-staging');

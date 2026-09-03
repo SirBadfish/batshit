@@ -190,7 +190,7 @@ export async function packageMacApp(argv = process.argv.slice(2)) {
 
   const { artifactSuffix } = parsePackageArgs(argv);
   const basename = packageBasename(artifactSuffix);
-  const outputRoot = join(macRoot, 'zig-out');
+  const outputRoot = join(macRoot, 'electron-out');
   const output = join(outputRoot, 'package', `${basename}.app`);
   const stagingRoot = join(outputRoot, 'electron-staging', basename);
   const packagerRoot = join(outputRoot, 'electron-packager', basename);
