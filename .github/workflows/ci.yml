@@ -239,19 +239,42 @@ jobs:
           exit $failed
       - name: Stale branding gate
         run: |
-          set +e
+          # The scanned paths live in one list so the existence check below and
+          # the search itself cannot drift apart. `batshit-mac/src` used to be
+          # listed here and is an EMPTY untracked leftover that never reaches
+          # this repo, so ripgrep exited 2 and `set +e` swallowed it while the
+          # real Electron source in `src-electron` and `frontend` went unscanned.
+          # A missing path is now a hard failure for exactly that reason.
+          set -e
+          BRANDING_PATHS="README.md docs/user-docs batshit-app/src batshit-server batshit-mac/src-electron batshit-mac/frontend batshit-mac/scripts batshit-portable-skills tools start-docker.sh compose.yaml"
+          missing=""
+          for path in ${BRANDING_PATHS}; do
+            [ -e "${path}" ] || missing="${missing} ${path}"
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::Stale branding gate is pointed at paths that do not exist:${missing}"
+            echo "Fix the path list in .github/workflows/ci.yml — a missing path silently scans nothing."
+            exit 1
+          fi
           term_one='s''8n'
           term_two="ctrl$(printf '\\\\+')room"
           term_three='ctrl''-room'
           term_four='ctrl''room'
+          set +e
           rg -in "\\b${term_one}\\b|${term_two}|${term_three}|${term_four}" \
-            README.md docs/user-docs batshit-app/src batshit-server batshit-mac/src batshit-mac/scripts batshit-portable-skills tools start-docker.sh compose.yaml \
+            ${BRANDING_PATHS} \
             -g '!**/node_modules/**' > branding-hits.txt
+          rg_status=$?
           set -e
-          cp branding-hits.txt branding-violations.txt
-          if [ -s branding-violations.txt ]; then
+          # ripgrep: 0 = matches found, 1 = no matches, 2+ = real error.
+          if [ "${rg_status}" -gt 1 ]; then
+            echo "::error::Stale branding scan failed (ripgrep exit ${rg_status})."
+            cat branding-hits.txt
+            exit 1
+          fi
+          if [ -s branding-hits.txt ]; then
             echo "::error::Stale branding found:"
-            cat branding-violations.txt
+            cat branding-hits.txt
             exit 1
           fi
           echo "Branding clean."
