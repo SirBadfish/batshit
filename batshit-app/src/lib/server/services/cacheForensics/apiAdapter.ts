@@ -5,7 +5,11 @@ import type {
   CacheForensicsRecord,
   CacheForensicsSegmentType,
 } from '$lib/types/cacheForensics'
-import { segmentCompiledUserMessage } from './compiledMessageSegments'
+import {
+  COMPILED_TEXT_PART_TYPES,
+  compiledTextPartValue,
+  segmentCompiledUserMessage,
+} from './compiledMessageSegments'
 import type { CacheForensicsSegmentInput } from './fingerprint'
 import { captureCacheForensicsRecord } from './record'
 
@@ -38,7 +42,13 @@ function parseBody(body: unknown): { value: unknown; parsed: boolean } {
 function segmentTypeForKey(key: string): CacheForensicsSegmentType {
   if (key === 'tools' || key === 'tool_config' || key === 'toolConfig') return 'tool'
   if (key === 'messages' || key === 'contents' || key === 'input') return 'history-message'
-  if (key === 'system' || key === 'systemInstruction' || key === 'system_instruction')
+  if (
+    key === 'system' ||
+    key === 'systemInstruction' ||
+    key === 'system_instruction' ||
+    // DQ-D-028: the Responses API's own system-instruction field.
+    key === 'instructions'
+  )
     return 'system-prompt'
   return 'request-block'
 }
@@ -57,10 +67,50 @@ function elementNameSuffix(element: unknown): string {
 }
 
 /**
+ * DQ-D-028: label rule for Responses-shaped `body.input[]` items.
+ *
+ * Role-bearing items keep their role suffix, matching the chat-shaped labels.
+ * Typed items — `function_call`, `function_call_output`, `reasoning`, … — are
+ * labelled by their ITEM TYPE, with the tool name appended when they carry
+ * one, because `elementNameSuffix` prefers `name` and would otherwise label a
+ * `function_call` with the bare tool name and hide what kind of item it is.
+ *
+ * Scoped to the `input` array on purpose: applying a type-first rule globally
+ * would relabel chat-shaped `body.tools[i]` entries (OpenAI chat tools carry
+ * `type: 'function'`), and chat-shaped bodies must stay byte-identical.
+ */
+function responsesInputNameSuffix(element: unknown): string {
+  if (!element || typeof element !== 'object') return ''
+  const record = element as Record<string, unknown>
+  if (typeof record.role === 'string' && record.role) return `:${record.role}`
+  const itemType = typeof record.type === 'string' && record.type ? record.type : ''
+  if (!itemType) return elementNameSuffix(element)
+  const name = typeof record.name === 'string' && record.name ? record.name : ''
+  return name ? `:${itemType}:${name}` : `:${itemType}`
+}
+
+/**
+ * True when a content part is one of the recognised text-part shapes,
+ * regardless of whether its `text` is actually a string. The standing-media
+ * boundary scan needs the TYPE test alone (a malformed text part still ends
+ * the leading image run), so it cannot use `compiledTextPartValue`.
+ */
+function isCompiledTextPartType(part: unknown): boolean {
+  const partType =
+    part && typeof part === 'object' ? (part as Record<string, unknown>).type : undefined
+  return typeof partType === 'string' && COMPILED_TEXT_PART_TYPES.includes(partType)
+}
+
+/**
  * SA-108: expands one message-array element. Batshit compiles the entire
  * conversation into ONE user message, so a Batshit-compiled element is split
  * into per-history-message + current-turn sub-segments; anything else keeps
  * its existing single-segment shape.
+ *
+ * DQ-D-028: the same rule covers Responses-shaped items, whose text parts are
+ * typed `input_text` rather than `text`. An array of parts that produced no
+ * split still collapses back to ONE segment — one rule for both shapes, which
+ * is what keeps chat-shaped fingerprints byte-identical.
  */
 function expandMessageElement(
   element: unknown,
@@ -82,14 +132,14 @@ function expandMessageElement(
     let startIndex = 0
     const standingHeader = content[0] as Record<string, unknown> | undefined
     if (
-      standingHeader?.type === 'text' &&
-      typeof standingHeader.text === 'string' &&
+      isCompiledTextPartType(standingHeader) &&
+      typeof standingHeader?.text === 'string' &&
       standingHeader.text.startsWith('==== AWARENESS MEDIA (STANDING) ====')
     ) {
       let standingEnd = 1
       while (standingEnd < content.length) {
         const part = content[standingEnd] as Record<string, unknown> | undefined
-        if (part?.type === 'text') break
+        if (isCompiledTextPartType(part)) break
         standingEnd += 1
       }
       expanded.push({
@@ -103,9 +153,9 @@ function expandMessageElement(
     content.slice(startIndex).forEach((part, relativePartIndex) => {
       const partIndex = startIndex + relativePartIndex
       const partRecord = part && typeof part === 'object' ? (part as Record<string, unknown>) : null
-      const partText = partRecord?.type === 'text' ? partRecord.text : undefined
+      const partText = compiledTextPartValue(part)
       const partSegments =
-        typeof partText === 'string' ? segmentCompiledUserMessage(partText, label) : null
+        partText !== null ? segmentCompiledUserMessage(partText, label) : null
       if (partSegments) {
         splitAnyPart = true
         expanded.push(...partSegments)
@@ -128,7 +178,9 @@ function expandMessageElement(
  * Segments a provider request body generically and deterministically:
  * top-level entries in the object's own key order (approximating wire order),
  * arrays expanded one segment per element so message/tool order is non-lossy.
- * Batshit-compiled user messages are additionally sub-segmented (SA-108).
+ * Batshit-compiled user messages are additionally sub-segmented (SA-108),
+ * on chat-shaped (`messages`/`contents`) and Responses-shaped (`input`)
+ * bodies alike (DQ-D-028, splitter v3).
  */
 export function segmentProviderRequestBody(body: unknown): {
   segments: CacheForensicsSegmentInput[]
@@ -149,8 +201,14 @@ export function segmentProviderRequestBody(body: unknown): {
     if (Array.isArray(entryValue)) {
       const type = segmentTypeForKey(key)
       const isMessageArray = type === 'history-message'
+      // DQ-D-028: `input` is the Responses API's item list (xAI, direct OpenAI
+      // in Responses mode). No chat-shaped body Batshit sends uses that key.
+      const isResponsesInput = key === 'input'
       entryValue.forEach((element, index) => {
-        const label = `body.${key}[${index}]${elementNameSuffix(element)}`
+        const suffix = isResponsesInput
+          ? responsesInputNameSuffix(element)
+          : elementNameSuffix(element)
+        const label = `body.${key}[${index}]${suffix}`
         if (isMessageArray) {
           segments.push(...expandMessageElement(element, type, label))
           return

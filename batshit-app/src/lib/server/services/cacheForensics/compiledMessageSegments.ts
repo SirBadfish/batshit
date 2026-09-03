@@ -17,6 +17,15 @@ import type { CacheForensicsSegmentInput } from './fingerprint'
  * Splitting is driven ONLY by the literal markers `buildFormattedChatInput`
  * writes (DL-108-02). Content without those markers is never touched, so
  * non-Batshit provider shapes keep their existing single-segment fingerprints.
+ *
+ * DQ-D-028 (splitter v3): the same rules now reach Responses-shaped wire
+ * bodies. xAI (`providers/index.ts` builds it with `createXai`, whose default
+ * model is the RESPONSES model) and direct OpenAI in Responses mode send a
+ * `body.input[]` item list whose text parts are typed `input_text`, not
+ * `text` — so the v2 splitter never matched them and those lanes reported
+ * `historyStability: not-applicable` with a `reusablePrefixBytes` frozen at
+ * the system item. `COMPILED_TEXT_PART_TYPES` is the shared allow-list that
+ * closes that gap.
  */
 
 /** Written by `buildFormattedChatInput` ahead of the compiled chat history. */
@@ -36,6 +45,31 @@ export const COMPILED_ZIP_APPEND_MARKER = '==== UNZIP INDEX (chronological) ====
  * CACHE_FORENSICS_MAX_SEGMENTS budget on its own.
  */
 export const COMPILED_HISTORY_SEGMENT_CAP = 256
+
+/**
+ * DQ-D-028: the content-part `type` values a Batshit-compiled message can
+ * arrive under. Chat-shaped bodies (Anthropic, OpenAI chat mode, every
+ * `@ai-sdk/openai-compatible` lane) use `text`; Responses-shaped bodies (xAI,
+ * direct OpenAI in Responses mode) use `input_text`.
+ *
+ * This stays a code-owned ALLOW-LIST rather than a "has a `.text` string"
+ * heuristic, for the same reason as DL-108-02: a heuristic could silently
+ * change the fingerprints of a provider shape Batshit does not emit.
+ */
+export const COMPILED_TEXT_PART_TYPES: readonly string[] = ['text', 'input_text']
+
+/**
+ * Returns a content part's text when the part is one of the recognised text
+ * shapes, and null otherwise (including a recognised type whose `text` is not
+ * a string — that part keeps its own segment, exactly as before).
+ */
+export function compiledTextPartValue(part: unknown): string | null {
+  if (!part || typeof part !== 'object') return null
+  const record = part as Record<string, unknown>
+  if (typeof record.type !== 'string') return null
+  if (!COMPILED_TEXT_PART_TYPES.includes(record.type)) return null
+  return typeof record.text === 'string' ? record.text : null
+}
 
 /** Label suffix that marks a per-message compiled-history sub-segment. */
 const HISTORY_LABEL_MARKER = '#history['

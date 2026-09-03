@@ -446,8 +446,9 @@ describe('cacheForensics record + baseline selection (P2)', () => {
   it('captures a storage-ready record with pseudonymous identifiers', () => {
     const record = capture()
     // Pinned deliberately: bumping the schema must be an explicit decision
-    // (v2 = SA-108 compiled-user-message sub-segments + historyStability).
-    expect(record.schemaVersion).toBe(2)
+    // (v2 = SA-108 compiled-user-message sub-segments + historyStability;
+    // v3 = DQ-D-028 Responses-shaped `body.input[]` sub-segmentation).
+    expect(record.schemaVersion).toBe(3)
     expect(record.comparisonId).toMatch(HEX_64)
     expect(record.runId).toMatch(HEX_64)
     expect(record.runId).not.toContain('run-raw-id-1')

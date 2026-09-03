@@ -14,11 +14,20 @@
 /**
  * v2 (SA-108): Batshit's single compiled user message is sub-segmented into
  * per-history-message + current-turn segments, and the divergence record
- * carries an explicit `historyStability` verdict. The segment list shape
- * changed, so v1 records must NOT be compared against v2 records —
- * `isEligibleBaseline` already refuses that with a plain-language reason.
+ * carries an explicit `historyStability` verdict.
+ *
+ * v3 (DQ-D-028): that sub-segmentation now also fires on Responses-shaped
+ * request bodies — the `body.input[]` item list sent by xAI (`createXai`
+ * defaults to the Responses model) and by direct OpenAI in Responses mode,
+ * whose text parts are typed `input_text` rather than `text`. Those lanes
+ * previously reported `historyStability: not-applicable` with a
+ * `reusablePrefixBytes` frozen at the system item.
+ *
+ * Each bump changes the segment list shape, so records must never be compared
+ * across versions — `isEligibleBaseline` already refuses that with a
+ * plain-language reason.
  */
-export const CACHE_FORENSICS_SCHEMA_VERSION = 2
+export const CACHE_FORENSICS_SCHEMA_VERSION = 3
 
 export type CacheForensicsRuntime = 'vercel' | 'codex' | 'claude' | 'n8n'
 
