@@ -38,18 +38,27 @@ vi.mock('../memoryEmbedder', async (importOriginal) => {
     return normalize(vector)
   }
 
+  const testEmbedder = () => ({
+    modelId: 'local-ai:test-embedder@8',
+    dims: 8,
+    async embedDocuments(texts: string[]) {
+      return texts.map((text) => fakeVector(text))
+    },
+    async embedQuery(text: string) {
+      return fakeVector(text)
+    }
+  })
+
   return {
     ...original,
-    createMemoryEmbedder: () => ({
-      modelId: 'local-ai:test-embedder@8',
-      dims: 8,
-      async embedDocuments(texts: string[]) {
-        return texts.map((text) => fakeVector(text))
-      },
-      async embedQuery(text: string) {
-        return fakeVector(text)
-      }
-    })
+    createMemoryEmbedder: testEmbedder,
+    // SA-102 P5 moved the production write/search paths onto the async door so
+    // the local lane can read its key from the shared encrypted store. BOTH
+    // doors have to return the same deterministic fake: `...original` spreads
+    // the REAL `createMemoryEmbedderAsync`, whose internal call resolves the
+    // module-local `createMemoryEmbedder` binding rather than this mock, so
+    // overriding only the sync name silently runs the real embedder.
+    createMemoryEmbedderAsync: async () => testEmbedder()
   }
 })
 

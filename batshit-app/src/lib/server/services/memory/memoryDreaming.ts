@@ -71,7 +71,7 @@ import {
   markExpiredDemotion,
   supersedeMemory
 } from './memoryStore'
-import { createMemoryEmbedder, type MemoryEmbedder } from './memoryEmbedder'
+import { createMemoryEmbedderAsync, type MemoryEmbedder } from './memoryEmbedder'
 import { getMemoryConfig, knnSearchMemories, requireReadyMemoryIndexes } from './memoryIndex'
 import {
   memoryDreamIndexKey,
@@ -597,9 +597,13 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
       return baseGenerate(prompt, hardMaxTokens)
     }
 
+    // SA-102 P5 (DL-102-14): async door so a key-protected local program gets
+    // the key from the shared encrypted store rather than the placeholder.
     const embedder =
       options.embedder ??
-      createMemoryEmbedder((await getMemoryConfig()).embedding, { userId: options.userId })
+      (await createMemoryEmbedderAsync((await getMemoryConfig()).embedding, {
+        userId: options.userId
+      }))
 
     const allSessions = await redis.getSessions(options.userId, true)
     const agentSessions = allSessions.filter(
