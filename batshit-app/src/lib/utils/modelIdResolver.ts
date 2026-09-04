@@ -1,5 +1,6 @@
 import type { ModelConnectionInfo } from '$lib/types/savedModels'
 import type { CatalogConnectionOption, CatalogModelIdVariant } from '$lib/types/modelCatalog'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import {
   isCatalogVariantCompatibleForConnection,
   resolveConnectionServiceFromId
@@ -38,13 +39,7 @@ const DIRECT_OWNER_PREFIX_SERVICES = new Set([
   'fireworks',
   'baseten'
 ])
-const LOCAL_PREFIX_SERVICES = new Set([
-  'ollama',
-  'dmr',
-  'lmstudio',
-  'llama-cpp',
-  'vllm'
-])
+const LOCAL_PREFIX_SERVICES: ReadonlySet<string> = LOCAL_AI_SERVER_IDS
 const N8N_DIRECT_PROVIDER_MAP: Record<string, string[]> = {
   'azure-openai': ['openai'],
   'aws-bedrock': ['anthropic', 'meta', 'meta-llama', 'mistral', 'cohere', 'ai21'],
@@ -126,7 +121,10 @@ export function resolveModelIds({
 
   const shouldParseDeveloperModel = !(
     transport === 'direct' &&
-    ((serviceLower.startsWith('custom_') && !connection?.useDeveloperPrefix) ||
+    // An authoritative local target already separates identity from its display
+    // fields. Re-splitting a nested model path on every save destroys segments.
+    ((LOCAL_PREFIX_SERVICES.has(serviceLower) && authoritativeEffectiveModelId && developerId && modelId) ||
+      (serviceLower.startsWith('custom_') && !connection?.useDeveloperPrefix) ||
       (serviceLower === 'fal' && developerId && developerId.toLowerCase() !== serviceLower))
   )
   const parsedInput = modelId || authoritativeEffectiveModelId

@@ -8,10 +8,12 @@ import type {
 import { redactHeaders } from '$lib/server/services/executionViewerRedaction'
 import { asSchema } from 'ai'
 import type { Tool } from 'ai'
+import { resolveLocalPromptCacheReporting } from '$lib/data/localAiServers'
 import {
   hasUsageValues as hasNormalizedUsageValues,
   mergeUsageLike,
   normalizeUsageLike,
+  withHonestLocalCacheUsage,
   type ApiUsageLike,
 } from '$lib/server/services/apiProviderUsage'
 
@@ -228,11 +230,17 @@ export function buildVercelLlmCapture(params: {
   steps: any[]
   totalUsage: UsageLike
   finalText?: string | null
+  providerId?: string | null
 }): { llmSummary: ExecutionLlmSummary; llmCalls: ExecutionLlmCall[] } {
   const steps = Array.isArray(params.steps) ? params.steps : []
+  const localCacheReporting = resolveLocalPromptCacheReporting(params.providerId)
   const finalText =
     typeof params.finalText === 'string' ? params.finalText : null
-  const totalUsage = normalizeUsageLike(params.totalUsage) ?? params.totalUsage
+  const totalUsage = withHonestLocalCacheUsage(
+    normalizeUsageLike(params.totalUsage) ?? params.totalUsage,
+    localCacheReporting,
+    steps.map((step) => step?.usage?.raw),
+  )
   const hasTotalUsage = hasUsageValues(totalUsage)
   const allowTotalUsageFallback = steps.length === 1 && hasTotalUsage
 
@@ -319,10 +327,15 @@ export function buildVercelLlmCapture(params: {
     const stepUsageFromMetadata = normalizeUsageLike({
       providerMetadata: step?.providerMetadata,
     })
-    const stepUsage =
+    const normalizedStepUsage =
       stepUsageFromSdk && stepUsageFromMetadata
         ? mergeUsageLike(stepUsageFromSdk, stepUsageFromMetadata)
         : stepUsageFromSdk ?? stepUsageFromMetadata ?? step?.usage
+    const stepUsage = withHonestLocalCacheUsage(
+      normalizedStepUsage,
+      localCacheReporting,
+      [step?.usage?.raw],
+    )
     const hasStepUsage = hasUsageValues(stepUsage)
     const resolvedUsage = hasStepUsage
       ? stepUsage

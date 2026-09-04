@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { normaliseModelSettings } from '$lib/server/services/modelManagerHelpers'
+import { filterParameters, resolveParameterProvider } from './parameterFilter'
 import {
   MIMO_V25_XIAOMI_MAX_OUTPUT_TOKENS,
   OPENROUTER_DEFAULT_MAX_OUTPUT_TOKENS,
@@ -347,6 +349,55 @@ describe('SA-102 cloud parity', () => {
 // SA-102 P2 (DL-102-02): the providerOptions segment local samplers travel under.
 // ---------------------------------------------------------------------------
 describe('SA-102 local providerOptions segment', () => {
+  it.each(['vllm', 'sglang'])(
+    'offers, normalizes and maps local settings for a Qwen model on %s',
+    (service) => {
+      const connection = { type: 'direct' as const, service }
+      const provider = 'Qwen'
+      const modelId = 'Qwen3-VL-4B-Instruct'
+      const definitions = filterParameters({
+        provider: resolveParameterProvider(provider, connection), modelId,
+      })
+      expect(definitions.map(({ name }) => name)).toEqual(expect.arrayContaining([
+        'topK', 'minP', 'repetitionPenalty', 'chatTemplateKwargs',
+      ]))
+
+      const settings = normaliseModelSettings({
+        provider, connection, modelId,
+        settings: {
+          temperature: '0', maxTokens: '512', topK: '20', minP: '0.05',
+          repetitionPenalty: '1.1', chatTemplateKwargs: '{"enable_thinking":false}',
+          custom_switch: false,
+        },
+      })
+      expect(settings).toEqual({
+        temperature: 0, maxTokens: 512, topK: 20, minP: 0.05,
+        repetitionPenalty: 1.1, chatTemplateKwargs: { enable_thinking: false },
+        custom_switch: false,
+      })
+      const runtime = buildRuntimeModelSettings({ provider, connection, modelId, settings })
+      expect(runtime.standard.temperature).toBe(0)
+      expect(runtime.standard.maxTokens).toBe(512)
+      expect(runtime.standard.topK).toBeUndefined()
+      expect(runtime.providerOptions).toEqual({
+        [service]: {
+          top_k: 20, min_p: 0.05, repetition_penalty: 1.1,
+          chat_template_kwargs: { enable_thinking: false }, custom_switch: false,
+        },
+      })
+    },
+  )
+
+  it('keeps cloud developer parameters and namespace when a gateway connection is supplied', () => {
+    const args = {
+      provider: 'anthropic', modelId: 'claude-3-5-sonnet-20241022',
+      settings: { thinkingMode: 'enabled', thinkingBudget: 4000, custom_switch: false },
+    }
+    const connection = { type: 'vercel-gateway' as const, service: 'vercel-gateway' }
+    expect(normaliseModelSettings({ ...args, connection })).toEqual(normaliseModelSettings(args))
+    expect(buildRuntimeModelSettings({ ...args, connection })).toEqual(buildRuntimeModelSettings(args))
+  })
+
   it('camel-cases a hyphenated local runtime id', () => {
     expect(resolveProviderOptionsSegment('llama-cpp')).toBe('llamaCpp')
   })

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SavedModel } from '$lib/types/savedModels'
+import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 
 const userModels = new Set<string>()
 const modelStore = new Map<string, SavedModel>()
@@ -104,6 +105,50 @@ describe('loadUserModelsWithPurge', () => {
     expect(redisMock.del).toHaveBeenCalledWith('model:vercel-deprecated')
     expect(redisMock.sRem).toHaveBeenCalledWith('user:user_123:models', 'vercel-deprecated')
   })
+})
+
+describe('local model identity survives preset editing', () => {
+  it('keeps nested local model paths through repeated edits', async () => {
+    const manager = { listAvailableModels: () => [] } as any
+    let model = {
+      id: 'nested-local', modelName: 'Nested local', provider: 'sglang',
+      modelId: 'owner/repo/model.gguf', purpose: 'chat',
+      connection: { type: 'direct', service: 'sglang' },
+      contextWindow: 16384, pricing: { input: 0, output: 0 },
+    } as SavedModel
+    for (const temperature of [0.2, 0.4, 0.6]) {
+      model = await routeModule._normaliseSavedModel({
+        ...model, settings: { temperature },
+      }, manager)
+      expect(model.provider).toBe('owner')
+      expect(model.modelId).toBe('repo/model.gguf')
+      expect(model.effectiveModelId).toBe('owner/repo/model.gguf')
+    }
+  })
+
+  it.each(LOCAL_AI_SERVER_DEFINITIONS.map(({ id }) => id))(
+    'keeps the exact %s model target when changing a sampler',
+    async (service) => {
+      const manager = { listAvailableModels: () => [] } as any
+      const first = await routeModule._normaliseSavedModel({
+        id: `local-${service}`, modelName: 'Local Qwen', provider: service,
+        modelId: 'Qwen/Qwen3-VL-4B-Instruct', purpose: 'chat',
+        connection: { type: 'direct', service, useDeveloperPrefix: false },
+        contextWindow: 16384, pricing: { input: 0, output: 0 },
+      } as SavedModel, manager)
+      const edited = await routeModule._normaliseSavedModel({
+        ...first, settings: { temperature: 0.4 },
+      }, manager)
+      expect(first.effectiveModelId).toBe('Qwen/Qwen3-VL-4B-Instruct')
+      expect(edited.effectiveModelId).toBe(first.effectiveModelId)
+      expect(edited.settings?.temperature).toBe(0.4)
+
+      const changedIdentity = await routeModule._normaliseSavedModel({
+        ...edited, provider: service, modelId: 'Other/Replacement',
+      }, manager)
+      expect(changedIdentity.effectiveModelId).toBe('Other/Replacement')
+    },
+  )
 })
 
 describe('normaliseSavedModel voice session metadata', () => {

@@ -70,11 +70,11 @@ It also serves embeddings and reranking on the same server, which means one Mac 
 
 ### Setting it up
 
-1. Install SGLang following its own documentation.
+1. Install SGLang following its [installation documentation](https://docs.sglang.io/docs/get-started/install). On Windows with an NVIDIA GPU, use its official Linux Docker image through Docker Desktop's WSL 2 backend.
 2. Start a server:
 
    ```bash
-   sglang serve --model-path <your-model>
+   sglang serve --model-path <your-model> --enable-cache-report
    ```
 
    Older builds use `python3 -m sglang.launch_server` instead.
@@ -84,13 +84,31 @@ It also serves embeddings and reranking on the same server, which means one Mac 
 
 If you started SGLang with `--api-key`, put that key into Batshit — see below.
 
+**Enable the features your model needs.** `--enable-cache-report` makes SGLang include cached-token counts in its replies; the prompt cache can work without that flag, but Batshit cannot display counts it never receives. Tool calling also needs a parser selected at startup: for Qwen3-VL, add `--tool-call-parser qwen`. Thinking models may additionally need a reasoning parser; use the instructions for your exact model.
+
+When Batshit runs in Docker, a Local AI URL such as `http://localhost:30000` is translated to the Windows host for server-side calls. Publish the SGLang container's port on loopback (`127.0.0.1:30000:30000`) for access from this PC.
+
+### Reuse existing model files
+
+SGLang and vLLM can read the same supported model directory. Mount that directory read-only into both containers and point each program at it; there is no need to download a separate copy for each program. Run one at a time if both models will not fit in your GPU memory.
+
+Sharing a folder does not change a model's format. LM Studio commonly uses GGUF files on Windows, while the usual shared SGLang/vLLM path is a Hugging Face model directory containing safetensors weights, tokenizer files, and model configuration. GGUF support depends on the exact program version and model architecture, including any vision projector. Check that combination before assuming an LM Studio model will work in either program.
+
+Keep compiled-program caches in Docker named volumes on Windows. Model files can stay in their existing Windows folders; generated kernels may require Linux filesystem operations that Windows bind mounts do not support.
+
+### vLLM on the same Windows PC
+
+vLLM can use that same supported model directory with its [official Docker image](https://github.com/vllm-project/vllm/releases/tag/v0.28.0). Enable **vLLM** in Batshit's Local AI settings at `http://localhost:8000`, then refresh models. Qwen3-VL uses `--enable-auto-tool-choice --tool-call-parser hermes`; add `--enable-prompt-tokens-details` for cache counts and `--enable-prefix-caching` to explicitly enable prefix caching.
+
+vLLM 0.28's default model runner needs pinned memory on WSL 2. Its [documented environment setting](https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/envs.py) is `VLLM_WSL2_ENABLE_PIN_MEMORY=1` on a supported WSL kernel. Without it, startup may fail with `UVA is not available`.
+
 ### What SGLang gives you
 
 - **Top K, Min P, and Repetition penalty**, all per message.
 - **Chat template options**, the standard way to toggle thinking on Qwen and GLM-class models.
 - **Cache reporting** — SGLang tells Batshit how many prompt tokens it reused, so the Token Panel shows a real number rather than a note.
 
-**Honest status:** Batshit's SGLang support is built from SGLang's own published API, and everything on Batshit's side is covered by tests — but the Batshit team has not yet run it end to end against a live SGLang server. If something doesn't behave the way this page describes, that's worth telling us about.
+**Versions used for validation:** SGLang **0.5.18** and vLLM **0.28.0**, serving the same Qwen3-VL-4B-Instruct files on a Windows RTX 4090 PC. This Instruct model does not produce separate thinking output; accepting a thinking option does not turn it into a Thinking model.
 
 ## Two programs, one port
 

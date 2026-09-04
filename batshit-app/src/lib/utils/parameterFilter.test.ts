@@ -1,9 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { filterParameters } from './parameterFilter'
+import { filterParameters, resolveParameterProvider } from './parameterFilter'
 
 function names(values: ReturnType<typeof filterParameters>) {
   return values.map((value) => value.name)
 }
+
+describe('resolveParameterProvider', () => {
+  it('uses the normalized local direct service independently of the developer', () => {
+    expect(resolveParameterProvider('Qwen', { type: 'direct', service: ' VLLM ' })).toBe('vllm')
+  })
+
+  it('preserves the provider outside a local direct connection', () => {
+    for (const connection of [
+      undefined,
+      { type: 'direct' as const, service: 'openai' },
+      { type: 'direct' as const, service: 'custom_server' },
+      { type: 'openrouter' as const, service: 'vllm' },
+    ]) {
+      expect(resolveParameterProvider('Qwen', connection)).toBe('Qwen')
+    }
+  })
+})
 
 describe('parameterFilter', () => {
   it('returns common parameters for unknown providers', () => {

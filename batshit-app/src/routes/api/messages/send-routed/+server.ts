@@ -4368,6 +4368,8 @@ async function handleBatshitAgentStream({
   let pendingControlText = ''
   let silentResponse = false
   let rawUsageFromStream: UsageLike | null = null
+  const rawUsageByFinishedStep: unknown[] = []
+  let streamLocalCacheReporting = resolveLocalPromptCacheReporting(null)
   let lastStreamSteps: any[] | null = null
   let lastStreamText: string | null = null
   let lastResolvedUsage: UsageLike | null = null
@@ -4891,6 +4893,9 @@ async function handleBatshitAgentStream({
     streamMessages: any[] = compiledMessages,
     streamImages: Array<{ url: string }> = images,
   ): NativeModeRequest => {
+    streamLocalCacheReporting = resolveLocalPromptCacheReporting(
+      connection?.service ?? requestProviderId ?? null,
+    )
     const providerOptions = withReasoningProviderOptions(
       Object.keys(settings.providerOptions).length > 0
         ? settings.providerOptions
@@ -4998,9 +5003,8 @@ async function handleBatshitAgentStream({
       // SA-107 (DL-107-06/07): SDK usage stays authoritative; raw-chunk cache
       // fields fill gaps (flat cached_tokens lanes), and the gateway lane can
       // derive inclusive cache usage from step providerMetadata.
-      // SA-102 P4 (DL-102-13): and a local program that never reports cached
-      // tokens must not arrive here claiming a confident zero — the SDK maps an
-      // absent `prompt_tokens_details.cached_tokens` to 0.
+      // SA-102 (DL-102-13): each local response's raw usage is the authority.
+      // The SDK maps absent cached_tokens to zero and drops raw at aggregation.
       const resolvedUsage =
         withHonestLocalCacheUsage(
           resolveMessageUsage({
@@ -5012,6 +5016,7 @@ async function handleBatshitAgentStream({
           resolveLocalPromptCacheReporting(
             connection?.service ?? requestProviderId ?? null,
           ),
+          Array.isArray(steps) ? steps.map((step: any) => step?.usage?.raw) : [],
         ) ?? undefined
       lastStreamSteps = Array.isArray(steps) ? steps : []
       lastResolvedUsage = resolvedUsage ?? null
@@ -5431,6 +5436,7 @@ async function handleBatshitAgentStream({
             steps: sanitizedSteps as any[],
             totalUsage: resolvedUsage ?? null,
             finalText: typeof text === 'string' ? text : null,
+            providerId: connection?.service ?? requestProviderId ?? null,
           })
 
           const toolCallsTotal = Array.isArray(steps)
@@ -5472,6 +5478,7 @@ async function handleBatshitAgentStream({
               steps: Array.isArray(steps) ? steps : [],
               agentId,
               connectionId: connection?.id ?? connection?.service ?? null,
+              providerId: connection?.service ?? requestProviderId ?? null,
               modelId: usedModelId ?? null,
               messageId,
               experimentGroup: resolveCacheForensicsExperimentGroup(),
@@ -6525,12 +6532,21 @@ async function handleBatshitAgentStream({
           shouldBreakStream = true
           break
         }
+        case 'finish-step': {
+          // Consumer-owned per-call evidence avoids racing the onFinish callback
+          // or treating the last raw usage chunk as a multi-call aggregate.
+          rawUsageByFinishedStep.push((chunk as any).usage?.raw)
+          break
+        }
         case 'finish': {
           await flushRawReasoningFallback()
           await ensureReasoningSegmentBoundary()
           const finishChunk = chunk as any
-          const usage =
-            finishChunk.totalUsage || finishChunk.usage || rawUsageFromStream
+          const usage = withHonestLocalCacheUsage(
+            finishChunk.totalUsage || finishChunk.usage || rawUsageFromStream,
+            streamLocalCacheReporting,
+            rawUsageByFinishedStep,
+          )
           if (usage) {
             if (!silentResponse) {
               await ensureStartEmitted()
@@ -6638,6 +6654,10 @@ async function handleBatshitAgentStream({
             steps: lastStreamSteps ?? [],
             totalUsage: fallbackUsage ?? null,
             finalText: lastStreamText,
+            providerId:
+              usedConnection?.service ??
+              (fallbackUsed ? fallbackResolvedIds?.developerId : primaryProviderId) ??
+              null,
           })
 
           const stepsForCount = Array.isArray(lastStreamSteps)

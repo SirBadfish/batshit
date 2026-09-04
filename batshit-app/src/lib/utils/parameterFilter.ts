@@ -1,4 +1,5 @@
-import type { ModelCapabilities, ModelPurpose } from '$lib/types/savedModels'
+import type { ModelCapabilities, ModelConnectionInfo, ModelPurpose } from '$lib/types/savedModels'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import type { CompatibilityMatrixEntry, MatrixConnectionId } from '$lib/types/compatibilityMatrix'
 import {
   getParameterSchema,
@@ -20,6 +21,22 @@ export interface ParameterFilterArgs {
   connection?: MatrixConnectionId | null
   purpose?: ModelPurpose | null
   matrixEntries?: CompatibilityMatrixEntry[] | null
+}
+
+const LOCAL_PARAMETER_PROVIDERS: ReadonlySet<string> = LOCAL_AI_SERVER_IDS
+
+/** Local programs own their request parameters even when the model has a separate developer. */
+export function resolveParameterProvider(
+  provider?: string | null,
+  connection?: {
+    type?: ModelConnectionInfo['type'] | null
+    service?: string | null
+  } | null,
+): string | null | undefined {
+  const service = connection?.service?.trim().toLowerCase()
+  return connection?.type === 'direct' && service && LOCAL_PARAMETER_PROVIDERS.has(service)
+    ? service
+    : provider
 }
 
 export function isParameterSupportedInN8N(

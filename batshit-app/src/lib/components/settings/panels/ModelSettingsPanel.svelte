@@ -35,7 +35,8 @@ import {
 import {
   filterParameters,
   isParameterSupportedInN8N,
-  isParameterSuppressedForModel
+  isParameterSuppressedForModel,
+  resolveParameterProvider
 } from '$lib/utils/parameterFilter'
 import { formatDefaultInput, fromInputValue, toInputValue } from '$lib/utils/parameterValueAdapter'
 import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
@@ -1008,7 +1009,10 @@ let lastInvalidModelSignature = $state<string | null>(null)
   })
 
   $effect(() => {
-    const provider = editingForm.provider || selectedCatalogEntry?.developerId || ''
+    const provider = resolveParameterProvider(
+      editingForm.provider || selectedCatalogEntry?.developerId || '',
+      { type: editingForm.connectionType, service: editingForm.connectionService },
+    )
     const modelId = editingForm.modelId || selectedCatalogEntry?.modelId || ''
     const vercelId = editingForm.catalogModelId || editingForm.vercelSourceId || selectedCatalogModel?.id || ''
 
@@ -2205,7 +2209,7 @@ $effect(() => {
   function buildParameterValueMap(model: SavedModel): Record<string, string> {
     if (!model.settings) return {}
     const definitions = filterParameters({
-      provider: model.provider,
+      provider: resolveParameterProvider(model.provider, model.connection),
       modelId: model.modelId,
       vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
       capabilities: model.capabilities ?? null,
@@ -2292,8 +2296,9 @@ $effect(() => {
 
   function buildCustomParameterRows(model: SavedModel): CustomParamRow[] {
     if (!model.settings) return []
+    const parameterProvider = resolveParameterProvider(model.provider, model.connection)
     const definitions = filterParameters({
-      provider: model.provider,
+      provider: parameterProvider,
       modelId: model.modelId,
       vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
       capabilities: model.capabilities ?? null,
@@ -2309,7 +2314,7 @@ $effect(() => {
       if (known.has(key)) continue
       if (
         isParameterSuppressedForModel(key, {
-          provider: model.provider,
+          provider: parameterProvider,
           modelId: model.modelId,
           vercelId: model.catalogModelId ?? model.vercelSourceId
         })
@@ -2450,7 +2455,10 @@ $effect(() => {
 
   function buildParameterSettings(form: ModelFormState) {
     const definitions = filterParameters({
-      provider: form.provider || selectedCatalogEntry?.developerId || undefined,
+      provider: resolveParameterProvider(
+        form.provider || selectedCatalogEntry?.developerId || undefined,
+        { type: form.connectionType, service: form.connectionService },
+      ),
       modelId: form.modelId || selectedCatalogEntry?.modelId || undefined,
       vercelId: form.catalogModelId || form.vercelSourceId || selectedCatalogModel?.id || undefined,
       capabilities: form.capabilities ?? null,

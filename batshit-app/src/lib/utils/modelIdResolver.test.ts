@@ -1,8 +1,27 @@
 import { describe, expect, it } from 'vitest'
+import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import { resolveCatalogIds, resolveModelIds } from './modelIdResolver'
 
 describe('modelIdResolver', () => {
   describe('resolveModelIds', () => {
+    it.each(LOCAL_AI_SERVER_DEFINITIONS.map(({ id }) => id))(
+      'preserves a manually entered owner-prefixed model id for %s',
+      (service) => {
+        const resolved = resolveModelIds({
+          developerId: service,
+          modelId: 'Qwen/Qwen3-VL-4B-Instruct',
+          connection: { type: 'direct', service, useDeveloperPrefix: false }
+        })
+
+        expect(resolved).toEqual({
+          providerId: service,
+          developerId: 'Qwen',
+          modelId: 'Qwen3-VL-4B-Instruct',
+          effectiveModelId: 'Qwen/Qwen3-VL-4B-Instruct'
+        })
+      }
+    )
+
     it('returns direct provider ids without prefixing model', () => {
       const resolved = resolveModelIds({
         developerId: 'openai',

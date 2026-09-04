@@ -99,6 +99,27 @@ describe('cacheForensics API adapter (P4)', () => {
   })
 
   describe('buildApiCacheForensicsRecords', () => {
+    it.each(['vllm', 'sglang', 'lmstudio'])(
+      'uses each %s response raw usage for per-call cache evidence', (providerId) => {
+        const records = buildApiCacheForensicsRecords({
+          providerId,
+          steps: [undefined, null, 0, 64].map((cached) => step(ANTHROPIC_BODY, {
+            inputTokens: 100, outputTokens: 5, cachedInputTokens: 0,
+            raw: {
+              prompt_tokens: 100,
+              ...(cached === undefined ? {} : { prompt_tokens_details: { cached_tokens: cached } }),
+            },
+          })),
+          agentId: 'agent-1', connectionId: 'opaque-connection-id',
+          modelId: 'Qwen3-VL-4B-Instruct', messageId: 'msg-local',
+        })
+        expect(records.map((record) => record.providerCacheUsage?.cachedInputTokens))
+          .toEqual([undefined, undefined, 0, 64])
+        expect(records.every((record) => record.providerCacheUsage?.inputTokens === 100))
+          .toBe(true)
+      },
+    )
+
     it('builds one exact record per model call with per-call cache usage', () => {
       const records = buildApiCacheForensicsRecords({
         steps: [
