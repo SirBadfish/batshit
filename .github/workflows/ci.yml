@@ -213,30 +213,39 @@ jobs:
           node-version-file: .nvmrc
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Dependency audit runner self-tests
+        # The runner below decides whether a red gate means "fix a dependency" or
+        # "npm was down". That logic is load-bearing, so it is tested here rather
+        # than trusted. Also finally runs the roots-manifest test, which had no
+        # runner wired up before.
+        run: node --test tools/run-dependency-audit.test.mjs tools/validate-dependency-audit-roots.test.mjs
       - name: npm audit — production deps (fail on high/critical)
         # Blocking gate scoped to what ships: --omit=dev keeps build-chain advisories
         # (vite/esbuild and friends, which churn upstream weekly and have no path into
         # the runtime artifact) from turning main red while upstream absorbs fixes.
-        run: |
-          set -e
-          node tools/validate-dependency-audit-roots.mjs
-          node tools/validate-dependency-audit-roots.mjs --lines | while IFS= read -r dir; do
-            echo "=== audit (prod deps): ${dir} ==="
-            (cd "${dir}" && npm audit --omit=dev --audit-level=high)
-          done
+        #
+        # `npm audit` exits 1 both for a real advisory AND when npm's advisory
+        # endpoint errors, so the old inline loop could not tell them apart: an
+        # npm outage on 2026-09-03/04 turned this red on every PR for hours.
+        # tools/run-dependency-audit.mjs classifies on the JSON payload instead
+        # (a real report has metadata.vulnerabilities; an endpoint error has
+        # none), retries ONLY unreachable roots, and exits 75 — never 1 — when
+        # npm never answered. Exit 1 still means a genuine high/critical finding.
+        #
+        # An outage does NOT auto-pass: "could not check" must never render as
+        # "nothing found" on a security gate. If npm stays down and a merge
+        # genuinely cannot wait, re-run this job with
+        # DEPENDENCY_AUDIT_ALLOW_UNREACHABLE=1 to accept that risk deliberately;
+        # it passes but records loudly that nothing was audited.
+        timeout-minutes: 25
+        run: node tools/run-dependency-audit.mjs
       - name: npm audit — full report (informational, never blocks)
+        # Same runner, full tree including dev/build chains. Never fails the job;
+        # it warns. Crucially it now says "endpoint unavailable" during an outage
+        # instead of falsely warning that advisories exist.
         continue-on-error: true
-        run: |
-          node tools/validate-dependency-audit-roots.mjs
-          failed=0
-          while IFS= read -r dir; do
-            echo "=== full audit: ${dir} ==="
-            (cd "${dir}" && npm audit --audit-level=high) || failed=1
-          done < <(node tools/validate-dependency-audit-roots.mjs --lines)
-          if [ "$failed" = "1" ]; then
-            echo "::warning::High/critical advisories exist in dev/build dependency chains (see log above). Non-blocking by design — review during dependency maintenance."
-          fi
-          exit $failed
+        timeout-minutes: 25
+        run: node tools/run-dependency-audit.mjs --mode=informational
       - name: Stale branding gate
         run: |
           # The scanned paths live in one list so the existence check below and
