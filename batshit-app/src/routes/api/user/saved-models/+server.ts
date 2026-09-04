@@ -22,6 +22,7 @@ import {
 import { inferModelPurpose } from '$lib/utils/modelPurpose'
 import { resolveCatalogIds, resolveModelIds } from '$lib/utils/modelIdResolver'
 import { resolveSavedModelConnection } from '$lib/utils/modelConnections'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 
 class ModelPresetValidationError extends Error {
   constructor(message: string) {
@@ -183,11 +184,23 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
   }
 
   const catalogIdentity = resolveCatalogPresetIdentity(catalogEntry, resolvedConnection)
+  // Local IDs are opaque provider targets. A previous save splits an owner
+  // prefix into developer/model fields, so a settings-only edit must retain
+  // the exact target. Reject stale effective IDs when identity fields change.
+  const submittedEffectiveId = payload.effectiveModelId?.trim()
+  const preservedLocalEffectiveId =
+    resolvedConnection.type === 'direct' &&
+    (LOCAL_AI_SERVER_IDS as ReadonlySet<string>).has(resolvedConnection.service ?? '') &&
+    (submittedEffectiveId === trimmedModelId ||
+      submittedEffectiveId === `${trimmedProvider}/${trimmedModelId}`)
+      ? submittedEffectiveId
+      : undefined
   const manualIdentity = catalogIdentity
     ? null
     : resolveModelIds({
         developerId: trimmedProvider,
         modelId: trimmedModelId,
+        effectiveModelId: preservedLocalEffectiveId,
         connection: resolvedConnection
       })
 
@@ -299,6 +312,7 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
   model.settings = normaliseModelSettings({
     settings: model.settings ?? undefined,
     provider: model.provider,
+    connection: model.connection,
     modelId: model.modelId,
     vercelId: model.catalogModelId ?? model.vercelSourceId ?? undefined,
     capabilities: model.capabilities ?? null,

@@ -1,4 +1,4 @@
-import { filterParameters, isParameterSuppressedForModel } from '$lib/utils/parameterFilter'
+import { filterParameters, isParameterSuppressedForModel, resolveParameterProvider } from '$lib/utils/parameterFilter'
 import {
   LOCAL_AI_SERVER_IDS,
   resolveLocalProviderOptionsSegment
@@ -103,8 +103,9 @@ export function buildRuntimeModelSettings({
   settings,
   fallbacks
 }: RuntimeSettingsArgs): RuntimeModelSettings {
+  const parameterProvider = resolveParameterProvider(provider, connection)
   const definitions = filterParameters({
-    provider: provider ?? undefined,
+    provider: parameterProvider ?? undefined,
     modelId: modelId ?? undefined,
     vercelId: vercelId ?? undefined,
     capabilities: capabilities ?? null,
@@ -119,7 +120,7 @@ export function buildRuntimeModelSettings({
     const value = settings?.[definition.name]
     if (value === undefined || value === null) continue
 
-    if (applySpecialProviderMapping(definition.name, value, providerOptions, provider)) {
+    if (applySpecialProviderMapping(definition.name, value, providerOptions, parameterProvider)) {
       continue
     }
 
@@ -143,11 +144,11 @@ export function buildRuntimeModelSettings({
       // was excluded on purpose. Only genuine user-authored Custom Parameters
       // reach the passthrough below.
       if (ALL_DEFINED_PARAMETER_NAMES.has(key)) continue
-      if (isParameterSuppressedForModel(key, { provider, modelId, vercelId })) {
+      if (isParameterSuppressedForModel(key, { provider: parameterProvider, modelId, vercelId })) {
         continue
       }
 
-      if (applySpecialProviderMapping(key, value, providerOptions, provider)) {
+      if (applySpecialProviderMapping(key, value, providerOptions, parameterProvider)) {
         continue
       }
 
@@ -162,10 +163,10 @@ export function buildRuntimeModelSettings({
         continue
       }
 
-      if (provider) {
+      if (parameterProvider) {
         assignProviderOption(
           providerOptions,
-          `${resolveProviderOptionsSegment(provider)}.${key}`,
+          `${resolveProviderOptionsSegment(parameterProvider)}.${key}`,
           value
         )
       }
@@ -175,7 +176,7 @@ export function buildRuntimeModelSettings({
   if (fallbacks) {
     for (const [key, fallbackValue] of Object.entries(fallbacks)) {
       const typedKey = key as keyof RuntimeModelStandardSettings
-      if (isParameterSuppressedForModel(typedKey, { provider, modelId, vercelId })) {
+      if (isParameterSuppressedForModel(typedKey, { provider: parameterProvider, modelId, vercelId })) {
         continue
       }
       if (standard[typedKey] === undefined && fallbackValue !== undefined) {

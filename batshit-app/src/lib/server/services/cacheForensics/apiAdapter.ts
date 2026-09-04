@@ -1,5 +1,6 @@
 import { env } from '$env/dynamic/private'
-import { normalizeUsageLike } from '$lib/server/services/apiProviderUsage'
+import { normalizeUsageLike, withHonestLocalCacheUsage } from '$lib/server/services/apiProviderUsage'
+import { resolveLocalPromptCacheReporting } from '$lib/data/localAiServers'
 import type {
   CacheForensicsProviderCacheUsage,
   CacheForensicsRecord,
@@ -227,10 +228,14 @@ export function segmentProviderRequestBody(body: unknown): {
   return { segments, parsed: true }
 }
 
-function providerCacheUsageForStep(step: any): CacheForensicsProviderCacheUsage | undefined {
+function providerCacheUsageForStep(step: any, providerId?: string | null): CacheForensicsProviderCacheUsage | undefined {
   const fromUsage = normalizeUsageLike(step?.usage)
   const fromMetadata = normalizeUsageLike({ providerMetadata: step?.providerMetadata })
-  const usage = fromUsage ?? fromMetadata
+  const usage = withHonestLocalCacheUsage(
+    fromUsage ?? fromMetadata,
+    resolveLocalPromptCacheReporting(providerId),
+    [step?.usage?.raw],
+  )
   if (!usage) return undefined
 
   const cacheUsage: CacheForensicsProviderCacheUsage = { source: 'provider' }
@@ -259,6 +264,7 @@ export function buildApiCacheForensicsRecords(args: {
   agentId: string | null | undefined
   connectionId: string | null | undefined
   modelId: string | null | undefined
+  providerId?: string | null
   messageId: string
   experimentGroup?: string | null
   capturedAt?: string
@@ -292,7 +298,7 @@ export function buildApiCacheForensicsRecords(args: {
 
     record.callIndex = callIndex
 
-    const cacheUsage = providerCacheUsageForStep(step)
+    const cacheUsage = providerCacheUsageForStep(step, args.providerId)
     if (cacheUsage) record.providerCacheUsage = cacheUsage
 
     if (!hasBody && record.divergence?.state !== 'capture-failed') {

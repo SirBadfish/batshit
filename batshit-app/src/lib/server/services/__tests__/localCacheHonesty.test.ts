@@ -15,7 +15,7 @@ describe('SA-102 honest local cache reporting', () => {
     expect(resolveLocalPromptCacheReporting('llama-cpp')).toBe('reports')
     expect(resolveLocalPromptCacheReporting('dmr')).toBe('reports')
     expect(resolveLocalPromptCacheReporting('ollama')).toBe('never-reports')
-    expect(resolveLocalPromptCacheReporting('vllm')).toBe('never-reports')
+    expect(resolveLocalPromptCacheReporting('vllm')).toBe('reports')
     expect(resolveLocalPromptCacheReporting('lmstudio')).toBe('never-reports')
     // cloud lanes are none of its business
     expect(resolveLocalPromptCacheReporting('openai')).toBeNull()
@@ -32,12 +32,18 @@ describe('SA-102 honest local cache reporting', () => {
   })
 
   it('keeps a real zero from a program that does report', () => {
-    const usage = { inputTokens: 3020, outputTokens: 5, cachedInputTokens: 0 }
+    const usage = {
+      inputTokens: 3020, outputTokens: 5, cachedInputTokens: 0,
+      raw: { prompt_tokens_details: { cached_tokens: 0 } },
+    }
     expect(withHonestLocalCacheUsage(usage, 'reports')?.cachedInputTokens).toBe(0)
   })
 
   it('keeps a real hit from a program that does report', () => {
-    const usage = { inputTokens: 3020, outputTokens: 5, cachedInputTokens: 3019 }
+    const usage = {
+      inputTokens: 3020, outputTokens: 5, cachedInputTokens: 3019,
+      raw: { prompt_tokens_details: { cached_tokens: 3019 } },
+    }
     expect(withHonestLocalCacheUsage(usage, 'reports')?.cachedInputTokens).toBe(3019)
   })
 
@@ -45,6 +51,56 @@ describe('SA-102 honest local cache reporting', () => {
     const usage = { inputTokens: 100, outputTokens: 2, cachedInputTokens: 64 }
     expect(withHonestLocalCacheUsage(usage, null)).toBe(usage)
     expect(withHonestLocalCacheUsage(usage, undefined)).toBe(usage)
+  })
+
+  it.each(['sglang', 'vllm', 'lmstudio', 'ollama'])(
+    '%s trusts raw counts rather than its static reporting capability', (program) => {
+      const capability = resolveLocalPromptCacheReporting(program)
+      const sdk = { inputTokens: 100, outputTokens: 5, cachedInputTokens: 0 }
+      for (const raw of [undefined, {}, { prompt_tokens_details: null },
+        { prompt_tokens_details: { cached_tokens: null } }]) {
+        const honest = withHonestLocalCacheUsage(sdk, capability, [raw])
+        expect(honest?.cachedInputTokens).toBeUndefined()
+        expect(honest?.inputTokenDetails?.cacheReadTokens).toBeUndefined()
+        expect(honest?.inputTokens).toBe(100)
+      }
+      for (const cached of [0, 64]) {
+        const honest = withHonestLocalCacheUsage(sdk, capability, [
+          { prompt_tokens_details: { cached_tokens: cached } },
+        ])
+        expect(honest?.cachedInputTokens).toBe(cached)
+        expect(honest?.inputTokenDetails?.cacheReadTokens).toBe(cached)
+      }
+    },
+  )
+
+  it('sums each call once and requires every call to report the aggregate field', () => {
+    const sdk = { inputTokens: 200, outputTokens: 10, cachedInputTokens: 64 }
+    const raw = [
+      { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 64 } },
+      { prompt_tokens: 100, cached_tokens: 32 },
+    ]
+    expect(withHonestLocalCacheUsage(sdk, 'reports', raw)?.cachedInputTokens).toBe(96)
+    expect(withHonestLocalCacheUsage(sdk, 'reports', [raw[0], {}])?.cachedInputTokens)
+      .toBeUndefined()
+    expect(withHonestLocalCacheUsage(sdk, 'reports', [{}, raw[1]])?.cachedInputTokens)
+      .toBeUndefined()
+    expect(withHonestLocalCacheUsage(sdk, 'reports', [])?.cachedInputTokens)
+      .toBeUndefined()
+  })
+
+  it('validates reads and writes independently and strips invalid raw counts', () => {
+    const sdk = { inputTokens: 200, cachedInputTokens: 0, cacheCreationInputTokens: 0 }
+    const honest = withHonestLocalCacheUsage(sdk, 'reports', [
+      { cached_tokens: 10, cache_creation_input_tokens: 12 },
+      { cached_tokens: 20 },
+    ])
+    expect(honest?.cachedInputTokens).toBe(30)
+    expect(honest?.cacheCreationInputTokens).toBeUndefined()
+    for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(withHonestLocalCacheUsage(sdk, 'reports', [{ cached_tokens: invalid }])
+        ?.cachedInputTokens).toBeUndefined()
+    }
   })
 })
 
@@ -145,14 +201,16 @@ describe('SA-102 honest cache with the SDK nested usage shape', () => {
     expect(honest?.outputTokens).toBe(5)
   })
 
-  it('passes a reporting program straight through, untouched', () => {
-    // Nothing to strip, so the object is returned by identity and the normal
-    // downstream normalization extracts the nested cacheRead as it always did.
+  it('requires raw evidence even for a nested SDK usage from a reporting program', () => {
     const usage = {
       inputTokens: { total: 3020, cacheRead: 3019 },
-      outputTokens: { total: 5 }
+      outputTokens: { total: 5 },
+      raw: { prompt_tokens_details: { cached_tokens: 3019 } },
     } as any
-    expect(withHonestLocalCacheUsage(usage, 'reports')).toBe(usage)
+    expect(withHonestLocalCacheUsage(usage, 'reports')?.cachedInputTokens).toBe(3019)
+    expect(withHonestLocalCacheUsage(usage, 'reports', [{}])?.cachedInputTokens)
+      .toBeUndefined()
+    // Neither the SDK source nor its raw evidence is mutated.
     expect(normalizeUsageLike(usage)?.cachedInputTokens).toBe(3019)
   })
 })

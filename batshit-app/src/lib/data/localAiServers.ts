@@ -74,7 +74,9 @@ export const LOCAL_AI_SERVER_DEFINITIONS: LocalAiServerDefinition[] = [
     supports: {
       management: false,
       modelList: true,
-      promptCacheReporting: 'never-reports'
+      // v0.28 reports counts with --enable-prompt-tokens-details. Older
+      // versions or servers without that flag can omit them per response.
+      promptCacheReporting: 'reports'
     }
   }
   ,
@@ -90,8 +92,8 @@ export const LOCAL_AI_SERVER_DEFINITIONS: LocalAiServerDefinition[] = [
     supports: {
       management: false,
       modelList: true,
-      // `UsageInfo.prompt_tokens_details.cached_tokens` in SGLang's own
-      // protocol.py, plus an opt-in `return_cached_tokens_details` breakdown.
+      // --enable-cache-report exposes prompt_tokens_details.cached_tokens;
+      // servers without that flag omit the count even when their cache works.
       promptCacheReporting: 'reports'
     }
   },
@@ -139,8 +141,8 @@ export function resolveLocalProviderOptionsSegment(runtimeId: string): string {
 }
 
 /**
- * SA-102 P4 (DL-102-13): does this program report cached prompt tokens?
- * `null` for anything that is not a local program, so cloud lanes are untouched.
+ * Local program reporting capability, not evidence for an individual response.
+ * `null` identifies non-local lanes, which the local usage guard never changes.
  */
 export function resolveLocalPromptCacheReporting(
   providerId: string | null | undefined

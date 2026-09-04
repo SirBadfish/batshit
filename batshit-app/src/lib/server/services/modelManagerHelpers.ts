@@ -1,7 +1,7 @@
-import type { ModelCapabilities, ModelPurpose } from '$lib/types/savedModels'
+import type { ModelCapabilities, ModelConnectionInfo, ModelPurpose } from '$lib/types/savedModels'
 import type { ParameterDefinition, ParameterValue } from '$lib/data/parameter-schemas'
 import type { ProviderFeatures } from './providers'
-import { filterParameters, isParameterSuppressedForModel } from '$lib/utils/parameterFilter'
+import { filterParameters, isParameterSuppressedForModel, resolveParameterProvider } from '$lib/utils/parameterFilter'
 
 const CLI_SETTING_PREFIXES = ['codex_']
 
@@ -88,12 +88,14 @@ function coerceSettingValue(definition: ParameterDefinition, value: unknown): Pa
 export function normaliseModelSettings(options: {
   settings?: Record<string, unknown> | null
   provider?: string | null
+  connection?: ModelConnectionInfo | null
   modelId?: string | null
   vercelId?: string | null
   capabilities?: ModelCapabilities | null
   purpose?: ModelPurpose | null
 }) {
   if (!options.settings) return undefined
+  const parameterProvider = resolveParameterProvider(options.provider, options.connection)
 
   const extraSettings: Record<string, ParameterValue> = {}
   for (const [key, value] of Object.entries(options.settings)) {
@@ -105,7 +107,7 @@ export function normaliseModelSettings(options: {
   }
 
   const definitions = filterParameters({
-    provider: options.provider ?? undefined,
+    provider: parameterProvider ?? undefined,
     modelId: options.modelId ?? undefined,
     vercelId: options.vercelId ?? undefined,
     capabilities: options.capabilities ?? null,
@@ -139,7 +141,7 @@ export function normaliseModelSettings(options: {
     if (knownKeys.has(key)) continue
     if (
       isParameterSuppressedForModel(key, {
-        provider: options.provider,
+        provider: parameterProvider,
         modelId: options.modelId,
         vercelId: options.vercelId
       })

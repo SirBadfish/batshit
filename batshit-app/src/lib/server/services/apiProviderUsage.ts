@@ -587,40 +587,25 @@ export function resolveMessageUsage(args: {
 }
 
 /**
- * SA-102 P4 (DL-102-13): strip a cached-token count a local program never
- * actually reported.
- *
- * `@ai-sdk/openai-compatible` maps an ABSENT `prompt_tokens_details.cached_tokens`
- * to **0**, so Ollama, vLLM and LM Studio's chat endpoint all arrive here
- * claiming a confident zero. Measured on the Ollama lane through Batshit's real
- * send path: time-to-first-output fell 43,085 ms -> 1,268 ms across three sends
- * while `cachedInputTokens` read 0 every time. The cache plainly worked; the
- * number was fiction.
- *
- * Zero is displayed only when a program that DOES report reported zero. For the
- * rest the field becomes `undefined`, which every readout already renders as
- * "not reported" rather than as a miss.
- *
- * This never touches cloud lanes, and it never invents a number — it only
- * refuses to pass one along.
+ * SA-102 (DL-102-13): local cache counts come from each response, not a runtime
+ * capability or the SDK's normalized zero. Reporting can depend on startup
+ * flags and versions. The SDK preserves provider usage on each step.usage.raw,
+ * but drops raw when aggregating steps, so aggregate callers must supply every
+ * model call's raw usage. A partially reported sum is not a run-wide count.
+ * Cloud usage is returned by identity. For a single call the default reads
+ * usage.raw before normalization discards that provenance.
  */
 export function withHonestLocalCacheUsage(
   usage: ApiUsageLike,
-  reporting: 'reports' | 'never-reports' | null | undefined
+  reporting: 'reports' | 'never-reports' | null | undefined,
+  rawUsages: readonly unknown[] = [plainObject(usage)?.raw],
 ): ApiUsageLike {
-  if (!usage || reporting !== 'never-reports') return usage
+  if (!usage || reporting == null) return usage
   // Normalize FIRST. The AI SDK can hand back either a flat
   // `cachedInputTokens` or a nested `inputTokens.cacheRead`, and a flat delete
   // on the un-normalized object leaves the nested one to be re-extracted
   // downstream by `buildTokenUsage`.
   const normalized = normalizeUsageLike(usage) ?? usage
-  if (
-    normalized.cachedInputTokens === undefined &&
-    normalized.cacheCreationInputTokens === undefined &&
-    normalized.inputTokenDetails?.cacheReadTokens === undefined
-  ) {
-    return usage
-  }
   const next: NonNullable<ApiUsageLike> = { ...normalized }
   delete next.cachedInputTokens
   delete next.cacheCreationInputTokens
@@ -629,5 +614,26 @@ export function withHonestLocalCacheUsage(
     delete (details as Record<string, unknown>).cacheReadTokens
     next.inputTokenDetails = Object.keys(details).length ? details : undefined
   }
+
+  const rawCounts = rawUsages.map((raw) => normalizeUsageLike(raw))
+  const sumReported = (field: 'cachedInputTokens' | 'cacheCreationInputTokens') => {
+    if (rawCounts.length === 0) return undefined
+    let total = 0
+    for (const raw of rawCounts) {
+      const count = raw?.[field]
+      if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) {
+        return undefined
+      }
+      total += count
+    }
+    return Number.isFinite(total) ? total : undefined
+  }
+  const cached = sumReported('cachedInputTokens')
+  const created = sumReported('cacheCreationInputTokens')
+  if (cached !== undefined) {
+    next.cachedInputTokens = cached
+    next.inputTokenDetails = { ...next.inputTokenDetails, cacheReadTokens: cached }
+  }
+  if (created !== undefined) next.cacheCreationInputTokens = created
   return next
 }

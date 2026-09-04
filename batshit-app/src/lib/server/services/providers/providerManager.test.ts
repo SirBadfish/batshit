@@ -11,6 +11,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { ProviderManager } from './index'
+import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import { env as testEnv } from '$env/dynamic/private'
 import { createDeepInfra } from '@ai-sdk/deepinfra'
 import { createXai } from '@ai-sdk/xai'
@@ -441,6 +442,20 @@ describe('ProviderManager - Story 5.3 Tests', () => {
         }
       }
     })
+
+    it.each(LOCAL_AI_SERVER_DEFINITIONS)(
+      'preserves the complete served model id through $id registration',
+      (definition) => {
+        const manager = new ProviderManager({ localProviders: [{
+          ...definition, baseUrl: definition.defaultBaseUrl, enabled: true,
+          imageTransport: definition.defaultImageTransport,
+          imageBaseUrl: definition.defaultImageBaseUrl, source: 'default',
+        }] })
+        expect(manager.getModel('Qwen/repo/model.gguf', {
+          transport: 'direct', service: definition.id,
+        }).modelId).toBe('Qwen/repo/model.gguf')
+      },
+    )
 
     it('uses dedicated AI SDK providers for supported direct model services', () => {
       const compatibleManager = new ProviderManager({
