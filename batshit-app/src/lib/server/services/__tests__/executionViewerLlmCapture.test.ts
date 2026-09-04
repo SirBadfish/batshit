@@ -351,6 +351,69 @@ describe('executionViewerLlmCapture redaction', () => {
   })
 })
 
+describe('Vercel capture local cache provenance', () => {
+  it.each(['sglang', 'vllm', 'lmstudio'])('uses raw per-call counts for %s', (providerId) => {
+    const rawUsages = [
+      undefined,
+      { prompt_tokens_details: null },
+      { prompt_tokens_details: { cached_tokens: 0 } },
+      { prompt_tokens_details: { cached_tokens: 64 } },
+    ]
+    const capture = buildVercelLlmCapture({
+      providerId,
+      steps: rawUsages.map((raw) => ({
+        usage: {
+          inputTokens: 100, outputTokens: 5,
+          inputTokenDetails: { cacheReadTokens: 0 }, raw,
+        },
+      })),
+      totalUsage: { inputTokens: 400, outputTokens: 20, cachedInputTokens: 64 },
+    })
+
+    expect(capture.llmCalls.map((call) => call.usage.cachedInputTokens?.value))
+      .toEqual([undefined, undefined, 0, 64])
+    expect(capture.llmCalls.map((call) => call.usage.inputTokens.value))
+      .toEqual([100, 100, 100, 100])
+    expect(capture.llmSummary.totalUsage.inputTokens.value).toBe(400)
+    expect(capture.llmSummary.totalUsage.cachedInputTokens).toBeUndefined()
+  })
+
+  it('totals cache counts only when every local call reports them', () => {
+    const capture = buildVercelLlmCapture({
+      providerId: 'vllm',
+      steps: [0, 64].map((cached) => ({
+        usage: {
+          inputTokens: 100, outputTokens: 5, cachedInputTokens: 0,
+          raw: { prompt_tokens_details: { cached_tokens: cached } },
+        },
+      })),
+      totalUsage: { inputTokens: 200, outputTokens: 10, cachedInputTokens: 0 },
+    })
+    expect(capture.llmSummary.totalUsage.cachedInputTokens?.value).toBe(64)
+    expect(capture.llmSummary.totalUsage.inputTokens.value).toBe(200)
+  })
+
+  it('does not manufacture a local cache count from a single-call total fallback', () => {
+    const capture = buildVercelLlmCapture({
+      providerId: 'sglang',
+      steps: [{}],
+      totalUsage: { inputTokens: 100, outputTokens: 5, cachedInputTokens: 0 },
+    })
+    expect(capture.llmCalls[0].usage.inputTokens.value).toBe(100)
+    expect(capture.llmCalls[0].usage.cachedInputTokens).toBeUndefined()
+    expect(capture.llmSummary.totalUsage.cachedInputTokens).toBeUndefined()
+  })
+
+  it('preserves cloud capture behavior when a provider identity is supplied', () => {
+    const params = {
+      steps: [{ usage: { inputTokens: 100, outputTokens: 5, cachedInputTokens: 0 } }],
+      totalUsage: { inputTokens: 100, outputTokens: 5, cachedInputTokens: 0 },
+    }
+    expect(buildVercelLlmCapture({ ...params, providerId: 'openai' }))
+      .toEqual(buildVercelLlmCapture(params))
+  })
+})
+
 describe('sanitizeRuntimeEventLogForCapture (SA-105 P3)', () => {
   const rawBase64 =
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII='

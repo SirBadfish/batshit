@@ -232,11 +232,11 @@
   const cacheNote = $derived.by(() => {
     if (!hasLatestResponse) return 'No responses in this chat yet.'
     const program = localProgramLabel ?? 'This program'
-    if (localCacheReporting === 'never-reports') {
-      return `${program} does not report cache numbers, so Batshit will not show one. Its cache is still working, and you can see it in the speed: a repeat answer starts much sooner than the first one did.`
-    }
-    if (localCacheReporting === 'reports' && cacheHitPercent === 0) {
+    if (localCacheReporting != null && cacheHitPercent === 0) {
       return `${program} reported no cached tokens this time. Some programs only cache in large blocks, so a short conversation honestly reports none until it grows.`
+    }
+    if (localCacheReporting != null) {
+      return `${program} did not report cache counts for this response. Batshit cannot determine cache reuse from response speed alone.`
     }
     return unknownStatsNote
   })
@@ -339,7 +339,7 @@
               <div class="token-panel-tooltip-title">Prompt cache (latest response)</div>
               {#if typeof cacheHitPercent === 'number'}
                 <div class="token-panel-tooltip-emphasis">{cacheHitLabel} of input read from cache</div>
-                {#if cacheHitPercent === 0 && localCacheReporting === 'reports'}
+                {#if cacheHitPercent === 0 && localCacheReporting != null}
                   <div>{cacheNote}</div>
                 {/if}
                 {#if typeof cacheCachedTokens === 'number' && typeof cacheInputTokens === 'number'}

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { autoSelectConnectionForModel, isModelAllowedForConnection } from './modelConnections'
+import { autoSelectConnectionForModel, isModelAllowedForConnection, isDirectDeveloperCompatible } from './modelConnections'
+import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCatalog'
 
 const baseModel = (overrides: Partial<CatalogModel> = {}): CatalogModel => ({
@@ -22,6 +23,15 @@ const baseConnection = (overrides: Partial<CatalogConnectionOption> = {}): Catal
 })
 
 describe('modelConnections utilities', () => {
+  it.each(LOCAL_AI_SERVER_DEFINITIONS)(
+    'allows a different model maker on the $id connection',
+    ({ id }) => {
+      expect(isDirectDeveloperCompatible('Qwen', {
+        id: `direct:${id}`, transport: 'direct', service: id, providers: [id],
+      })).toBe(true)
+    },
+  )
+
   describe('isModelAllowedForConnection', () => {
     it('allows matching gateway connections', () => {
       const model = baseModel()

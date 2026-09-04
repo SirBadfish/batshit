@@ -142,6 +142,29 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
     brain = new VercelAIBrain()
   })
 
+  describe('local response cache provenance', () => {
+    it.each([undefined, 0, 64])('uses raw local counts in the nonstreaming result: %s', async (cached) => {
+      const raw = {
+        prompt_tokens: 100, completion_tokens: 5,
+        ...(cached === undefined ? {} : { prompt_tokens_details: { cached_tokens: cached } }),
+      }
+      vi.mocked(streamText).mockResolvedValueOnce({
+        stream: (async function* () { yield { type: 'text-delta', text: 'Done' } })(),
+        usage: Promise.resolve({ inputTokens: 100, outputTokens: 5, cachedInputTokens: 0 }),
+        steps: Promise.resolve([{ usage: { raw } }]),
+      } as any)
+      const response = await brain.processNativeMode({
+        messages: [{ role: 'user', content: 'Hello' }],
+        model: 'Qwen3-VL-4B-Instruct',
+        connection: { type: 'direct', service: 'sglang' },
+        sessionId: 'test-session', messageId: 'test-message',
+      })
+      expect(response.usage?.cachedInputTokens).toBe(cached)
+      expect(response.usage?.promptTokens).toBe(100)
+      expect(response.usage?.completionTokens).toBe(5)
+    })
+  })
+
   describe('Subagent prompt compilation', () => {
     it('includes subagent-enabled Skills & Prompts guidance when commands are assigned', async () => {
       vi.mocked(redis.get).mockResolvedValueOnce('# Base subagent prompt' as any)

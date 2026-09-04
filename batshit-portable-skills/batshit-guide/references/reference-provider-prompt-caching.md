@@ -53,21 +53,21 @@ Numbers on this page come from our own measurements (August 2026), not provider 
 
 Local AI programs aren't in the table above, because you run them yourself and there is no per-token bill to discount. But they absolutely do cache, and it matters more than you might expect: on a home computer, reading the prompt is usually the slow part, so a cache hit is the difference between waiting 27 seconds and waiting 0.05.
 
-Four of the seven report the number, and three don't:
+Reporting depends on the program, its version, and its startup settings:
 
 | Program | Reports cached tokens? |
 | --- | --- |
 | llama.cpp | Yes |
 | Docker Model Runner | Yes |
-| SGLang | Yes |
+| SGLang | With `--enable-cache-report` |
 | oMLX | Yes |
 | Ollama | No |
-| vLLM | No |
+| vLLM | Supported versions report with `--enable-prompt-tokens-details` |
 | LM Studio | No, on the endpoint Batshit uses |
 
 **"No" means no counter, not no cache.** Ollama went from 27 seconds to 0.05 seconds on a repeat send while reporting nothing at all. Batshit says so plainly in the Token Panel instead of showing a zero it never received — and it will never turn a fast response into a cache verdict.
 
-Where a program does report, Batshit shows the real number. Some caches work in fixed blocks — oMLX uses 4,096 tokens — so a short conversation honestly reports zero until it grows past one block. That's correct behavior, and the tooltip explains it rather than leaving you guessing.
+Batshit checks each response: a real zero is preserved, and an absent count stays unknown. A tool run gets a total only when every model call reports a count. Some caches work in fixed blocks — oMLX uses 4,096 tokens — so a short conversation can honestly report zero until it grows past one block.
 
 For the whole story, including what resets a local cache and how to read the speed numbers instead, see [Why your local model gets faster on the second message](../local-ai/speed-and-caching.md).
 

@@ -4,6 +4,7 @@ import type {
   CatalogModelIdVariant
 } from '$lib/types/modelCatalog'
 import type { SavedModel, ModelConnectionInfo } from '$lib/types/savedModels'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 
 export function resolveConnectionServiceFromId(
   connectionId?: string | null
@@ -29,11 +30,7 @@ const DIRECT_MULTI_DEVELOPER_SERVICES = new Set([
   'cerebras',
   'qwencloud',
   'qwen_token_plan',
-  'ollama',
-  'dmr',
-  'lmstudio',
-  'llama-cpp',
-  'vllm'
+  ...LOCAL_AI_SERVER_IDS
 ])
 
 function normalizeConnectionValue(value?: string | null): string {

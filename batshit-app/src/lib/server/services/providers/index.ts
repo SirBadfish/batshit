@@ -35,6 +35,7 @@ import { apiKeyService } from '$lib/services/apiKey.server'
 import { listCustomProvidersForRuntime } from '$lib/server/services/customProviders'
 import type { CustomProviderRuntime } from '$lib/types/customProviders'
 import type { LocalAiServerId, LocalAiServerSummary } from '$lib/types/localAi'
+import { LOCAL_AI_SERVER_IDS } from '$lib/data/localAiServers'
 import {
   listLocalAiServers,
   resolveLocalAiRuntimeBaseUrl
@@ -1063,11 +1064,7 @@ export class ProviderManager {
       'cohere',
       'fal',
       'replicate',
-      'ollama',
-      'dmr',
-      'lmstudio',
-      'llama-cpp',
-      'vllm'
+      ...LOCAL_AI_SERVER_IDS
     ])
     const isCustomProvider = providerKey.startsWith('custom_')
     const resolvedModelName =

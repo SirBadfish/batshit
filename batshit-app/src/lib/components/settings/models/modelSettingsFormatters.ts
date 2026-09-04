@@ -7,6 +7,7 @@ import type { CatalogConnectionOption, CatalogModel } from '$lib/types/modelCata
 import type { ModelCapabilities, ModelCompatibility } from '$lib/types/savedModels'
 import type { ThemeMode } from '$lib/types/theme'
 import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
+import { LOCAL_AI_SERVER_DEFINITIONS } from '$lib/data/localAiServers'
 
 const DEVELOPER_LABEL_OVERRIDES: Record<string, string> = {
   openai: 'OpenAI',
@@ -64,11 +65,7 @@ const DEVELOPER_LABEL_OVERRIDES: Record<string, string> = {
   togetherai: 'Together.ai',
   fireworks: 'Fireworks AI',
   'stepfun-ai': 'StepFun AI',
-  ollama: 'Ollama',
-  dmr: 'Docker Model Runner',
-  lmstudio: 'LM Studio',
-  'llama-cpp': 'llama.cpp',
-  vllm: 'vLLM'
+  ...Object.fromEntries(LOCAL_AI_SERVER_DEFINITIONS.map(({ id, label }) => [id, label]))
 }
 
 const CONNECTION_ICON_OVERRIDES: Record<string, string> = {

@@ -24,27 +24,12 @@ export type LocalAiServerDefinition = {
     modelList: boolean
     richMetadata?: boolean
     /**
-     * SA-102 P4 (DL-102-13): does this program put cached prompt tokens in
-     * `usage`?
-     *
-     * This has to be a property of the PROGRAM, not a reading of the number,
-     * because `@ai-sdk/openai-compatible` defaults an absent
-     * `prompt_tokens_details.cached_tokens` to **0**. Without this flag Batshit
-     * cannot tell "the cache missed" from "this program never says", and it was
-     * showing a confident zero for both. Measured live 2026-09-02:
-     *
-     *   llama.cpp            yes  (0 -> 3019 through Docker Model Runner)
-     *   Docker Model Runner  yes  (same engine, measured directly)
-     *   oMLX                 yes  (8192 of 9274 on a warm 9k prompt)
-     *   SGLang               yes  (UsageInfo.prompt_tokens_details in protocol.py)
-     *   Ollama               no   (27s -> 0.05s with identical prompt_tokens)
-     *   vLLM                 no   (open upstream bug vllm#44961)
-     *   LM Studio            no   on /v1/chat/completions (51.6s -> 2.2s, no
-     *                             prompt_tokens_details at all); yes on
-     *                             /v1/responses, which Batshit does not use.
-     *
-     * A `no` here does NOT mean the cache is off. Every one of these programs
-     * caches by default; only the counter is missing.
+     * Known reporting capability on the chat endpoint. Versions and startup
+     * flags can change individual responses: SGLang needs --enable-cache-report
+     * and vLLM needs --enable-prompt-tokens-details. This is never permission to
+     * trust the SDK's default zero or discard a count a program actually sent.
+     * SA-102 (DL-102-13) uses step.usage.raw to distinguish a reported zero from
+     * an absent count. Missing telemetry says nothing about whether cache ran.
      */
     promptCacheReporting: 'reports' | 'never-reports'
   }

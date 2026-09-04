@@ -56,24 +56,24 @@ Open the Token Panel under the chat and hover the cache figure. What you see dep
 
 | Your program | What you'll see |
 | --- | --- |
-| llama.cpp, Docker Model Runner, SGLang, oMLX | A real cached-token count and a hit percentage |
-| Ollama, vLLM, LM Studio | A note saying that program doesn't report cache numbers |
+| llama.cpp, Docker Model Runner, oMLX | A cached-token count when the response includes one |
+| SGLang | A count when started with `--enable-cache-report` |
+| vLLM | A count on versions that support it, with `--enable-prompt-tokens-details` |
+| Ollama, LM Studio | Usually no cache count on the chat endpoint Batshit uses |
 
 Some programs simply don't put the number in their response. **Their caches still work** — Ollama went from 27 seconds to 0.05 seconds while reporting nothing at all. There is just no counter to read.
 
-Batshit will not fake it. It won't show you a zero the program never sent, and it won't look at how fast the answer arrived and call that a cache hit. Speed and cache are two different pieces of evidence, and guessing one from the other is exactly how you end up confidently wrong. On Ollama the tooltip says so plainly:
+Batshit reads the response itself. A reported zero means zero; an absent count means unknown. If a tool run makes several model calls, every call must report a count before Batshit shows a total. Individual counts remain available in the Execution Viewer when cache forensics is enabled.
 
-> Ollama does not report cache numbers, so Batshit will not show one. Its cache is still working, and you can see it in the speed: a repeat answer starts much sooner than the first one did.
-
-Which brings us to the number that always works.
+It won't show a zero the program never sent, or turn a fast answer into a cache verdict. Reporting can change with a program's version or startup flags.
 
 ## Watch the speed instead
 
 Next to the cache figure, the Token Panel shows **time to first output** — how long you waited before the model started writing — and **tokens per second** once it got going.
 
-Time to first output is the honest cache meter for every program, reporting or not. Send a message, note it. Send another, note it again. If the second one is dramatically lower, your cache is working.
+Compare time to first output on repeated messages to see whether performance improves. A faster repeat is useful evidence of speed, but cannot by itself prove a cache hit: scheduling, compilation, and other work also affect latency.
 
-That number is also how you spot a problem. If time to first output stops dropping on repeat messages and stays high, something is moving the front of your prompt. Check whether you edited the system prompt, changed Thinking effort, or ran out of context.
+If repeat messages stay slow, check whether you edited the system prompt, changed Thinking effort, ran out of context, or have other work competing for the GPU.
 
 ## Caches that work in blocks
 

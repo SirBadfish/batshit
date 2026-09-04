@@ -402,11 +402,10 @@ describe('TokenPanel', () => {
     ).toHaveTextContent('8.5 t/s')
   })
 
-  // SA-102 P4 (DL-102-13): a local program that never reports cached tokens
-  // must SAY so by name, not show a dash that reads like a cache miss. Measured
-  // on the Ollama lane: 43,085 ms -> 1,268 ms time-to-first-output with no
-  // cache number at any point.
-  it('names the local program when it never reports cache numbers', async () => {
+  it.each([
+    ['Ollama', 'never-reports'],
+    ['SGLang', 'reports'],
+  ] as const)('names %s when this response omitted cache counts', async (program, reporting) => {
     ;(window as any).ResizeObserver ??= class ResizeObserver {
       observe() {}
       unobserve() {}
@@ -418,8 +417,8 @@ describe('TokenPanel', () => {
         currentTokens: 12000,
         contextLimit: 128000,
         hasLatestResponse: true,
-        localProgramLabel: 'Ollama',
-        localCacheReporting: 'never-reports' as const,
+        localProgramLabel: program,
+        localCacheReporting: reporting,
       },
     })
 
@@ -430,12 +429,12 @@ describe('TokenPanel', () => {
     await fireEvent.mouseEnter(cacheTrigger)
     await fireEvent.focus(cacheTrigger)
     expect(
-      await screen.findByText(/Ollama does not report cache numbers/),
+      await screen.findByText(new RegExp(`${program} did not report cache counts for this response`)),
     ).toBeInTheDocument()
-    expect(screen.getByText(/you can see it in the speed/)).toBeInTheDocument()
+    expect(screen.getByText(/cannot determine cache reuse from response speed alone/)).toBeInTheDocument()
   })
 
-  it('explains a genuine zero from a program that does report', async () => {
+  it.each(['reports', 'never-reports'] as const)('explains a genuine zero regardless of the %s capability', async (reporting) => {
     ;(window as any).ResizeObserver ??= class ResizeObserver {
       observe() {}
       unobserve() {}
@@ -451,7 +450,7 @@ describe('TokenPanel', () => {
         cacheCachedTokens: 0,
         cacheInputTokens: 2140,
         localProgramLabel: 'oMLX',
-        localCacheReporting: 'reports' as const,
+        localCacheReporting: reporting,
       },
     })
 

@@ -56,7 +56,8 @@ import { normalizeSubagentType, type SubagentType } from '$lib/utils/subagentTyp
 import { isOpenAIReasoningParameterRestrictedModelId } from '$lib/utils/parameterFilter'
 import { collectReasoningTextFromFinish } from '$lib/utils/reasoningDisplay'
 import { applyApiPromptCachePolicy } from '$lib/server/services/apiPromptCachePolicy'
-import { normalizeUsageLike } from '$lib/server/services/apiProviderUsage'
+import { normalizeUsageLike, withHonestLocalCacheUsage } from '$lib/server/services/apiProviderUsage'
+import { resolveLocalPromptCacheReporting } from '$lib/data/localAiServers'
 
 /**
  * Subagent tool metadata (Story 6.7c)
@@ -533,7 +534,15 @@ export class VercelAIBrain {
       }
 
       // Get usage information
-      const usage = normalizeUsageLike(await result.usage)
+      const localCacheReporting = resolveLocalPromptCacheReporting(runtimeProviderId)
+      const sdkUsage = await result.usage
+      const usage = normalizeUsageLike(withHonestLocalCacheUsage(
+        sdkUsage,
+        localCacheReporting,
+        localCacheReporting == null
+          ? undefined
+          : (await result.steps).map((step) => step.usage.raw),
+      ))
       const totalTokens = usage?.totalTokens || 0
       const promptTokens = usage?.inputTokens || 0
       const completionTokens = usage?.outputTokens || 0
