@@ -192,6 +192,19 @@ export async function acquireSubagentRunLock(options: {
 }
 
 /**
+ * Compare-and-delete in ONE Redis round trip. A separate GET then DEL has a real window:
+ * the key can expire between the two calls and be re-acquired by the queued caller, and
+ * our DEL would then remove THEIR lock — handing the thread to a third call while the
+ * second is still running, which is exactly the F7 overwrite this lock exists to stop.
+ */
+const RELEASE_LOCK_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`
+
+/**
  * Give the turn back. Returns `false` when the lock was no longer ours — the run outlived
  * its own TTL and another call has already started, so our thread write would clobber
  * theirs. The caller reports that instead of persisting (DL-111-05).
@@ -202,12 +215,13 @@ export async function releaseSubagentRunLock(
 ): Promise<boolean> {
   if (!handle) return false
   try {
-    return await redis.execute(async (client) => {
-      const current = await client.get(handle.key)
-      if (current !== handle.token) return false
-      await client.del(handle.key)
-      return true
-    })
+    const deleted = await redis.execute(async (client) =>
+      client.eval(RELEASE_LOCK_SCRIPT, {
+        keys: [handle.key],
+        arguments: [handle.token],
+      })
+    )
+    return Number(deleted) === 1
   } catch (error) {
     console.warn('[SubagentThreads] Failed to release subagent run lock:', error)
     return false

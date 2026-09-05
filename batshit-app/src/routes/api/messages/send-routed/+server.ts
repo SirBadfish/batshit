@@ -1800,11 +1800,18 @@ function toolResultIndicatesFailure(result: unknown): boolean {
   }
 
   const record = parsed as Record<string, any>
+  // SA-111: `status` is a failure signal ONLY on a delegated-run payload. This helper runs
+  // over every tool result through `inferToolStepSuccess`, and plenty of ordinary tools
+  // report the status of their SUBJECT rather than of the call — a CI run, a deployment, a
+  // queued job. `{ status: 'failed' }` there means the build failed, not the tool. The
+  // managed CLI bridge is why the check exists at all: `/api/subagents/managed-execute`
+  // returns `success: true` with the run's own `status`, unlike the API lane, which already
+  // sets `success: result.status === 'completed'`.
+  const isDelegatedRunPayload = record.kind === 'subagent' || record.kind === 'worker'
   return (
     record.success === false ||
     record.blocked === true ||
-    record.status === 'failed' ||
-    record.status === 'timed_out'
+    (isDelegatedRunPayload && (record.status === 'failed' || record.status === 'timed_out'))
   )
 }
 

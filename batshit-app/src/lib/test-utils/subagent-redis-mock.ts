@@ -71,6 +71,33 @@ export function createSubagentRedisMock(): SubagentRedisMock {
       entry.expiresAt = Date.now() + seconds * 1000
       return true
     },
+    /**
+     * Models the ONE script the subagent lock uses: compare-and-delete. The point of the
+     * script in production is that the compare and the delete are a single indivisible
+     * step, so the fake runs both against the store with no `await` between them — a
+     * two-step fake would pass while the real race stayed open. Any other script throws,
+     * matching this file's rule that a new dependency must show up as a clear failure.
+     */
+    async eval(script: string, options?: { keys?: string[]; arguments?: string[] }) {
+      const normalized = script.replace(/\s+/g, ' ').trim()
+      const isCompareAndDelete =
+        normalized.includes("redis.call('GET', KEYS[1]) == ARGV[1]") &&
+        normalized.includes("redis.call('DEL', KEYS[1])")
+      if (!isCompareAndDelete) {
+        throw new Error(`subagent-redis-mock: unsupported eval script: ${normalized}`)
+      }
+      const key = options?.keys?.[0]
+      const expected = options?.arguments?.[0]
+      if (!key) throw new Error('subagent-redis-mock: eval needs KEYS[1]')
+      const entry = store.get(key)
+      if (!isLive(entry)) {
+        store.delete(key)
+        return 0
+      }
+      if (String(entry.value) !== expected) return 0
+      store.delete(key)
+      return 1
+    },
     json: {
       async get(key: string) {
         return read(key)
