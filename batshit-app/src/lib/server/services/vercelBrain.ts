@@ -52,6 +52,10 @@ import {
   compileManagedSubagentSystemPrompt,
   executeManagedSubagent
 } from '$lib/server/services/subagentRunner'
+import {
+  isSubagentBusyError,
+  normalizeSubagentThreadMode
+} from '$lib/server/services/subagentThreads'
 import { normalizeSubagentType, type SubagentType } from '$lib/utils/subagentType'
 import { isOpenAIReasoningParameterRestrictedModelId } from '$lib/utils/parameterFilter'
 import { collectReasoningTextFromFinish } from '$lib/utils/reasoningDisplay'
@@ -219,6 +223,11 @@ export interface NativeModeRequest extends ThinkRequest {
   allowFabricControlTools?: boolean
   /** SA-104 P3: PRIMARY runs of memory-enabled agents; subagent runner leaves it false. */
   memoryControlsEnabled?: boolean
+  /**
+   * SA-111 P4 (DL-111-11/12): PRIMARY runs of workers-enabled agents. The subagent runner
+   * leaves it false, which is what keeps delegation depth at one level.
+   */
+  workersEnabled?: boolean
   gatewayToolMap?: Record<string, string[]> | null
   preloadedGatewayTools?: ToolMetadataMap['tools']
   preloadedGatewayMetadata?: ToolMetadataMap['metadata']
@@ -431,6 +440,7 @@ export class VercelAIBrain {
           projectPath: request.projectPath ?? null,
           selectedCliToolIds: request.selectedCliToolIds,
           memoryControlsEnabled: request.memoryControlsEnabled,
+          workersEnabled: request.workersEnabled,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
           parentCapabilities: request.modelCapabilities ?? null,
@@ -543,12 +553,12 @@ export class VercelAIBrain {
           ? undefined
           : (await result.steps).map((step) => step.usage.raw),
       ))
-      const totalTokens = usage?.totalTokens || 0
-      const promptTokens = usage?.inputTokens || 0
-      const completionTokens = usage?.outputTokens || 0
+      const totalTokens = usage?.totalTokens
+      const promptTokens = usage?.inputTokens
+      const completionTokens = usage?.outputTokens
 
       // Verify multimodal efficiency
-      if (request.images?.length && promptTokens > 0) {
+      if (request.images?.length && typeof promptTokens === 'number' && promptTokens > 0) {
         const estimatedImageTokens = request.images.length * 765
         logger.debug('[VercelBrain API] Multimodal token check:', {
           imageCount: request.images.length,
@@ -562,18 +572,22 @@ export class VercelAIBrain {
         content,
         intermediateSteps: intermediateSteps.length > 0 ? intermediateSteps : undefined,
         modelUsed: request.model,
-        usage: {
-          promptTokens,
-          completionTokens,
-          totalTokens,
-          imageTokens: request.images?.length ? request.images.length * 765 : undefined,
-          ...(typeof usage?.cachedInputTokens === 'number'
-            ? { cachedInputTokens: usage.cachedInputTokens }
-            : {}),
-          ...(typeof usage?.cacheCreationInputTokens === 'number'
-            ? { cacheCreationInputTokens: usage.cacheCreationInputTokens }
-            : {})
-        },
+        ...(usage
+          ? {
+              usage: {
+                ...(typeof promptTokens === 'number' ? { promptTokens } : {}),
+                ...(typeof completionTokens === 'number' ? { completionTokens } : {}),
+                ...(typeof totalTokens === 'number' ? { totalTokens } : {}),
+                imageTokens: request.images?.length ? request.images.length * 765 : undefined,
+                ...(typeof usage.cachedInputTokens === 'number'
+                  ? { cachedInputTokens: usage.cachedInputTokens }
+                  : {}),
+                ...(typeof usage.cacheCreationInputTokens === 'number'
+                  ? { cacheCreationInputTokens: usage.cacheCreationInputTokens }
+                  : {})
+              }
+            }
+          : {}),
         metadata: {
           provider: this.getProviderName(request.model),
           latency: Date.now() - startTime,
@@ -595,11 +609,13 @@ export class VercelAIBrain {
       if (request.onFinish) {
         await request.onFinish({
           text: content,
-          usage: {
-            totalTokens,
-            promptTokens,
-            completionTokens
-          },
+          usage: usage
+            ? {
+                ...(typeof totalTokens === 'number' ? { totalTokens } : {}),
+                ...(typeof promptTokens === 'number' ? { promptTokens } : {}),
+                ...(typeof completionTokens === 'number' ? { completionTokens } : {})
+              }
+            : undefined,
           steps: intermediateSteps
         })
       }
@@ -956,6 +972,8 @@ export class VercelAIBrain {
       allowArtifactRuntimeTools?: boolean
       allowFabricControlTools?: boolean
       memoryControlsEnabled?: boolean
+      /** SA-111 P4: primary-agent sends only; every delegated run leaves it false. */
+      workersEnabled?: boolean
       parentModelId?: string | null
       parentConnection?: ModelConnectionInfo | null
       /** SA-105 P2 (DL-105-06): saved-model capabilities for the image lane gate. */
@@ -1032,7 +1050,21 @@ export class VercelAIBrain {
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode,
           imageDelivery,
-          ephemeralImages
+          ephemeralImages,
+          // SA-111 P4 (DL-111-09): the worker tool exists only on a primary send. Every
+          // other caller of this builder — subagents, workers, artifacts — leaves
+          // `workersEnabled` unset, which is what enforces depth 1 (DL-111-12).
+          workers: nativeContext?.workersEnabled
+            ? {
+                enabled: true,
+                parentMessageId: nativeContext?.parentMessageId ?? null,
+                parentModelId: nativeContext?.parentModelId ?? null,
+                parentConnection: nativeContext?.parentConnection ?? null,
+                assignedSubagents: agentContext?.assignedSubagents ?? null,
+                defaultGateways: agentContext?.defaultGateways ?? null,
+                abortSignal: nativeContext?.abortSignal
+              }
+            : null
         })
         Object.assign(tools, nativeToolSet.tools)
         Object.assign(toolApprovals, nativeToolSet.toolApprovals)
@@ -1076,7 +1108,15 @@ export class VercelAIBrain {
           const workflowTool = dynamicTool({
             description: compiledDescription || subagent.description || `Execute ${subagent.displayName || baseName} subagent`,
             inputSchema: z.object({
-              chatInput: z.string().describe('Message to send to the subagent')
+              chatInput: z.string().describe('Message to send to the subagent'),
+              // SA-111 P2 (DL-111-04). Optional so an agent that says nothing gets Josh's
+              // chosen default: a clean thread every call.
+              thread: z
+                .enum(['fresh', 'resume'])
+                .optional()
+                .describe(
+                  "Thread control. 'fresh' (default) starts a clean thread and DISCARDS this subagent's stored thread in this chat. 'resume' continues where the last call left off."
+                )
             }),
             execute: async (input) => {
               const baseInput = typeof input === 'object' && input !== null ? { ...input } : {}
@@ -1103,31 +1143,69 @@ export class VercelAIBrain {
                 return 'Subagent execution is missing required user/session context.'
               }
 
-              const result = await executeManagedSubagent({
-                userId: normalizedUserId,
-                sessionId: normalizedSessionId,
-                chatInput: (baseInput as any).chatInput ?? '',
-                subagent: {
-                  ...subagent,
-                  subagentType
-                },
-                parentAgentId: normalizedParentAgentId,
-                parentMessageId: nativeContext?.parentMessageId ?? null,
-                projectPath: nativeContext?.projectPath ?? null,
-                selectedGateways,
-                toolSelections,
-                selectedCliToolIds: nativeContext?.selectedCliToolIds,
-                dcmDisplaySettings: nativeContext?.dcmDisplaySettings ?? null,
-                defaultGateways: agentContext?.defaultGateways ?? null,
-                toolApprovalMode: 'off',
-                parentModelId: nativeContext?.parentModelId ?? null,
-                parentConnection: nativeContext?.parentConnection ?? null,
-                abortSignal: nativeContext?.abortSignal
-              })
+              try {
+                const result = await executeManagedSubagent({
+                  userId: normalizedUserId,
+                  sessionId: normalizedSessionId,
+                  chatInput: (baseInput as any).chatInput ?? '',
+                  subagent: {
+                    ...subagent,
+                    subagentType
+                  },
+                  parentAgentId: normalizedParentAgentId,
+                  parentMessageId: nativeContext?.parentMessageId ?? null,
+                  projectPath: nativeContext?.projectPath ?? null,
+                  selectedGateways,
+                  toolSelections,
+                  selectedCliToolIds: nativeContext?.selectedCliToolIds,
+                  dcmDisplaySettings: nativeContext?.dcmDisplaySettings ?? null,
+                  defaultGateways: agentContext?.defaultGateways ?? null,
+                  toolApprovalMode: 'off',
+                  parentModelId: nativeContext?.parentModelId ?? null,
+                  parentConnection: nativeContext?.parentConnection ?? null,
+                  thread: normalizeSubagentThreadMode((baseInput as any).thread),
+                  abortSignal: nativeContext?.abortSignal
+                })
 
-              return {
-                output: result.output,
-                intermediateSteps: result.intermediateSteps
+                return {
+                  kind: 'subagent',
+                  success: result.status === 'completed',
+                  subagentName: subagent.displayName || subagent.name || sanitizedName,
+                  subagentType: result.subagentType,
+                  output: result.output,
+                  intermediateSteps: result.intermediateSteps,
+                  usage: result.usage,
+                  modelId: result.modelId,
+                  provider: result.provider,
+                  durationMs: result.durationMs,
+                  status: result.status,
+                  thread: result.thread,
+                  ...(result.threadNote ? { threadNote: result.threadNote } : {})
+                }
+              } catch (error) {
+                // SA-111 P2 (DL-111-05): a same-subagent collision is an expected, explicit
+                // outcome the model can act on — call a different specialist, or wait. Every
+                // other failure still throws so it surfaces as a real tool error.
+                if (!isSubagentBusyError(error)) throw error
+                return {
+                  kind: 'subagent',
+                  success: false,
+                  error: 'subagent_busy',
+                  subagentName: subagent.displayName || subagent.name || sanitizedName,
+                  subagentType,
+                  output: error.message,
+                  intermediateSteps: [],
+                  usage: null,
+                  modelId:
+                    subagent.primary_model_name ?? subagent.settings?.primary_model_name ?? null,
+                  provider:
+                    subagent.primary_model_provider ??
+                    subagent.settings?.primary_model_provider ??
+                    null,
+                  durationMs: 0,
+                  status: 'failed',
+                  thread: null
+                }
               }
             }
           })
@@ -2553,6 +2631,7 @@ export class VercelAIBrain {
             allowArtifactRuntimeTools: request.allowArtifactRuntimeTools,
             allowFabricControlTools: request.allowFabricControlTools,
             memoryControlsEnabled: request.memoryControlsEnabled,
+            workersEnabled: request.workersEnabled,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,
             parentCapabilities: request.modelCapabilities ?? null,

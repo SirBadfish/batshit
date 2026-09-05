@@ -17,7 +17,8 @@ export const GET: RequestHandler = async ({ params, locals }) => {
             'batshit:batshit_mode4_system_prompt',
             // Base SA prompts
             'batshit:sub_system_prompt',
-            'batshit:subagent_instructions',
+            'batshit:worker_prompt',
+            'batshit:subagent_guidance',
             // Tool + zip guidance prompts
             'batshit:tool_guidance_zip_enabled_prompt',
             'batshit:tool_guidance_zip_disabled_prompt',

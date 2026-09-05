@@ -520,7 +520,10 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     const { server } = await runServerCompile({
       sessionId,
       messages: [],
-      agent: apiAgent({ memory_enabled: true }),
+      // SA-111 P4: `workers_enabled: false` alongside no subagents is now the ONLY way an
+      // agent has nothing to delegate to. With Workers defaulting on (DL-111-11), a plain
+      // agent DOES receive the delegation block — which is the point of the feature.
+      agent: apiAgent({ memory_enabled: true, workers_enabled: false }),
       currentUserMessage: 'hello',
       options: { runtimeFlavor: 'vercel' }
     })
@@ -531,6 +534,9 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     const toolZipIndex = prompt.indexOf('==== TOOL + ZIP GUIDANCE')
     const discoveryIndex = prompt.indexOf('==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====')
     const memoryIndex = prompt.indexOf('==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ====')
+    // DL-111-01: no subagents AND no workers, so the delegation block does not compile and
+    // pays no prompt bytes. `S2c` pins its position when it does.
+    expect(prompt).not.toContain('==== SUBAGENTS & WORKERS (DELEGATION) ====')
     // Identity zone: who you are, ending on the agent's own memories.
     const globalIndex = prompt.indexOf('==== GLOBAL CUSTOM SYSTEM PROMPT ====')
     const userIndex = prompt.indexOf('==== USER SYSTEM PROMPT ====')
@@ -587,6 +593,62 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
         })
         expect(index).toBeGreaterThan(previous)
         previous = index
+      }
+    }
+  })
+
+  it('S2c SA-111 P1: delegation guidance compiles in the Batshit zone for agents with subagents (DL-111-01)', async () => {
+    // F1: primary agents silently lost all subagent-usage guidance at SA-008 (2025-12-04)
+    // when the specialty-based description block was removed. The replacement is its own
+    // `====` block, so it is visible in the Execution Viewer and cannot fall out again
+    // without this pin failing.
+    const assignedSubagents = [
+      { id: 'api_helper', displayName: 'API Helper', description: 'API slice coverage' }
+    ]
+
+    for (const runtimeFlavor of ['vercel', 'codex', 'claude'] as const) {
+      const sessionId = nextSessionId()
+      state.current = freshState(sessionId)
+
+      const { server } = await runServerCompile({
+        sessionId,
+        messages: [],
+        agent: apiAgent({
+          memory_enabled: true,
+          ...(runtimeFlavor === 'vercel' ? {} : { primary_agent_type: 'cli', agentType: 'cli' })
+        }),
+        currentUserMessage: 'hello',
+        assignedSubagents,
+        options: { runtimeFlavor }
+      })
+
+      const prompt = server.primarySystemPrompt ?? ''
+      const delegationIndex = prompt.indexOf('==== SUBAGENTS & WORKERS (DELEGATION) ====')
+      const discoveryIndex = prompt.indexOf('==== DYNAMIC TOOL SEARCH / DISCOVERY (WHEN ENABLED) ====')
+      const memoryIndex = prompt.indexOf('==== MEMORY INSTRUCTIONS (AGENT MEMORY ENABLED) ====')
+      const globalIndex = prompt.indexOf('==== GLOBAL CUSTOM SYSTEM PROMPT ====')
+
+      expect({ runtimeFlavor, found: delegationIndex >= 0 }).toEqual({ runtimeFlavor, found: true })
+      // Directly after discovery, before memory instructions, inside the Batshit zone.
+      expect(delegationIndex).toBeGreaterThan(discoveryIndex)
+      expect(memoryIndex).toBeGreaterThan(delegationIndex)
+      expect(globalIndex).toBeGreaterThan(delegationIndex)
+
+      // Runtime-scoped: neither lane is taught the other's call shape.
+      if (runtimeFlavor === 'vercel') {
+        expect(prompt).toContain('Call a subagent by its own tool, directly.')
+        expect(prompt).not.toContain('the MCP server/tool pair the roster prints')
+      } else {
+        expect(prompt).toContain('the MCP server/tool pair the roster prints')
+        expect(prompt).not.toContain('Call a subagent by its own tool, directly.')
+      }
+
+      // SA-111 P4: Workers ship, and each lane is taught only its own tool name.
+      if (runtimeFlavor === 'vercel') {
+        expect(prompt).toContain('native_spawn_workers')
+      } else {
+        expect(prompt).toContain('`spawn_workers` on your subagent MCP server')
+        expect(prompt).not.toContain('native_spawn_workers')
       }
     }
   })

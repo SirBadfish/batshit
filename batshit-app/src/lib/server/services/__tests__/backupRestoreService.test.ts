@@ -73,6 +73,17 @@ const EYE_HASH = 'a'.repeat(64)
 const SOCKET_HASH = 'b'.repeat(64)
 const SEAM_HASH = 'c'.repeat(64)
 const ARTWORK_HASH = 'd'.repeat(64)
+const DELEGATION_BACKUP_RECORDS = {
+  'subagent_thread:sess_1:researcher': 'f8a11390-7654-4321-8765-123456789abc',
+  'batshit:subagent_guidance': 'Ask assigned specialists for bounded research and use fresh threads by default.',
+  'batshit:subagent_guidance:last_updated': '2026-09-04T12:00:00.000Z',
+  'batshit:worker_prompt': 'Return the requested result from this temporary worker run.',
+  'batshit:worker_prompt:last_updated': '2026-09-04T12:00:00.000Z'
+}
+const TRANSIENT_DELEGATION_KEYS = [
+  'subagent_lock:sess_1:researcher',
+  'n8n:sse-callback:sess_1:subagent_run_1'
+]
 
 function backupEyeDefinition() {
   const runtimeBinding = (side: 'L' | 'R') => ({
@@ -288,6 +299,18 @@ async function seedRepresentativeData(userId: string) {
     user_id: userId,
     title: 'Backup Chat'
   })
+  for (const [key, value] of Object.entries(DELEGATION_BACKUP_RECORDS)) {
+    await redis.set(key, value)
+  }
+  await redis.expire('subagent_thread:sess_1:researcher', 604800)
+  await redis.set(TRANSIENT_DELEGATION_KEYS[0], 'in-flight-lock-fixture')
+  await redis.expire(TRANSIENT_DELEGATION_KEYS[0], 185)
+  await redis.json.set(TRANSIENT_DELEGATION_KEYS[1], '$', {
+    userId,
+    sessionId: 'sess_1',
+    messageId: 'subagent_run_1'
+  })
+  await redis.expire(TRANSIENT_DELEGATION_KEYS[1], 1800)
   await redis.rPush('messages:sess_1', 'msg_1')
   await redis.json.set('message:sess_1:msg_1', '$', {
     id: 'msg_1',
@@ -612,6 +635,13 @@ describe('backupRestoreService', () => {
     expect(bundle.manifest.secrets.included).toBe(true)
     expect(bundle.manifest.secrets.excludedRecordCount).toBe(0)
     expect(bundle.manifest.contents.groups.find((group) => group.id === 'api-keys')?.recordCount).toBe(1)
+    const entries = unzipSync(bundle.bytes)
+    const recordKeys = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')).key)
+    for (const key of TRANSIENT_DELEGATION_KEYS) {
+      expect(recordKeys).not.toContain(key)
+    }
   })
 
   it('streams filesystem assets into a readable zip backup', async () => {
@@ -671,6 +701,21 @@ describe('backupRestoreService', () => {
       storage: 'filesystem',
       relativePath: 'images/photo.png'
     })
+    for (const [key, value] of Object.entries(DELEGATION_BACKUP_RECORDS)) {
+      expect(records.find((record) => record.key === key)).toMatchObject({
+        type: 'string',
+        value,
+        groupId: key.startsWith('subagent_thread:') ? 'chats' : 'prompts'
+      })
+    }
+    for (const key of TRANSIENT_DELEGATION_KEYS) {
+      expect(records.some((record) => record.key === key)).toBe(false)
+    }
+    // Remove the source copies so the following assertions prove restore hydrated the
+    // saved thread and editable prompts, without recreating live locks or credentials.
+    for (const key of [...Object.keys(DELEGATION_BACKUP_RECORDS), ...TRANSIENT_DELEGATION_KEYS]) {
+      await redis.del(key)
+    }
 
     const result = await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
 
@@ -692,6 +737,15 @@ describe('backupRestoreService', () => {
     const message = (await redis.json.get('message:sess_1:msg_1')) as Record<string, any>
     expect(message.user_id).toBe('target')
     expect(await redis.exists('api_keys:target:openai')).toBe(false)
+    for (const [key, value] of Object.entries(DELEGATION_BACKUP_RECORDS)) {
+      expect(await redis.get(key)).toBe(value)
+    }
+    const threadTtl = await redis.ttl('subagent_thread:sess_1:researcher')
+    expect(threadTtl).toBeGreaterThan(0)
+    expect(threadTtl).toBeLessThanOrEqual(604800)
+    for (const key of TRANSIENT_DELEGATION_KEYS) {
+      expect(await redis.exists(key)).toBe(false)
+    }
 
     const customProvider = (await redis.json.get('custom_provider:target:custom_alpha')) as Record<string, any>
     expect(customProvider.apiKeyEncrypted).toBeNull()

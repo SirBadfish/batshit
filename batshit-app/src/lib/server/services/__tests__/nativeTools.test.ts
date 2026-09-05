@@ -364,6 +364,59 @@ describe('nativeToolService hardening', () => {
     expect(result.mappedToolName).toBe('native_bash_execute')
   })
 
+  it('SA-111 P4: registers native_spawn_workers only when the run enables Workers', async () => {
+    // DL-111-09/12: the worker tool exists on a PRIMARY send and nowhere else. Absent
+    // context must fail closed, because every delegated run (subagent, worker) builds its
+    // tools through this same function — a default-on gate would break depth 1.
+    const baseContext = {
+      userId: 'josh',
+      projectPath: process.cwd(),
+      providerSettings: {
+        nativeTools: {
+          bashEnabled: false,
+          fetchZipEnabled: false,
+          dynamicMcpEnabled: false,
+          webSearchEnabled: false,
+          agentBrowserEnabled: false
+        }
+      }
+    }
+
+    const withoutWorkers = await nativeToolService.buildMode3NativeTools({ ...baseContext })
+    expect(withoutWorkers.tools.native_spawn_workers).toBeUndefined()
+
+    const explicitlyOff = await nativeToolService.buildMode3NativeTools({
+      ...baseContext,
+      workers: { enabled: false }
+    })
+    expect(explicitlyOff.tools.native_spawn_workers).toBeUndefined()
+
+    const withWorkers = await nativeToolService.buildMode3NativeTools({
+      ...baseContext,
+      workers: { enabled: true, parentMessageId: 'msg-1' }
+    })
+    expect(withWorkers.tools.native_spawn_workers).toBeDefined()
+  })
+
+  it.each([
+    { task: 'x'.repeat(20_001), role: 'researcher', refusal: 'Trim it or split the work.' },
+    { task: 'Research this', role: 'x'.repeat(81), refusal: 'It is a short label, not a brief.' }
+  ])('returns a readable Worker refusal for an oversized brief or label', async ({ task, role, refusal }) => {
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      sessionId: 'worker-limit-session',
+      agentId: 'worker-limit-parent',
+      workers: { enabled: true, parentMessageId: 'worker-limit-message' }
+    })
+    const workerTool = tools.native_spawn_workers as any
+    // Exercise the registered schema AND execution boundary. A zod length max would
+    // reject before the runner can explain the limit, even though direct runner tests pass.
+    const input = workerTool.inputSchema.parse({ workers: [{ task, role }] })
+    const result = await workerTool.execute(input)
+    expect(result).toMatchObject({ kind: 'workers', success: false, error: 'invalid_input', workers: [] })
+    expect(result.message).toContain(refusal)
+  })
+
   it('enforces Agent Settings bash policy mode for Mode 3 native tool calls', async () => {
     const { tools } = await nativeToolService.buildMode3NativeTools({
       userId: 'josh',

@@ -38,6 +38,7 @@ Workflow Subagents read Batshit's current payload fields:
 - `message_id`
 - `subagent_id`
 - `subagent_slug`
+- `subagent_thread_id`
 - `parent_agent_id`
 - `primary_agent_type`
 - `subagentPrompts`
@@ -51,3 +52,15 @@ Batshit treats slugs as exact user-owned names. It refuses collisions instead of
 After the workflow is configured and active, create an `n8n Workflow Subagent` in Batshit, paste the Production webhook URL, and assign it to an `API` or `CLI` Primary Agent.
 
 Batshit does not copy provider API keys into n8n. Keep n8n workflow credentials in n8n.
+
+## Conversation threads
+
+Batshit sends a `subagent_thread_id` with each Workflow Subagent call. A fresh call creates a new id; a resumed call reuses the current id for that Subagent in the chat. Both templates append it to the Redis Chat Memory session key:
+
+```text
+subagent_sessions:<session_id>:subagent:<subagent_slug>:<subagent_thread_id>
+```
+
+Keep the included seven-day `sessionTTL`. When a fresh call changes the id, the old n8n conversation is no longer used and expires after that time. Batshit backs up its current thread id, but it does not copy conversations stored in external n8n Redis.
+
+If you imported a template before thread control was added, re-import the current template and configure its credentials, or update the existing Redis Chat Memory node's key to include `subagent_thread_id` and set `sessionTTL` to `604800`. Updating Batshit alone does not edit an already-imported n8n workflow. A workflow that ignores the id may keep answering, but a fresh call will not reset its conversation.

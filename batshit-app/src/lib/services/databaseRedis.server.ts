@@ -40,10 +40,18 @@ import {
 import {
   buildDynamicMcpPromptBlock,
   buildMemoryPromptBlock,
+  buildSubagentGuidancePromptBlock,
   buildToolGuidanceZipPromptBlock,
   normalizeDynamicMcpPromptContent
 } from '$lib/utils/toolPromptInjection'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+import {
+  WORKERS_FEATURE_ENABLED,
+  WORKERS_MAX_CONCURRENT,
+  WORKERS_MAX_RUNS_PER_TURN,
+  resolveWorkersEnabled,
+  shouldCompileDelegationGuidance
+} from '$lib/utils/delegationCapabilities'
 import {
   computeMemoryCompileContext,
   type MemoryCompileContext
@@ -94,9 +102,15 @@ import { buildControlErrorDcmLines } from '$lib/utils/controlTags'
 import { summarizeControlInputSchema } from '$lib/services/controlSchemaSummary'
 import {
   appendManagedSubagentDynamicInfo,
-  buildManagedSubagentDynamicInfo
+  buildManagedSubagentDynamicInfo,
+  resolveManagedSubagentScope
 } from '$lib/server/services/subagentRuntimeScope'
-import { buildCliSubagentMcpToolReference } from '$lib/utils/cliSubagentToolNames'
+import { buildSubagentRosterCapabilityFragment } from '$lib/server/services/subagentRosterCapabilities'
+import { buildSubagentThreadStateKey } from '$lib/server/services/subagentThreads'
+import {
+  buildCliSubagentMcpToolReference,
+  buildCliWorkerSpawnToolReference
+} from '$lib/utils/cliSubagentToolNames'
 import { buildSubagentRuntimePrompt } from '$lib/utils/subagentRuntimePrompt'
 import { buildSkillSessionContextLines } from '$lib/server/services/skillSessionContext'
 import {
@@ -1456,6 +1470,26 @@ export class DatabaseService {
     })
   }
 
+  /**
+   * SA-111 P1 (DL-111-01) — the delegation guidance block. Same shape as the broker and
+   * memory guidance resolvers: stored Redis prompt first, packaged/code fallback second,
+   * runtime-scoped so an API primary is never taught the CLI call shape (or vice versa).
+   */
+  private async resolveSubagentGuidancePrompt(
+    agent: any,
+    runtimeFlavor: 'codex' | 'claude' | 'vercel'
+  ) {
+    const storedPrompt = await this.getRedisStringValue('batshit:subagent_guidance')
+    const fallbackPrompt = buildSubagentGuidancePromptBlock({ runtimeFlavor })
+    const prompt = storedPrompt?.trim() ? storedPrompt : fallbackPrompt
+    const scope = runtimeFlavorToScope(runtimeFlavor)
+    const scopedPrompt = applyPromptRuntimeScope(prompt, scope)
+    return replacePromptVariables(scopedPrompt, agent, {
+      ...(agent?.settings ?? {}),
+      runtime_flavor: runtimeFlavor
+    })
+  }
+
   private shouldInjectToolGuidance(context: {
     agent: any
     assignedSubagents?: any[]
@@ -2105,6 +2139,8 @@ export class DatabaseService {
     projectRules?: Record<string, any> | null
     fileReferences?: FileReferencePayload[]
     subagentDescriptions?: Record<string, string>
+    /** SA-111 P1 (DL-111-03): per-subagent `type; model; tools; skills; thread` facts. */
+    subagentCapabilityFragments?: Record<string, string>
     assignedSubagents?: any[]
     defaultWorkspacePath?: string | null
     nativeDynamicMcpEnabled?: boolean | null
@@ -2309,10 +2345,39 @@ export class DatabaseService {
           ? `; server: ${cliToolReference.serverName}; tool: ${cliToolReference.toolName}; full: ${cliToolReference.fullToolName}`
           : ''
         const label = displayName ? `${displayName} (${key}${toolSuffix})` : key
-        lines.push(cleanedDescription ? `- ${label}: ${cleanedDescription}` : `- ${label}`)
+        // SA-111 P1 (DL-111-03): capability facts trail the description so the primary can
+        // pick the right specialist instead of guessing from a name.
+        const capabilityFragment = options.subagentCapabilityFragments?.[key]?.trim() || ''
+        const capabilitySuffix = capabilityFragment ? ` \u2014 ${capabilityFragment}` : ''
+        lines.push(
+          cleanedDescription
+            ? `- ${label}: ${cleanedDescription}${capabilitySuffix}`
+            : `- ${label}${capabilitySuffix}`
+        )
       }
     } else {
       lines.push('- (none)')
+    }
+
+    // SA-111 P4 (DL-111-03): the workers line and the `spawn_workers` tool ship together —
+    // an agent told it has workers must actually have the tool, and an agent whose setting
+    // is off must be told so rather than left guessing. On a managed CLI lane the line
+    // carries the exact composed MCP name, the same AMD-111-01 rule the subagent lines use.
+    if (WORKERS_FEATURE_ENABLED) {
+      if (resolveWorkersEnabled(options.agentRecord)) {
+        const workerToolReference =
+          options.isCodexMode === true
+            ? buildCliWorkerSpawnToolReference(options.agentRecord)
+            : null
+        const workerToolSuffix = workerToolReference
+          ? `; tool: ${workerToolReference.fullToolName}`
+          : ''
+        lines.push(
+          `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel, ${WORKERS_MAX_RUNS_PER_TURN} per turn)${workerToolSuffix}`
+        )
+      } else {
+        lines.push('workers: disabled')
+      }
     }
 
     lines.push('')
@@ -2899,6 +2964,26 @@ export class DatabaseService {
       }
     }
 
+    // SA-111 P1 (DL-111-01): delegation guidance sits directly after the discovery block
+    // and before MEMORY INSTRUCTIONS, inside the Batshit zone. Primary agents lost this
+    // guidance at SA-008 (2025-12-04) when the specialty-based subagent description block
+    // was removed and nothing replaced it — the "Subagent Addon" prompt kept its Admin
+    // label but reached no compiler on any lane (F1/F2). Gated on having something to
+    // delegate to, so an agent with no subagents pays no bytes; stable-prefix bytes that
+    // move only when enablement or the stored prompt changes.
+    if (
+      shouldCompileDelegationGuidance({
+        hasSubagents: Array.isArray(assignedSubagents) && assignedSubagents.length > 0,
+        workersEnabled: resolveWorkersEnabled(agent)
+      })
+    ) {
+      const delegationPrompt = await this.resolveSubagentGuidancePrompt(agent, runtimeFlavor)
+      if (delegationPrompt.trim()) {
+        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+        mergedSystemPrompt += `==== SUBAGENTS & WORKERS (DELEGATION) ====\n\n${delegationPrompt}`
+      }
+    }
+
     // SA-104 P3: memory guidance is gated on per-agent memory enablement alone — the
     // inline <batshit-memory> save works without any broker family. Part of the stable
     // compiled prefix (DL-104-04): it changes only when enablement or the stored prompt
@@ -2958,10 +3043,32 @@ export class DatabaseService {
     // Compile system prompts and instructions for each subagent
     const subagentDescription: Record<string, string> = {}
     const subagentModels: Record<string, { provider?: string | null; model?: string | null }> = {}
+    // SA-111 P1 (DL-111-03): the capability fragment appended to each DCM roster line.
+    const subagentCapabilityFragments: Record<string, string> = {}
 
     if (assignedSubagents && assignedSubagents.length > 0) {
 
       const subAgentPrompt = await this.getRedisStringValue('batshit:sub_system_prompt')
+
+      // One gateway-registry read per compile, shared by every subagent's roster line, and
+      // only when a subagent actually has gateways to name.
+      let gatewayNames: Map<string, string> | null = null
+      const resolveGatewayNames = async (): Promise<Map<string, string>> => {
+        if (gatewayNames) return gatewayNames
+        const names = new Map<string, string>()
+        if (userId) {
+          try {
+            for (const gateway of await mcpGatewayService.list(userId)) {
+              if (gateway?.id) names.set(gateway.id, gateway.name?.trim() || gateway.id)
+            }
+          } catch (error) {
+            // A dangling id prints as the id itself, which is the honest thing to show.
+            console.warn('[buildDynamicInfoBlock] Failed to load gateway names for roster:', error)
+          }
+        }
+        gatewayNames = names
+        return names
+      }
 
       // SA-008 Phase 5: Simplified SA compilation
       // All SAs use the same compilation pattern - specialty-based logic removed
@@ -3010,11 +3117,21 @@ export class DatabaseService {
             `==== SKILLS & PROMPTS (AGENT ACCESS) ====\n\n${subagentSkillsCommandsLines.join('\n')}`
         }
 
+        const subagentScope = await resolveManagedSubagentScope({
+          userId: userId ?? '',
+          subagent: swf,
+          sessionId,
+          projectPath: options?.projectPath ?? agentDefaultProjectPath ?? null,
+        })
+        const subagentCapabilities = await getEnabledAgentSlashCapabilities(userId ?? '', swf.id)
+
         const subagentDynamicInfo = await buildManagedSubagentDynamicInfo({
           userId: userId ?? '',
           subagent: swf,
           sessionId,
           projectPath: options?.projectPath ?? agentDefaultProjectPath ?? null,
+          scope: subagentScope,
+          capabilities: subagentCapabilities,
         })
         subagentSystemPrompt = appendManagedSubagentDynamicInfo(
           subagentSystemPrompt,
@@ -3025,10 +3142,47 @@ export class DatabaseService {
 
         const saDescription = swf.description || `Subagent ${swf.displayName || swf.name || safeKey}`
         subagentDescription[safeKey] = saDescription
-        subagentModels[safeKey] = {
+        const subagentModel = {
           provider: swf.primary_model_provider ?? swf.settings?.primary_model_provider ?? null,
           model: swf.primary_model_name ?? swf.settings?.primary_model_name ?? null
         }
+        subagentModels[safeKey] = subagentModel
+
+        // `thread: resumable` means this subagent already holds prior context in THIS chat
+        // session, so a `thread: "resume"` call continues it instead of starting over.
+        //
+        // SA-111 P2: two owners, two keys. Batshit stores a managed API/CLI subagent's
+        // exchanges itself, while an n8n Workflow Subagent's conversation lives in n8n's own
+        // Redis — Batshit only holds the thread id that names it (DL-111-06). Reading the
+        // managed key for an n8n subagent would report `none` whenever n8n runs on a
+        // separate Redis, which is exactly the kind of confident-but-wrong roster fact the
+        // primary would act on.
+        let threadState: 'none' | 'resumable' = 'none'
+        if (sessionId) {
+          const threadKey = buildSubagentThreadStateKey(
+            sessionId,
+            safeKey,
+            subagentScope.subagentType
+          )
+          try {
+            threadState = (await redis.exists(threadKey)) ? 'resumable' : 'none'
+          } catch (error) {
+            console.warn('[buildDynamicInfoBlock] Failed to read subagent thread state:', error)
+          }
+        }
+
+        const needsGatewayNames =
+          subagentScope.subagentType !== 'n8n-workflow' &&
+          subagentScope.nativeToolSettings.dynamicMcpEnabled &&
+          subagentScope.resolvedGateways.length > 0
+        subagentCapabilityFragments[safeKey] = buildSubagentRosterCapabilityFragment({
+          scope: subagentScope,
+          capabilities: subagentCapabilities,
+          gatewayNames: needsGatewayNames ? await resolveGatewayNames() : new Map(),
+          model: subagentModel.model,
+          provider: subagentModel.provider,
+          threadState
+        })
       }
 
     }
@@ -3089,6 +3243,7 @@ export class DatabaseService {
           defaultWorkspacePath: defaultWorkspacePath ?? null,
           fileReferences: options?.fileReferences ?? [],
           subagentDescriptions: subagentDescription,
+          subagentCapabilityFragments,
           assignedSubagents,
           nativeDynamicMcpEnabled,
           previousSnapshot,

@@ -83,6 +83,7 @@ import {
   withHonestLocalCacheUsage,
 } from '$lib/server/services/apiProviderUsage'
 import type { NativeModeRequest } from '$lib/server/services/vercelBrain'
+import { buildDelegatedExecutionSummary } from '$lib/server/services/delegatedRunAccounting'
 import {
   initializeKeyspaceNotifications,
   setupSessionMonitoring,
@@ -123,6 +124,7 @@ import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
 import type { ClaudeRuntimeSettings } from '$lib/types/claude'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import { THINKING_INDICATOR } from '$lib/utils/thinkingIndicator'
 import { resolveMCPSelections } from '$lib/server/services/mcpSelectionResolver'
 import type { MCPSelectionResolution } from '$lib/server/services/mcpSelectionResolver'
@@ -1798,7 +1800,19 @@ function toolResultIndicatesFailure(result: unknown): boolean {
   }
 
   const record = parsed as Record<string, any>
-  return record.success === false || record.blocked === true
+  // SA-111: `status` is a failure signal ONLY on a delegated-run payload. This helper runs
+  // over every tool result through `inferToolStepSuccess`, and plenty of ordinary tools
+  // report the status of their SUBJECT rather than of the call — a CI run, a deployment, a
+  // queued job. `{ status: 'failed' }` there means the build failed, not the tool. The
+  // managed CLI bridge is why the check exists at all: `/api/subagents/managed-execute`
+  // returns `success: true` with the run's own `status`, unlike the API lane, which already
+  // sets `success: result.status === 'completed'`.
+  const isDelegatedRunPayload = record.kind === 'subagent' || record.kind === 'worker'
+  return (
+    record.success === false ||
+    record.blocked === true ||
+    (isDelegatedRunPayload && (record.status === 'failed' || record.status === 'timed_out'))
+  )
 }
 
 function extractToolResultErrorMessage(result: unknown): string | undefined {
@@ -4923,6 +4937,9 @@ async function handleBatshitAgentStream({
     agentSlug: agent.slug ?? null,
     // SA-104 P3: primary-agent sends of memory-enabled agents get the sys.memory.* refs.
     memoryControlsEnabled: resolveAgentMemoryEnabled(agent),
+    // SA-111 P4 (DL-111-11): the ONE place a primary send turns Workers on. Every
+    // delegated run leaves it unset, which is what enforces depth 1.
+    workersEnabled: resolveWorkersEnabled(agent),
     messages: streamMessages,
     model: modelId,
     mode4Style: mode4Style ?? undefined,
@@ -5064,6 +5081,7 @@ async function handleBatshitAgentStream({
       lastStreamText = normalizedFinishText || null
       finishSummary.text = normalizedFinishText
       finishSummary.intermediateSteps = filteredSteps
+      const delegated = buildDelegatedExecutionSummary(filteredSteps)
 
       // Safety: if a reasoning segment is still open, treat it as complete now.
       reasoningActive = false
@@ -5238,6 +5256,7 @@ async function handleBatshitAgentStream({
         voice: voiceMetadata,
         selectedTools,
         selectedGateways,
+        ...(delegated ? { delegated } : {}),
         ...(fallbackUsed
           ? {
               fallbackUsed: true,
@@ -5384,6 +5403,7 @@ async function handleBatshitAgentStream({
               Array.isArray(sanitizedToolSteps) && sanitizedToolSteps.length > 0
                 ? (sanitizedToolSteps as any[])
                 : null,
+            delegated,
             responseSummary: {
               content: { value: finalContent, confidence: 'exact' },
               usage: buildTokenUsage(
@@ -5455,6 +5475,7 @@ async function handleBatshitAgentStream({
               Array.isArray(sanitizedToolSteps) && sanitizedToolSteps.length > 0
                 ? (sanitizedToolSteps as any[])
                 : null,
+            delegated,
             responseSummary: {
               content: { value: finalContent, confidence: 'exact' },
               usage: buildTokenUsage(

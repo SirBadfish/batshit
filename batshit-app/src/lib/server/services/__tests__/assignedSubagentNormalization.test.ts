@@ -10,6 +10,7 @@ describe('normalizeAssignedSubagent', () => {
       subagentType: 'cli',
       primary_model_provider: 'openai-codex',
       primary_model_name: 'codex-cli',
+      timeout_seconds: 240,
       provider_specific_settings: {
         codex_model: 'gpt-5.4',
       },
@@ -31,6 +32,8 @@ describe('normalizeAssignedSubagent', () => {
     expect(normalized.provider_specific_settings).toMatchObject({
       codex_model: 'gpt-5.4',
     })
+    expect(normalized.timeout_seconds).toBe(240)
+    expect(normalized.settings.timeout_seconds).toBe(240)
     expect(normalized.settings.codex_settings).toMatchObject({
       model: 'gpt-5.4',
     })

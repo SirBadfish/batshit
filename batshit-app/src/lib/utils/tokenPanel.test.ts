@@ -184,6 +184,111 @@ describe('tokenPanel utilities', () => {
     expect(summary.cost).toBeCloseTo(0.00996, 5)
   })
 
+  it('adds delegated usage at each run model price without changing context pressure', () => {
+    const model = buildModel()
+    const agent = buildAgent()
+    const delegatedModel: SavedModel = {
+      ...buildModel(),
+      id: 'delegated-model',
+      provider: 'openai',
+      modelId: 'gpt-5.4',
+      modelName: 'GPT-5.4',
+      pricing: { input: 2, output: 10, cachedInput: 1 },
+    }
+    const snapshot = buildSnapshot({
+      delegated: {
+        runs: [
+          {
+            kind: 'subagent',
+            name: 'API Helper',
+            type: 'api',
+            model: 'gpt-5.4',
+            provider: 'openai',
+            usage: {
+              inputTokens: 1000,
+              outputTokens: 500,
+              totalTokens: 1500,
+              cachedInputTokens: 200,
+            },
+            durationMs: 2000,
+            status: 'completed',
+            thread: 'fresh',
+          },
+        ],
+        totals: {
+          runs: 1,
+          completed: 1,
+          failed: 0,
+          timedOut: 0,
+          usageKnownRuns: 1,
+          usageUnknownRuns: 0,
+          usage: { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
+        },
+      },
+    })
+
+    const cost = summarizeRunningCost(
+      [snapshot],
+      model,
+      agent,
+      [model, delegatedModel],
+    )
+    const context = summarizeContextUsage({
+      messages: [buildMessage('m1', 'visible chat')],
+      snapshots: [snapshot],
+      activeModel: model,
+      agent,
+    })
+
+    expect(cost.state).toBe('exact')
+    expect(cost.delegatedTokens).toBe(1500)
+    expect(cost.delegatedCost).toBeCloseTo(0.0068, 6)
+    expect(cost.cost).toBeCloseTo(0.01676, 6)
+    expect(context.displayTokens).toBe(1000)
+  })
+
+  it('marks delegated cost estimated when any recorded run has unknown usage', () => {
+    const model = buildModel()
+    const summary = summarizeRunningCost(
+      [
+        buildSnapshot({
+          delegated: {
+            runs: [
+              {
+                kind: 'subagent',
+                name: 'Workflow Helper',
+                type: 'n8n-workflow',
+                model: null,
+                provider: null,
+                usage: null,
+                durationMs: 42_000,
+                status: 'completed',
+                thread: 'fresh',
+              },
+            ],
+            totals: {
+              runs: 1,
+              completed: 1,
+              failed: 0,
+              timedOut: 0,
+              usageKnownRuns: 0,
+              usageUnknownRuns: 1,
+              usage: null,
+            },
+          },
+        }),
+      ],
+      model,
+      buildAgent(),
+      [model],
+    )
+
+    expect(summary.state).toBe('estimated')
+    expect(summary.delegatedTokens).toBeNull()
+    expect(summary.delegatedCost).toBeNull()
+    expect(summary.delegatedUsageUnknownRuns).toBe(1)
+  })
+
   it('downgrades running cost confidence when runtime identity no longer matches the active model', () => {
     const model = buildModel()
     const agent = buildAgent()

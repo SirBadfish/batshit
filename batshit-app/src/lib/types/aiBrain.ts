@@ -89,9 +89,9 @@ export interface ThoughtResponse {
 
   /** Token usage statistics */
   usage?: {
-    promptTokens: number
-    completionTokens: number
-    totalTokens: number
+    promptTokens?: number
+    completionTokens?: number
+    totalTokens?: number
     /** Structured image-input token estimate; raw data URLs must not appear in text context. */
     imageTokens?: number
     /** Provider-reported prompt-cache read tokens, when the provider reported them. */

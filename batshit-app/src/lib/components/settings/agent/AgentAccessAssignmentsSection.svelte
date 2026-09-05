@@ -21,6 +21,11 @@
     compatibleSubagentTypesLabel: string
     assignmentSaveState: SaveState
     assignmentSaveError: string | null
+    /** SA-111 P4 (DL-111-11): may this Primary Agent spawn Workers? */
+    workersEnabled: boolean
+    workersMaxConcurrent: number
+    workersMaxRunsPerTurn: number
+    onWorkersEnabledChange: (enabled: boolean) => void
     accessSaveState: SaveState
     accessSaveError: string | null
     accessSaveScope: string
@@ -61,6 +66,10 @@
     compatibleSubagentTypesLabel,
     assignmentSaveState,
     assignmentSaveError,
+    workersEnabled,
+    workersMaxConcurrent,
+    workersMaxRunsPerTurn,
+    onWorkersEnabledChange,
     accessSaveState,
     accessSaveError,
     accessSaveScope,
@@ -111,6 +120,24 @@
       savedLabel="Saved"
     />
   {/snippet}
+  <div class="batshit-settings-form-stack">
+    <div class="batshit-settings-toggle-row is-spine-toggle">
+      <div class="batshit-settings-form-label-line">
+        <span class="batshit-settings-parent-label">Workers</span>
+        <SettingsInfoMenu ariaLabel="About Workers">
+          Workers are throwaway helpers this agent can start on its own for one task, then
+          read the result. They borrow this agent's model and tools, remember nothing, and
+          cannot start more workers. It can also run a fresh copy of an assigned Subagent.
+          Limits: {workersMaxConcurrent} at a time, {workersMaxRunsPerTurn} per response.
+        </SettingsInfoMenu>
+      </div>
+      <Switch.Root
+        checked={workersEnabled}
+        onCheckedChange={(checked) => onWorkersEnabledChange(checked === true)}
+      />
+    </div>
+  </div>
+
   {#if subagentsLoading}
     <div class="flex items-center gap-2 text-sm text-muted-foreground">
       <Loader2 class="h-4 w-4 animate-spin" />

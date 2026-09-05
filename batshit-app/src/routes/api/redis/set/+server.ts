@@ -21,10 +21,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             'batshit:batshit_mode4_system_prompt',
             // Base SA prompts
             'batshit:sub_system_prompt',
-            'batshit:subagent_instructions',
+            'batshit:worker_prompt',
+            'batshit:subagent_guidance',
             // Tool + zip guidance prompts
             'batshit:tool_guidance_zip_enabled_prompt',
             'batshit:tool_guidance_zip_disabled_prompt',
+            'batshit:tool_guidance_memory_prompt',
             'batshit:dynamic_mcp_prompt',
             // Legacy keys (kept for backward compatibility)
             'batshit:batshit_primary_system_prompt',
@@ -34,9 +36,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             'batshit:batshit_mode3_system_prompt:last_updated',
             'batshit:batshit_mode4_system_prompt:last_updated',
             'batshit:sub_system_prompt:last_updated',
-            'batshit:subagent_instructions:last_updated',
+            'batshit:worker_prompt:last_updated',
+            'batshit:subagent_guidance:last_updated',
             'batshit:tool_guidance_zip_enabled_prompt:last_updated',
             'batshit:tool_guidance_zip_disabled_prompt:last_updated',
+            'batshit:tool_guidance_memory_prompt:last_updated',
             'batshit:dynamic_mcp_prompt:last_updated',
             'batshit:batshit_primary_system_prompt:last_updated',
             'batshit:primary_system_prompt:last_updated',

@@ -807,8 +807,38 @@ const compactUnavailableReason = $derived.by(() => {
   return 'Compact is available.'
 })
 const runningCost = $derived.by(() =>
-  summarizeRunningCost(executionSnapshots, activeModelPreset, agentStore.getCurrentAgent())
+  summarizeRunningCost(
+    executionSnapshots,
+    activeModelPreset,
+    agentStore.getCurrentAgent(),
+    savedModels
+  )
 )
+const delegatedCostDetail = $derived.by(() => {
+  if (runningCost.delegatedRunCount <= 0) return null
+  const tokens =
+    runningCost.delegatedTokens === null
+      ? 'Unknown tokens'
+      : `${Math.round(runningCost.delegatedTokens).toLocaleString()} tokens`
+  const cost =
+    runningCost.delegatedCost === null
+      ? 'Unknown cost'
+      : runningCost.delegatedCost.toLocaleString(undefined, {
+          style: 'currency',
+          currency: 'USD',
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 4,
+        })
+  const unknownRuns = Math.max(
+    runningCost.delegatedUsageUnknownRuns,
+    runningCost.delegatedCostUnknownRuns
+  )
+  const incomplete =
+    unknownRuns > 0
+      ? ` (${unknownRuns} ${unknownRuns === 1 ? 'run has' : 'runs have'} incomplete usage or pricing)`
+      : ''
+  return `Delegated (subagents/workers): ${tokens} · ${cost}${incomplete}`
+})
 // SA-093 P7: cache/speed strip stats from the LATEST assistant message only.
 // Older responses never stand in for the latest one (DL-093-14 honesty rule);
 // a missing metric renders as an explicit unknown in TokenPanel.
@@ -7054,6 +7084,7 @@ const immersiveActive = $derived.by(
                 : runningCost.note
           }
           costState={runningCost.state}
+          delegatedDetail={delegatedCostDetail}
           onTrim={handleTrim}
           onResetTrim={handleResetTrim}
           onCompact={() => handleCompact()}

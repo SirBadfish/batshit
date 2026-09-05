@@ -66,6 +66,7 @@ export function createSubagentStore() {
       model?: string;
       primary_model_provider?: string;
       primary_model_name?: string;
+      timeout_seconds?: number;
       primary_model_temperature?: number;
       primary_model_max_tokens?: number;
       primary_model_top_p?: number;
@@ -118,6 +119,7 @@ export function createSubagentStore() {
       model?: string;
       primary_model_provider?: string;
       primary_model_name?: string;
+      timeout_seconds?: number | null;
       primary_model_temperature?: number;
       primary_model_max_tokens?: number;
       primary_model_top_p?: number;

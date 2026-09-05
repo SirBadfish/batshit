@@ -1,24 +1,6 @@
-export type ApiUsageLike =
-  | {
-      inputTokens?: number | undefined
-      outputTokens?: number | undefined
-      totalTokens?: number | undefined
-      reasoningTokens?: number | undefined
-      cachedInputTokens?: number | undefined
-      cacheCreationInputTokens?: number | undefined
-      inputTokenDetails?:
-        | {
-            cacheReadTokens?: number | undefined
-          }
-        | undefined
-      outputTokenDetails?:
-        | {
-            reasoningTokens?: number | undefined
-          }
-        | undefined
-    }
-  | null
-  | undefined
+import type { DelegatedUsage } from '$lib/types/delegation'
+
+export type ApiUsageLike = DelegatedUsage | null | undefined
 
 export function coerceTokenCount(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {

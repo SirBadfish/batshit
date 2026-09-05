@@ -309,14 +309,50 @@ describe('codexProfileManager dynamic-only managed config', () => {
       'MCP_GATEWAY_AUTH_TOKEN',
       'REDIS_URL',
       'REDIS_CONNECTION_STRING',
-	      'REDIS_PASSWORD',
-	      'BATSHIT_FRONTEND_URL',
-	      'PUBLIC_BASE_URL',
-	      'ORIGIN',
-	      'BATSHIT_SESSION_ID',
-	      'BATSHIT_MANAGED_SUBAGENT_TIMEOUT_MS'
-	    ])
+      'REDIS_PASSWORD',
+      'BATSHIT_FRONTEND_URL',
+      'PUBLIC_BASE_URL',
+      'ORIGIN',
+      'BATSHIT_SESSION_ID',
+      // SA-111 P4: the parent turn id, so the bridge can pass it to the Workers cap.
+      'BATSHIT_MESSAGE_ID'
+    ])
     expect(subagentServer?.default_tools_approval_mode).toBe('approve')
+    // SA-111 P4: the same bridge carries the Workers batch tool; Workers default ON.
+    expect(subagentServer?.enabled_tools).toEqual(['subagent_subagent_1', 'spawn_workers'])
+  })
+
+  it('SA-111 P4: a workers-disabled agent gets the bridge without the spawn tool', async () => {
+    // DL-111-11: the toggle is real. An agent with Workers off must not be advertised a
+    // tool it will be refused server-side — that mismatch, in reverse, is finding F1.
+    const agent = buildCodexAgent({
+      assigned_subagent_ids: ['subagent-1'],
+      workers_enabled: false
+    })
+
+    mockRedis.getAgents.mockResolvedValue([agent])
+    mockGatewayService.list.mockResolvedValue([])
+    mockResolveMCPSelections.mockResolvedValue({
+      resolvedGateways: [],
+      defaultGateways: [],
+      resolvedToolSelections: [],
+      tools: {},
+      toolMetadata: new Map(),
+      gatewayToolMap: {}
+    })
+
+    const { syncAgentCodexProfiles, buildAgentProfileId } = await import('../codexProfileManager')
+    await syncAgentCodexProfiles('josh')
+
+    const profileId = buildAgentProfileId(agent.id)
+    const configPath = path.join(tempHome, '.batshit', 'agents', profileId, '.codex', 'config.toml')
+    const parsed = parseToml(await readFile(configPath, 'utf8')) as Record<string, any>
+    const subagentServer = Object.values(parsed.mcp_servers ?? {}).find((server: any) =>
+      Array.isArray(server.args) &&
+      server.args.some((arg: string) => arg.includes('codex-subagent-mcp.cjs'))
+    ) as Record<string, any> | undefined
+
+    expect(subagentServer).toBeTruthy()
     expect(subagentServer?.enabled_tools).toEqual(['subagent_subagent_1'])
   })
 
@@ -361,7 +397,7 @@ describe('codexProfileManager dynamic-only managed config', () => {
     expect(config).toContain('default_tools_enabled = false')
     expect(subagentServer).toBeTruthy()
     expect(subagentServer?.default_tools_approval_mode).toBe('approve')
-    expect(subagentServer?.enabled_tools).toEqual(['subagent_subagent_legacy'])
+    expect(subagentServer?.enabled_tools).toEqual(['subagent_subagent_legacy', 'spawn_workers'])
   })
 
   it('writes GPT-5.5 fast service tier and string web-search mode for managed Codex agents', async () => {

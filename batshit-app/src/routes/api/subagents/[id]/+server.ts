@@ -23,6 +23,10 @@ import {
   isWorkflowBackedSubagentType,
   normalizeSubagentType,
 } from '$lib/utils/subagentType'
+import {
+	getSubagentTimeoutValidationError,
+	normalizeSubagentTimeoutSeconds,
+} from '$lib/utils/subagentTimeout'
 
 // GET /api/subagents/[id] - Get a specific subagent
 export const GET: RequestHandler = async ({ params, locals }) => {
@@ -132,11 +136,19 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 		if (claudeValidationError) {
 			return json({ error: claudeValidationError }, { status: 400 })
 		}
+
+		const timeoutValidationError = getSubagentTimeoutValidationError(updates.timeout_seconds)
+		if (timeoutValidationError) {
+			return json({ error: timeoutValidationError }, { status: 400 })
+		}
 		
 		// Update subagent
 		const updated = canonicalizeSubagentRecord({
 			...existing,
 			...updates,
+			...(Object.prototype.hasOwnProperty.call(updates, 'timeout_seconds')
+				? { timeout_seconds: normalizeSubagentTimeoutSeconds(updates.timeout_seconds) }
+				: {}),
 			...(Object.prototype.hasOwnProperty.call(updates, 'avatar_icon_ref')
 				? { avatar_icon_ref: normalizeOptionalIconRefInput(updates.avatar_icon_ref, 'avatar_icon_ref') }
 				: {}),

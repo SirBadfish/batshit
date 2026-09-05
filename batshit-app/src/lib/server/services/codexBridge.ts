@@ -162,6 +162,8 @@ interface CodexRunOptions {
   unifiedExec: boolean;
   imagePaths?: string[];
   sessionId?: string | null;
+  /** SA-111 P4: the parent turn's message id, exported to managed STDIO bridges. */
+  messageId?: string | null;
   promptCacheKey?: string | null;
   developerInstructions?: string | null;
   nativeSkillDisablePaths?: string[];
@@ -645,6 +647,7 @@ export class CodexBridge {
       modelSupportsReasoningSummaries: codexSettings.modelSupportsReasoningSummaries,
       signal: request.abortSignal,
       sessionId: request.sessionId ?? null,
+      messageId: request.messageId ?? null,
       promptCacheKey:
         configScope === "managed"
           ? buildManagedCodexPromptCacheKey({
@@ -1142,6 +1145,12 @@ export class CodexBridge {
     }
     if (options.sessionId) {
       childEnv.BATSHIT_SESSION_ID = options.sessionId;
+    }
+    // SA-111 P4: the managed STDIO bridges need the parent TURN, not just the session, so
+    // the Worker per-turn cap counts against the right thing. The Claude bridge already
+    // exported this for the approval helper.
+    if (options.messageId) {
+      childEnv.BATSHIT_MESSAGE_ID = options.messageId;
     }
     for (const [key, value] of Object.entries(options.managedStdioEnv ?? {})) {
       childEnv[key] = value;

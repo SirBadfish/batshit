@@ -9,7 +9,8 @@ export type CoreSystemPromptId =
   | 'api_primary'
   | 'cli_primary'
   | 'subagent_base'
-  | 'subagent_addon'
+  | 'worker_prompt'
+  | 'subagent_guidance'
   | 'tool_guidance_zip_enabled'
   | 'tool_guidance_zip_disabled'
   | 'tool_guidance_memory'
@@ -85,13 +86,26 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     defaultVersion: '2026-05-22'
   },
   {
-    id: 'subagent_addon',
-    redisKey: 'batshit:subagent_instructions',
-    label: 'Subagent Addon',
-    description: 'Text shown to primary agents explaining when and how to use subagents.',
+    id: 'worker_prompt',
+    redisKey: 'batshit:worker_prompt',
+    label: 'Worker System Prompt',
+    description:
+      'Base instructions for throwaway Workers a primary agent spawns for one task. Separate from the Subagent System Prompt because a worker is ephemeral and memory-less.',
     warning: COMMON_CORE_PROMPT_WARNING,
-    defaultFile: 'batshit_subagent_addon.md',
-    defaultVersion: '2026-05-22'
+    defaultFile: 'batshit_worker_prompt.md',
+    defaultVersion: '2026-09-04'
+  },
+  {
+    id: 'subagent_guidance',
+    redisKey: 'batshit:subagent_guidance',
+    label: 'Subagent & Worker Guidance',
+    description:
+      'Tells primary agents when and how to delegate to subagents and workers, including thread control and limits.',
+    warning: COMMON_CORE_PROMPT_WARNING,
+    defaultFile: 'batshit_subagent_guidance.md',
+    // SA-111 P2 bumped this for the fresh/resume/reset rule; P4 bumps it again so an
+    // uncustomized copy picks up the Workers section on boot.
+    defaultVersion: '2026-09-05'
   },
   {
     id: 'tool_guidance_zip_enabled',
@@ -133,6 +147,26 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
 
 const definitionById = new Map(CORE_SYSTEM_PROMPTS.map((definition) => [definition.id, definition]))
 const PROMPT_DEFAULTS_DIRNAME = 'batshit_System_Prompts'
+
+/**
+ * SA-111 P1 (DL-111-02) — keys retired with their registry entry. `subagent_addon`
+ * ("Subagent Addon", `batshit:subagent_instructions`) claimed in Admin to tell primary
+ * agents when and how to use subagents, but no compiler had read it since SA-008
+ * (2025-12-04); its only live reader was the CLI bridge, which handed the whole ~5 KB
+ * document to one MCP tool as its description. Delegation guidance now has its own
+ * `subagent_guidance` block. Clean break: the stale value, its timestamp, and its
+ * metadata are deleted on startup with a visible log line — no compatibility shim.
+ */
+const RETIRED_SYSTEM_PROMPT_KEYS: Array<{ label: string; keys: string[] }> = [
+  {
+    label: 'subagent_addon (batshit:subagent_instructions)',
+    keys: [
+      'batshit:subagent_instructions',
+      'batshit:subagent_instructions:last_updated',
+      'batshit:system_prompt_meta:subagent_addon'
+    ]
+  }
+]
 
 function promptMetaKey(id: CoreSystemPromptId) {
   return `batshit:system_prompt_meta:${id}`
@@ -300,6 +334,34 @@ async function ensurePromptValue(definition: PromptDefinition, defaultValue: str
 
 export function listCoreSystemPromptDefinitions() {
   return [...CORE_SYSTEM_PROMPTS]
+}
+
+/**
+ * Startup sweep for prompt keys whose registry entry was retired (DL-111-02). Runs beside
+ * the retired-system-clip sweep in `hooks.server.ts`. Deleting is deliberate: a stale
+ * Redis value with no registry entry is unreachable from Admin and unreadable by any
+ * compiler, so leaving it behind is dead data that looks live in a Redis dump.
+ */
+export async function removeRetiredSystemPrompts() {
+  const removed: string[] = []
+
+  for (const entry of RETIRED_SYSTEM_PROMPT_KEYS) {
+    let removedForEntry = 0
+    for (const key of entry.keys) {
+      if (!(await redis.exists(key))) continue
+      await redis.del(key)
+      removedForEntry += 1
+    }
+    if (removedForEntry > 0) {
+      removed.push(`${entry.label} (${removedForEntry} key${removedForEntry === 1 ? '' : 's'})`)
+    }
+  }
+
+  if (removed.length > 0) {
+    console.info(`[SystemPrompts] Removed retired core system prompt(s): ${removed.join(', ')}`)
+  }
+
+  return { removed }
 }
 
 export async function checkCoreSystemPromptDefaults() {

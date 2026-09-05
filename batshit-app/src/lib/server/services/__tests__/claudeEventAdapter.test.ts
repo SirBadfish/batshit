@@ -35,6 +35,52 @@ afterEach(() => {
 })
 
 describe('ClaudeEventAdapter', () => {
+  it("SA-111 P4 (AMD-111-03): labels Claude Code's own Agent helper distinctly", async () => {
+    // F8, confirmed live in P0: Claude Code's native `Agent` tool runs inside Batshit and
+    // used to render as a Batshit "Subagent" card. It is neither a Batshit Subagent nor a
+    // Batshit Worker — it has no Batshit thread control, caps, or delegated accounting —
+    // so a user must be able to tell the three apart.
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+
+    async function* mockEvents() {
+      yield {
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              id: 'agent-1',
+              name: 'Agent',
+              input: { description: 'list entries', subagent_type: 'Explore' }
+            }
+          ]
+        }
+      }
+      yield {
+        type: 'user',
+        message: {
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'agent-1',
+              content: [{ type: 'text', text: 'src/, docs/, README.md' }]
+            }
+          ]
+        }
+      }
+      yield { type: 'result', usage: { input_tokens: 4, output_tokens: 6 } }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents()))
+    const resultChunk = chunks.find((chunk) => chunk.type === 'tool-result')
+
+    expect(resultChunk?.metadata?.isSubagent).toBe(false)
+    expect(resultChunk?.metadata?.toolProvider).toBe('claude')
+    expect(resultChunk?.metadata?.displayToolName).toBe('Claude Code Helper')
+    // Pinned so nothing downstream can promote it into the subagent renderer family.
+    expect(resultChunk?.metadata?.metadata?.operationKind).toBe('unknown_tool')
+  })
+
   it('normalizes built-in web search into the web_search lane', async () => {
     const adapter = new ClaudeEventAdapter({
       request: buildRequest(),

@@ -47,6 +47,42 @@ function buildRuntimeSpecificLines(type: ReturnType<typeof normalizeSubagentType
   }
 }
 
+/**
+ * SA-111 P4 (DL-111-10) — the worker case. A Worker is not a subagent: it is ephemeral,
+ * memory-less, and cannot be steered mid-run, so it gets its OWN runtime block rather than
+ * the subagent one. The base system prompt is `batshit:worker_prompt` for the same reason
+ * (the subagent base prompt tells its reader that subagent memory persists, which is false
+ * for a worker) — that was the judgment call DL-111-10 left to this packet.
+ *
+ * `baseLabel` is set only for a `base` clone, so the run knows which specialist it is a
+ * throwaway copy of; `lane` follows that specialist, or the parent for a general worker.
+ */
+export function buildWorkerRuntimePrompt(options: {
+  lane: 'api' | 'cli'
+  role?: string | null
+  baseLabel?: string | null
+}): string {
+  const role = typeof options.role === 'string' ? options.role.trim() : ''
+  const baseLabel = typeof options.baseLabel === 'string' ? options.baseLabel.trim() : ''
+
+  return [
+    '==== WORKER RUNTIME CONTEXT ====',
+    'type: worker (Worker)',
+    ...(role ? [`role: ${role}`] : []),
+    ...(baseLabel
+      ? [
+          `based_on: ${baseLabel}. You are a throwaway copy of that subagent — same prompt, model, tools, and skills, but no memory of its past calls.`,
+        ]
+      : []),
+    `runtime: Batshit ephemeral worker run on the ${options.lane === 'cli' ? 'managed CLI' : 'direct API'} lane, inheriting ${baseLabel ? "the named specialist's" : "the Primary Agent's"} model and tool scope.`,
+    'tool_surface: use only the tools shown in your runtime context. Batshit control-plane (Fabric) actions, memory tools, subagents, and worker spawning are deliberately unavailable to you.',
+    'memory: none. Nothing from an earlier run is loaded, and nothing you write here is stored for a later one.',
+    'limits: one shot, no approval pauses, bounded tool rounds (normally 10), and a hard time limit. Return your result before you run out of room rather than stopping mid-thought.',
+    'caller: a Batshit Primary Agent spawned you for this single task. Return your result to that Primary Agent.',
+    'return: the finished answer for the delegated task plus the evidence behind it. If a tool or policy fails, say so plainly and do not describe it as completed.',
+  ].join('\n')
+}
+
 export function buildSubagentRuntimePrompt(
   subagent?: RuntimePromptSubagent | null,
   explicitType?: unknown,

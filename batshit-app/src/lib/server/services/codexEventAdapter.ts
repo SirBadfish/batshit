@@ -910,14 +910,19 @@ export class CodexEventAdapter {
       case "mcp_tool_call": {
         const toolName = `mcp.${item.server}.${item.tool}`;
         const isSubagentCall = hasSubagentToolSegment(toolName);
+        const input =
+          item.arguments && typeof item.arguments === "object" && !Array.isArray(item.arguments)
+            ? item.arguments as Record<string, unknown>
+            : {};
         const args = isSubagentCall
           ? {
-              // Flatten to the standard subagent arg shape so CallSubagentRenderer
-              // can display the request cleanly.
+              // Normalize the displayed request without dropping supplied fields
+              // such as thread from tool events and Execution Viewer evidence.
+              ...input,
               chatInput:
-                (item.arguments as any)?.chatInput ??
-                (item.arguments as any)?.prompt ??
-                (item.arguments as any)?.input ??
+                input.chatInput ??
+                input.prompt ??
+                input.input ??
                 item.arguments,
             }
           : { arguments: item.arguments };

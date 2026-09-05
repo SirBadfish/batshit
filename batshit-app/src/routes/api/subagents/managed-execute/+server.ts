@@ -11,9 +11,13 @@ import {
 } from '$lib/utils/subagentType'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
 import { executeManagedSubagent } from '$lib/server/services/subagentRunner'
-
-const DEFAULT_TIMEOUT_MS = 120000
-const MAX_TIMEOUT_MS = 10 * 60 * 1000
+import {
+  isSubagentBusyError,
+  normalizeSubagentThreadMode,
+} from '$lib/server/services/subagentThreads'
+import { spawnWorkers } from '$lib/server/services/workerRunner'
+import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
+import { resolveCliSubagentRuntime } from '$lib/server/services/cliSubagentModelResolution'
 
 type ManagedExecuteBody = {
   agentId?: unknown
@@ -21,13 +25,28 @@ type ManagedExecuteBody = {
   sessionId?: unknown
   chatInput?: unknown
   projectPath?: unknown
-  timeoutMs?: unknown
+  /** SA-111 P2 (DL-111-04): `'fresh'` (default) or `'resume'`. */
+  thread?: unknown
   /** Optional parent send message id (SA-093 forensics correlation). */
   messageId?: unknown
+  /**
+   * SA-111 P4 (DL-111-09) — worker mode. When present, this is a `spawn_workers` batch
+   * from the CLI bridge rather than a subagent call: no `subagentId`, no thread, and the
+   * caps/validation live in `workerRunner`.
+   */
+  workers?: unknown
 }
 
 function readString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
+}
+
+/** `null` (not `[]`) when the field is absent: `[]` means "none selected", not "unset". */
+function normalizeIdList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  return value
+    .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+    .filter((entry) => entry.length > 0)
 }
 
 function jsonError(status: number, code: string, message: string) {
@@ -57,12 +76,6 @@ async function isAssigned(agentId: string, subagentId: string, agent: AgentRow) 
   }
 }
 
-function normalizeTimeoutMs(value: unknown): number {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_TIMEOUT_MS
-  return Math.min(Math.floor(parsed), MAX_TIMEOUT_MS)
-}
-
 function toolSourceFor(subagentType: SubagentType) {
   if (subagentType === 'cli') return 'managed-cli-subagent'
   if (subagentType === 'api') return 'managed-api-subagent'
@@ -77,28 +90,6 @@ function statusForExecutionError(message: string) {
   if (lower.includes('production webhook url')) return 400
   if (lower.includes('must point to either codex cli or claude cli')) return 400
   return 500
-}
-
-async function executeWithTimeout<T>(
-  work: (abortSignal: AbortSignal) => Promise<T>,
-  timeoutMs: number
-): Promise<T> {
-  const controller = new AbortController()
-  let timeout: ReturnType<typeof setTimeout> | undefined
-
-  try {
-    return await Promise.race([
-      work(controller.signal),
-      new Promise<T>((_, reject) => {
-        timeout = setTimeout(() => {
-          controller.abort()
-          reject(new Error(`Managed subagent execution timed out after ${timeoutMs}ms.`))
-        }, timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timeout) clearTimeout(timeout)
-  }
 }
 
 export const POST: RequestHandler = async ({ request }) => {
@@ -124,9 +115,17 @@ export const POST: RequestHandler = async ({ request }) => {
   const chatInput = typeof body.chatInput === 'string' ? body.chatInput : ''
   const projectPath = readString(body.projectPath) || null
   const parentMessageId = readString(body.messageId) || null
-  const timeoutMs = normalizeTimeoutMs(body.timeoutMs)
+  const thread = normalizeSubagentThreadMode(body.thread)
+  // SA-111 P4: one route, two modes. Worker mode is chosen by the presence of `workers`,
+  // never by a caller-supplied discriminator, so a malformed subagent call can never be
+  // reinterpreted as a worker batch.
+  const isWorkerMode = Array.isArray(body.workers)
 
-  if (!agentId || !subagentId || !sessionId || typeof body.chatInput !== 'string') {
+  if (!agentId || !sessionId) {
+    return jsonError(400, 'missing_fields', 'Managed execution requires agentId and sessionId.')
+  }
+
+  if (!isWorkerMode && (!subagentId || typeof body.chatInput !== 'string')) {
     return jsonError(
       400,
       'missing_fields',
@@ -153,6 +152,68 @@ export const POST: RequestHandler = async ({ request }) => {
   const primaryAgentType = normalizePrimaryAgentType(agent)
   if (primaryAgentType !== 'cli') {
     return jsonError(400, 'invalid_primary_type', 'Only CLI Primary Agents can use this managed bridge route.')
+  }
+
+  if (isWorkerMode) {
+    // DL-111-11: the per-agent setting is the gate, checked server-side. A bridge listing
+    // built before the toggle changed must never be able to run a worker.
+    if (!resolveWorkersEnabled(agent)) {
+      return json({
+        kind: 'workers',
+        success: false,
+        error: 'workers_disabled',
+        message: 'Workers are turned off for this Primary Agent in Batshit Agent Settings.',
+        workers: [],
+      })
+    }
+
+    const agentRecord = agent as AgentRow & Record<string, any>
+    // DL-111-10: a built-in CLI worker follows the parent's runtime family, so it needs the
+    // same model fields a CLI Subagent resolves its Codex/Claude lane from.
+    const cliModelFields = {
+      primary_model_provider: agentRecord.primary_model_provider ?? undefined,
+      primary_model_name: agentRecord.primary_model_name ?? undefined,
+      model: agentRecord.model ?? undefined,
+      codex_settings: agentRecord.codex_settings ?? undefined,
+      claude_settings: agentRecord.claude_settings ?? undefined,
+    }
+    if (!resolveCliSubagentRuntime(cliModelFields)) {
+      return json({
+        kind: 'workers',
+        success: false,
+        error: 'invalid_context',
+        message:
+          'This CLI Primary Agent has no resolvable Codex or Claude model, so a worker cannot inherit its runtime.',
+        workers: [],
+      })
+    }
+
+    const result = await spawnWorkers({
+      parent: {
+        userId,
+        sessionId,
+        parentAgentId: agentId,
+        parentMessageId,
+        projectPath,
+        lane: 'cli',
+        cliModelFields,
+        providerSettings: agentRecord.provider_specific_settings ?? null,
+        // The parent's scope as this lane knows it: a CLI primary's own runtime profile is
+        // built from these same stored defaults, so a worker inherits exactly what its
+        // parent has rather than the wider user-global set.
+        selectedGateways: normalizeIdList(agentRecord.defaultMCPGateways ?? agentRecord.default_mcp_gateways),
+        toolSelections: normalizeIdList(
+          agentRecord.defaultMCPToolSelections ?? agentRecord.default_mcp_tool_selections
+        ),
+        selectedCliToolIds: normalizeIdList(agentRecord.defaultTools ?? agentRecord.default_tools),
+        defaultGateways: normalizeIdList(agentRecord.defaultMCPGateways ?? agentRecord.default_mcp_gateways),
+        dcmDisplaySettings: agentRecord.dcmDisplaySettings ?? agentRecord.dcm_display_settings ?? null,
+        assignedSubagents: getAssignedSubagentIds(agentRecord),
+      },
+      workers: body.workers,
+    })
+
+    return json(result)
   }
 
   if (!(await isAssigned(agentId, subagentId, agent))) {
@@ -185,31 +246,58 @@ export const POST: RequestHandler = async ({ request }) => {
   }
 
   try {
-    const result = await executeWithTimeout(
-      (abortSignal) =>
-        executeManagedSubagent({
-          userId,
-          sessionId,
-          chatInput,
-          subagent,
-          parentAgentId: agentId,
-          parentMessageId,
-          projectPath,
-          abortSignal,
-        }),
-      timeoutMs
-    )
+    const result = await executeManagedSubagent({
+      userId,
+      sessionId,
+      chatInput,
+      subagent,
+      parentAgentId: agentId,
+      parentMessageId,
+      projectPath,
+      thread,
+    })
 
     return json({
       success: true,
+      kind: 'subagent',
       output: result.output,
       intermediateSteps: result.intermediateSteps,
       subagentType: result.subagentType,
       subagentId,
       subagentName: subagent.displayName || subagent.id,
+      usage: result.usage,
+      modelId: result.modelId,
+      provider: result.provider,
+      durationMs: result.durationMs,
+      status: result.status,
+      thread: result.thread,
+      ...(result.threadNote ? { threadNote: result.threadNote } : {}),
       toolSource: toolSourceFor(result.subagentType),
     })
   } catch (error) {
+    // SA-111 P2 (DL-111-05): a same-subagent collision is an explicit, expected outcome —
+    // the bridge turns this message into readable tool content so the CLI agent can adapt.
+    if (isSubagentBusyError(error)) {
+      return json({
+        success: true,
+        kind: 'subagent',
+        executionSucceeded: false,
+        error: 'subagent_busy',
+        output: error.message,
+        intermediateSteps: [],
+        subagentType,
+        subagentId,
+        subagentName: subagent.displayName || subagent.id,
+        usage: null,
+        modelId: subagent.primary_model_name ?? null,
+        provider: subagent.primary_model_provider ?? null,
+        durationMs: 0,
+        status: 'failed',
+        thread: null,
+        toolSource: toolSourceFor(subagentType),
+      })
+    }
+
     const message = error instanceof Error ? error.message : String(error)
     const status = statusForExecutionError(message)
     return jsonError(

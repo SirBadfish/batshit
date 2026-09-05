@@ -17,6 +17,7 @@ const renderers = {
   readFile: () => load(import('../file/ReadFileRenderer.svelte')),
   bash: () => load(import('../command/BashRenderer.svelte')),
   subagent: () => load(import('../subagent/CallSubagentRenderer.svelte')),
+  workers: () => load(import('../workers/WorkersRenderer.svelte')),
   dynamicFind: () => load(import('../mcp/DynamicMcpFindRenderer.svelte')),
   imageGen: () => load(import('../image/ImageGenerationRenderer.svelte')),
   abScreenshot: () => load(import('../image/AgentBrowserScreenshotRenderer.svelte'))
@@ -45,6 +46,22 @@ describe('getToolRenderer — priority short-circuits', () => {
     expect(
       await getToolRenderer('native_fabric_use', { isSubagent: true, toolSource: 'native-tool' } as any)
     ).toBe(await renderers.generic())
+  })
+
+  it('SA-111 P4: routes a workers batch to the Workers renderer on both lanes', async () => {
+    // The API lane's `native_spawn_workers` would fall through the subagent branch anyway
+    // (it is a native tool), but the managed CLI lane's composed MCP name would not — and
+    // a worker batch rendered as a subagent conversation card is simply wrong.
+    expect(await getToolRenderer('native_spawn_workers', { toolSource: 'native-tool' } as any)).toBe(
+      await renderers.workers()
+    )
+    expect(
+      await getToolRenderer('mcp__batshit_gateway_cody-subagents__spawn_workers', {} as any)
+    ).toBe(await renderers.workers())
+    // An explicit family wins too, for a normalized step that already resolved it.
+    expect(await getToolRenderer('whatever', { rendererFamily: 'workers' } as any)).toBe(
+      await renderers.workers()
+    )
   })
 
   it('honors the dynamic_mcp_find compatibility route via displayToolName', async () => {

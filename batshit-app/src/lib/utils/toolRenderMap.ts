@@ -79,6 +79,10 @@ export const canonicalToolAliases: Record<string, string> = {
   // Subagent
   call_subagent: 'subagent',
 
+  // SA-111 P4: Workers (one batch call, up to three runs)
+  spawn_workers: 'workers',
+  native_spawn_workers: 'workers',
+
   // Generic fallbacks
 }
 
@@ -120,7 +124,8 @@ export const toolCategories = {
   fabric: ['fabric_find', 'fabric_use', 'fetch_zip'],
   agentBrowser: ['agent_browser_find', 'agent_browser_use'],
   codex: ['codex_plan_update', 'codex_web_search'],
-  subagent: ['subagent']
+  subagent: ['subagent'],
+  workers: ['workers']
 }
 
 /**
@@ -146,6 +151,7 @@ export const categoryDefaults: Record<string, ZipPolicyDefault> = {
   fabric: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   agentBrowser: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   subagent: { buffer_size: 2, zip_threshold: 0 },
+  workers: { buffer_size: 2, zip_threshold: 0 },
   codex: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   allOther: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   coolTool: { buffer_size: 1, zip_threshold: 0, auto_zip: true }
@@ -170,7 +176,8 @@ const TOOL_DEFAULTS: Record<string, ZipPolicyDefault> = {
   fabric_use: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   agent_browser_find: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
   agent_browser_use: { buffer_size: 1, zip_threshold: 0, auto_zip: true },
-  subagent: { buffer_size: 2, zip_threshold: 0, auto_zip: false }
+  subagent: { buffer_size: 2, zip_threshold: 0, auto_zip: false },
+  workers: { buffer_size: 2, zip_threshold: 0, auto_zip: false }
 }
 
 const TYPE_DEFAULTS: Record<string, ZipPolicyDefault> = {
@@ -309,6 +316,9 @@ function getToolLookupNames(toolName: string): string[] {
       break
     case 'subagent':
       names.push('call_subagent')
+      break
+    case 'workers':
+      names.push('spawn_workers', 'native_spawn_workers')
       break
     default:
       break
