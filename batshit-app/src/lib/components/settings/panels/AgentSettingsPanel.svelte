@@ -12539,7 +12539,7 @@ import {
                                   side="bottom"
                                   class={SETTINGS_INFO_CONTENT_CLASS}
                                 >
-                                  Leave blank to use the type default: 180 seconds for API and n8n Workflow Subagents, or 300 seconds for CLI Subagents. Custom values can be 10 to 600 seconds.
+                                  Leave blank to use the type default: 180 seconds for API and n8n Workflow Subagents, or 300 seconds for CLI Subagents. Custom values can be 10 to 600 seconds. This covers the call itself, not time spent waiting for a turn: Batshit runs one call per Subagent at a time so its thread stays intact, so a call made while this Subagent is already busy waits first and can take up to about twice this long overall. Batshit says so in the result when that happens. Use Workers for work that should genuinely run at the same time.
                                 </DropdownMenu.Content>
                               </DropdownMenu.Root>
                             </div>

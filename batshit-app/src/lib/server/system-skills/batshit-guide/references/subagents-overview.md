@@ -106,6 +106,8 @@ Claude Code can also run its own native helpers. These are labeled **Claude Code
 
 API and n8n Workflow Subagents default to three minutes per call; CLI Subagents default to five minutes. Set **Call Timeout** in the Subagent's Agent Settings to override its default with 10–600 seconds, or leave it blank to use the default. Workers default to three minutes; a copy of a specialist honors that specialist's explicit timeout override. A timeout is shown as a timed-out result, not a completed task.
 
+Call Timeout covers the call itself, not time spent waiting for a turn. Batshit runs one call per Subagent at a time so its thread stays intact, so if your agent calls the same Subagent twice at once, the second call waits for the first to finish and can take up to about twice its Call Timeout overall. Batshit says so in the result when that happens, so a long call is never unexplained. Use Workers for work that should genuinely run at the same time — they do not wait in line.
+
 The Token Panel includes reported Subagent and Worker usage in the conversation's token and cost totals. The context meter measures only the Primary Agent's own context: a helper's entire conversation does not count against that window, although its returned result does. The [Execution Viewer](../chat/execution-viewer.md#delegated-runs) lists each delegated run separately. Missing usage or pricing is shown as unknown, not zero; the official n8n templates do not report token usage.
 
 ## Non-streaming behavior

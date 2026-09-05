@@ -41,7 +41,7 @@ export const DEFAULT_SUBAGENT_THREAD_MODE: SubagentThreadMode = 'fresh'
 /** DL-111-05: TTL = call timeout + 5 s, so a lock can never outlive one call. */
 const LOCK_TTL_GRACE_MS = 5_000
 
-/** A queued caller waits out the holder's whole TTL before giving up. */
+/** Slack on top of the holder's whole TTL, so an expiry and a retry cannot cross. */
 const LOCK_WAIT_GRACE_MS = 2_000
 
 const LOCK_POLL_MIN_MS = 50
@@ -102,11 +102,12 @@ export function normalizeSubagentThreadMode(value: unknown): SubagentThreadMode 
  * model-readable result rather than a bare failure, so the agent can pick a different
  * specialist or try again — never a silent overwrite of the other call's thread.
  *
- * This is the safety valve, not the common path. A lock cannot outlive its own TTL and the
- * waiter's budget is that TTL plus grace, so with equal budgets the queued call always gets
- * its turn. It fires when the budgets are ASYMMETRIC — a queued CLI-bridge call (its own
- * `timeoutMs`, 120 s by default) behind an API-lane holder sized by the longer documented
- * default — or when a third caller repeatedly takes the freed lock first.
+ * This is the safety valve, not the common path. A lock cannot outlive its own TTL and
+ * `resolveSubagentLockWaitMs` gives a waiter that whole lifetime plus slack, so two calls to
+ * the SAME subagent — which is the only collision that can happen — always resolve their own
+ * budgets and the queued one gets its turn. It fires when a third caller repeatedly takes the
+ * freed lock first, or when the stored Call Timeout changed between the holder starting and
+ * the waiter arriving, making the two budgets asymmetric.
  */
 export class SubagentBusyError extends Error {
   readonly code = 'subagent_busy'
@@ -132,10 +133,31 @@ export function resolveSubagentLockTtlMs(callTimeoutMs: number): number {
   return Math.floor(callTimeoutMs) + LOCK_TTL_GRACE_MS
 }
 
+/**
+ * How long a queued call waits for its turn, as its OWN policy rather than a side effect of
+ * the TTL. It resolves to a full holder lifetime plus slack ON PURPOSE: the collision this
+ * lock exists for is a primary calling the same subagent twice in one AI SDK step, where
+ * both calls are legitimate and the second must still get its complete run budget. A
+ * shorter wait would turn that into a spurious `SubagentBusyError`, and a queued call given
+ * a partial budget would turn it into a spurious timeout — both are WRONG ANSWERS, which is
+ * worse than a slow one.
+ *
+ * The deliberate consequence: a queued call's wall clock is up to roughly TWICE its Call
+ * Timeout — once waiting, once running. That is the documented contract (Agent Settings ->
+ * Call Timeout, and `primary-agent-types.md`), it is pinned by `subagentThreads.test.ts`,
+ * and the runner reports the wait in the call's `threadNote` so the extra time is never
+ * unexplained. A caller that wants real parallelism should use Workers, which take no lock.
+ */
+export function resolveSubagentLockWaitMs(callTimeoutMs: number): number {
+  return resolveSubagentLockTtlMs(callTimeoutMs) + LOCK_WAIT_GRACE_MS
+}
+
 export interface SubagentRunLockHandle {
   key: string
   token: string
   ttlMs: number
+  /** How long this call queued behind another call to the same subagent. */
+  waitedMs: number
 }
 
 function sleep(ms: number, abortSignal?: AbortSignal): Promise<void> {
@@ -160,12 +182,24 @@ export async function acquireSubagentRunLock(options: {
   slug: string
   subagentLabel: string
   ttlMs: number
+  /**
+   * The queue budget, passed in rather than derived from `ttlMs` here. Keeping the two
+   * apart means a change to how long a lock LIVES can never silently change how long other
+   * calls QUEUE for it — they answer different questions. Production passes
+   * `resolveSubagentLockWaitMs(callTimeoutMs)`.
+   */
+  waitBudgetMs: number
   abortSignal?: AbortSignal
 }): Promise<SubagentRunLockHandle> {
   const key = buildSubagentRunLockKey(options.sessionId, options.slug)
   const token = randomUUID()
   const ttlMs = Math.max(1_000, Math.floor(options.ttlMs))
-  const waitBudgetMs = ttlMs + LOCK_WAIT_GRACE_MS
+  // Fail loudly rather than open: `Math.floor(undefined)` is NaN, and every `waitedMs >=
+  // NaN` comparison is false, so a caller that forgot the budget would queue FOREVER.
+  if (!Number.isFinite(options.waitBudgetMs) || options.waitBudgetMs < 0) {
+    throw new Error('Subagent lock acquisition requires a resolved non-negative wait budget.')
+  }
+  const waitBudgetMs = Math.floor(options.waitBudgetMs)
   const startedAt = Date.now()
   let pollMs = LOCK_POLL_MIN_MS
 
@@ -174,7 +208,7 @@ export async function acquireSubagentRunLock(options: {
       client.set(key, token, { NX: true, PX: ttlMs })
     )
     if (acquired) {
-      return { key, token, ttlMs }
+      return { key, token, ttlMs, waitedMs: Date.now() - startedAt }
     }
 
     if (options.abortSignal?.aborted) {

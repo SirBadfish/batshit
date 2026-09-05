@@ -31,6 +31,7 @@ import {
   releaseSubagentRunLock,
   resetManagedSubagentThread,
   resolveSubagentLockTtlMs,
+  resolveSubagentLockWaitMs,
   selectN8nSubagentThreadId,
   stillHoldsSubagentRunLock,
   SubagentBusyError,
@@ -80,12 +81,14 @@ describe('subagent thread keys', () => {
 describe('subagent run lock (DL-111-05)', () => {
   it('waits out a holder whose turn ends before the waiter gives up', async () => {
     // Equal budgets is the normal case: the holder's lock cannot outlive its own TTL, and
-    // the waiter's budget is that TTL plus grace, so the waiter always gets its turn.
+    // `resolveSubagentLockWaitMs` gives the waiter that whole lifetime plus grace, so the
+    // waiter always gets its turn rather than failing spuriously.
     const first = await acquireSubagentRunLock({
       sessionId: 's1',
       slug: 'helper',
       subagentLabel: 'Helper',
       ttlMs: 200,
+      waitBudgetMs: 2200,
     })
 
     const second = await acquireSubagentRunLock({
@@ -93,6 +96,7 @@ describe('subagent run lock (DL-111-05)', () => {
       slug: 'helper',
       subagentLabel: 'Helper',
       ttlMs: 200,
+      waitBudgetMs: 2200,
     })
 
     expect(second.token).not.toBe(first.token)
@@ -102,14 +106,15 @@ describe('subagent run lock (DL-111-05)', () => {
   })
 
   it('reports busy when the holder outlasts the waiter\'s whole budget', async () => {
-    // The asymmetric-budget case, which is real: the CLI bridge sends its own timeout
-    // (120 s default) while the API lane uses the longer documented default, so a queued
-    // CLI call can genuinely run out of patience behind an API-lane holder.
+    // The asymmetric-budget case: the waiter's budget is smaller than the holder's whole
+    // lifetime, which happens when the subagent's stored Call Timeout changed between the
+    // holder starting and the waiter arriving. Then busy is the honest answer.
     await acquireSubagentRunLock({
       sessionId: 's1',
       slug: 'helper',
       subagentLabel: 'Helper',
       ttlMs: 60_000,
+      waitBudgetMs: 62000,
     })
 
     await expect(
@@ -118,6 +123,7 @@ describe('subagent run lock (DL-111-05)', () => {
         slug: 'helper',
         subagentLabel: 'Long Runner',
         ttlMs: 100,
+        waitBudgetMs: 2100,
       })
     ).rejects.toBeInstanceOf(SubagentBusyError)
   })
@@ -128,6 +134,7 @@ describe('subagent run lock (DL-111-05)', () => {
       slug: 'helper',
       subagentLabel: 'Helper',
       ttlMs: 5_000,
+      waitBudgetMs: 7000,
     })
 
     const queued = acquireSubagentRunLock({
@@ -135,6 +142,7 @@ describe('subagent run lock (DL-111-05)', () => {
       slug: 'helper',
       subagentLabel: 'Helper',
       ttlMs: 5_000,
+      waitBudgetMs: 7000,
     })
 
     await releaseSubagentRunLock(first)
@@ -150,12 +158,14 @@ describe('subagent run lock (DL-111-05)', () => {
       slug: 'alpha',
       subagentLabel: 'Alpha',
       ttlMs: 5_000,
+      waitBudgetMs: 7000,
     })
     const b = await acquireSubagentRunLock({
       sessionId: 's1',
       slug: 'beta',
       subagentLabel: 'Beta',
       ttlMs: 5_000,
+      waitBudgetMs: 7000,
     })
 
     expect(a.key).not.toBe(b.key)
@@ -171,6 +181,7 @@ describe('subagent run lock (DL-111-05)', () => {
       slug: 'helper',
       subagentLabel: 'Helper',
       ttlMs: 5_000,
+      waitBudgetMs: 7000,
     })
 
     subagentRedis.expireNow(handle.key)
@@ -179,6 +190,7 @@ describe('subagent run lock (DL-111-05)', () => {
       slug: 'helper',
       subagentLabel: 'Helper',
       ttlMs: 5_000,
+      waitBudgetMs: 7000,
     })
 
     expect(await stillHoldsSubagentRunLock(handle)).toBe(false)
@@ -193,6 +205,70 @@ describe('subagent run lock (DL-111-05)', () => {
     expect(() => resolveSubagentLockTtlMs(Number.NaN)).toThrow(
       'resolved positive call timeout'
     )
+  })
+
+  it('sizes the queue budget as a full holder lifetime, and pins the 2x wall clock', () => {
+    // The queue budget is its OWN decision, not a side effect of the TTL: a waiter gets the
+    // holder's whole lifetime plus slack so a legitimate second call to the same subagent
+    // never fails spuriously and never runs on a partial budget.
+    expect(resolveSubagentLockWaitMs(120_000)).toBe(127_000)
+    expect(resolveSubagentLockWaitMs(300_000)).toBe(307_000)
+
+    // The deliberate, documented cost of that choice: a QUEUED call's wall clock is the wait
+    // plus its own full run, i.e. a bit over twice the Call Timeout. This assertion exists so
+    // that number can only change on purpose — Agent Settings -> Call Timeout and
+    // `primary-agent-types.md` both state it, and the runner reports the wait in `threadNote`.
+    const callTimeoutMs = 300_000
+    const worstCaseMs = resolveSubagentLockWaitMs(callTimeoutMs) + callTimeoutMs
+    expect(worstCaseMs).toBe(607_000)
+    expect(worstCaseMs).toBeLessThanOrEqual(callTimeoutMs * 2 + 10_000)
+  })
+
+  it('refuses a missing or negative queue budget instead of waiting forever', async () => {
+    // Fail loudly, not open. `Math.floor(undefined)` is NaN and every `waited >= NaN` is
+    // false, so a caller that forgot the budget would queue until the process died.
+    await expect(
+      acquireSubagentRunLock({
+        sessionId: 's1',
+        slug: 'helper',
+        subagentLabel: 'Helper',
+        ttlMs: 5_000,
+        waitBudgetMs: undefined as unknown as number,
+      })
+    ).rejects.toThrow('resolved non-negative wait budget')
+
+    await expect(
+      acquireSubagentRunLock({
+        sessionId: 's1',
+        slug: 'helper',
+        subagentLabel: 'Helper',
+        ttlMs: 5_000,
+        waitBudgetMs: -1,
+      })
+    ).rejects.toThrow('resolved non-negative wait budget')
+  })
+
+  it('reports how long a call queued, so the extra wall clock is explainable', async () => {
+    const straightThrough = await acquireSubagentRunLock({
+      sessionId: 's1',
+      slug: 'helper',
+      subagentLabel: 'Helper',
+      ttlMs: 200,
+      waitBudgetMs: 2_200,
+    })
+    // Nothing held the turn, so there is nothing to explain.
+    expect(straightThrough.waitedMs).toBeLessThan(50)
+
+    // The holder's own TTL is what frees the turn here, so the waiter genuinely queues.
+    const queued = await acquireSubagentRunLock({
+      sessionId: 's1',
+      slug: 'helper',
+      subagentLabel: 'Helper',
+      ttlMs: 200,
+      waitBudgetMs: 2_200,
+    })
+    expect(queued.token).not.toBe(straightThrough.token)
+    expect(queued.waitedMs).toBeGreaterThanOrEqual(150)
   })
 
   it('recognises its own busy error', () => {

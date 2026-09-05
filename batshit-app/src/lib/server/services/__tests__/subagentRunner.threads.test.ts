@@ -252,6 +252,7 @@ describe('same-subagent serialization (DL-111-05, closes F7)', () => {
       slug: 'alpha',
       subagentLabel: 'Alpha',
       ttlMs: 60_000,
+      waitBudgetMs: 62_000,
     })
 
     const startedAt = Date.now()
@@ -260,6 +261,38 @@ describe('same-subagent serialization (DL-111-05, closes F7)', () => {
     expect(result.thread).toBe('fresh')
     expect(Date.now() - startedAt).toBeLessThan(1_000)
     expect(await releaseSubagentRunLock(alphaLock)).toBe(true)
+  })
+
+  it('explains a queued call instead of leaving the extra wall clock a mystery', async () => {
+    // A queued call reports only its RUN in `durationMs`, and it can legitimately spend up
+    // to another full Call Timeout waiting (see `resolveSubagentLockWaitMs`). Saying so is
+    // what keeps that honest — a silent gap between wall clock and reported duration is the
+    // kind of thing nobody can debug later.
+    const held = await acquireSubagentRunLock({
+      sessionId: 'session-1',
+      slug: 'alpha',
+      subagentLabel: 'Alpha',
+      // Short-lived on purpose: the TTL is what hands the turn over, so the run really does
+      // queue without the test having to orchestrate a second concurrent run.
+      ttlMs: 1_200,
+      waitBudgetMs: 3_200,
+    })
+
+    const result = await run({ subagent: apiSubagent('alpha') })
+
+    expect(result.status).toBe('completed')
+    expect(result.threadNote).toContain('waited')
+    expect(result.threadNote).toContain('same subagent')
+    // It points at the actual answer for parallel work rather than just apologising.
+    expect(result.threadNote).toContain('Workers')
+    // The stale handle must not steal the turn from the run that took it.
+    expect(await releaseSubagentRunLock(held)).toBe(false)
+  })
+
+  it('says nothing about queueing when the call went straight through', async () => {
+    const result = await run()
+    expect(result.status).toBe('completed')
+    expect(result.threadNote).toBeUndefined()
   })
 
   it('releases the turn even when the run fails', async () => {

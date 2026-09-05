@@ -61,6 +61,7 @@ import {
   releaseSubagentRunLock,
   resetManagedSubagentThread,
   resolveSubagentLockTtlMs,
+  resolveSubagentLockWaitMs,
   selectN8nSubagentThreadId,
   stillHoldsSubagentRunLock,
   type SubagentRunLockHandle,
@@ -352,6 +353,34 @@ async function openManagedSubagentThread(
   return {
     messages,
     outcome: messages.length > 0 ? 'resumed' : 'resumed-empty',
+  }
+}
+
+/**
+ * A queued call's `durationMs` is measured from inside its lane, AFTER it takes the lock, so
+ * it reports the run and not the wait. That is the right number for spend and for comparing
+ * runs — but it leaves the wall clock a caller actually experienced unexplained, and a
+ * queued call can legitimately take up to twice its Call Timeout (see
+ * `resolveSubagentLockWaitMs`). So a non-trivial wait is stated outright rather than left
+ * for someone to infer from a stopwatch.
+ */
+const QUEUE_WAIT_NOTE_FLOOR_MS = 1_000
+
+function buildQueueWaitNote(waitedMs: number): string {
+  return `This call waited ${Math.round(
+    waitedMs / 1000
+  )}s for its turn behind another call to the same subagent before it started; the reported duration covers only the run. Batshit runs one call per subagent at a time so their thread stays intact — use Workers for work that should genuinely run in parallel.`
+}
+
+function withQueueWaitNote(
+  result: ManagedSubagentExecutionResult,
+  lock: SubagentRunLockHandle | null
+): ManagedSubagentExecutionResult {
+  if (!lock || lock.waitedMs < QUEUE_WAIT_NOTE_FLOOR_MS) return result
+  const queueNote = buildQueueWaitNote(lock.waitedMs)
+  return {
+    ...result,
+    threadNote: result.threadNote ? `${queueNote} ${result.threadNote}` : queueNote,
   }
 }
 
@@ -1227,6 +1256,10 @@ export async function executeManagedSubagent(
         slug: subagentSlug,
         subagentLabel: params.subagent.displayName || subagentSlug,
         ttlMs: resolveSubagentLockTtlMs(timeoutMs),
+        // How long a lock LIVES and how long other calls QUEUE for it are separate
+        // decisions; see `resolveSubagentLockWaitMs` for why the queue budget is a full
+        // holder lifetime and what that costs in wall clock.
+        waitBudgetMs: resolveSubagentLockWaitMs(timeoutMs),
         abortSignal: params.abortSignal,
       })
   const threadPlan: ThreadPlan = isWorkerRun
@@ -1235,7 +1268,7 @@ export async function executeManagedSubagent(
 
   const executionStartedAt = Date.now()
   try {
-    return await executeWithManagedSubagentTimeout({
+    const result = await executeWithManagedSubagentTimeout({
       timeoutMs,
       parentAbortSignal: params.abortSignal,
       work: async (abortSignal) => {
@@ -1263,6 +1296,7 @@ export async function executeManagedSubagent(
         )
       },
     })
+    return withQueueWaitNote(result, lock)
   } catch (error) {
     if (!isManagedSubagentTimeoutError(error)) throw error
     const runtime = isCliSubagentType(subagentType)
@@ -1275,25 +1309,28 @@ export async function executeManagedSubagent(
       params.subagent.primary_model_provider?.trim() ||
       (runtime ?? params.parentConnection?.service?.trim()) ||
       null
-    return {
-      output: delegatedFailureOutput({
-        label: params.subagent.displayName || subagentSlug,
+    return withQueueWaitNote(
+      {
+        output: delegatedFailureOutput({
+          label: params.subagent.displayName || subagentSlug,
+          status: 'timed_out',
+          timeoutMs,
+          error,
+        }),
+        intermediateSteps: [],
+        subagentType,
+        usage: null,
+        modelId,
+        provider,
+        durationMs: Math.max(0, Date.now() - executionStartedAt),
         status: 'timed_out',
-        timeoutMs,
-        error,
-      }),
-      intermediateSteps: [],
-      subagentType,
-      usage: null,
-      modelId,
-      provider,
-      durationMs: Math.max(0, Date.now() - executionStartedAt),
-      status: 'timed_out',
-      thread: isWorkerRun
-        ? null
-        : (reportedThreadOutcome ??
-          (normalizeSubagentThreadMode(params.thread) === 'fresh' ? 'fresh' : 'resumed-empty')),
-    }
+        thread: isWorkerRun
+          ? null
+          : (reportedThreadOutcome ??
+            (normalizeSubagentThreadMode(params.thread) === 'fresh' ? 'fresh' : 'resumed-empty')),
+      },
+      lock
+    )
   } finally {
     await releaseSubagentRunLock(lock)
   }
