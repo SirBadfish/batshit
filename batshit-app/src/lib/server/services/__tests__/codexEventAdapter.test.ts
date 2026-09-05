@@ -734,7 +734,14 @@ describe('CodexEventAdapter', () => {
     expect(resultChunk?.result?.diff).not.toContain('Diff omitted to keep the tool result compact')
   })
 
-  it('unwraps subagent MCP tool results into clean output', async () => {
+  it.each([
+    { label: 'omitted thread', input: { chatInput: 'hi there' }, expected: { chatInput: 'hi there' } },
+    { label: 'fresh thread', input: { chatInput: 'hi there', thread: 'fresh' }, expected: { chatInput: 'hi there', thread: 'fresh' } },
+    { label: 'resumed thread', input: { chatInput: 'hi there', thread: 'resume' }, expected: { chatInput: 'hi there', thread: 'resume' } },
+    { label: 'prompt alias', input: { prompt: 'hi there', thread: 'resume' }, expected: { prompt: 'hi there', chatInput: 'hi there', thread: 'resume' } },
+    { label: 'input alias', input: { input: 'hi there' }, expected: { input: 'hi there', chatInput: 'hi there' } },
+    { label: 'scalar input', input: 'hi there', expected: { chatInput: 'hi there' } }
+  ])('preserves $label subagent input in events and stored steps while unwrapping output', async ({ input, expected }) => {
     const adapter = new CodexEventAdapter({
       request: buildRequest(),
       transport: 'cli'
@@ -748,7 +755,7 @@ describe('CodexEventAdapter', () => {
           type: 'mcp_tool_call',
           server: 'batshit_gateway_codex-subagents',
           tool: 'subagent_batshit_subagent',
-          arguments: { chatInput: 'hi there' }
+          arguments: input
         }
       }
       yield {
@@ -778,7 +785,10 @@ describe('CodexEventAdapter', () => {
     const resultChunk = chunks.find((chunk) => chunk.type === 'tool-result')
 
     expect(callChunk?.toolName).toContain('subagent_batshit_subagent')
-    expect(callChunk?.args).toMatchObject({ chatInput: 'hi there' })
+    expect(callChunk?.args).toEqual(expected)
+    expect(resultChunk?.args).toEqual(expected)
+    expect(adapter.getIntermediateSteps()).toHaveLength(1)
+    expect(adapter.getIntermediateSteps()[0].toolInput).toEqual(expected)
     expect(resultChunk?.metadata?.toolProvider).toBe('subagent')
     expect(resultChunk?.metadata?.toolSource).toBe('workflow-webhook')
     expect(resultChunk?.result).toMatchObject({ output: 'Hello from SA' })
