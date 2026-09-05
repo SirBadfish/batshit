@@ -33,6 +33,7 @@ import {
   resolveBrokerToolToggles
 } from '$lib/utils/brokerAvailability'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+import { WORKERS_MAX_PER_CALL } from '$lib/utils/delegationCapabilities'
 import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
 import { findControls, useControl, type ControlRuntimeMode, type ControlUseErrorCode } from './fabricRegistry'
 import {
@@ -220,6 +221,23 @@ export interface NativeToolContext {
    * module-level — so one run's images can never surface in another's step.
    */
   ephemeralImages?: EphemeralImageRegistry | null
+  /**
+   * SA-111 P4 (DL-111-09/11): the context `native_spawn_workers` needs, and the gate that
+   * decides whether the tool exists at all. ABSENT MEANS NO WORKER TOOL — the default is
+   * deliberately fail-closed, because a subagent or worker run that inherited this would
+   * break the depth-1 rule (DL-111-12). Only a primary-agent send sets `enabled: true`.
+   */
+  workers?: {
+    enabled: boolean
+    /** The parent turn's message id — the key the 9-runs-per-turn cap counts against. */
+    parentMessageId?: string | null
+    parentModelId?: string | null
+    parentConnection?: import('$lib/types/savedModels').ModelConnectionInfo | null
+    /** Assigned subagent records, so a worker can name one in `base`. */
+    assignedSubagents?: any[] | null
+    defaultGateways?: string[] | null
+    abortSignal?: AbortSignal
+  } | null
 }
 
 export interface NativeToolExecutionResult {
@@ -11856,6 +11874,75 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           safeSearch: input.safeSearch,
           timeoutMs: input.timeoutMs
         })
+    })
+  }
+
+  // SA-111 P4 (DL-111-09): one BATCH tool, not N separate calls. A batch is what lets the
+  // 3-per-call cap live in one place, and it gives every lane the same parallelism no
+  // matter how the model schedules its tool calls.
+  if (context.workers?.enabled === true) {
+    tools.native_spawn_workers = tool({
+      description:
+        `Spawn up to ${WORKERS_MAX_PER_CALL} throwaway workers that run in parallel and report back. ` +
+        'A general worker uses your tools and model, without your skills or past context — use it to keep a large or ' +
+        'parallel chunk of work out of your own context. Omit `base` for the built-in general worker, ' +
+        'or set it to an assigned API or CLI subagent slug to copy its prompt, model, tools, and skills. Workers cannot ' +
+        'be steered mid-run and cannot spawn more workers, so brief each one completely.',
+      inputSchema: z.object({
+        workers: z
+          .array(
+            z.object({
+              task: z
+                .string()
+                .min(1)
+                .describe(
+                  'The complete brief for this worker: goal, constraints, files or names involved, and the answer shape you want back.'
+                ),
+              role: z
+                .string()
+                .optional()
+                .describe('Short label for this worker, e.g. "docs researcher". Shown in the UI.'),
+              base: z
+                .string()
+                .optional()
+                .describe(
+                  'Slug of an assigned API or CLI subagent to copy. Omit for the built-in general worker.'
+                )
+            })
+          )
+          // Deliberately no `.max()`: DL-111-09 says a call over a cap returns an explicit
+          // error RESULT, not a throw. A schema max would turn the one cap that can be
+          // expressed in a schema into an opaque invalid-input error, while the other two
+          // (3 concurrent, 9 per turn) still came back as readable refusals. One path, one
+          // vocabulary — the limit lives in the description and in `workerTurnBudget`.
+          .min(1)
+      }),
+      execute: async (input) => {
+        // Dynamic import: `workerRunner` -> `subagentRunner` -> this module, so a static
+        // import would close a require cycle. Same pattern `runApiSubagent` uses for the brain.
+        const { spawnWorkers } = await import('./workerRunner')
+        return spawnWorkers({
+          parent: {
+            userId: context.userId,
+            sessionId: resolvedSessionId ?? '',
+            parentAgentId: resolvedAgentId ?? '',
+            parentMessageId: context.workers?.parentMessageId ?? null,
+            projectPath: context.projectPath ?? null,
+            lane: 'api',
+            parentModelId: context.workers?.parentModelId ?? null,
+            parentConnection: context.workers?.parentConnection ?? null,
+            providerSettings: context.providerSettings ?? null,
+            selectedGateways: selectedGateways ?? null,
+            toolSelections: context.toolSelections ?? null,
+            selectedCliToolIds: selectedCliToolIds ?? null,
+            defaultGateways: context.workers?.defaultGateways ?? null,
+            dcmDisplaySettings: context.dcmDisplaySettings ?? null,
+            assignedSubagents: context.workers?.assignedSubagents ?? null,
+            abortSignal: context.workers?.abortSignal
+          },
+          workers: (input as any)?.workers
+        })
+      }
     })
   }
 

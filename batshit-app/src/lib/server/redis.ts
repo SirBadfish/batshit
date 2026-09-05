@@ -548,6 +548,40 @@ export class RedisService {
         } catch (subagentError) {
           console.error(`[deleteSession] Error scanning/deleting subagent keys:`, subagentError)
         }
+
+        // SA-111 P2: the Batshit-issued n8n Workflow Subagent thread ids
+        // (`subagent_thread:{sessionId}:{slug}`, DL-111-06) and the in-flight run locks
+        // (`subagent_lock:{sessionId}:{slug}`, DL-111-05). Both carry a TTL, but the
+        // Session Key Cleanup rule is enumerate-don't-assume: a key that expires "soon"
+        // still outlives its session until it does.
+        try {
+          const threadIdKeys = await client.keys(`subagent_thread:${id}:*`)
+          if (threadIdKeys && threadIdKeys.length > 0) {
+            await client.del(threadIdKeys as [string, ...string[]])
+            logger.debug(`[deleteSession] Deleted ${threadIdKeys.length} subagent thread ids`)
+          }
+
+          const subagentLockKeys = await client.keys(`subagent_lock:${id}:*`)
+          if (subagentLockKeys && subagentLockKeys.length > 0) {
+            await client.del(subagentLockKeys as [string, ...string[]])
+            logger.debug(`[deleteSession] Deleted ${subagentLockKeys.length} subagent run locks`)
+          }
+        } catch (threadError) {
+          console.error(`[deleteSession] Error deleting subagent thread/lock keys:`, threadError)
+        }
+
+        // SA-111 AMD-111-02: scoped per-message n8n callback tokens. TTL-bounded (~30 min)
+        // and deliberately NOT part of backup — they are short-lived credentials, not data —
+        // but they are session-scoped state and belong in this sweep.
+        try {
+          const callbackKeys = await client.keys(`n8n:sse-callback:${id}:*`)
+          if (callbackKeys && callbackKeys.length > 0) {
+            await client.del(callbackKeys as [string, ...string[]])
+            logger.debug(`[deleteSession] Deleted ${callbackKeys.length} n8n callback tokens`)
+          }
+        } catch (callbackError) {
+          console.error(`[deleteSession] Error deleting n8n callback tokens:`, callbackError)
+        }
         
         // Note: We don't delete upload:images:* keys because they might be shared across sessions
         // The session-specific upload references are handled as zips with pattern: {sessionId}-upload-*

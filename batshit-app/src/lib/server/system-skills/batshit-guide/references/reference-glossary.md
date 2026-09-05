@@ -6,7 +6,7 @@ This glossary explains Batshit terms in plain English. It is written for first-t
 
 ### Agent
 
-An AI assistant configured in Batshit. The main agent you chat with is a Primary Agent. A specialist called by another agent is a Subagent.
+An AI assistant configured in Batshit. The main agent you chat with is a Primary Agent. A saved specialist called by that agent is a Subagent; a temporary helper for one task is a Worker.
 
 ### Agent Browser
 
@@ -351,6 +351,10 @@ A URL that receives a request from Batshit or another service. n8n Workflow Suba
 ### Workspace
 
 The files and runtime context available to Batshit agents. In Docker, the normal workspace path is `/workspace`.
+
+### Worker
+
+A temporary AI helper a Primary Agent starts for one task. It uses either the parent's model and tools without inheriting the parent's Skills, or a fresh copy of an assigned API or CLI Subagent with that specialist's model, tools, and Skills. Workers keep no conversation or memory, and Batshit allows up to three at once and nine per Primary Agent turn. See [Subagents and Workers](../subagents/overview.md#workers).
 
 ## Z
 

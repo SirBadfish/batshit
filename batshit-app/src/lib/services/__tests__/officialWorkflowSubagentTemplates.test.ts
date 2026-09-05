@@ -88,4 +88,24 @@ describe('official n8n Workflow Subagent templates (Category 2)', () => {
       expect(raw).toContain("primary_agent_type: 'n8n'")
     }
   })
+
+  it('keys Redis Chat Memory on the Batshit-issued thread id with a 7-day TTL', () => {
+    // SA-111 P2 (DL-111-06): n8n owns the conversation, so the thread id in the session key
+    // is the ONLY lever Batshit has over it. Drop the id and `thread: "fresh"` silently
+    // stops resetting, which is the failure mode this assertion exists to catch.
+    for (const name of [
+      'batshit-n8n-workflow-subagent.json',
+      'batshit-docker-n8n-workflow-subagent.json',
+    ]) {
+      const memory = loadTemplate(name).nodes.find(
+        (node: any) => node?.type === '@n8n/n8n-nodes-langchain.memoryRedisChat',
+      )
+
+      expect(memory?.parameters?.sessionKey).toBe(
+        '=subagent_sessions:{{ $json.body.session_id }}:subagent:{{ $json.body.subagent_slug }}:{{ $json.body.subagent_thread_id }}',
+      )
+      // Orphaned threads must age out on their own; Batshit's own id key uses the same clock.
+      expect(memory?.parameters?.sessionTTL).toBe(604800)
+    }
+  })
 })

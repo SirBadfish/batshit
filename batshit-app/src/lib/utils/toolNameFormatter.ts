@@ -81,6 +81,8 @@ const TOOL_DISPLAY_ALIASES: Record<string, string> = {
   runtime_addon_stop: 'Runtime Add-on Stop',
   call_subagent: 'Subagent',
   subagent: 'Subagent',
+  spawn_workers: 'Workers',
+  native_spawn_workers: 'Workers',
   codex_plan_update: 'Plan Update'
 }
 

@@ -54,6 +54,12 @@ vi.mock('./userStore', () => ({
 }))
 
 import { DatabaseService } from './databaseRedis.server'
+import { buildCliWorkerSpawnToolReference } from '$lib/utils/cliSubagentToolNames'
+import {
+  WORKERS_FEATURE_ENABLED,
+  WORKERS_MAX_CONCURRENT,
+  WORKERS_MAX_RUNS_PER_TURN
+} from '$lib/utils/delegationCapabilities'
 
 describe('DatabaseService prompt and DCM contract helpers', () => {
   afterEach(() => {
@@ -219,11 +225,100 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     expect(block).toContain(
       'CLI subagent delegation: call the MCP server/tool pair shown for the chosen subagent.'
     )
+    // SA-111 P1 (AMD-111-01): these names are bounded so `mcp__<server>__<tool>` fits
+    // OpenAI's 64-character function-name limit. Before the bound, Codex silently rewrote
+    // the 81-character form and the roster advertised a tool name that did not exist.
     expect(block).toContain(
-      'API Subagent (api_subagent; server: batshit_gateway_sample_codex_primary-subagents; tool: subagent_sample_api_subagent; full: mcp__batshit_gateway_sample_codex_primary-subagents__subagent_sample_api_subagent)'
+      'API Subagent (api_subagent; server: batshit_gateway_sample_co_6708b5; tool: subagent_sample_ap_af55e1; full: mcp__batshit_gateway_sample_co_6708b5__subagent_sample_ap_af55e1)'
     )
     expect(block).toContain(
-      'CLI Subagent (cli_subagent; server: batshit_gateway_sample_codex_primary-subagents; tool: subagent_sample_codex_subagent; full: mcp__batshit_gateway_sample_codex_primary-subagents__subagent_sample_codex_subagent)'
+      'CLI Subagent (cli_subagent; server: batshit_gateway_sample_co_6708b5; tool: subagent_sample_co_62a73f; full: mcp__batshit_gateway_sample_co_6708b5__subagent_sample_co_62a73f)'
+    )
+    for (const line of block.split('\n')) {
+      const match = line.match(/full: (mcp__\S+?)\)/)
+      if (match) expect(match[1].length).toBeLessThanOrEqual(64)
+    }
+  })
+
+  it('SA-111 P1: the roster prints each subagent\u2019s capabilities (DL-111-03)', async () => {
+    const service = new DatabaseService()
+
+    const block = await (service as any).buildDynamicInfoBlock({
+      agentId: 'sample_api_primary',
+      agentRecord: { id: 'sample_api_primary' },
+      subagentDescriptions: {
+        researcher: 'Digs through docs',
+        n8n_helper: 'Runs the intake workflow'
+      },
+      subagentCapabilityFragments: {
+        researcher:
+          'API Subagent; model: anthropic/claude-sonnet-5; tools: Bash, Web Search, MCP (Docker Catalog); skills: /research; thread: resumable',
+        n8n_helper: 'n8n Workflow Subagent; model: not set here; tools: defined in n8n; skills: none; thread: none'
+      },
+      assignedSubagents: [
+        { id: 'researcher', slug: 'researcher', name: 'Researcher', displayName: 'Researcher' },
+        { id: 'n8n_helper', slug: 'n8n_helper', name: 'n8n Helper', displayName: 'n8n Helper' }
+      ]
+    })
+
+    expect(block).toContain(
+      '- Researcher (researcher): Digs through docs \u2014 API Subagent; model: anthropic/claude-sonnet-5; tools: Bash, Web Search, MCP (Docker Catalog); skills: /research; thread: resumable'
+    )
+    expect(block).toContain(
+      '- n8n Helper (n8n_helper): Runs the intake workflow \u2014 n8n Workflow Subagent; model: not set here; tools: defined in n8n; skills: none; thread: none'
+    )
+  })
+
+  it('SA-111 P4: the roster carries a workers line that follows the per-agent setting', async () => {
+    // The `workers:` line and the `spawn_workers` tool ship together — an agent told it has
+    // workers must actually have the tool, and an agent with the setting off must be told
+    // so rather than left to guess. That pairing is the F1 failure this story exists to fix.
+    const service = new DatabaseService()
+    expect(WORKERS_FEATURE_ENABLED).toBe(true)
+
+    const enabled = await (service as any).buildDynamicInfoBlock({
+      agentId: 'sample_api_primary',
+      agentRecord: { id: 'sample_api_primary', workers_enabled: true },
+      subagentDescriptions: { researcher: 'Digs through docs' },
+      assignedSubagents: [{ id: 'researcher', slug: 'researcher', displayName: 'Researcher' }]
+    })
+    expect(enabled).toContain(
+      `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel, ${WORKERS_MAX_RUNS_PER_TURN} per turn)`
+    )
+
+    const disabled = await (service as any).buildDynamicInfoBlock({
+      agentId: 'sample_api_primary',
+      agentRecord: { id: 'sample_api_primary', workers_enabled: false },
+      subagentDescriptions: { researcher: 'Digs through docs' },
+      assignedSubagents: [{ id: 'researcher', slug: 'researcher', displayName: 'Researcher' }]
+    })
+    expect(disabled).toContain('workers: disabled')
+
+    // Default ON for a primary agent that never stored the field (DL-111-11).
+    const defaulted = await (service as any).buildDynamicInfoBlock({
+      agentId: 'sample_api_primary',
+      agentRecord: { id: 'sample_api_primary' },
+      subagentDescriptions: {},
+      assignedSubagents: []
+    })
+    expect(defaulted).toContain('workers: enabled')
+    // The API lane has no composed MCP name to print — only the CLI lane does.
+    expect(enabled).not.toContain('tool: mcp__')
+
+    // AMD-111-01's rule applies to the worker tool too: on a managed CLI lane the roster
+    // prints the exact name the CLI exposes, so the agent never has to guess it.
+    const codex = await (service as any).buildDynamicInfoBlock({
+      agentId: 'sample_codex_primary',
+      agentRecord: { id: 'sample_codex_primary', slug: 'sample_codex_primary' },
+      isCodexMode: true,
+      subagentDescriptions: {},
+      assignedSubagents: []
+    })
+    expect(codex).toContain(
+      `workers: enabled (max ${WORKERS_MAX_CONCURRENT} parallel, ${WORKERS_MAX_RUNS_PER_TURN} per turn); tool: ${
+        buildCliWorkerSpawnToolReference({ id: 'sample_codex_primary', slug: 'sample_codex_primary' })
+          ?.fullToolName
+      }`
     )
   })
 

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   isTrustedInternalRequest: vi.fn(),
   executeManagedSubagent: vi.fn(),
+  spawnWorkers: vi.fn(),
   redisGetSession: vi.fn(),
   redisGet: vi.fn(),
   redisSMembers: vi.fn(),
@@ -16,6 +17,10 @@ vi.mock('$lib/server/services/subagentRunner', () => ({
   executeManagedSubagent: mocks.executeManagedSubagent,
 }))
 
+vi.mock('$lib/server/services/workerRunner', () => ({
+  spawnWorkers: mocks.spawnWorkers,
+}))
+
 vi.mock('$lib/server/redis', () => ({
   redis: {
     getSession: mocks.redisGetSession,
@@ -23,6 +28,8 @@ vi.mock('$lib/server/redis', () => ({
     sMembers: mocks.redisSMembers,
   },
 }))
+
+import { SubagentBusyError } from '$lib/server/services/subagentThreads'
 
 let routeModule: typeof import('./+server')
 
@@ -76,8 +83,106 @@ describe('POST /api/subagents/managed-execute', () => {
       output: 'API helper answer',
       intermediateSteps: [{ toolName: 'batshit_server_read_file' }],
       subagentType: 'api',
+      usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
+      modelId: 'gpt-5.4',
+      provider: 'openai',
+      durationMs: 987,
+      status: 'completed',
+      thread: 'fresh',
     })
     routeModule = await import('./+server')
+  })
+
+  it('SA-111 P4: routes a workers batch to the worker runner with the parent turn context', async () => {
+    // The CLI lane's `spawn_workers` reaches the same trusted internal route. Worker mode
+    // is chosen by the PRESENCE of `workers`, so a subagent call can never be reinterpreted
+    // as a worker batch, and the parent turn id has to travel or the 9-per-turn cap cannot
+    // be enforced.
+    mocks.redisGet.mockImplementation(async (key: string) => {
+      if (key === 'agent:agent-1') {
+        return {
+          id: 'agent-1',
+          user_id: 'user-1',
+          displayName: 'CLI Primary',
+          agentType: 'cli',
+          primary_model_provider: 'codex',
+          primary_model_name: 'gpt-5.6',
+          assignedSubagents: ['api-subagent'],
+          defaultMCPGateways: ['gw-1'],
+        }
+      }
+      return null
+    })
+    mocks.spawnWorkers.mockResolvedValue({
+      kind: 'workers',
+      success: true,
+      requested: 1,
+      completed: 1,
+      workers: [{ index: 0, name: 'Worker 1', status: 'completed', output: 'done' }],
+    })
+
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1',
+        sessionId: 'session-1',
+        messageId: 'parent-msg-7',
+        projectPath: '/workspace/project',
+        workers: [{ task: 'Find the config file' }],
+      }),
+    } as any)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ kind: 'workers', success: true })
+    expect(mocks.executeManagedSubagent).not.toHaveBeenCalled()
+    expect(mocks.spawnWorkers).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parent: expect.objectContaining({
+          userId: 'user-1',
+          sessionId: 'session-1',
+          parentAgentId: 'agent-1',
+          parentMessageId: 'parent-msg-7',
+          lane: 'cli',
+          selectedGateways: ['gw-1'],
+          assignedSubagents: ['api-subagent'],
+        }),
+        workers: [{ task: 'Find the config file' }],
+      })
+    )
+  })
+
+  it('SA-111 P4: refuses a workers batch when the agent has Workers turned off', async () => {
+    // DL-111-11: the setting is enforced server-side. A bridge listing built before the
+    // toggle changed must not be able to run a worker anyway.
+    mocks.redisGet.mockImplementation(async (key: string) => {
+      if (key === 'agent:agent-1') {
+        return {
+          id: 'agent-1',
+          user_id: 'user-1',
+          displayName: 'CLI Primary',
+          agentType: 'cli',
+          primary_model_provider: 'codex',
+          primary_model_name: 'gpt-5.6',
+          workers_enabled: false,
+        }
+      }
+      return null
+    })
+
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1',
+        sessionId: 'session-1',
+        messageId: 'parent-msg-7',
+        workers: [{ task: 'Find the config file' }],
+      }),
+    } as any)
+
+    await expect(response.json()).resolves.toMatchObject({
+      kind: 'workers',
+      success: false,
+      error: 'workers_disabled',
+    })
+    expect(mocks.spawnWorkers).not.toHaveBeenCalled()
   })
 
   it('executes an assigned API Subagent through the managed runner', async () => {
@@ -106,7 +211,6 @@ describe('POST /api/subagents/managed-execute', () => {
           id: 'api-subagent',
           subagentType: 'api',
         }),
-        abortSignal: expect.any(AbortSignal),
       })
     )
     expect(body).toMatchObject({
@@ -115,8 +219,17 @@ describe('POST /api/subagents/managed-execute', () => {
       subagentType: 'api',
       subagentId: 'api-subagent',
       subagentName: 'API Helper',
+      kind: 'subagent',
+      usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
+      modelId: 'gpt-5.4',
+      provider: 'openai',
+      durationMs: 987,
+      status: 'completed',
       toolSource: 'managed-api-subagent',
     })
+    expect(mocks.executeManagedSubagent.mock.calls[0]?.[0]).not.toHaveProperty(
+      'callTimeoutMs',
+    )
   })
 
   it('rejects untrusted internal calls before loading runtime state', async () => {
@@ -181,6 +294,12 @@ describe('POST /api/subagents/managed-execute', () => {
       output: 'Workflow helper answer',
       intermediateSteps: [],
       subagentType: 'n8n-workflow',
+      usage: null,
+      modelId: null,
+      provider: null,
+      durationMs: 55,
+      status: 'completed',
+      thread: 'fresh',
     })
     mocks.redisGet.mockImplementation(async (key: string) => {
       if (key === 'agent:agent-1') {
@@ -237,16 +356,18 @@ describe('POST /api/subagents/managed-execute', () => {
     )
   })
 
-  it('returns a timeout error and aborts slow managed subagent runs', async () => {
-    let aborted = false
-    mocks.executeManagedSubagent.mockImplementationOnce(
-      ({ abortSignal }: { abortSignal: AbortSignal }) =>
-        new Promise(() => {
-          abortSignal.addEventListener('abort', () => {
-            aborted = true
-          })
-        })
-    )
+  it('passes through the runner-owned timed-out result as model-readable tool output', async () => {
+    mocks.executeManagedSubagent.mockResolvedValueOnce({
+      output: 'API Helper did not return a complete result within 10 seconds.',
+      intermediateSteps: [],
+      subagentType: 'api',
+      usage: null,
+      modelId: 'gpt-5.4',
+      provider: 'openai',
+      durationMs: 10_002,
+      status: 'timed_out',
+      thread: 'fresh',
+    })
 
     const response = await routeModule.POST({
       request: buildRequest({
@@ -254,14 +375,18 @@ describe('POST /api/subagents/managed-execute', () => {
         subagentId: 'api-subagent',
         sessionId: 'session-1',
         chatInput: 'this should time out',
-        timeoutMs: 1,
       }),
     } as any)
 
-    expect(response.status).toBe(504)
+    expect(response.status).toBe(200)
     const body = await response.json()
-    expect(body.error.code).toBe('managed_subagent_timeout')
-    expect(aborted).toBe(true)
+    expect(body).toMatchObject({
+      success: true,
+      kind: 'subagent',
+      status: 'timed_out',
+      usage: null,
+      durationMs: 10_002,
+    })
   })
 
   it('returns clear setup failures from the managed runner', async () => {
@@ -283,6 +408,107 @@ describe('POST /api/subagents/managed-execute', () => {
     expect(body.error).toMatchObject({
       code: 'managed_subagent_failed',
       message: expect.stringContaining('needs a real Codex or Claude model'),
+    })
+  })
+
+  it('defaults thread control to fresh and reports what the thread did', async () => {
+    // SA-111 P2 (DL-111-04): a CLI agent that says nothing gets Josh's chosen default.
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1',
+        subagentId: 'api-subagent',
+        sessionId: 'session-1',
+        chatInput: 'hello',
+      }),
+    } as any)
+
+    expect(response.status).toBe(200)
+    expect(mocks.executeManagedSubagent).toHaveBeenCalledWith(
+      expect.objectContaining({ thread: 'fresh' })
+    )
+    expect(mocks.executeManagedSubagent.mock.calls[0]?.[0]).not.toHaveProperty(
+      'callTimeoutMs',
+    )
+    expect(await response.json()).toMatchObject({ thread: 'fresh' })
+  })
+
+  it('passes an explicit resume through and normalizes anything else to fresh', async () => {
+    for (const [sent, expected] of [
+      ['resume', 'resume'],
+      ['RESUME', 'fresh'],
+      ['continue', 'fresh'],
+    ] as const) {
+      mocks.executeManagedSubagent.mockClear()
+      await routeModule.POST({
+        request: buildRequest({
+          agentId: 'agent-1',
+          subagentId: 'api-subagent',
+          sessionId: 'session-1',
+          chatInput: 'hello',
+          thread: sent,
+        }),
+      } as any)
+
+      expect(mocks.executeManagedSubagent).toHaveBeenCalledWith(
+        expect.objectContaining({ thread: expected })
+      )
+    }
+  })
+
+  it('reports a same-subagent collision as model-readable failed delegation output', async () => {
+    // DL-111-05: the bridge turns a non-ok body into readable tool content, so the CLI agent
+    // reads a plain explanation and can pick a different specialist.
+    mocks.executeManagedSubagent.mockRejectedValueOnce(
+      new SubagentBusyError('API Helper', 120000)
+    )
+
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1',
+        subagentId: 'api-subagent',
+        sessionId: 'session-1',
+        chatInput: 'hello',
+      }),
+    } as any)
+
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body).toMatchObject({
+      success: true,
+      executionSucceeded: false,
+      error: 'subagent_busy',
+      output: expect.stringContaining('API Helper'),
+      status: 'failed',
+      usage: null,
+    })
+  })
+
+  it('surfaces a thread that could not be saved instead of staying quiet', async () => {
+    mocks.executeManagedSubagent.mockResolvedValueOnce({
+      output: 'answer',
+      intermediateSteps: [],
+      subagentType: 'api',
+      usage: null,
+      modelId: 'gpt-5.4',
+      provider: 'openai',
+      durationMs: 50,
+      status: 'completed',
+      thread: 'resumed',
+      threadNote: 'This run outlived its own in-flight lock',
+    })
+
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1',
+        subagentId: 'api-subagent',
+        sessionId: 'session-1',
+        chatInput: 'hello',
+      }),
+    } as any)
+
+    expect(await response.json()).toMatchObject({
+      thread: 'resumed',
+      threadNote: expect.stringContaining('outlived its own in-flight lock'),
     })
   })
 })

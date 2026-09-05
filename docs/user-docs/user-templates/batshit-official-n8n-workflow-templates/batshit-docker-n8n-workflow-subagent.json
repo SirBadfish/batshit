@@ -272,8 +272,9 @@
     {
       "parameters": {
         "sessionIdType": "customKey",
-        "sessionKey": "=subagent_sessions:{{ $json.body.session_id }}:subagent:{{ $json.body.subagent_slug }}",
-        "contextWindowLength": 500
+        "sessionKey": "=subagent_sessions:{{ $json.body.session_id }}:subagent:{{ $json.body.subagent_slug }}:{{ $json.body.subagent_thread_id }}",
+        "contextWindowLength": 500,
+        "sessionTTL": 604800
       },
       "type": "@n8n/n8n-nodes-langchain.memoryRedisChat",
       "typeVersion": 1.5,

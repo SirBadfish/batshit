@@ -9,6 +9,15 @@ import {
   unwrapSubagentToolResult
 } from '$lib/utils/toolPayloadUnwrap'
 
+/**
+ * SA-111 P4 (AMD-111-03) — Claude Code's own delegation helper tool names. `Agent` is the
+ * current one and `Task` is its older name; both are CLI-owned, run outside Batshit's
+ * subagent model, and are deliberately left enabled (G20). They are labelled distinctly so
+ * a user can tell a CLI-native helper from a Batshit Subagent or Worker.
+ */
+const CLAUDE_NATIVE_DELEGATION_TOOLS = new Set(['agent', 'task'])
+const CLAUDE_NATIVE_DELEGATION_LABEL = 'Claude Code Helper'
+
 export type ClaudeStreamChunk =
   | { type: 'text-delta'; text: string }
   | { type: 'tool-call'; toolCallId: string; toolName: string; args?: Record<string, any> }
@@ -970,6 +979,22 @@ export class ClaudeEventAdapter {
 
   private detectToolMetadata(toolName: string, args?: any, result?: any) {
     const lower = toolName.toLowerCase()
+
+    // SA-111 P4 (AMD-111-03): Claude Code's OWN delegation helper runs inside Batshit
+    // (F8, confirmed live in P0) and used to render as a Batshit "Subagent" card. It is
+    // neither a Batshit Subagent nor a Batshit Worker: it has no Batshit thread control,
+    // no caps, and no delegated-usage accounting. Name it for what it is so the user can
+    // tell the three apart, and pin the operation kind so nothing downstream promotes it.
+    if (CLAUDE_NATIVE_DELEGATION_TOOLS.has(lower)) {
+      return {
+        toolProvider: 'claude',
+        toolSource: 'claude',
+        isSubagent: false,
+        displayToolName: CLAUDE_NATIVE_DELEGATION_LABEL,
+        metadata: { operationKind: 'unknown_tool' }
+      }
+    }
+
     if (lower.includes('subagent_')) {
       const match = lower.match(/subagent_([a-z0-9_-]+)/)
       const slug = match?.[1]

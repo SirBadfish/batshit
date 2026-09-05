@@ -72,6 +72,8 @@ Use a Redis host the n8n process can reach:
 
 Docker Batshit's Redis is internal-only by default. Do not assume an external host n8n can reach the Docker `redis` service unless you deliberately expose or route it.
 
+Keep `subagent_thread_id` in the template's Redis Chat Memory session key and retain the seven-day expiry. Batshit changes that id for a fresh Subagent call and reuses it for a resumed call. If you already imported an older template, update that node or re-import the current template; upgrading Batshit does not update workflows inside n8n. See the [conversation-thread setup](../user-templates/batshit-official-n8n-workflow-templates/README.md#conversation-threads).
+
 ## Import the Workflow Subagent template
 
 In n8n:

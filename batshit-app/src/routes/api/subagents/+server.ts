@@ -24,6 +24,10 @@ import {
 	isWorkflowBackedSubagentType,
 	normalizeSubagentType,
 } from '$lib/utils/subagentType'
+import {
+	getSubagentTimeoutValidationError,
+	normalizeSubagentTimeoutSeconds,
+} from '$lib/utils/subagentTimeout'
 
 // GET /api/subagents - List all subagents for the current user
 export const GET: RequestHandler = async ({ locals }) => {
@@ -128,6 +132,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			return json({ error: claudeValidationError }, { status: 400 })
 		}
 
+		const timeoutValidationError = getSubagentTimeoutValidationError(body.timeout_seconds)
+		if (timeoutValidationError) {
+			return json({ error: timeoutValidationError }, { status: 400 })
+		}
+
 		const service = redis
 
 		// Story 6.9c: Use provided ID or generate from displayName
@@ -148,6 +157,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			displayName,
 			description,
 			...settings,
+			timeout_seconds: normalizeSubagentTimeoutSeconds(body.timeout_seconds),
 			...(Object.prototype.hasOwnProperty.call(body, 'avatar_icon_ref')
 				? { avatar_icon_ref: normalizeOptionalIconRefInput(body.avatar_icon_ref, 'avatar_icon_ref') }
 				: {}),

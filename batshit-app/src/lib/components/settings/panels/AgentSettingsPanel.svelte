@@ -145,6 +145,11 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
     resolveAgentMemorySettingsDraft,
     type AgentMemorySettingsDraft,
   } from "$lib/utils/memoryControl";
+  import {
+    WORKERS_MAX_CONCURRENT,
+    WORKERS_MAX_RUNS_PER_TURN,
+    resolveWorkersEnabled,
+  } from "$lib/utils/delegationCapabilities";
   import AgentWebSearchDefaultsDisclosure from "$lib/components/settings/agent/AgentWebSearchDefaultsDisclosure.svelte";
   import SubagentAccessAssignmentsSection from "$lib/components/settings/agent/SubagentAccessAssignmentsSection.svelte";
   import {
@@ -196,6 +201,10 @@ import { getToolGridDefaultAutoZip, getToolGridDefaultNumber } from "$lib/utils/
 import { listUnsupportedN8NParameters } from "$lib/utils/modelCompatibility";
 import * as compatibilityMatrixStore from "$lib/stores/compatibilityMatrix.svelte";
 import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSettingsEvents";
+import {
+  getSubagentTimeoutValidationError,
+  normalizeSubagentTimeoutSeconds,
+} from "$lib/utils/subagentTimeout";
 
   const BASIC_SAVE_DEBOUNCE_MS = 600;
   const ZIP_SAVE_DEBOUNCE_MS = 700;
@@ -329,6 +338,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     tool_approval_mode: "off" | "all";
     auto_compact_settings: AgentAutoCompactSettings;
     memory_settings: AgentMemorySettingsDraft;
+    // SA-111 P4 (DL-111-11): may this Primary Agent spawn Workers? Default on.
+    workers_enabled: boolean;
     webhook_url: string;
     agent_url: string;
     default_project_id: string | null;
@@ -700,6 +711,8 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     preserve_reasoning: boolean;
     tool_approval_mode?: "off" | "all" | null;
     memory_enabled?: boolean;
+    /** SA-111 P4 (DL-111-11). */
+    workers_enabled?: boolean;
     memory_linger_turns?: number;
     memory_recall_linger_turns?: number;
     memory_lane_budgets?: Record<string, number>;
@@ -2824,14 +2837,16 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     system_prompt: string;
     primary_model_provider: string;
     primary_model_name: string;
+    timeout_seconds: string;
     avatar: string | null;
     avatar_icon_ref: IconRef;
     avatar_icon_fit: AvatarIconFit;
     provider_specific_settings: Record<string, any> | null;
   }
 
-  type LiveSubagentUpdate = Partial<Omit<SubagentRow, "subagentType">> & {
+  type LiveSubagentUpdate = Partial<Omit<SubagentRow, "subagentType" | "timeout_seconds">> & {
     subagentType?: SubagentType;
+    timeout_seconds?: number | null;
   };
 
   let subagentForm = $state<SubagentForm>({
@@ -2843,6 +2858,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
     system_prompt: "",
     primary_model_provider: "",
     primary_model_name: "",
+    timeout_seconds: "",
     avatar: null,
     avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
     avatar_icon_fit: "fill",
@@ -3435,6 +3451,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
             system_prompt: "",
             primary_model_provider: "",
             primary_model_name: "",
+            timeout_seconds: "",
             avatar: null,
             avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
             avatar_icon_fit: "fill",
@@ -3485,6 +3502,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
           system_prompt: "",
           primary_model_provider: "",
           primary_model_name: "",
+          timeout_seconds: "",
           avatar: null,
           avatar_icon_ref: DEFAULT_AGENT_ICON_REF,
           avatar_icon_fit: "fill",
@@ -4601,6 +4619,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       tool_approval_mode: "off",
       auto_compact_settings: normalizeAgentAutoCompactSettings(null),
       memory_settings: resolveAgentMemorySettingsDraft(null),
+      workers_enabled: true,
       webhook_url: "",
       agent_url: "",
       default_project_id: null,
@@ -4648,6 +4667,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
           : "off",
       auto_compact_settings: normalizeAgentAutoCompactSettings(agent.auto_compact_settings),
       memory_settings: resolveAgentMemorySettingsDraft(agent),
+      workers_enabled: resolveWorkersEnabled(agent),
       webhook_url: agent.webhook_url ?? agent.webhookUrl ?? "",
       agent_url: agent.agent_url ?? "",
       default_project_id:
@@ -4878,6 +4898,10 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       system_prompt: subagent.system_prompt ?? "",
       primary_model_provider: subagent.primary_model_provider ?? "",
       primary_model_name: subagent.primary_model_name ?? "",
+      timeout_seconds:
+        typeof subagent.timeout_seconds === "number"
+          ? String(subagent.timeout_seconds)
+          : "",
       avatar: subagent.avatar ?? null,
       avatar_icon_ref: normalizeIconRef(subagent.avatar_icon_ref, DEFAULT_AGENT_ICON_REF),
       avatar_icon_fit: normalizeAvatarIconFit(subagent.avatar_icon_fit),
@@ -5881,6 +5905,12 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
         return webhookValidation;
       }
     }
+    const timeoutValidation = getSubagentTimeoutValidationError(
+      form.timeout_seconds,
+    );
+    if (timeoutValidation) {
+      return timeoutValidation;
+    }
     return null;
   }
 
@@ -6123,6 +6153,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       tool_approval_mode: form.tool_approval_mode,
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
       memory_settings: buildAgentMemoryRecordFields(form.memory_settings),
+      workers_enabled: form.workers_enabled,
       webhook_url: form.webhook_url.trim(),
       agent_url: form.agent_url.trim(),
       default_project_id: form.default_project_id ?? null,
@@ -6268,6 +6299,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       tool_approval_mode: form.tool_approval_mode,
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
       ...buildAgentMemoryRecordFields(form.memory_settings),
+      workers_enabled: form.workers_enabled,
       webhook_url: normaliseStringOrNull(form.webhook_url),
       webhookUrl: normaliseStringOrNull(form.webhook_url),
       agent_url: normaliseStringOrNull(form.agent_url),
@@ -6388,6 +6420,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       system_prompt: form.system_prompt.trim(),
       primary_model_provider: form.primary_model_provider,
       primary_model_name: form.primary_model_name,
+      timeout_seconds: form.timeout_seconds.trim(),
       avatar: form.avatar ?? "",
       avatar_icon_ref: iconRefKey(form.avatar_icon_ref),
       avatar_icon_fit: form.avatar_icon_fit,
@@ -6417,6 +6450,7 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
       system_prompt: form.system_prompt.trim() || undefined,
       primary_model_provider: form.primary_model_provider || undefined,
       primary_model_name: form.primary_model_name || undefined,
+      timeout_seconds: normalizeSubagentTimeoutSeconds(form.timeout_seconds) ?? null,
       avatar: form.avatar ?? null,
       avatar_icon_ref: form.avatar_icon_ref,
       avatar_icon_fit: form.avatar_icon_fit,
@@ -12146,6 +12180,12 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
             compatibleSubagentTypesLabel={formatCompatibleSubagentTypes(basicForm.agentType)}
             {assignmentSaveState}
             {assignmentSaveError}
+            workersEnabled={basicForm.workers_enabled}
+            workersMaxConcurrent={WORKERS_MAX_CONCURRENT}
+            workersMaxRunsPerTurn={WORKERS_MAX_RUNS_PER_TURN}
+            onWorkersEnabledChange={(enabled) => {
+              basicForm = { ...basicForm, workers_enabled: enabled };
+            }}
             {accessSaveState}
             {accessSaveError}
             {accessSaveScope}
@@ -12478,6 +12518,42 @@ import { LIVE_SETTINGS_EVENTS, dispatchArtifactUpdated } from "$lib/utils/liveSe
                                 {/if}
                               {/if}
                             </div>
+                          </div>
+                        </div>
+
+                        <div class="batshit-settings-form-row">
+                          <div class="batshit-settings-form-copy">
+                            <div class="batshit-settings-form-label-line">
+                              <Label.Label class="batshit-settings-form-label" for="subagent-timeout">
+                                Call Timeout
+                              </Label.Label>
+                              <DropdownMenu.Root>
+                                <DropdownMenu.Trigger
+                                  class={SETTINGS_INFO_TRIGGER_CLASS}
+                                  aria-label="About Subagent Call Timeout"
+                                >
+                                  <Info class="h-3.5 w-3.5" />
+                                </DropdownMenu.Trigger>
+                                <DropdownMenu.Content
+                                  align="start"
+                                  side="bottom"
+                                  class={SETTINGS_INFO_CONTENT_CLASS}
+                                >
+                                  Leave blank to use the type default: 180 seconds for API and n8n Workflow Subagents, or 300 seconds for CLI Subagents. Custom values can be 10 to 600 seconds.
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Root>
+                            </div>
+                          </div>
+                          <div class="batshit-settings-form-control">
+                            <Input
+                              id="subagent-timeout"
+                              type="number"
+                              min="10"
+                              max="600"
+                              step="1"
+                              placeholder={subagentForm.subagentType === "cli" ? "300" : "180"}
+                              bind:value={subagentForm.timeout_seconds}
+                            />
                           </div>
                         </div>
 

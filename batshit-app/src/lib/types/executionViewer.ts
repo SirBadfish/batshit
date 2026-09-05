@@ -1,4 +1,5 @@
 import type { CacheForensicsRecord } from '$lib/types/cacheForensics'
+import type { DelegatedExecutionSummary } from '$lib/types/delegation'
 
 /**
  * SA-106: `n8n` retired with the n8n Primary Agent type. Execution snapshots recorded
@@ -140,6 +141,8 @@ export interface ExecutionSnapshot {
   intermediateSteps?: any[] | null
   /** Final response summary (assistant output, tool counts, usage) */
   responseSummary?: ExecutionResponseSummary | null
+  /** Subagent/worker calls billed inside this parent response; excluded from context pressure. */
+  delegated?: DelegatedExecutionSummary | null
   reasoningPersistence?: ExecutionReasoningPersistence | null
   selectedGateways?: string[] | null
   selectedTools?: string[] | null

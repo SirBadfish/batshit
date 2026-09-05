@@ -27,6 +27,8 @@ import {
 } from '$lib/server/services/mcpGatewayStdio'
 import { resolveCliToolSelectionScope } from '$lib/server/services/cliToolRegistry'
 import { resolveCliHelperBatshitBaseUrl } from '$lib/server/services/cliHelperBaseUrl'
+import { buildCliSubagentMcpServerName } from '$lib/utils/cliSubagentToolNames'
+import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import type { MCPToolSelections } from '$lib/types/database'
 
 const CLAUDE_DIR_NAME = '.claude'
@@ -227,6 +229,12 @@ async function buildManagedMcpServers(params: {
   dockerAuthToken?: string | null
   n8nInstanceToken?: string | null
   selectedCliToolIds?: string[] | null
+  /**
+   * SA-111 P4 (DL-111-12): whether this profile may advertise `spawn_workers`. Explicit and
+   * false by default — the subagent-profile path passes a synthesized `virtualAgent`, and
+   * `resolveWorkersEnabled` on that record would default to ON.
+   */
+  allowWorkerTools?: boolean
 }) {
   const { gateways, gatewayToolMap } = params
   const enabledGatewaysSet = Array.isArray(params.resolvedGateways)
@@ -293,8 +301,15 @@ async function buildManagedMcpServers(params: {
     ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0))
   )
 
-  if (assigned.length > 0) {
-    const managedId = buildManagedGatewayId(`${params.agent.id}-subagents`, `${params.agent.slug ?? params.agent.id}-subagents`)
+  // SA-111 P4: the same bridge carries `spawn_workers`, so a workers-only agent with no
+  // assigned subagents still needs it registered.
+  if (assigned.length > 0 || params.allowWorkerTools === true) {
+    // SA-111 P1 (AMD-111-01): same length-bounded subagent server name as the Codex profile,
+    // so both managed CLI lanes and the DCM roster agree on one string.
+    const managedId = buildCliSubagentMcpServerName(params.agent)
+    if (!managedId) {
+      throw new Error('Cannot register the subagent MCP bridge without a primary agent id.')
+    }
     const scriptPath = path.join(process.cwd(), 'scripts', 'codex-subagent-mcp.cjs')
     servers[managedId] = {
       type: 'stdio',
@@ -413,7 +428,9 @@ export async function prepareManagedClaudeSubagentProfile(
     resolvedGateways: resolution.resolvedGateways,
     dockerAuthToken,
     n8nInstanceToken,
-    selectedCliToolIds: params.defaultCliToolIds ?? null
+    selectedCliToolIds: params.defaultCliToolIds ?? null,
+    // SA-111 P4 (DL-111-12): a CLI Subagent or Worker profile never gets worker spawning.
+    allowWorkerTools: false
   })
 
   const { settingsPath, mcpPath } = getManagedClaudePaths(params.profileId)
@@ -672,7 +689,9 @@ export async function syncAgentClaudeProfiles(userId: string): Promise<Record<st
       gatewayToolMap,
       resolvedGateways,
       dockerAuthToken,
-      n8nInstanceToken
+      n8nInstanceToken,
+      // SA-111 P4: the PRIMARY profile is the only one allowed to advertise workers.
+      allowWorkerTools: resolveWorkersEnabled(agent)
     })
 
     const { settingsPath, mcpPath } = getManagedClaudePaths(profileId)

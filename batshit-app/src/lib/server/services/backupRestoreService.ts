@@ -73,9 +73,11 @@ const SYSTEM_PROMPT_KEYS = [
   'batshit:batshit_mode3_system_prompt',
   'batshit:batshit_mode4_system_prompt',
   'batshit:sub_system_prompt',
-  'batshit:subagent_instructions',
+  'batshit:worker_prompt',
+  'batshit:subagent_guidance',
   'batshit:tool_guidance_zip_enabled_prompt',
   'batshit:tool_guidance_zip_disabled_prompt',
+  'batshit:tool_guidance_memory_prompt',
   'batshit:dynamic_mcp_prompt',
   'batshit:batshit_primary_system_prompt',
   'batshit:primary_system_prompt',
@@ -83,9 +85,11 @@ const SYSTEM_PROMPT_KEYS = [
   'batshit:batshit_mode3_system_prompt:last_updated',
   'batshit:batshit_mode4_system_prompt:last_updated',
   'batshit:sub_system_prompt:last_updated',
-  'batshit:subagent_instructions:last_updated',
+  'batshit:worker_prompt:last_updated',
+  'batshit:subagent_guidance:last_updated',
   'batshit:tool_guidance_zip_enabled_prompt:last_updated',
   'batshit:tool_guidance_zip_disabled_prompt:last_updated',
+  'batshit:tool_guidance_memory_prompt:last_updated',
   'batshit:dynamic_mcp_prompt:last_updated',
   'batshit:batshit_primary_system_prompt:last_updated',
   'batshit:primary_system_prompt:last_updated',
@@ -1283,6 +1287,11 @@ function isRestorableKeyForUser(key: string, userId: string) {
     'rezipped_item:',
     'session_clip:',
     'subagent_sessions:',
+    // SA-111 P2 (DL-111-06): the Batshit-issued n8n Workflow Subagent thread id. The
+    // conversation itself lives in n8n's Redis and is not Batshit's to back up, but the id
+    // that names it is session data. The in-flight `subagent_lock:` keys are deliberately
+    // absent — transient run state, never restored.
+    'subagent_thread:',
     'pins:',
     'agent:',
     'subagent:',
@@ -1442,6 +1451,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     await addPatternKeys(keys, client, `message:${sessionId}:*`)
     await addPatternKeys(keys, client, `session_clip:${sessionId}:*`)
     await addPatternKeys(keys, client, `subagent_sessions:${sessionId}:subagent:*`)
+    await addPatternKeys(keys, client, `subagent_thread:${sessionId}:*`)
     await addPatternKeys(keys, client, `unzipped_item:${sessionId}:*`)
     await addPatternKeys(keys, client, `rezipped_item:${sessionId}:*`)
     await addPatternKeys(keys, client, `zip_temp:${sessionId}:*`)

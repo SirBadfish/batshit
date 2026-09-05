@@ -6,10 +6,10 @@ const cliSubagentMocks = vi.hoisted(() => ({
   prepareManagedCodexSubagentProfile: vi.fn(),
   prepareManagedClaudeSubagentProfile: vi.fn(),
   buildAgentProfileId: vi.fn((value: string) => `profile-${value}`),
-  redisGet: vi.fn(),
   redisGetUserSettings: vi.fn(),
-  redisJsonGet: vi.fn(),
-  redisJsonSet: vi.fn(),
+  // SA-111 P2: the runner's thread control and in-flight lock are Redis SEMANTICS, so this
+  // suite runs them against a real in-memory store rather than per-method stubs.
+  redisStore: { current: null as any },
   resolveManagedSubagentScope: vi.fn(),
   buildManagedSubagentDynamicInfo: vi.fn(),
   getEnabledAgentSlashCapabilities: vi.fn(),
@@ -44,14 +44,14 @@ vi.mock('$lib/server/services/claudeProfileManager', () => ({
 }))
 
 vi.mock('$lib/server/redis', () => ({
-  redis: {
-    get: (...args: any[]) => cliSubagentMocks.redisGet(...args),
-    getUserSettings: (...args: any[]) => cliSubagentMocks.redisGetUserSettings(...args),
-    json: {
-      get: (...args: any[]) => cliSubagentMocks.redisJsonGet(...args),
-      set: (...args: any[]) => cliSubagentMocks.redisJsonSet(...args),
+  redis: new Proxy({} as Record<string, any>, {
+    get(_target, prop: string) {
+      if (prop === 'getUserSettings') {
+        return (...args: any[]) => cliSubagentMocks.redisGetUserSettings(...args)
+      }
+      return cliSubagentMocks.redisStore.current.redis[prop]
     },
-  },
+  }),
 }))
 
 vi.mock('$lib/server/services/subagentRuntimeScope', () => ({
@@ -70,7 +70,12 @@ vi.mock('$lib/server/services/slashCommandCapabilities', () => ({
     cliSubagentMocks.buildSkillsCommandsDcmLines(...args),
 }))
 
+import { createSubagentRedisMock } from '$lib/test-utils/subagent-redis-mock'
+import { buildSubagentRunLockKey, buildSubagentThreadKey } from '../subagentThreads'
 import { executeManagedSubagent } from '../subagentRunner'
+
+const subagentRedis = createSubagentRedisMock()
+cliSubagentMocks.redisStore.current = subagentRedis
 
 function streamFromChunks(chunks: any[]) {
   return {
@@ -86,10 +91,9 @@ describe('executeManagedSubagent - CLI subagents', () => {
   beforeEach(() => {
     vi.clearAllMocks()
 
-    cliSubagentMocks.redisGet.mockResolvedValue('# Base subagent prompt')
+    subagentRedis.clear()
+    subagentRedis.seed('batshit:sub_system_prompt', '# Base subagent prompt')
     cliSubagentMocks.redisGetUserSettings.mockResolvedValue(null)
-    cliSubagentMocks.redisJsonGet.mockResolvedValue([])
-    cliSubagentMocks.redisJsonSet.mockResolvedValue('OK')
     cliSubagentMocks.resolveManagedSubagentScope.mockResolvedValue({
       subagentType: 'cli',
       nativeToolSettings: {},
@@ -128,6 +132,14 @@ describe('executeManagedSubagent - CLI subagents', () => {
           args: { filePath: '/tmp/demo.txt' },
           result: { success: true },
           metadata: { toolProvider: 'batshit-server' },
+        },
+        {
+          type: 'finish',
+          totalUsage: {
+            inputTokens: 220,
+            outputTokens: 44,
+            totalTokens: 264,
+          },
         },
       ]),
       __detectToolSource: vi.fn(() => ({
@@ -183,7 +195,7 @@ describe('executeManagedSubagent - CLI subagents', () => {
     ).toBe('codex-mini-latest')
     expect(cliSubagentMocks.codexStreamNativeMode.mock.calls[0]?.[0]).toMatchObject({
       assignedSubagents: [],
-      abortSignal: abortController.signal,
+      abortSignal: expect.any(AbortSignal),
     })
     expect(
       cliSubagentMocks.prepareManagedCodexSubagentProfile.mock.calls[0]?.[0]?.runtimeSettings?.enableFeatures,
@@ -196,6 +208,14 @@ describe('executeManagedSubagent - CLI subagents', () => {
       toolProvider: 'batshit-server',
       toolSource: 'native-tool',
     })
+    expect(result).toMatchObject({
+      usage: { inputTokens: 220, outputTokens: 44, totalTokens: 264 },
+      modelId: 'codex-mini-latest',
+      provider: 'openai-codex',
+      status: 'completed',
+      thread: 'fresh',
+    })
+    expect(result.durationMs).toBeGreaterThanOrEqual(0)
   })
 
   it('treats codex-cli saved-model sentinels as lane selectors, not runnable models', async () => {
@@ -319,5 +339,41 @@ describe('executeManagedSubagent - CLI subagents', () => {
       toolProvider: 'batshit-server',
       toolSource: 'native-tool',
     })
+  })
+
+  it('returns failed status when the CLI bridge fails and releases the thread lock', async () => {
+    cliSubagentMocks.codexStreamNativeMode.mockRejectedValueOnce(
+      new Error('Codex transport failed'),
+    )
+
+    const subagent = {
+      id: 'failure-helper',
+      user_id: 'user-1',
+      displayName: 'Failure Helper',
+      subagentType: 'cli' as const,
+      primary_model_provider: 'openai-codex',
+      primary_model_name: 'codex-cli',
+      codex_settings: { model: 'gpt-5.4' },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }
+
+    const failed = await executeManagedSubagent({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      chatInput: 'Fail clearly.',
+      subagent,
+    } as any)
+
+    expect(failed).toMatchObject({
+      status: 'failed',
+      usage: null,
+      modelId: 'gpt-5.4',
+      provider: 'openai-codex',
+      thread: 'fresh',
+    })
+    expect(failed.output).toContain('Codex transport failed')
+    expect(subagentRedis.snapshot()[buildSubagentRunLockKey('session-1', 'failure_helper')])
+      .toBeUndefined()
   })
 })

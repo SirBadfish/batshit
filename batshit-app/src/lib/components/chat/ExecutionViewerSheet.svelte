@@ -149,6 +149,7 @@
     Array.isArray(currentSnapshot?.intermediateSteps) ? currentSnapshot?.intermediateSteps : null,
   )
   const responseSummary = $derived(currentSnapshot?.responseSummary ?? null)
+  const delegated = $derived(currentSnapshot?.delegated ?? null)
   const reasoningPersistence = $derived(currentSnapshot?.reasoningPersistence ?? null)
   // SA-106: webhook input was an n8n-Primary-only snapshot surface. Old stored
   // snapshots may still carry an explicit availability record, so it is still read;
@@ -170,6 +171,7 @@
 	      llmCalls: _llmCalls,
 	      intermediateSteps: _intermediateSteps,
 	      responseSummary: _responseSummary,
+	      delegated: _delegated,
 	      runtime: runtimeRaw,
 	      ...rest
 	    } = snapshot
@@ -661,6 +663,29 @@
     return `${(value / 1000).toFixed(1)} s`
   }
 
+  function delegatedTokenTotal(usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | null): number | null {
+    if (typeof usage?.totalTokens === 'number') return usage.totalTokens
+    if (
+      typeof usage?.inputTokens === 'number' &&
+      typeof usage?.outputTokens === 'number'
+    ) {
+      return usage.inputTokens + usage.outputTokens
+    }
+    return null
+  }
+
+  function delegatedStatusLabel(status: 'completed' | 'failed' | 'timed_out'): string {
+    if (status === 'timed_out') return 'Timed out'
+    if (status === 'failed') return 'Failed'
+    return 'Completed'
+  }
+
+  function delegatedStatusClasses(status: 'completed' | 'failed' | 'timed_out'): string {
+    return status === 'completed'
+      ? 'execution-viewer-tool-status-success'
+      : 'execution-viewer-tool-status-error'
+  }
+
   function tokenBadgeText(label: string, stat: ExecutionTokenStat): string {
     return `${label}: ${formatTokenValue(stat.value)}`
   }
@@ -831,6 +856,7 @@
   let openMemoryContext = $state(false)
   let openCompiledMessages = $state(false)
   let openResponse = $state(false)
+  let openDelegated = $state(true)
   let openRawEvents = $state(false)
   let openRawSnapshotRequest = $state(false)
   let openRawProviderResponses = $state(false)
@@ -1586,6 +1612,84 @@
             </Collapsible.Content>
           </Collapsible.Root>
         </div>
+
+        {#if delegated && delegated.runs.length > 0}
+          <div class="execution-viewer-stack-lg execution-viewer-section-block">
+            <div class="execution-viewer-eyebrow">Delegation</div>
+
+            <Collapsible.Root bind:open={openDelegated}>
+              <Collapsible.Trigger class="execution-viewer-section-trigger">
+                <div class="execution-viewer-section-label">
+                  <span class="execution-viewer-section-heading">Delegated runs</span>
+                  <span class="execution-viewer-helper">
+                    Subagent and worker usage billed inside this parent response
+                  </span>
+                </div>
+                <div class="execution-viewer-inline-row">
+                  <Badge variant="outline" class="execution-viewer-confidence-badge execution-viewer-confidence-exact">
+                    Runs: {delegated.totals.runs}
+                  </Badge>
+                  <ChevronDown class="execution-viewer-section-chevron" data-open={openDelegated} />
+                </div>
+              </Collapsible.Trigger>
+              <Collapsible.Content class="execution-viewer-section-content">
+                <div class="execution-viewer-table-wrap">
+                  <table class="execution-viewer-table">
+                    <thead class="execution-viewer-table-head">
+                      <tr>
+                        <th class="execution-viewer-table-heading">Run</th>
+                        <th class="execution-viewer-table-heading">Type</th>
+                        <th class="execution-viewer-table-heading">Model</th>
+                        <th class="execution-viewer-table-heading">Tokens</th>
+                        <th class="execution-viewer-table-heading">Duration</th>
+                        <th class="execution-viewer-table-heading">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each delegated.runs as run, index}
+                        <tr class="execution-viewer-table-row">
+                          <td class="execution-viewer-table-primary-cell">
+                            <div class="execution-viewer-value">{run.name}</div>
+                            <div class="execution-viewer-helper">{run.kind} {index + 1}</div>
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            <div class="execution-viewer-value">{run.type}</div>
+                            {#if run.thread}
+                              <div class="execution-viewer-helper">Thread: {run.thread}</div>
+                            {/if}
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            <div class="execution-viewer-value">{run.model ?? 'Unknown'}</div>
+                            <div class="execution-viewer-helper">{run.provider ?? 'Unknown provider'}</div>
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            {formatTokenValue(delegatedTokenTotal(run.usage))}
+                          </td>
+                          <td class="execution-viewer-table-muted-cell">
+                            {formatDuration(run.durationMs)}
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            <Badge
+                              variant="outline"
+                              class={`execution-viewer-confidence-badge ${delegatedStatusClasses(run.status)}`}
+                            >
+                              {delegatedStatusLabel(run.status)}
+                            </Badge>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+                {#if delegated.totals.usageUnknownRuns > 0}
+                  <div class="execution-viewer-note execution-viewer-note-sm">
+                    {delegated.totals.usageUnknownRuns} delegated {delegated.totals.usageUnknownRuns === 1 ? 'run did' : 'runs did'} not report usage. Unknown values are not counted as zero.
+                  </div>
+                {/if}
+              </Collapsible.Content>
+            </Collapsible.Root>
+          </div>
+        {/if}
 
         <div class="execution-viewer-stack-lg execution-viewer-section-block">
           <div class="execution-viewer-eyebrow">Response</div>

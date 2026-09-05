@@ -157,6 +157,10 @@ export interface AgentRow {
   // through resolveAgentMemoryEnabled(). The Settings toggle ships in P5.
   memory_enabled?: boolean | null
 
+  // SA-111 P4: per-agent Workers enablement (DL-111-11). Default ON for API and CLI
+  // primaries; resolved only through resolveWorkersEnabled().
+  workers_enabled?: boolean | null
+
   // Reasoning / thinking rendering (SA-018)
   show_reasoning?: boolean
   preserve_reasoning?: boolean
@@ -448,6 +452,8 @@ export interface SubagentRow {
   // AI Provider settings
   primary_model_provider?: string
   primary_model_name?: string
+  /** Optional per-call timeout override. Blank uses the type default. */
+  timeout_seconds?: number
   primary_model_temperature?: number
   primary_model_max_tokens?: number
   primary_model_top_p?: number

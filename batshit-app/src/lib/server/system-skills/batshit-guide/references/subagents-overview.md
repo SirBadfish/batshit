@@ -1,8 +1,10 @@
-# Subagents
+# Subagents and Workers
 
 A Subagent is a smaller assistant a Primary Agent can call when it needs specialized help. You still talk to the Primary Agent. It decides when to call a Subagent, hands it a task, receives the result, and continues the conversation.
 
 Think of Subagents as teammates the Primary Agent delegates to, not as general MCP tools. They show up internally as tool calls, but the idea is still "an assistant called by another assistant."
+
+A **Worker** is a temporary helper for one task. Your Primary Agent can start Workers without creating a saved specialist first. It receives their results and stays responsible for the answer you see.
 
 ## Subagent types
 
@@ -29,6 +31,12 @@ Use a Subagent when a recurring piece of work deserves its own instructions, mod
 - A tool-heavy helper with narrower permissions than the Primary Agent.
 
 For a small one-off action with a clear input and output, a normal tool is usually simpler.
+
+## How the Primary Agent chooses a helper
+
+Each message includes a current roster of assigned Subagents: their descriptions, type, model, tool capabilities, assigned Skills, and whether a conversation can be resumed. This roster lives in the Dynamic Current Message (DCM), which you can inspect in the [Execution Viewer](../chat/execution-viewer.md). For n8n Workflow Subagents, the roster says the tools are defined in n8n.
+
+The system prompt separately teaches the Primary Agent when and how to delegate. **Every API and CLI Primary Agent receives this guidance by default**, because Workers start enabled. To remove it from an agent with no assigned Subagents, turn **Workers** off in Agent Settings beside the Subagent assignments. An agent with assigned Subagents still needs the delegation guidance when Workers are off. The setting takes effect on the next message without reloading Batshit.
 
 ## How a Subagent differs from a tool
 
@@ -61,6 +69,44 @@ Each Subagent has its own Tool Grid. Depending on type and configuration, Subage
 Broad Batshit control-plane tools stay Primary Agent territory. Subagents can use published Artifact runtime tools, but they do not get broad Fabric controls for changing the whole app.
 
 Fetch Zip is Primary-only. If a Subagent needs context from a large prior result, have the Primary Agent fetch or summarize it first.
+
+## Start fresh or continue a conversation
+
+Subagent calls start **fresh** by default. The Subagent gets the task the Primary Agent sends, without the conversation from its previous call.
+
+The Primary Agent can ask to **resume** when a follow-up depends on the Subagent's previous work. For example, after a code review, it can ask the same specialist to check the corrected version in the same conversation.
+
+- A fresh call **erases the stored thread**. It does not set it aside for later. Do not start fresh between calls you want to resume.
+- Resuming without a previous thread starts fresh and reports that fact.
+- Each Subagent has one thread per chat. A new chat starts separately; Group Chat members who share a Subagent also share its thread.
+- Calls to the same Subagent wait for each other, so they cannot overwrite the same conversation. Different Subagents can work at the same time.
+
+The tool argument is `thread: "fresh"` or `thread: "resume"`; normally your Primary Agent chooses it from your request. n8n Workflow Subagents need the current official template, or the matching [thread-key setup](../user-templates/batshit-official-n8n-workflow-templates/README.md#conversation-threads), to honor this choice.
+
+## Workers
+
+Workers handle independent research, review, drafting, or other focused tasks in parallel. Each runs once, returns a result, and keeps no conversation to resume. They receive the task brief and the active Project path, without inheriting the parent chat history, Clips, or global custom prompt.
+
+There are two choices:
+
+| Worker | Model and instructions | Tools and Skills |
+| --- | --- | --- |
+| Built-in general Worker | Uses the Primary Agent's model and API connection or CLI, with Batshit's Worker instructions. | Inherits the parent's enabled tool scope, **not the parent's Skills**. |
+| Fresh copy of a specialist | Uses an assigned API or CLI Subagent's model and custom instructions. | Keeps that Subagent's own tools and Skills, without its saved conversation. |
+
+The Primary Agent selects the specialist with the `base` argument. n8n Workflow Subagents cannot be copied into Workers because n8n owns their workflow and memory; call those as Subagents instead.
+
+Workers cannot use broad app-management or memory tools, call Subagents, or start more Workers. Subagents also cannot delegate further. Both must finish without pausing for user approval. Their output is a result for the Primary Agent to check.
+
+Batshit allows **three Workers in one call, three running at once, and nine Worker runs during one Primary Agent turn**. Going over a limit returns a clear refusal. The Workers card shows each helper's status, duration, reported usage, and result. Workers operate within the speaking agent's turn in Group Chat.
+
+Claude Code can also run its own native helpers. These are labeled **Claude Code Helper**; Batshit's Worker limits and thread controls do not govern them.
+
+## Time limits and cost
+
+API and n8n Workflow Subagents default to three minutes per call; CLI Subagents default to five minutes. Set **Call Timeout** in the Subagent's Agent Settings to override its default with 10–600 seconds, or leave it blank to use the default. Workers default to three minutes; a copy of a specialist honors that specialist's explicit timeout override. A timeout is shown as a timed-out result, not a completed task.
+
+The Token Panel includes reported Subagent and Worker usage in the conversation's token and cost totals. The context meter measures only the Primary Agent's own context: a helper's entire conversation does not count against that window, although its returned result does. The [Execution Viewer](../chat/execution-viewer.md#delegated-runs) lists each delegated run separately. Missing usage or pricing is shown as unknown, not zero; the official n8n templates do not report token usage.
 
 ## Non-streaming behavior
 

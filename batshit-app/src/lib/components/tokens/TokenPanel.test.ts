@@ -12,6 +12,7 @@ describe('TokenPanel', () => {
         trimmedTokens: 0,
         costLabel: '$0.12',
         costDetail: 'Estimated running cost',
+        delegatedDetail: 'Delegated (subagents/workers): 1,500 tokens · $0.0068',
         onTrim: vi.fn(),
         onCompact: vi.fn(),
         onResetTrim: vi.fn(),
@@ -50,6 +51,7 @@ describe('TokenPanel', () => {
         contextLimit: 128000,
         costLabel: '$0.12',
         costDetail: 'Estimated running cost',
+        delegatedDetail: 'Delegated (subagents/workers): 1,500 tokens · $0.0068',
       },
     })
 
@@ -74,6 +76,7 @@ describe('TokenPanel', () => {
         contextDetail: 'Context meter is showing a live compiled estimate after the active response changed since the last send.',
         costLabel: '$0.12',
         costDetail: 'Estimated running cost',
+        delegatedDetail: 'Delegated (subagents/workers): 1,500 tokens · $0.0068',
         onTrim: vi.fn(),
         onCompact: vi.fn(),
         onResetTrim: vi.fn(),
@@ -87,6 +90,9 @@ describe('TokenPanel', () => {
 
     expect(await screen.findByText('Running chat cost')).toBeInTheDocument()
     expect(screen.getByText('Estimated running cost')).toBeInTheDocument()
+    expect(
+      screen.getByText('Delegated (subagents/workers): 1,500 tokens · $0.0068'),
+    ).toBeInTheDocument()
     expect(screen.getByText('Context window estimate')).toBeInTheDocument()
     expect(screen.getByText(/active response changed/)).toBeInTheDocument()
   })

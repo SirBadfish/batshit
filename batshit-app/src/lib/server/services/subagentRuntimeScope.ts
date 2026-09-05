@@ -1,6 +1,10 @@
 import { redis } from '$lib/server/redis'
 import type { AgentDcmDisplaySettings, MCPToolSelections, SubagentRow } from '$lib/types/database'
-import { buildSkillsCommandsDcmLines, getEnabledAgentSlashCapabilities } from '$lib/server/services/slashCommandCapabilities'
+import {
+  buildSkillsCommandsDcmLines,
+  getEnabledAgentSlashCapabilities,
+  type AgentSlashCapability
+} from '$lib/server/services/slashCommandCapabilities'
 import {
   buildDynamicMcpIndex,
   normalizeDcmDisplaySettings,
@@ -126,8 +130,15 @@ export async function buildManagedSubagentDynamicInfo(options: {
   subagent: SubagentRow
   sessionId?: string | null
   projectPath?: string | null
+  /**
+   * SA-111 P1: the canonical compiler resolves the scope and the slash capabilities once
+   * per subagent per compile and passes them in, so building the DCM roster's capability
+   * line costs no extra Redis work (DL-111-03: "cached per compile").
+   */
+  scope?: SubagentResolvedScope
+  capabilities?: AgentSlashCapability[]
 }): Promise<string> {
-  const scope = await resolveManagedSubagentScope(options)
+  const scope = options.scope ?? (await resolveManagedSubagentScope(options))
   const lines: string[] = []
 
   if (scope.projectPath) {
@@ -165,7 +176,9 @@ export async function buildManagedSubagentDynamicInfo(options: {
     lines.push('', mcpIndex.text.trim())
   }
 
-  const capabilities = await getEnabledAgentSlashCapabilities(options.userId, options.subagent.id)
+  const capabilities =
+    options.capabilities ??
+    (await getEnabledAgentSlashCapabilities(options.userId, options.subagent.id))
   const skillsLines = buildSkillsCommandsDcmLines(capabilities)
   if (skillsLines.length > 0) {
     lines.push('', ...skillsLines)

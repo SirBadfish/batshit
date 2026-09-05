@@ -38,6 +38,12 @@ import {
   buildSubagentSlugCollisionError,
   normalizeSubagentSlugValue
 } from '$lib/utils/subagentSlug'
+import {
+  CLI_WORKER_SPAWN_TOOL_NAME,
+  buildCliSubagentMcpServerName,
+  buildCliSubagentMcpToolNameForKey
+} from '$lib/utils/cliSubagentToolNames'
+import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import toml from '@iarna/toml'
 const { parse: parseToml, stringify: stringifyToml } = toml
 
@@ -340,7 +346,9 @@ export async function syncAgentCodexProfiles(userId: string) {
         resolution,
         agent,
         userId,
-        n8nInstanceToken
+        n8nInstanceToken,
+        // SA-111 P4: the PRIMARY profile is the only one allowed to advertise workers.
+        allowWorkerTools: resolveWorkersEnabled(agent)
       })
     } catch (error) {
       console.error('[CodexProfileManager] Failed to resolve MCP selections for agent', agent.id, error)
@@ -420,6 +428,13 @@ async function buildManagedServers(params: {
   userId?: string
   n8nInstanceToken?: string | null
   selectedCliToolIds?: string[] | null
+  /**
+   * SA-111 P4 (DL-111-12): whether this profile may advertise `spawn_workers`. Passed
+   * EXPLICITLY and defaulting to false because the subagent-profile path builds a
+   * synthesized `virtualAgent` — reading `resolveWorkersEnabled` off that record would
+   * default to ON and hand a CLI Subagent the ability to spawn workers.
+   */
+  allowWorkerTools?: boolean
 }): Promise<ManagedServerEntry[]> {
   const { gateways, resolution } = params
   const dockerAuthTokenPresent = Boolean(getDockerGatewayAuthToken())
@@ -560,11 +575,24 @@ async function buildManagedServers(params: {
       )
     : []
 
-  if (params.agent && assigned.length > 0) {
-    const managedId = buildManagedGatewayId(`${params.agent.id}-subagents`, `${params.agent.slug ?? params.agent.id}-subagents`)
+  // SA-111 P4: the same bridge now also carries `spawn_workers`, so it registers when the
+  // agent has assigned subagents OR workers enabled — a workers-only agent still needs it.
+  const workerToolsAllowed = params.allowWorkerTools === true
+  if (params.agent && (assigned.length > 0 || workerToolsAllowed)) {
+    // SA-111 P1 (AMD-111-01): the subagent bridge gets its own length-bounded server name
+    // so `mcp__<server>__<tool>` never exceeds Codex's 64-character function-name limit and
+    // the DCM roster can print the exact name the CLI exposes. Other managed gateways keep
+    // `buildManagedGatewayId` unchanged.
+    const managedId = buildCliSubagentMcpServerName(params.agent)
+    if (!managedId) {
+      throw new Error('Cannot register the subagent MCP bridge without a primary agent id.')
+    }
     const scriptPath = path.join(process.cwd(), 'scripts', 'codex-subagent-mcp.cjs')
     const helperBaseUrl = resolveCliHelperBatshitBaseUrl()
-    const enabledTools = buildSubagentBridgeEnabledTools(assigned)
+    const enabledTools = [
+      ...buildSubagentBridgeEnabledTools(assigned),
+      ...(workerToolsAllowed ? [CLI_WORKER_SPAWN_TOOL_NAME] : []),
+    ]
 
     servers.push({
       gatewayId: `${params.agent.id}-subagents`,
@@ -587,7 +615,8 @@ async function buildManagedServers(params: {
 	        'PUBLIC_BASE_URL',
 	        'ORIGIN',
 	        'BATSHIT_SESSION_ID',
-	        'BATSHIT_MANAGED_SUBAGENT_TIMEOUT_MS',
+	        // SA-111 P4: the parent turn id, so the bridge can pass it to the Workers cap.
+	        'BATSHIT_MESSAGE_ID',
 	      ],
       managedId,
       slug: `${params.agent.slug ?? params.agent.id}_subagents`,
@@ -711,7 +740,9 @@ export async function prepareManagedCodexSubagentProfile(
     agent: virtualAgent,
     userId: params.userId,
     n8nInstanceToken,
-    selectedCliToolIds: params.defaultCliToolIds ?? null
+    selectedCliToolIds: params.defaultCliToolIds ?? null,
+    // SA-111 P4 (DL-111-12): a CLI Subagent or Worker profile never gets worker spawning.
+    allowWorkerTools: false
   })
 
   try {
@@ -1251,7 +1282,7 @@ function buildSubagentBridgeEnabledTools(assignedSubagentIds: string[]) {
       throw buildSubagentSlugCollisionError(key, existing, id)
     }
     usedKeys.set(key, id)
-    tools.push(`subagent_${key}`)
+    tools.push(buildCliSubagentMcpToolNameForKey(key))
   }
 
   return tools.sort()

@@ -489,6 +489,11 @@ export interface RunningCostSummary {
   cost: number | null
   state: RunningCostState
   note: string
+  delegatedTokens: number | null
+  delegatedCost: number | null
+  delegatedRunCount: number
+  delegatedUsageUnknownRuns: number
+  delegatedCostUnknownRuns: number
 }
 
 export type ContextUsageState = 'exact' | 'near' | 'estimated' | 'unknown'
@@ -847,23 +852,134 @@ export function summarizeContextUsage(params: {
   }
 }
 
+function findDelegatedSavedModel(
+  modelId: string | null,
+  provider: string | null,
+  models: SavedModel[],
+): SavedModel | null {
+  const wantedModel = normalize(modelId)
+  if (!wantedModel) return null
+  const wantedProvider = normalize(provider)
+
+  const matches = models.filter((model) => {
+    const modelIds = [
+      model.modelId,
+      model.effectiveModelId,
+      model.settings?.model,
+      model.settings?.codex_model,
+      model.settings?.claude_model,
+    ].map((value) => normalize(typeof value === 'string' ? value : null))
+    if (!modelIds.includes(wantedModel)) return false
+    if (!wantedProvider) return true
+    const connection = resolveSavedModelConnection(model)
+    return (
+      normalize(model.provider) === wantedProvider ||
+      normalize(connection.service) === wantedProvider
+    )
+  })
+
+  return matches[0] ?? null
+}
+
+function summarizeDelegatedCost(
+  snapshots: ExecutionSnapshot[],
+  models: SavedModel[],
+): Pick<
+  RunningCostSummary,
+  | 'delegatedTokens'
+  | 'delegatedCost'
+  | 'delegatedRunCount'
+  | 'delegatedUsageUnknownRuns'
+  | 'delegatedCostUnknownRuns'
+> {
+  let delegatedTokens = 0
+  let delegatedCost = 0
+  let delegatedRunCount = 0
+  let delegatedUsageUnknownRuns = 0
+  let delegatedCostUnknownRuns = 0
+  let tokenKnownRuns = 0
+  let costKnownRuns = 0
+
+  for (const snapshot of snapshots) {
+    for (const run of snapshot.delegated?.runs ?? []) {
+      delegatedRunCount += 1
+      const usage = run.usage
+      if (!usage) {
+        delegatedUsageUnknownRuns += 1
+        delegatedCostUnknownRuns += 1
+        continue
+      }
+
+      const totalTokens =
+        typeof usage.totalTokens === 'number'
+          ? usage.totalTokens
+          : typeof usage.inputTokens === 'number' && typeof usage.outputTokens === 'number'
+            ? usage.inputTokens + usage.outputTokens
+            : null
+      if (totalTokens !== null) {
+        tokenKnownRuns += 1
+        delegatedTokens += totalTokens
+      } else {
+        delegatedUsageUnknownRuns += 1
+      }
+
+      const model = findDelegatedSavedModel(run.model, run.provider, models)
+      const inputPrice = model ? getFlatPrice(model.pricing.input) : null
+      const outputPrice = model ? getFlatPrice(model.pricing.output) : null
+      if (
+        !model ||
+        inputPrice === null ||
+        outputPrice === null ||
+        typeof usage.inputTokens !== 'number' ||
+        typeof usage.outputTokens !== 'number'
+      ) {
+        delegatedCostUnknownRuns += 1
+        continue
+      }
+
+      const cachedTokens = Math.max(0, usage.cachedInputTokens ?? 0)
+      const uncachedTokens = Math.max(0, usage.inputTokens - cachedTokens)
+      const cachedPrice =
+        typeof model.pricing.cachedInput === 'number' && Number.isFinite(model.pricing.cachedInput)
+          ? model.pricing.cachedInput
+          : inputPrice
+      delegatedCost += (uncachedTokens / 1_000_000) * inputPrice
+      delegatedCost += (cachedTokens / 1_000_000) * cachedPrice
+      delegatedCost += (usage.outputTokens / 1_000_000) * outputPrice
+      costKnownRuns += 1
+    }
+  }
+
+  return {
+    delegatedTokens: tokenKnownRuns > 0 ? delegatedTokens : null,
+    delegatedCost: costKnownRuns > 0 ? delegatedCost : null,
+    delegatedRunCount,
+    delegatedUsageUnknownRuns,
+    delegatedCostUnknownRuns,
+  }
+}
+
 export function summarizeRunningCost(
   snapshots: ExecutionSnapshot[],
   activeModel: SavedModel | null,
-  agent: Agent | null | undefined
+  agent: Agent | null | undefined,
+  models: SavedModel[] = [],
 ): RunningCostSummary {
+  const delegated = summarizeDelegatedCost(snapshots, models)
   if (!activeModel) {
     return {
       cost: null,
       state: 'unknown',
-      note: 'Model pricing is unavailable for this agent.'
+      note: 'Model pricing is unavailable for this agent.',
+      ...delegated,
     }
   }
 
   const inputPrice = getFlatPrice(activeModel.pricing.input)
   const outputPrice = getFlatPrice(activeModel.pricing.output)
   const cachedInputPrice =
-    typeof activeModel.pricing.cachedInput === 'number' && Number.isFinite(activeModel.pricing.cachedInput)
+    typeof activeModel.pricing.cachedInput === 'number' &&
+    Number.isFinite(activeModel.pricing.cachedInput)
       ? activeModel.pricing.cachedInput
       : null
 
@@ -871,7 +987,8 @@ export function summarizeRunningCost(
     return {
       cost: null,
       state: 'unknown',
-      note: 'Cost is unavailable because this model uses pricing data Batshit cannot flatten into a truthful per-run number yet.'
+      note: 'Cost is unavailable because this model uses pricing data Batshit cannot flatten into a truthful per-run number yet.',
+      ...delegated,
     }
   }
 
@@ -900,8 +1017,7 @@ export function summarizeRunningCost(
       }
       const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens)
       total += (uncachedInputTokens / 1_000_000) * inputPrice
-      total +=
-        (cachedInputTokens / 1_000_000) * (cachedInputPrice ?? inputPrice)
+      total += (cachedInputTokens / 1_000_000) * (cachedInputPrice ?? inputPrice)
     } else {
       total += (inputTokens / 1_000_000) * inputPrice
     }
@@ -919,11 +1035,28 @@ export function summarizeRunningCost(
     }
   }
 
+  if (delegated.delegatedCost !== null) {
+    total += delegated.delegatedCost
+    hasUsage = true
+  }
+  if (delegated.delegatedCostUnknownRuns > 0) {
+    estimated = true
+  }
+
   if (!hasUsage) {
+    if (delegated.delegatedRunCount > 0) {
+      return {
+        cost: null,
+        state: 'unknown',
+        note: 'Delegated runs were recorded, but their usage or model pricing was not available for a truthful cost total.',
+        ...delegated,
+      }
+    }
     return {
       cost: 0,
       state: 'exact',
-      note: 'No completed runs yet for this chat.'
+      note: 'No completed runs yet for this chat.',
+      ...delegated,
     }
   }
 
@@ -931,13 +1064,15 @@ export function summarizeRunningCost(
     return {
       cost: total,
       state: 'estimated',
-      note: 'Running cost uses the current model pricing plus stored run usage. Mixed models or missing runtime identity make this an estimate.'
+      note: 'Running cost includes parent and delegated run usage. Mixed models, missing usage, or missing runtime identity make this an estimate.',
+      ...delegated,
     }
   }
 
   return {
     cost: total,
     state: 'exact',
-    note: 'Running cost is based on stored run usage and the current model pricing.'
+    note: 'Running cost is based on stored parent and delegated run usage with matching model pricing.',
+    ...delegated,
   }
 }

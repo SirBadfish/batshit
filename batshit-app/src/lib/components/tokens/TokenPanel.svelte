@@ -24,6 +24,7 @@
     costLabel = 'Unknown',
     costDetail = 'Cost is unavailable.',
     costState = 'unknown',
+    delegatedDetail = null,
     trimAvailable = false,
     trimUnavailableReason = 'Manual trim is unavailable.',
     trimBusy = false,
@@ -70,6 +71,7 @@
     costLabel?: string
     costDetail?: string
     costState?: 'exact' | 'estimated' | 'unknown'
+    delegatedDetail?: string | null
     trimAvailable?: boolean
     trimUnavailableReason?: string
     trimBusy?: boolean
@@ -264,6 +266,9 @@
             <div class="token-panel-tooltip-section">
               <div class="token-panel-tooltip-title">Running chat cost</div>
               <div>{costDetail}</div>
+              {#if delegatedDetail}
+                <div>{delegatedDetail}</div>
+              {/if}
             </div>
             {#if contextDetail}
               <div class="token-panel-tooltip-section">

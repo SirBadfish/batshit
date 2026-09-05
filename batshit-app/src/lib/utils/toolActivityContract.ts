@@ -56,6 +56,8 @@ export type ToolOperationKind =
   | 'fabric_find'
   | 'fabric_use'
   | 'subagent'
+  // SA-111 P4: one `spawn_workers` batch call carrying up to three worker runs.
+  | 'workers'
   | 'unknown_tool'
 
 export type ToolRendererFamily =
@@ -71,6 +73,7 @@ export type ToolRendererFamily =
   | 'cli_tool'
   | 'generic_tool'
   | 'subagent'
+  | 'workers'
 
 export type ToolRawSidecarPolicy = 'always' | 'limited' | 'never'
 
@@ -321,6 +324,7 @@ function normalizeExplicitOperationKind(value: unknown): ToolOperationKind | nul
     case 'fabric_find':
     case 'fabric_use':
     case 'subagent':
+    case 'workers':
     case 'unknown_tool':
       return normalized as ToolOperationKind
     default:
@@ -2485,6 +2489,10 @@ export function resolveToolOperationKind(input: CompactToolInput): ToolOperation
   if (brokerOperationKind && (names.includes('batshit_tool_use') || names.includes('native_batshit_tool_use'))) {
     return brokerOperationKind
   }
+  // SA-111 P4: workers before subagents. A worker batch is its own card, and the CLI
+  // lane's name (`mcp__batshit_gateway_<seg>__spawn_workers`) must resolve the same way
+  // the API lane's `native_spawn_workers` does.
+  if (names.some((name) => name.includes('spawn_workers'))) return 'workers'
   if (input.isSubagent || input.toolProvider === 'subagent') return 'subagent'
   if (names.some((name) => name.includes('subagent_') || name === 'call_subagent')) return 'subagent'
   if (isNativeAutomationPack) {
@@ -2575,6 +2583,8 @@ export function resolveToolRendererFamily(operationKind: ToolOperationKind): Too
       return 'cli_tool'
     case 'subagent':
       return 'subagent'
+    case 'workers':
+      return 'workers'
     case 'dynamic_use':
     case 'unknown_tool':
     default:
@@ -2588,6 +2598,7 @@ export function resolveRawSidecarPolicy(operationKind: ToolOperationKind): ToolR
     case 'skill_read':
     case 'edit_file':
     case 'subagent':
+    case 'workers':
       return 'always'
     case 'write_file':
     case 'web_search':
@@ -2924,6 +2935,7 @@ function compactToolArgs(operationKind: ToolOperationKind, toolArgs: Record<stri
             : {})
       }
     case 'subagent':
+    case 'workers':
       return summarizeValue(toolArgs) as Record<string, any>
     case 'unknown_tool':
     default:
@@ -3081,7 +3093,10 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
       flags = summarized.flags
       break
     }
-    case 'subagent': {
+    case 'subagent':
+    // SA-111 P4: a worker batch summarizes the same way — the full per-worker output lives
+    // in the zip, and the compact form keeps the card readable.
+    case 'workers': {
       const summarized = summarizeSubagentResult(toolResult)
       compactResult = summarized.result
       flags = summarized.flags

@@ -140,6 +140,19 @@ function isAgentBrowserScreenshotToolResult(toolData: ToolData): boolean {
 	return candidates.some((candidate) => normalizeAgentBrowserCommandName(candidate) === 'screenshot')
 }
 
+/**
+ * SA-111 P4: true for the Workers batch tool on either lane. The name check covers both
+ * `native_spawn_workers` (API) and the managed CLI bridge's composed MCP name; the
+ * `rendererFamily` check covers a normalized step that already resolved the family.
+ */
+function looksLikeWorkersTool(toolName: string, toolData: ToolData): boolean {
+	if (toolData?.rendererFamily === 'workers') return true
+	const candidates = [toolName, toolData?.toolName, toolData?.displayToolName]
+	return candidates.some(
+		(candidate) => typeof candidate === 'string' && candidate.toLowerCase().includes('spawn_workers')
+	)
+}
+
 function looksLikeAgentBrowserTool(...values: unknown[]): boolean {
 	return values.some((value) => {
 		const normalized = normalizeAgentBrowserCommandName(value)
@@ -166,7 +179,9 @@ const familyRenderers: Record<ToolRendererFamily, LazyComponent> = {
 	tool_find: () => import('./generic/ToolFindRenderer.svelte'),
 	cli_tool: () => import('./generic/CliToolRenderer.svelte'),
 	generic_tool: () => import('./generic/GenericToolRenderer.svelte'),
-	subagent: () => import('./subagent/CallSubagentRenderer.svelte')
+	subagent: () => import('./subagent/CallSubagentRenderer.svelte'),
+	// SA-111 P4: one `spawn_workers` call, up to three runs, one card.
+	workers: () => import('./workers/WorkersRenderer.svelte')
 }
 
 
@@ -193,6 +208,15 @@ export async function getToolRenderer(toolName: string, toolData?: ToolData | nu
 	if (!toolData) {
 		console.warn(`[Renderer] No toolData provided for ${toolName}, using GenericToolRenderer`)
 		const module = await genericToolRenderer()
+		return module.default
+	}
+
+	// SA-111 P4: a Workers batch is checked BEFORE the subagent branch. `native_spawn_workers`
+	// is a native tool so it would fall through anyway, but the managed CLI lane's
+	// `mcp__batshit_gateway_<seg>__spawn_workers` is not, and it must never render as a
+	// subagent conversation card.
+	if (looksLikeWorkersTool(toolName, toolData)) {
+		const module = await import('./workers/WorkersRenderer.svelte')
 		return module.default
 	}
 
