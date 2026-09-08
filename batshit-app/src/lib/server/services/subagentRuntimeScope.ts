@@ -171,6 +171,8 @@ export async function buildManagedSubagentDynamicInfo(options: {
     allowFabricControlTools: false,
     // SA-104 P3: memory tools are PA-only in v1 (deferred subagent-memory decision).
     memoryControlsEnabled: false,
+    // SA-113 P2 (DL-113-11): a subagent has no inbox and no identity to DM from.
+    dmControlsEnabled: false,
   })
   if (mcpIndex.text.trim()) {
     lines.push('', mcpIndex.text.trim())

@@ -114,7 +114,17 @@ const FABRIC_CONTROL_DISPLAY_ALIASES: Record<string, string> = {
   'sys.comfyui.object_info': 'ComfyUI Object Info',
   'sys.model_catalog.search': 'Model Catalog Search',
   'sys.mcp.dynamic.find': 'Dynamic Tool Search',
-  'sys.mcp.dynamic.use': 'MCP Tool'
+  'sys.mcp.dynamic.use': 'MCP Tool',
+  // SA-113: the Agent DM family. Without these the controls had no display name at all,
+  // which also meant they never reached the Fabric presentation branch and rendered as an
+  // untitled generic card.
+  'sys.dm.send': 'Agent DM Send',
+  'sys.dm.list': 'Agent DM Inbox',
+  'sys.dm.read': 'Agent DM Read',
+  'sys.dm.claim': 'Agent DM Claim',
+  'sys.dm.done': 'Agent DM Done',
+  'sys.dm.blocked': 'Agent DM Blocked',
+  'sys.dm.agents': 'Agent DM Presence'
 }
 
 const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
@@ -127,7 +137,8 @@ const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
   'sys.mcp.dynamic.': 'Dynamic Tool',
   'sys.comfyui.': 'ComfyUI',
   'sys.zip.': 'Zip',
-  'sys.agent_browser.': 'Agent Browser'
+  'sys.agent_browser.': 'Agent Browser',
+  'sys.dm.': 'Agent DM'
 }
 
 function normalizeDisplayAliasKey(rawName: string): string {
@@ -170,6 +181,7 @@ function formatControlWords(value: string): string {
       if (lower === 'api') return 'API'
       if (lower === 'cli') return 'CLI'
       if (lower === 'mcp') return 'MCP'
+      if (lower === 'dm') return 'DM'
       if (lower === 'stt') return 'STT'
       if (lower === 'tts') return 'TTS'
       if (lower === 'url') return 'URL'

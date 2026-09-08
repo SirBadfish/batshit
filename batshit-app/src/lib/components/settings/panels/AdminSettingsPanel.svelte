@@ -17,6 +17,8 @@
   import AdminDynamicSchemaHintsCard from '$lib/components/settings/admin/AdminDynamicSchemaHintsCard.svelte'
   import AdminGoonAssetCleanupCard from '$lib/components/settings/admin/AdminGoonAssetCleanupCard.svelte'
   import AdminUtilityCards from '$lib/components/settings/admin/AdminUtilityCards.svelte'
+  import AdminAgentWakeupsCard from '$lib/components/settings/admin/AdminAgentWakeupsCard.svelte'
+  import { resolveInstanceWakeupsEnabled } from '$lib/utils/dmControl'
   import AdminWebSearchCard from '$lib/components/settings/admin/AdminWebSearchCard.svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import { confirmDialog } from '$lib/stores/confirmDialog'
@@ -620,6 +622,7 @@
         dcm_schema_hint_max_chars: adminSettings.dcmSchemaHintMaxChars,
         dcm_tool_name_threshold: adminSettings.dcmToolNameThreshold,
         goon_lip_sync_lab_enabled: adminSettings.goonLipSyncLabEnabled,
+      agent_wakeups_enabled: adminSettings.agentWakeupsEnabled,
         web_search_default_provider: adminSettings.webSearchDefaultProvider,
         web_search_exa_type: adminSettings.webSearchExaType,
         web_search_perplexity_max_tokens_per_page:
@@ -1732,6 +1735,9 @@
         typeof admin.goon_lip_sync_lab_enabled === 'boolean'
           ? admin.goon_lip_sync_lab_enabled
           : DEFAULT_GOON_LIP_SYNC_LAB_ENABLED,
+      // SA-113 P1 (DL-113-01): read through THE rule so the panel and every server-side
+      // wake check agree on what "absent" means.
+      agentWakeupsEnabled: resolveInstanceWakeupsEnabled(admin),
       webSearchDefaultProvider: normalizeWebSearchProvider(
         admin.web_search_default_provider
       ),
@@ -1848,6 +1854,12 @@
       error={goonAssetCleanupError}
       onInspect={loadGoonAssetAudit}
       onCleanup={handleGoonAssetCleanup}
+    />
+
+    <AdminAgentWakeupsCard
+      agentWakeupsEnabled={adminSettings.agentWakeupsEnabled}
+      disabled={isLoading}
+      onAgentWakeupsEnabledChange={(checked) => (adminSettings.agentWakeupsEnabled = checked)}
     />
 
     <AdminUtilityCards

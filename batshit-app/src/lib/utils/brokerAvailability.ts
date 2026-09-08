@@ -147,6 +147,12 @@ export interface BrokerAvailabilityInput {
    * API/CLI Primary Agents. Default false: memory is opt-in.
    */
   memoryControlsEnabled?: boolean
+  /**
+   * SA-113 P2 (DL-113-03): true only for PRIMARY actors whose agent has `dms_enabled`.
+   * Same shape as `memoryControlsEnabled`, and default false for the same reason — DMs
+   * are opt-in per agent, and an agent without them pays no bytes and sees no tools.
+   */
+  dmControlsEnabled?: boolean
 }
 
 /**
@@ -161,6 +167,8 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   const cliReachable = toggles.cliToolsEnabled && input.hasCliTools !== false
   // Memory controls ride the Batshit Tools toggle but not the broad-control-plane gate.
   const memoryReachable = toggles.batshitToolsEnabled && input.memoryControlsEnabled === true
+  // SA-113 P2: DM controls follow exactly the same rule as memory controls.
+  const dmReachable = toggles.batshitToolsEnabled && input.dmControlsEnabled === true
 
   const families: BrokerToolFamily[] = []
 
@@ -171,7 +179,7 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
     if (toggles.cliToolsEnabled) families.push('cli')
     if (toggles.artifactRuntimeEnabled) families.push('artifact')
     if (toggles.agentBrowserEnabled) families.push('agent_browser')
-    if (toggles.fetchZipEnabled || memoryReachable) families.push('fabric')
+    if (toggles.fetchZipEnabled || memoryReachable || dmReachable) families.push('fabric')
     return families
   }
 
@@ -191,7 +199,12 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   if (toggles.dynamicMcpEnabled) families.push('mcp')
   if (cliReachable) families.push('cli')
   if (toggles.artifactRuntimeEnabled && allowArtifact) families.push('artifact')
-  if (toggles.fetchZipEnabled || (toggles.batshitToolsEnabled && allowFabric) || memoryReachable) {
+  if (
+    toggles.fetchZipEnabled ||
+    (toggles.batshitToolsEnabled && allowFabric) ||
+    memoryReachable ||
+    dmReachable
+  ) {
     families.push('fabric')
   }
   return families
@@ -234,6 +247,14 @@ export const BROKER_FABRIC_BATSHIT_TOOLS_CONTROL_IDS = [
  */
 export const BROKER_FABRIC_MEMORY_CONTROL_IDS = ['sys.memory.*'] as const
 
+/**
+ * SA-113 P2 (DL-113-03): the Agent DM family. One constant, one boolean, three
+ * registration sites — the same shape as memory, deliberately, so there is one place to
+ * audit "who can DM". Subagents and Workers never receive these: a delegated run has no
+ * inbox and no identity of its own to write from.
+ */
+export const BROKER_FABRIC_DM_CONTROL_IDS = ['sys.dm.*'] as const
+
 export interface BrokerFabricScopeInput {
   toggles: BrokerToolToggles
   /**
@@ -248,6 +269,8 @@ export interface BrokerFabricScopeInput {
   allowFetchZip?: boolean
   /** SA-104 P3: PRIMARY actor + agent `memory_enabled`. Default false (opt-in). */
   memoryControlsEnabled?: boolean
+  /** SA-113 P2: PRIMARY actor + agent `dms_enabled`. Default false (opt-in). */
+  dmControlsEnabled?: boolean
 }
 
 /**
@@ -280,6 +303,13 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
   // enablement, independent of the broad-control-plane gate (n8n primaries included).
   if (input.toggles.batshitToolsEnabled && input.memoryControlsEnabled === true) {
     for (const controlId of BROKER_FABRIC_MEMORY_CONTROL_IDS) {
+      allowed.add(controlId)
+    }
+  }
+
+  // SA-113 P2: DM controls, same rule.
+  if (input.toggles.batshitToolsEnabled && input.dmControlsEnabled === true) {
+    for (const controlId of BROKER_FABRIC_DM_CONTROL_IDS) {
       allowed.add(controlId)
     }
   }

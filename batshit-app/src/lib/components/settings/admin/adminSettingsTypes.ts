@@ -3,6 +3,8 @@ export const DEFAULT_DCM_SCHEMA_HINT_OPTIONAL_LIMIT = 6
 export const DEFAULT_DCM_SCHEMA_HINT_MAX_CHARS = 240
 export const DEFAULT_DCM_TOOL_NAME_THRESHOLD = 6
 export const DEFAULT_GOON_LIP_SYNC_LAB_ENABLED = false
+/** SA-113 P1 (DL-113-01): the wake-up master switch defaults ON. */
+export const DEFAULT_AGENT_WAKEUPS_ENABLED = true
 export const MAX_DCM_SCHEMA_HINT_LIMIT = 20
 export const MIN_DCM_SCHEMA_HINT_MAX_CHARS = 80
 export const MAX_DCM_SCHEMA_HINT_MAX_CHARS = 1000
@@ -43,6 +45,7 @@ export type AdminSettingsState = {
   dcmSchemaHintMaxChars: number
   dcmToolNameThreshold: number
   goonLipSyncLabEnabled: boolean
+  agentWakeupsEnabled: boolean
   webSearchDefaultProvider: NativeWebSearchProvider
   webSearchExaType: ExaSearchType
   webSearchPerplexityMaxTokensPerPage: number

@@ -84,6 +84,25 @@ describe('POST /api/artifacts/share', () => {
     }).rejects.toHaveProperty('status', 403)
   })
 
+  it('SA-113 F-SEC-3: repairs a rate-limit counter left with no TTL', async () => {
+    const { POST } = await import('../../../routes/api/artifacts/share/+server')
+    const key = 'ratelimit:artifact-share:user_a:art_share'
+
+    // The state a process death between `INCR` and `EXPIRE` leaves behind. Untouched, this
+    // key rate-limits this artifact forever once it passes the limit.
+    await redis.incr(key)
+    expect(await redis.ttl(key)).toBe(-1)
+
+    const response = await POST({
+      request: buildRequest({ artifactId: 'art_share', content: 'after the crash', sessionId: 'sess_1' }),
+      locals: { user: { id: 'user_a' } },
+      fetch: fetchMock
+    } as any)
+
+    expect(response.status).toBeLessThan(400)
+    expect(await redis.ttl(key)).toBeGreaterThan(0)
+  })
+
   it('persists clip/message and publishes SSE event', async () => {
     const { POST } = await import('../../../routes/api/artifacts/share/+server')
 

@@ -17,6 +17,7 @@ import { foldersStore } from '$lib/stores/folders.svelte';
 import SettingsPanel from '$lib/components/settings/SettingsPanel.svelte';
 import { resolveSessionStoredAgentId } from '$lib/components/agents/sessionTargetSync';
 import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
+import { startUserChannel } from '$lib/services/userChannel';
 	
 	const { data } = $props();
 	
@@ -92,6 +93,12 @@ import { evaluateActiveChatCapacity } from '$lib/utils/activeChatCapacity';
 			}
 		}
 	});
+
+	// SA-113 P1 (DL-113-06): the user-wide live channel. Without it the sidebar never
+	// learns about a chat Batshit started on its own (a wake-up), because there is no
+	// poll and no focus refresh. It also hydrates the run registry with server-owned runs,
+	// which is what makes the spinner show and the three-active-chats cap count them.
+	onMount(() => startUserChannel(data?.user?.id));
 
 	// Global open-settings hook (used by Projects dropdown + other UI)
 	onMount(() => {

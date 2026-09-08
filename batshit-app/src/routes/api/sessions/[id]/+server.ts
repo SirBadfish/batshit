@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import { resolveFixedSessionMetadataUpdate } from '$lib/utils/fixedSession'
+import { resolveSessionOriginMetadataUpdate } from '$lib/utils/sessionOrigin'
 
 // GET /api/sessions/[id] - Get a specific session
 export const GET: RequestHandler = async ({ params, locals }) => {
@@ -51,6 +52,25 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     }
     if (fixedResolution.metadata !== undefined) {
       updates.metadata = fixedResolution.metadata
+    }
+
+    // SA-113 P1 (DL-113-08): what started a chat is a fact about its history. Generic
+    // updates cannot add, change, or remove it, and a stale read-spread-write payload
+    // gets the stored block re-attached instead of silently stripping it. Chained AFTER
+    // the Infinite-Session resolver on purpose, over the same `updates.metadata`, so both
+    // re-attaches survive together instead of the second overwriting the first.
+    const originResolution = resolveSessionOriginMetadataUpdate(
+      session.metadata,
+      updates.metadata
+    )
+    if (!originResolution.ok) {
+      return json(
+        { error: originResolution.error, code: 'SESSION_ORIGIN_IMMUTABLE' },
+        { status: 409 }
+      )
+    }
+    if (originResolution.metadata !== undefined) {
+      updates.metadata = originResolution.metadata
     }
 
     await redis.updateSession(params.id!, updates)

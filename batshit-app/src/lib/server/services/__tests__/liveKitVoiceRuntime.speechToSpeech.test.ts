@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   retrieve: vi.fn(),
   getAgents: vi.fn(),
-  getMessages: vi.fn(),
+  getRecentMessages: vi.fn(),
   getUserSettings: vi.fn(),
   buildFormattedChatInput: vi.fn()
 }))
@@ -17,7 +17,7 @@ vi.mock('$lib/services/apiKey.server', () => ({
 vi.mock('$lib/server/redis', () => ({
   redis: {
     getAgents: mocks.getAgents,
-    getMessages: mocks.getMessages,
+    getRecentMessages: mocks.getRecentMessages,
     getUserSettings: mocks.getUserSettings,
     json: {
       get: vi.fn()
@@ -69,13 +69,13 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
   beforeEach(() => {
     mocks.retrieve.mockReset()
     mocks.getAgents.mockReset()
-    mocks.getMessages.mockReset()
+    mocks.getRecentMessages.mockReset()
     mocks.getUserSettings.mockReset()
     mocks.buildFormattedChatInput.mockReset()
     liveKitTestOptions.tokenFactory.mockClear()
     liveKitTestOptions.dispatchFactory.mockClear()
     mocks.retrieve.mockResolvedValue('saved-xai-key')
-    mocks.getMessages.mockResolvedValue([])
+    mocks.getRecentMessages.mockResolvedValue([])
     mocks.getUserSettings.mockResolvedValue(null)
   })
 
@@ -100,7 +100,7 @@ describe('createLiveKitVoiceSession speech-to-speech', () => {
         system_prompt: 'You are Luna.'
       }
     ])
-    mocks.getMessages.mockResolvedValue([
+    mocks.getRecentMessages.mockResolvedValue([
       {
         id: 'existing-user-message',
         role: 'user',

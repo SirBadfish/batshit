@@ -1,4 +1,5 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
+import { redis } from '$lib/server/redis'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
 import { useControl, type ControlUseErrorCode } from '$lib/server/services/fabricRegistry'
 import {
@@ -30,6 +31,10 @@ function statusForControlError(code?: ControlUseErrorCode): number {
       return 404
     case 'CONTROL_NOT_ALLOWED':
     case 'CONTROL_RISK_REQUIRES_APPROVAL':
+    // A woken turn's risky-control refusal is a POLICY answer, not a server fault. It fell
+    // through to `default: 500` — a retryable status — for a refusal that must never be
+    // retried, which is the loop `human_turn_hint` exists to stop.
+    case 'CONTROL_RISK_NEEDS_HUMAN_TURN':
       return 403
     case 'CONTROL_INPUT_INVALID':
       return 400
@@ -148,10 +153,21 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
+    // `sessionId` is body text, and the woken-turn gate and the risk-approval cache both
+    // read it. A session this user does not own must not be able to speak for them, so an
+    // unowned id is dropped rather than trusted — the gate then falls back to the wake
+    // registry, which is server-owned, instead of to a chat somebody else is sitting in.
+    const claimedSessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+    let sessionId: string | undefined
+    if (claimedSessionId) {
+      const session = await redis.getSession(claimedSessionId)
+      if (session && session.user_id === auth.userId) sessionId = claimedSessionId
+    }
+
     const result = await useControl({
       userId: auth.userId,
       agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
-      sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+      sessionId,
       controlId,
       input: body.input && typeof body.input === 'object' ? body.input : {},
       dryRun: body.dryRun === true,

@@ -27,6 +27,14 @@ Each Session has two names worth knowing about:
 
 The practical takeaway: rename the *title* whenever you want a chat to be easy to find. The ID is mostly plumbing.
 
+## Chats Batshit started
+
+Almost every chat starts because you typed. A few don't: one agent can send another a message and ask for the work to start now, and an outside program can do the same through a wake-up webhook. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+
+A chat Batshit started appears in the sidebar on its own the moment it starts, in the normal list, sorted like any new chat. It carries a small icon saying what started it — an envelope for a DM, a webhook icon for a webhook — and hovering it tells you which agent or which webhook. Inside, a one-line banner at the top of the chat says the same thing and links to the inbox.
+
+Otherwise it is an ordinary chat. It shows the running spinner while it works, it counts toward your three active chats, and Stop works normally.
+
 ## Infinite Sessions section
 
 If you create any [Infinite Sessions](memory-and-infinite-sessions.md) — ongoing one-agent conversations with long-term memory — they get their own pinned section above the folders. Infinite Sessions live there permanently: they can't be dragged into folders, and nothing can be dragged into their section. Each shows a **Fixed** badge.
@@ -69,4 +77,5 @@ The Session menu includes **View Chat as Markdown** — a clean, read-only trans
 - [Backup and restore](../admin/backup-and-restore.md)
 - [Execution Viewer](execution-viewer.md)
 - [Primary Agents](../primary-agents/overview.md)
+- [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md)
 - [Group Chat](../groups/overview.md)

@@ -346,6 +346,90 @@ describe('resolveBrokerFabricAllowedControlIds', () => {
       expect(isControlIdAllowedByList('sys.memory.save', allowed)).toBe(false)
     })
   })
+
+  // SA-113 P2 (DL-113-03) — the DM family copies the memory shape exactly: one constant,
+  // one boolean, PRIMARY actors only, outside the broad-control-plane gate.
+  describe('DM controls (SA-113 P2)', () => {
+    it('never includes sys.dm.* by default (DMs are opt-in per agent)', () => {
+      expect(resolveBrokerFabricAllowedControlIds({ toggles: ALL_ON })).not.toContain('sys.dm.*')
+    })
+
+    it('adds sys.dm.* for a DM-enabled primary even when the broad control plane is closed', () => {
+      const allowed = resolveBrokerFabricAllowedControlIds({
+        toggles: ALL_ON,
+        allowFabricControlTools: false,
+        dmControlsEnabled: true
+      })
+      expect(allowed).toContain('sys.dm.*')
+      expect(allowed).not.toContain('sys.artifact.*')
+      expect(isControlIdAllowedByList('sys.dm.send', allowed)).toBe(true)
+      expect(isControlIdAllowedByList('sys.dm.agents', allowed)).toBe(true)
+    })
+
+    it('DM controls still require the Batshit Tools toggle', () => {
+      const allowed = resolveBrokerFabricAllowedControlIds({
+        toggles: { ...ALL_OFF, fetchZipEnabled: true },
+        dmControlsEnabled: true
+      })
+      expect(allowed).toEqual([BROKER_FABRIC_FETCH_ZIP_CONTROL_ID])
+    })
+
+    it('a subagent or worker (dmControlsEnabled false/omitted) never sees DM refs', () => {
+      const allowed = resolveBrokerFabricAllowedControlIds({
+        toggles: ALL_ON,
+        allowFabricControlTools: false,
+        dmControlsEnabled: false
+      })
+      expect(isControlIdAllowedByList('sys.dm.send', allowed)).toBe(false)
+      expect(isControlIdAllowedByList('sys.dm.claim', allowed)).toBe(false)
+    })
+
+    it('memory and DMs are independent allowances', () => {
+      const dmOnly = resolveBrokerFabricAllowedControlIds({
+        toggles: ALL_ON,
+        allowFabricControlTools: false,
+        dmControlsEnabled: true
+      })
+      expect(dmOnly).toContain('sys.dm.*')
+      expect(dmOnly).not.toContain('sys.memory.*')
+
+      const both = resolveBrokerFabricAllowedControlIds({
+        toggles: ALL_ON,
+        allowFabricControlTools: false,
+        memoryControlsEnabled: true,
+        dmControlsEnabled: true
+      })
+      expect(both).toContain('sys.dm.*')
+      expect(both).toContain('sys.memory.*')
+    })
+  })
+})
+
+describe('resolveBrokerFamilies — DM reachability (SA-113 P2)', () => {
+  it('opens the fabric family on api for a DM-enabled agent with fetch-zip and broad Fabric off', () => {
+    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
+    expect(
+      resolveBrokerFamilies({
+        runtime: 'api',
+        toggles,
+        allowFabricControlTools: false,
+        dmControlsEnabled: true
+      })
+    ).toEqual(['fabric'])
+  })
+
+  it('opens the fabric family on n8n for a DM-enabled primary with fetch-zip off', () => {
+    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
+    expect(
+      resolveBrokerFamilies({ runtime: 'n8n', toggles, dmControlsEnabled: true })
+    ).toEqual(['fabric'])
+  })
+
+  it('DMs alone open nothing when Batshit Tools is off', () => {
+    expect(
+      resolveBrokerFamilies({ runtime: 'api', toggles: ALL_OFF, dmControlsEnabled: true })
+    ).toEqual([])
+  })
 })
 
 describe('resolveBrokerFamilies — memory reachability (SA-104 P3)', () => {

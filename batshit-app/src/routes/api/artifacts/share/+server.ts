@@ -66,6 +66,11 @@ async function enforceRateLimit(userId: string, artifactId: string) {
 
   if (count === 1) {
     await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+  } else if ((await redis.ttl(key)) === -1) {
+    // SA-113 F-SEC-3: `INCR` then `EXPIRE` is two round trips, and a crash between them
+    // leaves a counter with no TTL — after which this key rate-limits forever until someone
+    // deletes it by hand. Same two lines as the wake-up webhook route, for the same reason.
+    await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS)
   }
 
   if (count > RATE_LIMIT_MAX_REQUESTS) {
@@ -534,7 +539,9 @@ async function loadSessionMessagesForRouting(
   sessionId: string,
   limit = 300
 ): Promise<Array<Record<string, any>>> {
-  const loaded = await redis.getMessages(sessionId, limit)
+  // SA-113 P3 (F-P2-1): the RECENT `limit`. `getMessages` is head-first, so an auto
+  // follow-up in a chat longer than 300 messages routed on that chat's opening exchange.
+  const loaded = await redis.getRecentMessages(sessionId, limit)
   return Array.isArray(loaded) ? loaded as Array<Record<string, any>> : []
 }
 

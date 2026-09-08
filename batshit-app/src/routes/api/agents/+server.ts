@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager'
 import { syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManager'
+import { validateDmSenderFields } from '$lib/utils/dmControl'
 import { getCodexConfigOverrideValidationError } from '$lib/server/services/codexSettings'
 import { getClaudeConfigOverrideValidationError } from '$lib/server/services/claudeSettings'
 import { sanitizeId } from '$lib/utils/idSanitizer' // Story 6.9c
@@ -67,6 +68,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const claudeValidationError = getClaudeConfigOverrideValidationError(body.claude_settings ?? null)
     if (claudeValidationError) {
       return json({ error: claudeValidationError }, { status: 400 })
+    }
+    // SA-113 P2 (DL-113-01): same refusal as the update route.
+    const dmSenderValidationError = validateDmSenderFields(body)
+    if (dmSenderValidationError) {
+      return json({ error: dmSenderValidationError }, { status: 400 })
     }
 
     // Story 6.9c: Use provided ID or generate from displayName

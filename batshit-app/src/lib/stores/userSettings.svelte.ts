@@ -50,6 +50,11 @@ interface UserSettings {
     dcm_schema_hint_max_chars?: number
     dcm_tool_name_threshold?: number
     goon_lip_sync_lab_enabled?: boolean
+    /** SA-113 P1 (DL-113-01): instance-wide wake-up master switch. Absent means ON. */
+    agent_wakeups_enabled?: boolean
+    web_search_default_provider?: 'duckduckgo-html' | 'exa' | 'perplexity'
+    web_search_exa_type?: 'auto' | 'fast' | 'neural' | 'deep'
+    web_search_perplexity_max_tokens_per_page?: number
   }
 
   onboarding_settings?: {

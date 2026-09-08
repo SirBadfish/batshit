@@ -33,6 +33,7 @@ import {
   resolveBrokerToolToggles
 } from '$lib/utils/brokerAvailability'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import { WORKERS_MAX_PER_CALL } from '$lib/utils/delegationCapabilities'
 import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
 import { findControls, useControl, type ControlRuntimeMode, type ControlUseErrorCode } from './fabricRegistry'
@@ -205,6 +206,8 @@ export interface NativeToolContext {
   allowFabricControlTools?: boolean
   /** SA-104 P3: PRIMARY actor + agent `memory_enabled`. Default false (memory is opt-in). */
   memoryControlsEnabled?: boolean
+  /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. Default false. */
+  dmControlsEnabled?: boolean
   projectPath?: string | null
   providerSettings?: Record<string, any> | null
   toolApprovalMode?: ToolApprovalMode
@@ -6873,6 +6876,18 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
                   : [])
               ]
             : []
+        // SA-113 F-SEC-1: the ONE case where `allowRisky` is not the answer. Without this
+        // the `approval_hint` reflex — retry with allowRisky — sends the model into a loop
+        // against a gate that ignores the flag on purpose.
+        const humanTurnHint =
+          code === 'CONTROL_RISK_NEEDS_HUMAN_TURN'
+            ? [
+                '',
+                'human_turn_hint:',
+                'Do NOT retry with allowRisky: true. Batshit refuses risky controls in a chat a DM or a webhook started, and the flag is ignored here.',
+                'Say what you need and why, leave the item open, and stop. Once the user replies in THIS chat, the same ref works normally.'
+              ]
+            : []
         const promptHint =
           code === 'CONTROL_EXECUTION_FAILED' && /prompt is required/i.test(error)
             ? [
@@ -6891,6 +6906,7 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
             ...(details !== undefined ? ['', 'details:', stringifyBatshitToolModelValue(details)] : []),
             ...(retryPayload ? ['', 'retry_payload:', stringifyBatshitToolModelValue(retryPayload)] : []),
             ...approvalHint,
+            ...humanTurnHint,
             ...promptHint
           ].join('\n')
         }
@@ -9581,7 +9597,7 @@ function resolveNativeAutomationToggleState(
 function resolveBatshitToolBrokerFamiliesForAutomation(
   settings: ResolvedNativeToolSettings,
   context: NativeAutomationDispatchContext,
-  options?: { memoryControlsEnabled?: boolean }
+  options?: { memoryControlsEnabled?: boolean; dmControlsEnabled?: boolean }
 ): BatshitToolFamily[] {
   const families: BatshitToolFamily[] = []
   if (settings.dynamicMcpEnabled) families.push('mcp')
@@ -9604,6 +9620,14 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
     settings.batshitToolsEnabled &&
     context.actor_type === 'primary' &&
     options?.memoryControlsEnabled === true
+  ) {
+    if (!families.includes('fabric')) families.push('fabric')
+  }
+  // SA-113 P2: the Agent DM family opens the fabric family under the same conditions.
+  if (
+    settings.batshitToolsEnabled &&
+    context.actor_type === 'primary' &&
+    options?.dmControlsEnabled === true
   ) {
     if (!families.includes('fabric')) families.push('fabric')
   }
@@ -10215,6 +10239,9 @@ function mapControlUseErrorToNativeAutomationErrorCode(
       return 'INVALID_INPUT'
     case 'CONTROL_NOT_ALLOWED':
     case 'CONTROL_RISK_REQUIRES_APPROVAL':
+    // Same reason as the HTTP status mapping: a woken turn's refusal is policy, and
+    // `BACKEND_UNAVAILABLE` reads to the model as "the server is down, try again".
+    case 'CONTROL_RISK_NEEDS_HUMAN_TURN':
       return 'POLICY_BLOCKED'
     case 'CONTROL_EXECUTION_FAILED':
     default:
@@ -10440,8 +10467,12 @@ export async function dispatchNativeAutomationPackAction(input: {
     // PA-owned state (see BROKER_FABRIC_MEMORY_CONTROL_IDS).
     const brokerMemoryControlsEnabled =
       context.actor_type === 'primary' && resolveAgentMemoryEnabled(agentRecord)
+    // SA-113 P2: the Agent DM family, gated the same way — PRIMARY actors only, per-agent.
+    const brokerDmControlsEnabled =
+      context.actor_type === 'primary' && resolveAgentDmsEnabled(agentRecord)
     const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context, {
-      memoryControlsEnabled: brokerMemoryControlsEnabled
+      memoryControlsEnabled: brokerMemoryControlsEnabled,
+      dmControlsEnabled: brokerDmControlsEnabled
     })
     // SA-096 P4: same source as mode 3 registration and the DCM capability index's Fabric
     // count. This lane keeps its own actor/mode conditions, expressed as the two flags.
@@ -10459,7 +10490,8 @@ export async function dispatchNativeAutomationPackAction(input: {
         allowFabricControlTools:
           context.actor_type === 'primary' &&
           (context.mode === 'mode3' || context.mode === 'mode4'),
-        memoryControlsEnabled: brokerMemoryControlsEnabled
+        memoryControlsEnabled: brokerMemoryControlsEnabled,
+        dmControlsEnabled: brokerDmControlsEnabled
       })
     )
     const brokerSelectedGateways =
@@ -11782,6 +11814,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const allowFabricControlTools = context.allowFabricControlTools !== false
   // SA-104 P3: opt-in per agent; subagent callers leave this unset/false.
   const memoryControlsEnabled = context.memoryControlsEnabled === true
+  // SA-113 P2: same shape for the Agent DM family.
+  const dmControlsEnabled = context.dmControlsEnabled === true
 
   // SA-096: shared with the compile path's broker-guidance gate so registered tools and
   // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
@@ -11792,14 +11826,16 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     hasCliTools: selectedCliToolIds.length > 0,
     allowArtifactRuntimeTools,
     allowFabricControlTools,
-    memoryControlsEnabled
+    memoryControlsEnabled,
+    dmControlsEnabled
   })
   // SA-096 P4: same source as the DCM capability index's Fabric count.
   const apiBrokerFabricAllowedControlIds = new Set<string>(
     resolveBrokerFabricAllowedControlIds({
       toggles: brokerToggles,
       allowFabricControlTools,
-      memoryControlsEnabled
+      memoryControlsEnabled,
+      dmControlsEnabled
     })
   )
 

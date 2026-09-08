@@ -30,6 +30,17 @@ The behavior is honest about each environment. For example, the n8n runtime entr
 
 A few instance-level defaults live in Admin because they apply across the instance rather than to a single agent. These include Web Search and Dynamic Schema Hints (shared caps on how large compact tool-schema summaries get — they affect prompt size and clarity, not permissions).
 
+### Agent Wake-ups
+
+A wake-up is a chat Batshit starts on its own, with nobody typing — one agent asking another to start work now, or an outside program doing the same through a webhook. Full detail in [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+
+Two things live here:
+
+- **Allow Wake-ups** — the master switch for this Batshit. Off means nothing can start a chat on its own; every wake-up waits in the recipient's inbox instead, with the reason recorded. Each agent also has its own "May be woken" switch in Agent Settings.
+- **Wake-up Webhooks** — one URL and one token per hook, for n8n or any other outside program. Create a hook, pick the agent it writes to, and copy the token **once**: Batshit stores only a fingerprint of it and cannot show it again. Rows show each hook's agent, delivery default, last use, and count, and you can pause a hook, rotate its token, or revoke it.
+
+A hook's recipient needs **Agent DMs** on, not only "May be woken" — a call writes a real DM record, and an agent with DMs off would have no inbox to see it in.
+
 ## Cleanup utilities
 
 Admin also holds cleanup tools, including Goon Asset Cleanup, which inspects uploaded Goon files that aren't referenced by any current Goon, Motion Vault, Closet, or Scene, and lets you remove orphaned files deliberately. This is handy when backups or storage have grown large because of unused Goon assets.
@@ -37,6 +48,7 @@ Admin also holds cleanup tools, including Goon Asset Cleanup, which inspects upl
 ## In this section
 
 - [Backup and restore](backup-and-restore.md) — export, inspect, and restore Batshit-owned data safely.
+- [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md) — the master switch, wake-up webhooks, and what a woken chat looks like.
 - [Bug reports and diagnostics](../troubleshooting/bug-reports-and-diagnostics.md) — export a previewed support bundle for GitHub issues.
 
 ## Related

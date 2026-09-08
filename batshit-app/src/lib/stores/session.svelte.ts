@@ -95,11 +95,46 @@ export function addSession(session: ChatSession) {
   notifyListeners()
 }
 
+/**
+ * SA-113 P1 (DL-113-06) — add or patch a session that arrived on the user channel.
+ *
+ * `addSession` appends unconditionally, which is safe for the client's own New Chat but
+ * not for a push channel: a reconnect can replay, and a session Batshit created may
+ * already be in the list from a `loadSessions()` that raced it. Newest-first matches how
+ * a new chat sorts in the sidebar.
+ */
+export function upsertSession(session: ChatSession) {
+  const index = sessions.findIndex((s) => s.id === session.id)
+  if (index === -1) {
+    sessions = [session, ...sessions]
+  } else {
+    sessions = sessions.map((s) => (s.id === session.id ? { ...s, ...session } : s))
+  }
+  notifyListeners()
+}
+
 export function updateSession(id: string, updates: Partial<ChatSession>) {
   sessions = sessions.map(s => 
     s.id === id ? { ...s, ...updates, last_modified_at: new Date().toISOString() } : s
   )
   notifyListeners()
+}
+
+/**
+ * SA-113 P1 — patch a session WITHOUT bumping `last_modified_at`.
+ *
+ * `updateSession` stamps "now" because it is the local echo of a user edit. A server
+ * push already carries the authoritative timestamp, and re-stamping it would reorder the
+ * sidebar underneath the user for a change they did not make.
+ */
+export function patchSessionFromServer(id: string, updates: Partial<ChatSession>) {
+  let changed = false
+  sessions = sessions.map((s) => {
+    if (s.id !== id) return s
+    changed = true
+    return { ...s, ...updates }
+  })
+  if (changed) notifyListeners()
 }
 
 export function deleteSession(id: string) {

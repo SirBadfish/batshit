@@ -205,4 +205,21 @@ describe('portableSkillTokens', () => {
     })
     expect(templates[0].placeholder).toContain('BATSHIT_PORTABLE_TOKEN=paste-your-portable-skill-token-here')
   })
+
+  it('SA-113 P2 (DL-113-03): no Portable Skill family may reach sys.dm.*', async () => {
+    // A Portable Skill Token is an OUTSIDE caller. Agent DMs are addressed messages
+    // between this instance's own agents, and a portable token additionally forces
+    // `allowRisky`, so letting one DM on an agent's behalf would be a real impersonation
+    // door. The wake-up webhook (P3) is the only inbound way in, and it authenticates on
+    // its own route. This exists so a future family addition cannot open it by accident.
+    const { PORTABLE_SKILL_FAMILIES, getPortableSkillAllowedControlIds } = await import(
+      '$lib/server/services/portableSkillTokens'
+    )
+    const everyControlId = getPortableSkillAllowedControlIds(
+      PORTABLE_SKILL_FAMILIES.map((family) => family.id)
+    )
+    expect(everyControlId.some((controlId) => controlId.startsWith('sys.dm.'))).toBe(false)
+    // And no family may use a wildcard that could later swallow one.
+    expect(everyControlId.some((controlId) => controlId.includes('*'))).toBe(false)
+  })
 })

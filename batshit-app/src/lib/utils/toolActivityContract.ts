@@ -74,6 +74,9 @@ export type ToolRendererFamily =
   | 'generic_tool'
   | 'subagent'
   | 'workers'
+  // SA-113 P4 (DL-113-10b): the `sys.dm.*` family. A DM's card has to say what actually
+  // happened to it — woke a chat, or waited and why — which no generic control card can.
+  | 'dm'
 
 export type ToolRawSidecarPolicy = 'always' | 'limited' | 'never'
 
@@ -901,6 +904,10 @@ function buildArtifactControlPresentation(options: {
     normalizedControlId.startsWith('use.artifact.') ||
     normalizedControlId.startsWith('artifact.')
 
+  // SA-113 P4: a DM control keeps its own family so the card can render the delivery
+  // outcome. Placed before the artifact branches because `sys.dm.*` is never an artifact.
+  const isDmControl = normalizedControlId.startsWith('sys.dm.')
+
   const genericMetadata = displayToolName
     ? isArtifactControl
       ? buildArtifactRendererMetadata({
@@ -910,7 +917,8 @@ function buildArtifactControlPresentation(options: {
         })
       : {
           rendererTitle: displayToolName,
-          fabricControlId: controlId
+          fabricControlId: controlId,
+          ...(isDmControl ? { dmTool: true } : {})
         }
     : undefined
 
@@ -1163,7 +1171,7 @@ function buildArtifactControlPresentation(options: {
   if (genericMetadata || displayToolName) {
     return {
       operationKind,
-      rendererFamily: options.rendererFamily,
+      rendererFamily: isDmControl ? 'dm' : options.rendererFamily,
       displayToolName: displayToolName ?? controlId,
       toolArgs: compactToolArgs(operationKind, toolArgs, toolResult),
       toolResult: summarizeValue(unwrapNativeAutomationData(toolResult)),

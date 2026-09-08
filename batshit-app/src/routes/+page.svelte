@@ -11,6 +11,9 @@
   import IconColumn from '$lib/components/artifacts/IconColumn.svelte'
   import GoonDock from '$lib/components/goons/GoonDock.svelte'
   import ExecutionViewerSheet from '$lib/components/chat/ExecutionViewerSheet.svelte'
+  import DmInboxDrawer from '$lib/components/chat/DmInboxDrawer.svelte'
+  import DmInboxIndicator from '$lib/components/chat/DmInboxIndicator.svelte'
+  import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
   import HeaderBarIcons from '$lib/components/artifacts/HeaderBarIcons.svelte'
   import HeaderOverlay from '$lib/components/artifacts/HeaderOverlay.svelte'
   import UpdateAvailableIndicator from '$lib/components/update/UpdateAvailableIndicator.svelte'
@@ -18,7 +21,7 @@
   import FirstRunSetupWizard from '$lib/components/onboarding/FirstRunSetupWizard.svelte'
   import { Button } from '$lib/components/ui/button'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
-  import { ChevronRight } from '@lucide/svelte'
+  import { ChevronRight, Mail, Webhook } from '@lucide/svelte'
   import { useSidebar } from '$lib/components/ui/sidebar/context.svelte'
   import * as messageStore from '$lib/stores/messages.svelte'
   import type { Message } from '$lib/stores/messages.svelte'
@@ -167,6 +170,8 @@
   } from '$lib/utils/contextCompaction'
   import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
   import { isFixedSession } from '$lib/utils/fixedSession'
+  import { describeSessionOrigin, resolveSessionOrigin } from '$lib/utils/sessionOrigin'
+  import { onUserChannelEvent } from '$lib/services/userChannel'
   import { buildSessionMessagesForSend } from '$lib/utils/sessionSendMessages'
   import {
     hasInterruptibleActiveResponse,
@@ -334,6 +339,19 @@
     }
     window.addEventListener('batshit:zip-state-changed', handleZipStateChanged)
 
+    // SA-113 P1 (DL-113-06): a woken turn streams into a session the browser never sent
+    // to, so nothing here knows when it finished. The user channel says so; refetch the
+    // finished messages when the chat on screen is the one that just ended.
+    const stopUserChannelListener = onUserChannelEvent((event) => {
+      if (event?.type !== 'session_run_status') return
+      const eventSessionId =
+        typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
+      const status = (event as any).status
+      if (!eventSessionId || eventSessionId !== currentSessionId) return
+      if (status !== 'complete' && status !== 'failed' && status !== 'stopped') return
+      void loadMessagesForSession(eventSessionId)
+    })
+
     // Initialize user settings store
     if (data?.userSettings) {
       setUserSettings(data.userSettings)
@@ -380,6 +398,7 @@
     }
 
     return () => {
+      stopUserChannelListener()
       window.removeEventListener('batshit:zip-state-changed', handleZipStateChanged)
       if (contextPreviewTimer) {
         clearTimeout(contextPreviewTimer)
@@ -588,6 +607,9 @@
   let artifactsSidebarRef: any = $state(null)
   let draftPreviewArtifactId = $state<string | null>(null)
   let executionViewerOpen = $state(false)
+  // SA-113 P4 (DL-113-10a): the Agent DMs drawer. The envelope that opens it renders only
+  // for an agent with Agent DMs on, so an instance that never turned them on gains nothing.
+  let dmDrawerOpen = $state(false)
   const sidebar = useSidebar()
   let sidebarWasOpen: boolean | null = null
   let overlayListenerCleanup: (() => void) | null = null
@@ -759,6 +781,10 @@ const autoCompactTriggerTokens = $derived(
 )
 // SA-104 P6: Infinite Sessions replace Compact with the nap (DL-104-07).
 const currentSessionFixed = $derived(isFixedSession(currentSession))
+
+// SA-113 P1 (DL-113-08): null for every chat the user started, so the banner never
+// renders for an ordinary session.
+const currentSessionOrigin = $derived(resolveSessionOrigin(currentSession))
 const currentMemoryWindow = $derived.by(() => {
   if (!currentSessionFixed) return null
   const agent = agentStore.getCurrentAgent()
@@ -6959,6 +6985,30 @@ const immersiveActive = $derived.by(
         <CompactArtifactShelf bind:isOpen={tokenPanelOpen} />
       {/if}
 
+      <!-- SA-113 P1 (DL-113-08): one line saying a wake-up started this chat, not the user. -->
+      {#if currentSessionOrigin}
+        <div class="chat-origin-banner" data-testid="chat-origin-banner">
+          {#if currentSessionOrigin.kind === 'dm'}
+            <Mail class="chat-origin-banner-icon" aria-hidden="true" />
+          {:else}
+            <Webhook class="chat-origin-banner-icon" aria-hidden="true" />
+          {/if}
+          <span>{describeSessionOrigin(currentSessionOrigin)}</span>
+          <!-- P4: the banner is where a user first wonders "what DM was that?", so it is
+               also the shortest way into the drawer. Offered only when the agent has Agent
+               DMs on, so it can never point at a drawer that has nothing to show. -->
+          {#if resolveAgentDmsEnabled(agentStore.getCurrentAgent())}
+            <button
+              type="button"
+              class="chat-origin-banner-link"
+              onclick={() => (dmDrawerOpen = true)}
+            >
+              Open inbox
+            </button>
+          {/if}
+        </div>
+      {/if}
+
       <!-- Chat Messages Area or Welcome Screen -->
       {#if hasMessages}
         <ChatArea
@@ -7216,6 +7266,11 @@ const immersiveActive = $derived.by(
 
 {#if isMounted}
   <div class="chat-header-actions-slot">
+    <DmInboxIndicator
+      agentId={agentStore.getCurrentAgentId()}
+      dmsEnabled={resolveAgentDmsEnabled(agentStore.getCurrentAgent())}
+      onOpen={() => (dmDrawerOpen = true)}
+    />
     <UpdateAvailableIndicator />
     {#if headerArtifacts.length > 0 || triggerArtifacts.length > 0}
       <HeaderBarIcons
@@ -7238,6 +7293,8 @@ const immersiveActive = $derived.by(
 {/if}
 
 <ExecutionViewerSheet bind:open={executionViewerOpen} sessionId={currentSessionId ?? undefined} />
+
+<DmInboxDrawer bind:open={dmDrawerOpen} currentAgentId={agentStore.getCurrentAgentId()} />
 
 <!-- Header Overlay for header/trigger widgets -->
 <HeaderOverlay bind:open={headerOverlayOpen} bind:artifact={headerOverlayArtifact} />
@@ -7316,6 +7373,44 @@ const immersiveActive = $derived.by(
     .chat-input-shell {
       padding: 0.75rem 0.75rem 0;
     }
+  }
+
+  /* SA-113 P1 (DL-113-08): one quiet line above the messages saying a wake-up, not the
+     user, started this chat. Uses the shared surface tokens, no new colors. */
+  .chat-origin-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    margin: 0 auto;
+    padding: 0.25rem 0.625rem;
+    border: 1px solid var(--bs-border-subtle, color-mix(in oklab, var(--primary) 24%, transparent));
+    border-radius: 999px;
+    background: color-mix(in oklab, var(--primary) 8%, transparent);
+    color: var(--muted-foreground);
+    font-size: 0.6875rem;
+    line-height: 1.2;
+    width: fit-content;
+    max-width: 100%;
+  }
+
+  :global(.chat-origin-banner-icon) {
+    width: 0.75rem;
+    height: 0.75rem;
+    flex-shrink: 0;
+  }
+
+  .chat-origin-banner-link {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    color: inherit;
+    font-size: inherit;
+    line-height: inherit;
+    text-decoration: underline;
+  }
+
+  .chat-origin-banner-link:hover {
+    color: var(--foreground);
   }
 
   .chat-welcome {

@@ -223,6 +223,8 @@ export interface NativeModeRequest extends ThinkRequest {
   allowFabricControlTools?: boolean
   /** SA-104 P3: PRIMARY runs of memory-enabled agents; subagent runner leaves it false. */
   memoryControlsEnabled?: boolean
+  /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
+  dmControlsEnabled?: boolean
   /**
    * SA-111 P4 (DL-111-11/12): PRIMARY runs of workers-enabled agents. The subagent runner
    * leaves it false, which is what keeps delegation depth at one level.
@@ -440,6 +442,7 @@ export class VercelAIBrain {
           projectPath: request.projectPath ?? null,
           selectedCliToolIds: request.selectedCliToolIds,
           memoryControlsEnabled: request.memoryControlsEnabled,
+          dmControlsEnabled: request.dmControlsEnabled,
           workersEnabled: request.workersEnabled,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
@@ -972,6 +975,8 @@ export class VercelAIBrain {
       allowArtifactRuntimeTools?: boolean
       allowFabricControlTools?: boolean
       memoryControlsEnabled?: boolean
+      /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
+      dmControlsEnabled?: boolean
       /** SA-111 P4: primary-agent sends only; every delegated run leaves it false. */
       workersEnabled?: boolean
       parentModelId?: string | null
@@ -1046,6 +1051,7 @@ export class VercelAIBrain {
           allowArtifactRuntimeTools: nativeContext?.allowArtifactRuntimeTools,
           allowFabricControlTools: nativeContext?.allowFabricControlTools,
           memoryControlsEnabled: nativeContext?.memoryControlsEnabled,
+          dmControlsEnabled: nativeContext?.dmControlsEnabled,
           projectPath: nativeContext?.projectPath ?? null,
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode,
@@ -2631,6 +2637,7 @@ export class VercelAIBrain {
             allowArtifactRuntimeTools: request.allowArtifactRuntimeTools,
             allowFabricControlTools: request.allowFabricControlTools,
             memoryControlsEnabled: request.memoryControlsEnabled,
+            dmControlsEnabled: request.dmControlsEnabled,
             workersEnabled: request.workersEnabled,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,

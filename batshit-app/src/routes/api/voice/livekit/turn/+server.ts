@@ -334,7 +334,16 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
     }
   })
 
-  const messages = await redis.getMessages(sessionId, 300)
+  // SA-113 F-P2-1 — the RECENT 300, not the first 300. `getMessages` is
+  // `lRange(key, 0, limit - 1)`, so on a voice chat longer than the window this handed the
+  // model the chat's OPENING exchanges and left out the sentence just transcribed two lines
+  // above. Same fix as the wake primitive, `artifacts/share` and `liveKitVoiceRuntime`.
+  const messages = await redis.getRecentMessages(sessionId, 300)
+  // SA-113 F-P1-1 — own this turn's session-turn lock. send-routed registers AND releases
+  // the lock under the `messageId` the caller sends, and an unowned release deletes
+  // whatever lock it finds. A voice turn that unwinds late would otherwise cancel the lock
+  // of a turn the user had already started in the same chat.
+  const assistantMessageId = await createMessageId(sessionId)
   const routeResponse = await eventFetch(new URL('/api/messages/send-routed', request.url), {
     method: 'POST',
     headers: {
@@ -346,7 +355,7 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
       sessionId,
       agentId,
       userId,
-      messageId: undefined,
+      messageId: assistantMessageId,
       messages,
       agentType: payload.agentType ?? undefined,
       metadata: voiceMetadata,

@@ -42,6 +42,7 @@
         { "source": "local-ai/overview.md", "reference": "local-ai-overview.md" },
         { "source": "local-ai/sglang-and-omlx.md", "reference": "local-ai-sglang-and-omlx.md" },
         { "source": "local-ai/speed-and-caching.md", "reference": "local-ai-speed-and-caching.md" },
+        { "source": "primary-agents/agent-dms-and-wake-ups.md", "reference": "primary-agents-agent-dms-and-wake-ups.md" },
         { "source": "primary-agents/connect-n8n.md", "reference": "primary-agents-connect-n8n.md" },
         { "source": "primary-agents/overview.md", "reference": "primary-agents-overview.md" },
         { "source": "projects/overview.md", "reference": "projects-overview.md" },

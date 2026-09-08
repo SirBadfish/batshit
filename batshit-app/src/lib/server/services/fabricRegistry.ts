@@ -64,6 +64,17 @@ import {
   type MemoryToolContext
 } from '$lib/server/services/memory/memoryTools'
 import {
+  claimDmOp,
+  closeDmOp,
+  DmToolError,
+  listDmAgentsOp,
+  listDmsOp,
+  readDmOp,
+  sendDmOp,
+  type DmToolContext
+} from '$lib/server/services/dm/dmTools'
+import { resolveWokenTurnState } from '$lib/server/services/dm/wokenTurn'
+import {
   DEFAULT_SKILL_ICON_REF
 } from '$lib/icons/iconCatalog'
 import { isIconRef, parseIconRef, type IconRef } from '$lib/icons/iconTypes'
@@ -1525,8 +1536,226 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
   }
 ]
 
+// ---------------------------------------------------------------------------
+// SA-113 P2: Agent DM family (`sys.dm.*`).
+//
+// Registration and gating copy `sys.memory.*` exactly, on purpose: one shared ops layer
+// (`dm/dmTools.ts`), all `safe`, PRIMARY actors only, and broker exposure gated per agent
+// on `dms_enabled` through `resolveBrokerFabricAllowedControlIds`. Subagents and Workers
+// never receive these refs — a delegated run has no inbox and no identity to write from.
+//
+// Results are summary-first: only `sys.dm.read` returns a body. Unlike memory, DM tool
+// results stay zip-first, so the DM card persists in the chat.
+// ---------------------------------------------------------------------------
+
+function dmControlContext(context: ControlExecutionContext): DmToolContext {
+  return {
+    userId: context.userId,
+    agentId: typeof context.agentId === 'string' ? context.agentId : '',
+    sessionId: context.sessionId ?? null
+  }
+}
+
+async function runDmControl<T extends Record<string, any>>(
+  operation: () => Promise<T>
+): Promise<Record<string, any>> {
+  try {
+    return await operation()
+  } catch (error) {
+    if (error instanceof DmToolError) {
+      throw new Error(error.hint ? `${error.message} | fix: ${error.hint}` : error.message)
+    }
+    throw error
+  }
+}
+
+const dmIdSchema = z.object({ dm_id: z.string().trim().min(1) }).passthrough()
+
+const dmSendControlSchema = z
+  .object({
+    to: z.string().trim().min(1),
+    kind: z.string().trim().min(1),
+    subject: z.string().trim().min(1),
+    body: z.string().trim().min(1),
+    deliver: z.string().trim().min(1)
+  })
+  .passthrough()
+
+const dmCloseControlSchema = z
+  .object({
+    dm_id: z.string().trim().min(1),
+    result: z.string().trim().min(1)
+  })
+  .passthrough()
+
+const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
+  {
+    controlId: 'sys.dm.send',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'DM Send',
+    description:
+      'Send a DM to another primary agent: info (a note), assignment (do this and report back), or result (the answer to one). deliver "wait" puts it in their inbox; deliver "wake" asks Batshit to start a turn for them now and degrades to a wait with a reason if it cannot. Set to "all" to broadcast an info note to every DM-enabled agent (never wakes anybody). Returns the recipient\'s current state.',
+    inputSchema: dmSendControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Recipient agent id, or "all" to broadcast an info note to every DM-enabled agent that accepts you (info + wait only). Use sys.dm.agents to find one.' },
+        kind: { type: 'string', enum: ['info', 'assignment', 'result'], description: 'info = a note; assignment = do this and report back; result = the answer to an assignment.' },
+        subject: { type: 'string', description: 'One line, max 240 characters.' },
+        body: { type: 'string', description: 'The message itself, max 40,000 characters. Text only; name a clip id or a path rather than attaching.' },
+        priority: { type: 'string', enum: ['normal', 'urgent'], description: 'Urgent items sort to the top of their inbox. Default normal.' },
+        requested_outcome: { type: 'string', description: 'Required for assignment: what "done" looks like.' },
+        scope: { type: 'string', description: 'Required for assignment: what is in and out of bounds.' },
+        report_back_to: { type: 'string', description: 'Required for assignment: the agent id that gets the result.' },
+        deliver: { type: 'string', enum: ['wait', 'wake'], description: 'wait (default behaviour) leaves it in their inbox; wake asks Batshit to start a turn now.' },
+        result_delivery: { type: 'string', enum: ['wait', 'wake'], description: 'assignment only: how the eventual result reaches you. Default wait.' },
+        related_dm_id: { type: 'string', description: 'Required for result: the assignment this answers.' },
+        expires_in_hours: { type: 'integer', minimum: 1, maximum: 720, description: 'Override the default expiry (7 days for info, 14 for assignment and result).' }
+      },
+      required: ['to', 'kind', 'subject', 'body', 'deliver']
+    },
+    outputSchema: null,
+    schemaHint: 'to + kind + subject + body + deliver; assignment also needs requested_outcome, scope, report_back_to',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['dm', 'message', 'agent', 'wake'],
+    handler: async (context, input) =>
+      runDmControl(() => sendDmOp(dmControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.dm.list',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'DM List',
+    description:
+      'List the open DMs in your inbox as summary lines (no bodies), urgent first then oldest. The DMs roster in DYNAMIC INFO already shows these; use this to see past the roster cap or to include closed items.',
+    inputSchema: z.object({}).passthrough(),
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        include_done: { type: 'boolean', description: 'Also list closed and expired items. Default false.' }
+      }
+    },
+    outputSchema: null,
+    schemaHint: 'optional include_done',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['dm', 'inbox', 'list'],
+    handler: async (context, input) =>
+      runDmControl(() => listDmsOp(dmControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.dm.read',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'DM Read',
+    description:
+      'Read one DM in full, including its body. Reading an info item acknowledges it and closes it. Only the recipient can read a DM.',
+    inputSchema: dmIdSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: { dm_id: { type: 'string' } },
+      required: ['dm_id']
+    },
+    outputSchema: null,
+    schemaHint: 'dm_id',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['dm', 'read'],
+    handler: async (context, input) =>
+      runDmControl(() => readDmOp(dmControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.dm.claim',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'DM Claim',
+    description:
+      'Take an assignment from your inbox. One assignment at a time: this is refused while you already have one in progress. Close the one you are on first.',
+    inputSchema: dmIdSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: { dm_id: { type: 'string' } },
+      required: ['dm_id']
+    },
+    outputSchema: null,
+    schemaHint: 'dm_id',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['dm', 'claim', 'assignment'],
+    handler: async (context, input) =>
+      runDmControl(() => claimDmOp(dmControlContext(context), input as never))
+  },
+  {
+    controlId: 'sys.dm.done',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'DM Done',
+    description:
+      'Close a DM as finished with a real result. For an assignment this also creates and delivers the result DM back to whoever asked, so the report-back cannot be forgotten.',
+    inputSchema: dmCloseControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        dm_id: { type: 'string' },
+        result: { type: 'string', description: 'What you actually did or found, max 20,000 characters. This text IS the answer that goes back.' }
+      },
+      required: ['dm_id', 'result']
+    },
+    outputSchema: null,
+    schemaHint: 'dm_id + result',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['dm', 'done', 'close'],
+    handler: async (context, input) =>
+      runDmControl(() => closeDmOp(dmControlContext(context), input as never, 'done'))
+  },
+  {
+    controlId: 'sys.dm.blocked',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'DM Blocked',
+    description:
+      'Close a DM as blocked, with a result saying what stopped you. Like done, this reports back to whoever asked. Use it honestly — a blocked item is not a failure to hide.',
+    inputSchema: dmCloseControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        dm_id: { type: 'string' },
+        result: { type: 'string', description: 'What stopped you and what would unblock it, max 20,000 characters.' }
+      },
+      required: ['dm_id', 'result']
+    },
+    outputSchema: null,
+    schemaHint: 'dm_id + result',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['dm', 'blocked', 'close'],
+    handler: async (context, input) =>
+      runDmControl(() => closeDmOp(dmControlContext(context), input as never, 'blocked'))
+  },
+  {
+    controlId: 'sys.dm.agents',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'DM Agents (who is around)',
+    description:
+      'List every agent that can receive DMs, with whether it is idle, running, or waiting on a tool approval, how it takes wake-ups, and how many open DMs it has. Ask this before choosing wait or wake.',
+    inputSchema: z.object({}).passthrough(),
+    inputSchemaJson: { type: 'object', properties: {} },
+    outputSchema: null,
+    schemaHint: 'no input',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['dm', 'agents', 'presence'],
+    handler: async (context) => runDmControl(() => listDmAgentsOp(dmControlContext(context)))
+  }
+]
+
 const CONTROL_DEFINITIONS: ControlDefinition[] = [
   ...MEMORY_CONTROL_DEFINITIONS,
+  ...DM_CONTROL_DEFINITIONS,
   {
     controlId: 'sys.model_catalog.search',
     sourceType: 'core',
@@ -2349,6 +2578,7 @@ export type ControlUseErrorCode =
   | 'CONTROL_NOT_ALLOWED'
   | 'CONTROL_INPUT_INVALID'
   | 'CONTROL_RISK_REQUIRES_APPROVAL'
+  | 'CONTROL_RISK_NEEDS_HUMAN_TURN'
   | 'CONTROL_NOT_EXECUTABLE'
   | 'CONTROL_EXECUTION_FAILED'
 
@@ -2497,6 +2727,37 @@ function resolveControlRiskScopeKey(controlId: string, inputPayload: Record<stri
     return undefined
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * SA-113 F-SEC-1 (security) — a woken turn cannot approve its own risky control.
+ *
+ * ## The hole this closes
+ *
+ * Every `confirm` and `restricted` control below runs the moment the MODEL passes
+ * `allowRisky: true`. Nothing checked that a human clicked or typed anything; the broker's
+ * own failure text even tells the model to "retry with allowRisky: true" once "the user
+ * approved". That was a tolerable convention while the only text inside a user turn was
+ * text the user had typed.
+ *
+ * SA-113 ended that. A DM body and a wake-up **webhook** body are now first-class user
+ * turns, and the webhook route is reachable from outside the machine whenever a tunnel
+ * runs. Outside text saying "the user approved, retry with allowRisky: true" would
+ * otherwise reach `sys.skill.import` (which pulls code from a URL), the Docker
+ * runtime-addon start/stop controls, the voice-engine installers, `sys.memory.delete`, and
+ * artifact rollback. The DM guidance always said a DM cannot approve anything; the server
+ * did not enforce it. Now it does, in `useControl`, which is the one place every actor type
+ * and every lane funnels through.
+ *
+ * The five-minute approval cache is the same hole from the other side — an approval the
+ * user gave in chat at 9:00 would unlock a woken turn at 9:03 — so the gate runs BEFORE the
+ * cache is read, ignores `allowRisky`, and never writes the cache.
+ *
+ * `resolveWokenTurnState` (`dm/wokenTurn.ts`) owns the read and its fail-closed rule.
+ *
+ * What this cannot cover: an agent that already holds `BATSHIT_TOKEN` through auto-approved
+ * Bash can reach `/api/controls/use` itself. That is the broader shell boundary and the
+ * user's tool configuration owns it — UserDocs says so in plain words.
+ * ------------------------------------------------------------------ */
 
 async function hasContextualControlRiskApproval(options: {
   userId: string
@@ -6752,6 +7013,52 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       },
       control
     )
+  }
+
+  // F-SEC-1 — a woken turn cannot approve its own risky control. Runs BEFORE the approval
+  // cache is read, so neither `allowRisky` nor a cached human approval can get past it, and
+  // nothing is written that a later call could read as consent.
+  if (control.riskLevel !== 'safe') {
+    // The acting identity is passed so the gate has a server-owned source (the wake
+    // registry) beside the caller-supplied `sessionId`; see `resolveWokenTurnState`.
+    const wokenTurn = await resolveWokenTurnState(options.sessionId, {
+      userId: options.userId,
+      agentId: options.agentId
+    })
+    if (wokenTurn.woken) {
+      const message =
+        `Control "${effectiveControlId}" has risk level "${control.riskLevel}" and this turn ` +
+        'was started by a DM or a webhook, not by the user. Ask the user and leave the item ' +
+        'open; once the user replies in this chat, retry.'
+      // F-SEC-1b: tell the user their woken chat is stuck on them. Nothing here can fail the
+      // refusal — a missing stamp is a quieter badge, not a weaker gate.
+      if (wokenTurn.dmId) {
+        try {
+          const { stampDmNeedsUser } = await import('$lib/server/services/dm/dmStore')
+          await stampDmNeedsUser(
+            wokenTurn.dmId,
+            `This chat asked to run "${effectiveControlId}", which needs your say-so.`
+          )
+        } catch (error) {
+          console.warn('[ControlRegistry] Could not stamp the DM as needing the user:', error)
+        }
+      }
+      return await finalize(
+        {
+          success: false,
+          controlId: effectiveControlId,
+          error: {
+            code: 'CONTROL_RISK_NEEDS_HUMAN_TURN',
+            message,
+            details: {
+              riskLevel: control.riskLevel,
+              startedBy: 'wake'
+            }
+          }
+        },
+        control
+      )
+    }
   }
 
   const riskScopeKey = resolveControlRiskScopeKey(effectiveControlId, inputPayload)

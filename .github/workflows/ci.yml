@@ -136,8 +136,16 @@ jobs:
           src/lib/server/tests/redisPatterns.test.ts
           src/lib/server/tests/redisStreamService.test.ts
           src/lib/server/tests/messageDeletion.test.ts
+          src/lib/server/tests/redisMessageWindows.test.ts
           src/lib/server/tests/folderDeletion.test.ts
           src/lib/server/services/__tests__/backupRestoreService.test.ts
+          src/lib/server/services/dm/__tests__/dmStore.test.ts
+          src/lib/server/services/dm/__tests__/dmTools.test.ts
+          src/lib/server/services/dm/__tests__/wakeHookStore.test.ts
+          src/lib/server/services/dm/__tests__/wokenTurn.test.ts
+          src/lib/server/services/__tests__/agentWakeups.test.ts
+          src/routes/api/wake/wake-webhook-route.test.ts
+          src/routes/api/dms/dms-routes.test.ts
           src/lib/server/services/__tests__/goonRecipeRepository.test.ts
           src/lib/server/services/__tests__/hairAssetRepository.server.test.ts
           src/lib/server/services/__tests__/goonMutationRepository.test.ts

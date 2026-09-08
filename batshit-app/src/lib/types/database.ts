@@ -160,6 +160,21 @@ export interface AgentRow {
   // SA-111 P4: per-agent Workers enablement (DL-111-11). Default ON for API and CLI
   // primaries; resolved only through resolveWorkersEnabled().
   workers_enabled?: boolean | null
+  // SA-113 P1 (DL-113-01, DL-113-15): wake-up settings. `wake_enabled` absent means ON for
+  // API and CLI primaries; a blank `wake_timeout_minutes` means the code default. Resolved
+  // ONLY through `resolveAgentWakeEnabled` / `resolveWakeTimeoutMs` / `resolveWakeTarget`
+  // in `$lib/utils/dmControl.ts`.
+  wake_enabled?: boolean | null
+  wake_timeout_minutes?: number | null
+  wake_target?: 'new-session' | 'current-session' | null
+  // SA-113 P2 (DL-113-01): Agent DM settings. `dms_enabled` absent means OFF — DMs are
+  // opt-in per agent. `dm_senders` is the recipient-side policy: 'all' (the default) or
+  // 'selected', in which case `dm_sender_agent_ids` is the list, and an EMPTY list means
+  // nobody. Resolved ONLY through `resolveAgentDmsEnabled` / `resolveDmSenderPolicy` /
+  // `resolveDmSenderAllowed` in `$lib/utils/dmControl.ts`.
+  dms_enabled?: boolean | null
+  dm_senders?: 'all' | 'selected' | null
+  dm_sender_agent_ids?: string[] | null
 
   // Reasoning / thinking rendering (SA-018)
   show_reasoning?: boolean
@@ -317,6 +332,8 @@ export interface UserSettingsRow {
     dcm_schema_hint_max_chars?: number
     dcm_tool_name_threshold?: number
     goon_lip_sync_lab_enabled?: boolean
+    /** SA-113 P1 (DL-113-01): instance-wide wake-up master switch. Absent means ON. */
+    agent_wakeups_enabled?: boolean
     web_search_default_provider?: 'duckduckgo-html' | 'exa' | 'perplexity'
     web_search_exa_type?: 'auto' | 'fast' | 'neural' | 'deep'
     web_search_perplexity_max_tokens_per_page?: number
