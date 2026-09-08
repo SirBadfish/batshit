@@ -145,11 +145,35 @@ export function registerSessionTurn(
   } as const
 }
 
+/**
+ * Release a session-turn lock.
+ *
+ * Passing the `messageId` the lock was registered under is an OWNED release: it succeeds
+ * only against that turn, which is what stops one request from cancelling another's lock.
+ *
+ * A release with no id used to delete whatever it found. That is fine for the group-chat
+ * lane, which deliberately registers with no message id, but it also let any caller that
+ * simply omitted the field wipe a live turn's lock — the DM drawer's Stop on a stale row,
+ * the artifact auto-followup, the interrupt route's stale-turn branch. With the lock gone
+ * the 409 interlock in `send-routed` is blind and a second turn can start in the same chat.
+ *
+ * So an unowned release now honours the same rule `pruneStaleSessionTurns` already applies
+ * a few lines above: a turn that HAS a message id and is younger than
+ * `ORPHANED_TURN_RELEASE_MS` is a turn still in setup, not an orphan, and is left alone.
+ * Recovery of a genuinely stuck lock is unchanged, and the group lane (message id `null`)
+ * still releases its own.
+ */
 export function clearSessionTurn(sessionId: string, messageId?: string | null) {
+  const entry = activeSessionTurns.get(sessionId)
+  if (!entry) return
+
   if (messageId) {
-    const entry = activeSessionTurns.get(sessionId)
-    if (entry?.messageId && entry.messageId !== messageId) return
+    if (entry.messageId && entry.messageId !== messageId) return
+    activeSessionTurns.delete(sessionId)
+    return
   }
+
+  if (entry.messageId && Date.now() - entry.startedAt <= ORPHANED_TURN_RELEASE_MS) return
   activeSessionTurns.delete(sessionId)
 }
 
@@ -207,4 +231,17 @@ export function abortGroupChat(sessionId: string, reason?: string) {
 export function getActiveGroupAbort(sessionId: string) {
   pruneStaleSessionTurns()
   return activeGroupTurns.get(sessionId) ?? null
+}
+
+/**
+ * Test-only hard reset, so one suite's locks cannot leak into the next.
+ *
+ * Teardown used to call `clearSessionTurn(sessionId)` for this, which worked only because
+ * an id-less release deleted unconditionally — the very behaviour that let a stale Stop
+ * cancel a live turn. Precedent: `__resetWakeRunRegistryForTests`.
+ */
+export function __resetStreamAbortRegistryForTests(): void {
+  activeStreams.clear()
+  activeGroupTurns.clear()
+  activeSessionTurns.clear()
 }

@@ -1,6 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
+import {
+  __resetWakeRunRegistryForTests,
+  registerWakeRun
+} from '$lib/server/services/wakeRunRegistry'
 import { resolveWokenTurnState } from '../wokenTurn'
 
 /**
@@ -101,5 +105,70 @@ describe('resolveWokenTurnState', () => {
     } finally {
       ;(redis as any).getRecentMessages = original
     }
+  })
+})
+
+/**
+ * F-SEC-1 — the gate must not be the caller's to switch off.
+ *
+ * `sessionId` reaches this read from the `/api/controls/use` request BODY, and the MCP
+ * gateway fills it from the model's own tool arguments. An empty id answered `woken: false`
+ * outright, so a woken agent skipped the whole refusal by leaving the field out. The wake
+ * registry is server-owned and in-process, so it answers the question the body cannot be
+ * trusted with.
+ */
+describe('the wake registry is the first source, not the request body', () => {
+  const AGENT = 'agent-cooper'
+
+  function registerRun(sessionId: string, agentId: string, userId: string) {
+    registerWakeRun({
+      sessionId,
+      agentId,
+      userId,
+      origin: { kind: 'dm', dmId: 'dm_1', from: 'agent-faye' } as any,
+      startedAt: Date.now(),
+      controller: new AbortController(),
+      timer: setTimeout(() => {}, 60_000)
+    })
+  }
+
+  beforeEach(() => {
+    __resetWakeRunRegistryForTests()
+  })
+
+  afterEach(() => {
+    __resetWakeRunRegistryForTests()
+  })
+
+  it('answers woken for an agent mid-woken-turn even with NO sessionId', async () => {
+    registerRun(SESSION, AGENT, USER)
+
+    expect(await resolveWokenTurnState(undefined, { userId: USER, agentId: AGENT })).toEqual({
+      woken: true,
+      dmId: null
+    })
+  })
+
+  it('answers woken when the caller names a DIFFERENT, calm chat', async () => {
+    // Pointing at somebody else's quiet session used to read back "a human typed here".
+    registerRun(SESSION, AGENT, USER)
+    await save('user')
+
+    expect(
+      await resolveWokenTurnState('sess-some-other-chat', { userId: USER, agentId: AGENT })
+    ).toEqual({ woken: true, dmId: null })
+  })
+
+  it('fails closed for a session-less call while ANY wake-up is running', async () => {
+    registerRun(SESSION, AGENT, USER)
+
+    // No agent id either: the call cannot prove it is not the woken turn.
+    expect(await resolveWokenTurnState('', { userId: USER })).toEqual({ woken: true, dmId: null })
+  })
+
+  it('leaves an ordinary session-less call alone when nothing is woken', async () => {
+    expect(await resolveWokenTurnState('', { userId: USER, agentId: AGENT })).toEqual({
+      woken: false
+    })
   })
 })

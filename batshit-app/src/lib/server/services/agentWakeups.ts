@@ -597,7 +597,21 @@ async function runAgentWakeup(
           error: error instanceof Error ? error.message : String(error)
         })
       }
-      await finishWokenTurn(sessionId, aborted ? 'stopped' : 'failed', input.userId)
+      // F-P1-5 — read WHY it was aborted, do not assume a Stop.
+      //
+      // `endWokenTurn` aborts the controller first and only reaches its own
+      // `finishWokenTurn('timed_out')` after an awaited HTTP round trip, so this handler
+      // always wins the single-winner `clearWakeRun` race. Reporting a flat `'stopped'`
+      // therefore recorded EVERY hard timeout as a user Stop, while the finalized assistant
+      // message said "timeout" — the two records contradicted each other. `abortWakeRun`
+      // puts the answer on the signal; take it from there.
+      const abortReason = controller.signal.reason
+      const reason: WakeRunEndReason = aborted
+        ? abortReason === 'wake_timeout'
+          ? 'timed_out'
+          : 'stopped'
+        : 'failed'
+      await finishWokenTurn(sessionId, reason, input.userId)
     })
 
   return {
@@ -710,11 +724,19 @@ export async function endWokenTurn(input: {
   abortWakeRun(input.sessionId, input.reason)
 
   try {
-    await fetch(`${input.originBase}/api/messages/interrupt`, {
+    const response = await fetch(`${input.originBase}/api/messages/interrupt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...internalServiceHeaders() },
       body: JSON.stringify({ sessionId: input.sessionId })
     })
+    // `fetch` does not throw on 4xx/5xx, so without this an auth or routing regression on
+    // that route goes back to being a silent no-op — which is exactly how the missing
+    // service-token lane stayed hidden.
+    if (!response.ok) {
+      console.warn(
+        `[Wake-up] Interrupt call answered ${response.status} after aborting a woken turn.`
+      )
+    }
   } catch (error) {
     console.warn('[Wake-up] Interrupt call failed after aborting a woken turn:', error)
   }

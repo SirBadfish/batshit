@@ -10239,6 +10239,9 @@ function mapControlUseErrorToNativeAutomationErrorCode(
       return 'INVALID_INPUT'
     case 'CONTROL_NOT_ALLOWED':
     case 'CONTROL_RISK_REQUIRES_APPROVAL':
+    // Same reason as the HTTP status mapping: a woken turn's refusal is policy, and
+    // `BACKEND_UNAVAILABLE` reads to the model as "the server is down, try again".
+    case 'CONTROL_RISK_NEEDS_HUMAN_TURN':
       return 'POLICY_BLOCKED'
     case 'CONTROL_EXECUTION_FAILED':
     default:

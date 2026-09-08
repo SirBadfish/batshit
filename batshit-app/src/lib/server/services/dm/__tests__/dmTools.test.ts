@@ -985,3 +985,50 @@ describe('F-P4-1 — Reopen clears the "already reported" markers', () => {
     expect(JSON.parse(callbacks[1].init.body).result).toBe('Green, re-checked.')
   })
 })
+
+/**
+ * An assignment that expires unclaimed owes its sender a "nobody picked this up" result.
+ *
+ * It never arrived. The report was built with `from: record.from` — the ORIGINAL SENDER —
+ * and `to: record.reportBackTo`, and `report_back_to` is almost always that same sender, so
+ * `createDm`'s self-send guard threw every time. The throw was swallowed as a warning,
+ * `resultDmId` was never linked, and every later `sys.dm.list` retried the same failing
+ * write. The report is now sent FROM the inbox it expired in, as a real close would be.
+ */
+describe('an expired unclaimed assignment reports back', () => {
+  it('sends the sender a result DM instead of silently retrying forever', async () => {
+    await seedAgent(COOPER)
+    await seedAgent(FAYE)
+
+    const sent = await sendDmOp(baseContext(), assignmentInput({ expires_in_hours: 1 }))
+    const dmId = (sent as any).dm_id ?? (sent as any).dm?.id
+    expect(dmId).toBeTruthy()
+
+    // Push it past its expiry without waiting an hour.
+    const record = await getDm(dmId)
+    await redis.json.set(
+      `dm:${dmId}`,
+      '$.expiresAt',
+      new Date(Date.now() - 60_000).toISOString() as never
+    )
+    expect(record?.reportBackTo).toBe(FAYE)
+
+    // Cooper lists his inbox; the reaper expires the item and the report goes out.
+    await listDmsOp({ userId: USER, agentId: COOPER, sessionId: null })
+
+    const fayeInbox = await listInbox(FAYE, { includeClosed: true })
+    const report = fayeInbox.find((item) => item.kind === 'result' && item.relatedDmId === dmId)
+    expect(report).toBeTruthy()
+    expect(report?.from).toMatchObject({ kind: 'agent', agentId: COOPER })
+    expect(report?.body).toMatch(/expired unclaimed/i)
+
+    // Linked, so a second list does not send it again.
+    expect((await getDm(dmId))?.resultDmId).toBe(report?.id)
+    await listDmsOp({ userId: USER, agentId: COOPER, sessionId: null })
+    expect(
+      (await listInbox(FAYE, { includeClosed: true })).filter(
+        (item) => item.kind === 'result' && item.relatedDmId === dmId
+      )
+    ).toHaveLength(1)
+  })
+})

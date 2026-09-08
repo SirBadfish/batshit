@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  __resetStreamAbortRegistryForTests,
   abortStream,
   clearSessionTurn,
-  clearStreamAbort,
   getActiveSessionTurn,
   getActiveStream,
   registerSessionTurn,
@@ -13,10 +13,9 @@ import {
 describe('streamAbortRegistry', () => {
   afterEach(() => {
     vi.useRealTimers()
-    clearSessionTurn('session-1')
-    clearSessionTurn('session-2')
-    clearStreamAbort('session-1')
-    clearStreamAbort('session-2')
+    // A hard reset, not `clearSessionTurn`: an id-less release no longer deletes a live
+    // owned lock, so teardown cannot rely on it.
+    __resetStreamAbortRegistryForTests()
   })
 
   it('allows only one active session turn per session', () => {
@@ -29,7 +28,7 @@ describe('streamAbortRegistry', () => {
     expect(duplicate.existing.kind).toBe('single')
     expect(duplicate.existing.messageId).toBe('msg-1')
 
-    clearSessionTurn('session-1')
+    clearSessionTurn('session-1', 'msg-1')
 
     const retry = registerSessionTurn('session-1', 'group')
     expect(retry.ok).toBe(true)
@@ -45,10 +44,32 @@ describe('streamAbortRegistry', () => {
     expect(getActiveStream('session-1')?.messageId).toBe('msg-1')
     expect(getActiveSessionTurn('session-1')?.kind).toBe('single')
 
-    clearSessionTurn('session-1')
+    clearSessionTurn('session-1', 'msg-1')
 
     expect(getActiveSessionTurn('session-1')).toBeNull()
     expect(getActiveStream('session-1')?.messageId).toBe('msg-1')
+  })
+
+  it('does not let an unowned release cancel a turn that is still starting', () => {
+    // SA-113 F-P1-1. The DM drawer's Stop, the artifact auto-followup and the interrupt
+    // route's stale-turn branch all release without a message id. Deleting on their word
+    // wiped the lock of a live turn during its setup window, after which the 409 interlock
+    // in send-routed is blind and a second turn can start in the same chat.
+    registerSessionTurn('session-1', 'single', 'msg-1')
+
+    clearSessionTurn('session-1')
+
+    expect(getActiveSessionTurn('session-1')?.messageId).toBe('msg-1')
+  })
+
+  it('still lets the group lane release its own id-less turn', () => {
+    // A group turn deliberately registers with no message id, so an id-less release IS its
+    // owned release and must keep working.
+    registerSessionTurn('session-1', 'group')
+
+    clearSessionTurn('session-1')
+
+    expect(getActiveSessionTurn('session-1')).toBeNull()
   })
 
   it('does not clear a session turn for a different message id', () => {

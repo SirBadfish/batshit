@@ -128,8 +128,17 @@ describe('creating a DM', () => {
   })
 
   it('sorts urgent items ahead of older normal ones', async () => {
+    // `dmInboxScore` is `offset + createdTs`, so two normal items written in the SAME
+    // millisecond score identically and Redis falls back to ordering by member — a random
+    // id. Seeded back to back these three landed in one tick and the assertion below
+    // decided the run about half the time. A millisecond apart is what the test means by
+    // "older", so say it rather than race for it.
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 2))
+
     const first = await seedInfo({ subject: 'Old and normal' })
+    await tick()
     const second = await seedInfo({ subject: 'Newer and urgent', priority: 'urgent' })
+    await tick()
     const third = await seedInfo({ subject: 'Newest and normal' })
 
     const inbox = await listInbox(COOPER)

@@ -41,6 +41,7 @@ import {
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import {
   DM_KINDS,
+  isOpenDmStatus,
   toDmSummary,
   type DmKind,
   type DmPriority,
@@ -664,10 +665,16 @@ export async function listDmsOp(
   input?: { include_done?: boolean }
 ): Promise<{ open: DmSummary[]; total_open: number }> {
   await requireDmEnabledAgent(context.userId, context.agentId)
-  const records = await runStore(() =>
-    listInbox(context.agentId, { includeClosed: input?.include_done === true })
-  )
-  await settleExpiredAssignments(context, records)
+  // Settle off the FULL reaped set, then narrow for the reply.
+  //
+  // Reading with `includeClosed: false` filtered the just-expired items out before
+  // `settleExpiredAssignments` ever saw them, so the "nobody picked this up" report only
+  // fired when an agent happened to pass `include_done: true` — which is the rarer call.
+  // One read either way; the filter simply moves after the settle.
+  const all = await runStore(() => listInbox(context.agentId, { includeClosed: true }))
+  await settleExpiredAssignments(context, all)
+  const records =
+    input?.include_done === true ? all : all.filter((record) => isOpenDmStatus(record.status))
   return {
     open: records.map(toDmSummary),
     total_open: records.filter((record) => record.status === 'new' || record.status === 'working')
@@ -834,17 +841,37 @@ async function reportBack(
  * An assignment that expired with nobody claiming it owes its sender a result, so nobody
  * is left guessing whether it was ever picked up. Best-effort by design: this runs off a
  * read, and a failure here must never make a `list` fail.
+ *
+ * The report is sent FROM the inbox it expired in, exactly as `reportBack` sends a real
+ * close from the closing agent. Sending it from `record.from` — the original sender —
+ * addressed the DM back to that same agent in the normal case, because `report_back_to` is
+ * almost always the sender itself; `createDm`'s self-send guard then threw, the `catch`
+ * below swallowed it as a warning, `resultDmId` was never linked, and every later `list`
+ * retried the same failing write. The sender was never told, which is the one thing this
+ * function exists to do.
  */
 async function settleExpiredAssignments(
   context: DmToolContext,
   records: DmRecord[]
 ): Promise<void> {
   const owing = selectExpiredAssignmentsNeedingResult(records)
+  if (owing.length === 0) return
+
+  const inboxAgent = (await redis.get(`agent:${context.agentId}`)) as Record<string, any> | null
+
   for (const record of owing) {
+    // `report_back_to` may name the very agent whose inbox this is (an agent assigning to
+    // itself is impossible, but a third party can name the recipient as the reporter). That
+    // would be a self-send again, so leave it: there is nobody to tell.
+    if (record.reportBackTo === record.to) continue
     try {
       const created = await createDm({
         userId: context.userId,
-        from: record.from,
+        from: {
+          kind: 'agent',
+          agentId: record.to,
+          name: inboxAgent ? agentDisplayName(inboxAgent) : record.to
+        },
         to: record.reportBackTo as string,
         kind: 'result',
         subject: `Result: ${record.subject}`,

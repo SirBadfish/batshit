@@ -266,7 +266,10 @@ async function pruneMissingIndexEntries(
  */
 export async function reapExpired(records: DmRecord[], now = Date.now()): Promise<DmRecord[]> {
   const out: DmRecord[] = []
-  let expiredAny: DmRecord | null = null
+  // One announce PER INBOX. A single `expiredAny` slot kept only the last record, so a pass
+  // that expired items for several agents — `GET /api/dms` reaps the whole instance —
+  // published `dm_inbox_changed` for one of them and left every other header badge stale.
+  const touchedInboxes = new Map<string, string>()
   for (const record of records) {
     if (!isOpenDmStatus(record.status)) {
       out.push(record)
@@ -277,17 +280,34 @@ export async function reapExpired(records: DmRecord[], now = Date.now()): Promis
       out.push(record)
       continue
     }
-    const expired: DmRecord = {
-      ...record,
-      status: 'expired',
-      completedAt: new Date(now).toISOString()
+
+    // F-P2-3, for the one writer that cannot take the inbox lock.
+    //
+    // The reaper is reached from `listInbox`, which `createDm` and `claimDm` call while
+    // already holding the lock, so taking it here would deadlock (see `withInboxLock`).
+    // But a whole-record `JSON.SET $` from outside the lock silently discarded a locked
+    // writer's work: `closeDm` reading a `working` item, the reaper writing `expired` over
+    // the top, and the agent's `result` text gone even though the tool call had already
+    // returned success and `reportBack` had linked the result DM.
+    //
+    // Two things fix that without a lock. The status is re-read first, so an item another
+    // writer has already closed is left alone; and the write is PATH-SCOPED, so whatever
+    // else lands in the same instant keeps its own fields.
+    const current = await getDm(record.id)
+    if (!current || !isOpenDmStatus(current.status)) {
+      out.push(current ?? record)
+      continue
     }
-    await writeDm(expired)
-    await applyRetention(expired.id)
-    expiredAny = expired
+    const completedAt = new Date(now).toISOString()
+    await redis.json.set(dmKey(record.id), '$.status', 'expired' as never)
+    await redis.json.set(dmKey(record.id), '$.completedAt', completedAt as never)
+    await applyRetention(record.id)
+
+    const expired: DmRecord = { ...current, status: 'expired', completedAt }
+    touchedInboxes.set(expired.to, expired.userId)
     out.push(expired)
   }
-  if (expiredAny) void announceInboxChanged(expiredAny.to, expiredAny.userId)
+  for (const [agentId, userId] of touchedInboxes) void announceInboxChanged(agentId, userId)
   return out
 }
 

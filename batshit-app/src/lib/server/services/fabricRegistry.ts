@@ -7019,7 +7019,12 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
   // cache is read, so neither `allowRisky` nor a cached human approval can get past it, and
   // nothing is written that a later call could read as consent.
   if (control.riskLevel !== 'safe') {
-    const wokenTurn = await resolveWokenTurnState(options.sessionId)
+    // The acting identity is passed so the gate has a server-owned source (the wake
+    // registry) beside the caller-supplied `sessionId`; see `resolveWokenTurnState`.
+    const wokenTurn = await resolveWokenTurnState(options.sessionId, {
+      userId: options.userId,
+      agentId: options.agentId
+    })
     if (wokenTurn.woken) {
       const message =
         `Control "${effectiveControlId}" has risk level "${control.riskLevel}" and this turn ` +

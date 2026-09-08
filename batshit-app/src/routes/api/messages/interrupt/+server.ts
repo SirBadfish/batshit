@@ -11,9 +11,19 @@ import {
   getActiveStream
 } from '$lib/server/services/streamAbortRegistry'
 import { abortWokenTurnForInterrupt } from '$lib/server/services/agentWakeups'
+import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
 
 export const POST: RequestHandler = async ({ request, locals }) => {
-  if (!locals.user?.id) {
+  // SA-113 AMD-113-02 — Batshit itself calls this route.
+  //
+  // `endWokenTurn` posts here with `internalServiceHeaders()` when a wake-up hits its hard
+  // time limit, and this handler used to accept a session COOKIE only. A server-to-server
+  // fetch carries no cookie, so that call answered 401 every time; `fetch` does not throw
+  // on 4xx and the status was never read, so the whole second half of the documented
+  // Stop/timeout sequence was a silent no-op. The service-token lane is the same one
+  // `/api/sse` POST and `send-routed` already accept.
+  const internal = isTrustedInternalRequest(request)
+  if (!internal && !locals.user?.id) {
     return apiFailure('Unauthorized', 401)
   }
 
@@ -27,7 +37,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   const session = await redis.getSession(sessionId)
-  if (!session || session.user_id !== locals.user.id) {
+  // The internal caller names the session it just started, so ownership is checked against
+  // the session's own user rather than a browser identity it does not have.
+  if (!session || (!internal && session.user_id !== locals.user?.id)) {
     return json({ success: false, error: 'Session not found or unauthorized' }, { status: 404 })
   }
 

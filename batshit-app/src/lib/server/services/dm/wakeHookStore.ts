@@ -38,6 +38,23 @@ const TOKEN_SUFFIX_LENGTH = 6
 export const WAKE_HOOK_KEY_PREFIX = 'wake_hook:'
 export const WAKE_HOOKS_INDEX_PREFIX = 'wake_hooks:'
 
+/**
+ * A hook id is `whk_` plus base64url, and NOTHING else may be turned into a key.
+ *
+ * The id arrives as a URL path segment, so it is attacker-controlled text, and the two key
+ * spaces overlap: `wake_hook:` + `s:{userId}` is byte-identical to `wake_hooks:{userId}`,
+ * the index SET. Without this check `POST /api/wake/s:{userId}` sent `JSON.GET` at a SET,
+ * Redis answered WRONGTYPE, and the throw escaped `validateWakeHookToken` — which sits
+ * outside the route's try/catch — as a 500. That breaks the invariant this file's header
+ * states ("every failure the same 403") and hands an unauthenticated caller a probe that
+ * tells a real user id from a made-up one.
+ */
+const HOOK_ID_PATTERN = /^whk_[A-Za-z0-9_-]{1,64}$/
+
+export function isWellFormedHookId(hookId: unknown): hookId is string {
+  return typeof hookId === 'string' && HOOK_ID_PATTERN.test(hookId)
+}
+
 export function wakeHookKey(hookId: string): string {
   return `${WAKE_HOOK_KEY_PREFIX}${hookId}`
 }
@@ -125,7 +142,8 @@ function normalizeExpiresAt(value: unknown): string | null {
 
 export async function getWakeHook(hookId: string): Promise<WakeHookRecord | null> {
   const normalized = typeof hookId === 'string' ? hookId.trim() : ''
-  if (!normalized) return null
+  // A malformed id is "no such hook", never a key read: see `isWellFormedHookId`.
+  if (!isWellFormedHookId(normalized)) return null
   const record = (await redis.json.get(wakeHookKey(normalized))) as WakeHookRecord | null
   return record && typeof record === 'object' ? record : null
 }
@@ -212,6 +230,37 @@ async function requireOwnedHook(userId: string, hookId: string): Promise<WakeHoo
   return record
 }
 
+/**
+ * Write named fields onto an EXISTING hook, never the whole record.
+ *
+ * F-P3-2 again, for the two writers it was not applied to. `writeHook` is
+ * `JSON.SET key $ record`, and a root-path write CREATES a missing key — so a revoke
+ * landing between `requireOwnedHook`'s read and the write brought the hook back with its
+ * original `tokenHash` and `enabled: true`, while the owner's index no longer listed it.
+ * The result was a live credential nothing in the UI could revoke a second time. The same
+ * window silently undid a concurrent pause.
+ *
+ * A path write cannot create the root, so a revoked hook is a no-op here instead of a
+ * resurrection, exactly as in `recordWakeHookUse`. RedisJSON raises on the missing key and
+ * that is reported as the 404 it is.
+ */
+async function patchHookFields(
+  hookId: string,
+  fields: Record<string, unknown>
+): Promise<WakeHookRecord> {
+  const key = wakeHookKey(hookId)
+  try {
+    for (const [field, value] of Object.entries(fields)) {
+      await redis.json.set(key, `$.${field}`, value as never)
+    }
+  } catch {
+    throw new WakeHookError('That wake-up webhook was not found.', 404)
+  }
+  const record = await getWakeHook(hookId)
+  if (!record) throw new WakeHookError('That wake-up webhook was not found.', 404)
+  return record
+}
+
 export async function updateWakeHook(options: {
   userId: string
   hookId: string
@@ -220,9 +269,8 @@ export async function updateWakeHook(options: {
   enabled?: unknown
   expiresAt?: unknown
 }): Promise<WakeHookSummary> {
-  const record = await requireOwnedHook(options.userId, options.hookId)
-  const updated: WakeHookRecord = {
-    ...record,
+  await requireOwnedHook(options.userId, options.hookId)
+  const updated = await patchHookFields(options.hookId, {
     ...(options.name === undefined ? {} : { name: normalizeName(options.name) }),
     ...(options.deliverDefault === undefined
       ? {}
@@ -232,8 +280,7 @@ export async function updateWakeHook(options: {
       ? {}
       : { expiresAt: normalizeExpiresAt(options.expiresAt) }),
     updatedAt: nowIso()
-  }
-  await writeHook(updated)
+  })
   return toWakeHookSummary(updated)
 }
 
@@ -245,16 +292,14 @@ export async function rotateWakeHookToken(options: {
   userId: string
   hookId: string
 }): Promise<{ token: string; record: WakeHookSummary }> {
-  const record = await requireOwnedHook(options.userId, options.hookId)
+  await requireOwnedHook(options.userId, options.hookId)
   const secret = generateHookToken()
-  const updated: WakeHookRecord = {
-    ...record,
+  const updated = await patchHookFields(options.hookId, {
     tokenHash: hashToken(secret),
     tokenPrefix: secret.slice(0, TOKEN_PREFIX_LENGTH),
     tokenSuffix: secret.slice(-TOKEN_SUFFIX_LENGTH),
     updatedAt: nowIso()
-  }
-  await writeHook(updated)
+  })
   return { token: secret, record: toWakeHookSummary(updated) }
 }
 

@@ -57,6 +57,54 @@ const UNAUTHORIZED = { error: 'That wake-up webhook or token is not valid.' }
 const MAX_WAKE_BODY_BYTES = 256 * 1024
 
 /**
+ * Read the body with the cap actually ENFORCED, not merely declared.
+ *
+ * A `Content-Length` check alone is not a limit: `headers.get` answers `null` when the
+ * header is absent, `Number(null)` is `0`, and `0 > MAX_WAKE_BODY_BYTES` is false — so a
+ * chunked request (which never carries `Content-Length`) walked straight past the guard
+ * into an unbounded `request.json()` and the 1 GB `BODY_SIZE_LIMIT` behind it. That is the
+ * exact attack the constant above exists to stop.
+ *
+ * The header check stays as the cheap early refusal for an honest caller; the streaming
+ * counter below is what makes it true for a dishonest one. Both halves together are the
+ * `cli-runtimes` precedent — only the first half had been copied.
+ */
+class WakeBodyTooLarge extends Error {}
+
+async function readBoundedBody(request: Request): Promise<any> {
+  const declaredLength = Number(request.headers.get('content-length'))
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_WAKE_BODY_BYTES) {
+    throw new WakeBodyTooLarge()
+  }
+  if (!request.body) return null
+
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let bytes = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      bytes += value.byteLength
+      if (bytes > MAX_WAKE_BODY_BYTES) {
+        await reader.cancel()
+        throw new WakeBodyTooLarge()
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8'))
+  } catch {
+    return null
+  }
+}
+
+/**
  * F-SEC-4 — a hook id comes straight off the URL path, so it is attacker-controlled text.
  * Printing it raw lets a crafted path segment write newlines into the server log and forge
  * log lines. The id itself is 96 random bits of hex, so nothing legitimate is lost.
@@ -126,15 +174,18 @@ export const POST: RequestHandler = async ({ request, params }) => {
 
   // F-SEC-2 — after authentication, so an anonymous caller cannot learn anything from the
   // difference between 403 and 413, and the app-wide limiter has already seen them.
-  const declaredLength = Number(request.headers.get('content-length'))
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_WAKE_BODY_BYTES) {
-    return json(
-      { error: 'That wake-up body is too large.', limit_bytes: MAX_WAKE_BODY_BYTES },
-      { status: 413 }
-    )
+  let body: any
+  try {
+    body = await readBoundedBody(request)
+  } catch (error) {
+    if (error instanceof WakeBodyTooLarge) {
+      return json(
+        { error: 'That wake-up body is too large.', limit_bytes: MAX_WAKE_BODY_BYTES },
+        { status: 413 }
+      )
+    }
+    return json({ error: 'A JSON object body is required.' }, { status: 400 })
   }
-
-  const body = await request.json().catch(() => null)
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return json({ error: 'A JSON object body is required.' }, { status: 400 })
   }

@@ -279,6 +279,83 @@ describe('recording a call (F-P3-2)', () => {
     expect(await validateWakeHookToken(record.id, newToken)).toMatchObject({ valid: true })
     expect(await validateWakeHookToken(record.id, oldToken)).toMatchObject({ valid: false })
   })
+
+  /**
+   * The same window, for the two writers it had NOT been applied to.
+   *
+   * `updateWakeHook` and `rotateWakeHookToken` both read the record and then wrote the whole
+   * thing back with `JSON.SET $`, and a root-path write CREATES a missing key. A revoke
+   * landing between their read and their write therefore brought the hook back with its
+   * original `tokenHash` and `enabled: true`, while the owner's index no longer listed it —
+   * a live credential with nothing left in the UI to revoke a second time.
+   */
+  it('update cannot resurrect a hook revoked inside its own window', async () => {
+    await seedAgent(COOPER)
+    const { record, token } = await createWakeHook({
+      userId: USER,
+      agentId: COOPER,
+      name: 'Nightly'
+    })
+
+    const stale = await getWakeHook(record.id)
+    await revokeWakeHook({ userId: USER, hookId: record.id })
+
+    const getSpy = serveStaleHookRecord(record.id, stale)
+    try {
+      await expect(
+        updateWakeHook({ userId: USER, hookId: record.id, name: 'Renamed' })
+      ).rejects.toBeInstanceOf(WakeHookError)
+    } finally {
+      getSpy.mockRestore()
+    }
+
+    expect(await getWakeHook(record.id)).toBeNull()
+    expect(await validateWakeHookToken(record.id, token)).toMatchObject({ valid: false })
+    expect(await listWakeHooks(USER)).toHaveLength(0)
+  })
+
+  it('rotate cannot resurrect a hook revoked inside its own window', async () => {
+    await seedAgent(COOPER)
+    const { record } = await createWakeHook({
+      userId: USER,
+      agentId: COOPER,
+      name: 'Nightly'
+    })
+
+    const stale = await getWakeHook(record.id)
+    await revokeWakeHook({ userId: USER, hookId: record.id })
+
+    let rotatedToken: string | null = null
+    const getSpy = serveStaleHookRecord(record.id, stale)
+    try {
+      rotatedToken = (await rotateWakeHookToken({ userId: USER, hookId: record.id })).token
+    } catch {
+      // Refusing outright is the other acceptable outcome; what must not happen is a key.
+    } finally {
+      getSpy.mockRestore()
+    }
+
+    expect(await getWakeHook(record.id)).toBeNull()
+    if (rotatedToken) {
+      expect(await validateWakeHookToken(record.id, rotatedToken)).toMatchObject({ valid: false })
+    }
+    expect(await listWakeHooks(USER)).toHaveLength(0)
+  })
+})
+
+describe('hook id validation', () => {
+  it('treats an id shaped like the index key as no such hook, not a key read', async () => {
+    await seedAgent(COOPER)
+    await createWakeHook({ userId: USER, agentId: COOPER, name: 'Nightly' })
+
+    // `wake_hook:` + `s:{userId}` === `wake_hooks:{userId}`, which is a SET. Reading it as
+    // RedisJSON raised WRONGTYPE and escaped the route as a 500 instead of the uniform 403.
+    await expect(getWakeHook(`s:${USER}`)).resolves.toBeNull()
+    await expect(getWakeHook(wakeHooksIndexKey(USER))).resolves.toBeNull()
+    await expect(validateWakeHookToken(`s:${USER}`, 'bswh_anything')).resolves.toMatchObject({
+      valid: false
+    })
+  })
 })
 
 describe('ownership', () => {

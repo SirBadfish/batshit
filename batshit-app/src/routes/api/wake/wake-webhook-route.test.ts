@@ -359,9 +359,54 @@ describe('F-SEC-2 / F-SEC-4 — the body and the log line', () => {
     expect(await listInbox(COOPER)).toHaveLength(0)
   })
 
+  it('F-SEC-2: refuses an oversized body that declares NO Content-Length', async () => {
+    const { token, record } = await seedHook({ deliverDefault: 'wait' })
+
+    // The header check alone was not a limit. `headers.get` answers null with no header,
+    // `Number(null)` is 0, and `0 > 256 KB` is false — so a chunked request (which never
+    // carries Content-Length) walked past the guard into an unbounded read. The cap has to
+    // be counted off the stream, which is what the cited `cli-runtimes` precedent does.
+    const oversized = JSON.stringify({ message: 'x'.repeat(512 * 1024) })
+    const { POST } = await import('./[hookId]/+server')
+    const response = await POST({
+      request: new Request(`http://localhost:5620/api/wake/${record.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        // A ReadableStream body carries no Content-Length, exactly like chunked encoding.
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(oversized))
+            controller.close()
+          }
+        }),
+        // @ts-expect-error — undici needs this for a stream body.
+        duplex: 'half'
+      }),
+      params: { hookId: record.id }
+    } as any)
+
+    expect(response.status).toBe(413)
+    expect(await listInbox(COOPER)).toHaveLength(0)
+  })
+
   it('F-SEC-2: an ordinary body is unaffected', async () => {
     const { token, record } = await seedHook({ deliverDefault: 'wait' })
     expect((await call(record.id, token, { message: 'normal' })).status).toBe(202)
+  })
+
+  it('answers the same 403 — not a 500 — for a hook id shaped like the index key', async () => {
+    const { token } = await seedHook()
+
+    // `wake_hook:` + `s:{userId}` is byte-identical to `wake_hooks:{userId}`, the index SET.
+    // Unvalidated, that sent JSON.GET at a SET, Redis answered WRONGTYPE, and the throw
+    // escaped as a 500 — telling an unauthenticated caller a real user id from a made-up
+    // one, on a route that is internet-reachable behind a tunnel.
+    const response = await call(`s:${USER}`, token)
+
+    expect(response.status).toBe(403)
+    expect((await response.json()).error).toBe(
+      (await (await call('whk_does_not_exist', token)).json()).error
+    )
   })
 
   it('F-SEC-4: sanitises the hook id before it reaches the log line', async () => {

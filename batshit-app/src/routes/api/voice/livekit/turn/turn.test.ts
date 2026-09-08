@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   getAgents: vi.fn(),
   saveMessage: vi.fn(),
   getMessages: vi.fn(),
+  getRecentMessages: vi.fn(),
   generateMessageId: vi.fn()
 }))
 
@@ -27,7 +28,8 @@ vi.mock('$lib/server/redis', () => ({
     getSession: mocks.getSession,
     getAgents: mocks.getAgents,
     saveMessage: mocks.saveMessage,
-    getMessages: mocks.getMessages
+    getMessages: mocks.getMessages,
+    getRecentMessages: mocks.getRecentMessages
   }
 }))
 
@@ -99,7 +101,7 @@ describe('/api/voice/livekit/turn', () => {
       }
     ])
     mocks.saveMessage.mockResolvedValue(undefined)
-    mocks.getMessages.mockResolvedValue([
+    mocks.getRecentMessages.mockResolvedValue([
       {
         id: 'msg-1',
         role: 'user',

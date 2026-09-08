@@ -6,7 +6,7 @@ import {
   registerWakeRun
 } from '$lib/server/services/wakeRunRegistry'
 import {
-  clearSessionTurn,
+  __resetStreamAbortRegistryForTests,
   registerSessionTurn
 } from '$lib/server/services/streamAbortRegistry'
 import { buildSessionOrigin } from '$lib/utils/sessionOrigin'
@@ -67,7 +67,9 @@ beforeEach(async () => {
 
 afterEach(() => {
   __resetWakeRunRegistryForTests()
-  clearSessionTurn('sess-woken')
+  // A hard reset, not `clearSessionTurn`: an id-less release no longer deletes a live
+  // owned lock, so teardown cannot rely on it.
+  __resetStreamAbortRegistryForTests()
 })
 
 describe('POST /api/messages/interrupt', () => {

@@ -1658,13 +1658,39 @@ function ensureActiveStreamEventId(sessionId: string, event: StreamEventPayload)
   return event
 }
 
+/**
+ * The replay buffer is a JOINING AID, not a transcript, so it is capped.
+ *
+ * It used to be self-limiting: a session with no listener returned early and nothing was
+ * buffered at all. `bufferForWakeRun` removed that floor on purpose — a headless woken turn
+ * now fills the buffer so a tab opened mid-turn joins cleanly — which left an unbounded
+ * array growing for a run nobody is watching. A wake-up may run for
+ * `MAX_WAKE_TIMEOUT_MINUTES` (240) and three may run at once, so three complete
+ * object-per-chunk transcripts could sit resident for four hours each.
+ *
+ * Keeping the most recent slice is enough for what the buffer is for: a joining tab wants
+ * the tail it missed, and anything older is already on the persisted message it loads with
+ * the chat. The terminal-event cleanup still clears the whole entry as before.
+ */
+const MAX_ACTIVE_STREAM_REPLAY_EVENTS = 2000
+
+function pushActiveStreamEvent(
+  state: ReturnType<typeof getActiveStreamState>,
+  event: StreamEventPayload
+) {
+  state.events.push(event)
+  if (state.events.length > MAX_ACTIVE_STREAM_REPLAY_EVENTS) {
+    state.events.splice(0, state.events.length - MAX_ACTIVE_STREAM_REPLAY_EVENTS)
+  }
+}
+
 function initializeActiveStream(sessionId: string, event: StreamEventPayload) {
   ensureActiveStreamEventId(sessionId, event)
   if (event.messageId) {
     clearActiveStreamCleanup(sessionId, event.messageId)
   }
   const state = getActiveStreamState(sessionId)
-  state.events.push(event)
+  pushActiveStreamEvent(state, event)
   if (event.messageId) {
     state.messageIds.add(event.messageId)
   }
@@ -1681,7 +1707,7 @@ function appendActiveStreamEvent(sessionId: string, event: StreamEventPayload) {
   ensureActiveStreamEventId(sessionId, event)
   const state = getActiveStreamState(sessionId)
   state.messageIds.add(event.messageId)
-  state.events.push(event)
+  pushActiveStreamEvent(state, event)
 }
 
 function replayActiveStreamForListener(sessionId: string, controller: SSEController) {

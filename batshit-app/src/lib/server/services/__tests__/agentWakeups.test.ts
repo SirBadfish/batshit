@@ -15,6 +15,7 @@ import {
 } from '$lib/server/services/streamAbortRegistry'
 import {
   abortWokenTurnForInterrupt,
+  endWokenTurn,
   requestAgentWakeup,
   selectCurrentSessionForAgent
 } from '$lib/server/services/agentWakeups'
@@ -608,6 +609,60 @@ describe('F-P1-5: Stop and the hard timeout are told apart on the signal', () =>
     // the turn or the wake-up time limit did.
     expect(getWakeAbortSignal(stopped.sessionId)?.reason).toBe('wake_stop')
     release()
+  })
+
+  /**
+   * The signal carried the distinction; what was RECORDED threw it away.
+   *
+   * `endWokenTurn` aborts the controller and only reaches its own
+   * `finishWokenTurn('timed_out')` after an awaited HTTP round trip to the interrupt route,
+   * so the aborted `fetch`'s own handler always won the single-winner `clearWakeRun` race —
+   * and that handler reported a flat `'stopped'`. Every hard timeout was therefore filed as
+   * a user Stop, while the finalized assistant message said "timeout".
+   */
+  it('records a hard timeout as timed_out, not as a user Stop', async () => {
+    await seedAgent()
+    await redis.json.set('dm:dm_1', '$', {
+      id: 'dm_1',
+      messageId: 'dm_1',
+      userId: USER,
+      kind: 'assignment',
+      priority: 'normal',
+      from: { kind: 'agent', agentId: 'agent-faye', name: 'Faye' },
+      to: 'agent-cooper',
+      subject: 'Verify the package',
+      body: 'Run the audit.',
+      deliver: 'wake',
+      status: 'working',
+      createdAt: '2026-09-08T09:00:00.000Z',
+      createdTs: Date.parse('2026-09-08T09:00:00.000Z'),
+      expiresAt: '2026-09-15T09:00:00.000Z',
+      delivery: { requested: 'wake', actual: 'wake' }
+    } as never)
+
+    let release: () => void = () => {}
+    holdSendRouted = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    const started = await requestAgentWakeup(baseInput())
+    expect(started.ok).toBe(true)
+    if (!started.ok) return
+
+    await endWokenTurn({
+      sessionId: started.sessionId,
+      reason: 'timed_out',
+      originBase: 'http://localhost:5620',
+      userId: USER
+    })
+    release()
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await getDm('dm_1'))?.delivery?.outcome) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+
+    expect((await getDm('dm_1'))?.delivery?.outcome).toBe('timed_out')
   })
 })
 
