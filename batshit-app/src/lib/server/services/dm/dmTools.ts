@@ -17,6 +17,7 @@
  */
 
 import { redis } from '$lib/server/redis'
+import { randomBytes } from 'node:crypto'
 import {
   requestAgentWakeup,
   type RequestAgentWakeupResult
@@ -465,7 +466,7 @@ async function broadcastDmOp(
   }
 
   const agents = await redis.getAgents(context.userId)
-  const messageId = `dmb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  const messageId = `dmb_${Date.now()}_${randomBytes(3).toString('hex')}`
 
   const delivered: BroadcastDmDelivery[] = []
   const skipped: BroadcastDmResult['skipped'] = []

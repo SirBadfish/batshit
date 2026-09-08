@@ -28,6 +28,7 @@
  */
 
 import { redis } from '$lib/server/redis'
+import { randomBytes } from 'node:crypto'
 import { publishUserEvent } from '$lib/server/ssePublisher'
 import {
   DM_BODY_MAX_CHARS,
@@ -146,7 +147,7 @@ async function announceInboxChanged(agentId: string, userId: string): Promise<vo
  * ------------------------------------------------------------------ */
 
 export function createDmId(nowTs = Date.now()): string {
-  return `dm_${nowTs}_${Math.random().toString(36).slice(2, 8)}`
+  return `dm_${nowTs}_${randomBytes(3).toString('hex')}`
 }
 
 function defaultExpiryMs(kind: DmKind): number {

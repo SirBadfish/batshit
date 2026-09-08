@@ -23,6 +23,7 @@
  */
 
 import { redis } from '$lib/server/redis'
+import { randomBytes } from 'node:crypto'
 import { resolveCliHelperBatshitBaseUrl } from '$lib/server/services/cliHelperBaseUrl'
 import {
   getConfiguredInternalToken,
@@ -183,7 +184,9 @@ async function allocateWokenSessionId(userId: string): Promise<string> {
   const existing = await redis.getSessions(userId, true)
   const taken = new Set(existing.map((session) => session.id))
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const candidate = `wake-${stamp}-${Math.random().toString(36).slice(2, 8)}`
+    // Crypto randomness, not Math.random(): a session id is a security value (CodeQL
+    // js/insecure-randomness), and six hex characters keep the readable shape.
+    const candidate = `wake-${stamp}-${randomBytes(3).toString('hex')}`
     if (!taken.has(candidate)) return candidate
   }
   throw new Error('WAKEUP_SESSION_ID_UNAVAILABLE: could not allocate a session id.')
