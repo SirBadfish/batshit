@@ -396,7 +396,9 @@ async function compileSpeechToSpeechPrimaryInstructions(
 ): Promise<string | null> {
   const sessionId = request.sessionId?.trim() || 'livekit-speech-to-speech'
   const [previousMessages, assignedSubagents, userSettings] = await Promise.all([
-    request.sessionId?.trim() ? redis.getMessages(sessionId, 80).catch(() => []) : [],
+    // SA-113 P3 (F-P2-1): the RECENT 80. `getMessages` is head-first, so a voice session
+    // resumed on a long chat was seeded with that chat's opening exchange.
+    request.sessionId?.trim() ? redis.getRecentMessages(sessionId, 80).catch(() => []) : [],
     loadAssignedSubagentsForPrompt(userId, agent),
     redis.getUserSettings(userId).catch(() => null)
   ])

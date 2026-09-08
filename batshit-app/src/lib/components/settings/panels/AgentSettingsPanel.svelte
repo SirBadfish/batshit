@@ -140,6 +140,17 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
   import AgentSelectorSection from "$lib/components/settings/agent/AgentSelectorSection.svelte";
   import AgentAutoCompactSettingsCard from "$lib/components/settings/agent/AgentAutoCompactSettingsCard.svelte";
   import AgentMemorySettingsCard from "$lib/components/settings/agent/AgentMemorySettingsCard.svelte";
+  import AgentDmsSettingsCard from "$lib/components/settings/agent/AgentDmsSettingsCard.svelte";
+  import {
+    DEFAULT_WAKE_TARGET,
+    resolveAgentDmsEnabled,
+    resolveAgentWakeEnabled,
+    resolveDmSenderPolicy,
+    resolveWakeTarget,
+    validateWakeTimeoutMinutes,
+    type DmSenderScope,
+    type WakeTarget,
+  } from "$lib/utils/dmControl";
   import {
     buildAgentMemoryRecordFields,
     resolveAgentMemorySettingsDraft,
@@ -340,6 +351,14 @@ import {
     memory_settings: AgentMemorySettingsDraft;
     // SA-111 P4 (DL-111-11): may this Primary Agent spawn Workers? Default on.
     workers_enabled: boolean;
+    // SA-113 (DL-113-01, DL-113-15): the Agent DMs card. The DM half and the wake half
+    // are independent switches — a webhook can wake an agent that never uses DMs.
+    dms_enabled: boolean;
+    dm_sender_scope: DmSenderScope;
+    dm_sender_agent_ids: string[];
+    wake_enabled: boolean;
+    wake_timeout_minutes: number | null;
+    wake_target: WakeTarget;
     webhook_url: string;
     agent_url: string;
     default_project_id: string | null;
@@ -713,6 +732,12 @@ import {
     memory_enabled?: boolean;
     /** SA-111 P4 (DL-111-11). */
     workers_enabled?: boolean;
+    dms_enabled?: boolean;
+    dm_senders?: DmSenderScope | { scope?: DmSenderScope; agentIds?: string[] } | null;
+    dm_sender_agent_ids?: string[] | null;
+    wake_enabled?: boolean;
+    wake_timeout_minutes?: number | null;
+    wake_target?: WakeTarget;
     memory_linger_turns?: number;
     memory_recall_linger_turns?: number;
     memory_lane_budgets?: Record<string, number>;
@@ -1059,6 +1084,28 @@ import {
   const assignableGoons = $derived.by(() => goons.filter(isGoonRuntimeReady));
 
   let selectedAgentId = $state<string | null>(null);
+
+  /**
+   * SA-113 P2 (DL-113-01): the other primary agents this one could accept DMs from.
+   *
+   * Every other API/CLI primary is listed, not only the ones with DMs already on: the user
+   * picks who may write, and turning that agent's own DMs on afterwards is a separate act.
+   * A `DMs off` pill says which ones cannot write yet, so the list is honest rather than
+   * quietly incomplete.
+   */
+  const dmSenderCandidates = $derived(
+    agents
+      .filter((agent) => {
+        if (agent.id === selectedAgentId) return false;
+        const type = normalizePrimaryAgentType(agent);
+        return type === "api" || type === "cli";
+      })
+      .map((agent) => ({
+        id: agent.id,
+        name: agent.displayName || agent.id,
+        dmsEnabled: resolveAgentDmsEnabled(agent),
+      })),
+  );
   let detailLoading = $state(false);
   let hydrationInProgress = $state(false);
   let lastAppliedInitialAgentId = $state<string | null>(null);
@@ -4620,6 +4667,12 @@ import {
       auto_compact_settings: normalizeAgentAutoCompactSettings(null),
       memory_settings: resolveAgentMemorySettingsDraft(null),
       workers_enabled: true,
+    dms_enabled: false,
+    dm_sender_scope: "all",
+    dm_sender_agent_ids: [],
+    wake_enabled: true,
+    wake_timeout_minutes: null,
+    wake_target: DEFAULT_WAKE_TARGET,
       webhook_url: "",
       agent_url: "",
       default_project_id: null,
@@ -4668,6 +4721,17 @@ import {
       auto_compact_settings: normalizeAgentAutoCompactSettings(agent.auto_compact_settings),
       memory_settings: resolveAgentMemorySettingsDraft(agent),
       workers_enabled: resolveWorkersEnabled(agent),
+    dms_enabled: resolveAgentDmsEnabled(agent),
+    dm_sender_scope: resolveDmSenderPolicy(agent).scope,
+    dm_sender_agent_ids: resolveDmSenderPolicy(agent).agentIds,
+    wake_enabled: resolveAgentWakeEnabled(agent),
+    wake_timeout_minutes: (() => {
+      const validation = validateWakeTimeoutMinutes(
+        (agent as any)?.wake_timeout_minutes,
+      );
+      return validation.ok ? validation.minutes : null;
+    })(),
+    wake_target: resolveWakeTarget(agent),
       webhook_url: agent.webhook_url ?? agent.webhookUrl ?? "",
       agent_url: agent.agent_url ?? "",
       default_project_id:
@@ -6154,6 +6218,12 @@ import {
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
       memory_settings: buildAgentMemoryRecordFields(form.memory_settings),
       workers_enabled: form.workers_enabled,
+      dms_enabled: form.dms_enabled,
+      dm_senders: form.dm_sender_scope,
+      dm_sender_agent_ids: form.dm_sender_agent_ids,
+      wake_enabled: form.wake_enabled,
+      wake_timeout_minutes: form.wake_timeout_minutes,
+      wake_target: form.wake_target,
       webhook_url: form.webhook_url.trim(),
       agent_url: form.agent_url.trim(),
       default_project_id: form.default_project_id ?? null,
@@ -6300,6 +6370,14 @@ import {
       auto_compact_settings: normalizeAgentAutoCompactSettings(form.auto_compact_settings),
       ...buildAgentMemoryRecordFields(form.memory_settings),
       workers_enabled: form.workers_enabled,
+      dms_enabled: form.dms_enabled,
+      dm_senders: form.dm_sender_scope,
+      // Stored beside the scope rather than inside it, so an agent that switches back to
+      // "Any agent" and then to "Only chosen agents" keeps the list it had.
+      dm_sender_agent_ids: form.dm_sender_agent_ids,
+      wake_enabled: form.wake_enabled,
+      wake_timeout_minutes: form.wake_timeout_minutes,
+      wake_target: form.wake_target,
       webhook_url: normaliseStringOrNull(form.webhook_url),
       webhookUrl: normaliseStringOrNull(form.webhook_url),
       agent_url: normaliseStringOrNull(form.agent_url),
@@ -8359,6 +8437,34 @@ import {
                               ...basicForm,
                               memory_settings: nextDraft,
                             })}
+                        />
+
+                        <AgentDmsSettingsCard
+                          dmsEnabled={basicForm.dms_enabled}
+                          dmSenderScope={basicForm.dm_sender_scope}
+                          dmSenderAgentIds={basicForm.dm_sender_agent_ids}
+                          senderCandidates={dmSenderCandidates}
+                          onDmsEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, dms_enabled: enabled })}
+                          onDmSenderScopeChange={(scope) =>
+                            (basicForm = { ...basicForm, dm_sender_scope: scope })}
+                          onDmSenderAgentIdsChange={(agentIds) =>
+                            (basicForm = {
+                              ...basicForm,
+                              dm_sender_agent_ids: agentIds,
+                            })}
+                          wakeEnabled={basicForm.wake_enabled}
+                          wakeTimeoutMinutes={basicForm.wake_timeout_minutes}
+                          wakeTarget={basicForm.wake_target}
+                          onWakeEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, wake_enabled: enabled })}
+                          onWakeTimeoutMinutesChange={(minutes) =>
+                            (basicForm = {
+                              ...basicForm,
+                              wake_timeout_minutes: minutes,
+                            })}
+                          onWakeTargetChange={(target) =>
+                            (basicForm = { ...basicForm, wake_target: target })}
                         />
 
                       </div>

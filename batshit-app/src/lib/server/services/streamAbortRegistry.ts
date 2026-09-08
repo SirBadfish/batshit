@@ -158,6 +158,23 @@ export function getActiveSessionTurn(sessionId: string) {
   return activeSessionTurns.get(sessionId) ?? null
 }
 
+/**
+ * SA-113 P2 (DL-113-16) — every session with a turn in flight right now.
+ *
+ * `sys.dm.agents` maps these to agents through each session's `agent_id`, so a sender can
+ * see "Cooper is mid-task" before choosing wait or wake. No polling and no new store: the
+ * server already knows, this just lets presence read it.
+ */
+export function listActiveSessionTurns(): Array<
+  { sessionId: string } & SessionTurnEntry
+> {
+  pruneStaleSessionTurns()
+  return [...activeSessionTurns.entries()].map(([sessionId, entry]) => ({
+    sessionId,
+    ...entry
+  }))
+}
+
 export function registerGroupAbort(sessionId: string, controller: AbortController) {
   activeGroupTurns.set(sessionId, {
     controller,

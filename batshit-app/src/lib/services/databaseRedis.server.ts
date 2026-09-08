@@ -38,6 +38,7 @@ import {
   shouldIncludeGoonSpokenCues
 } from '$lib/goons/dcm'
 import {
+  buildDmGuidancePromptBlock,
   buildDynamicMcpPromptBlock,
   buildMemoryPromptBlock,
   buildSubagentGuidancePromptBlock,
@@ -45,6 +46,8 @@ import {
   normalizeDynamicMcpPromptContent
 } from '$lib/utils/toolPromptInjection'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
+import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { buildDmRosterDcmLines } from '$lib/utils/dmRoster'
 import {
   WORKERS_FEATURE_ENABLED,
   WORKERS_MAX_CONCURRENT,
@@ -1475,6 +1478,64 @@ export class DatabaseService {
    * memory guidance resolvers: stored Redis prompt first, packaged/code fallback second,
    * runtime-scoped so an API primary is never taught the CLI call shape (or vice versa).
    */
+  /**
+   * SA-113 P2 (DL-113-04a) — the Agent DM guidance block.
+   *
+   * Same contract as memory's: the packaged Markdown is the default, Admin can override it
+   * in Redis, and the code fallback compiles when neither exists. Gated on
+   * `resolveAgentDmsEnabled` alone — an agent without DMs pays nothing.
+   */
+  /**
+   * SA-113 P2 (DL-113-04b) — the one DM store read a compile makes.
+   *
+   * Mirrors `resolveSessionClipCompileState`: read once at the compile site, hand the
+   * formatter plain records, and let the formatter stay pure text. Failure is loud in the
+   * log but not fatal — a compile that cannot read the inbox omits the roster rather than
+   * failing the send, exactly like the clip roster, because the tools and the guidance are
+   * still there and the agent can ask.
+   */
+  private async resolveDmRosterForCompile(
+    agent: any,
+    sessionId: string,
+    messages: any[]
+  ): Promise<{ lines: string[]; listedIds: string[]; totalOpen: number }> {
+    const empty = { lines: [], listedIds: [], totalOpen: 0 }
+    if (!agent?.id || !resolveAgentDmsEnabled(agent)) return empty
+    try {
+      const { listInbox } = await import('$lib/server/services/dm/dmStore')
+      const records = await listInbox(agent.id)
+      // The previous user message in THIS session is the ✅/🟢 boundary: anything created
+      // after it is new to the agent this turn. A session with none yet — a woken
+      // session's first turn — treats everything as new, which is true.
+      const userMessages = messages.filter((message) => message?.role === 'user')
+      const previous = userMessages[userMessages.length - 2] ?? null
+      const previousTs = previous?.created_at ? Date.parse(previous.created_at) : null
+      return buildDmRosterDcmLines({
+        records,
+        sessionId,
+        previousUserMessageTs: Number.isFinite(previousTs) ? previousTs : null
+      })
+    } catch (error) {
+      console.error('[Agent DMs] Could not read the inbox for the DCM roster:', error)
+      return empty
+    }
+  }
+
+  private async resolveDmGuidancePrompt(
+    agent: any,
+    runtimeFlavor: 'codex' | 'claude' | 'vercel'
+  ) {
+    const storedPrompt = await this.getRedisStringValue('batshit:dm_guidance')
+    const prompt = storedPrompt?.trim() ? storedPrompt : buildDmGuidancePromptBlock()
+    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
+    return replacePromptVariables(prompt, agent, {
+      ...(agent?.settings ?? {}),
+      runtime_flavor: runtimeFlavor,
+      tool_search_tool: brokerNames.search,
+      tool_use_tool: brokerNames.use
+    })
+  }
+
   private async resolveSubagentGuidancePrompt(
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel'
@@ -2170,6 +2231,8 @@ export class DatabaseService {
     memoryDcmLines?: string[]
     /** SA-109 (DL-109-04): the general clip roster — all agents, groups included. */
     clipRosterDcmLines?: string[]
+    /** SA-113 P2 (DL-113-04b): the `DMs:` roster — open inbox items only. */
+    dmRosterDcmLines?: string[]
     /** SA-110 (DL-110-01): the episode whiteboard section (Infinite Sessions only). */
     whiteboardDcmLines?: string[]
     /** SA-110 P2 (DL-110-05): awareness changes newer than the stored fold snapshot. */
@@ -2459,6 +2522,14 @@ export class DatabaseService {
     // Omitted entirely when nothing is attached, so clip-free sends pay nothing.
     if (options.clipRosterDcmLines && options.clipRosterDcmLines.length > 0) {
       lines.push('', ...options.clipRosterDcmLines)
+    }
+
+    // SA-113 P2 (DL-113-04b): the DM roster is the third member of the "durable
+    // per-agent state you should act on" family — Clips, DMs, Memory, in that order.
+    // Open items only, so a closed DM stops costing tokens the moment it is closed;
+    // omitted entirely for every agent without DMs, which keeps their bytes identical.
+    if (options.dmRosterDcmLines && options.dmRosterDcmLines.length > 0) {
+      lines.push('', ...options.dmRosterDcmLines)
     }
 
     // SA-104 P4: the recall engine's memory-insert section (time awareness, Current /
@@ -2888,6 +2959,15 @@ export class DatabaseService {
       })
     )
 
+    // SA-113 P2 (DL-113-04b): ONE store read per compile, at the compile site, beside the
+    // clip roster's — the same rule. The formatter itself is pure text with no Redis, and
+    // returns [] on an empty inbox, so every agent without open DMs compiles unchanged.
+    //
+    // Served in group turns too (DL-113-11): the roster is read-only and needs no commit
+    // boundary, unlike memory linger, and each speaker's own inbox is derivable because
+    // `agent` is the speaking member.
+    const dmRoster = await this.resolveDmRosterForCompile(agent, sessionId, messages)
+
     // 6. Create clean structured input for Chat Model
     // This will be passed directly to the AI without any parsing needed
     
@@ -2981,6 +3061,18 @@ export class DatabaseService {
       if (delegationPrompt.trim()) {
         if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
         mergedSystemPrompt += `==== SUBAGENTS & WORKERS (DELEGATION) ====\n\n${delegationPrompt}`
+      }
+    }
+
+    // SA-113 P2 (DL-113-04a): Agent DM guidance sits directly after the delegation block
+    // and before MEMORY INSTRUCTIONS — both are "other things you can reach", and DMs are
+    // the closer sibling of delegation. Stable-prefix bytes: they move only when the
+    // agent's `dms_enabled` or the stored prompt changes.
+    if (resolveAgentDmsEnabled(agent)) {
+      const dmPrompt = await this.resolveDmGuidancePrompt(agent, runtimeFlavor)
+      if (dmPrompt.trim()) {
+        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+        mergedSystemPrompt += `==== AGENT DMS (MESSAGING) ====\n\n${dmPrompt}`
       }
     }
 
@@ -3261,6 +3353,7 @@ export class DatabaseService {
           isCodexMode: options?.runtimeFlavor === 'codex' || options?.runtimeFlavor === 'claude',
           memoryDcmLines,
           clipRosterDcmLines,
+          dmRosterDcmLines: dmRoster.lines,
           whiteboardDcmLines: memoryCompileContext?.whiteboardDcmLines ?? [],
           awarenessPendingDcmLines: memoryCompileContext?.awarenessPendingDcmLines ?? []
         })
@@ -3383,6 +3476,17 @@ export class DatabaseService {
         // recorded snapshot's structuredInput untouched on every lane).
         ...(memoryCompileContext?.memoryContext
           ? { memoryContext: memoryCompileContext.memoryContext }
+          : {}),
+        // SA-113 P2 (DL-113-04b): the structured twin of the DM roster, beside
+        // memoryContext, so the Execution Viewer can show which inbox items this turn was
+        // told about without re-reading the store.
+        ...(dmRoster.totalOpen > 0
+          ? {
+              dmsContext: {
+                listedIds: dmRoster.listedIds,
+                totalOpen: dmRoster.totalOpen
+              }
+            }
           : {}),
         messageStructure: {
           systemMessages: chatMessages.filter(m => m.role === 'system').length,

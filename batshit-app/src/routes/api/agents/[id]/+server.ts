@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import { syncAgentCodexProfiles, deleteAgentCodexConfig } from '$lib/server/services/codexProfileManager'
 import { syncAgentClaudeProfiles, deleteAgentClaudeConfig } from '$lib/server/services/claudeProfileManager'
+import { validateDmSenderFields } from '$lib/utils/dmControl'
 import { getCodexConfigOverrideValidationError } from '$lib/server/services/codexSettings'
 import { getClaudeConfigOverrideValidationError } from '$lib/server/services/claudeSettings'
 import {
@@ -62,6 +63,12 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     const claudeValidationError = getClaudeConfigOverrideValidationError(updates.claude_settings ?? null)
     if (claudeValidationError) {
       return json({ error: claudeValidationError }, { status: 400 })
+    }
+    // SA-113 P2 (DL-113-01): refuse a bad sender policy rather than storing it. The read
+    // side defaults an unrecognised value to "any agent", which is the permissive one.
+    const dmSenderValidationError = validateDmSenderFields(updates)
+    if (dmSenderValidationError) {
+      return json({ error: dmSenderValidationError }, { status: 400 })
     }
     
     // Verify agent exists and belongs to user

@@ -44,6 +44,8 @@ type FixtureState = {
   sets: Map<string, Set<string>>
   /** SA-104 P6: redis LIST fixtures (the episode ledger uses lRange). */
   lists: Map<string, string[]>
+  /** SA-113 P2: redis ZSET fixtures (the DM inbox index is ordered). */
+  zsets: Map<string, Map<string, number>>
   session: any
   userSettings: any
   projects: any[]
@@ -98,6 +100,29 @@ const redisFake = vi.hoisted(() => {
     lRange: async (key: string, start: number, stop: number) => {
       const list = state.current.lists.get(key) ?? []
       return list.slice(start, stop === -1 ? undefined : stop + 1)
+    },
+    zAdd: async (key: string, entries: any) => {
+      const zset = state.current.zsets.get(key) ?? new Map<string, number>()
+      for (const entry of Array.isArray(entries) ? entries : [entries]) {
+        zset.set(String(entry.value), Number(entry.score))
+      }
+      state.current.zsets.set(key, zset)
+      return 1
+    },
+    zRange: async (key: string, start: number, stop: number) => {
+      const ordered = Array.from(state.current.zsets.get(key)?.entries() ?? [])
+        .sort((a, b) => (a[1] === b[1] ? (a[0] < b[0] ? -1 : 1) : a[1] - b[1]))
+        .map(([member]) => member)
+      return ordered.slice(start, stop === -1 ? undefined : stop + 1)
+    },
+    zRem: async (key: string, members: any) => {
+      const zset = state.current.zsets.get(key)
+      if (!zset) return 0
+      let removed = 0
+      for (const member of Array.isArray(members) ? members : [members]) {
+        if (zset.delete(String(member))) removed += 1
+      }
+      return removed
     },
     sendCommand: async () => null
   })
@@ -271,6 +296,7 @@ function freshState(sessionId: string): FixtureState {
     ]),
     sets: new Map<string, Set<string>>(),
     lists: new Map<string, string[]>(),
+    zsets: new Map<string, Map<string, number>>(),
     session: { id: sessionId, user_id: USER_ID, name: 'Parity Session', metadata: {} },
     userSettings: {
       id: USER_ID,
@@ -1858,5 +1884,135 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
       .map((message: any) => message.content ?? '')
       .join('\n')
     expect(expiredCompiled).not.toContain(recovery?.renderedBlock)
+  })
+
+  // ------------------------------------------------------------------
+  // SA-113 P2 (DL-113-04) — Agent DMs
+  // ------------------------------------------------------------------
+
+  /** Seed one open DM addressed to the agent, index and all. */
+  function seedInboxDm(agentId: string, overrides: Record<string, any> = {}) {
+    const id = overrides.id ?? 'dm_seed_1'
+    const createdTs = overrides.createdTs ?? Date.parse('2026-09-07T11:00:00.000Z')
+    state.current.kv.set(`dm:${id}`, {
+      id,
+      messageId: id,
+      userId: USER_ID,
+      kind: 'assignment',
+      priority: 'normal',
+      from: { kind: 'agent', agentId: 'agent-faye', name: 'Faye' },
+      to: agentId,
+      subject: 'Verify the package',
+      body: 'Run the audit.',
+      requestedOutcome: 'Pass or fail.',
+      scope: 'Mac app only.',
+      reportBackTo: 'agent-faye',
+      deliver: 'wait',
+      status: 'new',
+      createdAt: new Date(createdTs).toISOString(),
+      createdTs,
+      expiresAt: new Date(createdTs + 14 * 24 * 60 * 60 * 1000).toISOString(),
+      delivery: { requested: 'wait', actual: 'wait' },
+      ...overrides
+    })
+    const zset = state.current.zsets.get(`dm_inbox:${agentId}`) ?? new Map<string, number>()
+    zset.set(id, 1e15 + createdTs)
+    state.current.zsets.set(`dm_inbox:${agentId}`, zset)
+    return id
+  }
+
+  it('S20a SA-113: an agent WITHOUT Agent DMs compiles byte-identically — no block, no roster, no metadata', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    // A DM addressed to this agent exists; DMs are off, so it must be invisible.
+    seedInboxDm('agent-api-parity')
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent(),
+      currentUserMessage: 'Nothing to do with DMs',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    expect(server.primarySystemPrompt ?? '').not.toContain('AGENT DMS (MESSAGING)')
+    expect(currentUserMessageContent(server)).not.toContain('DMs (your inbox')
+    expect(server.structuredInput?.metadata?.dmsContext).toBeUndefined()
+  })
+
+  it('S20b SA-113 (DL-113-04a): a DM-enabled agent gets the guidance block after delegation and before memory', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ dms_enabled: true }),
+      currentUserMessage: 'Anything for me?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    const prompt = server.primarySystemPrompt ?? ''
+    expect(prompt).toContain('==== AGENT DMS (MESSAGING) ====')
+    // The identity zone still closes the prompt: nothing may compile after it.
+    expect(prompt.indexOf('==== AGENT DMS (MESSAGING) ====')).toBeLessThan(
+      prompt.indexOf('==== GLOBAL CUSTOM SYSTEM PROMPT ====')
+    )
+  })
+
+  it('S20c SA-113 (DL-113-04b): the DM roster sits between the clip roster and the memory section', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    seedInboxDm('agent-api-parity')
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ dms_enabled: true }),
+      currentUserMessage: 'Anything for me?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    const compiled = currentUserMessageContent(server)
+    expect(compiled).toContain('DMs (your inbox; open items only;')
+    expect(compiled).toContain('dm_seed_1')
+    expect(compiled).toContain('assignment from Faye: "Verify the package"')
+    expect(server.structuredInput?.metadata?.dmsContext).toEqual({
+      listedIds: ['dm_seed_1'],
+      totalOpen: 1
+    })
+  })
+
+  it('S20d SA-113: a closed DM leaves the roster entirely', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    seedInboxDm('agent-api-parity', { status: 'done', result: 'Finished.' })
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ dms_enabled: true }),
+      currentUserMessage: 'Anything for me?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    expect(currentUserMessageContent(server)).not.toContain('DMs (your inbox')
+    expect(server.structuredInput?.metadata?.dmsContext).toBeUndefined()
+  })
+
+  it('S20e SA-113: a DM-enabled agent with an EMPTY inbox pays no DCM bytes', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    const { server } = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ dms_enabled: true }),
+      currentUserMessage: 'Anything for me?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    expect(currentUserMessageContent(server)).not.toContain('DMs (your inbox')
+    expect(server.structuredInput?.metadata?.dmsContext).toBeUndefined()
   })
 })

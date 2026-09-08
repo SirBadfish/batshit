@@ -181,7 +181,10 @@ const familyRenderers: Record<ToolRendererFamily, LazyComponent> = {
 	generic_tool: () => import('./generic/GenericToolRenderer.svelte'),
 	subagent: () => import('./subagent/CallSubagentRenderer.svelte'),
 	// SA-111 P4: one `spawn_workers` call, up to three runs, one card.
-	workers: () => import('./workers/WorkersRenderer.svelte')
+	workers: () => import('./workers/WorkersRenderer.svelte'),
+	// SA-113 P4: `sys.dm.*`. The family carries the delivery outcome, which is the one
+	// thing a generic control card cannot show.
+	dm: () => import('./dm/DmRenderer.svelte')
 }
 
 

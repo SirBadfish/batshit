@@ -123,6 +123,7 @@ import type { CodexRuntimeSettings } from '$lib/types/codex'
 import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
 import type { ClaudeRuntimeSettings } from '$lib/types/claude'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
+import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import { THINKING_INDICATOR } from '$lib/utils/thinkingIndicator'
@@ -138,6 +139,8 @@ import {
   registerGroupAbort,
   clearGroupAbort,
 } from '$lib/server/services/streamAbortRegistry'
+import { getWakeAbortSignal } from '$lib/server/services/wakeRunRegistry'
+import { clearNeedsUserForHumanReply } from '$lib/server/services/dm/dmStore'
 import type {
   GroupChatSessionConfig,
   GroupChatSpeakPolicy,
@@ -3006,6 +3009,44 @@ async function handleBatshitAgentStream({
     )
   }
 
+  // SA-113 P1 / AMD-113-02 — Stop for a turn Batshit started itself.
+  //
+  // A woken turn's request is made from inside this process, and the P1 live run measured
+  // that aborting that fetch does NOT reach `request.signal` here: the interrupt route
+  // reported the abort and the run still finished with a full answer. So the wake
+  // registry's controller is wired directly, exactly like group chat's
+  // `externalAbortSignal`. It is the SAME controller the interrupt route aborts, so this
+  // makes delivery certain rather than adding a second mechanism to keep in step.
+  //
+  // F-P1-5: the wake registry aborts with `wake_timeout` or `wake_stop`, and that
+  // distinction is carried through verbatim so the finalized message can say the hard
+  // time limit ended the turn rather than blaming the user.
+  const wakeAbortSignal = getWakeAbortSignal(sessionId)
+  if (wakeAbortSignal) {
+    const forwardWakeAbort = () => {
+      streamAbortController.abort(
+        wakeAbortSignal.reason === 'wake_timeout' ? 'wake_timeout' : 'wake_stop',
+      )
+    }
+    if (wakeAbortSignal.aborted) {
+      forwardWakeAbort()
+    } else {
+      wakeAbortSignal.addEventListener('abort', forwardWakeAbort, { once: true })
+    }
+  }
+
+  /**
+   * SA-113 F-P1-5 — who ended this turn. `timeout` only when the wake-up hard time limit
+   * fired; everything else is a Stop somebody pressed.
+   */
+  const resolveInterruptionReason = (): 'user' | 'timeout' =>
+    streamAbortSignal.reason === 'wake_timeout' ? 'timeout' : 'user'
+
+  const describeInterruption = (): string =>
+    resolveInterruptionReason() === 'timeout'
+      ? 'Stream stopped by the wake-up time limit'
+      : 'Stream interrupted by user'
+
   zipDetection.setContext(sessionId, messageId, {
     agent: zipSettingsAgent,
     globalSettings: globalZipSettings,
@@ -4937,6 +4978,10 @@ async function handleBatshitAgentStream({
     agentSlug: agent.slug ?? null,
     // SA-104 P3: primary-agent sends of memory-enabled agents get the sys.memory.* refs.
     memoryControlsEnabled: resolveAgentMemoryEnabled(agent),
+    // SA-113 P2 (DL-113-03): the ONE place a primary send turns the sys.dm.* refs on.
+    // The guidance block and the DCM roster follow the same rule, so an agent never gets
+    // the tools without the instructions or the roster without the tools (DL-113-13).
+    dmControlsEnabled: resolveAgentDmsEnabled(agent),
     // SA-111 P4 (DL-111-11): the ONE place a primary send turns Workers on. Every
     // delegated run leaves it unset, which is what enforces depth 1.
     workersEnabled: resolveWorkersEnabled(agent),
@@ -5573,6 +5618,62 @@ async function handleBatshitAgentStream({
     presetId: fallbackPresetId,
     localServers: localServerConfigs,
   })
+
+  // SA-113 P1 / AMD-113-02 — the setup window.
+  //
+  // Everything above this point is setup: the compile, the model presets, the bridge
+  // import, the Execution Viewer snapshot. On a large prompt that is 3–6 seconds on the
+  // API lane and 5–9 on Codex, and until now nothing looked at the abort signal during
+  // it. `registerStreamAbort` had not run yet, so a Stop landing in that window reached
+  // the interrupt route, found only the session-turn lock, answered `stale_turn_cleared`,
+  // and the run carried on to a full answer (P0 spike #7 and #8).
+  //
+  // Checking here is the last moment before this turn's real side effects — clip
+  // consumption and the memory linger commit — so a stopped turn does not spend the
+  // user's clips or advance memory state for work it will never do. Everything below is
+  // covered by the existing abort handling, because the provider call receives
+  // `streamAbortSignal`.
+  //
+  // This is not wake-specific: a browser Stop during setup hit the same gap.
+  // Read through a local so TypeScript does not narrow `streamAbortSignal.aborted` to
+  // `false` for the rest of the function; it is a live signal that can flip at any await.
+  const abortedDuringSetup = Boolean(streamAbortSignal.aborted)
+  if (abortedDuringSetup) {
+    const interruptedAt = new Date().toISOString()
+
+    try {
+      // No `ensureStartEmitted` here on purpose: nothing has streamed yet at this point,
+      // so there is no partial start to close.
+      finishSummary.metadata = {
+        ...(finishSummary.metadata ?? {}),
+        model: effectiveModelId ?? primarySelection.modelId,
+        agentType: primaryAgentType,
+        interrupted: true,
+        interruptionReason: resolveInterruptionReason(),
+        interruptedAt,
+        interruptedDuringSetup: true,
+      }
+      await finalizeAssistantMessage('error')
+      await streamAdapter.emitComplete({
+        metadata: { interrupted: true, interruptedAt },
+      })
+    } catch (setupAbortError) {
+      console.error(
+        '[Send-Routed] Failed to finalize a turn interrupted during setup:',
+        setupAbortError,
+      )
+    }
+
+    await persistRuntimeSnapshot('failed', describeInterruption())
+
+    return {
+      response: json({ error: describeInterruption() }, { status: 499 }),
+      messageId,
+      content: '',
+      metadata: finishSummary.metadata ?? {},
+      usage: undefined,
+    }
+  }
 
   let streamResult: any
   let usedModelId = primaryModelId
@@ -6872,7 +6973,7 @@ async function handleBatshitAgentStream({
           ...baseAbortMetadata,
           ...(finishSummary.metadata ?? {}),
           interrupted: true,
-          interruptionReason: 'user',
+          interruptionReason: resolveInterruptionReason(),
           interruptedAt,
         }
 
@@ -6890,11 +6991,11 @@ async function handleBatshitAgentStream({
         )
       }
 
-      await persistRuntimeSnapshot('failed', 'Stream interrupted by user')
+      await persistRuntimeSnapshot('failed', describeInterruption())
 
       return {
         response: json(
-          { error: 'Stream interrupted by user' },
+          { error: describeInterruption() },
           { status: 499 },
         ),
         messageId,
@@ -7779,6 +7880,21 @@ export const POST: RequestHandler = async ({
         { status: 404 },
       )
     }
+    // SA-113 F-SEC-1b — a reply from the user clears "needs you" on every open DM whose
+    // woken turn landed in THIS chat. Keyed on the DM's own `delivery.sessionId`, NOT on the
+    // session carrying an origin: a "One at a time" wake lands in a chat the user started,
+    // which has no origin (F-P5b-1). Only a DM-enabled agent's sends pay the one inbox
+    // read. `metadata.wake` marks the wake primitive's own POST, which is the one send here
+    // that is NOT the user.
+    //
+    // Fire-and-forget with its own catch: a badge that failed to clear must never be able to
+    // fail the send it was reporting on.
+    const sendingAgent = agents.find((candidate) => candidate.id === agentId)
+    if (!metadata?.wake && sendingAgent && resolveAgentDmsEnabled(sendingAgent)) {
+      void clearNeedsUserForHumanReply(agentId, sessionId).catch((error) => {
+        console.warn('[Agent DMs] Could not clear a "needs you" stamp after a user reply:', error)
+      })
+    }
     const fixedSessionAgentId = resolveFixedSessionAgentId(session)
     if (fixedSessionAgentId && fixedSessionAgentId !== agentId) {
       const fixedAgentExists = agents.some((candidate) => candidate.id === fixedSessionAgentId)
@@ -8311,7 +8427,17 @@ export const POST: RequestHandler = async ({
           sandboxCleanupError,
         )
       }
-	      clearSessionTurn(sessionId)
+	      // SA-113 P1: release only THIS request's lock. A turn stopped during setup can
+	      // have its lock cleared by the interrupt route (or the orphan prune) and a retry
+	      // can already own a new one by the time this `finally` unwinds; an unowned
+	      // release would then cancel the live turn's lock. Registration above used the
+	      // same `requestedMessageId`, so the two can never disagree within one request.
+	      clearSessionTurn(
+	        sessionId,
+	        typeof requestedMessageId === 'string' && requestedMessageId.trim().length > 0
+	          ? requestedMessageId.trim()
+	          : null,
+	      )
 	    }
   } catch (error) {
     console.error('Error in send-routed endpoint:', error)

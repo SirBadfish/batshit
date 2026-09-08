@@ -18,6 +18,7 @@ const renderers = {
   bash: () => load(import('../command/BashRenderer.svelte')),
   subagent: () => load(import('../subagent/CallSubagentRenderer.svelte')),
   workers: () => load(import('../workers/WorkersRenderer.svelte')),
+  dm: () => load(import('../dm/DmRenderer.svelte')),
   dynamicFind: () => load(import('../mcp/DynamicMcpFindRenderer.svelte')),
   imageGen: () => load(import('../image/ImageGenerationRenderer.svelte')),
   abScreenshot: () => load(import('../image/AgentBrowserScreenshotRenderer.svelte'))
@@ -62,6 +63,27 @@ describe('getToolRenderer — priority short-circuits', () => {
     expect(await getToolRenderer('whatever', { rendererFamily: 'workers' } as any)).toBe(
       await renderers.workers()
     )
+  })
+
+  it('SA-113 P4: routes a `sys.dm.*` control to the DM renderer', async () => {
+    // The family is set by `toolActivityContract` when the control id starts with
+    // `sys.dm.`, so both lanes arrive here already normalized. Without this the send
+    // would render as a generic control card and the delivery outcome — the one line the
+    // user actually needs — would be buried in the payload.
+    expect(await getToolRenderer('native_batshit_tool_use', { rendererFamily: 'dm' } as any)).toBe(
+      await renderers.dm()
+    )
+    expect(await getToolRenderer('batshit_tool_use', { rendererFamily: 'dm' } as any)).toBe(
+      await renderers.dm()
+    )
+    // A DM control must never be mistaken for a subagent conversation.
+    expect(
+      await getToolRenderer('batshit_tool_use', {
+        rendererFamily: 'dm',
+        isSubagent: false,
+        toolSource: 'native-tool'
+      } as any)
+    ).toBe(await renderers.dm())
   })
 
   it('honors the dynamic_mcp_find compatibility route via displayToolName', async () => {

@@ -1063,6 +1063,56 @@ describe('toolActivityContract', () => {
     })
   })
 
+  it('SA-113 P4: gives every `sys.dm.*` control the DM renderer family', () => {
+    const result = normalizeCompactTool({
+      toolName: 'native_batshit_tool_use',
+      toolArgs: {
+        ref: 'fabric:sys.dm.send',
+        input: {
+          to: 'agent-cooper',
+          kind: 'assignment',
+          subject: 'Verify the package',
+          body: 'Run the release checks.',
+          deliver: 'wake'
+        }
+      },
+      toolResult: {
+        success: true,
+        ref: 'fabric:sys.dm.send',
+        family: 'fabric',
+        target: 'sys.dm.send',
+        dm_id: 'dm_1',
+        delivered_as: 'wait',
+        reason: 'Cooper is already working an assignment.'
+      }
+    })
+
+    expect(result.operationKind).toBe('fabric_use')
+    // Without this the card is a generic control payload and the degraded-wake reason —
+    // the one thing the user needs to see — is buried.
+    expect(result.rendererFamily).toBe('dm')
+    expect(result.metadata?.dmTool).toBe(true)
+    expect(result.metadata?.fabricControlId).toBe('sys.dm.send')
+    // The display name is what made the control reach this branch at all: with no entry in
+    // the formatter it was `null`, so every `sys.dm.*` call rendered as an untitled card.
+    expect(result.displayToolName).toBe('Agent DM Send')
+  })
+
+  it('leaves a non-DM fabric control on its generic family', () => {
+    const result = normalizeCompactTool({
+      toolName: 'native_batshit_tool_use',
+      toolArgs: { ref: 'fabric:sys.cli_tool.list', input: {} },
+      toolResult: {
+        success: true,
+        ref: 'fabric:sys.cli_tool.list',
+        family: 'fabric',
+        target: 'sys.cli_tool.list'
+      }
+    })
+    expect(result.rendererFamily).toBe('generic_tool')
+    expect(result.metadata?.dmTool).toBeUndefined()
+  })
+
   it('renders artifact create controls through the write-file renderer family', () => {
     const content = '<!doctype html>\n<html><body><h1>Nano Banana 2</h1></body></html>'
     const result = normalizeCompactTool({

@@ -78,6 +78,7 @@ const SYSTEM_PROMPT_KEYS = [
   'batshit:tool_guidance_zip_enabled_prompt',
   'batshit:tool_guidance_zip_disabled_prompt',
   'batshit:tool_guidance_memory_prompt',
+  'batshit:dm_guidance',
   'batshit:dynamic_mcp_prompt',
   'batshit:batshit_primary_system_prompt',
   'batshit:primary_system_prompt',
@@ -90,6 +91,7 @@ const SYSTEM_PROMPT_KEYS = [
   'batshit:tool_guidance_zip_enabled_prompt:last_updated',
   'batshit:tool_guidance_zip_disabled_prompt:last_updated',
   'batshit:tool_guidance_memory_prompt:last_updated',
+  'batshit:dm_guidance:last_updated',
   'batshit:dynamic_mcp_prompt:last_updated',
   'batshit:batshit_primary_system_prompt:last_updated',
   'batshit:primary_system_prompt:last_updated',
@@ -127,6 +129,13 @@ const GROUP_DEFINITIONS = [
     classification: 'required',
     description:
       'Agent memories, graduated history segments, and memory configuration. Search indexes are derived and rebuild automatically after restore.'
+  },
+  {
+    id: 'dms',
+    label: 'Agent DMs and wake-up webhooks',
+    classification: 'required',
+    description:
+      'Agent-to-agent DMs, their inbox/sent indexes, and the wake-up webhook records. Wake-up webhook TOKENS are not stored anywhere and cannot be restored; a restored hook must be rotated before it works again.'
   },
   {
     id: 'models',
@@ -1027,7 +1036,11 @@ function remapUserKey(key: string, sourceUserId: string, targetUserId: string) {
     [`hair_refit_source:${sourceUserId}:`, `hair_refit_source:${targetUserId}:`],
     [`clothing_asset:${sourceUserId}:`, `clothing_asset:${targetUserId}:`],
     [`voice_engine_registry:${sourceUserId}`, `voice_engine_registry:${targetUserId}`],
-    [`user_artifact_usage:${sourceUserId}`, `user_artifact_usage:${targetUserId}`]
+    [`user_artifact_usage:${sourceUserId}`, `user_artifact_usage:${targetUserId}`],
+    // SA-113 P2 (DL-113-02): the two user-scoped DM/webhook keys. The DM records and the
+    // per-agent inbox/sent indexes are agent-scoped and need no remap.
+    [`dm_index:${sourceUserId}`, `dm_index:${targetUserId}`],
+    [`wake_hooks:${sourceUserId}`, `wake_hooks:${targetUserId}`]
   ]
 
   for (const [from, to] of replacements) {
@@ -1200,6 +1213,16 @@ function groupForKey(key: string, userId: string): BackupGroupId {
     return 'tools'
   }
   if (
+    key.startsWith('dm:') ||
+    key.startsWith('dm_inbox:') ||
+    key.startsWith('dm_sent:') ||
+    key.startsWith('dm_index:') ||
+    key.startsWith('wake_hook:') ||
+    key.startsWith('wake_hooks:')
+  ) {
+    return 'dms'
+  }
+  if (
     key.startsWith('memory:') ||
     key.startsWith('memseg:') ||
     key.startsWith('memdream:') ||
@@ -1255,6 +1278,8 @@ function isRestorableKeyForUser(key: string, userId: string) {
   if (exactKeys.has(key)) return true
 
   const userPrefixes = [
+    `dm_index:${userId}`,
+    `wake_hooks:${userId}`,
     `folder:${userId}:`,
     `project:${userId}:`,
     `api_keys:${userId}:`,
@@ -1310,7 +1335,13 @@ function isRestorableKeyForUser(key: string, userId: string) {
     'memdream_index:',
     'memfold:',
     'episode:',
-    'memlinger:'
+    'memlinger:',
+    // SA-113 P2 (DL-113-02). DMs are agent-scoped, so they follow the agent-prefix shape
+    // the memory keys use rather than a user prefix.
+    'dm:',
+    'dm_inbox:',
+    'dm_sent:',
+    'wake_hook:'
   ]
 
   return globalEntityPrefixes.some((prefix) => key.startsWith(prefix))
@@ -1377,6 +1408,19 @@ async function safeSetMembers(client: any, key: string) {
     const type = await client.type(key)
     if (type !== 'set') return []
     return await client.sMembers(key)
+  } catch {
+    return []
+  }
+}
+
+/** SA-113 P2: the DM indexes are sorted sets, not sets — same shape of safe read. */
+async function safeZsetMembers(client: any, key: string) {
+  try {
+    if ((await client.exists(key)) !== 1) return []
+    const type = await client.type(key)
+    if (type !== 'zset') return []
+    const members = await client.zRange(key, 0, -1)
+    return Array.isArray(members) ? (members as string[]) : []
   } catch {
     return []
   }
@@ -1472,6 +1516,21 @@ async function collectCandidateKeys(client: any, userId: string) {
     await addExistingKey(keys, client, `memdream_index:${agentId}`)
     await addExistingKey(keys, client, `memfold:${agentId}`)
     await addPatternKeys(keys, client, `upload:memory-media:${agentId}/*`)
+    // SA-113 P2: the agent's inbox and sent indexes. The DM records themselves are
+    // collected from those indexes below, because a DM's id carries no agent segment.
+    await addExistingKey(keys, client, `dm_inbox:${agentId}`)
+    await addExistingKey(keys, client, `dm_sent:${agentId}`)
+  }
+
+  // SA-113 P2: DM records, reached through the per-user index so a DM whose recipient was
+  // deleted is still exported while its record survives retention.
+  await addExistingKey(keys, client, `dm_index:${userId}`)
+  await addExistingKey(keys, client, `wake_hooks:${userId}`)
+  for (const dmId of await safeZsetMembers(client, `dm_index:${userId}`)) {
+    await addExistingKey(keys, client, `dm:${dmId}`)
+  }
+  for (const hookId of await safeSetMembers(client, `wake_hooks:${userId}`)) {
+    await addExistingKey(keys, client, `wake_hook:${hookId}`)
   }
 
   for (const subagentId of subagentIds) {

@@ -42,6 +42,8 @@ import {
   neutralizeUntrustedZipReferenceSyntax
 } from '$lib/utils/zipReferenceSafety'
 import { registerRuntimeShutdownTask } from '$lib/server/services/runtimeShutdown'
+import { parseSseChannel } from '$lib/server/ssePublisher'
+import { getWakeRun, hasActiveWakeRun } from '$lib/server/services/wakeRunRegistry'
 
 type SSEController = ReadableStreamDefaultController & {
   _id?: string;
@@ -65,6 +67,13 @@ type ActiveStreamState = {
 
 // Active SSE connections (can have multiple listeners per session)
 const connections = new Map<string, Set<SSEController>>()
+/**
+ * SA-113 P1 (DL-113-06) — the user-scoped channel, kept in its own map on purpose.
+ * A user connection is not a session connection: it has no zip buffers, no stream adapter,
+ * and no replay buffer, so sharing `connections` would run session-shaped teardown against
+ * a user id.
+ */
+const userConnections = new Map<string, Set<SSEController>>()
 const activeStreams = new Map<string, ActiveStreamState>()
 const activeStreamCleanupTimers = new Map<string, Map<string, ReturnType<typeof setTimeout>>>()
 const sessionAdapters = new Map<string, StreamEventAdapter>()
@@ -184,8 +193,11 @@ async function ensureExternalSubscriber() {
 
       await subscriber.connect()
       await subscriber.pSubscribe(`${EXTERNAL_CHANNEL_PREFIX}*`, (message, channel) => {
-        const sessionId = channel.replace(EXTERNAL_CHANNEL_PREFIX, '')
-        if (!sessionId) return
+        // SA-113 P1: the same pattern now carries two channel shapes. `parseSseChannel`
+        // is THE rule that tells them apart, so a user event can never be mistaken for a
+        // session whose id happens to start with the user segment.
+        const parsed = parseSseChannel(channel)
+        if (!parsed) return
 
         let payload: any = { type: 'external_event', raw: message }
         try {
@@ -194,7 +206,12 @@ async function ensureExternalSubscriber() {
           // keep fallback payload
         }
 
-        forwardExternalEvent(sessionId, payload)
+        if (parsed.scope === 'user') {
+          forwardUserEvent(parsed.userId, payload)
+          return
+        }
+
+        forwardExternalEvent(parsed.sessionId, payload)
       })
 
       externalSubscriber = subscriber
@@ -237,6 +254,22 @@ export function _closeSseRuntimeResources(reason = 'shutdown'): Promise<void> {
     }
     connections.clear()
 
+    for (const userControllers of userConnections.values()) {
+      for (const controller of userControllers) {
+        controller._closed = true
+        if (controller._heartbeat) {
+          clearInterval(controller._heartbeat)
+          controller._heartbeat = undefined
+        }
+        try {
+          controller.close()
+        } catch {
+          // The client may already have closed the stream.
+        }
+      }
+    }
+    userConnections.clear()
+
     for (const timers of activeStreamCleanupTimers.values()) {
       for (const timer of timers.values()) clearTimeout(timer)
     }
@@ -276,6 +309,42 @@ function forwardExternalEvent(sessionId: string, payload: any) {
   for (const controller of listeners) {
     enqueueWithTelemetry(sessionId, controller, payload)
   }
+}
+
+/**
+ * SA-113 P1 (DL-113-06). Deliberately does NOT go through `enqueueWithTelemetry`: that
+ * helper stamps `sseEventId` into the SESSION replay buffer for any payload carrying a
+ * `messageId`, which would file a user-channel event under a phantom session.
+ */
+function forwardUserEvent(userId: string, payload: any) {
+  const listeners = userConnections.get(userId)
+  if (!listeners || listeners.size === 0) return
+
+  for (const controller of listeners) {
+    if (controller._closed) continue
+    try {
+      controller.enqueue(`data: ${JSON.stringify(payload)}\n\n`)
+    } catch (err) {
+      logger.debug('[SSE] Dropping a closed user-channel controller', {
+        userId,
+        controllerId: controller._id,
+        error: err
+      })
+      removeUserController(userId, controller)
+    }
+  }
+}
+
+function removeUserController(userId: string, controller: SSEController) {
+  const listeners = userConnections.get(userId)
+  if (!listeners) return
+  controller._closed = true
+  if (controller._heartbeat) {
+    clearInterval(controller._heartbeat)
+    controller._heartbeat = undefined
+  }
+  listeners.delete(controller)
+  if (listeners.size === 0) userConnections.delete(userId)
 }
 
 function resolveAssignedSubagentIds(agent: any): string[] {
@@ -470,6 +539,39 @@ const zipDetection = new ZipDetectionService()
 const agentSettingsCache = new Map<string, any>()
 const sessionZipSettings = new Map<string, Record<string, any> | undefined>()
 
+/**
+ * SA-113 F-P1-2 — sessions whose zip settings were loaded for a headless woken turn
+ * rather than by a tab connecting.
+ *
+ * `sessionZipSettings` is normally filled on GET (a tab connects) and dropped on the last
+ * disconnect. A woken turn can stream with nobody watching, and AMD-113-01 hands its zips
+ * to the stream path, so without this the user's own thresholds would be ignored for
+ * exactly the turns they never see happen. Tracking which entries the wake path owns is
+ * what lets them be dropped again without touching an entry a real tab owns.
+ */
+const wakeOwnedZipSettings = new Set<string>()
+
+async function ensureZipSettingsForWakeRun(sessionId: string, userId: string) {
+  if (sessionZipSettings.has(sessionId)) return
+  let globalZipSettings: Record<string, any> | undefined = undefined
+  try {
+    const userSettings = await redis.getUserSettings(userId)
+    globalZipSettings = userSettings?.global_zip_settings || undefined
+  } catch (err) {
+    console.error('[SSE] Failed to load zip settings for a woken turn:', err)
+  }
+  sessionZipSettings.set(sessionId, globalZipSettings)
+  wakeOwnedZipSettings.add(sessionId)
+}
+
+function releaseWakeOwnedZipSettings(sessionId: string) {
+  if (!wakeOwnedZipSettings.delete(sessionId)) return
+  // A tab that connected meanwhile now owns the entry and its disconnect drops it.
+  const sessionControllers = connections.get(sessionId)
+  if (sessionControllers && sessionControllers.size > 0) return
+  sessionZipSettings.delete(sessionId)
+}
+
 function getStreamAdapter(sessionId: string) {
   let adapter = sessionAdapters.get(sessionId)
   if (!adapter) {
@@ -531,12 +633,90 @@ async function loadAgentSettings(sessionId: string) {
 }
 
 /**
+ * SA-113 P1 (DL-113-06) — the user-scoped live channel.
+ *
+ * Cookie-only, like the session channel: an `EventSource` cannot send headers, so there
+ * is no token lane here and there must not be one. It carries `session_created`,
+ * `session_updated`, `session_run_status`, and (from P2) `dm_inbox_changed`.
+ *
+ * Intentionally simpler than the session channel: no zip settings, no stream adapter, no
+ * replay buffer, no visual-indicator monitoring. Those are all session-scoped concerns.
+ */
+async function openUserChannel(url: URL, locals: App.Locals): Promise<Response> {
+  if (!locals.user) {
+    throw error(401, 'Unauthorized')
+  }
+  const userId = locals.user.id
+
+  await ensureExternalSubscriber()
+
+  let controllerRef: SSEController | null = null
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const typed = controller as SSEController
+      typed._id = `sse-user-${randomUUID()}`
+      typed._closed = false
+      controllerRef = typed
+
+      let listeners = userConnections.get(userId)
+      if (!listeners) {
+        listeners = new Set<SSEController>()
+        userConnections.set(userId, listeners)
+      }
+      listeners.add(typed)
+
+      try {
+        typed.enqueue(`data: ${JSON.stringify({ type: 'connected', scope: 'user' })}\n\n`)
+      } catch (err) {
+        logger.debug('[SSE] Failed to greet a user-channel listener', { userId, error: err })
+      }
+
+      const heartbeat = setInterval(() => {
+        if (typed._closed) {
+          clearInterval(heartbeat)
+          return
+        }
+        try {
+          typed.enqueue(':heartbeat\n\n')
+        } catch {
+          removeUserController(userId, typed)
+        }
+      }, 30000)
+      typed._heartbeat = heartbeat
+
+      logger.debug('[SSE] User channel opened', { userId, controllerId: typed._id })
+    },
+    cancel() {
+      if (controllerRef) removeUserController(userId, controllerRef)
+      logger.debug('[SSE] User channel closed', { userId })
+    }
+  })
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': url.origin
+    }
+  })
+}
+
+/**
  * SSE endpoint for canonical chat streaming events.
  * Native n8n sends forward webhook NDJSON here client-side; legacy/custom
  * callback workflows can still POST callback events directly.
  * Simplified version without "Respond to Webhook" complexity
  */
 export const GET: RequestHandler = async ({ url, locals }) => {
+  // SA-113 P1 (DL-113-06): one handler, two scopes. `?scope=user` opens the user-wide
+  // channel that tells the sidebar about sessions and runs the server started on its own.
+  if (url.searchParams.get('scope') === 'user') {
+    return openUserChannel(url, locals)
+  }
+
   const sessionId = url.searchParams.get('sessionId')
 
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
@@ -562,6 +742,8 @@ export const GET: RequestHandler = async ({ url, locals }) => {
   }
 
   sessionZipSettings.set(sessionId, globalZipSettings)
+  // A real tab now owns this entry; its disconnect is what drops it (F-P1-2).
+  wakeOwnedZipSettings.delete(sessionId)
 
   logger.debug('[SSE] New connection for session:', sessionId)
 
@@ -1400,7 +1582,26 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   const sessionControllers = connections.get(sessionId)
-  if (!sessionControllers || sessionControllers.size === 0) {
+  const hasListeners = Boolean(sessionControllers && sessionControllers.size > 0)
+
+  // SA-113 P1 / AMD-113-01 — a woken turn is watchable even before anyone watches it.
+  //
+  // Dropping events for an unwatched session is right for an async n8n callback, but a
+  // wake-up opens a real user-facing chat. The P0 spike measured the cost: a tab opened
+  // 7 s into a headless turn received no `start`, no `tool-call`, and none of the first
+  // chunks, so the reply appeared to begin mid-sentence. Running the event through the
+  // normal path fills the replay buffer, and a tab that joins mid-turn then gets the
+  // existing replay.
+  //
+  // Returning `success: true` also hands this turn's zips to the stream path, exactly as
+  // for a watched turn — send-routed reads that flag to decide whether to run its batch
+  // zip pass instead (`selectFinishZipInput`).
+  const bufferForWakeRun = !hasListeners && hasActiveWakeRun(sessionId)
+
+  if (!hasListeners && !bufferForWakeRun) {
+    // The woken turn is over and nobody is watching: give back any zip settings the wake
+    // path loaded, in case the turn ended without a terminal event (F-P1-2).
+    releaseWakeOwnedZipSettings(sessionId)
     // No active SSE connection - this is normal for async webhook calls
     logger.debug('[SSE] No active connection for session:', sessionId)
     return new Response(JSON.stringify({
@@ -1412,13 +1613,21 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     })
   }
 
+  // F-P1-2 — a headless woken turn must zip by the user's own thresholds. Nothing has
+  // loaded them, because loading happens when a tab connects; the wake registry knows
+  // whose turn this is.
+  if (bufferForWakeRun) {
+    const wakeRun = getWakeRun(sessionId)
+    if (wakeRun) await ensureZipSettingsForWakeRun(sessionId, wakeRun.userId)
+  }
+
   // Process as a regular n8n-style event through the NDJSON handler.
   const globalZipSettings = sessionZipSettings.get(sessionId)
   const { controller: collector, events } = createCollectingController(sessionId)
   await processNDJSONLine(sessionId, data, collector, { globalZipSettings })
 
   for (const event of events) {
-    for (const controller of sessionControllers) {
+    for (const controller of sessionControllers ?? []) {
       enqueueWithTelemetry(sessionId, controller, event)
     }
   }
@@ -1590,7 +1799,10 @@ function scheduleActiveStreamCleanup(sessionId: string, messageId?: string, dela
       state.messageIds.delete(messageId)
       if (state.events.length === 0) {
         activeStreams.delete(sessionId)
+        releaseWakeOwnedZipSettings(sessionId)
       }
+    } else {
+      releaseWakeOwnedZipSettings(sessionId)
     }
 
     const existingTimers = activeStreamCleanupTimers.get(sessionId)

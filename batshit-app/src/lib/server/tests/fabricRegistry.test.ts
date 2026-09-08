@@ -39,6 +39,7 @@ const mockRedisLPush = vi.fn()
 const mockRedisLTrim = vi.fn()
 const mockGetSession = vi.fn()
 const mockGetSessionMessages = vi.fn()
+const mockGetRecentMessages = vi.fn()
 const mockGetUserSettings = vi.fn()
 const mockUpdateUserSettings = vi.fn()
 const mockGetAgents = vi.fn()
@@ -90,6 +91,7 @@ vi.mock('$lib/server/redis', () => ({
     getZip: vi.fn(),
     getSession: (...args: any[]) => mockGetSession(...args),
     getSessionMessages: (...args: any[]) => mockGetSessionMessages(...args),
+    getRecentMessages: (...args: any[]) => mockGetRecentMessages(...args),
     getUserSettings: (...args: any[]) => mockGetUserSettings(...args),
     updateUserSettings: (...args: any[]) => mockUpdateUserSettings(...args),
     getAgents: (...args: any[]) => mockGetAgents(...args),
@@ -149,6 +151,13 @@ vi.mock('$lib/server/services/runtimeAddons', () => ({
   controlRuntimeAddon: (...args: any[]) => mockRuntimeAddons.controlRuntimeAddon(...args)
 }))
 
+// SA-113 F-SEC-1b: the gate dynamic-imports this to stamp the DM. Mocked so the test can
+// see the stamp without standing up the whole DM store, and so a stamp failure can never be
+// what makes a refusal test pass.
+vi.mock('$lib/server/services/dm/dmStore', () => ({
+  stampDmNeedsUser: vi.fn(async () => undefined)
+}))
+
 vi.mock('$lib/server/services/vercelModelCatalog', () => ({
   fetchVercelModelCatalog: (...args: any[]) => mockFetchVercelModelCatalog(...args)
 }))
@@ -194,6 +203,12 @@ describe('controlRegistry artifact capability controls', () => {
       user_id: 'user-1'
     })
     mockGetSessionMessages.mockResolvedValue([])
+    // Default: an ordinary chat the user typed in. SA-113 F-SEC-1 reads this to tell a
+    // woken turn from a typed one, and every pre-existing risk test in this file assumes
+    // the typed answer.
+    mockGetRecentMessages.mockResolvedValue([
+      { role: 'user', content: 'hello', metadata: {} }
+    ])
 
     mockGetUserSettings.mockImplementation(async () => ({
       id: 'settings_user-1',
@@ -601,6 +616,57 @@ describe('controlRegistry artifact capability controls', () => {
     ).toBe(12)
   })
 
+  it('publishes the SA-113 P2 sys.dm.* control family through findControls', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const result = await findControls({
+      query: 'sys.dm.',
+      includeDraft: true,
+      limit: 200
+    })
+
+    const dmIds = result.results
+      .filter((item) => item.controlId.startsWith('sys.dm.'))
+      .map((item) => item.controlId)
+      .sort()
+
+    expect(dmIds).toEqual([
+      'sys.dm.agents',
+      'sys.dm.blocked',
+      'sys.dm.claim',
+      'sys.dm.done',
+      'sys.dm.list',
+      'sys.dm.read',
+      'sys.dm.send'
+    ])
+
+    // DL-113-03: every DM control is `safe` — the control is the recipient's settings and
+    // the Admin switch, not a per-call confirmation prompt.
+    for (const control of result.results.filter((item) => item.controlId.startsWith('sys.dm.'))) {
+      expect(control.riskLevel).toBe('safe')
+    }
+  })
+
+  it('excludes sys.dm.* from a broker allowlist without the DM scope', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const withoutDms = await findControls({
+      query: 'dm',
+      limit: 200,
+      allowedControlIds: ['sys.artifact.*', 'sys.memory.*']
+    })
+    expect(withoutDms.results.some((item) => item.controlId.startsWith('sys.dm.'))).toBe(false)
+
+    const withDms = await findControls({
+      query: 'dm',
+      limit: 200,
+      allowedControlIds: ['sys.dm.*']
+    })
+    expect(
+      withDms.results.filter((item) => item.controlId.startsWith('sys.dm.')).length
+    ).toBe(7)
+  })
+
   it('matches multi-token artifact control queries in findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -791,6 +857,186 @@ describe('controlRegistry artifact capability controls', () => {
       'Validation input executed successfully'
     )
     expect((approvedResult.result as any).message).toContain('select it in the current chat Tools panel')
+  })
+
+  /* ---------------------------------------------------------------- *
+   * SA-113 F-SEC-1 — a woken turn cannot approve its own risky control
+   * ---------------------------------------------------------------- */
+
+  /** The wake primitive's user message: `metadata.wake` is what makes a turn a woken one. */
+  const wokenUserMessage = (dmId?: string) => ({
+    role: 'user',
+    content: '[Agent DM — from Cooper, not from the user] assignment — Check the build',
+    metadata: { wake: { chainDepth: 1, ...(dmId ? { dmId } : {}) } }
+  })
+
+  const riskApprovalKeysWritten = () =>
+    mockRedisSet.mock.calls
+      .map((call) => String(call[0] ?? ''))
+      .filter((key) => key.startsWith('control_risk_approval:'))
+
+  it('F-SEC-1: refuses a risky control in a woken turn even with allowRisky, and caches nothing', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
+
+    const result = await useControl({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      // The exact move the broker's own approval_hint teaches, and the one a webhook body
+      // could talk a compliant model into.
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
+    expect(result.error.message).toContain('not by the user')
+    expect(result.error.message).toContain('once the user replies in this chat, retry')
+    // The control did not run...
+    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+    // ...and no approval was recorded, so a later call cannot read this as consent.
+    expect(riskApprovalKeysWritten()).toEqual([])
+  })
+
+  it('F-SEC-1: the same session runs the control normally once the user has replied', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    // A human reply is simply the newest user message with no `metadata.wake`. That is the
+    // whole recovery path the refusal points the agent at — nothing is cancelled.
+    mockGetRecentMessages.mockResolvedValue([
+      wokenUserMessage(),
+      { role: 'assistant', content: 'I need your say-so first.', metadata: {} },
+      { role: 'user', content: 'go ahead', metadata: {} }
+    ])
+
+    const result = await useControl({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(true)
+    expect(mockCliToolService.validateCliTool).toHaveBeenCalledWith('user-1', 'repo_snapshot', {
+      projectPath: null
+    })
+  })
+
+  it('F-SEC-1: an approval cached from a human turn does not unlock a woken turn', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    // The user approves in an ordinary chat, which writes the five-minute cache.
+    const approved = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      allowRisky: true
+    })
+    expect(approved.success).toBe(true)
+    const cachedKey = riskApprovalKeysWritten().at(-1)
+    expect(cachedKey).toBeTruthy()
+    // Make the cache read find it, the way Redis would inside the five minutes.
+    mockRedisGet.mockImplementation(async (key: string) =>
+      key === cachedKey ? new Date().toISOString() : null
+    )
+    mockCliToolService.validateCliTool.mockClear()
+
+    // Three minutes later, a DM wakes the same agent in the same chat.
+    mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
+    const woken = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' }
+    })
+
+    expect(woken.success).toBe(false)
+    if (woken.success) return
+    expect(woken.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
+    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+  })
+
+  it('F-SEC-1: a safe control still runs in a woken turn', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
+
+    // The gate is risk-scoped, so nothing `safe` is affected. Every `sys.dm.*` control is
+    // registered `safe` (pinned by "publishes the SA-113 P2 sys.dm.* control family"), which
+    // is what keeps a woken agent able to read, claim, and close the DM that woke it —
+    // exactly what the refusal tells it to do.
+    const result = await useControl({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.create',
+      input: {
+        title: 'Repo Snapshot',
+        description: 'Summarise the repo',
+        connectedTo: 'node',
+        command: 'node scripts/snapshot.mjs'
+      }
+    })
+
+    expect(result.success).toBe(true)
+    expect(mockCliToolService.createCliTool).toHaveBeenCalled()
+  })
+
+  it('F-SEC-1: an unreadable session fails closed rather than assuming a human', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    mockGetRecentMessages.mockRejectedValue(new Error('redis is down'))
+
+    const result = await useControl({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
+    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+  })
+
+  it('F-SEC-1b: the refusal stamps the DM that woke the chat as needing the user', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    const { stampDmNeedsUser } = await import('$lib/server/services/dm/dmStore')
+    mockGetRecentMessages.mockResolvedValue([wokenUserMessage('dm_stuck')])
+
+    const result = await useControl({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(false)
+    expect(stampDmNeedsUser).toHaveBeenCalledWith('dm_stuck', expect.stringContaining('sys.cli_tool.test'))
+  })
+
+  it('F-SEC-1b: a woken turn with no DM id (a webhook wake) still refuses', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    const { stampDmNeedsUser } = await import('$lib/server/services/dm/dmStore')
+    mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
+
+    const result = await useControl({
+      userId: 'user-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
+    expect(stampDmNeedsUser).not.toHaveBeenCalled()
   })
 
   it('ranks use.artifact.* ahead of per-instance controls for artifact-use intent', async () => {

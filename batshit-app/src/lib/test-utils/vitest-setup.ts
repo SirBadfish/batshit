@@ -111,12 +111,32 @@ vi.mock('$lib/server/redis', async () => {
     return redisStore.get(key)!.value as Set<any>
   }
 
+  /**
+   * SA-113 P2: sorted-set support, for the DM inbox/sent/user indexes (DL-113-02). The
+   * ordering is load-bearing — urgent-first then oldest-first comes from the score, not
+   * from a JS sort — so the fake has to keep scores, not just membership.
+   */
+  const ensureZset = (key: string) => {
+    const existing = redisStore.get(key)
+    if (!existing || existing.type !== 'zset') {
+      redisStore.set(key, { type: 'zset', value: new Map<string, number>() })
+    }
+    return redisStore.get(key)!.value as Map<string, number>
+  }
+
+  const zsetMembersAscending = (key: string) =>
+    Array.from(ensureZset(key).entries())
+      .sort((a, b) => (a[1] === b[1] ? (a[0] < b[0] ? -1 : 1) : a[1] - b[1]))
+      .map(([member]) => member)
+
   const nowSeconds = () => Math.floor(Date.now() / 1000)
 
   const setExpiryValue = (key: string, seconds: number) => {
     expireStore.set(key, nowSeconds() + seconds)
     return true
   }
+
+  const clearExpiryValue = (key: string) => expireStore.delete(key)
 
   const getTtl = (key: string) => {
     if (!expireStore.has(key)) return -1
@@ -142,6 +162,33 @@ vi.mock('$lib/server/redis', async () => {
     return [clone(current)]
   }
 
+  /**
+   * Resolve `$.a.b` down to `{ parent, key }` so a path write lands on ONE field.
+   *
+   * SA-113 F-P3-2: this fake used to ignore the path entirely and replace the whole
+   * record with the value — the third place it disagreed with the real client (after
+   * `getMessages` head-vs-tail and `sRem` array flattening, both found in P3). Real
+   * RedisJSON refuses a path write when the root key is missing, and returns nil
+   * without writing when an intermediate segment does not resolve; both are copied
+   * here, because a fake that quietly succeeds is worse than no test at all.
+   */
+  const resolveJsonWriteTarget = (root: any, path: string) => {
+    if (!path.startsWith('$.')) return null
+    const parts = path
+      .slice(2)
+      .split('.')
+      .filter(Boolean)
+    if (parts.length === 0) return null
+
+    let current = root
+    for (const part of parts.slice(0, -1)) {
+      if (current == null || typeof current !== 'object') return null
+      current = current[part]
+    }
+    if (current == null || typeof current !== 'object') return null
+    return { parent: current, key: parts[parts.length - 1] }
+  }
+
   const redisJsonMock = {
     get: vi.fn(async (key: string, options?: { path?: string }) => {
       const entry = redisStore.get(key)
@@ -152,9 +199,34 @@ vi.mock('$lib/server/redis', async () => {
       }
       return null
     }),
-    set: vi.fn(async (key: string, _path: string, value: any) => {
-      redisStore.set(key, { type: 'json', value: clone(value) })
+    set: vi.fn(async (key: string, path: string, value: any) => {
+      if (!path || path === '$') {
+        redisStore.set(key, { type: 'json', value: clone(value) })
+        return 'OK'
+      }
+
+      const entry = redisStore.get(key)
+      if (!entry || entry.type !== 'json') {
+        // Real RedisJSON: "ERR new objects must be created at the root".
+        throw new Error(`ERR new objects must be created at the root (key ${key}, path ${path})`)
+      }
+
+      const target = resolveJsonWriteTarget(entry.value, path)
+      if (!target) return null
+      target.parent[target.key] = clone(value)
       return 'OK'
+    }),
+    numIncrBy: vi.fn(async (key: string, path: string, by: number) => {
+      const entry = redisStore.get(key)
+      if (!entry || entry.type !== 'json') {
+        throw new Error(`ERR could not perform this operation on a key that doesn't exist (${key})`)
+      }
+      const target = resolveJsonWriteTarget(entry.value, path)
+      if (!target) return null
+      const current = target.parent[target.key]
+      const next = (typeof current === 'number' ? current : 0) + by
+      target.parent[target.key] = next
+      return next
     }),
     del: vi.fn(async (key: string) => (redisStore.delete(key) ? 1 : 0))
   }
@@ -263,12 +335,60 @@ vi.mock('$lib/server/redis', async () => {
       }
       return messageRecord
     }),
+    // SA-113 P1: the wake primitive resolves a "One at a time" target by listing the
+    // agent's sessions, so the fake needs the same list-and-sort contract the real client
+    // has (newest first by last_modified_at, archived hidden unless asked for).
+    getSessions: vi.fn(async (userId: string, includeArchived = false) => {
+      const sessionIds = Array.from(ensureSet(`user:${userId}:sessions`).values())
+      const sessions = sessionIds
+        .map((sessionId) => {
+          const entry = redisStore.get(`session:${sessionId}`)
+          return entry?.type === 'json' ? clone(entry.value) : null
+        })
+        .filter(Boolean)
+        .filter((session: any) => includeArchived || !session.archived)
+
+      return sessions.sort((a: any, b: any) => {
+        const dateA = new Date(a.last_modified_at || a.created_at || 0).getTime()
+        const dateB = new Date(b.last_modified_at || b.created_at || 0).getTime()
+        return dateB - dateA
+      })
+    }),
+    // SA-113 P1: the generic session PUT (which re-attaches a stored `metadata.origin`)
+    // needs the real client's top-level merge, including the wholesale metadata replace
+    // that the re-attach resolver exists to defend against.
+    updateSession: vi.fn(async (id: string, updates: any) => {
+      const entry = redisStore.get(`session:${id}`)
+      if (!entry || entry.type !== 'json') {
+        throw new Error('Session not found')
+      }
+      const updated = {
+        ...clone(entry.value),
+        ...clone(updates),
+        last_modified_at: new Date().toISOString()
+      }
+      redisStore.set(`session:${id}`, { type: 'json', value: clone(updated) })
+    }),
     getSession: vi.fn(async (sessionId: string) => {
       const entry = redisStore.get(`session:${sessionId}`)
       if (!entry || entry.type !== 'json') return null
       return clone(entry.value)
     }),
+    // SA-113 P3 (F-P2-1): this fake used to return the LAST `limit` messages while the real
+    // client returns the FIRST `limit` (`lRange(key, 0, limit - 1)`). That drift is exactly
+    // what hid the chain-depth and presence bugs — under the fake both readers looked at
+    // the right end of the chat, and in production they looked at the wrong one. The fake
+    // now lies about nothing: `getMessages` is head-first, `getRecentMessages` is the tail.
     getMessages: vi.fn(async (sessionId: string, limit = 100) => {
+      const messageIds = await redisMock.lRange(`messages:${sessionId}`, 0, limit - 1)
+      const messages = await Promise.all(
+        messageIds.map((messageId) => redisJsonMock.get(`message:${sessionId}:${messageId}`))
+      )
+
+      return messages.filter(Boolean)
+    }),
+    getRecentMessages: vi.fn(async (sessionId: string, limit = 100) => {
+      if (!Number.isFinite(limit) || limit <= 0) return []
       const messageIds = await redisMock.lRange(`messages:${sessionId}`, -limit, -1)
       const messages = await Promise.all(
         messageIds.map((messageId) => redisJsonMock.get(`message:${sessionId}:${messageId}`))
@@ -323,6 +443,7 @@ vi.mock('$lib/server/redis', async () => {
     }),
     ttl: vi.fn(async (key: string) => getTtl(key)),
     expire: vi.fn(async (key: string, seconds: number) => setExpiryValue(key, seconds)),
+    persist: vi.fn(async (key: string) => clearExpiryValue(key)),
     keys: vi.fn(async (pattern: string) => {
       const regex = resolveMatch(pattern)
       return Array.from(redisStore.keys()).filter((key) => regex.test(key))
@@ -363,10 +484,47 @@ vi.mock('$lib/server/redis', async () => {
       return set.size
     }),
     sMembers: vi.fn(async (key: string) => Array.from(ensureSet(key).values())),
+    zAdd: vi.fn(async (key: string, entries: any) => {
+      const zset = ensureZset(key)
+      const list = Array.isArray(entries) ? entries : [entries]
+      let added = 0
+      for (const entry of list) {
+        if (!zset.has(String(entry.value))) added += 1
+        zset.set(String(entry.value), Number(entry.score))
+      }
+      return added
+    }),
+    zRange: vi.fn(async (key: string, start: number, stop: number) => {
+      const ordered = zsetMembersAscending(key)
+      const end = stop === -1 ? ordered.length : stop + 1
+      return ordered.slice(start, end)
+    }),
+    zRem: vi.fn(async (key: string, members: any) => {
+      const zset = ensureZset(key)
+      const list = Array.isArray(members) ? members : [members]
+      let removed = 0
+      for (const member of list) {
+        if (zset.delete(String(member))) removed += 1
+      }
+      return removed
+    }),
+    zRangeWithScores: vi.fn(async (key: string, start: number, stop: number) => {
+      const zset = ensureZset(key)
+      const ordered = zsetMembersAscending(key)
+      const end = stop === -1 ? ordered.length : stop + 1
+      return ordered
+        .slice(start, end)
+        .map((member) => ({ value: member, score: zset.get(member) ?? 0 }))
+    }),
+    zCard: vi.fn(async (key: string) => ensureZset(key).size),
     sRem: vi.fn(async (key: string, ...members: any[]) => {
       const set = ensureSet(key)
+      // node-redis accepts `sRem(key, ['a','b'])` as well as `sRem(key, 'a', 'b')`, and
+      // `sAdd` above already flattens. Without the same flattening here, a caller passing
+      // an array removed NOTHING under test while working correctly against real Redis.
+      const flattened = members.length === 1 && Array.isArray(members[0]) ? members[0] : members
       let removed = 0
-      members.forEach((m) => {
+      flattened.forEach((m: any) => {
         if (set.delete(m)) removed++
       })
       return removed
@@ -377,6 +535,7 @@ vi.mock('$lib/server/redis', async () => {
       if (entry.type === 'json') return 'ReJSON-RL'
       if (entry.type === 'list') return 'list'
       if (entry.type === 'set') return 'set'
+      if (entry.type === 'zset') return 'zset'
       return 'string'
     }),
     execute: vi.fn(async (operation: (client: any) => Promise<any>) => {
@@ -406,6 +565,10 @@ vi.mock('$lib/server/redis', async () => {
             set: (key: string, path: string, value: any) => {
               queue.push(() => redisJsonMock.set(key, path, value))
               return multiApi
+            },
+            numIncrBy: (key: string, path: string, by: number) => {
+              queue.push(() => redisJsonMock.numIncrBy(key, path, by))
+              return multiApi
             }
           },
           exec: vi.fn(async () => {
@@ -426,6 +589,7 @@ vi.mock('$lib/server/redis', async () => {
 
       const client = {
         expire: vi.fn(async (key: string, seconds: number) => redisMock.expire(key, seconds)),
+        persist: vi.fn(async (key: string) => (clearExpiryValue(key) ? 1 : 0)),
         exists: vi.fn(async (key: string) => (redisStore.has(key) ? 1 : 0)),
         ttl: vi.fn(async (key: string) => redisMock.ttl(key)),
         type: vi.fn(async (key: string) => redisMock.type(key)),
@@ -446,6 +610,15 @@ vi.mock('$lib/server/redis', async () => {
         sAdd: vi.fn(async (key: string, ...members: any[]) => redisMock.sAdd(key, ...members)),
         sMembers: vi.fn(async (key: string) => redisMock.sMembers(key)),
         sRem: vi.fn(async (key: string, ...members: any[]) => redisMock.sRem(key, ...members)),
+        zAdd: vi.fn(async (key: string, entries: any) => redisMock.zAdd(key, entries)),
+        zRange: vi.fn(async (key: string, start: number, stop: number) =>
+          redisMock.zRange(key, start, stop)
+        ),
+        zRem: vi.fn(async (key: string, members: any) => redisMock.zRem(key, members)),
+        zRangeWithScores: vi.fn(async (key: string, start: number, stop: number) =>
+          redisMock.zRangeWithScores(key, start, stop)
+        ),
+        zCard: vi.fn(async (key: string) => redisMock.zCard(key)),
         json: redisJsonMock,
         multi: vi.fn(() => createMulti())
       }

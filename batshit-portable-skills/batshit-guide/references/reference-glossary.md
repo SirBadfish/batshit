@@ -12,6 +12,10 @@ An AI assistant configured in Batshit. The main agent you chat with is a Primary
 
 Batshit's browser automation runtime. Native installs can use the host runtime where configured. Docker installs use an optional sidecar with its own headless browser.
 
+### Agent DM
+
+A message one Primary Agent sends another: an **info** note, an **assignment** (do this and report back), or a **result** (the answer to one). Off by default per agent. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+
 ### Agent Use
 
 Artifact setting that controls whether agents can discover and call a published Artifact as a runtime tool.
@@ -343,6 +347,14 @@ A 3D avatar format. VRM 1.0 is Batshit's full live Goon runtime format for launc
 VRM Animation, a reusable animation format for Goons.
 
 ## W
+
+### Wake-up
+
+A chat turn Batshit starts with nobody typing, because an Agent DM asked for the work to start now or a wake-up webhook was called. The chat appears in the sidebar with an icon saying what started it, costs tokens like any chat, and has the normal Stop button. A wake-up that cannot run becomes a **wait**, with the reason recorded.
+
+### Wake-up webhook
+
+One URL plus one token that lets anything outside Batshit — n8n, a schedule, a CI job — start a chat for one named agent. The token is shown once at creation; Batshit stores only a fingerprint. Managed in Admin → Instance-wide defaults → Agent Wake-ups.
 
 ### Webhook
 

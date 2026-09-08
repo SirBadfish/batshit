@@ -14,6 +14,13 @@ export type ChatRunTransport = PrimaryAgentType
 export type SessionRunState = {
   sessionId: string
   status: ChatRunStatus
+  /**
+   * SA-113 P1 (DL-113-06): who is driving this run. `client` is the browser's own send;
+   * `server` is a turn Batshit started on its own (a wake-up), hydrated from the
+   * user channel. The distinction matters because a server run has no local
+   * `abortController` — Stop for it goes through `/api/messages/interrupt`.
+   */
+  owner?: 'client' | 'server'
   transport?: ChatRunTransport
   activeMessageId?: string | null
   activeStreamMessageIds: string[]
@@ -28,6 +35,7 @@ function createIdleRunState(sessionId: string): SessionRunState {
   return {
     sessionId,
     status: 'idle',
+    owner: 'client',
     activeMessageId: null,
     activeStreamMessageIds: [],
     abortController: null,
@@ -101,10 +109,53 @@ export function startRun(params: {
   setRunState(params.sessionId, {
     ...createIdleRunState(params.sessionId),
     status: 'submitting',
+    owner: 'client',
     transport: params.transport,
     activeMessageId: params.activeMessageId ?? null,
     activeStreamMessageIds,
     abortController: params.abortController ?? null
+  })
+}
+
+/**
+ * SA-113 P1 (DL-113-06) — hydrate a run the SERVER started.
+ *
+ * Recon 2.4: the run spinner and the three-active-chats cap both read this registry, and
+ * both were filled only by the client's own send path, so a woken turn showed no spinner
+ * and counted for nothing. The user channel's `session_run_status` events land here.
+ *
+ * A server run never carries an `abortController` — there is no local request to abort.
+ * `isRunActive` still reports it as active through `status`, which is what the spinner
+ * and the capacity check read.
+ */
+export function applyServerRunStatus(params: {
+  sessionId: string
+  status: 'running' | 'tooling' | 'complete' | 'failed' | 'stopped'
+}) {
+  const normalized = normalizeSessionId(params.sessionId)
+  if (!normalized) return
+
+  const current = getRunState(normalized)
+
+  // Never let a server status stomp a run the user started in the same chat.
+  if (current.owner === 'client' && isRunActive(current)) return
+
+  if (params.status === 'running' || params.status === 'tooling') {
+    setRunState(normalized, {
+      ...createIdleRunState(normalized),
+      owner: 'server',
+      status: params.status === 'tooling' ? 'tooling' : 'streaming'
+    })
+    return
+  }
+
+  if (current.owner !== 'server') return
+
+  setRunState(normalized, {
+    ...createIdleRunState(normalized),
+    owner: 'server',
+    status: 'idle',
+    lastError: params.status === 'failed' ? 'The woken turn failed.' : null
   })
 }
 

@@ -77,6 +77,7 @@ These docs are grouped by subject — everything about a feature lives in one pl
 **Agents and orchestration**
 
 - [Primary Agents](primary-agents/overview.md) — the `API` and `CLI` agent types, plus [connecting n8n](primary-agents/connect-n8n.md) for workflow tools and Workflow Subagents.
+- [Agent DMs and wake-ups](primary-agents/agent-dms-and-wake-ups.md) — agents writing to each other, and chats Batshit starts on its own.
 - [Subagents](subagents/overview.md) — specialist helpers a Primary Agent can call.
 - [Groups](groups/overview.md) — multi-agent group chat with a single-speaker queue.
 - [Projects](projects/overview.md) — project-aware work and file mentions.

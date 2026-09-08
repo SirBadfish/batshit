@@ -755,6 +755,46 @@ export class RedisService {
     })
   }
 
+  /**
+   * The LAST `limit` messages of a session, oldest-first within that window.
+   *
+   * SA-113 P3 (F-P2-1). `getMessages` above is `lRange(key, 0, limit - 1)` — the FIRST
+   * `limit` messages — which is right for "load the whole chat" callers passing a limit
+   * larger than the chat, and silently wrong for every caller that meant "the recent end".
+   * Four callers meant the recent end and were reading ancient history on any chat longer
+   * than their window: the DM chain-depth guard, the DM presence check, the wake-up
+   * primitive's history re-read, and the LiveKit voice context seed.
+   *
+   * Use THIS one whenever the window is smaller than a chat could be. Use `getMessages`
+   * only when you genuinely want the beginning, or when the limit is a safety ceiling on a
+   * full read.
+   */
+  async getRecentMessages(sessionId: string, limit = 100): Promise<ChatMemoryRow[]> {
+    if (!Number.isFinite(limit) || limit <= 0) return []
+    return this.execute(async (client) => {
+      const messageIds = await client.lRange(`messages:${sessionId}`, -limit, -1)
+
+      if (messageIds.length === 0) {
+        return []
+      }
+
+      const messages: ChatMemoryRow[] = []
+      for (const msgId of messageIds) {
+        try {
+          const key = `message:${sessionId}:${msgId}`
+          const messageData = await client.json.get(key)
+          if (messageData) {
+            messages.push(messageData as unknown as ChatMemoryRow)
+          }
+        } catch (error) {
+          logger.warn(`Failed to load message ${msgId}:`, error)
+        }
+      }
+
+      return messages
+    })
+  }
+
   async getSessionMessages(sessionId: string): Promise<Message[]> {
     const messages = await this.getMessages(sessionId, 1000)
     
@@ -1246,6 +1286,18 @@ export class RedisService {
     // is part of the destructive contract: fail before deleting the agent if it fails.
     const { sweepAgentMemoryMedia } = await import('$lib/server/services/memory/memoryMedia')
     await sweepAgentMemoryMedia(id)
+    // SA-113 P2 (DL-113-02): DMs addressed to this agent go with it, along with its inbox
+    // and sent indexes. DMs it SENT stay with their recipients, carrying the sender name
+    // frozen at send time, so the other side of a conversation does not go blank. Same
+    // dynamic-import reason as above.
+    const { sweepAgentDms } = await import('$lib/server/services/dm/dmStore')
+    await sweepAgentDms(id)
+    // SA-113 P3 (DL-113-09): a wake-up webhook pointing at a deleted agent is a live
+    // credential that can only ever produce a 404, so it goes with the agent. This runs
+    // BEFORE the agent record is deleted, because the sweep reads `agent.user_id` to find
+    // the hook index.
+    const { sweepAgentWakeHooks } = await import('$lib/server/services/dm/wakeHookStore')
+    await sweepAgentWakeHooks(id)
     return this.execute(async (client) => {
       // Get agent to find user_id
       const agent = await client.json.get(`agent:${id}`)
@@ -2481,12 +2533,38 @@ export class RedisService {
       return this.execute(async (client) => {
         return await client.json.set(key, path, value)
       })
+    },
+    /**
+     * Add to one number inside a record without reading and rewriting the whole thing.
+     *
+     * Use this instead of read-modify-write for any counter that can be bumped while
+     * another writer owns the same record (SA-113 F-P3-2: a wake hook's `useCount` bump
+     * was undoing a concurrent rotate or resurrecting a revoked hook).
+     */
+    numIncrBy: async (key: string, path: string, by: number): Promise<any> => {
+      return this.execute(async (client) => {
+        return await client.json.numIncrBy(key, path, by)
+      })
     }
   }
 
   async expire(key: string, seconds: number): Promise<boolean> {
     return this.execute(async (client) => {
       const result = await client.expire(key, seconds)
+      return result === 1
+    })
+  }
+
+  /**
+   * Remove a key's expiry so it lives until something deletes it.
+   *
+   * SA-113 P4: the drawer's Reopen turns a closed DM back into an open one, and a closed
+   * DM is carrying the 30-day retention TTL. Without clearing it, a reopened DM would
+   * quietly disappear while it still said "new" in the roster.
+   */
+  async persist(key: string): Promise<boolean> {
+    return this.execute(async (client) => {
+      const result = await client.persist(key)
       return result === 1
     })
   }

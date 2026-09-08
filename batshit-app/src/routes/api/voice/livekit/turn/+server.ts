@@ -335,6 +335,11 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
   })
 
   const messages = await redis.getMessages(sessionId, 300)
+  // SA-113 F-P1-1 — own this turn's session-turn lock. send-routed registers AND releases
+  // the lock under the `messageId` the caller sends, and an unowned release deletes
+  // whatever lock it finds. A voice turn that unwinds late would otherwise cancel the lock
+  // of a turn the user had already started in the same chat.
+  const assistantMessageId = await createMessageId(sessionId)
   const routeResponse = await eventFetch(new URL('/api/messages/send-routed', request.url), {
     method: 'POST',
     headers: {
@@ -346,7 +351,7 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
       sessionId,
       agentId,
       userId,
-      messageId: undefined,
+      messageId: assistantMessageId,
       messages,
       agentType: payload.agentType ?? undefined,
       metadata: voiceMetadata,

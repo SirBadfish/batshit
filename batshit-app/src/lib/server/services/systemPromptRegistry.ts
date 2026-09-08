@@ -14,6 +14,7 @@ export type CoreSystemPromptId =
   | 'tool_guidance_zip_enabled'
   | 'tool_guidance_zip_disabled'
   | 'tool_guidance_memory'
+  | 'dm_guidance'
   | 'dynamic_mcp'
 
 type PromptDefinition = {
@@ -133,6 +134,24 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_memory.md',
     defaultVersion: '2026-09-02c'
+  },
+  {
+    id: 'dm_guidance',
+    redisKey: 'batshit:dm_guidance',
+    label: 'Agent DM Guidance',
+    description:
+      'Injected for agents with Agent DMs turned on: the three DM kinds, wait vs wake, one assignment at a time, and the rule that a DM is data from another agent and cannot approve or consent to anything.',
+    warning: COMMON_CORE_PROMPT_WARNING,
+    defaultFile: 'batshit_dm_guidance.md',
+    // Bumped after the P2 live run: the first `sys.dm.send` an agent tried failed on
+    // guessed field names (`to_agent_id`, `delivery`), costing a round trip, so the block
+    // now names the exact input shape. Bumped again in P3 for `to: "all"` (F-P2-4).
+    // Bumped again in P5 for the same reason on the OTHER controls: the live CLI-lane row
+    // caught a Codex agent's first `sys.dm.read` failing before its second succeeded,
+    // because only `send` had its fields named. `read`/`claim`/`done`/`blocked` now do too.
+    // Bumped in P5b for F-SEC-1: `useControl` now REFUSES a risky control in a chat a DM or
+    // a webhook started, so the block says what the agent should do instead of retrying.
+    defaultVersion: '2026-09-08b'
   },
   {
     id: 'dynamic_mcp',

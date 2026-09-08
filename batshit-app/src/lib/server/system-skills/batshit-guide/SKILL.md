@@ -59,6 +59,7 @@ Load only what the question needs. Names are `references/<file>`.
 
 **Agents**
 - `primary-agents-overview.md` — the two Primary Agent types (API and CLI) and how to choose.
+- `primary-agents-agent-dms-and-wake-ups.md` — Agent DMs between primary agents, wake-ups (chats Batshit starts on its own), the inbox drawer, and wake-up webhooks.
 - `primary-agents-connect-n8n.md` — connecting n8n workflow tools and Workflow Subagents.
 - `subagents-overview.md` — the three Subagent lanes and when delegation helps.
 - `groups-overview.md` — Group Chat: multi-agent sessions with a single-speaker queue.

@@ -903,6 +903,9 @@ async function runApiSubagent(
       // SA-104 P3: memory tools are PA-only in v1 — subagent memory access is a deferred
       // product decision and memory is PA-owned agent-scoped state (see story Out of Scope).
       memoryControlsEnabled: false,
+      // SA-113 P2 (DL-113-11): subagents and Workers never see `sys.dm.*`. A DM is
+      // addressed to an agent; a delegated run has no inbox and no identity of its own.
+      dmControlsEnabled: false,
       abortSignal: params.abortSignal,
     })
   } catch (error) {

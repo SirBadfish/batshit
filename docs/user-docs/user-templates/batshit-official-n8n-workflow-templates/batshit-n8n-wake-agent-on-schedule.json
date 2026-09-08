@@ -1,0 +1,117 @@
+{
+  "id": "batshitWakeAgentOnSchedule",
+  "name": "Batshit - Wake an Agent on a Schedule",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "7f2c1a90-1d4e-4a3b-9c21-0a5b6d7e8f01",
+      "name": "Every Day at 9am"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b1c2d3e4-0001-4a11-9f01-aaaaaaaaaaaa",
+              "name": "batshit_base_url",
+              "value": "={{ $env.BATSHIT_FRONTEND_URL || 'http://127.0.0.1:5620' }}",
+              "type": "string"
+            },
+            {
+              "id": "b1c2d3e4-0002-4a11-9f01-bbbbbbbbbbbb",
+              "name": "wake_hook_id",
+              "value": "PASTE_YOUR_WAKE_HOOK_ID_HERE",
+              "type": "string"
+            },
+            {
+              "id": "b1c2d3e4-0003-4a11-9f01-cccccccccccc",
+              "name": "message",
+              "value": "Good morning. Check my open DMs and tell me what needs attention today.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "id": "7f2c1a90-2d4e-4a3b-9c21-0a5b6d7e8f02",
+      "name": "Configure"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.batshit_base_url.replace(/\\/$/, '') + '/api/wake/' + $json.wake_hook_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  message: $json.message,\n  kind: 'info',\n  deliver: 'wake'\n} }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        440,
+        0
+      ],
+      "id": "7f2c1a90-3d4e-4a3b-9c21-0a5b6d7e8f03",
+      "name": "Wake the Batshit Agent"
+    }
+  ],
+  "connections": {
+    "Every Day at 9am": {
+      "main": [
+        [
+          {
+            "node": "Configure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configure": {
+      "main": [
+        [
+          {
+            "node": "Wake the Batshit Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  }
+}

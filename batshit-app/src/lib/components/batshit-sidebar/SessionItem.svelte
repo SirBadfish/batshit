@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Archive, LoaderCircle } from '@lucide/svelte';
+	import { Archive, LoaderCircle, Mail, Webhook } from '@lucide/svelte';
 	import * as Sidebar from '$lib/components/ui/sidebar';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import SessionAvatar from '$lib/components/batshit-sidebar/SessionAvatar.svelte';
@@ -24,6 +24,11 @@
 	import type { ChatSession } from '$lib/stores/session.svelte';
 	import { SessionService } from '$lib/services/sessions';
 	import { isFixedSession } from '$lib/utils/fixedSession';
+	import {
+		describeSessionOrigin,
+		resolveSessionOrigin,
+		sessionOriginPillLabel
+	} from '$lib/utils/sessionOrigin';
 	
 	interface Props {
 		session: ChatSession;
@@ -107,6 +112,10 @@
 	let checkingMessageState = $state(false);
 	let lockUpdatePending = $state(false);
 	const isIdEditingDisabled = $derived(Boolean(isSessionLocked || hasSessionMessages))
+
+	// SA-113 P1 (DL-113-08): what started this chat. Null for every chat the user typed,
+	// so an ordinary session renders exactly as before.
+	const sessionOrigin = $derived(resolveSessionOrigin(session))
 
 	// SA-104 P5: Infinite Session state + the one-way transition flow.
 	const isSessionFixed = $derived(isFixedSession(session))
@@ -477,6 +486,19 @@
 		flex-shrink: 0;
 	}
 
+	/* SA-113 P1 (DL-113-08): icon-only origin pill, same shell as the Group/Infinite pills. */
+	.session-item-origin-badge {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0.125rem 0.25rem;
+	}
+
+	:global(.session-item-origin-icon) {
+		width: 0.6875rem;
+		height: 0.6875rem;
+	}
+
 	.session-item-group-badge {
 		margin-left: 0.5rem;
 		padding: 0.125rem 0.375rem;
@@ -540,6 +562,21 @@
 				{#if isSessionFixed}
 					<span class="session-item-group-badge session-item-fixed-badge" title="Infinite Session: one agent, one ongoing conversation">
 						Infinite
+					</span>
+				{/if}
+				{#if sessionOrigin}
+					<span
+						class="session-item-group-badge session-item-origin-badge"
+						title={describeSessionOrigin(sessionOrigin)}
+						aria-label={describeSessionOrigin(sessionOrigin)}
+						data-testid={`session-origin-${sessionOrigin.kind}-${session.id}`}
+					>
+						{#if sessionOrigin.kind === 'dm'}
+							<Mail class="session-item-origin-icon" aria-hidden="true" />
+						{:else}
+							<Webhook class="session-item-origin-icon" aria-hidden="true" />
+						{/if}
+						<span class="sr-only">{sessionOriginPillLabel(sessionOrigin)}</span>
 					</span>
 				{/if}
 				{#if sessionRunLabel}

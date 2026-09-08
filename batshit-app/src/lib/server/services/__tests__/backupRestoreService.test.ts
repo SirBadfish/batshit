@@ -555,6 +555,58 @@ async function seedRepresentativeData(userId: string) {
     last_rebuilt_at: '2026-08-25T00:00:00.000Z',
     schema_version: 1
   })
+
+  // SA-113 P2 (DL-113-02): one Agent DM and all three of its indexes, so the `dms` backup
+  // group is exercised through the real export/restore path rather than asserted in
+  // isolation. A key family that is not registered in all four places silently vanishes.
+  await redis.json.set('dm:dm_1', '$', {
+    id: 'dm_1',
+    messageId: 'dm_1',
+    userId: 'source',
+    kind: 'assignment',
+    priority: 'normal',
+    from: { kind: 'agent', agentId: 'agent_2', name: 'Faye' },
+    to: 'agent_1',
+    subject: 'Verify the package',
+    body: 'Run the audit and report what it says.',
+    requestedOutcome: 'Pass or fail.',
+    scope: 'Mac app only.',
+    reportBackTo: 'agent_2',
+    deliver: 'wait',
+    status: 'new',
+    createdAt: '2026-09-07T09:00:00.000Z',
+    createdTs: Date.parse('2026-09-07T09:00:00.000Z'),
+    expiresAt: '2026-09-21T09:00:00.000Z',
+    delivery: { requested: 'wait', actual: 'wait' }
+  })
+  await redis.execute(async (client) => {
+    await client.zAdd('dm_inbox:agent_1', { score: 1e15, value: 'dm_1' })
+    await client.zAdd('dm_sent:agent_2', { score: 1e15, value: 'dm_1' })
+    await client.zAdd('dm_index:source', { score: 1, value: 'dm_1' })
+  })
+
+  // SA-113 P3 (DL-113-09): one wake-up webhook and its index, in the same `dms` group. A
+  // hook that did not survive a restore would leave an n8n workflow calling a URL that no
+  // longer exists, with nothing in the UI to say why.
+  await redis.json.set('wake_hook:whk_1', '$', {
+    id: 'whk_1',
+    userId: 'source',
+    agentId: 'agent_1',
+    name: 'Nightly build',
+    tokenHash: 'a'.repeat(64),
+    tokenPrefix: 'bswh_abcdefg',
+    tokenSuffix: 'zyxwvu',
+    deliverDefault: 'wake',
+    enabled: true,
+    createdAt: '2026-09-07T09:00:00.000Z',
+    updatedAt: '2026-09-07T09:00:00.000Z',
+    lastUsedAt: null,
+    useCount: 0,
+    expiresAt: null
+  })
+  await redis.execute(async (client) => {
+    await client.sAdd('wake_hooks:source', 'whk_1')
+  })
 }
 
 describe('backupRestoreService', () => {
@@ -811,6 +863,41 @@ describe('backupRestoreService', () => {
     expect(restoredDream.user_id).toBe('target')
     expect(restoredDream.actions[0].why).toContain('demoted')
     expect(await redis.lRange('memdream_index:agent_1', 0, -1)).toEqual(['dream_1'])
+
+    // SA-113 P2: the `dms` group — record plus all three indexes.
+    const restoredDm = (await redis.json.get('dm:dm_1')) as Record<string, any>
+    expect(restoredDm).toMatchObject({
+      to: 'agent_1',
+      kind: 'assignment',
+      subject: 'Verify the package',
+      status: 'new'
+    })
+    expect(restoredDm.userId).toBe('target')
+    const restoredIndexes = await redis.execute(async (client) => ({
+      inbox: await client.zRange('dm_inbox:agent_1', 0, -1),
+      sent: await client.zRange('dm_sent:agent_2', 0, -1),
+      all: await client.zRange('dm_index:target', 0, -1)
+    }))
+    expect(restoredIndexes.inbox).toEqual(['dm_1'])
+    expect(restoredIndexes.sent).toEqual(['dm_1'])
+    expect(restoredIndexes.all).toEqual(['dm_1'])
+
+    // SA-113 P3: the wake-up webhook travels with it, remapped to the target user, with its
+    // token fingerprint intact so the existing token still works after a restore.
+    const restoredHook = (await redis.json.get('wake_hook:whk_1')) as Record<string, any>
+    expect(restoredHook).toMatchObject({
+      id: 'whk_1',
+      agentId: 'agent_1',
+      name: 'Nightly build',
+      deliverDefault: 'wake',
+      enabled: true
+    })
+    expect(restoredHook.userId).toBe('target')
+    expect(restoredHook.tokenHash).toBe('a'.repeat(64))
+    const restoredHookIndex = await redis.execute(async (client) =>
+      client.sMembers('wake_hooks:target')
+    )
+    expect(restoredHookIndex).toEqual(['whk_1'])
   })
 
   it('preflights and restores a disk-staged archive without buffering upload assets', async () => {
