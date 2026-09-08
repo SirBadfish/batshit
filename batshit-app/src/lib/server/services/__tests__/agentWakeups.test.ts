@@ -214,7 +214,7 @@ describe('refusals, in the locked order (DL-113-05)', () => {
       expect(result).toMatchObject({ ok: false, degraded: 'wait', code: 'agent_busy' })
       if (!result.ok) expect(result.reason).toContain('mid-task')
     } finally {
-      clearSessionTurn('sess-busy')
+      clearSessionTurn('sess-busy', 'msg-1')
     }
   })
 
@@ -396,7 +396,7 @@ describe('working style (DL-113-15)', () => {
       const result = await requestAgentWakeup(baseInput({ target: { kind: 'auto' } }))
       expect(result).toMatchObject({ ok: false, degraded: 'wait', code: 'agent_busy' })
     } finally {
-      clearSessionTurn('sess-current')
+      clearSessionTurn('sess-current', 'msg-1')
     }
   })
 })

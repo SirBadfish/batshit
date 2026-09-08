@@ -635,7 +635,11 @@ describe.runIf(memorySearchLaneActive())('SA-104 P7 dreaming', () => {
       expect(skips[0].why).toContain('live turn')
       expect((await getEpisode(FIXED_SESSION, 'ep_live'))?.state).toBe('closed')
     } finally {
-      clearSessionTurn(FIXED_SESSION)
+      // An OWNED release. `clearSessionTurn` without the id no longer deletes a young
+      // owned lock (SA-113 review fix: an id-less release used to let a stale Stop cancel
+      // a live turn), so leaving it unowned kept this lock alive into the next test, where
+      // dreaming then skipped FIXED_SESSION as "live" and distilled nothing.
+      clearSessionTurn(FIXED_SESSION, 'msg_live')
     }
   })
 

@@ -477,7 +477,7 @@ describe('presence (DL-113-16)', () => {
       expect(cooper?.running_session_id).toBe('sess-cooper-live')
       expect(cooper?.running_since).toBeTruthy()
     } finally {
-      clearSessionTurn('sess-cooper-live')
+      clearSessionTurn('sess-cooper-live', 'msg-1')
     }
   })
 
@@ -546,7 +546,7 @@ describe('presence (DL-113-16)', () => {
       })
       expect(result.recipient_state).toBe('running')
     } finally {
-      clearSessionTurn('sess-cooper-live')
+      clearSessionTurn('sess-cooper-live', 'msg-1')
     }
   })
 })
