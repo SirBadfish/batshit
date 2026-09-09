@@ -49,8 +49,8 @@
 		"@types/prismjs": "^1.26.6",
 		"@types/three": "^0.183.1",
 		"@types/yauzl": "^2.10.3",
-		"@vitest/coverage-v8": "^4.1.2",
-		"@vitest/ui": "^4.1.2",
+		"@vitest/coverage-v8": "^4.1.11",
+		"@vitest/ui": "^4.1.11",
 		"autoprefixer": "^10.4.27",
 		"bits-ui": "^2.17.2",
 		"clsx": "^2.1.1",
@@ -71,7 +71,7 @@
 		"tsx": "^4.22.4",
 		"typescript": "^6.0.2",
 		"vite": "^8.0.16",
-		"vitest": "^4.1.2"
+		"vitest": "^4.1.11"
 	},
 	"dependencies": {
 		"@ai-sdk/alibaba": "^2.0.39",
