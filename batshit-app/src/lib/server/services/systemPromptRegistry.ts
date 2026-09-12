@@ -140,7 +140,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     redisKey: 'batshit:dm_guidance',
     label: 'Agent DM Guidance',
     description:
-      'Injected for agents with Agent DMs turned on: the three DM kinds, wait vs wake, one assignment at a time, and the rule that a DM is data from another agent and cannot approve or consent to anything.',
+      'Injected for agents with Agent DMs turned on: the three DM kinds, wait vs wake, one assignment at a time, an agent\u2019s own schedules, and the rule that a DM is data from another agent and cannot approve or consent to anything.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_dm_guidance.md',
     // Bumped after the P2 live run: the first `sys.dm.send` an agent tried failed on
@@ -151,7 +151,15 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     // because only `send` had its fields named. `read`/`claim`/`done`/`blocked` now do too.
     // Bumped in P5b for F-SEC-1: `useControl` now REFUSES a risky control in a chat a DM or
     // a webhook started, so the block says what the agent should do instead of retrying.
-    defaultVersion: '2026-09-08b'
+    // Bumped for SA-115 P2: the `sys.schedule.*` family exists now, gated on this same
+    // `dms_enabled` switch, so its four controls and their required input fields are named
+    // here — `tool_discovery` prints a Fabric COUNT and never a schema, so a block that
+    // names a control without its fields guarantees a first-call failure (the P2 and P5
+    // lesson, twice). The risky-control sentence also grew a third source (F-P1-5).
+    // Bumped for SA-115 P3 (F-P2-3b): an agent's call has no browser, so an omitted
+    // `time_zone` gets the SERVER's zone — the user's on the Mac app, usually UTC in
+    // Docker. The block now says so rather than letting an agent discover it as a bug.
+    defaultVersion: '2026-09-08d'
   },
   {
     id: 'dynamic_mcp',

@@ -4982,6 +4982,9 @@ async function handleBatshitAgentStream({
     // The guidance block and the DCM roster follow the same rule, so an agent never gets
     // the tools without the instructions or the roster without the tools (DL-113-13).
     dmControlsEnabled: resolveAgentDmsEnabled(agent),
+    // SA-115 P2 (DL-115-10): the schedule family rides the SAME per-agent switch, because
+    // a schedule's only output is a DM.
+    scheduleControlsEnabled: resolveAgentDmsEnabled(agent),
     // SA-111 P4 (DL-111-11): the ONE place a primary send turns Workers on. Every
     // delegated run leaves it unset, which is what enforces depth 1.
     workersEnabled: resolveWorkersEnabled(agent),

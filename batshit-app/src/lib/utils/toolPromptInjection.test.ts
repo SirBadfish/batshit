@@ -449,6 +449,26 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       // wording has to say what the agent should do instead of retrying, and it must say
       // that nothing is cancelled — the woken chat waits for a reply IN that chat.
       expect(prompt).toContain('refuses risky controls until the user replies in that chat')
+      // SA-115 F-P1-5: a schedule is the third thing that can start a chat, so the
+      // risky-control sentence has to name it or an agent woken by one has no rule to read.
+      expect(prompt).toContain('a DM, a webhook, or a schedule started')
+
+      // SA-115 P2 (DL-115-10): every `sys.schedule.*` control AND its required fields.
+      // `tool_discovery` prints a Fabric COUNT and never a schema, so a control named here
+      // without its input shape is a guaranteed failed first call — the P2 and P5 lesson.
+      expect(prompt).toContain('`sys.schedule.list` takes no input')
+      // F-P2-3b: an agent's call has no browser, so an omitted `time_zone` gets the
+      // SERVER's — the user's on the Mac app, usually UTC in Docker. Pinned on BOTH
+      // surfaces so the packaged default and the code fallback cannot drift apart.
+      expect(prompt).toContain('name it when you know it')
+      expect(prompt).toContain('`sys.schedule.create` takes `name`, `cadence`, and `message`')
+      expect(prompt).toContain('`sys.schedule.update` takes `schedule_id`')
+      expect(prompt).toContain('`sys.schedule.delete` takes `schedule_id`')
+      expect(prompt).toContain('every_minutes')
+      expect(prompt).toContain('0 is Sunday')
+      // The two rules an agent must not have to discover the hard way.
+      expect(prompt).toContain('You can only schedule **yourself**')
+      expect(prompt).toContain('does not fire and does not queue')
       expect(prompt).toContain('leave the item open')
       expect(prompt).toContain('nothing is cancelled')
     }
@@ -463,9 +483,19 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     // is not told what to do when it hits that refusal will retry with `allowRisky` in a
     // loop. Forty-one words to prevent that is a good trade. The guard still catches the
     // thing it was built for.
+    //
+    // Raised from 370 to 560 in SA-115 P2, deliberately and once. This block now documents
+    // TWO control families rather than one: `sys.schedule.*` is gated on the same
+    // `dms_enabled` switch, so it ships in the same block or not at all. Its four controls
+    // and their required fields cost what they cost — `tool_discovery` prints a Fabric
+    // COUNT and never a schema, so a family named without its input shape guarantees a
+    // failed first call, which is the exact mistake P2 and P5 each paid for once. The
+    // cadence shapes are spelled out for the same reason: three JSON examples are cheaper
+    // than three round trips. The guard still does its job; it is now sized for the block
+    // that exists rather than the block that existed.
     for (const prompt of [readPackaged('batshit_dm_guidance.md'), buildDmGuidancePromptBlock()]) {
       const words = prompt.trim().split(/\s+/).length
-      expect(words).toBeLessThan(370)
+      expect(words).toBeLessThan(560)
     }
   })
 

@@ -157,6 +157,8 @@ interface DynamicMcpIndexOptions {
   memoryControlsEnabled?: boolean
   /** SA-113 P2 (DL-113-03): explicit value wins; subagent scopes pass false. */
   dmControlsEnabled?: boolean
+  /** SA-115 P2 (DL-115-10): explicit value wins; subagent scopes pass false. */
+  scheduleControlsEnabled?: boolean
 }
 
 interface WorkingGroup extends DynamicMcpIndexGroup {
@@ -588,6 +590,12 @@ export async function buildDynamicMcpIndex(
   const allowFabricControlTools = options.allowFabricControlTools !== false
   const memoryControlsEnabled = await resolveIndexMemoryControlsEnabled(options)
   const dmControlsEnabled = await resolveIndexDmControlsEnabled(options)
+  // SA-115 P2: schedules ride the same per-agent switch as DMs, so they resolve from it
+  // rather than adding a second read of the same agent record.
+  const scheduleControlsEnabled =
+    typeof options.scheduleControlsEnabled === 'boolean'
+      ? options.scheduleControlsEnabled
+      : dmControlsEnabled
   const brokerFamilies = resolveBrokerFamilies({
     runtime: brokerRuntime,
     toggles: brokerToggles,
@@ -595,7 +603,8 @@ export async function buildDynamicMcpIndex(
     allowArtifactRuntimeTools: options.allowArtifactRuntimeTools,
     allowFabricControlTools: options.allowFabricControlTools,
     memoryControlsEnabled,
-    dmControlsEnabled
+    dmControlsEnabled,
+    scheduleControlsEnabled
   })
   const fabricReachable = brokerFamilies.includes('fabric')
   const artifactReachable = brokerFamilies.includes('artifact')
@@ -801,7 +810,8 @@ export async function buildDynamicMcpIndex(
         toggles: brokerToggles,
         allowFabricControlTools: options.allowFabricControlTools,
         memoryControlsEnabled,
-        dmControlsEnabled
+        dmControlsEnabled,
+        scheduleControlsEnabled
       })
     : []
   const fabricControls = fabricReachable

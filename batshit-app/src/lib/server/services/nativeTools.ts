@@ -208,6 +208,8 @@ export interface NativeToolContext {
   memoryControlsEnabled?: boolean
   /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. Default false. */
   dmControlsEnabled?: boolean
+  /** SA-115 P2 (DL-115-10): PRIMARY actor + agent `dms_enabled`. Default false. */
+  scheduleControlsEnabled?: boolean
   projectPath?: string | null
   providerSettings?: Record<string, any> | null
   toolApprovalMode?: ToolApprovalMode
@@ -9597,7 +9599,11 @@ function resolveNativeAutomationToggleState(
 function resolveBatshitToolBrokerFamiliesForAutomation(
   settings: ResolvedNativeToolSettings,
   context: NativeAutomationDispatchContext,
-  options?: { memoryControlsEnabled?: boolean; dmControlsEnabled?: boolean }
+  options?: {
+    memoryControlsEnabled?: boolean
+    dmControlsEnabled?: boolean
+    scheduleControlsEnabled?: boolean
+  }
 ): BatshitToolFamily[] {
   const families: BatshitToolFamily[] = []
   if (settings.dynamicMcpEnabled) families.push('mcp')
@@ -9628,6 +9634,14 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
     settings.batshitToolsEnabled &&
     context.actor_type === 'primary' &&
     options?.dmControlsEnabled === true
+  ) {
+    if (!families.includes('fabric')) families.push('fabric')
+  }
+  // SA-115 P2: the schedule family opens `fabric` under the same conditions.
+  if (
+    settings.batshitToolsEnabled &&
+    context.actor_type === 'primary' &&
+    options?.scheduleControlsEnabled === true
   ) {
     if (!families.includes('fabric')) families.push('fabric')
   }
@@ -10470,9 +10484,12 @@ export async function dispatchNativeAutomationPackAction(input: {
     // SA-113 P2: the Agent DM family, gated the same way — PRIMARY actors only, per-agent.
     const brokerDmControlsEnabled =
       context.actor_type === 'primary' && resolveAgentDmsEnabled(agentRecord)
+    // SA-115 P2: the schedule family, on the same per-agent switch as DMs.
+    const brokerScheduleControlsEnabled = brokerDmControlsEnabled
     const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context, {
       memoryControlsEnabled: brokerMemoryControlsEnabled,
-      dmControlsEnabled: brokerDmControlsEnabled
+      dmControlsEnabled: brokerDmControlsEnabled,
+      scheduleControlsEnabled: brokerScheduleControlsEnabled
     })
     // SA-096 P4: same source as mode 3 registration and the DCM capability index's Fabric
     // count. This lane keeps its own actor/mode conditions, expressed as the two flags.
@@ -10491,7 +10508,8 @@ export async function dispatchNativeAutomationPackAction(input: {
           context.actor_type === 'primary' &&
           (context.mode === 'mode3' || context.mode === 'mode4'),
         memoryControlsEnabled: brokerMemoryControlsEnabled,
-        dmControlsEnabled: brokerDmControlsEnabled
+        dmControlsEnabled: brokerDmControlsEnabled,
+        scheduleControlsEnabled: brokerScheduleControlsEnabled
       })
     )
     const brokerSelectedGateways =
@@ -11816,6 +11834,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const memoryControlsEnabled = context.memoryControlsEnabled === true
   // SA-113 P2: same shape for the Agent DM family.
   const dmControlsEnabled = context.dmControlsEnabled === true
+  // SA-115 P2: and the schedule family, on the same per-agent switch.
+  const scheduleControlsEnabled = context.scheduleControlsEnabled === true
 
   // SA-096: shared with the compile path's broker-guidance gate so registered tools and
   // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
@@ -11827,7 +11847,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     allowArtifactRuntimeTools,
     allowFabricControlTools,
     memoryControlsEnabled,
-    dmControlsEnabled
+    dmControlsEnabled,
+    scheduleControlsEnabled
   })
   // SA-096 P4: same source as the DCM capability index's Fabric count.
   const apiBrokerFabricAllowedControlIds = new Set<string>(
@@ -11835,7 +11856,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       toggles: brokerToggles,
       allowFabricControlTools,
       memoryControlsEnabled,
-      dmControlsEnabled
+      dmControlsEnabled,
+      scheduleControlsEnabled
     })
   )
 

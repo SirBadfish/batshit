@@ -12,6 +12,7 @@
   import GoonDock from '$lib/components/goons/GoonDock.svelte'
   import ExecutionViewerSheet from '$lib/components/chat/ExecutionViewerSheet.svelte'
   import DmInboxDrawer from '$lib/components/chat/DmInboxDrawer.svelte'
+  import MissedSchedulesDialog from '$lib/components/schedules/MissedSchedulesDialog.svelte'
   import DmInboxIndicator from '$lib/components/chat/DmInboxIndicator.svelte'
   import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
   import HeaderBarIcons from '$lib/components/artifacts/HeaderBarIcons.svelte'
@@ -21,7 +22,7 @@
   import FirstRunSetupWizard from '$lib/components/onboarding/FirstRunSetupWizard.svelte'
   import { Button } from '$lib/components/ui/button'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
-  import { ChevronRight, Mail, Webhook } from '@lucide/svelte'
+  import { ChevronRight, Sparkles } from '@lucide/svelte'
   import { useSidebar } from '$lib/components/ui/sidebar/context.svelte'
   import * as messageStore from '$lib/stores/messages.svelte'
   import type { Message } from '$lib/stores/messages.svelte'
@@ -171,6 +172,7 @@
   import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
   import { isFixedSession } from '$lib/utils/fixedSession'
   import { describeSessionOrigin, resolveSessionOrigin } from '$lib/utils/sessionOrigin'
+  import { sessionOriginIcon } from '$lib/utils/sessionOriginIcons'
   import { onUserChannelEvent } from '$lib/services/userChannel'
   import { buildSessionMessagesForSend } from '$lib/utils/sessionSendMessages'
   import {
@@ -785,6 +787,11 @@ const currentSessionFixed = $derived(isFixedSession(currentSession))
 // SA-113 P1 (DL-113-08): null for every chat the user started, so the banner never
 // renders for an ordinary session.
 const currentSessionOrigin = $derived(resolveSessionOrigin(currentSession))
+// DL-115-09: keyed by kind, with a neutral fallback. The binary if/else this replaced
+// would have labelled every schedule-started chat with a webhook icon.
+const ChatOriginIcon = $derived(
+  currentSessionOrigin ? sessionOriginIcon(currentSessionOrigin) : Sparkles
+)
 const currentMemoryWindow = $derived.by(() => {
   if (!currentSessionFixed) return null
   const agent = agentStore.getCurrentAgent()
@@ -6988,11 +6995,7 @@ const immersiveActive = $derived.by(
       <!-- SA-113 P1 (DL-113-08): one line saying a wake-up started this chat, not the user. -->
       {#if currentSessionOrigin}
         <div class="chat-origin-banner" data-testid="chat-origin-banner">
-          {#if currentSessionOrigin.kind === 'dm'}
-            <Mail class="chat-origin-banner-icon" aria-hidden="true" />
-          {:else}
-            <Webhook class="chat-origin-banner-icon" aria-hidden="true" />
-          {/if}
+          <ChatOriginIcon class="chat-origin-banner-icon" aria-hidden="true" />
           <span>{describeSessionOrigin(currentSessionOrigin)}</span>
           <!-- P4: the banner is where a user first wonders "what DM was that?", so it is
                also the shortest way into the drawer. Offered only when the agent has Agent
@@ -7295,6 +7298,10 @@ const immersiveActive = $derived.by(
 <ExecutionViewerSheet bind:open={executionViewerOpen} sessionId={currentSessionId ?? undefined} />
 
 <DmInboxDrawer bind:open={dmDrawerOpen} currentAgentId={agentStore.getCurrentAgentId()} />
+
+<!-- SA-115 P2 (DL-115-07): the ONLY place a missed run can start. It owns its own open
+     state because it opens on a live event and on load, not from a button anywhere. -->
+<MissedSchedulesDialog />
 
 <!-- Header Overlay for header/trigger widgets -->
 <HeaderOverlay bind:open={headerOverlayOpen} bind:artifact={headerOverlayArtifact} />

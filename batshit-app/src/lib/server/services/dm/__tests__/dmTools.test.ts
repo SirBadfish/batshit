@@ -18,9 +18,11 @@ import {
   reopenDm,
   stampDmNeedsUser
 } from '../dmStore'
+import { createSchedule } from '$lib/server/services/schedules/scheduleStore'
 import {
   buildWokenDmContent,
   claimDmOp,
+  deliverScheduledDm,
   closeDmOp,
   listDmAgentsOp,
   listDmsOp,
@@ -1030,5 +1032,129 @@ describe('an expired unclaimed assignment reports back', () => {
         (item) => item.kind === 'result' && item.relatedDmId === dmId
       )
     ).toHaveLength(1)
+  })
+})
+
+describe('scheduled wake-ups (SA-115, DL-115-05)', () => {
+  async function seedSchedule(overrides: Record<string, any> = {}) {
+    return createSchedule({
+      userId: USER,
+      agentId: COOPER,
+      name: 'Morning check',
+      cadence: { type: 'daily', at: '09:00' },
+      timeZone: 'America/Chicago',
+      message: 'Say good morning.',
+      ...overrides
+    })
+  }
+
+  it('writes a DM FROM the schedule and wakes the agent with a schedule origin', async () => {
+    const schedule = await seedSchedule()
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    expect(result.deliveredAs).toBe('wake')
+    expect(result.outcome).toBe(`woke: ${result.sessionId}`)
+
+    const dm = await getDm(result.dmId)
+    expect(dm?.from).toEqual({ kind: 'schedule', scheduleId: schedule.id, name: 'Morning check' })
+    expect(dm?.subject).toBe('Morning check')
+    expect(dm?.body).toBe('Say good morning.')
+    expect(dm?.delivery).toMatchObject({ requested: 'wake', actual: 'wake', sessionId: result.sessionId })
+
+    // A clock starts a chain; it never continues one. Depth 0 in means depth 1 on the
+    // woken turn, exactly as a webhook produces.
+    const session = await redis.getSession(result.sessionId as string)
+    expect((session?.metadata as any)?.origin).toMatchObject({
+      kind: 'schedule',
+      label: 'Morning check',
+      scheduleId: schedule.id,
+      dmId: result.dmId,
+      chainDepth: 1
+    })
+    expect(session?.name).toBe('Schedule: Morning check')
+
+    const messages = await redis.getMessages(result.sessionId as string, 10)
+    expect(messages[0].content).toContain('[Schedule "Morning check" — not from the user]')
+    expect(messages[0].content).toContain(`DM id: ${result.dmId}`)
+    expect((messages[0].metadata as any)?.wake?.chainDepth).toBe(1)
+  })
+
+  it('leaves a `wait` schedule in the inbox and never starts a turn', async () => {
+    const schedule = await seedSchedule({ deliver: 'wait' })
+    const before = fetchCalls.length
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    expect(result.deliveredAs).toBe('wait')
+    expect(result.outcome).toBe('waiting in inbox')
+    expect(result.sessionId).toBeUndefined()
+    expect(fetchCalls.length).toBe(before)
+    expect((await listInbox(COOPER)).map((item) => item.id)).toContain(result.dmId)
+  })
+
+  it('degrades to wait with the reason on the DM and in the outcome', async () => {
+    const schedule = await seedSchedule()
+    await redis.updateAgent(COOPER, { wake_enabled: false } as any)
+
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+    expect(result.deliveredAs).toBe('wait')
+    expect(result.outcome).toMatch(/^waited: /)
+    expect(result.outcome).toMatch(/May be woken/i)
+    expect((await getDm(result.dmId))?.delivery).toMatchObject({
+      requested: 'wake',
+      actual: 'wait'
+    })
+    // Nothing is dropped: the DM is still there for the agent's next turn.
+    expect(await listInbox(COOPER)).toHaveLength(1)
+  })
+
+  it('an assignment gets stated defaults and NO report-back, because a clock has no inbox', async () => {
+    const schedule = await seedSchedule({ kind: 'assignment', deliver: 'wait' })
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    const dm = await getDm(result.dmId)
+    expect(dm?.kind).toBe('assignment')
+    expect(dm?.requestedOutcome).toBeTruthy()
+    expect(dm?.scope).toBeTruthy()
+    expect(dm?.reportBackTo).toBeUndefined()
+  })
+
+  it('says when a LATE run was due, and stays quiet when it is on time', async () => {
+    const schedule = await seedSchedule({ deliver: 'wait' })
+    const dueAt = new Date('2026-09-08T14:00:00.000Z')
+
+    const late = await deliverScheduledDm(schedule, {
+      trigger: 'tick',
+      dueAt,
+      now: new Date(dueAt.getTime() + 4 * 60_000)
+    })
+    expect((await getDm(late.dmId))?.body).toContain(
+      '(This run was due Tue, Sep 8, 9:00 AM CDT and is running late.)'
+    )
+
+    // The on-time body has no note, which also makes it a different body — so the DM
+    // store's ten-minute duplicate guard does not swallow the second send.
+    const onTime = await deliverScheduledDm(schedule, {
+      trigger: 'tick',
+      dueAt,
+      now: new Date(dueAt.getTime() + 5_000)
+    })
+    expect((await getDm(onTime.dmId))?.body).toBe('Say good morning.')
+  })
+
+  it('refuses a recipient that is gone, not a primary, or has Agent DMs off', async () => {
+    const schedule = await seedSchedule()
+
+    await redis.updateAgent(COOPER, { dms_enabled: false } as any)
+    await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(/Agent DMs/i)
+
+    await redis.updateAgent(COOPER, { dms_enabled: true, agentType: 'n8n' } as any)
+    await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
+      /API or CLI primary/i
+    )
+
+    await redis.del(`agent:${COOPER}`)
+    await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
+      /no longer exists/i
+    )
   })
 })

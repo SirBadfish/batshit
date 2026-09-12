@@ -906,6 +906,9 @@ async function runApiSubagent(
       // SA-113 P2 (DL-113-11): subagents and Workers never see `sys.dm.*`. A DM is
       // addressed to an agent; a delegated run has no inbox and no identity of its own.
       dmControlsEnabled: false,
+      // SA-115 P2 (DL-115-10): and never `sys.schedule.*`. A delegated run is over in a
+      // moment; it has no business creating something that outlives it and keeps spending.
+      scheduleControlsEnabled: false,
       abortSignal: params.abortSignal,
     })
   } catch (error) {

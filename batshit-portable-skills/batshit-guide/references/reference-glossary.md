@@ -228,6 +228,10 @@ Batshit's per-agent memory system: Awareness (what the agent knows right now, in
 
 A saved provider/model configuration Batshit can reuse for agents, Artifacts, or other model-powered features.
 
+### Missed run
+
+A [Schedule](#schedule) whose time came and went while Batshit was closed or asleep for more than ten minutes. It never fires on its own. Batshit collects it — at most one entry per schedule, however many times it was missed — and asks you once, in the *Missed while Batshit was off* dialog, with **Run now** or **Skip** per item. Skip skips that one run; the schedule stays on.
+
 ### Mood
 
 A persistent Goon expression or motion state that stays active until changed.
@@ -281,6 +285,10 @@ An optional service Batshit can connect to, start through an approved operator, 
 ### Sandbox
 
 An isolated execution environment. In Batshit docs, this usually means Apple Container for Mac app command execution and Docker Sandbox for Docker or cross-platform command execution.
+
+### Schedule
+
+A saved *when* and *what* for one Primary Agent, inside Batshit — "every day at 9am, tell Cooper to check the build". Batshit's own clock checks every 60 seconds and writes a DM when a schedule is due, starting a chat for the agent if you chose that. Three cadences: every N minutes or hours, daily at a time, or on chosen weekdays at a time, each in its own time zone. Managed in Admin → Instance-wide defaults → Agent Wake-ups → Schedules. For a trigger that lives *outside* Batshit, use a [Wake-up webhook](#wake-up-webhook) instead. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 
 ### Schema Hints
 
@@ -350,11 +358,11 @@ VRM Animation, a reusable animation format for Goons.
 
 ### Wake-up
 
-A chat turn Batshit starts with nobody typing, because an Agent DM asked for the work to start now or a wake-up webhook was called. The chat appears in the sidebar with an icon saying what started it, costs tokens like any chat, and has the normal Stop button. A wake-up that cannot run becomes a **wait**, with the reason recorded.
+A chat turn Batshit starts with nobody typing, because an Agent DM asked for the work to start now, a **schedule** came due, or a wake-up webhook was called. The chat appears in the sidebar with an icon saying what started it, costs tokens like any chat, and has the normal Stop button. A wake-up that cannot run becomes a **wait**, with the reason recorded.
 
 ### Wake-up webhook
 
-One URL plus one token that lets anything outside Batshit — n8n, a schedule, a CI job — start a chat for one named agent. The token is shown once at creation; Batshit stores only a fingerprint. Managed in Admin → Instance-wide defaults → Agent Wake-ups.
+One URL plus one token that lets anything outside Batshit — n8n, a Slack bridge, a CI job — start a chat for one named agent. For a trigger that is just *time*, use a [Schedule](#schedule) instead; Batshit has its own clock. The token is shown once at creation; Batshit stores only a fingerprint. Managed in Admin → Instance-wide defaults → Agent Wake-ups.
 
 ### Webhook
 

@@ -40,6 +40,26 @@ export type UserChannelEvent =
       /** F-SEC-1b: open items whose woken turn is stopped waiting on the user. */
       needsUserCount: number
     }
+  /**
+   * SA-115 (DL-115-07) — schedules that were due while Batshit was off.
+   *
+   * Nothing fired. This is the signal that opens the *Missed while Batshit was off*
+   * dialog, which is the ONLY place a missed run can be started. Handled by that dialog
+   * (P2) rather than by `applyToStores`, because it is a question for the user, not a
+   * change to the sidebar's state.
+   */
+  | {
+      type: 'schedule_missed'
+      schedules: {
+        scheduleId: string
+        name: string
+        agentId: string
+        timeZone: string
+        dueAt: string
+        count: number
+        nextRunAt: string
+      }[]
+    }
   | (Record<string, any> & { type: string })
 
 type Listener = (event: UserChannelEvent) => void

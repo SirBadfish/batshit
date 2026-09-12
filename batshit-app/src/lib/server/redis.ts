@@ -1298,6 +1298,14 @@ export class RedisService {
     // the hook index.
     const { sweepAgentWakeHooks } = await import('$lib/server/services/dm/wakeHookStore')
     await sweepAgentWakeHooks(id)
+    // SA-115 P3 (DL-115-12): a schedule pointing at a deleted agent is a clock that can
+    // only ever fail its recipient check every minute, so it goes with the agent. Same
+    // BEFORE-the-record-delete reason as the two sweeps above: it reads `agent.user_id`
+    // to find the schedule index.
+    const { sweepAgentSchedules } = await import(
+      '$lib/server/services/schedules/scheduleStore'
+    )
+    await sweepAgentSchedules(id)
     return this.execute(async (client) => {
       // Get agent to find user_id
       const agent = await client.json.get(`agent:${id}`)

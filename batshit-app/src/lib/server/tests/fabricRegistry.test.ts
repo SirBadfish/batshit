@@ -667,6 +667,58 @@ describe('controlRegistry artifact capability controls', () => {
     ).toBe(7)
   })
 
+  it('publishes the SA-115 P2 sys.schedule.* control family through findControls', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const result = await findControls({
+      query: 'sys.schedule.',
+      includeDraft: true,
+      limit: 200
+    })
+
+    const scheduleControls = result.results.filter((item) =>
+      item.controlId.startsWith('sys.schedule.')
+    )
+    expect(scheduleControls.map((item) => item.controlId).sort()).toEqual([
+      'sys.schedule.create',
+      'sys.schedule.delete',
+      'sys.schedule.list',
+      'sys.schedule.update'
+    ])
+
+    // DL-115-10: reading is safe; every WRITE is `confirm`. Putting an agent on a clock is
+    // a spend decision that repeats until somebody stops it, so it goes past a person once.
+    const riskByControl = Object.fromEntries(
+      scheduleControls.map((item) => [item.controlId, item.riskLevel])
+    )
+    expect(riskByControl).toEqual({
+      'sys.schedule.list': 'safe',
+      'sys.schedule.create': 'confirm',
+      'sys.schedule.update': 'confirm',
+      'sys.schedule.delete': 'confirm'
+    })
+  })
+
+  it('excludes sys.schedule.* from a broker allowlist without the schedule scope', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const without = await findControls({
+      query: 'schedule',
+      limit: 200,
+      allowedControlIds: ['sys.artifact.*', 'sys.memory.*', 'sys.dm.*']
+    })
+    expect(without.results.some((item) => item.controlId.startsWith('sys.schedule.'))).toBe(false)
+
+    const withSchedules = await findControls({
+      query: 'schedule',
+      limit: 200,
+      allowedControlIds: ['sys.schedule.*']
+    })
+    expect(
+      withSchedules.results.filter((item) => item.controlId.startsWith('sys.schedule.')).length
+    ).toBe(4)
+  })
+
   it('matches multi-token artifact control queries in findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -1074,7 +1126,14 @@ describe('controlRegistry artifact capability controls', () => {
       agentId: 'agent-1',
       query: 'artifact use',
       includeDraft: true,
-      limit: 30
+      // SA-115: was 30, which the registry has outgrown. The claim here is a RELATIVE
+      // ordering between two controls, but a fixed window turns "the registry gained four
+      // entries" into "the lower-ranked one is missing" — a ranking failure that is not
+      // one. The 30 nearest matches for "artifact use" are now filled out with DM, memory,
+      // voice, and schedule controls that are not about artifacts either, so neither of
+      // the two items being compared was in it. 200 matches the other findControls tests
+      // in this file and lets the ordering assertion below mean what it says.
+      limit: 200
     })
 
     const ids = result.results.map((item) => item.controlId)

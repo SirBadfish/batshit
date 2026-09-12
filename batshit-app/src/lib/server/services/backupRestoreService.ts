@@ -132,10 +132,10 @@ const GROUP_DEFINITIONS = [
   },
   {
     id: 'dms',
-    label: 'Agent DMs and wake-up webhooks',
+    label: 'Agent DMs, wake-up webhooks, and schedules',
     classification: 'required',
     description:
-      'Agent-to-agent DMs, their inbox/sent indexes, and the wake-up webhook records. Wake-up webhook TOKENS are not stored anywhere and cannot be restored; a restored hook must be rotated before it works again.'
+      'Agent-to-agent DMs, their inbox/sent indexes, the wake-up webhook records, and the schedules that put agents on a clock. Wake-up webhook TOKENS are not stored anywhere and cannot be restored; a restored hook must be rotated before it works again.'
   },
   {
     id: 'models',
@@ -1040,7 +1040,11 @@ function remapUserKey(key: string, sourceUserId: string, targetUserId: string) {
     // SA-113 P2 (DL-113-02): the two user-scoped DM/webhook keys. The DM records and the
     // per-agent inbox/sent indexes are agent-scoped and need no remap.
     [`dm_index:${sourceUserId}`, `dm_index:${targetUserId}`],
-    [`wake_hooks:${sourceUserId}`, `wake_hooks:${targetUserId}`]
+    [`wake_hooks:${sourceUserId}`, `wake_hooks:${targetUserId}`],
+    // SA-115 P3 (DL-115-12): the schedule INDEX is user-scoped and needs the same remap.
+    // The `schedule:{id}` records are not — their ids carry no user segment, and the
+    // `userId` field inside each record is rewritten by the record-level user remap.
+    [`schedules:${sourceUserId}`, `schedules:${targetUserId}`]
   ]
 
   for (const [from, to] of replacements) {
@@ -1218,7 +1222,10 @@ function groupForKey(key: string, userId: string): BackupGroupId {
     key.startsWith('dm_sent:') ||
     key.startsWith('dm_index:') ||
     key.startsWith('wake_hook:') ||
-    key.startsWith('wake_hooks:')
+    key.startsWith('wake_hooks:') ||
+    // SA-115 P3: the clock rides in the same group as the DMs it writes.
+    key.startsWith('schedule:') ||
+    key.startsWith('schedules:')
   ) {
     return 'dms'
   }
@@ -1280,6 +1287,7 @@ function isRestorableKeyForUser(key: string, userId: string) {
   const userPrefixes = [
     `dm_index:${userId}`,
     `wake_hooks:${userId}`,
+    `schedules:${userId}`,
     `folder:${userId}:`,
     `project:${userId}:`,
     `api_keys:${userId}:`,
@@ -1341,7 +1349,11 @@ function isRestorableKeyForUser(key: string, userId: string) {
     'dm:',
     'dm_inbox:',
     'dm_sent:',
-    'wake_hook:'
+    'wake_hook:',
+    // SA-115 P3: `schedule:sch_…` carries no user segment, so it follows the agent/global
+    // prefix shape. `schedules:{userId}` is handled by the user-prefix list above, and the
+    // two can never be confused: an id is `sch_…` and a user id can never start `sch_`.
+    'schedule:'
   ]
 
   return globalEntityPrefixes.some((prefix) => key.startsWith(prefix))
@@ -1531,6 +1543,13 @@ async function collectCandidateKeys(client: any, userId: string) {
   }
   for (const hookId of await safeSetMembers(client, `wake_hooks:${userId}`)) {
     await addExistingKey(keys, client, `wake_hook:${hookId}`)
+  }
+
+  // SA-115 P3: schedules, reached through their user-scoped index the same way — a SET,
+  // like `wake_hooks:`, so `safeSetMembers` is the right reader.
+  await addExistingKey(keys, client, `schedules:${userId}`)
+  for (const scheduleId of await safeSetMembers(client, `schedules:${userId}`)) {
+    await addExistingKey(keys, client, `schedule:${scheduleId}`)
   }
 
   for (const subagentId of subagentIds) {

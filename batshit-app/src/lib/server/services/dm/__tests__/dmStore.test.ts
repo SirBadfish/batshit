@@ -166,6 +166,62 @@ describe('creating a DM', () => {
     expect(second.id).not.toBe(first.id)
   })
 
+  /**
+   * SA-115 F-P1-1 — a schedule is exempt, and it is the one sender kind that has to be.
+   *
+   * Loop guard 2 catches an agent or a program repeating itself. Repeating itself is
+   * exactly what a schedule is FOR: every fire of "every 5 minutes, check the queue"
+   * carries the same kind, subject, body, and sender by construction. With the guard
+   * applied, any interval under the ten-minute window whose previous DM was still open
+   * had its next fire refused — and the floor is five minutes, so a schedule at the
+   * lock's own minimum failed every other fire. The P1 live run fired four differently
+   * named schedules once each, which is why it could not see this.
+   */
+  it('SA-115 F-P1-1: a schedule may send the same DM again inside the window', async () => {
+    function scheduled(overrides: Record<string, any> = {}) {
+      return createDm({
+        userId: USER,
+        from: { kind: 'schedule' as const, scheduleId: 'sch_abc', name: 'Queue check' },
+        to: COOPER,
+        kind: 'info',
+        subject: 'Queue check',
+        body: 'Check the queue and say what is in it.',
+        deliver: 'wake',
+        ...overrides
+      })
+    }
+
+    const first = await scheduled()
+    // Five minutes later — the lock's minimum interval, well inside the ten-minute window —
+    // and the first note is still OPEN because nothing has read it yet.
+    const second = await scheduled()
+    const third = await scheduled()
+
+    expect(new Set([first.id, second.id, third.id]).size).toBe(3)
+    expect(await listInbox(COOPER)).toHaveLength(3)
+  })
+
+  it('SA-115 F-P1-1: the guard still holds for agents and webhooks', async () => {
+    // The exemption is per sender kind, not a hole in the guard. Both other kinds are
+    // asserted here so a future "just skip the duplicate check" edit cannot pass.
+    await seedInfo()
+    await expect(seedInfo()).rejects.toMatchObject({ code: 'duplicate' })
+
+    function fromWebhook() {
+      return createDm({
+        userId: USER,
+        from: { kind: 'webhook' as const, hookId: 'whk_abc', name: 'n8n nightly' },
+        to: COOPER,
+        kind: 'info',
+        subject: 'Nightly',
+        body: 'The nightly job finished.',
+        deliver: 'wait'
+      })
+    }
+    await fromWebhook()
+    await expect(fromWebhook()).rejects.toMatchObject({ code: 'duplicate' })
+  })
+
   it('refuses when the inbox is full', async () => {
     for (let index = 0; index < MAX_OPEN_DMS_PER_INBOX; index += 1) {
       await seedInfo({ subject: `Note ${index}` })
@@ -469,6 +525,102 @@ describe('F-SEC-1b — telling the user a woken chat is stuck on them', () => {
     expect(await clearNeedsUserForHumanReply(COOPER, 'sess-current-chat')).toEqual([])
   })
 
+  it('a human reply also ACKNOWLEDGES a wake-delivered info note, instead of leaving it new (F-P2-1)', async () => {
+    // The other half of F-P2-1. `finishWokenTurn` now deliberately skips F-P1-2's
+    // acknowledge while a DM carries `needsUser`, so the note has to close somewhere else
+    // or it goes back to leaking: the holdup ends when the human replies in that chat, and
+    // at that moment the note is BOTH delivered (the wake handed it over as the turn's
+    // first message) and seen (the human is reading that chat right now).
+    //
+    // Only for an `info` item whose delivery actually WOKE someone. An assignment is work
+    // and still closes by being claimed and closed; a `wait` delivery was never handed to
+    // anyone, so the agent still has to read it.
+    const note = await seedInfo({ deliver: 'wake' })
+    await stampDmDelivery(note.id, { actual: 'wake', sessionId: 'sess-woken-chat' })
+    await stampDmNeedsUser(note.id, 'That action needs you.')
+
+    const cleared = await clearNeedsUserForHumanReply(COOPER, 'sess-woken-chat')
+
+    expect(cleared).toEqual([note.id])
+    const closed = await getDm(note.id)
+    expect(closed?.delivery.needsUser).toBeUndefined()
+    expect(closed?.status).toBe('done')
+    expect(closed?.result).toBe('Delivered as the first message of a woken turn.')
+    expect(lastInboxEvent()?.needsUserCount).toBe(0)
+  })
+
+  it('keeps going when a stamped note vanishes MID-loop (F-P2-1)', async () => {
+    // The acknowledge THROWS on a missing record where the old `clearDmNeedsUser` was
+    // silent, so a DM deleted between the inbox read and this write would otherwise
+    // abandon the rest of the loop — one reply silently failing to clear the other
+    // holdups it answered.
+    //
+    // Staging that race needs the record present when `listInbox` reads it and gone by
+    // the time the loop reaches it: deleting it up front proves nothing, because
+    // `listInbox` prunes a dangling index entry before the loop ever sees it. So the
+    // FIRST acknowledge deletes the second record — `acknowledgeInfoDm` announces, and
+    // the announce is mocked here.
+    const first = await seedInfo({ deliver: 'wake', subject: 'First note' })
+    await stampDmDelivery(first.id, { actual: 'wake', sessionId: 'sess-woken-chat' })
+    await stampDmNeedsUser(first.id, 'That action needs you.')
+    const doomed = await seedInfo({ deliver: 'wake', subject: 'Second note' })
+    await stampDmDelivery(doomed.id, { actual: 'wake', sessionId: 'sess-woken-chat' })
+    await stampDmNeedsUser(doomed.id, 'That action needs you too.')
+
+    // Inbox order is urgent-first then oldest-first, so rather than guessing which one the
+    // loop reaches first, the first announce deletes whichever is still open.
+    let deleted: string | null = null
+    publishUserEvent.mockImplementation(async () => {
+      if (!deleted) {
+        for (const id of [first.id, doomed.id]) {
+          const record = (await redis.json.get(`dm:${id}`)) as Record<string, any> | null
+          if (record?.status === 'new') {
+            deleted = id
+            await redis.del(`dm:${id}`)
+            break
+          }
+        }
+      }
+      return undefined
+    })
+
+    const cleared = await clearNeedsUserForHumanReply(COOPER, 'sess-woken-chat')
+
+    // Exactly one was cleared: the loop kept going past the vanished record instead of
+    // throwing out of it, and the vanished one is not reported as cleared.
+    expect(deleted).toBeTruthy()
+    expect(cleared).toHaveLength(1)
+    expect(cleared).not.toContain(deleted)
+    expect((await getDm(cleared[0]))?.status).toBe('done')
+  })
+
+  it('a human reply leaves an ASSIGNMENT open — only its stamp is cleared (F-P2-1)', async () => {
+    const work = await seedAssignment({ deliver: 'wake' })
+    await stampDmDelivery(work.id, { actual: 'wake', sessionId: 'sess-woken-chat' })
+    await stampDmNeedsUser(work.id, 'That action needs you.')
+
+    await clearNeedsUserForHumanReply(COOPER, 'sess-woken-chat')
+
+    const still = await getDm(work.id)
+    expect(still?.delivery.needsUser).toBeUndefined()
+    // Work is claimed and closed by the agent; a reply does not finish it.
+    expect(still?.status).toBe('new')
+    expect(still?.result).toBeUndefined()
+  })
+
+  it('a human reply leaves a WAIT-delivered info note open — nothing delivered it (F-P2-1)', async () => {
+    const note = await seedInfo({ deliver: 'wait' })
+    await stampDmDelivery(note.id, { actual: 'wait', sessionId: 'sess-woken-chat' })
+    await stampDmNeedsUser(note.id, 'That action needs you.')
+
+    await clearNeedsUserForHumanReply(COOPER, 'sess-woken-chat')
+
+    const still = await getDm(note.id)
+    expect(still?.delivery.needsUser).toBeUndefined()
+    // It is still sitting in the inbox waiting to be read, which is what `wait` means.
+    expect(still?.status).toBe('new')
+  })
+
   it('is silent when there is nothing stamped, so every send can call it', async () => {
     const record = await seedInfo()
     publishUserEvent.mockClear()
@@ -705,5 +857,40 @@ describe('F-P2-3 — a late delivery stamp cannot undo a claim', () => {
     const stored = await getDm(record.id)
     expect(stored?.resultDmId).toBe('dm_result_1')
     expect(stored?.delivery).toMatchObject({ outcome: 'completed' })
+  })
+})
+
+describe('SA-115 — the third sender kind is answered explicitly', () => {
+  /**
+   * `sameSender`'s trailing `return false` is for an unknown FUTURE kind. It must never be
+   * how an existing kind gets its answer — which is what it was doing for `schedule`,
+   * making loop guard 2's exemption look like dead code while it was the only thing
+   * keeping a five-minute schedule alive. This pins the predicate so the exemption above
+   * stays load-bearing.
+   */
+  it('treats two fires of ONE schedule as the same sender', async () => {
+    // Proved through the guard, because that is the only thing `sameSender` feeds: with
+    // the exemption removed these would collide, and with it they do not.
+    const one = await createDm({
+      userId: USER,
+      from: { kind: 'schedule' as const, scheduleId: 'sch_same', name: 'Queue check' },
+      to: COOPER,
+      kind: 'info',
+      subject: 'Queue check',
+      body: 'Same body.',
+      deliver: 'wait'
+    })
+    const two = await createDm({
+      userId: USER,
+      from: { kind: 'schedule' as const, scheduleId: 'sch_same', name: 'Queue check' },
+      to: COOPER,
+      kind: 'info',
+      subject: 'Queue check',
+      body: 'Same body.',
+      deliver: 'wait'
+    })
+    expect(two.id).not.toBe(one.id)
+    const inbox = await listInbox(COOPER)
+    expect(inbox.map((record) => record.from.kind)).toEqual(['schedule', 'schedule'])
   })
 })

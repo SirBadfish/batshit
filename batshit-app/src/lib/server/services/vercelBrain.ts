@@ -225,6 +225,8 @@ export interface NativeModeRequest extends ThinkRequest {
   memoryControlsEnabled?: boolean
   /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
   dmControlsEnabled?: boolean
+  /** SA-115 P2 (DL-115-10): PRIMARY actor + agent `dms_enabled`. */
+  scheduleControlsEnabled?: boolean
   /**
    * SA-111 P4 (DL-111-11/12): PRIMARY runs of workers-enabled agents. The subagent runner
    * leaves it false, which is what keeps delegation depth at one level.
@@ -443,6 +445,7 @@ export class VercelAIBrain {
           selectedCliToolIds: request.selectedCliToolIds,
           memoryControlsEnabled: request.memoryControlsEnabled,
           dmControlsEnabled: request.dmControlsEnabled,
+          scheduleControlsEnabled: request.scheduleControlsEnabled,
           workersEnabled: request.workersEnabled,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
@@ -977,6 +980,7 @@ export class VercelAIBrain {
       memoryControlsEnabled?: boolean
       /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
       dmControlsEnabled?: boolean
+      scheduleControlsEnabled?: boolean
       /** SA-111 P4: primary-agent sends only; every delegated run leaves it false. */
       workersEnabled?: boolean
       parentModelId?: string | null
@@ -1052,6 +1056,7 @@ export class VercelAIBrain {
           allowFabricControlTools: nativeContext?.allowFabricControlTools,
           memoryControlsEnabled: nativeContext?.memoryControlsEnabled,
           dmControlsEnabled: nativeContext?.dmControlsEnabled,
+          scheduleControlsEnabled: nativeContext?.scheduleControlsEnabled,
           projectPath: nativeContext?.projectPath ?? null,
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode,
@@ -2638,6 +2643,7 @@ export class VercelAIBrain {
             allowFabricControlTools: request.allowFabricControlTools,
             memoryControlsEnabled: request.memoryControlsEnabled,
             dmControlsEnabled: request.dmControlsEnabled,
+            scheduleControlsEnabled: request.scheduleControlsEnabled,
             workersEnabled: request.workersEnabled,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,

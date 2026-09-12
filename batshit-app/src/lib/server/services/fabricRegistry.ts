@@ -73,6 +73,19 @@ import {
   sendDmOp,
   type DmToolContext
 } from '$lib/server/services/dm/dmTools'
+import {
+  createScheduleOp,
+  deleteScheduleOp,
+  listSchedulesOp,
+  ScheduleToolError,
+  updateScheduleOp,
+  type ScheduleToolContext
+} from '$lib/server/services/schedules/scheduleTools'
+import {
+  MAX_SCHEDULE_INTERVAL_MINUTES,
+  MIN_SCHEDULE_INTERVAL_MINUTES,
+  SCHEDULE_NAME_MAX_CHARS
+} from '$lib/utils/scheduleControl'
 import { resolveWokenTurnState } from '$lib/server/services/dm/wokenTurn'
 import {
   DEFAULT_SKILL_ICON_REF
@@ -1753,9 +1766,212 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
   }
 ]
 
+/* ------------------------------------------------------------------ *
+ * SA-115 P2 (DL-115-10) — `sys.schedule.*`: an agent's own hand on the clock.
+ *
+ * Copies `DM_CONTROL_DEFINITIONS` exactly, on purpose, including the context adapter and
+ * the error adapter, so there is one shape to audit for "a first-party family scoped to
+ * one agent". Two things differ from `sys.dm.*` and both are deliberate:
+ *
+ *  - **Every write is `confirm`, not `safe`.** Putting an agent on a clock is a spend
+ *    decision that repeats until somebody stops it, so it goes past a person once.
+ *  - **Self-only**, enforced in the ops layer rather than by a field: the `agentId` a
+ *    schedule is created with is the server-owned acting agent, so there is no input a
+ *    model could set to schedule somebody else.
+ * ------------------------------------------------------------------ */
+
+function scheduleControlContext(context: ControlExecutionContext): ScheduleToolContext {
+  return {
+    userId: context.userId,
+    agentId: typeof context.agentId === 'string' ? context.agentId : ''
+  }
+}
+
+async function runScheduleControl<T extends Record<string, any>>(
+  operation: () => Promise<T>
+): Promise<Record<string, any>> {
+  try {
+    return await operation()
+  } catch (error) {
+    if (error instanceof ScheduleToolError) {
+      throw new Error(error.hint ? `${error.message} | fix: ${error.hint}` : error.message)
+    }
+    throw error
+  }
+}
+
+const scheduleIdSchema = z.object({ schedule_id: z.string().trim().min(1) }).passthrough()
+
+const scheduleCreateControlSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    cadence: z.object({}).passthrough(),
+    message: z.string().trim().min(1)
+  })
+  .passthrough()
+
+/**
+ * The cadence, as the model sees it. Written out once here rather than referenced, because
+ * `tool_discovery` prints a Fabric COUNT and never a schema: an agent that has not run
+ * `_find` knows only what the guidance block says, so the schema it eventually reads has to
+ * be complete on its own.
+ */
+const CADENCE_SCHEMA_JSON = {
+  type: 'object',
+  description:
+    'Exactly one of three shapes. interval ignores the time zone; daily and weekly are wall-clock in it.',
+  properties: {
+    type: { type: 'string', enum: ['interval', 'daily', 'weekly'] },
+    every_minutes: {
+      type: 'integer',
+      minimum: MIN_SCHEDULE_INTERVAL_MINUTES,
+      maximum: MAX_SCHEDULE_INTERVAL_MINUTES,
+      description: `interval only. Whole minutes, ${MIN_SCHEDULE_INTERVAL_MINUTES} to ${MAX_SCHEDULE_INTERVAL_MINUTES} (7 days). Written everyMinutes is also accepted.`
+    },
+    at: {
+      type: 'string',
+      description: 'daily and weekly only. 24-hour HH:MM, for example "09:00" or "16:30".'
+    },
+    days: {
+      type: 'array',
+      items: { type: 'integer', minimum: 0, maximum: 6 },
+      description: 'weekly only. 0 is Sunday. At least one.'
+    }
+  },
+  required: ['type']
+}
+
+const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
+  {
+    controlId: 'sys.schedule.list',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Schedule List',
+    description:
+      'List YOUR OWN schedules: when each next runs, what it sends, and how the last run went. You can only see your own.',
+    inputSchema: z.object({}).passthrough(),
+    inputSchemaJson: { type: 'object', properties: {} },
+    outputSchema: null,
+    schemaHint: 'no input',
+    riskLevel: 'safe',
+    status: 'published',
+    tags: ['schedule', 'clock', 'list'],
+    handler: async (context) =>
+      runScheduleControl(() => listSchedulesOp(scheduleControlContext(context)))
+  },
+  {
+    controlId: 'sys.schedule.create',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Schedule Create',
+    description:
+      'Put YOURSELF on a clock: Batshit sends you this message at the times you describe. Good for a routine you should do without being asked. You cannot schedule another agent — DM them and ask. The user approves this once.',
+    inputSchema: scheduleCreateControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: `What this schedule is called, max ${SCHEDULE_NAME_MAX_CHARS} characters. It is the DM's subject and the row the user sees.`
+        },
+        cadence: CADENCE_SCHEMA_JSON,
+        message: {
+          type: 'string',
+          description: 'What you will be sent at that time. Write it to your future self.'
+        },
+        time_zone: {
+          type: 'string',
+          description:
+            'IANA zone for a daily or weekly time, for example "America/Chicago". Defaults to the SERVER\'s zone (the user\'s on the Mac app, usually UTC in Docker) — no browser is involved in your call, so name it if you know it. Ignored by interval.'
+        },
+        kind: {
+          type: 'string',
+          enum: ['info', 'assignment'],
+          description: 'info = a note (default). assignment = work whose outcome is recorded.'
+        },
+        deliver: {
+          type: 'string',
+          enum: ['wait', 'wake'],
+          description:
+            'wake (default) asks Batshit to start a turn for you at that time; wait leaves it in your inbox for your next turn.'
+        }
+      },
+      required: ['name', 'cadence', 'message']
+    },
+    outputSchema: null,
+    schemaHint: 'name + cadence + message; optional time_zone, kind, deliver',
+    riskLevel: 'confirm',
+    status: 'published',
+    tags: ['schedule', 'clock', 'create', 'wake'],
+    handler: async (context, input) =>
+      runScheduleControl(() =>
+        createScheduleOp(scheduleControlContext(context), input as never)
+      )
+  },
+  {
+    controlId: 'sys.schedule.update',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Schedule Update',
+    description:
+      'Change one of YOUR OWN schedules — its time, its message, or pause it with enabled false. Only the fields you send change. The user approves this once.',
+    inputSchema: scheduleIdSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        schedule_id: { type: 'string', description: 'From sys.schedule.list.' },
+        name: { type: 'string' },
+        cadence: CADENCE_SCHEMA_JSON,
+        message: { type: 'string' },
+        time_zone: { type: 'string' },
+        kind: { type: 'string', enum: ['info', 'assignment'] },
+        deliver: { type: 'string', enum: ['wait', 'wake'] },
+        enabled: {
+          type: 'boolean',
+          description: 'false pauses it without deleting it; true starts it again from now.'
+        }
+      },
+      required: ['schedule_id']
+    },
+    outputSchema: null,
+    schemaHint: 'schedule_id + whatever you are changing',
+    riskLevel: 'confirm',
+    status: 'published',
+    tags: ['schedule', 'clock', 'update'],
+    handler: async (context, input) =>
+      runScheduleControl(() =>
+        updateScheduleOp(scheduleControlContext(context), input as never)
+      )
+  },
+  {
+    controlId: 'sys.schedule.delete',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Schedule Delete',
+    description:
+      'Delete one of YOUR OWN schedules for good. To stop it for now instead, pause it with sys.schedule.update and enabled false. The user approves this once.',
+    inputSchema: scheduleIdSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: { schedule_id: { type: 'string', description: 'From sys.schedule.list.' } },
+      required: ['schedule_id']
+    },
+    outputSchema: null,
+    schemaHint: 'schedule_id',
+    riskLevel: 'confirm',
+    status: 'published',
+    tags: ['schedule', 'clock', 'delete'],
+    handler: async (context, input) =>
+      runScheduleControl(() =>
+        deleteScheduleOp(scheduleControlContext(context), input as never)
+      )
+  }
+]
+
 const CONTROL_DEFINITIONS: ControlDefinition[] = [
   ...MEMORY_CONTROL_DEFINITIONS,
   ...DM_CONTROL_DEFINITIONS,
+  ...SCHEDULE_CONTROL_DEFINITIONS,
   {
     controlId: 'sys.model_catalog.search',
     sourceType: 'core',

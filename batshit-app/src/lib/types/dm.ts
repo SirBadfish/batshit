@@ -31,6 +31,11 @@ export type DmSender =
   | { kind: 'agent'; agentId: string; name: string }
   /** P3's wake-up webhook. The name is the hook's, frozen at send time. */
   | { kind: 'webhook'; hookId: string; name: string }
+  /**
+   * SA-115: Batshit's own clock. The name is the schedule's, frozen at fire time, so a
+   * renamed or deleted schedule still reads correctly in an old inbox row.
+   */
+  | { kind: 'schedule'; scheduleId: string; name: string }
 
 /** What actually happened to a `deliver: 'wake'` request, and why if it changed. */
 export interface DmDeliveryRecord {

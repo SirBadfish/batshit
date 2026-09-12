@@ -153,6 +153,12 @@ export interface BrokerAvailabilityInput {
    * are opt-in per agent, and an agent without them pays no bytes and sees no tools.
    */
   dmControlsEnabled?: boolean
+  /**
+   * SA-115 P2 (DL-115-10): true only for PRIMARY actors whose agent has `dms_enabled` —
+   * the SAME switch as `dmControlsEnabled`, because a schedule's only output is a DM and
+   * an agent with DMs off could build a clock whose alarm it can never hear.
+   */
+  scheduleControlsEnabled?: boolean
 }
 
 /**
@@ -169,6 +175,8 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   const memoryReachable = toggles.batshitToolsEnabled && input.memoryControlsEnabled === true
   // SA-113 P2: DM controls follow exactly the same rule as memory controls.
   const dmReachable = toggles.batshitToolsEnabled && input.dmControlsEnabled === true
+  // SA-115 P2: schedule controls, same rule again.
+  const scheduleReachable = toggles.batshitToolsEnabled && input.scheduleControlsEnabled === true
 
   const families: BrokerToolFamily[] = []
 
@@ -179,7 +187,7 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
     if (toggles.cliToolsEnabled) families.push('cli')
     if (toggles.artifactRuntimeEnabled) families.push('artifact')
     if (toggles.agentBrowserEnabled) families.push('agent_browser')
-    if (toggles.fetchZipEnabled || memoryReachable || dmReachable) families.push('fabric')
+    if (toggles.fetchZipEnabled || memoryReachable || dmReachable || scheduleReachable) families.push('fabric')
     return families
   }
 
@@ -203,7 +211,8 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
     toggles.fetchZipEnabled ||
     (toggles.batshitToolsEnabled && allowFabric) ||
     memoryReachable ||
-    dmReachable
+    dmReachable ||
+    scheduleReachable
   ) {
     families.push('fabric')
   }
@@ -255,6 +264,14 @@ export const BROKER_FABRIC_MEMORY_CONTROL_IDS = ['sys.memory.*'] as const
  */
 export const BROKER_FABRIC_DM_CONTROL_IDS = ['sys.dm.*'] as const
 
+/**
+ * SA-115 P2 (DL-115-10): the Schedules family — an agent's own hand on the clock. Same
+ * shape again, and gated on the SAME per-agent switch as DMs, because a schedule's only
+ * output is a DM. Subagents and Workers never receive these: a delegated run is over in a
+ * moment and has no business creating something that outlives it.
+ */
+export const BROKER_FABRIC_SCHEDULE_CONTROL_IDS = ['sys.schedule.*'] as const
+
 export interface BrokerFabricScopeInput {
   toggles: BrokerToolToggles
   /**
@@ -271,6 +288,8 @@ export interface BrokerFabricScopeInput {
   memoryControlsEnabled?: boolean
   /** SA-113 P2: PRIMARY actor + agent `dms_enabled`. Default false (opt-in). */
   dmControlsEnabled?: boolean
+  /** SA-115 P2: PRIMARY actor + agent `dms_enabled`. Default false (opt-in). */
+  scheduleControlsEnabled?: boolean
 }
 
 /**
@@ -310,6 +329,13 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
   // SA-113 P2: DM controls, same rule.
   if (input.toggles.batshitToolsEnabled && input.dmControlsEnabled === true) {
     for (const controlId of BROKER_FABRIC_DM_CONTROL_IDS) {
+      allowed.add(controlId)
+    }
+  }
+
+  // SA-115 P2: schedule controls, same rule again.
+  if (input.toggles.batshitToolsEnabled && input.scheduleControlsEnabled === true) {
+    for (const controlId of BROKER_FABRIC_SCHEDULE_CONTROL_IDS) {
       allowed.add(controlId)
     }
   }

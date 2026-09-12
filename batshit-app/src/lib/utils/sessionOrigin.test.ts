@@ -5,6 +5,7 @@ import {
   describeSessionOrigin,
   isWokenSession,
   resolveSessionOrigin,
+  sessionOriginPillLabel,
   resolveSessionOriginMetadataUpdate,
   stripClientSuppliedOrigin
 } from '$lib/utils/sessionOrigin'
@@ -187,5 +188,72 @@ describe('resolveSessionOriginMetadataUpdate (DL-113-08)', () => {
   it('passes ordinary metadata through for a session with no origin', () => {
     const result = resolveSessionOriginMetadataUpdate({ agent_id: 'a1' }, { agent_id: 'a2' })
     expect(result).toEqual({ ok: true, metadata: { agent_id: 'a2' } })
+  })
+})
+
+describe('the schedule kind (SA-115)', () => {
+  const origin = buildSessionOrigin({
+    kind: 'schedule',
+    label: 'Morning check',
+    scheduleId: 'sch_abc123',
+    dmId: 'dm_9f3a',
+    chainDepth: 0
+  })
+
+  it('carries the schedule id through build and read', () => {
+    expect(origin).toMatchObject({
+      kind: 'schedule',
+      label: 'Morning check',
+      scheduleId: 'sch_abc123',
+      dmId: 'dm_9f3a',
+      chainDepth: 0
+    })
+    const read = resolveSessionOrigin({ metadata: { origin } })
+    expect(read?.scheduleId).toBe('sch_abc123')
+    expect(read?.kind).toBe('schedule')
+  })
+
+  it('says "schedule" everywhere, never "webhook"', () => {
+    // Part 2.4: the label and pill used to be binary ternaries, so a third kind would have
+    // read as a webhook everywhere. These are kind-keyed lookups now.
+    expect(describeSessionOrigin(origin)).toBe('Started by the "Morning check" schedule')
+    expect(sessionOriginPillLabel(origin)).toBe('Clock')
+    expect(buildWokenSessionName({ kind: 'schedule', label: 'Morning check' })).toBe(
+      'Schedule: Morning check'
+    )
+  })
+
+  it('leaves the two SA-113 kinds exactly as they were', () => {
+    const dm = buildSessionOrigin({ kind: 'dm', label: 'Cooper', chainDepth: 1 })
+    const hook = buildSessionOrigin({ kind: 'webhook', label: 'Nightly build', chainDepth: 0 })
+    expect(describeSessionOrigin(dm)).toBe('Started by a DM from Cooper')
+    expect(describeSessionOrigin(hook)).toBe('Started by webhook "Nightly build"')
+    expect(sessionOriginPillLabel(dm)).toBe('DM')
+    expect(sessionOriginPillLabel(hook)).toBe('Hook')
+    expect(buildWokenSessionName({ kind: 'dm', label: 'Cooper', subject: 'Ship it' })).toBe(
+      'DM from Cooper: Ship it'
+    )
+    expect(buildWokenSessionName({ kind: 'webhook', label: 'Nightly build' })).toBe(
+      'Webhook: Nightly build'
+    )
+  })
+
+  it('falls back to a schedule-shaped label when one is missing', () => {
+    const unnamed = resolveSessionOrigin({
+      metadata: { origin: { kind: 'schedule', at: 'x', chainDepth: 0 } }
+    })
+    expect(unnamed?.label).toBe('a schedule')
+  })
+
+  it('still refuses a kind it does not know', () => {
+    expect(
+      resolveSessionOrigin({ metadata: { origin: { kind: 'telepathy', label: 'x' } } })
+    ).toBeNull()
+  })
+
+  it('trims a long schedule name to the session-name limit', () => {
+    const name = buildWokenSessionName({ kind: 'schedule', label: 'x'.repeat(200) })
+    expect(name.length).toBe(WAKE_SESSION_NAME_MAX_CHARS)
+    expect(name.endsWith('…')).toBe(true)
   })
 })

@@ -39,6 +39,8 @@ import {
   type DmDeliveryMode
 } from '$lib/utils/dmControl'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
+import { SCHEDULE_TICK_MS, describeNextRun } from '$lib/utils/scheduleControl'
+import type { ScheduleRecord } from '$lib/types/schedule'
 import {
   DM_KINDS,
   isOpenDmStatus,
@@ -135,10 +137,15 @@ export async function requireDmEnabledAgent(
  */
 export function buildWokenDmContent(record: DmRecord): string {
   const urgent = record.priority === 'urgent' ? ', urgent' : ''
-  const header =
+  // One bracket per sender kind. Each one says plainly that the text is not the user's,
+  // and SA-115 added the third without disturbing the two SA-113 shipped.
+  const source =
     record.from.kind === 'webhook'
-      ? `[Wake-up webhook "${record.from.name}" — not from the user] ${record.kind}${urgent} — ${record.subject}`
-      : `[Agent DM — from ${record.from.name}, not from the user] ${record.kind}${urgent} — ${record.subject}`
+      ? `Wake-up webhook "${record.from.name}" — not from the user`
+      : record.from.kind === 'schedule'
+        ? `Schedule "${record.from.name}" — not from the user`
+        : `Agent DM — from ${record.from.name}, not from the user`
+  const header = `[${source}] ${record.kind}${urgent} — ${record.subject}`
 
   const lines = [header, '', record.body, '']
   if (record.requestedOutcome) lines.push(`Requested outcome: ${record.requestedOutcome}`)
@@ -1048,6 +1055,143 @@ function defaultWebhookSubject(hook: WakeHookRecord, message: string): string {
   const firstLine = (message ?? '').split('\n').find((line) => line.trim())?.trim() ?? ''
   if (!firstLine) return hook.name
   return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine
+}
+
+/* ------------------------------------------------------------------ *
+ * Scheduled wake-ups (SA-115, DL-115-05)
+ * ------------------------------------------------------------------ */
+
+export interface ScheduledDmResult {
+  dmId: string
+  deliveredAs: 'wait' | 'wake'
+  reason?: string
+  sessionId?: string
+  /** The sentence the schedule's `lastOutcome` stores and the Admin card shows. */
+  outcome: string
+}
+
+/**
+ * Fire one schedule: write its DM, then deliver it exactly the way an agent's own DM and
+ * a webhook's DM are delivered.
+ *
+ * **This goes through the DM record on purpose.** Doing so buys the drawer row, the header
+ * badge, the DCM roster line, claim/done, the delivery outcome, `needsUser` when a woken
+ * turn parks on a tool approval, and the `agent_busy` degrade — all for free, and all
+ * identical to the other two wake sources. A fire that talked to the wake primitive
+ * directly would have to re-earn every one of them.
+ *
+ * The recipient checks are `deliverWebhookDm`'s, including **Agent DMs ON** rather than
+ * just "May be woken" (AMD-113-05): a fire writes a DM, and an agent with DMs off has no
+ * roster to see it in and no `sys.dm.*` tools to close it with.
+ *
+ * `chainDepth: 0` always. A clock starts a chain; it never continues one.
+ */
+export async function deliverScheduledDm(
+  schedule: ScheduleRecord,
+  options: { trigger: 'tick' | 'run-now'; dueAt?: Date | null; now?: Date }
+): Promise<ScheduledDmResult> {
+  const recipient = (await redis.get(`agent:${schedule.agentId}`)) as Record<string, any> | null
+  if (!recipient || (recipient.user_id && recipient.user_id !== schedule.userId)) {
+    throw new DmToolError(
+      `The agent this schedule writes to (${schedule.agentId}) no longer exists.`,
+      'Delete this schedule, or point it at an agent that exists.'
+    )
+  }
+  const agentType = normalizePrimaryAgentType(recipient as any)
+  if (agentType !== 'api' && agentType !== 'cli') {
+    throw new DmToolError(
+      `${agentDisplayName(recipient)} is not an API or CLI primary agent, so a schedule cannot write to it.`
+    )
+  }
+  if (!resolveAgentDmsEnabled(recipient)) {
+    throw new DmToolError(
+      `${agentDisplayName(recipient)} does not have Agent DMs turned on, so it would never see this.`,
+      'Turn on Agent DMs for that agent in Agent Settings.'
+    )
+  }
+
+  const now = options.now ?? new Date()
+  const record = await runStore(() =>
+    createDm({
+      userId: schedule.userId,
+      from: { kind: 'schedule', scheduleId: schedule.id, name: schedule.name },
+      to: recipient.id,
+      kind: schedule.kind,
+      subject: schedule.name,
+      body: buildScheduledDmBody(schedule, options.dueAt ?? null, now),
+      // A schedule has no inbox, so like a webhook its assignment has NO `reportBackTo`.
+      // Its outcome is visible on the schedule's own card and in the DM drawer instead.
+      ...(schedule.kind === 'assignment'
+        ? {
+            requestedOutcome: 'Do what the message asks and say what happened.',
+            scope: 'Only what this message asks for.'
+          }
+        : {}),
+      deliver: schedule.deliver
+    })
+  )
+
+  if (schedule.deliver !== 'wake') {
+    return {
+      dmId: record.id,
+      deliveredAs: 'wait',
+      outcome: 'waiting in inbox'
+    }
+  }
+
+  const result = await requestAgentWakeup({
+    userId: schedule.userId,
+    agentId: recipient.id,
+    target: { kind: 'auto', subject: record.subject },
+    content: buildWokenDmContent(record),
+    origin: {
+      kind: 'schedule',
+      fromLabel: schedule.name,
+      scheduleId: schedule.id,
+      dmId: record.id
+    },
+    chainDepth: 0
+  })
+
+  if (!result.ok) {
+    await stampDmDelivery(record.id, { actual: 'wait', reason: result.reason })
+    return {
+      dmId: record.id,
+      deliveredAs: 'wait',
+      reason: result.reason,
+      outcome: `waited: ${result.reason}`
+    }
+  }
+
+  await stampDmDelivery(record.id, { actual: 'wake', sessionId: result.sessionId })
+  return {
+    dmId: record.id,
+    deliveredAs: 'wake',
+    sessionId: result.sessionId,
+    outcome: `woke: ${result.sessionId}`
+  }
+}
+
+/**
+ * The DM body: the schedule's message, plus one line naming the slot when this run is
+ * genuinely late.
+ *
+ * DL-115-08 requires a late fire to say when it was due, so an agent reading "run the
+ * morning check" at 09:07 knows it is the 09:00 run. Anything inside one tick is the
+ * ticker's own granularity rather than lateness, so it says nothing.
+ */
+function buildScheduledDmBody(
+  schedule: ScheduleRecord,
+  dueAt: Date | null,
+  now: Date
+): string {
+  if (!dueAt || !Number.isFinite(dueAt.getTime())) return schedule.message
+  if (now.getTime() - dueAt.getTime() <= SCHEDULE_TICK_MS) return schedule.message
+  return [
+    schedule.message,
+    '',
+    `(This run was due ${describeNextRun(dueAt, schedule.timeZone)} and is running late.)`
+  ].join('\n')
 }
 
 /* ------------------------------------------------------------------ *

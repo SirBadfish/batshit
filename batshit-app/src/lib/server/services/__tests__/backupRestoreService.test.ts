@@ -607,6 +607,34 @@ async function seedRepresentativeData(userId: string) {
   await redis.execute(async (client) => {
     await client.sAdd('wake_hooks:source', 'whk_1')
   })
+
+  // SA-115 P3 (DL-115-12): one schedule and its user-scoped index SET, in the same `dms`
+  // group. A schedule that did not survive a restore is a routine that silently stops
+  // happening — no error, no row, nothing to notice until the agent never wakes again.
+  await redis.json.set('schedule:sch_1', '$', {
+    id: 'sch_1',
+    userId: 'source',
+    agentId: 'agent_1',
+    name: 'Morning check',
+    cadence: { type: 'daily', at: '09:00' },
+    timeZone: 'America/Chicago',
+    message: 'Say good morning.',
+    kind: 'info',
+    deliver: 'wake',
+    enabled: true,
+    nextRunAt: '2026-09-09T14:00:00.000Z',
+    lastRunAt: null,
+    lastOutcome: null,
+    lastDmId: null,
+    runCount: 0,
+    missedRun: null,
+    createdBy: 'user',
+    createdAt: '2026-09-07T09:00:00.000Z',
+    updatedAt: '2026-09-07T09:00:00.000Z'
+  })
+  await redis.execute(async (client) => {
+    await client.sAdd('schedules:source', 'sch_1')
+  })
 }
 
 describe('backupRestoreService', () => {
@@ -677,6 +705,29 @@ describe('backupRestoreService', () => {
     expect(preflight.sourceUserId).toBe('source')
     expect(preflight.targetUserId).toBe('target')
     expect(preflight.userRemapRequired).toBe(true)
+  })
+
+  it('files the schedule keys under the `dms` group, not the `chats` fall-through (SA-115)', async () => {
+    // `groupForKey` is the site a round-trip test cannot see: an unregistered key still
+    // exports and still restores, it just lands in whatever group the fall-through picks
+    // (`chats`). The manifest then lies about what each group holds, and a user restoring
+    // "Agent DMs, wake-up webhooks, and schedules" without "Chats" quietly loses the clock.
+    await seedRepresentativeData('source')
+
+    const bundle = await createBackupBundle('source')
+    const entries = unzipSync(bundle.bytes)
+    const grouped = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+      .filter((record) => record.key === 'schedule:sch_1' || record.key === 'schedules:source')
+
+    expect(grouped.map((record) => record.key).sort()).toEqual([
+      'schedule:sch_1',
+      'schedules:source'
+    ])
+    for (const record of grouped) {
+      expect(record.groupId).toBe('dms')
+    }
   })
 
   it('can include encrypted secret records only when requested', async () => {
@@ -898,6 +949,26 @@ describe('backupRestoreService', () => {
       client.sMembers('wake_hooks:target')
     )
     expect(restoredHookIndex).toEqual(['whk_1'])
+
+    // SA-115 P3: the schedule travels too, with its next run and its cadence intact, and
+    // the user-scoped index SET remapped to the target user — without that remap the
+    // record survives and nothing can ever find it.
+    const restoredSchedule = (await redis.json.get('schedule:sch_1')) as Record<string, any>
+    expect(restoredSchedule).toMatchObject({
+      id: 'sch_1',
+      agentId: 'agent_1',
+      name: 'Morning check',
+      cadence: { type: 'daily', at: '09:00' },
+      timeZone: 'America/Chicago',
+      deliver: 'wake',
+      enabled: true,
+      nextRunAt: '2026-09-09T14:00:00.000Z'
+    })
+    expect(restoredSchedule.userId).toBe('target')
+    const restoredScheduleIndex = await redis.execute(async (client) =>
+      client.sMembers('schedules:target')
+    )
+    expect(restoredScheduleIndex).toEqual(['sch_1'])
   })
 
   it('preflights and restores a disk-staged archive without buffering upload assets', async () => {
