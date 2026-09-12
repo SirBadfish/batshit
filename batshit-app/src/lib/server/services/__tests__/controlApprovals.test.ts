@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import {
+  __resetWakeRunRegistryForTests,
+  registerWakeRun
+} from '$lib/server/services/wakeRunRegistry'
 import { redis } from '$lib/server/redis'
 import {
   CONTROL_APPROVAL_TTL_SECONDS,
@@ -874,5 +878,89 @@ describe('a woken turn', () => {
       gateInput({ grant: { kind: 'resume', approvalId: first.request.approvalId } })
     )
     expect(run.kind).toBe('run')
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * SA-117 P2 (DL-117-04) — the woken-turn gate now reads a bound agent id.
+ *
+ * The bypass this closes: `resolveWokenTurnState` consults the server-owned wake registry
+ * ONLY when it is given an agent id, and otherwise falls back to reading the session's
+ * messages. Before SA-117 that id reached this gate from `body.agentId`, so a caller could
+ * switch the registry check off by simply leaving the field out and pointing at a calm chat.
+ *
+ * The other half of the proof lives in `routes/api/controls/use/agent-lane.test.ts`: on the
+ * `agent` lane the route passes the id it read off the run credential even when the body
+ * names none, so the omission this test describes is no longer possible there.
+ * ------------------------------------------------------------------ */
+
+describe('SA-117: the wake registry and the acting agent id', () => {
+  const wakeRun = () => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => {}, 60_000)
+    registerWakeRun({
+      sessionId: 'sess-elsewhere',
+      agentId: AGENT,
+      userId: USER,
+      origin: 'agent-dm' as any,
+      startedAt: Date.now(),
+      controller,
+      timer
+    })
+    return () => {
+      clearTimeout(timer)
+      __resetWakeRunRegistryForTests()
+    }
+  }
+
+  afterEach(() => {
+    __resetWakeRunRegistryForTests()
+  })
+
+  it('treats the turn as woken when an acting agent id is supplied, whatever chat is named', async () => {
+    const cleanup = wakeRun()
+    try {
+      // A calm chat, read from real messages: only the registry can say this is woken.
+      setTurnMessages([typedUserMessage])
+      const decision = await decideRiskGate(gateInput({ agentId: AGENT }))
+      expect(decision.kind).toBe('pause')
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('an omitted acting agent id falls back to the session read — the bypass DL-117-04 closes', async () => {
+    const cleanup = wakeRun()
+    try {
+      setTurnMessages([typedUserMessage])
+      const voice = gateInput({
+        agentId: undefined,
+        controlId: 'sys.voice.engine.complete_local_setup',
+        controlTitle: 'Complete Local Setup',
+        input: { engineId: 'demo' },
+        scopeKey: 'engine:demo'
+      })
+
+      // Seed a window from a real click, then retry with the id omitted. It RIDES the
+      // window, because with no agent id the registry is never consulted — which is
+      // exactly why the route must supply the bound id rather than the body's.
+      const first = await decideRiskGate(voice)
+      if (first.kind !== 'pause') throw new Error('expected a pause')
+      await decideApproval({ userId: USER, approvalId: first.request.approvalId, approved: true })
+
+      const retry = await decideRiskGate({ ...voice, input: { engineId: 'demo', attempt: 2 } })
+      expect(retry.kind).toBe('run')
+
+      // The same retry WITH the acting agent named is refused, which is the state the
+      // `agent` lane is always in now.
+      const bound = await decideRiskGate({
+        ...voice,
+        agentId: AGENT,
+        input: { engineId: 'demo', attempt: 3 }
+      })
+      expect(bound.kind).toBe('pause')
+    } finally {
+      cleanup()
+    }
   })
 })

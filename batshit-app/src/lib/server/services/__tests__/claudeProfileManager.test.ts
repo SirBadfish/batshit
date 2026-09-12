@@ -137,7 +137,10 @@ describe('claudeProfileManager stdio config', () => {
     // deliberately receives no image blocks and the recall note says so.
     expect(mode4Server?.args).toContain('--runtime=claude')
     expect(mode4Server?.env).toEqual({
-      BATSHIT_TOKEN: '${BATSHIT_TOKEN}',
+      // SA-117 DL-117-06: the run credential replaces the instance token. `claudeBridge.ts`
+      // deletes `BATSHIT_TOKEN` from the child environment, so a `${BATSHIT_TOKEN}`
+      // reference here would expand to nothing at all.
+      BATSHIT_AGENT_TOKEN: '${BATSHIT_AGENT_TOKEN}',
       BATSHIT_SESSION_ID: '${BATSHIT_SESSION_ID}',
       // SA-116 DL-116-07: the assistant message id, so a risky-control refusal on this
       // lane becomes an approval card instead of a pause nobody can answer.
@@ -148,6 +151,7 @@ describe('claudeProfileManager stdio config', () => {
       ORIGIN: '${ORIGIN}'
     })
     expect(mode4Server?.env).toHaveProperty('BATSHIT_MESSAGE_ID')
+    expect(mode4Server?.env).not.toHaveProperty('BATSHIT_TOKEN')
   })
 
   it('writes gateway auth headers as env placeholders, keeps secrets out of mcp.json, and returns the spawn env map', async () => {

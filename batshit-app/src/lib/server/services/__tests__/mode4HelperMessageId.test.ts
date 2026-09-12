@@ -19,7 +19,7 @@ const HELPER = path.join(process.cwd(), 'scripts', 'mode4-controls-mcp.cjs')
 
 let server: http.Server
 let baseUrl: string
-const received: Array<{ url: string; body: any }> = []
+const received: Array<{ url: string; body: any; headers: Record<string, any> }> = []
 
 beforeAll(async () => {
   server = http.createServer((req, res) => {
@@ -34,7 +34,7 @@ beforeAll(async () => {
       } catch {
         body = { raw }
       }
-      received.push({ url: req.url ?? '', body })
+      received.push({ url: req.url ?? '', body, headers: req.headers as Record<string, any> })
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: true }))
     })
@@ -61,7 +61,9 @@ async function callHelper(
     {
       env: {
         ...process.env,
-        BATSHIT_TOKEN: 'test-service-token',
+        // SA-117 DL-117-06/07: the managed run exports its credential and NOT the instance
+        // token — `codexBridge.ts` and `claudeBridge.ts` delete that from the child env.
+        BATSHIT_AGENT_TOKEN: 'arc_testcredential.bsac_testsecret',
         ...env
       },
       stdio: ['pipe', 'pipe', 'pipe']
@@ -163,5 +165,84 @@ describe('the mode4 controls helper', () => {
     const call = received.find((entry) => entry.url === '/api/controls/use')
     expect(call).toBeTruthy()
     expect(call?.body?.messageId).toBeUndefined()
+  }, 30000)
+
+  /* ---------------------------------------------------------------------- *
+   * SA-117 P2 (DL-117-08) — the helper's handshake, black-box on the wire.
+   * ---------------------------------------------------------------------- */
+
+  it('presents the run credential and stops claiming an identity in the body', async () => {
+    await callHelper(
+      'mcp_fabric_use',
+      { controlId: 'sys.memory.delete', input: { memoryId: 'mem_1' } },
+      { BATSHIT_SESSION_ID: 'session-1' }
+    )
+
+    const call = received.find((entry) => entry.url === '/api/controls/use')
+    expect(call).toBeTruthy()
+    expect(call?.headers['x-batshit-agent-token']).toBe('arc_testcredential.bsac_testsecret')
+    // The instance token and the user header went with it. On the service lane that header
+    // was simply whatever the caller typed, which is the claim SA-117 stopped believing.
+    expect(call?.headers['x-batshit-service-token']).toBeUndefined()
+    expect(call?.headers['x-batshit-user-id']).toBeUndefined()
+    // DL-117-04: the body names neither, because a differing one is now a 400 and the
+    // server reads both off the credential anyway.
+    expect(call?.body).not.toHaveProperty('userId')
+    expect(call?.body).not.toHaveProperty('agentId')
+    // What the body still carries: the call itself.
+    expect(call?.body?.controlId).toBe('sys.memory.delete')
+    expect(call?.body?.sessionId).toBe('session-1')
+  }, 30000)
+
+  it('fails loudly at startup with no credential, instead of starting and erroring per call', async () => {
+    const child = spawn(
+      process.execPath,
+      [HELPER, '--agent=agent-1', '--user=user-1', `--url=${baseUrl}`, '--runtime=codex'],
+      {
+        env: (() => {
+          const next = { ...process.env }
+          delete next.BATSHIT_AGENT_TOKEN
+          delete next.BATSHIT_TOKEN
+          return next
+        })(),
+        stdio: ['pipe', 'pipe', 'pipe']
+      }
+    )
+
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+    const exitCode = await new Promise<number | null>((resolve) => {
+      child.on('exit', (code) => resolve(code))
+    })
+
+    expect(exitCode).toBe(1)
+    expect(stderr).toContain('BATSHIT_AGENT_TOKEN')
+  }, 30000)
+
+  it('treats an un-expanded ${VAR} placeholder as no credential at all', async () => {
+    // The Claude profile writes a literal `${BATSHIT_AGENT_TOKEN}` map entry. An unset
+    // variable arrives as its own placeholder, and a placeholder is not a credential — the
+    // same rule the message id already followed.
+    const child = spawn(
+      process.execPath,
+      [HELPER, '--agent=agent-1', '--user=user-1', `--url=${baseUrl}`, '--runtime=claude'],
+      {
+        env: { ...process.env, BATSHIT_AGENT_TOKEN: '${BATSHIT_AGENT_TOKEN}' },
+        stdio: ['pipe', 'pipe', 'pipe']
+      }
+    )
+
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+    const exitCode = await new Promise<number | null>((resolve) => {
+      child.on('exit', (code) => resolve(code))
+    })
+
+    expect(exitCode).toBe(1)
+    expect(stderr).toContain('BATSHIT_AGENT_TOKEN')
   }, 30000)
 })

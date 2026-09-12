@@ -2411,6 +2411,51 @@ describe('controlRegistry artifact capability controls', () => {
     )
   })
 
+  it('SA-117 DL-117-10: names the acting agent and the run credential on the agent lane', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    await useControl({
+      userId: 'user-1',
+      controlId: 'sys.artifact.list',
+      actorType: 'agent',
+      agentId: 'agent-cooper',
+      sessionId: 'sess-1',
+      credentialId: 'arc_abc123'
+    })
+
+    // "Which agent acted" has to be RECORDED to be true, and `credentialId` is what says the
+    // `agentId` beside it was bound by the server rather than claimed by the request body.
+    expect(mockRedisJsonSet).toHaveBeenCalledWith(
+      expect.stringMatching(/^control_audit:user-1:/),
+      '$',
+      expect.objectContaining({
+        actorType: 'agent',
+        agentId: 'agent-cooper',
+        sessionId: 'sess-1',
+        credentialId: 'arc_abc123'
+      })
+    )
+  })
+
+  it('SA-117 DL-117-10: writes a null credential on every lane that has none', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    await useControl({
+      userId: 'user-1',
+      controlId: 'sys.artifact.list',
+      actorType: 'service',
+      agentId: 'agent-cooper'
+    })
+
+    // `null`, never absent: a reader must be able to tell "no credential" from a field that a
+    // future writer forgot, and on this lane the `agentId` above is body text.
+    expect(mockRedisJsonSet).toHaveBeenCalledWith(
+      expect.stringMatching(/^control_audit:user-1:/),
+      '$',
+      expect.objectContaining({ actorType: 'service', credentialId: null })
+    )
+  })
+
   it('publishes sys.voice.engine.* controls in findControls without includeDraft', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -3735,5 +3780,154 @@ describe('sys.dm.send delivery modes (SA-114 DL-114-13)', () => {
     expect(properties.steer_fallback.enum).toEqual(['wait', 'wake'])
     expect(control!.schemaHint).toContain('wait | wake | steer')
     expect(control!.description).toContain('steer')
+  })
+})
+
+/* -------------------------------------------------------------------------- *
+ * SA-117 P2 (DL-117-05) — a control that acts as an agent needs an identity the
+ * server minted.
+ *
+ * This is the acceptance criterion in one place: "a caller holding only the instance token
+ * can no longer read, claim, or close another agent's DMs, recall its memories, or manage
+ * its schedules; it can still do everything the user can through the routes that act as the
+ * user." Before SA-117 every one of these ran, using whatever `agentId` the body named.
+ * -------------------------------------------------------------------------- */
+
+describe('SA-117 DL-117-05: identity-bearing controls', () => {
+  const IDENTITY_BEARING = [
+    'sys.dm.read',
+    'sys.dm.list',
+    'sys.dm.claim',
+    'sys.dm.done',
+    'sys.memory.recall',
+    'sys.memory.search',
+    'sys.schedule.list'
+  ] as const
+
+  it('refuses every identity-bearing family on the service lane, naming the agent or not', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    for (const controlId of IDENTITY_BEARING) {
+      const named = await useControl({
+        userId: 'user-1',
+        controlId,
+        // The exact shape of the old hole: the instance token, plus somebody else's name.
+        agentId: 'agent-faye',
+        actorType: 'service',
+        input: {}
+      })
+
+      expect(named.success, `${controlId} should refuse a named agent`).toBe(false)
+      if (named.success) continue
+      expect(named.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+      expect(named.error.message).toContain('acts as an agent')
+
+      const anonymous = await useControl({
+        userId: 'user-1',
+        controlId,
+        actorType: 'service',
+        input: {}
+      })
+      expect(anonymous.success, `${controlId} should refuse an unnamed caller too`).toBe(false)
+    }
+  })
+
+  it('lets the credential lane, the in-process callers, and the user\'s own session through the same gate', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    for (const actorType of ['agent', 'unknown', 'n8n-callback', 'session'] as const) {
+      const result = await useControl({
+        userId: 'user-1',
+        controlId: 'sys.dm.list',
+        agentId: 'agent-cooper',
+        actorType,
+        input: {}
+      })
+
+      // It may still fail for its OWN reasons (no inbox in this fixture); what must never
+      // happen is the identity refusal.
+      if (!result.success) {
+        expect(result.error.code, `${actorType} must pass the identity gate`).not.toBe(
+          'AGENT_IDENTITY_REQUIRED'
+        )
+      }
+    }
+  })
+
+  it('lets a signed-in browser act as one of the user\'s own agents (F-P2-4)', async () => {
+    // The MegaSmoke harness reads and closes DMs as a named agent on the login cookie, and
+    // `/api/dms` and `/api/schedules` already act across every agent on that same cookie. A
+    // session is the user; the user is the authority over the user's agents. The refusal is
+    // for a caller that only HOLDS a token — the instance token or a Portable Skill Token.
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      agentId: 'agent-cooper',
+      actorType: 'session',
+      input: {}
+    })
+
+    if (!result.success) {
+      expect(result.error.code).not.toBe('AGENT_IDENTITY_REQUIRED')
+    }
+  })
+
+  it('refuses a Subagent or Worker run, whose credential is real and names nobody', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      // `subagent_cli_<slug>` — the per-run runtime id, not one of the user's agents.
+      agentId: 'subagent_cli_worker_agent_cooper_1',
+      actorType: 'agent',
+      delegatedRun: true,
+      input: {}
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+    expect(result.error.message).toContain('Subagent or Worker')
+  })
+
+  it('leaves controls that act as the USER alone on the service lane', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    // The Docker gateway and every other service-token caller keep working for everything
+    // that is "the user's". Only acting AS an agent is closed.
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.runtime_addon.prepare',
+      agentId: 'agent-faye',
+      actorType: 'service',
+      input: { addonId: 'fbx2vrma' }
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  it('classifies the three families and nothing else as acting-as-agent', async () => {
+    const { controlActsAsAgent } = await import('../services/fabricRegistry')
+
+    for (const id of ['sys.dm.send', 'sys.memory.save', 'sys.schedule.create']) {
+      expect(controlActsAsAgent(id), id).toBe(true)
+    }
+    for (const id of [
+      'sys.mcp.use',
+      'sys.artifact.update',
+      'sys.cli_tool.create',
+      'sys.slash_command.upsert',
+      'sys.runtime_addon.start',
+      'artifact.something',
+      '',
+      'dm.read'
+    ]) {
+      expect(controlActsAsAgent(id), id).toBe(false)
+    }
+    expect(controlActsAsAgent(undefined)).toBe(false)
+    expect(controlActsAsAgent(42)).toBe(false)
   })
 })

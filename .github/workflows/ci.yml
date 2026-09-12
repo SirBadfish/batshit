@@ -139,6 +139,9 @@ jobs:
           src/lib/server/tests/redisMessageWindows.test.ts
           src/lib/server/tests/folderDeletion.test.ts
           src/lib/server/services/__tests__/backupRestoreService.test.ts
+          src/lib/server/services/__tests__/agentRunCredentials.test.ts
+          src/lib/server/services/__tests__/nativeToolAuth.test.ts
+          src/routes/api/controls/use/agent-lane.test.ts
           src/lib/server/services/dm/__tests__/dmStore.test.ts
           src/lib/server/services/dm/__tests__/dmTools.test.ts
           src/lib/server/services/dm/__tests__/wakeHookStore.test.ts

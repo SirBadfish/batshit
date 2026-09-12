@@ -245,6 +245,15 @@ export interface NativeModeRequest extends ThinkRequest {
   } | null
   groupMemberRun?: boolean
   /**
+   * SA-117 P2 (F-P2-1) — a Subagent or Worker run on a managed CLI lane.
+   *
+   * Set only by `subagentRunner.ts`, never by send-routed's primary turn. It tells the
+   * bridge that `agentId` is the per-run runtime id it derived from the subagent's slug
+   * (`subagent_cli_…`) rather than one of the user's stored agents, so the run credential is
+   * minted without an agent record to check and is marked as unable to act as an agent.
+   */
+  delegatedRun?: boolean
+  /**
    * SA-114 P1 (DL-114-05): takes every steer waiting for this turn and marks it delivered.
    *
    * Only send-routed's PRIMARY API turn supplies it. A subagent run, a Worker, a group

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  isTrustedInternalRequest: vi.fn(),
+  resolveNativeToolUser: vi.fn(),
   executeManagedSubagent: vi.fn(),
   spawnWorkers: vi.fn(),
   redisGetSession: vi.fn(),
@@ -9,8 +9,8 @@ const mocks = vi.hoisted(() => ({
   redisSMembers: vi.fn(),
 }))
 
-vi.mock('$lib/server/services/internalRequestAuth', () => ({
-  isTrustedInternalRequest: mocks.isTrustedInternalRequest,
+vi.mock('$lib/server/services/nativeToolAuth', () => ({
+  resolveNativeToolUser: mocks.resolveNativeToolUser,
 }))
 
 vi.mock('$lib/server/services/subagentRunner', () => ({
@@ -38,8 +38,9 @@ function buildRequest(body: Record<string, unknown>) {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-batshit-service-token': 'token',
-      'x-batshit-user-id': 'user-1',
+      // SA-117 DL-117-08: the subagent bridge presents the run credential Batshit minted
+      // for this run. The instance token and the `x-batshit-user-id` header are gone.
+      'x-batshit-agent-token': 'arc_test.bsac_secret',
     },
     body: JSON.stringify(body),
   })
@@ -48,7 +49,13 @@ function buildRequest(body: Record<string, unknown>) {
 describe('POST /api/subagents/managed-execute', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
-    mocks.isTrustedInternalRequest.mockReturnValue(true)
+    mocks.resolveNativeToolUser.mockResolvedValue({
+      userId: 'user-1',
+      auth: 'agent',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      credentialId: 'arc_test',
+    })
     mocks.redisGetSession.mockResolvedValue({
       id: 'session-1',
       user_id: 'user-1',
@@ -129,6 +136,7 @@ describe('POST /api/subagents/managed-execute', () => {
         projectPath: '/workspace/project',
         workers: [{ task: 'Find the config file' }],
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(200)
@@ -175,6 +183,7 @@ describe('POST /api/subagents/managed-execute', () => {
         messageId: 'parent-msg-7',
         workers: [{ task: 'Find the config file' }],
       }),
+      locals: {},
     } as any)
 
     await expect(response.json()).resolves.toMatchObject({
@@ -195,6 +204,7 @@ describe('POST /api/subagents/managed-execute', () => {
         projectPath: '/Users/example/batshit',
         timeoutMs: 45000,
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(200)
@@ -233,7 +243,7 @@ describe('POST /api/subagents/managed-execute', () => {
   })
 
   it('rejects untrusted internal calls before loading runtime state', async () => {
-    mocks.isTrustedInternalRequest.mockReturnValue(false)
+    mocks.resolveNativeToolUser.mockResolvedValue(null)
 
     const response = await routeModule.POST({
       request: buildRequest({
@@ -242,6 +252,7 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'hello',
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(401)
@@ -281,6 +292,7 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'hello',
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(403)
@@ -333,6 +345,7 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'hello',
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(200)
@@ -376,6 +389,7 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'this should time out',
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(200)
@@ -401,6 +415,7 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'run without a configured model',
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(400)
@@ -420,6 +435,7 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'hello',
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(200)
@@ -447,6 +463,7 @@ describe('POST /api/subagents/managed-execute', () => {
           chatInput: 'hello',
           thread: sent,
         }),
+        locals: {},
       } as any)
 
       expect(mocks.executeManagedSubagent).toHaveBeenCalledWith(
@@ -469,6 +486,7 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'hello',
       }),
+      locals: {},
     } as any)
 
     expect(response.status).toBe(200)
@@ -504,11 +522,71 @@ describe('POST /api/subagents/managed-execute', () => {
         sessionId: 'session-1',
         chatInput: 'hello',
       }),
+      locals: {},
     } as any)
 
     expect(await response.json()).toMatchObject({
       thread: 'resumed',
       threadNote: expect.stringContaining('outlived its own in-flight lock'),
     })
+  })
+  /* ---------------------------------------------------------------------- *
+   * SA-117 P2 (DL-117-04, DL-117-05, DL-117-08) — this route acts AS a primary agent.
+   *
+   * It spawns Subagents and Workers on that agent's behalf, bills them to its turn, and
+   * reads its provider settings. It used to accept three unverified claims — the instance
+   * token, an `x-batshit-user-id` header, and a body `agentId` — none of them checked
+   * against each other. AMD-117-01 says a shape kept alive only for a legacy caller is
+   * void, and its only production caller now presents a run credential.
+   * ---------------------------------------------------------------------- */
+
+  it('refuses a caller holding only the instance token', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue({ userId: 'user-1', auth: 'service' })
+
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'agent-1',
+        subagentId: 'api-subagent',
+        sessionId: 'session-1',
+        chatInput: 'hello',
+      }),
+      locals: {},
+    } as any)
+
+    expect(response.status).toBe(403)
+    expect((await response.json()).error.code).toBe('AGENT_IDENTITY_REQUIRED')
+    expect(mocks.executeManagedSubagent).not.toHaveBeenCalled()
+  })
+
+  it('refuses a body agentId that differs from the bound one instead of correcting it', async () => {
+    const response = await routeModule.POST({
+      request: buildRequest({
+        agentId: 'another-agents-id',
+        subagentId: 'api-subagent',
+        sessionId: 'session-1',
+        chatInput: 'hello',
+      }),
+      locals: {},
+    } as any)
+
+    expect(response.status).toBe(400)
+    expect((await response.json()).error.code).toBe('AGENT_MISMATCH')
+    expect(mocks.executeManagedSubagent).not.toHaveBeenCalled()
+  })
+
+  it('runs with no body agentId at all, because the credential already named the agent', async () => {
+    const response = await routeModule.POST({
+      request: buildRequest({
+        subagentId: 'api-subagent',
+        sessionId: 'session-1',
+        chatInput: 'hello',
+      }),
+      locals: {},
+    } as any)
+
+    expect(response.status).toBe(200)
+    expect(mocks.executeManagedSubagent).toHaveBeenCalledWith(
+      expect.objectContaining({ parentAgentId: 'agent-1' })
+    )
   })
 })

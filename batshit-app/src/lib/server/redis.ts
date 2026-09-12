@@ -1320,6 +1320,15 @@ export class RedisService {
       '$lib/server/services/schedules/scheduleStore'
     )
     await sweepAgentSchedules(id)
+    // SA-117 P1 (DL-117-09): a managed CLI run credential naming a deleted agent is a live
+    // credential that authenticates as nobody, so it goes with the agent. Its index is
+    // agent-scoped rather than user-scoped, so unlike the three sweeps above this one does not
+    // need `agent.user_id` — it still runs BEFORE the record delete so the destructive order
+    // stays one rule instead of two. Same dynamic-import reason as above.
+    const { sweepAgentRunCredentials } = await import(
+      '$lib/server/services/agentRunCredentials'
+    )
+    await sweepAgentRunCredentials(id)
     return this.execute(async (client) => {
       // Get agent to find user_id
       const agent = await client.json.get(`agent:${id}`)

@@ -1054,6 +1054,10 @@ async function runCliSubagent(
         messageId: runMessageId,
         userId: params.userId,
         agentId: runtimeId,
+        // SA-117 F-P2-1: `runtimeId` is `subagent_cli_<slug>`, a per-run identity with no
+        // `agent:` record behind it. The bridge mints this run's credential for it anyway
+        // (the helper needs one) and marks it as unable to act as an agent.
+        delegatedRun: true,
         agentSlug: subagentSlug,
         model: modelId,
         messages,
@@ -1101,6 +1105,10 @@ async function runCliSubagent(
         messageId: runMessageId,
         userId: params.userId,
         agentId: runtimeId,
+        // SA-117 F-P2-1: `runtimeId` is `subagent_cli_<slug>`, a per-run identity with no
+        // `agent:` record behind it. The bridge mints this run's credential for it anyway
+        // (the helper needs one) and marks it as unable to act as an agent.
+        delegatedRun: true,
         agentSlug: subagentSlug,
         model: modelId,
         messages,

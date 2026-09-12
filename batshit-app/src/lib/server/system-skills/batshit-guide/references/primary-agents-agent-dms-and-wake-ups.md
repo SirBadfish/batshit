@@ -262,6 +262,8 @@ You do not have to take Batshit down.
 
 Check the drawer afterwards for chats you did not expect. Every wake-up leaves a row saying which hook sent it and which chat it started.
 
+A webhook token is one of several secrets Batshit uses, and they are deliberately different sizes. [Security and trust](../security/overview.md#tokens-and-what-a-leak-can-do) lists all of them side by side and says what a leak of each one actually costs — including why holding your install's own service secret still does not let anything read one of your agents' DMs.
+
 ## The limits, with their numbers
 
 These are fixed in v1 except the time limit, which is a per-agent setting.

@@ -15,6 +15,7 @@ import { logger } from '$lib/utils/logger'
 import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
 import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelectionResolver'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
 
 interface ExecuteRequest {
   userId?: string                    // Required for service token auth
@@ -76,9 +77,17 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       : Array.isArray(body.gatewayFilter)
         ? body.gatewayFilter
         : undefined
+    // SA-117 DL-117-04: `agentId` here is a gateway SCOPE hint, not an act-as claim — but a
+    // hint the server minted still beats one the body typed, and a body id that differs from
+    // the bound one means a caller is confused about which agent it is.
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return apiFailure(agentBinding.message, 400, { toolName }) as Response
+    }
+
     const scopeResolution = await resolveDynamicMcpGatewayScope({
       userId,
-      agentId: body.agentId ?? null,
+      agentId: agentBinding.agentId ?? null,
       selectedGateways
     })
 

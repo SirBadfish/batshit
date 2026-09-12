@@ -388,4 +388,99 @@ describe('/api/native-tools/dispatch', () => {
       }
     })
   })
+  /* ---------------------------------------------------------------------- *
+   * SA-117 P2 (DL-117-04) — the dispatch context's agent id.
+   * ---------------------------------------------------------------------- */
+
+  const agentLaneAuth = {
+    userId: 'user-1',
+    auth: 'agent',
+    agentId: 'agent-cooper',
+    sessionId: 'session-bound',
+    credentialId: 'arc_test',
+    projectPath: null
+  }
+
+  it('binds the governing agent and the session from the run credential', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+
+    await POST({
+      request: request({
+        action: 'bash_execute',
+        input: { command: 'echo hi' },
+        // The managed helper stopped sending `agent_id`; the route fills it in.
+        context: { session_id: 'session-claimed', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: {
+          session_id: 'session-bound',
+          agent_id: 'agent-cooper',
+          mode: 'mode4',
+          actor_type: 'primary'
+        }
+      })
+    )
+  })
+
+  it('refuses a context agent id that differs, and dispatches nothing', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
+
+    const response = await POST({
+      request: request({
+        action: 'bash_execute',
+        input: { command: 'echo hi' },
+        context: {
+          session_id: 'session-bound',
+          agent_id: 'agent-faye',
+          mode: 'mode4',
+          actor_type: 'primary'
+        }
+      }),
+      locals: {}
+    } as any)
+
+    expect(response.status).toBe(400)
+    expect((await response.json()).error.code).toBe('AGENT_MISMATCH')
+    expect(mocks.dispatchNativeAutomationPackAction).not.toHaveBeenCalled()
+  })
+
+  it('reads the run project path on the agent lane, as it did on the service lane', async () => {
+    // The managed CLI helper moved lanes and still sends the run's project path; a route
+    // that only recognised `service` would have silently dropped it.
+    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+
+    await POST({
+      request: request({
+        action: 'bash_execute',
+        input: { command: 'echo hi' },
+        projectPath: '/Users/josh/batshit',
+        context: { session_id: 'session-bound', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(
+      expect.objectContaining({ projectPath: '/Users/josh/batshit' })
+    )
+  })
+
+  it('leaves the context alone on the service lane', async () => {
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+
+    const context = { session_id: 's', agent_id: 'agent-faye', mode: 'mode2', actor_type: 'primary' }
+    await POST({
+      request: request({ action: 'bash_execute', input: { command: 'echo hi' }, context }),
+      locals: {}
+    } as any)
+
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(
+      expect.objectContaining({ context })
+    )
+  })
 })

@@ -46,6 +46,11 @@ import {
   recipeStateSnapshotSha256
 } from '$lib/goons/recipe'
 import {
+  agentRunCredentialKey,
+  agentRunCredentialsIndexKey,
+  mintRunCredential
+} from '$lib/server/services/agentRunCredentials'
+import {
   BackupRestoreError,
   beginBackupRestoreMaintenance,
   createBackupBundle,
@@ -728,6 +733,61 @@ describe('backupRestoreService', () => {
     for (const record of grouped) {
       expect(record.groupId).toBe('dms')
     }
+  })
+
+  it('leaves managed CLI run credentials out of the backup on BOTH sides (SA-117 DL-117-09)', async () => {
+    // Transient run state, like `subagent_lock:`. A wake hook's `tokenHash` IS exported,
+    // because a hook is a durable thing the user made and a restore without the hash leaves it
+    // permanently unauthenticatable. A run credential is the opposite: it names one managed
+    // CLI turn that has already ended, so a restored one could only ever authenticate as an
+    // agent for a run nobody is taking — which is a live credential handed back for free.
+    await seedRepresentativeData('source')
+    const { credentialId } = await mintRunCredential({
+      userId: 'source',
+      agentId: 'agent_1',
+      sessionId: 'sess_1',
+      runtime: 'codex'
+    })
+    const recordKey = agentRunCredentialKey(credentialId)
+    const indexKey = agentRunCredentialsIndexKey('agent_1')
+    expect(await redis.exists(recordKey)).toBeTruthy()
+
+    // Half one: never collected, so never exported. Includes the agent-scoped index SET,
+    // which `collectCandidateKeys` reads for the wake-hook and schedule families.
+    const bundle = await createBackupBundle('source')
+    const exportedKeys = Object.entries(unzipSync(bundle.bytes))
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')).key as string)
+    expect(exportedKeys).not.toContain(recordKey)
+    expect(exportedKeys).not.toContain(indexKey)
+
+    // Half two: `isRestorableKeyForUser` refuses it, so a hand-built or future archive
+    // carrying one is rejected outright rather than quietly writing a credential.
+    const entries = unzipSync(bundle.bytes)
+    const records = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([name, value]) => {
+        delete entries[name]
+        return JSON.parse(Buffer.from(value).toString('utf8')) as Record<string, any>
+      })
+    records.push({
+      key: recordKey,
+      type: 'json',
+      groupId: 'chats',
+      value: (await redis.json.get(recordKey)) as Record<string, any>
+    })
+    records.forEach((record, index) => {
+      entries[`redis/records/${String(index + 1).padStart(8, '0')}.json`] = Buffer.from(
+        JSON.stringify(record)
+      )
+    })
+    const manifest = JSON.parse(Buffer.from(entries['manifest.json']).toString('utf8'))
+    manifest.contents.redisRecordCount = records.length
+    entries['manifest.json'] = Buffer.from(JSON.stringify(manifest))
+
+    await expect(
+      restoreBackupBundle('target', zipSync(entries), { confirmReplace: true })
+    ).rejects.toThrow(/will not restore/i)
   })
 
   it('can include encrypted secret records only when requested', async () => {

@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 
 import { findCliTools } from '$lib/server/services/cliToolRegistry'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
 
 interface FindRequest {
   userId?: string
@@ -26,9 +27,18 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       return json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    // SA-117 DL-117-04: the bound agent wins on the agent lane; a differing claim is a 400.
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json(
+        { error: agentBinding.message, code: agentBinding.code },
+        { status: 400 }
+      )
+    }
+
     const result = await findCliTools({
       userId,
-      agentId: body.agentId ?? null,
+      agentId: agentBinding.agentId ?? null,
       selectedToolIds: body.selectedToolIds,
       query: body.query,
       limit: body.limit,

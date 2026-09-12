@@ -11,6 +11,12 @@ import {
   getSchedule
 } from '$lib/server/services/schedules/scheduleStore'
 import { schedulesIndexKey } from '$lib/server/services/schedules/scheduleKeys'
+import {
+  agentRunCredentialsIndexKey,
+  getRunCredential,
+  mintRunCredential,
+  validateRunCredential
+} from '$lib/server/services/agentRunCredentials'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 
 useRedisTestServer()
@@ -117,5 +123,57 @@ describe.runIf(REAL_REDIS_LANE)('schedule cleanup after agent deletion (SA-115)'
     expect(await indexMembers()).toEqual([survivor.id])
     // The other agent's clock keeps ticking.
     expect(await getSchedule(survivor.id)).not.toBeNull()
+  })
+})
+
+/**
+ * SA-117 P1 (DL-117-09) — the fourth sweep `deleteAgent` owes.
+ *
+ * `sweepAgentRunCredentials` existing is not the same as it being CALLED, and the store's own
+ * suite cannot tell the difference: it runs against the in-memory fake, which has no
+ * `deleteAgent`. The claim here is about the real method, so it lives beside the other three.
+ *
+ * What an unswept credential is, plainly: a live secret that authenticates as an agent that no
+ * longer exists. Every route that acts on it would then look the agent up and fail, or worse,
+ * act on whatever a re-created agent of the same id turns out to be.
+ */
+describe.runIf(REAL_REDIS_LANE)('run credential cleanup after agent deletion (SA-117)', () => {
+  beforeEach(async () => {
+    await seedAgent('agent-cred-a', 'Cred A')
+    await seedAgent('agent-cred-b', 'Cred B')
+  })
+
+  async function credentialIndexMembers(agentId: string): Promise<string[]> {
+    const members = await redis.execute(async (client) =>
+      client.sMembers(agentRunCredentialsIndexKey(agentId))
+    )
+    return (Array.isArray(members) ? (members as string[]) : []).sort()
+  }
+
+  it('deletes that agent\u2019s run credentials and their index, and only theirs', async () => {
+    const doomed = await mintRunCredential({
+      userId,
+      agentId: 'agent-cred-a',
+      sessionId: 'sess-cred-a',
+      runtime: 'codex'
+    })
+    const survivor = await mintRunCredential({
+      userId,
+      agentId: 'agent-cred-b',
+      sessionId: 'sess-cred-b',
+      runtime: 'claude'
+    })
+
+    await redis.deleteAgent('agent-cred-a')
+
+    expect(await getRunCredential(doomed.credentialId)).toBeNull()
+    // The secret itself stops working, which is the property that actually matters.
+    expect(await validateRunCredential(doomed.token)).toMatchObject({ valid: false })
+    expect(await credentialIndexMembers('agent-cred-a')).toEqual([])
+
+    // The other agent's live run is untouched.
+    expect(await getRunCredential(survivor.credentialId)).not.toBeNull()
+    expect(await validateRunCredential(survivor.token)).toMatchObject({ valid: true })
+    expect(await credentialIndexMembers('agent-cred-b')).toEqual([survivor.credentialId])
   })
 })

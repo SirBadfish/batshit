@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { redis } from '$lib/server/redis'
 import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
+import { requireActingAgentIdentity } from '$lib/server/services/actingAgentIdentity'
 import {
   DEFAULT_DYNAMIC_MCP_RESULTS,
   MAX_DYNAMIC_MCP_RESULTS,
@@ -2815,11 +2816,63 @@ export interface ControlUseOptions {
   approval?: ControlApprovalGrant
   runtimeMode?: ControlRuntimeMode
   actorType?: ControlActorType
+  /**
+   * SA-117 DL-117-10 — the run credential this call arrived on, on the `agent` lane only.
+   *
+   * Recorded, never checked here: `resolveNativeToolUser` already validated it, and the
+   * `agentId` above is the bound one that came off the same record.
+   */
+  credentialId?: string
+  /**
+   * SA-117 P2 (F-P2-1) — the call arrived on a Subagent or Worker run's credential.
+   *
+   * Forwarded by `/api/controls/use` from `resolveNativeToolUser`. It is the one case where
+   * a valid `agent`-lane credential still cannot act as an agent, because the agent it names
+   * is a per-run runtime id rather than one of the user's agents.
+   */
+  delegatedRun?: boolean
   selectedGateways?: string[]
   allowedControlIds?: string[]
 }
 
-type ControlActorType = 'service' | 'session' | 'internal' | 'n8n-callback' | 'portable-skill' | 'unknown'
+/**
+ * SA-117 P1 (DL-117-03, DL-117-10) — who called, as the audit records it.
+ *
+ * Assigned straight from `resolveNativeToolUser`'s `auth` at `/api/controls/use`, so this union
+ * tracks `NativeToolAuthMethod` (which is exported for exactly that reason) plus `'unknown'`
+ * for the in-process callers that declare nothing.
+ *
+ * `'agent'` is new: a Batshit-minted run credential, so the acting agent on the entry was bound
+ * by the server rather than named by the body. `'internal'` is GONE — no lane ever produced it,
+ * so every entry that looked like it might have been an internal caller was really `'unknown'`,
+ * and keeping an unreachable value in a security-relevant union invites a future reader to
+ * "restore" a meaning it never had.
+ */
+type ControlActorType = 'agent' | 'service' | 'session' | 'n8n-callback' | 'portable-skill' | 'unknown'
+
+/**
+ * SA-117 DL-117-05 — the control families that act AS an agent.
+ *
+ * Each of these reads the acting agent out of `ControlExecutionContext.agentId` and uses it
+ * as an IDENTITY rather than a scope hint: `sys.dm.*` reads and closes that agent's inbox,
+ * `sys.memory.*` reads and writes that agent's memories and owned media, and `sys.schedule.*`
+ * puts that agent on a clock (self-only, keyed on the same field). Their three context
+ * adapters — `dmControlContext`, `memoryControlContext`, `scheduleControlContext` — are
+ * where that id becomes the acting agent.
+ *
+ * Controls left OUT of this list, and why: `executeDynamicMcpFind`/`Use` pass `agentId` as a
+ * gateway SCOPE hint, the artifact family reads it only to record whether a person or an
+ * agent started a publish, and the slash-command control uses it to seed an enabled-agent
+ * list the caller can set explicitly anyway. None of them can read or change something that
+ * belongs to an agent by naming it.
+ */
+const ACTING_AGENT_CONTROL_PREFIXES = ['sys.dm.', 'sys.memory.', 'sys.schedule.'] as const
+
+export function controlActsAsAgent(controlId: unknown): boolean {
+  if (typeof controlId !== 'string') return false
+  const id = controlId.trim()
+  return ACTING_AGENT_CONTROL_PREFIXES.some((prefix) => id.startsWith(prefix))
+}
 
 export type ControlUseErrorCode =
   | 'CONTROL_NOT_FOUND'
@@ -2832,6 +2885,8 @@ export type ControlUseErrorCode =
   | 'CONTROL_RISK_UNAVAILABLE_IN_GROUP'
   | 'CONTROL_NOT_EXECUTABLE'
   | 'CONTROL_EXECUTION_FAILED'
+  // SA-117 DL-117-05: the control acts as an agent and the lane cannot name one.
+  | 'AGENT_IDENTITY_REQUIRED'
 
 export type ControlUseResult =
   | {
@@ -2864,9 +2919,16 @@ type ControlAuditEntry = {
    * came to run (a click, the scoped voice window, or a Portable Skill Token's scope) and
    * is `null` for anything that did not need one; `paused` records the pauses, which are
    * the entries that show a card was raised. No reader page is built here (deferred).
+   *
+   * SA-117 DL-117-10 adds `credentialId`, and with it the answer to "was that `agentId` the
+   * caller's word or the server's?". On `actorType: 'agent'` it names the run credential the
+   * server minted and validated, so the `agentId` beside it is bound; it is `null` on every
+   * other lane, where `agentId` is server-owned (the in-process API broker) or body text (the
+   * service lane, which after DL-117-05 can no longer act AS an agent at all).
    */
   agentId: string | null
   sessionId: string | null
+  credentialId: string | null
   approval: ControlApprovalAudit | null
   paused: boolean
   controlId: string
@@ -7146,6 +7208,8 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       actorType,
       agentId: typeof options.agentId === 'string' ? options.agentId.trim() || null : null,
       sessionId: typeof options.sessionId === 'string' ? options.sessionId.trim() || null : null,
+      credentialId:
+        typeof options.credentialId === 'string' ? options.credentialId.trim() || null : null,
       approval: riskApproval,
       paused: riskApprovalPaused,
       controlId: definition?.controlId ?? requestedControlId,
@@ -7230,6 +7294,37 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       },
       control
     )
+  }
+
+  /**
+   * SA-117 DL-117-05 — a control that acts as an agent needs an identity the server minted.
+   *
+   * It sits here, after scope and visibility and before everything that costs work, because
+   * it is an authorization answer rather than a validation one. `requireActingAgentIdentity`
+   * is the whole rule and it is never restated inline: a `service`-lane caller holds the
+   * instance token and then NAMES an agent, which is exactly the claim this story stopped
+   * believing. The in-process API broker (`unknown`) and the `agent` lane pass, because on
+   * both the `agentId` reaching the handler was set by the server.
+   *
+   * It is audited like any other refusal, so "who tried to read whose inbox" is recorded.
+   */
+  if (control && controlActsAsAgent(control.controlId)) {
+    const identity = requireActingAgentIdentity(actorType, {
+      delegated: options.delegatedRun === true
+    })
+    if (!identity.ok) {
+      return await finalize(
+        {
+          success: false,
+          controlId: effectiveControlId,
+          error: {
+            code: identity.code,
+            message: identity.message
+          }
+        },
+        control
+      )
+    }
   }
 
   if (control.status !== 'published') {

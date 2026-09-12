@@ -320,6 +320,9 @@
 	    buildExecutionToolActivityEntries({
         steps: snapshotIntermediateSteps,
         llmCalls: snapshotLlmCalls,
+        // SA-117 DL-117-10 (AMD-117-02): the turn's own agent, so a step run by a DIFFERENT
+        // agent can be labelled and every step run by this one stays unlabelled.
+        sessionAgentId: currentSnapshot?.agentId ?? null,
       })
 	  )
 
@@ -1538,6 +1541,15 @@
                                 {toolActivityStatusLabel(selectedToolActivity.status)}
                               </Badge>
                             </div>
+
+                            {#if selectedToolActivity.actingAgentId}
+                              <div class="execution-viewer-stack-xs execution-viewer-helper">
+                                <div>
+                                  • Acting agent: {selectedToolActivity.actingAgentId} (not this
+                                  chat's agent)
+                                </div>
+                              </div>
+                            {/if}
 
                             {#if selectedToolActivity.notes.length > 0}
                               <div class="execution-viewer-stack-xs execution-viewer-helper">

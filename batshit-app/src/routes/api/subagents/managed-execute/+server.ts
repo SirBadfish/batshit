@@ -9,7 +9,11 @@ import {
   normalizeSubagentType,
   type SubagentType,
 } from '$lib/utils/subagentType'
-import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
+import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import {
+  bindActingAgentId,
+  requireActingAgentIdentity
+} from '$lib/server/services/actingAgentIdentity'
 import { executeManagedSubagent } from '$lib/server/services/subagentRunner'
 import {
   isSubagentBusyError,
@@ -92,14 +96,37 @@ function statusForExecutionError(message: string) {
   return 500
 }
 
-export const POST: RequestHandler = async ({ request }) => {
-  if (!isTrustedInternalRequest(request)) {
+export const POST: RequestHandler = async ({ request, locals }) => {
+  /**
+   * SA-117 DL-117-05 / DL-117-08 — this route spawns a Subagent or a batch of Workers AS a
+   * primary agent, bills them to that agent's turn, and reads that agent's provider
+   * settings. That makes it identity-bearing, so it needs an identity the server minted.
+   *
+   * It used to accept the instance token plus an `x-batshit-user-id` header plus a body
+   * `agentId`: three claims, none of them verified against each other. Its ONLY production
+   * caller is `scripts/codex-subagent-mcp.cjs`, which now presents the run credential, and
+   * AMD-117-01 says a shape kept alive only for a legacy caller is void rather than
+   * preserved — so the instance-token path is gone rather than left open beside the
+   * credential.
+   */
+  const auth = await resolveNativeToolUser({
+    request,
+    localsUserId: locals.user?.id ?? null
+  })
+  if (!auth) {
     return jsonError(401, 'unauthorized', 'Managed subagent execution requires trusted Batshit internal auth.')
   }
 
-  const userId = readString(request.headers.get('x-batshit-user-id'))
+  // The `delegated` half also keeps delegation one level deep on this route: a Subagent or
+  // Worker run cannot spawn another one by calling here with its own credential.
+  const identity = requireActingAgentIdentity(auth.auth, { delegated: auth.delegated })
+  if (!identity.ok) {
+    return jsonError(403, identity.code, identity.message)
+  }
+
+  const userId = auth.userId
   if (!userId) {
-    return jsonError(400, 'missing_user', 'Managed subagent execution requires x-batshit-user-id.')
+    return jsonError(400, 'missing_user', 'Managed subagent execution requires a caller identity.')
   }
 
   let body: ManagedExecuteBody
@@ -109,7 +136,13 @@ export const POST: RequestHandler = async ({ request }) => {
     return jsonError(400, 'invalid_json', 'Request body must be valid JSON.')
   }
 
-  const agentId = readString(body.agentId)
+  // DL-117-04: the calling primary agent is bound off the credential; a differing body id is
+  // refused rather than silently replaced.
+  const agentBinding = bindActingAgentId(auth, body.agentId)
+  if (!agentBinding.ok) {
+    return jsonError(400, agentBinding.code, agentBinding.message)
+  }
+  const agentId = agentBinding.agentId ?? ''
   const subagentId = readString(body.subagentId)
   const sessionId = readString(body.sessionId)
   const chatInput = typeof body.chatInput === 'string' ? body.chatInput : ''

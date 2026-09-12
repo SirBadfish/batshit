@@ -148,7 +148,10 @@ describe('codexProfileManager dynamic-only managed config', () => {
     // ride back as MCP image content. Codex renders those blocks.
     expect(mode4Server?.args).toContain('--runtime=codex')
     expect(mode4Server?.env_vars).toEqual([
-      'BATSHIT_TOKEN',
+      // SA-117 DL-117-06: the helper forwards THIS run's credential, not the instance
+      // token — which `codexBridge.ts` now deletes from the child environment entirely, so
+      // forwarding its name here would forward nothing.
+      'BATSHIT_AGENT_TOKEN',
       'BATSHIT_SESSION_ID',
       // SA-116 DL-116-07: the helper needs the assistant message id, or a risky-control
       // refusal on this lane records a pause with no card the user can click.
@@ -159,6 +162,7 @@ describe('codexProfileManager dynamic-only managed config', () => {
       'ORIGIN'
     ])
     expect(mode4Server?.env_vars).toContain('BATSHIT_MESSAGE_ID')
+    expect(mode4Server?.env_vars).not.toContain('BATSHIT_TOKEN')
     expect(mode4Server?.default_tools_approval_mode).toBe('approve')
   })
 
@@ -309,8 +313,12 @@ describe('codexProfileManager dynamic-only managed config', () => {
     expect(subagentServer).toBeTruthy()
     expect(subagentServer?.args).toContain('--url=http://localhost:5620')
     expect(subagentServer?.env_vars).toEqual([
-      'BATSHIT_TOKEN',
-      'MCP_GATEWAY_AUTH_TOKEN',
+      // SA-117 DL-117-06/08: the run credential replaces `BATSHIT_TOKEN`, and
+      // `MCP_GATEWAY_AUTH_TOKEN` goes with it — the subagent bridge only ever read the
+      // gateway token as a fallback SPELLING of the instance token, never to reach a
+      // gateway. The Redis variables stay, by explicit decision (SA-117 Scope): that bridge
+      // reads Redis directly, and removing them is the follow-up story.
+      'BATSHIT_AGENT_TOKEN',
       'REDIS_URL',
       'REDIS_CONNECTION_STRING',
       'REDIS_PASSWORD',
@@ -321,6 +329,7 @@ describe('codexProfileManager dynamic-only managed config', () => {
       // SA-111 P4: the parent turn id, so the bridge can pass it to the Workers cap.
       'BATSHIT_MESSAGE_ID'
     ])
+    expect(subagentServer?.env_vars).not.toContain('BATSHIT_TOKEN')
     expect(subagentServer?.default_tools_approval_mode).toBe('approve')
     // SA-111 P4: the same bridge carries the Workers batch tool; Workers default ON.
     expect(subagentServer?.enabled_tools).toEqual(['subagent_subagent_1', 'spawn_workers'])

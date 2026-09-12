@@ -19,6 +19,7 @@ import { resolveMCPSelections } from '$lib/server/services/mcpSelectionResolver'
 import type { GatewayMetadata } from '$lib/server/services/mcpGatewayTypes'
 import type { MCPSelectionResolution } from '$lib/server/services/mcpSelectionResolver'
 import { getDockerGatewayAuthToken } from '$lib/server/services/dockerGatewayConfig'
+import { AGENT_RUN_CREDENTIAL_ENV_VAR } from '$lib/server/services/agentRunCredentials'
 import { migrateLegacyN8nInstanceMcpTokens } from '$lib/server/services/mcpGatewayTokenMigration'
 import { resolveNativeToolSettings } from '$lib/server/services/nativeTools'
 import {
@@ -57,7 +58,6 @@ const CODEX_DIR_NAME = '.codex'
 const REAL_CODEX_HOME = path.join(os.homedir(), CODEX_DIR_NAME)
 export const DOCKER_AUTH_ENV_VAR = 'BATSHIT_DOCKER_MCP_TOKEN'
 export const N8N_INSTANCE_MCP_TOKEN_ENV = 'BATSHIT_N8N_INSTANCE_MCP_TOKEN'
-export const BATSHIT_TOKEN_ENV_VAR = 'BATSHIT_TOKEN'
 const UNGROUPED_GROUP_SLUG = 'ungrouped'
 const UNGROUPED_GROUP_LABEL = 'Ungrouped Tools'
 const MANAGED_CONFIG_OVERRIDE_KEYS = new Set([
@@ -606,8 +606,11 @@ async function buildManagedServers(params: {
         `--url=${helperBaseUrl}`
       ],
       envVars: [
-        BATSHIT_TOKEN_ENV_VAR,
-        'MCP_GATEWAY_AUTH_TOKEN',
+        // SA-117 DL-117-06/08: the subagent bridge authenticates with THIS run's credential.
+        // `BATSHIT_TOKEN` is gone from the list because the bridge no longer reads it, and
+        // `MCP_GATEWAY_AUTH_TOKEN` is gone because it was only ever that token's fallback
+        // spelling here — the bridge never talked to the Docker gateway.
+        AGENT_RUN_CREDENTIAL_ENV_VAR,
         'REDIS_URL',
         'REDIS_CONNECTION_STRING',
         'REDIS_PASSWORD',
@@ -672,7 +675,9 @@ async function buildManagedServers(params: {
         '--runtime=codex'
       ],
       envVars: [
-        BATSHIT_TOKEN_ENV_VAR,
+        // SA-117 DL-117-06: the helper presents this run's credential instead of the
+        // instance token, which `codexBridge.ts` now deletes from the child environment.
+        AGENT_RUN_CREDENTIAL_ENV_VAR,
         'BATSHIT_SESSION_ID',
         // SA-116 DL-116-07: the assistant message a risky-control refusal pins its
         // approval card onto. Without it the pause is recorded with no card to click.

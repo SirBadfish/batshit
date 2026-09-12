@@ -3,6 +3,8 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { executeCliTool } from '$lib/server/services/cliToolRegistry'
 import { resolveApprovalCardTarget } from '$lib/server/services/controlApprovals'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
+import { bindActingSessionId } from '$lib/server/services/actingAgentIdentity'
 
 interface ExecuteRequest {
   userId?: string
@@ -45,22 +47,30 @@ export const POST: RequestHandler = async ({ locals, request }) => {
         ? body.projectPath.trim()
         : null
 
+    // SA-117 DL-117-04: the bound agent and the bound session win on the agent lane.
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json({ error: agentBinding.message, code: agentBinding.code }, { status: 400 })
+    }
+
     const { sessionId, messageId } = await resolveApprovalCardTarget({
       userId,
-      sessionId: body.sessionId,
+      sessionId: bindActingSessionId(auth, body.sessionId),
       messageId: body.messageId
     })
 
     const result = await executeCliTool({
       userId,
-      agentId: body.agentId ?? null,
+      agentId: agentBinding.agentId ?? null,
       sessionId,
       messageId,
       toolId: body.toolId,
       input: body.input ?? {},
       selectedToolIds: body.selectedToolIds,
       allowRisky: body.allowRisky === true,
-      projectPath: auth.auth === 'service' ? bodyProjectPath : null
+      // SA-117: the managed CLI helper moved from the service lane to the agent lane and
+      // still sends the run's project path, so the agent lane reads it the same way.
+      projectPath: auth.auth === 'service' || auth.auth === 'agent' ? bodyProjectPath : null
     })
 
     return json(result, { status: result.success ? 200 : result.code === 'NOT_FOUND' ? 404 : 200 })

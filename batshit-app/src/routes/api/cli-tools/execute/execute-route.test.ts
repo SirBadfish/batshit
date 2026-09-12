@@ -102,4 +102,53 @@ describe('/api/cli-tools/execute — where a cli: pause pins its card', () => {
     expect(params.sessionId).toBe('session-1')
     expect(params.messageId).toBeUndefined()
   })
+  /* ---------------------------------------------------------------------- *
+   * SA-117 P2 (DL-117-04) — the managed CLI helper moved to the `agent` lane.
+   * ---------------------------------------------------------------------- */
+
+  const agentLaneAuth = {
+    auth: 'agent',
+    userId: 'user-1',
+    agentId: 'agent-cooper',
+    sessionId: 'session-1',
+    credentialId: 'arc_test'
+  }
+
+  it('uses the bound agent and still reads the run project path', async () => {
+    // The project path check used to be `auth.auth === 'service'` only. The helper that
+    // sends it is on the agent lane now, so a route that forgot to widen the check would
+    // have silently run every user CLI tool outside its project.
+    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
+
+    await POST({
+      request: request({
+        toolId: 'repo_snapshot',
+        input: { query: 'x' },
+        sessionId: 'session-1',
+        projectPath: '/Users/josh/batshit'
+      }),
+      locals: {}
+    } as any)
+
+    const params = mocks.executeCliTool.mock.calls[0][0]
+    expect(params.agentId).toBe('agent-cooper')
+    expect(params.projectPath).toBe('/Users/josh/batshit')
+  })
+
+  it('refuses a body agentId that differs from the bound one', async () => {
+    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
+
+    const response = await POST({
+      request: request({
+        toolId: 'repo_snapshot',
+        input: { query: 'x' },
+        agentId: 'agent-faye'
+      }),
+      locals: {}
+    } as any)
+
+    expect(response.status).toBe(400)
+    expect((await response.json()).code).toBe('AGENT_MISMATCH')
+    expect(mocks.executeCliTool).not.toHaveBeenCalled()
+  })
 })

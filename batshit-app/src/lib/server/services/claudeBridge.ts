@@ -43,7 +43,10 @@ import {
   isStdioGateway,
   resolveManagedStdioEnvironmentValues
 } from '$lib/server/services/mcpGatewayStdio'
-import { resolveCliHelperBatshitToken } from '$lib/server/services/cliHelperToken'
+import { mintCliRunCredential } from '$lib/server/services/cliHelperToken'
+import { applyCliRunCredentialToChildEnv } from '$lib/server/services/cliChildEnv'
+import { revokeRunCredential } from '$lib/server/services/agentRunCredentials'
+import { getDockerGatewayAuthToken } from '$lib/server/services/dockerGatewayConfig'
 import {
   buildClaudeChildEnv,
   buildClaudeChildProcessOptions,
@@ -72,7 +75,21 @@ interface ClaudeRunOptions {
   planAllowedTools?: string[]
   allowedDirs?: string[]
   autoAllowTools?: string[]
-  batshitToken?: string | null
+  /**
+   * SA-117 DL-117-06/07 — this run's credential (`<credentialId>.<secret>`), exported to the
+   * child as `BATSHIT_AGENT_TOKEN`. It replaces the instance `BATSHIT_TOKEN`, which
+   * `applyCliRunCredentialToChildEnv` now DELETES from the child environment.
+   */
+  agentRunToken?: string | null
+  /**
+   * SA-117 DL-117-07 — the Docker MCP gateway token this run resolved, if any.
+   *
+   * The Claude lane passes gateway auth to the CLI through `${BATSHIT_MCP_HEADER_*}`
+   * placeholders rather than this variable, so this exists only so the child keeps
+   * `MCP_GATEWAY_AUTH_TOKEN` on a run that HAS a gateway and loses it on one that does not
+   * — the same rule the Codex lane applies. The Codex bridge already carried this field.
+   */
+  dockerAuthToken?: string | null
   managedStdioEnv?: Record<string, string>
   systemPromptMode?: 'default' | 'append' | 'replace' | 'replace_file'
   systemPrompt?: string
@@ -155,6 +172,27 @@ export function redactClaudeCliArgsForLog(args: string[]) {
   }
 
   return redacted
+}
+
+/**
+ * SA-117 DL-117-07 — the Claude lane's child environment, as one testable function.
+ *
+ * The Codex lane already had `buildCodexChildEnv`; this is its counterpart, extracted so the
+ * "`BATSHIT_TOKEN` absent, `BATSHIT_AGENT_TOKEN` present" claim can be asserted on BOTH lanes
+ * without spawning a CLI. The rule itself lives in `cliChildEnv.ts` and is shared, so the two
+ * lanes cannot drift; this function only supplies the base environment the rule applies to.
+ */
+export function buildClaudeRunChildEnv(
+  options: Pick<ClaudeRunOptions, 'agentRunToken' | 'dockerAuthToken'>,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  identity = resolveClaudeRunAsIdentity(baseEnv)
+): NodeJS.ProcessEnv {
+  const envVars = buildClaudeChildEnv(baseEnv, identity)
+  applyCliRunCredentialToChildEnv(envVars, {
+    agentRunToken: options.agentRunToken,
+    dockerAuthToken: options.dockerAuthToken ?? null
+  })
+  return envVars
 }
 
 export class ClaudeBridge {
@@ -316,7 +354,6 @@ export class ClaudeBridge {
       allowedDirs.add(resolved)
     }
 
-    const batshitToken = await resolveCliHelperBatshitToken(request.userId ?? null)
     const managedStdioEnv =
       configScope === 'managed' && request.userId
         ? await this.resolveManagedStdioEnv(request.userId, request.gatewayToolMap ?? null)
@@ -337,6 +374,55 @@ export class ClaudeBridge {
       model: resolvedModel
     })
 
+    /**
+     * SA-117 DL-117-06 — mint this run's credential, where the instance token used to be
+     * resolved. See `codexBridge.ts` for the full reasoning; the two lanes are deliberately
+     * symmetric, down to the warning and the once-only revoke.
+     */
+    const runCredential =
+      request.userId && request.agentId && request.sessionId
+        ? await mintCliRunCredential({
+            userId: request.userId,
+            agentId: request.agentId,
+            sessionId: request.sessionId,
+            messageId: request.messageId ?? null,
+            runtime: 'claude',
+            delegated: request.delegatedRun === true
+          })
+        : null
+    if (!runCredential) {
+      console.warn(
+        '[ClaudeBridge] No run credential was minted for this run, so its managed helpers ' +
+          'cannot authenticate. Missing: ' +
+          [
+            request.userId ? null : 'userId',
+            request.agentId ? null : 'agentId',
+            request.sessionId ? null : 'sessionId'
+          ]
+            .filter(Boolean)
+            .join(', ')
+      )
+    }
+    const revokeRunCredentialOnce = (() => {
+      let revoked = false
+      return async () => {
+        if (revoked || !runCredential) return
+        revoked = true
+        try {
+          await revokeRunCredential(runCredential.credentialId, {
+            agentId: runCredential.agentId
+          })
+        } catch (error) {
+          console.warn('[ClaudeBridge] Failed to revoke the run credential', error)
+        }
+      }
+    })()
+
+    // SA-117 P2 review (F-P2-6): the mint is the LAST thing before the run options are
+    // built, so nothing that can throw sits between it and the `try` around the spawn —
+    // `resolveManagedStdioEnv` and `resolveContextGuardConfig` used to sit below it, and a
+    // throw there left an orphaned record until the 24 h backstop. Do not insert an awaited
+    // call between here and `runViaCli`.
     const runOptions: ClaudeRunOptions = {
       model: resolvedModel,
       workingDirectory,
@@ -348,7 +434,8 @@ export class ClaudeBridge {
       planAllowedTools,
       allowedDirs: Array.from(allowedDirs),
       autoAllowTools: CLAUDE_AUTO_ALLOW_TOOLS,
-      batshitToken,
+      agentRunToken: runCredential?.token ?? null,
+      dockerAuthToken: getDockerGatewayAuthToken() ?? null,
       managedStdioEnv,
       addDirectories: Array.from(addDirectories),
       systemPromptMode: claudeSettings.systemPromptMode,
@@ -370,7 +457,15 @@ export class ClaudeBridge {
       contextGuard
     }
 
-    const runner = await this.runViaCli(input, runOptions)
+    // SA-117 DL-117-06: a spawn that never produces a stream never reaches the cleanup
+    // below, so the credential is revoked here instead.
+    let runner: Awaited<ReturnType<typeof this.runViaCli>>
+    try {
+      runner = await this.runViaCli(input, runOptions)
+    } catch (error) {
+      await revokeRunCredentialOnce()
+      throw error
+    }
 
     const adapter = new ClaudeEventAdapter({
       request,
@@ -395,6 +490,9 @@ export class ClaudeBridge {
       abortSignal: request.abortSignal,
       adapter,
       cleanup: async () => {
+        // SA-117 DL-117-06: run end is credential end, on every exit — a finished stream, a
+        // Stop (the iterator's `return`), a timeout, or a thrown error.
+        await revokeRunCredentialOnce()
         if (runner.cleanup) await runner.cleanup()
       },
       onFirstChunk: () => {
@@ -916,7 +1014,7 @@ export class ClaudeBridge {
     }
 
     const runAsIdentity = resolveClaudeRunAsIdentity()
-    const envVars = buildClaudeChildEnv(process.env, runAsIdentity)
+    const envVars = buildClaudeRunChildEnv(options, process.env, runAsIdentity)
     const childProcessOptions = buildClaudeChildProcessOptions(runAsIdentity)
     if (typeof options.maxThinkingTokens === 'number' && options.maxThinkingTokens > 0) {
       envVars.MAX_THINKING_TOKENS = String(options.maxThinkingTokens)
@@ -932,9 +1030,6 @@ export class ClaudeBridge {
     }
     if (options.agentId) {
       envVars.BATSHIT_AGENT_ID = options.agentId
-    }
-    if (options.batshitToken) {
-      envVars.BATSHIT_TOKEN = options.batshitToken
     }
     if (options.approvalMode) {
       envVars.BATSHIT_CLAUDE_PERMISSION_MODE = options.approvalMode

@@ -1,6 +1,10 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { resolveApprovalCardTarget } from '$lib/server/services/controlApprovals'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import {
+  bindActingAgentId,
+  bindActingSessionId
+} from '$lib/server/services/actingAgentIdentity'
 import { useControl, type ControlUseErrorCode } from '$lib/server/services/fabricRegistry'
 import {
   getPortableSkillFamilyDefinitions,
@@ -49,6 +53,9 @@ function statusForControlError(code?: ControlUseErrorCode): number {
     // refusal; SA-116 retires that code and keeps the rule for its two replacements.
     case 'CONTROL_RISK_REQUIRES_APPROVAL':
     case 'CONTROL_RISK_UNAVAILABLE_IN_GROUP':
+    // SA-117 DL-117-05: the caller authenticated, and is not allowed to act as an agent.
+    // A policy answer, like the two above it — not a server fault and not a retry.
+    case 'AGENT_IDENTITY_REQUIRED':
       return 403
     case 'CONTROL_INPUT_INVALID':
       return 400
@@ -167,19 +174,62 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
+    /**
+     * SA-117 DL-117-04 — the acting agent, bound.
+     *
+     * This is the line P1 left open (F-P1-3): the route forwarded `auth.credentialId` to the
+     * audit but still passed `body.agentId` as the actor, so the audit could name a
+     * credential beside an agent id the body had claimed. Now the bound id wins, and a body
+     * id that DIFFERS is refused rather than corrected — a mismatch is a bug in a caller or
+     * a forgery, and either one should be visible.
+     */
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json(
+        {
+          auth: auth.auth,
+          userId: auth.userId,
+          success: false,
+          controlId,
+          error: { code: agentBinding.code, message: agentBinding.message }
+        },
+        { status: 400 }
+      )
+    }
+
     // `sessionId` and `messageId` are body text — the woken-turn gate reads the first and
     // the approval card is pinned to the second. `resolveApprovalCardTarget` owns both
     // ownership checks for this route and `/api/cli-tools/execute` alike, because the same
     // rule written twice is how DL-116-14's hole came to exist in two files.
+    //
+    // SA-117 DL-117-04: on the agent lane the credential's session is authoritative, so the
+    // ownership check below runs against the bound id rather than whatever the body sent.
     const { sessionId, messageId } = await resolveApprovalCardTarget({
       userId: auth.userId,
-      sessionId: body.sessionId,
+      sessionId: bindActingSessionId(auth, body.sessionId),
       messageId: body.messageId
     })
 
+    /**
+     * SA-117 DL-117-10 (AMD-117-02) — the acting agent, on the wire, for the Execution Viewer.
+     *
+     * Present ONLY when the server bound it: `auth.auth === 'agent'` means it came off a
+     * credential Batshit minted for this run. It is deliberately absent on every other lane
+     * rather than echoing `body.agentId` back, because a label sourced from the caller's own
+     * claim would read as though the server had vouched for it — which is worse than no
+     * label, and is exactly why F-P1-2 moved this half of DL-117-10 out of P1.
+     *
+     * The managed CLI helper returns this response verbatim as its MCP tool result, so the
+     * value reaches the Execution Viewer inside the step's own output.
+     */
+    const actingAgentField =
+      auth.auth === 'agent' && agentBinding.agentId
+        ? { actingAgentId: agentBinding.agentId }
+        : {}
+
     const result = await useControl({
       userId: auth.userId,
-      agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
+      agentId: agentBinding.agentId,
       sessionId,
       messageId,
       controlId,
@@ -190,6 +240,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       // helper all pause and wait for a click, the same as the model does.
       allowRisky: auth.auth === 'portable-skill',
       actorType: auth.auth,
+      // SA-117 DL-117-10: names the run credential this call arrived on, which is what makes
+      // the `agentId` beside it readable as server-bound rather than body-claimed. DL-117-04
+      // does the binding above.
+      credentialId: auth.credentialId,
+      // F-P2-1: a Subagent or Worker run's credential is real, and still names nobody who
+      // can act. `useControl` refuses the identity-bearing families for it.
+      delegatedRun: auth.delegated === true,
       selectedGateways: Array.isArray(body.selectedGateways) ? body.selectedGateways : undefined,
       allowedControlIds:
         auth.auth === 'portable-skill'
@@ -228,6 +285,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         {
           auth: auth.auth,
           userId: auth.userId,
+          ...actingAgentField,
           ...result,
           ...(approvalRequest ? { approvalRequest } : {})
         },
@@ -238,6 +296,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     return json({
       auth: auth.auth,
       userId: auth.userId,
+      ...actingAgentField,
       ...result
     })
   } catch (error) {

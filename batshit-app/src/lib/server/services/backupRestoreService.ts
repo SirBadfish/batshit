@@ -1324,6 +1324,17 @@ function isRestorableKeyForUser(key: string, userId: string) {
     // conversation itself lives in n8n's Redis and is not Batshit's to back up, but the id
     // that names it is session data. The in-flight `subagent_lock:` keys are deliberately
     // absent — transient run state, never restored.
+    //
+    // SA-117 P1 (DL-117-09): `agent_run_credential:` and `agent_run_credentials:` are
+    // deliberately absent for the same reason, and it is worth saying why the usual
+    // "a hash is not a secret" argument does not apply. A wake hook's `tokenHash` IS backed
+    // up, because the hook is a durable thing the user created and dropping the hash would
+    // leave every restored hook permanently unauthenticatable with no way to say which. A run
+    // credential is the opposite: it names one managed CLI run that ended, so a restored one
+    // could only ever authenticate as an agent for a turn nobody is taking. Absent from this
+    // list means absent from BOTH `collectCandidateKeys` (never exported) and
+    // `isRestorableKeyForUser` (a hand-built archive carrying one is refused outright at
+    // `buildTargetRecords`), and `backupRestoreService.test.ts` pins both halves.
     'subagent_thread:',
     'pins:',
     'agent:',
