@@ -107,7 +107,11 @@ const TOOL_DEFINITIONS = [
         ref: { type: 'string' },
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
-        allowRisky: { type: 'boolean' },
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        },
         dryRun: { type: 'boolean' }
       },
       required: ['ref']
@@ -180,7 +184,11 @@ const TOOL_DEFINITIONS = [
         toolId: { type: 'string' },
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
-        allowRisky: { type: 'boolean' }
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        }
       },
       required: ['toolId']
     }
@@ -246,7 +254,11 @@ const TOOL_DEFINITIONS = [
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
         dryRun: { type: 'boolean' },
-        allowRisky: { type: 'boolean' }
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        }
       },
       required: ['controlId']
     }
@@ -293,7 +305,11 @@ const TOOL_DEFINITIONS = [
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
         dryRun: { type: 'boolean' },
-        allowRisky: { type: 'boolean' },
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        },
         selectedGateways: { type: 'array', items: { type: 'string' } }
       },
       required: ['controlId']
@@ -316,6 +332,27 @@ if (!userId) {
 }
 const agentId = args.agent || args['agent-id'] || process.env.BATSHIT_AGENT_ID || null
 const sessionId = args.session || args['session-id'] || process.env.BATSHIT_SESSION_ID || null
+/**
+ * SA-116 DL-116-07: the assistant message this managed CLI turn is answering.
+ *
+ * Batshit exports it into the bridge's environment for every run (`codexBridge.ts`,
+ * `claudeBridge.ts`), and both profile managers forward it here. It is the ONLY way a
+ * risky-control refusal on this lane can become an approval card: `/api/controls/use`
+ * verifies the id belongs to the owned session and pins the card onto that message, so the
+ * user gets an Approve button instead of an agent describing a wall it just hit.
+ *
+ * Missing means no card — the route logs that loudly rather than guessing a message.
+ */
+const messageId = (() => {
+  const raw = typeof process.env.BATSHIT_MESSAGE_ID === 'string'
+    ? process.env.BATSHIT_MESSAGE_ID.trim()
+    : ''
+  // The Claude profile passes env through a `${VAR}` map. An unset variable there can
+  // arrive as its own literal placeholder, and a placeholder is not a message id — send
+  // nothing rather than an id the route will spend a Redis read rejecting.
+  if (!raw || raw.includes('${')) return null
+  return raw
+})()
 /**
  * SA-105 P3 (AMD-105-09): which managed CLI launched this bridge. Both profile
  * managers pass it explicitly rather than the bridge inferring it, because env
@@ -559,6 +596,8 @@ async function callControlUse(rawArgs) {
     userId,
     ...(agentId ? { agentId } : {}),
     ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
+    // SA-116 DL-116-07 — server-side env only, never an argument the model can set.
+    ...(messageId ? { messageId } : {}),
     controlId: controlId || control_id || id || '',
     input: payloadInput,
     dryRun: dryRun === true || dry_run === true,
@@ -688,6 +727,10 @@ async function callCliUse(rawArgs) {
   const payload = {
     userId,
     ...(agentId ? { agentId } : {}),
+    // SA-116 DL-116-14: a risky user-authored CLI tool earns the same card a risky Fabric
+    // control does, and a card needs the chat and the message it renders on.
+    ...(sessionId ? { sessionId } : {}),
+    ...(messageId ? { messageId } : {}),
     toolId: args.toolId || args.tool_id || '',
     input: payloadInput,
     allowRisky: args.allowRisky === true || args.allow_risky === true,

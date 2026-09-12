@@ -360,6 +360,9 @@ async function buildManagedMcpServers(params: {
         env: {
           BATSHIT_TOKEN: '${BATSHIT_TOKEN}',
           BATSHIT_SESSION_ID: '${BATSHIT_SESSION_ID}',
+          // SA-116 DL-116-07: the assistant message a risky-control refusal pins its
+          // approval card onto. Without it the pause is recorded with no card to click.
+          BATSHIT_MESSAGE_ID: '${BATSHIT_MESSAGE_ID}',
           BATSHIT_PROJECT_PATH: '${BATSHIT_PROJECT_PATH}',
           BATSHIT_FRONTEND_URL: '${BATSHIT_FRONTEND_URL}',
           PUBLIC_BASE_URL: '${PUBLIC_BASE_URL}',

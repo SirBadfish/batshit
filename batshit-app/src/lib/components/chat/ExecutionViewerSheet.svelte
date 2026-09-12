@@ -17,6 +17,7 @@
     buildExecutionToolActivityEntries,
     type ExecutionToolActivityEntry,
   } from './executionViewerToolActivity'
+  import { formatBatshitToolTargetDisplayName } from '$lib/utils/toolNameFormatter'
   import type {
     ExecutionAvailabilityLevel,
     ExecutionFieldAvailability,
@@ -327,7 +328,59 @@
 	    return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : null
 	  })
 
-	  const toolActivityUnavailableNote = $derived.by<string | null>(() => {
+	  /**
+   * SA-116 (DL-116-12) — what the user approved, denied, or let expire in this chat.
+   *
+   * Read from the approval RECORDS, not from the message's `toolApprovals` summary. The
+   * moment a resume lands, send-routed clears that summary so a spent card cannot reappear
+   * on refresh — and three of the four statuses the lock names only exist after that clear.
+   * A snapshot's id IS the assistant message id, so the rows filter on it.
+   */
+  type SessionApprovalRow = {
+    approvalId: string
+    controlId: string
+    controlTitle: string
+    riskLevel: string
+    status: string
+    messageId: string | null
+  }
+  let sessionApprovals = $state<SessionApprovalRow[]>([])
+
+  const toolApprovalRows = $derived.by<
+    Array<{ approvalId: string; title: string; status: string; risk: string | null }>
+  >(() => {
+    const snapshotId = currentSnapshot?.id
+    if (!snapshotId) return []
+    return sessionApprovals
+      .filter((row) => row.messageId === snapshotId)
+      .map((row) => ({
+        approvalId: row.approvalId,
+        title:
+          formatBatshitToolTargetDisplayName(row.controlId) ||
+          (row.controlTitle?.trim() ? row.controlTitle.trim() : row.controlId),
+        status: row.status,
+        risk: row.riskLevel || null
+      }))
+  })
+
+  async function loadSessionApprovals(targetSessionId: string) {
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(targetSessionId)}/control-approvals`
+      )
+      if (!response.ok) {
+        sessionApprovals = []
+        return
+      }
+      const payload = await response.json()
+      sessionApprovals = Array.isArray(payload?.approvals) ? payload.approvals : []
+    } catch {
+      // A history panel must never break the sheet it lives in.
+      sessionApprovals = []
+    }
+  }
+
+  const toolActivityUnavailableNote = $derived.by<string | null>(() => {
 	    if (toolActivityEntries.length > 0) return null
 
 	    if (typeof toolCallsCountFromSummary === 'number' && toolCallsCountFromSummary > 0) {
@@ -772,11 +825,15 @@
     if (!sessionId) {
       snapshots = []
       selectedId = null
+      sessionApprovals = []
       return
     }
 
     loading = true
     error = null
+    // SA-116 (DL-116-12): the approval history rides alongside the snapshots and never
+    // blocks them — a failed read leaves the rows empty, not the sheet broken.
+    void loadSessionApprovals(sessionId)
 
     try {
       const response = await fetch(`/api/sessions/${sessionId}/execution-log`)
@@ -1398,6 +1455,18 @@
                     <div class="execution-viewer-helper">
                       Tool token counts below estimate the prompt-facing tool transcript Batshit sends back to the agent. They are not provider-billed LLM token counts.
                     </div>
+
+                    {#if toolApprovalRows.length > 0}
+                      <div class="execution-viewer-stack-sm">
+                        {#each toolApprovalRows as approvalRow (approvalRow.approvalId)}
+                          <div class="execution-viewer-helper">
+                            Approval: {approvalRow.title}{approvalRow.risk
+                              ? ` (${approvalRow.risk})`
+                              : ''} — {approvalRow.status}
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
 
                     {#if toolActivityEntries.length > 0}
                       <div class="execution-viewer-table-wrap">

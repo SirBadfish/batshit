@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { redis } from '$lib/server/redis'
+import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import {
   DEFAULT_DYNAMIC_MCP_RESULTS,
   MAX_DYNAMIC_MCP_RESULTS,
@@ -86,7 +87,12 @@ import {
   MIN_SCHEDULE_INTERVAL_MINUTES,
   SCHEDULE_NAME_MAX_CHARS
 } from '$lib/utils/scheduleControl'
-import { resolveWokenTurnState } from '$lib/server/services/dm/wokenTurn'
+import {
+  decideRiskGate,
+  type ControlApprovalAudit,
+  type ControlApprovalGrant,
+  type ControlApprovalLane
+} from '$lib/server/services/controlApprovals'
 import {
   DEFAULT_SKILL_ICON_REF
 } from '$lib/icons/iconCatalog'
@@ -2778,9 +2784,33 @@ export interface ControlUseOptions {
   controlId: string
   agentId?: string
   sessionId?: string
+  /**
+   * The assistant message the card belongs to (SA-116 DL-116-07).
+   *
+   * Verified against the owned session by `/api/controls/use` before it reaches here; the
+   * managed CLI helper sends it from `BATSHIT_MESSAGE_ID`. A pause with no message id still
+   * creates the record — it just has no card to render on, which the caller logs.
+   */
+  messageId?: string
   input?: Record<string, any>
   dryRun?: boolean
+  /**
+   * SA-116 DL-116-01 — **honoured ONLY for a Portable Skill Token call.**
+   *
+   * The model's word is not consent. Every chat lane (the API broker, the managed CLI
+   * helper, the automation broker, and every service-token caller) may still pass this and
+   * it does nothing at all: the risky control pauses and waits for a click. The one
+   * exception is `actorType === 'portable-skill'`, where the token's family scope IS the
+   * consent because the person who minted it chose those families and there is no chat to
+   * click in (DL-116-09). Audited as `portable-skill-scope`, never as a click.
+   */
   allowRisky?: boolean
+  /**
+   * A server-owned approval, set ONLY by send-routed's resume paths — never from model
+   * input. Presenting one is not enough on its own: the record must be `approved` and match
+   * this exact call (`userId`, `agentId`, `sessionId`, `controlId`, and the input hash).
+   */
+  approval?: ControlApprovalGrant
   runtimeMode?: ControlRuntimeMode
   actorType?: ControlActorType
   selectedGateways?: string[]
@@ -2794,7 +2824,10 @@ export type ControlUseErrorCode =
   | 'CONTROL_NOT_ALLOWED'
   | 'CONTROL_INPUT_INVALID'
   | 'CONTROL_RISK_REQUIRES_APPROVAL'
-  | 'CONTROL_RISK_NEEDS_HUMAN_TURN'
+  // SA-116 DL-116-10. `CONTROL_RISK_NEEDS_HUMAN_TURN` (SA-113 F-SEC-1) is RETIRED: a woken
+  // turn now pauses for the same card as any other turn, so there is nothing left for the
+  // agent to wait for the user to type.
+  | 'CONTROL_RISK_UNAVAILABLE_IN_GROUP'
   | 'CONTROL_NOT_EXECUTABLE'
   | 'CONTROL_EXECUTION_FAILED'
 
@@ -2822,6 +2855,18 @@ type ControlAuditEntry = {
   timestamp: string
   userId: string
   actorType: ControlActorType
+  /**
+   * SA-116 DL-116-12 — "show me who approved what" needs the fields to exist.
+   *
+   * `agentId` and `sessionId` say WHO acted and WHERE; `approval` says how a risky control
+   * came to run (a click, the scoped voice window, or a Portable Skill Token's scope) and
+   * is `null` for anything that did not need one; `paused` records the pauses, which are
+   * the entries that show a card was raised. No reader page is built here (deferred).
+   */
+  agentId: string | null
+  sessionId: string | null
+  approval: ControlApprovalAudit | null
+  paused: boolean
   controlId: string
   controlStatus: ControlStatus | null
   riskLevel: ControlRiskLevel | null
@@ -2837,8 +2882,6 @@ type ControlAuditEntry = {
 
 const CONTROL_AUDIT_TTL_SECONDS = 60 * 60 * 24 * 14
 const CONTROL_AUDIT_RECENT_LIMIT = 200
-const CONTROL_RISK_APPROVAL_TTL_SECONDS = 60 * 5
-const CONTROL_RISK_APPROVAL_RECENT_USER_MESSAGE_LIMIT = 6
 const DYNAMIC_ARTIFACT_ZONE_INPUT_KEYS = [
   'zone',
   'target_zone',
@@ -2848,92 +2891,22 @@ const DYNAMIC_ARTIFACT_ZONE_INPUT_KEYS = [
   'placement',
   'location'
 ] as const
-const LOCAL_SETUP_INSTALL_TOPIC_PATTERN =
-  /\b(install|set up|setup|configure|connect)\b/
-const LOCAL_SETUP_EXPLICIT_APPROVAL_PATTERNS = [
-  /\blet'?s install\b/,
-  /\bcan you install\b/,
-  /\bcan we install\b/,
-  /\bplease install\b/,
-  /\binstall\b[\s\S]{0,40}\bfor me\b/,
-  /\bset\s+it\s+up\b[\s\S]{0,20}\bfor me\b/,
-  /\byou can install\b/,
-  /\byou can set it up\b/,
-  /\bgo ahead\b/,
-  /\blet'?s do (?:that|it|this)\b/,
-  /\bdo it\b/,
-  /\bbatshit-managed\b/
-] as const
-const LOCAL_SETUP_ACKNOWLEDGEMENT_PATTERN =
-  /\b(yes|yeah|yep|sure|okay|ok|sounds good|that works|works for me)\b/
-const LOCAL_SETUP_DENIAL_PATTERNS = [
-  /\bdon'?t\b[\s\S]{0,20}\b(install|set up|setup|configure)\b/,
-  /\bdo not\b[\s\S]{0,20}\b(install|set up|setup|configure)\b/,
-  /\bwalk me through\b/,
-  /\bguide me\b/,
-  /\buser-managed\b/,
-  /\bi(?:'|’)ll install\b/,
-  /\bi will install\b/
-] as const
-
 function buildControlAuditKey(userId: string, auditId: string): string {
   return `control_audit:${userId}:${auditId}`
 }
 
-function buildControlRiskApprovalKey(options: {
-  userId: string
-  controlId: string
-  agentId?: string | null
-  scopeKey?: string | null
-}): string {
-  const agentScope = toTrimmedString(options.agentId) || 'no-agent'
-  const scopeKey = toTrimmedString(options.scopeKey)
-  if (!scopeKey) {
-    return `control_risk_approval:${options.userId}:${agentScope}:${options.controlId}`
-  }
-  return `control_risk_approval:${options.userId}:${agentScope}:${options.controlId}:${encodeURIComponent(scopeKey)}`
-}
-
-async function hasRecentControlRiskApproval(options: {
-  userId: string
-  controlId: string
-  agentId?: string | null
-  scopeKey?: string | null
-}): Promise<boolean> {
-  try {
-    return await redis.execute(async (client) => {
-      const key = buildControlRiskApprovalKey(options)
-      const marker = await client.get(key)
-      return typeof marker === 'string' && marker.trim().length > 0
-    })
-  } catch (error) {
-    console.warn('[ControlRegistry] Failed to read risk approval cache:', error)
-    return false
-  }
-}
-
-async function recordControlRiskApproval(options: {
-  userId: string
-  controlId: string
-  agentId?: string | null
-  scopeKey?: string | null
-}): Promise<void> {
-  try {
-    await redis.execute(async (client) => {
-      const key = buildControlRiskApprovalKey(options)
-      await client.set(key, new Date().toISOString(), { EX: CONTROL_RISK_APPROVAL_TTL_SECONDS })
-    })
-  } catch (error) {
-    console.warn('[ControlRegistry] Failed to record risk approval cache:', error)
-  }
-}
-
-function normalizeRiskApprovalMessageContent(value: unknown): string {
-  if (typeof value !== 'string') return ''
-  const withoutDynamicInfo = value.split('==== DYNAMIC INFO')[0] ?? value
-  return withoutDynamicInfo.toLowerCase().replace(/\s+/g, ' ').trim()
-}
-
+/**
+ * The scope key that lets ONE approved click cover an immediate retry of the same thing.
+ *
+ * SA-116 DL-116-04 deleted the blanket five-minute window (approving "delete memory X" used
+ * to unlock "delete memory Y") and the chat-text sniffer that read the last six user
+ * messages for "go ahead" / "yes". This is what survives: a voice-engine setup approved for
+ * engine X lets a retry for engine X inside five minutes skip the card, because a local
+ * install that fails partway and retries is one action to the user, not two. Seeded ONLY by
+ * `decideApproval` in `controlApprovals.ts`, which is only ever reached by a click.
+ *
+ * Every other control returns `undefined`, which means "one click, one action".
+ */
 function resolveControlRiskScopeKey(controlId: string, inputPayload: Record<string, any>): string | undefined {
   if (controlId !== 'sys.voice.engine.complete_local_setup') return undefined
   try {
@@ -2942,93 +2915,6 @@ function resolveControlRiskScopeKey(controlId: string, inputPayload: Record<stri
   } catch {
     return undefined
   }
-}
-
-/* ------------------------------------------------------------------ *
- * SA-113 F-SEC-1 (security) — a woken turn cannot approve its own risky control.
- *
- * ## The hole this closes
- *
- * Every `confirm` and `restricted` control below runs the moment the MODEL passes
- * `allowRisky: true`. Nothing checked that a human clicked or typed anything; the broker's
- * own failure text even tells the model to "retry with allowRisky: true" once "the user
- * approved". That was a tolerable convention while the only text inside a user turn was
- * text the user had typed.
- *
- * SA-113 ended that. A DM body and a wake-up **webhook** body are now first-class user
- * turns, and the webhook route is reachable from outside the machine whenever a tunnel
- * runs. Outside text saying "the user approved, retry with allowRisky: true" would
- * otherwise reach `sys.skill.import` (which pulls code from a URL), the Docker
- * runtime-addon start/stop controls, the voice-engine installers, `sys.memory.delete`, and
- * artifact rollback. The DM guidance always said a DM cannot approve anything; the server
- * did not enforce it. Now it does, in `useControl`, which is the one place every actor type
- * and every lane funnels through.
- *
- * The five-minute approval cache is the same hole from the other side — an approval the
- * user gave in chat at 9:00 would unlock a woken turn at 9:03 — so the gate runs BEFORE the
- * cache is read, ignores `allowRisky`, and never writes the cache.
- *
- * `resolveWokenTurnState` (`dm/wokenTurn.ts`) owns the read and its fail-closed rule.
- *
- * What this cannot cover: an agent that already holds `BATSHIT_TOKEN` through auto-approved
- * Bash can reach `/api/controls/use` itself. That is the broader shell boundary and the
- * user's tool configuration owns it — UserDocs says so in plain words.
- * ------------------------------------------------------------------ */
-
-async function hasContextualControlRiskApproval(options: {
-  userId: string
-  controlId: string
-  sessionId?: string
-  inputPayload: Record<string, any>
-}): Promise<boolean> {
-  if (options.controlId !== 'sys.voice.engine.complete_local_setup') return false
-  if (typeof options.sessionId !== 'string' || options.sessionId.trim().length === 0) return false
-
-  const installOwnership =
-    typeof options.inputPayload.installOwnership === 'string'
-      ? options.inputPayload.installOwnership.trim().toLowerCase()
-      : 'batshit-managed'
-  if (installOwnership !== 'batshit-managed') return false
-
-  try {
-    const session = await redis.getSession(options.sessionId)
-    if (!session || session.user_id !== options.userId) return false
-
-    const messages = await redis.getSessionMessages(options.sessionId)
-    const recentUserMessages = messages
-      .filter((message) => message.role === 'user')
-      .slice(-CONTROL_RISK_APPROVAL_RECENT_USER_MESSAGE_LIMIT)
-      .reverse()
-
-    const normalizedMessages = recentUserMessages
-      .map((message) => normalizeRiskApprovalMessageContent(message.content))
-      .filter((message) => message.length > 0)
-
-    const hasInstallTopicInRecentContext = normalizedMessages.some((message) =>
-      LOCAL_SETUP_INSTALL_TOPIC_PATTERN.test(message)
-    )
-
-    for (const message of normalizedMessages) {
-      if (LOCAL_SETUP_DENIAL_PATTERNS.some((pattern) => pattern.test(message))) {
-        return false
-      }
-
-      if (LOCAL_SETUP_EXPLICIT_APPROVAL_PATTERNS.some((pattern) => pattern.test(message))) {
-        return true
-      }
-
-      if (
-        hasInstallTopicInRecentContext &&
-        LOCAL_SETUP_ACKNOWLEDGEMENT_PATTERN.test(message)
-      ) {
-        return true
-      }
-    }
-  } catch (error) {
-    console.warn('[ControlRegistry] Failed to inspect contextual risk approval:', error)
-  }
-
-  return false
 }
 
 async function recordControlAudit(entry: ControlAuditEntry): Promise<void> {
@@ -7095,6 +6981,124 @@ export async function findControls(options: ControlFindOptions): Promise<Control
   }
 }
 
+/**
+ * Which surface raised a card, derived from what the server can observe.
+ *
+ * A presentation and diagnostics label only — nothing in `decideRiskGate` branches on it,
+ * so a wrong answer here cannot weaken a gate. `mode3` is the API broker's own runtime
+ * mode; a verified `messageId` is the managed CLI helper's signature (DL-116-07: it is the
+ * only caller that forwards `BATSHIT_MESSAGE_ID`); everything else is a service-token
+ * caller with no chat to render a card in.
+ */
+function resolveApprovalLane(options: ControlUseOptions): ControlApprovalLane {
+  if (options.runtimeMode === 'mode3') return 'api'
+  if (typeof options.messageId === 'string' && options.messageId.trim().length > 0) return 'cli'
+  return 'service'
+}
+
+/**
+ * SA-116 P2 (DL-116-05, AMD-116-02, AMD-116-04, F-P1-2) — what a broker call would be
+ * gated on, WITHOUT running or writing anything.
+ *
+ * `useControl` cannot answer "would this pause?" for the AI SDK's approval policy, because
+ * by the time it can answer it has already paused (created a record) or run. This is the
+ * read-only half: the same resolution `useControl` does at its head — static control,
+ * dynamic-artifact alias, the caller's allowlist, agent/runtime visibility, published
+ * status — and then the control's risk level and its scope key.
+ *
+ * `null` means "do not raise a card", and it deliberately covers every reason a call could
+ * never run: an unknown control, one outside the actor's allowlist or scope, an unpublished
+ * one, and a safe one. AMD-116-02 measured why that matters — the user approved a control
+ * the actor could not use, and `useControl` answered `OUT_OF_SCOPE` after the click. A card
+ * is raised only for a call that can run.
+ *
+ * It intentionally does NOT validate the input schema. The SDK policy runs before `execute`
+ * and has only the model's raw arguments; `useControl` still validates before its own gate
+ * (AMD-116-04), so a call that pauses here and then fails validation returns
+ * `CONTROL_INPUT_INVALID` with no record written — the pause is wasted, not unsafe. Making
+ * the policy validate too would duplicate every control's schema resolution on a hot path
+ * for a case the model corrects by itself.
+ */
+export interface ControlRiskProfile {
+  controlId: string
+  controlTitle: string
+  riskLevel: Exclude<ControlRiskLevel, 'safe'>
+  scopeKey: string | null
+}
+
+export async function resolveControlRiskProfile(options: {
+  userId: string
+  agentId?: string | null
+  runtimeMode?: ControlRuntimeMode | null
+  controlId: string
+  input?: Record<string, any> | null
+  allowedControlIds?: string[] | null
+}): Promise<ControlRiskProfile | null> {
+  const requestedControlId = typeof options.controlId === 'string' ? options.controlId.trim() : ''
+  if (!requestedControlId) return null
+  const inputPayload =
+    options.input && typeof options.input === 'object' && !Array.isArray(options.input)
+      ? options.input
+      : {}
+  const allowedControlIds = normalizeControlIdList(options.allowedControlIds ?? undefined)
+
+  let control: ControlDefinition | undefined
+  try {
+    const controlDefinitions = await loadControlDefinitionsForUser(options.userId)
+    control =
+      STATIC_CONTROL_MAP.get(requestedControlId) ||
+      controlDefinitions.find((definition) => definition.controlId === requestedControlId)
+    if (!control) {
+      const alias = resolveDynamicArtifactAliasControl({
+        requestedControlId,
+        inputPayload,
+        controls: controlDefinitions,
+        agentId: options.agentId ?? null,
+        runtimeMode: options.runtimeMode ?? null,
+        allowedControlIds
+      })
+      if (alias.kind === 'resolved') control = alias.control
+    }
+  } catch (error) {
+    // A registry that cannot be read must not silently become "safe". Answering "pause"
+    // is the fail-closed side here: the worst case is a card for a call that then fails,
+    // and the alternative is a risky control running with no card at all.
+    console.warn('[FabricRegistry] Could not resolve a control for the risk policy:', error)
+    return {
+      controlId: requestedControlId,
+      controlTitle: requestedControlId,
+      riskLevel: 'confirm',
+      scopeKey: null
+    }
+  }
+
+  if (!control) return null
+  if (
+    Array.isArray(allowedControlIds) &&
+    !controlIdMatchesAllowedEntries(control.controlId, allowedControlIds)
+  ) {
+    return null
+  }
+  if (
+    !isControlVisibleForContext(control, {
+      agentId: options.agentId ?? null,
+      runtimeMode: options.runtimeMode ?? null,
+      forFind: false
+    })
+  ) {
+    return null
+  }
+  if (control.status !== 'published') return null
+  if (control.riskLevel === 'safe') return null
+
+  return {
+    controlId: control.controlId,
+    controlTitle: control.title,
+    riskLevel: control.riskLevel,
+    scopeKey: resolveControlRiskScopeKey(control.controlId, inputPayload) ?? null
+  }
+}
+
 export async function useControl(options: ControlUseOptions): Promise<ControlUseResult> {
   const startedAt = Date.now()
   const actorType = options.actorType ?? 'unknown'
@@ -7124,6 +7128,11 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
   }
   const effectiveControlId = control?.controlId ?? requestedControlId
 
+  // SA-116 DL-116-12: how a risky control came to run, recorded on the audit entry. Set by
+  // the gate below and read by `finalize`, which every exit path funnels through.
+  let riskApproval: ControlApprovalAudit | null = null
+  let riskApprovalPaused = false
+
   const finalize = async (
     result: ControlUseResult,
     definition: ControlDefinition | undefined
@@ -7133,6 +7142,10 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       timestamp: new Date().toISOString(),
       userId: options.userId,
       actorType,
+      agentId: typeof options.agentId === 'string' ? options.agentId.trim() || null : null,
+      sessionId: typeof options.sessionId === 'string' ? options.sessionId.trim() || null : null,
+      approval: riskApproval,
+      paused: riskApprovalPaused,
       controlId: definition?.controlId ?? requestedControlId,
       controlStatus: definition?.status ?? null,
       riskLevel: definition?.riskLevel ?? null,
@@ -7231,106 +7244,6 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     )
   }
 
-  // F-SEC-1 — a woken turn cannot approve its own risky control. Runs BEFORE the approval
-  // cache is read, so neither `allowRisky` nor a cached human approval can get past it, and
-  // nothing is written that a later call could read as consent.
-  if (control.riskLevel !== 'safe') {
-    // The acting identity is passed so the gate has a server-owned source (the wake
-    // registry) beside the caller-supplied `sessionId`; see `resolveWokenTurnState`.
-    const wokenTurn = await resolveWokenTurnState(options.sessionId, {
-      userId: options.userId,
-      agentId: options.agentId
-    })
-    if (wokenTurn.woken) {
-      const message =
-        `Control "${effectiveControlId}" has risk level "${control.riskLevel}" and this turn ` +
-        'was started by a DM or a webhook, not by the user. Ask the user and leave the item ' +
-        'open; once the user replies in this chat, retry.'
-      // F-SEC-1b: tell the user their woken chat is stuck on them. Nothing here can fail the
-      // refusal — a missing stamp is a quieter badge, not a weaker gate.
-      if (wokenTurn.dmId) {
-        try {
-          const { stampDmNeedsUser } = await import('$lib/server/services/dm/dmStore')
-          await stampDmNeedsUser(
-            wokenTurn.dmId,
-            `This chat asked to run "${effectiveControlId}", which needs your say-so.`
-          )
-        } catch (error) {
-          console.warn('[ControlRegistry] Could not stamp the DM as needing the user:', error)
-        }
-      }
-      return await finalize(
-        {
-          success: false,
-          controlId: effectiveControlId,
-          error: {
-            code: 'CONTROL_RISK_NEEDS_HUMAN_TURN',
-            message,
-            details: {
-              riskLevel: control.riskLevel,
-              startedBy: 'wake'
-            }
-          }
-        },
-        control
-      )
-    }
-  }
-
-  const riskScopeKey = resolveControlRiskScopeKey(effectiveControlId, inputPayload)
-  let hasCachedRiskApproval = false
-  if (control.riskLevel !== 'safe' && options.allowRisky !== true) {
-    hasCachedRiskApproval = await hasRecentControlRiskApproval({
-      userId: options.userId,
-      controlId: effectiveControlId,
-      agentId: options.agentId ?? null,
-      scopeKey: riskScopeKey
-    })
-    if (!hasCachedRiskApproval) {
-      const hasContextualApproval = await hasContextualControlRiskApproval({
-        userId: options.userId,
-        controlId: effectiveControlId,
-        sessionId: options.sessionId,
-        inputPayload
-      })
-      if (hasContextualApproval) {
-        await recordControlRiskApproval({
-          userId: options.userId,
-          controlId: effectiveControlId,
-          agentId: options.agentId ?? null,
-          scopeKey: riskScopeKey
-        })
-        hasCachedRiskApproval = true
-      }
-    }
-  }
-
-  if (control.riskLevel !== 'safe' && options.allowRisky !== true && !hasCachedRiskApproval) {
-    return await finalize(
-      {
-        success: false,
-        controlId: effectiveControlId,
-        error: {
-          code: 'CONTROL_RISK_REQUIRES_APPROVAL',
-          message: `Control "${effectiveControlId}" has risk level "${control.riskLevel}" and requires explicit approval.`,
-          details: {
-            riskLevel: control.riskLevel
-          }
-        }
-      },
-      control
-    )
-  }
-
-  if (control.riskLevel !== 'safe' && options.allowRisky === true) {
-    await recordControlRiskApproval({
-      userId: options.userId,
-      controlId: effectiveControlId,
-      agentId: options.agentId ?? null,
-      scopeKey: riskScopeKey
-    })
-  }
-
   const parsedInput = control.inputSchema.safeParse(inputPayload)
   if (!parsedInput.success) {
     return await finalize(
@@ -7347,6 +7260,23 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
     )
   }
 
+  /**
+   * SA-116 F-P1-2 — a dry run must not cost a click.
+   *
+   * This return sits ABOVE the risk gate, and the position is the whole point. A dry run
+   * validates and executes nothing, so pausing one raises a card for a call that runs
+   * nothing: the model's natural preflight ("dry-run, then ask") would cost the user two
+   * clicks per action, which is exactly the friction that makes people want the blanket
+   * "always allow" window this story removed.
+   *
+   * It still sits BELOW input validation, so a dry run keeps validating — that is what a
+   * dry run is for. AMD-116-04's rule, in order: scope and allowlist, then validation, then
+   * the gate. A card is raised only for a call that can run.
+   *
+   * `needsRiskApproval` in `nativeTools.ts` answers `undefined` for a dry-run input for the
+   * same reason, so the SDK does not pause before `execute` either. Both halves are needed:
+   * this one alone would still spend a turn on a pause the SDK raised.
+   */
   if (options.dryRun === true) {
     return await finalize(
       {
@@ -7361,6 +7291,99 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
       },
       control
     )
+  }
+
+  /* ---------------------------------------------------------------- *
+   * SA-116 (DL-116-01, DL-116-03) — the click is the approval.
+   *
+   * One call, into `decideRiskGate` in `controlApprovals.ts`, which owns the whole order:
+   * a Portable Skill Token's scope, the group refusal, a server-owned approval record and
+   * its consume-once, SA-113 F-SEC-1's woken check, the click-seeded voice window, and the
+   * pause. `executeCliTool` calls the same function for user-authored CLI tools — the same
+   * hole used to exist twice, in two files, with two different spellings.
+   *
+   * `allowRisky` reaches this point from four callers and is ignored by every one of them
+   * except a Portable Skill Token call. It is deliberately still ACCEPTED rather than
+   * removed from the signature, so a stale caller that still passes it gets the pause
+   * instead of a type error at a place nobody is looking.
+   *
+   * It runs AFTER input validation, which is a deliberate change from the pre-SA-116 order.
+   * AMD-116-02 measured the cost of pausing a call that could never run — the user spends a
+   * click and a turn on a card, and the control then answers `OUT_OF_SCOPE` anyway. A call
+   * whose input does not parse is the same waste, and it is the same fix: fail it first.
+   * Nothing is weakened, because an invalid input never executed anything either way.
+   *
+   * The hash is taken over the RAW input, not the parsed one, so the resume matches on the
+   * bytes the model actually sends rather than on whatever defaults a schema fills in —
+   * which keeps "the same call" true even if a schema gains a default later.
+   * ---------------------------------------------------------------- */
+  if (control.riskLevel !== 'safe') {
+    const decision = await decideRiskGate({
+      userId: options.userId,
+      agentId: options.agentId,
+      sessionId: options.sessionId,
+      messageId: options.messageId,
+      controlId: effectiveControlId,
+      controlTitle: control.title,
+      riskLevel: control.riskLevel,
+      lane: resolveApprovalLane(options),
+      input: inputPayload,
+      scopeKey: resolveControlRiskScopeKey(effectiveControlId, inputPayload),
+      grant: options.approval ?? null,
+      portableSkillScope: actorType === 'portable-skill' && options.allowRisky === true
+    })
+
+    if (decision.kind === 'refuse-group') {
+      return await finalize(
+        {
+          success: false,
+          controlId: effectiveControlId,
+          error: {
+            code: 'CONTROL_RISK_UNAVAILABLE_IN_GROUP',
+            message: decision.message,
+            details: { riskLevel: control.riskLevel }
+          }
+        },
+        control
+      )
+    }
+
+    if (decision.kind === 'pause') {
+      riskApprovalPaused = true
+      return await finalize(
+        {
+          success: false,
+          controlId: effectiveControlId,
+          error: {
+            code: 'CONTROL_RISK_REQUIRES_APPROVAL',
+            // DL-116-13: one lane-aware wording, shared with the runtime `approval_hint`
+            // so the refusal and the hint below it can never say different things. The
+            // `service` lane is the one that used to lie: it said the user had been asked
+            // to approve, when no card can render for a call with no chat message.
+            message: buildControlApprovalPauseGuidance({
+              lane: decision.request.lane,
+              controlTitle: control.title,
+              approvalId: decision.request.approvalId
+            })
+              .slice(0, 2)
+              .join(' '),
+            details: {
+              approvalId: decision.request.approvalId,
+              controlTitle: decision.request.controlTitle,
+              riskLevel: decision.request.riskLevel,
+              inputSummary: decision.request.inputSummary,
+              // DL-116-07: send-routed's one `case 'tool-result'` loop recognises this block
+              // on ANY lane and persists the card entry, so the CLI lanes and the service
+              // lane get the same card the SDK pause gives the API lane.
+              approvalRequest: decision.request
+            }
+          }
+        },
+        control
+      )
+    }
+
+    riskApproval = decision.approval
   }
 
   if (!control.handler) {

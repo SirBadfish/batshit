@@ -1368,6 +1368,13 @@ function isDefinitelyRuntimeOnlyKey(key: string) {
     key.startsWith('ratelimit:') ||
     key.startsWith('artifact_runtime_token:') ||
     key.startsWith('tool_approval:') ||
+    // SA-116 DL-116-02: a risk approval is transient consent for ONE call in ONE chat.
+    // Restoring a fortnight-old "approved" record would be a click nobody made, in a
+    // session that may not exist any more. Listed here rather than left to the fact that no
+    // pattern happens to collect it, so the exclusion is something a test can read.
+    key.startsWith('control_approval:') ||
+    key.startsWith('control_approvals:') ||
+    key.startsWith('control_risk_approval:') ||
     key.startsWith('codex_bridge:')
   )
 }

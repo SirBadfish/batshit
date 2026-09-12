@@ -159,7 +159,11 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     // Bumped for SA-115 P3 (F-P2-3b): an agent's call has no browser, so an omitted
     // `time_zone` gets the SERVER's zone — the user's on the Mac app, usually UTC in
     // Docker. The block now says so rather than letting an agent discover it as a bug.
-    defaultVersion: '2026-09-08d'
+    // Bumped for SA-116 P4 (DL-116-13): SA-113 F-SEC-1's hard refusal in a woken chat is
+    // RETIRED — a risky control now pauses for the same Approve card a typed chat gets,
+    // so the old "Batshit refuses risky controls until the user replies" sentence would
+    // have an agent give up on a call the user can simply click.
+    defaultVersion: '2026-09-10'
   },
   {
     id: 'dynamic_mcp',

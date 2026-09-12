@@ -752,8 +752,10 @@ export async function stampDmDelivery(
  * SA-113 F-SEC-1b — mark this DM's woken turn as stopped waiting on the user.
  *
  * Two holdups reach here, and neither can be cleared by the agent:
- *   - `useControl` refusing a risky Fabric control with `CONTROL_RISK_NEEDS_HUMAN_TURN`
- *     (F-SEC-1), which happens MID-turn;
+ *   - the risk gate PAUSING a risky Fabric control for an Approve click (SA-116
+ *     DL-116-03), which happens MID-turn. Until SA-116 this was F-SEC-1's outright
+ *     refusal, `CONTROL_RISK_NEEDS_HUMAN_TURN`; a woken turn now gets the same card as
+ *     any other turn, and the stamp is what tells the user their chat is parked on them;
  *   - a woken turn that ended sitting in the persisted tool-approval state, seen by
  *     `finishWokenTurn`.
  *

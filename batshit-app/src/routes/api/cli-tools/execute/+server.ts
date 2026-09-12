@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 
 import { executeCliTool } from '$lib/server/services/cliToolRegistry'
+import { resolveApprovalCardTarget } from '$lib/server/services/controlApprovals'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
 
 interface ExecuteRequest {
@@ -11,6 +12,15 @@ interface ExecuteRequest {
   selectedToolIds?: string[]
   allowRisky?: boolean
   projectPath?: unknown
+  /**
+   * SA-116 DL-116-07/DL-116-14 — the chat and the assistant message a pause pins its card
+   * to. The managed CLI helper forwards both from `BATSHIT_SESSION_ID` /
+   * `BATSHIT_MESSAGE_ID`; both are verified against this user before they are used, so a
+   * risky user-authored CLI tool gets the same Approve button a risky Fabric control does
+   * instead of a pause with nowhere to render.
+   */
+  sessionId?: unknown
+  messageId?: unknown
 }
 
 export const POST: RequestHandler = async ({ locals, request }) => {
@@ -35,9 +45,17 @@ export const POST: RequestHandler = async ({ locals, request }) => {
         ? body.projectPath.trim()
         : null
 
+    const { sessionId, messageId } = await resolveApprovalCardTarget({
+      userId,
+      sessionId: body.sessionId,
+      messageId: body.messageId
+    })
+
     const result = await executeCliTool({
       userId,
       agentId: body.agentId ?? null,
+      sessionId,
+      messageId,
       toolId: body.toolId,
       input: body.input ?? {},
       selectedToolIds: body.selectedToolIds,

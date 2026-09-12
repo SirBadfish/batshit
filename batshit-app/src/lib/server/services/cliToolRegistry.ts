@@ -8,6 +8,11 @@ import { cloneIconRef, isIconRef } from '$lib/icons/iconTypes'
 import { normalizeOptionalIconRef } from '$lib/icons/iconLegacy'
 import { redis } from '$lib/server/redis'
 import {
+  decideRiskGate,
+  type ControlApprovalGrant,
+  type ControlApprovalRequest
+} from '$lib/server/services/controlApprovals'
+import {
   INFRA_API_KEY_SERVICES,
   apiKeyService,
   normalizeApiKeyServiceName
@@ -203,7 +208,21 @@ export type CliToolExecutionParams = {
   agentId?: string | null
   sessionId?: string | null
   selectedToolIds?: string[] | null
+  /**
+   * SA-116 DL-116-14 — **no longer read.**
+   *
+   * This was the second, independent copy of the same hole `useControl` had: a non-safe CLI
+   * tool ran the moment the MODEL passed the flag. The field stays in the signature so a
+   * stale caller gets the approval card instead of a type error, and it does nothing.
+   */
   allowRisky?: boolean
+  /** The assistant message the card belongs to (DL-116-07), verified by the route. */
+  messageId?: string | null
+  /**
+   * A server-owned approval, set ONLY by send-routed's resume paths — never from model
+   * input. The record must be `approved` and match this exact call.
+   */
+  approval?: ControlApprovalGrant | null
   projectPath?: string | null
 }
 
@@ -241,6 +260,14 @@ export type CliToolExecutionResult =
       auditId?: string
       blocked?: boolean
       requiresApproval?: boolean
+      /**
+       * SA-116 DL-116-07/DL-116-14 — the block the approval card is built from.
+       *
+       * Present only on `REQUIRES_APPROVAL`. Carried out to the caller so the CLI-tool
+       * lane persists the same card entry as the Fabric lane, through the same
+       * `case 'tool-result'` loop in send-routed.
+       */
+      approvalRequest?: ControlApprovalRequest
       code:
         | 'NOT_FOUND'
         | 'OUT_OF_SCOPE'
@@ -248,6 +275,9 @@ export type CliToolExecutionResult =
         | 'INPUT_VALIDATION_FAILED'
         | 'POLICY_BLOCKED'
         | 'REQUIRES_APPROVAL'
+        // SA-116 DL-116-10: a card raised in a group turn would be abandoned by the next
+        // speaker, so a risky tool is refused there instead of carded.
+        | 'UNAVAILABLE_IN_GROUP'
         | 'EXECUTION_FAILED'
         | 'OUTPUT_PARSE_FAILED'
       error: string
@@ -1480,16 +1510,61 @@ export async function executeCliTool(params: CliToolExecutionParams): Promise<Cl
     }
   }
 
-  if (record.riskLevel !== 'safe' && params.allowRisky !== true) {
-    return {
-      success: false,
-      toolId: record.toolId,
-      title: record.title,
-      blocked: true,
-      requiresApproval: true,
-      code: 'REQUIRES_APPROVAL',
-      error: `CLI tool "${record.toolId}" has ${record.riskLevel} risk and requires explicit approval before execution`,
-      riskLevel: record.riskLevel
+  /* ------------------------------------------------------------------ *
+   * SA-116 DL-116-14 — user-authored CLI tools ride the same policy.
+   *
+   * This gate used to read `params.allowRisky` and nothing else, which was the identical
+   * hole `useControl` had, in a second file, with a different spelling. Both now call ONE
+   * function, so the order and the consume-once rule cannot drift between them.
+   *
+   * `cli_tool:` prefixes the control id because a CLI tool id is user-chosen text and the
+   * approval store is shared with the Fabric controls: without the prefix a tool called
+   * `sys.memory.delete` would look like the Fabric control of that name and could spend a
+   * click meant for it.
+   * ------------------------------------------------------------------ */
+  if (record.riskLevel !== 'safe') {
+    const decision = await decideRiskGate({
+      userId: params.userId,
+      agentId: params.agentId,
+      sessionId: params.sessionId,
+      messageId: params.messageId,
+      controlId: `cli_tool:${record.toolId}`,
+      controlTitle: record.title,
+      riskLevel: record.riskLevel,
+      lane:
+        typeof params.messageId === 'string' && params.messageId.trim().length > 0
+          ? 'cli'
+          : 'api',
+      input: params.input ?? {},
+      grant: params.approval ?? null
+    })
+
+    if (decision.kind === 'refuse-group') {
+      return {
+        success: false,
+        toolId: record.toolId,
+        title: record.title,
+        blocked: true,
+        code: 'UNAVAILABLE_IN_GROUP',
+        error: decision.message,
+        riskLevel: record.riskLevel
+      }
+    }
+
+    if (decision.kind === 'pause') {
+      return {
+        success: false,
+        toolId: record.toolId,
+        title: record.title,
+        blocked: true,
+        requiresApproval: true,
+        code: 'REQUIRES_APPROVAL',
+        approvalRequest: decision.request,
+        error:
+          `Batshit paused "${record.title}" and asked the user to approve it. ` +
+          'Tell the user what it does and why, then stop. Do not retry it yourself.',
+        riskLevel: record.riskLevel
+      }
     }
   }
 

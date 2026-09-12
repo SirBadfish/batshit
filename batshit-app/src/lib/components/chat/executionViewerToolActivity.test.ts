@@ -155,4 +155,57 @@ describe('buildExecutionToolActivityEntries', () => {
         'Tool call was captured in the provider trace, but no matching tool-result payload was stored in intermediateSteps for this run.',
     })
   })
+
+  it('SA-116 DL-116-12: a broker step is named by the control it ran, not by the broker', () => {
+    // A broker step is COMPACTED before it reaches a renderer: `toolArgs` becomes
+    // `{ ref, target }` and the real input moves under `toolResult.input`. Every Fabric call
+    // in the Execution Viewer used to read "Dynamic Tool Use", which is the broker's own
+    // display name.
+    // Captured from a live BSMS run on 2026-09-10 (SA-116 P2 T1): note that `toolArgs`
+    // holds the ref beside the control's OWN fields, not the `{ref, target}` pair the
+    // Fragility Map describes for the renderer path. A hand-written fixture using that pair
+    // would pass while the real step stayed unnamed.
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        {
+          toolCallId: 'toolu_01QmAdgoyudjLFRNzmmVhLPm',
+          toolName: 'native_batshit_tool_use',
+          originalToolName: 'native_batshit_tool_use',
+          toolArgs: {
+            ref: 'fabric:sys.memory.delete',
+            memoryId: 'mem_1789030269276_h43dh2',
+          },
+          toolResult: {
+            success: true,
+            controlId: 'sys.memory.delete',
+            riskLevel: 'confirm',
+            ref: 'fabric:sys.memory.delete',
+            target: 'sys.memory.delete',
+            input: { memoryId: 'mem_1789030269276_h43dh2' },
+          },
+        },
+      ],
+      llmCalls: [],
+    })
+
+    expect(entries[0]).toMatchObject({
+      rawToolName: 'native_batshit_tool_use',
+      displayName: 'Memory Delete',
+    })
+  })
+
+  it('SA-116: an unrecognised broker ref keeps the broker name instead of guessing', () => {
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        {
+          toolCallId: 'toolu_x',
+          toolName: 'native_batshit_tool_use',
+          toolArgs: {},
+        },
+      ],
+      llmCalls: [],
+    })
+
+    expect(entries[0]?.displayName).toBe('Dynamic Tool Use')
+  })
 })

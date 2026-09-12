@@ -570,6 +570,20 @@ export class RedisService {
           console.error(`[deleteSession] Error deleting subagent thread/lock keys:`, threadError)
         }
 
+        // SA-116 P1 (DL-116-15): the risk-approval records raised in this chat, plus their
+        // index. They carry a 24-hour EXPIRE, which is NOT a reason to skip this — the same
+        // reasoning left `n8n:sse-callback:` unenumerated until AMD-111-02, and a consent
+        // record that expires "soon" still outlives its chat until it does. An approval is
+        // session-scoped, so `deleteAgent` deliberately owes it nothing.
+        try {
+          const { sweepSessionApprovals } = await import(
+            '$lib/server/services/controlApprovals'
+          )
+          await sweepSessionApprovals(id)
+        } catch (approvalError) {
+          console.error(`[deleteSession] Error deleting control approvals:`, approvalError)
+        }
+
         // SA-111 AMD-111-02: scoped per-message n8n callback tokens. TTL-bounded (~30 min)
         // and deliberately NOT part of backup — they are short-lived credentials, not data —
         // but they are session-scoped state and belong in this sweep.

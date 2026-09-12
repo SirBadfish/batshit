@@ -162,7 +162,7 @@ For this helper-owned lane:
 - Do **not** invent `.env`, `start.sh`, or `launch.sh` files to bridge into the helper
 - Do **not** manually register/enable after the helper fits
 - If the repo already documents a server entrypoint, pass that directly to the helper
-- If the helper raises a confirm gate and the user already approved the managed setup work, immediately retry `sys.voice.engine.complete_local_setup` with `allowRisky: true` using the same payload instead of falling back to manual launch/register work
+- If the helper raises a confirm gate, Batshit is waiting on the user's **Approve** click — say what the setup does, then stop. Never pass `allowRisky`; it is ignored. When the click resumes you (Codex/Claude) retry `sys.voice.engine.complete_local_setup` with the same payload; on an API agent the same call re-runs by itself. Either way, do not fall back to manual launch/register work
 
 **Manual launch is only for:**
 - Non-TTS lanes where the helper doesn't fit

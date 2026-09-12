@@ -27,16 +27,17 @@ export const SCHEDULES_INDEX_PREFIX = 'schedules:'
 /**
  * A schedule id is `sch_` plus base64url, and NOTHING else may be turned into a key.
  *
- * The id arrives as a URL path segment (P2's routes) and as agent-supplied tool input
- * (`sys.schedule.update`), so it is attacker-controlled text — and the two key spaces
- * overlap exactly the way `wake_hook:` and `wake_hooks:` do: `schedule:` + `s:{userId}`
- * is byte-identical to `schedules:{userId}`, the index SET. Without this guard a crafted
- * id sends `JSON.GET` at a SET, Redis answers WRONGTYPE, and the throw escapes as a 500
- * that tells the caller a real user id from a made-up one.
+ * The id arrives as a URL path segment (the routes) and as agent-supplied tool input
+ * (`sys.schedule.update`), so it is attacker-controlled text. The guard is hygiene, and
+ * worth having for exactly these reasons: a malformed id answers "no such schedule" without
+ * a key read; the charset and length are bounded, so no wildcard, control character, or
+ * unbounded string ever reaches a key name or a log line built from one; and a typo is a
+ * clean miss instead of a Redis error escaping as a 500.
  *
- * The prefix makes a collision impossible in the other direction too: a real record key
- * is `schedule:sch_…` and an index key is `schedules:…`, and `sch_…` can never equal
- * `s:…` because the second character differs.
+ * What it is NOT: a fix for `schedule:` and `schedules:` colliding. This header used to
+ * claim `schedule:` + `s:{userId}` is byte-identical to `schedules:{userId}`; SA-116 P1
+ * checked the arithmetic and it is false — the record prefix ends in `:` where the index
+ * prefix has `s`, so no id can turn one key into the other, in either direction.
  */
 const SCHEDULE_ID_PATTERN = /^sch_[A-Za-z0-9_-]{1,64}$/
 

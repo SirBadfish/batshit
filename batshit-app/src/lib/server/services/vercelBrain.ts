@@ -232,6 +232,17 @@ export interface NativeModeRequest extends ThinkRequest {
    * leaves it false, which is what keeps delegation depth at one level.
    */
   workersEnabled?: boolean
+  /**
+   * SA-116 P2 (DL-116-05, DL-116-10): the approvals the user clicked, keyed by the SDK
+   * `toolCallId` of the paused call, and whether this is a group member's turn (a group run
+   * never registers the risk-approval policy). Both are resolved by send-routed from server
+   * state — never from anything the browser posts back.
+   */
+  controlApprovals?: {
+    approved?: Record<string, { kind: 'sdk' | 'resume'; approvalId: string; toolCallId?: string }> | null
+    denied?: Record<string, { controlTitle?: string | null }> | null
+  } | null
+  groupMemberRun?: boolean
   gatewayToolMap?: Record<string, string[]> | null
   preloadedGatewayTools?: ToolMetadataMap['tools']
   preloadedGatewayMetadata?: ToolMetadataMap['metadata']
@@ -447,6 +458,8 @@ export class VercelAIBrain {
           dmControlsEnabled: request.dmControlsEnabled,
           scheduleControlsEnabled: request.scheduleControlsEnabled,
           workersEnabled: request.workersEnabled,
+          controlApprovals: request.controlApprovals ?? null,
+          groupMemberRun: request.groupMemberRun === true,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
           parentCapabilities: request.modelCapabilities ?? null,
@@ -983,6 +996,9 @@ export class VercelAIBrain {
       scheduleControlsEnabled?: boolean
       /** SA-111 P4: primary-agent sends only; every delegated run leaves it false. */
       workersEnabled?: boolean
+      /** SA-116 P2: send-routed's resolved approval grants and the group-run flag. */
+      controlApprovals?: NativeModeRequest['controlApprovals']
+      groupMemberRun?: boolean
       parentModelId?: string | null
       parentConnection?: ModelConnectionInfo | null
       /** SA-105 P2 (DL-105-06): saved-model capabilities for the image lane gate. */
@@ -1060,6 +1076,9 @@ export class VercelAIBrain {
           projectPath: nativeContext?.projectPath ?? null,
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode,
+          // SA-116 P2: the click, and whether a card could ever be answered here.
+          controlApprovals: nativeContext?.controlApprovals ?? null,
+          groupMemberRun: nativeContext?.groupMemberRun === true,
           imageDelivery,
           ephemeralImages,
           // SA-111 P4 (DL-111-09): the worker tool exists only on a primary send. Every
@@ -2645,6 +2664,8 @@ export class VercelAIBrain {
             dmControlsEnabled: request.dmControlsEnabled,
             scheduleControlsEnabled: request.scheduleControlsEnabled,
             workersEnabled: request.workersEnabled,
+            controlApprovals: request.controlApprovals ?? null,
+            groupMemberRun: request.groupMemberRun === true,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,
             parentCapabilities: request.modelCapabilities ?? null,

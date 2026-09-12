@@ -1,6 +1,10 @@
 <script lang="ts">
   import { Button } from '$lib/components/ui/button'
   import { formatToolDisplayName } from '$lib/utils/toolNameFormatter'
+  import {
+    formatControlApprovalRiskWord,
+    formatControlApprovalTitle
+  } from '$lib/utils/controlApprovalPresentation'
 
   interface Props {
     approvals: any[]
@@ -11,6 +15,18 @@
     getApprovalRemainingSeconds: (approval: any) => number | null
     onApprovalAction: (approvalId: string, approved: boolean) => void | Promise<void>
   }
+
+  /**
+   * SA-116 (DL-116-06) — the Fabric presentation.
+   *
+   * A risky Fabric control, artifact control, or user-authored CLI tool carries a server
+   * written `control` block. Everything here reads from it: the title, the risk word, the
+   * exact input behind a disclosure (F-P2-2: `control.input`, the payload the hash covers;
+   * the shortened `inputSummary` only when a lane cannot carry it, labelled as a summary).
+   * A Bash approval has no `control` block and renders
+   * exactly as it did before. The wording lives in `controlApprovalPresentation.ts` so it
+   * can be pinned against a payload captured from a live run.
+   */
 
   let {
     approvals,
@@ -39,19 +55,44 @@
   <div class="message-approval-list">
     {#each approvals as approval (approval.approvalId)}
       {@const remainingSeconds = getApprovalRemainingSeconds(approval)}
+      {@const control = approval.control ?? null}
+      {@const exactInput = control?.input && typeof control.input === 'object' ? control.input : null}
       <div class="message-approval-card">
         <div class="message-approval-card-layout">
           <div class="message-approval-detail">
             <p class="message-approval-request">
               {describeApproval(approval)}
             </p>
-            <p class="message-approval-tool">
-              {formatToolDisplayName(approval.toolName || 'tool')}
-            </p>
-            {#if approval.status === 'pending' && remainingSeconds !== null && remainingSeconds <= 30}
-              <p class="message-approval-deadline">Expiring in {remainingSeconds}s</p>
+            <div class="message-approval-meta">
+              <span class="message-approval-tool">
+                {control
+                  ? formatControlApprovalTitle(control)
+                  : formatToolDisplayName(approval.toolName || 'tool')}
+              </span>
+              {#if control}
+                <span
+                  class="message-approval-risk"
+                  class:is-restricted={control.riskLevel === 'restricted'}
+                >
+                  {formatControlApprovalRiskWord(control.riskLevel)}
+                </span>
+              {/if}
+            </div>
+            {#if approval.status === 'pending'}
+              {#if control && control.lane && control.lane !== 'api'}
+                <p class="message-approval-waits">Waits for you</p>
+              {:else if remainingSeconds !== null && remainingSeconds <= 30}
+                <p class="message-approval-deadline">Expiring in {remainingSeconds}s</p>
+              {/if}
             {/if}
-            {#if approval.input}
+            {#if control}
+              <details class="message-approval-disclosure">
+                <summary>{exactInput ? 'Exact input' : 'Input summary'}</summary>
+                <pre class="message-approval-input">
+{formatApprovalInput(exactInput ?? control.inputSummary ?? approval.input)}
+                </pre>
+              </details>
+            {:else if approval.input}
               <pre class="message-approval-input">
 {formatApprovalInput(approval.input)}
               </pre>
@@ -161,6 +202,53 @@
 
   .message-approval-deadline {
     color: oklch(0.72 0.12 78);
+    font-size: 0.6875rem;
+  }
+
+  /* SA-116: an approval that waits for a resume turn has no countdown — its record lives
+     24 hours, not three minutes. */
+  .message-approval-waits {
+    color: var(--muted-foreground);
+    font-size: 0.6875rem;
+  }
+
+  .message-approval-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.375rem;
+  }
+
+  /* Same badge shape as the status pills below: fixed height, no vertical padding, quiet
+     contrast. `confirm` reuses this panel's existing warning amber; `restricted` uses the
+     app's destructive token. */
+  .message-approval-risk {
+    display: inline-flex;
+    align-items: center;
+    height: 1.125rem;
+    border-radius: 9999px;
+    border: 1px solid oklch(0.72 0.12 78 / 0.4);
+    padding: 0 0.5rem;
+    background: oklch(0.72 0.12 78 / 0.12);
+    color: oklch(0.72 0.12 78);
+    font-size: 0.6875rem;
+    font-weight: 500;
+    line-height: 1.125rem;
+  }
+
+  .message-approval-risk.is-restricted {
+    border-color: oklch(from var(--destructive) l c h / 0.45);
+    background: oklch(from var(--destructive) l c h / 0.12);
+    color: var(--destructive);
+  }
+
+  .message-approval-disclosure {
+    margin-top: 0.125rem;
+  }
+
+  .message-approval-disclosure summary {
+    color: var(--muted-foreground);
+    cursor: pointer;
     font-size: 0.6875rem;
   }
 

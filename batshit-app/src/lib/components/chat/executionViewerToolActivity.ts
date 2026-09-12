@@ -1,6 +1,9 @@
 import type { ExecutionConfidenceLevel } from '$lib/types/executionViewer'
 import type { ExecutionLlmCall } from '$lib/types/executionViewer'
-import { formatToolDisplayName } from '$lib/utils/toolNameFormatter'
+import {
+  formatBatshitToolTargetDisplayName,
+  formatToolDisplayName
+} from '$lib/utils/toolNameFormatter'
 import { estimateTokens } from '$lib/utils/tokens'
 import { estimateCoolToolAiTokens } from '$lib/utils/coolToolAiContent'
 
@@ -53,7 +56,43 @@ function extractRawToolName(step: any): string {
   return 'tool'
 }
 
+/** The broker tool names a Fabric/artifact/CLI call arrives under. */
+const BROKER_TOOL_NAMES = new Set(['native_batshit_tool_use', 'batshit_tool_use'])
+
+/**
+ * SA-116 (DL-116-12) — the ref a broker step actually ran.
+ *
+ * A broker step is COMPACTED before it reaches a renderer: `toolArgs` becomes
+ * `{ref, target}` and the real input moves under `toolResult.input`. So the ref is read
+ * from several shapes, and an unknown one falls back to the broker's own display name
+ * rather than guessing.
+ */
+function extractBrokerRef(step: any): string {
+  const candidates = [
+    step?.toolArgs?.ref,
+    step?.toolInput?.ref,
+    step?.args?.ref,
+    step?.input?.ref,
+    step?.toolResult?.ref,
+    step?.toolResult?.input?.ref,
+    step?.output?.ref,
+    step?.result?.ref
+  ]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate.trim()
+  }
+  const target = step?.toolArgs?.target ?? step?.toolResult?.target ?? step?.output?.target
+  return typeof target === 'string' ? target.trim() : ''
+}
+
 function formatExecutionToolName(rawToolName: string, step: any): string {
+  if (BROKER_TOOL_NAMES.has(rawToolName)) {
+    // Until SA-116 every Fabric call in the Execution Viewer read "Dynamic Tool Use",
+    // because the raw broker name is what the step carries. The control is the thing Josh
+    // is looking for.
+    const controlName = formatBatshitToolTargetDisplayName(extractBrokerRef(step))
+    if (controlName) return controlName
+  }
   if (rawToolName === 'Agent') return 'Subagent'
   if (rawToolName === 'ToolSearch') return 'Tool Search'
   if (

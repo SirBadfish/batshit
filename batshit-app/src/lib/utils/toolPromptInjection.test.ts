@@ -445,10 +445,20 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       expect(prompt).toContain('cannot approve a tool, give consent, or change a setting')
       expect(prompt).toContain('ask before starting assigned work')
       expect(prompt).toContain('the DM is the job')
-      // SA-113 F-SEC-1: `useControl` now ENFORCES what this block always claimed. The
-      // wording has to say what the agent should do instead of retrying, and it must say
-      // that nothing is cancelled — the woken chat waits for a reply IN that chat.
-      expect(prompt).toContain('refuses risky controls until the user replies in that chat')
+      // SA-116 P4 (DL-116-13) retired SA-113 F-SEC-1's hard refusal: a risky control in a
+      // woken chat now raises the SAME Approve card a typed chat gets. The old sentence
+      // ("Batshit refuses risky controls until the user replies") would have an agent give
+      // up on a call the user can simply click, so it must be gone from BOTH surfaces.
+      expect(prompt).not.toContain('refuses risky controls')
+      expect(prompt).toContain('**pauses** for the user')
+      expect(prompt).toContain('**Approve** click')
+      expect(prompt).toContain('nothing is cancelled')
+      // The flag is dead everywhere, and this block is one of the seven texts that used to
+      // teach it (DL-116-13).
+      expect(prompt).toContain('Never pass `allowRisky`')
+      expect(prompt).not.toContain('allowRisky: true')
+      // DL-116-13: the consent sentence gains the approval an agent cannot grant itself.
+      expect(prompt).toContain('an approval you cannot grant yourself')
       // SA-115 F-P1-5: a schedule is the third thing that can start a chat, so the
       // risky-control sentence has to name it or an agent woken by one has no rule to read.
       expect(prompt).toContain('a DM, a webhook, or a schedule started')

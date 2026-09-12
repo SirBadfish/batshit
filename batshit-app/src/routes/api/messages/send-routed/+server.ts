@@ -198,6 +198,28 @@ import { stripLeadingSubagentEchoText } from '$lib/server/services/finalAssistan
 import { selectFinishZipInput } from '$lib/server/services/managedStreamFinalization'
 import { applyUnavailableWebSearchMetadata } from '$lib/utils/webSearchAvailability'
 import { nativeToolService } from '$lib/server/services/nativeTools'
+import {
+  attachControlApprovalRecords,
+  buildControlApprovalResumeContent,
+  buildControlApprovalInPlaceAddendum,
+  planControlApprovalResumeTurn,
+  resolveApprovalResumeGrants,
+  settleControlApprovalCard,
+  type ResolvedApprovalResumeGrants
+} from '$lib/server/services/brokerControlApprovals'
+import { markApprovalExpired } from '$lib/server/services/controlApprovals'
+import {
+  analyzeApprovalState,
+  buildApprovalHistoryMessages,
+  buildControlApprovalEntry,
+  readControlApprovalRequestFromToolResult,
+  resolveApprovalSummarySource,
+  toolResultApprovalRendersCard,
+  parseApprovalTimestampMs,
+  TOOL_APPROVAL_TIMEOUT_MS,
+  TOOL_APPROVAL_TIMEOUT_SECONDS,
+  type ApprovalStateSnapshot
+} from '$lib/server/services/toolApprovalState'
 import { normalizeAssignedSubagent } from '$lib/server/services/assignedSubagentNormalization'
 import {
   internalServiceHeaders,
@@ -238,8 +260,6 @@ const CODEX_CONNECTION_ID = 'codex-cli'
 const CLAUDE_CONNECTION_ID = 'claude-cli'
 const SIMULATED_STREAM_DELAY_MS = 22
 const SIMULATED_STREAM_CHUNK_TARGET = 36
-const TOOL_APPROVAL_TIMEOUT_MS = 180_000
-const TOOL_APPROVAL_TIMEOUT_SECONDS = TOOL_APPROVAL_TIMEOUT_MS / 1000
 // Hard cap on automatic continuations after mid-run context-window exhaustion,
 // per user request, so a pathological task can never loop forever.
 const MAX_CONTEXT_CONTINUATIONS = 3
@@ -285,36 +305,6 @@ async function collectTrustedClipIdsForSession(
   }
 
   return Array.from(ids)
-}
-
-type ApprovalHistoryMessage = {
-  id?: string
-  created_at?: string
-  timestamp?: string
-  metadata?: Record<string, any> | null
-}
-
-type ApprovalStateRecord = {
-  approvalId: string
-  status: ToolApprovalEntry['status']
-  toolName?: string
-  expiresAt?: string
-  expiresAtMs: number | null
-  messageId?: string
-}
-
-type ApprovalStateSnapshot = {
-  byId: Map<string, ApprovalStateRecord>
-  newlyExpired: Array<{
-    approvalId: string
-    toolName?: string
-    expiredAt: string
-    timeoutSeconds: number
-  }>
-  updates: Array<{
-    messageId: string
-    metadata: Record<string, any>
-  }>
 }
 
 function shouldEnableTools(
@@ -855,259 +845,8 @@ async function loadProviderMessagesForApprovalsFromRedis(
   return []
 }
 
-function parseTimestampMs(value: unknown): number | null {
-  if (typeof value !== 'string' || value.trim().length === 0) return null
-  const parsed = Date.parse(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-function normalizeApprovalStatus(value: unknown): ToolApprovalEntry['status'] {
-  if (value === 'approved' || value === 'denied' || value === 'expired')
-    return value
-  return 'pending'
-}
-
-function extractApprovalToolName(
-  entry: Record<string, any>,
-): string | undefined {
-  const direct = typeof entry.toolName === 'string' ? entry.toolName.trim() : ''
-  if (direct) return direct
-
-  const toolCall = entry.toolCall
-  if (toolCall && typeof toolCall === 'object') {
-    const nestedName =
-      typeof (toolCall as any).toolName === 'string'
-        ? (toolCall as any).toolName.trim()
-        : typeof (toolCall as any).tool_name === 'string'
-          ? (toolCall as any).tool_name.trim()
-          : ''
-    if (nestedName) return nestedName
-  }
-
-  return undefined
-}
-
-function countApprovalEntries(metadata: unknown): number {
-  if (!metadata || typeof metadata !== 'object') return 0
-  const summary = (metadata as Record<string, any>).toolApprovals
-  if (!summary || typeof summary !== 'object') return 0
-  const approvals = (summary as Record<string, any>).approvals
-  return Array.isArray(approvals) ? approvals.length : 0
-}
-
-function buildApprovalHistoryMessages(
-  requestMessages: unknown,
-  persistedMessages: ChatMessage[],
-): ApprovalHistoryMessage[] {
-  const byId = new Map<string, ApprovalHistoryMessage>()
-  const insertionOrder: string[] = []
-  const idless: ApprovalHistoryMessage[] = []
-
-  const register = (raw: unknown, preferExisting = false) => {
-    if (!raw || typeof raw !== 'object') return
-    const message = raw as Record<string, any>
-    const messageId = typeof message.id === 'string' ? message.id : ''
-    const normalized: ApprovalHistoryMessage = {
-      ...(messageId ? { id: messageId } : {}),
-      ...(typeof message.created_at === 'string'
-        ? { created_at: message.created_at }
-        : {}),
-      ...(typeof message.timestamp === 'string'
-        ? { timestamp: message.timestamp }
-        : {}),
-      metadata:
-        message.metadata && typeof message.metadata === 'object'
-          ? (message.metadata as Record<string, any>)
-          : undefined,
-    }
-
-    if (!messageId) {
-      idless.push(normalized)
-      return
-    }
-
-    const existing = byId.get(messageId)
-    if (!existing) {
-      byId.set(messageId, normalized)
-      insertionOrder.push(messageId)
-      return
-    }
-
-    if (preferExisting) {
-      const existingApprovalCount = countApprovalEntries(existing.metadata)
-      const incomingApprovalCount = countApprovalEntries(normalized.metadata)
-      if (existingApprovalCount > 0 || incomingApprovalCount === 0) {
-        return
-      }
-    }
-
-    byId.set(messageId, {
-      ...existing,
-      ...normalized,
-      metadata: normalized.metadata ?? existing.metadata,
-    })
-  }
-
-  if (Array.isArray(persistedMessages)) {
-    for (const message of persistedMessages) {
-      register(message)
-    }
-  }
-
-  if (Array.isArray(requestMessages)) {
-    for (const message of requestMessages) {
-      register(message, true)
-    }
-  }
-
-  const combined = [
-    ...insertionOrder.map((id) => byId.get(id)).filter(Boolean),
-    ...idless,
-  ] as ApprovalHistoryMessage[]
-
-  combined.sort((a, b) => {
-    const aMs = parseTimestampMs(a.created_at ?? a.timestamp)
-    const bMs = parseTimestampMs(b.created_at ?? b.timestamp)
-    if (aMs === null && bMs === null) return 0
-    if (aMs === null) return 1
-    if (bMs === null) return -1
-    return aMs - bMs
-  })
-
-  return combined
-}
-
-function analyzeApprovalState(
-  messages: ApprovalHistoryMessage[],
-  nowMs = Date.now(),
-): ApprovalStateSnapshot {
-  const byId = new Map<string, ApprovalStateRecord>()
-  const newlyExpired: ApprovalStateSnapshot['newlyExpired'] = []
-  const updates: ApprovalStateSnapshot['updates'] = []
-  const nowIso = new Date(nowMs).toISOString()
-
-  for (const message of messages) {
-    const metadata =
-      message.metadata && typeof message.metadata === 'object'
-        ? (message.metadata as Record<string, any>)
-        : null
-    const summary =
-      metadata?.toolApprovals && typeof metadata.toolApprovals === 'object'
-        ? (metadata.toolApprovals as Record<string, any>)
-        : null
-    if (!summary) continue
-
-    const approvals = Array.isArray(summary.approvals) ? summary.approvals : []
-    if (approvals.length === 0) continue
-
-    const messageCreatedAtMs = parseTimestampMs(
-      message.created_at ?? message.timestamp,
-    )
-    let nextApprovals: any[] | null = null
-
-    for (let idx = 0; idx < approvals.length; idx += 1) {
-      const rawEntry = approvals[idx]
-      if (!rawEntry || typeof rawEntry !== 'object') continue
-
-      const entry = rawEntry as Record<string, any>
-      const approvalId =
-        typeof entry.approvalId === 'string' ? entry.approvalId.trim() : ''
-      if (!approvalId) continue
-
-      const requestedAtMs = parseTimestampMs(entry.requestedAt)
-      const fallbackRequestedAtMs = requestedAtMs ?? messageCreatedAtMs
-      const explicitExpiresAtMs = parseTimestampMs(entry.expiresAt)
-      const expiresAtMs =
-        explicitExpiresAtMs ??
-        (fallbackRequestedAtMs !== null
-          ? fallbackRequestedAtMs + TOOL_APPROVAL_TIMEOUT_MS
-          : null)
-
-      const requestedAt =
-        requestedAtMs !== null
-          ? new Date(requestedAtMs).toISOString()
-          : fallbackRequestedAtMs !== null
-            ? new Date(fallbackRequestedAtMs).toISOString()
-            : undefined
-      const expiresAt =
-        expiresAtMs !== null ? new Date(expiresAtMs).toISOString() : undefined
-
-      let status = normalizeApprovalStatus(entry.status)
-      let expiredAt =
-        parseTimestampMs(entry.expiredAt) !== null
-          ? new Date(parseTimestampMs(entry.expiredAt) as number).toISOString()
-          : undefined
-      let changed = false
-
-      if (
-        status === 'pending' &&
-        expiresAtMs !== null &&
-        nowMs >= expiresAtMs
-      ) {
-        status = 'expired'
-        expiredAt = nowIso
-        changed = true
-        newlyExpired.push({
-          approvalId,
-          toolName: extractApprovalToolName(entry),
-          expiredAt: nowIso,
-          timeoutSeconds: TOOL_APPROVAL_TIMEOUT_SECONDS,
-        })
-      }
-
-      if (!entry.requestedAt && requestedAt) changed = true
-      if (!entry.expiresAt && expiresAt) changed = true
-      if (entry.status !== status) changed = true
-      if (status === 'expired' && !entry.expiredAt && expiredAt) changed = true
-
-      const normalizedEntry = changed
-        ? {
-            ...entry,
-            status,
-            ...(status === 'expired' ? { submitted: false } : {}),
-            ...(requestedAt ? { requestedAt } : {}),
-            ...(expiresAt ? { expiresAt } : {}),
-            ...(status === 'expired' && expiredAt ? { expiredAt } : {}),
-          }
-        : entry
-
-      if (changed) {
-        if (!nextApprovals) {
-          nextApprovals = [...approvals]
-        }
-        nextApprovals[idx] = normalizedEntry
-      }
-
-      byId.set(approvalId, {
-        approvalId,
-        status,
-        toolName: extractApprovalToolName(normalizedEntry),
-        expiresAt,
-        expiresAtMs,
-        messageId: typeof message.id === 'string' ? message.id : undefined,
-      })
-    }
-
-    if (
-      nextApprovals &&
-      typeof message.id === 'string' &&
-      message.id.trim().length > 0
-    ) {
-      updates.push({
-        messageId: message.id.trim(),
-        metadata: {
-          ...(metadata ?? {}),
-          toolApprovals: {
-            ...summary,
-            approvals: nextApprovals,
-          },
-        },
-      })
-    }
-  }
-
-  return { byId, newlyExpired, updates }
-}
+/** One owner, in `toolApprovalState.ts`; aliased because this file reads timestamps well beyond approvals. */
+const parseTimestampMs = parseApprovalTimestampMs
 
 function buildToolApprovalTimeoutAddendum(raw: unknown) {
   if (!Array.isArray(raw) || raw.length === 0) return null
@@ -3237,11 +2976,24 @@ async function handleBatshitAgentStream({
     metadata?.expiredToolApprovals ??
       batshitInput?.metadata?.expiredToolApprovals,
   )
+  /**
+   * SA-116 F-P3-2 — a control approval the user granted on a click that ALSO resumed an
+   * SDK-paused call. There is no new user message to carry it (the resume re-enters the
+   * run that paused), so it is appended here, already formatted by
+   * `buildControlApprovalInPlaceAddendum`.
+   */
+  const controlApprovalAddendum = (() => {
+    const raw =
+      metadata?.controlApprovalNotice ??
+      batshitInput?.metadata?.controlApprovalNotice
+    return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : null
+  })()
   const mergedSystemPromptAddendum = [
     systemPromptAddendum,
     interruptionAddendum,
     contextContinuationAddendum,
     toolApprovalTimeoutAddendum,
+    controlApprovalAddendum,
   ]
     .filter(Boolean)
     .join('\n\n')
@@ -3795,6 +3547,28 @@ async function handleBatshitAgentStream({
       )
       .filter(Boolean),
   )
+
+  /**
+   * SA-116 P2 (DL-116-05, F-P1-4) — turn the click into a grant the run may spend.
+   *
+   * Resolved BEFORE the model request is built, from the persisted assistant message: which
+   * SDK approval belongs to which `toolCallId`, and which `apr_…` record it names. The POST
+   * body says only "this approval id, approved or not"; it can never name a different
+   * record. `resolveApprovalResumeGrants` also writes the decision, which is the one thing
+   * that seeds the scoped voice-engine window DL-116-04 keeps.
+   */
+  let resolvedControlApprovals: ResolvedApprovalResumeGrants = {
+    approved: {},
+    denied: {},
+  }
+  if (hasToolApprovalResponse && sessionId) {
+    resolvedControlApprovals = await resolveApprovalResumeGrants({
+      userId,
+      sessionId,
+      messageId,
+      responses: toolApprovalResponse,
+    })
+  }
   let continuationSourceMessages = extractProviderMessages(
     previousMessages,
     providerContinuationCriteria,
@@ -4988,6 +4762,11 @@ async function handleBatshitAgentStream({
     // SA-111 P4 (DL-111-11): the ONE place a primary send turns Workers on. Every
     // delegated run leaves it unset, which is what enforces depth 1.
     workersEnabled: resolveWorkersEnabled(agent),
+    // SA-116 P2 (DL-116-05, DL-116-10): the approvals this resume may spend, and whether
+    // this is a group member's turn (a group run never registers the risk policy at all —
+    // its card would be persisted and then abandoned as the next speaker starts).
+    controlApprovals: resolvedControlApprovals,
+    groupMemberRun: streamMetadata?.groupChat === true,
     messages: streamMessages,
     model: modelId,
     mode4Style: mode4Style ?? undefined,
@@ -6351,6 +6130,43 @@ async function handleBatshitAgentStream({
             rawToolCallId ||
             `tool_${Date.now()}_${crypto.randomUUID().replace(/-/g, '').slice(0, 10)}`
 
+          /**
+           * SA-116 DL-116-07 — a control pause that arrived as a tool RESULT.
+           *
+           * This is the ONE loop every lane feeds, which is why the CLI lanes' card lives
+           * here rather than in a bridge: the managed Codex/Claude helper's call has already
+           * been made by the time the gate refuses it, so the refusal comes back as an
+           * ordinary tool result rather than as an SDK `tool-approval-request`. Registering
+           * it in the same map the SDK pause uses means the finish path persists
+           * `metadata.toolApprovals` identically — with no tab open too, because the finish
+           * path runs regardless of listeners (AMD-113-01).
+           *
+           * The API lane feeds this loop too, and its own pauses stay OUT of it (F-P3-1):
+           * a card made here is answered by a resume turn, while an `api`-lane card is
+           * answered by the in-place SDK resume, which can only re-execute an SDK-paused
+           * call — a `tool-approval-response` for an id the SDK never issued throws for the
+           * whole click. `toolResultApprovalRendersCard` owns that rule.
+           */
+          const streamedApprovalRequest =
+            readControlApprovalRequestFromToolResult(resultPayload)
+          if (streamedApprovalRequest && toolResultApprovalRendersCard(streamedApprovalRequest)) {
+            streamedApprovalRequests.set(
+              streamedApprovalRequest.approvalId,
+              buildControlApprovalEntry({
+                request: streamedApprovalRequest,
+                toolCallId: rawToolCallId ?? null,
+                toolName: emittedToolName
+              })
+            )
+            logger.debug('[Send-Routed] Persisting a control approval card from a tool result', {
+              sessionId,
+              messageId,
+              approvalId: streamedApprovalRequest.approvalId,
+              controlId: streamedApprovalRequest.controlId,
+              lane: streamedApprovalRequest.lane,
+            })
+          }
+
           const resolvedMetadata = detectToolSource(toolResult.toolName)
           let toolZipReferences:
             | ZipReference[]
@@ -6720,10 +6536,35 @@ async function handleBatshitAgentStream({
         typeof entry?.approvalId === 'string' ? entry.approvalId.trim() : ''
       return !approvalId || !respondedApprovalIds.has(approvalId)
     })
+    /**
+     * SA-116 P2 (AMD-116-01) — the ONE place a pending approval record is created.
+     *
+     * This is where the card entry is persisted, and it already holds everything the record
+     * needs: the SDK approval id, the `toolCallId`, the model's input, and the assistant
+     * message id. The per-tool `toolApproval` policy deliberately writes NOTHING, because
+     * the SDK asks it again on the approval resume for the same call id — a policy that
+     * wrote would create a second record for one call.
+     *
+     * Entries that are not broker calls (Bash, `native_skill` script runs) pass through
+     * untouched; they are the Bash approval flow, which has no consent record.
+     */
+    const withControlRecords = async (
+      approvals: ToolApprovalEntry[],
+    ): Promise<ToolApprovalEntry[]> =>
+      sessionId
+        ? await attachControlApprovalRecords({
+            userId,
+            agentId: agentId || null,
+            sessionId,
+            messageId,
+            approvals,
+          })
+        : approvals
+
     if (toolApprovalRequests.length > 0) {
       const approvalSummary: ToolApprovalSummary = {
         mode: toolApprovalMode,
-        approvals: toolApprovalRequests,
+        approvals: await withControlRecords(toolApprovalRequests),
         source: 'vercel',
       }
       finishSummary.metadata = {
@@ -6739,10 +6580,11 @@ async function handleBatshitAgentStream({
         return !approvalId || !respondedApprovalIds.has(approvalId)
       })
       if (pendingStreamedApprovals.length > 0) {
+        const approvals = await withControlRecords(pendingStreamedApprovals)
         const approvalSummary: ToolApprovalSummary = {
           mode: toolApprovalMode,
-          approvals: pendingStreamedApprovals,
-          source: 'vercel',
+          approvals,
+          source: resolveApprovalSummarySource(approvals),
         }
         finishSummary.metadata = {
           ...(finishSummary.metadata ?? {}),
@@ -8058,6 +7900,29 @@ export const POST: RequestHandler = async ({
         const approvalState = analyzeApprovalState(approvalHistoryMessages)
         approvalTimeoutNotices = approvalState.newlyExpired
 
+        /**
+         * SA-116 P2 — a card that timed out retires its consent record with it.
+         *
+         * The card expires after three minutes; the record lives 24 hours so the CLI lanes
+         * can answer it later (DL-116-06). Leaving an API-lane record `pending` after its
+         * card expired would let a much later retry of the same call find it through
+         * `findApprovedMatch` — except it never can, because a pending record is not an
+         * approved one. Marking it `expired` is about honesty in the record and the audit,
+         * not about closing a hole. It never fails the turn.
+         */
+        for (const notice of approvalState.newlyExpired) {
+          if (!notice.controlApprovalId) continue
+          try {
+            await markApprovalExpired(notice.controlApprovalId)
+          } catch (error) {
+            console.warn('[SA-116] Could not mark an approval record expired', {
+              sessionId,
+              approvalId: notice.controlApprovalId,
+              error,
+            })
+          }
+        }
+
         if (approvalState.updates.length > 0) {
           for (const update of approvalState.updates) {
             try {
@@ -8225,6 +8090,77 @@ export const POST: RequestHandler = async ({
             })()
           : undefined
 
+      /**
+       * SA-116 P3 (DL-116-08) — Approve on a lane that cannot be resumed in place.
+       *
+       * The API lane re-executes the very SDK call the user paused. A managed Codex or
+       * Claude run has nothing left to un-pause: the helper's refusal already came back, the
+       * agent already spoke about it, and the turn already ended. So the click starts an
+       * ORDINARY next turn whose first message says what was approved, and the agent's retry
+       * finds the `approved` record waiting for it. That works after any delay and with no
+       * tab open, which a blocking wait inside the helper could never do.
+       *
+       * `planControlApprovalResumeTurn` returns null for a normal API-lane click, so nothing
+       * below this point changes for the lane P2 shipped.
+       */
+      let controlApprovalResumeContent: string | null = null
+      let controlApprovalResumeIds: string[] = []
+      let controlApprovalInPlaceAddendum: string | null = null
+      if (hasApprovalResponse && isManagedPrimaryAgentType(finalAgentType)) {
+        const resumePlan = await planControlApprovalResumeTurn({
+          userId: resolvedUserId,
+          sessionId,
+          messageId: requestedMessageId,
+          responses: approvalResponseForStream,
+        })
+        if (resumePlan?.mode === 'in-place') {
+          /**
+           * F-P3-2 — one click answered a card the SDK resume owns AND one it does not.
+           *
+           * The in-place resume wins, because only it can re-execute the call the SDK
+           * paused. The card is therefore NOT cleared here: `resolveApprovalResumeGrants`
+           * still has to read it off the persisted message when the run starts, and that
+           * run's finish path clears the whole summary afterwards. The other record was
+           * already decided by the planner, so nothing is lost; it travels into the
+           * resumed model's request as an addendum, the same way a tool-approval timeout
+           * does, and the model's retry spends it.
+           */
+          await settleControlApprovalCard({
+            userId: resolvedUserId,
+            sessionId,
+            messageId: resumePlan.cardMessageId || (requestedMessageId ?? ''),
+            denied: resumePlan.denied,
+            clearCard: false,
+          })
+          controlApprovalInPlaceAddendum =
+            buildControlApprovalInPlaceAddendum(resumePlan)
+        } else if (resumePlan) {
+          // Clear the spent card first. It is done whether or not a turn follows, because a
+          // denial must not leave a button the user can press again — and the denial's
+          // one-turn `control_errors` line is written in the same act.
+          await settleControlApprovalCard({
+            userId: resolvedUserId,
+            sessionId,
+            messageId: resumePlan.cardMessageId || (requestedMessageId ?? ''),
+            denied: resumePlan.denied,
+          })
+
+          if (resumePlan.approved.length === 0) {
+            // Deny starts NO turn (DL-116-08). The agent is told on its next typed turn
+            // through the DCM line just written; starting a turn to say "no" would spend
+            // the user's money to tell an agent something it will read anyway.
+            return json({
+              success: true,
+              approvalResume: 'denied',
+              deniedCount: resumePlan.denied.length,
+            })
+          }
+
+          controlApprovalResumeContent = buildControlApprovalResumeContent(resumePlan.approved)
+          controlApprovalResumeIds = resumePlan.approved.map((item) => item.recordId)
+        }
+      }
+
       // API and CLI agents use the managed streaming path.
       if (isManagedPrimaryAgentType(finalAgentType)) {
         const hasGroupConfig = Boolean(
@@ -8254,20 +8190,134 @@ export const POST: RequestHandler = async ({
           })
         }
 
-        const managedAssistantMessageId =
+        let managedAssistantMessageId =
           typeof requestedMessageId === 'string' &&
           requestedMessageId.trim().length > 0
             ? requestedMessageId.trim()
             : undefined
+        let managedContent: any = content
+        let managedMessages: any[] = Array.isArray(messages) ? messages : []
+        let managedMetadata: any = metadataForStream
+
+        if (controlApprovalResumeContent !== null) {
+          // The user message first, so the two ids read in the order they appear in the
+          // chat. Then a NEW assistant id, because `requestedMessageId` names the message
+          // the card was ON — reusing it would overwrite the turn the user just approved.
+          const resumeUserMessageId = await generateMessageId(sessionId)
+          const resumeAssistantMessageId = await generateMessageId(sessionId)
+          if (!resumeAssistantMessageId) {
+            return json(
+              {
+                error: 'Could not start the approval resume turn.',
+                code: 'approval_resume_failed',
+              },
+              { status: 500 },
+            )
+          }
+          const now = new Date().toISOString()
+          const resumeUserMessage = {
+            id: resumeUserMessageId ?? `msg_${crypto.randomUUID()}`,
+            session_id: sessionId,
+            user_id: resolvedUserId,
+            agent_id: agentId,
+            role: 'user' as const,
+            status: 'complete',
+            content: controlApprovalResumeContent,
+            created_at: now,
+            metadata: {
+              // DL-116-08: NO `metadata.wake`. This is a typed-style user turn, which is
+              // what lets `clearNeedsUserForHumanReply` clear a woken chat's *Needs you*
+              // and what makes the woken-turn gate read the chat as human from here on.
+              approvalResume: { approvalIds: controlApprovalResumeIds },
+            },
+          }
+
+          try {
+            await redis.saveMessage(resumeUserMessage as any)
+          } catch (error) {
+            console.error(
+              '[SA-116] Could not persist the approval resume message:',
+              error,
+            )
+            return json(
+              {
+                error: 'Could not start the approval resume turn.',
+                code: 'approval_resume_failed',
+              },
+              { status: 500 },
+            )
+          }
+
+          // Show it in the chat the same way a woken turn's message appears. No top-level
+          // messageId: the replay buffer is keyed on the ASSISTANT id.
+          try {
+            await eventFetch(new URL('/api/sse', request.url).toString(), {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-internal-sse-forward': '1',
+                ...internalServiceHeaders(),
+              },
+              body: JSON.stringify({
+                type: 'user_message',
+                sessionId,
+                message: resumeUserMessage,
+              }),
+            })
+          } catch (error) {
+            console.warn(
+              '[SA-116] Could not forward the approval resume message to SSE:',
+              error,
+            )
+          }
+
+          managedAssistantMessageId = resumeAssistantMessageId
+          managedContent = controlApprovalResumeContent
+          // History re-read from Redis so the turn sees the cleared card and the message
+          // just written, rather than the browser's copy from before the click.
+          try {
+            managedMessages = await redis.getRecentMessages(sessionId, 300)
+          } catch (error) {
+            console.error(
+              '[SA-116] Could not reload history for an approval resume turn:',
+              error,
+            )
+            managedMessages = []
+          }
+          const {
+            toolApprovalResponse: _resumeApprovals,
+            tool_approval_response: _resumeApprovalsSnake,
+            expiredToolApprovals: _resumeExpired,
+            ...restResumeMetadata
+          } = (metadataForStream ?? {}) as Record<string, any>
+          managedMetadata = {
+            ...restResumeMetadata,
+            approvalResume: { approvalIds: controlApprovalResumeIds },
+          }
+        }
+
+        if (controlApprovalInPlaceAddendum) {
+          // F-P3-2: the decision the click made off the SDK's lane, carried into the run
+          // the SDK is about to resume. It rides the same channel the tool-approval
+          // timeout notice does — a metadata field the compiler turns into a system-prompt
+          // addendum — so nothing about the resume itself changes.
+          managedMetadata = {
+            ...(managedMetadata && typeof managedMetadata === 'object'
+              ? managedMetadata
+              : {}),
+            controlApprovalNotice: controlApprovalInPlaceAddendum,
+          }
+        }
+
         try {
           let streamResult = await handleBatshitAgentStream({
-            content,
+            content: managedContent,
             sessionId,
             agent,
             agentId,
             messageId: managedAssistantMessageId,
-            messages: Array.isArray(messages) ? messages : [],
-            metadata: metadataForStream,
+            messages: managedMessages,
+            metadata: managedMetadata,
             batshitInput,
             globalZipSettings,
             voiceState: resolvedVoiceState,
@@ -8276,6 +8326,10 @@ export const POST: RequestHandler = async ({
             eventFetch,
             request,
             sessionRecord: session,
+            // DL-116-08: parity with the API lane's approval resume, which commits
+            // nothing — the clips and the memory linger belong to the turn the user
+            // approved, not to the click that unblocked it.
+            consumeSessionClips: controlApprovalResumeContent === null,
           })
 
           // Auto-continue after mid-run context-window exhaustion: the failed

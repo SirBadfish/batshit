@@ -1,13 +1,14 @@
 /**
  * SA-115 P1 (DL-115-02, DL-115-06, DL-115-07, DL-115-11) — the schedule records.
  *
- * `wakeHookStore.ts` is the store this copies, including the two bugs its header
+ * `wakeHookStore.ts` is the store this copies, including the two rules its header
  * documents, which are the spec for what not to repeat here:
  *
- *  1. **The id guard runs before ANY key read.** `schedule:` + `s:{userId}` is
- *     byte-identical to `schedules:{userId}`, the index SET, so a crafted id would send
- *     `JSON.GET` at a SET and turn a WRONGTYPE throw into a 500 that leaks whether a user
- *     id is real. `scheduleKeys.ts` owns the pattern.
+ *  1. **The id guard runs before ANY key read.** A malformed id answers "no such
+ *     schedule" without touching Redis: bounded charset and length, nothing attacker-shaped
+ *     in a key name or a log line, a clean miss instead of a Redis error escaping as a 500.
+ *     (Not a collision fix — `schedule:` and `schedules:` cannot collide; SA-116 P1
+ *     corrected that claim.) `scheduleKeys.ts` owns the pattern.
  *  2. **Create is the ONLY whole-record write.** `JSON.SET key $ record` CREATES a
  *     missing key (F-P3-2), so a root write racing a delete resurrects the record — and
  *     the ticker writes to a schedule on every fire while the user may be deleting it in

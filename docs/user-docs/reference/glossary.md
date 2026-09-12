@@ -36,6 +36,10 @@ A Primary Agent that talks directly to model providers through Batshit's built-i
 
 A Batshit-managed direct-provider specialist that a compatible Primary Agent can call.
 
+### Approval Card
+
+The **Approve** / **Deny** card Batshit puts on an agent's message when it tries a risky action. The action is paused, not refused: it runs only when you press **Approve**, exactly once, with exactly the input the card shows. Nothing an agent says can stand in for that click. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action).
+
 ### Artifact
 
 A persistent mini-app inside Batshit. Artifacts can be static, AI-powered, webhook-backed, n8n-backed, or panel-style front ends for external runtimes.
@@ -265,6 +269,10 @@ A folder Batshit can show in the file tree and use as active context for agents.
 Structured guidance attached to a Project. Project rules guide agents but are not a filesystem security boundary.
 
 ## R
+
+### Risk Level
+
+How much clearance a Fabric control needs. **Safe** runs straight away. **Confirm** and **Restricted** both stop and wait for your **Approve** click; Restricted carries a red badge because it deletes or rolls something back. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action).
 
 ### Redis
 

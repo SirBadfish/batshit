@@ -2,6 +2,11 @@ import { afterEach, vi } from 'vitest'
 // Extend expect with DOM matchers (toBeInTheDocument, toBeDisabled, etc.)
 import '@testing-library/jest-dom/vitest'
 import { waitForDelayedBodyScrollCleanup } from './delayedBodyScrollCleanup'
+import {
+  collectTrustedClipIdsFromMetadata,
+  neutralizeAllZipReferenceSyntax,
+  neutralizeUntrustedClipReferenceSyntax
+} from '$lib/utils/zipReferenceSafety'
 
 // Svelte Testing Library owns component cleanup. This earlier-registered global
 // hook runs after its per-file hook and lets Bits UI finish a delayed body unlock
@@ -395,6 +400,64 @@ vi.mock('$lib/server/redis', async () => {
       )
 
       return messages.filter(Boolean)
+    }),
+    /**
+     * SA-116 P3: the fake had NO `updateMessage`, so every caller of it threw
+     * "is not a function" — and a caller that (correctly) catches its own persistence
+     * failures then looked like it had written nothing wrong. That is the fourth
+     * fake-vs-client gap in this family, after `getMessages` head-vs-tail, `sRem` array
+     * flattening, and `json.set` ignoring its path.
+     *
+     * Faithful to the real client, including the two properties that matter to callers:
+     * the ownership checks throw, and `metadata` is REPLACED by the update rather than
+     * merged into (which is why `settleControlApprovalCard` reads before it writes).
+     */
+    updateMessage: vi.fn(async (
+      messageId: string,
+      sessionId: string,
+      updates: Record<string, any>,
+      userId: string
+    ) => {
+      const session = await redisJsonMock.get(`session:${sessionId}`)
+      if (!session) throw new Error('Session not found')
+      if ((session as any).user_id !== userId) {
+        throw new Error('Unauthorized: Session does not belong to user')
+      }
+
+      const key = `message:${sessionId}:${messageId}`
+      const existing = await redisJsonMock.get(key)
+      if (!existing) throw new Error('Message not found')
+
+      const updated: Record<string, any> = {
+        ...(existing as any),
+        ...clone(updates),
+        updated_at: new Date().toISOString()
+      }
+      if (updated.role === 'user' && typeof updated.content === 'string') {
+        const trustedClipIds = new Set(collectTrustedClipIdsFromMetadata(updated.metadata))
+        const state = await redisJsonMock.get(`session:${sessionId}:clip_state`)
+        const stateClips = Array.isArray((state as any)?.clips) ? (state as any).clips : []
+        for (const entry of stateClips) {
+          if (typeof entry?.clipId === 'string' && entry.clipId.trim()) {
+            trustedClipIds.add(entry.clipId.trim())
+          }
+        }
+        for (const clipId of await redisMock.sMembers(`session:${sessionId}:active_clips`)) {
+          if (clipId) trustedClipIds.add(clipId)
+        }
+        for (const clipId of await redisMock.sMembers(`session:${sessionId}:clips`)) {
+          if (clipId) trustedClipIds.add(clipId)
+        }
+        updated.content = neutralizeUntrustedClipReferenceSyntax(
+          neutralizeAllZipReferenceSyntax(updated.content),
+          { trustedClipIds }
+        )
+      }
+
+      // The real client also calls `touchSession` here. This fake models no session
+      // touching anywhere (its `saveMessage` does not either), so `last_modified_at` is
+      // not a thing any test on this lane may assert about a message write.
+      await redisJsonMock.set(key, '$', updated)
     }),
     deleteMessage: vi.fn(async (messageId: string, sessionId: string, userId: string) => {
       const session = await redisJsonMock.get(`session:${sessionId}`)

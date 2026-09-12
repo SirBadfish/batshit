@@ -41,13 +41,19 @@ export const WAKE_HOOKS_INDEX_PREFIX = 'wake_hooks:'
 /**
  * A hook id is `whk_` plus base64url, and NOTHING else may be turned into a key.
  *
- * The id arrives as a URL path segment, so it is attacker-controlled text, and the two key
- * spaces overlap: `wake_hook:` + `s:{userId}` is byte-identical to `wake_hooks:{userId}`,
- * the index SET. Without this check `POST /api/wake/s:{userId}` sent `JSON.GET` at a SET,
- * Redis answered WRONGTYPE, and the throw escaped `validateWakeHookToken` — which sits
- * outside the route's try/catch — as a 500. That breaks the invariant this file's header
- * states ("every failure the same 403") and hands an unauthenticated caller a probe that
- * tells a real user id from a made-up one.
+ * The id arrives as a URL path segment, so it is attacker-controlled text. This guard is
+ * hygiene, and worth having for exactly these reasons: a malformed id answers "no such
+ * hook" without a key read at all; the charset and length are bounded, so no wildcard,
+ * control character, or unbounded string ever reaches a key name or a log line built from
+ * one; and a typo is a clean miss instead of anything escaping `validateWakeHookToken` —
+ * which sits outside the route's try/catch — as a 500 that would break "every failure the
+ * same 403".
+ *
+ * What it is NOT: a fix for the two key spaces colliding. This header used to claim that
+ * `wake_hook:` + `s:{userId}` is byte-identical to `wake_hooks:{userId}`, the index SET.
+ * SA-116 P1 checked the arithmetic and it is false — the record prefix ends in `:` where the
+ * index prefix has `s`, so no id can turn one key into the other. `scheduleKeys.ts` and
+ * `controlApprovals.ts` follow the same shape and are equally safe.
  */
 const HOOK_ID_PATTERN = /^whk_[A-Za-z0-9_-]{1,64}$/
 

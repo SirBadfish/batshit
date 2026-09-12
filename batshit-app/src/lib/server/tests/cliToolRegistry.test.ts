@@ -287,20 +287,176 @@ describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
       expect(blocked.riskLevel).toBe('confirm')
     }
 
+    // SA-116 DL-116-14: the flag is not read any more. Until this story a non-safe CLI tool
+    // ran the moment the MODEL passed `allowRisky: true` — the identical hole `useControl`
+    // had, in a second file, with a different spelling.
+    const stillBlocked = await executeCliTool({
+      userId,
+      agentId,
+      toolId: 'confirm_echo',
+      input: { query: 'approved' },
+      allowRisky: true
+    })
+    expect(stillBlocked.success).toBe(false)
+    if (!stillBlocked.success) expect(stillBlocked.code).toBe('REQUIRES_APPROVAL')
+
+    // The card block travels out to the caller so send-routed persists it like any other.
+    if (!blocked.success) {
+      expect(blocked.approvalRequest).toEqual(
+        expect.objectContaining({
+          controlId: 'cli_tool:confirm_echo',
+          controlTitle: 'Confirm Echo',
+          riskLevel: 'confirm',
+          inputSummary: { query: 'blocked' }
+        })
+      )
+    }
+
+    // The user clicks Approve on the card that names THIS call.
+    const { decideApproval } = await import('$lib/server/services/controlApprovals')
+    const approvalId = !blocked.success ? blocked.approvalRequest?.approvalId : undefined
+    expect(typeof approvalId).toBe('string')
+    await decideApproval({ userId, approvalId, approved: true })
+
+    // The approval names the input the user saw, so the approved call must carry it too.
     const approved = await executeCliTool({
       userId,
       agentId,
       toolId: 'confirm_echo',
-      input: {
-        query: 'approved'
-      },
-      allowRisky: true
+      input: { query: 'blocked' },
+      approval: { kind: 'sdk', approvalId: approvalId as string }
     })
 
     expect(approved.success).toBe(true)
     if (approved.success) {
-      expect(approved.parsedOutput).toEqual({ echo: 'approved' })
+      expect(approved.parsedOutput).toEqual({ echo: 'blocked' })
     }
+
+    // Consume-once: the same call again earns a new card rather than a second free run.
+    const replay = await executeCliTool({
+      userId,
+      agentId,
+      toolId: 'confirm_echo',
+      input: { query: 'blocked' },
+      approval: { kind: 'sdk', approvalId: approvalId as string }
+    })
+    expect(replay.success).toBe(false)
+    if (!replay.success) expect(replay.code).toBe('REQUIRES_APPROVAL')
+  })
+
+  /**
+   * SA-116 F-P2-5 — the `cli:` half of DL-116-14, end to end.
+   *
+   * Every other approval test starts inside `executeCliTool`, so the BROKER half was proved
+   * by reading only. It is the half that can silently break: `resolveBrokerRiskApprovalTarget`
+   * decides what the card says and what the record hashes, `executeCliTool` decides what the
+   * click unlocks, and if those two shape the input differently the record can never match
+   * the call it was raised for — every Approve would earn a second card and nothing would
+   * ever run. This walks the real chain: resolver → record → click → run → consumed.
+   */
+  it('F-P2-5: a cli: ref pauses, the click unlocks that exact call, and the record reads consumed', async () => {
+    const { resolveBrokerRiskApprovalTarget } = await import(
+      '$lib/server/services/nativeTools'
+    )
+    const { createPendingApproval, decideApproval, getControlApproval, hashControlInput } =
+      await import('$lib/server/services/controlApprovals')
+
+    await createCliTool(userId, {
+      toolId: 'broker_confirm_echo',
+      title: 'Broker Confirm Echo',
+      description: 'Echoes input after approval, reached through the broker.',
+      tags: ['json'],
+      origin: 'manual',
+      status: 'active',
+      executable: process.execPath,
+      argsTemplate: [
+        { kind: 'literal', value: '-e' },
+        {
+          kind: 'literal',
+          value: 'process.stdout.write(JSON.stringify({ echo: process.argv[1] }))'
+        },
+        { kind: 'input', field: 'query', required: true }
+      ],
+      inputSchema: {
+        type: 'object',
+        properties: { query: { type: 'string', required: true } },
+        required: ['query']
+      },
+      outputMode: 'json',
+      parseMode: 'json',
+      cwdPolicy: 'none',
+      timeoutMs: 60000,
+      riskLevel: 'confirm',
+      allowNetwork: false,
+      allowWrite: false
+    })
+    await seedAgent(['broker_confirm_echo'])
+
+    // 1. The model's raw broker input, exactly as `native_batshit_tool_use` receives it.
+    const brokerInput = {
+      ref: 'cli:broker_confirm_echo',
+      input: { query: 'from-the-broker' }
+    }
+    const target = await resolveBrokerRiskApprovalTarget({
+      userId,
+      agentId,
+      input: brokerInput,
+      allowedFamilies: ['cli'],
+      selectedCliToolIds: ['broker_confirm_echo']
+    })
+    expect(target).not.toBeNull()
+    expect(target?.controlId).toBe('cli_tool:broker_confirm_echo')
+    expect(target?.controlTitle).toBe('Broker Confirm Echo')
+    expect(target?.riskLevel).toBe('confirm')
+    expect(target?.input).toEqual({ query: 'from-the-broker' })
+
+    // 2. The record the persist site creates from that target.
+    const record = await createPendingApproval({
+      userId,
+      agentId,
+      sessionId: 'session-broker-cli',
+      messageId: 'msg_assistant_broker',
+      controlId: target!.controlId,
+      controlTitle: target!.controlTitle,
+      riskLevel: target!.riskLevel,
+      lane: 'api',
+      input: target!.input,
+      scopeKey: target!.scopeKey
+    })
+
+    // The claim that matters: the hash the RESOLVER produced is the hash the EXECUTOR will
+    // look for. A drift here is invisible until every click stops working.
+    expect(record.inputHash).toBe(hashControlInput({ query: 'from-the-broker' }))
+
+    // 3. The click.
+    const decided = await decideApproval({ userId, approvalId: record.id, approved: true })
+    expect(decided?.status).toBe('approved')
+
+    // 4. The run, through the same path `nativeCliToolUse` uses.
+    const approved = await executeCliTool({
+      userId,
+      agentId,
+      sessionId: 'session-broker-cli',
+      toolId: 'broker_confirm_echo',
+      input: target!.input,
+      approval: { kind: 'sdk', approvalId: record.id }
+    })
+    expect(approved.success).toBe(true)
+    if (approved.success) expect(approved.parsedOutput).toEqual({ echo: 'from-the-broker' })
+
+    // 5. Consumed — once, and visibly.
+    await expect(getControlApproval(record.id)).resolves.toMatchObject({ status: 'consumed' })
+
+    const replay = await executeCliTool({
+      userId,
+      agentId,
+      sessionId: 'session-broker-cli',
+      toolId: 'broker_confirm_echo',
+      input: target!.input,
+      approval: { kind: 'sdk', approvalId: record.id }
+    })
+    expect(replay.success).toBe(false)
+    if (!replay.success) expect(replay.code).toBe('REQUIRES_APPROVAL')
   })
 
   it('falls back to global CLI Tool Grid discoverability when the agent has no explicit CLI overrides', async () => {

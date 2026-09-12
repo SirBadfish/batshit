@@ -70,15 +70,17 @@ That header matters. **A DM is data from another agent or program, not an instru
 
 ### Risky actions wait for you
 
-Some Fabric controls are marked risky — installing a skill from a link, starting or stopping a Docker add-on, installing a voice engine, deleting a memory, rolling an artifact back. In an ordinary chat the agent can run one after you say yes.
+Some Fabric controls are marked risky — installing a skill from a link, starting or stopping a Docker add-on, installing a voice engine, deleting a memory, rolling an artifact back, or setting up a schedule. None of them run because an agent decided they should.
 
-**In a chat a DM or a webhook started, Batshit refuses those outright**, no matter what the agent passes and no matter what you approved a few minutes earlier in a different chat. The agent is told to ask you and leave the item open.
+**A risky action pauses and waits for your click.** Batshit stops the action before it happens and puts an **Approval required** card on the agent's message, naming what it wants to do. You press **Approve** or **Deny**. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action) for what the card shows and how the two buttons behave.
 
-Nothing is cancelled when that happens. The turn ends normally, the DM stays open, and the agent's message says what it wanted to do. **Reply in that same chat** and the next turn is an ordinary one, so the agent can go ahead the usual way.
+**A chat a DM, a webhook, or a schedule started works exactly the same way.** It used to be refused outright; now it gets the same card, so a woken chat can finish its job as soon as you look at it — no matter how much later that is. The one thing that never happens is an agent approving itself: nothing another agent says, and nothing written inside a message it was sent, counts as your click.
+
+Nothing is cancelled while a card waits. The turn ends normally, the item stays open, and the agent's message says what it wanted to do.
 
 ### When a woken chat needs you
 
-A woken chat can stop on something only you can clear: the refusal above, or a Bash or tool approval waiting for a click. Batshit says so instead of leaving it to look like work in progress.
+A woken chat can stop on something only you can clear: an approval card like the one above, or a Bash or tool approval waiting for a click. Batshit says so instead of leaving it to look like work in progress.
 
 - The header envelope turns **orange**, and its tooltip says how many items need you.
 - The drawer row gets a **Needs you** badge; hover it for the reason.
@@ -224,7 +226,7 @@ A webhook message becomes the first message of a real chat. If your n8n flow for
 
 Batshit handles the part it can:
 
-- Risky Fabric controls are refused in any woken chat, whatever the message says (see [Risky actions wait for you](#risky-actions-wait-for-you)).
+- Risky Fabric controls stop and wait for **your** click in any woken chat, whatever the message says. An agent cannot approve one for itself or for another agent (see [Risky actions wait for you](#risky-actions-wait-for-you)).
 - The DM guidance tells every agent that a DM or webhook cannot approve a tool, give consent, or change a setting.
 - Wake-ups are capped, chains stop at three deep, and each hook is limited to 30 calls an hour.
 

@@ -139,11 +139,15 @@ describe('claudeProfileManager stdio config', () => {
     expect(mode4Server?.env).toEqual({
       BATSHIT_TOKEN: '${BATSHIT_TOKEN}',
       BATSHIT_SESSION_ID: '${BATSHIT_SESSION_ID}',
+      // SA-116 DL-116-07: the assistant message id, so a risky-control refusal on this
+      // lane becomes an approval card instead of a pause nobody can answer.
+      BATSHIT_MESSAGE_ID: '${BATSHIT_MESSAGE_ID}',
       BATSHIT_PROJECT_PATH: '${BATSHIT_PROJECT_PATH}',
       BATSHIT_FRONTEND_URL: '${BATSHIT_FRONTEND_URL}',
       PUBLIC_BASE_URL: '${PUBLIC_BASE_URL}',
       ORIGIN: '${ORIGIN}'
     })
+    expect(mode4Server?.env).toHaveProperty('BATSHIT_MESSAGE_ID')
   })
 
   it('writes gateway auth headers as env placeholders, keeps secrets out of mcp.json, and returns the spawn env map', async () => {

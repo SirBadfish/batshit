@@ -150,11 +150,15 @@ describe('codexProfileManager dynamic-only managed config', () => {
     expect(mode4Server?.env_vars).toEqual([
       'BATSHIT_TOKEN',
       'BATSHIT_SESSION_ID',
+      // SA-116 DL-116-07: the helper needs the assistant message id, or a risky-control
+      // refusal on this lane records a pause with no card the user can click.
+      'BATSHIT_MESSAGE_ID',
       'BATSHIT_PROJECT_PATH',
       'BATSHIT_FRONTEND_URL',
       'PUBLIC_BASE_URL',
       'ORIGIN'
     ])
+    expect(mode4Server?.env_vars).toContain('BATSHIT_MESSAGE_ID')
     expect(mode4Server?.default_tools_approval_mode).toBe('approve')
   })
 

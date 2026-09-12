@@ -173,7 +173,7 @@ WORKFLOW:
         controlId: { type: 'string', description: 'Exact runtime artifact control id from mcp_artifact_find (required)' },
         input: { type: 'object', description: 'Artifact runtime input payload (schema depends on artifact)', additionalProperties: true },
         dryRun: { type: 'boolean', description: 'Validate input without executing control', default: false },
-        allowRisky: { type: 'boolean', description: 'Allow confirm/restricted controls to execute', default: false }
+        allowRisky: { type: 'boolean', description: 'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.', default: false }
       },
       required: ['userId', 'controlId']
     }
@@ -225,7 +225,11 @@ WORKFLOW:
 
 RISK GATE:
 - safe controls execute immediately
-- confirm/restricted controls require allowRisky=true`,
+- confirm/restricted controls PAUSE for the user's Approve click (SA-116). Batshit answers
+  CONTROL_RISK_REQUIRES_APPROVAL, shows an Approve/Deny card in the chat, and runs the call
+  only after the user clicks. Tell the user what it does and why, then stop.
+- allowRisky is accepted and IGNORED on every lane except a Portable Skill Token, whose
+  family scope is the consent. Passing it changes nothing.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -233,7 +237,7 @@ RISK GATE:
         controlId: { type: 'string', description: 'Exact control id from mcp_fabric_find (required)' },
         input: { type: 'object', description: 'Control input payload (schema depends on control)', additionalProperties: true },
         dryRun: { type: 'boolean', description: 'Validate input without executing control', default: false },
-        allowRisky: { type: 'boolean', description: 'Allow confirm/restricted controls to execute', default: false }
+        allowRisky: { type: 'boolean', description: 'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.', default: false }
       },
       required: ['userId', 'controlId']
     }

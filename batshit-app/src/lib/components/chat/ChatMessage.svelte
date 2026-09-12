@@ -15,6 +15,10 @@
   import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from '$lib/services/voice'
   import type { VoiceSettings } from '$lib/types/voice'
   import * as messageStore from '$lib/stores/messages.svelte'
+  import {
+    describeControlApproval,
+    resolveApprovalSubmitSource
+  } from '$lib/utils/controlApprovalPresentation'
   import { getPlaybackState } from '$lib/stores/voicePlayback.svelte'
   import { toast } from 'svelte-sonner'
   import { DatabaseService } from '$lib/services/databaseRedis.client'
@@ -588,6 +592,13 @@
 
   function describeApproval(approval: any): string {
     const actor = approvalActorName || 'The agent'
+
+    // SA-116: a risky control carries a server-written `control` block. A Bash approval
+    // does not, and falls through to the wording it has always had.
+    if (approval?.control) {
+      return `${actor} wants to ${describeControlApproval(approval)}.`
+    }
+
     const toolName = (approval?.toolName || '').toLowerCase()
     const command = extractCommandFromApproval(approval)
 
@@ -627,6 +638,12 @@
   }
 
   function resolveApprovalExpiryMs(approval: any): number | null {
+    // SA-116 (DL-116-06): a control approval that waits for a resume turn has no three
+    // minute clock. Its record lives 24 hours, and the CLI lanes cannot answer a card that
+    // has already expired by the time the agent finishes speaking.
+    const controlLane = approval?.control?.lane
+    if (controlLane && controlLane !== 'api') return null
+
     const explicitExpiresAt = parseTimestampMs(approval?.expiresAt)
     if (explicitExpiresAt !== null) return explicitExpiresAt
 
@@ -870,9 +887,12 @@
         : entry
     )
 
-    const approvalSource =
-      summary.source ||
-      approvals.find((entry) => entry?.approvalId === approvalId)?.source
+    // SA-116 P3: the ENTRY's own source decides, not the summary's (the rule and its
+    // reason live in `controlApprovalPresentation.ts`, where a test can reach them).
+    const approvalSource = resolveApprovalSubmitSource(
+      approvals.find((entry) => entry?.approvalId === approvalId),
+      summary.source
+    )
     if (approvalSource === 'claude') {
       await submitClaudeApproval(approvalId, approved)
       return

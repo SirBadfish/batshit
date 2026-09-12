@@ -144,8 +144,11 @@ jobs:
           src/lib/server/services/dm/__tests__/wakeHookStore.test.ts
           src/lib/server/services/dm/__tests__/wokenTurn.test.ts
           src/lib/server/services/__tests__/agentWakeups.test.ts
+          src/lib/server/services/__tests__/controlApprovals.test.ts
+          src/lib/server/services/__tests__/brokerControlApprovals.test.ts
           src/lib/server/services/schedules/__tests__/scheduleStore.test.ts
           src/lib/server/services/schedules/__tests__/scheduleTicker.test.ts
+          src/routes/api/sessions/[sessionId]/control-approvals/control-approvals-route.test.ts
           src/routes/api/wake/wake-webhook-route.test.ts
           src/routes/api/internal/schedules/sweep/sweep-route.test.ts
           src/routes/api/dms/dms-routes.test.ts
