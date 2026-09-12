@@ -756,3 +756,200 @@ describe('F-SEC-1b — a woken turn that ends stuck on the user says so', () => 
     expect(dm?.delivery.needsUser).toBeUndefined()
   })
 })
+
+describe('SA-115 F-P1-2 — a wake DELIVERS an info note, so the note stops being open', () => {
+  /**
+   * Before this, an `info` DM that woke an agent stayed `new` forever. SA-113 closes an
+   * info item only when the agent calls `sys.dm.read`, and an agent handed the note as the
+   * first message of its turn has no reason to go and read it again — the P1 evidence's
+   * own roster capture shows exactly that, the waking DM still `new` in the next turn.
+   *
+   * On its own that is a leak; with SA-115's clock it is unbounded. A daily heartbeat adds
+   * one permanent open note per day to every later roster, and a five-minute wake schedule
+   * fills the fifty-item inbox in about four hours, after which every fire fails
+   * `inbox_full`.
+   */
+  async function seedWakingDm(overrides: Record<string, any> = {}) {
+    await redis.json.set('dm:dm_1', '$', {
+      id: 'dm_1',
+      messageId: 'dm_1',
+      userId: USER,
+      kind: 'info',
+      priority: 'normal',
+      from: { kind: 'schedule', scheduleId: 'sch_abc', name: 'Morning check' },
+      to: 'agent-cooper',
+      subject: 'Morning check',
+      body: 'Say good morning.',
+      deliver: 'wake',
+      status: 'new',
+      createdAt: '2026-09-08T09:00:00.000Z',
+      createdTs: Date.parse('2026-09-08T09:00:00.000Z'),
+      expiresAt: '2026-09-15T09:00:00.000Z',
+      delivery: { requested: 'wake', actual: 'wake' },
+      ...overrides
+    } as never)
+  }
+
+  /**
+   * Run one woken turn to completion and wait for the primitive to finish stamping.
+   *
+   * `seedTail` writes the assistant message the way a real turn does, BEFORE send-routed
+   * answers, because `hasPendingToolApproval` reads it.
+   */
+  async function runWakeAndFinish(seedTail: (sessionId: string) => Promise<void>) {
+    let release: () => void = () => {}
+    holdSendRouted = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    const result = await requestAgentWakeup(
+      baseInput({ content: '[Schedule "Morning check" — not from the user] info — Morning check' })
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('the wake was refused')
+
+    await seedTail(result.sessionId)
+    release()
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await getDm('dm_1'))?.delivery?.outcome) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    return result
+  }
+
+  async function finishPlainly(sessionId: string) {
+    await redis.saveMessage({
+      id: `msg-assistant-${sessionId}`,
+      session_id: sessionId,
+      user_id: USER,
+      agent_id: 'agent-cooper',
+      role: 'assistant',
+      status: 'complete',
+      content: 'Good morning.',
+      created_at: '2026-09-08T09:00:01.000Z',
+      metadata: {}
+    } as any)
+  }
+
+  beforeEach(async () => {
+    await seedAgent()
+  })
+
+  it('acknowledges the info DM when the turn completed', async () => {
+    await seedWakingDm()
+    await runWakeAndFinish(finishPlainly)
+
+    const dm = await getDm('dm_1')
+    expect(dm?.delivery.outcome).toBe('completed')
+    // The claim that matters: it is no longer open, so it leaves the roster and the inbox.
+    expect(dm?.status).toBe('done')
+    // And it says honestly WHY it closed — a wake delivered it, the agent did not read it.
+    expect(dm?.result).toBe('Delivered as the first message of a woken turn.')
+    expect(dm?.completedAt).toBeTruthy()
+  })
+
+  it('does it for an agent-sent note too, because the delivery is what closes it', async () => {
+    await seedWakingDm({ from: { kind: 'agent', agentId: 'agent-faye', name: 'Faye' } })
+    await runWakeAndFinish(finishPlainly)
+
+    expect((await getDm('dm_1'))?.status).toBe('done')
+  })
+
+  it('leaves an ASSIGNMENT open — work is claimed and closed, not acknowledged', async () => {
+    await seedWakingDm({
+      kind: 'assignment',
+      subject: 'Verify the package',
+      body: 'Run the audit and report what it says.',
+      requestedOutcome: 'A pass/fail with the audit output.',
+      scope: 'Only the audit.'
+    })
+    await runWakeAndFinish(finishPlainly)
+
+    const dm = await getDm('dm_1')
+    expect(dm?.delivery.outcome).toBe('completed')
+    expect(dm?.status).toBe('new')
+  })
+
+  it('leaves the note open when the turn parked on a tool approval', async () => {
+    await seedWakingDm()
+    await runWakeAndFinish(async (sessionId) => {
+      await redis.saveMessage({
+        id: 'msg-assistant-approval',
+        session_id: sessionId,
+        user_id: USER,
+        agent_id: 'agent-cooper',
+        role: 'assistant',
+        status: 'complete',
+        content: 'I need to run something first.',
+        created_at: '2026-09-08T09:00:01.000Z',
+        metadata: { toolApprovals: [{ id: 'approval-1', toolName: 'native_bash_execute' }] }
+      } as any)
+    })
+
+    const dm = await getDm('dm_1')
+    // The DM is the ONLY thing carrying `needsUser`, so closing it here would throw away
+    // the one signal telling the user their woken chat is waiting on them (F-SEC-1b).
+    expect(dm?.status).toBe('new')
+    expect(dm?.delivery.needsUser?.reason).toContain('approve a tool')
+  })
+
+  it('leaves the note open when a risky control already stamped "Needs you" (F-P2-1)', async () => {
+    // F-SEC-1 refuses a `confirm`/`restricted` Fabric control inside a woken turn and
+    // stamps `delivery.needsUser` from inside `useControl` — MID-turn. That refusal is
+    // NOT a `toolApprovals` entry, so the turn then ends `completed` with nothing pending
+    // and `hasPendingToolApproval` answers false.
+    //
+    // Without the guard below, F-P1-2's acknowledge fires on that turn, and
+    // `acknowledgeInfoDm` writes `withoutNeedsUser(...)`. The stamp is erased, the DM goes
+    // `done`, and the envelope, the drawer's "Needs you" row, and the `waiting_approval`
+    // presence all stop saying the chat is parked on the user — for the single most common
+    // woken kind, a schedule or webhook `info` wake. F-SEC-1b is silently undone.
+    await seedWakingDm({
+      delivery: {
+        requested: 'wake',
+        actual: 'wake',
+        needsUser: {
+          reason: 'That action needs you: reply in this chat and ask for it again.',
+          at: '2026-09-08T09:00:00.500Z'
+        }
+      }
+    })
+    await runWakeAndFinish(finishPlainly)
+
+    const dm = await getDm('dm_1')
+    expect(dm?.delivery.outcome).toBe('completed')
+    // The holdup outlives the turn ON PURPOSE — that is the whole point of F-SEC-1b.
+    expect(dm?.status).toBe('new')
+    expect(dm?.delivery.needsUser?.reason).toContain('needs you')
+    expect(dm?.result).toBeUndefined()
+  })
+
+  it('leaves the note open when the turn was stopped', async () => {
+    await seedWakingDm()
+
+    let release: () => void = () => {}
+    holdSendRouted = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const result = await requestAgentWakeup(baseInput())
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('the wake was refused')
+
+    await endWokenTurn({
+      sessionId: result.sessionId,
+      reason: 'stopped',
+      originBase: 'http://127.0.0.1:5173',
+      userId: USER
+    })
+    release()
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await getDm('dm_1'))?.delivery?.outcome) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+
+    const dm = await getDm('dm_1')
+    // A stopped turn may never have shown the agent the note at all.
+    expect(dm?.status).toBe('new')
+    expect(dm?.result).toBeUndefined()
+  })
+})

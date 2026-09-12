@@ -200,6 +200,21 @@ export type ThreadErrorEvent = {
   message: string
 }
 
+/**
+ * SA-114 P2 (DL-114-06, AMD-114-02) — Batshit-synthetic: the app server confirmed a steer.
+ *
+ * Codex has no event for "the model has your mid-turn message". What it does emit, within
+ * milliseconds of accepting a `turn/steer`, is a `userMessage` item carrying the exact text
+ * that was steered — and `codexAppServerLane` recognises that item as the one it just sent
+ * and pushes this in its place. It is synthetic in the same way `turn.started` is when the
+ * app-server lane maps a notification onto the exec-JSONL shape: nothing in `codex exec`
+ * emits it, because `codex exec` cannot be steered at all.
+ */
+export type SteerDeliveredEvent = {
+  type: 'steer.delivered'
+  steer_ids: string[]
+}
+
 /** Top-level JSONL events emitted by `codex exec --json`. */
 export type ThreadEvent =
   | ThreadStartedEvent
@@ -210,3 +225,4 @@ export type ThreadEvent =
   | ItemUpdatedEvent
   | ItemCompletedEvent
   | ThreadErrorEvent
+  | SteerDeliveredEvent

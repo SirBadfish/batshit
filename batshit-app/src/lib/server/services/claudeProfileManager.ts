@@ -358,8 +358,14 @@ async function buildManagedMcpServers(params: {
           '--runtime=claude'
         ],
         env: {
-          BATSHIT_TOKEN: '${BATSHIT_TOKEN}',
+          // SA-117 DL-117-06: the helper presents THIS run's credential. `BATSHIT_TOKEN` is
+          // gone from the map because `claudeBridge.ts` now deletes it from the child
+          // environment entirely, so a `${BATSHIT_TOKEN}` reference would expand to nothing.
+          BATSHIT_AGENT_TOKEN: '${BATSHIT_AGENT_TOKEN}',
           BATSHIT_SESSION_ID: '${BATSHIT_SESSION_ID}',
+          // SA-116 DL-116-07: the assistant message a risky-control refusal pins its
+          // approval card onto. Without it the pause is recorded with no card to click.
+          BATSHIT_MESSAGE_ID: '${BATSHIT_MESSAGE_ID}',
           BATSHIT_PROJECT_PATH: '${BATSHIT_PROJECT_PATH}',
           BATSHIT_FRONTEND_URL: '${BATSHIT_FRONTEND_URL}',
           PUBLIC_BASE_URL: '${PUBLIC_BASE_URL}',

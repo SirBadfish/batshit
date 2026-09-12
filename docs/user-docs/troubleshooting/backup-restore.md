@@ -15,6 +15,8 @@ Normal Batshit backups include Batshit-owned records and uploaded files, such as
 - artifacts and artifact runtime storage
 - Goons, Motion Vault, Closet, scenes, custom icons, and uploaded assets
 - voice profiles and voice engine registry references
+- agent memory
+- agent DMs, wake-up webhooks, and schedules
 
 Normal backups exclude secrets by default.
 

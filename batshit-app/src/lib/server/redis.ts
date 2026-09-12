@@ -570,6 +570,20 @@ export class RedisService {
           console.error(`[deleteSession] Error deleting subagent thread/lock keys:`, threadError)
         }
 
+        // SA-116 P1 (DL-116-15): the risk-approval records raised in this chat, plus their
+        // index. They carry a 24-hour EXPIRE, which is NOT a reason to skip this — the same
+        // reasoning left `n8n:sse-callback:` unenumerated until AMD-111-02, and a consent
+        // record that expires "soon" still outlives its chat until it does. An approval is
+        // session-scoped, so `deleteAgent` deliberately owes it nothing.
+        try {
+          const { sweepSessionApprovals } = await import(
+            '$lib/server/services/controlApprovals'
+          )
+          await sweepSessionApprovals(id)
+        } catch (approvalError) {
+          console.error(`[deleteSession] Error deleting control approvals:`, approvalError)
+        }
+
         // SA-111 AMD-111-02: scoped per-message n8n callback tokens. TTL-bounded (~30 min)
         // and deliberately NOT part of backup — they are short-lived credentials, not data —
         // but they are session-scoped state and belong in this sweep.
@@ -1298,6 +1312,23 @@ export class RedisService {
     // the hook index.
     const { sweepAgentWakeHooks } = await import('$lib/server/services/dm/wakeHookStore')
     await sweepAgentWakeHooks(id)
+    // SA-115 P3 (DL-115-12): a schedule pointing at a deleted agent is a clock that can
+    // only ever fail its recipient check every minute, so it goes with the agent. Same
+    // BEFORE-the-record-delete reason as the two sweeps above: it reads `agent.user_id`
+    // to find the schedule index.
+    const { sweepAgentSchedules } = await import(
+      '$lib/server/services/schedules/scheduleStore'
+    )
+    await sweepAgentSchedules(id)
+    // SA-117 P1 (DL-117-09): a managed CLI run credential naming a deleted agent is a live
+    // credential that authenticates as nobody, so it goes with the agent. Its index is
+    // agent-scoped rather than user-scoped, so unlike the three sweeps above this one does not
+    // need `agent.user_id` — it still runs BEFORE the record delete so the destructive order
+    // stays one rule instead of two. Same dynamic-import reason as above.
+    const { sweepAgentRunCredentials } = await import(
+      '$lib/server/services/agentRunCredentials'
+    )
+    await sweepAgentRunCredentials(id)
     return this.execute(async (client) => {
       // Get agent to find user_id
       const agent = await client.json.get(`agent:${id}`)
@@ -1674,6 +1705,7 @@ export class RedisService {
     global_zip_settings?: any,
     global_auto_compact_settings?: any,
     global_tool_grid_settings?: any,
+    global_chat_settings?: any,
     ui_settings?: any,
     admin_settings?: any,
     global_custom_system_prompt?: string,
@@ -1714,6 +1746,11 @@ export class RedisService {
           updates.global_tool_grid_settings !== undefined
             ? updates.global_tool_grid_settings
             : existing?.global_tool_grid_settings,
+        // SA-114 P3 (DL-114-01): the busy-send mode.
+        global_chat_settings:
+          updates.global_chat_settings !== undefined
+            ? updates.global_chat_settings
+            : (existing as any)?.global_chat_settings,
         ui_settings: updates.ui_settings !== undefined ? updates.ui_settings : existing?.ui_settings,
         admin_settings: updates.admin_settings !== undefined ? updates.admin_settings : (existing as any)?.admin_settings,
         global_custom_system_prompt: updates.global_custom_system_prompt !== undefined ? updates.global_custom_system_prompt : existing?.global_custom_system_prompt,

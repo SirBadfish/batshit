@@ -253,7 +253,7 @@ For Batshit-managed local TTS or STT installs, once you have a verified install 
 
 For STT, pass `smoke.mode = "stt"` with `smoke.audioBase64` from a real short audio sample. Include `smoke.expectedText` whenever you know what the sample says, so the helper can fail loudly if the transcript is wrong.
 
-**Important:** This is a `confirm` control. If the user already approved the managed setup work, immediately retry with `allowRisky: true` when the confirm gate appears. Use the same payload — don't fall back to manual register/enable steps just because the confirm gate fired.
+**Important:** This is a `confirm` control, so Batshit pauses it and shows the user an **Approve** button. Tell the user what the setup does and why, then stop. Never pass `allowRisky` — it is ignored. On an API agent the click re-runs the same call by itself; on a Codex or Claude agent the click resumes you with an approval message, and you then retry `sys.voice.engine.complete_local_setup` **with the same payload**. Either way, don't fall back to manual register/enable steps just because the gate fired.
 
 ---
 

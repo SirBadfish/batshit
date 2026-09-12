@@ -158,6 +158,14 @@ function buildCodexWebSearchResult(item: any, fallbackResult?: any) {
 
 export type CodexStreamChunk =
   | { type: "text-delta"; text: string }
+  /**
+   * SA-114 P2 (DL-114-06) — the app server confirmed a steer reached this turn.
+   *
+   * Carries only ids. The words are already in Batshit's own steer inbox, and send-routed
+   * writes the transcript marker from there in its `case 'steer'`; putting the text on the
+   * chunk would give two places the same bytes and one of them would eventually drift.
+   */
+  | { type: "steer"; steerIds: string[]; lane: "codex" }
   | {
       type: "tool-call";
       toolCallId: string;
@@ -830,6 +838,15 @@ export class CodexEventAdapter {
           yield* this.handleItemUpdated(event);
         } else if (event.type === "item.completed") {
           yield* this.handleItemCompleted(event);
+        } else if (event.type === "steer.delivered") {
+          // Straight through. The adapter deliberately does NOT mark the steer delivered
+          // itself (F-P1-3's rule for a CLI lane): send-routed's own `case` does that, so
+          // the transcript marker lands exactly where this chunk sits in the stream.
+          yield {
+            type: "steer",
+            steerIds: [...event.steer_ids],
+            lane: "codex",
+          };
         } else if (event.type === "turn.completed") {
           yield this.handleTurnCompleted(event.usage);
         } else if (event.type === "turn.failed") {

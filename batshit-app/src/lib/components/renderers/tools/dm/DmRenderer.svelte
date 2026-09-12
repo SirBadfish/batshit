@@ -137,6 +137,11 @@
 			const who = recipient ? `to ${recipient}` : 'sent'
 			const what = kind ? ` · ${kind}` : ''
 			if (deliveredAs === 'wake') return `${who}${what} · woke a chat`
+			// SA-114 DL-114-13: a steer landed INSIDE a reply that was already running. It
+			// needs its own line, because without one it falls through to the bare `${who}`
+			// and reads as an ordinary send — the card would be the only place in Batshit
+			// that could not tell the three delivery modes apart.
+			if (deliveredAs === 'steer') return `${who}${what} · landed mid-reply`
 			if (deliveredAs === 'wait') {
 				return reason ? `${who}${what} · waiting in inbox (${reason})` : `${who}${what} · waiting in inbox`
 			}

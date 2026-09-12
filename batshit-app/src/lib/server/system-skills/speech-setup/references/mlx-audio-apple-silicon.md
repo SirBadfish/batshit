@@ -210,7 +210,7 @@ Don't over-claim just because the underlying model can do more at CLI level.
 }
 ```
 
-If the confirm gate appears, retry with `allowRisky: true`. Don't fall back to manual work.
+If the confirm gate appears, Batshit is waiting on the user's **Approve** click. Say what the setup does, then stop; never pass `allowRisky`, it is ignored. When the click resumes you (Codex/Claude), retry with the same payload; on an API agent the same call re-runs by itself. Don't fall back to manual work.
 
 ---
 

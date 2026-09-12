@@ -13,6 +13,7 @@ import { CodexEventAdapter } from "./codexEventAdapter";
 import { redis } from "$lib/server/redis";
 import {
   buildCodexRuntimeSettings,
+  resolveCodexTransportLane,
   resolveCodexWebSearchMode,
 } from "$lib/server/services/codexSettings";
 import type {
@@ -24,7 +25,6 @@ import {
   ensureManagedCodexHome,
   DOCKER_AUTH_ENV_VAR,
   N8N_INSTANCE_MCP_TOKEN_ENV,
-  BATSHIT_TOKEN_ENV_VAR,
   buildAgentProfileId,
 } from "$lib/server/services/codexProfileManager";
 import { getDockerGatewayAuthToken } from "$lib/server/services/dockerGatewayConfig";
@@ -34,31 +34,16 @@ import {
   isStdioGateway,
   resolveManagedStdioEnvironmentValues,
 } from "$lib/server/services/mcpGatewayStdio";
-import { resolveCliHelperBatshitToken } from "$lib/server/services/cliHelperToken";
+import { mintCliRunCredential } from "$lib/server/services/cliHelperToken";
+import { applyCliRunCredentialToChildEnv } from "$lib/server/services/cliChildEnv";
+import { revokeRunCredential } from "$lib/server/services/agentRunCredentials";
 import {
   startCodexAppServerRun,
+  type CodexSteerResult,
   type CodexAppServerThreadParams,
 } from "$lib/server/services/codexAppServerLane";
 
 type CodexRunTransport = "app-server" | "exec";
-
-type CodexTransportLane = "app-server" | "exec";
-
-/**
- * Managed Batshit runs default to the app-server lane so mid-run token usage
- * can drive the proactive context guard. `BATSHIT_CODEX_TRANSPORT=exec` is the
- * documented escape hatch back to one-shot `codex exec --json`. Non-managed
- * scopes (user-profile runs) stay on exec.
- */
-export function resolveCodexTransportLane(
-  options: { configScope?: string | null },
-  processEnv: NodeJS.ProcessEnv = process.env,
-): CodexTransportLane {
-  if (options.configScope !== "managed") return "exec";
-  const override = (processEnv.BATSHIT_CODEX_TRANSPORT ?? "").trim().toLowerCase();
-  if (override === "exec") return "exec";
-  return "app-server";
-}
 
 /**
  * Reuses the exec arg builder as the single source of truth for `--config`
@@ -150,7 +135,12 @@ interface CodexRunOptions {
   managedConfigHome?: string | null;
   dockerAuthToken?: string | null;
   n8nInstanceMcpToken?: string | null;
-  batshitToken?: string | null;
+  /**
+   * SA-117 DL-117-06/07 — this run's credential (`<credentialId>.<secret>`), exported to the
+   * child as `BATSHIT_AGENT_TOKEN`. It replaces the instance `BATSHIT_TOKEN`, which
+   * `applyCliRunCredentialToChildEnv` now DELETES from the child environment.
+   */
+  agentRunToken?: string | null;
   managedStdioEnv?: Record<string, string>;
   historyPersistence: CodexHistoryPersistence;
   serviceTier: CodexRuntimeSettings["serviceTier"];
@@ -175,6 +165,15 @@ interface CodexRunner {
   transport: CodexRunTransport;
   events: AsyncGenerator<ThreadEvent>;
   cleanup?: () => void | Promise<void>;
+  /**
+   * SA-114 P2 (DL-114-06) — present only on the app-server lane.
+   *
+   * `exec` writes the prompt and closes stdin (see `runViaCli` below), so it has no channel
+   * left to steer through. Its absence here IS the refusal: send-routed registers a steer
+   * transport only when this exists, and `resolveSteerability` refuses the exec lane before
+   * the user can even try.
+   */
+  steer?: (payload: { steerIds: string[]; text: string }) => Promise<CodexSteerResult>;
 }
 
 function mapCodexRuntimeTransport(transport: CodexRunTransport) {
@@ -577,6 +576,7 @@ export class CodexBridge {
     if (configScope === "managed" && runProjectPath) {
       managedStdioEnv.BATSHIT_PROJECT_PATH = runProjectPath;
     }
+
     const addDirectories = Array.isArray(codexSettings.addDirs)
       ? codexSettings.addDirs
       : [];
@@ -612,6 +612,66 @@ export class CodexBridge {
           })
         : [];
 
+    /**
+     * SA-117 DL-117-06 — mint this run's credential.
+     *
+     * This is where `resolveCliHelperBatshitToken(userId)` used to hand back the instance
+     * token for every run of every agent. The mint needs all three ids: a credential names
+     * one user, one agent, and one session, and the pair `(userId, agentId)` IS the
+     * authorization it carries.
+     *
+     * A managed run with an agent but no session id cannot be given one, and the helpers
+     * then fail loudly at startup rather than falling back to naming themselves in a request
+     * body — which is the hole this story closes. The warning below is what makes that
+     * visible in the app log rather than only in the CLI's own output.
+     *
+     * `mintCliRunCredential` THROWS when the agent does not exist or belongs to another
+     * user, and this deliberately does not catch it: a run whose identity does not add up
+     * must not start.
+     */
+    const runCredential =
+      request.userId && request.agentId && request.sessionId
+        ? await mintCliRunCredential({
+            userId: request.userId,
+            agentId: request.agentId,
+            sessionId: request.sessionId,
+            messageId: request.messageId ?? null,
+            runtime: "codex",
+            delegated: request.delegatedRun === true,
+          })
+        : null;
+    if (!runCredential) {
+      console.warn(
+        "[CodexBridge] No run credential was minted for this run, so its managed helpers " +
+          "cannot authenticate. Missing: " +
+          [
+            request.userId ? null : "userId",
+            request.agentId ? null : "agentId",
+            request.sessionId ? null : "sessionId",
+          ]
+            .filter(Boolean)
+            .join(", "),
+      );
+    }
+    const revokeRunCredentialOnce = (() => {
+      let revoked = false;
+      return async () => {
+        if (revoked || !runCredential) return;
+        revoked = true;
+        try {
+          await revokeRunCredential(runCredential.credentialId, {
+            agentId: runCredential.agentId,
+          });
+        } catch (error) {
+          console.warn("[CodexBridge] Failed to revoke the run credential", error);
+        }
+      };
+    })();
+
+    // SA-117 P2 review (F-P2-6): the mint is the LAST thing before the run options are
+    // built, so nothing that can throw sits between it and the `try` around the spawn. A
+    // throw above this line has no credential to leak; a throw below it is revoked in the
+    // catch. Do not insert an awaited call between here and `createRunner`.
     const runOptions: CodexRunOptions = {
       model: resolvedModel,
       permissionMode: codexSettings.permissionMode,
@@ -636,7 +696,7 @@ export class CodexBridge {
       n8nInstanceMcpToken: request.userId
         ? await apiKeyService.retrieve("n8n_instance_mcp_token", request.userId).catch(() => null)
         : null,
-      batshitToken: await resolveCliHelperBatshitToken(request.userId ?? null),
+      agentRunToken: runCredential?.token ?? null,
       managedStdioEnv,
       historyPersistence: codexSettings.historyPersistence ?? "none",
       serviceTier: codexSettings.serviceTier,
@@ -671,7 +731,17 @@ export class CodexBridge {
       approvalPolicy: runOptions.approvalPolicy,
     });
 
-    const runner = await this.createRunner(prompt, runOptions);
+    // SA-117 DL-117-06: a spawn that never produces a stream never reaches the cleanup
+    // below, so the credential is revoked here instead. Anything that throws between the
+    // mint and a live stream — a missing CLI, an unwritable managed home, an aborted
+    // start — lands in this catch.
+    let runner: Awaited<ReturnType<typeof this.createRunner>>;
+    try {
+      runner = await this.createRunner(prompt, runOptions);
+    } catch (error) {
+      await revokeRunCredentialOnce();
+      throw error;
+    }
 
     const adapter = new CodexEventAdapter({
       request,
@@ -696,6 +766,10 @@ export class CodexBridge {
       abortSignal: request.abortSignal,
       adapter,
       cleanup: async () => {
+        // SA-117 DL-117-06: run end is credential end, on every exit — a finished stream, a
+        // Stop (the iterator's `return`), a timeout, or a thrown error. `wrapStream` funnels
+        // all four through here exactly once.
+        await revokeRunCredentialOnce();
         if (runner.cleanup) await runner.cleanup();
         await imageCleanup();
         if (codexSessionFallback) {
@@ -726,6 +800,11 @@ export class CodexBridge {
       // deprecated fullStream alias so no reader silently diverges.
       stream: wrappedStream,
       fullStream: wrappedStream,
+      // SA-114 P2 (DL-114-06): the running turn's steer channel, or nothing at all on the
+      // exec lane. send-routed reads it the moment this call resolves — which is exactly
+      // when the child process exists — and registers it as the session's steer transport.
+      __steer: runner.steer ?? null,
+      __steerLane: runner.steer ? ("codex" as const) : null,
       __transport: runner.transport,
       __detectToolSource: adapter.getToolMetadataResolver(),
       __rawEvents: adapter.getRawEvents?.(),
@@ -802,7 +881,8 @@ export class CodexBridge {
       managedConfigHome,
       dockerAuthToken: null,
       n8nInstanceMcpToken: null,
-      batshitToken: null,
+      // SA-117: the hidden worker lane registers no managed helpers, so it mints nothing.
+      agentRunToken: null,
       managedStdioEnv: {},
       historyPersistence: "none",
       serviceTier: baseSettings.serviceTier,
@@ -1133,16 +1213,18 @@ export class CodexBridge {
     }
     if (options.dockerAuthToken) {
       childEnv[DOCKER_AUTH_ENV_VAR] = options.dockerAuthToken;
-      if (!childEnv.MCP_GATEWAY_AUTH_TOKEN) {
-        childEnv.MCP_GATEWAY_AUTH_TOKEN = options.dockerAuthToken;
-      }
     }
     if (options.n8nInstanceMcpToken) {
       childEnv[N8N_INSTANCE_MCP_TOKEN_ENV] = options.n8nInstanceMcpToken;
     }
-    if (options.batshitToken) {
-      childEnv[BATSHIT_TOKEN_ENV_VAR] = options.batshitToken;
-    }
+    // SA-117 DL-117-07: the instance token LEAVES here, and this run's credential takes its
+    // place. It runs after the `dockerAuthToken` block above so the gateway token this run
+    // actually resolved is the one that survives; `MCP_GATEWAY_AUTH_TOKEN` inherited from the
+    // app's own environment does not. See `cliChildEnv.ts` for what stays and why.
+    applyCliRunCredentialToChildEnv(childEnv, {
+      agentRunToken: options.agentRunToken,
+      dockerAuthToken: options.dockerAuthToken,
+    });
     if (options.sessionId) {
       childEnv.BATSHIT_SESSION_ID = options.sessionId;
     }
@@ -1218,6 +1300,7 @@ export class CodexBridge {
       transport: "app-server",
       events: run.events,
       cleanup: run.cleanup,
+      steer: run.steer,
     };
   }
 

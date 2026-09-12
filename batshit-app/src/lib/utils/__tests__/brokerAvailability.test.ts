@@ -477,3 +477,77 @@ describe('isControlIdAllowedByList', () => {
     expect(isControlIdAllowedByList('use.artifact.demo', ['artifact.*'])).toBe(false)
   })
 })
+
+describe('Schedule controls (SA-115 P2, DL-115-10)', () => {
+  const ALL_ON = resolveBrokerToolToggles({})
+
+  it('never includes sys.schedule.* by default', () => {
+    const allowed = resolveBrokerFabricAllowedControlIds({ toggles: ALL_ON })
+    expect(isControlIdAllowedByList('sys.schedule.create', allowed)).toBe(false)
+  })
+
+  it('adds sys.schedule.* for an enabled primary even when the broad control plane is closed', () => {
+    const allowed = resolveBrokerFabricAllowedControlIds({
+      toggles: ALL_ON,
+      allowFabricControlTools: false,
+      scheduleControlsEnabled: true
+    })
+    expect(allowed).toContain('sys.schedule.*')
+    expect(allowed).not.toContain('sys.artifact.*')
+    expect(isControlIdAllowedByList('sys.schedule.list', allowed)).toBe(true)
+    expect(isControlIdAllowedByList('sys.schedule.delete', allowed)).toBe(true)
+  })
+
+  it('schedule controls still require the Batshit Tools toggle', () => {
+    const allowed = resolveBrokerFabricAllowedControlIds({
+      toggles: { ...ALL_OFF, fetchZipEnabled: true },
+      scheduleControlsEnabled: true
+    })
+    expect(allowed).toEqual([BROKER_FABRIC_FETCH_ZIP_CONTROL_ID])
+  })
+
+  it('a subagent or worker never sees schedule refs', () => {
+    // DL-115-10: a delegated run is over in a moment. It has no business creating
+    // something that outlives it and keeps spending an hourly wake budget.
+    const allowed = resolveBrokerFabricAllowedControlIds({
+      toggles: ALL_ON,
+      allowFabricControlTools: false,
+      scheduleControlsEnabled: false
+    })
+    expect(isControlIdAllowedByList('sys.schedule.create', allowed)).toBe(false)
+    expect(isControlIdAllowedByList('sys.schedule.list', allowed)).toBe(false)
+  })
+
+  it('memory, DMs, and schedules are three independent allowances', () => {
+    const scheduleOnly = resolveBrokerFabricAllowedControlIds({
+      toggles: ALL_ON,
+      allowFabricControlTools: false,
+      scheduleControlsEnabled: true
+    })
+    expect(scheduleOnly).toContain('sys.schedule.*')
+    expect(scheduleOnly).not.toContain('sys.dm.*')
+    expect(scheduleOnly).not.toContain('sys.memory.*')
+  })
+
+  it('opens the fabric family on api and n8n for a schedule-enabled agent', () => {
+    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
+    for (const runtime of ['api', 'n8n'] as const) {
+      expect(
+        resolveBrokerFamilies({
+          runtime,
+          toggles,
+          allowFabricControlTools: false,
+          scheduleControlsEnabled: true
+        })
+      ).toEqual(['fabric'])
+    }
+    expect(
+      resolveBrokerFamilies({
+        runtime: 'api',
+        toggles: ALL_OFF,
+        allowFabricControlTools: false,
+        scheduleControlsEnabled: true
+      })
+    ).toEqual([])
+  })
+})

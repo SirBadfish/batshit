@@ -906,6 +906,9 @@ async function runApiSubagent(
       // SA-113 P2 (DL-113-11): subagents and Workers never see `sys.dm.*`. A DM is
       // addressed to an agent; a delegated run has no inbox and no identity of its own.
       dmControlsEnabled: false,
+      // SA-115 P2 (DL-115-10): and never `sys.schedule.*`. A delegated run is over in a
+      // moment; it has no business creating something that outlives it and keeps spending.
+      scheduleControlsEnabled: false,
       abortSignal: params.abortSignal,
     })
   } catch (error) {
@@ -1051,6 +1054,10 @@ async function runCliSubagent(
         messageId: runMessageId,
         userId: params.userId,
         agentId: runtimeId,
+        // SA-117 F-P2-1: `runtimeId` is `subagent_cli_<slug>`, a per-run identity with no
+        // `agent:` record behind it. The bridge mints this run's credential for it anyway
+        // (the helper needs one) and marks it as unable to act as an agent.
+        delegatedRun: true,
         agentSlug: subagentSlug,
         model: modelId,
         messages,
@@ -1098,6 +1105,10 @@ async function runCliSubagent(
         messageId: runMessageId,
         userId: params.userId,
         agentId: runtimeId,
+        // SA-117 F-P2-1: `runtimeId` is `subagent_cli_<slug>`, a per-run identity with no
+        // `agent:` record behind it. The bridge mints this run's credential for it anyway
+        // (the helper needs one) and marks it as unable to act as an agent.
+        delegatedRun: true,
         agentSlug: subagentSlug,
         model: modelId,
         messages,

@@ -307,13 +307,19 @@ describe('ClaudeBridge managed MCP scoping', () => {
   posixIt('injects managed env secrets into the spawned CLI child and logs a single redacted executing line', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'claude-bridge-spawn-test-'))
     const probePath = path.join(tempDir, 'claude-probe.sh')
-    // Stands in for the claude executable: drains stdin, then reports the env it received
-    // as a stream-json line so the test can assert spawn-time secret injection.
+    // Stands in for the claude executable: reads the prompt LINE, then reports the env it
+    // received as a stream-json line so the test can assert spawn-time secret injection.
+    //
+    // SA-114 P2: one line, not `cat >/dev/null`. Since DL-114-08 the bridge keeps stdin
+    // open for the whole run so a steer can be written to it, and the real CLI starts
+    // working the moment it has a complete user line (P0 measured it streaming with stdin
+    // still open). A probe that waited for EOF would be modelling a CLI Batshit does not
+    // run, and would hang here forever.
     await writeFile(
       probePath,
       [
         '#!/bin/sh',
-        'cat >/dev/null',
+        'IFS= read -r _line',
         'printf \'{"type":"probe","headerEnv":"%s"}\\n\' "$BATSHIT_MCP_HEADER_GW_DOCKER_AUTHORIZATION"',
         'exit 0'
       ].join('\n'),
@@ -384,5 +390,96 @@ describe('ClaudeBridge managed MCP scoping', () => {
       'mcp__batshit_gateway_demo__allowed_tool',
       'mcp__batshit_gateway_agent_subagents__subagent_api_helper'
     ])
+  })
+})
+
+/* -------------------------------------------------------------------------- *
+ * SA-117 P2 (DL-117-07) — the Claude lane's half of the child-environment rule.
+ *
+ * The Codex lane's builder is asserted in `codexBridge.test.ts`. This is the same claim on
+ * the other lane, and it matters MORE here: the Claude CLI merges its `env` map with the
+ * inherited parent environment (that is how the permission bridge reads `REDIS_URL` with no
+ * env block at all), so nothing but an explicit delete removes the instance token.
+ * -------------------------------------------------------------------------- */
+
+describe('SA-117: the Claude child environment', () => {
+  const withEnv = async (
+    overrides: Record<string, string | undefined>,
+    run: (build: typeof import('../claudeBridge').buildClaudeRunChildEnv) => void | Promise<void>
+  ) => {
+    const previous: Record<string, string | undefined> = {}
+    for (const [key, value] of Object.entries(overrides)) {
+      previous[key] = process.env[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    try {
+      const { buildClaudeRunChildEnv } = await import('../claudeBridge')
+      await run(buildClaudeRunChildEnv)
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  }
+
+  it('drops BATSHIT_TOKEN and carries the run credential', async () => {
+    await withEnv(
+      { BATSHIT_TOKEN: 'instance-secret', MCP_GATEWAY_AUTH_TOKEN: 'inherited-gateway-token' },
+      (buildClaudeRunChildEnv) => {
+        const envVars = buildClaudeRunChildEnv({
+          agentRunToken: 'arc_abc.bsac_secret',
+          dockerAuthToken: null
+        })
+
+        expect(envVars.BATSHIT_TOKEN).toBeUndefined()
+        expect(envVars.BATSHIT_AGENT_TOKEN).toBe('arc_abc.bsac_secret')
+        expect(envVars.MCP_GATEWAY_AUTH_TOKEN).toBeUndefined()
+      }
+    )
+  })
+
+  it('keeps the gateway token for a run that resolved one', async () => {
+    await withEnv({ BATSHIT_TOKEN: 'instance-secret' }, (buildClaudeRunChildEnv) => {
+      const envVars = buildClaudeRunChildEnv({
+        agentRunToken: 'arc_abc.bsac_secret',
+        dockerAuthToken: 'run-gateway-token'
+      })
+
+      expect(envVars.MCP_GATEWAY_AUTH_TOKEN).toBe('run-gateway-token')
+      expect(envVars.BATSHIT_TOKEN).toBeUndefined()
+    })
+  })
+
+  it('never leaves a stale credential behind for a run that minted none', async () => {
+    // The app's own environment can carry `BATSHIT_AGENT_TOKEN` — a developer shell, a
+    // parent Batshit run. A run that minted nothing must fail loudly in its helper, not
+    // authenticate as whatever run exported one last.
+    await withEnv(
+      { BATSHIT_TOKEN: 'instance-secret', BATSHIT_AGENT_TOKEN: 'arc_stale.bsac_old' },
+      (buildClaudeRunChildEnv) => {
+        const envVars = buildClaudeRunChildEnv({ agentRunToken: null, dockerAuthToken: null })
+
+        expect(envVars.BATSHIT_AGENT_TOKEN).toBeUndefined()
+        expect(envVars.BATSHIT_TOKEN).toBeUndefined()
+      }
+    )
+  })
+
+  it('leaves the honest boundary alone: Redis and provider secrets still travel', async () => {
+    // SA-117 Scope says this out loud rather than pretending a deny-list fences a host
+    // shell. The Claude permission bridge and the Codex subagent bridge read Redis directly.
+    await withEnv(
+      { BATSHIT_TOKEN: 'instance-secret', REDIS_URL: 'redis://127.0.0.1:6379' },
+      (buildClaudeRunChildEnv) => {
+        const envVars = buildClaudeRunChildEnv({
+          agentRunToken: 'arc_abc.bsac_secret',
+          dockerAuthToken: null
+        })
+
+        expect(envVars.REDIS_URL).toBe('redis://127.0.0.1:6379')
+      }
+    )
   })
 })

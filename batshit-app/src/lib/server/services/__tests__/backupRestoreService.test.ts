@@ -46,6 +46,11 @@ import {
   recipeStateSnapshotSha256
 } from '$lib/goons/recipe'
 import {
+  agentRunCredentialKey,
+  agentRunCredentialsIndexKey,
+  mintRunCredential
+} from '$lib/server/services/agentRunCredentials'
+import {
   BackupRestoreError,
   beginBackupRestoreMaintenance,
   createBackupBundle,
@@ -607,6 +612,34 @@ async function seedRepresentativeData(userId: string) {
   await redis.execute(async (client) => {
     await client.sAdd('wake_hooks:source', 'whk_1')
   })
+
+  // SA-115 P3 (DL-115-12): one schedule and its user-scoped index SET, in the same `dms`
+  // group. A schedule that did not survive a restore is a routine that silently stops
+  // happening — no error, no row, nothing to notice until the agent never wakes again.
+  await redis.json.set('schedule:sch_1', '$', {
+    id: 'sch_1',
+    userId: 'source',
+    agentId: 'agent_1',
+    name: 'Morning check',
+    cadence: { type: 'daily', at: '09:00' },
+    timeZone: 'America/Chicago',
+    message: 'Say good morning.',
+    kind: 'info',
+    deliver: 'wake',
+    enabled: true,
+    nextRunAt: '2026-09-09T14:00:00.000Z',
+    lastRunAt: null,
+    lastOutcome: null,
+    lastDmId: null,
+    runCount: 0,
+    missedRun: null,
+    createdBy: 'user',
+    createdAt: '2026-09-07T09:00:00.000Z',
+    updatedAt: '2026-09-07T09:00:00.000Z'
+  })
+  await redis.execute(async (client) => {
+    await client.sAdd('schedules:source', 'sch_1')
+  })
 }
 
 describe('backupRestoreService', () => {
@@ -677,6 +710,84 @@ describe('backupRestoreService', () => {
     expect(preflight.sourceUserId).toBe('source')
     expect(preflight.targetUserId).toBe('target')
     expect(preflight.userRemapRequired).toBe(true)
+  })
+
+  it('files the schedule keys under the `dms` group, not the `chats` fall-through (SA-115)', async () => {
+    // `groupForKey` is the site a round-trip test cannot see: an unregistered key still
+    // exports and still restores, it just lands in whatever group the fall-through picks
+    // (`chats`). The manifest then lies about what each group holds, and a user restoring
+    // "Agent DMs, wake-up webhooks, and schedules" without "Chats" quietly loses the clock.
+    await seedRepresentativeData('source')
+
+    const bundle = await createBackupBundle('source')
+    const entries = unzipSync(bundle.bytes)
+    const grouped = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+      .filter((record) => record.key === 'schedule:sch_1' || record.key === 'schedules:source')
+
+    expect(grouped.map((record) => record.key).sort()).toEqual([
+      'schedule:sch_1',
+      'schedules:source'
+    ])
+    for (const record of grouped) {
+      expect(record.groupId).toBe('dms')
+    }
+  })
+
+  it('leaves managed CLI run credentials out of the backup on BOTH sides (SA-117 DL-117-09)', async () => {
+    // Transient run state, like `subagent_lock:`. A wake hook's `tokenHash` IS exported,
+    // because a hook is a durable thing the user made and a restore without the hash leaves it
+    // permanently unauthenticatable. A run credential is the opposite: it names one managed
+    // CLI turn that has already ended, so a restored one could only ever authenticate as an
+    // agent for a run nobody is taking — which is a live credential handed back for free.
+    await seedRepresentativeData('source')
+    const { credentialId } = await mintRunCredential({
+      userId: 'source',
+      agentId: 'agent_1',
+      sessionId: 'sess_1',
+      runtime: 'codex'
+    })
+    const recordKey = agentRunCredentialKey(credentialId)
+    const indexKey = agentRunCredentialsIndexKey('agent_1')
+    expect(await redis.exists(recordKey)).toBeTruthy()
+
+    // Half one: never collected, so never exported. Includes the agent-scoped index SET,
+    // which `collectCandidateKeys` reads for the wake-hook and schedule families.
+    const bundle = await createBackupBundle('source')
+    const exportedKeys = Object.entries(unzipSync(bundle.bytes))
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')).key as string)
+    expect(exportedKeys).not.toContain(recordKey)
+    expect(exportedKeys).not.toContain(indexKey)
+
+    // Half two: `isRestorableKeyForUser` refuses it, so a hand-built or future archive
+    // carrying one is rejected outright rather than quietly writing a credential.
+    const entries = unzipSync(bundle.bytes)
+    const records = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([name, value]) => {
+        delete entries[name]
+        return JSON.parse(Buffer.from(value).toString('utf8')) as Record<string, any>
+      })
+    records.push({
+      key: recordKey,
+      type: 'json',
+      groupId: 'chats',
+      value: (await redis.json.get(recordKey)) as Record<string, any>
+    })
+    records.forEach((record, index) => {
+      entries[`redis/records/${String(index + 1).padStart(8, '0')}.json`] = Buffer.from(
+        JSON.stringify(record)
+      )
+    })
+    const manifest = JSON.parse(Buffer.from(entries['manifest.json']).toString('utf8'))
+    manifest.contents.redisRecordCount = records.length
+    entries['manifest.json'] = Buffer.from(JSON.stringify(manifest))
+
+    await expect(
+      restoreBackupBundle('target', zipSync(entries), { confirmReplace: true })
+    ).rejects.toThrow(/will not restore/i)
   })
 
   it('can include encrypted secret records only when requested', async () => {
@@ -898,6 +1009,26 @@ describe('backupRestoreService', () => {
       client.sMembers('wake_hooks:target')
     )
     expect(restoredHookIndex).toEqual(['whk_1'])
+
+    // SA-115 P3: the schedule travels too, with its next run and its cadence intact, and
+    // the user-scoped index SET remapped to the target user — without that remap the
+    // record survives and nothing can ever find it.
+    const restoredSchedule = (await redis.json.get('schedule:sch_1')) as Record<string, any>
+    expect(restoredSchedule).toMatchObject({
+      id: 'sch_1',
+      agentId: 'agent_1',
+      name: 'Morning check',
+      cadence: { type: 'daily', at: '09:00' },
+      timeZone: 'America/Chicago',
+      deliver: 'wake',
+      enabled: true,
+      nextRunAt: '2026-09-09T14:00:00.000Z'
+    })
+    expect(restoredSchedule.userId).toBe('target')
+    const restoredScheduleIndex = await redis.execute(async (client) =>
+      client.sMembers('schedules:target')
+    )
+    expect(restoredScheduleIndex).toEqual(['sch_1'])
   })
 
   it('preflights and restores a disk-staged archive without buffering upload assets', async () => {

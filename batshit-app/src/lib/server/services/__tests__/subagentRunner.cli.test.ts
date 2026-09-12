@@ -196,7 +196,14 @@ describe('executeManagedSubagent - CLI subagents', () => {
     expect(cliSubagentMocks.codexStreamNativeMode.mock.calls[0]?.[0]).toMatchObject({
       assignedSubagents: [],
       abortSignal: expect.any(AbortSignal),
+      // SA-117 F-P2-1: this run's `agentId` is `subagent_cli_<slug>`, a per-run runtime id
+      // with no `agent:` record behind it. The marker is what lets the bridge mint a
+      // credential for it at all, and what stops that credential acting as an agent.
+      delegatedRun: true,
     })
+    expect(cliSubagentMocks.codexStreamNativeMode.mock.calls[0]?.[0]?.agentId).toMatch(
+      /^subagent_cli_/,
+    )
     expect(
       cliSubagentMocks.prepareManagedCodexSubagentProfile.mock.calls[0]?.[0]?.runtimeSettings?.enableFeatures,
     ).toContain('browser_use')
@@ -328,6 +335,13 @@ describe('executeManagedSubagent - CLI subagents', () => {
     expect(
       cliSubagentMocks.claudeStreamNativeMode.mock.calls[0]?.[0]?.claudeSettings?.model,
     ).toBe('claude-sonnet-4-20250514')
+    // SA-117 F-P2-1, the Claude half of the same claim.
+    expect(cliSubagentMocks.claudeStreamNativeMode.mock.calls[0]?.[0]).toMatchObject({
+      delegatedRun: true,
+    })
+    expect(cliSubagentMocks.claudeStreamNativeMode.mock.calls[0]?.[0]?.agentId).toMatch(
+      /^subagent_cli_/,
+    )
     expect(
       cliSubagentMocks.prepareManagedClaudeSubagentProfile.mock.calls[0]?.[0]?.runtimeSettings?.allowedTools,
     ).toContain('WebSearch')

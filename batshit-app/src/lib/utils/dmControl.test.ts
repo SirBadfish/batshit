@@ -4,7 +4,10 @@ import {
   DEFAULT_WAKE_TIMEOUT_MINUTES,
   MAX_WAKE_TIMEOUT_MINUTES,
   MIN_WAKE_TIMEOUT_MINUTES,
+  DEFAULT_DM_STEER_FALLBACK,
+  DM_STEER_FALLBACKS,
   isDeliverableNow,
+  resolveDmSteerFallback,
   resolveAgentDmsEnabled,
   resolveAgentWakeEnabled,
   resolveDmSenderAllowed,
@@ -135,11 +138,31 @@ describe('resolveWakeTimeoutMs (DL-113-01)', () => {
   })
 })
 
-describe('delivery modes (DL-113-03)', () => {
-  it('only wait and wake can be delivered in v1; steer is reserved for SA-114', () => {
+describe('delivery modes (DL-113-03, DL-114-13)', () => {
+  it('wait and wake can always be attempted', () => {
     expect(isDeliverableNow('wait')).toBe(true)
     expect(isDeliverableNow('wake')).toBe(true)
+  })
+
+  it('steer needs a steerable turn to land in — SA-114 filled the SA-113 reservation', () => {
+    // Before SA-114 P4 this was `false` unconditionally, with a sentence telling the sender
+    // to use wait or wake. The mode is live now, and the thing that decides it is the
+    // RECIPIENT's running turn, which is why the rule takes it as an argument rather than
+    // being re-derived at the one call site.
+    expect(isDeliverableNow('steer', { hasSteerableTurn: true })).toBe(true)
+    expect(isDeliverableNow('steer', { hasSteerableTurn: false })).toBe(false)
+    // No context at all is the honest "there is no turn", not a silent yes.
     expect(isDeliverableNow('steer')).toBe(false)
+  })
+
+  it('a steer fallback is wait or wake, never another steer', () => {
+    expect(DM_STEER_FALLBACKS).toEqual(['wait', 'wake'])
+    expect(resolveDmSteerFallback('wake')).toBe('wake')
+    expect(resolveDmSteerFallback('wait')).toBe('wait')
+    // A fallback that could be `steer` again would be a loop with no exit.
+    expect(resolveDmSteerFallback('steer')).toBe(DEFAULT_DM_STEER_FALLBACK)
+    expect(resolveDmSteerFallback(undefined)).toBe('wait')
+    expect(resolveDmSteerFallback(42)).toBe('wait')
   })
 })
 

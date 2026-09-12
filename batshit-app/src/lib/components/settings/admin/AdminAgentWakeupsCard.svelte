@@ -5,10 +5,14 @@
   import SettingsAccordionCard from '$lib/components/settings/SettingsAccordionCard.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import AdminWakeHooksSection from '$lib/components/settings/admin/AdminWakeHooksSection.svelte'
+  import AdminSchedulesSection from '$lib/components/settings/admin/AdminSchedulesSection.svelte'
 
   // SA-113 P1 (DL-113-01): the instance-wide master switch for wake-ups.
   // SA-113 P3 (DL-113-09): the "Wake-up webhooks" list lives under it, in the same card,
   // because the master switch is what turns every one of those hooks into a wait.
+  // SA-115 P2 (DL-115-01): "Schedules" joins them for the same reason — one card for
+  // everything that starts a chat with nobody typing. Schedules come first because they
+  // are the path that needs nothing installed; webhooks are the door for outside sources.
   interface Props {
     agentWakeupsEnabled: boolean
     disabled: boolean
@@ -28,8 +32,8 @@
     <SettingsInfoMenu ariaLabel="About Agent Wake-ups" contentClass="w-80">
       <p>
         A wake-up is a chat Batshit starts on its own, with nobody typing. One agent can send
-        another a message and ask for the work to start now, and an outside program can do the
-        same through a wake-up webhook.
+        another a message and ask for the work to start now, a schedule can do it at a set time,
+        and an outside program can do the same through a wake-up webhook.
       </p>
       <p>
         Woken chats are ordinary chats: they appear in the sidebar with a small icon showing what
@@ -63,6 +67,8 @@
       </div>
     </div>
   </div>
+
+  <AdminSchedulesSection {disabled} />
 
   <AdminWakeHooksSection {disabled} />
 </SettingsAccordionCard>

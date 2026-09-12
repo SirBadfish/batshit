@@ -15,6 +15,7 @@ import { mcpGatewayDiscovery } from '$lib/server/services/mcpGatewayDiscovery'
 import { resolveDynamicMcpGatewayScope } from '$lib/server/services/mcpSelectionResolver'
 import { redis } from '$lib/server/redis'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
 import {
   buildSchemaSummary,
   getSchemaHintText,
@@ -246,9 +247,16 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       : Array.isArray(body.gatewayFilter)
         ? body.gatewayFilter
         : undefined
+    // SA-117 DL-117-04: a server-bound scope hint on the agent lane; a differing body id is
+    // refused rather than silently used to widen or narrow what this run can see.
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json({ error: agentBinding.message, code: agentBinding.code }, { status: 400 })
+    }
+
     const scopeResolution = await resolveDynamicMcpGatewayScope({
       userId,
-      agentId: body.agentId ?? null,
+      agentId: agentBinding.agentId ?? null,
       selectedGateways
     })
     const resolvedGateways = scopeResolution.resolvedGateways
@@ -264,7 +272,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
 
     const normalizedGroupFilters = groupFilters.map((value) => value.toLowerCase())
     const dcmDisplaySettings = await resolveAgentDcmDisplaySettings({
-      agentId: body.agentId ?? null,
+      agentId: agentBinding.agentId ?? null,
       dcmDisplaySettings: body.dcmDisplaySettings
     })
     const gatewayDefaults = await resolveGatewayDisplayDefaults(userId)

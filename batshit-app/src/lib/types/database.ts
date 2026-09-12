@@ -12,6 +12,7 @@ import type {
   AgentAutoCompactSettings,
   GlobalAutoCompactSettings
 } from '$lib/utils/contextCompaction'
+import type { GlobalChatSettings } from '$lib/utils/steerControl'
 
 export interface ChatFolderRow {
   id: string
@@ -427,6 +428,9 @@ export interface UserSettingsRow {
   global_auto_compact_settings?: GlobalAutoCompactSettings
   
   global_tool_grid_settings?: GlobalToolGridSettings
+
+  /** SA-114 P3 (DL-114-01): what a send does while the agent is still replying. */
+  global_chat_settings?: GlobalChatSettings
   voice_settings?: VoiceSettings
   goons_settings?: GoonsSettings
   created_at: string

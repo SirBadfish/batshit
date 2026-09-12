@@ -3,6 +3,10 @@ import { apiFailure } from '$lib/server/services/apiResponses'
 
 import { redis } from '$lib/server/redis'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import {
+  bindActingAgentId,
+  bindActingSessionId
+} from '$lib/server/services/actingAgentIdentity'
 import { nativeToolService, resolveNativeToolSettings } from '$lib/server/services/nativeTools'
 
 interface AgentBrowserRequest {
@@ -49,7 +53,22 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       return apiFailure('Unauthorized', 401)
     }
 
-    const agentId = typeof body.agentId === 'string' ? body.agentId.trim() : ''
+    /**
+     * SA-117 DL-117-04 — bound first, then the pre-existing ownership check.
+     *
+     * This was the one route in Part 2.2 that already checked the named agent EXISTS and
+     * belongs to the caller's user. It never checked that the caller IS that agent, which is
+     * a different question: every one of a user's agents passed. The binding answers it on
+     * the agent lane, and the ownership check below still covers every other lane.
+     */
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json(
+        { success: false, error: agentBinding.message, code: agentBinding.code },
+        { status: 400 }
+      )
+    }
+    const agentId = agentBinding.agentId ?? ''
     if (!agentId) {
       return json({ success: false, error: 'agentId is required.' }, { status: 400 })
     }
@@ -90,7 +109,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
       const result = await nativeToolService.nativeAgentBrowserUse({
         userId: auth.userId,
-        sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+        sessionId: bindActingSessionId(auth, body.sessionId),
         toolName,
         params:
           body.params && typeof body.params === 'object' && !Array.isArray(body.params)

@@ -65,6 +65,31 @@ const mockPrivateEnv = vi.hoisted(() => ({
     PORT: ''
   } as Record<string, string>
 }))
+// SA-116 P1: the risk gate runs the REAL `controlApprovals.ts` inside this suite rather
+// than a stub, so what is proved here is the wiring an agent actually hits. That needs the
+// ZSET and key commands the approval store uses, backed by the same in-test maps the JSON
+// mocks already use.
+const zsetStore = new Map<string, Map<string, number>>()
+const ensureZset = (key: string) => {
+  if (!zsetStore.has(key)) zsetStore.set(key, new Map())
+  return zsetStore.get(key)!
+}
+const mockRedisZAdd = vi.fn(async (key: string, entries: any) => {
+  const list = Array.isArray(entries) ? entries : [entries]
+  const zset = ensureZset(key)
+  for (const entry of list) zset.set(String(entry.value), Number(entry.score))
+  return list.length
+})
+const mockRedisZRange = vi.fn(async (key: string) =>
+  Array.from(ensureZset(key).entries())
+    .sort((left, right) => left[1] - right[1])
+    .map(([member]) => member)
+)
+const mockRedisDel = vi.fn(async (key: string) => {
+  zsetStore.delete(key)
+  return 1
+})
+const mockRedisExists = vi.fn(async () => 0)
 const mockRedisExecute = vi.fn(async (operation: any) =>
   operation({
     get: mockRedisGet,
@@ -72,7 +97,11 @@ const mockRedisExecute = vi.fn(async (operation: any) =>
     json: { get: mockRedisJsonGet, set: mockRedisJsonSet },
     expire: mockRedisExpire,
     lPush: mockRedisLPush,
-    lTrim: mockRedisLTrim
+    lTrim: mockRedisLTrim,
+    zAdd: mockRedisZAdd,
+    zRange: mockRedisZRange,
+    del: mockRedisDel,
+    exists: mockRedisExists
   })
 )
 
@@ -99,6 +128,12 @@ vi.mock('$lib/server/redis', () => ({
     getVoiceProfiles: (...args: any[]) => mockGetVoiceProfiles(...args),
     deleteVoiceProfile: (...args: any[]) => mockDeleteVoiceProfile(...args),
     get: (...args: any[]) => mockRedisGet(...args),
+    json: {
+      get: (key: string) => mockRedisJsonGet(key),
+      set: (key: string, path: string, value: any) => mockRedisJsonSet(key, path, value)
+    },
+    expire: (...args: any[]) => mockRedisExpire(...args),
+    del: (...args: any[]) => mockRedisDel(...args),
     execute: (...args: any[]) => mockRedisExecute(...args)
   }
 }))
@@ -194,9 +229,28 @@ describe('controlRegistry artifact capability controls', () => {
     const jsonStore = new Map<string, any>()
 
     mockRedisJsonGet.mockImplementation(async (key: string) => jsonStore.get(key) ?? null)
-    mockRedisJsonSet.mockImplementation(async (key: string, _path: string, value: any) => {
-      jsonStore.set(key, value)
+    // Path-aware, because SA-116's approval store writes `$.status` onto an EXISTING record
+    // and a path write must NOT create the root. A path-blind fake would have made both the
+    // "swept approval stays gone" rule and the whole-record-write bug it guards against
+    // untestable here — and it would have silently replaced each record with a status string.
+    mockRedisJsonSet.mockImplementation(async (key: string, path: string, value: any) => {
+      if (path === '$' || !path) {
+        jsonStore.set(key, value)
+        return 'OK'
+      }
+      const field = path.startsWith('$.') ? path.slice(2) : path
+      const existing = jsonStore.get(key)
+      if (!existing || typeof existing !== 'object') {
+        throw new Error("ERR new objects must be created at the root")
+      }
+      jsonStore.set(key, { ...existing, [field]: value })
       return 'OK'
+    })
+    zsetStore.clear()
+    mockRedisDel.mockImplementation(async (key: string) => {
+      zsetStore.delete(key)
+      jsonStore.delete(key)
+      return 1
     })
     mockGetSession.mockResolvedValue({
       id: 'session-1',
@@ -667,6 +721,58 @@ describe('controlRegistry artifact capability controls', () => {
     ).toBe(7)
   })
 
+  it('publishes the SA-115 P2 sys.schedule.* control family through findControls', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const result = await findControls({
+      query: 'sys.schedule.',
+      includeDraft: true,
+      limit: 200
+    })
+
+    const scheduleControls = result.results.filter((item) =>
+      item.controlId.startsWith('sys.schedule.')
+    )
+    expect(scheduleControls.map((item) => item.controlId).sort()).toEqual([
+      'sys.schedule.create',
+      'sys.schedule.delete',
+      'sys.schedule.list',
+      'sys.schedule.update'
+    ])
+
+    // DL-115-10: reading is safe; every WRITE is `confirm`. Putting an agent on a clock is
+    // a spend decision that repeats until somebody stops it, so it goes past a person once.
+    const riskByControl = Object.fromEntries(
+      scheduleControls.map((item) => [item.controlId, item.riskLevel])
+    )
+    expect(riskByControl).toEqual({
+      'sys.schedule.list': 'safe',
+      'sys.schedule.create': 'confirm',
+      'sys.schedule.update': 'confirm',
+      'sys.schedule.delete': 'confirm'
+    })
+  })
+
+  it('excludes sys.schedule.* from a broker allowlist without the schedule scope', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const without = await findControls({
+      query: 'schedule',
+      limit: 200,
+      allowedControlIds: ['sys.artifact.*', 'sys.memory.*', 'sys.dm.*']
+    })
+    expect(without.results.some((item) => item.controlId.startsWith('sys.schedule.'))).toBe(false)
+
+    const withSchedules = await findControls({
+      query: 'schedule',
+      limit: 200,
+      allowedControlIds: ['sys.schedule.*']
+    })
+    expect(
+      withSchedules.results.filter((item) => item.controlId.startsWith('sys.schedule.')).length
+    ).toBe(4)
+  })
+
   it('matches multi-token artifact control queries in findControls', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -767,13 +873,12 @@ describe('controlRegistry artifact capability controls', () => {
     if (denied.success) return
     expect(denied.error?.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
 
-    const approved = await useControl({
+    const approved = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.runtime_addon.start',
       input: {
         addonId: 'fbx2vrma'
-      },
-      allowRisky: true
+      }
     })
 
     expect(approved.success).toBe(true)
@@ -823,44 +928,16 @@ describe('controlRegistry artifact capability controls', () => {
     expect((result.result as any).cliTool.basic.connectedTo).toBe('node')
   })
 
-  it('requires approval for sys.cli_tool.test and succeeds after allowRisky retry', async () => {
-    const { useControl } = await import('../services/fabricRegistry')
-
-    const firstResult = await useControl({
-      userId: 'user-1',
-      controlId: 'sys.cli_tool.test',
-      input: {
-        toolId: 'repo_snapshot'
-      }
-    })
-
-    expect(firstResult.success).toBe(false)
-    if (firstResult.success) return
-    expect(firstResult.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
-
-    const approvedResult = await useControl({
-      userId: 'user-1',
-      controlId: 'sys.cli_tool.test',
-      input: {
-        toolId: 'repo_snapshot'
-      },
-      allowRisky: true
-    })
-
-    expect(mockCliToolService.validateCliTool).toHaveBeenCalledWith('user-1', 'repo_snapshot', {
-      projectPath: null
-    })
-    expect(approvedResult.success).toBe(true)
-    if (!approvedResult.success) return
-    expect((approvedResult.result as any).verificationMode).toBe('registry_validation')
-    expect((approvedResult.result as any).validation.summary).toBe(
-      'Validation input executed successfully'
-    )
-    expect((approvedResult.result as any).message).toContain('select it in the current chat Tools panel')
-  })
-
   /* ---------------------------------------------------------------- *
-   * SA-113 F-SEC-1 — a woken turn cannot approve its own risky control
+   * SA-116 — the click is the approval (DL-116-01, DL-116-03, DL-116-09, DL-116-10)
+   *
+   * SA-113's F-SEC-1 suite lived here and pinned an outright refusal for a woken turn.
+   * A woken turn now PAUSES for the same card as any other turn, so those tests are
+   * rewritten rather than deleted: every load-bearing property they protected is still
+   * asserted below, in its new shape.
+   *
+   * These run the real `controlApprovals.ts` against this file's Redis mock, so what is
+   * proved is the wiring `useControl` actually has.
    * ---------------------------------------------------------------- */
 
   /** The wake primitive's user message: `metadata.wake` is what makes a turn a woken one. */
@@ -870,84 +947,60 @@ describe('controlRegistry artifact capability controls', () => {
     metadata: { wake: { chainDepth: 1, ...(dmId ? { dmId } : {}) } }
   })
 
-  const riskApprovalKeysWritten = () =>
+  /** Every `ControlAuditEntry` this test wrote, in order (DL-116-12). */
+  const auditEntriesWritten = () =>
+    mockRedisJsonSet.mock.calls
+      .filter((call) => String(call[0] ?? '').startsWith('control_audit:'))
+      .map((call) => call[2] as any)
+
+  const riskWindowKeysWritten = () =>
     mockRedisSet.mock.calls
       .map((call) => String(call[0] ?? ''))
       .filter((key) => key.startsWith('control_risk_approval:'))
 
-  it('F-SEC-1: refuses a risky control in a woken turn even with allowRisky, and caches nothing', async () => {
+  /** Every pending approval record this test caused (SA-116 F-P1-2). */
+  const approvalRecordsWritten = () =>
+    mockRedisJsonSet.mock.calls
+      .map((call) => String(call[0] ?? ''))
+      .filter((key) => key.startsWith('control_approval:'))
+
+  /**
+   * Run a risky control the way a user does now: it pauses, the user clicks Approve, and
+   * the very same call runs.
+   *
+   * Before SA-116 these sites simply passed `allowRisky: true`, which the server now
+   * ignores on every lane but the Portable Skill one — so a test that still passed the flag
+   * would be asserting against a gate that no longer reads it. This helper is what "the
+   * user clicked Approve" looks like from a test.
+   */
+  const useControlWithApproval = async (options: any) => {
     const { useControl } = await import('../services/fabricRegistry')
-    mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
+    const { decideApproval } = await import('../services/controlApprovals')
+    const first = await useControl(options)
+    if (first.success || first.error.code !== 'CONTROL_RISK_REQUIRES_APPROVAL') return first
+    const approvalId = first.error.details?.approvalId
+    expect(typeof approvalId).toBe('string')
+    await decideApproval({ userId: options.userId, approvalId, approved: true })
+    // The grant is how send-routed's resume names the record it is spending. It matters for
+    // a call with no `sessionId` (the service lane): the index is session-scoped, so there
+    // is nothing for the implicit lookup to search.
+    return await useControl({ ...options, approval: { kind: 'sdk', approvalId } })
+  }
 
-    const result = await useControl({
-      userId: 'user-1',
-      sessionId: 'session-1',
-      controlId: 'sys.cli_tool.test',
-      input: { toolId: 'repo_snapshot' },
-      // The exact move the broker's own approval_hint teaches, and the one a webhook body
-      // could talk a compliant model into.
-      allowRisky: true
-    })
+  /** Approve the pending card a paused `useControl` just raised. */
+  const approveThePause = async (result: any) => {
+    const { decideApproval } = await import('../services/controlApprovals')
+    const approvalId = result?.error?.details?.approvalId
+    expect(typeof approvalId).toBe('string')
+    const decided = await decideApproval({ userId: 'user-1', approvalId, approved: true })
+    expect(decided?.status).toBe('approved')
+    return approvalId as string
+  }
 
-    expect(result.success).toBe(false)
-    if (result.success) return
-    expect(result.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
-    expect(result.error.message).toContain('not by the user')
-    expect(result.error.message).toContain('once the user replies in this chat, retry')
-    // The control did not run...
-    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
-    // ...and no approval was recorded, so a later call cannot read this as consent.
-    expect(riskApprovalKeysWritten()).toEqual([])
-  })
-
-  it('F-SEC-1: the same session runs the control normally once the user has replied', async () => {
-    const { useControl } = await import('../services/fabricRegistry')
-    // A human reply is simply the newest user message with no `metadata.wake`. That is the
-    // whole recovery path the refusal points the agent at — nothing is cancelled.
-    mockGetRecentMessages.mockResolvedValue([
-      wokenUserMessage(),
-      { role: 'assistant', content: 'I need your say-so first.', metadata: {} },
-      { role: 'user', content: 'go ahead', metadata: {} }
-    ])
-
-    const result = await useControl({
-      userId: 'user-1',
-      sessionId: 'session-1',
-      controlId: 'sys.cli_tool.test',
-      input: { toolId: 'repo_snapshot' },
-      allowRisky: true
-    })
-
-    expect(result.success).toBe(true)
-    expect(mockCliToolService.validateCliTool).toHaveBeenCalledWith('user-1', 'repo_snapshot', {
-      projectPath: null
-    })
-  })
-
-  it('F-SEC-1: an approval cached from a human turn does not unlock a woken turn', async () => {
+  it('pauses sys.cli_tool.test for a card, and the click runs it exactly once', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    // The user approves in an ordinary chat, which writes the five-minute cache.
-    const approved = await useControl({
-      userId: 'user-1',
-      agentId: 'agent-1',
-      sessionId: 'session-1',
-      controlId: 'sys.cli_tool.test',
-      input: { toolId: 'repo_snapshot' },
-      allowRisky: true
-    })
-    expect(approved.success).toBe(true)
-    const cachedKey = riskApprovalKeysWritten().at(-1)
-    expect(cachedKey).toBeTruthy()
-    // Make the cache read find it, the way Redis would inside the five minutes.
-    mockRedisGet.mockImplementation(async (key: string) =>
-      key === cachedKey ? new Date().toISOString() : null
-    )
-    mockCliToolService.validateCliTool.mockClear()
-
-    // Three minutes later, a DM wakes the same agent in the same chat.
-    mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
-    const woken = await useControl({
+    const paused = await useControl({
       userId: 'user-1',
       agentId: 'agent-1',
       sessionId: 'session-1',
@@ -955,20 +1008,181 @@ describe('controlRegistry artifact capability controls', () => {
       input: { toolId: 'repo_snapshot' }
     })
 
-    expect(woken.success).toBe(false)
-    if (woken.success) return
-    expect(woken.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
+    expect(paused.success).toBe(false)
+    if (paused.success) return
+    expect(paused.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
+    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+    // DL-116-07: the block send-routed persists the card from, on every lane.
+    expect(paused.error.details?.approvalRequest).toEqual(
+      expect.objectContaining({
+        approvalId: paused.error.details?.approvalId,
+        controlId: 'sys.cli_tool.test',
+        riskLevel: 'confirm',
+        inputSummary: { toolId: 'repo_snapshot' }
+      })
+    )
+    // The model is told to stop, not to retry with a flag. This call names no message, so
+    // its lane is `service` and no card can render for it — DL-116-13 makes the refusal
+    // say that plainly instead of claiming the user was asked (P2-EVIDENCE §6).
+    expect(paused.error.details?.approvalRequest?.lane).toBe('service')
+    expect(paused.error.message).toContain('no chat to show an Approve button in')
+    expect(paused.error.message).toContain('then stop')
+    expect(paused.error.message).not.toContain('asked the user to approve it.')
+
+    await approveThePause(paused)
+
+    const approved = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' }
+    })
+    expect(approved.success).toBe(true)
+    expect(mockCliToolService.validateCliTool).toHaveBeenCalledWith('user-1', 'repo_snapshot', {
+      projectPath: null
+    })
+
+    // Consume-once: the same call again is a new card, not a second free run.
+    mockCliToolService.validateCliTool.mockClear()
+    const replay = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' }
+    })
+    expect(replay.success).toBe(false)
+    if (replay.success) return
+    expect(replay.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
     expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
   })
 
-  it('F-SEC-1: a safe control still runs in a woken turn', async () => {
+  it('DL-116-01: the model passing allowRisky alone runs nothing, and caches nothing', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    // The exact move the old `approval_hint` taught, on the API broker's own path (the
+    // broker passes `input.allowRisky` straight through and declares no actorType).
+    const result = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      runtimeMode: 'mode3',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
+    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+    // ...and nothing was written that a later call could read as consent.
+    expect(riskWindowKeysWritten()).toEqual([])
+  })
+
+  it('DL-116-09: a Portable Skill Token still runs its scoped control', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    // The token's family scope IS the consent, and there is no chat to click in.
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      actorType: 'portable-skill',
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(true)
+    expect(mockCliToolService.validateCliTool).toHaveBeenCalled()
+    // DL-116-12: recorded as a scope, never as a click.
+    const audited = auditEntriesWritten().at(-1)
+    expect(audited?.approval).toEqual(
+      expect.objectContaining({ kind: 'portable-skill-scope', approvalId: null })
+    )
+  })
+
+  it('a risky control with unusable input fails first, without costing a click', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    // AMD-116-02's lesson, one step further along: a pause on a call that could never run
+    // spends a click and a turn on a card, and the control then fails anyway.
+    const result = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 42 } as any
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_INPUT_INVALID')
+    // No card was raised for a call that cannot happen.
+    expect(auditEntriesWritten().at(-1)?.paused).toBe(false)
+  })
+
+  it('DL-116-10: a risky control in a group chat is refused, not carded', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    mockGetSession.mockResolvedValue({
+      id: 'session-group',
+      user_id: 'user-1',
+      metadata: { group_chat: { group_id: 'grp_1' } }
+    })
+
+    const result = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-group',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' }
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_RISK_UNAVAILABLE_IN_GROUP')
+    expect(result.error.message).toContain('direct chat')
+    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+  })
+
+  it('DL-116-12: the audit entry carries the agent, the session, and the approval', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const paused = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' }
+    })
+    const pausedAudit = auditEntriesWritten().at(-1)
+    expect(pausedAudit).toEqual(
+      expect.objectContaining({ agentId: 'agent-1', sessionId: 'session-1', paused: true })
+    )
+    expect(pausedAudit?.approval).toBeNull()
+
+    const approvalId = await approveThePause(paused)
+    await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      approval: { kind: 'sdk', approvalId }
+    })
+    const ranAudit = auditEntriesWritten().at(-1)
+    expect(ranAudit?.paused).toBe(false)
+    expect(ranAudit?.approval).toEqual(
+      expect.objectContaining({ approvalId, kind: 'sdk' })
+    )
+  })
+
+  it('a safe control never pauses, in a woken turn or anywhere else', async () => {
     const { useControl } = await import('../services/fabricRegistry')
     mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
 
-    // The gate is risk-scoped, so nothing `safe` is affected. Every `sys.dm.*` control is
-    // registered `safe` (pinned by "publishes the SA-113 P2 sys.dm.* control family"), which
-    // is what keeps a woken agent able to read, claim, and close the DM that woke it —
-    // exactly what the refusal tells it to do.
+    // The gate is risk-scoped. Every `sys.dm.*` control is `safe`, which is what keeps a
+    // woken agent able to read, claim, and close the DM that woke it.
     const result = await useControl({
       userId: 'user-1',
       sessionId: 'session-1',
@@ -985,12 +1199,34 @@ describe('controlRegistry artifact capability controls', () => {
     expect(mockCliToolService.createCliTool).toHaveBeenCalled()
   })
 
-  it('F-SEC-1: an unreadable session fails closed rather than assuming a human', async () => {
+  it('SA-113 F-SEC-1, kept: a woken turn pauses and cannot ride a window', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+    mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
+
+    const result = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.cli_tool.test',
+      input: { toolId: 'repo_snapshot' },
+      // The webhook body's move: outside text telling a compliant model the user said yes.
+      allowRisky: true
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
+    expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
+    expect(riskWindowKeysWritten()).toEqual([])
+  })
+
+  it('SA-113 F-SEC-1, kept: an unreadable session pauses rather than assuming a human', async () => {
     const { useControl } = await import('../services/fabricRegistry')
     mockGetRecentMessages.mockRejectedValue(new Error('redis is down'))
 
     const result = await useControl({
       userId: 'user-1',
+      agentId: 'agent-1',
       sessionId: 'session-1',
       controlId: 'sys.cli_tool.test',
       input: { toolId: 'repo_snapshot' },
@@ -999,34 +1235,37 @@ describe('controlRegistry artifact capability controls', () => {
 
     expect(result.success).toBe(false)
     if (result.success) return
-    expect(result.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
+    expect(result.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
     expect(mockCliToolService.validateCliTool).not.toHaveBeenCalled()
   })
 
-  it('F-SEC-1b: the refusal stamps the DM that woke the chat as needing the user', async () => {
+  it('F-SEC-1b, kept: the pause stamps the DM that woke the chat as needing the user', async () => {
     const { useControl } = await import('../services/fabricRegistry')
     const { stampDmNeedsUser } = await import('$lib/server/services/dm/dmStore')
     mockGetRecentMessages.mockResolvedValue([wokenUserMessage('dm_stuck')])
 
-    const result = await useControl({
+    await useControl({
       userId: 'user-1',
+      agentId: 'agent-1',
       sessionId: 'session-1',
       controlId: 'sys.cli_tool.test',
-      input: { toolId: 'repo_snapshot' },
-      allowRisky: true
+      input: { toolId: 'repo_snapshot' }
     })
 
-    expect(result.success).toBe(false)
-    expect(stampDmNeedsUser).toHaveBeenCalledWith('dm_stuck', expect.stringContaining('sys.cli_tool.test'))
+    expect(stampDmNeedsUser).toHaveBeenCalledWith(
+      'dm_stuck',
+      expect.stringContaining('waiting for you to approve')
+    )
   })
 
-  it('F-SEC-1b: a woken turn with no DM id (a webhook wake) still refuses', async () => {
+  it('F-SEC-1b, kept: a woken turn with no DM id (a webhook wake) still pauses', async () => {
     const { useControl } = await import('../services/fabricRegistry')
     const { stampDmNeedsUser } = await import('$lib/server/services/dm/dmStore')
     mockGetRecentMessages.mockResolvedValue([wokenUserMessage()])
 
     const result = await useControl({
       userId: 'user-1',
+      agentId: 'agent-1',
       sessionId: 'session-1',
       controlId: 'sys.cli_tool.test',
       input: { toolId: 'repo_snapshot' },
@@ -1035,7 +1274,7 @@ describe('controlRegistry artifact capability controls', () => {
 
     expect(result.success).toBe(false)
     if (result.success) return
-    expect(result.error.code).toBe('CONTROL_RISK_NEEDS_HUMAN_TURN')
+    expect(result.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
     expect(stampDmNeedsUser).not.toHaveBeenCalled()
   })
 
@@ -1074,7 +1313,14 @@ describe('controlRegistry artifact capability controls', () => {
       agentId: 'agent-1',
       query: 'artifact use',
       includeDraft: true,
-      limit: 30
+      // SA-115: was 30, which the registry has outgrown. The claim here is a RELATIVE
+      // ordering between two controls, but a fixed window turns "the registry gained four
+      // entries" into "the lower-ranked one is missing" — a ranking failure that is not
+      // one. The 30 nearest matches for "artifact use" are now filled out with DM, memory,
+      // voice, and schedule controls that are not about artifacts either, so neither of
+      // the two items being compared was in it. 200 matches the other findControls tests
+      // in this file and lets the ordering assertion below mean what it says.
+      limit: 200
     })
 
     const ids = result.results.map((item) => item.controlId)
@@ -1165,74 +1411,99 @@ describe('controlRegistry artifact capability controls', () => {
     expect(result.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
   })
 
-  it('records short-lived risk approval cache entries when risky controls are explicitly approved', async () => {
+  it('DL-116-04: one click covers one action, and leaves no window behind it', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    const result = await useControl({
+    // Until SA-116 an approved risky control wrote `control_risk_approval:{user}:{agent}:
+    // {controlId}` with a five-minute TTL, and the next call of that control ran with no
+    // card at all. Approving "roll artifact A back" therefore also approved rolling it back
+    // again, and approving "delete memory X" approved deleting memory Y.
+    const approved = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.artifact.rollback',
-      input: {
-        artifactId: 'artifact_123',
-        targetVersion: 1
-      },
-      allowRisky: true
-    })
-
-    expect(result.success).toBe(true)
-    expect(mockRedisSet).toHaveBeenCalledWith(
-      'control_risk_approval:user-1:no-agent:sys.artifact.rollback',
-      expect.any(String),
-      { EX: 300 }
-    )
-  })
-
-  it('reuses recent risk approval cache entries to avoid repeated approval prompts', async () => {
-    const { useControl } = await import('../services/fabricRegistry')
-
-    const approved = await useControl({
-      userId: 'user-1',
-      controlId: 'sys.artifact.rollback',
-      input: {
-        artifactId: 'artifact_123',
-        targetVersion: 1
-      },
-      allowRisky: true
+      input: { artifactId: 'artifact_123', targetVersion: 1 }
     })
     expect(approved.success).toBe(true)
+    expect(mockArtifactService.rollbackToVersion).toHaveBeenCalledTimes(1)
 
+    // Nothing unscoped is written any more...
+    expect(riskWindowKeysWritten()).toEqual([])
+
+    // ...and even if a stale marker were sitting in Redis, no unscoped read looks for one.
     mockRedisGet.mockResolvedValue('cached-risk-approval')
-
-    const reused = await useControl({
+    const second = await useControl({
       userId: 'user-1',
       controlId: 'sys.artifact.rollback',
-      input: {
-        artifactId: 'artifact_123',
-        targetVersion: 1
-      }
+      input: { artifactId: 'artifact_123', targetVersion: 1 }
     })
-
-    expect(reused.success).toBe(true)
-    expect(mockArtifactService.rollbackToVersion).toHaveBeenCalledTimes(2)
+    expect(second.success).toBe(false)
+    if (second.success) return
+    expect(second.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
+    expect(mockArtifactService.rollbackToVersion).toHaveBeenCalledTimes(1)
   })
 
-  it('supports dry-run validation on risky artifact controls', async () => {
+  it('F-P1-2: a dry run on a risky control costs no click and writes no record', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
+    // P1 left the `dryRun` return BELOW the gate, so the model's natural preflight
+    // ("dry-run, then ask") raised a card for a call that runs nothing — two clicks per
+    // action, which is the friction that makes people ask for the blanket window this story
+    // removed. Nobody clicks Approve anywhere in this test.
     const result = await useControl({
       userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
       controlId: 'sys.artifact.rollback',
       input: {
         artifactId: 'artifact_123',
         targetVersion: 1
       },
-      dryRun: true,
-      allowRisky: true
+      dryRun: true
     })
 
     expect(result.success).toBe(true)
     if (!result.success) return
     expect(result.dryRun).toBe(true)
     expect(result.result).toEqual({ validated: true })
+    expect(approvalRecordsWritten()).toEqual([])
+    expect(mockArtifactService.rollbackToVersion).not.toHaveBeenCalled()
+  })
+
+  it('F-P1-2: a dry run still validates its input before returning', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    // The `dryRun` return moved ABOVE the gate but stays BELOW validation (AMD-116-04). A
+    // dry run whose input does not parse must still say so — that is what a dry run is for.
+    const result = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.artifact.rollback',
+      input: { artifactId: 'artifact_123' },
+      dryRun: true
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_INPUT_INVALID')
+    expect(approvalRecordsWritten()).toEqual([])
+  })
+
+  it('a real (non-dry) run of the same risky control still pauses for a card', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const paused = await useControl({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      controlId: 'sys.artifact.rollback',
+      input: { artifactId: 'artifact_123', targetVersion: 1 }
+    })
+
+    expect(paused.success).toBe(false)
+    if (paused.success) return
+    expect(paused.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
+    expect(approvalRecordsWritten().length).toBeGreaterThan(0)
   })
 
   it('executes sys.artifact.create without allowRisky (safe lifecycle control)', async () => {
@@ -1516,14 +1787,13 @@ describe('controlRegistry artifact capability controls', () => {
   it('executes sys.artifact.create via ArtifactsService (no legacy MCP adapter)', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    const result = await useControl({
+    const result = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.artifact.create',
       input: {
         name: 'Demo Artifact',
         content: '<div>Hello</div>'
       },
-      allowRisky: true,
       actorType: 'service'
     })
 
@@ -2141,6 +2411,51 @@ describe('controlRegistry artifact capability controls', () => {
     )
   })
 
+  it('SA-117 DL-117-10: names the acting agent and the run credential on the agent lane', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    await useControl({
+      userId: 'user-1',
+      controlId: 'sys.artifact.list',
+      actorType: 'agent',
+      agentId: 'agent-cooper',
+      sessionId: 'sess-1',
+      credentialId: 'arc_abc123'
+    })
+
+    // "Which agent acted" has to be RECORDED to be true, and `credentialId` is what says the
+    // `agentId` beside it was bound by the server rather than claimed by the request body.
+    expect(mockRedisJsonSet).toHaveBeenCalledWith(
+      expect.stringMatching(/^control_audit:user-1:/),
+      '$',
+      expect.objectContaining({
+        actorType: 'agent',
+        agentId: 'agent-cooper',
+        sessionId: 'sess-1',
+        credentialId: 'arc_abc123'
+      })
+    )
+  })
+
+  it('SA-117 DL-117-10: writes a null credential on every lane that has none', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    await useControl({
+      userId: 'user-1',
+      controlId: 'sys.artifact.list',
+      actorType: 'service',
+      agentId: 'agent-cooper'
+    })
+
+    // `null`, never absent: a reader must be able to tell "no credential" from a field that a
+    // future writer forgot, and on this lane the `agentId` above is body text.
+    expect(mockRedisJsonSet).toHaveBeenCalledWith(
+      expect.stringMatching(/^control_audit:user-1:/),
+      '$',
+      expect.objectContaining({ actorType: 'service', credentialId: null })
+    )
+  })
+
   it('publishes sys.voice.engine.* controls in findControls without includeDraft', async () => {
     const { findControls } = await import('../services/fabricRegistry')
 
@@ -2735,7 +3050,7 @@ describe('controlRegistry artifact capability controls', () => {
       }
     }))
 
-    const result = await useControl({
+    const result = await useControlWithApproval({
       userId: 'user-1',
       agentId: 'agent-1',
       controlId: 'artifact.artifact_123.field.zone.set',
@@ -2743,8 +3058,7 @@ describe('controlRegistry artifact capability controls', () => {
         value: {
           zone: 'header'
         }
-      },
-      allowRisky: true
+      }
     })
 
     expect(mockArtifactService.update).toHaveBeenCalledWith('artifact_123', 'user-1', {
@@ -2782,12 +3096,11 @@ describe('controlRegistry artifact capability controls', () => {
     ] as const
 
     for (const aliasInput of aliasInputs) {
-      const result = await useControl({
+      const result = await useControlWithApproval({
         userId: 'user-1',
         agentId: 'agent-1',
         controlId: 'artifact.artifact_123.field.zone.set',
-        input: aliasInput.input,
-        allowRisky: true
+        input: aliasInput.input
       })
 
       expect(result.success).toBe(true)
@@ -2800,12 +3113,11 @@ describe('controlRegistry artifact capability controls', () => {
     const { useControl } = await import('../services/fabricRegistry')
     mockArtifactService.update.mockClear()
 
-    const result = await useControl({
+    const result = await useControlWithApproval({
       userId: 'user-1',
       agentId: 'agent-1',
       controlId: 'artifact.artifact_123.field.zone.set',
-      input: {},
-      allowRisky: true
+      input: {}
     })
 
     expect(result.success).toBe(false)
@@ -2861,12 +3173,11 @@ describe('controlRegistry artifact capability controls', () => {
       zone: null
     })
 
-    const result = await useControl({
+    const result = await useControlWithApproval({
       userId: 'user-1',
       agentId: 'agent-1',
       controlId: 'artifact.artifact_123.action.publish.run',
-      input: {},
-      allowRisky: true
+      input: {}
     })
 
     expect(result.success).toBe(false)
@@ -2895,12 +3206,11 @@ describe('controlRegistry artifact capability controls', () => {
       }
     })
 
-    const result = await useControl({
+    const result = await useControlWithApproval({
       userId: 'user-1',
       agentId: 'agent-1',
       controlId: 'artifact.artifact_123.action.publish.run',
-      input: { zone: 'header' },
-      allowRisky: true
+      input: { zone: 'header' }
     })
 
     expect(result.success).toBe(false)
@@ -2915,12 +3225,11 @@ describe('controlRegistry artifact capability controls', () => {
   it('blocks dynamic artifact control use for unassigned agents', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    const denied = await useControl({
+    const denied = await useControlWithApproval({
       userId: 'user-1',
       agentId: 'agent-2',
       controlId: 'artifact.artifact_123.field.model.set',
-      input: { model: 'gpt-4.1-mini' },
-      allowRisky: true
+      input: { model: 'gpt-4.1-mini' }
     })
 
     expect(denied.success).toBe(false)
@@ -2931,10 +3240,9 @@ describe('controlRegistry artifact capability controls', () => {
   it('executes voice engine register + enable through control registry', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    const register = await useControl({
+    const register = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.register',
-      allowRisky: true,
       input: {
         engineId: 'Parakeet',
         payload: {
@@ -2978,10 +3286,9 @@ describe('controlRegistry artifact capability controls', () => {
       })
     )
 
-    const enable = await useControl({
+    const enable = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.enable',
-      allowRisky: true,
       input: {
         engineId: 'parakeet',
         enabled: false
@@ -3023,10 +3330,9 @@ describe('controlRegistry artifact capability controls', () => {
 
     const { useControl } = await import('../services/fabricRegistry')
 
-    const result = await useControl({
+    const result = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.complete_local_setup',
-      allowRisky: true,
       input: {
         engineId: 'chatterbox-local',
         installRoot: '/Users/example/.batshit/installs/chatterbox-local',
@@ -3090,10 +3396,9 @@ describe('controlRegistry artifact capability controls', () => {
 
     const { useControl } = await import('../services/fabricRegistry')
 
-    const result = await useControl({
+    const result = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.complete_local_setup',
-      allowRisky: true,
       input: {
         engineId: 'kokoro',
         installRoot: '/Users/example/.batshit/installs/kokoro',
@@ -3141,34 +3446,15 @@ describe('controlRegistry artifact capability controls', () => {
     )
   })
 
-  it('accepts explicit user install consent in-session for local voice completion without allowRisky', async () => {
-    mockCompleteLocalVoiceEngineSetup.mockResolvedValue({
-      completed: true,
-      blocked: false,
-      stage: 'complete',
-      engineId: 'chatterbox-local',
-      providerId: 'byo:chatterbox-local',
-      installRoot: '/Users/example/.batshit/installs/chatterbox-local',
-      installOwnership: 'batshit-managed',
-      launchCwd: '/Users/example/.batshit/installs/chatterbox-local',
-      logPath: '/Users/example/.batshit/runtime/voice-engines/chatterbox-local/logs/local-engine-runtime.log',
-      statePath: '/Users/example/.batshit/runtime/voice-engines/chatterbox-local/.batshit-local-engine-setup.json',
-      launched: true,
-      alreadyRunning: false,
-      pid: 4242,
-      registered: true,
-      enabled: true,
-      health: {
-        ready: true,
-        reachable: true,
-        state: 'ready',
-        statusHint: 'Health check passed.'
-      }
-    })
+  it('DL-116-04: the chat-text sniffer is gone — typing "go ahead" approves nothing', async () => {
     mockGetSession.mockResolvedValue({
       id: 'session-speech-setup',
       user_id: 'user-1'
     })
+    // Until SA-116, `useControl` read the last six user messages for "go ahead", "do it",
+    // or a bare "yes" behind an install-topic guard, and a match not only ran the installer
+    // but WROTE the five-minute window. Hidden magic, and a sentence in a chat is not a
+    // decision the server can prove. The click replaces it.
     mockGetSessionMessages.mockResolvedValue([
       {
         id: 'msg-user-1',
@@ -3176,7 +3462,7 @@ describe('controlRegistry artifact capability controls', () => {
         user_id: 'user-1',
         role: 'user',
         content:
-          "[Skill: Speech Setup | skillId=speech_setup]\n\nLet's install chatterbox-turbo without mlx-audio if that works on this Mac.",
+          "[Skill: Speech Setup | skillId=speech_setup]\n\nLet's install chatterbox-turbo, go ahead.",
         timestamp: '2026-03-08T22:00:00.000Z',
         created_at: '2026-03-08T22:00:00.000Z',
         status: 'complete'
@@ -3194,23 +3480,60 @@ describe('controlRegistry artifact capability controls', () => {
         engineId: 'chatterbox-local',
         installRoot: '/Users/example/.batshit/installs/chatterbox-local',
         installOwnership: 'batshit-managed',
-        launch: {
-          command: '.venv/bin/python',
-          args: ['main.py']
-        },
+        launch: { command: '.venv/bin/python', args: ['main.py'] },
         payload: {
           name: 'Chatterbox Local',
           baseUrl: 'http://127.0.0.1:4123',
-          supports: {
-            tts: true,
-            stt: false,
-            clone: false
-          }
+          supports: { tts: true, stt: false, clone: false }
+        }
+      }
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('CONTROL_RISK_REQUIRES_APPROVAL')
+    expect(mockCompleteLocalVoiceEngineSetup).not.toHaveBeenCalled()
+    // And nothing was written that a later call could read as consent.
+    expect(riskWindowKeysWritten()).toEqual([])
+  })
+
+  it('DL-116-04: an approved voice setup seeds a window for THAT engine only', async () => {
+    mockCompleteLocalVoiceEngineSetup.mockResolvedValue({
+      completed: true,
+      blocked: false,
+      stage: 'complete',
+      engineId: 'chatterbox-local',
+      providerId: 'byo:chatterbox-local',
+      installRoot: '/Users/example/.batshit/installs/chatterbox-local',
+      installOwnership: 'batshit-managed',
+      launched: true,
+      registered: true,
+      enabled: true
+    })
+    mockGetSession.mockResolvedValue({ id: 'session-speech-setup', user_id: 'user-1' })
+
+    // The one window DL-116-04 keeps: a local install that fails partway and retries the
+    // same engine inside five minutes is one action to the user, so it must not ask twice.
+    const result = await useControlWithApproval({
+      userId: 'user-1',
+      agentId: 'agent-1',
+      sessionId: 'session-speech-setup',
+      controlId: 'sys.voice.engine.complete_local_setup',
+      input: {
+        engineId: 'chatterbox-local',
+        installRoot: '/Users/example/.batshit/installs/chatterbox-local',
+        installOwnership: 'batshit-managed',
+        launch: { command: '.venv/bin/python', args: ['main.py'] },
+        payload: {
+          name: 'Chatterbox Local',
+          baseUrl: 'http://127.0.0.1:4123',
+          supports: { tts: true, stt: false, clone: false }
         }
       }
     })
 
     expect(result.success).toBe(true)
+    // Scoped to the engine, and seeded by the click rather than by the successful run.
     expect(mockRedisSet).toHaveBeenCalledWith(
       'control_risk_approval:user-1:agent-1:sys.voice.engine.complete_local_setup:engine%3Achatterbox-local',
       expect.any(String),
@@ -3246,11 +3569,10 @@ describe('controlRegistry artifact capability controls', () => {
 
     const { useControl } = await import('../services/fabricRegistry')
 
-    const approved = await useControl({
+    const approved = await useControlWithApproval({
       userId: 'user-1',
       agentId: 'agent-1',
       controlId: 'sys.voice.engine.complete_local_setup',
-      allowRisky: true,
       input: {
         engineId: 'parakeet',
         installRoot: '/Users/example/.batshit/installs/parakeet',
@@ -3316,10 +3638,9 @@ describe('controlRegistry artifact capability controls', () => {
 
     const { useControl } = await import('../services/fabricRegistry')
 
-    await useControl({
+    await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.register',
-      allowRisky: true,
       input: {
         engineId: 'parakeet',
         payload: {
@@ -3370,10 +3691,9 @@ describe('controlRegistry artifact capability controls', () => {
 
     const { useControl } = await import('../services/fabricRegistry')
 
-    await useControl({
+    await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.register',
-      allowRisky: true,
       input: {
         engineId: 'warming-engine',
         payload: {
@@ -3411,10 +3731,9 @@ describe('controlRegistry artifact capability controls', () => {
   it('executes voice engine delete through control registry', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    await useControl({
+    await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.register',
-      allowRisky: true,
       input: {
         engineId: 'parakeet',
         payload: {
@@ -3424,10 +3743,9 @@ describe('controlRegistry artifact capability controls', () => {
       }
     })
 
-    const deleted = await useControl({
+    const deleted = await useControlWithApproval({
       userId: 'user-1',
       controlId: 'sys.voice.engine.delete',
-      allowRisky: true,
       input: {
         engineId: 'parakeet'
       }
@@ -3439,5 +3757,205 @@ describe('controlRegistry artifact capability controls', () => {
       engineId: 'parakeet',
       deleted: true
     })
+  })
+})
+
+describe('sys.dm.send delivery modes (SA-114 DL-114-13)', () => {
+  it('offers steer and its fallback field in the schema the model reads', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+    const result = await findControls({
+      query: 'sys.dm.send',
+      includeDraft: true,
+      includeSchema: true,
+      limit: 50
+    })
+    const control = result.results.find((item) => item.controlId === 'sys.dm.send')
+    expect(control).toBeTruthy()
+
+    const properties = (control as any).inputSchema?.properties
+    // A value missing from this enum is a value the model will not send, whatever the
+    // server accepts — the schema the broker hands over IS the offer.
+    expect(properties.deliver.enum).toEqual(['wait', 'wake', 'steer'])
+    // And a mode offered without the field that governs its failure case is half an offer.
+    expect(properties.steer_fallback.enum).toEqual(['wait', 'wake'])
+    expect(control!.schemaHint).toContain('wait | wake | steer')
+    expect(control!.description).toContain('steer')
+  })
+})
+
+/* -------------------------------------------------------------------------- *
+ * SA-117 P2 (DL-117-05) — a control that acts as an agent needs an identity the
+ * server minted.
+ *
+ * This is the acceptance criterion in one place: "a caller holding only the instance token
+ * can no longer read, claim, or close another agent's DMs, recall its memories, or manage
+ * its schedules; it can still do everything the user can through the routes that act as the
+ * user." Before SA-117 every one of these ran, using whatever `agentId` the body named.
+ * -------------------------------------------------------------------------- */
+
+describe('SA-117 DL-117-05: identity-bearing controls', () => {
+  const IDENTITY_BEARING = [
+    'sys.dm.read',
+    'sys.dm.list',
+    'sys.dm.claim',
+    'sys.dm.done',
+    'sys.memory.recall',
+    'sys.memory.search',
+    'sys.schedule.list'
+  ] as const
+
+  it('refuses every identity-bearing family on the service lane, naming the agent or not', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    for (const controlId of IDENTITY_BEARING) {
+      const named = await useControl({
+        userId: 'user-1',
+        controlId,
+        // The exact shape of the old hole: the instance token, plus somebody else's name.
+        agentId: 'agent-faye',
+        actorType: 'service',
+        input: {}
+      })
+
+      expect(named.success, `${controlId} should refuse a named agent`).toBe(false)
+      if (named.success) continue
+      expect(named.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+      expect(named.error.message).toContain('acts as an agent')
+
+      const anonymous = await useControl({
+        userId: 'user-1',
+        controlId,
+        actorType: 'service',
+        input: {}
+      })
+      expect(anonymous.success, `${controlId} should refuse an unnamed caller too`).toBe(false)
+    }
+  })
+
+  it('lets the credential lane, the in-process callers, and the user\'s own session through the same gate', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    for (const actorType of ['agent', 'in-process', 'n8n-callback', 'session'] as const) {
+      const result = await useControl({
+        userId: 'user-1',
+        controlId: 'sys.dm.list',
+        agentId: 'agent-cooper',
+        actorType,
+        input: {}
+      })
+
+      // It may still fail for its OWN reasons (no inbox in this fixture); what must never
+      // happen is the identity refusal.
+      if (!result.success) {
+        expect(result.error.code, `${actorType} must pass the identity gate`).not.toBe(
+          'AGENT_IDENTITY_REQUIRED'
+        )
+      }
+    }
+  })
+
+  it('refuses a caller that declares no lane — the default fails closed (PR #106 review, F-1)', async () => {
+    // `actorType` defaulted to `'unknown'` AND `'unknown'` was vouched, so any caller that
+    // forgot the parameter was silently trusted. The dispatch route's `batshit_tool_use` path
+    // reached `sys.dm.*` exactly that way with only the instance token.
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const omitted = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      agentId: 'agent-cooper',
+      input: {}
+    })
+    expect(omitted.success).toBe(false)
+    if (omitted.success) return
+    expect(omitted.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+
+    const declaredUnknown = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      agentId: 'agent-cooper',
+      actorType: 'unknown',
+      input: {}
+    })
+    expect(declaredUnknown.success).toBe(false)
+    if (declaredUnknown.success) return
+    expect(declaredUnknown.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+  })
+
+  it('lets a signed-in browser act as one of the user\'s own agents (F-P2-4)', async () => {
+    // The dev smoke harness reads and closes DMs as a named agent on the login cookie, and
+    // `/api/dms` and `/api/schedules` already act across every agent on that same cookie. A
+    // session is the user; the user is the authority over the user's agents. The refusal is
+    // for a caller that only HOLDS a token — the instance token or a Portable Skill Token.
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      agentId: 'agent-cooper',
+      actorType: 'session',
+      input: {}
+    })
+
+    if (!result.success) {
+      expect(result.error.code).not.toBe('AGENT_IDENTITY_REQUIRED')
+    }
+  })
+
+  it('refuses a Subagent or Worker run, whose credential is real and names nobody', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      // `subagent_cli_<slug>` — the per-run runtime id, not one of the user's agents.
+      agentId: 'subagent_cli_worker_agent_cooper_1',
+      actorType: 'agent',
+      delegatedRun: true,
+      input: {}
+    })
+
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+    expect(result.error.message).toContain('Subagent or Worker')
+  })
+
+  it('leaves controls that act as the USER alone on the service lane', async () => {
+    const { useControl } = await import('../services/fabricRegistry')
+
+    // The Docker gateway and every other service-token caller keep working for everything
+    // that is "the user's". Only acting AS an agent is closed.
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.runtime_addon.prepare',
+      agentId: 'agent-faye',
+      actorType: 'service',
+      input: { addonId: 'fbx2vrma' }
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  it('classifies the three families and nothing else as acting-as-agent', async () => {
+    const { controlActsAsAgent } = await import('../services/fabricRegistry')
+
+    for (const id of ['sys.dm.send', 'sys.memory.save', 'sys.schedule.create']) {
+      expect(controlActsAsAgent(id), id).toBe(true)
+    }
+    for (const id of [
+      'sys.mcp.use',
+      'sys.artifact.update',
+      'sys.cli_tool.create',
+      'sys.slash_command.upsert',
+      'sys.runtime_addon.start',
+      'artifact.something',
+      '',
+      'dm.read'
+    ]) {
+      expect(controlActsAsAgent(id), id).toBe(false)
+    }
+    expect(controlActsAsAgent(undefined)).toBe(false)
+    expect(controlActsAsAgent(42)).toBe(false)
   })
 })

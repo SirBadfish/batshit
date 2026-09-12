@@ -34,9 +34,10 @@ A few instance-level defaults live in Admin because they apply across the instan
 
 A wake-up is a chat Batshit starts on its own, with nobody typing — one agent asking another to start work now, or an outside program doing the same through a webhook. Full detail in [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 
-Two things live here:
+Three things live here:
 
 - **Allow Wake-ups** — the master switch for this Batshit. Off means nothing can start a chat on its own; every wake-up waits in the recipient's inbox instead, with the reason recorded. Each agent also has its own "May be woken" switch in Agent Settings.
+- **Schedules** — Batshit's own clock: a saved cadence, time zone, and message per agent, fired as a DM at the time you set. This card is also where a run Batshit slept through waits for your Run now or Skip. Full detail in [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 - **Wake-up Webhooks** — one URL and one token per hook, for n8n or any other outside program. Create a hook, pick the agent it writes to, and copy the token **once**: Batshit stores only a fingerprint of it and cannot show it again. Rows show each hook's agent, delivery default, last use, and count, and you can pause a hook, rotate its token, or revoke it.
 
 A hook's recipient needs **Agent DMs** on, not only "May be woken" — a call writes a real DM record, and an agent with DMs off would have no inbox to see it in.

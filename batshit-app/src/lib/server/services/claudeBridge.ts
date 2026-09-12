@@ -43,7 +43,10 @@ import {
   isStdioGateway,
   resolveManagedStdioEnvironmentValues
 } from '$lib/server/services/mcpGatewayStdio'
-import { resolveCliHelperBatshitToken } from '$lib/server/services/cliHelperToken'
+import { mintCliRunCredential } from '$lib/server/services/cliHelperToken'
+import { applyCliRunCredentialToChildEnv } from '$lib/server/services/cliChildEnv'
+import { revokeRunCredential } from '$lib/server/services/agentRunCredentials'
+import { getDockerGatewayAuthToken } from '$lib/server/services/dockerGatewayConfig'
 import {
   buildClaudeChildEnv,
   buildClaudeChildProcessOptions,
@@ -72,7 +75,21 @@ interface ClaudeRunOptions {
   planAllowedTools?: string[]
   allowedDirs?: string[]
   autoAllowTools?: string[]
-  batshitToken?: string | null
+  /**
+   * SA-117 DL-117-06/07 — this run's credential (`<credentialId>.<secret>`), exported to the
+   * child as `BATSHIT_AGENT_TOKEN`. It replaces the instance `BATSHIT_TOKEN`, which
+   * `applyCliRunCredentialToChildEnv` now DELETES from the child environment.
+   */
+  agentRunToken?: string | null
+  /**
+   * SA-117 DL-117-07 — the Docker MCP gateway token this run resolved, if any.
+   *
+   * The Claude lane passes gateway auth to the CLI through `${BATSHIT_MCP_HEADER_*}`
+   * placeholders rather than this variable, so this exists only so the child keeps
+   * `MCP_GATEWAY_AUTH_TOKEN` on a run that HAS a gateway and loses it on one that does not
+   * — the same rule the Codex lane applies. The Codex bridge already carried this field.
+   */
+  dockerAuthToken?: string | null
   managedStdioEnv?: Record<string, string>
   systemPromptMode?: 'default' | 'append' | 'replace' | 'replace_file'
   systemPrompt?: string
@@ -95,6 +112,14 @@ interface ClaudeRunner {
   transport: ClaudeTransport
   events: AsyncGenerator<any>
   cleanup?: () => void | Promise<void>
+  /**
+   * SA-114 P2 (DL-114-08) — write the user's mid-reply words onto the run's open stdin.
+   *
+   * Resolves `true` when the line was written, which is NOT delivery: Claude Code consumes
+   * a queued line between tool calls and only then replays it back on stdout
+   * (`--replay-user-messages`), and that echo is the delivery signal (AMD-114-01).
+   */
+  steer?: (payload: { steerIds: string[]; text: string }) => Promise<boolean>
 }
 
 const PROVIDER_DISABLED_ERROR =
@@ -147,6 +172,27 @@ export function redactClaudeCliArgsForLog(args: string[]) {
   }
 
   return redacted
+}
+
+/**
+ * SA-117 DL-117-07 — the Claude lane's child environment, as one testable function.
+ *
+ * The Codex lane already had `buildCodexChildEnv`; this is its counterpart, extracted so the
+ * "`BATSHIT_TOKEN` absent, `BATSHIT_AGENT_TOKEN` present" claim can be asserted on BOTH lanes
+ * without spawning a CLI. The rule itself lives in `cliChildEnv.ts` and is shared, so the two
+ * lanes cannot drift; this function only supplies the base environment the rule applies to.
+ */
+export function buildClaudeRunChildEnv(
+  options: Pick<ClaudeRunOptions, 'agentRunToken' | 'dockerAuthToken'>,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  identity = resolveClaudeRunAsIdentity(baseEnv)
+): NodeJS.ProcessEnv {
+  const envVars = buildClaudeChildEnv(baseEnv, identity)
+  applyCliRunCredentialToChildEnv(envVars, {
+    agentRunToken: options.agentRunToken,
+    dockerAuthToken: options.dockerAuthToken ?? null
+  })
+  return envVars
 }
 
 export class ClaudeBridge {
@@ -308,7 +354,6 @@ export class ClaudeBridge {
       allowedDirs.add(resolved)
     }
 
-    const batshitToken = await resolveCliHelperBatshitToken(request.userId ?? null)
     const managedStdioEnv =
       configScope === 'managed' && request.userId
         ? await this.resolveManagedStdioEnv(request.userId, request.gatewayToolMap ?? null)
@@ -329,6 +374,55 @@ export class ClaudeBridge {
       model: resolvedModel
     })
 
+    /**
+     * SA-117 DL-117-06 — mint this run's credential, where the instance token used to be
+     * resolved. See `codexBridge.ts` for the full reasoning; the two lanes are deliberately
+     * symmetric, down to the warning and the once-only revoke.
+     */
+    const runCredential =
+      request.userId && request.agentId && request.sessionId
+        ? await mintCliRunCredential({
+            userId: request.userId,
+            agentId: request.agentId,
+            sessionId: request.sessionId,
+            messageId: request.messageId ?? null,
+            runtime: 'claude',
+            delegated: request.delegatedRun === true
+          })
+        : null
+    if (!runCredential) {
+      console.warn(
+        '[ClaudeBridge] No run credential was minted for this run, so its managed helpers ' +
+          'cannot authenticate. Missing: ' +
+          [
+            request.userId ? null : 'userId',
+            request.agentId ? null : 'agentId',
+            request.sessionId ? null : 'sessionId'
+          ]
+            .filter(Boolean)
+            .join(', ')
+      )
+    }
+    const revokeRunCredentialOnce = (() => {
+      let revoked = false
+      return async () => {
+        if (revoked || !runCredential) return
+        revoked = true
+        try {
+          await revokeRunCredential(runCredential.credentialId, {
+            agentId: runCredential.agentId
+          })
+        } catch (error) {
+          console.warn('[ClaudeBridge] Failed to revoke the run credential', error)
+        }
+      }
+    })()
+
+    // SA-117 P2 review (F-P2-6): the mint is the LAST thing before the run options are
+    // built, so nothing that can throw sits between it and the `try` around the spawn —
+    // `resolveManagedStdioEnv` and `resolveContextGuardConfig` used to sit below it, and a
+    // throw there left an orphaned record until the 24 h backstop. Do not insert an awaited
+    // call between here and `runViaCli`.
     const runOptions: ClaudeRunOptions = {
       model: resolvedModel,
       workingDirectory,
@@ -340,7 +434,8 @@ export class ClaudeBridge {
       planAllowedTools,
       allowedDirs: Array.from(allowedDirs),
       autoAllowTools: CLAUDE_AUTO_ALLOW_TOOLS,
-      batshitToken,
+      agentRunToken: runCredential?.token ?? null,
+      dockerAuthToken: getDockerGatewayAuthToken() ?? null,
       managedStdioEnv,
       addDirectories: Array.from(addDirectories),
       systemPromptMode: claudeSettings.systemPromptMode,
@@ -362,7 +457,15 @@ export class ClaudeBridge {
       contextGuard
     }
 
-    const runner = await this.runViaCli(input, runOptions)
+    // SA-117 DL-117-06: a spawn that never produces a stream never reaches the cleanup
+    // below, so the credential is revoked here instead.
+    let runner: Awaited<ReturnType<typeof this.runViaCli>>
+    try {
+      runner = await this.runViaCli(input, runOptions)
+    } catch (error) {
+      await revokeRunCredentialOnce()
+      throw error
+    }
 
     const adapter = new ClaudeEventAdapter({
       request,
@@ -387,6 +490,9 @@ export class ClaudeBridge {
       abortSignal: request.abortSignal,
       adapter,
       cleanup: async () => {
+        // SA-117 DL-117-06: run end is credential end, on every exit — a finished stream, a
+        // Stop (the iterator's `return`), a timeout, or a thrown error.
+        await revokeRunCredentialOnce()
         if (runner.cleanup) await runner.cleanup()
       },
       onFirstChunk: () => {
@@ -404,6 +510,11 @@ export class ClaudeBridge {
       // deprecated fullStream alias so no reader silently diverges.
       stream: wrappedStream,
       fullStream: wrappedStream,
+      // SA-114 P2 (DL-114-08): the running turn's steer channel. send-routed reads it the
+      // moment this call resolves — the child is already spawned by then — and registers it
+      // as the session's steer transport for as long as the turn lives.
+      __steer: runner.steer ?? null,
+      __steerLane: runner.steer ? ('claude' as const) : null,
       __transport: runner.transport,
       __detectToolSource: adapter.getToolMetadataResolver(),
       __rawEvents: adapter.getRawEvents(),
@@ -822,7 +933,12 @@ export class ClaudeBridge {
       '--input-format=stream-json',
       '--output-format=stream-json',
       '--include-partial-messages',
-      '--verbose'
+      '--verbose',
+      // SA-114 P2 (DL-114-08): re-emit stdin user messages on stdout so Batshit can tell
+      // when the CLI actually HANDED a steered line to the model. P0 measured the echo
+      // firing 2-6 ms after the tool result that precedes delivery — at consumption, not at
+      // acceptance — which is the only honest moment to call a steer delivered.
+      '--replay-user-messages'
     ]
 
     if (options.model && !options.model.includes('claude-cli')) {
@@ -898,7 +1014,7 @@ export class ClaudeBridge {
     }
 
     const runAsIdentity = resolveClaudeRunAsIdentity()
-    const envVars = buildClaudeChildEnv(process.env, runAsIdentity)
+    const envVars = buildClaudeRunChildEnv(options, process.env, runAsIdentity)
     const childProcessOptions = buildClaudeChildProcessOptions(runAsIdentity)
     if (typeof options.maxThinkingTokens === 'number' && options.maxThinkingTokens > 0) {
       envVars.MAX_THINKING_TOKENS = String(options.maxThinkingTokens)
@@ -914,9 +1030,6 @@ export class ClaudeBridge {
     }
     if (options.agentId) {
       envVars.BATSHIT_AGENT_ID = options.agentId
-    }
-    if (options.batshitToken) {
-      envVars.BATSHIT_TOKEN = options.batshitToken
     }
     if (options.approvalMode) {
       envVars.BATSHIT_CLAUDE_PERMISSION_MODE = options.approvalMode
@@ -963,9 +1076,39 @@ export class ClaudeBridge {
       signal: options.signal
     })
 
+    // SA-114 P2 (DL-114-08): stdin stays OPEN for the whole run. Closing it after the
+    // prompt is what made Batshit unable to steer at all — the frame the CLI wants was
+    // already right, the pipe was just shut. The run's fence moves to the first `result`
+    // (AMD-114-01), which `createCliEventIterator` owns: P0 measured that with stdin open
+    // the CLI sits waiting after `result` (20.0 s to 45.0 s in scenario A) instead of
+    // exiting, so ending stdin there is now mandatory rather than tidy.
     if (child.stdin) {
       child.stdin.write(`${prompt}\n`)
-      child.stdin.end()
+    }
+
+    const steersAwaitingEcho: Array<{ steerIds: string[]; text: string }> = []
+
+    const steer = async (payload: {
+      steerIds: string[]
+      text: string
+    }): Promise<boolean> => {
+      const stdin = child.stdin
+      if (!stdin || stdin.destroyed || stdin.writableEnded) return false
+      if (child.exitCode !== null || child.killed) return false
+      const line = JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: payload.text }] }
+      })
+      try {
+        stdin.write(`${line}\n`)
+      } catch (error) {
+        console.warn('[ClaudeBridge CLI] Could not write a steer to stdin', error)
+        return false
+      }
+      // Matched by EXACT text when the echo arrives, because `--replay-user-messages`
+      // replays EVERY user line including the turn's original prompt.
+      steersAwaitingEcho.push({ steerIds: [...payload.steerIds], text: payload.text })
+      return true
     }
 
     const rl = readline.createInterface({
@@ -974,7 +1117,13 @@ export class ClaudeBridge {
     })
 
     let stderrBuffer = ''
-    const baseEvents = this.createCliEventIterator(rl, child, () => stderrBuffer, options.signal)
+    const baseEvents = this.createCliEventIterator(
+      rl,
+      child,
+      () => stderrBuffer,
+      options.signal,
+      steersAwaitingEcho
+    )
 
     const guard = options.contextGuard ?? null
     if (guard) {
@@ -1034,7 +1183,8 @@ export class ClaudeBridge {
     return {
       transport: 'cli',
       events,
-      cleanup
+      cleanup,
+      steer
     }
   }
 
@@ -1068,44 +1218,134 @@ export class ClaudeBridge {
     return values
   }
 
+  /**
+   * SA-114 P2 (AMD-114-01) — the run's fence, and the steer echo.
+   *
+   * Two things changed here, and they are the same fact seen from two sides. With stdin
+   * kept open (DL-114-08) the CLI no longer exits after `result`: P0 watched it sit for the
+   * full 25-second grace in scenario A. Worse, a line the CLI had already READ from stdin
+   * but not consumed starts a SECOND turn in the same process after the first `result` —
+   * and scenario C proved that ending stdin at `result` does not prevent it, because the
+   * pipe was closed after the read. So the first `result` is the end of the run: stop
+   * consuming stdout, end stdin, and kill the child outright when a written steer has not
+   * been echoed, which is exactly the state that would produce that second turn. Every
+   * unechoed steer is then promoted server-side (DL-114-07), so nothing typed is lost.
+   *
+   * The echo itself is the delivery signal: `--replay-user-messages` re-emits a stdin user
+   * line when the CLI HANDS it to the model, 2-6 ms after the preceding tool result. It is
+   * matched by exact text and turned into one synthetic event, which the adapter maps to a
+   * `steer` chunk and send-routed writes into the transcript at that position.
+   */
   private async *createCliEventIterator(
     rl: readline.Interface,
     child: import('node:child_process').ChildProcess,
     getStderr: () => string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    steersAwaitingEcho: Array<{ steerIds: string[]; text: string }> = []
   ): AsyncGenerator<any> {
+    let killedAtResult = false
+    /**
+     * F-P2-2 (SA-114 review): captured from the START of the run, never registered after
+     * the loop. The loop now ends at the first `result`, and stdin is ended before that
+     * event is yielded — so the CLI can exit, and `close` can fire, while the consumer still
+     * holds the `result` and this generator is suspended at the yield. A listener added only
+     * after the loop would miss that close and the wait below would never resolve.
+     * Resolve-only on purpose: a consumer that stops pulling at `finish` never awaits this,
+     * and a rejected promise nobody awaits is an unhandled rejection.
+     */
+    const childClosed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.once('close', (code, signal) => resolve({ code, signal }))
+      }
+    )
+    const endStdin = () => {
+      try {
+        if (child.stdin && !child.stdin.destroyed && !child.stdin.writableEnded) {
+          child.stdin.end()
+        }
+      } catch {
+        // The child exited between the check and the call — nothing left to close.
+      }
+    }
+    const matchSteerEcho = (event: any): string[] | null => {
+      if (steersAwaitingEcho.length === 0) return null
+      if (event?.type !== 'user') return null
+      const content = event?.message?.content
+      if (!Array.isArray(content)) return null
+      // A tool result is also a `user` event. Only a replayed steer is text-only.
+      if (content.some((block: any) => block?.type === 'tool_result')) return null
+      const text = content
+        .map((block: any) => (block && typeof block.text === 'string' ? block.text : ''))
+        .join('')
+      if (!text) return null
+      const index = steersAwaitingEcho.findIndex((entry) => entry.text === text)
+      if (index === -1) return null
+      const [matched] = steersAwaitingEcho.splice(index, 1)
+      return matched.steerIds
+    }
+
     try {
       for await (const line of rl) {
         if (!line) continue
+        let parsed: any
         try {
-          const parsed = JSON.parse(line)
-          yield parsed
+          parsed = JSON.parse(line)
         } catch (error) {
           console.error('[ClaudeBridge CLI] Failed to parse event line', error)
+          continue
         }
-      }
-      await new Promise<void>((resolve, reject) => {
-        child.once('close', (code, signal) => {
-          const aborted =
-            abortSignal?.aborted === true ||
-            signal === 'SIGTERM' ||
-            signal === 'SIGKILL' ||
-            code === 143 ||
-            code === 137
 
-          if (code === 0 || aborted) {
-            resolve()
-            return
-          }
+        const echoed = matchSteerEcho(parsed)
+        if (echoed) {
+          yield { type: 'batshit_steer_delivered', steer_ids: echoed }
+        }
 
-          reject(
-            new Error(
-              `Claude CLI exited with code ${code ?? -1}: ${getStderr()?.trim() || 'No stderr output'}`
+        // The fence runs BEFORE the yield, not after it. A consumer that stops pulling on
+        // `result` — which send-routed's loop does, `finish` sets `shouldBreakStream` — would
+        // never resume this generator, so anything written after the yield is code that may
+        // simply not run.
+        const isResult = parsed?.type === 'result'
+        if (isResult) {
+          endStdin()
+          if (steersAwaitingEcho.length > 0) {
+            // A steer the CLI read from stdin but never handed to the model. Left running,
+            // that is the second turn scenario C measured — a whole extra answer appended to
+            // a reply the user already has. The message is not lost: it is still in
+            // Batshit's steer inbox, and the end of the turn promotes it (DL-114-07).
+            killedAtResult = true
+            console.warn(
+              '[ClaudeBridge CLI] Ending the run at `result` with an unconsumed steer; the message is promoted to the next turn',
+              { unechoedSteers: steersAwaitingEcho.length }
             )
-          )
-        })
-      })
+            try {
+              if (child.exitCode === null && !child.killed) child.kill('SIGKILL')
+            } catch {
+              // Already gone.
+            }
+          }
+        }
+
+        yield parsed
+        if (isResult) break
+      }
+      // A killed child's exit code is not a failure to report: the run already produced its
+      // `result` and Batshit ended it on purpose.
+      if (killedAtResult) return
+      const { code, signal } = await childClosed
+      const aborted =
+        abortSignal?.aborted === true ||
+        signal === 'SIGTERM' ||
+        signal === 'SIGKILL' ||
+        code === 143 ||
+        code === 137
+
+      if (code === 0 || aborted) return
+
+      throw new Error(
+        `Claude CLI exited with code ${code ?? -1}: ${getStderr()?.trim() || 'No stderr output'}`
+      )
     } finally {
+      endStdin()
       rl.close()
     }
   }

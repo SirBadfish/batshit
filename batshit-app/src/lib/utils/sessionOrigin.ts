@@ -27,9 +27,28 @@ import { WAKE_SESSION_NAME_MAX_CHARS } from '$lib/utils/dmControl'
 
 export const SESSION_ORIGIN_SCHEMA_VERSION = 1 as const
 
-/** The two v1 sources. A user-typed session has no `origin` block at all. */
-export const SESSION_ORIGIN_KINDS = ['dm', 'webhook'] as const
+/**
+ * The three sources that can start a chat with nobody typing. A user-typed session has no
+ * `origin` block at all.
+ *
+ * SA-115 added `'schedule'`. Every place that reads a kind is a **lookup keyed by kind**
+ * with a neutral fallback, never a binary if/else: the two ternaries that used to live
+ * below would have quietly labelled every schedule "Hook", and the sidebar's icon still
+ * has to learn the same lesson (`SessionItem.svelte`, P2).
+ */
+export const SESSION_ORIGIN_KINDS = ['dm', 'webhook', 'schedule'] as const
 export type SessionOriginKind = (typeof SESSION_ORIGIN_KINDS)[number]
+
+/** What an origin of each kind is called when its own label is missing. */
+const ORIGIN_FALLBACK_LABELS: Record<SessionOriginKind, string> = {
+  dm: 'another agent',
+  webhook: 'a webhook',
+  schedule: 'a schedule'
+}
+
+function fallbackLabelFor(kind: SessionOriginKind): string {
+  return ORIGIN_FALLBACK_LABELS[kind] ?? 'Batshit'
+}
 
 export interface SessionOrigin {
   version: typeof SESSION_ORIGIN_SCHEMA_VERSION
@@ -40,6 +59,8 @@ export interface SessionOrigin {
   agentId?: string
   dmId?: string
   hookId?: string
+  /** The schedule that fired, for `kind: 'schedule'`. */
+  scheduleId?: string
   at: string
   /** How deep in a wake chain this session sits. 0 means a human or a webhook started it. */
   chainDepth: number
@@ -75,7 +96,7 @@ export function resolveSessionOrigin(session: unknown): SessionOrigin | null {
   return {
     version: SESSION_ORIGIN_SCHEMA_VERSION,
     kind: kind as SessionOriginKind,
-    label: readTrimmed(record.label) ?? (kind === 'dm' ? 'another agent' : 'a webhook'),
+    label: readTrimmed(record.label) ?? fallbackLabelFor(kind as SessionOriginKind),
     ...(readTrimmed(record.agentId ?? record.agent_id)
       ? { agentId: readTrimmed(record.agentId ?? record.agent_id)! }
       : {}),
@@ -84,6 +105,9 @@ export function resolveSessionOrigin(session: unknown): SessionOrigin | null {
       : {}),
     ...(readTrimmed(record.hookId ?? record.hook_id)
       ? { hookId: readTrimmed(record.hookId ?? record.hook_id)! }
+      : {}),
+    ...(readTrimmed(record.scheduleId ?? record.schedule_id)
+      ? { scheduleId: readTrimmed(record.scheduleId ?? record.schedule_id)! }
       : {}),
     at: readTrimmed(record.at) ?? '',
     chainDepth
@@ -101,16 +125,18 @@ export function buildSessionOrigin(input: {
   agentId?: string | null
   dmId?: string | null
   hookId?: string | null
+  scheduleId?: string | null
   chainDepth: number
   now?: Date
 }): SessionOrigin {
   return {
     version: SESSION_ORIGIN_SCHEMA_VERSION,
     kind: input.kind,
-    label: input.label.trim().slice(0, 120) || (input.kind === 'dm' ? 'another agent' : 'a webhook'),
+    label: input.label.trim().slice(0, 120) || fallbackLabelFor(input.kind),
     ...(readTrimmed(input.agentId) ? { agentId: readTrimmed(input.agentId)! } : {}),
     ...(readTrimmed(input.dmId) ? { dmId: readTrimmed(input.dmId)! } : {}),
     ...(readTrimmed(input.hookId) ? { hookId: readTrimmed(input.hookId)! } : {}),
+    ...(readTrimmed(input.scheduleId) ? { scheduleId: readTrimmed(input.scheduleId)! } : {}),
     at: (input.now ?? new Date()).toISOString(),
     chainDepth: Math.max(0, Math.floor(input.chainDepth))
   }
@@ -118,14 +144,30 @@ export function buildSessionOrigin(input: {
 
 /** Sidebar pill tooltip and chat banner text — one wording, used by both surfaces. */
 export function describeSessionOrigin(origin: SessionOrigin): string {
-  return origin.kind === 'dm'
-    ? `Started by a DM from ${origin.label}`
-    : `Started by webhook "${origin.label}"`
+  switch (origin.kind) {
+    case 'dm':
+      return `Started by a DM from ${origin.label}`
+    case 'webhook':
+      return `Started by webhook "${origin.label}"`
+    case 'schedule':
+      return `Started by the "${origin.label}" schedule`
+    default:
+      return 'Started by Batshit'
+  }
 }
 
 /** The icon-only sidebar pill's short label. */
 export function sessionOriginPillLabel(origin: SessionOrigin): string {
-  return origin.kind === 'dm' ? 'DM' : 'Hook'
+  switch (origin.kind) {
+    case 'dm':
+      return 'DM'
+    case 'webhook':
+      return 'Hook'
+    case 'schedule':
+      return 'Clock'
+    default:
+      return 'Auto'
+  }
 }
 
 /** DL-113-08: a meaningful auto-name instead of a bare timestamp. */
@@ -134,14 +176,20 @@ export function buildWokenSessionName(input: {
   label: string
   subject?: string | null
 }): string {
-  const label = input.label.trim() || (input.kind === 'dm' ? 'another agent' : 'a webhook')
+  const label = input.label.trim() || fallbackLabelFor(input.kind)
   const subject = readTrimmed(input.subject)
-  const name =
-    input.kind === 'dm'
-      ? subject
-        ? `DM from ${label}: ${subject}`
-        : `DM from ${label}`
-      : `Webhook: ${label}`
+  let name: string
+  switch (input.kind) {
+    case 'dm':
+      name = subject ? `DM from ${label}: ${subject}` : `DM from ${label}`
+      break
+    case 'schedule':
+      name = `Schedule: ${label}`
+      break
+    default:
+      name = `Webhook: ${label}`
+      break
+  }
   return name.length > WAKE_SESSION_NAME_MAX_CHARS
     ? `${name.slice(0, WAKE_SESSION_NAME_MAX_CHARS - 1).trimEnd()}…`
     : name

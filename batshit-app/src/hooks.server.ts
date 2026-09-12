@@ -10,6 +10,7 @@ import {
 import { removeRetiredSystemClips } from '$lib/server/services/retiredSystemClips'
 import { ensureMemoryIndexes } from '$lib/server/services/memory/memoryIndex'
 import { startMemoryDreamingScheduler } from '$lib/server/services/memory/memoryDreamingScheduler'
+import { startScheduleTicker } from '$lib/server/services/schedules/scheduleTicker'
 import { ensureMemoryMediaMigration } from '$lib/server/services/memory/memoryMediaMigration'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
 import { assertApiKeyEncryptionConfigured } from '$lib/services/encryption.server'
@@ -164,6 +165,11 @@ function ensureStartupIntegrityPass() {
       // SA-104 P7: the between-conversation dreaming scheduler (DL-104-15). Arms on
       // the first request after boot; each pass re-checks eligibility and live turns.
       startMemoryDreamingScheduler()
+      // SA-115 P1: Batshit's clock (DL-115-06). Same arming point and the same reason it
+      // works with no tab open — the Mac supervisor and the Docker healthcheck both poll
+      // this server forever. A due-while-off schedule is collapsed by the first sweep,
+      // never fired, so nothing starts an agent turn just because Batshit booted.
+      startScheduleTicker()
     })()
   }
   return startupIntegrityPromise ?? Promise.resolve()

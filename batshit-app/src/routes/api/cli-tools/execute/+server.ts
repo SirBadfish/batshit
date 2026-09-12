@@ -1,7 +1,10 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 
 import { executeCliTool } from '$lib/server/services/cliToolRegistry'
+import { resolveApprovalCardTarget } from '$lib/server/services/controlApprovals'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
+import { bindActingSessionId } from '$lib/server/services/actingAgentIdentity'
 
 interface ExecuteRequest {
   userId?: string
@@ -11,6 +14,15 @@ interface ExecuteRequest {
   selectedToolIds?: string[]
   allowRisky?: boolean
   projectPath?: unknown
+  /**
+   * SA-116 DL-116-07/DL-116-14 — the chat and the assistant message a pause pins its card
+   * to. The managed CLI helper forwards both from `BATSHIT_SESSION_ID` /
+   * `BATSHIT_MESSAGE_ID`; both are verified against this user before they are used, so a
+   * risky user-authored CLI tool gets the same Approve button a risky Fabric control does
+   * instead of a pause with nowhere to render.
+   */
+  sessionId?: unknown
+  messageId?: unknown
 }
 
 export const POST: RequestHandler = async ({ locals, request }) => {
@@ -35,14 +47,32 @@ export const POST: RequestHandler = async ({ locals, request }) => {
         ? body.projectPath.trim()
         : null
 
+    // SA-117 DL-117-04: the bound agent and the bound session win on the agent lane.
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json({ error: agentBinding.message, code: agentBinding.code }, { status: 400 })
+    }
+
+    const { sessionId, messageId } = await resolveApprovalCardTarget({
+      userId,
+      sessionId: bindActingSessionId(auth, body.sessionId),
+      messageId: body.messageId
+    })
+
     const result = await executeCliTool({
       userId,
-      agentId: body.agentId ?? null,
+      agentId: agentBinding.agentId ?? null,
+      sessionId,
+      messageId,
       toolId: body.toolId,
       input: body.input ?? {},
       selectedToolIds: body.selectedToolIds,
       allowRisky: body.allowRisky === true,
-      projectPath: auth.auth === 'service' ? bodyProjectPath : null
+      // PR #106 review F-5: the lane decides where the approval card lands.
+      actorType: auth.auth,
+      // SA-117: the managed CLI helper moved from the service lane to the agent lane and
+      // still sends the run's project path, so the agent lane reads it the same way.
+      projectPath: auth.auth === 'service' || auth.auth === 'agent' ? bodyProjectPath : null
     })
 
     return json(result, { status: result.success ? 200 : result.code === 'NOT_FOUND' ? 404 : 200 })

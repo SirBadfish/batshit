@@ -10,6 +10,7 @@ import { env } from '$env/dynamic/private'
 import { z } from 'zod'
 import type { AgentDcmDisplaySettings, MCPToolSelections } from '$lib/types/database'
 import type { ToolApprovalMode } from '$lib/types/tool-approvals'
+import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import { redis } from '$lib/server/redis'
 import {
   getInternalBatshitServerUrl,
@@ -20,6 +21,7 @@ import { resolveDynamicMcpGatewayScope } from './mcpSelectionResolver'
 import {
   executeCliTool,
   findCliTools,
+  getCliTool,
   resolveCliToolSelectionScope
 } from './cliToolRegistry'
 import { mapBashCommandToRendererTool } from './bashCommandMapper'
@@ -36,7 +38,20 @@ import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import { WORKERS_MAX_PER_CALL } from '$lib/utils/delegationCapabilities'
 import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
-import { findControls, useControl, type ControlRuntimeMode, type ControlUseErrorCode } from './fabricRegistry'
+import {
+  findControls,
+  resolveControlRiskProfile,
+  useControl,
+  type ControlRuntimeMode,
+  type ControlActorType,
+  type ControlUseErrorCode
+} from './fabricRegistry'
+import {
+  hasScopedRiskWindow,
+  type ControlApprovalGrant,
+  type ControlApprovalRiskLevel
+} from './controlApprovals'
+import { resolveWokenTurnState } from './dm/wokenTurn'
 import {
   DEFAULT_DYNAMIC_MCP_RESULTS,
   MAX_DYNAMIC_MCP_RESULTS,
@@ -208,6 +223,8 @@ export interface NativeToolContext {
   memoryControlsEnabled?: boolean
   /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. Default false. */
   dmControlsEnabled?: boolean
+  /** SA-115 P2 (DL-115-10): PRIMARY actor + agent `dms_enabled`. Default false. */
+  scheduleControlsEnabled?: boolean
   projectPath?: string | null
   providerSettings?: Record<string, any> | null
   toolApprovalMode?: ToolApprovalMode
@@ -230,6 +247,32 @@ export interface NativeToolContext {
    * deliberately fail-closed, because a subagent or worker run that inherited this would
    * break the depth-1 rule (DL-111-12). Only a primary-agent send sets `enabled: true`.
    */
+  /**
+   * SA-116 P2 (DL-116-05, F-P1-4) — what the user actually clicked, resolved by send-routed
+   * from SERVER state before this run started.
+   *
+   * Keyed by the AI SDK `toolCallId` of the paused call, because that is the one identifier
+   * the SDK hands back to `execute` on the resume. Plain objects, not Maps: this crosses the
+   * brain-request boundary as data.
+   *
+   * `approved` carries the `apr_…` record id to spend. It is never read from model input and
+   * never from anything the browser posts — send-routed re-reads the persisted assistant
+   * message to build it (F-P1-4), so an id a client can choose cannot name which consent
+   * record gets spent.
+   */
+  controlApprovals?: {
+    approved?: Record<string, ControlApprovalGrant> | null
+    denied?: Record<string, { controlTitle?: string | null }> | null
+  } | null
+  /**
+   * SA-116 P2 (DL-116-10) — true for a group member's turn.
+   *
+   * A group member run never registers the risk-approval policy. The group loop never reads
+   * or writes `toolApprovals` and the client's resume POST is single-agent, so a card raised
+   * mid-group would be persisted and then abandoned as the next speaker starts. The gate in
+   * `controlApprovals.ts` refuses the control outright with a reason instead.
+   */
+  groupMemberRun?: boolean
   workers?: {
     enabled: boolean
     /** The parent turn's message id — the key the 9-runs-per-turn cap counts against. */
@@ -1248,7 +1291,14 @@ function normalizeBatshitToolUsePayload(input: BatshitToolUseInput): Record<stri
     'execution_backend',
     'agentBrowserSettings',
     'gatewayToolsCache',
-    'executeControlUse'
+    'executeControlUse',
+    // SA-117 / PR #106 review F-1: the lane and the delegated flag are server-set plumbing
+    // too — leaving them out of this list shipped `actorType` into every MCP tool's input.
+    'actorType',
+    'delegatedRun',
+    // SA-116 P2: server-set plumbing, never part of a control's payload. Missing this
+    // shipped `approvalGrant: null` into every artifact control's input.
+    'approvalGrant'
   ])
   const topLevel = Object.fromEntries(
     Object.entries(input).filter(([key, value]) => !knownKeys.has(key) && value !== undefined)
@@ -5981,8 +6031,12 @@ async function nativeCliToolUse(input: {
   toolId: string
   cliInput?: Record<string, any>
   allowRisky?: boolean
+  /** SA-116 DL-116-14 — the same server-owned approval a Fabric control spends. */
+  approval?: ControlApprovalGrant | null
   projectPath?: string | null
   selectedCliToolIds?: string[]
+  /** PR #106 review F-5 — the caller's lane, so the CLI-tool card lands where it can be clicked. */
+  actorType?: ControlActorType
 }): Promise<Record<string, any>> {
   const toolId = input.toolId.trim()
   const cliInput =
@@ -5998,7 +6052,9 @@ async function nativeCliToolUse(input: {
     input: cliInput,
     selectedToolIds: input.selectedCliToolIds,
     allowRisky: input.allowRisky === true,
-    projectPath: input.projectPath ?? null
+    approval: input.approval ?? null,
+    projectPath: input.projectPath ?? null,
+    actorType: input.actorType
   })
 }
 
@@ -6480,6 +6536,23 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
   executionBackend?: NativeExecutionBackend
   agentBrowserSettings?: Parameters<typeof nativeAgentBrowserUse>[0]['settings']
   gatewayToolsCache?: GatewayToolsCache
+  /**
+   * SA-116 P2 — the server-owned approval this call is spending, or null.
+   *
+   * Set ONLY from send-routed's resume, matched on the SDK `toolCallId`. Never from model
+   * input: `allowRisky` reaches this function too and is ignored by the gate on every lane
+   * but a Portable Skill Token.
+   */
+  approvalGrant?: ControlApprovalGrant | null
+  /**
+   * SA-117 / PR #106 review F-1 — which lane the caller authenticated on, handed to
+   * `useControl`'s identity gate. The dispatch route passes what `resolveNativeToolUser`
+   * returned (so a service-token caller is refused `sys.dm.*` here exactly as it is on
+   * `/api/controls/use`); the in-process broker passes `'in-process'`. Never defaulted here.
+   */
+  actorType: ControlActorType
+  /** SA-117 F-P2-1 — the call arrived on a Subagent or Worker run's credential. */
+  delegatedRun?: boolean
   executeControlUse?: (
     controlInput: ControlUseInput,
     allowedControlIds: string[]
@@ -6522,8 +6595,10 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       toolId: parsed.target,
       cliInput: payload,
       allowRisky: input.allowRisky === true,
+      approval: input.approvalGrant ?? null,
       projectPath: input.projectPath ?? null,
-      selectedCliToolIds: input.selectedCliToolIds
+      selectedCliToolIds: input.selectedCliToolIds,
+      actorType: input.actorType
     })
   } else if (parsed.family === 'artifact' || parsed.family === 'fabric') {
     const controlInput: ControlUseInput = {
@@ -6577,6 +6652,9 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
             input: normalizeNativeControlUseInput(controlInput as Record<string, any>),
             dryRun: input.dryRun === true,
             allowRisky: input.allowRisky === true,
+            approval: input.approvalGrant ?? undefined,
+            actorType: input.actorType,
+            delegatedRun: input.delegatedRun === true,
             selectedGateways: input.selectedGateways,
             allowedControlIds
           })
@@ -6857,35 +6935,56 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
               ? (errorObject as any).code
               : null
         const details = (errorObject as any).details
-        const retryPayload =
-          (output as any).retryPayload && typeof (output as any).retryPayload === 'object'
-            ? (output as any).retryPayload
-            : null
+        const approvalIdFromDetails =
+          details && typeof details === 'object' && typeof (details as any).approvalId === 'string'
+            ? (details as any).approvalId.trim()
+            : ''
+        /**
+         * SA-116 F-P1-3 — the runtime hint and the gate are ONE contract.
+         *
+         * This string used to say "immediately retry this same ref with allowRisky: true",
+         * directly under the pause text that says "Do not retry it yourself". Two
+         * contradictory instructions in one tool result, and the moment a card exists the
+         * old sentence sends the model into a retry loop, each retry minting another
+         * pending record. DL-116-13's seven skill texts are P4's; this one runtime string
+         * moved to P2 because P2 is what makes the card real.
+         */
+        // PR #106 review F-6: a `cli:` ref's pause carries its request at the top level and
+        // answers `REQUIRES_APPROVAL`, so both are read here or the managed CLI lanes' hint
+        // ("retry after the resume turn") never fired for a CLI tool.
+        const approvalRequestFromDetails =
+          details && typeof details === 'object' && (details as any).approvalRequest
+            ? ((details as any).approvalRequest as Record<string, any>)
+            : (output as any).approvalRequest && typeof (output as any).approvalRequest === 'object'
+              ? ((output as any).approvalRequest as Record<string, any>)
+              : null
         const approvalHint =
-          code === 'CONTROL_RISK_REQUIRES_APPROVAL'
+          code === 'CONTROL_RISK_REQUIRES_APPROVAL' || code === 'REQUIRES_APPROVAL'
             ? [
                 '',
                 'approval_hint:',
-                'If the user approved this action, immediately retry this same ref with allowRisky: true.',
-                'Use the same payload bytes. You may omit input to reuse the cached payload for this turn.',
+                // DL-116-13: the wording lives in `controlApprovalPresentation.ts` so the
+                // gate's refusal and this hint are one string, and so a test can reach it.
+                // It is lane-aware because "do not retry" is true on the API lane and
+                // WRONG on the managed CLI lanes, where the model's own retry after the
+                // resume turn is what runs the control.
+                ...buildControlApprovalPauseGuidance({
+                  lane:
+                    typeof approvalRequestFromDetails?.lane === 'string'
+                      ? approvalRequestFromDetails.lane
+                      : null,
+                  controlTitle:
+                    typeof approvalRequestFromDetails?.controlTitle === 'string'
+                      ? approvalRequestFromDetails.controlTitle
+                      : target,
+                  approvalId: approvalIdFromDetails
+                }),
                 ...(target === 'sys.voice.engine.complete_local_setup'
                   ? [
-                      'Do not switch to sys.voice.engine.register / update / health_check / enable or ad-hoc bash just because this confirm gate fired.',
-                      'Retry sys.voice.engine.complete_local_setup itself so the helper keeps ownership of TTS/STT launch, readiness, smoke, registration, and enablement.'
+                      'Do not switch to sys.voice.engine.register / update / health_check / enable or ad-hoc bash just because this approval gate fired.',
+                      'sys.voice.engine.complete_local_setup keeps ownership of TTS/STT launch, readiness, smoke, registration, and enablement.'
                     ]
                   : [])
-              ]
-            : []
-        // SA-113 F-SEC-1: the ONE case where `allowRisky` is not the answer. Without this
-        // the `approval_hint` reflex — retry with allowRisky — sends the model into a loop
-        // against a gate that ignores the flag on purpose.
-        const humanTurnHint =
-          code === 'CONTROL_RISK_NEEDS_HUMAN_TURN'
-            ? [
-                '',
-                'human_turn_hint:',
-                'Do NOT retry with allowRisky: true. Batshit refuses risky controls in a chat a DM or a webhook started, and the flag is ignored here.',
-                'Say what you need and why, leave the item open, and stop. Once the user replies in THIS chat, the same ref works normally.'
               ]
             : []
         const promptHint =
@@ -6904,10 +7003,8 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
             ...(code ? [`code: ${code}`] : []),
             `message: ${error}`,
             ...(details !== undefined ? ['', 'details:', stringifyBatshitToolModelValue(details)] : []),
-            ...(retryPayload ? ['', 'retry_payload:', stringifyBatshitToolModelValue(retryPayload)] : []),
             ...approvalHint,
-            ...humanTurnHint,
-            ...promptHint
+              ...promptHint
           ].join('\n')
         }
       }
@@ -6915,9 +7012,6 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
       const text = [
         `batshit_tool_use succeeded: ${ref}`,
         `family: ${family}`,
-        ...((output as any).retryPayloadReused === true
-          ? ['retry_payload: reused cached payload for this allowRisky retry.']
-          : []),
         '',
         'result:',
         JSON.stringify(output, null, 2)
@@ -9597,7 +9691,11 @@ function resolveNativeAutomationToggleState(
 function resolveBatshitToolBrokerFamiliesForAutomation(
   settings: ResolvedNativeToolSettings,
   context: NativeAutomationDispatchContext,
-  options?: { memoryControlsEnabled?: boolean; dmControlsEnabled?: boolean }
+  options?: {
+    memoryControlsEnabled?: boolean
+    dmControlsEnabled?: boolean
+    scheduleControlsEnabled?: boolean
+  }
 ): BatshitToolFamily[] {
   const families: BatshitToolFamily[] = []
   if (settings.dynamicMcpEnabled) families.push('mcp')
@@ -9628,6 +9726,14 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
     settings.batshitToolsEnabled &&
     context.actor_type === 'primary' &&
     options?.dmControlsEnabled === true
+  ) {
+    if (!families.includes('fabric')) families.push('fabric')
+  }
+  // SA-115 P2: the schedule family opens `fabric` under the same conditions.
+  if (
+    settings.batshitToolsEnabled &&
+    context.actor_type === 'primary' &&
+    options?.scheduleControlsEnabled === true
   ) {
     if (!families.includes('fabric')) families.push('fabric')
   }
@@ -10229,7 +10335,7 @@ function buildNativeAutomationResult(params: {
   }
 }
 
-function mapControlUseErrorToNativeAutomationErrorCode(
+export function mapControlUseErrorToNativeAutomationErrorCode(
   code: ControlUseErrorCode | undefined
 ): NativeAutomationErrorCode {
   switch (code) {
@@ -10238,15 +10344,47 @@ function mapControlUseErrorToNativeAutomationErrorCode(
     case 'CONTROL_NOT_EXECUTABLE':
       return 'INVALID_INPUT'
     case 'CONTROL_NOT_ALLOWED':
-    case 'CONTROL_RISK_REQUIRES_APPROVAL':
-    // Same reason as the HTTP status mapping: a woken turn's refusal is policy, and
+    // Same reason as the HTTP status mapping: a pause and a group refusal are policy, and
     // `BACKEND_UNAVAILABLE` reads to the model as "the server is down, try again".
-    case 'CONTROL_RISK_NEEDS_HUMAN_TURN':
+    // SA-116 retired `CONTROL_RISK_NEEDS_HUMAN_TURN` and kept the rule for both successors.
+    case 'CONTROL_RISK_REQUIRES_APPROVAL':
+    case 'CONTROL_RISK_UNAVAILABLE_IN_GROUP':
+    // SA-117 DL-117-05 (PR #106 review, F-11): "this lane cannot act as an agent" is policy
+    // too — a retry can never satisfy it.
+    case 'AGENT_IDENTITY_REQUIRED':
       return 'POLICY_BLOCKED'
     case 'CONTROL_EXECUTION_FAILED':
     default:
       return 'BACKEND_UNAVAILABLE'
   }
+}
+
+/**
+ * PR #106 review F-11 — ONE map for a failed broker call, so a code the broker adds later is
+ * forgotten in one place rather than three.
+ *
+ * The broker answers with its own short codes (`NOT_FOUND`, `INPUT_VALIDATION_FAILED`,
+ * `POLICY_BLOCKED`, `OUT_OF_SCOPE`, `REQUIRES_APPROVAL`, `UNAVAILABLE_IN_GROUP`) and, for a
+ * Fabric control, carries the control's own `error.code` underneath. Both spell policy the
+ * same way here.
+ */
+export function mapBrokerFailureToNativeAutomationErrorCode(failed: unknown): NativeAutomationErrorCode {
+  const result = (failed && typeof failed === 'object' ? failed : {}) as { code?: unknown; error?: unknown }
+  const brokerCode = typeof result.code === 'string' ? result.code : null
+  if (brokerCode === 'NOT_FOUND' || brokerCode === 'INPUT_VALIDATION_FAILED') return 'INVALID_INPUT'
+  if (
+    brokerCode === 'POLICY_BLOCKED' ||
+    brokerCode === 'OUT_OF_SCOPE' ||
+    brokerCode === 'REQUIRES_APPROVAL' ||
+    brokerCode === 'UNAVAILABLE_IN_GROUP'
+  ) {
+    return 'POLICY_BLOCKED'
+  }
+  const controlCode =
+    result.error && typeof result.error === 'object' && typeof (result.error as any).code === 'string'
+      ? ((result.error as any).code as ControlUseErrorCode)
+      : undefined
+  return controlCode ? mapControlUseErrorToNativeAutomationErrorCode(controlCode) : 'BACKEND_UNAVAILABLE'
 }
 
 type NonInteractiveAutomationBashPolicyResult =
@@ -10321,6 +10459,14 @@ export async function dispatchNativeAutomationPackAction(input: {
   payloadInput: unknown
   context: unknown
   projectPath?: string | null
+  /**
+   * SA-117 / PR #106 review F-1 — the lane `/api/native-tools/dispatch` authenticated on.
+   * Reaches `useControl`'s identity gate through `batshit_tool_use` and `artifact_use`, so a
+   * service-token caller cannot act as an agent through this door either. Omitted means
+   * `'unknown'`, which that gate refuses.
+   */
+  actorType?: ControlActorType
+  delegatedRun?: boolean
 }): Promise<NativeAutomationDispatchResult> {
   const parsedAction = parseNativeAutomationAction(input.action)
   if (!parsedAction.ok) {
@@ -10470,9 +10616,12 @@ export async function dispatchNativeAutomationPackAction(input: {
     // SA-113 P2: the Agent DM family, gated the same way — PRIMARY actors only, per-agent.
     const brokerDmControlsEnabled =
       context.actor_type === 'primary' && resolveAgentDmsEnabled(agentRecord)
+    // SA-115 P2: the schedule family, on the same per-agent switch as DMs.
+    const brokerScheduleControlsEnabled = brokerDmControlsEnabled
     const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context, {
       memoryControlsEnabled: brokerMemoryControlsEnabled,
-      dmControlsEnabled: brokerDmControlsEnabled
+      dmControlsEnabled: brokerDmControlsEnabled,
+      scheduleControlsEnabled: brokerScheduleControlsEnabled
     })
     // SA-096 P4: same source as mode 3 registration and the DCM capability index's Fabric
     // count. This lane keeps its own actor/mode conditions, expressed as the two flags.
@@ -10491,7 +10640,8 @@ export async function dispatchNativeAutomationPackAction(input: {
           context.actor_type === 'primary' &&
           (context.mode === 'mode3' || context.mode === 'mode4'),
         memoryControlsEnabled: brokerMemoryControlsEnabled,
-        dmControlsEnabled: brokerDmControlsEnabled
+        dmControlsEnabled: brokerDmControlsEnabled,
+        scheduleControlsEnabled: brokerScheduleControlsEnabled
       })
     )
     const brokerSelectedGateways =
@@ -10545,6 +10695,8 @@ export async function dispatchNativeAutomationPackAction(input: {
       const result = await nativeBatshitToolUse({
         ...(parsedInput.value as BatshitToolUseInput),
         userId: input.userId,
+        actorType: input.actorType ?? 'unknown',
+        delegatedRun: input.delegatedRun === true,
         agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
         agentMetadata: context.actor_type === 'subagent' ? subagentRecord ?? null : null,
         sessionId: context.session_id,
@@ -10573,15 +10725,7 @@ export async function dispatchNativeAutomationPackAction(input: {
           backend,
           context,
           error: {
-            code:
-              result.code === 'NOT_FOUND' || result.code === 'INPUT_VALIDATION_FAILED'
-                ? 'INVALID_INPUT'
-                : result.code === 'POLICY_BLOCKED' ||
-                    result.code === 'OUT_OF_SCOPE' ||
-                    result.code === 'REQUIRES_APPROVAL' ||
-                    result.error?.code === 'CONTROL_RISK_REQUIRES_APPROVAL'
-                  ? 'POLICY_BLOCKED'
-                  : 'BACKEND_UNAVAILABLE',
+            code: mapBrokerFailureToNativeAutomationErrorCode(result),
             message:
               typeof result.error === 'string'
                 ? result.error
@@ -10787,6 +10931,7 @@ export async function dispatchNativeAutomationPackAction(input: {
         : null
     const result = await nativeCliToolUse({
       userId: input.userId,
+      actorType: input.actorType ?? 'unknown',
       agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
       sessionId: context.session_id,
       toolId: parsedInput.value.toolId,
@@ -10805,12 +10950,7 @@ export async function dispatchNativeAutomationPackAction(input: {
         backend,
         context,
         error: {
-          code:
-            result.code === 'NOT_FOUND' || result.code === 'INPUT_VALIDATION_FAILED'
-              ? 'INVALID_INPUT'
-              : result.code === 'POLICY_BLOCKED' || result.code === 'OUT_OF_SCOPE' || result.code === 'REQUIRES_APPROVAL'
-                ? 'POLICY_BLOCKED'
-                : 'BACKEND_UNAVAILABLE',
+          code: mapBrokerFailureToNativeAutomationErrorCode(result),
           message: result.error,
           details: {
             toolId: parsedInput.value.toolId,
@@ -10947,6 +11087,8 @@ export async function dispatchNativeAutomationPackAction(input: {
       dryRun: parsedInput.value.dryRun,
       allowRisky: parsedInput.value.allowRisky,
       runtimeMode: context.mode,
+      actorType: input.actorType ?? 'unknown',
+      delegatedRun: input.delegatedRun === true,
       allowedControlIds: Array.from(ARTIFACT_RUNTIME_ALLOWED_CONTROL_IDS)
     })
 
@@ -11406,6 +11548,211 @@ export function normalizeNativeControlUseInput(
   return Object.keys(mergedInput).length > 0 ? mergedInput : undefined
 }
 
+/* ------------------------------------------------------------------ *
+ * SA-116 P2 (DL-116-05, DL-116-14, AMD-116-01/02, F-P1-2) — the broker risk resolver
+ * ------------------------------------------------------------------ */
+
+/**
+ * What a risky broker call would pause on, resolved from the model's raw tool input.
+ *
+ * ONE resolver serves both halves of the API lane, and it has to, because they must agree
+ * byte for byte:
+ *
+ *  - `needsBrokerRiskApproval` — the AI SDK `toolApproval` policy, which answers before
+ *    `execute` runs and therefore before anything is written.
+ *  - send-routed's finish path — which creates the ONE pending record per approval id where
+ *    the card entry is persisted (AMD-116-01: the SDK re-asks the policy on the approval
+ *    resume, so a policy that wrote would write twice for one call).
+ *
+ * `input` is the object the gate will hash. It is built with the SAME normalizers the
+ * execute path uses, because `consumeApproval` matches on that hash: a record created from
+ * a differently-shaped payload would never match the call it was raised for, and every
+ * Approve click would silently earn a second card.
+ */
+export interface BrokerRiskApprovalTarget {
+  ref: string
+  family: BatshitToolFamily
+  controlId: string
+  controlTitle: string
+  riskLevel: Exclude<ControlApprovalRiskLevel, 'safe'>
+  scopeKey: string | null
+  input: Record<string, any>
+  lane: 'api'
+}
+
+function readBrokerRefInput(raw: unknown): {
+  ref: string
+  dryRun: boolean
+  payload: Record<string, any>
+} | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const record = raw as Record<string, any>
+  const ref = typeof record.ref === 'string' ? record.ref.trim() : ''
+  if (!ref) return null
+  return {
+    ref,
+    dryRun: record.dryRun === true || record.dry_run === true,
+    payload: normalizeBatshitToolUsePayload(record as BatshitToolUseInput)
+  }
+}
+
+export async function resolveBrokerRiskApprovalTarget(options: {
+  userId: string
+  agentId?: string | null
+  /** The model's raw `native_batshit_tool_use` input: `{ ref, input, dryRun, … }`. */
+  input: unknown
+  /** Absent means "do not narrow" — the persist path trusts the pause the policy already made. */
+  allowedFamilies?: BatshitToolFamily[] | null
+  fabricAllowedControlIds?: string[] | null
+  selectedCliToolIds?: string[] | null
+}): Promise<BrokerRiskApprovalTarget | null> {
+  const parsedInput = readBrokerRefInput(options.input)
+  if (!parsedInput) return null
+
+  // F-P1-2: a dry run validates and runs nothing, so it never pauses. Without this the
+  // model's own preflight ("dry-run, then ask") costs the user two clicks for one action.
+  if (parsedInput.dryRun) return null
+
+  let parsed: { family: BatshitToolFamily; target: string }
+  try {
+    parsed = parseBatshitToolRef(parsedInput.ref)
+  } catch {
+    return null
+  }
+
+  // AMD-116-02: scope first. A family the actor cannot use never reaches a control, so
+  // pausing it would spend a click and a turn on a call that answers OUT_OF_SCOPE anyway.
+  if (Array.isArray(options.allowedFamilies) && !options.allowedFamilies.includes(parsed.family)) {
+    return null
+  }
+
+  if (parsed.family === 'cli') {
+    const toolId = parsed.target.trim()
+    if (!toolId) return null
+    if (
+      Array.isArray(options.selectedCliToolIds) &&
+      !options.selectedCliToolIds.includes(toolId)
+    ) {
+      return null
+    }
+    let record: Awaited<ReturnType<typeof getCliTool>> = null
+    try {
+      record = await getCliTool(options.userId, toolId)
+    } catch (error) {
+      console.warn('[NativeTools] Could not read a CLI tool for the risk policy:', error)
+      return null
+    }
+    if (!record || record.status !== 'active' || record.riskLevel === 'safe') return null
+    return {
+      ref: parsedInput.ref,
+      family: 'cli',
+      // DL-116-14: the same namespaced id `executeCliTool` gates on, so a user-named tool
+      // cannot spend a click meant for the Fabric control of that name.
+      controlId: `cli_tool:${record.toolId}`,
+      controlTitle: record.title,
+      riskLevel: record.riskLevel,
+      scopeKey: null,
+      input: parsedInput.payload,
+      lane: 'api'
+    }
+  }
+
+  if (parsed.family !== 'fabric' && parsed.family !== 'artifact') return null
+
+  const allowedControlIds =
+    parsed.family === 'artifact'
+      ? Array.from(ARTIFACT_RUNTIME_ALLOWED_CONTROL_IDS)
+      : Array.isArray(options.fabricAllowedControlIds)
+        ? options.fabricAllowedControlIds
+        : null
+  if (
+    parsed.family === 'fabric' &&
+    Array.isArray(allowedControlIds) &&
+    !isControlIdAllowedByList(parsed.target, allowedControlIds)
+  ) {
+    return null
+  }
+
+  const controlInput: ControlUseInput = {
+    controlId: parsed.target,
+    input: parsedInput.payload,
+    dryRun: false,
+    allowRisky: false
+  }
+  const normalized = normalizeNativeControlUseInput(controlInput as Record<string, any>) ?? {}
+
+  const profile = await resolveControlRiskProfile({
+    userId: options.userId,
+    agentId: options.agentId ?? null,
+    runtimeMode: 'mode3',
+    controlId: parsed.target,
+    input: normalized,
+    allowedControlIds: allowedControlIds ?? undefined
+  })
+  if (!profile) return null
+
+  return {
+    ref: parsedInput.ref,
+    family: parsed.family,
+    controlId: profile.controlId,
+    controlTitle: profile.controlTitle,
+    riskLevel: profile.riskLevel,
+    scopeKey: profile.scopeKey,
+    input: normalized,
+    lane: 'api'
+  }
+}
+
+/**
+ * The AI SDK `toolApproval` answer for the broker tool: pause, or let `execute` run.
+ *
+ * Deliberately NOT gated on `bashApprovalRequestsEnabled` or `toolApprovalMode` — a risk
+ * approval is not a Bash setting, and P0 measured the policy firing correctly on an agent
+ * whose Bash approval mode was `off`.
+ *
+ * It never writes. The pending record is created once, where the card entry is persisted
+ * (AMD-116-01), because the SDK asks this question again on the approval resume.
+ */
+export async function needsBrokerRiskApproval(options: {
+  userId: string
+  agentId?: string | null
+  sessionId?: string | null
+  input: unknown
+  allowedFamilies?: BatshitToolFamily[] | null
+  fabricAllowedControlIds?: string[] | null
+  selectedCliToolIds?: string[] | null
+}): Promise<boolean> {
+  let target: BrokerRiskApprovalTarget | null = null
+  try {
+    target = await resolveBrokerRiskApprovalTarget(options)
+  } catch (error) {
+    // Fail closed: an unresolvable risk question pauses. `execute` then answers whatever it
+    // was going to answer anyway, and the worst case is a card for a call that fails.
+    console.warn('[NativeTools] Risk-approval policy could not resolve the ref:', error)
+    return true
+  }
+  if (!target) return false
+  if (!target.scopeKey) return true
+
+  // The one window DL-116-04 keeps, and the one place it is read on this lane. A woken turn
+  // never rides it — `decideRiskGate` enforces that too, and answering "pause" here keeps
+  // the SDK from executing a call the gate would then pause anyway (which on the API lane
+  // has no card path of its own until P3).
+  const woken = await resolveWokenTurnState(options.sessionId ?? null, {
+    userId: options.userId,
+    agentId: options.agentId ?? null
+  })
+  if (woken.woken) return true
+
+  const covered = await hasScopedRiskWindow({
+    userId: options.userId,
+    controlId: target.controlId,
+    agentId: options.agentId ?? null,
+    scopeKey: target.scopeKey
+  })
+  return !covered
+}
+
 export type NativeToolApprovalPolicy = (
   input: unknown
 ) => Promise<'user-approval' | undefined>
@@ -11435,180 +11782,68 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const resolvedSessionId = normalizeOptionalString(context.sessionId)
   const resolvedAgentId = normalizeOptionalString(context.agentId)
   const gatewayToolsCache: GatewayToolsCache = new Map()
-  type RiskRetryCacheEntry = {
-    controlId: string
-    input: Record<string, any> | undefined
-    inputHash: string
-    inputBytes: number
-    capturedAt: string
+
+  /* ---------------------------------------------------------------- *
+   * SA-116 P2 — the click is the approval, and the retry cache is gone.
+   *
+   * What used to live here: an in-turn `Map` that stashed a risky control's payload on
+   * `CONTROL_RISK_REQUIRES_APPROVAL` so the model could retry with `allowRisky: true` and
+   * omit its input. It existed only to serve a flag the server no longer honours, it could
+   * never survive a resume (a new `buildMode3NativeTools` call means a new empty Map), and
+   * on the API lane there is nothing left for it to do: the SDK re-executes the very call
+   * the user approved, with the very same input bytes (measured, Part 2.10 (c)).
+   *
+   * What replaces it: `approvedGrants` / `deniedGrants`, keyed by the SDK `toolCallId`,
+   * resolved by send-routed from the PERSISTED message before this run started.
+   * ---------------------------------------------------------------- */
+  const approvedGrants = (context.controlApprovals?.approved ?? {}) as Record<
+    string,
+    ControlApprovalGrant
+  >
+  const deniedGrants = (context.controlApprovals?.denied ?? {}) as Record<
+    string,
+    { controlTitle?: string | null }
+  >
+
+  const resolveApprovalGrant = (toolCallId?: string | null): ControlApprovalGrant | null => {
+    const id = typeof toolCallId === 'string' ? toolCallId.trim() : ''
+    if (!id) return null
+    const grant = approvedGrants[id]
+    return grant && typeof grant === 'object' && typeof grant.approvalId === 'string'
+      ? grant
+      : null
   }
-  const controlRiskRetryCache = new Map<string, RiskRetryCacheEntry>()
-  const buildRiskRetryCacheKey = (controlId: string) =>
-    `${resolvedSessionId ?? 'no-session'}::${resolvedAgentId ?? 'no-agent'}::${controlId}`
-  const cloneRiskRetryInput = (
-    payload: Record<string, any> | undefined
-  ): Record<string, any> | undefined => {
-    if (!payload || typeof payload !== 'object') return undefined
-    try {
-      return structuredClone(payload)
-    } catch {
-      try {
-        return JSON.parse(JSON.stringify(payload)) as Record<string, any>
-      } catch {
-        return undefined
-      }
-    }
+
+  const resolveApprovalDenial = (
+    toolCallId?: string | null
+  ): { controlTitle?: string | null } | null => {
+    const id = typeof toolCallId === 'string' ? toolCallId.trim() : ''
+    if (!id) return null
+    if (resolveApprovalGrant(id)) return null
+    const denial = deniedGrants[id]
+    return denial && typeof denial === 'object' ? denial : null
   }
-  const serializeRiskRetryInput = (
-    payload: Record<string, any> | undefined
-  ): { json: string; hash: string; bytes: number } | null => {
-    try {
-      const json = JSON.stringify(payload ?? {})
-      if (typeof json !== 'string') return null
-      const hash = createHash('sha256').update(json).digest('hex')
-      const bytes = new TextEncoder().encode(json).length
-      return { json, hash, bytes }
-    } catch {
-      return null
-    }
-  }
+
   const executeBrokerScopedControlUse = async (
     input: ControlUseInput,
-    wrapperAllowedControlIds: string[]
+    wrapperAllowedControlIds: string[],
+    approval?: ControlApprovalGrant | null
   ) => {
-    const retryCacheKey = buildRiskRetryCacheKey(input.controlId)
-    const cachedRetry = controlRiskRetryCache.get(retryCacheKey)
-    let normalizedInput = normalizeNativeControlUseInput(input as Record<string, any>)
-    let retryPayloadReused = false
-
-    if (input.allowRisky === true) {
-      if (cachedRetry) {
-        const hasExplicitInput =
-          normalizedInput &&
-          typeof normalizedInput === 'object' &&
-          Object.keys(normalizedInput).length > 0
-        if (!hasExplicitInput) {
-          normalizedInput = cloneRiskRetryInput(cachedRetry.input)
-          retryPayloadReused = true
-        } else {
-          const provided = serializeRiskRetryInput(normalizedInput)
-          if (!provided) {
-            return {
-              success: false,
-              controlId: input.controlId,
-              error: {
-                code: 'INVALID_INPUT',
-                message: 'Risk retry input must be JSON-serializable.',
-                details: {
-                  reason: 'payload_serialization_failed'
-                }
-              }
-            }
-          }
-          if (provided.hash !== cachedRetry.inputHash) {
-            return {
-              success: false,
-              controlId: input.controlId,
-              error: {
-                code: 'INVALID_INPUT',
-                message:
-                  'Risk retry payload mismatch. Retry with the same input payload, or omit input to reuse cached payload.',
-                details: {
-                  expectedInputHash: cachedRetry.inputHash,
-                  providedInputHash: provided.hash
-                }
-              }
-            }
-          }
-        }
-      } else {
-        const hasExplicitInput =
-          normalizedInput &&
-          typeof normalizedInput === 'object' &&
-          Object.keys(normalizedInput).length > 0
-        if (!hasExplicitInput) {
-          return {
-            success: false,
-            controlId: input.controlId,
-            error: {
-              code: 'INVALID_CONTEXT',
-              message:
-                'No cached payload exists for this risky retry. Send the full input once, then retry with allowRisky.',
-              details: {
-                retryCacheKey
-              }
-            }
-          }
-        }
-      }
-    }
-
-    const response = await useControl({
+    return await useControl({
       userId: context.userId,
       agentId: context.agentId ?? undefined,
       sessionId: context.sessionId,
       runtimeMode: 'mode3',
+      // The API lane's broker never crosses a request boundary: its `agentId` is the turn's own.
+      actorType: 'in-process',
       controlId: input.controlId,
-      input: normalizedInput,
+      input: normalizeNativeControlUseInput(input as Record<string, any>),
       dryRun: input.dryRun,
       allowRisky: input.allowRisky,
+      approval: approval ?? undefined,
       selectedGateways,
       allowedControlIds: wrapperAllowedControlIds
     })
-
-    if (!response || typeof response !== 'object') {
-      return response
-    }
-
-    const responseError =
-      (response as any).error && typeof (response as any).error === 'object'
-        ? (response as any).error
-        : null
-    const errorCode =
-      responseError && typeof responseError.code === 'string' ? responseError.code : null
-
-    if ((response as any).success === false && errorCode === 'CONTROL_RISK_REQUIRES_APPROVAL') {
-      const serialized = serializeRiskRetryInput(normalizedInput)
-      if (!serialized) {
-        return {
-          ...(response as Record<string, any>),
-          retryPayload: {
-            cached: false,
-            reason: 'payload_serialization_failed'
-          }
-        }
-      }
-
-      controlRiskRetryCache.set(retryCacheKey, {
-        controlId: input.controlId,
-        input: cloneRiskRetryInput(normalizedInput),
-        inputHash: serialized.hash,
-        inputBytes: serialized.bytes,
-        capturedAt: new Date().toISOString()
-      })
-
-      return {
-        ...(response as Record<string, any>),
-        retryPayload: {
-          cached: true,
-          retryCacheKey,
-          inputHash: serialized.hash,
-          inputBytes: serialized.bytes
-        }
-      }
-    }
-
-    if ((response as any).success === true) {
-      controlRiskRetryCache.delete(retryCacheKey)
-      if (retryPayloadReused) {
-        return {
-          ...(response as Record<string, any>),
-          retryPayloadReused: true
-        }
-      }
-    }
-
-    return response
   }
 
   const bashApprovalRequestsEnabled =
@@ -11816,6 +12051,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const memoryControlsEnabled = context.memoryControlsEnabled === true
   // SA-113 P2: same shape for the Agent DM family.
   const dmControlsEnabled = context.dmControlsEnabled === true
+  // SA-115 P2: and the schedule family, on the same per-agent switch.
+  const scheduleControlsEnabled = context.scheduleControlsEnabled === true
 
   // SA-096: shared with the compile path's broker-guidance gate so registered tools and
   // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
@@ -11827,7 +12064,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     allowArtifactRuntimeTools,
     allowFabricControlTools,
     memoryControlsEnabled,
-    dmControlsEnabled
+    dmControlsEnabled,
+    scheduleControlsEnabled
   })
   // SA-096 P4: same source as the DCM capability index's Fabric count.
   const apiBrokerFabricAllowedControlIds = new Set<string>(
@@ -11835,7 +12073,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       toggles: brokerToggles,
       allowFabricControlTools,
       memoryControlsEnabled,
-      dmControlsEnabled
+      dmControlsEnabled,
+      scheduleControlsEnabled
     })
   )
 
@@ -11861,14 +12100,71 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       toModelOutput: formatBatshitToolSearchModelOutput()
     })
 
+    /**
+     * SA-116 P2 (DL-116-05, DL-116-10) — a risky Fabric control, artifact control, or
+     * user-authored CLI tool PAUSES the broker tool before it runs.
+     *
+     * This is the Bash approval machinery, unchanged and already live: an AI SDK v7
+     * call-level `toolApproval` policy. The SDK ends the step with a
+     * `tool-approval-request` part, send-routed persists the card entry, the user clicks,
+     * and the SDK re-executes the very same call with the very same input.
+     *
+     * Not registered at all on a group member run: the group loop is approval-blind and the
+     * resume POST is single-agent, so the card would be written and then abandoned as the
+     * next speaker starts. `decideRiskGate` refuses those with a reason instead.
+     */
+    if (context.groupMemberRun !== true) {
+      toolApprovals.native_batshit_tool_use = async (input) =>
+        (await needsBrokerRiskApproval({
+          userId: context.userId,
+          agentId: context.agentId ?? null,
+          sessionId: context.sessionId ?? null,
+          input,
+          allowedFamilies: apiBrokerAllowedFamilies,
+          fabricAllowedControlIds: Array.from(apiBrokerFabricAllowedControlIds),
+          selectedCliToolIds
+        }))
+          ? 'user-approval'
+          : undefined
+    }
+
     tools.native_batshit_tool_use = tool({
       description:
         'Execute one exact ref returned by native_batshit_tool_search. Refs look like mcp:tool, cli:toolId, artifact:use.artifact.slug, or fabric:sys.control.',
       inputSchema: BATSHIT_TOOL_USE_INPUT_SCHEMA,
-      execute: async (input: BatshitToolUseInput) =>
-        nativeBatshitToolUse({
+      // `options.toolCallId` is how a resumed run knows WHICH call the user approved: the
+      // SDK hands `execute` the same call id the persisted card entry carries (measured,
+      // Part 2.10 (c)). It is the only identifier that survives the round trip.
+      execute: async (input: BatshitToolUseInput, options?: { toolCallId?: string }) => {
+        const toolCallId = typeof options?.toolCallId === 'string' ? options.toolCallId : null
+        const denial = resolveApprovalDenial(toolCallId)
+        if (denial) {
+          // The user said no to exactly this call. Raising a fresh card for it would ask the
+          // same question again, so answer the model instead and let it move on.
+          const ref = typeof (input as any)?.ref === 'string' ? (input as any).ref : 'unknown'
+          const parsedRef = (() => {
+            try {
+              return parseBatshitToolRef(ref)
+            } catch {
+              return null
+            }
+          })()
+          return {
+            success: false,
+            ref,
+            family: parsedRef?.family ?? 'fabric',
+            target: parsedRef?.target ?? ref,
+            code: 'CONTROL_RISK_DENIED',
+            error:
+              `The user denied ${denial.controlTitle ? `"${denial.controlTitle}"` : 'this action'}. ` +
+              'Do not retry it. Tell the user it was not run and ask what they want instead.'
+          } as any
+        }
+        const grant = resolveApprovalGrant(toolCallId)
+        return await nativeBatshitToolUse({
           ...input,
           userId: context.userId,
+          actorType: 'in-process',
           agentId: context.agentId ?? null,
           sessionId: context.sessionId,
           selectedGateways,
@@ -11880,8 +12176,11 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           runtimeMode: 'mode3',
           fabricAllowedControlIds: Array.from(apiBrokerFabricAllowedControlIds),
           executionBackend: settings.executionBackend,
-          executeControlUse: executeBrokerScopedControlUse
-        }),
+          approvalGrant: grant,
+          executeControlUse: (controlInput, allowedControlIds) =>
+            executeBrokerScopedControlUse(controlInput, allowedControlIds, grant)
+        })
+      },
       toModelOutput: formatBatshitToolUseModelOutput(context)
     })
   }
@@ -12121,6 +12420,8 @@ export const nativeToolService = {
   buildMode3NativeTools,
   nativeBatshitToolSearch,
   nativeBatshitToolUse,
+  resolveBrokerRiskApprovalTarget,
+  needsBrokerRiskApproval,
   nativeFetchZip,
   nativeDynamicMcpFind,
   nativeDynamicMcpUse,

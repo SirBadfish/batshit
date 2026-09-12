@@ -173,6 +173,8 @@ export async function buildManagedSubagentDynamicInfo(options: {
     memoryControlsEnabled: false,
     // SA-113 P2 (DL-113-11): a subagent has no inbox and no identity to DM from.
     dmControlsEnabled: false,
+    // SA-115 P2 (DL-115-10): a delegated run cannot put anything on a clock.
+    scheduleControlsEnabled: false,
   })
   if (mcpIndex.text.trim()) {
     lines.push('', mcpIndex.text.trim())

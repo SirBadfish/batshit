@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
-import { nativeToolService, normalizeNativeControlUseInput } from '../nativeTools'
+import {
+  mapBrokerFailureToNativeAutomationErrorCode,
+  mapControlUseErrorToNativeAutomationErrorCode,
+  nativeToolService,
+  normalizeNativeControlUseInput
+} from '../nativeTools'
 import { mcpGatewayDiscovery } from '../mcpGatewayDiscovery'
 import { mcpGatewayService } from '../mcpGatewayService'
 import { apiKeyService } from '$lib/services/apiKey.server'
@@ -87,8 +92,11 @@ vi.mock('$lib/server/redis', () => ({
     get: vi.fn(),
     execute: vi.fn(),
     json: {
-      get: vi.fn()
+      get: vi.fn(),
+      set: vi.fn()
     },
+    expire: vi.fn(),
+    del: vi.fn(),
     getZip: vi.fn(),
     getSession: vi.fn(),
     getUserSettings: vi.fn(),
@@ -191,7 +199,14 @@ describe('nativeToolService hardening', () => {
         },
         expire: vi.fn().mockResolvedValue(1),
         lPush: vi.fn().mockResolvedValue(1),
-        lTrim: vi.fn().mockResolvedValue('OK')
+        lTrim: vi.fn().mockResolvedValue('OK'),
+        // SA-116: a risky control now reaches `controlApprovals.ts`, which reads the
+        // session's approval ZSET before it decides to pause. This suite probes the broker's
+        // SCOPE, not its risk gate, so an empty index is the right answer here.
+        zAdd: vi.fn().mockResolvedValue(1),
+        zRange: vi.fn().mockResolvedValue([]),
+        del: vi.fn().mockResolvedValue(1),
+        exists: vi.fn().mockResolvedValue(0)
       })
     })
     vi.mocked(redis.json.get).mockResolvedValue(null as any)
@@ -2389,165 +2404,220 @@ PATCH`
     }
   )
 
-  it('Mode 3 native Fabric use caches risky payloads and reuses them on allowRisky retry', async () => {
-    const useControlSpy = vi
-      .spyOn(fabricRegistry, 'useControl')
-      .mockResolvedValueOnce({
-        success: false,
-        controlId: 'sys.artifact.update',
-        error: {
-          code: 'CONTROL_RISK_REQUIRES_APPROVAL',
-          message: 'Approval required.'
-        }
-      } as any)
-      .mockResolvedValueOnce({
-        success: true,
-        controlId: 'sys.artifact.update',
-        result: { ok: true }
+  /* ------------------------------------------------------------------ *
+   * SA-116 P2 — the click is the approval on the API broker lane.
+   *
+   * What used to be tested here: an in-turn retry-payload cache that let the model re-send
+   * a risky control with `allowRisky: true` and omit its input. The server no longer honours
+   * that flag on any chat lane, the cache could never survive a resume, and the SDK now
+   * re-executes the very call the user approved. These replace those three tests.
+   * ------------------------------------------------------------------ */
+
+  const brokerFabricContext = (overrides: Record<string, any> = {}) => ({
+    userId: 'josh',
+    sessionId: 'session-approvals',
+    agentId: 'agent-1',
+    providerSettings: { nativeTools: { fabricEnabled: true } },
+    ...overrides
+  })
+
+  it('SA-116: the SDK policy pauses a risky control before execute runs', async () => {
+    const profileSpy = vi
+      .spyOn(fabricRegistry, 'resolveControlRiskProfile')
+      .mockResolvedValue({
+        controlId: 'sys.artifact.rollback',
+        controlTitle: 'Roll Back Artifact',
+        riskLevel: 'confirm',
+        scopeKey: null
       } as any)
 
-    const { tools } = await nativeToolService.buildMode3NativeTools({
-      userId: 'josh',
-      sessionId: 'session-risk-retry',
-      selectedGateways: ['gw_ctx'],
-      providerSettings: {
-        nativeTools: {
-          fabricEnabled: true
-        }
-      }
+    const { toolApprovals } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext() as any
+    )
+    const policy = (toolApprovals as any).native_batshit_tool_use
+    expect(policy).toBeTruthy()
+
+    await expect(
+      policy({
+        ref: 'fabric:sys.artifact.rollback',
+        input: { artifactId: 'artifact_123', targetVersion: 1 }
+      })
+    ).resolves.toBe('user-approval')
+
+    profileSpy.mockRestore()
+  })
+
+  it('SA-116 F-P1-2: a dry run never pauses the SDK', async () => {
+    // The server-side half of F-P1-2 moved `dryRun` above the gate. Without this half the
+    // SDK still pauses BEFORE `execute`, so the dry run costs a card and a turn anyway.
+    const profileSpy = vi
+      .spyOn(fabricRegistry, 'resolveControlRiskProfile')
+      .mockResolvedValue({
+        controlId: 'sys.artifact.rollback',
+        controlTitle: 'Roll Back Artifact',
+        riskLevel: 'confirm',
+        scopeKey: null
+      } as any)
+
+    const { toolApprovals } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext() as any
+    )
+    const policy = (toolApprovals as any).native_batshit_tool_use
+
+    await expect(
+      policy({
+        ref: 'fabric:sys.artifact.rollback',
+        input: { artifactId: 'artifact_123', targetVersion: 1 },
+        dryRun: true
+      })
+    ).resolves.toBeUndefined()
+    expect(profileSpy).not.toHaveBeenCalled()
+
+    profileSpy.mockRestore()
+  })
+
+  it('SA-116 AMD-116-02: a control outside the actor scope never raises a card', async () => {
+    // Measured in P0: the user approved a control the actor could not use, and `useControl`
+    // then answered OUT_OF_SCOPE — a click and a turn spent on a call that could never run.
+    const profileSpy = vi.spyOn(fabricRegistry, 'resolveControlRiskProfile')
+
+    const { toolApprovals } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext() as any
+    )
+    const policy = (toolApprovals as any).native_batshit_tool_use
+
+    // `sys.memory.*` is not in the API broker's allowed control ids for this agent.
+    await expect(
+      policy({ ref: 'fabric:sys.memory.delete', input: { memory_id: 'mem_1' } })
+    ).resolves.toBeUndefined()
+    expect(profileSpy).not.toHaveBeenCalled()
+
+    profileSpy.mockRestore()
+  })
+
+  it('SA-116: a safe control never pauses', async () => {
+    const profileSpy = vi
+      .spyOn(fabricRegistry, 'resolveControlRiskProfile')
+      .mockResolvedValue(null)
+
+    const { toolApprovals } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext() as any
+    )
+    const policy = (toolApprovals as any).native_batshit_tool_use
+
+    await expect(
+      policy({ ref: 'fabric:sys.artifact.create', input: { name: 'Demo' } })
+    ).resolves.toBeUndefined()
+
+    profileSpy.mockRestore()
+  })
+
+  it('SA-116 DL-116-10: a group member run registers no risk policy at all', async () => {
+    const { toolApprovals } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext({ groupMemberRun: true }) as any
+    )
+    expect((toolApprovals as any).native_batshit_tool_use).toBeUndefined()
+  })
+
+  it('SA-116 DL-116-05: the resume hands useControl the approval the user clicked', async () => {
+    const useControlSpy = vi.spyOn(fabricRegistry, 'useControl').mockResolvedValue({
+      success: true,
+      controlId: 'sys.artifact.rollback',
+      result: { ok: true }
     } as any)
 
+    const { tools } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext({
+        controlApprovals: {
+          approved: {
+            toolu_013Y: { kind: 'sdk', approvalId: 'apr_click', toolCallId: 'toolu_013Y' }
+          }
+        }
+      }) as any
+    )
     const brokerUse = (tools as any).native_batshit_tool_use
-    expect(brokerUse).toBeTruthy()
 
-    const first = await brokerUse.execute({
-      ref: 'fabric:sys.artifact.update',
-      input: {
-        artifactId: 'artifact_123',
-        content: '<html><body>large payload</body></html>'
-      }
-    } as any)
+    const result = await brokerUse.execute(
+      {
+        ref: 'fabric:sys.artifact.rollback',
+        input: { artifactId: 'artifact_123', targetVersion: 1 }
+      } as any,
+      { toolCallId: 'toolu_013Y' }
+    )
 
-    expect(first.success).toBe(false)
-    expect(first.retryPayload?.cached).toBe(true)
-    expect(first.retryPayload?.inputBytes).toBeGreaterThan(0)
-
-    const second = await brokerUse.execute({
-      ref: 'fabric:sys.artifact.update',
-      allowRisky: true
-    } as any)
-
-    expect(second.success).toBe(true)
-    expect(second.retryPayloadReused).toBe(true)
-
-    const firstCall = useControlSpy.mock.calls[0]?.[0] as any
-    const secondCall = useControlSpy.mock.calls[1]?.[0] as any
-    expect(secondCall.allowRisky).toBe(true)
-    expect(secondCall.input).toEqual(firstCall.input)
-
-    const secondModelOutput = await brokerUse.toModelOutput({ output: second })
-    expect(String(secondModelOutput.value)).toContain('reused cached payload')
+    expect(result.success).toBe(true)
+    const call = useControlSpy.mock.calls.at(-1)?.[0] as any
+    expect(call.approval).toEqual({
+      kind: 'sdk',
+      approvalId: 'apr_click',
+      toolCallId: 'toolu_013Y'
+    })
 
     useControlSpy.mockRestore()
   })
 
-  it('Mode 3 native Fabric use adds a helper-specific retry hint for local voice setup approval gates', async () => {
-    const useControlSpy = vi
-      .spyOn(fabricRegistry, 'useControl')
-      .mockResolvedValueOnce({
-        success: false,
-        controlId: 'sys.voice.engine.complete_local_setup',
-        error: {
-          code: 'CONTROL_RISK_REQUIRES_APPROVAL',
-          message: 'Approval required.'
-        }
-      } as any)
+  it('SA-116: a call the user denied is refused without raising a second card', async () => {
+    const useControlSpy = vi.spyOn(fabricRegistry, 'useControl')
 
-    const { tools } = await nativeToolService.buildMode3NativeTools({
-      userId: 'josh',
-      sessionId: 'session-voice-local-setup-risk-retry',
-      providerSettings: {
-        nativeTools: {
-          fabricEnabled: true
+    const { tools } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext({
+        controlApprovals: {
+          denied: { toolu_denied: { controlTitle: 'Roll Back Artifact' } }
         }
-      }
-    } as any)
-
+      }) as any
+    )
     const brokerUse = (tools as any).native_batshit_tool_use
-    expect(brokerUse).toBeTruthy()
 
-    const first = await brokerUse.execute({
-      ref: 'fabric:sys.voice.engine.complete_local_setup',
-      input: {
-        engineId: 'chatterbox-local',
-        installRoot: '/Users/example/.batshit/installs/chatterbox-local'
+    const result = await brokerUse.execute(
+      {
+        ref: 'fabric:sys.artifact.rollback',
+        input: { artifactId: 'artifact_123', targetVersion: 1 }
+      } as any,
+      { toolCallId: 'toolu_denied' }
+    )
+
+    expect(result.success).toBe(false)
+    expect(result.code).toBe('CONTROL_RISK_DENIED')
+    expect(String(result.error)).toContain('Roll Back Artifact')
+    expect(useControlSpy).not.toHaveBeenCalled()
+
+    useControlSpy.mockRestore()
+  })
+
+  it('SA-116 F-P1-3: the approval hint tells the model to stop, never to retry with a flag', async () => {
+    const useControlSpy = vi.spyOn(fabricRegistry, 'useControl').mockResolvedValueOnce({
+      success: false,
+      controlId: 'sys.voice.engine.complete_local_setup',
+      error: {
+        code: 'CONTROL_RISK_REQUIRES_APPROVAL',
+        message: 'Batshit paused it and asked the user to approve it.',
+        details: { approvalId: 'apr_abc', controlTitle: 'Complete Local Setup' }
       }
     } as any)
 
-    expect(first.success).toBe(false)
-    expect(first.retryPayload?.cached).toBe(true)
+    const { tools } = await nativeToolService.buildMode3NativeTools(
+      brokerFabricContext({ sessionId: 'session-voice-local-setup' }) as any
+    )
+    const brokerUse = (tools as any).native_batshit_tool_use
 
-    const modelOutput = await brokerUse.toModelOutput({ output: first })
-    expect(String(modelOutput.value)).toContain('allowRisky: true')
-    expect(String(modelOutput.value)).toContain(
+    const paused = await brokerUse.execute({
+      ref: 'fabric:sys.voice.engine.complete_local_setup',
+      input: { engineId: 'chatterbox-local' }
+    } as any)
+    const modelOutput = await brokerUse.toModelOutput({ output: paused })
+    const text = String(modelOutput.value)
+
+    // The old sentence sat directly under "Do not retry it yourself" — two contradictory
+    // instructions in one tool result, and once a card exists the model loops on it.
+    expect(text).not.toContain('allowRisky: true')
+    expect(text).not.toContain('retry_payload')
+    expect(text).toContain("for the user's approval (approval apr_abc)")
+    expect(text).toContain('Do not retry it yourself.')
+    expect(text).toContain('Never pass allowRisky — it is ignored.')
+    // The voice-setup addendum survives: it keeps the helper owning the whole install.
+    expect(text).toContain(
       'Do not switch to sys.voice.engine.register / update / health_check / enable or ad-hoc bash'
     )
-    expect(String(modelOutput.value)).toContain(
-      'Retry sys.voice.engine.complete_local_setup itself so the helper keeps ownership'
-    )
-
-    useControlSpy.mockRestore()
-  })
-
-  it('Mode 3 native Fabric use blocks allowRisky retry when payload bytes differ', async () => {
-    const useControlSpy = vi
-      .spyOn(fabricRegistry, 'useControl')
-      .mockResolvedValueOnce({
-        success: false,
-        controlId: 'sys.artifact.update',
-        error: {
-          code: 'CONTROL_RISK_REQUIRES_APPROVAL',
-          message: 'Approval required.'
-        }
-      } as any)
-
-    const { tools } = await nativeToolService.buildMode3NativeTools({
-      userId: 'josh',
-      sessionId: 'session-risk-retry-mismatch',
-      providerSettings: {
-        nativeTools: {
-          fabricEnabled: true
-        }
-      }
-    } as any)
-
-    const brokerUse = (tools as any).native_batshit_tool_use
-    expect(brokerUse).toBeTruthy()
-
-    const first = await brokerUse.execute({
-      ref: 'fabric:sys.artifact.update',
-      input: {
-        artifactId: 'artifact_123',
-        content: '<html><body>payload-v1</body></html>'
-      }
-    } as any)
-
-    expect(first.success).toBe(false)
-    expect(first.retryPayload?.cached).toBe(true)
-
-    const mismatch = await brokerUse.execute({
-      ref: 'fabric:sys.artifact.update',
-      allowRisky: true,
-      input: {
-        artifactId: 'artifact_123',
-        content: '<html><body>payload-v2</body></html>'
-      }
-    } as any)
-
-    expect(mismatch.success).toBe(false)
-    expect(mismatch.error?.code).toBe('INVALID_INPUT')
-    expect(String(mismatch.error?.message || '')).toMatch(/payload mismatch/i)
-    expect(useControlSpy).toHaveBeenCalledTimes(1)
 
     useControlSpy.mockRestore()
   })
@@ -8182,4 +8252,78 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
   })
 
 
+})
+
+/* -------------------------------------------------------------------------- *
+ * PR #106 review (SA-113 follow-ups batch) — F-1 and F-11.
+ * -------------------------------------------------------------------------- */
+
+describe('PR #106 F-1: the dispatch route’s lane reaches the identity gate', () => {
+  it('passes the lane it was given to useControl, and `unknown` when it was given none', async () => {
+    const useControlSpy = vi.spyOn(fabricRegistry, 'useControl').mockResolvedValue({
+      success: true,
+      controlId: 'sys.runtime_addon.prepare',
+      result: { ok: true }
+    } as any)
+    vi.mocked(redis.get).mockResolvedValue({
+      user_id: 'josh',
+      provider_specific_settings: { nativeTools: { fabricEnabled: true, batshitToolsEnabled: true } }
+    } as any)
+
+    // `mode4` is the managed CLI helper's own dispatch shape — the exact door the finding
+    // walked through (Fabric control refs are only allowed on mode3/mode4 primaries).
+    const context = {
+      session_id: 'session_lane',
+      agent_id: 'agent_primary',
+      mode: 'mode4',
+      actor_type: 'primary'
+    }
+    const payloadInput = { ref: 'fabric:sys.runtime_addon.prepare', input: { addonId: 'fbx2vrma' } }
+
+    await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: 'batshit_tool_use',
+      payloadInput,
+      context,
+      actorType: 'service',
+      delegatedRun: false
+    })
+    expect(useControlSpy).toHaveBeenCalled()
+    expect(useControlSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      actorType: 'service',
+      delegatedRun: false
+    })
+
+    await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: 'batshit_tool_use',
+      payloadInput,
+      context
+    })
+    // A caller that forgot the lane is `unknown`, which the gate refuses — never a vouched
+    // default filled in on its behalf.
+    expect(useControlSpy.mock.calls.at(-1)?.[0]).toMatchObject({ actorType: 'unknown' })
+
+    useControlSpy.mockRestore()
+  })
+})
+
+describe('PR #106 F-11: one map for a failed broker call', () => {
+  it('reads every policy refusal as POLICY_BLOCKED, never as "the server is down"', () => {
+    expect(mapControlUseErrorToNativeAutomationErrorCode('AGENT_IDENTITY_REQUIRED')).toBe('POLICY_BLOCKED')
+    expect(mapControlUseErrorToNativeAutomationErrorCode('CONTROL_RISK_UNAVAILABLE_IN_GROUP')).toBe('POLICY_BLOCKED')
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ code: 'UNAVAILABLE_IN_GROUP' })).toBe('POLICY_BLOCKED')
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ code: 'REQUIRES_APPROVAL' })).toBe('POLICY_BLOCKED')
+    expect(
+      mapBrokerFailureToNativeAutomationErrorCode({ error: { code: 'AGENT_IDENTITY_REQUIRED' } })
+    ).toBe('POLICY_BLOCKED')
+  })
+
+  it('keeps the other two answers where they were', () => {
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ code: 'INPUT_VALIDATION_FAILED' })).toBe('INVALID_INPUT')
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ error: { code: 'CONTROL_EXECUTION_FAILED' } })).toBe(
+      'BACKEND_UNAVAILABLE'
+    )
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ error: 'plain text' })).toBe('BACKEND_UNAVAILABLE')
+  })
 })

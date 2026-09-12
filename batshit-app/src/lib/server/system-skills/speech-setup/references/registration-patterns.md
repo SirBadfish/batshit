@@ -65,17 +65,23 @@ Detached launch → Readiness polling → TTS or STT smoke test
 
 ### Confirm-Step Rule
 
-This is a `confirm` control. When the confirm gate appears:
+This is a `confirm` control. Batshit pauses it and shows the user an **Approve** button on
+your message. When the gate appears:
 
-1. If the user already approved the setup, retry immediately with `allowRisky: true`
-2. Use the same payload — Batshit may cache it for the retry
-3. Do **not** switch to manual register/enable calls just because the confirm gate fired
+1. Say what the setup will do and why, then stop. Do not retry it in the same turn
+2. Never pass `allowRisky` — it is ignored on every chat lane
+3. On an API agent, the user's click re-runs the same call by itself. On a Codex or Claude
+   agent, the click resumes you with an `[Approval — from the user, not from the agent]`
+   message; retry then, with the **same payload**
+4. A different payload is a different call, so it earns a new approval card rather than
+   riding the first click
+5. Do **not** switch to manual register/enable calls just because the gate fired
 
-Minimal retry shape:
+Minimal retry shape after an approval resume — the same one you sent before:
 ```json
 {
   "controlId": "sys.voice.engine.complete_local_setup",
-  "allowRisky": true
+  "input": { "engineId": "<the same engineId>" }
 }
 ```
 

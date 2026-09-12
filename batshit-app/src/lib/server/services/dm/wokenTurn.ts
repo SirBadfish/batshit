@@ -29,9 +29,28 @@ const WOKEN_TURN_MESSAGE_WINDOW = 50
 
 export type WokenTurnState = { woken: false } | { woken: true; dmId: string | null }
 
-/** What the CALLER claims about itself. Every field here is caller-supplied — see below. */
+/**
+ * What the caller says about itself.
+ *
+ * **SA-117 DL-117-04 changed where `agentId` comes from on the managed CLI lanes.** Before
+ * it, this field was caller-supplied on every lane: `/api/controls/use` read `body.agentId`
+ * and passed it straight through, so a caller that simply OMITTED it skipped the wake-registry
+ * branch below and fell back to the session heuristic — the gate was the caller's to opt out
+ * of. The managed helper always sent its launch-bound id, so the model could not exploit it;
+ * a raw-token caller could.
+ *
+ * Now the `agent` lane binds this id from the run credential Batshit minted, so on that lane
+ * it is ALWAYS present and cannot be chosen: there is no omission to make, and no other id to
+ * name. The in-process API lanes were already server-owned. What is left caller-supplied is
+ * the `service`, `session` and `portable-skill` lanes. DL-117-05 closes the DM, memory and
+ * schedule families to `service` and `portable-skill`; the `session` lane still reaches them,
+ * because a signed-in browser is the user (SA-117 P2 review, F-P2-4) — and a user who can
+ * omit this field can also click Approve, so nothing is bypassed there that the user does
+ * not already own.
+ */
 export interface WokenTurnActor {
   userId?: string | null
+  /** Server-bound on the `agent` lane (DL-117-04); caller-supplied on the rest. */
   agentId?: string | null
 }
 

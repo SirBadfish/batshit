@@ -1255,6 +1255,30 @@ async function processNDJSONLine(
       break
     }
 
+    /**
+     * SA-114 (DL-114-03) — the three steer events.
+     *
+     * They are forwarded verbatim AND appended to the replay buffer, which is the whole
+     * point of routing them through this POST rather than `publishSessionEvent`: a tab
+     * opened mid-turn replays `steer_queued` and `steer_delivered` in order, so the inset
+     * inside the reply is never unexplained. The default branch below would already
+     * forward them; they get their own case so the contract is deliberate rather than
+     * inherited from an "unknown event" fallback.
+     */
+    case 'steer_queued':
+    case 'steer_delivered':
+    case 'steer_promoted': {
+      const steerEvent = {
+        type: eventType,
+        sessionId,
+        ...data,
+        ...eventData
+      }
+      enqueueWithTelemetry(sessionId, controller as SSEController, steerEvent)
+      appendActiveStreamEvent(sessionId, steerEvent)
+      break
+    }
+
     case 'finish': {
       const usage = data.usage || eventData.usage
       const finishEvent = await adapter.emitFinish({

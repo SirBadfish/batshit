@@ -6,6 +6,7 @@ import { normalizeVoiceSettings } from '$lib/utils/voiceSchema'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { mergeGoonsSettingsPatch } from '$lib/goons/resolve'
+import { normalizeGlobalChatSettings } from '$lib/utils/steerControl'
 
 const NO_STORE_RESPONSE = {
 	headers: {
@@ -105,6 +106,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				global_tool_grid_settings:
 					data.global_tool_grid_settings !== undefined ?
 						data.global_tool_grid_settings : (existing as any).global_tool_grid_settings,
+				// SA-114 P3 (DL-114-01): what a send does while the agent is still replying.
+				global_chat_settings:
+					data.global_chat_settings !== undefined ?
+						normalizeGlobalChatSettings(data.global_chat_settings)
+						: (existing as any).global_chat_settings,
 				// Other settings
 				ui_settings: data.ui_settings !== undefined ? 
 					data.ui_settings : (existing as any).ui_settings,

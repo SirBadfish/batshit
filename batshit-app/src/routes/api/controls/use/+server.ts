@@ -1,6 +1,10 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
-import { redis } from '$lib/server/redis'
+import { resolveApprovalCardTarget } from '$lib/server/services/controlApprovals'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import {
+  bindActingAgentId,
+  bindActingSessionId
+} from '$lib/server/services/actingAgentIdentity'
 import { useControl, type ControlUseErrorCode } from '$lib/server/services/fabricRegistry'
 import {
   getPortableSkillFamilyDefinitions,
@@ -13,9 +17,22 @@ type UseControlRequest = {
   userId?: string
   agentId?: string
   sessionId?: string
+  /**
+   * SA-116 DL-116-07 — the assistant message this call belongs to.
+   *
+   * The managed CLI helper sends it from `BATSHIT_MESSAGE_ID`. Verified against the owned
+   * session below, so a caller cannot pin a card onto somebody else's chat.
+   */
+  messageId?: string
   controlId?: string
   input?: Record<string, any>
   dryRun?: boolean
+  /**
+   * SA-116 DL-116-01 — **ignored on every lane except `portable-skill`.**
+   *
+   * Still accepted so a stale caller (an old MCP proxy schema, an n8n workflow) gets the
+   * approval card rather than a 400 it cannot act on.
+   */
   allowRisky?: boolean
   selectedGateways?: string[]
   allowedControlIds?: string[]
@@ -30,11 +47,15 @@ function statusForControlError(code?: ControlUseErrorCode): number {
     case 'CONTROL_NOT_FOUND':
       return 404
     case 'CONTROL_NOT_ALLOWED':
+    // A pause and a group refusal are POLICY answers, not server faults. Falling through to
+    // `default: 500` — a retryable status — would tell the caller to try again, which is
+    // exactly the loop the guidance exists to stop. SA-113 shipped this for the woken
+    // refusal; SA-116 retires that code and keeps the rule for its two replacements.
     case 'CONTROL_RISK_REQUIRES_APPROVAL':
-    // A woken turn's risky-control refusal is a POLICY answer, not a server fault. It fell
-    // through to `default: 500` — a retryable status — for a refusal that must never be
-    // retried, which is the loop `human_turn_hint` exists to stop.
-    case 'CONTROL_RISK_NEEDS_HUMAN_TURN':
+    case 'CONTROL_RISK_UNAVAILABLE_IN_GROUP':
+    // SA-117 DL-117-05: the caller authenticated, and is not allowed to act as an agent.
+    // A policy answer, like the two above it — not a server fault and not a retry.
+    case 'AGENT_IDENTITY_REQUIRED':
       return 403
     case 'CONTROL_INPUT_INVALID':
       return 400
@@ -153,26 +174,79 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       )
     }
 
-    // `sessionId` is body text, and the woken-turn gate and the risk-approval cache both
-    // read it. A session this user does not own must not be able to speak for them, so an
-    // unowned id is dropped rather than trusted — the gate then falls back to the wake
-    // registry, which is server-owned, instead of to a chat somebody else is sitting in.
-    const claimedSessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
-    let sessionId: string | undefined
-    if (claimedSessionId) {
-      const session = await redis.getSession(claimedSessionId)
-      if (session && session.user_id === auth.userId) sessionId = claimedSessionId
+    /**
+     * SA-117 DL-117-04 — the acting agent, bound.
+     *
+     * This is the line P1 left open (F-P1-3): the route forwarded `auth.credentialId` to the
+     * audit but still passed `body.agentId` as the actor, so the audit could name a
+     * credential beside an agent id the body had claimed. Now the bound id wins, and a body
+     * id that DIFFERS is refused rather than corrected — a mismatch is a bug in a caller or
+     * a forgery, and either one should be visible.
+     */
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json(
+        {
+          auth: auth.auth,
+          userId: auth.userId,
+          success: false,
+          controlId,
+          error: { code: agentBinding.code, message: agentBinding.message }
+        },
+        { status: 400 }
+      )
     }
+
+    // `sessionId` and `messageId` are body text — the woken-turn gate reads the first and
+    // the approval card is pinned to the second. `resolveApprovalCardTarget` owns both
+    // ownership checks for this route and `/api/cli-tools/execute` alike, because the same
+    // rule written twice is how DL-116-14's hole came to exist in two files.
+    //
+    // SA-117 DL-117-04: on the agent lane the credential's session is authoritative, so the
+    // ownership check below runs against the bound id rather than whatever the body sent.
+    const { sessionId, messageId } = await resolveApprovalCardTarget({
+      userId: auth.userId,
+      sessionId: bindActingSessionId(auth, body.sessionId),
+      messageId: body.messageId
+    })
+
+    /**
+     * SA-117 DL-117-10 (AMD-117-02) — the acting agent, on the wire, for the Execution Viewer.
+     *
+     * Present ONLY when the server bound it: `auth.auth === 'agent'` means it came off a
+     * credential Batshit minted for this run. It is deliberately absent on every other lane
+     * rather than echoing `body.agentId` back, because a label sourced from the caller's own
+     * claim would read as though the server had vouched for it — which is worse than no
+     * label, and is exactly why F-P1-2 moved this half of DL-117-10 out of P1.
+     *
+     * The managed CLI helper returns this response verbatim as its MCP tool result, so the
+     * value reaches the Execution Viewer inside the step's own output.
+     */
+    const actingAgentField =
+      auth.auth === 'agent' && agentBinding.agentId
+        ? { actingAgentId: agentBinding.agentId }
+        : {}
 
     const result = await useControl({
       userId: auth.userId,
-      agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
+      agentId: agentBinding.agentId,
       sessionId,
+      messageId,
       controlId,
       input: body.input && typeof body.input === 'object' ? body.input : {},
       dryRun: body.dryRun === true,
-      allowRisky: auth.auth === 'portable-skill' ? true : body.allowRisky === true,
+      // DL-116-01/DL-116-09: the flag survives for exactly one lane. `body.allowRisky` is
+      // not read at all — a service-token caller, an n8n workflow, and the managed CLI
+      // helper all pause and wait for a click, the same as the model does.
+      allowRisky: auth.auth === 'portable-skill',
       actorType: auth.auth,
+      // SA-117 DL-117-10: names the run credential this call arrived on, which is what makes
+      // the `agentId` beside it readable as server-bound rather than body-claimed. DL-117-04
+      // does the binding above.
+      credentialId: auth.credentialId,
+      // F-P2-1: a Subagent or Worker run's credential is real, and still names nobody who
+      // can act. `useControl` refuses the identity-bearing families for it.
+      delegatedRun: auth.delegated === true,
       selectedGateways: Array.isArray(body.selectedGateways) ? body.selectedGateways : undefined,
       allowedControlIds:
         auth.auth === 'portable-skill'
@@ -190,11 +264,30 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     })
 
     if (!result.success) {
+      // SA-116 DL-116-07: a pause carries its card block at the TOP level of the body, not
+      // only nested in `error.details`. send-routed's single `case 'tool-result'` loop — the
+      // one every lane feeds — looks for `approvalRequest` there, so the CLI lanes and the
+      // service lane get the same persisted card the SDK pause gives the API lane, with no
+      // tab open. It is lifted rather than duplicated at the source so `useControl` keeps
+      // one shape for every caller.
+      const approvalRequest =
+        result.error.code === 'CONTROL_RISK_REQUIRES_APPROVAL'
+          ? (result.error.details?.approvalRequest ?? null)
+          : null
+      if (approvalRequest && !messageId) {
+        console.warn(
+          `[Controls Use] Paused "${result.controlId}" for approval, but no message id was ` +
+            'verified for this call, so no approval card can render. The managed CLI ' +
+            'profiles forward BATSHIT_MESSAGE_ID — regenerate them if this persists.'
+        )
+      }
       return json(
         {
           auth: auth.auth,
           userId: auth.userId,
-          ...result
+          ...actingAgentField,
+          ...result,
+          ...(approvalRequest ? { approvalRequest } : {})
         },
         { status: statusForControlError(result.error.code) }
       )
@@ -203,6 +296,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     return json({
       auth: auth.auth,
       userId: auth.userId,
+      ...actingAgentField,
       ...result
     })
   } catch (error) {

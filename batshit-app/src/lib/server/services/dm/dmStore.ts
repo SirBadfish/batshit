@@ -347,7 +347,9 @@ export interface CreateDmInput {
   scope?: string | null
   reportBackTo?: string | null
   relatedDmId?: string | null
-  deliver: 'wait' | 'wake'
+  deliver: 'wait' | 'wake' | 'steer'
+  /** `deliver: 'steer'` only (SA-114 DL-114-13). */
+  steerFallback?: 'wait' | 'wake'
   resultDelivery?: 'wait' | 'wake'
   expiresInHours?: number | null
   senderSessionId?: string | null
@@ -410,12 +412,15 @@ export async function createDm(input: CreateDmInput): Promise<DmRecord> {
         'invalid_input'
       )
     }
-    // A webhook assignment (P3) is the ONE exception: its sender is a program, which has no
-    // inbox to be reported back to. Its report-back is the one-shot `callbackUrl` instead,
-    // and `reportBack` skips an item with no `reportBackTo` by construction. Requiring the
-    // field here would force it to point at the recipient itself, which the self-send guard
-    // would then refuse at close time — a failure two turns after the mistake.
-    if (input.from.kind !== 'webhook' && !input.reportBackTo?.trim()) {
+    // **Only an AGENT has an inbox to be reported back to.** A webhook assignment (P3) is
+    // sent by a program and reports back through its one-shot `callbackUrl`; a schedule
+    // assignment (SA-115) is Batshit's own clock and reports back on its card and in the
+    // DM drawer. `reportBack` skips an item with no `reportBackTo` by construction.
+    // Requiring the field for either would force it to point at the recipient itself,
+    // which the self-send guard then refuses at close time — a failure two turns after
+    // the mistake. This condition was `!== 'webhook'` until SA-115 added the third sender
+    // kind and a scheduled assignment could not be written at all.
+    if (input.from.kind === 'agent' && !input.reportBackTo?.trim()) {
       throw new DmStoreError(
         'An assignment needs report_back_to — the agent that gets the result.',
         'invalid_input'
@@ -444,14 +449,27 @@ export async function createDm(input: CreateDmInput): Promise<DmRecord> {
     }
 
     // Loop guard 2: the same DM twice inside ten minutes is a loop, not a reminder.
-    const duplicate = existing.find(
-      (record) =>
-        record.kind === input.kind &&
-        record.subject === subject &&
-        record.body === body &&
-        sameSender(record.from, input.from) &&
-        nowTs - record.createdTs < DM_DUPLICATE_WINDOW_MS
-    )
+    //
+    // **A schedule is exempt (SA-115 F-P1-1), and it is the one sender kind that has to
+    // be.** This guard catches an agent or a program repeating itself; repeating itself is
+    // exactly what a schedule is FOR. Every fire of "every 5 minutes, check the queue"
+    // carries the same kind, subject, body, and sender by construction, so with the guard
+    // applied, any interval under this ten-minute window whose previous DM is still open
+    // has its next fire refused as a duplicate — the floor is five minutes, so a schedule
+    // at the lock's own minimum would fail every other fire. A schedule's loop guards are
+    // its five-minute floor, the per-agent and per-instance caps, and the hourly wake caps
+    // it spends like any other wake.
+    const duplicate =
+      input.from.kind === 'schedule'
+        ? undefined
+        : existing.find(
+            (record) =>
+              record.kind === input.kind &&
+              record.subject === subject &&
+              record.body === body &&
+              sameSender(record.from, input.from) &&
+              nowTs - record.createdTs < DM_DUPLICATE_WINDOW_MS
+          )
     if (duplicate) {
       throw new DmStoreError(
         `That exact DM was already sent ${Math.round((nowTs - duplicate.createdTs) / 1000)}s ago (${duplicate.id}).`,
@@ -478,6 +496,9 @@ export async function createDm(input: CreateDmInput): Promise<DmRecord> {
       ...(input.reportBackTo?.trim() ? { reportBackTo: input.reportBackTo.trim() } : {}),
       ...(input.relatedDmId?.trim() ? { relatedDmId: input.relatedDmId.trim() } : {}),
       deliver: input.deliver,
+      ...(input.deliver === 'steer'
+        ? { steerFallback: input.steerFallback ?? 'wait' }
+        : {}),
       ...(input.kind === 'assignment'
         ? { resultDelivery: input.resultDelivery ?? 'wait' }
         : {}),
@@ -506,10 +527,23 @@ export async function createDm(input: CreateDmInput): Promise<DmRecord> {
   })
 }
 
+/**
+ * Are these two DMs from the same sender?
+ *
+ * Every kind is answered explicitly, including `schedule` (SA-115). The trailing `return
+ * false` is for an unknown FUTURE kind only — it must never be how an existing kind gets
+ * its answer. It was, until SA-115: `schedule` was added as a third `DmSender` variant and
+ * this predicate quietly kept saying "different senders" about two fires of the same
+ * schedule, which is simply untrue, and which made loop guard 2's schedule exemption look
+ * unnecessary while it was in fact the only thing standing between a five-minute schedule
+ * and a refused fire. Same family as AMD-115-02: a rule written for the kinds that existed
+ * at the time answers wrongly, not loudly, when a new kind arrives.
+ */
 function sameSender(a: DmSender, b: DmSender): boolean {
   if (a.kind !== b.kind) return false
   if (a.kind === 'agent' && b.kind === 'agent') return a.agentId === b.agentId
   if (a.kind === 'webhook' && b.kind === 'webhook') return a.hookId === b.hookId
+  if (a.kind === 'schedule' && b.kind === 'schedule') return a.scheduleId === b.scheduleId
   return false
 }
 
@@ -616,15 +650,34 @@ export async function closeDm(input: {
   })
 }
 
-/** `read` on an `info` item acknowledges it: `new → done`, per the mailbox's `ack`. */
-export async function acknowledgeInfoDm(dmId: string, agentId: string): Promise<DmRecord> {
+/**
+ * The result text an `info` note gets when a WAKE closed it rather than the agent reading
+ * it. One constant because two places write it — `finishWokenTurn` on a completed turn
+ * (SA-115 F-P1-2) and `clearNeedsUserForHumanReply` when the human replies in a chat whose
+ * note was still stamped (F-P2-1) — and the drawer must not show two wordings for one
+ * event.
+ */
+export const WAKE_DELIVERED_INFO_RESULT = 'Delivered as the first message of a woken turn.'
+
+/**
+ * `read` on an `info` item acknowledges it: `new → done`, per the mailbox's `ack`.
+ *
+ * `result` is overridable because SA-115 F-P1-2 added a second way an info note gets
+ * acknowledged: a wake DELIVERED it as the first message of a turn, which is not the same
+ * event as the agent choosing to read it, and the drawer should not claim it was.
+ */
+export async function acknowledgeInfoDm(
+  dmId: string,
+  agentId: string,
+  result = 'Read and acknowledged.'
+): Promise<DmRecord> {
   return withInboxLock(agentId, async () => {
     const record = await requireOwnedDm(dmId, agentId)
     if (record.kind !== 'info' || !isOpenDmStatus(record.status)) return record
     const acked: DmRecord = {
       ...record,
       status: 'done',
-      result: 'Read and acknowledged.',
+      result,
       completedAt: new Date().toISOString(),
       delivery: withoutNeedsUser(record.delivery)
     }
@@ -689,23 +742,122 @@ async function requireOwnedDm(dmId: string, agentId: string): Promise<DmRecord> 
 export async function stampDmDelivery(
   dmId: string,
   patch: Partial<DmRecord['delivery']>
-): Promise<void> {
-  if (!dmId?.trim()) return
+): Promise<boolean> {
+  if (!dmId?.trim()) return false
   const record = await getDm(dmId)
-  if (!record) return
-  await withInboxLock(record.to, async () => {
+  if (!record) return false
+  // SA-114 P4: this returns whether it actually wrote. Every caller before it ignored the
+  // answer, and `degradeMissedDmSteers` cannot — it reports which DMs it degraded, and a
+  // vanished record (the user deleted it, or the reaper expired it, while the turn ran)
+  // would otherwise be reported as stamped. A function that says it wrote when it did not
+  // is the kind of quiet lie this codebase does not keep.
+  return withInboxLock(record.to, async () => {
     const current = await getDm(dmId)
-    if (!current) return
+    if (!current) return false
+    // F-P4-1 (the P4 review): a field stamped `undefined` is REMOVED on write, on both
+    // lanes (JSON serialisation drops it) — which is how a caller clears `sessionId` on a
+    // steer that landed nowhere. Pinned by the "drops a field stamped as undefined" test.
     await writeDm({ ...current, delivery: { ...current.delivery, ...patch } })
+    return true
   })
+}
+
+/**
+ * SA-114 P4 (DL-114-13) — a DM steer that never landed goes back to being a `wait`.
+ *
+ * Called by send-routed at the end of a turn, from the same `finally` that clears the steer
+ * inbox and BEFORE it — once the entries are cleared there is nothing left to read. A
+ * user's steer is promoted into the next message at this point; a DM's is not, because an
+ * agent's text must not start a user turn. So the honest outcome is the one the sender
+ * would have got by asking for `wait` in the first place, with a reason saying what
+ * happened.
+ *
+ * Failures are logged, never thrown: this runs inside a `finally` that is also releasing
+ * the session-turn lock, and a Redis hiccup here must not take that with it. The DM itself
+ * is already written and already in the recipient's inbox — only the `actual`/`reason`
+ * stamp is at stake.
+ */
+export async function degradeMissedDmSteers(
+  entries: Array<{ dmId?: string; source?: string }>,
+  reason: string
+): Promise<string[]> {
+  const stamped: string[] = []
+  for (const entry of entries) {
+    if (entry.source !== 'dm') continue
+    const dmId = typeof entry.dmId === 'string' ? entry.dmId.trim() : ''
+    if (!dmId) continue
+    try {
+      // F-P4-1: it landed nowhere, so it names no chat. `sessionId` was stamped when the
+      // steer was accepted; leaving it would point the drawer at the reply it MISSED.
+      if (await stampDmDelivery(dmId, { actual: 'wait', reason, sessionId: undefined })) {
+        stamped.push(dmId)
+      }
+    } catch (error) {
+      console.warn('[SA-114] Could not degrade a missed DM steer to wait:', {
+        dmId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+  return stamped
+}
+
+/**
+ * The result text an `info` note gets when a STEER delivered it (SA-114 P4 review, F-P4-2).
+ * Beside `WAKE_DELIVERED_INFO_RESULT` for the same reason that one is a constant: the drawer
+ * must not show two wordings for one event.
+ */
+export const STEER_DELIVERED_INFO_RESULT =
+  'Delivered mid-reply, inside a turn that was already running.'
+
+/**
+ * SA-114 P4 review (F-P4-2) — an `info` note the model has just READ mid-reply is no longer
+ * open.
+ *
+ * The wake lane closes a delivered info note at the end of its turn (SA-115 F-P1-2), for the
+ * reason spelled out there: an agent that was handed the note has no reason to go read it
+ * again, so an open one re-lists on every later turn's `DMs:` roster and sits open in the
+ * drawer until it expires. A steer hands the note over just as surely — the transport
+ * confirmed the model has it — so the same rule applies, at the moment of delivery, for the
+ * recipient of the run that delivered it. Assignments and results are untouched: they are
+ * work, not notes, and stay open until claimed and closed.
+ *
+ * Called from send-routed's transcript drain, inside the stream loop, so it must never throw
+ * and never take the stream down with a Redis hiccup: failures are logged per DM.
+ */
+export async function acknowledgeDeliveredDmSteers(
+  entries: Array<{ dmId?: string; source?: string }>,
+  agentId: string
+): Promise<string[]> {
+  const acked: string[] = []
+  for (const entry of entries) {
+    if (entry.source !== 'dm') continue
+    const dmId = typeof entry.dmId === 'string' ? entry.dmId.trim() : ''
+    if (!dmId) continue
+    try {
+      const record = await getDm(dmId)
+      if (!record || record.kind !== 'info' || !isOpenDmStatus(record.status)) continue
+      // Ownership is `acknowledgeInfoDm`'s own rule (`requireOwnedDm` throws), not restated.
+      await acknowledgeInfoDm(dmId, agentId, STEER_DELIVERED_INFO_RESULT)
+      acked.push(dmId)
+    } catch (error) {
+      console.warn('[SA-114] Could not acknowledge a DM steer the model read:', {
+        dmId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+  return acked
 }
 
 /**
  * SA-113 F-SEC-1b — mark this DM's woken turn as stopped waiting on the user.
  *
  * Two holdups reach here, and neither can be cleared by the agent:
- *   - `useControl` refusing a risky Fabric control with `CONTROL_RISK_NEEDS_HUMAN_TURN`
- *     (F-SEC-1), which happens MID-turn;
+ *   - the risk gate PAUSING a risky Fabric control for an Approve click (SA-116
+ *     DL-116-03), which happens MID-turn. Until SA-116 this was F-SEC-1's outright
+ *     refusal, `CONTROL_RISK_NEEDS_HUMAN_TURN`; a woken turn now gets the same card as
+ *     any other turn, and the stamp is what tells the user their chat is parked on them;
  *   - a woken turn that ended sitting in the persisted tool-approval state, seen by
  *     `finishWokenTurn`.
  *
@@ -770,6 +922,18 @@ export async function clearDmNeedsUser(dmId: string): Promise<void> {
  * otherwise outlive the reply that answered it (Faye's P5b re-check, F-P5b-1). One inbox
  * read for the acting agent; send-routed pays it only for a DM-enabled agent's sends.
  * Returns the ids it cleared, for the test and for anyone curious.
+ *
+ * SA-115 F-P2-1 — a wake-delivered `info` note CLOSES here rather than just losing its
+ * stamp. `finishWokenTurn` deliberately skips F-P1-2's acknowledge while a DM is stamped,
+ * so without this the note would go back to living in every later roster forever. At this
+ * exact moment it is both delivered (the wake handed it over as the turn's first message)
+ * and seen (the human is replying in that very chat), which is more than `sys.dm.read`
+ * proves. Narrow on purpose: an `assignment` is work and still closes by being claimed and
+ * closed, and a `wait` delivery was never handed to anyone, so it still has to be read.
+ *
+ * `acknowledgeInfoDm` runs `withoutNeedsUser` itself, so the stamped note takes ONE write,
+ * not a clear followed by a close. Neither call nests: this function holds no lock of its
+ * own, and each takes and releases the agent's inbox lock in turn.
  */
 export async function clearNeedsUserForHumanReply(
   agentId: string,
@@ -782,7 +946,23 @@ export async function clearNeedsUserForHumanReply(
   const cleared: string[] = []
   for (const record of open) {
     if (!record.delivery?.needsUser || record.delivery.sessionId !== session) continue
-    await clearDmNeedsUser(record.id)
+    if (record.kind === 'info' && record.delivery.actual === 'wake') {
+      // `clearDmNeedsUser` is silent on a vanished record; `acknowledgeInfoDm` THROWS
+      // (`requireOwnedDm`). A DM can disappear between the `listInbox` above and this line —
+      // the user deleting it from the drawer, or the lazy reaper expiring it — and letting
+      // that escape would abandon the REST of this loop, so one reply would silently fail
+      // to clear the other holdups it answered. Only that one benign case is tolerated;
+      // anything else still reaches the caller's catch, because a Redis failure here is a
+      // real failure and must not read as "nothing to clear".
+      try {
+        await acknowledgeInfoDm(record.id, agent, WAKE_DELIVERED_INFO_RESULT)
+      } catch (error) {
+        if (!(error instanceof DmStoreError) || error.code !== 'not_found') throw error
+        continue
+      }
+    } else {
+      await clearDmNeedsUser(record.id)
+    }
     cleared.push(record.id)
   }
   return cleared

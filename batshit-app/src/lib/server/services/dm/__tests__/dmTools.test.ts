@@ -8,19 +8,31 @@ import {
 } from '$lib/server/services/wakeRunRegistry'
 import {
   clearSessionTurn,
-  registerSessionTurn
+  clearStreamAbort,
+  registerSessionTurn,
+  registerStreamAbort
 } from '$lib/server/services/streamAbortRegistry'
+import {
+  __resetSteerInboxRegistryForTests,
+  listPendingSteers,
+  registerSteerRun,
+  takeMissedDmSteers
+} from '$lib/server/services/steerInboxRegistry'
+import { STEER_MISSED_REASON } from '$lib/utils/dmControl'
 import {
   __resetDmLocksForTests,
   createDm,
+  degradeMissedDmSteers,
   getDm,
   listInbox,
   reopenDm,
   stampDmNeedsUser
 } from '../dmStore'
+import { createSchedule } from '$lib/server/services/schedules/scheduleStore'
 import {
   buildWokenDmContent,
   claimDmOp,
+  deliverScheduledDm,
   closeDmOp,
   listDmAgentsOp,
   listDmsOp,
@@ -111,6 +123,7 @@ beforeEach(async () => {
   fetchCalls.length = 0
   __resetDmLocksForTests()
   __resetWakeRunRegistryForTests()
+  __resetSteerInboxRegistryForTests()
   previousToken = envRecord.BATSHIT_TOKEN
   envRecord.BATSHIT_TOKEN = 'test-service-token'
   stubFetch()
@@ -120,6 +133,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   __resetWakeRunRegistryForTests()
+  __resetSteerInboxRegistryForTests()
   if (previousToken === undefined) delete envRecord.BATSHIT_TOKEN
   else envRecord.BATSHIT_TOKEN = previousToken
   vi.unstubAllGlobals()
@@ -223,16 +237,22 @@ describe('sending (DL-113-03)', () => {
     ).resolves.toMatchObject({ delivered_as: 'wait' })
   })
 
-  it('refuses `steer` until SA-114 ships', async () => {
-    await expect(
-      sendDmOp(baseContext(), {
-        to: COOPER,
-        kind: 'info',
-        subject: 'x',
-        body: 'y',
-        deliver: 'steer' as never
-      })
-    ).rejects.toThrow(/SA-114/)
+  it('accepts `steer` and degrades it to wait when nobody is mid-reply (DL-114-13)', async () => {
+    // SA-113 reserved this mode and this test asserted it was refused. SA-114 P4 filled it
+    // in: a steer with no reply to land in is not an error — the DM is written, the sender
+    // is told what happened, and it waits in the inbox like any other note.
+    const result = await sendDmOp(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'x',
+      body: 'y',
+      deliver: 'steer'
+    })
+    expect(result).toMatchObject({ delivered_as: 'wait' })
+    expect((result as any).reason).toMatch(/not mid-reply/i)
+    const record = await getDm((result as any).dm_id)
+    expect(record?.delivery.requested).toBe('steer')
+    expect(record?.delivery.actual).toBe('wait')
   })
 })
 
@@ -1030,5 +1050,505 @@ describe('an expired unclaimed assignment reports back', () => {
         (item) => item.kind === 'result' && item.relatedDmId === dmId
       )
     ).toHaveLength(1)
+  })
+})
+
+describe('scheduled wake-ups (SA-115, DL-115-05)', () => {
+  async function seedSchedule(overrides: Record<string, any> = {}) {
+    return createSchedule({
+      userId: USER,
+      agentId: COOPER,
+      name: 'Morning check',
+      cadence: { type: 'daily', at: '09:00' },
+      timeZone: 'America/Chicago',
+      message: 'Say good morning.',
+      ...overrides
+    })
+  }
+
+  it('writes a DM FROM the schedule and wakes the agent with a schedule origin', async () => {
+    const schedule = await seedSchedule()
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    expect(result.deliveredAs).toBe('wake')
+    expect(result.outcome).toBe(`woke: ${result.sessionId}`)
+
+    const dm = await getDm(result.dmId)
+    expect(dm?.from).toEqual({ kind: 'schedule', scheduleId: schedule.id, name: 'Morning check' })
+    expect(dm?.subject).toBe('Morning check')
+    expect(dm?.body).toBe('Say good morning.')
+    expect(dm?.delivery).toMatchObject({ requested: 'wake', actual: 'wake', sessionId: result.sessionId })
+
+    // A clock starts a chain; it never continues one. Depth 0 in means depth 1 on the
+    // woken turn, exactly as a webhook produces.
+    const session = await redis.getSession(result.sessionId as string)
+    expect((session?.metadata as any)?.origin).toMatchObject({
+      kind: 'schedule',
+      label: 'Morning check',
+      scheduleId: schedule.id,
+      dmId: result.dmId,
+      chainDepth: 1
+    })
+    expect(session?.name).toBe('Schedule: Morning check')
+
+    const messages = await redis.getMessages(result.sessionId as string, 10)
+    expect(messages[0].content).toContain('[Schedule "Morning check" — not from the user]')
+    expect(messages[0].content).toContain(`DM id: ${result.dmId}`)
+    expect((messages[0].metadata as any)?.wake?.chainDepth).toBe(1)
+  })
+
+  it('leaves a `wait` schedule in the inbox and never starts a turn', async () => {
+    const schedule = await seedSchedule({ deliver: 'wait' })
+    const before = fetchCalls.length
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    expect(result.deliveredAs).toBe('wait')
+    expect(result.outcome).toBe('waiting in inbox')
+    expect(result.sessionId).toBeUndefined()
+    expect(fetchCalls.length).toBe(before)
+    expect((await listInbox(COOPER)).map((item) => item.id)).toContain(result.dmId)
+  })
+
+  it('degrades to wait with the reason on the DM and in the outcome', async () => {
+    const schedule = await seedSchedule()
+    await redis.updateAgent(COOPER, { wake_enabled: false } as any)
+
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+    expect(result.deliveredAs).toBe('wait')
+    expect(result.outcome).toMatch(/^waited: /)
+    expect(result.outcome).toMatch(/May be woken/i)
+    expect((await getDm(result.dmId))?.delivery).toMatchObject({
+      requested: 'wake',
+      actual: 'wait'
+    })
+    // Nothing is dropped: the DM is still there for the agent's next turn.
+    expect(await listInbox(COOPER)).toHaveLength(1)
+  })
+
+  it('an assignment gets stated defaults and NO report-back, because a clock has no inbox', async () => {
+    const schedule = await seedSchedule({ kind: 'assignment', deliver: 'wait' })
+    const result = await deliverScheduledDm(schedule, { trigger: 'tick' })
+
+    const dm = await getDm(result.dmId)
+    expect(dm?.kind).toBe('assignment')
+    expect(dm?.requestedOutcome).toBeTruthy()
+    expect(dm?.scope).toBeTruthy()
+    expect(dm?.reportBackTo).toBeUndefined()
+  })
+
+  it('says when a LATE run was due, and stays quiet when it is on time', async () => {
+    const schedule = await seedSchedule({ deliver: 'wait' })
+    const dueAt = new Date('2026-09-08T14:00:00.000Z')
+
+    const late = await deliverScheduledDm(schedule, {
+      trigger: 'tick',
+      dueAt,
+      now: new Date(dueAt.getTime() + 4 * 60_000)
+    })
+    expect((await getDm(late.dmId))?.body).toContain(
+      '(This run was due Tue, Sep 8, 9:00 AM CDT and is running late.)'
+    )
+
+    // The on-time body has no note, which also makes it a different body — so the DM
+    // store's ten-minute duplicate guard does not swallow the second send.
+    const onTime = await deliverScheduledDm(schedule, {
+      trigger: 'tick',
+      dueAt,
+      now: new Date(dueAt.getTime() + 5_000)
+    })
+    expect((await getDm(onTime.dmId))?.body).toBe('Say good morning.')
+  })
+
+  it('refuses a recipient that is gone, not a primary, or has Agent DMs off', async () => {
+    const schedule = await seedSchedule()
+
+    await redis.updateAgent(COOPER, { dms_enabled: false } as any)
+    await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(/Agent DMs/i)
+
+    await redis.updateAgent(COOPER, { dms_enabled: true, agentType: 'n8n' } as any)
+    await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
+      /API or CLI primary/i
+    )
+
+    await redis.del(`agent:${COOPER}`)
+    await expect(deliverScheduledDm(schedule, { trigger: 'tick' })).rejects.toThrow(
+      /no longer exists/i
+    )
+  })
+})
+
+/**
+ * SA-114 P4 (DL-114-13) — `deliver: 'steer'`.
+ *
+ * The recipient's running turn is set up here the way send-routed sets it up: the
+ * session-turn lock, the stream, and the steer run's verdict, all naming one assistant
+ * message id. Nothing here fakes `sendDmOp`'s own view of that — the point of these tests
+ * is that it reads the SAME three registries the steer route reads.
+ */
+describe('steering a busy agent (DL-114-13)', () => {
+  const COOPER_SESSION = 'sess-cooper-busy'
+  const COOPER_ASSISTANT = 'msg_assistant_cooper'
+
+  async function startCooperReply(
+    options: { steerable?: boolean; reason?: string | null; messageId?: string } = {}
+  ) {
+    const messageId = options.messageId ?? COOPER_ASSISTANT
+    await redis.createSession({
+      id: COOPER_SESSION,
+      user_id: USER,
+      agent_id: COOPER,
+      name: 'Cooper is working'
+    } as any)
+    registerSessionTurn(COOPER_SESSION, 'single', messageId)
+    registerStreamAbort(COOPER_SESSION, messageId, new AbortController())
+    registerSteerRun(COOPER_SESSION, {
+      messageId,
+      steerable: options.steerable ?? true,
+      reason: options.reason ?? null,
+      lane: (options.steerable ?? true) ? 'api' : null
+    })
+    return messageId
+  }
+
+  function stopCooperReply(messageId = COOPER_ASSISTANT) {
+    clearStreamAbort(COOPER_SESSION, messageId)
+    clearSessionTurn(COOPER_SESSION, messageId)
+  }
+
+  afterEach(() => {
+    stopCooperReply()
+  })
+
+  it('lands inside the reply the recipient is writing and stamps the DM', async () => {
+    const messageId = await startCooperReply()
+
+    const result = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'Use the smoke lane',
+      body: 'Not the Mac app — the smoke stack is the one with the seeded agents.',
+      priority: 'urgent',
+      deliver: 'steer'
+    })
+
+    expect(result).toMatchObject({ delivered_as: 'steer', session_id: COOPER_SESSION })
+
+    const queued = listPendingSteers(COOPER_SESSION)
+    expect(queued).toHaveLength(1)
+    expect(queued[0]).toMatchObject({
+      steerId: result.dm_id,
+      dmId: result.dm_id,
+      messageId,
+      source: 'dm',
+      label: 'Faye'
+    })
+    // The steer text carries the DM's own content and its id, so a steered assignment is
+    // still claimable — but NOT a second "not from the user" bracket: the injection wrapper
+    // adds that on the way to the model.
+    expect(queued[0].text).toContain('Use the smoke lane')
+    expect(queued[0].text).toContain(`DM id: ${result.dm_id}`)
+    expect(queued[0].text).not.toContain('not from the user')
+
+    const record = await getDm(result.dm_id)
+    expect(record?.delivery).toMatchObject({
+      requested: 'steer',
+      actual: 'steer',
+      sessionId: COOPER_SESSION
+    })
+  })
+
+  it('degrades to wait when the recipient is idle, and records why', async () => {
+    const result = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'No rush',
+      body: 'Whenever you get to it.',
+      deliver: 'steer'
+    })
+
+    expect(result.delivered_as).toBe('wait')
+    expect(result.reason).toMatch(/not mid-reply/i)
+    expect(listPendingSteers(COOPER_SESSION)).toHaveLength(0)
+    const record = await getDm(result.dm_id)
+    expect(record?.delivery).toMatchObject({ requested: 'steer', actual: 'wait' })
+    expect(record?.steerFallback).toBe('wait')
+  })
+
+  it('degrades to a real wake when the sender asked for that fallback', async () => {
+    const result = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'Start now',
+      body: 'The build is red.',
+      deliver: 'steer',
+      steer_fallback: 'wake'
+    })
+
+    expect(result.delivered_as).toBe('wake')
+    expect(result.session_id).toBeTruthy()
+    // A degraded steer spends the wake budget only because it BECAME a wake. The steer
+    // itself spends none, which is why nothing above this line touches it.
+    const record = await getDm(result.dm_id)
+    expect(record?.delivery).toMatchObject({ requested: 'steer', actual: 'wake' })
+    expect(record?.steerFallback).toBe('wake')
+  })
+
+  it('refuses a second agent DM while the first is still waiting for that reply', async () => {
+    await startCooperReply()
+    await seedAgent(OPIE)
+
+    const first = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'First',
+      body: 'one',
+      deliver: 'steer'
+    })
+    expect(first.delivered_as).toBe('steer')
+
+    const second = await sendOne(baseContext(OPIE, 'sess-opie'), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'Second',
+      body: 'two',
+      deliver: 'steer'
+    })
+    expect(second.delivered_as).toBe('wait')
+    expect(second.reason).toMatch(/already waiting to land/i)
+    expect(listPendingSteers(COOPER_SESSION)).toHaveLength(1)
+  })
+
+  it('degrades when the running turn says it cannot be steered, using the run\'s own reason', async () => {
+    await startCooperReply({
+      steerable: false,
+      reason: 'This Codex agent runs on the one-shot exec transport.'
+    })
+
+    const result = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'Nope',
+      body: 'x',
+      deliver: 'steer'
+    })
+
+    expect(result.delivered_as).toBe('wait')
+    expect(result.reason).toMatch(/exec transport/i)
+    expect(listPendingSteers(COOPER_SESSION)).toHaveLength(0)
+  })
+
+  it('degrades when the turn dies in setup before its stream ever registers', async () => {
+    // The lock is held (the top of send-routed) but the stream never comes. The DM door
+    // waits through that window like the route does (F-P4-3) and stops the moment the lock
+    // goes, so the honest answer arrives as soon as it is true rather than at the bound.
+    await startCooperReply()
+    clearStreamAbort(COOPER_SESSION, COOPER_ASSISTANT)
+    const releaseTimer = setTimeout(
+      () => clearSessionTurn(COOPER_SESSION, COOPER_ASSISTANT),
+      200
+    )
+
+    try {
+      const result = await sendOne(baseContext(), {
+        to: COOPER,
+        kind: 'info',
+        subject: 'Too early',
+        body: 'x',
+        deliver: 'steer'
+      })
+      expect(result.delivered_as).toBe('wait')
+      expect(result.reason).toMatch(/not mid-reply/i)
+      expect(listPendingSteers(COOPER_SESSION)).toHaveLength(0)
+      // F-P4-1: a steer that landed nowhere names no chat.
+      const record = await getDm(result.dm_id)
+      expect(record?.delivery).toMatchObject({ requested: 'steer', actual: 'wait' })
+      expect(record?.delivery.sessionId).toBeUndefined()
+    } finally {
+      clearTimeout(releaseTimer)
+    }
+  })
+
+  it('waits through the setup window the way the steer route does (F-P4-3)', async () => {
+    // send-routed registers the session-turn lock at its top and the stream only after
+    // compile, clips and the memory commit — 1.5 to 3 s later, measured. A DM steer sent in
+    // that window degraded with "not mid-reply right now", which is false: the agent IS
+    // mid-reply, its reply is being set up. F-P3-1 fixed the same defect on the user's door.
+    await redis.createSession({
+      id: COOPER_SESSION,
+      user_id: USER,
+      agent_id: COOPER,
+      name: 'Cooper is starting a reply'
+    } as any)
+    registerSessionTurn(COOPER_SESSION, 'single', COOPER_ASSISTANT)
+    const streamTimer = setTimeout(() => {
+      registerStreamAbort(COOPER_SESSION, COOPER_ASSISTANT, new AbortController())
+      registerSteerRun(COOPER_SESSION, {
+        messageId: COOPER_ASSISTANT,
+        steerable: true,
+        reason: null,
+        lane: 'api'
+      })
+    }, 300)
+
+    try {
+      const result = await sendOne(baseContext(), {
+        to: COOPER,
+        kind: 'info',
+        subject: 'Early',
+        body: 'Sent while the reply was still compiling.',
+        deliver: 'steer'
+      })
+      expect(result).toMatchObject({ delivered_as: 'steer', session_id: COOPER_SESSION })
+      expect(listPendingSteers(COOPER_SESSION)).toHaveLength(1)
+    } finally {
+      clearTimeout(streamTimer)
+    }
+  })
+
+  it('keeps the steer reason on the record when the fallback wakes (F-P4-1)', async () => {
+    const result = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'Start now',
+      body: 'The build is red.',
+      deliver: 'steer',
+      steer_fallback: 'wake'
+    })
+    expect(result.delivered_as).toBe('wake')
+    // The sender was told why the steer became a wake; the record must say the same.
+    const record = await getDm(result.dm_id)
+    expect(record?.delivery.actual).toBe('wake')
+    expect(record?.delivery.reason).toMatch(/not mid-reply/i)
+  })
+
+  it('records both reasons when the fallback wake is refused too (F-P4-1)', async () => {
+    await seedAgent(COOPER, { wake_enabled: false })
+    const result = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'Start now',
+      body: 'The build is red.',
+      deliver: 'steer',
+      steer_fallback: 'wake'
+    })
+    expect(result.delivered_as).toBe('wait')
+    const record = await getDm(result.dm_id)
+    expect(record?.delivery.actual).toBe('wait')
+    expect(record?.delivery.reason).toMatch(/not mid-reply/i)
+    expect(record?.delivery.reason).toMatch(/"May be woken" turned off/)
+    expect(record?.delivery.sessionId).toBeUndefined()
+  })
+
+  it('cannot overwrite the end-of-turn degrade with a stale "landed" stamp (F-P4-1)', async () => {
+    // The race: the entry is enqueued, the reply ends at once, the request's `finally`
+    // takes the missed entry and stamps `wait` — and THEN the send's own "landed" stamp
+    // completes and overwrites it with `steer`. The record would say "landed mid-reply"
+    // about a DM the model never saw. The fix is order: the stamp goes down BEFORE the
+    // enqueue, so a degrade can only ever come after it.
+    //
+    // The gate below holds the first read of this DM's record that happens while its steer
+    // entry is already in the inbox. Before the fix that read is the "landed" stamp's own
+    // re-read (the stamp runs AFTER the enqueue); with the fix the stamp runs before the
+    // enqueue, so the gate never engages and the test simply degrades afterwards.
+    await startCooperReply()
+    let release: (() => void) | null = null
+    let markEngaged: (() => void) | null = null
+    const engaged = new Promise<void>((resolve) => {
+      markEngaged = resolve
+    })
+    // On the fake lane `redis.json.get` is already a `vi.fn`, so spying on it REPLACES its
+    // implementation rather than wrapping it — the original has to be read off the mock
+    // first or the gate calls itself. On the real lane it is a plain function.
+    const currentGet = redis.json.get as any
+    const originalGet: (key: string, path?: string) => Promise<any> =
+      typeof currentGet.getMockImplementation === 'function' &&
+      currentGet.getMockImplementation()
+        ? currentGet.getMockImplementation()
+        : currentGet.bind(redis.json)
+    const spy = vi
+      .spyOn(redis.json, 'get')
+      .mockImplementation(async (key: string, path?: string) => {
+        if (
+          key.startsWith('dm:') &&
+          listPendingSteers(COOPER_SESSION).length > 0 &&
+          release === null
+        ) {
+          await new Promise<void>((resolve) => {
+            release = resolve
+            markEngaged?.()
+          })
+        }
+        return originalGet(key, path)
+      })
+
+    try {
+      const sending = sendOne(baseContext(), {
+        to: COOPER,
+        kind: 'info',
+        subject: 'Racing the end of the reply',
+        body: 'x',
+        deliver: 'steer'
+      })
+      const outcome = await Promise.race([
+        engaged.then(() => 'gated' as const),
+        sending.then(() => 'done' as const)
+      ])
+
+      // The reply ends now, exactly as send-routed's `finally` does it.
+      const missed = takeMissedDmSteers(COOPER_SESSION)
+      expect(missed).toHaveLength(1)
+      await degradeMissedDmSteers(missed, STEER_MISSED_REASON)
+
+      if (outcome === 'gated') release!()
+      const result = await sending
+
+      const record = await getDm(result.dm_id)
+      expect(record?.delivery.actual).toBe('wait')
+      expect(record?.delivery.reason).toBe(STEER_MISSED_REASON)
+      expect(record?.delivery.sessionId).toBeUndefined()
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('never steers somebody else\'s session', async () => {
+    await redis.createSession({
+      id: 'sess-theirs',
+      user_id: 'someone-else',
+      agent_id: COOPER,
+      name: 'Not yours'
+    } as any)
+    registerSessionTurn('sess-theirs', 'single', 'msg_theirs')
+    registerStreamAbort('sess-theirs', 'msg_theirs', new AbortController())
+    registerSteerRun('sess-theirs', {
+      messageId: 'msg_theirs',
+      steerable: true,
+      reason: null,
+      lane: 'api'
+    })
+
+    const result = await sendOne(baseContext(), {
+      to: COOPER,
+      kind: 'info',
+      subject: 'x',
+      body: 'y',
+      deliver: 'steer'
+    })
+    expect(result.delivered_as).toBe('wait')
+    expect(listPendingSteers('sess-theirs')).toHaveLength(0)
+    clearStreamAbort('sess-theirs', 'msg_theirs')
+    clearSessionTurn('sess-theirs', 'msg_theirs')
+  })
+
+  it('refuses a broadcast that asks to steer', async () => {
+    await expect(
+      sendDmOp(baseContext(), {
+        to: 'all',
+        kind: 'info',
+        subject: 'everyone',
+        body: 'x',
+        deliver: 'steer'
+      })
+    ).rejects.toThrow(/cannot steer anybody/i)
   })
 })

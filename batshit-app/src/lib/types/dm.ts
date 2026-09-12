@@ -31,13 +31,27 @@ export type DmSender =
   | { kind: 'agent'; agentId: string; name: string }
   /** P3's wake-up webhook. The name is the hook's, frozen at send time. */
   | { kind: 'webhook'; hookId: string; name: string }
+  /**
+   * SA-115: Batshit's own clock. The name is the schedule's, frozen at fire time, so a
+   * renamed or deleted schedule still reads correctly in an old inbox row.
+   */
+  | { kind: 'schedule'; scheduleId: string; name: string }
 
-/** What actually happened to a `deliver: 'wake'` request, and why if it changed. */
+/**
+ * What actually happened to a `deliver: 'wake'` or `deliver: 'steer'` request, and why if
+ * it changed.
+ *
+ * `requested` is what the sender asked for and never changes. `actual` is what Batshit did:
+ * a refused wake reads `wait`, and a `steer` with no reply to land in reads whichever
+ * fallback the sender chose (SA-114 DL-114-13). A steer that could not land is NEVER
+ * promoted into a user turn — an agent's text must not start one — so `actual` for a
+ * degraded steer is `wait` or `wake`, never a third outcome.
+ */
 export interface DmDeliveryRecord {
-  requested: 'wait' | 'wake'
-  actual: 'wait' | 'wake'
+  requested: 'wait' | 'wake' | 'steer'
+  actual: 'wait' | 'wake' | 'steer'
   reason?: string
-  /** The session the wake-up ran in, when one started. */
+  /** The session the wake-up ran in, or the chat a steer landed inside. */
   sessionId?: string
   /** How that woken turn ended, once it did (`WakeRunEndReason`). */
   outcome?: string
@@ -80,7 +94,12 @@ export interface DmRecord {
   /** Required on a `result`: the assignment this answers. */
   relatedDmId?: string
 
-  deliver: 'wait' | 'wake'
+  deliver: 'wait' | 'wake' | 'steer'
+  /**
+   * `deliver: 'steer'` only (SA-114 DL-114-13): what to do when the recipient is not
+   * mid-reply. Default `wait`.
+   */
+  steerFallback?: 'wait' | 'wake'
   /** `assignment` only: how the eventual `result` is delivered. Default `wait`. */
   resultDelivery?: 'wait' | 'wake'
 

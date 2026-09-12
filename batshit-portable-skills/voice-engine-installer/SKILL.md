@@ -82,7 +82,7 @@ curl -sS "$BATSHIT_BASE_URL/api/controls/use" \
   }'
 ```
 
-Portable Skill Tokens are the standing approval for the granted family. The server applies `allowRisky: true` for portable-token calls after family scope passes, so do not add parallel approval workarounds.
+Portable Skill Tokens are the standing approval for the granted family. The server applies `allowRisky: true` for portable-token calls after family scope passes, so do not add parallel approval workarounds. This is the ONE lane where that flag still means anything: in a Batshit chat the flag is ignored and a risky control pauses for the user's **Approve** click instead. The shared reference files below describe that chat behaviour, because Batshit's own in-app skill reads the same pages.
 
 ## Safety Boundary
 

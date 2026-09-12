@@ -28,6 +28,14 @@ export type ClaudeStreamChunk =
       usage?: ClaudeUsageSummary
     }
   | { type: 'thinking'; itemId: string; content: string; final?: boolean }
+  /**
+   * SA-114 P2 (DL-114-08) — the CLI replayed a steered line, so the model has it.
+   *
+   * Ids only. The words live in Batshit's steer inbox and send-routed writes the transcript
+   * marker from there in its `case 'steer'`; duplicating the text on the chunk would give
+   * two places the same bytes and one of them would drift.
+   */
+  | { type: 'steer'; steerIds: string[]; lane: 'claude' }
 
 type ClaudeUsageSummary = {
   inputTokens?: number
@@ -571,7 +579,20 @@ export class ClaudeEventAdapter {
         }
 
         if (event.type === 'user' && event.message) {
+          // A replayed steer is a text-only `user` event, and `handleUserMessage` looks at
+          // `tool_result` blocks only — so the echo already produces nothing here. That is
+          // the behaviour to keep: the user's own mid-reply words must never be surfaced as
+          // a tool result or as a second user turn. The bridge recognises the echo and
+          // yields the synthetic event below in its place.
           yield* this.handleUserMessage(event.message, event.tool_use_result)
+          continue
+        }
+
+        if (event.type === 'batshit_steer_delivered' && Array.isArray(event.steer_ids)) {
+          // Straight through. The adapter deliberately does NOT mark the steer delivered
+          // itself (F-P1-3's rule for a CLI lane): send-routed's own `case` does that, so
+          // the transcript marker lands exactly where this chunk sits in the stream.
+          yield { type: 'steer', steerIds: [...event.steer_ids], lane: 'claude' }
           continue
         }
 

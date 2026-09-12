@@ -17,6 +17,34 @@ Around the text box sit the controls you use most:
 
 When an agent is working, a **Stop** control appears so you can cut a run short. Stopping doesn't throw away what the agent already produced — partial work and tool results stay in the chat with a clear note. More on that in [Zips and context](../tools/zips.md).
 
+## Steer or interrupt while the agent is busy
+
+You thought of something after you hit send. You don't have to wait, and you don't have to start over.
+
+While an agent is replying, the Send button changes to **Steer**. Your message waits for the agent to finish whatever tool it's in the middle of, then arrives **inside the reply it's already writing** — the agent reads it and adjusts without losing its place. It shows up in the chat as a small bubble tucked into the reply, at the exact spot it arrived, marked *You, mid-reply*.
+
+The other option is **Interrupt**: the reply stops, everything it already produced is kept, and your message starts a fresh turn with a note saying the last one was cut short. That's what Batshit did before, and it's still one click away. The **Stop** button is always an interrupt.
+
+**Picking which one is the default.** Settings → User → Chat → *When you send while the agent is busy*. Steer is the default. The change takes effect immediately, even in a chat that's mid-reply.
+
+**Sending the other way just once.** Press **Cmd+Enter** (Ctrl+Enter on Windows) instead of Enter and that one message goes with the opposite mode. Enter always means your default.
+
+**What the bubble tells you.**
+
+| It says | It means |
+|---|---|
+| *Queued for the agent's next step* | Batshit has your message and is holding it for the next tool call to finish. On a Codex or Claude agent this can sit for several seconds — that's normal, not a failure. |
+| *Read mid-reply* | The agent has it and is working with it. |
+| *Sent as your next message* | The reply ended before your message could fit inside it, so Batshit sent it as your next message instead and the agent is answering it now. |
+| *Not sent — you stopped the reply* | You pressed Stop. Nothing was sent. Your words are still in the box; send them again when you're ready. |
+| *With files: waits for the reply to finish* | You attached something. Files are never steered — the message waits and goes as a normal send once the reply ends. |
+
+**Nothing you type is lost.** If the agent's reply has no tool call left to catch your message — a plain text answer, or one that's already wrapping up — Batshit sends it as your next message the moment the reply ends. That happens on the server, so it works even if you close the tab.
+
+**Where steering isn't available.** Group chats interrupt instead, because agents there speak one at a time. So do Codex agents running on the one-shot transport and CLI agents using your own profile rather than Batshit's. In all of those the button says *Interrupt and send* and the tooltip says why.
+
+**Voice.** A steer doesn't stop the agent talking — the reply is still going. An interrupt stops it, exactly like Stop.
+
 ## The message stream
 
 Above the composer is the conversation itself — your messages and the agent's replies, newest at the bottom. Replies stream in live as the model generates them.

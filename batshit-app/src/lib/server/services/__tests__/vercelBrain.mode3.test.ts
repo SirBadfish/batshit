@@ -903,4 +903,128 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       expect(callArgs.providerOptions?.openrouter?.cache_control).toBeUndefined()
     })
   })
+
+  /**
+   * SA-114 P1 (DL-114-05) — the composed `prepareStep`.
+   *
+   * Before this story the hook existed only on SA-105's text-only image lanes. It is now
+   * registered on EVERY streaming run, and DL-105-13's "call shape unchanged" promise
+   * becomes the stricter one these tests pin: always present, and returning `undefined` —
+   * the SDK's own "change nothing" answer — whenever nothing is pending.
+   */
+  describe('SA-114 steer delivery (DL-114-05)', () => {
+    const baseRequest = (overrides: Partial<NativeModeRequest> = {}): NativeModeRequest => ({
+      messages: [{ role: 'user', content: 'do some work' }],
+      model: 'claude-3-5-sonnet',
+      sessionId: 'test-session',
+      messageId: 'test-message',
+      ...overrides
+    })
+
+    const toolResultStep = () => ({
+      content: [{ type: 'tool-call' }, { type: 'tool-result', toolCallId: 'call_1' }]
+    })
+
+    const getPrepareStep = async (request: NativeModeRequest) => {
+      await brain.streamNativeMode(request)
+      const callArgs = vi.mocked(streamText).mock.calls.at(-1)?.[0] as any
+      return callArgs.prepareStep as (args: {
+        messages: any[]
+        steps: any[]
+      }) => { messages: any[] } | undefined
+    }
+
+    it('registers prepareStep on every run, with or without a steer channel', async () => {
+      expect(await getPrepareStep(baseRequest())).toBeTypeOf('function')
+      expect(await getPrepareStep(baseRequest({ takeSteers: () => [] }))).toBeTypeOf(
+        'function'
+      )
+    })
+
+    it('DL-105-13 parity: changes nothing when neither images nor steers are pending', async () => {
+      const prepareStep = await getPrepareStep(baseRequest({ takeSteers: () => [] }))
+      const messages = [{ role: 'user', content: 'do some work' }]
+
+      expect(prepareStep({ messages, steps: [] })).toBeUndefined()
+      expect(prepareStep({ messages, steps: [toolResultStep()] })).toBeUndefined()
+    })
+
+    it('injects one user message after a tool result, and marks the steers delivered', async () => {
+      const takeSteers = vi.fn().mockReturnValue([
+        {
+          steerId: 'steer_1',
+          messageId: 'test-message',
+          text: 'also run the tests',
+          at: '2026-09-10T12:00:00.000Z',
+          source: 'user',
+          step: 1,
+          lane: 'api'
+        },
+        {
+          steerId: 'steer_2',
+          messageId: 'test-message',
+          text: 'and push it',
+          at: '2026-09-10T12:00:01.000Z',
+          source: 'user',
+          step: 1,
+          lane: 'api'
+        }
+      ])
+      const prepareStep = await getPrepareStep(baseRequest({ takeSteers }))
+      const messages = [{ role: 'user', content: 'do some work' }]
+
+      const result = prepareStep({ messages, steps: [toolResultStep()] })
+      expect(takeSteers).toHaveBeenCalledWith(1)
+      expect(result?.messages).toHaveLength(2)
+
+      const injected = result!.messages[1]
+      expect(injected.role).toBe('user')
+      // Both steers are ONE message: they are one interruption from the user's point of
+      // view, and they arrive in acceptance order.
+      expect(injected.content[0].text).toBe(
+        '[Steer — from the user, mid-reply]\nalso run the tests\n\n' +
+          '[Steer — from the user, mid-reply]\nand push it'
+      )
+    })
+
+    it('never lands mid-tool: a step with no tool result is not a boundary', async () => {
+      const takeSteers = vi.fn().mockReturnValue([])
+      const prepareStep = await getPrepareStep(baseRequest({ takeSteers }))
+      const messages = [{ role: 'user', content: 'do some work' }]
+
+      // Before the first model call: `steps` is empty, so there is nothing to land after.
+      expect(prepareStep({ messages, steps: [] })).toBeUndefined()
+      // A text-only step means the model has stopped calling tools; anything still waiting
+      // is promoted (DL-114-07) rather than injected here.
+      expect(
+        prepareStep({ messages, steps: [{ content: [{ type: 'text' }] }] })
+      ).toBeUndefined()
+      expect(takeSteers).not.toHaveBeenCalled()
+    })
+
+    it('labels a DM steer as not from the user (DL-114-13)', async () => {
+      const prepareStep = await getPrepareStep(
+        baseRequest({
+          takeSteers: () => [
+            {
+              steerId: 'steer_dm',
+              messageId: 'test-message',
+              text: 'the build is red',
+              at: '2026-09-10T12:00:00.000Z',
+              source: 'dm' as const,
+              dmId: 'dm_1',
+              label: 'Cooper',
+              step: 1,
+              lane: 'api' as const
+            }
+          ]
+        })
+      )
+
+      const result = prepareStep({ messages: [], steps: [toolResultStep()] })
+      expect(result?.messages[0].content[0].text).toBe(
+        '[Agent DM — from Cooper, not from the user, delivered mid-reply]\nthe build is red'
+      )
+    })
+  })
 })

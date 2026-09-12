@@ -197,7 +197,7 @@ When you are sure this is a new tool, use `sys.cli_tool.create` to save it. Here
 
 After saving, immediately run `sys.cli_tool.test` with the tool's `toolId`.
 
-- If it needs risk approval and the user clearly asked you to proceed, retry with `allowRisky: true`
+- If it needs risk approval, Batshit pauses it and shows the user an **Approve** button. Say what the test does and why, then stop. Never pass `allowRisky` — it is ignored. On an API agent the click re-runs the same call by itself; on a Codex or Claude agent the click resumes you with an approval message, and you then retry the same ref with the same input
 - This test verifies the saved record works. It is **not** the same as running the tool in chat.
 - **Do not** try to immediately rediscover or run the tool through Dynamic Tool Search. A saved CLI Tool becomes available for normal chat use only after the user selects it in their Tools panel.
 - The tool only becomes available for actual chat use after the user selects it in their Tools panel.

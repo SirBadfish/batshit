@@ -6,7 +6,12 @@
  * uses it on every captured provider response, so this remains a live security boundary.
  */
 
-const SENSITIVE_HEADER_KEYS = new Set([
+/**
+ * Exported so a test can assert that a header is EXPLICITLY registered, not merely caught by
+ * the conservative fallback below. SA-117 P1: `x-batshit-agent-token` is redacted either way,
+ * so a test that only checked the output would pass even if the entry were deleted.
+ */
+export const SENSITIVE_HEADER_KEYS = new Set([
   'authorization',
   'cookie',
   'set-cookie',
@@ -17,6 +22,11 @@ const SENSITIVE_HEADER_KEYS = new Set([
   'x-batshit-service-token',
   'x-batshit-callback-token',
   'x-batshit-native-tool-token',
+  // SA-117 P1 (DL-117-09). The `includes('token')` fallback below would already catch this
+  // one, and it is listed anyway: the fallback is a net for headers nobody thought about, and
+  // a credential Batshit itself mints and sends is not one of those. A rename to something
+  // without "token" in it would silently start capturing a live secret.
+  'x-batshit-agent-token',
   'x-batshit-internal-key',
   'x-auth-token',
   'x-access-token',

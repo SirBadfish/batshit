@@ -14,7 +14,7 @@ Batshit's browser automation runtime. Native installs can use the host runtime w
 
 ### Agent DM
 
-A message one Primary Agent sends another: an **info** note, an **assignment** (do this and report back), or a **result** (the answer to one). Off by default per agent. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+A message one Primary Agent sends another: an **info** note, an **assignment** (do this and report back), or a **result** (the answer to one). Off by default per agent. It is delivered one of three ways: **wait** (it sits in the inbox), **wake** (Batshit starts a chat for the recipient now), or **steer** (it lands inside the reply the recipient is already writing). See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 
 ### Agent Use
 
@@ -35,6 +35,10 @@ A Primary Agent that talks directly to model providers through Batshit's built-i
 ### API Subagent
 
 A Batshit-managed direct-provider specialist that a compatible Primary Agent can call.
+
+### Approval Card
+
+The **Approve** / **Deny** card Batshit puts on an agent's message when it tries a risky action. The action is paused, not refused: it runs only when you press **Approve**, exactly once, with exactly the input the card shows. Nothing an agent says can stand in for that click. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action).
 
 ### Artifact
 
@@ -192,6 +196,13 @@ An Artifact that embeds a HuggingFace Space. Current HuggingFace embeds are user
 
 An opt-in, one-way session type where one agent lives in one ongoing conversation. Infinite Sessions auto-lock, pin to their own sidebar section, organize life into episodes, and use naps instead of Compact. See [Memory & Infinite Sessions](../chat/memory-and-infinite-sessions.md).
 
+### Interrupt
+
+Sending a message while an agent is still replying in the way Batshit used to do it always:
+the reply stops, everything it already produced is kept, and your message starts a new turn
+with a note saying the last one was cut short. The **Stop** button is always an interrupt.
+The other option, and the default, is **Steer**.
+
 ### Inworld
 
 One of Batshit's direct realtime TTS providers when an Inworld API key and voice are configured. Batshit uses Inworld for speech output only; Batshit still owns chat context, tools, Zips, message storage, and playback events.
@@ -228,6 +239,10 @@ Batshit's per-agent memory system: Awareness (what the agent knows right now, in
 
 A saved provider/model configuration Batshit can reuse for agents, Artifacts, or other model-powered features.
 
+### Missed run
+
+A [Schedule](#schedule) whose time came and went while Batshit was closed or asleep for more than ten minutes. It never fires on its own. Batshit collects it — at most one entry per schedule, however many times it was missed — and asks you once, in the *Missed while Batshit was off* dialog, with **Run now** or **Skip** per item. Skip skips that one run; the schedule stays on.
+
 ### Mood
 
 A persistent Goon expression or motion state that stays active until changed.
@@ -262,6 +277,10 @@ Structured guidance attached to a Project. Project rules guide agents but are no
 
 ## R
 
+### Risk Level
+
+How much clearance a Fabric control needs. **Safe** runs straight away. **Confirm** and **Restricted** both stop and wait for your **Approve** click; Restricted carries a red badge because it deletes or rolls something back. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action).
+
 ### Redis
 
 Batshit's main data store for user settings, agents, messages, zips, clips, artifacts, Goons, and other app records. Batshit runs Redis 8, which builds in the JSON support Batshit needs. Docker keeps Redis internal-only by default.
@@ -282,6 +301,10 @@ An optional service Batshit can connect to, start through an approved operator, 
 
 An isolated execution environment. In Batshit docs, this usually means Apple Container for Mac app command execution and Docker Sandbox for Docker or cross-platform command execution.
 
+### Schedule
+
+A saved *when* and *what* for one Primary Agent, inside Batshit — "every day at 9am, tell Cooper to check the build". Batshit's own clock checks every 60 seconds and writes a DM when a schedule is due, starting a chat for the agent if you chose that. Three cadences: every N minutes or hours, daily at a time, or on chosen weekdays at a time, each in its own time zone. Managed in Admin → Instance-wide defaults → Agent Wake-ups → Schedules. For a trigger that lives *outside* Batshit, use a [Wake-up webhook](#wake-up-webhook) instead. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+
 ### Schema Hints
 
 Compact, on-demand tool descriptions returned by Dynamic Tool Search. Instead of loading every tool's full schema into the prompt up front, Batshit gives an agent just enough detail to call the tool it picked, which saves context.
@@ -301,6 +324,16 @@ A reusable instruction bundle with optional reference files and scripts. Users c
 ### Speech-to-text
 
 The process of turning spoken audio into text. Abbreviated as STT.
+
+### Steer
+
+Sending a message while an agent is still replying, so it arrives **inside** that reply at the
+agent's next tool call instead of stopping it. The default for a mid-reply send; the chat shows
+it as a small inset bubble at the spot it arrived. If the reply has no tool call left to catch
+it, Batshit sends it as your next message once the reply ends, so nothing you type is lost.
+The opposite is **Interrupt**. An urgent Agent DM can steer a busy agent the same way, marked
+as coming from another agent rather than from you. See
+[the chat workspace](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy).
 
 ### Subagent
 
@@ -350,11 +383,11 @@ VRM Animation, a reusable animation format for Goons.
 
 ### Wake-up
 
-A chat turn Batshit starts with nobody typing, because an Agent DM asked for the work to start now or a wake-up webhook was called. The chat appears in the sidebar with an icon saying what started it, costs tokens like any chat, and has the normal Stop button. A wake-up that cannot run becomes a **wait**, with the reason recorded.
+A chat turn Batshit starts with nobody typing, because an Agent DM asked for the work to start now, a **schedule** came due, or a wake-up webhook was called. The chat appears in the sidebar with an icon saying what started it, costs tokens like any chat, and has the normal Stop button. A wake-up that cannot run becomes a **wait**, with the reason recorded.
 
 ### Wake-up webhook
 
-One URL plus one token that lets anything outside Batshit — n8n, a schedule, a CI job — start a chat for one named agent. The token is shown once at creation; Batshit stores only a fingerprint. Managed in Admin → Instance-wide defaults → Agent Wake-ups.
+One URL plus one token that lets anything outside Batshit — n8n, a Slack bridge, a CI job — start a chat for one named agent. For a trigger that is just *time*, use a [Schedule](#schedule) instead; Batshit has its own clock. The token is shown once at creation; Batshit stores only a fingerprint. Managed in Admin → Instance-wide defaults → Agent Wake-ups.
 
 ### Webhook
 

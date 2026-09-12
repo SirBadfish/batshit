@@ -63,6 +63,23 @@ Provider API keys and custom provider secrets are stored encrypted, not as plain
 
 Docker note: the internal service token and encryption key are runtime-managed through the Docker environment. Rotate them deliberately and recreate/restart containers as required.
 
+## Tokens, and what a leak can do
+
+Batshit uses a handful of different secrets, and they are deliberately not the same size. The reason is simple: if one of them ever escapes, you want the damage to be as small as possible, and you want to know exactly what it is.
+
+The most important rule Batshit follows is that **an agent's identity comes from a credential Batshit minted, not from whatever a caller says it is**. When your Codex or Claude agent reads its own Agent DMs, Batshit knows it is that agent because the request arrived on a one-run credential Batshit created for that run. Nothing has to take the caller's word for it.
+
+| Secret | What it is | What someone holding it can do |
+| --- | --- | --- |
+| Instance token | Your install's own service secret, set once at setup. | Act as **you** — everything you can do through Batshit's own service routes. It can **not** act as one of your agents: reading, claiming, or closing another agent's DMs, recalling an agent's memories, and managing an agent's schedules are all refused. |
+| Run credential | Created automatically when a managed Codex or Claude run starts, thrown away when the run ends. | Act as that one agent, for the length of that one run. After the run it is deleted, and presenting it again is refused. You never see it, name it, or rotate it — there is nothing to manage. |
+| Run credential for a Subagent or Worker | The same thing, for a delegated run. | Authenticate that helper and nothing else. A Subagent or Worker has no inbox, no memories, and no schedules of its own, so it is refused an agent identity outright. |
+| Portable Skill Token | Issued by you, for an outside coding agent, scoped to specific capability families. | Run the capabilities in its scope, as you. It never names an agent, so it cannot act as one. |
+| Wake-up webhook token | Issued per webhook, shown once at creation. | Fire that one webhook, within its rate limit. Rotate or revoke it from Admin at any time. |
+| Workflow Subagent token | Created per message, for one n8n Workflow Subagent run. | Complete that one run. |
+
+**What this does not protect against.** If a command running inside an agent's shell can read your machine, it can read your machine. A Codex or Claude run happens on your computer, as you, so it can still see your database address, your encryption key, and your provider keys — and it could read your `.env` file whether or not Batshit handed it anything. Per-run credentials make Batshit's own idea of "who is acting" real and shrink what a stolen helper credential is worth. They are not a wall around your computer. That is what sandboxed Agent Mode is for, and it is why the [agent command execution](#agent-command-execution) section is worth reading.
+
 ## Backups
 
 Admin backup/restore exports a structured Batshit `.zip` bundle. Normal backups exclude saved provider keys and tokens by default. A With Secrets backup is available behind explicit confirmation, but it must be protected like a password vault.

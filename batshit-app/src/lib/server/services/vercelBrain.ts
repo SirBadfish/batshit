@@ -47,6 +47,7 @@ import { redis } from '$lib/server/redis' // Story 6.8: Load agent assigned work
 import { nativeToolService, type NativeToolApprovalPolicy } from './nativeTools'
 import { isNativeToolName } from './nativeToolConstants'
 import { compileClipReferencesForAiView } from '$lib/utils/clipAiView'
+import { buildSteerInjectionText, type DeliveredSteer } from '$lib/utils/steerControl'
 import { toOwnedBytes } from '$lib/utils/binary'
 import {
   compileManagedSubagentSystemPrompt,
@@ -225,11 +226,41 @@ export interface NativeModeRequest extends ThinkRequest {
   memoryControlsEnabled?: boolean
   /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
   dmControlsEnabled?: boolean
+  /** SA-115 P2 (DL-115-10): PRIMARY actor + agent `dms_enabled`. */
+  scheduleControlsEnabled?: boolean
   /**
    * SA-111 P4 (DL-111-11/12): PRIMARY runs of workers-enabled agents. The subagent runner
    * leaves it false, which is what keeps delegation depth at one level.
    */
   workersEnabled?: boolean
+  /**
+   * SA-116 P2 (DL-116-05, DL-116-10): the approvals the user clicked, keyed by the SDK
+   * `toolCallId` of the paused call, and whether this is a group member's turn (a group run
+   * never registers the risk-approval policy). Both are resolved by send-routed from server
+   * state — never from anything the browser posts back.
+   */
+  controlApprovals?: {
+    approved?: Record<string, { kind: 'sdk' | 'resume'; approvalId: string; toolCallId?: string }> | null
+    denied?: Record<string, { controlTitle?: string | null }> | null
+  } | null
+  groupMemberRun?: boolean
+  /**
+   * SA-117 P2 (F-P2-1) — a Subagent or Worker run on a managed CLI lane.
+   *
+   * Set only by `subagentRunner.ts`, never by send-routed's primary turn. It tells the
+   * bridge that `agentId` is the per-run runtime id it derived from the subagent's slug
+   * (`subagent_cli_…`) rather than one of the user's stored agents, so the run credential is
+   * minted without an agent record to check and is marked as unable to act as an agent.
+   */
+  delegatedRun?: boolean
+  /**
+   * SA-114 P1 (DL-114-05): takes every steer waiting for this turn and marks it delivered.
+   *
+   * Only send-routed's PRIMARY API turn supplies it. A subagent run, a Worker, a group
+   * member's turn, and an artifact completion all leave it unset, which is what keeps the
+   * user's mid-reply words inside the turn they were typed into (DL-114-09).
+   */
+  takeSteers?: ((step: number) => DeliveredSteer[]) | null
   gatewayToolMap?: Record<string, string[]> | null
   preloadedGatewayTools?: ToolMetadataMap['tools']
   preloadedGatewayMetadata?: ToolMetadataMap['metadata']
@@ -443,7 +474,10 @@ export class VercelAIBrain {
           selectedCliToolIds: request.selectedCliToolIds,
           memoryControlsEnabled: request.memoryControlsEnabled,
           dmControlsEnabled: request.dmControlsEnabled,
+          scheduleControlsEnabled: request.scheduleControlsEnabled,
           workersEnabled: request.workersEnabled,
+          controlApprovals: request.controlApprovals ?? null,
+          groupMemberRun: request.groupMemberRun === true,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
           parentCapabilities: request.modelCapabilities ?? null,
@@ -977,8 +1011,12 @@ export class VercelAIBrain {
       memoryControlsEnabled?: boolean
       /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
       dmControlsEnabled?: boolean
+      scheduleControlsEnabled?: boolean
       /** SA-111 P4: primary-agent sends only; every delegated run leaves it false. */
       workersEnabled?: boolean
+      /** SA-116 P2: send-routed's resolved approval grants and the group-run flag. */
+      controlApprovals?: NativeModeRequest['controlApprovals']
+      groupMemberRun?: boolean
       parentModelId?: string | null
       parentConnection?: ModelConnectionInfo | null
       /** SA-105 P2 (DL-105-06): saved-model capabilities for the image lane gate. */
@@ -998,8 +1036,9 @@ export class VercelAIBrain {
     const tools: Record<string, any> = {}
     const toolApprovals: Record<string, NativeToolApprovalPolicy> = {}
     // SA-105 P2: resolved below when native tools are built, then handed back to
-    // the caller so the streamText call can register `prepareStep` for exactly
-    // the runs that need it.
+    // the caller. SA-114 P1 (DL-114-05) made `prepareStep` unconditional, so this registry
+    // no longer decides WHETHER the hook exists — only whether the image half of it has
+    // anything to inject.
     let ephemeralImages: EphemeralImageRegistry | null = null
 
     // Story 6.4, 6.7c, SA-005: Track metadata for O(1) detection
@@ -1033,9 +1072,11 @@ export class VercelAIBrain {
           capabilities: nativeContext?.parentCapabilities ?? null
         })
         // Only a text-only lane needs the synthetic channel, so only it gets a
-        // registry — and therefore only it gets `prepareStep` registered on the
-        // streamText call below. Every other run's SDK call shape stays exactly
-        // as it was (DL-105-13 parity).
+        // registry. SA-114 P1 (DL-114-05): the hook itself is now registered on every
+        // streaming run, and DL-105-13's parity promise becomes the stricter one — the
+        // composed hook returns `undefined`, the SDK's own "change nothing" answer,
+        // whenever neither images nor steers have anything pending, so a run with neither
+        // still sends byte-identical requests.
         if (imageDelivery.lane === 'synthetic_user') {
           ephemeralImages = createEphemeralImageRegistry()
         }
@@ -1052,9 +1093,13 @@ export class VercelAIBrain {
           allowFabricControlTools: nativeContext?.allowFabricControlTools,
           memoryControlsEnabled: nativeContext?.memoryControlsEnabled,
           dmControlsEnabled: nativeContext?.dmControlsEnabled,
+          scheduleControlsEnabled: nativeContext?.scheduleControlsEnabled,
           projectPath: nativeContext?.projectPath ?? null,
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode,
+          // SA-116 P2: the click, and whether a card could ever be answered here.
+          controlApprovals: nativeContext?.controlApprovals ?? null,
+          groupMemberRun: nativeContext?.groupMemberRun === true,
           imageDelivery,
           ephemeralImages,
           // SA-111 P4 (DL-111-09): the worker tool exists only on a primary send. Every
@@ -1596,6 +1641,70 @@ export class VercelAIBrain {
       if (injected.length === 0) return undefined
 
       return { messages: [...messages, ...injected] }
+    }
+  }
+
+  /**
+   * SA-114 P1 (DL-114-05) — the ONE `prepareStep` an API run registers.
+   *
+   * Before this story the hook existed only on SA-105's text-only image lanes, which is
+   * why DL-105-13 could promise "call shape unchanged" for every other run. It is now
+   * registered on EVERY streaming run, and the promise becomes the stricter one it should
+   * always have been: the hook is always present and returns `undefined` — the SDK's own
+   * "change nothing" answer — whenever neither feature has anything pending. A run with no
+   * images and no steers therefore sends byte-identical requests, which is what the
+   * updated parity test pins.
+   *
+   * Order is deliberate: ephemeral images first (they belong to the tool result that just
+   * finished), then the steer, so the user's mid-reply words are the last thing the model
+   * reads before its next step.
+   *
+   * P0 measured the three properties this depends on, live on `ai@7.0.77`: the injected
+   * message reaches the model, it carries forward to later steps, and it never appears in
+   * `response.messages` — so Batshit, not the SDK, owns persisting it (DL-114-04). P0 also
+   * measured that `stepNumber === steps.length`, and that a reply with NO tool step calls
+   * this hook exactly once (with `steps` empty), which is why a steer typed during a
+   * text-only reply can only be promoted (DL-114-07).
+   */
+  private buildTurnPrepareStep(options: {
+    ephemeralImages: EphemeralImageRegistry | null
+    /**
+     * Takes every steer waiting for THIS turn and marks it delivered, or returns `[]`.
+     * send-routed supplies it for primary API turns only: a subagent, a Worker, or an
+     * artifact completion is not the user's turn, so it never receives one (DL-114-09).
+     */
+    takeSteers: ((step: number) => DeliveredSteer[]) | null
+  }) {
+    const images = options.ephemeralImages
+      ? this.buildEphemeralImagePrepareStep(options.ephemeralImages)
+      : null
+
+    return ({ messages, steps }: { messages: any[]; steps: any[] }) => {
+      const base = images ? images({ messages, steps }) : undefined
+      const injected: any[] = base ? [...base.messages] : [...messages]
+      let changed = Boolean(base)
+
+      const previous = steps[steps.length - 1]
+      // A steer lands at a TOOL boundary and nowhere else — that is the promise the whole
+      // story rests on, and it is the same rule both CLI lanes follow. A step that
+      // produced no tool result means the model has stopped calling tools and the reply is
+      // about to end, so anything still waiting is promoted instead.
+      const previousHadToolResult = (previous?.content ?? []).some(
+        (part: any) => part?.type === 'tool-result'
+      )
+
+      if (options.takeSteers && previousHadToolResult) {
+        const steers = options.takeSteers(steps.length)
+        if (steers.length > 0) {
+          injected.push({
+            role: 'user',
+            content: [{ type: 'text', text: buildSteerInjectionText(steers) }]
+          })
+          changed = true
+        }
+      }
+
+      return changed ? { messages: injected } : undefined
     }
   }
 
@@ -2638,7 +2747,10 @@ export class VercelAIBrain {
             allowFabricControlTools: request.allowFabricControlTools,
             memoryControlsEnabled: request.memoryControlsEnabled,
             dmControlsEnabled: request.dmControlsEnabled,
+            scheduleControlsEnabled: request.scheduleControlsEnabled,
             workersEnabled: request.workersEnabled,
+            controlApprovals: request.controlApprovals ?? null,
+            groupMemberRun: request.groupMemberRun === true,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,
             parentCapabilities: request.modelCapabilities ?? null,
@@ -2771,10 +2883,13 @@ export class VercelAIBrain {
         },
         onEnd: wrappedOnEnd,
         onAbort: request.onAbort,
-        // SA-105 P2 (DL-105-03): the synthetic image lane on the streaming path.
-        ...(ephemeralImagesForRequest
-          ? { prepareStep: this.buildEphemeralImagePrepareStep(ephemeralImagesForRequest) }
-          : {})
+        // SA-114 P1 (DL-114-05): ONE composed hook, always registered — SA-105's synthetic
+        // image lane first, then the steer. It returns `undefined` when neither has
+        // anything pending, so a run with no images and no steers is unchanged.
+        prepareStep: this.buildTurnPrepareStep({
+          ephemeralImages: ephemeralImagesForRequest,
+          takeSteers: request.takeSteers ?? null
+        })
       })
 
       // Return the full result for SSE conversion

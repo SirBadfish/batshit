@@ -103,17 +103,70 @@ export const DEFAULT_WAKE_TARGET: WakeTarget = 'new-session'
  * ------------------------------------------------------------------ */
 
 /**
- * `steer` is RESERVED, not implemented: SA-114 owns delivering a message into a running
- * turn at its next tool boundary. `isDeliverableNow` is the one rule that says so, so a
- * caller can never quietly treat `steer` as `wake`.
+ * `wait` leaves the DM in the recipient's inbox, `wake` starts a turn for them now, and
+ * `steer` (SA-114 DL-114-13) lands it INSIDE a reply the recipient is already writing, at
+ * that agent's next tool boundary.
+ *
+ * `steer` was reserved here in SA-113 and filled in by SA-114 P4. It is the one mode whose
+ * answer depends on something outside the DM: a steer needs a running, steerable,
+ * single-agent turn to land in. `isDeliverableNow` is still THE rule that says so — it now
+ * takes that fact as an argument instead of answering "not built yet".
  */
 export const DM_DELIVERY_MODES = ['wait', 'wake', 'steer'] as const
 export type DmDeliveryMode = (typeof DM_DELIVERY_MODES)[number]
 
-export const STEER_UNAVAILABLE_REASON =
-  'Steering a running turn is not available until SA-114 ships. Send this as "wait" or "wake".'
+/**
+ * What a `steer` becomes when there is no reply to land in (DL-114-13).
+ *
+ * `steer` is deliberately NOT one of these: a fallback that could be `steer` again would
+ * be a loop with no exit, and the two honest answers to "they are not mid-reply" are
+ * "leave it in their inbox" and "start a turn for them".
+ */
+export const DM_STEER_FALLBACKS = ['wait', 'wake'] as const
+export type DmSteerFallback = (typeof DM_STEER_FALLBACKS)[number]
 
-export function isDeliverableNow(mode: DmDeliveryMode): mode is 'wait' | 'wake' {
+/**
+ * Josh's default posture for everything DM (DL-113-03): the quiet option. A sender that
+ * wanted a turn started would have asked for `wake` in the first place.
+ */
+export const DEFAULT_DM_STEER_FALLBACK: DmSteerFallback = 'wait'
+
+/** Why a `steer` degraded. Written to `delivery.reason` and returned to the sender. */
+export const STEER_NO_ACTIVE_TURN_REASON =
+  'That agent is not mid-reply right now, so there was nothing to steer.'
+
+/**
+ * Why a `steer` that WAS accepted still ended up in the inbox (DL-114-13).
+ *
+ * The reply ended before a tool boundary carried it. The user's own steers are promoted
+ * into the next message at that point; a DM's are not, because an agent's text must never
+ * start a user turn. It waits in the inbox instead and shows on the next turn's roster.
+ */
+export const STEER_MISSED_REASON =
+  'The reply ended before this could land inside it, so it is waiting in the inbox instead.'
+
+/** THE read of the sender-chosen fallback. Anything unrecognised is the default. */
+export function resolveDmSteerFallback(value: unknown): DmSteerFallback {
+  const raw = typeof value === 'string' ? value.trim() : ''
+  return (DM_STEER_FALLBACKS as readonly string[]).includes(raw)
+    ? (raw as DmSteerFallback)
+    : DEFAULT_DM_STEER_FALLBACK
+}
+
+/**
+ * Can this DM be delivered the way it asked, right now?
+ *
+ * `wait` and `wake` always can be *attempted* — a refused wake degrades with a reason, which
+ * is a different thing from not being deliverable. `steer` genuinely cannot be attempted
+ * without a reply to land in, so it takes that fact as an argument rather than being
+ * re-derived at each call site. `sendDmOp` is the only caller today; it degrades a `false`
+ * to the sender's `steer_fallback` instead of failing the send.
+ */
+export function isDeliverableNow(
+  mode: DmDeliveryMode,
+  context: { hasSteerableTurn?: boolean } = {}
+): boolean {
+  if (mode === 'steer') return context.hasSteerableTurn === true
   return mode === 'wait' || mode === 'wake'
 }
 

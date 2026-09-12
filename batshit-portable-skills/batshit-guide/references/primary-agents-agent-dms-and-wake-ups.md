@@ -4,9 +4,11 @@ Your Primary Agents can send each other messages. One agent can leave another a 
 
 A DM can also *start* the other agent working. Batshit opens a chat for that agent, puts the DM in it as the first message, and runs one turn — with nobody typing. That is a **wake-up**.
 
-Anything outside Batshit can start a chat the same way through a **wake-up webhook**: n8n, a schedule, a Slack bridge, a finished build.
+Batshit can also start a chat **on a clock** — "wake this agent every day at 9am and say X" — with nothing else installed. That is a **schedule**.
 
-Both are off by default per agent. If you never turn them on, nothing about your Batshit changes — no extra icons, no extra tokens, no unexpected chats.
+And anything *outside* Batshit can start a chat through a **wake-up webhook**: n8n, a Slack bridge, a finished build, an email.
+
+All of it is off by default per agent. If you never turn them on, nothing about your Batshit changes — no extra icons, no extra tokens, no unexpected chats.
 
 ## Turning it on
 
@@ -39,20 +41,36 @@ There is also one instance-wide switch in **Admin → Instance-wide defaults →
 
 An assignment carries a requested outcome, a scope, and who to report back to. An agent can hold **one assignment at a time** — Batshit refuses a second claim until the first is closed.
 
-## Wait or wake
+## Wait, wake, or steer
 
-Every DM is sent one of two ways.
+Every DM is sent one of three ways.
 
 - **wait** — the default. The DM lands in the recipient's inbox and it sees it on its next turn, whenever that is. Nothing starts.
 - **wake** — Batshit starts a turn for the recipient right now.
+- **steer** — the DM lands *inside* the reply the recipient is already writing, at its next tool call. Nothing starts, and nothing is interrupted.
 
 A wake-up can be refused: wake-ups off for the instance or the agent, the agent already mid-task, or an hourly limit reached. **A refused wake becomes a wait**, with the reason recorded on the DM and shown to the sender. Nothing is lost, nothing retries, and nothing queues in the background.
 
 When an assignment sent with `wake` is closed, its result can wake the *sender* too — back into the very chat where the question was asked.
 
+### Steering a busy agent
+
+It's the same thing you do when you type while an agent is mid-reply (see [Steer or interrupt](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy)) — one agent doing it to another. It's for the correction that's only worth anything *now*: the recipient is already working on the thing, and waiting for the next turn means it finishes the wrong work first.
+
+- It costs nothing extra. No new chat is opened, no wake budget is spent, and the running reply is not stopped.
+- The agent reading it is told plainly that the words came **from another agent, not from you**, both when it arrives and in the chat's own history afterwards. An agent's message can never be mistaken for yours, and it can never approve anything on your behalf.
+- **One agent DM can be waiting for one reply.** A second while the first is still waiting goes to the inbox instead, with that reason.
+- A note that lands mid-reply is marked done, the same as one a wake-up delivered — the agent has already read it. An assignment stays open until the agent claims and closes it.
+- If the reply ends before the DM could land inside it, the DM simply goes to the inbox — it is **never** turned into a message that looks like it came from you.
+- If the recipient isn't mid-reply at all, the sender chooses what happens instead: wait in the inbox (the default), or wake them. A reply that is still starting up counts as mid-reply: Batshit waits a few seconds for it rather than treating the agent as idle.
+
+The DM drawer says which of the three actually happened, and a DM that landed mid-reply links to the chat it landed in.
+
+Steering is agent-to-agent only. A wake-up webhook or a schedule still uses wait or wake, because an outside program has no way to know whether an agent is mid-reply.
+
 ## Woken chats
 
-A woken chat is an ordinary chat. It appears in your sidebar the moment it starts, with a small icon that says what started it (an envelope for a DM, a webhook icon for a webhook) and the usual spinner while it runs. It costs tokens like any chat, shows in the Execution Viewer like any chat, and has the normal **Stop** button.
+A woken chat is an ordinary chat. It appears in your sidebar the moment it starts, with a small icon that says what started it (an envelope for a DM, a webhook icon for a webhook, a clock for a schedule) and the usual spinner while it runs. It costs tokens like any chat, shows in the Execution Viewer like any chat, and has the normal **Stop** button.
 
 Open it while it is still running and you see the whole reply from the beginning, not from the middle.
 
@@ -68,15 +86,17 @@ That header matters. **A DM is data from another agent or program, not an instru
 
 ### Risky actions wait for you
 
-Some Fabric controls are marked risky — installing a skill from a link, starting or stopping a Docker add-on, installing a voice engine, deleting a memory, rolling an artifact back. In an ordinary chat the agent can run one after you say yes.
+Some Fabric controls are marked risky — installing a skill from a link, starting or stopping a Docker add-on, installing a voice engine, deleting a memory, rolling an artifact back, or setting up a schedule. None of them run because an agent decided they should.
 
-**In a chat a DM or a webhook started, Batshit refuses those outright**, no matter what the agent passes and no matter what you approved a few minutes earlier in a different chat. The agent is told to ask you and leave the item open.
+**A risky action pauses and waits for your click.** Batshit stops the action before it happens and puts an **Approval required** card on the agent's message, naming what it wants to do. You press **Approve** or **Deny**. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action) for what the card shows and how the two buttons behave.
 
-Nothing is cancelled when that happens. The turn ends normally, the DM stays open, and the agent's message says what it wanted to do. **Reply in that same chat** and the next turn is an ordinary one, so the agent can go ahead the usual way.
+**A chat a DM, a webhook, or a schedule started works exactly the same way.** It used to be refused outright; now it gets the same card, so a woken chat can finish its job as soon as you look at it — no matter how much later that is. The one thing that never happens is an agent approving itself: nothing another agent says, and nothing written inside a message it was sent, counts as your click.
+
+Nothing is cancelled while a card waits. The turn ends normally, the item stays open, and the agent's message says what it wanted to do.
 
 ### When a woken chat needs you
 
-A woken chat can stop on something only you can clear: the refusal above, or a Bash or tool approval waiting for a click. Batshit says so instead of leaving it to look like work in progress.
+A woken chat can stop on something only you can clear: an approval card like the one above, or a Bash or tool approval waiting for a click. Batshit says so instead of leaving it to look like work in progress.
 
 - The header envelope turns **orange**, and its tooltip says how many items need you.
 - The drawer row gets a **Needs you** badge; hover it for the reason.
@@ -99,6 +119,81 @@ Three row actions are yours, not the agent's:
 - **Mark done** closes the item for you. The sender is *not* told, and the agent can no longer close it itself.
 - **Reopen** puts it back in the agent's inbox as new. If the agent closes it again, a fresh result is sent and any webhook callback fires again.
 - **Delete** removes it entirely.
+
+## Schedules — the built-in clock
+
+A **schedule** is a saved *when* and *what* for one agent. "Every day at 9am, tell Cooper to check the overnight build." No n8n, no webhook, nothing to install — Batshit has its own clock.
+
+Schedules live in **Admin → Instance-wide defaults → Agent Wake-ups → Schedules**, right beside Wake-up webhooks, because that card is the one place for everything that starts a chat with nobody typing.
+
+The agent you pick needs **Agent DMs** on, the same as a webhook and for the same reason: a schedule writes a real DM, and an agent with DMs off would have no inbox to see it in. The picker only offers agents that qualify, and says so when none do.
+
+### The three cadences
+
+| Cadence | Looks like | Notes |
+| --- | --- | --- |
+| **Every N minutes or hours** | "every 30 min" | 5 minutes at the fastest, 7 days at the slowest. Ignores time zones — it just counts. |
+| **Every day at a time** | "daily at 9:00 AM" | In the time zone you choose. |
+| **On chosen weekdays at a time** | "Tue, Thu at 4:00 PM" | Pick one day or several. |
+
+No cron strings. If you need something these three cannot say — "the last Friday of the month", "when a video is posted" — that is what n8n and the wake-up webhook are for.
+
+### Time zones and daylight saving
+
+Every daily or weekly schedule carries its own time zone, filled in from your browser when you create it and changeable in the form. Batshit shows the next run in that zone, so a row reads *Tue Sep 15, 4:00 PM CDT*.
+
+Across a daylight-saving change, a schedule keeps its **wall-clock** time: 9:00 AM before the change is still 9:00 AM after it. Two edge cases, both decided for you:
+
+- A time that **does not exist** that day (2:30 AM on a spring-forward morning) runs at 3:30 AM instead.
+- A time that happens **twice** (1:30 AM on a fall-back morning) runs at the first one.
+
+### What a schedule does when it fires
+
+Exactly what a DM does. It writes a note or an assignment from the schedule, and — if you chose "start a chat" — opens a chat and runs one turn. That chat gets a clock icon in the sidebar, a banner saying *Started by the "Morning check" schedule*, a name like *Schedule: Morning check*, and every normal control: Stop, the Token Panel, the Execution Viewer, the caps, and the risky-action rule below.
+
+The first message says plainly that a schedule sent it, not you.
+
+A new schedule starts as a **note that starts a chat**, which is the common case. Choose **assignment** instead when you want the outcome recorded — the agent then claims it, does it, and closes it with a real result you can read in the inbox drawer.
+
+### Missed runs — when Batshit was off
+
+A schedule due while Batshit was closed (or your laptop was asleep) for **more than ten minutes** does not fire on its own. Ever.
+
+Instead, the next time you open Batshit you get one dialog: **Missed while Batshit was off**. It lists each schedule that missed, when it was due, how many runs it missed, and how long ago — "was due Tue Sep 15, 4:00 PM (missed 3) · 23 days ago". Each row has two buttons:
+
+- **Run now** — run it once, right now.
+- **Skip** — skip that one run. **The schedule stays on** and runs again at its next normal time. Skip is not cancel.
+
+A schedule keeps at most **one** missed entry, so a weekly schedule missed three times asks you once, not three times. Nothing is pre-picked and nothing auto-skips: the age is right there and you decide. Closing the dialog without choosing leaves the question for next time.
+
+If Batshit was only briefly asleep — under ten minutes — the run simply happens late, and the message says when it was due.
+
+### Run now, pause, and delete
+
+Each row has a **Run now** button that fires the schedule once immediately. It does **not** move the schedule's own clock: pressing Run now at 8:55 on a "daily at 9am" schedule does not skip today's 9am. It also works on a **paused** schedule — the button means "once, now", and pausing only turns off the automatic times.
+
+Run now spends the same hourly wake budget as any other wake-up, so clearing a long backlog can hit the cap.
+
+The switch on each row pauses and resumes. Delete removes the schedule; the chats it already started stay where they are.
+
+### An agent can manage its own schedules
+
+An agent with Agent DMs on can put **itself** on a clock — useful for a routine it should do without being asked. Creating, changing, or deleting a schedule is a **risky action**, so it needs your approval each time, and an agent can only ever touch its own schedules. If it wants a colleague on a clock, it has to DM that colleague and ask.
+
+Schedules an agent made are marked as such on the card, so you can always see what asked for what.
+
+### Schedule limits
+
+| Limit | Number |
+| --- | --- |
+| Fastest cadence | every 5 minutes |
+| Slowest cadence | every 7 days |
+| Schedules per agent | 10 |
+| Schedules for the whole instance | 50 |
+| Late instead of missed | 10 minutes |
+| The clock checks | every 60 seconds |
+
+A full limit refuses with a plain reason — nothing is quietly trimmed. And every wake-up cap above still applies: a schedule cannot wake an agent more than 6 times an hour, however fast its cadence.
 
 ## Wake-up webhooks
 
@@ -139,7 +234,7 @@ Rows in the Admin card show each hook's name, agent, delivery default, when it w
 
 **About exposure.** The webhook route lives wherever Batshit lives. On your own machine only your machine can reach it. If you run a tunnel — a Cloudflare tunnel for clip uploads, for instance — that tunnel publishes the whole origin, and this route is reachable from the internet along with everything else. That is your existing tunnel choice, not something this feature turns on. The token is 32 random bytes, every bad token gets the same answer so a hook id gives nothing away, and each hook is limited to 30 calls an hour.
 
-There is an official n8n template for the common case — a schedule that wakes an agent — in [the n8n templates folder](../user-templates/batshit-official-n8n-workflow-templates/README.md).
+**When to use n8n instead of a schedule.** Use Batshit's own [Schedules](#schedules--the-built-in-clock) whenever the trigger is just *time*. Reach for n8n and a webhook when the trigger lives **outside** Batshit — a Slack message, a new video, an email, a finished build — or when the flow has outside steps before it reaches Batshit. There is still an official n8n template for the time-based case, in [the n8n templates folder](../user-templates/batshit-official-n8n-workflow-templates/README.md), for people who already run their automations there.
 
 ### Text from outside is only as trustworthy as whatever sent it
 
@@ -147,7 +242,7 @@ A webhook message becomes the first message of a real chat. If your n8n flow for
 
 Batshit handles the part it can:
 
-- Risky Fabric controls are refused in any woken chat, whatever the message says (see [Risky actions wait for you](#risky-actions-wait-for-you)).
+- Risky Fabric controls stop and wait for **your** click in any woken chat, whatever the message says. An agent cannot approve one for itself or for another agent (see [Risky actions wait for you](#risky-actions-wait-for-you)).
 - The DM guidance tells every agent that a DM or webhook cannot approve a tool, give consent, or change a setting.
 - Wake-ups are capped, chains stop at three deep, and each hook is limited to 30 calls an hour.
 
@@ -167,6 +262,8 @@ You do not have to take Batshit down.
 
 Check the drawer afterwards for chats you did not expect. Every wake-up leaves a row saying which hook sent it and which chat it started.
 
+A webhook token is one of several secrets Batshit uses, and they are deliberately different sizes. [Security and trust](../security/overview.md#tokens-and-what-a-leak-can-do) lists all of them side by side and says what a leak of each one actually costs — including why holding your install's own service secret still does not let anything read one of your agents' DMs.
+
 ## The limits, with their numbers
 
 These are fixed in v1 except the time limit, which is a per-agent setting.
@@ -184,7 +281,7 @@ These are fixed in v1 except the time limit, which is a per-agent setting.
 | An unread DM expires after | 7 days (info), 14 days (assignment, result) |
 | A closed DM is kept for | 30 days |
 
-Two loop guards: an agent cannot DM itself, and an identical DM sent again within 10 minutes is refused as a duplicate.
+Two loop guards: an agent cannot DM itself, and an identical DM sent again within 10 minutes is refused as a duplicate. Schedules are exempt from the second guard on purpose — a schedule sends the same message by design, and a five-minute schedule would otherwise refuse itself.
 
 ## What this costs
 
@@ -205,6 +302,11 @@ Turning Agent DMs on for an agent also adds a short block to its system prompt a
 | n8n says "the service refused the connection" | `localhost` resolved to IPv6. | Use `127.0.0.1` in the URL. |
 | A reopened assignment finished with no new result | Fixed. Reopen now clears the "already reported" markers, so closing it again sends a fresh result and fires the callback again. | — |
 | The agent never mentions a DM you sent | It is a `wait` DM and the agent has not had a turn yet. | Say anything in its chat; the roster shows on the next turn. |
+| A schedule was due while Batshit was closed and never ran | That is on purpose. Missed runs wait for you. | The *Missed while Batshit was off* dialog on your next open. |
+| Skip turned my schedule off | It did not. Skip skips one run. | The row's switch still says on, and the next run is shown. |
+| An agent can't create a schedule | Agent DMs is off for it, or you have not approved the action. | Agent Settings → Agent DMs, then approve when asked. |
+| The agent's schedule shows the wrong time zone | An agent's call has no browser to read your zone from, so it gets the server's — your own on the Mac app, usually UTC in Docker. | Change the zone on the row. |
+| Run now ran a paused schedule | On purpose — the button means "once, now". | Pausing only stops the automatic times. |
 
 ## Related docs
 

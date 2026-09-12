@@ -39,10 +39,38 @@ Under the hood, the agent searches the registry for the capability it needs, the
 Fabric actions are **risk-gated**, so the agent can't quietly do something heavy without the right clearance:
 
 - **Safe** actions (like reading a model catalog or creating a draft Artifact) run directly.
-- **Confirm** actions (the ones that execute something or change real state) ask for explicit approval before they run.
-- **Restricted** actions are blocked unless policy explicitly allows them.
+- **Confirm** actions (the ones that execute something or change real state) stop and wait for you to press **Approve**.
+- **Restricted** actions do the same, with a red badge — deleting an Artifact version, deleting a CLI Tool, rolling an Artifact back.
 
 Every Fabric action is also validated against what the agent is actually permitted to do, and executions are recorded. Honest boundaries are the whole point — Batshit fails clearly instead of pretending an action succeeded. For the bigger picture on agent permissions, sandboxing, and trust, see [Security and trust](../security/overview.md).
+
+## Approving a risky action
+
+When an agent tries a **Confirm** or **Restricted** action, Batshit stops it *before* it happens and puts a card on the agent's message:
+
+> **Approval required** — Skill Import · **Confirm**
+> Batshit Codex wants to **install skill from https://example.com/skill.zip**
+> ▸ Exact input
+> **Deny**  **Approve**
+
+The card names the action, not the plumbing. It shows a badge saying **Confirm** or **Restricted**, one plain line saying what will happen, and the exact input the action will run with, folded away behind **Exact input** so you can open it when you want to check.
+
+**Approve** runs that one action, with that exact input, once.
+
+- On an **API** agent the paused call simply carries on — same action, same input, no second guess from the model.
+- On a **Codex** or **Claude** agent, Batshit starts a short follow-up turn that tells the agent you approved it, and the agent runs it. This is why the click still works hours later and with no Batshit tab open.
+
+**Deny** starts nothing. The action is recorded as denied and the agent is told on your next message, so it does not try again.
+
+A few things worth knowing:
+
+- **One click, one action.** Approving "delete memory A" does not unlock "delete memory B", and it does not unlock the same action again tomorrow. If the agent changes anything about the input, that is a different action and you get a new card.
+- **The agent cannot approve itself**, and neither can another agent, a webhook, an n8n workflow, or anything written inside a message. Your click is the only thing that counts.
+- **Nothing is cancelled while a card waits.** The turn ends normally. A card raised by an API agent expires after three minutes (ask again and you get a fresh one); a card on a Codex or Claude agent says **Waits for you** and has no clock at all.
+- **A chat that started on its own** — from an Agent DM, a webhook, or a schedule — raises exactly the same card, and Batshit marks that chat **Needs you** so you can find it. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md#risky-actions-wait-for-you).
+- **One exception, on purpose:** a [Portable Skill Token](../reference/portable-skills.md) you minted yourself carries its own approval, because you chose which families it could touch when you created it. There is no chat there to click in.
+
+Every decision is recorded. Open the **Execution Viewer** on a message to see the action's real name and whether its approval was approved, denied, or expired.
 
 ## Where Fabric shows up
 

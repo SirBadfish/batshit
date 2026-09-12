@@ -222,6 +222,13 @@ export interface ControlErrorRecord {
   error: string
   hint?: string
   at: string
+  /**
+   * SA-116 P3 (DL-116-08). `tag` (the default) is a malformed control block in the agent's
+   * own output. `approval` is the user answering a pending approval card — not a mistake
+   * the agent made, and it rides the same one-turn channel because it is the same job:
+   * tell the agent once, on its next turn, what happened while it was not looking.
+   */
+  kind?: 'tag' | 'approval'
 }
 
 export function buildControlErrorRecord(
@@ -234,6 +241,31 @@ export function buildControlErrorRecord(
     error,
     ...(hint ? { hint } : {}),
     at: new Date().toISOString()
+  }
+}
+
+/**
+ * The one-turn line a DENIED approval leaves behind (SA-116 DL-116-08).
+ *
+ * Deny starts no turn — the agent already said what it wanted to do and stopped — so this
+ * is how it learns the answer: on its next turn, once, and with "do not retry it" said
+ * plainly, because the alternative is an agent asking for the same thing again.
+ */
+export function buildControlDenialRecord(
+  controlTitle: string,
+  decidedAt?: string
+): ControlErrorRecord {
+  const at = typeof decidedAt === 'string' && decidedAt.trim() ? decidedAt.trim() : new Date().toISOString()
+  const when = (() => {
+    const parsed = Date.parse(at)
+    if (!Number.isFinite(parsed)) return at
+    return new Date(parsed).toISOString().slice(11, 16)
+  })()
+  return {
+    tag: 'approval',
+    kind: 'approval',
+    error: `Denied by the user: ${controlTitle} (${when}) — do not retry it.`,
+    at
   }
 }
 
@@ -252,12 +284,28 @@ export function buildControlErrorDcmLines(
       ? (message.metadata!.controlErrors as ControlErrorRecord[])
       : []
     if (errors.length === 0) return []
-    const lines = ['control_errors (your previous response had malformed control blocks):']
-    for (const entry of errors.slice(0, 4)) {
-      const tag = typeof entry?.tag === 'string' ? entry.tag : 'unknown'
-      const error = typeof entry?.error === 'string' ? entry.error : 'malformed control block'
-      const hint = typeof entry?.hint === 'string' && entry.hint ? ` | fix: ${entry.hint}` : ''
-      lines.push(`- <${tag}>: ${error}${hint}`)
+    // Two kinds share this channel and must not share a heading: a malformed control block
+    // is the agent's own mistake, and a denied approval is the user's answer. Telling an
+    // agent its approval was "a malformed control block" would send it looking for a bug
+    // in its own output.
+    const tagErrors = errors.filter((entry) => entry?.kind !== 'approval')
+    const approvalErrors = errors.filter((entry) => entry?.kind === 'approval')
+    const lines: string[] = []
+    if (tagErrors.length > 0) {
+      lines.push('control_errors (your previous response had malformed control blocks):')
+      for (const entry of tagErrors.slice(0, 4)) {
+        const tag = typeof entry?.tag === 'string' ? entry.tag : 'unknown'
+        const error = typeof entry?.error === 'string' ? entry.error : 'malformed control block'
+        const hint = typeof entry?.hint === 'string' && entry.hint ? ` | fix: ${entry.hint}` : ''
+        lines.push(`- <${tag}>: ${error}${hint}`)
+      }
+    }
+    if (approvalErrors.length > 0) {
+      lines.push('control_errors (the user answered a pending approval):')
+      for (const entry of approvalErrors.slice(0, 4)) {
+        const error = typeof entry?.error === 'string' ? entry.error : 'the user answered an approval'
+        lines.push(`- ${error}`)
+      }
     }
     return lines
   }

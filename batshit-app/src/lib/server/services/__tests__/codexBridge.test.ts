@@ -13,9 +13,40 @@ const mockRedisClient = {
   sRem: vi.fn().mockResolvedValue(1)
 }
 
+/**
+ * SA-117 P2 — the bridge mints a run credential at run start, so this fake has to serve
+ * `agentRunCredentials.ts`: `redis.get('agent:…')` for the ownership check, `json.set` +
+ * `expire` for the record, `execute(sAdd)` for the index, and `del` for the revoke.
+ *
+ * It records what was written so the tests below can assert the credential's LIFECYCLE
+ * (minted with the run's ids, revoked when the run ends) rather than only its presence.
+ */
+const mintedCredentialRecords: Array<{ key: string; record: any }> = []
+const deletedKeys: string[] = []
+
 const mockRedis = {
   getProjectPreferences: vi.fn().mockResolvedValue(null),
   getAgents: vi.fn().mockResolvedValue([]),
+  get: vi.fn(async (key: string) =>
+    key === 'agent:agent-123' ? { id: 'agent-123', user_id: 'user-123' } : null
+  ),
+  json: {
+    get: vi.fn(async (key: string) => {
+      const entry = [...mintedCredentialRecords].reverse().find((item) => item.key === key)
+      if (!entry) return null
+      return deletedKeys.includes(key) ? null : entry.record
+    }),
+    set: vi.fn(async (key: string, path: string, value: any) => {
+      if (path === '$') mintedCredentialRecords.push({ key, record: value })
+      return 'OK'
+    }),
+    numIncrBy: vi.fn().mockResolvedValue(1)
+  },
+  expire: vi.fn().mockResolvedValue(true),
+  del: vi.fn(async (key: string) => {
+    deletedKeys.push(key)
+    return 1
+  }),
   execute: vi.fn(async (fn: any) => fn(mockRedisClient))
 }
 
@@ -31,7 +62,6 @@ vi.mock('../codexProfileManager', () => ({
   ensureManagedCodexHome: mockEnsureManagedCodexHome,
   DOCKER_AUTH_ENV_VAR: 'BATSHIT_DOCKER_MCP_TOKEN',
   N8N_INSTANCE_MCP_TOKEN_ENV: 'BATSHIT_N8N_INSTANCE_MCP_TOKEN',
-  BATSHIT_TOKEN_ENV_VAR: 'BATSHIT_TOKEN',
   syncAgentCodexProfiles: mockSyncAgentCodexProfiles
 }))
 
@@ -94,6 +124,8 @@ async function collectStream(stream: AsyncGenerator<any>) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mintedCredentialRecords.length = 0
+  deletedKeys.length = 0
   mockEnsureManagedCodexHome.mockResolvedValue('/tmp/codex-home')
   mockSyncAgentCodexProfiles.mockResolvedValue(undefined)
   mockRedisClient.json.get.mockResolvedValue(null)
@@ -631,5 +663,225 @@ describe('CodexBridge', () => {
       ignoreRules: true
     })
     expect(options.developerInstructions).toContain('hidden maintenance summarizer')
+  })
+  /* ------------------------------------------------------------------ *
+   * SA-117 P2 (DL-117-06, DL-117-07) — the run credential's life on the Codex lane.
+   * ------------------------------------------------------------------ */
+
+  describe('SA-117: the run credential', () => {
+    it('mints one for this run and hands its token to the child, never the instance token', async () => {
+      const bridge = new CodexBridgeClass()
+      let receivedRunOptions: Record<string, any> | null = null
+
+      vi.spyOn(bridge as any, 'runViaCli').mockImplementation(
+        async (_prompt: unknown, options: unknown) => {
+          receivedRunOptions = options as Record<string, any>
+          return {
+            transport: 'exec',
+            events: (async function* () {
+              yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+            })()
+          }
+        }
+      )
+
+      const result = await bridge.streamNativeMode(buildRequest())
+      await collectStream(result.fullStream)
+
+      expect(mintedCredentialRecords).toHaveLength(1)
+      const record = mintedCredentialRecords[0]!.record
+      expect(record).toMatchObject({
+        userId: 'user-123',
+        agentId: 'agent-123',
+        sessionId: 'sess-one',
+        messageId: 'msg-one',
+        runtime: 'codex'
+      })
+      // The SECRET is never stored — only its hash — and the token is `<id>.<secret>`.
+      expect(record.tokenHash).toEqual(expect.any(String))
+      expect(receivedRunOptions).toBeTruthy()
+      expect(receivedRunOptions!.agentRunToken).toMatch(/^arc_[A-Za-z0-9_-]+\.bsac_/)
+      expect(receivedRunOptions!.agentRunToken.startsWith(`${record.id}.`)).toBe(true)
+      expect(receivedRunOptions).not.toHaveProperty('batshitToken')
+    })
+
+    it('revokes it when the run ends', async () => {
+      const bridge = new CodexBridgeClass()
+
+      vi.spyOn(bridge as any, 'runViaCli').mockResolvedValue({
+        transport: 'exec',
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+        })()
+      })
+
+      const result = await bridge.streamNativeMode(buildRequest())
+      const credentialId = mintedCredentialRecords[0]!.record.id
+      expect(deletedKeys).not.toContain(`agent_run_credential:${credentialId}`)
+
+      await collectStream(result.fullStream)
+
+      expect(deletedKeys).toContain(`agent_run_credential:${credentialId}`)
+      // F-P1-5: the bridge passes the agent it minted for, so the index member is pruned
+      // even when the 24 h backstop already reaped the record.
+      expect(mockRedisClient.sRem).toHaveBeenCalledWith('agent_run_credentials:agent-123', [
+        credentialId
+      ])
+    })
+
+    it('prunes the index by the minted agent even after the TTL reaped the record', async () => {
+      // F-P1-5, at the bridge. A record the 24 h backstop already reaped cannot say which
+      // agent's index it sat in, so the caller that KNOWS — this bridge, which minted it for
+      // one agent — passes the hint. Without it, a crash-then-restart leaves one stale
+      // member per orphaned run, and nothing in production ever lists that index to prune it.
+      const bridge = new CodexBridgeClass()
+
+      vi.spyOn(bridge as any, 'runViaCli').mockResolvedValue({
+        transport: 'exec',
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+        })()
+      })
+
+      const result = await bridge.streamNativeMode(buildRequest())
+      const credentialId = mintedCredentialRecords[0]!.record.id
+
+      // The TTL reaps the record mid-run: the key is gone, the index member is not.
+      deletedKeys.push(`agent_run_credential:${credentialId}`)
+      mockRedisClient.sRem.mockClear()
+
+      await collectStream(result.fullStream)
+
+      expect(mockRedisClient.sRem).toHaveBeenCalledWith('agent_run_credentials:agent-123', [
+        credentialId
+      ])
+    })
+
+    it('revokes it when the stream throws, not only when it finishes', async () => {
+      const bridge = new CodexBridgeClass()
+
+      vi.spyOn(bridge as any, 'createRunner').mockResolvedValue({
+        transport: 'exec',
+        events: (async function* () {
+          throw new Error('Codex stream exploded')
+        })()
+      })
+
+      const result = await bridge.streamNativeMode(buildRequest())
+      const credentialId = mintedCredentialRecords[0]!.record.id
+      await expect(collectStream(result.fullStream)).rejects.toThrow('Codex stream exploded')
+
+      expect(deletedKeys).toContain(`agent_run_credential:${credentialId}`)
+    })
+
+    it('revokes it when the spawn itself fails, which never reaches the stream cleanup', async () => {
+      const bridge = new CodexBridgeClass()
+
+      vi.spyOn(bridge as any, 'createRunner').mockRejectedValue(new Error('Codex CLI missing'))
+
+      await expect(bridge.streamNativeMode(buildRequest())).rejects.toThrow('Codex CLI missing')
+
+      expect(mintedCredentialRecords).toHaveLength(1)
+      const credentialId = mintedCredentialRecords[0]!.record.id
+      expect(deletedKeys).toContain(`agent_run_credential:${credentialId}`)
+    })
+
+    it('mints nothing when the run has no session to bind to, and says so', async () => {
+      const bridge = new CodexBridgeClass()
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      let receivedRunOptions: Record<string, any> | null = null
+
+      vi.spyOn(bridge as any, 'runViaCli').mockImplementation(
+        async (_prompt: unknown, options: unknown) => {
+          receivedRunOptions = options as Record<string, any>
+          return {
+            transport: 'exec',
+            events: (async function* () {
+              yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+            })()
+          }
+        }
+      )
+
+      const result = await bridge.streamNativeMode(buildRequest({ sessionId: undefined }))
+      await collectStream(result.fullStream)
+
+      expect(mintedCredentialRecords).toHaveLength(0)
+      expect(receivedRunOptions!.agentRunToken).toBeNull()
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('No run credential was minted'))
+    })
+
+    it('F-P2-1: a delegated run mints for its runtime id, with no agent record to read', async () => {
+      // The live Worker spawn found this: `subagentRunner.ts` launches a Subagent or Worker
+      // with `agentId = subagent_cli_<slug>`, and nothing is stored at `agent:{that id}`.
+      const bridge = new CodexBridgeClass()
+
+      vi.spyOn(bridge as any, 'runViaCli').mockResolvedValue({
+        transport: 'exec',
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }
+        })()
+      })
+
+      const result = await bridge.streamNativeMode(
+        buildRequest({ agentId: 'subagent_cli_worker_agent_123_1', delegatedRun: true } as any)
+      )
+      await collectStream(result.fullStream)
+
+      expect(mintedCredentialRecords).toHaveLength(1)
+      expect(mintedCredentialRecords[0]!.record).toMatchObject({
+        agentId: 'subagent_cli_worker_agent_123_1',
+        delegated: true
+      })
+    })
+
+    it('DL-117-07: the child env drops BATSHIT_TOKEN and carries the credential', () => {
+      const bridge = new CodexBridgeClass()
+      const previousInstance = process.env.BATSHIT_TOKEN
+      const previousGateway = process.env.MCP_GATEWAY_AUTH_TOKEN
+      process.env.BATSHIT_TOKEN = 'instance-secret'
+      process.env.MCP_GATEWAY_AUTH_TOKEN = 'inherited-gateway-token'
+
+      try {
+        const childEnv = (bridge as any).buildCodexChildEnv({
+          agentRunToken: 'arc_abc.bsac_secret',
+          dockerAuthToken: null,
+          sessionId: 'sess-one',
+          messageId: 'msg-one'
+        }) as NodeJS.ProcessEnv
+
+        expect(childEnv.BATSHIT_TOKEN).toBeUndefined()
+        expect(childEnv.BATSHIT_AGENT_TOKEN).toBe('arc_abc.bsac_secret')
+        // A run with no Docker gateway does not get the gateway's secret either, even
+        // though the app's own environment carries one.
+        expect(childEnv.MCP_GATEWAY_AUTH_TOKEN).toBeUndefined()
+        // The honest boundary (SA-117 Scope): Redis and provider secrets still travel.
+        expect(childEnv.PATH).toBe(process.env.PATH)
+      } finally {
+        if (previousInstance === undefined) delete process.env.BATSHIT_TOKEN
+        else process.env.BATSHIT_TOKEN = previousInstance
+        if (previousGateway === undefined) delete process.env.MCP_GATEWAY_AUTH_TOKEN
+        else process.env.MCP_GATEWAY_AUTH_TOKEN = previousGateway
+      }
+    })
+
+    it('DL-117-07: a run WITH a Docker gateway keeps the gateway token', () => {
+      const bridge = new CodexBridgeClass()
+      const previousInstance = process.env.BATSHIT_TOKEN
+      process.env.BATSHIT_TOKEN = 'instance-secret'
+
+      try {
+        const childEnv = (bridge as any).buildCodexChildEnv({
+          agentRunToken: 'arc_abc.bsac_secret',
+          dockerAuthToken: 'run-gateway-token'
+        }) as NodeJS.ProcessEnv
+
+        expect(childEnv.MCP_GATEWAY_AUTH_TOKEN).toBe('run-gateway-token')
+        expect(childEnv.BATSHIT_TOKEN).toBeUndefined()
+      } finally {
+        if (previousInstance === undefined) delete process.env.BATSHIT_TOKEN
+        else process.env.BATSHIT_TOKEN = previousInstance
+      }
+    })
   })
 })

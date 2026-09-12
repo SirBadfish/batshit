@@ -219,6 +219,10 @@ describe('portableSkillTokens', () => {
       PORTABLE_SKILL_FAMILIES.map((family) => family.id)
     )
     expect(everyControlId.some((controlId) => controlId.startsWith('sys.dm.'))).toBe(false)
+    // SA-115 P2 (DL-115-10): the schedule family is scoped the same way, and for a sharper
+    // reason — a Portable Skill token reaching `sys.schedule.create` could leave a clock
+    // behind that keeps waking an agent after the token itself is long gone.
+    expect(everyControlId.some((controlId) => controlId.startsWith('sys.schedule.'))).toBe(false)
     // And no family may use a wildcard that could later swallow one.
     expect(everyControlId.some((controlId) => controlId.includes('*'))).toBe(false)
   })

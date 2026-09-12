@@ -227,9 +227,29 @@ export type CodexAppServerRunInput = {
   contextGuardEnabled?: boolean
 }
 
+/**
+ * SA-114 P2 (DL-114-06) — what `turn/steer` answered.
+ *
+ * A refusal is not an error to throw: all three of Codex's refusals mean "the model never
+ * got this", which is exactly the state DL-114-07 promotes from. The reason travels back so
+ * the caller can log what happened rather than guessing.
+ */
+export type CodexSteerResult =
+  | { accepted: true; turnId: string }
+  | { accepted: false; reason: string }
+
 export type CodexAppServerRun = {
   events: AsyncGenerator<ThreadEvent>
   cleanup: () => Promise<void>
+  /**
+   * SA-114 P2 (DL-114-06) — append the user's mid-reply words to the turn that is running.
+   *
+   * `turn/steer` is the vendor's own primitive: the app server holds the text and hands it
+   * to the model at its next step, so Batshit never has to guess at a boundary. Acceptance
+   * is not delivery — the lane pushes a `steer.delivered` event when the app server emits
+   * its own `userMessage` item for this text (AMD-114-02).
+   */
+  steer: (payload: { steerIds: string[]; text: string }) => Promise<CodexSteerResult>
 }
 
 type PendingRpc = {
@@ -319,12 +339,50 @@ export function startCodexAppServerRun(
   let nextRpcId = 1
   let threadId: string | null = null
   let turnId: string | null = null
+  /**
+   * F-P2-1 (SA-114 review): settles `true` the moment this run has a turn id, `false` when
+   * the run ends without one. `steer()` waits on it, because send-routed attaches the
+   * steer channel as soon as `streamNativeMode` resolves — which is BEFORE the eager
+   * `initialize` → `thread/start` → `turn/start` chain below has answered. A steer flushed
+   * in that window used to be refused as "no active turn" and never pushed again. It
+   * settles on the `turn/started` NOTIFICATION, not the `turn/start` reply: live Codex
+   * refused a steer sent in the gap between the two.
+   */
+  let resolveTurnReady: (ready: boolean) => void = () => {}
+  const turnReady = new Promise<boolean>((resolve) => {
+    resolveTurnReady = resolve
+  })
   let latestUsage: AppServerTokenUsage | null = null
   let guardTripped = false
   let guardStopMessage: string | null = null
   let interruptRequested = false
   let stderrTail = ''
   let closed = false
+  /**
+   * SA-114 P2 (AMD-114-02) — steers sent but not yet echoed, oldest first.
+   *
+   * Matched by EXACT text, never by arrival order alone, because `turn/start` emits a
+   * `userMessage` item for the turn's ORIGINAL prompt too (measured in P0's log: two of the
+   * four `userMessage` items in that run were the prompt). Matching on order would confirm
+   * a steer against the prompt's echo and write the marker before the steer had been sent.
+   */
+  const steersAwaitingEcho: Array<{ steerIds: string[]; text: string }> = []
+  /** `item/started` and `item/completed` both fire for one item; only the first counts. */
+  const echoedSteerItemIds = new Set<string>()
+  /**
+   * F-P2-3 (SA-114 review) — echoed, and waiting for the model call that reads them.
+   *
+   * The echo is not the delivery point. Measured live with `sleep 8`: Codex accepted the
+   * steer at once and echoed it 6.3 s later, when its loop picked the input up for the NEXT
+   * model call — and that echo reached Batshit before the finished command's own
+   * `item/completed`. A marker written at the echo therefore sat BEFORE the tool result the
+   * model read the steer after. The first `item/started` of any model-produced item after
+   * the echo is the reading call, so that is where `steer.delivered` is pushed: after
+   * everything the previous step produced, before anything the reading call produces. An
+   * echo the turn ends on without such an item is not a delivery; the steer stays in flight
+   * and the end of the turn promotes it (DL-114-07).
+   */
+  const steersEchoedAwaitingModelCall: string[][] = []
 
   const send = (payload: Record<string, unknown>) => {
     if (!child.stdin || child.stdin.destroyed) return
@@ -405,9 +463,85 @@ export function startCodexAppServerRun(
     }
   }
 
+  /**
+   * Is this `userMessage` item the echo of a steer this lane sent?
+   *
+   * Exact text, first match, once per item id. Anything else — the turn's original prompt,
+   * or an item shape a future Codex adds — is left alone.
+   */
+  const matchSteerEcho = (rawItem: Record<string, any>): string[] | null => {
+    const itemId = typeof rawItem?.id === 'string' ? rawItem.id : ''
+    if (itemId && echoedSteerItemIds.has(itemId)) return null
+    if (steersAwaitingEcho.length === 0) return null
+
+    const parts = Array.isArray(rawItem?.content) ? rawItem.content : []
+    const text = parts
+      .map((part: any) => (part && typeof part.text === 'string' ? part.text : ''))
+      .join('')
+    if (!text) return null
+
+    const index = steersAwaitingEcho.findIndex((entry) => entry.text === text)
+    if (index === -1) return null
+
+    const [matched] = steersAwaitingEcho.splice(index, 1)
+    if (itemId) echoedSteerItemIds.add(itemId)
+    return matched.steerIds
+  }
+
+  const steer = async (payload: {
+    steerIds: string[]
+    text: string
+  }): Promise<CodexSteerResult> => {
+    if (closed) return { accepted: false, reason: 'The Codex run has already finished.' }
+    if (!turnId) {
+      // The turn has not been answered yet (F-P2-1): wait for it rather than refusing. The
+      // wait ends the moment `turn/start` is answered or `turn/started` arrives, or when
+      // the run dies first — and only then is "no active turn to steer" the truth. P0
+      // measured that exact refusal on the wire; the lane answers it itself here rather
+      // than spending a round trip on it.
+      const started = await turnReady
+      if (!started || closed || !threadId || !turnId) {
+        return { accepted: false, reason: 'no active turn to steer' }
+      }
+    }
+    if (!threadId) return { accepted: false, reason: 'no active turn to steer' }
+    const activeTurnId = turnId
+    // Registered BEFORE the request is sent, for the same reason `request` registers its
+    // pending entry before writing: the app server's response and its `userMessage` echo
+    // can arrive in the SAME stdout flush, and the readline handler processes both lines
+    // synchronously. Pushing after the `await` leaves the echo arriving while this list is
+    // still empty — the steer is then never marked delivered even though the model read it,
+    // and it is promoted into a second turn asking for something already done.
+    const awaiting = { steerIds: [...payload.steerIds], text: payload.text }
+    steersAwaitingEcho.push(awaiting)
+    try {
+      const result = await request('turn/steer', {
+        threadId,
+        input: [{ type: 'text', text: payload.text }],
+        expectedTurnId: activeTurnId,
+      })
+      // The app server answers with the turn id that took the input. The echo is what turns
+      // this into a delivery; acceptance alone only means Codex is holding the text.
+      return { accepted: true, turnId: result?.turnId ?? activeTurnId }
+    } catch (error) {
+      const index = steersAwaitingEcho.indexOf(awaiting)
+      if (index !== -1) steersAwaitingEcho.splice(index, 1)
+      // All three refusals are `-32600` (P0): no active turn, a turn-id mismatch, and a
+      // steer after `turn/completed` — which is indistinguishable from "no turn" on the
+      // wire. Every one of them means the model never saw it, so the caller returns the
+      // entries to the inbox and the end of the turn promotes them.
+      const reason = error instanceof Error ? error.message : String(error)
+      console.warn('[CodexAppServer] turn/steer refused; the steer will be promoted instead', {
+        reason,
+      })
+      return { accepted: false, reason }
+    }
+  }
+
   const finishWithError = (error: Error) => {
     if (closed) return
     closed = true
+    resolveTurnReady(false)
     queue.finish(error)
     try {
       if (!child.killed) child.kill()
@@ -468,6 +602,10 @@ export function startCodexAppServerRun(
     }
 
     if (method === 'turn/started') {
+      // F-P2-1: THIS is what makes the turn steerable — the `turn/start` reply carries the
+      // id, but live Codex refused a `turn/steer` sent in the gap between that reply and
+      // this notification (the review's early-steer run).
+      if (turnId && threadId) resolveTurnReady(true)
       queue.push({ type: 'turn.started' })
       return
     }
@@ -476,6 +614,23 @@ export function startCodexAppServerRun(
       const rawItem = params.item
       if (rawItem?.id && typeof rawItem.type === 'string') {
         itemTypeById.set(rawItem.id, rawItem.type)
+      }
+      // SA-114 P2 (AMD-114-02): the app server's own echo of a steer Batshit sent is the
+      // delivery signal. `mapAppServerItem` returns null for every `userMessage` item, so
+      // this is also the only place that can see it — and it must stay that way: surfacing
+      // the echo as agent text would put the user's own words in the agent's mouth, and
+      // surfacing it as a user turn would split the reply in two.
+      if (rawItem?.type === 'userMessage') {
+        const echoed = matchSteerEcho(rawItem)
+        if (echoed) steersEchoedAwaitingModelCall.push(echoed)
+        return
+      }
+      // Any other item STARTING is the model call that read whatever was echoed before it
+      // (F-P2-3) — delivered here, ahead of that item's own event.
+      if (method === 'item/started' && steersEchoedAwaitingModelCall.length > 0) {
+        for (const steerIds of steersEchoedAwaitingModelCall.splice(0)) {
+          queue.push({ type: 'steer.delivered', steer_ids: steerIds })
+        }
       }
       const mapped = mapAppServerItem(rawItem)
       if (!mapped) return
@@ -675,6 +830,7 @@ export function startCodexAppServerRun(
 
   const cleanup = async () => {
     closed = true
+    resolveTurnReady(false)
     queue.finish()
     rl.close()
     input.signal?.removeEventListener('abort', onAbort)
@@ -683,5 +839,5 @@ export function startCodexAppServerRun(
     } catch {}
   }
 
-  return { events: events(), cleanup }
+  return { events: events(), cleanup, steer }
 }

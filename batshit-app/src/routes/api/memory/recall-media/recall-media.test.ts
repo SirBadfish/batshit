@@ -60,7 +60,16 @@ const recallBody = (runtime: string) => ({
 describe('POST /api/memory/recall-media', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mocks.resolveUser.mockResolvedValue({ userId: 'user-1', auth: 'service' })
+    // SA-117 DL-117-05: this route acts AS an agent, so the service lane no longer reaches
+    // it at all. The managed CLI helper it exists for is on the `agent` lane now, with the
+    // agent bound off the run credential Batshit minted.
+    mocks.resolveUser.mockResolvedValue({
+      userId: 'user-1',
+      auth: 'agent',
+      agentId: 'agent-1',
+      sessionId: 'session-1',
+      credentialId: 'arc_test'
+    })
     mocks.loadManagedMemoryMedia.mockResolvedValue({ bytes: new Uint8Array([7, 7, 7]) })
   })
 
@@ -96,7 +105,12 @@ describe('POST /api/memory/recall-media', () => {
   })
 
   it('uses the authenticated user, never the one the caller claims in the body', async () => {
-    mocks.resolveUser.mockResolvedValue({ userId: 'real-user', auth: 'service' })
+    mocks.resolveUser.mockResolvedValue({
+      userId: 'real-user',
+      auth: 'agent',
+      agentId: 'agent-1',
+      credentialId: 'arc_test'
+    })
 
     await call({ ...recallBody('codex'), userId: 'someone-else' })
 
@@ -156,6 +170,9 @@ describe('POST /api/memory/recall-media', () => {
   })
 
   it('requires an agentId and rejects an unauthenticated caller', async () => {
+    // On a vouched lane with NO bound agent (the n8n-callback token names a run, not an
+    // agent) the body still has to say which agent, and an absent one is still a 400.
+    mocks.resolveUser.mockResolvedValue({ userId: 'user-1', auth: 'n8n-callback' })
     const missingAgent = await call({ userId: 'user-1', runtime: 'codex', recall: {} })
     expect(missingAgent.status).toBe(400)
 
@@ -163,5 +180,45 @@ describe('POST /api/memory/recall-media', () => {
     const unauthorized = await call(recallBody('codex'))
     expect(unauthorized.status).toBe(401)
     expect(await unauthorized.json()).toEqual({ success: false, error: 'Unauthorized' })
+  })
+
+  /* ---------------------------------------------------------------------- *
+   * SA-117 P2 — identity, on a route that acts as an agent without a control.
+   * ---------------------------------------------------------------------- */
+
+  it('DL-117-05: a caller holding only the instance token cannot read an agent\'s memory media', async () => {
+    // The whole point, in one test. Before SA-117 this returned 200 and the bytes: the
+    // service lane authenticated as the USER and then named whichever agent it liked.
+    mocks.resolveUser.mockResolvedValue({ userId: 'user-1', auth: 'service' })
+
+    const response = await call(recallBody('codex'))
+    const payload = await response.json()
+
+    expect(response.status).toBe(403)
+    expect(payload.error).toContain('acts as an agent')
+    expect(mocks.loadManagedMemoryMedia).not.toHaveBeenCalled()
+  })
+
+  it('DL-117-04: a body agentId that differs from the bound one is refused, not corrected', async () => {
+    const response = await call({ ...recallBody('codex'), agentId: 'someone-elses-agent' })
+    const payload = await response.json()
+
+    expect(response.status).toBe(400)
+    expect(payload.error).toContain('someone-elses-agent')
+    expect(mocks.loadManagedMemoryMedia).not.toHaveBeenCalled()
+  })
+
+  it('DL-117-04: an omitted body agentId is fine, because the credential already said', async () => {
+    const { agentId, ...withoutAgentId } = recallBody('codex')
+    void agentId
+
+    const response = await call(withoutAgentId)
+
+    expect(response.status).toBe(200)
+    expect(mocks.loadManagedMemoryMedia).toHaveBeenCalledWith(
+      { userId: 'user-1', agentId: 'agent-1' },
+      'mem-1',
+      'media-1'
+    )
   })
 })

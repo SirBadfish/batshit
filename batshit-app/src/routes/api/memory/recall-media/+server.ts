@@ -29,6 +29,10 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { apiFailure } from '$lib/server/services/apiResponses'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
 import {
+  bindActingAgentId,
+  requireActingAgentIdentity
+} from '$lib/server/services/actingAgentIdentity'
+import {
   resolveToolResultImageDelivery,
   type ToolResultImageRuntime
 } from '$lib/server/services/toolResultImageDelivery'
@@ -67,7 +71,25 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       return apiFailure('Unauthorized', 401)
     }
 
-    const agentId = typeof body.agentId === 'string' ? body.agentId.trim() : ''
+    /**
+     * SA-117 DL-117-05 — this route acts AS an agent without going through a control.
+     *
+     * It loads that agent's OWNED memory media, so it is exactly the shape `sys.memory.*`
+     * is: a caller holding the instance token could name any of the user's agents and read
+     * back its memory images. `requireActingAgentIdentity` is the same helper `useControl`
+     * uses, so the refusal is one rule with one wording rather than two that can drift.
+     */
+    const identity = requireActingAgentIdentity(auth.auth, { delegated: auth.delegated })
+    if (!identity.ok) {
+      return apiFailure(identity.message, 403)
+    }
+
+    // DL-117-04: on the agent lane the bound id IS the agent; a differing body id is a 400.
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return apiFailure(agentBinding.message, 400)
+    }
+    const agentId = agentBinding.agentId ?? ''
     if (!agentId) {
       return apiFailure('agentId is required.', 400)
     }

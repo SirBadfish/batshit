@@ -58,7 +58,40 @@ const MANAGED_SUBAGENT_ROUTE = '/api/subagents/managed-execute'
 // and a queued same-subagent call may wait for one complete call before running itself.
 const MANAGED_SUBAGENT_TRANSPORT_TIMEOUT_MS = 2 * 600000 + 15000
 const AMBIGUOUS_CODEX_SESSION = '__batshit_ambiguous_codex_session__'
-const serviceToken = process.env.BATSHIT_TOKEN || process.env.MCP_GATEWAY_AUTH_TOKEN || ''
+/**
+ * SA-117 DL-117-08 — this bridge authenticates with THIS run's credential.
+ *
+ * `BATSHIT_TOKEN` (and its `MCP_GATEWAY_AUTH_TOKEN` fallback spelling, which was only ever
+ * the same instance secret under another name) are gone from the managed CLI child
+ * environment. Batshit mints one credential per managed run, exports it as
+ * `BATSHIT_AGENT_TOKEN`, and revokes it at run end; `/api/subagents/managed-execute` reads
+ * the calling agent and user off that record instead of off this bridge's request body.
+ *
+ * The Claude profile passes env through a `${VAR}` map, and an unset variable there can
+ * arrive as its own literal placeholder. A placeholder is not a credential.
+ *
+ * The direct Redis reads below are UNCHANGED in v1 and deliberately so (SA-117 Scope): the
+ * child still inherits `REDIS_URL` and friends, and converting those reads to HTTP on this
+ * credential is the follow-up story that would let the child environment be allow-listed.
+ */
+const runCredential = (() => {
+  const raw = typeof process.env.BATSHIT_AGENT_TOKEN === 'string'
+    ? process.env.BATSHIT_AGENT_TOKEN.trim()
+    : ''
+  if (!raw || raw.includes('${')) return ''
+  return raw
+})()
+if (!runCredential) {
+  // Loud, at startup: every HTTP path here needs it, so a missing credential is a broken
+  // run rather than a degraded one. The CLI reports the MCP server as failed and the agent
+  // sees it, instead of each tool call answering the same auth error.
+  console.error(
+    '[codex-subagent-mcp] BATSHIT_AGENT_TOKEN is not set, so this bridge has no run ' +
+      'credential and cannot reach Batshit. Batshit mints one per managed CLI run; if this ' +
+      'persists, regenerate the managed profile for this agent in Agent Settings.'
+  )
+  process.exit(1)
+}
 const batshitBaseUrl = trimTrailingSlash(
   args.url ||
     args['frontend-url'] ||
@@ -313,15 +346,10 @@ async function callManagedSubagent(tool, params) {
 	        'Managed Subagent call could not choose a Batshit session because multiple Codex chats for this agent are running. Batshit passes the session through BATSHIT_SESSION_ID for normal runs; if this keeps happening, stop the parallel Codex run and try again.'
 	    }
 	  }
-  if (!serviceToken) {
-    return {
-      error:
-        'Managed Subagent bridge requires BATSHIT_TOKEN so Batshit can verify the local internal call.'
-    }
-  }
 
   const body = {
-    agentId,
+    // SA-117 DL-117-04/08: no `agentId`. The route binds the calling agent off the run
+    // credential; a body id that differs from the bound one is refused 400 AGENT_MISMATCH.
     subagentId: tool.subagentId,
     sessionId: resolvedSessionId,
     chatInput,
@@ -337,8 +365,9 @@ async function callManagedSubagent(tool, params) {
       headers: {
         'Content-Type': 'application/json',
         'X-Source': 'batshit-cli-subagent-bridge',
-        'x-batshit-service-token': serviceToken,
-        'x-batshit-user-id': userId
+        // SA-117 DL-117-08: the credential names the user and the calling agent; the route
+        // binds both off it rather than believing a header and a body field.
+        'x-batshit-agent-token': runCredential
       },
       body: JSON.stringify(body),
       signal: controller.signal
@@ -394,14 +423,9 @@ async function callSpawnWorkers(params) {
         'Spawning workers could not choose a Batshit session because multiple Codex chats for this agent are running. Stop the parallel run and try again.'
     }
   }
-  if (!serviceToken) {
-    return {
-      error: 'Worker spawning requires BATSHIT_TOKEN so Batshit can verify the local internal call.'
-    }
-  }
 
   const body = {
-    agentId,
+    // SA-117 DL-117-04/08: the calling agent is bound off the run credential.
     sessionId: resolvedSessionId,
     messageId: process.env.BATSHIT_MESSAGE_ID || null,
     projectPath: resolveProjectPath(params),
@@ -416,8 +440,9 @@ async function callSpawnWorkers(params) {
       headers: {
         'Content-Type': 'application/json',
         'X-Source': 'batshit-cli-subagent-bridge',
-        'x-batshit-service-token': serviceToken,
-        'x-batshit-user-id': userId
+        // SA-117 DL-117-08: the credential names the user and the calling agent; the route
+        // binds both off it rather than believing a header and a body field.
+        'x-batshit-agent-token': runCredential
       },
       body: JSON.stringify(body),
       signal: controller.signal

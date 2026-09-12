@@ -139,13 +139,25 @@ jobs:
           src/lib/server/tests/redisMessageWindows.test.ts
           src/lib/server/tests/folderDeletion.test.ts
           src/lib/server/services/__tests__/backupRestoreService.test.ts
+          src/lib/server/services/__tests__/agentRunCredentials.test.ts
+          src/lib/server/services/__tests__/nativeToolAuth.test.ts
+          src/routes/api/controls/use/agent-lane.test.ts
           src/lib/server/services/dm/__tests__/dmStore.test.ts
           src/lib/server/services/dm/__tests__/dmTools.test.ts
           src/lib/server/services/dm/__tests__/wakeHookStore.test.ts
           src/lib/server/services/dm/__tests__/wokenTurn.test.ts
           src/lib/server/services/__tests__/agentWakeups.test.ts
+          src/lib/server/services/__tests__/controlApprovals.test.ts
+          src/lib/server/services/__tests__/brokerControlApprovals.test.ts
+          src/lib/server/services/schedules/__tests__/scheduleStore.test.ts
+          src/lib/server/services/schedules/__tests__/scheduleTicker.test.ts
+          src/routes/api/sessions/[sessionId]/control-approvals/control-approvals-route.test.ts
           src/routes/api/wake/wake-webhook-route.test.ts
+          src/routes/api/internal/schedules/sweep/sweep-route.test.ts
           src/routes/api/dms/dms-routes.test.ts
+          src/routes/api/messages/steer/steer-route.test.ts
+          src/lib/server/services/__tests__/steerPromotion.test.ts
+          src/routes/api/user/settings/user-settings-chat.test.ts
           src/lib/server/services/__tests__/goonRecipeRepository.test.ts
           src/lib/server/services/__tests__/hairAssetRepository.server.test.ts
           src/lib/server/services/__tests__/goonMutationRepository.test.ts

@@ -5,10 +5,11 @@
   import { Button } from '$lib/components/ui/button'
   import EntityAvatar from '$lib/components/avatar/EntityAvatar.svelte'
   import * as Card from '$lib/components/ui/card'
+  import * as Select from '$lib/components/ui/select'
   import IconPicker from '$lib/components/icons/IconPicker.svelte'
   import SettingsInfoMenu from '$lib/components/settings/SettingsInfoMenu.svelte'
   import SettingsSaveStatus from '$lib/components/settings/SettingsSaveStatus.svelte'
-  import { Loader2, LogOut, AlertCircle, UploadCloud, Sparkles, UserRound, Pencil, Trash2 } from '@lucide/svelte'
+  import { Loader2, LogOut, AlertCircle, UploadCloud, Sparkles, UserRound, Pencil, Trash2, MessageSquareMore } from '@lucide/svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
   import { setUserSettings } from '$lib/stores/userSettings.svelte'
   import type { UserSettingsRow } from '$lib/types/database'
@@ -16,6 +17,11 @@
   import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
   import { iconRefKey, normalizeAvatarIconFit } from '$lib/icons/iconTypes'
   import { normalizeIconRef } from '$lib/icons/iconLegacy'
+  import {
+    busySendModeLabel,
+    resolveBusySendMode,
+    type BusySendMode
+  } from '$lib/utils/steerControl'
 
   const MAX_DISPLAY_NAME_LENGTH = 14
   const MAX_AVATAR_BYTES = 2 * 1024 * 1024
@@ -36,6 +42,8 @@
     avatar_icon_ref: IconRef | null
     avatar_icon_fit: AvatarIconFit
     global_custom_system_prompt?: string
+    /** SA-114 P3 (DL-114-01): what a send does while the agent is still replying. */
+    global_chat_settings: { busy_send_mode: BusySendMode }
   }
 
   let { data = null }: { data?: PanelData } = $props()
@@ -50,7 +58,8 @@
   let saveError = $state<string | null>(null)
   let persistedProfileSignature = $state(makeProfileSignature(normaliseSettings(null)))
   let persistedPromptSignature = $state(makePromptSignature(normaliseSettings(null)))
-  let activeSaveScope = $state<'profile' | 'prompt' | null>(null)
+  let persistedChatSignature = $state(makeChatSignature(normaliseSettings(null)))
+  let activeSaveScope = $state<'profile' | 'prompt' | 'chat' | null>(null)
   let isUploadingAvatar = $state(false)
   let logoutBusy = $state(false)
   let globalPromptEditorOpen = $state(false)
@@ -68,6 +77,7 @@
       persistedSettings = data?.userSettings ? { ...next } : null
       persistedProfileSignature = makeProfileSignature(next)
       persistedPromptSignature = makePromptSignature(next)
+      persistedChatSignature = makeChatSignature(next)
     }
     email = data?.user?.email ?? ''
     userId = data?.user?.id ?? null
@@ -98,6 +108,7 @@
         persistedSettings = nextPersisted
         persistedProfileSignature = makeProfileSignature(nextPersisted)
         persistedPromptSignature = makePromptSignature(nextPersisted)
+        persistedChatSignature = makeChatSignature(nextPersisted)
         saveState = 'saved'
         saveError = null
       })
@@ -163,7 +174,8 @@
       avatar_url: settings.avatar_url ?? null,
       avatar_icon_ref: settings.avatar_icon_ref,
       avatar_icon_fit: settings.avatar_icon_fit,
-      global_custom_system_prompt: settings.global_custom_system_prompt ?? ''
+      global_custom_system_prompt: settings.global_custom_system_prompt ?? '',
+      global_chat_settings: { ...settings.global_chat_settings }
     }
 
     const previous = persistedSettings
@@ -174,7 +186,9 @@
       iconRefKey(previous.avatar_icon_ref) !== iconRefKey(currentPayload.avatar_icon_ref) ||
       previous.avatar_icon_fit !== currentPayload.avatar_icon_fit ||
       (previous.global_custom_system_prompt ?? '') !==
-        (currentPayload.global_custom_system_prompt ?? '')
+        (currentPayload.global_custom_system_prompt ?? '') ||
+      previous.global_chat_settings.busy_send_mode !==
+        currentPayload.global_chat_settings.busy_send_mode
 
     if (!hasChanges) {
       return
@@ -182,7 +196,12 @@
 
     const profileChanged = makeProfileSignature(currentPayload) !== persistedProfileSignature
     const promptChanged = makePromptSignature(currentPayload) !== persistedPromptSignature
-    activeSaveScope = promptChanged && !profileChanged ? 'prompt' : 'profile'
+    const chatChanged = makeChatSignature(currentPayload) !== persistedChatSignature
+    activeSaveScope = chatChanged && !profileChanged && !promptChanged
+      ? 'chat'
+      : promptChanged && !profileChanged
+        ? 'prompt'
+        : 'profile'
 
     const validationMessage = validateDisplayName(settings.displayName)
     if (validationMessage) {
@@ -214,6 +233,7 @@
         persistedSettings = { ...next }
         persistedProfileSignature = makeProfileSignature(next)
         persistedPromptSignature = makePromptSignature(next)
+        persistedChatSignature = makeChatSignature(next)
         isLoading = false
         saveError = null
         activeSaveScope = null
@@ -231,6 +251,7 @@
         persistedSettings = { ...fallback }
         persistedProfileSignature = makeProfileSignature(fallback)
         persistedPromptSignature = makePromptSignature(fallback)
+        persistedChatSignature = makeChatSignature(fallback)
         isLoading = false
         saveError = error instanceof Error ? error.message : 'Failed to load settings'
         activeSaveScope = null
@@ -324,7 +345,11 @@
       avatar_url: row?.avatar_url ?? null,
       avatar_icon_ref: normalizeIconRef(row?.avatar_icon_ref, DEFAULT_USER_ICON_REF),
       avatar_icon_fit: normalizeAvatarIconFit(row?.avatar_icon_fit),
-      global_custom_system_prompt: row?.global_custom_system_prompt ?? ''
+      global_custom_system_prompt: row?.global_custom_system_prompt ?? '',
+      // `resolveBusySendMode` is THE rule (DL-114-01); this panel reads it rather than
+      // restating the default, so the control can never show a different answer from the
+      // one the send button acts on.
+      global_chat_settings: { busy_send_mode: resolveBusySendMode(row) }
     }
   }
 
@@ -378,7 +403,10 @@
       avatar_url: settings.avatar_url ?? null,
       avatar_icon_ref: settings.avatar_icon_ref,
       avatar_icon_fit: settings.avatar_icon_fit,
-      global_custom_system_prompt: newPrompt
+      global_custom_system_prompt: newPrompt,
+      // Carried, not defaulted: the prompt editor saves the whole record, and sending the
+      // default here would silently reset a busy-send mode the user had chosen.
+      global_chat_settings: { ...settings.global_chat_settings }
     }
 
     const validationMessage = validateDisplayName(settings.displayName)
@@ -406,6 +434,12 @@
   function makePromptSignature(payload: SavePayload) {
     return JSON.stringify({
       global_custom_system_prompt: payload.global_custom_system_prompt ?? ''
+    })
+  }
+
+  function makeChatSignature(payload: SavePayload) {
+    return JSON.stringify({
+      busy_send_mode: payload.global_chat_settings.busy_send_mode
     })
   }
 </script>
@@ -583,6 +617,67 @@
             </span>
             <span class="batshit-settings-form-label">Opens Editor</span>
           </Button>
+        </Card.Content>
+      </Card.Root>
+
+      <Card.Root class="batshit-settings-card batshit-settings-card-default batshit-settings-l1-card">
+        <Card.Header class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div class="flex items-center gap-1.5">
+            <Card.Title class="flex items-center gap-2">
+              <MessageSquareMore class="h-4 w-4 text-primary" />
+              Chat
+            </Card.Title>
+            <SettingsInfoMenu ariaLabel="About Chat" contentClass="w-80">
+              <p>
+                Steer means your message waits for the agent to finish the tool it is running,
+                then lands inside the same reply, so the agent reads it and adjusts without
+                losing its place. Interrupt is the older behaviour: the reply stops, the work so
+                far is kept, and your message starts a new turn.
+              </p>
+              <p>
+                The Stop button is always an interrupt, and Cmd/Ctrl+Enter sends the other way
+                for one message. Messages with files attached are never steered: they wait for
+                the reply to finish and then send normally.
+              </p>
+            </SettingsInfoMenu>
+          </div>
+          <SettingsSaveStatus
+            state={activeSaveScope === 'chat' ? (saveError ? 'error' : saveState) : 'idle'}
+            error={activeSaveScope === 'chat' ? saveError : null}
+            savedLabel="Chat Saved"
+            sticky={false}
+          />
+        </Card.Header>
+        <Card.Content class="space-y-4 pt-4">
+          <div class="batshit-settings-form-stack">
+            <div class="batshit-settings-form-row">
+              <div class="batshit-settings-form-copy">
+                <div class="batshit-settings-form-label-line">
+                  <Label.Root class="batshit-settings-form-label">
+                    When You Send While the Agent Is Busy
+                  </Label.Root>
+                </div>
+              </div>
+              <div class="batshit-settings-form-control">
+                <Select.Root
+                  type="single"
+                  bind:value={settings.global_chat_settings.busy_send_mode}
+                >
+                  <Select.Trigger data-testid="busy-send-mode-trigger">
+                    {busySendModeLabel(settings.global_chat_settings.busy_send_mode)}
+                  </Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="steer" label="Steer (default)">
+                      Steer (default)
+                    </Select.Item>
+                    <Select.Item value="interrupt" label="Interrupt and send">
+                      Interrupt and send
+                    </Select.Item>
+                  </Select.Content>
+                </Select.Root>
+              </div>
+            </div>
+          </div>
         </Card.Content>
       </Card.Root>
 

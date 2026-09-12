@@ -8,6 +8,7 @@ import {
   type ControlSourceType
 } from '$lib/server/services/fabricRegistry'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
+import { bindActingAgentId } from '$lib/server/services/actingAgentIdentity'
 
 type FindControlsRequest = {
   userId?: string
@@ -23,10 +24,17 @@ type FindControlsRequest = {
   allowedControlIds?: string[]
 }
 
-function toFindOptions(body: FindControlsRequest, userId: string): ControlFindOptions {
+function toFindOptions(
+  body: FindControlsRequest,
+  userId: string,
+  agentId: string | undefined
+): ControlFindOptions {
   return {
     userId,
-    agentId: typeof body.agentId === 'string' ? body.agentId : undefined,
+    // SA-117 DL-117-04: bound off the run credential on the agent lane, the caller's claim
+    // everywhere else. Here it only narrows which controls are VISIBLE, but a scope hint the
+    // server minted is still better than one the body typed.
+    agentId,
     query: body.query,
     tags: Array.isArray(body.tags) ? body.tags : [],
     sourceType: body.sourceType,
@@ -62,9 +70,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       return apiFailure('Unauthorized', 401)
     }
 
+    const agentBinding = bindActingAgentId(auth, body.agentId)
+    if (!agentBinding.ok) {
+      return json(
+        { success: false, error: { code: agentBinding.code, message: agentBinding.message } },
+        { status: 400 }
+      )
+    }
+
     if (auth.auth === 'portable-skill') {
       const portableResult = await findControls({
-        ...toFindOptions(body, auth.userId),
+        ...toFindOptions(body, auth.userId, agentBinding.agentId),
         allowedControlIds: auth.portableSkillAllowedControlIds
       })
       return json({
@@ -75,7 +91,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       })
     }
 
-    const result = await findControls(toFindOptions(body, auth.userId))
+    const result = await findControls(toFindOptions(body, auth.userId, agentBinding.agentId))
     return json({
       success: true,
       auth: auth.auth,

@@ -246,6 +246,29 @@ export function getCodexConfigOverrideValidationError(settings: CodexAgentSettin
   return null
 }
 
+export type CodexTransportLane = 'app-server' | 'exec'
+
+/**
+ * Managed Batshit runs default to the app-server lane so mid-run token usage can drive the
+ * proactive context guard. `BATSHIT_CODEX_TRANSPORT=exec` is the documented escape hatch
+ * back to one-shot `codex exec --json`. Non-managed scopes (user-profile runs) stay on exec.
+ *
+ * SA-114 P2 moved this here from `codexBridge.ts`. It is a pure settings-plus-env decision,
+ * and send-routed now needs the same answer to resolve steerability BEFORE the bridge is
+ * even imported (`exec` closes stdin after the prompt, so it can never be steered). Keeping
+ * one copy is the point: a second derivation of "which transport will this run use" would
+ * let the route promise a steer the bridge cannot deliver.
+ */
+export function resolveCodexTransportLane(
+  options: { configScope?: string | null },
+  processEnv: NodeJS.ProcessEnv = process.env
+): CodexTransportLane {
+  if (options.configScope !== 'managed') return 'exec'
+  const override = (processEnv.BATSHIT_CODEX_TRANSPORT ?? '').trim().toLowerCase()
+  if (override === 'exec') return 'exec'
+  return 'app-server'
+}
+
 export function resolveCodexWebSearchMode(enabled: boolean | null | undefined): 'disabled' | 'live' {
   return enabled === false ? 'disabled' : 'live'
 }

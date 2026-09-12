@@ -124,7 +124,14 @@ const FABRIC_CONTROL_DISPLAY_ALIASES: Record<string, string> = {
   'sys.dm.claim': 'Agent DM Claim',
   'sys.dm.done': 'Agent DM Done',
   'sys.dm.blocked': 'Agent DM Blocked',
-  'sys.dm.agents': 'Agent DM Presence'
+  'sys.dm.agents': 'Agent DM Presence',
+  // SA-115: the Schedules family. Same lesson as the DM entries above — without these the
+  // controls have no display name, never reach the Fabric presentation branch, and render
+  // as untitled generic cards while working perfectly on the wire.
+  'sys.schedule.list': 'Schedule List',
+  'sys.schedule.create': 'Schedule Create',
+  'sys.schedule.update': 'Schedule Update',
+  'sys.schedule.delete': 'Schedule Delete'
 }
 
 const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
@@ -135,10 +142,16 @@ const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
   'sys.runtime_addon.': 'Runtime Add-on',
   'sys.voice.engine.': 'Voice Engine',
   'sys.mcp.dynamic.': 'Dynamic Tool',
+  // SA-116: the memory and Goon-scene families had no label at all, so every one of their
+  // controls rendered as an untitled generic card — the same gap SA-113 and SA-115 hit. The
+  // approval card is built from this name, so a missing entry is now a blank card too.
+  'sys.memory.': 'Memory',
+  'sys.goon_scene.': 'Goon Scene',
   'sys.comfyui.': 'ComfyUI',
   'sys.zip.': 'Zip',
   'sys.agent_browser.': 'Agent Browser',
-  'sys.dm.': 'Agent DM'
+  'sys.dm.': 'Agent DM',
+  'sys.schedule.': 'Schedule'
 }
 
 function normalizeDisplayAliasKey(rawName: string): string {

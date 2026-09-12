@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Archive, LoaderCircle, Mail, Webhook } from '@lucide/svelte';
+	import { Archive, LoaderCircle, Sparkles } from '@lucide/svelte';
 	import * as Sidebar from '$lib/components/ui/sidebar';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import SessionAvatar from '$lib/components/batshit-sidebar/SessionAvatar.svelte';
@@ -29,7 +29,8 @@
 		resolveSessionOrigin,
 		sessionOriginPillLabel
 	} from '$lib/utils/sessionOrigin';
-	
+	import { sessionOriginIcon } from '$lib/utils/sessionOriginIcons';
+
 	interface Props {
 		session: ChatSession;
 		isSelected: boolean;
@@ -116,6 +117,9 @@
 	// SA-113 P1 (DL-113-08): what started this chat. Null for every chat the user typed,
 	// so an ordinary session renders exactly as before.
 	const sessionOrigin = $derived(resolveSessionOrigin(session))
+	// DL-115-09: keyed by kind, with a neutral fallback — never a binary if/else, which is
+	// what shipped a webhook icon for schedules before SA-115.
+	const SessionOriginIcon = $derived(sessionOrigin ? sessionOriginIcon(sessionOrigin) : Sparkles)
 
 	// SA-104 P5: Infinite Session state + the one-way transition flow.
 	const isSessionFixed = $derived(isFixedSession(session))
@@ -571,11 +575,7 @@
 						aria-label={describeSessionOrigin(sessionOrigin)}
 						data-testid={`session-origin-${sessionOrigin.kind}-${session.id}`}
 					>
-						{#if sessionOrigin.kind === 'dm'}
-							<Mail class="session-item-origin-icon" aria-hidden="true" />
-						{:else}
-							<Webhook class="session-item-origin-icon" aria-hidden="true" />
-						{/if}
+						<SessionOriginIcon class="session-item-origin-icon" aria-hidden="true" />
 						<span class="sr-only">{sessionOriginPillLabel(sessionOrigin)}</span>
 					</span>
 				{/if}

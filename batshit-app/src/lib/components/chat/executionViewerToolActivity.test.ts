@@ -155,4 +155,176 @@ describe('buildExecutionToolActivityEntries', () => {
         'Tool call was captured in the provider trace, but no matching tool-result payload was stored in intermediateSteps for this run.',
     })
   })
+
+  it('SA-116 DL-116-12: a broker step is named by the control it ran, not by the broker', () => {
+    // A broker step is COMPACTED before it reaches a renderer: `toolArgs` becomes
+    // `{ ref, target }` and the real input moves under `toolResult.input`. Every Fabric call
+    // in the Execution Viewer used to read "Dynamic Tool Use", which is the broker's own
+    // display name.
+    // Captured from a live BSMS run on 2026-09-10 (SA-116 P2 T1): note that `toolArgs`
+    // holds the ref beside the control's OWN fields, not the `{ref, target}` pair the
+    // Fragility Map describes for the renderer path. A hand-written fixture using that pair
+    // would pass while the real step stayed unnamed.
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        {
+          toolCallId: 'toolu_01QmAdgoyudjLFRNzmmVhLPm',
+          toolName: 'native_batshit_tool_use',
+          originalToolName: 'native_batshit_tool_use',
+          toolArgs: {
+            ref: 'fabric:sys.memory.delete',
+            memoryId: 'mem_1789030269276_h43dh2',
+          },
+          toolResult: {
+            success: true,
+            controlId: 'sys.memory.delete',
+            riskLevel: 'confirm',
+            ref: 'fabric:sys.memory.delete',
+            target: 'sys.memory.delete',
+            input: { memoryId: 'mem_1789030269276_h43dh2' },
+          },
+        },
+      ],
+      llmCalls: [],
+    })
+
+    expect(entries[0]).toMatchObject({
+      rawToolName: 'native_batshit_tool_use',
+      displayName: 'Memory Delete',
+    })
+  })
+
+  it('SA-116: an unrecognised broker ref keeps the broker name instead of guessing', () => {
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        {
+          toolCallId: 'toolu_x',
+          toolName: 'native_batshit_tool_use',
+          toolArgs: {},
+        },
+      ],
+      llmCalls: [],
+    })
+
+    expect(entries[0]?.displayName).toBe('Dynamic Tool Use')
+  })
+  /* ---------------------------------------------------------------------- *
+   * SA-117 DL-117-10, moved here by AMD-117-02 — the acting-agent label.
+   *
+   * F-P1-2 is why it was not built in P1: `ExecutionSnapshot.agentId` is the SESSION's
+   * agent, and until DL-117-04 bound the acting one, a per-step agent id was still
+   * whatever the request body claimed. A label over body text would read as though the
+   * server had vouched for it, which is worse than no label at all.
+   * ---------------------------------------------------------------------- */
+
+  const fabricStep = (output: Record<string, unknown>) => ({
+    toolName: 'batshit_control_use',
+    toolInput: { controlId: 'sys.dm.read' },
+    toolResult: output,
+    toolCallId: 'call-1'
+  })
+
+  it('labels a step whose bound acting agent is not this chat\'s agent', () => {
+    const entries = buildExecutionToolActivityEntries({
+      steps: [fabricStep({ success: true, auth: 'agent', actingAgentId: 'agent-worker' })],
+      sessionAgentId: 'agent-cooper'
+    })
+
+    expect(entries[0]?.actingAgentId).toBe('agent-worker')
+  })
+
+  it('shows nothing when the acting agent IS the session\'s agent', () => {
+    // The normal case, and the reason the field is a difference rather than a value:
+    // repeating the chat's own agent on every row would be noise.
+    const entries = buildExecutionToolActivityEntries({
+      steps: [fabricStep({ success: true, auth: 'agent', actingAgentId: 'agent-cooper' })],
+      sessionAgentId: 'agent-cooper'
+    })
+
+    expect(entries[0]?.actingAgentId).toBeNull()
+  })
+
+  it('shows nothing on a lane with no bound agent, even when the body named one', () => {
+    // `/api/controls/use` puts `actingAgentId` on its response ONLY for a call that arrived
+    // on a run credential, so a service-lane response simply has no such field — and this
+    // builder must not reach for `agentId` or anything else the caller could have set.
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        fabricStep({ success: true, auth: 'service', userId: 'user-1', agentId: 'agent-faye' })
+      ],
+      sessionAgentId: 'agent-cooper'
+    })
+
+    expect(entries[0]?.actingAgentId).toBeNull()
+  })
+
+  it('shows nothing when the snapshot has no session agent to compare against', () => {
+    const entries = buildExecutionToolActivityEntries({
+      steps: [fabricStep({ success: true, auth: 'agent', actingAgentId: 'agent-worker' })]
+    })
+
+    expect(entries[0]?.actingAgentId).toBeNull()
+  })
+
+  it('reads the acting agent through the MCP text envelope a CLI step actually carries (F-P2-5)', () => {
+    // The only steps that can carry a bound acting agent are the managed CLI lanes', and on
+    // those the step's `toolResult` is NOT the route's JSON: it is the MCP result envelope the
+    // helper returned — `{ content: [{ type: 'text', text }] }` with `text` the
+    // `JSON.stringify` of the route's whole response (`scripts/lib/cli-tool-result-content.cjs`,
+    // stored as-is by `codexEventAdapter`; see that adapter's own `mcp_tool_call` fixture). The
+    // route's `actingAgentId` sits at the top level of that JSON, so the envelope must be opened.
+    const routeResponse = {
+      auth: 'agent',
+      userId: 'user-1',
+      actingAgentId: 'agent-worker',
+      success: true,
+      controlId: 'sys.mcp.use',
+      result: { ok: true }
+    }
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        fabricStep({ content: [{ type: 'text', text: JSON.stringify(routeResponse, null, 2) }] }),
+        // The Claude lane can hand the adapter the content blocks bare, or the text alone.
+        fabricStep([{ type: 'text', text: JSON.stringify(routeResponse) }] as never),
+        fabricStep(JSON.stringify(routeResponse) as never)
+      ],
+      sessionAgentId: 'agent-cooper'
+    })
+
+    expect(entries.map((entry) => entry.actingAgentId)).toEqual([
+      'agent-worker',
+      'agent-worker',
+      'agent-worker'
+    ])
+  })
+
+  it('reads nothing out of envelope text that is not JSON, or JSON that names no acting agent', () => {
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        fabricStep({ content: [{ type: 'text', text: 'Recalled 3 memories.' }] }),
+        fabricStep({ content: [{ type: 'text', text: '{"success":true,"result":{"agentId":"agent-faye"}}' }] }),
+        fabricStep({ content: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] })
+      ],
+      sessionAgentId: 'agent-cooper'
+    })
+
+    expect(entries.map((entry) => entry.actingAgentId)).toEqual([null, null, null])
+  })
+
+  it('never reads an acting agent out of the step INPUT', () => {
+    // The input is the model's own arguments. Only the server's response may source it.
+    const entries = buildExecutionToolActivityEntries({
+      steps: [
+        {
+          toolName: 'batshit_control_use',
+          toolInput: { controlId: 'sys.dm.read', actingAgentId: 'agent-faye' },
+          toolResult: { success: true },
+          toolCallId: 'call-1'
+        }
+      ],
+      sessionAgentId: 'agent-cooper'
+    })
+
+    expect(entries[0]?.actingAgentId).toBeNull()
+  })
 })

@@ -16,6 +16,12 @@ export type StreamEventType =
   | 'error'
   | 'zip_activity_change'
   | 'user_message'
+  // SA-114 (DL-114-03) — the three steer events. They are forwarded directly rather than
+  // built by an adapter method: like `zip_activity_change`, they describe something that
+  // happened AROUND the model's output rather than a piece of it.
+  | 'steer_queued'
+  | 'steer_delivered'
+  | 'steer_promoted'
   | 'file'           // SA-010: Generated file output (images, etc.)
   | 'audio'          // SA-011: Generated audio output (TTS/speech)
   | 'object_partial' // SA-011: Streaming structured object partial update

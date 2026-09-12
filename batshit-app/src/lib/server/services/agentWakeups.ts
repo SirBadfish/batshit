@@ -72,11 +72,13 @@ export type WakeTargetInput =
 
 export interface WakeOriginInput {
   kind: SessionOriginKind
-  /** Frozen display name: the sending agent, or the hook's name. */
+  /** Frozen display name: the sending agent, the hook's name, or the schedule's name. */
   fromLabel: string
   agentId?: string | null
   dmId?: string | null
   hookId?: string | null
+  /** SA-115: the schedule that fired, for `kind: 'schedule'`. */
+  scheduleId?: string | null
 }
 
 export interface RequestAgentWakeupInput {
@@ -393,6 +395,7 @@ async function runAgentWakeup(
     agentId: input.origin.agentId,
     dmId: input.origin.dmId,
     hookId: input.origin.hookId,
+    scheduleId: input.origin.scheduleId,
     chainDepth: nextChainDepth
   })
 
@@ -655,9 +658,13 @@ async function finishWokenTurn(
   // wake primitive's static graph — the DM tools import BOTH, and one direction is enough.
   if (entry.origin.dmId) {
     try {
-      const { stampDmDelivery, stampDmNeedsUser } = await import(
-        '$lib/server/services/dm/dmStore'
-      )
+      const {
+        acknowledgeInfoDm,
+        getDm,
+        stampDmDelivery,
+        stampDmNeedsUser,
+        WAKE_DELIVERED_INFO_RESULT
+      } = await import('$lib/server/services/dm/dmStore')
       await stampDmDelivery(entry.origin.dmId, {
         ...(reason === 'agent_busy'
           ? {
@@ -677,11 +684,48 @@ async function finishWokenTurn(
       //
       // Only on a turn that actually finished: a stopped, timed-out, failed, or busy turn
       // has its own honest outcome, and calling those "needs you" would cry wolf.
-      if (reason === 'completed' && (await hasPendingToolApproval(sessionId))) {
+      const parkedOnApproval =
+        reason === 'completed' && (await hasPendingToolApproval(sessionId))
+
+      if (parkedOnApproval) {
         await stampDmNeedsUser(
           entry.origin.dmId,
           'This chat is waiting for you to approve a tool before it can go on.'
         )
+      } else if (reason === 'completed') {
+        // SA-115 F-P1-2 — a wake DELIVERS an info note, so the note is no longer open.
+        //
+        // Without this, an `info` DM that woke an agent stays `new` forever: SA-113 closes
+        // an info item only when the agent calls `sys.dm.read`, and an agent that was
+        // handed the note as the first message of its turn has no reason to go read it
+        // again. Every later turn's DCM roster then re-lists it, and a repeating schedule
+        // makes that unbounded — a daily heartbeat adds one permanent open note per day,
+        // and a 5-minute wake schedule fills the 50-item inbox in about four hours, after
+        // which every fire fails `inbox_full`.
+        //
+        // Deliberately narrow:
+        //   - `info` only. An `assignment` is work, not a note; it stays open until the
+        //     agent claims and closes it, which is the whole point of the kind.
+        //   - `completed` only. A `stopped`, `timed_out`, `failed`, or `agent_busy` turn
+        //     may never have shown the agent the note at all.
+        //   - not while parked on an approval. That turn is unfinished and its DM is the
+        //     one thing carrying `needsUser`; closing it would throw away the only signal
+        //     telling the user the chat is waiting on them.
+        //   - not while the DM already carries `needsUser` at all (SA-115 F-P2-1). The
+        //     approval check above sees only `metadata.toolApprovals`, and that is not the
+        //     only way a turn parks on the user: F-SEC-1 refuses a risky Fabric control
+        //     MID-turn and stamps `needsUser` from inside `useControl`, after which the
+        //     turn ends `completed` with nothing pending. Acknowledging there would run
+        //     `withoutNeedsUser` and erase the stamp, so the envelope, the drawer's
+        //     "Needs you" row, and the `waiting_approval` presence would all go quiet on
+        //     the most common woken kind of all — a schedule or webhook `info` wake.
+        //     The holdup outlives its turn on purpose; `clearNeedsUserForHumanReply`
+        //     closes the note when the human actually replies in that chat.
+        // Every sender kind, because what closes it is the delivery, not who sent it.
+        const originDm = await getDm(entry.origin.dmId)
+        if (originDm?.kind === 'info' && !originDm.delivery?.needsUser) {
+          await acknowledgeInfoDm(entry.origin.dmId, entry.agentId, WAKE_DELIVERED_INFO_RESULT)
+        }
       }
     } catch (error) {
       console.warn('[Wake-up] Could not stamp the DM delivery outcome:', error)

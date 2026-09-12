@@ -107,7 +107,11 @@ const TOOL_DEFINITIONS = [
         ref: { type: 'string' },
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
-        allowRisky: { type: 'boolean' },
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        },
         dryRun: { type: 'boolean' }
       },
       required: ['ref']
@@ -180,7 +184,11 @@ const TOOL_DEFINITIONS = [
         toolId: { type: 'string' },
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
-        allowRisky: { type: 'boolean' }
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        }
       },
       required: ['toolId']
     }
@@ -246,7 +254,11 @@ const TOOL_DEFINITIONS = [
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
         dryRun: { type: 'boolean' },
-        allowRisky: { type: 'boolean' }
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        }
       },
       required: ['controlId']
     }
@@ -293,7 +305,11 @@ const TOOL_DEFINITIONS = [
         input: { type: 'object', additionalProperties: true },
         params: { type: 'object', additionalProperties: true },
         dryRun: { type: 'boolean' },
-        allowRisky: { type: 'boolean' },
+        allowRisky: {
+          type: 'boolean',
+          description:
+            'Ignored (SA-116). A confirm/restricted control pauses for the user Approve click; this flag unlocks nothing.'
+        },
         selectedGateways: { type: 'array', items: { type: 'string' } }
       },
       required: ['controlId']
@@ -314,8 +330,47 @@ if (!userId) {
   console.error('[cli-controls-mcp] Missing required --user (or BATSHIT_USER_ID) parameter')
   process.exit(1)
 }
+/**
+ * SA-117 DL-117-08 — fail LOUDLY, at startup, when there is no run credential.
+ *
+ * Every call this bridge makes needs it, so a missing one is a broken run, not a degraded
+ * one. Exiting here means the CLI reports the MCP server as failed and the agent sees it;
+ * the alternative — starting up and answering every tool call with the same auth error — is
+ * the silent-fallback shape this story exists to remove.
+ */
+const runCredential = resolveRunCredential()
+if (!runCredential) {
+  console.error(
+    '[cli-controls-mcp] BATSHIT_AGENT_TOKEN is not set, so this bridge has no run ' +
+      'credential and cannot call Batshit. Batshit mints one per managed CLI run and ' +
+      'exports it into the child environment; if this persists, regenerate the managed ' +
+      'profile for this agent in Agent Settings.'
+  )
+  process.exit(1)
+}
 const agentId = args.agent || args['agent-id'] || process.env.BATSHIT_AGENT_ID || null
 const sessionId = args.session || args['session-id'] || process.env.BATSHIT_SESSION_ID || null
+/**
+ * SA-116 DL-116-07: the assistant message this managed CLI turn is answering.
+ *
+ * Batshit exports it into the bridge's environment for every run (`codexBridge.ts`,
+ * `claudeBridge.ts`), and both profile managers forward it here. It is the ONLY way a
+ * risky-control refusal on this lane can become an approval card: `/api/controls/use`
+ * verifies the id belongs to the owned session and pins the card onto that message, so the
+ * user gets an Approve button instead of an agent describing a wall it just hit.
+ *
+ * Missing means no card — the route logs that loudly rather than guessing a message.
+ */
+const messageId = (() => {
+  const raw = typeof process.env.BATSHIT_MESSAGE_ID === 'string'
+    ? process.env.BATSHIT_MESSAGE_ID.trim()
+    : ''
+  // The Claude profile passes env through a `${VAR}` map. An unset variable there can
+  // arrive as its own literal placeholder, and a placeholder is not a message id — send
+  // nothing rather than an id the route will spend a Redis read rejecting.
+  if (!raw || raw.includes('${')) return null
+  return raw
+})()
 /**
  * SA-105 P3 (AMD-105-09): which managed CLI launched this bridge. Both profile
  * managers pass it explicitly rather than the bridge inferring it, because env
@@ -346,9 +401,25 @@ const batshitBaseUrl =
   process.env.ORIGIN ||
   defaultBatshitBaseUrl
 
-function resolveServiceToken() {
-  const token = process.env.BATSHIT_TOKEN || ''
-  return token.trim()
+/**
+ * SA-117 DL-117-08 — this helper authenticates with the run credential Batshit minted for
+ * THIS run, not with the instance token.
+ *
+ * `codexBridge.ts` and `claudeBridge.ts` mint it at run start, export it here as
+ * `BATSHIT_AGENT_TOKEN`, delete `BATSHIT_TOKEN` from the child environment, and revoke the
+ * credential when the run ends. The server reads the acting agent and the session off that
+ * record, so this bridge no longer SAYS who it is — `--agent` and `--user` survive for log
+ * lines and local guards only.
+ *
+ * The Claude profile passes env through a `${VAR}` map, and an unset variable there can
+ * arrive as its own literal placeholder. A placeholder is not a credential.
+ */
+function resolveRunCredential() {
+  const raw = typeof process.env.BATSHIT_AGENT_TOKEN === 'string'
+    ? process.env.BATSHIT_AGENT_TOKEN.trim()
+    : ''
+  if (!raw || raw.includes('${')) return ''
+  return raw
 }
 
 function normalizeArgs(input) {
@@ -412,15 +483,6 @@ function attachZipControlNotice(payload) {
 }
 
 async function postJson(endpointPath, payload, timeoutMs = 60000) {
-  const token = resolveServiceToken()
-  if (!token) {
-    return {
-      ok: false,
-      status: 500,
-      body: toErrorPayload('BATSHIT_TOKEN is not configured for CLI internal control tools.')
-    }
-  }
-
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -428,8 +490,10 @@ async function postJson(endpointPath, payload, timeoutMs = 60000) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-batshit-service-token': token,
-        'x-batshit-user-id': userId
+        // SA-117 DL-117-08: the credential IS the identity. `x-batshit-user-id` is gone with
+        // the instance token it accompanied — on the service lane that header was simply
+        // whatever the caller typed, which is the claim this story stopped believing.
+        'x-batshit-agent-token': runCredential
       },
       body: JSON.stringify(payload),
       signal: controller.signal
@@ -504,8 +568,9 @@ function formatFetchZipResult(responseBody, inputZipId) {
 async function callControlFind(rawArgs) {
   const args = normalizeArgs(rawArgs)
   const payload = {
-    userId,
-    ...(agentId ? { agentId } : {}),
+    // SA-117 DL-117-04: no `userId`, no `agentId`. Both come off the run credential the
+    // server minted; a body id that DIFFERS from the bound one is now a 400, and an absent
+    // one is the expected shape on this lane.
     ...(typeof args.query === 'string' ? { query: args.query } : {}),
     ...(Array.isArray(args.tags) ? { tags: args.tags } : {}),
     ...(args.sourceType ? { sourceType: args.sourceType } : {}),
@@ -556,9 +621,12 @@ async function callControlUse(rawArgs) {
           : {}
 
   const payload = {
-    userId,
-    ...(agentId ? { agentId } : {}),
+    // SA-117 DL-117-04: no `userId`, no `agentId`. Both come off the run credential the
+    // server minted; a body id that DIFFERS from the bound one is now a 400, and an absent
+    // one is the expected shape on this lane.
     ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
+    // SA-116 DL-116-07 — server-side env only, never an argument the model can set.
+    ...(messageId ? { messageId } : {}),
     controlId: controlId || control_id || id || '',
     input: payloadInput,
     dryRun: dryRun === true || dry_run === true,
@@ -665,8 +733,9 @@ async function callDynamicUse(rawArgs) {
 async function callCliFind(rawArgs) {
   const args = normalizeArgs(rawArgs)
   const payload = {
-    userId,
-    ...(agentId ? { agentId } : {}),
+    // SA-117 DL-117-04: no `userId`, no `agentId`. Both come off the run credential the
+    // server minted; a body id that DIFFERS from the bound one is now a 400, and an absent
+    // one is the expected shape on this lane.
     ...(typeof args.query === 'string' ? { query: args.query } : {}),
     ...(typeof args.limit === 'number' ? { limit: args.limit } : {}),
     ...(typeof args.includeSchema === 'boolean' ? { includeSchema: args.includeSchema } : {})
@@ -686,8 +755,13 @@ async function callCliUse(rawArgs) {
         : {}
 
   const payload = {
-    userId,
-    ...(agentId ? { agentId } : {}),
+    // SA-117 DL-117-04: no `userId`, no `agentId`. Both come off the run credential the
+    // server minted; a body id that DIFFERS from the bound one is now a 400, and an absent
+    // one is the expected shape on this lane.
+    // SA-116 DL-116-14: a risky user-authored CLI tool earns the same card a risky Fabric
+    // control does, and a card needs the chat and the message it renders on.
+    ...(sessionId ? { sessionId } : {}),
+    ...(messageId ? { messageId } : {}),
     toolId: args.toolId || args.tool_id || '',
     input: payloadInput,
     allowRisky: args.allowRisky === true || args.allow_risky === true,
@@ -703,8 +777,9 @@ async function callCliUse(rawArgs) {
 async function callAgentBrowser(rawArgs, action) {
   const args = normalizeArgs(rawArgs)
   const payload = {
-    userId,
-    ...(agentId ? { agentId } : {}),
+    // SA-117 DL-117-04: no `userId`, no `agentId`. Both come off the run credential the
+    // server minted; a body id that DIFFERS from the bound one is now a 400, and an absent
+    // one is the expected shape on this lane.
     ...(sessionId ? { sessionId } : {}),
     action,
     ...(typeof args.query === 'string' ? { query: args.query } : {}),
@@ -768,15 +843,16 @@ async function callBashExecute(rawArgs) {
   const response = await postJson(
     '/api/native-tools/dispatch',
     {
-      userId,
       ...(typeof projectPath === 'string' && projectPath.trim().length > 0
         ? { projectPath: projectPath.trim() }
         : {}),
       action: 'bash_execute',
       input,
+      // SA-117 DL-117-04: `agent_id` is bound from the run credential by the dispatch
+      // route. `session_id` still travels because the route's bound session overrides it
+      // and the non-agent lanes still need it.
       context: {
         session_id: sessionId,
-        agent_id: agentId,
         mode: 'mode4',
         actor_type: 'primary'
       }
@@ -1050,7 +1126,7 @@ async function callBatshitToolUse(rawArgs) {
 async function callSkillRuntime(rawArgs) {
   const args = normalizeArgs(rawArgs)
   const payload = {
-    userId,
+    // SA-117 DL-117-04: identity comes off the run credential.
     ...(typeof args.skillId === 'string' ? { skillId: args.skillId } : {}),
     ...(typeof args.action === 'string' ? { action: args.action } : {}),
     ...(typeof args.path === 'string' ? { path: args.path } : {}),
@@ -1082,7 +1158,8 @@ async function deliverRecalledImages(payload) {
 
   const response = await postJson(
     '/api/memory/recall-media',
-    { userId, agentId, runtime: cliRuntime, recall: payload },
+    // SA-117 DL-117-04: the route binds the agent from the run credential.
+    { runtime: cliRuntime, recall: payload },
     60000
   )
 

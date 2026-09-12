@@ -185,7 +185,18 @@ If an artifact runtime call returns `CONTROL_NOT_FOUND`: rerun the current lane'
 
 ### Risk approval needed
 
-If a control returns `CONTROL_RISK_REQUIRES_APPROVAL` and the user approved: retry immediately with `allowRisky: true` using the exact same payload.
+`CONTROL_RISK_REQUIRES_APPROVAL` means Batshit **paused** the call and put an **Approve** /
+**Deny** card on your message. It is not a refusal, and it is not something you can unlock.
+
+- Tell the user what the control does and why, then stop
+- Never pass `allowRisky` — it is ignored on every chat lane
+- **API agent:** the user's click re-runs that same call with that same input. Do not retry
+  it yourself
+- **Codex / Claude agent:** the click resumes you with an
+  `[Approval — from the user, not from the agent]` message. Retry the same ref with the
+  **same input** then
+- A different input is a different call, so it earns a new card
+- **Deny** starts no turn; you are told on the user's next message, and you must not retry
 
 ### Prompt is required
 

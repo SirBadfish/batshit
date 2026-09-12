@@ -59,6 +59,8 @@ describe('/api/cli-tools/execute', () => {
       input: { path: 'README.md' },
       selectedToolIds: ['tool-1'],
       allowRisky: true,
+      // PR #106 review F-5: the route hands the lane down so the card lands where it can be answered.
+      actorType: 'service',
       projectPath: '/Users/example/batshit'
     })
   })

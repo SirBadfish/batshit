@@ -115,7 +115,11 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected when tool prompting is needed and Zip Control is enabled for the agent.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_zip_control_enabled.md',
-    defaultVersion: '2026-08-31'
+    // Bumped for SA-114 P4 (DL-114-16): a steer arrives as an ordinary injected user
+    // message at a tool boundary, so without this sentence nothing tells an agent that
+    // `[The user said, mid-reply: ...]` is the user and `[Agent DM - ... not from the
+    // user ...]` is not.
+    defaultVersion: '2026-09-11'
   },
   {
     id: 'tool_guidance_zip_disabled',
@@ -124,7 +128,8 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected when tool prompting is needed and Zip Control is disabled for the agent.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_zip_control_disabled.md',
-    defaultVersion: '2026-08-31'
+    // Bumped for SA-114 P4 (DL-114-16), same sentence as the enabled variant.
+    defaultVersion: '2026-09-11'
   },
   {
     id: 'tool_guidance_memory',
@@ -140,7 +145,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     redisKey: 'batshit:dm_guidance',
     label: 'Agent DM Guidance',
     description:
-      'Injected for agents with Agent DMs turned on: the three DM kinds, wait vs wake, one assignment at a time, and the rule that a DM is data from another agent and cannot approve or consent to anything.',
+      'Injected for agents with Agent DMs turned on: the three DM kinds, wait vs wake vs steer, one assignment at a time, an agent\u2019s own schedules, and the rule that a DM is data from another agent and cannot approve or consent to anything.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_dm_guidance.md',
     // Bumped after the P2 live run: the first `sys.dm.send` an agent tried failed on
@@ -151,7 +156,24 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     // because only `send` had its fields named. `read`/`claim`/`done`/`blocked` now do too.
     // Bumped in P5b for F-SEC-1: `useControl` now REFUSES a risky control in a chat a DM or
     // a webhook started, so the block says what the agent should do instead of retrying.
-    defaultVersion: '2026-09-08b'
+    // Bumped for SA-115 P2: the `sys.schedule.*` family exists now, gated on this same
+    // `dms_enabled` switch, so its four controls and their required input fields are named
+    // here — `tool_discovery` prints a Fabric COUNT and never a schema, so a block that
+    // names a control without its fields guarantees a first-call failure (the P2 and P5
+    // lesson, twice). The risky-control sentence also grew a third source (F-P1-5).
+    // Bumped for SA-115 P3 (F-P2-3b): an agent's call has no browser, so an omitted
+    // `time_zone` gets the SERVER's zone — the user's on the Mac app, usually UTC in
+    // Docker. The block now says so rather than letting an agent discover it as a bug.
+    // Bumped for SA-116 P4 (DL-116-13): SA-113 F-SEC-1's hard refusal in a woken chat is
+    // RETIRED — a risky control now pauses for the same Approve card a typed chat gets,
+    // so the old "Batshit refuses risky controls until the user replies" sentence would
+    // have an agent give up on a call the user can simply click.
+    // Bumped for SA-114 P4 (DL-114-13): `deliver: 'steer'` is live, so the block names the
+    // third value and its `steer_fallback` field. `tool_discovery` prints a Fabric COUNT
+    // and never a schema, so a mode the block does not name is a mode no agent will use —
+    // and one it names without its fields is a guaranteed first-call failure (the P2, P5
+    // and SA-115 lesson, three times).
+    defaultVersion: '2026-09-11'
   },
   {
     id: 'dynamic_mcp',

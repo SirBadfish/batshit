@@ -8,7 +8,7 @@ These are public-safe n8n Workflow Subagent templates for Batshit. They intentio
 | --- | --- |
 | `batshit-n8n-workflow-subagent.json` | Host/local n8n Workflow Subagent for `API` and `CLI` Primary Agents. |
 | `batshit-docker-n8n-workflow-subagent.json` | Docker-flavored Workflow Subagent for Batshit's optional Docker n8n profile. |
-| `batshit-n8n-wake-agent-on-schedule.json` | Wake-up webhook caller: a schedule that starts a chat for one Batshit agent. |
+| `batshit-n8n-wake-agent-on-schedule.json` | Wake-up webhook caller: a timed n8n workflow that starts a chat for one Batshit agent. For time-only triggers, Batshit's built-in Schedules need no n8n at all. |
 
 ## Import and configure
 
@@ -69,6 +69,14 @@ If you imported a template before thread control was added, re-import the curren
 ---
 
 ## Waking an agent on a schedule
+
+> **Batshit has its own clock now.** For a trigger that is only *time* — "every day at 9am",
+> "every 30 minutes", "Tuesdays and Thursdays at 4pm" — use **Settings -> Admin -> Agent
+> Wake-ups -> Schedules** instead. It needs no n8n, no webhook, and no token, and it adds a
+> missed-run dialog for the times Batshit was closed. Use n8n when the trigger lives
+> **outside** Batshit — a Slack message, a new video, an email, a finished build — or when
+> the flow has outside steps before it reaches Batshit. This template stays supported for
+> people who already run their automations in n8n and want everything in one place.
 
 `batshit-n8n-wake-agent-on-schedule.json` is the other direction: instead of Batshit calling
 n8n, n8n calls Batshit and asks an agent to start working. Use it for a morning check-in, a
