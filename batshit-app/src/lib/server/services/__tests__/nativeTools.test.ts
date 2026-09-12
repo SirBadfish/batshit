@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
-import { nativeToolService, normalizeNativeControlUseInput } from '../nativeTools'
+import {
+  mapBrokerFailureToNativeAutomationErrorCode,
+  mapControlUseErrorToNativeAutomationErrorCode,
+  nativeToolService,
+  normalizeNativeControlUseInput
+} from '../nativeTools'
 import { mcpGatewayDiscovery } from '../mcpGatewayDiscovery'
 import { mcpGatewayService } from '../mcpGatewayService'
 import { apiKeyService } from '$lib/services/apiKey.server'
@@ -8247,4 +8252,78 @@ describe('SA-096 P5 — broker registration pins the documented availability rul
   })
 
 
+})
+
+/* -------------------------------------------------------------------------- *
+ * PR #106 review (SA-113 follow-ups batch) — F-1 and F-11.
+ * -------------------------------------------------------------------------- */
+
+describe('PR #106 F-1: the dispatch route’s lane reaches the identity gate', () => {
+  it('passes the lane it was given to useControl, and `unknown` when it was given none', async () => {
+    const useControlSpy = vi.spyOn(fabricRegistry, 'useControl').mockResolvedValue({
+      success: true,
+      controlId: 'sys.runtime_addon.prepare',
+      result: { ok: true }
+    } as any)
+    vi.mocked(redis.get).mockResolvedValue({
+      user_id: 'josh',
+      provider_specific_settings: { nativeTools: { fabricEnabled: true, batshitToolsEnabled: true } }
+    } as any)
+
+    // `mode4` is the managed CLI helper's own dispatch shape — the exact door the finding
+    // walked through (Fabric control refs are only allowed on mode3/mode4 primaries).
+    const context = {
+      session_id: 'session_lane',
+      agent_id: 'agent_primary',
+      mode: 'mode4',
+      actor_type: 'primary'
+    }
+    const payloadInput = { ref: 'fabric:sys.runtime_addon.prepare', input: { addonId: 'fbx2vrma' } }
+
+    await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: 'batshit_tool_use',
+      payloadInput,
+      context,
+      actorType: 'service',
+      delegatedRun: false
+    })
+    expect(useControlSpy).toHaveBeenCalled()
+    expect(useControlSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      actorType: 'service',
+      delegatedRun: false
+    })
+
+    await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: 'batshit_tool_use',
+      payloadInput,
+      context
+    })
+    // A caller that forgot the lane is `unknown`, which the gate refuses — never a vouched
+    // default filled in on its behalf.
+    expect(useControlSpy.mock.calls.at(-1)?.[0]).toMatchObject({ actorType: 'unknown' })
+
+    useControlSpy.mockRestore()
+  })
+})
+
+describe('PR #106 F-11: one map for a failed broker call', () => {
+  it('reads every policy refusal as POLICY_BLOCKED, never as "the server is down"', () => {
+    expect(mapControlUseErrorToNativeAutomationErrorCode('AGENT_IDENTITY_REQUIRED')).toBe('POLICY_BLOCKED')
+    expect(mapControlUseErrorToNativeAutomationErrorCode('CONTROL_RISK_UNAVAILABLE_IN_GROUP')).toBe('POLICY_BLOCKED')
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ code: 'UNAVAILABLE_IN_GROUP' })).toBe('POLICY_BLOCKED')
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ code: 'REQUIRES_APPROVAL' })).toBe('POLICY_BLOCKED')
+    expect(
+      mapBrokerFailureToNativeAutomationErrorCode({ error: { code: 'AGENT_IDENTITY_REQUIRED' } })
+    ).toBe('POLICY_BLOCKED')
+  })
+
+  it('keeps the other two answers where they were', () => {
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ code: 'INPUT_VALIDATION_FAILED' })).toBe('INVALID_INPUT')
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ error: { code: 'CONTROL_EXECUTION_FAILED' } })).toBe(
+      'BACKEND_UNAVAILABLE'
+    )
+    expect(mapBrokerFailureToNativeAutomationErrorCode({ error: 'plain text' })).toBe('BACKEND_UNAVAILABLE')
+  })
 })

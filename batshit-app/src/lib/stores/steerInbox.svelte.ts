@@ -91,6 +91,10 @@ function upsert(
     source: patch.source ?? existing?.source ?? 'user',
     label: normalize(patch.label) ?? existing?.label,
     lane: patch.lane ?? existing?.lane ?? null,
+    // PR #106 review F-19b: the reason a drop was made travels with the state. Rebuilding
+    // the entry without it left `state: 'dropped'` with no reason, and the label's fallback
+    // accuses the user of a Stop they never pressed (AMD-114-08).
+    dropReason: patch.dropReason ?? existing?.dropReason,
     updatedAt: Date.now()
   })
 }

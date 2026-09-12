@@ -2815,6 +2815,12 @@ export interface ControlUseOptions {
    */
   approval?: ControlApprovalGrant
   runtimeMode?: ControlRuntimeMode
+  /**
+   * Which lane the caller authenticated on. The HTTP routes pass what `resolveNativeToolUser`
+   * returned; the in-process callers pass `'in-process'` explicitly. Omitting it means
+   * `'unknown'`, which every control that acts as an agent REFUSES — the default fails closed
+   * (PR #106 review, F-1).
+   */
   actorType?: ControlActorType
   /**
    * SA-117 DL-117-10 — the run credential this call arrived on, on the `agent` lane only.
@@ -2839,8 +2845,11 @@ export interface ControlUseOptions {
  * SA-117 P1 (DL-117-03, DL-117-10) — who called, as the audit records it.
  *
  * Assigned straight from `resolveNativeToolUser`'s `auth` at `/api/controls/use`, so this union
- * tracks `NativeToolAuthMethod` (which is exported for exactly that reason) plus `'unknown'`
- * for the in-process callers that declare nothing.
+ * tracks `NativeToolAuthMethod` (which is exported for exactly that reason) plus `'in-process'`
+ * for the callers that never cross a request boundary — send-routed's broker, the artifact
+ * runtime, the automation broker — and `'unknown'` for a caller that declared nothing.
+ * `'unknown'` is NOT vouched for by the identity gate (PR #106 review, F-1): it used to be the
+ * silent default and a vouched lane at once, so forgetting the parameter meant being trusted.
  *
  * `'agent'` is new: a Batshit-minted run credential, so the acting agent on the entry was bound
  * by the server rather than named by the body. `'internal'` is GONE — no lane ever produced it,
@@ -2848,7 +2857,14 @@ export interface ControlUseOptions {
  * and keeping an unreachable value in a security-relevant union invites a future reader to
  * "restore" a meaning it never had.
  */
-type ControlActorType = 'agent' | 'service' | 'session' | 'n8n-callback' | 'portable-skill' | 'unknown'
+export type ControlActorType =
+  | 'agent'
+  | 'service'
+  | 'session'
+  | 'n8n-callback'
+  | 'portable-skill'
+  | 'in-process'
+  | 'unknown'
 
 /**
  * SA-117 DL-117-05 — the control families that act AS an agent.
@@ -7165,7 +7181,9 @@ export async function resolveControlRiskProfile(options: {
 
 export async function useControl(options: ControlUseOptions): Promise<ControlUseResult> {
   const startedAt = Date.now()
-  const actorType = options.actorType ?? 'unknown'
+  // `'unknown'` is recorded on the audit entry and refused by the identity gate below; it is
+  // never a vouched lane (PR #106 review, F-1).
+  const actorType: ControlActorType = options.actorType ?? 'unknown'
   const requestedControlId = typeof options.controlId === 'string' ? options.controlId.trim() : ''
   const inputPayload =
     options.input && typeof options.input === 'object' && !Array.isArray(options.input) ? options.input : {}
@@ -7303,8 +7321,9 @@ export async function useControl(options: ControlUseOptions): Promise<ControlUse
    * it is an authorization answer rather than a validation one. `requireActingAgentIdentity`
    * is the whole rule and it is never restated inline: a `service`-lane caller holds the
    * instance token and then NAMES an agent, which is exactly the claim this story stopped
-   * believing. The in-process API broker (`unknown`) and the `agent` lane pass, because on
-   * both the `agentId` reaching the handler was set by the server.
+   * believing. The in-process callers (`in-process`) and the `agent` lane pass, because on
+   * both the `agentId` reaching the handler was set by the server. A caller that declared
+   * no lane at all (`unknown`) is refused: the default fails closed (PR #106 review, F-1).
    *
    * It is audited like any other refusal, so "who tried to read whose inbox" is recorded.
    */

@@ -1,7 +1,9 @@
 <script lang="ts">
   import * as Sheet from '$lib/components/ui/sheet'
   import { Button } from '$lib/components/ui/button'
-  import { CircleStop, Mail, RefreshCcw, Trash2, Webhook } from '@lucide/svelte'
+  import { CircleStop, RefreshCcw, Trash2 } from '@lucide/svelte'
+  import { dmSenderLabel } from '$lib/utils/dmSender'
+  import { dmSenderIcon } from '$lib/utils/dmSenderIcons'
   import * as sessionStore from '$lib/stores/session.svelte'
   import { onUserChannelEvent } from '$lib/services/userChannel'
   import { hydrateDmInboxCounts } from '$lib/stores/dmInbox.svelte'
@@ -91,7 +93,9 @@
   })
 
   function senderLabel(from: DmSender): string {
-    return from.kind === 'agent' ? from.name || from.agentId : `${from.name} (webhook)`
+    // PR #106 review F-13: keyed by kind, so a schedule is a schedule and a fourth kind is a
+    // compile error rather than a silent "(webhook)".
+    return dmSenderLabel(from)
   }
 
   function agentName(id: string): string {
@@ -359,6 +363,7 @@
       {:else}
         <ul class="dm-drawer-list">
           {#each visibleRows as row (row.id)}
+            {@const SenderIcon = dmSenderIcon(row.from)}
             <li class="dm-drawer-row">
               <button
                 type="button"
@@ -368,11 +373,7 @@
                 onclick={() => toggleRow(row)}
               >
                 <span class="dm-drawer-row-line">
-                  {#if row.from.kind === 'webhook'}
-                    <Webhook class="dm-drawer-row-icon" />
-                  {:else}
-                    <Mail class="dm-drawer-row-icon" />
-                  {/if}
+                  <SenderIcon class="dm-drawer-row-icon" />
                   <span class="dm-drawer-row-subject">{row.subject}</span>
                   {#if row.runningSessionId}
                     <span class="dm-drawer-live">running</span>

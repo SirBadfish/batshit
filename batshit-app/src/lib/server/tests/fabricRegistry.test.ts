@@ -3835,7 +3835,7 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
   it('lets the credential lane, the in-process callers, and the user\'s own session through the same gate', async () => {
     const { useControl } = await import('../services/fabricRegistry')
 
-    for (const actorType of ['agent', 'unknown', 'n8n-callback', 'session'] as const) {
+    for (const actorType of ['agent', 'in-process', 'n8n-callback', 'session'] as const) {
       const result = await useControl({
         userId: 'user-1',
         controlId: 'sys.dm.list',
@@ -3852,6 +3852,34 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
         )
       }
     }
+  })
+
+  it('refuses a caller that declares no lane — the default fails closed (PR #106 review, F-1)', async () => {
+    // `actorType` defaulted to `'unknown'` AND `'unknown'` was vouched, so any caller that
+    // forgot the parameter was silently trusted. The dispatch route's `batshit_tool_use` path
+    // reached `sys.dm.*` exactly that way with only the instance token.
+    const { useControl } = await import('../services/fabricRegistry')
+
+    const omitted = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      agentId: 'agent-cooper',
+      input: {}
+    })
+    expect(omitted.success).toBe(false)
+    if (omitted.success) return
+    expect(omitted.error.code).toBe('AGENT_IDENTITY_REQUIRED')
+
+    const declaredUnknown = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.dm.list',
+      agentId: 'agent-cooper',
+      actorType: 'unknown',
+      input: {}
+    })
+    expect(declaredUnknown.success).toBe(false)
+    if (declaredUnknown.success) return
+    expect(declaredUnknown.error.code).toBe('AGENT_IDENTITY_REQUIRED')
   })
 
   it('lets a signed-in browser act as one of the user\'s own agents (F-P2-4)', async () => {

@@ -40,6 +40,7 @@ import { deliverScheduledDm } from '$lib/server/services/dm/dmTools'
 import type { ScheduleRecord } from '$lib/types/schedule'
 import {
   collapseMissedRun,
+  disableScheduleAfterFailure,
   listDueSchedules,
   recordFire
 } from './scheduleStore'
@@ -128,14 +129,15 @@ export async function runScheduleSweep(now = new Date()): Promise<ScheduleSweepR
           bucket.push(entry)
           missedByUser.set(schedule.userId, bucket)
         } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
           console.error(
             `[Schedules] Could not collapse the missed runs of schedule ${schedule.id}:`,
             error
           )
-          report.skipped.push({
-            scheduleId: schedule.id,
-            reason: error instanceof Error ? error.message : String(error)
-          })
+          report.skipped.push({ scheduleId: schedule.id, reason })
+          // PR #106 review F-3: a collapse that cannot compute the next run would throw here
+          // again every 60 seconds, forever, with nothing on the Admin card. Stop it and say why.
+          await stopScheduleThatCannotAdvance(schedule.id, reason, now)
         }
         continue
       }
@@ -193,23 +195,42 @@ async function fireSchedule(
     console.error(`[Schedules] Schedule ${schedule.id} ("${schedule.name}") failed to fire:`, error)
   }
 
+  // AMD-115-03 — the anchor is the slot this run was DUE, not the moment it actually fired.
+  // A sweep is up to 60 seconds late by construction; anchoring on `now` would add that
+  // lateness to every period and compound it, so "every 30 minutes" would slowly become
+  // every 31. Anchoring on `dueAt` keeps the grid.
+  //
+  // PR #106 review F-3: computed on its own, BEFORE `recordFire`. Evaluated inside that call's
+  // argument object, a throw here (an unresolvable stored zone) skipped the whole record —
+  // no `lastOutcome`, no advanced `nextRunAt` — and the same slot fired again every sweep.
+  let nextRunAt: Date | null = null
+  let cannotAdvance: string | null = null
+  try {
+    nextRunAt = computeNextRunAt(schedule.cadence, schedule.timeZone, now, dueAt)
+  } catch (error) {
+    ok = false
+    cannotAdvance = error instanceof Error ? error.message : String(error)
+    outcome = `failed: ${cannotAdvance}`
+    console.error(
+      `[Schedules] Schedule ${schedule.id} ("${schedule.name}") cannot compute its next run:`,
+      error
+    )
+  }
+
   try {
     await recordFire({
       scheduleId: schedule.id,
       ranAt: now,
       outcome,
       dmId,
-      // AMD-115-03 — the anchor is the slot this run was DUE, not the moment it actually
-      // fired. A sweep is up to 60 seconds late by construction; anchoring on `now` would
-      // add that lateness to every period and compound it, so "every 30 minutes" would
-      // slowly become every 31. Anchoring on `dueAt` keeps the grid.
-      nextRunAt: computeNextRunAt(schedule.cadence, schedule.timeZone, now, dueAt)
+      ...(nextRunAt ? { nextRunAt } : {})
     })
   } catch (error) {
     // A schedule deleted mid-fire is the expected case here and is a no-op by design
     // (path-scoped writes). Anything else is worth seeing.
     console.warn(`[Schedules] Could not record the fire of schedule ${schedule.id}:`, error)
   }
+  if (cannotAdvance) await stopScheduleThatCannotAdvance(schedule.id, cannotAdvance, now)
 
   return {
     ...base,
@@ -218,6 +239,21 @@ async function fireSchedule(
     ...(sessionId ? { sessionId } : {}),
     ...(dmId ? { dmId } : {}),
     outcome
+  }
+}
+
+/**
+ * PR #106 review F-3 — switch a schedule off with its reason, never throwing from a sweep.
+ * A schedule deleted in the meantime is a no-op; anything else is logged and the sweep goes on.
+ */
+async function stopScheduleThatCannotAdvance(scheduleId: string, reason: string, now: Date) {
+  try {
+    await disableScheduleAfterFailure(scheduleId, reason, now)
+    console.error(
+      `[Schedules] Schedule ${scheduleId} was switched off: it cannot compute its next run (${reason}). Edit it to turn it back on.`
+    )
+  } catch (error) {
+    console.warn(`[Schedules] Could not switch off schedule ${scheduleId} after a failure:`, error)
   }
 }
 

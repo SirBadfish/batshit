@@ -107,6 +107,17 @@ describe('steerInbox', () => {
     expect(steerBubbleStatusLabel(getSteer('steer_b')!)).toContain('Send it again')
   })
 
+  it('PR #106 F-19b: keeps the drop reason through a later event for the same steer', () => {
+    noteLocalSteer({ steerId: 'steer_late', sessionId: 's1', messageId: 'm1', text: 'late' })
+    markSteerDropped('steer_late', 'unanswered')
+    // A replayed queue event arriving after the drop used to rebuild the entry without its
+    // reason, and the label then blamed the user for a Stop they never pressed.
+    applySteerQueued({ steerId: 'steer_late', sessionId: 's1', messageId: 'm1', text: 'late' })
+
+    expect(getSteer('steer_late')?.dropReason).toBe('unanswered')
+    expect(steerBubbleStatusLabel(getSteer('steer_late')!)).toContain('Send it again')
+  })
+
   it('labels the waiting and queued states', () => {
     noteLocalSteer({ steerId: 'steer_w', sessionId: 's1', messageId: 'm1', text: 'w', state: 'waiting' })
     noteLocalSteer({ steerId: 'steer_q', sessionId: 's1', messageId: 'm1', text: 'q' })

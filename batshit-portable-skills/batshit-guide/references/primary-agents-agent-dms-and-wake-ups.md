@@ -281,7 +281,7 @@ These are fixed in v1 except the time limit, which is a per-agent setting.
 | An unread DM expires after | 7 days (info), 14 days (assignment, result) |
 | A closed DM is kept for | 30 days |
 
-Two loop guards: an agent cannot DM itself, and an identical DM sent again within 10 minutes is refused as a duplicate.
+Two loop guards: an agent cannot DM itself, and an identical DM sent again within 10 minutes is refused as a duplicate. Schedules are exempt from the second guard on purpose — a schedule sends the same message by design, and a five-minute schedule would otherwise refuse itself.
 
 ## What this costs
 

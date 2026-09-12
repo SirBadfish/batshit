@@ -339,3 +339,58 @@ describe('AMD-115-03 / F-P1-3 — the ticker anchors the next run on the DUE slo
     expect(options.now.toISOString()).toBe('2026-09-08T09:00:37.000Z')
   })
 })
+
+/* -------------------------------------------------------------------------- *
+ * PR #106 review F-3 — a schedule whose stored zone this host cannot resolve.
+ *
+ * The zone is stored verbatim (AMD-115-01) and restored verbatim, so a backup from a host
+ * with newer tzdata can carry a zone this ICU rejects. `computeNextRunAt` then throws for a
+ * record `listDueSchedules` and `deliverScheduledDm` both accept.
+ * -------------------------------------------------------------------------- */
+
+describe('a schedule whose zone this host cannot resolve (PR #106 F-3)', () => {
+  const now = new Date('2026-09-02T14:05:00.000Z')
+
+  it('fires once, records the failure, and switches itself off instead of storming', async () => {
+    const record = await seedSchedule({
+      name: 'Bad zone',
+      nextRunAt: new Date(now.getTime() - 60_000).toISOString()
+    })
+    await redis.json.set(`schedule:${record.id}`, '$.timeZone', 'Mars/Olympus_Mons' as never)
+
+    const first = await runScheduleSweep(now)
+    expect(deliverScheduledDm).toHaveBeenCalledTimes(1)
+    expect(first.fired).toHaveLength(1)
+    expect(first.fired[0]?.ok).toBe(false)
+
+    const stored = await getSchedule(record.id)
+    expect(stored?.enabled).toBe(false)
+    expect(stored?.lastOutcome).toMatch(/^failed: .*time zone/)
+    expect(stored?.lastRunAt).toBe(now.toISOString())
+
+    // The storm: before the fix nothing was recorded, so the same slot fired every sweep.
+    await runScheduleSweep(new Date(now.getTime() + 60_000))
+    await runScheduleSweep(new Date(now.getTime() + 120_000))
+    expect(deliverScheduledDm).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops a missed-run collapse that cannot compute the next slot, with the reason on the card', async () => {
+    const record = await seedSchedule({
+      name: 'Bad zone, overdue',
+      nextRunAt: new Date(now.getTime() - LATE_FIRE_GRACE_MS - 60_000).toISOString()
+    })
+    await redis.json.set(`schedule:${record.id}`, '$.timeZone', 'Mars/Olympus_Mons' as never)
+
+    const report = await runScheduleSweep(now)
+    expect(deliverScheduledDm).not.toHaveBeenCalled()
+    expect(report.skipped.map((entry) => entry.scheduleId)).toContain(record.id)
+
+    const stored = await getSchedule(record.id)
+    expect(stored?.enabled).toBe(false)
+    expect(stored?.lastOutcome).toMatch(/^failed: .*time zone/)
+
+    // Nothing to retry every minute any more.
+    const again = await runScheduleSweep(new Date(now.getTime() + 60_000))
+    expect(again.skipped.map((entry) => entry.scheduleId)).not.toContain(record.id)
+  })
+})

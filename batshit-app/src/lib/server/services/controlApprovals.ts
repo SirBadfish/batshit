@@ -102,8 +102,8 @@ const CONTROL_RISK_WINDOW_KEY_PREFIX = 'control_risk_approval:'
  * than assuming, and they cannot: for `control_approval:{X}` to equal
  * `control_approvals:{Y}` you would need `:{X}` to equal `s:{Y}`, and those differ in their
  * first character. (`schedule:` / `schedules:` and `wake_hook:` / `wake_hooks:` are the same
- * shape and are equally safe; `scheduleKeys.ts` states that collision as fact, which is
- * wrong — the guard there is still worth having for the reasons above.)
+ * shape and are equally safe, and their headers say so; the guards there are still worth
+ * having for the reasons above.)
  */
 const APPROVAL_ID_PATTERN = /^apr_[A-Za-z0-9_-]{1,64}$/
 
@@ -917,8 +917,19 @@ export async function decideRiskGate(options: {
   toolCallId?: string | null
   now?: Date
 }): Promise<RiskGateDecision> {
-  // (1) DL-116-09 — the token's scope is the consent; there is no chat to click in.
-  if (options.portableSkillScope === true) {
+  // (0) SA-113 F-SEC-1, read FIRST (PR #106 review, F-2). A woken turn is driven by a DM
+  // body or a webhook payload — untrusted text — so nothing below may exempt it from the
+  // card, not even a Portable Skill Token. `resolveWokenTurnState` owns the fail-closed rule
+  // (an unreadable session answers "woken"); it is read once, here, for steps (1) and (5).
+  const wokenTurn = await resolveWokenTurnState(options.sessionId, {
+    userId: options.userId,
+    agentId: options.agentId
+  })
+
+  // (1) DL-116-09 — the token's scope is the consent; there is no chat to click in. A woken
+  // turn holding the token gets NO such exemption (F-2): it falls through to the pause like
+  // every other woken turn, which is what `main` refused outright before SA-116.
+  if (options.portableSkillScope === true && !wokenTurn.woken) {
     return {
       kind: 'run',
       approval: {
@@ -973,12 +984,7 @@ export async function decideRiskGate(options: {
     // than running a call nobody has an unspent approval for.
   }
 
-  // (4) SA-113 F-SEC-1, kept — a woken turn never rides a window, and an unreadable session
-  // answers "woken". `resolveWokenTurnState` owns that fail-closed rule.
-  const wokenTurn = await resolveWokenTurnState(options.sessionId, {
-    userId: options.userId,
-    agentId: options.agentId
-  })
+  // (4) SA-113 F-SEC-1, kept — a woken turn never rides a window. The read happened at (0).
 
   // (5) The one window DL-116-04 keeps, seeded only by a click.
   const scopeKey = trimmed(options.scopeKey)

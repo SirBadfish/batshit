@@ -433,3 +433,31 @@ export function buildSteerSendPayload(steers: SteerEntry[]): SteerSendPayload {
     text: buildSteerInjectionText(steers)
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * PR #106 review F-4 — what the client does with a refused steer.
+ * ------------------------------------------------------------------ */
+
+export type SteerRefusalKind = 'already_finished' | 'not_steerable' | 'refused'
+
+/**
+ * Only two refusals may escalate. `reply_finished` means there is nothing to steer into
+ * any more, so the words go out as an ordinary message. `not_steerable` means this agent
+ * cannot be steered at all, so the words interrupt — the design the send button already
+ * promised. EVERYTHING else — the cap (`steer_inbox_full`), a waiting DM
+ * (`steer_dm_pending`), a bad request, a lost server — is `refused`: the client shows the
+ * reason and stops. The reply keeps running, and the steers it already accepted stay where
+ * they are. Collapsing those into "interrupt instead" is how five accepted messages were
+ * thrown away and the bubbles blamed the user for a Stop nobody pressed.
+ */
+export function classifySteerRefusal(
+  status: number | null | undefined,
+  payload: Record<string, unknown> | null | undefined
+): SteerRefusalKind {
+  const reason = typeof payload?.reason === 'string' ? payload.reason : ''
+  if (payload?.refusal === 'reply_finished' || reason.startsWith('That reply already finished')) {
+    return 'already_finished'
+  }
+  if (status === 409 && payload?.code === 'not_steerable') return 'not_steerable'
+  return 'refused'
+}

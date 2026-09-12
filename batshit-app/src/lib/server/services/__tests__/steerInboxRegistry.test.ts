@@ -331,6 +331,35 @@ describe('the in-flight lane (P2)', () => {
     expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['first', 'second'])
   })
 
+  it('PR #106 F-9: returns only what is still in flight, and never re-creates a cleared inbox', () => {
+    enqueueSteer(SESSION, entry('first'))
+    const taken = takePendingSteersForTransport(SESSION, MESSAGE)
+    // The transport echoed it: the model has it, it is delivered.
+    confirmSteerDelivery(SESSION, MESSAGE, { steerIds: ['first'], step: 1, lane: 'codex' })
+    returnSteersToPending(SESSION, taken)
+    // A late rejection must not put a delivered steer back to be promoted a second time.
+    expect(listPendingSteers(SESSION)).toEqual([])
+
+    enqueueSteer(SESSION, entry('second'))
+    const takenAgain = takePendingSteersForTransport(SESSION, MESSAGE)
+    clearSteerInbox(SESSION)
+    returnSteersToPending(SESSION, takenAgain)
+    // The turn is over; a rejection arriving after `clearSteerInbox` must not leave a ghost
+    // that eats a slot for every later turn.
+    expect(countPendingSteers(SESSION)).toBe(0)
+    expect(listPendingSteers(SESSION)).toEqual([])
+  })
+
+  it('PR #106 F-10: the cap counts the messages waiting for THIS reply, not the whole chat', () => {
+    for (let index = 0; index < MAX_PENDING_STEERS; index += 1) {
+      expect(enqueueSteer(SESSION, entry(`dead_${index}`, { messageId: 'msg_stopped' })).ok).toBe(true)
+    }
+    // A stopped turn's entries are still in the inbox in the overlap window; the live turn's
+    // first steer must not be refused on their account.
+    const live = enqueueSteer(SESSION, entry('live', { messageId: 'msg_live' }))
+    expect(live.ok).toBe(true)
+  })
+
   it('keeps a live turn’s in-flight steers when a finished request clears the inbox', () => {
     enqueueSteer(SESSION, entry('stopped', { messageId: 'msg_stopped' }))
     takePendingSteersForTransport(SESSION, 'msg_stopped')

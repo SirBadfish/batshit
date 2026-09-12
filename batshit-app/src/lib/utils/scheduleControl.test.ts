@@ -107,6 +107,16 @@ describe('validateCadence', () => {
     expect(validateCadence(null).ok).toBe(false)
   })
 
+  it('PR #106 F-12: never invents Sunday from an empty, null or boolean weekday', () => {
+    for (const bad of [null, false, true, '', ' ', [], {}]) {
+      const result = validateCadence({ type: 'weekly', days: [bad], at: '09:00' })
+      expect(result.ok, `days: [${JSON.stringify(bad)}]`).toBe(false)
+    }
+    const numeric = validateCadence({ type: 'weekly', days: ['0', 6], at: '09:00' })
+    expect(numeric.ok).toBe(true)
+    if (numeric.ok && numeric.cadence.type === 'weekly') expect(numeric.cadence.days).toEqual([0, 6])
+  })
+
   it('refuses a weekly cadence with no days or an out-of-range day', () => {
     expect(validateCadence({ type: 'weekly', days: [], at: '09:00' }).ok).toBe(false)
     expect(validateCadence({ type: 'weekly', days: [7], at: '09:00' }).ok).toBe(false)

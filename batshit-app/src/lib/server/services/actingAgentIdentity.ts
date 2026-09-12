@@ -25,7 +25,8 @@
  * | Lane | Vouched? | Why |
  * |---|---|---|
  * | `agent` | yes | Batshit minted the credential and read the agent off it. |
- * | `unknown` | yes | The in-process callers — send-routed's broker, the automation broker — never cross a request boundary at all; their `agentId` is the turn's own, set by the server. |
+ * | `in-process` | yes | The in-process callers — send-routed's broker, the artifact runtime, the automation broker — never cross a request boundary at all; their `agentId` is the turn's own, set by the server. They SAY so: every in-process caller passes `'in-process'` explicitly. |
+ * | `unknown` | **no** | A caller that declared no lane. Refused, so a call site that forgets the parameter fails closed instead of being trusted by omission (PR #106 review, F-1). |
  * | `n8n-callback` | yes | A per-message token scoped to one run, and DL-117-05 keeps `context.agent_id` as it is; the DM, memory and schedule families are closed to subagents anyway. |
  * | `service` | **no** | The instance token names nobody (DL-117-05). |
  * | `portable-skill` | **no** | Scoped to a USER and a family list; it never names an agent, so it has no agent to act as. |
@@ -38,8 +39,14 @@
 
 import type { NativeToolAuthMethod } from '$lib/server/services/nativeToolAuth'
 
-/** Lanes as `useControl` sees them: every auth method, plus the in-process callers. */
-export type ActingAgentLane = NativeToolAuthMethod | 'unknown'
+/**
+ * Lanes as `useControl` sees them: every auth method, plus `in-process` for the callers that
+ * never cross a request boundary, plus `unknown` for a caller that declared nothing — which
+ * is REFUSED for every control that acts as an agent. `unknown` used to be the default AND a
+ * vouched lane, so any call site that forgot the parameter was silently trusted (PR #106
+ * review, F-1: the dispatch route reached `sys.dm.*` that way with the instance token).
+ */
+export type ActingAgentLane = NativeToolAuthMethod | 'in-process' | 'unknown'
 
 export const AGENT_MISMATCH_ERROR_CODE = 'AGENT_MISMATCH'
 export const AGENT_IDENTITY_REQUIRED_ERROR_CODE = 'AGENT_IDENTITY_REQUIRED'
@@ -165,7 +172,7 @@ const VOUCHED_LANES: ReadonlySet<ActingAgentLane> = new Set<ActingAgentLane>([
   'agent',
   'n8n-callback',
   'session',
-  'unknown'
+  'in-process'
 ])
 
 export function laneCanVouchForAgentIdentity(lane: ActingAgentLane | null | undefined): boolean {

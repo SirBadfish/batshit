@@ -806,6 +806,22 @@ describe('decideRiskGate', () => {
  * ------------------------------------------------------------------ */
 
 describe('a woken turn', () => {
+  it('is not exempted by a Portable Skill Token (PR #106 review, F-2)', async () => {
+    // Before SA-116, F-SEC-1 refused this outright. SA-116 replaced the refusal with the
+    // card but ran the portable-skill short-circuit BEFORE the woken read, so a DM- or
+    // webhook-woken turn calling a confirm-risk control with a Portable Skill Token ran with
+    // no card at all. The token's family scope is the user's consent for an ordinary call
+    // (DL-116-09); it was never consent for whatever untrusted text woke the turn.
+    setTurnMessages([wokenUserMessage('dm_stuck')])
+    const woken = await decideRiskGate(gateInput({ portableSkillScope: true }))
+    expect(woken.kind).toBe('pause')
+
+    // The ordinary call keeps its exemption.
+    setTurnMessages([typedUserMessage])
+    const ordinary = await decideRiskGate(gateInput({ portableSkillScope: true }))
+    expect(ordinary.kind).toBe('run')
+  })
+
   it('pauses for the same card instead of being refused outright', async () => {
     setTurnMessages([wokenUserMessage('dm_stuck')])
     const decision = await decideRiskGate(gateInput())

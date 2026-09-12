@@ -149,6 +149,7 @@
   } from '$lib/utils/primaryAgentType'
   import { setUserSettings, getUserSettings } from '$lib/stores/userSettings.svelte'
   import {
+    classifySteerRefusal,
     resolveBusySendMode,
     resolveEffectiveBusySendMode,
     type BusySendMode
@@ -1137,7 +1138,10 @@ const immersiveActive = $derived.by(
     steerId: string
     text: string
   }): Promise<
-    { kind: 'accepted' } | { kind: 'already_finished' } | { kind: 'not_steerable'; reason: string }
+    | { kind: 'accepted' }
+    | { kind: 'already_finished' }
+    | { kind: 'not_steerable'; reason: string }
+    | { kind: 'refused'; reason: string }
   > {
     try {
       const response = await fetch('/api/messages/steer', {
@@ -1156,21 +1160,17 @@ const immersiveActive = $derived.by(
             ? payload.error.trim()
             : 'This agent cannot be steered mid-reply. Your message interrupts instead.'
 
-      // `not_steerable` covers both "cannot" and "too late", and only the second one may
-      // skip the interrupt. The route tags the second (F-P3-5); the sentence is the
-      // fallback for a server that predates the tag.
-      if (
-        payload?.refusal === 'reply_finished' ||
-        reason.startsWith('That reply already finished')
-      ) {
-        return { kind: 'already_finished' }
-      }
-      return { kind: 'not_steerable', reason }
+      // PR #106 review F-4: `classifySteerRefusal` is THE rule. Only `reply_finished` (send
+      // normally) and `not_steerable` (interrupt) may escalate; the cap, a waiting DM, a bad
+      // request and a lost server all `refuse` — the reply keeps running and nothing is lost.
+      const kind = classifySteerRefusal(response.status, payload)
+      if (kind === 'already_finished') return { kind: 'already_finished' }
+      return { kind, reason }
     } catch (error) {
       console.error('[handleSendMessage] Failed to steer:', error)
       return {
-        kind: 'not_steerable',
-        reason: 'Batshit could not reach the server to steer. Your message interrupts instead.'
+        kind: 'refused',
+        reason: 'Batshit could not reach the server to steer. Your message was not sent — try again.'
       }
     }
   }
@@ -4850,7 +4850,12 @@ const immersiveActive = $derived.by(
 	      mode: busySendOverride ?? busySendMode,
 	      steerable: activeGroupId ? false : chatRunRegistry.getRunState(currentSessionId).steerable
 	    })
-	    const sendCarriesClips = collectTrustedClipIdsFromMetadata(metadata).length > 0
+	    // DL-114-10 says files are never steered. PR #106 review F-23: an `@file` mention is a
+	    // file too — it travels as `metadata.fileReferences`, which the steer route cannot carry,
+	    // so steering it handed the model the bare path with no content behind it and no error.
+	    const sendCarriesAttachments =
+	      collectTrustedClipIdsFromMetadata(metadata).length > 0 ||
+	      (Array.isArray(metadata?.fileReferences) && metadata.fileReferences.length > 0)
 	    const steerBranchEligible =
 	      isManagedPrimaryAgentType(agentType) &&
 	      hasActiveStream &&
@@ -4863,7 +4868,7 @@ const immersiveActive = $derived.by(
 	    // session-turn lock and its retry handle the overlap.
 	    let steerRefusedAsFinished = false
 
-	    if (steerBranchEligible && !sendCarriesClips) {
+	    if (steerBranchEligible && !sendCarriesAttachments) {
 	      const steerRunState = chatRunRegistry.getRunState(currentSessionId)
 	      const steerTargetMessageId =
 	        steerRunState.activeMessageId ?? steerRunState.activeStreamMessageIds[0] ?? null
@@ -4911,11 +4916,18 @@ const immersiveActive = $derived.by(
 	        if (outcome.kind === 'already_finished') {
 	          steerRefusedAsFinished = true
 	          logger.debug('[handleSendMessage] Steer refused: that reply had already finished')
+	        } else if (outcome.kind === 'refused') {
+	          // PR #106 review F-4: the server said no WITHOUT ending the reply — the cap, a
+	          // waiting DM, a bad request, an outage. The reply keeps running and the steers it
+	          // already accepted stay; nothing here may fall through to an interrupt the user
+	          // never asked for.
+	          toast.info(outcome.reason)
+	          return false
 	        } else {
 	          toast.info(outcome.reason)
 	        }
 	      }
-	    } else if (steerBranchEligible && sendCarriesClips) {
+	    } else if (steerBranchEligible && sendCarriesAttachments) {
 	      // DL-114-10: files are never steered. Hold the send until the reply finishes, then
 	      // continue down the ordinary path — no interrupt, because the user did not ask to
 	      // stop anything.

@@ -10,8 +10,11 @@ import { redis } from '$lib/server/redis'
 import {
   decideRiskGate,
   type ControlApprovalGrant,
+  type ControlApprovalLane,
   type ControlApprovalRequest
 } from '$lib/server/services/controlApprovals'
+import type { ControlActorType } from '$lib/server/services/fabricRegistry'
+import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import {
   INFRA_API_KEY_SERVICES,
   apiKeyService,
@@ -218,6 +221,15 @@ export type CliToolExecutionParams = {
   allowRisky?: boolean
   /** The assistant message the card belongs to (DL-116-07), verified by the route. */
   messageId?: string | null
+  /**
+   * PR #106 review F-5 — which lane the caller authenticated on. The in-process API broker
+   * passes `'in-process'` and gets the SDK card (`lane: 'api'`); the managed CLI helper is on
+   * the `agent` lane with a verified `messageId` and gets the chat card (`lane: 'cli'`);
+   * everything else has no chat to click in (`lane: 'service'`). Derived from the ACTOR, the
+   * way `useControl` derives it — inferring it from `messageId` alone turned a helper call
+   * that arrived without an id into an `api` pause that persisted no card anywhere.
+   */
+  actorType?: ControlActorType
   /**
    * A server-owned approval, set ONLY by send-routed's resume paths — never from model
    * input. The record must be `approved` and match this exact call.
@@ -1474,6 +1486,18 @@ export async function validateCliTool(
   return result
 }
 
+/**
+ * PR #106 review F-5 — the approval lane, from the actor. Mirrors `useControl`'s
+ * `resolveApprovalLane`: the in-process broker is `api` (the SDK pause renders the card), a
+ * verified message id is the managed CLI helper's signature (`cli`, the chat card and the
+ * resume turn), and everything else has no chat to click in (`service`).
+ */
+function resolveCliToolApprovalLane(params: CliToolExecutionParams): ControlApprovalLane {
+  if (params.actorType === 'in-process') return 'api'
+  if (typeof params.messageId === 'string' && params.messageId.trim().length > 0) return 'cli'
+  return 'service'
+}
+
 export async function executeCliTool(params: CliToolExecutionParams): Promise<CliToolExecutionResult> {
   const { toolIds: selectedToolIds } = await resolveCliToolSelectionScope(params)
   const selectedSet = new Set(selectedToolIds)
@@ -1522,7 +1546,31 @@ export async function executeCliTool(params: CliToolExecutionParams): Promise<Cl
    * `sys.memory.delete` would look like the Fabric control of that name and could spend a
    * click meant for it.
    * ------------------------------------------------------------------ */
+  // PR #106 review F-7 — validation BEFORE the gate, the order `useControl` keeps (AMD-116-04):
+  // a card is raised only for a call that can run. Gating first spent the user's click on a
+  // call that then failed validation, and asked for a second click.
+  let validatedInput: Record<string, any>
+  try {
+    validatedInput = validateCliToolInput(record.inputSchema, params.input ?? {})
+  } catch (error) {
+    return {
+      success: false,
+      toolId: record.toolId,
+      title: record.title,
+      blocked: true,
+      code: 'INPUT_VALIDATION_FAILED',
+      error: error instanceof Error ? error.message : 'CLI input validation failed',
+      riskLevel: record.riskLevel
+    }
+  }
+
   if (record.riskLevel !== 'safe') {
+    const lane = resolveCliToolApprovalLane(params)
+    if (lane === 'service' && params.actorType === 'agent') {
+      console.warn(
+        `[CLI tools] A managed CLI run called risky tool "${record.toolId}" with no message id, so no approval card can render. The managed CLI profiles forward BATSHIT_MESSAGE_ID — regenerate them if this persists.`
+      )
+    }
     const decision = await decideRiskGate({
       userId: params.userId,
       agentId: params.agentId,
@@ -1531,10 +1579,7 @@ export async function executeCliTool(params: CliToolExecutionParams): Promise<Cl
       controlId: `cli_tool:${record.toolId}`,
       controlTitle: record.title,
       riskLevel: record.riskLevel,
-      lane:
-        typeof params.messageId === 'string' && params.messageId.trim().length > 0
-          ? 'cli'
-          : 'api',
+      lane,
       input: params.input ?? {},
       grant: params.approval ?? null
     })
@@ -1560,26 +1605,17 @@ export async function executeCliTool(params: CliToolExecutionParams): Promise<Cl
         requiresApproval: true,
         code: 'REQUIRES_APPROVAL',
         approvalRequest: decision.request,
-        error:
-          `Batshit paused "${record.title}" and asked the user to approve it. ` +
-          'Tell the user what it does and why, then stop. Do not retry it yourself.',
+        // PR #106 review F-6 — the lane-aware wording `useControl` uses (DL-116-13). The old
+        // hardcoded "Do not retry it yourself" is right on the API lane and WRONG on the
+        // managed CLI lanes, where the model's own retry after the resume turn is what runs
+        // the tool.
+        error: buildControlApprovalPauseGuidance({
+          lane: decision.request.lane,
+          controlTitle: record.title,
+          approvalId: decision.request.approvalId
+        }).join(' '),
         riskLevel: record.riskLevel
       }
-    }
-  }
-
-  let validatedInput: Record<string, any>
-  try {
-    validatedInput = validateCliToolInput(record.inputSchema, params.input ?? {})
-  } catch (error) {
-    return {
-      success: false,
-      toolId: record.toolId,
-      title: record.title,
-      blocked: true,
-      code: 'INPUT_VALIDATION_FAILED',
-      error: error instanceof Error ? error.message : 'CLI input validation failed',
-      riskLevel: record.riskLevel
     }
   }
 

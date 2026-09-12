@@ -203,7 +203,16 @@ export function validateCadence(input: unknown): CadenceValidation {
   }
   const days: number[] = []
   for (const entry of raw.days) {
-    const day = typeof entry === 'number' ? entry : Number(entry)
+    // PR #106 review F-12: the interval branch's shape. `Number(null)`, `Number(false)`,
+    // `Number('')` and `Number([])` are all 0, so a model emitting `[null]` used to get a
+    // real Sunday schedule and a success answer — the exact "quietly changed number" the
+    // contract above forbids.
+    const day =
+      typeof entry === 'number'
+        ? entry
+        : typeof entry === 'string' && entry.trim()
+          ? Number(entry.trim())
+          : Number.NaN
     if (!Number.isInteger(day) || day < 0 || day > 6) {
       return { ok: false, error: 'Weekdays are 0 to 6, with Sunday as 0.' }
     }

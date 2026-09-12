@@ -99,7 +99,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       action: body.action,
       payloadInput: body.input,
       context: boundContext.context,
-      projectPath: dispatchProjectPath
+      projectPath: dispatchProjectPath,
+      // SA-117 / PR #106 review F-1: the lane travels with the call, so `useControl`'s
+      // identity gate answers the same way here as on `/api/controls/use`.
+      actorType: auth.auth,
+      delegatedRun: auth.delegated === true
     })
 
     const statusCode =

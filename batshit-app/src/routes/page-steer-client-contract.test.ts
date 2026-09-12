@@ -36,7 +36,7 @@ describe('the client send path (SA-114 P3)', () => {
   })
 
   it('holds a send that carries files instead of steering it (DL-114-10)', () => {
-    const clipsBranch = page.indexOf('} else if (steerBranchEligible && sendCarriesClips) {')
+    const clipsBranch = page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {')
     expect(clipsBranch).toBeGreaterThan(-1)
     // The branch grew a bubble in review (F-P3-3); the window covers the whole branch.
     const body = page.slice(clipsBranch, page.indexOf('// Re-read: a steer that was refused', clipsBranch))
@@ -74,20 +74,20 @@ describe('the client send path (SA-114 P3)', () => {
   })
 
   it('shows the bubble before the route answers, and removes it on a refusal (F-P3-1)', () => {
-    const branch = page.indexOf('if (steerBranchEligible && !sendCarriesClips) {')
+    const branch = page.indexOf('if (steerBranchEligible && !sendCarriesAttachments) {')
     const post = page.indexOf('const outcome = await postSteer({', branch)
     const note = page.indexOf('steerInbox.noteLocalSteer({', branch)
     expect(branch).toBeGreaterThan(-1)
     expect(note).toBeGreaterThan(branch)
     // Optimistic: the bubble is drawn BEFORE the round trip, as DL-114-14 describes.
     expect(note).toBeLessThan(post)
-    const refusals = page.slice(post, page.indexOf('} else if (steerBranchEligible && sendCarriesClips) {', post))
+    const refusals = page.slice(post, page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {', post))
     expect(refusals).toContain('steerInbox.forgetSteer(steerId)')
   })
 
   it('refuses to interrupt a reply whose assistant id it does not know yet (F-P3-2)', () => {
-    const branch = page.indexOf('if (steerBranchEligible && !sendCarriesClips) {')
-    const body = page.slice(branch, page.indexOf('} else if (steerBranchEligible && sendCarriesClips) {', branch))
+    const branch = page.indexOf('if (steerBranchEligible && !sendCarriesAttachments) {')
+    const body = page.slice(branch, page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {', branch))
     // No target: say so and keep the words in the composer — never fall through to the
     // interrupt branch on a click that promised to steer.
     expect(body).toContain('if (!steerTargetMessageId) {')
@@ -96,7 +96,7 @@ describe('the client send path (SA-114 P3)', () => {
   })
 
   it('draws the waiting bubble for a send with files (F-P3-3, DL-114-10)', () => {
-    const clipsBranch = page.indexOf('} else if (steerBranchEligible && sendCarriesClips) {')
+    const clipsBranch = page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {')
     const body = page.slice(clipsBranch, clipsBranch + 1400)
     expect(body).toContain("state: 'waiting'")
     expect(body).toContain('await waitForStreamCompletion(waitForMessageId)')
@@ -111,9 +111,16 @@ describe('the client send path (SA-114 P3)', () => {
   })
 
   it('reads the machine-readable tag for "already finished" before the sentence (F-P3-5)', () => {
+    // PR #106 review F-4 moved the classification into the rules module, where it is unit
+    // tested; the page hands it the status and the payload and switches on the answer.
     const post = page.indexOf('async function postSteer(')
     const body = page.slice(post, post + 2400)
-    expect(body).toContain("payload?.refusal === 'reply_finished'")
+    expect(body).toContain('classifySteerRefusal(response.status, payload)')
+    const rules = readFileSync('src/lib/utils/steerControl.ts', 'utf8')
+    const tag = rules.indexOf("payload?.refusal === 'reply_finished'")
+    const sentence = rules.indexOf("reason.startsWith('That reply already finished')")
+    expect(tag).toBeGreaterThan(-1)
+    expect(sentence).toBeGreaterThan(tag)
   })
 
   it('leaves the interrupt path itself byte-identical apart from the speech stop (DL-114-15)', () => {
@@ -143,5 +150,26 @@ describe('the send button (SA-114 P3)', () => {
     expect(body).toContain('otherBusySendMode(busyEffectiveSendMode)')
     // Enter alone keeps its meaning.
     expect(body).toContain('handleSend(oneOffMode)')
+  })
+})
+
+describe('PR #106 review — the client steer contracts that were missing', () => {
+  it('F-4: a refused steer stops; only reply_finished and not_steerable may escalate', () => {
+    const handler = page.indexOf('async function handleSendMessage(')
+    const refusedBranch = page.indexOf("} else if (outcome.kind === 'refused') {", handler)
+    const interruptBranch = page.indexOf("logger.debug('[handleSendMessage] Interrupting active stream'", handler)
+    expect(refusedBranch).toBeGreaterThan(handler)
+    expect(interruptBranch).toBeGreaterThan(refusedBranch)
+    // The refused branch returns before anything can interrupt.
+    expect(page.slice(refusedBranch, refusedBranch + 700)).toContain('return false')
+    // And the classification is the rules module's, not a sentence match in the page.
+    expect(page).toContain('classifySteerRefusal(response.status, payload)')
+    expect(page).not.toContain("reason.startsWith('That reply already finished')")
+  })
+
+  it('F-23: a send that mentions a file is held like one that carries a clip', () => {
+    const definition = page.indexOf('const sendCarriesAttachments =')
+    expect(definition).toBeGreaterThan(-1)
+    expect(page.slice(definition, definition + 300)).toContain('metadata?.fileReferences')
   })
 })

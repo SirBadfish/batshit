@@ -43,6 +43,7 @@ import {
   resolveControlRiskProfile,
   useControl,
   type ControlRuntimeMode,
+  type ControlActorType,
   type ControlUseErrorCode
 } from './fabricRegistry'
 import {
@@ -1291,6 +1292,10 @@ function normalizeBatshitToolUsePayload(input: BatshitToolUseInput): Record<stri
     'agentBrowserSettings',
     'gatewayToolsCache',
     'executeControlUse',
+    // SA-117 / PR #106 review F-1: the lane and the delegated flag are server-set plumbing
+    // too — leaving them out of this list shipped `actorType` into every MCP tool's input.
+    'actorType',
+    'delegatedRun',
     // SA-116 P2: server-set plumbing, never part of a control's payload. Missing this
     // shipped `approvalGrant: null` into every artifact control's input.
     'approvalGrant'
@@ -6030,6 +6035,8 @@ async function nativeCliToolUse(input: {
   approval?: ControlApprovalGrant | null
   projectPath?: string | null
   selectedCliToolIds?: string[]
+  /** PR #106 review F-5 — the caller's lane, so the CLI-tool card lands where it can be clicked. */
+  actorType?: ControlActorType
 }): Promise<Record<string, any>> {
   const toolId = input.toolId.trim()
   const cliInput =
@@ -6046,7 +6053,8 @@ async function nativeCliToolUse(input: {
     selectedToolIds: input.selectedCliToolIds,
     allowRisky: input.allowRisky === true,
     approval: input.approval ?? null,
-    projectPath: input.projectPath ?? null
+    projectPath: input.projectPath ?? null,
+    actorType: input.actorType
   })
 }
 
@@ -6536,6 +6544,15 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
    * but a Portable Skill Token.
    */
   approvalGrant?: ControlApprovalGrant | null
+  /**
+   * SA-117 / PR #106 review F-1 — which lane the caller authenticated on, handed to
+   * `useControl`'s identity gate. The dispatch route passes what `resolveNativeToolUser`
+   * returned (so a service-token caller is refused `sys.dm.*` here exactly as it is on
+   * `/api/controls/use`); the in-process broker passes `'in-process'`. Never defaulted here.
+   */
+  actorType: ControlActorType
+  /** SA-117 F-P2-1 — the call arrived on a Subagent or Worker run's credential. */
+  delegatedRun?: boolean
   executeControlUse?: (
     controlInput: ControlUseInput,
     allowedControlIds: string[]
@@ -6580,7 +6597,8 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       allowRisky: input.allowRisky === true,
       approval: input.approvalGrant ?? null,
       projectPath: input.projectPath ?? null,
-      selectedCliToolIds: input.selectedCliToolIds
+      selectedCliToolIds: input.selectedCliToolIds,
+      actorType: input.actorType
     })
   } else if (parsed.family === 'artifact' || parsed.family === 'fabric') {
     const controlInput: ControlUseInput = {
@@ -6635,6 +6653,8 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
             dryRun: input.dryRun === true,
             allowRisky: input.allowRisky === true,
             approval: input.approvalGrant ?? undefined,
+            actorType: input.actorType,
+            delegatedRun: input.delegatedRun === true,
             selectedGateways: input.selectedGateways,
             allowedControlIds
           })
@@ -6929,12 +6949,17 @@ function formatBatshitToolUseModelOutput(context: NativeToolContext) {
          * pending record. DL-116-13's seven skill texts are P4's; this one runtime string
          * moved to P2 because P2 is what makes the card real.
          */
+        // PR #106 review F-6: a `cli:` ref's pause carries its request at the top level and
+        // answers `REQUIRES_APPROVAL`, so both are read here or the managed CLI lanes' hint
+        // ("retry after the resume turn") never fired for a CLI tool.
         const approvalRequestFromDetails =
           details && typeof details === 'object' && (details as any).approvalRequest
             ? ((details as any).approvalRequest as Record<string, any>)
-            : null
+            : (output as any).approvalRequest && typeof (output as any).approvalRequest === 'object'
+              ? ((output as any).approvalRequest as Record<string, any>)
+              : null
         const approvalHint =
-          code === 'CONTROL_RISK_REQUIRES_APPROVAL'
+          code === 'CONTROL_RISK_REQUIRES_APPROVAL' || code === 'REQUIRES_APPROVAL'
             ? [
                 '',
                 'approval_hint:',
@@ -10310,7 +10335,7 @@ function buildNativeAutomationResult(params: {
   }
 }
 
-function mapControlUseErrorToNativeAutomationErrorCode(
+export function mapControlUseErrorToNativeAutomationErrorCode(
   code: ControlUseErrorCode | undefined
 ): NativeAutomationErrorCode {
   switch (code) {
@@ -10324,11 +10349,42 @@ function mapControlUseErrorToNativeAutomationErrorCode(
     // SA-116 retired `CONTROL_RISK_NEEDS_HUMAN_TURN` and kept the rule for both successors.
     case 'CONTROL_RISK_REQUIRES_APPROVAL':
     case 'CONTROL_RISK_UNAVAILABLE_IN_GROUP':
+    // SA-117 DL-117-05 (PR #106 review, F-11): "this lane cannot act as an agent" is policy
+    // too — a retry can never satisfy it.
+    case 'AGENT_IDENTITY_REQUIRED':
       return 'POLICY_BLOCKED'
     case 'CONTROL_EXECUTION_FAILED':
     default:
       return 'BACKEND_UNAVAILABLE'
   }
+}
+
+/**
+ * PR #106 review F-11 — ONE map for a failed broker call, so a code the broker adds later is
+ * forgotten in one place rather than three.
+ *
+ * The broker answers with its own short codes (`NOT_FOUND`, `INPUT_VALIDATION_FAILED`,
+ * `POLICY_BLOCKED`, `OUT_OF_SCOPE`, `REQUIRES_APPROVAL`, `UNAVAILABLE_IN_GROUP`) and, for a
+ * Fabric control, carries the control's own `error.code` underneath. Both spell policy the
+ * same way here.
+ */
+export function mapBrokerFailureToNativeAutomationErrorCode(failed: unknown): NativeAutomationErrorCode {
+  const result = (failed && typeof failed === 'object' ? failed : {}) as { code?: unknown; error?: unknown }
+  const brokerCode = typeof result.code === 'string' ? result.code : null
+  if (brokerCode === 'NOT_FOUND' || brokerCode === 'INPUT_VALIDATION_FAILED') return 'INVALID_INPUT'
+  if (
+    brokerCode === 'POLICY_BLOCKED' ||
+    brokerCode === 'OUT_OF_SCOPE' ||
+    brokerCode === 'REQUIRES_APPROVAL' ||
+    brokerCode === 'UNAVAILABLE_IN_GROUP'
+  ) {
+    return 'POLICY_BLOCKED'
+  }
+  const controlCode =
+    result.error && typeof result.error === 'object' && typeof (result.error as any).code === 'string'
+      ? ((result.error as any).code as ControlUseErrorCode)
+      : undefined
+  return controlCode ? mapControlUseErrorToNativeAutomationErrorCode(controlCode) : 'BACKEND_UNAVAILABLE'
 }
 
 type NonInteractiveAutomationBashPolicyResult =
@@ -10403,6 +10459,14 @@ export async function dispatchNativeAutomationPackAction(input: {
   payloadInput: unknown
   context: unknown
   projectPath?: string | null
+  /**
+   * SA-117 / PR #106 review F-1 — the lane `/api/native-tools/dispatch` authenticated on.
+   * Reaches `useControl`'s identity gate through `batshit_tool_use` and `artifact_use`, so a
+   * service-token caller cannot act as an agent through this door either. Omitted means
+   * `'unknown'`, which that gate refuses.
+   */
+  actorType?: ControlActorType
+  delegatedRun?: boolean
 }): Promise<NativeAutomationDispatchResult> {
   const parsedAction = parseNativeAutomationAction(input.action)
   if (!parsedAction.ok) {
@@ -10631,6 +10695,8 @@ export async function dispatchNativeAutomationPackAction(input: {
       const result = await nativeBatshitToolUse({
         ...(parsedInput.value as BatshitToolUseInput),
         userId: input.userId,
+        actorType: input.actorType ?? 'unknown',
+        delegatedRun: input.delegatedRun === true,
         agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
         agentMetadata: context.actor_type === 'subagent' ? subagentRecord ?? null : null,
         sessionId: context.session_id,
@@ -10659,15 +10725,7 @@ export async function dispatchNativeAutomationPackAction(input: {
           backend,
           context,
           error: {
-            code:
-              result.code === 'NOT_FOUND' || result.code === 'INPUT_VALIDATION_FAILED'
-                ? 'INVALID_INPUT'
-                : result.code === 'POLICY_BLOCKED' ||
-                    result.code === 'OUT_OF_SCOPE' ||
-                    result.code === 'REQUIRES_APPROVAL' ||
-                    result.error?.code === 'CONTROL_RISK_REQUIRES_APPROVAL'
-                  ? 'POLICY_BLOCKED'
-                  : 'BACKEND_UNAVAILABLE',
+            code: mapBrokerFailureToNativeAutomationErrorCode(result),
             message:
               typeof result.error === 'string'
                 ? result.error
@@ -10873,6 +10931,7 @@ export async function dispatchNativeAutomationPackAction(input: {
         : null
     const result = await nativeCliToolUse({
       userId: input.userId,
+      actorType: input.actorType ?? 'unknown',
       agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
       sessionId: context.session_id,
       toolId: parsedInput.value.toolId,
@@ -10891,12 +10950,7 @@ export async function dispatchNativeAutomationPackAction(input: {
         backend,
         context,
         error: {
-          code:
-            result.code === 'NOT_FOUND' || result.code === 'INPUT_VALIDATION_FAILED'
-              ? 'INVALID_INPUT'
-              : result.code === 'POLICY_BLOCKED' || result.code === 'OUT_OF_SCOPE' || result.code === 'REQUIRES_APPROVAL'
-                ? 'POLICY_BLOCKED'
-                : 'BACKEND_UNAVAILABLE',
+          code: mapBrokerFailureToNativeAutomationErrorCode(result),
           message: result.error,
           details: {
             toolId: parsedInput.value.toolId,
@@ -11033,6 +11087,8 @@ export async function dispatchNativeAutomationPackAction(input: {
       dryRun: parsedInput.value.dryRun,
       allowRisky: parsedInput.value.allowRisky,
       runtimeMode: context.mode,
+      actorType: input.actorType ?? 'unknown',
+      delegatedRun: input.delegatedRun === true,
       allowedControlIds: Array.from(ARTIFACT_RUNTIME_ALLOWED_CONTROL_IDS)
     })
 
@@ -11778,6 +11834,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       agentId: context.agentId ?? undefined,
       sessionId: context.sessionId,
       runtimeMode: 'mode3',
+      // The API lane's broker never crosses a request boundary: its `agentId` is the turn's own.
+      actorType: 'in-process',
       controlId: input.controlId,
       input: normalizeNativeControlUseInput(input as Record<string, any>),
       dryRun: input.dryRun,
@@ -12106,6 +12164,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         return await nativeBatshitToolUse({
           ...input,
           userId: context.userId,
+          actorType: 'in-process',
           agentId: context.agentId ?? null,
           sessionId: context.sessionId,
           selectedGateways,

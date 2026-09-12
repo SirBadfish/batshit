@@ -108,7 +108,11 @@ describe('promoting an undelivered steer (DL-114-07)', () => {
 
     expect(sseBodies.map((body) => body.type)).toEqual(['user_message', 'steer_promoted'])
     expect(sseBodies[0].message.id).toBe('steer_one')
-    expect(sseBodies[1]).toMatchObject({ steerIds: ['steer_one'], messageId: 'steer_one' })
+    expect(sseBodies[1]).toMatchObject({ steerIds: ['steer_one'] })
+    // PR #106 review F-22: no top-level messageId on the promoted event. The replay buffer is
+    // keyed on the assistant id, and an event carrying any other id was never pruned — the
+    // session's buffer stayed pinned open for the life of the process.
+    expect(sseBodies[1]).not.toHaveProperty('messageId')
 
     // A NEW assistant id: reusing the one the steer was aimed at would overwrite the reply
     // the user was reading.

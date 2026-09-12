@@ -68,6 +68,8 @@ export const POST: RequestHandler = async ({ locals, request }) => {
       input: body.input ?? {},
       selectedToolIds: body.selectedToolIds,
       allowRisky: body.allowRisky === true,
+      // PR #106 review F-5: the lane decides where the approval card lands.
+      actorType: auth.auth,
       // SA-117: the managed CLI helper moved from the service lane to the agent lane and
       // still sends the run's project path, so the agent lane reads it the same way.
       projectPath: auth.auth === 'service' || auth.auth === 'agent' ? bodyProjectPath : null

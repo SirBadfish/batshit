@@ -15,6 +15,7 @@ import {
   resolveBusySendMode,
   resolveSteerability,
   STEER_TEXT_MAX_CHARS,
+  classifySteerRefusal,
   type DeliveredSteer
 } from './steerControl'
 
@@ -314,5 +315,30 @@ describe('resolveEffectiveBusySendMode', () => {
     for (const steerable of [true, false, null, undefined]) {
       expect(resolveEffectiveBusySendMode({ mode: 'interrupt', steerable })).toBe('interrupt')
     }
+  })
+})
+
+describe('classifySteerRefusal (PR #106 review, F-4)', () => {
+  it('lets only the two escalating refusals escalate', () => {
+    expect(classifySteerRefusal(409, { code: 'not_steerable', reason: 'x', refusal: 'reply_finished' })).toBe(
+      'already_finished'
+    )
+    expect(classifySteerRefusal(409, { code: 'not_steerable', reason: 'That reply already finished. Send it.' })).toBe(
+      'already_finished'
+    )
+    expect(
+      classifySteerRefusal(409, { code: 'not_steerable', reason: 'This agent cannot be steered mid-reply.' })
+    ).toBe('not_steerable')
+  })
+
+  it('refuses — never interrupts — for the cap, a waiting DM, a bad request, and a lost server', () => {
+    expect(classifySteerRefusal(409, { code: 'steer_inbox_full', reason: '5 messages are already waiting' })).toBe(
+      'refused'
+    )
+    expect(classifySteerRefusal(409, { code: 'steer_dm_pending', reason: 'a DM is waiting' })).toBe('refused')
+    expect(classifySteerRefusal(400, { code: 'invalid_input', error: 'A steer needs some text.' })).toBe('refused')
+    expect(classifySteerRefusal(401, { error: 'Unauthorized' })).toBe('refused')
+    expect(classifySteerRefusal(500, null)).toBe('refused')
+    expect(classifySteerRefusal(null, undefined)).toBe('refused')
   })
 })

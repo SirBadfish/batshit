@@ -84,11 +84,15 @@ export async function promoteSteersToNextTurn(params: {
     return null
   }
 
-  // Show it in the chat the way a woken turn's message appears. No top-level messageId:
-  // the replay buffer is keyed on the ASSISTANT id.
+  // Show it in the chat the way a woken turn's message appears. No top-level messageId on
+  // EITHER event: the replay buffer is keyed on the ASSISTANT id, and an event carrying any
+  // other id is pinned in that buffer for the life of the process (PR #106 review, F-22 —
+  // the promoted event used to carry the steer id, so the session's buffer never drained and
+  // every later listener replayed a stale `steer_promoted` on connect). The client settles
+  // the bubbles by `steerIds` alone.
   for (const body of [
     { type: 'user_message', sessionId, message: userMessage },
-    { type: 'steer_promoted', sessionId, steerIds, messageId: userMessage.id },
+    { type: 'steer_promoted', sessionId, steerIds },
   ]) {
     try {
       await eventFetch(new URL('/api/sse', request.url).toString(), {

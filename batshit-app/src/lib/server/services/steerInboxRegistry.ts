@@ -151,7 +151,14 @@ export function enqueueSteer(
   // P2: in-flight entries count too. A steer written to a managed CLI's wire but not yet
   // echoed has not reached the model, so it is still one of the messages "waiting for this
   // reply" the refusal sentence talks about.
-  const waiting = state.pending.length + state.inFlight.length
+  //
+  // PR #106 review F-10: counted for THIS reply only, like every sibling in this module. In
+  // the overlap window `clearSteerInbox`'s `keepMessageId` exists for, a stopped turn's dead
+  // entries must not spend the live turn's budget, and the refusal sentence must not name
+  // messages that are not in the reply the user is looking at.
+  const waiting = [...state.pending, ...state.inFlight].filter(
+    (waitingEntry) => waitingEntry.messageId === entry.messageId
+  ).length
   if (waiting >= MAX_PENDING_STEERS) {
     return {
       ok: false,
@@ -348,12 +355,20 @@ export function returnSteersToPending(
   now = Date.now()
 ): void {
   if (entries.length === 0) return
-  const state = inboxes.get(sessionId) ?? emptyState(now)
+  // PR #106 review F-9: this is an UNDO of a take, so it may only put back what is still in
+  // flight, and only into an inbox that still exists. The old shape re-created an inbox
+  // `clearSteerInbox` had deleted (a late transport rejection after the turn ended left a
+  // ghost entry that ate a steer slot for every later turn) and put back entries the
+  // transport had already echoed (a steer the model received, promoted a second time).
+  const state = inboxes.get(sessionId)
+  if (!state) return
   const returning = new Set(entries.map((entry) => entry.steerId))
+  const stillInFlight = state.inFlight.filter((entry) => returning.has(entry.steerId))
+  if (stillInFlight.length === 0) return
   state.inFlight = state.inFlight.filter((entry) => !returning.has(entry.steerId))
   // Acceptance order, not arrival-back order: these were the OLDEST waiting entries, and a
   // second steer accepted while the write was in flight must still read after them.
-  state.pending = [...entries, ...state.pending]
+  state.pending = [...stillInFlight, ...state.pending]
   state.updatedAt = now
   inboxes.set(sessionId, state)
 }

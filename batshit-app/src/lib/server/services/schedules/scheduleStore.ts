@@ -462,6 +462,28 @@ export async function recordFire(options: {
 }
 
 /**
+ * PR #106 review F-3 — a schedule Batshit cannot schedule stops and says so.
+ *
+ * `computeNextRunAt` can throw for a STORED record: the zone is kept verbatim (AMD-115-01),
+ * so a backup restored onto a host whose ICU does not know that zone makes every fire and
+ * every missed-run collapse throw. Retrying that every 60 seconds is the storm the ticker's
+ * header forbids — one DM per sweep, forever — and leaving `lastOutcome` empty hides it from
+ * the Admin card. So the schedule is switched off with the reason where the card shows it.
+ * An edit that fixes the zone, or Run now, recomputes `nextRunAt` and turns it back on.
+ */
+export async function disableScheduleAfterFailure(
+  scheduleId: string,
+  reason: string,
+  now = new Date()
+): Promise<void> {
+  await patchScheduleFields(scheduleId, {
+    enabled: false,
+    lastOutcome: `failed: ${reason}`,
+    updatedAt: now.toISOString()
+  })
+}
+
+/**
  * Collapse every slot this schedule slept through into its ONE missed-run entry, and move
  * `nextRunAt` to the next future slot. **Nothing fires.**
  *

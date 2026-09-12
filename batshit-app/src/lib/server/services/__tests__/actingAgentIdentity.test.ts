@@ -202,7 +202,7 @@ describe('DL-117-04: the dispatch context', () => {
 
 describe('DL-117-05: which lanes can vouch for an agent identity', () => {
   it('lets the credential lane, the in-process callers, the n8n-callback token, and the user\'s own session through', () => {
-    for (const lane of ['agent', 'unknown', 'n8n-callback', 'session'] as const) {
+    for (const lane of ['agent', 'in-process', 'n8n-callback', 'session'] as const) {
       expect(laneCanVouchForAgentIdentity(lane)).toBe(true)
       expect(requireActingAgentIdentity(lane)).toEqual({ ok: true })
     }
@@ -218,8 +218,18 @@ describe('DL-117-05: which lanes can vouch for an agent identity', () => {
     expect(requireActingAgentIdentity('session')).toEqual({ ok: true })
   })
 
-  it('refuses the instance token and a Portable Skill Token', () => {
-    for (const lane of ['service', 'portable-skill'] as const) {
+  it('the in-process lane is explicit, and a caller that declared no lane is refused (PR #106 F-1)', () => {
+    // `unknown` used to be BOTH the default `useControl` filled in and a vouched lane, so a
+    // call site that forgot the parameter was trusted by omission — the dispatch route
+    // reached `sys.dm.*` that way with the instance token. Now the in-process callers say
+    // `'in-process'` out loud and the default fails closed.
+    expect(laneCanVouchForAgentIdentity('in-process')).toBe(true)
+    expect(laneCanVouchForAgentIdentity('unknown')).toBe(false)
+    expect(requireActingAgentIdentity('unknown').ok).toBe(false)
+  })
+
+  it('refuses the instance token, a Portable Skill Token, and an undeclared lane', () => {
+    for (const lane of ['service', 'portable-skill', 'unknown'] as const) {
       expect(laneCanVouchForAgentIdentity(lane)).toBe(false)
       const result = requireActingAgentIdentity(lane)
       expect(result.ok).toBe(false)

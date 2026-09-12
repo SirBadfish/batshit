@@ -459,6 +459,133 @@ describe.runIf(REAL_REDIS_LANE)('cliToolRegistry', () => {
     if (!replay.success) expect(replay.code).toBe('REQUIRES_APPROVAL')
   })
 
+  /* ------------------------------------------------------------------ *
+   * PR #106 review — the CLI-tool path on the shared approval contract.
+   * ------------------------------------------------------------------ */
+
+  async function seedConfirmEcho() {
+    await createCliTool(userId, {
+      toolId: 'confirm_echo',
+      title: 'Confirm Echo',
+      description: 'Echoes input after approval.',
+      tags: ['json'],
+      origin: 'manual',
+      status: 'active',
+      executable: process.execPath,
+      argsTemplate: [
+        { kind: 'literal', value: '-e' },
+        { kind: 'literal', value: 'process.stdout.write(JSON.stringify({ echo: process.argv[1] }))' },
+        { kind: 'input', field: 'query', required: true }
+      ],
+      inputSchema: {
+        type: 'object',
+        properties: { query: { type: 'string', required: true } },
+        required: ['query']
+      },
+      outputMode: 'json',
+      parseMode: 'json',
+      cwdPolicy: 'none',
+      timeoutMs: 60000,
+      riskLevel: 'confirm',
+      allowNetwork: false,
+      allowWrite: false
+    })
+    await seedAgent(['confirm_echo'])
+  }
+
+  it('F-7: validates the input BEFORE raising a card, so a click is never spent on a call that cannot run', async () => {
+    await seedConfirmEcho()
+    const sessionId = 'session_f7'
+
+    const invalid = await executeCliTool({
+      userId,
+      agentId,
+      sessionId,
+      toolId: 'confirm_echo',
+      input: {},
+      actorType: 'in-process'
+    })
+
+    expect(invalid.success).toBe(false)
+    if (invalid.success) return
+    expect(invalid.code).toBe('INPUT_VALIDATION_FAILED')
+    expect(invalid.requiresApproval).toBeUndefined()
+    expect(invalid.approvalRequest).toBeUndefined()
+    // No pause was recorded for it either — nothing to consume on the retry.
+    const indexed = await redis.execute(async (client) => client.zCard(`control_approvals:${sessionId}`))
+    expect(indexed).toBe(0)
+  })
+
+  it('F-5: the approval lane comes from the actor, so every caller gets a card it can answer', async () => {
+    await seedConfirmEcho()
+
+    const inProcess = await executeCliTool({
+      userId,
+      agentId,
+      sessionId: 'session_f5',
+      toolId: 'confirm_echo',
+      input: { query: 'x' },
+      actorType: 'in-process'
+    })
+    expect(inProcess.success).toBe(false)
+    if (!inProcess.success) expect(inProcess.approvalRequest?.lane).toBe('api')
+
+    const helper = await executeCliTool({
+      userId,
+      agentId,
+      sessionId: 'session_f5',
+      messageId: 'msg_helper',
+      toolId: 'confirm_echo',
+      input: { query: 'y' },
+      actorType: 'agent'
+    })
+    expect(helper.success).toBe(false)
+    if (!helper.success) expect(helper.approvalRequest?.lane).toBe('cli')
+
+    // A caller with no chat to click in — a service-token call, or a helper call whose
+    // message id went missing — is `service`, never a silent `api` pause that persists no card.
+    const service = await executeCliTool({
+      userId,
+      agentId,
+      sessionId: 'session_f5',
+      toolId: 'confirm_echo',
+      input: { query: 'z' },
+      actorType: 'service'
+    })
+    expect(service.success).toBe(false)
+    if (!service.success) expect(service.approvalRequest?.lane).toBe('service')
+  })
+
+  it('F-6: the pause tells the managed CLI lane to retry after the resume turn, and the API lane not to', async () => {
+    await seedConfirmEcho()
+
+    const cli = await executeCliTool({
+      userId,
+      agentId,
+      sessionId: 'session_f6',
+      messageId: 'msg_cli',
+      toolId: 'confirm_echo',
+      input: { query: 'a' },
+      actorType: 'agent'
+    })
+    expect(cli.success).toBe(false)
+    if (!cli.success) {
+      expect(cli.error).toContain('When the user clicks Approve you are resumed')
+      expect(cli.error).not.toContain('Do not retry it yourself')
+    }
+
+    const api = await executeCliTool({
+      userId,
+      agentId,
+      sessionId: 'session_f6',
+      toolId: 'confirm_echo',
+      input: { query: 'b' },
+      actorType: 'in-process'
+    })
+    expect(api.success).toBe(false)
+    if (!api.success) expect(api.error).toContain('Do not retry it yourself')
+  })
+
   it('falls back to global CLI Tool Grid discoverability when the agent has no explicit CLI overrides', async () => {
     await createCliTool(userId, {
       toolId: 'json_echo',
