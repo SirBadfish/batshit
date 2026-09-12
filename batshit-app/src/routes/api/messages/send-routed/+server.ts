@@ -117,13 +117,16 @@ import { resolveModelIds } from '$lib/utils/modelIdResolver'
 import { N8N_ONLY_CONNECTION_IDS } from '$lib/server/constants/modelConnections'
 import { N8N_ONLY_PROVIDER_IDS } from '$lib/data/model-compatibility-registry'
 import { listLocalAiServers } from '$lib/server/services/localAiServers'
-import { buildCodexRuntimeSettings } from '$lib/server/services/codexSettings'
+import {
+  buildCodexRuntimeSettings,
+  resolveCodexTransportLane
+} from '$lib/server/services/codexSettings'
 import { buildAgentProfileId } from '$lib/server/services/codexProfileManager'
 import type { CodexRuntimeSettings } from '$lib/types/codex'
 import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
 import type { ClaudeRuntimeSettings } from '$lib/types/claude'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
-import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { STEER_MISSED_REASON, resolveAgentDmsEnabled } from '$lib/utils/dmControl'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import { THINKING_INDICATOR } from '$lib/utils/thinkingIndicator'
@@ -132,6 +135,7 @@ import type { MCPSelectionResolution } from '$lib/server/services/mcpSelectionRe
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import {
 	  getActiveSessionTurn,
+	  getActiveStream,
 	  registerSessionTurn,
 	  clearSessionTurn,
 	  registerStreamAbort,
@@ -139,8 +143,34 @@ import {
   registerGroupAbort,
   clearGroupAbort,
 } from '$lib/server/services/streamAbortRegistry'
-import { getWakeAbortSignal } from '$lib/server/services/wakeRunRegistry'
-import { clearNeedsUserForHumanReply } from '$lib/server/services/dm/dmStore'
+import { getWakeAbortSignal, getWakeRun } from '$lib/server/services/wakeRunRegistry'
+import { publishUserEvent } from '$lib/server/ssePublisher'
+import {
+  attachSteerTransport,
+  clearSteerInbox,
+  clearSteerRun,
+  confirmSteerDelivery,
+  drainDeliveredSteers,
+  registerSteerRun,
+  takeMissedDmSteers,
+  takePendingSteersForDelivery,
+  takeUndeliveredSteers
+} from '$lib/server/services/steerInboxRegistry'
+import {
+  MAX_STEER_PROMOTIONS,
+  promoteSteersToNextTurn
+} from '$lib/server/services/steerPromotion'
+import {
+  buildSteerPlaceholder,
+  resolveSteerability,
+  type DeliveredSteer,
+  type SteerLane
+} from '$lib/utils/steerControl'
+import {
+  acknowledgeDeliveredDmSteers,
+  clearNeedsUserForHumanReply,
+  degradeMissedDmSteers
+} from '$lib/server/services/dm/dmStore'
 import type {
   GroupChatSessionConfig,
   GroupChatSpeakPolicy,
@@ -4013,6 +4043,22 @@ async function handleBatshitAgentStream({
           endMetadataBase.zipReferences = finishSummary.zipReferences
         }
       }
+      // SA-114 P1 (DL-114-04): the delivered steers ride the SAME single write as the
+      // content that carries their placeholders. It is set here, in `finalizeAssistantMessage`,
+      // rather than on the happy path only, so a steer that landed before an interrupt or a
+      // failure is still expandable in the record that keeps the partial work.
+      if (deliveredSteers.length > 0) {
+        endMetadataBase.steers = deliveredSteers.map((steer) => ({
+          steerId: steer.steerId,
+          text: steer.text,
+          at: steer.at,
+          step: steer.step,
+          lane: steer.lane,
+          source: steer.source,
+          ...(steer.dmId ? { dmId: steer.dmId } : {}),
+          ...(steer.label ? { label: steer.label } : {}),
+        }))
+      }
       // SA-104 P5: chat-surface "memory inserted" affordance — the accepted-send
       // commit result rides the finalized assistant message. On-my-mind presence is
       // deliberately not stamped (ambient every turn; EV owns that visibility).
@@ -4217,6 +4263,7 @@ async function handleBatshitAgentStream({
       await ensureStartEmitted()
     }
     streamedMessageContent += safeContent
+    streamedNonSteerContent = true
     if (shouldSimulateStreamingEffect) {
       await emitSimulatedChunks(safeContent, async (simulated) => {
         await streamAdapter.emitChunk({ content: simulated })
@@ -4244,6 +4291,114 @@ async function handleBatshitAgentStream({
       streamedMessageContent += '\n\n'
     }
     streamedMessageContent += reference
+    streamedNonSteerContent = true
+  }
+
+  /**
+   * SA-114 P1 (DL-114-04, DL-114-05) — the steer channel for this turn.
+   *
+   * A steer may be delivered only inside an ordinary single-agent turn: group chats are
+   * interrupt-only in v1 (DL-114-12), and a group member's run is not the user's own turn.
+   * `handleBatshitAgentStream` is reached by the group loop as well as the normal send, so
+   * the gate lives here, once, rather than at each call site.
+   */
+  const steerDeliveryEnabled = !groupContext && streamMetadata?.groupChat !== true
+
+  /** Delivered steers, in the order they landed, for `metadata.steers[]` (DL-114-04). */
+  const deliveredSteers: DeliveredSteer[] = []
+  /**
+   * P2: whether this run put its steerability verdict in the steer registry, so the
+   * `finally` removes exactly what it added and never another turn's.
+   */
+  let steerRunRegistered = false
+  /**
+   * True once real model output has been streamed. `selectFinishZipInput` prefers
+   * `streamedMessageContent` whenever it is non-empty, so a turn whose ONLY streamed bytes
+   * were steer markers must not beat the SDK's own finish text — the markers are re-added
+   * after selection in that case.
+   */
+  let streamedNonSteerContent = false
+  /**
+   * How many `finish-step` chunks THIS loop has consumed. The SDK runs ahead of the loop
+   * (it can be several chunks into the next step by the time a `tool-result` here has
+   * finished its zip write), so "which chunk is in hand" says nothing reliable about
+   * where the step boundary sits in `streamedMessageContent`. This count does: a steer
+   * delivered after step k is written only once the loop has consumed step k's finish.
+   */
+  let finishedStepsConsumed = 0
+
+  /**
+   * Write every steer the transport just handed to the model into the transcript.
+   *
+   * Called once per stream iteration, which is what puts the marker exactly where
+   * DL-114-04 says it goes: AFTER the tool result's zip placeholder (appended while that
+   * `tool-result` chunk was handled) and BEFORE the next text chunk. The marker is a
+   * placeholder, not the text — the words live in `metadata.steers[]` and both compilers
+   * expand them, the same split the zip family uses.
+   *
+   * Gated on `finishedStepsConsumed` (F-P1-3): a steer whose delivery step the loop has
+   * not yet finished consuming stays in the inbox, so the marker can never land inside
+   * the step the model read it after — not between two parallel tool results (measured
+   * live on BSMS, 2026-09-10) and not before a fast tool's result while the loop is still
+   * writing the previous step. `force` is for the finish path, where every step is over.
+   *
+   * Nothing here touches the session-turn lock, clip consumption, or the memory linger
+   * commit: a delivered steer rides inside a turn that has already paid those once
+   * (DL-114-02).
+   */
+  const drainSteersIntoTranscript = async (force = false) => {
+    if (!steerDeliveryEnabled) return
+    const drained = drainDeliveredSteers(sessionId, messageId, {
+      upToStep: force ? Number.POSITIVE_INFINITY : finishedStepsConsumed,
+    })
+    if (drained.length === 0) return
+
+    for (const steer of drained) {
+      deliveredSteers.push(steer)
+      const placeholder = buildSteerPlaceholder(steer.steerId)
+      const prefix =
+        streamedMessageContent && !streamedMessageContent.endsWith('\n') ? '\n\n' : ''
+      streamedMessageContent += `${prefix}${placeholder}`
+
+      // SA-114 P3 (F-P3-A): the marker has to go out as a CHUNK, not only into
+      // `streamedMessageContent`.
+      //
+      // `/api/sse`'s `end` case does not forward the content it is handed: it REBUILDS the
+      // final content from the stream events it recorded (`buildEndContent`), and that
+      // rebuild wins whenever it is non-empty. The browser then saves the rebuilt content
+      // back over the record. So a marker that never rode a chunk survived the server's own
+      // save and was erased a moment later by the client's — which is exactly why P1 and P2
+      // could not see this: they drove the route with no browser, so nothing overwrote it.
+      //
+      // It deliberately does NOT go through `emitTextChunk`: that sets
+      // `streamedNonSteerContent`, and a turn whose only streamed bytes were steer markers
+      // must still let the SDK's finish text win (the `steerMarkersOnly` branch below).
+      if (ensureStartEmitted) {
+        await ensureStartEmitted()
+      }
+      await streamAdapter.emitChunk({ content: `${prefix}${placeholder}` })
+
+      await forwardStreamEvent({
+        type: 'steer_delivered',
+        sessionId,
+        messageId,
+        steerId: steer.steerId,
+        step: steer.step,
+        lane: steer.lane,
+        source: steer.source,
+      } as CanonicalStreamEvent)
+    }
+
+    // SA-114 P4 review (F-P4-2): an `info` DM the model has just read is no longer open.
+    // The wake lane closes a delivered note at the end of its turn (SA-115 F-P1-2); a
+    // steer hands it over just as surely — the transport confirmed the model has it — so
+    // it closes here, at delivery, for the recipient of THIS run. Left open, the same
+    // note re-lists on every later turn's roster and sits in the drawer for a week.
+    // Assignments and results are untouched: they are work, not notes.
+    const deliveredDmSteers = drained.filter((steer) => steer.source === 'dm' && steer.dmId)
+    if (deliveredDmSteers.length > 0) {
+      await acknowledgeDeliveredDmSteers(deliveredDmSteers, agentId)
+    }
   }
 
   const extractZipIdFromReference = (reference: string): string | null => {
@@ -4767,6 +4922,13 @@ async function handleBatshitAgentStream({
     // its card would be persisted and then abandoned as the next speaker starts).
     controlApprovals: resolvedControlApprovals,
     groupMemberRun: streamMetadata?.groupChat === true,
+    // SA-114 P1 (DL-114-05): the ONE place a run is allowed to deliver a steer. Groups are
+    // interrupt-only in v1 (DL-114-12) and a delegated run is not the user's turn
+    // (DL-114-09), so both leave this null and the composed hook injects nothing.
+    takeSteers: steerDeliveryEnabled
+      ? (step: number) =>
+          takePendingSteersForDelivery(sessionId, messageId, { step, lane: 'api' })
+      : null,
     messages: streamMessages,
     model: modelId,
     mode4Style: mode4Style ?? undefined,
@@ -4842,6 +5004,11 @@ async function handleBatshitAgentStream({
       // SA-093 P7: stamp finish time immediately — the zip/EV work below can
       // take real time and must not inflate measured stream timings.
       const measuredFinishedAt = Date.now()
+      // SA-114 P1 (DL-114-04): idempotent, and the reason it is FIRST is ordering — the
+      // finish path reads `streamedMessageContent` a few lines down, and a steer delivered
+      // at the final step boundary must already be in it. Forced: every step is over on
+      // the SDK's side, so the consumed-step gate has nothing left to protect.
+      await drainSteersIntoTranscript(true)
       const sanitizedFinishText = stripToolPartOnlyText(text)
 
       // SA-107 (DL-107-06/07): SDK usage stays authoritative; raw-chunk cache
@@ -4986,8 +5153,18 @@ async function handleBatshitAgentStream({
         }
       }
 
+      // SA-114 P1: `selectFinishZipInput` prefers the streamed content whenever it is
+      // non-empty. A turn whose only streamed bytes were steer MARKERS (no text, no tool
+      // zip) would therefore beat the SDK's own finish text and lose the reply. In that
+      // one case the finish text wins and the markers are re-appended after selection;
+      // position is meaningless there because nothing streamed before them.
+      const steerMarkersOnly =
+        deliveredSteers.length > 0 && !streamedNonSteerContent
+      const steerMarkerTail = steerMarkersOnly
+        ? deliveredSteers.map((steer) => buildSteerPlaceholder(steer.steerId)).join('\n\n')
+        : ''
       const finishZipInput = selectFinishZipInput({
-        streamedMessageContent,
+        streamedMessageContent: steerMarkersOnly ? '' : streamedMessageContent,
         sanitizedFinishText,
         forwardedToActiveSse: forwardedTextChunkToActiveSse
       })
@@ -5007,6 +5184,11 @@ async function handleBatshitAgentStream({
         : { content: baseTextForZipping, references: [] }
 
       let finalContent = inlineProcessed.content
+      if (steerMarkerTail) {
+        finalContent = finalContent
+          ? `${finalContent}\n\n${steerMarkerTail}`
+          : steerMarkerTail
+      }
       const inlineZipRefs = inlineProcessed.references
 
       let coolToolZips: ZipReference[] = []
@@ -5471,6 +5653,40 @@ async function handleBatshitAgentStream({
     Boolean(fallbackRuntimeSettings) &&
     fallbackEffectiveModelId !== primaryModelId
 
+  /**
+   * SA-114 P2 (DL-114-09) — decide once, here, what this run can do about a mid-reply
+   * message. The run registry carries the verdict from here and the steer route reads it.
+   *
+   * Resolved ABOVE the once-per-accepted-send boundary on purpose: clip consumption and the
+   * memory linger commit are this turn's real side effects (DL-114-02), and nothing about
+   * steering may sit between them and `registerStreamAbort`. It is a pure function of
+   * things already resolved, so it costs nothing to do it early.
+   *
+   * This is the only place that knows all three inputs: the primary agent type, whether
+   * this is a group member's run, and — for a `cli` primary — which transport lane the
+   * bridge is about to take. `resolveCodexTransportLane` is the SAME function
+   * `CodexBridge.createRunner` calls moments later with the same `configScope`, which is
+   * what makes the promise the route gives the user and the channel the bridge actually
+   * opens one decision rather than two that can drift.
+   */
+  const steerVerdict = resolveSteerability({
+    primaryAgentType,
+    isGroupSession: Boolean(groupContext) || streamMetadata?.groupChat === true,
+    cli: isCliProvider
+      ? {
+          provider: isCodexProvider ? 'codex' : isClaudeProvider ? 'claude' : null,
+          configScope:
+            codexRuntimeSettings?.configScope ?? claudeRuntimeSettings?.configScope ?? null,
+          codexTransport: isCodexProvider
+            ? resolveCodexTransportLane(
+                { configScope: codexRuntimeSettings?.configScope ?? null },
+                process.env,
+              )
+            : null,
+        }
+      : null,
+  })
+
   if (consumeSessionClips) {
     await consumePostCompileSessionClips(sessionId)
 
@@ -5500,6 +5716,44 @@ async function handleBatshitAgentStream({
   }
 
   registerStreamAbort(sessionId, messageId, streamAbortController)
+
+  // SA-114 P2 (DL-114-09): the verdict lands in the steer registry, not on the stream-abort
+  // entry — the interrupt path and its registry stay byte-identical through this story
+  // (DL-114-15), and DL-114-02 already made "steering gets its own map" the rule.
+  registerSteerRun(sessionId, {
+    messageId,
+    steerable: steerVerdict.steerable,
+    reason: steerVerdict.steerable ? null : steerVerdict.reason,
+    lane: steerVerdict.steerable ? steerVerdict.lane : null,
+  })
+  steerRunRegistered = true
+
+  // SA-114 P2 (DL-114-09) — the same verdict on the USER channel, for a turn Batshit started
+  // on its own. `requestAgentWakeup` publishes `running` before this request even begins, so
+  // it cannot know the transport; this second publish carries it once the run is registered.
+  // A chat the user has open learns it from the `start` event instead — the sidebar's copy
+  // is what lets a tab that was not watching this chat still label its send button correctly.
+  const wakeRunForStatus = getWakeRun(sessionId)
+  if (wakeRunForStatus) {
+    try {
+      await publishUserEvent(wakeRunForStatus.userId, {
+        type: 'session_run_status',
+        sessionId,
+        // F-P3-2: the assistant message this reply is writing. A tab that did not start
+        // the reply otherwise learns it only from the `start` event, which the API lane
+        // sends with its first chunk — seconds after a steer could already be accepted.
+        messageId,
+        status: 'running',
+        owner: 'server',
+        origin: wakeRunForStatus.origin,
+        steerable: steerVerdict.steerable,
+        steerReason: steerVerdict.steerable ? null : steerVerdict.reason,
+      })
+    } catch (error) {
+      // A live-update channel must never fail the turn it is reporting.
+      console.warn('[SA-114] Could not publish steerability for a woken turn:', error)
+    }
+  }
 
   try {
     const primaryImagePayload = await applyImageTransportOverrides({
@@ -5645,6 +5899,32 @@ async function handleBatshitAgentStream({
       runtimeEventLogBuffer = (result as any).__rawEvents
     }
 
+    /**
+     * SA-114 P2 (DL-114-06, DL-114-08) — the managed CLI steer channel, if this run has one.
+     *
+     * Registered HERE and nowhere earlier, because the child process only exists once
+     * `streamNativeMode` has resolved. The API lane never sets `__steer`: its hook pulls at
+     * the next step instead, so the steer route finds no transport and simply leaves the
+     * entry waiting. A Codex run on the `exec` lane sets none either, which is the same
+     * refusal `steerVerdict` already gave the user before they could try.
+     */
+    const steerChannel = (result as any).__steer
+    const steerChannelLane = (result as any).__steerLane as SteerLane | null | undefined
+    if (
+      steerDeliveryEnabled &&
+      steerVerdict.steerable &&
+      typeof steerChannel === 'function' &&
+      (steerChannelLane === 'codex' || steerChannelLane === 'claude')
+    ) {
+      attachSteerTransport(sessionId, messageId, steerChannelLane, async (payload) => {
+        const answer = await steerChannel(payload)
+        // Codex answers `{accepted}`; Claude answers a boolean write result. Both mean the
+        // same thing here: did the transport TAKE it. Delivery is the echo, which arrives
+        // later as a synthetic `steer` chunk in this same stream.
+        return typeof answer === 'boolean' ? answer : Boolean(answer?.accepted)
+      })
+    }
+
     detectToolSource =
       typeof (result as any).__detectToolSource === 'function'
         ? (result as any).__detectToolSource
@@ -5659,6 +5939,14 @@ async function handleBatshitAgentStream({
         model: usedModelId,
         selectedTools,
         selectedGateways,
+        // SA-114 P2 (DL-114-09): every tab watching this chat learns whether the reply it
+        // is looking at can be steered, and why not when it cannot. It rides the session
+        // channel's replay buffer, so a tab opened mid-reply gets it too. The steer route
+        // is still the backstop — a tab that guessed wrong is refused with this same
+        // reason and falls back to an interrupt (DL-114-14).
+        steerable: steerVerdict.steerable,
+        steerReason: steerVerdict.steerable ? null : steerVerdict.reason,
+        steerLane: steerVerdict.steerable ? steerVerdict.lane : null,
         ...(fallbackUsed
           ? {
               fallbackUsed: true,
@@ -5720,6 +6008,16 @@ async function handleBatshitAgentStream({
 
     shouldBreakStream = false
     for await (const chunk of result.stream) {
+      // SA-114 P1 (DL-114-04): anything the transport handed to the model since the last
+      // chunk is written into the transcript HERE, before this chunk is processed — which
+      // is what places the marker after the tool results that preceded delivery and before
+      // the text that answers them. The drain itself only releases a steer once this loop
+      // has consumed the `finish-step` of the step it was read after (F-P1-3), because the
+      // SDK runs AHEAD of this loop: with two parallel tool calls in one step,
+      // `prepareStep` delivered the steer while the loop was still between that step's two
+      // `tool-result` chunks (measured live on BSMS, 2026-09-10), and a fast tool can put it
+      // even earlier. Counting consumed steps is what makes the position deterministic.
+      await drainSteersIntoTranscript()
       switch (chunk.type) {
         case 'text-delta': {
           if ((chunk as any).text) markMeasuredFirstOutput()
@@ -6473,10 +6771,45 @@ async function handleBatshitAgentStream({
           shouldBreakStream = true
           break
         }
+        case 'steer': {
+          /**
+           * SA-114 P2 — a managed CLI told us the model has the user's mid-reply words.
+           *
+           * This is the CLI half of F-P1-3, and it is deliberately the mirror image of the
+           * API lane's gate rather than a copy of it. The API lane holds a delivered steer
+           * until the loop has consumed the `finish-step` of the step it was read after,
+           * because the SDK runs AHEAD of this loop and "which chunk is in hand" proves
+           * nothing about where the step boundary sits. A CLI stream has no `finish-step`
+           * chunks at all — there is no count for such a gate to consume — but it does not
+           * need one: the echo arrives IN the stream, 2-6 ms after the tool result that
+           * preceded delivery, so its position in the stream IS the position the marker
+           * belongs at. Marking delivered here and draining unbounded puts it exactly there.
+           * Marking it in the adapter with a step the gate could never reach would instead
+           * leave it waiting for the forced finish drain and land it at the very end.
+           */
+          const steerChunk = chunk as any
+          const steerIds = Array.isArray(steerChunk.steerIds) ? steerChunk.steerIds : []
+          const echoLane: SteerLane =
+            steerChunk.lane === 'codex' || steerChunk.lane === 'claude'
+              ? steerChunk.lane
+              : 'api'
+          if (steerDeliveryEnabled && steerIds.length > 0) {
+            confirmSteerDelivery(sessionId, messageId, {
+              steerIds,
+              step: finishedStepsConsumed,
+              lane: echoLane,
+            })
+            await drainSteersIntoTranscript(true)
+          }
+          break
+        }
         case 'finish-step': {
           // Consumer-owned per-call evidence avoids racing the onFinish callback
           // or treating the last raw usage chunk as a multi-call aggregate.
           rawUsageByFinishedStep.push((chunk as any).usage?.raw)
+          // SA-114 (F-P1-3): the loop has now consumed everything this step produced, so
+          // a steer delivered at this boundary may be written before the next chunk.
+          finishedStepsConsumed += 1
           break
         }
         case 'finish': {
@@ -6505,6 +6838,13 @@ async function handleBatshitAgentStream({
         break
       }
     }
+
+    // SA-114 P1: a steer delivered at the LAST step boundary has no following chunk to
+    // ride on, so drain once more here. `onFinish` drains first as well, because the SDK's
+    // finish callback and this loop's tail can complete in either order and the marker has
+    // to be in `streamedMessageContent` before the finish path reads it. Forced: the loop
+    // has consumed every chunk, so every step is over.
+    await drainSteersIntoTranscript(true)
 
     // Keep the raw fallback consumer-owned. The SDK finish callback can run
     // ahead of queued stream parts; flushing there could append raw reasoning
@@ -7083,6 +7423,10 @@ async function handleBatshitAgentStream({
     }
   } finally {
     zipDetection.deleteSessionBuffers(sessionId)
+    // SA-114 P2: the run's steerability verdict and its CLI channel die with the turn that
+    // owned them. Scoped by message id, like every other cleanup in this file, so a request
+    // unwinding late cannot remove a newer turn's registration.
+    if (steerRunRegistered) clearSteerRun(sessionId, messageId)
     clearStreamAbort(sessionId, messageId)
     if (visualCleanup) {
       try {
@@ -8408,6 +8752,113 @@ export const POST: RequestHandler = async ({
             })
           }
 
+          // SA-114 P1 (DL-114-07) — an undelivered steer becomes the next turn.
+          //
+          // A reply with no tool boundary left (a plain text answer, or an agent already
+          // wrapping up) cannot carry a steer inside it. Rather than dropping it or
+          // leaving it to a tab that may already be closed, the SERVER sends it as the
+          // user's next message and runs the follow-up turn here, in-process — the same
+          // shape the context-exhaustion auto-continue above uses, and the same
+          // server-written user message SA-116's approval resume writes.
+          //
+          // The promoted turn is an ORDINARY accepted send: clips consumed once, memory
+          // linger committed once, no `metadata.wake` (a human typed it, so a woken chat
+          // reads as human from here on).
+          let steerPromotions = 0
+          while (steerPromotions < MAX_STEER_PROMOTIONS) {
+            const interrupted =
+              streamResult.response.status === 499 ||
+              (streamResult.metadata as any)?.interrupted === true
+            // Stop means stop: the client still holds what it typed and re-sends it as a
+            // normal message. Promoting here would answer a reply the user cancelled.
+            if (interrupted) break
+
+            // DL-114-13: only the USER's steers are taken here. A DM that could not land
+            // degrades to `wait` and shows on the next turn's roster — an agent's text must
+            // never start a user turn — and it stays in the inbox so the `finally` below can
+            // find it and stamp it. P1 took everything and filtered afterwards, which left
+            // the degrade nothing to read.
+            const promotable = takeUndeliveredSteers(
+              sessionId,
+              streamResult.messageId,
+              { source: 'user' },
+            )
+            if (promotable.length === 0) break
+
+            steerPromotions += 1
+            const promoted = await promoteSteersToNextTurn({
+              sessionId,
+              userId: resolvedUserId,
+              agentId,
+              steers: promotable,
+              eventFetch,
+              request,
+            })
+            if (!promoted) break
+
+            streamResult = await handleBatshitAgentStream({
+              content: promoted.content,
+              sessionId,
+              agent,
+              agentId,
+              messageId: promoted.assistantMessageId,
+              messages: promoted.history,
+              metadata: {
+                ...(metadataForStream && typeof metadataForStream === 'object'
+                  ? (() => {
+                      const {
+                        toolApprovalResponse: _approvals,
+                        tool_approval_response: _approvalsSnake,
+                        expiredToolApprovals: _expired,
+                        interruption: _interruption,
+                        ...rest
+                      } = metadataForStream as Record<string, any>
+                      return rest
+                    })()
+                  : {}),
+                steerPromoted: { steerIds: promotable.map((entry) => entry.steerId) },
+              },
+              batshitInput,
+              globalZipSettings,
+              voiceState: resolvedVoiceState,
+              userSettings,
+              userId: resolvedUserId,
+              eventFetch,
+              request,
+              sessionRecord: session,
+            })
+          }
+
+          // The bound above is a safety net, not a product limit — but if it ever fires,
+          // "nothing you typed is lost" still has to hold. The remaining text is written
+          // into the chat as an ordinary unanswered user message rather than being cleared
+          // with the inbox, and the error says a chain this long means something is wrong.
+          if (steerPromotions >= MAX_STEER_PROMOTIONS) {
+            const stranded = takeUndeliveredSteers(
+              sessionId,
+              streamResult.messageId,
+              { source: 'user' },
+            )
+            if (stranded.length > 0) {
+              console.error(
+                '[SA-114] Steer promotion chain hit its bound; the remaining message is saved unanswered',
+                {
+                  sessionId,
+                  steerIds: stranded.map((entry) => entry.steerId),
+                  promotions: steerPromotions,
+                },
+              )
+              await promoteSteersToNextTurn({
+                sessionId,
+                userId: resolvedUserId,
+                agentId,
+                steers: stranded,
+                eventFetch,
+                request,
+              })
+            }
+          }
+
           if (
             !streamResult.response.ok &&
             streamResult.response.status !== 499 &&
@@ -8484,6 +8935,34 @@ export const POST: RequestHandler = async ({
           sandboxCleanupError,
         )
       }
+	      // SA-114 P1 (DL-114-02): the steer inbox is cleared beside the session-turn lock,
+	      // so a finished request never leaves accepted text behind. Everything promotable
+	      // has already been taken by the promotion loop above; what remains here is either
+	      // a DM steer that degrades to `wait` (DL-114-13) or a steer on a turn the user
+	      // stopped, which the client still holds and re-sends itself.
+	      //
+	      // Scoped like the lock release below (F-P1-1): a turn stopped during setup can
+	      // unwind this `finally` AFTER a retry has registered its own stream and accepted
+	      // steers for it, and an unscoped clear would drop that live turn's text after
+	      // the route already answered 202. This request's own streams are gone by now
+	      // (`handleBatshitAgentStream` clears each in its own `finally`), so whatever
+	      // stream is live belongs to someone else and its mail is kept.
+	      const steerKeepMessageId = getActiveStream(sessionId)?.messageId ?? null
+	      // SA-114 P4 (DL-114-13): a DM steer is never promoted, so the end of the turn is
+	      // where it goes back to being an ordinary inbox item. It is read HERE, before the
+	      // clear below, because after that there is nothing left to read — and with the same
+	      // `keepMessageId`, so it degrades exactly what the clear is about to delete.
+	      // Awaited inside the `finally` on purpose: the response has already been returned,
+	      // and the alternative is a floating promise racing the next request's enqueue.
+	      const missedDmSteers = takeMissedDmSteers(sessionId, {
+	        keepMessageId: steerKeepMessageId,
+	      })
+	      if (missedDmSteers.length > 0) {
+	        await degradeMissedDmSteers(missedDmSteers, STEER_MISSED_REASON)
+	      }
+	      clearSteerInbox(sessionId, {
+	        keepMessageId: steerKeepMessageId,
+	      })
 	      // SA-113 P1: release only THIS request's lock. A turn stopped during setup can
 	      // have its lock cleared by the interrupt route (or the orphan prune) and a retry
 	      // can already own a new one by the time this `finally` unwinds; an unowned

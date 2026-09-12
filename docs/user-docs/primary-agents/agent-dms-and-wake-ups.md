@@ -41,16 +41,32 @@ There is also one instance-wide switch in **Admin → Instance-wide defaults →
 
 An assignment carries a requested outcome, a scope, and who to report back to. An agent can hold **one assignment at a time** — Batshit refuses a second claim until the first is closed.
 
-## Wait or wake
+## Wait, wake, or steer
 
-Every DM is sent one of two ways.
+Every DM is sent one of three ways.
 
 - **wait** — the default. The DM lands in the recipient's inbox and it sees it on its next turn, whenever that is. Nothing starts.
 - **wake** — Batshit starts a turn for the recipient right now.
+- **steer** — the DM lands *inside* the reply the recipient is already writing, at its next tool call. Nothing starts, and nothing is interrupted.
 
 A wake-up can be refused: wake-ups off for the instance or the agent, the agent already mid-task, or an hourly limit reached. **A refused wake becomes a wait**, with the reason recorded on the DM and shown to the sender. Nothing is lost, nothing retries, and nothing queues in the background.
 
 When an assignment sent with `wake` is closed, its result can wake the *sender* too — back into the very chat where the question was asked.
+
+### Steering a busy agent
+
+It's the same thing you do when you type while an agent is mid-reply (see [Steer or interrupt](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy)) — one agent doing it to another. It's for the correction that's only worth anything *now*: the recipient is already working on the thing, and waiting for the next turn means it finishes the wrong work first.
+
+- It costs nothing extra. No new chat is opened, no wake budget is spent, and the running reply is not stopped.
+- The agent reading it is told plainly that the words came **from another agent, not from you**, both when it arrives and in the chat's own history afterwards. An agent's message can never be mistaken for yours, and it can never approve anything on your behalf.
+- **One agent DM can be waiting for one reply.** A second while the first is still waiting goes to the inbox instead, with that reason.
+- A note that lands mid-reply is marked done, the same as one a wake-up delivered — the agent has already read it. An assignment stays open until the agent claims and closes it.
+- If the reply ends before the DM could land inside it, the DM simply goes to the inbox — it is **never** turned into a message that looks like it came from you.
+- If the recipient isn't mid-reply at all, the sender chooses what happens instead: wait in the inbox (the default), or wake them. A reply that is still starting up counts as mid-reply: Batshit waits a few seconds for it rather than treating the agent as idle.
+
+The DM drawer says which of the three actually happened, and a DM that landed mid-reply links to the chat it landed in.
+
+Steering is agent-to-agent only. A wake-up webhook or a schedule still uses wait or wake, because an outside program has no way to know whether an agent is mid-reply.
 
 ## Woken chats
 

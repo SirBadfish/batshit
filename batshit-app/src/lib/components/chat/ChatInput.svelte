@@ -100,6 +100,13 @@
     type DesktopControlsVoiceOwnerState
   } from '$lib/services/desktopControlsVoice'
   import type { DesktopGoonPresentationMode } from '$lib/goons/desktopGoonPresentation'
+  import { detectDesktopShortcutPlatform } from '$lib/goons/desktopShortcut'
+  import {
+    busySendModeLabel,
+    otherBusySendMode,
+    resolveEffectiveBusySendMode,
+    type BusySendMode
+  } from '$lib/utils/steerControl'
   
   type BatshitSlashExpandResult = {
     text: string
@@ -137,7 +144,10 @@
     onOpenExecutionViewer = (sessionId?: string | null) => {},
     workBusy = false,
     onStopWork = async () => {},
-    onClippedItemsChange = (_clips: ComposerClip[]) => {}
+    onClippedItemsChange = (_clips: ComposerClip[]) => {},
+    busySendMode = 'steer' as BusySendMode,
+    steerable = true,
+    steerReason = null
   } = $props<{
     onSend?: (message: string, metadata?: any) => boolean | void | Promise<boolean | void>
     disabled?: boolean
@@ -152,6 +162,11 @@
     workBusy?: boolean
     onStopWork?: () => void | Promise<void>
     onClippedItemsChange?: (clips: ComposerClip[]) => void
+    /** SA-114 P3 (DL-114-01): the per-user default, already resolved by the page. */
+    busySendMode?: BusySendMode
+    /** SA-114 P3 (DL-114-09): the server's verdict for the reply running right now. */
+    steerable?: boolean
+    steerReason?: string | null
   }>()
   
   let message = $state('')
@@ -177,13 +192,44 @@
   let stoppingWork = $state(false)
   let finalizingDictation = $state(false)
   const sendDisabled = $derived(disabled || !message.trim() || finalizingDictation)
+
+  /**
+   * SA-114 P3 (DL-114-01, DL-114-09) — the send button while the agent is replying.
+   *
+   * The effective mode is the user's default UNLESS this reply cannot carry a steer, in
+   * which case the button says *Interrupt and send* and the tooltip says why. The route is
+   * still the backstop, so the label is allowed to be optimistic for the fraction of a
+   * second before `start` lands — but it must never promise "Steer" for a lane the server
+   * has already told us cannot.
+   */
+  const shortcutModifierLabel = detectDesktopShortcutPlatform() === 'darwin' ? 'Cmd' : 'Ctrl'
+  const busyEffectiveSendMode = $derived(
+    resolveEffectiveBusySendMode({ mode: busySendMode, steerable })
+  )
+  const composerBusy = $derived(workBusy || waitingForAI)
   const sendButtonLabel = $derived(
     finalizingDictation
       ? 'Finalizing dictation'
-      : workBusy || waitingForAI
-        ? 'Interrupt and send message'
+      : composerBusy
+        ? busySendModeLabel(busyEffectiveSendMode)
         : 'Send message'
   )
+  const sendButtonTooltip = $derived.by(() => {
+    if (finalizingDictation) return 'Finalizing dictation...'
+    if (!composerBusy) return 'Send message'
+    // The shortcut is only mentioned when the other mode is actually available. A reply
+    // that cannot be steered would otherwise be advertising a key that does nothing —
+    // measured on a group chat, where the tooltip offered "Cmd+Enter sends as steer"
+    // beside its own sentence explaining that groups cannot be steered.
+    const shortcutHint = steerable
+      ? ` ${shortcutModifierLabel}+Enter sends as ${busySendModeLabel(otherBusySendMode(busyEffectiveSendMode)).toLowerCase()} instead.`
+      : ''
+    if (busyEffectiveSendMode === 'steer') {
+      return `Steer: your message waits for the agent's next tool call, then lands inside this reply.${shortcutHint}`
+    }
+    const why = steerable ? '' : ` ${(steerReason ?? '').trim()}`.trimEnd()
+    return `Interrupt and send: this reply stops and your message starts a new turn.${why}${shortcutHint}`
+  })
   let interimTranscript = $state('')
   let dictationPromise: Promise<void> | null = null
   let dictationBaseMessage = ''
@@ -2051,7 +2097,7 @@ $effect(() => {
 
   async function sendMessageWithText(
     rawText: string,
-    overrides?: { stt?: boolean; tts?: boolean }
+    overrides?: { stt?: boolean; tts?: boolean; busySendModeOverride?: BusySendMode }
   ) {
     if (!rawText.trim() || disabled) return
 
@@ -2150,7 +2196,9 @@ $effect(() => {
       composerSessionId: composerSessionId ?? undefined,
       fileReferences: fileReferences.length ? fileReferences : undefined,
       clipIds: clippedItems.map((clip: { id?: string }) => clip.id).filter(Boolean),
-      onAccepted: () => handleAccepted(false)
+      onAccepted: () => handleAccepted(false),
+      // SA-114 P3 (DL-114-01): present only when Cmd/Ctrl+Enter asked for the other mode.
+      busySendModeOverride: overrides?.busySendModeOverride
     }
     if (isCodexMode3) {
       metadata.codexPermissionMode = codexPermissionActive
@@ -2198,11 +2246,11 @@ $effect(() => {
     }
   }
 
-  async function handleSend() {
+  async function handleSend(busySendModeOverride: BusySendMode | null = null) {
     if (finalizingDictation) return
     const dictationReady = await stopDictationBeforeSend()
     if (!dictationReady) return
-    await sendMessageWithText(message)
+    await sendMessageWithText(message, busySendModeOverride ? { busySendModeOverride } : undefined)
   }
 
   async function handleStopWorkClick() {
@@ -2374,7 +2422,15 @@ $effect(() => {
 
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      handleSend()
+      // SA-114 P3 (DL-114-01): Cmd/Ctrl+Enter sends with the OTHER mode, for this message
+      // only. Enter keeps its meaning, which is the point: the shortcut is the escape
+      // hatch, not a second default. It is "the other mode" rather than "interrupt"
+      // because someone who set the default to interrupt still needs a way to steer once.
+      const oneOffMode =
+        (e.metaKey || e.ctrlKey) && composerBusy
+          ? otherBusySendMode(busyEffectiveSendMode)
+          : null
+      handleSend(oneOffMode)
     }
   }
 
@@ -3702,13 +3758,14 @@ $effect(() => {
         </Button>
         
         <Button
-          onclick={handleSend}
+          onclick={() => handleSend()}
           disabled={sendDisabled}
           size="icon"
           class="chat-input-icon-lg"
           aria-label={sendButtonLabel}
-          title={finalizingDictation ? 'Finalizing dictation...' : sendButtonLabel}
+          title={sendButtonTooltip}
           data-testid="send-button"
+          data-busy-send-mode={composerBusy ? busyEffectiveSendMode : undefined}
           data-ab-control="send-message"
         >
           <span class="chat-sr-only">Send message</span>

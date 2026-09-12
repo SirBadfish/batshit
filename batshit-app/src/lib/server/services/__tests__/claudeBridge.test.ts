@@ -307,13 +307,19 @@ describe('ClaudeBridge managed MCP scoping', () => {
   posixIt('injects managed env secrets into the spawned CLI child and logs a single redacted executing line', async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'claude-bridge-spawn-test-'))
     const probePath = path.join(tempDir, 'claude-probe.sh')
-    // Stands in for the claude executable: drains stdin, then reports the env it received
-    // as a stream-json line so the test can assert spawn-time secret injection.
+    // Stands in for the claude executable: reads the prompt LINE, then reports the env it
+    // received as a stream-json line so the test can assert spawn-time secret injection.
+    //
+    // SA-114 P2: one line, not `cat >/dev/null`. Since DL-114-08 the bridge keeps stdin
+    // open for the whole run so a steer can be written to it, and the real CLI starts
+    // working the moment it has a complete user line (P0 measured it streaming with stdin
+    // still open). A probe that waited for EOF would be modelling a CLI Batshit does not
+    // run, and would hang here forever.
     await writeFile(
       probePath,
       [
         '#!/bin/sh',
-        'cat >/dev/null',
+        'IFS= read -r _line',
         'printf \'{"type":"probe","headerEnv":"%s"}\\n\' "$BATSHIT_MCP_HEADER_GW_DOCKER_AUTHORIZATION"',
         'exit 0'
       ].join('\n'),

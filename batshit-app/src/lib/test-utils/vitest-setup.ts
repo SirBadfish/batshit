@@ -694,6 +694,14 @@ vi.mock('$lib/server/redis', async () => {
 
   return {
     redis: redisMock,
+    // SA-114 P3: the real module exports the CLASS too, and several routes construct their
+    // own instance (`new RedisService()`) instead of importing the singleton. Without this
+    // the fake lane throws "No RedisService export is defined" for those routes, which
+    // looks like a broken test rather than a missing export. `new` on a function that
+    // returns an object yields that object, so both shapes reach the same fake.
+    RedisService: vi.fn(function RedisService() {
+      return redisMock
+    }),
     default: redisMock
   }
 })

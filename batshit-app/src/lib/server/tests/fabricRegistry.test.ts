@@ -3714,3 +3714,26 @@ describe('controlRegistry artifact capability controls', () => {
     })
   })
 })
+
+describe('sys.dm.send delivery modes (SA-114 DL-114-13)', () => {
+  it('offers steer and its fallback field in the schema the model reads', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+    const result = await findControls({
+      query: 'sys.dm.send',
+      includeDraft: true,
+      includeSchema: true,
+      limit: 50
+    })
+    const control = result.results.find((item) => item.controlId === 'sys.dm.send')
+    expect(control).toBeTruthy()
+
+    const properties = (control as any).inputSchema?.properties
+    // A value missing from this enum is a value the model will not send, whatever the
+    // server accepts — the schema the broker hands over IS the offer.
+    expect(properties.deliver.enum).toEqual(['wait', 'wake', 'steer'])
+    // And a mode offered without the field that governs its failure case is half an offer.
+    expect(properties.steer_fallback.enum).toEqual(['wait', 'wake'])
+    expect(control!.schemaHint).toContain('wait | wake | steer')
+    expect(control!.description).toContain('steer')
+  })
+})

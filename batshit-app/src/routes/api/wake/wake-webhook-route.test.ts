@@ -146,10 +146,15 @@ describe('the body contract', () => {
     expect((await response.json()).error).toMatch(/cannot send a result/i)
   })
 
-  it('refuses an unknown delivery mode', async () => {
+  it('refuses a delivery mode a webhook cannot use', async () => {
+    // SA-114 P4: `steer` became a real mode for `sys.dm.send`, and deliberately not here.
+    // An outside program cannot see whether the agent is mid-reply, and DL-114-13 gives
+    // the steer door to the agent-to-agent lane only — so this stays a 400, now because
+    // the lane refuses it rather than because nothing implements it.
     const { token, record } = await seedHook()
     const response = await call(record.id, token, { message: 'x', deliver: 'steer' })
     expect(response.status).toBe(400)
+    expect((await response.json()).error).toMatch(/"wait" or "wake"/i)
   })
 
   it('uses the first line of the message as the subject when none is given', async () => {

@@ -7,6 +7,14 @@
   import { calculateZipActivation } from '$lib/utils/zipActivation'
   import { extractVisibleBatshitCueState } from '$lib/utils/batshitCue'
   import { hideStreamingHiddenControlBlocks } from '$lib/utils/zipControl'
+  import {
+    expandSteerPlaceholders,
+    formatSteerForUser,
+    hasSteerPlaceholder,
+    readMessageSteers,
+    type DeliveredSteer
+  } from '$lib/utils/steerControl'
+  import * as steerInbox from '$lib/stores/steerInbox.svelte'
   import TextRenderer from '../renderers/content/TextRenderer.svelte'
   import CodeRenderer from '../renderers/content/CodeRenderer.svelte'
   import TerminalRenderer from '../renderers/content/TerminalRenderer.svelte'
@@ -606,16 +614,27 @@
       
       if (isStreaming) {
         // CRITICAL FIX: Always update compiledContent during streaming for reactivity
-        compiledContent = hideStreamingHiddenControlBlocks(content)
+        const streamingContent = hideStreamingHiddenControlBlocks(content)
+        // SA-114 P3: expand steer markers from the LIVE store, because the stored
+        // `metadata.steers[]` does not exist until finalise. Without this the raw
+        // `{{batshit-steer:…}}` braces would sit in the chat for the rest of the reply.
+        compiledContent = hasSteerPlaceholder(streamingContent)
+          ? expandSteerPlaceholders(streamingContent, liveSteers, formatSteerForUser)
+          : streamingContent
         isCompiling = false
         pendingCompileSource = null
         lastCompiledSource = null
-      } else if (extractZipIds(content, validZipIds).length === 0) {
+      } else if (
+        extractZipIds(content, validZipIds).length === 0 &&
+        // SA-114 (DL-114-04): a reply can carry a steer marker and no zips at all, and the
+        // short-circuit would then show the raw `{{batshit-steer:…}}` braces in the chat.
+        !hasSteerPlaceholder(content)
+      ) {
         compiledContent = content
         isCompiling = false
         pendingCompileSource = null
         lastCompiledSource = content
-      } else if (hasOnlyCoolToolZips(content)) {
+      } else if (hasOnlyCoolToolZips(content) && !hasSteerPlaceholder(content)) {
         // Tool-only messages already hydrate from Redis; no compile needed.
         compiledContent = content
         isCompiling = false
@@ -628,7 +647,7 @@
         pendingCompileSource = content
         isCompiling = true
         const token = ++compileToken
-        compileForUserBatch(content).then(compiled => {
+        compileForUserBatch(content, { steers: messageSteers }).then(compiled => {
           if (token !== compileToken) return
           compiledContent = compiled
           isCompiling = false
@@ -717,6 +736,30 @@
     const normalized = rawIds.map((id) => normalizeId(id)).filter(Boolean)
     return { hasExplicitIds, rawIds, normalized }
   })
+
+  // SA-114 (DL-114-04): the text behind each `{{batshit-steer:id}}` marker in this message.
+  const messageSteers = $derived(readMessageSteers({ metadata }))
+
+  /**
+   * SA-114 P3 — the same words, while the reply is still streaming.
+   *
+   * `metadata.steers[]` is written at finalise, so mid-reply there is a marker and no text
+   * to put in it. `steer_delivered` carries none either (AMD-114-04), so the words come
+   * from the live steer store — filled by the browser's own send, and by `steer_queued`
+   * for a tab that was only watching.
+   */
+  const liveSteers = $derived.by((): DeliveredSteer[] =>
+    steerInbox.getSteersForMessage(sessionId, messageId).map((entry) => ({
+      steerId: entry.steerId,
+      messageId: entry.messageId,
+      text: entry.text,
+      at: new Date(entry.updatedAt).toISOString(),
+      source: entry.source,
+      label: entry.label,
+      step: 0,
+      lane: entry.lane ?? 'api'
+    }))
+  )
 
   const validZipIds = $derived.by((): Set<string> | null => {
     if (isStreaming) return null

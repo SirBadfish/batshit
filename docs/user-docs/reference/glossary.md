@@ -14,7 +14,7 @@ Batshit's browser automation runtime. Native installs can use the host runtime w
 
 ### Agent DM
 
-A message one Primary Agent sends another: an **info** note, an **assignment** (do this and report back), or a **result** (the answer to one). Off by default per agent. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+A message one Primary Agent sends another: an **info** note, an **assignment** (do this and report back), or a **result** (the answer to one). Off by default per agent. It is delivered one of three ways: **wait** (it sits in the inbox), **wake** (Batshit starts a chat for the recipient now), or **steer** (it lands inside the reply the recipient is already writing). See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 
 ### Agent Use
 
@@ -196,6 +196,13 @@ An Artifact that embeds a HuggingFace Space. Current HuggingFace embeds are user
 
 An opt-in, one-way session type where one agent lives in one ongoing conversation. Infinite Sessions auto-lock, pin to their own sidebar section, organize life into episodes, and use naps instead of Compact. See [Memory & Infinite Sessions](../chat/memory-and-infinite-sessions.md).
 
+### Interrupt
+
+Sending a message while an agent is still replying in the way Batshit used to do it always:
+the reply stops, everything it already produced is kept, and your message starts a new turn
+with a note saying the last one was cut short. The **Stop** button is always an interrupt.
+The other option, and the default, is **Steer**.
+
 ### Inworld
 
 One of Batshit's direct realtime TTS providers when an Inworld API key and voice are configured. Batshit uses Inworld for speech output only; Batshit still owns chat context, tools, Zips, message storage, and playback events.
@@ -317,6 +324,16 @@ A reusable instruction bundle with optional reference files and scripts. Users c
 ### Speech-to-text
 
 The process of turning spoken audio into text. Abbreviated as STT.
+
+### Steer
+
+Sending a message while an agent is still replying, so it arrives **inside** that reply at the
+agent's next tool call instead of stopping it. The default for a mid-reply send; the chat shows
+it as a small inset bubble at the spot it arrived. If the reply has no tool call left to catch
+it, Batshit sends it as your next message once the reply ends, so nothing you type is lost.
+The opposite is **Interrupt**. An urgent Agent DM can steer a busy agent the same way, marked
+as coming from another agent rather than from you. See
+[the chat workspace](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy).
 
 ### Subagent
 

@@ -15,7 +15,10 @@ import {
   clearDmNeedsUser,
   clearNeedsUserForHumanReply,
   closeDm,
+  acknowledgeDeliveredDmSteers,
   createDm,
+  degradeMissedDmSteers,
+  STEER_DELIVERED_INFO_RESULT,
   deleteDmForUser,
   DmStoreError,
   getDm,
@@ -456,8 +459,17 @@ describe('delivery stamping', () => {
     })
   })
 
-  it('is a no-op for a DM that no longer exists', async () => {
-    await expect(stampDmDelivery('dm_gone', { actual: 'wait' })).resolves.toBeUndefined()
+  it('is a no-op for a DM that no longer exists, and says so', async () => {
+    // SA-114 P4 gave this a return value: `degradeMissedDmSteers` reports which DMs it
+    // degraded, so "there was nothing to write" has to be distinguishable from "written".
+    await expect(stampDmDelivery('dm_gone', { actual: 'wait' })).resolves.toBe(false)
+  })
+
+  it('reports a real write', async () => {
+    const dm = await seedInfo({ deliver: 'wake' })
+    await expect(stampDmDelivery(dm.id, { actual: 'wait', reason: 'busy' })).resolves.toBe(
+      true
+    )
   })
 })
 
@@ -892,5 +904,195 @@ describe('SA-115 — the third sender kind is answered explicitly', () => {
     expect(two.id).not.toBe(one.id)
     const inbox = await listInbox(COOPER)
     expect(inbox.map((record) => record.from.kind)).toEqual(['schedule', 'schedule'])
+  })
+})
+
+/**
+ * SA-114 P4 review (F-P4-2) — an `info` note the model READ mid-reply is no longer open.
+ *
+ * The wake lane closes a delivered info note at the end of the turn (SA-115 F-P1-2), for
+ * the reason spelled out there: an agent handed the note has no reason to go read it
+ * again, so an open one re-lists on every later roster. A steer hands the note over just
+ * as surely — the transport confirmed the model has it — so the same rule applies, at the
+ * moment of delivery. Assignments and results are untouched: they are work, not notes.
+ */
+describe('SA-114 — acknowledging a DM steer the model read (F-P4-2)', () => {
+  it('closes a delivered info note with the steer result text', async () => {
+    const dm = await seedInfo({ deliver: 'steer' })
+    await stampDmDelivery(dm.id, { actual: 'steer', sessionId: 'sess-cooper' })
+
+    const acked = await acknowledgeDeliveredDmSteers([{ dmId: dm.id, source: 'dm' }], COOPER)
+
+    expect(acked).toEqual([dm.id])
+    const record = await getDm(dm.id)
+    expect(record?.status).toBe('done')
+    expect(record?.result).toBe(STEER_DELIVERED_INFO_RESULT)
+    // The delivery stamp survives the close: the drawer still says where it landed.
+    expect(record?.delivery).toMatchObject({ actual: 'steer', sessionId: 'sess-cooper' })
+    expect((await listInbox(COOPER)).map((row) => row.id)).not.toContain(dm.id)
+  })
+
+  it('leaves an assignment open — it is work, not a note', async () => {
+    const dm = await createDm({
+      userId: USER,
+      from: sender(),
+      to: COOPER,
+      kind: 'assignment',
+      subject: 'Check the build',
+      body: 'x',
+      requestedOutcome: 'A pass or a fail.',
+      scope: 'The smoke lane.',
+      reportBackTo: FAYE,
+      deliver: 'steer'
+    })
+    const acked = await acknowledgeDeliveredDmSteers([{ dmId: dm.id, source: 'dm' }], COOPER)
+    expect(acked).toEqual([])
+    expect((await getDm(dm.id))?.status).toBe('new')
+  })
+
+  it('ignores user steers and keeps going past a vanished DM', async () => {
+    const dm = await seedInfo({ deliver: 'steer' })
+    const acked = await acknowledgeDeliveredDmSteers(
+      [
+        { source: 'user' },
+        { dmId: 'dm_gone_1757000000_aaaaaa', source: 'dm' },
+        { dmId: dm.id, source: 'dm' }
+      ],
+      COOPER
+    )
+    expect(acked).toEqual([dm.id])
+  })
+
+  it('does not close a note that belongs to another agent', async () => {
+    const dm = await seedInfo({ deliver: 'steer' })
+    const acked = await acknowledgeDeliveredDmSteers([{ dmId: dm.id, source: 'dm' }], FAYE)
+    expect(acked).toEqual([])
+    expect((await getDm(dm.id))?.status).toBe('new')
+  })
+})
+
+/**
+ * SA-114 P4 (DL-114-13) — a DM steer that never landed goes back to being a `wait`.
+ *
+ * send-routed calls this at the end of a turn with whatever the steer inbox was still
+ * holding. The user's own steers are promoted into the next message at that point; a DM's
+ * are not, because an agent's text must never start a user turn.
+ */
+describe('SA-114 — degrading a DM steer that never landed', () => {
+  it('stamps the DM back to wait with the reason it did not land', async () => {
+    const dm = await createDm({
+      userId: USER,
+      from: sender(),
+      to: COOPER,
+      kind: 'info',
+      subject: 'Mid-reply',
+      body: 'x',
+      deliver: 'steer',
+      steerFallback: 'wait'
+    })
+    await stampDmDelivery(dm.id, { actual: 'steer', sessionId: 'sess-cooper' })
+
+    const stamped = await degradeMissedDmSteers(
+      [{ dmId: dm.id, source: 'dm' }],
+      'The reply ended before this could land inside it.'
+    )
+
+    expect(stamped).toEqual([dm.id])
+    const record = await getDm(dm.id)
+    expect(record?.delivery.requested).toBe('steer')
+    expect(record?.delivery.actual).toBe('wait')
+    expect(record?.delivery.reason).toMatch(/reply ended/i)
+    // F-P4-1: it landed nowhere, so it names no chat — the drawer's "open the chat" link
+    // reads `sessionId`, and a stale one would point at the reply it MISSED.
+    expect(record?.delivery.sessionId).toBeUndefined()
+    // Still open and still in the inbox — degrading is not closing.
+    expect((await listInbox(COOPER)).map((row) => row.id)).toContain(dm.id)
+  })
+
+  it('never touches a user steer, which the promotion loop owns', async () => {
+    const dm = await seedInfo()
+    const stamped = await degradeMissedDmSteers(
+      [{ source: 'user' }, { dmId: dm.id, source: 'user' }],
+      'x'
+    )
+    expect(stamped).toEqual([])
+    expect((await getDm(dm.id))?.delivery.reason).toBeUndefined()
+  })
+
+  it('keeps going when one stamp throws, because it runs inside the lock release', async () => {
+    // This loop runs in the same `finally` that clears the steer inbox and releases the
+    // session-turn lock. A Redis hiccup on one DM that escaped here would skip both of
+    // those and wedge the chat — which is a far worse outcome than a DM whose `actual` is
+    // one stamp out of date.
+    const first = await createDm({
+      userId: USER,
+      from: sender(),
+      to: COOPER,
+      kind: 'info',
+      subject: 'Breaks',
+      body: 'x',
+      deliver: 'steer'
+    })
+    const second = await createDm({
+      userId: USER,
+      from: sender(),
+      to: COOPER,
+      kind: 'info',
+      subject: 'Survives',
+      body: 'y',
+      deliver: 'steer'
+    })
+
+    // `mockImplementationOnce` only, so every call after the first runs the real write.
+    // The loop stamps in order and each stamp reads then writes, so the first `json.set`
+    // after this line is the first DM's.
+    const spy = vi.spyOn(redis.json, 'set').mockImplementationOnce(async () => {
+      throw new Error('redis went away')
+    })
+
+    const stamped = await degradeMissedDmSteers(
+      [
+        { dmId: first.id, source: 'dm' },
+        { dmId: second.id, source: 'dm' }
+      ],
+      'the reply ended'
+    )
+    spy.mockRestore()
+
+    expect(stamped).toEqual([second.id])
+    expect((await getDm(second.id))?.delivery.actual).toBe('wait')
+  })
+
+  it('drops a field stamped as undefined rather than storing it (F-P4-1)', async () => {
+    const dm = await seedInfo({ deliver: 'steer' })
+    await stampDmDelivery(dm.id, { actual: 'steer', sessionId: 'sess-a' })
+    await stampDmDelivery(dm.id, { actual: 'wait', reason: 'ended', sessionId: undefined })
+    const record = await getDm(dm.id)
+    expect(record?.delivery.actual).toBe('wait')
+    expect(Object.keys(record?.delivery ?? {})).not.toContain('sessionId')
+  })
+
+  it('keeps going when one DM has vanished', async () => {
+    // This runs inside the `finally` that also releases the session-turn lock, so one bad
+    // id must not abandon the rest of the list or take the lock release with it.
+    const dm = await createDm({
+      userId: USER,
+      from: sender(),
+      to: COOPER,
+      kind: 'info',
+      subject: 'Still here',
+      body: 'x',
+      deliver: 'steer'
+    })
+    const stamped = await degradeMissedDmSteers(
+      [
+        { dmId: 'dm_gone_1757000000_aaaaaa', source: 'dm' },
+        { dmId: dm.id, source: 'dm' }
+      ],
+      'gone'
+    )
+    // A vanished DM is silent (`stampDmDelivery` returns on a missing record), and the one
+    // that is still there is stamped.
+    expect(stamped).toEqual([dm.id])
   })
 })

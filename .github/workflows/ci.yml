@@ -152,6 +152,9 @@ jobs:
           src/routes/api/wake/wake-webhook-route.test.ts
           src/routes/api/internal/schedules/sweep/sweep-route.test.ts
           src/routes/api/dms/dms-routes.test.ts
+          src/routes/api/messages/steer/steer-route.test.ts
+          src/lib/server/services/__tests__/steerPromotion.test.ts
+          src/routes/api/user/settings/user-settings-chat.test.ts
           src/lib/server/services/__tests__/goonRecipeRepository.test.ts
           src/lib/server/services/__tests__/hairAssetRepository.server.test.ts
           src/lib/server/services/__tests__/goonMutationRepository.test.ts

@@ -31,6 +31,11 @@ export type UserChannelEvent =
       owner?: 'server'
       origin?: Record<string, any>
       reason?: string
+      /** SA-114 (DL-114-09): whether this server-started reply can be steered, and why not. */
+      steerable?: boolean | null
+      steerReason?: string | null
+      /** F-P3-2: the assistant message the reply is writing — what a steer is aimed at. */
+      messageId?: string | null
     }
   | {
       type: 'dm_inbox_changed'
@@ -120,9 +125,18 @@ function applyToStores(event: UserChannelEvent) {
       break
     }
     case 'session_run_status': {
-      const { sessionId, status } = event as any
+      const { sessionId, status, steerable, steerReason, messageId } = event as any
       if (typeof sessionId === 'string' && SERVER_RUN_STATUSES.includes(status)) {
-        chatRunRegistry.applyServerRunStatus({ sessionId, status })
+        // SA-114 P3 (DL-114-09): a woken turn's steerability reaches a tab that was not
+        // watching that chat only here — the `start` event rides the SESSION channel, and
+        // nobody was listening on it when Batshit started the turn by itself.
+        chatRunRegistry.applyServerRunStatus({
+          sessionId,
+          status,
+          steerable: typeof steerable === 'boolean' ? steerable : null,
+          steerReason: typeof steerReason === 'string' ? steerReason : null,
+          messageId: typeof messageId === 'string' ? messageId : null
+        })
       }
       break
     }

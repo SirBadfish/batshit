@@ -36,6 +36,30 @@ afterEach(() => {
 })
 
 describe('CodexEventAdapter', () => {
+  /**
+   * SA-114 P2 (DL-114-06): the lane's `steer.delivered` becomes one `steer` chunk carrying
+   * ids only. The adapter does not touch the steer inbox — send-routed's own `case` marks
+   * the delivery, so the transcript marker lands where this chunk sits in the stream.
+   */
+  it('forwards a steer delivery as a steer chunk with ids only', async () => {
+    const adapter = new CodexEventAdapter({ request: buildRequest(), transport: 'cli' })
+    async function* mockEvents() {
+      yield { type: 'thread.started', thread_id: 'thread-1' } as any
+      yield { type: 'steer.delivered', steer_ids: ['steer_1', 'steer_2'] } as any
+      yield { type: 'turn.completed', usage: {} } as any
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents() as any))
+    const steerChunks = chunks.filter((chunk) => chunk.type === 'steer')
+
+    expect(steerChunks).toEqual([
+      { type: 'steer', steerIds: ['steer_1', 'steer_2'], lane: 'codex' }
+    ])
+    // Ids only: the words live in Batshit's steer inbox, and duplicating them on the chunk
+    // would give two places the same bytes.
+    expect(JSON.stringify(steerChunks)).not.toContain('text')
+  })
+
   it('keeps in-turn image bytes out of the stored MCP tool result (SA-105 P3)', async () => {
     // The helper bridge now returns MCP image blocks on this runtime so a
     // recalled memory photo reaches the model in-turn. The model sees it in its

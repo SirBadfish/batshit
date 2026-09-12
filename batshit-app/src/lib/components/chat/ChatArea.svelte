@@ -3,6 +3,8 @@
   import type { VoiceSettings } from '$lib/types/voice'
   import ChatMessageComponent from './ChatMessage.svelte'
   import LoadingIndicator from './LoadingIndicator.svelte'
+  import SteerBubble from './SteerBubble.svelte'
+  import * as steerInbox from '$lib/stores/steerInbox.svelte'
   import { onDestroy, onMount, tick } from 'svelte'
   import { zippingService } from '$lib/services/zipping'
   import { calculateAgentMessagesFromEndByIndex } from '$lib/utils/zipMessageAge'
@@ -52,6 +54,19 @@
   const compactedMessageIdSet = $derived(new Set(compactedMessageIds))
   const activeToolMessageIdSet = $derived(new Set(activeToolMessageIds))
   const agentMessagesFromEndByIndex = $derived(calculateAgentMessagesFromEndByIndex(messages))
+
+  /**
+   * SA-114 P3 (DL-114-14) — steers with nowhere to live yet.
+   *
+   * Only the in-between states draw a bubble. A `delivered` steer renders inside the reply
+   * above (the inset), and a `promoted` one has become a real user message, so both would
+   * be a duplicate here.
+   */
+  const pendingSteers = $derived(
+    steerInbox
+      .getPendingSteersForSession(sessionId)
+      .filter((entry) => entry.state !== 'delivered' && entry.state !== 'promoted')
+  )
 
   // Update pinning service when session changes
   $effect(() => {
@@ -362,6 +377,9 @@
           planSubject={planSubjects?.[message.id]}
           {voiceSettings}
         />
+      {/each}
+      {#each pendingSteers as steer (steer.steerId)}
+        <SteerBubble {steer} />
       {/each}
       <div class="chat-bottom-sentinel" aria-hidden="true"></div>
     {/if}

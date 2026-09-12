@@ -5,7 +5,14 @@
   import * as sessionStore from '$lib/stores/session.svelte'
   import { onUserChannelEvent } from '$lib/services/userChannel'
   import { hydrateDmInboxCounts } from '$lib/stores/dmInbox.svelte'
-  import type { DmKind, DmPriority, DmRecord, DmStatus, DmSender } from '$lib/types/dm'
+  import type {
+    DmDeliveryRecord,
+    DmKind,
+    DmPriority,
+    DmRecord,
+    DmStatus,
+    DmSender
+  } from '$lib/types/dm'
 
   /**
    * SA-113 P4 (DL-113-10a) — the inbox drawer.
@@ -35,15 +42,12 @@
     createdAt: string
     expiresAt: string
     completedAt: string | null
-    delivery: {
-      requested: 'wait' | 'wake'
-      actual: 'wait' | 'wake'
-      reason?: string
-      sessionId?: string
-      outcome?: string
-      /** F-SEC-1b: the woken turn stopped on something only the user can clear. */
-      needsUser?: { reason: string; at: string }
-    }
+    /**
+     * The stored shape, not a copy of it. This was a hand-written duplicate until SA-114 P4
+     * added `steer` to the record and left the drawer's copy behind — the one place in
+     * Batshit that could not render a delivery mode it was being handed.
+     */
+    delivery: DmDeliveryRecord
     senderSessionId: string | null
     claimedSessionId: string | null
     relatedDmId: string | null
@@ -398,11 +402,14 @@
                     Needs you
                   </span>
                 {/if}
-                {#if row.delivery.requested === 'wake' && row.delivery.actual === 'wake'}
+                {#if row.delivery.actual === 'wake' && row.delivery.requested !== 'wait'}
                   <span class="batshit-settings-status-badge is-success">woke a chat</span>
-                {:else if row.delivery.requested === 'wake'}
+                {:else if row.delivery.actual === 'steer'}
+                  <span class="batshit-settings-status-badge is-success">landed mid-reply</span>
+                {:else if row.delivery.requested !== 'wait'}
                   <span class="batshit-settings-status-badge is-warning">
-                    waited: {row.delivery.reason ?? 'no reason recorded'}
+                    {row.delivery.requested === 'steer' ? 'could not steer' : 'waited'}:
+                    {row.delivery.reason ?? 'no reason recorded'}
                   </span>
                 {:else}
                   <span class="batshit-settings-status-badge">waiting in inbox</span>
@@ -416,7 +423,9 @@
                     class="dm-drawer-link"
                     onclick={() => openSession(row.delivery.sessionId)}
                   >
-                    Open the chat it started
+                    {row.delivery.actual === 'steer'
+                      ? 'Open the chat it landed in'
+                      : 'Open the chat it started'}
                   </button>
                 {/if}
                 {#if row.senderSessionId}

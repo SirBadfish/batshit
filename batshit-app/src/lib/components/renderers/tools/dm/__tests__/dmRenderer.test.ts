@@ -103,6 +103,24 @@ describe('DmRenderer', () => {
     })
   })
 
+  it('says plainly when a steer landed inside a running reply (SA-114 DL-114-13)', async () => {
+    // Without its own line this falls through to the bare recipient and reads as an
+    // ordinary send — the card would be the one place in Batshit that cannot tell the
+    // three delivery modes apart.
+    render(DmRenderer, {
+      props: {
+        tool: withResult(
+          { delivered_as: 'steer', session_id: 'sess-cooper-busy' },
+          { deliver: 'steer' }
+        )
+      }
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/landed mid-reply/)).toBeTruthy()
+    })
+  })
+
   it('labels each control in the family, not just send', async () => {
     render(DmRenderer, {
       props: {

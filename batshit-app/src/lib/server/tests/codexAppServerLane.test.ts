@@ -15,8 +15,8 @@ import { isContextExhaustionError } from '../services/contextExhaustion'
 import {
   buildCodexAppServerThreadParams,
   extractAppServerSpawnArgs,
-  resolveCodexTransportLane,
 } from '../services/codexBridge'
+import { resolveCodexTransportLane } from '../services/codexSettings'
 
 const spawnMock = vi.hoisted(() => vi.fn())
 vi.mock('node:child_process', async (importOriginal) => {

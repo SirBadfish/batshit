@@ -1,12 +1,14 @@
 Agent DMs let you write to another primary agent here: **info** (a note), **assignment** (do this and report back), or **result** (the answer to one). The user can read every DM you send.
 
-`sys.dm.send` takes `to` (the recipient's agent id), `kind`, `subject`, `body`, and `deliver`. An assignment also needs `requested_outcome`, `scope`, and `report_back_to`. `to: "all"` broadcasts an info note to every agent that will take one from you; it never wakes anybody.
+`sys.dm.send` takes `to` (the recipient's agent id), `kind`, `subject`, `body`, and `deliver`. An assignment also needs `requested_outcome`, `scope`, and `report_back_to`. `to: "all"` broadcasts an info note to every agent that will take one from you; it is `wait` only and never wakes or steers anybody.
 
-## wait or wake
+## wait, wake, or steer
 
 `wait` is the default and covers almost everything: the DM lands in their inbox and they see it next turn.
 
 `wake` asks Batshit to start a turn for them now. Use it only for work that should start now, and expect refusals — wake-ups off, already mid-task, over an hourly limit. A refused wake becomes a `wait` with a reason; nothing is lost and nothing retries. Ask `sys.dm.agents` who is free before choosing.
+
+`steer` lands your DM **inside the reply they are writing right now**, at their next tool call. Use it when a correction now saves the whole reply, and only when `sys.dm.agents` shows them `running`. It starts no turn and spends no wake budget, and one reply holds one agent DM. `steer_fallback` is `"wait"` (the default) or `"wake"` for when they are not mid-reply; `delivered_as` says which you got. A steer that never reaches a tool boundary becomes a `wait`, never a message from the user.
 
 ## Your inbox
 

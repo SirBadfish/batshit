@@ -7,6 +7,13 @@ import {
 } from './universalResolver'
 import { normalizeId } from '$lib/utils/idNormalizer'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
+import {
+  expandSteerPlaceholders,
+  formatSteerForAI,
+  formatSteerForUser,
+  readMessageSteers,
+  type DeliveredSteer
+} from '$lib/utils/steerControl'
 import { getActiveInterruptedReasoningRecoveryBlock } from '$lib/utils/reasoningRecovery'
 import { isConcreteZipId } from '$lib/utils/zipReferenceSafety'
 import {
@@ -467,6 +474,21 @@ export async function compileForAI(
     }
   }
 
+  // SA-114 (DL-114-04) — expand `{{batshit-steer:id}}` into the mid-reply line.
+  //
+  // AFTER the zip loop on purpose: `extractZips` records each zip's index against the
+  // ORIGINAL content, and the loop tracks its own offset, so replacing anything else first
+  // would move every zip out from under those indices.
+  //
+  // The text lives in `metadata.steers[]` rather than in the marker — the same split the
+  // zip family uses, and what lets one assistant record carry it without the compiled
+  // history ever changing after it is written.
+  compiled = expandSteerPlaceholders(
+    compiled,
+    readMessageSteers(_message),
+    formatSteerForAI
+  )
+
   // Tell the model when this response never completed, so it does not treat
   // the partial work as a finished turn (mirrors the user-facing failure
   // banner; the auto-continue addendum covers only the automatic relay case).
@@ -538,9 +560,23 @@ export async function batchGetZips(zipIds: string[]): Promise<Map<string, ZipDat
   return zipMap
 }
 
-export async function compileForUserBatch(content: string): Promise<string> {
+/**
+ * SA-114 (DL-114-04) — the user twin of the steer expansion.
+ *
+ * `steers` comes from the message's own `metadata.steers[]`; the caller passes it because
+ * this function takes content, not a message. P1 renders each one as a markdown blockquote
+ * so the chat is honest the moment a steer can land; P3 replaces that rendering with the
+ * inset bubble, and neither the marker nor the metadata changes when it does.
+ */
+export async function compileForUserBatch(
+  content: string,
+  options?: { steers?: DeliveredSteer[] }
+): Promise<string> {
+  const steers = options?.steers ?? []
   const zips = extractZips(content)
-  if (zips.length === 0) return content
+  if (zips.length === 0) {
+    return expandSteerPlaceholders(content, steers, formatSteerForUser)
+  }
   
   const zipIds = zips.map(t => t.id)
   logger.debug('[compileForUserBatch] Resolving zip IDs:', zipIds)
@@ -589,5 +625,5 @@ export async function compileForUserBatch(content: string): Promise<string> {
       compiled.substring(zip.index + zip.length)
   }
   
-  return compiled
+  return expandSteerPlaceholders(compiled, steers, formatSteerForUser)
 }

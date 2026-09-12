@@ -83,7 +83,12 @@ describe('creating a hook', () => {
     expect(waiting.record.deliverDefault).toBe('wait')
   })
 
-  it('refuses a nameless hook, an unknown delivery mode, and a missing agent', async () => {
+  // SA-114 P4: `steer` is a real DM delivery mode now, but NOT on this lane. A wake-up
+  // webhook is an outside program with no view of whether the agent is mid-reply, and
+  // DL-114-13 gives the steer door to `sys.dm.send` only. So the example below still fails
+  // — it changed from "not built yet" to "not this lane", which is why the sentence names
+  // the two a hook takes rather than the one it does not.
+  it('refuses a nameless hook, a delivery mode a hook cannot use, and a missing agent', async () => {
     await expect(createWakeHook({ userId: USER, agentId: COOPER, name: '  ' })).rejects.toThrow(
       /needs a name/i
     )

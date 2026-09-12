@@ -35,6 +35,45 @@ afterEach(() => {
 })
 
 describe('ClaudeEventAdapter', () => {
+  /**
+   * SA-114 P2 (DL-114-08): the bridge recognises the CLI's `--replay-user-messages` echo
+   * and yields one synthetic event in its place; the adapter turns that into a `steer`
+   * chunk. The replayed `user` event itself must stay invisible — surfacing it would put
+   * the user's own mid-reply words in the agent's mouth or split the reply in two.
+   */
+  it('forwards a steer delivery as a steer chunk, and never surfaces the replayed line', async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    const steerText = '[Steer — from the user, mid-reply]\nstart with PINEAPPLE'
+    async function* mockEvents() {
+      yield { type: 'batshit_steer_delivered', steer_ids: ['steer_1'] }
+      yield {
+        type: 'user',
+        message: { role: 'user', content: [{ type: 'text', text: steerText }] }
+      }
+      yield { type: 'result', subtype: 'success', result: 'done' }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents() as any))
+
+    expect(chunks.filter((chunk) => chunk.type === 'steer')).toEqual([
+      { type: 'steer', steerIds: ['steer_1'], lane: 'claude' }
+    ])
+    expect(JSON.stringify(chunks)).not.toContain('PINEAPPLE')
+    expect(chunks.some((chunk) => chunk.type === 'tool-result')).toBe(false)
+  })
+
+  it('ignores a malformed steer delivery rather than throwing mid-stream', async () => {
+    const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
+    async function* mockEvents() {
+      yield { type: 'batshit_steer_delivered' }
+      yield { type: 'batshit_steer_delivered', steer_ids: 'steer_1' }
+      yield { type: 'result', subtype: 'success', result: 'done' }
+    }
+
+    const chunks = await collectChunks(adapter.stream(mockEvents() as any))
+    expect(chunks.some((chunk) => chunk.type === 'steer')).toBe(false)
+  })
+
   it("SA-111 P4 (AMD-111-03): labels Claude Code's own Agent helper distinctly", async () => {
     // F8, confirmed live in P0: Claude Code's native `Agent` tool runs inside Batshit and
     // used to render as a Batshit "Subagent" card. It is neither a Batshit Subagent nor a

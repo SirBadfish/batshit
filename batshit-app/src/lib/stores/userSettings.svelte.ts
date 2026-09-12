@@ -3,6 +3,7 @@ import type { GoonsSettings } from '$lib/types/goons'
 import type { GlobalToolGridSettings } from '$lib/types/database'
 import type { AvatarIconFit, IconRef } from '$lib/icons/iconTypes'
 import type { GlobalAutoCompactSettings } from '$lib/utils/contextCompaction'
+import type { GlobalChatSettings } from '$lib/utils/steerControl'
 
 interface UserSettings {
   displayName?: string
@@ -27,6 +28,16 @@ interface UserSettings {
   global_zip_settings?: Record<string, any>
   global_auto_compact_settings?: GlobalAutoCompactSettings
   global_tool_grid_settings?: GlobalToolGridSettings
+
+  /**
+   * SA-114 P3 (DL-114-01) — what a send does while the agent is still replying.
+   *
+   * Read through `resolveBusySendMode`, never directly: the send button's label and the
+   * branch `handleSendMessage` takes must agree, and they only do while one rule answers
+   * for both. This store is what makes the setting live (LS-047) — the Settings panel
+   * writes it back here on save, and the chat reads it with `$derived`.
+   */
+  global_chat_settings?: GlobalChatSettings
 
   // Uploads
   upload_settings?: Record<string, any>

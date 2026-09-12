@@ -1614,7 +1614,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     executorType: 'internal_handler',
     title: 'DM Send',
     description:
-      'Send a DM to another primary agent: info (a note), assignment (do this and report back), or result (the answer to one). deliver "wait" puts it in their inbox; deliver "wake" asks Batshit to start a turn for them now and degrades to a wait with a reason if it cannot. Set to "all" to broadcast an info note to every DM-enabled agent (never wakes anybody). Returns the recipient\'s current state.',
+      'Send a DM to another primary agent: info (a note), assignment (do this and report back), or result (the answer to one). deliver "wait" puts it in their inbox; deliver "wake" asks Batshit to start a turn for them now; deliver "steer" lands it inside the reply they are already writing, at their next tool boundary. Both degrade with a reason if they cannot. Set to "all" to broadcast an info note to every DM-enabled agent (wait only). Returns the recipient\'s current state.',
     inputSchema: dmSendControlSchema,
     inputSchemaJson: {
       type: 'object',
@@ -1627,7 +1627,8 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
         requested_outcome: { type: 'string', description: 'Required for assignment: what "done" looks like.' },
         scope: { type: 'string', description: 'Required for assignment: what is in and out of bounds.' },
         report_back_to: { type: 'string', description: 'Required for assignment: the agent id that gets the result.' },
-        deliver: { type: 'string', enum: ['wait', 'wake'], description: 'wait (default behaviour) leaves it in their inbox; wake asks Batshit to start a turn now.' },
+        deliver: { type: 'string', enum: ['wait', 'wake', 'steer'], description: 'wait (default behaviour) leaves it in their inbox; wake asks Batshit to start a turn now; steer lands it inside the reply they are writing right now.' },
+        steer_fallback: { type: 'string', enum: ['wait', 'wake'], description: 'deliver "steer" only: what to do when they are not mid-reply. Default wait.' },
         result_delivery: { type: 'string', enum: ['wait', 'wake'], description: 'assignment only: how the eventual result reaches you. Default wait.' },
         related_dm_id: { type: 'string', description: 'Required for result: the assignment this answers.' },
         expires_in_hours: { type: 'integer', minimum: 1, maximum: 720, description: 'Override the default expiry (7 days for info, 14 for assignment and result).' }
@@ -1635,10 +1636,11 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
       required: ['to', 'kind', 'subject', 'body', 'deliver']
     },
     outputSchema: null,
-    schemaHint: 'to + kind + subject + body + deliver; assignment also needs requested_outcome, scope, report_back_to',
+    schemaHint:
+      'to + kind + subject + body + deliver (wait | wake | steer); assignment also needs requested_outcome, scope, report_back_to',
     riskLevel: 'safe',
     status: 'published',
-    tags: ['dm', 'message', 'agent', 'wake'],
+    tags: ['dm', 'message', 'agent', 'wake', 'steer'],
     handler: async (context, input) =>
       runDmControl(() => sendDmOp(dmControlContext(context), input as never))
   },

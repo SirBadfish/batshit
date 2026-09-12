@@ -1696,6 +1696,7 @@ export class RedisService {
     global_zip_settings?: any,
     global_auto_compact_settings?: any,
     global_tool_grid_settings?: any,
+    global_chat_settings?: any,
     ui_settings?: any,
     admin_settings?: any,
     global_custom_system_prompt?: string,
@@ -1736,6 +1737,11 @@ export class RedisService {
           updates.global_tool_grid_settings !== undefined
             ? updates.global_tool_grid_settings
             : existing?.global_tool_grid_settings,
+        // SA-114 P3 (DL-114-01): the busy-send mode.
+        global_chat_settings:
+          updates.global_chat_settings !== undefined
+            ? updates.global_chat_settings
+            : (existing as any)?.global_chat_settings,
         ui_settings: updates.ui_settings !== undefined ? updates.ui_settings : existing?.ui_settings,
         admin_settings: updates.admin_settings !== undefined ? updates.admin_settings : (existing as any)?.admin_settings,
         global_custom_system_prompt: updates.global_custom_system_prompt !== undefined ? updates.global_custom_system_prompt : existing?.global_custom_system_prompt,

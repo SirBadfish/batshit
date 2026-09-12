@@ -347,7 +347,9 @@ export interface CreateDmInput {
   scope?: string | null
   reportBackTo?: string | null
   relatedDmId?: string | null
-  deliver: 'wait' | 'wake'
+  deliver: 'wait' | 'wake' | 'steer'
+  /** `deliver: 'steer'` only (SA-114 DL-114-13). */
+  steerFallback?: 'wait' | 'wake'
   resultDelivery?: 'wait' | 'wake'
   expiresInHours?: number | null
   senderSessionId?: string | null
@@ -494,6 +496,9 @@ export async function createDm(input: CreateDmInput): Promise<DmRecord> {
       ...(input.reportBackTo?.trim() ? { reportBackTo: input.reportBackTo.trim() } : {}),
       ...(input.relatedDmId?.trim() ? { relatedDmId: input.relatedDmId.trim() } : {}),
       deliver: input.deliver,
+      ...(input.deliver === 'steer'
+        ? { steerFallback: input.steerFallback ?? 'wait' }
+        : {}),
       ...(input.kind === 'assignment'
         ? { resultDelivery: input.resultDelivery ?? 'wait' }
         : {}),
@@ -737,15 +742,112 @@ async function requireOwnedDm(dmId: string, agentId: string): Promise<DmRecord> 
 export async function stampDmDelivery(
   dmId: string,
   patch: Partial<DmRecord['delivery']>
-): Promise<void> {
-  if (!dmId?.trim()) return
+): Promise<boolean> {
+  if (!dmId?.trim()) return false
   const record = await getDm(dmId)
-  if (!record) return
-  await withInboxLock(record.to, async () => {
+  if (!record) return false
+  // SA-114 P4: this returns whether it actually wrote. Every caller before it ignored the
+  // answer, and `degradeMissedDmSteers` cannot — it reports which DMs it degraded, and a
+  // vanished record (the user deleted it, or the reaper expired it, while the turn ran)
+  // would otherwise be reported as stamped. A function that says it wrote when it did not
+  // is the kind of quiet lie this codebase does not keep.
+  return withInboxLock(record.to, async () => {
     const current = await getDm(dmId)
-    if (!current) return
+    if (!current) return false
+    // F-P4-1 (the P4 review): a field stamped `undefined` is REMOVED on write, on both
+    // lanes (JSON serialisation drops it) — which is how a caller clears `sessionId` on a
+    // steer that landed nowhere. Pinned by the "drops a field stamped as undefined" test.
     await writeDm({ ...current, delivery: { ...current.delivery, ...patch } })
+    return true
   })
+}
+
+/**
+ * SA-114 P4 (DL-114-13) — a DM steer that never landed goes back to being a `wait`.
+ *
+ * Called by send-routed at the end of a turn, from the same `finally` that clears the steer
+ * inbox and BEFORE it — once the entries are cleared there is nothing left to read. A
+ * user's steer is promoted into the next message at this point; a DM's is not, because an
+ * agent's text must not start a user turn. So the honest outcome is the one the sender
+ * would have got by asking for `wait` in the first place, with a reason saying what
+ * happened.
+ *
+ * Failures are logged, never thrown: this runs inside a `finally` that is also releasing
+ * the session-turn lock, and a Redis hiccup here must not take that with it. The DM itself
+ * is already written and already in the recipient's inbox — only the `actual`/`reason`
+ * stamp is at stake.
+ */
+export async function degradeMissedDmSteers(
+  entries: Array<{ dmId?: string; source?: string }>,
+  reason: string
+): Promise<string[]> {
+  const stamped: string[] = []
+  for (const entry of entries) {
+    if (entry.source !== 'dm') continue
+    const dmId = typeof entry.dmId === 'string' ? entry.dmId.trim() : ''
+    if (!dmId) continue
+    try {
+      // F-P4-1: it landed nowhere, so it names no chat. `sessionId` was stamped when the
+      // steer was accepted; leaving it would point the drawer at the reply it MISSED.
+      if (await stampDmDelivery(dmId, { actual: 'wait', reason, sessionId: undefined })) {
+        stamped.push(dmId)
+      }
+    } catch (error) {
+      console.warn('[SA-114] Could not degrade a missed DM steer to wait:', {
+        dmId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+  return stamped
+}
+
+/**
+ * The result text an `info` note gets when a STEER delivered it (SA-114 P4 review, F-P4-2).
+ * Beside `WAKE_DELIVERED_INFO_RESULT` for the same reason that one is a constant: the drawer
+ * must not show two wordings for one event.
+ */
+export const STEER_DELIVERED_INFO_RESULT =
+  'Delivered mid-reply, inside a turn that was already running.'
+
+/**
+ * SA-114 P4 review (F-P4-2) — an `info` note the model has just READ mid-reply is no longer
+ * open.
+ *
+ * The wake lane closes a delivered info note at the end of its turn (SA-115 F-P1-2), for the
+ * reason spelled out there: an agent that was handed the note has no reason to go read it
+ * again, so an open one re-lists on every later turn's `DMs:` roster and sits open in the
+ * drawer until it expires. A steer hands the note over just as surely — the transport
+ * confirmed the model has it — so the same rule applies, at the moment of delivery, for the
+ * recipient of the run that delivered it. Assignments and results are untouched: they are
+ * work, not notes, and stay open until claimed and closed.
+ *
+ * Called from send-routed's transcript drain, inside the stream loop, so it must never throw
+ * and never take the stream down with a Redis hiccup: failures are logged per DM.
+ */
+export async function acknowledgeDeliveredDmSteers(
+  entries: Array<{ dmId?: string; source?: string }>,
+  agentId: string
+): Promise<string[]> {
+  const acked: string[] = []
+  for (const entry of entries) {
+    if (entry.source !== 'dm') continue
+    const dmId = typeof entry.dmId === 'string' ? entry.dmId.trim() : ''
+    if (!dmId) continue
+    try {
+      const record = await getDm(dmId)
+      if (!record || record.kind !== 'info' || !isOpenDmStatus(record.status)) continue
+      // Ownership is `acknowledgeInfoDm`'s own rule (`requireOwnedDm` throws), not restated.
+      await acknowledgeInfoDm(dmId, agentId, STEER_DELIVERED_INFO_RESULT)
+      acked.push(dmId)
+    } catch (error) {
+      console.warn('[SA-114] Could not acknowledge a DM steer the model read:', {
+        dmId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+  return acked
 }
 
 /**

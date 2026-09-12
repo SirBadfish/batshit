@@ -13,6 +13,7 @@ import { CodexEventAdapter } from "./codexEventAdapter";
 import { redis } from "$lib/server/redis";
 import {
   buildCodexRuntimeSettings,
+  resolveCodexTransportLane,
   resolveCodexWebSearchMode,
 } from "$lib/server/services/codexSettings";
 import type {
@@ -37,28 +38,11 @@ import {
 import { resolveCliHelperBatshitToken } from "$lib/server/services/cliHelperToken";
 import {
   startCodexAppServerRun,
+  type CodexSteerResult,
   type CodexAppServerThreadParams,
 } from "$lib/server/services/codexAppServerLane";
 
 type CodexRunTransport = "app-server" | "exec";
-
-type CodexTransportLane = "app-server" | "exec";
-
-/**
- * Managed Batshit runs default to the app-server lane so mid-run token usage
- * can drive the proactive context guard. `BATSHIT_CODEX_TRANSPORT=exec` is the
- * documented escape hatch back to one-shot `codex exec --json`. Non-managed
- * scopes (user-profile runs) stay on exec.
- */
-export function resolveCodexTransportLane(
-  options: { configScope?: string | null },
-  processEnv: NodeJS.ProcessEnv = process.env,
-): CodexTransportLane {
-  if (options.configScope !== "managed") return "exec";
-  const override = (processEnv.BATSHIT_CODEX_TRANSPORT ?? "").trim().toLowerCase();
-  if (override === "exec") return "exec";
-  return "app-server";
-}
 
 /**
  * Reuses the exec arg builder as the single source of truth for `--config`
@@ -175,6 +159,15 @@ interface CodexRunner {
   transport: CodexRunTransport;
   events: AsyncGenerator<ThreadEvent>;
   cleanup?: () => void | Promise<void>;
+  /**
+   * SA-114 P2 (DL-114-06) — present only on the app-server lane.
+   *
+   * `exec` writes the prompt and closes stdin (see `runViaCli` below), so it has no channel
+   * left to steer through. Its absence here IS the refusal: send-routed registers a steer
+   * transport only when this exists, and `resolveSteerability` refuses the exec lane before
+   * the user can even try.
+   */
+  steer?: (payload: { steerIds: string[]; text: string }) => Promise<CodexSteerResult>;
 }
 
 function mapCodexRuntimeTransport(transport: CodexRunTransport) {
@@ -726,6 +719,11 @@ export class CodexBridge {
       // deprecated fullStream alias so no reader silently diverges.
       stream: wrappedStream,
       fullStream: wrappedStream,
+      // SA-114 P2 (DL-114-06): the running turn's steer channel, or nothing at all on the
+      // exec lane. send-routed reads it the moment this call resolves — which is exactly
+      // when the child process exists — and registers it as the session's steer transport.
+      __steer: runner.steer ?? null,
+      __steerLane: runner.steer ? ("codex" as const) : null,
       __transport: runner.transport,
       __detectToolSource: adapter.getToolMetadataResolver(),
       __rawEvents: adapter.getRawEvents?.(),
@@ -1218,6 +1216,7 @@ export class CodexBridge {
       transport: "app-server",
       events: run.events,
       cleanup: run.cleanup,
+      steer: run.steer,
     };
   }
 

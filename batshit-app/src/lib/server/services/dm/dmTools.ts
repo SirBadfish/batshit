@@ -26,17 +26,29 @@ import {
   findWakeRunForAgent,
   getWakeRun
 } from '$lib/server/services/wakeRunRegistry'
-import { listActiveSessionTurns } from '$lib/server/services/streamAbortRegistry'
+import {
+  getActiveStream,
+  listActiveSessionTurns
+} from '$lib/server/services/streamAbortRegistry'
+import {
+  enqueueSteer,
+  flushPendingSteersToTransport,
+  getSteerRun
+} from '$lib/server/services/steerInboxRegistry'
+import { waitForStreamRegistration } from '$lib/server/services/steerSetupWait'
+import { STEER_DM_ALREADY_PENDING_REASON } from '$lib/utils/steerControl'
 import {
   DM_DELIVERY_MODES,
   MAX_WAKE_CHAIN_DEPTH,
-  STEER_UNAVAILABLE_REASON,
+  STEER_NO_ACTIVE_TURN_REASON,
   isDeliverableNow,
   resolveAgentDmsEnabled,
   resolveAgentWakeEnabled,
   resolveDmSenderAllowed,
+  resolveDmSteerFallback,
   resolveWakeTarget,
-  type DmDeliveryMode
+  type DmDeliveryMode,
+  type DmSteerFallback
 } from '$lib/utils/dmControl'
 import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
 import { SCHEDULE_TICK_MS, describeNextRun } from '$lib/utils/scheduleControl'
@@ -147,12 +159,31 @@ export function buildWokenDmContent(record: DmRecord): string {
         : `Agent DM — from ${record.from.name}, not from the user`
   const header = `[${source}] ${record.kind}${urgent} — ${record.subject}`
 
-  const lines = [header, '', record.body, '']
+  return [header, '', record.body, '', ...dmDetailLines(record)].join('\n')
+}
+
+function dmDetailLines(record: DmRecord): string[] {
+  const lines: string[] = []
   if (record.requestedOutcome) lines.push(`Requested outcome: ${record.requestedOutcome}`)
   if (record.scope) lines.push(`Scope: ${record.scope}`)
   if (record.reportBackTo) lines.push(`Report back to: ${record.reportBackTo}`)
   lines.push(`DM id: ${record.id}`)
-  return lines.join('\n')
+  return lines
+}
+
+/**
+ * SA-114 P4 (DL-114-13) — the same DM, as a steer.
+ *
+ * Deliberately missing the "not from the user" bracket `buildWokenDmContent` opens with:
+ * `buildSteerInjectionText` wraps every DM steer in `[Agent DM — from <name>, not from the
+ * user, delivered mid-reply]` on its way to the model, and saying it twice would be noise
+ * in the middle of somebody else's reply. Everything else is identical, including the
+ * `DM id:` line — a steered assignment still has to be claimable.
+ */
+export function buildSteeredDmContent(record: DmRecord): string {
+  const urgent = record.priority === 'urgent' ? ', urgent' : ''
+  const header = `${record.kind}${urgent} — ${record.subject}`
+  return [header, '', record.body, '', ...dmDetailLines(record)].join('\n')
 }
 
 /* ------------------------------------------------------------------ *
@@ -324,6 +355,8 @@ export interface SendDmInput {
   scope?: string
   report_back_to?: string
   deliver: DmDeliveryMode
+  /** `deliver: 'steer'` only (DL-114-13): what to do if they are not mid-reply. Default wait. */
+  steer_fallback?: DmSteerFallback
   result_delivery?: 'wait' | 'wake'
   related_dm_id?: string
   expires_in_hours?: number
@@ -331,8 +364,9 @@ export interface SendDmInput {
 
 export interface SendDmResult {
   dm_id: string
-  delivered_as: 'wait' | 'wake'
+  delivered_as: 'wait' | 'wake' | 'steer'
   reason?: string
+  /** The chat a wake started, or the chat a steer landed inside (DL-114-13). */
   session_id?: string
   expires_at: string
   recipient_state: AgentPresenceState
@@ -375,12 +409,15 @@ export async function sendDmOp(
   if (!DM_DELIVERY_MODES.includes(deliver)) {
     throw new DmToolError(
       `"${deliver}" is not a delivery mode.`,
-      'Use wait (it appears in their inbox) or wake (Batshit starts a turn for them now).'
+      'Use wait (it appears in their inbox), wake (Batshit starts a turn for them now), or steer (it lands inside the reply they are writing).'
     )
   }
-  if (!isDeliverableNow(deliver)) {
-    throw new DmToolError(STEER_UNAVAILABLE_REASON)
-  }
+  // SA-114 P4 (DL-114-13): `steer` is no longer refused here. Whether it can be delivered
+  // depends on something this line cannot see — whether the RECIPIENT is mid-reply on a
+  // steerable transport — so `isDeliverableNow` is asked that question further down, once
+  // the recipient is known, and a `false` degrades to the sender's fallback rather than
+  // failing the send. Nothing is ever lost: the DM is written either way.
+  const steerFallback: DmSteerFallback = resolveDmSteerFallback(input.steer_fallback)
 
   if (typeof input.to === 'string' && input.to.trim().toLowerCase() === DM_BROADCAST_RECIPIENT) {
     return broadcastDmOp(context, sender, input)
@@ -415,6 +452,7 @@ export async function sendDmOp(
       reportBackTo: input.report_back_to ?? null,
       relatedDmId: input.related_dm_id ?? null,
       deliver,
+      steerFallback: deliver === 'steer' ? steerFallback : undefined,
       resultDelivery: input.result_delivery,
       expiresInHours: input.expires_in_hours ?? null,
       senderSessionId: context.sessionId ?? null
@@ -423,10 +461,60 @@ export async function sendDmOp(
 
   const recipientState = await resolveRecipientState(context.userId, recipient.id)
 
-  if (deliver !== 'wake') {
+  if (deliver === 'wait') {
     return {
       dm_id: record.id,
       delivered_as: 'wait',
+      expires_at: record.expiresAt,
+      recipient_state: recipientState
+    }
+  }
+
+  // SA-114 P4 (DL-114-13). A steer that lands is done; one that cannot degrades to whatever
+  // the sender asked for, and `wake` there is a real wake — chain depth, the hourly budgets,
+  // the working style, all of it — because it IS one. A steer is not: it spends no wake
+  // budget, starts no session, and writes no user message. It rides a turn that is already
+  // running and already paid for.
+  if (deliver === 'steer') {
+    const steer = await deliverBySteer(context, record, recipient)
+    if (steer.ok) {
+      return {
+        dm_id: record.id,
+        delivered_as: 'steer',
+        session_id: steer.sessionId,
+        expires_at: record.expiresAt,
+        recipient_state: recipientState
+      }
+    }
+    // F-P4-1 (the P4 review): `deliverBySteer` stamps `steer` BEFORE it enqueues, so that
+    // a degrade can only ever come after it. A miss is therefore stamped back here, once,
+    // whatever the fallback — and the chat it was aimed at is cleared with it, because a
+    // steer that landed nowhere names no chat.
+    await stampDmDelivery(record.id, {
+      actual: 'wait',
+      reason: steer.reason,
+      sessionId: undefined
+    })
+    if (steerFallback === 'wait') {
+      return {
+        dm_id: record.id,
+        delivered_as: 'wait',
+        reason: steer.reason,
+        expires_at: record.expiresAt,
+        recipient_state: recipientState
+      }
+    }
+    // The wake carries the steer's reason with it, so the record and the sender's answer
+    // say the same thing: why the steer became a wake, and — if that was refused too — why.
+    const wokenAfterSteer = await deliverByWake(context, record, recipient, {
+      steerReason: steer.reason
+    })
+    return {
+      dm_id: record.id,
+      delivered_as: wokenAfterSteer.ok ? 'wake' : 'wait',
+      ...(wokenAfterSteer.ok
+        ? { session_id: wokenAfterSteer.sessionId, reason: steer.reason }
+        : { reason: wokenAfterSteer.reason }),
       expires_at: record.expiresAt,
       recipient_state: recipientState
     }
@@ -440,6 +528,127 @@ export async function sendDmOp(
     expires_at: record.expiresAt,
     recipient_state: recipientState
   }
+}
+
+/**
+ * SA-114 P4 (DL-114-13) — hand this DM to a reply the recipient is already writing.
+ *
+ * The user's own steers come in through `POST /api/messages/steer`; this is the only other
+ * door, and it is deliberately not an HTTP one — a service-token holder must not be able to
+ * push text into somebody's reply. It ends at the same `enqueueSteer`, so the cap, the
+ * message-id pinning, and the transport push are all the ones the route already proved.
+ *
+ * Three differences from the route, each from the lock:
+ *
+ *   - **No `steer_queued` event.** The route publishes one so the tab that typed can draw
+ *     its bubble. Nobody typed this, and the client renders a DM steer from
+ *     `steer_delivered` instead (P3).
+ *   - **One pending DM steer per recipient turn**, enforced in the registry: several agents'
+ *     notes inside one reply would read as a conversation the user never saw.
+ *   - **Never promoted.** If it does not land before the reply ends, send-routed degrades it
+ *     to `wait` rather than turning it into the user's next message.
+ */
+async function deliverBySteer(
+  context: DmToolContext,
+  record: DmRecord,
+  recipient: Record<string, any>
+): Promise<{ ok: true; sessionId: string } | { ok: false; reason: string }> {
+  // Every Redis read happens in this loop, ABOVE the check-and-enqueue below (F-P1-2). A
+  // reply that finishes while a session is being read must not leave an entry pinned to a
+  // dead assistant id, so the verdict, the live stream and the enqueue are one synchronous
+  // block once a candidate session is known.
+  const candidates: Array<{ sessionId: string; lockedMessageId: string | null }> = []
+  for (const turn of listActiveSessionTurns()) {
+    if (turn.kind !== 'single') continue
+    const session = await redis.getSession(turn.sessionId)
+    if (!session || session.user_id !== context.userId) continue
+    const metadata = (session.metadata ?? {}) as Record<string, any>
+    if (typeof metadata.group_chat?.group_id === 'string') continue
+    const agentId = session.agent_id || metadata.last_agent_id || metadata.agent_id
+    if (agentId !== recipient.id) continue
+    candidates.push({ sessionId: turn.sessionId, lockedMessageId: turn.messageId ?? null })
+  }
+
+  if (candidates.length === 0) {
+    return { ok: false, reason: STEER_NO_ACTIVE_TURN_REASON }
+  }
+
+  const at = new Date().toISOString()
+  let lastReason = STEER_NO_ACTIVE_TURN_REASON
+
+  for (const { sessionId, lockedMessageId } of candidates) {
+    // F-P4-3 (the P4 review): the lock is registered at the top of send-routed and the
+    // stream 1.5–3 s later, after compile. A DM sent in that window was told "not
+    // mid-reply right now" — false, and the same defect F-P3-1 fixed on the user's door.
+    // The wait is the route's own; it ends the moment the stream appears or the lock goes.
+    if (lockedMessageId) {
+      await waitForStreamRegistration(sessionId, lockedMessageId)
+    }
+
+    // F-P4-1 (the P4 review): the "landed" stamp goes down BEFORE the enqueue. Stamped
+    // after it, the stamp raced the end of the reply: the request's `finally` could take
+    // the entry and stamp `wait` first, and this stamp would then overwrite it with
+    // `steer` — "landed mid-reply" on a DM the model never saw. Stamped first, a degrade
+    // can only ever come after it. A candidate that fails below is re-stamped `wait` by
+    // the caller, which also clears this `sessionId`.
+    await stampDmDelivery(record.id, { actual: 'steer', sessionId })
+
+    // ---- synchronous from here to `enqueueSteer` ----
+    const activeStream = getActiveStream(sessionId)
+    const steerRun = getSteerRun(sessionId)
+    if (!activeStream || !steerRun) {
+      lastReason = STEER_NO_ACTIVE_TURN_REASON
+      continue
+    }
+    if (steerRun.messageId !== activeStream.messageId) {
+      lastReason = STEER_NO_ACTIVE_TURN_REASON
+      continue
+    }
+    // The run's own verdict, not a second derivation of it — the same reason the route
+    // reads it rather than re-deriving a transport-dependent answer (AMD-114-05) — asked
+    // through `isDeliverableNow`, which is THE rule for "can this mode be delivered right
+    // now" on both DM doors.
+    const hasSteerableTurn = Boolean(steerRun.steerable && steerRun.lane)
+    if (!isDeliverableNow('steer', { hasSteerableTurn })) {
+      lastReason = steerRun.reason ?? STEER_NO_ACTIVE_TURN_REASON
+      continue
+    }
+
+    const enqueued = enqueueSteer(sessionId, {
+      steerId: record.id,
+      messageId: activeStream.messageId,
+      text: buildSteeredDmContent(record),
+      at,
+      source: 'dm',
+      dmId: record.id,
+      label: record.from.name
+    })
+
+    if (!enqueued.ok) {
+      lastReason =
+        enqueued.code === 'steer_dm_pending'
+          ? STEER_DM_ALREADY_PENDING_REASON
+          : enqueued.reason
+      continue
+    }
+
+    // Fire-and-forget for the same reason the route does it (a `turn/steer` round trip has a
+    // 120-second ceiling): the server already owns the text, and a refused write returns it
+    // to the inbox where the end of the turn degrades it to `wait`.
+    void flushPendingSteersToTransport(sessionId, activeStream.messageId).then((result) => {
+      if (result.reason === 'refused') {
+        console.warn('[SA-114] A managed CLI refused a DM steer; it will degrade to wait', {
+          sessionId,
+          dmId: record.id,
+          error: result.error ?? null
+        })
+      }
+    })
+
+    return { ok: true, sessionId }
+  }
+
+  return { ok: false, reason: lastReason }
 }
 
 /**
@@ -466,10 +675,15 @@ async function broadcastDmOp(
       'Send an assignment to one agent so somebody owns it and reports back.'
     )
   }
-  if (input.deliver === 'wake') {
+  if (input.deliver !== 'wait') {
+    // SA-114 P4 widened this from `=== 'wake'` to "anything but wait", which is the rule the
+    // lock always meant: a broadcast must not start N turns, and for the same reason it must
+    // not land inside N replies at once. Writing the positive rule rather than a carve-out
+    // against one exception is SA-115's lesson (`sameSender`) — a carve-out breaks silently
+    // the moment a third value exists, which is exactly what happened here.
     throw new DmToolError(
-      'A broadcast to "all" cannot wake anybody.',
-      'Send it as deliver: "wait" — it appears in every inbox on their next turn — or wake one agent by id.'
+      `A broadcast to "all" cannot ${input.deliver} anybody.`,
+      'Send it as deliver: "wait" — it appears in every inbox on their next turn — or wake or steer one agent by id.'
     )
   }
 
@@ -588,11 +802,20 @@ async function loadDmAddressableAgent(
 async function deliverByWake(
   context: DmToolContext,
   record: DmRecord,
-  recipient: Record<string, any>
+  recipient: Record<string, any>,
+  options: {
+    /**
+     * SA-114 F-P4-1: set when this wake is a steer's fallback. A refusal's reason is
+     * prefixed with it, so the record and the sender's answer never disagree about why the
+     * steer became a wake and why that wake did not start.
+     */
+    steerReason?: string
+  } = {}
 ): Promise<{ ok: true; sessionId: string } | { ok: false; reason: string }> {
+  const reasonPrefix = options.steerReason ? `${options.steerReason} ` : ''
   const chainDepth = await resolveSessionChainDepth(context.sessionId)
   if (chainDepth >= MAX_WAKE_CHAIN_DEPTH) {
-    const reason = `This wake-up chain is already ${chainDepth} deep and Batshit stops at ${MAX_WAKE_CHAIN_DEPTH}.`
+    const reason = `${reasonPrefix}This wake-up chain is already ${chainDepth} deep and Batshit stops at ${MAX_WAKE_CHAIN_DEPTH}.`
     await stampDmDelivery(record.id, { actual: 'wait', reason })
     return { ok: false, reason }
   }
@@ -638,10 +861,14 @@ async function deliverByWake(
   })
 
   if (!result.ok) {
-    await stampDmDelivery(record.id, { actual: 'wait', reason: result.reason })
-    return { ok: false, reason: result.reason }
+    const reason = `${reasonPrefix}${result.reason}`
+    await stampDmDelivery(record.id, { actual: 'wait', reason })
+    return { ok: false, reason }
   }
 
+  // A steer's reason, when there is one, is already on the record (the caller stamped the
+  // miss before falling back here) and this merge keeps it: the drawer then says both that
+  // the chat was woken and why the steer became a wake.
   await stampDmDelivery(record.id, { actual: 'wake', sessionId: result.sessionId })
   return { ok: true, sessionId: result.sessionId }
 }

@@ -276,3 +276,39 @@
   background: currentColor;
   transform: translate(-50%, -50%);
 }
+
+/* SA-114 (DL-114-04) — a steer, shown inside the reply it landed in.
+   A small user bubble at the exact spot the words arrived. It reuses the chat's own
+   user-message tokens rather than inventing a tone, so "this was me" reads instantly.
+   Emitted as HTML by `formatSteerForUser`, the same path the skill pill above uses. */
+.batshit-markdown .batshit-steer-inset {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  max-width: 100%;
+  margin: 0.75rem 0;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid oklch(0.63 0.05 281.84 / 0.45);
+  border-radius: var(--radius);
+  background: var(--message-user-background);
+  color: var(--message-user-foreground);
+}
+
+.batshit-markdown .batshit-steer-inset.is-dm {
+  border-color: oklch(from var(--muted-foreground) l c h / 0.35);
+  background: oklch(0.19 0.02 279.23 / 0.75);
+  color: var(--neutral-100);
+}
+
+.batshit-markdown .batshit-steer-inset-label {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  opacity: 0.75;
+}
+
+.batshit-markdown .batshit-steer-inset-text {
+  min-width: 0;
+  font-weight: 300;
+  overflow-wrap: anywhere;
+}

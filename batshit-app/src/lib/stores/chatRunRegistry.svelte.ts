@@ -22,6 +22,19 @@ export type SessionRunState = {
    */
   owner?: 'client' | 'server'
   transport?: ChatRunTransport
+  /**
+   * SA-114 P3 (DL-114-09): can the reply running in this chat be steered, and if not, why?
+   *
+   * The SERVER decides (`resolveSteerability` at the moment it registers the run — a Codex
+   * run's answer depends on the transport lane it actually got) and the client only reports
+   * it. It arrives on the `start` event for a chat the user is watching, and on
+   * `session_run_status` for a turn Batshit started on its own. `null` means "not told yet",
+   * which is not the same as `false`: the send button treats an unknown answer as steerable
+   * and lets the route's 409 be the backstop, because the alternative is labelling every
+   * reply "Interrupt and send" for the moment before `start` lands.
+   */
+  steerable?: boolean | null
+  steerReason?: string | null
   activeMessageId?: string | null
   activeStreamMessageIds: string[]
   abortController?: AbortController | null
@@ -36,6 +49,8 @@ function createIdleRunState(sessionId: string): SessionRunState {
     sessionId,
     status: 'idle',
     owner: 'client',
+    steerable: null,
+    steerReason: null,
     activeMessageId: null,
     activeStreamMessageIds: [],
     abortController: null,
@@ -131,6 +146,15 @@ export function startRun(params: {
 export function applyServerRunStatus(params: {
   sessionId: string
   status: 'running' | 'tooling' | 'complete' | 'failed' | 'stopped'
+  /** SA-114 P3 (DL-114-09): send-routed publishes these once the run's transport is known. */
+  steerable?: boolean | null
+  steerReason?: string | null
+  /**
+   * F-P3-2: the ASSISTANT message the server-started reply is writing. A steer is aimed at
+   * that id, and a tab that did not start the reply otherwise learns it only from the
+   * `start` event — which the API lane sends with its first chunk, seconds later.
+   */
+  messageId?: string | null
 }) {
   const normalized = normalizeSessionId(params.sessionId)
   if (!normalized) return
@@ -141,10 +165,22 @@ export function applyServerRunStatus(params: {
   if (current.owner === 'client' && isRunActive(current)) return
 
   if (params.status === 'running' || params.status === 'tooling') {
+    const serverMessageId =
+      typeof params.messageId === 'string' && params.messageId.trim()
+        ? params.messageId.trim()
+        : (current.activeMessageId ?? null)
     setRunState(normalized, {
       ...createIdleRunState(normalized),
       owner: 'server',
-      status: params.status === 'tooling' ? 'tooling' : 'streaming'
+      status: params.status === 'tooling' ? 'tooling' : 'streaming',
+      activeMessageId: serverMessageId,
+      activeStreamMessageIds: serverMessageId ? [serverMessageId] : [],
+      // `requestAgentWakeup` publishes `running` before the transport is known, so its
+      // event carries no verdict; send-routed publishes a second `running` once the run is
+      // registered. An absent field must therefore keep whatever the last one said rather
+      // than resetting to "not told yet".
+      steerable: params.steerable ?? current.steerable ?? null,
+      steerReason: params.steerReason ?? current.steerReason ?? null
     })
     return
   }
