@@ -35,7 +35,7 @@ import {
  * both win.
  *
  * Every test in here was checked the way SA-115's were: revert the fix, watch it go red.
- * The mutation log is in `_local/sa116/p1/P1-EVIDENCE.md`.
+ * The mutation log is in the story's private evidence.
  */
 
 useRedisTestServer()

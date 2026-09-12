@@ -211,7 +211,7 @@ describe('DL-117-05: which lanes can vouch for an agent identity', () => {
   it('lets a signed-in browser act as one of the user\'s own agents (F-P2-4)', () => {
     // The session lane IS the user, and the user is the authority over the user's agents:
     // `/api/dms` lists every agent's inbox and `/api/schedules` creates a schedule for any
-    // agent on this same cookie, and the MegaSmoke harness drives the SA-113 DM rows and the
+    // agent on this same cookie, and the dev smoke harness drives the SA-113 DM rows and the
     // SA-115 schedule rows through `/api/controls/use` on it. Refusing it here closed nothing
     // a cookie holder could not do one route over, and broke those rows. The audit still
     // records the lane as `session`, so "the user acted as Cooper" stays readable.

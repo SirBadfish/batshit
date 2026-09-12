@@ -11,7 +11,7 @@
  *
  *   - packaged Mac app: the runtime supervisor polls `/` every 5 seconds, forever.
  *   - Docker Compose: the healthcheck fetches `/api/health` every 10 seconds, forever.
- *   - source checkout: `start-all.sh` waits on `/` (and on `/api/health`) during startup.
+ *   - source checkout: the dev launcher waits on `/` (and on `/api/health`) during startup.
  *
  * The one honest gap is `npm run dev` started by hand with no launcher and no tab open.
  * That is a developer-only case; it is recorded rather than fixed.
@@ -79,7 +79,7 @@ export interface ScheduleSweepReport {
 }
 
 /**
- * One sweep. Exported so the internal trigger route (DL-115-13) and the MegaSmoke row can
+ * One sweep. Exported so the internal trigger route (DL-115-13) and the dev smoke row can
  * prove a fire, a late fire, and a missed-run collapse without waiting a minute or a day.
  *
  * Schedules are handled **one at a time**: a fire can start a whole agent turn, and three

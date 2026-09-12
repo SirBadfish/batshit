@@ -125,14 +125,14 @@ describe('/api/cli-tools/execute — where a cli: pause pins its card', () => {
         toolId: 'repo_snapshot',
         input: { query: 'x' },
         sessionId: 'session-1',
-        projectPath: '/Users/josh/batshit'
+        projectPath: '/tmp/example-project'
       }),
       locals: {}
     } as any)
 
     const params = mocks.executeCliTool.mock.calls[0][0]
     expect(params.agentId).toBe('agent-cooper')
-    expect(params.projectPath).toBe('/Users/josh/batshit')
+    expect(params.projectPath).toBe('/tmp/example-project')
   })
 
   it('refuses a body agentId that differs from the bound one', async () => {

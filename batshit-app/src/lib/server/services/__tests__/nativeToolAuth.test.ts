@@ -30,7 +30,7 @@ import { resolveNativeToolUser } from '../nativeToolAuth'
 
 useRedisTestServer()
 
-const SERVICE_TOKEN = 'sa117-instance-token-at-least-32-chars-long'
+const SERVICE_TOKEN = 'test-service-token-0123456789abcdef0123456789abcdef'
 const USER = 'user-lane'
 const COOPER = 'agent-cooper'
 

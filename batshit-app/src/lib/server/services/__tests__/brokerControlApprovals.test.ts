@@ -18,7 +18,7 @@ import { buildControlErrorDcmLines } from '$lib/utils/controlTags'
  * SA-116 P2 (AMD-116-01, F-P1-4) — the two ends of an API-lane approval.
  *
  * The claims here are about WHO decides which consent record gets spent, so the mutations
- * behind them are in `_local/sa116/p2/P2-EVIDENCE.md`.
+ * behind them are in the story's private evidence.
  */
 
 useRedisTestServer()

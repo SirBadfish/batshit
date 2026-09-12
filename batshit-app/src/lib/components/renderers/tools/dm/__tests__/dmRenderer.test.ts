@@ -35,7 +35,7 @@ const liveWaitSend = {
     target: 'sys.dm.send',
     input: {
       ref: 'fabric:sys.dm.send',
-      to: 'megasmoke_openai_api_primary',
+      to: 'demo_openai_api_primary',
       kind: 'info',
       subject: 'P4 card check',
       body: 'Just checking the tool card renders.',
@@ -65,7 +65,7 @@ describe('DmRenderer', () => {
       expect(screen.getByText(/Agent DM · Send/)).toBeTruthy()
     })
     // The subtitle is the whole point of a DM card: who it went to and what happened.
-    expect(screen.getByText(/to megasmoke_openai_api_primary · info · waiting in inbox/)).toBeTruthy()
+    expect(screen.getByText(/to demo_openai_api_primary · info · waiting in inbox/)).toBeTruthy()
   })
 
   it('shows WHY a requested wake became a wait — the line a generic card buries', async () => {

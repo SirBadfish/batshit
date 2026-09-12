@@ -3855,7 +3855,7 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
   })
 
   it('lets a signed-in browser act as one of the user\'s own agents (F-P2-4)', async () => {
-    // The MegaSmoke harness reads and closes DMs as a named agent on the login cookie, and
+    // The dev smoke harness reads and closes DMs as a named agent on the login cookie, and
     // `/api/dms` and `/api/schedules` already act across every agent on that same cookie. A
     // session is the user; the user is the authority over the user's agents. The refusal is
     // for a caller that only HOLDS a token — the instance token or a Portable Skill Token.

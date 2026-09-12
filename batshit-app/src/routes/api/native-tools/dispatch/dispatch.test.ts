@@ -459,14 +459,14 @@ describe('/api/native-tools/dispatch', () => {
       request: request({
         action: 'bash_execute',
         input: { command: 'echo hi' },
-        projectPath: '/Users/josh/batshit',
+        projectPath: '/tmp/example-project',
         context: { session_id: 'session-bound', mode: 'mode4', actor_type: 'primary' }
       }),
       locals: {}
     } as any)
 
     expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(
-      expect.objectContaining({ projectPath: '/Users/josh/batshit' })
+      expect.objectContaining({ projectPath: '/tmp/example-project' })
     )
   })
 

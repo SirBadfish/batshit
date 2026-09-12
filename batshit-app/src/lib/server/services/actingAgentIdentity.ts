@@ -29,7 +29,7 @@
  * | `n8n-callback` | yes | A per-message token scoped to one run, and DL-117-05 keeps `context.agent_id` as it is; the DM, memory and schedule families are closed to subagents anyway. |
  * | `service` | **no** | The instance token names nobody (DL-117-05). |
  * | `portable-skill` | **no** | Scoped to a USER and a family list; it never names an agent, so it has no agent to act as. |
- * | `session` | yes | A signed-in browser IS the user, and the user is the authority over the user's own agents: `/api/dms` lists every agent's inbox and `/api/schedules` creates a schedule for any agent on this same cookie, and the MegaSmoke harness drives the SA-113 DM rows and the SA-115 schedule rows through `/api/controls/use` on it. Refusing it here closed nothing a cookie holder could not do one route over (F-P2-4). The audit records the lane as `session`, so "the user acted as Cooper" stays readable. |
+ * | `session` | yes | A signed-in browser IS the user, and the user is the authority over the user's own agents: `/api/dms` lists every agent's inbox and `/api/schedules` creates a schedule for any agent on this same cookie, and the dev smoke harness drives the SA-113 DM rows and the SA-115 schedule rows through `/api/controls/use` on it. Refusing it here closed nothing a cookie holder could not do one route over (F-P2-4). The audit records the lane as `session`, so "the user acted as Cooper" stays readable. |
  *
  * AMD-117-01 is why no lane here carries a legacy carve-out: Josh confirmed there are no old
  * n8n workflows presenting the instance token, so a shape whose only purpose was keeping such
