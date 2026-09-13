@@ -152,7 +152,8 @@
     classifySteerRefusal,
     resolveBusySendMode,
     resolveEffectiveBusySendMode,
-    type BusySendMode
+    type BusySendMode,
+    type EffectiveBusySendMode
   } from '$lib/utils/steerControl'
   import * as steerInbox from '$lib/stores/steerInbox.svelte'
   import { stripGatewayPrefix } from '$lib/utils/toolNameFormatter'
@@ -2156,7 +2157,17 @@ const immersiveActive = $derived.by(
   // Initialize on mount
   onMount(() => {
     const unsubscribeSession = sessionStore.subscribe((state) => {
+      const leavingSessionId = currentSessionIdState
       currentSessionIdState = state.currentSessionId
+      // SA-118 (DL-118-08): the one chokepoint every session change passes through. A
+      // `dropped` bubble in the chat being LEFT has already told the user their steer was
+      // not sent, and it used to come back every time they returned to that chat. Only
+      // `dropped` is cleared, and only for the session being left: a `queued` or `waiting`
+      // bubble belongs to a reply that is still running, and losing it on navigation would
+      // take away the only sign that a steer is still pending.
+      if (leavingSessionId && leavingSessionId !== state.currentSessionId) {
+        steerInbox.clearDroppedSteersForSession(leavingSessionId)
+      }
     })
 
     ;(async () => {
@@ -4635,6 +4646,13 @@ const immersiveActive = $derived.by(
         trustedClipIds: collectTrustedClipIdsFromMetadata(metadata)
       })
 
+      // SA-118 (DL-118-08): a "Not sent — you stopped the reply" bubble is a receipt, and
+      // the user acting again is what it was waiting for. Cleared HERE — after the empty
+      // and duplicate guards, so a stray keypress does not wipe it, and before the steer
+      // branch, so this send's own bubble is never the one removed. Only `dropped` goes:
+      // a `queued` or `waiting` bubble belongs to a reply that is still running.
+      steerInbox.clearDroppedSteersForSession(sendSessionId)
+
       // SA-114 P3 (DL-114-11, AMD-114-07): a send stops any speech still playing — UNLESS
       // it turns out to be a steer, which does not stop the reply and so must not stop its
       // voice. The decision needs the session, the agent and the run's steerability, none
@@ -4846,7 +4864,12 @@ const immersiveActive = $derived.by(
 	    // The SAME rule the send button read, so the two cannot disagree: a lane the server
 	    // has already told us cannot be steered resolves to `interrupt` here too, and the user
 	    // gets the interrupt straight away instead of a round trip and a toast.
-	    const effectiveBusySendMode: BusySendMode = resolveEffectiveBusySendMode({
+	    // SA-118 (DL-118-09): `carriesAttachments` is deliberately NOT passed. The wait
+	    // branch below is chosen by `sendCarriesAttachments`, read from the metadata this
+	    // send is about to post; handing the same fact to the rule here would make this
+	    // read `'wait'`, fail the `=== 'steer'` test, and silently retire that branch. The
+	    // BUTTON passes it, because only the button has to say so before it happens.
+	    const effectiveBusySendMode: EffectiveBusySendMode = resolveEffectiveBusySendMode({
 	      mode: busySendOverride ?? busySendMode,
 	      steerable: activeGroupId ? false : chatRunRegistry.getRunState(currentSessionId).steerable
 	    })

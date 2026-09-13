@@ -9,7 +9,7 @@ import { normalizeId } from '$lib/utils/idNormalizer'
 import { stripZipControlBlocks } from '$lib/utils/zipControl'
 import {
   expandSteerPlaceholders,
-  formatSteerForAI,
+  formatSteerForModel,
   formatSteerForUser,
   readMessageSteers,
   type DeliveredSteer
@@ -486,7 +486,7 @@ export async function compileForAI(
   compiled = expandSteerPlaceholders(
     compiled,
     readMessageSteers(_message),
-    formatSteerForAI
+    formatSteerForModel
   )
 
   // Tell the model when this response never completed, so it does not treat

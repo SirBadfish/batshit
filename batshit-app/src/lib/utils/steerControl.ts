@@ -46,6 +46,27 @@ export const STEER_DM_ALREADY_PENDING_REASON =
  */
 export type BusySendMode = 'steer' | 'interrupt'
 
+/**
+ * DL-118-09 — what a send is ACTUALLY about to do, which is one word wider than the setting.
+ *
+ * `wait` is not a third setting and never appears in `BusySendMode`: it is what a steer
+ * BECOMES when the composer carries files. DL-114-10 has always held those back until the
+ * reply ends — the steer route cannot carry a clip or a `metadata.fileReferences` entry —
+ * but the button went on saying **Steer** and promising the words would "land inside this
+ * reply" (PR #106 review F-25). The behaviour is the accepted one; only the label was
+ * lying.
+ */
+export type EffectiveBusySendMode = BusySendMode | 'wait'
+
+/**
+ * The one sentence a held send gets, wherever it is shown (DL-118-09).
+ *
+ * The bubble the same click draws has said this since SA-114 P3. The button's tooltip now
+ * says it too, from here, so the two cannot drift into two different promises about one
+ * behaviour.
+ */
+export const WAIT_SEND_SENTENCE = 'With files: waits for the reply to finish'
+
 /** Josh's call (2026-09-07): steer is the default, interrupt stays one click away. */
 export const DEFAULT_BUSY_SEND_MODE: BusySendMode = 'steer'
 
@@ -89,12 +110,17 @@ export function normalizeGlobalChatSettings(value: unknown): GlobalChatSettings 
  * one-off has to be able to steer, or the shortcut would be dead for anyone who flipped
  * the default.
  */
-export function otherBusySendMode(mode: BusySendMode): BusySendMode {
+export function otherBusySendMode(mode: EffectiveBusySendMode): BusySendMode {
+  // DL-118-09: the other way out of a held send is to stop the reply — Cmd/Ctrl+Enter
+  // still interrupts. "The other way" cannot be `steer` here: this send carries files, and
+  // a steer that carries files is precisely what `wait` already is.
+  if (mode === 'wait') return 'interrupt'
   return mode === 'steer' ? 'interrupt' : 'steer'
 }
 
-/** The send button's label while the agent is busy (DL-114-01). */
-export function busySendModeLabel(mode: BusySendMode): string {
+/** The send button's label while the agent is busy (DL-114-01, DL-118-09). */
+export function busySendModeLabel(mode: EffectiveBusySendMode): string {
+  if (mode === 'wait') return 'Send after reply'
   return mode === 'steer' ? 'Steer' : 'Interrupt and send'
 }
 
@@ -114,9 +140,21 @@ export function busySendModeLabel(mode: BusySendMode): string {
 export function resolveEffectiveBusySendMode(input: {
   mode: BusySendMode
   steerable?: boolean | null
-}): BusySendMode {
+  /**
+   * DL-118-09 — clips or `@file` mentions in the composer. OMITTED by the send path on
+   * purpose: `+page.svelte` reads the same two things itself, at send time, from the
+   * metadata it is about to post (`sendCarriesAttachments`), and then picks the wait branch
+   * on `steerBranchEligible && sendCarriesAttachments`. Passing it there would make the
+   * page's `=== 'steer'` test false and silently retire that branch. Only the BUTTON passes
+   * it, because only the button has to say what is about to happen before it happens.
+   */
+  carriesAttachments?: boolean
+}): EffectiveBusySendMode {
   if (input.mode === 'interrupt') return 'interrupt'
-  return input.steerable === false ? 'interrupt' : 'steer'
+  // A reply the server says cannot be steered is an interrupt whatever the composer holds:
+  // there is no reply to wait inside of, and this is the order `+page.svelte` takes too.
+  if (input.steerable === false) return 'interrupt'
+  return input.carriesAttachments ? 'wait' : 'steer'
 }
 
 /** Where a steer came from. A DM steer is labelled as not from the user (DL-114-13, P4). */
@@ -219,11 +257,23 @@ export function readMessageSteers(message: unknown): DeliveredSteer[] {
 }
 
 /**
- * The AI view of a delivered steer (DL-114-04). A user steer reads as the user's own words
- * so the agent honours it; a DM steer is explicitly marked as NOT from the user, because an
- * agent's text must never be mistaken for an instruction from Josh.
+ * The AI view of one steer (DL-114-04, DL-118-07). A user steer reads as the user's own
+ * words so the agent honours it; a DM steer is explicitly marked as NOT from the user,
+ * because an agent's text must never be mistaken for an instruction from Josh.
+ *
+ * **This is the only wrapper.** Until SA-118 there were two: this spelling for the history
+ * replay, and `[Steer — from the user, mid-reply]\n…` for the live delivery on all three
+ * lanes. The guidance taught only this one — so at the single moment "outranks what you
+ * were told earlier" is meant to apply, the model was reading a label it had never been
+ * taught, and met the taught one a turn later in the replay (PR #106 review F-15). This
+ * spelling won because it is the one on three surfaces and in every stored turn.
+ *
+ * The guidance is not a copy of this text: `toolPromptInjection.ts` builds its sentence
+ * from `STEER_WRAPPER_GUIDANCE_EXAMPLES`, which this function produces. The two packaged
+ * `docs/batshit_System_Prompts/batshit_tool_prompt_zip_control_*.md` files are the same
+ * words by hand, and `toolPromptInjection.test.ts` fails if any surface drifts.
  */
-export function formatSteerForAI(steer: DeliveredSteer): string {
+export function formatSteerForModel(steer: SteerEntry): string {
   const text = steer.text.trim()
   if (steer.source === 'dm') {
     const from = (steer.label ?? '').trim() || 'another agent'
@@ -231,6 +281,32 @@ export function formatSteerForAI(steer: DeliveredSteer): string {
   }
   return `[The user said, mid-reply: ${text}]`
 }
+
+/**
+ * The two wrappers, with `...` where the words go — what every surface that teaches the
+ * model about a mid-reply line must quote (DL-118-07).
+ *
+ * Derived from `formatSteerForModel` rather than written out, so the guidance cannot say
+ * one thing while the delivery does another. `<name>` stands in for the sender because the
+ * guidance is describing a shape, not one DM.
+ */
+export const STEER_WRAPPER_GUIDANCE_EXAMPLES = {
+  user: formatSteerForModel({
+    steerId: 'example',
+    messageId: 'example',
+    at: '',
+    source: 'user',
+    text: '...'
+  }),
+  dm: formatSteerForModel({
+    steerId: 'example',
+    messageId: 'example',
+    at: '',
+    source: 'dm',
+    label: '<name>',
+    text: '...'
+  })
+} as const
 
 /**
  * The user view of a delivered steer: the inset bubble, at the spot it arrived (DL-114-04).
@@ -389,26 +465,19 @@ export function resolveSteerability(input: {
 }
 
 /**
- * The text a lane hands to the model for one delivery (DL-114-05).
+ * The text a lane hands to the model for one delivery (DL-114-05, DL-118-07).
  *
  * All three transports send the same wrapper so an agent sees one shape whatever it is
  * running on: the API lane injects it as a user message, Codex sends it as a `turn/steer`
- * text item (P2), and Claude writes it as a second stream-json user line (P2).
+ * text item (P2), and Claude writes it as a second stream-json user line (P2). Since
+ * SA-118 that wrapper is also the one the history replay uses and the one the guidance
+ * teaches — `formatSteerForModel`, and nothing else.
  *
  * Several steers that arrive before the same boundary are joined into ONE message, in
  * acceptance order, because they are one interruption from the user's point of view.
  */
 export function buildSteerInjectionText(steers: SteerEntry[]): string {
-  return steers
-    .map((steer) => {
-      const text = steer.text.trim()
-      if (steer.source === 'dm') {
-        const from = (steer.label ?? '').trim() || 'another agent'
-        return `[Agent DM — from ${from}, not from the user, delivered mid-reply]\n${text}`
-      }
-      return `[Steer — from the user, mid-reply]\n${text}`
-    })
-    .join('\n\n')
+  return steers.map(formatSteerForModel).join('\n\n')
 }
 
 /**

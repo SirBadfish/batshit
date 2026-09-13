@@ -117,9 +117,10 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     defaultFile: 'batshit_tool_prompt_zip_control_enabled.md',
     // Bumped for SA-114 P4 (DL-114-16): a steer arrives as an ordinary injected user
     // message at a tool boundary, so without this sentence nothing tells an agent that
-    // `[The user said, mid-reply: ...]` is the user and `[Agent DM - ... not from the
-    // user ...]` is not.
-    defaultVersion: '2026-09-11'
+    // `[The user said, mid-reply: ...]` is the user and `[Agent DM — ... not from the
+    // user ...]` is not. Bumped again for SA-118 (DL-118-07): the DM bracket was taught
+    // with a hyphen and emitted with an em dash, so the taught spelling never matched.
+    defaultVersion: '2026-09-12'
   },
   {
     id: 'tool_guidance_zip_disabled',
@@ -128,8 +129,9 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected when tool prompting is needed and Zip Control is disabled for the agent.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_zip_control_disabled.md',
-    // Bumped for SA-114 P4 (DL-114-16), same sentence as the enabled variant.
-    defaultVersion: '2026-09-11'
+    // Bumped for SA-114 P4 (DL-114-16) and again for SA-118 (DL-118-07), same sentence
+    // as the enabled variant.
+    defaultVersion: '2026-09-12'
   },
   {
     id: 'tool_guidance_memory',

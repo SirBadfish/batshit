@@ -175,9 +175,9 @@ function dmDetailLines(record: DmRecord): string[] {
  * SA-114 P4 (DL-114-13) — the same DM, as a steer.
  *
  * Deliberately missing the "not from the user" bracket `buildWokenDmContent` opens with:
- * `buildSteerInjectionText` wraps every DM steer in `[Agent DM — from <name>, not from the
- * user, delivered mid-reply]` on its way to the model, and saying it twice would be noise
- * in the middle of somebody else's reply. Everything else is identical, including the
+ * `formatSteerForModel` wraps every DM steer in `[Agent DM — from <name>, not from the
+ * user, delivered mid-reply: ...]` on its way to the model, and saying it twice would be
+ * noise in the middle of somebody else's reply. Everything else is identical, including the
  * `DM id:` line — a steered assignment still has to be claimable.
  */
 export function buildSteeredDmContent(record: DmRecord): string {

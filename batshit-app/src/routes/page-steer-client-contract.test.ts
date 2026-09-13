@@ -136,10 +136,56 @@ describe('the client send path (SA-114 P3)', () => {
 
 describe('the send button (SA-114 P3)', () => {
   it('reads one rule for the label and offers the shortcut only when it works', () => {
-    expect(chatInput).toContain('resolveEffectiveBusySendMode({ mode: busySendMode, steerable })')
+    expect(chatInput).toContain('resolveEffectiveBusySendMode({')
     expect(chatInput).toContain('busySendModeLabel(busyEffectiveSendMode)')
     // A reply that cannot be steered must not advertise a key that does nothing.
     expect(chatInput).toContain('const shortcutHint = steerable')
+  })
+
+  /**
+   * SA-118 (DL-118-09) — PR #106 review F-25.
+   *
+   * With a clip attached and the agent busy, the button read **Steer** and its tooltip
+   * promised the words would "land inside this reply", while `+page.svelte` took the wait
+   * branch and sent them after the reply ended. The wait behaviour is DL-114-10 and is not
+   * in question; only the label was lying. So the claim below is that the BUTTON and the
+   * SEND read the same two facts — clips, and `@file` mentions — and it is the reason this
+   * file exists: they live 4,600 lines apart in two different components.
+   */
+  it('F-25: the button and the send read the same two attachment facts', () => {
+    const buttonRule = chatInput.indexOf('const composerCarriesAttachments = $derived.by(')
+    expect(buttonRule).toBeGreaterThan(-1)
+    const buttonBody = chatInput.slice(buttonRule, buttonRule + 500)
+    expect(buttonBody).toContain('composerClippedItems.length > 0')
+    expect(buttonBody).toContain('mapMentionsToFileReferences(')
+    // The same exclusions the SEND path passes, not the narrower highlighter list — or the
+    // button and the send could disagree about whether one mention counts.
+    expect(buttonBody).toContain('activeMentionExclusions')
+    expect(chatInput).toContain('carriesAttachments: composerCarriesAttachments')
+
+    const sendRule = page.indexOf('const sendCarriesAttachments =')
+    expect(sendRule).toBeGreaterThan(-1)
+    const sendBody = page.slice(sendRule, sendRule + 300)
+    expect(sendBody).toContain('collectTrustedClipIdsFromMetadata(metadata)')
+    expect(sendBody).toContain('metadata?.fileReferences')
+
+    // And the send path must NOT pass the flag: `steerBranchEligible` tests
+    // `=== 'steer'`, so a page that resolved `'wait'` would silently retire its own wait
+    // branch and send a clip through the steer route instead.
+    const pageRule = page.indexOf('const effectiveBusySendMode: EffectiveBusySendMode =')
+    expect(pageRule).toBeGreaterThan(-1)
+    expect(page.slice(pageRule, pageRule + 320)).not.toContain('carriesAttachments')
+    expect(page).toContain("effectiveBusySendMode === 'steer'")
+  })
+
+  it('F-25: the held send carries the label and the sentence, not a fourth wording', () => {
+    // The tooltip's sentence comes from `steerControl`, which is where the bubble the same
+    // click draws gets it. One behaviour, one promise.
+    expect(chatInput).toContain('WAIT_SEND_SENTENCE')
+    expect(chatInput).toContain("if (busyEffectiveSendMode === 'wait')")
+    expect(chatInput).not.toContain("'Send after reply'")
+    // The attribute a live proof and a future test can read the effective mode off.
+    expect(chatInput).toContain('data-busy-send-mode={composerBusy ? busyEffectiveSendMode : undefined}')
   })
 
   it('sends the OTHER mode on Cmd/Ctrl+Enter, and only while busy (DL-114-01)', () => {
@@ -171,5 +217,45 @@ describe('PR #106 review — the client steer contracts that were missing', () =
     const definition = page.indexOf('const sendCarriesAttachments =')
     expect(definition).toBeGreaterThan(-1)
     expect(page.slice(definition, definition + 300)).toContain('metadata?.fileReferences')
+  })
+})
+
+/**
+ * SA-118 (DL-118-08) — PR #106 review F-24.
+ *
+ * Nothing in production cleared a `dropped` steer, so the "Not sent — you stopped the
+ * reply" bubble sat under every later exchange in that chat and came back each time the
+ * chat was reopened. Two call sites fix it, and the thing that must NOT happen is the
+ * reason both are pinned here: a `queued` or `waiting` bubble belongs to a reply that is
+ * still running, and it is the only sign the user has that a steer is pending.
+ */
+describe('the dropped steer bubble (SA-118, DL-118-08)', () => {
+  it('is cleared by the next send in that chat, before the steer branch', () => {
+    const handler = page.indexOf('async function handleSendMessage(')
+    const clearCall = page.indexOf('steerInbox.clearDroppedSteersForSession(sendSessionId)', handler)
+    const steerBranch = page.indexOf('if (steerBranchEligible && !sendCarriesAttachments) {', handler)
+    expect(clearCall).toBeGreaterThan(handler)
+    expect(steerBranch).toBeGreaterThan(clearCall)
+
+    // After the empty-content guard, so a stray keypress does not wipe the receipt.
+    const emptyGuard = page.indexOf('if (!content.trim()) return false', handler)
+    expect(emptyGuard).toBeGreaterThan(-1)
+    expect(clearCall).toBeGreaterThan(emptyGuard)
+  })
+
+  it('is cleared for the chat being LEFT on a session change', () => {
+    const subscribe = page.indexOf('sessionStore.subscribe((state) => {')
+    expect(subscribe).toBeGreaterThan(-1)
+    const body = page.slice(subscribe, subscribe + 1200)
+    expect(body).toContain('const leavingSessionId = currentSessionIdState')
+    expect(body).toContain('leavingSessionId !== state.currentSessionId')
+    expect(body).toContain('steerInbox.clearDroppedSteersForSession(leavingSessionId)')
+  })
+
+  it('never clears a running reply’s queued or waiting bubbles', () => {
+    // The blunt version of this function cleared every state and had no caller outside its
+    // own test; it is gone, and nothing may call it back.
+    expect(page).not.toContain('clearSteersForSession')
+    expect(page).not.toContain('steerInbox.clearSteerInboxForTest')
   })
 })

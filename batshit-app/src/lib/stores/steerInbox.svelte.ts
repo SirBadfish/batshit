@@ -18,7 +18,7 @@
  * entry to exist first.
  */
 
-import type { SteerLane, SteerSource } from '$lib/utils/steerControl'
+import { WAIT_SEND_SENTENCE, type SteerLane, type SteerSource } from '$lib/utils/steerControl'
 
 /**
  * Where a steer is, from the browser's side.
@@ -60,6 +60,28 @@ export interface SteerBubbleEntry {
 
 let steerBySteerId = $state<Record<string, SteerBubbleEntry>>({})
 
+/**
+ * F-P2-1 (SA-118) — steers this tab has already cleared, so nothing can put them back.
+ *
+ * The session replay buffer keeps a turn's `steer_queued` for a while after the turn ends,
+ * and re-sends it whenever a tab (re)subscribes to that session — which is how a tab opened
+ * mid-reply learns the words, and is deliberate. Leaving a chat and coming back
+ * resubscribes. So `clearDroppedSteersForSession` removing a `dropped` entry was not enough
+ * on its own: the replay rebuilt the same steer from scratch, with no earlier state to
+ * merge into, and `upsert`'s default put it back as **queued** — a bubble saying "Queued
+ * for the agent's next step" about a reply the user stopped a minute ago. Measured live on
+ * BSMS, which is the only place it shows.
+ *
+ * A steer id is minted once and never reused, so an id this tab has settled and cleared can
+ * only ever be that same dead steer arriving again. The set holds those ids for the life of
+ * the tab; it gains one short string per stopped-and-cleared steer, which is a handful.
+ *
+ * It is deliberately NOT a fix for the wider case: a tab that never saw the steer — a fresh
+ * tab, or a spectator joining late — still gets the replayed `queued` bubble for an ended
+ * turn. That is older than this story and belongs to the replay buffer, not to this store.
+ */
+let clearedSteerIds = new Set<string>()
+
 function normalize(value?: string | null) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
@@ -82,6 +104,9 @@ function upsert(
   const id = normalize(steerId)
   if (!id) return
   const existing = steerBySteerId[id]
+  // F-P2-1: a cleared steer stays cleared. Only a REBUILD is refused — an entry that is
+  // still here goes on being updated normally, so a live reply's bubble is untouched.
+  if (!existing && clearedSteerIds.has(id)) return
   write({
     steerId: id,
     sessionId: patch.sessionId,
@@ -179,7 +204,8 @@ export function markSteerDropped(steerId: string, reason: SteerDropReason = 'sto
 export function steerBubbleStatusLabel(entry: SteerBubbleEntry): string {
   switch (entry.state) {
     case 'waiting':
-      return 'With files: waits for the reply to finish'
+      // DL-118-09: the send button's tooltip says this too, from the same constant.
+      return WAIT_SEND_SENTENCE
     case 'dropped':
       return entry.dropReason === 'unanswered'
         ? 'Not sent — the reply ended before it could land. Send it again.'
@@ -241,17 +267,41 @@ export function forgetSteer(steerId: string) {
   steerBySteerId = next
 }
 
-export function clearSteersForSession(sessionId?: string | null) {
+/**
+ * SA-118 (DL-118-08) — a bubble that has said its piece goes away.
+ *
+ * `dropped` is the only state cleared here, and the exclusion is the point. A `dropped`
+ * bubble ("Not sent — you stopped the reply") is a receipt: it had no caller in production
+ * at all before this, so it sat under every later exchange in that chat and came back each
+ * time the chat was reopened (PR #106 review F-24). `queued` and `waiting` are the
+ * opposite — they belong to a reply that is still running, and they are the only feedback
+ * the user has that a steer is pending, so navigating away must not touch them. `delivered`
+ * is folded into the finished record by `clearDeliveredSteersForMessage`, and `promoted`
+ * becomes a real message through `forgetSteer`; neither is this function's business.
+ *
+ * Called on the next send in that session, and when the user leaves it.
+ *
+ * This replaces `clearSteersForSession`, which cleared every state and never ran outside
+ * its own test.
+ */
+export function clearDroppedSteersForSession(sessionId?: string | null) {
   const session = normalize(sessionId)
   if (!session) return
-  const next: Record<string, SteerBubbleEntry> = {}
+  const next = { ...steerBySteerId }
+  let changed = false
   for (const entry of Object.values(steerBySteerId)) {
-    if (entry.sessionId !== session) next[entry.steerId] = entry
+    if (entry.sessionId !== session) continue
+    if (entry.state !== 'dropped') continue
+    delete next[entry.steerId]
+    // F-P2-1: remember it, or the session replay rebuilds it as `queued` on the way back in.
+    clearedSteerIds.add(entry.steerId)
+    changed = true
   }
-  steerBySteerId = next
+  if (changed) steerBySteerId = next
 }
 
 export function clearSteerInboxForTest() {
   if (typeof process !== 'undefined' && process.env.VITEST !== 'true') return
   steerBySteerId = {}
+  clearedSteerIds = new Set()
 }
