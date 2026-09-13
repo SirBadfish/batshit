@@ -90,7 +90,7 @@ Some Fabric controls are marked risky — installing a skill from a link, starti
 
 **A risky action pauses and waits for your click.** Batshit stops the action before it happens and puts an **Approval required** card on the agent's message, naming what it wants to do. You press **Approve** or **Deny**. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action) for what the card shows and how the two buttons behave.
 
-**A chat a DM, a webhook, or a schedule started works exactly the same way.** It used to be refused outright; now it gets the same card, so a woken chat can finish its job as soon as you look at it — no matter how much later that is. The one thing that never happens is an agent approving itself: nothing another agent says, and nothing written inside a message it was sent, counts as your click.
+**A chat a DM, a webhook, or a schedule started works exactly the same way.** It raises the same card and waits, so a woken chat can finish its job as soon as you look at it — no matter how much later that is. The one thing that never happens is an agent approving itself: nothing another agent says, and nothing written inside a message it was sent, counts as your click. That holds even for a [Portable Skill Token](../reference/portable-skills.md), which skips the card in an ordinary chat but not in one that started on its own.
 
 Nothing is cancelled while a card waits. The turn ends normally, the item stays open, and the agent's message says what it wanted to do.
 
@@ -111,6 +111,7 @@ An agent with Agent DMs on shows an **envelope** in the chat header, with a coun
 - **Inbox / Sent / Done** tabs, and a filter for one agent or all of them.
 - A dot beside the chosen agent showing whether it is idle, working, or waiting on you right now.
 - Each row: who wrote it, the kind, the subject, what the wake-up actually did and why if it was refused, and links into the chats on both sides.
+- The sender says what it was, not just its name. Another agent shows its name and an envelope. A webhook reads *Nightly build (webhook)* with a webhook icon. A schedule reads *Morning check (schedule)* with a clock. You never have to guess whether a colleague or a clock wrote to your agent.
 - Open a row to read the body, the requested outcome, the scope, and the result.
 - **Stop** on any row whose woken turn is still running.
 
@@ -128,19 +129,35 @@ Schedules live in **Admin → Instance-wide defaults → Agent Wake-ups → Sche
 
 The agent you pick needs **Agent DMs** on, the same as a webhook and for the same reason: a schedule writes a real DM, and an agent with DMs off would have no inbox to see it in. The picker only offers agents that qualify, and says so when none do.
 
+### Making one
+
+Press **New Schedule**. The form is short, and it opens already filled in with the common answer — *Every day*, 9:00 AM, a note that starts a chat — so a daily wake-up takes a name, a message, and nothing else.
+
+- **Name** — what the row is called, and the subject of the DM it sends. "Morning check".
+- **Agent** — who gets it. Only agents with Agent DMs on are offered.
+- **How Often** — the cadence, below. It decides the fields under it: **Minutes**, or a **Time** and (for weekdays) which **Days**.
+- **Time Zone** — for a time of day only, and filled in from your browser.
+- **Message** — what the agent is told. "Check my open DMs and tell me what needs me."
+- **Kind** — **A note** or **An assignment**.
+- **What It Does** — **Start a chat now**, or **Leave it in the inbox**.
+
+**A note** is something to read: the agent reads it and gets on with it. **An assignment** is work whose outcome you want recorded — the agent claims it, does it, and closes it with a result you can read in the inbox drawer.
+
 ### The three cadences
 
-| Cadence | Looks like | Notes |
+**How Often** offers exactly three shapes.
+
+| It's called | Looks like on the row | Notes |
 | --- | --- | --- |
-| **Every N minutes or hours** | "every 30 min" | 5 minutes at the fastest, 7 days at the slowest. Ignores time zones — it just counts. |
-| **Every day at a time** | "daily at 9:00 AM" | In the time zone you choose. |
-| **On chosen weekdays at a time** | "Tue, Thu at 4:00 PM" | Pick one day or several. |
+| **Every so often** | "every 30 min", "every hour", "every 2 days" | 5 minutes at the fastest, 7 days at the slowest. Ignores time zones — it just counts. |
+| **Every day** | "daily at 9:00 AM" | In the time zone you choose. |
+| **On chosen weekdays** | "Tue, Thu at 4:00 PM" | Pick one day or several. |
 
 No cron strings. If you need something these three cannot say — "the last Friday of the month", "when a video is posted" — that is what n8n and the wake-up webhook are for.
 
 ### Time zones and daylight saving
 
-Every daily or weekly schedule carries its own time zone, filled in from your browser when you create it and changeable in the form. Batshit shows the next run in that zone, so a row reads *Tue Sep 15, 4:00 PM CDT*.
+Every daily or weekly schedule carries its own time zone. Batshit fills it in from your browser when you create it, and you can pick a different one in the same form — including plain `UTC`, which is the honest choice when the machine running Batshit is a Docker container. Batshit shows the next run in that zone, so a row reads *Tue, Sep 15, 4:00 PM CDT*. **Every so often** ignores the zone entirely: 30 minutes is 30 minutes everywhere.
 
 Across a daylight-saving change, a schedule keeps its **wall-clock** time: 9:00 AM before the change is still 9:00 AM after it. Two edge cases, both decided for you:
 
@@ -153,28 +170,36 @@ Exactly what a DM does. It writes a note or an assignment from the schedule, and
 
 The first message says plainly that a schedule sent it, not you.
 
-A new schedule starts as a **note that starts a chat**, which is the common case. Choose **assignment** instead when you want the outcome recorded — the agent then claims it, does it, and closes it with a real result you can read in the inbox drawer.
-
 ### Missed runs — when Batshit was off
 
 A schedule due while Batshit was closed (or your laptop was asleep) for **more than ten minutes** does not fire on its own. Ever.
 
-Instead, the next time you open Batshit you get one dialog: **Missed while Batshit was off**. It lists each schedule that missed, when it was due, how many runs it missed, and how long ago — "was due Tue Sep 15, 4:00 PM (missed 3) · 23 days ago". Each row has two buttons:
+Instead, the next time you open Batshit you get one dialog: **Missed while Batshit was off**. Each row names the schedule and its agent, says when the run was due and how long ago that was — *Was due Tue, Sep 15, 4:00 PM · 23 days ago* — and shows when the next normal run is. A schedule that missed more than one run also carries a *missed 3* badge. Each row has two buttons:
 
 - **Run now** — run it once, right now.
 - **Skip** — skip that one run. **The schedule stays on** and runs again at its next normal time. Skip is not cancel.
 
-A schedule keeps at most **one** missed entry, so a weekly schedule missed three times asks you once, not three times. Nothing is pre-picked and nothing auto-skips: the age is right there and you decide. Closing the dialog without choosing leaves the question for next time.
+A schedule keeps at most **one** missed entry, so a weekly schedule missed three times asks you once, not three times. Nothing is pre-picked and nothing auto-skips: the age is right there and you decide. **Decide later** closes the dialog and leaves every question for next time.
 
 If Batshit was only briefly asleep — under ten minutes — the run simply happens late, and the message says when it was due.
 
-### Run now, pause, and delete
+### What a row shows, and the three things you can do to it
 
-Each row has a **Run now** button that fires the schedule once immediately. It does **not** move the schedule's own clock: pressing Run now at 8:55 on a "daily at 9am" schedule does not skip today's 9am. It also works on a **paused** schedule — the button means "once, now", and pausing only turns off the automatic times.
+Each row carries the schedule's name and badges for its agent, its cadence, what it does (*Starts a chat* or *Waits in the inbox*), and *Assignment* or *Created by the agent* where those apply. Under them: the next run in the schedule's own zone, and the last run with how it went and how many times it has run.
 
-Run now spends the same hourly wake budget as any other wake-up, so clearing a long backlog can hit the cap.
+**Run now** fires the schedule once immediately. It does **not** move the schedule's own clock: pressing Run now at 8:55 on a "daily at 9am" schedule does not skip today's 9am. It also works on a **paused** schedule — the button means "once, now", and pausing only turns off the automatic times. Run now spends the same hourly wake budget as any other wake-up, so clearing a long backlog can hit the cap.
 
-The switch on each row pauses and resumes. Delete removes the schedule; the chats it already started stay where they are.
+**The switch** pauses and resumes. A paused row says *Paused, so nothing is scheduled*.
+
+**Delete** asks first, and warns that the schedule's history goes with it. The chats it already started stay where they are.
+
+There is no edit button. A schedule's time, message, or zone cannot be changed from this card — make a new one and delete the old, or ask the agent whose schedule it is to change it (that counts as a risky action, so it comes back to you for approval).
+
+### When Batshit switches a schedule off
+
+A schedule that can no longer work out when it should next run is **switched off** rather than left to fail every minute. The row shows *Paused*, and the last-run line says `failed:` followed by the reason.
+
+This is rare, and it is not something you caused by pausing it. Turning the switch back on will only stick if the reason is gone — otherwise the safe fix is to delete that schedule and create a fresh one.
 
 ### An agent can manage its own schedules
 
@@ -300,12 +325,13 @@ Turning Agent DMs on for an agent also adds a short block to its system prompt a
 | The webhook answers `403` | Wrong token, wrong hook id, paused hook, or expired hook. | The Admin card. Rotate the token if you lost it. |
 | The webhook answers `429` | 30 calls this hour for that hook. | `Retry-After` in the response says how long. |
 | n8n says "the service refused the connection" | `localhost` resolved to IPv6. | Use `127.0.0.1` in the URL. |
-| A reopened assignment finished with no new result | Fixed. Reopen now clears the "already reported" markers, so closing it again sends a fresh result and fires the callback again. | — |
+| A reopened assignment seems to have reported nothing | It did report. Reopen clears the "already reported" markers, so closing it again sends a fresh result and fires the callback again. | The **Done** tab, and the callback's own log. |
 | The agent never mentions a DM you sent | It is a `wait` DM and the agent has not had a turn yet. | Say anything in its chat; the roster shows on the next turn. |
 | A schedule was due while Batshit was closed and never ran | That is on purpose. Missed runs wait for you. | The *Missed while Batshit was off* dialog on your next open. |
 | Skip turned my schedule off | It did not. Skip skips one run. | The row's switch still says on, and the next run is shown. |
 | An agent can't create a schedule | Agent DMs is off for it, or you have not approved the action. | Agent Settings → Agent DMs, then approve when asked. |
-| The agent's schedule shows the wrong time zone | An agent's call has no browser to read your zone from, so it gets the server's — your own on the Mac app, usually UTC in Docker. | Change the zone on the row. |
+| The agent's schedule shows the wrong time zone | An agent's call has no browser to read your zone from, so it gets the server's — your own on the Mac app, usually UTC in Docker. | The card has no edit control. Delete it and make a new one with the right zone, or ask the agent to change its own schedule and approve that. |
+| A schedule says *Paused* and its last run says `failed:` | Batshit could not work out when it should next run, so it switched the schedule off instead of failing every minute. | The reason is on the row. Deleting it and making a fresh one is the reliable fix. |
 | Run now ran a paused schedule | On purpose — the button means "once, now". | Pausing only stops the automatic times. |
 
 ## Related docs

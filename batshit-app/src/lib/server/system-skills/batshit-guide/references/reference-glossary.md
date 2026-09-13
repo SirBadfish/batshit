@@ -198,10 +198,10 @@ An opt-in, one-way session type where one agent lives in one ongoing conversatio
 
 ### Interrupt
 
-Sending a message while an agent is still replying in the way Batshit used to do it always:
-the reply stops, everything it already produced is kept, and your message starts a new turn
-with a note saying the last one was cut short. The **Stop** button is always an interrupt.
-The other option, and the default, is **Steer**.
+Sending a message while an agent is still replying, so that the reply stops: everything it
+already produced is kept, and your message starts a new turn with a note saying the last one
+was cut short. The **Stop** button is always an interrupt, and a Group chat only ever
+interrupts. The other option, and the default, is **Steer**.
 
 ### Inworld
 

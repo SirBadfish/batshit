@@ -23,23 +23,32 @@ You thought of something after you hit send. You don't have to wait, and you don
 
 While an agent is replying, the Send button changes to **Steer**. Your message waits for the agent to finish whatever tool it's in the middle of, then arrives **inside the reply it's already writing** — the agent reads it and adjusts without losing its place. It shows up in the chat as a small bubble tucked into the reply, at the exact spot it arrived, marked *You, mid-reply*.
 
-The other option is **Interrupt**: the reply stops, everything it already produced is kept, and your message starts a fresh turn with a note saying the last one was cut short. That's what Batshit did before, and it's still one click away. The **Stop** button is always an interrupt.
+The other option is **Interrupt**: the reply stops, everything it already produced is kept, and your message starts a fresh turn with a note saying the last one was cut short. It's always one click away. The **Stop** button is always an interrupt.
 
-**Picking which one is the default.** Settings → User → Chat → *When you send while the agent is busy*. Steer is the default. The change takes effect immediately, even in a chat that's mid-reply.
+**Picking which one is the default.** Settings → User → Chat → **When You Send While the Agent Is Busy**, which offers **Steer (default)** and **Interrupt and send**. The change takes effect immediately, even in a chat that's mid-reply.
 
 **Sending the other way just once.** Press **Cmd+Enter** (Ctrl+Enter on Windows) instead of Enter and that one message goes with the opposite mode. Enter always means your default.
 
-**What the bubble tells you.**
+**What the bubble tells you.** A steered message draws its own small bubble while it is in between — sent, but not yet part of anything. It says one of these:
 
 | It says | It means |
 |---|---|
 | *Queued for the agent's next step* | Batshit has your message and is holding it for the next tool call to finish. On a Codex or Claude agent this can sit for several seconds — that's normal, not a failure. |
-| *Read mid-reply* | The agent has it and is working with it. |
-| *Sent as your next message* | The reply ended before your message could fit inside it, so Batshit sent it as your next message instead and the agent is answering it now. |
-| *Not sent — you stopped the reply* | You pressed Stop. Nothing was sent. Your words are still in the box; send them again when you're ready. |
 | *With files: waits for the reply to finish* | You attached something. Files are never steered — the message waits and goes as a normal send once the reply ends. |
+| *Not sent — you stopped the reply* | You pressed Stop, and Stop means stop: your message was not passed on and no new turn started. |
+| *Not sent — the reply ended before it could land. Send it again.* | The rare backstop: the chat went quiet with your message still waiting, so Batshit never placed it anywhere rather than guess. |
 
-**Nothing you type is lost.** If the agent's reply has no tool call left to catch your message — a plain text answer, or one that's already wrapping up — Batshit sends it as your next message the moment the reply ends. That happens on the server, so it works even if you close the tab.
+Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there to copy and send again. It is never quietly turned into a message you didn't mean to send.
+
+A bubble disappears the moment your message has a real home. If the agent read it mid-reply, it becomes the inset inside that reply, marked *You, mid-reply*. If the reply ended first, it becomes an ordinary message from you, and the agent answers it.
+
+**Nothing you type is lost.** If the agent's reply has no tool call left to catch your message — a plain text answer, or one that's already wrapping up — Batshit sends it as your next message the moment the reply ends. That happens on the server, so it works even if you close the tab. The one exception is the backstop row above, and it tells you plainly to send it again.
+
+**Five at a time, per reply.** You can steer the same reply five times. The sixth is refused with *"5 messages are already waiting for this reply (Batshit holds 5). Wait for the reply to finish."* A message the agent has already read frees its slot, so a long tool-heavy reply never locks you out.
+
+**When a steer is refused.** If Batshit says no without the reply ending — the cap above, an agent DM already waiting, or a moment when it can't reach the server — you get a one-line note saying why. The reply keeps running, nothing is interrupted, and nothing is sent. Your words stay in the box.
+
+**@file mentions wait too.** Mentioning a file with `@` counts as an attachment, the same as a Clip: the message waits for the reply to finish and then sends normally. A steer carries text only, so a steered `@file` would hand the agent a bare path with nothing behind it.
 
 **Where steering isn't available.** Group chats interrupt instead, because agents there speak one at a time. So do Codex agents running on the one-shot transport and CLI agents using your own profile rather than Batshit's. In all of those the button says *Interrupt and send* and the tooltip says why.
 
