@@ -92,46 +92,43 @@ const TOOL_DISPLAY_ALIAS_ENTRIES = Object.entries(TOOL_DISPLAY_ALIASES).sort(
 
 const BATSHIT_TOOL_REF_FAMILIES = new Set(['mcp', 'cli', 'artifact', 'fabric', 'agent_browser'])
 
+/**
+ * Fabric control ids whose display name the derivation below gets WRONG.
+ *
+ * SA-118 Guard 2 emptied this table of everything it no longer had to carry. It used to hold
+ * a row for every control of every registered family, because without one the formatter
+ * returned null, null meant "not a Fabric control", and the call rendered as an untitled tool
+ * card (and, since SA-116, a blank approval card). The `sys.*` fallback in
+ * `formatBatshitToolTargetDisplayName` removes that failure mode, so seventeen rows that only
+ * restated what `<prefix label> + <suffix words>` already derives were deleted — each one's
+ * former string is pinned in `toolNameFormatter.test.ts`, captured before the deletion.
+ *
+ * What is left earns its place: a name the derivation cannot reach. Add a row only when the
+ * derived name is wrong, never to make a new family visible — it already is.
+ */
 const FABRIC_CONTROL_DISPLAY_ALIASES: Record<string, string> = {
-  'sys.artifact.create': 'Artifact Create',
-  'sys.artifact.list': 'Artifact List',
+  // "Read", not "Get"; "Edit", not "Apply Patch"; the shorter word the cards use.
   'sys.artifact.get': 'Artifact Read',
   'sys.artifact.run_logs.list': 'Artifact Logs',
   'sys.artifact.run_logs.get': 'Artifact Logs',
-  'sys.artifact.update': 'Artifact Edit',
   'sys.artifact.apply_patch': 'Artifact Edit',
   'sys.artifact.validate_structure': 'Artifact Validate',
-  'sys.artifact.publish': 'Artifact Publish',
   'sys.artifact.add_version': 'Artifact Version',
-  'sys.artifact.rollback': 'Artifact Rollback',
   'sys.artifact.delete_version': 'Artifact Version Delete',
   'sys.artifact.set_webhook': 'Artifact Webhook',
   'sys.artifact.set_zone': 'Artifact Zone',
-  'sys.artifact.analyze_url': 'Artifact Analyze URL',
   'sys.artifact.check_requirements': 'Artifact Requirements',
+  // The product name is "Fetch Zip", not the derived "Zip Fetch".
   'sys.zip.fetch': 'Fetch Zip',
-  'sys.comfyui.workflows': 'ComfyUI Workflows',
-  'sys.comfyui.object_info': 'ComfyUI Object Info',
-  'sys.model_catalog.search': 'Model Catalog Search',
+  // These two share their names with the broker helpers the user already knows.
   'sys.mcp.dynamic.find': 'Dynamic Tool Search',
   'sys.mcp.dynamic.use': 'MCP Tool',
-  // SA-113: the Agent DM family. Without these the controls had no display name at all,
-  // which also meant they never reached the Fabric presentation branch and rendered as an
-  // untitled generic card.
-  'sys.dm.send': 'Agent DM Send',
+  // SA-113's Agent DM family: the two whose derived names say the wrong thing.
   'sys.dm.list': 'Agent DM Inbox',
-  'sys.dm.read': 'Agent DM Read',
-  'sys.dm.claim': 'Agent DM Claim',
-  'sys.dm.done': 'Agent DM Done',
-  'sys.dm.blocked': 'Agent DM Blocked',
   'sys.dm.agents': 'Agent DM Presence',
-  // SA-115: the Schedules family. Same lesson as the DM entries above — without these the
-  // controls have no display name, never reach the Fabric presentation branch, and render
-  // as untitled generic cards while working perfectly on the wire.
-  'sys.schedule.list': 'Schedule List',
-  'sys.schedule.create': 'Schedule Create',
-  'sys.schedule.update': 'Schedule Update',
-  'sys.schedule.delete': 'Schedule Delete'
+  // SA-115's Schedules family: `formatControlWords` renders `update` as "Edit", which is
+  // right for an artifact and wrong for a schedule.
+  'sys.schedule.update': 'Schedule Update'
 }
 
 const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
@@ -238,6 +235,24 @@ export function formatBatshitToolTargetDisplayName(rawName: string | undefined):
     return readableSuffix ? `${label} ${readableSuffix}` : label
   }
 
+  // SA-118 Guard 2 (DL-118-11) — every `sys.<family>.<suffix>` id gets a name, registered or
+  // not. Three consecutive stories added a family and hit the same wall: this function
+  // returned null, null means "not a Fabric control", and the call rendered as an untitled
+  // tool card — and since SA-116's approval card is built from this name, a BLANK card too,
+  // all while the control worked perfectly on the wire. The tables above still exist for the
+  // names the derivation gets WRONG ("Artifact Read", not "Artifact Get"); they are no
+  // longer what stands between a new family and a nameless card.
+  const systemControlMatch = /^sys\.([a-z0-9_]+)\.(.+)$/.exec(normalizedTarget)
+  if (systemControlMatch) {
+    const family = formatControlWords(systemControlMatch[1])
+    const suffix = formatControlWords(systemControlMatch[2])
+    const derived = [family, suffix].filter(Boolean).join(' ')
+    if (derived) return derived
+  }
+
+  // Still null for anything that is not a `sys.*` control id — a `cli_tool:` id, an MCP tool,
+  // a plain helper name. Callers read null as "use your own title", so widening it further
+  // would rename cards that are correctly named today.
   return null
 }
 

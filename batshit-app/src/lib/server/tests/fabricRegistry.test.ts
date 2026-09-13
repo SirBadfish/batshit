@@ -3937,6 +3937,39 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
     expect(result.success).toBe(true)
   })
 
+  /**
+   * SA-118 Guard 1 (DL-118-10) — the prefix list lives HERE now.
+   *
+   * `ACTING_AGENT_CONTROL_PREFIXES` used to be a hand-maintained constant in
+   * `fabricRegistry.ts`, a thousand lines from the definitions it classified, so a new
+   * `sys.<family>.*` whose handler read `context.agentId` as an identity was un-gated by
+   * omission. The flag on `ControlDefinition` is required, so forgetting it is a type error
+   * — and this is the other half: the three families are the test's EXPECTATION, so adding
+   * a flag without a decision is as loud as losing one.
+   */
+  const ACTING_AGENT_CONTROL_PREFIXES = ['sys.dm.', 'sys.memory.', 'sys.schedule.'] as const
+
+  it('flags exactly the three acting-agent families across every code-defined control', async () => {
+    const { CORE_CONTROL_ACTING_AGENT_FLAGS } = await import('../services/fabricRegistry')
+
+    // Guards the guard: an empty or truncated readback would make the comparison below pass
+    // against nothing at all.
+    expect(CORE_CONTROL_ACTING_AGENT_FLAGS.length).toBeGreaterThan(40)
+
+    const flagged = CORE_CONTROL_ACTING_AGENT_FLAGS.filter((entry) => entry.actsAsAgent)
+      .map((entry) => entry.controlId)
+      .sort()
+    const byPrefix = CORE_CONTROL_ACTING_AGENT_FLAGS.map((entry) => entry.controlId)
+      .filter((controlId) => ACTING_AGENT_CONTROL_PREFIXES.some((prefix) => controlId.startsWith(prefix)))
+      .sort()
+
+    expect(flagged).toEqual(byPrefix)
+    // Each family is actually present, so the two empty sets could never agree by accident.
+    for (const prefix of ACTING_AGENT_CONTROL_PREFIXES) {
+      expect(flagged.some((controlId) => controlId.startsWith(prefix)), prefix).toBe(true)
+    }
+  })
+
   it('classifies the three families and nothing else as acting-as-agent', async () => {
     const { controlActsAsAgent } = await import('../services/fabricRegistry')
 
@@ -3957,5 +3990,17 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
     }
     expect(controlActsAsAgent(undefined)).toBe(false)
     expect(controlActsAsAgent(42)).toBe(false)
+  })
+
+  it('reads the definition, so an id that merely LOOKS like a family is not vouched', async () => {
+    const { controlActsAsAgent } = await import('../services/fabricRegistry')
+
+    // Before SA-118 these three matched a prefix and were classified as acting agents even
+    // though no such control exists. The flag comes from a definition or it is false.
+    expect(controlActsAsAgent('sys.dm.not_a_control')).toBe(false)
+    expect(controlActsAsAgent('sys.memory.nope')).toBe(false)
+    expect(controlActsAsAgent('sys.schedule.')).toBe(false)
+    // A real one still is.
+    expect(controlActsAsAgent('sys.memory.recall')).toBe(true)
   })
 })

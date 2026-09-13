@@ -160,7 +160,7 @@ describe('sweeping', () => {
  * PR #106 review F-8 (DL-118-01) — this route always walks.
  *
  * The store now caches "nothing is due before T" and the ticker trusts it. This route must
- * not: it exists to answer "is anything due NOW?" for a caller — a MegaSmoke row, a dev
+ * not: it exists to answer "is anything due NOW?" for a caller — a smoke-test row, a dev
  * smoke — that has usually just written a schedule into Redis. That write is invisible to
  * an in-process cache, so a route that trusted it would answer "nothing" about a schedule
  * the caller had just created and made due.
@@ -179,7 +179,7 @@ describe('the due cache (F-8, DL-118-01)', () => {
     expect(primed.fired).toHaveLength(0)
 
     // Make it due the way a seeder does — a raw write, around the store, so nothing
-    // invalidates. This is exactly what a MegaSmoke row does before it triggers a sweep.
+    // invalidates. This is exactly what a smoke-test row does before it triggers a sweep.
     await redis.json.set(
       `schedule:${record.id}`,
       '$.nextRunAt',

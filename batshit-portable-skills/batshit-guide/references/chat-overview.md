@@ -23,6 +23,8 @@ You thought of something after you hit send. You don't have to wait, and you don
 
 While an agent is replying, the Send button changes to **Steer**. Your message waits for the agent to finish whatever tool it's in the middle of, then arrives **inside the reply it's already writing** — the agent reads it and adjusts without losing its place. It shows up in the chat as a small bubble tucked into the reply, at the exact spot it arrived, marked *You, mid-reply*.
 
+If you attach a Clip or mention a file with `@`, the button says **Send after reply** instead. Files can't be steered, so that message waits and goes as an ordinary send the moment the reply ends. The button tells you that before you click rather than after.
+
 The other option is **Interrupt**: the reply stops, everything it already produced is kept, and your message starts a fresh turn with a note saying the last one was cut short. It's always one click away. The **Stop** button is always an interrupt.
 
 **Picking which one is the default.** Settings → User → Chat → **When You Send While the Agent Is Busy**, which offers **Steer (default)** and **Interrupt and send**. The change takes effect immediately, even in a chat that's mid-reply.
@@ -41,6 +43,8 @@ The other option is **Interrupt**: the reply stops, everything it already produc
 Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there to copy and send again. It is never quietly turned into a message you didn't mean to send.
 
 A bubble disappears the moment your message has a real home. If the agent read it mid-reply, it becomes the inset inside that reply, marked *You, mid-reply*. If the reply ended first, it becomes an ordinary message from you, and the agent answers it.
+
+A **grey "not sent" bubble** has no home to go to, so it stays until you are done with it: it clears the next time you send in that chat, and it clears when you leave the chat. A bubble for a reply that is still running stays put — leaving and coming back does not throw away the only sign that your message is still waiting.
 
 **Nothing you type is lost.** If the agent's reply has no tool call left to catch your message — a plain text answer, or one that's already wrapping up — Batshit sends it as your next message the moment the reply ends. That happens on the server, so it works even if you close the tab. The one exception is the backstop row above, and it tells you plainly to send it again.
 
