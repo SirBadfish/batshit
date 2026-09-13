@@ -89,9 +89,14 @@ describe('minting a run credential', () => {
     expect(JSON.stringify(stored)).not.toContain(secret)
     expect(stored?.tokenHash).toBeTruthy()
     expect(stored?.tokenHash).not.toBe(secret)
-    // Enough to tell two runs apart in a log, never enough to use one.
-    expect(secret.startsWith(stored!.tokenPrefix)).toBe(true)
-    expect(secret.endsWith(stored!.tokenSuffix)).toBe(true)
+    // PR #106 review F-19: NO fragment of the secret either. This record used to carry a
+    // 12-character prefix and a 6-character suffix copied from the wake-hook store — 13 of
+    // the secret's 43 random characters in plaintext beside its hash, for a record no UI
+    // ever shows and no code ever read.
+    expect(stored).not.toHaveProperty('tokenPrefix')
+    expect(stored).not.toHaveProperty('tokenSuffix')
+    expect(JSON.stringify(stored)).not.toContain(secret.slice(0, 12))
+    expect(JSON.stringify(stored)).not.toContain(secret.slice(-6))
 
     expect(stored).toMatchObject({
       userId: USER,
@@ -367,6 +372,35 @@ describe('revoking at run end', () => {
     // prune (and the agent sweep) still clean it.
     expect(await listAgentRunCredentialIds(COOPER)).toEqual([])
     expect(await indexMembers(COOPER)).toEqual([])
+  })
+
+  /**
+   * PR #106 review F-19 — the prune-on-read has a production caller now.
+   *
+   * `listAgentRunCredentialIds` prunes, and two comments named it as what keeps the index
+   * bounded — but nothing outside its own test ever called it. `revokeRunCredential`
+   * removes the member at a clean run end; a crash-then-restart never reaches that
+   * `finally`, so one dead member per orphaned run stayed until the whole agent was
+   * deleted. The mint is the honest place to pay for it: once per run, on an index that
+   * holds live runs only.
+   */
+  it('prunes dead members on the next mint, so a crashed run does not leak one forever', async () => {
+    const orphan = await mint({ sessionId: 'sess-crashed' })
+    // The app died mid-run: no `finally`, no revoke. Twenty-four hours later the TTL reaps
+    // the record and leaves its index member behind.
+    await redis.del(agentRunCredentialKey(orphan.credentialId))
+    expect(await indexMembers(COOPER)).toEqual([orphan.credentialId])
+
+    const next = await mint({ sessionId: 'sess-after-restart' })
+
+    expect(await indexMembers(COOPER)).toEqual([next.credentialId])
+  })
+
+  it('leaves another agent’s index alone when it prunes', async () => {
+    const faye = await mint({ agentId: FAYE, sessionId: 'sess-faye' })
+    await mint({ sessionId: 'sess-cooper' })
+    // The index is per agent, so a mint for Cooper must not walk Faye's.
+    expect(await indexMembers(FAYE)).toEqual([faye.credentialId])
   })
 
   it('prunes the index after a TTL reap when the caller says which agent (F-P1-5)', async () => {

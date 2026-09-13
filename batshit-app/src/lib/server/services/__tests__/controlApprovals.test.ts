@@ -466,6 +466,83 @@ describe('matching and consuming', () => {
     expect(reordered).not.toBeNull()
   })
 
+  /**
+   * PR #106 review F-18 — the index is pruned by the reader that meets the dead id.
+   *
+   * Records carry a 24-hour TTL; their ids were never removed from
+   * `control_approvals:{sessionId}`, and the index's own TTL is refreshed by every write.
+   * In a session still active a day later, dead ids accumulated and THIS function — which
+   * runs on every non-safe control call — paid one `JSON.GET` per historical id, nearly
+   * all of them null.
+   */
+  describe('self-healing the index (F-18)', () => {
+    // The index is a ZSET scored by `requestedAt`, and `findApprovedMatch` reads it
+    // newest-first. Two approvals created in the same millisecond share a score, so every
+    // test below states its own order explicitly rather than relying on the clock.
+    const EARLIER = new Date('2026-09-10T10:00:00.000Z')
+    const LATER = new Date('2026-09-10T10:00:01.000Z')
+
+    it('drops a reaped id from the index the first time it is met', async () => {
+      const live = await approved({ now: EARLIER })
+      const reaped = await approved({ input: { memory_id: 'mem_gone' }, now: LATER })
+      // What the 24-hour TTL does, without waiting a day for it.
+      await redis.del(controlApprovalKey(reaped.id))
+
+      // Newest first, so the dead id is met before the live one.
+      expect((await findApprovedMatch(criteria()))?.id).toBe(live.id)
+
+      const members = await redis.execute(async (client) =>
+        client.zRange(controlApprovalsIndexKey(SESSION), 0, -1)
+      )
+      expect(members).not.toContain(reaped.id)
+      expect(members).toContain(live.id)
+    })
+
+    it('never removes a live id, even one that does not match this call', async () => {
+      const live = await approved({ now: EARLIER })
+      const other = await approved({
+        controlId: 'sys.skill.import',
+        controlTitle: 'Skill Import',
+        input: { url: 'https://example.test' },
+        now: LATER
+      })
+
+      // `other` is met first and does not match; the prune is self-heal, never a way to
+      // revoke, so a record that still exists stays indexed.
+      await expect(findApprovedMatch(criteria())).resolves.not.toBeNull()
+
+      const members = await redis.execute(async (client) =>
+        client.zRange(controlApprovalsIndexKey(SESSION), 0, -1)
+      )
+      expect(members).toEqual(expect.arrayContaining([other.id, live.id]))
+    })
+
+    it('still spends the click the user made MOST recently', async () => {
+      // Newest-first is the rule the prune must not disturb: an agent that asked for the
+      // same call twice spends the later approval.
+      const older = await approved({ now: EARLIER })
+      const newer = await approved({ now: LATER })
+      expect(newer.id).not.toBe(older.id)
+      expect((await findApprovedMatch(criteria()))?.id).toBe(newer.id)
+    })
+
+    it('leaves the reader that shows history alone — it reports, it does not heal', async () => {
+      const live = await approved({ now: EARLIER })
+      const reaped = await approved({ input: { memory_id: 'mem_gone' }, now: LATER })
+      await redis.del(controlApprovalKey(reaped.id))
+
+      const rows = await listSessionApprovals(SESSION, USER)
+      expect(rows.map((row) => row.approvalId)).toEqual([live.id])
+
+      // Unchanged behaviour: the history reader skips the dead id without touching the
+      // index. Only `findApprovedMatch`, the one on the hot path, prunes.
+      const members = await redis.execute(async (client) =>
+        client.zRange(controlApprovalsIndexKey(SESSION), 0, -1)
+      )
+      expect(members).toContain(reaped.id)
+    })
+  })
+
   it('is spent exactly once, even by two callers at the same moment', async () => {
     const record = await approved()
     const [first, second] = await Promise.all([

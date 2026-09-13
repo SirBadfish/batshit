@@ -1,8 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { countRedisCommands } from '$lib/test-utils/redis-command-counter'
 import { redis } from '$lib/server/redis'
 import { LATE_FIRE_GRACE_MS } from '$lib/utils/scheduleControl'
-import { createSchedule, getSchedule } from '../scheduleStore'
+import {
+  __resetScheduleDueCacheForTests,
+  createSchedule,
+  getSchedule
+} from '../scheduleStore'
 import {
   __resetScheduleTickerForTests,
   runScheduleSweep,
@@ -85,6 +90,10 @@ beforeEach(async () => {
   })
   publishUserEvent.mockClear()
   __resetScheduleTickerForTests()
+  // SA-118 DL-118-01: the store's due cache is module-level, so it outlives a test. Every
+  // sweep below passes `{ walk: true }` for the same reason — a test asks "is this due
+  // now?" about a keyspace it has just written to behind the store's back.
+  __resetScheduleDueCacheForTests()
   await seedAgent(COOPER)
 })
 
@@ -98,7 +107,7 @@ describe('firing', () => {
     const record = await seedSchedule({ name: 'Morning', nextRunAt: '2026-09-08T14:00:00.000Z' })
     const now = new Date('2026-09-08T14:00:30.000Z')
 
-    const report = await runScheduleSweep(now)
+    const report = await runScheduleSweep(now, { walk: true })
 
     expect(report.fired).toHaveLength(1)
     expect(report.missed).toHaveLength(0)
@@ -124,7 +133,7 @@ describe('firing', () => {
     // Four minutes behind: the laptop slept, the run still happens.
     const now = new Date(Date.parse('2026-09-08T14:00:00.000Z') + 4 * 60_000)
 
-    const report = await runScheduleSweep(now)
+    const report = await runScheduleSweep(now, { walk: true })
 
     expect(report.fired).toHaveLength(1)
     expect(report.missed).toHaveLength(0)
@@ -139,7 +148,7 @@ describe('firing', () => {
       nextRunAt: '2026-09-01T14:00:00.000Z',
       enabled: false
     })
-    const report = await runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'))
+    const report = await runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'), { walk: true })
     expect(report.fired).toHaveLength(0)
     expect(report.missed).toHaveLength(0)
     expect(deliverScheduledDm).not.toHaveBeenCalled()
@@ -147,7 +156,7 @@ describe('firing', () => {
 
   it('leaves a schedule alone until its next run arrives', async () => {
     await seedSchedule({ name: 'Later', nextRunAt: '2026-09-09T14:00:00.000Z' })
-    const report = await runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'))
+    const report = await runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'), { walk: true })
     expect(report.fired).toHaveLength(0)
     expect(deliverScheduledDm).not.toHaveBeenCalled()
   })
@@ -167,7 +176,7 @@ describe('firing', () => {
       return { dmId: 'dm_x', deliveredAs: 'wake', sessionId: 's', outcome: 'woke: s' }
     })
 
-    const report = await runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'))
+    const report = await runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'), { walk: true })
     expect(report.fired).toHaveLength(3)
     expect(peak).toBe(1)
   })
@@ -179,7 +188,7 @@ describe('a fire that throws', () => {
     deliverScheduledDm.mockRejectedValue(new Error('That agent no longer exists.'))
     vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    const first = await runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'))
+    const first = await runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'), { walk: true })
     expect(first.fired).toHaveLength(1)
     expect(first.fired[0].ok).toBe(false)
     expect(first.fired[0].outcome).toBe('failed: That agent no longer exists.')
@@ -191,7 +200,7 @@ describe('a fire that throws', () => {
     // A minute later the same schedule must NOT be tried again: a broken schedule that
     // retried every tick would be a storm against the log and the agent's wake budget.
     deliverScheduledDm.mockClear()
-    const second = await runScheduleSweep(new Date('2026-09-08T14:01:30.000Z'))
+    const second = await runScheduleSweep(new Date('2026-09-08T14:01:30.000Z'), { walk: true })
     expect(second.fired).toHaveLength(0)
     expect(deliverScheduledDm).not.toHaveBeenCalled()
   })
@@ -202,7 +211,7 @@ describe('missed runs', () => {
     const record = await seedSchedule({ name: 'Morning', nextRunAt: '2026-09-08T14:00:00.000Z' })
     const now = new Date(Date.parse('2026-09-08T14:00:00.000Z') + LATE_FIRE_GRACE_MS + 60_000)
 
-    const report = await runScheduleSweep(now)
+    const report = await runScheduleSweep(now, { walk: true })
 
     expect(deliverScheduledDm).not.toHaveBeenCalled()
     expect(report.fired).toHaveLength(0)
@@ -218,12 +227,12 @@ describe('missed runs', () => {
 
   it('never fires a collapsed run on the next sweep', async () => {
     const record = await seedSchedule({ name: 'Morning', nextRunAt: '2026-09-08T14:00:00.000Z' })
-    await runScheduleSweep(new Date('2026-09-08T16:00:00.000Z'))
+    await runScheduleSweep(new Date('2026-09-08T16:00:00.000Z'), { walk: true })
     expect(deliverScheduledDm).not.toHaveBeenCalled()
 
     // One minute later: the missed run is still sitting there waiting for the user, and
     // the ticker walks past it. Only **Run now** can start it.
-    const second = await runScheduleSweep(new Date('2026-09-08T16:01:00.000Z'))
+    const second = await runScheduleSweep(new Date('2026-09-08T16:01:00.000Z'), { walk: true })
     expect(second.fired).toHaveLength(0)
     expect(second.missed).toHaveLength(0)
     expect(deliverScheduledDm).not.toHaveBeenCalled()
@@ -234,7 +243,7 @@ describe('missed runs', () => {
     await seedSchedule({ name: 'A', nextRunAt: '2026-09-08T14:00:00.000Z' })
     await seedSchedule({ name: 'B', nextRunAt: '2026-09-08T14:00:00.000Z' })
 
-    await runScheduleSweep(new Date('2026-09-08T18:00:00.000Z'))
+    await runScheduleSweep(new Date('2026-09-08T18:00:00.000Z'), { walk: true })
 
     expect(publishUserEvent).toHaveBeenCalledTimes(1)
     const [userId, event] = publishUserEvent.mock.calls[0]
@@ -246,7 +255,7 @@ describe('missed runs', () => {
 
   it('says nothing when nothing was missed', async () => {
     await seedSchedule({ name: 'Morning', nextRunAt: '2026-09-08T14:00:00.000Z' })
-    await runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'))
+    await runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'), { walk: true })
     expect(publishUserEvent).not.toHaveBeenCalled()
   })
 })
@@ -263,11 +272,11 @@ describe('sweep overlap', () => {
       return { dmId: 'dm_x', deliveredAs: 'wake', sessionId: 's', outcome: 'woke: s' }
     })
 
-    const first = runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'))
+    const first = runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'), { walk: true })
     // Let the first sweep reach the fire and park there.
     await vi.waitFor(() => expect(release).not.toBeNull())
 
-    const second = await runScheduleSweep(new Date('2026-09-08T14:00:31.000Z'))
+    const second = await runScheduleSweep(new Date('2026-09-08T14:00:31.000Z'), { walk: true })
     expect(second.fired).toHaveLength(0)
     expect(second.skipped).toEqual([
       { scheduleId: '*', reason: 'A schedule sweep was already running.' }
@@ -312,7 +321,7 @@ describe('AMD-115-03 / F-P1-3 — the ticker anchors the next run on the DUE slo
 
     for (const late of lateness) {
       const due = Date.parse((await getSchedule(record.id))!.nextRunAt)
-      const report = await runScheduleSweep(new Date(due + late))
+      const report = await runScheduleSweep(new Date(due + late), { walk: true })
       expect(report.fired).toHaveLength(1)
       landed.push((await getSchedule(record.id))?.nextRunAt)
     }
@@ -330,7 +339,7 @@ describe('AMD-115-03 / F-P1-3 — the ticker anchors the next run on the DUE slo
       cadence: { type: 'interval', everyMinutes: 5 },
       nextRunAt: '2026-09-08T09:00:00.000Z'
     })
-    await runScheduleSweep(new Date('2026-09-08T09:00:37.000Z'))
+    await runScheduleSweep(new Date('2026-09-08T09:00:37.000Z'), { walk: true })
 
     // The DM body says when the run was DUE (DL-115-08), so the agent reading a late note
     // knows which slot it belongs to. That only works if `dueAt` reaches this far.
@@ -358,7 +367,7 @@ describe('a schedule whose zone this host cannot resolve (PR #106 F-3)', () => {
     })
     await redis.json.set(`schedule:${record.id}`, '$.timeZone', 'Mars/Olympus_Mons' as never)
 
-    const first = await runScheduleSweep(now)
+    const first = await runScheduleSweep(now, { walk: true })
     expect(deliverScheduledDm).toHaveBeenCalledTimes(1)
     expect(first.fired).toHaveLength(1)
     expect(first.fired[0]?.ok).toBe(false)
@@ -369,8 +378,8 @@ describe('a schedule whose zone this host cannot resolve (PR #106 F-3)', () => {
     expect(stored?.lastRunAt).toBe(now.toISOString())
 
     // The storm: before the fix nothing was recorded, so the same slot fired every sweep.
-    await runScheduleSweep(new Date(now.getTime() + 60_000))
-    await runScheduleSweep(new Date(now.getTime() + 120_000))
+    await runScheduleSweep(new Date(now.getTime() + 60_000), { walk: true })
+    await runScheduleSweep(new Date(now.getTime() + 120_000), { walk: true })
     expect(deliverScheduledDm).toHaveBeenCalledTimes(1)
   })
 
@@ -381,7 +390,7 @@ describe('a schedule whose zone this host cannot resolve (PR #106 F-3)', () => {
     })
     await redis.json.set(`schedule:${record.id}`, '$.timeZone', 'Mars/Olympus_Mons' as never)
 
-    const report = await runScheduleSweep(now)
+    const report = await runScheduleSweep(now, { walk: true })
     expect(deliverScheduledDm).not.toHaveBeenCalled()
     expect(report.skipped.map((entry) => entry.scheduleId)).toContain(record.id)
 
@@ -390,7 +399,66 @@ describe('a schedule whose zone this host cannot resolve (PR #106 F-3)', () => {
     expect(stored?.lastOutcome).toMatch(/^failed: .*time zone/)
 
     // Nothing to retry every minute any more.
-    const again = await runScheduleSweep(new Date(now.getTime() + 60_000))
+    const again = await runScheduleSweep(new Date(now.getTime() + 60_000), { walk: true })
     expect(again.skipped.map((entry) => entry.scheduleId)).not.toContain(record.id)
+  })
+})
+
+/**
+ * PR #106 review F-8 (DL-118-01) — the 60-second sweep stops walking the keyspace.
+ *
+ * The ticker is the ONLY caller that does not force a walk, and it is the caller that
+ * mattered: `KEYS` is O(every key in the database) and blocked Redis's command thread for
+ * the scan, once a minute, forever, on an instance that may hold no schedules at all.
+ * The store's own suite pins the cache; what is pinned here is that the ticker gets the
+ * benefit and still fires on time.
+ */
+describe('the sweep does not walk when nothing can be due (F-8)', () => {
+  it('issues no Redis command on a second sweep inside the bound', async () => {
+    await seedSchedule({ name: 'Tomorrow', nextRunAt: '2026-09-09T14:00:00.000Z' })
+
+    const first = await countRedisCommands(() =>
+      runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'))
+    )
+    expect(first.counts.commands.keys ?? 0).toBe(1)
+
+    const second = await countRedisCommands(() =>
+      runScheduleSweep(new Date('2026-09-08T14:01:00.000Z'))
+    )
+    expect(second.result.fired).toHaveLength(0)
+    expect(second.counts.commands.keys ?? 0).toBe(0)
+    expect(second.counts.executes).toBe(0)
+  })
+
+  it('still fires the moment the schedule is actually due', async () => {
+    await seedSchedule({ name: 'Soon', nextRunAt: '2026-09-08T14:02:00.000Z' })
+
+    const early = await runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'))
+    expect(early.fired).toHaveLength(0)
+    // A sweep that skipped the walk must not skip the fire: the cache knows when the
+    // earliest run is, so the tick that reaches it walks.
+    const onTime = await runScheduleSweep(new Date('2026-09-08T14:02:00.000Z'))
+    expect(onTime.fired).toHaveLength(1)
+    expect(deliverScheduledDm).toHaveBeenCalledTimes(1)
+  })
+
+  it('notices a schedule created after the last walk', async () => {
+    await seedSchedule({ name: 'Tomorrow', nextRunAt: '2026-09-09T14:00:00.000Z' })
+    await runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'))
+
+    // `createSchedule` invalidates, which is the whole reason the cache is safe to trust.
+    const fresh = await createSchedule({
+      userId: USER,
+      agentId: COOPER,
+      name: 'Just added',
+      cadence: { type: 'interval', everyMinutes: 30 },
+      timeZone: CHICAGO,
+      message: 'Say hello.',
+      now: new Date('2026-09-08T14:00:30.000Z')
+    })
+    expect(Date.parse(fresh.nextRunAt)).toBe(Date.parse('2026-09-08T14:30:30.000Z'))
+
+    const report = await runScheduleSweep(new Date('2026-09-08T14:30:30.000Z'))
+    expect(report.fired.map((entry) => entry.name)).toEqual(['Just added'])
   })
 })

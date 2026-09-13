@@ -2,8 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { env } from '$env/dynamic/private'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
-import { createSchedule, getSchedule } from '$lib/server/services/schedules/scheduleStore'
-import { __resetScheduleTickerForTests } from '$lib/server/services/schedules/scheduleTicker'
+import {
+  __resetScheduleDueCacheForTests,
+  createSchedule,
+  getSchedule
+} from '$lib/server/services/schedules/scheduleStore'
+import {
+  __resetScheduleTickerForTests,
+  runScheduleSweep
+} from '$lib/server/services/schedules/scheduleTicker'
 
 /**
  * SA-115 P1 (DL-115-13) — `POST /api/internal/schedules/sweep`.
@@ -64,6 +71,7 @@ beforeEach(async () => {
     outcome: 'woke: session-seeded'
   })
   __resetScheduleTickerForTests()
+  __resetScheduleDueCacheForTests()
   previousToken = envRecord.BATSHIT_TOKEN
   previousFlag = envRecord.BATSHIT_ENABLE_WAKE_TEST_TRIGGER
   envRecord.BATSHIT_TOKEN = 'test-service-token'
@@ -145,5 +153,53 @@ describe('sweeping', () => {
     const response = await call({ token: 'test-service-token', body: { now: 'tomorrow-ish' } })
     expect(response.status).toBe(400)
     expect(deliverScheduledDm).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * PR #106 review F-8 (DL-118-01) — this route always walks.
+ *
+ * The store now caches "nothing is due before T" and the ticker trusts it. This route must
+ * not: it exists to answer "is anything due NOW?" for a caller — a MegaSmoke row, a dev
+ * smoke — that has usually just written a schedule into Redis. That write is invisible to
+ * an in-process cache, so a route that trusted it would answer "nothing" about a schedule
+ * the caller had just created and made due.
+ */
+describe('the due cache (F-8, DL-118-01)', () => {
+  it('walks even when the cache says nothing can be due', async () => {
+    // One schedule, created ONCE — `createSchedule` invalidates the cache, so creating a
+    // second one here would hand the route a walk it did not have to ask for and the test
+    // would pass whether or not the route forces one.
+    const record = await seedDueSchedule('2026-09-09T14:00:00.000Z')
+
+    // Prime: the TICKER's own sweep learns "nothing is due before tomorrow". It has to be
+    // the ticker's kind of walk — a forced one, this route's kind, never publishes to the
+    // cache (review F-P1-7), so priming through the route would leave nothing to bypass.
+    const primed = await runScheduleSweep(new Date('2026-09-08T14:00:00.000Z'))
+    expect(primed.fired).toHaveLength(0)
+
+    // Make it due the way a seeder does — a raw write, around the store, so nothing
+    // invalidates. This is exactly what a MegaSmoke row does before it triggers a sweep.
+    await redis.json.set(
+      `schedule:${record.id}`,
+      '$.nextRunAt',
+      '2026-09-08T14:00:00.000Z' as never
+    )
+
+    // The ticker, which trusts the cache, cannot see it. That is correct and is the whole
+    // reason this route exists — asserted here so the next line means something.
+    const tickerSweep = await runScheduleSweep(new Date('2026-09-08T14:00:30.000Z'))
+    expect(tickerSweep.fired).toHaveLength(0)
+    expect(deliverScheduledDm).not.toHaveBeenCalled()
+
+    const response = await call({
+      token: 'test-service-token',
+      body: { now: '2026-09-08T14:00:30.000Z' }
+    })
+    const report = await response.json()
+    expect(report.fired.map((entry: { scheduleId: string }) => entry.scheduleId)).toEqual([
+      record.id
+    ])
+    expect(deliverScheduledDm).toHaveBeenCalledTimes(1)
   })
 })

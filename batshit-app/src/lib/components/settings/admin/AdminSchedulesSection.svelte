@@ -230,6 +230,12 @@
         throw new Error(payload?.error || 'The schedule could not run.')
       }
       toast.success(`"${schedule.name}" ran: ${payload.outcome}`)
+      // PR #106 review F-16: the run fired but Batshit could not write it down, so this
+      // row's "last run" is about to be wrong. That is a real thing to tell the user —
+      // not an error, because the run itself happened.
+      if (payload?.recorded === false && typeof payload?.warning === 'string') {
+        toast.warning(payload.warning)
+      }
       onSchedulesChanged?.()
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'The schedule could not run.')

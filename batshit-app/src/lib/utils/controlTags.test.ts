@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   CONTROL_TAGS,
+  buildControlDenialRecord,
   buildControlErrorDcmLines,
   buildControlErrorRecord,
   controlTag,
@@ -139,5 +140,34 @@ describe('buildControlErrorDcmLines', () => {
 
   it('returns nothing for empty histories', () => {
     expect(buildControlErrorDcmLines([])).toEqual([])
+  })
+})
+
+describe('buildControlDenialRecord (PR #106 review F-17)', () => {
+  /**
+   * The sentence used to carry `decidedAt`'s UTC `HH:MM` with no zone marker, so a user in
+   * `America/Chicago` who denied at 09:32 had the agent told "(14:32)" — and the agent
+   * repeats that back to them. The DCM reads only the most recent assistant message, so
+   * position already says "this just happened"; the time added nothing the model could use
+   * and one thing it got wrong.
+   */
+  it('names the control and says not to retry, with NO clock time', () => {
+    const record = buildControlDenialRecord('Skill Import', '2026-09-10T14:35:00.000Z')
+    expect(record.error).toBe('Denied by the user: Skill Import — do not retry it.')
+    // Belt and braces: no `HH:MM` anywhere in the agent-facing sentence, in any zone.
+    expect(record.error).not.toMatch(/\d{1,2}:\d{2}/)
+  })
+
+  it('keeps the full ISO instant on the record, for machines', () => {
+    const record = buildControlDenialRecord('Skill Import', '2026-09-10T14:35:00.000Z')
+    expect(record.at).toBe('2026-09-10T14:35:00.000Z')
+    expect(record.kind).toBe('approval')
+    expect(record.tag).toBe('approval')
+  })
+
+  it('stamps now when the decision carries no instant', () => {
+    const before = Date.now()
+    const record = buildControlDenialRecord('Skill Import')
+    expect(Date.parse(record.at!)).toBeGreaterThanOrEqual(before)
   })
 })

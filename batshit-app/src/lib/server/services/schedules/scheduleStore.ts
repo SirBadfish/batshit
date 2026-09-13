@@ -136,19 +136,100 @@ export async function getOwnedSchedule(
   return requireOwnedSchedule(userId, scheduleId)
 }
 
+/* ------------------------------------------------------------------ *
+ * The due cache (SA-118 DL-118-01)
+ * ------------------------------------------------------------------ */
+
+/**
+ * How long a "nothing is due before T" answer may be trusted without re-walking.
+ *
+ * The bound exists because the cache is in-process and the keyspace is not: a restore, a
+ * second node, or a bug that forgets to invalidate would otherwise park the clock forever.
+ * Five minutes is short enough that the worst case is one late fire and long enough that a
+ * quiet instance walks 12 times an hour instead of 60.
+ */
+export const SCHEDULE_DUE_CACHE_MAX_MS = 5 * 60_000
+
+/**
+ * What the last walk saw, and when.
+ *
+ * `earliestDueAtMs` is the earliest `nextRunAt` across every ENABLED schedule the walk
+ * met, due or not — `null` means this instance has no enabled schedule at all. It is not
+ * "the earliest due one": a cache built only from due schedules would say nothing about
+ * the one that becomes due in 90 seconds.
+ */
+let dueCache: { computedAtMs: number; earliestDueAtMs: number | null } | null = null
+
+/**
+ * Bumped by every invalidation so a walk that started BEFORE a write cannot publish its
+ * stale answer after it.
+ *
+ * Without this: a sweep reads the keyspace, a user creates a schedule due in ten seconds
+ * (clearing the cache), and the sweep then writes back the earliest time it saw — which
+ * does not know about the new schedule. The next sweeps would skip the walk until the
+ * five-minute bound expired. A walk only publishes when the generation it started on is
+ * still current.
+ */
+let dueCacheGeneration = 0
+
+/**
+ * Forget "nothing is due before T".
+ *
+ * **Every writer that can move a `nextRunAt`, enable a schedule, or add or remove one must
+ * call this**, including `restoreBackupBundle` and `restoreStagedBackup`, which write
+ * `schedules:{userId}` and the records under it directly rather than through this store.
+ * A missed invalidation is a schedule that does not fire until the bound expires.
+ */
+export function invalidateScheduleDueCache(): void {
+  dueCache = null
+  dueCacheGeneration += 1
+}
+
+/** Tests only: a known-empty cache, so a suite cannot inherit another's walk. */
+export function __resetScheduleDueCacheForTests(): void {
+  invalidateScheduleDueCache()
+}
+
 /**
  * Every enabled schedule on the instance whose next run has arrived, oldest due first.
  *
- * Enumerating index keys rather than agents (the dreaming sweep's shape) keeps the sweep
+ * Enumerating index keys rather than agents (the dreaming sweep's shape) keeps the walk
  * proportional to "users who actually have schedules", which on a single-user instance is
  * one key. A disabled schedule is skipped here rather than in the ticker so "paused" can
  * never be confused with "missed".
+ *
+ * **It does not walk when nothing can be due** (PR #106 review F-8). The walk itself is
+ * `KEYS`, which is O(every key in the database) and blocks Redis's single command thread
+ * for the scan — cheap on the ~1,900-key live instance, but paid every 60 seconds forever,
+ * including on an instance with no schedules at all. So a walk also records the earliest
+ * enabled `nextRunAt` it saw, and a later call inside `SCHEDULE_DUE_CACHE_MAX_MS` that
+ * cannot have reached it returns `[]` without touching Redis.
+ *
+ * `KEYS` stays rather than becoming `SCAN`: `SCAN` is non-blocking and would be the better
+ * primitive, but it is in neither the Vitest Redis fake nor `redisPrimitiveConformance`,
+ * and adding a primitive is its own change with its own conformance obligations.
+ *
+ * `{ walk: true }` forces the walk. The ticker never passes it — the cache is the whole
+ * point there — and `/api/internal/schedules/sweep` and the tests always do, so a fire can
+ * still be proved on demand rather than waited for.
  */
-export async function listDueSchedules(now: Date): Promise<ScheduleRecord[]> {
+export async function listDueSchedules(
+  now: Date,
+  options: { walk?: boolean } = {}
+): Promise<ScheduleRecord[]> {
+  if (options.walk !== true && dueCache) {
+    const fresh = now.getTime() - dueCache.computedAtMs < SCHEDULE_DUE_CACHE_MAX_MS
+    const nothingReachedYet =
+      dueCache.earliestDueAtMs === null || dueCache.earliestDueAtMs > now.getTime()
+    if (fresh && nothingReachedYet) return []
+  }
+
+  const generation = dueCacheGeneration
   const indexKeys = await redis.execute(async (client) =>
     client.keys(`${SCHEDULES_INDEX_PREFIX}*`)
   )
   const due: ScheduleRecord[] = []
+  let earliestDueAtMs: number | null = null
 
   for (const indexKey of Array.isArray(indexKeys) ? (indexKeys as string[]) : []) {
     const userId = indexKey.slice(SCHEDULES_INDEX_PREFIX.length)
@@ -158,9 +239,22 @@ export async function listDueSchedules(now: Date): Promise<ScheduleRecord[]> {
       if (!record || record.userId !== userId) continue
       if (record.enabled !== true) continue
       const nextRunAt = readInstant(record.nextRunAt)
-      if (!nextRunAt || nextRunAt.getTime() > now.getTime()) continue
+      if (!nextRunAt) continue
+      if (earliestDueAtMs === null || nextRunAt.getTime() < earliestDueAtMs) {
+        earliestDueAtMs = nextRunAt.getTime()
+      }
+      if (nextRunAt.getTime() > now.getTime()) continue
       due.push(record)
     }
+  }
+
+  // A forced walk answers ITS caller's question and leaves the cache to the ticker (SA-118
+  // P1 review, F-P1-7). The internal route and the tests pass their own `now`; a cache
+  // stamped with a simulated clock a day ahead would read as `fresh` for a day and five
+  // minutes at real time, not five, which is the bound's whole promise. The next unforced
+  // tick walks once and publishes with the real clock.
+  if (options.walk !== true && generation === dueCacheGeneration) {
+    dueCache = { computedAtMs: now.getTime(), earliestDueAtMs }
   }
 
   return due.sort((a, b) => a.nextRunAt.localeCompare(b.nextRunAt))
@@ -260,6 +354,7 @@ export async function createSchedule(options: {
 
   await redis.json.set(scheduleKey(record.id), '$', record as never)
   await redis.execute(async (client) => client.sAdd(schedulesIndexKey(record.userId), record.id))
+  invalidateScheduleDueCache()
   return toScheduleSummary(record)
 }
 
@@ -397,6 +492,7 @@ export async function patchSchedule(options: {
       : {}),
     updatedAt: now.toISOString()
   })
+  invalidateScheduleDueCache()
 
   const updated = await getSchedule(current.id)
   if (!updated) throw new ScheduleError('That schedule was not found.', 404)
@@ -410,6 +506,7 @@ export async function deleteSchedule(options: {
   const record = await requireOwnedSchedule(options.userId, options.scheduleId)
   await redis.del(scheduleKey(record.id))
   await removeIndexMember(record.userId, record.id)
+  invalidateScheduleDueCache()
 }
 
 /**
@@ -443,6 +540,7 @@ export async function recordFire(options: {
     ...(options.nextRunAt ? { nextRunAt: options.nextRunAt.toISOString() } : {}),
     updatedAt: options.ranAt.toISOString()
   })
+  invalidateScheduleDueCache()
   try {
     await redis.json.numIncrBy(scheduleKey(options.scheduleId), '$.runCount', 1)
   } catch (error) {
@@ -481,6 +579,7 @@ export async function disableScheduleAfterFailure(
     lastOutcome: `failed: ${reason}`,
     updatedAt: now.toISOString()
   })
+  invalidateScheduleDueCache()
 }
 
 /**
@@ -520,6 +619,7 @@ export async function collapseMissedRun(options: {
     nextRunAt: collapse.nextRunAt.toISOString(),
     updatedAt: now.toISOString()
   })
+  invalidateScheduleDueCache()
 
   return {
     dueAt: missedRun.dueAt,
@@ -546,6 +646,7 @@ export async function clearMissedRun(options: {
     missedRun: null,
     updatedAt: now.toISOString()
   })
+  invalidateScheduleDueCache()
   const updated = await getSchedule(record.id)
   if (!updated) throw new ScheduleError('That schedule was not found.', 404)
   return toScheduleSummary(updated)
@@ -576,5 +677,11 @@ export async function sweepAgentSchedules(agentId: string): Promise<number> {
     await removeIndexMember(userId, id)
     deleted += 1
   }
+  // F-P1-1: DL-118-01's rule is "every writer in the store", and this is one. Its
+  // enumeration does not name it, which is safe only because this sweep DELETES — it can
+  // move the earliest enabled run later, never earlier, and a cache pointing at a deleted
+  // schedule costs one wasted walk. That is a fact about today's body, not a contract, so
+  // the invalidation goes here rather than the reasoning in a comment somewhere else.
+  if (deleted > 0) invalidateScheduleDueCache()
   return deleted
 }

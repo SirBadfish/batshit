@@ -1,16 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
+import { countRedisCommands } from '$lib/test-utils/redis-command-counter'
 import { redis } from '$lib/server/redis'
 import {
   MAX_SCHEDULES_PER_AGENT,
   MAX_SCHEDULES_PER_INSTANCE
 } from '$lib/utils/scheduleControl'
 import {
+  SCHEDULE_DUE_CACHE_MAX_MS,
   ScheduleError,
+  __resetScheduleDueCacheForTests,
   clearMissedRun,
   collapseMissedRun,
   createSchedule,
   deleteSchedule,
+  disableScheduleAfterFailure,
   getSchedule,
   listDueSchedules,
   listSchedules,
@@ -69,6 +73,9 @@ async function indexMembers(userId: string): Promise<string[]> {
 }
 
 beforeEach(async () => {
+  // The due cache is module-level, so it outlives a test unless it is cleared. Every
+  // assertion below about walking or not walking depends on starting from "unknown".
+  __resetScheduleDueCacheForTests()
   await seedAgent(COOPER)
   await seedAgent(FAYE)
 })
@@ -212,7 +219,7 @@ describe('listing', () => {
     await redis.json.set(`schedule:${paused.id}`, '$.nextRunAt', '2026-09-08T10:00:00.000Z' as never)
     await redis.json.set(`schedule:${paused.id}`, '$.enabled', false as never)
 
-    const result = await listDueSchedules(new Date('2026-09-08T13:00:00.000Z'))
+    const result = await listDueSchedules(new Date('2026-09-08T13:00:00.000Z'), { walk: true })
     expect(result.map((entry) => entry.name)).toEqual(['Also due', 'Due'])
     expect(result.map((entry) => entry.id)).not.toContain(future.id)
     // A paused schedule is skipped entirely — it is off, not "missed".
@@ -496,7 +503,7 @@ describe('SA-115 F-P1-4 — the store is honest about what happened', () => {
 
     expect(updated.enabled).toBe(true)
     expect(Date.parse(updated.nextRunAt)).toBeGreaterThan(now.getTime())
-    expect(await listDueSchedules(now)).toHaveLength(0)
+    expect(await listDueSchedules(now, { walk: true })).toHaveLength(0)
   })
 
   /**
@@ -560,5 +567,178 @@ describe('SA-115 F-P1-4 — the store is honest about what happened', () => {
     const stored = await getSchedule(record.id)
     expect(stored?.lastOutcome).toBe('woke: session-1')
     expect(stored?.runCount).toBe(0)
+  })
+})
+
+/**
+ * PR #106 review F-8 (DL-118-01) — the sweep does not walk when nothing can be due.
+ *
+ * `listDueSchedules` runs `KEYS schedules:*` to find the per-user index sets. `KEYS` is
+ * O(every key in the database) and blocks Redis's single command thread for the scan, and
+ * the ticker called it **every 60 seconds forever, including on an instance with no
+ * schedules at all**. The fix is one module-level fact — "no enabled schedule is due
+ * before T" — so the claim to prove is about commands issued, not about results returned:
+ * "it returned nothing" is equally true of a walk that found nothing.
+ *
+ * `countRedisCommands` counts real commands on both lanes; see its header for why it does
+ * not use `vi.spyOn`.
+ */
+describe('the due cache (F-8, DL-118-01)', () => {
+  const NOW = new Date('2026-09-08T15:00:00.000Z')
+
+  /** A schedule whose next run is a day away, and one walk to learn that. */
+  async function primeWithNothingDue(now = NOW) {
+    const record = await createSchedule(baseInput({ now }))
+    // The create emptied the cache, so this UNFORCED call walks — and it is the ticker's
+    // kind of walk, the only kind that publishes (review F-P1-7): a forced walk never does.
+    const { counts } = await countRedisCommands(() => listDueSchedules(now))
+    expect(counts.commands.keys ?? 0).toBe(1)
+    return record
+  }
+
+  async function keysIssuedBy(now: Date): Promise<number> {
+    const { counts } = await countRedisCommands(() => listDueSchedules(now))
+    return counts.commands.keys ?? 0
+  }
+
+  it('walks the first time, because it knows nothing yet', async () => {
+    await createSchedule(baseInput({ now: NOW }))
+    expect(await keysIssuedBy(NOW)).toBe(1)
+  })
+
+  it('issues NO Redis command at all on a second call inside the bound', async () => {
+    await primeWithNothingDue()
+
+    const { result, counts } = await countRedisCommands(() =>
+      listDueSchedules(new Date(NOW.getTime() + 60_000))
+    )
+
+    expect(result).toEqual([])
+    // Not just "no KEYS": nothing is read at all, which is the point on an idle instance.
+    expect(counts.commands.keys ?? 0).toBe(0)
+    expect(counts.executes).toBe(0)
+  })
+
+  it('walks again once the cached earliest run has arrived', async () => {
+    const record = await createSchedule(baseInput({ now: NOW }))
+    // Two minutes out, so this test is about the earliest-run bound and not the
+    // five-minute one. Written raw and BEFORE the priming walk, so the walk is what
+    // learns it — going through the store here would just invalidate the cache.
+    const dueAt = new Date(NOW.getTime() + 2 * 60_000)
+    await redis.json.set(`schedule:${record.id}`, '$.nextRunAt', dueAt.toISOString() as never)
+    // Unforced: the create emptied the cache, so this call walks — and it is the ticker's
+    // kind of walk, the only kind that publishes (review F-P1-7).
+    await countRedisCommands(() => listDueSchedules(NOW))
+
+    // One second before the stored next run: still nothing that can be due.
+    expect(await keysIssuedBy(new Date(dueAt.getTime() - 1000))).toBe(0)
+    // The moment it arrives, the cache stops answering and the walk happens.
+    expect(await keysIssuedBy(dueAt)).toBe(1)
+  })
+
+  it('walks again once the five-minute bound expires, even with nothing due', async () => {
+    await primeWithNothingDue()
+
+    // The cache is in-process and the keyspace is not, so trusting it forever would let a
+    // restore or a missed invalidation park the clock. One minute in: still trusted.
+    expect(await keysIssuedBy(new Date(NOW.getTime() + 60_000))).toBe(0)
+    expect(await keysIssuedBy(new Date(NOW.getTime() + SCHEDULE_DUE_CACHE_MAX_MS))).toBe(1)
+  })
+
+  it('trusts "no schedules at all" the same way, and stops walking an empty instance', async () => {
+    const { counts: first } = await countRedisCommands(() => listDueSchedules(NOW))
+    expect(first.commands.keys ?? 0).toBe(1)
+    // This is the case F-8 is really about: nothing exists, and the old code scanned the
+    // whole keyspace for it once a minute, forever.
+    expect(await keysIssuedBy(new Date(NOW.getTime() + 60_000))).toBe(0)
+  })
+
+  it('walks whenever it is told to, cache or no cache', async () => {
+    await primeWithNothingDue()
+    const { counts } = await countRedisCommands(() =>
+      listDueSchedules(new Date(NOW.getTime() + 60_000), { walk: true })
+    )
+    expect(counts.commands.keys ?? 0).toBe(1)
+  })
+
+  it("does not let a forced walk stamp the cache with its caller's clock (review F-P1-7)", async () => {
+    // The internal route and the tests pass their own `now`. If a walk forced a day ahead
+    // published "nothing due before tomorrow" with a computedAt a day in the future, the
+    // ticker at real time would read it as fresh for a day and five minutes, not five —
+    // and the five-minute bound is the whole promise behind trusting an in-process cache.
+    await createSchedule(baseInput({ now: NOW }))
+    const aDayAhead = new Date(NOW.getTime() + 24 * 60 * 60_000)
+    await listDueSchedules(aDayAhead, { walk: true })
+    expect(await keysIssuedBy(NOW)).toBe(1)
+  })
+
+  it('does not let a walk that started before a write publish its stale answer', async () => {
+    // A sweep reads the keyspace; a schedule is created while it is reading; the sweep then
+    // writes back the earliest run it saw, which knows nothing about the new one. Without
+    // the generation guard the next sweeps would skip the walk until the bound expired.
+    const soon = new Date(NOW.getTime() + 90_000)
+    const originalExecute = redis.execute
+    let interleaved = false
+    ;(redis as any).execute = async (operation: any) => {
+      const value = await (originalExecute as any).call(redis, operation)
+      if (!interleaved) {
+        interleaved = true
+        const created = await createSchedule(baseInput({ name: 'Snuck in', now: NOW }))
+        await redis.json.set(
+          `schedule:${created.id}`,
+          '$.nextRunAt',
+          soon.toISOString() as never
+        )
+      }
+      return value
+    }
+    try {
+      await listDueSchedules(NOW, { walk: true })
+    } finally {
+      ;(redis as any).execute = originalExecute
+    }
+
+    // The interleaved create invalidated the cache, so the walk's answer was discarded.
+    expect(await keysIssuedBy(new Date(NOW.getTime() + 1000))).toBe(1)
+  })
+
+  /**
+   * One row per writer. DL-118-01's rule is "every writer in the store invalidates"; its
+   * enumeration does not name `sweepAgentSchedules`, which is safe today only because that
+   * sweep deletes — it can move the earliest run later, never earlier (F-P1-1). The rule is
+   * what is pinned here, so a writer added later without an invalidation fails a test
+   * instead of quietly delaying a fire by up to five minutes.
+   */
+  describe('every writer makes the next sweep walk', () => {
+    const writers: [name: string, act: (scheduleId: string) => Promise<unknown>][] = [
+      ['createSchedule', () => createSchedule(baseInput({ name: 'Another', now: NOW }))],
+      ['patchSchedule', (id) => patchSchedule({ userId: USER, scheduleId: id, name: 'Renamed' })],
+      ['recordFire', (id) => recordFire({ scheduleId: id, ranAt: NOW, outcome: 'woke: s' })],
+      [
+        'collapseMissedRun',
+        // Two days on, so the seeded schedule really is overdue: `collapseMissedRuns`
+        // refuses to invent a missed run for one that is not.
+        async (id) =>
+          collapseMissedRun({
+            schedule: (await getSchedule(id))!,
+            now: new Date('2026-09-10T15:00:00.000Z')
+          })
+      ],
+      ['disableScheduleAfterFailure', (id) => disableScheduleAfterFailure(id, 'unknown zone', NOW)],
+      ['clearMissedRun', (id) => clearMissedRun({ userId: USER, scheduleId: id, now: NOW })],
+      ['deleteSchedule', (id) => deleteSchedule({ userId: USER, scheduleId: id })],
+      ['sweepAgentSchedules', () => sweepAgentSchedules(COOPER)]
+    ]
+
+    for (const [name, act] of writers) {
+      it(name, async () => {
+        const record = await primeWithNothingDue()
+        expect(await keysIssuedBy(new Date(NOW.getTime() + 1000))).toBe(0)
+
+        await act(record.id)
+
+        expect(await keysIssuedBy(new Date(NOW.getTime() + 2000))).toBe(1)
+      })
+    }
   })
 })

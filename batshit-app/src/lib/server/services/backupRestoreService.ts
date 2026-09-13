@@ -13,6 +13,7 @@ import type { Entry, ZipFile } from 'yauzl'
 
 import { redis } from '$lib/server/redis'
 import { reconcileMemoryIndexesAfterRestore } from '$lib/server/services/memory/memoryIndex'
+import { invalidateScheduleDueCache } from '$lib/server/services/schedules/scheduleStore'
 import {
   GOON_RECIPE_OWNER_V2_CONTRACT,
   GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
@@ -2679,6 +2680,12 @@ export async function restoreBackupBundle(
     )
   }
 
+  // SA-118 DL-118-01: this restore wrote `schedules:{userId}` and the records under it
+  // directly, around the schedule store — so the store's in-process "nothing is due before
+  // T" cache is describing the keyspace that was just replaced. Without this the ticker
+  // could ignore a restored schedule for up to five minutes.
+  invalidateScheduleDueCache()
+
   return {
     restored: true,
     redisRecordCount: targetRecords.length,
@@ -3446,6 +3453,10 @@ export async function restoreStagedBackup(
         memoryIndexError
       )
     }
+
+    // SA-118 DL-118-01 — same reason as `restoreBackupBundle`: the schedule keyspace was
+    // replaced from outside the store, so its due cache has to be thrown away.
+    invalidateScheduleDueCache()
 
     return {
       restored: true,
