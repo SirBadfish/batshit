@@ -564,6 +564,37 @@ describe('Codex app-server steering (DL-114-06, AMD-114-02)', () => {
       await pump
     })
 
+    it('rejects a turn/steer still in flight when the turn finishes normally, at once (review F-P2-4)', async () => {
+      // The first test covers the child dying (`finishWithError`); this one covers the turn
+      // COMPLETING with the steer's RPC unanswered (`finishNormally`). Faye's P2 review found
+      // that removing `failPending` from the normal finish left every test green — the lock
+      // names all three close paths, so each needs its own pin.
+      const fake = createFakeAppServer({ hangSteer: true })
+      const run = startRun(fake.child)
+      const pump = (async () => {
+        for await (const _event of run.events) void _event
+      })().catch(() => {})
+
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const steering = run.steer({ steerIds: ['steer_1'], text: STEER_TEXT })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(fake.steerRequests).toHaveLength(1)
+
+      fake.send({
+        jsonrpc: '2.0',
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } }
+      })
+
+      const result = await raceShort(steering)
+      expect(result).not.toBe('TIMED_OUT')
+      expect(result).toMatchObject({ accepted: false })
+      expect((result as { reason: string }).reason).toContain(
+        'Codex app-server closed before turn/steer answered'
+      )
+      await pump
+    })
+
     it('releases a steer parked on turnReady when the turn finishes normally', async () => {
       // `finishWithError` and `cleanup` both settled `turnReady`; `finishNormally` did not,
       // so a steer waiting in the pre-`turn/started` window waited for the stream to drain

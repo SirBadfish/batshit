@@ -183,7 +183,7 @@ A schedule keeps at most **one** missed entry, so a weekly schedule missed three
 
 If Batshit was only briefly asleep — under ten minutes — the run simply happens late, and the message says when it was due.
 
-### What a row shows, and the three things you can do to it
+### What a row shows, and the four things you can do to it
 
 Each row carries the schedule's name and badges for its agent, its cadence, what it does (*Starts a chat* or *Waits in the inbox*), and *Assignment* or *Created by the agent* where those apply. Under them: the next run in the schedule's own zone, and the last run with how it went and how many times it has run.
 
@@ -193,7 +193,9 @@ Each row carries the schedule's name and badges for its agent, its cadence, what
 
 **Delete** asks first, and warns that the schedule's history goes with it. The chats it already started stay where they are.
 
-There is no edit button. A schedule's time, message, or zone cannot be changed from this card — make a new one and delete the old, or ask the agent whose schedule it is to change it (that counts as a risky action, so it comes back to you for approval).
+**Edit** opens the schedule in the same form you used to make it, headed **Edit Schedule**. You can change the **Name**, **How Often** (and its minutes, time, or weekdays), the **Time Zone**, the **Message**, the **Kind**, and **What It Does**. **Save changes** applies them straight away: the row's next run is recalculated from the moment you save, so an edited time governs the very next run with no reload. **Cancel** changes nothing.
+
+Two things are deliberately not on that form. **The agent is shown but cannot be changed** — the form says so: *To move a schedule to another agent, create a new one.* And **pausing is not there either**: that is the switch on the row, so a form left open cannot resume a schedule you paused somewhere else.
 
 ### When Batshit switches a schedule off
 
@@ -330,7 +332,7 @@ Turning Agent DMs on for an agent also adds a short block to its system prompt a
 | A schedule was due while Batshit was closed and never ran | That is on purpose. Missed runs wait for you. | The *Missed while Batshit was off* dialog on your next open. |
 | Skip turned my schedule off | It did not. Skip skips one run. | The row's switch still says on, and the next run is shown. |
 | An agent can't create a schedule | Agent DMs is off for it, or you have not approved the action. | Agent Settings → Agent DMs, then approve when asked. |
-| The agent's schedule shows the wrong time zone | An agent's call has no browser to read your zone from, so it gets the server's — your own on the Mac app, usually UTC in Docker. | The card has no edit control. Delete it and make a new one with the right zone, or ask the agent to change its own schedule and approve that. |
+| The agent's schedule shows the wrong time zone | An agent's call has no browser to read your zone from, so it gets the server's — your own on the Mac app, usually UTC in Docker. | Press **Edit** on the row, pick the right **Time Zone**, and **Save changes**. The next run is recalculated as you save. |
 | A schedule says *Paused* and its last run says `failed:` | Batshit could not work out when it should next run, so it switched the schedule off instead of failing every minute. | The reason is on the row. Deleting it and making a fresh one is the reliable fix. |
 | Run now ran a paused schedule | On purpose — the button means "once, now". | Pausing only stops the automatic times. |
 
