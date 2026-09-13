@@ -65,10 +65,16 @@ The card names the action, not the plumbing. It shows a badge saying **Confirm**
 A few things worth knowing:
 
 - **One click, one action.** Approving "delete memory A" does not unlock "delete memory B", and it does not unlock the same action again tomorrow. If the agent changes anything about the input, that is a different action and you get a new card.
+- **There is no "always allow", on purpose.** Every risky action asks, every time. A switch that turned the asking off would be clicked once, on a quiet afternoon, and would still be off the day it mattered.
 - **The agent cannot approve itself**, and neither can another agent, a webhook, an n8n workflow, or anything written inside a message. Your click is the only thing that counts.
 - **Nothing is cancelled while a card waits.** The turn ends normally. A card raised by an API agent expires after three minutes (ask again and you get a fresh one); a card on a Codex or Claude agent says **Waits for you** and has no clock at all.
 - **A chat that started on its own** — from an Agent DM, a webhook, or a schedule — raises exactly the same card, and Batshit marks that chat **Needs you** so you can find it. See [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md#risky-actions-wait-for-you).
-- **One exception, on purpose:** a [Portable Skill Token](../reference/portable-skills.md) you minted yourself carries its own approval, because you chose which families it could touch when you created it. There is no chat there to click in.
+- **A [Portable Skill Token](../reference/portable-skills.md) carries its own approval** in an ordinary chat, because you chose which families it could touch when you minted it, and there is no chat there to click in. In a chat that started on its own it does not: a woken chat is driven by text somebody else wrote, so it gets the card like anything else.
+
+Two places where there is no card at all:
+
+- **Group chats.** Batshit refuses a risky action there instead of pausing — *"Risky controls are not available in group chats. Ask the user in a direct chat with this agent."* A card in a Group would be abandoned the moment the next agent speaks. Ask the same agent in a direct chat and approve it there.
+- **A call with no chat behind it** — an n8n workflow, or a script holding a raw token. Batshit stops the action and tells the agent there is no Approve button to show you. Nothing runs and nothing waits. Ask for the same thing in a normal chat with that agent, where the card appears.
 
 Every decision is recorded. Open the **Execution Viewer** on a message to see the action's real name and whether its approval was approved, denied, or expired.
 

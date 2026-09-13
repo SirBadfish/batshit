@@ -683,11 +683,55 @@ export async function markApprovalExpired(approvalId: unknown): Promise<boolean>
 }
 
 /**
+ * The ONE read of `control_approvals:{sessionId}` — oldest first, as the ZSET stores it.
+ *
+ * `findApprovedMatch`, `listSessionApprovals` and `sweepSessionApprovals` had three copies
+ * of this line. They are kept together because the index's ordering and the fact that it is
+ * scored by `requestedAt` are facts three callers reason about, and a fourth caller
+ * spelling it a fourth way is how the self-heal below would get missed.
+ *
+ * **Newest-first is still JS `.reverse()`** and not the server's `{ REV: true }` (PR #106
+ * review F-18 suggested the option). The Vitest Redis fake's `zRange` takes
+ * `(key, start, stop)` with no options argument, and `redisPrimitiveConformance.test.ts`
+ * does not cover the option either — so passing it would work against real Redis and be
+ * silently ignored by the fake, which is the exact shape of bug the conformance suite
+ * exists to catch. Teaching the fake a new primitive is its own change.
+ */
+async function readApprovalIndexIds(sessionId: string): Promise<string[]> {
+  const ids = await redis.execute(async (client) =>
+    client.zRange(controlApprovalsIndexKey(sessionId), 0, -1)
+  )
+  return Array.isArray(ids) ? (ids as string[]) : []
+}
+
+/**
+ * Drop one id from a session's index. Self-heal only — never a way to revoke an approval.
+ */
+async function forgetApprovalIndexMember(sessionId: string, approvalId: string): Promise<void> {
+  await redis.execute(async (client) =>
+    client.zRem(controlApprovalsIndexKey(sessionId), approvalId)
+  )
+}
+
+/**
  * Find the approved record that unlocks THIS call, if one exists.
  *
  * Matched on every field that makes a call the same call, so "the user approved deleting
  * memory X" can never unlock "delete memory Y", and a retry with different input bytes
  * finds nothing and earns a new card (DL-116-08).
+ *
+ * **It prunes as it goes** (PR #106 review F-18). Records carry a 24-hour TTL; their ids
+ * were never removed from the index, and the index's own TTL is refreshed by every write —
+ * so in a busy session dead ids accumulated and this function, which runs on EVERY non-safe
+ * control call, paid one `JSON.GET` per historical id, nearly all of them null. An id whose
+ * record is gone is removed from the index the first time it is met, which is what
+ * `listSchedules` and `listAgentRunCredentialIds` already do.
+ *
+ * The prune is deliberately NOT `zRemRangeByScore(0, now − 24 h)`: the score is
+ * `Date.parse(requestedAt)`, but a DECISION rewrites the record and refreshes its TTL, so a
+ * record approved late in its window outlives its score by up to another 24 hours. Pruning
+ * by score could drop a LIVE approval from the index, and the retry that should have spent
+ * it would raise a second card at the user instead.
  */
 export async function findApprovedMatch(criteria: {
   userId: string
@@ -698,15 +742,15 @@ export async function findApprovedMatch(criteria: {
 }): Promise<ControlApprovalRecord | null> {
   const sessionId = trimmed(criteria.sessionId)
   if (!sessionId) return null
-  const ids = await redis.execute(async (client) =>
-    client.zRange(controlApprovalsIndexKey(sessionId), 0, -1)
-  )
-  if (!Array.isArray(ids)) return null
+  const ids = await readApprovalIndexIds(sessionId)
   // Newest first: an agent that re-asked for the same call twice should spend the click the
   // user most recently made.
-  for (const id of [...(ids as string[])].reverse()) {
+  for (const id of [...ids].reverse()) {
     const record = await getControlApproval(id)
-    if (!record) continue
+    if (!record) {
+      await forgetApprovalIndexMember(sessionId, id)
+      continue
+    }
     if (matchesApproval(record, criteria)) return record
   }
   return null
@@ -781,11 +825,9 @@ export async function listSessionApprovals(
 ): Promise<SessionApprovalSummary[]> {
   const id = trimmed(sessionId)
   if (!id) return []
-  const ids = await redis.execute(async (client) =>
-    client.zRange(controlApprovalsIndexKey(id), 0, -1)
-  )
+  const ids = await readApprovalIndexIds(id)
   const summaries: SessionApprovalSummary[] = []
-  for (const approvalId of Array.isArray(ids) ? (ids as string[]) : []) {
+  for (const approvalId of ids) {
     const record = await getControlApproval(approvalId)
     if (!record || record.userId !== userId) continue
     summaries.push({
@@ -814,15 +856,14 @@ export async function listSessionApprovals(
 export async function sweepSessionApprovals(sessionId: string): Promise<number> {
   const id = trimmed(sessionId)
   if (!id) return 0
-  const indexKey = controlApprovalsIndexKey(id)
-  const ids = await redis.execute(async (client) => client.zRange(indexKey, 0, -1))
+  const ids = await readApprovalIndexIds(id)
   let deleted = 0
-  for (const approvalId of Array.isArray(ids) ? (ids as string[]) : []) {
+  for (const approvalId of ids) {
     if (!isWellFormedApprovalId(approvalId)) continue
     await redis.del(controlApprovalKey(approvalId))
     deleted += 1
   }
-  await redis.del(indexKey)
+  await redis.del(controlApprovalsIndexKey(id))
   return deleted
 }
 

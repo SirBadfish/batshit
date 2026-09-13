@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { Clock, Loader2, Play, Plus, Trash2 } from '@lucide/svelte'
+  import { Clock, Loader2, Pencil, Play, Plus, Trash2 } from '@lucide/svelte'
   import { toast } from 'svelte-sonner'
   import * as Card from '$lib/components/ui/card'
   import * as Dialog from '$lib/components/ui/dialog'
@@ -63,19 +63,34 @@
   let loadError = $state<string | null>(null)
   let busyScheduleId = $state<string | null>(null)
 
-  let createOpen = $state(false)
-  let creating = $state(false)
-  let createError = $state<string | null>(null)
-  let newName = $state('')
-  let newAgentId = $state('')
-  let newMessage = $state('')
-  let newKind = $state<ScheduleKind>('info')
-  let newDeliver = $state<ScheduleDeliveryMode>('wake')
-  let newCadenceType = $state<ScheduleCadence['type']>('daily')
-  let newEveryMinutes = $state(30)
-  let newAt = $state('09:00')
-  let newDays = $state<number[]>([2])
-  let newTimeZone = $state('UTC')
+  /**
+   * SA-118 P4 (DL-118-13) — ONE form, two modes.
+   *
+   * SA-115's acceptance criteria promised "create, pause, edit, run now, and delete" and
+   * the shipped card had four of the five: `PATCH /api/schedules/{id}` and `patchSchedule`
+   * have always accepted every field below, and nothing in the UI called them with more
+   * than `enabled`. A promised behaviour that did not ship is a fix, not new scope.
+   *
+   * Edit reuses this form rather than copying it, so the two modes cannot drift into two
+   * different ideas of what a schedule is. What edit mode changes is small and deliberate:
+   * the title, the submit button, a read-only Agent row, and where Save sends its body.
+   */
+  let formOpen = $state(false)
+  let formMode = $state<'create' | 'edit'>('create')
+  /** The schedule being edited, or `null` in create mode. */
+  let editingScheduleId = $state<string | null>(null)
+  let saving = $state(false)
+  let formError = $state<string | null>(null)
+  let formName = $state('')
+  let formAgentId = $state('')
+  let formMessage = $state('')
+  let formKind = $state<ScheduleKind>('info')
+  let formDeliver = $state<ScheduleDeliveryMode>('wake')
+  let formCadenceType = $state<ScheduleCadence['type']>('daily')
+  let formEveryMinutes = $state(30)
+  let formAt = $state('09:00')
+  let formDays = $state<number[]>([2])
+  let formTimeZone = $state('UTC')
 
   const agentById = $derived(new Map(agents.map((agent) => [agent.id, agent])))
   const timeZones = listSelectableTimeZones()
@@ -83,16 +98,16 @@
 
   /** The cadence the create form currently describes, or null while it is unusable. */
   const draftCadence = $derived.by<ScheduleCadence | null>(() => {
-    if (newCadenceType === 'interval') {
-      return Number.isInteger(newEveryMinutes) ? { type: 'interval', everyMinutes: newEveryMinutes } : null
+    if (formCadenceType === 'interval') {
+      return Number.isInteger(formEveryMinutes) ? { type: 'interval', everyMinutes: formEveryMinutes } : null
     }
-    if (newCadenceType === 'daily') return { type: 'daily', at: newAt }
-    if (newDays.length === 0) return null
-    return { type: 'weekly', days: [...newDays].sort((a, b) => a - b), at: newAt }
+    if (formCadenceType === 'daily') return { type: 'daily', at: formAt }
+    if (formDays.length === 0) return null
+    return { type: 'weekly', days: [...formDays].sort((a, b) => a - b), at: formAt }
   })
 
-  const canCreate = $derived(
-    Boolean(newName.trim()) && Boolean(newAgentId) && Boolean(newMessage.trim()) && draftCadence !== null
+  const canSubmit = $derived(
+    Boolean(formName.trim()) && Boolean(formAgentId) && Boolean(formMessage.trim()) && draftCadence !== null
   )
 
   function formatDate(value: string | null | undefined): string {
@@ -106,7 +121,7 @@
   }
 
   function toggleDay(day: number) {
-    newDays = newDays.includes(day) ? newDays.filter((entry) => entry !== day) : [...newDays, day]
+    formDays = formDays.includes(day) ? formDays.filter((entry) => entry !== day) : [...formDays, day]
   }
 
   async function load() {
@@ -120,7 +135,7 @@
       }
       schedules = payload.schedules ?? []
       agents = payload.agents ?? []
-      if (!newAgentId) newAgentId = agents[0]?.id ?? ''
+      if (!formAgentId) formAgentId = agents[0]?.id ?? ''
     } catch (error) {
       loadError = error instanceof Error ? error.message : 'Could not load schedules.'
     } finally {
@@ -137,16 +152,16 @@
    *
    * The browser is the only honest source of the user's zone: the Mac app's server clock is
    * theirs, but a Docker container's is usually UTC. Doing it in an effect that also read
-   * `newTimeZone` made the effect re-run on every change, which re-fetched the list on each
+   * `formTimeZone` made the effect re-run on every change, which re-fetched the list on each
    * selection and — worse — flipped a deliberately chosen `UTC` straight back to the local
    * zone, so a Mac user could not pick UTC at all. `onMount` runs once, so a later choice
    * (UTC included) simply stands.
    */
   onMount(() => {
     try {
-      newTimeZone = getLocalTimeZone()
+      formTimeZone = getLocalTimeZone()
     } catch {
-      newTimeZone = 'UTC'
+      formTimeZone = 'UTC'
     }
   })
 
@@ -161,22 +176,173 @@
     return { destroy: () => details.removeEventListener('toggle', onToggle) }
   }
 
+  /**
+   * The in-progress create form, parked while an edit borrows the fields (DL-118-13).
+   *
+   * One form means one set of variables, so opening Edit necessarily overwrites whatever
+   * the user had half-typed into New Schedule. It also puts the edited schedule's zone,
+   * cadence, kind and agent into the create form's memory, which the card has always kept
+   * between creates on purpose. F-P2-2 is the recorded lesson there: a zone the user chose
+   * deliberately must not be replaced behind their back. So the create fields are snapped
+   * on the way into edit mode and put back on the way out.
+   */
+  type CreateDraft = {
+    name: string
+    agentId: string
+    message: string
+    kind: ScheduleKind
+    deliver: ScheduleDeliveryMode
+    cadenceType: ScheduleCadence['type']
+    everyMinutes: number
+    at: string
+    days: number[]
+    timeZone: string
+  }
+  let parkedCreateDraft: CreateDraft | null = null
+
+  function snapshotForm(): CreateDraft {
+    return {
+      name: formName,
+      agentId: formAgentId,
+      message: formMessage,
+      kind: formKind,
+      deliver: formDeliver,
+      cadenceType: formCadenceType,
+      everyMinutes: formEveryMinutes,
+      at: formAt,
+      days: [...formDays],
+      timeZone: formTimeZone
+    }
+  }
+
+  function applyToForm(draft: CreateDraft) {
+    formName = draft.name
+    formAgentId = draft.agentId
+    formMessage = draft.message
+    formKind = draft.kind
+    formDeliver = draft.deliver
+    formCadenceType = draft.cadenceType
+    formEveryMinutes = draft.everyMinutes
+    formAt = draft.at
+    formDays = [...draft.days]
+    formTimeZone = draft.timeZone
+  }
+
+  function openCreate() {
+    if (parkedCreateDraft) {
+      applyToForm(parkedCreateDraft)
+      parkedCreateDraft = null
+    }
+    formMode = 'create'
+    editingScheduleId = null
+    formError = null
+    formOpen = true
+  }
+
+  /** Fill the form from a row, in the same shapes `draftCadence` builds (DL-118-13). */
+  function openEdit(schedule: ScheduleSummary) {
+    if (formMode === 'create' && !parkedCreateDraft) parkedCreateDraft = snapshotForm()
+    formMode = 'edit'
+    editingScheduleId = schedule.id
+    formError = null
+    formName = schedule.name
+    formAgentId = schedule.agentId
+    formMessage = schedule.message
+    formKind = schedule.kind
+    formDeliver = schedule.deliver
+    formCadenceType = schedule.cadence.type
+    if (schedule.cadence.type === 'interval') {
+      formEveryMinutes = schedule.cadence.everyMinutes
+    } else {
+      formAt = schedule.cadence.at
+      // A daily schedule has no days of its own; the ones already in the form stay, so
+      // switching How Often to weekly offers a sensible starting set rather than none.
+      if (schedule.cadence.type === 'weekly') formDays = [...schedule.cadence.days]
+    }
+    formTimeZone = schedule.timeZone
+    formOpen = true
+  }
+
+  function closeForm() {
+    formOpen = false
+    if (formMode === 'edit' && parkedCreateDraft) {
+      applyToForm(parkedCreateDraft)
+      parkedCreateDraft = null
+    }
+    formMode = 'create'
+    editingScheduleId = null
+    formError = null
+  }
+
+  function submitForm() {
+    if (formMode === 'edit') return saveEdit()
+    return createSchedule()
+  }
+
+  /**
+   * Save an edit (DL-118-13).
+   *
+   * The body carries exactly the fields this form owns. **Never `enabled`** — that belongs
+   * to the row's pause switch, and sending it here would let a stale form value flip a
+   * schedule the user paused in another tab. **Never `agentId`** — the store has no agent
+   * patch by design, and the form says so.
+   *
+   * A refusal keeps the dialog open with the route's own sentence, the way the create path
+   * does: the user's typing is still in front of them and is the thing they have to change.
+   */
+  async function saveEdit() {
+    if (!canSubmit || !draftCadence || !editingScheduleId) return
+    const scheduleId = editingScheduleId
+    saving = true
+    formError = null
+    try {
+      const response = await fetch(`/api/schedules/${scheduleId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: formName.trim(),
+          cadence: draftCadence,
+          timeZone: formTimeZone,
+          message: formMessage.trim(),
+          kind: formKind,
+          deliver: formDeliver
+        })
+      })
+      const payload = await response.json()
+      if (!response.ok || !payload?.success) {
+        throw new Error(
+          [payload?.error, payload?.hint].filter(Boolean).join(' ') || 'Could not update the schedule.'
+        )
+      }
+      // The route answers with the recomputed record, so the row's next run moves here with
+      // no reload (LS-046) — that is the whole point of `patchSchedule` recomputing it.
+      schedules = schedules.map((entry) => (entry.id === scheduleId ? payload.schedule : entry))
+      closeForm()
+      toast.success('Schedule updated')
+      onSchedulesChanged?.()
+    } catch (error) {
+      formError = error instanceof Error ? error.message : 'Could not update the schedule.'
+    } finally {
+      saving = false
+    }
+  }
+
   async function createSchedule() {
-    if (!canCreate || !draftCadence) return
-    creating = true
-    createError = null
+    if (!canSubmit || !draftCadence) return
+    saving = true
+    formError = null
     try {
       const response = await fetch('/api/schedules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: newName.trim(),
-          agentId: newAgentId,
+          name: formName.trim(),
+          agentId: formAgentId,
           cadence: draftCadence,
-          timeZone: newTimeZone,
-          message: newMessage.trim(),
-          kind: newKind,
-          deliver: newDeliver
+          timeZone: formTimeZone,
+          message: formMessage.trim(),
+          kind: formKind,
+          deliver: formDeliver
         })
       })
       const payload = await response.json()
@@ -186,14 +352,15 @@
         throw new Error([payload?.error, payload?.hint].filter(Boolean).join(' ') || 'Could not create the schedule.')
       }
       schedules = [payload.schedule, ...schedules]
-      createOpen = false
-      newName = ''
-      newMessage = ''
+      formOpen = false
+      parkedCreateDraft = null
+      formName = ''
+      formMessage = ''
       onSchedulesChanged?.()
     } catch (error) {
-      createError = error instanceof Error ? error.message : 'Could not create the schedule.'
+      formError = error instanceof Error ? error.message : 'Could not create the schedule.'
     } finally {
-      creating = false
+      saving = false
     }
   }
 
@@ -230,6 +397,12 @@
         throw new Error(payload?.error || 'The schedule could not run.')
       }
       toast.success(`"${schedule.name}" ran: ${payload.outcome}`)
+      // PR #106 review F-16: the run fired but Batshit could not write it down, so this
+      // row's "last run" is about to be wrong. That is a real thing to tell the user —
+      // not an error, because the run itself happened.
+      if (payload?.recorded === false && typeof payload?.warning === 'string') {
+        toast.warning(payload.warning)
+      }
       onSchedulesChanged?.()
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'The schedule could not run.')
@@ -289,7 +462,7 @@
       type="button"
       variant="outline"
       size="sm"
-      onclick={() => (createOpen = true)}
+      onclick={openCreate}
       disabled={disabled || loading || agents.length === 0}
     >
       <Plus class="size-4" aria-hidden="true" />
@@ -361,6 +534,17 @@
                 type="button"
                 variant="outline"
                 size="sm"
+                onclick={() => openEdit(schedule)}
+                disabled={disabled || busyScheduleId === schedule.id}
+                title="Change this schedule's name, time, message, or what it does"
+              >
+                <Pencil class="size-4" aria-hidden="true" />
+                Edit
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
                 onclick={() => runNow(schedule)}
                 disabled={disabled || busyScheduleId === schedule.id}
                 title="Run this schedule once, now — even if it is paused. Its normal times do not change."
@@ -391,12 +575,23 @@
   {/if}
 </div>
 
-<Dialog.Root bind:open={createOpen}>
+<Dialog.Root
+  bind:open={formOpen}
+  onOpenChange={(next) => {
+    // Closing by the X, Escape, or a click outside is a Cancel: no request, and the parked
+    // create draft comes back.
+    if (!next) closeForm()
+  }}
+>
   <Dialog.Content class="sm:max-w-lg">
     <Dialog.Header>
-      <Dialog.Title>New Schedule</Dialog.Title>
+      <Dialog.Title>{formMode === 'edit' ? 'Edit Schedule' : 'New Schedule'}</Dialog.Title>
       <Dialog.Description>
-        A time and a message for one agent. Batshit sends it at that time.
+        {#if formMode === 'edit'}
+          Changes take effect on the very next run. Pausing is the switch on the row.
+        {:else}
+          A time and a message for one agent. Batshit sends it at that time.
+        {/if}
       </Dialog.Description>
     </Dialog.Header>
 
@@ -408,7 +603,7 @@
         <div class="batshit-settings-form-control">
           <Input
             id="schedule-name"
-            bind:value={newName}
+            bind:value={formName}
             placeholder="Morning check"
             maxlength={SCHEDULE_NAME_MAX_CHARS}
           />
@@ -417,12 +612,22 @@
 
       <div class="batshit-settings-form-row">
         <div class="batshit-settings-form-copy">
-          <Label.Root class="batshit-settings-form-label" for="schedule-agent">Agent</Label.Root>
+          {#if formMode === 'edit'}
+            <span class="batshit-settings-form-label">Agent</span>
+          {:else}
+            <Label.Root class="batshit-settings-form-label" for="schedule-agent">Agent</Label.Root>
+          {/if}
         </div>
         <div class="batshit-settings-form-control">
-          <Select.Root type="single" value={newAgentId} onValueChange={(v) => (newAgentId = v ?? '')}>
+          {#if formMode === 'edit'}
+            <p class="batshit-settings-form-meta">{agentById.get(formAgentId)?.name ?? formAgentId}</p>
+            <p class="batshit-settings-form-help">
+              To move a schedule to another agent, create a new one.
+            </p>
+          {:else}
+          <Select.Root type="single" value={formAgentId} onValueChange={(v) => (formAgentId = v ?? '')}>
             <Select.Trigger id="schedule-agent" class="w-full">
-              <span class="truncate">{agentById.get(newAgentId)?.name ?? 'Choose an agent'}</span>
+              <span class="truncate">{agentById.get(formAgentId)?.name ?? 'Choose an agent'}</span>
             </Select.Trigger>
             <Select.Content>
               {#each agents as agent (agent.id)}
@@ -430,6 +635,7 @@
               {/each}
             </Select.Content>
           </Select.Root>
+          {/if}
         </div>
       </div>
 
@@ -440,15 +646,15 @@
         <div class="batshit-settings-form-control">
           <Select.Root
             type="single"
-            value={newCadenceType}
+            value={formCadenceType}
             onValueChange={(v) =>
-              (newCadenceType = v === 'interval' || v === 'weekly' ? v : 'daily')}
+              (formCadenceType = v === 'interval' || v === 'weekly' ? v : 'daily')}
           >
             <Select.Trigger id="schedule-cadence" class="w-full">
               <span class="truncate">
-                {newCadenceType === 'interval'
+                {formCadenceType === 'interval'
                   ? 'Every so often'
-                  : newCadenceType === 'weekly'
+                  : formCadenceType === 'weekly'
                     ? 'On chosen weekdays'
                     : 'Every day'}
               </span>
@@ -462,7 +668,7 @@
         </div>
       </div>
 
-      {#if newCadenceType === 'interval'}
+      {#if formCadenceType === 'interval'}
         <div class="batshit-settings-form-row">
           <div class="batshit-settings-form-copy">
             <Label.Root class="batshit-settings-form-label" for="schedule-minutes">Minutes</Label.Root>
@@ -474,14 +680,14 @@
               min={MIN_SCHEDULE_INTERVAL_MINUTES}
               max={MAX_SCHEDULE_INTERVAL_MINUTES}
               step={1}
-              value={newEveryMinutes}
+              value={formEveryMinutes}
               oninput={(event) =>
-                (newEveryMinutes = Number((event.currentTarget as HTMLInputElement).value))}
+                (formEveryMinutes = Number((event.currentTarget as HTMLInputElement).value))}
             />
           </div>
         </div>
       {:else}
-        {#if newCadenceType === 'weekly'}
+        {#if formCadenceType === 'weekly'}
           <div class="batshit-settings-form-row">
             <div class="batshit-settings-form-copy">
               <span class="batshit-settings-form-label">Days</span>
@@ -491,10 +697,10 @@
                 {#each WEEKDAY_LABELS as label, day (label)}
                   <Button
                     type="button"
-                    variant={newDays.includes(day) ? 'default' : 'outline'}
+                    variant={formDays.includes(day) ? 'default' : 'outline'}
                     size="xs"
                     onclick={() => toggleDay(day)}
-                    aria-pressed={newDays.includes(day)}
+                    aria-pressed={formDays.includes(day)}
                   >
                     {label}
                   </Button>
@@ -508,7 +714,7 @@
             <Label.Root class="batshit-settings-form-label" for="schedule-at">Time</Label.Root>
           </div>
           <div class="batshit-settings-form-control">
-            <Input id="schedule-at" type="time" bind:value={newAt} />
+            <Input id="schedule-at" type="time" bind:value={formAt} />
           </div>
         </div>
         <div class="batshit-settings-form-row">
@@ -527,11 +733,11 @@
           <div class="batshit-settings-form-control">
             <Select.Root
               type="single"
-              value={newTimeZone}
-              onValueChange={(v) => (newTimeZone = v ?? 'UTC')}
+              value={formTimeZone}
+              onValueChange={(v) => (formTimeZone = v ?? 'UTC')}
             >
               <Select.Trigger id="schedule-zone" class="w-full">
-                <span class="truncate">{newTimeZone}</span>
+                <span class="truncate">{formTimeZone}</span>
               </Select.Trigger>
               <Select.Content class="max-h-72">
                 {#each timeZones as zone (zone)}
@@ -550,7 +756,7 @@
         <div class="batshit-settings-form-control">
           <Textarea
             id="schedule-message"
-            bind:value={newMessage}
+            bind:value={formMessage}
             rows={3}
             placeholder="Check my open DMs and tell me what needs me."
           />
@@ -573,11 +779,11 @@
         <div class="batshit-settings-form-control">
           <Select.Root
             type="single"
-            value={newKind}
-            onValueChange={(v) => (newKind = v === 'assignment' ? 'assignment' : 'info')}
+            value={formKind}
+            onValueChange={(v) => (formKind = v === 'assignment' ? 'assignment' : 'info')}
           >
             <Select.Trigger id="schedule-kind" class="w-full">
-              <span class="truncate">{newKind === 'assignment' ? 'An assignment' : 'A note'}</span>
+              <span class="truncate">{formKind === 'assignment' ? 'An assignment' : 'A note'}</span>
             </Select.Trigger>
             <Select.Content>
               <Select.Item value="info">A note</Select.Item>
@@ -596,12 +802,12 @@
         <div class="batshit-settings-form-control">
           <Select.Root
             type="single"
-            value={newDeliver}
-            onValueChange={(v) => (newDeliver = v === 'wait' ? 'wait' : 'wake')}
+            value={formDeliver}
+            onValueChange={(v) => (formDeliver = v === 'wait' ? 'wait' : 'wake')}
           >
             <Select.Trigger id="schedule-deliver" class="w-full">
               <span class="truncate">
-                {newDeliver === 'wake' ? 'Start a chat now' : 'Leave it in the inbox'}
+                {formDeliver === 'wake' ? 'Start a chat now' : 'Leave it in the inbox'}
               </span>
             </Select.Trigger>
             <Select.Content>
@@ -612,18 +818,18 @@
         </div>
       </div>
 
-      {#if createError}
-        <p class="batshit-settings-form-meta is-error">{createError}</p>
+      {#if formError}
+        <p class="batshit-settings-form-meta is-error">{formError}</p>
       {/if}
     </div>
 
     <Dialog.Footer>
-      <Button type="button" variant="outline" onclick={() => (createOpen = false)}>Cancel</Button>
-      <Button type="button" onclick={createSchedule} disabled={creating || !canCreate}>
-        {#if creating}
+      <Button type="button" variant="outline" onclick={closeForm}>Cancel</Button>
+      <Button type="button" onclick={submitForm} disabled={saving || !canSubmit}>
+        {#if saving}
           <Loader2 class="size-4 animate-spin" aria-hidden="true" />
         {/if}
-        Create
+        {formMode === 'edit' ? 'Save changes' : 'Create'}
       </Button>
     </Dialog.Footer>
   </Dialog.Content>

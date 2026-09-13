@@ -34,7 +34,9 @@ afterEach(() => {
 })
 
 const PROMPT = 'Run three commands, then summarise.'
-const STEER_TEXT = '[Steer — from the user, mid-reply]\nstart with PINEAPPLE'
+// SA-118 (DL-118-07): the ONE wrapper, live and replay alike. This lane matches its
+// own echo by exact bytes, so the spelling here is the spelling on the wire.
+const STEER_TEXT = '[The user said, mid-reply: start with PINEAPPLE]'
 
 type FakeChild = EventEmitter & {
   stdin: PassThrough
@@ -60,6 +62,10 @@ function createFakeAppServer(
     swallowEcho?: boolean
     /** Answer `turn/start` at once but send `turn/started` only after this many ms. */
     delayTurnStartedMs?: number
+    /** Take the `turn/steer` and never answer it — a child that dies mid-RPC (DL-118-06). */
+    hangSteer?: boolean
+    /** Never answer `turn/start`, so `turnId` stays null and `steer()` parks on `turnReady`. */
+    withholdTurnStart?: boolean
   } = {}
 ) {
   const child = new EventEmitter() as FakeChild
@@ -142,6 +148,7 @@ function createFakeAppServer(
           result: { thread: { id: 'thread-1', ephemeral: true } }
         })
       } else if (msg.method === 'turn/start') {
+        if (options.withholdTurnStart) continue
         send({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } })
         if (options.delayTurnStartedMs) {
           // Live Codex answered the review's early steer with a refusal when it was sent in
@@ -178,6 +185,11 @@ function createFakeAppServer(
         })
       } else if (msg.method === 'turn/steer') {
         steerRequests.push(msg.params)
+        if (options.hangSteer) {
+          // No reply, ever. Before DL-118-06 the only way out of this was the 120-second
+          // RPC timer, whichever way the run ended.
+          continue
+        }
         if (options.refuseSteerWith) {
           send({
             jsonrpc: '2.0',
@@ -195,7 +207,15 @@ function createFakeAppServer(
     }
   })
 
-  return { child, steerRequests, completeTurn, completeCommand, emitUserMessageItem, emitModelCallStart }
+  return {
+    child,
+    steerRequests,
+    completeTurn,
+    completeCommand,
+    emitUserMessageItem,
+    emitModelCallStart,
+    send
+  }
 }
 
 function startRun(child: FakeChild) {
@@ -380,7 +400,7 @@ describe('Codex app-server steering (DL-114-06, AMD-114-02)', () => {
   it('matches two steers to their own echoes even when the echoes arrive reversed', async () => {
     const fake = createFakeAppServer({ swallowEcho: true })
     const run = startRun(fake.child)
-    const second = '[Steer — from the user, mid-reply]\nand mention the exit code'
+    const second = '[The user said, mid-reply: and mention the exit code]'
 
     const events = await collect(run.events, async () => {
       await run.steer({ steerIds: ['steer_1'], text: STEER_TEXT })
@@ -495,6 +515,115 @@ describe('Codex app-server steering (DL-114-06, AMD-114-02)', () => {
 
     fake.completeTurn()
     await pump
+  })
+
+  /**
+   * SA-118 (DL-118-06) — PR #106 review F-14.
+   *
+   * `finishWithError`, `finishNormally` and `cleanup` all set `closed` and finish the event
+   * queue; none of them touched the `pending` RPC map. The only exit for an entry was
+   * `RPC_RESPONSE_TIMEOUT_MS`, so a `turn/steer` in flight when the child died sat for two
+   * minutes after the run had ended and then rejected into a catch nobody was listening to
+   * any more — long enough to reach an unrelated later turn.
+   *
+   * Both tests race the answer against a short real timer. That is the whole claim: under
+   * the old code the answer is 120 seconds away, so `TIMED_OUT` is what comes back.
+   */
+  describe('closing the lane answers its outstanding RPCs (DL-118-06)', () => {
+    const SHORT_MS = 500
+    const raceShort = <T,>(promise: Promise<T>) =>
+      Promise.race([
+        promise,
+        new Promise<'TIMED_OUT'>((resolve) => setTimeout(() => resolve('TIMED_OUT'), SHORT_MS))
+      ])
+
+    it('rejects a turn/steer the dying child never answered, at once', async () => {
+      const fake = createFakeAppServer({ hangSteer: true })
+      const run = startRun(fake.child)
+      // The events generator THROWS the finish error when the child dies — that is the
+      // lane working. Swallowed here so the assertion below is about the steer, not it.
+      const pump = (async () => {
+        for await (const _event of run.events) void _event
+      })().catch(() => {})
+
+      // Wait for the turn to be live, then steer into a server that will never answer.
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const steering = run.steer({ steerIds: ['steer_1'], text: STEER_TEXT })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(fake.steerRequests).toHaveLength(1)
+
+      // The child dies with the steer still in flight: Stop, a guard interrupt, a crash.
+      fake.child.emit('close', 1, null)
+
+      const result = await raceShort(steering)
+      expect(result).not.toBe('TIMED_OUT')
+      expect(result).toMatchObject({ accepted: false })
+      expect((result as { reason: string }).reason).toContain(
+        'Codex app-server closed before turn/steer answered'
+      )
+      await pump
+    })
+
+    it('rejects a turn/steer still in flight when the turn finishes normally, at once (review F-P2-4)', async () => {
+      // The first test covers the child dying (`finishWithError`); this one covers the turn
+      // COMPLETING with the steer's RPC unanswered (`finishNormally`). Faye's P2 review found
+      // that removing `failPending` from the normal finish left every test green — the lock
+      // names all three close paths, so each needs its own pin.
+      const fake = createFakeAppServer({ hangSteer: true })
+      const run = startRun(fake.child)
+      const pump = (async () => {
+        for await (const _event of run.events) void _event
+      })().catch(() => {})
+
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const steering = run.steer({ steerIds: ['steer_1'], text: STEER_TEXT })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(fake.steerRequests).toHaveLength(1)
+
+      fake.send({
+        jsonrpc: '2.0',
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } }
+      })
+
+      const result = await raceShort(steering)
+      expect(result).not.toBe('TIMED_OUT')
+      expect(result).toMatchObject({ accepted: false })
+      expect((result as { reason: string }).reason).toContain(
+        'Codex app-server closed before turn/steer answered'
+      )
+      await pump
+    })
+
+    it('releases a steer parked on turnReady when the turn finishes normally', async () => {
+      // `finishWithError` and `cleanup` both settled `turnReady`; `finishNormally` did not,
+      // so a steer waiting in the pre-`turn/started` window waited for the stream to drain
+      // instead of for the finish that had already happened.
+      const fake = createFakeAppServer({ withholdTurnStart: true })
+      const run = startRun(fake.child)
+      const pump = (async () => {
+        for await (const _event of run.events) void _event
+      })().catch(() => {})
+
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      // No `turn/start` answer means no turn id, which is exactly what parks `steer()`.
+      const steering = run.steer({ steerIds: ['steer_1'], text: STEER_TEXT })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(fake.steerRequests).toHaveLength(0)
+
+      fake.send({
+        jsonrpc: '2.0',
+        method: 'turn/completed',
+        params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } }
+      })
+
+      const result = await raceShort(steering)
+      expect(result).not.toBe('TIMED_OUT')
+      expect(result).toEqual({ accepted: false, reason: 'no active turn to steer' })
+      // It never reached the wire, so it is not waiting for an echo either.
+      expect(fake.steerRequests).toHaveLength(0)
+      await pump
+    })
   })
 
   describe('the three refusals (all -32600)', () => {

@@ -27,7 +27,10 @@ import { toScheduleSummary } from '$lib/types/schedule'
  *    already moved forward by the collapse, so there is nothing to advance there either.
  *  - It **clears `missedRun` even when the fire fails**, because the user has now
  *    answered the dialog. Leaving the entry would re-ask a question they already answered;
- *    the failure itself is visible as the schedule's `lastOutcome`.
+ *    the failure itself is visible as the schedule's `lastOutcome`. Since PR #106 review
+ *    F-16 the clear also runs BEFORE the fire is recorded and in its own `try`, so it does
+ *    not depend on that write succeeding either — and when the record fails the response
+ *    says so (`recorded: false` plus a `warning`) rather than only the console.
  *  - It **fires a PAUSED schedule too** (F-P2-3a). There is deliberately no `enabled`
  *    check here: the button says "run this once, now", and a paused schedule is one whose
  *    automatic times are off, not one that is forbidden to run. It is also the only way to
@@ -80,11 +83,31 @@ export const POST: RequestHandler = async ({ params, locals }) => {
     console.error(`[Schedules] Run now failed for schedule ${schedule.id}:`, error)
   }
 
+  // PR #106 review F-16 — two separate `try`s, and the CLEAR goes first.
+  //
+  // These used to share one `try` with `recordFire` in front. `patchScheduleFields`
+  // rethrows anything that is not a missing record, so a transient blip on one of its
+  // per-field writes skipped the clear entirely — `missedRun` stayed on the record, the
+  // *Missed while Batshit was off* dialog re-asked a question the user had just answered,
+  // and a second Run now fired the schedule twice. The user has answered the dialog
+  // whatever the bookkeeping does next, so the clear must not depend on the record.
   try {
-    await recordFire({ scheduleId: schedule.id, ranAt: now, outcome, dmId })
     await clearMissedRun({ userId: locals.user.id, scheduleId: schedule.id, now })
   } catch (error) {
-    // A schedule deleted mid-run is the expected case and is a no-op by design.
+    // A schedule deleted mid-run is the expected case and is a no-op by design: the fire
+    // already happened and is recorded on its DM.
+    console.warn(`[Schedules] Could not clear the missed run of schedule ${schedule.id}:`, error)
+  }
+
+  // `recorded` is about this write and nothing else. `lastOutcome` is exactly what a failure
+  // here does NOT write, so a silent catch would leave the failure recorded nowhere at all.
+  let recorded = true
+  let recordWarning: string | null = null
+  try {
+    await recordFire({ scheduleId: schedule.id, ranAt: now, outcome, dmId })
+  } catch (error) {
+    recorded = false
+    recordWarning = `The run fired but Batshit could not record it: ${errorMessage(error, 'the write failed')}`
     console.warn(`[Schedules] Could not record the Run now of schedule ${schedule.id}:`, error)
   }
 
@@ -92,6 +115,8 @@ export const POST: RequestHandler = async ({ params, locals }) => {
   return json({
     success: ok,
     outcome,
+    recorded,
+    ...(recordWarning ? { warning: recordWarning } : {}),
     ...(dmId ? { dmId } : {}),
     ...(ok ? {} : { error: outcome }),
     ...(updated ? { schedule: toScheduleSummary(updated) } : {})

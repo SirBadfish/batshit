@@ -873,7 +873,7 @@ describe('settleControlApprovalCard', () => {
     expect(stored.metadata.toolApprovals).toMatchObject(summary)
     expect(buildControlErrorDcmLines([stored])).toEqual([
       'control_errors (the user answered a pending approval):',
-      '- Denied by the user: Skill Import (14:35) — do not retry it.'
+      '- Denied by the user: Skill Import — do not retry it.'
     ])
   })
 
@@ -917,7 +917,7 @@ describe('settleControlApprovalCard', () => {
     const lines = buildControlErrorDcmLines([{ role: 'assistant', metadata: stored.metadata }])
     expect(lines).toEqual([
       'control_errors (the user answered a pending approval):',
-      '- Denied by the user: Skill Import (14:35) — do not retry it.'
+      '- Denied by the user: Skill Import — do not retry it.'
     ])
   })
 })

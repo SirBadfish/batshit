@@ -2,6 +2,23 @@ import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from 'vite
 import type { NativeModeRequest } from '../vercelBrain'
 import { buildCodexRuntimeSettings } from '../codexSettings'
 
+/**
+ * The credential index, modelled as a real SET rather than stubbed.
+ *
+ * SA-118 F-19 gave `mintRunCredential` a prune: it calls `listAgentRunCredentialIds`
+ * before adding this run's member, so the mint now READS the index as well as writing to
+ * it. Stubbing `sMembers` to `[]` would make every prune a silent no-op here, which is
+ * exactly the kind of fake-versus-real disagreement the deep dive's §14.1 list is made of.
+ */
+const credentialIndex = new Map<string, Set<string>>()
+const indexSet = (key: string) => {
+  const existing = credentialIndex.get(key)
+  if (existing) return existing
+  const created = new Set<string>()
+  credentialIndex.set(key, created)
+  return created
+}
+
 const mockRedisClient = {
   json: {
     get: vi.fn().mockResolvedValue(null)
@@ -9,14 +26,27 @@ const mockRedisClient = {
   set: vi.fn().mockResolvedValue(null),
   expire: vi.fn().mockResolvedValue(true),
   del: vi.fn().mockResolvedValue(1),
-  sAdd: vi.fn().mockResolvedValue(1),
-  sRem: vi.fn().mockResolvedValue(1)
+  sAdd: vi.fn(async (key: string, ...members: any[]) => {
+    const flattened = members.length === 1 && Array.isArray(members[0]) ? members[0] : members
+    flattened.forEach((member: string) => indexSet(key).add(member))
+    return flattened.length
+  }),
+  sMembers: vi.fn(async (key: string) => Array.from(indexSet(key))),
+  sRem: vi.fn(async (key: string, ...members: any[]) => {
+    const flattened = members.length === 1 && Array.isArray(members[0]) ? members[0] : members
+    let removed = 0
+    flattened.forEach((member: string) => {
+      if (indexSet(key).delete(member)) removed += 1
+    })
+    return removed
+  })
 }
 
 /**
  * SA-117 P2 — the bridge mints a run credential at run start, so this fake has to serve
  * `agentRunCredentials.ts`: `redis.get('agent:…')` for the ownership check, `json.set` +
- * `expire` for the record, `execute(sAdd)` for the index, and `del` for the revoke.
+ * `expire` for the record, `execute(sMembers/sAdd/sRem)` for the index — the mint prunes
+ * it on the way in since SA-118 F-19 — and `del` for the revoke.
  *
  * It records what was written so the tests below can assert the credential's LIFECYCLE
  * (minted with the run's ids, revoked when the run ends) rather than only its presence.
@@ -132,8 +162,9 @@ beforeEach(() => {
   mockRedisClient.set.mockResolvedValue(null)
   mockRedisClient.expire.mockResolvedValue(true)
   mockRedisClient.del.mockResolvedValue(1)
-  mockRedisClient.sAdd.mockResolvedValue(1)
-  mockRedisClient.sRem.mockResolvedValue(1)
+  // `sAdd`/`sMembers`/`sRem` keep their implementations — they model a real SET so the
+  // mint's prune (SA-118 F-19) is exercised rather than stubbed away. Only the data resets.
+  credentialIndex.clear()
 })
 
 afterEach(() => {

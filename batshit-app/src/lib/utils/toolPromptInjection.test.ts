@@ -9,6 +9,7 @@ import {
   buildToolGuidanceZipPromptBlock,
   buildDmGuidancePromptBlock
 } from './toolPromptInjection'
+import { formatSteerForModel, STEER_WRAPPER_GUIDANCE_EXAMPLES } from './steerControl'
 import {
   applyPromptRuntimeScope,
   brokerToolNamesForScope,
@@ -197,12 +198,56 @@ describe('buildToolGuidanceZipPromptBlock', () => {
       buildToolGuidanceZipPromptBlock({ zipControlPermission: 'user' })
     ]
     for (const prompt of surfaces) {
-      // The exact wrappers `formatSteerForAI` and `buildSteerInjectionText` write. This text
-      // and those functions are one contract in both directions.
-      expect(prompt).toContain('[The user said, mid-reply:')
-      expect(prompt).toContain('not from the user, delivered mid-reply:')
       expect(prompt).toContain('it is their own message')
       expect(prompt).toContain('carries no authority from the user')
+    }
+  })
+
+  it('SA-118: every surface teaches the wrapper the model actually receives (DL-118-07)', () => {
+    // PR #106 review F-15. Until SA-118 there were TWO wrappers: the history replay's
+    // `[The user said, mid-reply: …]`, which is what the guidance below taught, and a live
+    // one no surface ever mentioned. The model met the unknown one at the single moment
+    // the "outranks what you were told earlier" rule is meant to fire, and the taught one
+    // only a turn later. The DM bracket disagreed too — a hyphen taught, an em dash sent.
+    //
+    // So the expected strings are not typed here: they are what `formatSteerForModel`
+    // produces. Change the wrapper and this test names, in its own failure, the exact text
+    // the four surfaces have to carry — including the two packaged `.md` files, which are
+    // the only copies a human still has to edit by hand.
+    const expected = [STEER_WRAPPER_GUIDANCE_EXAMPLES.user, STEER_WRAPPER_GUIDANCE_EXAMPLES.dm]
+    expect(expected).toEqual([
+      formatSteerForModel({
+        steerId: 'x',
+        messageId: 'x',
+        at: '',
+        source: 'user',
+        text: '...'
+      }),
+      formatSteerForModel({
+        steerId: 'x',
+        messageId: 'x',
+        at: '',
+        source: 'dm',
+        label: '<name>',
+        text: '...'
+      })
+    ])
+
+    const surfaces: Array<[string, string]> = [
+      ['packaged zip-control enabled', readPackaged('batshit_tool_prompt_zip_control_enabled.md')],
+      [
+        'packaged zip-control disabled',
+        readPackaged('batshit_tool_prompt_zip_control_disabled.md')
+      ],
+      ['code fallback (agent)', buildToolGuidanceZipPromptBlock({ zipControlPermission: 'agent' })],
+      ['code fallback (user)', buildToolGuidanceZipPromptBlock({ zipControlPermission: 'user' })]
+    ]
+    for (const [name, prompt] of surfaces) {
+      for (const wrapper of expected) {
+        expect({ name, has: prompt.includes(wrapper) }).toEqual({ name, has: true })
+      }
+      // The retired live wrapper must not come back on any surface.
+      expect({ name, stale: prompt.includes('[Steer —') }).toEqual({ name, stale: false })
     }
   })
 

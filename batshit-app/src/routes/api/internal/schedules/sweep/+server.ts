@@ -49,6 +49,10 @@ export const POST: RequestHandler = async ({ request }) => {
     now = new Date(parsed)
   }
 
-  const report = await runScheduleSweep(now)
+  // SA-118 DL-118-01: always walk. This route exists to answer "is anything due now?"
+  // about a keyspace the caller has usually just written to — a smoke-test row seeds a
+  // schedule and triggers a sweep in the same breath — and the store's due cache is
+  // in-process, so it cannot know about that write.
+  const report = await runScheduleSweep(now, { walk: true })
   return json(report, { status: 200 })
 }

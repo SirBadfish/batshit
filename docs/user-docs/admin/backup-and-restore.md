@@ -11,6 +11,7 @@ A Batshit backup is a structured `.zip` file created by the app. It is not a raw
 - Agents, Subagents, Groups, assignments, and model presets
 - Sessions, folders, messages, zips, clips, and Execution Viewer records
 - Agent memories, graduated history, and memory-owned photos
+- Agent DMs, wake-up webhooks, and schedules
 - MCP gateways, CLI tools, slash commands, skill metadata, and related settings
 - Artifacts and artifact ordering/runtime data
 - Goons, custom icons, voice profiles, and voice engine registry references
@@ -34,8 +35,11 @@ Batshit backups don't silently copy external systems. They do not include:
 - ComfyUI or other external runtime data
 - Project source files on disk
 - Docker volumes outside the Batshit-owned app export
+- The one-run credentials Batshit mints for a Codex or Claude run
 
 Back up those systems with their own tools.
+
+That last one is deliberate and costs you nothing. A run credential names a single agent run that has already ended, so a restored one could only ever prove an agent's identity for a turn nobody is taking. Batshit makes a fresh one for every run. A wake-up webhook's token is the opposite case — it belongs to a hook you created and means to keep — so its fingerprint *is* backed up, and your hooks still work after a restore.
 
 ## Normal export
 

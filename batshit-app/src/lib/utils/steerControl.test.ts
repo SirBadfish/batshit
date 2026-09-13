@@ -5,6 +5,7 @@ import {
   busySendModeLabel,
   DEFAULT_BUSY_SEND_MODE,
   extractSteerPlaceholderIds,
+  formatSteerForModel,
   hasSteerPlaceholder,
   isValidSteerId,
   MAX_PENDING_STEERS,
@@ -15,6 +16,8 @@ import {
   resolveBusySendMode,
   resolveSteerability,
   STEER_TEXT_MAX_CHARS,
+  STEER_WRAPPER_GUIDANCE_EXAMPLES,
+  WAIT_SEND_SENTENCE,
   classifySteerRefusal,
   type DeliveredSteer
 } from './steerControl'
@@ -84,11 +87,37 @@ describe('readMessageSteers', () => {
   })
 })
 
-describe('buildSteerInjectionText', () => {
-  it('wraps the user’s words so an agent honours them', () => {
-    expect(buildSteerInjectionText([steer()])).toBe(
-      '[Steer — from the user, mid-reply]\nalso run the tests'
+describe('formatSteerForModel (DL-118-07)', () => {
+  it('gives the user’s words the spelling the guidance teaches', () => {
+    expect(formatSteerForModel(steer())).toBe('[The user said, mid-reply: also run the tests]')
+  })
+
+  it('marks a DM as NOT from the user, with a fallback name', () => {
+    expect(formatSteerForModel(steer({ source: 'dm', label: 'Cooper' }))).toBe(
+      '[Agent DM — from Cooper, not from the user, delivered mid-reply: also run the tests]'
     )
+    expect(formatSteerForModel(steer({ source: 'dm' }))).toContain(
+      'from another agent, not from the user'
+    )
+  })
+
+  it('publishes the two shapes the guidance quotes, with `...` for the words', () => {
+    // The guidance is BUILT from these, so this is the whole anti-drift contract in one
+    // place: change the wrapper and this test names the new text the prompts must carry.
+    expect(STEER_WRAPPER_GUIDANCE_EXAMPLES.user).toBe('[The user said, mid-reply: ...]')
+    expect(STEER_WRAPPER_GUIDANCE_EXAMPLES.dm).toBe(
+      '[Agent DM — from <name>, not from the user, delivered mid-reply: ...]'
+    )
+  })
+})
+
+describe('buildSteerInjectionText', () => {
+  it('sends the live delivery in the SAME wrapper the replay uses (DL-118-07)', () => {
+    // PR #106 review F-15: this used to be `[Steer — from the user, mid-reply]\n…`, a
+    // second spelling no surface ever taught the model. The live delivery and the history
+    // replay are now one function, so a wrapper can never again be introduced in only one.
+    expect(buildSteerInjectionText([steer()])).toBe(formatSteerForModel(steer()))
+    expect(buildSteerInjectionText([steer()])).not.toContain('[Steer —')
   })
 
   it('marks a DM as NOT from the user, with a fallback name', () => {
@@ -106,7 +135,7 @@ describe('buildSteerInjectionText', () => {
       steer({ steerId: 'b', text: 'second' })
     ])
     expect(text.indexOf('first')).toBeLessThan(text.indexOf('second'))
-    expect(text.split('[Steer — from the user, mid-reply]')).toHaveLength(3)
+    expect(text.split('[The user said, mid-reply:')).toHaveLength(3)
   })
 })
 
@@ -269,12 +298,23 @@ describe('otherBusySendMode', () => {
     expect(otherBusySendMode('steer')).toBe('interrupt')
     expect(otherBusySendMode('interrupt')).toBe('steer')
   })
+
+  it('offers interrupt as the way out of a held send (DL-118-09)', () => {
+    // Not `steer`: a send that carries files IS a steer that has to wait, so offering to
+    // steer it would be offering what it is already doing. Stopping the reply is the only
+    // other thing the shortcut could honestly mean.
+    expect(otherBusySendMode('wait')).toBe('interrupt')
+  })
 })
 
 describe('busySendModeLabel', () => {
   it('uses the product words', () => {
     expect(busySendModeLabel('steer')).toBe('Steer')
     expect(busySendModeLabel('interrupt')).toBe('Interrupt and send')
+  })
+
+  it('says what a held send will do, not what it wishes it did (DL-118-09)', () => {
+    expect(busySendModeLabel('wait')).toBe('Send after reply')
   })
 })
 
@@ -315,6 +355,57 @@ describe('resolveEffectiveBusySendMode', () => {
     for (const steerable of [true, false, null, undefined]) {
       expect(resolveEffectiveBusySendMode({ mode: 'interrupt', steerable })).toBe('interrupt')
     }
+  })
+
+  /**
+   * SA-118 (DL-118-09) — a send that carries files was always held, and always said "Steer".
+   */
+  it('says wait when the composer carries files', () => {
+    expect(
+      resolveEffectiveBusySendMode({ mode: 'steer', steerable: true, carriesAttachments: true })
+    ).toBe('wait')
+    expect(
+      resolveEffectiveBusySendMode({ mode: 'steer', steerable: null, carriesAttachments: true })
+    ).toBe('wait')
+  })
+
+  it('keeps steer when the composer carries nothing', () => {
+    expect(
+      resolveEffectiveBusySendMode({ mode: 'steer', steerable: true, carriesAttachments: false })
+    ).toBe('steer')
+  })
+
+  it('lets a refusal and an interrupt setting both beat wait', () => {
+    // The order `+page.svelte` takes: a reply that cannot be steered has no inside to wait
+    // in, so it is an interrupt however full the composer is.
+    expect(
+      resolveEffectiveBusySendMode({ mode: 'steer', steerable: false, carriesAttachments: true })
+    ).toBe('interrupt')
+    expect(
+      resolveEffectiveBusySendMode({ mode: 'interrupt', steerable: true, carriesAttachments: true })
+    ).toBe('interrupt')
+  })
+
+  it('is byte-identical to the old rule when nothing is attached (the send path)', () => {
+    // `+page.svelte` never passes `carriesAttachments`. If omitting it ever started
+    // producing `wait`, the page's `=== 'steer'` test would go false and the clips-wait
+    // branch would quietly stop running.
+    for (const steerable of [true, false, null, undefined]) {
+      const withoutFlag = resolveEffectiveBusySendMode({ mode: 'steer', steerable })
+      const explicitlyEmpty = resolveEffectiveBusySendMode({
+        mode: 'steer',
+        steerable,
+        carriesAttachments: false
+      })
+      expect(withoutFlag).toBe(explicitlyEmpty)
+      expect(withoutFlag).not.toBe('wait')
+    }
+  })
+})
+
+describe('WAIT_SEND_SENTENCE (DL-118-09)', () => {
+  it('is the one sentence the bubble and the button both use', () => {
+    expect(WAIT_SEND_SENTENCE).toBe('With files: waits for the reply to finish')
   })
 })
 

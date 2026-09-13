@@ -6,7 +6,7 @@ import {
   applySteerQueued,
   clearDeliveredSteersForMessage,
   clearSteerInboxForTest,
-  clearSteersForSession,
+  clearDroppedSteersForSession,
   getPendingSteersForSession,
   getSteer,
   getSteersForMessage,
@@ -138,9 +138,85 @@ describe('steerInbox', () => {
     expect(getSteersForMessage('s1', 'm2')).toEqual([])
     expect(getPendingSteersForSession('s2').map((entry) => entry.steerId)).toEqual(['steer_b'])
 
-    clearSteersForSession('s1')
+    markSteerDropped('steer_a')
+    clearDroppedSteersForSession('s1')
     expect(getSteer('steer_a')).toBeNull()
     expect(getSteer('steer_b')?.steerId).toBe('steer_b')
+  })
+
+  /**
+   * SA-118 (DL-118-08) — PR #106 review F-24.
+   *
+   * A `dropped` bubble ("Not sent — you stopped the reply") had no caller in production at
+   * all: it sat under every later exchange in that chat and came back each time the chat
+   * was reopened. What must NOT go with it is a `queued` or `waiting` bubble — those belong
+   * to a reply that is still running, and they are the only sign the user has that a steer
+   * is pending. So the test worth having is the exclusion, not the deletion.
+   */
+  describe('clearDroppedSteersForSession (DL-118-08)', () => {
+    it('clears only dropped bubbles, and only in the session named', () => {
+      noteLocalSteer({ steerId: 'steer_dropped', sessionId: 's1', messageId: 'm1', text: 'd' })
+      noteLocalSteer({ steerId: 'steer_queued', sessionId: 's1', messageId: 'm1', text: 'q' })
+      noteLocalSteer({
+        steerId: 'steer_waiting',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'w',
+        state: 'waiting'
+      })
+      noteLocalSteer({ steerId: 'steer_delivered', sessionId: 's1', messageId: 'm1', text: 'v' })
+      noteLocalSteer({ steerId: 'steer_other', sessionId: 's2', messageId: 'm2', text: 'o' })
+
+      applySteerDelivered({ sessionId: 's1', messageId: 'm1', steerId: 'steer_delivered' })
+      markSteerDropped('steer_dropped')
+      markSteerDropped('steer_other')
+
+      clearDroppedSteersForSession('s1')
+
+      expect(getSteer('steer_dropped')).toBeNull()
+      expect(getSteer('steer_queued')?.state).toBe('queued')
+      expect(getSteer('steer_waiting')?.state).toBe('waiting')
+      expect(getSteer('steer_delivered')?.state).toBe('delivered')
+      // Another chat's receipt is not this send's business.
+      expect(getSteer('steer_other')?.state).toBe('dropped')
+    })
+
+    /**
+     * F-P2-1 — measured live on BSMS, and the reason this test exists at all.
+     *
+     * The session replay buffer re-sends a turn's `steer_queued` whenever a tab
+     * resubscribes, which is what leaving a chat and coming back does. Clearing the
+     * `dropped` entry alone therefore did not remove the bubble: the replay rebuilt it from
+     * scratch, with no earlier state to merge into, and it came back as **queued** — worse
+     * than the stale receipt it replaced, because it claimed a stopped reply was still
+     * going to read it.
+     */
+    it('stays cleared when the session replay sends the same steer again', () => {
+      noteLocalSteer({ steerId: 'steer_a', sessionId: 's1', messageId: 'm1', text: 'a' })
+      markSteerDropped('steer_a')
+      clearDroppedSteersForSession('s1')
+      expect(getSteer('steer_a')).toBeNull()
+
+      // Exactly what `/api/sse`'s replay hands the page on the way back into the chat.
+      applySteerQueued({ sessionId: 's1', messageId: 'm1', steerId: 'steer_a', text: 'a' })
+      expect(getSteer('steer_a')).toBeNull()
+    })
+
+    it('goes on updating a bubble that is still on screen', () => {
+      // The refusal is only of a REBUILD. A live reply's own bubble must still take every
+      // event it is sent, or a steer would freeze at `queued` and never show as delivered.
+      noteLocalSteer({ steerId: 'steer_live', sessionId: 's1', messageId: 'm1', text: 'live' })
+      applySteerDelivered({ sessionId: 's1', messageId: 'm1', steerId: 'steer_live' })
+      expect(getSteer('steer_live')?.state).toBe('delivered')
+    })
+
+    it('does nothing for an empty session id, rather than filing under ""', () => {
+      noteLocalSteer({ steerId: 'steer_a', sessionId: 's1', messageId: 'm1', text: 'a' })
+      markSteerDropped('steer_a')
+      clearDroppedSteersForSession('')
+      clearDroppedSteersForSession(null)
+      expect(getSteer('steer_a')?.state).toBe('dropped')
+    })
   })
 
   it('refuses an event with no session or message rather than filing it under ""', () => {

@@ -43,7 +43,8 @@ describe('ClaudeEventAdapter', () => {
    */
   it('forwards a steer delivery as a steer chunk, and never surfaces the replayed line', async () => {
     const adapter = new ClaudeEventAdapter({ request: buildRequest(), transport: 'cli' })
-    const steerText = '[Steer — from the user, mid-reply]\nstart with PINEAPPLE'
+    // SA-118 (DL-118-07): the one wrapper both the live delivery and the replay use.
+    const steerText = '[The user said, mid-reply: start with PINEAPPLE]'
     async function* mockEvents() {
       yield { type: 'batshit_steer_delivered', steer_ids: ['steer_1'] }
       yield {

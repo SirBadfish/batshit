@@ -182,13 +182,19 @@ describe('formatToolDisplayName (toolNameFormatter.ts) — display label normali
 })
 
 describe('formatBatshitToolTargetDisplayName (toolNameFormatter.ts)', () => {
-  it('resolves only known families/targets and returns null otherwise', () => {
+  it('resolves every sys.* control and returns null for everything else', () => {
+    // SA-118 Guard 2 changed this contract on purpose: null used to mean "family not in the
+    // tables", which made a new family invisible in the UI until somebody added rows. It now
+    // means only "not a `sys.*` control id" — which is what the callers actually read it as.
     expect(formatBatshitToolTargetDisplayName('cli:my-tool')).toBeNull()
     expect(formatBatshitToolTargetDisplayName('artifact.goon_widget.field.model.set')).toBe(
       'Artifact Model'
     )
     expect(formatBatshitToolTargetDisplayName('artifact.goon_widget.field.prompt.set')).toBe(
       'Artifact Field'
+    )
+    expect(formatBatshitToolTargetDisplayName('sys.unregistered_family.do_thing')).toBe(
+      'Unregistered Family Do Thing'
     )
     expect(formatBatshitToolTargetDisplayName(undefined)).toBeNull()
   })

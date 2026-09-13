@@ -89,6 +89,31 @@ function baseBody(overrides: Record<string, any> = {}) {
   }
 }
 
+/**
+ * Make ONE RedisJSON path write fail, the way a transient blip on one of
+ * `patchScheduleFields`' per-field writes does.
+ *
+ * Swapped by hand rather than with `vi.spyOn`: `redis.json.set` is already a `vi.fn` under
+ * the default lane, and this file's `vi.restoreAllMocks()` would take the fake's own
+ * implementation away with the spy. The same wrapper works against real Redis.
+ */
+async function withFailingWriteTo<T>(path: string, run: () => Promise<T>): Promise<T> {
+  const original = redis.json.set
+  let fired = false
+  ;(redis.json as any).set = async (key: string, at: string, value: unknown) => {
+    if (!fired && at === path) {
+      fired = true
+      throw new Error('Redis went away mid-write')
+    }
+    return await (original as any).call(redis.json, key, at, value)
+  }
+  try {
+    return await run()
+  } finally {
+    ;(redis.json as any).set = original
+  }
+}
+
 async function seedSchedule(overrides: Record<string, any> = {}) {
   return createSchedule({
     userId: USER,
@@ -293,6 +318,69 @@ describe('POST /api/schedules/[id]/run-now', () => {
 
     await runNow(USER, record.id)
     expect((await getSchedule(record.id))?.missedRun).toBeNull()
+  })
+
+  /**
+   * PR #106 review F-16 — the clear does not depend on the record being written.
+   *
+   * These two `await`s used to share one `try`, with `recordFire` in front.
+   * `patchScheduleFields` rethrows anything that is not a missing record, so one transient
+   * blip on one of its per-field writes skipped the clear — the *Missed while Batshit was
+   * off* dialog then re-asked a question the user had already answered, and a second Run
+   * now fired the schedule twice.
+   */
+  it('clears the missed run even when recording the fire throws, and SAYS the record failed', async () => {
+    const record = await seedSchedule()
+    await redis.json.set(`schedule:${record.id}`, '$.missedRun', {
+      dueAt: '2026-09-01T14:00:00.000Z',
+      count: 2,
+      noticedAt: '2026-09-08T15:00:00.000Z'
+    } as never)
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const payload = await withFailingWriteTo('$.lastRunAt', async () =>
+      (await runNow(USER, record.id)).json()
+    )
+
+    // The delivery is what `success` is about, and it worked.
+    expect(payload.success).toBe(true)
+    // The bookkeeping did not, and the response says so rather than only the console:
+    // `lastOutcome` is exactly what a failure here does NOT write.
+    expect(payload.recorded).toBe(false)
+    expect(payload.warning).toContain('could not record it')
+
+    const stored = await getSchedule(record.id)
+    // The user answered the dialog. Re-asking would be the surprise.
+    expect(stored?.missedRun).toBeNull()
+  })
+
+  it('reports recorded: true on an ordinary run', async () => {
+    const record = await seedSchedule()
+    const payload = await (await runNow(USER, record.id)).json()
+    expect(payload.success).toBe(true)
+    expect(payload.recorded).toBe(true)
+    expect(payload.warning).toBeUndefined()
+  })
+
+  it('stays a no-op when the schedule is deleted mid-run', async () => {
+    const record = await seedSchedule()
+    // The fire itself deletes the record, which is the real shape of "deleted mid-run":
+    // both the clear and the record then find nothing to write to.
+    deliverScheduledDm.mockImplementationOnce(async () => {
+      await redis.del(`schedule:${record.id}`)
+      return { dmId: 'dm_x', deliveredAs: 'wake', sessionId: 's', outcome: 'woke: s' }
+    })
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const response = await runNow(USER, record.id)
+    const payload = await response.json()
+
+    // As before F-16: a 200, `success` about the delivery, no schedule to return, and no
+    // throw out of the route.
+    expect(response.status).toBe(200)
+    expect(payload.success).toBe(true)
+    expect(payload.outcome).toBe('woke: s')
+    expect(payload.schedule).toBeUndefined()
   })
 
   it('records a FAILED fire rather than hiding it, and still clears the entry', async () => {

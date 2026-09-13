@@ -37,7 +37,7 @@ A wake-up is a chat Batshit starts on its own, with nobody typing — one agent 
 Three things live here:
 
 - **Allow Wake-ups** — the master switch for this Batshit. Off means nothing can start a chat on its own; every wake-up waits in the recipient's inbox instead, with the reason recorded. Each agent also has its own "May be woken" switch in Agent Settings.
-- **Schedules** — Batshit's own clock: a saved cadence, time zone, and message per agent, fired as a DM at the time you set. This card is also where a run Batshit slept through waits for your Run now or Skip. Full detail in [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
+- **Schedules** — Batshit's own clock: a saved cadence, time zone, and message per agent, fired as a DM at the time you set. Each row can be run once now, paused, or deleted; there is no edit, so changing a schedule means replacing it. A run Batshit slept through is not asked about here — that question arrives as a dialog in the chat window the next time you open Batshit. Full detail in [Agent DMs and wake-ups](../primary-agents/agent-dms-and-wake-ups.md).
 - **Wake-up Webhooks** — one URL and one token per hook, for n8n or any other outside program. Create a hook, pick the agent it writes to, and copy the token **once**: Batshit stores only a fingerprint of it and cannot show it again. Rows show each hook's agent, delivery default, last use, and count, and you can pause a hook, rotate its token, or revoke it.
 
 A hook's recipient needs **Agent DMs** on, not only "May be woken" — a call writes a real DM record, and an agent with DMs off would have no inbox to see it in.

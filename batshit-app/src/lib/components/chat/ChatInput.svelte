@@ -105,6 +105,7 @@
     busySendModeLabel,
     otherBusySendMode,
     resolveEffectiveBusySendMode,
+    WAIT_SEND_SENTENCE,
     type BusySendMode
   } from '$lib/utils/steerControl'
   
@@ -203,8 +204,31 @@
    * has already told us cannot.
    */
   const shortcutModifierLabel = detectDesktopShortcutPlatform() === 'darwin' ? 'Cmd' : 'Ctrl'
+  /**
+   * SA-118 (DL-118-09) — the two things that make `+page.svelte` hold a send back.
+   *
+   * The same two inputs the send path reads, read the same way: the composer's clips, and
+   * the `@file` mentions that become `metadata.fileReferences`. `validateMentions` is
+   * called with `activeMentionExclusions`, which is what `sendMessageWithText` passes — not
+   * the narrower list the highlighter uses — so the button and the send cannot disagree
+   * about whether a mention counts. `mapMentionsToFileReferences` is the same filter, so a
+   * mention that is missing, excluded or otherwise carries nothing does not make the button
+   * lie the other way.
+   */
+  const composerCarriesAttachments = $derived.by(() => {
+    if (composerClippedItems.length > 0) return true
+    return (
+      mapMentionsToFileReferences(
+        validateMentions(message, flatFiles, activeMentionExclusions)
+      ).length > 0
+    )
+  })
   const busyEffectiveSendMode = $derived(
-    resolveEffectiveBusySendMode({ mode: busySendMode, steerable })
+    resolveEffectiveBusySendMode({
+      mode: busySendMode,
+      steerable,
+      carriesAttachments: composerCarriesAttachments
+    })
   )
   const composerBusy = $derived(workBusy || waitingForAI)
   const sendButtonLabel = $derived(
@@ -226,6 +250,11 @@
       : ''
     if (busyEffectiveSendMode === 'steer') {
       return `Steer: your message waits for the agent's next tool call, then lands inside this reply.${shortcutHint}`
+    }
+    // DL-118-09: the sentence comes from `steerControl`, which is also where the bubble
+    // this same click draws gets it. One behaviour, one promise, said in one place.
+    if (busyEffectiveSendMode === 'wait') {
+      return `Send after reply. ${WAIT_SEND_SENTENCE}, then sends as an ordinary message.${shortcutHint}`
     }
     const why = steerable ? '' : ` ${(steerReason ?? '').trim()}`.trimEnd()
     return `Interrupt and send: this reply stops and your message starts a new turn.${why}${shortcutHint}`

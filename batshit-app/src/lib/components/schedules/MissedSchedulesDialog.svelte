@@ -78,6 +78,14 @@
       }
       if (action === 'run-now') {
         toast.success(`"${schedule.name}" ran: ${payload.outcome ?? 'done'}`)
+        // SA-118 F-P1-2 (from P1's DL-118-02): this is the SECOND caller of `run-now`, and
+        // it used to drop the route's `warning`. The run fired and Batshit could not write
+        // it down, so this schedule's "last run" is about to be wrong — and here the row it
+        // would be wrong on is about to disappear from this dialog, which makes saying it
+        // out loud the only chance the user gets. Not an error: the run itself happened.
+        if (payload?.recorded === false && typeof payload?.warning === 'string') {
+          toast.warning(payload.warning)
+        }
       }
       items = items.filter((entry) => entry.id !== schedule.id)
       if (items.length === 0) open = false

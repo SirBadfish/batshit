@@ -35,6 +35,14 @@ You steer who talks. By default, speaker selection is flexible — Batshit picks
 
 Agents in a Group can share tool results so the group stays on the same page. Shared tools are visible to the other agents; unshared tool output is summarized for everyone else rather than dumped in full. Set tool sharing intentionally — it's how you decide whether the group works from a common set of results or each agent keeps its own.
 
+## Two things a Group does differently
+
+Both come from the same fact: agents in a Group speak one at a time, and the room moves on to the next speaker.
+
+**Sending while the group is busy interrupts.** In a one-on-one chat you can [steer](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy) — your message lands inside the reply the agent is already writing. A Group can't do that, so the Send button reads **Interrupt and send** and its tooltip says why. The reply stops, what it already produced is kept, and your message starts the next turn.
+
+**Risky actions can't be approved in a Group.** A [risky Fabric action](../fabric/overview.md#approving-a-risky-action) normally pauses and waits for your click on an **Approval required** card. In a Group, Batshit refuses it instead: *"Risky controls are not available in group chats. Ask the user in a direct chat with this agent."* A card raised here would be abandoned the moment the next agent starts speaking, and a half-answered approval is worse than a plain no. Open a direct chat with that agent, ask for the same thing, and approve it there.
+
 ## Voice in a Group
 
 Group Chat supports Voice. Batshit queues playback by agent, so spoken replies don't collide — each agent finishes speaking before the next begins, the same way the text queue works. Each agent can use its own voice settings.

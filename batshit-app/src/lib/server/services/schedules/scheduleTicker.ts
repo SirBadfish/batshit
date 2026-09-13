@@ -85,8 +85,17 @@ export interface ScheduleSweepReport {
  *
  * Schedules are handled **one at a time**: a fire can start a whole agent turn, and three
  * of them racing would spend the hourly wake budget in an order nobody chose.
+ *
+ * `{ walk: true }` makes the store re-read the keyspace instead of trusting its "nothing is
+ * due before T" cache (SA-118 DL-118-01). **The 60-second ticker never passes it** — not
+ * walking when nothing can be due is the whole point of the cache. The internal trigger
+ * route and the tests always do, because they are asking "is anything due *now*" about a
+ * keyspace they have just written to from outside this process's cache.
  */
-export async function runScheduleSweep(now = new Date()): Promise<ScheduleSweepReport> {
+export async function runScheduleSweep(
+  now = new Date(),
+  options: { walk?: boolean } = {}
+): Promise<ScheduleSweepReport> {
   const report: ScheduleSweepReport = { at: now.toISOString(), fired: [], missed: [], skipped: [] }
   if (sweepInProgress) {
     report.skipped.push({ scheduleId: '*', reason: 'A schedule sweep was already running.' })
@@ -98,7 +107,7 @@ export async function runScheduleSweep(now = new Date()): Promise<ScheduleSweepR
   const missedByUser = new Map<string, ScheduleMissedReport[]>()
 
   try {
-    const due = await listDueSchedules(now)
+    const due = await listDueSchedules(now, options)
 
     for (const schedule of due) {
       const dueAt = new Date(Date.parse(schedule.nextRunAt))

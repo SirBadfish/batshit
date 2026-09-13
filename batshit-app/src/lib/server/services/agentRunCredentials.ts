@@ -48,8 +48,6 @@ import { redis } from '$lib/server/redis'
 
 const CREDENTIAL_ID_BYTES = 12
 const TOKEN_SECRET_BYTES = 32
-const TOKEN_PREFIX_LENGTH = 12
-const TOKEN_SUFFIX_LENGTH = 6
 
 export const AGENT_RUN_CREDENTIAL_KEY_PREFIX = 'agent_run_credential:'
 export const AGENT_RUN_CREDENTIALS_INDEX_PREFIX = 'agent_run_credentials:'
@@ -94,10 +92,18 @@ export type AgentRunCredentialRecord = {
    * belongs to nobody.
    */
   delegated: boolean
-  /** sha256 hex of the secret half. The secret itself is stored nowhere. */
+  /**
+   * sha256 hex of the secret half. **No fragment of the secret itself is stored.**
+   *
+   * This record used to carry `tokenPrefix` (12 chars) and `tokenSuffix` (6), copied from
+   * `wakeHookStore.ts` — where they earn their place, because that store HAS a settings
+   * surface that shows the user which token a row is. A run credential is shown to nobody
+   * (DL-117-02) and nothing ever read the fields, so all they did was put 13 of the
+   * secret's 43 random characters in plaintext beside its hash for the life of the run
+   * (PR #106 review F-19). A record written before SA-118 still parses; the extra keys are
+   * ignored.
+   */
   tokenHash: string
-  tokenPrefix: string
-  tokenSuffix: string
   createdAt: string
   expiresAt: string
   lastUsedAt: string | null
@@ -245,6 +251,8 @@ export async function listAgentRunCredentialIds(agentId: string): Promise<string
     if (!record || record.agentId !== agentId) {
       // A credential the TTL reaped leaves its index member behind; prune on read so the
       // index cannot grow without bound across a long-lived agent's thousands of runs.
+      // `mintRunCredential` is what calls this in production (PR #106 review F-19), so the
+      // prune happens once per run rather than never.
       await redis.execute(async (client) => client.sRem(indexKey, [id]))
       continue
     }
@@ -317,8 +325,6 @@ export async function mintRunCredential(options: {
     runtime,
     delegated,
     tokenHash: hashSecret(secret),
-    tokenPrefix: secret.slice(0, TOKEN_PREFIX_LENGTH),
-    tokenSuffix: secret.slice(-TOKEN_SUFFIX_LENGTH),
     createdAt: new Date(createdAt).toISOString(),
     expiresAt: new Date(createdAt + AGENT_RUN_CREDENTIAL_TTL_SECONDS * 1000).toISOString(),
     lastUsedAt: null,
@@ -327,6 +333,13 @@ export async function mintRunCredential(options: {
 
   await redis.json.set(agentRunCredentialKey(record.id), '$', record as never)
   await redis.expire(agentRunCredentialKey(record.id), AGENT_RUN_CREDENTIAL_TTL_SECONDS)
+  // PR #106 review F-19 — prune BEFORE adding this run's member, so the claim that the
+  // index is pruned on read is true of something that actually runs. `revokeRunCredential`
+  // removes the member at a clean run end, but a crash-then-restart never reaches that
+  // `finally`, and until SA-118 `listAgentRunCredentialIds` had no production caller at all
+  // — so one dead member per orphaned run stayed until the whole agent was deleted. The
+  // index is per agent and holds live runs only, so this is a few reads, once per run.
+  await listAgentRunCredentialIds(record.agentId)
   await redis.execute(async (client) =>
     client.sAdd(agentRunCredentialsIndexKey(record.agentId), record.id)
   )
@@ -430,7 +443,8 @@ export async function recordRunCredentialUse(credentialId: string): Promise<void
  * A record the TTL already reaped (an app that crashed mid-run) cannot say which agent's index
  * it sat in, so the caller that knows — the bridge, which minted it for one agent — passes
  * `agentId` and the member is pruned here too (SA-117 P1 review, F-P1-5). Without the hint the
- * member waits for `listAgentRunCredentialIds` or the agent sweep to prune it on read.
+ * member waits for the NEXT MINT for that agent (which calls `listAgentRunCredentialIds`) or
+ * for the agent sweep. Those two are the prunes; there is no third.
  */
 export async function revokeRunCredential(
   credentialId: string,

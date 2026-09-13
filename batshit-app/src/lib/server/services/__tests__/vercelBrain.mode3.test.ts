@@ -981,9 +981,10 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       expect(injected.role).toBe('user')
       // Both steers are ONE message: they are one interruption from the user's point of
       // view, and they arrive in acceptance order.
+      // SA-118 (DL-118-07): one wrapper for the live delivery and the history replay.
       expect(injected.content[0].text).toBe(
-        '[Steer — from the user, mid-reply]\nalso run the tests\n\n' +
-          '[Steer — from the user, mid-reply]\nand push it'
+        '[The user said, mid-reply: also run the tests]\n\n' +
+          '[The user said, mid-reply: and push it]'
       )
     })
 
@@ -1023,7 +1024,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
 
       const result = prepareStep({ messages: [], steps: [toolResultStep()] })
       expect(result?.messages[0].content[0].text).toBe(
-        '[Agent DM — from Cooper, not from the user, delivered mid-reply]\nthe build is red'
+        '[Agent DM — from Cooper, not from the user, delivered mid-reply: the build is red]'
       )
     })
   })

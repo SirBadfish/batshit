@@ -276,7 +276,9 @@ describe('POST /api/messages/steer', () => {
 
     expect(sent).toHaveLength(1)
     expect(sent[0].steerIds).toEqual(['steer_abc123'])
-    expect(sent[0].text).toContain('[Steer — from the user, mid-reply]')
+    // SA-118 (DL-118-07): one wrapper, and it is the one the guidance teaches.
+    expect(sent[0].text).toContain('[The user said, mid-reply:')
+    expect(sent[0].text).not.toContain('[Steer —')
     expect(sent[0].text).toContain('also check the tests')
     // Written, not yet echoed: it has left Batshit but the model has not read it.
     expect(listPendingSteers(SESSION)).toHaveLength(0)

@@ -250,21 +250,26 @@ export function buildControlErrorRecord(
  * Deny starts no turn — the agent already said what it wanted to do and stopped — so this
  * is how it learns the answer: on its next turn, once, and with "do not retry it" said
  * plainly, because the alternative is an agent asking for the same thing again.
+ *
+ * **No clock time in the sentence** (PR #106 review F-17). It used to carry
+ * `decidedAt`'s UTC `HH:MM`, unlabelled — so a user in `America/Chicago` who denied at
+ * 09:32 had the agent told "(14:32)" and repeated that back to them. Every other
+ * agent-facing instant in this product is rendered in the user's own zone, and this one
+ * had no zone to render in at the point it is built. It is also the one detail the model
+ * cannot use: `buildControlErrorDcmLines` reads the MOST RECENT assistant message only, so
+ * the DCM's position already says "this just happened". The machine-readable `at` stays on
+ * the record (full ISO) for anything that needs the instant.
  */
 export function buildControlDenialRecord(
   controlTitle: string,
   decidedAt?: string
 ): ControlErrorRecord {
-  const at = typeof decidedAt === 'string' && decidedAt.trim() ? decidedAt.trim() : new Date().toISOString()
-  const when = (() => {
-    const parsed = Date.parse(at)
-    if (!Number.isFinite(parsed)) return at
-    return new Date(parsed).toISOString().slice(11, 16)
-  })()
+  const at =
+    typeof decidedAt === 'string' && decidedAt.trim() ? decidedAt.trim() : new Date().toISOString()
   return {
     tag: 'approval',
     kind: 'approval',
-    error: `Denied by the user: ${controlTitle} (${when}) — do not retry it.`,
+    error: `Denied by the user: ${controlTitle} — do not retry it.`,
     at
   }
 }

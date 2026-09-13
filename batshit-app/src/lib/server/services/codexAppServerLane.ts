@@ -405,6 +405,32 @@ export function startCodexAppServerRun(
     })
   }
 
+  /**
+   * SA-118 (DL-118-06) — every outstanding JSON-RPC dies with the lane, not 120 s later.
+   *
+   * Before this, the only exit for a `pending` entry was `RPC_RESPONSE_TIMEOUT_MS`. A
+   * `turn/steer` in flight when the child died — Stop, a guard interrupt, a crash — sat for
+   * two minutes after the run had ended and then rejected into
+   * `flushPendingSteersToTransport`'s catch, which calls `returnSteersToPending`. Since
+   * PR #106 review F-9 that return no longer resurrects a cleared inbox, so nothing is
+   * corrupted; but a two-minute orphan is still long enough to land in an unrelated later
+   * turn, and a rejection that arrives after everyone stopped listening explains nothing.
+   *
+   * Clearing the map makes this idempotent, which matters because `cleanup` does not guard
+   * on `closed` the way the two finish paths do. The timer stays as the backstop for the
+   * other failure: a LIVE child that simply never answers.
+   */
+  const failPending = (reason: string) => {
+    if (pending.size === 0) return
+    const entries = [...pending.values()]
+    pending.clear()
+    for (const entry of entries) {
+      entry.reject(
+        new Error(`Codex app-server closed before ${entry.method} answered (${reason})`)
+      )
+    }
+  }
+
   const requestInterrupt = (reason: 'guard' | 'abort') => {
     if (interruptRequested || !threadId || !turnId) return false
     interruptRequested = true
@@ -542,6 +568,7 @@ export function startCodexAppServerRun(
     if (closed) return
     closed = true
     resolveTurnReady(false)
+    failPending(error.message)
     queue.finish(error)
     try {
       if (!child.killed) child.kill()
@@ -551,6 +578,11 @@ export function startCodexAppServerRun(
   const finishNormally = () => {
     if (closed) return
     closed = true
+    // DL-118-06: `finishWithError` and `cleanup` both settle `turnReady`; this path did
+    // not, so a `steer()` parked on it in the pre-`turn/started` window waited for the
+    // stream to drain instead of for the finish that had already happened.
+    resolveTurnReady(false)
+    failPending('the turn finished')
     queue.finish()
     try {
       if (!child.killed) child.kill()
@@ -831,6 +863,7 @@ export function startCodexAppServerRun(
   const cleanup = async () => {
     closed = true
     resolveTurnReady(false)
+    failPending('the lane was cleaned up')
     queue.finish()
     rl.close()
     input.signal?.removeEventListener('abort', onAbort)

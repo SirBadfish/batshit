@@ -11,7 +11,7 @@ The User area holds four things:
 - **Profile** — your display name and avatar. This is also where you change your password. Profile edits save inline as you make them.
 - **Global System Prompt** — your own standing instructions that apply across agents when enabled. This is the place to put a preference you want to carry everywhere (a tone, a formatting rule, a recurring constraint), rather than repeating it on every agent. It's saved through its own editor, and you can turn its inclusion on or off per agent when you set agents up.
 - **Session** — session-related preferences for your account.
-- **Chat** — how a message you send while an agent is still replying is handled: steer it into the running reply (the default) or interrupt the reply. See [Chat](../chat/overview.md).
+- **Chat** — one setting, **When You Send While the Agent Is Busy**: **Steer (default)** lands your message inside the reply the agent is already writing, and **Interrupt and send** stops the reply and starts a new turn. See [Steer or interrupt](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy).
 
 That's the whole area. If a setting feels like it should be in User but isn't here, it's probably either a per-agent setting (in [Agent Settings](../primary-agents/overview.md)) or an instance-wide control (in [Admin](../admin/overview.md)).
 

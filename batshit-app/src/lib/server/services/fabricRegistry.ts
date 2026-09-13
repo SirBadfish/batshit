@@ -268,6 +268,17 @@ type ControlDefinition = {
   outputSchema: Record<string, any> | null
   schemaHint: string
   riskLevel: ControlRiskLevel
+  /**
+   * SA-118 Guard 1 (DL-118-10) — does this control act AS the agent named in its context?
+   *
+   * Required, with no default, so a new `sys.<family>.*` whose handler reads
+   * `context.agentId` as an IDENTITY cannot join by omission the way F-1 did. `true` means
+   * the handler reads or writes something that belongs to that agent by naming it; the
+   * identity gate in `useControl` refuses any lane that cannot produce a server-vouched
+   * agent for it. Everything else is `false`, including controls that pass `agentId` as a
+   * scope HINT.
+   */
+  actsAsAgent: boolean
   status: ControlStatus
   tags: string[]
   scope?: z.infer<typeof controlRegistryScopeSchema>
@@ -1091,6 +1102,9 @@ const ARTIFACT_CONTROL_DEFINITIONS: ControlDefinition[] = ARTIFACT_CONTROL_SEEDS
   outputSchema: null,
   schemaHint: seed.schemaHint,
   riskLevel: seed.riskLevel,
+  // SA-118 Guard 1: the artifact family reads `agentId` only to record whether a person or
+  // an agent started a publish. It never reads or writes something that belongs to an agent.
+  actsAsAgent: false,
   status: 'published',
   tags: seed.tags,
   handler: seed.handler
@@ -1273,6 +1287,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'lane + content (required); stm needs trigger_terms; optional importance/expiry/supersedes',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'save', 'awareness', 'stm', 'ltm'],
     handler: async (context, input) =>
@@ -1303,6 +1318,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'query (required) + optional lane/time-range/limit filters',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'search', 'recall', 'ltm'],
     handler: async (context, input) =>
@@ -1326,6 +1342,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'optional lane/include_superseded/limit',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'list'],
     handler: async (context, input) =>
@@ -1359,6 +1376,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'memoryId (required) + fields to change',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'update'],
     handler: async (context, input) =>
@@ -1383,6 +1401,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'memoryId + supersedes[] (both required)',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'supersede'],
     handler: async (context, input) =>
@@ -1405,6 +1424,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'memoryId (required)',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'supersede', 'undo'],
     handler: async (context, input) =>
@@ -1429,6 +1449,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'memoryId + lane (both required)',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'lane', 'move'],
     handler: async (context, input) =>
@@ -1452,6 +1473,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'memoryIds[] (1-8, required)',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'recall', 'context'],
     handler: async (context, input) =>
@@ -1475,6 +1497,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'memoryId (required)',
     riskLevel: 'confirm',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'delete'],
     handler: async (context, input) =>
@@ -1492,6 +1515,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'no input',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'episode', 'fixed-session'],
     handler: async (context) => runMemoryControl(() => closeEpisodeOp(memoryControlContext(context)))
@@ -1520,6 +1544,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'hold_until (ISO timestamp or null)',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'episode', 'fixed-session'],
     handler: async (context, input) =>
@@ -1549,6 +1574,7 @@ const MEMORY_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'content (full replacement text, or null to clear)',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['memory', 'episode', 'whiteboard', 'fixed-session'],
     handler: async (context, input) =>
@@ -1640,6 +1666,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     schemaHint:
       'to + kind + subject + body + deliver (wait | wake | steer); assignment also needs requested_outcome, scope, report_back_to',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['dm', 'message', 'agent', 'wake', 'steer'],
     handler: async (context, input) =>
@@ -1662,6 +1689,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'optional include_done',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['dm', 'inbox', 'list'],
     handler: async (context, input) =>
@@ -1683,6 +1711,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'dm_id',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['dm', 'read'],
     handler: async (context, input) =>
@@ -1704,6 +1733,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'dm_id',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['dm', 'claim', 'assignment'],
     handler: async (context, input) =>
@@ -1728,6 +1758,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'dm_id + result',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['dm', 'done', 'close'],
     handler: async (context, input) =>
@@ -1752,6 +1783,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'dm_id + result',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['dm', 'blocked', 'close'],
     handler: async (context, input) =>
@@ -1769,6 +1801,7 @@ const DM_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'no input',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['dm', 'agents', 'presence'],
     handler: async (context) => runDmControl(() => listDmAgentsOp(dmControlContext(context)))
@@ -1863,6 +1896,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'no input',
     riskLevel: 'safe',
+    actsAsAgent: true,
     status: 'published',
     tags: ['schedule', 'clock', 'list'],
     handler: async (context) =>
@@ -1910,6 +1944,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'name + cadence + message; optional time_zone, kind, deliver',
     riskLevel: 'confirm',
+    actsAsAgent: true,
     status: 'published',
     tags: ['schedule', 'clock', 'create', 'wake'],
     handler: async (context, input) =>
@@ -1945,6 +1980,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'schedule_id + whatever you are changing',
     riskLevel: 'confirm',
+    actsAsAgent: true,
     status: 'published',
     tags: ['schedule', 'clock', 'update'],
     handler: async (context, input) =>
@@ -1968,6 +2004,7 @@ const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'schedule_id',
     riskLevel: 'confirm',
+    actsAsAgent: true,
     status: 'published',
     tags: ['schedule', 'clock', 'delete'],
     handler: async (context, input) =>
@@ -2022,6 +2059,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     },
     schemaHint: 'query/provider/developer/modelId/purpose + optional limit',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['model', 'catalog', 'provider', 'developer', 'artifact', 'discovery'],
     handler: async (_context, input) => executeModelCatalogSearch(input)
@@ -2052,6 +2090,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     },
     schemaHint: 'zipId (required), includeContent?, maxChars?',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['zip', 'context', 'history'],
     handler: async (context, input) => executeZipFetch(context.userId, input)
@@ -2082,6 +2121,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     },
     schemaHint: 'no input',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['goons', 'scene', 'skybox', 'skill', 'portable'],
     handler: async () => executeGoonSceneCreatorInfo()
@@ -2117,6 +2157,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     },
     schemaHint: 'query/tool/group + optional exact/limit/includeSchema',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['mcp', 'dynamic', 'discovery'],
     handler: async (context, input) => executeDynamicMcpFind(context, input)
@@ -2148,6 +2189,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     },
     schemaHint: 'toolName (required), params?, selectedGateways?',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['mcp', 'dynamic', 'execution'],
     handler: async (context, input) => executeDynamicMcpUse(context, input)
@@ -2182,6 +2224,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'commandName + skill.markdown (required), optional command metadata + skill metadata',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['skill', 'slash', 'registry'],
     handler: async (context, input) => await executeSkillSave(context, input)
@@ -2209,6 +2252,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'installCommand OR source/sourceType (+ optional command save fields)',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['skill', 'import', 'slash'],
     handler: async (context, input) => await executeSkillImport(context, input)
@@ -2231,6 +2275,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'optional includeStatus',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['runtime', 'addon', 'docker', 'sidecar', 'discovery'],
     handler: async (context, input) => await executeRuntimeAddonList(context, input)
@@ -2254,6 +2299,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: RUNTIME_ADDON_SCHEMA_HINT,
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['runtime', 'addon', 'docker', 'sidecar', 'status'],
     handler: async (context, input) => await executeRuntimeAddonStatus(context, input)
@@ -2277,6 +2323,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: RUNTIME_ADDON_SCHEMA_HINT,
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['runtime', 'addon', 'docker', 'sidecar', 'prepare'],
     handler: async (context, input) => await executeRuntimeAddonPrepare(context, input)
@@ -2300,6 +2347,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: RUNTIME_ADDON_SCHEMA_HINT,
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['runtime', 'addon', 'docker', 'sidecar', 'start'],
     handler: async (context, input) => await executeRuntimeAddonControl(context, input, 'start')
@@ -2323,6 +2371,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: RUNTIME_ADDON_SCHEMA_HINT,
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['runtime', 'addon', 'docker', 'sidecar', 'stop'],
     handler: async (context, input) => await executeRuntimeAddonControl(context, input, 'stop')
@@ -2345,6 +2394,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'optional status/includeArchived filters',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['cli', 'tool', 'registry', 'discovery'],
     handler: async (context, input) => await executeCliToolList(context, input)
@@ -2366,6 +2416,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'toolId (required)',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['cli', 'tool', 'registry', 'read'],
     handler: async (context, input) => await executeCliToolGet(context, input)
@@ -2396,6 +2447,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     schemaHint:
       'title/description/executable + manifest fields; toolId may be inferred from title; origin/status default to generated/active',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['cli', 'tool', 'registry', 'create', 'fabric'],
     handler: async (context, input) => await executeCliToolCreate(context, input)
@@ -2422,6 +2474,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'toolId (required) + fields to change',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['cli', 'tool', 'registry', 'update', 'fabric'],
     handler: async (context, input) => await executeCliToolUpdate(context, input)
@@ -2445,6 +2498,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'toolId (required), optional projectPath',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['cli', 'tool', 'registry', 'test', 'validation'],
     handler: async (context, input) => await executeCliToolTest(context, input)
@@ -2467,6 +2521,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'toolId (required), optional status (defaults to archived)',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['cli', 'tool', 'registry', 'archive'],
     handler: async (context, input) => await executeCliToolArchive(context, input)
@@ -2488,6 +2543,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'toolId (required)',
     riskLevel: 'restricted',
+    actsAsAgent: false,
     status: 'published',
     tags: ['cli', 'tool', 'registry', 'delete'],
     handler: async (context, input) => await executeCliToolDelete(context, input)
@@ -2511,6 +2567,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required), payload?',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'registry'],
     handler: async (context, input) => await executeVoiceEngineRegister(context, input)
@@ -2533,6 +2590,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required), payload?',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'registry'],
     handler: async (context, input) => await executeVoiceEngineUpdate(context, input)
@@ -2554,6 +2612,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required)',
     riskLevel: 'safe',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'health'],
     handler: async (context, input) => await executeVoiceEngineHealthCheck(context, input)
@@ -2627,6 +2686,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     },
     schemaHint: 'engineId, installRoot, launch, payload (+ optional TTS/STT smoke/poll settings)',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'local', 'setup'],
     handler: async (context, input) => await executeVoiceEngineCompleteLocalSetup(context, input)
@@ -2650,6 +2710,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required), modelId (required)',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'stt', 'model', 'download'],
     handler: async (context, input) => await executeVoiceEngineModelDownload(context, input)
@@ -2673,6 +2734,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required), modelId (required)',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'stt', 'model', 'select'],
     handler: async (context, input) => await executeVoiceEngineModelUse(context, input)
@@ -2695,6 +2757,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required), modelId (required)',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'stt', 'model', 'delete'],
     handler: async (context, input) => await executeVoiceEngineModelDelete(context, input)
@@ -2717,6 +2780,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required), enabled (required)',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'toggle'],
     handler: async (context, input) => await executeVoiceEngineEnable(context, input)
@@ -2740,6 +2804,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
     outputSchema: null,
     schemaHint: 'engineId (required), deleteLocalFiles?',
     riskLevel: 'confirm',
+    actsAsAgent: false,
     status: 'published',
     tags: ['voice', 'engine', 'delete'],
     handler: async (context, input) => await executeVoiceEngineDelete(context, input)
@@ -2867,28 +2932,55 @@ export type ControlActorType =
   | 'unknown'
 
 /**
- * SA-117 DL-117-05 — the control families that act AS an agent.
+ * SA-117 DL-117-05 — does this control act AS an agent? SA-118 Guard 1 — the DEFINITION says.
  *
- * Each of these reads the acting agent out of `ControlExecutionContext.agentId` and uses it
- * as an IDENTITY rather than a scope hint: `sys.dm.*` reads and closes that agent's inbox,
- * `sys.memory.*` reads and writes that agent's memories and owned media, and `sys.schedule.*`
- * puts that agent on a clock (self-only, keyed on the same field). Their three context
- * adapters — `dmControlContext`, `memoryControlContext`, `scheduleControlContext` — are
- * where that id becomes the acting agent.
+ * A control that acts as an agent reads the acting agent out of
+ * `ControlExecutionContext.agentId` and uses it as an IDENTITY rather than a scope hint:
+ * `sys.dm.*` reads and closes that agent's inbox, `sys.memory.*` reads and writes that
+ * agent's memories and owned media, and `sys.schedule.*` puts that agent on a clock
+ * (self-only, keyed on the same field). Their three context adapters — `dmControlContext`,
+ * `memoryControlContext`, `scheduleControlContext` — are where that id becomes the acting
+ * agent.
  *
- * Controls left OUT of this list, and why: `executeDynamicMcpFind`/`Use` pass `agentId` as a
- * gateway SCOPE hint, the artifact family reads it only to record whether a person or an
- * agent started a publish, and the slash-command control uses it to seed an enabled-agent
- * list the caller can set explicitly anyway. None of them can read or change something that
- * belongs to an agent by naming it.
+ * Until SA-118 this was a hand-maintained prefix list kept a thousand lines away from the
+ * definitions it classified, so a future family whose handler read `agentId` as an identity
+ * was un-gated by OMISSION, with no compile error — the same failure shape as PR #106
+ * review F-1. `ControlDefinition.actsAsAgent` is required, so forgetting it is now a type
+ * error at the definition site, and this function reads the flag instead of guessing from
+ * the id. `fabricRegistry.test.ts` owns the other half: it asserts that the flagged set is
+ * exactly `sys.dm.*`, `sys.memory.*` and `sys.schedule.*` today, so a change is loud both
+ * ways — a new flag without a decision, or a lost flag on a family that needs one.
+ *
+ * Controls that are deliberately `false`, and why: `executeDynamicMcpFind`/`Use` pass
+ * `agentId` as a gateway SCOPE hint, the artifact family reads it only to record whether a
+ * person or an agent started a publish, and the slash-command control uses it to seed an
+ * enabled-agent list the caller can set explicitly anyway. None of them can read or change
+ * something that belongs to an agent by naming it.
+ *
+ * An id with no code-defined control resolves to `false`: extensible (Redis-defined)
+ * controls carry `actsAsAgent: false` at load for the reason in `dynamicRecordToDefinition`,
+ * and an id that is not a control at all cannot act as anything.
  */
-const ACTING_AGENT_CONTROL_PREFIXES = ['sys.dm.', 'sys.memory.', 'sys.schedule.'] as const
-
 export function controlActsAsAgent(controlId: unknown): boolean {
   if (typeof controlId !== 'string') return false
-  const id = controlId.trim()
-  return ACTING_AGENT_CONTROL_PREFIXES.some((prefix) => id.startsWith(prefix))
+  return STATIC_CONTROL_MAP.get(controlId.trim())?.actsAsAgent === true
 }
+
+/**
+ * SA-118 Guard 1 — every code-defined control with its `actsAsAgent` flag, read-only.
+ *
+ * The flag's whole value is that a family cannot join the acting-agent set by omission, and
+ * that is only checkable if something can read the WHOLE set back. `fabricRegistry.test.ts`
+ * is the reader: it holds the three prefixes that used to live here and asserts the flagged
+ * set matches them exactly.
+ */
+export const CORE_CONTROL_ACTING_AGENT_FLAGS: ReadonlyArray<{
+  readonly controlId: string
+  readonly actsAsAgent: boolean
+}> = CONTROL_DEFINITIONS.map((definition) => ({
+  controlId: definition.controlId,
+  actsAsAgent: definition.actsAsAgent
+}))
 
 export type ControlUseErrorCode =
   | 'CONTROL_NOT_FOUND'
@@ -6645,6 +6737,15 @@ function dynamicRecordToDefinition(record: ControlRegistryRecord): ControlDefini
     outputSchema: record.outputSchema ?? null,
     schemaHint: record.schemaHint,
     riskLevel: record.riskLevel,
+    /**
+     * SA-118 Guard 1 — an extensible control is never an acting agent, and this is a fact
+     * about the handler rather than a default: every dynamic record is generated from an
+     * artifact (`syncDynamicRegistryRecords` is the only writer) and runs
+     * `executeDynamicArtifactHandler`, which has no inbox, memory or schedule adapter.
+     * A record can also never shadow a code-defined id — `loadControlDefinitionsForUser`
+     * drops any dynamic definition whose id is already static.
+     */
+    actsAsAgent: false,
     status: record.status,
     tags: record.tags,
     scope: record.scope,

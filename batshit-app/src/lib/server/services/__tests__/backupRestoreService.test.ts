@@ -62,6 +62,10 @@ import {
   restoreStagedBackup,
   restoreBackupBundle
 } from '../backupRestoreService'
+import {
+  __resetScheduleDueCacheForTests,
+  listDueSchedules
+} from '$lib/server/services/schedules/scheduleStore'
 
 useRedisTestServer()
 
@@ -1961,4 +1965,81 @@ describe('backupRestoreService', () => {
     expect(preflight.ok).toBe(true)
     expect(preflight.redisRecordCount).toBe(records.length)
   })
+
+  describe('the schedule due cache survives nothing (F-8, DL-118-01)', () => {
+    /** The seeded `sch_1` is due at this instant; see `seedRepresentativeData`. */
+    const DUE_AT = new Date('2026-09-09T14:00:00.000Z')
+
+    /**
+     * Clear the schedule keyspace, then take one ticker-style sweep of it.
+     *
+     * The bundle is already built by this point, so removing the source schedule leaves
+     * the instance with none at all — which is what the cache then remembers, for five
+     * minutes. `listDueSchedules` is instance-wide (it walks `schedules:*`), so this has
+     * to be the whole keyspace and not just the target user's half.
+     */
+    async function primeWithNoSchedulesAnywhere() {
+      await redis.del('schedule:sch_1')
+      await redis.execute(async (client) => client.del('schedules:source'))
+      await redis.execute(async (client) => client.del('schedules:target'))
+      __resetScheduleDueCacheForTests()
+      await expect(listDueSchedules(DUE_AT)).resolves.toEqual([])
+    }
+
+    it('after restoreBackupBundle', async () => {
+      await seedRepresentativeData('source')
+      const bundle = await createBackupBundle('source')
+      await primeWithNoSchedulesAnywhere()
+
+      await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+
+      // No `{ walk: true }`: this is the ticker's call, and it must see the restored schedule.
+      const due = await listDueSchedules(DUE_AT)
+      expect(due.map((record) => record.id)).toEqual(['sch_1'])
+    })
+
+    it('after restoreStagedBackup', async () => {
+      await seedRepresentativeData('source')
+      const bundle = await createBackupBundle('source')
+
+      // Staged the same way the disk-staged restore test above stages: the archive plus its
+      // sidecar manifest under the staging root, keyed by the hash of the stage id.
+      const stageId = '11111111-2222-4333-8444-555555555556'
+      const storageKey = createHash('sha256').update(stageId, 'utf8').digest('hex')
+      const archivePath = path.join(backupStagingRoot, `${storageKey}.zip`)
+      await fs.writeFile(archivePath, bundle.bytes)
+      await fs.writeFile(
+        path.join(backupStagingRoot, `${storageKey}.json`),
+        `${JSON.stringify({
+          contract: 'batshit-backup-stage/v1',
+          stageId,
+          userId: 'target',
+          filename: 'batshit-backup.zip',
+          bytes: bundle.bytes.byteLength,
+          sha256: createHash('sha256').update(bundle.bytes).digest('hex'),
+          stagedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          archivePath
+        })}\n`
+      )
+      await primeWithNoSchedulesAnywhere()
+
+      await restoreStagedBackup('target', stageId, { confirmReplace: true })
+
+      const due = await listDueSchedules(DUE_AT)
+      expect(due.map((record) => record.id)).toEqual(['sch_1'])
+    })
+  })
 })
+
+/**
+ * PR #106 review F-8 (DL-118-01) — a restore throws away the schedule due cache.
+ *
+ * `listDueSchedules` keeps one in-process fact, "no enabled schedule is due before T", so
+ * the 60-second ticker does not walk the keyspace when nothing can be due. A restore
+ * writes `schedules:{userId}` and the records under it **directly**, around the schedule
+ * store — so nothing in the store knows the keyspace changed. Without the invalidation a
+ * restored schedule is invisible to the clock until the five-minute bound expires, which
+ * is the quiet half of "a schedule that did not survive a restore is a routine that
+ * silently stops happening".
+ */

@@ -86,7 +86,9 @@ const toolResultEvent = (toolUseId: string, alsoText?: string) => ({
   }
 })
 
-const STEER_TEXT = '[Steer — from the user, mid-reply]\nstart with PINEAPPLE'
+// SA-118 (DL-118-07): the ONE wrapper, live and replay alike. This lane matches its
+// own echo by exact bytes, so the spelling here is the spelling on the wire.
+const STEER_TEXT = '[The user said, mid-reply: start with PINEAPPLE]'
 
 async function startRun(child: FakeChild, options: Record<string, unknown> = {}) {
   spawnMock.mockReturnValue(child)
@@ -246,7 +248,7 @@ describe('Claude steering (DL-114-08, AMD-114-01)', () => {
   it('matches two steers to their own echoes, in the order they were consumed', async () => {
     const child = createFakeClaude()
     const runner = await startRun(child)
-    const second = '[Steer — from the user, mid-reply]\nalso the exit code'
+    const second = '[The user said, mid-reply: also the exit code]'
     const seen: any[] = []
     const pump = (async () => {
       for await (const event of runner.events) seen.push(event)

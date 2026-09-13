@@ -59,6 +59,40 @@ describe('formatControlApprovalTitle', () => {
       })
     ).toBe('Repo Snapshot')
   })
+
+  /**
+   * SA-118 Guard 2 (DL-118-11) — the blank card three stories hand-patched in a row.
+   *
+   * A `sys.*` family the formatter had never heard of returned null here, and the card fell
+   * through to the raw id run through title case ("Sys.future.thing") or, with no
+   * `controlTitle`, to whatever the generic path produced. The fallback names it instead,
+   * and the card can never be blank for a `sys.*` control again.
+   */
+  it('names an unregistered sys.* control on the card, with or without a tool title', () => {
+    expect(
+      formatControlApprovalTitle({
+        approvalId: 'apr_1',
+        controlId: 'sys.future.thing',
+        controlTitle: 'Some Future Thing',
+        riskLevel: 'confirm'
+      })
+    ).toBe('Future Thing')
+
+    const title = formatControlApprovalTitle({
+      approvalId: 'apr_2',
+      controlId: 'sys.future.thing',
+      riskLevel: 'restricted'
+    } as any)
+    expect(title).toBe('Future Thing')
+    expect(title.trim().length).toBeGreaterThan(0)
+
+    // And the sentence under it names the control rather than trailing off.
+    expect(
+      describeControlApproval(
+        liveEntry({ approvalId: 'apr_3', controlId: 'sys.future.thing', riskLevel: 'confirm' }, {})
+      )
+    ).toBe('run Future Thing')
+  })
 })
 
 describe('describeControlApproval', () => {
