@@ -142,8 +142,48 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     expect(helperBody).toContain('chatRunRegistry.isSessionBusy(sessionId)')
     expect(helperBody).toContain('CLIENT_QUEUE_MAX_WAIT_MS')
     // A ceiling, not a forever — and the caller must keep the words when it is hit.
-    expect(body).toContain('if (!replyEnded) {')
+    // AMD-119-04 turned the two-way `replyEnded` test into the three-way rule below, so
+    // the ceiling's branch is named rather than negated.
+    expect(body).toContain("if (outcome === 'still-running') {")
     expect(body).toContain('still here')
+  })
+
+  it('drops a browser-held queued message when the user stops the reply (AMD-119-04)', () => {
+    // Josh's decision, 2026-09-13: Stop stops everything. DL-119-05 already dropped a
+    // SERVER-held queued message with this receipt; this branch used to SEND, because a
+    // Stop is one of the ways `waitForReplyToEnd` finishes — and the receipt was already
+    // on screen, so the user was told "Not sent" about a message that then sent.
+    const branch = page.indexOf('if (clientQueueEligible) {')
+    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
+
+    // The count is read BEFORE the await and compared after; the rule decides, not the page.
+    expect(body).toContain('const stopCountBeforeWait = manualStopCountBySession.get(currentSessionId) ?? 0')
+    expect(body).toContain('outcome = resolveQueuedSendAfterWait({')
+    expect(body).toContain('(manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeWait')
+    expect(page.match(/resolveQueuedSendAfterWait\(/g)?.length ?? 0).toBe(1)
+
+    // Stopped: the bubble SURVIVES as the receipt, and nothing is sent.
+    expect(body).toContain("if (outcome !== 'dropped-by-stop') steerInbox.forgetSteer(waitingSteerId)")
+    expect(body).toContain("if (outcome === 'dropped-by-stop') {")
+    expect(body).toContain('steerInbox.markSteerDropped(waitingSteerId)')
+    const dropped = body.indexOf("if (outcome === 'dropped-by-stop') {")
+    expect(body.slice(dropped, dropped + 1400)).toContain('return false')
+  })
+
+  it('counts every Stop, whether or not it had a message to name (AMD-119-04)', () => {
+    const stopHandler = page.indexOf('async function handleStopStream()')
+    // Outside P2b's `if (previousMessageId)` guard: the waiting queue is waiting on the
+    // GESTURE, not on what it cut.
+    // Pinned from the LINE START, not from the call: `void 0 && theCall(` still contains
+    // `theCall(`, which is how the first draft of this very pin survived its mutation.
+    expect(page).toContain(
+      '\n\t    manualStopCountBySession.set(\n\t      sessionId,\n\t      (manualStopCountBySession.get(sessionId) ?? 0) + 1\n\t    )'
+    )
+    const bump = page.indexOf('manualStopCountBySession.set(', stopHandler)
+    expect(bump).toBeGreaterThan(stopHandler)
+    expect(bump).toBeLessThan(page.indexOf("'/api/messages/interrupt'", stopHandler))
+    // One writer, one reader.
+    expect(page.match(/manualStopCountBySession\.set\(/g)?.length ?? 0).toBe(1)
   })
 
   it('does not send into a reply the route says already finished (DL-114-14)', () => {

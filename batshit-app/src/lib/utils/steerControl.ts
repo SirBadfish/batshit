@@ -749,3 +749,35 @@ export function resolveStopInterruptionStamp(input: {
 
   return { previousMessageId: messageId, interruptedAt, reason: 'user' }
 }
+
+/* ------------------------------------------------------------------ *
+ * SA-119 P3 (AMD-119-04) — what a browser-held queued message does when
+ * its wait ends.
+ * ------------------------------------------------------------------ */
+
+export type QueuedSendAfterWait = 'send' | 'dropped-by-stop' | 'still-running'
+
+/**
+ * A browser-held queued message (DL-119-06) waits for the reply to END, and **a Stop is
+ * one of the ways a reply ends** — so `replyEnded` alone cannot tell "the agent finished"
+ * from "the user pressed Stop". Before AMD-119-04 the page read `replyEnded` and sent, so
+ * a Stop dropped a SERVER-held queued message with a receipt (DL-119-05) and released a
+ * browser-held one into the chat seconds later. Worse, the receipt was already on screen:
+ * `settleSteerBubblesForMessage(..., { interrupted: true })` settles `waiting` bubbles too,
+ * so the user was shown *Not sent — you stopped the reply* about a message that then sent.
+ *
+ * Josh's decision (2026-09-13): **Stop stops everything.** One button, one meaning.
+ *
+ * The order is the whole rule. `stoppedDuringWait` is read FIRST, because a Stop sets
+ * `replyEnded` as surely as a finished answer does; reading `replyEnded` first would send
+ * every stopped message. The caller must keep the bubble as the receipt in that case
+ * rather than forgetting it.
+ */
+export function resolveQueuedSendAfterWait(input: {
+  stoppedDuringWait: boolean
+  replyEnded: boolean
+}): QueuedSendAfterWait {
+  if (input.stoppedDuringWait) return 'dropped-by-stop'
+  if (!input.replyEnded) return 'still-running'
+  return 'send'
+}

@@ -15,6 +15,7 @@ import {
   resolveBusySendActions,
   readMessageSteers,
   resolveBusySendMode,
+  resolveQueuedSendAfterWait,
   resolveSteerability,
   resolveStopInterruptionStamp,
   STEER_TEXT_MAX_CHARS,
@@ -703,5 +704,51 @@ describe('resolveStopInterruptionStamp (SA-119 P2b)', () => {
       interruptedAt: '2026-09-13T20:00:00.000Z',
       reason: 'user'
     })
+  })
+})
+
+/**
+ * SA-119 P3 (AMD-119-04) — Stop stops everything.
+ *
+ * Josh's decision, 2026-09-13. A browser-held queued message waits for the reply to END,
+ * and a Stop is one of the ways a reply ends — so before this rule the page read
+ * `replyEnded` and sent, while `settleSteerBubblesForMessage` had already drawn the
+ * receipt. The user was shown *Not sent — you stopped the reply* about a message that then
+ * sent, and a SERVER-held queued message in the same situation really was dropped.
+ */
+describe('resolveQueuedSendAfterWait (SA-119 P3)', () => {
+  it('sends when the reply simply ended', () => {
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: false, replyEnded: true })).toBe('send')
+  })
+
+  it('keeps the words when the ceiling was hit and the reply is still going (F-P2-1)', () => {
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: false, replyEnded: false })).toBe(
+      'still-running'
+    )
+  })
+
+  it('drops the message when the user stopped the reply', () => {
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: true, replyEnded: false })).toBe(
+      'dropped-by-stop'
+    )
+  })
+
+  it('reads the Stop FIRST, because a Stop also makes the reply end', () => {
+    // The whole rule is this row. A Stop sets `replyEnded` as surely as a finished answer
+    // does, so an implementation that tested `replyEnded` first would send every stopped
+    // message — which is exactly what the page did before AMD-119-04.
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: true, replyEnded: true })).toBe(
+      'dropped-by-stop'
+    )
+  })
+
+  it('answers one of exactly three things, and never anything else', () => {
+    const seen = new Set<string>()
+    for (const stoppedDuringWait of [true, false]) {
+      for (const replyEnded of [true, false]) {
+        seen.add(resolveQueuedSendAfterWait({ stoppedDuringWait, replyEnded }))
+      }
+    }
+    expect([...seen].sort()).toEqual(['dropped-by-stop', 'send', 'still-running'])
   })
 })

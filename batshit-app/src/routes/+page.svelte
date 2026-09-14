@@ -153,12 +153,14 @@
     isSteerDeliver,
     resolveBusySendActions,
     resolveBusySendMode,
+    resolveQueuedSendAfterWait,
     resolveStopInterruptionStamp,
     QUEUE_ONE_AT_A_TIME_SENTENCE,
     QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE,
     STEER_REFUSED_GROUP_SENTENCE,
     STEER_REFUSED_UNKNOWN_SENTENCE,
     type BusySendMode,
+    type QueuedSendAfterWait,
     type SteerDeliver,
     type StopInterruptionRecord
   } from '$lib/utils/steerControl'
@@ -1824,6 +1826,16 @@ const immersiveActive = $derived.by(
 	   * consuming the stamp silently close the session-turn retry as well.
 	   */
 	  const pendingStopInterruptionBySession = new Map<string, StopInterruptionRecord>()
+
+	  /**
+	   * SA-119 P3 (AMD-119-04) — how many times the user has pressed Stop in this chat.
+	   *
+	   * A browser-held queued message is awaiting `waitForReplyToEnd`, and a Stop is exactly
+	   * what makes that wait finish, so its own result cannot say which happened. Comparing
+	   * this count across the await can. A COUNT rather than a flag because a flag needs
+	   * clearing, and whoever cleared it would race the next Stop.
+	   */
+	  const manualStopCountBySession = new Map<string, number>()
 
 	  function isSendInFlight(sessionId: string) {
 	    return sendInFlightBySession.get(sessionId) === true
@@ -5094,14 +5106,39 @@ const immersiveActive = $derived.by(
 	          withFiles: sendCarriesAttachments
 	        })
 	        clientQueueWaitingBySession.add(currentSessionId)
+	        const stopCountBeforeWait = manualStopCountBySession.get(currentSessionId) ?? 0
 	        let replyEnded = false
+	        let outcome: QueuedSendAfterWait = 'still-running'
 	        try {
 	          replyEnded = await waitForReplyToEnd(currentSessionId, waitForMessageId)
 	        } finally {
 	          clientQueueWaitingBySession.delete(currentSessionId)
-	          steerInbox.forgetSteer(waitingSteerId)
+	          outcome = resolveQueuedSendAfterWait({
+	            stoppedDuringWait:
+	              (manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeWait,
+	            replyEnded
+	          })
+	          // AMD-119-04: on a Stop the bubble IS the receipt, so it must survive. Every
+	          // other outcome either sends the message (the bubble's job is done) or leaves
+	          // the words in the composer (a second bubble saying the same thing twice).
+	          if (outcome !== 'dropped-by-stop') steerInbox.forgetSteer(waitingSteerId)
 	        }
-	        if (!replyEnded) {
+	        if (outcome === 'dropped-by-stop') {
+	          /**
+	           * AMD-119-04 (Josh, 2026-09-13) — Stop stops everything.
+	           *
+	           * DL-119-05 already had Stop drop a SERVER-held queued message with this exact
+	           * receipt. This branch used to send instead, because a Stop is one of the ways
+	           * `waitForReplyToEnd` finishes — and `settleSteerBubblesForMessage` had already
+	           * drawn the receipt, so the user was told "Not sent" about a message that then
+	           * sent. Marked here rather than left to that call because a context-exhaustion
+	           * auto-continue can move the session's active message id, and the settle is
+	           * keyed on the id this bubble was filed under.
+	           */
+	          steerInbox.markSteerDropped(waitingSteerId)
+	          return false
+	        }
+	        if (outcome === 'still-running') {
 	          // F-P2-1: the reply is still running after the ceiling. Queue promised "sends
 	          // after this reply", so sending now would break the promise AND race a live
 	          // turn. Say so and keep the words.
@@ -5486,6 +5523,13 @@ const immersiveActive = $derived.by(
 	        interruptedAt: new Date().toISOString()
 	      })
 	    }
+
+	    // AMD-119-04: counted whether or not there was a message id to name, because a
+	    // browser-held queued message is waiting on THIS gesture, not on what it cut.
+	    manualStopCountBySession.set(
+	      sessionId,
+	      (manualStopCountBySession.get(sessionId) ?? 0) + 1
+	    )
 
 	    stopRealtimeSpeechPlayback(previousMessageId)
 	    // SA-114 P3 (F-P3-B): Stop promotes nothing (DL-114-07), so anything still waiting is
