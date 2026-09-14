@@ -54,7 +54,9 @@ A message that is in between — sent, but not yet part of anything — draws it
 | *Not sent — you stopped the reply* | You pressed Stop, and Stop means stop: your message was not passed on and no new turn started. This covers a queued message too. |
 | *Not sent — the reply ended before it could land. Send it again.* | The rare backstop: the chat went quiet with your message still waiting, so Batshit never placed it anywhere rather than guess. |
 
-Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there to copy and send again. It is never quietly turned into a message you didn't mean to send.
+Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there. It is never quietly turned into a message you didn't mean to send.
+
+**You don't have to retype it.** A grey bubble carries two small buttons: **Send now** sends that message exactly as you wrote it, attachment and all, and **Dismiss** clears the bubble away. Nothing is put back into the message box, on purpose: if you spent the wait typing something else, a receipt should not overwrite it. (After a reload the bubble keeps your words but loses **Send now**, because Batshit will not guess at a message it can no longer send exactly.)
 
 A bubble disappears the moment your message has a real home. If the agent read it mid-reply, it becomes the inset inside that reply, marked *You, mid-reply*. If the reply ended first, it becomes an ordinary message from you, and the agent answers it.
 

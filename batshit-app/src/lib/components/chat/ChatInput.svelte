@@ -2261,6 +2261,22 @@ $effect(() => {
       fileReferences: fileReferences.length ? fileReferences : undefined,
       clipIds: clippedItems.map((clip: { id?: string }) => clip.id).filter(Boolean),
       onAccepted: () => handleAccepted(false),
+      /**
+       * AMD-119-05 — a browser-held queued message leaves the box the moment it is queued,
+       * the way a steer and a server-held one already do, and the bubble holds the words
+       * from then on.
+       *
+       * `resetComposer()` and NOT `handleAccepted`: the clips must stay exactly as they
+       * are. `clipsManager.handleMessageAccepted` unclips ONE-TIME clips, and a queued
+       * message has not been sent yet — its one-time clip still has to be attached when it
+       * finally goes, and has to survive a Stop that drops it.
+       *
+       * Nothing puts the words BACK. Josh, 2026-09-13: refilling the composer could erase
+       * paragraphs the user typed while waiting. The dropped bubble carries **Send now**
+       * and **Dismiss** instead, so the words are one click away without ever touching
+       * what is in the box.
+       */
+      onQueuedForLater: () => resetComposer(),
       // SA-114 P3 (DL-114-01): present only when Cmd/Ctrl+Enter asked for the other mode.
       busySendModeOverride: overrides?.busySendModeOverride
     }

@@ -400,6 +400,104 @@ describe('the interruption note after a Stop (SA-119 P2b, F-P2-7)', () => {
 })
 
 /**
+ * SA-119 P3b (AMD-119-05) — a queued message leaves the box, and comes back as a click.
+ *
+ * Josh, 2026-09-13. Two halves. (1) The words leave the composer the moment the message is
+ * queued: they sat in BOTH the box and the bubble for the whole wait, which reads as "this
+ * will be sent twice". (2) Nothing is ever written back into the composer — a user who
+ * spent the wait typing paragraphs would lose them to a receipt — so the dropped bubble
+ * carries **Send now** and **Dismiss** instead.
+ *
+ * The bubble's own behaviour is mounted and tested in `SteerBubble.test.ts`. What is pinned
+ * here is the WIRING: that the exact send is kept, that Send now replays it rather than the
+ * words on screen, and that the composer is cleared but never refilled.
+ */
+describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
+  const handler = page.indexOf('async function handleSendMessage(')
+  const stopHandler = page.indexOf('async function handleStopStream()')
+  const sendPath = page.slice(handler, stopHandler)
+
+  it('clears the composer the moment a browser-held message is queued', () => {
+    const branch = sendPath.indexOf('if (clientQueueEligible) {')
+    const body = sendPath.slice(branch, sendPath.indexOf('stopRealtimeSpeechPlayback()', branch))
+    // Pinned from the line start: `void 0 && theCall(` still contains `theCall(`.
+    expect(body).toContain(
+      "\n\t        if (typeof metadata?.onQueuedForLater === 'function') {\n\t          metadata.onQueuedForLater()"
+    )
+    // And it happens AFTER the bubble exists, or the words would be nowhere for a moment.
+    const bubble = body.indexOf('steerInbox.noteLocalSteer({')
+    expect(bubble).toBeGreaterThan(-1)
+    expect(body.indexOf('metadata.onQueuedForLater()')).toBeGreaterThan(bubble)
+  })
+
+  it('clears the WORDS only — the clips are sticky and a one-time clip is unspent', () => {
+    const chatInput = readFileSync('src/lib/components/chat/ChatInput.svelte', 'utf8')
+    expect(chatInput).toContain('onQueuedForLater: () => resetComposer(),')
+    // `resetComposer` has only ever cleared text (DL-119-04); the clips are cleared by
+    // `clipsManager.handleMessageAccepted`, which a queued message has not earned yet.
+    const reset = chatInput.indexOf('function resetComposer() {')
+    expect(chatInput.slice(reset, reset + 500)).not.toContain('clipsManager')
+  })
+
+  it('never writes anything back into the composer', () => {
+    // Josh's reason, 2026-09-13: a user who spent the wait typing paragraphs would lose
+    // them. The first draft of this packet did refill it; that is why the claim is here.
+    const chatInput = readFileSync('src/lib/components/chat/ChatInput.svelte', 'utf8')
+    for (const gone of ['restoreComposerText', 'onReturnedToComposer', 'queuedDraft']) {
+      expect(codeOnly(chatInput)).not.toContain(gone)
+      expect(codeOnly(page)).not.toContain(gone)
+    }
+  })
+
+  it('keeps the EXACT send behind each bubble, not the words on screen', () => {
+    // The bubble's text has had clip syntax stripped for reading (F-P2-6), and the clip ids
+    // and file references live in the metadata. Re-sending the display text would name a
+    // clip it does not carry, or drop the file.
+    expect(page.match(/resendableSteerPayloads\.set\(/g)?.length ?? 0).toBe(2)
+    expect(sendPath).toContain(
+      'resendableSteerPayloads.set(steerId, { content, metadata: { ...metadata } })'
+    )
+    expect(sendPath).toContain(
+      'resendableSteerPayloads.set(waitingSteerId, { content, metadata: { ...metadata } })'
+    )
+    // A copy, not the live object: the send path mutates `metadata` on its way through.
+    expect(page).not.toContain('resendableSteerPayloads.set(steerId, { content, metadata })')
+  })
+
+  it('sends that exact payload on Send now, and takes the receipt down first', () => {
+    const fn = page.indexOf('function resendDroppedSteer(steerId: string) {')
+    expect(fn).toBeGreaterThan(-1)
+    const body = page.slice(fn, page.indexOf('function dismissDroppedSteer(', fn))
+    expect(body).toContain('const payload = resendableSteerPayloads.get(steerId)')
+    expect(body).toContain('if (!payload) return')
+    expect(body).toContain('steerInbox.forgetSteer(steerId)')
+    expect(body).toContain('void handleSendMessage(payload.content, payload.metadata)')
+    // The bubble goes BEFORE the send, or the words show twice for the length of a turn.
+    expect(body.indexOf('steerInbox.forgetSteer(steerId)')).toBeLessThan(
+      body.indexOf('void handleSendMessage(')
+    )
+    // Never the display text.
+    expect(body).not.toContain('steer.text')
+  })
+
+  it('offers Send now only when that exact payload still exists', () => {
+    expect(page).toContain('function canResendDroppedSteer(steerId: string) {')
+    expect(page).toContain('return resendableSteerPayloads.has(steerId)')
+    expect(page).toContain('canResendDroppedSteer={canResendDroppedSteer}')
+    expect(page).toContain('onResendDroppedSteer={resendDroppedSteer}')
+    expect(page).toContain('onDismissDroppedSteer={dismissDroppedSteer}')
+  })
+
+  it('prunes the payloads wherever dropped bubbles are cleared', () => {
+    // Two call sites, matching the two `clearDroppedSteersForSession` calls (DL-118-08).
+    expect(page.match(/prunePayloadsForForgottenSteers\(\)/g)?.length ?? 0).toBe(3)
+    const prune = page.indexOf('function prunePayloadsForForgottenSteers() {')
+    expect(prune).toBeGreaterThan(-1)
+    expect(page.slice(prune, prune + 400)).toContain('if (!steerInbox.getSteer(steerId))')
+  })
+})
+
+/**
  * SA-119 P2 (DL-119-03) — the two badges beside Stop.
  *
  * SA-118's F-25 put the third send state behind a hover tooltip, and Josh's finding
