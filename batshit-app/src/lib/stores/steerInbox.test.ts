@@ -5,6 +5,7 @@ import {
   applySteerPromoted,
   applySteerQueued,
   clearDeliveredSteersForMessage,
+  clearDroppedSteer,
   clearSteerInboxForTest,
   clearDroppedSteersForSession,
   getPendingSteersForSession,
@@ -406,5 +407,93 @@ describe('steerInbox', () => {
     applySteerDelivered({ sessionId: 's1', messageId: '', steerId: 'steer_b' })
     expect(getSteer('steer_a')).toBeNull()
     expect(getSteer('steer_b')).toBeNull()
+  })
+})
+
+/**
+ * SA-119 P3b review (Faye, F-P3b-3) — one receipt, its own button.
+ *
+ * P3b's Send now and Dismiss retired the bubble with `forgetSteer`, which does not remember
+ * the id — so the session replay could rebuild the very bubble the user had just acted on,
+ * as a `queued` promise about a reply that is over (the AMD-118-08 lie, back through a new
+ * door). This is the single-receipt twin of `clearDroppedSteersForSession`.
+ */
+describe('clearDroppedSteer (SA-119 P3b review, F-P3b-3)', () => {
+  afterEach(() => {
+    clearSteerInboxForTest()
+  })
+
+  it('removes a dropped bubble and refuses the session replay that would rebuild it', () => {
+    noteLocalSteer({ steerId: 'steer_a', sessionId: 's1', messageId: 'm1', text: 'a', deliver: 'end' })
+    markSteerDropped('steer_a')
+    clearDroppedSteer('steer_a')
+    expect(getSteer('steer_a')).toBeNull()
+
+    // Exactly what `/api/sse`'s replay hands the page on the next resubscribe.
+    applySteerQueued({ sessionId: 's1', messageId: 'm1', steerId: 'steer_a', text: 'a', deliver: 'end' })
+    expect(getSteer('steer_a')).toBeNull()
+  })
+
+  it("leaves the chat's OTHER receipts where they are (F-P3b-1)", () => {
+    noteLocalSteer({ steerId: 'steer_a', sessionId: 's1', messageId: 'm1', text: 'a' })
+    noteLocalSteer({ steerId: 'steer_b', sessionId: 's1', messageId: 'm1', text: 'b' })
+    markSteerDropped('steer_a')
+    markSteerDropped('steer_b')
+    clearDroppedSteer('steer_a')
+    expect(getSteer('steer_a')).toBeNull()
+    expect(getSteer('steer_b')?.state).toBe('dropped')
+    expect(getSteer('steer_b')?.text).toBe('b')
+  })
+
+  it('touches nothing that is not a dropped bubble', () => {
+    noteLocalSteer({ steerId: 'steer_q', sessionId: 's1', messageId: 'm1', text: 'q' })
+    noteLocalSteer({ steerId: 'steer_w', sessionId: 's1', messageId: 'm1', text: 'w', state: 'waiting' })
+    clearDroppedSteer('steer_q')
+    clearDroppedSteer('steer_w')
+    clearDroppedSteer('')
+    clearDroppedSteer('steer_missing')
+    expect(getSteer('steer_q')?.state).toBe('queued')
+    expect(getSteer('steer_w')?.state).toBe('waiting')
+  })
+})
+
+/**
+ * SA-119 P3b review (Faye, F-P3b-4) — the wait that gives up on a reply still running.
+ *
+ * The browser-held queue waits fifteen minutes at most. Before P3b the words were still in
+ * the composer when that ran out, so forgetting the bubble lost nothing; P3b cleared the
+ * composer at queue time, and the same `forgetSteer` then lost the message outright while
+ * the toast said it was "still here". The bubble is the receipt now, with its own reason.
+ */
+describe('the timed-out receipt (SA-119 P3b review, F-P3b-4)', () => {
+  afterEach(() => {
+    clearSteerInboxForTest()
+  })
+
+  it('drops a waiting bubble as timed out, and says so without blaming a Stop', () => {
+    noteLocalSteer({
+      steerId: 'steer_w',
+      sessionId: 's1',
+      messageId: 'm1',
+      text: 'w',
+      state: 'waiting',
+      withFiles: true
+    })
+    markSteerDropped('steer_w', 'timed_out')
+    expect(getSteer('steer_w')?.state).toBe('dropped')
+    expect(getSteer('steer_w')?.dropReason).toBe('timed_out')
+    const label = steerBubbleStatusLabel(getSteer('steer_w')!)
+    expect(label).toContain('Not sent')
+    expect(label).toContain('ran too long')
+    expect(label).toContain('Send it again')
+    expect(label).not.toContain('you stopped')
+    expect(label).not.toContain('reply ended')
+  })
+
+  it('is still a dropped bubble to the session-wide clear (DL-118-08)', () => {
+    noteLocalSteer({ steerId: 'steer_w', sessionId: 's1', messageId: 'm1', text: 'w', state: 'waiting' })
+    markSteerDropped('steer_w', 'timed_out')
+    clearDroppedSteersForSession('s1')
+    expect(getSteer('steer_w')).toBeNull()
   })
 })

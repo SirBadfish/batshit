@@ -24,6 +24,8 @@ import {
   QUEUED_WITH_FILES_SENTENCE,
   QUEUE_ONE_AT_A_TIME_SENTENCE,
   classifySteerRefusal,
+  COMPOSER_BOUND_SEND_METADATA_KEYS,
+  replayableSendMetadata,
   type BusySendMode,
   type DeliveredSteer
 } from './steerControl'
@@ -750,5 +752,90 @@ describe('resolveQueuedSendAfterWait (SA-119 P3)', () => {
       }
     }
     expect([...seen].sort()).toEqual(['dropped-by-stop', 'send', 'still-running'])
+  })
+})
+
+/**
+ * SA-119 P3b review (Faye, F-P3b-2) — what a receipt's Send now may replay.
+ *
+ * P3b kept the composer's whole metadata object beside the bubble and replayed it. That
+ * object carries the composer's OWN closures: `onAccepted` clears the box and unclips every
+ * one-time clip in it, `onQueuedForLater` clears the box — both over the composer's LIVE
+ * state, minutes after the message was written. A replay accepted while the user was typing
+ * their next message wiped it: the loss Josh rejected a composer refill for.
+ */
+describe('replayableSendMetadata (SA-119 P3b review, F-P3b-2)', () => {
+  const onAccepted = () => {}
+  const onQueuedForLater = () => {}
+  const onReplayAccepted = () => {}
+  const composerMetadata = {
+    stt: false,
+    tts: true,
+    voiceMode: 'voice',
+    realtime: false,
+    composerSessionId: 'session_1',
+    fileReferences: [{ path: 'notes/a.txt' }],
+    clipIds: ['clip_1'],
+    onAccepted,
+    onQueuedForLater,
+    onReplayAccepted,
+    busySendModeOverride: 'queue'
+  }
+
+  it('drops every closure and choice that belonged to the composer', () => {
+    const replay = replayableSendMetadata(composerMetadata)
+    // `onAccepted` survives as a KEY only because the replay-safe callback took its place.
+    expect(replay.onAccepted).not.toBe(onAccepted)
+    expect('onQueuedForLater' in replay).toBe(false)
+    expect('busySendModeOverride' in replay).toBe(false)
+    expect('onReplayAccepted' in replay).toBe(false)
+    // With no replay-safe callback offered, every composer-bound key is gone outright.
+    const { onReplayAccepted: _omit, ...withoutReplay } = composerMetadata
+    const bare = replayableSendMetadata(withoutReplay)
+    for (const key of COMPOSER_BOUND_SEND_METADATA_KEYS) expect(key in bare).toBe(false)
+    expect(COMPOSER_BOUND_SEND_METADATA_KEYS).toEqual([
+      'onAccepted',
+      'onQueuedForLater',
+      'busySendModeOverride'
+    ])
+  })
+
+  it('keeps the facts of the send itself — the file travels', () => {
+    const replay = replayableSendMetadata(composerMetadata)
+    expect(replay.clipIds).toEqual(['clip_1'])
+    expect(replay.fileReferences).toEqual([{ path: 'notes/a.txt' }])
+    expect(replay.composerSessionId).toBe('session_1')
+    expect(replay.tts).toBe(true)
+    expect(replay.voiceMode).toBe('voice')
+  })
+
+  it('lets the replay-safe callback answer the acceptance, under the name the page calls', () => {
+    const replay = replayableSendMetadata(composerMetadata)
+    expect(replay.onAccepted).toBe(onReplayAccepted)
+    expect(replay.onAccepted).not.toBe(onAccepted)
+  })
+
+  it("offers no acceptance callback when the composer gave no replay-safe one — never the composer's own", () => {
+    const { onReplayAccepted: _omit, ...withoutReplay } = composerMetadata
+    expect('onAccepted' in replayableSendMetadata(withoutReplay)).toBe(false)
+    // A non-function in that slot is not promoted either.
+    expect('onAccepted' in replayableSendMetadata({ ...withoutReplay, onReplayAccepted: true })).toBe(
+      false
+    )
+  })
+
+  it('answers a new object and leaves the input alone', () => {
+    const input = { ...composerMetadata }
+    const replay = replayableSendMetadata(input)
+    expect(replay).not.toBe(input)
+    expect(input.onAccepted).toBe(onAccepted)
+    expect(input.onQueuedForLater).toBe(onQueuedForLater)
+    expect(input.onReplayAccepted).toBe(onReplayAccepted)
+    expect(input.busySendModeOverride).toBe('queue')
+  })
+
+  it('answers an empty object for nothing', () => {
+    expect(replayableSendMetadata(null)).toEqual({})
+    expect(replayableSendMetadata(undefined)).toEqual({})
   })
 })

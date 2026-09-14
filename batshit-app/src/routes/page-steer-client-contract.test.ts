@@ -145,7 +145,10 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     // AMD-119-04 turned the two-way `replyEnded` test into the three-way rule below, so
     // the ceiling's branch is named rather than negated.
     expect(body).toContain("if (outcome === 'still-running') {")
-    expect(body).toContain('still here')
+    // Review F-P3b-4: the composer was cleared when the message was queued (AMD-119-05), so
+    // the bubble is where the words are. It becomes the receipt; it is not forgotten.
+    expect(body).toContain("steerInbox.markSteerDropped(waitingSteerId, 'timed_out')")
+    expect(body).toContain('kept on its receipt')
   })
 
   it('drops a browser-held queued message when the user stops the reply (AMD-119-04)', () => {
@@ -163,7 +166,10 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     expect(page.match(/resolveQueuedSendAfterWait\(/g)?.length ?? 0).toBe(1)
 
     // Stopped: the bubble SURVIVES as the receipt, and nothing is sent.
-    expect(body).toContain("if (outcome !== 'dropped-by-stop') steerInbox.forgetSteer(waitingSteerId)")
+    // Review F-P3b-4 narrowed this from "everything but a Stop" to "only a send": a wait
+    // that gives up on a reply still running keeps its bubble too, as the receipt.
+    expect(body).toContain("if (outcome === 'send') steerInbox.forgetSteer(waitingSteerId)")
+    expect(page.match(/steerInbox\.forgetSteer\(waitingSteerId\)/g)?.length ?? 0).toBe(1)
     expect(body).toContain("if (outcome === 'dropped-by-stop') {")
     expect(body).toContain('steerInbox.markSteerDropped(waitingSteerId)')
     const dropped = body.indexOf("if (outcome === 'dropped-by-stop') {")
@@ -454,14 +460,18 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     // and file references live in the metadata. Re-sending the display text would name a
     // clip it does not carry, or drop the file.
     expect(page.match(/resendableSteerPayloads\.set\(/g)?.length ?? 0).toBe(2)
+    // Review F-P3b-2: through the rules module, which answers a NEW object with the
+    // composer's closures stripped — never a spread of the live metadata, whose `onAccepted`
+    // would clear the composer the moment the replay was accepted.
     expect(sendPath).toContain(
-      'resendableSteerPayloads.set(steerId, { content, metadata: { ...metadata } })'
+      'resendableSteerPayloads.set(steerId, { content, metadata: replayableSendMetadata(metadata) })'
     )
     expect(sendPath).toContain(
-      'resendableSteerPayloads.set(waitingSteerId, { content, metadata: { ...metadata } })'
+      'resendableSteerPayloads.set(waitingSteerId, { content, metadata: replayableSendMetadata(metadata) })'
     )
-    // A copy, not the live object: the send path mutates `metadata` on its way through.
+    expect(page.match(/replayableSendMetadata\(metadata\)/g)?.length ?? 0).toBe(2)
     expect(page).not.toContain('resendableSteerPayloads.set(steerId, { content, metadata })')
+    expect(page).not.toContain('metadata: { ...metadata } })')
   })
 
   it('sends that exact payload on Send now, and takes the receipt down first', () => {
@@ -470,10 +480,18 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     const body = page.slice(fn, page.indexOf('function dismissDroppedSteer(', fn))
     expect(body).toContain('const payload = resendableSteerPayloads.get(steerId)')
     expect(body).toContain('if (!payload) return')
-    expect(body).toContain('steerInbox.forgetSteer(steerId)')
-    expect(body).toContain('void handleSendMessage(payload.content, payload.metadata)')
+    // Review F-P3b-3: CLEARED (remembered), never merely forgotten — a forgotten id is
+    // rebuilt by the session replay on the next resubscribe. And only while the bubble is
+    // still `dropped`: the button was drawn for that state.
+    expect(body).toContain("if (steerInbox.getSteer(steerId)?.state !== 'dropped') return")
+    expect(body).toContain('steerInbox.clearDroppedSteer(steerId)')
+    expect(body).not.toContain('steerInbox.forgetSteer(')
+    // Review F-P3b-1: a replay, so the send path leaves the chat's OTHER receipts alone.
+    expect(body).toContain(
+      'void handleSendMessage(payload.content, payload.metadata, { fromDroppedReceipt: true })'
+    )
     // The bubble goes BEFORE the send, or the words show twice for the length of a turn.
-    expect(body.indexOf('steerInbox.forgetSteer(steerId)')).toBeLessThan(
+    expect(body.indexOf('steerInbox.clearDroppedSteer(steerId)')).toBeLessThan(
       body.indexOf('void handleSendMessage(')
     )
     // Never the display text.
@@ -494,6 +512,50 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
     const prune = page.indexOf('function prunePayloadsForForgottenSteers() {')
     expect(prune).toBeGreaterThan(-1)
     expect(page.slice(prune, prune + 400)).toContain('if (!steerInbox.getSteer(steerId))')
+  })
+
+  /**
+   * Faye's review of P3b (2026-09-13). Four ways the receipt could still lose words:
+   * Send now on one receipt cleared every other receipt in the chat (F-P3b-1); the replayed
+   * metadata carried the composer's `onAccepted`, which cleared the box on acceptance
+   * (F-P3b-2); Dismiss and Send now forgot the bubble without remembering it, so the session
+   * replay could rebuild it (F-P3b-3); and the wait's ceiling forgot a bubble whose words
+   * were no longer in the composer (F-P3b-4, pinned with the wait branch above).
+   */
+  it('retires ONE receipt from its own button and keeps the others (review F-P3b-1, F-P3b-3)', () => {
+    const dismiss = page.indexOf('function dismissDroppedSteer(steerId: string) {')
+    expect(dismiss).toBeGreaterThan(-1)
+    expect(page.slice(dismiss, dismiss + 400)).toContain('steerInbox.clearDroppedSteer(steerId)')
+    expect(page.match(/steerInbox\.clearDroppedSteer\(steerId\)/g)?.length ?? 0).toBe(2)
+    // The per-send clear of the chat's dropped receipts (DL-118-08) is skipped for a
+    // replay — pinned as the whole guard with its body on the next line, from the line
+    // start, because `void 0 &&` in front of a call still contains the call.
+    expect(page).toContain(
+      '\n      if (!sendOptions.fromDroppedReceipt) {\n        steerInbox.clearDroppedSteersForSession(sendSessionId)'
+    )
+    expect(page).toContain('sendOptions: { fromDroppedReceipt?: boolean } = {}')
+    // And it travels as an argument, not as metadata: `requestMetadata` spreads metadata
+    // into the request body and a placeholder record, and the server has no use for it.
+    expect(codeOnly(page)).not.toContain('metadata.fromDroppedReceipt')
+    expect(codeOnly(page)).not.toContain('metadata?.fromDroppedReceipt')
+  })
+
+  it('hands the replay a callback over its OWN clip ids, never the composer (review F-P3b-2)', () => {
+    // Pinned from the line start, with the call on the next line.
+    expect(chatInput).toContain(
+      '\n      onReplayAccepted: () =>\n        clipsManager?.handleMessageAccepted?.({ waitForServer: false, clipIds: sentClipIds }),'
+    )
+    const callback = chatInput.indexOf('onReplayAccepted: () =>')
+    expect(chatInput.slice(callback, callback + 160)).not.toContain('resetComposer')
+    expect(chatInput.slice(callback, callback + 160)).not.toContain('handleAccepted(')
+    // The composer's own acceptance still clears the box — only the replay's must not.
+    expect(chatInput).toContain('onAccepted: () => handleAccepted(false),')
+    // The key list lives in the rules module and nowhere else; the page never names the
+    // replay callback, because `replayableSendMetadata` has already renamed it.
+    expect(rules).toContain(
+      "export const COMPOSER_BOUND_SEND_METADATA_KEYS = [\n  'onAccepted',\n  'onQueuedForLater',\n  'busySendModeOverride'\n] as const"
+    )
+    expect(codeOnly(page)).not.toContain('onReplayAccepted')
   })
 })
 

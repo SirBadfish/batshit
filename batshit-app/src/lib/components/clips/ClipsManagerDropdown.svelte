@@ -817,9 +817,23 @@
     await setClipOneTimeMode(clipId, enabled)
   }
 
-  export async function handleMessageAccepted(options?: { waitForServer?: boolean }) {
+  /**
+   * A message with clips has gone: release the one-time clips it carried.
+   *
+   * `clipIds` (SA-119 review F-P3b-2) narrows that to the clips of ONE message. A receipt's
+   * **Send now** replays a message minutes after it was written, and by then the user may
+   * have attached a one-time clip for their NEXT message — releasing every one-time clip in
+   * the box, as the composer's own send does, would spend that one on a message it was
+   * never part of. Without `clipIds` the behaviour is unchanged.
+   */
+  export async function handleMessageAccepted(options?: {
+    waitForServer?: boolean
+    clipIds?: readonly string[]
+  }) {
+    const only = options?.clipIds
     const oneTimeIds = clippedItems
       .filter((clip) => (clip.messagesUntilUnclip ?? clip.unclipAfter ?? null) === 1)
+      .filter((clip) => !only || only.includes(clip.id))
       .map((clip) => clip.id)
 
     if (oneTimeIds.length > 0) {

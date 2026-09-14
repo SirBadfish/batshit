@@ -53,6 +53,7 @@ A message that is in between — sent, but not yet part of anything — draws it
 | *Queued — sends after this reply (with files)* | Same promise, and your attachment goes with it. |
 | *Not sent — you stopped the reply* | You pressed Stop, and Stop means stop: your message was not passed on and no new turn started. This covers a queued message too. |
 | *Not sent — the reply ended before it could land. Send it again.* | The rare backstop: the chat went quiet with your message still waiting, so Batshit never placed it anywhere rather than guess. |
+| *Not sent — the reply ran too long to wait for. Send it again when it ends.* | A message your browser was holding (one with a file, or a chat that cannot take a steer) waits for the reply to end, but not forever. After a very long reply it gives up, and the receipt keeps your message: press **Send now** when the reply ends. |
 
 Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there. It is never quietly turned into a message you didn't mean to send.
 
@@ -60,7 +61,7 @@ Either way the bubble goes grey and **keeps your words on screen**, so a message
 
 A bubble disappears the moment your message has a real home. If the agent read it mid-reply, it becomes the inset inside that reply, marked *You, mid-reply*. If the reply ended first, it becomes an ordinary message from you, and the agent answers it.
 
-A **grey "not sent" bubble** has no home to go to, so it stays until you are done with it: it clears the next time you send in that chat, and it clears when you leave the chat. A bubble for a reply that is still running stays put — leaving and coming back does not throw away the only sign that your message is still waiting.
+A **grey "not sent" bubble** has no home to go to, so it stays until you are done with it: it clears the next time you send in that chat, and it clears when you leave the chat. Pressing **Send now** or **Dismiss** on one receipt leaves the others alone. A bubble for a reply that is still running stays put — leaving and coming back does not throw away the only sign that your message is still waiting.
 
 ### The limits
 

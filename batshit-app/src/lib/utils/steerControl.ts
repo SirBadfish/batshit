@@ -781,3 +781,45 @@ export function resolveQueuedSendAfterWait(input: {
   if (!input.replyEnded) return 'still-running'
   return 'send'
 }
+
+/* ------------------------------------------------------------------ *
+ * SA-119 P3b review (F-P3b-2) — what a receipt's Send now may replay.
+ * ------------------------------------------------------------------ */
+
+/**
+ * The keys of a send's metadata that belong to the composer that built it, and must never
+ * ride a replay.
+ *
+ * `onAccepted` and `onQueuedForLater` are closures over the composer's LIVE text and clips
+ * (`resetComposer()`, `clipsManager.handleMessageAccepted()`), so replaying them from a
+ * receipt minutes later would wipe whatever the user has typed since and unclip whatever
+ * they have attached since — the exact loss Josh rejected a composer refill for
+ * (AMD-119-05). `busySendModeOverride` was one badge click or one keypress; a replay is an
+ * ordinary send and does whatever Enter would do now.
+ */
+export const COMPOSER_BOUND_SEND_METADATA_KEYS = [
+  'onAccepted',
+  'onQueuedForLater',
+  'busySendModeOverride'
+] as const
+
+/**
+ * The metadata a dropped bubble's **Send now** replays: the send's own facts (clip ids,
+ * file references, the voice flags, the composer's session) with the composer's closures
+ * removed.
+ *
+ * One callback survives, under a new name. The composer may hand over `onReplayAccepted`,
+ * a closure over THIS message's clip ids and nothing else; the replay's acceptance calls it
+ * as `onAccepted`, so a one-time clip the message carried is released when it finally goes
+ * and a clip attached since is left alone. Always a new object; the input is not touched.
+ */
+export function replayableSendMetadata(
+  metadata: Record<string, unknown> | null | undefined
+): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...(metadata ?? {}) }
+  for (const key of COMPOSER_BOUND_SEND_METADATA_KEYS) delete copy[key]
+  const onReplayAccepted = copy.onReplayAccepted
+  delete copy.onReplayAccepted
+  if (typeof onReplayAccepted === 'function') copy.onAccepted = onReplayAccepted
+  return copy
+}

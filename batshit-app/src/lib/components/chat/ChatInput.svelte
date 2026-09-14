@@ -2252,6 +2252,9 @@ $effect(() => {
 
     const composerSessionId =
       resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
+    const sentClipIds = clippedItems
+      .map((clip: { id?: string }) => clip.id)
+      .filter((id: string | undefined): id is string => Boolean(id))
     const metadata: Record<string, any> = {
       stt: Boolean(messageIncludesStt),
       tts: Boolean(shouldSpeak),
@@ -2259,8 +2262,21 @@ $effect(() => {
       realtime: false,
       composerSessionId: composerSessionId ?? undefined,
       fileReferences: fileReferences.length ? fileReferences : undefined,
-      clipIds: clippedItems.map((clip: { id?: string }) => clip.id).filter(Boolean),
+      clipIds: sentClipIds,
       onAccepted: () => handleAccepted(false),
+      /**
+       * SA-119 review F-P3b-2 — the one callback a receipt's **Send now** may replay.
+       *
+       * `onAccepted` above closes over the composer's LIVE state: it clears the text and
+       * unclips whatever one-time clips are attached when it runs. A replay minutes later
+       * must do neither to a box the user has typed into since. This closes over THIS
+       * message's clip ids and nothing else, so the one-time clip it carried is released
+       * when it finally goes and a clip attached since is left alone.
+       * `replayableSendMetadata` swaps it in for `onAccepted` on the replay and drops it
+       * everywhere else; the page never calls it by this name.
+       */
+      onReplayAccepted: () =>
+        clipsManager?.handleMessageAccepted?.({ waitForServer: false, clipIds: sentClipIds }),
       /**
        * AMD-119-05 — a browser-held queued message leaves the box the moment it is queued,
        * the way a steer and a server-held one already do, and the bubble holds the words

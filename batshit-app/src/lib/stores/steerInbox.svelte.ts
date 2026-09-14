@@ -47,9 +47,12 @@ export type SteerBubbleState = 'queued' | 'waiting' | 'delivered' | 'promoted' |
 /**
  * Why a steer was dropped (F-P3-4). `stopped` is the user's own Stop; `unanswered` is the
  * backstop — the chat went quiet with the steer still waiting, so the server never wrote
- * the promotion. Only the first may say "you stopped the reply".
+ * the promotion. Only the first may say "you stopped the reply". `timed_out` (SA-119
+ * review F-P3b-4) is the browser-held wait giving up on a reply that is STILL running: the
+ * composer was cleared when the message was queued, so the receipt is the only place the
+ * words are, and it must not disappear with them.
  */
-export type SteerDropReason = 'stopped' | 'unanswered'
+export type SteerDropReason = 'stopped' | 'unanswered' | 'timed_out'
 
 export interface SteerBubbleEntry {
   steerId: string
@@ -281,9 +284,15 @@ export function steerBubbleStatusLabel(entry: SteerBubbleEntry): string {
       // one of them is allowed to mention files, and only when there are some.
       return entry.withFiles ? QUEUED_WITH_FILES_SENTENCE : QUEUED_AFTER_REPLY_SENTENCE
     case 'dropped':
-      return entry.dropReason === 'unanswered'
-        ? 'Not sent — the reply ended before it could land. Send it again.'
-        : 'Not sent — you stopped the reply'
+      if (entry.dropReason === 'unanswered') {
+        return 'Not sent — the reply ended before it could land. Send it again.'
+      }
+      if (entry.dropReason === 'timed_out') {
+        // F-P3b-4: the reply was still running when the browser stopped waiting. No number
+        // in the sentence, so it cannot drift from `CLIENT_QUEUE_MAX_WAIT_MS`.
+        return 'Not sent — the reply ran too long to wait for. Send it again when it ends.'
+      }
+      return 'Not sent — you stopped the reply'
     default:
       // DL-119-05: `queued` is TWO promises. A steer lands inside this reply; a held
       // message never will, and saying "the agent's next step" about it would be the same
@@ -343,6 +352,26 @@ export function forgetSteer(steerId: string) {
   if (!id || !steerBySteerId[id]) return
   const next = { ...steerBySteerId }
   delete next[id]
+  steerBySteerId = next
+}
+
+/**
+ * SA-119 P3b review (F-P3b-3) — one receipt, acted on by its own button.
+ *
+ * **Send now** and **Dismiss** retire ONE `dropped` bubble. It has to be remembered the way
+ * `clearDroppedSteersForSession` remembers a whole chat's receipts, because a `forgetSteer`
+ * alone leaves the id free for the session replay to rebuild on the next resubscribe — as
+ * a `queued` promise about a reply that is over (AMD-118-08). Only a `dropped` bubble is
+ * touched: a bubble that moved on between the draw and the click is not this button's.
+ */
+export function clearDroppedSteer(steerId: string) {
+  const id = normalize(steerId)
+  if (!id) return
+  const existing = steerBySteerId[id]
+  if (!existing || existing.state !== 'dropped') return
+  const next = { ...steerBySteerId }
+  delete next[id]
+  clearedSteerIds.add(id)
   steerBySteerId = next
 }
 

@@ -151,6 +151,7 @@
   import {
     classifySteerRefusal,
     isSteerDeliver,
+    replayableSendMetadata,
     resolveBusySendActions,
     resolveBusySendMode,
     resolveQueuedSendAfterWait,
@@ -1789,18 +1790,27 @@ const immersiveActive = $derived.by(
     // No payload means this bubble came back from the replay buffer after a reload. The
     // button is not offered in that case; this is the belt to that braces.
     if (!payload) return
+    // Review F-P3b-3: the button was drawn for a `dropped` bubble. If the bubble moved on
+    // between the draw and the click, there is nothing left to re-send.
+    if (steerInbox.getSteer(steerId)?.state !== 'dropped') return
     resendableSteerPayloads.delete(steerId)
     // The receipt goes first: the words are about to exist as a real message, and leaving
     // the bubble would show them twice — the duplicate this packet exists to remove.
-    steerInbox.forgetSteer(steerId)
-    // Exactly what was queued, metadata and all. If the chat is busy again it queues again,
-    // which is the same promise it made the first time.
-    void handleSendMessage(payload.content, payload.metadata)
+    // CLEARED, not forgotten (review F-P3b-3): a forgotten id is free for the session
+    // replay to rebuild on the next resubscribe, as a `queued` promise about a reply that
+    // is over (AMD-118-08).
+    steerInbox.clearDroppedSteer(steerId)
+    // Exactly what was queued — the send's own facts, with the composer's closures already
+    // stripped (review F-P3b-2). If the chat is busy again it queues again, which is the
+    // same promise it made the first time. `fromDroppedReceipt` keeps the OTHER receipts in
+    // the chat (review F-P3b-1): this click acts on one of them, not on all of them.
+    void handleSendMessage(payload.content, payload.metadata, { fromDroppedReceipt: true })
   }
 
   function dismissDroppedSteer(steerId: string) {
     resendableSteerPayloads.delete(steerId)
-    steerInbox.forgetSteer(steerId)
+    // Same reason as above (review F-P3b-3): remembered, so the replay cannot bring it back.
+    steerInbox.clearDroppedSteer(steerId)
   }
 
   /** Whether a bubble can still be sent exactly as it was written. */
@@ -1890,7 +1900,9 @@ const immersiveActive = $derived.by(
 	   * references live in the send's METADATA, not in the words. Re-sending from what is on
 	   * screen would send a message that names a clip it does not carry, or quietly drops the
 	   * file — the one thing this story exists to prevent. So the exact `(content, metadata)`
-	   * is kept beside the bubble and replayed unchanged.
+	   * is kept beside the bubble and replayed — minus the composer's own closures, which
+	   * `replayableSendMetadata` strips (review F-P3b-2): `onAccepted` would clear whatever
+	   * the user has typed since, which is the loss the refill was rejected for.
 	   *
 	   * Tab-local and deliberately so: a bubble restored from the replay buffer after a
 	   * reload has no payload here, and **Send now** is simply not offered for it. An
@@ -4749,7 +4761,13 @@ const immersiveActive = $derived.by(
 	    }
 	  }
 
-		  async function handleSendMessage(content: string, metadata: any = {}) {
+		  async function handleSendMessage(
+		    content: string,
+		    metadata: any = {},
+		    // Review F-P3b-1: a replay from a receipt's Send now. Not metadata, because
+		    // `requestMetadata` spreads metadata into the request body and a placeholder record.
+		    sendOptions: { fromDroppedReceipt?: boolean } = {}
+		  ) {
 		    const goonPresentationMode: DesktopGoonPresentationMode | null = goonDcmPresentationMode
 		    metadata = {
 		      ...metadata,
@@ -4798,8 +4816,14 @@ const immersiveActive = $derived.by(
       // and duplicate guards, so a stray keypress does not wipe it, and before the steer
       // branch, so this send's own bubble is never the one removed. Only `dropped` goes:
       // a `queued` or `waiting` bubble belongs to a reply that is still running.
-      steerInbox.clearDroppedSteersForSession(sendSessionId)
-      prunePayloadsForForgottenSteers()
+      // Review F-P3b-1: a receipt's own Send now is the user acting on THAT receipt, not on
+      // the others in the chat — each of those is still waiting for its own button, and the
+      // composer no longer holds their words (AMD-119-05), so clearing them here would be
+      // the loss this story exists to prevent.
+      if (!sendOptions.fromDroppedReceipt) {
+        steerInbox.clearDroppedSteersForSession(sendSessionId)
+        prunePayloadsForForgottenSteers()
+      }
 
       // SA-114 P3 (DL-114-11, AMD-114-07): a send stops any speech still playing — UNLESS
       // it turns out to be a steer, which does not stop the reply and so must not stop its
@@ -5098,7 +5122,7 @@ const immersiveActive = $derived.by(
 	        })
 	        // AMD-119-05: kept before the round trip, like the bubble, so a refusal or a Stop
 	        // arriving mid-flight still finds it.
-	        resendableSteerPayloads.set(steerId, { content, metadata: { ...metadata } })
+	        resendableSteerPayloads.set(steerId, { content, metadata: replayableSendMetadata(metadata) })
 	        const outcome = await postSteer({
 	          sessionId: currentSessionId,
 	          messageId: steerTargetMessageId,
@@ -5174,7 +5198,7 @@ const immersiveActive = $derived.by(
 	          state: 'waiting',
 	          withFiles: sendCarriesAttachments
 	        })
-	        resendableSteerPayloads.set(waitingSteerId, { content, metadata: { ...metadata } })
+	        resendableSteerPayloads.set(waitingSteerId, { content, metadata: replayableSendMetadata(metadata) })
 	        /**
 	         * AMD-119-05 (Josh, 2026-09-13) — the words leave the box now.
 	         *
@@ -5200,10 +5224,11 @@ const immersiveActive = $derived.by(
 	              (manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeWait,
 	            replyEnded
 	          })
-	          // AMD-119-04: on a Stop the bubble IS the receipt, so it must survive. Every
-	          // other outcome either sends the message (the bubble's job is done) or leaves
-	          // the words in the composer (a second bubble saying the same thing twice).
-	          if (outcome !== 'dropped-by-stop') steerInbox.forgetSteer(waitingSteerId)
+	          // AMD-119-04, review F-P3b-4: the bubble IS the receipt for BOTH ways of not
+	          // sending — a Stop, and a wait that gave up on a reply still running. The
+	          // composer was cleared when the message was queued (AMD-119-05), so the bubble
+	          // is the only place the words still are. Only a send retires it.
+	          if (outcome === 'send') steerInbox.forgetSteer(waitingSteerId)
 	        }
 	        if (outcome === 'dropped-by-stop') {
 	          /**
@@ -5226,8 +5251,11 @@ const immersiveActive = $derived.by(
 	        if (outcome === 'still-running') {
 	          // F-P2-1: the reply is still running after the ceiling. Queue promised "sends
 	          // after this reply", so sending now would break the promise AND race a live
-	          // turn. Say so and keep the words.
-	          toast.info('That reply is still going. Your message is still here — send it again when it ends.')
+	          // turn. Review F-P3b-4: the words left the composer when the message was
+	          // queued, so the bubble becomes the receipt — with Send now for when the reply
+	          // ends — instead of vanishing with them.
+	          steerInbox.markSteerDropped(waitingSteerId, 'timed_out')
+	          toast.info('That reply is still going. Your message is kept on its receipt — use Send now when the reply ends.')
 	          return false
 	        }
 	      }
