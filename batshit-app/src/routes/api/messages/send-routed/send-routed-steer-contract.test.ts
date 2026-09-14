@@ -2,6 +2,10 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 const source = readFileSync('src/routes/api/messages/send-routed/+server.ts', 'utf8')
+const registrySource = readFileSync(
+  'src/lib/server/services/steerInboxRegistry.ts',
+  'utf8'
+)
 
 /**
  * SA-114 P1 — the send-routed steer contracts.
@@ -299,5 +303,71 @@ describe('send-routed steer contracts (SA-114 P1)', () => {
     expect(body).toContain("{ source: 'user' }")
     expect(body).toContain('await promoteSteersToNextTurn({')
     expect(body).toContain('console.error(')
+  })
+})
+
+/**
+ * SA-119 P1 (DL-119-05) — a queued message must never be injected mid-reply, on ANY lane.
+ *
+ * The behaviour is proved live in `steerInboxRegistry.test.ts`: both take-for-delivery
+ * functions skip a `deliver: 'end'` entry. What is pinned HERE is that send-routed has no
+ * OTHER door — that every boundary injection on all three lanes goes through one of those
+ * two functions, so the skip cannot be bypassed by a path that reads the inbox its own way.
+ * A held entry handed to the model mid-reply is the user's NEXT message arriving inside the
+ * answer it was meant to follow, on the one lane nobody re-checked.
+ */
+describe('a queued steer never reaches a tool boundary (SA-119 DL-119-05)', () => {
+  it('the API lane injects only what its boundary hook takes', () => {
+    // `prepareStep`'s only source of steers is `takeSteers`, and `takeSteers` is only ever
+    // `takePendingSteersForDelivery` — the function that skips held entries.
+    const takeSteers = source.indexOf('takeSteers: steerDeliveryEnabled')
+    expect(takeSteers).toBeGreaterThan(-1)
+    expect(source.slice(takeSteers, takeSteers + 260)).toContain(
+      'takePendingSteersForDelivery(sessionId, messageId, { step, lane: \'api\' })'
+    )
+    // Exactly one call, so there is no second reader with its own idea of what is pending.
+    expect(source.split('takePendingSteersForDelivery(').length - 1).toBe(1)
+  })
+
+  it('both CLI lanes push only through the transport flush', () => {
+    // send-routed never takes for a transport itself: the route and `attachSteerTransport`
+    // both go through `flushPendingSteersToTransport`, which takes through
+    // `takePendingSteersForTransport` — the other function that skips held entries.
+    expect(source).not.toContain('takePendingSteersForTransport(')
+    expect(registrySource.split('takePendingSteersForTransport(sessionId, messageId)').length - 1).toBe(1)
+    const flush = registrySource.indexOf('export async function flushPendingSteersToTransport(')
+    expect(flush).toBeGreaterThan(-1)
+    expect(registrySource.slice(flush)).toContain('takePendingSteersForTransport(sessionId, messageId)')
+  })
+
+  it('both boundary takes skip a held entry, and say so', () => {
+    for (const fn of ['takePendingSteersForDelivery', 'takePendingSteersForTransport']) {
+      const start = registrySource.indexOf(`export function ${fn}(`)
+      expect(start).toBeGreaterThan(-1)
+      const body = registrySource.slice(start, registrySource.indexOf('\n}', start))
+      // The same predicate in both, so the two lanes cannot drift apart on what "held" means.
+      expect(body).toContain('isHeldForEndOfTurn(entry)')
+    }
+  })
+
+  it('the end-of-turn take does NOT skip them — that is the whole point', () => {
+    const start = registrySource.indexOf('export function takeUndeliveredSteers(')
+    expect(start).toBeGreaterThan(-1)
+    const body = registrySource.slice(start, registrySource.indexOf('\n}', start))
+    expect(body).not.toContain('isHeldForEndOfTurn')
+    // Acceptance order, so several queued messages read back as the conversation the user had.
+    expect(body).toContain('.sort(')
+  })
+
+  it('a Stop still drops them, because nothing about the promotion loop reads `deliver`', () => {
+    const loop = source.indexOf('while (steerPromotions < MAX_STEER_PROMOTIONS) {')
+    const body = source.slice(loop, source.indexOf('if (steerPromotions >= MAX_STEER_PROMOTIONS) {', loop))
+    expect(body).toContain('if (interrupted) break')
+    // No special case: a queued message is promoted with everything else, or dropped with
+    // everything else. A `deliver` test here would be a second rule about the same field.
+    // (`takeUndeliveredSteers` contains the letters, so the check is on the FIELD.)
+    expect(body).not.toContain('.deliver')
+    expect(body).not.toContain('deliver:')
+    expect(body).not.toContain("'end'")
   })
 })

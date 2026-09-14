@@ -1127,11 +1127,13 @@ const immersiveActive = $derived.by(
    * - `already_finished` — the reply ended between the button and the route. There is
    *   nothing to interrupt, so the caller sends it as an ordinary message rather than
    *   stopping a turn that already stopped.
-   * - `not_steerable` — this agent, or this transport, cannot carry a mid-reply message.
-   *   The caller falls back to the interrupt branch and shows the server's own reason.
+   * - `queue` — this agent, or this transport, cannot carry a mid-reply message. SA-119
+   *   (DL-119-07) renamed this outcome from `not_steerable`: the words now wait for the
+   *   reply to end rather than stopping it, which is what the user asked for rather than
+   *   the Stop they did not. **P2 wires the branch**; until then this arm still falls
+   *   through to the interrupt path below, exactly as it did before SA-119.
    *
-   * A network failure is `not_steerable` too, with a plain sentence: the honest outcome is
-   * the one the user can see happen, and an interrupt is what Batshit did before this story.
+   * A network failure is `refused`, with a plain sentence.
    */
   async function postSteer(params: {
     sessionId: string
@@ -1141,7 +1143,7 @@ const immersiveActive = $derived.by(
   }): Promise<
     | { kind: 'accepted' }
     | { kind: 'already_finished' }
-    | { kind: 'not_steerable'; reason: string }
+    | { kind: 'queue'; reason: string }
     | { kind: 'refused'; reason: string }
   > {
     try {
@@ -1162,8 +1164,9 @@ const immersiveActive = $derived.by(
             : 'This agent cannot be steered mid-reply. Your message interrupts instead.'
 
       // PR #106 review F-4: `classifySteerRefusal` is THE rule. Only `reply_finished` (send
-      // normally) and `not_steerable` (interrupt) may escalate; the cap, a waiting DM, a bad
-      // request and a lost server all `refuse` — the reply keeps running and nothing is lost.
+      // normally) and `not_steerable` (DL-119-07: queue) may escalate; the cap, a waiting DM,
+      // a bad request and a lost server all `refuse` — the reply keeps running and nothing is
+      // lost.
       const kind = classifySteerRefusal(response.status, payload)
       if (kind === 'already_finished') return { kind: 'already_finished' }
       return { kind, reason }

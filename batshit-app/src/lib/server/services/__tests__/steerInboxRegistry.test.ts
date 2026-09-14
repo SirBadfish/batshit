@@ -625,3 +625,149 @@ describe('DM-sourced steers (DL-114-13)', () => {
     expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['user_1'])
   })
 })
+
+/**
+ * SA-119 P1 (DL-119-05) — Queue, held by the server.
+ *
+ * A queued message is an ordinary steer with one extra field: `deliver: 'end'`. It rides
+ * every path a steer rides — the cap, the Stop drop, the end-of-turn promotion — and is
+ * refused exactly one of them: **it is never handed to a transport at a tool boundary.**
+ * That single skip is what makes "send it when you finish" different from "steer", and it
+ * has to hold on all three lanes, because a held entry injected mid-reply is the user's
+ * next message arriving inside the answer it was meant to follow.
+ */
+describe('a queued steer (deliver: end) — DL-119-05', () => {
+  const queued = (steerId: string, overrides: Partial<SteerEntry> = {}): SteerEntry =>
+    entry(steerId, { deliver: 'end', ...overrides })
+
+  it('is accepted and waits like any other steer', () => {
+    expect(enqueueSteer(SESSION, queued('q1'))).toEqual({ ok: true, pending: 1 })
+    expect(listPendingSteers(SESSION).map((row) => [row.steerId, row.deliver])).toEqual([
+      ['q1', 'end']
+    ])
+  })
+
+  it('is never taken by the API lane’s boundary hook (DL-119-05)', () => {
+    enqueueSteer(SESSION, queued('q1'))
+    enqueueSteer(SESSION, entry('now1'))
+
+    const delivered = takePendingSteersForDelivery(SESSION, MESSAGE, { step: 1, lane: 'api' })
+    expect(delivered.map((row) => row.steerId)).toEqual(['now1'])
+    // Still waiting, untouched, for the end of the turn to promote.
+    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
+  })
+
+  it('is never taken by a CLI lane’s transport flush (DL-119-05)', () => {
+    enqueueSteer(SESSION, queued('q1'))
+    enqueueSteer(SESSION, entry('now1'))
+
+    expect(takePendingSteersForTransport(SESSION, MESSAGE).map((row) => row.steerId)).toEqual([
+      'now1'
+    ])
+    expect(listInFlightSteers(SESSION).map((row) => row.steerId)).toEqual(['now1'])
+    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
+  })
+
+  it('is not enough on its own to make a flush claim it sent something', async () => {
+    const sent: Array<{ steerIds: string[]; text: string }> = []
+    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'claude' })
+    attachSteerTransport(SESSION, MESSAGE, 'claude', async (payload) => {
+      sent.push(payload)
+      return true
+    })
+    enqueueSteer(SESSION, queued('q1'))
+
+    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
+      flushed: 0,
+      reason: 'nothing_pending'
+    })
+    // Nothing reached the wire, so nothing can reach the model mid-reply.
+    expect(sent).toEqual([])
+    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
+  })
+
+  it('flushes only the mid-reply steers when both kinds are waiting', async () => {
+    const sent: Array<{ steerIds: string[]; text: string }> = []
+    registerSteerRun(SESSION, { messageId: MESSAGE, steerable: true, reason: null, lane: 'codex' })
+    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
+      sent.push(payload)
+      return true
+    })
+    enqueueSteer(SESSION, queued('q1'))
+    enqueueSteer(SESSION, entry('now1'))
+
+    expect(await flushPendingSteersToTransport(SESSION, MESSAGE)).toEqual({
+      flushed: 1,
+      reason: 'sent'
+    })
+    expect(sent).toHaveLength(1)
+    expect(sent[0].steerIds).toEqual(['now1'])
+    expect(sent[0].text).not.toContain('steer q1')
+  })
+
+  it('counts against the cap like any other waiting message (DL-119-05)', () => {
+    for (let i = 0; i < MAX_PENDING_STEERS; i += 1) {
+      expect(enqueueSteer(SESSION, queued(`q${i}`)).ok).toBe(true)
+    }
+    const refused = enqueueSteer(SESSION, entry('overflow'))
+    expect(refused.ok).toBe(false)
+    if (refused.ok) throw new Error('expected a refusal')
+    expect(refused.code).toBe('steer_inbox_full')
+    expect(countPendingSteers(SESSION, MESSAGE)).toBe(MAX_PENDING_STEERS)
+  })
+
+  /**
+   * The order the user typed in, not the order the transport happened to leave things in.
+   * Two queued messages and one steer that never found a boundary become ONE next message,
+   * and the user has to be able to read it back as the conversation they had.
+   */
+  it('is promoted with everything else still pending, in acceptance order', () => {
+    enqueueSteer(SESSION, queued('q1', { at: '2026-09-13T10:00:00.000Z' }))
+    enqueueSteer(SESSION, queued('q2', { at: '2026-09-13T10:00:01.000Z' }))
+    enqueueSteer(SESSION, entry('late_steer', { at: '2026-09-13T10:00:02.000Z' }))
+
+    const promotable = takeUndeliveredSteers(SESSION, MESSAGE, { source: 'user' })
+    expect(promotable.map((row) => row.steerId)).toEqual(['q1', 'q2', 'late_steer'])
+    expect(listPendingSteers(SESSION)).toEqual([])
+  })
+
+  it('is promoted after an in-flight steer that was accepted first', () => {
+    enqueueSteer(SESSION, entry('now1', { at: '2026-09-13T10:00:00.000Z' }))
+    takePendingSteersForTransport(SESSION, MESSAGE)
+    enqueueSteer(SESSION, queued('q1', { at: '2026-09-13T10:00:01.000Z' }))
+
+    expect(
+      takeUndeliveredSteers(SESSION, MESSAGE, { source: 'user' }).map((row) => row.steerId)
+    ).toEqual(['now1', 'q1'])
+  })
+
+  /**
+   * Stop means stop, for a queued message exactly as for a steer. There is no server code
+   * that drops one: the promotion loop breaks on an interrupted turn and the request's
+   * `finally` clears the inbox, which is the same drop a steer gets — pinned here so a
+   * later change to the clear cannot start sparing them.
+   */
+  it('is dropped by the clear that a stopped turn runs (DL-119-05)', () => {
+    enqueueSteer(SESSION, queued('q1'))
+    enqueueSteer(SESSION, entry('now1'))
+
+    clearSteerInbox(SESSION)
+    expect(listPendingSteers(SESSION)).toEqual([])
+    expect(listInFlightSteers(SESSION)).toEqual([])
+  })
+
+  it('is kept by a scoped clear when the live turn is still its own', () => {
+    enqueueSteer(SESSION, queued('q1'))
+    enqueueSteer(SESSION, queued('other_turn', { messageId: 'msg_assistant_2' }))
+
+    clearSteerInbox(SESSION, { keepMessageId: MESSAGE })
+    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
+  })
+
+  it('never reaches a different turn, including the promoted follow-up', () => {
+    enqueueSteer(SESSION, queued('q1'))
+    expect(takePendingSteersForDelivery(SESSION, 'msg_assistant_2', { step: 1, lane: 'api' })).toEqual([])
+    expect(takePendingSteersForTransport(SESSION, 'msg_assistant_2')).toEqual([])
+    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['q1'])
+  })
+})

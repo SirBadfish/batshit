@@ -54,34 +54,57 @@ describe('global_chat_settings', () => {
     updateSpy.mockRestore()
   })
 
-  it('stores the busy-send mode and reads it back', async () => {
+  it('stores the busy-send mode and reads it back (DL-119-01)', async () => {
+    const response = await post({ global_chat_settings: { busy_send_mode: 'queue' } })
+    expect(response.status).toBe(200)
+
+    const payload = await response.json()
+    expect(payload.settings.global_chat_settings).toEqual({ busy_send_mode: 'queue' })
+
+    const stored = await redis.getUserSettings(USER)
+    expect((stored as any)?.global_chat_settings).toEqual({ busy_send_mode: 'queue' })
+  })
+
+  it('carries a stored mode forward when an unrelated save comes through', async () => {
+    await post({ global_chat_settings: { busy_send_mode: 'queue' } })
+    await post({ upload_provider: 'local' })
+
+    const stored = await redis.getUserSettings(USER)
+    expect((stored as any)?.global_chat_settings).toEqual({ busy_send_mode: 'queue' })
+    if (updateSpy.mock.calls.length > 0) {
+      expect(lastUpdateArgument().global_chat_settings).toEqual({ busy_send_mode: 'queue' })
+    }
+  })
+
+  /**
+   * SA-119 (DL-119-01) — the migration, through the door that actually writes.
+   *
+   * "Interrupt and send" is retired. A record written before this story still says
+   * `interrupt`; the route must read it as the default rather than storing a third value
+   * that no rule in the app knows how to answer for.
+   */
+  it('normalises a stored `interrupt` to steer on the next save (DL-119-01)', async () => {
     const response = await post({ global_chat_settings: { busy_send_mode: 'interrupt' } })
     expect(response.status).toBe(200)
 
     const payload = await response.json()
-    expect(payload.settings.global_chat_settings).toEqual({ busy_send_mode: 'interrupt' })
+    expect(payload.settings.global_chat_settings).toEqual({ busy_send_mode: 'steer' })
 
     const stored = await redis.getUserSettings(USER)
-    expect((stored as any)?.global_chat_settings).toEqual({ busy_send_mode: 'interrupt' })
-  })
-
-  it('carries a stored mode forward when an unrelated save comes through', async () => {
-    await post({ global_chat_settings: { busy_send_mode: 'interrupt' } })
-    await post({ upload_provider: 'local' })
-
-    const stored = await redis.getUserSettings(USER)
-    expect((stored as any)?.global_chat_settings).toEqual({ busy_send_mode: 'interrupt' })
+    expect((stored as any)?.global_chat_settings).toEqual({ busy_send_mode: 'steer' })
     if (updateSpy.mock.calls.length > 0) {
-      expect(lastUpdateArgument().global_chat_settings).toEqual({ busy_send_mode: 'interrupt' })
+      expect(lastUpdateArgument().global_chat_settings).toEqual({ busy_send_mode: 'steer' })
     }
   })
 
   it('refuses to store anything but the two modes', async () => {
-    const response = await post({ global_chat_settings: { busy_send_mode: 'queue' } })
-    const payload = await response.json()
-    expect(payload.settings.global_chat_settings).toEqual({ busy_send_mode: 'steer' })
-    if (updateSpy.mock.calls.length > 0) {
-      expect(lastUpdateArgument().global_chat_settings).toEqual({ busy_send_mode: 'steer' })
+    for (const busy_send_mode of ['wait', 'Steer', '', 7, null]) {
+      const response = await post({ global_chat_settings: { busy_send_mode } })
+      const payload = await response.json()
+      expect(payload.settings.global_chat_settings).toEqual({ busy_send_mode: 'steer' })
+      if (updateSpy.mock.calls.length > 0) {
+        expect(lastUpdateArgument().global_chat_settings).toEqual({ busy_send_mode: 'steer' })
+      }
     }
   })
 })

@@ -455,3 +455,149 @@ describe('POST /api/messages/steer', () => {
     expect(payload.reason).toContain('Wait for the reply')
   })
 })
+
+/**
+ * SA-119 P1 (DL-119-05) — the `deliver` field.
+ *
+ * Queue is not a second route. It is the same door with one word on it: `deliver: 'end'`
+ * means "hold this and send it when the reply is over" — the promotion SA-114 already
+ * built, asked for on purpose rather than arrived at by accident. Everything else about the
+ * request is unchanged, which is why the refusals, the cap and the events below are the
+ * ones the steer path already proved.
+ */
+describe('POST /api/messages/steer — deliver (DL-119-05)', () => {
+  it('defaults to now, so an existing client keeps steering', async () => {
+    await seed()
+    activeTurn()
+
+    expect((await call(goodBody())).status).toBe(202)
+    expect(listPendingSteers(SESSION).map((row) => [row.steerId, row.deliver])).toEqual([
+      ['steer_abc123', 'now']
+    ])
+  })
+
+  it('stores an explicit now', async () => {
+    await seed()
+    activeTurn()
+
+    expect((await call(goodBody({ deliver: 'now' }))).status).toBe(202)
+    expect(listPendingSteers(SESSION)[0].deliver).toBe('now')
+  })
+
+  it('stores a queued message as deliver: end', async () => {
+    await seed()
+    activeTurn()
+
+    const response = await call(goodBody({ deliver: 'end' }))
+    expect(response.status).toBe(202)
+    expect(listPendingSteers(SESSION).map((row) => [row.steerId, row.text, row.deliver])).toEqual([
+      ['steer_abc123', 'also check the tests', 'end']
+    ])
+  })
+
+  it('refuses anything that is not one of the two words', async () => {
+    await seed()
+    activeTurn()
+
+    for (const deliver of ['END', 'later', 'queue', '', 7, null, {}]) {
+      const response = await call(goodBody({ deliver }))
+      expect(response.status).toBe(400)
+      expect((await response.json()).code).toBe('invalid_input')
+    }
+    // Nothing was accepted, so nothing is waiting under a timing nobody chose.
+    expect(listPendingSteers(SESSION)).toEqual([])
+  })
+
+  it('tells every tab how the message will be delivered', async () => {
+    await seed()
+    activeTurn()
+
+    await call(goodBody({ deliver: 'end' }))
+    expect(sseBodies).toHaveLength(1)
+    expect(sseBodies[0]).toMatchObject({
+      type: 'steer_queued',
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      steerId: 'steer_abc123',
+      deliver: 'end'
+    })
+  })
+
+  it('says `now` on the event for an ordinary steer, so the bubble never has to guess', async () => {
+    await seed()
+    activeTurn()
+
+    await call(goodBody())
+    expect(sseBodies[0]).toMatchObject({ type: 'steer_queued', deliver: 'now' })
+  })
+
+  /**
+   * The load-bearing one. A queued message must never be pushed onto a managed CLI's wire:
+   * the CLI would hold it until its own next tool boundary and hand it to the model inside
+   * the reply the user asked it to WAIT for.
+   */
+  it('never pushes a queued message to a managed CLI transport (DL-119-05)', async () => {
+    await seed({ agentType: 'cli' })
+    activeTurn(MESSAGE, { lane: 'codex' })
+    const sent: any[] = []
+    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
+      sent.push(payload)
+      return true
+    })
+
+    expect((await call(goodBody({ deliver: 'end' }))).status).toBe(202)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect(sent).toEqual([])
+    expect(listInFlightSteers(SESSION)).toEqual([])
+    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['steer_abc123'])
+  })
+
+  it('still pushes an ordinary steer accepted beside a queued one', async () => {
+    await seed({ agentType: 'cli' })
+    activeTurn(MESSAGE, { lane: 'codex' })
+    const sent: any[] = []
+    attachSteerTransport(SESSION, MESSAGE, 'codex', async (payload) => {
+      sent.push(payload)
+      return true
+    })
+
+    await call(goodBody({ steerId: 'steer_queued_one', deliver: 'end' }))
+    await call(goodBody({ steerId: 'steer_now_one', text: 'use the other file' }))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    expect(sent).toHaveLength(1)
+    expect(sent[0].steerIds).toEqual(['steer_now_one'])
+    expect(listPendingSteers(SESSION).map((row) => row.steerId)).toEqual(['steer_queued_one'])
+  })
+
+  it('counts a queued message against the cap', async () => {
+    await seed()
+    activeTurn()
+    for (let i = 0; i < MAX_PENDING_STEERS; i += 1) {
+      expect((await call(goodBody({ steerId: `steer_${i}`, deliver: 'end' }))).status).toBe(202)
+    }
+
+    const response = await call(goodBody({ steerId: 'steer_overflow' }))
+    expect(response.status).toBe(409)
+    expect((await response.json()).code).toBe('steer_inbox_full')
+  })
+
+  it('refuses a queued message for a reply that already finished', async () => {
+    await seed()
+    const response = await call(goodBody({ deliver: 'end' }))
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ refusal: 'reply_finished' })
+  })
+
+  it('refuses a queued message on a lane that cannot be steered', async () => {
+    // Queue rides the steer inbox, so a turn with no inbox to ride cannot hold one. The
+    // client falls back to its own wait branch (DL-119-06) for exactly this case.
+    await seed()
+    activeTurn(MESSAGE, { steerable: false, reason: 'This agent cannot be steered mid-reply.' })
+
+    const response = await call(goodBody({ deliver: 'end' }))
+    expect(response.status).toBe(409)
+    expect((await response.json()).code).toBe('not_steerable')
+  })
+})

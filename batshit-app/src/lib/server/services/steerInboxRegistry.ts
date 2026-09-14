@@ -32,6 +32,23 @@ import {
   type SteerSendPayload
 } from '$lib/utils/steerControl'
 
+/**
+ * SA-119 P1 (DL-119-05) — is this entry Queue rather than Steer?
+ *
+ * ONE predicate, read by both take-for-delivery functions, because the API lane's hook and
+ * the two CLI lanes' flush are the only two doors to a tool boundary and they must not come
+ * to disagree about what "held" means. A held entry injected at a boundary is the user's
+ * NEXT message arriving inside the answer it was meant to follow — on whichever lane nobody
+ * re-checked.
+ *
+ * Deliberately NOT applied by `takeUndeliveredSteers`: the end of the turn is exactly where
+ * a held entry is supposed to be taken, beside every steer that never found a boundary, in
+ * acceptance order.
+ */
+function isHeldForEndOfTurn(entry: SteerEntry): boolean {
+  return entry.deliver === 'end'
+}
+
 interface SteerInboxState {
   /** Accepted, not yet handed to any transport. */
   pending: SteerEntry[]
@@ -131,7 +148,9 @@ export type SteerEnqueueResult =
  * The cap counts steers still WAITING, not steers this turn has seen: one that has already
  * reached the model has freed its slot, and a long tool-heavy reply should not lock the
  * user out after five successful steers. A sixth waiting steer is refused with a reason
- * rather than queued behind the others.
+ * rather than queued behind the others. SA-119 (DL-119-05): a `deliver: 'end'` entry counts
+ * like any other — it is one of the messages waiting for this reply, and it never frees its
+ * slot by reaching the model, which is exactly why it must not be exempt.
  *
  * P4 (DL-114-13) adds the second rule, for DM-sourced entries only: **one pending DM steer
  * per recipient turn.** Several agents' notes landing inside one reply would read to the
@@ -215,6 +234,9 @@ export function listInFlightSteers(sessionId: string): SteerEntry[] {
  * Entries are filtered by `messageId` so a leftover from an earlier turn can never be
  * delivered into a later one, including the promoted follow-up turn (DL-114-07), which
  * always carries a new assistant id.
+ *
+ * SA-119 (DL-119-05): a `deliver: 'end'` entry is skipped and left pending. Queue means the
+ * end of the reply, so a boundary is precisely where it must NOT go.
  */
 export function takePendingSteersForDelivery(
   sessionId: string,
@@ -225,10 +247,15 @@ export function takePendingSteersForDelivery(
   const state = getState(sessionId)
   if (!state || state.pending.length === 0) return []
 
-  const taken = state.pending.filter((entry) => entry.messageId === messageId)
+  // DL-119-05: a queued message is skipped here and stays pending for the promotion. The
+  // filter is on the ENTRY, not on the message id, so the entries left behind keep their
+  // place in the list and their acceptance order.
+  const mine = (entry: SteerEntry) =>
+    entry.messageId === messageId && !isHeldForEndOfTurn(entry)
+  const taken = state.pending.filter(mine)
   if (taken.length === 0) return []
 
-  state.pending = state.pending.filter((entry) => entry.messageId !== messageId)
+  state.pending = state.pending.filter((entry) => !mine(entry))
   const delivered = taken.map((entry) => ({
     ...entry,
     step: options.step,
@@ -292,6 +319,10 @@ export function drainDeliveredSteers(
  * turn inside the same process, which is why the bridge kills the child rather than letting
  * it run. "Written" is not "read", so it is promoted like any other undelivered steer.
  *
+ * SA-119 (DL-119-05): queued entries are taken HERE and nowhere else. That is the whole of
+ * Queue's server half — the transports skip them, this takes them with everything else still
+ * waiting, and `promoteSteersToNextTurn` joins the lot into ONE next user message.
+ *
  * P4 (DL-114-13): `source` narrows what is taken, and the promotion loop passes `'user'`.
  * A DM steer is never promoted — an agent's text must not start a user turn — so leaving it
  * here is what lets the end of the request read it and degrade it to `wait`. Taking it and
@@ -329,6 +360,9 @@ export function takeUndeliveredSteers(
  * succession, and two flushes reading the same `pending` list would send the same words to
  * the model twice. `returnSteersToPending` puts them back when the write is refused, which
  * is what makes a `-32600` refusal or a dead pipe end in promotion rather than in silence.
+ *
+ * SA-119 (DL-119-05): `deliver: 'end'` entries are skipped, exactly as the API lane's take
+ * skips them. A turn whose only waiting entry is queued therefore flushes `nothing_pending`.
  */
 export function takePendingSteersForTransport(
   sessionId: string,
@@ -338,10 +372,15 @@ export function takePendingSteersForTransport(
   const state = getState(sessionId)
   if (!state || state.pending.length === 0) return []
 
-  const taken = state.pending.filter((entry) => entry.messageId === messageId)
+  // DL-119-05: same skip as the API lane's take, from the same predicate. A queued message
+  // written to a managed CLI's wire would be held by the CLI until its own next tool
+  // boundary and handed to the model inside the reply the user asked it to wait for.
+  const mine = (entry: SteerEntry) =>
+    entry.messageId === messageId && !isHeldForEndOfTurn(entry)
+  const taken = state.pending.filter(mine)
   if (taken.length === 0) return []
 
-  state.pending = state.pending.filter((entry) => entry.messageId !== messageId)
+  state.pending = state.pending.filter((entry) => !mine(entry))
   state.inFlight = [...state.inFlight, ...taken]
   state.updatedAt = now
   inboxes.set(sessionId, state)

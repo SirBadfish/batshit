@@ -37,24 +37,32 @@ export const STEER_DM_ALREADY_PENDING_REASON =
   'Another agent DM is already waiting to land in that reply.'
 
 /**
- * DL-114-01 — what a send does while the agent is still replying.
+ * DL-119-01 — what a send does while the agent is still replying.
  *
  * `steer` is the default: the words wait for the agent's next tool call and land inside the
- * same reply. `interrupt` is what Batshit did before this story: the reply stops and the
- * message starts a new turn. There is no third mode — "queue" is what a steer BECOMES when
- * no tool boundary arrives, so naming it would put three buttons on one behaviour.
+ * same reply. `queue` is the other one: the words are held and sent the moment the reply
+ * ends. SA-114 called the second mode `interrupt` — stop the reply, start a new turn — and
+ * SA-119 retires it, because Stop followed by Enter is that job and a hidden third state on
+ * the send button was how "Send after reply" came to live behind a hover nobody used.
+ *
+ * Queue is not a new mechanism. It is the promotion SA-114 already built (DL-119-05, a
+ * server-held steer) for a text-only message, and the browser wait DL-114-10 already had
+ * (DL-119-06) for a message carrying files: one word for the user, two mechanisms
+ * underneath, each already tested.
+ *
+ * A record written before this story still says `interrupt`. `resolveBusySendMode` reads it
+ * as the default; nothing is written back until the user saves the panel themselves.
  */
-export type BusySendMode = 'steer' | 'interrupt'
+export type BusySendMode = 'steer' | 'queue'
 
 /**
  * DL-118-09 — what a send is ACTUALLY about to do, which is one word wider than the setting.
  *
- * `wait` is not a third setting and never appears in `BusySendMode`: it is what a steer
- * BECOMES when the composer carries files. DL-114-10 has always held those back until the
- * reply ends — the steer route cannot carry a clip or a `metadata.fileReferences` entry —
- * but the button went on saying **Steer** and promising the words would "land inside this
- * reply" (PR #106 review F-25). The behaviour is the accepted one; only the label was
- * lying.
+ * **Superseded by DL-119-02 and deleted in SA-119 P2.** `resolveBusySendActions` is the rule
+ * now; this type and the two functions below survive P1 only so `ChatInput.svelte` and
+ * `+page.svelte` keep compiling until P2 moves them onto the badges. `wait` is the legacy
+ * word for "queue, held in the browser because this send carries files" — the behaviour
+ * DL-119-06 keeps.
  */
 export type EffectiveBusySendMode = BusySendMode | 'wait'
 
@@ -67,7 +75,7 @@ export type EffectiveBusySendMode = BusySendMode | 'wait'
  */
 export const WAIT_SEND_SENTENCE = 'With files: waits for the reply to finish'
 
-/** Josh's call (2026-09-07): steer is the default, interrupt stays one click away. */
+/** Josh's call (2026-09-07, carried into DL-119-01): steer is the default; Queue is the other badge. */
 export const DEFAULT_BUSY_SEND_MODE: BusySendMode = 'steer'
 
 /** The new per-user settings block DL-114-01 adds. */
@@ -88,7 +96,12 @@ export interface GlobalChatSettings {
  */
 export function resolveBusySendMode(settings: unknown): BusySendMode {
   const raw = (settings as any)?.global_chat_settings?.busy_send_mode
-  return raw === 'interrupt' || raw === 'steer' ? raw : DEFAULT_BUSY_SEND_MODE
+  // DL-119-01: `interrupt` is a record this app can no longer honour — the mode it names
+  // was retired with the branch behind it — so it reads as the default rather than as a
+  // third value every caller would then have to have an answer for. It is a READ, not a
+  // migration: nothing is written until the user saves the panel themselves.
+  if (raw === 'steer' || raw === 'queue') return raw
+  return DEFAULT_BUSY_SEND_MODE
 }
 
 /**
@@ -97,45 +110,158 @@ export function resolveBusySendMode(settings: unknown): BusySendMode {
  * The sibling global blocks are passed through unvalidated, and this one is not, because a
  * mode is one of exactly two words: storing anything else would leave a record that reads
  * back as the default forever with no way to tell it from a real choice. Unknown keys are
- * dropped for the same reason.
+ * dropped for the same reason. DL-119-01: a stored `interrupt` lands here as `steer` on the
+ * next save, because `resolveBusySendMode` is what this delegates to.
  */
 export function normalizeGlobalChatSettings(value: unknown): GlobalChatSettings {
   return { busy_send_mode: resolveBusySendMode({ global_chat_settings: value }) }
 }
 
 /**
- * The mode Cmd/Ctrl+Enter sends with for ONE message (DL-114-01).
+ * The mode Cmd/Ctrl+Enter sends with for ONE message (DL-114-01, DL-119-02).
  *
- * The shortcut is "the other way", not "interrupt": with the setting on `interrupt`, the
- * one-off has to be able to steer, or the shortcut would be dead for anyone who flipped
- * the default.
+ * The shortcut is "the other way", not one named mode: with the setting on `queue`, the
+ * one-off has to be able to steer, or the shortcut would be dead for exactly the people who
+ * changed the default. `resolveBusySendActions` calls this for its `other`, so the badge
+ * pair and the keyboard cannot come to disagree about which one is the other one.
  */
 export function otherBusySendMode(mode: EffectiveBusySendMode): BusySendMode {
-  // DL-118-09: the other way out of a held send is to stop the reply — Cmd/Ctrl+Enter
-  // still interrupts. "The other way" cannot be `steer` here: this send carries files, and
-  // a steer that carries files is precisely what `wait` already is.
-  if (mode === 'wait') return 'interrupt'
-  return mode === 'steer' ? 'interrupt' : 'steer'
+  // The legacy `wait` is "queue, held in the browser because this send carries files"
+  // (DL-119-06), so the other way is to steer — which since DL-119-04 keeps the file in the
+  // composer instead of throwing it away, and is the reason Steer is offered here at all.
+  if (mode === 'wait') return 'steer'
+  return mode === 'steer' ? 'queue' : 'steer'
 }
 
-/** The send button's label while the agent is busy (DL-114-01, DL-118-09). */
+/** The send button's label while the agent is busy (DL-119-01; `wait` is DL-118-09's legacy word). */
 export function busySendModeLabel(mode: EffectiveBusySendMode): string {
   if (mode === 'wait') return 'Send after reply'
-  return mode === 'steer' ? 'Steer' : 'Interrupt and send'
+  return mode === 'steer' ? 'Steer' : 'Queue'
 }
 
 /**
- * What this send will ACTUALLY do (DL-114-01 + DL-114-09).
+ * The note beside a Steer badge that cannot be pressed, when the server sent no reason.
  *
- * The setting says what the user wants; the running reply says what is possible. This is
- * where the two meet, and it is one function because the send button's label and the branch
- * `handleSendMessage` takes must never disagree — a button that says "Steer" over a send
- * that interrupts is the exact failure this story exists to remove.
+ * Deliberately short and deliberately not one of the `NOT_STEERABLE_*` sentences below:
+ * those three end "Your message interrupts instead", which stopped being true when
+ * DL-119-07 retired interrupt-and-send. They are the server's own refusal text on a path
+ * P1 does not own; F-P1-2 records them for P2, which owns the words the user reads.
+ */
+const STEER_DISABLED_FALLBACK_NOTE = 'This reply can’t take a steer.'
+
+/** Why Steer is greyed out, in the user's words (DL-119-02). */
+const STEER_CLIPS_NOTE = 'Won’t include the file — it stays here.'
+const STEER_MENTIONS_NOTE = 'Mentions can’t steer.'
+
+/** What one of the two badges beside Stop can do right now (DL-119-02). */
+export interface BusySendBadgeState {
+  enabled: boolean
+  /** Shown as plain text beside a disabled badge, or as Steer's warning when it is on. */
+  note: string | null
+}
+
+/** Everything the busy composer needs to draw itself and answer both keys (DL-119-02). */
+export interface BusySendActions {
+  /** What plain Enter does. */
+  enter: BusySendMode
+  /** What Cmd/Ctrl+Enter does. */
+  other: BusySendMode
+  steer: BusySendBadgeState
+  queue: BusySendBadgeState
+}
+
+/**
+ * DL-119-02 — THE rule for the busy composer: one function, four inputs, every answer.
+ *
+ * SA-118's F-25 put a third send state behind a hover tooltip, and Josh's finding (2026-09-13)
+ * was that people press Enter and nobody hovers. So the choice is two visible badges, and
+ * this decides which one is filled, what each key does, whether Steer is clickable at all,
+ * and the sentence shown beside it when it is not. All of it in one place, because the
+ * moment the badge's label and the key's behaviour are computed separately is the moment a
+ * button starts promising something the keyboard does not do — the exact failure SA-114
+ * built `resolveEffectiveBusySendMode` to remove and this replaces it to keep removing.
+ *
+ * The order of the three things that can disable Steer is load-bearing:
+ *
+ * 1. **The server said this reply cannot be steered.** There is no inside to land in, so
+ *    nothing the composer holds can change the answer. This is the order `+page.svelte`
+ *    takes too, and the note is the server's own reason.
+ * 2. **An `@file` mention.** It travels as `metadata.fileReferences`, which the steer route
+ *    cannot carry (PR #106 review F-23), and unlike a clip it cannot "stay in the box" —
+ *    the path is inline in the text the user is sending. So it can only queue.
+ * 3. **A clip.** Steer stays available and sends the words now; DL-119-04 keeps the clip in
+ *    the composer rather than throwing it away, which is what the note says.
  *
  * `steerable` is the server's verdict for the reply in flight (`resolveSteerability`, read
- * off the run). `null` means "not told yet", and it is treated as steerable on purpose: the
- * alternative is labelling every fresh reply "Interrupt and send" for the fraction of a
- * second before its `start` event lands, and the route's 409 is already the backstop.
+ * off the run). `null` means "not told yet", and it counts as steerable on purpose: the
+ * alternative is greying out Steer for the fraction of a second before a reply's `start`
+ * event lands, and the route's 409 is already the backstop.
+ *
+ * **Enter queues whenever the box carries a file** (Josh's design), whatever the default —
+ * a clip is the case where "send it now" silently means "send it without the thing I
+ * attached", so the safe key is the one that keeps everything together.
+ *
+ * Queue is enabled always. That is DL-119-05 and DL-119-06 together: a text-only message is
+ * held by the server, anything else waits in the browser, and between them every message
+ * has a way to be sent. "Nothing you typed is lost" rests on that being unconditional.
+ */
+export function resolveBusySendActions(input: {
+  mode: BusySendMode
+  /** The server's verdict for the reply in flight. `null`/omitted means "not told yet". */
+  steerable?: boolean | null
+  /** The server's plain-English "why not", shown as Steer's note when it refused. */
+  steerReason?: string | null
+  /** Clips attached in the composer. They stay there when Steer sends (DL-119-04). */
+  hasClips: boolean
+  /** `@file` mentions in the text. They cannot steer at all (DL-119-02). */
+  hasMentions: boolean
+}): BusySendActions {
+  const refusedByServer = input.steerable === false
+  const steerEnabled = !refusedByServer && !input.hasMentions
+
+  const note = refusedByServer
+    ? (input.steerReason ?? '').trim() || STEER_DISABLED_FALLBACK_NOTE
+    : input.hasMentions
+      ? STEER_MENTIONS_NOTE
+      : input.hasClips
+        ? STEER_CLIPS_NOTE
+        : null
+
+  // With Steer unavailable both keys queue: offering "the other mode" would be offering a
+  // key that does nothing, which is what the tooltip on a group chat used to do.
+  if (!steerEnabled) {
+    return {
+      enter: 'queue',
+      other: 'queue',
+      steer: { enabled: false, note },
+      queue: { enabled: true, note: null }
+    }
+  }
+
+  // A file in the box makes Enter queue whatever the default is; the other key is then
+  // Steer, which is the only way to send the words now AND keep the file.
+  const enter: BusySendMode = input.hasClips ? 'queue' : input.mode
+  return {
+    enter,
+    other: otherBusySendMode(enter),
+    steer: { enabled: true, note },
+    queue: { enabled: true, note: null }
+  }
+}
+
+/**
+ * What this send will ACTUALLY do (DL-114-01 + DL-114-09) — **superseded by DL-119-02.**
+ *
+ * P1 keeps this as a thin derivation of `resolveBusySendActions` rather than deleting it,
+ * because its only two callers are `ChatInput.svelte` and `+page.svelte`, which P2 owns:
+ * deleting it here would mean rewriting the composer and the page inside the server packet.
+ * It is a DERIVATION and not a second rule — one answer, two spellings — so the shim cannot
+ * drift from the badges while both exist. **P2 deletes it with its callers.**
+ *
+ * Two things changed under it in P1. `interrupt` is gone (DL-119-07): a reply the server
+ * says cannot be steered now QUEUES rather than stopping the reply. And `wait` is now just
+ * the legacy word for "queue, held in the browser because this send carries files"
+ * (DL-119-06) — the same behaviour DL-114-10 has always had.
  */
 export function resolveEffectiveBusySendMode(input: {
   mode: BusySendMode
@@ -150,11 +276,21 @@ export function resolveEffectiveBusySendMode(input: {
    */
   carriesAttachments?: boolean
 }): EffectiveBusySendMode {
-  if (input.mode === 'interrupt') return 'interrupt'
-  // A reply the server says cannot be steered is an interrupt whatever the composer holds:
-  // there is no reply to wait inside of, and this is the order `+page.svelte` takes too.
-  if (input.steerable === false) return 'interrupt'
-  return input.carriesAttachments ? 'wait' : 'steer'
+  const carries = input.carriesAttachments === true
+  const actions = resolveBusySendActions({
+    mode: input.mode,
+    steerable: input.steerable,
+    // The shim's one input covers both, so it is read as the weaker of the two (a clip):
+    // the badge pair is where they are told apart, and that is P2's job.
+    hasClips: carries,
+    hasMentions: false
+  })
+  // The legacy spelling, and only where it was ever true: a queue this send will hold in
+  // the BROWSER because it carries files the steer route cannot take. A reply the SERVER
+  // refused keeps the old precedence — the refusal beat `wait` before SA-119 and still
+  // does, which is the order `+page.svelte` reads.
+  if (actions.enter === 'queue' && carries && actions.steer.enabled) return 'wait'
+  return actions.enter
 }
 
 /** Where a steer came from. A DM steer is labelled as not from the user (DL-114-13, P4). */
@@ -162,6 +298,30 @@ export type SteerSource = 'user' | 'dm'
 
 /** Which transport delivered a steer. Only `api` can deliver in P1. */
 export type SteerLane = 'api' | 'codex' | 'claude'
+
+/**
+ * DL-119-05 — WHEN a held message is meant to reach the model.
+ *
+ * `now` is a steer: hand it over at the running reply's next tool boundary. `end` is Queue:
+ * hold it, skip every boundary, and let the end of the turn promote it into the user's next
+ * message. One field rather than a second inbox, because everything else about the two is
+ * identical — the cap, the ownership of the text, the Stop drop, the promotion that joins
+ * several into one message, the bubble's lifetime.
+ *
+ * The DM door (`deliverBySteer`) never sets it: an agent DM always delivers now.
+ */
+export type SteerDeliver = 'now' | 'end'
+
+/**
+ * The ONE validator for `deliver`, shared by the route and its tests (DL-119-05).
+ *
+ * The route refuses an unknown value rather than coercing it to the default. A steer stored
+ * with a timing nobody chose either lands mid-reply when the user asked it to wait, or waits
+ * when they asked it to land — and both read as Batshit ignoring the badge they pressed.
+ */
+export function isSteerDeliver(value: unknown): value is SteerDeliver {
+  return value === 'now' || value === 'end'
+}
 
 export interface SteerEntry {
   steerId: string
@@ -171,6 +331,12 @@ export interface SteerEntry {
   /** ISO timestamp of acceptance, not delivery. */
   at: string
   source: SteerSource
+  /**
+   * DL-119-05 — `end` means Queue: never handed to a transport at a tool boundary, promoted
+   * with everything else when the reply ends. Absent means `now`, which is what every entry
+   * written before SA-119 and every DM steer is.
+   */
+  deliver?: SteerDeliver
   /** DM source only (DL-114-13). */
   dmId?: string
   /** DM source only: the sender's display name, frozen at send time. */
@@ -507,17 +673,23 @@ export function buildSteerSendPayload(steers: SteerEntry[]): SteerSendPayload {
  * PR #106 review F-4 — what the client does with a refused steer.
  * ------------------------------------------------------------------ */
 
-export type SteerRefusalKind = 'already_finished' | 'not_steerable' | 'refused'
+export type SteerRefusalKind = 'already_finished' | 'queue' | 'refused'
 
 /**
  * Only two refusals may escalate. `reply_finished` means there is nothing to steer into
  * any more, so the words go out as an ordinary message. `not_steerable` means this agent
- * cannot be steered at all, so the words interrupt — the design the send button already
- * promised. EVERYTHING else — the cap (`steer_inbox_full`), a waiting DM
- * (`steer_dm_pending`), a bad request, a lost server — is `refused`: the client shows the
- * reason and stops. The reply keeps running, and the steers it already accepted stay where
- * they are. Collapsing those into "interrupt instead" is how five accepted messages were
- * thrown away and the bubbles blamed the user for a Stop nobody pressed.
+ * cannot be steered at all — and since DL-119-07 that answer is **queue**, not interrupt:
+ * the words wait in the browser and go the moment the reply ends (DL-119-06), which is what
+ * the user asked for rather than the stop they did not. EVERYTHING else — the cap
+ * (`steer_inbox_full`), a waiting DM (`steer_dm_pending`), a bad request, a lost server — is
+ * `refused`: the client shows the reason and stops. The reply keeps running, and the steers
+ * it already accepted stay where they are. Collapsing those into "interrupt instead" is how
+ * five accepted messages were thrown away and the bubbles blamed the user for a Stop nobody
+ * pressed.
+ *
+ * The TAG wins over the sentence, always: `refusal: 'reply_finished'` is a contract and the
+ * reason beside it is for people, so a tagged refusal is "too late" whatever words came
+ * with it (F-P3-5).
  */
 export function classifySteerRefusal(
   status: number | null | undefined,
@@ -527,6 +699,6 @@ export function classifySteerRefusal(
   if (payload?.refusal === 'reply_finished' || reason.startsWith('That reply already finished')) {
     return 'already_finished'
   }
-  if (status === 409 && payload?.code === 'not_steerable') return 'not_steerable'
+  if (status === 409 && payload?.code === 'not_steerable') return 'queue'
   return 'refused'
 }
