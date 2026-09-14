@@ -22,7 +22,10 @@
     thinkingSubjects = {},
     planSubjects = {},
     voiceSettings,
-    composerClipCount = 0
+    composerClipCount = 0,
+    onResendDroppedSteer = null,
+    onDismissDroppedSteer = null,
+    canResendDroppedSteer = null
   } = $props<{ 
     messages: Message[],
     trimmedMessageIds?: string[],
@@ -36,6 +39,10 @@
     planSubjects?: Record<string, { content?: string; items?: any[] }>
     voiceSettings?: VoiceSettings
     composerClipCount?: number
+    /** SA-119 P3b (AMD-119-05) — the dropped bubble's Send now / Dismiss. */
+    onResendDroppedSteer?: ((steerId: string) => void) | null
+    onDismissDroppedSteer?: ((steerId: string) => void) | null
+    canResendDroppedSteer?: ((steerId: string) => boolean) | null
   }>()
   
   const BOTTOM_THRESHOLD_PX = 64
@@ -379,7 +386,12 @@
         />
       {/each}
       {#each pendingSteers as steer (steer.steerId)}
-        <SteerBubble {steer} />
+        <SteerBubble
+          {steer}
+          onSendNow={onResendDroppedSteer}
+          onDismiss={onDismissDroppedSteer}
+          canSendNow={canResendDroppedSteer ? canResendDroppedSteer(steer.steerId) : false}
+        />
       {/each}
       <div class="chat-bottom-sentinel" aria-hidden="true"></div>
     {/if}

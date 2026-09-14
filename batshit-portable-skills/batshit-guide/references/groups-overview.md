@@ -39,7 +39,7 @@ Agents in a Group can share tool results so the group stays on the same page. Sh
 
 Both come from the same fact: agents in a Group speak one at a time, and the room moves on to the next speaker.
 
-**Sending while the group is busy interrupts.** In a one-on-one chat you can [steer](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy) — your message lands inside the reply the agent is already writing. A Group can't do that, so the Send button reads **Interrupt and send** and its tooltip says why. The reply stops, what it already produced is kept, and your message starts the next turn.
+**Sending while the group is busy queues.** In a one-on-one chat you can [steer](../chat/overview.md#steer-or-queue-while-the-agent-is-busy) — your message lands inside the reply the agent is already writing. A Group can't do that, because agents there speak one at a time, so the **Steer** button is greyed out with the reason beside it and **Queue** is what you get: your message waits and goes the moment the reply ends. To stop a group reply instead, press **Stop**.
 
 **Risky actions can't be approved in a Group.** A [risky Fabric action](../fabric/overview.md#approving-a-risky-action) normally pauses and waits for your click on an **Approval required** card. In a Group, Batshit refuses it instead: *"Risky controls are not available in group chats. Ask the user in a direct chat with this agent."* A card raised here would be abandoned the moment the next agent starts speaking, and a half-answered approval is worse than a plain no. Open a direct chat with that agent, ask for the same thing, and approve it there.
 

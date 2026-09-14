@@ -18,7 +18,14 @@
  * entry to exist first.
  */
 
-import { WAIT_SEND_SENTENCE, type SteerLane, type SteerSource } from '$lib/utils/steerControl'
+import {
+  QUEUED_AFTER_REPLY_SENTENCE,
+  QUEUED_WITH_FILES_SENTENCE,
+  type SteerDeliver,
+  type SteerLane,
+  type SteerSource
+} from '$lib/utils/steerControl'
+import { BATSHIT_CLIP_REFERENCE_REGEX, isConcreteClipId } from '$lib/utils/zipReferenceSafety'
 
 /**
  * Where a steer is, from the browser's side.
@@ -26,8 +33,9 @@ import { WAIT_SEND_SENTENCE, type SteerLane, type SteerSource } from '$lib/utils
  * - `queued` — the server has it and the turn has not handed it to the model yet. On a
  *   managed CLI lane this is the NORMAL state for several seconds (Codex reads a steer at
  *   its next model call, Claude at its next tool boundary), so it is not a failure.
- * - `waiting` — not sent at all yet: the send carried files, which are never steered
- *   (DL-114-10), so the browser is holding it until the reply finishes.
+ * - `waiting` — not sent at all yet: the BROWSER is holding it until the reply finishes,
+ *   because it carries files (DL-114-10) or because this turn cannot take a steer at all
+ *   (DL-119-06). Since SA-119 this is one half of **Queue**, not a third thing.
  * - `delivered` — the model read it mid-reply. It now belongs inside the assistant record.
  * - `promoted` — the reply ended before it could land, so the server sent it as the user's
  *   next message (DL-114-07).
@@ -39,9 +47,12 @@ export type SteerBubbleState = 'queued' | 'waiting' | 'delivered' | 'promoted' |
 /**
  * Why a steer was dropped (F-P3-4). `stopped` is the user's own Stop; `unanswered` is the
  * backstop — the chat went quiet with the steer still waiting, so the server never wrote
- * the promotion. Only the first may say "you stopped the reply".
+ * the promotion. Only the first may say "you stopped the reply". `timed_out` (SA-119
+ * review F-P3b-4) is the browser-held wait giving up on a reply that is STILL running: the
+ * composer was cleared when the message was queued, so the receipt is the only place the
+ * words are, and it must not disappear with them.
  */
-export type SteerDropReason = 'stopped' | 'unanswered'
+export type SteerDropReason = 'stopped' | 'unanswered' | 'timed_out'
 
 export interface SteerBubbleEntry {
   steerId: string
@@ -55,6 +66,22 @@ export interface SteerBubbleEntry {
   label?: string
   lane?: SteerLane | null
   dropReason?: SteerDropReason
+  /**
+   * SA-119 (DL-119-05) — which queue this is in.
+   *
+   * `now` is a steer: it lands inside this reply at the agent's next tool boundary. `end`
+   * is a message the SERVER is holding until the reply finishes. They travel the same
+   * route and look identical on the wire, so without this the bubble cannot tell the user
+   * which promise was made. Absent means `now`, which is every event written before SA-119.
+   */
+  deliver?: SteerDeliver
+  /**
+   * SA-119 (DL-119-06) — a `waiting` entry that carries files, so the bubble can say so.
+   *
+   * The browser also holds a TEXT-only message whenever the turn cannot take a steer, and
+   * that user never attached anything (F-P2-2).
+   */
+  withFiles?: boolean
   updatedAt: number
 }
 
@@ -86,6 +113,44 @@ function normalize(value?: string | null) {
   return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
+/**
+ * SA-119 P2 (F-P2-6) — what the user TYPED, not what went on the wire.
+ *
+ * The composer appends `{{batshit-clip:id:::name}}` to the text of a send that carries a
+ * Clip, and this bubble drew that text raw — so a queued message with a file showed a line
+ * of machinery under the user's own sentence (Josh, reviewing P2's live screenshots). Every
+ * real message either strips that syntax or renders it as a chip; a bubble is deliberately
+ * NOT a message, so nothing was doing it here.
+ *
+ * It is done ONCE, on the way in, because both readers of `text` are displays — this
+ * bubble and the mid-reply inset in `MessageContent` — and the words that actually travel
+ * are a separate value the page posts itself. A steer never carries a clip at all
+ * (DL-119-04 strips them from that send), so this only ever touches a browser-held queue.
+ *
+ * A placeholder whose id is not a concrete clip id is LEFT ALONE. Anything Batshit wrote is
+ * recognisable; something else in that shape is worth the user seeing rather than quietly
+ * deleting. And when the clip WAS the whole message, the filename is better than an empty
+ * bubble under a paperclip, so it becomes the text.
+ */
+function readableSteerText(raw: string): string {
+  if (!raw.includes('{{batshit-clip')) return raw
+  const names: string[] = []
+  const withoutClips = raw.replace(
+    new RegExp(BATSHIT_CLIP_REFERENCE_REGEX.source, 'g'),
+    (match: string, clipId: string, name?: string) => {
+      if (!isConcreteClipId(clipId)) return match
+      const label = typeof name === 'string' ? name.trim() : ''
+      if (label) names.push(label)
+      return ''
+    }
+  )
+  const tidied = withoutClips
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return tidied || names.join(', ')
+}
+
 function write(entry: SteerBubbleEntry) {
   steerBySteerId = { ...steerBySteerId, [entry.steerId]: { ...entry, updatedAt: Date.now() } }
 }
@@ -111,7 +176,7 @@ function upsert(
     steerId: id,
     sessionId: patch.sessionId,
     messageId: patch.messageId,
-    text: normalize(patch.text) ?? existing?.text ?? '',
+    text: readableSteerText(normalize(patch.text) ?? existing?.text ?? ''),
     state: patch.state ?? existing?.state ?? 'queued',
     source: patch.source ?? existing?.source ?? 'user',
     label: normalize(patch.label) ?? existing?.label,
@@ -120,6 +185,10 @@ function upsert(
     // the entry without it left `state: 'dropped'` with no reason, and the label's fallback
     // accuses the user of a Stop they never pressed (AMD-114-08).
     dropReason: patch.dropReason ?? existing?.dropReason,
+    // Same merge rule as `text`, for the same reason: `steer_delivered` carries neither,
+    // and arriving first must not turn a held message back into a steer.
+    deliver: patch.deliver ?? existing?.deliver,
+    withFiles: patch.withFiles ?? existing?.withFiles,
     updatedAt: Date.now()
   })
 }
@@ -131,13 +200,17 @@ export function noteLocalSteer(params: {
   messageId: string
   text: string
   state?: SteerBubbleState
+  deliver?: SteerDeliver
+  withFiles?: boolean
 }) {
   upsert(params.steerId, {
     sessionId: params.sessionId,
     messageId: params.messageId,
     text: params.text,
     state: params.state ?? 'queued',
-    source: 'user'
+    source: 'user',
+    deliver: params.deliver,
+    withFiles: params.withFiles
   })
 }
 
@@ -147,13 +220,16 @@ export function applySteerQueued(event: {
   messageId: string
   steerId: string
   text?: string
+  /** DL-119-05: the route has carried this since P1, so a tab that did not send still knows. */
+  deliver?: SteerDeliver
 }) {
   if (!normalize(event.sessionId) || !normalize(event.messageId)) return
   upsert(event.steerId, {
     sessionId: event.sessionId,
     messageId: event.messageId,
     text: event.text ?? '',
-    source: 'user'
+    source: 'user',
+    deliver: event.deliver
   })
 }
 
@@ -204,14 +280,26 @@ export function markSteerDropped(steerId: string, reason: SteerDropReason = 'sto
 export function steerBubbleStatusLabel(entry: SteerBubbleEntry): string {
   switch (entry.state) {
     case 'waiting':
-      // DL-118-09: the send button's tooltip says this too, from the same constant.
-      return WAIT_SEND_SENTENCE
+      // DL-119-06: the browser is holding it. Both sentences promise the same moment; only
+      // one of them is allowed to mention files, and only when there are some.
+      return entry.withFiles ? QUEUED_WITH_FILES_SENTENCE : QUEUED_AFTER_REPLY_SENTENCE
     case 'dropped':
-      return entry.dropReason === 'unanswered'
-        ? 'Not sent — the reply ended before it could land. Send it again.'
-        : 'Not sent — you stopped the reply'
+      if (entry.dropReason === 'unanswered') {
+        return 'Not sent — the reply ended before it could land. Send it again.'
+      }
+      if (entry.dropReason === 'timed_out') {
+        // F-P3b-4: the reply was still running when the browser stopped waiting. No number
+        // in the sentence, so it cannot drift from `CLIENT_QUEUE_MAX_WAIT_MS`.
+        return 'Not sent — the reply ran too long to wait for. Send it again when it ends.'
+      }
+      return 'Not sent — you stopped the reply'
     default:
-      return 'Queued for the agent’s next step'
+      // DL-119-05: `queued` is TWO promises. A steer lands inside this reply; a held
+      // message never will, and saying "the agent's next step" about it would be the same
+      // hidden third state the badges exist to remove.
+      return entry.deliver === 'end'
+        ? QUEUED_AFTER_REPLY_SENTENCE
+        : 'Queued for the agent’s next step'
   }
 }
 
@@ -264,6 +352,26 @@ export function forgetSteer(steerId: string) {
   if (!id || !steerBySteerId[id]) return
   const next = { ...steerBySteerId }
   delete next[id]
+  steerBySteerId = next
+}
+
+/**
+ * SA-119 P3b review (F-P3b-3) — one receipt, acted on by its own button.
+ *
+ * **Send now** and **Dismiss** retire ONE `dropped` bubble. It has to be remembered the way
+ * `clearDroppedSteersForSession` remembers a whole chat's receipts, because a `forgetSteer`
+ * alone leaves the id free for the session replay to rebuild on the next resubscribe — as
+ * a `queued` promise about a reply that is over (AMD-118-08). Only a `dropped` bubble is
+ * touched: a bubble that moved on between the draw and the click is not this button's.
+ */
+export function clearDroppedSteer(steerId: string) {
+  const id = normalize(steerId)
+  if (!id) return
+  const existing = steerBySteerId[id]
+  if (!existing || existing.state !== 'dropped') return
+  const next = { ...steerBySteerId }
+  delete next[id]
+  clearedSteerIds.add(id)
   steerBySteerId = next
 }
 

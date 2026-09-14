@@ -18,12 +18,17 @@ const USER = 'user-promote'
 const SESSION = 'session-promote'
 const AGENT = 'agent-api'
 
-const steer = (steerId: string, text: string): SteerEntry => ({
+const steer = (
+  steerId: string,
+  text: string,
+  overrides: Partial<SteerEntry> = {}
+): SteerEntry => ({
   steerId,
   messageId: 'msg_assistant_1',
   text,
   at: '2026-09-10T12:00:00.000Z',
-  source: 'user'
+  source: 'user',
+  ...overrides
 })
 
 let sseBodies: any[] = []
@@ -60,7 +65,15 @@ const promote = (steers: SteerEntry[]) =>
 
 beforeEach(async () => {
   sseBodies = []
-  eventFetch.mockClear()
+  // Reset the IMPLEMENTATION, not only the call list: the "channel is down" case below
+  // sets a rejecting one with `mockRejectedValue`, which is not a spy and so survives
+  // `restoreAllMocks` — every suite added after it then ran with a dead SSE channel and
+  // saw no events at all.
+  eventFetch.mockReset()
+  eventFetch.mockImplementation(async (_url: any, init: any) => {
+    sseBodies.push(JSON.parse(init.body))
+    return new Response(JSON.stringify({ success: true }), { status: 200 })
+  })
   await seed()
 })
 
@@ -140,5 +153,53 @@ describe('promoting an undelivered steer (DL-114-07)', () => {
     expect(result).not.toBeNull()
     expect((await redis.get(`message:${SESSION}:steer_one`)) as any).toBeTruthy()
     expect(warns).toHaveBeenCalled()
+  })
+})
+
+/**
+ * SA-119 P1 (DL-119-05) — Queue promotes through this exact path.
+ *
+ * A queued message is a steer the transports were told to skip, so when the reply ends it
+ * is simply one of the entries still waiting. That is the whole mechanism: no second
+ * writer, no second message shape, and one next user message however many were queued.
+ */
+describe('promoting queued messages (DL-119-05)', () => {
+  it('joins two queued messages and a late steer into ONE next message, in acceptance order', async () => {
+    const result = await promote([
+      steer('steer_q1', 'also run the tests', { deliver: 'end', at: '2026-09-13T10:00:00.000Z' }),
+      steer('steer_q2', 'and push it', { deliver: 'end', at: '2026-09-13T10:00:01.000Z' }),
+      steer('steer_late', 'one more thing', { at: '2026-09-13T10:00:02.000Z' })
+    ])
+
+    expect(result!.content).toBe('also run the tests\n\nand push it\n\none more thing')
+
+    const saved = (await redis.get(`message:${SESSION}:steer_q1`)) as any
+    expect(saved.content).toBe('also run the tests\n\nand push it\n\none more thing')
+    expect(saved.metadata.steerPromoted).toEqual({
+      steerIds: ['steer_q1', 'steer_q2', 'steer_late']
+    })
+
+    // ONE message, under the first id the client already drew a bubble for.
+    expect(await redis.get(`message:${SESSION}:steer_q2`)).toBeNull()
+    expect(await redis.get(`message:${SESSION}:steer_late`)).toBeNull()
+  })
+
+  it('settles every queued bubble on the one promoted event', async () => {
+    await promote([
+      steer('steer_q1', 'first', { deliver: 'end' }),
+      steer('steer_q2', 'second', { deliver: 'end' })
+    ])
+
+    expect(sseBodies.map((body) => body.type)).toEqual(['user_message', 'steer_promoted'])
+    expect(sseBodies[1]).toMatchObject({ steerIds: ['steer_q1', 'steer_q2'] })
+  })
+
+  it('writes a plain user message: the timing was a delivery choice, not part of the words', async () => {
+    await promote([steer('steer_q1', 'run it when you are done', { deliver: 'end' })])
+
+    const saved = (await redis.get(`message:${SESSION}:steer_q1`)) as any
+    expect(saved.content).toBe('run it when you are done')
+    expect(saved.metadata.deliver).toBeUndefined()
+    expect(saved.metadata.wake).toBeUndefined()
   })
 })

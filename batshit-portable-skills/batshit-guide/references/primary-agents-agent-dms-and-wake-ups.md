@@ -55,7 +55,7 @@ When an assignment sent with `wake` is closed, its result can wake the *sender* 
 
 ### Steering a busy agent
 
-It's the same thing you do when you type while an agent is mid-reply (see [Steer or interrupt](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy)) — one agent doing it to another. It's for the correction that's only worth anything *now*: the recipient is already working on the thing, and waiting for the next turn means it finishes the wrong work first.
+It's the same thing you do when you type while an agent is mid-reply (see [Steer or Queue](../chat/overview.md#steer-or-queue-while-the-agent-is-busy)) — one agent doing it to another. It's for the correction that's only worth anything *now*: the recipient is already working on the thing, and waiting for the next turn means it finishes the wrong work first.
 
 - It costs nothing extra. No new chat is opened, no wake budget is spent, and the running reply is not stopped.
 - The agent reading it is told plainly that the words came **from another agent, not from you**, both when it arrives and in the chat's own history afterwards. An agent's message can never be mistaken for yours, and it can never approve anything on your behalf.

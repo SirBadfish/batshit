@@ -150,10 +150,20 @@
   import { setUserSettings, getUserSettings } from '$lib/stores/userSettings.svelte'
   import {
     classifySteerRefusal,
+    isSteerDeliver,
+    replayableSendMetadata,
+    resolveBusySendActions,
     resolveBusySendMode,
-    resolveEffectiveBusySendMode,
+    resolveQueuedSendAfterWait,
+    resolveStopInterruptionStamp,
+    QUEUE_ONE_AT_A_TIME_SENTENCE,
+    QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE,
+    STEER_REFUSED_GROUP_SENTENCE,
+    STEER_REFUSED_UNKNOWN_SENTENCE,
     type BusySendMode,
-    type EffectiveBusySendMode
+    type QueuedSendAfterWait,
+    type SteerDeliver,
+    type StopInterruptionRecord
   } from '$lib/utils/steerControl'
   import * as steerInbox from '$lib/stores/steerInbox.svelte'
   import { stripGatewayPrefix } from '$lib/utils/toolNameFormatter'
@@ -1070,6 +1080,34 @@ const immersiveActive = $derived.by(
     return new Promise<void>((resolve) => setTimeout(resolve, ms))
   }
 
+  /**
+   * SA-119 P2 (DL-119-06, F-P2-1) — wait until the reply is actually over.
+   *
+   * `waitForStreamCompletion` has an EIGHT-SECOND ceiling and resolves when it expires,
+   * which was survivable while a send that got past it fell into the interrupt branch and
+   * stopped the reply first. DL-119-07 deleted that branch, so the same expiry would now
+   * post an ordinary message into a live turn — and Queue's whole promise is "sends after
+   * this reply". So this waits on the message, and then keeps waiting while the chat is
+   * still busy, because a context-exhaustion auto-continue makes the NEXT assistant message
+   * part of the same run the user is waiting out.
+   *
+   * It is a ceiling and not a forever: a run that is still going after it returns `false`,
+   * and the caller keeps the user's words and says so rather than sending them anywhere.
+   */
+  const CLIENT_QUEUE_MAX_WAIT_MS = 15 * 60_000
+
+  async function waitForReplyToEnd(sessionId: string, messageId: string): Promise<boolean> {
+    const deadline = Date.now() + CLIENT_QUEUE_MAX_WAIT_MS
+    let target: string | null = messageId
+    while (target && Date.now() < deadline) {
+      await waitForStreamCompletion(target)
+      if (!chatRunRegistry.isSessionBusy(sessionId)) return true
+      const state = chatRunRegistry.getRunState(sessionId)
+      target = state.activeMessageId ?? state.activeStreamMessageIds[0] ?? null
+    }
+    return !chatRunRegistry.isSessionBusy(sessionId)
+  }
+
   async function parseJsonResponse(response: Response): Promise<Record<string, any>> {
     const payload = await response.json().catch(() => ({}))
     return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
@@ -1127,21 +1165,25 @@ const immersiveActive = $derived.by(
    * - `already_finished` — the reply ended between the button and the route. There is
    *   nothing to interrupt, so the caller sends it as an ordinary message rather than
    *   stopping a turn that already stopped.
-   * - `not_steerable` — this agent, or this transport, cannot carry a mid-reply message.
-   *   The caller falls back to the interrupt branch and shows the server's own reason.
+   * - `queue` — this agent, or this transport, cannot carry a mid-reply message. SA-119
+   *   (DL-119-07) renamed this outcome from `not_steerable`: the words now wait for the
+   *   reply to end rather than stopping it, which is what the user asked for rather than
+   *   the Stop they did not. **P2 wires the branch**; until then this arm still falls
+   *   through to the browser-held queue below (DL-119-07).
    *
-   * A network failure is `not_steerable` too, with a plain sentence: the honest outcome is
-   * the one the user can see happen, and an interrupt is what Batshit did before this story.
+   * A network failure is `refused`, with a plain sentence.
    */
   async function postSteer(params: {
     sessionId: string
     messageId: string
     steerId: string
     text: string
+    /** DL-119-05: `now` lands inside this reply; `end` is held until the reply finishes. */
+    deliver: SteerDeliver
   }): Promise<
     | { kind: 'accepted' }
     | { kind: 'already_finished' }
-    | { kind: 'not_steerable'; reason: string }
+    | { kind: 'queue'; reason: string }
     | { kind: 'refused'; reason: string }
   > {
     try {
@@ -1159,11 +1201,14 @@ const immersiveActive = $derived.by(
           ? payload.reason.trim()
           : typeof payload?.error === 'string' && payload.error.trim()
             ? payload.error.trim()
-            : 'This agent cannot be steered mid-reply. Your message interrupts instead.'
+            // F-P1-2: this used to be a hand-copy of the module's sentence, which is how the
+            // two came to disagree the moment DL-119-07 changed one of them.
+            : STEER_REFUSED_UNKNOWN_SENTENCE
 
       // PR #106 review F-4: `classifySteerRefusal` is THE rule. Only `reply_finished` (send
-      // normally) and `not_steerable` (interrupt) may escalate; the cap, a waiting DM, a bad
-      // request and a lost server all `refuse` — the reply keeps running and nothing is lost.
+      // normally) and `not_steerable` (DL-119-07: queue) may escalate; the cap, a waiting DM,
+      // a bad request and a lost server all `refuse` — the reply keeps running and nothing is
+      // lost.
       const kind = classifySteerRefusal(response.status, payload)
       if (kind === 'already_finished') return { kind: 'already_finished' }
       return { kind, reason }
@@ -1723,6 +1768,56 @@ const immersiveActive = $derived.by(
     for (const entry of stillWaiting) armDropBackstop(entry)
   }
 
+  /**
+   * SA-119 P3b (AMD-119-05) — the two actions on a dropped bubble.
+   *
+   * A dropped bubble is a receipt for a message that never went. Josh's rule: the user must
+   * not have to retype it, and the composer must not be refilled behind their back. So the
+   * receipt itself carries **Send now** and **Dismiss**.
+   */
+  /**
+   * The map is keyed by a bubble that may be gone. Pruned at the two places the store
+   * clears dropped bubbles, so it can never outlive what it describes.
+   */
+  function prunePayloadsForForgottenSteers() {
+    for (const steerId of [...resendableSteerPayloads.keys()]) {
+      if (!steerInbox.getSteer(steerId)) resendableSteerPayloads.delete(steerId)
+    }
+  }
+
+  function resendDroppedSteer(steerId: string) {
+    const payload = resendableSteerPayloads.get(steerId)
+    // No payload means this bubble came back from the replay buffer after a reload. The
+    // button is not offered in that case; this is the belt to that braces.
+    if (!payload) return
+    // Review F-P3b-3: the button was drawn for a `dropped` bubble. If the bubble moved on
+    // between the draw and the click, there is nothing left to re-send.
+    if (steerInbox.getSteer(steerId)?.state !== 'dropped') return
+    resendableSteerPayloads.delete(steerId)
+    // The receipt goes first: the words are about to exist as a real message, and leaving
+    // the bubble would show them twice — the duplicate this packet exists to remove.
+    // CLEARED, not forgotten (review F-P3b-3): a forgotten id is free for the session
+    // replay to rebuild on the next resubscribe, as a `queued` promise about a reply that
+    // is over (AMD-118-08).
+    steerInbox.clearDroppedSteer(steerId)
+    // Exactly what was queued — the send's own facts, with the composer's closures already
+    // stripped (review F-P3b-2). If the chat is busy again it queues again, which is the
+    // same promise it made the first time. `fromDroppedReceipt` keeps the OTHER receipts in
+    // the chat (review F-P3b-1): this click acts on one of them, not on all of them.
+    void handleSendMessage(payload.content, payload.metadata, { fromDroppedReceipt: true })
+  }
+
+  function dismissDroppedSteer(steerId: string) {
+    resendableSteerPayloads.delete(steerId)
+    // Same reason as above (review F-P3b-3): remembered, so the replay cannot bring it back.
+    steerInbox.clearDroppedSteer(steerId)
+  }
+
+  /** Whether a bubble can still be sent exactly as it was written. */
+  function canResendDroppedSteer(steerId: string) {
+    return resendableSteerPayloads.has(steerId)
+  }
+
 	  // Abort controller for cancelling the selected session's managed API/CLI send.
 	  const currentAbortController = $derived(currentRunState.abortController ?? null)
 	  const chatWorkBusy = $derived(chatRunRegistry.isSessionBusy(currentSessionId))
@@ -1750,14 +1845,73 @@ const immersiveActive = $derived.by(
 	  })
 	  const chatSteerReason = $derived.by(() => {
 	    if (activeGroupId) {
-	      return 'Group chats cannot be steered — each agent speaks in turn, so a message interrupts instead.'
+	      // F-P1-2: imported, not copied. The badge beside Stop prints this as plain text.
+	      return STEER_REFUSED_GROUP_SENTENCE
 	    }
 	    return currentRunState.steerable === false ? (currentRunState.steerReason ?? null) : null
 	  })
 
+	  /**
+	   * SA-119 P2 (DL-119-06) — the chats with a browser-held queued message waiting.
+	   *
+	   * One per chat. A second would race the first for the same "the reply just ended"
+	   * moment, and whichever lost would send into a live turn — which, with
+	   * interrupt-and-send retired, nothing downstream would catch.
+	   */
+	  const clientQueueWaitingBySession = new Set<string>()
+
 	  const sendInFlightBySession = new Map<string, boolean>()
 	  const sendInFlightSerialBySession = new Map<string, number>()
 	  const lastManualInterruptAtBySession = new Map<string, number>()
+
+	  /**
+	   * SA-119 P2b (F-P2-7) — what Stop leaves behind for the next ordinary send.
+	   *
+	   * `metadata.interruption` is what send-routed turns into the model's
+	   * `==== INTERRUPTION NOTE ====`, and DL-119-07 deleted its only writer along with
+	   * interrupt-and-send. Stop, then Enter, is the whole gesture now, so Stop is what has
+	   * to record it: which reply it cut, and when.
+	   *
+	   * Kept apart from `lastManualInterruptAtBySession`, which is a retry WINDOW — eight
+	   * seconds, read repeatedly, never consumed. Folding the two together would make
+	   * consuming the stamp silently close the session-turn retry as well.
+	   */
+	  const pendingStopInterruptionBySession = new Map<string, StopInterruptionRecord>()
+
+	  /**
+	   * SA-119 P3 (AMD-119-04) — how many times the user has pressed Stop in this chat.
+	   *
+	   * A browser-held queued message is awaiting `waitForReplyToEnd`, and a Stop is exactly
+	   * what makes that wait finish, so its own result cannot say which happened. Comparing
+	   * this count across the await can. A COUNT rather than a flag because a flag needs
+	   * clearing, and whoever cleared it would race the next Stop.
+	   */
+	  const manualStopCountBySession = new Map<string, number>()
+
+	  /**
+	   * SA-119 P3b (AMD-119-05) — the exact send behind a bubble, for its **Send now**.
+	   *
+	   * Josh, 2026-09-13: a dropped message should be one click from going, and the composer
+	   * must never be refilled — a user who spent the wait typing paragraphs would lose them
+	   * to a receipt.
+	   *
+	   * The bubble's own text cannot be that click. It is display text: F-P2-6 strips the
+	   * `{{batshit-clip:…}}` syntax out of it for reading, and the clip ids and file
+	   * references live in the send's METADATA, not in the words. Re-sending from what is on
+	   * screen would send a message that names a clip it does not carry, or quietly drops the
+	   * file — the one thing this story exists to prevent. So the exact `(content, metadata)`
+	   * is kept beside the bubble and replayed — minus the composer's own closures, which
+	   * `replayableSendMetadata` strips (review F-P3b-2): `onAccepted` would clear whatever
+	   * the user has typed since, which is the loss the refill was rejected for.
+	   *
+	   * Tab-local and deliberately so: a bubble restored from the replay buffer after a
+	   * reload has no payload here, and **Send now** is simply not offered for it. An
+	   * approximate resend would be worse than none, and the words are still on screen.
+	   */
+	  const resendableSteerPayloads = new Map<
+	    string,
+	    { content: string; metadata: Record<string, any> }
+	  >()
 
 	  function isSendInFlight(sessionId: string) {
 	    return sendInFlightBySession.get(sessionId) === true
@@ -2167,6 +2321,7 @@ const immersiveActive = $derived.by(
       // take away the only sign that a steer is still pending.
       if (leavingSessionId && leavingSessionId !== state.currentSessionId) {
         steerInbox.clearDroppedSteersForSession(leavingSessionId)
+        prunePayloadsForForgottenSteers()
       }
     })
 
@@ -3089,7 +3244,11 @@ const immersiveActive = $derived.by(
         sessionId: eventSessionContext ?? '',
         messageId: typeof data.messageId === 'string' ? data.messageId : '',
         steerId: typeof data.steerId === 'string' ? data.steerId : '',
-        text: typeof data.text === 'string' ? data.text : ''
+        text: typeof data.text === 'string' ? data.text : '',
+        // DL-119-05: the route has carried this since P1. Without it a tab that did not
+        // send — a spectator, or one reopened mid-reply — would be told a held message is
+        // about to land inside this reply.
+        deliver: isSteerDeliver(data.deliver) ? data.deliver : undefined
       })
     } else if (data.type === 'steer_delivered') {
       const steerSessionId = eventSessionContext ?? ''
@@ -4602,7 +4761,13 @@ const immersiveActive = $derived.by(
 	    }
 	  }
 
-		  async function handleSendMessage(content: string, metadata: any = {}) {
+		  async function handleSendMessage(
+		    content: string,
+		    metadata: any = {},
+		    // Review F-P3b-1: a replay from a receipt's Send now. Not metadata, because
+		    // `requestMetadata` spreads metadata into the request body and a placeholder record.
+		    sendOptions: { fromDroppedReceipt?: boolean } = {}
+		  ) {
 		    const goonPresentationMode: DesktopGoonPresentationMode | null = goonDcmPresentationMode
 		    metadata = {
 		      ...metadata,
@@ -4651,7 +4816,14 @@ const immersiveActive = $derived.by(
       // and duplicate guards, so a stray keypress does not wipe it, and before the steer
       // branch, so this send's own bubble is never the one removed. Only `dropped` goes:
       // a `queued` or `waiting` bubble belongs to a reply that is still running.
-      steerInbox.clearDroppedSteersForSession(sendSessionId)
+      // Review F-P3b-1: a receipt's own Send now is the user acting on THAT receipt, not on
+      // the others in the chat — each of those is still waiting for its own button, and the
+      // composer no longer holds their words (AMD-119-05), so clearing them here would be
+      // the loss this story exists to prevent.
+      if (!sendOptions.fromDroppedReceipt) {
+        steerInbox.clearDroppedSteersForSession(sendSessionId)
+        prunePayloadsForForgottenSteers()
+      }
 
       // SA-114 P3 (DL-114-11, AMD-114-07): a send stops any speech still playing — UNLESS
       // it turns out to be a steer, which does not stop the reply and so must not stop its
@@ -4836,62 +5008,92 @@ const immersiveActive = $derived.by(
             .map((sw: any) => sw?.id ?? sw)
             .filter((id: any) => typeof id === 'string')
         : []
-	    // API/CLI interrupt: abort active stream before sending a new message
-    let interruptionContext: {
-      previousMessageId?: string | null
-      interruptedAt?: string
-      reason?: string
-    } | null = null
+	    /**
+	     * DL-119-07: the interruption stamp is gone with the branch that wrote it. A SEND
+	     * never interrupts any more, so the field it filled was always going to be absent;
+	     * leaving the variable behind would have left a permanently-null value two message
+	     * records read.
+	     *
+	     * `postSendRoutedWithInterruptRetry` still needs to know a Stop may have just run —
+	     * that is `lastManualInterruptAtBySession`, written by `handleStopStream`, which does
+	     * not change.
+	     */
 	    const hasActiveStream = chatRunRegistry.isSessionBusy(currentSessionId)
 
 	    /**
-	     * SA-114 P3 (DL-114-14) — steer or interrupt.
+	     * SA-119 P2 (DL-119-02, DL-119-05, DL-119-06, DL-119-07) — steer or queue.
 	     *
-	     * Which one runs is decided here, from the same value the send button reads, so the
-	     * button cannot promise one thing while the send does another.
-	     * `busySendModeOverride` is Cmd/Ctrl+Enter asking for the other mode, for this
-	     * message only.
+	     * Two outcomes, never three. **Steer** hands the words to the server, which places
+	     * them inside this reply at the agent's next tool boundary. **Queue** sends them the
+	     * moment the reply ends, and has two mechanisms under one word: the SERVER holds a
+	     * text-only message on a steerable turn (`deliver: 'end'`, promoted into the next
+	     * turn's user message), and the BROWSER holds anything else (files, a group chat, an
+	     * unmanaged profile, a Codex exec lane) until the reply finishes.
 	     *
-	     * The clips rule (DL-114-10) is a THIRD outcome and not a steer: a send with files
-	     * waits for the reply to finish and then goes as an ordinary message. Image bytes at
-	     * a step boundary would need the SA-105 lane matrix per transport, which is its own
-	     * work; text is the daily case, and a steer may still name a clip or a path in words.
+	     * **Interrupt-and-send is gone** (DL-119-07). Stop, then Enter, is that job, and it
+	     * is one gesture the user chose rather than a side effect of a send. Nothing here may
+	     * stop a running reply.
+	     *
+	     * `busySendModeOverride` is the composer's own answer — a badge click, or whichever
+	     * key was pressed. It is trusted because only the composer knows what is in the box;
+	     * when it is absent (a Voice Mode send, a programmatic one) the same rule is read
+	     * here from the metadata this send is about to post, so the two cannot disagree.
 	     */
 	    const busySendOverride: BusySendMode | null =
-	      metadata?.busySendModeOverride === 'steer' || metadata?.busySendModeOverride === 'interrupt'
+	      metadata?.busySendModeOverride === 'steer' || metadata?.busySendModeOverride === 'queue'
 	        ? metadata.busySendModeOverride
 	        : null
-	    // The SAME rule the send button read, so the two cannot disagree: a lane the server
-	    // has already told us cannot be steered resolves to `interrupt` here too, and the user
-	    // gets the interrupt straight away instead of a round trip and a toast.
-	    // SA-118 (DL-118-09): `carriesAttachments` is deliberately NOT passed. The wait
-	    // branch below is chosen by `sendCarriesAttachments`, read from the metadata this
-	    // send is about to post; handing the same fact to the rule here would make this
-	    // read `'wait'`, fail the `=== 'steer'` test, and silently retire that branch. The
-	    // BUTTON passes it, because only the button has to say so before it happens.
-	    const effectiveBusySendMode: EffectiveBusySendMode = resolveEffectiveBusySendMode({
-	      mode: busySendOverride ?? busySendMode,
-	      steerable: activeGroupId ? false : chatRunRegistry.getRunState(currentSessionId).steerable
-	    })
+
 	    // DL-114-10 says files are never steered. PR #106 review F-23: an `@file` mention is a
 	    // file too — it travels as `metadata.fileReferences`, which the steer route cannot carry,
 	    // so steering it handed the model the bare path with no content behind it and no error.
-	    const sendCarriesAttachments =
-	      collectTrustedClipIdsFromMetadata(metadata).length > 0 ||
-	      (Array.isArray(metadata?.fileReferences) && metadata.fileReferences.length > 0)
-	    const steerBranchEligible =
-	      isManagedPrimaryAgentType(agentType) &&
-	      hasActiveStream &&
-	      effectiveBusySendMode === 'steer'
-	    // Set when the route says the reply is already over. There is then nothing to
-	    // interrupt, and the browser can still believe it is busy for a few seconds — a
+	    // DL-119-02 needs the two APART: a clip may stay in the composer while the words steer,
+	    // and a mention may not, because the path is inline in the text being sent.
+	    const sendCarriesClips = collectTrustedClipIdsFromMetadata(metadata).length > 0
+	    const sendCarriesMentions =
+	      Array.isArray(metadata?.fileReferences) && metadata.fileReferences.length > 0
+	    const sendCarriesAttachments = sendCarriesClips || sendCarriesMentions
+
+	    const runSteerable = activeGroupId
+	      ? false
+	      : chatRunRegistry.getRunState(currentSessionId).steerable
+	    // The SAME rule the badges read, so the badge cannot promise one thing while the send
+	    // does another — the failure SA-114 built `resolveEffectiveBusySendMode` to remove and
+	    // DL-119-02 replaced it to keep removing.
+	    const busySendActions = resolveBusySendActions({
+	      mode: busySendMode,
+	      steerable: runSteerable,
+	      hasClips: sendCarriesClips,
+	      hasMentions: sendCarriesMentions
+	    })
+	    const busySendAction: BusySendMode = busySendOverride ?? busySendActions.enter
+
+	    const managedBusy = isManagedPrimaryAgentType(agentType) && hasActiveStream
+	    /**
+	     * Can this turn hold the words on the SERVER at all?
+	     *
+	     * Both doors go through one answer because they are one route: a steer and a
+	     * server-held queue differ only in `deliver`. A turn that fails this test can still
+	     * queue — in the browser (DL-119-06) — which is why nothing below falls through to a
+	     * send into a live reply.
+	     */
+	    const turnCanHoldText = managedBusy && runSteerable !== false && !sendCarriesAttachments
+	    const steerBranchEligible = turnCanHoldText && busySendAction === 'steer'
+	    const serverQueueEligible = turnCanHoldText && busySendAction === 'queue'
+	    // Everything busy that the server cannot hold waits in the browser instead.
+	    let clientQueueEligible = managedBusy && !steerBranchEligible && !serverQueueEligible
+	    // Set when the route says the reply is already over. There is then nothing to wait
+	    // for, and the browser can still believe it is busy for a few seconds — a
 	    // simulated-streaming reply finishes SERVER-side while the tab is still typing it
 	    // out, which is exactly when this happens (measured on BSMS, 2026-09-11). Sending it
 	    // as an ordinary message is what the user would have got a second later; the
 	    // session-turn lock and its retry handle the overlap.
 	    let steerRefusedAsFinished = false
 
-	    if (steerBranchEligible && !sendCarriesAttachments) {
+	    if (steerBranchEligible || serverQueueEligible) {
+	      // DL-119-05: one field decides which promise was made. `now` lands inside this
+	      // reply; `end` is held by the server and becomes the next turn's user message.
+	      const deliver: SteerDeliver = steerBranchEligible ? 'now' : 'end'
 	      const steerRunState = chatRunRegistry.getRunState(currentSessionId)
 	      const steerTargetMessageId =
 	        steerRunState.activeMessageId ?? steerRunState.activeStreamMessageIds[0] ?? null
@@ -4900,7 +5102,7 @@ const immersiveActive = $derived.by(
 	        // F-P3-2: a reply Batshit started on its own tells this tab its assistant id on
 	        // `session_run_status`, but only once send-routed has registered the run; before
 	        // that there is nothing to aim a steer at. A click that promised to steer must
-	        // never fall through to an interrupt, so say so and keep the words where they are.
+	        // never fall through to something else, so say so and keep the words where they are.
 	        toast.info('The reply is still starting. Send again in a moment.')
 	        return false
 	      }
@@ -4915,20 +5117,26 @@ const immersiveActive = $derived.by(
 	          steerId,
 	          sessionId: currentSessionId,
 	          messageId: steerTargetMessageId,
-	          text: content
+	          text: content,
+	          deliver
 	        })
+	        // AMD-119-05: kept before the round trip, like the bubble, so a refusal or a Stop
+	        // arriving mid-flight still finds it.
+	        resendableSteerPayloads.set(steerId, { content, metadata: replayableSendMetadata(metadata) })
 	        const outcome = await postSteer({
 	          sessionId: currentSessionId,
 	          messageId: steerTargetMessageId,
 	          steerId,
-	          text: content
+	          text: content,
+	          deliver
 	        })
 
 	        if (outcome.kind === 'accepted') {
 	          // The server owns the text from here: it either lands inside this reply or
-	          // becomes the next message when the reply ends (DL-114-07). Nothing else in
-	          // this function runs — no user record is written (DL-114-04), no turn starts,
-	          // and the voice keeps playing, because a steer does not stop the reply.
+	          // becomes the next message when the reply ends (DL-114-07, DL-119-05). Nothing
+	          // else in this function runs — no user record is written (DL-114-04), no turn
+	          // starts, and the voice keeps playing, because neither a steer nor a queued
+	          // message stops the reply.
 	          if (typeof metadata?.onAccepted === 'function') {
 	            await metadata.onAccepted()
 	          }
@@ -4938,22 +5146,43 @@ const immersiveActive = $derived.by(
 	        steerInbox.forgetSteer(steerId)
 	        if (outcome.kind === 'already_finished') {
 	          steerRefusedAsFinished = true
+	          clientQueueEligible = false
 	          logger.debug('[handleSendMessage] Steer refused: that reply had already finished')
-	        } else if (outcome.kind === 'refused') {
+	        } else if (outcome.kind === 'queue') {
+	          // DL-119-07: the server says this reply cannot take a steer at all. That answer
+	          // is QUEUE, not a stop the user never asked for — the words wait in the browser
+	          // and go the moment the reply ends (DL-119-06).
+	          clientQueueEligible = true
+	          logger.debug('[handleSendMessage] Steer refused as not steerable; queueing in the browser')
+	        } else {
 	          // PR #106 review F-4: the server said no WITHOUT ending the reply — the cap, a
 	          // waiting DM, a bad request, an outage. The reply keeps running and the steers it
-	          // already accepted stay; nothing here may fall through to an interrupt the user
-	          // never asked for.
+	          // already accepted stay; nothing here may fall through to a send the user never
+	          // asked for, so the words stay in the composer.
 	          toast.info(outcome.reason)
 	          return false
-	        } else {
-	          toast.info(outcome.reason)
 	        }
 	      }
-	    } else if (steerBranchEligible && sendCarriesAttachments) {
-	      // DL-114-10: files are never steered. Hold the send until the reply finishes, then
-	      // continue down the ordinary path — no interrupt, because the user did not ask to
-	      // stop anything.
+	    }
+
+	    if (clientQueueEligible) {
+	      /**
+	       * DL-119-06 — Queue, held in the browser.
+	       *
+	       * One at a time per chat: a second would race the first for the same "the reply
+	       * just ended" moment and the loser would send into a live turn. The refusal is a
+	       * toast and the words stay in the composer, because dropping one silently is the
+	       * thing this story exists to stop.
+	       */
+	      if (clientQueueWaitingBySession.has(currentSessionId)) {
+	        toast.info(
+	          sendCarriesAttachments
+	            ? QUEUE_ONE_AT_A_TIME_SENTENCE
+	            : QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE
+	        )
+	        return false
+	      }
+
 	      const waitRunState = chatRunRegistry.getRunState(currentSessionId)
 	      const waitForMessageId =
 	        waitRunState.activeMessageId ?? waitRunState.activeStreamMessageIds[0] ?? null
@@ -4966,77 +5195,106 @@ const immersiveActive = $derived.by(
 	          sessionId: currentSessionId,
 	          messageId: waitForMessageId,
 	          text: content,
-	          state: 'waiting'
+	          state: 'waiting',
+	          withFiles: sendCarriesAttachments
 	        })
+	        resendableSteerPayloads.set(waitingSteerId, { content, metadata: replayableSendMetadata(metadata) })
+	        /**
+	         * AMD-119-05 (Josh, 2026-09-13) — the words leave the box now.
+	         *
+	         * A steer and a server-held queue already clear it, because both return from
+	         * here the moment the route accepts them. This branch does not return until the
+	         * reply ends, so the words sat in the composer AND in the bubble for the whole
+	         * wait — which reads as "this is going to be sent twice". The clips are left
+	         * alone: they are sticky by design, and a one-time clip has not been spent yet.
+	         */
+	        if (typeof metadata?.onQueuedForLater === 'function') {
+	          metadata.onQueuedForLater()
+	        }
+	        clientQueueWaitingBySession.add(currentSessionId)
+	        const stopCountBeforeWait = manualStopCountBySession.get(currentSessionId) ?? 0
+	        let replyEnded = false
+	        let outcome: QueuedSendAfterWait = 'still-running'
 	        try {
-	          await waitForStreamCompletion(waitForMessageId)
+	          replyEnded = await waitForReplyToEnd(currentSessionId, waitForMessageId)
 	        } finally {
-	          steerInbox.forgetSteer(waitingSteerId)
+	          clientQueueWaitingBySession.delete(currentSessionId)
+	          outcome = resolveQueuedSendAfterWait({
+	            stoppedDuringWait:
+	              (manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeWait,
+	            replyEnded
+	          })
+	          // AMD-119-04, review F-P3b-4: the bubble IS the receipt for BOTH ways of not
+	          // sending — a Stop, and a wait that gave up on a reply still running. The
+	          // composer was cleared when the message was queued (AMD-119-05), so the bubble
+	          // is the only place the words still are. Only a send retires it.
+	          if (outcome === 'send') steerInbox.forgetSteer(waitingSteerId)
+	        }
+	        if (outcome === 'dropped-by-stop') {
+	          /**
+	           * AMD-119-04 (Josh, 2026-09-13) — Stop stops everything.
+	           *
+	           * DL-119-05 already had Stop drop a SERVER-held queued message with this exact
+	           * receipt. This branch used to send instead, because a Stop is one of the ways
+	           * `waitForReplyToEnd` finishes — and `settleSteerBubblesForMessage` had already
+	           * drawn the receipt, so the user was told "Not sent" about a message that then
+	           * sent. Marked here rather than left to that call because a context-exhaustion
+	           * auto-continue can move the session's active message id, and the settle is
+	           * keyed on the id this bubble was filed under.
+	           */
+	          steerInbox.markSteerDropped(waitingSteerId)
+	          // AMD-119-05: the words stay in the bubble, which carries Send now / Dismiss.
+	          // Nothing is written back into the composer — a user who spent the wait typing
+	          // something else would lose it to a receipt.
+	          return false
+	        }
+	        if (outcome === 'still-running') {
+	          // F-P2-1: the reply is still running after the ceiling. Queue promised "sends
+	          // after this reply", so sending now would break the promise AND race a live
+	          // turn. Review F-P3b-4: the words left the composer when the message was
+	          // queued, so the bubble becomes the receipt — with Send now for when the reply
+	          // ends — instead of vanishing with them.
+	          steerInbox.markSteerDropped(waitingSteerId, 'timed_out')
+	          toast.info('That reply is still going. Your message is kept on its receipt — use Send now when the reply ends.')
+	          return false
 	        }
 	      }
 	    }
 
-	    // Re-read: a steer that was refused, or a clips send that waited, may have changed
-	    // whether there is still anything running to interrupt.
-	    if (
-	      isManagedPrimaryAgentType(agentType) &&
-	      !steerRefusedAsFinished &&
-	      chatRunRegistry.isSessionBusy(currentSessionId)
-	    ) {
-	      const activeRunState = chatRunRegistry.getRunState(currentSessionId)
-	      const previousMessageId =
-	        activeRunState.activeMessageId ?? activeRunState.activeStreamMessageIds[0] ?? null
+	    // A queued message that waited, or a steer the route said was too late, may have
+	    // changed whether anything is still running. Nothing below stops a reply: DL-119-07
+	    // retired interrupt-and-send, and Stop is the only thing that interrupts.
+	    stopRealtimeSpeechPlayback()
 
-      logger.debug('[handleSendMessage] Interrupting active stream', {
-        previousMessageId
-      })
-
-      // SA-114 P3 (DL-114-11): an interrupt stops the voice, exactly like the Stop button.
-      // A steer never reaches here, which is the whole point — the reply continues, so its
-      // speech continues too.
-      stopRealtimeSpeechPlayback(previousMessageId)
-
-      let resolvedMessageId = previousMessageId
-      try {
-        const interruptResponse = await fetch('/api/messages/interrupt', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sessionId: currentSessionId,
-            messageId: previousMessageId
-          })
-        })
-        const payload = await interruptResponse.json().catch(() => ({}))
-        if (typeof payload?.messageId === 'string' && payload.messageId.trim().length > 0) {
-          resolvedMessageId = payload.messageId.trim()
-        }
-      } catch (error) {
-        console.error('[handleSendMessage] Failed to interrupt stream:', error)
-      }
-
-	      if (activeRunState.abortController) {
-	        activeRunState.abortController.abort()
-	        chatRunRegistry.setAbortController(currentSessionId, null)
+	    /**
+	     * SA-119 P2b (F-P2-7) — the interruption note, written from Stop's record alone.
+	     *
+	     * The record is CONSUMED here whatever happens next, so one Stop can only ever
+	     * colour the one send that follows it. Whether it then becomes a stamp is
+	     * `resolveStopInterruptionStamp`'s decision, in the rules module beside
+	     * `resolveBusySendActions`, because it has real behaviour and belongs where a test
+	     * can mutate it — this file can only be pinned on order and reachability.
+	     *
+	     * `browserQueued` is the half that is easy to miss: a steer and a server-held queue
+	     * return far above, but a BROWSER-held queue falls through to exactly here, and what
+	     * it waits for — "the reply ends" — is precisely what a Stop makes happen.
+	     */
+	    const stopInterruptionRecord =
+	      pendingStopInterruptionBySession.get(currentSessionId) ?? null
+	    pendingStopInterruptionBySession.delete(currentSessionId)
+	    const latestAssistantMessageId = (() => {
+	      const sessionMessages = messageStore.getMessages(currentSessionId)
+	      for (let index = sessionMessages.length - 1; index >= 0; index -= 1) {
+	        const candidate = sessionMessages[index]
+	        if (candidate?.role === 'assistant') return candidate.id ?? null
 	      }
-
-	      isWaitingForResponse = false
-	      clearActiveToolProcessingState(currentSessionId)
-
-      if (resolvedMessageId) {
-        await waitForStreamCompletion(resolvedMessageId)
-      }
-
-      interruptionContext = {
-        previousMessageId: resolvedMessageId ?? previousMessageId,
-        interruptedAt: new Date().toISOString(),
-        reason: 'user'
-      }
-    } else {
-      // SA-114 P3 (DL-114-11): the ordinary send keeps the behaviour it always had —
-      // starting a new turn silences whatever the last one was still saying. Only a steer
-      // is exempt, and a steer has already returned above.
-      stopRealtimeSpeechPlayback()
-    }
+	      return null
+	    })()
+	    const stopInterruption = resolveStopInterruptionStamp({
+	      record: stopInterruptionRecord,
+	      browserQueued: clientQueueEligible,
+	      latestAssistantMessageId
+	    })
 
 	    const pendingZipControl = currentSessionId ? zipControlPendingBySession.get(currentSessionId) : null
 	    if (pendingZipControl) {
@@ -5077,7 +5335,9 @@ const immersiveActive = $derived.by(
           metadata?.skillInvocation && typeof metadata.skillInvocation === 'object'
             ? metadata.skillInvocation
             : undefined,
-        interruption: interruptionContext ?? undefined,
+        // F-P2-7: both write sites, as `metadata.wake` learned to be — send-routed reads
+        // the request body first and this record second, and a recompile only has this one.
+        interruption: stopInterruption ?? undefined,
         zipIds: []
       }
     }
@@ -5180,7 +5440,7 @@ const immersiveActive = $derived.by(
             tts: metadata?.tts ?? false,
             voiceMode: metadata?.voiceMode ?? (voiceMode ? 'voice' : 'text'),
             realtime: metadata?.realtime ?? false,
-            interruption: interruptionContext ?? undefined,
+            interruption: stopInterruption ?? undefined
           };
 
         try {
@@ -5211,7 +5471,6 @@ const immersiveActive = $derived.by(
             body: routedRequestBody,
             signal: abortController.signal,
 	            wasInterrupting:
-	              Boolean(interruptionContext) ||
 	              Date.now() - (lastManualInterruptAtBySession.get(currentSessionId) ?? 0) < 8_000
           })
           const response = routedSend.response
@@ -5365,6 +5624,25 @@ const immersiveActive = $derived.by(
 	    const runState = chatRunRegistry.getRunState(sessionId)
 	    const previousMessageId =
 	      runState.activeMessageId ?? runState.activeStreamMessageIds[0] ?? null
+
+	    // F-P2-7: written here, above everything that can throw, time out or be aborted,
+	    // because the note on the next send is now the only thing that tells the model the
+	    // user cut this reply short. No id means nothing to name — an addendum about "the
+	    // previous response" that cannot say which one is not worth writing — so no record
+	    // is left and no note is stamped.
+	    if (previousMessageId) {
+	      pendingStopInterruptionBySession.set(sessionId, {
+	        messageId: previousMessageId,
+	        interruptedAt: new Date().toISOString()
+	      })
+	    }
+
+	    // AMD-119-04: counted whether or not there was a message id to name, because a
+	    // browser-held queued message is waiting on THIS gesture, not on what it cut.
+	    manualStopCountBySession.set(
+	      sessionId,
+	      (manualStopCountBySession.get(sessionId) ?? 0) + 1
+	    )
 
 	    stopRealtimeSpeechPlayback(previousMessageId)
 	    // SA-114 P3 (F-P3-B): Stop promotes nothing (DL-114-07), so anything still waiting is
@@ -7416,6 +7694,9 @@ const immersiveActive = $derived.by(
           planSubjects={planSubjects}
           {voiceSettings}
           composerClipCount={activeComposerClipIds.length}
+          onResendDroppedSteer={resendDroppedSteer}
+          onDismissDroppedSteer={dismissDroppedSteer}
+          canResendDroppedSteer={canResendDroppedSteer}
         />
       {:else}
         <!-- Centered Welcome Layout -->

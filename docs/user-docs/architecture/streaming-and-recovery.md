@@ -26,7 +26,9 @@ Automatic continuation is capped. If the task still cannot continue safely, Bats
 
 ## Interrupts
 
-Stopping a run preserves completed text and tools, marks the message as interrupted, and releases the chat for the next send. Sending another message in the same active chat first interrupts the current turn so two responses cannot overlap in one transcript.
+Stopping a run preserves completed text and tools, marks the message as interrupted, and releases the chat for the next send. **Stop is the only thing that interrupts a reply.** Sending while an agent is still replying steers or queues your message instead (see [Steer or Queue while the agent is busy](../chat/overview.md#steer-or-queue-while-the-agent-is-busy)), so two responses can never overlap in one transcript.
+
+The first message you send after a Stop tells the agent that its previous reply was cut short, so it picks up from a stop rather than carrying on as if it had finished. Only that one message carries the note, and only in the chat you stopped.
 
 ## Execution Viewer
 

@@ -8,7 +8,13 @@ import {
 } from '$lib/server/services/steerInboxRegistry'
 import { internalServiceHeaders } from '$lib/server/services/internalRequestAuth'
 import { waitForStreamRegistration } from '$lib/server/services/steerSetupWait'
-import { isValidSteerId, resolveSteerability, STEER_TEXT_MAX_CHARS } from '$lib/utils/steerControl'
+import {
+  isSteerDeliver,
+  isValidSteerId,
+  resolveSteerability,
+  STEER_TEXT_MAX_CHARS,
+  type SteerDeliver
+} from '$lib/utils/steerControl'
 
 /**
  * SA-114 P1 (DL-114-03) — `POST /api/messages/steer`.
@@ -23,6 +29,13 @@ import { isValidSteerId, resolveSteerability, STEER_TEXT_MAX_CHARS } from '$lib/
  * USER's own words landing inside a reply, and the only other source SA-114 allows is an
  * urgent DM, which goes through `sendDmOp` server-side (DL-114-13, P4) rather than through
  * an HTTP door a token holder could push text through.
+ *
+ * SA-119 P1 (DL-119-05) adds **Queue** as one field on this same door: `deliver: 'end'`.
+ * Everything the route does is unchanged — the same ownership, the same refusals, the same
+ * cap, the same live-turn check — and the only difference downstream is that no transport
+ * will take the entry at a tool boundary, so the end of the reply promotes it. Queue is not
+ * a second route because it is not a second mechanism: it is the promotion SA-114 already
+ * built, asked for on purpose rather than arrived at by accident.
  */
 
 type SteerRefusal = { status: number; body: Record<string, unknown> }
@@ -66,6 +79,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   const steerId = typeof body?.steerId === 'string' ? body.steerId.trim() : ''
   const rawText = typeof body?.text === 'string' ? body.text : ''
   const text = rawText.trim()
+  // DL-119-05: absent means `now`, so every client written before SA-119 keeps steering.
+  // Anything that is neither word is refused rather than coerced — a message stored under a
+  // timing nobody chose either lands mid-reply when the user asked it to wait or waits when
+  // they asked it to land, and both read as Batshit ignoring the badge they pressed.
+  const rawDeliver = body?.deliver
+  const deliver: SteerDeliver = rawDeliver === undefined ? 'now' : (rawDeliver as SteerDeliver)
 
   if (!sessionId || !messageId) {
     return json(
@@ -89,6 +108,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
   if (!text) {
     return json({ error: 'A steer needs some text.', code: 'invalid_input' }, { status: 400 })
+  }
+
+  if (rawDeliver !== undefined && !isSteerDeliver(rawDeliver)) {
+    return json(
+      { error: "deliver must be 'now' or 'end'.", code: 'invalid_input' },
+      { status: 400 }
+    )
   }
 
   if (text.length > STEER_TEXT_MAX_CHARS) {
@@ -175,7 +201,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     messageId,
     text,
     at,
-    source: 'user'
+    source: 'user',
+    deliver
   })
 
   if (!enqueued.ok) {
@@ -192,6 +219,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   // ceiling, and the user's send button must not hang on a wedged app server. The server
   // already owns the text either way — a refused write returns it to the inbox, where the
   // end of the turn promotes it (DL-114-07).
+  //
+  // SA-119 (DL-119-05): this runs for a queued message too, and takes nothing.
+  // `takePendingSteersForTransport` skips every `deliver: 'end'` entry — that ONE skip, in
+  // the registry, is the contract, and it is the same predicate the API lane's take reads.
+  // A second guard here would be a second statement of the same rule that no test could
+  // hold honest: with the skip in place it can never change the outcome (measured — the
+  // mutation that deleted the guard left every suite green), so it could only ever drift.
   void flushPendingSteersToTransport(sessionId, messageId).then((result) => {
     if (result.reason === 'refused') {
       console.warn('[SA-114] A managed CLI refused a steer; it will be promoted instead', {
@@ -202,7 +236,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     }
   })
 
-  await publishSteerQueued({ request, sessionId, messageId, steerId, text, at })
+  await publishSteerQueued({ request, sessionId, messageId, steerId, text, at, deliver })
 
   return json({ steerId, pending: enqueued.pending, lane: steerRun.lane }, { status: 202 })
 }
@@ -228,6 +262,8 @@ async function publishSteerQueued(payload: {
   steerId: string
   text: string
   at: string
+  /** DL-119-05: the bubble reads this to say *Queued — sends after this reply* rather than guessing. */
+  deliver: SteerDeliver
 }) {
   try {
     await fetch(new URL('/api/sse', payload.request.url).toString(), {
@@ -243,7 +279,8 @@ async function publishSteerQueued(payload: {
         messageId: payload.messageId,
         steerId: payload.steerId,
         text: payload.text,
-        at: payload.at
+        at: payload.at,
+        deliver: payload.deliver
       })
     })
   } catch (error) {

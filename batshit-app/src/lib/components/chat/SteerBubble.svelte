@@ -13,13 +13,39 @@
    * the inset takes over, and `promoted` ones the moment the server's user message lands.
    */
   import { Loader2, Paperclip, Ban } from '@lucide/svelte'
+  import { Button } from '$lib/components/ui/button'
   import { steerBubbleStatusLabel, type SteerBubbleEntry } from '$lib/stores/steerInbox.svelte'
 
-  let { steer }: { steer: SteerBubbleEntry } = $props()
+  /**
+   * SA-119 P3b (AMD-119-05) — a dropped bubble is a receipt with two ways out.
+   *
+   * Josh, 2026-09-13: after a Stop drops a queued message the user must not have to retype
+   * it, and refilling the composer is the wrong way to give it back — they may have spent
+   * the wait typing something else. So the receipt carries the actions instead.
+   *
+   * **Send now** appears only when the page can still send the EXACT message that was
+   * queued, metadata and all. A bubble restored from the replay buffer after a reload has
+   * no payload behind it, so it offers Dismiss alone rather than an approximate resend.
+   *
+   * Visible, not on hover. DL-119-03 settled that argument: people press Enter and nobody
+   * hovers, which is the finding this whole story came from.
+   */
+  let {
+    steer,
+    onSendNow = null,
+    onDismiss = null,
+    canSendNow = false
+  }: {
+    steer: SteerBubbleEntry
+    onSendNow?: ((steerId: string) => void) | null
+    onDismiss?: ((steerId: string) => void) | null
+    canSendNow?: boolean
+  } = $props()
 
   // F-P3-4: the sentence lives in the store beside the state that decides it, so a drop
   // that was not the user's Stop never reads "you stopped the reply".
   const statusLabel = $derived(steerBubbleStatusLabel(steer))
+  const showActions = $derived(steer.state === 'dropped' && Boolean(onDismiss))
 </script>
 
 <div class="steer-row" data-testid="steer-bubble" data-steer-state={steer.state}>
@@ -35,6 +61,30 @@
       {/if}
       {statusLabel}
     </span>
+    {#if showActions}
+      <div class="steer-actions" data-testid="steer-dropped-actions">
+        {#if canSendNow && onSendNow}
+          <Button
+            variant="ghost"
+            size="xs"
+            class="steer-action-button"
+            data-testid="steer-send-now"
+            onclick={() => onSendNow?.(steer.steerId)}
+          >
+            Send now
+          </Button>
+        {/if}
+        <Button
+          variant="ghost"
+          size="xs"
+          class="steer-action-button is-danger"
+          data-testid="steer-dismiss"
+          onclick={() => onDismiss?.(steer.steerId)}
+        >
+          Dismiss
+        </Button>
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -85,6 +135,33 @@
     font-size: 0.6875rem;
     font-weight: 500;
     opacity: 0.78;
+  }
+
+  /* Compact Precision: small quiet text actions, the same tone ladder the message row's
+     actions use (muted at rest, foreground on hover, destructive for the destructive one).
+     Visible at rest rather than hover-revealed, which is DL-119-03's whole point. */
+  .steer-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-top: 0.1rem;
+    margin-left: -0.35rem;
+  }
+
+  :global(.steer-action-button) {
+    height: 1.5rem;
+    padding-inline: 0.35rem;
+    font-size: 0.6875rem;
+    font-weight: 500;
+    color: var(--muted-foreground);
+  }
+
+  :global(.steer-action-button:hover) {
+    color: var(--foreground);
+  }
+
+  :global(.steer-action-button.is-danger:hover) {
+    color: var(--destructive);
   }
 
   .steer-status :global(.steer-status-icon) {

@@ -17,46 +17,65 @@ Around the text box sit the controls you use most:
 
 When an agent is working, a **Stop** control appears so you can cut a run short. Stopping doesn't throw away what the agent already produced — partial work and tool results stay in the chat with a clear note. More on that in [Zips and context](../tools/zips.md).
 
-## Steer or interrupt while the agent is busy
+## Steer or Queue while the agent is busy
 
 You thought of something after you hit send. You don't have to wait, and you don't have to start over.
 
-While an agent is replying, the Send button changes to **Steer**. Your message waits for the agent to finish whatever tool it's in the middle of, then arrives **inside the reply it's already writing** — the agent reads it and adjusts without losing its place. It shows up in the chat as a small bubble tucked into the reply, at the exact spot it arrived, marked *You, mid-reply*.
+While an agent is replying, two small buttons appear beside **Stop**: **Steer** and **Queue**. They are your two choices, and whichever one plain Enter will do is filled in so you can see it without hovering over anything.
 
-If you attach a Clip or mention a file with `@`, the button says **Send after reply** instead. Files can't be steered, so that message waits and goes as an ordinary send the moment the reply ends. The button tells you that before you click rather than after.
+- **Steer** hands your message to the agent *now*. It waits for the agent to finish whatever tool it's in the middle of, then arrives **inside the reply it's already writing** — the agent reads it and adjusts without losing its place. It shows up in the chat as a small bubble tucked into the reply, at the exact spot it arrived, marked *You, mid-reply*.
+- **Queue** holds your message and sends it **the moment the reply ends**, as the next thing you say. Queue works for every message, including ones with files.
 
-The other option is **Interrupt**: the reply stops, everything it already produced is kept, and your message starts a fresh turn with a note saying the last one was cut short. It's always one click away. The **Stop** button is always an interrupt.
+Click either button to send that way. Or press **Enter** for your default and **Cmd+Enter** (Ctrl+Enter on Windows) for the other one.
 
-**Picking which one is the default.** Settings → User → Chat → **When You Send While the Agent Is Busy**, which offers **Steer (default)** and **Interrupt and send**. The change takes effect immediately, even in a chat that's mid-reply.
+**Several queued messages go together.** If you queue two or three things while one long reply runs, they arrive as a single next message, in the order you sent them — not as three separate turns.
 
-**Sending the other way just once.** Press **Cmd+Enter** (Ctrl+Enter on Windows) instead of Enter and that one message goes with the opposite mode. Enter always means your default.
+**There is no "interrupt and send".** If you want the reply to stop and your message to start fresh, press **Stop**, then **Enter**. That's two deliberate steps instead of a mode you could pick by accident. Stop always stops.
 
-**What the bubble tells you.** A steered message draws its own small bubble while it is in between — sent, but not yet part of anything. It says one of these:
+**Picking which one Enter does.** Settings → User → Chat → **When You Send While the Agent Is Busy**, which offers **Steer (default)** and **Queue**. The change takes effect immediately, even in a chat that's mid-reply.
+
+### Files
+
+**A message with a file always queues.** A Clip or an `@file` mention can't be handed to an agent in the middle of a reply, so pressing Enter with something attached queues the message whatever your default is. That's on purpose: "send it now" would have quietly meant "send it without the thing I attached".
+
+**Steer never throws a file away.** If you press the Steer button (or Cmd+Enter) with a Clip attached, the words go now and **the Clip stays in the box** for your next message. The note beside the button says so before you click.
+
+**An `@file` mention can't steer at all.** Unlike a Clip, the path is written into the text you're sending, so it can't stay behind. Steer is greyed out and the reason is printed beside it — that message can only queue.
+
+### What the bubble tells you
+
+A message that is in between — sent, but not yet part of anything — draws its own small bubble. It says one of these:
 
 | It says | It means |
 |---|---|
-| *Queued for the agent's next step* | Batshit has your message and is holding it for the next tool call to finish. On a Codex or Claude agent this can sit for several seconds — that's normal, not a failure. |
-| *With files: waits for the reply to finish* | You attached something. Files are never steered — the message waits and goes as a normal send once the reply ends. |
-| *Not sent — you stopped the reply* | You pressed Stop, and Stop means stop: your message was not passed on and no new turn started. |
+| *Queued for the agent's next step* | You steered. Batshit has your message and is holding it for the next tool call to finish. On a Codex or Claude agent this can sit for several seconds — that's normal, not a failure. |
+| *Queued — sends after this reply* | You queued. It goes as your next message the moment the reply ends. |
+| *Queued — sends after this reply (with files)* | Same promise, and your attachment goes with it. |
+| *Not sent — you stopped the reply* | You pressed Stop, and Stop means stop: your message was not passed on and no new turn started. This covers a queued message too. |
 | *Not sent — the reply ended before it could land. Send it again.* | The rare backstop: the chat went quiet with your message still waiting, so Batshit never placed it anywhere rather than guess. |
+| *Not sent — the reply ran too long to wait for. Send it again when it ends.* | A message your browser was holding (one with a file, or a chat that cannot take a steer) waits for the reply to end, but not forever. After a very long reply it gives up, and the receipt keeps your message: press **Send now** when the reply ends. |
 
-Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there to copy and send again. It is never quietly turned into a message you didn't mean to send.
+Either way the bubble goes grey and **keeps your words on screen**, so a message that wasn't sent is still there. It is never quietly turned into a message you didn't mean to send.
+
+**You don't have to retype it.** A grey bubble carries two small buttons: **Send now** sends that message exactly as you wrote it, attachment and all, and **Dismiss** clears the bubble away. Nothing is put back into the message box, on purpose: if you spent the wait typing something else, a receipt should not overwrite it. (After a reload the bubble keeps your words but loses **Send now**, because Batshit will not guess at a message it can no longer send exactly.)
 
 A bubble disappears the moment your message has a real home. If the agent read it mid-reply, it becomes the inset inside that reply, marked *You, mid-reply*. If the reply ended first, it becomes an ordinary message from you, and the agent answers it.
 
-A **grey "not sent" bubble** has no home to go to, so it stays until you are done with it: it clears the next time you send in that chat, and it clears when you leave the chat. A bubble for a reply that is still running stays put — leaving and coming back does not throw away the only sign that your message is still waiting.
+A **grey "not sent" bubble** has no home to go to, so it stays until you are done with it: it clears the next time you send in that chat, and it clears when you leave the chat. Pressing **Send now** or **Dismiss** on one receipt leaves the others alone. A bubble for a reply that is still running stays put — leaving and coming back does not throw away the only sign that your message is still waiting.
 
-**Nothing you type is lost.** If the agent's reply has no tool call left to catch your message — a plain text answer, or one that's already wrapping up — Batshit sends it as your next message the moment the reply ends. That happens on the server, so it works even if you close the tab. The one exception is the backstop row above, and it tells you plainly to send it again.
+### The limits
 
-**Five at a time, per reply.** You can steer the same reply five times. The sixth is refused with *"5 messages are already waiting for this reply (Batshit holds 5). Wait for the reply to finish."* A message the agent has already read frees its slot, so a long tool-heavy reply never locks you out.
+**Nothing you type is lost.** A steer the agent never got to — a plain text answer, or one that's already wrapping up — is sent as your next message the moment the reply ends, the same as a queued one. Queued text messages are held **on the server**, so they still arrive even if you close the tab.
 
-**When a steer is refused.** If Batshit says no without the reply ending — the cap above, an agent DM already waiting, or a moment when it can't reach the server — you get a one-line note saying why. The reply keeps running, nothing is interrupted, and nothing is sent. Your words stay in the box.
+**One queued message with files at a time.** A message with an attachment waits in your browser rather than on the server, and only one can wait per chat. A second is refused with *"One queued message with files at a time — send it after this one"*, and your words stay in the box. (A queued message with files does not survive a browser reload — a text-only one does.)
 
-**@file mentions wait too.** Mentioning a file with `@` counts as an attachment, the same as a Clip: the message waits for the reply to finish and then sends normally. A steer carries text only, so a steered `@file` would hand the agent a bare path with nothing behind it.
+**Five at a time, per reply.** Steered and server-queued messages share one allowance of five per reply. The sixth is refused with *"5 messages are already waiting for this reply (Batshit holds 5). Wait for the reply to finish."* A message the agent has already read frees its slot, so a long tool-heavy reply never locks you out.
 
-**Where steering isn't available.** Group chats interrupt instead, because agents there speak one at a time. So do Codex agents running on the one-shot transport and CLI agents using your own profile rather than Batshit's. In all of those the button says *Interrupt and send* and the tooltip says why.
+**When Batshit says no.** If it refuses without the reply ending — the cap above, an agent DM already waiting, or a moment when it can't reach the server — you get a one-line note saying why. The reply keeps running, nothing is interrupted, and nothing is sent. Your words stay in the box.
 
-**Voice.** A steer doesn't stop the agent talking — the reply is still going. An interrupt stops it, exactly like Stop.
+**Where steering isn't available.** Group chats can't be steered, because agents there speak one at a time. Neither can Codex agents running on the one-shot transport, or CLI agents using your own profile rather than Batshit's. In all of those the Steer button is greyed out, the reason is printed beside it, and **Queue still works** — your message waits and goes when the reply ends.
+
+**Voice.** Neither steering nor queuing stops the agent talking, because the reply is still going. Only Stop does that.
 
 ## The message stream
 

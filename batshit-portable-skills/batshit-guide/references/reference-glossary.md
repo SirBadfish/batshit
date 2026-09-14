@@ -198,10 +198,10 @@ An opt-in, one-way session type where one agent lives in one ongoing conversatio
 
 ### Interrupt
 
-Sending a message while an agent is still replying, so that the reply stops: everything it
-already produced is kept, and your message starts a new turn with a note saying the last one
-was cut short. The **Stop** button is always an interrupt, and a Group chat only ever
-interrupts. The other option, and the default, is **Steer**.
+Stopping a reply that is still running: everything it already produced is kept, and the chat
+is free for a new turn. **Stop** is the only thing that interrupts. "Interrupt and send" used
+to be a way to send while an agent was busy; it was retired, because Stop followed by Enter is
+the same thing said out loud. The two mid-reply choices are **Steer** and **Queue**.
 
 ### Inworld
 
@@ -277,6 +277,15 @@ Structured guidance attached to a Project. Project rules guide agents but are no
 
 ## R
 
+### Queue
+
+Sending a message while an agent is still replying, so it goes **the moment that reply ends**
+as your next message. The other choice beside **Steer**, and the one that works for every
+message, including ones with a file attached. Several queued messages arrive together, in the
+order you sent them. A text-only queued message is held on the server, so it survives closing
+the tab; one carrying files waits in the browser, one per chat at a time. See
+[the chat workspace](../chat/overview.md#steer-or-queue-while-the-agent-is-busy).
+
 ### Risk Level
 
 How much clearance a Fabric control needs. **Safe** runs straight away. **Confirm** and **Restricted** both stop and wait for your **Approve** click; Restricted carries a red badge because it deletes or rolls something back. See [Approving a risky action](../fabric/overview.md#approving-a-risky-action).
@@ -331,9 +340,9 @@ Sending a message while an agent is still replying, so it arrives **inside** tha
 agent's next tool call instead of stopping it. The default for a mid-reply send; the chat shows
 it as a small inset bubble at the spot it arrived. If the reply has no tool call left to catch
 it, Batshit sends it as your next message once the reply ends, so nothing you type is lost.
-The opposite is **Interrupt**. An urgent Agent DM can steer a busy agent the same way, marked
+The other choice is **Queue**. An urgent Agent DM can steer a busy agent the same way, marked
 as coming from another agent rather than from you. See
-[the chat workspace](../chat/overview.md#steer-or-interrupt-while-the-agent-is-busy).
+[the chat workspace](../chat/overview.md#steer-or-queue-while-the-agent-is-busy).
 
 ### Subagent
 

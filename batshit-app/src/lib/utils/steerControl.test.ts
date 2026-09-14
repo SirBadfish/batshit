@@ -7,18 +7,26 @@ import {
   extractSteerPlaceholderIds,
   formatSteerForModel,
   hasSteerPlaceholder,
+  isSteerDeliver,
   isValidSteerId,
   MAX_PENDING_STEERS,
   normalizeGlobalChatSettings,
   otherBusySendMode,
-  resolveEffectiveBusySendMode,
+  resolveBusySendActions,
   readMessageSteers,
   resolveBusySendMode,
+  resolveQueuedSendAfterWait,
   resolveSteerability,
+  resolveStopInterruptionStamp,
   STEER_TEXT_MAX_CHARS,
   STEER_WRAPPER_GUIDANCE_EXAMPLES,
-  WAIT_SEND_SENTENCE,
+  QUEUED_AFTER_REPLY_SENTENCE,
+  QUEUED_WITH_FILES_SENTENCE,
+  QUEUE_ONE_AT_A_TIME_SENTENCE,
   classifySteerRefusal,
+  COMPOSER_BOUND_SEND_METADATA_KEYS,
+  replayableSendMetadata,
+  type BusySendMode,
   type DeliveredSteer
 } from './steerControl'
 
@@ -183,7 +191,9 @@ describe('resolveSteerability (DL-114-09)', () => {
     expect(verdict.steerable).toBe(false)
     if (verdict.steerable) throw new Error('expected a refusal')
     expect(verdict.reason).toContain('exec transport')
-    expect(verdict.reason).toContain('interrupts instead')
+    // F-P1-2: it used to end "Your message interrupts instead". DL-119-07 took that branch
+    // away, so the sentence now says what actually happens.
+    expect(verdict.reason).toContain('queues and sends when the reply ends')
   })
 
   /**
@@ -272,18 +282,30 @@ describe('resolveBusySendMode', () => {
   })
 
   it('reads a stored choice back, both ways', () => {
-    expect(resolveBusySendMode({ global_chat_settings: { busy_send_mode: 'interrupt' } })).toBe(
-      'interrupt'
-    )
+    expect(resolveBusySendMode({ global_chat_settings: { busy_send_mode: 'queue' } })).toBe('queue')
     expect(resolveBusySendMode({ global_chat_settings: { busy_send_mode: 'steer' } })).toBe('steer')
+  })
+
+  /**
+   * SA-119 (DL-119-01) — the migration, and why it is a READ rather than a write.
+   *
+   * "Interrupt and send" is retired as a mode: Stop then Enter is that job now. A record
+   * written before this story still says `interrupt`, and the honest answer for it is the
+   * default — not a refusal, and not a silent write-back, because nothing is stored until
+   * the user saves the panel themselves.
+   */
+  it('reads a stored `interrupt` as steer (DL-119-01)', () => {
+    expect(resolveBusySendMode({ global_chat_settings: { busy_send_mode: 'interrupt' } })).toBe(
+      'steer'
+    )
   })
 
   it('falls back rather than throwing on anything unreadable', () => {
     for (const value of [
-      { global_chat_settings: { busy_send_mode: 'queue' } },
+      { global_chat_settings: { busy_send_mode: 'wait' } },
       { global_chat_settings: { busy_send_mode: 7 } },
-      { global_chat_settings: 'interrupt' },
-      'interrupt',
+      { global_chat_settings: 'queue' },
+      'queue',
       42
     ]) {
       expect(resolveBusySendMode(value)).toBe('steer')
@@ -292,38 +314,45 @@ describe('resolveBusySendMode', () => {
 })
 
 describe('otherBusySendMode', () => {
-  it('is "the other one", not "interrupt"', () => {
-    // Cmd/Ctrl+Enter has to be able to STEER for someone whose default is interrupt, or
-    // the shortcut is dead for exactly the people who changed the setting.
-    expect(otherBusySendMode('steer')).toBe('interrupt')
-    expect(otherBusySendMode('interrupt')).toBe('steer')
+  it('is "the other one" (DL-119-01, DL-119-02)', () => {
+    // Cmd/Ctrl+Enter has to reach whichever mode Enter is not, or the shortcut is dead for
+    // exactly the people who changed the setting.
+    expect(otherBusySendMode('steer')).toBe('queue')
+    expect(otherBusySendMode('queue')).toBe('steer')
   })
 
-  it('offers interrupt as the way out of a held send (DL-118-09)', () => {
-    // Not `steer`: a send that carries files IS a steer that has to wait, so offering to
-    // steer it would be offering what it is already doing. Stopping the reply is the only
-    // other thing the shortcut could honestly mean.
-    expect(otherBusySendMode('wait')).toBe('interrupt')
+  it('has no third word left to answer for (DL-119-07)', () => {
+    // P2 deleted `EffectiveBusySendMode`. Two modes in, two modes out, and the `queue` a
+    // held-for-files send takes is the SAME queue the badge offers — not a third state
+    // with its own opposite, which is how "Send after reply" came to live behind a hover.
+    for (const mode of ['steer', 'queue'] as BusySendMode[]) {
+      expect(otherBusySendMode(otherBusySendMode(mode))).toBe(mode)
+    }
   })
 })
 
 describe('busySendModeLabel', () => {
-  it('uses the product words', () => {
+  it('uses the product words (DL-119-01)', () => {
     expect(busySendModeLabel('steer')).toBe('Steer')
-    expect(busySendModeLabel('interrupt')).toBe('Interrupt and send')
+    expect(busySendModeLabel('queue')).toBe('Queue')
   })
 
-  it('says what a held send will do, not what it wishes it did (DL-118-09)', () => {
-    expect(busySendModeLabel('wait')).toBe('Send after reply')
+  it('names only the two badges the composer draws (DL-119-01, DL-119-03)', () => {
+    // The label is what a badge says. There is no third label because there is no third
+    // badge: a send that carries files is a Queue, said in the queue's own words.
+    const labels = (['steer', 'queue'] as BusySendMode[]).map(busySendModeLabel)
+    expect(labels).toEqual(['Steer', 'Queue'])
+    expect(labels.join(' ')).not.toMatch(/interrupt/i)
   })
 })
 
 describe('normalizeGlobalChatSettings', () => {
-  it('stores one of exactly two words and drops anything else', () => {
-    expect(normalizeGlobalChatSettings({ busy_send_mode: 'interrupt' })).toEqual({
-      busy_send_mode: 'interrupt'
-    })
+  it('stores one of exactly two words and drops anything else (DL-119-01)', () => {
     expect(normalizeGlobalChatSettings({ busy_send_mode: 'queue' })).toEqual({
+      busy_send_mode: 'queue'
+    })
+    // The retired mode normalises rather than sticking around as a third value.
+    expect(normalizeGlobalChatSettings({ busy_send_mode: 'interrupt' })).toEqual({
       busy_send_mode: 'steer'
     })
     expect(normalizeGlobalChatSettings({ busy_send_mode: 'steer', junk: true })).toEqual({
@@ -334,82 +363,209 @@ describe('normalizeGlobalChatSettings', () => {
 })
 
 /**
- * SA-114 P3 (DL-114-01 + DL-114-09) — the setting meets the running reply.
+ * SA-119 (DL-119-02) — THE rule for the two badges beside Stop.
  *
- * One rule, read by the send button's label AND by the branch `handleSendMessage` takes. A
- * button that says "Steer" over a send that interrupts is the exact failure this story
- * exists to remove, so these pin both directions of the meeting.
+ * Every cell of default x steerable x clips x mentions is pinned, because this one function
+ * answers for which badge is filled, what Enter does, what Cmd/Ctrl+Enter does, whether
+ * Steer is even clickable, and the sentence shown beside it when it is not. A table with a
+ * hole in it is how the filled badge would come to promise something the key does not do.
  */
-describe('resolveEffectiveBusySendMode', () => {
-  it('lets a known refusal beat the setting', () => {
-    expect(resolveEffectiveBusySendMode({ mode: 'steer', steerable: false })).toBe('interrupt')
-  })
-
-  it('treats "not told yet" as steerable, because the route is the backstop', () => {
-    expect(resolveEffectiveBusySendMode({ mode: 'steer', steerable: null })).toBe('steer')
-    expect(resolveEffectiveBusySendMode({ mode: 'steer' })).toBe('steer')
-    expect(resolveEffectiveBusySendMode({ mode: 'steer', steerable: true })).toBe('steer')
-  })
-
-  it('never turns an interrupt setting into a steer', () => {
-    for (const steerable of [true, false, null, undefined]) {
-      expect(resolveEffectiveBusySendMode({ mode: 'interrupt', steerable })).toBe('interrupt')
-    }
-  })
+describe('resolveBusySendActions (DL-119-02)', () => {
+  const NOTE_CLIPS = 'Won’t include the file — it stays here.'
+  const NOTE_MENTIONS = 'Mentions can’t steer.'
+  const SERVER_REASON = 'Group chats cannot be steered.'
 
   /**
-   * SA-118 (DL-118-09) — a send that carries files was always held, and always said "Steer".
+   * All sixteen rows, written out rather than generated: a generated table would restate
+   * the rule it is meant to check, and then both could be wrong together.
    */
-  it('says wait when the composer carries files', () => {
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: true, carriesAttachments: true })
-    ).toBe('wait')
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: null, carriesAttachments: true })
-    ).toBe('wait')
+  const rows: Array<{
+    mode: BusySendMode
+    steerable: boolean
+    hasClips: boolean
+    hasMentions: boolean
+    enter: 'steer' | 'queue'
+    other: 'steer' | 'queue'
+    steerEnabled: boolean
+    note: string | null
+  }> = [
+    // --- default steer, reply can be steered ---
+    { mode: 'steer', steerable: true, hasClips: false, hasMentions: false, enter: 'steer', other: 'queue', steerEnabled: true, note: null },
+    { mode: 'steer', steerable: true, hasClips: true, hasMentions: false, enter: 'queue', other: 'steer', steerEnabled: true, note: NOTE_CLIPS },
+    { mode: 'steer', steerable: true, hasClips: false, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: NOTE_MENTIONS },
+    { mode: 'steer', steerable: true, hasClips: true, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: NOTE_MENTIONS },
+    // --- default steer, reply cannot be steered: the server's verdict wins over everything ---
+    { mode: 'steer', steerable: false, hasClips: false, hasMentions: false, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON },
+    { mode: 'steer', steerable: false, hasClips: true, hasMentions: false, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON },
+    { mode: 'steer', steerable: false, hasClips: false, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON },
+    { mode: 'steer', steerable: false, hasClips: true, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON },
+    // --- default queue, reply can be steered ---
+    { mode: 'queue', steerable: true, hasClips: false, hasMentions: false, enter: 'queue', other: 'steer', steerEnabled: true, note: null },
+    { mode: 'queue', steerable: true, hasClips: true, hasMentions: false, enter: 'queue', other: 'steer', steerEnabled: true, note: NOTE_CLIPS },
+    { mode: 'queue', steerable: true, hasClips: false, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: NOTE_MENTIONS },
+    { mode: 'queue', steerable: true, hasClips: true, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: NOTE_MENTIONS },
+    // --- default queue, reply cannot be steered ---
+    { mode: 'queue', steerable: false, hasClips: false, hasMentions: false, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON },
+    { mode: 'queue', steerable: false, hasClips: true, hasMentions: false, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON },
+    { mode: 'queue', steerable: false, hasClips: false, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON },
+    { mode: 'queue', steerable: false, hasClips: true, hasMentions: true, enter: 'queue', other: 'queue', steerEnabled: false, note: SERVER_REASON }
+  ]
+
+  it('has one row per cell of the table', () => {
+    expect(rows).toHaveLength(16)
+    expect(new Set(rows.map((row) => JSON.stringify([row.mode, row.steerable, row.hasClips, row.hasMentions]))).size).toBe(16)
   })
 
-  it('keeps steer when the composer carries nothing', () => {
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: true, carriesAttachments: false })
-    ).toBe('steer')
-  })
-
-  it('lets a refusal and an interrupt setting both beat wait', () => {
-    // The order `+page.svelte` takes: a reply that cannot be steered has no inside to wait
-    // in, so it is an interrupt however full the composer is.
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: false, carriesAttachments: true })
-    ).toBe('interrupt')
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'interrupt', steerable: true, carriesAttachments: true })
-    ).toBe('interrupt')
-  })
-
-  it('is byte-identical to the old rule when nothing is attached (the send path)', () => {
-    // `+page.svelte` never passes `carriesAttachments`. If omitting it ever started
-    // producing `wait`, the page's `=== 'steer'` test would go false and the clips-wait
-    // branch would quietly stop running.
-    for (const steerable of [true, false, null, undefined]) {
-      const withoutFlag = resolveEffectiveBusySendMode({ mode: 'steer', steerable })
-      const explicitlyEmpty = resolveEffectiveBusySendMode({
-        mode: 'steer',
-        steerable,
-        carriesAttachments: false
+  for (const row of rows) {
+    const name = `${row.mode} default, ${row.steerable ? 'steerable' : 'not steerable'}, ${row.hasClips ? 'clips' : 'no clips'}, ${row.hasMentions ? 'mentions' : 'no mentions'}`
+    it(`${name} -> Enter ${row.enter}, other ${row.other}, Steer ${row.steerEnabled ? 'on' : 'off'}`, () => {
+      const actions = resolveBusySendActions({
+        mode: row.mode,
+        steerable: row.steerable,
+        steerReason: SERVER_REASON,
+        hasClips: row.hasClips,
+        hasMentions: row.hasMentions
       })
-      expect(withoutFlag).toBe(explicitlyEmpty)
-      expect(withoutFlag).not.toBe('wait')
+      expect(actions.enter).toBe(row.enter)
+      expect(actions.other).toBe(row.other)
+      expect(actions.steer.enabled).toBe(row.steerEnabled)
+      expect(actions.steer.note).toBe(row.note)
+      // Queue is the one thing that is always available: it is what "nothing you typed is
+      // lost" rests on, and DL-119-05/06 give it a path for every message.
+      expect(actions.queue.enabled).toBe(true)
+    })
+  }
+
+  it('treats "not told yet" as steerable, because the route is the backstop', () => {
+    for (const steerable of [null, undefined]) {
+      const actions = resolveBusySendActions({ mode: 'steer', steerable, hasClips: false, hasMentions: false })
+      expect(actions.enter).toBe('steer')
+      expect(actions.steer.enabled).toBe(true)
+      expect(actions.steer.note).toBeNull()
+    }
+  })
+
+  it('shows the server’s own reason, and a plain one when it sent none', () => {
+    expect(
+      resolveBusySendActions({ mode: 'steer', steerable: false, steerReason: '  Groups cannot be steered.  ', hasClips: false, hasMentions: false }).steer.note
+    ).toBe('Groups cannot be steered.')
+    const noReason = resolveBusySendActions({ mode: 'steer', steerable: false, hasClips: false, hasMentions: false })
+    expect(noReason.steer.note).toBe('This reply can’t take a steer.')
+    expect(noReason.steer.note).not.toContain('interrupt')
+  })
+
+  it('never offers a key that does nothing: `other` is always a mode Enter is not, or queue', () => {
+    for (const row of rows) {
+      if (row.steerEnabled) expect(row.other).not.toBe(row.enter)
+      else expect(row.other).toBe('queue')
     }
   })
 })
 
-describe('WAIT_SEND_SENTENCE (DL-118-09)', () => {
-  it('is the one sentence the bubble and the button both use', () => {
-    expect(WAIT_SEND_SENTENCE).toBe('With files: waits for the reply to finish')
+/**
+ * SA-119 P2 (DL-119-07, F-P1-2) — the words a refused Steer shows the user.
+ *
+ * These four sentences are the server's own "why not", and DL-119-03 puts them on screen as
+ * plain text beside a Steer badge that cannot be pressed. Every one of them used to end
+ * "Your message interrupts instead", which stopped being TRUE the moment interrupt-and-send
+ * was retired: the message now queues and goes when the reply ends. A sentence that
+ * describes a branch the app no longer has is worse than no sentence, because the user acts
+ * on it.
+ */
+describe('the refusal sentences (F-P1-2)', () => {
+  const refusals = [
+    resolveSteerability({ primaryAgentType: 'api', isGroupSession: true }),
+    resolveSteerability({ primaryAgentType: 'cli', isGroupSession: false, cli: null }),
+    resolveSteerability({
+      primaryAgentType: 'cli',
+      isGroupSession: false,
+      cli: { provider: 'codex', configScope: 'user', codexTransport: 'app-server' }
+    }),
+    resolveSteerability({
+      primaryAgentType: 'cli',
+      isGroupSession: false,
+      cli: { provider: 'codex', configScope: 'managed', codexTransport: 'exec' }
+    })
+  ].map((verdict) => {
+    expect(verdict.steerable).toBe(false)
+    return verdict.steerable === false ? verdict.reason : ''
+  })
+
+  it('never promises an interrupt that no longer exists', () => {
+    expect(refusals).toHaveLength(4)
+    for (const reason of refusals) {
+      expect(reason.length).toBeGreaterThan(0)
+      expect(reason).not.toMatch(/interrupt/i)
+    }
+  })
+
+  it('says what WILL happen instead, in the queue’s own words', () => {
+    for (const reason of refusals) {
+      expect(reason.toLowerCase()).toContain('queue')
+    }
+  })
+
+  it('is still four different sentences, one per reason', () => {
+    expect(new Set(refusals).size).toBe(4)
   })
 })
 
-describe('classifySteerRefusal (PR #106 review, F-4)', () => {
+/**
+ * SA-119 P2 (DL-119-05, DL-119-06) — one promise, said in one place.
+ *
+ * Queue has two mechanisms under it: the server holds a text-only message and promotes it
+ * when the reply ends, and the browser holds one that carries files. The USER is told the
+ * same thing either way, and the bubble, the badge and the toast all read these constants
+ * rather than spelling the promise out three times.
+ */
+describe('the queued sentences (DL-119-05, DL-119-06)', () => {
+  it('says when the message will go, not merely that it is waiting', () => {
+    expect(QUEUED_AFTER_REPLY_SENTENCE).toBe('Queued — sends after this reply')
+    expect(QUEUED_WITH_FILES_SENTENCE).toBe('Queued — sends after this reply (with files)')
+  })
+
+  it('names the files case as a variation of the same promise, not a different one', () => {
+    expect(QUEUED_WITH_FILES_SENTENCE.startsWith(QUEUED_AFTER_REPLY_SENTENCE)).toBe(true)
+  })
+
+  it('refuses a second file message honestly, and says what to do (DL-119-06)', () => {
+    expect(QUEUE_ONE_AT_A_TIME_SENTENCE).toBe(
+      'One queued message with files at a time — send it after this one'
+    )
+  })
+
+  it('never uses the retired word', () => {
+    for (const sentence of [
+      QUEUED_AFTER_REPLY_SENTENCE,
+      QUEUED_WITH_FILES_SENTENCE,
+      QUEUE_ONE_AT_A_TIME_SENTENCE
+    ]) {
+      expect(sentence).not.toMatch(/interrupt/i)
+    }
+  })
+})
+
+/**
+ * SA-119 (DL-119-05) — `deliver` is a two-word field, validated in one place.
+ *
+ * The route refuses anything else rather than coercing it: a steer stored with a `deliver`
+ * nobody chose would either land mid-reply when the user asked it to wait, or wait when
+ * they asked it to land — and both look like Batshit ignoring the button they pressed.
+ */
+describe('isSteerDeliver (DL-119-05)', () => {
+  it('accepts exactly the two words', () => {
+    expect(isSteerDeliver('now')).toBe(true)
+    expect(isSteerDeliver('end')).toBe(true)
+  })
+
+  it('rejects everything else, including the near misses', () => {
+    for (const value of ['END', 'Now', 'queue', 'later', '', ' now', null, undefined, 1, {}, ['end']]) {
+      expect(isSteerDeliver(value)).toBe(false)
+    }
+  })
+})
+
+describe('classifySteerRefusal (PR #106 review, F-4; DL-119-07)', () => {
   it('lets only the two escalating refusals escalate', () => {
     expect(classifySteerRefusal(409, { code: 'not_steerable', reason: 'x', refusal: 'reply_finished' })).toBe(
       'already_finished'
@@ -417,12 +573,26 @@ describe('classifySteerRefusal (PR #106 review, F-4)', () => {
     expect(classifySteerRefusal(409, { code: 'not_steerable', reason: 'That reply already finished. Send it.' })).toBe(
       'already_finished'
     )
+    // DL-119-07: a reply that cannot take a steer at all no longer interrupts — the words
+    // queue through the client wait and go the moment the reply ends.
     expect(
       classifySteerRefusal(409, { code: 'not_steerable', reason: 'This agent cannot be steered mid-reply.' })
-    ).toBe('not_steerable')
+    ).toBe('queue')
   })
 
-  it('refuses — never interrupts — for the cap, a waiting DM, a bad request, and a lost server', () => {
+  it('lets the tag win over the sentence', () => {
+    // The tag is the contract and the sentence is for people: a refusal carrying
+    // `reply_finished` is "too late", whatever words came with it.
+    expect(
+      classifySteerRefusal(409, {
+        code: 'not_steerable',
+        refusal: 'reply_finished',
+        reason: 'This agent cannot be steered mid-reply.'
+      })
+    ).toBe('already_finished')
+  })
+
+  it('refuses — never queues — for the cap, a waiting DM, a bad request, and a lost server', () => {
     expect(classifySteerRefusal(409, { code: 'steer_inbox_full', reason: '5 messages are already waiting' })).toBe(
       'refused'
     )
@@ -431,5 +601,241 @@ describe('classifySteerRefusal (PR #106 review, F-4)', () => {
     expect(classifySteerRefusal(401, { error: 'Unauthorized' })).toBe('refused')
     expect(classifySteerRefusal(500, null)).toBe('refused')
     expect(classifySteerRefusal(null, undefined)).toBe('refused')
+  })
+})
+
+/**
+ * SA-119 P2b (F-P2-7) — the interruption note after Stop, then Enter.
+ *
+ * `send-routed` builds the model's `==== INTERRUPTION NOTE ====` from
+ * `metadata.interruption`; DL-119-07 deleted the branch that was its only writer, so
+ * between the packets the model stopped being told that the user cut a reply short. Stop's
+ * record is the only source now, and this is the whole decision about what it becomes.
+ */
+describe('resolveStopInterruptionStamp (SA-119 P2b)', () => {
+  const record = { messageId: 'msg_assistant_1', interruptedAt: '2026-09-13T20:00:00.000Z' }
+
+  it('stamps the send that follows a Stop', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record,
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toEqual({
+      previousMessageId: 'msg_assistant_1',
+      interruptedAt: '2026-09-13T20:00:00.000Z',
+      reason: 'user'
+    })
+  })
+
+  it('says nothing when there was no Stop', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record: null,
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+  })
+
+  it('says nothing when the browser was holding this message (DL-119-06)', () => {
+    // The case the packet row called impossible. A steer and a server-held queue return
+    // before the ordinary send path, but a browser-held queue falls through into it — and
+    // it is waiting for "the reply ends", which is exactly what Stop makes happen. Without
+    // this the model is told the user cut short a reply the user chose to wait behind.
+    expect(
+      resolveStopInterruptionStamp({
+        record,
+        browserQueued: true,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+  })
+
+  it('says nothing once another turn has landed on top of the stopped one', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record,
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_2'
+      })
+    ).toBeNull()
+  })
+
+  it('says nothing when the chat has no assistant message to name', () => {
+    for (const latest of [null, undefined, '', '   ']) {
+      expect(
+        resolveStopInterruptionStamp({
+          record,
+          browserQueued: false,
+          latestAssistantMessageId: latest
+        })
+      ).toBeNull()
+    }
+  })
+
+  it('refuses a half-written record rather than completing it', () => {
+    // A fabricated timestamp would be a silent fallback inside a note whose entire job is
+    // to be true about one specific message.
+    expect(
+      resolveStopInterruptionStamp({
+        record: { messageId: 'msg_assistant_1', interruptedAt: '' },
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+    expect(
+      resolveStopInterruptionStamp({
+        record: { messageId: '  ', interruptedAt: '2026-09-13T20:00:00.000Z' },
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+  })
+
+  it('matches the ids it was given, whitespace and all', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record: { messageId: ' msg_assistant_1 ', interruptedAt: ' 2026-09-13T20:00:00.000Z ' },
+        browserQueued: false,
+        latestAssistantMessageId: ' msg_assistant_1 '
+      })
+    ).toEqual({
+      previousMessageId: 'msg_assistant_1',
+      interruptedAt: '2026-09-13T20:00:00.000Z',
+      reason: 'user'
+    })
+  })
+})
+
+/**
+ * SA-119 P3 (AMD-119-04) — Stop stops everything.
+ *
+ * Josh's decision, 2026-09-13. A browser-held queued message waits for the reply to END,
+ * and a Stop is one of the ways a reply ends — so before this rule the page read
+ * `replyEnded` and sent, while `settleSteerBubblesForMessage` had already drawn the
+ * receipt. The user was shown *Not sent — you stopped the reply* about a message that then
+ * sent, and a SERVER-held queued message in the same situation really was dropped.
+ */
+describe('resolveQueuedSendAfterWait (SA-119 P3)', () => {
+  it('sends when the reply simply ended', () => {
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: false, replyEnded: true })).toBe('send')
+  })
+
+  it('keeps the words when the ceiling was hit and the reply is still going (F-P2-1)', () => {
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: false, replyEnded: false })).toBe(
+      'still-running'
+    )
+  })
+
+  it('drops the message when the user stopped the reply', () => {
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: true, replyEnded: false })).toBe(
+      'dropped-by-stop'
+    )
+  })
+
+  it('reads the Stop FIRST, because a Stop also makes the reply end', () => {
+    // The whole rule is this row. A Stop sets `replyEnded` as surely as a finished answer
+    // does, so an implementation that tested `replyEnded` first would send every stopped
+    // message — which is exactly what the page did before AMD-119-04.
+    expect(resolveQueuedSendAfterWait({ stoppedDuringWait: true, replyEnded: true })).toBe(
+      'dropped-by-stop'
+    )
+  })
+
+  it('answers one of exactly three things, and never anything else', () => {
+    const seen = new Set<string>()
+    for (const stoppedDuringWait of [true, false]) {
+      for (const replyEnded of [true, false]) {
+        seen.add(resolveQueuedSendAfterWait({ stoppedDuringWait, replyEnded }))
+      }
+    }
+    expect([...seen].sort()).toEqual(['dropped-by-stop', 'send', 'still-running'])
+  })
+})
+
+/**
+ * SA-119 P3b review (Faye, F-P3b-2) — what a receipt's Send now may replay.
+ *
+ * P3b kept the composer's whole metadata object beside the bubble and replayed it. That
+ * object carries the composer's OWN closures: `onAccepted` clears the box and unclips every
+ * one-time clip in it, `onQueuedForLater` clears the box — both over the composer's LIVE
+ * state, minutes after the message was written. A replay accepted while the user was typing
+ * their next message wiped it: the loss Josh rejected a composer refill for.
+ */
+describe('replayableSendMetadata (SA-119 P3b review, F-P3b-2)', () => {
+  const onAccepted = () => {}
+  const onQueuedForLater = () => {}
+  const onReplayAccepted = () => {}
+  const composerMetadata = {
+    stt: false,
+    tts: true,
+    voiceMode: 'voice',
+    realtime: false,
+    composerSessionId: 'session_1',
+    fileReferences: [{ path: 'notes/a.txt' }],
+    clipIds: ['clip_1'],
+    onAccepted,
+    onQueuedForLater,
+    onReplayAccepted,
+    busySendModeOverride: 'queue'
+  }
+
+  it('drops every closure and choice that belonged to the composer', () => {
+    const replay = replayableSendMetadata(composerMetadata)
+    // `onAccepted` survives as a KEY only because the replay-safe callback took its place.
+    expect(replay.onAccepted).not.toBe(onAccepted)
+    expect('onQueuedForLater' in replay).toBe(false)
+    expect('busySendModeOverride' in replay).toBe(false)
+    expect('onReplayAccepted' in replay).toBe(false)
+    // With no replay-safe callback offered, every composer-bound key is gone outright.
+    const { onReplayAccepted: _omit, ...withoutReplay } = composerMetadata
+    const bare = replayableSendMetadata(withoutReplay)
+    for (const key of COMPOSER_BOUND_SEND_METADATA_KEYS) expect(key in bare).toBe(false)
+    expect(COMPOSER_BOUND_SEND_METADATA_KEYS).toEqual([
+      'onAccepted',
+      'onQueuedForLater',
+      'busySendModeOverride'
+    ])
+  })
+
+  it('keeps the facts of the send itself — the file travels', () => {
+    const replay = replayableSendMetadata(composerMetadata)
+    expect(replay.clipIds).toEqual(['clip_1'])
+    expect(replay.fileReferences).toEqual([{ path: 'notes/a.txt' }])
+    expect(replay.composerSessionId).toBe('session_1')
+    expect(replay.tts).toBe(true)
+    expect(replay.voiceMode).toBe('voice')
+  })
+
+  it('lets the replay-safe callback answer the acceptance, under the name the page calls', () => {
+    const replay = replayableSendMetadata(composerMetadata)
+    expect(replay.onAccepted).toBe(onReplayAccepted)
+    expect(replay.onAccepted).not.toBe(onAccepted)
+  })
+
+  it("offers no acceptance callback when the composer gave no replay-safe one — never the composer's own", () => {
+    const { onReplayAccepted: _omit, ...withoutReplay } = composerMetadata
+    expect('onAccepted' in replayableSendMetadata(withoutReplay)).toBe(false)
+    // A non-function in that slot is not promoted either.
+    expect('onAccepted' in replayableSendMetadata({ ...withoutReplay, onReplayAccepted: true })).toBe(
+      false
+    )
+  })
+
+  it('answers a new object and leaves the input alone', () => {
+    const input = { ...composerMetadata }
+    const replay = replayableSendMetadata(input)
+    expect(replay).not.toBe(input)
+    expect(input.onAccepted).toBe(onAccepted)
+    expect(input.onQueuedForLater).toBe(onQueuedForLater)
+    expect(input.onReplayAccepted).toBe(onReplayAccepted)
+    expect(input.busySendModeOverride).toBe('queue')
+  })
+
+  it('answers an empty object for nothing', () => {
+    expect(replayableSendMetadata(null)).toEqual({})
+    expect(replayableSendMetadata(undefined)).toEqual({})
   })
 })

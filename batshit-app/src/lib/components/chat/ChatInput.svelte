@@ -103,11 +103,10 @@
   import { detectDesktopShortcutPlatform } from '$lib/goons/desktopShortcut'
   import {
     busySendModeLabel,
-    otherBusySendMode,
-    resolveEffectiveBusySendMode,
-    WAIT_SEND_SENTENCE,
+    resolveBusySendActions,
     type BusySendMode
   } from '$lib/utils/steerControl'
+  import * as Tooltip from '$lib/components/ui/tooltip'
   
   type BatshitSlashExpandResult = {
     text: string
@@ -195,70 +194,82 @@
   const sendDisabled = $derived(disabled || !message.trim() || finalizingDictation)
 
   /**
-   * SA-114 P3 (DL-114-01, DL-114-09) — the send button while the agent is replying.
+   * SA-119 P2 (DL-119-02, DL-119-03) — the composer while the agent is replying.
    *
-   * The effective mode is the user's default UNLESS this reply cannot carry a steer, in
-   * which case the button says *Interrupt and send* and the tooltip says why. The route is
-   * still the backstop, so the label is allowed to be optimistic for the fraction of a
-   * second before `start` lands — but it must never promise "Steer" for a lane the server
-   * has already told us cannot.
+   * SA-118's F-25 put a third send state behind a hover tooltip, and Josh's finding
+   * (2026-09-13) was that people press Enter and nobody hovers — and that the tooltip was
+   * the browser's own plain one, not the app's. So the choice is two visible badges beside
+   * Stop, and ONE rule answers for both of them and for both keys:
+   * `resolveBusySendActions`. Nothing here decides anything itself.
    */
   const shortcutModifierLabel = detectDesktopShortcutPlatform() === 'darwin' ? 'Cmd' : 'Ctrl'
   /**
-   * SA-118 (DL-118-09) — the two things that make `+page.svelte` hold a send back.
+   * SA-118 (DL-118-09), split in two for DL-119-02.
    *
-   * The same two inputs the send path reads, read the same way: the composer's clips, and
-   * the `@file` mentions that become `metadata.fileReferences`. `validateMentions` is
-   * called with `activeMentionExclusions`, which is what `sendMessageWithText` passes — not
-   * the narrower list the highlighter uses — so the button and the send cannot disagree
-   * about whether a mention counts. `mapMentionsToFileReferences` is the same filter, so a
-   * mention that is missing, excluded or otherwise carries nothing does not make the button
-   * lie the other way.
+   * The rule needs clips and `@file` mentions APART, because they are not the same case: a
+   * clip can stay in the composer while the words steer (DL-119-04), and a mention cannot —
+   * the path is inline in the text being sent, and it travels as `metadata.fileReferences`,
+   * which the steer route cannot carry (PR #106 review F-23).
+   *
+   * `validateMentions` is called with `activeMentionExclusions`, which is what
+   * `sendMessageWithText` passes — not the narrower list the highlighter uses — so the
+   * badges and the send cannot disagree about whether a mention counts.
    */
-  const composerCarriesAttachments = $derived.by(() => {
-    if (composerClippedItems.length > 0) return true
-    return (
-      mapMentionsToFileReferences(
-        validateMentions(message, flatFiles, activeMentionExclusions)
-      ).length > 0
-    )
-  })
-  const busyEffectiveSendMode = $derived(
-    resolveEffectiveBusySendMode({
+  const composerHasClips = $derived.by(() => composerClippedItems.length > 0)
+  const composerHasMentions = $derived.by(
+    () =>
+      mapMentionsToFileReferences(validateMentions(message, flatFiles, activeMentionExclusions))
+        .length > 0
+  )
+  /** F-25's claim, kept: the button and the send read the SAME two facts. */
+  const composerCarriesAttachments = $derived(composerHasClips || composerHasMentions)
+  const busySendActions = $derived(
+    resolveBusySendActions({
       mode: busySendMode,
       steerable,
-      carriesAttachments: composerCarriesAttachments
+      steerReason,
+      hasClips: composerHasClips,
+      hasMentions: composerHasMentions
     })
   )
   const composerBusy = $derived(workBusy || waitingForAI)
+  /** DL-119-03: the send icon does what Enter does, and says so. */
   const sendButtonLabel = $derived(
     finalizingDictation
       ? 'Finalizing dictation'
       : composerBusy
-        ? busySendModeLabel(busyEffectiveSendMode)
+        ? busySendModeLabel(busySendActions.enter)
         : 'Send message'
+  )
+  /**
+   * DL-119-02/03 — one sentence per mode, plus the other key only when it does something.
+   *
+   * With Steer unavailable both keys queue (`enter === other`), so the shortcut line is
+   * dropped rather than advertising a key that changes nothing — measured on a group chat,
+   * where the old tooltip offered "Cmd+Enter sends as steer" beside its own sentence
+   * explaining that groups cannot be steered.
+   */
+  const busySendShortcutHint = $derived(
+    busySendActions.other === busySendActions.enter
+      ? ''
+      : ` ${shortcutModifierLabel}+Enter ${busySendModeLabel(busySendActions.other).toLowerCase()}s instead.`
   )
   const sendButtonTooltip = $derived.by(() => {
     if (finalizingDictation) return 'Finalizing dictation...'
     if (!composerBusy) return 'Send message'
-    // The shortcut is only mentioned when the other mode is actually available. A reply
-    // that cannot be steered would otherwise be advertising a key that does nothing —
-    // measured on a group chat, where the tooltip offered "Cmd+Enter sends as steer"
-    // beside its own sentence explaining that groups cannot be steered.
-    const shortcutHint = steerable
-      ? ` ${shortcutModifierLabel}+Enter sends as ${busySendModeLabel(otherBusySendMode(busyEffectiveSendMode)).toLowerCase()} instead.`
-      : ''
-    if (busyEffectiveSendMode === 'steer') {
-      return `Steer: your message waits for the agent's next tool call, then lands inside this reply.${shortcutHint}`
+    if (busySendActions.enter === 'steer') {
+      return `Steer: your message waits for the agent's next tool call, then lands inside this reply.${busySendShortcutHint}`
     }
-    // DL-118-09: the sentence comes from `steerControl`, which is also where the bubble
-    // this same click draws gets it. One behaviour, one promise, said in one place.
-    if (busyEffectiveSendMode === 'wait') {
-      return `Send after reply. ${WAIT_SEND_SENTENCE}, then sends as an ordinary message.${shortcutHint}`
-    }
-    const why = steerable ? '' : ` ${(steerReason ?? '').trim()}`.trimEnd()
-    return `Interrupt and send: this reply stops and your message starts a new turn.${why}${shortcutHint}`
+    const why = busySendActions.steer.note ? ` ${busySendActions.steer.note}` : ''
+    return `Queue: your message is held and sent the moment this reply ends.${why}${busySendShortcutHint}`
   })
+  /** The Steer badge's own sentence. It is never the only place a disabled reason is shown. */
+  const steerBadgeTooltip = $derived(
+    busySendActions.steer.enabled
+      ? `Steer: your message waits for the agent's next tool call, then lands inside this reply.${busySendActions.steer.note ? ` ${busySendActions.steer.note}` : ''}`
+      : (busySendActions.steer.note ?? 'This reply can’t take a steer.')
+  )
+  const queueBadgeTooltip = 'Queue: your message is held and sent the moment this reply ends.'
   let interimTranscript = $state('')
   let dictationPromise: Promise<void> | null = null
   let dictationBaseMessage = ''
@@ -2167,12 +2178,33 @@ $effect(() => {
       )
     }
     
+    /**
+     * SA-119 P2 (DL-119-04) — a Steer sends the WORDS, and the file stays in the box.
+     *
+     * Josh's rule is that nothing typed or attached is ever thrown away. The steer route
+     * cannot carry a clip (it takes `{sessionId, messageId, steerId, text, deliver}` and
+     * nothing else), so a Steer with a clip attached has two honest options: refuse, or
+     * send the words now and leave the clip where it is for the next send. DL-119-04 picks
+     * the second, and that means this send must carry NO clip at all — not the syntax
+     * appended to the text, and not the ids in the metadata. Appending the syntax anyway
+     * would hand the model a reference to a clip the server was never given, and then send
+     * the same clip again with the next message.
+     *
+     * Enter never reaches here with a clip (DL-119-02 makes Enter queue whenever the box
+     * carries a file), so this is the Steer badge and Cmd/Ctrl+Enter.
+     */
+    const steeringKeepsClips = overrides?.busySendModeOverride === 'steer'
+
     // Get the clips that are being sent with this message
-    const clippedItems = clipsManager?.getClippedItems ? clipsManager.getClippedItems() : []
-    
+    const clippedItems = steeringKeepsClips
+      ? []
+      : clipsManager?.getClippedItems
+        ? clipsManager.getClippedItems()
+        : []
+
     // TEMPORARY: Still embed clips during transition period
     // Once backend is fully migrated, we can remove this
-    if (clipsManager?.getClippedItemsSyntax) {
+    if (!steeringKeepsClips && clipsManager?.getClippedItemsSyntax) {
       const clipsSyntax = clipsManager.getClippedItemsSyntax()
       if (clipsSyntax) {
         finalMessage = `${finalMessage}\n\n${clipsSyntax}`
@@ -2208,7 +2240,10 @@ $effect(() => {
       if (acceptedHandled) return
       acceptedHandled = true
 
-      if (clipsManager?.handleMessageAccepted) {
+      // DL-119-04: the text-only reset. `resetComposer` has only ever cleared the TEXT —
+      // the clips are cleared here, by telling the clips manager the message was accepted —
+      // so "keep the clips" is this call being skipped, and nothing else.
+      if (!steeringKeepsClips && clipsManager?.handleMessageAccepted) {
         await clipsManager.handleMessageAccepted({ waitForServer })
       }
 
@@ -2217,6 +2252,9 @@ $effect(() => {
 
     const composerSessionId =
       resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
+    const sentClipIds = clippedItems
+      .map((clip: { id?: string }) => clip.id)
+      .filter((id: string | undefined): id is string => Boolean(id))
     const metadata: Record<string, any> = {
       stt: Boolean(messageIncludesStt),
       tts: Boolean(shouldSpeak),
@@ -2224,8 +2262,37 @@ $effect(() => {
       realtime: false,
       composerSessionId: composerSessionId ?? undefined,
       fileReferences: fileReferences.length ? fileReferences : undefined,
-      clipIds: clippedItems.map((clip: { id?: string }) => clip.id).filter(Boolean),
+      clipIds: sentClipIds,
       onAccepted: () => handleAccepted(false),
+      /**
+       * SA-119 review F-P3b-2 — the one callback a receipt's **Send now** may replay.
+       *
+       * `onAccepted` above closes over the composer's LIVE state: it clears the text and
+       * unclips whatever one-time clips are attached when it runs. A replay minutes later
+       * must do neither to a box the user has typed into since. This closes over THIS
+       * message's clip ids and nothing else, so the one-time clip it carried is released
+       * when it finally goes and a clip attached since is left alone.
+       * `replayableSendMetadata` swaps it in for `onAccepted` on the replay and drops it
+       * everywhere else; the page never calls it by this name.
+       */
+      onReplayAccepted: () =>
+        clipsManager?.handleMessageAccepted?.({ waitForServer: false, clipIds: sentClipIds }),
+      /**
+       * AMD-119-05 — a browser-held queued message leaves the box the moment it is queued,
+       * the way a steer and a server-held one already do, and the bubble holds the words
+       * from then on.
+       *
+       * `resetComposer()` and NOT `handleAccepted`: the clips must stay exactly as they
+       * are. `clipsManager.handleMessageAccepted` unclips ONE-TIME clips, and a queued
+       * message has not been sent yet — its one-time clip still has to be attached when it
+       * finally goes, and has to survive a Stop that drops it.
+       *
+       * Nothing puts the words BACK. Josh, 2026-09-13: refilling the composer could erase
+       * paragraphs the user typed while waiting. The dropped bubble carries **Send now**
+       * and **Dismiss** instead, so the words are one click away without ever touching
+       * what is in the box.
+       */
+      onQueuedForLater: () => resetComposer(),
       // SA-114 P3 (DL-114-01): present only when Cmd/Ctrl+Enter asked for the other mode.
       busySendModeOverride: overrides?.busySendModeOverride
     }
@@ -2451,15 +2518,13 @@ $effect(() => {
 
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      // SA-114 P3 (DL-114-01): Cmd/Ctrl+Enter sends with the OTHER mode, for this message
-      // only. Enter keeps its meaning, which is the point: the shortcut is the escape
-      // hatch, not a second default. It is "the other mode" rather than "interrupt"
-      // because someone who set the default to interrupt still needs a way to steer once.
-      const oneOffMode =
-        (e.metaKey || e.ctrlKey) && composerBusy
-          ? otherBusySendMode(busyEffectiveSendMode)
-          : null
-      handleSend(oneOffMode)
+      // SA-119 P2 (DL-119-02): while the agent is busy BOTH keys answer from the same rule
+      // the badges draw themselves from — Enter does `enter`, Cmd/Ctrl+Enter does `other`.
+      // The mode is passed EXPLICITLY rather than left for the page to re-derive, because
+      // the composer is the only place that knows what is in the box; the page recomputes
+      // the same answer from the metadata only when no key gave it one (a voice send).
+      const busyMode = (e.metaKey || e.ctrlKey) ? busySendActions.other : busySendActions.enter
+      handleSend(composerBusy ? busyMode : null)
     }
   }
 
@@ -3497,20 +3562,90 @@ $effect(() => {
       onToggleUseOnce={toggleComposerClipUseOnce}
     />
 
+    <!--
+      SA-119 P2 (DL-119-03) — the two choices, visible, beside Stop.
+
+      Stop is unchanged in place, icon and behaviour; the badges sit to its LEFT in the same
+      float, so the cluster reads left to right as "what your words do" then "stop the
+      reply". The one Enter will do is filled and the other is an outline, because the
+      question the user is actually asking is "what does Enter do right now" — and a hover
+      could not answer it (SA-118 F-25). A disabled Steer prints its reason as plain text
+      beside the pair, never only in the tooltip.
+    -->
     {#if workBusy}
-      <button
-        type="button"
-        onclick={handleStopWorkClick}
-        disabled={disabled || stoppingWork}
-        class="chat-stop-work-float"
-        aria-label="Stop current run"
-        title="Stop current run"
-        data-testid="stop-current-run-button"
-        data-ab-control="stop-current-run"
-      >
-        <span class="chat-sr-only">Stop current run</span>
-        <Square class="chat-stop-work-icon" />
-      </button>
+      <div class="chat-busy-send-float" data-testid="busy-send-cluster">
+        <Tooltip.Provider delayDuration={250} skipDelayDuration={0}>
+          <div class="chat-busy-send-badges">
+            <Tooltip.Root>
+              <Tooltip.Trigger>
+                {#snippet child({ props })}
+                  <button
+                    {...props}
+                    type="button"
+                    onclick={() => handleSend('steer')}
+                    disabled={disabled || sendDisabled || !busySendActions.steer.enabled}
+                    class="bs-badge chat-busy-send-badge"
+                    class:is-default={busySendActions.enter === 'steer'}
+                    aria-label={steerBadgeTooltip}
+                    data-testid="busy-send-steer-badge"
+                    data-ab-control="busy-send-steer"
+                    data-busy-send-default={busySendActions.enter === 'steer' ? 'true' : 'false'}
+                  >
+                    Steer
+                  </button>
+                {/snippet}
+              </Tooltip.Trigger>
+              <Tooltip.Content>
+                <p>{steerBadgeTooltip}</p>
+              </Tooltip.Content>
+            </Tooltip.Root>
+
+            <Tooltip.Root>
+              <Tooltip.Trigger>
+                {#snippet child({ props })}
+                  <button
+                    {...props}
+                    type="button"
+                    onclick={() => handleSend('queue')}
+                    disabled={disabled || sendDisabled}
+                    class="bs-badge chat-busy-send-badge"
+                    class:is-default={busySendActions.enter === 'queue'}
+                    aria-label={queueBadgeTooltip}
+                    data-testid="busy-send-queue-badge"
+                    data-ab-control="busy-send-queue"
+                    data-busy-send-default={busySendActions.enter === 'queue' ? 'true' : 'false'}
+                  >
+                    Queue
+                  </button>
+                {/snippet}
+              </Tooltip.Trigger>
+              <Tooltip.Content>
+                <p>{queueBadgeTooltip}</p>
+              </Tooltip.Content>
+            </Tooltip.Root>
+          </div>
+        </Tooltip.Provider>
+
+        <button
+          type="button"
+          onclick={handleStopWorkClick}
+          disabled={disabled || stoppingWork}
+          class="chat-stop-work-float"
+          aria-label="Stop current run"
+          title="Stop current run"
+          data-testid="stop-current-run-button"
+          data-ab-control="stop-current-run"
+        >
+          <span class="chat-sr-only">Stop current run</span>
+          <Square class="chat-stop-work-icon" />
+        </button>
+      </div>
+
+      {#if busySendActions.steer.note}
+        <p class="chat-busy-send-note" data-testid="busy-send-note">
+          {busySendActions.steer.note}
+        </p>
+      {/if}
     {/if}
 
     {#if voiceModeSessionPillActive}
@@ -3786,24 +3921,41 @@ $effect(() => {
           {/if}
         </Button>
         
-        <Button
-          onclick={() => handleSend()}
-          disabled={sendDisabled}
-          size="icon"
-          class="chat-input-icon-lg"
-          aria-label={sendButtonLabel}
-          title={sendButtonTooltip}
-          data-testid="send-button"
-          data-busy-send-mode={composerBusy ? busyEffectiveSendMode : undefined}
-          data-ab-control="send-message"
-        >
-          <span class="chat-sr-only">Send message</span>
-          {#if finalizingDictation}
-            <Loader2 class="chat-input-action-icon animate-spin" />
-          {:else}
-            <Send class="chat-input-action-icon" />
-          {/if}
-        </Button>
+        <!--
+          DL-119-03: the send icon stays and does what Enter does. Its hover text is the
+          app's Tooltip, not the browser's `title` — the browser's plain one was half of
+          Josh's original finding, because it looks like nothing else in Batshit and it
+          cannot be styled, delayed, or read on a touch screen.
+        -->
+        <Tooltip.Provider delayDuration={250} skipDelayDuration={0}>
+          <Tooltip.Root>
+            <Tooltip.Trigger>
+              {#snippet child({ props })}
+                <Button
+                  {...props}
+                  onclick={() => handleSend(composerBusy ? busySendActions.enter : null)}
+                  disabled={sendDisabled}
+                  size="icon"
+                  class="chat-input-icon-lg"
+                  aria-label={sendButtonLabel}
+                  data-testid="send-button"
+                  data-busy-send-mode={composerBusy ? busySendActions.enter : undefined}
+                  data-ab-control="send-message"
+                >
+                  <span class="chat-sr-only">{sendButtonLabel}</span>
+                  {#if finalizingDictation}
+                    <Loader2 class="chat-input-action-icon animate-spin" />
+                  {:else}
+                    <Send class="chat-input-action-icon" />
+                  {/if}
+                </Button>
+              {/snippet}
+            </Tooltip.Trigger>
+            <Tooltip.Content>
+              <p>{sendButtonTooltip}</p>
+            </Tooltip.Content>
+          </Tooltip.Root>
+        </Tooltip.Provider>
       </div>
     </div>
   </div>
@@ -3983,11 +4135,92 @@ $effect(() => {
     justify-content: center;
   }
 
-  .chat-stop-work-float {
+  /*
+   * SA-119 P2 (DL-119-03) — the busy cluster.
+   *
+   * Stop kept its exact float (`right: 0.55rem; bottom: 3.15rem`); the cluster took the
+   * position over so the two badges could sit beside it without either moving. Stop itself
+   * is unchanged in size, colour and behaviour — only its `position` moved from the button
+   * to its parent, because two absolutely-positioned siblings would stack on each other.
+   */
+  .chat-busy-send-float {
     position: absolute;
     right: 0.55rem;
     bottom: 3.15rem;
     z-index: 8;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .chat-busy-send-badges {
+    /* The documented override hook on `.bs-badge`: 24px so a text badge stays a real tap
+     * target beside a 2.15rem button, without inventing a second badge size. */
+    --bs-badge-height: 1.5rem;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+
+  .chat-busy-send-badge {
+    border-color: var(--bs-app-field-line);
+    background: var(--bs-app-field);
+    color: var(--bs-app-muted-text);
+    cursor: pointer;
+  }
+
+  .chat-busy-send-badge:hover:not(:disabled) {
+    border-color: var(--bs-app-field-line-hover);
+    background: var(--bs-app-field-hover);
+    color: var(--bs-app-title);
+  }
+
+  /* Filled = the one plain Enter will do. Outline = the one Cmd/Ctrl+Enter will do. */
+  .chat-busy-send-badge.is-default {
+    border-color: var(--bs-app-primary-line);
+    background: var(--bs-app-primary);
+    color: var(--bs-app-primary-foreground);
+  }
+
+  .chat-busy-send-badge.is-default:hover:not(:disabled) {
+    border-color: var(--bs-app-primary-line);
+    background: color-mix(in oklab, var(--bs-app-primary) 82%, var(--bs-app-title));
+    color: var(--bs-app-primary-foreground);
+  }
+
+  .chat-busy-send-badge:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  .chat-busy-send-badge:disabled {
+    border-color: var(--bs-app-line);
+    background: transparent;
+    color: var(--bs-app-faint-text);
+    cursor: not-allowed;
+  }
+
+  /*
+   * DL-119-03: the reason a badge is greyed out is PLAIN TEXT, not only a tooltip. The
+   * whole story exists because a state behind a hover is a state nobody reads.
+   */
+  .chat-busy-send-note {
+    position: absolute;
+    right: 0.55rem;
+    bottom: 5.35rem;
+    z-index: 8;
+    max-width: min(22rem, calc(100% - 1.1rem));
+    margin: 0;
+    border-radius: 6px;
+    background: var(--bs-app-inset-surface);
+    padding: 0.1rem 0.4rem;
+    color: var(--bs-app-muted-text);
+    font-size: 0.6875rem;
+    line-height: 1.35;
+    text-align: right;
+  }
+
+  .chat-stop-work-float {
     display: inline-flex;
     width: 2.15rem;
     height: 2.15rem;
