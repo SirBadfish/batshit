@@ -631,13 +631,20 @@
               <p>
                 Steer means your message waits for the agent to finish the tool it is running,
                 then lands inside the same reply, so the agent reads it and adjusts without
-                losing its place. Interrupt is the older behaviour: the reply stops, the work so
-                far is kept, and your message starts a new turn.
+                losing its place. Queue means it is held and sent the moment the reply ends, as
+                the next thing you say. Several queued messages go together, in the order you
+                sent them.
               </p>
               <p>
-                The Stop button is always an interrupt, and Cmd/Ctrl+Enter sends the other way
-                for one message. Messages with files attached are never steered: they wait for
-                the reply to finish and then send normally.
+                While the agent is busy the chat box shows both as buttons beside Stop. Enter
+                does whichever one you pick here, and Cmd/Ctrl+Enter does the other one for a
+                single message. Stop always stops the reply; to stop and send, press Stop, then
+                Enter.
+              </p>
+              <p>
+                A message with a file attached always queues, because a file cannot be handed
+                to an agent in the middle of a reply. Steer sends the words straight away and
+                leaves the file in the box for your next message, so nothing is thrown away.
               </p>
             </SettingsInfoMenu>
           </div>
@@ -670,8 +677,13 @@
                     <Select.Item value="steer" label="Steer (default)">
                       Steer (default)
                     </Select.Item>
-                    <Select.Item value="interrupt" label="Interrupt and send">
-                      Interrupt and send
+                    <!--
+                      F-P1-5: this offered "Interrupt and send" until SA-119 P2. The route
+                      normalised the choice to Steer on save (DL-119-01), so the panel looked
+                      like it had kept a choice it had not.
+                    -->
+                    <Select.Item value="queue" label="Queue">
+                      Queue
                     </Select.Item>
                   </Select.Content>
                 </Select.Root>

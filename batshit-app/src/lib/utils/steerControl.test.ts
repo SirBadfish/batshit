@@ -13,13 +13,14 @@ import {
   normalizeGlobalChatSettings,
   otherBusySendMode,
   resolveBusySendActions,
-  resolveEffectiveBusySendMode,
   readMessageSteers,
   resolveBusySendMode,
   resolveSteerability,
   STEER_TEXT_MAX_CHARS,
   STEER_WRAPPER_GUIDANCE_EXAMPLES,
-  WAIT_SEND_SENTENCE,
+  QUEUED_AFTER_REPLY_SENTENCE,
+  QUEUED_WITH_FILES_SENTENCE,
+  QUEUE_ONE_AT_A_TIME_SENTENCE,
   classifySteerRefusal,
   type BusySendMode,
   type DeliveredSteer
@@ -186,7 +187,9 @@ describe('resolveSteerability (DL-114-09)', () => {
     expect(verdict.steerable).toBe(false)
     if (verdict.steerable) throw new Error('expected a refusal')
     expect(verdict.reason).toContain('exec transport')
-    expect(verdict.reason).toContain('interrupts instead')
+    // F-P1-2: it used to end "Your message interrupts instead". DL-119-07 took that branch
+    // away, so the sentence now says what actually happens.
+    expect(verdict.reason).toContain('queues and sends when the reply ends')
   })
 
   /**
@@ -314,11 +317,13 @@ describe('otherBusySendMode', () => {
     expect(otherBusySendMode('queue')).toBe('steer')
   })
 
-  it('offers steer as the other way out of a held send (legacy `wait`)', () => {
-    // `wait` is the old word for "queue, held in the browser because this send carries
-    // files" (DL-119-06). The other key then offers to steer — which now keeps the file in
-    // the composer instead of throwing it away (DL-119-04).
-    expect(otherBusySendMode('wait')).toBe('steer')
+  it('has no third word left to answer for (DL-119-07)', () => {
+    // P2 deleted `EffectiveBusySendMode`. Two modes in, two modes out, and the `queue` a
+    // held-for-files send takes is the SAME queue the badge offers — not a third state
+    // with its own opposite, which is how "Send after reply" came to live behind a hover.
+    for (const mode of ['steer', 'queue'] as BusySendMode[]) {
+      expect(otherBusySendMode(otherBusySendMode(mode))).toBe(mode)
+    }
   })
 })
 
@@ -328,8 +333,12 @@ describe('busySendModeLabel', () => {
     expect(busySendModeLabel('queue')).toBe('Queue')
   })
 
-  it('says what a held send will do, not what it wishes it did (DL-118-09)', () => {
-    expect(busySendModeLabel('wait')).toBe('Send after reply')
+  it('names only the two badges the composer draws (DL-119-01, DL-119-03)', () => {
+    // The label is what a badge says. There is no third label because there is no third
+    // badge: a send that carries files is a Queue, said in the queue's own words.
+    const labels = (['steer', 'queue'] as BusySendMode[]).map(busySendModeLabel)
+    expect(labels).toEqual(['Steer', 'Queue'])
+    expect(labels.join(' ')).not.toMatch(/interrupt/i)
   })
 })
 
@@ -450,84 +459,85 @@ describe('resolveBusySendActions (DL-119-02)', () => {
 })
 
 /**
- * SA-114 P3 (DL-114-01 + DL-114-09), superseded by DL-119-02.
+ * SA-119 P2 (DL-119-07, F-P1-2) — the words a refused Steer shows the user.
  *
- * This is now a thin derivation of `resolveBusySendActions` kept only so the composer and
- * the page keep compiling between P1 and P2; P2 deletes it with its callers. `interrupt` is
- * gone from it (DL-119-07) — a refusal now queues.
+ * These four sentences are the server's own "why not", and DL-119-03 puts them on screen as
+ * plain text beside a Steer badge that cannot be pressed. Every one of them used to end
+ * "Your message interrupts instead", which stopped being TRUE the moment interrupt-and-send
+ * was retired: the message now queues and goes when the reply ends. A sentence that
+ * describes a branch the app no longer has is worse than no sentence, because the user acts
+ * on it.
  */
-describe('resolveEffectiveBusySendMode (legacy shim, deleted in P2)', () => {
-  it('queues instead of interrupting on a known refusal (DL-119-07)', () => {
-    expect(resolveEffectiveBusySendMode({ mode: 'steer', steerable: false })).toBe('queue')
+describe('the refusal sentences (F-P1-2)', () => {
+  const refusals = [
+    resolveSteerability({ primaryAgentType: 'api', isGroupSession: true }),
+    resolveSteerability({ primaryAgentType: 'cli', isGroupSession: false, cli: null }),
+    resolveSteerability({
+      primaryAgentType: 'cli',
+      isGroupSession: false,
+      cli: { provider: 'codex', configScope: 'user', codexTransport: 'app-server' }
+    }),
+    resolveSteerability({
+      primaryAgentType: 'cli',
+      isGroupSession: false,
+      cli: { provider: 'codex', configScope: 'managed', codexTransport: 'exec' }
+    })
+  ].map((verdict) => {
+    expect(verdict.steerable).toBe(false)
+    return verdict.steerable === false ? verdict.reason : ''
   })
 
-  it('treats "not told yet" as steerable, because the route is the backstop', () => {
-    expect(resolveEffectiveBusySendMode({ mode: 'steer', steerable: null })).toBe('steer')
-    expect(resolveEffectiveBusySendMode({ mode: 'steer' })).toBe('steer')
-    expect(resolveEffectiveBusySendMode({ mode: 'steer', steerable: true })).toBe('steer')
-  })
-
-  it('never turns a queue setting into a steer', () => {
-    for (const steerable of [true, false, null, undefined]) {
-      expect(resolveEffectiveBusySendMode({ mode: 'queue', steerable })).toBe('queue')
+  it('never promises an interrupt that no longer exists', () => {
+    expect(refusals).toHaveLength(4)
+    for (const reason of refusals) {
+      expect(reason.length).toBeGreaterThan(0)
+      expect(reason).not.toMatch(/interrupt/i)
     }
   })
 
-  it('says wait when the composer carries files', () => {
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: true, carriesAttachments: true })
-    ).toBe('wait')
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: null, carriesAttachments: true })
-    ).toBe('wait')
-  })
-
-  it('keeps steer when the composer carries nothing', () => {
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: true, carriesAttachments: false })
-    ).toBe('steer')
-  })
-
-  it('lets a refusal beat wait', () => {
-    // The order `+page.svelte` takes: a reply the server says cannot take a steer has no
-    // inside to wait in, so the composer's contents cannot change the answer.
-    expect(
-      resolveEffectiveBusySendMode({ mode: 'steer', steerable: false, carriesAttachments: true })
-    ).toBe('queue')
-  })
-
-  it('is byte-identical to the old rule when nothing is attached (the send path)', () => {
-    // `+page.svelte` never passes `carriesAttachments`. If omitting it ever started
-    // producing `wait`, the page's `=== 'steer'` test would go false and the clips-wait
-    // branch would quietly stop running.
-    for (const steerable of [true, false, null, undefined]) {
-      const withoutFlag = resolveEffectiveBusySendMode({ mode: 'steer', steerable })
-      const explicitlyEmpty = resolveEffectiveBusySendMode({
-        mode: 'steer',
-        steerable,
-        carriesAttachments: false
-      })
-      expect(withoutFlag).toBe(explicitlyEmpty)
-      expect(withoutFlag).not.toBe('wait')
+  it('says what WILL happen instead, in the queue’s own words', () => {
+    for (const reason of refusals) {
+      expect(reason.toLowerCase()).toContain('queue')
     }
   })
 
-  it('reads the SAME rule the badges read (DL-119-02)', () => {
-    // One rule, two readers. The shim exists to keep two call sites compiling, not to be a
-    // second opinion about what a send does.
-    for (const mode of ['steer', 'queue'] as BusySendMode[]) {
-      for (const steerable of [true, false]) {
-        const shim = resolveEffectiveBusySendMode({ mode, steerable })
-        const actions = resolveBusySendActions({ mode, steerable, hasClips: false, hasMentions: false })
-        expect(shim).toBe(actions.enter)
-      }
-    }
+  it('is still four different sentences, one per reason', () => {
+    expect(new Set(refusals).size).toBe(4)
   })
 })
 
-describe('WAIT_SEND_SENTENCE (DL-118-09)', () => {
-  it('is the one sentence the bubble and the button both use', () => {
-    expect(WAIT_SEND_SENTENCE).toBe('With files: waits for the reply to finish')
+/**
+ * SA-119 P2 (DL-119-05, DL-119-06) — one promise, said in one place.
+ *
+ * Queue has two mechanisms under it: the server holds a text-only message and promotes it
+ * when the reply ends, and the browser holds one that carries files. The USER is told the
+ * same thing either way, and the bubble, the badge and the toast all read these constants
+ * rather than spelling the promise out three times.
+ */
+describe('the queued sentences (DL-119-05, DL-119-06)', () => {
+  it('says when the message will go, not merely that it is waiting', () => {
+    expect(QUEUED_AFTER_REPLY_SENTENCE).toBe('Queued — sends after this reply')
+    expect(QUEUED_WITH_FILES_SENTENCE).toBe('Queued — sends after this reply (with files)')
+  })
+
+  it('names the files case as a variation of the same promise, not a different one', () => {
+    expect(QUEUED_WITH_FILES_SENTENCE.startsWith(QUEUED_AFTER_REPLY_SENTENCE)).toBe(true)
+  })
+
+  it('refuses a second file message honestly, and says what to do (DL-119-06)', () => {
+    expect(QUEUE_ONE_AT_A_TIME_SENTENCE).toBe(
+      'One queued message with files at a time — send it after this one'
+    )
+  })
+
+  it('never uses the retired word', () => {
+    for (const sentence of [
+      QUEUED_AFTER_REPLY_SENTENCE,
+      QUEUED_WITH_FILES_SENTENCE,
+      QUEUE_ONE_AT_A_TIME_SENTENCE
+    ]) {
+      expect(sentence).not.toMatch(/interrupt/i)
+    }
   })
 })
 

@@ -14,6 +14,10 @@ import {
   noteLocalSteer,
   steerBubbleStatusLabel
 } from './steerInbox.svelte'
+import {
+  QUEUED_AFTER_REPLY_SENTENCE,
+  QUEUED_WITH_FILES_SENTENCE
+} from '$lib/utils/steerControl'
 
 /**
  * SA-114 P3 (DL-114-14) — the browser's view of a steer.
@@ -119,10 +123,188 @@ describe('steerInbox', () => {
   })
 
   it('labels the waiting and queued states', () => {
-    noteLocalSteer({ steerId: 'steer_w', sessionId: 's1', messageId: 'm1', text: 'w', state: 'waiting' })
+    noteLocalSteer({
+      steerId: 'steer_w',
+      sessionId: 's1',
+      messageId: 'm1',
+      text: 'w',
+      state: 'waiting',
+      withFiles: true
+    })
     noteLocalSteer({ steerId: 'steer_q', sessionId: 's1', messageId: 'm1', text: 'q' })
-    expect(steerBubbleStatusLabel(getSteer('steer_w')!)).toContain('waits for the reply to finish')
+    expect(steerBubbleStatusLabel(getSteer('steer_w')!)).toBe(QUEUED_WITH_FILES_SENTENCE)
     expect(steerBubbleStatusLabel(getSteer('steer_q')!)).toContain('Queued')
+  })
+
+  it('never says "with files" about a text-only message the browser is holding (F-P2-2)', () => {
+    // A group chat, an unmanaged profile or a Codex exec lane cannot take a steer at all,
+    // so a plain typed message waits in the browser too (DL-119-06). Telling that user
+    // "(with files)" would describe a message they did not send.
+    noteLocalSteer({
+      steerId: 'steer_text_wait',
+      sessionId: 's1',
+      messageId: 'm1',
+      text: 'plain words',
+      state: 'waiting'
+    })
+    expect(steerBubbleStatusLabel(getSteer('steer_text_wait')!)).toBe(QUEUED_AFTER_REPLY_SENTENCE)
+  })
+
+  /**
+   * SA-119 P2 (DL-119-05) — a steer and a queued message are the same OBJECT on the wire and
+   * two different promises to the user.
+   *
+   * `deliver` is the only thing that tells them apart: `now` lands inside this reply at the
+   * next tool boundary, `end` is held by the server and becomes the next turn's message.
+   * The bubble has to say which, because "Queued for the agent's next step" under a message
+   * that will never enter this reply is the same hidden-state problem the badges exist to
+   * remove.
+   */
+  describe('the queued bubble says which queue it is in (DL-119-05, DL-119-06)', () => {
+    it('says "sends after this reply" for a message the SERVER is holding', () => {
+      noteLocalSteer({
+        steerId: 'steer_end',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'after you finish',
+        deliver: 'end'
+      })
+      expect(steerBubbleStatusLabel(getSteer('steer_end')!)).toBe(QUEUED_AFTER_REPLY_SENTENCE)
+    })
+
+    it('still says "the agent’s next step" for a real steer', () => {
+      noteLocalSteer({
+        steerId: 'steer_now',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'also run the tests',
+        deliver: 'now'
+      })
+      expect(steerBubbleStatusLabel(getSteer('steer_now')!)).toBe('Queued for the agent’s next step')
+    })
+
+    it('treats an unsaid deliver as a steer, which is what every pre-SA-119 event is', () => {
+      noteLocalSteer({ steerId: 'steer_old', sessionId: 's1', messageId: 'm1', text: 'x' })
+      expect(getSteer('steer_old')?.deliver ?? 'now').toBe('now')
+      expect(steerBubbleStatusLabel(getSteer('steer_old')!)).toBe('Queued for the agent’s next step')
+    })
+
+    it('learns `deliver` from the event, so a tab that did not send still says the right thing', () => {
+      // The replay buffer re-sends `steer_queued` to any tab that (re)subscribes, and the
+      // route has carried `deliver` on it since P1. A spectator must not be told a held
+      // message is about to land inside the reply.
+      applySteerQueued({
+        sessionId: 's1',
+        messageId: 'm1',
+        steerId: 'steer_spec',
+        text: 'held',
+        deliver: 'end'
+      })
+      expect(steerBubbleStatusLabel(getSteer('steer_spec')!)).toBe(QUEUED_AFTER_REPLY_SENTENCE)
+    })
+
+    it('never blanks a deliver a previous event already supplied', () => {
+      // Same merge rule as `text`: `steer_delivered` carries no deliver, and arriving first
+      // must not turn a held message back into a steer.
+      noteLocalSteer({
+        steerId: 'steer_merge',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'held',
+        deliver: 'end'
+      })
+      applySteerDelivered({ sessionId: 's1', messageId: 'm1', steerId: 'steer_merge' })
+      expect(getSteer('steer_merge')?.deliver).toBe('end')
+    })
+
+    it('drops a held message with the same receipt a steer gets (DL-119-05)', () => {
+      noteLocalSteer({
+        steerId: 'steer_stop',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'held',
+        deliver: 'end'
+      })
+      markSteerDropped('steer_stop')
+      expect(steerBubbleStatusLabel(getSteer('steer_stop')!)).toBe('Not sent — you stopped the reply')
+    })
+  })
+
+  /**
+   * SA-119 P2 (F-P2-6, Josh's review of the live screenshots) — the bubble shows the words,
+   * not the wire.
+   *
+   * A send that carries a Clip has the clip's `{{batshit-clip:id:::name}}` placeholder
+   * appended to its text by the composer, and the browser-held queue drew that text raw —
+   * so a queued message with a file showed the user a line of machinery under their own
+   * sentence. Every real message strips or renders it; this bubble is not a message, so it
+   * had nothing doing that for it.
+   */
+  describe('the bubble shows what was typed, not the wire text (F-P2-6)', () => {
+    it('drops a clip placeholder and the blank line it rode on', () => {
+      noteLocalSteer({
+        steerId: 'steer_clip',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'this one carries a file.\n\n{{batshit-clip:clip_1789301213116_83c88e87_0:::sample.txt}}',
+        state: 'waiting',
+        withFiles: true
+      })
+      expect(getSteer('steer_clip')?.text).toBe('this one carries a file.')
+    })
+
+    it('drops several, and leaves the words between them alone', () => {
+      noteLocalSteer({
+        steerId: 'steer_clips',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'read these\n\n{{batshit-clip:clip_1789301213116_83c88e87_0:::a.txt}}\n{{batshit-clip:clip_1789301213117_83c88e88_0:::b.txt}}',
+        state: 'waiting',
+        withFiles: true
+      })
+      expect(getSteer('steer_clips')?.text).toBe('read these')
+    })
+
+    it('falls back to the file names when the clip was the whole message', () => {
+      // An empty bubble under a paperclip would say less than the filename does.
+      noteLocalSteer({
+        steerId: 'steer_only',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: '{{batshit-clip:clip_1789301213116_83c88e87_0:::sample.txt}}',
+        state: 'waiting',
+        withFiles: true
+      })
+      expect(getSteer('steer_only')?.text).toBe('sample.txt')
+    })
+
+    it('leaves text with no clip syntax byte-identical', () => {
+      const typed = 'also run the tests, and check @src/app.ts while you are there'
+      noteLocalSteer({ steerId: 'steer_plain', sessionId: 's1', messageId: 'm1', text: typed })
+      expect(getSteer('steer_plain')?.text).toBe(typed)
+    })
+
+    it('keeps a reference it cannot recognise, rather than hiding it', () => {
+      // A placeholder that is not a concrete clip id is not Batshit's own machinery, and
+      // silently deleting it would hide something the user should see.
+      noteLocalSteer({
+        steerId: 'steer_odd',
+        sessionId: 's1',
+        messageId: 'm1',
+        text: 'look at {{batshit-clip:...}} please'
+      })
+      expect(getSteer('steer_odd')?.text).toContain('{{batshit-clip:...}}')
+    })
+
+    it('cleans the text the SSE event brings too, not only this tab’s own send', () => {
+      applySteerQueued({
+        sessionId: 's1',
+        messageId: 'm1',
+        steerId: 'steer_event',
+        text: 'from another tab\n\n{{batshit-clip:clip_1789301213116_83c88e87_0:::sample.txt}}'
+      })
+      expect(getSteer('steer_event')?.text).toBe('from another tab')
+    })
   })
 
   it('ignores a promotion for a steer this tab never saw', () => {

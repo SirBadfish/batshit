@@ -2,8 +2,10 @@
  * SA-114 — steer: THE shared rules for a message sent while the agent is still replying.
  *
  * Two verbs, one channel. **Steer** hands the text to the server, which holds it until the
- * agent's next tool call finishes and then places it inside the same reply. **Interrupt**
- * is today's behaviour: the reply stops and the message starts a new turn. This module is
+ * agent's next tool call finishes and then places it inside the same reply. **Queue**
+ * (SA-119) hands it to the same channel marked `deliver: 'end'`, so it waits out the reply
+ * and becomes the next turn's message. `interrupt` was the second verb until SA-119
+ * retired it: Stop followed by Enter is that job. This module is
  * browser-safe on purpose — the route, the registry, the compiler twins, the Execution
  * Viewer, and (from P3) the client all read the same rules from here rather than restating
  * them, which is the mistake `decideRiskGate` had to be built to undo in SA-116.
@@ -56,24 +58,38 @@ export const STEER_DM_ALREADY_PENDING_REASON =
 export type BusySendMode = 'steer' | 'queue'
 
 /**
- * DL-118-09 — what a send is ACTUALLY about to do, which is one word wider than the setting.
+ * DL-119-05, DL-119-06 — the promise a queued message makes, in one place.
  *
- * **Superseded by DL-119-02 and deleted in SA-119 P2.** `resolveBusySendActions` is the rule
- * now; this type and the two functions below survive P1 only so `ChatInput.svelte` and
- * `+page.svelte` keep compiling until P2 moves them onto the badges. `wait` is the legacy
- * word for "queue, held in the browser because this send carries files" — the behaviour
- * DL-119-06 keeps.
+ * Queue has two mechanisms under it and the user is told the same thing by both. A
+ * text-only message on a steerable turn is held by the SERVER (`deliver: 'end'`) and becomes
+ * the next turn's user message; anything carrying files is held by the BROWSER and sent as
+ * an ordinary message the moment the reply ends. The bubble, the badge and the toast all
+ * read these constants, because SA-118's F-25 was exactly what happens when one behaviour
+ * gets two wordings in two components.
+ *
+ * These replace `WAIT_SEND_SENTENCE` ("With files: waits for the reply to finish"), which
+ * described the waiting rather than the sending and belonged to the retired third send
+ * state.
  */
-export type EffectiveBusySendMode = BusySendMode | 'wait'
+export const QUEUED_AFTER_REPLY_SENTENCE = 'Queued — sends after this reply'
+export const QUEUED_WITH_FILES_SENTENCE = 'Queued — sends after this reply (with files)'
 
 /**
- * The one sentence a held send gets, wherever it is shown (DL-118-09).
+ * DL-119-06 — the honest refusal when a second message tries to queue in the browser.
  *
- * The bubble the same click draws has said this since SA-114 P3. The button's tooltip now
- * says it too, from here, so the two cannot drift into two different promises about one
- * behaviour.
+ * One client-held message per chat at a time: a second would race the first for the same
+ * "the reply just ended" moment, and the loser sends into a live turn. The words stay in
+ * the composer, which is the whole point of saying it out loud rather than dropping one.
+ *
+ * The files sentence is DL-119-06's own. The second exists because the same browser hold
+ * also carries a TEXT-only message whenever the turn cannot take a steer (a group chat, an
+ * unmanaged profile, a Codex exec lane) — telling that user "with files" would be a
+ * sentence about a message they did not send (F-P2-2).
  */
-export const WAIT_SEND_SENTENCE = 'With files: waits for the reply to finish'
+export const QUEUE_ONE_AT_A_TIME_SENTENCE =
+  'One queued message with files at a time — send it after this one'
+export const QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE =
+  'One queued message at a time — send it after this one'
 
 /** Josh's call (2026-09-07, carried into DL-119-01): steer is the default; Queue is the other badge. */
 export const DEFAULT_BUSY_SEND_MODE: BusySendMode = 'steer'
@@ -125,17 +141,12 @@ export function normalizeGlobalChatSettings(value: unknown): GlobalChatSettings 
  * changed the default. `resolveBusySendActions` calls this for its `other`, so the badge
  * pair and the keyboard cannot come to disagree about which one is the other one.
  */
-export function otherBusySendMode(mode: EffectiveBusySendMode): BusySendMode {
-  // The legacy `wait` is "queue, held in the browser because this send carries files"
-  // (DL-119-06), so the other way is to steer — which since DL-119-04 keeps the file in the
-  // composer instead of throwing it away, and is the reason Steer is offered here at all.
-  if (mode === 'wait') return 'steer'
+export function otherBusySendMode(mode: BusySendMode): BusySendMode {
   return mode === 'steer' ? 'queue' : 'steer'
 }
 
-/** The send button's label while the agent is busy (DL-119-01; `wait` is DL-118-09's legacy word). */
-export function busySendModeLabel(mode: EffectiveBusySendMode): string {
-  if (mode === 'wait') return 'Send after reply'
+/** What a badge says, and what the send icon says it will do (DL-119-01, DL-119-03). */
+export function busySendModeLabel(mode: BusySendMode): string {
   return mode === 'steer' ? 'Steer' : 'Queue'
 }
 
@@ -247,50 +258,6 @@ export function resolveBusySendActions(input: {
     steer: { enabled: true, note },
     queue: { enabled: true, note: null }
   }
-}
-
-/**
- * What this send will ACTUALLY do (DL-114-01 + DL-114-09) — **superseded by DL-119-02.**
- *
- * P1 keeps this as a thin derivation of `resolveBusySendActions` rather than deleting it,
- * because its only two callers are `ChatInput.svelte` and `+page.svelte`, which P2 owns:
- * deleting it here would mean rewriting the composer and the page inside the server packet.
- * It is a DERIVATION and not a second rule — one answer, two spellings — so the shim cannot
- * drift from the badges while both exist. **P2 deletes it with its callers.**
- *
- * Two things changed under it in P1. `interrupt` is gone (DL-119-07): a reply the server
- * says cannot be steered now QUEUES rather than stopping the reply. And `wait` is now just
- * the legacy word for "queue, held in the browser because this send carries files"
- * (DL-119-06) — the same behaviour DL-114-10 has always had.
- */
-export function resolveEffectiveBusySendMode(input: {
-  mode: BusySendMode
-  steerable?: boolean | null
-  /**
-   * DL-118-09 — clips or `@file` mentions in the composer. OMITTED by the send path on
-   * purpose: `+page.svelte` reads the same two things itself, at send time, from the
-   * metadata it is about to post (`sendCarriesAttachments`), and then picks the wait branch
-   * on `steerBranchEligible && sendCarriesAttachments`. Passing it there would make the
-   * page's `=== 'steer'` test false and silently retire that branch. Only the BUTTON passes
-   * it, because only the button has to say what is about to happen before it happens.
-   */
-  carriesAttachments?: boolean
-}): EffectiveBusySendMode {
-  const carries = input.carriesAttachments === true
-  const actions = resolveBusySendActions({
-    mode: input.mode,
-    steerable: input.steerable,
-    // The shim's one input covers both, so it is read as the weaker of the two (a clip):
-    // the badge pair is where they are told apart, and that is P2's job.
-    hasClips: carries,
-    hasMentions: false
-  })
-  // The legacy spelling, and only where it was ever true: a queue this send will hold in
-  // the BROWSER because it carries files the steer route cannot take. A reply the SERVER
-  // refused keeps the old precedence — the refusal beat `wait` before SA-119 and still
-  // does, which is the order `+page.svelte` reads.
-  if (actions.enter === 'queue' && carries && actions.steer.enabled) return 'wait'
-  return actions.enter
 }
 
 /** Where a steer came from. A DM steer is labelled as not from the user (DL-114-13, P4). */
@@ -580,14 +547,31 @@ export interface SteerCliRuntime {
   codexTransport?: 'app-server' | 'exec' | null
 }
 
-const NOT_STEERABLE_GROUP =
-  'Group chats cannot be steered — each agent speaks in turn, so a message interrupts instead.'
-const NOT_STEERABLE_UNKNOWN =
-  'This agent cannot be steered mid-reply. Your message interrupts instead.'
-const NOT_STEERABLE_CODEX_EXEC =
-  'This Codex agent runs on the one-shot exec transport, which closes its input as soon as the prompt is sent. Your message interrupts instead.'
-const NOT_STEERABLE_UNMANAGED =
-  'This agent runs from your own CLI profile, which Batshit does not drive, so it cannot be steered mid-reply. Your message interrupts instead.'
+/**
+ * Why this reply cannot take a steer, in the user's words (F-P1-2, DL-119-07).
+ *
+ * Every one of these used to end "Your message interrupts instead", which was true until
+ * DL-119-07 retired interrupt-and-send and false the moment it landed: nothing stops the
+ * reply any more, and the message queues. A sentence that names a branch the app no longer
+ * has is worse than none, because these are exactly what DL-119-03 prints as plain text
+ * beside a Steer badge the user cannot press — the one moment they decide what to do next.
+ *
+ * They are EXPORTED because `+page.svelte` had hand-copied two of them (F-P1-2), and two
+ * copies of one sentence is how they come to disagree.
+ */
+export const STEER_REFUSED_GROUP_SENTENCE =
+  'Group chats cannot be steered — each agent speaks in turn, so your message queues and sends when the reply ends.'
+export const STEER_REFUSED_UNKNOWN_SENTENCE =
+  'This agent cannot be steered mid-reply, so your message queues and sends when the reply ends.'
+export const STEER_REFUSED_CODEX_EXEC_SENTENCE =
+  'This Codex agent runs on the one-shot exec transport, which closes its input as soon as the prompt is sent, so your message queues and sends when the reply ends.'
+export const STEER_REFUSED_UNMANAGED_SENTENCE =
+  'This agent runs from your own CLI profile, which Batshit does not drive, so it cannot be steered mid-reply; your message queues and sends when the reply ends.'
+
+const NOT_STEERABLE_GROUP = STEER_REFUSED_GROUP_SENTENCE
+const NOT_STEERABLE_UNKNOWN = STEER_REFUSED_UNKNOWN_SENTENCE
+const NOT_STEERABLE_CODEX_EXEC = STEER_REFUSED_CODEX_EXEC_SENTENCE
+const NOT_STEERABLE_UNMANAGED = STEER_REFUSED_UNMANAGED_SENTENCE
 
 export function resolveSteerability(input: {
   /** Live primary agent type, already normalised by `normalizePrimaryAgentType`. */

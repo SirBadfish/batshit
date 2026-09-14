@@ -3,58 +3,165 @@ import { describe, expect, it } from 'vitest'
 
 const page = readFileSync('src/routes/+page.svelte', 'utf8')
 const chatInput = readFileSync('src/lib/components/chat/ChatInput.svelte', 'utf8')
+const rules = readFileSync('src/lib/utils/steerControl.ts', 'utf8')
+const settingsPanel = readFileSync(
+  'src/lib/components/settings/panels/UserSettingsPanel.svelte',
+  'utf8'
+)
 
 /**
- * SA-114 P3 — the client's steer contracts.
+ * Source with its comments stripped.
  *
- * `+page.svelte` is 7,700 lines of one component; the claims below are purely about ORDER
- * and about which branch reaches which call, which is what the send-routed steer contracts
- * are already pinned this way for. Everything with real behaviour behind it (the store, the
- * rules module, the settings route) has its own test.
+ * The claims below are about what the code DOES. The comments deliberately keep the
+ * history — "these four sentences used to end 'Your message interrupts instead'" is worth
+ * reading a year from now — and an assertion that cannot tell a retired behaviour from a
+ * note about a retired behaviour would force that history to be deleted to stay green.
  */
-describe('the client send path (SA-114 P3)', () => {
-  it('never stops the voice on a steer, and always does on an interrupt (DL-114-11)', () => {
-    // AMD-114-07: the lock assumed only the Stop button called this and an interrupt-mode
-    // send had to GAIN it. In fact every send called it unconditionally at the top of
+const codeOnly = (source: string) =>
+  source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+/**
+ * SA-114 P3, rewritten for SA-119 P2 — the client's steer and queue contracts.
+ *
+ * `+page.svelte` is 7,700 lines of one component and `ChatInput.svelte` is 4,000 more; the
+ * claims below are purely about ORDER and about which branch reaches which call, which is
+ * how the send-routed steer contracts are pinned too. Everything with real behaviour behind
+ * it (the store, the rules module, the settings route) has its own test.
+ */
+describe('the client send path (SA-114 P3, SA-119 P2)', () => {
+  it('never stops the voice on a steer or a queue (DL-114-11, DL-119-07)', () => {
+    // AMD-114-07: every send used to call this unconditionally at the top of
     // `handleSendMessage`, which would have silenced the reply a steer is meant to leave
-    // running. The call moved down into the two branches that keep it.
+    // running. SA-119 P2 deleted the interrupt branch that was the other caller, so there
+    // is now exactly ONE call left in the send path and it sits below both queue branches:
+    // by the time it runs, either the reply has ended or nothing was held.
     const handler = page.indexOf('async function handleSendMessage(')
     const steerReturn = page.indexOf("if (outcome.kind === 'accepted')", handler)
-    const interruptBranch = page.indexOf("logger.debug('[handleSendMessage] Interrupting active stream'", handler)
-
     expect(handler).toBeGreaterThan(-1)
     expect(steerReturn).toBeGreaterThan(handler)
-    expect(interruptBranch).toBeGreaterThan(steerReturn)
 
     // Nothing between the start of the send and the accepted-steer return may stop speech.
     expect(page.slice(handler, steerReturn)).not.toContain('stopRealtimeSpeechPlayback(')
-    // The accepted branch returns; the interrupt branch below it stops the voice.
-    expect(page.slice(steerReturn, interruptBranch)).toContain('return true')
-    expect(page.slice(interruptBranch, interruptBranch + 900)).toContain(
-      'stopRealtimeSpeechPlayback(previousMessageId)'
+    expect(page.slice(steerReturn, steerReturn + 900)).toContain('return true')
+  })
+
+  it('has no interrupt-and-send branch left at all (DL-119-07)', () => {
+    // The retired mode, in every spelling it had. `/api/messages/interrupt` itself is NOT
+    // retired — `handleStopStream` still posts it — so the claim is about the SEND path.
+    const handler = page.indexOf('async function handleSendMessage(')
+    const endOfHandler = page.indexOf('async function handleStopStream()')
+    expect(endOfHandler).toBeGreaterThan(handler)
+    const sendPath = page.slice(handler, endOfHandler)
+    expect(sendPath).not.toContain('/api/messages/interrupt')
+    expect(sendPath).not.toContain('Interrupting active stream')
+    expect(sendPath).not.toContain('abortController.abort()')
+    expect(sendPath).not.toContain('interruptionContext')
+    // And Stop still owns the route it always did.
+    const stop = page.indexOf('async function handleStopStream()')
+    expect(page.slice(stop, stop + 2600)).toContain("'/api/messages/interrupt'")
+  })
+
+  it('reads ONE rule for the mode, the same one the badges read (DL-119-02)', () => {
+    const rule = page.indexOf('const busySendActions = resolveBusySendActions({')
+    expect(rule).toBeGreaterThan(-1)
+    const body = page.slice(rule, rule + 400)
+    expect(body).toContain('mode: busySendMode')
+    expect(body).toContain('steerable: runSteerable')
+    expect(body).toContain('hasClips: sendCarriesClips')
+    expect(body).toContain('hasMentions: sendCarriesMentions')
+    // The composer's own answer wins when a key or a badge gave one; otherwise the page
+    // computes the same answer rather than guessing a different one.
+    expect(page).toContain(
+      'const busySendAction: BusySendMode = busySendOverride ?? busySendActions.enter'
+    )
+    // Both words, and only those two, are accepted as a one-off override (F-P1-6).
+    const override = page.indexOf('const busySendOverride: BusySendMode | null =')
+    expect(page.slice(override, override + 260)).toContain(
+      "metadata?.busySendModeOverride === 'steer' || metadata?.busySendModeOverride === 'queue'"
     )
   })
 
-  it('holds a send that carries files instead of steering it (DL-114-10)', () => {
-    const clipsBranch = page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {')
-    expect(clipsBranch).toBeGreaterThan(-1)
-    // The branch grew a bubble in review (F-P3-3); the window covers the whole branch.
-    const body = page.slice(clipsBranch, page.indexOf('// Re-read: a steer that was refused', clipsBranch))
-    expect(body).toContain('await waitForStreamCompletion(waitForMessageId)')
-    // Waiting, not interrupting: the user did not ask to stop anything.
-    expect(body).not.toContain('/api/messages/interrupt')
-    expect(body).not.toContain('postSteer(')
+  it('sends a steer as `now` and a queue as `end`, through one door (DL-119-05)', () => {
+    const branch = page.indexOf('if (steerBranchEligible || serverQueueEligible) {')
+    expect(branch).toBeGreaterThan(-1)
+    const body = page.slice(branch, page.indexOf('if (clientQueueEligible) {', branch))
+    expect(body).toContain("const deliver: SteerDeliver = steerBranchEligible ? 'now' : 'end'")
+    // One post, one bubble, both carrying it — the bubble's sentence depends on it.
+    expect(body).toContain('steerInbox.noteLocalSteer({')
+    expect(body.match(/deliver\n/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+    expect(body).toContain('const outcome = await postSteer({')
   })
 
-  it('does not interrupt a reply the route says already finished (DL-114-14)', () => {
+  it('only lets the SERVER hold a text-only message on a steerable turn (DL-119-05)', () => {
+    const gate = page.indexOf('const turnCanHoldText =')
+    expect(gate).toBeGreaterThan(-1)
+    const body = page.slice(gate, gate + 420)
+    expect(body).toContain('managedBusy')
+    expect(body).toContain('runSteerable !== false')
+    expect(body).toContain('!sendCarriesAttachments')
+    expect(page).toContain("const steerBranchEligible = turnCanHoldText && busySendAction === 'steer'")
+    expect(page).toContain("const serverQueueEligible = turnCanHoldText && busySendAction === 'queue'")
+  })
+
+  it('sends everything else the browser is holding after the reply, one at a time (DL-119-06)', () => {
+    const branch = page.indexOf('if (clientQueueEligible) {')
+    expect(branch).toBeGreaterThan(-1)
+    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
+    // The refusal, with the words left in the composer.
+    expect(body).toContain('clientQueueWaitingBySession.has(currentSessionId)')
+    expect(body).toContain('QUEUE_ONE_AT_A_TIME_SENTENCE')
+    expect(body).toContain('QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE')
+    expect(body).toContain('return false')
+    // The bubble, and the flag that tells it whether to mention files (F-P2-2).
+    expect(body).toContain("state: 'waiting'")
+    expect(body).toContain('withFiles: sendCarriesAttachments')
+    // Waiting, not interrupting, and never through the steer route.
+    expect(body).not.toContain('/api/messages/interrupt')
+    expect(body).not.toContain('postSteer(')
+    // The claim released in a `finally`, or one refused send would wedge the chat.
+    expect(body).toContain('clientQueueWaitingBySession.add(currentSessionId)')
+    expect(body).toContain('} finally {')
+    expect(body).toContain('clientQueueWaitingBySession.delete(currentSessionId)')
+  })
+
+  it('waits for the reply to actually end, not for eight seconds (F-P2-1)', () => {
+    // `waitForStreamCompletion` resolves when its 8s ceiling expires. That was survivable
+    // while the send then fell into the interrupt branch and stopped the reply first;
+    // DL-119-07 deleted that branch, so an expiry would now post into a live turn.
+    const branch = page.indexOf('if (clientQueueEligible) {')
+    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
+    expect(body).toContain('await waitForReplyToEnd(currentSessionId, waitForMessageId)')
+    expect(body).not.toContain('await waitForStreamCompletion(')
+
+    const helper = page.indexOf('async function waitForReplyToEnd(')
+    expect(helper).toBeGreaterThan(-1)
+    const helperBody = page.slice(helper, helper + 700)
+    expect(helperBody).toContain('chatRunRegistry.isSessionBusy(sessionId)')
+    expect(helperBody).toContain('CLIENT_QUEUE_MAX_WAIT_MS')
+    // A ceiling, not a forever — and the caller must keep the words when it is hit.
+    expect(body).toContain('if (!replyEnded) {')
+    expect(body).toContain('still here')
+  })
+
+  it('does not send into a reply the route says already finished (DL-114-14)', () => {
     // Measured on BSMS: a simulated-streaming reply finishes SERVER-side while the tab is
-    // still typing it out, so the browser can still believe it is busy. Interrupting then
-    // would stop nothing and stamp a turn that already ended.
+    // still typing it out, so the browser can still believe it is busy. There is then
+    // nothing to queue behind, and the words go as an ordinary message.
     expect(page).toContain('let steerRefusedAsFinished = false')
     const refusal = page.indexOf("if (outcome.kind === 'already_finished') {")
     expect(refusal).toBeGreaterThan(-1)
-    expect(page.slice(refusal, refusal + 200)).toContain('steerRefusedAsFinished = true')
-    expect(page).toContain('!steerRefusedAsFinished &&')
+    const body = page.slice(refusal, refusal + 300)
+    expect(body).toContain('steerRefusedAsFinished = true')
+    expect(body).toContain('clientQueueEligible = false')
+  })
+
+  it('turns a not-steerable refusal into a queue, never a stop (DL-119-07)', () => {
+    const refusal = page.indexOf("} else if (outcome.kind === 'queue') {")
+    expect(refusal).toBeGreaterThan(-1)
+    expect(page.slice(refusal, refusal + 500)).toContain('clientQueueEligible = true')
   })
 
   it('settles steer bubbles on every finalise a stopped turn can reach (F-P3-B)', () => {
@@ -74,33 +181,24 @@ describe('the client send path (SA-114 P3)', () => {
   })
 
   it('shows the bubble before the route answers, and removes it on a refusal (F-P3-1)', () => {
-    const branch = page.indexOf('if (steerBranchEligible && !sendCarriesAttachments) {')
+    const branch = page.indexOf('if (steerBranchEligible || serverQueueEligible) {')
     const post = page.indexOf('const outcome = await postSteer({', branch)
     const note = page.indexOf('steerInbox.noteLocalSteer({', branch)
     expect(branch).toBeGreaterThan(-1)
     expect(note).toBeGreaterThan(branch)
     // Optimistic: the bubble is drawn BEFORE the round trip, as DL-114-14 describes.
     expect(note).toBeLessThan(post)
-    const refusals = page.slice(post, page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {', post))
+    const refusals = page.slice(post, page.indexOf('if (clientQueueEligible) {', post))
     expect(refusals).toContain('steerInbox.forgetSteer(steerId)')
   })
 
-  it('refuses to interrupt a reply whose assistant id it does not know yet (F-P3-2)', () => {
-    const branch = page.indexOf('if (steerBranchEligible && !sendCarriesAttachments) {')
-    const body = page.slice(branch, page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {', branch))
-    // No target: say so and keep the words in the composer — never fall through to the
-    // interrupt branch on a click that promised to steer.
+  it('refuses a reply whose assistant id it does not know yet (F-P3-2)', () => {
+    const branch = page.indexOf('if (steerBranchEligible || serverQueueEligible) {')
+    const body = page.slice(branch, page.indexOf('if (clientQueueEligible) {', branch))
+    // No target: say so and keep the words in the composer.
     expect(body).toContain('if (!steerTargetMessageId) {')
     expect(body).toContain('still starting')
     expect(body).toContain('return false')
-  })
-
-  it('draws the waiting bubble for a send with files (F-P3-3, DL-114-10)', () => {
-    const clipsBranch = page.indexOf('} else if (steerBranchEligible && sendCarriesAttachments) {')
-    const body = page.slice(clipsBranch, clipsBranch + 1400)
-    expect(body).toContain("state: 'waiting'")
-    expect(body).toContain('await waitForStreamCompletion(waitForMessageId)')
-    expect(body).toContain('steerInbox.forgetSteer(')
   })
 
   it('re-arms the drop backstop while the chat is still busy, and never blames a Stop for it (F-P3-4)', () => {
@@ -114,7 +212,7 @@ describe('the client send path (SA-114 P3)', () => {
     // PR #106 review F-4 moved the classification into the rules module, where it is unit
     // tested; the page hands it the status and the payload and switches on the answer.
     const post = page.indexOf('async function postSteer(')
-    const body = page.slice(post, post + 2400)
+    const body = page.slice(post, post + 2600)
     expect(body).toContain('classifySteerRefusal(response.status, payload)')
     const rules = readFileSync('src/lib/utils/steerControl.ts', 'utf8')
     const tag = rules.indexOf("payload?.refusal === 'reply_finished'")
@@ -123,100 +221,190 @@ describe('the client send path (SA-114 P3)', () => {
     expect(sentence).toBeGreaterThan(tag)
   })
 
-  it('leaves the interrupt path itself byte-identical apart from the speech stop (DL-114-15)', () => {
-    // The interrupt POST, the abort, the wait and the interruption stamp are unchanged.
-    const interruptBranch = page.indexOf("logger.debug('[handleSendMessage] Interrupting active stream'")
-    const body = page.slice(interruptBranch, interruptBranch + 1800)
-    expect(body).toContain("await fetch('/api/messages/interrupt'")
-    expect(body).toContain('activeRunState.abortController.abort()')
-    expect(body).toContain('await waitForStreamCompletion(resolvedMessageId)')
-    expect(body).toContain("reason: 'user'")
+  it('imports the refusal sentences rather than copying them (F-P1-2)', () => {
+    // Two of the four lived a second time in this file, and the copies did not change when
+    // DL-119-07 made the originals false.
+    expect(page).toContain('STEER_REFUSED_GROUP_SENTENCE')
+    expect(page).toContain('STEER_REFUSED_UNKNOWN_SENTENCE')
+    expect(page).not.toContain('interrupts instead')
+    expect(page).not.toContain('Your message interrupts')
   })
 })
 
-describe('the send button (SA-114 P3)', () => {
-  it('reads one rule for the label and offers the shortcut only when it works', () => {
-    expect(chatInput).toContain('resolveEffectiveBusySendMode({')
-    expect(chatInput).toContain('busySendModeLabel(busyEffectiveSendMode)')
-    // A reply that cannot be steered must not advertise a key that does nothing.
-    expect(chatInput).toContain('const shortcutHint = steerable')
+/**
+ * SA-119 P2 (DL-119-03) — the two badges beside Stop.
+ *
+ * SA-118's F-25 put the third send state behind a hover tooltip, and Josh's finding
+ * (2026-09-13) was that people press Enter and nobody hovers — and that the tooltip was the
+ * browser's own plain one, not the app's. So the claims here are: both badges exist and
+ * both call the same send function; the one Enter will do is marked; the disabled reason is
+ * on screen as text; and nothing in the cluster uses a `title` attribute.
+ */
+describe('the busy send badges (SA-119 P2)', () => {
+  /** The whole busy cluster's markup, or '' when it does not exist — which is a failure. */
+  const readCluster = () => {
+    const start = chatInput.indexOf('<div class="chat-busy-send-float"')
+    if (start < 0) return ''
+    const end = chatInput.indexOf('{#if voiceModeSessionPillActive}', start)
+    return end > start ? chatInput.slice(start, end) : ''
+  }
+  const cluster = readCluster()
+
+  it('exists at all', () => {
+    expect(cluster.length).toBeGreaterThan(0)
   })
 
-  /**
-   * SA-118 (DL-118-09) — PR #106 review F-25.
-   *
-   * With a clip attached and the agent busy, the button read **Steer** and its tooltip
-   * promised the words would "land inside this reply", while `+page.svelte` took the wait
-   * branch and sent them after the reply ended. The wait behaviour is DL-114-10 and is not
-   * in question; only the label was lying. So the claim below is that the BUTTON and the
-   * SEND read the same two facts — clips, and `@file` mentions — and it is the reason this
-   * file exists: they live 4,600 lines apart in two different components.
-   */
-  it('F-25: the button and the send read the same two attachment facts', () => {
-    const buttonRule = chatInput.indexOf('const composerCarriesAttachments = $derived.by(')
-    expect(buttonRule).toBeGreaterThan(-1)
-    const buttonBody = chatInput.slice(buttonRule, buttonRule + 500)
-    expect(buttonBody).toContain('composerClippedItems.length > 0')
-    expect(buttonBody).toContain('mapMentionsToFileReferences(')
-    // The same exclusions the SEND path passes, not the narrower highlighter list — or the
-    // button and the send could disagree about whether one mention counts.
-    expect(buttonBody).toContain('activeMentionExclusions')
-    expect(chatInput).toContain('carriesAttachments: composerCarriesAttachments')
+  it('draws Steer and Queue as buttons, each sending in its own mode', () => {
+    expect(cluster).toContain('data-testid="busy-send-steer-badge"')
+    expect(cluster).toContain('data-testid="busy-send-queue-badge"')
+    expect(cluster).toContain("onclick={() => handleSend('steer')}")
+    expect(cluster).toContain("onclick={() => handleSend('queue')}")
+  })
 
-    const sendRule = page.indexOf('const sendCarriesAttachments =')
+  it('marks the one plain Enter will do, so the choice is not a hover', () => {
+    expect(cluster).toContain("class:is-default={busySendActions.enter === 'steer'}")
+    expect(cluster).toContain("class:is-default={busySendActions.enter === 'queue'}")
+    // Readable by a live proof and by the AB controller, not only by eye.
+    expect(cluster).toContain("data-busy-send-default={busySendActions.enter === 'steer' ? 'true' : 'false'}")
+    expect(cluster).toContain("data-busy-send-default={busySendActions.enter === 'queue' ? 'true' : 'false'}")
+  })
+
+  it('disables Steer from the rule, and never disables Queue', () => {
+    expect(cluster).toContain('disabled={disabled || sendDisabled || !busySendActions.steer.enabled}')
+    // DL-119-02: Queue is unconditional. "Nothing you typed is lost" rests on it.
+    expect(cluster).toContain('disabled={disabled || sendDisabled}')
+    expect(cluster).not.toContain('!busySendActions.queue.enabled')
+  })
+
+  it('shows the reason as plain text, not only in a tooltip (DL-119-03)', () => {
+    expect(chatInput).toContain('{#if busySendActions.steer.note}')
+    expect(chatInput).toContain('data-testid="busy-send-note"')
+    expect(chatInput).toContain('{busySendActions.steer.note}')
+  })
+
+  it('uses the app’s Tooltip for every hover text in the cluster, and no `title`', () => {
+    expect(cluster).toContain('<Tooltip.Provider')
+    expect(cluster).toContain('<Tooltip.Content>')
+    expect(chatInput).toContain("import * as Tooltip from '$lib/components/ui/tooltip'")
+    // Stop keeps its own `title` because DL-119-03 leaves Stop unchanged; the badges have
+    // none, which is the claim.
+    const badges = cluster.slice(0, cluster.indexOf('class="chat-stop-work-float"'))
+    expect(badges).not.toContain('title=')
+  })
+
+  it('leaves Stop unchanged in place, icon and behaviour (DL-119-03)', () => {
+    expect(cluster).toContain('onclick={handleStopWorkClick}')
+    expect(cluster).toContain('data-testid="stop-current-run-button"')
+    expect(cluster).toContain('<Square class="chat-stop-work-icon" />')
+    // The float moved from the button to the cluster around it, at the same coordinates,
+    // because two absolutely-positioned siblings would stack on each other.
+    const css = chatInput.slice(chatInput.indexOf('.chat-busy-send-float {'))
+    expect(css.slice(0, 200)).toContain('right: 0.55rem')
+    expect(css.slice(0, 200)).toContain('bottom: 3.15rem')
+  })
+
+  it('reuses the shared badge class rather than a new one', () => {
+    expect(cluster).toContain('class="bs-badge chat-busy-send-badge"')
+  })
+})
+
+describe('the send icon while busy (SA-119 P2)', () => {
+  it('does what Enter does, and says so from the same rule', () => {
+    expect(chatInput).toContain('busySendModeLabel(busySendActions.enter)')
+    expect(chatInput).toContain("onclick={() => handleSend(composerBusy ? busySendActions.enter : null)}")
+    // The attribute a live proof and a future test read the Enter mode off.
+    expect(chatInput).toContain(
+      'data-busy-send-mode={composerBusy ? busySendActions.enter : undefined}'
+    )
+  })
+
+  it('uses the app’s Tooltip, which is half of what Josh reported', () => {
+    const send = chatInput.indexOf('data-testid="send-button"')
+    expect(send).toBeGreaterThan(-1)
+    const button = chatInput.slice(send - 1400, send + 400)
+    expect(button).toContain('<Tooltip.Trigger>')
+    expect(button).not.toContain('title={sendButtonTooltip}')
+  })
+
+  it('offers the other key only when it does something different', () => {
+    const hint = chatInput.indexOf('const busySendShortcutHint = $derived(')
+    expect(hint).toBeGreaterThan(-1)
+    expect(chatInput.slice(hint, hint + 400)).toContain(
+      'busySendActions.other === busySendActions.enter'
+    )
+  })
+
+  it('the badges and the send read the same two attachment facts (F-25)', () => {
+    // The claim that keeps the badge honest: what it promises and what the page does are
+    // computed from the same two things, 4,600 lines apart in two components.
+    const buttonRule = chatInput.indexOf('const composerHasMentions = $derived.by(')
+    expect(buttonRule).toBeGreaterThan(-1)
+    const buttonBody = chatInput.slice(buttonRule, buttonRule + 320)
+    expect(buttonBody).toContain('mapMentionsToFileReferences(')
+    // The same exclusions the SEND path passes, not the narrower highlighter list.
+    expect(buttonBody).toContain('activeMentionExclusions')
+    expect(chatInput).toContain('const composerHasClips = $derived.by(() => composerClippedItems.length > 0)')
+    expect(chatInput).toContain('hasClips: composerHasClips')
+    expect(chatInput).toContain('hasMentions: composerHasMentions')
+
+    const sendRule = page.indexOf('const sendCarriesClips =')
     expect(sendRule).toBeGreaterThan(-1)
-    const sendBody = page.slice(sendRule, sendRule + 300)
+    const sendBody = page.slice(sendRule, sendRule + 320)
     expect(sendBody).toContain('collectTrustedClipIdsFromMetadata(metadata)')
     expect(sendBody).toContain('metadata?.fileReferences')
-
-    // And the send path must NOT pass the flag: `steerBranchEligible` tests
-    // `=== 'steer'`, so a page that resolved `'wait'` would silently retire its own wait
-    // branch and send a clip through the steer route instead.
-    const pageRule = page.indexOf('const effectiveBusySendMode: EffectiveBusySendMode =')
-    expect(pageRule).toBeGreaterThan(-1)
-    expect(page.slice(pageRule, pageRule + 320)).not.toContain('carriesAttachments')
-    expect(page).toContain("effectiveBusySendMode === 'steer'")
   })
 
-  it('F-25: the held send carries the label and the sentence, not a fourth wording', () => {
-    // The tooltip's sentence comes from `steerControl`, which is where the bubble the same
-    // click draws gets it. One behaviour, one promise.
-    expect(chatInput).toContain('WAIT_SEND_SENTENCE')
-    expect(chatInput).toContain("if (busyEffectiveSendMode === 'wait')")
-    expect(chatInput).not.toContain("'Send after reply'")
-    // The attribute a live proof and a future test can read the effective mode off.
-    expect(chatInput).toContain('data-busy-send-mode={composerBusy ? busyEffectiveSendMode : undefined}')
-  })
-
-  it('sends the OTHER mode on Cmd/Ctrl+Enter, and only while busy (DL-114-01)', () => {
+  it('sends the OTHER mode on Cmd/Ctrl+Enter, and only while busy (DL-119-02)', () => {
     const keydown = chatInput.indexOf("if (e.key === 'Enter' && !e.shiftKey) {")
     expect(keydown).toBeGreaterThan(-1)
-    const body = chatInput.slice(keydown, keydown + 700)
-    expect(body).toContain('(e.metaKey || e.ctrlKey) && composerBusy')
-    expect(body).toContain('otherBusySendMode(busyEffectiveSendMode)')
-    // Enter alone keeps its meaning.
-    expect(body).toContain('handleSend(oneOffMode)')
+    const body = chatInput.slice(keydown, keydown + 900)
+    expect(body).toContain('const busyMode = (e.metaKey || e.ctrlKey) ? busySendActions.other : busySendActions.enter')
+    // Not busy: no mode at all, so an ordinary send is untouched.
+    expect(body).toContain('handleSend(composerBusy ? busyMode : null)')
+  })
+})
+
+/**
+ * SA-119 P2 (DL-119-04) — Steer never loses a file.
+ */
+describe('Steer keeps the clips (DL-119-04)', () => {
+  it('sends the words only, and leaves the clips in the composer', () => {
+    expect(chatInput).toContain(
+      "const steeringKeepsClips = overrides?.busySendModeOverride === 'steer'"
+    )
+    // No clip ids on the message...
+    expect(chatInput).toContain('const clippedItems = steeringKeepsClips\n      ? []')
+    // ...no clip syntax appended to the text...
+    expect(chatInput).toContain('if (!steeringKeepsClips && clipsManager?.getClippedItemsSyntax) {')
+    // ...and the clips manager is never told the message was accepted, which is what would
+    // clear them.
+    expect(chatInput).toContain('if (!steeringKeepsClips && clipsManager?.handleMessageAccepted) {')
+  })
+
+  it('still resets the TEXT, which is all `resetComposer` ever did', () => {
+    const reset = chatInput.indexOf('function resetComposer() {')
+    const body = chatInput.slice(reset, reset + 500)
+    expect(body).toContain("message = ''")
+    expect(body).not.toContain('clipsManager')
   })
 })
 
 describe('PR #106 review — the client steer contracts that were missing', () => {
   it('F-4: a refused steer stops; only reply_finished and not_steerable may escalate', () => {
     const handler = page.indexOf('async function handleSendMessage(')
-    const refusedBranch = page.indexOf("} else if (outcome.kind === 'refused') {", handler)
-    const interruptBranch = page.indexOf("logger.debug('[handleSendMessage] Interrupting active stream'", handler)
+    const refusedBranch = page.indexOf('          toast.info(outcome.reason)\n', handler)
     expect(refusedBranch).toBeGreaterThan(handler)
-    expect(interruptBranch).toBeGreaterThan(refusedBranch)
-    // The refused branch returns before anything can interrupt.
-    expect(page.slice(refusedBranch, refusedBranch + 700)).toContain('return false')
+    expect(page.slice(refusedBranch, refusedBranch + 200)).toContain('return false')
     // And the classification is the rules module's, not a sentence match in the page.
     expect(page).toContain('classifySteerRefusal(response.status, payload)')
     expect(page).not.toContain("reason.startsWith('That reply already finished')")
   })
 
   it('F-23: a send that mentions a file is held like one that carries a clip', () => {
-    const definition = page.indexOf('const sendCarriesAttachments =')
+    const definition = page.indexOf('const sendCarriesMentions =')
     expect(definition).toBeGreaterThan(-1)
-    expect(page.slice(definition, definition + 300)).toContain('metadata?.fileReferences')
+    expect(page.slice(definition, definition + 200)).toContain('metadata?.fileReferences')
+    expect(page).toContain('const sendCarriesAttachments = sendCarriesClips || sendCarriesMentions')
   })
 })
 
@@ -227,13 +415,13 @@ describe('PR #106 review — the client steer contracts that were missing', () =
  * reply" bubble sat under every later exchange in that chat and came back each time the
  * chat was reopened. Two call sites fix it, and the thing that must NOT happen is the
  * reason both are pinned here: a `queued` or `waiting` bubble belongs to a reply that is
- * still running, and it is the only sign the user has that a steer is pending.
+ * still running, and it is the only sign the user has that a message is pending.
  */
 describe('the dropped steer bubble (SA-118, DL-118-08)', () => {
   it('is cleared by the next send in that chat, before the steer branch', () => {
     const handler = page.indexOf('async function handleSendMessage(')
     const clearCall = page.indexOf('steerInbox.clearDroppedSteersForSession(sendSessionId)', handler)
-    const steerBranch = page.indexOf('if (steerBranchEligible && !sendCarriesAttachments) {', handler)
+    const steerBranch = page.indexOf('if (steerBranchEligible || serverQueueEligible) {', handler)
     expect(clearCall).toBeGreaterThan(handler)
     expect(steerBranch).toBeGreaterThan(clearCall)
 
@@ -257,5 +445,44 @@ describe('the dropped steer bubble (SA-118, DL-118-08)', () => {
     // own test; it is gone, and nothing may call it back.
     expect(page).not.toContain('clearSteersForSession')
     expect(page).not.toContain('steerInbox.clearSteerInboxForTest')
+  })
+})
+
+/**
+ * SA-119 P2 — P1's three open findings, closed.
+ *
+ * Each of these was a thing private `main` shipped between the packets: a setting that
+ * looked like it kept a choice it did not, a keystroke that silently fell back, and four
+ * sentences promising a branch the app no longer had.
+ */
+describe("P1's open findings (F-P1-2, F-P1-5, F-P1-6)", () => {
+  it('F-P1-5: the settings panel offers Steer and Queue, and no retired mode', () => {
+    expect(settingsPanel).toContain('<Select.Item value="steer" label="Steer (default)">')
+    expect(settingsPanel).toContain('<Select.Item value="queue" label="Queue">')
+    expect(settingsPanel).not.toContain('value="interrupt"')
+    // And the copy beside it describes what the app actually does now.
+    expect(settingsPanel).not.toContain('Interrupt is the older behaviour')
+    expect(settingsPanel).toContain('press Stop, then')
+  })
+
+  it('F-P1-6: the shims are deleted, not left behind as a second opinion', () => {
+    for (const gone of [
+      'resolveEffectiveBusySendMode',
+      'EffectiveBusySendMode',
+      'WAIT_SEND_SENTENCE'
+    ]) {
+      for (const source of [rules, chatInput, page]) {
+        expect(codeOnly(source)).not.toContain(gone)
+      }
+    }
+    // `otherBusySendMode` survives, narrowed to the two real modes.
+    expect(rules).toContain('export function otherBusySendMode(mode: BusySendMode): BusySendMode')
+  })
+
+  it('F-P1-2: no surface promises an interrupt any more', () => {
+    for (const source of [rules, chatInput, page, settingsPanel]) {
+      expect(codeOnly(source)).not.toMatch(/interrupts instead/i)
+      expect(codeOnly(source)).not.toContain('Interrupt and send')
+    }
   })
 })
