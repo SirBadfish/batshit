@@ -686,3 +686,66 @@ export function classifySteerRefusal(
   if (status === 409 && payload?.code === 'not_steerable') return 'queue'
   return 'refused'
 }
+
+/* ------------------------------------------------------------------ *
+ * SA-119 P2b (F-P2-7) — the interruption note after Stop, then Enter.
+ * ------------------------------------------------------------------ */
+
+/** What Stop leaves behind for the next send: which reply it cut, and when. */
+export interface StopInterruptionRecord {
+  messageId: string
+  interruptedAt: string
+}
+
+/**
+ * What `send-routed` turns into the model's `==== INTERRUPTION NOTE ====`, travelling as
+ * `metadata.interruption` on the user message and on the request body.
+ */
+export interface InterruptionStamp {
+  previousMessageId: string
+  interruptedAt: string
+  reason: 'user'
+}
+
+/**
+ * Does the send that follows a Stop tell the model the previous reply was cut short?
+ *
+ * DL-119-07 retired interrupt-and-send, and the branch it deleted was the only writer of
+ * `metadata.interruption` — so after SA-119 P2 the model was no longer told, even though
+ * `buildInterruptionAddendum` was still waiting to be given something. Stop, then Enter, is
+ * now the whole gesture, so Stop's record is the only source (F-P2-7).
+ *
+ * Three things say no:
+ *
+ * - **No record.** Nothing was stopped, so there is nothing to say.
+ * - **The browser was holding this message.** A steer and a server-held queue return long
+ *   before the ordinary send path, but a BROWSER-held queue falls through into it — and
+ *   what it waits for, "the reply ends", is exactly what a Stop makes happen. Stamping it
+ *   would tell the model the user cut short a reply the user had chosen to wait behind.
+ * - **The stopped reply is no longer the agent's last word.** A turn has landed since, so
+ *   the note would name the wrong message.
+ *
+ * A record missing either field is not completed from a default: a fabricated timestamp is
+ * a worse answer than no note, and the one writer always sets both.
+ */
+export function resolveStopInterruptionStamp(input: {
+  record: StopInterruptionRecord | null | undefined
+  browserQueued: boolean
+  latestAssistantMessageId: string | null | undefined
+}): InterruptionStamp | null {
+  const messageId =
+    typeof input.record?.messageId === 'string' ? input.record.messageId.trim() : ''
+  const interruptedAt =
+    typeof input.record?.interruptedAt === 'string' ? input.record.interruptedAt.trim() : ''
+  if (!messageId || !interruptedAt) return null
+
+  if (input.browserQueued) return null
+
+  const latest =
+    typeof input.latestAssistantMessageId === 'string'
+      ? input.latestAssistantMessageId.trim()
+      : ''
+  if (!latest || latest !== messageId) return null
+
+  return { previousMessageId: messageId, interruptedAt, reason: 'user' }
+}

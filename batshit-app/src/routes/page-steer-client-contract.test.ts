@@ -169,9 +169,16 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     // would carry it — so `handleStopStream` and the `end` handler settle too.
     const stopHandler = page.indexOf('async function handleStopStream()')
     expect(stopHandler).toBeGreaterThan(-1)
-    expect(page.slice(stopHandler, stopHandler + 1200)).toContain(
-      'settleSteerBubblesForMessage(sessionId, previousMessageId, { interrupted: true })'
+    // An ORDER claim rather than a character window: P2b added Stop's interruption record
+    // above this line, and a fixed window would have to be re-tuned by every later edit.
+    // The real invariant is that the bubbles are settled BEFORE the route call, because
+    // that call is the one that may never answer.
+    const settled = page.indexOf(
+      'settleSteerBubblesForMessage(sessionId, previousMessageId, { interrupted: true })',
+      stopHandler
     )
+    expect(settled).toBeGreaterThan(stopHandler)
+    expect(settled).toBeLessThan(page.indexOf("'/api/messages/interrupt'", stopHandler))
     expect(page).toContain(
       "settleSteerBubblesForMessage(currentMessage.session_id, targetMessageId, {"
     )
@@ -228,6 +235,127 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     expect(page).toContain('STEER_REFUSED_UNKNOWN_SENTENCE')
     expect(page).not.toContain('interrupts instead')
     expect(page).not.toContain('Your message interrupts')
+  })
+})
+
+/**
+ * SA-119 P2b (F-P2-7) — the interruption note after Stop, then Enter.
+ *
+ * `send-routed` still builds the model's `==== INTERRUPTION NOTE ====` from
+ * `metadata.interruption`, and DL-119-07 deleted the branch that was its only writer. Stop,
+ * then Enter, is now the only way to cut a reply short, so Stop is what records it.
+ *
+ * These are ORDER and REACHABILITY claims about one 7,700-line component, like the ones
+ * above. What is load-bearing and cheap to get wrong: the record is written by Stop and
+ * never by a send; it is consumed unconditionally, so one Stop colours one send; a
+ * browser-held queue is excluded rather than assumed unreachable; and nothing here brought
+ * interrupt-and-send back.
+ */
+describe('the interruption note after a Stop (SA-119 P2b, F-P2-7)', () => {
+  const handler = page.indexOf('async function handleSendMessage(')
+  const stopHandler = page.indexOf('async function handleStopStream()')
+  const sendPath = page.slice(handler, stopHandler)
+
+  it('is recorded by Stop, naming the reply it cut, above anything that can fail', () => {
+    expect(stopHandler).toBeGreaterThan(handler)
+    const stopBody = page.slice(stopHandler, stopHandler + 2600)
+    expect(stopBody).toContain('pendingStopInterruptionBySession.set(sessionId, {')
+    expect(stopBody).toContain('messageId: previousMessageId')
+    expect(stopBody).toContain('interruptedAt: new Date().toISOString()')
+
+    // Above the fetch, the abort and the finalise — all three can throw or hang, and the
+    // note is now the only thing that tells the model the reply was cut.
+    const record = page.indexOf('pendingStopInterruptionBySession.set(sessionId, {', stopHandler)
+    expect(record).toBeGreaterThan(stopHandler)
+    expect(record).toBeLessThan(page.indexOf("'/api/messages/interrupt'", stopHandler))
+    expect(record).toBeLessThan(page.indexOf('runState.abortController.abort()', stopHandler))
+
+    // No id, no record: an addendum about "the previous response" that cannot name it.
+    // Pinned as the WHOLE guard, its body on the next line, because a text claim that only
+    // asks whether a call appears cannot tell a live call from a disabled one.
+    expect(page).toContain(
+      'if (previousMessageId) {\n\t      pendingStopInterruptionBySession.set(sessionId, {'
+    )
+  })
+
+  it('is the ONLY writer — a send never records one (DL-119-07)', () => {
+    expect(sendPath).not.toContain('pendingStopInterruptionBySession.set(')
+    expect(page.match(/pendingStopInterruptionBySession\.set\(/g)?.length ?? 0).toBe(1)
+  })
+
+  it('is consumed on the next ordinary send whether or not it is stamped', () => {
+    const read = sendPath.indexOf('pendingStopInterruptionBySession.get(currentSessionId)')
+    const consume = sendPath.indexOf('pendingStopInterruptionBySession.delete(currentSessionId)')
+    expect(read).toBeGreaterThan(-1)
+    expect(consume).toBeGreaterThan(read)
+    // Unconditional: the delete is the statement straight after the read, not a branch.
+    expect(sendPath.slice(read, consume)).not.toContain('if (')
+    // One Stop colours one send, so there is exactly one consumer.
+    expect(page.match(/pendingStopInterruptionBySession\.delete\(/g)?.length ?? 0).toBe(1)
+  })
+
+  it('asks ONE rule, and hands it all three facts', () => {
+    // The decision itself lives in the rules module, where a mutation to it turns a test
+    // red — a claim about this file's text cannot do that, which is why the first draft of
+    // this pin survived `false &&` in front of the whole condition. What is pinned HERE is
+    // that the page asks that rule rather than restating it.
+    const call = sendPath.indexOf('const stopInterruption = resolveStopInterruptionStamp({')
+    expect(call).toBeGreaterThan(-1)
+    const body = sendPath.slice(call, call + 260)
+    expect(body).toContain('record: stopInterruptionRecord')
+    expect(body).toContain('browserQueued: clientQueueEligible')
+    expect(body).toContain('latestAssistantMessageId')
+    // And the page computes the third fact from the store rather than trusting a variable.
+    expect(sendPath).toContain('const latestAssistantMessageId = (() => {')
+    expect(sendPath).toContain("if (candidate?.role === 'assistant') return candidate.id ?? null")
+    // No second opinion anywhere: the page states the rule nowhere else.
+    expect(page.match(/resolveStopInterruptionStamp\(/g)?.length ?? 0).toBe(1)
+  })
+
+  it('is reached only after a steer and both queues have had their say', () => {
+    // Steer and the SERVER-held queue return above it; the claim is the ORDER. The
+    // BROWSER-held queue falls THROUGH to here, which is why the rule is handed
+    // `browserQueued` at all — see the rules module's own test for what it does with it.
+    const steerBranch = sendPath.indexOf('if (steerBranchEligible || serverQueueEligible) {')
+    const clientQueue = sendPath.indexOf('if (clientQueueEligible) {')
+    const read = sendPath.indexOf('pendingStopInterruptionBySession.get(currentSessionId)')
+    expect(steerBranch).toBeGreaterThan(-1)
+    expect(clientQueue).toBeGreaterThan(steerBranch)
+    expect(read).toBeGreaterThan(clientQueue)
+  })
+
+  it('rides BOTH write sites, like `metadata.wake`', () => {
+    // The persisted user message and the send-routed body. `send-routed` reads the request
+    // metadata first and the message record second; a recompile only ever has the record.
+    expect(page.match(/interruption: stopInterruption \?\? undefined/g)?.length ?? 0).toBe(2)
+    const userRecord = page.indexOf('const userMessage = {', handler)
+    const requestBody = page.indexOf('const requestMetadata = {', handler)
+    expect(userRecord).toBeGreaterThan(-1)
+    expect(requestBody).toBeGreaterThan(userRecord)
+    expect(page.indexOf('interruption: stopInterruption', userRecord)).toBeLessThan(requestBody)
+    expect(page.indexOf('interruption: stopInterruption', requestBody)).toBeGreaterThan(requestBody)
+    // Computed before either one, or the stamp would be read after it was needed.
+    const read = page.indexOf('pendingStopInterruptionBySession.get(currentSessionId)', handler)
+    expect(read).toBeLessThan(userRecord)
+  })
+
+  it('did not bring interrupt-and-send back with it (DL-119-07)', () => {
+    // The same three claims as above, re-asserted against the packet that touched this
+    // path last: recording what Stop did is not the same as doing it from a send.
+    expect(sendPath).not.toContain('/api/messages/interrupt')
+    expect(sendPath).not.toContain('abortController.abort()')
+    expect(sendPath).not.toContain('Interrupting active stream')
+  })
+
+  it('leaves the retry window alone — it is a different fact (F-P2-7)', () => {
+    // `lastManualInterruptAtBySession` is an 8-second window read repeatedly and never
+    // consumed. Folding the stamp into it would make consuming the stamp close the
+    // session-turn retry as well.
+    expect(page).toContain('const lastManualInterruptAtBySession = new Map<string, number>()')
+    expect(page).toContain(
+      'Date.now() - (lastManualInterruptAtBySession.get(currentSessionId) ?? 0) < 8_000'
+    )
+    expect(page).not.toContain('lastManualInterruptAtBySession.delete(')
   })
 })
 

@@ -153,12 +153,14 @@
     isSteerDeliver,
     resolveBusySendActions,
     resolveBusySendMode,
+    resolveStopInterruptionStamp,
     QUEUE_ONE_AT_A_TIME_SENTENCE,
     QUEUE_ONE_AT_A_TIME_TEXT_SENTENCE,
     STEER_REFUSED_GROUP_SENTENCE,
     STEER_REFUSED_UNKNOWN_SENTENCE,
     type BusySendMode,
-    type SteerDeliver
+    type SteerDeliver,
+    type StopInterruptionRecord
   } from '$lib/utils/steerControl'
   import * as steerInbox from '$lib/stores/steerInbox.svelte'
   import { stripGatewayPrefix } from '$lib/utils/toolNameFormatter'
@@ -1808,6 +1810,20 @@ const immersiveActive = $derived.by(
 	  const sendInFlightBySession = new Map<string, boolean>()
 	  const sendInFlightSerialBySession = new Map<string, number>()
 	  const lastManualInterruptAtBySession = new Map<string, number>()
+
+	  /**
+	   * SA-119 P2b (F-P2-7) — what Stop leaves behind for the next ordinary send.
+	   *
+	   * `metadata.interruption` is what send-routed turns into the model's
+	   * `==== INTERRUPTION NOTE ====`, and DL-119-07 deleted its only writer along with
+	   * interrupt-and-send. Stop, then Enter, is the whole gesture now, so Stop is what has
+	   * to record it: which reply it cut, and when.
+	   *
+	   * Kept apart from `lastManualInterruptAtBySession`, which is a retry WINDOW — eight
+	   * seconds, read repeatedly, never consumed. Folding the two together would make
+	   * consuming the stamp silently close the session-turn retry as well.
+	   */
+	  const pendingStopInterruptionBySession = new Map<string, StopInterruptionRecord>()
 
 	  function isSendInFlight(sessionId: string) {
 	    return sendInFlightBySession.get(sessionId) === true
@@ -5100,6 +5116,36 @@ const immersiveActive = $derived.by(
 	    // retired interrupt-and-send, and Stop is the only thing that interrupts.
 	    stopRealtimeSpeechPlayback()
 
+	    /**
+	     * SA-119 P2b (F-P2-7) — the interruption note, written from Stop's record alone.
+	     *
+	     * The record is CONSUMED here whatever happens next, so one Stop can only ever
+	     * colour the one send that follows it. Whether it then becomes a stamp is
+	     * `resolveStopInterruptionStamp`'s decision, in the rules module beside
+	     * `resolveBusySendActions`, because it has real behaviour and belongs where a test
+	     * can mutate it — this file can only be pinned on order and reachability.
+	     *
+	     * `browserQueued` is the half that is easy to miss: a steer and a server-held queue
+	     * return far above, but a BROWSER-held queue falls through to exactly here, and what
+	     * it waits for — "the reply ends" — is precisely what a Stop makes happen.
+	     */
+	    const stopInterruptionRecord =
+	      pendingStopInterruptionBySession.get(currentSessionId) ?? null
+	    pendingStopInterruptionBySession.delete(currentSessionId)
+	    const latestAssistantMessageId = (() => {
+	      const sessionMessages = messageStore.getMessages(currentSessionId)
+	      for (let index = sessionMessages.length - 1; index >= 0; index -= 1) {
+	        const candidate = sessionMessages[index]
+	        if (candidate?.role === 'assistant') return candidate.id ?? null
+	      }
+	      return null
+	    })()
+	    const stopInterruption = resolveStopInterruptionStamp({
+	      record: stopInterruptionRecord,
+	      browserQueued: clientQueueEligible,
+	      latestAssistantMessageId
+	    })
+
 	    const pendingZipControl = currentSessionId ? zipControlPendingBySession.get(currentSessionId) : null
 	    if (pendingZipControl) {
 	      try {
@@ -5139,6 +5185,9 @@ const immersiveActive = $derived.by(
           metadata?.skillInvocation && typeof metadata.skillInvocation === 'object'
             ? metadata.skillInvocation
             : undefined,
+        // F-P2-7: both write sites, as `metadata.wake` learned to be — send-routed reads
+        // the request body first and this record second, and a recompile only has this one.
+        interruption: stopInterruption ?? undefined,
         zipIds: []
       }
     }
@@ -5241,7 +5290,8 @@ const immersiveActive = $derived.by(
             tts: metadata?.tts ?? false,
             voiceMode: metadata?.voiceMode ?? (voiceMode ? 'voice' : 'text'),
             realtime: metadata?.realtime ?? false,
-              };
+            interruption: stopInterruption ?? undefined
+          };
 
         try {
 	          const messagesForSend = getMessagesForSend(currentSessionId, sendManualTrimProtections)
@@ -5424,6 +5474,18 @@ const immersiveActive = $derived.by(
 	    const runState = chatRunRegistry.getRunState(sessionId)
 	    const previousMessageId =
 	      runState.activeMessageId ?? runState.activeStreamMessageIds[0] ?? null
+
+	    // F-P2-7: written here, above everything that can throw, time out or be aborted,
+	    // because the note on the next send is now the only thing that tells the model the
+	    // user cut this reply short. No id means nothing to name — an addendum about "the
+	    // previous response" that cannot say which one is not worth writing — so no record
+	    // is left and no note is stamped.
+	    if (previousMessageId) {
+	      pendingStopInterruptionBySession.set(sessionId, {
+	        messageId: previousMessageId,
+	        interruptedAt: new Date().toISOString()
+	      })
+	    }
 
 	    stopRealtimeSpeechPlayback(previousMessageId)
 	    // SA-114 P3 (F-P3-B): Stop promotes nothing (DL-114-07), so anything still waiting is

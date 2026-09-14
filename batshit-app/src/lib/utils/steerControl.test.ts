@@ -16,6 +16,7 @@ import {
   readMessageSteers,
   resolveBusySendMode,
   resolveSteerability,
+  resolveStopInterruptionStamp,
   STEER_TEXT_MAX_CHARS,
   STEER_WRAPPER_GUIDANCE_EXAMPLES,
   QUEUED_AFTER_REPLY_SENTENCE,
@@ -597,5 +598,110 @@ describe('classifySteerRefusal (PR #106 review, F-4; DL-119-07)', () => {
     expect(classifySteerRefusal(401, { error: 'Unauthorized' })).toBe('refused')
     expect(classifySteerRefusal(500, null)).toBe('refused')
     expect(classifySteerRefusal(null, undefined)).toBe('refused')
+  })
+})
+
+/**
+ * SA-119 P2b (F-P2-7) — the interruption note after Stop, then Enter.
+ *
+ * `send-routed` builds the model's `==== INTERRUPTION NOTE ====` from
+ * `metadata.interruption`; DL-119-07 deleted the branch that was its only writer, so
+ * between the packets the model stopped being told that the user cut a reply short. Stop's
+ * record is the only source now, and this is the whole decision about what it becomes.
+ */
+describe('resolveStopInterruptionStamp (SA-119 P2b)', () => {
+  const record = { messageId: 'msg_assistant_1', interruptedAt: '2026-09-13T20:00:00.000Z' }
+
+  it('stamps the send that follows a Stop', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record,
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toEqual({
+      previousMessageId: 'msg_assistant_1',
+      interruptedAt: '2026-09-13T20:00:00.000Z',
+      reason: 'user'
+    })
+  })
+
+  it('says nothing when there was no Stop', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record: null,
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+  })
+
+  it('says nothing when the browser was holding this message (DL-119-06)', () => {
+    // The case the packet row called impossible. A steer and a server-held queue return
+    // before the ordinary send path, but a browser-held queue falls through into it — and
+    // it is waiting for "the reply ends", which is exactly what Stop makes happen. Without
+    // this the model is told the user cut short a reply the user chose to wait behind.
+    expect(
+      resolveStopInterruptionStamp({
+        record,
+        browserQueued: true,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+  })
+
+  it('says nothing once another turn has landed on top of the stopped one', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record,
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_2'
+      })
+    ).toBeNull()
+  })
+
+  it('says nothing when the chat has no assistant message to name', () => {
+    for (const latest of [null, undefined, '', '   ']) {
+      expect(
+        resolveStopInterruptionStamp({
+          record,
+          browserQueued: false,
+          latestAssistantMessageId: latest
+        })
+      ).toBeNull()
+    }
+  })
+
+  it('refuses a half-written record rather than completing it', () => {
+    // A fabricated timestamp would be a silent fallback inside a note whose entire job is
+    // to be true about one specific message.
+    expect(
+      resolveStopInterruptionStamp({
+        record: { messageId: 'msg_assistant_1', interruptedAt: '' },
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+    expect(
+      resolveStopInterruptionStamp({
+        record: { messageId: '  ', interruptedAt: '2026-09-13T20:00:00.000Z' },
+        browserQueued: false,
+        latestAssistantMessageId: 'msg_assistant_1'
+      })
+    ).toBeNull()
+  })
+
+  it('matches the ids it was given, whitespace and all', () => {
+    expect(
+      resolveStopInterruptionStamp({
+        record: { messageId: ' msg_assistant_1 ', interruptedAt: ' 2026-09-13T20:00:00.000Z ' },
+        browserQueued: false,
+        latestAssistantMessageId: ' msg_assistant_1 '
+      })
+    ).toEqual({
+      previousMessageId: 'msg_assistant_1',
+      interruptedAt: '2026-09-13T20:00:00.000Z',
+      reason: 'user'
+    })
   })
 })
