@@ -141,7 +141,7 @@ for (const prompt of [
 
 const teamInstructions = files.find((relativePath) => relativePath.endsWith('/AGENTS.md'))
 if (teamInstructions && (await exists(teamInstructions))) {
-  await requireText(teamInstructions, 'Batshit exposes two user-facing Primary Agent types.', 'the team-instruction two-type rule')
+  await requireText(teamInstructions, 'Only **API** and **CLI** are Primary Agent types.', 'the team-instruction two-type rule')
 }
 
 const promptDefaults = (await fs.readdir(path.join(repoRoot, 'docs/batshit_System_Prompts'))).filter((name) =>

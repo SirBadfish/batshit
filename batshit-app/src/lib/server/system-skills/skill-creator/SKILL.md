@@ -246,7 +246,10 @@ Provide:
 Important `sys.skill.save` behavior:
 - It creates or updates by command ID. Reusing the same `commandId` updates that command instead of creating a duplicate.
 - It refuses protected system skills. If the app says a system skill cannot be saved from chat, explain that system skills are product-owned and must be updated in the packaged source by the Batshit developers.
-- It can set command metadata such as invocation, display name, description, category, icon, `enabledForAllAgents`, `enabledAgentIds`, `isActive`, and the skill's allowed tools, trust level, standards status, dependencies, and bundle files.
+- It can set command metadata such as invocation, display name, description, category, icon, `isActive`, and the skill's allowed tools, trust level, standards status, dependencies, and bundle files.
+- Who may use a skill is the user's setting, not the save's. A NEW skill is on for you only, so you can test it. An EXISTING command keeps the access the user set, and a command the user switched off stays off. `enabledForAllAgents` and `enabledAgentIds` are not applied; the save result carries `accessNote` when you asked for them. Tell the user to turn the skill on for other agents in Settings > Agents > Access (one agent) or Settings > Skills & Prompts (all agents).
+- It refuses a new command for a skill that already exists. Update an existing skill through its own command ID.
+- You can update only a skill that is on for you. If the user asks you to change one that is off for you, ask them to turn it on for you first, or to edit it in Settings > Skills & Prompts.
 - Put capability-specific fields inside the nested `input` object when calling the Fabric broker.
 
 If updating an existing skill, prefer updating over creating a duplicate. Check first through Fabric or the visible Settings state, not by reading product source files.
@@ -258,7 +261,7 @@ Tell the user:
 - How to invoke it (type `/<name>` in chat)
 - What references and scripts are included, if any
 - Any dependencies it requires
-- That they can enable it for specific agents in Settings > Skills & Prompts
+- That an agent can only load it while it is on for that agent: Settings > Agents > Access (one agent) or Settings > Skills & Prompts (all agents)
 - If the skill depends on CLI tools, remind them to set those up first (via `/cli-tool-creator` or Settings > Tools)
 
 ---

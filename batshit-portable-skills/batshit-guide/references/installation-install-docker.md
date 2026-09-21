@@ -37,7 +37,7 @@ docker compose version
 node --version
 ```
 
-Node should be version 24 or newer.
+Node should be version 24 or newer. Docker Desktop must be running before you start Batshit.
 
 ## Clone Batshit
 
@@ -46,7 +46,15 @@ git clone https://github.com/SirBadfish/batshit.git
 cd batshit
 ```
 
-Start from the folder that contains `compose.yaml` and `start-docker.sh`.
+Run every command below from this folder, the one that contains `compose.yaml` and `start-docker.sh`.
+
+## Start Docker Batshit
+
+On macOS, Linux, or a shell that can run repo scripts:
+
+```sh
+./start-docker.sh
+```
 
 On Windows PowerShell, use the Node launcher directly:
 
@@ -54,42 +62,32 @@ On Windows PowerShell, use the Node launcher directly:
 node tools/docker/start-docker.mjs
 ```
 
-On macOS, Linux, or a shell that can run repo scripts, use:
+On the first start the launcher creates `.env.docker` from `.env.docker.example`, generates its two secrets (`BATSHIT_TOKEN` and `ENCRYPTION_KEY`), points `/workspace` at this folder, starts Batshit's Docker Sandbox/runtime add-on host operator, starts the optional Docker MCP Gateway if configured, then runs Docker Compose. The first start also builds Batshit's images, so it takes a few minutes; later starts take seconds.
 
-```sh
-./start-docker.sh
+When it prints `Batshit Docker is starting at http://localhost:5620`, open:
+
+```text
+http://localhost:5620
 ```
 
-## Create `.env.docker`
+On macOS, the first run may show a system prompt like `"node" would like to access data from other apps`. That's the host-side helper used for Docker Sandbox and approved sidecar start/stop controls. Allow it if you want those features.
 
-Copy the example:
+The normal Docker start does not start n8n. Existing n8n is first-class; only use the `n8n` profile when you intentionally want Batshit Compose to run a separate local n8n for this instance.
 
-```sh
-cp .env.docker.example .env.docker
-```
+## Your settings file: `.env.docker`
 
-Generate two stable secrets:
-
-```sh
-openssl rand -hex 32
-openssl rand -hex 32
-```
-
-Open `.env.docker` and replace:
-
-```env
-BATSHIT_TOKEN=replace-with-a-long-random-token
-ENCRYPTION_KEY=replace-with-a-long-stable-secret-at-least-32-chars
-```
-
-with your generated values. Keep both stable after first boot:
+The launcher wrote `.env.docker` for you. Two values in it must stay the same after the first start:
 
 - `BATSHIT_TOKEN` is the internal service token used by Batshit, batshit-server, and n8n callbacks.
-- `ENCRYPTION_KEY` encrypts saved API keys and custom provider secrets.
+- `ENCRYPTION_KEY` encrypts saved API keys and custom provider secrets. If it changes, you re-enter your saved keys.
 
-The launcher can generate missing placeholder secrets, but setting them yourself makes the boundary explicit and easier to back up.
+Keep a private copy of `.env.docker` with your backups.
+
+If you'd rather choose the two secrets yourself, do it before the first start: copy the example (`cp .env.docker.example .env.docker`), make two random values with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` (run it twice; it works on every system, including Windows), and put them in place of the `replace-with-…` placeholders.
 
 By default Docker publishes Batshit's ports on `127.0.0.1` (`BATSHIT_DOCKER_BIND_HOST=127.0.0.1`), so only the computer running Docker can reach them. Setting `BATSHIT_DOCKER_BIND_HOST=0.0.0.0` in `.env.docker` exposes Batshit to your local network — only do that on a network you trust, because Batshit is a single-user app and isn't hardened for untrusted LAN access.
+
+If another program already uses port `5620` or `5600`, see [Port conflicts](../troubleshooting/docker.md#port-conflicts).
 
 ## Choose your workspace mount
 
@@ -109,31 +107,33 @@ Inside Docker, Batshit sees that folder as:
 
 Project source files are not copied by Batshit backups. Keep your source in Git or your own backup system.
 
-## Start Docker Batshit
+## Set up Docker Sandbox
 
-Start the core stack on macOS/Linux:
+Skip this for your first chat. Batshit starts and chats without it; only agent commands that use the Docker Sandbox backend need it.
 
-```sh
-./start-docker.sh
-```
+Docker Sandbox is where Batshit runs an agent's shell commands when you want them walled off from your computer. Each chat gets a small throwaway virtual machine. It can see your project folder, but not the rest of your files, and its outbound network is blocked. It runs through Docker's free `sbx` tool, which lives on your computer (the host), not inside the Batshit containers.
 
-Or on Windows PowerShell:
+Set it up once:
 
-```powershell
-node tools/docker/start-docker.mjs
-```
+1. Install `sbx`:
+   - Windows 11, in PowerShell: `winget install -h Docker.sbx`. Docker Sandboxes also needs the Windows Hypervisor Platform. Turn it on with `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All` in an administrator PowerShell, then restart.
+   - macOS 14 or newer on Apple silicon: `brew install docker/tap/sbx`.
+   - Linux: follow [Docker's install guide](https://docs.docker.com/ai/sandboxes/install/).
+2. Sign in with your Docker account. A free account works:
 
-Open:
+   ```sh
+   sbx login
+   ```
 
-```text
-http://localhost:5620
-```
+3. Pick the default network rules for all your sandboxes. `balanced` is Docker's recommended choice, and Batshit still blocks all network inside its own sandboxes:
 
-The launcher prepares `.env.docker`, starts Batshit's Docker Sandbox/runtime add-on host operator, starts the optional Docker MCP Gateway if configured, then runs Docker Compose.
+   ```sh
+   sbx policy init balanced
+   ```
 
-On macOS, the first run may show a system prompt like `"node" would like to access data from other apps`. That's the host-side helper used for Docker Sandbox and approved sidecar start/stop controls. Allow it if you want those features.
+The first sandbox downloads Docker's sandbox image (about 460 MB), so the first sandboxed command can take a minute or two. After that, a new chat's sandbox starts in a few seconds.
 
-The normal Docker start does not start n8n. Existing n8n is first-class; only use the `n8n` profile when you intentionally want Batshit Compose to run a separate local n8n for this instance.
+If a step is missing, `./start-docker.sh` says which one when it starts, and so does Settings → Admin → Runtimes → Docker Sandbox Runtime.
 
 ## Start with the optional Docker n8n profile
 
@@ -311,7 +311,11 @@ Run:
 ./start-docker.sh
 ```
 
-The public launcher starts the host operator and fills the app's operator URL/token values.
+The public launcher starts the host operator and fills the app's operator URL/token values. The operator stops by itself about ten minutes after Docker Batshit stops, so if you later started Docker Batshit some other way (Docker Desktop, or `docker compose up`), run `./start-docker.sh` once to bring the operator back.
+
+### Docker Sandbox says to install, sign in, or set up `sbx`
+
+Do the step it names, from [Set up Docker Sandbox](#set-up-docker-sandbox): install `sbx`, run `sbx login`, or run `sbx policy init balanced`. Then run `./start-docker.sh` again, or press Refresh on the Docker Sandbox Runtime card in Settings → Admin → Runtimes.
 
 ### Project files are missing
 

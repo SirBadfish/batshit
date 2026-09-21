@@ -7,10 +7,16 @@
  * chat that Batshit starts on its own (a wake-up) would simply not appear until the next
  * page load, and the run spinner and the three-active-chats cap would not count it.
  *
- * This module opens exactly one `EventSource` per browser tab and applies what it hears
+ * This module holds one user-channel subscription per browser tab and applies what it hears
  * to the stores the sidebar already reads, so no component needs new wiring. Consumers
  * that want to react to a specific event (the chat page refetching messages when a woken
  * turn completes) subscribe through `onUserChannelEvent`.
+ *
+ * The subscription rides the browser's ONE shared live connection (the live hub,
+ * 2026-09-18, `$lib/services/liveHub/`): each tab used to open its own `EventSource` here,
+ * which with the chat stream beside it held two of the browser's six connections per server,
+ * so three tabs froze every request. The hub reconnects by itself, so this module no longer
+ * keeps its own retry timer.
  *
  * `SA-111b`'s "your background worker finished" event lands on this same channel.
  */
@@ -18,12 +24,20 @@
 import * as sessionStore from '$lib/stores/session.svelte'
 import * as chatRunRegistry from '$lib/stores/chatRunRegistry.svelte'
 import { applyDmInboxChanged } from '$lib/stores/dmInbox.svelte'
+import { subscribeLive, type LiveSubscription } from '$lib/services/liveHub/liveHubClient'
 import { logger } from '$lib/utils/logger'
 
 export type UserChannelEvent =
   | { type: 'connected'; scope: 'user' }
   | { type: 'session_created'; session: Record<string, any> }
   | { type: 'session_updated'; sessionId: string; patch: Record<string, any> }
+  /**
+   * A chat was deleted, from any tab or route (2026-09-18). Every tab drops it from the
+   * sidebar here; the chat page also forgets its messages and live connection, and leaves it
+   * when it was on screen. Before this event a chat deleted in one tab stayed in every other
+   * tab until that tab reloaded.
+   */
+  | { type: 'session_deleted'; sessionId: string }
   | {
       type: 'session_run_status'
       sessionId: string
@@ -65,18 +79,37 @@ export type UserChannelEvent =
         nextRunAt: string
       }[]
     }
+  /**
+   * SA-120 P5 — Batshit itself changed zip state in a session (Jev Juice smart zip opened a
+   * zipped result for a message, or zipped a finished one after a reply; `source: 'inferred'`).
+   * The server wrote Redis; every tab showing that session re-reads zip state so the badge and
+   * the ordinary countdown are right. Handled by the chat page, not by `applyToStores`.
+   */
+  | { type: 'zip_state_changed'; sessionId: string; source: 'inferred'; opened: string[]; rezipped: string[] }
+  /**
+   * SA-120 P6 — the Jev Juice after-reply check stored something about a finished reply (a
+   * flag, a style note, or a note that a lane could not run). It happens once the session
+   * stream has already emitted `end`, so the user channel carries it, and every tab showing
+   * that session re-reads the chat's after-reply records to draw the chip. Handled by the chat
+   * page, not by `applyToStores`.
+   */
+  | { type: 'jev_juice_post_turn'; sessionId: string; messageId: string }
+  /**
+   * The SERVER changed a chat's stored messages in a way no stream event can show a tab:
+   * an approval resume that streams into a message every tab has already marked finished,
+   * an approval card the server settled, or a message deleted in another tab. The tab
+   * showing that chat re-reads it. Handled by the chat page, not by `applyToStores`.
+   *
+   * It exists because until 2026-09-18 the chat page re-fetched the open chat about ten
+   * times a second, so none of these ever had to be said out loud.
+   */
+  | { type: 'session_messages_changed'; sessionId: string; reason: string }
   | (Record<string, any> & { type: string })
 
 type Listener = (event: UserChannelEvent) => void
 
-const MAX_RECONNECT_ATTEMPTS = 8
-const MAX_RECONNECT_DELAY_MS = 30_000
-
-let source: EventSource | null = null
+let subscription: LiveSubscription | null = null
 let connectedUserId: string | null = null
-let reconnectAttempts = 0
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-let stopped = false
 let holders = 0
 
 const listeners = new Set<Listener>()
@@ -124,6 +157,15 @@ function applyToStores(event: UserChannelEvent) {
       }
       break
     }
+    case 'session_deleted': {
+      const { sessionId } = event as any
+      if (typeof sessionId === 'string' && sessionId) {
+        sessionStore.deleteSession(sessionId)
+        // Its spinner, and its place in the three-active-chats count, go with it.
+        chatRunRegistry.resetRunState(sessionId)
+      }
+      break
+    }
     case 'session_run_status': {
       const { sessionId, status, steerable, steerReason, messageId } = event as any
       if (typeof sessionId === 'string' && SERVER_RUN_STATUSES.includes(status)) {
@@ -151,60 +193,33 @@ function applyToStores(event: UserChannelEvent) {
   }
 }
 
-function scheduleReconnect(userId: string) {
-  if (stopped) return
-  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    logger.warn('[UserChannel] Giving up after repeated reconnect failures.')
+function handleMessage(text: string) {
+  let parsed: UserChannelEvent | null = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {
     return
   }
-  reconnectAttempts += 1
-  const delay = Math.min(1000 * 2 ** (reconnectAttempts - 1), MAX_RECONNECT_DELAY_MS)
-  if (reconnectTimer) clearTimeout(reconnectTimer)
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null
-    open(userId)
-  }, delay)
+  if (!parsed || typeof parsed.type !== 'string') return
+  applyToStores(parsed)
+  emit(parsed)
 }
 
 function open(userId: string) {
-  if (typeof window === 'undefined' || typeof EventSource === 'undefined') return
-  if (source) return
-
-  try {
-    const next = new EventSource('/api/sse?scope=user')
-    source = next
-    connectedUserId = userId
-
-    next.onopen = () => {
-      reconnectAttempts = 0
-      logger.debug('[UserChannel] Connected.')
-    }
-
-    next.onmessage = (message) => {
-      let parsed: UserChannelEvent | null = null
-      try {
-        parsed = JSON.parse(message.data)
-      } catch {
-        return
-      }
-      if (!parsed || typeof parsed.type !== 'string') return
-      applyToStores(parsed)
-      emit(parsed)
-    }
-
-    next.onerror = () => {
-      // EventSource reconnects on its own for transient drops, but a closed source is
-      // terminal (a 401 after a logout, for example), so back off and retry deliberately.
-      if (next.readyState === EventSource.CLOSED) {
-        source = null
-        scheduleReconnect(userId)
+  if (typeof window === 'undefined') return
+  if (subscription) return
+  connectedUserId = userId
+  subscription = subscribeLive(
+    { scope: 'user' },
+    {
+      onEvent: handleMessage,
+      onStatus: (status, code) => {
+        if (status === 'open') logger.debug('[UserChannel] Connected.')
+        else if (status === 'down') logger.debug('[UserChannel] Live connection dropped; reconnecting.')
+        else logger.warn('[UserChannel] The server refused the user channel:', code)
       }
     }
-  } catch (error) {
-    logger.warn('[UserChannel] Failed to open:', error)
-    source = null
-    scheduleReconnect(userId)
-  }
+  )
 }
 
 /**
@@ -221,7 +236,6 @@ export function startUserChannel(userId?: string | null): () => void {
     stopUserChannel()
   }
 
-  stopped = false
   holders += 1
   open(normalized)
 
@@ -235,24 +249,13 @@ export function startUserChannel(userId?: string | null): () => void {
 }
 
 export function stopUserChannel() {
-  stopped = true
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
-  if (source) {
-    try {
-      source.close()
-    } catch {
-      // Already closed.
-    }
-  }
-  source = null
+  const current = subscription
+  subscription = null
+  current?.unsubscribe()
   connectedUserId = null
-  reconnectAttempts = 0
   holders = 0
 }
 
 export function isUserChannelConnected(): boolean {
-  return Boolean(source && source.readyState === EventSource.OPEN)
+  return subscription?.state() === 'open'
 }

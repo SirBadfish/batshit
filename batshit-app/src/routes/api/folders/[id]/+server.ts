@@ -1,6 +1,10 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
+import {
+  SessionDeleteRefusedError,
+  deleteSessionStoppingItsTurn
+} from '$lib/server/services/sessionDeleteTurnStop'
 import type { ChatFolderRow } from '$lib/types/database'
 
 // PUT /api/folders/{id} - Update folder (rename, reorder, expand/collapse)
@@ -54,7 +58,13 @@ export const DELETE: RequestHandler = async ({ params, locals, url }) => {
     }
     
     const deleteSessions = url.searchParams.get('deleteSessions') === 'true'
-    const result = await redis.deleteFolder(userId, folderId, { deleteSessions })
+    // Each chat goes the way the session route deletes one: its running reply is stopped first
+    // and the chat is swept once that reply's request is done (`sessionDeleteTurnStop.ts`).
+    const result = await redis.deleteFolder(
+      userId,
+      folderId,
+      deleteSessions ? { deleteSessions: true, deleteSession: deleteSessionStoppingItsTurn } : {}
+    )
     
     if (!result.success) {
       const status = result.error?.includes('locked') ? 409 : 500
@@ -63,6 +73,11 @@ export const DELETE: RequestHandler = async ({ params, locals, url }) => {
     
     return json(result)
   } catch (error) {
+    // A chat in the folder whose reply did not stop in time is not deleted, nor is the folder;
+    // the chats before it are gone, and a retry finishes the rest (`sessionDeleteTurnStop.ts`).
+    if (error instanceof SessionDeleteRefusedError) {
+      return json({ error: error.message, code: error.code }, { status: error.status })
+    }
     console.error('Error deleting folder:', error)
     return json({ error: 'Failed to delete folder' }, { status: 500 })
   }

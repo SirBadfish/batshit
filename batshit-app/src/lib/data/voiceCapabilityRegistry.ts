@@ -51,7 +51,7 @@ export type ValidatedVoiceOptions = {
 
 const OPENAI_FORMAT_OPTIONS = ['mp3', 'opus', 'aac', 'flac', 'wav', 'pcm']
 const BASIC_AUDIO_FORMAT_OPTIONS = ['mp3', 'wav', 'flac']
-const DEEPGRAM_ENCODING_OPTIONS = ['linear16', 'mulaw', 'alaw', 'mp3', 'opus', 'flac']
+const DEEPGRAM_ENCODING_OPTIONS = ['linear16', 'mulaw', 'alaw', 'mp3', 'opus', 'flac', 'aac']
 const DEEPGRAM_CONTAINER_OPTIONS = ['wav', 'ogg', 'none']
 const FISH_FORMAT_OPTIONS = ['pcm']
 const FISH_SAMPLE_RATE_OPTIONS = ['16000', '24000', '32000', '44100']
@@ -122,6 +122,55 @@ export const OPENAI_STT_CAPABILITIES: VoiceSttCapabilityProfile = {
   notes: [
     'The recorded transcription lane uses OpenAI audio transcription models.',
     'Realtime transcription sessions are tracked as a separate future voice-session lane.'
+  ]
+}
+
+export const GOOGLE_STT_CAPABILITIES: VoiceSttCapabilityProfile = {
+  recorded: true,
+  realtime: false,
+  turnDetection: false,
+  vad: false,
+  partialResults: false,
+  finalResults: true,
+  wordTimestamps: true,
+  diarization: true,
+  languageDetection: true,
+  keyterms: true,
+  transport: 'http-upload',
+  runtimeSupport: 'supported',
+  cost: 'paid',
+  privacy: 'cloud',
+  setupWeight: 'light',
+  runtimeLabel: 'Recorded Gemini 3.5 Transcribe STT',
+  unsupportedReason:
+    'Gemini live transcription uses a separate Live API contract; Batshit only owns the recorded/uploaded path here.',
+  notes: [
+    'Gemini 3.5 Transcribe uploads the recording through the Google Files API, calls the Interactions API, then deletes the temporary file.',
+    'Smart mode cannot be combined with speaker diarization or word timestamps. Custom vocabulary cannot be combined with either feature.'
+  ]
+}
+
+export const MIMO_STT_CAPABILITIES: VoiceSttCapabilityProfile = {
+  recorded: true,
+  realtime: false,
+  turnDetection: false,
+  vad: false,
+  partialResults: false,
+  finalResults: true,
+  wordTimestamps: false,
+  diarization: false,
+  languageDetection: true,
+  keyterms: false,
+  transport: 'http-upload',
+  runtimeSupport: 'supported',
+  cost: 'paid',
+  privacy: 'cloud',
+  setupWeight: 'light',
+  runtimeLabel: 'Recorded MiMo V2.5 ASR',
+  unsupportedReason: 'MiMo V2.5 ASR is an uploaded-audio path in Batshit, not a realtime microphone session.',
+  notes: [
+    'MiMo V2.5 ASR accepts WAV or MP3 and supports automatic Chinese/English language detection plus Chinese dialects.',
+    'The separate MiMo Token Plan key and endpoint are preferred when configured.'
   ]
 }
 
@@ -360,6 +409,56 @@ const elevenLabsFields: VoiceCapabilityField[] = [
   }
 ]
 
+const googleFields: VoiceCapabilityField[] = [
+  {
+    id: 'language',
+    scope: 'stt',
+    surface: 'global',
+    type: 'string',
+    path: 'language',
+    label: 'Language',
+    help: 'Optional BCP-47 language hint. Leave blank for automatic language detection.'
+  },
+  {
+    id: 'mode',
+    scope: 'stt',
+    surface: 'global',
+    type: 'select',
+    path: 'providerOptions.google.mode',
+    label: 'Transcription mode',
+    help: 'Verbatim preserves spoken wording. Smart removes disfluencies and applies readable formatting.',
+    options: ['verbatim', 'smart'],
+    defaultValue: 'verbatim'
+  },
+  {
+    id: 'customVocabulary',
+    scope: 'stt',
+    surface: 'global',
+    type: 'string',
+    path: 'providerOptions.google.customVocabulary',
+    label: 'Custom vocabulary',
+    help: 'Comma- or line-separated terms. Google accepts up to 1,000; this cannot be combined with diarization or word timestamps.'
+  },
+  {
+    id: 'diarization',
+    scope: 'stt',
+    surface: 'global',
+    type: 'boolean',
+    path: 'providerOptions.google.diarization',
+    label: 'Speaker diarization',
+    help: 'Label different speakers. Requires Verbatim mode.'
+  },
+  {
+    id: 'wordTimestamps',
+    scope: 'stt',
+    surface: 'global',
+    type: 'boolean',
+    path: 'providerOptions.google.wordTimestamps',
+    label: 'Word timestamps',
+    help: 'Return word start/end offsets. Requires Verbatim mode.'
+  }
+]
+
 const deepgramFields: VoiceCapabilityField[] = [
   {
     id: 'encoding',
@@ -378,6 +477,65 @@ const deepgramFields: VoiceCapabilityField[] = [
     path: 'providerOptions.deepgram.container',
     label: 'Container',
     options: DEEPGRAM_CONTAINER_OPTIONS
+  },
+  {
+    id: 'speed',
+    scope: 'tts',
+    surface: 'both',
+    type: 'number',
+    path: 'common.speed',
+    label: 'Speed',
+    help: 'Flux accepts 0.5 to 1.5 in 0.05 steps; Aura accepts 0.7 to 1.5.',
+    defaultValue: 1,
+    min: 0.5,
+    max: 1.5,
+    step: 0.05
+  },
+  {
+    id: 'sampleRate',
+    scope: 'tts',
+    surface: 'both',
+    type: 'number',
+    path: 'providerOptions.deepgram.sampleRate',
+    label: 'Sample rate',
+    help: 'Optional output sample rate in hertz.',
+    min: 8000,
+    max: 48000,
+    step: 1000
+  },
+  {
+    id: 'bitRate',
+    scope: 'tts',
+    surface: 'both',
+    type: 'number',
+    path: 'providerOptions.deepgram.bitRate',
+    label: 'Bit rate',
+    help: 'Optional compressed-audio bit rate for batch synthesis.',
+    min: 16000,
+    max: 320000,
+    step: 1000
+  },
+  {
+    id: 'expressivity',
+    scope: 'tts',
+    surface: 'both',
+    type: 'number',
+    path: 'providerOptions.deepgram.expressivity',
+    label: 'Flux expressivity',
+    help: 'Flux-only beta delivery register from -2 (calm) to 2 (animated).',
+    defaultValue: 0,
+    min: -2,
+    max: 2,
+    step: 1
+  },
+  {
+    id: 'mipOptOut',
+    scope: 'tts',
+    surface: 'both',
+    type: 'boolean',
+    path: 'providerOptions.deepgram.mipOptOut',
+    label: 'Opt out of model improvement',
+    help: 'Send Deepgram mip_opt_out=true for this synthesis request.'
   },
   {
     id: 'language',
@@ -610,6 +768,17 @@ const mimoFields: VoiceCapabilityField[] = [
     label: 'Audio format',
     options: ['wav', 'pcm16'],
     defaultValue: 'wav'
+  },
+  {
+    id: 'language',
+    scope: 'stt',
+    surface: 'both',
+    type: 'select',
+    path: 'language',
+    label: 'Recognition language',
+    help: 'Auto-detect, Chinese, or English. Chinese dialects are handled through the Chinese/auto modes.',
+    options: ['auto', 'zh', 'en'],
+    defaultValue: 'auto'
   }
 ]
 
@@ -983,14 +1152,15 @@ const baseRegistry: VoiceProviderCapability[] = [
     label: 'Google Gemini',
     supports: {
       tts: true,
-      stt: false,
+      stt: true,
       listVoices: true,
       clone: false,
       streaming: false
     },
+    sttCapabilities: GOOGLE_STT_CAPABILITIES,
     modelSource: 'static',
     voiceSource: 'static',
-    fields: []
+    fields: googleFields
   },
   {
     providerId: 'openai',
@@ -1086,11 +1256,12 @@ const baseRegistry: VoiceProviderCapability[] = [
     label: 'MiMo',
     supports: {
       tts: true,
-      stt: false,
+      stt: true,
       listVoices: true,
       clone: false,
       streaming: false
     },
+    sttCapabilities: MIMO_STT_CAPABILITIES,
     modelSource: 'static',
     voiceSource: 'static',
     fields: mimoFields

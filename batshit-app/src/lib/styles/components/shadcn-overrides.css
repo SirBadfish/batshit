@@ -59,7 +59,8 @@
 
 /* Sidebar Overrides */
 [data-slot="sidebar"] {
-  background-color: var(--sidebar-background);
+  /* `background`, not `background-color`: --sidebar-background is a painted gradient. */
+  background: var(--sidebar-background);
   border-color: var(--sidebar-border);
 }
 

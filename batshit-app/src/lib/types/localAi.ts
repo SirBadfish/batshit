@@ -7,6 +7,8 @@ export type LocalAiServerId =
   // SA-102 P5 (DL-102-07): added last, each proven against a real running server.
   | 'sglang'
   | 'omlx'
+  // SA-124 P0 (DL-124-01): proven against KoboldCpp 1.121, mac-arm64.
+  | 'koboldcpp'
 
 export type LocalAiImageTransport = 'auto' | 'url'
 

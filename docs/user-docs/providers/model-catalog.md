@@ -9,7 +9,7 @@ Every AI provider has its own model list, its own names, and its own quirks. Wit
 The Model Catalog solves that. It's one combined, searchable list that pulls together:
 
 - Hosted gateway models (Vercel AI Gateway, OpenRouter, and the providers they front).
-- Direct provider models for providers you've connected — OpenAI, Anthropic, Google, xAI, Mistral, Groq, DeepSeek, Together.ai, Fireworks AI, Baseten, Cerebras, MiniMax, MiMo, Cohere, and more.
+- Direct provider models for providers you've connected — OpenAI, Anthropic, Google, xAI, Mistral, Groq, DeepSeek, Together.ai, Fireworks AI, Baseten, Cerebras, MiniMax, MiMo, Cohere, and more. Separate Kimi Code, MiniMax Token Plan, MiMo Token Plan, Qwen Token Plan, and Z.ai Coding Plan routes appear when those subscriptions use distinct credentials or endpoints.
 - Your own [Local AI](../local-ai/overview.md) models, once a local program is enabled and reachable.
 
 Instead of memorizing model IDs, you browse the catalog, filter to what you want, and let Batshit fill in the exact identifiers. It lives in Settings → Models, with a toggleable catalog viewer for browsing and searching the full normalized list.
@@ -46,6 +46,7 @@ A few honest notes:
 - Catalog freshness isn't instant. A model a provider added minutes ago may not appear until the next refresh.
 - DeepInfra's active chat models come from its public model feed, so the shared catalog can stay current without putting your personal DeepInfra key in Batshit's Vercel project. Your saved key is still required locally when you actually send a message through DeepInfra.
 - Together.ai, Fireworks AI, Baseten, Cerebras, MiniMax, MiMo, and Cohere use their provider-published model lists. Batshit preserves each connection's exact request ID, including developer prefixes and Fireworks' full `accounts/fireworks/models/...` names.
+- Subscription connections with stable published rosters keep a docs-backed fallback even when Batshit's hosted sync cannot use your personal key. If a configured environment plan key exposes `/models`, Batshit merges that live list so newly advertised IDs can appear without deleting the reviewed fallback during an outage.
 
 If a model you expect is missing, confirm the relevant provider key is saved and the connection shows Ready before assuming the catalog is broken.
 

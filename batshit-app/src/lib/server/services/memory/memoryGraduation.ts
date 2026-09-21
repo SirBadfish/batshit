@@ -72,6 +72,7 @@ import {
   listEpisodes,
   markEpisodeGraduated,
   updateEpisodeWhiteboard,
+  whiteboardAuthor,
   type EpisodeRecord
 } from './memoryEpisodes'
 
@@ -103,6 +104,24 @@ export const NAP_COMPACTION_PROMPT = [
   '',
   'WHITEBOARD:',
   'The complete refreshed episode whiteboard: the load-bearing WORKING FACTS the ongoing work still depends on right now (current goal, key decisions, live state, open items, exact values). Start from the current whiteboard when one is provided, keep what still matters, drop what lapsed, add what the summarized stretch established. Compact bullet lines. This stays in front of the agent until the episode closes.',
+  '',
+  'Be explicit about uncertainty. Never invent results or hidden state.'
+].join('\n')
+
+/**
+ * 2026-09-19 (Josh): the agent owns its whiteboard. When the agent wrote the board, the nap
+ * asks the summary model for the SUMMARY only and shows the board as read-only context, so
+ * the summary does not repeat what the agent already keeps in front of itself.
+ */
+export const NAP_COMPACTION_SUMMARY_ONLY_PROMPT = [
+  'You are performing a Batshit "nap": mid-conversation memory relief for a long-running session. The older part of the CURRENT open work episode below will be replaced in the live window by your summary, while the originals move to searchable long-term memory. The recent conversation stays fully live.',
+  '',
+  'Return EXACTLY one section with this exact header on its own line:',
+  '',
+  'SUMMARY:',
+  'A dense, factual summary of the conversation segment below — facts, decisions, user preferences, task state, constraints, blockers, file paths, commands, results, and next steps that still matter. It becomes the searchable memory of this stretch and the gist left in the window.',
+  '',
+  'The agent keeps its own episode whiteboard (shown below as context). It is the agent\'s to maintain and is NOT part of your output; do not return a WHITEBOARD section.',
   '',
   'Be explicit about uncertainty. Never invent results or hidden state.'
 ].join('\n')
@@ -173,7 +192,7 @@ function isWindowSummaryMessage(message: Message): boolean {
 }
 
 async function loadOrderedSessionMessages(sessionId: string): Promise<Message[]> {
-  const raw = await redis.getSessionMessages(sessionId)
+  const raw = await redis.getAllSessionMessages(sessionId)
   return normalizeMessages(raw)
 }
 
@@ -383,7 +402,13 @@ async function appendNapRecord(
 
 const SECTION_HEADER_REGEX = /^\s*#{0,4}\s*(SUMMARY|WHITEBOARD)\s*:?\s*$/im
 
-export function parseNapCompactionSections(text: string): { summary: string; whiteboard: string } {
+export function parseNapCompactionSections(
+  text: string,
+  options: { whiteboard?: boolean } = {}
+): { summary: string; whiteboard: string | null } {
+  // `whiteboard: false` is the summary-only call made when the agent wrote the board: only
+  // SUMMARY is required, and a WHITEBOARD section the model returns anyway is dropped.
+  const expectWhiteboard = options.whiteboard !== false
   const lines = text.split('\n')
   let current: 'summary' | 'whiteboard' | null = null
   const buckets: Record<'summary' | 'whiteboard', string[]> = { summary: [], whiteboard: [] }
@@ -405,6 +430,14 @@ export function parseNapCompactionSections(text: string): { summary: string; whi
   }
   const summary = buckets.summary.join('\n').trim()
   const whiteboard = buckets.whiteboard.join('\n').trim()
+  if (!expectWhiteboard) {
+    if (!summary) {
+      throw new Error(
+        'Nap compaction model output was missing the required SUMMARY section; the window was left untouched.'
+      )
+    }
+    return { summary, whiteboard: null }
+  }
   if (!summary || !whiteboard) {
     throw new Error(
       'Nap compaction model output was missing the required SUMMARY/WHITEBOARD sections; the window was left untouched.'
@@ -857,23 +890,33 @@ export async function runFixedSessionNap(options: {
         contextLimit: window.contextLimit,
         sourceTokenEstimate: sourceTokens
       })
+      // 2026-09-19 (Josh): the agent owns its whiteboard. The nap writes the board only
+      // when it is EMPTY (fills it) or when a nap wrote it last (refreshes it); a board the
+      // agent wrote is never rewritten — the summary model then gets a summary-only call
+      // with the agent's board as read-only context.
       const currentWhiteboard = openEpisode?.whiteboard?.content?.trim()
+      const boardAuthor = currentWhiteboard ? whiteboardAuthor(openEpisode?.whiteboard) : null
+      const napWritesBoard = Boolean(openEpisode) && boardAuthor !== 'agent'
+      const whiteboardOutcome: NonNullable<FixedSessionNapRecord['compaction']>['whiteboard'] =
+        !openEpisode ? 'none' : !napWritesBoard ? 'kept' : currentWhiteboard ? 'refreshed' : 'filled'
       const prompt = [
-        NAP_COMPACTION_PROMPT,
+        napWritesBoard ? NAP_COMPACTION_PROMPT : NAP_COMPACTION_SUMMARY_ONLY_PROMPT,
         '',
         'SUMMARY BUDGET:',
         `Aim for roughly ${budget.softTargetTokens.toLocaleString()} tokens for the SUMMARY section; do not exceed about ${budget.hardMaxTokens.toLocaleString()}.`,
         '',
-        currentWhiteboard
-          ? `CURRENT EPISODE WHITEBOARD:\n${currentWhiteboard}`
-          : 'CURRENT EPISODE WHITEBOARD: (empty — build it from the segment below)',
+        napWritesBoard
+          ? currentWhiteboard
+            ? `CURRENT EPISODE WHITEBOARD:\n${currentWhiteboard}`
+            : 'CURRENT EPISODE WHITEBOARD: (empty — build it from the segment below)'
+          : `CURRENT EPISODE WHITEBOARD (kept by the agent; context only, not yours to change):\n${currentWhiteboard}`,
         '',
         'OLDER OPEN-EPISODE SEGMENT TO COMPACT:',
         buildCompactionTranscript(candidates)
       ].join('\n')
 
       const generated = await generateSummary(prompt, budget.hardMaxTokens)
-      const sections = parseNapCompactionSections(generated)
+      const sections = parseNapCompactionSections(generated, { whiteboard: napWritesBoard })
 
       const written = await writeGraduationForMessages({
         userId: options.userId,
@@ -891,10 +934,11 @@ export async function runFixedSessionNap(options: {
       compaction = {
         segmentId: written.segmentId,
         eventId: written.eventId,
-        compactedMessageCount: candidates.length
+        compactedMessageCount: candidates.length,
+        whiteboard: whiteboardOutcome
       }
-      if (openEpisode) {
-        await updateEpisodeWhiteboard(sessionId, openEpisode.id, sections.whiteboard)
+      if (openEpisode && napWritesBoard && sections.whiteboard) {
+        await updateEpisodeWhiteboard(sessionId, openEpisode.id, sections.whiteboard, 'nap')
       }
     }
 

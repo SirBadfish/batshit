@@ -24,7 +24,11 @@
   import { normalizeId } from '$lib/utils/idNormalizer'
   import { calculateAgentMessagesFromEndByIndex } from '$lib/utils/zipMessageAge'
   import { calculateZipActivation } from '$lib/utils/zipActivation'
-  import { buildZipStatusPresentation, type ZipStatusPresentation } from '$lib/utils/zipStatusPresentation'
+  import {
+    buildZipStatusPresentation,
+    resolveZipStateActors,
+    type ZipStatusPresentation
+  } from '$lib/utils/zipStatusPresentation'
   import { normalizeCompactTool } from '$lib/utils/toolActivityContract'
   import {
     getHiddenRawSidecarZipIds,
@@ -38,7 +42,7 @@
   type ZipManagerFilter = 'unzipped' | 'zipped' | 'all'
   type ZipManagerSort = 'chat' | 'manual' | 'tokens' | 'newest'
   type ZipManagerToolStatus = 'loading' | 'success' | 'error' | 'info'
-  type ZipManagerExpandedReason = 'buffer' | 'user' | 'agent'
+  type ZipManagerExpandedReason = 'buffer' | 'user' | 'agent' | 'inferred'
 
   interface ZipListItem {
     id: string
@@ -69,6 +73,7 @@
     manualZip: boolean
     autoZip: boolean
     agentControlled: boolean
+    inferredControlled: boolean
     aboutToZip: boolean
     presentation: ZipStatusPresentation
     toolTitle: string
@@ -472,7 +477,7 @@
 
   function getManualSortWeight(row: ZipManagerRow) {
     if (row.isPermanent) return 0
-    if (row.isManuallyUnzipped || row.manualZip || row.agentControlled) return 1
+    if (row.isManuallyUnzipped || row.manualZip || row.agentControlled || row.inferredControlled) return 1
     return 2
   }
 
@@ -527,8 +532,10 @@
     })
     const isManuallyUnzipped = Boolean(unzippedItem)
     const isUnzippedNow = isManuallyUnzipped || !activation.shouldCompress
+    // SA-120 P5: the same reading of stored sources the chat badges use.
+    const actors = resolveZipStateActors(unzippedItem?.source, rezippedSource, isManuallyUnzipped)
     const expandedReason = unzippedItem
-      ? unzippedItem.source === 'agent' ? 'agent' : 'user'
+      ? actors.expandedReason
       : isUnzippedNow ? 'buffer' : undefined
     const remainingMessages = resolveRemainingMessages(unzippedItem, activation)
     const aboutToZip =
@@ -539,7 +546,8 @@
       activation.meetsThreshold &&
       activation.bufferSize > 0 &&
       context.messagesFromEnd === activation.bufferSize - 1
-    const agentControlled = unzippedItem?.source === 'agent' || rezippedSource === 'agent'
+    const agentControlled = actors.agentControlled
+    const inferredControlled = actors.inferredControlled
     const presentation = buildZipStatusPresentation({
       isZipped: !isUnzippedNow,
       isUnzipped: isManuallyUnzipped,
@@ -549,6 +557,7 @@
       manualZip: isRezipped,
       autoZip: activation.autoZip,
       agentControlled,
+      inferredControlled,
       aboutToZip
     })
     const labelParts = splitZipDescription(zip.description || zip.name || zip.id)
@@ -568,6 +577,7 @@
       manualZip: isRezipped,
       autoZip: activation.autoZip,
       agentControlled,
+      inferredControlled,
       aboutToZip,
       presentation,
       ...toolPresentation
@@ -1012,6 +1022,7 @@
                 aboutToZip={row.aboutToZip}
                 autoZip={row.autoZip}
                 agentControlled={row.agentControlled}
+                inferredControlled={row.inferredControlled}
                 manualZip={row.manualZip}
                 onToggleUnzip={(permanent: boolean) => handleUnzip(row, permanent)}
                 onZipNow={() => handleZip(row)}

@@ -22,7 +22,7 @@ The Mac app release path is a Developer ID signed, notarized DMG. Local developm
 
 | Area | Current truth |
 | --- | --- |
-| App shell | Zero-native-system WebView app with a packaged Runtime Doctor |
+| App shell | Electron desktop app (its own bundled Chromium) with a packaged Runtime Doctor |
 | Local runtime | Packaged Batshit app/server code launched with app-owned runtime binaries when the release package includes them |
 | Redis | Mac-app-owned Redis 8 on a Batshit port and Batshit data directory; Runtime Doctor refuses to attach to an unrelated Redis process on that port |
 | n8n | Connect existing; not bundled into the Mac app |
@@ -40,7 +40,7 @@ Runtime Doctor checks the Mac app's required runtime and reports anything missin
 | macOS on Apple Silicon | Current Mac app and Apple Container proof target |
 | App-owned Node 24 runtime | Runs the packaged SvelteKit app/server payload |
 | App-owned Redis 8 with the JSON module and `redis-cli` | Stores chats, agents, settings, zips, clips, prompts, and sessions |
-| App-owned ffmpeg | Needed by batshit-server for media and Goon preview workflows |
+| App-owned FFmpeg and FFprobe | Needed by batshit-server for media and Goon preview workflows |
 | Apple Container | Default Mac app command sandbox backend on supported Macs |
 
 Normal Mac users should not need to install Node, Redis, or ffmpeg globally for a release package that includes Batshit's managed runtime assets. Local development packages may still report a missing managed runtime if a curated binary was not included in that build; in that case, use the release notes or an advanced repair fallback rather than pointing Batshit at unrelated global services.
@@ -79,9 +79,13 @@ The Mac app still owns startup, restart, repair, logs, and local data. Browser c
 
 ## Quitting the app
 
-Closing the Batshit window or quitting the app (Cmd+Q, or Dock right-click → Quit) stops the whole Batshit runtime: the app and server services, the Mac-app-owned Redis process, upload tunnels, and any local voice engines Batshit started for you.
+Closing the Batshit window or quitting the app (Cmd+Q, or Dock right-click → Quit) stops the whole Batshit runtime: the app and server services, the Mac-app-owned Redis process, upload tunnels, any local voice engines Batshit started for you (unless you turned their **Stop with Batshit** switch off), and Docker's `sbx` background service when Batshit started it and no sandbox is running.
 
-A small "Stopping Batshit services…" notice remains responsive while this happens. The app closes itself once every managed service has stopped cleanly; you should not need to force-quit it. If anything from an earlier session was left behind — say, after a crash or force-quit — the next launch cleans it up automatically before starting fresh.
+The window closes at once, and the Dock icon stays for a few seconds while the services stop. The app closes itself once every managed service has stopped cleanly; you should not need to force-quit it. If anything from an earlier session was left behind — say, after a crash or force-quit — the next launch cleans it up automatically before starting fresh.
+
+Batshit only stops what it started. A voice engine you run yourself, or an `sbx` service you started (for example with `sbx run`), keeps running.
+
+On macOS 27 and later, a light gray dot under an app's Dock icon means something that app started is still running after it quit, and hovering the icon says "Running in Background". For Batshit that is expected only while a voice engine you set to keep running is up. If you see it otherwise, right-click the icon and choose **Stop Running in Background**, then please report it.
 
 If you were using Batshit in a separate browser window, that window stops working after you quit the app, because quitting stops the shared runtime.
 
@@ -138,7 +142,7 @@ Provider API keys saved in Batshit are not the same as CLI login. CLI agents nee
 
 Apple Container is the normal Mac app sandbox backend for agent command execution on supported Macs. Runtime Doctor reports Apple Container status, can start the Apple Container system when it is installed but stopped, and surfaces repair actions when the sandbox needs attention.
 
-Docker Sandbox remains available as a selectable backup for Mac users who want that backend, and it remains the cross-platform sandbox path for Docker, Windows, and Linux installs.
+Docker Sandbox remains available as a selectable backup for Mac users who want that backend, and it remains the cross-platform sandbox path for Docker, Windows, and Linux installs. On a Mac it needs Docker's `sbx` tool: see [Set up Docker Sandbox](install-docker.md#set-up-docker-sandbox).
 
 If a sandbox backend is unavailable, Batshit shows an unavailable state instead of silently treating full host shell access as a sandbox.
 

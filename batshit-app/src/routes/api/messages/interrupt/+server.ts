@@ -8,7 +8,8 @@ import {
   clearSessionTurn,
   getActiveGroupAbort,
   getActiveSessionTurn,
-  getActiveStream
+  getActiveStream,
+  stopSessionTurn
 } from '$lib/server/services/streamAbortRegistry'
 import { abortWokenTurnForInterrupt } from '$lib/server/services/agentWakeups'
 import { isTrustedInternalRequest } from '$lib/server/services/internalRequestAuth'
@@ -63,6 +64,25 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   }
 
   if (!active && !activeGroup && activeSessionTurn) {
+    // A turn still SETTING UP (its compile, snapshot, and bridge run before anything is
+    // registered to abort) is stopped through the turn itself: send-routed carries this into
+    // the run, and the setup checkpoint ends it before the provider call. Clearing its lock, as
+    // this branch used to, deleted a LIVE lock and the reply ran on to a full answer (measured
+    // in a real page, Stop 150 ms after the send, 2026-09-18). The request lets go of its own
+    // lock when it is done; a stuck one loses it 5 s after this Stop (`stopSessionTurn`).
+    if (!activeSessionTurn.runEnded) {
+      stopSessionTurn(sessionId, 'user')
+      return json({
+        success: true,
+        reason: abortedWokenTurn ? 'wake_run_aborted' : 'setup_stopped',
+        abortedWokenTurn,
+        messageId: requestedMessageId,
+        requestedMessageId,
+        activeMessageId: activeSessionTurn.messageId ?? null,
+        activeTurnKind: activeSessionTurn.kind
+      })
+    }
+    // The reply is over (its request is doing its after-reply work) or its request is stuck.
     clearSessionTurn(sessionId, requestedMessageId)
     return json({
       success: true,

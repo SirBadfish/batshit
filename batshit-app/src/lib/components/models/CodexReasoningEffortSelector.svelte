@@ -4,6 +4,7 @@
   import { toast } from 'svelte-sonner'
   import * as agentStore from '$lib/stores/agents.svelte'
   import {
+    CODEX_SUBMODEL_CHOICES,
     CODEX_XHIGH_REASONING_HELPER_TEXT,
     supportsCodexFastMode,
     supportsCodexXhighReasoning
@@ -39,10 +40,7 @@
         ? safeExisting.sandbox
         : 'read-only'
 
-    const approval: CodexApproval =
-      safeExisting.approval === 'on-request' || safeExisting.approval === 'on-failure' || safeExisting.approval === 'untrusted'
-        ? safeExisting.approval
-        : 'never'
+    const approval: CodexApproval = safeExisting.approval === 'on-request' ? 'on-request' : 'never'
 
     const rawReasoning = safeExisting.reasoningEffort ?? 'default'
     const allowsXhigh = supportsCodexXhighReasoning(model)
@@ -75,7 +73,7 @@
   const selectedModel = $derived.by(() => {
     const fromAgent = currentAgent?.codex_settings?.model
     if (typeof fromAgent === 'string' && fromAgent.trim().length) return fromAgent.trim()
-    return 'gpt-5'
+    return CODEX_SUBMODEL_CHOICES[0]?.value ?? 'gpt-6-astra'
   })
 
   const selectedReasoning = $derived.by(() => {

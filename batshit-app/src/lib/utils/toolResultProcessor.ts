@@ -14,8 +14,27 @@ import { extractManagedPatchFromSources } from "./editDiff";
 import { logger } from '$lib/utils/logger'
 import type { IntermediateStep, ToolProvider, ToolSource } from './toolStepTypes'
 import { unwrapDynamicMcpUsePayload } from './toolPayloadUnwrap'
+import {
+  commandFoundNothing,
+  failedCommandExitCode,
+  failedCommandOutput,
+  joinListingSectionPath,
+  shellActionCommand,
+  shellCommandFailed,
+  splitLsSections,
+  stripShellErrorLines
+} from './toolActivityContract'
 import { estimateTokens } from './tokens'
 export type { IntermediateStep } from './toolStepTypes'
+
+/** The lanes a shell command becomes when it is stored as a file action (never bash). */
+const MAPPED_SHELL_FILE_LANES = new Set([
+  "read_file",
+  "write_file",
+  "edit_file",
+  "list_files",
+  "search_files",
+]);
 
 const NON_SUBAGENT_OPERATION_KINDS = new Set([
   "artifact_find",
@@ -1278,9 +1297,14 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
   }
 
   failureDetails = failureDetails ?? getToolFailureDetails(result);
+  // A search that matched nothing is not a failed tool (`toolStepFoundNothing`).
+  if (failureDetails && toolStepFoundNothing(canonical, args, result)) {
+    failureDetails = null;
+  }
   if (failureDetails) {
     clone.success = false;
-    clone.error = clone.error || failureDetails.reason || failureDetails.error || "Tool execution failed.";
+    clone.error =
+      clone.error || failureDetails.reason || failureDetails.error || toolFailureFallbackMessage(result);
   }
 
   // Heuristic: if command tool actually represents a file op, remap before shaping
@@ -1306,10 +1330,14 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
       Array.isArray((result as any)?.files) ||
       Array.isArray((result as any)?.items) ||
       Array.isArray(result as any);
-    const hasDiff =
-      (result as any)?.diff ||
-      (result as any)?.changes ||
-      (result as any)?.patch;
+    // A diff is text. Codex reports a native patch's targets as a `changes` LIST, and reading
+    // that as a diff turned every delete, rename, and move into an Edit File card whose "diff"
+    // was the JSON of those objects (F-P6-5 follow-up item 4).
+    const hasDiff = [
+      (result as any)?.diff,
+      (result as any)?.changes,
+      (result as any)?.patch,
+    ].some((value) => typeof value === "string" && value.length > 0);
     const hasContent =
       (result as any)?.content ||
       (result as any)?.data ||
@@ -1318,10 +1346,12 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
     const hasPath =
       args.filePath || args.file_path || args.path || (result as any)?.filePath;
 
-    // Parse file path hints from command text (cat/sed/apply_patch/ls/find)
-    const patchMatch = commandText.match(/update file:\s*([^\n\r]+)/);
-    const sedCatMatch = commandText.match(
-      /\b(?:cat|sed|head|tail)[^\n\r]*?([\w./_-]+\.[\w]+)/,
+    // Parse file path hints from command text (cat/sed/apply_patch/ls/find). A path is taken from
+    // the command as written, so it keeps its case; the command names and the patch header match
+    // in any case (bug sweep item 8: `/Users/Josh/Hello.md` was stored as `/users/josh/hello.md`).
+    const patchMatch = commandTextRaw.match(/update file:\s*([^\n\r]+)/i);
+    const sedCatMatch = commandTextRaw.match(
+      /\b(?:cat|sed|head|tail)[^\n\r]*?([\w./_-]+\.[\w]+)/i,
     );
     const lsMatch = commandText.match(/\bls\b[^|]*/);
 
@@ -1365,16 +1395,28 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
         result?.input?.path ||
         result?.absolutePath ||
         args.input;
-      const content =
-        result?.content ||
-        result?.data ||
-        result?.text ||
-        result?.stdout ||
-        result?.output ||
-        result?.aggregated_output ||
-        result?.result ||
-        result;
+      // A shell command read as a file keeps its failure (F-P6-5), and its content is what the
+      // command printed: never the whole result object, which the API lane's empty stdout once
+      // turned into 31 lines of JSON. A read that printed nothing read nothing, so the first
+      // text field the result carries wins even when it is empty; the whole result is a last
+      // resort for a read that carries no text at all.
+      const command = shellActionCommand(args, result);
+      const failed = shellCommandFailed(result, command);
+      const content = failed
+        ? (typeof result?.content === "string" && result.content.length > 0
+            ? result.content
+            : failedCommandOutput(result) ?? "")
+        : firstReadContent([
+            result?.content,
+            result?.data,
+            result?.text,
+            result?.stdout,
+            result?.output,
+            result?.aggregated_output,
+            result?.result,
+          ]) ?? result;
       const language = result?.language || detectLanguage(filePath);
+      const exitCode = failedCommandExitCode(result, command);
       clone.toolResult = {
         content:
           typeof content === "string"
@@ -1386,6 +1428,7 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
           content && typeof content === "string"
             ? content.split("\n").length
             : undefined,
+        ...(exitCode !== undefined ? { exitCode } : {}),
       };
       clone.toolArgs = { ...args, filePath };
       break;
@@ -1400,14 +1443,19 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
         result?.mappedToolInput?.path ||
         result?.absolutePath ||
         args.input;
-      const content =
-        args.content ||
-        args.data ||
-        result?.mappedToolInput?.content ||
-        result?.content ||
-        result?.stdout ||
-        result?.output ||
-        result;
+      const command = shellActionCommand(args, result);
+      const failed = shellCommandFailed(result, command);
+      // A failed write wrote nothing: keep only what the command meant to write, never what it
+      // printed or the file's old content (F-P6-5).
+      const content = failed
+        ? args.content || args.data || result?.mappedToolInput?.content || ""
+        : args.content ||
+          args.data ||
+          result?.mappedToolInput?.content ||
+          result?.content ||
+          result?.stdout ||
+          result?.output ||
+          result;
       const language = result?.language || detectLanguage(filePath);
       clone.toolResult = {
         content:
@@ -1416,6 +1464,7 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
             : JSON.stringify(content, null, 2),
         filePath,
         language,
+        ...shellFailureResultFields(result, command, failed),
       };
       clone.toolArgs = { ...args, filePath };
       break;
@@ -1430,14 +1479,27 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
         result?.mappedToolInput?.path ||
         result?.absolutePath ||
         args.input;
-      const diffCandidate =
-        result?.diff ||
-        result?.changes ||
-        result?.patch ||
-        result?.output ||
-        result?.aggregated_output ||
-        args.diff ||
-        args.changes;
+      const command = shellActionCommand(args, result);
+      const failed = shellCommandFailed(result, command);
+      // A failed edit keeps only a patch or diff the command meant to apply, never what it
+      // printed and never Codex's `changes` list (F-P6-5).
+      // `changes` counts only as diff TEXT: Codex's list of changed paths is not a diff (item 4).
+      const changesText = (value: unknown) =>
+        typeof value === "string" && value.length > 0 ? value : undefined;
+      const diffCandidate = failed
+        ? [result?.diff, result?.patch, args.diff].find(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          )
+        : result?.diff ||
+          // The native wrapper nests the run's result, and so its diff, under `data`, the way
+          // the patch sources below read its command.
+          (typeof result?.data?.diff === "string" && result.data.diff) ||
+          changesText(result?.changes) ||
+          result?.patch ||
+          result?.output ||
+          result?.aggregated_output ||
+          args.diff ||
+          changesText(args.changes);
 
       // Prefer an explicit patch body when apply_patch was used
       const patchSources: Array<string | undefined> = [
@@ -1468,12 +1530,16 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
         filePath,
         language: result?.language || detectLanguage(filePath),
         ...(failureDetails ?? {}),
+        ...shellFailureResultFields(result, command, failed),
       };
       clone.toolArgs = { ...args, filePath };
       break;
     }
     case "list_files": {
-      const parseShellListOutput = (rawOutput: string): Array<{ name: string; type: "file" | "directory" | "unknown" }> => {
+      const command = shellActionCommand(args, result);
+      const parseListingLines = (
+        rawOutput: string
+      ): Array<{ name: string; type: "file" | "directory" | "unknown" }> => {
         if (!rawOutput) return []
 
         return rawOutput
@@ -1505,13 +1571,28 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
           .filter(Boolean) as Array<{ name: string; type: "file" | "directory" | "unknown" }>
       }
 
+      const failed = shellCommandFailed(result, command);
+      // A listing's own error lines (`ls: /nope: No such file …`, `bfs: error: …`) are never
+      // entries, whatever the exit code said (F-P6-5, and its follow-up: Claude Code reported a
+      // `find` that hit a permission error as a success, and its diagnostic was listed as a file).
+      const listText = (text: string) => stripShellErrorLines(text, command);
+      // `ls` of several directories heads each one's entries with `<dir>:`; that header is not an
+      // entry, and the entries under it are that directory's (item 6).
+      const parseShellListOutput = (
+        rawOutput: string
+      ): Array<{ name: string; path?: string; type: "file" | "directory" | "unknown" }> =>
+        splitLsSections(rawOutput, command).flatMap((section) =>
+          parseListingLines(section.body).map((entry) =>
+            section.dir ? { ...entry, path: joinListingSectionPath(section.dir, entry.name) } : entry
+          )
+        );
       let files =
         result?.files || result?.items || result?.entries || result?.list;
       if (!files && Array.isArray(result)) {
         files = result;
       }
       if (!files && typeof result?.stdout === "string") {
-        files = parseShellListOutput(result.stdout)
+        files = parseShellListOutput(listText(result.stdout))
       }
       if (!files && typeof result === "string") {
         try {
@@ -1524,11 +1605,11 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
             files = parsed;
           }
         } catch {
-          files = parseShellListOutput(result)
+          files = parseShellListOutput(listText(result))
         }
       }
       if (!files && typeof result?.output === "string") {
-        files = parseShellListOutput(result.output)
+        files = parseShellListOutput(listText(result.output))
       }
       clone.toolResult = {
         files: Array.isArray(files) ? files : result?.files ? result.files : [],
@@ -1542,31 +1623,34 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
           result?.mappedToolInput?.dirPath ||
           result?.mappedToolInput?.path ||
           ".",
+        ...shellFailureResultFields(result, command, failed),
       };
       break;
     }
     case "execute_command": {
       const stdout =
         result?.stdout || result?.output || result?.aggregated_output || "";
+      // A command that never started (sandbox unavailable, policy block, bad patch) has no
+      // exit code and no stderr of its own. Its card and its AI view show the failure
+      // reason; an exit code appears only when the command reported one (F-P5-1).
+      const awaitingApproval =
+        step.success === false &&
+        !step.error &&
+        !failureDetails &&
+        !result?.stdout &&
+        !result?.output;
       const stderr =
         result?.stderr ||
         result?.error ||
-        (step.success === false && !step.error && !result?.stdout && !result?.output
-          ? "Awaiting approval before execution."
-          : "");
+        failureDetails?.reason ||
+        (awaitingApproval ? "Awaiting approval before execution." : "");
       const explicitExitCode =
         result?.exitCode ?? result?.code ?? result?.status;
       clone.toolResult = {
         stdout,
         stderr,
-        exitCode:
-          typeof explicitExitCode === "number"
-            ? explicitExitCode
-            : step.error
-              ? 1
-              : step.success === false
-                ? 1
-                : 0,
+        ...(typeof explicitExitCode === "number" ? { exitCode: explicitExitCode } : {}),
+        ...(failureDetails?.errorCode ? { errorCode: failureDetails.errorCode } : {}),
         cwd: result?.cwd || args.cwd || args.directory || result?.directory,
         command: result?.command || args.command,
       };
@@ -1608,6 +1692,146 @@ export function normalizeToolStep(step: IntermediateStep): IntermediateStep {
   }
 
   return clone;
+}
+
+/**
+ * True when a tool step is a shell command stored as a file action (a read, write, edit,
+ * listing, or search) whose search matched nothing: D1's one exception to a lane's own failure
+ * flag. The API lane's native bash calls every non-zero exit a failure (`success` is
+ * `exitCode === 0`), so a step asks this before that flag becomes a failure; a real search error
+ * (exit 2 and up), a timeout, and a blocked command still fail, and the bash lane keeps its own
+ * exit code either way. `normalizeToolStep` asks it for the stored step, and send-routed asks it
+ * (through `toolStepFailureSource`) for its own copies of the step, so the two never disagree.
+ */
+export function toolStepFoundNothing(toolName: string | undefined, args: unknown, result: unknown): boolean {
+  return (
+    MAPPED_SHELL_FILE_LANES.has(canonicalToolName(toolName)) &&
+    commandFoundNothing(result, shellActionCommand(args, result))
+  );
+}
+
+/**
+ * What a copy of a tool step reads its failure from: the step's result, or nothing when that
+ * result's own flag only says a search matched nothing (`toolStepFoundNothing`). send-routed
+ * keeps a copy of every tool step (the Execution Viewer's, the saved message's
+ * `intermediateSteps`, the `end` event's) and reads its `error` and `success` from this, so a
+ * search that matched nothing is an answer there as it is in the stored zip.
+ */
+export function toolStepFailureSource<T>(toolName: string | undefined, args: unknown, result: T): T | undefined {
+  return toolStepFoundNothing(toolName, args, result) ? undefined : result;
+}
+
+function plainRecord(value: unknown): Record<string, any> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, any>) : null;
+}
+
+/**
+ * The words a failed step gives when its result names no reason of its own (fp65h): a command
+ * that ran out of time says so and for how long, and one that exited non-zero gives its exit code;
+ * anything else keeps the generic sentence. The API lane's native bash result carries
+ * `timedOut: true` or a failing `exitCode` but no reason, so a timed-out command was stored, and
+ * shown in the Execution Viewer, as `Tool execution failed.` The stored step
+ * (`normalizeToolStep`) and send-routed's copies of it (`toolStepFailureMessage`) both use this,
+ * so the zip and the Execution Viewer say the same thing.
+ */
+export function toolFailureFallbackMessage(result: unknown): string {
+  const record = plainRecord(result);
+  if (record?.timedOut === true) {
+    const durationMs = record.durationMs;
+    if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0) {
+      return durationMs >= 1000
+        ? `The command timed out after ${Math.round(durationMs / 1000)} s.`
+        : `The command timed out after ${Math.round(durationMs)} ms.`;
+    }
+    return "The command timed out.";
+  }
+  const exitCode = record?.exitCode;
+  if (typeof exitCode === "number" && Number.isFinite(exitCode) && exitCode !== 0) {
+    return `The command failed with exit code ${exitCode}.`;
+  }
+  return "Tool execution failed.";
+}
+
+/** The reason a failed result names itself, in the order send-routed always read it. */
+function namedFailureReason(record: Record<string, any>): string | undefined {
+  for (const candidate of [record.reason, record.failureMessage, record.error]) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  if (record.error && typeof record.error === "object" && typeof record.error.message === "string") {
+    return record.error.message.trim() || undefined;
+  }
+  if (typeof record.errorCode === "string" && record.errorCode.trim()) return record.errorCode.trim();
+  return undefined;
+}
+
+/**
+ * The error a copy of a tool step carries, or `undefined` when the step did not fail (fp65h).
+ * send-routed keeps a copy of every tool step (the Execution Viewer's rows, the saved message's
+ * `intermediateSteps`, the `end` event's) and reads its `error` and `success` from this, from the
+ * facts the stored zip reads:
+ * - a search that matched nothing never failed (`toolStepFailureSource`);
+ * - the result's own flag: `success: false`, `blocked`, or a delegated run that failed or timed
+ *   out. `status` is a failure signal ONLY on a delegated-run payload (SA-111): ordinary tools
+ *   report the status of their SUBJECT (a CI run, a deployment, a queued job), not of the call,
+ *   while `/api/subagents/managed-execute` returns `success: true` with the run's own `status`;
+ * - a shell command that exited non-zero. Codex and Claude report that as an exit code with no
+ *   `success: false`, so a failed Codex command was a Success row. A command stored as a file
+ *   action reads its exit code by the zip's rule (`failedCommandExitCode`: exit 1 from a search is
+ *   an answer); a bash command, like the API lane's own bash, fails on any non-zero exit. An exit
+ *   code on any other tool is its subject's, not a failure of the call.
+ * The caller parses a JSON-like result first.
+ */
+export function toolStepFailureMessage(toolName: string | undefined, args: unknown, result: unknown): string | undefined {
+  const record = plainRecord(toolStepFailureSource(toolName, args, result));
+  if (!record) return undefined;
+  const isDelegatedRun = record.kind === "subagent" || record.kind === "worker";
+  if (
+    record.success === false ||
+    record.blocked === true ||
+    (isDelegatedRun && (record.status === "failed" || record.status === "timed_out"))
+  ) {
+    return namedFailureReason(record) ?? toolFailureFallbackMessage(record);
+  }
+  const canonical = canonicalToolName(toolName);
+  const exitCode = MAPPED_SHELL_FILE_LANES.has(canonical)
+    ? failedCommandExitCode(record, shellActionCommand(args, record))
+    : canonical === "execute_command" &&
+        typeof record.exitCode === "number" &&
+        Number.isFinite(record.exitCode) &&
+        record.exitCode !== 0
+      ? record.exitCode
+      : undefined;
+  return exitCode === undefined ? undefined : `The command failed with exit code ${exitCode}.`;
+}
+
+/**
+ * A read's content from the fields a result can carry it in, in order. A string wins even when
+ * it is empty — an empty file, or `cat x | grep y` with no match, read nothing — while any other
+ * falsy value is skipped as before. `undefined` means the result carries no text at all.
+ */
+function firstReadContent(candidates: unknown[]): unknown {
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" || candidate) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * What a shell command stored as a write, edit, or listing keeps when it failed (F-P6-5): its
+ * failing exit code and what it printed, as `commandOutput`. Nothing for a success.
+ */
+function shellFailureResultFields(
+  result: unknown,
+  command: string | undefined,
+  failed: boolean,
+): Record<string, unknown> {
+  if (!failed) return {};
+  const exitCode = failedCommandExitCode(result, command);
+  const commandOutput = failedCommandOutput(result);
+  return {
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(commandOutput ? { commandOutput } : {}),
+  };
 }
 
 function looksLikePatch(value: unknown): boolean {

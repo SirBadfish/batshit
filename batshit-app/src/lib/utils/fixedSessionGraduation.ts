@@ -54,6 +54,12 @@ export interface FixedSessionNapStep3Record {
   segmentId: string
   eventId: string
   compactedMessageCount: number
+  /**
+   * What step 3 did to the open episode's whiteboard (2026-09-19): `filled` an empty board,
+   * `refreshed` a board a nap wrote earlier, `kept` a board the agent wrote (never touched),
+   * or `none` when no episode was open. Absent on older nap records.
+   */
+  whiteboard?: 'filled' | 'refreshed' | 'kept' | 'none'
 }
 
 export interface FixedSessionNapRecord {

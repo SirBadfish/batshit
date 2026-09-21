@@ -383,6 +383,86 @@ describe('modelCatalogSync merge', () => {
     })
   })
 
+  it('publishes current Kimi Code membership models on the separate subscription connection', () => {
+    const curated = _getManualDirectModelsForTest('kimi_code')
+    const directEntries = _mapDirectProviderEntriesForTest('kimi_code', curated)
+
+    expect(curated.map((model) => model.id)).toEqual([
+      'k3',
+      'k3-256k',
+      'kimi-for-coding',
+      'kimi-for-coding-highspeed'
+    ])
+    expect(directEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'k3',
+          provider: 'moonshotai',
+          contextWindow: 1_048_576,
+          connectionId: 'direct:kimi_code'
+        }),
+        expect.objectContaining({
+          id: 'kimi-for-coding-highspeed',
+          provider: 'moonshotai',
+          connectionId: 'direct:kimi_code'
+        })
+      ])
+    )
+  })
+
+  it('publishes current MiniMax Token Plan text models separately from pay-as-you-go', () => {
+    const curated = _getManualDirectModelsForTest('minimax_token_plan')
+    const directEntries = _mapDirectProviderEntriesForTest('minimax_token_plan', curated)
+
+    expect(curated.map((model) => model.id)).toEqual([
+      'MiniMax-M3',
+      'MiniMax-M2.7',
+      'MiniMax-M2.7-highspeed'
+    ])
+    expect(directEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'MiniMax-M3',
+          provider: 'minimax',
+          connectionId: 'direct:minimax_token_plan'
+        })
+      ])
+    )
+  })
+
+  it('publishes the full MiMo Token Plan chat and audio model set with correct purposes', () => {
+    const curated = _getManualDirectModelsForTest('mimo_token_plan')
+    const directEntries = _mapDirectProviderEntriesForTest('mimo_token_plan', curated)
+
+    expect(curated.map((model) => model.id)).toEqual([
+      'mimo-v2.5-pro',
+      'mimo-v2.5',
+      'mimo-v2.5-asr',
+      'mimo-v2.5-tts',
+      'mimo-v2.5-tts-voicedesign',
+      'mimo-v2.5-tts-voiceclone'
+    ])
+    expect(directEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'mimo-v2.5-pro',
+          purpose: 'chat',
+          connectionId: 'direct:mimo_token_plan'
+        }),
+        expect.objectContaining({
+          id: 'mimo-v2.5-asr',
+          purpose: 'audio',
+          connectionId: 'direct:mimo_token_plan'
+        }),
+        expect.objectContaining({
+          id: 'mimo-v2.5-tts-voiceclone',
+          purpose: 'audio',
+          connectionId: 'direct:mimo_token_plan'
+        })
+      ])
+    )
+  })
+
   it('merges curated Z.ai coding-plan entries into lagging live discovery results', () => {
     const curated = _getManualDirectModelsForTest('zai_coding')
     const merged = _mergeDirectProviderEntriesForTest([{ id: 'glm-5.3' }], curated)
@@ -630,6 +710,8 @@ describe('modelCatalogSync merge', () => {
       'deepseek-v4-pro',
       'deepseek-v4-pro-0813',
       'deepseek-v4-flash-0731',
+      'deepseek-v4.1-flash',
+      'glm-5.3',
       'glm-5.2'
     ])
     expect(directEntries).toEqual(
@@ -645,7 +727,7 @@ describe('modelCatalogSync merge', () => {
           connectionId: 'direct:qwen_token_plan'
         }),
         expect.objectContaining({
-          id: 'glm-5.2',
+          id: 'glm-5.3',
           provider: 'zai',
           connectionId: 'direct:qwen_token_plan'
         })

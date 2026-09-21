@@ -74,8 +74,8 @@ describe('modelConnections utilities', () => {
       expect(isModelAllowedForConnection(model, connection)).toBe(true)
     })
 
-    it('allows provider match for direct connections (fallback when explicit metadata is missing)', () => {
-      const model = baseModel({ provider: 'anthropic', connectionId: 'vercel-gateway' })
+    it('allows provider match for direct connections only when the row names no connection at all', () => {
+      const model = baseModel({ provider: 'anthropic', connectionId: undefined, transport: undefined })
       const connection = baseConnection({
         id: 'direct:anthropic',
         label: 'Anthropic Direct',
@@ -83,6 +83,65 @@ describe('modelConnections utilities', () => {
         providers: ['anthropic', 'openai']
       })
       expect(isModelAllowedForConnection(model, connection)).toBe(true)
+    })
+
+    it('rejects a same-developer row that names only other connections (BL-66)', () => {
+      // The hosted registry's gateway row for Claude Haiku 4.5 advertises only Vercel AI Gateway and
+      // OpenRouter. Under Anthropic (Direct) it has no exact identity, so applying it fails with
+      // invalid_model_identity; it must not be offered there.
+      const gatewayOnlyRow = baseModel({
+        id: 'anthropic/claude-haiku-4.5',
+        name: 'claude-haiku-4.5',
+        connectionId: 'vercel-gateway',
+        availableConnections: ['vercel-gateway', 'openrouter'],
+        idVariants: {
+          'vercel-gateway': {
+            developerId: 'anthropic',
+            modelId: 'claude-haiku-4.5',
+            effectiveId: 'anthropic/claude-haiku-4.5',
+            source: 'vercel'
+          },
+          openrouter: {
+            developerId: 'anthropic',
+            modelId: 'claude-haiku-4.5',
+            effectiveId: 'anthropic/claude-haiku-4.5',
+            source: 'openrouter'
+          }
+        }
+      })
+      const directRow = baseModel({
+        id: 'claude-haiku-4-5-20251001',
+        name: 'claude-haiku-4-5-20251001',
+        source: 'direct',
+        transport: 'direct',
+        connectionId: 'direct:anthropic',
+        availableConnections: ['direct:anthropic'],
+        idVariants: {
+          'direct:anthropic': {
+            developerId: 'anthropic',
+            modelId: 'claude-haiku-4-5-20251001',
+            effectiveId: 'claude-haiku-4-5-20251001',
+            source: 'direct'
+          }
+        }
+      })
+      const anthropicDirect = baseConnection({
+        id: 'direct:anthropic',
+        label: 'Anthropic (Direct)',
+        transport: 'direct',
+        service: 'anthropic',
+        providers: ['anthropic']
+      })
+
+      expect(isModelAllowedForConnection(gatewayOnlyRow, anthropicDirect)).toBe(false)
+      expect(isModelAllowedForConnection(directRow, anthropicDirect)).toBe(true)
+      expect(isModelAllowedForConnection(gatewayOnlyRow, baseConnection())).toBe(true)
+      expect(
+        isModelAllowedForConnection(
+          gatewayOnlyRow,
+          baseConnection({ id: 'openrouter', label: 'OpenRouter', transport: 'openrouter' })
+        )
+      ).toBe(true)
     })
 
     it('rejects incompatible direct id variants even when connection metadata claims support', () => {

@@ -2,6 +2,15 @@
   import type { Message } from '$lib/stores/messages.svelte'
   import MessageContent from './MessageContent.svelte'
   import MessageActionsRow from './MessageActionsRow.svelte'
+  import JevJuiceFlagNotice from './JevJuiceFlagNotice.svelte'
+  import JevJuiceWakeMessageFlag from './JevJuiceWakeMessageFlag.svelte'
+  import JevJuiceQuickActionChip from './JevJuiceQuickActionChip.svelte'
+  import { readQuickActionMark } from '$lib/utils/jevJuiceQuickActions'
+  import type { WakeTurnRef } from '$lib/utils/jevJuice'
+  import JevJuiceNote from './JevJuiceNote.svelte'
+  import JevJuicePostTurnChip from './JevJuicePostTurnChip.svelte'
+  import { getJevJuicePostTurnRecord } from '$lib/stores/jevJuicePostTurn.svelte'
+  import { jevJuiceGapDetail, jevJuiceGapText, readJevJuiceGaps, readJevJuiceNotes } from '$lib/utils/jevJuice'
   import { copyTextToClipboard } from '$lib/utils/clipboard'
   import MessageApprovalPanel from './MessageApprovalPanel.svelte'
   import MessageDeleteDialog from './MessageDeleteDialog.svelte'
@@ -15,13 +24,22 @@
   import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from '$lib/services/voice'
   import type { VoiceSettings } from '$lib/types/voice'
   import * as messageStore from '$lib/stores/messages.svelte'
+  import * as chatRunRegistry from '$lib/stores/chatRunRegistry.svelte'
   import {
     describeControlApproval,
     resolveApprovalSubmitSource
   } from '$lib/utils/controlApprovalPresentation'
+  import {
+    buildToolApprovalResponses,
+    collectUnsentApprovalDecisions,
+    approvalAnswerWasRecorded,
+    markApprovalDecisionsSent,
+    returnRefusedApprovalDecisions
+  } from '$lib/utils/toolApprovalSubmit'
   import { getPlaybackState } from '$lib/stores/voicePlayback.svelte'
   import { toast } from 'svelte-sonner'
   import { DatabaseService } from '$lib/services/databaseRedis.client'
+  import { postSendRouted } from '$lib/services/sendRoutedClient'
   import {
     normalizePrimaryAgentType,
     shouldShowReasoningByDefaultForPrimaryAgent
@@ -40,7 +58,7 @@
     getProviderOptionsFor,
     normalizeAgentVoiceProfile
   } from '$lib/utils/voiceSchema'
-  import { Archive, Brain, ChevronDown, TriangleAlert } from '@lucide/svelte'
+  import { Archive, Brain, ChevronDown, TriangleAlert, Zap } from '@lucide/svelte'
   import { DEFAULT_AGENT_ICON_REF } from '$lib/icons/iconCatalog'
   import { normalizeIconRef } from '$lib/icons/iconLegacy'
 
@@ -59,7 +77,8 @@
     isCompacted = false,
     thinkingSubject = '',
     planSubject = {},
-    voiceSettings
+    voiceSettings,
+    wakeTurn = null
   } = $props<{ 
     message: Message
     messageIndex?: number
@@ -74,9 +93,19 @@
     thinkingSubject?: string
     planSubject?: { content?: string; items?: any[] }
     voiceSettings?: VoiceSettings
+    /**
+     * SA-120 P7: the wake-up that started this message's turn, when a DM, a webhook, or a
+     * schedule did: on a reply, for the approval card's origin line and the Jev Juice notice
+     * above it; on the user message that IS the wake-up message, for the flag under its text.
+     */
+    wakeTurn?: WakeTurnRef | null
   }>()
   
   const isAI = $derived(message.role === 'assistant')
+  /** This user message IS the wake-up message of its turn (SA-120 P7). */
+  const isWakeMessage = $derived(!isAI && wakeTurn !== null && wakeTurn.messageId === message.id)
+  // SA-120 P9: a spoken turn Batshit acted on carries its mark in the stored message.
+  const quickActionMark = $derived(!isAI ? readQuickActionMark(message.metadata) : null)
   const responseFailed = $derived(
     isAI &&
       message.status !== 'in_progress' &&
@@ -85,6 +114,13 @@
   const responseFailureText = $derived.by(() => {
     const raw = (message.metadata as any)?.error_message
     return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : ''
+  })
+  // The banner's detail repeats nothing (bug sweep, 2026-09-18): a turn that failed before it said
+  // anything stores the error as its text too (`resolveFailedTurnContent`), so the same sentence
+  // showed as the reply AND under the banner's heading.
+  const responseFailureDetail = $derived.by(() => {
+    const shown = typeof message.content === 'string' ? message.content.trim() : ''
+    return responseFailureText && responseFailureText !== shown ? responseFailureText : ''
   })
   const responseFailureKind = $derived.by(() => {
     const kind = (message.metadata as any)?.failure_kind
@@ -253,6 +289,8 @@
       triggerTerms?: string[]
       turnsRemaining?: number
       holdEpisode?: boolean
+      /** SA-120 P4b: Jev Juice brought this memory in, not the agent and not a trigger word. */
+      inferred?: boolean
     }>
   })
   const memoryInsertedSummary = $derived.by(() => {
@@ -276,6 +314,7 @@
     status?: string
     turnsRemaining?: number
     holdEpisode?: boolean
+    inferred?: boolean
   }): string {
     const status =
       item.status === 'new'
@@ -288,11 +327,40 @@
               ? `lingering, ${item.turnsRemaining} message${item.turnsRemaining === 1 ? '' : 's'} left`
               : 'lingering'
     if (item.source === 'recall') {
-      return `${item.segment ? 'recalled episode summary' : 'recalled by search'} · ${status}`
+      // SA-120 P4b (DL-120-04): an inferred row says who brought it in.
+      const how = item.inferred
+        ? 'brought in by Jev'
+        : item.segment
+          ? 'recalled episode summary'
+          : 'recalled by search'
+      return `${how} · ${status}`
     }
     return status
   }
-  const hasMemoryAffordances = $derived(memorySaves.length > 0 || memoryInserted !== null)
+  // SA-120 (DL-120-02): a Jev Juice lane that could not run this turn leaves a note beside
+  // the memory chips; the message was sent without it. Never a pop-up.
+  const jevJuiceNotes = $derived.by(() => (isAI ? readJevJuiceNotes(message.metadata) : []))
+  // SA-120 P1 (B6): a capability the request looked like it needed but the agent does not
+  // have. The chip names the gap and opens the agent's settings; it never widens access.
+  const jevJuiceGaps = $derived.by(() => (isAI ? readJevJuiceGaps(message.metadata) : []))
+  // SA-120 P6: what the after-reply check noticed about this reply. It lives in its own
+  // server-owned store, never in `message.metadata`: the check finishes after the stream's
+  // `end`, when the browser already owns the next save of this message.
+  const jevJuicePostTurn = $derived.by(() =>
+    isAI ? getJevJuicePostTurnRecord(sessionId || message.session_id, message.id) : null
+  )
+  const hasMemoryAffordances = $derived(
+    memorySaves.length > 0 ||
+      memoryInserted !== null ||
+      jevJuiceNotes.length > 0 ||
+      jevJuiceGaps.length > 0 ||
+      jevJuicePostTurn !== null
+  )
+  function openAgentSettingsForGap(agentId: string) {
+    window.dispatchEvent(
+      new CustomEvent('batshit:open-settings', { detail: { tab: 'agents', agentId } })
+    )
+  }
 
   const showPlan = $derived(
     isAI && (planItems.length > 0 || Boolean(planSummary))
@@ -610,25 +678,42 @@
     return `${actor} wants to use ${displayName}.`
   }
 
-  function updateToolApprovalStatus(
-    approvalId: string,
-    status: 'pending' | 'approved' | 'denied' | 'expired'
-  ) {
-    const summary = toolApprovalSummary
-    if (!summary) return
-    const approvals = summary.approvals.map((entry) =>
-      entry?.approvalId === approvalId ? { ...entry, status, submitted: false } : entry
-    )
+  function currentApprovalMessage() {
+    return messageStore.getMessage(message.id, sessionId || message.session_id) ?? message
+  }
 
+  function currentApprovalSummary(): ToolApprovalSummary | undefined {
+    return currentApprovalMessage().metadata?.toolApprovals as ToolApprovalSummary | undefined
+  }
+
+  function writeToolApprovals(approvals: ToolApprovalSummary['approvals']) {
+    // A resume can finish and reload this record before Svelte refreshes this component's
+    // props. Never put the old card's metadata (including its zip allow-list) back over it.
+    const current = currentApprovalMessage()
+    const summary = currentApprovalSummary()
+    if (!summary) return
     messageStore.updateMessage(message.id, {
       metadata: {
-        ...(message.metadata ?? {}),
+        ...(current.metadata ?? {}),
         toolApprovals: {
           ...summary,
           approvals
         }
       }
     })
+  }
+
+  function updateToolApprovalStatus(
+    approvalId: string,
+    status: 'pending' | 'approved' | 'denied' | 'expired'
+  ) {
+    const summary = toolApprovalSummary
+    if (!summary) return
+    writeToolApprovals(
+      summary.approvals.map((entry) =>
+        entry?.approvalId === approvalId ? { ...entry, status, submitted: false } : entry
+      )
+    )
   }
 
   function parseTimestampMs(value: unknown): number | null {
@@ -669,112 +754,84 @@
     if (!approvals.length) return
     if (approvalSubmitting) return
 
+    // The entries this answer carries. The card keeps their marks once the server has recorded
+    // the answer: from its acceptance on, whatever the resumed run does after; a refused or lost
+    // answer puts them back to pending (`toolApprovalSubmit.ts`, `approvalAnswerWasRecorded`).
+    const unsentApprovals = collectUnsentApprovalDecisions(approvals)
+    if (unsentApprovals.length === 0) return
+
     approvalSubmitting = true
     approvalError = null
 
-    const unsentApprovals = approvals.filter(
-      (entry) =>
-        !entry?.submitted &&
-        (entry?.status === 'approved' || entry?.status === 'denied' || entry?.status === 'expired')
-    )
-
-    if (unsentApprovals.length === 0) {
-      approvalSubmitting = false
-      return
-    }
-
-    const responses: ToolApprovalResponse[] = unsentApprovals.map((entry) => ({
-      type: 'tool-approval-response',
-      approvalId: entry.approvalId,
-      approved: entry.status === 'approved',
-      reason:
-        entry.status === 'approved'
-          ? 'User approved'
-          : entry.status === 'expired'
-            ? 'Approval expired after 3 minutes'
-            : 'User denied'
-    }))
-
+    const responses: ToolApprovalResponse[] = buildToolApprovalResponses(unsentApprovals)
     const agentRecord = agent ?? agentStore.getCurrentAgent()
     const session = sessionId || message.session_id
-
-    try {
-      const response = await fetch('/api/messages/send-routed', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messageId: message.id,
-          content: '',
-          sessionId: session,
-          agentId: agentRecord?.id ?? message.agent_id,
-          messages: messageStore.getMessages(),
-          agentType: normalizePrimaryAgentType(agentRecord as any),
-          webhookUrl: agentRecord?.webhook_url ?? null,
-          metadata: {
-            ...(message.metadata ?? {}),
-            toolApprovalResponse: responses
-          }
-        })
+    const approvalAbortController = new AbortController()
+    if (session && !chatRunRegistry.isSessionBusy(session)) {
+      chatRunRegistry.startRun({
+        sessionId: session,
+        transport: normalizePrimaryAgentType(agentRecord as any) === 'cli' ? 'cli' : 'api',
+        abortController: approvalAbortController
       })
+    }
 
-      if (!response.ok) {
-        const errorPayload = await response.json().catch(() => ({}))
-        if (response.status === 410 && errorPayload?.code === 'APPROVAL_EXPIRED') {
-          const expiredIds = Array.isArray(errorPayload?.approvalIds)
-            ? errorPayload.approvalIds
-                .map((entry: unknown) => (typeof entry === 'string' ? entry.trim() : ''))
-                .filter((entry: string) => entry.length > 0)
-            : []
-
-          if (expiredIds.length > 0 && toolApprovalSummary) {
-            const expiredSet = new Set(expiredIds)
-            const nextApprovals = toolApprovalSummary.approvals.map((entry) =>
-              entry && expiredSet.has(entry.approvalId)
-                ? {
-                    ...entry,
-                    status: 'expired',
-                    submitted: false,
-                    ...(typeof errorPayload?.expiredAt === 'string' ? { expiredAt: errorPayload.expiredAt } : {})
-                  }
-                : entry
-            )
-            messageStore.updateMessage(message.id, {
-              metadata: {
-                ...(message.metadata ?? {}),
-                toolApprovals: {
-                  ...toolApprovalSummary,
-                  approvals: nextApprovals
-                }
-              }
-            })
-          }
-        }
-        throw new Error(errorPayload.error || 'Failed to submit tool approvals')
-      }
-
-      const summary = toolApprovalSummary
-      if (summary) {
-        const sentIds = new Set(unsentApprovals.map((entry) => entry.approvalId))
-        const nextApprovals = summary.approvals.map((entry) =>
-          sentIds.has(entry?.approvalId) ? { ...entry, submitted: true } : entry
-        )
-        messageStore.updateMessage(message.id, {
-          metadata: {
-            ...(message.metadata ?? {}),
-            toolApprovals: {
-              ...summary,
-              approvals: nextApprovals
+    let accepted = false
+    let ok = false
+    let code: string | null = null
+    let failure = ''
+    try {
+      try {
+        // The card's answer runs the rest of the reply; `postSendRouted` waits for it over the live
+        // hub instead of holding one of the browser's connections that whole time (2026-09-18).
+        const response = await postSendRouted(
+          JSON.stringify({
+            messageId: message.id,
+            content: '',
+            sessionId: session,
+            agentId: agentRecord?.id ?? message.agent_id,
+            messages: messageStore.getMessages(session),
+            agentType: normalizePrimaryAgentType(agentRecord as any),
+            webhookUrl: agentRecord?.webhook_url ?? null,
+            metadata: {
+              ...(message.metadata ?? {}),
+              toolApprovalResponse: responses
+            }
+          }),
+          {
+            signal: approvalAbortController.signal,
+            // The server owns the turn and has recorded the answer before the run starts.
+            onAccepted: () => {
+              accepted = true
+              writeToolApprovals(markApprovalDecisionsSent(currentApprovalSummary()?.approvals ?? [], unsentApprovals))
             }
           }
-        })
+        )
+        ok = response.ok
+        if (!ok) {
+          const errorPayload = await response.json().catch(() => ({}))
+          code = typeof errorPayload?.code === 'string' ? errorPayload.code : null
+          failure = errorPayload?.error || 'Failed to submit tool approvals'
+        }
+      } catch (error: any) {
+        const messageText = error instanceof Error ? error.message : String(error ?? '')
+        failure = messageText || 'Failed to submit approvals'
       }
-    } catch (error: any) {
-      const messageText = error instanceof Error ? error.message : String(error ?? '')
-      approvalError = messageText || 'Failed to submit approvals'
-      toast.error(approvalError)
-      return
+
+      const approvalsNow = currentApprovalSummary()?.approvals ?? []
+      writeToolApprovals(
+        approvalAnswerWasRecorded({ accepted, ok, code })
+          ? markApprovalDecisionsSent(approvalsNow, unsentApprovals)
+          : returnRefusedApprovalDecisions(approvalsNow, unsentApprovals)
+      )
+      if (!ok && !approvalAbortController.signal.aborted) {
+        approvalError = failure
+        toast.error(approvalError)
+      }
     } finally {
       approvalSubmitting = false
+      if (session && chatRunRegistry.getRunState(session).abortController === approvalAbortController) {
+        chatRunRegistry.releaseAbortController(session, approvalAbortController)
+      }
     }
   }
 
@@ -803,6 +860,11 @@
         throw new Error(errorPayload.error || 'Failed to submit approval')
       }
     } catch (error: any) {
+      writeToolApprovals(
+        returnRefusedApprovalDecisions(toolApprovalSummary?.approvals ?? [], [
+          { approvalId, status: approved ? 'approved' : 'denied' }
+        ])
+      )
       const messageText = error instanceof Error ? error.message : String(error ?? '')
       approvalError = messageText || 'Failed to submit approval'
       toast.error(approvalError)
@@ -1114,6 +1176,14 @@
           />
         {/if}
 
+        {#if isWakeMessage && wakeTurn}
+          <JevJuiceWakeMessageFlag dmId={wakeTurn.dmId} />
+        {/if}
+
+        {#if quickActionMark}
+          <JevJuiceQuickActionChip mark={quickActionMark} agentName={agentDisplayName} />
+        {/if}
+
         {#if responseFailed && !shouldShowLoading}
           <div class="message-failure-banner" data-testid="message-failure-banner">
             <div class="message-failure-heading">
@@ -1124,8 +1194,8 @@
                   : 'This response was cut short by an error'}
               </span>
             </div>
-            {#if responseFailureText}
-              <p class="message-failure-detail">{responseFailureText}</p>
+            {#if responseFailureDetail}
+              <p class="message-failure-detail">{responseFailureDetail}</p>
             {/if}
           </div>
         {/if}
@@ -1257,6 +1327,26 @@
                 </DropdownMenu.Content>
               </DropdownMenu.Root>
             {/if}
+            {#if jevJuiceNotes.length > 0}
+              <JevJuiceNote notes={jevJuiceNotes} />
+            {/if}
+            {#each jevJuiceGaps as gap, gapIndex (`${gap.id}:${gap.at}:${gapIndex}`)}
+              <button
+                type="button"
+                class="message-memory-chip is-jev-juice"
+                title={jevJuiceGapDetail(gap)}
+                aria-label={`${jevJuiceGapText(gap)}. Open the agent's settings.`}
+                data-testid="jev-juice-gap"
+                data-gap-id={gap.id}
+                onclick={() => openAgentSettingsForGap(gap.agentId)}
+              >
+                <Zap class="message-memory-chip-icon" aria-hidden="true" />
+                {jevJuiceGapText(gap)}
+              </button>
+            {/each}
+            {#if jevJuicePostTurn}
+              <JevJuicePostTurnChip record={jevJuicePostTurn} />
+            {/if}
           </div>
         {/if}
 
@@ -1275,6 +1365,9 @@
       </div>
 
       {#if hasToolApprovals}
+        {#if wakeTurn}
+          <JevJuiceFlagNotice dmId={wakeTurn.dmId} wakeMessageId={wakeTurn.messageId} withApproval />
+        {/if}
         <MessageApprovalPanel
           approvals={toolApprovals}
           {approvalSubmitting}
@@ -1283,6 +1376,7 @@
           {formatApprovalInput}
           {getApprovalRemainingSeconds}
           onApprovalAction={handleApprovalAction}
+          wakeDmId={wakeTurn?.dmId ?? null}
         />
       {/if}
     </div>
@@ -1422,8 +1516,8 @@
     width: 100%;
     min-width: 0;
     max-width: 100%;
-    padding: 4px;
-    border-radius: 0.75rem;
+    padding: 3px;
+    border-radius: 0.3rem;
     --backdrop-bg: oklch(1 0 0 / 0.13);
     --backdrop-bg-trimmed: oklch(0.72 0.35 333.46 / 0.13);
     --backdrop-border: none;
@@ -1435,6 +1529,36 @@
 
   .message-bubble-backdrop.is-trimmed {
     background: var(--backdrop-bg-trimmed);
+  }
+
+  /* Each role gets its own backdrop wash plus a hairline under it, so a turn reads as
+     one block without the bubble needing a full border. Only the variable is set here,
+     so a trimmed message keeps its own wash. */
+  .message-shell.is-user .message-bubble-backdrop {
+    --backdrop-bg: linear-gradient(
+      135deg,
+      oklch(0.0852 0.0384 274.56 / 0.741) 0%,
+      oklch(0.0852 0.0384 274.56 / 0.741) 40%,
+      oklch(0 0 0 / 0.741) 100%
+    );
+    border-bottom: 1px solid oklch(0.8931 0.0561 290.81 / 0.098);
+  }
+
+  .message-shell.is-ai .message-bubble-backdrop {
+    --backdrop-bg: linear-gradient(
+      135deg,
+      oklch(0.0999 0.0115 284.11 / 0.741) 0%,
+      oklch(0.0999 0.0115 284.11 / 0.741) 40%,
+      oklch(0 0 0 / 0.741) 100%
+    );
+    border-bottom: 1px solid oklch(0.8931 0.0561 290.81 / 0.09);
+  }
+
+  /* Over a Goon those near black washes would read as holes, so the backdrop turns
+     into a light pane instead. */
+  :global(body.goon-immersive) .message-shell.is-user .message-bubble-backdrop,
+  :global(body.goon-immersive) .message-shell.is-ai .message-bubble-backdrop {
+    --backdrop-bg: oklch(1 0 0 / 0.11);
   }
   
   /* Message bubble - the actual chat bubble */
@@ -1451,11 +1575,13 @@
   }
 
   .message-bubble.is-ai {
+    border-top: 1px solid oklch(0.8931 0.0561 290.81 / 0.09);
     background: var(--message-ai-background);
     color: var(--message-ai-foreground);
   }
 
   .message-bubble.is-user {
+    border-top: 1px solid oklch(0.8931 0.0561 290.81 / 0.125);
     background: var(--message-user-background);
     color: var(--message-user-foreground);
   }

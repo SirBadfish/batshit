@@ -16,6 +16,11 @@ vi.mock('$lib/server/services/nativeTools', () => ({
 }))
 
 import { POST } from './+server'
+import {
+  __resetStreamAbortRegistryForTests,
+  abortStream,
+  registerStreamAbort
+} from '$lib/server/services/streamAbortRegistry'
 
 function request(body: Record<string, unknown>) {
   return new Request('http://localhost/api/native-tools/dispatch', {
@@ -28,6 +33,7 @@ function request(body: Record<string, unknown>) {
 describe('/api/native-tools/dispatch', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    __resetStreamAbortRegistryForTests()
     mocks.resolveNativeToolUser.mockResolvedValue({
       userId: 'user-1',
       auth: 'service',
@@ -518,5 +524,82 @@ describe('/api/native-tools/dispatch', () => {
     expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledWith(
       expect.objectContaining({ context })
     )
+  })
+
+  /**
+   * A Stop reaches a command run through the dispatch (2026-09-18, the sweep's second round).
+   *
+   * The managed CLI helper's `batshit_server_bash_execute` and n8n Workflow Subagents run their
+   * commands through this route, and neither request can carry a Stop: SvelteKit aborts
+   * `request.signal` only when the caller leaves before the body is read. The route hands the
+   * dispatch the Stop of the reply running in the chat, the chat the run credential is bound to
+   * on the agent lane (the same binding as the context's `session_id`).
+   */
+  it('hands the dispatch the Stop of the reply running in the chat the credential is bound to', async () => {
+    registerStreamAbort('session-bound', 'message-1', new AbortController())
+    registerStreamAbort('session-claimed', 'message-2', new AbortController())
+    mocks.resolveNativeToolUser.mockResolvedValue(agentLaneAuth)
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+
+    await POST({
+      request: request({
+        action: 'bash_execute',
+        input: { command: 'sleep 30' },
+        context: { session_id: 'session-claimed', mode: 'mode4', actor_type: 'primary' }
+      }),
+      locals: {}
+    } as any)
+
+    const signal = mocks.dispatchNativeAutomationPackAction.mock.calls[0]?.[0]?.abortSignal
+    expect(signal).toBeInstanceOf(AbortSignal)
+    // The chat the body names is not the one the credential is bound to: its Stop does not count.
+    abortStream('session-claimed', 'user')
+    expect(signal.aborted).toBe(false)
+    abortStream('session-bound', 'user')
+    expect(signal.aborted).toBe(true)
+  })
+
+  it('hands an n8n caller the Stop of the reply running in the chat it names', async () => {
+    registerStreamAbort('session-n8n', 'message-3', new AbortController())
+    mocks.resolveNativeToolUser.mockResolvedValue({ userId: 'user-1', auth: 'n8n-callback' })
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+
+    await POST({
+      request: request({
+        action: 'bash_execute',
+        input: { command: 'sleep 30' },
+        context: { session_id: 'session-n8n', agent_id: 'agent-1', mode: 'mode2', actor_type: 'subagent', parent_agent_id: 'agent-1' }
+      }),
+      locals: {}
+    } as any)
+
+    const signal = mocks.dispatchNativeAutomationPackAction.mock.calls[0]?.[0]?.abortSignal
+    expect(signal).toBeInstanceOf(AbortSignal)
+    abortStream('session-n8n', 'user')
+    expect(signal.aborted).toBe(true)
+  })
+
+  it('hands no Stop when no reply runs in the chat, so a caller with no chat keeps its time limit', async () => {
+    registerStreamAbort('another-session', 'message-9', new AbortController())
+    mocks.dispatchNativeAutomationPackAction.mockResolvedValue({ success: true })
+
+    // The service lane, a chat with no reply running.
+    await POST({
+      request: request({ action: 'bash_execute', input: { command: 'echo hi' }, context: { session_id: 's', agent_id: 'agent-1', mode: 'mode2', actor_type: 'primary' } }),
+      locals: {}
+    } as any)
+    // The n8n lane, the same.
+    mocks.resolveNativeToolUser.mockResolvedValueOnce({ userId: 'user-1', auth: 'n8n-callback' })
+    await POST({
+      request: request({ action: 'bash_execute', input: { command: 'echo hi' }, context: { session_id: 'n8n-idle', agent_id: 'agent-1', mode: 'mode2', actor_type: 'primary' } }),
+      locals: {}
+    } as any)
+    // No context at all (the dispatcher refuses it; no Stop is looked up for it).
+    await POST({ request: request({ action: 'bash_execute', input: { command: 'echo hi' } }), locals: {} } as any)
+
+    expect(mocks.dispatchNativeAutomationPackAction).toHaveBeenCalledTimes(3)
+    for (const [input] of mocks.dispatchNativeAutomationPackAction.mock.calls) {
+      expect(input.abortSignal).toBeUndefined()
+    }
   })
 })

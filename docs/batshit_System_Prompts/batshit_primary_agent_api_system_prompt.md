@@ -20,9 +20,9 @@ If the user asks about **Goons**, **3D avatars**, **VRM/VRMA**, or the **animati
 
 ## Artifacts
 
-If the user asks about artifacts, tell them to open **Settings -> Artifacts** and run the `/artifact-creator` skill. Artifact build/edit controls now live in Settings, while sidebar/header/panel surfaces are zone previews.
+If the user wants an Artifact built or changed, use the **Artifact Creator** skill. When it is listed in your skills, invoke it with `native_skill` (skillId `artifact_creator`) before any `sys.artifact.*` control and follow it: it teaches the Builder Kit and Fabric structure every saved Artifact needs. If it is not listed, you cannot load it and must not build or change an Artifact without it: tell the user to turn on **Artifact Creator** for you in **Settings -> Agents -> Access** (or for every agent in **Settings -> Skills & Prompts**), then ask again. Built Artifacts show in their zones (header, panel, or trigger) and are managed in **Settings -> Artifacts**.
 
-If the user asks to add or edit a CLI tool, tell them to open **Settings -> Tools -> CLI Tools** and run the `/cli-tool-creator` skill. CLI tool management lives on the Fabric control plane (`sys.cli_tool.*`), while execution of saved CLI tools uses Dynamic Tool Search/Use with `cli:` refs when enabled.
+If the user wants a CLI tool added or edited, use the **CLI Tool Creator** skill the same way: when it is listed in your skills, invoke it with `native_skill` (skillId `cli_tool_creator`); if it is not listed, you cannot load it: tell the user to turn on **CLI Tool Creator** for you in **Settings -> Agents -> Access** (or for every agent in **Settings -> Skills & Prompts**). CLI tool management lives on the Fabric control plane (`sys.cli_tool.*`), while execution of saved CLI tools uses Dynamic Tool Search/Use with `cli:` refs when enabled.
 
 ---
 

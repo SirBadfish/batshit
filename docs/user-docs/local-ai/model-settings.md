@@ -26,7 +26,7 @@ Three things to know:
 
 ### Why keep the fields at all?
 
-Because "let the program decide" only works if the program has a place to decide. LM Studio and oMLX have settings screens. llama.cpp, vLLM, and SGLang do not — their settings are command-line flags you chose when you started the server, and changing one means restarting it.
+Because "let the program decide" only works if the program has a place to decide. LM Studio and oMLX have settings screens. llama.cpp, vLLM, SGLang, and KoboldCpp do not — their settings are command-line flags you chose when you started the server, and changing one means restarting it.
 
 There is also a second reason: **one model, several agents.** If a coding agent wants temperature 0.2 and a roleplay agent wants 0.9 on the same loaded model, only a per-message value can do that. Your program's default is one number for everybody.
 
@@ -44,7 +44,8 @@ That sounds obvious. It was not true before: Batshit offered **Top K** on every 
 | vLLM | Top K, Min P, Repetition penalty, Chat template options |
 | SGLang | Top K, Min P, Repetition penalty, Chat template options |
 | oMLX | Top K, Min P, Repetition penalty and window, Chat template options |
-| Ollama | Thinking effort only — see below |
+| KoboldCpp | The widest set here: repeat penalty and its range and slope, Top A, Tail-free, N-sigma, DRY, XTC, DynaTemp, Smoothing, Adaptive target, a drag-to-reorder sampler order, phrase bans, token bans, logit bias, and negative prompts |
+| Ollama | Top K, Min P, Repeat penalty and window, Context size, Thinking |
 
 Every program also gets the basics it accepts: temperature, Top P, max output tokens, the penalties, stop sequences, and seed.
 
@@ -52,15 +53,60 @@ Every program also gets the basics it accepts: temperature, Top P, max output to
 
 ### Spelling matters, per program
 
+**KoboldCpp's list is short on purpose, and will grow.** Batshit only shows a setting after someone
+proved that changing it changes what the model writes. KoboldCpp accepts any setting you send without
+complaining, even ones it ignores, so "it accepted it" proves nothing. Two results worth knowing:
+
+- **Mirostat is not offered.** On the Mac version we tested, turning it on only switches off Top K
+  and Top P, and its two dials change nothing whatsoever.
+- **Frequency penalty is not offered.** KoboldCpp writes it into the same setting as Presence
+  Penalty, so two boxes would fight over one value. You get Presence Penalty.
+
+**KoboldCpp now has 35 settings**, the most of any program here. The specialist ones live in their
+own **KoboldCpp Options** section, so Common stays short.
+
+A few worth knowing:
+
+- **Sampler order** is a drag list. Leave it alone and KoboldCpp uses its own order. Click
+  *Customise Order* to start from that default and drag from there; *Reset* puts it back to "not
+  sent". Order only matters when more than one sampler is actually doing something.
+- **Phrase bans** takes one phrase per line. This is the one that kills stock phrases a model leans
+  on. KoboldCpp allows up to 768.
+- **Negative prompt** and **Guidance strength** only work if you started KoboldCpp with
+  `--enableguidance`, and they cost speed.
+- **Never stop on its own** makes the model keep writing until Max output tokens runs out. Good for
+  forcing a longer scene.
+
+Four settings you may know from elsewhere are **not** here, on purpose. Adaptive decay and the
+per-request context size both changed nothing when we tested them. Thinking budget and thinking
+effort could not be tested on the model we had, so they wait until someone can prove they work.
+
 Some programs call the same idea by a different name, and they ignore the other spelling without complaining. LM Studio wants `repeat_penalty` and ignores `repetition_penalty`; oMLX, vLLM, and SGLang want `repetition_penalty`. Batshit already picks the right one for you — this only matters if you're adding a Custom Parameter by hand.
 
-## Ollama is the odd one out
+## Ollama used to be the odd one out
 
-Ollama's OpenAI-compatible endpoint accepts the smallest set of any program here, and — this is the part that catches people — **it ignores anything it doesn't recognize without saying a word.** Send it `top_k` and you get a normal successful response with `top_k` quietly discarded.
+It isn't any more, and the story is worth knowing.
 
-So Batshit doesn't offer them. Showing you a Top K box that does nothing would be a lie.
+Ollama has **two doors**. The one most apps use speaks the common format, and it is very limited: it
+takes almost no settings, and — this is the part that catches people — **it ignores anything it
+doesn't recognize without saying a word.** Send it `top_k` and you get a normal, successful reply
+with `top_k` quietly thrown away.
 
-The settings Ollama can genuinely use live in a **Modelfile**: a short recipe you write, then bake into a new model name. It isn't a file sitting on your disk waiting to be edited — `ollama show --modelfile` prints the recipe for a model you already pulled so you can copy and change it.
+Batshit used to use that door, and offered you almost nothing, because a Top K box that does nothing
+is a lie.
+
+**Batshit now uses Ollama's own door instead.** Top K, Min P, repeat penalty, the repeat window and
+a real Context size all work. We tested each one by sending it twice with the same settings and the
+same seed, and keeping only the ones that actually changed the answer.
+
+Two did not survive that test, so you will not see them:
+
+- **Mirostat.** Ollama accepts it and nothing changes.
+- **Typical P.** This one is worse than useless: Ollama now answers with an error and your whole
+  message fails. Batshit strips it out even if you add it as a Custom Parameter, so a setting copied
+  from another app cannot break your chats.
+
+The one thing still worth a **Modelfile**: a short recipe you write, then bake into a new model name. It isn't a file sitting on your disk waiting to be edited — `ollama show --modelfile` prints the recipe for a model you already pulled so you can copy and change it.
 
 Batshit shows you the exact commands, already filled in with your model's name, right in the preset editor. They look like this:
 
@@ -90,7 +136,16 @@ This one is worth reading twice, because it fails silently and it can make a lon
 
 So a model card that says 131k, on a 16 GiB laptop, is really 4k — and past that point your agent silently forgets the start of every conversation.
 
-Batshit now reads the real number from Ollama while the model is loaded and plans against that instead. But **Batshit cannot set it** — the OpenAI-compatible endpoint has no field for context size. Two ways to change it yourself:
+Batshit reads the real number from Ollama while the model is loaded and plans against that.
+
+**And now Batshit can set it.** There is a **Context size** box in the Ollama preset. Leave it blank
+to keep whatever Ollama already loaded, or put a number in it and Ollama will use that.
+
+One thing to know: changing it makes Ollama **reload the model**. That takes a moment, and it throws
+away Ollama's memory of your earlier prompts, so the next reply is slower. Set it once and leave it;
+don't change it between chats.
+
+If you would rather not set it per preset, there are still two other ways:
 
 - **For one model**, add `PARAMETER num_ctx 32768` to a Modelfile using the three commands above.
 - **For everything**, start Ollama with the size you want:

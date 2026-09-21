@@ -115,6 +115,14 @@ vi.mock('$lib/services/apiKey.server', () => ({
   }
 }))
 
+// BL-75: `sys.skill.save` tests never write a skill to disk (the real `upsertSkill` writes
+// under the home folder); every other skillRegistry export stays real.
+const mockUpsertSkill = vi.fn()
+vi.mock('../services/skillRegistry', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/skillRegistry')>()),
+  upsertSkill: (...args: any[]) => mockUpsertSkill(...args)
+}))
+
 vi.mock('$lib/server/redis', () => ({
   redis: {
     getZip: vi.fn(),
@@ -771,6 +779,44 @@ describe('controlRegistry artifact capability controls', () => {
     expect(
       withSchedules.results.filter((item) => item.controlId.startsWith('sys.schedule.')).length
     ).toBe(4)
+  })
+
+  it('SA-120 P2: publishes sys.judge.ask through findControls as a safe control that does not act as the agent', async () => {
+    const { findControls, controlActsAsAgent } = await import('../services/fabricRegistry')
+
+    const result = await findControls({
+      query: 'sys.judge.',
+      includeDraft: true,
+      limit: 200
+    })
+
+    const judgeControls = result.results.filter((item) => item.controlId.startsWith('sys.judge.'))
+    expect(judgeControls.map((item) => item.controlId)).toEqual(['sys.judge.ask'])
+    // The control is the agent's own switch plus the instance master switch, never a
+    // per-call prompt: Jev cannot act, so there is nothing to approve.
+    expect(judgeControls[0].riskLevel).toBe('safe')
+    // DL-120-12: the handler forwards the agent's own `state` and `questions` on the
+    // user's key and reads nothing the agent owns, so it is NOT an acting-agent control —
+    // and the acting-agent prefix guard below must keep saying so.
+    expect(controlActsAsAgent('sys.judge.ask')).toBe(false)
+  })
+
+  it('SA-120 P2: excludes sys.judge.* from a broker allowlist without the judge scope', async () => {
+    const { findControls } = await import('../services/fabricRegistry')
+
+    const without = await findControls({
+      query: 'judge',
+      limit: 200,
+      allowedControlIds: ['sys.artifact.*', 'sys.memory.*', 'sys.dm.*', 'sys.schedule.*']
+    })
+    expect(without.results.some((item) => item.controlId.startsWith('sys.judge.'))).toBe(false)
+
+    const withJudge = await findControls({
+      query: 'judge',
+      limit: 200,
+      allowedControlIds: ['sys.judge.*']
+    })
+    expect(withJudge.results.filter((item) => item.controlId.startsWith('sys.judge.')).length).toBe(1)
   })
 
   it('matches multi-token artifact control queries in findControls', async () => {
@@ -1803,6 +1849,241 @@ describe('controlRegistry artifact capability controls', () => {
     })
     expect(mockLoadToolsForUser).not.toHaveBeenCalled()
     expect(result.success).toBe(true)
+  })
+
+  it('tells the agent to load Artifact Creator when structure enforcement blocks a save (BL-69)', async () => {
+    const issues = [
+      { code: 'BUILDER_KIT_REQUIRED', message: 'Use Batshit Builder Kit primitives.' },
+      { code: 'FABRIC_RUNTIME_REQUIRED', message: 'Declare a Fabric runtime contract before saving.' }
+    ]
+    mockArtifactService.create.mockRejectedValueOnce(
+      Object.assign(
+        new Error(
+          'Artifact save blocked: "Enforce Batshit Artifact Structure" is enabled.\n- Use Batshit Builder Kit primitives.\nTurn the toggle off in Settings -> Artifacts only if you intentionally want to save a manual/raw artifact without Builder Kit + Fabric.'
+        ),
+        { status: 400, code: 'ARTIFACT_STRUCTURE_ENFORCED', details: { issues, usesBuilderKit: false } }
+      )
+    )
+
+    const { useControl, ARTIFACT_STRUCTURE_AGENT_NEXT_STEP } = await import('../services/fabricRegistry')
+
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.artifact.create',
+      input: { name: 'Tip Calculator', type: 'html', content: '<input id="bill">' }
+    })
+
+    const payload = (result.success ? result.result : result) as any
+    const serialized = JSON.stringify(payload)
+    // The agent sees the skill step, not only the opt-out, and keeps the code and issues.
+    expect(serialized).toContain(JSON.stringify(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).slice(1, -1))
+    expect(serialized).toContain('ARTIFACT_STRUCTURE_ENFORCED')
+    expect(serialized).toContain('BUILDER_KIT_REQUIRED')
+    expect(serialized).toContain('FABRIC_RUNTIME_REQUIRED')
+    expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('`native_skill` (skillId `artifact_creator`)')
+    expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('Settings -> Agents -> Access')
+    expect(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).toContain('Settings -> Skills & Prompts')
+  })
+
+  it('keeps ordinary artifact control errors unchanged (BL-69)', async () => {
+    mockArtifactService.create.mockRejectedValueOnce(
+      Object.assign(new Error('Artifact storage is unavailable.'), { status: 503 })
+    )
+
+    const { useControl, ARTIFACT_STRUCTURE_AGENT_NEXT_STEP } = await import('../services/fabricRegistry')
+
+    const result = await useControl({
+      userId: 'user-1',
+      controlId: 'sys.artifact.create',
+      input: { name: 'Tip Calculator', type: 'html', content: '<div></div>' }
+    })
+
+    const serialized = JSON.stringify(result.success ? result.result : result)
+    expect(serialized).toContain('Artifact storage is unavailable.')
+    expect(serialized).not.toContain(JSON.stringify(ARTIFACT_STRUCTURE_AGENT_NEXT_STEP).slice(1, -1))
+    expect(serialized).not.toContain('ARTIFACT_STRUCTURE_ENFORCED')
+  })
+
+  describe('sys.skill.save cannot widen skill access (BL-75)', () => {
+    function savedSkill(id: string) {
+      return {
+        id,
+        name: id,
+        displayName: id,
+        description: '',
+        standards_status: 'valid',
+        trust_level: 'trusted',
+        dependencies: [],
+        metadata: {},
+        allowed_tools: []
+      }
+    }
+
+    async function saveSkill(
+      input: Record<string, unknown>,
+      caller: { agentId?: string; actorType?: any } = { agentId: 'agent_1', actorType: 'agent' }
+    ) {
+      const { useControl } = await import('../services/fabricRegistry')
+      return useControl({
+        userId: 'user-1',
+        ...(caller.agentId ? { agentId: caller.agentId } : {}),
+        actorType: caller.actorType,
+        controlId: 'sys.skill.save',
+        input
+      })
+    }
+
+    it('refuses a new command for a skill that already exists, a built-in one included', async () => {
+      await mockRedisJsonSet('skill:user-1:skill_creator', '$', { id: 'skill_creator', is_system: true })
+
+      const result = await saveSkill({
+        commandName: 'my-alias',
+        skill: { id: 'skill_creator', markdown: '# x', source: 'custom' }
+      })
+
+      expect(result.success).toBe(false)
+      expect(JSON.stringify(result)).toContain('already exists and belongs to another command')
+      expect(mockUpsertSkill).not.toHaveBeenCalled()
+      expect(await mockRedisJsonGet('slash_command:user-1:my_alias')).toBeNull()
+    })
+
+    it('saves a new skill on for the saving agent only, and answers a wider request with accessNote', async () => {
+      mockUpsertSkill.mockResolvedValueOnce(savedSkill('my_skill'))
+
+      const result = await saveSkill({
+        commandName: 'my-skill',
+        enabledForAllAgents: true,
+        enabledAgentIds: ['agent_2'],
+        skill: { markdown: '# My skill' }
+      })
+
+      expect(result.success).toBe(true)
+      expect(mockUpsertSkill).toHaveBeenCalledWith(
+        expect.objectContaining({ skill: expect.objectContaining({ id: 'my_skill' }) })
+      )
+      const stored = await mockRedisJsonGet('slash_command:user-1:my_skill')
+      expect(stored).toMatchObject({
+        skill_id: 'my_skill',
+        enabled_for_all_agents: false,
+        enabled_agent_ids: ['agent_1']
+      })
+      if (!result.success) return
+      expect((result.result as any).accessNote).toContain('Saved for you only')
+    })
+
+    it('keeps an existing command\'s access as the user set it', async () => {
+      await mockRedisJsonSet('skill:user-1:my_skill', '$', { id: 'my_skill' })
+      await mockRedisJsonSet('slash_command:user-1:my_skill', '$', {
+        id: 'my_skill',
+        type: 'skill',
+        skill_id: 'my_skill',
+        enabled_for_all_agents: false,
+        enabled_agent_ids: ['agent_1']
+      })
+      mockUpsertSkill.mockResolvedValueOnce(savedSkill('my_skill'))
+
+      const result = await saveSkill({
+        commandName: 'my-skill',
+        enabledForAllAgents: true,
+        enabledAgentIds: ['agent_1', 'agent_3'],
+        skill: { id: 'my_skill', markdown: '# Updated' }
+      })
+
+      expect(result.success).toBe(true)
+      expect(await mockRedisJsonGet('slash_command:user-1:my_skill')).toMatchObject({
+        enabled_for_all_agents: false,
+        enabled_agent_ids: ['agent_1']
+      })
+      if (!result.success) return
+      expect((result.result as any).accessNote).toContain('Access unchanged')
+    })
+
+    it('keeps a switched-off command off for a caller with no agent (BL-80)', async () => {
+      await mockRedisJsonSet('skill:user-1:my_skill', '$', { id: 'my_skill' })
+      await mockRedisJsonSet('slash_command:user-1:my_skill', '$', {
+        id: 'my_skill',
+        type: 'skill',
+        skill_id: 'my_skill',
+        enabled_for_all_agents: true,
+        is_active: false
+      })
+      mockUpsertSkill.mockResolvedValueOnce(savedSkill('my_skill'))
+
+      const result = await saveSkill(
+        { commandName: 'my-skill', isActive: true, skill: { id: 'my_skill', markdown: '# Updated' } },
+        { actorType: 'session' }
+      )
+
+      expect(result.success).toBe(true)
+      expect(await mockRedisJsonGet('slash_command:user-1:my_skill')).toMatchObject({ is_active: false })
+      if (!result.success) return
+      expect((result.result as any).accessNote).toContain('Access unchanged')
+    })
+
+    it.each([
+      ['off for the saving agent', { enabled_agent_ids: ['agent_2'] }],
+      ['switched off', { enabled_agent_ids: ['agent_1'], is_active: false }]
+    ])('refuses to change a skill that is %s (BL-80)', async (_label, access) => {
+      const command = {
+        id: 'my_skill',
+        displayName: 'My Skill',
+        type: 'skill',
+        skill_id: 'my_skill',
+        enabled_for_all_agents: false,
+        ...access
+      }
+      await mockRedisJsonSet('skill:user-1:my_skill', '$', { id: 'my_skill' })
+      await mockRedisJsonSet('slash_command:user-1:my_skill', '$', command)
+
+      const result = await saveSkill({
+        commandName: 'my-skill',
+        skill: { id: 'my_skill', markdown: '# Rewritten by an agent' }
+      })
+
+      expect(result.success).toBe(false)
+      expect(JSON.stringify(result)).toContain('Skill \\"My Skill\\" is not on for you, so you cannot change it.')
+      expect(mockUpsertSkill).not.toHaveBeenCalled()
+      expect(await mockRedisJsonGet('slash_command:user-1:my_skill')).toEqual(command)
+    })
+
+    it('tells a save with no agent that nobody can use the new skill yet (BL-80)', async () => {
+      mockUpsertSkill.mockResolvedValueOnce(savedSkill('portable_skill'))
+
+      const result = await saveSkill(
+        { commandName: 'portable-skill', skill: { markdown: '# From a portable skill' } },
+        { actorType: 'session' }
+      )
+
+      expect(result.success).toBe(true)
+      expect(await mockRedisJsonGet('slash_command:user-1:portable_skill')).toMatchObject({
+        enabled_for_all_agents: false,
+        enabled_agent_ids: []
+      })
+      if (!result.success) return
+      expect((result.result as any).accessNote).toContain('no agent can use it yet')
+    })
+
+    it('keeps a legacy command without an access field without one, and updates its content', async () => {
+      await mockRedisJsonSet('skill:user-1:legacy_skill', '$', { id: 'legacy_skill' })
+      await mockRedisJsonSet('slash_command:user-1:legacy_skill', '$', {
+        id: 'legacy_skill',
+        type: 'skill',
+        skill_id: 'legacy_skill'
+      })
+      mockUpsertSkill.mockResolvedValueOnce(savedSkill('legacy_skill'))
+
+      const result = await saveSkill({
+        commandName: 'legacy-skill',
+        skill: { id: 'legacy_skill', markdown: '# Legacy, updated' }
+      })
+
+      expect(result.success).toBe(true)
+      const stored = await mockRedisJsonGet('slash_command:user-1:legacy_skill')
+      expect(Object.prototype.hasOwnProperty.call(stored, 'enabled_agent_ids')).toBe(false)
+      expect(stored?.enabled_for_all_agents).toBe(false)
+      if (!result.success) return
+      expect((result.result as any).accessNote).toBeUndefined()
+    })
   })
 
   it('returns compact artifact summaries for lifecycle write controls', async () => {
@@ -3982,6 +4263,9 @@ describe('SA-117 DL-117-05: identity-bearing controls', () => {
       'sys.cli_tool.create',
       'sys.slash_command.upsert',
       'sys.runtime_addon.start',
+      // SA-120 P2 (DL-120-12): Jev never approves and the handler reads nothing the agent
+      // owns, so the judgment tool is deliberately NOT an acting-agent control.
+      'sys.judge.ask',
       'artifact.something',
       '',
       'dm.read'

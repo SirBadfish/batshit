@@ -286,8 +286,9 @@
             How this agent's Infinite Sessions manage their context window: the guaranteed
             floor of recent conversation that never graduates away, the headroom kept free
             below the model's maximum, the nap trigger (graduate closed episodes, compress
-            stale bulk, refresh the whiteboard), the idle gap that closes an episode after a
-            break, and the model that writes graduation summaries.
+            stale bulk, fill the whiteboard only if the agent has not written one), the idle
+            gap that closes an episode after a break, and the model that writes graduation
+            summaries.
           </p>
         </SettingsInfoMenu>
       </div>

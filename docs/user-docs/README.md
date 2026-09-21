@@ -2,7 +2,7 @@
 
 These are the launch-facing UserDocs source for Batshit. They should be useful, current, and honest before they're beautiful.
 
-Batshit is planned for public release as open source under **AGPL-3.0-only**. The Batshit name, logo, mascot, and visual identity are protected separately by the project's trademark policy.
+Batshit is open source under **AGPL-3.0-only**. The Batshit name, logo, mascot, and visual identity are protected separately by the project's trademark policy.
 
 User-created chats, agents, prompts, workflows, artifacts, uploaded files, project files, generated content, and local data remain the user's content. Batshit integrates with n8n, which is separately licensed by n8n.
 

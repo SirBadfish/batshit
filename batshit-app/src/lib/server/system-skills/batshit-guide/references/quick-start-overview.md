@@ -7,26 +7,26 @@ This is the fast lane. The [Installation](../installation/choose-mac-app-or-dock
 ## Pick your install in one line
 
 - **On a Mac?** Use the Mac app. You open `Batshit.app`, let Runtime Doctor start the local services, then open Batshit. Full steps: [Install Mac app](../installation/install-mac-app.md).
-- **On Windows or Linux?** Use Docker. You clone the repo, set two secrets, and run one launcher. Full steps: [Install Docker](../installation/install-docker.md).
+- **On Windows or Linux?** Use Docker. You clone the repo and run one launcher; the first start writes your settings file and its two secrets for you. Full steps: [Install Docker](../installation/install-docker.md).
 
 Both paths are first-class peers — neither is a lesser fallback. If you want the full comparison before deciding, read [Choose Mac app or Docker](../installation/choose-mac-app-or-docker.md). Otherwise, the one-liner above is enough to start.
 
 Batshit is alpha self-hosting, not a one-click consumer app yet. Expect a few real setup steps and honest error messages when something needs configuring.
 
-## The five steps to a first message
+## The six steps to a first message
 
 Once Batshit is installed and running, this is the whole fast path:
 
 1. **Start Batshit and open it.**
    - Mac app: open `Batshit.app`, use **Start Runtime**, then **Open Batshit**. It opens at `http://127.0.0.1:5620`.
    - Docker: run `./start-docker.sh`, then open `http://localhost:5620`.
-2. **Create the first admin account.** A fresh instance shows a setup screen. Enter an email, a display name, and a password of at least 10 characters. This is a single-user-per-instance app, so this account is yours.
-3. **Use the first-time setup wizard.** It opens the right settings areas in order: API Keys, Models, then Agents. You can add one key or several, create one starter preset and agent, and add more later.
+2. **Create the first admin account.** A fresh instance shows a setup screen. Enter an email, a display name, and a password of at least 10 characters (typed twice), then choose **Create Admin Account**. This is a single-user-per-instance app, so this account is yours.
+3. **Use the first-time setup wizard.** It opens the right settings areas in order: API Keys, Models, then Agents. After each step, close Settings (**Close** at the bottom of the Settings list, or Esc) to get back to the wizard. You can add one key or several, create one starter preset and agent, and add more later.
 4. **Add one model source.** You need exactly one of these:
    - A provider API key (the simplest start) — use the wizard or open Settings → API Keys, add a key for a provider like OpenAI, Anthropic, or Google, then create a saved model preset in Settings → Models. Details: [API keys and models](../providers/api-keys-and-models.md).
    - A Local AI runtime — if you'd rather run a model on your own machine, configure it in Settings → Local AI and create a preset that uses it. Details: [Local AI](../local-ai/overview.md).
 5. **Create one `API` Primary Agent.** Use the wizard or open Settings → Agents, create a Primary Agent, set its type to `API`, give it a name, and pick the model preset you just saved.
-6. **Send a message.** Select the agent in chat and try: `Say hello and tell me what model you are using.` If the model answers, your core path works.
+6. **Send a message.** Select the agent in chat and try: `Say hello and tell me one thing you can do in Batshit.` If the model answers, your core path works. (Don't ask it which model it is; models often misname themselves. The chat bar shows the preset Batshit actually used.)
 
 That's it. You now have a working Batshit chat.
 

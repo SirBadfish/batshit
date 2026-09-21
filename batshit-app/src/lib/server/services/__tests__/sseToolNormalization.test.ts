@@ -28,4 +28,29 @@ describe('sseToolNormalization', () => {
     expect(normalized.subagentName).toBe('Researcher')
     expect(normalized.Prompt__User_Message_).toBe('Find the launch notes')
   })
+
+  // Bug sweep (2026-09-18): `Prompt__User_Message_` is n8n's Subagent message field, and every reader
+  // (the zip step, the source detector, the reply sanitizer, the client hydration and renderer) takes
+  // it for a subagent call. A tool's own `prompt` argument is not that: inventing the field from it
+  // filed Claude Code's WebFetch, CronCreate, and Agent helper (real inputs below) as Subagent cards.
+  it.each([
+    ['WebFetch', { url: 'https://www.example.com/listing', prompt: 'Return the address and the price.' }],
+    ['CronCreate', { cron: '*/15 * * * *', recurring: true, prompt: 'Run one polling cycle.' }],
+    ['Agent', { description: 'Find the tests', subagent_type: 'Explore', prompt: 'Find every test file.' }]
+  ])("never invents a subagent message from %s's own prompt", (_tool, input) => {
+    const normalized = normalizeToolArgs(input)
+
+    expect(normalized).toEqual(input)
+    expect(normalized).not.toHaveProperty('Prompt__User_Message_')
+  })
+
+  it("keeps a subagent's own message: its chatInput, or n8n's field as sent", () => {
+    // The API lane's and the CLI bridge's subagent tools both take `{ chatInput, thread }`.
+    expect(normalizeToolArgs({ chatInput: 'Summarize the notes', thread: 'fresh' }).Prompt__User_Message_).toBe(
+      'Summarize the notes'
+    )
+    expect(normalizeToolArgs({ Prompt__User_Message_: 'Check the workspace.' })).toEqual({
+      Prompt__User_Message_: 'Check the workspace.'
+    })
+  })
 })

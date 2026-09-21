@@ -1,4 +1,5 @@
 import type { ZipReference } from '$lib/server/zipService'
+import { joinResumedContent } from '$lib/server/services/approvalResumeMessage'
 import {
   composeToolStreamContentFromEvents,
   injectZipReferencesIntoReplayEvents,
@@ -10,6 +11,7 @@ export function buildEndStreamingContent(options: {
   inlineCapable: boolean
   toolZipRefs: ZipReference[]
   allZipRefs: ZipReference[]
+  priorContent?: string
 }) {
   const { streamEvents, inlineCapable, toolZipRefs, allZipRefs } = options
 
@@ -23,6 +25,8 @@ export function buildEndStreamingContent(options: {
         .filter((event) => event.type === 'chunk' && typeof event.content === 'string')
         .map((event) => event.content as string)
         .join('')
+
+  if (options.priorContent) workingContent = joinResumedContent(options.priorContent, workingContent)
 
   const refsToAppend = allZipRefs.filter(
     (ref) =>

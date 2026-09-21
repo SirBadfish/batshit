@@ -40,6 +40,17 @@
     type LiveKitVoiceRoomHandle
   } from '$lib/services/liveKitVoiceClient'
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
+  import {
+    QUICK_ACTION_EVENT,
+    quickActionDidText,
+    quickActionMarkOf,
+    quickActionSettingsTabTarget,
+    readQuickActionVerdict,
+    resolveJevQuickActionsEnabled,
+    resolveQuickActionWakeGate,
+    type QuickActionMark,
+    type QuickActionVerdict
+  } from '$lib/utils/jevJuiceQuickActions'
   import { getPlaybackState } from '$lib/stores/voicePlayback.svelte'
   import * as agentStore from '$lib/stores/agents.svelte'
   import * as sessionStore from '$lib/stores/session.svelte'
@@ -66,6 +77,12 @@
   } from '$lib/utils/primaryAgentType'
   import { cleanSpeechTranscript } from '$lib/utils/speechTranscript'
   import {
+    createVoiceQuickActionCommitCoordinator,
+    runVoiceQuickActionCommit,
+    voiceQuickActionSnapshotMatches,
+    type VoiceQuickActionCommitToken
+  } from '$lib/utils/voiceQuickActionCommit'
+  import {
     resolveModelVoiceSessionConfig,
     shouldRouteLiveKitRemoteAudioToGoon
   } from '$lib/utils/modelVoiceSession'
@@ -90,6 +107,7 @@
   import type { SavedModel } from '$lib/types/savedModels'
   import type { VoiceModeInputMode, VoiceProviderSummary } from '$lib/types/voice'
   import { LIVE_SETTINGS_EVENTS } from '$lib/utils/liveSettingsEvents'
+  import { CODEX_SUBMODEL_CHOICES } from '$lib/data/codex-models'
   import { isSlashCommandEnabledForAgent } from '$lib/utils/slashCommandAccess'
   import { neutralizeAllClipReferenceSyntax } from '$lib/utils/zipReferenceSafety'
   import { ProjectService } from '$lib/services/projects'
@@ -147,7 +165,8 @@
     onClippedItemsChange = (_clips: ComposerClip[]) => {},
     busySendMode = 'steer' as BusySendMode,
     steerable = true,
-    steerReason = null
+    steerReason = null,
+    onQuickActionMessage = async (_content: string, _mark: QuickActionMark) => {}
   } = $props<{
     onSend?: (message: string, metadata?: any) => boolean | void | Promise<boolean | void>
     disabled?: boolean
@@ -167,6 +186,11 @@
     /** SA-114 P3 (DL-114-09): the server's verdict for the reply running right now. */
     steerable?: boolean
     steerReason?: string | null
+    /**
+     * SA-120 P9: a spoken turn that was ONLY a quick action is stored by the page as a user
+     * message with the mark, and no agent turn runs. The page owns message persistence.
+     */
+    onQuickActionMessage?: (content: string, mark: QuickActionMark) => Promise<void> | void
   }>()
   
   let message = $state('')
@@ -286,6 +310,7 @@
   let voiceModeActivityPreviewActive = $state(false)
   let voiceModeActivityPreviewTimer: ReturnType<typeof setTimeout> | null = null
   let voiceModeCommittedTranscript = ''
+  const voiceQuickActionCommits = createVoiceQuickActionCommitCoordinator()
   let voiceProviderSummaryCache: { loadedAt: number; providers: VoiceProviderSummary[] } | null = null
   const voiceModeActivityBars = Array.from({ length: 28 }, (_, index) => index)
   // Files now handled through ClipsManager component
@@ -492,6 +517,26 @@
 
   const savedModels = $derived(savedModelsStore.getSavedModels())
   const currentAgent = $derived(agentStore.getCurrentAgent())
+  const voiceQuickActionCommitContextKey = $derived(
+    `${sessionId ?? ''}\u0000${currentAgent?.id ?? ''}`
+  )
+
+  function currentVoiceQuickActionContext() {
+    return { sessionId: sessionId ?? null, agentId: currentAgent?.id ?? null }
+  }
+
+  function invalidatePendingVoiceQuickActionCommit(context?: ReturnType<typeof currentVoiceQuickActionContext>) {
+    const invalidated = context
+      ? voiceQuickActionCommits.invalidateContext(context)
+      : voiceQuickActionCommits.invalidate()
+    if (invalidated) waitingForAI = false
+  }
+
+  $effect(() => {
+    voiceQuickActionCommitContextKey
+    const ownedContext = currentVoiceQuickActionContext()
+    return () => invalidatePendingVoiceQuickActionCommit(ownedContext)
+  })
   const activeAgentVoiceSessionRuntime = $derived(
     normalizeAgentVoiceProfile(currentAgent?.voice_profile)?.voiceSessionRuntime
   )
@@ -762,6 +807,7 @@
 
   function stopDirectVoiceModeForLiveKit() {
     if (!isListening && !isVoiceMode) return
+    invalidatePendingVoiceQuickActionCommit()
     voiceService.stopListening()
     resetVoiceModeTranscriptBuffer()
     isListening = false
@@ -774,7 +820,8 @@
     }
   }
 
-  function endDirectVoiceMode(options: { notify?: boolean } = {}) {
+  function endDirectVoiceMode(options: { notify?: boolean; preservePendingCommit?: boolean } = {}) {
+    if (!options.preservePendingCommit) invalidatePendingVoiceQuickActionCommit()
     voiceService.stopAll()
     voiceService.stopListening()
     resetVoiceModeTranscriptBuffer()
@@ -2137,9 +2184,20 @@ $effect(() => {
 
   async function sendMessageWithText(
     rawText: string,
-    overrides?: { stt?: boolean; tts?: boolean; busySendModeOverride?: BusySendMode }
-  ) {
-    if (!rawText.trim() || disabled) return
+    overrides?: {
+      stt?: boolean
+      tts?: boolean
+      busySendModeOverride?: BusySendMode
+      quickAction?: QuickActionMark | null
+      /** A pending Voice Mode verdict must still belong to the selected chat at commit time. */
+      beforeSend?: () => boolean
+      /** Preserve the chat that owned a delayed Voice Mode turn throughout send preparation. */
+      composerSessionId?: string | null
+      /** A newer live transcript must survive acceptance of the older delayed turn. */
+      mayResetComposer?: () => boolean
+    }
+  ): Promise<boolean> {
+    if (!rawText.trim() || disabled) return false
 
     const currentMentions = validateMentions(
       rawText,
@@ -2211,18 +2269,20 @@ $effect(() => {
       }
     }
 
-    let slashInvocationSessionId =
-      resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
+    const hasCapturedComposerSession = overrides?.composerSessionId !== undefined
+    let slashInvocationSessionId = hasCapturedComposerSession
+      ? resolveSessionId(overrides?.composerSessionId)
+      : resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
 
     if ((hasSlashToken(finalMessage) || hasSkillNoteToken(finalMessage)) && !slashInvocationSessionId) {
       slashInvocationSessionId = await ensureSessionForSlashInvocation()
       if (!slashInvocationSessionId) {
-        return
+        return false
       }
     }
 
     const slashResult = await expandSlashCommands(finalMessage, slashInvocationSessionId)
-    if (slashResult.blocked) return
+    if (slashResult.blocked) return false
     finalMessage = slashResult.text
     if (slashResult.expandedPrompts.length > 0) {
       const expandedNames = slashResult.expandedPrompts.map((command) => command.name).join(', ')
@@ -2235,6 +2295,13 @@ $effect(() => {
     // Send with appropriate metadata for voice mode + Codex permission
     const shouldSpeak = overrides?.tts ?? voiceMode
     const messageIncludesStt = overrides?.stt ?? composerHasSttTranscript
+    const sentClipIds = clippedItems
+      .map((clip: { id?: string }) => clip.id)
+      .filter((id: string | undefined): id is string => Boolean(id))
+    const resetAcceptedComposer = () => {
+      if (overrides?.mayResetComposer && !overrides.mayResetComposer()) return
+      resetComposer()
+    }
     let acceptedHandled = false
     const handleAccepted = async (waitForServer = false) => {
       if (acceptedHandled) return
@@ -2244,17 +2311,18 @@ $effect(() => {
       // the clips are cleared here, by telling the clips manager the message was accepted —
       // so "keep the clips" is this call being skipped, and nothing else.
       if (!steeringKeepsClips && clipsManager?.handleMessageAccepted) {
-        await clipsManager.handleMessageAccepted({ waitForServer })
+        await clipsManager.handleMessageAccepted({
+          waitForServer,
+          ...(overrides?.mayResetComposer ? { clipIds: sentClipIds } : {})
+        })
       }
 
-      resetComposer()
+      resetAcceptedComposer()
     }
 
-    const composerSessionId =
-      resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
-    const sentClipIds = clippedItems
-      .map((clip: { id?: string }) => clip.id)
-      .filter((id: string | undefined): id is string => Boolean(id))
+    const composerSessionId = hasCapturedComposerSession
+      ? resolveSessionId(overrides?.composerSessionId) ?? slashInvocationSessionId
+      : resolveSessionId(sessionId) ?? resolveSessionId(sessionStore.getCurrentSessionId())
     const metadata: Record<string, any> = {
       stt: Boolean(messageIncludesStt),
       tts: Boolean(shouldSpeak),
@@ -2263,6 +2331,8 @@ $effect(() => {
       composerSessionId: composerSessionId ?? undefined,
       fileReferences: fileReferences.length ? fileReferences : undefined,
       clipIds: sentClipIds,
+      // SA-120 P9: a quick action that ran on this turn AND left something for the agent.
+      quickAction: overrides?.quickAction ?? undefined,
       onAccepted: () => handleAccepted(false),
       /**
        * SA-119 review F-P3b-2 — the one callback a receipt's **Send now** may replay.
@@ -2292,7 +2362,7 @@ $effect(() => {
        * and **Dismiss** instead, so the words are one click away without ever touching
        * what is in the box.
        */
-      onQueuedForLater: () => resetComposer(),
+      onQueuedForLater: () => resetAcceptedComposer(),
       // SA-114 P3 (DL-114-01): present only when Cmd/Ctrl+Enter asked for the other mode.
       busySendModeOverride: overrides?.busySendModeOverride
     }
@@ -2308,11 +2378,13 @@ $effect(() => {
     if (resolvedProjectRules) {
       metadata.projectRules = resolvedProjectRules
     }
+    if (overrides?.beforeSend && !overrides.beforeSend()) return false
     const sendAccepted = await Promise.resolve(onSend(finalMessage, metadata))
     if (sendAccepted === false) {
-      return
+      return false
     }
     await handleAccepted(true)
+    return true
   }
 
   async function stopDictationBeforeSend(): Promise<boolean> {
@@ -2771,6 +2843,7 @@ $effect(() => {
       disconnectLiveKitVoiceRoom()
       desktopControlsVoiceOwner?.detach()
       desktopControlsVoiceOwner = null
+      invalidatePendingVoiceQuickActionCommit()
     }
   })
   
@@ -2783,7 +2856,7 @@ $effect(() => {
     const defaults: CodexAgentSettings = {
       permissionMode: 'chat',
       includeProjectInstructions: true,
-      model: 'gpt-5',
+      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? 'gpt-6-astra',
       sandbox: 'read-only',
       approval: 'never',
       streamingEffect: true,
@@ -2804,6 +2877,12 @@ $effect(() => {
     return {
       ...defaults,
       ...settings,
+      approval:
+        settings.approval === 'on-request' ||
+        (settings.approval as string) === 'on-failure' ||
+        (settings.approval as string) === 'untrusted'
+          ? 'on-request'
+          : 'never',
       includeProjectInstructions:
         typeof settings.includeProjectInstructions === 'boolean'
           ? settings.includeProjectInstructions
@@ -2904,7 +2983,7 @@ $effect(() => {
       mode === 'agent_full'
         ? { sandbox: 'danger-full-access', approval: 'never' }
         : mode === 'agent'
-          ? { sandbox: 'workspace-write', approval: 'on-failure' }
+          ? { sandbox: 'workspace-write', approval: 'on-request' }
           : { sandbox: 'read-only', approval: 'never' }
     try {
       const nextCodex: CodexAgentSettings = {
@@ -3222,8 +3301,130 @@ $effect(() => {
       voiceModeTurnSendPending = false
       voiceModeCommittedTranscript = ''
       message = finalMessage
-      void sendMessageWithText(finalMessage, { stt: true, tts: true })
+      void commitVoiceModeTurn(finalMessage)
     }, delayMs)
+  }
+
+  /**
+   * SA-120 P9: the one place a spoken turn is committed. With Quick Actions on, Batshit first
+   * asks whether the turn is a small request to the app itself; if so it acts at once and,
+   * when that was the whole turn, sends nothing to the agent. Any failure or slowness in the
+   * check means "no quick action": the turn is sent exactly as it always was.
+   */
+  async function commitVoiceModeTurn(finalMessage: string) {
+    const pending = voiceQuickActionCommits.begin(currentVoiceQuickActionContext())
+    // P9b: with a wake word required (the default, "Yo"), a turn that does not start with it is
+    // never judged: no Jev call, no wait. Jev sees the words after the wake word.
+    const gate = quickActionsEnabled() ? resolveQuickActionWakeGate(finalMessage, quickActionVoiceModeSettings()) : null
+    const snapshotStillOwnsComposer = () =>
+      voiceQuickActionCommits.ownsLatestGeneration(pending) &&
+      voiceQuickActionSnapshotMatches(
+        pending.context,
+        currentVoiceQuickActionContext(),
+        finalMessage,
+        message
+      )
+
+    try {
+      await runVoiceQuickActionCommit<QuickActionVerdict, QuickActionMark>({
+        coordinator: voiceQuickActionCommits,
+        token: pending,
+        currentContext: currentVoiceQuickActionContext,
+        requestVerdict: () => gate
+          ? requestQuickActionVerdict(gate.said, finalMessage, pending)
+          : Promise.resolve(null),
+        decide: (verdict) => {
+          const mark = verdict?.action ? quickActionMarkOf(verdict) : null
+          return { mark, onlyThis: Boolean(verdict?.onlyThis && mark) }
+        },
+        applyAction: (verdict, mark) => {
+          runQuickAction(verdict)
+          toast.info(`Quick action by Jev: ${quickActionDidText(mark)}`)
+        },
+        persistOnly: async (mark) => {
+          // A live-transcript lane may already have printed the user's NEXT words while Jev
+          // was deciding. Persist first so a storage failure leaves the words recoverable, then
+          // clear only the captured generation and snapshot that were actually stored.
+          await onQuickActionMessage(finalMessage, mark)
+          if (snapshotStillOwnsComposer()) message = ''
+        },
+        send: (mark, beforeSend) => sendMessageWithText(finalMessage, {
+          stt: true,
+          tts: true,
+          quickAction: mark,
+          composerSessionId: pending.context.sessionId,
+          beforeSend,
+          mayResetComposer: snapshotStillOwnsComposer
+        }),
+        releasePending: () => {
+          waitingForAI = false
+        }
+      })
+    } catch (error) {
+      console.error('[Jev Juice] could not commit the voice turn:', error)
+    }
+  }
+
+  /** The switch and the wake word are global (LS-060): read from the user's voice settings, never from an agent profile. */
+  function quickActionVoiceModeSettings() {
+    return normalizeVoiceSettings(getUserSettings()?.voice_settings).voiceMode
+  }
+  function quickActionsEnabled(): boolean {
+    return resolveJevQuickActionsEnabled(quickActionVoiceModeSettings())
+  }
+
+  async function requestQuickActionVerdict(
+    said: string,
+    spoken: string,
+    pending: VoiceQuickActionCommitToken
+  ): Promise<QuickActionVerdict | null> {
+    try {
+      const response = await fetch('/api/jev-juice/quick-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          said,
+          spoken,
+          sessionId: pending.context.sessionId,
+          agentId: pending.context.agentId
+        }),
+        signal: pending.signal
+      })
+      if (!response.ok) return null
+      return readQuickActionVerdict(await response.json().catch(() => null))
+    } catch (error) {
+      if (!pending.signal.aborted) {
+        console.warn('[Jev Juice] quick-action check failed; the turn is sent as usual:', error)
+      }
+      return null
+    }
+  }
+
+  /** Every action is one the user could click: the composer's own controls, or a window event the page answers. */
+  function runQuickAction(verdict: QuickActionVerdict) {
+    switch (verdict.action) {
+      case 'stop':
+        voiceService.stopAll()
+        if (workBusy) void handleStopWorkClick()
+        return
+      case 'end_voice_mode':
+        endDirectVoiceMode({ notify: true, preservePendingCommit: true })
+        return
+      case 'show_execution_viewer':
+        onOpenExecutionViewer(sessionId)
+        return
+      case 'open_settings': {
+        const tab = quickActionSettingsTabTarget(verdict.tab)
+        window.dispatchEvent(new CustomEvent('batshit:open-settings', { detail: tab ? { tab } : {} }))
+        return
+      }
+      case 'open_goon_dock':
+      case 'close_goon_dock':
+        window.dispatchEvent(new CustomEvent(QUICK_ACTION_EVENT, { detail: { id: verdict.action } }))
+        return
+      default:
+        return
+    }
   }
 
   // Handle mic button (manual dictation STT)

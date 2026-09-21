@@ -267,7 +267,7 @@
   .update-available-menu-subtitle {
     margin: 2px 0 0;
     color: var(--muted-foreground);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     font-size: 0.75rem;
   }
 

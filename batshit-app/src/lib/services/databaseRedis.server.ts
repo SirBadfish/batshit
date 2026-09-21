@@ -10,12 +10,13 @@ import { userStore } from './userStore'
 import { redis } from '$lib/server/redis'
 import { mcpGatewayService } from '$lib/server/services/mcpGatewayService'
 import {
+  type AgentSlashCapability,
   buildSkillsCommandsDcmLines,
   getEnabledAgentSlashCapabilities
 } from '$lib/server/services/slashCommandCapabilities'
 import { normalizeSubagentType } from '$lib/utils/subagentType'
 import { resolveSubagentSlug } from '$lib/utils/subagentSlug'
-import type { UnzippedItem } from '$lib/services/zipping'
+import { createZipStateView, type UnzippedItem, type ZipStateView } from '$lib/services/zipping'
 
 // Import types
 import type { ChatSessionRow, ChatMemoryRow, AgentRow, UserSettingsRow, ClipRow, SessionClipRow, ChatFolderRow, SubagentRow } from '$lib/types/database'
@@ -26,13 +27,16 @@ import type { GroupChatAgentSettings } from '$lib/types/groupChat'
 import {
   buildPreservedReasoningHistory,
   compileForAI,
+  type ZipCompression,
+  type ZipExposed,
   type ZipExposure
 } from '$lib/services/messageCompiler'
 import { normalizeId } from '$lib/utils/idNormalizer'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
 import { createReference, extractAllReferences } from '$lib/services/universalResolver'
 import { buildFileReferenceBlock, type FileReferencePayload } from '$lib/utils/fileMentions'
-import { buildDynamicMcpIndex } from '$lib/server/services/dynamicMcpIndex'
+import {
+  type DynamicMcpDiscoverableRef, buildDynamicMcpIndex } from '$lib/server/services/dynamicMcpIndex'
 import {
   buildGoonDcmLines as formatGoonDcmLines,
   shouldIncludeGoonSpokenCues
@@ -40,6 +44,7 @@ import {
 import {
   buildDmGuidancePromptBlock,
   buildDynamicMcpPromptBlock,
+  buildJevJuiceGuidancePromptBlock,
   buildMemoryPromptBlock,
   buildSubagentGuidancePromptBlock,
   buildToolGuidanceZipPromptBlock,
@@ -47,6 +52,7 @@ import {
 } from '$lib/utils/toolPromptInjection'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
 import { buildDmRosterDcmLines } from '$lib/utils/dmRoster'
 import {
   WORKERS_FEATURE_ENABLED,
@@ -57,7 +63,8 @@ import {
 } from '$lib/utils/delegationCapabilities'
 import {
   computeMemoryCompileContext,
-  type MemoryCompileContext
+  type MemoryCompileContext,
+  type MemoryInferredRecallProvider
 } from '$lib/server/services/memory/memoryRecall'
 import {
   applyPromptRuntimeScope,
@@ -72,6 +79,7 @@ import {
   resolveClipDataUrlFromStoredUpload,
   resolveClipPreferredUrl
 } from '$lib/server/services/clipUploadPayload'
+import { ApiCallError } from './redisCore'
 import { loadClipRow } from '$lib/server/services/clipService'
 import { loadMemoryMedia } from '$lib/server/services/memory/memoryMedia'
 import {
@@ -103,19 +111,19 @@ import {
 import { applyFixedSessionGraduationToMessages } from '$lib/utils/fixedSessionGraduation'
 import { buildControlErrorDcmLines } from '$lib/utils/controlTags'
 import { summarizeControlInputSchema } from '$lib/services/controlSchemaSummary'
-import {
-  appendManagedSubagentDynamicInfo,
-  buildManagedSubagentDynamicInfo,
-  resolveManagedSubagentScope
-} from '$lib/server/services/subagentRuntimeScope'
+import { resolveManagedSubagentScope } from '$lib/server/services/subagentRuntimeScope'
 import { buildSubagentRosterCapabilityFragment } from '$lib/server/services/subagentRosterCapabilities'
 import { buildSubagentThreadStateKey } from '$lib/server/services/subagentThreads'
 import {
   buildCliSubagentMcpToolReference,
   buildCliWorkerSpawnToolReference
 } from '$lib/utils/cliSubagentToolNames'
-import { buildSubagentRuntimePrompt } from '$lib/utils/subagentRuntimePrompt'
 import { buildSkillSessionContextLines } from '$lib/server/services/skillSessionContext'
+import type {
+  JevJuiceHintProvider,
+  JevJuiceSmartZipProvider
+} from '$lib/server/services/typesafe/jevJuiceHintContext'
+import { loadRezippedSources } from '$lib/server/services/zipStateInferred'
 import {
   getPrimaryAgentSystemPromptLabel,
   getPrimaryAgentSystemPromptRedisKey,
@@ -336,8 +344,8 @@ export class DatabaseService {
     })
 
     if (!response.ok) {
-      const error = await response.text()
-      throw new Error(`API error: ${error}`)
+      // The server's own sentence, never its raw JSON (`ApiCallError`, bug sweep 2026-09-18).
+      throw new ApiCallError(response.status, await response.text())
     }
 
     return response.json()
@@ -1161,7 +1169,7 @@ export class DatabaseService {
     if (!state.enabled) return 'native_bash: disabled'
 
     if (state.mode === 'plan') {
-      return `native_bash: enabled | mode=plan | backend=${state.backend} | read/search + .md edits only | command chaining blocked | prefer apply_patch when available; otherwise use safe native edit commands`
+      return `native_bash: enabled | mode=plan | backend=${state.backend} | proven read/search + .md edits only | hidden side effects and executor/writer pipeline stages blocked | command chaining blocked | prefer apply_patch when available; otherwise use safe native edit commands`
     }
     if (state.mode === 'dangerous') {
       return `native_bash: enabled | mode=dangerous | backend=${state.backend} | approval popups skipped | never_allow_rules=${state.neverAllowCount} still enforced`
@@ -1536,6 +1544,28 @@ export class DatabaseService {
     })
   }
 
+  /**
+   * SA-120 P2 (H1) — the Jev Juice judgment-tool guidance block. Same contract as the DM
+   * block: stored Redis prompt first, code fallback second. Gated by the caller on
+   * `resolveAgentJevJudgeToolEnabled` alone — the switch that opens `sys.judge.*` in the
+   * broker — so an agent without the tool pays nothing and is never taught a control it
+   * cannot call.
+   */
+  private async resolveJevJuiceGuidancePrompt(
+    agent: any,
+    runtimeFlavor: 'codex' | 'claude' | 'vercel'
+  ) {
+    const storedPrompt = await this.getRedisStringValue('batshit:jev_juice_guidance')
+    const prompt = storedPrompt?.trim() ? storedPrompt : buildJevJuiceGuidancePromptBlock()
+    const brokerNames = brokerToolNamesForScope(runtimeFlavorToScope(runtimeFlavor))
+    return replacePromptVariables(prompt, agent, {
+      ...(agent?.settings ?? {}),
+      runtime_flavor: runtimeFlavor,
+      tool_search_tool: brokerNames.search,
+      tool_use_tool: brokerNames.use
+    })
+  }
+
   private async resolveSubagentGuidancePrompt(
     agent: any,
     runtimeFlavor: 'codex' | 'claude' | 'vercel'
@@ -1707,8 +1737,8 @@ export class DatabaseService {
   private async compileChatHistory(
     messages: Message[],
     agent: any,
-    globalZipSettings?: Record<string, any>,
-    options?: {
+    globalZipSettings: Record<string, any> | undefined,
+    options: {
       fetch?: typeof fetch
       groupToolSharing?: {
         currentAgentId?: string | null
@@ -1718,6 +1748,8 @@ export class DatabaseService {
       activeClipIds?: Set<string> | null
       /** SA-109: id → filename, for Clip Logs whose placeholder lost its name. */
       clipNames?: Map<string, string> | null
+      /** F-P5-11: this pass's own zip state, never the browser singleton. */
+      zipState: ZipStateView
     },
     speakerMap?: SpeakerMap
   ) {
@@ -1731,6 +1763,11 @@ export class DatabaseService {
     const interruptedReasoningRecoveryActiveByIndex =
       calculateInterruptedReasoningRecoveryActiveByIndex(messages)
     const zipExposures: ZipExposure[] = []
+    // SA-120 P5: what this compile leaves compressed, in chat order. Observation only;
+    // the only reader is the route-owned Jev Juice smart-zip hint provider.
+    const compressedZips: ZipCompression[] = []
+    // ...and what it leaves expanded, for the same lane's after-reply question.
+    const exposedZips: ZipExposed[] = []
     const zipCompilationCache = new Map<string, Promise<any | null>>()
     const resolveZipForCompilation = (zipId: string) => {
       if (!zipCompilationCache.has(zipId)) {
@@ -1776,11 +1813,14 @@ export class DatabaseService {
               interruptedReasoningRecoveryActive:
                 interruptedReasoningRecoveryActiveByIndex[i] ?? false,
               zipResolver: resolveZipForCompilation,
+              zipState: options.zipState,
               zipViewMode,
               onZipExposure:
                 zipViewMode === 'appended'
                   ? (exposure) => zipExposures.push(exposure)
-                  : undefined
+                  : undefined,
+              onZipCompressed: (compression) => compressedZips.push(compression),
+              onZipExposed: (exposed) => exposedZips.push(exposed)
             }
           )
 
@@ -1838,7 +1878,7 @@ export class DatabaseService {
         : zipAppend
       : baseHistory
 
-    return { formattedMessages, currentDay, chatHistory }
+    return { formattedMessages, currentDay, chatHistory, compressedZips, exposedZips }
   }
 
   private formatToolResultsSummaryForContext(message: Message, notesEnabled = true): string {
@@ -1896,17 +1936,13 @@ export class DatabaseService {
         ? options.zipSettingsAgentOverride
         : agent
 
-    const { zippingService } = await import('$lib/services/zipping')
+    // F-P5-11: this pass's own zip state, read from Redis. Server compiles overlap in one
+    // process, so none of them reads or writes the browser's `zippingService` singleton.
     const [serverUnzipped, serverRezipped] = await Promise.all([
       this.loadUnzippedFromRedis(sessionId),
       this.loadRezippedFromRedis(sessionId)
     ])
-
-    if (serverUnzipped.length > 0 || serverRezipped.length > 0) {
-      zippingService.hydrate(sessionId, serverUnzipped, serverRezipped)
-    } else {
-      await zippingService.ensureSessionLoaded(sessionId, fetchImpl)
-    }
+    const zipState = createZipStateView(serverUnzipped, serverRezipped)
 
     const speakerMap = this.buildSpeakerMap(messages, options?.groupContext)
 
@@ -1924,6 +1960,7 @@ export class DatabaseService {
       globalZipSettings,
       {
         ...options,
+        zipState,
         activeClipIds: clipCompileState.activeClipIds,
         clipNames: clipCompileState.clipNames
       },
@@ -2092,10 +2129,16 @@ export class DatabaseService {
     nativeDynamicMcpEnabled?: boolean | null
     nativeCliToolsEnabled?: boolean | null
     isCodexMode?: boolean
-  }): Promise<string> {
+  }): Promise<{
+    text: string
+    /** SA-120 P1: the typed refs the agent can reach, for the Jev Juice hint provider. */
+    discoverable: DynamicMcpDiscoverableRef[]
+    resolvedGatewayIds: string[] | null
+  }> {
+    const empty = { text: '', discoverable: [] as DynamicMcpDiscoverableRef[], resolvedGatewayIds: null }
     const userId = options.userId?.trim()
     const agentId = options.agentId?.trim()
-    if (!userId || !agentId) return ''
+    if (!userId || !agentId) return empty
 
     try {
       const result = await buildDynamicMcpIndex({
@@ -2109,27 +2152,31 @@ export class DatabaseService {
             : undefined,
         isCodexMode: options.isCodexMode === true
       })
-      return typeof result.text === 'string' ? result.text : ''
+      return {
+        text: typeof result.text === 'string' ? result.text : '',
+        discoverable: Array.isArray(result.discoverable) ? result.discoverable : [],
+        resolvedGatewayIds: result.resolvedGatewayIds ?? null
+      }
     } catch (error) {
       console.warn('[buildDynamicInfoBlock] Failed to build MCP DCM index:', error)
-      return ''
+      return empty
     }
   }
 
   private async buildSkillsCommandsDcm(options: {
     userId?: string | null
     agentId?: string | null
-  }): Promise<string[]> {
+  }): Promise<{ lines: string[]; capabilities: AgentSlashCapability[] }> {
     const userId = options.userId?.trim()
     const agentId = options.agentId?.trim()
-    if (!userId || !agentId) return []
+    if (!userId || !agentId) return { lines: [], capabilities: [] }
 
     try {
       const capabilities = await getEnabledAgentSlashCapabilities(userId, agentId)
-      return buildSkillsCommandsDcmLines(capabilities)
+      return { lines: buildSkillsCommandsDcmLines(capabilities), capabilities }
     } catch (error) {
       console.warn('[buildDynamicInfoBlock] Failed to load skills/commands DCM index:', error)
-      return []
+      return { lines: [], capabilities: [] }
     }
   }
 
@@ -2237,6 +2284,12 @@ export class DatabaseService {
     whiteboardDcmLines?: string[]
     /** SA-110 P2 (DL-110-05): awareness changes newer than the stored fold snapshot. */
     awarenessPendingDcmLines?: string[]
+    /**
+     * SA-120 P1 (DL-120-05): the route-owned Jev Juice hint provider. Called once with the
+     * agent's skills and discoverable refs after every other section is built; its lines
+     * close the DCM (the cache-free tail). Absent on subagent and group compiles.
+     */
+    jevJuiceHintProvider?: JevJuiceHintProvider
   }) {
     const statusIcons = {
       new: '\u2705',
@@ -2483,10 +2536,11 @@ export class DatabaseService {
         lines.push(`  ${detailLine}`)
       }
     }
-    const skillsCommandsLines = await this.buildSkillsCommandsDcm({
+    const skillsCommandsDcm = await this.buildSkillsCommandsDcm({
       userId: options.userId,
       agentId: options.agentId
     })
+    const skillsCommandsLines = skillsCommandsDcm.lines
     if (skillsCommandsLines.length > 0) {
       lines.push('', ...skillsCommandsLines)
     }
@@ -2578,7 +2632,10 @@ export class DatabaseService {
         lines.push('- Unzipped: (none)')
       } else {
         for (const item of unzipped) {
-          const sourceLabel = item?.source === 'user' ? 'user-locked' : 'agent'
+          // SA-120 P5: a third actor. `batshit-inferred` is Batshit acting on a Jev Juice
+          // judgment: temporary, never a lock, and either other actor may overwrite it.
+          const sourceLabel =
+            item?.source === 'user' ? 'user-locked' : item?.source === 'inferred' ? 'batshit-inferred' : 'agent'
           const permanence = item?.permanent
             ? 'permanent'
             : `temp ${item?.messageCount ?? 0}/${item?.duration ?? '?'}`
@@ -2600,6 +2657,8 @@ export class DatabaseService {
       lines.push('', ...goonLines)
     }
 
+    let discoverable: DynamicMcpDiscoverableRef[] = []
+    let resolvedGatewayIds: string[] | null = null
     if (options.agentRecord) {
       const mcpDcm = await this.buildDynamicMcpDcm({
         userId: options.userId,
@@ -2613,9 +2672,30 @@ export class DatabaseService {
         nativeCliToolsEnabled: this.resolveCliToolsEnabled(options.agentRecord),
         isCodexMode: options.isCodexMode
       })
+      discoverable = mcpDcm.discoverable
+      resolvedGatewayIds = mcpDcm.resolvedGatewayIds
 
-      if (mcpDcm) {
-        lines.push('', ...mcpDcm.split('\n'))
+      if (mcpDcm.text) {
+        lines.push('', ...mcpDcm.text.split('\n'))
+      }
+    }
+
+    // SA-120 P1 (DL-120-05): Jev Juice hints close the DCM. The provider owns the network
+    // call, its deadline, and its evidence; the compiler only appends what comes back.
+    // A provider that throws is a bug — logged loudly, and the turn ships without hints.
+    if (options.jevJuiceHintProvider) {
+      try {
+        const hintLines = await options.jevJuiceHintProvider({
+          currentUserMessage: options.currentUserMessage ?? '',
+          skills: skillsCommandsDcm.capabilities,
+          discoverable,
+          resolvedGatewayIds
+        })
+        if (Array.isArray(hintLines) && hintLines.length > 0) {
+          lines.push('', ...hintLines)
+        }
+      } catch (error) {
+        console.error('[buildDynamicInfoBlock] Jev Juice hint provider threw; no hint lines this turn:', error)
       }
     }
 
@@ -2644,6 +2724,24 @@ export class DatabaseService {
       goonsSettings?: GoonsSettings | null
       goonsEnabled?: boolean
       goonPresentationMode?: DesktopGoonPresentationMode | null
+      /** SA-120 P1: route-owned Jev Juice hint provider; primary lanes only. */
+      jevJuiceHintProvider?: JevJuiceHintProvider
+      /**
+       * SA-120 P4b: route-owned Jev Juice recall-by-meaning provider, handed straight to
+       * the recall engine. Absent (every caller but an eligible `send-routed` turn), the
+       * memory section compiles exactly as it always has.
+       */
+      jevJuiceMemoryRecallProvider?: MemoryInferredRecallProvider
+      /**
+       * SA-120 P5: route-owned Jev Juice smart-zip provider. Called once, after the first
+       * history pass, with the zips that pass left compressed; the zips it returns are
+       * expanded for THIS compile through an in-memory overlay and one more history pass.
+       * The compile writes nothing (the route stores the state at the accepted-send
+       * boundary). Absent, history compiles exactly once, as it always has.
+       */
+      jevJuiceSmartZipProvider?: JevJuiceSmartZipProvider
+      /** SA-120 P5: told what the final history pass left expanded (only beside the provider above). */
+      jevJuiceSmartZipExposedObserver?: (exposed: ZipExposed[]) => void
     }
   ): Promise<{
     structuredInput: any
@@ -2678,20 +2776,29 @@ export class DatabaseService {
         userId,
         agentId: agent.id,
         sessionId,
-        currentUserMessage: currentUserMessage ?? ''
+        currentUserMessage: currentUserMessage ?? '',
+        ...(options?.jevJuiceMemoryRecallProvider
+          ? { inferredRecallProvider: options.jevJuiceMemoryRecallProvider }
+          : {})
       })
     }
 
-    // CRITICAL: Ensure unzip state is loaded BEFORE compiling history so compileForAI
-    // can expand user-unzipped zips for the server-side API/CLI compilation path.
-    const { zippingService } = await import('$lib/services/zipping')
-
+    // F-P5-11: this compile's own zip state, read from Redis BEFORE the history pass and
+    // handed to every reader explicitly (history passes, the unzipped count, the DCM).
+    // Server compiles overlap in one process (parallel chats, a wake-up, a token preview),
+    // so none of them reads or writes the browser's `zippingService` singleton.
     const [serverUnzipped, serverRezipped] = await Promise.all([
       this.loadUnzippedFromRedis(sessionId),
       this.loadRezippedFromRedis(sessionId)
     ])
+    // SA-120 P5: whose rezip each marker is. Only a smart-zip turn needs it (Jev may reopen
+    // its own rezip and nobody else's), so every other compile skips these reads.
+    const serverRezippedSources =
+      options?.jevJuiceSmartZipProvider && serverRezipped.length > 0
+        ? await loadRezippedSources(sessionId, serverRezipped)
+        : {}
 
-    zippingService.hydrate(sessionId, serverUnzipped, serverRezipped)
+    let zipState = createZipStateView(serverUnzipped, serverRezipped, serverRezippedSources)
 
     const sessionRecord = await redis.getSession(sessionId).catch(() => null)
     const compactionState = getContextCompactionState(sessionRecord?.metadata ?? null)
@@ -2713,23 +2820,91 @@ export class DatabaseService {
       fetchImpl
     )
 
-    const { formattedMessages, currentDay, chatHistory } = precompiledHistory
+    const compileHistoryPass = (passZipState: ZipStateView) =>
+      this.compileChatHistory(
+        contextMessages,
+        agent,
+        globalZipSettings,
+        {
+          ...options,
+          zipState: passZipState,
+          activeClipIds: clipCompileState.activeClipIds,
+          clipNames: clipCompileState.clipNames
+        },
+        speakerMap
+      )
+    let compiledHistory = precompiledHistory
       ? {
           formattedMessages: precompiledHistory.formattedMessages,
           currentDay: precompiledHistory.currentDay,
-          chatHistory: precompiledHistory.chatHistory
+          chatHistory: precompiledHistory.chatHistory,
+          // Group runs compile history once and get no Jev Juice provider (DL-120-06).
+          compressedZips: [] as ZipCompression[],
+          exposedZips: [] as ZipExposed[]
         }
-      : await this.compileChatHistory(
-          contextMessages,
-          agent,
-          globalZipSettings,
-          {
-            ...options,
-            activeClipIds: clipCompileState.activeClipIds,
-            clipNames: clipCompileState.clipNames
-          },
-          speakerMap
+      : await compileHistoryPass(zipState)
+
+    // SA-120 P5: Jev Juice smart zip. The route-owned provider is told exactly which zips
+    // the pass above left compressed and answers with the ones Batshit opens for THIS
+    // message. They are expanded through an in-memory overlay on this compile's zip state
+    // (source `inferred`) and ONE more history pass, so zip activation is still decided in
+    // `compileForAI` and nowhere else. Nothing is written here: `send-routed` stores the
+    // state at the accepted-send boundary. No provider, a precompiled history, a quiet
+    // answer, or a provider that throws: history is what the first pass produced.
+    if (options?.jevJuiceSmartZipProvider && !precompiledHistory && currentUserMessage) {
+      let opens: Awaited<ReturnType<JevJuiceSmartZipProvider>> = []
+      try {
+        opens = await options.jevJuiceSmartZipProvider({
+          currentUserMessage,
+          zippedItems: compiledHistory.compressedZips
+        })
+      } catch (error) {
+        console.error('[buildFormattedChatInput] Jev Juice smart zip provider threw; nothing opened this turn:', error)
+        opens = []
+      }
+      // Re-check every id: only a zip this compile really left compressed, and never one a
+      // user or an agent zipped by hand or that is an oversized safety row, can be opened.
+      const openable = new Map(
+        compiledHistory.compressedZips
+          .filter(
+            (zip) =>
+              !zip.forceCompress &&
+              !zip.groupUnshared &&
+              (zip.rezippedBy === null || zip.rezippedBy === 'inferred')
+          )
+          .map((zip) => [zip.zipId, zip] as const)
+      )
+      const accepted = (Array.isArray(opens) ? opens : []).filter((open) => open && openable.has(open.zipId))
+      if (accepted.length > 0) {
+        const openedIds = new Set(accepted.map((open) => normalizeId(open.zipId)))
+        const overlay: UnzippedItem[] = accepted.map((open) => ({
+          zipId: normalizeId(open.zipId),
+          sessionId,
+          permanent: false,
+          duration: open.durationMessages,
+          unzippedAt: Date.now(),
+          messageCount: 0,
+          name: openable.get(open.zipId)?.toolName,
+          description: open.description,
+          tokens: open.tokens,
+          source: 'inferred'
+        }))
+        zipState = createZipStateView(
+          [...serverUnzipped.filter((item) => !openedIds.has(normalizeId(item.zipId))), ...overlay],
+          serverRezipped.filter((id) => !openedIds.has(normalizeId(id))),
+          serverRezippedSources
         )
+        compiledHistory = await compileHistoryPass(zipState)
+      }
+      // What the FINAL pass left expanded, for the lane's after-reply question (is the agent
+      // done with it?). Facts only; the route owns what happens next.
+      try {
+        options.jevJuiceSmartZipExposedObserver?.(compiledHistory.exposedZips)
+      } catch (error) {
+        console.error('[buildFormattedChatInput] Jev Juice smart zip exposed-observer threw; ignored:', error)
+      }
+    }
+    const { formattedMessages, currentDay, chatHistory } = compiledHistory
 
     const resolvedChatHistory =
       chatHistory ?? formattedMessages.join('\n\n---\n\n').trim()
@@ -2755,7 +2930,7 @@ export class DatabaseService {
     // 5. Count unzipped pins without fetching their bodies (G-0029): only the count
     // reaches the compiled output — the bodies are resolved independently inside
     // compileForAI — and unzipped zips are by definition the large expanded ones.
-    const unzippedItemsCount = zippingService.getAllUnzipped().length
+    const unzippedItemsCount = zipState.getAllUnzipped().length
     
     // 6. Get clipped items from SESSION STATE (NEW approach - no more embedding in messages!)
     const clippedContent = []
@@ -3076,6 +3251,20 @@ export class DatabaseService {
       }
     }
 
+    // SA-120 P2 (H1): the Jev Juice judgment-tool guidance sits directly after the DM
+    // block and before MEMORY INSTRUCTIONS — one more "thing you can reach". Gated on the
+    // agent's `jev_juice_judge_tool` switch alone, the same switch that opens `sys.judge.*`
+    // in the broker (DL-120-06), so a control the agent cannot call is never taught.
+    // Stable-prefix bytes: they move only when the switch or the stored prompt changes.
+    // Jev's ANSWERS never land here (DL-120-05); this only teaches how to ask.
+    if (resolveAgentJevJudgeToolEnabled(agent)) {
+      const jevPrompt = await this.resolveJevJuiceGuidancePrompt(agent, runtimeFlavor)
+      if (jevPrompt.trim()) {
+        if (mergedSystemPrompt) mergedSystemPrompt += '\n\n'
+        mergedSystemPrompt += `==== JEV JUICE (JUDGMENT TOOL) ====\n\n${jevPrompt}`
+      }
+    }
+
     // SA-104 P3: memory guidance is gated on per-agent memory enablement alone — the
     // inline <batshit-memory> save works without any broker family. Part of the stable
     // compiled prefix (DL-104-04): it changes only when enablement or the stored prompt
@@ -3132,16 +3321,18 @@ export class DatabaseService {
     // Build context still controls tool availability and DCM visibility,
     // but artifact prompt addons are retired and no longer injected here.
 
-    // Compile system prompts and instructions for each subagent
+    // Each subagent's ROSTER facts, for the DCM. A delegated run compiles its own system
+    // prompt when it starts (`subagentRunner.ts`). Until 2026-09-18 this loop built that prompt
+    // here too and threw it away (nothing had read it since `3ef1c664f` retired the n8n
+    // primary lane): its DYNAMIC INFO discovers every reachable MCP gateway's tools LIVE, so
+    // each compile, sends and Token Panel previews alike, waited on every gateway once per
+    // subagent (1 to 7 s per preview on the smoke stack).
     const subagentDescription: Record<string, string> = {}
     const subagentModels: Record<string, { provider?: string | null; model?: string | null }> = {}
     // SA-111 P1 (DL-111-03): the capability fragment appended to each DCM roster line.
     const subagentCapabilityFragments: Record<string, string> = {}
 
     if (assignedSubagents && assignedSubagents.length > 0) {
-
-      const subAgentPrompt = await this.getRedisStringValue('batshit:sub_system_prompt')
-
       // One gateway-registry read per compile, shared by every subagent's roster line, and
       // only when a subagent actually has gateways to name.
       let gatewayNames: Map<string, string> | null = null
@@ -3162,53 +3353,7 @@ export class DatabaseService {
         return names
       }
 
-      // SA-008 Phase 5: Simplified SA compilation
-      // All SAs use the same compilation pattern - specialty-based logic removed
-      // Specialty knowledge is now injected via Edit Mode into PA's SP instead
-
-      // Compile prompt for each subagent
       for (const swf of assignedSubagents) {
-        let subagentSystemPrompt = ''
-
-        // All SAs get the same base prompt
-        if (subAgentPrompt) {
-          const processedSubAgent = replacePromptVariables(subAgentPrompt, swf, swf.settings)
-          subagentSystemPrompt = `==== BATSHIT SUB-AGENT SYSTEM PROMPT ====\n\n${processedSubAgent}`
-        }
-        
-        // Add global custom prompt if enabled
-        if (swf.include_global_prompt && globalCustomPrompt) {
-          if (subagentSystemPrompt) subagentSystemPrompt += '\n\n'
-          const processedGlobal = replacePromptVariables(globalCustomPrompt, swf, swf.settings)
-          subagentSystemPrompt += `==== GLOBAL CUSTOM SYSTEM PROMPT ====\n\n${processedGlobal}`
-        }
-        
-        // Add subagent-specific custom prompt
-        if (swf.system_prompt) {
-          if (subagentSystemPrompt) subagentSystemPrompt += '\n\n'
-          const processedCustom = replacePromptVariables(swf.system_prompt, swf, swf.settings)
-          subagentSystemPrompt += `==== SUBAGENT CUSTOM SYSTEM PROMPT ====\n\n${processedCustom}`
-        }
-
-        const runtimePrompt = buildSubagentRuntimePrompt(swf)
-        if (runtimePrompt.trim()) {
-          if (subagentSystemPrompt) subagentSystemPrompt += '\n\n'
-          subagentSystemPrompt += runtimePrompt
-        }
-
-        const subagentSkillsCommandsLines = await this.buildSkillsCommandsDcm({
-          userId,
-          agentId: swf.id
-        })
-        const hasSubagentSkillsCommands = subagentSkillsCommandsLines.some((line) =>
-          line.startsWith('- /')
-        )
-        if (hasSubagentSkillsCommands) {
-          if (subagentSystemPrompt) subagentSystemPrompt += '\n\n'
-          subagentSystemPrompt +=
-            `==== SKILLS & PROMPTS (AGENT ACCESS) ====\n\n${subagentSkillsCommandsLines.join('\n')}`
-        }
-
         const subagentScope = await resolveManagedSubagentScope({
           userId: userId ?? '',
           subagent: swf,
@@ -3216,19 +3361,6 @@ export class DatabaseService {
           projectPath: options?.projectPath ?? agentDefaultProjectPath ?? null,
         })
         const subagentCapabilities = await getEnabledAgentSlashCapabilities(userId ?? '', swf.id)
-
-        const subagentDynamicInfo = await buildManagedSubagentDynamicInfo({
-          userId: userId ?? '',
-          subagent: swf,
-          sessionId,
-          projectPath: options?.projectPath ?? agentDefaultProjectPath ?? null,
-          scope: subagentScope,
-          capabilities: subagentCapabilities,
-        })
-        subagentSystemPrompt = appendManagedSubagentDynamicInfo(
-          subagentSystemPrompt,
-          subagentDynamicInfo,
-        )
 
         const safeKey = resolveSubagentSlug(swf)
 
@@ -3303,7 +3435,7 @@ export class DatabaseService {
     let textContent = ''
 
     const previousSnapshot = this.getPreviousDynamicSnapshot(contextMessages)
-    const zipState = this.buildZipStateSnapshot(contextMessages, zippingService.getAllUnzipped())
+    const zipStateSnapshot = this.buildZipStateSnapshot(contextMessages, zipState.getAllUnzipped())
     const autoZipSummary = this.buildAutoZipSummary({
       agent,
       globalZipSettings
@@ -3343,9 +3475,10 @@ export class DatabaseService {
           goonsEnabled,
           goonsSettings: options?.goonsSettings ?? null,
           goonPresentationMode: options?.goonPresentationMode ?? null,
+          jevJuiceHintProvider: options?.jevJuiceHintProvider,
           groupContext: options?.groupContext,
           voiceState: options?.voiceState,
-          zipState,
+          zipState: zipStateSnapshot,
           autoZipContent: autoZipSummary.autoZipContent,
           autoZipTools: autoZipSummary.autoZipTools,
           zipControlPermission: zipPermission,

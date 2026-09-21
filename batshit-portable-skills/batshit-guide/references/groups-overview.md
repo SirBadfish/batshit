@@ -31,6 +31,8 @@ The single-speaker queue is the heart of it:
 
 You steer who talks. By default, speaker selection is flexible — Batshit picks a reasonable next speaker — but when you name a specific agent, that agent is the one who answers. Speak policies let you tune how eager each agent is to jump in versus waiting until it's directly addressed.
 
+If you have [Jev Juice](../jev-juice/overview.md) set up, an agent can also use the **Jev Juice: Smart** preset: Batshit then asks a fast judgment model who is best placed to answer instead of picking at random, and skips follow-up turns from agents with nothing to add, which saves a model call each time. Naming an agent still wins, your messages are always answered, and the Execution Viewer shows who was picked and who was skipped.
+
 ## Tool sharing
 
 Agents in a Group can share tool results so the group stays on the same page. Shared tools are visible to the other agents; unshared tool output is summarized for everyone else rather than dumped in full. Set tool sharing intentionally — it's how you decide whether the group works from a common set of results or each agent keeps its own.
@@ -69,7 +71,7 @@ Get each agent working solo before grouping them. A Group can only be as healthy
 | --- | --- | --- |
 | An agent can't be added to a Group | The saved record is missing or uses a retired type. | Delete the retired record and create an `API` or `CLI` agent. |
 | The group feels stuck | Turns are sequential, so one agent's slow or stuck tool call holds the line. | Check that agent's model/provider and tools on their own. |
-| The wrong agent keeps answering | Speak policies, or you didn't name a specific agent. | Address an agent by name, or adjust speak policies. |
+| The wrong agent keeps answering | Speak policies, or you didn't name a specific agent. | Address an agent by name, adjust speak policies, or put the agents on **Jev Juice: Smart** so a judgment model picks. |
 | Agents ignore each other | Tool results aren't shared, so they're missing each other's context. | Turn on tool sharing for the results the group should see. |
 | No Goon appears | The current speaker has no ready Goon assigned, or the Dock/Desktop Mode is not active. | Assign a ready Goon to that agent and open the Goon Dock. |
 | The idle Goon is not the one you expected | The Group driver is the idle visual fallback when it is valid. | Check the Group driver and each agent's Goon assignment. |

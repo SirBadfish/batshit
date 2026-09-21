@@ -275,6 +275,131 @@ describe('isMemoryControlToolStep (zip-first exemption detector, DL-104-17)', ()
     ).toBe(true)
   })
 
+  // F-P4-7 (2026-09-17): the managed Codex event adapter stores every helper call as
+  // `{ arguments: <the model's call> }`, so the ref sits one level down. Captured from the
+  // SA-120 P4 live proof (`p4a-codex-search.raw.json`, `intermediateSteps[0]`).
+  const codexHelperStep = (ref: string, input: Record<string, unknown>) => ({
+    toolName: 'mcp.batshit_gateway_jev_p4_codex-mode4-controls.batshit_tool_use',
+    originalToolName: 'mcp.batshit_gateway_jev_p4_codex-mode4-controls.batshit_tool_use',
+    toolInput: { arguments: { ref, input } },
+    toolArgs: { arguments: { ref, input } },
+    toolCallId: 'call_c8xJODnFnOudj1AFBlRMcBEv',
+    toolProvider: 'mcp',
+    toolSource: 'mcp-gateway',
+    mcpServerName: 'batshit_gateway_jev_p4_codex-mode4-controls',
+    agentType: 'cli'
+  })
+
+  it('matches the managed Codex helper step shape (ref under `arguments`) — F-P4-7', () => {
+    expect(
+      isMemoryControlToolStep(
+        codexHelperStep('fabric:sys.memory.search', {
+          query: 'who should not be near loud bangs',
+          limit: 3
+        })
+      )
+    ).toBe(true)
+    expect(
+      isMemoryControlToolStep(
+        codexHelperStep('fabric:sys.memory.recall', { memoryIds: ['mem_1789617220856_78ghr1'] })
+      )
+    ).toBe(true)
+    // What `+page.svelte` receives: the SSE `tool-result` event carries the same args
+    // under `args`, and no zip references.
+    expect(
+      isMemoryControlToolStep({
+        type: 'tool-result',
+        toolCallId: 'call_c8xJODnFnOudj1AFBlRMcBEv',
+        toolName: 'mcp.batshit_gateway_jev_p4_codex-mode4-controls.batshit_tool_use',
+        args: {
+          arguments: { ref: 'fabric:sys.memory.recall', input: { memoryIds: ['mem_1'] } }
+        },
+        zipReferences: []
+      })
+    ).toBe(true)
+  })
+
+  it('follows the helper bridge unwrap (`value`, then `arguments`, repeated) to the ref it runs', () => {
+    // `normalizeArgs` in scripts/mode4-controls-mcp.cjs executes these refs, so the
+    // exemption must see them too (a model may wrap its own call once more).
+    expect(
+      isMemoryControlToolStep({
+        toolName: 'mcp.batshit_gateway_cody-mode4-controls.batshit_tool_use',
+        toolInput: {
+          arguments: { arguments: { ref: 'fabric:sys.memory.recall', input: { memoryIds: ['mem_1'] } } }
+        }
+      })
+    ).toBe(true)
+    expect(
+      isMemoryControlToolStep({
+        toolName: 'mcp.batshit_gateway_cody-mode4-controls.batshit_tool_use',
+        toolInput: { arguments: { value: { ref: 'fabric:sys.memory.search' } } }
+      })
+    ).toBe(true)
+  })
+
+  it('stays strict under `arguments`: a non-memory ref still zips', () => {
+    expect(
+      isMemoryControlToolStep(
+        codexHelperStep('fabric:sys.artifact.update', { content: 'see sys.memory.search' })
+      )
+    ).toBe(false)
+    expect(isMemoryControlToolStep(codexHelperStep('fabric:sys.zip.fetch', { zipId: 'z' }))).toBe(false)
+    // Memory-looking text that is not a ref, and an `arguments` value the bridge never
+    // unwraps (an array), are not authority.
+    expect(
+      isMemoryControlToolStep({
+        toolName: 'mcp.batshit_gateway_cody-mode4-controls.batshit_tool_search',
+        toolInput: { arguments: { query: 'sys.memory.search', family: 'fabric' } }
+      })
+    ).toBe(false)
+    expect(
+      isMemoryControlToolStep({
+        toolName: 'mcp.batshit_gateway_cody-mode4-controls.batshit_tool_use',
+        toolInput: { arguments: [{ ref: 'fabric:sys.memory.search' }] }
+      })
+    ).toBe(false)
+  })
+
+  it('keeps the API lane exactly as it was: a step that names its own ref is never unwrapped', () => {
+    // The API broker step as send-routed stores it (captured, `p4a-api-search-2.raw.json`):
+    // the tool input is flattened beside `ref`.
+    expect(
+      isMemoryControlToolStep({
+        toolName: 'native_batshit_tool_use',
+        toolInput: { ref: 'fabric:sys.memory.search', query: 'who should not be near loud bangs', limit: 3 },
+        toolArgs: { ref: 'fabric:sys.memory.search', query: 'who should not be near loud bangs', limit: 3 }
+      })
+    ).toBe(true)
+    // A flattened payload that happens to hold an `arguments` or `value` object is the
+    // called tool's own input, not a wrapper, so it cannot widen the exemption.
+    expect(
+      isMemoryControlToolStep({
+        toolName: 'native_batshit_tool_use',
+        toolInput: { ref: 'mcp:workflow_runner', arguments: { ref: 'fabric:sys.memory.search' } },
+        toolArgs: { ref: 'mcp:workflow_runner', arguments: { ref: 'fabric:sys.memory.search' } }
+      })
+    ).toBe(false)
+    expect(
+      isMemoryControlToolStep({
+        toolName: 'native_batshit_tool_use',
+        args: { ref: 'fabric:sys.artifact.update', value: { target: 'sys.memory.recall' } }
+      })
+    ).toBe(false)
+  })
+
+  it('never loops on a self-referencing wrapper (the adapter checks every step of a reply)', () => {
+    const looped: Record<string, unknown> = {}
+    looped.arguments = looped
+    expect(() => isMemoryControlToolStep({ toolName: 'x', toolInput: looped })).not.toThrow()
+    expect(isMemoryControlToolStep({ toolName: 'x', toolInput: looped })).toBe(false)
+    const outer: Record<string, unknown> = {}
+    const inner: Record<string, unknown> = { arguments: outer }
+    outer.value = inner
+    expect(() => isMemoryControlToolStep({ toolName: 'x', args: outer })).not.toThrow()
+    expect(isMemoryControlToolStep({ toolName: 'x', args: outer })).toBe(false)
+  })
+
   it('stays strict: non-memory refs and ref-less steps zip normally', () => {
     expect(
       isMemoryControlToolStep({

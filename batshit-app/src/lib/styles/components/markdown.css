@@ -197,6 +197,13 @@
   font-weight: var(--bs-font-weight-bold, 500);
 }
 
+/* Chat reading text runs dimmed, so bold has to be much heavier than the UI bold
+   weight to still register as emphasis. */
+.batshit-markdown.batshit-markdown-compact strong,
+.batshit-markdown.batshit-markdown-compact b {
+  font-weight: 900;
+}
+
 /* Emphasis/Italic */
 .batshit-markdown em,
 .batshit-markdown i {
@@ -218,6 +225,19 @@
 /* Small text adjustments for chat context */
 .batshit-markdown.batshit-markdown-compact {
   font-size: 0.9375rem;
+}
+
+/* Reading text inside a chat bubble takes the bubble's own tone and sits back from
+   full strength, so the bubble frame and the controls around it stay readable. The
+   markdown root sets `color` itself, so the bubble's colour cannot simply inherit. */
+.message-bubble.is-user .batshit-markdown.batshit-markdown-compact {
+  color: var(--message-user-foreground);
+  opacity: 0.8;
+}
+
+.message-bubble.is-ai .batshit-markdown.batshit-markdown-compact {
+  color: var(--message-ai-foreground);
+  opacity: 0.7;
 }
 
 .batshit-markdown.batshit-markdown-compact h1 { font-size: 1.5rem; }

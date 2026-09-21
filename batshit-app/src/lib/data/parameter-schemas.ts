@@ -14,8 +14,18 @@ export type ParameterInputType =
   | 'boolean'
   | 'json'
   | 'string-array'
+  // SA-124 P1: KoboldCpp's seven-slot sampler order, dragged rather than typed.
+  | 'sampler-order'
 
-export type ParameterValue = number | string | boolean | string[] | Record<string, unknown> | null
+export type ParameterValue =
+  | number
+  | string
+  | boolean
+  | string[]
+  // SA-124 P1: KoboldCpp's sampler_order is seven integers, not strings.
+  | number[]
+  | Record<string, unknown>
+  | null
 
 export interface ParameterDefinition {
   name: string
@@ -63,6 +73,14 @@ export interface ParameterDefinition {
     | 'stopSequences'
     | 'maxTokens'
   arrayDelimiter?: 'comma' | 'newline'
+  /**
+   * SA-124 P1: turn typed escapes (\\n, \\t, \\") into the real characters, per
+   * entry. A newline-delimited editor cannot hold a real newline as an ENTRY,
+   * because every newline is a separator. KoboldCpp's DRY sequence breakers
+   * need exactly that: SillyTavern's default list starts with a newline, and a
+   * literal backslash-n never appears in prose, so it would silently never match.
+   */
+  unescapeEntries?: true
   jsonSchema?: {
     name?: string
     description?: string
@@ -1070,7 +1088,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     description: 'How many recent words the repeat penalty looks back over.',
     inputType: 'integer',
     min: 0,
-    section: 'core',
+    section: 'provider',
     order: 64,
     advanced: true,
     wireName: 'repeat_last_n'
@@ -1081,7 +1099,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     description: 'How many recent words the repetition penalty looks back over.',
     inputType: 'integer',
     min: 0,
-    section: 'core',
+    section: 'provider',
     order: 64,
     advanced: true,
     wireName: 'repetition_context_size'
@@ -1094,10 +1112,30 @@ const LOCAL_SAMPLER_LIBRARY = {
     min: 0,
     max: 1,
     step: 0.01,
-    section: 'core',
+    section: 'provider',
     order: 46,
     advanced: true,
     wireName: 'typical_p'
+  },
+  /**
+   * KoboldCpp reads this sampler as `typical`, never `typical_p`
+   * (`typical_p = tryparsefloat(genparams.get('typical', 1.0), 1.0)` in
+   * koboldcpp.py). Measured 2026-09-20 on 1.121: `typical: 0.1` changed the
+   * output, `typical_p: 0.1` was byte-identical to the baseline. Same `name` as
+   * the entry above, so a value a user already saved keeps working.
+   */
+  typicalKoboldCpp: {
+    name: 'typicalP',
+    label: 'Typical P',
+    description: 'Prefer words that are averagely surprising rather than simply most likely. 1 is off.',
+    inputType: 'number',
+    min: 0,
+    max: 1,
+    step: 0.01,
+    section: 'provider',
+    order: 46,
+    advanced: true,
+    wireName: 'typical'
   },
   dryMultiplier: {
     name: 'dryMultiplier',
@@ -1106,7 +1144,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     inputType: 'number',
     min: 0,
     step: 0.01,
-    section: 'core',
+    section: 'provider',
     order: 66,
     advanced: true,
     wireName: 'dry_multiplier'
@@ -1118,7 +1156,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     inputType: 'number',
     min: 0,
     step: 0.01,
-    section: 'core',
+    section: 'provider',
     order: 67,
     advanced: true,
     wireName: 'dry_base'
@@ -1129,7 +1167,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     description: 'How long a repeated phrase may be before the DRY penalty starts.',
     inputType: 'integer',
     min: 0,
-    section: 'core',
+    section: 'provider',
     order: 68,
     advanced: true,
     wireName: 'dry_allowed_length'
@@ -1142,7 +1180,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     min: 0,
     max: 1,
     step: 0.01,
-    section: 'core',
+    section: 'provider',
     order: 70,
     advanced: true,
     wireName: 'xtc_probability'
@@ -1155,7 +1193,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     min: 0,
     max: 1,
     step: 0.01,
-    section: 'core',
+    section: 'provider',
     order: 71,
     advanced: true,
     wireName: 'xtc_threshold'
@@ -1167,7 +1205,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     inputType: 'integer',
     min: 0,
     max: 2,
-    section: 'core',
+    section: 'provider',
     order: 74,
     advanced: true,
     wireName: 'mirostat'
@@ -1179,7 +1217,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     inputType: 'number',
     min: 0,
     step: 0.01,
-    section: 'core',
+    section: 'provider',
     order: 75,
     advanced: true,
     wireName: 'mirostat_tau'
@@ -1191,7 +1229,7 @@ const LOCAL_SAMPLER_LIBRARY = {
     inputType: 'number',
     min: 0,
     step: 0.01,
-    section: 'core',
+    section: 'provider',
     order: 76,
     advanced: true,
     wireName: 'mirostat_eta'
@@ -1249,6 +1287,354 @@ const LOCAL_SAMPLER_LIBRARY = {
     // Owned option key, NOT the wire name — see LocalSamplerDefinition.
     wireName: 'reasoningEffort'
   },
+  /**
+   * SA-124 P1: KoboldCpp's roleplay sampler set.
+   *
+   * All twenty measured against KoboldCpp 1.121 on 2026-09-21 with a pinned
+   * seed and two control rows (same request twice, and an unknown field). Four
+   * needed purpose-built probes before they would show anything, which is why
+   * the first pass wrongly called two of them ignored:
+   *   sampler_order  reordering does nothing unless several samplers are ACTIVE.
+   *   rep_pen_slope  needs a long repeat run across a wide penalty range.
+   *   DRY fields     only act on repetition, so they get a repeating prompt.
+   *   bans           need a word actually worth banning.
+   *
+   * Measured and NOT offered, so nobody re-adds them:
+   *   adaptive_decay      moved nothing at 0.99 vs 0.01, even over 160 tokens.
+   *   max_context_length  KoboldCpp keeps the size it was launched with; the
+   *                       server still reported 32768 after requests asked for
+   *                       4096 and 8192. The launch flag wins.
+   *   thinking_budget_tokens / reasoning_effort
+   *                       unprovable on llama3.2, which cannot think. Not
+   *                       rejected, just not measured; revisit on a thinking
+   *                       model rather than shipping a guess.
+   */
+  koboldRepPen: {
+    name: 'repPen',
+    label: 'Repeat penalty',
+    description: 'Discourage reusing recent words. 1 is off. Above about 1.3 the text starts to break.',
+    inputType: 'number',
+    min: 0,
+    max: 3,
+    step: 0.01,
+    section: 'provider',
+    order: 60,
+    advanced: true,
+    wireName: 'rep_pen'
+  },
+  koboldRepPenRange: {
+    name: 'repPenRange',
+    label: 'Repeat penalty range',
+    description: 'How many recent words the repeat penalty looks back over.',
+    inputType: 'integer',
+    min: 0,
+    section: 'provider',
+    order: 61,
+    advanced: true,
+    wireName: 'rep_pen_range'
+  },
+  koboldRepPenSlope: {
+    name: 'repPenSlope',
+    label: 'Repeat penalty slope',
+    description: 'Whether the penalty is even across the range, or stronger on the most recent words. 1 is even.',
+    inputType: 'number',
+    min: 0,
+    step: 0.1,
+    section: 'provider',
+    order: 62,
+    advanced: true,
+    wireName: 'rep_pen_slope'
+  },
+  koboldTopA: {
+    name: 'topA',
+    label: 'Top A',
+    description: 'Drop words far less likely than the best one, scaled by how confident the model is. 0 is off.',
+    inputType: 'number',
+    min: 0,
+    max: 1,
+    step: 0.01,
+    section: 'provider',
+    order: 47,
+    advanced: true,
+    wireName: 'top_a'
+  },
+  koboldTfs: {
+    name: 'tfs',
+    label: 'Tail-free sampling',
+    description: 'Cut off the long tail of unlikely words. 1 is off.',
+    inputType: 'number',
+    min: 0,
+    max: 1,
+    step: 0.01,
+    section: 'provider',
+    order: 48,
+    advanced: true,
+    wireName: 'tfs'
+  },
+  koboldNsigma: {
+    name: 'nsigma',
+    label: 'Top N-sigma',
+    description: 'Keep only words within this many standard deviations of the best one. 0 is off.',
+    inputType: 'number',
+    min: 0,
+    step: 0.1,
+    section: 'provider',
+    order: 49,
+    advanced: true,
+    wireName: 'nsigma'
+  },
+  koboldDryPenaltyLastN: {
+    name: 'dryPenaltyLastN',
+    label: 'DRY range',
+    description: 'How many recent words DRY looks back over when hunting for repeats.',
+    inputType: 'integer',
+    min: 0,
+    section: 'provider',
+    order: 69,
+    advanced: true,
+    wireName: 'dry_penalty_last_n'
+  },
+  koboldDrySequenceBreakers: {
+    name: 'drySequenceBreakers',
+    label: 'DRY sequence breakers',
+    description: 'Text that resets DRY, so a repeat across it does not count. One per line.',
+    inputType: 'string-array',
+    arrayDelimiter: 'newline',
+    placeholder: '\n,\n:\n"',
+    unescapeEntries: true,
+    section: 'provider',
+    order: 69.5,
+    advanced: true,
+    wireName: 'dry_sequence_breakers'
+  },
+  koboldDynatempRange: {
+    name: 'dynatempRange',
+    label: 'DynaTemp range',
+    description: 'Let temperature move up and down by this much as the model goes. 0 is off.',
+    inputType: 'number',
+    min: 0,
+    step: 0.01,
+    section: 'provider',
+    order: 72,
+    advanced: true,
+    wireName: 'dynatemp_range'
+  },
+  koboldDynatempExponent: {
+    name: 'dynatempExponent',
+    label: 'DynaTemp exponent',
+    description: 'How sharply DynaTemp reacts. 1 is a straight line.',
+    inputType: 'number',
+    min: 0,
+    step: 0.1,
+    section: 'provider',
+    order: 73,
+    advanced: true,
+    wireName: 'dynatemp_exponent'
+  },
+  koboldSmoothingFactor: {
+    name: 'smoothingFactor',
+    label: 'Smoothing factor',
+    description: 'Flatten the gap between likely and unlikely words instead of cutting any off. 0 is off.',
+    inputType: 'number',
+    min: 0,
+    step: 0.1,
+    section: 'provider',
+    order: 74,
+    advanced: true,
+    wireName: 'smoothing_factor'
+  },
+  koboldSmoothingCurve: {
+    name: 'smoothingCurve',
+    label: 'Smoothing curve',
+    description: 'How the smoothing is shaped. 1 is a straight line. Only does anything when Smoothing factor is set.',
+    inputType: 'number',
+    min: 0,
+    step: 0.1,
+    section: 'provider',
+    order: 75,
+    advanced: true,
+    wireName: 'smoothing_curve'
+  },
+  koboldAdaptiveTarget: {
+    name: 'adaptiveTarget',
+    label: 'Adaptive target',
+    description: 'Aim for this much surprise per word and adjust as it writes. Below 0 is off. KoboldCpp forces a small Min P when this is on.',
+    inputType: 'number',
+    step: 0.1,
+    section: 'provider',
+    order: 76,
+    advanced: true,
+    wireName: 'adaptive_target'
+  },
+  koboldSamplerOrder: {
+    name: 'samplerOrder',
+    label: 'Sampler order',
+    description: 'The order the samplers run in. Drag to reorder. Only matters when more than one is doing something.',
+    inputType: 'sampler-order',
+    // Deliberately NO defaultValue (DL-102-01): blank means "do not send", and a
+    // default here would pre-fill the field and send KoboldCpp its own default
+    // back on every request. The editor offers the default order to START from.
+    section: 'provider',
+    order: 80,
+    advanced: true,
+    wireName: 'sampler_order'
+  },
+  koboldBannedTokens: {
+    name: 'bannedTokens',
+    label: 'Phrase bans',
+    description: 'Words or phrases the model may never write. One per line. KoboldCpp allows up to 768.',
+    inputType: 'string-array',
+    arrayDelimiter: 'newline',
+    placeholder: 'shivers down\nAs an AI\ndelve',
+    section: 'provider',
+    order: 90,
+    advanced: true,
+    wireName: 'banned_tokens'
+  },
+  koboldCustomTokenBans: {
+    name: 'customTokenBans',
+    label: 'Token ID bans',
+    description: 'Ban exact token numbers, separated by commas. For people who know the IDs.',
+    inputType: 'text',
+    placeholder: '9059, 8415',
+    section: 'provider',
+    order: 91,
+    advanced: true,
+    wireName: 'custom_token_bans'
+  },
+  koboldLogitBias: {
+    name: 'logitBias',
+    label: 'Logit bias',
+    description: 'Nudge single tokens up or down instead of banning them. JSON of token id to bias. KoboldCpp allows up to 512.',
+    inputType: 'json',
+    placeholder: '{"9059": -5, "8415": 2}',
+    section: 'provider',
+    order: 92,
+    advanced: true,
+    wireName: 'logit_bias'
+  },
+  koboldBanEosToken: {
+    name: 'banEosToken',
+    label: 'Never stop on its own',
+    description: 'Stop the model ending its own reply, so it writes until Max output tokens runs out. Useful for forcing longer scenes.',
+    inputType: 'boolean',
+    section: 'provider',
+    order: 93,
+    advanced: true,
+    wireName: 'ban_eos_token'
+  },
+  koboldGuidanceScale: {
+    name: 'guidanceScale',
+    label: 'Guidance strength',
+    description: 'How hard to pull away from the Negative prompt. 1 is off. Needs KoboldCpp started with --enableguidance, and it costs speed.',
+    inputType: 'number',
+    min: 1,
+    step: 0.1,
+    section: 'provider',
+    order: 95,
+    advanced: true,
+    wireName: 'guidance_scale'
+  },
+  koboldNegativePrompt: {
+    name: 'negativePrompt',
+    label: 'Negative prompt',
+    description: 'What the reply should steer away from. Only does anything when Guidance strength is above 1.',
+    inputType: 'textarea',
+    placeholder: 'Never mention the weather.',
+    section: 'provider',
+    order: 96,
+    advanced: true,
+    wireName: 'negative_prompt'
+  },
+  /**
+   * SA-125: Ollama's NATIVE door. Everything Ollama generates with lives inside
+   * an `options` object, so these route to `ollama.options.*` — the mapper's
+   * `assignProviderOption` already walks a dot path and builds the nesting.
+   *
+   * Measured against a running Ollama on 2026-09-20 with a pinned seed and two
+   * control rows (same request twice, and an unknown key). What is NOT here:
+   *   tfs_z     — ignored.
+   *   mirostat  — ignored in both modes, same as KoboldCpp.
+   *   typical_p — NOT ignored: it fails the whole request with
+   *               "typical_p is no longer supported". It must never be sent.
+   */
+  ollamaTopK: {
+    name: 'topK',
+    label: 'Top K',
+    description: 'Only consider the K most likely next words. 1 makes the model fully predictable.',
+    inputType: 'integer',
+    min: 0,
+    section: 'core',
+    order: 40,
+    advanced: true,
+    wireName: 'options.top_k'
+  },
+  ollamaMinP: {
+    name: 'minP',
+    label: 'Min P',
+    description:
+      'Drop any word less likely than this fraction of the best word. A common alternative to Top P for local models.',
+    inputType: 'number',
+    min: 0,
+    max: 1,
+    step: 0.01,
+    section: 'core',
+    order: 45,
+    advanced: true,
+    wireName: 'options.min_p'
+  },
+  ollamaRepeatPenalty: {
+    name: 'repeatPenalty',
+    label: 'Repeat penalty',
+    description: 'Discourage reusing recent words. 1 is off. Above about 1.3 the text starts to break.',
+    inputType: 'number',
+    min: 0,
+    max: 3,
+    step: 0.01,
+    section: 'core',
+    order: 62,
+    advanced: true,
+    wireName: 'options.repeat_penalty'
+  },
+  ollamaRepeatLastN: {
+    name: 'repeatLastN',
+    label: 'Repeat window',
+    description: 'How many recent words the repeat penalty looks back over.',
+    inputType: 'integer',
+    min: 0,
+    section: 'provider',
+    order: 64,
+    advanced: true,
+    wireName: 'options.repeat_last_n'
+  },
+  ollamaNumCtx: {
+    name: 'ollamaNumCtx',
+    label: 'Context size',
+    description:
+      'How much conversation Ollama keeps in memory for this model. Leave blank to use the size Ollama already loaded. Changing it makes Ollama reload the model, which takes a moment and clears its prompt cache.',
+    inputType: 'integer',
+    min: 256,
+    section: 'provider',
+    order: 215,
+    advanced: true,
+    wireName: 'options.num_ctx'
+  },
+  ollamaThink: {
+    name: 'ollamaThink',
+    label: 'Thinking',
+    description:
+      'Let the model think before answering. Only for models that can think; Ollama rejects the whole request otherwise.',
+    inputType: 'boolean',
+    // Measured 2026-09-20: `think: true` FAILS the send on a model that cannot
+    // think ("llama3.2:latest" does not support thinking), exactly like the
+    // `/v1` door's reasoning_effort. `think: false` is safe on any model, which
+    // is why the provider sends it by default.
+    requiresCapability: 'reasoning',
+    section: 'reasoning',
+    order: 210,
+    // Top level, NOT inside options: `think` is a sibling of `messages`.
+    wireName: 'think'
+  },
   chatTemplateKwargs: {
     name: 'chatTemplateKwargs',
     label: 'Chat template options',
@@ -1270,10 +1656,20 @@ type LocalSamplerKey = keyof typeof LOCAL_SAMPLER_LIBRARY
  * present only where the program demonstrably applies it.
  */
 const LOCAL_RUNTIME_SAMPLERS: Record<LocalAiServerId, readonly LocalSamplerKey[]> = {
-  // DL-102-15: Ollama's /v1 accepts the smallest set of any program and ignores
-  // unknown fields without a word, so offering more would be a lie. Everything
-  // else it can do lives in a Modelfile.
-  ollama: ['ollamaReasoningEffort'],
+  // SA-125 replaces SA-102's DL-102-15 note. Ollama no longer goes through the
+  // OpenAI door at all: it speaks its native `/api/chat`, where the samplers it
+  // silently ignored on `/v1` genuinely work. Measured 2026-09-20 — `top_k: 1`
+  // and `min_p: 0.9` on `/v1` produced byte-identical output, and the same
+  // values natively changed it. The Modelfile advice that used to be the only
+  // answer here is no longer the only answer.
+  ollama: [
+    'ollamaTopK',
+    'ollamaMinP',
+    'ollamaRepeatPenalty',
+    'ollamaRepeatLastN',
+    'ollamaNumCtx',
+    'ollamaThink'
+  ],
   // Docker Model Runner is the llama.cpp engine behind /engines/llama.cpp/v1.
   dmr: [
     'topK',
@@ -1322,7 +1718,77 @@ const LOCAL_RUNTIME_SAMPLERS: Record<LocalAiServerId, readonly LocalSamplerKey[]
     'repetitionPenalty',
     'repetitionContextSize',
     'chatTemplateKwargs'
+  ],
+  // SA-124 P0. Measured against KoboldCpp 1.121 (mac-arm64) on 2026-09-20 with a
+  // PINNED SEED, which is the whole trick: KoboldCpp defaults `sampler_seed` to
+  // -1, so two identical requests return different text and an unseeded
+  // did-it-change probe measures noise. A control pair (same request twice, and
+  // the known-clobbered `mirostat` name) guards every run.
+  //
+  // Each key below changed the output with everything else held fixed. What is
+  // NOT here, and why:
+  //
+  //   mirostat / mirostatTau / mirostatEta — a no-op on this build. Sending
+  //   `mirostat_mode: 2`, `mirostat_mode: 1`, and `top_k: 0, top_p: 1` all
+  //   produced the SAME output hash, different from the baseline: enabling
+  //   Mirostat only switches off Top K and Top P, and neither dial moves a byte
+  //   (tau 0.1 vs 20, eta 0.01 vs 1, all identical). Python hands all three to
+  //   the C layer, so the gap is below it. Recheck on a CUDA build before
+  //   offering these; on what Batshit's Mac users run, they are dead boxes.
+  //
+  //   chatTemplateKwargs — needs `--jinja` at startup AND a model whose template
+  //   reads the key. Proven unprovable on llama3.2, which has no thinking mode.
+  //   Not offered until measured on a model that can show it.
+  //
+  //   The shared `mirostat` entry would have shipped broken anyway: KoboldCpp's
+  //   OpenAI path runs `genparams["mirostat"] = genparams.get('mirostat_mode', 0)`,
+  //   so a `mirostat` field is overwritten before the sampler sees it. Same trap
+  //   applies to `sampler_seed` (send `seed`) and `stop_sequence` (send `stop`).
+  koboldcpp: [
+    'topK',
+    'minP',
+    // NOT the shared `typicalP`: that sends `typical_p`, which KoboldCpp ignores.
+    'typicalKoboldCpp',
+    'dryMultiplier',
+    'dryBase',
+    'dryAllowedLength',
+    'xtcProbability',
+    'xtcThreshold',
+    // SA-124 P1, all measured 2026-09-21.
+    'koboldRepPen',
+    'koboldRepPenRange',
+    'koboldRepPenSlope',
+    'koboldTopA',
+    'koboldTfs',
+    'koboldNsigma',
+    'koboldDryPenaltyLastN',
+    'koboldDrySequenceBreakers',
+    'koboldDynatempRange',
+    'koboldDynatempExponent',
+    'koboldSmoothingFactor',
+    'koboldSmoothingCurve',
+    'koboldAdaptiveTarget',
+    'koboldSamplerOrder',
+    'koboldBannedTokens',
+    'koboldCustomTokenBans',
+    'koboldLogitBias',
+    'koboldBanEosToken',
+    'koboldGuidanceScale',
+    'koboldNegativePrompt'
   ]
+}
+
+/**
+ * Common parameters a local program cannot honour as a field of its own.
+ *
+ * KoboldCpp folds Frequency Penalty into the SAME slot as Presence Penalty —
+ * `presence_penalty = genparams.get('presence_penalty',
+ * genparams.get('frequency_penalty', 0.0))` (koboldcpp.py, read 2026-09-20).
+ * Two boxes writing one value is a lie about what the program does, so only
+ * Presence Penalty is offered. DL-124-03.
+ */
+const LOCAL_RUNTIME_OMITTED_COMMON: Partial<Record<LocalAiServerId, readonly string[]>> = {
+  koboldcpp: ['frequencyPenalty']
 }
 
 /**
@@ -1371,14 +1837,17 @@ export const PARAMETER_SCHEMAS: ParameterSchema[] = [
   },
   // SA-102 P3: one schema per local program, generated from the runtime
   // definition list so a runtime added there cannot be forgotten here.
-  ...LOCAL_AI_SERVER_DEFINITIONS.map((definition) => ({
-    provider: definition.id,
-    base: [
-      ...COMMON_PARAMETERS,
-      ...buildLocalRuntimeParameters(definition.id),
-      ...ROLE_PARAMETERS
-    ]
-  }))
+  ...LOCAL_AI_SERVER_DEFINITIONS.map((definition) => {
+    const omitted = new Set(LOCAL_RUNTIME_OMITTED_COMMON[definition.id] ?? [])
+    return {
+      provider: definition.id,
+      base: [
+        ...COMMON_PARAMETERS.filter((parameter) => !omitted.has(parameter.name)),
+        ...buildLocalRuntimeParameters(definition.id),
+        ...ROLE_PARAMETERS
+      ]
+    }
+  })
 ]
 
 /**

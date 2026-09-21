@@ -108,7 +108,7 @@
     padding: 0.5rem 0.85rem;
     border: 1px solid oklch(0.63 0.05 281.84 / 0.45);
     border-radius: var(--radius);
-    background: oklch(from var(--message-user-background) l c h / 0.45);
+    background: oklch(from var(--message-user-tint) l c h / 0.45);
     color: var(--message-user-foreground);
   }
 

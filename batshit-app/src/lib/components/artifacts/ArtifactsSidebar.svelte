@@ -1494,7 +1494,7 @@
 
   :global(.artifact-sidebar-code-editor) {
     min-height: 260px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     font-size: 0.875rem;
   }
 
@@ -1538,7 +1538,7 @@
 
   :global(.artifact-sidebar-blueprint-editor) {
     min-height: 200px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     font-size: 0.875rem;
   }
 

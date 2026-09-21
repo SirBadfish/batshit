@@ -5,6 +5,7 @@
   import { normalizeId } from '$lib/utils/idNormalizer'
   import { getTypeZipSettings } from '$lib/utils/toolRenderMap'
   import { calculateZipActivation } from '$lib/utils/zipActivation'
+  import { resolveZipStateActors } from '$lib/utils/zipStatusPresentation'
   import { extractVisibleBatshitCueState } from '$lib/utils/batshitCue'
   import { hideStreamingHiddenControlBlocks } from '$lib/utils/zipControl'
   import {
@@ -1362,7 +1363,7 @@
     }
   }
 
-  type ExpandedReason = 'buffer' | 'user' | 'agent'
+  type ExpandedReason = 'buffer' | 'user' | 'agent' | 'inferred'
 
   function resolveZipVisualState(options: {
     zipId: string
@@ -1380,6 +1381,7 @@
     remainingMessages?: number | null
     autoZip?: boolean
     agentControlled?: boolean
+    inferredControlled?: boolean
   } {
     const normalized = normalizeId(options.zipId)
     if (!normalized) {
@@ -1418,9 +1420,12 @@
     const autoZip = activation.autoZip
     const effectiveUnzipped = isUnzipped
 
+    // SA-120 P5: one reading of stored sources for the chat and the Zip Manager, so an
+    // `inferred` unzip is never drawn as a user lock.
+    const actors = resolveZipStateActors(unzippedItem?.source, rezippedSource, effectiveUnzipped)
     let expandedReason: ExpandedReason | undefined
     if (effectiveUnzipped) {
-      expandedReason = unzippedItem?.source === 'agent' ? 'agent' : 'user'
+      expandedReason = actors.expandedReason
     } else if (!activation.shouldCompress) {
       expandedReason = 'buffer'
     }
@@ -1456,7 +1461,8 @@
       aboutToZip,
       remainingMessages: manualRemainingMessages ?? autoRemainingMessages,
       autoZip,
-      agentControlled: unzippedItem?.source === 'agent' || rezippedSource === 'agent'
+      agentControlled: actors.agentControlled,
+      inferredControlled: actors.inferredControlled
     }
   }
   
@@ -1761,6 +1767,7 @@
         {aboutToZip}
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
+        inferredControlled={Boolean(zipState.inferredControlled)}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           normalizedZipId &&
@@ -1828,6 +1835,7 @@
         {aboutToZip}
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
+        inferredControlled={Boolean(zipState.inferredControlled)}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           normalizedZipId &&
@@ -1905,6 +1913,7 @@
           {aboutToZip}
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
+          inferredControlled={Boolean(zipState.inferredControlled)}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             normalizedZipId &&
@@ -1971,6 +1980,7 @@
           {aboutToZip}
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
+          inferredControlled={Boolean(zipState.inferredControlled)}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2040,6 +2050,7 @@
           {aboutToZip}
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
+          inferredControlled={Boolean(zipState.inferredControlled)}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2109,6 +2120,7 @@
           {aboutToZip}
           autoZip={autoZip}
           agentControlled={Boolean(zipState.agentControlled)}
+          inferredControlled={Boolean(zipState.inferredControlled)}
           {manualZip}
           onToggleUnzip={(permanent: boolean) =>
             zipId &&
@@ -2202,6 +2214,7 @@
             {aboutToZip}
             autoZip={autoZip}
             agentControlled={Boolean(zipState.agentControlled)}
+            inferredControlled={Boolean(zipState.inferredControlled)}
             {manualZip}
             onToggleUnzip={(permanent: boolean) =>
               handleUnzip(
@@ -2298,6 +2311,7 @@
         {aboutToZip}
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
+        inferredControlled={Boolean(zipState.inferredControlled)}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           handleUnzip(
@@ -2385,6 +2399,7 @@
         {aboutToZip}
         autoZip={autoZip}
         agentControlled={Boolean(zipState.agentControlled)}
+        inferredControlled={Boolean(zipState.inferredControlled)}
         {manualZip}
         onToggleUnzip={(permanent: boolean) =>
           handleUnzip(

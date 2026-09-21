@@ -905,6 +905,15 @@ export async function ensureSkillCache(skill: SkillRow): Promise<void> {
   })
 }
 
+/**
+ * BL-75: whether a skill record exists, without the filesystem refresh `getSkill` runs. Used by
+ * `sys.skill.save` to refuse a new or repointed command for a skill that already exists.
+ */
+export async function skillRecordExists(userId: string, skillId: string): Promise<boolean> {
+  if (!skillId) return false
+  return (await redis.json.get(buildSkillKey(userId, skillId))) != null
+}
+
 export async function getSkill(userId: string, skillId: string): Promise<SkillRow | null> {
   const key = buildSkillKey(userId, skillId)
   const skill = (await redis.json.get(key)) as SkillRow | null

@@ -14,7 +14,10 @@ import {
   isExactDesktopGoonUrl,
   isSafeExternalUrl,
   normalizeLoopbackOrigin,
+  resolveCustomCssPath,
   resolveDesktopControlsUrl,
+  resolveDevToolsEnabled,
+  resolveDevToolsOptInPath,
   resolveDesktopGoonUrl,
   resolveBackupExportUrl,
   resolveShellAssetPath,
@@ -280,4 +283,70 @@ test('only the registered main window receives audio media permission', () => {
   assert.equal(check(mainContents, 'geolocation', []), false);
   assert.equal(check(desktopContents, 'media', ['audio']), false);
   assert.equal(check(controlsContents, 'media', ['audio']), false);
+});
+
+
+test('Electron developer tools stay off unless the local opt-in marker or env flag is present', () => {
+  const home = '/Users/tester';
+  const marker = resolveDevToolsOptInPath({}, home);
+  assert.equal(marker, join(home, 'Library', 'Application Support', 'Batshit', 'enable-devtools'));
+
+  assert.equal(
+    resolveDevToolsEnabled({ env: {}, homePath: home, fileExists: () => false }),
+    false
+  );
+  assert.equal(
+    resolveDevToolsEnabled({ env: {}, homePath: home, fileExists: (path) => path === marker }),
+    true
+  );
+  assert.equal(
+    resolveDevToolsEnabled({
+      env: { BATSHIT_MAC_ENABLE_DEVTOOLS: '1' },
+      homePath: home,
+      fileExists: () => false
+    }),
+    true
+  );
+  assert.equal(
+    resolveDevToolsEnabled({
+      env: { BATSHIT_MAC_ENABLE_DEVTOOLS: '0' },
+      homePath: home,
+      fileExists: () => true
+    }),
+    false
+  );
+});
+
+test('the developer tools opt-in marker follows an overridden Mac data root', () => {
+  const env = { BATSHIT_MAC_DATA_DIR: '/tmp/batshit-test-lane' };
+  const marker = resolveDevToolsOptInPath(env, '/Users/tester');
+  assert.equal(marker, join('/tmp/batshit-test-lane', 'enable-devtools'));
+  assert.equal(
+    resolveDevToolsEnabled({ env, homePath: '/Users/tester', fileExists: (path) => path === marker }),
+    true
+  );
+  assert.equal(
+    resolveDevToolsEnabled({
+      env,
+      homePath: '/Users/tester',
+      fileExists: (path) => path === join('/Users/tester', 'Library', 'Application Support', 'Batshit', 'enable-devtools')
+    }),
+    false
+  );
+});
+
+
+test('the custom stylesheet sits beside the Mac data root and honours an explicit override', () => {
+  assert.equal(
+    resolveCustomCssPath({}, '/Users/tester'),
+    join('/Users/tester', 'Library', 'Application Support', 'Batshit', 'custom.css')
+  );
+  assert.equal(
+    resolveCustomCssPath({ BATSHIT_MAC_DATA_DIR: '/tmp/lane' }, '/Users/tester'),
+    join('/tmp/lane', 'custom.css')
+  );
+  assert.equal(
+    resolveCustomCssPath({ BATSHIT_MAC_CUSTOM_CSS: '  /tmp/explicit.css  ' }, '/Users/tester'),
+    '/tmp/explicit.css'
+  );
 });

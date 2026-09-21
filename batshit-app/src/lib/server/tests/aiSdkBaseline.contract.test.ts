@@ -577,6 +577,48 @@ describe('AI SDK contract — stream part families and feature surfaces', () => 
     expect(errorParts[0].error).toEqual({ message: 'provider blew up' })
   })
 
+  it('pins abort: onAbort runs BEFORE the loop reads the abort part, and onFinish never runs', async () => {
+    // send-routed waits for `onFinish` after its loop, because the SDK can finish ahead of the
+    // loop, and it releases that wait from `onAbort`: an aborted stream never calls `onFinish`,
+    // and the wait held every stopped API reply for its full 2 s (2026-09-18).
+    const stop = new AbortController()
+    const model = new MockLanguageModelV4({
+      doStream: async ({ abortSignal }: any) => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start' as const, warnings: [] })
+            controller.enqueue({ type: 'text-start' as const, id: 't1' })
+            controller.enqueue({ type: 'text-delta' as const, id: 't1', delta: 'partial' })
+            // Like a provider's fetch: it ends only when the call is aborted.
+            abortSignal?.addEventListener('abort', () =>
+              controller.error(new DOMException('The operation was aborted.', 'AbortError'))
+            )
+          }
+        })
+      })
+    })
+    const order: string[] = []
+    const result = streamText({
+      model,
+      prompt: 'x',
+      abortSignal: stop.signal,
+      onAbort: () => {
+        order.push('onAbort')
+      },
+      onFinish: () => {
+        order.push('onFinish')
+      }
+    })
+
+    for await (const part of result.stream) {
+      if (part.type === 'text-delta') stop.abort('user')
+      if (part.type === 'abort') order.push('loop read abort')
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(order).toEqual(['onAbort', 'loop read abort'])
+  })
+
   it('pins blank tool-call id tolerance (upstream #18440 class): executes without throwing', async () => {
     const model = new MockLanguageModelV4({
       doStream: async () => ({

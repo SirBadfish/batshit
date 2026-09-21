@@ -10,7 +10,9 @@ vi.mock('./api', () => ({
 vi.mock('$lib/services/zipping', () => ({
   zippingService: {
     isUnzipped: vi.fn(() => true),
-    isRezipped: vi.fn(() => false)
+    isRezipped: vi.fn(() => false),
+    getRezippedSource: vi.fn(() => undefined),
+    getUnzippedInfo: vi.fn(() => undefined)
   }
 }))
 
@@ -938,4 +940,246 @@ describe('messageCompiler – cool_tool inline payloads', () => {
     expect(otherAgent).toBe('Partial visible answer.')
   })
 
+})
+
+describe('messageCompiler – onZipCompressed (SA-120 P5)', () => {
+  const readZip = (id: string, metadata: Record<string, unknown> = {}) => ({
+    id,
+    content: payloadJson,
+    type: 'cool_tool',
+    tokens: 900,
+    description: 'read_file: /tmp/demo.txt - 1 line',
+    // `promptTokens` is the prompt-facing estimate zip activation reads; without it the
+    // compiler derives one from the payload, which is also what the observer would get.
+    metadata: { toolName: 'read_file', operationKind: 'read_file', tokens: 900, promptTokens: 900, ...metadata }
+  })
+  const normalLane = { buffer_size_read_file: 2, zip_threshold_read_file: 0 }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(false)
+    vi.mocked(zippingService.isRezipped).mockReturnValue(false)
+  })
+
+  it('reports a zip left compressed, with the description the model reads, and never an exposed one', async () => {
+    const zipResolver = vi.fn(async (id: string) => readZip(id))
+    const seen: any[] = []
+    const marker = `{{batshit-zip:${zipId}:::read_file: /tmp/demo.txt - 1 line}}`
+
+    const older = await compileForAI(marker, 0, 5, normalLane, undefined, {}, {
+      zipResolver,
+      onZipCompressed: (entry) => seen.push(entry)
+    })
+    expect(older).toBe(marker)
+    expect(seen).toEqual([
+      {
+        zipId,
+        zipType: 'cool_tool',
+        description: 'read_file: /tmp/demo.txt - 1 line',
+        tokens: 900,
+        operationKind: 'read_file',
+        toolName: 'read_file',
+        forceCompress: false,
+        rezipped: false,
+        rezippedBy: null,
+        groupUnshared: false,
+        messagesFromEnd: 4
+      }
+    ])
+
+    // Inside the buffer the result is expanded for the model: nothing to report.
+    seen.length = 0
+    const recent = await compileForAI(marker, 4, 5, normalLane, undefined, {}, {
+      zipResolver,
+      onZipCompressed: (entry) => seen.push(entry)
+    })
+    expect(recent).toContain('Tool result: batshit_server_read_file')
+    expect(seen).toEqual([])
+  })
+
+  it('does not report a zip that the appended view exposes while keeping its reference inline', async () => {
+    const zipResolver = vi.fn(async (id: string) => readZip(id))
+    const compressed: any[] = []
+    const exposed: any[] = []
+    const marker = `{{batshit-zip:${zipId}:::read_file: /tmp/demo.txt - 1 line}}`
+    const result = await compileForAI(marker, 4, 5, normalLane, undefined, {}, {
+      zipResolver,
+      zipViewMode: 'appended',
+      onZipExposure: (entry) => exposed.push(entry),
+      onZipCompressed: (entry) => compressed.push(entry)
+    })
+    // Same bytes as a compressed reference, but the body rides the appended block.
+    expect(result).toBe(marker)
+    expect(exposed).toHaveLength(1)
+    expect(compressed).toEqual([])
+  })
+
+  it('passes the stored description parts through as facts, with a missing part as an empty string', async () => {
+    const seen: any[] = []
+    const observe = { onZipCompressed: (entry: any) => seen.push(entry) }
+    await compileForAI(`{{batshit-zip:${zipId}}}`, 0, 5, normalLane, undefined, {}, {
+      zipResolver: vi.fn(async (id: string) =>
+        readZip(id, { zipDescriptionLabel: 'bash', zipDescriptionTarget: ' git log --oneline -5 ', zipDescriptionStatus: 'error' })
+      ),
+      ...observe
+    })
+    await compileForAI(`{{batshit-zip:${zipId}}}`, 0, 5, normalLane, undefined, {}, {
+      zipResolver: vi.fn(async (id: string) => readZip(id, { zipDescriptionLabel: 'read_file', zipDescriptionTarget: 'src/a.ts' })),
+      ...observe
+    })
+    await compileForAI(`{{batshit-zip:${zipId}}}`, 0, 5, normalLane, undefined, {}, {
+      zipResolver: vi.fn(async (id: string) => readZip(id, { zipDescriptionLabel: 'bash' })),
+      ...observe
+    })
+    await compileForAI(`{{batshit-zip:${zipId}}}`, 0, 5, normalLane, undefined, {}, {
+      zipResolver: vi.fn(async (id: string) => readZip(id)),
+      ...observe
+    })
+    expect(seen.map((entry) => entry.descriptionParts)).toEqual([
+      { label: 'bash', target: 'git log --oneline -5', status: 'error' },
+      { label: 'read_file', target: 'src/a.ts', status: '' },
+      { label: 'bash', target: '', status: '' },
+      undefined
+    ])
+  })
+
+  it('carries why it is compressed: a hand rezip and the oversized safety row', async () => {
+    vi.mocked(zippingService.isRezipped).mockReturnValue(true)
+    const seen: any[] = []
+    await compileForAI(`{{batshit-zip:${zipId}}}`, 4, 5, normalLane, undefined, {}, {
+      zipResolver: vi.fn(async (id: string) => readZip(id, { forceCompress: true })),
+      onZipCompressed: (entry) => seen.push(entry)
+    })
+    expect(seen).toHaveLength(1)
+    // No source was hydrated, so the rezip reads as the user's: the safe default for a
+    // reader that must never override an explicit zip.
+    expect(seen[0]).toMatchObject({ rezipped: true, rezippedBy: 'user', forceCompress: true })
+
+    vi.mocked(zippingService.getRezippedSource).mockReturnValue('inferred')
+    seen.length = 0
+    await compileForAI(`{{batshit-zip:${zipId}}}`, 4, 5, normalLane, undefined, {}, {
+      zipResolver: vi.fn(async (id: string) => readZip(id)),
+      onZipCompressed: (entry) => seen.push(entry)
+    })
+    expect(seen[0]).toMatchObject({ rezipped: true, rezippedBy: 'inferred' })
+    // No description in the marker: the stored zip description is what the lane gets.
+    expect(seen[0].description).toBe('read_file: /tmp/demo.txt - 1 line')
+  })
+
+  it('an observer that throws changes nothing about the compile', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const zipResolver = vi.fn(async (id: string) => readZip(id))
+    const marker = `before {{batshit-zip:${zipId}:::read_file: /tmp/demo.txt - 1 line}} after`
+    const quiet = await compileForAI(marker, 0, 5, normalLane, undefined, {}, { zipResolver })
+    const noisy = await compileForAI(marker, 0, 5, normalLane, undefined, {}, {
+      zipResolver,
+      onZipCompressed: () => {
+        throw new Error('observer bug')
+      }
+    })
+    expect(noisy).toBe(quiet)
+    expect(errorSpy).toHaveBeenCalledWith('[compileForAI] onZipCompressed observer threw; ignored:', expect.any(Error))
+    errorSpy.mockRestore()
+  })
+})
+
+describe('messageCompiler – onZipExposed (SA-120 P5)', () => {
+  const readZip = (id: string, metadata: Record<string, unknown> = {}) => ({
+    id,
+    content: payloadJson,
+    type: 'cool_tool',
+    tokens: 900,
+    description: 'read_file: /tmp/demo.txt - 1 line',
+    metadata: {
+      toolName: 'read_file',
+      operationKind: 'read_file',
+      tokens: 900,
+      promptTokens: 900,
+      zipDescriptionLabel: 'read_file',
+      zipDescriptionTarget: '/tmp/demo.txt',
+      ...metadata
+    }
+  })
+  const normalLane = { buffer_size_read_file: 2, zip_threshold_read_file: 0 }
+  const marker = `{{batshit-zip:${zipId}:::read_file: /tmp/demo.txt - 1 line}}`
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(false)
+    vi.mocked(zippingService.isRezipped).mockReturnValue(false)
+    vi.mocked(zippingService.getUnzippedInfo).mockReturnValue(undefined)
+  })
+
+  it('reports a zip the buffer leaves expanded, with how much buffer is left, and never a compressed one', async () => {
+    const zipResolver = vi.fn(async (id: string) => readZip(id))
+    const exposed: any[] = []
+    const compressed: any[] = []
+    const observers = { zipResolver, onZipExposed: (entry: any) => exposed.push(entry), onZipCompressed: (entry: any) => compressed.push(entry) }
+
+    await compileForAI(marker, 4, 5, normalLane, undefined, {}, observers)
+    expect(exposed).toEqual([
+      {
+        zipId,
+        zipType: 'cool_tool',
+        description: 'read_file: /tmp/demo.txt - 1 line',
+        descriptionParts: { label: 'read_file', target: '/tmp/demo.txt', status: '' },
+        tokens: 900,
+        operationKind: 'read_file',
+        toolName: 'read_file',
+        unzippedBy: null,
+        recoveryHold: false,
+        messagesFromEnd: 0,
+        bufferSize: 2,
+        autoZip: false,
+        zipDisabled: false
+      }
+    ])
+    expect(compressed).toEqual([])
+
+    exposed.length = 0
+    await compileForAI(marker, 0, 5, normalLane, undefined, {}, observers)
+    expect(exposed).toEqual([])
+    expect(compressed).toHaveLength(1)
+  })
+
+  it('reports in the appended view too, where the reference stays inline but the body is exposed', async () => {
+    const exposed: any[] = []
+    await compileForAI(marker, 4, 5, normalLane, undefined, {}, {
+      zipResolver: vi.fn(async (id: string) => readZip(id)),
+      zipViewMode: 'appended',
+      onZipExposed: (entry) => exposed.push(entry)
+    })
+    expect(exposed.map((entry) => entry.zipId)).toEqual([zipId])
+  })
+
+  it('says who holds it open by hand; an unreadable source is the user\'s, and a recovery hold is named', async () => {
+    const zipResolver = vi.fn(async (id: string) => readZip(id))
+    const seen: any[] = []
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(true)
+    for (const source of ['user', 'agent', 'inferred', undefined] as const) {
+      vi.mocked(zippingService.getUnzippedInfo).mockReturnValue(source ? ({ source } as never) : undefined)
+      await compileForAI(marker, 0, 5, normalLane, undefined, {}, { zipResolver, onZipExposed: (entry) => seen.push(entry.unzippedBy) })
+    }
+    expect(seen).toEqual(['user', 'agent', 'inferred', 'user'])
+
+    vi.mocked(zippingService.isUnzipped).mockReturnValue(false)
+    const held: any[] = []
+    await compileForAI(marker, 0, 5, normalLane, undefined, {}, { zipResolver, recoveryHold: true, onZipExposed: (entry) => held.push(entry) })
+    expect(held[0]).toMatchObject({ unzippedBy: null, recoveryHold: true })
+  })
+
+  it('an observer that throws changes nothing about the compile', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const zipResolver = vi.fn(async (id: string) => readZip(id))
+    const quiet = await compileForAI(`before ${marker} after`, 4, 5, normalLane, undefined, {}, { zipResolver })
+    const noisy = await compileForAI(`before ${marker} after`, 4, 5, normalLane, undefined, {}, {
+      zipResolver,
+      onZipExposed: () => {
+        throw new Error('observer bug')
+      }
+    })
+    expect(noisy).toBe(quiet)
+    expect(errorSpy).toHaveBeenCalledWith('[compileForAI] onZipExposed observer threw; ignored:', expect.any(Error))
+    errorSpy.mockRestore()
+  })
 })

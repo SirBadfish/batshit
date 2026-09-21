@@ -1,4 +1,4 @@
-import { basename, extname, isAbsolute, resolve, sep } from 'node:path';
+import { basename, extname, isAbsolute, join, resolve, sep } from 'node:path';
 
 import {
   DESKTOP_GOON_WINDOW_ROLES
@@ -60,6 +60,34 @@ export function collectAllowedOrigins(env = process.env) {
     if (origin) origins.add(origin);
   }
   return origins;
+}
+
+export const DEV_TOOLS_OPT_IN_FILENAME = 'enable-devtools';
+
+export function resolveMacDataRoot(env = process.env, homePath = '') {
+  return env.BATSHIT_MAC_DATA_DIR || join(homePath, 'Library', 'Application Support', 'Batshit');
+}
+
+export function resolveDevToolsOptInPath(env = process.env, homePath = '') {
+  return join(resolveMacDataRoot(env, homePath), DEV_TOOLS_OPT_IN_FILENAME);
+}
+
+export function resolveDevToolsEnabled({
+  env = process.env,
+  homePath = '',
+  fileExists = () => false
+} = {}) {
+  if (env.BATSHIT_MAC_ENABLE_DEVTOOLS === '1') return true;
+  if (env.BATSHIT_MAC_ENABLE_DEVTOOLS === '0') return false;
+  return fileExists(resolveDevToolsOptInPath(env, homePath)) === true;
+}
+
+export const CUSTOM_CSS_FILENAME = 'custom.css';
+
+export function resolveCustomCssPath(env = process.env, homePath = '') {
+  const configured = typeof env.BATSHIT_MAC_CUSTOM_CSS === 'string' ? env.BATSHIT_MAC_CUSTOM_CSS.trim() : '';
+  if (configured) return configured;
+  return join(resolveMacDataRoot(env, homePath), CUSTOM_CSS_FILENAME);
 }
 
 export function isAllowedAppUrl(value, allowedOrigins) {

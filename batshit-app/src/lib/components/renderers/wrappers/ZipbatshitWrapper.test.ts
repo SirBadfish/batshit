@@ -101,4 +101,32 @@ describe('ZipbatshitWrapper controls', () => {
     )
     expect(screen.getByLabelText('Agent zip control')).toBeInTheDocument()
   })
+
+  it('shows a Jev Juice unzip as its own actor with a countdown, never as a user lock (SA-120 P5)', () => {
+    render(ZipbatshitWrapperFixture, {
+      props: {
+        isUnzipped: true,
+        expandedReason: 'inferred',
+        inferredControlled: true,
+        remainingMessages: 2
+      }
+    })
+
+    const controls = screen.getByLabelText('Zip controls')
+    expect(controls).toHaveAttribute('title', 'Jev unzipped this for 2 messages')
+    expect(screen.getByLabelText('Unzipped by Jev')).toBeInTheDocument()
+    expect(screen.queryByLabelText('User zip control')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Agent zip control')).not.toBeInTheDocument()
+    expect(controls).toHaveTextContent('2')
+  })
+
+  it('says who zipped it when Jev Juice closed a finished result (SA-120 P5)', () => {
+    render(ZipbatshitWrapperFixture, {
+      props: { isZipped: true, manualZip: true, inferredControlled: true }
+    })
+    expect(screen.getByLabelText('Zip controls')).toHaveAttribute(
+      'title',
+      'Zipped by Jev: the agent seemed done with it'
+    )
+  })
 })

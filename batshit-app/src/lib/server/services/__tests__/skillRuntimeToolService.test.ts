@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  getSkill: vi.fn()
+  getSkill: vi.fn(),
+  commands: new Map<string, Record<string, unknown>>()
 }))
 
 vi.mock('../skillRegistry', () => ({
@@ -9,17 +10,50 @@ vi.mock('../skillRegistry', () => ({
   evaluateSkillDependencies: vi.fn()
 }))
 
+// The real access gate runs (BL-75); only the command records it reads are faked.
+vi.mock('$lib/server/redis', () => ({
+  redis: {
+    keys: vi.fn(async (pattern: string) =>
+      Array.from(mocks.commands.keys()).filter((key) => key.startsWith(pattern.replace(/\*$/, '')))
+    ),
+    json: {
+      get: vi.fn(async (key: string) => mocks.commands.get(key) ?? null)
+    }
+  }
+}))
+
 import {
   buildSkillScriptCommand,
+  executeSkillRuntimeAction,
   findBundleFileByPath,
   readSkillBundleFileText,
   resolveBundleFileAbsolutePath,
   resolveSkillRuntimeForTool
 } from '../skillRuntimeToolService'
 
+const PRIMARY = { kind: 'agent', agentId: 'agent-1' } as const
+
+function seedSkillCommand(skillId: string, access: Record<string, unknown>) {
+  mocks.commands.set(`slash_command:josh:${skillId}`, {
+    id: skillId,
+    name: skillId,
+    displayName: 'Skill Alpha',
+    type: 'skill',
+    is_active: true,
+    can_be_invoked_in_chat: true,
+    skill_id: skillId,
+    enabled_for_all_agents: false,
+    enabled_agent_ids: [],
+    ...access
+  })
+}
+
 describe('skillRuntimeToolService', () => {
   beforeEach(() => {
     mocks.getSkill.mockReset()
+    mocks.commands.clear()
+    seedSkillCommand('skill_alpha', { enabled_agent_ids: ['agent-1'] })
+    seedSkillCommand('nonexistent', { enabled_agent_ids: ['agent-1'] })
   })
 
   it('resolves skill runtime for tool with references/scripts in bundleFiles', async () => {
@@ -50,7 +84,7 @@ describe('skillRuntimeToolService', () => {
       ]
     })
 
-    const result = await resolveSkillRuntimeForTool('josh', 'skill-alpha')
+    const result = await resolveSkillRuntimeForTool('josh', 'skill-alpha', PRIMARY)
 
     expect(result.runtime).not.toBeNull()
     expect(result.error).toBeNull()
@@ -58,15 +92,70 @@ describe('skillRuntimeToolService', () => {
     const scripts = result.runtime!.bundleFiles.filter((f) => f.kind === 'script')
     expect(refs.map((f) => f.path)).toEqual(['references/guide.md'])
     expect(scripts.map((f) => f.path)).toEqual(['scripts/run.sh'])
+    // The id that passed the gate is the id that loads (BL-75).
+    expect(mocks.getSkill).toHaveBeenCalledWith('josh', 'skill_alpha')
   })
 
   it('returns error when skill is not found', async () => {
     mocks.getSkill.mockResolvedValue(null)
 
-    const result = await resolveSkillRuntimeForTool('josh', 'nonexistent')
+    const result = await resolveSkillRuntimeForTool('josh', 'nonexistent', PRIMARY)
 
     expect(result.runtime).toBeNull()
     expect(result.error).toContain('nonexistent')
+  })
+
+  it('refuses a skill that is off for the agent before it loads anything (BL-75)', async () => {
+    seedSkillCommand('skill_alpha', { enabled_agent_ids: ['agent-2'] })
+
+    const result = await resolveSkillRuntimeForTool('josh', 'skill_alpha', PRIMARY)
+
+    expect(result).toEqual({
+      runtime: null,
+      error: expect.stringContaining('is not enabled for this agent'),
+      errorCode: 'SKILL_NOT_ENABLED',
+      blocked: true,
+      skillId: 'skill_alpha'
+    })
+    expect(mocks.getSkill).not.toHaveBeenCalled()
+  })
+
+  it('refuses a skill no command lists, and a caller with no agent (BL-75)', async () => {
+    const unlisted = await resolveSkillRuntimeForTool('josh', 'secret_skill', PRIMARY)
+    expect(unlisted).toEqual(expect.objectContaining({ errorCode: 'SKILL_NOT_LISTED', blocked: true }))
+
+    const anonymous = await resolveSkillRuntimeForTool('josh', 'skill_alpha', {
+      kind: 'none',
+      lane: 'service'
+    })
+    expect(anonymous).toEqual(
+      expect.objectContaining({ errorCode: 'AGENT_IDENTITY_REQUIRED', blocked: true })
+    )
+    expect(mocks.getSkill).not.toHaveBeenCalled()
+  })
+
+  it('returns the refusal from every invoke/list/read action (BL-75)', async () => {
+    seedSkillCommand('skill_alpha', { enabled_agent_ids: [] })
+
+    for (const action of ['invoke', 'list', 'read'] as const) {
+      const result = await executeSkillRuntimeAction({
+        userId: 'josh',
+        skillId: 'skill_alpha',
+        actor: PRIMARY,
+        action,
+        path: 'SKILL.md'
+      })
+      expect(result).toEqual(
+        expect.objectContaining({
+          success: false,
+          action,
+          blocked: true,
+          errorCode: 'SKILL_NOT_ENABLED',
+          skillId: 'skill_alpha'
+        })
+      )
+    }
+    expect(mocks.getSkill).not.toHaveBeenCalled()
   })
 
   it('reads bundle text safely and supports truncation', () => {

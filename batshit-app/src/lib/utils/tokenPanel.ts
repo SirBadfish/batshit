@@ -453,6 +453,7 @@ function resolveContextUsage(snapshot: ExecutionSnapshot): ContextUsageCandidate
 }
 
 function getFlatPrice(value: SavedModel['pricing']['input'] | SavedModel['pricing']['output']): number | null {
+  // Absent (undefined) and tiered prices are both unknown here; only a finite number is a price.
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
@@ -984,10 +985,15 @@ export function summarizeRunningCost(
       : null
 
   if (inputPrice === null || outputPrice === null) {
+    // BL-67: an absent price is unknown, never $0.00. A real zero is a number and lands below.
+    const missingPrice =
+      activeModel.pricing?.input === undefined || activeModel.pricing?.output === undefined
     return {
       cost: null,
       state: 'unknown',
-      note: 'Cost is unavailable because this model uses pricing data Batshit cannot flatten into a truthful per-run number yet.',
+      note: missingPrice
+        ? 'Cost is unknown because this model preset has no price. Add its input and output prices in Settings → Models to see a running cost.'
+        : 'Cost is unavailable because this model uses pricing data Batshit cannot flatten into a truthful per-run number yet.',
       ...delegated,
     }
   }

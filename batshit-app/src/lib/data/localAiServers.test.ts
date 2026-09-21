@@ -8,8 +8,12 @@ describe('local AI server definitions smoke', () => {
     // real server (0.6.4); SGLang's definition is built from its published API
     // and is NOT yet proven live (DL-102-07 open — needs the PC 4090 lane), so
     // do not let this comment drift into claiming it was.
+    // SA-124 P0 added KoboldCpp, proven live against 1.121 (mac-arm64):
+    // /v1/models listed the loaded model, a real chat send answered with token
+    // counts, and /api/extra/true_max_context_length reported 8192.
     expect(Array.from(LOCAL_AI_SERVER_IDS).sort()).toEqual([
       'dmr',
+      'koboldcpp',
       'llama-cpp',
       'lmstudio',
       'ollama',
@@ -17,7 +21,7 @@ describe('local AI server definitions smoke', () => {
       'sglang',
       'vllm'
     ])
-    expect(LOCAL_AI_SERVER_DEFINITIONS).toHaveLength(7)
+    expect(LOCAL_AI_SERVER_DEFINITIONS).toHaveLength(8)
   })
 
   it('has valid defaults required by Local AI settings/runtime routing', () => {

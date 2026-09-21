@@ -1,6 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
-import { listEpisodes } from '$lib/server/services/memory/memoryEpisodes'
+import { listEpisodes, whiteboardAuthor } from '$lib/server/services/memory/memoryEpisodes'
 
 /**
  * SA-104 P5 — minimal episode state for the session menu (Infinite Sessions).
@@ -33,7 +33,9 @@ export const GET: RequestHandler = async ({ params, locals }) => {
             hold_until: open.hold_until ?? null,
             // SA-104 P6 (DL-104-16): the whiteboard is never hidden from the user.
             whiteboard: open.whiteboard?.content ?? null,
-            whiteboard_updated_at: open.whiteboard?.updated_at ?? null
+            whiteboard_updated_at: open.whiteboard?.updated_at ?? null,
+            // 2026-09-19: who wrote the board last ('agent' or 'nap'); naps never rewrite an agent's board.
+            whiteboard_written_by: open.whiteboard?.content ? whiteboardAuthor(open.whiteboard) : null
           }
         : null,
       closedCount: episodes.filter((episode) => episode.state !== 'open').length

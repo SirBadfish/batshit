@@ -256,7 +256,8 @@ describe('/api/controls/use on the agent lane', () => {
       agentId: 'subagent_cli_worker_agent_cooper_1',
       sessionId: 'sess-1',
       runtime: 'codex',
-      delegated: true
+      delegated: true,
+      scopeAgentId: 'worker_cooper_1'
     })
 
     await POST({

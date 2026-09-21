@@ -118,7 +118,8 @@ describe('the agent lane comes first', () => {
       agentId: 'subagent_cli_worker_agent_cooper_1',
       sessionId: 'sess-1',
       runtime: 'codex',
-      delegated: true
+      delegated: true,
+      scopeAgentId: 'worker_cooper_1'
     })
 
     const auth = await resolveNativeToolUser({
@@ -128,7 +129,9 @@ describe('the agent lane comes first', () => {
     expect(auth).toMatchObject({
       auth: 'agent',
       agentId: 'subagent_cli_worker_agent_cooper_1',
-      delegated: true
+      delegated: true,
+      // BL-75: the Worker whose skill access governs the run, off the credential.
+      scopeAgentId: 'worker_cooper_1'
     })
   })
 

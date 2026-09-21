@@ -151,6 +151,45 @@ describe('GET /api/dms', () => {
   })
 })
 
+describe('the Jev Juice incoming-text screen on a row (SA-120 P7)', () => {
+  const SCREEN = {
+    version: 1,
+    source: 'agent_dm',
+    status: 'flagged',
+    at: '2026-09-17T09:30:00.000Z',
+    findings: [{ id: 'override', probability: 0.98 }],
+    severity: 'serious',
+    harm: 2,
+    record: { feature: 'untrusted_text', status: 'ok', model: 'jev-1.13.0', latencyMs: 190, usage: null, deadlineHit: false, questionCount: 4, at: '2026-09-17T09:30:00.000Z' }
+  } as const
+
+  it('rides the list row and the detail record for the badge, and is `null` on a DM that has none', async () => {
+    const { stampDmScreen } = await import('$lib/server/services/dm/dmStore')
+    const flagged = await seedAssignment({ subject: 'Flagged one' })
+    const plain = await seedAssignment({ subject: 'Plain one', body: 'A different body.' })
+    await stampDmScreen(flagged.id, SCREEN as never)
+
+    const payload = await (await list(USER)).json()
+    const rows = payload.dms as Array<Record<string, any>>
+    expect(rows.find((row) => row.id === flagged.id)?.screen).toEqual(SCREEN)
+    expect(rows.find((row) => row.id === plain.id)?.screen).toBeNull()
+    // Still summary-first: the badge needs no body.
+    expect(rows.find((row) => row.id === flagged.id)).not.toHaveProperty('body')
+
+    const detail = await (await readOne(USER, flagged.id)).json()
+    expect(detail.dm.screen).toEqual(SCREEN)
+  })
+
+  it('goes when the DM goes: deleting the DM is the only cleanup the screen needs', async () => {
+    const { stampDmScreen } = await import('$lib/server/services/dm/dmStore')
+    const dm = await seedAssignment()
+    await stampDmScreen(dm.id, SCREEN as never)
+    await remove(USER, dm.id)
+    expect(await getDm(dm.id)).toBeNull()
+    expect(await redis.exists(`dm:${dm.id}`)).toBeFalsy()
+  })
+})
+
 describe('GET /api/dms/[id]', () => {
   it('returns the full record, body included', async () => {
     const record = await seedAssignment()

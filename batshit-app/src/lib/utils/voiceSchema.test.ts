@@ -5,7 +5,8 @@ import {
   flattenLegacyVoiceStyle,
   normalizeAgentVoiceProfile,
   normalizeVoiceModeTurnSettings,
-  normalizeVoiceSettings
+  normalizeVoiceSettings,
+  shouldStopVoiceRuntimeOnShutdown
 } from './voiceSchema'
 
 describe('voiceSchema legacy cutover normalization', () => {
@@ -151,7 +152,11 @@ describe('voiceSchema legacy cutover normalization', () => {
       inputMode: 'text',
       submitMode: 'manual',
       autoSubmitDelayMs: 3200,
-      endOfTurnThreshold: 0.85
+      endOfTurnThreshold: 0.85,
+      // SA-120 P9 (LS-060): absent means OFF; P9b: the wake word is required by default and is "Yo".
+      jevJuiceQuickActions: false,
+      jevJuiceQuickActionsWakeWordRequired: true,
+      jevJuiceQuickActionsWakeWord: 'Yo'
     })
     expect(normalizeVoiceSettings({ voiceSessionRuntime: 'unknown' }).voiceSessionRuntime).toBe('direct')
   })
@@ -272,7 +277,10 @@ describe('voiceSchema legacy cutover normalization', () => {
       inputMode: 'stt',
       submitMode: 'auto',
       autoSubmitDelayMs: DEFAULT_VOICE_MODE_AUTO_SUBMIT_DELAY_MS,
-      endOfTurnThreshold: DEFAULT_VOICE_MODE_END_OF_TURN_THRESHOLD
+      endOfTurnThreshold: DEFAULT_VOICE_MODE_END_OF_TURN_THRESHOLD,
+      jevJuiceQuickActions: false,
+      jevJuiceQuickActionsWakeWordRequired: true,
+      jevJuiceQuickActionsWakeWord: 'Yo'
     })
 
     expect(
@@ -286,8 +294,31 @@ describe('voiceSchema legacy cutover normalization', () => {
       inputMode: 'text',
       submitMode: 'manual',
       autoSubmitDelayMs: 5000,
-      endOfTurnThreshold: 0.9
+      endOfTurnThreshold: 0.9,
+      jevJuiceQuickActions: false,
+      jevJuiceQuickActionsWakeWordRequired: true,
+      jevJuiceQuickActionsWakeWord: 'Yo'
     })
+  })
+
+  it('SA-120 P9 (LS-060): Jev Juice: Quick Actions is ON only for a stored `true`, and an agent profile never carries it', () => {
+    expect(normalizeVoiceModeTurnSettings({ jevJuiceQuickActions: true }).jevJuiceQuickActions).toBe(true)
+    for (const value of ['true', 1, {}, null, undefined]) {
+      expect(normalizeVoiceModeTurnSettings({ jevJuiceQuickActions: value }).jevJuiceQuickActions).toBe(false)
+    }
+    expect(normalizeVoiceSettings({ voiceMode: { jevJuiceQuickActions: true } }).voiceMode?.jevJuiceQuickActions).toBe(true)
+    // Global only: a profile spread over the global block can neither turn it on nor off.
+    const profile = normalizeAgentVoiceProfile({ voiceMode: { submitMode: 'manual', jevJuiceQuickActions: true } })
+    expect(profile?.voiceMode).toBeDefined()
+    expect(profile?.voiceMode).not.toHaveProperty('jevJuiceQuickActions')
+    // P9b: the wake word and its switch are global too.
+    const wake = normalizeVoiceSettings({ voiceMode: { jevJuiceQuickActionsWakeWordRequired: false, jevJuiceQuickActionsWakeWord: 'Hey Bat' } }).voiceMode
+    expect(wake).toMatchObject({ jevJuiceQuickActionsWakeWordRequired: false, jevJuiceQuickActionsWakeWord: 'Hey Bat' })
+    expect(normalizeVoiceSettings({ voiceMode: { jevJuiceQuickActionsWakeWord: '' } }).voiceMode?.jevJuiceQuickActionsWakeWord).toBe('Yo')
+    const wakeProfile = normalizeAgentVoiceProfile({ voiceMode: { submitMode: 'manual', jevJuiceQuickActionsWakeWordRequired: false, jevJuiceQuickActionsWakeWord: 'Nope' } })
+    expect(wakeProfile?.voiceMode).not.toHaveProperty('jevJuiceQuickActionsWakeWordRequired')
+    expect(wakeProfile?.voiceMode).not.toHaveProperty('jevJuiceQuickActionsWakeWord')
+    expect({ ...normalizeVoiceSettings({ voiceMode: { jevJuiceQuickActions: true } }).voiceMode, ...profile?.voiceMode }.jevJuiceQuickActions).toBe(true)
   })
 
   it('keeps agent Voice Mode input overrides separate from STT provider overrides', () => {
@@ -555,5 +586,46 @@ describe('voiceSchema legacy cutover normalization', () => {
 
     expect(saved.goonLipSync?.visemeBlendMs).toBe(45)
     expect(clamped.goonLipSync?.visemeBlendMs).toBe(80)
+  })
+})
+
+describe('Stop with Batshit', () => {
+  it('stops a runtime whose choice was never saved', () => {
+    // Quitting the packaged Mac app has always stopped every recorded local
+    // voice runtime. Reading "absent" as "keep running" would leave every
+    // existing install holding gigabytes it used to release.
+    expect(shouldStopVoiceRuntimeOnShutdown(undefined)).toBe(true)
+    expect(shouldStopVoiceRuntimeOnShutdown(null)).toBe(true)
+    expect(shouldStopVoiceRuntimeOnShutdown({})).toBe(true)
+    expect(shouldStopVoiceRuntimeOnShutdown({ stopOnShutdown: undefined })).toBe(true)
+  })
+
+  it('keeps a runtime alive only on an explicit false', () => {
+    expect(shouldStopVoiceRuntimeOnShutdown({ stopOnShutdown: false })).toBe(false)
+    expect(shouldStopVoiceRuntimeOnShutdown({ stopOnShutdown: true })).toBe(true)
+  })
+
+  it('keeps the LiveKit choice when Start with Batshit was never touched', () => {
+    // The two halves are independent settings. Dropping the block unless the
+    // start half was set would silently discard a saved stop choice.
+    const normalized = normalizeVoiceSettings({
+      voiceRuntimes: { livekit: { startup: { stopOnShutdown: false } } }
+    })
+    expect(normalized.voiceRuntimes?.livekit?.startup?.stopOnShutdown).toBe(false)
+    expect(normalized.voiceRuntimes?.livekit?.startup?.autoStartOnLaunch).toBeUndefined()
+  })
+
+  it('round trips both LiveKit halves and drops an empty block', () => {
+    const both = normalizeVoiceSettings({
+      voiceRuntimes: { livekit: { startup: { autoStartOnLaunch: true, stopOnShutdown: true } } }
+    })
+    expect(both.voiceRuntimes?.livekit?.startup).toEqual({
+      autoStartOnLaunch: true,
+      stopOnShutdown: true
+    })
+
+    expect(
+      normalizeVoiceSettings({ voiceRuntimes: { livekit: { startup: {} } } }).voiceRuntimes
+    ).toBeUndefined()
   })
 })

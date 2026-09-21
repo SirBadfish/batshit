@@ -243,6 +243,21 @@ async function executeWithManagedSubagentTimeout<T>(args: {
   }
 }
 
+/**
+ * BL-75 — the id whose skill access governs this delegated run's `native_skill`: the same id
+ * its `skills_commands` list is built for (the Subagent's record id, a `base` Worker's base id,
+ * or a built-in Worker's `worker_…` id). Neither run lane's `agentId` can stand in for it: an
+ * API run passes the PARENT, a CLI run a `subagent_cli_…` runtime id. A record with no id has
+ * no list, so the run fails loudly instead of borrowing the parent's skills.
+ */
+function requireDelegatedSkillScopeId(subagent: SubagentRow): string {
+  const id = typeof subagent.id === 'string' ? subagent.id.trim() : ''
+  if (!id) {
+    throw new Error('This delegated run has no subagent id, so Batshit cannot decide which skills it may load.')
+  }
+  return id
+}
+
 function delegatedFailureOutput(args: {
   label: string
   status: Extract<DelegatedRunStatus, 'failed' | 'timed_out'>
@@ -882,6 +897,7 @@ async function runApiSubagent(
       messageId: runMessageId,
       userId: params.userId,
       agentId: params.parentAgentId ?? undefined,
+      scopeAgentId: requireDelegatedSkillScopeId(params.subagent),
       model: modelId,
       connection: params.subagent.primary_model_name?.trim()
         ? undefined
@@ -909,6 +925,8 @@ async function runApiSubagent(
       // SA-115 P2 (DL-115-10): and never `sys.schedule.*`. A delegated run is over in a
       // moment; it has no business creating something that outlives it and keeps spending.
       scheduleControlsEnabled: false,
+      // SA-120 P2 (DL-120-06): and never `sys.judge.ask` — the primary judges for it.
+      judgeControlsEnabled: false,
       abortSignal: params.abortSignal,
     })
   } catch (error) {
@@ -1058,6 +1076,7 @@ async function runCliSubagent(
         // `agent:` record behind it. The bridge mints this run's credential for it anyway
         // (the helper needs one) and marks it as unable to act as an agent.
         delegatedRun: true,
+        scopeAgentId: requireDelegatedSkillScopeId(params.subagent),
         agentSlug: subagentSlug,
         model: modelId,
         messages,
@@ -1109,6 +1128,7 @@ async function runCliSubagent(
         // `agent:` record behind it. The bridge mints this run's credential for it anyway
         // (the helper needs one) and marks it as unable to act as an agent.
         delegatedRun: true,
+        scopeAgentId: requireDelegatedSkillScopeId(params.subagent),
         agentSlug: subagentSlug,
         model: modelId,
         messages,

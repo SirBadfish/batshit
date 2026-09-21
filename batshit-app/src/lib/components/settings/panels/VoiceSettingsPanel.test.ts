@@ -1272,6 +1272,73 @@ describe('VoiceSettingsPanel external engine refresh', () => {
     expect(rowTools.getByText('Silent')).toBeInTheDocument()
   })
 
+  it('SA-120 P9 (LS-060): a stored Quick Actions ON survives an unrelated save, and the switch flips it through the same auto-save path', async () => {
+    vi.useFakeTimers()
+
+    const stored = {
+      ...baseVoiceSettings,
+      voiceMode: { inputMode: 'stt', submitMode: 'auto', autoSubmitDelayMs: 1000, endOfTurnThreshold: 0.7, jevJuiceQuickActions: true }
+    }
+    const saves: Array<Record<string, any>> = []
+
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = resolveUrl(input)
+      if (url.includes('/api/user/settings') && init?.method === 'POST') {
+        const voice = JSON.parse(String(init.body)).voice_settings
+        saves.push(voice)
+        return jsonResponse({ settings: { voice_settings: voice } })
+      }
+      if (url.includes('/api/user/settings')) return jsonResponse({ settings: { voice_settings: stored } })
+      if (url.includes('/api/voice/byo/engines')) return jsonResponse({ engines: [] })
+      if (url.includes('/api/voice/runtime/livekit')) return jsonResponse({ status: 'not-installed' })
+      if (url.includes('/api/voice/providers')) return jsonResponse({ providers: [browserProvider] })
+      if (url.includes('/api/voice/profiles')) return jsonResponse({ profiles: [] })
+      throw new Error(`Unhandled fetch: ${url}`)
+    })
+    // @ts-expect-error test override
+    global.fetch = fetchMock
+
+    render(VoiceSettingsPanel, { props: { data: { user: { id: 'josh' }, userSettings: { voice_settings: stored } } } })
+    await screen.findByText('Text-to-Speech (TTS)')
+
+    const quickActions = screen.getByRole('switch', { name: /Jev Juice: Quick Actions/i })
+    expect(quickActions).toHaveAttribute('aria-checked', 'true')
+
+    // An unrelated edit (the italic narration switch) must carry the field along, not drop it.
+    // The panel names the voiceMode fields one by one in its payload; the first live proof lost
+    // the switch to exactly that.
+    const narrationRow = screen.getByText('Italic narration').closest('.batshit-settings-form-row')
+    await fireEvent.click(within(narrationRow as HTMLElement).getByRole('switch'))
+    await vi.advanceTimersByTimeAsync(700)
+    await waitFor(() => expect(saves).toHaveLength(1))
+    expect(saves[0].voiceMode).toMatchObject({ inputMode: 'stt', submitMode: 'auto', jevJuiceQuickActions: true, jevJuiceQuickActionsWakeWordRequired: true, jevJuiceQuickActionsWakeWord: 'Yo' })
+
+    // P9b: the wake word saves through the same path; a bad word is refused in the field and never saved.
+    const wakeWord = screen.getByLabelText('Wake Word') as HTMLInputElement
+    expect(wakeWord.value).toBe('Yo')
+    await fireEvent.input(wakeWord, { target: { value: 'Hey Bat' } })
+    await vi.advanceTimersByTimeAsync(700)
+    await waitFor(() => expect(saves).toHaveLength(2))
+    expect(saves[1].voiceMode).toMatchObject({ jevJuiceQuickActions: true, jevJuiceQuickActionsWakeWord: 'Hey Bat' })
+    await fireEvent.input(wakeWord, { target: { value: 'one two three four' } })
+    await vi.advanceTimersByTimeAsync(700)
+    expect(saves).toHaveLength(2)
+    expect(screen.getByText(/one to three plain words/)).toBeInTheDocument()
+
+    const wakeRequired = screen.getByRole('switch', { name: /Require Wake Word/i })
+    expect(wakeRequired).toHaveAttribute('aria-checked', 'true')
+    await fireEvent.click(wakeRequired)
+    await vi.advanceTimersByTimeAsync(700)
+    await waitFor(() => expect(saves).toHaveLength(3))
+    expect(saves[2].voiceMode.jevJuiceQuickActionsWakeWordRequired).toBe(false)
+
+    await fireEvent.click(quickActions)
+    await vi.advanceTimersByTimeAsync(700)
+    await waitFor(() => expect(saves).toHaveLength(4))
+    expect(saves[3].voiceMode.jevJuiceQuickActions).toBe(false)
+    expect(quickActions).toHaveAttribute('aria-checked', 'false')
+  })
+
   it('shows BYO speed default as a placeholder and clearing it removes the saved override', async () => {
     let savedVoiceSettings: Record<string, any> | null = null
     const byoEngineWithSpeedField = {

@@ -205,4 +205,82 @@ describe('messages store session cache', () => {
 
     expect(getMessage('msg-assistant-live', 'session-a')).toBeNull()
   })
+
+  it('keeps a same-id local approval resume when a stale chat read has an older version', () => {
+    setMessagesForSession('session-a', [
+      message({
+        id: 'msg-approval',
+        session_id: 'session-a',
+        content: 'Continued after approval',
+        status: 'in_progress',
+        metadata: { approvalResumeVersion: 102 }
+      })
+    ])
+
+    setMessagesForSession('session-a', [
+      message({
+        id: 'msg-approval',
+        session_id: 'session-a',
+        content: 'Pre-approval card',
+        status: 'complete',
+        metadata: { approvalResumeVersion: 101 }
+      })
+    ])
+
+    expect(getMessage('msg-approval', 'session-a')).toMatchObject({
+      content: 'Continued after approval',
+      status: 'in_progress',
+      metadata: { approvalResumeVersion: 102 }
+    })
+  })
+
+  it('keeps a versioned local approval resume when the stale chat read predates versioning', () => {
+    setMessagesForSession('session-a', [
+      message({
+        id: 'msg-approval',
+        session_id: 'session-a',
+        content: 'Finished continuation',
+        status: 'complete',
+        metadata: { approvalResumeVersion: 102 }
+      })
+    ])
+
+    setMessagesForSession('session-a', [
+      message({
+        id: 'msg-approval',
+        session_id: 'session-a',
+        content: 'Pre-approval card',
+        status: 'complete'
+      })
+    ])
+
+    expect(getMessage('msg-approval', 'session-a')?.content).toBe('Finished continuation')
+  })
+
+  it('accepts a same-version server record after an approval resume is saved', () => {
+    setMessagesForSession('session-a', [
+      message({
+        id: 'msg-approval',
+        session_id: 'session-a',
+        content: 'Streaming continuation',
+        status: 'in_progress',
+        metadata: { approvalResumeVersion: 102 }
+      })
+    ])
+
+    setMessagesForSession('session-a', [
+      message({
+        id: 'msg-approval',
+        session_id: 'session-a',
+        content: 'Saved continuation',
+        status: 'complete',
+        metadata: { approvalResumeVersion: 102 }
+      })
+    ])
+
+    expect(getMessage('msg-approval', 'session-a')).toMatchObject({
+      content: 'Saved continuation',
+      status: 'complete'
+    })
+  })
 })

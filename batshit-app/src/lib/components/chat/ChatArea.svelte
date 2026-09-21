@@ -8,6 +8,7 @@
   import { onDestroy, onMount, tick } from 'svelte'
   import { zippingService } from '$lib/services/zipping'
   import { calculateAgentMessagesFromEndByIndex } from '$lib/utils/zipMessageAge'
+  import { resolveWakeTurnsByIndex } from '$lib/utils/jevJuice'
   import { normalizeId } from '$lib/utils/idNormalizer'
   
   let { 
@@ -61,6 +62,9 @@
   const compactedMessageIdSet = $derived(new Set(compactedMessageIds))
   const activeToolMessageIdSet = $derived(new Set(activeToolMessageIds))
   const agentMessagesFromEndByIndex = $derived(calculateAgentMessagesFromEndByIndex(messages))
+  // SA-120 P7: which DM woke the turn each reply belongs to, so an Approve card in a chat that
+  // a flagged message started can say so. Display only.
+  const wakeTurnByIndex = $derived(resolveWakeTurnsByIndex(messages))
 
   /**
    * SA-114 P3 (DL-114-14) — steers with nowhere to live yet.
@@ -192,6 +196,8 @@
       normalizedZipId?: string
       candidateZipIds?: string[]
       messageId?: string
+      /** `'auto'` jumps at once; the default smooth glide is for a nearby zip. */
+      behavior?: ScrollBehavior
     }>).detail
     const candidateIds = getLocateCandidateIds(
       detail?.zipId,
@@ -213,9 +219,13 @@
     target = target ?? findMessageLocateTarget(detail?.messageId)
     if (!target) return
 
-    autoScroll = false
-    programmaticScrollUntil = Date.now() + 500
-    target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
+    // A locate is the user deliberately leaving the bottom, exactly like a wheel-up. A long
+    // SMOOTH scroll from the bottom is lost here: its first scroll event still reads "at bottom",
+    // re-arms bottom-follow, and the next render snaps the chat back down. So a caller that
+    // jumps far (the Jev Juice notice card's "Show the message", SA-120 P7b) asks for `'auto'`,
+    // which lands in one step, and the release below keeps the chat there.
+    releaseBottomFollow()
+    target.scrollIntoView({ behavior: detail?.behavior ?? 'smooth', block: 'center', inline: 'nearest' })
     target.classList.remove('zip-locate-highlight')
     void target.offsetWidth
     target.classList.add('zip-locate-highlight')
@@ -376,6 +386,7 @@
           messageIndex={index} 
           totalMessages={messages.length}
           agentMessagesFromEnd={agentMessagesFromEndByIndex[index] ?? 0}
+          wakeTurn={wakeTurnByIndex[index] ?? null}
           {isWaitingForResponse}
           isWaitingForToolCall={messageWaitingForTool}
           toolCallName={messageToolCallName}
@@ -405,7 +416,7 @@
     overflow-y: auto;
     overflow-x: hidden;
     padding: 1.75rem;
-    background: var(--background);
+    background: var(--bs-chat-canvas);
     color: var(--bs-app-text);
     min-width: 0;
     min-height: 0;

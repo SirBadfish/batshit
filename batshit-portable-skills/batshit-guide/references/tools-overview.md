@@ -97,6 +97,14 @@ The Global Tool Grid has `Reset to defaults`. The Agent Tool Grid has `Reset to 
 
 Keep tool access as narrow as the job allows. Broad access is powerful, but it also makes agent behavior harder to predict.
 
+### Bash access modes
+
+- **Plan** allows inspection and search commands plus deliberate Markdown (`.md`) writes or edits. Batshit blocks command chaining, hidden mutation or command-execution flags, shell/process substitution, and pipelines that contain an executor or writer instead of another approved read-only stage. Git commands are blocked here because repository configuration can make even an inspection run helper programs.
+- **Agent** allows workspace work. Simple inspections normally skip a popup. Shell file writes, Git commands, interpreters, and ambiguous compound commands follow your approval policy unless explicitly allowlisted. Every operation must qualify independently. Batshit's managed patch and native file tools keep their normal workspace checks.
+- **Dangerous** skips approval popups, while Batshit's hard safety blocks and your Never Allow rules still apply.
+
+**An approved command runs once.** If the reply fails or you press **Stop** after you approved, the card still says **Approved** and does not offer the buttons again. To run the command again, ask the agent again; it asks you again with a new card.
+
 ### The Fabric Controls and Artifact Tools rows
 
 Most people never need to touch these two. They're already set the way they should be, and this section is here for the times you're curious what they are or you want to turn one off.
@@ -152,7 +160,7 @@ A Batshit CLI Tool is not just shell text in a prompt. It's a saved tool record 
 - A test path.
 - An icon.
 
-Use CLI Tools for a repeatable local action that agents should call safely and consistently.
+Use CLI Tools for a repeatable local action that agents should call safely and consistently. Stop cancels a saved CLI tool running in that reply; on Mac and Linux, Stop and timeout also end the processes it started.
 
 Most CLI Tool setup is best handled through an agent or the CLI Tool Creator flow, because the record includes command shape, validation, permissions, and runtime boundaries. Settings still shows the saved details and user-facing controls — icon, status, tests, permissions — but normal users shouldn't need to hand-author raw manifests.
 
@@ -201,7 +209,6 @@ The Docker core app container does not get arbitrary host Docker control. Start/
 
 | Primary Agent type | Tool path |
 | --- | --- |
-| `n8n` | Uses the Batshit Tools automation pack inside n8n, plus n8n-native workflow tools. |
 | `API` | Uses Batshit native tools through the direct provider path. |
 | `CLI` | Uses CLI-native command/search/edit behavior plus Batshit-managed helper tools through a managed bridge. |
 
@@ -249,6 +256,7 @@ Tools are powerful — treat them like giving a capable assistant access to real
 | Symptom | Likely cause | What to check |
 | --- | --- | --- |
 | Agent can't find an MCP tool | Tool Grid discoverability is off, or the gateway is offline. | Agent Tools settings and gateway status. |
+| A tool you just added on the server doesn't show up yet | Batshit keeps each gateway's tool list for up to five minutes, so messages don't wait on every tool server. | Click **Refresh** on that gateway in Settings → MCPs, or wait five minutes. |
 | Docker MCP calls fail with unauthorized errors | Gateway token mismatch, or the gateway wasn't started with the same token. | Docker MCP Gateway settings and active environment. |
 | CLI Tool is visible but fails | Manifest input, working directory, missing executable, or missing saved key. | Run the CLI Tool test path. |
 | n8n tool callback fails | The Batshit Tools node isn't forwarding the per-message native-tool token, or the callback URL isn't reachable from n8n. | The `x-batshit-native-tool-token` header, n8n execution history, and runtime URLs. |

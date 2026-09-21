@@ -45,6 +45,56 @@ describe.runIf(REAL_REDIS_LANE)('group cleanup after agent deletion', () => {
     await seedAgent('agent-c', 'Agent C')
   })
 
+  it('scrubs the deleted agent from skill enable-lists and artifact allow-lists, touching nothing else (2026-09-19)', async () => {
+    await redis.json.set(`slash_command:${userId}:batshit-guide`, '$', {
+      id: 'batshit-guide',
+      user_id: userId,
+      enabled_for_all_agents: false,
+      enabled_agent_ids: ['agent-a', 'agent-b'],
+      is_active: true
+    } as never)
+    await redis.json.set(`slash_command:${userId}:all-agents`, '$', {
+      id: 'all-agents',
+      user_id: userId,
+      enabled_for_all_agents: true,
+      enabled_agent_ids: [],
+      is_active: true
+    } as never)
+    await redis.json.set('artifact:art-1', '$', {
+      id: 'art-1',
+      user_id: userId,
+      name: 'Nano',
+      agent_access_scope: 'all',
+      agent_allowlist: ['agent-a'],
+      agent_use_enabled: true
+    } as never)
+    await redis.json.set('artifact:art-2', '$', {
+      id: 'art-2',
+      user_id: userId,
+      name: 'Other',
+      agent_allowlist: null
+    } as never)
+    await redis.sAdd(`user:${userId}:artifacts`, ['art-1', 'art-2'])
+
+    await redis.deleteAgent('agent-a')
+
+    expect(await redis.json.get(`slash_command:${userId}:batshit-guide`)).toMatchObject({
+      enabled_agent_ids: ['agent-b'],
+      enabled_for_all_agents: false,
+      is_active: true
+    })
+    expect(await redis.json.get(`slash_command:${userId}:all-agents`)).toMatchObject({
+      enabled_agent_ids: []
+    })
+    expect(await redis.json.get('artifact:art-1')).toMatchObject({
+      agent_allowlist: [],
+      agent_use_enabled: true,
+      name: 'Nano'
+    })
+    expect(await redis.json.get('artifact:art-2')).toMatchObject({ agent_allowlist: null })
+    expect(await redis.get('agent:agent-b')).toMatchObject({ id: 'agent-b' })
+  })
+
   it('scrubs deleted agents from saved groups and repairs driver fallback', async () => {
     await redis.createGroup({
       id: 'group-cleanup-1',

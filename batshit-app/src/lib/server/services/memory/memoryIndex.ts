@@ -60,6 +60,23 @@ export function sanitizeTextQuery(text: string): string {
     .join(' ')
 }
 
+const ANY_WORD_QUERY_MAX_TERMS = 32
+
+/**
+ * SA-120 P4b: the same neutralized words as `sanitizeTextQuery`, joined as alternatives
+ * (`a|b|c`) so a whole sentence can be a lexical query. Words under three characters add
+ * only noise, repeats add nothing, and the count is capped so a pasted log stays a query.
+ */
+export function anyWordTextQuery(text: string): string {
+  const seen = new Set<string>()
+  for (const token of sanitizeTextQuery(text).split(' ')) {
+    if (token.length < 3) continue
+    seen.add(token.toLowerCase())
+    if (seen.size >= ANY_WORD_QUERY_MAX_TERMS) break
+  }
+  return Array.from(seen).join('|')
+}
+
 // ---------------------------------------------------------------------------
 // Config + meta records
 // ---------------------------------------------------------------------------
@@ -409,6 +426,19 @@ export async function hybridSearchMemories(options: {
   vector: number[]
   limit: number
   filters?: MemorySearchFilters
+  /**
+   * SA-120 P4a: how many candidates EACH leg hands the fusion. Absent, Redis uses its
+   * defaults (KNN K 10, RRF WINDOW 20) and the command is exactly what it always was;
+   * the rerank lane passes its shortlist size so a wider page is not capped by K 10.
+   */
+  candidatesPerLeg?: number
+  /**
+   * SA-120 P4b: how the words of `query` combine in the lexical leg. `all` (the default,
+   * and what the agent's search tool has always used) needs every word in one memory;
+   * `any` lets BM25 rank by whichever words match, which is what a whole chat message
+   * needs — a sentence of fifteen words never appears in one memory.
+   */
+  lexicalMode?: 'all' | 'any'
 }): Promise<MemorySearchHit[]> {
   const meta = await requireReadyMemoryIndexes()
   if (options.vector.length !== meta.dims) {
@@ -416,14 +446,22 @@ export async function hybridSearchMemories(options: {
       `Memory query vector has ${options.vector.length} dims but the index expects ${meta.dims}.`
     )
   }
-  const text = sanitizeTextQuery(options.query)
+  const text =
+    options.lexicalMode === 'any' ? anyWordTextQuery(options.query) : sanitizeTextQuery(options.query)
   const prefilter = `@agent:{${escapeTagValue(options.agentId)}}${buildFilterClauses(options.filters)}`
   const lexical = text ? `${prefilter} (@content:(${text}) | @gist:(${text}))` : prefilter
+  const perLeg =
+    typeof options.candidatesPerLeg === 'number' && options.candidatesPerLeg > 0
+      ? String(Math.floor(options.candidatesPerLeg))
+      : null
   return redis.execute(async (client) => {
     const reply = await client.sendCommand([
       'FT.HYBRID', memoryIndexName(),
       'SEARCH', lexical,
-      'VSIM', '@embedding', '$qvec', 'FILTER', prefilter,
+      'VSIM', '@embedding', '$qvec',
+      ...(perLeg ? ['KNN', '2', 'K', perLeg] : []),
+      'FILTER', prefilter,
+      ...(perLeg ? ['COMBINE', 'RRF', '2', 'WINDOW', perLeg] : []),
       'LIMIT', '0', String(options.limit),
       'PARAMS', '2', 'qvec', float32Blob(options.vector)
     ])

@@ -1,23 +1,32 @@
 export const CODEX_SUBMODEL_CHOICES = [
+  { value: 'gpt-6-astra', label: 'GPT-6 Astra' },
+  { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
+  { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
+  { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
   { value: 'gpt-5.5', label: 'GPT-5.5' },
-  { value: 'gpt-5.4', label: 'GPT-5.4' },
-  { value: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
-  { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' }
 ] as const
 
 const CODEX_XHIGH_REASONING_MODEL_SET = new Set<string>([
-  'gpt-5.5',
-  'gpt-5.4',
-  'gpt-5.3-codex-spark'
+  'gpt-6-astra',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5'
 ])
 
-const CODEX_FAST_MODE_MODEL_SET = new Set<string>(['gpt-5.5', 'gpt-5.4'])
+const CODEX_FAST_MODE_MODEL_SET = new Set<string>([
+  'gpt-6-astra',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5'
+])
 
 export const CODEX_XHIGH_REASONING_HELPER_TEXT =
-  'GPT-5.5 / GPT-5.4 / GPT-5.3 Codex Spark (deepest reasoning)'
+  'Astra, GPT-5.6, and GPT-5.5 (deepest reasoning)'
 
 export const CODEX_FAST_MODE_HELPER_TEXT =
-  "Available for GPT-5.5 and GPT-5.4 in Batshit's current Codex list."
+  "Available for Astra, GPT-5.6, and GPT-5.5 in Batshit's current Codex list."
 
 export function supportsCodexXhighReasoning(model: string | null | undefined): boolean {
   if (typeof model !== 'string') return false

@@ -27,6 +27,7 @@ import {
   escapeStructuredTextContent
 } from '$lib/utils/htmlEntities'
 import { logger } from '$lib/utils/logger'
+import type { ZipStateView } from './zipping'
 
 const ZIP_COMPILATION_BATCH_SIZE = 100
 
@@ -58,6 +59,69 @@ export interface ZipExposure {
   zipData: ZipData
   expandedContent: string
   message?: any
+}
+
+/**
+ * SA-120 P5: one zip this compile left COMPRESSED for the model, reported through
+ * `onZipCompressed`. Observation only — the decision was already made and applied by
+ * the time the callback runs. The canonical compiler hands these to the Jev Juice
+ * smart-zip hint lane as its candidates, so the lane judges exactly what the agent
+ * cannot see rather than re-deriving zip activation on its own.
+ */
+export interface ZipCompression {
+  zipId: string
+  zipType: string
+  /** The compact description the model reads inside the compressed reference. */
+  description: string
+  /**
+   * The stored parts of that description (`metadata.zipDescriptionLabel` / `Target` /
+   * `Status`), when the zip has any; a part it lacks is `''`. Facts only: what a reader
+   * does with a repeat of the same tool call, or with a result that names no target, is
+   * that reader's policy.
+   */
+  descriptionParts?: { label: string; target: string; status: string }
+  /** Prompt-facing tokens the expanded result would cost. */
+  tokens: number
+  operationKind?: string
+  toolName?: string
+  /** Safety row (`metadata.forceCompress`): stays compressed even when unzipped. */
+  forceCompress: boolean
+  /** Someone zipped it by hand (`rezipped_item`). */
+  rezipped: boolean
+  /**
+   * Whose rezip it is, when the compile's zip state carries rezip sources (the canonical
+   * compiler loads them only for a smart-zip turn). Unknown reads as `user`, the strongest,
+   * so a reader that must not override an explicit zip stays safe by default.
+   */
+  rezippedBy: 'user' | 'agent' | 'inferred' | null
+  /** Compressed only because the tool is not shared with this group agent. */
+  groupUnshared: boolean
+  messagesFromEnd: number
+}
+
+/**
+ * SA-120 P5: one zip this compile left EXPANDED for the model, reported through
+ * `onZipExposed` in every view mode (unlike `onZipExposure`, which carries the expanded body
+ * for the appended block). Facts only, after the fact. The Jev Juice smart-zip lane asks,
+ * once the reply is finished, whether the agent is done with the ones that would otherwise
+ * stay open.
+ */
+export interface ZipExposed {
+  zipId: string
+  zipType: string
+  description: string
+  descriptionParts?: { label: string; target: string; status: string }
+  /** Prompt-facing tokens it costs while it stays open. */
+  tokens: number
+  operationKind?: string
+  toolName?: string
+  /** Who holds it open by hand; `null` when only buffer rules or a recovery hold keep it open. */
+  unzippedBy: 'user' | 'agent' | 'inferred' | null
+  recoveryHold: boolean
+  messagesFromEnd: number
+  bufferSize: number
+  autoZip: boolean
+  zipDisabled: boolean
 }
 
 const PRESERVED_REASONING_HEADER = '==== PRESERVED REASONING FROM THIS RESPONSE ===='
@@ -300,14 +364,25 @@ export async function compileForAI(
     zipViewMode?: 'inline' | 'appended'
     agentMessagesFromEnd?: number
     onZipExposure?: (exposure: ZipExposure) => void
+    /** SA-120 P5: told about each zip left compressed, AFTER the fact. Must not throw; a throw is logged and ignored. */
+    onZipCompressed?: (compression: ZipCompression) => void
+    /** SA-120 P5: told about each zip left expanded, in every view mode, AFTER the fact. Same rule. */
+    onZipExposed?: (exposed: ZipExposed) => void
     /** See calculateRecoveryHoldByIndex — blocks automatic zip compression for failed/interrupted trailing runs. */
     recoveryHold?: boolean
     /** Replays one stored, byte-stable reasoning block until the same agent completes a later successful turn. */
     interruptedReasoningRecoveryActive?: boolean
+    /**
+     * The zip state this compile reads (unzips, rezips, and whose they are). The server
+     * always passes the one it built for this compile: compiles overlap in one process, and
+     * the zip reads below await in between. Absent, a browser caller reads its tab's
+     * singleton, which holds only the current chat.
+     */
+    zipState?: ZipStateView
   }
 ): Promise<string> {
-  // Import zipping service to check unzipped status
-  const { zippingService } = await import('$lib/services/zipping')
+  const zipState: ZipStateView =
+    options?.zipState ?? (await import('$lib/services/zipping')).zippingService
   const fetchImpl = options?.fetch
   const groupToolSharing = options?.groupToolSharing
   const sharedTools = normalizeSharedTools(groupToolSharing?.sharedTools)
@@ -361,8 +436,8 @@ export async function compileForAI(
       
       // Check if this zip is unzipped by the user
       const checkZipId = normalizeId(zip.id)
-      const isUnzipped = zippingService.isUnzipped(checkZipId)
-      const isRezipped = zippingService.isRezipped(checkZipId)
+      const isUnzipped = zipState.isUnzipped(checkZipId)
+      const isRezipped = zipState.isRezipped(checkZipId)
       const messagesFromEnd =
         options?.agentMessagesFromEnd ?? totalMessages - messageIndex - 1
       
@@ -439,6 +514,41 @@ export async function compileForAI(
         return expandedContent
       }
 
+      const descriptionPart = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
+      const reportExposed = () => {
+        if (!options?.onZipExposed) return
+        try {
+          const label = descriptionPart(zipData.metadata?.zipDescriptionLabel)
+          const target = descriptionPart(zipData.metadata?.zipDescriptionTarget)
+          const unzippedSource = isUnzipped ? zipState.getUnzippedInfo(checkZipId)?.source : undefined
+          options.onZipExposed({
+            zipId: zip.id,
+            zipType: zipData.type,
+            description: zip.optionalContent || zip.description || zipData.description || '',
+            ...(label || target
+              ? { descriptionParts: { label, target, status: descriptionPart(zipData.metadata?.zipDescriptionStatus) } }
+              : {}),
+            tokens: activation.tokens,
+            operationKind:
+              typeof zipData.metadata?.operationKind === 'string' ? zipData.metadata.operationKind : undefined,
+            toolName: activation.toolName,
+            // An unzip whose source cannot be read is the user's, the strongest.
+            unzippedBy: !isUnzipped
+              ? null
+              : unzippedSource === 'agent' || unzippedSource === 'inferred'
+                ? unzippedSource
+                : 'user',
+            recoveryHold: activation.recoveryHold,
+            messagesFromEnd: activation.messagesFromEnd,
+            bufferSize: activation.bufferSize,
+            autoZip: activation.autoZip,
+            zipDisabled: activation.zipDisabled
+          })
+        } catch (error) {
+          console.error('[compileForAI] onZipExposed observer threw; ignored:', error)
+        }
+      }
+
       if (shouldAppend && shouldExpose) {
         const expandedContent = await buildExpandedContent()
         options?.onZipExposure?.({
@@ -457,6 +567,38 @@ export async function compileForAI(
           compressedZip +
           compiled.substring(start + zip.length)
         offset += compressedZip.length - zip.length
+
+        // SA-120 P5: report after the reference is written, so an observer can never
+        // change or interrupt what this compile produced.
+        if (!shouldCompress) reportExposed()
+        if (shouldCompress && options?.onZipCompressed) {
+          try {
+            const part = (value: unknown) => (typeof value === 'string' ? value.trim() : '')
+            const label = part(zipData.metadata?.zipDescriptionLabel)
+            const target = part(zipData.metadata?.zipDescriptionTarget)
+            options.onZipCompressed({
+              zipId: zip.id,
+              zipType: zipData.type,
+              description: optionalContent || zipData.description || '',
+              ...(label || target
+                ? { descriptionParts: { label, target, status: part(zipData.metadata?.zipDescriptionStatus) } }
+                : {}),
+              tokens: activation.tokens,
+              operationKind:
+                typeof zipData.metadata?.operationKind === 'string'
+                  ? zipData.metadata.operationKind
+                  : undefined,
+              toolName: activation.toolName,
+              forceCompress: zipData.metadata?.forceCompress === true,
+              rezipped: isRezipped,
+              rezippedBy: isRezipped ? (zipState.getRezippedSource(checkZipId) ?? 'user') : null,
+              groupUnshared: shouldForceCompress,
+              messagesFromEnd: activation.messagesFromEnd
+            })
+          } catch (error) {
+            console.error('[compileForAI] onZipCompressed observer threw; ignored:', error)
+          }
+        }
       } else {
         // When expanding zips that are within the buffer zone OR manually unzipped
         const expandedContent = await buildExpandedContent()
@@ -465,6 +607,7 @@ export async function compileForAI(
           expandedContent +
           compiled.substring(start + zip.length)
         offset += expandedContent.length - zip.length
+        reportExposed()
       }
     } catch (error) {
       console.warn('[compileForAI] Failed to resolve zip during AI history compilation:', {

@@ -15,7 +15,7 @@
   import { isGoonRuntimeReady } from "$lib/goons/recipe";
   import { subagentStore } from "$lib/stores/subagents.svelte";
   import { getUserSettings } from "$lib/stores/userSettings.svelte";
-  import { confirmDialog } from "$lib/stores/confirmDialog";
+  import { confirmDialog, confirmDialogWithCheckbox } from "$lib/stores/confirmDialog";
   import { copyTextToClipboard } from "$lib/utils/clipboard";
   import type {
   AgentDcmDisplaySettings,
@@ -141,6 +141,15 @@ import { resolveVoiceSettingsForSpeech, voiceService, type VoiceConfig } from "$
   import AgentAutoCompactSettingsCard from "$lib/components/settings/agent/AgentAutoCompactSettingsCard.svelte";
   import AgentMemorySettingsCard from "$lib/components/settings/agent/AgentMemorySettingsCard.svelte";
   import AgentDmsSettingsCard from "$lib/components/settings/agent/AgentDmsSettingsCard.svelte";
+  import AgentJevJuiceSettingsCard from "$lib/components/settings/agent/AgentJevJuiceSettingsCard.svelte";
+  import {
+    resolveAgentJevJudgeToolEnabled,
+    resolveAgentJevMemoryRecallEnabled,
+    resolveAgentJevMemoryRerankEnabled,
+    resolveAgentJevReplyCheckEnabled,
+    resolveAgentJevSkillToolHintsEnabled,
+    resolveAgentJevStyleCoachEnabled,
+  } from "$lib/utils/jevJuiceControl";
   import {
     DEFAULT_WAKE_TARGET,
     resolveAgentDmsEnabled,
@@ -337,6 +346,8 @@ import {
     policy: string;
     version: string | null;
     cli?: string | null;
+    /** Apple Container only: false until the first sandboxed command starts it (BL-62). */
+    systemRunning?: boolean;
     reason: string | null;
   };
 
@@ -359,6 +370,17 @@ import {
     wake_enabled: boolean;
     wake_timeout_minutes: number | null;
     wake_target: WakeTarget;
+    // SA-120 P1 (DL-120-01): the per-agent Jev Juice skill/tool hint switch. Default off.
+    jev_juice_skill_tool_hints: boolean;
+    // SA-120 P2 (LS-050): the per-agent switch for the sys.judge.ask tool. Default off.
+    jev_juice_judge_tool: boolean;
+    // SA-120 P4a (LS-052): the per-agent switch for the memory search rerank. Default off.
+    jev_juice_memory_rerank: boolean;
+    // SA-120 P4b (LS-053): the per-agent switch for recall by meaning. Default off.
+    jev_juice_memory_recall: boolean;
+    // SA-120 P6 — the two after-reply lanes (LS-055, LS-056).
+    jev_juice_reply_check: boolean;
+    jev_juice_style_coach: boolean;
     webhook_url: string;
     agent_url: string;
     default_project_id: string | null;
@@ -617,7 +639,7 @@ import {
     icon: typeof MessageCircle;
   }> = [
     { value: "chat", label: "Chat", helper: "Read-only, never prompts", icon: MessageCircle },
-    { value: "agent", label: "Agent", helper: "Workspace write, ask on failure", icon: Shield },
+    { value: "agent", label: "Agent", helper: "Workspace write, ask when needed", icon: Shield },
     {
       value: "agent_full",
       label: "Agent (full)",
@@ -659,7 +681,7 @@ import {
     },
     {
       value: "all",
-      label: "On Failure",
+      label: "On Request",
       helper: "When a primary agent hits a permission boundary, supported runtimes can ask for extra approval.",
     },
   ];
@@ -735,6 +757,12 @@ import {
     dms_enabled?: boolean;
     dm_senders?: DmSenderScope | { scope?: DmSenderScope; agentIds?: string[] } | null;
     dm_sender_agent_ids?: string[] | null;
+    jev_juice_skill_tool_hints?: boolean | null;
+    jev_juice_judge_tool?: boolean | null;
+    jev_juice_memory_rerank?: boolean | null;
+    jev_juice_memory_recall?: boolean | null;
+    jev_juice_reply_check?: boolean | null;
+    jev_juice_style_coach?: boolean | null;
     wake_enabled?: boolean;
     wake_timeout_minutes?: number | null;
     wake_target?: WakeTarget;
@@ -3152,13 +3180,60 @@ import {
     if (!selectedAgentId) return;
     const current = agents.find((agent) => agent.id === selectedAgentId);
     const label = current?.displayName?.trim() || "this Primary Agent";
-    const confirmed = await confirmDialog({
-      title: `Delete ${label}?`,
-      description:
-        "This permanently removes the agent's settings, model defaults, zip overrides, and tool assignments. Chat history is preserved.",
-      confirmLabel: "Delete Primary Agent",
-      tone: "destructive",
-    });
+
+    // 2026-09-19 (Josh): deleting an agent may take its own chats with it. The count comes
+    // from the same selection the delete uses, so the number shown is the number that goes.
+    // Group chats are never counted or deleted; the agent only leaves their rosters.
+    let chatCounts: { deletable: number; infinite: number; keptLocked: number } | null = null;
+    try {
+      const countResponse = await fetch(`/api/agents/${selectedAgentId}/chats`);
+      if (countResponse.ok) {
+        chatCounts = await countResponse.json();
+      }
+    } catch (error) {
+      console.warn("Failed to count the agent's chats:", error);
+    }
+
+    const description = [
+      "This permanently removes the agent's settings, model defaults, tool assignments, memories, DMs sent to it, schedules, and wake-up webhooks.",
+      "Group chats are kept; the agent is only removed from their rosters.",
+    ];
+    const confirmLabel = "Delete Primary Agent";
+    let confirmed = false;
+    let deleteChats = false;
+    if (chatCounts && (chatCounts.deletable > 0 || chatCounts.keptLocked > 0)) {
+      const chatWord = chatCounts.deletable === 1 ? "chat" : "chats";
+      const infiniteNote =
+        chatCounts.infinite > 0
+          ? `, including ${chatCounts.infinite === 1 ? "its Infinite Session" : `${chatCounts.infinite} Infinite Sessions`}`
+          : "";
+      const keptNote =
+        chatCounts.keptLocked > 0
+          ? `${chatCounts.keptLocked} locked ${chatCounts.keptLocked === 1 ? "chat is" : "chats are"} kept; unlock ${chatCounts.keptLocked === 1 ? "it" : "them"} first to delete ${chatCounts.keptLocked === 1 ? "it" : "them"} too.`
+          : undefined;
+      const result = await confirmDialogWithCheckbox({
+        title: `Delete ${label}?`,
+        description,
+        checkbox: {
+          label: `Also delete its ${chatCounts.deletable} ${chatWord}${infiniteNote}`,
+          note: keptNote,
+          checked: chatCounts.deletable > 0,
+        },
+        confirmLabel,
+        tone: "destructive",
+      });
+      confirmed = result.confirmed;
+      deleteChats = result.checked && chatCounts.deletable > 0;
+    } else {
+      confirmed = await confirmDialog({
+        title: `Delete ${label}?`,
+        description: chatCounts
+          ? [...description, "It has no chats of its own."]
+          : description,
+        confirmLabel,
+        tone: "destructive",
+      });
+    }
     if (!confirmed) {
       return;
     }
@@ -3167,9 +3242,12 @@ import {
     agentDeleteError = null;
 
     try {
-      const response = await fetch(`/api/agents/${selectedAgentId}`, {
-        method: "DELETE",
-      });
+      const response = await fetch(
+        `/api/agents/${selectedAgentId}${deleteChats ? "?chats=1" : ""}`,
+        {
+          method: "DELETE",
+        },
+      );
       if (!response.ok) {
         const message = await extractError(
           response,
@@ -3177,8 +3255,16 @@ import {
         );
         throw new Error(message);
       }
+      const payload = (await response.json().catch(() => null)) as {
+        chats?: { deleted: number; keptLocked: number } | null;
+      } | null;
+      const deletedChats = payload?.chats?.deleted ?? 0;
 
-      toast.success(`Primary Agent "${label}" deleted`);
+      toast.success(
+        deletedChats > 0
+          ? `Primary Agent "${label}" deleted with ${deletedChats} ${deletedChats === 1 ? "chat" : "chats"}`
+          : `Primary Agent "${label}" deleted`,
+      );
       untrack(() => {
         selectedEntity = null;
         selectedAgentId = null;
@@ -4673,6 +4759,12 @@ import {
     wake_enabled: true,
     wake_timeout_minutes: null,
     wake_target: DEFAULT_WAKE_TARGET,
+    jev_juice_skill_tool_hints: false,
+    jev_juice_judge_tool: false,
+    jev_juice_memory_rerank: false,
+    jev_juice_memory_recall: false,
+    jev_juice_reply_check: false,
+    jev_juice_style_coach: false,
       webhook_url: "",
       agent_url: "",
       default_project_id: null,
@@ -4724,6 +4816,12 @@ import {
     dms_enabled: resolveAgentDmsEnabled(agent),
     dm_sender_scope: resolveDmSenderPolicy(agent).scope,
     dm_sender_agent_ids: resolveDmSenderPolicy(agent).agentIds,
+    jev_juice_skill_tool_hints: resolveAgentJevSkillToolHintsEnabled(agent),
+    jev_juice_judge_tool: resolveAgentJevJudgeToolEnabled(agent),
+    jev_juice_memory_rerank: resolveAgentJevMemoryRerankEnabled(agent),
+    jev_juice_memory_recall: resolveAgentJevMemoryRecallEnabled(agent),
+    jev_juice_reply_check: resolveAgentJevReplyCheckEnabled(agent),
+    jev_juice_style_coach: resolveAgentJevStyleCoachEnabled(agent),
     wake_enabled: resolveAgentWakeEnabled(agent),
     wake_timeout_minutes: (() => {
       const validation = validateWakeTimeoutMinutes(
@@ -6219,6 +6317,12 @@ import {
       memory_settings: buildAgentMemoryRecordFields(form.memory_settings),
       workers_enabled: form.workers_enabled,
       dms_enabled: form.dms_enabled,
+      jev_juice_skill_tool_hints: form.jev_juice_skill_tool_hints,
+      jev_juice_judge_tool: form.jev_juice_judge_tool,
+      jev_juice_memory_rerank: form.jev_juice_memory_rerank,
+      jev_juice_memory_recall: form.jev_juice_memory_recall,
+      jev_juice_reply_check: form.jev_juice_reply_check,
+      jev_juice_style_coach: form.jev_juice_style_coach,
       dm_senders: form.dm_sender_scope,
       dm_sender_agent_ids: form.dm_sender_agent_ids,
       wake_enabled: form.wake_enabled,
@@ -6371,6 +6475,12 @@ import {
       ...buildAgentMemoryRecordFields(form.memory_settings),
       workers_enabled: form.workers_enabled,
       dms_enabled: form.dms_enabled,
+      jev_juice_skill_tool_hints: form.jev_juice_skill_tool_hints,
+      jev_juice_judge_tool: form.jev_juice_judge_tool,
+      jev_juice_memory_rerank: form.jev_juice_memory_rerank,
+      jev_juice_memory_recall: form.jev_juice_memory_recall,
+      jev_juice_reply_check: form.jev_juice_reply_check,
+      jev_juice_style_coach: form.jev_juice_style_coach,
       dm_senders: form.dm_sender_scope,
       // Stored beside the scope rather than inside it, so an agent that switches back to
       // "Any agent" and then to "Only chosen agents" keeps the list it had.
@@ -7126,7 +7236,7 @@ import {
     return {
       permissionMode: "chat",
       includeProjectInstructions: true,
-      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? "gpt-5",
+      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? "gpt-6-astra",
       reasoningEffort: "default",
       serviceTier: "standard",
       streamingEffect: true,
@@ -7190,7 +7300,7 @@ import {
   ): CodexApproval {
     if (scope === "subagent") return "never";
     if (permissionMode !== "agent") return "never";
-    return sharedToolApprovalMode === "all" ? "on-failure" : "never";
+    return sharedToolApprovalMode === "all" ? "on-request" : "never";
   }
 
   function getPrimaryApprovalPolicyLabel(mode: "off" | "all") {
@@ -8467,6 +8577,28 @@ import {
                             (basicForm = { ...basicForm, wake_target: target })}
                         />
 
+                        <AgentJevJuiceSettingsCard
+                          skillToolHintsEnabled={basicForm.jev_juice_skill_tool_hints}
+                          judgeToolEnabled={basicForm.jev_juice_judge_tool}
+                          memoryRerankEnabled={basicForm.jev_juice_memory_rerank}
+                          memoryRecallEnabled={basicForm.jev_juice_memory_recall}
+                          replyCheckEnabled={basicForm.jev_juice_reply_check}
+                          styleCoachEnabled={basicForm.jev_juice_style_coach}
+                          memoryEnabled={basicForm.memory_settings?.enabled === true}
+                          onSkillToolHintsEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_skill_tool_hints: enabled })}
+                          onJudgeToolEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_judge_tool: enabled })}
+                          onMemoryRerankEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_memory_rerank: enabled })}
+                          onMemoryRecallEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_memory_recall: enabled })}
+                          onReplyCheckEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_reply_check: enabled })}
+                          onStyleCoachEnabledChange={(enabled) =>
+                            (basicForm = { ...basicForm, jev_juice_style_coach: enabled })}
+                        />
+
                       </div>
                     </div>
 
@@ -8871,6 +9003,10 @@ import {
                           {#if selectedSandboxStatus?.reason}
                             <p class="batshit-settings-form-help is-danger">{selectedSandboxStatus.reason}</p>
                           {/if}
+                        {:else if selectedSandboxBackend === "apple_container" && selectedSandboxStatus?.systemRunning === false}
+                          <p class="batshit-settings-form-help">
+                            Apple Container is not started yet. Batshit starts it with the first sandboxed command.
+                          </p>
                         {:else if selectedSandboxBackend === "local" && isDockerNativeRuntime()}
                           <p class="batshit-settings-form-help">
                             Bash commands will run inside the Batshit app container with access to the mounted workspace.
@@ -14696,6 +14832,10 @@ import {
                           {#if subagentSelectedSandboxStatus?.reason}
                             <p class="batshit-settings-form-help is-danger">{subagentSelectedSandboxStatus.reason}</p>
                           {/if}
+                        {:else if subagentSelectedSandboxBackend === "apple_container" && subagentSelectedSandboxStatus?.systemRunning === false}
+                          <p class="batshit-settings-form-help">
+                            Apple Container is not started yet. Batshit starts it with the first sandboxed command.
+                          </p>
                         {:else if subagentSelectedSandboxBackend === "local" && isDockerNativeRuntime()}
                           <p class="batshit-settings-form-help">
                             Bash commands will run inside the Batshit app container with access to the mounted workspace.

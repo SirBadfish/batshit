@@ -1,5 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
+import { isSessionDeleting } from '$lib/server/services/streamAbortRegistry'
 import { generateMessageId } from '$lib/utils/messageId'
 
 // POST /api/messages - Create a new message
@@ -10,7 +11,15 @@ export const POST: RequestHandler = async ({ request, locals }) => {
   
   try {
     const messageData = await request.json()
-    
+
+    // A chat being deleted takes no more messages. Its delete stopped the reply, so that reply's
+    // `end` reaches every tab showing the chat, and each tab saves the finished reply here, while
+    // the delete waits and sweeps. A save that landed during the sweep would put the message and
+    // its list entry back after the sweep passed them (`sessionDeleteTurnStop.ts`, 2026-09-18).
+    if (isSessionDeleting(messageData.session_id)) {
+      return json({ error: 'Session not found' }, { status: 404 })
+    }
+
     // Verify session belongs to user
     const session = await redis.get(`session:${messageData.session_id}`)
     if (!session) {

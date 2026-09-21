@@ -15,6 +15,9 @@ const { Server } = require(path.join(sdkRoot, 'server', 'index.js'))
 const { StdioServerTransport } = require(path.join(sdkRoot, 'server', 'stdio.js'))
 const { CallToolRequestSchema, ListToolsRequestSchema } = require(path.join(sdkRoot, 'types.js'))
 const { createClient } = require('redis')
+// F-P7-10: one shutdown rule for every stdio bridge. This one holds an open Redis socket,
+// so without it the process outlives its parent CLI forever as a PID-1 orphan.
+const { installStdioLifecycle } = require(path.join(__dirname, 'lib', 'mcp-stdio-lifecycle.cjs'))
 
 const APPROVAL_TOOL_NAME = 'batshit_permission_prompt'
 const APPROVAL_TOOL_FULL_NAME =
@@ -394,6 +397,15 @@ async function main() {
 
   const transport = new StdioServerTransport()
   await server.connect(transport)
+
+  // AFTER connect: the transport's `data` listener is what puts stdin into flowing mode, and
+  // a paused stream never emits `end`.
+  installStdioLifecycle({
+    logPrefix: '[claude-approval-mcp]',
+    onShutdown: async () => {
+      if (redis.isOpen) await redis.quit()
+    }
+  })
 }
 
 main().catch((error) => {

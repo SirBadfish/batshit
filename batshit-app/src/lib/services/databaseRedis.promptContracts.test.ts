@@ -450,6 +450,28 @@ describe('DatabaseService prompt and DCM contract helpers', () => {
     expect(block).not.toContain('batshit_server_upload_single')
   })
 
+  it('states the enforced Plan-mode read-only boundary in dynamic context', async () => {
+    const service = new DatabaseService()
+
+    const block = await (service as any).buildDynamicInfoBlock({
+      agentRecord: {
+        id: 'api-plan-agent',
+        primary_agent_type: 'api',
+        provider_specific_settings: {
+          nativeTools: {
+            bashEnabled: true,
+            bashAccessMode: 'plan'
+          }
+        }
+      },
+      agentId: 'api-plan-agent'
+    })
+
+    expect(block).toContain('native_bash: enabled | mode=plan')
+    expect(block).toContain('proven read/search + .md edits only')
+    expect(block).toContain('hidden side effects and executor/writer pipeline stages blocked')
+  })
+
   it('does not use global fetch when server prompt compilation has no event.fetch', async () => {
     redisMock.sMembers.mockResolvedValue([])
     redisMock.get.mockResolvedValue(null)

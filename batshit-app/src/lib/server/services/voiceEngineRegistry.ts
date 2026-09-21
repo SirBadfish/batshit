@@ -13,10 +13,18 @@ import {
   isUserFacingApiKeyService,
   normalizeApiKeyServiceName
 } from '$lib/services/apiKey.server'
+import { syncLocalRuntimeStopPreference } from '$lib/server/services/voiceRuntimeStopPreference'
+import {
+  pruneLocalRuntimeLaunchRecords,
+  stopDeletedEngineRuntimes
+} from '$lib/server/services/voiceRuntimeLaunchRecords'
+import { logger } from '$lib/utils/logger'
+import { hostOperatorCanStopVoiceRuntimes } from '$lib/server/services/voiceHostOperatorRuntime'
 import {
   normalizeAgentVoiceProfile,
   normalizeVoiceSettings,
-  normalizeVoiceProviderId
+  normalizeVoiceProviderId,
+  shouldStopVoiceRuntimeOnShutdown
 } from '$lib/utils/voiceSchema'
 import type {
   LocalVoiceEngineInstallOwnership,
@@ -32,6 +40,7 @@ import type {
   VoiceEngineRecord,
   VoiceEngineRuntimeCompatibility,
   VoiceEngineRuntimeStartupConfig,
+  VoiceEngineStopUnavailableReason,
   VoiceEngineSuiteConfig,
   VoiceEngineSuiteRole,
   VoiceEngineVoiceSurface,
@@ -230,7 +239,8 @@ const voiceEngineLaunchSchema = z
 
 const voiceEngineRuntimeStartupSchema = z
   .object({
-    autoStartOnLaunch: z.boolean().optional()
+    autoStartOnLaunch: z.boolean().optional(),
+    stopOnShutdown: z.boolean().optional()
   })
   .strict()
 
@@ -673,6 +683,10 @@ function mergeRuntimeStartup(
     next.autoStartOnLaunch = source.autoStartOnLaunch
   }
 
+  if (typeof source.stopOnShutdown === 'boolean') {
+    next.stopOnShutdown = source.stopOnShutdown
+  }
+
   return Object.keys(next).length > 0 ? next : existing
 }
 
@@ -1010,6 +1024,16 @@ async function writeVoiceEngineRegistryStore(
   await redis.execute(async (client) => {
     await client.json.set(key, '$', store as any)
   })
+  // The engine list just changed (a delete, a base URL or recipe change, from any writer), so
+  // bring this registry's launch records in line: an attach record must never outlive its
+  // engine, or its "keep running" would hold a shared runtime up with no switch left to change
+  // it. Batshit is one user per instance, so this user's engines are the registry's engines.
+  // Docker keeps no local records (the host operator does, and tidies its own at shutdown).
+  if (!isContainerizedRuntime()) {
+    await pruneLocalRuntimeLaunchRecords(store.records).catch((error) =>
+      logger.warn('[voice-runtime] could not tidy launch records after a registry change', { error })
+    )
+  }
 }
 
 function mergeVoiceEnginePayload(
@@ -1344,9 +1368,51 @@ function mergeVoiceEnginePayload(
   return voiceEngineRecordSchema.parse(next)
 }
 
+function isContainerizedRuntime(): boolean {
+  return process.env.BATSHIT_CONTAINERIZED === '1' || process.env.BATSHIT_RUNTIME_ENV === 'docker'
+}
+
+/** What `resolveStopOnShutdownAvailability` needs to know about this runtime. */
+export type StopOnShutdownContext = {
+  /** Docker only: the host operator records what it starts and can stop it (revision 5+). */
+  hostOperatorCanStop?: boolean
+}
+
+/**
+ * Can Batshit honestly offer "Stop with Batshit" for this engine?
+ *
+ * Only for a process Batshit itself launches, and only in a runtime where it
+ * can reach that process afterwards. A `Connect Existing` engine has no launch
+ * recipe, so Batshit never started it and must not claim it can stop it. In
+ * Docker the host runtime add-on operator starts host engines, and only an
+ * operator that records them and publishes `/v1/voice-engines/stop` (protocol
+ * revision 5) can stop them; with no operator, an older one, or one on Windows
+ * the container cannot reach them — saying so is the whole point, rather than
+ * showing a switch that silently does nothing.
+ */
+export function resolveStopOnShutdownAvailability(
+  engine: { localRuntime?: VoiceEngineLocalRuntimeConfig },
+  context: StopOnShutdownContext = {}
+): { canStop: boolean; reason?: VoiceEngineStopUnavailableReason } {
+  if (!engine.localRuntime?.launch?.command?.trim()) {
+    return { canStop: false, reason: 'no-launch-recipe' }
+  }
+  if (isContainerizedRuntime() && context.hostOperatorCanStop !== true) {
+    return { canStop: false, reason: 'docker' }
+  }
+  return { canStop: true }
+}
+
+/** Asks the host operator only in Docker; the answer is cached for 30 s. */
+async function resolveStopOnShutdownContext(): Promise<StopOnShutdownContext> {
+  if (!isContainerizedRuntime()) return {}
+  return { hostOperatorCanStop: await hostOperatorCanStopVoiceRuntimes() }
+}
+
 function sanitizeVoiceEngineForClient(
   engine: VoiceEngineRecord,
-  allRecords: VoiceEngineRecord[]
+  allRecords: VoiceEngineRecord[],
+  stopContext: StopOnShutdownContext = {}
 ): VoiceEngineClientSummary {
   const suiteId = getVoiceEngineSuiteId(engine)
   const suiteMembers = allRecords.filter((record) => getVoiceEngineSuiteId(record) === suiteId)
@@ -1357,10 +1423,13 @@ function sanitizeVoiceEngineForClient(
   const supportsClone =
     engine.supportsClone === true || suiteMembers.some((record) => record.supportsClone === true)
 
+  const stopAvailability = resolveStopOnShutdownAvailability(engine, stopContext)
   const localRuntime: VoiceEngineLocalRuntimeSummary | undefined = engine.localRuntime
     ? {
         installOwnership: engine.localRuntime.installOwnership,
-        startup: engine.localRuntime.startup
+        startup: engine.localRuntime.startup,
+        canStopOnShutdown: stopAvailability.canStop,
+        stopOnShutdownUnavailableReason: stopAvailability.reason
       }
     : undefined
 
@@ -1444,9 +1513,10 @@ export async function listVoiceEngineRecords(userId: string): Promise<VoiceEngin
 
 export async function listVoiceEngineSummaries(userId: string): Promise<VoiceEngineClientSummary[]> {
   const records = await listVoiceEngineRecords(userId)
+  const stopContext = await resolveStopOnShutdownContext()
   return records
     .filter((record) => !isVoiceEngineHidden(record))
-    .map((record) => sanitizeVoiceEngineForClient(record, records))
+    .map((record) => sanitizeVoiceEngineForClient(record, records, stopContext))
 }
 
 export async function getVoiceEngineRecord(
@@ -1480,7 +1550,9 @@ export async function getVoiceEngineSummaryByProviderId(
   }
   const engineId = normalizedProvider.replace(/^byo:/, '')
   const record = records.find((entry) => entry.id === engineId) ?? null
-  return record ? sanitizeVoiceEngineForClient(record, records) : null
+  return record
+    ? sanitizeVoiceEngineForClient(record, records, await resolveStopOnShutdownContext())
+    : null
 }
 
 export async function upsertVoiceEngineRecord(
@@ -1511,7 +1583,11 @@ export async function upsertVoiceEngineRecord(
   return {
     created: existingIndex < 0,
     record: merged,
-    summary: sanitizeVoiceEngineForClient(merged, nextStore.records)
+    summary: sanitizeVoiceEngineForClient(
+      merged,
+      nextStore.records,
+      await resolveStopOnShutdownContext()
+    )
   }
 }
 
@@ -1530,6 +1606,7 @@ export async function applyVoiceEnginePublicUpdates(
 ): Promise<VoiceEngineClientSummary[]> {
   const store = await loadRegistry(userId)
   const recordsById = new Map(store.records.map((record) => [record.id, record]))
+  const touchedEngineIds = new Set<string>()
 
   for (const update of updates) {
     const engineId = normalizeVoiceEngineId(update.id)
@@ -1548,6 +1625,7 @@ export async function applyVoiceEnginePublicUpdates(
     }
 
     recordsById.set(engineId, merged)
+    touchedEngineIds.add(engineId)
   }
 
   const nextStore: VoiceEngineRegistryStore = {
@@ -1556,9 +1634,26 @@ export async function applyVoiceEnginePublicUpdates(
   }
   await writeVoiceEngineRegistryStore(userId, nextStore)
 
+  // The shutdown hooks read the on-disk launch record, never Redis, so the new
+  // choice has to reach that file now. Saving is not the moment the engine
+  // restarts, and a quit a second later must honor what the user just chose.
+  // An engine that uses a runtime another engine's launch started records its
+  // choice beside that launch (found by its base URL), so the shared runtime
+  // stops only if every engine that uses it says stop.
+  for (const engineId of touchedEngineIds) {
+    const record = recordsById.get(engineId)
+    if (!record?.localRuntime?.launch?.command) continue
+    await syncLocalRuntimeStopPreference(
+      engineId,
+      shouldStopVoiceRuntimeOnShutdown(record.localRuntime.startup),
+      { endpoint: record.baseUrl }
+    )
+  }
+
+  const stopContext = await resolveStopOnShutdownContext()
   return nextStore.records
     .filter((record) => !isVoiceEngineHidden(record))
-    .map((record) => sanitizeVoiceEngineForClient(record, nextStore.records))
+    .map((record) => sanitizeVoiceEngineForClient(record, nextStore.records, stopContext))
 }
 
 export type DeleteVoiceEngineRecordOptions = {
@@ -1614,6 +1709,7 @@ async function deleteManagedLocalVoiceEngineFiles(
 ): Promise<VoiceEngineLocalFileCleanupResult> {
   const result = createLocalFileCleanupResult(requested)
   if (!requested) return result
+  const deletingEngineIds = new Set(records.map((record) => record.id))
 
   for (const record of records) {
     if (record.localRuntime?.installOwnership !== 'batshit-managed') {
@@ -1646,6 +1742,21 @@ async function deleteManagedLocalVoiceEngineFiles(
         result.skipped.push({
           engineId: record.id,
           reason: 'Saved install root is outside the Batshit-managed installs root.'
+        })
+        continue
+      }
+
+      // Stop what the engine's own launches still run before its files and launch records go,
+      // or it would run on from a deleted folder with nothing left that could ever stop it. A
+      // runtime another engine still uses keeps running (that engine's record names it). If a
+      // process could not be checked or stopped, keep the files and the record, and say so.
+      const runtime = await stopDeletedEngineRuntimes(record.id, deletingEngineIds)
+      if (runtime.notStopped.length > 0) {
+        result.errors.push({
+          engineId: record.id,
+          message: `"${record.name}" is still running and could not be stopped (${runtime.notStopped
+            .map((entry) => entry.reason)
+            .join('; ')}), so its local files and launch record were kept.`
         })
         continue
       }

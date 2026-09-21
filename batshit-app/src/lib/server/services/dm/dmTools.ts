@@ -73,11 +73,19 @@ import {
   listInbox,
   selectExpiredAssignmentsNeedingResult,
   setDmCallbackStatus,
-  stampDmDelivery
+  stampDmDelivery,
+  stampDmScreen
 } from './dmStore'
 import { hasPendingToolApproval } from './pendingToolApproval'
 import { deliverWakeCallback, isAllowedCallbackUrl } from './wakeCallback'
 import type { WakeHookRecord } from '$lib/types/wakeHook'
+import type { UntrustedTextScreen } from '$lib/types/typesafe'
+import { attachTypesafeRecordToActiveStream } from '$lib/server/services/typesafe/typesafeRunEvidence'
+import {
+  buildUntrustedTextAdvisory,
+  screenUntrustedText,
+  type UntrustedTextAdvisory
+} from '$lib/server/services/untrustedText.jev'
 
 export interface DmToolContext {
   userId: string
@@ -342,6 +350,73 @@ async function resolveRecipientState(
 }
 
 /* ------------------------------------------------------------------ *
+ * SA-120 P7 — the Jev Juice incoming-text screen
+ * ------------------------------------------------------------------ */
+
+/**
+ * Show a DM's subject and body to Jev ONCE, as it arrives, and store the answer on the DM.
+ *
+ * Every door that writes another party's words into an inbox calls this right after the record
+ * exists and BEFORE it is delivered: `sys.dm.send` (a broadcast screens its shared text once),
+ * the `result` a close creates, and the wake-up webhook. So by the time a wake starts a turn, a
+ * steer lands, or the drawer lists the row, the answer is already there and no reader ever
+ * makes a second call. Two kinds of text are NOT screened: a schedule's message, which the
+ * user wrote, and the fixed "expired unclaimed" report, which Batshit wrote.
+ *
+ * With **Screen Incoming Text** (on the Jev Juice card) off this returns `null` having read one config
+ * record and nothing else: no call, no stamp, a DM record byte-identical to today's.
+ *
+ * ADVISORY ONLY (DL-120-12). The return value is for evidence and for the badge. No caller may
+ * use it to refuse, delay, downgrade, or reroute a delivery, and none does: every caller goes
+ * on to deliver exactly as it would have. It never throws, because a screen that could fail a
+ * send would be a block by another name.
+ *
+ * `evidenceSessionId` is the chat whose running turn made the call (the sender's), so the
+ * Execution Viewer row lands on that reply. A webhook has no such turn: its row waits on the
+ * DM and is replayed into the turn the webhook wakes (`buildUntrustedTextTurn`).
+ */
+export async function screenIncomingDms(
+  records: DmRecord[],
+  options: { evidenceSessionId?: string | null } = {}
+): Promise<UntrustedTextScreen | null> {
+  const first = records[0]
+  if (!first || first.from.kind === 'schedule') return null
+  try {
+    const screen = await screenUntrustedText({
+      userId: first.userId,
+      source: first.from.kind === 'webhook' ? 'webhook' : 'agent_dm',
+      subject: first.subject,
+      text: first.body
+    })
+    if (!screen) return null
+    for (const record of records) await stampDmScreen(record.id, screen)
+    if (options.evidenceSessionId) {
+      await attachTypesafeRecordToActiveStream(
+        options.evidenceSessionId,
+        screen.record,
+        'the incoming-text screen (an agent DM)'
+      )
+    }
+    return screen
+  } catch (error) {
+    console.warn('[Jev Juice] Could not screen or stamp an incoming DM; it is delivered unscreened:', error)
+    return null
+  }
+}
+
+/**
+ * What the agent that READS a DM is told about its screen: the advisory field, and only for a
+ * flag. The stored `screen` (evidence, numbers, the skipped reason) is for the user's surfaces,
+ * so it never rides inside the record an agent is handed, and `no_flag` is never told at all.
+ */
+function forAgentReader<T extends { screen?: UntrustedTextScreen }>(
+  record: T
+): { dm: Omit<T, 'screen'>; advisory: UntrustedTextAdvisory | null } {
+  const { screen, ...dm } = record
+  return { dm, advisory: buildUntrustedTextAdvisory(screen) }
+}
+
+/* ------------------------------------------------------------------ *
  * send
  * ------------------------------------------------------------------ */
 
@@ -458,6 +533,10 @@ export async function sendDmOp(
       senderSessionId: context.sessionId ?? null
     })
   )
+
+  // SA-120 P7: screened once, here, before any delivery reads it. Advisory only: whatever it
+  // says, the DM is delivered exactly as asked.
+  await screenIncomingDms([record], { evidenceSessionId: context.sessionId })
 
   const recipientState = await resolveRecipientState(context.userId, recipient.id)
 
@@ -692,6 +771,7 @@ async function broadcastDmOp(
 
   const delivered: BroadcastDmDelivery[] = []
   const skipped: BroadcastDmResult['skipped'] = []
+  const createdRecords: DmRecord[] = []
   let expiresAt = ''
 
   for (const candidate of agents) {
@@ -724,6 +804,7 @@ async function broadcastDmOp(
         messageId
       })
       expiresAt = created.expiresAt
+      createdRecords.push(created)
       delivered.push({
         dm_id: created.id,
         to: record.id,
@@ -747,6 +828,9 @@ async function broadcastDmOp(
       'Use sys.dm.agents to see who can receive DMs.'
     )
   }
+
+  // SA-120 P7: one note, one text, one call; every recipient's copy carries the same answer.
+  await screenIncomingDms(createdRecords, { evidenceSessionId: context.sessionId })
 
   return { broadcast: true, message_id: messageId, delivered, skipped, expires_at: expiresAt }
 }
@@ -920,7 +1004,7 @@ export async function listDmsOp(
 export async function readDmOp(
   context: DmToolContext,
   input: { dm_id: string }
-): Promise<{ dm: DmRecord }> {
+): Promise<{ dm: Omit<DmRecord, 'screen'>; jev_juice_screen?: UntrustedTextAdvisory }> {
   await requireDmEnabledAgent(context.userId, context.agentId)
   const record = await runStore(async () => {
     const found = await getDm(input.dm_id)
@@ -935,13 +1019,15 @@ export async function readDmOp(
       ? acknowledgeInfoDm(input.dm_id, context.agentId)
       : found
   })
-  return { dm: record }
+  // SA-120 P7: the reader is told about a flag in the same result that hands it the body.
+  const { dm, advisory } = forAgentReader(record)
+  return { dm, ...(advisory ? { jev_juice_screen: advisory } : {}) }
 }
 
 export async function claimDmOp(
   context: DmToolContext,
   input: { dm_id: string }
-): Promise<{ dm: DmSummary }> {
+): Promise<{ dm: DmSummary; jev_juice_screen?: UntrustedTextAdvisory }> {
   await requireDmEnabledAgent(context.userId, context.agentId)
   const record = await runStore(() =>
     claimDm({
@@ -950,7 +1036,10 @@ export async function claimDmOp(
       sessionId: context.sessionId ?? null
     })
   )
-  return { dm: toDmSummary(record) }
+  // SA-120 P7: a claim is "I will act on this", and a woken agent claims without reading (the
+  // body was its first message), so a flag is said here too. The claim itself is never refused.
+  const { advisory } = forAgentReader(record)
+  return { dm: toDmSummary(record), ...(advisory ? { jev_juice_screen: advisory } : {}) }
 }
 
 export async function closeDmOp(
@@ -1055,6 +1144,9 @@ async function reportBack(
   }
 
   await linkResultDm(record.id, resultRecord.id)
+
+  // SA-120 P7: a result's text is another agent's words too, and it can wake the asker's chat.
+  await screenIncomingDms([resultRecord], { evidenceSessionId: context.sessionId })
 
   let deliveredAs: 'wait' | 'wake' = 'wait'
   if (deliver === 'wake') {
@@ -1233,6 +1325,11 @@ export async function deliverWebhookDm(options: {
   )
 
   const agent = { id: recipient.id, name: agentDisplayName(recipient) }
+
+  // SA-120 P7: a webhook message is a program's words, screened at receipt. No turn is running
+  // here, so the call's Execution Viewer row waits on the DM and is replayed into the turn this
+  // wakes. The caller's answer says nothing about it: a hook holder learns only what it sent.
+  await screenIncomingDms([record])
 
   if (deliver !== 'wake') {
     return {

@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { apiKeyService } from '$lib/services/apiKey.server';
+import { apiKeyService, normalizeApiKeyServiceName } from '$lib/services/apiKey.server';
+import { testTypesafeKey } from '$lib/server/services/typesafe/typesafeKeyTest';
 
 // POST: Test/validate an API key
 export const POST: RequestHandler = async ({ request, locals }) => {
@@ -37,6 +38,19 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         success: false,
         error: validationResult.error || 'Invalid API key format'
       }, { status: 400 });
+    }
+
+    // SA-120 (Josh, 2026-09-17): the TypeSafe key is the one key Batshit really tests, with one
+    // fixed sample question to Jev, so the API Keys row's Test button proves the key works. It
+    // lives HERE, in the route, and not in apiKeyService: the key service is reachable from the
+    // Fabric risk gate's modules, and those must never be able to reach the Jev client
+    // (DL-120-12, `jevNeverApproves.pinning.test.ts`).
+    if (normalizeApiKeyServiceName(service) === 'typesafe') {
+      const jev = await testTypesafeKey(apiKey.trim());
+      if (!jev.ok) {
+        return json({ success: false, error: jev.error }, { status: 400 });
+      }
+      return json({ success: true, formatValid: true, verified: true, message: jev.message });
     }
 
     const testResult = await apiKeyService.testApiKey(service, apiKey);

@@ -66,11 +66,13 @@ import { ensureMemoryIndexes, setMemoryConfig } from '../memoryIndex'
 import { createMemory, getMemory, supersedeMemory, type CreateMemoryInput } from '../memoryStore'
 import { getMemoryLingerState, queuePendingMemoryRecalls } from '../memoryLinger'
 import {
+  MEMORY_INFERRED_RECALL_NOTE,
   blendMemoryRanking,
   commitMemoryTurnState,
   computeMemoryCompileContext,
   formatInteractionGap,
-  messageMatchesTriggerTerm
+  messageMatchesTriggerTerm,
+  type MemoryInferredRecallRequest
 } from '../memoryRecall'
 import { searchMemoriesOp } from '../memoryTools'
 import { redis } from '$lib/server/redis'
@@ -609,6 +611,190 @@ describe.runIf(memorySearchLaneActive())('memory recall engine (dedicated Redis 
         currentUserMessage: 'anything'
       })
       expect(result.committed).toBe(false)
+    })
+  })
+
+  describe('SA-120 P4b: inferred recalls from the route-owned Jev Juice provider', () => {
+    it('compiles byte-identically without a provider, and with one that brings nothing in', async () => {
+      await seedMemory({ lane: 'stm', content: 'Maggie is an Irish Setter', trigger_terms: ['maggie'] })
+      await seedMemory({ content: 'A long-term fact nobody asked for' })
+      const plain = await computeMemoryCompileContext(compileArgs('how is maggie today'))
+      const asked: MemoryInferredRecallRequest[] = []
+      const withEmptyProvider = await computeMemoryCompileContext({
+        ...compileArgs('how is maggie today'),
+        inferredRecallProvider: async (request) => {
+          asked.push(request)
+          return []
+        }
+      })
+      expect(asked).toHaveLength(1)
+      expect(withEmptyProvider.dcmLines).toEqual(plain.dcmLines)
+      expect(JSON.stringify(withEmptyProvider.memoryContext?.inserts)).toBe(JSON.stringify(plain.memoryContext?.inserts))
+      expect(plain.dcmLines.join('\n')).not.toContain('inferred')
+    })
+
+    it('tells the provider what is already in context, and never asks on an empty message', async () => {
+      const awarenessId = await seedMemory({ lane: 'awareness', content: 'Always-on fact', importance: 9 })
+      const triggerId = await seedMemory({ lane: 'stm', content: 'Maggie is an Irish Setter', trigger_terms: ['maggie'] })
+      const pendingId = await seedMemory({ content: 'Deliberately recalled' })
+      const freeId = await seedMemory({ content: 'Nothing brought this one in' })
+      await queuePendingMemoryRecalls(SESSION, AGENT, [{ id: pendingId, kind: 'memory' }])
+
+      const asked: MemoryInferredRecallRequest[] = []
+      const provider = async (request: MemoryInferredRecallRequest) => {
+        asked.push(request)
+        return []
+      }
+      await computeMemoryCompileContext({ ...compileArgs('tell me about maggie'), inferredRecallProvider: provider })
+      expect(asked).toHaveLength(1)
+      expect(asked[0].currentUserMessage).toBe('tell me about maggie')
+      expect(asked[0].excludeIds.sort()).toEqual([awarenessId, triggerId, pendingId].sort())
+      expect(asked[0].excludeIds).not.toContain(freeId)
+
+      await computeMemoryCompileContext({ ...compileArgs('   '), inferredRecallProvider: provider })
+      expect(asked).toHaveLength(1)
+    })
+
+    it('inserts an inferred memory as a labelled Current entry and tells the agent who brought it in', async () => {
+      const memoryId = await seedMemory({ content: 'Josh is allergic to shellfish', importance: 7 })
+      const context = await computeMemoryCompileContext({
+        ...compileArgs('what snack should I bring?'),
+        inferredRecallProvider: async () => [{ id: memoryId, probability: 0.9149 }]
+      })
+      const text = context.dcmLines.join('\n')
+      expect(text).toContain('- Current (new this message):')
+      expect(text).toContain(`[recalled (inferred 0.91) | ltm | ${memoryId} | importance 7 |`)
+      expect(text).toContain('    Josh is allergic to shellfish')
+      expect(context.dcmLines).toContain(MEMORY_INFERRED_RECALL_NOTE)
+      expect(context.memoryContext?.inserts).toEqual([
+        expect.objectContaining({
+          id: memoryId,
+          source: 'recall',
+          status: 'new',
+          inferred: true,
+          inferredProbability: 0.9149
+        })
+      ])
+    })
+
+    it('re-checks every inferred id: unknown, superseded, expired, non-LTM, and already-present ones are ignored', async () => {
+      const oldId = await seedMemory({ content: 'Outdated decision' })
+      const newId = await seedMemory({ content: 'Current decision' })
+      await supersedeMemory(AGENT, newId, [oldId])
+      const expiredId = await seedMemory({ content: 'Expired fact' })
+      await patchMemoryField(expiredId, '$.expires_ts', Date.now() - 1000)
+      const stmId = await seedMemory({ lane: 'stm', content: 'A trigger memory', trigger_terms: ['zebra'] })
+      const awarenessId = await seedMemory({ lane: 'awareness', content: 'Always-on fact', importance: 9 })
+      const pendingId = await seedMemory({ content: 'Deliberately recalled' })
+      await queuePendingMemoryRecalls(SESSION, AGENT, [{ id: pendingId, kind: 'memory' }])
+
+      const context = await computeMemoryCompileContext({
+        ...compileArgs('unrelated message'),
+        inferredRecallProvider: async () =>
+          [oldId, expiredId, stmId, awarenessId, pendingId, 'mem_ghost'].map((id) => ({ id, probability: 0.99 }))
+      })
+      // Only the deliberate recall is there, and it stays a deliberate recall.
+      expect(context.memoryContext?.inserts).toHaveLength(1)
+      expect(context.memoryContext?.inserts[0]).toMatchObject({ id: pendingId, source: 'recall', status: 'new' })
+      expect(context.memoryContext?.inserts[0]).not.toHaveProperty('inferred')
+      expect(context.dcmLines).not.toContain(MEMORY_INFERRED_RECALL_NOTE)
+    })
+
+    it('ranks every explicit candidate ahead of every inferred one for the recall budget', async () => {
+      await seedAgent(AGENT, { memory_lane_budgets: { recalled: 40 } })
+      const explicitId = await seedMemory({ content: `Deliberate recall ${'word '.repeat(30)}`, importance: 1 })
+      const inferredId = await seedMemory({ content: `Inferred recall ${'word '.repeat(30)}`, importance: 10 })
+      await queuePendingMemoryRecalls(SESSION, AGENT, [{ id: explicitId, kind: 'memory' }])
+
+      const context = await computeMemoryCompileContext({
+        ...compileArgs('unrelated message'),
+        inferredRecallProvider: async () => [{ id: inferredId, probability: 0.99 }]
+      })
+      expect(context.memoryContext?.inserts.map((insert: { id: string }) => insert.id)).toEqual([explicitId])
+      expect(context.dcmLines.join('\n')).toContain('1 inferred memory was not inserted (recall budget 40 tokens)')
+    })
+
+    it('a provider that throws is logged and the turn compiles without inferred recalls', async () => {
+      await seedMemory({ lane: 'stm', content: 'Maggie is an Irish Setter', trigger_terms: ['maggie'] })
+      const plain = await computeMemoryCompileContext(compileArgs('how is maggie'))
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const context = await computeMemoryCompileContext({
+        ...compileArgs('how is maggie'),
+        inferredRecallProvider: async () => {
+          throw new Error('lane bug')
+        }
+      })
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('inferred-recall provider threw'), expect.any(Error))
+      errorSpy.mockRestore()
+      expect(context.dcmLines).toEqual(plain.dcmLines)
+    })
+
+    it('commits the same answer: normal recall linger, the inferred label held, recall-refresh on delivery', async () => {
+      const memoryId = await seedMemory({ content: 'Josh is allergic to shellfish' })
+      const inferredRecalls = [{ id: memoryId, probability: 0.91 }]
+
+      const result = await commitMemoryTurnState({
+        userId: USER,
+        agentId: AGENT,
+        sessionId: SESSION,
+        currentUserMessage: 'what snack should I bring?',
+        inferredRecalls
+      })
+      expect(result.insertedNewIds).toEqual([memoryId])
+      expect(result.items).toEqual([
+        expect.objectContaining({ id: memoryId, source: 'recall', status: 'new', inferred: true })
+      ])
+      const linger = await getMemoryLingerState(SESSION)
+      expect(linger?.lingering).toEqual([
+        expect.objectContaining({ memory_id: memoryId, source: 'recall', turns_remaining: 2, inferred: true })
+      ])
+      expect((await getMemory(AGENT, memoryId))?.recall_count).toBe(1)
+
+      // Next turn, no provider answer: the entry is held and still says who brought it in.
+      const asked: MemoryInferredRecallRequest[] = []
+      const next = await computeMemoryCompileContext({
+        ...compileArgs('and for dessert?'),
+        inferredRecallProvider: async (request) => {
+          asked.push(request)
+          return []
+        }
+      })
+      expect(asked[0].excludeIds).toContain(memoryId)
+      const text = next.dcmLines.join('\n')
+      expect(text).toContain('- Lingering (from earlier messages):')
+      expect(text).toContain(`[recalled (inferred) | ltm | ${memoryId} |`)
+      expect(text).toContain('2 turns left')
+      expect(next.dcmLines).toContain(MEMORY_INFERRED_RECALL_NOTE)
+      expect(next.memoryContext?.inserts[0]).toMatchObject({ id: memoryId, status: 'held', inferred: true })
+      expect(next.memoryContext?.inserts[0]).not.toHaveProperty('inferredProbability')
+
+      const held = await commitMemoryTurnState({
+        userId: USER,
+        agentId: AGENT,
+        sessionId: SESSION,
+        currentUserMessage: 'and for dessert?'
+      })
+      expect(held.heldIds).toEqual([memoryId])
+      expect((await getMemoryLingerState(SESSION))?.lingering?.[0]).toMatchObject({ turns_remaining: 1, inferred: true })
+    })
+
+    it('a deliberate recall of a lingering inferred memory makes it explicit', async () => {
+      const memoryId = await seedMemory({ content: 'Josh is allergic to shellfish' })
+      await commitMemoryTurnState({
+        userId: USER,
+        agentId: AGENT,
+        sessionId: SESSION,
+        currentUserMessage: 'snack?',
+        inferredRecalls: [{ id: memoryId, probability: 0.91 }]
+      })
+      await queuePendingMemoryRecalls(SESSION, AGENT, [{ id: memoryId, kind: 'memory' }])
+      const context = await computeMemoryCompileContext(compileArgs('tell me more'))
+      expect(context.dcmLines.join('\n')).toContain(`[recalled | ltm | ${memoryId} |`)
+      expect(context.dcmLines).not.toContain(MEMORY_INFERRED_RECALL_NOTE)
+      await commitMemoryTurnState({ userId: USER, agentId: AGENT, sessionId: SESSION, currentUserMessage: 'tell me more' })
+      const entry = (await getMemoryLingerState(SESSION))?.lingering?.[0]
+      expect(entry).toMatchObject({ memory_id: memoryId, source: 'recall' })
+      expect(entry).not.toHaveProperty('inferred')
     })
   })
 

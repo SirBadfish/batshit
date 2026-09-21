@@ -91,7 +91,7 @@ export function buildCodexAppServerThreadParams(
   let approvalPolicy: string | undefined = options.approvalPolicy || undefined;
   let sandbox: string | undefined = options.sandboxMode || undefined;
   if (options.permissionMode === "agent") {
-    approvalPolicy = approvalPolicy ?? "on-failure";
+    approvalPolicy = approvalPolicy ?? "on-request";
     sandbox = sandbox ?? "workspace-write";
   } else if (options.permissionMode === "agent_full") {
     approvalPolicy = "never";
@@ -350,7 +350,7 @@ export function buildCodexCliArgs(
     ? options.sandboxMode ?? "workspace-write"
     : options.sandboxMode
   const resolvedApprovalPolicy = forceAgentPermissionArgs
-    ? options.approvalPolicy ?? "on-failure"
+    ? options.approvalPolicy ?? "on-request"
     : options.approvalPolicy
 
   if (options.ignoreUserConfig) {
@@ -638,6 +638,9 @@ export class CodexBridge {
             messageId: request.messageId ?? null,
             runtime: "codex",
             delegated: request.delegatedRun === true,
+            // BL-75: a delegated run's credential names the Subagent or Worker whose skill
+            // access governs its `native_skill` loads.
+            scopeAgentId: request.scopeAgentId ?? null,
           })
         : null;
     if (!runCredential) {
@@ -681,7 +684,7 @@ export class CodexBridge {
       allowNetwork,
       approvalPolicy:
         codexSettings.permissionMode === "agent" && request.toolApprovalMode === "all"
-          ? "on-failure"
+          ? "on-request"
           : "never",
       webSearchEnabled: codexSettings.search,
       addDirectories,

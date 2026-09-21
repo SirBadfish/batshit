@@ -387,7 +387,10 @@ export class ClaudeBridge {
             sessionId: request.sessionId,
             messageId: request.messageId ?? null,
             runtime: 'claude',
-            delegated: request.delegatedRun === true
+            delegated: request.delegatedRun === true,
+            // BL-75: a delegated run's credential names the Subagent or Worker whose skill
+            // access governs its `native_skill` loads.
+            scopeAgentId: request.scopeAgentId ?? null
           })
         : null
     if (!runCredential) {
@@ -1115,10 +1118,23 @@ export class ClaudeBridge {
       input: child.stdout,
       crlfDelay: Infinity
     })
+    // Attached HERE, at spawn, not when the event iterator first runs (2026-09-18). A Stop can
+    // kill the child before anyone reads its events; by then the readline is closed, and
+    // iterating a closed readline waits forever, and `close` has already fired. Measured: Stop
+    // 0.3 s into a run, and the reply's request never ended
+    // (`_local/stopfix-proof/before-claude-stop-300.json`). Both buffer what they see.
+    const lines = rl[Symbol.asyncIterator]()
+    const childClosed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.once('close', (code, signal) => resolve({ code, signal }))
+      }
+    )
 
     let stderrBuffer = ''
     const baseEvents = this.createCliEventIterator(
       rl,
+      lines,
+      childClosed,
       child,
       () => stderrBuffer,
       options.signal,
@@ -1238,26 +1254,26 @@ export class ClaudeBridge {
    */
   private async *createCliEventIterator(
     rl: readline.Interface,
+    /** `rl`'s line iterator, made at spawn: iterating a readline created later hangs if closed. */
+    lines: AsyncIterableIterator<string>,
+    /**
+     * F-P2-2 (SA-114 review): captured from the START of the run, never registered after
+     * the loop. The loop now ends at the first `result`, and stdin is ended before that
+     * event is yielded — so the CLI can exit, and `close` can fire, while the consumer still
+     * holds the `result` and this generator is suspended at the yield. A listener added only
+     * after the loop would miss that close and the wait below would never resolve. The start
+     * of the run is the SPAWN, not this generator's first step (2026-09-18): a child killed
+     * by an early Stop closes before anyone iterates. Resolve-only on purpose: a consumer that
+     * stops pulling at `finish` never awaits this, and a rejected promise nobody awaits is an
+     * unhandled rejection.
+     */
+    childClosed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
     child: import('node:child_process').ChildProcess,
     getStderr: () => string,
     abortSignal?: AbortSignal,
     steersAwaitingEcho: Array<{ steerIds: string[]; text: string }> = []
   ): AsyncGenerator<any> {
     let killedAtResult = false
-    /**
-     * F-P2-2 (SA-114 review): captured from the START of the run, never registered after
-     * the loop. The loop now ends at the first `result`, and stdin is ended before that
-     * event is yielded — so the CLI can exit, and `close` can fire, while the consumer still
-     * holds the `result` and this generator is suspended at the yield. A listener added only
-     * after the loop would miss that close and the wait below would never resolve.
-     * Resolve-only on purpose: a consumer that stops pulling at `finish` never awaits this,
-     * and a rejected promise nobody awaits is an unhandled rejection.
-     */
-    const childClosed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-      (resolve) => {
-        child.once('close', (code, signal) => resolve({ code, signal }))
-      }
-    )
     const endStdin = () => {
       try {
         if (child.stdin && !child.stdin.destroyed && !child.stdin.writableEnded) {
@@ -1285,7 +1301,7 @@ export class ClaudeBridge {
     }
 
     try {
-      for await (const line of rl) {
+      for await (const line of lines) {
         if (!line) continue
         let parsed: any
         try {

@@ -28,7 +28,11 @@ const USER_FIXABLE_PATTERNS = [
   'no voice provider configured',
   'only available on the client',
   'too large',
-  'does not support'
+  'does not support',
+  'does not accept',
+  'must use',
+  'cannot be combined',
+  'accepts at most'
 ]
 
 function normalizeMessage(error: unknown): string {
@@ -102,6 +106,19 @@ export function classifyVoiceApiError(error: unknown, mode: VoiceApiMode): Voice
   const fallback = mode === 'tts' ? 'Failed to synthesize speech' : 'Failed to transcribe audio'
   const message = normalizeMessage(error) || fallback
   const lower = message.toLowerCase()
+  const providerStatus =
+    error && typeof error === 'object' && typeof (error as { status?: unknown }).status === 'number'
+      ? (error as { status: number }).status
+      : undefined
+
+  if (providerStatus === 429) {
+    return {
+      status: 429,
+      error: message,
+      setupHint: 'The provider rate or quota limit was reached. Check provider usage/billing, then retry after the limit resets.',
+      logLevel: 'warn'
+    }
+  }
 
   if (lower.includes('api key not configured')) {
     return {

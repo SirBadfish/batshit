@@ -16,6 +16,8 @@ import { createAnthropic } from '@ai-sdk/anthropic'
 import { logger } from '$lib/utils/logger'
 import { createOpenAI } from '@ai-sdk/openai'
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
+import { createOllama } from 'ollama-ai-provider-v2'
+import { withOllamaOptionsShim } from './ollamaOptionsShim'
 import { createGoogle } from '@ai-sdk/google'
 import { createGroq } from '@ai-sdk/groq'
 import { createMistral } from '@ai-sdk/mistral'
@@ -48,6 +50,18 @@ import {
   ZAI_CODING_PLAN_MODEL_IDS,
   ZAI_CODING_PLAN_OPENAI_BASE_URL
 } from '$lib/server/constants/zaiCodingPlan'
+import {
+  KIMI_CODE_MODEL_IDS,
+  KIMI_CODE_OPENAI_BASE_URL
+} from '$lib/server/constants/kimiCodePlan'
+import {
+  MINIMAX_TOKEN_PLAN_OPENAI_BASE_URL,
+  MINIMAX_TOKEN_PLAN_TEXT_MODEL_IDS
+} from '$lib/server/constants/minimaxTokenPlan'
+import {
+  MIMO_TOKEN_PLAN_OPENAI_BASE_URL,
+  MIMO_TOKEN_PLAN_TEXT_MODEL_IDS
+} from '$lib/server/constants/mimoTokenPlan'
 
 /**
  * Provider configuration interface
@@ -109,8 +123,11 @@ export type KnownProviderId =
   | 'xai'
   | 'deepseek'
   | 'moonshot'
+  | 'kimi_code'
   | 'minimax'
+  | 'minimax_token_plan'
   | 'mimo'
+  | 'mimo_token_plan'
   | 'qwencloud'
   | 'qwen_token_plan'
   | 'alibaba'
@@ -366,6 +383,56 @@ export class ProviderManager {
       const baseUrl = resolveLocalAiRuntimeBaseUrl(provider.baseUrl)?.replace(/\/+$/, '')
       const openaiPath = provider.openaiPath?.replace(/\/+$/, '')
       const openaiBaseUrl = baseUrl && openaiPath ? `${baseUrl}${openaiPath}` : baseUrl
+
+      // SA-125 (DL-125-01): Ollama alone speaks its NATIVE protocol.
+      //
+      // Ollama's OpenAI-compatible door accepts the smallest sampler set of any
+      // local program here and cannot set context size at all. Measured
+      // 2026-09-20 with a pinned seed: `top_k: 1` and `min_p: 0.9` on `/v1`
+      // produced output byte-identical to the baseline, while the same values on
+      // `/api/chat` changed it. Ollama accepts the unknown keys silently, which
+      // is why offering them on `/v1` would have been a lie (DL-102-15).
+      //
+      // The swap is scoped to this one program so a regression cannot reach the
+      // other seven, exactly as SA-102 scoped its own provider swap.
+      if (provider.id === 'ollama') {
+        const ollama = createOllama({
+          // The provider appends `/chat`, and its own default is
+          // `http://127.0.0.1:11434/api`.
+          baseURL: `${baseUrl ?? 'http://127.0.0.1:11434'}/api`,
+          // `strict` is the mode for a real Ollama rather than a third party
+          // pretending to be one.
+          compatibility: 'strict',
+          // DL-125-06: the provider puts the SDK's standard settings at the TOP
+          // LEVEL of the body, and Ollama does not read them there. Measured
+          // 2026-09-20 against Ollama directly: `options.temperature` 0 vs 2
+          // changed the output, while a top-level `temperature: 2` sent beside
+          // `options.temperature: 0` was byte-identical to the 0 run, and a
+          // top-level `max_output_tokens: 5` did not truncate anything.
+          // Shipping the provider unshimmed would silently break Temperature and
+          // Max Output Tokens on every Ollama preset, which is worse than the
+          // `/v1` door it replaces.
+          fetch: withOllamaOptionsShim(),
+          ...(this.localApiKeys[provider.id]
+            ? { headers: { authorization: `Bearer ${this.localApiKeys[provider.id]}` } }
+            : {})
+        })
+        this.providers.set(provider.id, {
+          client: (modelId: string) => ollama(modelId),
+          models: [],
+          features: {
+            streaming: true,
+            tools: true,
+            vision: true,
+            maxTokens: 128000
+          },
+          displayName: provider.label,
+          priority
+        })
+        logger.debug(`[ProviderManager] ${provider.label} configured (ollama native)`)
+        registeredCount++
+        return
+      }
 
       const client = createOpenAICompatible({
         // The name becomes the providerOptions key the request body is built
@@ -627,6 +694,16 @@ export class ProviderManager {
     })
 
     registerOpenAICompatibleProvider({
+      id: 'kimi_code',
+      label: 'Kimi Code Membership',
+      apiKey: this.apiKeys.kimi_code ?? env.KIMI_CODE_API_KEY,
+      baseURL: env.KIMI_CODE_API_BASE_URL || KIMI_CODE_OPENAI_BASE_URL,
+      priority: 11,
+      apiMode: 'chat',
+      models: [...KIMI_CODE_MODEL_IDS]
+    })
+
+    registerOpenAICompatibleProvider({
       id: 'minimax',
       label: 'MiniMax',
       apiKey: this.apiKeys.minimax ?? env.MINIMAX_API_KEY,
@@ -643,6 +720,16 @@ export class ProviderManager {
     })
 
     registerOpenAICompatibleProvider({
+      id: 'minimax_token_plan',
+      label: 'MiniMax Token Plan',
+      apiKey: this.apiKeys.minimax_token_plan ?? env.MINIMAX_TOKEN_PLAN_API_KEY,
+      baseURL: env.MINIMAX_TOKEN_PLAN_API_BASE_URL || MINIMAX_TOKEN_PLAN_OPENAI_BASE_URL,
+      priority: 12,
+      apiMode: 'chat',
+      models: [...MINIMAX_TOKEN_PLAN_TEXT_MODEL_IDS]
+    })
+
+    registerOpenAICompatibleProvider({
       id: 'mimo',
       label: 'MiMo',
       apiKey: this.apiKeys.mimo ?? env.MIMO_API_KEY,
@@ -650,6 +737,16 @@ export class ProviderManager {
       priority: 12,
       apiMode: 'chat',
       models: ['mimo-v2.5-pro', 'mimo-v2.5']
+    })
+
+    registerOpenAICompatibleProvider({
+      id: 'mimo_token_plan',
+      label: 'MiMo Token Plan',
+      apiKey: this.apiKeys.mimo_token_plan ?? env.MIMO_TOKEN_PLAN_API_KEY,
+      baseURL: env.MIMO_TOKEN_PLAN_API_BASE_URL || MIMO_TOKEN_PLAN_OPENAI_BASE_URL,
+      priority: 13,
+      apiMode: 'chat',
+      models: [...MIMO_TOKEN_PLAN_TEXT_MODEL_IDS]
     })
 
     registerOpenAICompatibleProvider({
@@ -1060,6 +1157,9 @@ export class ProviderManager {
       'cerebras',
       'qwencloud',
       'qwen_token_plan',
+      'kimi_code',
+      'minimax_token_plan',
+      'mimo_token_plan',
       'groq',
       'cohere',
       'fal',
@@ -1172,8 +1272,11 @@ export class ProviderManager {
       groq: 'llama-3.1-70b',
       xai: 'grok-4.3',
       moonshot: 'kimi-k2.6',
+      kimi_code: 'k3',
       minimax: 'MiniMax-M3',
+      minimax_token_plan: 'MiniMax-M3',
       mimo: 'mimo-v2.5-pro',
+      mimo_token_plan: 'mimo-v2.5-pro',
       qwen_token_plan: 'qwen3.8-max',
       alibaba: 'qwen3-max',
       stepfun: 'step-3.7-flash',
@@ -1352,8 +1455,11 @@ const PROVIDER_KEY_CONFIG = [
   { id: 'xai', envVar: 'XAI_API_KEY' },
   { id: 'deepseek', envVar: 'DEEPSEEK_API_KEY' },
   { id: 'moonshot', envVar: 'MOONSHOT_API_KEY' },
+  { id: 'kimi_code', envVar: 'KIMI_CODE_API_KEY' },
   { id: 'minimax', envVar: 'MINIMAX_API_KEY' },
+  { id: 'minimax_token_plan', envVar: 'MINIMAX_TOKEN_PLAN_API_KEY' },
   { id: 'mimo', envVar: 'MIMO_API_KEY' },
+  { id: 'mimo_token_plan', envVar: 'MIMO_TOKEN_PLAN_API_KEY' },
   { id: 'qwencloud', envVar: 'DASHSCOPE_API_KEY' },
   { id: 'qwen_token_plan', envVar: 'QWEN_TOKEN_PLAN_API_KEY' },
   { id: 'alibaba', envVar: 'ALIBABA_CLOUD_API_KEY' },

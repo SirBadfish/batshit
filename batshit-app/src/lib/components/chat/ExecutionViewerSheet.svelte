@@ -6,6 +6,12 @@
   import JSONViewer from '$lib/components/ui/JSONViewer.svelte'
   import { Badge } from '$lib/components/ui/badge'
   import { ChevronDown, RefreshCcw } from '@lucide/svelte'
+  import {
+    describeTypesafeReason,
+    readTypesafeCallRecords,
+    typesafeCallStatusLabel,
+    typesafeFeatureLabel
+  } from '$lib/utils/jevJuice'
   import { getUserSettings } from '$lib/stores/userSettings.svelte'
   import { approximateTokenCount } from '$lib/utils/tokenCounter'
   import { normalizePrimaryAgentType } from '$lib/utils/primaryAgentType'
@@ -89,6 +95,40 @@
     return policy.replace(/_/g, ' ')
   }
 
+  // SA-120 P3: `executionMetadata.groupChat.speakerSelection` exists only when a `smart`
+  // agent was a candidate for this event (the Jev Juice group lane ran or tried to).
+  const groupSpeakerSelection = $derived.by<Record<string, any> | null>(() => {
+    const selection = groupMeta?.speakerSelection
+    return selection && typeof selection === 'object' && !Array.isArray(selection) ? selection : null
+  })
+
+  const describeGroupSpeakerSelection = (selection: Record<string, any>) => {
+    const share =
+      typeof selection.probability === 'number' && Number.isFinite(selection.probability)
+        ? ` (${Math.round(selection.probability * 100)}% confidence)`
+        : ''
+    const chooser =
+      selection.by === 'jev'
+        ? `Speaker picked by Jev${share}`
+        : selection.reason === 'low_confidence'
+          ? 'Speaker picked by the usual rules (Jev was not confident)'
+          : selection.reason === 'unavailable' || selection.reason === 'error'
+            ? 'Speaker picked by the usual rules (Jev did not answer)'
+            : 'Speaker picked by the usual rules'
+    const skipped = Array.isArray(selection.skipped) ? selection.skipped : []
+    if (skipped.length === 0) return `${chooser}.`
+    const names = skipped
+      .map((entry: Record<string, any>) => {
+        const value =
+          typeof entry?.addsValue === 'number' && Number.isFinite(entry.addsValue)
+            ? ` (${Math.round(entry.addsValue * 100)}% confidence)`
+            : ''
+        return `${entry?.agentName ?? entry?.agentId ?? 'agent'}${value}`
+      })
+      .join(', ')
+    return `${chooser}. Skipped by Jev for adding little: ${names}.`
+  }
+
   type ExecutionViewerModeKind = 'vercel' | 'codex' | 'claude' | 'unknown'
   type UsageDetailEntry = {
     key: string
@@ -151,6 +191,11 @@
   )
   const responseSummary = $derived(currentSnapshot?.responseSummary ?? null)
   const delegated = $derived(currentSnapshot?.delegated ?? null)
+  // SA-120 (DL-120-07): one row per Jev call. Missing usage renders as unknown, never zero.
+  const typesafeCalls = $derived(readTypesafeCallRecords(currentSnapshot?.executionMetadata))
+  const typesafeUsageUnknownCount = $derived(
+    typesafeCalls.filter((call) => call.status === 'ok' && call.usage === null).length
+  )
   const reasoningPersistence = $derived(currentSnapshot?.reasoningPersistence ?? null)
   // SA-106: webhook input was an n8n-Primary-only snapshot surface. Old stored
   // snapshots may still carry an explicit availability record, so it is still read;
@@ -917,6 +962,7 @@
   let openCompiledMessages = $state(false)
   let openResponse = $state(false)
   let openDelegated = $state(true)
+  let openJevJuice = $state(true)
   let openRawEvents = $state(false)
   let openRawSnapshotRequest = $state(false)
   let openRawProviderResponses = $state(false)
@@ -1066,6 +1112,12 @@
                   {#if Array.isArray(groupMeta.speakTopics) && groupMeta.speakTopics.length > 0}
                     <div class="execution-viewer-helper">
                       Topics: {groupMeta.speakTopics.join(', ')}
+                    </div>
+                  {/if}
+                  {#if groupSpeakerSelection}
+                    <!-- SA-120 P3: who chose this speaker, and whom Jev Juice skipped this turn. -->
+                    <div class="execution-viewer-helper" data-testid="execution-viewer-group-speaker-selection">
+                      {describeGroupSpeakerSelection(groupSpeakerSelection)}
                     </div>
                   {/if}
                 </div>
@@ -1772,6 +1824,101 @@
           </div>
         {/if}
 
+        {#if typesafeCalls.length > 0}
+          <div class="execution-viewer-stack-lg execution-viewer-section-block">
+            <div class="execution-viewer-eyebrow">Jev Juice</div>
+
+            <Collapsible.Root bind:open={openJevJuice}>
+              <Collapsible.Trigger class="execution-viewer-section-trigger">
+                <div class="execution-viewer-section-label">
+                  <span class="execution-viewer-section-heading">Jev Juice calls</span>
+                  <span class="execution-viewer-helper">
+                    Typed judgments Batshit asked TypeSafe for during this run, and what it did with them
+                  </span>
+                </div>
+                <div class="execution-viewer-inline-row">
+                  <Badge variant="outline" class="execution-viewer-confidence-badge execution-viewer-confidence-exact">
+                    Calls: {typesafeCalls.length}
+                  </Badge>
+                  <ChevronDown class="execution-viewer-section-chevron" data-open={openJevJuice} />
+                </div>
+              </Collapsible.Trigger>
+              <Collapsible.Content class="execution-viewer-section-content">
+                <div class="execution-viewer-table-wrap">
+                  <table class="execution-viewer-table" data-testid="execution-viewer-jev-juice-table">
+                    <thead class="execution-viewer-table-head">
+                      <tr>
+                        <th class="execution-viewer-table-heading">Feature</th>
+                        <th class="execution-viewer-table-heading">Model</th>
+                        <th class="execution-viewer-table-heading">Status</th>
+                        <th class="execution-viewer-table-heading">Latency</th>
+                        <th class="execution-viewer-table-heading">Tokens (in / out)</th>
+                        <th class="execution-viewer-table-heading">Decision</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each typesafeCalls as call, index (`${call.feature}:${call.at}:${index}`)}
+                        <tr class="execution-viewer-table-row">
+                          <td class="execution-viewer-table-primary-cell">
+                            <div class="execution-viewer-value">{typesafeFeatureLabel(call.feature)}</div>
+                            <div class="execution-viewer-helper">
+                              {call.questionCount} question{call.questionCount === 1 ? '' : 's'}
+                            </div>
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            <div class="execution-viewer-value">{call.model ?? 'Unknown'}</div>
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            <Badge
+                              variant="outline"
+                              class={`execution-viewer-confidence-badge ${
+                                call.status === 'ok'
+                                  ? 'execution-viewer-tool-status-success'
+                                  : call.status === 'unavailable'
+                                    ? 'execution-viewer-tool-status-partial'
+                                    : 'execution-viewer-tool-status-error'
+                              }`}
+                            >
+                              {typesafeCallStatusLabel(call.status)}
+                            </Badge>
+                            {#if call.status !== 'ok'}
+                              <div class="execution-viewer-helper">
+                                {describeTypesafeReason(call.reason)}{call.deadlineHit ? ' Deadline hit.' : ''}
+                              </div>
+                            {/if}
+                          </td>
+                          <td class="execution-viewer-table-muted-cell">
+                            {formatDuration(call.latencyMs)}
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            {#if call.usage}
+                              {formatTokenValue(call.usage.inputTokens)} / {formatTokenValue(call.usage.outputTokens)}
+                            {:else}
+                              <span class="execution-viewer-helper">Unknown</span>
+                            {/if}
+                          </td>
+                          <td class="execution-viewer-table-cell">
+                            <div class="execution-viewer-value">{call.decision ?? '—'}</div>
+                            <!-- SA-120 P4: the lane's own body-free detail (a pre-filter timing, a vendor 422's field name, a local error). -->
+                            {#if call.detail}
+                              <div class="execution-viewer-helper" data-testid="execution-viewer-jev-juice-detail">{call.detail}</div>
+                            {/if}
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+                {#if typesafeUsageUnknownCount > 0}
+                  <div class="execution-viewer-note execution-viewer-note-sm">
+                    {typesafeUsageUnknownCount} answered {typesafeUsageUnknownCount === 1 ? 'call did' : 'calls did'} not report usage. Unknown values are not counted as zero.
+                  </div>
+                {/if}
+              </Collapsible.Content>
+            </Collapsible.Root>
+          </div>
+        {/if}
+
         <div class="execution-viewer-stack-lg execution-viewer-section-block">
           <div class="execution-viewer-eyebrow">Response</div>
 
@@ -2323,7 +2470,7 @@
     background: oklch(from var(--muted) l c h / 0.1);
     padding: 12px;
     white-space: pre-wrap;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     line-height: 1.6;
   }
 

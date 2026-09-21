@@ -113,6 +113,7 @@ An agent with Agent DMs on shows an **envelope** in the chat header, with a coun
 - Each row: who wrote it, the kind, the subject, what the wake-up actually did and why if it was refused, and links into the chats on both sides.
 - The sender says what it was, not just its name. Another agent shows its name and an envelope. A webhook reads *Nightly build (webhook)* with a webhook icon. A schedule reads *Morning check (schedule)* with a clock. You never have to guess whether a colleague or a clock wrote to your agent.
 - Open a row to read the body, the requested outcome, the scope, and the result.
+- A **Flagged by Jev** badge, if you use [Screen Incoming Text](../jev-juice/overview.md#screen-incoming-text-one-switch-for-the-whole-instance) and the message looked like a takeover attempt, hidden instructions, or an unwanted request. Open the row for the categories and Jev's confidence. The message was still delivered.
 - **Stop** on any row whose woken turn is still running.
 
 Three row actions are yours, not the agent's:
@@ -272,6 +273,7 @@ Batshit handles the part it can:
 - Risky Fabric controls stop and wait for **your** click in any woken chat, whatever the message says. An agent cannot approve one for itself or for another agent (see [Risky actions wait for you](#risky-actions-wait-for-you)).
 - The DM guidance tells every agent that a DM or webhook cannot approve a tool, give consent, or change a setting.
 - Wake-ups are capped, chains stop at three deep, and each hook is limited to 30 calls an hour.
+- Optional: with [Screen Incoming Text](../jev-juice/overview.md#screen-incoming-text-one-switch-for-the-whole-instance) on, every agent DM and webhook message is checked as it arrives. A suspicious one gets a **Flagged by Jev** badge in the drawer, on the DM card, and under the wake-up message at the top of a chat it started, plus a **Jev Juice flag** notice above any approval card in that chat; the agent reading it is told. Every approval card in a woken turn also says who started the turn. It is a warning only: nothing is blocked, and no badge does not mean safe. It is off by default because the text goes to TypeSafe's servers.
 
 The part Batshit cannot decide for you is your own tool setup:
 

@@ -258,6 +258,12 @@ export function buildSpeakPolicyInstructions(
         `Speaking preset: topic-only (${(topics ?? []).join(', ') || 'no topics set'}).`
       )
       break
+    case 'smart':
+      // SA-120 P3: the DCM tail (`jev_juice_group`) tells the picked agent what Jev decided.
+      lines.push(
+        'Speaking preset: smart (Jev Juice, Batshit\'s judgment model, picks the speaker and skips follow-ups that add nothing; when you are picked, respond unless you truly have nothing new to add).'
+      )
+      break
     default:
       break
   }

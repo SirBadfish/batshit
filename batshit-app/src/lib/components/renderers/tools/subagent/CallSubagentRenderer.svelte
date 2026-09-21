@@ -575,7 +575,7 @@
 		font-size: 0.75rem;
 		font-weight: 400;
 		text-transform: none;
-		font-family: monospace;
+		font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
 	}
 
 	.conversation-content .subagent-tool-icon {

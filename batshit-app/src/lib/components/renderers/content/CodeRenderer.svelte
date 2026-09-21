@@ -110,7 +110,7 @@
 
 <style>
   .code-block {
-    font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     border-radius: var(--radius);
     overflow: hidden;
     background-color: var(--muted);

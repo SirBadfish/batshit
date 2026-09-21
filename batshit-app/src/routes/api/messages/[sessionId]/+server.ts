@@ -20,7 +20,11 @@ export const GET: RequestHandler = async ({ params, url, locals }) => {
     }
     
     const limit = parseInt(url.searchParams.get('limit') || '100')
-    const messages = await redis.getMessages(params.sessionId!, limit)
+    // The NEWEST `limit` messages, oldest first (bug sweep, 2026-09-18). `getMessages` reads the
+    // FIRST `limit`, so a chat longer than the page's 1,000-message load showed its oldest messages,
+    // never its newest, and a send carried that history; every other caller only asks whether a
+    // chat has messages or reads its latest reply.
+    const messages = await redis.getRecentMessages(params.sessionId!, limit)
     const trustedMessages = await enrichMessagesWithTrustedZipMetadata(messages, locals.user.id)
     
     return json(trustedMessages)

@@ -72,7 +72,7 @@ The browser-facing gateway URL may still show `localhost`.
 
 The agent may not have discovered or selected it. Try:
 
-1. Refresh the MCP source.
+1. Refresh the MCP source. Batshit keeps each MCP source's tool list for up to five minutes, so a message doesn't wait on every tool server. A tool you just added on the server side shows up after **Refresh**, after you edit that source's settings, or within five minutes.
 2. Check Tool Grid visibility for that agent.
 3. Ask the agent to search for the tool by purpose, not exact internal name.
 4. Check whether the tool needs credentials.

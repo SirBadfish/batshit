@@ -55,6 +55,8 @@ When an agent tries a **Confirm** or **Restricted** action, Batshit stops it *be
 
 The card names the action, not the plumbing. It shows a badge saying **Confirm** or **Restricted**, one plain line saying what will happen, and the exact input the action will run with, folded away behind **Exact input** so you can open it when you want to check.
 
+In a chat that a DM, a webhook, or a schedule started, the card also says who started the turn ("This turn was started by a wake-up message from webhook 'Nightly build', not by you"), so it never reads like an ordinary tool request. If [Jev](../jev-juice/overview.md#screen-incoming-text-one-switch-for-the-whole-instance) flagged that message, a separate notice card sits above the approval card.
+
 **Approve** runs that one action, with that exact input, once.
 
 - On an **API** agent the paused call simply carries on — same action, same input, no second guess from the model.
@@ -65,6 +67,7 @@ The card names the action, not the plumbing. It shows a badge saying **Confirm**
 A few things worth knowing:
 
 - **One click, one action.** Approving "delete memory A" does not unlock "delete memory B", and it does not unlock the same action again tomorrow. If the agent changes anything about the input, that is a different action and you get a new card.
+- **An answered card stays answered.** If the reply fails or you press **Stop** after you approved, the card still says **Approved** and nothing runs a second time. To run the action again, ask the agent again; you get a new card.
 - **There is no "always allow", on purpose.** Every risky action asks, every time. A switch that turned the asking off would be clicked once, on a quiet afternoon, and would still be off the day it mattered.
 - **The agent cannot approve itself**, and neither can another agent, a webhook, an n8n workflow, or anything written inside a message. Your click is the only thing that counts.
 - **Nothing is cancelled while a card waits.** The turn ends normally. A card raised by an API agent expires after three minutes (ask again and you get a fresh one); a card on a Codex or Claude agent says **Waits for you** and has no clock at all.

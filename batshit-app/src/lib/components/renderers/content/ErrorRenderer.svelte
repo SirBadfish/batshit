@@ -150,7 +150,7 @@
     background: var(--error-stack-background, oklch(0% 0 0 / 0.3));
     border: 1px solid var(--error-border, oklch(40% 0.2 15));
     border-radius: calc(var(--radius) - 2px);
-    font-family: monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     font-size: 0.75rem;
     line-height: 1.4;
     color: var(--error-stack-text, oklch(80% 0.05 15));

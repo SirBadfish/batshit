@@ -35,7 +35,7 @@ export function resolveManagedInstallsRoot(): string {
   return path.resolve(os.homedir(), hiddenDir, installsDir)
 }
 
-function resolveVoiceRuntimeStateRoot(): string {
+export function resolveVoiceRuntimeStateRoot(): string {
   const configured = process.env[VOICE_RUNTIME_STATE_ROOT_ENV_VAR]
   if (typeof configured === 'string' && configured.trim().length > 0) {
     return path.resolve(expandUserHomePath(configured.trim()))

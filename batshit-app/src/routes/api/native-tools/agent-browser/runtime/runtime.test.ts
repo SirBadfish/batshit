@@ -25,12 +25,12 @@ const dockerStatus = {
   command: null,
   version: null,
   reason: 'Docker Agent Browser sidecar is not reachable: sidecar offline.',
-  installCommand: 'npm install -g agent-browser@0.24.1 && agent-browser install',
+  installCommand: 'npm install -g agent-browser@0.37.1 && agent-browser install',
   installHelp:
     'Docker Agent Browser is managed by the optional agent-browser Compose sidecar, not by downloading a binary into the core app container.',
-  testedVersion: '0.24.1',
-  packageSpec: 'agent-browser@0.24.1',
-  packageTarballUrl: 'https://registry.npmjs.org/agent-browser/-/agent-browser-0.24.1.tgz',
+  testedVersion: '0.37.1',
+  packageSpec: 'agent-browser@0.37.1',
+  packageTarballUrl: 'https://registry.npmjs.org/agent-browser/-/agent-browser-0.37.1.tgz',
   packageIntegrity: 'sha512-test',
   runtimeMatchesTestedVersion: null,
   run: null

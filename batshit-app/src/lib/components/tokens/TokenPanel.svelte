@@ -536,7 +536,7 @@
   .token-panel {
     padding: 0.25rem 1rem 0.5rem;
     margin-top: 5px;
-    background: var(--background);
+    background: var(--bs-chat-canvas);
   }
 
   :global(body.goon-immersive) .token-panel {

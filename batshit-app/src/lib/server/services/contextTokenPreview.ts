@@ -153,7 +153,13 @@ async function loadProtectedUnzippedZipIds(sessionId: string): Promise<string[]>
   const protectedIds: string[] = []
 
   for (const zipId of ids ?? []) {
-    if (typeof zipId === 'string' && zipId.trim()) protectedIds.push(zipId.trim())
+    if (typeof zipId !== 'string' || !zipId.trim()) continue
+    // SA-120 P5: a result Jev Juice opened (source `inferred`) is Batshit's guess, not a pin,
+    // so it never shields a message from Manual Trim, Compact, or a nap. A record that
+    // cannot be read keeps protecting, as every unzip always has.
+    const item = await redis.get(`unzipped_item:${sessionId}:${zipId.trim()}`).catch(() => null)
+    if ((item as { source?: unknown } | null)?.source === 'inferred') continue
+    protectedIds.push(zipId.trim())
   }
 
   return protectedIds

@@ -26,6 +26,16 @@ import { normalizeIconRef } from '$lib/icons/iconLegacy'
 import type { CustomIconRecord, IconLibraryPrefs, IconRef } from '$lib/icons/iconTypes'
 import { iconLibraryService } from '$lib/services/iconLibraryService'
 import { debounce } from '$lib/utils/debounce'
+import type { UntrustedTextScreen } from '$lib/types/typesafe'
+import {
+  UNTRUSTED_TEXT_BADGE_TEXT,
+  UNTRUSTED_TEXT_SKILL_NO_FLAG_TEXT,
+  jevJuiceNoteDetail,
+  jevJuiceNoteText,
+  untrustedTextImportLines,
+  readUntrustedTextScreen,
+  untrustedTextSkippedNote
+} from '$lib/utils/jevJuice'
 import { dispatchSlashCommandsUpdated } from '$lib/utils/liveSettingsEvents'
 import {
   Sparkles,
@@ -139,6 +149,10 @@ let importSource = $state('')
 let importSkillPath = $state('')
 let importInstallCommand = $state('')
 let importWarnings = $state<string[]>([])
+// SA-120 P7: what the Jev Juice incoming-text screen said about the imported SKILL.md, when the
+// switch is on. Advisory only: it never blocks the import or the save.
+let importScreen = $state<UntrustedTextScreen | null>(null)
+const importScreenView = $derived(readUntrustedTextScreen(importScreen))
 let cliInvocationIndex = $state<Record<string, CliCollisionEntry[]>>({})
 let skillSources = $state<SkillSourceRow[]>([])
 let skillSourcesLoading = $state(false)
@@ -699,6 +713,7 @@ function selectCommand(command: SlashCommandRow) {
   deleteDisclosureOpen = false
   skillDetailsOpen = false
   importWarnings = []
+  importScreen = null
   const commandSkillMetadata =
     command.skill_metadata && typeof command.skill_metadata === 'object' && !Array.isArray(command.skill_metadata)
       ? (command.skill_metadata as Record<string, unknown>)
@@ -763,6 +778,7 @@ function openCreateForm(type: CommandType = 'prompt') {
   deleteDisclosureOpen = false
   skillDetailsOpen = false
   importWarnings = []
+  importScreen = null
   form = emptyForm()
   form.type = type
   form.iconRef = getDefaultCommandIconRef(type)
@@ -785,6 +801,7 @@ function hideEditor() {
   deleteDisclosureOpen = false
   skillDetailsOpen = false
   importWarnings = []
+  importScreen = null
   form = emptyForm()
 }
 
@@ -1134,6 +1151,7 @@ async function importSkill(mode: 'source' | 'command') {
   try {
     importingSkill = true
     importWarnings = []
+    importScreen = null
 
     const payload: Record<string, unknown> =
       mode === 'command'
@@ -1165,6 +1183,10 @@ async function importSkill(mode: 'source' | 'command') {
     importWarnings = Array.isArray(result.warnings)
       ? result.warnings.map((warning: unknown) => String(warning)).filter(Boolean)
       : []
+    importScreen =
+      result.jevJuiceScreen && typeof result.jevJuiceScreen === 'object'
+        ? (result.jevJuiceScreen as UntrustedTextScreen)
+        : null
 
     toast.success('Skill imported into the form. Save the Skill to persist it.')
   } catch (error) {
@@ -2383,6 +2405,30 @@ async function deleteCommand(command: SlashCommandRow) {
                       <p class="mt-1">- {warning}</p>
                     {/each}
                   </div>
+                {/if}
+
+                {#if importScreenView?.status === 'flagged'}
+                  <div
+                    class={`batshit-settings-inline-alert ${importScreenView.severity === 'serious' ? 'is-danger' : 'is-warning'}`}
+                    data-testid="jev-juice-skill-flag"
+                  >
+                    <p class="batshit-settings-form-label">{UNTRUSTED_TEXT_BADGE_TEXT}</p>
+                    {#each untrustedTextImportLines(importScreenView) as line, index (index)}
+                      <p class="mt-1">{line}</p>
+                    {/each}
+                  </div>
+                {:else if importScreenView?.status === 'skipped'}
+                  <p
+                    class="batshit-settings-form-help is-warning"
+                    data-testid="jev-juice-skill-screen-skipped"
+                  >
+                    {jevJuiceNoteText(untrustedTextSkippedNote(importScreenView))}.
+                    {jevJuiceNoteDetail(untrustedTextSkippedNote(importScreenView))}
+                  </p>
+                {:else if importScreen?.status === 'no_flag'}
+                  <p class="batshit-settings-form-help" data-testid="jev-juice-skill-no-flag">
+                    {UNTRUSTED_TEXT_SKILL_NO_FLAG_TEXT}
+                  </p>
                 {/if}
               </div>
             {/if}

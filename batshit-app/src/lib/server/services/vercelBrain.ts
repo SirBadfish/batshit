@@ -150,48 +150,25 @@ function stringifyForToolModelOutput(value: unknown): string {
   }
 }
 
-function buildZipControlNotice(zipId: string): string {
-  return [
-    'Batshit zip control:',
-    `zipId: ${zipId}`,
-    'Use this exact zipId in unzip/zip controls if this tool result should stay expanded or change zip state. Use zip IDs only.'
-  ].join('\n')
-}
-
-function appendZipControlNoticeToModelOutput(modelOutput: any, zipId: string): any {
-  const notice = buildZipControlNotice(zipId)
+/**
+ * One model-facing shape for every API tool result: a JSON output becomes pretty-printed
+ * text, because that is what this lane has always sent the model. Text and content outputs
+ * pass through untouched.
+ *
+ * F-P4-9: this used to append a reserved zip id and "Use this exact zipId in unzip/zip
+ * controls". That notice is gone on every lane. The one model-facing handle for a
+ * current-response tool result is the `tool_result_N` alias the zip-control prompt teaches;
+ * older zips keep their real ids. Announcing an id here also meant announcing one for
+ * memory tools, which are never zipped at all (DL-104-17), so an agent that fetched it got
+ * `not_found`.
+ */
+function toReadableToolModelOutput(modelOutput: any): any {
   if (!modelOutput || typeof modelOutput !== 'object') {
-    return {
-      type: 'text',
-      value: [stringifyForToolModelOutput(modelOutput), notice].filter(Boolean).join('\n\n')
-    }
-  }
-
-  if (modelOutput.type === 'text' || modelOutput.type === 'error-text') {
-    return {
-      ...modelOutput,
-      value: [String(modelOutput.value ?? ''), notice].filter(Boolean).join('\n\n')
-    }
-  }
-
-  if (modelOutput.type === 'content' && Array.isArray(modelOutput.value)) {
-    return {
-      ...modelOutput,
-      value: [
-        ...modelOutput.value,
-        {
-          type: 'text',
-          text: notice
-        }
-      ]
-    }
+    return { type: 'text', value: stringifyForToolModelOutput(modelOutput) }
   }
 
   if (modelOutput.type === 'json' || modelOutput.type === 'error-json') {
-    return {
-      type: 'text',
-      value: [stringifyForToolModelOutput(modelOutput.value), notice].filter(Boolean).join('\n\n')
-    }
+    return { type: 'text', value: stringifyForToolModelOutput(modelOutput.value) }
   }
 
   return modelOutput
@@ -228,6 +205,8 @@ export interface NativeModeRequest extends ThinkRequest {
   dmControlsEnabled?: boolean
   /** SA-115 P2 (DL-115-10): PRIMARY actor + agent `dms_enabled`. */
   scheduleControlsEnabled?: boolean
+  /** SA-120 P2 (DL-120-06): PRIMARY actor + agent `jev_juice_judge_tool`. */
+  judgeControlsEnabled?: boolean
   /**
    * SA-111 P4 (DL-111-11/12): PRIMARY runs of workers-enabled agents. The subagent runner
    * leaves it false, which is what keeps delegation depth at one level.
@@ -254,6 +233,15 @@ export interface NativeModeRequest extends ThinkRequest {
    */
   delegatedRun?: boolean
   /**
+   * BL-75 — whose skill access governs this run's `native_skill` loads, when that is not
+   * `agentId`. Set only by `subagentRunner.ts`: to the Subagent's (or a `base` Worker's) record
+   * id, or a built-in Worker's `worker_…` id. The same id builds the run's `skills_commands`
+   * list, so a skill it lists is a skill it can load, and nothing more. An API Subagent run
+   * passes the PARENT as `agentId`, and a CLI one a `subagent_cli_…` runtime id, so neither
+   * can stand in for it. The CLI bridges stamp it on the run credential.
+   */
+  scopeAgentId?: string | null
+  /**
    * SA-114 P1 (DL-114-05): takes every steer waiting for this turn and marks it delivered.
    *
    * Only send-routed's PRIMARY API turn supplies it. A subagent run, a Worker, a group
@@ -277,16 +265,6 @@ export interface NativeModeRequest extends ThinkRequest {
   providerOptions?: Record<string, Record<string, any>>
   connection?: ModelConnectionInfo | null
   providerSettings?: Record<string, any> | null
-  reserveToolZipId?: (params: {
-    toolCallId: string
-    toolName?: string
-    input?: unknown
-  }) => string | undefined
-  registerReservedToolZipId?: (params: {
-    toolCallId: string
-    toolName?: string
-    zipId: string
-  }) => string | undefined
   codexSettings?: CodexRuntimeSettings | null
   claudeSettings?: ClaudeRuntimeSettings | null
   projectPath?: string | null
@@ -316,12 +294,14 @@ export class VercelAIBrain {
     this.providerManager = new ProviderManager()
   }
 
-  private wrapToolsWithZipControlNotices(
-    tools: Record<string, any>,
-    reserveToolZipId?: NativeModeRequest['reserveToolZipId']
-  ): Record<string, any> {
-    if (!reserveToolZipId) return tools
-
+  /**
+   * Gives every executable API tool the one model-facing output shape this lane has always
+   * sent (`toReadableToolModelOutput`). A tool's own `toModelOutput` still runs first; a
+   * tool without one gets the SDK's default shape, which this normalizes the same way.
+   *
+   * F-P4-9: it no longer reserves a zip id or appends a zip-id notice.
+   */
+  private wrapToolsWithReadableModelOutput(tools: Record<string, any>): Record<string, any> {
     const wrappedTools: Record<string, any> = {}
     for (const [toolName, toolDefinition] of Object.entries(tools)) {
       if (
@@ -342,39 +322,17 @@ export class VercelAIBrain {
 
       wrappedTools[toolName] = {
         ...toolDefinition,
-        ...(typeof originalExecute === 'function'
-          ? {
-              execute: (input: unknown, options: any) => {
-                const toolCallId =
-                  typeof options?.toolCallId === 'string' ? options.toolCallId : ''
-                if (toolCallId) {
-                  reserveToolZipId({ toolCallId, toolName, input })
-                }
-                return originalExecute.call(toolDefinition, input, options)
-              }
-            }
-          : {}),
         toModelOutput: async (params: {
           toolCallId: string
           input: unknown
           output: unknown
         }) => {
-          const zipId =
-            typeof params.toolCallId === 'string' && params.toolCallId.trim()
-              ? reserveToolZipId({
-                  toolCallId: params.toolCallId,
-                  toolName,
-                  input: params.input
-                })
-              : undefined
           const modelOutput =
             typeof originalToModelOutput === 'function'
               ? await originalToModelOutput.call(toolDefinition, params)
               : buildDefaultToolModelOutput(params.output)
 
-          return zipId
-            ? appendZipControlNoticeToModelOutput(modelOutput, zipId)
-            : modelOutput
+          return toReadableToolModelOutput(modelOutput)
         }
       }
     }
@@ -475,14 +433,15 @@ export class VercelAIBrain {
           memoryControlsEnabled: request.memoryControlsEnabled,
           dmControlsEnabled: request.dmControlsEnabled,
           scheduleControlsEnabled: request.scheduleControlsEnabled,
+          judgeControlsEnabled: request.judgeControlsEnabled,
           workersEnabled: request.workersEnabled,
           controlApprovals: request.controlApprovals ?? null,
           groupMemberRun: request.groupMemberRun === true,
+          scopeAgentId: request.scopeAgentId ?? null,
           parentModelId: request.model ?? null,
           parentConnection: request.connection ?? null,
           parentCapabilities: request.modelCapabilities ?? null,
           parentMessageId: request.messageId ?? null,
-          reserveToolZipId: request.reserveToolZipId,
           abortSignal: request.abortSignal
         }
       )
@@ -1012,18 +971,21 @@ export class VercelAIBrain {
       /** SA-113 P2 (DL-113-03): PRIMARY actor + agent `dms_enabled`. */
       dmControlsEnabled?: boolean
       scheduleControlsEnabled?: boolean
+      /** SA-120 P2 (DL-120-06): PRIMARY actor + agent `jev_juice_judge_tool`. */
+      judgeControlsEnabled?: boolean
       /** SA-111 P4: primary-agent sends only; every delegated run leaves it false. */
       workersEnabled?: boolean
       /** SA-116 P2: send-routed's resolved approval grants and the group-run flag. */
       controlApprovals?: NativeModeRequest['controlApprovals']
       groupMemberRun?: boolean
+      /** BL-75: whose skill access governs `native_skill` here, when not `agentId`. */
+      scopeAgentId?: string | null
       parentModelId?: string | null
       parentConnection?: ModelConnectionInfo | null
       /** SA-105 P2 (DL-105-06): saved-model capabilities for the image lane gate. */
       parentCapabilities?: ModelCapabilities | null
       /** SA-093 P4: parent send's message id so subagent forensics can land on its snapshot. */
       parentMessageId?: string | null
-      reserveToolZipId?: NativeModeRequest['reserveToolZipId']
       abortSignal?: AbortSignal
     }
   ): Promise<{
@@ -1094,12 +1056,14 @@ export class VercelAIBrain {
           memoryControlsEnabled: nativeContext?.memoryControlsEnabled,
           dmControlsEnabled: nativeContext?.dmControlsEnabled,
           scheduleControlsEnabled: nativeContext?.scheduleControlsEnabled,
+          judgeControlsEnabled: nativeContext?.judgeControlsEnabled,
           projectPath: nativeContext?.projectPath ?? null,
           providerSettings: nativeContext?.providerSettings ?? null,
           toolApprovalMode,
           // SA-116 P2: the click, and whether a card could ever be answered here.
           controlApprovals: nativeContext?.controlApprovals ?? null,
           groupMemberRun: nativeContext?.groupMemberRun === true,
+          scopeAgentId: nativeContext?.scopeAgentId ?? null,
           imageDelivery,
           ephemeralImages,
           // SA-111 P4 (DL-111-09): the worker tool exists only on a primary send. Every
@@ -1437,10 +1401,7 @@ export class VercelAIBrain {
       }
     }
 
-    const wrappedTools = this.wrapToolsWithZipControlNotices(
-      tools,
-      nativeContext?.reserveToolZipId
-    )
+    const wrappedTools = this.wrapToolsWithReadableModelOutput(tools)
 
     // Story 6.4: Return both tools and metadata maps for detection
     return {
@@ -2748,14 +2709,15 @@ export class VercelAIBrain {
             memoryControlsEnabled: request.memoryControlsEnabled,
             dmControlsEnabled: request.dmControlsEnabled,
             scheduleControlsEnabled: request.scheduleControlsEnabled,
+            judgeControlsEnabled: request.judgeControlsEnabled,
             workersEnabled: request.workersEnabled,
             controlApprovals: request.controlApprovals ?? null,
             groupMemberRun: request.groupMemberRun === true,
+            scopeAgentId: request.scopeAgentId ?? null,
             parentModelId: request.model ?? null,
             parentConnection: request.connection ?? null,
             parentCapabilities: request.modelCapabilities ?? null,
             parentMessageId: request.messageId ?? null,
-            reserveToolZipId: request.reserveToolZipId,
             abortSignal: request.abortSignal
           }
         )

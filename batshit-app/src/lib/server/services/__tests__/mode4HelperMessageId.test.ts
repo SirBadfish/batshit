@@ -2,6 +2,14 @@ import { spawn } from 'node:child_process'
 import http from 'node:http'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { normalizeCompactTool } from '$lib/utils/toolActivityContract'
+import {
+  FETCHED_ZIP_ID,
+  claudeBrokeredZipFetchStep,
+  codexBrokeredZipFetchStep,
+  controlsUseZipFetchBody,
+  fetchedZipContent
+} from '$lib/test-utils/zip-fetch-steps'
 
 /**
  * SA-116 DL-116-07 — the managed CLI helper forwards the assistant message id.
@@ -20,6 +28,8 @@ const HELPER = path.join(process.cwd(), 'scripts', 'mode4-controls-mcp.cjs')
 let server: http.Server
 let baseUrl: string
 const received: Array<{ url: string; body: any; headers: Record<string, any> }> = []
+/** What the stand-in answers per route; anything unlisted gets `{ success: true }`. */
+const responseBodies = new Map<string, unknown>()
 
 beforeAll(async () => {
   server = http.createServer((req, res) => {
@@ -36,7 +46,7 @@ beforeAll(async () => {
       }
       received.push({ url: req.url ?? '', body, headers: req.headers as Record<string, any> })
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true }))
+      res.end(JSON.stringify(responseBodies.get(req.url ?? '') ?? { success: true }))
     })
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -49,11 +59,12 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()))
 })
 
+/** Calls one helper tool and resolves with its JSON-RPC response. */
 async function callHelper(
   toolName: string,
   args: Record<string, any>,
   env: Record<string, string>
-): Promise<void> {
+): Promise<any> {
   received.length = 0
   const child = spawn(
     process.execPath,
@@ -70,7 +81,7 @@ async function callHelper(
     }
   )
 
-  const done = new Promise<void>((resolve, reject) => {
+  const done = new Promise<any>((resolve, reject) => {
     let buffer = ''
     const timer = setTimeout(() => {
       child.kill()
@@ -89,7 +100,7 @@ async function callHelper(
         if (message?.id === 2) {
           clearTimeout(timer)
           child.kill()
-          resolve()
+          resolve(message)
           return
         }
       }
@@ -114,7 +125,7 @@ async function callHelper(
     }) + '\n'
   )
 
-  await done
+  return await done
 }
 
 describe('the mode4 controls helper', () => {
@@ -244,5 +255,82 @@ describe('the mode4 controls helper', () => {
 
     expect(exitCode).toBe(1)
     expect(stderr).toContain('BATSHIT_AGENT_TOKEN')
+  }, 30000)
+
+  /* ---------------------------------------------------------------------- *
+   * F-P5-2 — the managed broker presents a zip fetch the way the API broker
+   * does (`resolveBrokerPresentation`), so both CLIs land in the Fetch Zip lane.
+   * ---------------------------------------------------------------------- */
+
+  // No session id: the helper then adds no zip-control notice, which is exactly what the
+  // CLI adapters leave in the step once they have stripped it.
+  const noSession = { BATSHIT_SESSION_ID: '' }
+
+  it('presents a brokered zip fetch as fetch_zip, and both CLI step shapes normalize to it', async () => {
+    responseBodies.set('/api/controls/use', controlsUseZipFetchBody())
+    try {
+      const response = await callHelper(
+        'batshit_tool_use',
+        { ref: 'fabric:sys.zip.fetch', input: { zipId: FETCHED_ZIP_ID } },
+        noSession
+      )
+      const text = response?.result?.content?.[0]?.text
+      expect(typeof text).toBe('string')
+      expect(JSON.parse(text)).toMatchObject({
+        success: true,
+        ref: 'fabric:sys.zip.fetch',
+        family: 'fabric',
+        target: 'sys.zip.fetch',
+        operationKind: 'fetch_zip',
+        rendererFamily: 'generic_tool',
+        result: { found: true, zipId: FETCHED_ZIP_ID }
+      })
+      expect(received.find((entry) => entry.url === '/api/controls/use')?.body).toMatchObject({
+        controlId: 'sys.zip.fetch',
+        input: { zipId: FETCHED_ZIP_ID }
+      })
+
+      for (const step of [codexBrokeredZipFetchStep(text), claudeBrokeredZipFetchStep(text)]) {
+        const compact = normalizeCompactTool({
+          toolName: step.toolName,
+          originalToolName: step.originalToolName,
+          toolArgs: step.toolArgs,
+          toolResult: step.toolResult
+        })
+        expect(compact.operationKind).toBe('fetch_zip')
+        expect(compact.displayToolName).toBe('Fetch Zip')
+        expect(compact.toolArgs).toEqual({ zipId: FETCHED_ZIP_ID })
+        expect(compact.toolResult).toMatchObject({
+          found: true,
+          zipId: FETCHED_ZIP_ID,
+          type: 'cool_tool',
+          content: fetchedZipContent()
+        })
+      }
+    } finally {
+      responseBodies.clear()
+    }
+  }, 30000)
+
+  it('keeps every other fabric ref in the fabric_use lane', async () => {
+    responseBodies.set('/api/controls/use', {
+      success: true,
+      controlId: 'sys.cli_tool.list',
+      result: { tools: [] }
+    })
+    try {
+      const response = await callHelper(
+        'batshit_tool_use',
+        { ref: 'fabric:sys.cli_tool.list', input: {} },
+        noSession
+      )
+      expect(JSON.parse(response?.result?.content?.[0]?.text)).toMatchObject({
+        target: 'sys.cli_tool.list',
+        operationKind: 'fabric_use',
+        rendererFamily: 'generic_tool'
+      })
+    } finally {
+      responseBodies.clear()
+    }
   }, 30000)
 })

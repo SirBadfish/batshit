@@ -437,13 +437,14 @@ async function runAgentWakeup(
     )
   }
 
-  // F-P1-1 — the woken turn must OWN its session-turn lock.
+  // F-P1-1 — the woken turn names its own assistant message, as the browser does.
   //
-  // send-routed registers and releases the lock under the `messageId` the caller sends,
-  // and `clearSessionTurn(sessionId, null)` deletes unconditionally. Posting no id meant
-  // a woken turn stopped during setup could delete the lock of a live turn the user had
-  // already started in the same chat — the exact case the ownership rule exists for. The
-  // browser generates its assistant placeholder id up front; so does this now.
+  // send-routed registers the session-turn lock under the `messageId` the caller sends. It
+  // used to RELEASE by that id too, so posting no id let a woken turn stopped during setup
+  // delete the lock of a live turn the user had already started in the same chat. The
+  // release is by registration now (`releaseSessionTurn`, 2026-09-18), but the lock's
+  // message id is still how a steer's setup wait and an approval click recognise the reply
+  // that holds the chat, and where a failed turn is written. So the id is generated up front.
   const assistantMessageId = await generateMessageId(sessionId)
   if (!assistantMessageId) {
     return refuse(

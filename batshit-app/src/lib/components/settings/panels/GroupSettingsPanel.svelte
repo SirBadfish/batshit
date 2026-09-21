@@ -81,7 +81,9 @@
     { value: 'balanced', label: 'Balanced' },
     { value: 'quiet', label: 'Quiet' },
     { value: 'only_when_asked', label: 'Only when asked' },
-    { value: 'topic_only', label: 'Topic only' }
+    { value: 'topic_only', label: 'Topic only' },
+    // SA-120 P3 (LS-051): Jev Juice picks the speaker and skips follow-ups that add nothing.
+    { value: 'smart', label: 'Jev Juice: Smart' }
   ]
 
   const EMPTY_FORM: GroupFormState = {
@@ -1127,6 +1129,15 @@
                               </Select.Content>
                             </Select.Root>
                           </div>
+
+                          {#if settings.speak_policy === 'smart'}
+                            <div class="batshit-settings-form-label md:col-span-2" data-testid="group-smart-preset-note">
+                              Jev Juice picks who speaks and skips follow-ups with nothing to add. When a turn needs a
+                              pick, Batshit sends the current message, the last replies in the round, and every group
+                              agent's name and description to TypeSafe. Needs <strong>Allow Jev Juice</strong> on in
+                              Settings → Admin; if it is off or slow, the usual rules pick.
+                            </div>
+                          {/if}
 
                           {#if settings.speak_policy === 'topic_only'}
                             <div class="space-y-1">

@@ -462,7 +462,7 @@ describe('CodexBridge', () => {
       workingDirectory: process.cwd(),
       allowFileEdits: true,
       allowNetwork: true,
-      approvalPolicy: 'on-failure',
+      approvalPolicy: 'on-request',
       webSearchEnabled: true,
       addDirectories: [],
       enableFeatures: [],
@@ -492,7 +492,7 @@ describe('CodexBridge', () => {
     expect(args).toContain('--sandbox')
     expect(args).toContain('workspace-write')
     expect(args).toContain('sandbox_mode=workspace-write')
-    expect(args).toContain('approval_policy=on-failure')
+    expect(args).toContain('approval_policy=on-request')
     expect(args).not.toContain('--full-auto')
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox')
   })
@@ -855,14 +855,20 @@ describe('CodexBridge', () => {
       })
 
       const result = await bridge.streamNativeMode(
-        buildRequest({ agentId: 'subagent_cli_worker_agent_123_1', delegatedRun: true } as any)
+        buildRequest({
+          agentId: 'subagent_cli_worker_agent_123_1',
+          delegatedRun: true,
+          scopeAgentId: 'worker_123'
+        } as any)
       )
       await collectStream(result.fullStream)
 
       expect(mintedCredentialRecords).toHaveLength(1)
       expect(mintedCredentialRecords[0]!.record).toMatchObject({
         agentId: 'subagent_cli_worker_agent_123_1',
-        delegated: true
+        delegated: true,
+        // BL-75: the Worker whose skill access governs the run rides on its credential.
+        scopeAgentId: 'worker_123'
       })
     })
 

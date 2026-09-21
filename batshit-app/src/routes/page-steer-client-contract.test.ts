@@ -141,6 +141,11 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     const helperBody = page.slice(helper, helper + 700)
     expect(helperBody).toContain('chatRunRegistry.isSessionBusy(sessionId)')
     expect(helperBody).toContain('CLIENT_QUEUE_MAX_WAIT_MS')
+    // 2026-09-18: the loop is `replyEndWait.ts`, which keeps waiting while THIS tab's own
+    // request is still open after `end`; the page's old loop gave up there and parked the
+    // message as "the reply ran too long to wait for" (measured on the smoke stack).
+    expect(helperBody).toContain('\n    return waitUntilReplyIsOver(\n      messageId,\n')
+    expect(helperBody).toContain('\n        isBusy: () => chatRunRegistry.isSessionBusy(sessionId),\n')
     // A ceiling, not a forever — and the caller must keep the words when it is hit.
     // AMD-119-04 turned the two-way `replyEnded` test into the three-way rule below, so
     // the ceiling's branch is named rather than negated.
@@ -149,6 +154,30 @@ describe('the client send path (SA-114 P3, SA-119 P2)', () => {
     // the bubble is where the words are. It becomes the receipt; it is not forgotten.
     expect(body).toContain("steerInbox.markSteerDropped(waitingSteerId, 'timed_out')")
     expect(body).toContain('kept on its receipt')
+  })
+
+  it('waits for a group reply to name its message before queuing behind it (bug sweep, 2026-09-18)', () => {
+    // A group send gets no assistant id; its reply names one with its first `start` event. A
+    // message queued before that skipped the wait, went straight into the running turn, and was
+    // refused `session_turn_in_progress`, saved and never answered. `waitForReplyTarget`
+    // (`replyEndWait.ts`) has the rule and its tests; these pins are about where the page uses it.
+    const branch = page.indexOf('if (clientQueueEligible) {')
+    const body = page.slice(branch, page.indexOf('stopRealtimeSpeechPlayback()', branch))
+    const targetWait = body.indexOf('found = await waitForReplyTargetInSession(currentSessionId)')
+    const bubbleWait = body.indexOf('await waitForReplyToEnd(currentSessionId, waitForMessageId)')
+    expect(targetWait).toBeGreaterThan(-1)
+    expect(bubbleWait).toBeGreaterThan(targetWait)
+    expect(body.slice(0, targetWait)).toContain('if (!waitForMessageId) {')
+    expect(body).toContain('waitForMessageId = found.target')
+    // One queued message at a time holds for this wait too, released in a `finally`.
+    expect(body.slice(0, targetWait)).toContain('clientQueueWaitingBySession.add(currentSessionId)')
+    // A Stop in that short wait drops the send; the words are still in the composer.
+    expect(body).toContain(
+      '(manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeTargetWait'
+    )
+    const helper = page.indexOf('function waitForReplyTargetInSession(')
+    expect(helper).toBeGreaterThan(-1)
+    expect(page.slice(helper, helper + 700)).toContain('CLIENT_QUEUE_TARGET_WAIT_MS')
   })
 
   it('drops a browser-held queued message when the user stops the reply (AMD-119-04)', () => {
@@ -438,7 +467,15 @@ describe('a queued message leaves the box (SA-119 P3b, AMD-119-05)', () => {
 
   it('clears the WORDS only — the clips are sticky and a one-time clip is unspent', () => {
     const chatInput = readFileSync('src/lib/components/chat/ChatInput.svelte', 'utf8')
-    expect(chatInput).toContain('onQueuedForLater: () => resetComposer(),')
+    expect(chatInput).toContain('onQueuedForLater: () => resetAcceptedComposer(),')
+    // Delayed voice turns keep newer words; ordinary queued sends still reset immediately.
+    const guardedResetStart = chatInput.indexOf('const resetAcceptedComposer = () => {')
+    const guardedResetEnd = chatInput.indexOf('let acceptedHandled = false', guardedResetStart)
+    expect(guardedResetStart).toBeGreaterThan(-1)
+    const guardedReset = chatInput.slice(guardedResetStart, guardedResetEnd)
+    expect(guardedReset).toContain('if (overrides?.mayResetComposer && !overrides.mayResetComposer()) return')
+    expect(guardedReset).toContain('resetComposer()')
+    expect(guardedReset).not.toContain('clipsManager')
     // `resetComposer` has only ever cleared text (DL-119-04); the clips are cleared by
     // `clipsManager.handleMessageAccepted`, which a queued message has not earned yet.
     const reset = chatInput.indexOf('function resetComposer() {')

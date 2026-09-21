@@ -8,13 +8,13 @@ import type { Message } from '$lib/stores/messages.svelte'
 export class MessageApiClient extends RedisStoreBase {
   // Messages
   async getMessages(sessionId: string, limit = 100) {
-    const messages = await this.apiCall(`/messages/${sessionId}?limit=${limit}`)
+    const messages = await this.apiCall(`/messages/${encodeURIComponent(sessionId)}?limit=${limit}`)
     return messages as ChatMemoryRow[]
   }
 
   async getSessionMessages(sessionId: string): Promise<Message[]> {
     try {
-      const messages = (await this.apiCall(`/messages/${sessionId}?limit=1000`)) as ChatMemoryRow[]
+      const messages = (await this.apiCall(`/messages/${encodeURIComponent(sessionId)}?limit=1000`)) as ChatMemoryRow[]
 
       const mapped = messages.map(msg => {
         const m = msg as any
@@ -103,14 +103,14 @@ export class MessageApiClient extends RedisStoreBase {
   }
 
   async updateMessage(messageId: string, sessionId: string, updates: Partial<ChatMemoryRow>, userId: string) {
-    await this.apiCall(`/messages/${sessionId}/${messageId}`, {
+    await this.apiCall(`/messages/${encodeURIComponent(sessionId)}/${encodeURIComponent(messageId)}`, {
       method: 'PUT',
       body: JSON.stringify({ ...updates, session_id: sessionId, user_id: userId })
     })
   }
 
   async deleteMessage(messageId: string, sessionId: string, userId: string) {
-    await this.apiCall(`/messages/${sessionId}/${messageId}`, {
+    await this.apiCall(`/messages/${encodeURIComponent(sessionId)}/${encodeURIComponent(messageId)}`, {
       method: 'DELETE',
       body: JSON.stringify({ session_id: sessionId, user_id: userId })
     })

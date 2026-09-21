@@ -26,15 +26,56 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+/** A shell option whose value is the next word (`-o pipefail`, `-O extglob`, `--rcfile <file>`). */
+const SHELL_OPTION_WITH_VALUE = /^(?:[-+][oO]|--rcfile|--init-file)$/
+
+/**
+ * Whether the flag at `flagIndex` belongs to a shell (bug sweep item 6): the nearest word before it
+ * that is not one of the shell's own options (`-e`, `--norc`, `-o pipefail`) names a shell, by path
+ * or not, or `su`/`script`/`flock`, whose `-c` value is a command line too. Quotes, `(`, and command
+ * separators around that word do not count.
+ */
+function flagFollowsShellWord(text: string, flagIndex: number): boolean {
+  const words = text
+    .slice(0, flagIndex)
+    .split(/[\s;&|()`]+/)
+    .map((word) => word.replace(/['"\\]/g, ''))
+    .filter(Boolean)
+  for (let index = words.length - 1; index >= 0; index -= 1) {
+    const word = words[index]
+    const program = word.slice(word.lastIndexOf('/') + 1).toLowerCase()
+    if (SHELL_PROGRAM_NAMES.has(program) || COMMAND_OPTION_PROGRAM_NAMES.has(program)) return true
+    if (index > 0 && SHELL_OPTION_WITH_VALUE.test(words[index - 1])) index -= 1
+    else if (!/^[-+]/.test(word)) return false
+  }
+  return false
+}
+
+/**
+ * The command line a shell runs from its quoted `-c` value, exactly as written between the quotes
+ * (bug sweep item 6). Another program's `-c` is that program's own option (`grep -c 'foo' notes.md`
+ * counts matches of `foo`; `ls -lc` lists by change time), so a value counts only when its flag
+ * belongs to a shell. A `-lc` value is read first, as it always was, so Codex's `/bin/zsh -lc '…'`
+ * unwraps byte for byte; a shell's `-c` in any cluster (`-ec`, `-euc`) is the same flag.
+ */
+function shellQuotedCommandString(text: string): string | null {
+  // A flag word and its quoted value: a `-lc`, then any cluster with a `c`. Built on every call,
+  // since a shared `/g` pattern carries `lastIndex` from one call to the next.
+  const patterns = [/(?<!\S)-lc\s+(['"])([\s\S]*?)\1/g, /(?<!\S)-[a-zA-Z]*c[a-zA-Z]*\s+(['"])([\s\S]*?)\1/g]
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      if (match[2] && flagFollowsShellWord(text, match.index ?? 0)) return match[2]
+    }
+  }
+  return null
+}
+
 function extractShellCommand(command: string): string {
   const trimmed = command.trim()
   if (!trimmed) return command
 
-  const loginMatch = trimmed.match(/-lc\s+(['"])([\s\S]*?)\1/)
-  if (loginMatch?.[2]) return loginMatch[2]
-
-  const commandMatch = trimmed.match(/-c\s+(['"])([\s\S]*?)\1/)
-  if (commandMatch?.[2]) return commandMatch[2]
+  const shellCommandString = shellQuotedCommandString(trimmed)
+  if (shellCommandString !== null) return shellCommandString
 
   const tokens = tokenizeCommand(trimmed)
   for (let index = 0; index < tokens.length - 2; index += 1) {
@@ -123,13 +164,71 @@ function tokenizeCommand(command: string): string[] {
   return tokens.filter((token) => token.length > 0)
 }
 
-function extractPathFromReadCommand(shellCommand: string): string | undefined {
-  const catLikeMatch = shellCommand.match(
-    /\b(?:cat|head|tail)\b\s+(?:-[^\s]+\s+)*(?![><])(?:['"]?)([^'"`\s|><]+)(?:['"]?)/i
-  )
-  if (catLikeMatch?.[1]) return catLikeMatch[1].trim()
+/**
+ * The first command of a pipeline: the text before its first `|` outside quotes (`|`, `|&`, and
+ * `||` all end it). A read's operand is in its own command, never in the one it pipes into (bug
+ * sweep item 7).
+ */
+function firstPipelineStage(command: string): string {
+  let quote: string | null = null
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (quote) {
+      if (char === '\\' && quote === '"') index += 1
+      else if (char === quote) quote = null
+      continue
+    }
+    if (char === '\\') index += 1
+    else if (char === "'" || char === '"') quote = char
+    else if (char === '|') return command.slice(0, index)
+  }
+  return command
+}
 
-  const sedMatch = shellCommand.match(
+// `head -n 2 file` and `tail -n +5 file` give a count before the file; the count is not the path.
+// An option without a separate value (`cat -n`, `head -5`, `--lines=5`) is skipped whole.
+const CAT_LIKE_COUNT_OPTION = /(?:-[nc]|--lines|--bytes)\s+[+-]?\d+[a-z]*\s+/iy
+const CAT_LIKE_OTHER_OPTION = /-\S+\s+/y
+const CAT_LIKE_PATH = /(?![><])['"]?([^'"`\s|><]+)/y
+
+function matchAt(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
+  pattern.lastIndex = index
+  return pattern.exec(text)
+}
+
+/**
+ * The file a `cat`, `head`, or `tail` in the read stage reads: the first word after its options.
+ * The options are skipped one at a time, never back: the single regex this replaced could match a
+ * run like `-c -0 ` two ways (CodeQL js/redos, public PR 114), and when no file followed it fell
+ * back to calling a count the file (`head -n 5 | grep x` read `5`).
+ */
+function extractCatLikePath(readStage: string): string | undefined {
+  const commands = /\b(?:cat|head|tail)\b\s+/gi
+  let command: RegExpExecArray | null
+  while ((command = commands.exec(readStage))) {
+    let index = command.index + command[0].length
+    for (;;) {
+      const option =
+        matchAt(CAT_LIKE_COUNT_OPTION, readStage, index) ?? matchAt(CAT_LIKE_OTHER_OPTION, readStage, index)
+      if (!option) break
+      index += option[0].length
+    }
+    const filePath = matchAt(CAT_LIKE_PATH, readStage, index)?.[1]
+    if (filePath) return filePath
+  }
+  return undefined
+}
+
+function extractPathFromReadCommand(shellCommand: string): string | undefined {
+  // The read is the pipeline's first stage: `sed -n '1,5p' app.js | grep -i foo` reads app.js, as
+  // `cat app.js | grep foo` and `head app.js | grep foo` always did, and a later `| head -3` or
+  // `| cat -n` lends it no count or flag for a path (bug sweep item 7).
+  const readStage = firstPipelineStage(shellCommand)
+
+  const catLikePath = extractCatLikePath(readStage)
+  if (catLikePath) return catLikePath
+
+  const sedMatch = readStage.match(
     /\bsed\b[\s\S]*?\s(?:['"]?)([^'"`\s|><]+)(?:['"]?)\s*$/i
   )
   if (sedMatch?.[1]) return sedMatch[1].trim()
@@ -262,15 +361,510 @@ function extractRedirectPath(shellCommand: string): string | undefined {
   return candidate
 }
 
-function extractPathFromInPlaceEditCommand(shellCommand: string): string | undefined {
-  const lower = shellCommand.toLowerCase()
-  const hasStandaloneInPlaceFlag = /\s-i(?:\s|$)/.test(lower)
-  const hasCombinedPerlInPlaceFlag = /\s-[a-z0-9]*i[a-z0-9]*(?:\s|$)/.test(lower)
-  const looksInPlaceEdit =
-    (lower.includes('sed') && hasStandaloneInPlaceFlag) ||
-    (lower.includes('perl') && (hasStandaloneInPlaceFlag || hasCombinedPerlInPlaceFlag))
-  if (!looksInPlaceEdit) return undefined
+/** One word of a command line, after the shell's quote and backslash removal. */
+interface ShellWord {
+  text: string
+  /** The word holds a `$…` or backtick substitution, so its text is not what the shell runs. */
+  dynamic: boolean
+  /** This word contains an output-redirection `>` that was outside quotes/backslash escaping. */
+  outputRedirect: boolean
+}
 
+const SHELL_WORD_BREAK = /\s/
+
+/**
+ * One command line split the way the shell reads it, into simple commands of words (Bug Q). Quotes
+ * and backslashes are removed as the shell removes them, so a flag written in quotes (`"-i"`,
+ * `-'i'`) is still that flag, while a quoted script (`'s/ -i / x /'`) stays one word whose text is
+ * never a flag. Outside quotes, `;`, `&&`, `||`, `|`, `&`, a newline, and a parenthesis end a
+ * simple command, but `&` inside a redirect (`2>&1`, `&>`) does not. A `$(…)` or backtick
+ * substitution stays inside its word and marks it dynamic. A `#` that starts a word ends the line.
+ */
+function splitShellSimpleCommands(line: string): ShellWord[][] {
+  const commands: ShellWord[][] = []
+  let words: ShellWord[] = []
+  let text = ''
+  let dynamic = false
+  let outputRedirect = false
+  let inWord = false
+
+  const endWord = () => {
+    if (inWord) words.push({ text, dynamic, outputRedirect })
+    text = ''
+    dynamic = false
+    outputRedirect = false
+    inWord = false
+  }
+  const endCommand = () => {
+    endWord()
+    if (words.length > 0) commands.push(words)
+    words = []
+  }
+  // Where the substitution opened by the backtick or `(` at `open` ends, quotes and nesting included.
+  const substitutionEnd = (open: number): number => {
+    if (line[open] === '`') {
+      let cursor = open + 1
+      while (cursor < line.length && line[cursor] !== '`') cursor += line[cursor] === '\\' ? 2 : 1
+      return Math.min(cursor, line.length - 1)
+    }
+    let depth = 1
+    for (let cursor = open + 1; cursor < line.length; cursor += 1) {
+      const char = line[cursor]
+      if (char === '\\') {
+        cursor += 1
+      } else if (char === "'" || char === '"') {
+        let close = cursor + 1
+        while (close < line.length && line[close] !== char) {
+          close += char === '"' && line[close] === '\\' ? 2 : 1
+        }
+        cursor = close
+      } else if (char === '(') {
+        depth += 1
+      } else if (char === ')') {
+        depth -= 1
+        if (depth === 0) return cursor
+      }
+    }
+    return line.length - 1
+  }
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]
+    const next = line[index + 1]
+
+    if (char === '\\') {
+      if (next !== undefined && next !== '\n') text += next
+      index += 1
+      inWord = true
+      continue
+    }
+    if (char === "'") {
+      const close = line.indexOf("'", index + 1)
+      const end = close === -1 ? line.length : close
+      text += line.slice(index + 1, end)
+      index = end
+      inWord = true
+      continue
+    }
+    if (char === '"') {
+      let cursor = index + 1
+      while (cursor < line.length && line[cursor] !== '"') {
+        const inner = line[cursor]
+        if (inner === '\\' && cursor + 1 < line.length && '$`"\\\n'.includes(line[cursor + 1])) {
+          text += line[cursor + 1]
+          cursor += 2
+          continue
+        }
+        if (inner === '$' || inner === '`') dynamic = true
+        if ((inner === '$' && line[cursor + 1] === '(') || inner === '`') {
+          const end = substitutionEnd(inner === '`' ? cursor : cursor + 1)
+          text += line.slice(cursor, end + 1)
+          cursor = end + 1
+          continue
+        }
+        text += inner
+        cursor += 1
+      }
+      index = cursor
+      inWord = true
+      continue
+    }
+    if (char === '$' && next === "'") {
+      // ANSI-C quotes decode escapes after parsing (`$'\\x2f'` becomes `/`). Keep the visible
+      // spelling for renderer logic, but approval policy must treat the executed bytes as unknown.
+      dynamic = true
+      let cursor = index + 2
+      while (cursor < line.length && line[cursor] !== "'") {
+        if (line[cursor] === '\\' && cursor + 1 < line.length) {
+          text += line[cursor + 1]
+          cursor += 2
+          continue
+        }
+        text += line[cursor]
+        cursor += 1
+      }
+      index = cursor
+      inWord = true
+      continue
+    }
+    if ((char === '$' && next === '(') || char === '`') {
+      const end = substitutionEnd(char === '`' ? index : index + 1)
+      text += line.slice(index, end + 1)
+      index = end
+      dynamic = true
+      inWord = true
+      continue
+    }
+    if (char === '$') {
+      text += char
+      dynamic = true
+      inWord = true
+      continue
+    }
+    if (char === '>') outputRedirect = true
+    if (char === '#' && !inWord) break
+    if (SHELL_WORD_BREAK.test(char)) {
+      if (char === '\n') endCommand()
+      else endWord()
+      continue
+    }
+    if (char === ';' || char === '(' || char === ')') {
+      endCommand()
+      continue
+    }
+    if (char === '|') {
+      endCommand()
+      if (next === '|' || next === '&') index += 1
+      continue
+    }
+    if (char === '&') {
+      if (next === '&') {
+        endCommand()
+        index += 1
+        continue
+      }
+      if (line[index - 1] === '>' || line[index - 1] === '<' || next === '>') {
+        text += char
+        inWord = true
+        continue
+      }
+      endCommand()
+      continue
+    }
+    text += char
+    inWord = true
+  }
+  endCommand()
+  return commands
+}
+
+/** A command word's program name: the last path segment, lowercased (macOS runs `SED` as `sed`). */
+function shellProgramName(word: ShellWord): string {
+  return word.text.slice(word.text.lastIndexOf('/') + 1).toLowerCase()
+}
+
+export interface ShellSimpleCommandSummary {
+  /** The first non-assignment word's basename, lowercased; null for assignment-only commands. */
+  program: string | null
+  /** Shell-unquoted words, retained so policy can classify each operation independently. */
+  words: string[]
+  /** Literal redirect destinations; null means a redirect target could not be proven. */
+  outputRedirectTargets: Array<string | null>
+  /** Any word contains expansion/substitution whose executed bytes are not statically known. */
+  dynamic: boolean
+}
+
+/**
+ * Quote-aware simple commands from one top-level shell line. Approval policy uses the mapper's
+ * parser so a renderer classification and its execution gate cannot disagree about where a
+ * chained operation starts. Heredoc bodies must be removed by the caller before passing lines.
+ */
+export function summarizeShellSimpleCommands(line: string): ShellSimpleCommandSummary[] {
+  return splitShellSimpleCommands(line).map((words) => {
+    const commandWord = words.find((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word.text))
+    const outputRedirectTargets: Array<string | null> = []
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index]
+      if (!word.outputRedirect) continue
+      const lastRedirect = word.text.lastIndexOf('>')
+      let target = lastRedirect >= 0 ? word.text.slice(lastRedirect + 1) : ''
+      if (target.startsWith('|')) target = target.slice(1)
+      if (!target) target = words[index + 1]?.text ?? ''
+      outputRedirectTargets.push(target || null)
+    }
+    return {
+      program: commandWord ? shellProgramName(commandWord) : null,
+      words: words.map((word) => word.text),
+      outputRedirectTargets,
+      dynamic: words.some((word) => word.dynamic)
+    }
+  })
+}
+
+const SED_PROGRAM_NAMES = new Set(['sed', 'gsed'])
+const PERL_PROGRAM_NAME = /^perl(?:\d+(?:\.\d+)*)?$/
+const SHELL_PROGRAM_NAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash', 'fish'])
+/** Programs whose `-c` (or `--command`) value is a command line the shell runs. */
+const COMMAND_OPTION_PROGRAM_NAMES = new Set(['su', 'script', 'flock'])
+const MAX_COMMAND_STRING_DEPTH = 3
+
+/**
+ * A sed option that edits in place. Short options cluster, so the letters before `i` are the ones
+ * that take no value: GNU's `-E -n -r -s -u -z -b` and BSD's `-a -l` (GNU's `-l` wants a number,
+ * so `-li` fails there, and reading it as an edit is the safe side). BSD also spells in-place `-I`,
+ * and GNU accepts any unambiguous prefix of `--in-place`, which `--i` already is.
+ */
+function isSedInPlaceOption(option: string): boolean {
+  const longOption = /^--([a-z-]+)(?:=|$)/.exec(option)
+  if (longOption) return longOption[1].startsWith('i') && 'in-place'.startsWith(longOption[1])
+  return /^-[abElnrsuz]*[iI]/.test(option)
+}
+
+function sedArgsEditInPlace(args: ShellWord[]): boolean {
+  for (const arg of args) {
+    if (arg.text === '--') return false
+    if (isSedInPlaceOption(arg.text)) return true
+  }
+  return false
+}
+
+/**
+ * Whether perl's switches ask for in-place editing. Switches cluster (`-pi`, `-0pi`, `-lpi.bak`),
+ * and a switch that takes a value ends its cluster (`-Ilib`, `-Mstrict`, `-ne` then its program),
+ * so `i` counts only when it is reached as a switch. A bare `-e`, `-E`, or `-I` takes the next word,
+ * so a program's text is never read as a switch. Every other word after perl is read, even past the
+ * script's name, which errs on the side of an edit.
+ */
+function perlArgsEditInPlace(args: ShellWord[]): boolean {
+  for (let index = 0; index < args.length; index += 1) {
+    const word = args[index].text
+    if (word === '--') return false
+    if (!word.startsWith('-') || word.startsWith('--')) continue
+
+    for (let cursor = 1; cursor < word.length; cursor += 1) {
+      const letter = word[cursor]
+      if (letter === 'i') return true
+      if (letter === '0' && (word[cursor + 1] === 'x' || word[cursor + 1] === 'X')) {
+        // `-0x0d`: the hexadecimal number is the value of `-0`, and its letters are not switches.
+        // Octal digits (`-0777`, `-l015`) are never switch letters, so they need no skipping.
+        cursor += 1
+        while (/[0-9a-fA-F]/.test(word[cursor + 1] ?? '')) cursor += 1
+        continue
+      }
+      if (letter === 'e' || letter === 'E' || letter === 'I') {
+        if (cursor === word.length - 1) index += 1
+        break
+      }
+      // These take the rest of the word as their value.
+      if ('CdDFmMVx'.includes(letter)) break
+    }
+  }
+  return false
+}
+
+/** The command line in a shell's `-c` value (`bash -c '…'`, `zsh -lc "…"`), or null. */
+function shellCommandStringArg(args: ShellWord[]): ShellWord | null {
+  for (let index = 0; index < args.length; index += 1) {
+    if (!/^-[a-zA-Z]*c[a-zA-Z]*$/.test(args[index].text)) continue
+    return args.slice(index + 1).find((arg) => !/^[-+]/.test(arg.text)) ?? null
+  }
+  return null
+}
+
+/** The command line in `su -c '…'`, `script -qc '…'`, or `flock <lock> --command '…'`, or null. */
+function commandOptionArg(args: ShellWord[]): string | null {
+  for (let index = 0; index < args.length; index += 1) {
+    const text = args[index].text
+    if (/^-[a-zA-Z]*c$/.test(text) || text === '--command') return args[index + 1]?.text ?? null
+    if (text.startsWith('--command=')) return text.slice('--command='.length)
+  }
+  return null
+}
+
+/**
+ * Whether a command line edits a file in place with sed or perl (Bug Q). It decides from the
+ * command's words, never from the raw text: a quoted sed script that only contains ` -i ` is a
+ * read, and another command's `-i` next to the letters `sed` or `perl` is not an edit. Every real
+ * in-place spelling must stay an edit, because Plan mode lets a read run: sed or perl named by a
+ * path, called through `sudo`, `env`, `xargs`, or `find -exec`, run by a shell's `-c`, by `eval`,
+ * or from a variable (`$SED -i`, whose text still says what it runs).
+ */
+export function commandEditsInPlace(line: string, depth = 0): boolean {
+  if (depth > MAX_COMMAND_STRING_DEPTH) return false
+
+  for (const words of splitShellSimpleCommands(line)) {
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index]
+      const args = words.slice(index + 1)
+
+      if (word.dynamic) {
+        if (/sed|perl/i.test(word.text) && (sedArgsEditInPlace(args) || perlArgsEditInPlace(args))) {
+          return true
+        }
+        continue
+      }
+
+      const program = shellProgramName(word)
+      if (SED_PROGRAM_NAMES.has(program) && sedArgsEditInPlace(args)) return true
+      if (PERL_PROGRAM_NAME.test(program) && perlArgsEditInPlace(args)) return true
+
+      const commandString =
+        SHELL_PROGRAM_NAMES.has(program)
+          ? shellCommandStringArg(args)?.text
+          : program === 'eval'
+            ? args.map((arg) => arg.text).join(' ')
+            : COMMAND_OPTION_PROGRAM_NAMES.has(program)
+              ? commandOptionArg(args)
+              : null
+      if (commandString && commandEditsInPlace(commandString, depth + 1)) return true
+    }
+  }
+  return false
+}
+
+function isLiteralInPlaceTarget(word: ShellWord): boolean {
+  const text = word.text.trim()
+  if (!text || word.dynamic || text.startsWith('-')) return false
+  if (text === '{}' || text === '+' || text === ';' || text === '\\;') return false
+  if (/^(?:\d*[<>]|&>)/.test(text)) return false
+  return true
+}
+
+function sedInPlaceTargetPaths(args: ShellWord[]): string[] {
+  const operands: ShellWord[] = []
+  let hasScriptSource = false
+
+  for (let index = 0; index < args.length; index += 1) {
+    const word = args[index]
+    const text = word.text
+
+    if (text === '--') {
+      operands.push(...args.slice(index + 1))
+      break
+    }
+
+    if (text.startsWith('-') && text !== '-') {
+      if (text === '--expression' || text === '--file') {
+        hasScriptSource = true
+        index += 1
+        continue
+      }
+      if (text.startsWith('--expression=') || text.startsWith('--file=')) {
+        hasScriptSource = true
+        continue
+      }
+
+      if (isSedInPlaceOption(text)) {
+        // BSD sed accepts an empty backup suffix as the following word (`-i ''`, `-I ''`).
+        // Preserve that empty shell word in the parser, but never mistake it for the script.
+        if (/^-[abElnrsuz]*[iI]$/.test(text) && args[index + 1]?.text === '') index += 1
+        continue
+      }
+
+      const scriptOption = /^-[abElnrsuz]*([ef])(.*)$/.exec(text)
+      if (scriptOption) {
+        hasScriptSource = true
+        if (!scriptOption[2]) index += 1
+      }
+      continue
+    }
+
+    operands.push(word)
+  }
+
+  if (!hasScriptSource) operands.shift()
+  return operands.filter(isLiteralInPlaceTarget).map((word) => word.text)
+}
+
+function perlInPlaceTargetPaths(args: ShellWord[]): string[] {
+  const operands: ShellWord[] = []
+  let hasProgramOption = false
+
+  for (let index = 0; index < args.length; index += 1) {
+    const word = args[index]
+    const text = word.text
+
+    if (text === '--') {
+      operands.push(...args.slice(index + 1))
+      break
+    }
+
+    if (!text.startsWith('-') || text === '-') {
+      operands.push(word)
+      continue
+    }
+
+    for (let cursor = 1; cursor < text.length; cursor += 1) {
+      const letter = text[cursor]
+      if (letter === 'e' || letter === 'E') {
+        hasProgramOption = true
+        if (cursor === text.length - 1) index += 1
+        break
+      }
+      if (letter === 'I') {
+        if (cursor === text.length - 1) index += 1
+        break
+      }
+      if ('CdDFmMVx'.includes(letter)) break
+    }
+  }
+
+  if (!hasProgramOption) operands.shift()
+  return operands.filter(isLiteralInPlaceTarget).map((word) => word.text)
+}
+
+function collectInPlaceEditTargetPaths(line: string, depth: number): string[] {
+  if (depth > MAX_COMMAND_STRING_DEPTH) return []
+
+  const targets: string[] = []
+  for (const words of splitShellSimpleCommands(line)) {
+    let simpleCommandEditsInPlace = false
+
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index]
+      const args = words.slice(index + 1)
+
+      if (word.dynamic) {
+        if (/sed/i.test(word.text) && sedArgsEditInPlace(args)) {
+          simpleCommandEditsInPlace = true
+          targets.push(...sedInPlaceTargetPaths(args))
+        }
+        if (/perl/i.test(word.text) && perlArgsEditInPlace(args)) {
+          simpleCommandEditsInPlace = true
+          targets.push(...perlInPlaceTargetPaths(args))
+        }
+        continue
+      }
+
+      const program = shellProgramName(word)
+      if (SED_PROGRAM_NAMES.has(program) && sedArgsEditInPlace(args)) {
+        simpleCommandEditsInPlace = true
+        targets.push(...sedInPlaceTargetPaths(args))
+        continue
+      }
+      if (PERL_PROGRAM_NAME.test(program) && perlArgsEditInPlace(args)) {
+        simpleCommandEditsInPlace = true
+        targets.push(...perlInPlaceTargetPaths(args))
+        continue
+      }
+
+      const commandString =
+        SHELL_PROGRAM_NAMES.has(program)
+          ? shellCommandStringArg(args)?.text
+          : program === 'eval'
+            ? args.map((arg) => arg.text).join(' ')
+            : COMMAND_OPTION_PROGRAM_NAMES.has(program)
+              ? commandOptionArg(args)
+              : null
+      if (commandString && commandEditsInPlace(commandString, depth + 1)) {
+        simpleCommandEditsInPlace = true
+        targets.push(...collectInPlaceEditTargetPaths(commandString, depth + 1))
+      }
+    }
+
+    // `find ... -exec sed -i ... {} +` names its mutable population before `-exec`; the
+    // placeholder itself is not a path the protected-source scan can resolve.
+    if (simpleCommandEditsInPlace) {
+      const findIndex = words.findIndex((word) => shellProgramName(word) === 'find')
+      if (findIndex !== -1) {
+        for (const word of words.slice(findIndex + 1)) {
+          if (word.text.startsWith('-')) break
+          if (isLiteralInPlaceTarget(word)) targets.push(word.text)
+        }
+      }
+    }
+  }
+
+  return targets
+}
+
+/** Every literal file operand named by a recognized in-place sed/perl edit. */
+export function extractInPlaceEditTargetPaths(line: string): string[] {
+  return Array.from(new Set(collectInPlaceEditTargetPaths(line, 0)))
+}
+
+/** The file an in-place edit names: the last word of its line, unless that word is an option. */
+function extractInPlaceEditTargetPath(shellCommand: string): string | undefined {
   const match = shellCommand.match(/\s(['"]?)([^'"`\s|><]+)\1\s*$/)
   const candidate = match?.[2]?.trim()
   if (!candidate || candidate.startsWith('-') || candidate.includes('=')) return undefined
@@ -441,13 +1035,18 @@ export function mapBashCommandToRendererTool(command: string): BashToolMapping {
     }
   }
 
-  const inPlaceEditPath =
-    commandLines.map((line) => extractPathFromInPlaceEditCommand(line)).find((value) => Boolean(value)) ??
-    extractPathFromInPlaceEditCommand(primaryCommand)
-  if (inPlaceEditPath) {
+  // An in-place edit stays an edit even when its line names no clean path (`… | cat -n`): read or
+  // plain-command mapping would let Plan mode run it.
+  const inPlaceEditLines = [...commandLines, primaryCommand].filter((line) => commandEditsInPlace(line))
+  if (inPlaceEditLines.length > 0) {
+    const inPlaceEditPath = inPlaceEditLines
+      .map((line) => extractInPlaceEditTargetPath(line))
+      .find((value) => Boolean(value))
     return {
       toolName: 'batshit_server_edit_file',
-      args: { ...normalized, filePath: inPlaceEditPath, path: inPlaceEditPath },
+      args: inPlaceEditPath
+        ? { ...normalized, filePath: inPlaceEditPath, path: inPlaceEditPath }
+        : normalized,
       reason: 'in-place-edit'
     }
   }

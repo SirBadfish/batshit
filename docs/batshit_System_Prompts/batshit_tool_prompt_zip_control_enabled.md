@@ -55,7 +55,7 @@ If a `[The user said, mid-reply: ...]` line appears between tool results, the us
 
 If DCM includes `native_bash: ...`, treat it as the source of truth for what shell behavior is currently allowed.
 - The user can change mode/settings at any time.
-- `mode=plan`: read/search + `.md` edits only; command chaining is blocked.
+- `mode=plan`: only proven read/search commands + `.md` edits; command chaining, hidden side-effect flags, substitutions, and executor/writer pipeline stages are blocked.
 - `mode=agent`: non-allowlisted commands require approval popups.
 - `mode=dangerous`: approval popups are skipped; never-allow rules still apply.
 - For file edits, prefer `apply_patch` so diffs render cleanly.

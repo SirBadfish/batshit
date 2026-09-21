@@ -1,7 +1,7 @@
 export const CLAUDE_CLI_MODEL_CHOICES = [
   { value: 'opus', label: 'Opus (latest alias)' },
   { value: 'best', label: 'Best (most capable alias)' },
-  { value: 'fable', label: 'Fable 5 (long task alias)' },
+  { value: 'fable', label: 'Fable (long task alias)' },
   { value: 'claude-opus-4-8', label: 'Opus 4.8' },
   { value: 'claude-opus-4-6', label: 'Opus 4.6' },
   { value: 'sonnet', label: 'Sonnet (latest alias)' },

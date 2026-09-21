@@ -2,6 +2,7 @@ import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import { requireOwnedSession, requireUser } from '$lib/server/services/routeSecurity'
+import { isZipStateSource, type ZipStateSource } from '$lib/services/zipping'
 
 // GET: Get unzipped items for a session
 export const GET: RequestHandler = async ({ url, locals }) => {
@@ -29,11 +30,12 @@ export const GET: RequestHandler = async ({ url, locals }) => {
     // Rezipped markers force compression after manual rezip
     const rezippedKey = `rezipped:${sessionId}`
     const rezippedIds = await redis.sMembers(rezippedKey)
-    const rezippedSources: Record<string, 'user' | 'agent'> = {}
+    const rezippedSources: Record<string, ZipStateSource> = {}
     for (const zipId of rezippedIds || []) {
       const marker = await redis.get(`rezipped_item:${sessionId}:${zipId}`)
       const source = (marker as any)?.source
-      rezippedSources[zipId] = source === 'agent' ? 'agent' : 'user'
+      // A marker with no readable source predates sources and was always the user's.
+      rezippedSources[zipId] = isZipStateSource(source) ? source : 'user'
     }
 
     return json({ unzipped, rezipped: rezippedIds || [], rezippedSources })
@@ -58,7 +60,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const sessionCheck = await requireOwnedSession(item.sessionId, user.value.id)
     if (!sessionCheck.ok) return sessionCheck.response
 
-    if (item.source !== 'user' && item.source !== 'agent') {
+    // SA-120 P5: the browser never CREATES an `inferred` unzip (the server writes those at
+    // the accepted-send boundary), but it does re-post one to persist its countdown. That
+    // must keep its source: coercing it to `user` would turn Batshit's weakest, temporary
+    // state into a user lock. Accepting the value from a browser widens nothing, because
+    // `inferred` locks nothing and both other sources overwrite it.
+    if (!isZipStateSource(item.source)) {
       item.source = 'user'
     }
 

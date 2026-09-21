@@ -5,6 +5,7 @@ import * as Card from '$lib/components/ui/card'
 import { Input } from '$lib/components/ui/input'
 import * as Label from '$lib/components/ui/label'
 import { Button } from '$lib/components/ui/button'
+import SamplerOrderEditor from '../models/SamplerOrderEditor.svelte'
 import * as Select from '$lib/components/ui/select'
 import * as ToggleGroup from '$lib/components/ui/toggle-group'
 import { Textarea } from '$lib/components/ui/textarea'
@@ -42,7 +43,6 @@ import { formatDefaultInput, fromInputValue, toInputValue } from '$lib/utils/par
 import ModelProviderIcon from '$lib/components/models/ModelProviderIcon.svelte'
   import type {
     SavedModel,
-    PricingTier,
     ModelCompatibility,
     ModelCapabilities,
     ModelEnrichmentSnapshot,
@@ -100,6 +100,11 @@ import {
   toComparableNumber,
   type CatalogRoleFilter
 } from '$lib/components/settings/models/modelSettingsFormatters'
+import {
+  buildCatalogPresetPricing,
+  buildPresetPricingFromForm,
+  parsePresetContextWindow
+} from '$lib/components/settings/models/modelPresetPayload'
 import { themeStore } from '$lib/stores/theme'
 	import * as savedModelsStore from '$lib/stores/savedModels.svelte'
 import * as compatibilityMatrixStore from '$lib/stores/compatibilityMatrix.svelte'
@@ -187,7 +192,7 @@ import {
     streamingEffect: boolean
     search: boolean
     sandbox: 'read-only' | 'workspace-write' | 'danger-full-access'
-    approval: 'never' | 'on-request' | 'on-failure' | 'untrusted'
+    approval: 'never' | 'on-request'
     addDirs: string[]
     enableFeatures: string[]
     disableFeatures: string[]
@@ -213,12 +218,12 @@ import {
     { sandbox: CodexFormOptions['sandbox']; approval: CodexFormOptions['approval'] }
   > = {
     chat: { sandbox: 'read-only', approval: 'never' },
-    agent: { sandbox: 'workspace-write', approval: 'on-failure' },
+    agent: { sandbox: 'workspace-write', approval: 'on-request' },
     agent_full: { sandbox: 'danger-full-access', approval: 'never' }
   }
   const CODEX_PERMISSION_OPTIONS: Array<{ value: CodexPermissionMode; label: string; helper: string }> = [
     { value: 'chat', label: 'Chat', helper: 'Read-only, never prompts' },
-    { value: 'agent', label: 'Agent', helper: 'Workspace write, ask on failure' },
+    { value: 'agent', label: 'Agent', helper: 'Workspace write, ask when needed' },
     { value: 'agent_full', label: 'Agent (full)', helper: 'Full access, run without prompts' }
   ]
   const CODEX_SANDBOX_OPTIONS = [
@@ -228,9 +233,7 @@ import {
   ] as const
   const CODEX_APPROVAL_OPTIONS = [
     { value: 'never', label: 'Never' },
-    { value: 'on-failure', label: 'On failure' },
-    { value: 'on-request', label: 'On request' },
-    { value: 'untrusted', label: 'Untrusted' }
+    { value: 'on-request', label: 'On request' }
   ] as const
 
 const EMPTY_FORM: ModelFormState = {
@@ -571,7 +574,6 @@ function allowModelForConnection(model: CatalogModel, connection: CatalogConnect
   let isEnriching = $state(false)
   let enrichmentWarning = $state<string | null>(null)
   let purgeNotice = $state<{ count: number; names: string[] } | null>(null)
-  let suppressCatalogAutoModelSelection = $state(false)
 
   let selectedModelId = $state<string | null>(null)
   let editingForm = $state<ModelFormState>({ ...EMPTY_FORM })
@@ -842,11 +844,15 @@ let lastInvalidModelSignature = $state<string | null>(null)
     return typeof raw === 'string' && raw.trim() ? raw.trim() : null
   })
   /**
-   * SA-102 P3 (DL-102-15): Ollama's OpenAI-compatible endpoint silently ignores
-   * top_k, min_p, repeat_penalty, mirostat and num_ctx (measured: top_k 1 at
-   * temperature 2 still produced different answers). Those live in a Modelfile
-   * instead — which is a recipe the user writes, not a file Ollama keeps on
-   * disk, so the only useful help is the exact commands, prefilled with this
+   * SA-125 supersedes SA-102's DL-102-15 here. Ollama now speaks its NATIVE
+   * `/api/chat`, where top_k, min_p, repeat_penalty, repeat_last_n and num_ctx
+   * all genuinely apply (measured 2026-09-20 with a pinned seed; the same values
+   * on `/v1` were byte-identical to baseline). Batshit sends them directly, so
+   * the Modelfile is no longer the only answer.
+   *
+   * The commands stay because ONE thing still needs them: Mirostat was accepted
+   * by Ollama and changed nothing, in both modes, so Batshit does not offer it.
+   * A user who wants to try it anyway needs the recipe, prefilled with this
    * model's name.
    */
   const ollamaModelfileCommands = $derived.by(() => {
@@ -858,6 +864,8 @@ let lastInvalidModelSignature = $state<string | null>(null)
       show: `ollama show --modelfile ${model} > Modelfile`,
       parameter: 'PARAMETER top_k 40',
       create: `ollama create ${base}-custom -f Modelfile`,
+      // Still useful as a server-wide default; the per-preset Context size
+      // field is now the normal route.
       contextEnv: 'OLLAMA_CONTEXT_LENGTH=32768 ollama serve'
     }
   })
@@ -1068,6 +1076,26 @@ let lastInvalidModelSignature = $state<string | null>(null)
     return formatDeveloperLabel(normalized)
   }
 
+  /**
+   * BL-58 / SA-125 follow-up: whether to badge a connection as n8n-usable.
+   *
+   * This used to be hardcoded static text on every row, which made it a badge
+   * that carried no information and, worse, said something false: the CLI
+   * connections report `n8nStatus: 'locked'` and every other row reports
+   * `'unknown'`, so nothing actually reported compatible. Local programs are
+   * `n8n: false` / `batshit_only` in their own compatibility records too.
+   *
+   * Two gates now. n8n is no longer a Primary Agent type at all — it is only a
+   * Workflow Subagent platform — so a user without one never needs to see the
+   * badge, and `hasWorkflowSubagents` already existed for exactly that. Beyond
+   * that, only a connection whose own data says `ready` earns the badge.
+   */
+  function showsN8nBadge(option: { id: string; n8nStatus?: string } | null | undefined) {
+    if (!option) return false
+    if (!n8nCompatibilityState.hasWorkflowSubagents) return false
+    return option.n8nStatus === 'ready'
+  }
+
   function resolveProviderSectionTitle(
     items: ParameterDefinition[],
     provider?: string | null
@@ -1208,15 +1236,15 @@ let lastInvalidModelSignature = $state<string | null>(null)
     }
   })
 
+  // The model is always the user's explicit choice. Auto-picking the first row handed a first-run
+  // user the list's oldest entry (Claude 3 Haiku, OpenAI's legacy babbage-002), BL-66. When the
+  // chosen model leaves the list (another developer or role filter), ask again instead of swapping.
   $effect(() => {
     if (!selectedCatalogProvider) return
     if (!filteredCatalogEntries.length) return
-    if (suppressCatalogAutoModelSelection && !selectedCatalogModelId) return
-    if (
-      !selectedCatalogModelId ||
-      !filteredCatalogEntries.some((model) => model.catalogId === selectedCatalogModelId)
-    ) {
-      selectedCatalogModelId = filteredCatalogEntries[0].catalogId
+    if (!selectedCatalogModelId) return
+    if (!filteredCatalogEntries.some((model) => model.catalogId === selectedCatalogModelId)) {
+      selectedCatalogModelId = ''
     }
   })
 
@@ -1398,7 +1426,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
   function createDefaultCodexOptions(): CodexFormOptions {
     return {
       permissionMode: 'chat',
-      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? 'gpt-5',
+      model: CODEX_SUBMODEL_CHOICES[0]?.value ?? 'gpt-6-astra',
       reasoningEffort: 'default',
       streamingEffect: false,
       search: true,
@@ -1482,7 +1510,7 @@ let lastInvalidModelSignature = $state<string | null>(null)
       settings.codex_approval === 'on-request' ||
       settings.codex_approval === 'on-failure' ||
       settings.codex_approval === 'untrusted'
-        ? settings.codex_approval
+        ? 'on-request'
         : settings.codex_approval === 'never'
           ? 'never'
           : preset.approval
@@ -1652,7 +1680,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
     creatingNew = false
     suppressDraftAutoCreate = false
     lastDraftCreateAttemptSignature = null
-    suppressCatalogAutoModelSelection = false
     selectedModelId = model.id
     editingForm = normaliseModel(model)
     codexOptions = normaliseCodexOptions(model.settings ?? null)
@@ -1682,7 +1709,6 @@ let lastInvalidModelSignature = $state<string | null>(null)
     creatingNew = false
     suppressDraftAutoCreate = false
     lastDraftCreateAttemptSignature = null
-    suppressCatalogAutoModelSelection = false
     selectedModelId = null
     editingForm = { ...EMPTY_FORM }
     codexOptions = createDefaultCodexOptions()
@@ -1935,6 +1961,13 @@ $effect(() => {
     }
 
     const sourceModel = selectedCatalogModel
+    const applyTarget = resolveCatalogApplyTarget(sourceModel)
+    if (!applyTarget.resolvedIds) {
+      // Refuse before startCreate() resets the pickers, so the user keeps their selection and
+      // sees why (BL-66: this used to fail silently with an empty form).
+      toast.error(missingCatalogIdentityMessage(applyTarget.connection, applyTarget.connectionId))
+      return
+    }
     startCreate()
     // startCreate resets the draft state; pause auto-create after that reset while
     // catalog copy/enrichment finishes so only the final selected connection is saved.
@@ -1990,7 +2023,18 @@ $effect(() => {
           error instanceof Error
             ? error.message
             : 'Failed to fetch metadata from Vercel, using catalog snapshot.'
-        const { data, warnings } = buildCatalogEnrichmentFromModel(sourceModel)
+        let fallback: ReturnType<typeof buildCatalogEnrichmentFromModel>
+        try {
+          fallback = buildCatalogEnrichmentFromModel(sourceModel)
+        } catch (fallbackError) {
+          // Clear the half-filled draft so draft auto-create cannot save it, then say why.
+          showCatalogLanding()
+          toast.error('Model preset not created', {
+            description: fallbackError instanceof Error ? fallbackError.message : message
+          })
+          return
+        }
+        const { data, warnings } = fallback
         applyEnrichment(data)
         enrichmentWarning = [message, ...warnings].join(' ')
         catalogSelectionDirty = false
@@ -2542,35 +2586,10 @@ $effect(() => {
   function buildModelPayload(form: ModelFormState): SavedModel {
     const now = new Date().toISOString()
 
-    let pricingInput: number | PricingTier[] = 0
-    if (form.pricingInputMode === 'tiered') {
-      const tiers: (PricingTier | null)[] = form.pricingInputTiers.map((tier) => {
-        const from = parseFormattedNumber(tier.from)
-        const to = parseFormattedNumber(tier.to)
-        const cost = parseFormattedNumber(tier.cost)
-
-        if (from === undefined || to === undefined || cost === undefined) {
-          return null
-        }
-        if (from < 0 || to <= 0 || cost < 0) {
-          return null
-        }
-
-        return {
-          from,
-          to,
-          costPerMillion: cost
-        } as PricingTier
-      })
-
-      const filtered = tiers.filter((tier): tier is PricingTier => tier !== null)
-      pricingInput = filtered.length > 0 ? filtered.sort((a, b) => a.from - b.from) : 0
-    } else {
-      const parsed = parseFormattedNumber(form.pricingInput)
-      pricingInput = parsed ?? 0
-    }
-
-    const contextWindow = form.contextWindow ? parseFormattedInteger(form.contextWindow) || 0 : 0
+    // BL-67: blank sends nothing, zero is real. An unknown price or context window
+    // stays absent so the Token Panel says Unknown instead of an exact $0.00.
+    const pricing = buildPresetPricingFromForm(form)
+    const contextWindow = parsePresetContextWindow(form.contextWindow)
     const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(form.parameterValues.maxTokens ?? null, contextWindow)
     const settings = buildParameterSettings(form)
     settings.maxTokens = maxOutputResolution.maxOutputTokens
@@ -2601,12 +2620,8 @@ $effect(() => {
       effectiveModelId: form.effectiveModelId ?? undefined,
       purpose: form.purpose,
       purposeOverride: form.purposeOverride ?? undefined,
-      contextWindow,
-      pricing: {
-        input: pricingInput,
-        output: form.pricingOutput ? parseFormattedNumber(form.pricingOutput) || 0 : 0,
-        cachedInput: form.pricingCachedInput ? parseFormattedNumber(form.pricingCachedInput) || undefined : undefined
-      },
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      pricing,
       settings: mergedSettings,
       capabilities: form.capabilities ?? undefined,
       voiceSession: voiceSession ?? undefined,
@@ -2660,35 +2675,57 @@ $effect(() => {
     }
   }
 
-  function prefillFromCatalogModel(model: CatalogModel) {
+  // Which connection a catalog row would be applied through, and its exact provider identity there.
+  // Pure: callers check it BEFORE touching the form, so a row that cannot run on the chosen
+  // connection is refused up front instead of half-applying (BL-66).
+  function resolveCatalogApplyTarget(model: CatalogModel) {
     const currentConnection = selectedConnection
     const needsAutoSelection =
       !currentConnection ||
       !isModelAllowedForConnection(model, currentConnection) ||
       !allowModelForConnection(model, currentConnection)
 
-    let connectionIdForVariant = selectedConnectionId
-    let connectionForVariant = currentConnection
+    let connectionId = selectedConnectionId
+    let connection = currentConnection
+    let autoSelectedConnectionId: string | null = null
     if (needsAutoSelection) {
       const nextConnection = autoSelectConnectionForModel(connectionOptions, model)
       if (nextConnection) {
-        selectedConnectionId = nextConnection.id
-        connectionIdForVariant = nextConnection.id
-        connectionForVariant = nextConnection
+        autoSelectedConnectionId = nextConnection.id
+        connectionId = nextConnection.id
+        connection = nextConnection
       }
     }
 
     const resolvedIds = resolveCatalogIds({
-      connectionId: connectionIdForVariant,
-      connection: connectionForVariant,
+      connectionId,
+      connection,
       developerId: model.provider,
       modelId: model.name,
       idVariants: model.idVariants ?? null
     })
+    return { connectionId, connection, autoSelectedConnectionId, resolvedIds }
+  }
+
+  function missingCatalogIdentityMessage(
+    connection: CatalogConnectionOption | null,
+    connectionId: string | null
+  ) {
+    const label = connection?.label || connectionId || 'this connection'
+    return `This model has no exact identifier for ${label}, so it cannot run there. Pick another model, or refresh the catalog.`
+  }
+
+  function prefillFromCatalogModel(model: CatalogModel) {
+    const target = resolveCatalogApplyTarget(model)
+    if (target.autoSelectedConnectionId) {
+      selectedConnectionId = target.autoSelectedConnectionId
+    }
+    const resolvedIds = target.resolvedIds
     if (!resolvedIds) {
-      formValidationError = `The Model Catalog is missing the exact identifier for ${connectionIdForVariant || 'this connection'}. Refresh the catalog before using this model.`
+      formValidationError = missingCatalogIdentityMessage(target.connection, target.connectionId)
       return
     }
+    const connectionForVariant = target.connection
     const hostedCatalogIdentity = !['local', 'n8n-only', 'codex', 'claude-cli'].includes(model.source ?? '')
     const isGatewaySelection = connectionForVariant?.transport === 'vercel-gateway'
     editingForm = {
@@ -2784,7 +2821,6 @@ $effect(() => {
       baselineModelId.length > 0 && normalizedField(editingForm.modelId) !== baselineModelId
 
     if (providerModified || modelModified) {
-      suppressCatalogAutoModelSelection = true
       if (!providerModified && editingForm.provider) {
         selectedCatalogProvider = canonicalizeCatalogDeveloperId(editingForm.provider)
       } else {
@@ -2828,11 +2864,9 @@ $effect(() => {
 
     if (match) {
       const scopedMatch = resolveConnectionScopedCatalogModel(match, selectedConnection)
-      suppressCatalogAutoModelSelection = false
       selectedCatalogProvider = scopedMatch.canonicalDeveloperId
       selectedCatalogModelId = match.id
     } else {
-      suppressCatalogAutoModelSelection = false
       selectedCatalogProvider = ''
       selectedCatalogModelId = ''
     }
@@ -2841,30 +2875,14 @@ $effect(() => {
   function handleCatalogProviderSelect(value: string | string[]) {
     const nextValue = Array.isArray(value) ? value[0] ?? '' : value ?? ''
     selectedCatalogProvider = nextValue
-    suppressCatalogAutoModelSelection = false
     catalogSelectionDirty = true
-    if (!nextValue) {
-      selectedCatalogModelId = ''
-      return
-    }
-
-    const baseModels = selectedConnection
-      ? catalogModels.filter(
-          (model) =>
-            isModelAllowedForConnection(model, selectedConnection) &&
-            allowModelForConnection(model, selectedConnection)
-        )
-      : catalogModels
-    const candidates = buildConnectionScopedCatalogModels(baseModels, selectedConnection).filter(
-      (model) => model.developerId === nextValue
-    )
-    selectedCatalogModelId = candidates[0]?.catalogId ?? ''
+    // A new developer means a new model list; the user picks from it (no first-row default).
+    selectedCatalogModelId = ''
   }
 
   function handleCatalogModelSelect(value: string | string[]) {
     const nextValue = Array.isArray(value) ? value[0] ?? '' : value ?? ''
     selectedCatalogModelId = nextValue
-    suppressCatalogAutoModelSelection = false
     catalogSelectionDirty = true
   }
 
@@ -2934,7 +2952,8 @@ $effect(() => {
     const pricingOutput = toCatalogNumber(model.pricing?.output)
     const pricingCached = toCatalogNumber(model.pricing?.cachedInput)
     const rawContext = toCatalogNumber(model.contextWindow)
-    const contextWindow = rawContext !== undefined ? Math.max(0, Math.round(rawContext)) : undefined
+    // BL-67: a catalog window of 0 (or less) is not a window; it is unknown.
+    const contextWindow = rawContext !== undefined && rawContext > 0 ? Math.round(rawContext) : undefined
     const maxOutputResolution = resolveSafeFormMaxOutputTokenResolution(rawMaxOutputTokens, contextWindow)
     const baselineMaxOutputTokens = maxOutputResolution.maxOutputTokens
     const capabilities = catalogFeaturesToCapabilities(model.features ?? null)
@@ -2980,14 +2999,12 @@ $effect(() => {
       identifier: resolvedIds.effectiveModelId
     }
 
-    const pricingPayload =
-      pricingInput !== undefined || pricingOutput !== undefined || pricingCached !== undefined
-        ? {
-            input: pricingInput ?? 0,
-            output: pricingOutput ?? 0,
-            ...(pricingCached !== undefined ? { cachedInput: pricingCached } : {})
-          }
-        : undefined
+    // BL-67: copy only the prices the row lists; a missing half is not invented as 0.
+    const pricingPayload = buildCatalogPresetPricing({
+      input: pricingInput,
+      output: pricingOutput,
+      cachedInput: pricingCached
+    })
 
     const data: Partial<SavedModel> = {
       modelName: baselineModelName,
@@ -3094,24 +3111,23 @@ $effect(() => {
     if (data.modelName) next.modelName = data.modelName
     if (data.modelId) next.modelId = data.modelId
     if (data.provider) next.provider = data.provider
-    if (typeof data.contextWindow === 'number') {
-      next.contextWindow = data.contextWindow ? formatGroupedIntegerDisplay(data.contextWindow) : ''
-    }
-
-    if (data.pricing) {
-      if (data.pricing.input !== undefined) {
-        next.pricingInputMode = 'flat'
-        next.pricingInputTiers = []
-        next.pricingInput = formatCurrencyDisplay(data.pricing.input ?? 0)
-      }
-      if (data.pricing.output !== undefined) {
-        next.pricingOutput = formatCurrencyDisplay(data.pricing.output ?? 0)
-      }
-      if (data.pricing.cachedInput !== undefined) {
-        next.pricingCachedInput =
-          data.pricing.cachedInput === undefined ? '' : formatCurrencyDisplay(data.pricing.cachedInput ?? 0)
-      }
-    }
+    // BL-67: every caller hands in a whole catalog row, so a window or price the row
+    // does not list is unknown: clear the field (it saves as absent) instead of keeping
+    // the previous model's value or writing a fake 0. A listed 0 price stays 0.
+    next.contextWindow =
+      typeof data.contextWindow === 'number' && data.contextWindow > 0
+        ? formatGroupedIntegerDisplay(data.contextWindow)
+        : ''
+    next.pricingInputMode = 'flat'
+    next.pricingInputTiers = []
+    next.pricingInput =
+      typeof data.pricing?.input === 'number' ? formatCurrencyDisplay(data.pricing.input) : ''
+    next.pricingOutput =
+      typeof data.pricing?.output === 'number' ? formatCurrencyDisplay(data.pricing.output) : ''
+    next.pricingCachedInput =
+      typeof data.pricing?.cachedInput === 'number'
+        ? formatCurrencyDisplay(data.pricing.cachedInput)
+        : ''
 
     if (data.settings && typeof data.settings.maxTokens === 'number') {
       next.parameterValues = {
@@ -3291,6 +3307,13 @@ $effect(() => {
 
     if (!selectedCatalogModel) {
       toast.error('Select a model from the catalog first.')
+      return
+    }
+
+    const applyTarget = resolveCatalogApplyTarget(selectedCatalogModel)
+    if (!applyTarget.resolvedIds) {
+      // Refuse before the existing preset's connection fields change (BL-66).
+      toast.error(missingCatalogIdentityMessage(applyTarget.connection, applyTarget.connectionId))
       return
     }
 
@@ -3523,9 +3546,11 @@ $effect(() => {
                                 <span>Batshit · {option.status === 'ready' ? 'ready' : 'compatible'}</span>
                               </Badge>
                             {/if}
-                            <Badge variant="outline" class="batshit-settings-child-label">
-                              n8n · compatible
-                            </Badge>
+                            {#if showsN8nBadge(option)}
+                              <Badge variant="outline" class="batshit-settings-child-label">
+                                n8n · compatible
+                              </Badge>
+                            {/if}
                           </div>
                         </div>
                       </Select.Item>
@@ -3756,9 +3781,11 @@ $effect(() => {
                           <span>Batshit · {selectedConnection.status === 'ready' ? 'ready' : 'compatible'}</span>
                         </Badge>
                       {/if}
-                      <Badge variant="outline" class="batshit-settings-child-label">
-                        n8n · compatible
-                      </Badge>
+                      {#if showsN8nBadge(selectedConnection)}
+                        <Badge variant="outline" class="batshit-settings-child-label">
+                          n8n · compatible
+                        </Badge>
+                      {/if}
                     </div>
                   {/if}
                   {#if getModelConnections(selectedCatalogModel).length}
@@ -4028,9 +4055,11 @@ $effect(() => {
 		                          <span>Batshit · {appliedConnection.status === 'ready' ? 'ready' : 'compatible'}</span>
 		                        </Badge>
 		                      {/if}
-		                      <Badge variant="outline" class="batshit-settings-child-label">
-		                        n8n · compatible
-		                      </Badge>
+		                      {#if showsN8nBadge(appliedConnection)}
+		                        <Badge variant="outline" class="batshit-settings-child-label">
+		                          n8n · compatible
+		                        </Badge>
+		                      {/if}
 		                    </div>
 		                  {:else if editingForm.connectionId}
 		                    <p class="batshit-settings-form-meta">
@@ -4462,11 +4491,11 @@ $effect(() => {
 	                  {/if}
 	                {/if}
 	                {#if localProviderId === 'ollama'}
-	                  <p class="batshit-settings-form-meta is-warning">
-	                    Ollama cannot be told a context size by Batshit, and it drops the oldest part
-	                    of a long conversation without saying so. Set it in a Modelfile, or start
-	                    Ollama with OLLAMA_CONTEXT_LENGTH. The exact commands are in the
-	                    Managed by Ollama note below.
+	                  <p class="batshit-settings-form-meta">
+	                    Batshit can set Ollama's context size directly now. Use the Context size
+	                    field below. Leave it blank to keep whatever Ollama already loaded.
+	                    Changing it makes Ollama reload the model, which takes a moment and clears
+	                    its prompt cache, so set it once rather than per chat.
 	                  </p>
 	                {/if}
 	              </div>
@@ -4589,8 +4618,9 @@ $effect(() => {
               {/if}
           {/snippet}
 	        {#if n8nCompatibilitySyncError && n8nCompatibilityState.hasWorkflowSubagents}
-	          <div class="batshit-settings-inline-alert is-danger">
-	            n8n parameter support could not refresh: {n8nCompatibilitySyncError}
+	          <div class="batshit-settings-inline-alert is-warning">
+	            Batshit could not reach n8n to check which settings its nodes accept. Your preset is
+	            unaffected; only the n8n column of the compatibility notes is out of date.
 	          </div>
 	        {/if}
 		          <div class="batshit-settings-form-stack">
@@ -4689,10 +4719,12 @@ $effect(() => {
 		                      {/if}
 		                      {#if ollamaModelfileCommands}
 		                        <p class="mt-2">
-		                          Ollama accepts fewer settings here than the other programs. Top K, Min P,
-		                          repeat penalty, Mirostat and the context length are not settings Ollama
-		                          reads from a request, so Batshit does not offer them. They live in a
-		                          Modelfile, which you write yourself. To set one for
+		                          Batshit now sends Top K, Min P, repeat penalty, the repeat window and
+		                          the context size straight to Ollama, so you do not need a Modelfile for
+		                          those. Mirostat is the exception: Ollama accepted it but it changed
+		                          nothing when we measured it, so Batshit does not offer a box that does
+		                          nothing. If you want to try it anyway, it lives in a Modelfile, which
+		                          you write yourself. To set one for
 		                          <code>{ollamaModelfileCommands.model}</code>:
 		                        </p>
 		                        <p>1. <code>{ollamaModelfileCommands.show}</code></p>
@@ -4703,7 +4735,8 @@ $effect(() => {
 		                        <p>3. <code>{ollamaModelfileCommands.create}</code></p>
 		                        <p>4. Pick the new model in Batshit.</p>
 		                        <p class="mt-2">
-		                          For context length only, you can instead start Ollama with
+		                          To change the context size for every model at once, rather than per
+		                          preset, start Ollama with
 		                          <code>{ollamaModelfileCommands.contextEnv}</code>.
 		                        </p>
 		                        <p class="mt-2">
@@ -4843,6 +4876,11 @@ $effect(() => {
                                           {/each}
                                         </Select.Content>
                                       </Select.Root>
+                                    {:else if parameter.inputType === 'sampler-order'}
+                                      <SamplerOrderEditor
+                                        value={getParameterValue(parameter.name)}
+                                        onChange={(next) => updateParameterValue(parameter.name, next)}
+                                      />
                                     {:else if parameter.inputType === 'textarea' || parameter.inputType === 'json' || parameter.inputType === 'string-array'}
                                       <Textarea
                                         rows={parameter.inputType === 'json' ? 6 : 3}

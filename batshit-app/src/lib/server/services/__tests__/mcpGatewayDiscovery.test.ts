@@ -60,6 +60,18 @@ vi.mock('$lib/services/apiKey.server', () => ({
   }
 }))
 
+// Discovery resolves a STDIO launch first, because the saved tool list is keyed on it.
+vi.mock('../mcpGatewayStdio', () => ({
+  resolveStdioGatewayProcessConfig: vi.fn(async ({ projectPath }: { projectPath?: string | null }) => ({
+    command: '/usr/local/bin/node',
+    args: [],
+    cwd: projectPath ?? undefined,
+    env: {},
+    startupTimeoutMs: 10_000,
+    toolCallTimeoutMs: 60_000
+  }))
+}))
+
 vi.mock('$lib/utils/logger', () => ({
   logger: {
     debug: vi.fn(),
@@ -69,8 +81,10 @@ vi.mock('$lib/utils/logger', () => ({
 }))
 
 describe('MCPGatewayDiscovery', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks()
+    const { mcpToolListCache } = await import('../mcpToolListCache')
+    mcpToolListCache.clearAll()
     mocks.closeClient.mockResolvedValue(undefined)
     mocks.targetExecute.mockResolvedValue({ text: 'hello' })
     mocks.discoverTools.mockResolvedValue([
@@ -125,11 +139,14 @@ describe('MCPGatewayDiscovery', () => {
       }
     )
 
-    expect(mocks.discoverTools).toHaveBeenCalledWith({
-      gateway: expect.objectContaining({ id: 'gw-stdio' }),
-      userId: 'josh',
-      projectPath: '/Users/example/batshit'
-    })
+    expect(mocks.discoverTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        gateway: expect.objectContaining({ id: 'gw-stdio' }),
+        userId: 'josh',
+        projectPath: '/Users/example/batshit',
+        resolved: expect.objectContaining({ cwd: '/Users/example/batshit' })
+      })
+    )
 
     await (result.tools.read_text_file as any).execute({
       path: '/Users/example/batshit/README.md'

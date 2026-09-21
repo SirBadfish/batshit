@@ -93,6 +93,17 @@ export type AgentRunCredentialRecord = {
    */
   delegated: boolean
   /**
+   * BL-75 — whose skill access governs this run's `native_skill` loads.
+   *
+   * Set on a DELEGATED run only: the Subagent's record id, a `base` Worker's base id, or a
+   * built-in Worker's `worker_…` id — the id the run's `skills_commands` list was built for.
+   * `agentId` cannot do this job there, because it is the `subagent_cli_…` runtime id, which
+   * no access list names. A primary run leaves it `null`, and its own `agentId` governs. A
+   * record written before BL-75 has no field, which reads as `null`: a delegated one then has
+   * no skill access at all, and it expires with its run anyway.
+   */
+  scopeAgentId?: string | null
+  /**
    * sha256 hex of the secret half. **No fragment of the secret itself is stored.**
    *
    * This record used to carry `tokenPrefix` (12 chars) and `tokenSuffix` (6), copied from
@@ -266,6 +277,45 @@ export async function listAgentRunCredentialIds(agentId: string): Promise<string
  * ------------------------------------------------------------------ */
 
 /**
+ * BL-75 — check the skill scope a mint names, the way the agent itself is checked: a caller
+ * bug here would hand a run another subagent's skills, so it fails the run start loudly.
+ *
+ * A delegated run must name one, and it must be this user's subagent record, or a built-in
+ * Worker's `worker_…` id (which is never stored, and which no access list names except
+ * through Enable For All Agents). A primary run names none, or its own agent.
+ */
+async function resolveCredentialScopeAgentId(options: {
+  userId: string
+  agentId: string
+  delegated: boolean
+  scopeAgentId: unknown
+}): Promise<string | null> {
+  const scope = typeof options.scopeAgentId === 'string' ? options.scopeAgentId.trim() : ''
+  if (!options.delegated) {
+    if (scope && scope !== options.agentId) {
+      throw new AgentRunCredentialError(
+        `A primary run of "${options.agentId}" cannot carry the skill scope of "${scope}", so no run credential was minted.`
+      )
+    }
+    return null
+  }
+  if (!scope) {
+    throw new AgentRunCredentialError(
+      'A Subagent or Worker run needs the id whose skills it may load, so no run credential was minted.'
+    )
+  }
+  const subagent = (await redis.get(`subagent:${scope}`)) as Record<string, any> | null
+  // The same owner rule as the agent check above: a record that names another user is refused.
+  if (subagent ? Boolean(subagent.user_id && subagent.user_id !== options.userId) : !scope.startsWith('worker_')) {
+    throw new AgentRunCredentialError(
+      `Subagent "${scope}" was not found for this user, so no run credential was minted.`,
+      404
+    )
+  }
+  return scope
+}
+
+/**
  * Mint one credential for one managed CLI run, and return the token ONCE.
  *
  * The token is `<credentialId>.<secret>`. Neither half contains a `.` (both are base64url
@@ -295,6 +345,12 @@ export async function mintRunCredential(options: {
   runtime: unknown
   /** A Subagent or Worker run, whose `agentId` is a per-run runtime id (F-P2-1). */
   delegated?: boolean
+  /**
+   * BL-75 — the Subagent or Worker whose skill access governs a delegated run. Required when
+   * `delegated`, and it must be this user's subagent or a built-in Worker's `worker_…` id. A
+   * primary run may omit it or repeat its own `agentId`; anything else is refused.
+   */
+  scopeAgentId?: string | null
 }): Promise<{ credentialId: string; token: string; record: AgentRunCredentialRecord }> {
   const userId = requireIdentifier(options.userId, 'a user id')
   const agentId = requireIdentifier(options.agentId, 'an agent id')
@@ -313,6 +369,12 @@ export async function mintRunCredential(options: {
       404
     )
   }
+  const scopeAgentId = await resolveCredentialScopeAgentId({
+    userId,
+    agentId,
+    delegated,
+    scopeAgentId: options.scopeAgentId
+  })
 
   const secret = generateCredentialSecret()
   const createdAt = Date.now()
@@ -324,6 +386,7 @@ export async function mintRunCredential(options: {
     messageId,
     runtime,
     delegated,
+    scopeAgentId,
     tokenHash: hashSecret(secret),
     createdAt: new Date(createdAt).toISOString(),
     expiresAt: new Date(createdAt + AGENT_RUN_CREDENTIAL_TTL_SECONDS * 1000).toISOString(),

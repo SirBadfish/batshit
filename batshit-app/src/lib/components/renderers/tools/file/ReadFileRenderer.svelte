@@ -5,9 +5,20 @@
 	import { getProjectTreeIconRef } from '$lib/icons/fileTypeIcons'
 	import { getLanguageFromPath } from '$lib/utils/languageDetection'
 	import PrismCodeBlock from '$lib/components/renderers/shared/PrismCodeBlock.svelte'
+	import { failedCommandExitCode } from '$lib/utils/toolActivityContract'
 	import { AlertCircle, FileText } from '@lucide/svelte'
 	
 	let { tool }: { tool: ToolData } = $props()
+	// A shell command read as a file keeps a failed exit code (F-P6-5). Like the Bash card, a
+	// non-zero exit code makes this card an error even when the step itself reported none.
+	let failedExitCode = $derived(failedCommandExitCode(tool.toolResult))
+	let status = $derived.by((): 'success' | 'error' => {
+		if (failedExitCode !== undefined) return 'error'
+		return tool.success ? 'success' : 'error'
+	})
+	let errorMessage = $derived(
+		tool.error || (failedExitCode !== undefined ? `Command exited with code ${failedExitCode}` : undefined)
+	)
 	let isSkillRead = $derived(
 		tool.rendererFamily === 'skill_read' || tool.operationKind === 'skill_read'
 	)
@@ -84,6 +95,7 @@
 		...(isSkillRead && skillName ? { 'Skill': skillName } : {}),
 		...(isSkillRead ? { 'Action': skillAction === 'invoke' ? 'Invoke' : 'Read' } : {}),
 		'File Path': filePath,
+		...(failedExitCode !== undefined ? { 'Exit Code': failedExitCode } : {}),
 		'Lines': lineCount.toLocaleString(),
 		'Size': formatFileSize(fileSize),
 		'Language': language || fileExtension || 'Plain Text',
@@ -184,10 +196,10 @@
 	iconRef={fileIconRef}
 	title={rendererTitle}
 	subtitle={isSkillRead && skillName ? `${skillName} • ${lineCount} lines` : `${subtitleTarget} • ${lineCount} lines`}
-	status={tool.success ? 'success' : 'error'}
+	{status}
 	{metadata}
 	duration={tool.metadata?.executionTime}
-	error={tool.error}
+	error={errorMessage}
 >
 	<!-- Use PrismCodeBlock directly without double headers! -->
 	<div class="file-content-wrapper">
@@ -198,11 +210,11 @@
 				showCopyButton={true}
 				showLineNumbers={true}
 			/>
-		{:else if tool.error}
+		{:else if errorMessage}
 			<div class="error-container">
 				<div class="error-icon"><AlertCircle class="h-5 w-5" /></div>
 				<div class="error-message">
-					Failed to read file: {tool.error}
+					Failed to read file: {errorMessage}
 				</div>
 			</div>
 		{:else}

@@ -22,14 +22,14 @@ export class SessionApiClient extends RedisStoreBase {
   }
 
   async updateSession(id: string, updates: Partial<ChatSessionRow>) {
-    await this.apiCall(`/sessions/${id}`, {
+    await this.apiCall(`/sessions/${encodeURIComponent(id)}`, {
       method: 'PUT',
       body: JSON.stringify(updates)
     })
   }
 
   async deleteSession(id: string) {
-    await this.apiCall(`/sessions/${id}`, {
+    await this.apiCall(`/sessions/${encodeURIComponent(id)}`, {
       method: 'DELETE'
     })
   }

@@ -38,6 +38,21 @@ vi.mock('$lib/server/services/nativeTools', () => ({
 }))
 
 import { POST } from './+server'
+import {
+  __resetStreamAbortRegistryForTests,
+  abortStream,
+  registerStreamAbort
+} from '$lib/server/services/streamAbortRegistry'
+
+function useRequest(body: Record<string, unknown>) {
+  return POST({
+    request: new Request('http://localhost/api/native-tools/agent-browser', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'use', agentId: 'agent-1', toolName: 'open', ...body })
+    }),
+    locals: { user: { id: 'user-1' } }
+  } as any)
+}
 
 const dockerSidecarStoppedResult = {
   success: false,
@@ -57,6 +72,7 @@ const dockerSidecarStoppedResult = {
 describe('/api/native-tools/agent-browser', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    __resetStreamAbortRegistryForTests()
     mocks.resolveNativeToolUser.mockResolvedValue({ userId: 'user-1' })
     mocks.redisGet.mockResolvedValue({
       user_id: 'user-1',
@@ -123,5 +139,46 @@ describe('/api/native-tools/agent-browser', () => {
       supportLevel: 'docker-sidecar',
       error: expect.stringContaining('sidecar')
     })
+  })
+
+  /**
+   * A Stop reaches the managed CLI lanes' Agent Browser call (2026-09-18, bug sweep item 17).
+   *
+   * The helper's request cannot carry it: SvelteKit aborts `request.signal` only when the caller
+   * leaves before the body is read, and a Stop ends the managed CLI after that. The reply that
+   * runs in the chat registers its stream controller, and that controller is what the Stop
+   * button's interrupt route (`abortStream`), a voice barge-in, and a chat delete abort.
+   */
+  it('hands a use call the Stop of the reply that runs in its chat', async () => {
+    const reply = new AbortController()
+    registerStreamAbort('session-1', 'message-1', reply)
+    let received: AbortSignal | undefined
+    mocks.nativeAgentBrowserUse.mockImplementation(async ({ abortSignal }: { abortSignal?: AbortSignal }) => {
+      received = abortSignal
+      await new Promise((resolve) => abortSignal?.addEventListener('abort', resolve, { once: true }))
+      return { success: false, stopped: true, reason: 'The command was stopped.' }
+    })
+
+    const pending = useRequest({ sessionId: 'session-1', params: { url: 'https://example.com' } })
+    await vi.waitFor(() => expect(received).toBeInstanceOf(AbortSignal))
+    abortStream('session-1', 'user')
+    const response = await pending
+
+    expect(received?.aborted).toBe(true)
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ stopped: true, reason: 'The command was stopped.' })
+  })
+
+  it('hands no signal when no reply runs in the chat, so the call keeps its own time limit', async () => {
+    registerStreamAbort('another-session', 'message-9', new AbortController())
+    mocks.nativeAgentBrowserUse.mockResolvedValue({ success: true })
+
+    await useRequest({ sessionId: 'session-2', params: { url: 'https://example.com' } })
+    await useRequest({ params: { url: 'https://example.com' } })
+
+    expect(mocks.nativeAgentBrowserUse).toHaveBeenCalledTimes(2)
+    for (const [input] of mocks.nativeAgentBrowserUse.mock.calls) {
+      expect(input.abortSignal).toBeUndefined()
+    }
   })
 })

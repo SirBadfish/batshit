@@ -1,7 +1,10 @@
-import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockRedisJsonGet = vi.fn()
 const mockRedisJsonSet = vi.fn()
@@ -938,6 +941,477 @@ describe('voiceEngineRegistry', () => {
     expect(await getVoiceEngineRecordByProviderId('user-1', 'byo:qwen3-tts-base')).toBeNull()
     expect(storedVoiceSettings?.tts).toEqual({
       providerId: 'browser'
+    })
+  })
+  describe('Stop with Batshit', () => {
+    // resolveLocalVoiceRuntimeLaunchRecordPath reads this at call time, so a
+    // test that forgets it rewrites launch records under the REAL ~/.batshit.
+    let stateRoot: string
+    const originalStateRoot = process.env.BATSHIT_VOICE_RUNTIME_STATE_ROOT
+    const originalContainerized = process.env.BATSHIT_CONTAINERIZED
+
+    beforeEach(async () => {
+      stateRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-voice-runtime-state-'))
+      process.env.BATSHIT_VOICE_RUNTIME_STATE_ROOT = stateRoot
+      delete process.env.BATSHIT_CONTAINERIZED
+    })
+
+    afterEach(async () => {
+      if (originalStateRoot === undefined) delete process.env.BATSHIT_VOICE_RUNTIME_STATE_ROOT
+      else process.env.BATSHIT_VOICE_RUNTIME_STATE_ROOT = originalStateRoot
+      if (originalContainerized === undefined) delete process.env.BATSHIT_CONTAINERIZED
+      else process.env.BATSHIT_CONTAINERIZED = originalContainerized
+      await rm(stateRoot, { recursive: true, force: true })
+    })
+
+    it('never rewrites a launch record outside the configured state root', async () => {
+      // Safety net for the hazard above: if the resolver ever stops honoring the
+      // env var, this fails here instead of quietly editing Josh's real records.
+      const { resolveLocalVoiceRuntimeLaunchRecordPath } = await import(
+        '../services/voiceLocalRuntimePaths'
+      )
+      expect(resolveLocalVoiceRuntimeLaunchRecordPath('whisper-cpp').startsWith(stateRoot)).toBe(
+        true
+      )
+    })
+
+    function useStore() {
+      const jsonStore = new Map<string, any>()
+      let storedVoiceSettings: Record<string, any> | undefined
+
+      mockRedisJsonGet.mockImplementation(async (key: string) => jsonStore.get(key) ?? null)
+      mockRedisJsonSet.mockImplementation(async (key: string, _path: string, value: any) => {
+        jsonStore.set(key, value)
+        return 'OK'
+      })
+      mockGetUserSettings.mockImplementation(async () => ({
+        id: 'settings_user-1',
+        user_id: 'user-1',
+        voice_settings: storedVoiceSettings
+      }))
+      mockUpdateUserSettings.mockImplementation(
+        async (_userId: string, updates: Record<string, any>) => {
+          storedVoiceSettings = updates.voice_settings
+          return { id: 'settings_user-1', user_id: 'user-1', voice_settings: storedVoiceSettings }
+        }
+      )
+      return jsonStore
+    }
+
+    const LAUNCHABLE = {
+      name: 'Whisper.cpp',
+      baseUrl: 'http://127.0.0.1:8077',
+      localRuntime: {
+        installRoot: '/tmp/whisper-cpp',
+        installOwnership: 'batshit-managed' as const,
+        launch: { command: '/tmp/whisper-cpp/bin/whisper-server', args: ['--port', '8077'] }
+      }
+    }
+
+    it('offers the toggle only for an engine Batshit can honestly stop', async () => {
+      useStore()
+      const { listVoiceEngineSummaries, upsertVoiceEngineRecord } = await import(
+        '../services/voiceEngineRegistry'
+      )
+
+      await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+      // Connect Existing: no launch recipe, so Batshit never started it.
+      await upsertVoiceEngineRecord('user-1', 'connected-tts', {
+        name: 'Connected TTS',
+        baseUrl: 'http://127.0.0.1:9100',
+        localRuntime: { installOwnership: 'user-managed' as const }
+      })
+
+      const byId = Object.fromEntries(
+        (await listVoiceEngineSummaries('user-1')).map((summary) => [summary.id, summary])
+      )
+      expect(byId['whisper-cpp'].localRuntime?.canStopOnShutdown).toBe(true)
+      expect(byId['whisper-cpp'].localRuntime?.stopOnShutdownUnavailableReason).toBeUndefined()
+      expect(byId['connected-tts'].localRuntime?.canStopOnShutdown).toBe(false)
+      expect(byId['connected-tts'].localRuntime?.stopOnShutdownUnavailableReason).toBe(
+        'no-launch-recipe'
+      )
+    })
+
+    it('hides the toggle in Docker when no host operator is configured to stop it', async () => {
+      useStore()
+      const { resetHostOperatorVoiceStopSupportCacheForTests } = await import(
+        '../services/voiceHostOperatorRuntime'
+      )
+      resetHostOperatorVoiceStopSupportCacheForTests()
+      const { listVoiceEngineSummaries, upsertVoiceEngineRecord } = await import(
+        '../services/voiceEngineRegistry'
+      )
+      await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+
+      process.env.BATSHIT_CONTAINERIZED = '1'
+      const summary = (await listVoiceEngineSummaries('user-1'))[0]
+      expect(summary.localRuntime?.canStopOnShutdown).toBe(false)
+      expect(summary.localRuntime?.stopOnShutdownUnavailableReason).toBe('docker')
+    })
+
+    describe('in Docker, with a host operator', () => {
+      // A real HTTP server plays the operator's authenticated /health.
+      let server: http.Server
+      let health: Record<string, unknown>
+      let privateEnv: Record<string, string | undefined>
+
+      beforeEach(async () => {
+        server = http.createServer((req, res) => {
+          const authorized = req.headers.authorization === 'Bearer operator-test-token'
+          res.writeHead(authorized ? 200 : 401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify(authorized ? health : { ok: false, error: 'Unauthorized.' }))
+        })
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+        privateEnv = (await import('$env/dynamic/private')).env as Record<string, string | undefined>
+        privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+        privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN = 'operator-test-token'
+        ;(await import('../services/voiceHostOperatorRuntime')).resetHostOperatorVoiceStopSupportCacheForTests()
+        process.env.BATSHIT_CONTAINERIZED = '1'
+      })
+
+      afterEach(async () => {
+        delete privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_URL
+        delete privateEnv.BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN
+        ;(await import('../services/voiceHostOperatorRuntime')).resetHostOperatorVoiceStopSupportCacheForTests()
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+      })
+
+      async function summaryWith(operatorHealth: Record<string, unknown>) {
+        health = operatorHealth
+        ;(await import('../services/voiceHostOperatorRuntime')).resetHostOperatorVoiceStopSupportCacheForTests()
+        useStore()
+        const { listVoiceEngineSummaries, upsertVoiceEngineRecord } = await import(
+          '../services/voiceEngineRegistry'
+        )
+        await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+        return (await listVoiceEngineSummaries('user-1'))[0].localRuntime
+      }
+
+      it('offers the toggle once the operator records and can stop what it starts', async () => {
+        const runtime = await summaryWith({
+          ok: true,
+          sandboxRevision: 5,
+          hostVoiceControls: ['start', 'stop', 'write-reference-audio']
+        })
+        expect(runtime?.canStopOnShutdown).toBe(true)
+        expect(runtime?.stopOnShutdownUnavailableReason).toBeUndefined()
+      })
+
+      it('hides it while the operator is older than revision 5', async () => {
+        // Revision 5 is when the operator started recording what it starts; an older one is too
+        // old whatever it lists. start-docker replaces it on the next start.
+        const runtime = await summaryWith({
+          ok: true,
+          sandboxRevision: 4,
+          hostVoiceControls: ['start', 'stop', 'write-reference-audio']
+        })
+        expect(runtime?.canStopOnShutdown).toBe(false)
+        expect(runtime?.stopOnShutdownUnavailableReason).toBe('docker')
+      })
+
+      it('hides it when the operator does not offer the stop (Windows, for now)', async () => {
+        const runtime = await summaryWith({
+          ok: true,
+          sandboxRevision: 5,
+          hostVoiceControls: ['start', 'write-reference-audio']
+        })
+        expect(runtime?.canStopOnShutdown).toBe(false)
+      })
+    })
+
+    describe('attach records never outlive their engine', () => {
+      // chatterbox-turbo's launch started the runtime on 8012 (this test process stands in for
+      // it); kokoro uses the same runtime and says keep running.
+      async function sharedRuntime() {
+        useStore()
+        const registry = await import('../services/voiceEngineRegistry')
+        const records = await import('../services/voiceRuntimeLaunchRecords')
+        await registry.upsertVoiceEngineRecord('user-1', 'chatterbox-turbo', {
+          ...LAUNCHABLE,
+          name: 'Chatterbox',
+          baseUrl: 'http://127.0.0.1:8012'
+        })
+        await registry.upsertVoiceEngineRecord('user-1', 'kokoro', {
+          ...LAUNCHABLE,
+          name: 'Kokoro',
+          baseUrl: 'http://localhost:8012'
+        })
+        await records.writeLocalRuntimeLaunchRecord({
+          engineId: 'chatterbox-turbo',
+          pid: process.pid,
+          command: '/tmp/mlx_audio.server',
+          endpoint: 'http://127.0.0.1:8012',
+          launchedAt: '2026-09-17T01:00:03.000Z'
+        })
+        expect(
+          await records.attachLocalRuntimeLaunchRecord({
+            engineId: 'kokoro',
+            endpoint: 'http://localhost:8012',
+            stopOnShutdown: false
+          })
+        ).toBe(true)
+        return registry
+      }
+      const kokoroRecordExists = () =>
+        stat(path.join(stateRoot, 'kokoro', '.batshit-local-runtime-launch.json')).then(
+          () => true,
+          () => false
+        )
+
+      it('a plain delete removes the engine\'s attach record at once', async () => {
+        const registry = await sharedRuntime()
+        await registry.deleteVoiceEngineRecord('user-1', 'kokoro')
+        expect(await kokoroRecordExists()).toBe(false)
+        // The runtime's own record stays: chatterbox-turbo still started it.
+        expect(
+          JSON.parse(await readFile(path.join(stateRoot, 'chatterbox-turbo', '.batshit-local-runtime-launch.json'), 'utf8')).pid
+        ).toBe(process.pid)
+      })
+
+      it('moving the engine to another endpoint removes its attach record for the old one', async () => {
+        const registry = await sharedRuntime()
+        await registry.upsertVoiceEngineRecord('user-1', 'kokoro', { baseUrl: 'http://127.0.0.1:8013' })
+        expect(await kokoroRecordExists()).toBe(false)
+      })
+
+      it('an unrelated save keeps it', async () => {
+        const registry = await sharedRuntime()
+        await registry.upsertVoiceEngineRecord('user-1', 'kokoro', { name: 'Kokoro (renamed)' })
+        expect(await kokoroRecordExists()).toBe(true)
+      })
+    })
+
+    describe('"Delete local files too" stops the engine first', () => {
+      // A real detached "engine" under a throwaway managed installs root; its launch record is
+      // written by the real writer. Stopping is checked on the real process.
+      let installsRoot: string
+      const originalInstallsRoot = process.env.BATSHIT_MANAGED_INSTALLS_ROOT
+      const originalPath = process.env.PATH
+      const running = new Set<number>()
+
+      beforeEach(async () => {
+        installsRoot = await mkdtemp(path.join(os.tmpdir(), 'batshit-voice-installs-'))
+        process.env.BATSHIT_MANAGED_INSTALLS_ROOT = installsRoot
+      })
+      afterEach(async () => {
+        process.env.PATH = originalPath
+        for (const pid of running) {
+          for (const target of [-pid, pid]) {
+            try {
+              process.kill(target, 'SIGKILL')
+            } catch {}
+          }
+        }
+        running.clear()
+        if (originalInstallsRoot === undefined) delete process.env.BATSHIT_MANAGED_INSTALLS_ROOT
+        else process.env.BATSHIT_MANAGED_INSTALLS_ROOT = originalInstallsRoot
+        await rm(installsRoot, { recursive: true, force: true })
+      })
+
+      const alive = (pid: number) => {
+        try {
+          process.kill(pid, 0)
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      async function launchedEngine(engineId: string, port: number) {
+        const installRoot = path.join(installsRoot, engineId)
+        await mkdir(installRoot, { recursive: true })
+        const script = path.join(installRoot, 'serve.mjs')
+        await writeFile(script, 'setInterval(() => {}, 1000)\n')
+        const child = spawn(process.execPath, [script], { cwd: installRoot, detached: true, stdio: 'ignore' })
+        child.unref()
+        // The engine must really be running first, or "it was stopped" would pass for nothing.
+        expect(typeof child.pid).toBe('number')
+        running.add(child.pid as number)
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        expect(alive(child.pid as number)).toBe(true)
+        const registry = await import('../services/voiceEngineRegistry')
+        await registry.upsertVoiceEngineRecord('user-1', engineId, {
+          name: engineId,
+          baseUrl: `http://127.0.0.1:${port}`,
+          localRuntime: {
+            installRoot,
+            installOwnership: 'batshit-managed' as const,
+            launch: { command: process.execPath, args: [script], cwd: installRoot }
+          }
+        })
+        const records = await import('../services/voiceRuntimeLaunchRecords')
+        await records.writeLocalRuntimeLaunchRecord({
+          engineId,
+          pid: child.pid as number,
+          command: process.execPath,
+          args: [script],
+          cwd: installRoot,
+          endpoint: `http://127.0.0.1:${port}`,
+          launchedAt: new Date().toISOString()
+        })
+        return { pid: child.pid as number, installRoot }
+      }
+
+      const gone = async (pid: number) => {
+        for (let tries = 0; tries < 40 && alive(pid); tries += 1) await new Promise((r) => setTimeout(r, 100))
+        return !alive(pid)
+      }
+
+      it('a runtime only the deleted engine used is stopped, then its files go', async () => {
+        useStore()
+        const { pid, installRoot } = await launchedEngine('solo-engine', 8201)
+        const { deleteVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+
+        const deleted = await deleteVoiceEngineRecord('user-1', 'solo-engine', { deleteLocalFiles: true })
+
+        expect(await gone(pid)).toBe(true)
+        expect(deleted.localFiles).toMatchObject({ deleted: true, errors: [] })
+        await expect(stat(installRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+        await expect(stat(path.join(stateRoot, 'solo-engine'))).rejects.toMatchObject({ code: 'ENOENT' })
+      })
+
+      it('a runtime another engine still uses keeps running, and stays recorded', async () => {
+        useStore()
+        const { pid } = await launchedEngine('starter-engine', 8202)
+        const registry = await import('../services/voiceEngineRegistry')
+        await registry.upsertVoiceEngineRecord('user-1', 'sharing-engine', {
+          ...LAUNCHABLE,
+          name: 'Sharing',
+          baseUrl: 'http://localhost:8202'
+        })
+        const records = await import('../services/voiceRuntimeLaunchRecords')
+        expect(
+          await records.attachLocalRuntimeLaunchRecord({ engineId: 'sharing-engine', endpoint: 'http://localhost:8202', stopOnShutdown: true })
+        ).toBe(true)
+
+        const deleted = await registry.deleteVoiceEngineRecord('user-1', 'starter-engine', { deleteLocalFiles: true })
+
+        expect(alive(pid)).toBe(true)
+        expect(deleted.localFiles.errors).toEqual([])
+        expect(
+          JSON.parse(await readFile(path.join(stateRoot, 'sharing-engine', '.batshit-local-runtime-launch.json'), 'utf8'))
+        ).toMatchObject({ pid, startedBy: 'starter-engine' })
+      })
+
+      it('an engine that cannot be checked or stopped keeps its files and record, and says so', async () => {
+        useStore()
+        const { pid, installRoot } = await launchedEngine('stuck-engine', 8203)
+        // `ps` fails: Batshit cannot confirm the pid is still this engine, so it must not kill,
+        // and must not throw the record away either.
+        const fakeBin = path.join(installsRoot, 'fake-bin')
+        await mkdir(fakeBin, { recursive: true })
+        await writeFile(path.join(fakeBin, 'ps'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+        process.env.PATH = `${fakeBin}${path.delimiter}${originalPath ?? ''}`
+        const { deleteVoiceEngineRecord } = await import('../services/voiceEngineRegistry')
+
+        const deleted = await deleteVoiceEngineRecord('user-1', 'stuck-engine', { deleteLocalFiles: true })
+
+        expect(alive(pid)).toBe(true)
+        expect(deleted.localFiles.errors).toEqual([
+          expect.objectContaining({ engineId: 'stuck-engine', message: expect.stringMatching(/still running .* could not be stopped/) })
+        ])
+        expect((await stat(installRoot)).isDirectory()).toBe(true)
+        expect(
+          JSON.parse(await readFile(path.join(stateRoot, 'stuck-engine', '.batshit-local-runtime-launch.json'), 'utf8')).pid
+        ).toBe(pid)
+      })
+    })
+
+    it('the switch on an engine that shares a runtime another engine launched is recorded', async () => {
+      useStore()
+      const { applyVoiceEnginePublicUpdates, upsertVoiceEngineRecord } = await import(
+        '../services/voiceEngineRegistry'
+      )
+      await upsertVoiceEngineRecord('user-1', 'kokoro', {
+        ...LAUNCHABLE,
+        name: 'Kokoro',
+        baseUrl: 'http://localhost:8012'
+      })
+      // chatterbox-turbo's launch started the runtime on 8012 (this test process stands in for it).
+      await mkdir(path.join(stateRoot, 'chatterbox-turbo'), { recursive: true })
+      await writeFile(
+        path.join(stateRoot, 'chatterbox-turbo', '.batshit-local-runtime-launch.json'),
+        JSON.stringify({
+          engineId: 'chatterbox-turbo',
+          pid: process.pid,
+          command: '/tmp/mlx_audio.server',
+          endpoint: 'http://127.0.0.1:8012',
+          launchedAt: '2026-09-17T01:00:03.000Z'
+        })
+      )
+
+      await applyVoiceEnginePublicUpdates('user-1', [
+        { id: 'kokoro', localRuntime: { startup: { stopOnShutdown: false } } }
+      ])
+
+      const record = JSON.parse(
+        await readFile(path.join(stateRoot, 'kokoro', '.batshit-local-runtime-launch.json'), 'utf8')
+      )
+      expect(record).toMatchObject({ pid: process.pid, startedBy: 'chatterbox-turbo', stopOnShutdown: false })
+    })
+
+    it('saves the choice and rewrites the on-disk launch record the shutdown hooks read', async () => {
+      useStore()
+      const { applyVoiceEnginePublicUpdates, getVoiceEngineRecord, upsertVoiceEngineRecord } =
+        await import('../services/voiceEngineRegistry')
+      const { resolveLocalVoiceRuntimeLaunchRecordPath } = await import(
+        '../services/voiceLocalRuntimePaths'
+      )
+
+      await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+
+      // A record from an earlier launch, written before the user chose.
+      const recordPath = resolveLocalVoiceRuntimeLaunchRecordPath('whisper-cpp')
+      await mkdir(path.dirname(recordPath), { recursive: true })
+      await writeFile(
+        recordPath,
+        JSON.stringify({ engineId: 'whisper-cpp', pid: 4242, stopOnShutdown: true })
+      )
+
+      await applyVoiceEnginePublicUpdates('user-1', [
+        { id: 'whisper-cpp', localRuntime: { startup: { stopOnShutdown: false } } }
+      ])
+
+      expect(
+        (await getVoiceEngineRecord('user-1', 'whisper-cpp'))?.localRuntime?.startup?.stopOnShutdown
+      ).toBe(false)
+      // Saving is not when the engine restarts, so a quit one second later has
+      // to read the new choice off disk.
+      const written = JSON.parse(await readFile(recordPath, 'utf8'))
+      expect(written).toMatchObject({ engineId: 'whisper-cpp', pid: 4242, stopOnShutdown: false })
+
+      await applyVoiceEnginePublicUpdates('user-1', [
+        { id: 'whisper-cpp', localRuntime: { startup: { stopOnShutdown: true } } }
+      ])
+      expect(JSON.parse(await readFile(recordPath, 'utf8')).stopOnShutdown).toBe(true)
+    })
+
+    it('saving an unrelated field leaves an untouched engine stopping on shutdown', async () => {
+      useStore()
+      const { applyVoiceEnginePublicUpdates, getVoiceEngineRecord, upsertVoiceEngineRecord } =
+        await import('../services/voiceEngineRegistry')
+
+      await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+      await applyVoiceEnginePublicUpdates('user-1', [{ id: 'whisper-cpp', enabled: false }])
+
+      const startup = (await getVoiceEngineRecord('user-1', 'whisper-cpp'))?.localRuntime?.startup
+      expect(startup?.stopOnShutdown).not.toBe(false)
+    })
+
+    it('a missing launch record is a no-op, not a failed save', async () => {
+      useStore()
+      const { applyVoiceEnginePublicUpdates, upsertVoiceEngineRecord } = await import(
+        '../services/voiceEngineRegistry'
+      )
+      await upsertVoiceEngineRecord('user-1', 'whisper-cpp', LAUNCHABLE)
+
+      // The engine has never been launched by this Batshit: there is nothing to
+      // stop, and the preference will travel with its next spawn.
+      const updated = await applyVoiceEnginePublicUpdates('user-1', [
+        { id: 'whisper-cpp', localRuntime: { startup: { stopOnShutdown: false } } }
+      ])
+      expect(updated[0].localRuntime?.startup?.stopOnShutdown).toBe(false)
     })
   })
 })

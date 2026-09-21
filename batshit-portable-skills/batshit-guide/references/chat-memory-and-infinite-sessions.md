@@ -19,7 +19,7 @@ When an agent saves a memory, it picks where it belongs. You can see and change 
 ## What "remembering" looks like in chat
 
 - A small **Memory saved** chip appears under an agent reply that stored something. Click it to see what was saved.
-- A **memories surfaced** chip appears when memories were pulled into the conversation. Click it to see which memories, whether a trigger word fired them or the agent searched for them, and how long each one is lingering.
+- A **memories surfaced** chip appears when memories were pulled into the conversation. Click it to see which memories, whether a trigger word fired them, the agent searched for them, or (with the optional [Jev Juice](../jev-juice/overview.md) recall switch on) Jev Juice brought them in, and how long each one is lingering.
 - The [Execution Viewer](execution-viewer.md) has a **Memory Context** section showing exactly which memories the agent received on any turn — nothing is invisible.
 - When facts change, agents **supersede** instead of delete: "your favorite color is green" replaces blue, but blue stays in history, clearly flagged as outdated. Ask "what used to be my favorite color?" and the agent can tell you.
 
@@ -51,9 +51,17 @@ Life in an Infinite Session is organized into **episodes** — natural stretches
 
 Why this matters: when the conversation gets long, Batshit never chops off "the oldest N messages" mid-task. Instead, **finished episodes graduate**: they're summarized into memory, the summary takes their place in the conversation, and the full original messages stay stored and searchable. The agent keeps perfect recall of recent conversation (a guaranteed "floor"), keeps the story line of graduated episodes, and can search everything older. Nothing is deleted — ever — unless you delete it.
 
+### The episode whiteboard
+
+If your agent talks about "the whiteboard" or "my board", this is what it means. The **episode whiteboard** is the agent's own working notes for the current episode: the goal, the decisions so far, what is live right now, and the open items. Batshit hands the board to the agent with every message until the episode ends, so the agent does not have to re-read the whole conversation to remember where things stand. The agent rewrites it on purpose, with a tool, when something worth pinning changes; it is not the model's thinking (that happens inside one reply and is gone by the next) but a small sticky note that outlives replies. Durable facts still belong in memories; the board is only for the current stretch of work.
+
+The board belongs to the agent. A nap fills it in only when the agent has not written one, and never rewrites a board the agent wrote. When an episode ends, the board is kept with that episode's record and its facts go into the episode's summary.
+
+Where you see it: the Infinite Session's menu in the sidebar says "Whiteboard active", who wrote it last (the agent, or a nap), and when; and the [Execution Viewer](execution-viewer.md) shows the board inside the message the model actually received, under "Episode whiteboard".
+
 ### Naps
 
-When one very long conversation gets close to the model's context limit, the agent takes a **nap** — a between-turns cleanup that graduates finished episodes, compresses stale tool output, and if needed condenses the oldest part of the current episode while promoting the important working facts onto an **episode whiteboard** the agent keeps in front of itself. You'll see a Nap button in the token panel (replacing Compact, which is intentionally disabled in Infinite Sessions), and every nap leaves a visible record of what it did.
+When one very long conversation gets close to the model's context limit, the agent takes a **nap** — a between-turns cleanup that graduates finished episodes, compresses stale tool output, and if needed condenses the oldest part of the current episode into memory. The agent keeps an **episode whiteboard** in front of itself (goal, decisions, open items), and that board is the agent's: a nap only fills it in when the agent has not written one, and never rewrites a board the agent wrote. You'll see a Nap button in the token panel (replacing Compact, which is intentionally disabled in Infinite Sessions), and every nap leaves a visible record of what it did.
 
 One setup note, honestly: **nap and graduation summaries need a model that can write them.**
 
@@ -82,9 +90,9 @@ Between conversations — never during one — the agent's memory "dreams": it m
 
 ## Privacy and limits, honestly
 
-- **Memories are stored on your instance.** Memory search uses a local model by default. Memories and photos included in a chat go to the model you selected, including a hosted provider when you use one. If you configure an API embedding provider, memory text also goes to that provider for indexing.
+- **Memories are stored on your instance.** Memory search uses a local model by default. Memories and photos included in a chat go to the model you selected, including a hosted provider when you use one. If you configure an API embedding provider, memory text also goes to that provider for indexing. The two optional [Jev Juice](../jev-juice/overview.md) memory switches (**Recall by Meaning** and **Rerank Memory Search**, both off by default, per agent) send memory text to TypeSafe's servers while they are on; leave them off and that never happens.
 - **The agent has no secret notebook.** Everything it stores is visible and editable in the Memory Panel. (A "private reflections" mode is a possible future idea — if it ever ships, it will be explicit and opt-in.)
-- **Memory is per-agent.** Agents don't share memories. Deleting an agent deletes its memories; deleting a session keeps agent memories but marks their origin as deleted.
+- **Memory is per-agent.** Agents don't share memories. Deleting an agent deletes its memories (and, if you leave the "Also delete its chats" box checked, its own chats too; group chats stay); deleting a session keeps agent memories but marks their origin as deleted.
 - **Backups include memory.** [Backup and restore](../admin/backup-and-restore.md) covers memories, their owned photos, graduated episodes, and settings; the search index rebuilds automatically after a restore.
 - **Group chats don't do memory recall yet.** Agents can still save memories in groups, but automatic remembering is single-agent chats only for now.
 - **Memory photos are local owned copies.** A Clip is only the input used when the memory is saved; Batshit makes a bounded copy and the memory never depends on that Clip afterward. Missing or damaged owned files fail loudly instead of silently dropping the photo.
@@ -106,4 +114,5 @@ Between conversations — never during one — the agent's memory "dreams": it m
 - [Compact and Trim](compact-and-trim.md)
 - [Execution Viewer](execution-viewer.md)
 - [Clips](../clips/overview.md)
+- [Jev Juice (optional)](../jev-juice/overview.md): recall by meaning and a sharper memory search
 - [Backup and restore](../admin/backup-and-restore.md)

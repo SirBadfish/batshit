@@ -4,6 +4,13 @@ import path from 'node:path'
 import type { SkillBundleFile, SkillRow } from '$lib/types/database'
 
 import { evaluateSkillDependencies, getSkill } from './skillRegistry'
+import {
+  resolveSkillAccessForActor,
+  type SkillAccessRefusalCode,
+  type SkillRuntimeActor
+} from './slashCommandCapabilities'
+
+export type { SkillRuntimeActor } from './slashCommandCapabilities'
 
 export interface SkillRuntimeForTool {
   skill: SkillRow
@@ -104,15 +111,47 @@ function decodeBundleFileText(
   }
 }
 
+export type SkillRuntimeResolution =
+  | { runtime: SkillRuntimeForTool; error: null }
+  | {
+      runtime: null
+      error: string
+      /** Set only when the access gate refused the load (BL-75). */
+      errorCode?: SkillAccessRefusalCode
+      blocked?: true
+      skillId?: string
+    }
+
+/**
+ * The single choke point for every agent skill load: `native_skill` invoke/list/read and the
+ * script actions, in-process and through `/api/skills/runtime`. The actor is required so a new
+ * caller cannot skip the access gate (BL-75).
+ */
 export async function resolveSkillRuntimeForTool(
   userId: string,
-  skillId: string
-): Promise<{ runtime: SkillRuntimeForTool; error: null } | { runtime: null; error: string }> {
-  const skill = await getSkill(userId, skillId)
+  skillId: string,
+  actor: SkillRuntimeActor
+): Promise<SkillRuntimeResolution> {
+  const access = await resolveSkillAccessForActor(userId, skillId, actor)
+  if (!access.ok) {
+    console.warn(
+      `[skills] refused skill load: ${access.code} skill=${access.skillId || '(empty)'} ` +
+        `actor=${actor.kind === 'agent' ? actor.agentId : `none:${actor.lane}`}`
+    )
+    return {
+      runtime: null,
+      error: access.message,
+      errorCode: access.code,
+      blocked: true,
+      skillId: access.skillId
+    }
+  }
+
+  const skill = await getSkill(userId, access.skillId)
   if (!skill) {
     return {
       runtime: null,
-      error: `Skill '${skillId}' was not found.`
+      error: `Skill '${access.skillId}' was not found.`
     }
   }
 
@@ -168,13 +207,24 @@ export function buildSkillScriptCommand(scriptAbsolutePath: string, args: string
 export async function executeSkillRuntimeAction(input: {
   userId: string
   skillId: string
+  actor: SkillRuntimeActor
   action?: SkillRuntimeAction
   path?: string
   maxChars?: number
 }) {
   const action = input.action ?? 'list'
-  const runtimeResult = await resolveSkillRuntimeForTool(input.userId, input.skillId)
+  const runtimeResult = await resolveSkillRuntimeForTool(input.userId, input.skillId, input.actor)
   if (!runtimeResult.runtime) {
+    if (runtimeResult.blocked) {
+      return {
+        success: false,
+        action,
+        error: runtimeResult.error,
+        errorCode: runtimeResult.errorCode,
+        blocked: true as const,
+        skillId: runtimeResult.skillId
+      }
+    }
     return {
       success: false,
       action,

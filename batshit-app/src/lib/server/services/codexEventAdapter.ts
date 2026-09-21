@@ -8,11 +8,10 @@ import type {
 } from "$lib/types/codexProtocol";
 import type { NativeModeRequest } from "./vercelBrain";
 import path from "node:path";
-import os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { logger } from "$lib/utils/logger";
-import { buildCompactEditPreview } from "$lib/utils/editDiff";
+import { buildCompactEditPreview, buildSnapshotEditPreview } from "$lib/utils/editDiff";
 import { mapBashCommandToMode4Tool } from "./bashCommandMapper";
 import {
   hasSubagentToolSegment,
@@ -27,12 +26,25 @@ import {
   getInternalBatshitServerTaskUrl,
   getInternalBatshitServerAuthHeaders,
 } from "./batshitServerUrls";
-import { extractAndStripToolZipControl } from "./toolZipControlNotice";
+import { stripToolZipControl } from "./toolZipControlNotice";
 import { stripMcpImageContentBlocks } from "./toolResultImageDelivery";
 
 type CodexTransport = "sdk" | "cli";
 const execFileAsync = promisify(execFile);
 const GIT_DIFF_MAX_BUFFER_BYTES = 5_000_000;
+// F-P6-5: a failure Codex reports without an exit code keeps its failure as a reason.
+const CODEX_COMMAND_FAILED_WITHOUT_EXIT_CODE =
+  "Codex reported this command as failed and gave no exit code.";
+const CODEX_PATCH_FAILED = "Codex reported that this patch failed.";
+// Known copies: the most files kept, and the largest copy kept (bigger files are read again).
+const MAX_KNOWN_COPIES = 32;
+const MAX_KNOWN_COPY_CHARS = 2_000_000;
+
+/** The key a known copy is kept under: the file's absolute path. */
+function copyKey(filePath: string, projectPath: string | null): string {
+  if (path.isAbsolute(filePath)) return path.normalize(filePath);
+  return path.resolve(projectPath && projectPath.trim().length > 0 ? projectPath : "/", filePath);
+}
 
 function extractShellCommand(command: string): string {
   const trimmed = command.trim();
@@ -42,16 +54,6 @@ function extractShellCommand(command: string): string {
   const simpleMatch = trimmed.match(/-c\s+(['"])([\s\S]*?)\1/);
   if (simpleMatch?.[2]) return simpleMatch[2];
   return command;
-}
-
-function normalizeSnapshotPath(
-  filePath: string | undefined,
-  projectPath: string | null,
-): string | null {
-  if (!filePath) return null;
-  if (path.isAbsolute(filePath)) return filePath;
-  const base = projectPath && projectPath.trim().length > 0 ? projectPath : os.homedir();
-  return path.resolve(base, filePath);
 }
 
 function normalizeWebSearchResults(rawResults: any): Array<Record<string, any>> {
@@ -405,16 +407,55 @@ type CodexFileChange = {
   dest?: string
   targetPath?: string
   target_path?: string
-  kind?: string
+  /** A word (`update`, `add`, …), or the app server's `{ type, move_path }` object. */
+  kind?: unknown
+  /** Codex's own record of this file's change (app-server lane; see `mapAppServerFileChange`). */
+  diff?: string
 }
 
-function normalizeFileChangeKind(kind?: string): string | null {
-  if (!kind) return null
-  const normalized = kind.toLowerCase()
+/**
+ * A change's kind as a word. The app server sends an object (`{ type: 'update', move_path }`),
+ * which the lane maps to a word; reading one here anyway must never throw, because a throw in
+ * this adapter ends the whole reply (every native patch did, until 2026-09-18).
+ */
+function normalizeFileChangeKind(kind: unknown): string | null {
+  const record = kind && typeof kind === 'object' ? (kind as Record<string, unknown>) : null
+  if (record && typeof record.move_path === 'string' && record.move_path) return 'move'
+  const word = typeof kind === 'string' ? kind : typeof record?.type === 'string' ? record.type : ''
+  if (!word) return null
+  const normalized = word.toLowerCase()
   if (normalized === 'modify') return 'update'
   if (normalized === 'remove') return 'delete'
   if (normalized === 'create') return 'add'
   return normalized
+}
+
+/** The path a file change reads from (the old path of a rename). */
+function fileChangePath(change?: CodexFileChange): string | undefined {
+  return (
+    change?.path ||
+    change?.filePath ||
+    change?.filepath ||
+    change?.from ||
+    change?.oldPath ||
+    change?.old_path ||
+    change?.previousPath ||
+    change?.previous_path
+  )
+}
+
+/** Where a file change moves its file, if it moves it. */
+function fileChangeTargetPath(change?: CodexFileChange): string | undefined {
+  return (
+    change?.to ||
+    (typeof (change?.kind as any)?.move_path === 'string' ? (change?.kind as any).move_path : undefined) ||
+    change?.newPath ||
+    change?.new_path ||
+    change?.destination ||
+    change?.dest ||
+    change?.targetPath ||
+    change?.target_path
+  )
 }
 
 function resolveFileChangeTool(changes: CodexFileChange[] | undefined): {
@@ -429,42 +470,34 @@ function resolveFileChangeTool(changes: CodexFileChange[] | undefined): {
       .filter((value): value is string => Boolean(value))
   )
 
-  const resolvePath = (change?: CodexFileChange) =>
-    change?.path ||
-    change?.filePath ||
-    change?.filepath ||
-    change?.from ||
-    change?.oldPath ||
-    change?.old_path ||
-    change?.previousPath ||
-    change?.previous_path
-
-  const resolveTargetPath = (change?: CodexFileChange) =>
-    change?.to ||
-    change?.newPath ||
-    change?.new_path ||
-    change?.destination ||
-    change?.dest ||
-    change?.targetPath ||
-    change?.target_path
-
   const paths = safeChanges
-    .map((change) => resolvePath(change))
+    .map((change) => fileChangePath(change))
     .filter((value): value is string => typeof value === 'string' && value.length > 0)
 
-  const primaryPath = paths[0]
-  const targetPath = safeChanges
-    .map((change) => resolveTargetPath(change))
-    .find((value): value is string => typeof value === 'string' && value.length > 0)
-
   let toolName = 'batshit_server_overwrite_file'
+  let deciding: string | null = null
   if (kinds.has('update')) {
     toolName = 'batshit_server_edit_file'
+    deciding = 'update'
   } else if (kinds.has('add')) {
     toolName = 'batshit_server_overwrite_file'
+    deciding = 'add'
   } else if (kinds.has('delete') || kinds.has('rename') || kinds.has('move')) {
     toolName = 'batshit_server_execute_command'
+    deciding = kinds.has('delete') ? 'delete' : kinds.has('rename') ? 'rename' : 'move'
   }
+
+  // The change that decided the tool names the card, its read-back, and its command. The first
+  // path of the patch did, so a patch that added one file and edited another was an Edit File
+  // card titled with the ADDED file (whose start copy and read-back were that file too, on the
+  // exec lane), an add beside a delete stored the deleted file's text as the written content,
+  // and `rm`/`mv` could name a file the patch had not deleted or moved.
+  const primaryChange =
+    (deciding
+      ? safeChanges.find((change) => normalizeFileChangeKind(change?.kind) === deciding && fileChangePath(change))
+      : undefined) ?? safeChanges.find((change) => fileChangePath(change))
+  const primaryPath = fileChangePath(primaryChange)
+  const targetPath = fileChangeTargetPath(primaryChange)
 
   const args: Record<string, any> = {}
   if (primaryPath) {
@@ -476,19 +509,13 @@ function resolveFileChangeTool(changes: CodexFileChange[] | undefined): {
   }
 
   const result: Record<string, any> = {
-    changes: safeChanges,
+    changes: withoutCodexRecords(safeChanges),
     ...(primaryPath ? { filePath: primaryPath } : {}),
     ...(paths.length > 1 ? { filePaths: paths } : {})
   }
 
   if (toolName === 'batshit_server_execute_command') {
-    const kind = kinds.has('delete')
-      ? 'delete'
-      : kinds.has('rename')
-      ? 'rename'
-      : kinds.has('move')
-      ? 'move'
-      : 'change'
+    const kind = deciding ?? 'change'
     let command = `file_change ${kind}`
     if (kind === 'delete' && primaryPath) {
       command = `rm ${primaryPath}`
@@ -502,6 +529,83 @@ function resolveFileChangeTool(changes: CodexFileChange[] | undefined): {
   }
 
   return { toolName, args, result }
+}
+
+/**
+ * A patch's changes without Codex's per-file records, for the call's arguments and result. The
+ * records become the diff (or an add's content) once; left in, whole-file texts would ride along in
+ * every event, the Execution Viewer, and the raw sidecar.
+ */
+function withoutCodexRecords<T>(changes: T[]): T[] {
+  return changes.map((change) => {
+    if (!change || typeof change !== 'object' || !('diff' in (change as object))) return change
+    const { diff: _record, ...rest } = change as Record<string, unknown>
+    return rest as T
+  })
+}
+
+/** True when every change of a native patch carries Codex's own record of it (app-server lane). */
+function fileChangesCarryCodexDiffs(changes: CodexFileChange[] | undefined): boolean {
+  return Array.isArray(changes) && changes.length > 0 && changes.every((change) => typeof change?.diff === 'string')
+}
+
+/**
+ * A native patch's diff from Codex's own per-file records (the app server's `fileChange.changes`),
+ * as one git-style unified diff so the files of a patch stay apart. It is exact and needs no
+ * copy of the file: a start copy is read only after the item starts, and Codex applies a patch in
+ * its own process, so that copy can already hold the patched text. `undefined` when a change
+ * carries no record (the exec lane), which leaves the adapter to its copies.
+ */
+function buildCodexPatchDiff(
+  changes: CodexFileChange[] | undefined,
+  projectPath: string | null,
+): string | undefined {
+  if (!fileChangesCarryCodexDiffs(changes)) return undefined
+  const project = projectPath?.replace(/\/+$/, '') ?? ''
+  const shown = (filePath: string) =>
+    project && filePath.startsWith(`${project}/`)
+      ? filePath.slice(project.length + 1)
+      : filePath.replace(/^\/+/, '')
+  const textLines = (text: string) => {
+    const lines = text.replace(/\r\n?/g, '\n').split('\n')
+    if (lines[lines.length - 1] === '') lines.pop()
+    return lines
+  }
+
+  return (changes as CodexFileChange[])
+    .map((change) => {
+      const from = shown(change.path ?? '')
+      const kind = normalizeFileChangeKind(change.kind)
+      const record = change.diff as string
+      if (kind === 'add') {
+        const lines = textLines(record)
+        return [
+          `diff --git a/${from} b/${from}`,
+          '--- /dev/null',
+          `+++ b/${from}`,
+          ...(lines.length > 0 ? [`@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)] : []),
+        ].join('\n')
+      }
+      if (kind === 'delete') {
+        const lines = textLines(record)
+        return [
+          `diff --git a/${from} b/${from}`,
+          `--- a/${from}`,
+          '+++ /dev/null',
+          ...(lines.length > 0 ? [`@@ -1,${lines.length} +0,0 @@`, ...lines.map((line) => `-${line}`)] : []),
+        ].join('\n')
+      }
+      const target = typeof change.to === 'string' && change.to ? shown(change.to) : from
+      // A rename's record ends `\n\nMoved to: <path>`; the rename lines below say that already.
+      const hunks = (target === from ? record : record.replace(/\n*\n\nMoved to: [^\n]*$/, ''))
+        .replace(/\n+$/, '')
+      return [
+        `diff --git a/${from} b/${target}`,
+        ...(target !== from ? [`rename from ${from}`, `rename to ${target}`] : []),
+        ...(hunks ? [`--- a/${from}`, `+++ b/${target}`, hunks] : []),
+      ].join('\n')
+    })
+    .join('\n')
 }
 
 async function readFileFromCommander(
@@ -587,7 +691,26 @@ export class CodexEventAdapter {
   private readonly toolStates = new Map<string, CodexToolState>();
   private readonly intermediateSteps: any[] = [];
   private readonly rawEvents: ThreadEvent[] = [];
-  private readonly fileSnapshots = new Map<string, string>();
+  /**
+   * Batshit's own whole copy of each file an item it can follow has shown it, keyed by absolute
+   * path: read from batshit-server when a read completes, or the read-back of a write or an edit,
+   * and read again after any command Batshit cannot follow. It is never a command's OUTPUT: a
+   * partial read (`sed -n 1,3p`, `head`) or a numbered one (`cat -n`, `nl`) is not the file, and
+   * kept as the file it made the next edit's diff draw the rest of the file as added.
+   *
+   * An edit's "before" comes from here when it can. On the app-server lane a command's
+   * `item/started` reaches Batshit about a millisecond before its `item/completed`, after the
+   * command has run (measured live, 2026-09-18), so a copy read at the edit's own start is too
+   * late for a fast command: it matched the edited file, and a real `sed -i` said "No change
+   * seen". A copy read when an EARLIER item completed was read before the model even chose this
+   * command. The one gap: a model that sends a read and an edit of the same file in one reply.
+   */
+  private readonly knownCopies = new Map<string, string>();
+  /**
+   * Each edit's "before", keyed by the item: its file's known copy (`known: true`), or else a copy
+   * read at the item's own start, which only a slow command lets Batshit read in time.
+   */
+  private readonly startCopies = new Map<string, { text: string; known: boolean }>();
   private finalText = "";
   private usageSummary:
     | {
@@ -706,48 +829,95 @@ export class CodexEventAdapter {
     }
   }
 
-  private async captureFileSnapshot(filePath: unknown): Promise<void> {
-    if (typeof filePath !== "string" || filePath.trim().length === 0) return;
-    const projectPath =
-      typeof this.request.projectPath === "string" ? this.request.projectPath : null;
-    const snapshotKey = normalizeSnapshotPath(filePath, projectPath);
-    if (!snapshotKey || this.fileSnapshots.has(snapshotKey)) return;
+  private requestProjectPath(): string | null {
+    return typeof this.request.projectPath === "string" ? this.request.projectPath : null;
+  }
 
-    const content = await readFileFromCommander(filePath, projectPath);
+  private rememberCopy(filePath: string, text: string): void {
+    const key = copyKey(filePath, this.requestProjectPath());
+    this.knownCopies.delete(key);
+    if (text.length > MAX_KNOWN_COPY_CHARS) return;
+    this.knownCopies.set(key, text);
+    while (this.knownCopies.size > MAX_KNOWN_COPIES) {
+      const oldest = this.knownCopies.keys().next().value;
+      if (oldest === undefined) break;
+      this.knownCopies.delete(oldest);
+    }
+  }
+
+  private forgetCopy(filePath: unknown): void {
+    if (typeof filePath !== "string" || filePath.trim().length === 0) return;
+    this.knownCopies.delete(copyKey(filePath, this.requestProjectPath()));
+  }
+
+  /** Read the whole file now and keep it as its known copy (or forget it if it cannot be read). */
+  private async learnCopy(filePath: unknown): Promise<void> {
+    if (typeof filePath !== "string" || filePath.trim().length === 0) return;
+    const content = await readFileFromCommander(filePath, this.requestProjectPath());
+    if (typeof content === "string") this.rememberCopy(filePath, content);
+    else this.forgetCopy(filePath);
+  }
+
+  /** A command Batshit cannot follow may have changed any file: read every known one again. */
+  private async refreshKnownCopies(): Promise<void> {
+    await Promise.all([...this.knownCopies.keys()].map((key) => this.learnCopy(key)));
+  }
+
+  private async captureStartCopy(itemId: string, filePath: unknown): Promise<void> {
+    if (typeof filePath !== "string" || filePath.trim().length === 0) return;
+    const known = this.knownCopies.get(copyKey(filePath, this.requestProjectPath()));
+    if (known !== undefined) {
+      this.startCopies.set(itemId, { text: known, known: true });
+      return;
+    }
+    const content = await readFileFromCommander(filePath, this.requestProjectPath());
     if (typeof content === "string") {
-      this.fileSnapshots.set(snapshotKey, content);
+      this.startCopies.set(itemId, { text: content, known: false });
     }
   }
 
   private async buildEditDiff(options: {
+    itemId: string;
     filePath: string;
     projectPath: string | null;
     after: string;
     inputPreview?: string;
+    /**
+     * A shell command's start copy that matches the file proves Batshit saw no change. A native
+     * patch always changes its file, so a matching copy there was read after the patch landed.
+     */
+    matchingCopyMeansNoChange: boolean;
   }): Promise<string> {
-    const snapshotKey = normalizeSnapshotPath(options.filePath, options.projectPath);
-    const before =
-      snapshotKey && this.fileSnapshots.has(snapshotKey)
-        ? this.fileSnapshots.get(snapshotKey)
-        : undefined;
+    const before = this.startCopies.get(options.itemId);
 
-    const snapshotDiff =
-      typeof before === "string"
-        ? buildCompactEditPreview({
-            filePath: options.filePath,
-            before,
-            after: options.after,
-          })
-        : undefined;
-    const gitDiff =
-      snapshotDiff || options.inputPreview
-        ? null
-        : await readGitDiffForFile(options.filePath, options.projectPath);
+    if (options.inputPreview) return options.inputPreview;
 
+    // A copy that differs from the file now was read before the command wrote it.
+    if (before && before.text !== options.after) {
+      return (
+        buildSnapshotEditPreview({
+          filePath: options.filePath,
+          before: before.text,
+          after: options.after,
+        }) ?? `Updated ${options.filePath}. Diff unavailable.`
+      );
+    }
+
+    // A KNOWN copy (read when an earlier item completed) that matches the file now means this
+    // command changed nothing Batshit could see: say that, and never `git diff -- <file>`, which
+    // is every unstaged change in the file, not this command's (it drew a no-match `sed -i` as the
+    // file's older edits). "Seen", where the API lane, which reads its copies around the run
+    // itself, says "No changes". A copy read at this item's own start that matches proves
+    // nothing: it is usually read after the command ran (see `knownCopies`), and saying "No
+    // change seen" there hid a real `sed -i` edit.
+    if (before?.known && options.matchingCopyMeansNoChange) {
+      return `No change seen: ${options.filePath} matches the copy Batshit read before this command ran.`;
+    }
+
+    // No copy from before the command, or a patch that beat its copy: the file's git diff is the
+    // best record left, then the summary.
     return (
-      options.inputPreview ??
-      snapshotDiff ??
-      gitDiff ??
+      (await readGitDiffForFile(options.filePath, options.projectPath)) ??
       buildCompactEditPreview({
         filePath: options.filePath,
         after: options.after,
@@ -893,18 +1063,17 @@ export class CodexEventAdapter {
           args,
         };
         if (toolName === "batshit_server_edit_file") {
-          await this.captureFileSnapshot(args?.filePath ?? args?.path ?? args?.input);
+          await this.captureStartCopy(item.id, args?.filePath ?? args?.path ?? args?.input);
         }
         break;
       }
 
       case "file_change": {
-        const resolved = resolveFileChangeTool(
-          Array.isArray(item.changes) ? item.changes : undefined,
-        );
+        const changes = Array.isArray(item.changes) ? item.changes : undefined;
+        const resolved = resolveFileChangeTool(changes);
         const args: Record<string, any> = {
           ...resolved.args,
-          ...(item.changes ? { changes: item.changes } : {}),
+          ...(item.changes ? { changes: withoutCodexRecords(item.changes) } : {}),
         };
         this.toolStates.set(item.id, {
           id: item.id,
@@ -918,8 +1087,12 @@ export class CodexEventAdapter {
           toolName: resolved.toolName,
           args,
         };
-        if (resolved.toolName === "batshit_server_edit_file") {
-          await this.captureFileSnapshot(args?.filePath ?? args?.path);
+        // A patch Codex describes itself needs no start copy, which it can beat.
+        if (
+          resolved.toolName === "batshit_server_edit_file" &&
+          !fileChangesCarryCodexDiffs(changes)
+        ) {
+          await this.captureStartCopy(item.id, args?.filePath ?? args?.path);
         }
         break;
       }
@@ -1086,6 +1259,16 @@ export class CodexEventAdapter {
         typeof this.request.projectPath === "string"
           ? this.request.projectPath
           : null;
+      // A command that exited non-zero, or that Codex reports `failed` with no exit code (the
+      // app-server lane maps a declined or cancelled command that way), changed nothing Batshit
+      // can show: its file is not read back, and its output is not the file's content (F-P6-5).
+      const commandFailed =
+        item.status === "failed" ||
+        (typeof item.exit_code === "number" && item.exit_code !== 0);
+      const failureWithoutExitCode =
+        item.status === "failed" && typeof item.exit_code !== "number"
+          ? { success: false, error: CODEX_COMMAND_FAILED_WITHOUT_EXIT_CODE }
+          : {};
       if (tracked.toolName === "batshit_server_read_file") {
         const filePath =
           tracked.args?.filePath ?? tracked.args?.path ?? tracked.args?.input;
@@ -1094,11 +1277,11 @@ export class CodexEventAdapter {
           exitCode: item.exit_code,
           status: item.status,
           ...(filePath ? { filePath } : {}),
+          ...failureWithoutExitCode,
         };
-        const snapshotKey = normalizeSnapshotPath(filePath, projectPath);
-        if (snapshotKey && typeof toolResult.content === "string") {
-          this.fileSnapshots.set(snapshotKey, toolResult.content);
-        }
+        // The file as Batshit reads it now, before the model has chosen its next command; never
+        // this read's output, which can be part of the file or numbered (see `knownCopies`).
+        if (!commandFailed) await this.learnCopy(filePath);
       } else if (tracked.toolName === "batshit_server_overwrite_file") {
         const filePath =
           tracked.args?.filePath ?? tracked.args?.path ?? tracked.args?.input;
@@ -1107,18 +1290,22 @@ export class CodexEventAdapter {
           exitCode: item.exit_code,
           status: item.status,
           ...(filePath ? { filePath } : {}),
+          ...failureWithoutExitCode,
         };
-        if (typeof filePath === "string") {
+        if (typeof filePath === "string" && !commandFailed) {
           const content = await readFileFromCommander(filePath, projectPath);
           if (typeof content === "string") {
             toolResult.content = content;
-            const snapshotKey = normalizeSnapshotPath(filePath, projectPath);
-            if (snapshotKey) {
-              this.fileSnapshots.set(snapshotKey, content);
+            this.rememberCopy(filePath, content);
+          } else {
+            this.forgetCopy(filePath);
+            if (toolResult.content === undefined) {
+              toolResult.content = "(content unavailable from codex command_execution)";
             }
-          } else if (toolResult.content === undefined) {
-            toolResult.content = "(content unavailable from codex command_execution)";
           }
+        } else {
+          // A failed write is never read back, so its file's copy may be stale.
+          this.forgetCopy(filePath);
         }
       } else if (tracked.toolName === "batshit_server_edit_file") {
         const filePath =
@@ -1128,6 +1315,7 @@ export class CodexEventAdapter {
           exitCode: item.exit_code,
           status: item.status,
           ...(filePath ? { filePath } : {}),
+          ...failureWithoutExitCode,
         };
         const inputPreview = buildCompactEditPreview({
           filePath: typeof filePath === "string" ? filePath : undefined,
@@ -1145,23 +1333,30 @@ export class CodexEventAdapter {
               : undefined,
           allowSummary: false,
         });
-        if (typeof filePath === "string") {
+        if (commandFailed) {
+          // Only the change the command meant to make; never "Updated <path>". Never read back,
+          // so its file's copy may be stale.
+          if (inputPreview) toolResult.diff = inputPreview;
+          this.forgetCopy(filePath);
+        } else if (typeof filePath === "string") {
           const content = await readFileFromCommander(filePath, projectPath);
           if (typeof content === "string") {
-            const snapshotKey = normalizeSnapshotPath(filePath, projectPath);
             toolResult.diff = await this.buildEditDiff({
+              itemId: item.id,
               filePath,
               projectPath,
               after: content,
               inputPreview,
+              matchingCopyMeansNoChange: true,
             });
-            if (snapshotKey) {
-              this.fileSnapshots.set(snapshotKey, content);
+            this.rememberCopy(filePath, content);
+          } else {
+            this.forgetCopy(filePath);
+            if (toolResult.diff === undefined) {
+              toolResult.diff =
+                inputPreview ??
+                `Updated ${filePath}. Diff unavailable because Batshit could not reconstruct the before/after change.`;
             }
-          } else if (toolResult.diff === undefined) {
-            toolResult.diff =
-              inputPreview ??
-              `Updated ${filePath}. Diff unavailable because Batshit could not reconstruct the before/after change.`;
           }
         } else if (toolResult.diff === undefined) {
           toolResult.diff =
@@ -1173,21 +1368,34 @@ export class CodexEventAdapter {
           output: item.aggregated_output,
           exitCode: item.exit_code,
           status: item.status,
+          ...failureWithoutExitCode,
         };
+        // Any other command may have changed a file Batshit knows (a formatter, a checkout, a
+        // `python3 -c` one-liner); a listing or a search does not.
+        if (
+          tracked.toolName !== "batshit_server_list_files" &&
+          tracked.toolName !== "batshit_server_search_files"
+        ) {
+          await this.refreshKnownCopies();
+        }
       }
+      this.startCopies.delete(item.id);
     } else if (item.type === "file_change") {
-      const resolved = resolveFileChangeTool(
-        Array.isArray(item.changes) ? item.changes : undefined,
-      );
+      const changes = Array.isArray(item.changes) ? item.changes : undefined;
+      const resolved = resolveFileChangeTool(changes);
       tracked.toolName = resolved.toolName;
       tracked.args = {
         ...resolved.args,
         ...(tracked.args || {}),
-        ...(item.changes ? { changes: item.changes } : {}),
+        ...(item.changes ? { changes: withoutCodexRecords(item.changes) } : {}),
       };
+      // A patch Codex could not apply changed nothing Batshit can show: no read-back, no
+      // "Updated <path>", and the failure travels as `success: false` plus a reason (F-P6-5).
+      const patchFailed = item.status === "failed";
       toolResult = {
         ...resolved.result,
         status: item.status,
+        ...(patchFailed ? { success: false, error: CODEX_PATCH_FAILED } : {}),
       };
 
       const projectPath =
@@ -1196,48 +1404,73 @@ export class CodexEventAdapter {
           : null;
       const filePath =
         toolResult?.filePath || tracked.args?.filePath || tracked.args?.path;
-      const snapshotKey =
-        typeof filePath === "string"
-          ? normalizeSnapshotPath(filePath, projectPath)
-          : null;
+      // Codex's own record of the patch (app-server lane) is its diff, exactly; a failed patch
+      // keeps it as the change it meant to make (F-P6-5 D3), with no read-back.
+      const codexDiff =
+        resolved.toolName === "batshit_server_edit_file"
+          ? buildCodexPatchDiff(changes, projectPath)
+          : undefined;
+      if (patchFailed && codexDiff) toolResult.diff = codexDiff;
+      /** A file of this patch as Batshit read it back (or an add's own text), by path. */
+      const readBack = new Map<string, string>();
 
-      if (resolved.toolName === "batshit_server_overwrite_file") {
-        if (typeof filePath === "string") {
-          const content = await readFileFromCommander(filePath, projectPath);
-          if (typeof content === "string") {
-            toolResult.content = content;
-            if (snapshotKey) {
-              this.fileSnapshots.set(snapshotKey, content);
-            }
-          } else if (toolResult.content === undefined) {
-            toolResult.content =
-              "(content unavailable from codex file_change)";
-          }
+      if (resolved.toolName === "batshit_server_overwrite_file" && !patchFailed) {
+        // An add's own record is exactly the text it wrote; without one (the exec lane) the file
+        // is read back.
+        const recorded = changes?.find(
+          (change) => change?.path === filePath && typeof change?.diff === "string",
+        )?.diff;
+        const content =
+          recorded ??
+          (typeof filePath === "string"
+            ? await readFileFromCommander(filePath, projectPath)
+            : null);
+        if (typeof content === "string") {
+          toolResult.content = content;
+          if (typeof filePath === "string") readBack.set(filePath, content);
         } else if (toolResult.content === undefined) {
           toolResult.content = "(content unavailable from codex file_change)";
         }
       }
 
-      if (resolved.toolName === "batshit_server_edit_file") {
-        if (typeof filePath === "string") {
+      if (resolved.toolName === "batshit_server_edit_file" && !patchFailed) {
+        if (codexDiff) {
+          toolResult.diff = codexDiff;
+        } else if (typeof filePath === "string") {
           const content = await readFileFromCommander(filePath, projectPath);
-          if (typeof content === "string") {
-            toolResult.diff = await this.buildEditDiff({
-              filePath,
-              projectPath,
-              after: content,
-            });
-            if (snapshotKey) {
-              this.fileSnapshots.set(snapshotKey, content);
-            }
-          } else if (toolResult.diff === undefined) {
-            toolResult.diff = `Updated ${filePath}. Diff unavailable because Batshit could not reconstruct the before/after change.`;
-          }
-        } else if (toolResult.diff === undefined) {
+          if (typeof content === "string") readBack.set(filePath, content);
+          toolResult.diff =
+            typeof content === "string"
+              ? await this.buildEditDiff({
+                  itemId: item.id,
+                  filePath,
+                  projectPath,
+                  after: content,
+                  matchingCopyMeansNoChange: false,
+                })
+              : `Updated ${filePath}. Diff unavailable because Batshit could not reconstruct the before/after change.`;
+        } else {
           toolResult.diff =
             "Updated file. Diff unavailable because Batshit could not reconstruct the before/after change.";
         }
       }
+
+      // The patch changed its own files; keep what Batshit knows of them current. A failed patch
+      // is never read back, so its files' copies are dropped. Otherwise a file just read back (or
+      // an add's own text) is kept, and any other file of the patch Batshit knew is read again (a
+      // deleted or moved-away path fails that read and is dropped).
+      const patchPaths = new Set(
+        (changes ?? [])
+          .flatMap((change) => [fileChangePath(change), fileChangeTargetPath(change)])
+          .filter((value): value is string => typeof value === "string" && value.length > 0),
+      );
+      for (const patchPath of patchPaths) {
+        const text = readBack.get(patchPath);
+        if (patchFailed) this.forgetCopy(patchPath);
+        else if (text !== undefined) this.rememberCopy(patchPath, text);
+        else if (this.knownCopies.has(copyKey(patchPath, projectPath))) await this.learnCopy(patchPath);
+      }
+      this.startCopies.delete(item.id);
     } else if (item.type === "mcp_tool_call") {
       // SA-105 P3: an MCP result can now carry image content blocks (the helper
       // bridge delivers recalled memory photos that way on this runtime). The
@@ -1302,6 +1535,8 @@ export class CodexEventAdapter {
           ...(query ? { query } : {})
         };
       }
+      // An MCP tool may write a file (a helper's own write tools do), so read every known one again.
+      await this.refreshKnownCopies();
     } else if (item.type === "todo_list") {
       toolResult = item.items;
     } else if (item.type === "web_search") {
@@ -1331,15 +1566,10 @@ export class CodexEventAdapter {
 
     const displayToolName =
       executedToolName && tracked.toolName ? executedToolName : tracked.toolName;
-    const zipControl = extractAndStripToolZipControl(toolResult);
-    if (zipControl.zipId) {
-      toolResult = zipControl.value;
-      this.request.registerReservedToolZipId?.({
-        toolCallId: tracked.id,
-        toolName: displayToolName,
-        zipId: zipControl.zipId,
-      });
-    }
+    // F-P4-9: Batshit announces no zip id to the model, so there is nothing to register
+    // here. A `batshitZipControl` marker can still arrive from a user-installed MCP server,
+    // and it must not reach the stored step.
+    toolResult = stripToolZipControl(toolResult);
     const metadata = this.detectToolMetadata(tracked.toolName, tracked.args, toolResult);
 
     this.intermediateSteps.push({

@@ -32,7 +32,12 @@ describe('the interrupt path is untouched by steering', () => {
   })
 
   it('the interrupted stamp is unchanged, and the steer stamp cannot reach it', () => {
-    const abortBranch = sendRouted.indexOf('if (isAbortError) {')
+    // The interrupted path itself (2026-09-18: the catch's first `isAbortError` branch now only
+    // chooses the log line, `streamStop.ts`).
+    const abortBranch = sendRouted.indexOf(
+      '    if (isAbortError) {\n      const interruptedAt = new Date().toISOString()\n'
+    )
+    expect(abortBranch).toBeGreaterThan(-1)
     const abortBlock = sendRouted.slice(abortBranch, abortBranch + 2200)
 
     expect(abortBlock).toContain('interrupted: true')

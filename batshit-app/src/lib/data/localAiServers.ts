@@ -116,6 +116,27 @@ export const LOCAL_AI_SERVER_DEFINITIONS: LocalAiServerDefinition[] = [
       // short conversation honestly reports zero until it grows past one block.
       promptCacheReporting: 'reports'
     }
+  },
+  {
+    id: 'koboldcpp',
+    label: 'KoboldCpp',
+    description: 'Single-binary local server with the widest sampler set of any program here. Popular for roleplay.',
+    defaultBaseUrl: 'http://localhost:5001',
+    openaiPath: '/v1',
+    enabledByDefault: false,
+    defaultImageTransport: 'auto',
+    defaultImageBaseUrl: 'http://localhost:5600',
+    supports: {
+      management: false,
+      modelList: true,
+      // Measured live against KoboldCpp 1.121 (mac-arm64, 2026-09-20): the chat
+      // path returns usage.{prompt_tokens, completion_tokens, total_tokens} and
+      // carries no `prompt_tokens_details` key at all, so there is no cache count
+      // to read. Its separate Responses-API path hardcodes `cached_tokens: 0`,
+      // which is a zero nobody measured — Batshit does not route through that
+      // path and must not start. DL-124-02.
+      promptCacheReporting: 'never-reports'
+    }
   }
 ]
 

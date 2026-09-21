@@ -134,6 +134,7 @@
 		closedCount: number
 		hasWhiteboard: boolean
 		whiteboardUpdatedAt: string | null
+		whiteboardWrittenBy: 'agent' | 'nap' | null
 	} | null>(null)
 
 	function requestFixedSession() {
@@ -172,7 +173,13 @@
 				holdUntil: payload?.open?.hold_until ?? null,
 				closedCount: Number(payload?.closedCount) || 0,
 				hasWhiteboard: Boolean(payload?.open?.whiteboard),
-				whiteboardUpdatedAt: payload?.open?.whiteboard_updated_at ?? null
+				whiteboardUpdatedAt: payload?.open?.whiteboard_updated_at ?? null,
+				whiteboardWrittenBy:
+					payload?.open?.whiteboard_written_by === 'nap'
+						? 'nap'
+						: payload?.open?.whiteboard_written_by === 'agent'
+							? 'agent'
+							: null
 			}
 		} catch (error) {
 			console.warn('Failed to load episode state:', error)
@@ -341,8 +348,13 @@
 			// Show user-friendly error message
 			if (error instanceof Error && /locked/i.test(error.message)) {
 				toast.error('Session is locked. Unlock it before deleting.');
-			} else if (error instanceof Error) {
-				toast.error(`Failed to delete session: ${error.message}`);
+			} else if (error instanceof Error && error.message.trim()) {
+				// The server's own sentence (`ApiCallError`), never its JSON. The route's 500 answer
+				// is already "Failed to delete session", so it is not said twice.
+				const reason = error.message.trim();
+				toast.error(
+					/^failed to delete session/i.test(reason) ? reason : `Failed to delete session: ${reason}`
+				);
 			} else {
 				toast.error('Failed to delete session. Please check the console for details.');
 			}

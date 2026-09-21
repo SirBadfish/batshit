@@ -279,6 +279,35 @@ export function extractManagedPatchFromSources(sources: Array<string | undefined
   return undefined;
 }
 
+/**
+ * What copies of an edit's target, read just before and just after the command ran, say about
+ * the edit: its changed lines as bounded hunks; for a run that did not fail, also that it changed
+ * nothing (identical copies) or only line endings (copies whose lines match once line endings are
+ * normalized, which a line diff cannot show). `undefined` without both copies, and for a failed
+ * run that shows no changed line.
+ *
+ * Only for copies that bracket the command (`nativeBashExecute` reads them around the run): the
+ * Codex adapter's copy can be older than the command, so identical copies there prove nothing,
+ * and that lane keeps `buildCompactEditPreview`.
+ */
+export function buildSnapshotEditPreview(options: {
+  filePath?: string;
+  before?: unknown;
+  after?: unknown;
+  allowSummary?: boolean;
+}) {
+  if (typeof options.before !== 'string' || typeof options.after !== 'string') return undefined;
+
+  const unchanged = options.before === options.after;
+  const diff = unchanged ? undefined : buildSnapshotDiff(options.before, options.after);
+  if (diff || options.allowSummary === false) return diff;
+
+  const target = options.filePath || 'file';
+  return unchanged
+    ? `No changes: the command left ${target} exactly as it was.`
+    : `Updated ${target}: only its line endings changed.`;
+}
+
 export function buildCompactEditPreview(options: CompactEditPreviewOptions) {
   const extractedPatch = extractManagedPatchFromSources([options.command]);
   if (extractedPatch) return extractedPatch;

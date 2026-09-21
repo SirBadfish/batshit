@@ -703,8 +703,9 @@ export function extractMemoryControls(content: string): MemoryControlExtraction 
 const MEMORY_FABRIC_REF_PATTERN = /^fabric:sys\.memory\./i
 const MEMORY_CONTROL_ID_PATTERN = /^sys\.memory\./i
 
-function extractCandidateRefs(value: unknown): string[] {
-  if (!value || typeof value !== 'object') return []
+function extractCandidateRefs(value: unknown, seen = new WeakSet<object>()): string[] {
+  if (!value || typeof value !== 'object' || seen.has(value)) return []
+  seen.add(value)
   const record = value as Record<string, any>
   const refs: string[] = []
   if (typeof record.ref === 'string') refs.push(record.ref)
@@ -714,7 +715,20 @@ function extractCandidateRefs(value: unknown): string[] {
     if (typeof inner.ref === 'string') refs.push(inner.ref)
     if (typeof inner.target === 'string') refs.push(inner.target)
   }
-  return refs
+  if (refs.length > 0) return refs
+  // F-P4-7: a record that names no ref may be a wrapper. Unwrap it the way the managed CLI
+  // helper bridge does (`normalizeArgs` in `scripts/mode4-controls-mcp.cjs`): a `value`
+  // object first, else a plain `arguments` object, as deep as it goes. The Codex event
+  // adapter stores every helper call as `{ arguments: <the model's call> }`. A record that
+  // names a ref is already the broker call, so its payload is never read as a wrapper —
+  // API and Claude steps arrive with the tool input flattened beside `ref`.
+  const unwrapped =
+    record.value && typeof record.value === 'object'
+      ? record.value
+      : record.arguments && typeof record.arguments === 'object' && !Array.isArray(record.arguments)
+        ? record.arguments
+        : null
+  return unwrapped ? extractCandidateRefs(unwrapped, seen) : refs
 }
 
 /**
@@ -730,18 +744,34 @@ function extractCandidateRefs(value: unknown): string[] {
  * exempt. SA-106 retired the n8n PRIMARY lane but NOT that hazard — `n8n Workflow
  * Subagent` steps still reach the cool-tool adapter with workflow-authored names. Do
  * not relax this back to a name gate.
+ * The ref may sit under the managed CLI helper's `arguments` / `value` wrapping (F-P4-7:
+ * managed Codex steps and their SSE `tool-result` events carry `{ arguments: { ref } }`).
+ * The unwrap follows the helper bridge's own and opens only a record that names no ref of
+ * its own — never a deep search for any string.
  * Still strict: with no matching ref, the step is NOT a memory step and zips normally.
  */
 export function isMemoryControlToolStep(step: unknown): boolean {
-  if (!step || typeof step !== 'object') return false
+  return memoryControlIdsOfToolStep(step).length > 0
+}
+
+/**
+ * The `sys.memory.*` controls an intermediate tool step targets, as plain lower-case control
+ * ids (`sys.memory.save`), in the order found and without repeats. Empty for every other
+ * step. Same ref rules as `isMemoryControlToolStep`, which is this list being non-empty.
+ * SA-120 P6 reads it to know, as a fact, whether a turn saved a memory: these steps are
+ * exempt from zips (DL-104-17), so no tool-result zip records them.
+ */
+export function memoryControlIdsOfToolStep(step: unknown): string[] {
+  if (!step || typeof step !== 'object') return []
   const record = step as Record<string, any>
+  const ids: string[] = []
   for (const candidate of [record.toolInput, record.toolArgs, record.args, record.input, record.action?.toolInput]) {
     for (const ref of extractCandidateRefs(candidate)) {
       const trimmed = ref.trim()
-      if (MEMORY_FABRIC_REF_PATTERN.test(trimmed) || MEMORY_CONTROL_ID_PATTERN.test(trimmed)) {
-        return true
-      }
+      if (!MEMORY_FABRIC_REF_PATTERN.test(trimmed) && !MEMORY_CONTROL_ID_PATTERN.test(trimmed)) continue
+      const id = trimmed.replace(/^fabric:/i, '').toLowerCase()
+      if (!ids.includes(id)) ids.push(id)
     }
   }
-  return false
+  return ids
 }

@@ -18,10 +18,14 @@ Skills are session-free: they don't carry conversation state between uses. Each 
 
 ## Built-in Skills
 
-Batshit ships with a few system Skills you can enable right away:
+Batshit ships with a few system Skills. On a new install, **Batshit Guide** and **Artifact Creator** start on for all agents, so a fresh agent can answer Batshit questions and build an Artifact when you ask. The others start off; turn any of them on in Settings → Skills & Prompts (for all agents) or per agent in Settings → Agents → Access. If you installed an earlier alpha, your existing choices stay as they were, so switch these two on yourself if you want them.
+
+An agent can only load a Skill that is on for it. A Subagent follows its own Access list, not its parent's. If you ask for something a Skill handles and that Skill is off, the agent tells you which Skill to switch on and where. Only you change who may use a Skill: when an agent saves a new Skill for you, it is on for that agent alone until you turn it on for others. An agent can change only a Skill that is on for it.
+
+The built-in Skills:
 
 - **Batshit Guide** (`/batshit-guide`) — turns any agent into a Batshit expert. Its references are the official Batshit docs (the same pages as the public docs site), kept in sync automatically, so an enabled agent can answer "how does X work in Batshit?" and walk you through features accurately. Enable it and just ask — the agent pulls in the guide on its own.
-- **Artifact Creator** (`/artifact-creator`) — helps build Artifacts.
+- **Artifact Creator** (`/artifact-creator`) — builds Artifacts with the Builder Kit and Fabric structure Batshit requires, so an agent can go from "build me a tip calculator" to a working panel.
 - **CLI Tool Creator** (`/cli-tool-creator`) — helps set up saved CLI Tools.
 - **Goon Scene Creator** (`/goon-scene-creator`) — helps plan and generate Goon scenes, including Room Builder or Uploaded GLB placement, one coherent Ground Level or Elevated placement, projection-safe skyboxes with the 50% Ground Projection Line rule, one Scene Atmosphere layer, props, markers, and 4K vs 8K texture choices.
 - **Skill Creator** (`/skill-creator`) — helps create reusable Skills and Prompts.
@@ -63,6 +67,6 @@ Full details — tokens, scopes, install paths, and the current bundles — are 
 ## Related
 
 - [Tools](../tools/overview.md) — Skills sit alongside tools, MCPs, and CLI Tools as ways agents get work done.
-- [Primary Agents](../primary-agents/overview.md) — Skills are enabled per agent in Agent Settings → Access.
+- [Primary Agents](../primary-agents/overview.md) — Skills are enabled per agent in Settings → Agents → Access.
 - [User](../user/overview.md) — your global custom prompt.
 - [Admin](../admin/overview.md) — core system prompt editing.

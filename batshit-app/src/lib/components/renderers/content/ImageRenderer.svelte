@@ -617,7 +617,7 @@
     padding: 0.25rem 0.5rem;
     border-radius: var(--radius);
     font-size: 0.75rem;
-    font-family: monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
   }
   
   .image-actions {

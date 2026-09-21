@@ -49,6 +49,11 @@ export async function mintCliRunCredential(options: {
    * credential is marked so it cannot act as an agent.
    */
   delegated?: boolean
+  /**
+   * BL-75 — the Subagent or Worker whose skill access governs a delegated run. Required when
+   * `delegated`; see `mintRunCredential`.
+   */
+  scopeAgentId?: string | null
 }): Promise<CliRunCredential> {
   const minted = await mintRunCredential({
     userId: options.userId,
@@ -56,7 +61,8 @@ export async function mintCliRunCredential(options: {
     sessionId: options.sessionId,
     messageId: options.messageId ?? null,
     runtime: options.runtime,
-    delegated: options.delegated === true
+    delegated: options.delegated === true,
+    scopeAgentId: options.scopeAgentId ?? null
   })
 
   return {

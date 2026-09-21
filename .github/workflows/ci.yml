@@ -79,6 +79,8 @@ jobs:
       - name: Install runtime test dependencies (zsh, ffmpeg)
         run: sudo apt-get update && sudo apt-get install -y zsh ffmpeg
       - run: npm ci
+      # Upload proxy integration exercises the actual server PNG validator.
+      - run: npm ci --prefix ../batshit-server/server
       - run: npx vitest run --shard=${{ matrix.shard }}
 
   # Keep the existing required-check name stable for branch protection. This small
@@ -149,6 +151,7 @@ jobs:
           src/lib/server/services/__tests__/agentWakeups.test.ts
           src/lib/server/services/__tests__/controlApprovals.test.ts
           src/lib/server/services/__tests__/brokerControlApprovals.test.ts
+          src/lib/server/services/__tests__/approvalAnswerRecord.test.ts
           src/lib/server/services/schedules/__tests__/scheduleStore.test.ts
           src/lib/server/services/schedules/__tests__/scheduleTicker.test.ts
           src/routes/api/sessions/[sessionId]/control-approvals/control-approvals-route.test.ts
@@ -239,6 +242,13 @@ jobs:
         # than trusted. Also finally runs the roots-manifest test, which had no
         # runner wired up before.
         run: node --test tools/run-dependency-audit.test.mjs tools/validate-dependency-audit-roots.test.mjs
+      - name: Docker host operator self-tests
+        # The host operator creates and removes Docker Sandboxes for Docker installs. These
+        # start it against a fake `sbx` that plays the real CLI's rules (sign-in, network
+        # preset, per-sandbox deny, idle stop) and send parallel requests for one chat. The end
+        # command a Stop or timeout runs inside a sandbox reads `/proc`, so it runs for real here.
+        # The Agent Browser sidecar runs against a fake `agent-browser` (its time limit, a Stop).
+        run: node --test tools/docker/sandbox-lifecycle-gate.test.mjs tools/docker/sbx-cli.test.mjs tools/docker/runtime-addon-operator.test.mjs tools/docker/command-end.test.mjs tools/docker/agent-browser-sidecar.test.mjs
       - name: npm audit — production deps (fail on high/critical)
         # Blocking gate scoped to what ships: --omit=dev keeps build-chain advisories
         # (vite/esbuild and friends, which churn upstream weekly and have no path into

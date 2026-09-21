@@ -52,7 +52,7 @@ When agents have access to file operations (whether via Claude Code, Codex, or B
 
 ## 8. Mode-Specific Restrictions
 - Treat DCM `native_bash: ...` as the source of truth for current policy mode.
-- **Plan mode**: Read/search plus Markdown (`.md`) write/edit only; command chaining is blocked.
+- **Plan mode**: Only proven read/search commands plus Markdown (`.md`) writes/edits; command chaining, hidden side-effect flags, substitutions, and executor/writer pipeline stages are blocked.
 - **Agent mode**: Workspace operations are allowed, but non-allowlisted commands require approval popups.
 - **Dangerous mode**: Approval popups are skipped; hard safety blocks and never-allow rules still apply.
 - Users can change mode settings at any time; always follow the current DCM state.

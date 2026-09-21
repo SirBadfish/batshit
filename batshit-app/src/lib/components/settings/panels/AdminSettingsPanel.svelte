@@ -18,6 +18,7 @@
   import AdminGoonAssetCleanupCard from '$lib/components/settings/admin/AdminGoonAssetCleanupCard.svelte'
   import AdminUtilityCards from '$lib/components/settings/admin/AdminUtilityCards.svelte'
   import AdminAgentWakeupsCard from '$lib/components/settings/admin/AdminAgentWakeupsCard.svelte'
+  import AdminJevJuiceCard from '$lib/components/settings/admin/AdminJevJuiceCard.svelte'
   import { resolveInstanceWakeupsEnabled } from '$lib/utils/dmControl'
   import AdminWebSearchCard from '$lib/components/settings/admin/AdminWebSearchCard.svelte'
   import { toast } from '$lib/components/ui/sonner/settings-toast'
@@ -288,9 +289,11 @@
     backend: 'docker_sandbox' | 'apple_container'
     policy: string
     version: string | null
-    cli?: 'sbx' | 'docker-sandbox' | null
+    cli?: 'sbx' | null
     image?: string | null
     network?: string | null
+    /** Apple Container only: false until the first sandboxed command starts it (BL-62). */
+    systemRunning?: boolean
     reason: string | null
     installUrl?: string
   }
@@ -1862,6 +1865,8 @@
       onAgentWakeupsEnabledChange={(checked) => (adminSettings.agentWakeupsEnabled = checked)}
     />
 
+    <AdminJevJuiceCard disabled={isLoading} />
+
     <AdminUtilityCards
       goonLipSyncLabEnabled={adminSettings.goonLipSyncLabEnabled}
       disabled={isLoading}
@@ -2575,6 +2580,11 @@
                   </p>
                   {#if appleSandboxRuntimeStatus?.reason}
                     <p class="batshit-settings-form-label">{appleSandboxRuntimeStatus.reason}</p>
+                  {/if}
+                  {#if appleSandboxRuntimeStatus?.available && appleSandboxRuntimeStatus.systemRunning === false}
+                    <p class="batshit-settings-form-label">
+                      Not started yet. Batshit starts Apple Container with the first sandboxed command.
+                    </p>
                   {/if}
                   {#if appleSandboxError}
                     <p class="batshit-settings-form-help is-danger">{appleSandboxError}</p>

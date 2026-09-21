@@ -129,6 +129,11 @@ export interface ExecutionSnapshot {
   subagentDescription?: Record<string, string>
   compiledMessages?: Array<{ role: string; content: any }>
   compileMetadata?: Record<string, any>
+  /**
+   * Free-form run metadata. SA-120 Jev Juice lanes add `typesafeCalls: TypesafeCallRecord[]`
+   * (`$lib/types/typesafe`): one row per TypeSafe call with model, latency, usage or
+   * honest `null`, deadline state, status, reason, and the decision taken (DL-120-07).
+   */
   executionMetadata?: Record<string, any>
   /** n8n-style webhook input: [{ headers, params, query, body }] */
   webhookStyleInput?: any[] | null

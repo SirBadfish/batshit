@@ -138,7 +138,7 @@
     display: block;
     flex: 0 0 auto;
     font-weight: 500;
-    font-family: monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     min-width: 0;
     max-width: min(14rem, 45%);
     overflow: hidden;

@@ -561,8 +561,9 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
       /already has open episode/
     )
 
-    const withBoard = await updateEpisodeWhiteboard('sess_ep', episode.id, 'vet Friday; rope toy')
+    const withBoard = await updateEpisodeWhiteboard('sess_ep', episode.id, 'vet Friday; rope toy', 'agent')
     expect(withBoard.whiteboard?.content).toContain('vet Friday')
+    expect(withBoard.whiteboard?.written_by).toBe('agent')
     await updateEpisodeBounds('sess_ep', episode.id, { last_message_id: 'm9', hold_until: '2026-08-26T09:00:00.000Z' })
 
     await expect(markEpisodeGraduated('sess_ep', episode.id)).rejects.toThrow(/only closed episodes graduate/)
@@ -572,7 +573,7 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     expect(closed.hold_until).toBeNull()
     expect(closed.whiteboard?.content).toContain('vet Friday')
 
-    await expect(updateEpisodeWhiteboard('sess_ep', episode.id, 'nope')).rejects.toThrow(
+    await expect(updateEpisodeWhiteboard('sess_ep', episode.id, 'nope', 'agent')).rejects.toThrow(
       /belongs to the open episode/
     )
 
@@ -598,7 +599,7 @@ describe.runIf(memorySearchLaneActive())('memory data layer (dedicated Redis 8 d
     for (let round = 0; round < 5; round++) {
       const hold = `2026-09-0${round + 2}T09:00:00.000Z`
       await Promise.all([
-        updateEpisodeWhiteboard('sess_race', episode.id, `board r${round}`),
+        updateEpisodeWhiteboard('sess_race', episode.id, `board r${round}`, 'agent'),
         updateEpisodeBounds('sess_race', episode.id, { hold_until: hold })
       ])
       const stored = await getEpisode('sess_race', episode.id)

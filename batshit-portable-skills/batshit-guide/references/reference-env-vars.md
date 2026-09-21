@@ -42,10 +42,10 @@ These apply when Batshit runs through `Batshit.app` or directly from source on t
 | `PUBLIC_BATSHIT_SERVER_URL` | Mac app: `http://127.0.0.1:5600`; source checkout: `http://localhost:5610` | Browser-facing batshit-server URL saved/returned to users. |
 | `PUBLIC_BATSHIT_SERVER_API_URL` | Mac app: `http://127.0.0.1:5600/api/v1`; source checkout: `http://localhost:5610/api/v1` | Browser-facing batshit-server API root. |
 | `BATSHIT_ARTIFACT_COMPLETE_URL` | Mac app: `http://127.0.0.1:5620/api/artifacts/complete`; source checkout: `http://localhost:5621/api/artifacts/complete` | Server-to-app artifact completion callback. |
-| `BATSHIT_APP_VERSION` | `0.1.0-alpha.1` | Current installed Batshit version shown by the in-app update check. Normal users should not change this. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.2` | Current installed Batshit version shown by the in-app update check. Normal users should not change this. |
 | `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
 | `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks for offline/private environments. |
-| `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom latest-release feed. Blank uses Batshit's official GitHub release feed. |
+| `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom release feed: a GitHub-style release list or one release. Blank uses Batshit's official GitHub release list, pre-releases included. |
 | `BATSHIT_UPDATE_LATEST_VERSION` | blank | Optional local/test override for the latest available version. Leave blank for normal installs. |
 | `BATSHIT_UPDATE_RELEASE_URL` / `BATSHIT_UPDATE_DOWNLOAD_URL` | blank | Optional local/test links used with `BATSHIT_UPDATE_LATEST_VERSION`. |
 | `N8N_BATSHIT_FRONTEND_URL` | Mac app: `http://127.0.0.1:5620`; Docker: the app/container-reachable Batshit URL | Server-to-server Batshit app URL that n8n workflows call for native-tool dispatch and callbacks. |
@@ -87,10 +87,10 @@ These live in `.env.docker`.
 | `BATSHIT_SESSION_COOKIE_SECURE` | blank | Leave blank for automatic local HTTP vs HTTPS behavior. |
 | `BATSHIT_SESSION_COOKIE_NAME` | `batshit_session_docker` | Lets Docker stay logged in beside another local Batshit instance. |
 | `BODY_SIZE_LIMIT` | `1G` | SvelteKit incoming request body limit for ordinary app requests and trusted local imports. It is not a backup export or restore limit. |
-| `BATSHIT_APP_VERSION` | `0.1.0-alpha.1` | Current installed Batshit version shown by the in-app update check. |
+| `BATSHIT_APP_VERSION` | `0.1.0-alpha.2` | Current installed Batshit version shown by the in-app update check. |
 | `BATSHIT_APP_CHANNEL` | `alpha` | Release channel label shown by the in-app update check. |
 | `BATSHIT_UPDATE_CHECK_DISABLED` | `0` | Set to `1` to disable in-app update checks. |
-| `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom latest-release feed. Blank uses Batshit's official GitHub release feed. |
+| `BATSHIT_UPDATE_FEED_URL` | blank | Optional custom release feed: a GitHub-style release list or one release. Blank uses Batshit's official GitHub release list, pre-releases included. |
 | `BATSHIT_UPDATE_LATEST_VERSION` | blank | Optional local/test override for the latest available version. Leave blank for normal installs. |
 | `BATSHIT_UPDATE_RELEASE_URL` / `BATSHIT_UPDATE_DOWNLOAD_URL` | blank | Optional local/test links used with `BATSHIT_UPDATE_LATEST_VERSION`. |
 
@@ -189,8 +189,11 @@ These can be env fallbacks, but Settings -> API Keys is preferred for normal use
 | `MISTRAL_API_KEY` | Mistral provider key. |
 | `GROQ_API_KEY` | Groq provider key. |
 | `MOONSHOT_API_KEY` / `MOONSHOT_API_BASE_URL` | Moonshot AI/Kimi provider key and optional OpenAI-compatible base URL override. |
+| `KIMI_CODE_API_KEY` / `KIMI_CODE_API_BASE_URL` | Separate Kimi Code membership key and optional coding-endpoint override. Batshit defaults to the overseas OpenAI-compatible `https://api.kimi.ai/coding/v1` endpoint; this key does not replace Moonshot pay-as-you-go. |
 | `MINIMAX_API_KEY` / `MINIMAX_API_BASE_URL` | MiniMax key and optional OpenAI-compatible base URL override. The same key also powers MiniMax TTS. |
+| `MINIMAX_TOKEN_PLAN_API_KEY` / `MINIMAX_TOKEN_PLAN_API_BASE_URL` | Separate MiniMax Token Plan `sk-cp` subscription key and optional endpoint override. Eligible MiniMax speech prefers this key when configured. |
 | `MIMO_API_KEY` / `MIMO_API_BASE_URL` | MiMo key and optional OpenAI-compatible base URL override. The same key also powers MiMo TTS. |
+| `MIMO_TOKEN_PLAN_API_KEY` / `MIMO_TOKEN_PLAN_API_BASE_URL` | Separate MiMo Token Plan `tp-` subscription key and regional OpenAI-compatible endpoint override. Batshit defaults to the Singapore endpoint; eligible MiMo ASR/TTS prefers this key when configured. |
 | `DASHSCOPE_API_KEY` / `DASHSCOPE_API_BASE_URL` | Qwen Cloud model-catalog and direct-inference key, plus an optional OpenAI-compatible base URL override. The default is the international DashScope endpoint. The Alibaba voice lane may also use this key. |
 | `QWEN_TOKEN_PLAN_API_KEY` / `QWEN_TOKEN_PLAN_API_BASE_URL` | Separate Alibaba Token Plan subscription key and optional endpoint override. Batshit defaults to the plan's Singapore OpenAI-compatible endpoint. Use this key only for interactive coding/agent work allowed by Alibaba, not automation, n8n workflows, batch calls, or generic application backends. |
 | `ALIBABA_CLOUD_API_KEY` / `ALIBABA_CLOUD_API_BASE_URL` | Alibaba Cloud manual model-preset key and optional OpenAI-compatible base URL override. |
@@ -198,6 +201,7 @@ These can be env fallbacks, but Settings -> API Keys is preferred for normal use
 | `STEPFUN_API_KEY` / `STEP_API_KEY` / `STEPFUN_API_BASE_URL` | StepFun key and optional OpenAI-compatible base URL override. The same key also powers StepFun TTS. |
 | `OPENROUTER_API_KEY` | OpenRouter provider key. |
 | `AI_GATEWAY_API_KEY` | Vercel AI Gateway key. |
+| `TYPESAFE_API_KEY` | Optional TypeSafe key for [Jev Juice](../jev-juice/overview.md). Settings → API Keys is preferred; every Jev Juice feature stays off until you turn it on. |
 | `DEEPSEEK_API_KEY` | DeepSeek provider key in app env examples. |
 | `ZAI_API_KEY` / `ZAI_API_BASE_URL` | Z.ai regular pay-as-you-go key and optional OpenAI-compatible base URL override. |
 | `ZAI_CODING_API_KEY` / `ZAI_CODING_API_BASE_URL` | Separate Z.ai Coding Plan key and optional coding-endpoint override. The regular key never activates this connection. |
@@ -253,7 +257,7 @@ These variables configure Batshit's optional bridge. NVIDIA Audio2Face-3D NIM v2
 
 | Variable | Default example | Purpose |
 | --- | --- | --- |
-| `AGENT_BROWSER_VERSION` | `0.24.1` | Pinned Agent Browser CLI version for Docker sidecar. |
+| `AGENT_BROWSER_VERSION` | `0.37.1` | Pinned Agent Browser CLI version for Docker sidecar. |
 | `BATSHIT_AGENT_BROWSER_SIDECAR_URL` | `http://agent-browser:8091` | Internal sidecar URL. |
 | `BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN` | generated by launcher | Sidecar token. |
 | `BATSHIT_AGENT_BROWSER_TMP_DIR` | `/runtime/agent-browser/tmp` | Shared screenshot/temp directory. |

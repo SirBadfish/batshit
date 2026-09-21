@@ -139,6 +139,23 @@ function isRefreshProtected(sessionId: string, messageId: string) {
   return typeof expiresAt === 'number' && expiresAt > Date.now()
 }
 
+function approvalResumeVersion(message: Message) {
+  const version = message.metadata?.approvalResumeVersion
+  return Number.isSafeInteger(version) && version > 0 ? version : null
+}
+
+/**
+ * A chat re-read can finish after a resumed approval has already reopened this same message.
+ * The server-authored resume version is monotonic, so an older Redis snapshot must not put the
+ * completed pre-approval record back over the locally newer in-progress or finalized record.
+ */
+function keepNewerLocalApprovalResume(local: Message, incoming: Message) {
+  const localVersion = approvalResumeVersion(local)
+  if (localVersion === null) return false
+  const incomingVersion = approvalResumeVersion(incoming)
+  return incomingVersion === null || incomingVersion < localVersion
+}
+
 function mergePreservedLocalMessages(
   sessionId: string,
   incomingMessages: Message[],
@@ -146,6 +163,16 @@ function mergePreservedLocalMessages(
 ) {
   const incomingIds = new Set(incomingMessages.map((message) => message.id).filter(Boolean))
   cleanupRefreshProtections(sessionId, incomingIds)
+
+  const localById = new Map(
+    getMessages(sessionId)
+      .filter((message) => Boolean(message.id))
+      .map((message) => [message.id, message])
+  )
+  const mergedIncoming = incomingMessages.map((incoming) => {
+    const local = localById.get(incoming.id)
+    return local && keepNewerLocalApprovalResume(local, incoming) ? local : incoming
+  })
 
   const preservedMessages = getMessages(sessionId).filter(
     (message) =>
@@ -157,10 +184,10 @@ function mergePreservedLocalMessages(
   )
 
   if (preservedMessages.length === 0) {
-    return incomingMessages
+    return mergedIncoming
   }
 
-  return dedupeMessages([...incomingMessages, ...preservedMessages]).sort((a, b) => {
+  return dedupeMessages([...mergedIncoming, ...preservedMessages]).sort((a, b) => {
     const timeDelta = getMessageTime(a) - getMessageTime(b)
     if (timeDelta !== 0) return timeDelta
     return a.id.localeCompare(b.id)
@@ -249,9 +276,7 @@ export function setMessagesForSession(
   const deduped = dedupeMessages(Array.isArray(newMessages) ? newMessages : [])
   setSessionMessages(
     sessionId,
-    options.preserveLocalInProgress || refreshProtectedMessageIdsBySession.has(sessionId)
-      ? mergePreservedLocalMessages(sessionId, deduped, options)
-      : deduped
+    mergePreservedLocalMessages(sessionId, deduped, options)
   )
 }
 

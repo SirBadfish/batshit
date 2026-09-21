@@ -53,7 +53,9 @@ describe('mintCliRunCredential', () => {
       runtime: 'codex',
       // F-P2-1: an ordinary primary run is not delegated, so the store still requires an
       // `agent:` record for it.
-      delegated: false
+      delegated: false,
+      // BL-75: and it names no separate skill scope; its own agent governs.
+      scopeAgentId: null
     })
   })
 

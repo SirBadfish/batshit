@@ -128,7 +128,9 @@ const FABRIC_CONTROL_DISPLAY_ALIASES: Record<string, string> = {
   'sys.dm.agents': 'Agent DM Presence',
   // SA-115's Schedules family: `formatControlWords` renders `update` as "Edit", which is
   // right for an artifact and wrong for a schedule.
-  'sys.schedule.update': 'Schedule Update'
+  'sys.schedule.update': 'Schedule Update',
+  // SA-120 P2: the derived "Jev Juice Ask" reads backwards; the card says what you do.
+  'sys.judge.ask': 'Ask Jev Juice'
 }
 
 const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
@@ -148,7 +150,9 @@ const FABRIC_CONTROL_PREFIX_LABELS: Record<string, string> = {
   'sys.zip.': 'Zip',
   'sys.agent_browser.': 'Agent Browser',
   'sys.dm.': 'Agent DM',
-  'sys.schedule.': 'Schedule'
+  'sys.schedule.': 'Schedule',
+  // SA-120 P2: the product name, two words (DL-120-13).
+  'sys.judge.': 'Jev Juice'
 }
 
 function normalizeDisplayAliasKey(rawName: string): string {

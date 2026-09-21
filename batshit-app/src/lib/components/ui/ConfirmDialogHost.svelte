@@ -9,7 +9,12 @@
     AlertDialogHeader,
     AlertDialogTitle
   } from '$lib/components/ui/alert-dialog'
-  import { activeConfirmDialog, resolveConfirmDialog } from '$lib/stores/confirmDialog'
+  import { Checkbox } from '$lib/components/ui/checkbox'
+  import {
+    activeConfirmDialog,
+    resolveConfirmDialog,
+    setConfirmDialogChecked
+  } from '$lib/stores/confirmDialog'
 
   const request = $derived($activeConfirmDialog)
   const open = $derived(Boolean(request))
@@ -44,6 +49,23 @@
           </AlertDialogDescription>
         {/if}
       </AlertDialogHeader>
+      {#if request.checkbox}
+        <label class="batshit-confirm-dialog-checkbox">
+          <Checkbox
+            checked={request.checked}
+            onCheckedChange={(checked: boolean) =>
+              setConfirmDialogChecked(request.id, checked === true)}
+            class="mt-0.5 shrink-0"
+            aria-label={request.checkbox.label}
+          />
+          <span class="batshit-confirm-dialog-checkbox-text">
+            <span class="batshit-confirm-dialog-checkbox-label">{request.checkbox.label}</span>
+            {#if request.checkbox.note}
+              <span class="batshit-confirm-dialog-checkbox-note">{request.checkbox.note}</span>
+            {/if}
+          </span>
+        </label>
+      {/if}
       <AlertDialogFooter>
         <AlertDialogCancel>{request.cancelLabel}</AlertDialogCancel>
         <AlertDialogAction
@@ -68,6 +90,33 @@
 
   :global(.batshit-confirm-dialog-description span:empty) {
     min-height: 0.25rem;
+  }
+
+  :global(.batshit-confirm-dialog-checkbox) {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    cursor: pointer;
+  }
+
+  :global(.batshit-confirm-dialog-checkbox-text) {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  :global(.batshit-confirm-dialog-checkbox-label) {
+    font-size: 0.875rem;
+    font-weight: 500;
+    line-height: 1.35;
+    color: var(--foreground);
+  }
+
+  :global(.batshit-confirm-dialog-checkbox-note) {
+    font-size: 0.8125rem;
+    font-weight: 300;
+    line-height: 1.4;
+    color: var(--muted-foreground);
   }
 
   :global(.batshit-confirm-dialog-action.is-destructive) {

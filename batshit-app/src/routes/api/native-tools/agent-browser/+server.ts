@@ -8,6 +8,7 @@ import {
   bindActingSessionId
 } from '$lib/server/services/actingAgentIdentity'
 import { nativeToolService, resolveNativeToolSettings } from '$lib/server/services/nativeTools'
+import { getRunningReplyStopSignal } from '$lib/server/services/streamAbortRegistry'
 
 interface AgentBrowserRequest {
   userId?: string
@@ -107,15 +108,19 @@ export const POST: RequestHandler = async ({ request, locals }) => {
         return json({ success: false, error: 'toolName is required.' }, { status: 400 })
       }
 
+      const sessionId = bindActingSessionId(auth, body.sessionId)
       const result = await nativeToolService.nativeAgentBrowserUse({
         userId: auth.userId,
-        sessionId: bindActingSessionId(auth, body.sessionId),
+        sessionId,
         toolName,
         params:
           body.params && typeof body.params === 'object' && !Array.isArray(body.params)
             ? body.params
             : undefined,
-        settings: resolved.runtime
+        settings: resolved.runtime,
+        // A Stop of the reply running in this chat ends the call (2026-09-18); no reply running,
+        // no signal, as before (`getRunningReplyStopSignal` says why the request cannot carry it).
+        abortSignal: getRunningReplyStopSignal(sessionId)
       })
       return json(result, { status: result.dockerUnsupported === true ? 503 : 200 })
     }

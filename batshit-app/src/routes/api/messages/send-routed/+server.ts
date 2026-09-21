@@ -2,7 +2,7 @@ import { open, unlink } from 'node:fs/promises'
 import { randomInt } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
-import { json } from '@sveltejs/kit'
+import { json, type RequestEvent } from '@sveltejs/kit'
 import { commitMemoryTurnState } from '$lib/server/services/memory/memoryRecall'
 import { ensureFixedSessionOpenEpisode } from '$lib/server/services/memory/memoryEpisodes'
 import { isFixedSession, resolveFixedSessionAgentId } from '$lib/utils/fixedSession'
@@ -28,6 +28,34 @@ import {
   type ZipReference,
 } from '$lib/server/zipService'
 import { executionViewerService } from '$lib/server/services/executionViewerService'
+import {
+  attachJevJuiceRecords,
+  buildGroupSpeakerProvider,
+  buildJevJuiceMessageMetadata,
+  buildPostTurnCheckTurn,
+  buildQuickActionTellProvider,
+  buildSemanticRecallTurn,
+  buildSkillToolHintProvider,
+  buildSmartZipTurn,
+  buildUntrustedTextHintProvider,
+  composeJevJuiceHintProviders,
+  createJevJuiceTurnCollector,
+  type GroupSpeakerProviderInput,
+} from '$lib/server/services/typesafe/jevJuiceTurn'
+import {
+  GROUP_SPEAK_POLICY_SMART,
+  buildGroupSpeakerDcmLines,
+  buildGroupSpeakerRequest,
+  buildGroupSpeakerSelectionMetadata,
+  computeGroupSpeakerSelection,
+  type GroupSpeakerCandidate,
+  type GroupSpeakerOutcome,
+  type GroupSpeakerSelectionMetadata,
+} from '$lib/server/services/groupSpeaker.jev'
+import { appendTypesafeCallRecords } from '$lib/server/services/typesafe/typesafeEvidence'
+import { markInferredRezipsTold, writeInferredUnzips } from '$lib/server/services/zipStateInferred'
+import { markPostTurnRecordTold } from '$lib/server/services/postTurnCheckState'
+import type { TypesafeCallRecord } from '$lib/types/typesafe'
 import type { ExecutionRuntimeDetails } from '$lib/types/executionViewer'
 import { getTypeZipSettings } from '$lib/utils/toolRenderMap'
 import { normalizeAgentBrowserCommandName } from '$lib/utils/toolNameNormalization'
@@ -127,6 +155,7 @@ import { buildClaudeRuntimeSettings } from '$lib/server/services/claudeSettings'
 import type { ClaudeRuntimeSettings } from '$lib/types/claude'
 import { replacePromptVariables } from '$lib/utils/promptVariables'
 import { STEER_MISSED_REASON, resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { resolveWorkersEnabled } from '$lib/utils/delegationCapabilities'
 import { THINKING_INDICATOR } from '$lib/utils/thinkingIndicator'
@@ -137,14 +166,44 @@ import {
 	  getActiveSessionTurn,
 	  getActiveStream,
 	  registerSessionTurn,
-	  clearSessionTurn,
+	  releaseSessionTurn,
+	  isSessionTurnHeldByAnother,
 	  registerStreamAbort,
   clearStreamAbort,
   registerGroupAbort,
   clearGroupAbort,
+  isSessionDeleting,
 } from '$lib/server/services/streamAbortRegistry'
 import { getWakeAbortSignal, getWakeRun } from '$lib/server/services/wakeRunRegistry'
 import { publishUserEvent } from '$lib/server/ssePublisher'
+import {
+  composeInPlaceResumeMessage,
+  createApprovalResumeStart,
+  isInPlaceApprovalResume,
+  readStoredAssistantRecord,
+  resolveFailedTurnContent,
+} from '$lib/server/services/approvalResumeMessage'
+import {
+  isApprovalClick,
+  waitForCardReplyToFinish,
+} from '$lib/server/services/approvalClickWait'
+import { answerApprovalsOnce } from '$lib/server/services/approvalAnswerRecord'
+import { waitForFinishingTurn } from '$lib/server/services/finishingTurnWait'
+import {
+  answerWhenTurnAccepted,
+  prefersRespondAsync,
+  type AcceptTurn,
+} from '$lib/server/services/respondAsyncSend'
+import { enterBackupRestoreHttpRequest } from '$lib/server/services/backupRestoreService'
+import {
+  StreamStoppedError,
+  isStopError,
+  judgeStreamEnd,
+} from '$lib/server/services/streamStop'
+import {
+  SESSION_DELETED_STOP_MESSAGE,
+  isStoppedForSessionDelete,
+} from '$lib/server/services/sessionDeleteTurnStop'
 import {
   attachSteerTransport,
   clearSteerInbox,
@@ -202,6 +261,7 @@ import {
   stripRepeatedLeadingGroupControlBlocks,
 } from '$lib/server/services/groupChatUtils'
 import { resolveNativeBashMapping } from '$lib/server/services/bashCommandMapper'
+import { toolStepFailureMessage } from '$lib/utils/toolResultProcessor'
 import {
   MODE4_PRELAUNCH_STYLE,
   resolveMode4MemoryOwner,
@@ -416,6 +476,22 @@ async function extractFailurePayload(response: Response): Promise<{
   }
 }
 
+class ApprovalResumeAcquisitionError extends Error {
+  readonly approvalResumeVersion: number
+
+  constructor(cause: unknown, approvalResumeVersion: number) {
+    super(getFailureMessage(cause), { cause })
+    this.name = cause instanceof Error ? cause.name : 'Error'
+    this.stack = cause instanceof Error ? cause.stack : this.stack
+    this.approvalResumeVersion = approvalResumeVersion
+    if (cause && typeof cause === 'object') {
+      for (const key of ['code', 'status', 'statusCode'] as const) {
+        if (key in cause) (this as any)[key] = (cause as any)[key]
+      }
+    }
+  }
+}
+
 async function persistFailedAssistantTurn(options: {
   sessionId?: string | null
   userId?: string | null
@@ -426,6 +502,18 @@ async function persistFailedAssistantTurn(options: {
   code?: string | null
   status?: number | null
   metadata?: Record<string, any> | null
+  /**
+   * An API-lane approval resume writes into the message the card was ON. Its failure keeps
+   * the words already there (`resolveFailedTurnContent`) and says so on the user channel,
+   * including failures before the versioned resume start reaches watching tabs.
+   */
+  inPlaceResume?: boolean
+  /**
+   * The turn failed before its stream sent anything (bug sweep item 2, 2026-09-18): no stream
+   * event reaches another tab showing the chat, which showed the user's words with no reply and
+   * no error until it reloaded. Said on the user channel so every tab re-reads the chat.
+   */
+  noStreamEvent?: boolean
 }) {
   const sessionId =
     typeof options.sessionId === 'string' ? options.sessionId.trim() : ''
@@ -450,6 +538,12 @@ async function persistFailedAssistantTurn(options: {
       : null
 
   try {
+    const inPlaceResume = options.inPlaceResume === true
+    const content = resolveFailedTurnContent({
+      inPlaceResume,
+      errorText: cleanMessage,
+      prior: inPlaceResume ? await readStoredAssistantRecord(sessionId, messageId) : null,
+    })
     await redis.saveMessage({
       id: messageId,
       session_id: sessionId,
@@ -457,7 +551,7 @@ async function persistFailedAssistantTurn(options: {
       agent_id: agentId,
       role: 'assistant',
       status: 'error',
-      content: cleanMessage,
+      content,
       created_at: now,
       metadata: {
         ...(options.metadata ?? {}),
@@ -473,6 +567,13 @@ async function persistFailedAssistantTurn(options: {
           : {}),
       },
     } as Partial<ChatMessage>)
+    if (inPlaceResume || options.noStreamEvent === true) {
+      await publishUserEvent(userId, {
+        type: 'session_messages_changed',
+        sessionId,
+        reason: inPlaceResume ? 'approval_resume' : 'turn_failed',
+      })
+    }
   } catch (persistError) {
     console.error('[send-routed] Failed to persist assistant error message:', {
       sessionId,
@@ -826,7 +927,9 @@ async function loadProviderMessagesForApprovalsFromRedis(
   criteria: ProviderMessageSource,
   approvalIds: Set<string>,
 ): Promise<ModelMessage[]> {
-  const persisted = await redis.getMessages(sessionId, 300)
+  // The card is on a RECENT message: `getMessages` reads the first 300 of a chat, so on a
+  // chat longer than that the approval's context was never found (bug sweep, 2026-09-18).
+  const persisted = await redis.getRecentMessages(sessionId, 300)
   if (!Array.isArray(persisted) || persisted.length === 0) {
     return []
   }
@@ -1563,69 +1666,6 @@ function isNativeBashExecuteToolName(toolName?: string | null): boolean {
   if (!toolName) return false
   const normalized = toolName.toLowerCase().trim()
   return normalized === 'native_bash_execute' || normalized === 'bash_execute'
-}
-
-function toolResultIndicatesFailure(result: unknown): boolean {
-  const parsed = parseJsonLike(result)
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return false
-  }
-
-  const record = parsed as Record<string, any>
-  // SA-111: `status` is a failure signal ONLY on a delegated-run payload. This helper runs
-  // over every tool result through `inferToolStepSuccess`, and plenty of ordinary tools
-  // report the status of their SUBJECT rather than of the call — a CI run, a deployment, a
-  // queued job. `{ status: 'failed' }` there means the build failed, not the tool. The
-  // managed CLI bridge is why the check exists at all: `/api/subagents/managed-execute`
-  // returns `success: true` with the run's own `status`, unlike the API lane, which already
-  // sets `success: result.status === 'completed'`.
-  const isDelegatedRunPayload = record.kind === 'subagent' || record.kind === 'worker'
-  return (
-    record.success === false ||
-    record.blocked === true ||
-    (isDelegatedRunPayload && (record.status === 'failed' || record.status === 'timed_out'))
-  )
-}
-
-function extractToolResultErrorMessage(result: unknown): string | undefined {
-  const parsed = parseJsonLike(result)
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return undefined
-  }
-
-  const record = parsed as Record<string, any>
-  if (!toolResultIndicatesFailure(record)) {
-    return undefined
-  }
-
-  const error = record.error
-  if (typeof record.reason === 'string' && record.reason.trim()) {
-    return record.reason.trim()
-  }
-  if (typeof record.failureMessage === 'string' && record.failureMessage.trim()) {
-    return record.failureMessage.trim()
-  }
-  if (typeof error === 'string' && error.trim()) {
-    return error.trim()
-  }
-  if (error && typeof error === 'object' && typeof error.message === 'string') {
-    return error.message.trim() || undefined
-  }
-  if (typeof record.errorCode === 'string' && record.errorCode.trim()) {
-    return record.errorCode.trim()
-  }
-  return 'Tool execution failed.'
-}
-
-function inferToolStepSuccess(
-  result: unknown,
-  fallback: boolean,
-): boolean {
-  if (toolResultIndicatesFailure(result)) {
-    return false
-  }
-
-  return fallback
 }
 
 const AGENT_BROWSER_BASH_CHAIN_OPERATOR_REGEX = /\s(?:&&|\|\||;)\s/
@@ -2471,6 +2511,9 @@ function normalizePrecompiledToolStep(step: any): any | null {
     rawResult !== undefined
       ? normalizeToolResult(rawResult, toolName, normalizedInput)
       : rawResult
+  // The step's own error (a lane that named it), or the result's by the stored zip's rules.
+  const error =
+    step.error ?? toolStepFailureMessage(toolName, normalizedInput, parseJsonLike(normalizedResult))
 
   return {
     ...step,
@@ -2478,15 +2521,13 @@ function normalizePrecompiledToolStep(step: any): any | null {
     toolInput: normalizedInput,
     toolArgs: normalizedInput,
     toolResult: normalizedResult,
-    error: step.error ?? extractToolResultErrorMessage(normalizedResult),
+    error,
     timestamp: step.timestamp ?? Date.now(),
-    success:
-      typeof step.success === 'boolean'
-        ? inferToolStepSuccess(normalizedResult, step.success)
-        : inferToolStepSuccess(
-            normalizedResult,
-            normalizedResult !== undefined && normalizedResult !== null,
-          ),
+    success: error
+      ? false
+      : typeof step.success === 'boolean'
+        ? step.success
+        : normalizedResult !== undefined && normalizedResult !== null,
   }
 }
 
@@ -2640,6 +2681,8 @@ function buildIntermediateStepsFromSteps(
             mappedReason: nativeBashMapping.reason,
           }
         : toolResult
+    // The result's failure by the stored zip's rules.
+    const error = toolStepFailureMessage(mappedToolName, mappedInput, parseJsonLike(mappedResult))
 
     intermediateSteps.push({
       toolName: mappedToolName,
@@ -2650,8 +2693,8 @@ function buildIntermediateStepsFromSteps(
       ...(call?.toolCallId ? { toolCallId: call.toolCallId } : {}),
       timestamp: Date.now(),
       ...(metadata as any),
-      error: extractToolResultErrorMessage(mappedResult),
-      success: inferToolStepSuccess(mappedResult, mappedResult !== undefined),
+      error,
+      success: error ? false : mappedResult !== undefined,
     })
   })
 
@@ -2687,6 +2730,19 @@ interface BatshitStreamParams {
   consumeSessionClips?: boolean
   /** SA-104 P5: the already-loaded session record (Infinite Session episode opening). */
   sessionRecord?: Record<string, any> | null
+  /**
+   * SA-120 P3: the group scheduler's Jev Juice speaker decision for THIS speaker — its DCM
+   * lines, its Execution Viewer record, and any miss note. The call already happened; the
+   * stream only replays the lines through the compiler's provider seam and records them.
+   */
+  jevJuiceGroupSelection?: GroupSpeakerProviderInput | null
+  /**
+   * The stop signal of the session-turn registration this run belongs to (2026-09-18). A Stop
+   * or a delete that lands while the turn is still setting up has nothing else to abort, so it
+   * stops the TURN (`stopSessionTurn`, `stopRunningRequests`); this run carries that into its
+   * own controller, with the reason, and the setup checkpoint ends it.
+   */
+  turnStopSignal?: AbortSignal | null
 }
 
 interface BatshitStreamResult {
@@ -2723,6 +2779,8 @@ async function handleBatshitAgentStream({
   request,
   consumeSessionClips = true,
   sessionRecord = null,
+  jevJuiceGroupSelection = null,
+  turnStopSignal = null,
 }: BatshitStreamParams): Promise<BatshitStreamResult> {
   const zipDetection = new ZipDetectionService()
   let zipSettingsAgent: Record<string, unknown> | null =
@@ -2804,6 +2862,17 @@ async function handleBatshitAgentStream({
     }
   }
 
+  // A Stop or a delete that lands while this turn is still setting up has no stream to abort:
+  // it stops the turn itself, and this carries it here with its reason (`user`, or
+  // `session_deleted`), so the setup checkpoint below ends the run before the provider call.
+  // Measured before, in a real page: Stop 150 ms after the send, and the reply ran `sleep 20`
+  // to a full answer (2026-09-18, `_local/stopfix-proof/before-page-same-150b.json`).
+  if (turnStopSignal) {
+    const forwardTurnStop = () => streamAbortController.abort(turnStopSignal.reason)
+    if (turnStopSignal.aborted) forwardTurnStop()
+    else turnStopSignal.addEventListener('abort', forwardTurnStop, { once: true })
+  }
+
   /**
    * SA-113 F-P1-5 — who ended this turn. `timeout` only when the wake-up hard time limit
    * fired; everything else is a Stop somebody pressed.
@@ -2811,10 +2880,20 @@ async function handleBatshitAgentStream({
   const resolveInterruptionReason = (): 'user' | 'timeout' =>
     streamAbortSignal.reason === 'wake_timeout' ? 'timeout' : 'user'
 
+  /**
+   * A Stop because the chat was deleted (bug sweep, 2026-09-18). Every tab showing the chat saves
+   * a finished reply back at `end`, and the save route refuses a chat being deleted, so each tab
+   * showed a false "Failed to save message to database". The `end` says so (`chatDeleted`) and
+   * the answer carries the same `session_deleted` code a send into a deleted chat gets.
+   */
+  const stoppedForDeletedChat = (): boolean => isStoppedForSessionDelete(streamAbortSignal.reason)
+
   const describeInterruption = (): string =>
-    resolveInterruptionReason() === 'timeout'
-      ? 'Stream stopped by the wake-up time limit'
-      : 'Stream interrupted by user'
+    isStoppedForSessionDelete(streamAbortSignal.reason)
+      ? SESSION_DELETED_STOP_MESSAGE
+      : resolveInterruptionReason() === 'timeout'
+        ? 'Stream stopped by the wake-up time limit'
+        : 'Stream interrupted by user'
 
   zipDetection.setContext(sessionId, messageId, {
     agent: zipSettingsAgent,
@@ -2916,6 +2995,88 @@ async function handleBatshitAgentStream({
         ? 'codex'
         : 'vercel'
 
+  // SA-120 P1: Jev Juice skill/tool hints ride the DCM tail through a provider the
+  // compiler calls once it knows the agent's skills and discoverable refs. The agent's
+  // own switch OFF means no provider and no record; group turns get none (P3 owns
+  // group judgments); a resume without a user turn has nothing to judge.
+  const jevJuiceTurn = createJevJuiceTurnCollector()
+  // SA-120 P3: a group speaker chosen (or nearly chosen) by Jev Juice replays the scheduler's
+  // decided lines through the same seam; the call itself already happened before this stream.
+  // SA-120 P5: smart zip, behind the ONE global switch in `global_zip_settings` (OFF or a
+  // group turn: no turn at all). Its open provider answers the compiler's first history pass
+  // with the zipped results Batshit opens for THIS message; its tail provider only replays the
+  // decided lines; and what the compile opened is stored below, at the accepted-send boundary.
+  const jevJuiceSmartZip = jevJuiceGroupSelection
+    ? undefined
+    : buildSmartZipTurn({
+        userId,
+        sessionId,
+        agent,
+        globalZipSettings,
+        message: typeof messageForCompilation === 'string' ? messageForCompilation : '',
+        isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
+        collector: jevJuiceTurn,
+      })
+  // SA-120 P6: the after-reply check, behind two per-agent switches (both OFF, a group turn, or
+  // a resume with no user turn: no turn at all). Before the reply it only REPLAYS what was
+  // noticed about the previous reply (a Redis read, never a Jev call); the check itself runs
+  // once this reply is complete, on the one after-reply site below.
+  const jevJuicePostTurnCheck = jevJuiceGroupSelection
+    ? undefined
+    : buildPostTurnCheckTurn({
+        userId,
+        sessionId,
+        agent,
+        message: typeof messageForCompilation === 'string' ? messageForCompilation : '',
+        isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
+        history: historyForCompilation,
+      })
+  // The compiler takes ONE tail provider, so the primary lanes are composed: they start side
+  // by side and their lines keep a fixed order (skill and tool hints, then zips, then the
+  // notes about the previous reply, then the quick actions Batshit ran by voice since the
+  // agent's last reply, then the screen of the message that woke this turn).
+  const jevJuiceHintProvider = jevJuiceGroupSelection
+    ? buildGroupSpeakerProvider(jevJuiceGroupSelection, jevJuiceTurn)
+    : composeJevJuiceHintProviders([
+        buildSkillToolHintProvider({
+          userId,
+          agent,
+          message: typeof messageForCompilation === 'string' ? messageForCompilation : '',
+          isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
+          collector: jevJuiceTurn,
+        }),
+        jevJuiceSmartZip?.hintProvider,
+        jevJuicePostTurnCheck?.hintProvider,
+        // SA-120 P9: what Batshit did for the user by voice since the agent's last reply, read
+        // from the marks the browser stored on the user messages of this request's history.
+        // Replay only: no Jev call, no Redis read.
+        buildQuickActionTellProvider({
+          messages,
+          isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
+        }),
+        // SA-120 P7: a WOKEN turn only. The DM that started it was screened when it arrived;
+        // this replays a flag as the last lines of the prompt that carries that DM's text. The
+        // DM id comes from the wake registry (server-owned), never from the request body.
+        buildUntrustedTextHintProvider({
+          userId,
+          agentId,
+          wakeDmId: getWakeRun(sessionId)?.origin?.dmId ?? null,
+          message: typeof messageForCompilation === 'string' ? messageForCompilation : '',
+          isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
+          collector: jevJuiceTurn,
+        }),
+      ])
+  // SA-120 P4b: recall by meaning. The compiler hands this provider to the recall engine;
+  // its one answer also goes to the memory commit below so compile and commit select alike.
+  // Agent switch OFF, memory off, a group turn, or a resume with no user turn: no provider.
+  const jevJuiceMemoryRecall = buildSemanticRecallTurn({
+    userId,
+    agent,
+    message: typeof messageForCompilation === 'string' ? messageForCompilation : '',
+    isGroupTurn: Boolean(groupContext) || streamMetadata?.groupChat === true,
+    collector: jevJuiceTurn,
+  })
+
   const databaseService = new DatabaseService(eventFetch)
 
   const formattedInput = await databaseService.buildFormattedChatInput(
@@ -2945,6 +3106,10 @@ async function handleBatshitAgentStream({
           : undefined,
       goonPresentationMode: metadata?.goonPresentationMode ?? null,
       goonsSettings: userSettings?.goons_settings ?? null,
+      jevJuiceHintProvider,
+      jevJuiceMemoryRecallProvider: jevJuiceMemoryRecall?.provider,
+      jevJuiceSmartZipProvider: jevJuiceSmartZip?.openProvider,
+      jevJuiceSmartZipExposedObserver: jevJuiceSmartZip?.exposedObserver,
     },
   )
 
@@ -3130,6 +3295,10 @@ async function handleBatshitAgentStream({
         streamMetadata?.driverAgentId ??
         streamMetadata?.driver_agent_id ??
         null,
+      // SA-120 P3: present only when a `smart` agent was a candidate for this event.
+      ...(streamMetadata?.speakerSelection
+        ? { speakerSelection: streamMetadata.speakerSelection }
+        : {}),
     }
   }
 
@@ -3195,6 +3364,8 @@ async function handleBatshitAgentStream({
   }
 
   executionMetadata.gatewayToolMap = gatewayToolMap
+  // SA-120 P1 (DL-120-07): every Jev call this turn made becomes an Execution Viewer row.
+  attachJevJuiceRecords(executionMetadata, jevJuiceTurn)
 
   const primaryPresetId =
     agentMetadata.primary_model_preset_id ??
@@ -3715,6 +3886,14 @@ async function handleBatshitAgentStream({
   const effectiveContext = resolveEffectiveContextLimit({
     presetContextWindow: primarySelection.contextWindow ?? null,
     reading: localContextReading,
+    // SA-125 (DL-125-03): when this request carries Ollama's `num_ctx`, Ollama
+    // reloads the model at that size, so the currently loaded reading is stale
+    // before the send even leaves. Budget against what we are about to set.
+    requestedContextWindow:
+      primaryProviderId === 'ollama'
+        ? ((runtimeSettings.providerOptions?.ollama as Record<string, any> | undefined)?.options
+            ?.num_ctx ?? null)
+        : null,
   })
   if (effectiveContext.mismatch) {
     console.warn('[Send-Routed] Local context differs from the saved preset', {
@@ -3899,6 +4078,12 @@ async function handleBatshitAgentStream({
     toolSource: 'unknown',
   })
 
+  // Freeze the prefix once, before any resumed event or browser save can change it.
+  const approvalResumePrior = isApprovalResumeWithoutUserTurn
+    ? await readStoredAssistantRecord(sessionId, messageId)
+    : null
+  const approvalResumeStart = approvalResumePrior ? createApprovalResumeStart(approvalResumePrior) : null
+
   const streamAdapter = new StreamEventAdapter({
     sessionId,
     forward: forwardStreamEvent,
@@ -3907,6 +4092,7 @@ async function handleBatshitAgentStream({
       agentType: primaryAgentType,
       agentDisplayName: agent.displayName ?? (agent as any).name ?? agent.id,
       ...(streamMetadata ?? {}),
+      ...(approvalResumeStart ? { approvalResumeVersion: approvalResumeStart.version } : {}),
     },
     toolMetadataResolver: (toolName) => detectToolSource(toolName),
   })
@@ -4025,6 +4211,7 @@ async function handleBatshitAgentStream({
               selectedTools,
               selectedGateways,
             }
+      if (approvalResumeStart) endMetadataBase.approvalResumeVersion = approvalResumeStart.version
       if (finishSummary.zipReferences.length > 0) {
         const trustedZipIds = Array.from(
           new Set(
@@ -4082,6 +4269,12 @@ async function handleBatshitAgentStream({
           ...(memoryTurnCommit.items.length > 0 ? { items: memoryTurnCommit.items } : {}),
         }
       }
+      // SA-120 P1 (DL-120-02 / B6): a Jev Juice miss note or capability-gap chip rides the
+      // finalized assistant message, beside the memory chips.
+      const jevJuiceMessageMetadata = buildJevJuiceMessageMetadata(jevJuiceTurn)
+      if (jevJuiceMessageMetadata) {
+        endMetadataBase.jevJuice = jevJuiceMessageMetadata
+      }
       const sanitizedEndMetadata = sanitizePayloadForLogs(endMetadataBase)
       const sanitizedIntermediateSteps = sanitizePayloadForLogs(
         finishSummary.intermediateSteps.length > 0
@@ -4118,7 +4311,34 @@ async function handleBatshitAgentStream({
         metadata: sanitizedEndMetadata as Record<string, any>,
       }
 
+      // An API-lane approval resume CONTINUES the message the card was on: its stream starts
+      // empty, and `saveMessage` replaces content, so saving it as the whole message dropped
+      // the words before the card and any tool run before it (`approvalResumeMessage.ts`).
+      if (isApprovalResumeWithoutUserTurn && typeof finalMessage.content === 'string') {
+        const priorRecord = approvalResumePrior
+        if (priorRecord) {
+          const continued = composeInPlaceResumeMessage(priorRecord, {
+            content: finalMessage.content,
+            metadata: (finalMessage.metadata ?? {}) as Record<string, any>,
+            intermediateSteps: finalMessage.intermediateSteps as any[] | undefined,
+          })
+          finalMessage.content = continued.content
+          finalMessage.metadata = continued.metadata
+          finalMessage.intermediateSteps = continued.intermediateSteps
+        }
+      }
+
       await redis.saveMessage(finalMessage)
+
+      // Reconcile the authoritative saved continuation after live delivery. The versioned
+      // start reopens this same id; this notification also recovers tabs that missed it.
+      if (isApprovalResumeWithoutUserTurn) {
+        await publishUserEvent(userId, {
+          type: 'session_messages_changed',
+          sessionId,
+          reason: 'approval_resume',
+        })
+      }
 
       try {
         await executionViewerService.updateSnapshot(sessionId, messageId, {
@@ -4213,11 +4433,18 @@ async function handleBatshitAgentStream({
   let coolToolZipAdapterModule:
     | typeof import('$lib/server/coolToolZipAdapter')
     | null = null
-  const RESERVED_TOOL_ZIP_ID_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*_\d{10,17}_[a-z0-9]{5,12}$/
+  /**
+   * One zip id per tool call, decided when the CALL arrives, so both zip-writing sites
+   * (this stream's `tool-result` case and the finish path's pending steps) write the same
+   * id for the same call.
+   *
+   * F-P4-9: it used to accept an id supplied by a caller, for the managed CLI helper's
+   * `batshitZipControl` notice. The first reservation always won, so the announced id
+   * never matched the saved zip; nothing announces an id to the model any more.
+   */
   const reserveToolZipIdForCall = (params: {
     toolCallId?: string | null
     toolName?: string | null
-    zipId?: string | null
   }): string | undefined => {
     const toolCallId =
       typeof params.toolCallId === 'string' ? params.toolCallId.trim() : ''
@@ -4226,11 +4453,7 @@ async function handleBatshitAgentStream({
     const existing = reservedToolZipIdsByCallId.get(toolCallId)
     if (existing) return existing
 
-    const explicitZipId =
-      typeof params.zipId === 'string' && RESERVED_TOOL_ZIP_ID_PATTERN.test(params.zipId.trim())
-        ? params.zipId.trim()
-        : undefined
-    const zipId = explicitZipId ?? reserveZipId('cool_tool')
+    const zipId = reserveZipId('cool_tool')
     reservedToolZipIdsByCallId.set(toolCallId, zipId)
     return zipId
   }
@@ -4914,6 +5137,8 @@ async function handleBatshitAgentStream({
     // SA-115 P2 (DL-115-10): the schedule family rides the SAME per-agent switch, because
     // a schedule's only output is a DM.
     scheduleControlsEnabled: resolveAgentDmsEnabled(agent),
+    // SA-120 P2 (DL-120-06): the Jev Juice judgment tool rides its own per-agent switch.
+    judgeControlsEnabled: resolveAgentJevJudgeToolEnabled(agent),
     // SA-111 P4 (DL-111-11): the ONE place a primary send turns Workers on. Every
     // delegated run leaves it unset, which is what enforces depth 1.
     workersEnabled: resolveWorkersEnabled(agent),
@@ -4986,10 +5211,6 @@ async function handleBatshitAgentStream({
     defaultGateways,
     toolApprovalMode,
     userId,
-    reserveToolZipId: ({ toolCallId, toolName }) =>
-      reserveToolZipIdForCall({ toolCallId, toolName }),
-    registerReservedToolZipId: ({ toolCallId, toolName, zipId }) =>
-      reserveToolZipIdForCall({ toolCallId, toolName, zipId }),
     abortSignal: streamAbortSignal,
     simulateStreamingEffect: shouldSimulateStreamingEffect,
     taggedReasoningTagName,
@@ -5533,6 +5754,11 @@ async function handleBatshitAgentStream({
         messageId,
         stepsCompleted: steps?.length || 0,
       })
+      // The SDK never calls `onFinish` after an abort, and it calls this BEFORE the loop reads
+      // the abort part (pinned in `aiSdkBaseline.contract.test.ts`). Release the loop's wait for
+      // `onFinish`: it held every stopped API reply for its full 2 s (2026-09-18, Stop to `end`
+      // measured 2.06 s). Not `onFinishResolved`: `onFinish` did not run.
+      resolveOnFinish?.()
     },
     }
   }
@@ -5616,10 +5842,15 @@ async function handleBatshitAgentStream({
         interruptionReason: resolveInterruptionReason(),
         interruptedAt,
         interruptedDuringSetup: true,
+        ...(stoppedForDeletedChat() ? { chatDeleted: true } : {}),
       }
       await finalizeAssistantMessage('error')
       await streamAdapter.emitComplete({
-        metadata: { interrupted: true, interruptedAt },
+        metadata: {
+          interrupted: true,
+          interruptedAt,
+          ...(stoppedForDeletedChat() ? { chatDeleted: true } : {}),
+        },
       })
     } catch (setupAbortError) {
       console.error(
@@ -5631,7 +5862,13 @@ async function handleBatshitAgentStream({
     await persistRuntimeSnapshot('failed', describeInterruption())
 
     return {
-      response: json({ error: describeInterruption() }, { status: 499 }),
+      response: json(
+        {
+          error: describeInterruption(),
+          ...(stoppedForDeletedChat() ? { code: 'session_deleted' } : {}),
+        },
+        { status: 499 },
+      ),
       messageId,
       content: '',
       metadata: finishSummary.metadata ?? {},
@@ -5711,7 +5948,56 @@ async function handleBatshitAgentStream({
         agentId,
         sessionId,
         currentUserMessage: messageForCompilation,
+        // SA-120 P4b: the compile's own Jev Juice answer, never a second call.
+        inferredRecalls: jevJuiceMemoryRecall?.getRecalls(),
       })
+    }
+
+    // SA-120 P5: the zip state the compile used becomes real here and nowhere earlier, on the
+    // same accepted-send boundary (a send that never reached it opened nothing). Each write
+    // re-reads the state it would replace, so a user or agent action that landed since the
+    // compile still wins. What was stored rides the reply's metadata so the tab re-reads zip
+    // state; the notice about Batshit's earlier rezips is marked as told.
+    if (jevJuiceSmartZip && messageForCompilation && !groupContext) {
+      const opens = jevJuiceSmartZip.getOpens()
+      if (opens.length > 0) {
+        const stored = await writeInferredUnzips(
+          sessionId,
+          opens.map((open) => ({
+            zipId: open.zipId,
+            description: open.description,
+            tokens: open.tokens,
+            probability: open.probability,
+            durationMessages: open.durationMessages,
+          })),
+        )
+        jevJuiceTurn.zips.opened.push(
+          ...opens
+            .filter((open) => stored.includes(open.zipId))
+            .map((open) => ({ zipId: open.zipId, probability: open.probability })),
+        )
+        // Every tab showing this chat re-reads zip state now, while the reply streams, so the
+        // badge shows the Jev Juice mark at once (the reply's metadata is the second trigger).
+        if (stored.length > 0) {
+          await publishUserEvent(userId, {
+            type: 'zip_state_changed',
+            sessionId,
+            source: 'inferred',
+            opened: stored,
+            rezipped: [],
+          })
+        }
+      }
+      const told = jevJuiceSmartZip.getToldRezipIds()
+      if (told.length > 0) await markInferredRezipsTold(sessionId, told)
+    }
+
+    // SA-120 P6: the notes about the previous reply were in this send's prompt, and the send was
+    // accepted, so they are marked as told here and nowhere earlier (one turn, like
+    // `control_errors`; a send that never reached this boundary told nobody).
+    if (jevJuicePostTurnCheck && messageForCompilation && !groupContext) {
+      const toldMessageId = jevJuicePostTurnCheck.getToldMessageId()
+      if (toldMessageId) await markPostTurnRecordTold(sessionId, toldMessageId)
     }
   }
 
@@ -5727,6 +6013,119 @@ async function handleBatshitAgentStream({
     lane: steerVerdict.steerable ? steerVerdict.lane : null,
   })
   steerRunRegistered = true
+
+  /**
+   * A normal API reply can wait for its first visible event before opening the message. An
+   * approval resume cannot: it reuses a completed message id, and the provider may spend a long
+   * time inside the approved tool before producing another chunk. Open that continuation as soon
+   * as its abort/steer run is registered so a joining tab gets the replayed start and Stop state.
+   *
+   * Build the payload at emission time. Ordinary turns still emit after provider setup and keep
+   * accurate fallback metadata; only the in-place, non-group resume takes the early path below.
+   */
+  let startEmitted = false
+  ensureStartEmitted = async () => {
+    if (startEmitted) return
+    await streamAdapter.emitStart({
+      messageId,
+      metadata: {
+        ...(approvalResumeStart ? { approvalResume: approvalResumeStart } : {}),
+        model: usedModelId,
+        selectedTools,
+        selectedGateways,
+        // SA-114 P2 (DL-114-09): every tab watching this chat learns whether the reply it
+        // is looking at can be steered, and why not when it cannot. It rides the session
+        // channel's replay buffer, so a tab opened mid-reply gets it too. The steer route
+        // is still the backstop — a tab that guessed wrong is refused with this same
+        // reason and falls back to an interrupt (DL-114-14).
+        steerable: steerVerdict.steerable,
+        steerReason: steerVerdict.steerable ? null : steerVerdict.reason,
+        steerLane: steerVerdict.steerable ? steerVerdict.lane : null,
+        ...(fallbackUsed
+          ? {
+              fallbackUsed: true,
+              primaryModel: primaryModelId,
+              fallbackModel: usedModelId,
+            }
+          : {}),
+      },
+    })
+    startEmitted = true
+  }
+
+  const closeStartedAcquisitionFailure = async (error: unknown) => {
+    if (!startEmitted) return
+    const interrupted = isStopError(error, [streamAbortSignal, request.signal])
+    if (interrupted) {
+      const interruptedAt = new Date().toISOString()
+      try {
+        finishSummary.metadata = {
+          ...(finishSummary.metadata ?? {}),
+          model: effectiveModelId ?? primarySelection.modelId,
+          agentType: primaryAgentType,
+          interrupted: true,
+          interruptionReason: resolveInterruptionReason(),
+          interruptedAt,
+          ...(stoppedForDeletedChat() ? { chatDeleted: true } : {}),
+        }
+        // This is the setup-abort rule after a resume start has opened: persist the Stop before
+        // complete. The in-place finalizer composes the frozen pre-card prefix and stamps the
+        // resume version, while the POST catch recognizes AbortError and writes no false failure.
+        await finalizeAssistantMessage('error')
+      } catch (abortFinalizeError) {
+        console.error(
+          '[Send-Routed] Failed to finalize a stopped early approval resume:',
+          abortFinalizeError,
+        )
+      }
+      try {
+        await streamAdapter.emitComplete({
+          metadata: {
+            interrupted: true,
+            interruptionReason: resolveInterruptionReason(),
+            interruptedAt,
+            ...(stoppedForDeletedChat() ? { chatDeleted: true } : {}),
+            ...(approvalResumeStart ? { approvalResumeVersion: approvalResumeStart.version } : {}),
+          },
+        })
+      } catch (emitCompleteError) {
+        console.error(
+          '[Send-Routed] Failed to close a stopped early approval-resume start:',
+          emitCompleteError,
+        )
+      }
+      return
+    }
+
+    const rawMessage = getFailureMessage(error)
+    const safeMessage =
+      redactDataImageUrlsInText(rawMessage).value ||
+      'The response failed before provider streaming started.'
+    const failureMetadata = {
+      response_failed: true,
+      ...(approvalResumeStart ? { approvalResumeVersion: approvalResumeStart.version } : {}),
+    }
+
+    // The POST handler remains the one persistence owner for an acquisition throw. A real failure
+    // uses terminal error cleanup; an expected Stop above uses complete so it never draws a false
+    // provider-error banner.
+    try {
+      await streamAdapter.emitError({
+        error: safeMessage,
+        metadata: failureMetadata,
+      })
+    } catch (emitError) {
+      console.error(
+        '[Send-Routed] Failed to close an early approval-resume start with an error event:',
+        emitError,
+      )
+    }
+  }
+
+  const preserveAcquisitionFailureVersion = (error: unknown): unknown =>
+    approvalResumeStart
+      ? new ApprovalResumeAcquisitionError(error, approvalResumeStart.version)
+      : error
 
   // SA-114 P2 (DL-114-09) — the same verdict on the USER channel, for a turn Batshit started
   // on its own. `requestAgentWakeup` publishes `running` before this request even begins, so
@@ -5756,6 +6155,14 @@ async function handleBatshitAgentStream({
   }
 
   try {
+    if (
+      approvalResumeStart &&
+      !groupContext &&
+      streamMetadata?.groupChat !== true
+    ) {
+      await ensureStartEmitted()
+    }
+
     const primaryImagePayload = await applyImageTransportOverrides({
       messages: compiledMessages,
       images,
@@ -5780,8 +6187,10 @@ async function handleBatshitAgentStream({
     )
   } catch (primaryError) {
     if (!fallbackAvailable) {
+      const terminalError = preserveAcquisitionFailureVersion(primaryError)
+      await closeStartedAcquisitionFailure(terminalError)
       clearStreamAbort(sessionId, messageId)
-      throw primaryError
+      throw terminalError
     }
 
     fallbackUsed = true
@@ -5822,8 +6231,10 @@ async function handleBatshitAgentStream({
         ),
       )
     } catch (fallbackError) {
+      const terminalError = preserveAcquisitionFailureVersion(fallbackError)
+      await closeStartedAcquisitionFailure(terminalError)
       clearStreamAbort(sessionId, messageId)
-      throw fallbackError
+      throw terminalError
     }
   }
 
@@ -5932,37 +6343,6 @@ async function handleBatshitAgentStream({
             toolProvider: 'unknown',
             toolSource: 'unknown',
           })
-
-    const startPayload = {
-      messageId,
-      metadata: {
-        model: usedModelId,
-        selectedTools,
-        selectedGateways,
-        // SA-114 P2 (DL-114-09): every tab watching this chat learns whether the reply it
-        // is looking at can be steered, and why not when it cannot. It rides the session
-        // channel's replay buffer, so a tab opened mid-reply gets it too. The steer route
-        // is still the backstop — a tab that guessed wrong is refused with this same
-        // reason and falls back to an interrupt (DL-114-14).
-        steerable: steerVerdict.steerable,
-        steerReason: steerVerdict.steerable ? null : steerVerdict.reason,
-        steerLane: steerVerdict.steerable ? steerVerdict.lane : null,
-        ...(fallbackUsed
-          ? {
-              fallbackUsed: true,
-              primaryModel: primaryModelId,
-              fallbackModel: usedModelId,
-            }
-          : {}),
-      },
-    }
-
-    let startEmitted = false
-    ensureStartEmitted = async () => {
-      if (startEmitted) return
-      await streamAdapter.emitStart(startPayload)
-      startEmitted = true
-    }
 
     controlsEnabled = streamMetadata?.groupChat === true
     controlsResolved = !controlsEnabled
@@ -6704,6 +7084,17 @@ async function handleBatshitAgentStream({
           const streamedCallId = toolResultEvent.toolCallId
           if (streamedCallId && !streamedToolCallIds.has(streamedCallId)) {
             streamedToolCallIds.add(streamedCallId)
+            // This copy is the Execution Viewer's row, the saved message's step, and the `end`
+            // event's. The lane's own error (Claude Code's `is_error`, which the zip step above
+            // already carries) wins; otherwise the result's, by the stored zip's rules. Both were
+            // once overwritten here by the raw result's flag, so a failed Claude or Codex command
+            // was a Success row (fp65h).
+            const laneError = [toolResult.metadata?.error, toolResultEvent.metadata?.error].find(
+              (value): value is string => typeof value === 'string' && value.trim().length > 0,
+            )
+            const stepError =
+              laneError ??
+              toolStepFailureMessage(emittedToolName, emittedArgs, parseJsonLike(sanitizedResultPayload))
             streamedToolSteps.push({
               toolName: emittedToolName,
               originalToolName: toolResult.toolName,
@@ -6715,11 +7106,8 @@ async function handleBatshitAgentStream({
               ...(resolvedMetadata ?? {}),
               ...(toolResultEvent.metadata ?? {}),
               ...(toolResult.metadata ?? {}),
-              error: extractToolResultErrorMessage(sanitizedResultPayload),
-              success: inferToolStepSuccess(
-                sanitizedResultPayload,
-                sanitizedResultPayload !== undefined,
-              ),
+              error: stepError,
+              success: stepError ? false : sanitizedResultPayload !== undefined,
             })
           }
           await streamAdapter.emitToolEnd({
@@ -6858,9 +7246,15 @@ async function handleBatshitAgentStream({
       ])
     }
 
-    if (streamRuntimeError) {
-      throw streamRuntimeError
-    }
+    // A stopped stream is interrupted, whatever else it ended with (`streamStop.ts`). The SDK can
+    // end an aborted stream normally, with its `abort` part; judged like a finished reply below,
+    // a Stop was logged as a provider failure (the rejected `steps`, then "empty response").
+    const streamEnd = judgeStreamEnd({
+      stopped: streamAbortSignal.aborted,
+      runtimeError: streamRuntimeError,
+    })
+    if (streamEnd.kind === 'stopped') throw new StreamStoppedError()
+    if (streamEnd.kind === 'failed') throw streamEnd.error
 
     const respondedApprovalIds = new Set(
       toolApprovalResponse
@@ -7075,6 +7469,44 @@ async function handleBatshitAgentStream({
 
     await persistRuntimeSnapshot('succeeded')
 
+    // SA-120 P5: smart zip's after-reply step. The reply is complete and on screen, so this
+    // never delays the user: Jev is asked which still-open tool results the agent is done
+    // with, those are zipped (`source: 'inferred'`), every tab is told, and the row is
+    // appended to this reply's snapshot. AFTER the snapshot's own last write, so nothing
+    // overwrites the row. It never throws, and a silent reply has nothing to judge.
+    //
+    // SA-120 P6: the after-reply check runs on this SAME site, beside smart zip's step: Jev is
+    // asked whether the reply claims something the turn did not do (and about repeated
+    // wording), what it notices is stored per message and told to every tab, and the reply is
+    // NEVER edited. The two steps judge side by side; their Execution Viewer rows are appended
+    // one writer at a time (`appendRowsAfter`), because appending is a read-modify-write.
+    if (!silentResponse && (jevJuiceSmartZip || jevJuicePostTurnCheck)) {
+      const finishedReply = finishSummary.content || finishSummary.text || ''
+      const newZipIds = (finishSummary.zipReferences ?? [])
+        .map((reference) => reference?.zipId)
+        .filter((zipId): zipId is string => typeof zipId === 'string' && zipId.length > 0)
+      const smartZipStep = jevJuiceSmartZip
+        ? jevJuiceSmartZip.runPostTurn({ messageId, reply: finishedReply, newZipIds })
+        : Promise.resolve([])
+      const postTurnCheckStep = jevJuicePostTurnCheck
+        ? jevJuicePostTurnCheck.runPostTurn({
+            messageId,
+            reply: finishedReply,
+            newZipIds,
+            toolSteps:
+              streamedToolSteps.length > 0
+                ? streamedToolSteps
+                : Array.isArray(finishSummary.intermediateSteps)
+                  ? finishSummary.intermediateSteps
+                  : [],
+            awaitingApproval:
+              streamedApprovalRequests.size > 0 || Boolean(finishSummary.metadata?.toolApprovals),
+            appendRowsAfter: smartZipStep,
+          })
+        : Promise.resolve(null)
+      await Promise.all([smartZipStep, postTurnCheckStep])
+    }
+
     const response = json({
       success: true,
       messageId,
@@ -7092,7 +7524,16 @@ async function handleBatshitAgentStream({
       usage: finishSummary.usage ?? streamAdapter.getUsage(),
     }
   } catch (error: any) {
-    console.error('[Send-Routed] Batshit agent streaming error:', error)
+    const isAbortError = isStopError(error, [streamAbortSignal, request.signal])
+    if (isAbortError) {
+      logger.debug('[Send-Routed] Stream stopped', {
+        sessionId,
+        messageId,
+        reason: streamAbortSignal.reason ?? null,
+      })
+    } else {
+      console.error('[Send-Routed] Batshit agent streaming error:', error)
+    }
 
     const normalizedErrorMessage =
       error instanceof Error ? error.message : String(error ?? 'Unknown error')
@@ -7111,11 +7552,6 @@ async function handleBatshitAgentStream({
       imageInputFailure?.userMessage ??
       normalizedErrorMessage
     const contextExhausted = isContextExhaustionError(normalizedErrorMessage)
-
-    const isAbortError =
-      error?.name === 'AbortError' ||
-      streamAbortSignal?.aborted === true ||
-      request.signal?.aborted === true
 
     if (isAbortError) {
       const interruptedAt = new Date().toISOString()
@@ -7160,6 +7596,7 @@ async function handleBatshitAgentStream({
           interrupted: true,
           interruptionReason: resolveInterruptionReason(),
           interruptedAt,
+          ...(stoppedForDeletedChat() ? { chatDeleted: true } : {}),
         }
 
         await finalizeAssistantMessage('error')
@@ -7167,6 +7604,7 @@ async function handleBatshitAgentStream({
           metadata: {
             interrupted: true,
             interruptedAt,
+            ...(stoppedForDeletedChat() ? { chatDeleted: true } : {}),
           },
         })
       } catch (abortFinalizeError) {
@@ -7180,7 +7618,10 @@ async function handleBatshitAgentStream({
 
       return {
         response: json(
-          { error: describeInterruption() },
+          {
+            error: describeInterruption(),
+            ...(stoppedForDeletedChat() ? { code: 'session_deleted' } : {}),
+          },
           { status: 499 },
         ),
         messageId,
@@ -7202,6 +7643,7 @@ async function handleBatshitAgentStream({
       rawUsageFromStream ??
       null
     const failureRuntimeMetadata = {
+      ...(approvalResumeStart ? { approvalResumeVersion: approvalResumeStart.version } : {}),
       provider: providerIdentifier || null,
       connection: connectionIdentifier || null,
       model: effectiveModelId || null,
@@ -7314,6 +7756,7 @@ async function handleBatshitAgentStream({
         code: errorCode,
         status: errorStatus,
         metadata: failureRuntimeMetadata,
+        inPlaceResume: isApprovalResumeWithoutUserTurn,
       })
     }
 
@@ -7438,6 +7881,57 @@ async function handleBatshitAgentStream({
   }
 }
 
+/**
+ * SA-120 P3: what Jev reads about a group agent — its description, else the first
+ * non-empty line of its system prompt (the constants module clips it). Disclosed in the
+ * preset's own copy and in UserDocs as the text that leaves the machine.
+ */
+function resolveGroupSpeakerAbout(agent: AgentRow): string | null {
+  const description =
+    typeof agent.description === 'string' ? agent.description.trim() : ''
+  if (description) return description
+  const prompt = typeof agent.system_prompt === 'string' ? agent.system_prompt : ''
+  const firstLine = prompt
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0)
+  return firstLine ?? null
+}
+
+/**
+ * SA-120 P3 (DL-120-07): a follow-up Jev Juice skipped entirely has no speaker message of
+ * its own, so its record is appended to the previous speaker's Execution Viewer snapshot
+ * (the message the follow-up event came from). No snapshot means a logged missing row,
+ * never a hidden one.
+ */
+async function recordSkippedGroupFollowup(
+  sessionId: string,
+  sourceMessageId: string | null,
+  record: TypesafeCallRecord,
+): Promise<void> {
+  if (!sourceMessageId) {
+    console.warn(
+      '[Jev Juice] group follow-up skipped with no previous speaker message to record it on',
+      { sessionId },
+    )
+    return
+  }
+  try {
+    const attached = await appendTypesafeCallRecords(sessionId, sourceMessageId, [record])
+    if (!attached) {
+      console.warn(
+        '[Jev Juice] group follow-up skipped: no Execution Viewer snapshot to attach the record to',
+        { sessionId, sourceMessageId },
+      )
+    }
+  } catch (error) {
+    console.error(
+      '[Jev Juice] group follow-up skipped: failed to attach the Execution Viewer record:',
+      error,
+    )
+  }
+}
+
 async function handleGroupChatStream({
   content,
   sessionId,
@@ -7454,6 +7948,7 @@ async function handleGroupChatStream({
   eventFetch,
   request,
   groupConfig,
+  turnStopSignal = null,
 }: BatshitStreamParams & {
   groupConfig: GroupChatSessionConfig
   userDisplayName?: string
@@ -7474,6 +7969,7 @@ async function handleGroupChatStream({
       userId,
       eventFetch,
       request,
+      turnStopSignal,
     })
     return result.response
   }
@@ -7482,6 +7978,13 @@ async function handleGroupChatStream({
 
   const groupAbortController = new AbortController()
   registerGroupAbort(sessionId, groupAbortController)
+  // A Stop or a delete that landed before this group run registered stopped the turn itself;
+  // every speaker's run listens to the group's controller, so it is carried there.
+  if (turnStopSignal) {
+    const forwardTurnStop = () => groupAbortController.abort(turnStopSignal.reason)
+    if (turnStopSignal.aborted) forwardTurnStop()
+    else turnStopSignal.addEventListener('abort', forwardTurnStop, { once: true })
+  }
 
   try {
     const allAgents = await redis.getAgents(userId)
@@ -7595,6 +8098,8 @@ async function handleGroupChatStream({
       eventIndex: number
       sourceAgentId?: string
       sourceAgentName?: string
+      /** SA-120 P3: the previous speaker's message id, where a skipped follow-up's Jev record lands. */
+      sourceMessageId?: string
     }
 
     const pendingEvents: GroupChatEvent[] = [
@@ -7709,20 +8214,15 @@ async function handleGroupChatStream({
       if (candidates.length === 0) return
 
       const pickRandom = <T>(list: T[]) => list[randomInt(list.length)]
-      let selected = candidates.length === 1 ? candidates[0] : null
-
-      if (!selected && event.type === 'user') {
-        const addressed = candidates.filter((candidate) =>
-          isAgentAddressed(eventPrompt, candidate.agentName, [
-            candidate.agent.id,
-            candidate.agent.slug ?? '',
-          ]),
-        )
-        if (addressed.length === 1) {
-          selected = addressed[0]
-        }
-      }
-
+      const addressedCandidates =
+        event.type === 'user'
+          ? candidates.filter((candidate) =>
+              isAgentAddressed(eventPrompt, candidate.agentName, [
+                candidate.agent.id,
+                candidate.agent.slug ?? '',
+              ]),
+            )
+          : []
       const driverCandidate =
         driverMode && driverAgentId
           ? (candidates.find(
@@ -7730,13 +8230,103 @@ async function handleGroupChatStream({
             ) ?? null)
           : null
 
+      // SA-120 P3: Jev Juice is asked only when a `smart` candidate exists AND today's rules
+      // do not already decide the speaker (explicit beats inferred, DL-120-04): exactly one
+      // addressed agent, an eligible driver, or a user event with a single candidate. On a
+      // follow-up event a lone smart candidate still needs the call, because the call is what
+      // decides whether that follow-up is worth an LLM call at all. Jev never sees the
+      // candidates the preset rules above already excluded.
+      const smartCandidatePresent = candidates.some(
+        (candidate) => candidate.speakPolicy === GROUP_SPEAK_POLICY_SMART,
+      )
+      const rulesDecide =
+        Boolean(driverCandidate) ||
+        (event.type === 'user' &&
+          (addressedCandidates.length === 1 || candidates.length === 1))
+      let jevOutcome: GroupSpeakerOutcome | null = null
+      let eligible = candidates
+      if (smartCandidatePresent && !rulesDecide) {
+        const request = buildGroupSpeakerRequest({
+          eventType: event.type,
+          message: event.content,
+          spokeLast:
+            event.type === 'user'
+              ? `the user (${resolvedUserName})`
+              : `${event.sourceAgentName ?? 'another agent'} (an agent in this group)`,
+          earlierThisTurn: assistantHistory.map((message) => ({
+            name:
+              agentDisplayNames[message.agent_id ?? ''] ??
+              message.agent_id ??
+              'an agent',
+            content: typeof message.content === 'string' ? message.content : '',
+          })),
+          candidates: candidates.map(
+            (candidate): GroupSpeakerCandidate => ({
+              agentId: candidate.agent.id,
+              name: candidate.agentName,
+              about: resolveGroupSpeakerAbout(candidate.agent),
+              preset: candidate.speakPolicy,
+              topics: candidate.speakTopics,
+            }),
+          ),
+        })
+        if (request) {
+          jevOutcome = await computeGroupSpeakerSelection({
+            userId,
+            request,
+            signal: groupAbortController.signal,
+          })
+          if (groupAbortController.signal.aborted) return
+          if (jevOutcome.decision) {
+            const remainingIds = new Set(
+              jevOutcome.decision.remaining.map((reading) => reading.agentId),
+            )
+            eligible = candidates.filter((candidate) =>
+              remainingIds.has(candidate.agent.id),
+            )
+            if (eligible.length === 0) {
+              // Nobody left: the follow-up chain ends here without an LLM call. The record
+              // lands on the previous speaker's snapshot, the message this event came from.
+              await recordSkippedGroupFollowup(
+                sessionId,
+                event.sourceMessageId ?? null,
+                jevOutcome.record,
+              )
+              return
+            }
+          }
+        }
+      }
+      const jevPickedAgentId = jevOutcome?.decision?.picked?.agentId ?? null
+
+      let selected = eligible.length === 1 ? eligible[0] : null
+      if (!selected && addressedCandidates.length === 1) {
+        selected = addressedCandidates[0]
+      }
       if (!selected && driverCandidate) {
         selected = driverCandidate
       }
-
-      if (!selected) {
-        selected = pickRandom(candidates)
+      if (!selected && jevPickedAgentId) {
+        selected =
+          eligible.find((candidate) => candidate.agent.id === jevPickedAgentId) ??
+          null
       }
+      if (!selected) {
+        selected = pickRandom(eligible)
+      }
+
+      const speakerSelection: GroupSpeakerSelectionMetadata | null = jevOutcome
+        ? buildGroupSpeakerSelectionMetadata(jevOutcome, selected.agent.id)
+        : null
+      const jevJuiceGroupSelection: GroupSpeakerProviderInput | null = jevOutcome
+        ? {
+            lines: jevOutcome.decision
+              ? buildGroupSpeakerDcmLines(jevOutcome.decision, selected.agent.id)
+              : [],
+            record: jevOutcome.record,
+            note: jevOutcome.note,
+          }
+        : null
 
       const agentRow = selected.agent
       const agentName = selected.agentName
@@ -7811,6 +8401,8 @@ async function handleGroupChatStream({
         driverAgentId,
         driver_mode: driverMode,
         driver_agent_id: driverAgentId,
+        // SA-120 P3: who chose this speaker and whom Jev Juice skipped (only when the lane ran).
+        ...(speakerSelection ? { speakerSelection } : {}),
       }
 
       if (isFollowupEvent) {
@@ -7861,6 +8453,7 @@ async function handleGroupChatStream({
         eventFetch,
         request,
         consumeSessionClips: false,
+        jevJuiceGroupSelection,
       })
 
       try {
@@ -7890,6 +8483,7 @@ async function handleGroupChatStream({
               eventIndex,
               sourceAgentId: agentRow.id,
               sourceAgentName: agentName,
+              sourceMessageId: result.messageId,
             })
           }
         }
@@ -7907,6 +8501,8 @@ async function handleGroupChatStream({
             agentId: agentRow.id,
             messageId: selectedMessageId,
             message: getFailureMessage(error),
+            // API setup may fail before any start/error event exists for spectators.
+            noStreamEvent: true,
             details:
               error instanceof Error
                 ? error.stack || error.message
@@ -7960,11 +8556,47 @@ async function handleGroupChatStream({
   }
 }
 
-export const POST: RequestHandler = async ({
-  request,
-  fetch: eventFetch,
-  locals,
-}) => {
+/**
+ * The chat is being deleted, or was deleted while this request waited (2026-09-18). The same
+ * answer a send gets for a chat that is gone; the code tells the two apart for a reader.
+ */
+function sessionDeletedResponse() {
+  return json(
+    {
+      error: 'Session not found or unauthorized',
+      code: 'session_deleted',
+      details: 'This chat was deleted.',
+    },
+    { status: 404 },
+  )
+}
+
+/**
+ * A browser send is answered once the server owns its turn (2026-09-18).
+ *
+ * The page awaited this request until the whole turn was over, so each running reply held one
+ * of the browser's six HTTP/1.1 connections to this server, shared by every tab: five replies at
+ * once froze every other request, Stop included (`_local/sconn-proof/fivetabs-before.json`). A
+ * send that asks (`Prefer: respond-async`) is answered `202 {turnId}` the moment its session-turn
+ * lock is registered, the turn runs on here exactly as before, and its final answer reaches the
+ * tab over the live hub (`respondAsyncSend.ts`, `turnOutcomeRegistry.ts`). Every refusal before
+ * the lock is still the direct answer. A send that does not ask (a woken turn, the voice turn
+ * route, artifact share, the dev smoke runner) is answered at the end of the turn, as always.
+ */
+export const POST: RequestHandler = async (event) => {
+  if (!prefersRespondAsync(event.request)) {
+    return handleSendRoutedRequest(event)
+  }
+  return answerWhenTurnAccepted(
+    (acceptTurn) => handleSendRoutedRequest(event, acceptTurn),
+    { holdWork: enterBackupRestoreHttpRequest },
+  )
+}
+
+async function handleSendRoutedRequest(
+  { request, fetch: eventFetch, locals }: RequestEvent,
+  acceptTurn: AcceptTurn | null = null,
+): Promise<Response> {
   try {
     const body = await request.json()
     const {
@@ -8149,6 +8781,45 @@ export const POST: RequestHandler = async ({
     }
 
 	    const sessionTurnKind = groupConfig ? 'group' : 'single'
+    // An Approve or Deny click belongs to the reply that raised its card, and that reply
+    // keeps this lock through its after-reply work while the card is already on screen. So
+    // the click waits for it rather than being refused as a second turn — never for a lock
+    // that is itself answering an approval (`approvalClickWait.ts`). ABOVE the check, so the
+    // check and the registration below stay one synchronous block.
+    const approvalClick = isApprovalClick({
+      approvalResponseCount: approvalResponse.length,
+      content,
+    })
+    if (approvalClick) {
+      const clickWait = await waitForCardReplyToFinish(sessionId, requestedMessageId)
+      if (clickWait !== 'no_wait') {
+        logger.debug('[Send-Routed] Approval click waited for the reply that raised its card', {
+          sessionId,
+          messageId: requestedMessageId,
+          outcome: clickWait,
+        })
+      }
+    } else {
+      // Anything else that is not a click — a message the browser queued behind the reply, a
+      // send from another tab, a woken turn, a voice turn — waits for a turn that is only
+      // FINISHING (its reply is over, its request is doing its after-reply work) instead of
+      // being refused as a second turn (`finishingTurnWait.ts`). Never for a click: its own
+      // wait above refuses to wait behind another click on the same card.
+      const finishWait = await waitForFinishingTurn(sessionId)
+      if (finishWait !== 'no_wait') {
+        logger.debug('[Send-Routed] A new turn waited for the previous one to finish', {
+          sessionId,
+          messageId: requestedMessageId,
+          outcome: finishWait,
+        })
+      }
+    }
+    // A chat being deleted takes no new turn: its delete is stopping the turn it had and sweeps
+    // the chat once that turn's request is done (`sessionDeleteTurnStop.ts`). Read here, in the
+    // same synchronous block as the lock check and the registration.
+    if (isSessionDeleting(sessionId)) {
+      return sessionDeletedResponse()
+    }
     const activeSessionTurn = getActiveSessionTurn(sessionId)
     if (activeSessionTurn) {
       return json(
@@ -8170,8 +8841,12 @@ export const POST: RequestHandler = async ({
       typeof requestedMessageId === 'string' && requestedMessageId.trim().length > 0
         ? requestedMessageId.trim()
         : null,
+      { answersApproval: approvalClick },
     )
 	    if (!sessionTurnRegistration.ok) {
+      if (sessionTurnRegistration.reason === 'session_deleting') {
+        return sessionDeletedResponse()
+      }
 	      return json(
         {
           error: 'Another response is already in progress for this session.',
@@ -8184,8 +8859,24 @@ export const POST: RequestHandler = async ({
         { status: 409 },
 	      )
 	    }
+    // This request's own lock, by its registration: the `finally` releases exactly this one.
+    // A message id cannot stand in for it — an Approve click resumes in place, into the
+    // card's own message id (`releaseSessionTurn`).
+    const sessionTurnId = sessionTurnRegistration.entry.turnId
+    const turnStopSignal = sessionTurnRegistration.entry.stop.signal
+    // The server owns this turn now. A send that asked (`Prefer: respond-async`) is answered
+    // here and its request lets go of the browser's connection; everything below runs as it
+    // always did, and its final answer is kept for the tab (`respondAsyncSend.ts`).
+    acceptTurn?.({ sessionId, userId: resolvedUserId })
 
     try {
+      // The chat was read before the waits above. A delete that found no turn may have swept it
+      // and ended its mark while this request waited, so it is read again under the lock; from
+      // here on a delete waits for this request (`sessionDeleteTurnStop.ts`). The `finally`
+      // below lets the lock go.
+      if (!(await redis.getSession(sessionId))) {
+        return sessionDeletedResponse()
+      }
       try {
         const sandboxCleanupWarnings =
           await nativeToolService.cleanupExecutionSandboxesForSession(sessionId)
@@ -8226,7 +8917,9 @@ export const POST: RequestHandler = async ({
       ) {
         let persistedMessages: ChatMessage[] = []
         try {
-          persistedMessages = await redis.getMessages(sessionId, 300)
+          // The newest 300, where the cards are: `getMessages` reads the FIRST 300, so on a
+          // longer chat no card was ever checked for its three minutes (bug sweep, 2026-09-18).
+          persistedMessages = await redis.getRecentMessages(sessionId, 300)
         } catch (error) {
           console.warn(
             '[Send-Routed] Failed to load persisted messages for approval timeout checks',
@@ -8362,6 +9055,44 @@ export const POST: RequestHandler = async ({
                   (entry) => entry.approvalId,
                 ),
               },
+            )
+          }
+
+          // An approval is answered ONCE (bug sweep, 2026-09-18). Recorded on the card's own
+          // message under this click's lock and before the resumed run starts, so a resume
+          // that fails or is stopped after the command ran can never run it a second time;
+          // a click naming an answered approval is refused (`approvalAnswerRecord.ts`).
+          const approvalAnswer = await answerApprovalsOnce({
+            userId: resolvedUserId,
+            sessionId,
+            messageId: requestedMessageId,
+            responses: approvalResponseForStream,
+          })
+          if (!approvalAnswer.ok) {
+            if (approvalAnswer.reason === 'already_answered') {
+              return json(
+                {
+                  error: 'This approval was already answered.',
+                  code: 'approval_already_answered',
+                  details:
+                    'Each approval runs once. Ask the agent again if you want it to run again.',
+                  approvalIds: approvalAnswer.approvalIds,
+                },
+                { status: 409 },
+              )
+            }
+            console.error('[Send-Routed] Could not record an approval answer', {
+              sessionId,
+              messageId: requestedMessageId,
+              error: approvalAnswer.error,
+            })
+            return json(
+              {
+                error: 'Batshit could not record this approval, so it did not run it.',
+                code: 'approval_record_failed',
+                details: 'Try again.',
+              },
+              { status: 503 },
             )
           }
         }
@@ -8531,6 +9262,7 @@ export const POST: RequestHandler = async ({
             eventFetch,
             request,
             groupConfig,
+            turnStopSignal,
           })
         }
 
@@ -8640,6 +9372,15 @@ export const POST: RequestHandler = async ({
           }
         }
 
+        // An API-lane approval resume writes into the message the card was ON — this
+        // request's own `messageId`. The same rule the stream handler applies
+        // (`isApprovalResumeWithoutUserTurn`); a CLI control resume above is a NEW turn.
+        const managedRunIsInPlaceApprovalResume = isInPlaceApprovalResume({
+          approvalResponseCount: approvalResponseForStream.length,
+          content,
+          controlResumeContent: controlApprovalResumeContent,
+        })
+
         if (controlApprovalInPlaceAddendum) {
           // F-P3-2: the decision the click made off the SDK's lane, carried into the run
           // the SDK is about to resume. It rides the same channel the tool-approval
@@ -8669,6 +9410,7 @@ export const POST: RequestHandler = async ({
             userId: resolvedUserId,
             eventFetch,
             request,
+            turnStopSignal,
             sessionRecord: session,
             // DL-116-08: parity with the API lane's approval resume, which commits
             // nothing — the clips and the memory linger belong to the turn the user
@@ -8704,7 +9446,10 @@ export const POST: RequestHandler = async ({
 
             let persistedHistory: ChatMessage[] = []
             try {
-              persistedHistory = await redis.getMessages(sessionId, 300)
+              // The newest 300, which end with the reply that just ran out of room.
+              // `getMessages` reads the FIRST 300, so on a longer chat the continuation was
+              // compiled from the start of the chat (bug sweep, 2026-09-18).
+              persistedHistory = await redis.getRecentMessages(sessionId, 300)
             } catch (historyError) {
               console.error(
                 '[Send-Routed] Auto-continue stopped: could not reload persisted history',
@@ -8748,6 +9493,7 @@ export const POST: RequestHandler = async ({
               userId: resolvedUserId,
               eventFetch,
               request,
+              turnStopSignal,
               consumeSessionClips: false,
             })
           }
@@ -8825,6 +9571,7 @@ export const POST: RequestHandler = async ({
               userId: resolvedUserId,
               eventFetch,
               request,
+              turnStopSignal,
               sessionRecord: session,
             })
           }
@@ -8879,6 +9626,9 @@ export const POST: RequestHandler = async ({
               metadata: {
                 agentType: finalAgentType,
               },
+              inPlaceResume: managedRunIsInPlaceApprovalResume,
+              // Refused before its stream opened: no other tab has heard anything.
+              noStreamEvent: true,
             })
           }
           return streamResult.response
@@ -8892,6 +9642,7 @@ export const POST: RequestHandler = async ({
               userId: resolvedUserId,
               agentId,
               messageId: managedAssistantMessageId,
+              inPlaceResume: managedRunIsInPlaceApprovalResume,
               message: getFailureMessage(streamError),
               details:
                 streamError instanceof Error
@@ -8901,7 +9652,14 @@ export const POST: RequestHandler = async ({
               status: getFailureStatus(streamError),
               metadata: {
                 agentType: finalAgentType,
+                ...(managedRunIsInPlaceApprovalResume &&
+                streamError instanceof ApprovalResumeAcquisitionError
+                  ? { approvalResumeVersion: streamError.approvalResumeVersion }
+                  : {}),
               },
+              // Reconcile the authoritative saved failure in every tab, including one that
+              // missed the terminal event from an early approval-resume start.
+              noStreamEvent: true,
             })
           }
           throw streamError
@@ -8917,22 +9675,35 @@ export const POST: RequestHandler = async ({
         `send-routed reached an unsupported primary agent type: ${finalAgentType}`,
       )
     } finally {
-      try {
-        const sandboxCleanupWarnings =
-          await nativeToolService.cleanupExecutionSandboxesForSession(sessionId)
-        if (sandboxCleanupWarnings.length > 0) {
-          console.warn(
-            '[Send-Routed] sandbox post-run cleanup warnings:',
-            {
-              sessionId,
-              warnings: sandboxCleanupWarnings,
-            },
+      // The run-end sweep removes this chat's sandboxes even while a command runs in one,
+      // because it assumes the chat's run is over. That is true while this request still has
+      // the chat (or nobody does). If another turn holds it now — this lock was taken as an
+      // orphan, or cleared by a Stop — the sweep would kill that turn's commands, and that
+      // turn already swept on its way in. Measured live before the lock fix: an old reply's
+      // sweep killed a newer turn's approved command (`_local/lock-prune-proof/`).
+      if (!isSessionTurnHeldByAnother(sessionId, sessionTurnId)) {
+        try {
+          const sandboxCleanupWarnings =
+            await nativeToolService.cleanupExecutionSandboxesForSession(sessionId)
+          if (sandboxCleanupWarnings.length > 0) {
+            console.warn(
+              '[Send-Routed] sandbox post-run cleanup warnings:',
+              {
+                sessionId,
+                warnings: sandboxCleanupWarnings,
+              },
+            )
+          }
+        } catch (sandboxCleanupError) {
+          console.error(
+            '[Send-Routed] sandbox post-run cleanup failed:',
+            sandboxCleanupError,
           )
         }
-      } catch (sandboxCleanupError) {
-        console.error(
-          '[Send-Routed] sandbox post-run cleanup failed:',
-          sandboxCleanupError,
+      } else {
+        console.warn(
+          '[Send-Routed] Skipped the run-end sandbox sweep: another turn holds this chat now',
+          { sessionId },
         )
       }
 	      // SA-114 P1 (DL-114-02): the steer inbox is cleared beside the session-turn lock,
@@ -8966,14 +9737,11 @@ export const POST: RequestHandler = async ({
 	      // SA-113 P1: release only THIS request's lock. A turn stopped during setup can
 	      // have its lock cleared by the interrupt route (or the orphan prune) and a retry
 	      // can already own a new one by the time this `finally` unwinds; an unowned
-	      // release would then cancel the live turn's lock. Registration above used the
-	      // same `requestedMessageId`, so the two can never disagree within one request.
-	      clearSessionTurn(
-	        sessionId,
-	        typeof requestedMessageId === 'string' && requestedMessageId.trim().length > 0
-	          ? requestedMessageId.trim()
-	          : null,
-	      )
+	      // release would then cancel the live turn's lock. It releases by REGISTRATION
+	      // (2026-09-18), not by message id: an Approve click registers under the card's own
+	      // message id, so the reply that raised the card, released by id, deleted the
+	      // click's lock and a second click on the same card ran the command again.
+	      releaseSessionTurn(sessionId, sessionTurnId)
 	    }
   } catch (error) {
     console.error('Error in send-routed endpoint:', error)

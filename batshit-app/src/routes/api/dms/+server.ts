@@ -92,6 +92,9 @@ function toRow(record: DmRecord) {
     resultDmId: record.resultDmId ?? null,
     callbackStatus: record.callbackStatus ?? null,
     hasResult: typeof record.result === 'string' && record.result.length > 0,
+    // SA-120 P7: what the Jev Juice incoming-text screen said, for the row's advisory badge.
+    // Display only; this route decides nothing from it.
+    screen: record.screen ?? null,
     // A row is "live" only while the wake registry still owns that session's turn, which
     // is what makes the row's Stop button meaningful rather than decorative.
     runningSessionId: wokenSessionId && getWokenRunForSession(wokenSessionId) ? wokenSessionId : null

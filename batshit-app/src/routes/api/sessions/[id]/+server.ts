@@ -1,5 +1,9 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
+import {
+  SessionDeleteRefusedError,
+  deleteSessionStoppingItsTurn
+} from '$lib/server/services/sessionDeleteTurnStop'
 import { resolveFixedSessionMetadataUpdate } from '$lib/utils/fixedSession'
 import { resolveSessionOriginMetadataUpdate } from '$lib/utils/sessionOrigin'
 
@@ -100,10 +104,14 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
       return json({ error: 'Session is locked. Unlock it before deleting.' }, { status: 409 })
     }
     
-    // Delete the session and all related data
-    await redis.deleteSession(params.id!)
+    // Delete the session and all related data. A reply still running in it is stopped first,
+    // and the chat is swept once that reply's request is done (`sessionDeleteTurnStop.ts`).
+    await deleteSessionStoppingItsTurn(params.id!)
     return json({ success: true })
   } catch (error) {
+    if (error instanceof SessionDeleteRefusedError) {
+      return json({ error: error.message, code: error.code }, { status: error.status })
+    }
     console.error('Error deleting session:', error)
     return json({ error: 'Failed to delete session' }, { status: 500 })
   }

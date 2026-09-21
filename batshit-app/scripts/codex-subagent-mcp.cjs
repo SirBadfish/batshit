@@ -20,6 +20,9 @@ const {
   buildCliSubagentMcpToolNameForKey: buildSubagentToolName,
   CLI_WORKER_SPAWN_TOOL_NAME
 } = require(path.join(__dirname, 'lib', 'cli-subagent-tool-names.cjs'))
+// F-P7-10: one shutdown rule for every stdio bridge. This one holds an open Redis socket,
+// so without it the process outlives its parent CLI forever as a PID-1 orphan.
+const { installStdioLifecycle } = require(path.join(__dirname, 'lib', 'mcp-stdio-lifecycle.cjs'))
 // SA-111 P4 (DL-111-09). Mirrors `$lib/utils/delegationCapabilities`; the bridge is a
 // standalone node process and cannot import `$lib`. The server-side runner re-validates
 // every one of these, so a drift here can only make the advertised schema stale, never
@@ -605,6 +608,15 @@ async function main() {
 
   const transport = new StdioServerTransport()
   await server.connect(transport)
+
+  // AFTER connect: the transport's `data` listener is what puts stdin into flowing mode, and
+  // a paused stream never emits `end`.
+  installStdioLifecycle({
+    logPrefix: '[subagent-mcp]',
+    onShutdown: async () => {
+      if (redis.isOpen) await redis.quit()
+    }
+  })
 }
 
 main().catch((err) => {

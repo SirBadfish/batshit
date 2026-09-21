@@ -195,14 +195,52 @@ export async function readLocalRuntimeContext(args: {
 export function resolveEffectiveContextLimit(args: {
   presetContextWindow: number | null | undefined
   reading: LocalContextReading | null
+  /**
+   * SA-125 (DL-125-03): the context size THIS request will set, when Batshit is
+   * the one setting it. Ollama's native `/api/chat` takes `options.num_ctx` and
+   * reloads the model at that size — measured 2026-09-20, `/api/ps` went
+   * 131072 -> 8192 -> 2048 -> 131072 as requests asked for it.
+   *
+   * That makes Batshit both the reader and the setter, and the reader is stale
+   * the moment the setter disagrees: the currently loaded 131072 is about to
+   * become 8192 because of this very request. Planning the prompt budget
+   * against the old number would overflow the new window on the first send.
+   * So a requested size outranks a loaded reading.
+   */
+  requestedContextWindow?: number | null
 }): {
   contextLimit: number | null
-  source: LocalContextReading['source'] | 'preset'
+  source: LocalContextReading['source'] | 'preset' | 'requested'
   presetContextWindow: number | null
   loadedContextWindow: number | null
   /** True only when both numbers are known AND differ. */
   mismatch: boolean
 } {
+  const requested =
+    typeof args.requestedContextWindow === 'number' &&
+    Number.isFinite(args.requestedContextWindow) &&
+    args.requestedContextWindow > 0
+      ? args.requestedContextWindow
+      : null
+  if (requested !== null) {
+    const loadedNow =
+      args.reading?.source === 'loaded' &&
+      typeof args.reading.loadedContextWindow === 'number'
+        ? args.reading.loadedContextWindow
+        : null
+    return {
+      contextLimit: requested,
+      source: 'requested',
+      presetContextWindow:
+        typeof args.presetContextWindow === 'number' && Number.isFinite(args.presetContextWindow)
+          ? args.presetContextWindow
+          : null,
+      loadedContextWindow: loadedNow,
+      // Not a mismatch to warn about: Batshit asked for this, and Ollama is
+      // about to reload to it. Surfacing it as a conflict would be noise.
+      mismatch: false
+    }
+  }
   const preset =
     typeof args.presetContextWindow === 'number' && Number.isFinite(args.presetContextWindow)
       ? args.presetContextWindow

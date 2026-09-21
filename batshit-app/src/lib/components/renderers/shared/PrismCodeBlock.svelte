@@ -241,7 +241,7 @@
     --prism-line-number-color: var(--prism-line-number, rgba(255, 255, 255, 0.6));
 
     position: relative;
-    font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     font-size: 0.88rem;
     line-height: 1.3;
     border-radius: var(--radius);

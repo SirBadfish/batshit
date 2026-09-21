@@ -5,6 +5,20 @@
   import * as Collapsible from '$lib/components/ui/collapsible'
   import * as Select from '$lib/components/ui/select'
   import * as Switch from '$lib/components/ui/switch'
+  import {
+    DEFAULT_QUICK_ACTION_WAKE_WORD,
+    QUICK_ACTION_WAKE_WORD_MAX_CHARS,
+    VOICE_JEV_QUICK_ACTIONS_FIELD,
+    VOICE_JEV_QUICK_ACTIONS_LABEL,
+    VOICE_JEV_QUICK_ACTIONS_WAKE_REQUIRED_FIELD,
+    VOICE_JEV_QUICK_ACTIONS_WAKE_REQUIRED_LABEL,
+    VOICE_JEV_QUICK_ACTIONS_WAKE_WORD_FIELD,
+    VOICE_JEV_QUICK_ACTIONS_WAKE_WORD_LABEL,
+    quickActionWakeWordProblem,
+    resolveJevQuickActionsEnabled,
+    resolveJevQuickActionsWakeWord,
+    resolveJevQuickActionsWakeWordRequired
+  } from '$lib/utils/jevJuiceQuickActions'
   import * as Tabs from '$lib/components/ui/tabs'
   import { Input } from '$lib/components/ui/input'
   import { Button } from '$lib/components/ui/button'
@@ -47,6 +61,7 @@
     DEEPGRAM_STT_CAPABILITIES,
     ELEVENLABS_STT_CAPABILITIES,
     FISH_STT_CAPABILITIES,
+    GOOGLE_STT_CAPABILITIES,
     MISTRAL_STT_CAPABILITIES,
     OPENAI_STT_CAPABILITIES,
     getVoiceCapabilityFields,
@@ -67,7 +82,8 @@
     normalizeAgentVoiceProfile,
     normalizeTtsEnginePromptText,
     normalizeVoiceModeTurnSettings,
-    normalizeVoiceSettings
+    normalizeVoiceSettings,
+    shouldStopVoiceRuntimeOnShutdown
   } from '$lib/utils/voiceSchema'
   import {
     DEFAULT_GOON_LIP_SYNC_VISEME_BLEND_MS,
@@ -147,6 +163,7 @@
     inputDeviceId?: string | null
     voiceSessionRuntime?: VoiceSessionRuntime
     liveKitAutoStartOnLaunch?: boolean
+    liveKitStopOnShutdown?: boolean
     goonLipSyncMode?: GoonLipSyncMode
     goonLipSyncAnalyzerId?: GoonLipSyncPremiumAnalyzerId
     goonLipSyncBlendMs?: number
@@ -158,6 +175,11 @@
     voiceModeSubmitMode?: VoiceModeSubmitMode
     voiceModeAutoSubmitDelayMs?: number
     voiceModeEndOfTurnThreshold?: number
+    /** SA-120 P9 (LS-060): Jev Juice: Quick Actions, global, default OFF. */
+    voiceModeJevJuiceQuickActions?: boolean
+    /** SA-120 P9b: the wake word gate (default required, "Yo"). */
+    voiceModeJevJuiceQuickActionsWakeWordRequired?: boolean
+    voiceModeJevJuiceQuickActionsWakeWord?: string
     ttsProvider?: VoiceProviderId
     ttsModel?: string
     ttsVoiceId?: string
@@ -729,12 +751,12 @@
     },
     {
       id: 'google',
-      label: 'Google Gemini (TTS)',
+      label: 'Google Gemini',
       type: 'cloud',
       requiresKey: true,
       supports: {
         tts: true,
-        stt: false,
+        stt: true,
         listVoices: true,
         clone: false,
         streaming: false,
@@ -742,13 +764,16 @@
         emotions: false
       },
       defaultTtsModel: 'gemini-3.1-flash-tts-preview',
+      defaultSttModel: 'gemini-3.5-transcribe',
       defaultModel: 'gemini-3.1-flash-tts-preview',
       defaultVoice: 'Kore',
       ttsModels: [
         'gemini-3.1-flash-tts-preview',
         'gemini-2.5-flash-preview-tts',
         'gemini-2.5-pro-preview-tts'
-      ]
+      ],
+      sttModels: ['gemini-3.5-transcribe'],
+      sttCapabilities: GOOGLE_STT_CAPABILITIES
     },
     {
       id: 'openai',
@@ -849,7 +874,7 @@
       defaultRealtimeSttModel: 'flux-general-en',
       defaultModel: 'aura-2-asteria-en',
       defaultVoice: 'aura-2-asteria-en',
-      ttsModels: ['aura-2-asteria-en', 'aura-asteria-en'],
+      ttsModels: ['aura-2-asteria-en', 'flux-hannah-en'],
       sttCapabilities: DEEPGRAM_STT_CAPABILITIES
     },
     {
@@ -1652,6 +1677,10 @@
       voiceSessionRuntime: normalized.voiceSessionRuntime ?? 'direct',
       liveKitAutoStartOnLaunch:
         normalized.voiceRuntimes?.livekit?.startup?.autoStartOnLaunch === true,
+      // Absent means stop, which is what quitting has always done to the pair.
+      liveKitStopOnShutdown: shouldStopVoiceRuntimeOnShutdown(
+        normalized.voiceRuntimes?.livekit?.startup
+      ),
       goonLipSyncMode: normalized.goonLipSync?.mode ?? 'amplitude',
       goonLipSyncAnalyzerId:
         normalized.goonLipSync?.analyzerId ?? DEFAULT_PREMIUM_GOON_LIP_SYNC_ANALYZER,
@@ -1667,6 +1696,9 @@
         voiceMode?.autoSubmitDelayMs ?? DEFAULT_VOICE_MODE_AUTO_SUBMIT_DELAY_MS,
       voiceModeEndOfTurnThreshold:
         voiceMode?.endOfTurnThreshold ?? DEFAULT_VOICE_MODE_END_OF_TURN_THRESHOLD,
+      voiceModeJevJuiceQuickActions: resolveJevQuickActionsEnabled(voiceMode),
+      voiceModeJevJuiceQuickActionsWakeWordRequired: resolveJevQuickActionsWakeWordRequired(voiceMode),
+      voiceModeJevJuiceQuickActionsWakeWord: resolveJevQuickActionsWakeWord(voiceMode),
       ttsProvider,
       ttsModel: tts?.modelId ?? '',
       ttsVoiceId: tts?.voiceId ?? '',
@@ -1716,7 +1748,10 @@
       inputMode: form.voiceModeInputMode,
       submitMode: form.voiceModeSubmitMode,
       autoSubmitDelayMs: form.voiceModeAutoSubmitDelayMs,
-      endOfTurnThreshold: form.voiceModeEndOfTurnThreshold
+      endOfTurnThreshold: form.voiceModeEndOfTurnThreshold,
+      [VOICE_JEV_QUICK_ACTIONS_FIELD]: form.voiceModeJevJuiceQuickActions === true,
+      [VOICE_JEV_QUICK_ACTIONS_WAKE_REQUIRED_FIELD]: form.voiceModeJevJuiceQuickActionsWakeWordRequired !== false,
+      [VOICE_JEV_QUICK_ACTIONS_WAKE_WORD_FIELD]: form.voiceModeJevJuiceQuickActionsWakeWord
     })
 
     const payload: VoiceSettings = {
@@ -1726,7 +1761,8 @@
       voiceRuntimes: {
         livekit: {
           startup: {
-            autoStartOnLaunch: form.liveKitAutoStartOnLaunch === true
+            autoStartOnLaunch: form.liveKitAutoStartOnLaunch === true,
+            stopOnShutdown: form.liveKitStopOnShutdown !== false
           }
         }
       },
@@ -1757,7 +1793,12 @@
         inputMode: normalizedVoiceMode.inputMode,
         submitMode: normalizedVoiceMode.submitMode,
         autoSubmitDelayMs: normalizedVoiceMode.autoSubmitDelayMs,
-        endOfTurnThreshold: normalizedVoiceMode.endOfTurnThreshold
+        endOfTurnThreshold: normalizedVoiceMode.endOfTurnThreshold,
+        // SA-120 P9 (LS-060). This block names its fields one by one, so a new field that is
+        // not listed here is silently dropped by every save of the panel (found live).
+        [VOICE_JEV_QUICK_ACTIONS_FIELD]: normalizedVoiceMode.jevJuiceQuickActions === true,
+        [VOICE_JEV_QUICK_ACTIONS_WAKE_REQUIRED_FIELD]: normalizedVoiceMode.jevJuiceQuickActionsWakeWordRequired !== false,
+        [VOICE_JEV_QUICK_ACTIONS_WAKE_WORD_FIELD]: normalizedVoiceMode.jevJuiceQuickActionsWakeWord ?? DEFAULT_QUICK_ACTION_WAKE_WORD
       },
       ttsEnginePrompts: buildTtsEnginePromptPayload(form.ttsEnginePrompts),
       ttsEngineSettings: buildTtsEngineSettingsPayload(form.ttsEngineSettings),
@@ -1789,7 +1830,9 @@
         engine.localRuntime?.startup
           ? {
               startup: {
-                autoStartOnLaunch: engine.localRuntime.startup.autoStartOnLaunch === true
+                autoStartOnLaunch: engine.localRuntime.startup.autoStartOnLaunch === true,
+                // Shared with the server so "absent means stop" cannot drift.
+                stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(engine.localRuntime.startup)
               }
             }
           : undefined
@@ -2243,6 +2286,16 @@
     })
   }
 
+  // SA-120 P9b: a bad wake word is refused in the field and never saved; the stored word stands.
+  let quickActionWakeWordDraft = $state<string | null>(null)
+  const quickActionWakeWordError = $derived(quickActionWakeWordDraft === null ? null : quickActionWakeWordProblem(quickActionWakeWordDraft))
+  function handleQuickActionWakeWordInput(value: string) {
+    quickActionWakeWordDraft = value
+    if (quickActionWakeWordProblem(value)) return
+    quickActionWakeWordDraft = null
+    handleSettingsChange({ voiceModeJevJuiceQuickActionsWakeWord: value.replace(/\s+/g, ' ').trim() })
+  }
+
   function handleVoiceModeEndOfTurnThresholdChange(value: number | number[]) {
     const nextValue = Array.isArray(value) ? value[0] : value
     handleSettingsChange({
@@ -2471,6 +2524,20 @@
 
   function isBatshitManagedLocalEngine(provider: VoiceEngineClientSummary) {
     return provider.localRuntime?.installOwnership === 'batshit-managed'
+  }
+
+  function canStopEngineWithBatshit(provider: VoiceEngineClientSummary) {
+    return provider.localRuntime?.canStopOnShutdown === true
+  }
+
+  function getEngineStopUnavailableReason(provider: VoiceEngineClientSummary) {
+    // An engine with no saved local runtime at all was connected, never
+    // installed, so "Batshit did not start it" is the honest reason.
+    return provider.localRuntime?.stopOnShutdownUnavailableReason ?? 'no-launch-recipe'
+  }
+
+  function isStopWithBatshitOn(provider: VoiceEngineClientSummary) {
+    return shouldStopVoiceRuntimeOnShutdown(provider.localRuntime?.startup)
   }
 
   function getDeleteLocalFilesForEngine(providerId: string) {
@@ -2902,7 +2969,7 @@
     if (isBatshitManagedLocalEngine(provider)) {
       description.push(
         deleteLocalFiles
-          ? 'The Batshit-managed install folder and runtime logs/state for this engine will also be deleted from disk.'
+          ? 'The Batshit-managed install folder and runtime logs/state for this engine will also be deleted from disk. If Batshit started the engine and it is still running, Batshit stops it first, unless another engine still uses it.'
           : 'The Batshit-managed install folder and runtime logs/state will stay on disk unless you turn on "Delete local files too."'
       )
     }
@@ -4176,6 +4243,115 @@
                         />
                       </div>
                     </div>
+
+                    <div class="batshit-settings-form-row is-compact">
+                      <div class="batshit-settings-form-copy">
+                        <div class="batshit-settings-form-label-line">
+                          <Label.Label class="batshit-settings-form-label" for="voice-mode-jev-juice-quick-actions">
+                            {VOICE_JEV_QUICK_ACTIONS_LABEL}
+                          </Label.Label>
+                          <SettingsInfoMenu ariaLabel={`About ${VOICE_JEV_QUICK_ACTIONS_LABEL}`} contentClass="w-96">
+                            <p>
+                              In Voice Mode, when what you just said is a small request to Batshit itself,
+                              Batshit does it at once instead of sending it to your agent: stop talking,
+                              hang up, show or hide the Goon, open Settings, or show the Execution
+                              Viewer. Jev, a model made by TypeSafe, judges each spoken turn; when the
+                              request was all you said, nothing goes to the agent, and when you also said
+                              something for the agent, the rest is sent as usual.
+                            </p>
+                            <p>
+                              You always see a mark under what you said, with Jev's confidence, and the
+                              agent is told on its next turn. Jev can be wrong; every quick action is one
+                              click to undo. Nothing risky ever runs this way.
+                            </p>
+                            <p>
+                              What leaves this computer when it is on: the words of each turn you speak
+                              in Voice Mode and the names of these actions. Never your chat history. Needs
+                              Allow Jev Juice on in Settings → Admin and a TypeSafe key.
+                            </p>
+                          </SettingsInfoMenu>
+                        </div>
+                      </div>
+                      <div class="batshit-settings-form-control is-inline-status">
+                        <Switch.Root
+                          id="voice-mode-jev-juice-quick-actions"
+                          checked={settings.voiceModeJevJuiceQuickActions === true}
+                          onCheckedChange={(value) =>
+                            handleSettingsChange({
+                              voiceModeJevJuiceQuickActions: value === true
+                            })}
+                          disabled={!voiceModeUsesSttInput}
+                        />
+                      </div>
+                    </div>
+
+                    <div class="batshit-settings-form-row is-compact">
+                      <div class="batshit-settings-form-copy">
+                        <div class="batshit-settings-form-label-line">
+                          <Label.Label class="batshit-settings-form-label" for="voice-mode-jev-juice-wake-required">
+                            {VOICE_JEV_QUICK_ACTIONS_WAKE_REQUIRED_LABEL}
+                          </Label.Label>
+                          <SettingsInfoMenu ariaLabel={`About ${VOICE_JEV_QUICK_ACTIONS_WAKE_REQUIRED_LABEL}`} contentClass="w-96">
+                            <p>
+                              On (the default): a spoken turn is only checked for a quick action when it
+                              starts with the wake word, as in "Yo, hang up". Everything else you say goes
+                              straight to your agent with no check at all, so it costs nothing and waits
+                              for nothing.
+                            </p>
+                            <p>
+                              Off: every spoken turn is checked. Jev still only acts when it is sure, but each
+                              turn waits for one Jev call first.
+                            </p>
+                          </SettingsInfoMenu>
+                        </div>
+                      </div>
+                      <div class="batshit-settings-form-control is-inline-status">
+                        <Switch.Root
+                          id="voice-mode-jev-juice-wake-required"
+                          checked={settings.voiceModeJevJuiceQuickActionsWakeWordRequired !== false}
+                          onCheckedChange={(value) =>
+                            handleSettingsChange({
+                              voiceModeJevJuiceQuickActionsWakeWordRequired: value === true
+                            })}
+                          disabled={!voiceModeUsesSttInput || settings.voiceModeJevJuiceQuickActions !== true}
+                        />
+                      </div>
+                    </div>
+
+                    <div class="batshit-settings-form-row is-compact">
+                      <div class="batshit-settings-form-copy">
+                        <div class="batshit-settings-form-label-line">
+                          <Label.Label class="batshit-settings-form-label" for="voice-mode-jev-juice-wake-word">
+                            {VOICE_JEV_QUICK_ACTIONS_WAKE_WORD_LABEL}
+                          </Label.Label>
+                          <SettingsInfoMenu ariaLabel={`About the ${VOICE_JEV_QUICK_ACTIONS_WAKE_WORD_LABEL}`} contentClass="w-96">
+                            <p>
+                              The word a quick action starts with. "{DEFAULT_QUICK_ACTION_WAKE_WORD}" by default:
+                              short, easy for speech-to-text, and rarely the first word of anything else. It
+                              must be the first word, spelled exactly; case and punctuation do not matter.
+                              One to three plain words, up to {QUICK_ACTION_WAKE_WORD_MAX_CHARS} characters.
+                            </p>
+                            <p>
+                              Pick a word you do not normally start sentences with. "System" collides with
+                              "system prompt", and "Jev" is often misheard.
+                            </p>
+                          </SettingsInfoMenu>
+                        </div>
+                        {#if quickActionWakeWordError}
+                          <p class="batshit-settings-form-help is-error">{quickActionWakeWordError}</p>
+                        {/if}
+                      </div>
+                      <div class="batshit-settings-form-control">
+                        <Input
+                          id="voice-mode-jev-juice-wake-word"
+                          type="text"
+                          maxlength={QUICK_ACTION_WAKE_WORD_MAX_CHARS}
+                          value={settings.voiceModeJevJuiceQuickActionsWakeWord ?? DEFAULT_QUICK_ACTION_WAKE_WORD}
+                          disabled={!voiceModeUsesSttInput || settings.voiceModeJevJuiceQuickActions !== true || settings.voiceModeJevJuiceQuickActionsWakeWordRequired === false}
+                          oninput={(event) => handleQuickActionWakeWordInput((event.currentTarget as HTMLInputElement).value)}
+                        />
+                      </div>
+                    </div>
                   </div>
 
                 </div>
@@ -4697,6 +4873,34 @@
                   onCheckedChange={(value) =>
                     handleSettingsChange({
                       liveKitAutoStartOnLaunch: value === true
+                    })}
+                />
+              </div>
+
+              <div class="flex flex-wrap items-center justify-between gap-3 batshit-settings-muted-panel">
+                <div class="flex min-w-0 items-center gap-2">
+                  <span class="batshit-settings-form-label">Stop with Batshit</span>
+                  <SettingsInfoMenu ariaLabel="About LiveKit Stop with Batshit" contentClass="w-80">
+                    <p>
+                      When this is on, Batshit stops the managed local LiveKit server and sidecar
+                      when Batshit shuts down.
+                    </p>
+                    <p>
+                      When it is off, both keep running until you stop them yourself. Batshit only
+                      ever stops the processes it started, and a crash or a force quit cannot stop
+                      anything.
+                    </p>
+                    <p>
+                      In Docker, the LiveKit runtime add-on owns its own lifecycle, so this control
+                      does not apply.
+                    </p>
+                  </SettingsInfoMenu>
+                </div>
+                <Switch.Root
+                  checked={settings.liveKitStopOnShutdown !== false}
+                  onCheckedChange={(value) =>
+                    handleSettingsChange({
+                      liveKitStopOnShutdown: value === true
                     })}
                 />
               </div>
@@ -5733,7 +5937,9 @@
                                     When this is checked, deleting the engine also removes the
                                     Batshit-managed install folder plus this engine's runtime logs
                                     and launch state. It is only available for engines Batshit
-                                    installed under its managed installs folder.
+                                    installed under its managed installs folder. If the engine is
+                                    still running, Batshit stops it first; if another engine still
+                                    uses it, it keeps running for that engine.
                                   </p>
                                 </SettingsInfoMenu>
                               </label>
@@ -5758,6 +5964,22 @@
                                   launcher or packaged runtime; per-engine runtime launch lives
                                   here.
                                 </p>
+                                {#if !canStopEngineWithBatshit(provider)}
+                                  {#if getEngineStopUnavailableReason(provider) === 'docker'}
+                                    <p>
+                                      In Docker, Batshit stops this engine through its helper
+                                      program on your computer, and the helper running now cannot
+                                      stop engines. Starting Docker Batshit with ./start-docker.sh
+                                      updates the helper and adds the Stop with Batshit control
+                                      here. On Windows this is not available yet.
+                                    </p>
+                                  {:else}
+                                    <p>
+                                      Batshit did not install or start this engine, so it cannot
+                                      stop it either. There is no Stop with Batshit control here.
+                                    </p>
+                                  {/if}
+                                {/if}
                               </SettingsInfoMenu>
                               <Switch.Root
                                 checked={provider.localRuntime?.startup?.autoStartOnLaunch === true}
@@ -5774,6 +5996,44 @@
                                   }))}
                               />
                             </div>
+                            {#if canStopEngineWithBatshit(provider)}
+                              <div class="batshit-settings-pill is-control">
+                                <span class="batshit-settings-form-label">Stop with Batshit</span>
+                                <SettingsInfoMenu ariaLabel="About Stop with Batshit" contentClass="w-80">
+                                  <p>
+                                    When this is on, Batshit stops this engine when Batshit shuts
+                                    down, so it stops holding memory while you are not using it.
+                                  </p>
+                                  <p>
+                                    When it is off, the engine keeps running until you stop it
+                                    yourself, and it is ready straight away next time.
+                                  </p>
+                                  <p>
+                                    Batshit only ever stops the process it started, and it checks
+                                    that the process is still the one it launched first. A crash or
+                                    a force quit cannot stop anything.
+                                  </p>
+                                  <p>
+                                    When several engines share one running program, Batshit stops
+                                    it only if every one of them has Stop with Batshit on.
+                                  </p>
+                                </SettingsInfoMenu>
+                                <Switch.Root
+                                  checked={isStopWithBatshitOn(provider)}
+                                  onCheckedChange={(value) =>
+                                    updateByoProvider(provider.id, (current) => ({
+                                      ...current,
+                                      localRuntime: {
+                                        ...(current.localRuntime ?? {}),
+                                        startup: {
+                                          ...(current.localRuntime?.startup ?? {}),
+                                          stopOnShutdown: value === true
+                                        }
+                                      }
+                                    }))}
+                                />
+                              </div>
+                            {/if}
                           </div>
                         </div>
 

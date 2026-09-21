@@ -2,7 +2,7 @@ import type { Mode4Style } from '$lib/constants/mode4'
 
 export type CodexPermissionMode = 'chat' | 'agent' | 'agent_full'
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access'
-export type CodexApproval = 'never' | 'on-request' | 'on-failure' | 'untrusted'
+export type CodexApproval = 'never' | 'on-request'
 export type CodexReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh'
 export type CodexReasoningSummary = 'auto' | 'concise' | 'detailed' | 'none'
 export type CodexModelVerbosity = 'low' | 'medium' | 'high'

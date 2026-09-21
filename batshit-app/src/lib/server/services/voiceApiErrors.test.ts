@@ -58,11 +58,37 @@ describe('classifyVoiceApiError', () => {
     expect(result.error).toContain('disabled')
   })
 
+  it('treats provider-specific local voice validation as user-fixable input', () => {
+    const flux = classifyVoiceApiError(
+      new Error('Deepgram Flux speed must use 0.05 increments.'),
+      'tts'
+    )
+    const google = classifyVoiceApiError(
+      new Error('Google Gemini 3.5 Transcribe does not accept audio type "text/plain".'),
+      'stt'
+    )
+
+    expect(flux).toMatchObject({ status: 400, logLevel: 'warn' })
+    expect(google).toMatchObject({ status: 400, logLevel: 'warn' })
+  })
+
   it('maps network failures to upstream dependency errors', () => {
     const result = classifyVoiceApiError(new Error('connect ECONNREFUSED 127.0.0.1:7777'), 'tts')
 
     expect(result.status).toBe(502)
     expect(result.logLevel).toBe('error')
+  })
+
+  it('preserves provider quota responses as retryable rate-limit errors', () => {
+    const error = Object.assign(new Error('Resource exhausted for this project.'), { status: 429 })
+    const result = classifyVoiceApiError(error, 'stt')
+
+    expect(result).toMatchObject({
+      status: 429,
+      logLevel: 'warn',
+      error: 'Resource exhausted for this project.'
+    })
+    expect(result.setupHint).toContain('usage/billing')
   })
 
   it('falls back to generic server error handling for unknown failures', () => {

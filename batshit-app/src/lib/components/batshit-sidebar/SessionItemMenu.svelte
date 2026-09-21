@@ -41,6 +41,7 @@
       closedCount: number
       hasWhiteboard: boolean
       whiteboardUpdatedAt: string | null
+      whiteboardWrittenBy: 'agent' | 'nap' | null
     } | null
     onMenuOpenChange: (open: boolean) => void | Promise<void>
     onNameSave: () => void | Promise<void>
@@ -220,7 +221,11 @@
                   {episodeSummary.closedCount} earlier episode{episodeSummary.closedCount === 1 ? '' : 's'}.
                 {/if}
                 {#if episodeSummary.hasWhiteboard}
-                  Whiteboard active{episodeSummary.whiteboardUpdatedAt
+                  Whiteboard active{episodeSummary.whiteboardWrittenBy === 'nap'
+                    ? ', filled by a nap'
+                    : episodeSummary.whiteboardWrittenBy === 'agent'
+                      ? ', written by the agent'
+                      : ''}{episodeSummary.whiteboardUpdatedAt
                     ? ` (updated ${formatEpisodeDate(episodeSummary.whiteboardUpdatedAt)})`
                     : ''}.
                 {/if}

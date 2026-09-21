@@ -29,13 +29,23 @@ export type CommandExecutionItem = {
   status: CommandExecutionStatus
 }
 
-/** Indicates the type of a file change. */
-export type PatchChangeKind = 'add' | 'delete' | 'update'
+/**
+ * Indicates the type of a file change. `move` is a bare rename, which only the app-server lane
+ * reports (as `update` with a `move_path`); a rename that also changed lines stays `update`.
+ */
+export type PatchChangeKind = 'add' | 'delete' | 'update' | 'move'
 
 /** A single file change inside a patch. */
 export type FileUpdateChange = {
   path: string
   kind: PatchChangeKind
+  /** App-server lane only: where a renamed file went (the app server's `move_path`). */
+  to?: string
+  /**
+   * App-server lane only: Codex's own record of this file's change. Unified hunks for an update,
+   * the whole text for an add or a delete; a rename's ends `\n\nMoved to: <path>`.
+   */
+  diff?: string
 }
 
 /** The status of a file change. */

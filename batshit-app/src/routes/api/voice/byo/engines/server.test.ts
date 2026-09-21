@@ -7,8 +7,9 @@ vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
   upsertVoiceEngineRecord: vi.fn()
 }))
 
-import { POST } from './+server'
+import { POST, PUT } from './+server'
 import {
+  applyVoiceEnginePublicUpdates,
   listVoiceEngineSummaries,
   upsertVoiceEngineRecord
 } from '$lib/server/services/voiceEngineRegistry'
@@ -125,5 +126,68 @@ describe('POST /api/voice/byo/engines', () => {
 
     expect(response.status).toBe(401)
     expect(upsertVoiceEngineRecord).not.toHaveBeenCalled()
+  })
+})
+
+describe('PUT /api/voice/byo/engines', () => {
+  // This handler rebuilds every update from an ALLOW-LIST. A startup field it
+  // does not name is silently dropped here, with the whole chain below it
+  // correct and every service-level test still green — which is exactly how
+  // "Stop with Batshit" first failed its live proof.
+  function buildPutEvent(engines: unknown[], userId: string | null = 'user-1'): RequestEvent {
+    return {
+      request: new Request('http://localhost/api/voice/byo/engines', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ engines })
+      }),
+      locals: userId ? { user: { id: userId } } : { user: null }
+    } as unknown as RequestEvent
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(applyVoiceEnginePublicUpdates).mockResolvedValue([])
+  })
+
+  it('passes both startup halves through to the registry', async () => {
+    await PUT(
+      buildPutEvent([
+        {
+          id: 'whisper-cpp',
+          enabled: true,
+          localRuntime: { startup: { autoStartOnLaunch: true, stopOnShutdown: false } }
+        }
+      ])
+    )
+
+    expect(applyVoiceEnginePublicUpdates).toHaveBeenCalledWith('user-1', [
+      expect.objectContaining({
+        id: 'whisper-cpp',
+        localRuntime: { startup: { autoStartOnLaunch: true, stopOnShutdown: false } }
+      })
+    ])
+  })
+
+  it('keeps a stop choice sent on its own', async () => {
+    await PUT(
+      buildPutEvent([{ id: 'whisper-cpp', localRuntime: { startup: { stopOnShutdown: false } } }])
+    )
+
+    expect(applyVoiceEnginePublicUpdates).toHaveBeenCalledWith('user-1', [
+      expect.objectContaining({ localRuntime: { startup: { stopOnShutdown: false } } })
+    ])
+  })
+
+  it('ignores a non-boolean stop value instead of saving a guess', async () => {
+    await PUT(
+      buildPutEvent([
+        { id: 'whisper-cpp', localRuntime: { startup: { stopOnShutdown: 'false' } } }
+      ])
+    )
+
+    expect(applyVoiceEnginePublicUpdates).toHaveBeenCalledWith('user-1', [
+      expect.objectContaining({ localRuntime: { startup: undefined } })
+    ])
   })
 })

@@ -112,13 +112,22 @@ export interface SavedModel {
   purpose?: ModelPurpose; // chat | visual | audio | utility
   /** User-selected category override. When absent, purpose follows catalog/inference. */
   purposeOverride?: ModelPurpose;
-  contextWindow: number; // Context window size in tokens
+  /**
+   * Context window size in tokens. ABSENT means unknown (BL-67): a catalog row that
+   * reports no window stores nothing, never 0. Readers must treat absent (and any
+   * non-positive value on older presets) as "unknown", never as a real limit.
+   */
+  contextWindow?: number;
   iconPath?: string; // Optional custom icon path for the model
   
-  // Pricing can be either simple (single number) or tiered
+  /**
+   * Prices per million tokens, simple (single number) or tiered. An ABSENT input or
+   * output price means unknown (BL-67): the Token Panel then shows the cost as Unknown.
+   * An explicit 0 is a real zero (a free local program, or a catalog row that says 0).
+   */
   pricing: {
-    input: number | PricingTier[];
-    output: number | PricingTier[];
+    input?: number | PricingTier[];
+    output?: number | PricingTier[];
     cachedInput?: number; // Optional, not all models support caching
   };
   
@@ -159,7 +168,7 @@ export interface SavedModel {
 }
 
 // Helper type guards
-export function isTieredPricing(pricing: number | PricingTier[]): pricing is PricingTier[] {
+export function isTieredPricing(pricing: number | PricingTier[] | undefined): pricing is PricingTier[] {
   return Array.isArray(pricing);
 }
 

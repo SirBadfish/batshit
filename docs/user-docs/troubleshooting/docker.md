@@ -136,6 +136,18 @@ Also check `BATSHIT_WORKSPACE_MOUNT`. Docker Sandbox needs a real host folder ma
 
 The safe failure is an explicit unavailable/operator error. Batshit won't silently fall back from Docker Sandbox to app-container Bash.
 
+## Docker Sandbox says to install, sign in, or set up `sbx`
+
+Docker Sandbox runs through Docker's `sbx` tool on your computer, so it needs three one-time steps on the host (not inside Docker):
+
+1. Install `sbx`: `winget install -h Docker.sbx` on Windows 11, or `brew install docker/tap/sbx` on a Mac.
+2. Run `sbx login` and sign in with your Docker account. A free account works.
+3. Run `sbx policy init balanced` to pick the default network rules.
+
+The message names the step that's missing. After you do it, press Refresh on the Docker Sandbox Runtime card in Settings → Admin → Runtimes.
+
+Older setups used a `docker sandbox` command that came with Docker Desktop. Docker Desktop has removed it, so updating Docker Desktop alone doesn't give you Docker Sandbox. `sbx` is a separate install.
+
 ## Bash runs, but it's not my host shell
 
 In Docker, the `local` Bash backend means the Batshit app-container shell. That shell can use `/workspace`, installed container tools, and files mounted into the app container — it is not your host Mac/Windows/Linux shell.

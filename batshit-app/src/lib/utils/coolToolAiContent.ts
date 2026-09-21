@@ -1,3 +1,5 @@
+import { failedCommandExitCode } from './toolActivityContract'
+
 export const FULL_FIDELITY_AI_EXPANSION_LANES = new Set([
   'read_file',
   'skill_read',
@@ -133,16 +135,60 @@ function buildFullFidelityToolAiContent(
     args.path
   )
   const skill = firstScalarString(result?.skillName, result?.skillId, args.skillId)
+  // A shell command read as a file stores an exit code only when it failed (F-P6-5).
+  const exitCode = failedCommandExitCode(result)
   const lineCount = firstScalarString(result?.lineCount, result?.numLines, result?.totalLines)
   const size = firstScalarString(result?.size, result?.bytes, result?.contentChars, result?.diffChars)
   const header = formatAiToolHeader(toolName, [
     path ? `Path: ${path}` : '',
     skill ? `Skill: ${skill}` : '',
+    exitCode !== undefined ? `Exit code: ${exitCode}` : '',
     lineCount ? `Lines: ${lineCount}` : '',
     size ? `Chars/bytes: ${size}` : ''
   ])
 
   return `${header}\n${contentLabel}:\n${fenceForAi(content, language)}`
+}
+
+/**
+ * A failed shell command's own account of its failure (F-P6-5): what it printed, then the step's
+ * error. Like a bash result, an exit code plus output explain a failure, so the generic step
+ * error is added only when there is no exit code (a command that never ran, or a lane that
+ * reports failures as text).
+ */
+function buildShellFailureBlocks(payload: Record<string, any>): string[] {
+  const result = asObject(getCoolToolResult(payload))
+  const exitCode = failedCommandExitCode(result)
+  const output = firstString(result?.commandOutput)
+  const error = firstScalarString(payload.error)
+  const blocks: string[] = []
+  if (output !== null && output.trim()) blocks.push(`Output:\n${fenceForAi(output, 'text')}`)
+  if (error && exitCode === undefined && !(output !== null && sameTextIgnoringWhitespace(error, output))) {
+    blocks.push(`Error:\n${fenceForAi(error, 'text')}`)
+  }
+  return blocks
+}
+
+/** A write or edit that failed: it wrote nothing, so there is no "Written content" or "Diff". */
+function isFailedFileChange(payload: Record<string, any>): boolean {
+  const result = asObject(getCoolToolResult(payload))
+  return (
+    failedCommandExitCode(result) !== undefined ||
+    typeof result?.commandOutput === 'string' ||
+    Boolean(firstScalarString(payload.error))
+  )
+}
+
+function buildFailedFileChangeAiContent(toolName: string, payload: Record<string, any>): string {
+  const result = asObject(getCoolToolResult(payload))
+  const args = getCoolToolArgs(payload)
+  const path = firstScalarString(result?.filePath, result?.path, result?.absolutePath, args.filePath, args.path)
+  const exitCode = failedCommandExitCode(result)
+  const header = formatAiToolHeader(toolName, [
+    path ? `Path: ${path}` : '',
+    exitCode !== undefined ? `Exit code: ${exitCode}` : ''
+  ])
+  return [header, ...buildShellFailureBlocks(payload)].join('\n')
 }
 
 function buildListToolAiContent(toolName: string, payload: Record<string, any>): string {
@@ -151,6 +197,7 @@ function buildListToolAiContent(toolName: string, payload: Record<string, any>):
   const path = firstScalarString(result?.path, result?.dirPath, args.path, args.dirPath)
   const files = Array.isArray(result?.files) ? result.files : []
   const total = firstScalarString(result?.totalItems, result?.totalFiles) ?? String(files.length)
+  const exitCode = failedCommandExitCode(result)
   const renderedFiles = files
     .map((entry) => {
       if (typeof entry === 'string') return entry
@@ -160,9 +207,13 @@ function buildListToolAiContent(toolName: string, payload: Record<string, any>):
     .filter(Boolean)
   const header = formatAiToolHeader(toolName, [
     path ? `Path: ${path}` : '',
+    exitCode !== undefined ? `Exit code: ${exitCode}` : '',
     `Items: ${total}`
   ])
-  return `${header}\nFiles:\n${renderedFiles.map((file) => `- ${file}`).join('\n') || '(none)'}`
+  return [
+    `${header}\nFiles:\n${renderedFiles.map((file) => `- ${file}`).join('\n') || '(none)'}`,
+    ...buildShellFailureBlocks(payload)
+  ].join('\n')
 }
 
 function buildBashToolAiContent(toolName: string, payload: Record<string, any>): string {
@@ -170,17 +221,32 @@ function buildBashToolAiContent(toolName: string, payload: Record<string, any>):
   const args = getCoolToolArgs(payload)
   const command = firstScalarString(result?.command, args.command, args.innerCommand)
   const exitCode = firstScalarString(result?.exitCode)
+  const errorCode = firstScalarString(result?.errorCode)
   const stdout = firstString(result?.stdout, result?.output)
   const stderr = firstString(result?.stderr)
+  // A command that never started has no exit code and carries its reason in the payload's
+  // `error`. Older zips stored an invented `exitCode: 0` beside that reason (F-P5-1), so an
+  // error next to exit code 0 means the same thing. A command that exited non-zero is
+  // explained by its exit code and stderr, not by the generic step error.
+  const error = firstScalarString(payload.error)
+  const commandNeverRan = exitCode === null || exitCode === '0'
   const blocks = [
     formatAiToolHeader(toolName, [
       command ? `Command: ${command}` : '',
-      exitCode ? `Exit code: ${exitCode}` : ''
+      exitCode ? `Exit code: ${exitCode}` : '',
+      errorCode ? `Error code: ${errorCode}` : ''
     ])
   ]
   if (stdout !== null) blocks.push(`Stdout:\n${fenceForAi(stdout, 'text')}`)
   if (stderr !== null && stderr.trim()) blocks.push(`Stderr:\n${fenceForAi(stderr, 'text')}`)
+  if (error && commandNeverRan && !(stderr !== null && sameTextIgnoringWhitespace(error, stderr))) {
+    blocks.push(`Error:\n${fenceForAi(error, 'text')}`)
+  }
   return blocks.join('\n')
+}
+
+function sameTextIgnoringWhitespace(left: string, right: string): boolean {
+  return left.replace(/\s+/g, ' ').trim() === right.replace(/\s+/g, ' ').trim()
 }
 
 function buildFetchZipToolAiContent(toolName: string, payload: Record<string, any>): string {
@@ -247,11 +313,19 @@ export function buildCoolToolAiContent(
         result?.data
       )
       if (content !== null) {
-        return buildFullFidelityToolAiContent(toolName, payload, 'Content', content, language)
+        const transcript = buildFullFidelityToolAiContent(toolName, payload, 'Content', content, language)
+        const error = firstScalarString(payload.error)
+        // A read's content is what it printed; one that printed nothing and has no exit code
+        // (a command Codex declined) explains its failure only through the error.
+        if (error && !content.trim() && failedCommandExitCode(result) === undefined) {
+          return `${transcript}\nError:\n${fenceForAi(error, 'text')}`
+        }
+        return transcript
       }
       break
     }
     case 'write_file': {
+      if (isFailedFileChange(payload)) return buildFailedFileChangeAiContent(toolName, payload)
       const content = firstString(result?.content, result?.fileContent, result?.newContent, result?.output)
       if (content !== null) {
         return buildFullFidelityToolAiContent(toolName, payload, 'Written content', content, language)
@@ -259,6 +333,7 @@ export function buildCoolToolAiContent(
       break
     }
     case 'edit_file': {
+      if (isFailedFileChange(payload)) return buildFailedFileChangeAiContent(toolName, payload)
       const diff = firstString(result?.diff, result?.patch, result?.changes, result?.output)
       if (diff !== null) {
         return buildFullFidelityToolAiContent(toolName, payload, 'Diff', diff, 'diff')

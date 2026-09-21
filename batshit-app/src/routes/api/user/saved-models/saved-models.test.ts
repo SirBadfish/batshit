@@ -420,3 +420,115 @@ describe('saved model purpose', () => {
     expect(normalized.purpose).toBe('utility')
   })
 })
+
+describe('normaliseSavedModel unknown price and context window (BL-67)', () => {
+  const manager = { listAvailableModels: () => [] } as any
+  const base = {
+    id: 'openai-unpriced',
+    modelName: 'OpenAI Unpriced',
+    modelId: 'gpt-unpriced',
+    provider: 'openai',
+    connection: { id: 'direct:openai', type: 'direct', service: 'openai' },
+    createdAt: '',
+    updatedAt: ''
+  }
+
+  it('stores an absent price and context window as absent, never 0', async () => {
+    const normalized = await routeModule._normaliseSavedModel(
+      { ...base, pricing: {} } as SavedModel,
+      manager
+    )
+
+    expect('contextWindow' in normalized).toBe(false)
+    expect(normalized.pricing).toEqual({})
+    // The Redis payload carries no zero either.
+    const stored = JSON.parse(JSON.stringify(normalized))
+    expect(stored.contextWindow).toBeUndefined()
+    expect(stored.pricing.input).toBeUndefined()
+    expect(stored.pricing.output).toBeUndefined()
+  })
+
+  it('stores nothing for a preset that sends no pricing object at all', async () => {
+    const payload = { ...base } as Partial<SavedModel>
+    const normalized = await routeModule._normaliseSavedModel(payload as SavedModel, manager)
+
+    expect(normalized.pricing.input).toBeUndefined()
+    expect(normalized.pricing.output).toBeUndefined()
+  })
+
+  it('treats a context window of 0 from an older client as unknown', async () => {
+    const normalized = await routeModule._normaliseSavedModel(
+      { ...base, contextWindow: 0, pricing: {} } as SavedModel,
+      manager
+    )
+
+    expect('contextWindow' in normalized).toBe(false)
+  })
+
+  it('keeps an explicit price of 0 as a real zero', async () => {
+    const normalized = await routeModule._normaliseSavedModel(
+      { ...base, contextWindow: 128000, pricing: { input: 0, output: 0 } } as SavedModel,
+      manager
+    )
+
+    expect(normalized.pricing).toEqual({ input: 0, output: 0 })
+    expect(normalized.contextWindow).toBe(128000)
+  })
+
+  it('keeps a known half of the price without inventing the other half', async () => {
+    const normalized = await routeModule._normaliseSavedModel(
+      { ...base, pricing: { output: 15 } } as SavedModel,
+      manager
+    )
+
+    expect(normalized.pricing).toEqual({ output: 15 })
+  })
+
+  it.each([
+    ['codex-cli', 'openai-codex'],
+    ['claude-cli', 'anthropic-claude-cli']
+  ])(
+    'prices a %s preset at a real 0 because the user\'s plan pays for it',
+    async (connectionId, service) => {
+      const normalized = await routeModule._normaliseSavedModel(
+        {
+          id: `cli-${service}`,
+          modelName: 'CLI model',
+          provider: service,
+          modelId: 'some-cli-model',
+          purpose: 'chat',
+          connection: { id: connectionId, type: 'direct', service, useDeveloperPrefix: false },
+          pricing: {},
+          createdAt: '',
+          updatedAt: ''
+        } as SavedModel,
+        manager
+      )
+
+      expect(normalized.pricing).toEqual({ input: 0, output: 0, cachedInput: 0 })
+    }
+  )
+
+  it.each(LOCAL_AI_SERVER_DEFINITIONS.map(({ id }) => id))(
+    'prices a %s Local AI preset at a real 0 because the local program is free',
+    async (service) => {
+      const normalized = await routeModule._normaliseSavedModel(
+        {
+          id: `local-${service}`,
+          modelName: 'Local model',
+          provider: service,
+          modelId: 'some-local-model',
+          purpose: 'chat',
+          connection: { type: 'direct', service, useDeveloperPrefix: false },
+          pricing: {},
+          createdAt: '',
+          updatedAt: ''
+        } as SavedModel,
+        manager
+      )
+
+      expect(normalized.pricing).toEqual({ input: 0, output: 0, cachedInput: 0 })
+      expect('contextWindow' in normalized).toBe(false)
+    }
+  )
+})

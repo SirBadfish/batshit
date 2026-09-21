@@ -8,6 +8,7 @@ import {
   inspectManagedRuntimePortability,
   MAC_RUNTIME_MINIMUM_VERSION
 } from './managed-runtime-portability.mjs';
+import { inspectFfmpegRuntimeCapabilities } from './ffmpeg-runtime-capabilities.mjs';
 import {
   HAIR_CATALOG_PACKAGE_CONTRACT,
   validateHairCatalogPackageDefinition
@@ -472,39 +473,16 @@ async function copyManagedFfmpegRuntime() {
     'BATSHIT_MAC_FFMPEG_DIST_DIR build configuration'
   );
   const proof = await runtimeProofFiles(resolvedSource, 'BATSHIT_MAC_FFMPEG_DIST_DIR');
-  const versionResult = runCaptured(ffmpegBin, ['-hide_banner', '-version']);
-  if (!versionResult.ok) {
-    throw new Error(
-      `BATSHIT_MAC_FFMPEG_DIST_DIR bin/ffmpeg must run successfully: ${
-        versionResult.stderr || versionResult.stdout || versionResult.error?.message || 'unknown error'
-      }`
-    );
+  const capabilities = await inspectFfmpegRuntimeCapabilities(resolvedSource, {
+    allowGpl: process.env.BATSHIT_MAC_ALLOW_GPL_FFMPEG === '1'
+  });
+  if (!capabilities.ok) {
+    throw new Error(`BATSHIT_MAC_FFMPEG_DIST_DIR does not meet the managed FFmpeg contract:\n- ${capabilities.issues.join('\n- ')}`);
   }
-  const versionOutput = `${versionResult.stdout}\n${versionResult.stderr}`;
-  const configLine = versionOutput
-    .split(/\r?\n/)
-    .find((line) => line.startsWith('configuration:')) || '';
-  if (!configLine) {
-    throw new Error('BATSHIT_MAC_FFMPEG_DIST_DIR bin/ffmpeg must report its configure flags in `ffmpeg -version` output.');
-  }
+  const { versionOutput, configLine, gplEnabled } = capabilities;
   if (configLine.includes(resolvedSource) || configLine.includes(repoRoot)) {
     throw new Error(
       'BATSHIT_MAC_FFMPEG_DIST_DIR uses a local build-machine path in its FFmpeg configure prefix. Rebuild it with the managed runtime asset prep script so the packaged app does not expose local source paths.'
-    );
-  }
-  if (configLine.includes('--enable-nonfree')) {
-    throw new Error('BATSHIT_MAC_FFMPEG_DIST_DIR must not use an FFmpeg build configured with --enable-nonfree.');
-  }
-  const gplEnabled = configLine.includes('--enable-gpl');
-  if (gplEnabled && process.env.BATSHIT_MAC_ALLOW_GPL_FFMPEG !== '1') {
-    throw new Error(
-      'BATSHIT_MAC_FFMPEG_DIST_DIR uses --enable-gpl. Use an LGPL-compatible FFmpeg build for the Mac app, or set BATSHIT_MAC_ALLOW_GPL_FFMPEG=1 only after release owners accept the GPL notice/source obligations.'
-    );
-  }
-  const encodersResult = runCaptured(ffmpegBin, ['-hide_banner', '-encoders']);
-  if (!encodersResult.ok || !/\bh264_videotoolbox\b/.test(`${encodersResult.stdout}\n${encodersResult.stderr}`)) {
-    throw new Error(
-      'BATSHIT_MAC_FFMPEG_DIST_DIR must include the h264_videotoolbox encoder so the Mac app can avoid a bundled libx264/GPL dependency.'
     );
   }
   const portability = await inspectManagedRuntimePortability(resolvedSource);
@@ -522,6 +500,10 @@ async function copyManagedFfmpegRuntime() {
       version: versionOutput.split(/\r?\n/).find(Boolean) || null,
       licenseMode: gplEnabled ? 'GPL-enabled' : 'LGPL-compatible',
       h264Encoder: 'h264_videotoolbox',
+      av1Decoder: 'libdav1d',
+      bundledDav1dLicense: 'Contents/Resources/runtime/vendor/ffmpeg/share/dav1d/COPYING',
+      bundledDav1dSource: 'Contents/Resources/runtime/vendor/ffmpeg/share/dav1d/SOURCE.txt',
+      bundledDav1dChecksums: 'Contents/Resources/runtime/vendor/ffmpeg/share/dav1d/CHECKSUMS.txt',
       minimumMacosVersion: MAC_RUNTIME_MINIMUM_VERSION,
       license: `Contents/Resources/runtime/vendor/ffmpeg/${license}`,
       buildConfig: `Contents/Resources/runtime/vendor/ffmpeg/${buildConfig}`,
@@ -588,8 +570,20 @@ async function main() {
     join(resourcesPath, 'scripts', 'managed-runtime-portability.mjs')
   );
   await cp(
+    join(macRoot, 'scripts', 'ffmpeg-runtime-capabilities.mjs'),
+    join(resourcesPath, 'scripts', 'ffmpeg-runtime-capabilities.mjs')
+  );
+  await cp(
     join(macRoot, 'scripts', 'hair-catalog-package-contract.mjs'),
     join(resourcesPath, 'scripts', 'hair-catalog-package-contract.mjs')
+  );
+  await cp(
+    join(macRoot, 'scripts', 'local-voice-runtime-stop.mjs'),
+    join(resourcesPath, 'scripts', 'local-voice-runtime-stop.mjs')
+  );
+  await cp(
+    join(macRoot, 'scripts', 'sbx-daemon-stop.mjs'),
+    join(resourcesPath, 'scripts', 'sbx-daemon-stop.mjs')
   );
   await copyRequiredFile(thirdPartyNoticesSource, join(resourcesPath, 'THIRD_PARTY_NOTICES.md'));
 

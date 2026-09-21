@@ -214,3 +214,53 @@ describe('SA-102 honest cache with the SDK nested usage shape', () => {
     expect(normalizeUsageLike(usage)?.cachedInputTokens).toBe(3019)
   })
 })
+
+/**
+ * SA-125 DL-125-03. Ollama's native door lets Batshit SET the context size, so
+ * Batshit is now both the reader and the setter. Measured 2026-09-20: sending
+ * `options.num_ctx` made `/api/ps` report 131072 -> 8192 -> 2048 -> 131072.
+ * The loaded reading is therefore stale the moment a request carries num_ctx.
+ */
+describe('SA-125 requested context outranks the loaded reading', () => {
+  const loadedAt = (n: number) => ({
+    source: 'loaded' as const,
+    loadedContextWindow: n,
+    modelId: 'llama3.2:latest'
+  })
+
+  it('budgets against what this request will set, not what is loaded now', () => {
+    const result = resolveEffectiveContextLimit({
+      presetContextWindow: 131072,
+      reading: loadedAt(131072) as any,
+      requestedContextWindow: 8192
+    })
+    // Planning against 131072 would overflow the 8192 window Ollama is about to
+    // reload into, on this very send.
+    expect(result.contextLimit).toBe(8192)
+    expect(result.source).toBe('requested')
+    // Batshit asked for this, so it is not a conflict to warn about.
+    expect(result.mismatch).toBe(false)
+  })
+
+  it('leaves the loaded reading in charge when nothing is requested', () => {
+    const result = resolveEffectiveContextLimit({
+      presetContextWindow: 262144,
+      reading: loadedAt(208384) as any,
+      requestedContextWindow: null
+    })
+    expect(result.contextLimit).toBe(208384)
+    expect(result.source).toBe('loaded')
+    expect(result.mismatch).toBe(true)
+  })
+
+  it('ignores a nonsense requested size rather than budgeting against it', () => {
+    for (const bad of [0, -1, Number.NaN, undefined]) {
+      const result = resolveEffectiveContextLimit({
+        presetContextWindow: 4096,
+        reading: loadedAt(8192) as any,
+        requestedContextWindow: bad as any
+      })
+      expect(result.contextLimit, String(bad)).toBe(8192)
+    }
+  })
+})

@@ -150,7 +150,7 @@
   }
 
   .chat-autocomplete-invocation {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
   }
 
   .chat-autocomplete-plugin,

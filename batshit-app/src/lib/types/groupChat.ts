@@ -66,10 +66,64 @@ export type GroupChatSpeakPolicy =
   | 'quiet'
   | 'only_when_asked'
   | 'topic_only'
+  /** SA-120 P3 (LS-051): "Jev Juice: Smart" — Batshit's judgment model picks the speaker and skips follow-ups that add nothing. */
+  | 'smart'
+
+/** Every accepted `speak_policy` value; the group create/update routes refuse anything else. */
+export const GROUP_CHAT_SPEAK_POLICIES: readonly GroupChatSpeakPolicy[] = Object.freeze([
+  'none',
+  'balanced',
+  'quiet',
+  'only_when_asked',
+  'topic_only',
+  'smart'
+])
+
+export function isGroupChatSpeakPolicy(value: unknown): value is GroupChatSpeakPolicy {
+  return typeof value === 'string' && (GROUP_CHAT_SPEAK_POLICIES as readonly string[]).includes(value)
+}
 
 export interface GroupChatAgentSettings {
   speak_policy?: GroupChatSpeakPolicy
   speak_topics?: string[]
+}
+
+/**
+ * Write-side validation for `agent_settings` on the group create/update routes: a present
+ * `speak_policy` must be one of the accepted presets and `speak_topics`, when present, an
+ * array of strings. The read side treats an unknown stored preset like `balanced` so a send
+ * can never throw on config, but a typo must be refused loudly rather than silently widened
+ * or narrowed (SA-120 P3). Returns a readable error, or `null` when the input is acceptable.
+ */
+export function validateGroupAgentSettingsInput(value: unknown): string | null {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return 'agent_settings must be an object keyed by agent id.'
+  }
+  for (const [agentId, settings] of Object.entries(value as Record<string, unknown>)) {
+    if (settings === null || settings === undefined) continue
+    if (typeof settings !== 'object' || Array.isArray(settings)) {
+      return `agent_settings.${agentId} must be an object.`
+    }
+    const record = settings as Record<string, unknown>
+    if (
+      Object.prototype.hasOwnProperty.call(record, 'speak_policy') &&
+      record.speak_policy !== undefined &&
+      record.speak_policy !== null &&
+      !isGroupChatSpeakPolicy(record.speak_policy)
+    ) {
+      return `agent_settings.${agentId}.speak_policy must be one of: ${GROUP_CHAT_SPEAK_POLICIES.join(', ')}.`
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(record, 'speak_topics') &&
+      record.speak_topics !== undefined &&
+      record.speak_topics !== null &&
+      (!Array.isArray(record.speak_topics) || record.speak_topics.some((topic) => typeof topic !== 'string'))
+    ) {
+      return `agent_settings.${agentId}.speak_topics must be an array of strings.`
+    }
+  }
+  return null
 }
 
 export interface GroupChatZipSettings extends Record<string, any> {

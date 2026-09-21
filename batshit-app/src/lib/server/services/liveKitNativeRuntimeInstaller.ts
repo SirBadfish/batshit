@@ -791,6 +791,8 @@ export async function startNativeLiveKitServerRuntime(options: {
   apiKey: string
   apiSecret: string
   forceRestart?: boolean
+  /** "Stop with Batshit". Omitted means stop, which is today's behavior. */
+  stopOnShutdown?: boolean
 }): Promise<LiveKitNativeServerStartResult> {
   if (isContainerizedRuntime()) {
     throw new Error('Dockerized Batshit starts LiveKit through the runtime add-on operator.')
@@ -882,6 +884,7 @@ export async function startNativeLiveKitServerRuntime(options: {
     engineId: LIVEKIT_NATIVE_SERVER_ENGINE_ID,
     installRoot: status.serverInstallRoot,
     installOwnership: 'batshit-managed',
+    stopOnShutdown: options.stopOnShutdown,
     launch: {
       command: status.serverBinaryPath,
       args: [

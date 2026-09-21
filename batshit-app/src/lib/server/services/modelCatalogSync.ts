@@ -20,6 +20,15 @@ import {
   ZAI_CODING_PLAN_MODELS,
   ZAI_CODING_PLAN_OPENAI_BASE_URL
 } from '$lib/server/constants/zaiCodingPlan'
+import { KIMI_CODE_MODELS, KIMI_CODE_OPENAI_BASE_URL } from '$lib/server/constants/kimiCodePlan'
+import {
+  MINIMAX_TOKEN_PLAN_OPENAI_BASE_URL,
+  MINIMAX_TOKEN_PLAN_TEXT_MODELS
+} from '$lib/server/constants/minimaxTokenPlan'
+import {
+  MIMO_TOKEN_PLAN_MODELS,
+  MIMO_TOKEN_PLAN_OPENAI_BASE_URL
+} from '$lib/server/constants/mimoTokenPlan'
 import { canonicalizeCatalogDeveloperId } from '$lib/utils/catalogDeveloperIdentity'
 
 const GATEWAY_ENDPOINT = 'https://ai-gateway.vercel.sh/v1/models'
@@ -145,8 +154,11 @@ const DIRECT_PROVIDER_IDS = [
   'deepseek',
   'deepinfra',
   'moonshot',
+  'kimi_code',
   'minimax',
+  'minimax_token_plan',
   'mimo',
+  'mimo_token_plan',
   'qwencloud',
   'qwen_token_plan',
   'zai',
@@ -254,6 +266,18 @@ const MANUAL_DIRECT_MODELS: Partial<Record<DirectProviderId, DirectProviderEntry
     { id: 'kimi-k2.6', displayName: 'Kimi K2.6' },
     { id: 'kimi-latest', displayName: 'Kimi Latest' }
   ],
+  kimi_code: KIMI_CODE_MODELS.map((model) => ({
+    ...model,
+    tags: [...model.tags]
+  })),
+  minimax_token_plan: MINIMAX_TOKEN_PLAN_TEXT_MODELS.map((model) => ({
+    ...model,
+    tags: [...model.tags]
+  })),
+  mimo_token_plan: MIMO_TOKEN_PLAN_MODELS.map((model) => ({
+    ...model,
+    tags: [...model.tags]
+  })),
   qwen_token_plan: QWEN_TOKEN_PLAN_TEXT_MODELS.map((model) => ({
     id: model.id,
     developerId: model.developerId,
@@ -825,16 +849,22 @@ function normalizeDeveloperId(value: unknown, fallback: string) {
 }
 
 function mapOpenAICompatibleCatalogModels(
-  provider: 'cerebras' | 'minimax' | 'mimo' | 'qwencloud',
+  provider:
+    | 'cerebras'
+    | 'minimax'
+    | 'minimax_token_plan'
+    | 'mimo'
+    | 'mimo_token_plan'
+    | 'qwencloud',
   models: OpenAICompatibleCatalogModel[]
 ): DirectProviderEntry[] {
   return models
     .map((model) => {
       const id = safeString(model.id).trim()
-      const isAsr =
-        (provider === 'mimo' || provider === 'qwencloud') && /(?:^|[-_])asr(?:$|[-_])/i.test(id)
-      const isTts =
-        (provider === 'mimo' || provider === 'qwencloud') && /(?:^|[-_])tts(?:$|[-_])/i.test(id)
+      const isAudioProvider =
+        provider === 'mimo' || provider === 'mimo_token_plan' || provider === 'qwencloud'
+      const isAsr = isAudioProvider && /(?:^|[-_])asr(?:$|[-_])/i.test(id)
+      const isTts = isAudioProvider && /(?:^|[-_])tts(?:$|[-_])/i.test(id)
       const isAudio = isAsr || isTts
       const tags = Array.from(
         new Set([
@@ -1372,6 +1402,31 @@ async function fetchMiniMaxEntries(options: SourceFetchOptions = {}): Promise<Di
   return mapOpenAICompatibleCatalogModels('minimax', models)
 }
 
+async function fetchMiniMaxTokenPlanEntries(
+  options: SourceFetchOptions = {}
+): Promise<DirectProviderEntry[]> {
+  const curated = MANUAL_DIRECT_MODELS.minimax_token_plan ?? []
+  const apiKey = await getRuntimeEnv('MINIMAX_TOKEN_PLAN_API_KEY')
+  if (!apiKey) return curated
+
+  const baseUrl =
+    (await getRuntimeEnv('MINIMAX_TOKEN_PLAN_API_BASE_URL')) ||
+    MINIMAX_TOKEN_PLAN_OPENAI_BASE_URL
+
+  try {
+    const models = await fetchOpenAICompatibleModels({ baseUrl, apiKey, signal: options.signal })
+    const live = mapOpenAICompatibleCatalogModels('minimax_token_plan', models)
+    if (live.length) return mergeDirectProviderEntries(live, curated)
+  } catch (error) {
+    console.warn(
+      '[catalog] MiniMax Token Plan model list fetch failed; falling back to the docs-backed list:',
+      normalizeError(error)
+    )
+  }
+
+  return curated
+}
+
 async function fetchMimoEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
   const apiKey = await getRuntimeEnv('MIMO_API_KEY')
   if (!apiKey) return []
@@ -1383,6 +1438,31 @@ async function fetchMimoEntries(options: SourceFetchOptions = {}): Promise<Direc
     signal: options.signal
   })
   return mapOpenAICompatibleCatalogModels('mimo', models)
+}
+
+async function fetchMimoTokenPlanEntries(
+  options: SourceFetchOptions = {}
+): Promise<DirectProviderEntry[]> {
+  const curated = MANUAL_DIRECT_MODELS.mimo_token_plan ?? []
+  const apiKey = await getRuntimeEnv('MIMO_TOKEN_PLAN_API_KEY')
+  if (!apiKey) return curated
+
+  const baseUrl =
+    (await getRuntimeEnv('MIMO_TOKEN_PLAN_API_BASE_URL')) ||
+    MIMO_TOKEN_PLAN_OPENAI_BASE_URL
+
+  try {
+    const models = await fetchOpenAICompatibleModels({ baseUrl, apiKey, signal: options.signal })
+    const live = mapOpenAICompatibleCatalogModels('mimo_token_plan', models)
+    if (live.length) return mergeDirectProviderEntries(live, curated)
+  } catch (error) {
+    console.warn(
+      '[catalog] MiMo Token Plan model list fetch failed; falling back to the docs-backed list:',
+      normalizeError(error)
+    )
+  }
+
+  return curated
 }
 
 async function fetchQwenCloudEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -1469,6 +1549,36 @@ async function fetchMoonshotEntries(options: SourceFetchOptions = {}): Promise<D
   }
 
   return MANUAL_DIRECT_MODELS.moonshot ?? []
+}
+
+async function fetchKimiCodeEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
+  const curated = MANUAL_DIRECT_MODELS.kimi_code ?? []
+  const apiKey = await getRuntimeEnv('KIMI_CODE_API_KEY')
+  if (!apiKey) return curated
+
+  const baseUrl = (await getRuntimeEnv('KIMI_CODE_API_BASE_URL')) || KIMI_CODE_OPENAI_BASE_URL
+
+  try {
+    const ids = await fetchOpenAICompatibleModelIds({ baseUrl, apiKey, signal: options.signal })
+    if (ids.length) {
+      return mergeDirectProviderEntries(
+        ids.map((id) => ({
+          id,
+          developerId: 'moonshotai',
+          modelId: id,
+          effectiveId: id
+        })),
+        curated
+      )
+    }
+  } catch (error) {
+    console.warn(
+      '[catalog] Kimi Code model list fetch failed; falling back to the docs-backed list:',
+      normalizeError(error)
+    )
+  }
+
+  return curated
 }
 
 async function fetchZaiEntries(options: SourceFetchOptions = {}): Promise<DirectProviderEntry[]> {
@@ -2194,7 +2304,13 @@ export function _mapBasetenModelsForTest(models: BasetenCatalogModel[]): DirectP
 }
 
 export function _mapOpenAICompatibleCatalogModelsForTest(
-  provider: 'cerebras' | 'minimax' | 'mimo' | 'qwencloud',
+  provider:
+    | 'cerebras'
+    | 'minimax'
+    | 'minimax_token_plan'
+    | 'mimo'
+    | 'mimo_token_plan'
+    | 'qwencloud',
   models: OpenAICompatibleCatalogModel[]
 ): DirectProviderEntry[] {
   return mapOpenAICompatibleCatalogModels(provider, models)
@@ -2595,8 +2711,11 @@ const DIRECT_SOURCE_FETCHERS: Record<
   deepseek: fetchDeepSeekEntries,
   deepinfra: fetchDeepInfraEntries,
   moonshot: fetchMoonshotEntries,
+  kimi_code: fetchKimiCodeEntries,
   minimax: fetchMiniMaxEntries,
+  minimax_token_plan: fetchMiniMaxTokenPlanEntries,
   mimo: fetchMimoEntries,
+  mimo_token_plan: fetchMimoTokenPlanEntries,
   qwencloud: fetchQwenCloudEntries,
   qwen_token_plan: fetchQwenTokenPlanEntries,
   zai: fetchZaiEntries,
@@ -2624,8 +2743,11 @@ const DIRECT_SOURCE_ENV_VARS: Record<DirectProviderId, string[]> = {
   deepseek: ['DEEPSEEK_API_KEY'],
   deepinfra: [],
   moonshot: ['MOONSHOT_API_KEY'],
+  kimi_code: [],
   minimax: ['MINIMAX_API_KEY'],
+  minimax_token_plan: [],
   mimo: ['MIMO_API_KEY'],
+  mimo_token_plan: [],
   qwencloud: ['DASHSCOPE_API_KEY'],
   qwen_token_plan: [],
   zai: ['ZAI_API_KEY'],

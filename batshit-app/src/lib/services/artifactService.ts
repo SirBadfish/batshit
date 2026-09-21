@@ -5,6 +5,7 @@
 import type { Message } from '$lib/stores/messages.svelte'
 import type { ArtifactBrainType, ArtifactModelConfig } from '$lib/types/artifacts'
 import type { IconRef } from '$lib/icons/iconTypes'
+import { ApiCallError } from './redisCore'
 
 export interface ArtifactRow {
   id: string
@@ -77,8 +78,9 @@ export class ArtifactService {
     })
     
     if (!response.ok) {
-      const error = await response.text()
-      throw new Error(`API error: ${error}`)
+      // The server's own sentence, never its raw JSON (the same rule as every store client's
+      // `apiCall`, bug sweep 2026-09-18): Agent Settings shows this message when saving fails.
+      throw new ApiCallError(response.status, await response.text())
     }
     
     return response.json()

@@ -79,6 +79,32 @@ describe('codexSettings override guards', () => {
     expect(legacy.serviceTier).toBe('standard')
   })
 
+  it('migrates retired approval policies onto the current interactive policy', () => {
+    const structured = buildCodexRuntimeSettings({
+      permissionMode: 'agent',
+      model: 'gpt-6-astra',
+      streamingEffect: true,
+      search: true,
+      sandbox: 'workspace-write',
+      approval: 'on-failure' as any,
+      addDirs: [],
+      enableFeatures: [],
+      disableFeatures: [],
+      configOverrides: [],
+      workingDirectoryMode: 'project',
+      unifiedExec: true,
+      historyPersistence: 'none'
+    })
+    const legacy = buildCodexRuntimeSettings({
+      codex_permission_mode: 'agent',
+      codex_model: 'gpt-6-astra',
+      codex_approval: 'untrusted'
+    })
+
+    expect(structured.approval).toBe('on-request')
+    expect(legacy.approval).toBe('on-request')
+  })
+
   it('preserves structured custom working directory settings', () => {
     const settings = buildCodexRuntimeSettings({
       permissionMode: 'chat',

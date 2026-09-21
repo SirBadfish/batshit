@@ -4,7 +4,10 @@ import type { Tool } from 'ai'
 
 import type { MCPGateway } from '$lib/types/database'
 import type { ToolWithName } from './mcpGatewayTypes'
-import { resolveStdioGatewayProcessConfig } from './mcpGatewayStdio'
+import {
+  resolveStdioGatewayProcessConfig,
+  type ResolvedStdioGatewayProcessConfig
+} from './mcpGatewayStdio'
 import { logger } from '$lib/utils/logger'
 
 export interface StdioMCPGatewayHealth {
@@ -24,8 +27,10 @@ export class StdioMCPGatewayClient {
     gateway: MCPGateway
     userId?: string
     projectPath?: string | null
+    /** A launch the caller already resolved, so the process started is exactly the one it named. */
+    resolved?: ResolvedStdioGatewayProcessConfig
   }) {
-    const resolved = await resolveStdioGatewayProcessConfig(params)
+    const resolved = params.resolved ?? (await resolveStdioGatewayProcessConfig(params))
     const transport = new StdioClientTransport({
       command: resolved.command,
       args: resolved.args,
@@ -50,6 +55,8 @@ export class StdioMCPGatewayClient {
     gateway: MCPGateway
     userId?: string
     projectPath?: string | null
+    /** Gateway discovery resolves the launch first, because its saved tool list is keyed on it. */
+    resolved?: ResolvedStdioGatewayProcessConfig
   }): Promise<ToolWithName[]> {
     let mcpClient: MCPClient | undefined
     let timeoutId: ReturnType<typeof setTimeout> | undefined

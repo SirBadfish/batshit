@@ -28,6 +28,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             'batshit:tool_guidance_zip_disabled_prompt',
             'batshit:tool_guidance_memory_prompt',
             'batshit:dm_guidance',
+            'batshit:jev_juice_guidance',
             'batshit:dynamic_mcp_prompt',
             // Legacy keys (kept for backward compatibility)
             'batshit:batshit_primary_system_prompt',
@@ -43,6 +44,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
             'batshit:tool_guidance_zip_disabled_prompt:last_updated',
             'batshit:tool_guidance_memory_prompt:last_updated',
             'batshit:dm_guidance:last_updated',
+            'batshit:jev_juice_guidance:last_updated',
             'batshit:dynamic_mcp_prompt:last_updated',
             'batshit:batshit_primary_system_prompt:last_updated',
             'batshit:primary_system_prompt:last_updated',

@@ -4,9 +4,55 @@ import { spawn } from 'node:child_process'
 import process from 'node:process'
 import path from 'node:path'
 import os from 'node:os'
-import { createHash } from 'node:crypto'
 import { closeSync, mkdirSync, openSync, readFileSync } from 'node:fs'
-import { realpath, stat, writeFile } from 'node:fs/promises'
+import { realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { createSandboxLifecycleGate } from './sandbox-lifecycle-gate.mjs'
+// "Stop with Batshit" for host voice engines: the SAME records and decision the Mac supervisor
+// and the native launcher use, so a runtime several engines share stops only if every one of
+// them says stop, and a pid that now belongs to something else is never killed.
+import {
+  attachLocalRuntimeLaunchRecordFile,
+  decideLocalRuntimeGroupStop,
+  groupLocalRuntimeLaunchRecords,
+  isLocalRuntimeProcessAlive,
+  normalizeLocalRuntimeEndpoint,
+  readLocalRuntimeLaunchRecords,
+  readLocalRuntimeProcessGroup,
+  removeLocalRuntimeLaunchRecord,
+  updateLocalRuntimeLaunchRecord,
+  writeLocalRuntimeLaunchRecordFile
+} from '../../batshit-mac/scripts/local-voice-runtime-stop.mjs'
+// Docker's sbx daemon: recorded when this operator's own call starts it, and stopped when the
+// operator stops with Docker Batshit (BL-61, BL-59), by the same module the Mac app uses.
+import {
+  findSbxOnPath,
+  sbxCallStartedDaemon,
+  stopSbxDaemonIfBatshitStartedIt,
+  writeSbxDaemonRecord
+} from '../../batshit-mac/scripts/sbx-daemon-stop.mjs'
+import { SANDBOX_COMMAND_END_TIMEOUT_MS, newSandboxCommandTag } from './command-end.mjs'
+import {
+  SBX_COMMAND,
+  buildSbxSandboxName,
+  buildSbxSessionMarker,
+  classifySbxFailure,
+  describeSbxFailure,
+  isAbandonedSbxSandbox,
+  isManagedSbxSandboxName,
+  isReusableSbxSandbox,
+  parseSbxSandboxList,
+  sbxCommandEndArgs,
+  sbxCreateArgs,
+  sbxDenyAllNetworkArgs,
+  sbxExecArgs,
+  sbxListArgs,
+  sbxPolicyListArgs,
+  sbxRemoveArgs,
+  sbxSandboxHasWorkspace,
+  sbxStopArgs,
+  sbxVersionArgs,
+  toSbxSandboxPath
+} from './sbx-cli.mjs'
 
 const ROOT = process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT || process.cwd()
 const ENV_FILE = process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE || '.env.docker'
@@ -56,7 +102,18 @@ const MAX_OUTPUT_CHARS = 120_000
 const RUN_TIMEOUT_MS = Number(process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_TIMEOUT_MS || 180_000)
 const MAX_RUN_TIMEOUT_MS = 300_000
 const SANDBOX_NETWORK_POLICY = 'deny'
-const SANDBOX_NAME_PREFIX = 'batshit-'
+// `sbx` may start its background daemon on the first call, and the first sandbox on a
+// computer downloads Docker's shell image (about 460 MB), so these are generous; a create
+// gets the operator's full run ceiling.
+const SBX_TIMEOUT_MS = 60_000
+const SBX_CREATE_TIMEOUT_MS = MAX_RUN_TIMEOUT_MS
+// Reported by /health; `start-docker` restarts an operator that reports less. It is the
+// operator's protocol revision, raised for any change the app or `start-docker` must wait for,
+// not only the sandbox lane.
+const SANDBOX_REVISION = 6
+// F-P5-1: every create and remove of a named sandbox goes through this gate, so a chat's
+// parallel first bash calls share one `create`.
+const sandboxGate = createSandboxLifecycleGate()
 const SANDBOX_CONTAINER_WORKSPACE_ROOT =
   process.env.BATSHIT_SANDBOX_CONTAINER_WORKSPACE_ROOT || '/workspace'
 const SANDBOX_HOST_WORKSPACE_ROOT_RAW =
@@ -73,6 +130,25 @@ const HOST_VOICE_ALLOWED_ROOTS_RAW =
     path.join(HOST_BATSHIT_ROOT, 'voice-profiles')
   ].join(path.delimiter)
 const HOST_VOICE_BLOCKED_COMMANDS = new Set(['bash', 'sh', 'zsh', 'fish'])
+// What this operator started, one launch record per engine (the Mac supervisor's format),
+// in its OWN folder: the Mac supervisor and the native launcher read
+// `~/.batshit/runtime/voice-engines/`, and must never stop what Docker Batshit started, nor
+// this operator what they started. Read afresh on every stop, so a restarted operator still
+// knows what it started.
+const HOST_VOICE_STATE_DIR = path.resolve(
+  expandHomePath(
+    process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_STATE_DIR ||
+      path.join(HOST_BATSHIT_ROOT, 'runtime', 'runtime-addon-operator', 'voice-engines')
+  )
+)
+// The sbx daemon this operator's calls started, beside its voice records and for the same reason:
+// the Mac app and the native launcher never stop what Docker Batshit started, nor it theirs.
+const HOST_SBX_DAEMON_STATE_DIR = path.join(path.dirname(HOST_VOICE_STATE_DIR), 'sbx-daemon')
+const OPERATOR_OWNER = `docker-operator:${ROOT}`
+// The stop needs `ps` process groups and `kill(-pgid)`; on Windows it is not built yet, so the
+// operator does not offer it there and the app keeps "Stop with Batshit" hidden.
+const HOST_VOICE_STOP_SUPPORTED = process.platform !== 'win32'
+const HOST_VOICE_STOP_GRACE_MS = 2_000
 const MAX_HOST_VOICE_REFERENCE_AUDIO_BYTES = 100 * 1024 * 1024
 
 const ADDONS = {
@@ -166,10 +242,14 @@ function appendOutput(current, chunk) {
   return next.length > MAX_OUTPUT_CHARS ? next.slice(0, MAX_OUTPUT_CHARS) : next
 }
 
+// Plain comparisons, not Math.min/Math.max: CodeQL reads only a comparison as the bound on a
+// request's time limit (js/resource-exhaustion, public PR 114).
 function clampRunTimeoutMs(value, fallback = RUN_TIMEOUT_MS) {
   const parsed = Number(value)
-  const candidate = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
-  return Math.min(MAX_RUN_TIMEOUT_MS, Math.max(1_000, Math.floor(candidate)))
+  const candidate = Math.floor(Number.isFinite(parsed) && parsed > 0 ? parsed : fallback)
+  if (candidate > MAX_RUN_TIMEOUT_MS) return MAX_RUN_TIMEOUT_MS
+  if (candidate < 1_000) return 1_000
+  return candidate
 }
 
 function isAuthorized(req) {
@@ -259,6 +339,10 @@ function runDocker(args) {
   })
 }
 
+// A Stop and a timeout end a command the same way (2026-09-18, the app's `commandEnd.ts`): the
+// CLI (SIGTERM, then SIGKILL a second later) and, for a sandbox command, what it started inside
+// the sandbox (`endInside`). `signal` is the app's request: it ends at once on a Stop. The run is
+// over once the CLI's output has closed and that end is done.
 function runCommand(command, args, options = {}) {
   return new Promise((resolve) => {
     const startedAt = Date.now()
@@ -270,11 +354,75 @@ function runCommand(command, args, options = {}) {
     let stdout = ''
     let stderr = ''
     let timedOut = false
+    let stopped = false
+    let settled = false
+    let ending = false
+    let endedInside = true
+    let closed = null
+    let spawnError = null
+
+    const settle = () => {
+      if (settled || !closed || !endedInside) return
+      settled = true
+      clearTimeout(timeout)
+      options.signal?.removeEventListener('abort', onAbort)
+      const { exitCode, signal } = closed
+      resolve({
+        command: [command, ...args].join(' '),
+        ok: !spawnError && exitCode === 0 && !timedOut && !stopped,
+        error: spawnError
+          ? spawnError.message
+          : timedOut
+            ? 'Command timed out.'
+            : stopped
+              ? 'Command was stopped.'
+              : exitCode === 0
+                ? null
+                : stderr.trim() || `Command exited with ${exitCode}.`,
+        stdout,
+        stderr,
+        exitCode,
+        signal,
+        timedOut,
+        ...(stopped ? { stopped: true } : {}),
+        durationMs: Date.now() - startedAt,
+        truncated: stdout.length >= MAX_OUTPUT_CHARS || stderr.length >= MAX_OUTPUT_CHARS
+      })
+    }
+
+    const end = () => {
+      if (ending || settled) return
+      ending = true
+      child.kill('SIGTERM')
+      setTimeout(() => {
+        child.kill('SIGKILL')
+        child.stdout.destroy()
+        child.stderr.destroy()
+      }, 1_000)
+      if (options.endInside) {
+        endedInside = false
+        options
+          .endInside()
+          .catch((error) => console.warn('Ending a command inside its sandbox failed:', error))
+          .finally(() => {
+            endedInside = true
+            settle()
+          })
+      }
+    }
+
     const timeout = setTimeout(() => {
       timedOut = true
-      child.kill('SIGTERM')
-      setTimeout(() => child.kill('SIGKILL'), 1_000).unref()
+      end()
     }, clampRunTimeoutMs(options.timeoutMs))
+
+    const onAbort = () => {
+      if (settled) return
+      stopped = true
+      end()
+    }
+    if (options.signal?.aborted) onAbort()
+    else options.signal?.addEventListener('abort', onAbort, { once: true })
 
     child.stdout.on('data', (chunk) => {
       stdout = appendOutput(stdout, chunk)
@@ -283,38 +431,13 @@ function runCommand(command, args, options = {}) {
       stderr = appendOutput(stderr, chunk)
     })
     child.on('error', (error) => {
-      clearTimeout(timeout)
-      resolve({
-        command: [command, ...args].join(' '),
-        ok: false,
-        error: error.message,
-        stdout,
-        stderr,
-        exitCode: null,
-        signal: null,
-        timedOut,
-        durationMs: Date.now() - startedAt,
-        truncated: stdout.length >= MAX_OUTPUT_CHARS || stderr.length >= MAX_OUTPUT_CHARS
-      })
+      spawnError = error
+      closed ??= { exitCode: null, signal: null }
+      settle()
     })
     child.on('close', (exitCode, signal) => {
-      clearTimeout(timeout)
-      resolve({
-        command: [command, ...args].join(' '),
-        ok: exitCode === 0 && !timedOut,
-        error: timedOut
-          ? 'Command timed out.'
-          : exitCode === 0
-            ? null
-            : stderr.trim() || `Command exited with ${exitCode}.`,
-        stdout,
-        stderr,
-        exitCode,
-        signal,
-        timedOut,
-        durationMs: Date.now() - startedAt,
-        truncated: stdout.length >= MAX_OUTPUT_CHARS || stderr.length >= MAX_OUTPUT_CHARS
-      })
+      closed ??= { exitCode, signal }
+      settle()
     })
   })
 }
@@ -359,6 +482,12 @@ async function resolveVoiceLogPath(value, engineId, roots) {
   const parentReal = await realpath(parent)
   if (!isPathWithinAnyRoot(parentReal, roots)) {
     throw new Error('launch.logPath must stay inside Batshit voice runtime roots.')
+  }
+  // A runtime's output must never land in the operator's own launch records, which decide
+  // what it may stop.
+  const stateDirReal = await realpath(HOST_VOICE_STATE_DIR).catch(() => HOST_VOICE_STATE_DIR)
+  if (isPathWithinRoot(parentReal, stateDirReal) || isPathWithinRoot(raw, HOST_VOICE_STATE_DIR)) {
+    throw new Error('launch.logPath must not be inside the operator\'s own state folder.')
   }
   return raw
 }
@@ -537,151 +666,59 @@ function spawnHostVoiceRuntime(prepared) {
   }
 }
 
-function normalizeSandboxCliKind(raw) {
-  const value = String(raw || '').trim().toLowerCase()
-  if (value === 'sbx') return 'sbx'
-  if (value === 'docker-sandbox' || value === 'docker_sandbox' || value === 'docker sandbox') {
-    return 'docker-sandbox'
+// Every sandbox `sbx` call goes through here; a missing CLI becomes one clear reason, and a call
+// that starts Docker's sbx daemon is recorded, so the operator stops it when it stops (BL-61).
+async function runSbx(args, options = {}) {
+  const callStartedAt = Date.now()
+  const run = await runCommand(SBX_COMMAND, args, options)
+  if (sbxCallStartedDaemon(run.stderr || '', run.stdout || '')) {
+    await writeSbxDaemonRecord(HOST_SBX_DAEMON_STATE_DIR, {
+      launchedBy: OPERATOR_OWNER,
+      callStartedAt,
+      callEndedAt: Date.now(),
+      sbxPath: findSbxOnPath()
+    }).catch((error) => console.warn(`Could not record the sbx daemon this call started: ${error?.message ?? error}`))
   }
-  return null
+  if (run.ok || !/ENOENT/.test(run.error || '')) return run
+  return { ...run, error: `${SBX_COMMAND} is not installed (spawn ${SBX_COMMAND} ENOENT).` }
 }
 
-function orderedSandboxCliCandidates() {
-  const candidates = [
-    { kind: 'sbx', command: 'sbx', versionArgs: ['version'] },
-    { kind: 'docker-sandbox', command: 'docker', versionArgs: ['sandbox', 'version'] }
-  ]
-  const preferred = normalizeSandboxCliKind(process.env.BATSHIT_DOCKER_SANDBOX_CLI)
-  if (!preferred) return candidates
-  return [
-    ...candidates.filter((candidate) => candidate.kind === preferred),
-    ...candidates.filter((candidate) => candidate.kind !== preferred)
-  ]
-}
-
-function buildSandboxCommand(kind, input) {
-  if (kind === 'sbx') {
-    if (input.action === 'version') return { command: 'sbx', args: ['version'] }
-    if (input.action === 'ls') return { command: 'sbx', args: ['ls'] }
-    if (input.action === 'create') {
-      return { command: 'sbx', args: ['create', '--name', input.sandboxName, 'codex', input.workspaceRoot] }
-    }
-    if (input.action === 'rm') {
-      return { command: 'sbx', args: ['rm', '--force', ...input.sandboxNames] }
-    }
-    if (input.action === 'stop') return { command: 'sbx', args: ['stop', ...input.sandboxNames] }
-    if (input.action === 'policy-deny-network') {
-      return { command: 'sbx', args: ['policy', 'deny', 'network', input.sandboxName, '**'] }
-    }
-    if (input.action === 'exec') {
-      return {
-        command: 'sbx',
-        args: [
-          'exec',
-          '--workdir',
-          input.cwd,
-          ...input.envArgs,
-          input.sandboxName,
-          '/bin/bash',
-          '-lc',
-          input.commandText
-        ]
-      }
-    }
-  }
-
-  if (input.action === 'version') return { command: 'docker', args: ['sandbox', 'version'] }
-  if (input.action === 'ls') return { command: 'docker', args: ['sandbox', 'ls'] }
-  if (input.action === 'create') {
-    return {
-      command: 'docker',
-      args: ['sandbox', 'create', '--name', input.sandboxName, 'codex', input.workspaceRoot]
-    }
-  }
-  if (input.action === 'rm') return { command: 'docker', args: ['sandbox', 'rm', ...input.sandboxNames] }
-  if (input.action === 'stop') return { command: 'docker', args: ['sandbox', 'stop', ...input.sandboxNames] }
-  if (input.action === 'policy-deny-network') {
-    return {
-      command: 'docker',
-      args: ['sandbox', 'network', 'proxy', input.sandboxName, '--policy', SANDBOX_NETWORK_POLICY]
-    }
-  }
-  if (input.action === 'exec') {
-    return {
-      command: 'docker',
-      args: [
-        'sandbox',
-        'exec',
-        '--workdir',
-        input.cwd,
-        ...input.envArgs,
-        input.sandboxName,
-        '/bin/bash',
-        '-lc',
-        input.commandText
-      ]
-    }
-  }
-  throw new Error(`Unsupported Docker Sandbox action: ${input.action}`)
-}
-
-async function resolveSandboxCli() {
-  const errors = []
-  for (const candidate of orderedSandboxCliCandidates()) {
-    const run = await runCommand(candidate.command, candidate.versionArgs, { timeoutMs: 5_000 })
-    const message = [run.stdout.trim(), run.stderr.trim()].filter(Boolean).join('\n')
-    if (run.ok) return { ok: true, cli: candidate, version: message || null }
-    errors.push(`${candidate.kind}: ${message || run.error || 'version command failed.'}`)
-  }
-  return {
-    ok: false,
-    reason: errors.join(' | ') || 'Docker Sandbox CLI is unavailable.'
-  }
-}
-
-function parseSandboxList(output) {
-  const lines = String(output || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
+function sbxRunOutput(run) {
+  return [run.stderr, run.stdout, run.ok ? '' : run.error]
+    .map((value) => String(value || '').trim())
     .filter(Boolean)
-  if (lines.length <= 1) return []
-
-  const header = lines[0].split(/\s{2,}/).map((part) => part.trim().toLowerCase())
-  const nameIndex = header.findIndex((part) => part === 'sandbox' || part === 'name')
-  const statusIndex = header.findIndex((part) => part === 'status')
-  const workspaceIndex = header.findIndex((part) => part === 'workspace')
-
-  return lines.slice(1).map((line) => {
-    const parts = line.split(/\s{2,}/).filter(Boolean)
-    return {
-      name: parts[nameIndex >= 0 ? nameIndex : 0] || '',
-      status: String(parts[statusIndex >= 0 ? statusIndex : 2] || '').toLowerCase(),
-      workspace: parts[workspaceIndex >= 0 ? workspaceIndex : parts.length - 1] || ''
-    }
-  })
+    .join('\n')
 }
 
-function isManagedSandboxName(name) {
-  return Boolean(name && name.startsWith(SANDBOX_NAME_PREFIX))
+function describeSbxRunFailure(run, action) {
+  if (run.timedOut) return `${action} timed out.`
+  return describeSbxFailure(sbxRunOutput(run), `${action} failed.`)
 }
 
-function sessionHash(sessionId) {
-  return createHash('sha256').update(String(sessionId || '')).digest('hex').slice(0, 8)
+async function listSandboxes() {
+  const run = await runSbx(sbxListArgs(), { timeoutMs: SBX_TIMEOUT_MS })
+  if (!run.ok) throw new Error(describeSbxRunFailure(run, 'Listing Docker sandboxes'))
+  return parseSbxSandboxList(run.stdout)
 }
 
-function sandboxSessionMarker(sessionId) {
-  return `-s${sessionHash(sessionId)}-`
-}
-
-function buildSandboxName({ userId, workspaceRoot, sessionId }) {
-  const userPrefix = String(userId || 'user')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .slice(0, 20)
-  const workspaceHash = createHash('sha256').update(workspaceRoot).digest('hex').slice(0, 10)
-  const sessionSegment = sessionId ? `s${sessionHash(sessionId)}-` : ''
-  return `${SANDBOX_NAME_PREFIX}${userPrefix || 'user'}-${sessionSegment}${workspaceHash}`
+// `sbx version` works before sign-in, so readiness also lists sandboxes (needs sign-in)
+// and reads the policy (needs the one-time preset).
+async function checkSbxReadiness() {
+  const versionRun = await runSbx(sbxVersionArgs(), { timeoutMs: 10_000 })
+  if (!versionRun.ok) {
+    return { ok: false, version: null, reason: describeSbxRunFailure(versionRun, 'Checking sbx') }
+  }
+  const version = versionRun.stdout.trim() || null
+  try {
+    await listSandboxes()
+  } catch (error) {
+    return { ok: false, version, reason: error instanceof Error ? error.message : String(error) }
+  }
+  const policyRun = await runSbx(sbxPolicyListArgs(), { timeoutMs: SBX_TIMEOUT_MS })
+  if (!policyRun.ok) {
+    return { ok: false, version, reason: describeSbxRunFailure(policyRun, 'Reading the sbx network policy') }
+  }
+  return { ok: true, version }
 }
 
 function isPathWithinRoot(candidate, root) {
@@ -757,88 +794,102 @@ function commandReferencesContainerWorkspace(commandText, containerRoot) {
   return new RegExp(`(^|[^\\w.-])${escaped}(/|$)`).test(commandText)
 }
 
-async function listSandboxes(cli) {
-  const commandSpec = buildSandboxCommand(cli.kind, { action: 'ls' })
-  const run = await runCommand(commandSpec.command, commandSpec.args, { timeoutMs: 15_000 })
-  if (!run.ok) throw new Error(run.stderr.trim() || run.error || 'Failed to list Docker sandboxes.')
-  return parseSandboxList(run.stdout)
+async function removeSandbox(name) {
+  if (!isManagedSbxSandboxName(name)) return null
+  const isGone = (run) => run.ok || classifySbxFailure(sbxRunOutput(run)) === 'not_found'
+  const run = await runSbx(sbxRemoveArgs([name]), { timeoutMs: SBX_TIMEOUT_MS })
+  if (isGone(run)) return null
+  await runSbx(sbxStopArgs([name]), { timeoutMs: SBX_TIMEOUT_MS })
+  const retry = await runSbx(sbxRemoveArgs([name]), { timeoutMs: SBX_TIMEOUT_MS })
+  if (isGone(retry)) return null
+  return describeSbxRunFailure(retry, 'Removing the Docker sandbox')
 }
 
-async function removeSandbox(cli, name) {
-  if (!isManagedSandboxName(name)) return null
-  const commandSpec = buildSandboxCommand(cli.kind, { action: 'rm', sandboxNames: [name] })
-  const run = await runCommand(commandSpec.command, commandSpec.args, { timeoutMs: 30_000 })
-  if (run.ok) return null
-  return run.stderr.trim() || run.stdout.trim() || run.error || 'Failed to remove Docker sandbox.'
+// The prune list is read once up front, so each removal checks again inside the gate: by
+// its turn the sandbox may have been used again.
+async function removeSandboxIfStillAbandoned(name) {
+  try {
+    const current = (await listSandboxes()).find((entry) => entry.name === name)
+    if (!current || !isAbandonedSbxSandbox(current)) return null
+    return await removeSandbox(name)
+  } catch (error) {
+    return error instanceof Error ? error.message : 'Failed to list Docker sandboxes.'
+  }
 }
 
-async function pruneStoppedSandboxes(cli, keepNames = []) {
+// sbx stops an idle sandbox about 30 s after its last command, so a stopped sandbox can
+// belong to a chat that is still running; only one unused for an hour is removed here.
+async function pruneAbandonedSandboxes() {
   const warnings = []
   let entries = []
   try {
-    entries = await listSandboxes(cli)
+    entries = await listSandboxes()
   } catch (error) {
     return [error instanceof Error ? error.message : 'Failed to list Docker sandboxes.']
   }
-  const keep = new Set(keepNames)
   for (const entry of entries) {
-    if (keep.has(entry.name)) continue
-    if (!isManagedSandboxName(entry.name)) continue
-    if (entry.status === 'running') continue
-    const warning = await removeSandbox(cli, entry.name)
-    if (warning) warnings.push(`${entry.name}: ${warning}`)
+    if (!isManagedSbxSandboxName(entry.name) || !isAbandonedSbxSandbox(entry)) continue
+    // A sandbox this operator is creating or using is not abandoned.
+    if (sandboxGate.isBusy(entry.name)) continue
+    const removal = await sandboxGate.removeIfIdle(entry.name, () =>
+      removeSandboxIfStillAbandoned(entry.name)
+    )
+    if (removal.removed && removal.value) warnings.push(`${entry.name}: ${removal.value}`)
   }
   return warnings
 }
 
-async function ensureSandboxReady({ userId, sessionId, workspaceRoot, cwd }) {
-  const resolvedCli = await resolveSandboxCli()
-  if (!resolvedCli.ok) {
-    throw new Error(resolvedCli.reason)
-  }
-  const cli = resolvedCli.cli
+async function prepareSandbox({ userId, sessionId, workspaceRoot, cwd }) {
   const mapping = await resolveWorkspaceMapping({ workspaceRoot, cwd })
-  const sandboxName = buildSandboxName({
+  const sandboxName = buildSbxSandboxName({
     userId,
     workspaceRoot: mapping.hostWorkspaceRoot,
     sessionId
   })
-  const entries = await listSandboxes(cli)
-  const existing = entries.find((entry) => entry.name === sandboxName)
-  const hasWorkspaceMismatch =
-    existing?.workspace && existing.workspace !== '-' && existing.workspace !== mapping.hostWorkspaceRoot
-  if (existing && (existing.status !== 'running' || hasWorkspaceMismatch)) {
-    const warning = await removeSandbox(cli, sandboxName)
-    if (warning) throw new Error(warning)
-  }
+  return { sandboxName, mapping }
+}
 
-  if (!existing || existing.status !== 'running' || hasWorkspaceMismatch) {
-    const createSpec = buildSandboxCommand(cli.kind, {
-      action: 'create',
-      sandboxName,
-      workspaceRoot: mapping.hostWorkspaceRoot
-    })
-    const createRun = await runCommand(createSpec.command, createSpec.args, { timeoutMs: 90_000 })
+// Runs inside `sandboxGate.ensure`, so one call at a time per sandbox name.
+async function startSandbox({ sandboxName, hostWorkspaceRoot }) {
+  const usable = (entry) =>
+    Boolean(entry) && isReusableSbxSandbox(entry) && sbxSandboxHasWorkspace(entry, hostWorkspaceRoot)
+  const existing = (await listSandboxes()).find((entry) => entry.name === sandboxName)
+
+  if (!usable(existing)) {
+    if (existing) {
+      const warning = await removeSandbox(sandboxName)
+      if (warning) throw new Error(`Could not replace the unusable Docker sandbox ${sandboxName}: ${warning}`)
+    }
+    const createRun = await runSbx(
+      sbxCreateArgs({ sandboxName, workspaceRoot: hostWorkspaceRoot }),
+      { timeoutMs: SBX_CREATE_TIMEOUT_MS }
+    )
     if (!createRun.ok) {
-      throw new Error(createRun.stderr.trim() || createRun.error || 'Failed to create Docker sandbox.')
+      // Another process created this sandbox between the list and the create: use it.
+      const createdElsewhere =
+        classifySbxFailure(sbxRunOutput(createRun)) === 'already_exists' &&
+        usable((await listSandboxes()).find((entry) => entry.name === sandboxName))
+      if (!createdElsewhere) throw new Error(describeSbxRunFailure(createRun, 'Creating the Docker sandbox'))
     }
   }
 
-  const policySpec = buildSandboxCommand(cli.kind, {
-    action: 'policy-deny-network',
-    sandboxName
-  })
-  const policyRun = await runCommand(policySpec.command, policySpec.args, { timeoutMs: 15_000 })
+  // Applied on every run: a repeat is a no-op, and it also covers a sandbox created without
+  // the rule. A stopped sandbox needs no start here; `sbx exec` starts it.
+  const policyRun = await runSbx(sbxDenyAllNetworkArgs(sandboxName), { timeoutMs: SBX_TIMEOUT_MS })
   if (!policyRun.ok) {
-    throw new Error(policyRun.stderr.trim() || policyRun.error || 'Failed to apply Docker sandbox network policy.')
+    throw new Error(describeSbxRunFailure(policyRun, 'Blocking network access for the Docker sandbox'))
   }
+}
 
-  return {
-    sandboxName,
-    cli,
-    version: resolvedCli.version,
-    mapping
-  }
+// Concurrent callers for one sandbox share one create.
+async function ensureSandboxReady(prepared) {
+  await sandboxGate.ensure(prepared.sandboxName, () =>
+    startSandbox({
+      sandboxName: prepared.sandboxName,
+      hostWorkspaceRoot: prepared.mapping.hostWorkspaceRoot
+    })
+  )
+  return prepared
 }
 
 async function handleSandboxStatus(req, res) {
@@ -846,50 +897,26 @@ async function handleSandboxStatus(req, res) {
     json(res, 401, { ok: false, error: 'Unauthorized.' })
     return
   }
-  const resolvedCli = await resolveSandboxCli()
   const workspace = {
     containerRoot: SANDBOX_CONTAINER_WORKSPACE_ROOT,
     hostRoot: SANDBOX_HOST_WORKSPACE_ROOT_RAW || null
   }
-  if (!SANDBOX_HOST_WORKSPACE_ROOT_RAW.trim()) {
-    json(res, 200, {
-      ok: true,
-      available: false,
-      supported: true,
-      reason:
-        'Docker Sandbox operator requires BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT or BATSHIT_WORKSPACE_MOUNT so /workspace can map to a real host directory.',
-      policy: SANDBOX_NETWORK_POLICY,
-      cli: null,
-      version: null,
-      driver: 'operator',
-      capabilities: ['status', 'recover', 'execute', 'cleanup'],
-      workspace
-    })
-    return
-  }
-  if (!resolvedCli.ok) {
-    json(res, 200, {
-      ok: true,
-      available: false,
-      supported: true,
-      reason: resolvedCli.reason,
-      policy: SANDBOX_NETWORK_POLICY,
-      cli: null,
-      version: null,
-      driver: 'operator',
-      capabilities: ['status', 'recover', 'execute', 'cleanup'],
-      workspace
-    })
-    return
-  }
+  const readiness = SANDBOX_HOST_WORKSPACE_ROOT_RAW.trim()
+    ? await checkSbxReadiness()
+    : {
+        ok: false,
+        version: null,
+        reason:
+          'Docker Sandbox operator requires BATSHIT_SANDBOX_HOST_WORKSPACE_ROOT or BATSHIT_WORKSPACE_MOUNT so /workspace can map to a real host directory.'
+      }
   json(res, 200, {
     ok: true,
-    available: true,
+    available: readiness.ok,
     supported: true,
-    reason: null,
+    reason: readiness.ok ? null : readiness.reason,
     policy: SANDBOX_NETWORK_POLICY,
-    cli: resolvedCli.cli.kind,
-    version: resolvedCli.version,
+    cli: readiness.version ? 'sbx' : null,
+    version: readiness.version,
     driver: 'operator',
     capabilities: ['status', 'recover', 'execute', 'cleanup'],
     workspace
@@ -904,11 +931,13 @@ async function handleSandboxRecover(req, res) {
   let body
   try {
     body = await readBody(req)
-    const ensured = await ensureSandboxReady({
-      userId: body.userId,
-      workspaceRoot: body.workspaceRoot || SANDBOX_CONTAINER_WORKSPACE_ROOT,
-      cwd: body.cwd || body.workspaceRoot || SANDBOX_CONTAINER_WORKSPACE_ROOT
-    })
+    const ensured = await ensureSandboxReady(
+      await prepareSandbox({
+        userId: body.userId,
+        workspaceRoot: body.workspaceRoot || SANDBOX_CONTAINER_WORKSPACE_ROOT,
+        cwd: body.cwd || body.workspaceRoot || SANDBOX_CONTAINER_WORKSPACE_ROOT
+      })
+    )
     json(res, 200, {
       ok: true,
       success: true,
@@ -917,8 +946,7 @@ async function handleSandboxRecover(req, res) {
       workspaceRoot: body.workspaceRoot || SANDBOX_CONTAINER_WORKSPACE_ROOT,
       mappedWorkspaceRoot: ensured.mapping.hostWorkspaceRoot,
       mappedCwd: ensured.mapping.hostCwd,
-      cli: ensured.cli.kind,
-      version: ensured.version,
+      cli: 'sbx',
       policy: SANDBOX_NETWORK_POLICY
     })
   } catch (error) {
@@ -931,12 +959,40 @@ async function handleSandboxRecover(req, res) {
   }
 }
 
+// A stopped or timed-out command's end inside its sandbox, by its tag (`command-end.mjs`).
+async function endSandboxCommand(sandboxName, tag) {
+  const run = await runSbx(sbxCommandEndArgs({ sandboxName, tag }), {
+    timeoutMs: SANDBOX_COMMAND_END_TIMEOUT_MS
+  })
+  if (run.ok) return
+  // A sandbox removed meanwhile (the chat's run-end cleanup) took everything in it along.
+  if (classifySbxFailure(sbxRunOutput(run)) === 'not_found') return
+  const stillThere = await listSandboxes()
+    .then((entries) => entries.some((entry) => entry.name === sandboxName))
+    .catch(() => true)
+  if (!stillThere) return
+  // JSON.stringify keeps the request's sandbox name and the CLI's output on one log line
+  // (CodeQL js/log-injection, public PR 114).
+  console.warn(
+    `Could not end what a stopped command started in ${JSON.stringify(sandboxName)}: ${JSON.stringify(describeSbxRunFailure(run, `Ending the command (exit ${run.exitCode ?? run.signal})`))}`
+  )
+}
+
 async function handleSandboxExecute(req, res) {
   if (!isAuthorized(req)) {
     json(res, 401, { ok: false, error: 'Unauthorized.' })
     return
   }
+  // The app ends its request at once on a Stop (2026-09-18). The operator used to run its
+  // `sbx exec` on regardless, and sbx passes no signal into the sandbox, so the command ran on
+  // until the chat's run-end cleanup removed the sandbox. `res` closes unfinished when the app
+  // goes; `req`'s own close fires as soon as the body is read.
+  const requestGone = new AbortController()
+  res.on('close', () => {
+    if (!res.writableFinished) requestGone.abort()
+  })
   let body
+  let releaseLease = null
   try {
     body = await readBody(req)
     const commandText = String(body.command || '').trim()
@@ -949,49 +1005,67 @@ async function handleSandboxExecute(req, res) {
       commandReferencesContainerWorkspace(commandText, mapping.containerRoot)
     ) {
       throw new Error(
-        `Docker Sandbox operator maps ${mapping.containerRoot} to ${mapping.hostRoot}; use relative paths or the mapped host path in sandbox commands.`
+        `In Docker Sandbox, ${mapping.containerRoot} is ${toSbxSandboxPath(mapping.hostRoot)}; use relative paths or that path in sandbox commands.`
       )
     }
-    const ensured = await ensureSandboxReady({
+    const prepared = await prepareSandbox({
       userId: body.userId,
       sessionId: body.sessionId,
       workspaceRoot,
       cwd
     })
-    const envArgs = []
-    const envInput = body.env && typeof body.env === 'object' ? body.env : {}
-    for (const [key, value] of Object.entries(envInput)) {
-      if (!key || typeof value !== 'string') continue
-      envArgs.push('--env', `${key}=${value}`)
-    }
-    const execSpec = buildSandboxCommand(ensured.cli.kind, {
-      action: 'exec',
-      sandboxName: ensured.sandboxName,
-      cwd: ensured.mapping.hostCwd,
-      envArgs,
-      commandText
-    })
-    const run = await runCommand(execSpec.command, execSpec.args)
+    // Held until the command returns, so no cleanup removes the sandbox under it.
+    releaseLease = sandboxGate.lease(prepared.sandboxName)
+    // A Stop never cuts a sandbox start in half: the start finishes, and the command never runs.
+    const ensured = await ensureSandboxReady(prepared)
+    const tag = newSandboxCommandTag()
+    const run = requestGone.signal.aborted
+      ? null
+      : await runSbx(
+          sbxExecArgs({
+            sandboxName: ensured.sandboxName,
+            cwd: ensured.mapping.hostCwd,
+            env: body.env && typeof body.env === 'object' ? body.env : {},
+            command: commandText,
+            tag
+          }),
+          {
+            timeoutMs: body.timeoutMs,
+            signal: requestGone.signal,
+            endInside: () => endSandboxCommand(ensured.sandboxName, tag)
+          }
+        )
     const warnings = []
     if (!body.sessionId) {
-      const warning = await removeSandbox(ensured.cli, ensured.sandboxName)
-      if (warning) warnings.push(`${ensured.sandboxName}: ${warning}`)
-      warnings.push(...(await pruneStoppedSandboxes(ensured.cli)))
+      // A one-shot sandbox goes away with its command, unless another one-shot command
+      // for the same workspace still runs in it; that command removes it when it ends.
+      releaseLease()
+      releaseLease = null
+      const removal = await sandboxGate.removeIfIdle(ensured.sandboxName, () =>
+        removeSandbox(ensured.sandboxName)
+      )
+      if (removal.removed && removal.value) warnings.push(`${ensured.sandboxName}: ${removal.value}`)
+      warnings.push(...(await pruneAbandonedSandboxes()))
     }
+    // Nobody is waiting for an answer.
+    if (requestGone.signal.aborted) return
     json(res, 200, {
       ok: true,
       sandboxName: ensured.sandboxName,
       mappedWorkspaceRoot: ensured.mapping.hostWorkspaceRoot,
       mappedCwd: ensured.mapping.hostCwd,
-      cli: ensured.cli.kind,
+      cli: 'sbx',
       warnings,
       run
     })
   } catch (error) {
+    if (requestGone.signal.aborted) return
     json(res, 500, {
       ok: false,
       error: error instanceof Error ? error.message : 'Docker Sandbox execution failed.'
     })
+  } finally {
+    releaseLease?.()
   }
 }
 
@@ -1003,19 +1077,31 @@ async function handleSandboxCleanup(req, res) {
   try {
     const body = await readBody(req)
     const sessionId = String(body.sessionId || '').trim()
-    const resolvedCli = await resolveSandboxCli()
-    if (!resolvedCli.ok) throw new Error(resolvedCli.reason)
+    let entries
+    try {
+      entries = await listSandboxes()
+    } catch (error) {
+      // An sbx that is missing or not set up cannot have made a sandbox for this run.
+      const reason = error instanceof Error ? error.message : String(error)
+      const kind = classifySbxFailure(reason)
+      if (kind === 'not_installed' || kind === 'not_signed_in' || kind === 'network_policy_not_initialized') {
+        json(res, 200, { ok: true, warnings: [] })
+        return
+      }
+      throw error
+    }
     const warnings = []
     if (sessionId) {
-      const entries = await listSandboxes(resolvedCli.cli)
+      const marker = buildSbxSessionMarker(sessionId)
       for (const entry of entries) {
-        if (isManagedSandboxName(entry.name) && entry.name.includes(sandboxSessionMarker(sessionId))) {
-          const warning = await removeSandbox(resolvedCli.cli, entry.name)
-          if (warning) warnings.push(`${entry.name}: ${warning}`)
-        }
+        if (!isManagedSbxSandboxName(entry.name) || !entry.name.includes(marker)) continue
+        // The chat's run is over, so this removal does not wait for a command it started.
+        // It does wait for a create already under way, instead of removing a starting sandbox.
+        const warning = await sandboxGate.remove(entry.name, () => removeSandbox(entry.name))
+        if (warning) warnings.push(`${entry.name}: ${warning}`)
       }
     }
-    warnings.push(...(await pruneStoppedSandboxes(resolvedCli.cli)))
+    warnings.push(...(await pruneAbandonedSandboxes()))
     json(res, 200, { ok: true, warnings })
   } catch (error) {
     json(res, 500, {
@@ -1072,6 +1158,13 @@ async function handleVoiceEngineStart(req, res) {
     const body = await readBody(req)
     const prepared = await prepareHostVoiceLaunch(body)
     const pid = spawnHostVoiceRuntime(prepared)
+    const recordError = pid ? await recordHostVoiceLaunch(prepared, pid, body) : 'the runtime has no pid'
+    if (recordError) {
+      // Started but unrecorded means this operator can never stop it: say so.
+      console.error(
+        `Started host voice engine "${prepared.engineId}" (pid ${pid}) but could not record it, so it cannot be stopped with Batshit: ${recordError}`
+      )
+    }
     json(res, 200, {
       ok: true,
       success: true,
@@ -1081,13 +1174,243 @@ async function handleVoiceEngineStart(req, res) {
       args: prepared.args,
       cwd: prepared.cwd,
       installRoot: prepared.installRoot,
-      logPath: prepared.logPath
+      logPath: prepared.logPath,
+      recorded: !recordError,
+      ...(recordError ? { recordError } : {})
     })
   } catch (error) {
     json(res, 500, {
       ok: false,
       success: false,
       error: error instanceof Error ? error.message : 'Failed to start host voice runtime.'
+    })
+  }
+}
+
+// ---- "Stop with Batshit" for host voice engines (revision 5, 2026-09-18) --------------------
+
+// The launch record for what this operator just started. A record whose process still runs is
+// moved aside, never overwritten (`writeLocalRuntimeLaunchRecordFile`). Answers the error text,
+// or null.
+async function recordHostVoiceLaunch(prepared, pid, body) {
+  const endpoint = normalizeLocalRuntimeEndpoint(body?.endpoint)
+  try {
+    await writeLocalRuntimeLaunchRecordFile(HOST_VOICE_STATE_DIR, {
+      engineId: prepared.engineId,
+      pid,
+      command: prepared.command,
+      args: prepared.args,
+      cwd: prepared.cwd,
+      logPath: prepared.logPath,
+      ...(endpoint ? { endpoint } : {}),
+      ...(typeof body?.stopOnShutdown === 'boolean' ? { stopOnShutdown: body.stopOnShutdown } : {}),
+      launchedAt: new Date().toISOString()
+    })
+    return null
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
+
+function normalizeVoiceStopChoices(value) {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error('engines must be an array.')
+  return value.map((entry) => {
+    if (!entry || typeof entry !== 'object') throw new Error('Each engine must be an object.')
+    return {
+      engineId: normalizeVoiceEngineId(entry.engineId),
+      endpoint: typeof entry.endpoint === 'string' ? entry.endpoint : null,
+      stopOnShutdown: entry.stopOnShutdown !== false
+    }
+  })
+}
+
+// The app names every engine it has. So first tidy: an attach record whose engine is not named,
+// or is named with another endpoint (deleted, or moved to another port), goes, or its "keep
+// running" would hold a shared runtime up with no switch left; an unnamed engine's own launch
+// keeps its record (the process still runs) but loses a saved "keep running": no saved choice
+// means stop. Then the named engines' current choices go into their records (every copy), and
+// an engine that uses a runtime another engine's launch started gets an attach record.
+async function applyVoiceStopChoices(choices) {
+  const named = new Map(choices.map((choice) => [choice.engineId, choice]))
+  for (const record of await readLocalRuntimeLaunchRecords(HOST_VOICE_STATE_DIR)) {
+    if (record.invalid) continue
+    const choice = named.get(record.engineId)
+    try {
+      if (record.startedBy) {
+        const stillUsed =
+          choice &&
+          normalizeLocalRuntimeEndpoint(choice.endpoint) === normalizeLocalRuntimeEndpoint(record.endpoint)
+        if (!stillUsed) await removeLocalRuntimeLaunchRecord(record)
+      } else if (!choice && record.stopOnShutdown === false) {
+        await updateLocalRuntimeLaunchRecord(record, { stopOnShutdown: undefined })
+      }
+    } catch (error) {
+      console.warn(`Could not tidy the launch record of "${record.engineId}": ${error?.message ?? error}`)
+    }
+  }
+
+  const records = await readLocalRuntimeLaunchRecords(HOST_VOICE_STATE_DIR)
+  for (const choice of choices) {
+    const own = records.filter((record) => record.engineId === choice.engineId && !record.invalid)
+    try {
+      for (const record of own) {
+        if (record.stopOnShutdown === choice.stopOnShutdown) continue
+        await updateLocalRuntimeLaunchRecord(record, { stopOnShutdown: choice.stopOnShutdown })
+      }
+      if (choice.endpoint && !own.some((record) => isLocalRuntimeProcessAlive(record.pid))) {
+        await attachLocalRuntimeLaunchRecordFile(HOST_VOICE_STATE_DIR, choice)
+      }
+    } catch (error) {
+      console.warn(`Could not record the choice of "${choice.engineId}": ${error?.message ?? error}`)
+    }
+  }
+}
+
+// Is anything left in this process group?
+function voiceRuntimeGroupAlive(pgid) {
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function terminateVoiceRuntimeGroup(pgid) {
+  try {
+    process.kill(-pgid, 'SIGTERM')
+  } catch (error) {
+    if (error?.code === 'ESRCH') return true
+  }
+  const deadline = Date.now() + HOST_VOICE_STOP_GRACE_MS
+  while (Date.now() < deadline) {
+    if (!voiceRuntimeGroupAlive(pgid)) return true
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  try {
+    process.kill(-pgid, 'SIGKILL')
+  } catch (error) {
+    if (error?.code === 'ESRCH') return true
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  return !voiceRuntimeGroupAlive(pgid)
+}
+
+// The pid-reuse test for this operator's records. Launch args come from the app container, the
+// less trusted side of this boundary, so only paths the operator can vouch for count: the
+// command and cwd it resolved at start, and args that are paths inside its allowed roots (never a
+// root itself). An arg like `/` would otherwise match almost any process that later took the pid.
+function operatorRecordMatchesCommand(record, commandLine, roots) {
+  const candidates = [record.command, record.cwd, ...(Array.isArray(record.args) ? record.args : [])]
+    .filter((value) => typeof value === 'string' && path.isAbsolute(value))
+    .map((value) => path.resolve(value))
+    .filter((value) => isPathWithinAnyRoot(value, roots) && !roots.includes(value))
+  return candidates.some((candidate) => commandLine.includes(candidate))
+}
+
+async function voiceMatchRoots() {
+  const roots = new Set()
+  for (const root of parseAllowedVoiceRoots()) {
+    roots.add(root)
+    roots.add(await realpath(root).catch(() => root))
+  }
+  return [...roots]
+}
+
+// One PROCESS with every record that names it, decided by the shared module. Detached runtimes
+// lead their own process group; the leader's start time against the launch time this operator
+// recorded, then the group's live command lines, are the pid-reuse guard.
+async function stopRecordedVoiceRuntime({ pid, records }, roots) {
+  const alive = isLocalRuntimeProcessAlive(pid)
+  const group = alive ? await readLocalRuntimeProcessGroup(pid) : { commandLines: [], leaderStartedAtMs: null }
+  const decision = decideLocalRuntimeGroupStop({
+    records,
+    alive,
+    commandLines: group ? group.commandLines : null,
+    leaderStartedAtMs: group ? group.leaderStartedAtMs : null,
+    matchesCommand: (record, line) => operatorRecordMatchesCommand(record, line, roots)
+  })
+  for (const record of decision.stale) await removeLocalRuntimeLaunchRecord(record)
+  const live = records.filter((record) => !decision.stale.includes(record))
+  const engineIds = (live.length ? live : records).map((record) => record.engineId)
+
+  if (decision.action === 'drop-records') return null
+  if (decision.action === 'keep-running') return { kind: 'keptRunning', pid, engineIds, reason: decision.reason }
+  if (decision.action === 'refuse' || decision.action === 'unverified') {
+    return { kind: 'notStopped', pid, engineIds, reason: decision.reason }
+  }
+  if (!(await terminateVoiceRuntimeGroup(pid))) {
+    return { kind: 'notStopped', pid, engineIds, reason: 'it did not stop after SIGKILL' }
+  }
+  for (const record of live) await removeLocalRuntimeLaunchRecord(record)
+  return { kind: 'stopped', pid, engineIds }
+}
+
+// Stop what this operator started, as each engine's "Stop with Batshit" choice says (absent
+// means stop). Never anything without a record here: the operator did not start it. The app sends
+// its current choices first; with none (`applyChoices: false`, the operator stopping with Docker
+// Batshit), each record's saved choice decides.
+async function stopRecordedVoiceRuntimes(choices, { applyChoices = true } = {}) {
+  if (applyChoices) await applyVoiceStopChoices(choices)
+  const { groups, unusable } = groupLocalRuntimeLaunchRecords(
+    await readLocalRuntimeLaunchRecords(HOST_VOICE_STATE_DIR)
+  )
+  await Promise.all(
+    unusable.map((record) =>
+      removeLocalRuntimeLaunchRecord(record).catch((error) =>
+        console.warn(`Could not remove the launch record of "${record.engineId}": ${error?.message ?? error}`)
+      )
+    )
+  )
+  // Concurrently, so the whole stop stays inside one SIGTERM grace window.
+  const roots = await voiceMatchRoots()
+  // One process's trouble never stops the rest: it is reported as not stopped.
+  const outcomes = (
+    await Promise.all(
+      groups.map((group) =>
+        stopRecordedVoiceRuntime(group, roots).catch((error) => ({
+          kind: 'notStopped',
+          pid: group.pid,
+          engineIds: group.records.map((record) => record.engineId),
+          reason: `it could not be handled: ${error instanceof Error ? error.message : String(error)}`
+        }))
+      )
+    )
+  ).filter(Boolean)
+  const pick = (kind) => outcomes.filter((outcome) => outcome.kind === kind).map(({ kind: _kind, ...rest }) => rest)
+  return { stopped: pick('stopped'), keptRunning: pick('keptRunning'), notStopped: pick('notStopped') }
+}
+
+async function handleVoiceEngineStop(req, res) {
+  if (!isAuthorized(req)) {
+    json(res, 401, { ok: false, error: 'Unauthorized.' })
+    return
+  }
+  if (!HOST_VOICE_STOP_SUPPORTED) {
+    json(res, 501, { ok: false, error: 'Stopping host voice engines is not supported on Windows yet.' })
+    return
+  }
+
+  let choices
+  try {
+    choices = normalizeVoiceStopChoices((await readBody(req)).engines)
+  } catch (error) {
+    json(res, 400, { ok: false, error: error instanceof Error ? error.message : 'Invalid request body.' })
+    return
+  }
+
+  try {
+    const result = await stopRecordedVoiceRuntimes(choices)
+    for (const outcome of result.notStopped) {
+      console.warn(`Did not stop host voice engine ${outcome.engineIds.join(', ')} (pid ${outcome.pid}): ${outcome.reason}.`)
+    }
+    json(res, 200, { ok: true, success: true, ...result })
+  } catch (error) {
+    json(res, 500, {
+      ok: false,
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to stop host voice engines.'
     })
   }
 }
@@ -1125,7 +1448,25 @@ function handleHealth(req, res) {
     service: 'batshit-runtime-addon-operator',
     controls: ['start', 'stop'],
     sandboxControls: ['status', 'recover', 'execute', 'cleanup'],
-    hostVoiceControls: ['start', 'write-reference-audio'],
+    // `stop` only where it is built (not Windows yet); the app offers "Stop with Batshit" in
+    // Docker only when it is listed and sandboxRevision is 5 or more.
+    hostVoiceControls: HOST_VOICE_STOP_SUPPORTED
+      ? ['start', 'stop', 'write-reference-audio']
+      : ['start', 'write-reference-audio'],
+    // Raised when the operator's protocol changes, so `start-docker` restarts an older
+    // operator that is still running. 2 = sbx only, per-name lifecycle gate, idle sandboxes
+    // reused. 3 = the Windows path rules. 4 = a Stop or timeout ends the command and what it
+    // started inside the sandbox. 5 = the host voice engines it starts are recorded and can be
+    // stopped (`POST /v1/voice-engines/stop`). 6 = it stops with Docker Batshit instead of
+    // running from login forever, and stops the sbx daemon its own call started.
+    sandboxRevision: SANDBOX_REVISION,
+    // How it stops with Docker Batshit (revision 6): `start-docker` restarts an operator whose
+    // login item is not the current one, so an older item (KeepAlive true) never lingers.
+    watch: {
+      enabled: WATCH_ENABLED,
+      launchAgent: LAUNCH_AGENT_PATH || null,
+      startedByOldLoginItem: STARTED_BY_OLD_LOGIN_ITEM
+    },
     cwd: ROOT,
     envFile: ENV_FILE,
     sandboxWorkspace: {
@@ -1133,7 +1474,8 @@ function handleHealth(req, res) {
       hostRoot: SANDBOX_HOST_WORKSPACE_ROOT_RAW || null
     },
     hostVoice: {
-      allowedRoots: parseAllowedVoiceRoots()
+      allowedRoots: parseAllowedVoiceRoots(),
+      stateDir: HOST_VOICE_STATE_DIR
     },
     addons: Object.fromEntries(
       Object.entries(ADDONS).map(([id, addon]) => [
@@ -1152,7 +1494,143 @@ if (TOKENS.length === 0) {
   process.exit(1)
 }
 
+// ---- The operator stops with Docker Batshit (2026-09-21, BL-59) ----------------------------
+//
+// It used to run from login forever (`start-docker` installs a LaunchAgent, which had RunAtLoad and
+// KeepAlive), whether or not Docker Batshit ran, so quitting Batshit could never stop it. Now it
+// asks Docker every minute whether any Docker Batshit that uses it is up: a running, paused, or
+// restarting `app` container whose environment holds this operator's token (any Compose project,
+// any checkout: the token is what makes a container this operator's client).
+// - Docker answered "none" for ten minutes, three checks in a row at least (or Docker is not
+//   installed): Docker Batshit was stopped on purpose. The operator stops what it started (voice
+//   engines as each one's saved choice says, and the sbx daemon its own call started), removes its
+//   login item (`BATSHIT_RUNTIME_ADDON_OPERATOR_LAUNCH_AGENT`; `./start-docker.sh` installs it
+//   again), and exits cleanly, which launchd does not restart (KeepAlive only after a crash).
+// - Docker did not answer (quit, or still starting after a login): it waits, because Docker brings
+//   Docker Batshit back when it starts. Only after an hour does it stop what it started and exit,
+//   keeping its login item, so the next login is covered.
+// A login item written before revision 6 keeps KeepAlive true and names no file to remove: an exit
+// would only restart it, so under one the operator keeps running as it always did until
+// `./start-docker.sh` writes the new item (`/health` reports it, and `start-docker` restarts it).
+// `BATSHIT_RUNTIME_ADDON_OPERATOR_WATCH=0` turns the watch off.
+const OPERATOR_LAUNCHD_LABEL = 'ai.batshit.sandbox-operator'
+const WATCH_INTERVAL_MS = Number(process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_WATCH_MS) || 60_000
+const GONE_AFTER_MS = Number(process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_GONE_AFTER_MS) || 10 * 60_000
+const UNREACHABLE_AFTER_MS = Number(process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_UNREACHABLE_AFTER_MS) || 60 * 60_000
+const STOPPED_ON_PURPOSE_CHECKS = 3
+const LAUNCH_AGENT_PATH = String(process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_LAUNCH_AGENT || '').trim()
+const STARTED_BY_OLD_LOGIN_ITEM = process.env.XPC_SERVICE_NAME === OPERATOR_LAUNCHD_LABEL && !LAUNCH_AGENT_PATH
+const WATCH_ENABLED = process.env.BATSHIT_RUNTIME_ADDON_OPERATOR_WATCH !== '0' && !STARTED_BY_OLD_LOGIN_ITEM
+const OPERATOR_TOKEN_ENV_NAMES = ['BATSHIT_RUNTIME_ADDON_OPERATOR_TOKEN', 'BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN']
+let stoppingWithDockerBatshit = false
+
+// `running`, `stopped` (Docker answered, or is not installed, and no client of this operator is
+// up), or `unreachable` (Docker did not answer).
+async function dockerBatshitState() {
+  const listed = await runCommand(
+    'docker',
+    [
+      'ps',
+      '--filter', 'label=com.docker.compose.service=app',
+      '--filter', 'status=running',
+      '--filter', 'status=paused',
+      '--filter', 'status=restarting',
+      '--format', '{{.ID}}'
+    ],
+    { timeoutMs: 15_000 }
+  )
+  if (!listed.ok) return /ENOENT/.test(listed.error || '') ? 'stopped' : 'unreachable'
+  const ids = listed.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
+  if (!ids.length) return 'stopped'
+  const inspected = await runCommand('docker', ['inspect', '--format', '{{json .Config.Env}}', ...ids], {
+    timeoutMs: 15_000
+  })
+  if (!inspected.ok) return 'unreachable'
+  const holdsOurToken = inspected.stdout.split('\n').some((line) => {
+    let env
+    try {
+      env = JSON.parse(line)
+    } catch {
+      return false
+    }
+    return (
+      Array.isArray(env) &&
+      env.some((entry) => OPERATOR_TOKEN_ENV_NAMES.some((name) => TOKENS.some((token) => entry === `${name}=${token}`)))
+    )
+  })
+  return holdsOurToken ? 'running' : 'stopped'
+}
+
+async function stopBecauseDockerBatshitIsGone({ stoppedOnPurpose }) {
+  // No new work from here on: a request that arrives now would be cut off by the exit.
+  stoppingWithDockerBatshit = true
+  server.close()
+  console.log(
+    stoppedOnPurpose
+      ? 'Docker Batshit has stopped; stopping what this operator started.'
+      : 'Docker has not answered for a long time; stopping what this operator started.'
+  )
+  if (HOST_VOICE_STOP_SUPPORTED) {
+    try {
+      const voice = await stopRecordedVoiceRuntimes([], { applyChoices: false })
+      for (const entry of voice.stopped) console.log(`Stopped voice engine ${entry.engineIds.join(', ')} (pid ${entry.pid}).`)
+      for (const entry of voice.keptRunning) console.log(`Left voice engine ${entry.engineIds.join(', ')} running: ${entry.reason}.`)
+      for (const entry of voice.notStopped) console.log(`Could not stop voice engine ${entry.engineIds.join(', ')}: ${entry.reason}.`)
+    } catch (error) {
+      console.warn(`Voice engines could not be checked: ${error?.message ?? error}`)
+    }
+  }
+  try {
+    const sbx = await stopSbxDaemonIfBatshitStartedIt({
+      stateDir: HOST_SBX_DAEMON_STATE_DIR,
+      owner: OPERATOR_OWNER,
+      ownerIsGone: () => false
+    })
+    if (sbx.action === 'stopped') console.log(`Stopped Docker's sbx daemon (pid ${sbx.pid}), which this operator started.`)
+    else if (sbx.action === 'keep' || sbx.action === 'unverified') console.log(`Left Docker's sbx daemon running: ${sbx.reason}.`)
+  } catch (error) {
+    console.warn(`Docker's sbx daemon could not be checked: ${error?.message ?? error}`)
+  }
+  if (stoppedOnPurpose && LAUNCH_AGENT_PATH) {
+    await rm(LAUNCH_AGENT_PATH, { force: true })
+      .then(() => console.log(`Removed the login item ${LAUNCH_AGENT_PATH}; ./start-docker.sh installs it again.`))
+      .catch((error) => console.warn(`Could not remove the login item ${LAUNCH_AGENT_PATH}: ${error?.message ?? error}`))
+  }
+  process.exit(0)
+}
+
+function watchDockerBatshit() {
+  let lastSeenAt = Date.now()
+  let stoppedChecks = 0
+  let checking = false
+  const timer = setInterval(async () => {
+    if (checking) return
+    checking = true
+    try {
+      const state = await dockerBatshitState()
+      if (state === 'running') {
+        lastSeenAt = Date.now()
+        stoppedChecks = 0
+        return
+      }
+      stoppedChecks = state === 'stopped' ? stoppedChecks + 1 : 0
+      const goneForMs = Date.now() - lastSeenAt
+      const stoppedOnPurpose = stoppedChecks >= STOPPED_ON_PURPOSE_CHECKS && goneForMs >= GONE_AFTER_MS
+      const dockerGaveUp = state === 'unreachable' && goneForMs >= UNREACHABLE_AFTER_MS
+      if (!stoppedOnPurpose && !dockerGaveUp) return
+      clearInterval(timer)
+      await stopBecauseDockerBatshitIsGone({ stoppedOnPurpose })
+    } finally {
+      checking = false
+    }
+  }, WATCH_INTERVAL_MS)
+}
+
 const server = http.createServer(async (req, res) => {
+  if (stoppingWithDockerBatshit) {
+    json(res, 503, { ok: false, error: 'The operator is stopping because Docker Batshit stopped. Run ./start-docker.sh.' })
+    return
+  }
   const url = new URL(req.url || '/', `http://${req.headers.host || `${HOST}:${PORT}`}`)
   if (req.method === 'GET' && url.pathname === '/health') {
     handleHealth(req, res)
@@ -1190,6 +1668,11 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'POST' && url.pathname === '/v1/voice-engines/stop') {
+    await handleVoiceEngineStop(req, res)
+    return
+  }
+
   if (req.method === 'POST' && url.pathname === '/v1/voice-profiles/reference-audio') {
     await handleVoiceReferenceAudioWrite(req, res)
     return
@@ -1200,4 +1683,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`Batshit runtime add-on operator listening on http://${HOST}:${PORT}`)
+  if (STARTED_BY_OLD_LOGIN_ITEM) {
+    console.log('Started by an older login item: running until ./start-docker.sh installs the one that stops with Docker Batshit.')
+  }
+  if (WATCH_ENABLED) watchDockerBatshit()
 })

@@ -48,6 +48,13 @@ A few things to know:
 - There's always a **default folder**, and it can't be deleted. Chats that aren't filed anywhere live there.
 - Folders sort by recent activity, so the chats you're actually using float toward the top.
 - Deleting a folder gives you a choice: **delete the folder only** (its chats move back to the default folder, nothing is lost) or **delete the folder and its chats** (the chats are permanently removed). Batshit asks which one you mean — it never guesses.
+- A chat you delete leaves every Batshit tab you have open at once, not only the one you deleted it from. A tab that was showing it goes to a new, empty chat.
+
+## Deleting a chat that is still replying
+
+You can delete a chat while its agent is still working. Batshit stops the reply first, the way Stop does, and also ends any command the agent is running for that chat. It waits for the reply to wind down, then deletes the chat and everything it stored, so nothing from the stopped reply is left behind. That usually takes less than a second.
+
+If the reply can't be stopped within 30 seconds, Batshit deletes nothing and tells you the reply is still stopping. Try again in a moment. A tab that was showing the chat ends its reply with "Stopped because this chat was deleted."
 
 ## Locking a Session
 

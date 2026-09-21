@@ -28,6 +28,7 @@ Global Voice Settings separates the lanes so they're easy to audit:
 - **Transcribe** — composer dictation and uploaded-audio transcription.
 - **Voice Mode Input** — Mic STT or Text Input for the ChatBar Voice button.
 - **Turn Mode** — Auto Listen or Manual Turn when Direct Voice Mode uses recorded-turn STT.
+- **Jev Juice: Quick Actions** — off by default. With it on, a spoken turn that starts with the wake word and asks Batshit itself for something small ("Yo, stop", "Yo, hang up", "Yo, open the dock", "Yo, open the voice settings") is done at once, without the agent. **Require Wake Word** and **Wake Word** ("Yo" by default) sit under it. See [Jev Juice](../jev-juice/overview.md#quick-actions-from-speech-one-switch-in-voice-settings).
 - **Voice Mode STT** — the listener used by the ChatBar Voice button.
 - **Reply Voice** — the TTS provider used for spoken assistant replies.
 - **Runtime** — Direct Voice Mode or LiveKit Bridge.
@@ -47,7 +48,7 @@ Open Settings -> Voice -> Voice Engines to tune advanced settings for each engin
 - **Text-to-Speech Engines** — TTS prompt guidance plus engine-level speech settings such as speed, volume, language, format, sample rate, chunk length, or other provider-specific controls.
 - **Speech-to-Text Engines** — STT language and provider-specific transcription settings.
 
-These settings belong to the engine itself, not to one agent. If you set Whisper/Deepgram/OpenAI language to English, that setting stays attached to that engine whether you use it globally, on an agent, in Transcribe mode, or after switching away and back.
+These settings belong to the engine itself, not to one agent. If you set Google Gemini/Whisper/Deepgram/OpenAI language to English, that setting stays attached to that engine whether you use it globally, on an agent, in Transcribe mode, or after switching away and back.
 
 ## TTS: speaking replies
 
@@ -56,6 +57,7 @@ TTS plays assistant text as audio. Launch-facing behavior:
 - OpenAI, ElevenLabs, Deepgram, Google/browser-style lanes, Fish Audio, MiniMax, MiMo, Alibaba Cloud, Inworld, Cartesia, Async, StepFun, Azure Speech, and BYO engines appear according to configured provider support and saved keys.
 - Fish Audio and Inworld are the direct realtime TTS paths Batshit currently owns.
 - Other built-in/BYO/local providers should be treated as batch TTS unless Batshit has a proven streaming adapter for that provider.
+- Deepgram offers Aura on Batshit's `/v1/speak` batch path and Flux voices on the separate `/v2/speak` batch path. Flux speed, expressivity, output format, and model-improvement opt-out controls live in Voice Engines. Batshit does not label Flux as realtime TTS until its separate WebSocket lifecycle and interruption path is implemented and proven.
 - TTS model rows show `Batch TTS` or `Realtime TTS` based on Batshit's actual runtime path, not only what a provider's public docs advertise.
 - Voice pickers use built-in static voice lists where the provider has one, and provider APIs where voices are account/workspace-specific. Mistral lists saved Audio Voices when a key is configured, while still allowing a manual `voice_id`.
 
@@ -71,13 +73,17 @@ Fish realtime TTS needs a Fish API key and a selected Fish voice in Voice Settin
 
 Inworld realtime TTS needs an Inworld API key and a selected Inworld voice in Voice Settings. Batshit calls Inworld's realtime TTS endpoint directly and keeps ownership of chat context, tools, Zips, message storage, and playback events. When 3D Goon Lip Sync is set to Rhubarb WASM / the Premium viseme lane, Batshit keeps Inworld's OVR-style phoneme/viseme detail through playback and adapts it to the active Goon's authored mouth profile instead of flattening it early or waiting for Rhubarb WASM analysis.
 
-MiniMax, MiMo, Alibaba Cloud, and StepFun reuse the same saved API key for direct model presets and TTS. Inworld, Cartesia, Async, and Azure Speech are TTS-only rows in Settings -> API Keys; Inworld is TTS-only but supports Batshit-owned direct realtime TTS, while Cartesia, Async, and Azure Speech remain batch TTS lanes in Batshit until direct streaming adapters land. Azure's current Batshit lane is REST batch TTS and regional voice listing; provider viseme/lip-sync events need a future Azure Speech SDK bridge.
+MiniMax, MiMo, Alibaba Cloud, and StepFun reuse their pay-as-you-go saved API key for direct model presets and speech. MiniMax Token Plan and MiMo Token Plan are separate key rows; eligible MiniMax/MiMo speech prefers subscription quota when the plan key is present. Inworld, Cartesia, Async, and Azure Speech are TTS-only rows in Settings -> API Keys; Inworld is TTS-only but supports Batshit-owned direct realtime TTS, while Cartesia, Async, and Azure Speech remain batch TTS lanes in Batshit until direct streaming adapters land. Azure's current Batshit lane is REST batch TTS and regional voice listing; provider viseme/lip-sync events need a future Azure Speech SDK bridge.
 
 ## STT: transcribing audio
 
 Batshit separates normal transcription from phone-style Voice Mode.
 
 **Recorded or uploaded-audio transcription** uses the selected STT provider after the audio is captured. It can use cloud providers or a proven local/BYO engine, and it does not automatically become a continuous realtime microphone lane.
+
+Google Gemini 3.5 Transcribe is available in that recorded lane. It can auto-detect language or use a BCP-47 language hint, and Voice Engines exposes Verbatim/Smart mode, custom vocabulary, speaker diarization, and word timestamps. Smart mode cannot be combined with diarization or word timestamps; custom vocabulary cannot be combined with either. Batshit uploads the recording through Google's Files API, transcribes it through the Interactions API, and deletes the temporary Google file afterward. This does not enable the separate Gemini live-transcription model.
+
+MiMo V2.5 ASR is available in the same recorded/uploaded lane. Batshit converts supported captures to WAV, sends only `mimo-v2.5-asr`, and offers automatic, Chinese, or English recognition; Xiaomi's model also covers major Chinese dialects and Chinese-English code switching. This is not a realtime microphone session.
 
 **Realtime microphone Voice Mode:**
 
@@ -145,7 +151,26 @@ Recommended flow:
 
 For Mac app or source-checkout Batshit, local engines can usually use normal `localhost` URLs. For Docker Batshit, server-side TTS and uploaded-audio STT usually need `http://host.docker.internal:<port>`, while browser-direct realtime STT usually needs a browser-reachable WebSocket like `ws://localhost:<port>`. LiveKit bridge-mode STT starts from the LiveKit sidecar, so the same host service is reached through `host.docker.internal` for that path.
 
+### Start with Batshit and Stop with Batshit
+
+Each local engine Batshit can launch has two switches in Settings → Voice → Voice Engines → Installed Engine Controls:
+
+- **Start with Batshit** launches the engine after the app boots.
+- **Stop with Batshit** stops it when Batshit shuts down. It is **on** by default, so an idle engine stops holding memory (a large Whisper model can hold several gigabytes). Turn it off to keep the engine running all the time, which makes the next start instant because the model stays loaded.
+
+Batshit only ever stops the process it started. It records the process it launched and when, and before stopping anything it checks that the running process is still that one, so an engine you started yourself is never touched. A crash or a force quit cannot stop anything, so an engine can survive that way whatever the switch says.
+
+On macOS 27 and later, an engine left running with **Stop with Batshit** off shows as a light gray dot under Batshit's Dock icon after you quit ("Running in Background"), because Batshit started it. That is expected; the dot goes away when the engine stops.
+
+Some engines share one running program. Several MLX engines, for example, can run on the same shared `mlx_audio.server` on one port. Batshit stops a shared program only if every engine that uses it has **Stop with Batshit** on; if any one of them has it off, the program keeps running for all of them.
+
+Engines you added with **Connect Existing** have no **Stop with Batshit** switch, because Batshit never started them. Their info menu says so.
+
+In Docker, Batshit starts and stops host engines through its helper program on your computer (the host operator that `./start-docker.sh` starts). When the Docker app shuts down, the helper stops the engines whose switch is on. The switch appears once `./start-docker.sh` has updated that helper; until then, and on Windows, where stopping is not available yet, it stays hidden and the info menu says why.
+
 Batshit-managed local engines should keep their own files under `~/.batshit/installs/<engine-id>/`. For Hugging Face-backed engines, Batshit uses a per-engine cache such as `~/.batshit/installs/<engine-id>/hf-home` by default, so deleting that managed engine's local files can remove its downloaded weights too. Reusing an existing shared Hugging Face cache is allowed, but it should be an explicit choice because Batshit will not own or delete that shared folder automatically.
+
+When you delete an engine with **Delete local files too**, Batshit first stops the engine if it started it and it is still running, unless another engine still uses the same running program. If Batshit cannot stop it, it keeps the engine's files and tells you why, so the engine is never left running from a deleted folder.
 
 ## Docker voice boundary
 
@@ -173,7 +198,7 @@ Native Mac/Linux users can install the local LiveKit runtime from:
 Settings → Voice → Voice Engines → Voice Runtimes → LiveKit → Install
 ```
 
-The install button downloads the LiveKit Server version tested with your Batshit build, installs the matching Batshit sidecar under the managed runtime folder, saves local Voice Runtime credentials when needed, and starts both services. If a later Batshit build carries a newer tested runtime, this row shows **Update available** and changes the action to **Update & Restart**. **Start with Batshit** also refreshes stale Batshit-managed sidecar code before auto-start; it does not chase untested upstream releases on its own.
+The install button downloads the LiveKit Server version tested with your Batshit build, installs the matching Batshit sidecar under the managed runtime folder, saves local Voice Runtime credentials when needed, and starts both services. If a later Batshit build carries a newer tested runtime, this row shows **Update available** and changes the action to **Update & Restart**. **Start with Batshit** also refreshes stale Batshit-managed sidecar code before auto-start; it does not chase untested upstream releases on its own. The LiveKit row has its own **Stop with Batshit** switch, on by default, which stops the managed LiveKit server and sidecar when Batshit shuts down. Turn it off to leave both running. In Docker the LiveKit add-on owns its own lifecycle, so that switch does not apply.
 
 Docker users can start the local LiveKit add-on with:
 
