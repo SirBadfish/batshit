@@ -32,6 +32,14 @@ export type EpisodeBoundarySignal =
   | 'nap'
   | 'dreaming'
 
+/**
+ * Who last wrote the open episode's whiteboard (2026-09-19, Josh's call). The agent owns
+ * its board: a nap may only FILL an empty board or refresh one a nap wrote; it never
+ * rewrites a board the agent wrote. Records written before this field existed carry no
+ * author and are treated as agent-written (the conservative reading).
+ */
+export type WhiteboardAuthor = 'agent' | 'nap'
+
 export interface EpisodeRecord {
   id: string
   session_id: string
@@ -50,8 +58,15 @@ export interface EpisodeRecord {
    * to `opened_at`).
    */
   last_activity_at?: string | null
-  whiteboard?: { content: string; updated_at: string } | null
+  whiteboard?: { content: string; updated_at: string; written_by?: WhiteboardAuthor } | null
   schema_version: typeof MEMORY_SCHEMA_VERSION
+}
+
+/** The board's author; an absent field means the agent (records older than the field). */
+export function whiteboardAuthor(
+  whiteboard: { written_by?: WhiteboardAuthor | null } | null | undefined
+): WhiteboardAuthor {
+  return whiteboard?.written_by === 'nap' ? 'nap' : 'agent'
 }
 
 export function episodeKey(sessionId: string, episodeId: string): string {
@@ -152,17 +167,25 @@ export async function updateEpisodeBounds(
   return record
 }
 
-/** The whiteboard lives only on the OPEN episode; closing dissolves it (kept, not compiled). */
+/**
+ * The whiteboard lives only on the OPEN episode; closing dissolves it (kept, not compiled).
+ * Every writer names itself: the agent's control writes `'agent'`, the nap writes `'nap'`,
+ * and the nap checks the author before it writes (see `runFixedSessionNap` step 3).
+ */
 export async function updateEpisodeWhiteboard(
   sessionId: string,
   episodeId: string,
-  content: string | null
+  content: string | null,
+  writtenBy: WhiteboardAuthor
 ): Promise<EpisodeRecord> {
   const record = await requireEpisode(sessionId, episodeId)
   if (record.state !== 'open') {
     throw new Error(`Episode ${episodeId} is ${record.state}; the whiteboard belongs to the open episode.`)
   }
-  record.whiteboard = content === null ? null : { content, updated_at: new Date().toISOString() }
+  record.whiteboard =
+    content === null
+      ? null
+      : { content, updated_at: new Date().toISOString(), written_by: writtenBy }
   await redis.json.set(episodeKey(sessionId, episodeId), '$.whiteboard', record.whiteboard as never)
   return record
 }

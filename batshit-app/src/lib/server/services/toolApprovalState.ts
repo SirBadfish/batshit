@@ -349,6 +349,155 @@ export function analyzeApprovalState(
 }
 
 /* ------------------------------------------------------------------ *
+ * An approval is answered ONCE (bug sweep, 2026-09-18)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The approval ids a click has answered, kept on the card's own message by the server.
+ *
+ * A Fabric card has a consent record that is spent once (`controlApprovals.ts`); a Bash card
+ * has none. Its stored card said `pending` until the resumed run SUCCEEDED, so a resume that
+ * failed after the approved command ran (the next model call failed, or the user pressed Stop
+ * mid-command) brought the buttons back, and a second Approve rebuilt the same continuation:
+ * the AI SDK runs an approved call again unless the last tool message already holds its result.
+ *
+ * send-routed now records every approval a click answers here, under the click's turn lock and
+ * before the resumed run starts (`approvalAnswerRecord.ts`), and refuses a click that names one
+ * of them. The list only grows: `redis.saveMessage` keeps the union of the stored and incoming
+ * lists, because a browser's copy of the message can be older than the server's.
+ */
+export const ANSWERED_APPROVAL_IDS_KEY = 'answeredApprovalIds'
+
+type ApprovalAnswer = { approvalId?: unknown; approved?: unknown }
+
+function trimmedApprovalId(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+export function readAnsweredApprovalIds(metadata: unknown): Set<string> {
+  const raw = (metadata as Record<string, any> | null | undefined)?.[ANSWERED_APPROVAL_IDS_KEY]
+  const ids = new Set<string>()
+  if (!Array.isArray(raw)) return ids
+  for (const value of raw) {
+    const id = trimmedApprovalId(value)
+    if (id) ids.add(id)
+  }
+  return ids
+}
+
+/** The ids in this click that a click already answered, in the click's order. */
+export function findAnsweredApprovalIds(
+  responses: ReadonlyArray<ApprovalAnswer>,
+  answered: ReadonlySet<string>
+): string[] {
+  const found: string[] = []
+  for (const response of responses) {
+    const id = trimmedApprovalId(response?.approvalId)
+    if (id && answered.has(id) && !found.includes(id)) found.push(id)
+  }
+  return found
+}
+
+/**
+ * The card's metadata once this click's answers are recorded: every id joins the answered
+ * list, and each entry it names keeps the decision the resumed run was given (`approved` or
+ * `denied`), marked sent. An expired entry stays expired: its late Approve reached the run as
+ * a denial.
+ */
+export function recordApprovalAnswers(
+  metadata: Record<string, any> | null | undefined,
+  responses: ReadonlyArray<ApprovalAnswer>,
+  decidedAt: string
+): Record<string, any> {
+  const base = metadata && typeof metadata === 'object' ? metadata : {}
+  const answered = readAnsweredApprovalIds(base)
+  const approvedById = new Map<string, boolean>()
+  for (const response of responses) {
+    const id = trimmedApprovalId(response?.approvalId)
+    if (!id) continue
+    answered.add(id)
+    approvedById.set(id, response?.approved === true)
+  }
+
+  const summary =
+    base.toolApprovals && typeof base.toolApprovals === 'object'
+      ? (base.toolApprovals as Record<string, any>)
+      : null
+  const approvals = Array.isArray(summary?.approvals) ? (summary?.approvals as any[]) : null
+  const nextApprovals = approvals?.map((entry) => {
+    const id = trimmedApprovalId(entry?.approvalId)
+    if (!id || !approvedById.has(id)) return entry
+    const status =
+      normalizeApprovalStatus(entry.status) === 'expired'
+        ? 'expired'
+        : approvedById.get(id)
+          ? 'approved'
+          : 'denied'
+    return { ...entry, status, submitted: true, decidedAt }
+  })
+
+  return {
+    ...base,
+    ...(summary && nextApprovals ? { toolApprovals: { ...summary, approvals: nextApprovals } } : {}),
+    [ANSWERED_APPROVAL_IDS_KEY]: Array.from(answered)
+  }
+}
+
+/**
+ * What a message save may do to the server's record of answered approvals.
+ *
+ * `saveMessage` merges metadata shallowly, and every tab saves the messages it shows (at a
+ * reply's end, error, or Stop), from a copy that can predate the click. So the answered list
+ * is the union of the stored and incoming lists, and a card entry an answered id names never
+ * goes back to `pending` while the stored card holds its decision.
+ */
+export function keepAnsweredApprovals(
+  existingMetadata: Record<string, any> | null | undefined,
+  mergedMetadata: Record<string, any>
+): Record<string, any> {
+  const answered = readAnsweredApprovalIds(existingMetadata)
+  if (answered.size === 0) return mergedMetadata
+  for (const id of readAnsweredApprovalIds(mergedMetadata)) answered.add(id)
+
+  const decidedById = new Map<string, Record<string, any>>()
+  const storedApprovals = (existingMetadata as any)?.toolApprovals?.approvals
+  if (Array.isArray(storedApprovals)) {
+    for (const entry of storedApprovals) {
+      const id = trimmedApprovalId(entry?.approvalId)
+      if (id && answered.has(id) && normalizeApprovalStatus(entry?.status) !== 'pending') {
+        decidedById.set(id, entry)
+      }
+    }
+  }
+
+  const summary =
+    mergedMetadata.toolApprovals && typeof mergedMetadata.toolApprovals === 'object'
+      ? (mergedMetadata.toolApprovals as Record<string, any>)
+      : null
+  const approvals = Array.isArray(summary?.approvals) ? (summary?.approvals as any[]) : null
+  let changed = false
+  const nextApprovals = approvals?.map((entry) => {
+    const stored = decidedById.get(trimmedApprovalId(entry?.approvalId))
+    if (!stored || normalizeApprovalStatus(entry?.status) !== 'pending') return entry
+    changed = true
+    return {
+      ...entry,
+      status: stored.status,
+      submitted: true,
+      ...(typeof stored.decidedAt === 'string' ? { decidedAt: stored.decidedAt } : {})
+    }
+  })
+
+  return {
+    ...mergedMetadata,
+    ...(summary && nextApprovals && changed
+      ? { toolApprovals: { ...summary, approvals: nextApprovals } }
+      : {}),
+    [ANSWERED_APPROVAL_IDS_KEY]: Array.from(answered)
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * SA-116 DL-116-07 — a pause that arrives as a tool RESULT
  * ------------------------------------------------------------------ */
 

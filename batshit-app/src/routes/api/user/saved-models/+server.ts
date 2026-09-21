@@ -1,7 +1,7 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
-import { type SavedModel, isTieredPricing, type ModelConnectionInfo, type ImageTransport, type ModelPurpose } from '$lib/types/savedModels'
+import { type SavedModel, type PricingTier, isTieredPricing, type ModelConnectionInfo, type ImageTransport, type ModelPurpose } from '$lib/types/savedModels'
 import { sanitizeId } from '$lib/utils/idSanitizer'
 import { determineModelCompatibility } from '$lib/data/model-compatibility-registry'
 import { ProviderManager, type ModelInfo } from '$lib/server/services/providers'
@@ -145,6 +145,56 @@ function toNumber(value: unknown): number | undefined {
   return undefined
 }
 
+function toPositiveNumber(value: unknown): number | undefined {
+  const parsed = toNumber(value)
+  return parsed !== undefined && parsed > 0 ? parsed : undefined
+}
+
+function isLocalAiConnection(connection: ModelConnectionInfo): boolean {
+  return (
+    connection.type === 'direct' &&
+    (LOCAL_AI_SERVER_IDS as ReadonlySet<string>).has(connection.service ?? '')
+  )
+}
+
+/** The managed Codex CLI and Claude Code CLI connections, which the user's plan pays for. */
+const SUBSCRIPTION_CLI_SERVICES: ReadonlySet<string> = new Set(['openai-codex', 'anthropic-claude-cli'])
+
+function isSubscriptionCliConnection(connection: ModelConnectionInfo): boolean {
+  return SUBSCRIPTION_CLI_SERVICES.has(connection.service ?? '')
+}
+
+/**
+ * BL-67: blank sends nothing, zero is real. A price the payload does not carry stays
+ * ABSENT so the Token Panel says Unknown instead of an exact $0.00. The derived zeros
+ * are the presets whose per-token price really is nothing: a Local AI program on the
+ * user's own machine, and a Codex CLI or Claude Code CLI run that the user's plan covers.
+ */
+function normalizePresetPricing(
+  raw: Partial<SavedModel['pricing']> | null | undefined,
+  realZeroPrice: boolean
+): SavedModel['pricing'] {
+  const pricing: SavedModel['pricing'] = {}
+  const readPrice = (value: unknown) =>
+    isTieredPricing(value as SavedModel['pricing']['input'])
+      ? (value as PricingTier[]).length > 0
+        ? (value as PricingTier[])
+        : undefined
+      : toNumber(value)
+  const input = readPrice(raw?.input)
+  const output = readPrice(raw?.output)
+  const cachedInput = toNumber(raw?.cachedInput)
+  if (input !== undefined) pricing.input = input
+  if (output !== undefined) pricing.output = output
+  if (cachedInput !== undefined) pricing.cachedInput = cachedInput
+  if (realZeroPrice) {
+    pricing.input ??= 0
+    pricing.output ??= 0
+    pricing.cachedInput ??= 0
+  }
+  return pricing
+}
+
 function normalizeImageTransport(value: unknown): ImageTransport | undefined {
   if (value === 'auto' || value === 'url') {
     return value
@@ -263,8 +313,11 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
     effectiveModelId,
     purpose,
     purposeOverride: purposeOverride ?? undefined,
-    contextWindow: toNumber(payload.contextWindow) ?? 0,
-    pricing: payload.pricing ?? { input: 0, output: 0 },
+    contextWindow: toPositiveNumber(payload.contextWindow),
+    pricing: normalizePresetPricing(
+      payload.pricing,
+      isLocalAiConnection(resolvedConnection) || isSubscriptionCliConnection(resolvedConnection)
+    ),
     settings: stripInternalModelSettings(payload.settings) ?? {},
     isVercelImport,
     vercelSourceId,
@@ -299,15 +352,8 @@ async function normaliseSavedModel(payload: SavedModel, manager: ProviderManager
     }
   }
 
-  if (model.pricing) {
-    if (!isTieredPricing(model.pricing.input)) {
-      model.pricing.input = toNumber(model.pricing.input) ?? 0
-    }
-    model.pricing.output = toNumber(model.pricing.output) ?? 0
-    if (model.pricing.cachedInput !== undefined) {
-      model.pricing.cachedInput = toNumber(model.pricing.cachedInput)
-    }
-  }
+  // BL-67: an unknown context window is ABSENT, never 0 (blank sends nothing).
+  if (model.contextWindow === undefined) delete model.contextWindow
 
   model.settings = normaliseModelSettings({
     settings: model.settings ?? undefined,

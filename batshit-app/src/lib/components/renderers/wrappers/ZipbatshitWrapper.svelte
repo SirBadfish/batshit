@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Infinity, Clock, Hand, Lock, Sparkles } from '@lucide/svelte'
+  import { Infinity, Clock, Hand, Lock, Sparkles, Zap } from '@lucide/svelte'
   import BatshitIcon from '$lib/components/icons/BatshitIcon.svelte'
   import { buildZipStatusPresentation } from '$lib/utils/zipStatusPresentation'
 
@@ -13,6 +13,7 @@
     isPermanent = false,
     manualZip = false,
     agentControlled = false,
+    inferredControlled = false,
     aboutToZip = false,
     remainingMessages = undefined,
     autoZip = false,
@@ -39,10 +40,12 @@
     source?: string
     tokens?: number | undefined
     isUnzipped?: boolean
-    expandedReason?: 'buffer' | 'user' | 'agent'
+    expandedReason?: 'buffer' | 'user' | 'agent' | 'inferred'
     isPermanent?: boolean
     manualZip?: boolean
     agentControlled?: boolean
+    /** SA-120 P5: Jev Juice opened it, or zipped it after a reply (`source: 'inferred'`). */
+    inferredControlled?: boolean
     aboutToZip?: boolean
     remainingMessages?: number | null
     autoZip?: boolean
@@ -115,6 +118,7 @@
       manualZip,
       autoZip,
       agentControlled,
+      inferredControlled,
       aboutToZip
     })
   )
@@ -273,6 +277,9 @@
               <Hand class="status-modifier-icon user-zip-control-icon" size={11} strokeWidth={2.2} aria-label="User zip control" />
             {:else if statusPresentation.actor === 'agent'}
               <Sparkles class="status-modifier-icon agent-zip-control-icon" size={10} strokeWidth={2.4} aria-label="Agent zip control" />
+            {:else if statusPresentation.actor === 'inferred'}
+              <!-- The Jev Juice mark (the same icon as its Settings card and its chat note). -->
+              <Zap class="status-modifier-icon inferred-zip-control-icon" size={10} strokeWidth={2.4} aria-label="Unzipped by Jev" />
             {/if}
             {#if isPermanent}
               <Infinity class="h-2.5 w-2.5 ml-0.5 opacity-80" />

@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   writeFileSync
 } from 'node:fs'
 import os from 'node:os'
@@ -542,12 +543,32 @@ async function fetchOperatorHealth(env) {
   }
 }
 
+// Must match `SANDBOX_REVISION` in runtime-addon-operator.mjs. An operator started by an
+// older checkout keeps running its old code until it is restarted.
+const REQUIRED_OPERATOR_SANDBOX_REVISION = 6
+
 function operatorSupportsCurrentRuntimeControls(health) {
   return (
     Array.isArray(health?.hostVoiceControls) &&
     health.hostVoiceControls.includes('start') &&
-    health.hostVoiceControls.includes('write-reference-audio')
+    health.hostVoiceControls.includes('write-reference-audio') &&
+    Number(health?.sandboxRevision) >= REQUIRED_OPERATOR_SANDBOX_REVISION
   )
+}
+
+export function macLaunchAgentPlistPath() {
+  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`)
+}
+
+/**
+ * Can a running operator stay as it is? It must speak the current protocol and, on a Mac, run
+ * from the current login item (BL-59): one started by an older item (KeepAlive true, no file to
+ * remove) would never stop with Docker Batshit, so it is restarted, which rewrites the item.
+ */
+export function operatorIsCurrent(health, { platform = process.platform, plistPath = macLaunchAgentPlistPath() } = {}) {
+  if (!operatorSupportsCurrentRuntimeControls(health)) return false
+  if (platform !== 'darwin') return true
+  return health?.watch?.launchAgent === plistPath
 }
 
 function pathForLaunchd() {
@@ -573,13 +594,13 @@ function xmlEscape(value) {
     .replace(/'/g, '&apos;')
 }
 
-function writeMacLaunchAgentPlist() {
-  const launchAgentsDir = path.join(os.homedir(), 'Library', 'LaunchAgents')
-  mkdirSync(launchAgentsDir, { recursive: true })
-  mkdirSync(path.dirname(LOG_FILE), { recursive: true })
-
-  const plistPath = path.join(launchAgentsDir, `${LAUNCHD_LABEL}.plist`)
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+// The operator's login item. It starts at login (RunAtLoad), so it is ready when Docker restarts
+// Docker Batshit after a restart, and launchd restarts it only after a crash (KeepAlive only on an
+// unsuccessful exit): the operator exits cleanly once Docker Batshit stops, and then removes this
+// file when Docker Batshit was stopped on purpose (BL-59). It used to be KeepAlive true, so it ran
+// from login forever whether or not Docker Batshit did.
+export function renderMacLaunchAgentPlist({ plistPath, projectName = '' }) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -604,11 +625,22 @@ function writeMacLaunchAgentPlist() {
     <string>${xmlEscape(ROOT)}</string>
     <key>BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE</key>
     <string>${xmlEscape(envFilePath)}</string>
+    <key>BATSHIT_RUNTIME_ADDON_OPERATOR_LAUNCH_AGENT</key>
+    <string>${xmlEscape(plistPath)}</string>${
+      projectName
+        ? `
+    <key>COMPOSE_PROJECT_NAME</key>
+    <string>${xmlEscape(projectName)}</string>`
+        : ''
+    }
   </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>StandardOutPath</key>
   <string>${xmlEscape(LOG_FILE)}</string>
   <key>StandardErrorPath</key>
@@ -616,7 +648,14 @@ function writeMacLaunchAgentPlist() {
 </dict>
 </plist>
 `
-  writeFileSync(plistPath, plist)
+}
+
+function writeMacLaunchAgentPlist(projectName = '') {
+  const plistPath = macLaunchAgentPlistPath()
+  mkdirSync(path.dirname(plistPath), { recursive: true })
+  mkdirSync(path.dirname(LOG_FILE), { recursive: true })
+
+  writeFileSync(plistPath, renderMacLaunchAgentPlist({ plistPath, projectName }))
   return plistPath
 }
 
@@ -792,13 +831,13 @@ async function ensureDockerMcpGateway(env) {
   console.log(`Docker MCP Gateway started on port ${port}.`)
 }
 
-function startMacOperator() {
+function startMacOperator(projectName) {
   const uidResult = run('id', ['-u'])
   if (uidResult.status !== 0) {
     throw new Error(uidResult.stderr?.trim() || 'Unable to read current user id.')
   }
   const uid = uidResult.stdout.trim()
-  const plistPath = writeMacLaunchAgentPlist()
+  const plistPath = writeMacLaunchAgentPlist(projectName)
 
   run('launchctl', ['bootout', `gui/${uid}/${LAUNCHD_LABEL}`], { stdio: 'ignore' })
   const bootstrap = run('launchctl', ['bootstrap', `gui/${uid}`, plistPath])
@@ -842,7 +881,7 @@ function stopKnownOperator() {
   }
 }
 
-function startDetachedOperator() {
+function startDetachedOperator(projectName) {
   mkdirSync(path.dirname(LOG_FILE), { recursive: true })
   mkdirSync(path.dirname(PID_FILE), { recursive: true })
   const out = openSync(LOG_FILE, 'a')
@@ -855,7 +894,8 @@ function startDetachedOperator() {
     env: {
       ...process.env,
       BATSHIT_RUNTIME_ADDON_OPERATOR_ROOT: ROOT,
-      BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE: envFilePath
+      BATSHIT_RUNTIME_ADDON_OPERATOR_ENV_FILE: envFilePath,
+      ...(projectName ? { COMPOSE_PROJECT_NAME: projectName } : {})
     },
     stdio: ['ignore', out, err]
   })
@@ -874,7 +914,7 @@ async function waitForOperator(env) {
   return null
 }
 
-async function ensureSandboxOperator(env) {
+async function ensureSandboxOperator(env, projectName = '') {
   const driver = env.get('BATSHIT_NATIVE_DOCKER_SANDBOX_DRIVER') || 'operator'
   if (['disabled', 'disable', 'off', 'none', 'unavailable'].includes(driver)) {
     console.log('Docker Sandbox operator is disabled by .env.docker.')
@@ -894,7 +934,7 @@ async function ensureSandboxOperator(env) {
   }
   if (existing) {
     const health = await fetchOperatorHealth(env)
-    if (operatorSupportsCurrentRuntimeControls(health)) {
+    if (operatorIsCurrent(health)) {
       printOperatorStatus(existing, 'Docker Sandbox operator is already running.')
       return
     }
@@ -903,8 +943,8 @@ async function ensureSandboxOperator(env) {
   }
 
   console.log('Starting Docker Sandbox operator...')
-  if (process.platform === 'darwin') startMacOperator()
-  else startDetachedOperator()
+  if (process.platform === 'darwin') startMacOperator(projectName)
+  else startDetachedOperator(projectName)
 
   const status = await waitForOperator(env)
   if (!status) {
@@ -917,10 +957,12 @@ async function ensureSandboxOperator(env) {
 
 function printOperatorStatus(status, prefix) {
   if (status.available) {
-    console.log(`${prefix} Sandbox CLI: ${status.cli || 'available'}.`)
+    console.log(`${prefix} Docker Sandbox is ready (${status.version || status.cli || 'sbx'}).`)
     return
   }
-  console.warn(`${prefix} Operator is reachable, but Sandbox is unavailable: ${status.reason}`)
+  console.log(prefix)
+  // Batshit still starts; only commands on the Docker Sandbox backend need this.
+  console.warn(`\nDocker Sandbox is not ready yet: ${status.reason}\n`)
 }
 
 function ensureDockerCli() {
@@ -965,7 +1007,7 @@ async function main() {
   for (const note of notes) console.log(note)
 
   if (options.startSandboxOperator) {
-    await ensureSandboxOperator(env)
+    await ensureSandboxOperator(env, options.projectName)
   }
   if (options.startDockerMcpGateway) {
     await ensureDockerMcpGateway(env)
@@ -977,7 +1019,20 @@ async function main() {
   console.log(`Batshit Docker is starting at http://localhost:${appPort}`)
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error))
-  process.exit(1)
-})
+// Run only when started as a program (`./start-docker.sh`), so a test can import the plist renderer.
+// Real paths on both sides: a checkout reached through a symlink (macOS `/tmp` is one) still runs.
+function startedAsProgram() {
+  if (!process.argv[1]) return false
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+}
+
+if (startedAsProgram()) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  })
+}

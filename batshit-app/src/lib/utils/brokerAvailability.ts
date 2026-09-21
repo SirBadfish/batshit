@@ -159,6 +159,12 @@ export interface BrokerAvailabilityInput {
    * an agent with DMs off could build a clock whose alarm it can never hear.
    */
   scheduleControlsEnabled?: boolean
+  /**
+   * SA-120 P2 (DL-120-06): true only for PRIMARY actors whose agent has
+   * `jev_juice_judge_tool` ON. Same shape as memory and DMs, default false: the judgment
+   * tool is opt-in per agent, and a delegated run never receives it.
+   */
+  judgeControlsEnabled?: boolean
 }
 
 /**
@@ -177,6 +183,8 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
   const dmReachable = toggles.batshitToolsEnabled && input.dmControlsEnabled === true
   // SA-115 P2: schedule controls, same rule again.
   const scheduleReachable = toggles.batshitToolsEnabled && input.scheduleControlsEnabled === true
+  // SA-120 P2: the Jev Juice judgment tool, same rule again.
+  const judgeReachable = toggles.batshitToolsEnabled && input.judgeControlsEnabled === true
 
   const families: BrokerToolFamily[] = []
 
@@ -187,7 +195,7 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
     if (toggles.cliToolsEnabled) families.push('cli')
     if (toggles.artifactRuntimeEnabled) families.push('artifact')
     if (toggles.agentBrowserEnabled) families.push('agent_browser')
-    if (toggles.fetchZipEnabled || memoryReachable || dmReachable || scheduleReachable) families.push('fabric')
+    if (toggles.fetchZipEnabled || memoryReachable || dmReachable || scheduleReachable || judgeReachable) families.push('fabric')
     return families
   }
 
@@ -212,7 +220,8 @@ export function resolveBrokerFamilies(input: BrokerAvailabilityInput): BrokerToo
     (toggles.batshitToolsEnabled && allowFabric) ||
     memoryReachable ||
     dmReachable ||
-    scheduleReachable
+    scheduleReachable ||
+    judgeReachable
   ) {
     families.push('fabric')
   }
@@ -272,6 +281,14 @@ export const BROKER_FABRIC_DM_CONTROL_IDS = ['sys.dm.*'] as const
  */
 export const BROKER_FABRIC_SCHEDULE_CONTROL_IDS = ['sys.schedule.*'] as const
 
+/**
+ * SA-120 P2 (DL-120-06): the Jev Juice judgment tool family (`sys.judge.ask`). Same shape
+ * once more: one constant, one boolean, PRIMARY actors only, opened at the same
+ * registration sites and passed explicit `false` from every subagent and Worker scope. A
+ * delegated run never judges through Jev on the user's key; the primary decides for it.
+ */
+export const BROKER_FABRIC_JUDGE_CONTROL_IDS = ['sys.judge.*'] as const
+
 export interface BrokerFabricScopeInput {
   toggles: BrokerToolToggles
   /**
@@ -290,6 +307,8 @@ export interface BrokerFabricScopeInput {
   dmControlsEnabled?: boolean
   /** SA-115 P2: PRIMARY actor + agent `dms_enabled`. Default false (opt-in). */
   scheduleControlsEnabled?: boolean
+  /** SA-120 P2: PRIMARY actor + agent `jev_juice_judge_tool`. Default false (opt-in). */
+  judgeControlsEnabled?: boolean
 }
 
 /**
@@ -336,6 +355,13 @@ export function resolveBrokerFabricAllowedControlIds(input: BrokerFabricScopeInp
   // SA-115 P2: schedule controls, same rule again.
   if (input.toggles.batshitToolsEnabled && input.scheduleControlsEnabled === true) {
     for (const controlId of BROKER_FABRIC_SCHEDULE_CONTROL_IDS) {
+      allowed.add(controlId)
+    }
+  }
+
+  // SA-120 P2: the Jev Juice judgment tool, same rule again.
+  if (input.toggles.batshitToolsEnabled && input.judgeControlsEnabled === true) {
+    for (const controlId of BROKER_FABRIC_JUDGE_CONTROL_IDS) {
       allowed.add(controlId)
     }
   }

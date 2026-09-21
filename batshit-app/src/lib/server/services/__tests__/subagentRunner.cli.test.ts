@@ -200,6 +200,9 @@ describe('executeManagedSubagent - CLI subagents', () => {
       // with no `agent:` record behind it. The marker is what lets the bridge mint a
       // credential for it at all, and what stops that credential acting as an agent.
       delegatedRun: true,
+      // BL-75: the subagent's own id rides to the credential, so its native_skill loads are
+      // checked against its own skills list, not the parent's and not the runtime id's.
+      scopeAgentId: 'builder',
     })
     expect(cliSubagentMocks.codexStreamNativeMode.mock.calls[0]?.[0]?.agentId).toMatch(
       /^subagent_cli_/,
@@ -335,9 +338,10 @@ describe('executeManagedSubagent - CLI subagents', () => {
     expect(
       cliSubagentMocks.claudeStreamNativeMode.mock.calls[0]?.[0]?.claudeSettings?.model,
     ).toBe('claude-sonnet-4-20250514')
-    // SA-117 F-P2-1, the Claude half of the same claim.
+    // SA-117 F-P2-1, the Claude half of the same claim (and BL-75's skill scope).
     expect(cliSubagentMocks.claudeStreamNativeMode.mock.calls[0]?.[0]).toMatchObject({
       delegatedRun: true,
+      scopeAgentId: 'reviewer',
     })
     expect(cliSubagentMocks.claudeStreamNativeMode.mock.calls[0]?.[0]?.agentId).toMatch(
       /^subagent_cli_/,

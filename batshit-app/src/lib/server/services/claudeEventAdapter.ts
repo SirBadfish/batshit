@@ -1,9 +1,10 @@
 import path from 'node:path'
 import type { NativeModeRequest } from './vercelBrain'
-import { extractAndStripToolZipControl } from './toolZipControlNotice'
+import { stripToolZipControl } from './toolZipControlNotice'
 import { stripMcpImageContentBlocks } from './toolResultImageDelivery'
 import { mapBashCommandToMode4Tool } from './bashCommandMapper'
 import { hasSubagentToolSegment } from '$lib/utils/toolNameNormalization'
+import { commandFoundNothing } from '$lib/utils/toolActivityContract'
 import {
   unwrapStructuredToolValue,
   unwrapSubagentToolResult
@@ -17,6 +18,18 @@ import {
  */
 const CLAUDE_NATIVE_DELEGATION_TOOLS = new Set(['agent', 'task'])
 const CLAUDE_NATIVE_DELEGATION_LABEL = 'Claude Code Helper'
+
+/**
+ * The file lanes `normalizeToolName` maps Claude Code's own Read, Write, Edit, and Grep to. Their
+ * shapers read a result's text as a file's content, an edit's diff, or a search's matches. (Bash can
+ * map to these or to a listing or a plain command; it has its own rule.)
+ */
+const CLAUDE_FILE_LANE_TOOL_NAMES = new Set([
+  'batshit_server_read_file',
+  'batshit_server_overwrite_file',
+  'batshit_server_edit_file',
+  'batshit_server_search_files'
+])
 
 export type ClaudeStreamChunk =
   | { type: 'text-delta'; text: string }
@@ -407,6 +420,136 @@ function normalizeToolErrorMessage(rawToolResult: any, fallbackContent?: any): s
   return stripClaudeToolErrorTags(text || 'Tool error')
 }
 
+/**
+ * Claude Code's framing for a Bash call that exited non-zero: the `tool_result` block reads
+ * `Exit code N` and then what the command printed, and the event's `tool_use_result` is the same
+ * text behind `Error: `. The code itself exists nowhere else, so this is where Batshit's one
+ * failure rule (`failedCommandExitCode`, D1) gets a number to read on this lane.
+ */
+const CLAUDE_BASH_EXIT_FRAMING = /^(?:Error:\s*)?Exit code (-?\d+)(?:\r?\n([\s\S]*))?$/
+
+function parseClaudeBashFailure(
+  ...candidates: unknown[]
+): { exitCode: number; output: string } | null {
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue
+    const match = CLAUDE_BASH_EXIT_FRAMING.exec(candidate)
+    if (!match) continue
+    const exitCode = Number.parseInt(match[1], 10)
+    if (!Number.isFinite(exitCode)) continue
+    return { exitCode, output: match[2] ?? '' }
+  }
+  return null
+}
+
+/**
+ * Whether a failed Bash call's block carries Claude's `Exit code N` framing in any form it can come
+ * in (text, or a text-block list). Only a call with no framing at all is a command that never ran.
+ */
+function hasClaudeBashExitFraming(blockContent: unknown): boolean {
+  const text = claudeBlockText(blockContent)
+  return text !== null && CLAUDE_BASH_EXIT_FRAMING.test(text)
+}
+
+/**
+ * Claude Code's framing for an output it will not show in full (Bug C): over 30,000 bytes, the
+ * `tool_result` block becomes `<persisted-output>\nOutput too large (58.9KB). Full output saved to:
+ * <path>\n\nPreview (first 2KB):\n<the first 2 kB>\n...\n</persisted-output>`, followed by anything
+ * Claude adds after it (its `Shell cwd was reset …` note, which is also its `stderr`). A Bash
+ * result's `tool_use_result` still holds the first 30,000 bytes in `stdout`, cut mid-line and at
+ * times inside a character, beside `persistedOutputSize`, the whole output's size. Measured on the
+ * managed lane's 2.1.220 and in 198 transcript records of 2.1.197-2.1.275. A failed call is framed
+ * differently (5,000 characters from each end around Claude's own `... [N characters truncated] ...`
+ * line) and keeps that honest text (D5).
+ */
+const CLAUDE_PERSISTED_OUTPUT_NOTICE =
+  /^<persisted-output>\nOutput too large \([^)\n]*\)\. Full output saved to: [^\n]*\n(?:\nPreview \(first [^)\n]*\):\n([\s\S]*?)\n\.\.\.\n)?<\/persisted-output>/
+
+function claudeBlockText(content: unknown): string | null {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content) || content.length === 0) return null
+  if (!content.every((block) => block?.type === 'text' && typeof block.text === 'string')) return null
+  return content.map((block) => block.text).join('')
+}
+
+/** A cut output keeps only its whole lines: a half line would be a file named after half a name. */
+function claudeWholeLines(text: string): string {
+  const lastNewline = text.lastIndexOf('\n')
+  return lastNewline > 0 ? text.slice(0, lastNewline) : text
+}
+
+function claudeCutOutputLine(keptBytes: number, totalBytes: number | undefined): string {
+  const kept = keptBytes.toLocaleString('en-US')
+  return totalBytes === undefined
+    ? `[Output cut here by Claude Code: only the first ${kept} bytes kept.]`
+    : `[Output cut here by Claude Code: ${kept} of ${totalBytes.toLocaleString('en-US')} bytes kept.]`
+}
+
+/**
+ * The output a persisted-output notice stands for, or null when the block is not that notice. A
+ * lane that stores what the command printed (a read, a write, an edit) gets the whole lines Claude
+ * kept, one line that says the output was cut and how much was kept, and Claude's own trailing note.
+ * A lane that reads `stdout` (a listing, a search, a plain command) gets the whole lines only, since
+ * one more line there would be one more entry or match. With no `stdout` (a result Claude sent
+ * without it) the preview is the text; a Bash result is then given the shape the lanes expect.
+ */
+function parseClaudePersistedOutput(
+  blockContent: unknown,
+  toolUseResult: unknown,
+  isBash: boolean
+): { printedText: string; toolUseResult: Record<string, any> | null } | null {
+  const blockText = claudeBlockText(blockContent)
+  const notice = blockText === null ? null : CLAUDE_PERSISTED_OUTPUT_NOTICE.exec(blockText)
+  if (blockText === null || !notice) return null
+
+  const result =
+    toolUseResult && typeof toolUseResult === 'object' && !Array.isArray(toolUseResult)
+      ? (toolUseResult as Record<string, any>)
+      : null
+  // A result without Claude's persisted fields is a file that only starts with the notice's text.
+  if (result && typeof result.persistedOutputSize !== 'number' && typeof result.persistedOutputPath !== 'string') {
+    return null
+  }
+
+  const totalBytes =
+    typeof result?.persistedOutputSize === 'number' ? result.persistedOutputSize : undefined
+  const stdout = typeof result?.stdout === 'string' && result.stdout.length > 0 ? result.stdout : null
+  const source = stdout ?? notice[1] ?? ''
+  const cut = totalBytes === undefined || Buffer.byteLength(source) < totalBytes
+  const kept = cut ? claudeWholeLines(source) : source
+  const trailer = blockText.slice(notice[0].length)
+  const printedText = cut
+    ? `${kept}${kept ? '\n' : ''}${claudeCutOutputLine(Buffer.byteLength(kept), totalBytes)}${trailer}`
+    : `${kept}${trailer}`
+
+  return {
+    printedText,
+    toolUseResult: result
+      ? { ...result, stdout: kept }
+      : isBash && toolUseResult == null
+        ? { stdout: kept, stderr: '', interrupted: false, isImage: false, noOutputExpected: false }
+        : null
+  }
+}
+
+/**
+ * What a Bash call printed, for the fields that hold a file's content. Claude Code answers a
+ * command with no output with the note `(Bash completed with no output)`; that note is Claude's
+ * own words about the call, never the content of the file the command read or wrote.
+ */
+function bashPrintedText(toolUseResult: any, fallbackContent: any): any {
+  if (toolUseResult && typeof toolUseResult === 'object' && typeof toolUseResult.stdout === 'string') {
+    const printed = [
+      toolUseResult.stdout,
+      typeof toolUseResult.stderr === 'string' ? toolUseResult.stderr : ''
+    ]
+      .filter(Boolean)
+      .join('\n')
+    if (!printed) return ''
+  }
+  return fallbackContent
+}
+
 function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?: any) {
   const isSubagentCall = hasSubagentToolSegment(toolName)
   if (isSubagentCall) {
@@ -428,7 +571,7 @@ function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?:
     const filePath = file?.filePath || toolUseResult.filePath
     return {
       filePath,
-      content: file?.content ?? fallbackContent ?? '',
+      content: file?.content ?? bashPrintedText(toolUseResult, fallbackContent) ?? '',
       lineCount: file?.numLines ?? file?.totalLines
     }
   }
@@ -436,7 +579,7 @@ function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?:
   if (toolName === 'batshit_server_overwrite_file') {
     return {
       filePath: toolUseResult.filePath,
-      content: toolUseResult.content ?? fallbackContent ?? '',
+      content: toolUseResult.content ?? bashPrintedText(toolUseResult, fallbackContent) ?? '',
       structuredPatch: toolUseResult.structuredPatch ?? null
     }
   }
@@ -450,7 +593,7 @@ function buildToolResult(toolName: string, toolUseResult: any, fallbackContent?:
       originalFile: toolUseResult.originalFile,
       oldString: toolUseResult.oldString,
       newString: toolUseResult.newString,
-      content: fallbackContent
+      content: bashPrintedText(toolUseResult, fallbackContent)
     }
   }
 
@@ -840,29 +983,93 @@ export class ClaudeEventAdapter {
   ): ClaudeStreamChunk | null {
     const state = this.toolStates.get(toolId)
     const toolName = state?.toolName ?? state?.originalName ?? 'tool'
+    // Bug C: the notice Claude sends for an output too large to show is its framing, not the output.
+    const persistedOutput = parseClaudePersistedOutput(
+      fallbackContent,
+      rawToolResult,
+      state?.originalName === 'Bash'
+    )
+    if (persistedOutput) {
+      fallbackContent = persistedOutput.printedText
+      rawToolResult = persistedOutput.toolUseResult ?? rawToolResult
+    }
+    /**
+     * F-P6-5 follow-up — a Bash call that exited non-zero.
+     *
+     * Claude Code reports EVERY non-zero exit as an error and keeps the code inside its text
+     * (`Exit code N\n<output>`), so the shapers saw a failure with no exit code and a first line
+     * that is not output: a failed `ls` stored `Exit code 1` and its `ls:` line as two entries,
+     * and a failed edit still claimed it had updated the file. The lane hands them what every
+     * other lane hands them instead — the numeric `exitCode` and the command's own output — and
+     * exit 1 from a search, which is an answer and not a failure (D1,
+     * `commandFoundNothing`), is not stored as an error at all.
+     */
+    const bashCommand = typeof state?.args?.command === 'string' ? state.args.command : undefined
+    const bashFailure =
+      isError && state?.originalName === 'Bash'
+        ? parseClaudeBashFailure(fallbackContent, rawToolResult)
+        : null
+    const foundNothing =
+      bashFailure !== null &&
+      toolName !== 'batshit_server_execute_command' &&
+      commandFoundNothing({ exitCode: bashFailure.exitCode }, bashCommand)
+    const failedToolCall = isError && !foundNothing
+    const errorMessage = failedToolCall
+      ? normalizeToolErrorMessage(rawToolResult, fallbackContent)
+      : undefined
+    /**
+     * A failed call whose text is Claude's words about the call, never output. The result is a
+     * failure whose reason is that text and nothing else, so no shaper stores it as a file's
+     * content, a listing's entries, a search's matches, a command's stdout, or an update.
+     * - Bash (bug sweep item 4): a call with no `Exit code N` framing never ran. Claude Code refused
+     *   it first (a path outside its working directories, a line that needs approval, a sleep it
+     *   will not wait out, a user's rejection, an input it cannot show). The API lane stores a
+     *   command that never started this way (F-P5-1), and a plain command keeps the reason as
+     *   `stderr`.
+     * - Claude Code's own file tools (item 4's sibling): a failed Read, Write, Edit, or Grep read or
+     *   changed nothing ("File does not exist", "String to replace not found in file"). A failed
+     *   Read was stored with the error as the file's content, and a failed Edit as "Updated <path>".
+     *   batshit-server's own file tools answer a failure this way (`{ success: false, error }`).
+     */
+    const failureWithReasonOnly =
+      isError &&
+      (state?.originalName === 'Bash'
+        ? bashFailure === null && !hasClaudeBashExitFraming(fallbackContent)
+        : CLAUDE_FILE_LANE_TOOL_NAMES.has(toolName))
     // SA-105 P3: the symmetric half of the Codex strip. Batshit's own bridge
     // never sends image content to this runtime (Claude Code stores MCP
     // ImageContent as text at 10-20x tokens), but a user-installed MCP server
     // can, and this result becomes an intermediate step, a zip and compiled
     // history. Keyed on block shape, so it holds for any server.
     let result = stripMcpImageContentBlocks(
-      buildToolResult(toolName, rawToolResult, fallbackContent)
+      bashFailure
+        ? buildToolResult(
+            toolName,
+            {
+              stdout: bashFailure.output,
+              stderr: '',
+              interrupted: false,
+              isImage: false,
+              noOutputExpected: false
+            },
+            bashFailure.output
+          )
+        : failureWithReasonOnly
+          ? { success: false, reason: errorMessage }
+          : buildToolResult(toolName, rawToolResult, fallbackContent)
     )
-    const zipControl = extractAndStripToolZipControl(result)
-    if (zipControl.zipId) {
-      result = zipControl.value
-      this.request.registerReservedToolZipId?.({
-        toolCallId: toolId,
-        toolName,
-        zipId: zipControl.zipId
-      })
+    if (bashFailure && result && typeof result === 'object' && !Array.isArray(result)) {
+      result = { ...result, exitCode: bashFailure.exitCode, output: bashFailure.output }
     }
+    // F-P4-9: Batshit announces no zip id to the model, so there is nothing to register
+    // here. A `batshitZipControl` marker can still arrive from a user-installed MCP server,
+    // and it must not reach the stored step.
+    result = stripToolZipControl(result)
     const metadata = this.detectToolMetadata(toolName, state?.args, result)
-    const errorMessage = isError ? normalizeToolErrorMessage(rawToolResult, fallbackContent) : undefined
     const executionTime = state ? Date.now() - state.startTimestamp : undefined
 
     this.intermediateSteps.push({
-      type: isError ? 'tool_error' : 'tool',
+      type: failedToolCall ? 'tool_error' : 'tool',
       toolName,
       originalToolName: state?.originalName ?? toolName,
       toolInput: state?.args ?? {},

@@ -41,6 +41,7 @@ import {
   type BrokerToolToggles
 } from '$lib/utils/brokerAvailability'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import {
   ARTIFACT_TOOL_GRID_GROUP_NAME,
@@ -101,9 +102,35 @@ export interface DynamicMcpIndexGroup {
   note?: string | null
 }
 
+export type DynamicMcpDiscoverableFamily = 'mcp' | 'cli' | 'fabric' | 'artifact'
+
+/**
+ * SA-120 P1: one discoverable capability the agent can reach through the broker, in
+ * the exact typed-ref form `tool_use` accepts. This is the list the Jev Juice skill and
+ * tool hint judges over, so it follows the SAME visibility and allowlist rules the DCM
+ * text and `_find` follow: a hidden tool is not here, and a family the broker would
+ * refuse on this runtime is not here. Unlike the rendered text, it is not collapsed by
+ * the tool-name threshold, and it includes MCP tools already in the runtime tool list
+ * (flagged `enabled`) because a hint may point at either.
+ */
+export interface DynamicMcpDiscoverableRef {
+  ref: string
+  family: DynamicMcpDiscoverableFamily
+  name: string
+  group: string
+  description: string | null
+  hint: string | null
+  /** MCP only: already registered in the agent's runtime tool list (no discovery needed). */
+  enabled: boolean
+}
+
 export interface DynamicMcpIndexResult {
   groups: DynamicMcpIndexGroup[]
   text: string
+  /** SA-120 P1: every typed ref the agent could reach, regardless of how the text collapsed it. */
+  discoverable: DynamicMcpDiscoverableRef[]
+  /** The gateway ids the agent's MCP scope resolved to (`null` when Dynamic MCP is off). */
+  resolvedGatewayIds: string[] | null
   tokenEstimates: {
     enabled: number
     dcm: number
@@ -159,6 +186,8 @@ interface DynamicMcpIndexOptions {
   dmControlsEnabled?: boolean
   /** SA-115 P2 (DL-115-10): explicit value wins; subagent scopes pass false. */
   scheduleControlsEnabled?: boolean
+  /** SA-120 P2 (DL-120-06): explicit value wins; subagent scopes pass false. */
+  judgeControlsEnabled?: boolean
 }
 
 interface WorkingGroup extends DynamicMcpIndexGroup {
@@ -333,6 +362,17 @@ interface BrokerFamilyEntry {
   hint: string | null
 }
 
+const DISCOVERABLE_DESCRIPTION_MAX_CHARS = 200
+
+function normalizeDescription(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const oneLine = value.replace(/\s+/g, ' ').trim()
+  if (!oneLine) return null
+  return oneLine.length > DISCOVERABLE_DESCRIPTION_MAX_CHARS
+    ? `${oneLine.slice(0, DISCOVERABLE_DESCRIPTION_MAX_CHARS - 1).trimEnd()}…`
+    : oneLine
+}
+
 /**
  * Applies the Tool Grid contract to one synthetic-gateway family (Fabric or Artifact).
  *
@@ -492,6 +532,24 @@ async function resolveIndexDmControlsEnabled(
   }
 }
 
+/** SA-120 P2: the judgment-tool twin of `resolveIndexDmControlsEnabled`, same precedence. */
+async function resolveIndexJudgeControlsEnabled(
+  options: DynamicMcpIndexOptions
+): Promise<boolean> {
+  if (typeof options.judgeControlsEnabled === 'boolean') {
+    return options.judgeControlsEnabled
+  }
+  const agentId = options.agentId?.trim()
+  if (!agentId) return false
+  try {
+    const agent = (await redis.get(`agent:${agentId}`)) as Record<string, unknown> | null
+    return resolveAgentJevJudgeToolEnabled(agent)
+  } catch (error) {
+    console.warn('[Dynamic MCP DCM] Failed to resolve Jev Juice judgment-tool enablement:', error)
+    return false
+  }
+}
+
 async function resolveIndexBrokerToggles(
   options: DynamicMcpIndexOptions
 ): Promise<BrokerToolToggles> {
@@ -596,6 +654,7 @@ export async function buildDynamicMcpIndex(
     typeof options.scheduleControlsEnabled === 'boolean'
       ? options.scheduleControlsEnabled
       : dmControlsEnabled
+  const judgeControlsEnabled = await resolveIndexJudgeControlsEnabled(options)
   const brokerFamilies = resolveBrokerFamilies({
     runtime: brokerRuntime,
     toggles: brokerToggles,
@@ -604,7 +663,8 @@ export async function buildDynamicMcpIndex(
     allowFabricControlTools: options.allowFabricControlTools,
     memoryControlsEnabled,
     dmControlsEnabled,
-    scheduleControlsEnabled
+    scheduleControlsEnabled,
+    judgeControlsEnabled
   })
   const fabricReachable = brokerFamilies.includes('fabric')
   const artifactReachable = brokerFamilies.includes('artifact')
@@ -624,6 +684,8 @@ export async function buildDynamicMcpIndex(
     return {
       groups: [],
       text: '',
+      discoverable: [],
+      resolvedGatewayIds: dynamicMcpEnabled ? (enabled.resolvedGateways ?? null) : null,
       tokenEstimates: {
         enabled: enabledTokens,
         dcm: 0,
@@ -659,19 +721,16 @@ export async function buildDynamicMcpIndex(
   }
 
   const groups = new Map<string, WorkingGroup>()
+  const discoverable: DynamicMcpDiscoverableRef[] = []
   let dcmToolCount = 0
   let availableToolCount = 0
 
   if (dynamicMcpEnabled) {
-    for (const [toolName] of Object.entries(allTools)) {
+    for (const [toolName, tool] of Object.entries(allTools)) {
       if (shouldHideInternalMcpTool(toolName)) {
         continue
       }
       availableToolCount += 1
-
-      if (!includeEnabledTools && enabledToolNames.has(toolName)) {
-        continue
-      }
 
       const toolMeta = metadata.get(toolName)
       const gatewayId = toolMeta?.gatewayId || UNKNOWN_GATEWAY
@@ -688,6 +747,22 @@ export async function buildDynamicMcpIndex(
       })
 
       if (!visibility.isToolDiscoverable) {
+        continue
+      }
+
+      // SA-120 P1: the discoverable list follows discoverability, not the DCM listing —
+      // an enabled tool is skipped from the text below but is still a valid hint target.
+      discoverable.push({
+        ref: `mcp:${toolName}`,
+        family: 'mcp',
+        name: toolName,
+        group: baseGroupName,
+        description: normalizeDescription((tool as any)?.description),
+        hint: getSchemaHintText(buildSchemaSummary(extractSchema(tool), schemaHintCaps)) || null,
+        enabled: enabledToolNames.has(toolName)
+      })
+
+      if (!includeEnabledTools && enabledToolNames.has(toolName)) {
         continue
       }
 
@@ -783,6 +858,18 @@ export async function buildDynamicMcpIndex(
 
         if (toolVisibility === 'hidden') continue
 
+        discoverable.push({
+          ref: `cli:${record.toolId}`,
+          family: 'cli',
+          name: record.toolId,
+          group: CLI_TOOL_GRID_GROUP_NAME,
+          description: normalizeDescription(
+            [record.title, record.description].filter(Boolean).join(' — ')
+          ),
+          hint: buildCliFieldSummary((record as Record<string, any>).inputSchema) || null,
+          enabled: false
+        })
+
         cliGroup.toolCount += 1
         dcmToolCount += 1
 
@@ -811,7 +898,8 @@ export async function buildDynamicMcpIndex(
         allowFabricControlTools: options.allowFabricControlTools,
         memoryControlsEnabled,
         dmControlsEnabled,
-        scheduleControlsEnabled
+        scheduleControlsEnabled,
+        judgeControlsEnabled
       })
     : []
   const fabricControls = fabricReachable
@@ -859,6 +947,22 @@ export async function buildDynamicMcpIndex(
     if (fabricGroup) {
       dcmToolCount += fabricGroup.toolCount
       groups.set(buildCompositeKey(FABRIC_TOOL_GRID_ID, FABRIC_TOOL_GRID_GROUP_NAME), fabricGroup)
+      // Same per-entry visibility the group applied: hidden controls never become hints.
+      const visibleNames = new Set(
+        (fabricGroup.tools ?? entries.map((entry) => ({ name: entry.name }))).map((tool) => tool.name)
+      )
+      for (const entry of entries) {
+        if (fabricGroup.tools && !visibleNames.has(entry.name)) continue
+        discoverable.push({
+          ref: `fabric:${entry.name}`,
+          family: 'fabric',
+          name: entry.name,
+          group: FABRIC_TOOL_GRID_GROUP_NAME,
+          description: null,
+          hint: entry.hint,
+          enabled: false
+        })
+      }
     }
   }
 
@@ -908,6 +1012,21 @@ export async function buildDynamicMcpIndex(
         buildCompositeKey(ARTIFACT_TOOL_GRID_ID, ARTIFACT_TOOL_GRID_GROUP_NAME),
         artifactGroup
       )
+      const visibleNames = new Set(
+        (artifactGroup.tools ?? entries.map((entry) => ({ name: entry.name }))).map((tool) => tool.name)
+      )
+      for (const entry of entries) {
+        if (artifactGroup.tools && !visibleNames.has(entry.name)) continue
+        discoverable.push({
+          ref: `artifact:${entry.name}`,
+          family: 'artifact',
+          name: entry.name,
+          group: ARTIFACT_TOOL_GRID_GROUP_NAME,
+          description: null,
+          hint: entry.hint,
+          enabled: false
+        })
+      }
     }
   }
 
@@ -979,6 +1098,8 @@ export async function buildDynamicMcpIndex(
   return {
     groups: resultGroups,
     text: dcmText,
+    discoverable: discoverable.sort((left, right) => left.ref.localeCompare(right.ref)),
+    resolvedGatewayIds: dynamicMcpEnabled ? (enabled.resolvedGateways ?? null) : null,
     tokenEstimates: {
       enabled: enabledTokens,
       dcm: dcmTokens,

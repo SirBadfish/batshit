@@ -1,12 +1,22 @@
 <script lang="ts">
   import * as Sheet from '$lib/components/ui/sheet'
   import { Button } from '$lib/components/ui/button'
-  import { CircleStop, RefreshCcw, Trash2 } from '@lucide/svelte'
+  import { CircleStop, RefreshCcw, Trash2, Zap } from '@lucide/svelte'
   import { dmSenderLabel } from '$lib/utils/dmSender'
   import { dmSenderIcon } from '$lib/utils/dmSenderIcons'
   import * as sessionStore from '$lib/stores/session.svelte'
   import { onUserChannelEvent } from '$lib/services/userChannel'
   import { hydrateDmInboxCounts } from '$lib/stores/dmInbox.svelte'
+  import {
+    UNTRUSTED_TEXT_BADGE_TEXT,
+    UNTRUSTED_TEXT_DRAWER_TOLD_TEXT,
+    jevJuiceNoteDetail,
+    jevJuiceNoteText,
+    readUntrustedTextScreen,
+    untrustedTextFlagDetail,
+    untrustedTextSkippedNote
+  } from '$lib/utils/jevJuice'
+  import JevJuiceFlagBlock from './JevJuiceFlagBlock.svelte'
   import type {
     DmDeliveryRecord,
     DmKind,
@@ -57,6 +67,12 @@
     callbackStatus: string | null
     hasResult: boolean
     runningSessionId: string | null
+    /**
+     * SA-120 P7: what the Jev Juice incoming-text screen stored on this DM, as the route sent
+     * it. Read ONLY through `readUntrustedTextScreen`, which draws a flag or a skipped note and
+     * answers `null` for "no flag": a missing flag proves nothing, so it is never a badge.
+     */
+    screen?: unknown
   }
 
   type AgentRow = {
@@ -364,6 +380,7 @@
         <ul class="dm-drawer-list">
           {#each visibleRows as row (row.id)}
             {@const SenderIcon = dmSenderIcon(row.from)}
+            {@const rowScreen = readUntrustedTextScreen(row.screen)}
             <li class="dm-drawer-row">
               <button
                 type="button"
@@ -395,6 +412,25 @@
               </button>
 
               <div class="dm-drawer-row-delivery">
+                {#if rowScreen?.status === 'flagged'}
+                  <span
+                    class={`batshit-settings-status-badge dm-drawer-flag-badge ${rowScreen.severity === 'serious' ? 'is-serious' : 'is-warning'}`}
+                    title={untrustedTextFlagDetail(rowScreen, UNTRUSTED_TEXT_DRAWER_TOLD_TEXT)}
+                    data-testid="jev-juice-dm-flag"
+                  >
+                    <Zap class="dm-drawer-badge-icon" aria-hidden="true" />
+                    {UNTRUSTED_TEXT_BADGE_TEXT}
+                  </span>
+                {:else if rowScreen?.status === 'skipped'}
+                  <span
+                    class="batshit-settings-status-badge"
+                    title={jevJuiceNoteDetail(untrustedTextSkippedNote(rowScreen))}
+                    data-testid="jev-juice-dm-screen-skipped"
+                  >
+                    <Zap class="dm-drawer-badge-icon" aria-hidden="true" />
+                    {jevJuiceNoteText(untrustedTextSkippedNote(rowScreen))}
+                  </span>
+                {/if}
                 {#if row.delivery.needsUser}
                   <span
                     class="batshit-settings-status-badge is-warning"
@@ -445,6 +481,15 @@
                   {#if detailLoading}
                     <p class="dm-drawer-empty">Loading…</p>
                   {:else if detail}
+                    {#if rowScreen?.status === 'flagged'}
+                      <div class="dm-drawer-flag">
+                        <JevJuiceFlagBlock
+                          view={rowScreen}
+                          closing={UNTRUSTED_TEXT_DRAWER_TOLD_TEXT}
+                          testId="jev-juice-dm-flag-detail"
+                        />
+                      </div>
+                    {/if}
                     <p class="dm-drawer-body-text">{detail.body}</p>
                     {#if detail.requestedOutcome}
                       <p class="dm-drawer-field">
@@ -769,6 +814,27 @@
     flex: 0 0 auto;
     color: var(--muted-foreground);
     font-weight: 500;
+  }
+
+  /* SA-120 P7: the Jev Juice flag. Same amber as `batshit-settings-status-badge.is-warning`;
+     the serious tone uses the danger tokens this drawer already falls back on. */
+  :global(.dm-drawer-badge-icon) {
+    width: 11px;
+    height: 11px;
+    flex: 0 0 auto;
+  }
+
+  /* The serious tone. `is-danger` reads the Settings sheet's tokens, which this drawer does not
+     have, so it uses the app-wide destructive token with the Approve card's own recipe
+     (`.message-approval-risk.is-restricted`). The caution tone is the shared `is-warning` amber. */
+  .dm-drawer-flag-badge.is-serious {
+    border-color: oklch(from var(--destructive) l c h / 0.45);
+    background: oklch(from var(--destructive) l c h / 0.12);
+    color: var(--destructive);
+  }
+
+  .dm-drawer-flag {
+    margin: 0 0 10px;
   }
 
   .dm-drawer-actions {

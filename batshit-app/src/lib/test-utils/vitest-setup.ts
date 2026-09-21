@@ -401,6 +401,19 @@ vi.mock('$lib/server/redis', async () => {
 
       return messages.filter(Boolean)
     }),
+    getAllMessages: vi.fn(async (sessionId: string) => {
+      const messageIds = await redisMock.lRange(`messages:${sessionId}`, 0, -1)
+      const messages = await Promise.all(
+        messageIds.map((messageId) => redisJsonMock.get(`message:${sessionId}:${messageId}`))
+      )
+      return messages.filter(Boolean)
+    }),
+    getSessionMessages: vi.fn(async (sessionId: string) =>
+      redisMock.getRecentMessages(sessionId, 1000)
+    ),
+    getAllSessionMessages: vi.fn(async (sessionId: string) =>
+      redisMock.getAllMessages(sessionId)
+    ),
     /**
      * SA-116 P3: the fake had NO `updateMessage`, so every caller of it threw
      * "is not a function" — and a caller that (correctly) catches its own persistence

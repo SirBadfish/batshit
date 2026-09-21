@@ -361,6 +361,43 @@ test('shutdown completion JSON is published atomically without temp residue', as
   assert.deepEqual(await readdir(root), ['shutdown-complete.json']);
 });
 
+test('a stop step that throws never skips Redis or the final sweep', async () => {
+  // Bug sweep (2026-09-18): the concurrent group ran under `Promise.all`, so one throw there
+  // skipped Redis's clean shutdown and the sweep that proves nothing managed survived.
+  const events = [];
+  const operation = (name, value) => async () => {
+    events.push(name);
+    return value;
+  };
+  const throwing = (name) => async () => {
+    events.push(name);
+    throw new Error(`${name} broke`);
+  };
+
+  const results = await executeOrderedRuntimeStop({
+    monitor: throwing('monitor'),
+    batshitApp: operation('app', { ok: true }),
+    localRuntimes: throwing('local'),
+    mcpProxy: operation('mcp', { ok: true }),
+    batshitServer: throwing('server'),
+    dockerMcpGateway: operation('gateway', { ok: true }),
+    sbxDaemon: throwing('sbx'),
+    redis: operation('redis', { ok: true }),
+    sweep: throwing('sweep')
+  });
+
+  for (const step of ['monitor', 'app', 'local', 'mcp', 'server', 'gateway', 'sbx', 'redis', 'sweep']) {
+    assert.ok(events.includes(step), `${step} ran`);
+  }
+  assert.ok(events.indexOf('redis') > events.indexOf('server'));
+  assert.deepEqual(results.monitor, { ok: false, error: 'monitor broke' });
+  assert.deepEqual(results.localRuntimes, [{ ok: false, error: 'local broke' }]);
+  assert.deepEqual(results.batshitServer, { ok: false, error: 'server broke' });
+  assert.deepEqual(results.sbxDaemon, { ok: false, error: 'sbx broke' });
+  assert.deepEqual(results.redis, { ok: true });
+  assert.deepEqual(results.sweep, { issues: ['The final sweep failed: sweep broke'] });
+});
+
 test('stop ordering keeps monitor and app first, Redis last, and sweep final', async () => {
   const events = [];
   const operation = (name, value, delay = 0) => async () => {
@@ -377,6 +414,7 @@ test('stop ordering keeps monitor and app first, Redis last, and sweep final', a
     mcpProxy: operation('mcp', { ok: true }, 5),
     batshitServer: operation('server', { ok: true }, 2),
     dockerMcpGateway: operation('gateway', { ok: true }, 1),
+    sbxDaemon: operation('sbx', { action: 'none' }, 30),
     redis: operation('redis', { ok: true }),
     sweep: operation('sweep', { issues: [] })
   });
@@ -386,6 +424,11 @@ test('stop ordering keeps monitor and app first, Redis last, and sweep final', a
     assert.ok(events.indexOf('app:end') < events.indexOf(`${service}:start`));
     assert.ok(events.indexOf(`${service}:end`) < events.indexOf('redis:start'));
   }
+  // Docker's sbx daemon is stopped only after the app, whose calls could start another sandbox,
+  // and a slow `sbx` never holds up Redis's clean shutdown.
+  assert.ok(events.indexOf('app:end') < events.indexOf('sbx:start'));
+  assert.ok(events.indexOf('redis:end') < events.indexOf('sbx:end'));
+  assert.deepEqual(results.sbxDaemon, { action: 'none' });
   assert.ok(events.indexOf('redis:end') < events.indexOf('sweep:start'));
   assert.deepEqual(results.localRuntimes, []);
 });

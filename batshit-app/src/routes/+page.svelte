@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/state'
+  import { readApprovalResumeStart, isNewApprovalResume, approvalResumeStartPatch } from '$lib/utils/approvalResumeStream'
   import { goto } from '$app/navigation'
   import ChatArea from '$lib/components/chat/ChatArea.svelte'
   import ChatInput from '$lib/components/chat/ChatInput.svelte'
@@ -44,8 +45,9 @@
   import { ProjectService } from '$lib/services/projects'
   import { SessionService } from '$lib/services/sessions'
   import { artifactService } from '$lib/services/artifactService'
-  import { onMount, onDestroy, tick } from 'svelte'
+  import { onMount, onDestroy, tick, untrack } from 'svelte'
   import { toast } from 'svelte-sonner'
+  import { QUICK_ACTION_EVENT, type QuickActionMark } from '$lib/utils/jevJuiceQuickActions'
   import * as savedModelsStore from '$lib/stores/savedModels.svelte'
   import * as projectStore from '$lib/stores/projects.svelte'
   import {
@@ -148,6 +150,8 @@
     shouldShowReasoningByDefaultForPrimaryAgent
   } from '$lib/utils/primaryAgentType'
   import { setUserSettings, getUserSettings } from '$lib/stores/userSettings.svelte'
+  import { waitForReplyTarget, waitUntilReplyIsOver } from '$lib/utils/replyEndWait'
+  import { postSendRouted } from '$lib/services/sendRoutedClient'
   import {
     classifySteerRefusal,
     isSteerDeliver,
@@ -166,6 +170,10 @@
     type StopInterruptionRecord
   } from '$lib/utils/steerControl'
   import * as steerInbox from '$lib/stores/steerInbox.svelte'
+  import {
+    forgetJevJuicePostTurnRecords,
+    refreshJevJuicePostTurnRecords
+  } from '$lib/stores/jevJuicePostTurn.svelte'
   import { stripGatewayPrefix } from '$lib/utils/toolNameFormatter'
   import { THINKING_INDICATOR, isThinkingIndicator } from '$lib/utils/thinkingIndicator'
   import { normalizeId } from '$lib/utils/idNormalizer'
@@ -178,6 +186,7 @@
     summarizeContextUsage,
     summarizeRunningCost
   } from '$lib/utils/tokenPanel'
+  import { createContextPreviewGate } from '$lib/utils/contextPreviewGate'
   import {
     applyContextCompactionToMessages,
     calculateCompactedTokens,
@@ -193,6 +202,7 @@
   import { sessionOriginIcon } from '$lib/utils/sessionOriginIcons'
   import { onUserChannelEvent } from '$lib/services/userChannel'
   import { buildSessionMessagesForSend } from '$lib/utils/sessionSendMessages'
+  import { createChatLoadQueue, watchSelectedSessionLoad } from '$lib/utils/selectedSessionLoad.svelte'
   import {
     hasInterruptibleActiveResponse,
     INTERRUPTED_SEND_RETRY_DELAYS_MS,
@@ -363,6 +373,57 @@
     // to, so nothing here knows when it finished. The user channel says so; refetch the
     // finished messages when the chat on screen is the one that just ended.
     const stopUserChannelListener = onUserChannelEvent((event) => {
+      // SA-120 P5: the SERVER changed zip state for a session (Jev Juice smart zip, source
+      // `inferred`). Re-read it from Redis when that chat is on screen, in every tab.
+      if (event?.type === 'zip_state_changed') {
+        const changedSessionId =
+          typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
+        if (!changedSessionId || changedSessionId !== currentSessionId) return
+        void import('$lib/services/zipping')
+          .then(({ zippingService }) => zippingService.refreshFromServer(changedSessionId))
+          .then(() => {
+            window.dispatchEvent(new CustomEvent('checkZipActivity', { detail: { sessionId: changedSessionId } }))
+          })
+          .catch((error) => console.warn('[Jev Juice] Failed to re-read zip state:', error))
+        return
+      }
+      // SA-120 P6: the after-reply check stored something about a finished reply. It happens
+      // after the session stream's `end`, so this channel carries it; re-read the chat's notes
+      // when that chat is on screen (any other chat reads them when it is opened).
+      if (event?.type === 'jev_juice_post_turn') {
+        const checkedSessionId =
+          typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
+        if (!checkedSessionId || checkedSessionId !== currentSessionId) return
+        void refreshJevJuicePostTurnRecords(checkedSessionId)
+        return
+      }
+      // The SERVER changed this chat's stored messages in a way no stream event could show
+      // this tab: a reply resumed into a message the tab had already finished (an approval),
+      // an approval card the server settled, or a message deleted in another tab. Re-read the
+      // chat on screen. Until 2026-09-18 the page re-fetched every open chat ten times a
+      // second, so none of these needed saying.
+      if (event?.type === 'session_messages_changed') {
+        const changedSessionId =
+          typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
+        if (!changedSessionId || changedSessionId !== currentSessionId) return
+        logger.debug('[UserChannel] Re-reading the chat the server changed', {
+          sessionId: changedSessionId,
+          reason: (event as any).reason
+        })
+        void loadMessagesForSession(changedSessionId)
+        return
+      }
+      // A chat was deleted, in this tab or another one (2026-09-18). The user channel has
+      // already taken it out of the sidebar; forget its messages and its live connection
+      // too, and leave it if this tab still shows it. Before this, it stayed in every other
+      // tab, on screen as well, until that tab reloaded.
+      if (event?.type === 'session_deleted') {
+        const deletedSessionId =
+          typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
+        if (!deletedSessionId) return
+        clearMissingSelectedSession(deletedSessionId, 'session_deleted')
+        return
+      }
       if (event?.type !== 'session_run_status') return
       const eventSessionId =
         typeof (event as any).sessionId === 'string' ? (event as any).sessionId : null
@@ -470,13 +531,22 @@
     if (!sessionId) return null
     return liveContextEstimateBySession[sessionId] ?? null
   })
+  // One preview request in flight per chat, plus one trailing refresh (`contextPreviewGate.ts`).
+  // Every ask used to start its own request: a reply's end opened three or four at once, which
+  // beside the page's two event streams filled Chrome's six connections and held the next send.
+  const contextPreviewGate = createContextPreviewGate<{
+    reason: string
+    options: ContextPreviewRefreshOptions
+  }>({
+    run: (sessionId, ask) => runLiveContextPreview(ask.reason, sessionId, ask.options),
+    isOnScreen: (sessionId) => sessionId === currentSessionId
+  })
 
 	  let realtimeSpeechSessionScopeId = sessionStore.getCurrentSessionId()
 
 	  const sseServices = new Map<string, SSEService>()
 	  const sseDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
 	  const missingSessionIds = new Set<string>()
-	  const loadingMessageSessionIds = new Set<string>()
 	  let connectedSseSessionIds = $state<string[]>([])
 	  let connectingSseSessionIds = $state<string[]>([])
 	  let eventSessionContext: string | null = null
@@ -515,7 +585,6 @@
   })
   let shouldCreateSession = $state(false)
   let creatingSessionIds = $state<string[]>([])
-  const isCreatingNewSession = $derived(creatingSessionIds.length > 0)
   const creatingSessionId = $derived(creatingSessionIds[0] ?? null)
 
   function isSessionCreating(sessionId: string | null | undefined) {
@@ -1093,19 +1162,53 @@ const immersiveActive = $derived.by(
    *
    * It is a ceiling and not a forever: a run that is still going after it returns `false`,
    * and the caller keeps the user's words and says so rather than sending them anywhere.
+   *
+   * "Over" is the chat no longer being busy, and that includes THIS tab's own send, whose abort
+   * controller stays in the run registry until the server says the turn is over: after `end`,
+   * after the server's after-reply work, after the lock is let go. Since 2026-09-18 that is the
+   * server's own `turn_over` over the live hub (`postSendRouted`), not an open request. The old
+   * loop here stopped as soon as no message was left to wait on, so in that second it gave up
+   * and parked the message as "the reply ran too long to wait for" after a 20-second reply
+   * (2026-09-18, measured). The rule, which polls through that second, is `replyEndWait.ts`.
    */
   const CLIENT_QUEUE_MAX_WAIT_MS = 15 * 60_000
+  /** How long a queued message waits for a reply that has not named its first message yet. */
+  const CLIENT_QUEUE_TARGET_WAIT_MS = 60_000
+
+  /**
+   * The reply's first message id, or `busy: false` once the chat is free. A group reply has no id
+   * until its first `start` event (`waitForReplyTarget` in `replyEndWait.ts`).
+   */
+  function waitForReplyTargetInSession(sessionId: string) {
+    return waitForReplyTarget(
+      {
+        isBusy: () => chatRunRegistry.isSessionBusy(sessionId),
+        nextTarget: () => {
+          const state = chatRunRegistry.getRunState(sessionId)
+          return state.activeMessageId ?? state.activeStreamMessageIds[0] ?? null
+        },
+        sleep: wait,
+        now: () => Date.now()
+      },
+      CLIENT_QUEUE_TARGET_WAIT_MS
+    )
+  }
 
   async function waitForReplyToEnd(sessionId: string, messageId: string): Promise<boolean> {
-    const deadline = Date.now() + CLIENT_QUEUE_MAX_WAIT_MS
-    let target: string | null = messageId
-    while (target && Date.now() < deadline) {
-      await waitForStreamCompletion(target)
-      if (!chatRunRegistry.isSessionBusy(sessionId)) return true
-      const state = chatRunRegistry.getRunState(sessionId)
-      target = state.activeMessageId ?? state.activeStreamMessageIds[0] ?? null
-    }
-    return !chatRunRegistry.isSessionBusy(sessionId)
+    return waitUntilReplyIsOver(
+      messageId,
+      {
+        isBusy: () => chatRunRegistry.isSessionBusy(sessionId),
+        nextTarget: () => {
+          const state = chatRunRegistry.getRunState(sessionId)
+          return state.activeMessageId ?? state.activeStreamMessageIds[0] ?? null
+        },
+        waitForMessageEnd: (target) => waitForStreamCompletion(target),
+        sleep: wait,
+        now: () => Date.now()
+      },
+      CLIENT_QUEUE_MAX_WAIT_MS
+    )
   }
 
   async function parseJsonResponse(response: Response): Promise<Record<string, any>> {
@@ -1113,6 +1216,12 @@ const immersiveActive = $derived.by(
     return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}
   }
 
+  /**
+   * The send, and its retry after a Stop. Resolves with the turn's FINAL answer: since 2026-09-18
+   * `postSendRouted` is answered once the server owns the turn and waits for the answer over the
+   * live hub, so a running reply no longer holds one of the browser's six connections (five
+   * replies at once froze every other request of every tab, Stop included).
+   */
   async function postSendRoutedWithInterruptRetry(params: {
     body: Record<string, any>
     signal: AbortSignal
@@ -1122,12 +1231,7 @@ const immersiveActive = $derived.by(
     let attemptIndex = 0
 
     while (true) {
-      const response = await fetch('/api/messages/send-routed', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: bodyText,
-        signal: params.signal
-      })
+      const response = await postSendRouted(bodyText, { signal: params.signal })
 
       if (response.ok) {
         return { response }
@@ -2041,10 +2145,19 @@ const immersiveActive = $derived.by(
 
 	  function clearMissingSelectedSession(sessionId: string | null, source: string) {
 	    if (!sessionId) return
-	    const wasSelected = sessionStore.getCurrentSessionId() === sessionId
+	    // On screen: the selected chat, or the chat the message view still holds. A chat deleted
+	    // in another tab has already left the session store by the time the page hears of it (the
+	    // user channel applies `session_deleted` first), so asking the store alone would leave the
+	    // page's per-chat state below (the message view's active chat, the thinking indicators,
+	    // the Execution Viewer snapshots) pointing at a chat that is gone. The view itself clears
+	    // either way: the chat's messages are dropped above and nothing is selected.
+	    const wasSelected =
+	      sessionStore.getCurrentSessionId() === sessionId ||
+	      messageStore.getActiveSessionId() === sessionId
 	    missingSessionIds.add(sessionId)
-	    loadingMessageSessionIds.delete(sessionId)
+	    chatLoadQueue.forget(sessionId)
 	    messageStore.clearMessages(sessionId)
+	    forgetJevJuicePostTurnRecords(sessionId)
 	    clearCreatingSession(sessionId)
 	    chatRunRegistry.resetRunState(sessionId)
 	    if (sseServices.has(sessionId)) {
@@ -2118,55 +2231,43 @@ const immersiveActive = $derived.by(
     persistManualTrimState(nextState)
   }
 
-  // Load messages when session changes
-  $effect(() => {
-    const sessionId = currentSessionId
-    // 🐛 DEBUG: Log every time effect fires
-    logger.debug('[Session Effect] Session change detected', {
-      sessionId,
-      isCreatingNewSession,
-      creatingSessionId,
-      timestamp: new Date().toISOString()
-    })
-	    if (sessionId && missingSessionIds.has(sessionId)) {
-	      clearMissingSelectedSession(sessionId, 'session-effect')
-	      return
-	    }
-	    const isBlocked = isSessionCreating(sessionId)
-
-	    if (sessionId && !isBlocked) {
-	      messageStore.setActiveSession(sessionId)
-	      syncActiveToolProcessingState()
-	      logger.debug('[Session Effect] Loading messages for session', { sessionId })
-      // Wrap in try/catch to prevent any errors from breaking session switching
-      try {
-        loadMessagesForSession(sessionId)
-      } catch (error) {
-        console.error('[Session Switch] Error loading messages:', error)
-        // Continue anyway - don't let errors break session switching
-      }
-
-      // Update pinning service with current session
-      import('$lib/services/zipping').then(async ({ zippingService }) => {
-        try {
-          await zippingService.setCurrentSession(sessionId)
-        } catch (error) {
-          console.error('[Session Switch] Error updating zipping service:', error)
-          // Non-critical, continue anyway
-        }
-      }).catch(error => {
-        console.error('[Session Switch] Error importing zipping service:', error)
-        // Non-critical, continue anyway
-      })
-
-      void loadExecutionSnapshots(sessionId)
-	    } else if (sessionId && isBlocked) {
-	      messageStore.setActiveSession(sessionId)
-	      logger.debug('[Session Effect] Skipping load while new session finalizes', {
+  // Load the selected chat when it changes, and once more when a new chat's creating hold
+  // lifts. The rule and its tests live in `selectedSessionLoad.svelte.ts`: nothing these
+  // handlers read may re-run the load, or the open chat is re-fetched in a loop (it was,
+  // about ten times a second, from 2026-06-06 until this moved there).
+  watchSelectedSessionLoad({
+    selectedSessionId: () => currentSessionId,
+    isCreating: isSessionCreating,
+    isMissing: (sessionId) => missingSessionIds.has(sessionId),
+    clearMissing: (sessionId) => clearMissingSelectedSession(sessionId, 'session-effect'),
+    holdForCreation: (sessionId) => {
+      messageStore.setActiveSession(sessionId)
+      logger.debug('[Session Effect] Skipping load while new session finalizes', {
         sessionId,
         creatingSessionId
       })
+    },
+    load: (sessionId) => {
+      messageStore.setActiveSession(sessionId)
+      syncActiveToolProcessingState()
+      logger.debug('[Session Effect] Loading messages for session', { sessionId })
+      void loadMessagesForSession(sessionId)
+      // Non-critical: the zip badges follow the selected chat.
+      zippingService.setCurrentSession(sessionId).catch((error) => {
+        console.error('[Session Switch] Error updating zipping service:', error)
+      })
+      void loadExecutionSnapshots(sessionId)
     }
+  })
+
+  // The tool busy flags mirror the selected chat's tool state in the run registry. This
+  // effect, not the load above, is the one that follows the registry: a run-state write
+  // re-syncs the flags (for example after another chat's send clears its own tools) and
+  // loads nothing.
+  $effect(() => {
+    const sessionId = currentSessionId
+    void chatRunRegistry.getRunState(sessionId).activeToolMessageIds
+    untrack(syncActiveToolProcessingState)
   })
 
   $effect(() => {
@@ -2459,12 +2560,21 @@ const immersiveActive = $derived.by(
       draftPreviewArtifactId = detail?.artifactId || null
     }
 
+    // SA-120 P9: the two quick actions the page owns (the Goon Dock). Desktop Mode already shows
+    // the Goon, so "open" is a no-op there and "close" leaves Desktop Mode, as the Dock toggle does.
+    const handleQuickActionEvent = (event: Event) => {
+      const id = (event as CustomEvent<{ id?: string }>).detail?.id
+      if (id === 'open_goon_dock' && !goonsPanelOpen && !desktopModeActive) toggleGoonsPanel()
+      else if (id === 'close_goon_dock' && (goonsPanelOpen || desktopModeActive)) toggleGoonsPanel()
+    }
+    window.addEventListener(QUICK_ACTION_EVENT, handleQuickActionEvent as EventListener)
     window.addEventListener('batshit:settings-opened', handleSettingsOpened as EventListener)
     window.addEventListener('batshit:artifact-open', handleArtifactOpen as EventListener)
     window.addEventListener(LIVE_SETTINGS_EVENTS.artifactUpdated, handleArtifactUpdated as EventListener)
     window.addEventListener(LIVE_SETTINGS_EVENTS.artifactDeleted, handleArtifactDeleted as EventListener)
     window.addEventListener(LIVE_SETTINGS_EVENTS.artifactDraftPreview, handleDraftPreview as EventListener)
     return () => {
+      window.removeEventListener(QUICK_ACTION_EVENT, handleQuickActionEvent as EventListener)
       window.removeEventListener('batshit:settings-opened', handleSettingsOpened as EventListener)
       window.removeEventListener('batshit:artifact-open', handleArtifactOpen as EventListener)
       window.removeEventListener(LIVE_SETTINGS_EVENTS.artifactUpdated, handleArtifactUpdated as EventListener)
@@ -2543,6 +2653,9 @@ const immersiveActive = $derived.by(
 
 	    connectingSseSessionIds = [...new Set([...connectingSseSessionIds, sessionId])]
 
+	    // A service that is not connected is replaced, never left behind: over the shared live
+	    // connection a forgotten one stays subscribed and every event of this chat arrives twice.
+	    existingService?.disconnect()
 	    const service = new SSEService(sessionId)
 	    sseServices.set(sessionId, service)
 	    try {
@@ -2594,6 +2707,12 @@ const immersiveActive = $derived.by(
 	  }
 
 	  function shouldAutoConnectSseForSession(sessionId: string) {
+	    // The chat ON SCREEN always listens, empty or not. Batshit writes into a chat the
+	    // browser never sent to — a LiveKit voice turn, an artifact shared to chat, a wake-up —
+	    // and an event for a session with no listener is DROPPED by `/api/sse`. An empty chat
+	    // used to stay unsubscribed and only caught up because the page re-fetched it ten times
+	    // a second; now it hears the first message live like any other chat.
+	    if (sessionId === sessionStore.getCurrentSessionId()) return true
 	    if (chatRunRegistry.isSessionBusy(sessionId)) return true
 	    if (messageStore.getMessageCount(sessionId) > 0) return true
 	    return false
@@ -2696,17 +2815,6 @@ const immersiveActive = $derived.by(
           }
         })
     }
-
-	    if (
-	      sessionId &&
-	      !isSessionCreating(sessionId) &&
-	      !chatRunRegistry.isSessionBusy(sessionId) &&
-	      messageStore.getMessageCount(sessionId) === 0 &&
-	      sseServices.has(sessionId)
-	    ) {
-	      logger.debug('[SSE Effect] Disconnecting idle blank selected session SSE', { sessionId })
-	      disconnectSSE(sessionId)
-	    }
   })
 
 	  $effect(() => {
@@ -2748,10 +2856,15 @@ const immersiveActive = $derived.by(
 	    }
 	  })
 
-  async function loadMessagesForSession(sessionId: string) {
+  // One load at a time per chat, plus one catch-up load for anything asked while it ran.
+  const chatLoadQueue = createChatLoadQueue((sessionId: string) => loadMessagesFromServer(sessionId))
+
+  function loadMessagesForSession(sessionId: string) {
+    return chatLoadQueue.request(sessionId)
+  }
+
+  async function loadMessagesFromServer(sessionId: string) {
     if (missingSessionIds.has(sessionId)) return
-    if (loadingMessageSessionIds.has(sessionId)) return
-    loadingMessageSessionIds.add(sessionId)
 
     try {
       logger.debug('[loadMessagesForSession] Loading messages for session:', sessionId)
@@ -2771,6 +2884,10 @@ const immersiveActive = $derived.by(
 	      if (sessionStore.getCurrentSessionId() === sessionId) {
 	        messageStore.setActiveSession(sessionId)
 	      }
+	      // SA-120 P6: the Jev Juice after-reply notes live beside the messages, not inside them
+	      // (the server writes them after a reply's `end`). Never awaited: a chip must not be
+	      // able to delay or fail a chat's load.
+	      void refreshJevJuicePostTurnRecords(sessionId)
 	    } catch (error) {
 	      const message = error instanceof Error ? error.message : String(error)
 	      if (message.includes('Session not found')) {
@@ -2789,8 +2906,6 @@ const immersiveActive = $derived.by(
 	          lastConversationLoadToastAt = now
 	        }
 	      }
-	    } finally {
-	      loadingMessageSessionIds.delete(sessionId)
 	    }
 	  }
 
@@ -3388,10 +3503,29 @@ const immersiveActive = $derived.by(
         })
       }
 
+      const existingStreamMessage = messageStore.getMessage(realMessageId, sessionId)
+      const approvalResume = readApprovalResumeStart(data.metadata)
+      if (approvalResume && existingStreamMessage && !isNewApprovalResume(existingStreamMessage.metadata, approvalResume)) return
+      if (!approvalResume && existingStreamMessage && ignoreLateEventForFinalizedMessage(realMessageId, 'start')) return
+
       registerActiveMessage(realMessageId)
       resetToolStateForMessage(realMessageId)
 
-      const existingStreamMessage = messageStore.getMessage(realMessageId, sessionId)
+      if (approvalResume) {
+        // A fresh, server-owned continuation can reopen this one finished message. An
+        // old start replay cannot: its monotonic version is already on the saved record.
+        const patch = approvalResumeStartPatch(approvalResume, data.metadata)
+        if (existingStreamMessage) {
+          messageStore.updateMessage(realMessageId, patch)
+        } else {
+          messageStore.addMessage({
+            id: realMessageId, role: 'assistant', session_id: sessionId!,
+            agent_id: agentId || undefined, user_id: pageData.user?.id || data.userId,
+            ...patch
+          })
+        }
+        return
+      }
       if (existingStreamMessage) {
         if (ignoreLateEventForFinalizedMessage(realMessageId, 'start')) {
           return
@@ -3873,6 +4007,28 @@ const immersiveActive = $derived.by(
         requestedUnzip.length > 0 ||
         requestedZip.length > 0
 
+      // SA-120 P5: Jev Juice smart zip opened zipped results for this send. The SERVER wrote
+      // that state (source `inferred`) at the accepted-send boundary, so this tab re-reads zip
+      // state from Redis: the badge then shows the Jev Juice mark and the ordinary countdown
+      // closes it. Before the agent's own zip control below, so an explicit action lands on
+      // fresh state and wins.
+      const inferredZipChanges = (metadata as any)?.jevJuice?.zips
+      if (
+        eventSessionContext &&
+        Array.isArray(inferredZipChanges?.opened) &&
+        inferredZipChanges.opened.length > 0
+      ) {
+        try {
+          const { zippingService } = await import('$lib/services/zipping')
+          await zippingService.refreshFromServer(eventSessionContext)
+          window.dispatchEvent(
+            new CustomEvent('checkZipActivity', { detail: { sessionId: eventSessionContext } })
+          )
+        } catch (error) {
+          console.warn('[Jev Juice] Failed to re-read zip state after a smart zip change:', error)
+        }
+      }
+
       if (hasZipActions && zipPermissionEnabled) {
 	        const sessionId = eventSessionContext
         if (sessionId) {
@@ -4156,8 +4312,12 @@ const immersiveActive = $derived.by(
         interrupted: metadata?.interrupted === true
       })
 
-      // Save to database after updating
-      await saveMessageToDatabase(targetMessageId)
+      // Save to database after updating. Not for a reply stopped because its chat was deleted:
+      // the chat is gone, the save route refuses it, and the refusal was a false "Failed to save
+      // message to database" (bug sweep, 2026-09-18).
+      if (metadata?.chatDeleted !== true) {
+        await saveMessageToDatabase(targetMessageId)
+      }
 
 	      resolveStreamCompletion(targetMessageId)
       unregisterActiveMessage(targetMessageId)
@@ -4210,7 +4370,7 @@ const immersiveActive = $derived.by(
         } else {
           const currentMessage = messageStore.getMessage(targetMessageId)
 
-          if (currentMessage && currentMessage.status !== 'complete') {
+          if (currentMessage && currentMessage.status !== 'complete' && data?.metadata?.chatDeleted !== true) {
             messageStore.updateMessage(targetMessageId, {
               status: 'complete'
             })
@@ -4761,6 +4921,55 @@ const immersiveActive = $derived.by(
 	    }
 	  }
 
+  /**
+   * SA-120 P9: a spoken turn that was ONLY a quick action (DL-120-15). The words are stored as a
+   * user message with the mark, so the user sees what was said and what Batshit did, and so the
+   * next turn's DCM can tell the agent; no agent turn runs. Same three writes as a send (the
+   * store, the spectator broadcast, the record), no `send-routed`.
+   */
+  async function handleQuickActionMessage(content: string, mark: QuickActionMark) {
+    const sessionIdForMark = sessionStore.getCurrentSessionId()
+    const agent = agentStore.getCurrentAgent()
+    if (!sessionIdForMark || !agent || !data.user) return
+    const id = await generateClientMessageId(sessionIdForMark, 'msg_user_client')
+    const now = new Date().toISOString()
+    const userMessage = {
+      id,
+      content,
+      role: 'user' as const,
+      session_id: sessionIdForMark,
+      agent_id: agent.id,
+      user_id: data.user.id,
+      created_at: now,
+      timestamp: now,
+      status: 'complete' as const,
+      metadata: {
+        client_sent: true,
+        error_message: null,
+        hasAttachments: false,
+        attachmentCount: 0,
+        stt: true,
+        tts: true,
+        voiceMode: true,
+        fileReferences: [],
+        clipIds: [],
+        quickAction: mark,
+        zipIds: []
+      }
+    }
+    messageStore.addMessage(userMessage)
+    try {
+      await fetch('/api/sse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-sse-forward': '1' },
+        body: JSON.stringify({ type: 'user_message', sessionId: sessionIdForMark, message: userMessage })
+      })
+    } catch (error) {
+      console.error('[handleQuickActionMessage] Failed to broadcast the quick-action turn via SSE:', error)
+    }
+    await new DatabaseService().saveMessage(userMessage, agent)
+  }
+
 		  async function handleSendMessage(
 		    content: string,
 		    metadata: any = {},
@@ -5184,8 +5393,36 @@ const immersiveActive = $derived.by(
 	      }
 
 	      const waitRunState = chatRunRegistry.getRunState(currentSessionId)
-	      const waitForMessageId =
+	      let waitForMessageId =
 	        waitRunState.activeMessageId ?? waitRunState.activeStreamMessageIds[0] ?? null
+	      if (!waitForMessageId) {
+	        // A group reply has no message id until its first `start` event, so a message queued
+	        // in that moment used to skip the wait below and go straight into the running turn,
+	        // which refused it (`session_turn_in_progress`) and left it saved and unanswered (bug
+	        // sweep, 2026-09-18). Wait for the id, or for the reply to end. The words are still in
+	        // the composer during this short wait, so a Stop or a reply that never starts leaves
+	        // them there.
+	        clientQueueWaitingBySession.add(currentSessionId)
+	        const stopCountBeforeTargetWait = manualStopCountBySession.get(currentSessionId) ?? 0
+	        let found: { target: string | null; busy: boolean } = { target: null, busy: true }
+	        try {
+	          found = await waitForReplyTargetInSession(currentSessionId)
+	        } finally {
+	          clientQueueWaitingBySession.delete(currentSessionId)
+	        }
+	        if ((manualStopCountBySession.get(currentSessionId) ?? 0) !== stopCountBeforeTargetWait) {
+	          // AMD-119-04: Stop stops everything, a message waiting to be queued included.
+	          return false
+	        }
+	        if (found.target) {
+	          waitForMessageId = found.target
+	        } else if (found.busy) {
+	          toast.info('That reply is still starting. Your message is still in the box: send it again in a moment.')
+	          return false
+	        }
+	        // Otherwise the chat is free again: nothing to wait for, so it goes as an ordinary
+	        // message below.
+	      }
 	      if (waitForMessageId) {
 	        // F-P3-3: the bubble DL-114-10 describes — the words stay visible while they
 	        // wait, and go the moment the send leaves as an ordinary message.
@@ -5338,6 +5575,8 @@ const immersiveActive = $derived.by(
         // F-P2-7: both write sites, as `metadata.wake` learned to be — send-routed reads
         // the request body first and this record second, and a recompile only has this one.
         interruption: stopInterruption ?? undefined,
+        // SA-120 P9: a quick action ran on this spoken turn and the rest went to the agent.
+        quickAction: metadata?.quickAction && typeof metadata.quickAction === 'object' ? metadata.quickAction : undefined,
         zipIds: []
       }
     }
@@ -5521,6 +5760,18 @@ const immersiveActive = $derived.by(
 	        errorCode === 'IMAGE_DATA_URL_IN_TEXT' ||
 	        /Image data URLs are not allowed in text context/i.test(message)
 		      const isSessionTurnInProgress = errorCode === 'session_turn_in_progress'
+
+	      if (errorCode === 'session_deleted') {
+	        // The chat was deleted, here or in another tab, while this reply ran or waited. Say so
+	        // once: the generic error toast below printed the sentence as its title AND its
+	        // description (bug sweep, 2026-09-18). Nothing to retry and nothing to save.
+	        toast.info(message || 'This chat was deleted.')
+	        isWaitingForResponse = false
+	        if (isSessionCreating(currentSessionId)) {
+	          clearCreatingSession(currentSessionId)
+	        }
+	        return false
+	      }
 
 		      if (isSessionTurnInProgress) {
 	        toast.info('Response already in progress', {
@@ -5707,8 +5958,11 @@ const immersiveActive = $derived.by(
   }
 
   function getCurrentManualTrimProtections(extraClipIds: string[] = []) {
+    // SA-120 P5: a result Jev Juice opened (source `inferred`) is Batshit's guess, not a pin.
+    // It never shields a message from the user's own Manual Trim or Compact.
     const protectedUnzippedZipIds = zippingService
       .getAllUnzipped()
+      .filter((item) => item?.source !== 'inferred')
       .map((item) => item.zipId)
       .filter(Boolean)
     return {
@@ -5818,6 +6072,7 @@ const immersiveActive = $derived.by(
     delete next[sessionId]
     liveContextEstimateBySession = next
     contextPreviewSerial += 1
+    contextPreviewGate.forget(sessionId)
   }
 
   function scheduleLiveContextPreview(
@@ -5845,12 +6100,22 @@ const immersiveActive = $derived.by(
     }, delay)
   }
 
-  async function refreshLiveContextPreview(
+  function refreshLiveContextPreview(
     reason: string,
     scheduledSessionId = currentSessionId,
     options: ContextPreviewRefreshOptions = {}
   ) {
-    const sessionId = scheduledSessionId
+    if (!scheduledSessionId) return
+    contextPreviewGate.request(scheduledSessionId, { reason, options })
+  }
+
+  // Runs only through `contextPreviewGate`, which sends it when the chat has no preview in
+  // flight. Every guard is read again here because a trailing refresh runs later than its ask.
+  async function runLiveContextPreview(
+    reason: string,
+    sessionId: string,
+    options: ContextPreviewRefreshOptions
+  ) {
     const currentAgent = agentStore.getCurrentAgent()
     if (!sessionId || !currentAgent?.id) return
     if (!options.ignoreBusy && (chatWorkBusy || compactBusy)) return
@@ -7743,6 +8008,10 @@ const immersiveActive = $derived.by(
             showExecutionViewer={false}
             workBusy={chatWorkBusy || compactBusy}
             onStopWork={handleStopStream}
+            onOpenExecutionViewer={() => {
+              executionViewerOpen = true
+            }}
+            onQuickActionMessage={handleQuickActionMessage}
             onClippedItemsChange={handleComposerClippedItemsChange}
             busySendMode={busySendMode}
             steerable={chatSteerable}
@@ -8013,7 +8282,7 @@ const immersiveActive = $derived.by(
     flex-direction: column;
     min-width: 480px;
     min-height: 0;
-    background: var(--background);
+    background: var(--bs-chat-canvas);
   }
 
   :global(body.sidebar-overlay [data-slot="sidebar-gap"]) {

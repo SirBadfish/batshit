@@ -4,9 +4,16 @@
 	import type { ToolData } from '../toolRendererRegistry'
 	import { getLanguageFromPath } from '$lib/utils/languageDetection'
 	import { buildCompactEditPreview } from '$lib/utils/editDiff'
+	import { failedCommandExitCode } from '$lib/utils/toolActivityContract'
 	import { AlertCircle, Edit3 } from '@lucide/svelte'
-	
+
 	let { tool }: { tool: ToolData } = $props()
+	// A shell edit that failed keeps its exit code and what it printed (F-P6-5). Like the Bash
+	// card, a non-zero exit code means the edit was not applied, even when the step reported none.
+	let failedExitCode = $derived(failedCommandExitCode(tool.toolResult))
+	let commandOutput = $derived(
+		typeof tool.toolResult?.commandOutput === 'string' ? tool.toolResult.commandOutput : ''
+	)
 
 	// Extract file info from input AND result (batshit-server returns it in result too)
 	let filePath = $derived(tool.toolInput?.filePath ||
@@ -37,7 +44,8 @@
 			}
 		}
 
-		return typeof tool.error === 'string' && tool.error.trim() ? tool.error.trim() : ''
+		if (typeof tool.error === 'string' && tool.error.trim()) return tool.error.trim()
+		return failedExitCode !== undefined ? `Command exited with code ${failedExitCode}` : ''
 	})
 	let rendererTitle = $derived(
 		failureReason
@@ -112,6 +120,7 @@
 		'File Path': filePath,
 		...(failureReason
 			? {
+				...(failedExitCode !== undefined ? { 'Exit Code': failedExitCode } : {}),
 				'Result': 'Not applied',
 				'Reason': failureReason
 			}
@@ -201,7 +210,9 @@
 			if (patches.length > 0) return patches.join('\n\n')
 		}
 		
-		// Last resort - stringify it
+		// Last resort - stringify it. A failed edit changed nothing, so it has no diff: its reason
+		// and output are in the error section, never a data dump shown as a diff (F-P6-5).
+		if (failureReason) return ''
 		return JSON.stringify(result, null, 2)
 	}
 	
@@ -242,7 +253,7 @@
 	status={failureReason || !tool.success ? 'error' : 'success'}
 	{metadata}
 	duration={tool.metadata?.executionTime}
-	error={failureReason || tool.error}
+	error={[failureReason || tool.error, commandOutput].filter(Boolean).join('\n') || undefined}
 >
 	<div class="diff-content-wrapper">
 		{#if failureReason}
@@ -298,7 +309,7 @@
 		overflow-y: auto;
 		overflow-x: hidden;  /* Hide horizontal scroll, allow wrapping */
 		padding: 1rem 0;
-		font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+		font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
 		font-size: 0.85rem;
 		line-height: 1.5;
 	}

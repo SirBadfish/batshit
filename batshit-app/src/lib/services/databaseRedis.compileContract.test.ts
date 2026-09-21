@@ -33,6 +33,9 @@
  *            the episode whiteboard.
  *   - S20/S21 reasoning-history policy: opt-in standing preservation plus the exact-agent,
  *            one-success interruption recovery override.
+ *   - S26/S27 F-P5-11: each compile reads only its own chat's zip state, even while another
+ *            chat compiles in the same process, and a group history pass reads Redis rather
+ *            than anything an earlier compile left in memory.
  *
  * The fetch router still serves the real SvelteKit route handlers off the same seeded
  * fixture store, so an accidental network call fails loudly instead of reaching out.
@@ -52,6 +55,8 @@ type FixtureState = {
   zips: Map<string, any>
   failUserSettings: boolean
   failSettingsRoute: boolean
+  /** F-P5-11: awaited before every zip read, so a scenario can pause one compile there. */
+  onGetZip?: (zipId: string) => Promise<void>
 }
 
 const state = vi.hoisted(() => ({
@@ -179,6 +184,7 @@ const redisFake = vi.hoisted(() => {
       return state.current.projects
     },
     async getZip(zipId: string) {
+      await state.current.onGetZip?.(zipId)
       return state.current.zips.get(zipId) ?? null
     },
     async getZips(zipIds: string[]) {
@@ -450,7 +456,8 @@ type TwinArgs = {
   sessionId: string
   messages: any[]
   agent: any
-  currentUserMessage: string
+  /** Absent for a Token Panel preview, which compiles the chat with no current message. */
+  currentUserMessage?: string
   assignedSubagents?: any[]
   options?: Record<string, any>
 }
@@ -498,6 +505,218 @@ let scenarioCounter = 0
 function nextSessionId() {
   scenarioCounter += 1
   return `parity-session-${scenarioCounter}`
+}
+
+async function runServerGroupHistory(args: {
+  sessionId: string
+  messages: any[]
+  agent: any
+  options?: Record<string, any>
+}) {
+  vi.stubGlobal('fetch', createFetchRouter())
+  invalidateServerSettingsCache(USER_ID)
+  return new ServerDatabaseService().prepareGroupHistory(
+    args.sessionId,
+    args.messages,
+    args.agent,
+    USER_ID,
+    { ...(args.options ?? {}) }
+  )
+}
+
+/**
+ * F-P5-11: runs `first` and, the moment it reaches its `pauseOnRead`-th read of
+ * `pauseZipId`, starts `second` and holds the first compile there until the second has
+ * loaded its own zip state and reached its read of `secondZipId`. A zip read is where a
+ * compile yields, so this is the interleaving that three active chats, a wake-up beside a
+ * chat, or a token preview beside a send can produce in one server process.
+ */
+async function runOverlapping<A, B>(options: {
+  pauseZipId: string
+  pauseOnRead?: number
+  secondZipId: string
+  first: () => Promise<A>
+  second: () => Promise<B>
+}): Promise<{ first: A; second: B }> {
+  const run: { second: Promise<B> | null } = { second: null }
+  let pauseReads = 0
+  let releaseFirst: () => void = () => {}
+  const secondReachedItsZip = new Promise<void>((resolve) => {
+    releaseFirst = resolve
+  })
+  state.current.onGetZip = async (zipId) => {
+    if (zipId === options.secondZipId) {
+      releaseFirst()
+      return
+    }
+    if (zipId !== options.pauseZipId) return
+    pauseReads += 1
+    if (pauseReads !== (options.pauseOnRead ?? 1) || run.second) return
+    run.second = options.second()
+    // A second compile that fails before its zip read must not hang the suite.
+    run.second.then(releaseFirst, releaseFirst)
+    await secondReachedItsZip
+  }
+  try {
+    const first = await options.first()
+    if (!run.second) {
+      throw new Error('overlap harness: the first compile never reached the paused zip read')
+    }
+    return { first, second: await run.second }
+  } finally {
+    state.current.onGetZip = undefined
+  }
+}
+
+const OVERLAP_ZIPS = {
+  aUnzipped: 'cool_tool_1779416400001_aunz1',
+  aRezipped: 'cool_tool_1779416400002_arez1',
+  cOpened: 'cool_tool_1779416400003_copn1',
+  bUnzipped: 'cool_tool_1779416400004_bunz1',
+  bUnzipped2: 'cool_tool_1779416400005_bunz2',
+  gUnzipped: 'cool_tool_1779416400006_gunz1'
+} as const
+
+/** Bash is Auto (compressed at once); Read File is Normal with room in its buffer. */
+function overlapAgent() {
+  return apiAgent({
+    auto_zip_execute_command: true,
+    auto_zip_read_file: false,
+    buffer_size_read_file: 3,
+    zip_threshold_read_file: 0,
+    zip_ai_view_mode: 'inline'
+  })
+}
+
+function overlapBashZip(zipId: string, target: string) {
+  const description = `bash: ls ${target} - exit 0 - 1 lines`
+  return {
+    zip: {
+      id: zipId,
+      type: 'cool_tool',
+      content: JSON.stringify({
+        toolName: 'bash',
+        operationKind: 'bash',
+        toolArgs: { command: `ls ${target}` },
+        toolResult: { stdout: `${target}-listing-body.ts`, stderr: '', exitCode: 0 }
+      }),
+      tokens: 310,
+      description,
+      metadata: { toolName: 'bash', operationKind: 'bash', promptTokens: 310 }
+    },
+    ref: `{{batshit-zip:${zipId}:::${description}}}`,
+    body: `${target}-listing-body.ts`
+  }
+}
+
+function overlapReadZip(zipId: string, marker: string) {
+  const description = `read_file: ${marker}.md - 1 lines`
+  return {
+    zip: {
+      id: zipId,
+      type: 'cool_tool',
+      content: JSON.stringify({
+        toolName: 'read_file',
+        operationKind: 'read_file',
+        toolArgs: { path: `${marker}.md` },
+        toolResult: { content: `${marker}-notes-body`, lines: 1 }
+      }),
+      tokens: 40,
+      description,
+      metadata: { toolName: 'read_file', operationKind: 'read_file', promptTokens: 40 }
+    },
+    ref: `{{batshit-zip:${zipId}:::${description}}}`,
+    body: `${marker}-notes-body`
+  }
+}
+
+function seedUserUnzip(sessionId: string, zipId: string, description: string) {
+  const setKey = `unzipped:${sessionId}`
+  const ids = state.current.sets.get(setKey) ?? new Set<string>()
+  ids.add(zipId)
+  state.current.sets.set(setKey, ids)
+  state.current.kv.set(`unzipped_item:${sessionId}:${zipId}`, {
+    zipId,
+    sessionId,
+    permanent: true,
+    unzippedAt: 1781258400000,
+    name: 'bash',
+    description,
+    tokens: 310,
+    source: 'user'
+  })
+}
+
+function seedUserRezip(sessionId: string, zipId: string) {
+  state.current.sets.set(`rezipped:${sessionId}`, new Set([zipId]))
+  state.current.kv.set(`rezipped_item:${sessionId}:${zipId}`, {
+    zipId,
+    sessionId,
+    source: 'user',
+    rezippedAt: 1781258400000
+  })
+}
+
+/** One assistant reply per entry, each carrying its zip refs, after the base exchange. */
+function overlapMessages(replies: Array<{ content: string; zipIds: string[] }>, agentId?: string) {
+  const messages = baseMessages()
+  replies.forEach((reply, index) => {
+    const turn = index + 3
+    messages.push(
+      {
+        id: `msg-${turn * 2 - 3}`,
+        role: 'user',
+        content: `Follow-up request number ${turn}`,
+        timestamp: `2026-06-12T09:0${turn}:00.000Z`,
+        metadata: {}
+      },
+      {
+        id: `msg-${turn * 2 - 2}`,
+        role: 'assistant',
+        content: reply.content,
+        timestamp: `2026-06-12T09:0${turn}:30.000Z`,
+        ...(agentId ? { agent_id: agentId } : {}),
+        metadata: { zipIds: reply.zipIds }
+      }
+    )
+  })
+  return messages
+}
+
+/**
+ * Chat B, the chat that compiles in the middle of another one: two user-unzipped listings,
+ * so its DCM names two pins and its unzipped count is 2.
+ */
+function seedOverlapChatB(sessionId: string) {
+  const b1 = overlapBashZip(OVERLAP_ZIPS.bUnzipped, 'bravo')
+  const b2 = overlapBashZip(OVERLAP_ZIPS.bUnzipped2, 'bravo-two')
+  state.current.zips.set(b1.zip.id, b1.zip)
+  state.current.zips.set(b2.zip.id, b2.zip)
+  seedUserUnzip(sessionId, b1.zip.id, b1.zip.description)
+  seedUserUnzip(sessionId, b2.zip.id, b2.zip.description)
+  return {
+    b1,
+    b2,
+    compile: () =>
+      runServerCompile({
+        sessionId,
+        messages: overlapMessages([
+          { content: `Listed both: ${b1.ref} and ${b2.ref}`, zipIds: [b1.zip.id, b2.zip.id] }
+        ]),
+        agent: overlapAgent(),
+        currentUserMessage: 'What was in bravo?',
+        options: { runtimeFlavor: 'vercel' }
+      })
+  }
+}
+
+function expectChatBReadItsOwnState(result: any, b: ReturnType<typeof seedOverlapChatB>) {
+  const text = currentUserMessageContent(result.server)
+  expect(text).toContain(b.b1.body)
+  expect(text).toContain(b.b2.body)
+  expect(text).toContain(`| ${b.b1.zip.id} | user-locked | permanent`)
+  expect(text).toContain(`| ${b.b2.zip.id} | user-locked | permanent`)
+  expect(result.server.structuredInput.metadata.unzippedItemsCount).toBe(2)
 }
 
 const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!
@@ -2000,6 +2219,364 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
     expect(server.structuredInput?.metadata?.dmsContext).toBeUndefined()
   })
 
+  it('S22 SA-120 P1: a Jev Juice hint provider gets the agent\'s skills and refs and its lines close the DCM; no provider, byte-identical', async () => {
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+
+    const seen: any[] = []
+    const provider = vi.fn(async (context: any) => {
+      seen.push(context)
+      return ['jev_juice_hints (advisory guesses from a fast judgment model; ignore any that do not fit):', '- Likely tool: fabric:sys.memory.save']
+    })
+
+    const withHints = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent(),
+      currentUserMessage: 'Remember that I like teal',
+      options: { runtimeFlavor: 'vercel', jevJuiceHintProvider: provider }
+    })
+    const withoutHints = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent(),
+      currentUserMessage: 'Remember that I like teal',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    expect(provider).toHaveBeenCalledTimes(1)
+    expect(seen[0].currentUserMessage).toBe('Remember that I like teal')
+    expect(Array.isArray(seen[0].skills)).toBe(true)
+    expect(Array.isArray(seen[0].discoverable)).toBe(true)
+
+    const hinted = currentUserMessageContent(withHints.server)
+    const plain = currentUserMessageContent(withoutHints.server)
+    expect(hinted.trimEnd().endsWith('- Likely tool: fabric:sys.memory.save')).toBe(true)
+    expect(plain).not.toContain('jev_juice_hints')
+    // Every byte before the hint block is what the plain compile produced: the hint is the tail.
+    expect(hinted.startsWith(plain.trimEnd())).toBe(true)
+    // The system prompt never carries Jev output (DL-120-05).
+    expect(withHints.server.primarySystemPrompt).toBe(withoutHints.server.primarySystemPrompt)
+  })
+
+  it('S23 SA-120 P2 (H1): the Jev Juice judgment-tool guidance compiles only for a judge-enabled agent, after DMs and before the identity zone', async () => {
+    // OFF (the default): not one byte. The guidance is gated on the same per-agent switch
+    // that opens `sys.judge.*` in the broker, so a control the agent cannot call is never
+    // taught — and Jev's answers never reach the system prompt either way (DL-120-05).
+    const offSessionId = nextSessionId()
+    state.current = freshState(offSessionId)
+    const { server: off } = await runServerCompile({
+      sessionId: offSessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ dms_enabled: true }),
+      currentUserMessage: 'Which of these three drafts is the most polite?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    expect(off.primarySystemPrompt ?? '').not.toContain('JEV JUICE (JUDGMENT TOOL)')
+
+    const onSessionId = nextSessionId()
+    state.current = freshState(onSessionId)
+    const { server: on } = await runServerCompile({
+      sessionId: onSessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ dms_enabled: true, jev_juice_judge_tool: true }),
+      currentUserMessage: 'Which of these three drafts is the most polite?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    const prompt = on.primarySystemPrompt ?? ''
+    expect(prompt).toContain('==== JEV JUICE (JUDGMENT TOOL) ====')
+    // The code fallback compiled (no stored override in the fake): the exact call shape.
+    expect(prompt).toContain('`sys.judge.ask` takes `state` and `questions`')
+    // Placement: after the DM block (its closer sibling), and the identity zone still
+    // closes the prompt — nothing may compile after it.
+    expect(prompt.indexOf('==== AGENT DMS (MESSAGING) ====')).toBeLessThan(
+      prompt.indexOf('==== JEV JUICE (JUDGMENT TOOL) ====')
+    )
+    expect(prompt.indexOf('==== JEV JUICE (JUDGMENT TOOL) ====')).toBeLessThan(
+      prompt.indexOf('==== GLOBAL CUSTOM SYSTEM PROMPT ====')
+    )
+  })
+
+  it('S24 SA-120 P4b: a Jev Juice memory-recall provider reaches the recall engine and its memories enter Memory context; no provider, byte-identical; memory-off and group compiles never call it', async () => {
+    const AGENT_ID = 'agent-api-parity'
+    const seedLtm = (sessionId: string) => {
+      state.current.kv.set(`agent:${AGENT_ID}`, { id: AGENT_ID, user_id: USER_ID, name: 'Memory Twin', memory_enabled: true })
+      state.current.kv.set(`memory:${AGENT_ID}:mem_ltm_1`, {
+        id: 'mem_ltm_1',
+        agent_id: AGENT_ID,
+        user_id: USER_ID,
+        lane: 'ltm',
+        content: 'The user is allergic to shellfish.',
+        importance: 6,
+        event_at: null,
+        event_ts: null,
+        saved_at: '2026-06-05T09:00:00.000Z',
+        saved_ts: new Date('2026-06-05T09:00:00.000Z').getTime(),
+        is_superseded: 'n',
+        provenance: [{ session_id: sessionId, source: 'agent' }],
+        visibility: 'normal',
+        embedding: [],
+        embedding_model: 'test',
+        schema_version: 1
+      })
+    }
+
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    seedLtm(sessionId)
+    const seen: any[] = []
+    const provider = vi.fn(async (request: any) => {
+      seen.push(request)
+      return [{ id: 'mem_ltm_1', probability: 0.88 }]
+    })
+    const withRecall = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ memory_enabled: true }),
+      currentUserMessage: 'what snack should I bring?',
+      options: { runtimeFlavor: 'vercel', jevJuiceMemoryRecallProvider: provider }
+    })
+    const withoutRecall = await runServerCompile({
+      sessionId,
+      messages: baseMessages(),
+      agent: apiAgent({ memory_enabled: true }),
+      currentUserMessage: 'what snack should I bring?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+
+    // The compiler only passes the closure through; the recall engine asks it once.
+    expect(provider).toHaveBeenCalledTimes(1)
+    expect(seen[0]).toEqual({ currentUserMessage: 'what snack should I bring?', excludeIds: [] })
+
+    const recalled = currentUserMessageContent(withRecall.server)
+    const plain = currentUserMessageContent(withoutRecall.server)
+    // The inferred memory rides the SINGLE memory channel, labelled, with the agent told.
+    expect(recalled).toContain('Memory context:')
+    expect(recalled).toContain('[recalled (inferred 0.88) | ltm | mem_ltm_1 | importance 6 |')
+    expect(recalled).toContain('    The user is allergic to shellfish.')
+    expect(recalled).toContain("were brought in by Batshit's judgment model (Jev Juice)")
+    expect(withRecall.server.structuredInput?.metadata?.memoryContext?.inserts).toEqual([
+      expect.objectContaining({ id: 'mem_ltm_1', source: 'recall', status: 'new', inferred: true, inferredProbability: 0.88 })
+    ])
+    // No provider: not one inferred byte, and nothing else moved.
+    expect(plain).not.toContain('inferred')
+    expect(plain).not.toContain('mem_ltm_1')
+    // Jev output never reaches the system prompt zone (DL-120-05).
+    expect(withRecall.server.primarySystemPrompt).toBe(withoutRecall.server.primarySystemPrompt)
+
+    // A memory-off agent has no recall engine run, so the provider is never asked.
+    {
+      const offSession = nextSessionId()
+      state.current = freshState(offSession)
+      const offProvider = vi.fn(async () => [{ id: 'mem_ltm_1', probability: 0.99 }])
+      const off = await runServerCompile({
+        sessionId: offSession,
+        messages: baseMessages(),
+        agent: apiAgent(),
+        currentUserMessage: 'what snack should I bring?',
+        options: { runtimeFlavor: 'vercel', jevJuiceMemoryRecallProvider: offProvider }
+      })
+      const offPlain = await runServerCompile({
+        sessionId: offSession,
+        messages: baseMessages(),
+        agent: apiAgent(),
+        currentUserMessage: 'what snack should I bring?',
+        options: { runtimeFlavor: 'vercel' }
+      })
+      expect(offProvider).not.toHaveBeenCalled()
+      expect(currentUserMessageContent(off.server)).toBe(currentUserMessageContent(offPlain.server))
+    }
+
+    // Group recall is inert in v1: a group compile never asks either.
+    {
+      const groupSession = nextSessionId()
+      state.current = freshState(groupSession)
+      seedLtm(groupSession)
+      const groupProvider = vi.fn(async () => [{ id: 'mem_ltm_1', probability: 0.99 }])
+      const group = await runServerCompile({
+        sessionId: groupSession,
+        messages: baseMessages(),
+        agent: apiAgent({ memory_enabled: true }),
+        currentUserMessage: 'what snack should I bring?',
+        options: {
+          runtimeFlavor: 'vercel',
+          jevJuiceMemoryRecallProvider: groupProvider,
+          groupContext: {
+            agentOrder: [AGENT_ID],
+            agentDisplayNames: { [AGENT_ID]: 'Cody' },
+            currentAgentId: AGENT_ID
+          }
+        }
+      })
+      expect(groupProvider).not.toHaveBeenCalled()
+      expect(currentUserMessageContent(group.server)).not.toContain('Memory context:')
+    }
+  })
+
+
+  it('S25 SA-120 P5: the smart zip provider is told exactly which zips the first pass left compressed; what it returns is expanded for THIS compile through an overlay and one more pass; the compile writes nothing; a wrong id opens nothing; no provider or a quiet answer moves no byte', async () => {
+    const LIST_ZIP = 'cool_tool_1779416324513_list1'
+    const READ_ZIP = 'cool_tool_1779416324999_read1'
+    const BIG_ZIP = 'cool_tool_1779416325555_bigg1'
+    const seedZips = () => {
+      state.current.zips.set(LIST_ZIP, {
+        id: LIST_ZIP,
+        type: 'cool_tool',
+        content: JSON.stringify({ toolName: 'bash', operationKind: 'bash', toolArgs: { command: 'ls src' }, toolResult: { stdout: 'alpha-entry.ts\nbeta-entry.ts', stderr: '', exitCode: 0 } }),
+        tokens: 310,
+        description: 'bash: ls src - exit 0 - 2 lines',
+        metadata: { toolName: 'bash', operationKind: 'bash', promptTokens: 310 }
+      })
+      state.current.zips.set(READ_ZIP, {
+        id: READ_ZIP,
+        type: 'cool_tool',
+        content: JSON.stringify({ toolName: 'read_file', operationKind: 'read_file', toolArgs: { path: 'notes.md' }, toolResult: { content: 'alpha\nbeta\ngamma', lines: 3 } }),
+        tokens: 40,
+        description: 'read_file: notes.md - 3 lines',
+        metadata: { toolName: 'read_file', operationKind: 'read_file', promptTokens: 40 }
+      })
+      state.current.zips.set(BIG_ZIP, {
+        id: BIG_ZIP,
+        type: 'cool_tool',
+        content: JSON.stringify({ toolName: 'bash', operationKind: 'bash', toolArgs: { command: 'ls huge' }, toolResult: { stdout: 'huge-entry.ts', stderr: '', exitCode: 0 } }),
+        tokens: 41000,
+        description: 'bash: ls huge - exit 0 - 9000 lines',
+        metadata: { toolName: 'bash', operationKind: 'bash', promptTokens: 41000, forceCompress: true }
+      })
+    }
+    const zipMessages = () => [
+      ...baseMessages(),
+      { id: 'msg-3', role: 'user', content: 'List the source folder', timestamp: '2026-06-12T09:01:00.000Z', metadata: {} },
+      {
+        id: 'msg-4',
+        role: 'assistant',
+        content: `Listed it: {{batshit-zip:${LIST_ZIP}:::bash: ls src - exit 0 - 2 lines}} and {{batshit-zip:${BIG_ZIP}:::bash: ls huge - exit 0 - 9000 lines}}`,
+        timestamp: '2026-06-12T09:01:30.000Z',
+        metadata: { zipIds: [LIST_ZIP, BIG_ZIP] }
+      },
+      { id: 'msg-5', role: 'user', content: 'Now read the notes', timestamp: '2026-06-12T09:02:00.000Z', metadata: {} },
+      {
+        id: 'msg-6',
+        role: 'assistant',
+        content: `Read it: {{batshit-zip:${READ_ZIP}:::read_file: notes.md - 3 lines}}`,
+        timestamp: '2026-06-12T09:02:30.000Z',
+        metadata: { zipIds: [READ_ZIP] }
+      }
+    ] as any[]
+    // Bash is Auto here (compressed at once); Read File is Normal with room in its buffer.
+    const agent = apiAgent({
+      auto_zip_execute_command: true,
+      auto_zip_read_file: false,
+      buffer_size_read_file: 3,
+      zip_threshold_read_file: 0,
+      zip_ai_view_mode: 'inline'
+    })
+    const open = (zipId: string) => ({ zipId, description: 'bash: ls src - exit 0 - 2 lines', tokens: 310, probability: 0.84, durationMessages: 2 })
+    const exposedReports: any[][] = []
+    const compile = (sessionId: string, provider?: any) =>
+      runServerCompile({
+        sessionId,
+        messages: zipMessages(),
+        agent,
+        currentUserMessage: 'Which files were in src again?',
+        options: {
+          runtimeFlavor: 'vercel',
+          ...(provider
+            ? { jevJuiceSmartZipProvider: provider, jevJuiceSmartZipExposedObserver: (exposed: any[]) => exposedReports.push(exposed) }
+            : {})
+        }
+      })
+
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    seedZips()
+    const seen: any[] = []
+    const provider = vi.fn(async (context: any) => {
+      seen.push(context)
+      return [open(LIST_ZIP)]
+    })
+    const opened = await compile(sessionId, provider)
+    const plainResult = await compile(sessionId)
+
+    expect(provider).toHaveBeenCalledTimes(1)
+    expect(seen[0].currentUserMessage).toBe('Which files were in src again?')
+    // Exactly what the agent sees as a compressed reference, and nothing it can already read.
+    expect(seen[0].zippedItems.map((zip: any) => zip.zipId)).toEqual([LIST_ZIP, BIG_ZIP])
+    expect(seen[0].zippedItems[0]).toEqual({
+      zipId: LIST_ZIP,
+      zipType: 'cool_tool',
+      description: 'bash: ls src - exit 0 - 2 lines',
+      tokens: 310,
+      operationKind: 'bash',
+      toolName: 'bash',
+      forceCompress: false,
+      rezipped: false,
+      rezippedBy: null,
+      groupUnshared: false,
+      messagesFromEnd: 1
+    })
+
+    const openedText = currentUserMessageContent(opened.server)
+    const plain = currentUserMessageContent(plainResult.server)
+    // Today's compile: the listing is a compressed reference and its content is absent.
+    expect(plain).toContain(`{{batshit-zip:${LIST_ZIP}:::bash: ls src - exit 0 - 2 lines}}`)
+    expect(plain).not.toContain('alpha-entry.ts')
+    expect(plain).toContain('gamma')
+    // The opened compile: the listing's content is in the prompt for THIS message, the DCM
+    // names the new actor, and the safety row stayed zipped.
+    expect(openedText).toContain('alpha-entry.ts')
+    expect(openedText).not.toContain(`{{batshit-zip:${LIST_ZIP}`)
+    expect(openedText).toContain(`{{batshit-zip:${BIG_ZIP}:::bash: ls huge - exit 0 - 9000 lines}}`)
+    expect(openedText).toContain(`| ${LIST_ZIP} | batshit-inferred | temp 0/2`)
+    expect(opened.server.primarySystemPrompt).toBe(plainResult.server.primarySystemPrompt)
+    // The route is told what the FINAL pass left expanded (for the after-reply question): the
+    // buffer-expanded read, and the result Batshit just opened, named as Jev's own unzip.
+    expect(exposedReports).toHaveLength(1)
+    expect(exposedReports[0].map((zip: any) => [zip.zipId, zip.unzippedBy, zip.messagesFromEnd, zip.bufferSize])).toEqual([
+      [LIST_ZIP, 'inferred', 1, 0],
+      [READ_ZIP, null, 0, 3]
+    ])
+    // Read-only: the compile stored nothing. The route writes the state at the accepted-send boundary.
+    const zipStateKeys = () =>
+      [...state.current.kv.keys(), ...state.current.sets.keys()].filter((key) => /^(unzipped|rezipped)/.test(key))
+    expect(zipStateKeys()).toEqual([])
+
+    // A quiet answer, a zip the compile never reported, an oversized safety row, and a provider
+    // that throws all leave history exactly as today's compile produced it.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    for (const answer of [
+      async () => [],
+      async () => [open('cool_tool_1779416329999_nope1')],
+      async () => [open(READ_ZIP)],
+      async () => [open(BIG_ZIP)],
+      async () => {
+        throw new Error('lane bug')
+      }
+    ]) {
+      const same = await compile(sessionId, answer)
+      expect(currentUserMessageContent(same.server)).toBe(plain)
+    }
+    errorSpy.mockRestore()
+
+    // A precompiled history (group runs) was not compiled here, so the provider is never asked.
+    const groupSession = nextSessionId()
+    state.current = freshState(groupSession)
+    seedZips()
+    const groupProvider = vi.fn(async () => [open(LIST_ZIP)])
+    await runServerCompile({
+      sessionId: groupSession,
+      messages: zipMessages(),
+      agent,
+      currentUserMessage: 'Which files were in src again?',
+      options: {
+        runtimeFlavor: 'vercel',
+        precompiledHistory: { formattedMessages: ['Earlier'], currentDay: null, chatHistory: 'Earlier' },
+        jevJuiceSmartZipProvider: groupProvider
+      }
+    })
+    expect(groupProvider).not.toHaveBeenCalled()
+  })
+
   it('S20e SA-113: a DM-enabled agent with an EMPTY inbox pays no DCM bytes', async () => {
     const sessionId = nextSessionId()
     state.current = freshState(sessionId)
@@ -2014,5 +2591,229 @@ describe('buildFormattedChatInput compile contract (DL-5 / G-0001)', () => {
 
     expect(currentUserMessageContent(server)).not.toContain('DMs (your inbox')
     expect(server.structuredInput?.metadata?.dmsContext).toBeUndefined()
+  })
+
+  it('S26 F-P5-11: a compile that pauses while another chat compiles still reads its OWN unzips and rezips, in history, the DCM, and the unzipped count', async () => {
+    const sessionA = nextSessionId()
+    const sessionB = nextSessionId()
+    state.current = freshState(sessionA)
+    const aUnzipped = overlapBashZip(OVERLAP_ZIPS.aUnzipped, 'alpha')
+    const aRezipped = overlapReadZip(OVERLAP_ZIPS.aRezipped, 'alpha')
+    state.current.zips.set(aUnzipped.zip.id, aUnzipped.zip)
+    state.current.zips.set(aRezipped.zip.id, aRezipped.zip)
+    // Chat A: the user holds the Auto-zipped listing open and zipped the in-buffer read by hand.
+    seedUserUnzip(sessionA, aUnzipped.zip.id, aUnzipped.zip.description)
+    seedUserRezip(sessionA, aRezipped.zip.id)
+    const chatB = seedOverlapChatB(sessionB)
+
+    const { first: resultA, second: resultB } = await runOverlapping({
+      pauseZipId: aUnzipped.zip.id,
+      secondZipId: chatB.b1.zip.id,
+      first: () =>
+        runServerCompile({
+          sessionId: sessionA,
+          messages: overlapMessages([
+            { content: `Listed it: ${aUnzipped.ref}`, zipIds: [aUnzipped.zip.id] },
+            { content: `Read it: ${aRezipped.ref}`, zipIds: [aRezipped.zip.id] }
+          ]),
+          agent: overlapAgent(),
+          currentUserMessage: 'What was in alpha?',
+          options: { runtimeFlavor: 'vercel' }
+        }),
+      second: chatB.compile
+    })
+
+    const textA = currentUserMessageContent(resultA.server)
+    // A's user unzip still expands the Auto-zipped listing...
+    expect(textA).toContain(aUnzipped.body)
+    expect(textA).not.toContain(aUnzipped.ref)
+    // ...and A's hand-made rezip still compresses the read its buffer would have kept open.
+    expect(textA).toContain(aRezipped.ref)
+    expect(textA).not.toContain(aRezipped.body)
+    // The DCM lists A's pin and nothing of B's.
+    expect(textA).toContain(`| ${aUnzipped.zip.id} | user-locked | permanent`)
+    expect(textA).not.toContain(chatB.b1.zip.id)
+    expect(textA).not.toContain(chatB.b2.zip.id)
+    expect(resultA.server.structuredInput.metadata.unzippedItemsCount).toBe(1)
+    expectChatBReadItsOwnState(resultB, chatB)
+  })
+
+  it('S26b F-P5-11: a smart zip turn keeps its in-memory overlay for the second history pass while another chat compiles', async () => {
+    const sessionC = nextSessionId()
+    const sessionB = nextSessionId()
+    state.current = freshState(sessionC)
+    const cOpened = overlapBashZip(OVERLAP_ZIPS.cOpened, 'charlie')
+    state.current.zips.set(cOpened.zip.id, cOpened.zip)
+    const chatB = seedOverlapChatB(sessionB)
+    const provider = vi.fn(async () => [
+      {
+        zipId: cOpened.zip.id,
+        description: cOpened.zip.description,
+        tokens: 310,
+        probability: 0.84,
+        durationMessages: 2
+      }
+    ])
+    const exposedReports: any[][] = []
+
+    const { first: resultC, second: resultB } = await runOverlapping({
+      pauseZipId: cOpened.zip.id,
+      // The first read belongs to the first history pass; the second pass reads it again.
+      pauseOnRead: 2,
+      secondZipId: chatB.b1.zip.id,
+      first: () =>
+        runServerCompile({
+          sessionId: sessionC,
+          messages: overlapMessages([{ content: `Listed it: ${cOpened.ref}`, zipIds: [cOpened.zip.id] }]),
+          agent: overlapAgent(),
+          currentUserMessage: 'What was in charlie?',
+          options: {
+            runtimeFlavor: 'vercel',
+            jevJuiceSmartZipProvider: provider,
+            jevJuiceSmartZipExposedObserver: (exposed: any[]) => exposedReports.push(exposed)
+          }
+        }),
+      second: chatB.compile
+    })
+
+    expect(provider).toHaveBeenCalledTimes(1)
+    const textC = currentUserMessageContent(resultC.server)
+    expect(textC).toContain(cOpened.body)
+    expect(textC).not.toContain(cOpened.ref)
+    expect(textC).toContain(`| ${cOpened.zip.id} | batshit-inferred | temp 0/2`)
+    expect(textC).not.toContain(chatB.b1.zip.id)
+    expect(textC).not.toContain(chatB.b2.zip.id)
+    expect(resultC.server.structuredInput.metadata.unzippedItemsCount).toBe(1)
+    expect(exposedReports).toHaveLength(1)
+    expect(exposedReports[0].map((zip: any) => [zip.zipId, zip.unzippedBy])).toEqual([
+      [cOpened.zip.id, 'inferred']
+    ])
+    expectChatBReadItsOwnState(resultB, chatB)
+  })
+
+  it('S26c F-P5-11: a group history pass reads its own chat\'s unzips while another chat compiles', async () => {
+    const sessionG = nextSessionId()
+    const sessionB = nextSessionId()
+    state.current = freshState(sessionG)
+    const gUnzipped = overlapBashZip(OVERLAP_ZIPS.gUnzipped, 'golf')
+    state.current.zips.set(gUnzipped.zip.id, gUnzipped.zip)
+    seedUserUnzip(sessionG, gUnzipped.zip.id, gUnzipped.zip.description)
+    const chatB = seedOverlapChatB(sessionB)
+    const agent = overlapAgent()
+
+    const { first: groupHistory, second: resultB } = await runOverlapping({
+      pauseZipId: gUnzipped.zip.id,
+      secondZipId: chatB.b1.zip.id,
+      first: () =>
+        runServerGroupHistory({
+          sessionId: sessionG,
+          messages: overlapMessages([{ content: `Listed it: ${gUnzipped.ref}`, zipIds: [gUnzipped.zip.id] }], agent.id),
+          agent,
+          options: { groupToolSharing: { currentAgentId: agent.id, sharedTools: [] } }
+        }),
+      second: chatB.compile
+    })
+
+    expect(groupHistory.chatHistory).toContain(gUnzipped.body)
+    expect(groupHistory.chatHistory).not.toContain(gUnzipped.ref)
+    expectChatBReadItsOwnState(resultB, chatB)
+  })
+
+  it('S27 F-P5-11: a group history pass reads the chat\'s zip state from Redis, never what an earlier compile of the same chat left in memory', async () => {
+    const sessionG = nextSessionId()
+    state.current = freshState(sessionG)
+    const gUnzipped = overlapBashZip(OVERLAP_ZIPS.gUnzipped, 'golf')
+    state.current.zips.set(gUnzipped.zip.id, gUnzipped.zip)
+    seedUserUnzip(sessionG, gUnzipped.zip.id, gUnzipped.zip.description)
+    const agent = overlapAgent()
+    const messages = () =>
+      overlapMessages([{ content: `Listed it: ${gUnzipped.ref}`, zipIds: [gUnzipped.zip.id] }], agent.id)
+
+    const pinned = await runServerCompile({
+      sessionId: sessionG,
+      messages: messages(),
+      agent,
+      currentUserMessage: 'What was in golf?',
+      options: { runtimeFlavor: 'vercel' }
+    })
+    expect(currentUserMessageContent(pinned.server)).toContain(gUnzipped.body)
+
+    // The user returns the listing to automatic: its manual state leaves Redis.
+    state.current.sets.delete(`unzipped:${sessionG}`)
+    state.current.kv.delete(`unzipped_item:${sessionG}:${gUnzipped.zip.id}`)
+
+    const groupHistory = await runServerGroupHistory({
+      sessionId: sessionG,
+      messages: messages(),
+      agent,
+      options: { groupToolSharing: { currentAgentId: agent.id, sharedTools: [] } }
+    })
+    expect(groupHistory.chatHistory).toContain(gUnzipped.ref)
+    expect(groupHistory.chatHistory).not.toContain(gUnzipped.body)
+  })
+
+  it('S28 (2026-09-18): a compile never runs a live MCP tool discovery for an assigned subagent, and the roster still names its gateway', async () => {
+    // From `3ef1c664f` (2026-08-30) the compiler still built a full system prompt for every
+    // subagent, including its DYNAMIC INFO, which discovers every reachable gateway's tools
+    // live, and then threw it away. On the smoke stack that made one Token Panel preview take
+    // 1 to 7 s and ran on every send too. A delegated run builds its own (`subagentRunner.ts`).
+    const sessionId = nextSessionId()
+    state.current = freshState(sessionId)
+    state.current.kv.set(`mcp_gateways:${USER_ID}`, {
+      gateways: [
+        {
+          id: 'gw_probe',
+          name: 'Probe Gateway',
+          slug: 'probe_gateway',
+          type: 'custom',
+          url: 'http://127.0.0.1:9/mcp',
+          enabled: true
+        }
+      ]
+    })
+    const assignedSubagents = [
+      {
+        id: 'mcp_helper',
+        name: 'MCP Helper',
+        description: 'Reaches the probe gateway',
+        subagentType: 'cli',
+        defaultMCPGateways: ['gw_probe'],
+        provider_specific_settings: { nativeTools: { dynamicMcpEnabled: true } }
+      }
+    ]
+    const { mcpGatewayDiscovery } = await import('$lib/server/services/mcpGatewayDiscovery')
+    const discovery = vi
+      .spyOn(mcpGatewayDiscovery, 'loadToolsForUser')
+      .mockResolvedValue({ tools: {}, metadata: new Map() } as any)
+    const discoveredSubagentGateway = () =>
+      discovery.mock.calls.some(([, gatewayIds]) => Array.isArray(gatewayIds) && gatewayIds.includes('gw_probe'))
+
+    try {
+      // A Token Panel preview: the chat, no current message, so no DCM.
+      const preview = await runServerCompile({
+        sessionId,
+        messages: baseMessages(),
+        agent: apiAgent(),
+        assignedSubagents,
+        options: { runtimeFlavor: 'vercel' }
+      })
+      expect(discovery).not.toHaveBeenCalled()
+      expect(preview.server.subagentDescription).toMatchObject({ mcp_helper: 'Reaches the probe gateway' })
+
+      // A send: the primary's own DCM may discover its gateways; never the subagent's.
+      const send = await runServerCompile({
+        sessionId,
+        messages: baseMessages(),
+        agent: apiAgent(),
+        currentUserMessage: 'ask the helper',
+        assignedSubagents,
+        options: { runtimeFlavor: 'vercel' }
+      })
+      expect(discoveredSubagentGateway()).toBe(false)
+      // The roster line still carries the subagent's gateway by name, from its resolved scope.
+      expect(currentUserMessageContent(send.server)).toContain('MCP (Probe Gateway)')
+    } finally {
+      discovery.mockRestore()
+    }
   })
 })

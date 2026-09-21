@@ -38,6 +38,7 @@ import {
   normalizeUploadUrlsForStorageInPayload,
   resolveUploadUrlsForBrowserInPayload
 } from '$lib/server/services/batshitServerUrls'
+import { keepAnsweredApprovals } from '$lib/server/services/toolApprovalState'
 
 async function resolveRuntimeRedisUrl(): Promise<string> {
   return resolveRedisConnectionUrl({
@@ -406,6 +407,13 @@ export class RedisService {
     })
   }
 
+  /**
+   * Sweep a chat and every key it owns. The SWEEP only: a server route deletes a chat through
+   * `deleteSessionStoppingItsTurn` (`sessionDeleteTurnStop.ts`), which stops the chat's running
+   * reply first and calls this once that reply's request is done (2026-09-18). Swept under a
+   * running reply, the reply's request went on writing its message, message list, zip, zip set,
+   * and Execution Viewer log into a chat that no longer existed.
+   */
   async deleteSession(id: string): Promise<void> {
     return this.execute(async (client) => {
       try {
@@ -677,6 +685,16 @@ export class RedisService {
           console.error(`[deleteSession] Error deleting rezipped data:`, rezipError)
         }
 
+        // SA-120 P6: what the Jev Juice after-reply check noticed about this chat's replies
+        // (`jev_post_turn:{id}` + `jev_post_turn_item:{id}:*`). Session-scoped, no TTL, so this
+        // sweep is the only thing that ever removes them.
+        try {
+          const { sweepPostTurnRecords } = await import('$lib/server/services/postTurnCheckState')
+          await sweepPostTurnRecords(id)
+        } catch (postTurnError) {
+          console.error(`[deleteSession] Error deleting Jev Juice after-reply records:`, postTurnError)
+        }
+
         // Delete message counter for this session (Story 6.9b)
         try {
           await client.del(`message_counter:${id}`)
@@ -773,15 +791,14 @@ export class RedisService {
    * The LAST `limit` messages of a session, oldest-first within that window.
    *
    * SA-113 P3 (F-P2-1). `getMessages` above is `lRange(key, 0, limit - 1)` — the FIRST
-   * `limit` messages — which is right for "load the whole chat" callers passing a limit
-   * larger than the chat, and silently wrong for every caller that meant "the recent end".
+   * `limit` messages — which is right for callers that explicitly want the beginning, and
+   * silently wrong for every caller that meant "the recent end".
    * Four callers meant the recent end and were reading ancient history on any chat longer
    * than their window: the DM chain-depth guard, the DM presence check, the wake-up
    * primitive's history re-read, and the LiveKit voice context seed.
    *
-   * Use THIS one whenever the window is smaller than a chat could be. Use `getMessages`
-   * only when you genuinely want the beginning, or when the limit is a safety ceiling on a
-   * full read.
+   * Use THIS one whenever the window is smaller than a chat could be. Use `getAllMessages`
+   * for a complete transcript; never guess a limit that the chat might outgrow.
    */
   async getRecentMessages(sessionId: string, limit = 100): Promise<ChatMemoryRow[]> {
     if (!Number.isFinite(limit) || limit <= 0) return []
@@ -809,9 +826,34 @@ export class RedisService {
     })
   }
 
+  /** Every stored message in conversation order. Reserved for genuinely full-history work. */
+  async getAllMessages(sessionId: string): Promise<ChatMemoryRow[]> {
+    return this.execute(async (client) => {
+      const messageIds = await client.lRange(`messages:${sessionId}`, 0, -1)
+      const messages: ChatMemoryRow[] = []
+      for (const msgId of messageIds) {
+        try {
+          const messageData = await client.json.get(`message:${sessionId}:${msgId}`)
+          if (messageData) messages.push(messageData as unknown as ChatMemoryRow)
+        } catch (error) {
+          logger.warn(`Failed to load message ${msgId}:`, error)
+        }
+      }
+      return messages
+    })
+  }
+
+  /** The browser/current-context window: newest 1,000 messages, in conversation order. */
   async getSessionMessages(sessionId: string): Promise<Message[]> {
-    const messages = await this.getMessages(sessionId, 1000)
-    
+    return this.toSessionMessages(await this.getRecentMessages(sessionId, 1000))
+  }
+
+  /** The complete stored transcript. Do not use this for model context or the browser window. */
+  async getAllSessionMessages(sessionId: string): Promise<Message[]> {
+    return this.toSessionMessages(await this.getAllMessages(sessionId))
+  }
+
+  private toSessionMessages(messages: ChatMemoryRow[]): Message[] {
     return messages.map(msg => {
       const metadata =
         msg.metadata && typeof msg.metadata === 'object'
@@ -919,6 +961,12 @@ export class RedisService {
       // Convert to ChatMemoryRow format
       const role = (message as any).role
       const sessionId = (message as any).session_id || ''
+      // A message belongs to a chat that exists. The `updateSession` / `touchSession` at the end
+      // refused a chat that no longer exists, but only AFTER the message was written and pushed
+      // onto the list, which left both behind for a chat deleted mid-reply (2026-09-18).
+      if (sessionId && !(await client.exists(`session:${sessionId}`))) {
+        throw new Error('Session not found')
+      }
       const metadata = (message as any).metadata
       const trustedClipIds = await collectTrustedClipIds(sessionId, metadata)
       const messageData: ChatMemoryRow = {
@@ -959,10 +1007,12 @@ export class RedisService {
           messageData.metadata && typeof messageData.metadata === 'object'
             ? messageData.metadata
             : {}
-        messageData.metadata = {
+        // The approvals a click answered are the server's record (`toolApprovalState.ts`): a
+        // tab's copy of this message can predate the click, and its save must not undo it.
+        messageData.metadata = keepAnsweredApprovals(existingMetadata, {
           ...existingMetadata,
           ...incomingMetadata
-        }
+        })
 
         if (!messageData.intermediateSteps && existingObj.intermediateSteps) {
           messageData.intermediateSteps = existingObj.intermediateSteps
@@ -1070,6 +1120,10 @@ export class RedisService {
       
       // Remove from session's message list
       await client.lRem(`messages:${sessionId}`, 0, messageId)
+
+      // SA-120 P6: a Jev Juice after-reply record annotates exactly one reply and goes with it.
+      const { deletePostTurnRecord } = await import('$lib/server/services/postTurnCheckState')
+      await deletePostTurnRecord(sessionId, messageId)
 
       // Clear any stale per-session message cache so refresh reloads the live list.
       await client.del(`session:${sessionId}:messages`)
@@ -1368,6 +1422,40 @@ export class RedisService {
       if (agentObj?.user_id) {
         const userId = agentObj.user_id as string
         await client.sRem(`user:${userId}:agents`, id)
+
+        // 2026-09-19 (Josh: "when you delete an agent, it should delete everything about that
+        // agent"): the agent's id also sits inside two per-user lists that are not the agent's
+        // own records — a skill's `enabled_agent_ids` (Settings → Skills, enabled for chosen
+        // agents) and an artifact's `agent_allowlist` (Artifacts → Agent use). Each scrub is
+        // a path-scoped write of that ONE field: a whole-record write here would race the
+        // skill registry and the artifacts service, which own those records.
+        const scrubAgentIdList = async (key: string, path: string) => {
+          const raw = await client.json.get(key, { path: `$${path}` })
+          const list = Array.isArray(raw) && raw.length > 0 && Array.isArray(raw[0]) ? raw[0] : null
+          if (!list || !list.includes(id)) return false
+          await client.json.set(key, `$${path}`, list.filter((value) => value !== id) as any)
+          return true
+        }
+        try {
+          const skillKeys = await client.keys(`slash_command:${userId}:*`)
+          let scrubbed = 0
+          for (const key of skillKeys) {
+            if (await scrubAgentIdList(key, '.enabled_agent_ids')) scrubbed += 1
+          }
+          if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} skill enable-list(s)`)
+        } catch (skillError) {
+          console.error(`[deleteAgent] Error scrubbing skill enable-lists:`, skillError)
+        }
+        try {
+          const artifactIds = await client.sMembers(`user:${userId}:artifacts`)
+          let scrubbed = 0
+          for (const artifactId of artifactIds) {
+            if (await scrubAgentIdList(`artifact:${artifactId}`, '.agent_allowlist')) scrubbed += 1
+          }
+          if (scrubbed > 0) logger.debug(`[deleteAgent] Removed ${id} from ${scrubbed} artifact allow-list(s)`)
+        } catch (artifactError) {
+          console.error(`[deleteAgent] Error scrubbing artifact allow-lists:`, artifactError)
+        }
 
         const groupIds = await client.sMembers(`user:${userId}:groups`)
         for (const groupId of groupIds) {
@@ -2156,10 +2244,18 @@ export class RedisService {
     })
   }
 
+  /**
+   * Delete a folder. With `deleteSessions`, its chats go too, each through the caller's
+   * `deleteSession`: the folder route passes `deleteSessionStoppingItsTurn`, which stops a chat's
+   * running reply before sweeping it (`sessionDeleteTurnStop.ts`). The type makes the caller
+   * choose, so this facade never sweeps a chat under a running reply by default.
+   */
   async deleteFolder(
     userId: string,
     folderId: string,
-    options: { deleteSessions?: boolean } = {}
+    options:
+      | { deleteSessions?: false }
+      | { deleteSessions: true; deleteSession: (sessionId: string) => Promise<unknown> } = {}
   ): Promise<{
     success: boolean
     moved_to?: string
@@ -2228,7 +2324,7 @@ export class RedisService {
       }
 
       for (const sessionId of validation.sessionIds) {
-        await this.deleteSession(sessionId)
+        await options.deleteSession(sessionId)
       }
 
       return this.execute(async (client) => {

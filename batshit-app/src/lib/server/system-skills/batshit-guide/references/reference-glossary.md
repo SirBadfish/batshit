@@ -120,7 +120,7 @@ Apple's local container system used by the Mac app as Batshit's default sandbox 
 
 ### Docker Sandbox
 
-Batshit's isolated command-execution backend. In Docker installs it uses a first-party host operator path instead of mounting the host Docker socket into the app container.
+Batshit's isolated command-execution backend. It runs through Docker's free `sbx` tool on the host computer, which needs a one-time setup: see [Set up Docker Sandbox](../installation/install-docker.md#set-up-docker-sandbox). In Docker installs it uses a first-party host operator path instead of mounting the host Docker socket into the app container.
 
 ### Dynamic Current Message
 
@@ -139,6 +139,10 @@ The Voice Settings area for managing BYO TTS/STT engines and related local/exter
 ### Episode
 
 A natural stretch of conversation inside an Infinite Session (for example, one afternoon of work). Finished episodes graduate: they are summarized into the agent's memory while the original messages stay stored and searchable.
+
+### Episode Whiteboard
+
+The agent's own working notes for the current episode of an Infinite Session: the goal, the decisions made, what is live right now, and the open items. Batshit shows the board to the agent with every message until the episode ends, and the agent rewrites it deliberately with a tool. It is not the model's thinking (that happens inside one reply and is gone by the next); it is a small sticky note that outlives replies. It belongs to the agent: a nap fills it only when the agent has not written one, and never rewrites a board the agent wrote. You can read it in the Execution Viewer (the compiled message carries an "Episode whiteboard" section), and the Infinite Session's menu says when it was last written and by whom.
 
 ### Execution Viewer
 
@@ -259,7 +263,7 @@ A separate n8n workflow with its own webhook, called by an `API` or `CLI` Primar
 
 ### Nap
 
-An Infinite Session's between-turns context relief: graduate finished episodes, compress stale tool output, and condense the oldest open-episode narrative while promoting key working facts onto the episode whiteboard. Replaces Compact inside Infinite Sessions; every nap leaves a visible record.
+An Infinite Session's between-turns context relief: graduate finished episodes, compress stale tool output, and condense the oldest open-episode narrative into memory. The episode whiteboard belongs to the agent: a nap fills it only when the agent has not written one, and never rewrites a board the agent wrote. Replaces Compact inside Infinite Sessions; every nap leaves a visible record.
 
 ## P
 

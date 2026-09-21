@@ -23,6 +23,7 @@ import {
   parseOtoolInstallName,
   parseOtoolLibraries
 } from './managed-runtime-portability.mjs';
+import { inspectFfmpegRuntimeCapabilities } from './ffmpeg-runtime-capabilities.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
@@ -31,6 +32,9 @@ const repoRoot = resolve(macRoot, '..');
 const nodeVersion = process.env.BATSHIT_MAC_NODE_VERSION || '24.17.0';
 const redisVersion = process.env.BATSHIT_MAC_REDIS_VERSION || '8.10.1';
 const ffmpegVersion = process.env.BATSHIT_MAC_FFMPEG_VERSION || '8.1.2';
+const dav1dVersion = '1.5.4';
+const dav1dArchiveSha256 = '686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5';
+const dav1dInstallPrefix = '/opt/batshit/dav1d';
 const opensslVersion = process.env.BATSHIT_MAC_OPENSSL_VERSION || '3.5.7';
 const minimumMacosVersion =
   process.env.BATSHIT_MAC_MINIMUM_VERSION || MAC_RUNTIME_MINIMUM_VERSION;
@@ -76,6 +80,8 @@ const REDIS_BUNDLED_BINARIES = ['redis-server', 'redis-cli', 'redis-check-aof', 
 const REDIS_UNWINDER_SUBSTITUTIONS = new Map([['libunwind.1.dylib', '/usr/lib/libSystem.B.dylib']]);
 const ffmpegFilename = `ffmpeg-${ffmpegVersion}.tar.xz`;
 const ffmpegArchiveUrl = `https://ffmpeg.org/releases/${ffmpegFilename}`;
+const dav1dFilename = `dav1d-${dav1dVersion}.tar.xz`;
+const dav1dArchiveUrl = `https://download.videolan.org/pub/videolan/dav1d/${dav1dVersion}/${dav1dFilename}`;
 const opensslFilename = `openssl-${opensslVersion}.tar.gz`;
 const opensslArchiveUrl = `https://www.openssl.org/source/${opensslFilename}`;
 const opensslSha256Url = `${opensslArchiveUrl}.sha256`;
@@ -722,31 +728,66 @@ async function copyFfmpegLicenseFiles(sourceDir, dest) {
   }
 }
 
-async function assertCleanFfmpegBuild(ffmpegBin) {
-  const version = run(ffmpegBin, ['-hide_banner', '-version']);
-  const versionOutput = `${version.stdout}\n${version.stderr}`;
-  const configLine = versionOutput
-    .split(/\r?\n/)
-    .find((line) => line.startsWith('configuration:')) || '';
-  if (!configLine) throw new Error('Built FFmpeg did not report a configuration line.');
-  if (configLine.includes('--enable-gpl')) throw new Error('Built FFmpeg unexpectedly includes --enable-gpl.');
-  if (configLine.includes('--enable-nonfree')) throw new Error('Built FFmpeg unexpectedly includes --enable-nonfree.');
-  const encoders = run(ffmpegBin, ['-hide_banner', '-encoders']);
-  if (!/\bh264_videotoolbox\b/.test(`${encoders.stdout}\n${encoders.stderr}`)) {
-    throw new Error('Built FFmpeg does not expose h264_videotoolbox.');
+async function assertCleanFfmpegBuild(runtimeRoot) {
+  const capabilities = await inspectFfmpegRuntimeCapabilities(runtimeRoot);
+  if (!capabilities.ok) {
+    throw new Error(`Built FFmpeg does not satisfy the Mac media contract:\n- ${capabilities.issues.join('\n- ')}`);
   }
-  return { versionOutput, configLine };
+  return capabilities;
+}
+
+async function prepareDav1d() {
+  for (const command of ['meson', 'ninja', 'pkg-config']) await ensureTool(command);
+  const archive = join(downloadsRoot, dav1dFilename);
+  await download(dav1dArchiveUrl, archive);
+  const actualSha = await sha256(archive);
+  if (actualSha !== dav1dArchiveSha256) {
+    throw new Error(`dav1d ${dav1dVersion} archive checksum mismatch: expected ${dav1dArchiveSha256}, got ${actualSha}.`);
+  }
+  const extractRoot = join(buildRoot, 'dav1d-extract');
+  const compileRoot = join(buildRoot, 'dav1d-compile');
+  const stageRoot = join(buildRoot, 'dav1d-stage');
+  for (const dir of [extractRoot, compileRoot, stageRoot]) await resetDir(dir);
+  run('tar', ['-xJf', archive, '-C', extractRoot], { stdio: 'inherit' });
+  const sourceDir = await findDirContaining(extractRoot, 'meson.build');
+  const targetFlags = `-arch arm64 -mmacosx-version-min=${minimumMacosVersion}`;
+  const buildEnv = {
+    ...process.env,
+    MACOSX_DEPLOYMENT_TARGET: minimumMacosVersion,
+    CFLAGS: targetFlags,
+    LDFLAGS: targetFlags
+  };
+  const configureArgs = [
+    'setup', compileRoot, sourceDir,
+    `--prefix=${dav1dInstallPrefix}`, '--libdir=lib',
+    '--default-library=static', '--buildtype=release',
+    '-Denable_tools=false', '-Denable_tests=false',
+    '-Denable_examples=false', '-Denable_docs=false'
+  ];
+  log(`Building static dav1d ${dav1dVersion} for software AV1 decoding on macOS ${minimumMacosVersion}+`);
+  run('meson', configureArgs, { env: buildEnv, stdio: 'inherit' });
+  run('meson', ['compile', '-C', compileRoot, '-j', String(Math.max(1, Math.min(cpus().length, 8)))], {
+    env: buildEnv, stdio: 'inherit'
+  });
+  run('meson', ['install', '-C', compileRoot, '--destdir', stageRoot], { env: buildEnv, stdio: 'inherit' });
+  const installRoot = join(stageRoot, ...dav1dInstallPrefix.split('/').filter(Boolean));
+  return { sourceDir, stageRoot, installRoot, buildEnv, configureArgs };
 }
 
 async function prepareFfmpeg() {
   const dest = join(assetsRoot, 'ffmpeg');
-  if (!options.force && (await exists(join(dest, 'bin', 'ffmpeg'))) && (await exists(join(dest, 'BUILD-CONFIG.txt')))) {
+  if (!options.force && (await exists(join(dest, 'bin', 'ffmpeg'))) && (await exists(join(dest, 'bin', 'ffprobe'))) && (await exists(join(dest, 'BUILD-CONFIG.txt')))) {
     const portability = await inspectManagedRuntimePortability(dest, {
       maximumMinimumVersion: minimumMacosVersion
     });
     const buildConfig = await readFile(join(dest, 'BUILD-CONFIG.txt'), 'utf8').catch(() => '');
+    const capabilities = await inspectFfmpegRuntimeCapabilities(dest);
+    const dav1dSource = await readFile(join(dest, 'share', 'dav1d', 'SOURCE.txt'), 'utf8').catch(() => '');
     if (
       portability.ok &&
+      capabilities.ok &&
+      capabilities.versionOutput.startsWith(`ffmpeg version ${ffmpegVersion} `) &&
+      dav1dSource.includes(`Archive SHA256: ${dav1dArchiveSha256}`) &&
       buildConfig.includes('--disable-autodetect') &&
       buildConfig.includes(`MACOSX_DEPLOYMENT_TARGET=${minimumMacosVersion}`)
     ) {
@@ -754,11 +795,13 @@ async function prepareFfmpeg() {
       return dest;
     }
     log(
-      `Rebuilding non-portable cached FFmpeg runtime: ${
-        portability.issues.join('; ') || 'build flags are stale'
+      `Rebuilding stale or non-portable cached FFmpeg runtime: ${
+        [...portability.issues, ...capabilities.issues].join('; ') || 'version or build flags are stale'
       }`
     );
   }
+
+  const dav1d = await prepareDav1d();
 
   const archive = join(downloadsRoot, ffmpegFilename);
   await download(ffmpegArchiveUrl, archive);
@@ -777,7 +820,7 @@ async function prepareFfmpeg() {
     '--disable-debug',
     '--disable-doc',
     '--disable-ffplay',
-    '--disable-ffprobe',
+    '--enable-ffprobe',
     '--disable-x86asm',
     '--disable-libxcb',
     '--disable-libxcb-shm',
@@ -786,9 +829,17 @@ async function prepareFfmpeg() {
     '--disable-xlib',
     '--enable-audiotoolbox',
     '--enable-avfoundation',
-    '--enable-videotoolbox'
+    '--enable-videotoolbox',
+    '--enable-libdav1d',
+    '--pkg-config-flags=--static'
   ];
-  const buildEnv = { ...process.env, MACOSX_DEPLOYMENT_TARGET: minimumMacosVersion };
+  const buildEnv = {
+    ...process.env,
+    MACOSX_DEPLOYMENT_TARGET: minimumMacosVersion,
+    PKG_CONFIG_PATH: '',
+    PKG_CONFIG_LIBDIR: join(dav1d.installRoot, 'lib', 'pkgconfig'),
+    PKG_CONFIG_SYSROOT_DIR: dav1d.stageRoot
+  };
   log(`Configuring FFmpeg ${ffmpegVersion} for macOS ${minimumMacosVersion}+`);
   run('./configure', configureArgs, { cwd: sourceDir, env: buildEnv, stdio: 'inherit' });
   log('Building FFmpeg. This can take a few minutes.');
@@ -808,12 +859,36 @@ async function prepareFfmpeg() {
   await rm(join(dest, 'lib'), { recursive: true, force: true });
   await rm(join(dest, 'share'), { recursive: true, force: true });
   await copyFfmpegLicenseFiles(sourceDir, dest);
+  const dav1dProofRoot = join(dest, 'share', 'dav1d');
+  await mkdir(dav1dProofRoot, { recursive: true });
+  await cp(join(dav1d.sourceDir, 'COPYING'), join(dav1dProofRoot, 'COPYING'));
+  await writeText(join(dav1dProofRoot, 'SOURCE.txt'), `
+dav1d ${dav1dVersion}, statically linked into FFmpeg and FFprobe.
+Official source archive: ${dav1dArchiveUrl}
+Archive SHA256: ${dav1dArchiveSha256}
+License: BSD-2-Clause; see COPYING.
+Minimum macOS: ${minimumMacosVersion}
+
+Build: MACOSX_DEPLOYMENT_TARGET=${minimumMacosVersion}
+CFLAGS/LDFLAGS: -arch arm64 -mmacosx-version-min=${minimumMacosVersion}
+meson setup <build> <source> ${dav1d.configureArgs.slice(3).map(shellQuote).join(' ')}
+meson compile -C <build>
+meson install -C <build> --destdir <stage>
+FFmpeg pkg-config is isolated to <stage>${dav1dInstallPrefix}/lib/pkgconfig with PKG_CONFIG_SYSROOT_DIR=<stage>.
+`);
+  await writeText(join(dav1dProofRoot, 'CHECKSUMS.txt'), `
+${dav1dArchiveSha256}  ${dav1dFilename}
+${await sha256(join(dav1dProofRoot, 'COPYING'))}  COPYING
+`);
 
   const ffmpegBin = join(dest, 'bin', 'ffmpeg');
+  const ffprobeBin = join(dest, 'bin', 'ffprobe');
   await adHocSignMachOFiles(dest);
   await assertPortableRuntime(dest, 'FFmpeg runtime');
-  const { versionOutput, configLine } = await assertCleanFfmpegBuild(ffmpegBin);
+  const { versionOutput, configLine } = await assertCleanFfmpegBuild(dest);
   const binarySha = await sha256(ffmpegBin);
+  run(ffprobeBin, ['-version']);
+  const probeSha = await sha256(ffprobeBin);
   await writeText(
     join(dest, 'SOURCE.txt'),
     `
@@ -825,6 +900,7 @@ Minimum macOS: ${minimumMacosVersion}
 Prepared: ${new Date().toISOString()}
 
 The packaged Batshit Mac app uses h264_videotoolbox for MP4 preview encoding.
+Software AV1 inspection uses statically linked dav1d ${dav1dVersion}; see share/dav1d for its license and verified source.
 `
   );
   await writeText(
@@ -832,6 +908,7 @@ The packaged Batshit Mac app uses h264_videotoolbox for MP4 preview encoding.
     `
 ${archiveSha}  ${ffmpegFilename}
 ${binarySha}  bin/ffmpeg
+${probeSha}  bin/ffprobe
 `
   );
   await writeText(
@@ -896,6 +973,7 @@ export BATSHIT_MAC_FFMPEG_DIST_DIR=${shellQuote(join(assetsRoot, 'ffmpeg'))}
         redisVersion,
         opensslVersion,
         ffmpegVersion,
+        dav1dVersion,
         minimumMacosVersion,
         assetsRoot,
         prepared

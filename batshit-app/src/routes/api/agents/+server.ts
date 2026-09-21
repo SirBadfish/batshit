@@ -3,6 +3,7 @@ import { redis } from '$lib/server/redis'
 import { syncAgentCodexProfiles } from '$lib/server/services/codexProfileManager'
 import { syncAgentClaudeProfiles } from '$lib/server/services/claudeProfileManager'
 import { validateDmSenderFields } from '$lib/utils/dmControl'
+import { validateJevJuiceAgentFields } from '$lib/utils/jevJuiceControl'
 import { getCodexConfigOverrideValidationError } from '$lib/server/services/codexSettings'
 import { getClaudeConfigOverrideValidationError } from '$lib/server/services/claudeSettings'
 import { sanitizeId } from '$lib/utils/idSanitizer' // Story 6.9c
@@ -73,6 +74,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
     const dmSenderValidationError = validateDmSenderFields(body)
     if (dmSenderValidationError) {
       return json({ error: dmSenderValidationError }, { status: 400 })
+    }
+    // SA-120 P1: the per-agent Jev Juice switch must be a boolean (absent reads as OFF).
+    const jevJuiceValidationError = validateJevJuiceAgentFields(body)
+    if (jevJuiceValidationError) {
+      return json({ error: jevJuiceValidationError }, { status: 400 })
     }
 
     // Story 6.9c: Use provided ID or generate from displayName

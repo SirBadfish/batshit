@@ -8,6 +8,7 @@ import { redis } from '$lib/server/redis'
  *
  * `getMessages(id, n)` is `lRange(key, 0, n - 1)`: the FIRST n, oldest first.
  * `getRecentMessages(id, n)` is the negative-index range: the LAST n, still oldest first.
+ * `getAllMessages(id)` is the unbounded full transcript, oldest first.
  *
  * This suite is on the curated real-Redis lane on purpose. The bug it guards (F-P2-1) was
  * five callers meaning "recent" and reading the beginning of the chat, and the reason no
@@ -35,6 +36,24 @@ async function seedFiveMessages() {
   }
 }
 
+async function seedLongSession(messageCount: number) {
+  await redis.createSession({ id: SESSION, user_id: USER, name: 'Long message window' })
+  await redis.execute(async (client) => {
+    for (let index = 1; index <= messageCount; index += 1) {
+      const id = `msg-${index}`
+      await client.json.set(`message:${SESSION}:${id}`, '$', {
+        id,
+        session_id: SESSION,
+        user_id: USER,
+        role: index % 2 === 1 ? 'user' : 'assistant',
+        content: `message ${index}`,
+        created_at: new Date(index).toISOString()
+      })
+      await client.rPush(`messages:${SESSION}`, id)
+    }
+  })
+}
+
 describe('message window readers (F-P3-3)', () => {
   it('getMessages takes the OLDEST two, and getRecentMessages the NEWEST two', async () => {
     await seedFiveMessages()
@@ -54,11 +73,27 @@ describe('message window readers (F-P3-3)', () => {
     const all = ['msg-1', 'msg-2', 'msg-3', 'msg-4', 'msg-5']
     expect((await redis.getMessages(SESSION, 50)).map((m) => m.id)).toEqual(all)
     expect((await redis.getRecentMessages(SESSION, 50)).map((m) => m.id)).toEqual(all)
+    expect((await redis.getAllMessages(SESSION)).map((m) => m.id)).toEqual(all)
+  })
+
+  it('the session context window takes the newest messages while the transcript reader takes all', async () => {
+    await seedLongSession(1002)
+
+    const currentWindow = await redis.getSessionMessages(SESSION)
+    expect(currentWindow).toHaveLength(1000)
+    expect(currentWindow[0]?.id).toBe('msg-3')
+    expect(currentWindow.at(-1)?.id).toBe('msg-1002')
+
+    const fullTranscript = await redis.getAllSessionMessages(SESSION)
+    expect(fullTranscript).toHaveLength(1002)
+    expect(fullTranscript[0]?.id).toBe('msg-1')
+    expect(fullTranscript.at(-1)?.id).toBe('msg-1002')
   })
 
   it('both answer with nothing for a session that has no messages', async () => {
     await redis.createSession({ id: `${SESSION}-empty`, user_id: USER, name: 'Empty' })
     expect(await redis.getMessages(`${SESSION}-empty`, 5)).toEqual([])
     expect(await redis.getRecentMessages(`${SESSION}-empty`, 5)).toEqual([])
+    expect(await redis.getAllMessages(`${SESSION}-empty`)).toEqual([])
   })
 })

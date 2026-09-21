@@ -13,6 +13,7 @@ The badge tells you the Zip's state at a glance:
 - A **clock with a number** means the item is temporarily unzipped, and the number is how many messages remain before normal behavior resumes.
 - A **hand** means you changed this Zip's state by hand.
 - The **agent-control marker** means an agent changed it (using zip-control permission, if you granted that).
+- A **lightning bolt** means [Jev Juice](../jev-juice/overview.md) opened it for a message, if you turned on **Jev Juice: Smart Zip**. It always comes with a short countdown, and it's never a lock: your own choice, or the agent's, replaces it. A result Jev Juice zipped after a reply says so when you hover its badge.
 - An **infinity icon** means it's being kept unzipped indefinitely.
 - A plain zipped item shows only the zipped state, with no extra icon.
 
@@ -38,7 +39,7 @@ Click any row and Batshit jumps to that item in the conversation and briefly hig
 
 ## What the badge count means
 
-The Zip Manager's badge in the Token row counts **manually unzipped items only** — the ones you deliberately opened, plus any an agent opened through zip-control permission. It is *not* a count of every Zip in the chat. Think of it as "how many things am I currently holding open against the normal rules," which is exactly the number worth keeping an eye on, because held-open content is content the model keeps paying for.
+The Zip Manager's badge in the Token row counts **items held open against the normal rules** — the ones you deliberately opened, any an agent opened through zip-control permission, and any Jev Juice has open for a message or two. It is *not* a count of every Zip in the chat. Think of it as "how many things am I currently holding open against the normal rules," which is exactly the number worth keeping an eye on, because held-open content is content the model keeps paying for.
 
 A Zip you open is treated as yours: an agent shouldn't silently re-compress something you deliberately expanded. Your manual choices sit on top of Batshit's automatic buffer and threshold behavior, and they win.
 

@@ -19,7 +19,8 @@ const registrySource = readFileSync(
 describe('send-routed steer contracts (SA-114 P1)', () => {
   it('clears the steer inbox beside the session-turn lock, in the same finally (DL-114-02)', () => {
     const clearInbox = source.indexOf('clearSteerInbox(sessionId, {')
-    const clearLock = source.indexOf('clearSessionTurn(', clearInbox)
+    // The request releases its own registration (`releaseSessionTurn`, 2026-09-18).
+    const clearLock = source.indexOf('releaseSessionTurn(', clearInbox)
 
     expect(clearInbox).toBeGreaterThan(-1)
     expect(clearLock).toBeGreaterThan(clearInbox)

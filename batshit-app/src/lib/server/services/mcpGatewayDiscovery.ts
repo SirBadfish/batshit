@@ -21,8 +21,16 @@ import { createMCPClient } from '@ai-sdk/mcp'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import { stdioMCPGatewayClient } from './stdioMCPGatewayClient'
+import { resolveStdioGatewayProcessConfig } from './mcpGatewayStdio'
 import { rewriteN8nGatewayUrlForRuntime } from './runtimeUrlRewrites'
 import type { GatewayMetadata, ToolMetadataMap, ToolWithName } from './mcpGatewayTypes'
+import {
+  MCP_TOOL_LIST_FAILURE_SAVED_MS,
+  fingerprintSecret,
+  mcpToolListCache,
+  type ToolListLookup,
+  type ToolListSource
+} from './mcpToolListCache'
 
 /**
  * SA-009: Discovery options for controlling tool loading behavior
@@ -32,6 +40,8 @@ export interface DiscoveryOptions {
   skipFiltering?: boolean
   /** Optional project path for cwdPolicy=project stdio MCP gateways */
   projectPath?: string | null
+  /** Ask the tool server now and replace any saved copy of its tool list (the Refresh button). */
+  fresh?: boolean
 }
 
 export interface GatewayDiscoveryResult {
@@ -42,6 +52,26 @@ export interface GatewayDiscoveryResult {
   tools: ToolWithName[]
   success: boolean
   error?: string
+  /**
+   * Where the tool list came from (`mcpToolListCache.ts`): `live` asked the tool server,
+   * `saved` used a saved copy, `joined` shared a lookup already running. Absent when nothing
+   * was looked up (a disabled or blocked gateway, n8n MCP client placeholders).
+   */
+  lookupSource?: ToolListSource
+  /** When the tool server gave this list or this failure (ms since the epoch). */
+  fetchedAt?: number
+}
+
+type ToolListLookupPlan = {
+  /** Everything the lookup uses, secrets hashed: the saved copy's key. */
+  inputs: Record<string, unknown>
+  lookup: () => Promise<ToolListLookup>
+}
+
+function describeSavedFailure(result: GatewayDiscoveryResult): string {
+  if (result.lookupSource !== 'saved' || typeof result.fetchedAt !== 'number') return ''
+  const ageSeconds = Math.max(0, Math.round((Date.now() - result.fetchedAt) / 1000))
+  return ` (remembered from ${ageSeconds}s ago; asked again ${MCP_TOOL_LIST_FAILURE_SAVED_MS / 1000}s after it)`
 }
 
 export class MCPGatewayDiscovery {
@@ -104,76 +134,161 @@ export class MCPGatewayDiscovery {
         return result
       }
 
-      // Route to appropriate client based on gateway type
-      switch (gateway.type) {
-        case 'docker-catalog':
-          result.tools = await dockerMCPGatewayClient.discoverTools()
-          break
-
-        case 'n8n-mcp-trigger':
-        case 'n8n-instance-mcp': {
-          const gatewayUrl = gateway.url!
-          result.tools = await n8nMCPGatewayClient.discoverTools(gatewayUrl, { headers: authHeaders })
-          break
-        }
-
-        case 'n8n-mcp-client': {
-          const toolNames = Array.isArray(gateway.metadata?.toolNames)
-            ? gateway.metadata?.toolNames
-            : Array.isArray(gateway.discoveredTools)
-              ? gateway.discoveredTools
-              : []
-
-          result.tools = toolNames.map((name: string) => {
-            const sanitized = this.sanitizeToolName(name)
-          const placeholder = tool({
-            description: `Direct n8n MCP client tool "${name}" discovered from the associated workflow. Execution occurs inside n8n.`,
-            inputSchema: jsonSchema({
-              type: 'object',
-              additionalProperties: true,
-              description: 'Inputs are forwarded to the n8n MCP client node inside the workflow.'
-            }),
-            strict: false,
-            execute: async () => ({
-              warning: 'Direct MCP client nodes execute within n8n workflows and cannot be invoked directly via batshit.',
-              tool: name
-            })
-          })
-
-            return { ...placeholder, name: sanitized } as ToolWithName
-          })
-
-          result.success = true
-          break
-        }
-
-        case 'custom': {
-          const gatewayUrl = gateway.url!
-          result.tools = await n8nMCPGatewayClient.discoverTools(gatewayUrl, { headers: authHeaders })
-          break
-        }
-
-        case 'stdio':
-          result.tools = await stdioMCPGatewayClient.discoverTools({
-            gateway,
-            userId,
-            projectPath: options?.projectPath
-          })
-          break
-
-        default:
-          result.error = `Unknown gateway type: ${gateway.type}`
-          return result
+      if (gateway.type === 'n8n-mcp-client') {
+        // Built from the gateway record: there is nothing to ask and nothing to save.
+        result.tools = this.buildN8nMcpClientPlaceholders(gateway)
+        result.success = true
+        return result
       }
 
+      const plan = await this.planToolListLookup(gateway, {
+        authToken,
+        authHeaders,
+        userId,
+        projectPath: options?.projectPath
+      })
+      if (!plan) {
+        result.error = `Unknown gateway type: ${gateway.type}`
+        return result
+      }
+
+      // One saved copy per user, gateway, and exactly what the lookup uses. Which gateways an
+      // agent may reach was decided before this call and which tools it may see is decided by
+      // the caller after it, so the copy cannot change what an agent sees.
+      const answer = userId
+        ? await mcpToolListCache.read(
+            { userId, gatewayId: gateway.id, inputs: plan.inputs },
+            plan.lookup,
+            { fresh: options?.fresh === true }
+          )
+        : { lookup: await plan.lookup(), source: 'live' as const, fetchedAt: Date.now() }
+
+      result.lookupSource = answer.source
+      result.fetchedAt = answer.fetchedAt
+      if (!answer.lookup.ok) {
+        result.error = answer.lookup.error
+        return result
+      }
+      result.tools = answer.lookup.tools
       result.success = true
-      logger.debug(`[Gateway Discovery] Discovered ${result.tools.length} tools from ${gateway.name}`)
+      logger.debug(
+        `[Gateway Discovery] ${answer.source === 'live' ? 'Discovered' : 'Reused'} ${result.tools.length} tools from ${gateway.name}`
+      )
     } catch (error) {
       result.error = error instanceof Error ? error.message : 'Discovery failed'
       console.error(`[Gateway Discovery] Failed to discover from ${gateway.name}:`, error)
     }
 
     return result
+  }
+
+  /**
+   * The tool server lookup for one gateway, and everything it uses (secrets hashed), which is
+   * the key of its saved copy. A STDIO launch is resolved first, so the key names exactly the
+   * process that would start; a launch that cannot be resolved throws here and is reported at
+   * once, never saved. `null` for a gateway type Batshit does not know.
+   */
+  private async planToolListLookup(
+    gateway: MCPGateway,
+    context: {
+      authToken: string | null
+      authHeaders?: Record<string, string>
+      userId?: string
+      projectPath?: string | null
+    }
+  ): Promise<ToolListLookupPlan | null> {
+    const ask = (discover: () => Promise<ToolWithName[]>) => async (): Promise<ToolListLookup> => {
+      try {
+        return { ok: true, tools: await discover() }
+      } catch (error) {
+        console.error(`[Gateway Discovery] Failed to discover from ${gateway.name}:`, error)
+        return { ok: false, error: error instanceof Error ? error.message : 'Discovery failed' }
+      }
+    }
+
+    switch (gateway.type) {
+      case 'docker-catalog': {
+        const headers = buildDockerGatewayHeaders()
+        return {
+          inputs: {
+            type: gateway.type,
+            url: buildDockerGatewayUrl('/mcp'),
+            authorization: fingerprintSecret(headers.Authorization ?? headers.authorization),
+            dockerProfile: gateway.metadata?.dockerProfile ?? null
+          },
+          lookup: ask(() => dockerMCPGatewayClient.discoverTools())
+        }
+      }
+
+      case 'n8n-mcp-trigger':
+      case 'n8n-instance-mcp':
+      case 'custom': {
+        const gatewayUrl = gateway.url!
+        return {
+          inputs: { type: gateway.type, url: gatewayUrl, token: fingerprintSecret(context.authToken) },
+          lookup: ask(() => n8nMCPGatewayClient.discoverTools(gatewayUrl, { headers: context.authHeaders }))
+        }
+      }
+
+      case 'stdio': {
+        const resolved = await resolveStdioGatewayProcessConfig({
+          gateway,
+          userId: context.userId,
+          projectPath: context.projectPath
+        })
+        return {
+          inputs: {
+            type: gateway.type,
+            command: resolved.command,
+            args: resolved.args,
+            cwd: resolved.cwd ?? null,
+            env: Object.fromEntries(
+              Object.entries(resolved.env).map(([name, value]) => [name, fingerprintSecret(value)])
+            ),
+            startupTimeoutMs: resolved.startupTimeoutMs
+          },
+          lookup: ask(() =>
+            stdioMCPGatewayClient.discoverTools({
+              gateway,
+              userId: context.userId,
+              projectPath: context.projectPath,
+              resolved
+            })
+          )
+        }
+      }
+
+      default:
+        return null
+    }
+  }
+
+  /** Placeholder tools for a direct n8n MCP client node; they only describe what runs inside n8n. */
+  private buildN8nMcpClientPlaceholders(gateway: MCPGateway): ToolWithName[] {
+    const toolNames = Array.isArray(gateway.metadata?.toolNames)
+      ? gateway.metadata?.toolNames
+      : Array.isArray(gateway.discoveredTools)
+        ? gateway.discoveredTools
+        : []
+
+    return toolNames.map((name: string) => {
+      const sanitized = this.sanitizeToolName(name)
+      const placeholder = tool({
+        description: `Direct n8n MCP client tool "${name}" discovered from the associated workflow. Execution occurs inside n8n.`,
+        inputSchema: jsonSchema({
+          type: 'object',
+          additionalProperties: true,
+          description: 'Inputs are forwarded to the n8n MCP client node inside the workflow.'
+        }),
+        strict: false,
+        execute: async () => ({
+          warning: 'Direct MCP client nodes execute within n8n workflows and cannot be invoked directly via batshit.',
+          tool: name
+        })
+      })
+
+      return { ...placeholder, name: sanitized } as ToolWithName
+    })
   }
 
   /**
@@ -735,16 +850,22 @@ export class MCPGatewayDiscovery {
             totalFiltered++
           }
         } else {
-          console.warn(`[Gateway Discovery] Gateway ${result.gatewayName} failed: ${result.error}`)
+          console.warn(
+            `[Gateway Discovery] Gateway ${result.gatewayName} failed: ${result.error}${describeSavedFailure(result)}`
+          )
         }
       }
 
       const totalTime = performance.now() - startTime
+      const askedCount = results.filter((result) => result.lookupSource === 'live').length
+      const savedCount = results.filter(
+        (result) => result.lookupSource === 'saved' || result.lookupSource === 'joined'
+      ).length
 
       logger.info(
         `[Gateway Discovery] Loaded ${totalFiltered} tools (${totalDiscovered} discovered, ` +
         `${totalDiscovered - totalFiltered} filtered out) from ${gateways.length} gateways in ${totalTime.toFixed(2)}ms` +
-        ` [Story 6.4: with metadata]`
+        ` (tool servers asked: ${askedCount}, saved copies used: ${savedCount})`
       )
 
       // Warn if filtering overhead is high (> 50ms target from AC25)
@@ -797,8 +918,8 @@ export class MCPGatewayDiscovery {
       }
     }
 
-    // Discover tools
-    const result = await this.discoverFromGateway(gateway, userId)
+    // The Refresh button: ask the tool server now, and let its answer replace the saved copy.
+    const result = await this.discoverFromGateway(gateway, userId, { fresh: true })
 
     // Update gateway with discovered tools if successful
     if (result.success) {

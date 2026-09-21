@@ -168,6 +168,49 @@ function extractLineCountText(value: unknown): string | null {
   return streamText || null
 }
 
+/**
+ * A known lane's own size, when its output does not sit in a field `extractLineCountText` reads.
+ *
+ * The size in a zip description must describe what the tool produced, never the stored renderer
+ * JSON. An edit's output is its diff, a search's is its matching lines, and a command that
+ * printed nothing printed nothing — each of those used to fall through to the JSON fallback
+ * below, so every edit read about `- 8 lines`, a one-match search `- 17 lines`, and a silent
+ * `mkdir` `- 11 lines` (F-P6-5 follow-up item 3).
+ */
+function laneResultLineCount(tool: NormalizedCoolTool): number | undefined {
+  const result =
+    tool.toolResult && typeof tool.toolResult === 'object' && !Array.isArray(tool.toolResult)
+      ? (tool.toolResult as Record<string, any>)
+      : null
+  if (!result) return undefined
+
+  switch (tool.operationKind) {
+    case 'edit_file': {
+      const diff = [result.diff, result.patch].find((value) => typeof value === 'string')
+      return typeof diff === 'string' ? countTextLines(diff) : undefined
+    }
+    case 'bash': {
+      const streams = [result.stdout, result.stderr].filter(
+        (value): value is string => typeof value === 'string'
+      )
+      return streams.length > 0 ? countTextLines(streams.filter(Boolean).join('\n')) : undefined
+    }
+    case 'search_files': {
+      if (!Array.isArray(result.results)) return undefined
+      const total =
+        typeof result.totalMatches === 'number'
+          ? result.totalMatches
+          : result.results.reduce(
+              (sum: number, entry: any) => sum + (typeof entry?.matchCount === 'number' ? entry.matchCount : 0),
+              0
+            )
+      return normalizeLineCount(total) ?? undefined
+    }
+    default:
+      return undefined
+  }
+}
+
 function inferCoolToolResultLineCount(tool: NormalizedCoolTool): number | undefined {
   const result = tool.toolResult
   const metadata = tool.metadata
@@ -179,6 +222,9 @@ function inferCoolToolResultLineCount(tool: NormalizedCoolTool): number | undefi
     normalizeLineCount((metadata as any)?.lineCount) ??
     normalizeLineCount((metadata as any)?.resultLineCount)
   if (explicit !== null) return explicit
+
+  const laneCount = laneResultLineCount(tool)
+  if (laneCount !== undefined) return laneCount
 
   const text = extractLineCountText(result)
   if (text !== null) return countTextLines(text)
@@ -598,12 +644,10 @@ function descriptionStatusForTool(tool: NormalizedCoolTool): string | undefined 
   const result = tool.toolResult
   if (tool.error) return 'error'
 
-  const exitCode =
-    typeof result?.exitCode === 'number'
-      ? result.exitCode
-      : typeof result?.code === 'number'
-        ? result.code
-        : undefined
+  // A tool's own `code` is not a command's exit code (F-P6-5): a WebFetch reports its page's HTTP
+  // status there, and `exit 200` in the description read as a failed tool. A command's exit code is
+  // `exitCode` by now: `normalizeToolStep` rebuilds a command's result with its `code` there.
+  const exitCode = typeof result?.exitCode === 'number' ? result.exitCode : undefined
   if (typeof exitCode === 'number') return `exit ${exitCode}`
   if (result?.interrupted === true) return 'interrupted'
   if (result?.success === false || result?.ok === false || result?.error) return 'error'

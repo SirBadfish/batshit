@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readdirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { mkdir, open, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises'
 import { env } from '$env/dynamic/private'
 import { z } from 'zod'
 import type { AgentDcmDisplaySettings, MCPToolSelections } from '$lib/types/database'
@@ -24,7 +24,13 @@ import {
   getCliTool,
   resolveCliToolSelectionScope
 } from './cliToolRegistry'
-import { mapBashCommandToRendererTool } from './bashCommandMapper'
+import {
+  commandEditsInPlace,
+  extractInPlaceEditTargetPaths,
+  mapBashCommandToRendererTool,
+  summarizeShellSimpleCommands
+} from './bashCommandMapper'
+import { buildSnapshotEditPreview, extractManagedPatchFromSource } from '$lib/utils/editDiff'
 import { resolveDefaultNativeExecutionBackend } from './nativeExecutionDefaults'
 import {
   BROKER_FABRIC_FETCH_ZIP_CONTROL_ID,
@@ -36,6 +42,7 @@ import {
 } from '$lib/utils/brokerAvailability'
 import { resolveAgentMemoryEnabled } from '$lib/utils/memoryControl'
 import { resolveAgentDmsEnabled } from '$lib/utils/dmControl'
+import { resolveAgentJevJudgeToolEnabled } from '$lib/utils/jevJuiceControl'
 import { WORKERS_MAX_PER_CALL } from '$lib/utils/delegationCapabilities'
 import { NATIVE_FABRIC_HELPER_CONTROL_META } from './nativeFabricHelperCatalog'
 import {
@@ -73,8 +80,10 @@ import {
   normalizeBundleFiles,
   readSkillBundleFileText,
   resolveBundleFileAbsolutePath,
-  resolveSkillRuntimeForTool
+  resolveSkillRuntimeForTool,
+  type SkillRuntimeActor
 } from './skillRuntimeToolService'
+import { resolveSkillAccessForActor } from './slashCommandCapabilities'
 import {
   resolveScreenshotUploadModelUrl,
   resolveUploadConfigForScreenshot
@@ -91,6 +100,36 @@ import {
   isPathInsideSandboxRoot,
   recoverAppleContainerSandbox
 } from './appleContainerSandbox'
+import { createSandboxLifecycleGate } from './sandboxLifecycleGate'
+import {
+  SBX_COMMAND,
+  buildSbxSandboxName,
+  buildSbxSessionMarker,
+  classifySbxFailure,
+  describeSbxFailure,
+  isAbandonedSbxSandbox,
+  isManagedSbxSandboxName,
+  isReusableSbxSandbox,
+  parseSbxSandboxList,
+  sbxCommandEndArgs,
+  sbxCreateArgs,
+  sbxDenyAllNetworkArgs,
+  sbxExecArgs,
+  sbxListArgs,
+  sbxPolicyListArgs,
+  sbxRemoveArgs,
+  sbxSandboxHasWorkspace,
+  sbxStopArgs,
+  sbxVersionArgs,
+  type SbxSandboxEntry
+} from './dockerSandboxSbx'
+import { recordSbxDaemonStart, sbxCallStartedDaemon } from './sbxDaemonRecord'
+import {
+  SANDBOX_COMMAND_END_TIMEOUT_MS,
+  endCommandProcess,
+  newSandboxCommandTag,
+  trackCommandGroup
+} from './commandEnd'
 import { bytesToBlob } from '$lib/utils/binary'
 import {
   APPLY_PATCH_BEGIN_MARKER,
@@ -122,7 +161,7 @@ import {
 
 type LegacyNativeToolPolicyMode = 'workspace' | 'read_only'
 type NativeBashAccessMode = 'plan' | 'agent' | 'dangerous'
-type DockerSandboxCliKind = 'sbx' | 'docker-sandbox'
+type DockerSandboxCliKind = 'sbx'
 type NativeWebSearchProvider = 'duckduckgo-html' | 'exa' | 'perplexity'
 type ExaSearchType = 'auto' | 'fast' | 'neural' | 'deep'
 type AgentBrowserRuntimeMode = 'chromium' | 'chrome-cdp'
@@ -225,6 +264,8 @@ export interface NativeToolContext {
   dmControlsEnabled?: boolean
   /** SA-115 P2 (DL-115-10): PRIMARY actor + agent `dms_enabled`. Default false. */
   scheduleControlsEnabled?: boolean
+  /** SA-120 P2 (DL-120-06): PRIMARY actor + agent `jev_juice_judge_tool`. Default false. */
+  judgeControlsEnabled?: boolean
   projectPath?: string | null
   providerSettings?: Record<string, any> | null
   toolApprovalMode?: ToolApprovalMode
@@ -273,6 +314,13 @@ export interface NativeToolContext {
    * `controlApprovals.ts` refuses the control outright with a reason instead.
    */
   groupMemberRun?: boolean
+  /**
+   * BL-75 — whose skill access governs `native_skill` in this run, when not `agentId`. Set by
+   * `subagentRunner.ts` for an API Subagent or Worker run (whose `agentId` is the PARENT's) to
+   * the id its `skills_commands` list was built for. Absent on a primary turn, where the turn's
+   * own `agentId` governs.
+   */
+  scopeAgentId?: string | null
   workers?: {
     enabled: boolean
     /** The parent turn's message id — the key the 9-runs-per-turn cap counts against. */
@@ -534,22 +582,28 @@ const MAX_AGENT_BROWSER_OUTPUT_CHARS = 200_000
 const DEFAULT_AGENT_BROWSER_CDP_PORT = 9222
 const DEFAULT_AGENT_BROWSER_RUNTIME_MODE: AgentBrowserRuntimeMode = 'chromium'
 const DEFAULT_AGENT_BROWSER_PROVIDER: AgentBrowserProvider = 'local'
-const AGENT_BROWSER_TESTED_VERSION = '0.24.1'
+const AGENT_BROWSER_TESTED_VERSION = '0.37.1'
 
 function getDefaultNativeExecutionBackend(): NativeExecutionBackend {
   return resolveDefaultNativeExecutionBackend()
 }
 const AGENT_BROWSER_TESTED_PACKAGE_SPEC = `agent-browser@${AGENT_BROWSER_TESTED_VERSION}`
 const AGENT_BROWSER_TESTED_TARBALL_URL =
-  'https://registry.npmjs.org/agent-browser/-/agent-browser-0.24.1.tgz'
+  'https://registry.npmjs.org/agent-browser/-/agent-browser-0.37.1.tgz'
 const AGENT_BROWSER_TESTED_INTEGRITY =
-  'sha512-csWJtYEQow52b+p93zVZfNrcNBwbxGCZDXDMNWl2ij2i0MFKubIzN+icUeX2/NrkZe5iIau8px+HQlxata2oPw=='
+  'sha512-NDojTSXrIq7zS090T0VwI1uzBryZWvewgxXvS0swj8/5GGnziBZLmyhEkfETO8n4n3DsJpZbZkq9F/MV2rIQKw=='
 const AGENT_BROWSER_INSTALL_COMMAND =
   `npm install -g ${AGENT_BROWSER_TESTED_PACKAGE_SPEC} && agent-browser install`
 const AGENT_BROWSER_INSTALL_TIMEOUT_MS = 10 * 60_000
 const AGENT_BROWSER_INSTALL_MAX_OUTPUT_CHARS = 400_000
 const AGENT_BROWSER_UNINSTALL_COMMAND = 'npm uninstall -g agent-browser'
 const AGENT_BROWSER_DOCKER_SIDECAR_DEFAULT_URL = 'http://agent-browser:8091'
+/**
+ * The Docker sidecar revision that ends a run's CLI call when Batshit's request goes (a Stop)
+ * and keeps the time limit Batshit sends (`tools/docker/agent-browser-sidecar/server.mjs`
+ * `SIDECAR_REVISION`, 2026-09-18). An older sidecar reports none.
+ */
+const AGENT_BROWSER_SIDECAR_STOP_REVISION = 2
 const DOCKER_AGENT_BROWSER_UNSUPPORTED_REASON =
   'Docker Agent Browser sidecar is not running yet. Start it from Batshit when the host operator is configured, or run the agent-browser Compose profile from the host.'
 const DOCKER_AGENT_BROWSER_INSTALL_HELP =
@@ -670,17 +724,6 @@ function resolveDockerSandboxOperatorConfig():
   }
 }
 
-function resolvePreferredDockerSandboxCliKind(): DockerSandboxCliKind | null {
-  const raw =
-    env.BATSHIT_DOCKER_SANDBOX_CLI?.trim().toLowerCase() ||
-    process.env.BATSHIT_DOCKER_SANDBOX_CLI?.trim().toLowerCase() ||
-    ''
-  if (raw === 'sbx') return 'sbx'
-  if (raw === 'docker-sandbox' || raw === 'docker_sandbox' || raw === 'docker sandbox') {
-    return 'docker-sandbox'
-  }
-  return null
-}
 const AGENT_BROWSER_UNINSTALL_TIMEOUT_MS = 5 * 60_000
 const AGENT_BROWSER_UNINSTALL_MAX_OUTPUT_CHARS = 400_000
 const AGENT_BROWSER_INSTALL_HELP =
@@ -693,8 +736,24 @@ function resolveBatshitRuntimeTmpRoot(): string {
     process.env.BATSHIT_AGENT_BROWSER_TMP_DIR?.trim()
   return configured || path.join(os.tmpdir(), 'batshit-runtime', 'tmp')
 }
-const DOCKER_SANDBOX_NAME_PREFIX = 'batshit-'
-const DOCKER_SANDBOX_CLEANUP_TIMEOUT_MS = 15_000
+// `sbx` may start its background daemon on the first call, and the first sandbox on a
+// computer downloads Docker's shell image (about 460 MB), so these are generous.
+const DOCKER_SANDBOX_SBX_TIMEOUT_MS = 60_000
+const DOCKER_SANDBOX_CREATE_TIMEOUT_MS = 10 * 60_000
+// F-P5-1: host Docker Sandbox creates and removes go through this gate, so a chat's
+// parallel first bash calls share one `create` (see `sandboxLifecycleGate.ts`). The
+// containerized runtime's host operator keeps its own copy of the same rule.
+const dockerSandboxGate = createSandboxLifecycleGate()
+// Sessions that ran a Docker Sandbox command in this process. Run-end cleanup calls sbx (or
+// the operator) only for these, so a chat that never used Docker Sandbox pays no sbx calls
+// on every turn once sbx is installed. After a restart, an untracked session's sandbox is
+// reused by its next command or pruned after an hour unused.
+const dockerSandboxSessionsUsed = new Set<string>()
+
+function markDockerSandboxSessionUsed(sessionId?: string | null) {
+  const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+  if (id) dockerSandboxSessionsUsed.add(id)
+}
 const AGENT_BROWSER_TMP_FILE_PREFIX = 'batshit-agent-browser-'
 const MIN_AGENT_BROWSER_SCREENSHOT_WAIT_MS = 0
 const DEFAULT_AGENT_BROWSER_SCREENSHOT_WAIT_MS = 1_500
@@ -934,6 +993,18 @@ type AgentBrowserCliRunRequest = {
   maxOutputChars?: number
   cwd?: string
   env?: Record<string, string>
+  /**
+   * A Stop (2026-09-18): ends the CLI call the way its timeout does, and never the daemon. A call
+   * it reaches first never starts, on every path.
+   */
+  abortSignal?: AbortSignal
+  /**
+   * The Docker sidecar ends a run's CLI call when Batshit's request to it goes (its /health
+   * `sidecarRevision` is `AGENT_BROWSER_SIDECAR_STOP_REVISION` or more). Only then is the sidecar
+   * request handed the Stop mid-run: an older sidecar runs the command on, so Batshit waits for
+   * its answer as before rather than calling the call stopped.
+   */
+  sidecarHearsStop?: boolean
 }
 
 type AgentBrowserCliRunResult = {
@@ -946,6 +1017,8 @@ type AgentBrowserCliRunResult = {
   timedOut: boolean
   durationMs: number
   truncated: boolean
+  /** Ended by a Stop, not by itself or the timeout. */
+  stopped?: boolean
 }
 
 let agentBrowserCliRunnerOverride:
@@ -1263,6 +1336,61 @@ function buildCompactJsonSchemaHint(inputSchema: unknown): string | undefined {
   return `input: { ${fields.join(', ')}${suffix} }`
 }
 
+/**
+ * The Batshit Tool broker's plumbing: every key the SERVER sets on a broker call. None of it is
+ * ever part of a tool's payload, and none of it is ever the model's (bug sweep, 2026-09-18).
+ *
+ * The model's input is spread into the broker call, and `BATSHIT_TOOL_USE_INPUT_SCHEMA` passes
+ * unknown keys through on purpose (a model may put a tool's fields at the top level), so a key a
+ * lane did not set after the spread was the model's: the API lane never set `agentMetadata`, and
+ * `resolveDynamicMcpGatewayScope` prefers `agentMetadata.defaultMCPGateways` over the agent's own
+ * record when the send selected no gateways, so a model chose its own MCP gateway scope.
+ * `withoutBrokerPlumbing` drops every key here from the model's input on every lane, before the
+ * server adds its own. A new server-set key goes here, or the model can set it.
+ */
+const BATSHIT_BROKER_PLUMBING_KEYS = [
+  'selectedGateways',
+  'selected_gateways',
+  'selectedToolIds',
+  'selected_tool_ids',
+  'selectedCliToolIds',
+  'selected_cli_tool_ids',
+  'userId',
+  'agentId',
+  'agentMetadata',
+  'sessionId',
+  'dcmDisplaySettings',
+  'projectPath',
+  'allowedFamilies',
+  'allowArtifactRuntimeTools',
+  'runtimeMode',
+  'fabricAllowedControlIds',
+  'executionBackend',
+  'execution_backend',
+  'agentBrowserSettings',
+  'gatewayToolsCache',
+  'executeControlUse',
+  'abortSignal',
+  // SA-117 / PR #106 review F-1: the lane and the delegated flag are server-set plumbing
+  // too — leaving them out of this list shipped `actorType` into every MCP tool's input.
+  'actorType',
+  'delegatedRun',
+  // SA-116 P2: server-set plumbing, never part of a control's payload. Missing this
+  // shipped `approvalGrant: null` into every artifact control's input.
+  'approvalGrant'
+] as const
+
+const BATSHIT_BROKER_PLUMBING_KEY_SET = new Set<string>(BATSHIT_BROKER_PLUMBING_KEYS)
+
+/** The model's broker input without the server's plumbing (`BATSHIT_BROKER_PLUMBING_KEYS`). */
+function withoutBrokerPlumbing<T extends object>(input: T): T {
+  const kept: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(input ?? {})) {
+    if (!BATSHIT_BROKER_PLUMBING_KEY_SET.has(key)) kept[key] = value
+  }
+  return kept as T
+}
+
 function normalizeBatshitToolUsePayload(input: BatshitToolUseInput): Record<string, any> {
   const knownKeys = new Set([
     'ref',
@@ -1272,33 +1400,7 @@ function normalizeBatshitToolUsePayload(input: BatshitToolUseInput): Record<stri
     'allow_risky',
     'dryRun',
     'dry_run',
-    'selectedGateways',
-    'selected_gateways',
-    'selectedToolIds',
-    'selected_tool_ids',
-    'selectedCliToolIds',
-    'selected_cli_tool_ids',
-    'userId',
-    'agentId',
-    'agentMetadata',
-    'sessionId',
-    'dcmDisplaySettings',
-    'projectPath',
-    'allowedFamilies',
-    'runtimeMode',
-    'fabricAllowedControlIds',
-    'executionBackend',
-    'execution_backend',
-    'agentBrowserSettings',
-    'gatewayToolsCache',
-    'executeControlUse',
-    // SA-117 / PR #106 review F-1: the lane and the delegated flag are server-set plumbing
-    // too — leaving them out of this list shipped `actorType` into every MCP tool's input.
-    'actorType',
-    'delegatedRun',
-    // SA-116 P2: server-set plumbing, never part of a control's payload. Missing this
-    // shipped `approvalGrant: null` into every artifact control's input.
-    'approvalGrant'
+    ...BATSHIT_BROKER_PLUMBING_KEYS
   ])
   const topLevel = Object.fromEntries(
     Object.entries(input).filter(([key, value]) => !knownKeys.has(key) && value !== undefined)
@@ -1396,6 +1498,8 @@ function firstNonEmptyLine(value: unknown): string | null {
 }
 
 function summarizeNativeBashExecutionFailure(result: Record<string, any>): string {
+  // A stopped command's words are the Stop, whatever it printed first (2026-09-18).
+  if (result.stopped === true) return STOPPED_COMMAND_REASON
   const stderrLine = firstNonEmptyLine(result.stderr)
   if (stderrLine) return `Bash command failed: ${stderrLine}`
 
@@ -2350,8 +2454,6 @@ function stripFdRedirections(command: string): string {
 const PROTECTED_WRITE_SHAPED_REGEXES: RegExp[] = [
   /(?:^|[^<>])>{1,2}/,
   /\b(?:rm|mv|cp|tee|touch|truncate|unlink|ln|rsync|dd|install)\b/i,
-  /\bsed\b[^|;&]*\s-i\b/i,
-  /\bperl\b[^|;&]*\s-i\b/i,
   /\b(?:chmod|chown|chgrp|mkdir|rmdir)\b/i,
   /\bgit\s+(?:apply|checkout|restore|clean|reset|stash|am|cherry-pick|merge|rebase|pull|mv|rm|commit)\b/i,
   /\b(?:npm|pnpm|yarn|bun)\s+(?:install|ci|add|remove|rm|update|upgrade|link)\b/i
@@ -2359,7 +2461,10 @@ const PROTECTED_WRITE_SHAPED_REGEXES: RegExp[] = [
 
 function commandLooksWriteShaped(command: string): boolean {
   const sanitized = stripFdRedirections(command)
-  return PROTECTED_WRITE_SHAPED_REGEXES.some((pattern) => pattern.test(sanitized))
+  return (
+    commandEditsInPlace(sanitized) ||
+    PROTECTED_WRITE_SHAPED_REGEXES.some((pattern) => pattern.test(sanitized))
+  )
 }
 
 const SHELL_WRITE_COMMANDS = new Set([
@@ -2388,6 +2493,10 @@ function extractCandidateShellWriteTargets(command: string): string[] {
 
   const targets: string[] = []
 
+  // Keep this detector in lockstep with renderer/Plan-mode classification. The shared mapper
+  // owns every supported sed/perl in-place spelling and returns all literal operands it can see.
+  targets.push(...extractInPlaceEditTargetPaths(analysisText))
+
   const redirectPattern = />{1,2}\s*("[^"]+"|'[^']+'|[^\s;|&<>]+)/g
   let redirectMatch: RegExpExecArray | null
   while ((redirectMatch = redirectPattern.exec(analysisText))) {
@@ -2412,11 +2521,6 @@ function extractCandidateShellWriteTargets(command: string): string[] {
       } else {
         targets.push(...positional)
       }
-      continue
-    }
-
-    if ((commandName === 'sed' || commandName === 'perl') && args.some((token) => token.startsWith('-i'))) {
-      targets.push(...positional.slice(1))
       continue
     }
 
@@ -2519,12 +2623,21 @@ function resolveMappedPath(mapping: ReturnType<typeof mapBashCommandToRendererTo
   return null
 }
 
+/**
+ * A copy of a mapped edit's target, read just before or just after the run, for the edit's diff.
+ * `null` when there is no copy to take: not an edit, a command that carries its own patch (that
+ * patch is the diff), a target outside the workspace, or one that is missing, binary, or larger
+ * than `MAX_BASH_EDIT_SNAPSHOT_BYTES`. An empty file is a copy (`''`), so an edit that empties a
+ * file or fills an empty one still gets a diff.
+ */
 async function captureMappedTextFileSnapshot(options: {
   mapping: ReturnType<typeof mapBashCommandToRendererTool>
+  command: string
   cwd: string
   workspaceRoot: string
 }): Promise<string | null> {
   if (options.mapping.toolName !== 'batshit_server_edit_file') return null
+  if (extractManagedPatchFromSource(options.command)) return null
 
   const mappedPath = resolveMappedPath(options.mapping)
   if (!mappedPath?.trim()) return null
@@ -2536,7 +2649,11 @@ async function captureMappedTextFileSnapshot(options: {
 
   try {
     const bytes = await readFileWithinLimit(absolutePath, MAX_BASH_EDIT_SNAPSHOT_BYTES)
-    if (!bytes) return null
+    if (!bytes) {
+      // `readFileWithinLimit` answers null for zero bytes as well as for too many.
+      const details = await stat(absolutePath)
+      return details.isFile() && details.size === 0 ? '' : null
+    }
     if (bytes.includes(0)) return null
 
     return bytes.toString('utf8')
@@ -2706,14 +2823,391 @@ function getPolicyInspectionCommand(command: string): string {
   return trimmed
 }
 
+function getPolicyInspectionCommandLines(command: string): string[] {
+  const lines: string[] = []
+  let heredocMarker: string | null = null
+
+  for (const rawLine of command.trim().split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (!trimmed) continue
+
+    if (heredocMarker) {
+      if (trimmed === heredocMarker) heredocMarker = null
+      continue
+    }
+
+    lines.push(trimmed)
+    const markerMatch = trimmed.match(/<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/)
+    if (markerMatch?.[1]) heredocMarker = markerMatch[1]
+  }
+
+  return lines
+}
+
+function hasUnquotedHeredoc(command: string): boolean {
+  let heredocMarker: string | null = null
+  for (const rawLine of command.split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (heredocMarker) {
+      if (trimmed === heredocMarker) heredocMarker = null
+      continue
+    }
+    if (!trimmed.includes('<<')) continue
+
+    const matches = [...trimmed.matchAll(/<<-?\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|\\([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))/g)]
+    if (matches.length === 0 || matches.some((match) => Boolean(match[4]))) return true
+    heredocMarker = matches[0]?.[1] ?? matches[0]?.[2] ?? matches[0]?.[3] ?? null
+  }
+  return false
+}
+
+function tokenizeShellPolicyWords(command: string): string[] {
+  const tokens: string[] = []
+  let token = ''
+  let quote: "'" | '"' | null = null
+  let escaped = false
+
+  const pushToken = () => {
+    if (!token) return
+    tokens.push(token)
+    token = ''
+  }
+
+  for (const char of command) {
+    if (escaped) {
+      token += char
+      escaped = false
+      continue
+    }
+
+    if (quote === "'") {
+      if (char === "'") quote = null
+      else token += char
+      continue
+    }
+
+    if (char === '\\') {
+      escaped = true
+      continue
+    }
+
+    if (quote === '"') {
+      if (char === '"') quote = null
+      else token += char
+      continue
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char
+      continue
+    }
+
+    if (/\s/.test(char)) {
+      pushToken()
+      continue
+    }
+
+    token += char
+  }
+
+  if (escaped) token += '\\'
+  pushToken()
+  return tokens
+}
+
+function splitUnquotedShellPipelines(command: string): string[] {
+  const segments: string[] = []
+  let segment = ''
+  let quote: "'" | '"' | null = null
+  let escaped = false
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index] ?? ''
+    if (escaped) {
+      segment += char
+      escaped = false
+      continue
+    }
+
+    if (quote === "'") {
+      segment += char
+      if (char === "'") quote = null
+      continue
+    }
+
+    if (char === '\\') {
+      segment += char
+      escaped = true
+      continue
+    }
+
+    if (quote === '"') {
+      segment += char
+      if (char === '"') quote = null
+      continue
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char
+      segment += char
+      continue
+    }
+
+    if (char === '|') {
+      segments.push(segment.trim())
+      segment = ''
+      if (command[index + 1] === '&') index += 1
+      continue
+    }
+
+    segment += char
+  }
+
+  segments.push(segment.trim())
+  return segments
+}
+
+function shellTokensContainOption(tokens: string[], option: string): boolean {
+  return tokens.some((token) => token === option || token.startsWith(`${option}=`))
+}
+
+function sedSubstitutionHasSideEffectFlag(script: string): boolean {
+  for (let index = 0; index < script.length - 1; index += 1) {
+    if (script[index] !== 's') continue
+    const delimiter = script[index + 1] ?? ''
+    if (!delimiter || /[A-Za-z0-9_\s\\]/.test(delimiter)) continue
+
+    let cursor = index + 2
+    let delimitersSeen = 0
+    let escaped = false
+    for (; cursor < script.length; cursor += 1) {
+      const char = script[cursor] ?? ''
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (char === '\\') {
+        escaped = true
+        continue
+      }
+      if (char !== delimiter) continue
+      delimitersSeen += 1
+      if (delimitersSeen === 2) break
+    }
+
+    if (delimitersSeen !== 2) continue
+    const flags = script.slice(cursor + 1).match(/^[0-9gIpMmewW]*/)?.[0] ?? ''
+    if (/[ewW]/.test(flags)) return true
+  }
+
+  return false
+}
+
+function sedScriptHasHiddenSideEffect(script: string): boolean {
+  if (sedSubstitutionHasSideEffectFlag(script)) return true
+
+  const address = String.raw`(?:\d+|\$|\/(?:\\.|[^/])*\/)`
+  const standaloneSideEffect = new RegExp(
+    // sed accepts an inverted address (`1!w file`) and attached operands (`w/tmp/out`, GNU
+    // `ecommand`). Once e/W/w is in command position, its suffix is an operand, not a safe word.
+    String.raw`(?:^|[;{}\n])\s*(?:${address}(?:\s*,\s*${address})?\s*)?!?\s*[eWw]`
+  )
+  return standaloneSideEffect.test(script)
+}
+
+function getSedPolicyViolation(tokens: string[]): string | null {
+  const scripts: string[] = []
+  let hasExpressionOption = false
+
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? ''
+    if (!token) continue
+
+    if (
+      token === '-f' ||
+      token === '--file' ||
+      token.startsWith('--file=') ||
+      /^-[Enrsuz]*f/.test(token)
+    ) {
+      return 'Plan mode blocks sed script files because they can hide write or execute commands.'
+    }
+
+    if (token === '-e' || token === '--expression' || /^-[Enrsuz]*e$/.test(token)) {
+      hasExpressionOption = true
+      const expression = tokens[index + 1]
+      if (expression) {
+        scripts.push(expression)
+        index += 1
+      }
+      continue
+    }
+
+    if (token.startsWith('--expression=')) {
+      hasExpressionOption = true
+      scripts.push(token.slice('--expression='.length))
+      continue
+    }
+
+    const attachedExpression = token.match(/^-[Enrsuz]*e(.+)$/)
+    if (attachedExpression?.[1]) {
+      hasExpressionOption = true
+      scripts.push(attachedExpression[1])
+      continue
+    }
+
+    if (token === '--' && !hasExpressionOption) {
+      const expression = tokens[index + 1]
+      if (expression) scripts.push(expression)
+      break
+    }
+
+    if (!token.startsWith('-') && !hasExpressionOption && scripts.length === 0) {
+      scripts.push(token)
+      continue
+    }
+  }
+
+  return scripts.some(sedScriptHasHiddenSideEffect)
+    ? 'Plan mode blocks sed w/W/e commands and substitution flags because they can write files or execute commands.'
+    : null
+}
+
+function getReadOnlyShellSideEffectViolation(command: string): string | null {
+  for (const commandLine of getPolicyInspectionCommandLines(command)) {
+    if (/\$\(|`|[<>]\(/.test(commandLine)) {
+      return 'Plan mode blocks shell and process substitutions because they can execute hidden commands.'
+    }
+
+    const pipelineSegments = splitUnquotedShellPipelines(commandLine)
+    if (pipelineSegments.length > 1) {
+      for (const segment of pipelineSegments) {
+        if (!segment || !SAFE_BASH_COMMAND_ALLOW_LIST.some((pattern) => pattern.test(segment))) {
+          return 'Plan mode only allows pipelines whose every stage is an approved read-only inspection command; executors and writers are blocked.'
+        }
+        const segmentViolation = getReadOnlyShellCommandViolation(segment)
+        if (segmentViolation) return segmentViolation
+      }
+      continue
+    }
+
+    const commandViolation = getReadOnlyShellCommandViolation(commandLine)
+    if (commandViolation) return commandViolation
+  }
+
+  return null
+}
+
+function getPlanModeInPlaceEditViolation(command: string): string | null {
+  if (!commandEditsInPlace(command)) return null
+
+  const targets = extractInPlaceEditTargetPaths(command)
+  return targets.length > 0 && targets.every((target) => isMarkdownPath(target))
+    ? null
+    : 'Plan mode only allows in-place sed/perl edits when every target is Markdown.'
+}
+
+function getReadOnlyShellWordsViolation(tokens: string[], normalizedProgram?: string): string | null {
+  const commandName = normalizedProgram ?? tokens[0]?.toLowerCase().replace(/^.*\//, '') ?? ''
+
+  if (commandName === 'find') {
+    const hiddenAction = tokens.slice(1).find((token) =>
+      /^(?:-delete|-exec|-execdir|-ok|-okdir|-fprint.*|-fprintf|-fls)$/.test(token)
+    )
+    if (hiddenAction) {
+      return `Plan mode blocks find action ${hiddenAction} because it can modify files, write output files, or execute commands.`
+    }
+  }
+
+  if (commandName === 'sed') {
+    const sedViolation = getSedPolicyViolation(tokens)
+    if (sedViolation) return sedViolation
+  }
+
+  if (
+    commandName === 'rg' &&
+    (shellTokensContainOption(tokens, '--pre') ||
+      shellTokensContainOption(tokens, '--hostname-bin') ||
+      shellTokensContainOption(tokens, '--search-zip') ||
+      tokens.slice(1).some((token) => /^-[^-]*z/.test(token)))
+  ) {
+    return 'Plan mode blocks rg --pre, --hostname-bin, and --search-zip options because they can execute helper programs.'
+  }
+
+  if (
+    commandName === 'file' &&
+    (shellTokensContainOption(tokens, '--compile') ||
+      shellTokensContainOption(tokens, '--uncompress') ||
+      shellTokensContainOption(tokens, '--uncompress-noreport') ||
+      tokens.slice(1).some((token) => /^--(?:comp|uncomp)/.test(token)) ||
+      tokens.slice(1).some((token) => /^-[^-]*[CzZ]/.test(token)))
+  ) {
+    return 'Plan mode blocks file options that write compiled magic files or invoke decompression helpers.'
+  }
+
+  if (commandName === 'printf' && tokens.slice(1).some((token) => /^-v/.test(token))) {
+    return 'Plan mode blocks printf -v because it mutates shell variables used by later commands.'
+  }
+
+  if (
+    (commandName === 'diff' ||
+      (commandName === 'git' && ['diff', 'show', 'log'].includes(tokens[1]?.toLowerCase() ?? ''))) &&
+    shellTokensContainOption(tokens, '--output')
+  ) {
+    return 'Plan mode blocks --output on diff and git inspection commands because it writes a file.'
+  }
+
+  if (
+    commandName === 'git' &&
+    ['diff', 'show', 'log'].includes(tokens[1]?.toLowerCase() ?? '') &&
+    (tokens.includes('--ext-diff') || tokens.includes('--textconv'))
+  ) {
+    return 'Plan mode blocks git external diff and text-conversion hooks because they can execute configured commands.'
+  }
+
+  if (commandName === 'git') {
+    return 'Plan mode blocks Git commands because repository configuration can execute helpers such as core.fsmonitor, external diff, or textconv.'
+  }
+
+  if (commandName === 'tree' && (tokens.includes('-o') || shellTokensContainOption(tokens, '--output'))) {
+    return 'Plan mode blocks tree output-file options because they write a file.'
+  }
+
+  return null
+}
+
+function getReadOnlyShellCommandViolation(command: string): string | null {
+  return getReadOnlyShellWordsViolation(tokenizeShellPolicyWords(command))
+}
+
 async function resolveManagedPatchPath(options: {
   rawPath: string
   cwd: string
   workspaceRoot: string
 }): Promise<{ absolutePath: string; relativePath: string; exists: boolean }> {
-  const resolvedRoot = path.resolve(options.workspaceRoot)
+  const lexicalRoot = path.resolve(options.workspaceRoot)
+  const resolvedRoot = (await getSafeRealPath(lexicalRoot)) ?? lexicalRoot
   const absolutePath = path.resolve(options.cwd, options.rawPath)
-  const realTargetPath = (await getSafeRealPath(absolutePath)) ?? absolutePath
+  let existingAncestor = absolutePath
+  const missingSegments: string[] = []
+  let realTargetPath: string | null = null
+  for (;;) {
+    const resolvedAncestor = await getSafeRealPath(existingAncestor)
+    if (resolvedAncestor) {
+      realTargetPath = path.resolve(resolvedAncestor, ...missingSegments)
+      break
+    }
+    const unresolvedInfo = await lstat(existingAncestor).catch(() => null)
+    if (unresolvedInfo) {
+      throw new Error(
+        `Patch target "${options.rawPath}" contains an existing path that cannot be resolved safely.`
+      )
+    }
+    const parent = path.dirname(existingAncestor)
+    if (parent === existingAncestor) break
+    missingSegments.unshift(path.basename(existingAncestor))
+    existingAncestor = parent
+  }
+  realTargetPath ??= absolutePath
   if (!isPathWithinRoot(realTargetPath, resolvedRoot)) {
     throw new Error(`Patch target "${options.rawPath}" is outside the allowed workspace root.`)
   }
@@ -2726,7 +3220,7 @@ async function resolveManagedPatchPath(options: {
     exists = false
   }
 
-  const relativeRaw = path.relative(resolvedRoot, absolutePath)
+  const relativeRaw = path.relative(lexicalRoot, absolutePath)
   const relativePath = (relativeRaw || path.basename(absolutePath)).split(path.sep).join('/')
 
   return {
@@ -2842,15 +3336,20 @@ function isPlanModeAllowedCommand(command: string): boolean {
   const commandForPolicy = getPolicyInspectionCommand(trimmed)
 
   if (/[;&]|&&|\|\|/.test(commandForPolicy)) return false
+  if (getPolicyInspectionCommandLines(trimmed).length > 1) return false
 
   if (isManagedApplyPatchCommand(trimmed)) return true
+  if (getPlanModeInPlaceEditViolation(trimmed)) return false
 
   const mapping = mapBashCommandToRendererTool(trimmed)
   const mappedPath = resolveMappedPath(mapping)
 
   if (mapping.toolName === 'batshit_server_overwrite_file' || mapping.toolName === 'batshit_server_edit_file') {
+    if (getReadOnlyShellSideEffectViolation(trimmed)) return false
     return isMarkdownPath(mappedPath)
   }
+
+  if (getReadOnlyShellSideEffectViolation(trimmed)) return false
 
   if (SAFE_BASH_COMMAND_ALLOW_LIST.some((pattern) => pattern.test(trimmed))) {
     return true
@@ -2866,19 +3365,88 @@ function isAgentModeAutoAllowedCommand(command: string, customAllowList?: string
   const trimmed = command.trim()
   if (!trimmed) return false
 
+  const explicitlyAllowed = commandMatchesAnyPattern(trimmed, customAllowList)
+  if (explicitlyAllowed) return true
+  if (/\/dev\/(?:tcp|udp)\//i.test(trimmed)) return false
+  // Unquoted heredoc bodies perform shell expansion even though they are data for the receiving
+  // program. The inspection-line helper intentionally omits bodies, so ambiguous heredocs need
+  // approval instead of hiding command/process substitution there.
+  if (hasUnquotedHeredoc(trimmed)) return false
+  if (getReadOnlyShellSideEffectViolation(trimmed)) return explicitlyAllowed
+  if (isManagedApplyPatchCommand(trimmed) && extractManagedApplyPatchDocument(trimmed)) return true
+
+  const operations = getPolicyInspectionCommandLines(trimmed).flatMap((line) =>
+    summarizeShellSimpleCommands(line)
+  )
+  if (operations.length === 0 || operations.some((operation) => operation.dynamic)) return false
+
+  // Shell write targets can resolve through symlinks or shell-specific syntax outside the
+  // workspace. Only managed apply_patch has Batshit's structural path checks; other shell writes
+  // require approval (or an explicit user allow-list entry). Pure fd/null redirects are not files.
+  if (commandEditsInPlace(trimmed)) return false
+
+  const operationIsAutoAllowed = (operation: (typeof operations)[number]): boolean => {
+    // An assignment-only operation changes how a later trusted basename resolves or behaves
+    // (`PATH=/tmp; cat ...`). Parsed operations are never empty, so no-program is ambiguous.
+    if (!operation.program) return false
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(operation.words[0] ?? '')) return false
+    const commandWord = operation.words.find((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word))
+    // A caller-controlled executable can borrow a trusted basename (`/tmp/cat`, `./git`).
+    if (!commandWord || commandWord.includes('/') || commandWord !== operation.program) return false
+    if (
+      operation.outputRedirectTargets.some(
+        (target) =>
+          target === null ||
+          !(
+            target === '/dev/null' ||
+            /^\/dev\/fd\/\d+$/.test(target) ||
+            /^&(?:\d+|-)$/.test(target)
+          )
+      )
+    ) return false
+    if (getReadOnlyShellWordsViolation(operation.words, operation.program)) return false
+    // A renderer mapping is presentation, not authority: `node -e '...' > out` maps as a file
+    // write too. Grant only programs whose behavior is already constrained by the policy above.
+    if (
+      ['pwd', 'ls', 'find', 'tree', 'cat', 'sed', 'head', 'tail', 'rg', 'grep', 'diff', 'wc',
+        'stat', 'file', 'echo', 'printf', 'which', 'whereis'].includes(operation.program)
+    ) return true
+    if (operation.program === 'git') {
+      // Even ordinary inspection can run repo-configured helpers (for example core.fsmonitor or
+      // external diff/textconv drivers). It remains available after approval or an explicit user
+      // allow-list entry, but repo config is not a basis for automatic approval.
+      return false
+    }
+    if (operation.program === 'set') return false
+    if (operation.program === 'cd') return false
+    if (operation.program === 'mkdir') return false
+    return false
+  }
+
+  // A mapped renderer describes one card, not the authority of every operation in its shell
+  // string. Once a command is composite, each operation must independently qualify.
+  if (operations.length > 1) return operations.every(operationIsAutoAllowed)
+
+  if (['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash', 'fish'].includes(operations[0].program ?? '')) {
+    return false
+  }
+
   const mapped = mapBashCommandToRendererTool(trimmed)
-  if (mapped.toolName === 'batshit_server_read_file') return true
-  if (mapped.toolName === 'batshit_server_list_files') return true
-  if (mapped.toolName === 'batshit_server_search_files') return true
+  if (mapped.toolName === 'batshit_server_read_file') return operationIsAutoAllowed(operations[0])
+  if (mapped.toolName === 'batshit_server_list_files') return operationIsAutoAllowed(operations[0])
+  if (mapped.toolName === 'batshit_server_search_files') return operationIsAutoAllowed(operations[0])
 
   // Agent mode is project write-capable by default.
   // Workspace-root containment + hard safety rules still apply in nativeBashExecute.
   if (mapped.toolName === 'batshit_server_overwrite_file' || mapped.toolName === 'batshit_server_edit_file') {
-    return true
+    return operationIsAutoAllowed(operations[0])
   }
 
-  if (SAFE_BASH_COMMAND_ALLOW_LIST.some((pattern) => pattern.test(trimmed))) return true
-  return commandMatchesAnyPattern(trimmed, customAllowList)
+  if (
+    operationIsAutoAllowed(operations[0]) &&
+    SAFE_BASH_COMMAND_ALLOW_LIST.some((pattern) => pattern.test(trimmed))
+  ) return true
+  return false
 }
 
 async function getAdminDefaultWebSearchProvider(
@@ -3403,12 +3971,21 @@ function evaluateBashPolicy(
 
   if (mode === 'plan') {
     const commandForPolicy = getPolicyInspectionCommand(trimmed)
+    const commandLinesForPolicy = getPolicyInspectionCommandLines(trimmed)
 
     if (/[;&]|&&|\|\|/.test(commandForPolicy)) {
       return {
         success: false,
         blocked: true,
         reason: 'Command chaining is blocked in Plan mode.'
+      }
+    }
+
+    if (commandLinesForPolicy.length > 1) {
+      return {
+        success: false,
+        blocked: true,
+        reason: 'Multiple shell command lines are blocked in Plan mode.'
       }
     }
 
@@ -3423,6 +4000,25 @@ function evaluateBashPolicy(
         reason: 'Shell substitutions are blocked in Plan mode.'
       }
     }
+
+    const inPlaceEditViolation = getPlanModeInPlaceEditViolation(trimmed)
+    if (inPlaceEditViolation) {
+      return {
+        success: false,
+        blocked: true,
+        reason: inPlaceEditViolation
+      }
+    }
+
+    const sideEffectViolation = getReadOnlyShellSideEffectViolation(trimmed)
+    if (sideEffectViolation) {
+      return {
+        success: false,
+        blocked: true,
+        reason: sideEffectViolation
+      }
+    }
+
     if (!isPlanModeAllowedCommand(trimmed)) {
       return {
         success: false,
@@ -3580,6 +4176,40 @@ type CommandRunResult = {
   timedOut: boolean
   durationMs: number
   truncated: boolean
+  /** Ended by the model run's abort signal (a Stop), not by itself or the timeout. */
+  stopped?: boolean
+}
+
+/**
+ * The words of a stopped command's result, which become its stored step's words (without them a
+ * stopped command read "Tool execution failed."). The bash tool and Agent Browser say the same.
+ */
+const STOPPED_COMMAND_REASON = 'The command was stopped.'
+
+/**
+ * What a bash tool tells the model about a Stop and a timeout (Agent Docs, 2026-09-18): both end
+ * the command and everything it started (`commandEnd.ts`), and how to leave a program running.
+ * Every reply removes the chat's sandboxes when it ends, which is the sandbox limit. The API
+ * lane's `native_bash_execute` and the managed CLI helper's `batshit_server_bash_execute`
+ * (`scripts/mode4-controls-mcp.cjs`, which holds a copy of this exact text) both say it; a test
+ * holds the copy to this constant.
+ */
+export const NATIVE_BASH_STOP_GUIDANCE =
+  'A Stop or a timeout ends the command and everything it started. To leave a program running, start it in the background with its output sent to a file (`cmd > log 2>&1 &`) and let the command finish; it then runs until Batshit quits (in a sandbox, at most until this reply ends).'
+
+/** A command a Stop reached before it started: it never ran. */
+function stoppedBeforeStartRun(command: string): CommandRunResult {
+  return {
+    command,
+    stdout: '',
+    stderr: '',
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    durationMs: 0,
+    truncated: false,
+    stopped: true
+  }
 }
 
 async function runProcessCommand(options: {
@@ -3589,24 +4219,44 @@ async function runProcessCommand(options: {
   timeoutMs: number
   maxOutputChars: number
   env?: Record<string, string>
+  abortSignal?: AbortSignal
+  /**
+   * The local shell (2026-09-18): the command leads its own process group, so a Stop or timeout
+   * ends everything it started (`commandEnd.ts`).
+   */
+  ownProcessGroup?: boolean
+  /** A sandbox command: what a Stop or timeout also ends inside the sandbox (`commandEnd.ts`). */
+  endInside?: () => Promise<void>
 }): Promise<CommandRunResult> {
   const start = Date.now()
   const envOverrides = options.env ?? {}
+  const commandText = `${options.command} ${options.args.join(' ')}`.trim()
+  const abortSignal = options.abortSignal
+
+  if (abortSignal?.aborted) return stoppedBeforeStartRun(commandText)
 
   return await new Promise((resolve, reject) => {
+    const ownGroup = options.ownProcessGroup === true && process.platform !== 'win32'
     const child = spawn(options.command, options.args, {
       cwd: options.cwd,
       env: {
         ...process.env,
         ...envOverrides
       },
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: ownGroup
     })
+    if (ownGroup && child.pid) trackCommandGroup(child.pid)
 
     let stdout = ''
     let stderr = ''
     let truncated = false
     let timedOut = false
+    let stopped = false
+    let settled = false
+    let ending = false
+    let endedInside = true
+    let closed: { exitCode: number | null; signal: NodeJS.Signals | null } | null = null
 
     child.stdout.on('data', (chunk) => {
       const next = appendWithLimit(stdout, String(chunk), options.maxOutputChars)
@@ -3620,29 +4270,78 @@ async function runProcessCommand(options: {
       if (next.truncated) truncated = true
     })
 
+    // The run is over once its output has closed and, for a Stop or timeout, once what it
+    // started inside its sandbox has been ended too.
+    const settle = () => {
+      if (settled || !closed || !endedInside) return
+      settled = true
+      clearTimeout(timer)
+      abortSignal?.removeEventListener('abort', onAbort)
+      resolve({
+        command: commandText,
+        stdout,
+        stderr,
+        exitCode: closed.exitCode,
+        signal: closed.signal,
+        timedOut,
+        durationMs: Date.now() - start,
+        truncated,
+        ...(stopped ? { stopped: true } : {})
+      })
+    }
+
+    // A Stop and a timeout end a command the same way (2026-09-18, `commandEnd.ts`): SIGTERM and
+    // then SIGKILL to its process group (a program it started in the background went on running
+    // before, and a timeout waited for any program that held the command's output), and its end
+    // inside a sandbox. A program that escaped the group may still hold the output; after the
+    // SIGKILL it is no longer read.
+    const end = () => {
+      if (ending || settled) return
+      ending = true
+      endCommandProcess(child, {
+        ownGroup,
+        afterKill: () => {
+          child.stdout.destroy()
+          child.stderr.destroy()
+        }
+      })
+      if (options.endInside) {
+        endedInside = false
+        void options
+          .endInside()
+          .catch((error) => {
+            console.warn('[Native Tools] Ending a command inside its sandbox failed:', error)
+          })
+          .finally(() => {
+            endedInside = true
+            settle()
+          })
+      }
+    }
+
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGTERM')
-      setTimeout(() => child.kill('SIGKILL'), 400)
+      end()
     }, options.timeoutMs)
 
+    const onAbort = () => {
+      if (settled) return
+      stopped = true
+      end()
+    }
+    abortSignal?.addEventListener('abort', onAbort, { once: true })
+
     child.on('error', (error) => {
+      if (settled) return
+      settled = true
       clearTimeout(timer)
+      abortSignal?.removeEventListener('abort', onAbort)
       reject(error)
     })
 
     child.on('close', (exitCode, signal) => {
-      clearTimeout(timer)
-      resolve({
-        command: `${options.command} ${options.args.join(' ')}`.trim(),
-        stdout,
-        stderr,
-        exitCode,
-        signal,
-        timedOut,
-        durationMs: Date.now() - start,
-        truncated
-      })
+      closed = { exitCode, signal }
+      settle()
     })
   })
 }
@@ -3667,6 +4366,11 @@ async function fetchDockerSandboxOperatorJson<TPayload = Record<string, any>>(
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs ?? config.timeoutMs)
+  // The caller's own signal (a Stop) ends the request too.
+  const callerSignal = init.signal ?? null
+  const forwardCallerAbort = () => controller.abort()
+  if (callerSignal?.aborted) controller.abort()
+  else callerSignal?.addEventListener('abort', forwardCallerAbort, { once: true })
 
   try {
     const response = await fetch(`${config.url}${pathname}`, {
@@ -3703,13 +4407,16 @@ async function fetchDockerSandboxOperatorJson<TPayload = Record<string, any>>(
       statusCode: 0,
       payload: null,
       reason: isAbort
-        ? 'Docker Sandbox operator request timed out.'
+        ? callerSignal?.aborted
+          ? 'Docker Sandbox operator request was stopped.'
+          : 'Docker Sandbox operator request timed out.'
         : error instanceof Error
           ? `Docker Sandbox operator is unreachable: ${error.message}`
           : 'Docker Sandbox operator is unreachable.'
     }
   } finally {
     clearTimeout(timer)
+    callerSignal?.removeEventListener('abort', forwardCallerAbort)
   }
 }
 
@@ -3754,10 +4461,7 @@ async function getDockerSandboxOperatorBackendStatus(): Promise<{
   }
 
   const payload = result.payload as Record<string, any>
-  const cli =
-    payload.cli === 'sbx' || payload.cli === 'docker-sandbox'
-      ? (payload.cli as DockerSandboxCliKind)
-      : null
+  const cli: DockerSandboxCliKind | null = payload.cli === 'sbx' ? 'sbx' : null
   const available = payload.available !== false
   return {
     available,
@@ -3856,6 +4560,7 @@ async function executeDockerSandboxViaOperator(options: {
   timeoutMs: number
   maxOutputChars?: number
   env?: Record<string, string>
+  abortSignal?: AbortSignal
 }): Promise<
   | { ok: true; run: CommandRunResult; sandboxName: string }
   | { ok: false; code: NativeAutomationErrorCode; reason: string; sandboxName?: string }
@@ -3873,10 +4578,17 @@ async function executeDockerSandboxViaOperator(options: {
         timeoutMs: options.timeoutMs,
         maxOutputChars: options.maxOutputChars ?? MAX_BASH_OUTPUT_CHARS,
         env: options.env ?? {}
-      })
+      }),
+      signal: options.abortSignal
     },
     options.timeoutMs + 10_000
   )
+
+  // The reply stops here. The operator's command ends with the chat's sandbox, which the run-end
+  // sweep removes.
+  if (!result.ok && options.abortSignal?.aborted) {
+    return { ok: true, run: stoppedBeforeStartRun(options.command), sandboxName: '' }
+  }
 
   if (!result.ok) {
     return {
@@ -3906,277 +4618,54 @@ async function cleanupDockerSandboxesForSessionViaOperator(sessionId: string): P
     : []
 }
 
-function buildDockerSandboxSessionHash(sessionId: string) {
-  return createHash('sha256').update(sessionId).digest('hex').slice(0, 8)
+// Every host `sbx` call goes through here, so a missing CLI surfaces as one clear reason, and a
+// call that starts Docker's sbx daemon is recorded so quitting Batshit stops it (BL-61).
+async function runSbx(
+  args: string[],
+  options: {
+    timeoutMs: number
+    maxOutputChars?: number
+    abortSignal?: AbortSignal
+    endInside?: () => Promise<void>
+  }
+): Promise<CommandRunResult> {
+  const callStartedAt = Date.now()
+  const run = await runSbxCommand(args, options)
+  // Output is kept from its start, so the daemon's first line always survives a long output.
+  if (sbxCallStartedDaemon(run.stderr, run.stdout)) {
+    await recordSbxDaemonStart(callStartedAt, Date.now()).catch((error) => {
+      console.warn('[Native Tools] Could not record the sbx daemon this call started:', error)
+    })
+  }
+  return run
 }
 
-function buildDockerSandboxSessionMarker(sessionId: string) {
-  return `-s${buildDockerSandboxSessionHash(sessionId)}-`
-}
-
-function buildDockerSandboxName(options: {
-  userId?: string
-  workspaceRoot: string
-  sessionId?: string | null
-}) {
-  const userPrefix =
-    typeof options.userId === 'string' && options.userId.trim().length > 0
-      ? options.userId.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').slice(0, 20)
-      : 'user'
-  const workspaceHash = createHash('sha256').update(options.workspaceRoot).digest('hex').slice(0, 10)
-  const sessionSegment =
-    typeof options.sessionId === 'string' && options.sessionId.trim().length > 0
-      ? `s${buildDockerSandboxSessionHash(options.sessionId.trim())}-`
-      : ''
-  return `${DOCKER_SANDBOX_NAME_PREFIX}${userPrefix}-${sessionSegment}${workspaceHash}`
-}
-
-function parseSandboxList(output: string): Array<{ name: string; status: string; workspace: string }> {
-  const lines = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-  if (lines.length <= 1) return []
-
-  const header = lines[0].split(/\s{2,}/).map((part) => part.trim().toLowerCase())
-  const nameIndex = header.findIndex((part) => part === 'sandbox' || part === 'name')
-  const statusIndex = header.findIndex((part) => part === 'status')
-  const workspaceIndex = header.findIndex((part) => part === 'workspace')
-
-  return lines.slice(1).map((line) => {
-    const parts = line.split(/\s{2,}/).filter(Boolean)
-    return {
-      name: parts[nameIndex >= 0 ? nameIndex : 0] ?? '',
-      status: (parts[statusIndex >= 0 ? statusIndex : 2] ?? '').toLowerCase(),
-      workspace: parts[workspaceIndex >= 0 ? workspaceIndex : parts.length - 1] ?? ''
-    }
-  })
-}
-
-function isManagedDockerSandboxName(name: string) {
-  if (!name) return false
-  return name.startsWith(DOCKER_SANDBOX_NAME_PREFIX)
-}
-
-type DockerSandboxCli = {
-  kind: DockerSandboxCliKind
-  command: string
-  versionArgs: string[]
-}
-
-type DockerSandboxCliCommandInput =
-  | { action: 'version' | 'ls' }
-  | { action: 'create'; sandboxName: string; workspaceRoot: string; extraWorkspaces?: string[] }
-  | { action: 'rm' | 'stop'; sandboxName: string | string[] }
-  | { action: 'policy-deny-network'; sandboxName: string }
-  | {
-      action: 'exec'
-      sandboxName: string
-      cwd: string
-      envArgs: string[]
-      commandText: string
-    }
-
-const DOCKER_SANDBOX_CLI_DETECTION_ORDER: DockerSandboxCli[] = [
-  { kind: 'sbx', command: 'sbx', versionArgs: ['version'] },
-  { kind: 'docker-sandbox', command: 'docker', versionArgs: ['sandbox', 'version'] }
-]
-
-function orderedDockerSandboxCliCandidates(): DockerSandboxCli[] {
-  const preferred = resolvePreferredDockerSandboxCliKind()
-  if (!preferred) return DOCKER_SANDBOX_CLI_DETECTION_ORDER
-  return [
-    ...DOCKER_SANDBOX_CLI_DETECTION_ORDER.filter((candidate) => candidate.kind === preferred),
-    ...DOCKER_SANDBOX_CLI_DETECTION_ORDER.filter((candidate) => candidate.kind !== preferred)
-  ]
-}
-
-function buildDockerSandboxCliCommand(
-  kind: DockerSandboxCliKind,
-  input: DockerSandboxCliCommandInput
-): { command: string; args: string[] } {
-  if (kind === 'sbx') {
-    if (input.action === 'version') return { command: 'sbx', args: ['version'] }
-    if (input.action === 'ls') return { command: 'sbx', args: ['ls'] }
-    if (input.action === 'create') {
-      return {
-        command: 'sbx',
-        args: [
-          'create',
-          '--name',
-          input.sandboxName,
-          'codex',
-          input.workspaceRoot,
-          ...(input.extraWorkspaces ?? [])
-        ]
-      }
-    }
-    if (input.action === 'rm') {
-      const names = Array.isArray(input.sandboxName) ? input.sandboxName : [input.sandboxName]
-      return { command: 'sbx', args: ['rm', '--force', ...names] }
-    }
-    if (input.action === 'stop') {
-      const names = Array.isArray(input.sandboxName) ? input.sandboxName : [input.sandboxName]
-      return { command: 'sbx', args: ['stop', ...names] }
-    }
-    if (input.action === 'policy-deny-network') {
-      return { command: 'sbx', args: ['policy', 'deny', 'network', input.sandboxName, '**'] }
-    }
-    if (input.action === 'exec') {
-      return {
-        command: 'sbx',
-        args: [
-          'exec',
-          '--workdir',
-          input.cwd,
-          ...input.envArgs,
-          input.sandboxName,
-          '/bin/bash',
-          '-lc',
-          input.commandText
-        ]
-      }
-    }
-    throw new Error(`Unsupported Docker Sandbox CLI action: ${(input as { action: string }).action}`)
+async function runSbxCommand(
+  args: string[],
+  options: {
+    timeoutMs: number
+    maxOutputChars?: number
+    abortSignal?: AbortSignal
+    endInside?: () => Promise<void>
   }
-
-  if (input.action === 'version') return { command: 'docker', args: ['sandbox', 'version'] }
-  if (input.action === 'ls') return { command: 'docker', args: ['sandbox', 'ls'] }
-  if (input.action === 'create') {
-    return {
-      command: 'docker',
-      args: [
-        'sandbox',
-        'create',
-        '--name',
-        input.sandboxName,
-        'codex',
-        input.workspaceRoot,
-        ...(input.extraWorkspaces ?? [])
-      ]
-    }
-  }
-  if (input.action === 'rm') {
-    const names = Array.isArray(input.sandboxName) ? input.sandboxName : [input.sandboxName]
-    return { command: 'docker', args: ['sandbox', 'rm', ...names] }
-  }
-  if (input.action === 'stop') {
-    const names = Array.isArray(input.sandboxName) ? input.sandboxName : [input.sandboxName]
-    return { command: 'docker', args: ['sandbox', 'stop', ...names] }
-  }
-  if (input.action === 'policy-deny-network') {
-    return {
-      command: 'docker',
-      args: ['sandbox', 'network', 'proxy', input.sandboxName, '--policy', DOCKER_SANDBOX_NETWORK_POLICY_DEFAULT]
-    }
-  }
-  if (input.action === 'exec') {
-    return {
-      command: 'docker',
-      args: [
-        'sandbox',
-        'exec',
-        '--workdir',
-        input.cwd,
-        ...input.envArgs,
-        input.sandboxName,
-        '/bin/bash',
-        '-lc',
-        input.commandText
-      ]
-    }
-  }
-  throw new Error(`Unsupported Docker Sandbox CLI action: ${(input as { action: string }).action}`)
-}
-
-async function resolveDockerSandboxCli(): Promise<
-  | { ok: true; cli: DockerSandboxCli; version: string | null }
-  | { ok: false; reason: string; attempted: DockerSandboxCliKind[] }
-> {
-  const errors: string[] = []
-  const attempted: DockerSandboxCliKind[] = []
-
-  for (const candidate of orderedDockerSandboxCliCandidates()) {
-    attempted.push(candidate.kind)
-    try {
-      const run = await runProcessCommand({
-        command: candidate.command,
-        args: candidate.versionArgs,
-        cwd: process.cwd(),
-        timeoutMs: DOCKER_SANDBOX_STATUS_TIMEOUT_MS,
-        maxOutputChars: DOCKER_SANDBOX_STATUS_MAX_OUTPUT_CHARS
-      })
-      const message = [run.stdout.trim(), run.stderr.trim()].filter(Boolean).join('\n')
-      if (run.timedOut) {
-        errors.push(`${candidate.kind}: Docker Sandbox status check timed out.`)
-        continue
-      }
-      if (run.exitCode !== 0) {
-        errors.push(`${candidate.kind}: ${message || 'version command failed.'}`)
-        continue
-      }
-      return { ok: true, cli: candidate, version: message || null }
-    } catch (error) {
-      const maybeError = error as NodeJS.ErrnoException
-      errors.push(
-        `${candidate.kind}: ${
-          maybeError?.code === 'ENOENT'
-            ? `${candidate.command} is not installed or not in PATH.`
-            : maybeError?.message || 'version command failed.'
-        }`
-      )
-    }
-  }
-
-  return {
-    ok: false,
-    attempted,
-    reason:
-      errors.join(' | ') ||
-      'Docker Sandbox CLI is unavailable. Install the standalone sbx CLI or legacy Docker Sandbox support.'
-  }
-}
-
-async function runDockerSandboxLifecycleCommand(options: {
-  kind: 'ls' | 'rm' | 'stop'
-  sandboxNames?: string[]
-  timeoutMs?: number
-  maxOutputChars?: number
-  fallbackCommand: string
-  fallbackError: string
-}): Promise<CommandRunResult> {
-  const cli = await resolveDockerSandboxCli()
-  if (!cli.ok) {
-    return {
-      command: options.fallbackCommand,
-      stdout: '',
-      stderr: cli.reason,
-      exitCode: 1,
-      signal: null,
-      timedOut: false,
-      durationMs: 0,
-      truncated: false
-    }
-  }
-  const names = options.sandboxNames ?? []
-  const commandSpec =
-    options.kind === 'ls'
-      ? buildDockerSandboxCliCommand(cli.cli.kind, { action: 'ls' })
-      : options.kind === 'rm'
-        ? buildDockerSandboxCliCommand(cli.cli.kind, { action: 'rm', sandboxName: names })
-        : buildDockerSandboxCliCommand(cli.cli.kind, { action: 'stop', sandboxName: names })
+): Promise<CommandRunResult> {
   return await runProcessCommand({
-    command: commandSpec.command,
-    args: commandSpec.args,
+    command: SBX_COMMAND,
+    args,
     cwd: process.cwd(),
-    timeoutMs: options.timeoutMs ?? DOCKER_SANDBOX_CLEANUP_TIMEOUT_MS,
-    maxOutputChars: options.maxOutputChars ?? DOCKER_SANDBOX_STATUS_MAX_OUTPUT_CHARS
+    timeoutMs: options.timeoutMs,
+    maxOutputChars: options.maxOutputChars ?? DOCKER_SANDBOX_STATUS_MAX_OUTPUT_CHARS,
+    abortSignal: options.abortSignal,
+    endInside: options.endInside
   }).catch((error) => {
     const maybeError = error as NodeJS.ErrnoException
     return {
-      command: options.fallbackCommand,
+      command: `${SBX_COMMAND} ${args.join(' ')}`,
       stdout: '',
-      stderr: maybeError?.message || options.fallbackError,
+      stderr:
+        maybeError?.code === 'ENOENT'
+          ? `${SBX_COMMAND} is not installed (spawn ${SBX_COMMAND} ENOENT).`
+          : maybeError?.message || `${SBX_COMMAND} failed to start.`,
       exitCode: 1,
       signal: null,
       timedOut: false,
@@ -4186,71 +4675,117 @@ async function runDockerSandboxLifecycleCommand(options: {
   })
 }
 
-async function bestEffortRemoveDockerSandbox(name: string): Promise<string | null> {
-  if (!isManagedDockerSandboxName(name)) return null
-
-  const removeResult = await runDockerSandboxLifecycleCommand({
-    kind: 'rm',
-    sandboxNames: [name],
-    fallbackCommand: 'Docker Sandbox remove',
-    fallbackError: 'Failed to remove Docker sandbox.'
-  })
-  if (!removeResult.timedOut && removeResult.exitCode === 0) {
-    return null
-  }
-
-  await runDockerSandboxLifecycleCommand({
-    kind: 'stop',
-    sandboxNames: [name],
-    fallbackCommand: 'Docker Sandbox stop',
-    fallbackError: 'Failed to stop Docker sandbox before cleanup.'
-  })
-
-  const retryRemoveResult = await runDockerSandboxLifecycleCommand({
-    kind: 'rm',
-    sandboxNames: [name],
-    fallbackCommand: 'Docker Sandbox remove',
-    fallbackError: 'Failed to remove Docker sandbox after stop.'
-  })
-  if (!retryRemoveResult.timedOut && retryRemoveResult.exitCode === 0) {
-    return null
-  }
-
-  return (
-    retryRemoveResult.stderr.trim() ||
-    retryRemoveResult.stdout.trim() ||
-    removeResult.stderr.trim() ||
-    removeResult.stdout.trim() ||
-    'Docker sandbox cleanup failed.'
-  )
+function sbxRunSucceeded(run: CommandRunResult) {
+  return !run.timedOut && run.exitCode === 0
 }
 
-async function pruneStoppedManagedDockerSandboxes(options?: { keepNames?: string[] }) {
-  const listResult = await runDockerSandboxLifecycleCommand({
-    kind: 'ls',
-    fallbackCommand: 'Docker Sandbox list',
-    fallbackError: 'Failed to list Docker sandboxes for cleanup.'
-  })
-  if (listResult.timedOut || listResult.exitCode !== 0) {
-    return [
-      listResult.stderr.trim() ||
-        listResult.stdout.trim() ||
-        'Failed to list Docker sandboxes for cleanup.'
-    ].filter(Boolean)
-  }
+function sbxRunOutput(run: CommandRunResult) {
+  return [run.stderr.trim(), run.stdout.trim()].filter(Boolean).join('\n')
+}
 
-  const keepNames = new Set((options?.keepNames ?? []).filter(Boolean))
+function describeSbxRunFailure(run: CommandRunResult, action: string) {
+  if (run.timedOut) return `${action} timed out.`
+  return describeSbxFailure(sbxRunOutput(run), `${action} failed.`)
+}
+
+/** A stopped or timed-out command's end inside its sandbox, by its tag (`commandEnd.ts`). */
+async function endDockerSandboxCommand(sandboxName: string, tag: string) {
+  const run = await runSbx(sbxCommandEndArgs({ sandboxName, tag }), {
+    timeoutMs: SANDBOX_COMMAND_END_TIMEOUT_MS
+  })
+  if (sbxRunSucceeded(run)) return
+  // A sandbox removed meanwhile (the chat's run-end sweep) took everything in it along.
+  if (classifySbxFailure(sbxRunOutput(run)) === 'not_found') return
+  const listed = await listSbxSandboxes()
+  if (listed.ok && !listed.entries.some((entry) => entry.name === sandboxName)) return
+  console.warn('[Native Tools] Could not end what a stopped Docker Sandbox command started:', {
+    sandboxName,
+    reason: describeSbxRunFailure(run, `Ending the command (exit ${run.exitCode ?? run.signal})`)
+  })
+}
+
+async function listSbxSandboxes(): Promise<
+  { ok: true; entries: SbxSandboxEntry[] } | { ok: false; reason: string }
+> {
+  const run = await runSbx(sbxListArgs(), { timeoutMs: DOCKER_SANDBOX_SBX_TIMEOUT_MS })
+  if (!sbxRunSucceeded(run)) {
+    return { ok: false, reason: describeSbxRunFailure(run, 'Listing Docker sandboxes') }
+  }
+  try {
+    return { ok: true, entries: parseSbxSandboxList(run.stdout) }
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `sbx ls --json printed something Batshit cannot read: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    }
+  }
+}
+
+// `sbx version` works before sign-in, so readiness also lists sandboxes (needs sign-in)
+// and reads the policy (needs the one-time preset).
+async function checkSbxReadiness(): Promise<
+  { ok: true; version: string | null } | { ok: false; reason: string; version: string | null }
+> {
+  const versionRun = await runSbx(sbxVersionArgs(), { timeoutMs: DOCKER_SANDBOX_STATUS_TIMEOUT_MS })
+  if (!sbxRunSucceeded(versionRun)) {
+    return { ok: false, version: null, reason: describeSbxRunFailure(versionRun, 'Checking sbx') }
+  }
+  const version = versionRun.stdout.trim() || null
+  const listed = await listSbxSandboxes()
+  if (!listed.ok) return { ok: false, version, reason: listed.reason }
+  const policyRun = await runSbx(sbxPolicyListArgs(), { timeoutMs: DOCKER_SANDBOX_SBX_TIMEOUT_MS })
+  if (!sbxRunSucceeded(policyRun)) {
+    return { ok: false, version, reason: describeSbxRunFailure(policyRun, 'Reading the sbx network policy') }
+  }
+  return { ok: true, version }
+}
+
+async function bestEffortRemoveDockerSandbox(name: string): Promise<string | null> {
+  if (!isManagedSbxSandboxName(name)) return null
+
+  const isGone = (run: CommandRunResult) =>
+    sbxRunSucceeded(run) || classifySbxFailure(sbxRunOutput(run)) === 'not_found'
+  const removeRun = await runSbx(sbxRemoveArgs([name]), { timeoutMs: DOCKER_SANDBOX_SBX_TIMEOUT_MS })
+  if (isGone(removeRun)) return null
+
+  await runSbx(sbxStopArgs([name]), { timeoutMs: DOCKER_SANDBOX_SBX_TIMEOUT_MS })
+  const retryRun = await runSbx(sbxRemoveArgs([name]), { timeoutMs: DOCKER_SANDBOX_SBX_TIMEOUT_MS })
+  if (isGone(retryRun)) return null
+  return describeSbxRunFailure(retryRun, 'Removing the Docker sandbox')
+}
+
+// The prune list is read once up front, so each removal checks again inside the gate:
+// by its turn the sandbox may have been used again.
+async function removeDockerSandboxIfStillAbandoned(name: string): Promise<string | null> {
+  const listed = await listSbxSandboxes()
+  if (!listed.ok) return listed.reason
+  const current = listed.entries.find((entry) => entry.name === name)
+  if (!current || !isAbandonedSbxSandbox(current)) return null
+  return await bestEffortRemoveDockerSandbox(name)
+}
+
+// sbx stops an idle sandbox about 30 s after its last command, so a stopped sandbox can
+// belong to a chat that is still running; only one unused for an hour is removed here.
+async function pruneAbandonedManagedDockerSandboxes() {
+  const listed = await listSbxSandboxes()
+  if (!listed.ok) return [listed.reason]
+
   const warnings: string[] = []
-  const staleEntries = parseSandboxList(listResult.stdout).filter(
+  const abandoned = listed.entries.filter(
     (entry) =>
-      !keepNames.has(entry.name) &&
-      isManagedDockerSandboxName(entry.name) &&
-      entry.status.trim().toLowerCase() !== 'running'
+      isManagedSbxSandboxName(entry.name) &&
+      isAbandonedSbxSandbox(entry) &&
+      // A sandbox this process is creating or using is not abandoned.
+      !dockerSandboxGate.isBusy(entry.name)
   )
 
-  for (const entry of staleEntries) {
-    const warning = await bestEffortRemoveDockerSandbox(entry.name)
-    if (warning) warnings.push(`${entry.name}: ${warning}`)
+  for (const entry of abandoned) {
+    const removal = await dockerSandboxGate.removeIfIdle(entry.name, () =>
+      removeDockerSandboxIfStillAbandoned(entry.name)
+    )
+    if (removal.removed && removal.value) warnings.push(`${entry.name}: ${removal.value}`)
   }
 
   return warnings
@@ -4259,6 +4794,7 @@ async function pruneStoppedManagedDockerSandboxes(options?: { keepNames?: string
 async function cleanupDockerSandboxesForSession(sessionId: string) {
   const normalizedSessionId = sessionId.trim()
   if (!normalizedSessionId) return [] as string[]
+  if (!dockerSandboxSessionsUsed.delete(normalizedSessionId)) return [] as string[]
 
   if (
     isBatshitContainerizedRuntime() &&
@@ -4270,32 +4806,31 @@ async function cleanupDockerSandboxesForSession(sessionId: string) {
       : []
   }
 
-  const listResult = await runDockerSandboxLifecycleCommand({
-    kind: 'ls',
-    fallbackCommand: 'Docker Sandbox list',
-    fallbackError: 'Failed to list Docker sandboxes for session cleanup.'
-  })
-  const warnings: string[] = []
-
-  if (listResult.timedOut || listResult.exitCode !== 0) {
-    warnings.push(
-      listResult.stderr.trim() ||
-        listResult.stdout.trim() ||
-        'Failed to list Docker sandboxes for session cleanup.'
-    )
-  } else {
-    const sessionMarker = buildDockerSandboxSessionMarker(normalizedSessionId)
-    const sessionEntries = parseSandboxList(listResult.stdout).filter(
-      (entry) => isManagedDockerSandboxName(entry.name) && entry.name.includes(sessionMarker)
-    )
-
-    for (const entry of sessionEntries) {
-      const warning = await bestEffortRemoveDockerSandbox(entry.name)
-      if (warning) warnings.push(`${entry.name}: ${warning}`)
-    }
+  // An sbx that is missing or not set up cannot have made a sandbox for this run, and on a
+  // computer that never uses Docker Sandbox that is not worth a warning on every turn.
+  const listed = await listSbxSandboxes()
+  if (!listed.ok) {
+    const kind = classifySbxFailure(listed.reason)
+    return kind === 'not_installed' || kind === 'not_signed_in' || kind === 'network_policy_not_initialized'
+      ? []
+      : [listed.reason]
   }
 
-  warnings.push(...(await pruneStoppedManagedDockerSandboxes()))
+  const warnings: string[] = []
+  const sessionMarker = buildSbxSessionMarker(normalizedSessionId)
+  const sessionEntries = listed.entries.filter(
+    (entry) => isManagedSbxSandboxName(entry.name) && entry.name.includes(sessionMarker)
+  )
+  for (const entry of sessionEntries) {
+    // The chat's run is over, so this removal does not wait for a command it started.
+    // It does wait for a create already under way, instead of removing a starting sandbox.
+    const warning = await dockerSandboxGate.remove(entry.name, () =>
+      bestEffortRemoveDockerSandbox(entry.name)
+    )
+    if (warning) warnings.push(`${entry.name}: ${warning}`)
+  }
+
+  warnings.push(...(await pruneAbandonedManagedDockerSandboxes()))
   return warnings
 }
 
@@ -4340,31 +4875,17 @@ export async function getSandboxBackendStatus(): Promise<{
     }
   }
 
-  const resolved = await resolveDockerSandboxCli()
-  if (resolved.ok) {
-    return {
-      available: true,
-      supported: true,
-      dockerUnsupported: false,
-      containerized: isBatshitContainerizedRuntime(),
-      backend: 'docker_sandbox',
-      policy: DOCKER_SANDBOX_NETWORK_POLICY_DEFAULT,
-      version: resolved.version,
-      cli: resolved.cli.kind,
-      reason: null
-    }
-  }
-
+  const readiness = await checkSbxReadiness()
   return {
-    available: false,
+    available: readiness.ok,
     supported: true,
     dockerUnsupported: false,
     containerized: isBatshitContainerizedRuntime(),
     backend: 'docker_sandbox',
     policy: DOCKER_SANDBOX_NETWORK_POLICY_DEFAULT,
-    version: null,
-    cli: null,
-    reason: resolved.reason
+    version: readiness.version,
+    cli: readiness.version ? 'sbx' : null,
+    reason: readiness.ok ? null : readiness.reason
   }
 }
 
@@ -4422,204 +4943,89 @@ async function resolveSandboxRecoveryWorkspaceRoot(options: {
   }
 }
 
-async function ensureDockerSandboxReady(options: {
-  workspaceRoot: string
-  userId?: string
-  sessionId?: string | null
-}): Promise<
+type DockerSandboxReadyResult =
   | { ok: true; sandboxName: string; cli: DockerSandboxCliKind }
   | { ok: false; code: NativeAutomationErrorCode; reason: string }
-> {
-  const status = await getSandboxBackendStatus()
-  if (!status.available) {
-    return {
-      ok: false,
-      code: 'SANDBOX_UNAVAILABLE',
-      reason:
-        status.reason ||
-        'Docker Sandbox is unavailable. Start Docker Desktop and install Docker Sandbox support.'
-    }
+
+// Concurrent callers for one sandbox share one create (F-P5-1).
+function ensureDockerSandboxReady(options: {
+  sandboxName: string
+  workspaceRoot: string
+}): Promise<DockerSandboxReadyResult> {
+  return dockerSandboxGate.ensure(options.sandboxName, () => startDockerSandbox(options))
+}
+
+// Runs inside `dockerSandboxGate.ensure`, so one call at a time per sandbox name.
+async function startDockerSandbox(options: {
+  sandboxName: string
+  workspaceRoot: string
+}): Promise<DockerSandboxReadyResult> {
+  if (isBatshitContainerizedRuntime() && !containerizedDockerSandboxLocalCliExplicitlyAllowed()) {
+    return { ok: false, code: 'SANDBOX_UNAVAILABLE', reason: CONTAINERIZED_DOCKER_SANDBOX_DISABLED_REASON }
   }
-  const resolvedCli = await resolveDockerSandboxCli()
-  if (!resolvedCli.ok) {
-    return {
-      ok: false,
-      code: 'SANDBOX_UNAVAILABLE',
-      reason: resolvedCli.reason
-    }
-  }
-  const cliKind = resolvedCli.cli.kind
+  const { sandboxName } = options
+  const usable = (entry: SbxSandboxEntry | undefined) =>
+    Boolean(entry) &&
+    isReusableSbxSandbox(entry as SbxSandboxEntry) &&
+    sbxSandboxHasWorkspace(entry as SbxSandboxEntry, options.workspaceRoot)
 
-  const sandboxName = buildDockerSandboxName({
-    userId: options.userId,
-    workspaceRoot: options.workspaceRoot,
-    sessionId: options.sessionId ?? null
-  })
-  const listCommand = buildDockerSandboxCliCommand(cliKind, { action: 'ls' })
+  const listed = await listSbxSandboxes()
+  if (!listed.ok) return { ok: false, code: 'SANDBOX_UNAVAILABLE', reason: listed.reason }
+  const existing = listed.entries.find((entry) => entry.name === sandboxName)
 
-  const listResult = await runProcessCommand({
-    command: listCommand.command,
-    args: listCommand.args,
-    cwd: process.cwd(),
-    timeoutMs: DOCKER_SANDBOX_STATUS_TIMEOUT_MS,
-    maxOutputChars: DOCKER_SANDBOX_STATUS_MAX_OUTPUT_CHARS
-  }).catch((error) => {
-    const maybeError = error as NodeJS.ErrnoException
-    return {
-      command: `${listCommand.command} ${listCommand.args.join(' ')}`,
-      stdout: '',
-      stderr: maybeError?.message || 'Failed to list Docker sandboxes.',
-      exitCode: 1,
-      signal: null,
-      timedOut: false,
-      durationMs: 0,
-      truncated: false
-    } as CommandRunResult
-  })
-
-  if (listResult.timedOut || listResult.exitCode !== 0) {
-    return {
-      ok: false,
-      code: 'SANDBOX_UNAVAILABLE',
-      reason:
-        listResult.stderr.trim() ||
-        listResult.stdout.trim() ||
-        'Unable to query Docker Sandbox state.'
-    }
-  }
-
-  const existing = parseSandboxList(listResult.stdout).find(
-    (entry) => entry.name === sandboxName
-  )
-
-  const existingStatus = existing?.status?.trim().toLowerCase() ?? ''
-  const existingWorkspace = existing?.workspace?.trim() ?? ''
-  const hasWorkspaceMismatch =
-    existingWorkspace.length > 0 && existingWorkspace !== '-' && existingWorkspace !== options.workspaceRoot
-  const shouldRecreateExisting =
-    Boolean(existing) && (existingStatus !== 'running' || hasWorkspaceMismatch)
-
-  if (shouldRecreateExisting) {
-    const removeCommand = buildDockerSandboxCliCommand(cliKind, {
-      action: 'rm',
-      sandboxName
-    })
-    const removeResult = await runProcessCommand({
-      command: removeCommand.command,
-      args: removeCommand.args,
-      cwd: process.cwd(),
-      timeoutMs: 30_000,
-      maxOutputChars: DOCKER_SANDBOX_STATUS_MAX_OUTPUT_CHARS
-    }).catch((error) => {
-      const maybeError = error as NodeJS.ErrnoException
-      return {
-        command: `${removeCommand.command} ${removeCommand.args.join(' ')}`,
-        stdout: '',
-        stderr: maybeError?.message || 'Failed to remove stale Docker sandbox.',
-        exitCode: 1,
-        signal: null,
-        timedOut: false,
-        durationMs: 0,
-        truncated: false
-      } as CommandRunResult
-    })
-
-    if (removeResult.timedOut || removeResult.exitCode !== 0) {
-      return {
-        ok: false,
-        code: 'BACKEND_UNAVAILABLE',
-        reason:
-          removeResult.stderr.trim() ||
-          removeResult.stdout.trim() ||
-          'Failed to reset stale Docker sandbox state.'
+  if (!usable(existing)) {
+    if (existing) {
+      const warning = await bestEffortRemoveDockerSandbox(sandboxName)
+      if (warning) {
+        return {
+          ok: false,
+          code: 'BACKEND_UNAVAILABLE',
+          reason: `Could not replace the unusable Docker sandbox ${sandboxName}: ${warning}`
+        }
       }
     }
-  }
 
-  if (!existing || shouldRecreateExisting) {
     const batshitHomeMount = await ensureBatshitHomeSandboxMountPath()
     const extraWorkspaces =
       !isPathInsideSandboxRoot(batshitHomeMount, options.workspaceRoot) &&
       !isPathInsideSandboxRoot(options.workspaceRoot, batshitHomeMount)
         ? [batshitHomeMount]
         : []
-    const createCommand = buildDockerSandboxCliCommand(cliKind, {
-      action: 'create',
-      sandboxName,
-      workspaceRoot: options.workspaceRoot,
-      extraWorkspaces
-    })
-    const createResult = await runProcessCommand({
-      command: createCommand.command,
-      args: createCommand.args,
-      cwd: process.cwd(),
-      timeoutMs: 90_000,
-      maxOutputChars: 120_000
-    }).catch((error) => {
-      const maybeError = error as NodeJS.ErrnoException
-      return {
-        command: `${createCommand.command} ${createCommand.args.join(' ')}`,
-        stdout: '',
-        stderr: maybeError?.message || 'Failed to create Docker sandbox.',
-        exitCode: 1,
-        signal: null,
-        timedOut: false,
-        durationMs: 0,
-        truncated: false
-      } as CommandRunResult
-    })
-
-    if (createResult.timedOut || createResult.exitCode !== 0) {
-      return {
-        ok: false,
-        code: 'SANDBOX_UNAVAILABLE',
-        reason:
-          createResult.stderr.trim() ||
-          createResult.stdout.trim() ||
-          'Failed to create Docker sandbox.'
+    const createRun = await runSbx(
+      sbxCreateArgs({ sandboxName, workspaceRoot: options.workspaceRoot, extraWorkspaces }),
+      { timeoutMs: DOCKER_SANDBOX_CREATE_TIMEOUT_MS, maxOutputChars: 120_000 }
+    )
+    if (!sbxRunSucceeded(createRun)) {
+      // Another process created this sandbox between the list and the create: use it.
+      const createdElsewhere =
+        classifySbxFailure(sbxRunOutput(createRun)) === 'already_exists' &&
+        (await listSbxSandboxes().then((again) =>
+          again.ok ? usable(again.entries.find((entry) => entry.name === sandboxName)) : false
+        ))
+      if (!createdElsewhere) {
+        return {
+          ok: false,
+          code: 'SANDBOX_UNAVAILABLE',
+          reason: describeSbxRunFailure(createRun, 'Creating the Docker sandbox')
+        }
       }
     }
   }
 
-  // Always enforce an explicit network policy so behavior is deterministic.
-  const policyCommand = buildDockerSandboxCliCommand(cliKind, {
-    action: 'policy-deny-network',
-    sandboxName
+  // Applied on every run: a repeat is a no-op, and it also covers a sandbox created without
+  // the rule. A stopped sandbox needs no start here; `sbx exec` starts it.
+  const policyRun = await runSbx(sbxDenyAllNetworkArgs(sandboxName), {
+    timeoutMs: DOCKER_SANDBOX_SBX_TIMEOUT_MS
   })
-  const networkPolicyResult = await runProcessCommand({
-    command: policyCommand.command,
-    args: policyCommand.args,
-    cwd: process.cwd(),
-    timeoutMs: DOCKER_SANDBOX_STATUS_TIMEOUT_MS,
-    maxOutputChars: DOCKER_SANDBOX_STATUS_MAX_OUTPUT_CHARS
-  }).catch((error) => {
-    const maybeError = error as NodeJS.ErrnoException
-    return {
-      command: `${policyCommand.command} ${policyCommand.args.join(' ')}`,
-      stdout: '',
-      stderr: maybeError?.message || 'Failed to configure Docker sandbox network policy.',
-      exitCode: 1,
-      signal: null,
-      timedOut: false,
-      durationMs: 0,
-      truncated: false
-    } as CommandRunResult
-  })
-
-  if (networkPolicyResult.timedOut || networkPolicyResult.exitCode !== 0) {
+  if (!sbxRunSucceeded(policyRun)) {
     return {
       ok: false,
       code: 'BACKEND_UNAVAILABLE',
-      reason:
-        networkPolicyResult.stderr.trim() ||
-        networkPolicyResult.stdout.trim() ||
-        cliKind === 'sbx'
-          ? 'Failed to apply Docker sandbox network policy. If sbx reports that no default policy exists, run sbx policy set-default first and retry.'
-          : 'Failed to apply Docker sandbox network policy.'
+      reason: describeSbxRunFailure(policyRun, 'Blocking network access for the Docker sandbox')
     }
   }
 
-  return { ok: true, sandboxName, cli: cliKind }
+  return { ok: true, sandboxName, cli: 'sbx' }
 }
 
 export async function recoverSandboxBackend(options: {
@@ -4689,8 +5095,11 @@ export async function recoverSandboxBackend(options: {
   }
 
   const ensured = await ensureDockerSandboxReady({
-    workspaceRoot: workspaceResolution.workspaceRoot,
-    userId: options.userId
+    sandboxName: buildSbxSandboxName({
+      userId: options.userId,
+      workspaceRoot: workspaceResolution.workspaceRoot
+    }),
+    workspaceRoot: workspaceResolution.workspaceRoot
   })
   if (!ensured.ok) {
     return {
@@ -4796,6 +5205,7 @@ async function runBashCommand(options: {
   timeoutMs: number
   maxOutputChars?: number
   env?: Record<string, string>
+  abortSignal?: AbortSignal
 }): Promise<CommandRunResult> {
   const maxOutputChars = options.maxOutputChars ?? MAX_BASH_OUTPUT_CHARS
   return await runProcessCommand({
@@ -4804,7 +5214,9 @@ async function runBashCommand(options: {
     cwd: options.cwd,
     timeoutMs: options.timeoutMs,
     maxOutputChars,
-    env: options.env
+    env: options.env,
+    abortSignal: options.abortSignal,
+    ownProcessGroup: true
   })
 }
 
@@ -4817,6 +5229,7 @@ async function runDockerSandboxCommand(options: {
   timeoutMs: number
   maxOutputChars?: number
   env?: Record<string, string>
+  abortSignal?: AbortSignal
 }): Promise<
   | { ok: true; run: CommandRunResult; sandboxName: string }
   | { ok: false; code: NativeAutomationErrorCode; reason: string; sandboxName?: string }
@@ -4825,77 +5238,102 @@ async function runDockerSandboxCommand(options: {
     isBatshitContainerizedRuntime() &&
     containerizedDockerSandboxOperatorEnabled()
   ) {
-    return await executeDockerSandboxViaOperator(options)
+    const viaOperator = await executeDockerSandboxViaOperator(options)
+    if (viaOperator.ok) markDockerSandboxSessionUsed(options.sessionId)
+    return viaOperator
   }
 
-  const ensured = await ensureDockerSandboxReady({
-    workspaceRoot: options.workspaceRoot,
+  const sandboxName = buildSbxSandboxName({
     userId: options.userId,
-    sessionId: options.sessionId
+    workspaceRoot: options.workspaceRoot,
+    sessionId: options.sessionId ?? null
   })
-  if (!ensured.ok) {
-    return ensured
-  }
-
-  const envArgs: string[] = []
-  for (const [key, value] of Object.entries(options.env ?? {})) {
-    if (!key || typeof value !== 'string') continue
-    envArgs.push('--env', `${key}=${value}`)
-  }
-
-  const maxOutputChars = options.maxOutputChars ?? MAX_BASH_OUTPUT_CHARS
-  const execCommand = buildDockerSandboxCliCommand(ensured.cli, {
-    action: 'exec',
-    sandboxName: ensured.sandboxName,
-    cwd: options.cwd,
-    envArgs,
-    commandText: options.command
-  })
-  const run = await runProcessCommand({
-    command: execCommand.command,
-    args: execCommand.args,
-    cwd: process.cwd(),
-    timeoutMs: options.timeoutMs,
-    maxOutputChars
-  }).catch((error) => {
-    const maybeError = error as NodeJS.ErrnoException
-    return {
-      command: `${execCommand.command} ${execCommand.args.join(' ')}`,
-      stdout: '',
-      stderr: maybeError?.message || 'Failed to execute command in Docker sandbox.',
-      exitCode: 1,
-      signal: null,
-      timedOut: false,
-      durationMs: 0,
-      truncated: false
-    } as CommandRunResult
-  })
-
-  if (!options.sessionId) {
-    const cleanupWarnings: string[] = []
-    const currentCleanupWarning = await bestEffortRemoveDockerSandbox(ensured.sandboxName)
-    if (currentCleanupWarning) {
-      cleanupWarnings.push(`${ensured.sandboxName}: ${currentCleanupWarning}`)
+  // Held until the command returns, so no cleanup removes the sandbox under it.
+  let releaseLease: (() => void) | null = dockerSandboxGate.lease(sandboxName)
+  try {
+    const ensured = await ensureDockerSandboxReady({
+      sandboxName,
+      workspaceRoot: options.workspaceRoot
+    })
+    if (!ensured.ok) {
+      return { ...ensured, sandboxName }
     }
-    cleanupWarnings.push(...(await pruneStoppedManagedDockerSandboxes()))
-    if (cleanupWarnings.length > 0) {
-      console.warn(
-        '[Native Tools] Docker sandbox cleanup warnings:',
-        cleanupWarnings.join(' | ')
+    markDockerSandboxSessionUsed(options.sessionId)
+
+    // A Stop ends the command, not a sandbox start already under way (that waits for its own
+    // timeout, and the command then never starts). `sbx exec` passes nothing into the sandbox,
+    // so a Stop or timeout ends the client and then, by its tag, what it runs inside
+    // (`commandEnd.ts`).
+    const tag = newSandboxCommandTag()
+    const run = await runSbx(
+      sbxExecArgs({
+        sandboxName,
+        cwd: options.cwd,
+        env: options.env,
+        command: options.command,
+        tag
+      }),
+      {
+        timeoutMs: options.timeoutMs,
+        maxOutputChars: options.maxOutputChars ?? MAX_BASH_OUTPUT_CHARS,
+        abortSignal: options.abortSignal,
+        endInside: () => endDockerSandboxCommand(sandboxName, tag)
+      }
+    )
+
+    if (!options.sessionId) {
+      // A one-shot sandbox goes away with its command, unless another one-shot command
+      // for the same workspace still runs in it; that command removes it when it ends.
+      releaseLease()
+      releaseLease = null
+      const cleanupWarnings: string[] = []
+      const removal = await dockerSandboxGate.removeIfIdle(sandboxName, () =>
+        bestEffortRemoveDockerSandbox(sandboxName)
       )
+      if (removal.removed && removal.value) {
+        cleanupWarnings.push(`${sandboxName}: ${removal.value}`)
+      }
+      cleanupWarnings.push(...(await pruneAbandonedManagedDockerSandboxes()))
+      if (cleanupWarnings.length > 0) {
+        console.warn(
+          '[Native Tools] Docker sandbox cleanup warnings:',
+          cleanupWarnings.join(' | ')
+        )
+      }
     }
-  }
 
+    return {
+      ok: true,
+      run,
+      sandboxName
+    }
+  } finally {
+    releaseLease?.()
+  }
+}
+
+/** An Agent Browser call a Stop reached before it started: it never ran. */
+function stoppedBeforeStartAgentBrowserRun(request: AgentBrowserCliRunRequest): AgentBrowserCliRunResult {
   return {
-    ok: true,
-    run,
-    sandboxName: ensured.sandboxName
+    command: request.command,
+    args: request.args,
+    stdout: '',
+    stderr: '',
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    durationMs: 0,
+    truncated: false,
+    stopped: true
   }
 }
 
 async function runAgentBrowserCli(
   request: AgentBrowserCliRunRequest
 ): Promise<AgentBrowserCliRunResult> {
+  const abortSignal = request.abortSignal
+  if (abortSignal?.aborted) return stoppedBeforeStartAgentBrowserRun(request)
+
   if (agentBrowserCliRunnerOverride) {
     return await agentBrowserCliRunnerOverride(request)
   }
@@ -4923,6 +5361,9 @@ async function runAgentBrowserCli(
     let stderr = ''
     let truncated = false
     let timedOut = false
+    let stopped = false
+    let ending = false
+    let settled = false
 
     child.stdout.on('data', (chunk) => {
       const next = appendWithLimit(stdout, String(chunk), maxOutputChars)
@@ -4936,19 +5377,50 @@ async function runAgentBrowserCli(
       if (next.truncated) truncated = true
     })
 
+    // A Stop and the timeout end the call the same way (`commandEnd.ts`): SIGTERM, then SIGKILL
+    // 400 ms later, to the CLI process ALONE. The daemon the CLI starts once is long-lived by
+    // design and has left the CLI's process group (seen with 0.37.1: its own group, output on
+    // /dev/null), so it is never signalled. Output still held after the SIGKILL round is let go.
+    const end = () => {
+      if (ending || settled) return
+      ending = true
+      endCommandProcess(child, {
+        ownGroup: false,
+        afterKill: () => {
+          child.stdout.destroy()
+          child.stderr.destroy()
+        }
+      })
+    }
+
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGTERM')
-      setTimeout(() => child.kill('SIGKILL'), 400)
+      end()
     }, timeoutMs)
 
-    child.on('error', (error) => {
+    const onAbort = () => {
+      if (settled) return
+      stopped = true
+      end()
+    }
+    abortSignal?.addEventListener('abort', onAbort, { once: true })
+
+    // The signal is the reply's: it outlives this call, so the listener must not.
+    const finish = () => {
+      settled = true
       clearTimeout(timer)
+      abortSignal?.removeEventListener('abort', onAbort)
+    }
+
+    child.on('error', (error) => {
+      if (settled) return
+      finish()
       reject(error)
     })
 
     child.on('close', (exitCode, signal) => {
-      clearTimeout(timer)
+      if (settled) return
+      finish()
       resolve({
         command,
         args,
@@ -4958,7 +5430,8 @@ async function runAgentBrowserCli(
         signal,
         timedOut,
         durationMs: Date.now() - start,
-        truncated
+        truncated,
+        ...(stopped ? { stopped: true } : {})
       })
     })
   })
@@ -5168,6 +5641,8 @@ async function fetchAgentBrowserSidecarHealth(): Promise<{
   ok: boolean
   url: string
   version: string | null
+  /** What the sidecar's runs do (`AGENT_BROWSER_SIDECAR_STOP_REVISION`); `null` from an older one. */
+  revision: number | null
   reason: string | null
   payload: Record<string, any> | null
 }> {
@@ -5182,6 +5657,10 @@ async function fetchAgentBrowserSidecarHealth(): Promise<{
       ok,
       url,
       version: typeof payload?.version === 'string' ? payload.version : null,
+      revision:
+        typeof payload?.sidecarRevision === 'number' && Number.isFinite(payload.sidecarRevision)
+          ? payload.sidecarRevision
+          : null,
       reason: ok
         ? null
         : typeof payload?.error === 'string'
@@ -5194,6 +5673,7 @@ async function fetchAgentBrowserSidecarHealth(): Promise<{
       ok: false,
       url,
       version: null,
+      revision: null,
       reason:
         error instanceof Error
           ? `Docker Agent Browser sidecar is not reachable: ${error.message}`
@@ -5207,17 +5687,37 @@ async function runAgentBrowserSidecarCli(
   request: AgentBrowserCliRunRequest
 ): Promise<AgentBrowserCliRunResult> {
   const url = resolveAgentBrowserSidecarUrl()
-  const response = await fetch(`${url}/v1/run`, {
-    method: 'POST',
-    headers: buildAgentBrowserSidecarHeaders(true),
-    body: JSON.stringify({
-      args: request.args,
-      env: request.env ?? {},
-      timeoutMs: request.timeoutMs,
-      maxOutputChars: request.maxOutputChars
-    })
+  // A sidecar that ends its run when this request goes (2026-09-18) is handed the Stop; an older
+  // one would run the command on, so Batshit waits for its answer as before.
+  const stopSignal = request.sidecarHearsStop === true ? request.abortSignal : undefined
+  const started = Date.now()
+  const stoppedRun = (): AgentBrowserCliRunResult => ({
+    ...stoppedBeforeStartAgentBrowserRun(request),
+    durationMs: Date.now() - started
   })
-  const payload = (await response.json().catch(() => null)) as Record<string, any> | null
+  let response: Response
+  try {
+    response = await fetch(`${url}/v1/run`, {
+      method: 'POST',
+      headers: buildAgentBrowserSidecarHeaders(true),
+      body: JSON.stringify({
+        args: request.args,
+        env: request.env ?? {},
+        timeoutMs: request.timeoutMs,
+        maxOutputChars: request.maxOutputChars
+      }),
+      ...(stopSignal ? { signal: stopSignal } : {})
+    })
+  } catch (error) {
+    if (stopSignal?.aborted) return stoppedRun()
+    throw error
+  }
+  let payload: Record<string, any> | null = null
+  try {
+    payload = (await response.json()) as Record<string, any> | null
+  } catch {
+    if (stopSignal?.aborted) return stoppedRun()
+  }
   if (!response.ok) {
     throw new Error(
       typeof payload?.error === 'string'
@@ -5236,6 +5736,8 @@ async function checkAgentBrowserAvailability(): Promise<{
   supported?: boolean
   dockerUnsupported?: boolean
   supportLevel?: AgentBrowserSupportLevel
+  /** The Docker sidecar's `sidecarRevision`, when it reported one. */
+  sidecarRevision?: number | null
 }> {
   if (isBatshitContainerizedRuntime()) {
     const health = await fetchAgentBrowserSidecarHealth()
@@ -5243,6 +5745,7 @@ async function checkAgentBrowserAvailability(): Promise<{
       available: health.ok,
       command: health.ok ? 'agent-browser' : undefined,
       version: health.version ?? undefined,
+      sidecarRevision: health.revision,
       reason: health.ok ? undefined : health.reason ?? DOCKER_AGENT_BROWSER_UNSUPPORTED_REASON,
       supported: true,
       dockerUnsupported: false,
@@ -6037,6 +6540,7 @@ async function nativeCliToolUse(input: {
   selectedCliToolIds?: string[]
   /** PR #106 review F-5 — the caller's lane, so the CLI-tool card lands where it can be clicked. */
   actorType?: ControlActorType
+  abortSignal?: AbortSignal | null
 }): Promise<Record<string, any>> {
   const toolId = input.toolId.trim()
   const cliInput =
@@ -6055,7 +6559,7 @@ async function nativeCliToolUse(input: {
     approval: input.approval ?? null,
     projectPath: input.projectPath ?? null,
     actorType: input.actorType
-  })
+  }, { abortSignal: input.abortSignal })
 }
 
 function buildBatshitToolUseExample(ref: string, inputHint: string): string {
@@ -6553,6 +7057,11 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
   actorType: ControlActorType
   /** SA-117 F-P2-1 — the call arrived on a Subagent or Worker run's credential. */
   delegatedRun?: boolean
+  /**
+   * The server-owned Stop of the reply this call belongs to. Agent Browser and saved CLI
+   * runners receive it separately from model-supplied tool input and approval authority.
+   */
+  abortSignal?: AbortSignal | null
   executeControlUse?: (
     controlInput: ControlUseInput,
     allowedControlIds: string[]
@@ -6598,7 +7107,8 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       approval: input.approvalGrant ?? null,
       projectPath: input.projectPath ?? null,
       selectedCliToolIds: input.selectedCliToolIds,
-      actorType: input.actorType
+      actorType: input.actorType,
+      abortSignal: input.abortSignal
     })
   } else if (parsed.family === 'artifact' || parsed.family === 'fabric') {
     const controlInput: ControlUseInput = {
@@ -6665,7 +7175,10 @@ async function nativeBatshitToolUse(input: BatshitToolUseInput & {
       sessionId: input.sessionId,
       toolName: parsed.target,
       params: payload,
-      settings: input.agentBrowserSettings
+      settings: input.agentBrowserSettings,
+      // The model's input is spread into this call and its schema passes unknown keys through,
+      // so only a real signal counts.
+      abortSignal: input.abortSignal instanceof AbortSignal ? input.abortSignal : undefined
     })
   }
 
@@ -8287,8 +8800,14 @@ async function nativeBashExecute(input: {
    * dispatch, where the flag keeps meaning "an image payload exists".
    */
   imageDelivery?: ToolResultImageDeliveryDecision | null
+  /**
+   * The model run's abort signal (the AI SDK hands one to every tool call). A Stop ends the
+   * command, and a command it reaches before it starts never runs.
+   */
+  abortSignal?: AbortSignal | null
 }): Promise<Record<string, any>> {
   const command = input.command?.trim() || ''
+  const abortSignal = input.abortSignal ?? undefined
   const accessMode =
     normalizeBashAccessMode(input.accessMode ?? input.policyMode) ??
     DEFAULT_BASH_ACCESS_MODE
@@ -8522,6 +9041,7 @@ async function nativeBashExecute(input: {
   const mapping = mapBashCommandToRendererTool(command)
   const beforeEditSnapshot = await captureMappedTextFileSnapshot({
     mapping,
+    command,
     cwd: cwdResolution.cwd,
     workspaceRoot: workspaceResolution.workspaceRoot
   })
@@ -8743,6 +9263,9 @@ async function nativeBashExecute(input: {
     | { ok: true; run: CommandRunResult; sandboxName?: string }
     | { ok: false; code: NativeAutomationErrorCode; reason: string; sandboxName?: string }
   > => {
+    // Stopped before it began: no sandbox is started for it either.
+    if (abortSignal?.aborted) return { ok: true, run: stoppedBeforeStartRun(commandValue) }
+
     if (effectiveBackend === 'docker_sandbox') {
       const sandboxRun = await runDockerSandboxCommand({
         userId: input.userId,
@@ -8752,7 +9275,8 @@ async function nativeBashExecute(input: {
         command: commandValue,
         timeoutMs: effectiveTimeoutMs,
         maxOutputChars,
-        env: commandEnv
+        env: commandEnv,
+        abortSignal
       })
       if (!sandboxRun.ok) return sandboxRun
       return {
@@ -8771,7 +9295,8 @@ async function nativeBashExecute(input: {
         command: commandValue,
         timeoutMs: effectiveTimeoutMs,
         maxOutputChars,
-        env: commandEnv
+        env: commandEnv,
+        abortSignal
       })
       if (!sandboxRun.ok) {
         return {
@@ -8799,7 +9324,8 @@ async function nativeBashExecute(input: {
       cwd: cwdResolution.cwd,
       timeoutMs: effectiveTimeoutMs,
       maxOutputChars,
-      env: commandEnv
+      env: commandEnv,
+      abortSignal
     })
     return { ok: true, run }
   }
@@ -8828,7 +9354,7 @@ async function nativeBashExecute(input: {
   let recoverySucceeded = false
   let recoveryError: string | null = null
 
-  if (useAgentBrowserDefaults && isLikelyAgentBrowserBashCommand(commandToRun)) {
+  if (!run.stopped && useAgentBrowserDefaults && isLikelyAgentBrowserBashCommand(commandToRun)) {
     const initialErrorMessage = extractAgentBrowserBashErrorMessage(run)
     const isRecoverableStartupFailure =
       isAgentBrowserBashRunFailure(run) && isAgentBrowserRecoverableStartupError(initialErrorMessage)
@@ -8882,13 +9408,26 @@ async function nativeBashExecute(input: {
     }
   }
   const afterEditSnapshot =
-    run.exitCode === 0 && run.timedOut === false
+    beforeEditSnapshot !== null && run.exitCode === 0 && run.timedOut === false
       ? await captureMappedTextFileSnapshot({
           mapping,
+          command,
           cwd: cwdResolution.cwd,
           workspaceRoot: workspaceResolution.workspaceRoot
         })
       : null
+  // The edit's diff is built HERE, where its two copies are read, and only the diff leaves: the
+  // model reads this result in its loop, the n8n dispatch and the SSE event carry it, and the
+  // Execution Viewer stores it. The copies themselves (up to 24,000 bytes each) went to all of
+  // them until 2026-09-18, and every later model call in the run paid for both again.
+  const editDiff =
+    beforeEditSnapshot !== null && afterEditSnapshot !== null
+      ? buildSnapshotEditPreview({
+          filePath: resolveMappedPath(mapping) ?? undefined,
+          before: beforeEditSnapshot,
+          after: afterEditSnapshot
+        })
+      : undefined
   const screenshotPath = resolveAgentBrowserBashScreenshotPath(commandToRun, cwdResolution.cwd)
   const isAgentBrowserScreenshot = Boolean(screenshotPath)
   const screenshotMediaType = inferImageMediaTypeFromPath(screenshotPath || '') || 'image/png'
@@ -8967,7 +9506,7 @@ async function nativeBashExecute(input: {
   }
 
   return {
-    success: run.exitCode === 0 && run.timedOut === false,
+    success: run.exitCode === 0 && run.timedOut === false && !run.stopped,
     blocked: false,
     command: run.command,
     stdout: run.stdout,
@@ -8975,6 +9514,8 @@ async function nativeBashExecute(input: {
     exitCode: run.exitCode,
     signal: run.signal,
     timedOut: run.timedOut,
+    // The stored step's words: without a reason, a stopped command read "Tool execution failed."
+    ...(run.stopped ? { stopped: true, reason: STOPPED_COMMAND_REASON } : {}),
     durationMs: run.durationMs,
     truncated: run.truncated,
     policyMode,
@@ -8987,12 +9528,7 @@ async function nativeBashExecute(input: {
     mappedToolName: mapping.toolName,
     mappedToolInput: mapping.args,
     mappedReason: mapping.reason,
-    ...(beforeEditSnapshot && afterEditSnapshot
-      ? {
-          before: beforeEditSnapshot,
-          after: afterEditSnapshot
-        }
-      : {}),
+    ...(editDiff !== undefined ? { diff: editDiff } : {}),
     ...(commandToRun !== command ? { requestedCommand: command } : {}),
     ...(agentBrowserMetadata ? { agentBrowser: agentBrowserMetadata } : {}),
     ...(modelImageUrl ? { modelImageUrl } : {})
@@ -9114,7 +9650,14 @@ async function nativeAgentBrowserUse(input: {
     extraFlags?: string[]
     timeoutMs?: number
   }
+  /**
+   * The Stop of the reply this call belongs to (2026-09-18). It ends the running CLI call, and a
+   * call it reaches first never starts. Absent (the n8n dispatch), the call runs to its own time
+   * limit as before.
+   */
+  abortSignal?: AbortSignal | null
 }): Promise<Record<string, any>> {
+  const abortSignal = input.abortSignal ?? undefined
   const normalizedToolName = normalizeAgentBrowserToolName(input.toolName)
   if (!normalizedToolName) {
     return {
@@ -9152,6 +9695,9 @@ async function nativeAgentBrowserUse(input: {
 
   const params = input.params && typeof input.params === 'object' ? input.params : {}
   const dockerSidecar = availability.supportLevel === 'docker-sidecar'
+  // The Docker sidecar hears a Stop from its revision 2 on; an older one is not handed one mid-run.
+  const sidecarHearsStop =
+    dockerSidecar && (availability.sidecarRevision ?? 0) >= AGENT_BROWSER_SIDECAR_STOP_REVISION
   const requestedRuntimeMode =
     normalizeAgentBrowserRuntimeMode(params.runtimeMode) ??
     input.settings?.runtimeMode ??
@@ -9287,7 +9833,9 @@ async function nativeAgentBrowserUse(input: {
         command: availability.command,
         args: prepArgs,
         timeoutMs,
-        env: providerEnvResult.env
+        env: providerEnvResult.env,
+        abortSignal,
+        sidecarHearsStop
       })
       const prepOutput = parseJsonFromOutput(prepRun.stdout)
       const prepError = parseJsonFromOutput(prepRun.stderr)
@@ -9332,7 +9880,9 @@ async function nativeAgentBrowserUse(input: {
         command: availability.command,
         args: waitArgs,
         timeoutMs,
-        env: providerEnvResult.env
+        env: providerEnvResult.env,
+        abortSignal,
+        sidecarHearsStop
       })
       const waitOutput = parseJsonFromOutput(waitRun.stdout)
       const waitError = parseJsonFromOutput(waitRun.stderr)
@@ -9373,7 +9923,9 @@ async function nativeAgentBrowserUse(input: {
       command: availability.command,
       args,
       timeoutMs,
-      env: providerEnvResult.env
+      env: providerEnvResult.env,
+      abortSignal,
+      sidecarHearsStop
     })
   } catch (error) {
     const maybeError = error as NodeJS.ErrnoException
@@ -9392,10 +9944,13 @@ async function nativeAgentBrowserUse(input: {
   let bootstrapAttempted = false
   let bootstrapSucceeded = false
 
-  const bootstrapCliCommands = resolveAgentBrowserBootstrapCliArgs(
-    command.id,
-    extractAgentBrowserErrorMessage(parsedOutput, parsedError, run.stderr)
-  )
+  // A stopped call is never retried, whatever it printed before the Stop.
+  const bootstrapCliCommands = run.stopped
+    ? []
+    : resolveAgentBrowserBootstrapCliArgs(
+        command.id,
+        extractAgentBrowserErrorMessage(parsedOutput, parsedError, run.stderr)
+      )
 
   if (bootstrapCliCommands.length > 0) {
     bootstrapAttempted = true
@@ -9416,8 +9971,16 @@ async function nativeAgentBrowserUse(input: {
           command: availability.command,
           args: bootstrapArgs,
           timeoutMs,
-          env: providerEnvResult.env
+          env: providerEnvResult.env,
+          abortSignal,
+          sidecarHearsStop
         })
+        if (bootstrapRun.stopped) {
+          run = bootstrapRun
+          parsedOutput = parseJsonFromOutput(bootstrapRun.stdout)
+          parsedError = parseJsonFromOutput(bootstrapRun.stderr)
+          break
+        }
         const bootstrapOutput = parseJsonFromOutput(bootstrapRun.stdout)
         const bootstrapError = parseJsonFromOutput(bootstrapRun.stderr)
         const bootstrapErrorMessage = extractAgentBrowserErrorMessage(
@@ -9441,7 +10004,9 @@ async function nativeAgentBrowserUse(input: {
           command: availability.command,
           args,
           timeoutMs,
-          env: providerEnvResult.env
+          env: providerEnvResult.env,
+          abortSignal,
+          sidecarHearsStop
         })
         const retryOutput = parseJsonFromOutput(retryRun.stdout)
         const retryError = parseJsonFromOutput(retryRun.stderr)
@@ -9456,6 +10021,7 @@ async function nativeAgentBrowserUse(input: {
         run = retryRun
         parsedOutput = retryOutput
         parsedError = retryError
+        if (retryRun.stopped) break
 
         if (retrySuccessFromPayload && retryRun.timedOut === false) {
           bootstrapSucceeded = true
@@ -9473,13 +10039,17 @@ async function nativeAgentBrowserUse(input: {
     }
   }
 
+  // A Stop ended the call (2026-09-18): never a success, whatever the CLI printed before it, and
+  // said the way a stopped bash command says it. No screenshot is uploaded for it.
+  const stopped = run.stopped === true
   const successFromPayload =
-    typeof parsedOutput?.success === 'boolean' ? parsedOutput.success : run.exitCode === 0
-  const errorMessage =
-    (typeof parsedOutput?.error === 'string' && parsedOutput.error) ||
-    (typeof parsedError?.error === 'string' && parsedError.error) ||
-    run.stderr.trim() ||
-    (run.timedOut ? 'Agent Browser command timed out.' : null)
+    !stopped && (typeof parsedOutput?.success === 'boolean' ? parsedOutput.success : run.exitCode === 0)
+  const errorMessage = stopped
+    ? STOPPED_COMMAND_REASON
+    : (typeof parsedOutput?.error === 'string' && parsedOutput.error) ||
+      (typeof parsedError?.error === 'string' && parsedError.error) ||
+      run.stderr.trim() ||
+      (run.timedOut ? 'Agent Browser command timed out.' : null)
 
   let resultPayload: unknown = parsedOutput?.data ?? parsedOutput ?? run.stdout.trim()
   let modelImageUrl: string | null = null
@@ -9513,6 +10083,7 @@ async function nativeAgentBrowserUse(input: {
 
   return {
     success: successFromPayload && run.timedOut === false,
+    ...(stopped ? { stopped: true, reason: STOPPED_COMMAND_REASON } : {}),
     toolName: command.id,
     cliCommand: `${availability.command} ${args.join(' ')}`.trim(),
     supportLevel: availability.supportLevel ?? 'native-cli',
@@ -9695,6 +10266,7 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
     memoryControlsEnabled?: boolean
     dmControlsEnabled?: boolean
     scheduleControlsEnabled?: boolean
+    judgeControlsEnabled?: boolean
   }
 ): BatshitToolFamily[] {
   const families: BatshitToolFamily[] = []
@@ -9734,6 +10306,14 @@ function resolveBatshitToolBrokerFamiliesForAutomation(
     settings.batshitToolsEnabled &&
     context.actor_type === 'primary' &&
     options?.scheduleControlsEnabled === true
+  ) {
+    if (!families.includes('fabric')) families.push('fabric')
+  }
+  // SA-120 P2: the Jev Juice judgment tool opens `fabric` under the same conditions.
+  if (
+    settings.batshitToolsEnabled &&
+    context.actor_type === 'primary' &&
+    options?.judgeControlsEnabled === true
   ) {
     if (!families.includes('fabric')) families.push('fabric')
   }
@@ -10467,7 +11047,20 @@ export async function dispatchNativeAutomationPackAction(input: {
    */
   actorType?: ControlActorType
   delegatedRun?: boolean
+  /**
+   * BL-75 — the run credential's `scopeAgentId` on the `agent` lane: the Subagent or Worker
+   * whose skill access governs a delegated run's `native_skill`. Absent on every other lane.
+   */
+  scopeAgentId?: string | null
+  /**
+   * The Stop of the reply running in the context's chat (2026-09-18,
+   * `getRunningReplyStopSignal`). Handed to every action that runs a process here: bash, a
+   * skill script, and an Agent Browser call. Absent (no reply runs), each keeps its own time
+   * limit, as before. Not handed to CLI tools, whose runner takes no Stop on any lane.
+   */
+  abortSignal?: AbortSignal | null
 }): Promise<NativeAutomationDispatchResult> {
+  const abortSignal = input.abortSignal ?? undefined
   const parsedAction = parseNativeAutomationAction(input.action)
   if (!parsedAction.ok) {
     return buildNativeAutomationResult({
@@ -10618,10 +11211,14 @@ export async function dispatchNativeAutomationPackAction(input: {
       context.actor_type === 'primary' && resolveAgentDmsEnabled(agentRecord)
     // SA-115 P2: the schedule family, on the same per-agent switch as DMs.
     const brokerScheduleControlsEnabled = brokerDmControlsEnabled
+    // SA-120 P2: the Jev Juice judgment tool, on its own per-agent switch.
+    const brokerJudgeControlsEnabled =
+      context.actor_type === 'primary' && resolveAgentJevJudgeToolEnabled(agentRecord)
     const brokerAllowedFamilies = resolveBatshitToolBrokerFamiliesForAutomation(nativeSettings, context, {
       memoryControlsEnabled: brokerMemoryControlsEnabled,
       dmControlsEnabled: brokerDmControlsEnabled,
-      scheduleControlsEnabled: brokerScheduleControlsEnabled
+      scheduleControlsEnabled: brokerScheduleControlsEnabled,
+      judgeControlsEnabled: brokerJudgeControlsEnabled
     })
     // SA-096 P4: same source as mode 3 registration and the DCM capability index's Fabric
     // count. This lane keeps its own actor/mode conditions, expressed as the two flags.
@@ -10641,7 +11238,8 @@ export async function dispatchNativeAutomationPackAction(input: {
           (context.mode === 'mode3' || context.mode === 'mode4'),
         memoryControlsEnabled: brokerMemoryControlsEnabled,
         dmControlsEnabled: brokerDmControlsEnabled,
-        scheduleControlsEnabled: brokerScheduleControlsEnabled
+        scheduleControlsEnabled: brokerScheduleControlsEnabled,
+        judgeControlsEnabled: brokerJudgeControlsEnabled
       })
     )
     const brokerSelectedGateways =
@@ -10661,7 +11259,7 @@ export async function dispatchNativeAutomationPackAction(input: {
 
     if (action === 'batshit_tool_search') {
       const result = await nativeBatshitToolSearch({
-        ...(parsedInput.value as BatshitToolSearchInput),
+        ...withoutBrokerPlumbing(parsedInput.value as BatshitToolSearchInput),
         userId: input.userId,
         agentId: context.actor_type === 'subagent' ? context.agent_id : governingAgentId || null,
         agentMetadata: context.actor_type === 'subagent' ? subagentRecord ?? null : null,
@@ -10693,7 +11291,7 @@ export async function dispatchNativeAutomationPackAction(input: {
 
     try {
       const result = await nativeBatshitToolUse({
-        ...(parsedInput.value as BatshitToolUseInput),
+        ...withoutBrokerPlumbing(parsedInput.value as BatshitToolUseInput),
         userId: input.userId,
         actorType: input.actorType ?? 'unknown',
         delegatedRun: input.delegatedRun === true,
@@ -10716,9 +11314,15 @@ export async function dispatchNativeAutomationPackAction(input: {
           executablePath: nativeSettings.agentBrowserExecutablePath,
           extraFlags: nativeSettings.agentBrowserExtraFlags,
           timeoutMs: nativeSettings.agentBrowserTimeoutMs
-        }
+        },
+        abortSignal
       })
-      if (result.success === false) {
+      // A stopped call, and a CLI timeout, are command data rather than backend failures.
+      if (
+        result.success === false &&
+        (result as Record<string, any>).stopped !== true &&
+        !(result.family === 'cli' && (result as Record<string, any>).timedOut === true)
+      ) {
         return buildNativeAutomationResult({
           success: false,
           action,
@@ -10818,7 +11422,8 @@ export async function dispatchNativeAutomationPackAction(input: {
       neverAllowList: nativeSettings.bashNeverAllowList,
       requireApproval: false,
       approved: true,
-      backend
+      backend,
+      abortSignal
     })
 
     const policyProfile = {
@@ -10937,13 +11542,15 @@ export async function dispatchNativeAutomationPackAction(input: {
       toolId: parsedInput.value.toolId,
       cliInput: parsedInput.value.input,
       allowRisky: parsedInput.value.allowRisky,
+      abortSignal,
       projectPath: resolvedProjectPath,
       selectedCliToolIds:
         context.actor_type === 'subagent'
           ? subagentCliScope?.toolIds
           : parsedInput.value.selectedToolIds
     })
-    if (result.success === false) {
+    // Stop and timeout are command outcomes, as they are for native Bash, not backend failures.
+    if (result.success === false && result.stopped !== true && result.timedOut !== true) {
       return buildNativeAutomationResult({
         success: false,
         action,
@@ -11025,10 +11632,12 @@ export async function dispatchNativeAutomationPackAction(input: {
         executablePath: nativeSettings.agentBrowserExecutablePath,
         extraFlags: nativeSettings.agentBrowserExtraFlags,
         timeoutMs: nativeSettings.agentBrowserTimeoutMs
-      }
+      },
+      abortSignal
     })
 
-    if (result.success === false) {
+    // A call a Stop ended ran: it is data, as a failed bash command is, never a backend failure.
+    if (result.success === false && result.stopped !== true) {
       return buildNativeAutomationResult({
         success: false,
         action,
@@ -11223,8 +11832,30 @@ export async function dispatchNativeAutomationPackAction(input: {
   }
 
   if (action === 'native_skill') {
+    const skillActor = resolveDispatchSkillActor({
+      lane: input.actorType ?? 'unknown',
+      delegatedRun: input.delegatedRun === true,
+      scopeAgentId: input.scopeAgentId ?? null,
+      contextActorType: context.actor_type,
+      contextAgentId: context.agent_id,
+      governingAgentId,
+      subagentOwnedByUser: Boolean(subagentRecord && subagentRecord.user_id === input.userId)
+    })
+    if (!skillActor.ok) {
+      return buildNativeAutomationResult({
+        success: false,
+        action,
+        backend,
+        context,
+        error: {
+          code: 'INVALID_CONTEXT',
+          message: skillActor.message
+        }
+      })
+    }
     const result = await executeNativeSkillToolAction({
       userId: input.userId,
+      actor: skillActor.actor,
       settings: nativeSettings,
       sessionId: context.session_id,
       projectPath: resolvedProjectPath,
@@ -11236,7 +11867,8 @@ export async function dispatchNativeAutomationPackAction(input: {
       maxChars: parsedInput.value.maxChars,
       cwd: parsedInput.value.cwd,
       timeoutMs: parsedInput.value.timeoutMs,
-      maxOutputChars: parsedInput.value.maxOutputChars
+      maxOutputChars: parsedInput.value.maxOutputChars,
+      abortSignal
     })
 
     if (result.success === false) {
@@ -11252,7 +11884,11 @@ export async function dispatchNativeAutomationPackAction(input: {
         context,
         error: {
           code: propagatedErrorCode ?? (result.blocked ? 'POLICY_BLOCKED' : 'BACKEND_UNAVAILABLE'),
-          message: result.error || 'Skill runtime request failed.'
+          message: result.error || 'Skill runtime request failed.',
+          // BL-75: keep the access gate's own code (SKILL_NOT_ENABLED, …) for a workflow to read.
+          ...(result.blocked && typeof result.errorCode === 'string'
+            ? { details: { skillErrorCode: result.errorCode } }
+            : {})
         }
       })
     }
@@ -11325,6 +11961,71 @@ export const NATIVE_FABRIC_USE_TOP_LEVEL_INPUT_KEYS = [
   'location'
 ] as const
 
+/**
+ * BL-75 — whose skill access governs a `native_skill` call that arrived through
+ * `/api/native-tools/dispatch`, by the lane it authenticated on (see `actingAgentIdentity.ts`).
+ *
+ * - `agent`: the run credential. The route already bound the context's governing field to it;
+ *   a delegated run's credential also carries the Subagent or Worker it runs as.
+ * - `session`, `in-process`, `n8n-callback`: the context, as those lanes are trusted for it. A
+ *   subagent-shaped context (an n8n Workflow Subagent) names the subagent, whose own list
+ *   governs, and only when that subagent is this user's.
+ * - `service`, `portable-skill`, `unknown`: no agent identity, so no skill loads.
+ */
+function resolveDispatchSkillActor(args: {
+  lane: ControlActorType
+  delegatedRun: boolean
+  scopeAgentId: string | null
+  contextActorType: 'primary' | 'subagent'
+  contextAgentId: string
+  governingAgentId: string
+  subagentOwnedByUser: boolean
+}): { ok: true; actor: SkillRuntimeActor } | { ok: false; message: string } {
+  if (args.lane === 'agent') {
+    const scoped = args.scopeAgentId?.trim() || ''
+    return {
+      ok: true,
+      actor: {
+        kind: 'agent',
+        agentId: scoped || args.governingAgentId,
+        delegated: args.delegatedRun
+      }
+    }
+  }
+  if (args.lane === 'n8n-callback' && args.contextActorType !== 'subagent') {
+    // n8n is never a Primary Agent type, and its callback token binds the PARENT agent, so a
+    // primary-shaped context here would load the parent's skills. A Workflow Subagent names
+    // itself (`actor_type: 'subagent'`), and its own list governs.
+    return {
+      ok: false,
+      message:
+        'An n8n workflow loads skills only as a Workflow Subagent: send context actor_type "subagent" with its own agent_id.'
+    }
+  }
+  if (args.lane === 'session' || args.lane === 'in-process' || args.lane === 'n8n-callback') {
+    if (args.contextActorType === 'subagent') {
+      if (!args.subagentOwnedByUser) {
+        return {
+          ok: false,
+          message: `Unable to resolve subagent "${args.contextAgentId}" for this skill request.`
+        }
+      }
+      return { ok: true, actor: { kind: 'agent', agentId: args.contextAgentId, delegated: true } }
+    }
+    return { ok: true, actor: { kind: 'agent', agentId: args.governingAgentId } }
+  }
+  return { ok: true, actor: { kind: 'none', lane: args.lane } }
+}
+
+/** BL-75 — the in-process tool's actor: the run's scope, else the turn's own agent. */
+function resolveInProcessSkillActor(context: NativeToolContext): SkillRuntimeActor {
+  const scoped = typeof context.scopeAgentId === 'string' ? context.scopeAgentId.trim() : ''
+  if (scoped) return { kind: 'agent', agentId: scoped, delegated: true }
+  const agentId = typeof context.agentId === 'string' ? context.agentId.trim() : ''
+  if (agentId) return { kind: 'agent', agentId }
+  return { kind: 'none', lane: 'in-process' }
+}
+
 async function executeNativeSkillToolAction(input: {
   userId: string
   settings: ResolvedNativeToolSettings
@@ -11332,6 +12033,11 @@ async function executeNativeSkillToolAction(input: {
   projectPath?: string | null
   bashApprovalRequestsEnabled: boolean
   skillId: string
+  /**
+   * BL-75: whose skill access decides this load. Required, so every caller names one; see
+   * `resolveSkillAccessForActor`. Every action below, scripts included, goes through it.
+   */
+  actor: SkillRuntimeActor
   action?: unknown
   path?: string
   args?: unknown
@@ -11339,6 +12045,8 @@ async function executeNativeSkillToolAction(input: {
   cwd?: string
   timeoutMs?: number
   maxOutputChars?: number
+  /** The model run's abort signal: a Stop ends a running script. */
+  abortSignal?: AbortSignal
 }): Promise<Record<string, any>> {
   const action = normalizeNativeSkillToolAction(input.action)
 
@@ -11346,6 +12054,7 @@ async function executeNativeSkillToolAction(input: {
     const result = await executeSkillRuntimeAction({
       userId: input.userId,
       skillId: input.skillId,
+      actor: input.actor,
       action,
       path: input.path,
       maxChars: input.maxChars
@@ -11360,8 +12069,18 @@ async function executeNativeSkillToolAction(input: {
     return result
   }
 
-  const runtimeResult = await resolveSkillRuntimeForTool(input.userId, input.skillId)
+  const runtimeResult = await resolveSkillRuntimeForTool(input.userId, input.skillId, input.actor)
   if (!runtimeResult.runtime) {
+    if (runtimeResult.blocked) {
+      return {
+        success: false,
+        action,
+        error: runtimeResult.error,
+        errorCode: runtimeResult.errorCode,
+        blocked: true,
+        skillId: runtimeResult.skillId
+      }
+    }
     return {
       success: false,
       action,
@@ -11491,7 +12210,8 @@ async function executeNativeSkillToolAction(input: {
       executablePath: input.settings.agentBrowserExecutablePath,
       extraFlags: input.settings.agentBrowserExtraFlags,
       timeoutMs: input.settings.agentBrowserTimeoutMs
-    }
+    },
+    abortSignal: input.abortSignal
   })
 
   return {
@@ -11855,7 +12575,16 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const nativeSkillNeedsApproval = async (input: unknown) => {
     if (!input || typeof input !== 'object') return false
     const action = normalizeNativeSkillToolAction((input as any).action)
-    return action === 'script_run' && bashApprovalRequestsEnabled
+    if (action !== 'script_run' || !bashApprovalRequestsEnabled) return false
+    // BL-75: never ask the user to approve a script the access gate will refuse. The refusal
+    // reaches the model from `execute`, which checks again.
+    const skillId = typeof (input as any).skillId === 'string' ? (input as any).skillId : ''
+    const access = await resolveSkillAccessForActor(
+      context.userId,
+      skillId,
+      resolveInProcessSkillActor(context)
+    )
+    return access.ok
   }
 
   toolApprovals.native_skill = async (input) =>
@@ -11874,9 +12603,10 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       timeoutMs: z.number().int().min(MIN_BASH_TIMEOUT_MS).max(MAX_BASH_TIMEOUT_MS).optional(),
       maxOutputChars: z.number().int().min(1_000).max(MAX_BASH_OUTPUT_CHARS).optional()
     }),
-    execute: async (input) =>
+    execute: async (input, options) =>
       executeNativeSkillToolAction({
         userId: context.userId,
+        actor: resolveInProcessSkillActor(context),
         settings,
         sessionId: context.sessionId,
         projectPath: context.projectPath ?? null,
@@ -11888,7 +12618,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         maxChars: input.maxChars,
         cwd: input.cwd,
         timeoutMs: input.timeoutMs,
-        maxOutputChars: input.maxOutputChars
+        maxOutputChars: input.maxOutputChars,
+        abortSignal: options?.abortSignal
       }),
     toModelOutput: async ({ output }: { output: any }) => {
       if (output && typeof output === 'object' && (output as any).success === true) {
@@ -12053,6 +12784,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
   const dmControlsEnabled = context.dmControlsEnabled === true
   // SA-115 P2: and the schedule family, on the same per-agent switch.
   const scheduleControlsEnabled = context.scheduleControlsEnabled === true
+  // SA-120 P2: and the Jev Juice judgment tool, on its own per-agent switch.
+  const judgeControlsEnabled = context.judgeControlsEnabled === true
 
   // SA-096: shared with the compile path's broker-guidance gate so registered tools and
   // shipped instructions can never disagree. Rules live in $lib/utils/brokerAvailability.
@@ -12065,7 +12798,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     allowFabricControlTools,
     memoryControlsEnabled,
     dmControlsEnabled,
-    scheduleControlsEnabled
+    scheduleControlsEnabled,
+    judgeControlsEnabled
   })
   // SA-096 P4: same source as the DCM capability index's Fabric count.
   const apiBrokerFabricAllowedControlIds = new Set<string>(
@@ -12074,7 +12808,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       allowFabricControlTools,
       memoryControlsEnabled,
       dmControlsEnabled,
-      scheduleControlsEnabled
+      scheduleControlsEnabled,
+      judgeControlsEnabled
     })
   )
 
@@ -12085,7 +12820,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       inputSchema: BATSHIT_TOOL_SEARCH_INPUT_SCHEMA,
       execute: async (input: BatshitToolSearchInput) =>
         nativeBatshitToolSearch({
-          ...input,
+          ...withoutBrokerPlumbing(input),
           userId: context.userId,
           agentId: context.agentId ?? null,
           selectedGateways,
@@ -12135,7 +12870,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
       // `options.toolCallId` is how a resumed run knows WHICH call the user approved: the
       // SDK hands `execute` the same call id the persisted card entry carries (measured,
       // Part 2.10 (c)). It is the only identifier that survives the round trip.
-      execute: async (input: BatshitToolUseInput, options?: { toolCallId?: string }) => {
+      execute: async (input: BatshitToolUseInput, options?: { toolCallId?: string; abortSignal?: AbortSignal }) => {
         const toolCallId = typeof options?.toolCallId === 'string' ? options.toolCallId : null
         const denial = resolveApprovalDenial(toolCallId)
         if (denial) {
@@ -12162,7 +12897,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
         }
         const grant = resolveApprovalGrant(toolCallId)
         return await nativeBatshitToolUse({
-          ...input,
+          ...withoutBrokerPlumbing(input),
           userId: context.userId,
           actorType: 'in-process',
           agentId: context.agentId ?? null,
@@ -12177,6 +12912,7 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
           fabricAllowedControlIds: Array.from(apiBrokerFabricAllowedControlIds),
           executionBackend: settings.executionBackend,
           approvalGrant: grant,
+          abortSignal: options?.abortSignal,
           executeControlUse: (controlInput, allowedControlIds) =>
             executeBrokerScopedControlUse(controlInput, allowedControlIds, grant)
         })
@@ -12329,15 +13065,18 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
     }
 
     tools.native_bash_execute = tool({
+      // Agent Docs (2026-09-18): the model is told what a Stop and a timeout end (`commandEnd.ts`)
+      // and how to leave a program running. Every API agent pays for these words on every turn.
       description:
-        'Execute bash commands using Agent Settings access mode (Plan, Agent, Dangerous) with policy guards and renderer mapping.',
+        'Execute bash commands using Agent Settings access mode (Plan, Agent, Dangerous) with policy guards and renderer mapping. ' +
+        NATIVE_BASH_STOP_GUIDANCE,
       inputSchema: z.object({
         command: z.string().min(1),
         cwd: z.string().optional(),
         timeoutMs: z.number().int().min(MIN_BASH_TIMEOUT_MS).max(MAX_BASH_TIMEOUT_MS).optional(),
         maxOutputChars: z.number().int().min(1_000).max(MAX_BASH_OUTPUT_CHARS).optional()
       }),
-      execute: async (input) => {
+      execute: async (input, options) => {
         const command = typeof input.command === 'string' ? input.command.trim() : ''
         const agentModePolicyOnly =
           settings.bashAccessMode === 'agent' && !bashApprovalRequestsEnabled
@@ -12384,7 +13123,8 @@ export async function buildMode3NativeTools(context: NativeToolContext): Promise
             extraFlags: settings.agentBrowserExtraFlags,
             timeoutMs: settings.agentBrowserTimeoutMs
           },
-          imageDelivery: context.imageDelivery ?? null
+          imageDelivery: context.imageDelivery ?? null,
+          abortSignal: options?.abortSignal
         })
       },
       toModelOutput: async ({ output, toolCallId }) => {

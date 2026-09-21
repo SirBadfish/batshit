@@ -206,7 +206,7 @@
     width: var(--sidebar-width-icon, 3rem);
     height: 100%;
     border-left: 1px solid var(--bs-app-shell-line);
-    background: var(--background);
+    background: var(--bs-app-canvas-surface);
     box-shadow: -2px 0 8px 0 rgba(0, 0, 0, 0.05);
   }
 

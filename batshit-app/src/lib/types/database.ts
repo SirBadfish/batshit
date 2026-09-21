@@ -176,6 +176,27 @@ export interface AgentRow {
   dms_enabled?: boolean | null
   dm_senders?: 'all' | 'selected' | null
   dm_sender_agent_ids?: string[] | null
+  // SA-120 P1 (DL-120-01): the per-agent Jev Juice switch for skill and tool hints.
+  // Absent means OFF. Resolved ONLY through `resolveAgentJevSkillToolHintsEnabled` in
+  // `$lib/utils/jevJuiceControl.ts`.
+  jev_juice_skill_tool_hints?: boolean | null
+  // SA-120 P2: the per-agent switch that hands the agent the `sys.judge.ask` tool.
+  // Absent means OFF. Resolved ONLY through `resolveAgentJevJudgeToolEnabled`.
+  jev_juice_judge_tool?: boolean | null
+  // SA-120 P4a: the per-agent switch that adds a Jev relevance term to `sys.memory.search`
+  // ranking. Absent means OFF. Resolved ONLY through `resolveAgentJevMemoryRerankEnabled`.
+  jev_juice_memory_rerank?: boolean | null
+  // SA-120 P4b: the per-agent switch that lets Jev bring long-term memories into the DCM
+  // `Memory context:` section by meaning. Absent means OFF. Resolved ONLY through
+  // `resolveAgentJevMemoryRecallEnabled`.
+  jev_juice_memory_recall?: boolean | null
+  // SA-120 P6: the per-agent switch for the after-reply check of what a reply claims (it
+  // never edits the reply). Absent means OFF. Resolved ONLY through
+  // `resolveAgentJevReplyCheckEnabled`.
+  jev_juice_reply_check?: boolean | null
+  // SA-120 P6: the per-agent switch for the after-reply style coach. Absent means OFF.
+  // Resolved ONLY through `resolveAgentJevStyleCoachEnabled`.
+  jev_juice_style_coach?: boolean | null
 
   // Reasoning / thinking rendering (SA-018)
   show_reasoning?: boolean
@@ -373,6 +394,9 @@ export interface UserSettingsRow {
 
     // Tool Notes enable/disable
     zip_tool_notes_enabled?: boolean
+
+    // SA-120 P5 (LS-054): "Jev Juice: Smart Zip". Absent means OFF.
+    jev_juice_smart_zip?: boolean
     
     // AI Content Blocks
     auto_zip_error?: boolean

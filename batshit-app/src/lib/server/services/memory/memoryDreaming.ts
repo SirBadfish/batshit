@@ -668,7 +668,7 @@ export async function runDreamingPass(options: DreamingRunOptions): Promise<Drea
           continue
         }
 
-        const messages = normalizeMessages(await redis.getSessionMessages(sessionId))
+        const messages = normalizeMessages(await redis.getAllSessionMessages(sessionId))
         const protections = await loadContextProtections(sessionId)
         const recoveryHold = calculateRecoveryHoldByIndex(messages)
         const recoveryHoldIds = new Set(

@@ -51,7 +51,11 @@ import {
 } from './memoryLinger'
 import { MEMORY_SCHEMA_VERSION } from './memoryTypes'
 import { isFixedSession } from '$lib/utils/fixedSession'
-import { getOpenEpisode } from './memoryEpisodes'
+import { getOpenEpisode, whiteboardAuthor, type WhiteboardAuthor } from './memoryEpisodes'
+
+/** SA-120 P4b: closes the `Memory context:` entries whenever one of them was inferred. */
+export const MEMORY_INFERRED_RECALL_NOTE =
+  "- Note: entries marked \"recalled (inferred)\" were brought in by Batshit's judgment model (Jev Juice) because they seemed to bear on what the user said. You did not recall them; ignore any that do not fit."
 
 // Status icons match the DCM's existing key: new / updated / unchanged.
 const ICON_NEW = '✅'
@@ -71,7 +75,35 @@ export interface MemoryInsertCandidate {
   /** True for 'episode' linger holds — no countdown; drops when the episode ends. */
   holdEpisode?: boolean
   firstInsertedAt?: string
+  /**
+   * SA-120 P4b: set when Batshit's judgment model (Jev Juice), not the agent and not a
+   * trigger word, brought this memory in. `probability` is this turn's judgment; `null`
+   * on a held entry that was inferred on an earlier turn.
+   */
+  inferred?: { probability: number | null }
 }
+
+/** SA-120 P4b: one memory the route's Jev Juice lane judged relevant to the current message. */
+export interface MemoryInferredRecall {
+  id: string
+  probability: number
+}
+
+export interface MemoryInferredRecallRequest {
+  currentUserMessage: string
+  /** Memory ids already in this turn's context (Awareness, recalls, trigger hits, lingering): never candidates. */
+  excludeIds: string[]
+}
+
+/**
+ * SA-120 P4b (F-P1-2): the recall engine never calls TypeSafe itself. `send-routed` injects
+ * this closure — it owns the pre-filter, the network call, its deadline, and its evidence —
+ * and hands the SAME answer to `commitMemoryTurnState`, so compile and commit still select
+ * identically. It must never throw; a miss returns [].
+ */
+export type MemoryInferredRecallProvider = (
+  request: MemoryInferredRecallRequest
+) => Promise<MemoryInferredRecall[]>
 
 /**
  * Episode context for 'episode' linger holds, computed identically by compile and
@@ -318,6 +350,8 @@ function selectMemoryInserts(options: {
   budgets: MemoryLaneBudgets
   episode: MemoryEpisodeContext
   nowTs: number
+  /** SA-120 P4b: memories the Jev Juice lane inferred for this message. Absent or [] = today's selection. */
+  inferred?: MemoryInferredRecall[]
 }): MemorySelection {
   const { agentId, currentUserMessage, records, linger, budgets, episode, nowTs } = options
   const byId = new Map(records.map((record) => [record.id, record]))
@@ -403,7 +437,26 @@ function selectMemoryInserts(options: {
       ...(entry.hold === 'episode'
         ? { holdEpisode: true }
         : { turnsRemaining: entry.turns_remaining }),
-      firstInsertedAt: entry.first_inserted_at
+      firstInsertedAt: entry.first_inserted_at,
+      ...(entry.inferred ? { inferred: { probability: null } } : {})
+    })
+  }
+
+  // SA-120 P4b: inferred recalls join LAST, and only for memories nothing else brought in
+  // (explicit beats inferred, DL-120-04). The engine re-checks what the provider was asked
+  // to respect: a current, unexpired LTM record that is not already on the agent's mind.
+  for (const entry of options.inferred ?? []) {
+    if (candidates.has(entry.id) || onMyMindIds.has(entry.id)) continue
+    const record = byId.get(entry.id)
+    if (!record || (record as InsertableRecord).__segment) continue
+    if (record.lane !== 'ltm' || record.is_superseded === 'y' || isExpired(record, nowTs)) continue
+    if (!Number.isFinite(entry.probability)) continue
+    candidates.set(record.id, {
+      record,
+      source: 'recall',
+      status: 'new',
+      matchedTerms: [],
+      inferred: { probability: entry.probability }
     })
   }
 
@@ -412,6 +465,9 @@ function selectMemoryInserts(options: {
   const statusRank: Record<MemoryInsertStatus, number> = { new: 0, refreshed: 1, held: 2 }
   const ranked = Array.from(candidates.values()).sort(
     (a, b) =>
+      // SA-120 P4b: every inferred candidate ranks behind every explicit one, so an inference
+      // can never push a deliberate recall or a trigger hit out of its budget.
+      Number(Boolean(a.inferred)) - Number(Boolean(b.inferred)) ||
       statusRank[a.status] - statusRank[b.status] ||
       b.record.importance - a.record.importance ||
       (b.record.last_recalled_ts ?? b.record.saved_ts) -
@@ -423,6 +479,7 @@ function selectMemoryInserts(options: {
   const kept: MemoryInsertCandidate[] = []
   let droppedTriggerNew = 0
   let droppedLingering = 0
+  let droppedInferred = 0
   const deferredPendingIds: string[] = []
   const pendingIds = new Set(pending.map((entry) => entry.memory_id))
 
@@ -434,6 +491,9 @@ function selectMemoryInserts(options: {
       if (candidate.source === 'recall' && pendingIds.has(candidate.record.id)) {
         // Budget-deferred recalls stay queued and insert on upcoming turns.
         deferredPendingIds.push(candidate.record.id)
+      } else if (candidate.inferred && candidate.status === 'new') {
+        // An inference is about THIS message; it is not queued for a later one.
+        droppedInferred += 1
       } else if (candidate.status === 'new') {
         droppedTriggerNew += 1
       } else {
@@ -472,6 +532,11 @@ function selectMemoryInserts(options: {
   if (deferredPendingIds.length > 0) {
     moreAvailable.push(
       `${deferredPendingIds.length} recalled ${deferredPendingIds.length === 1 ? 'memory stays' : 'memories stay'} queued (recall budget ${budgets.recalled} tokens) and will insert on upcoming turns.`
+    )
+  }
+  if (droppedInferred > 0) {
+    moreAvailable.push(
+      `${droppedInferred} inferred ${droppedInferred === 1 ? 'memory was' : 'memories were'} not inserted (recall budget ${budgets.recalled} tokens) — use sys.memory.search / sys.memory.recall to fetch.`
     )
   }
   if (droppedLingering > 0) {
@@ -587,7 +652,15 @@ function formatInsertLine(
         : 'trigger'
     )
   }
-  if (candidate.source === 'recall') parts.push('recalled')
+  if (candidate.source === 'recall') {
+    parts.push(
+      !candidate.inferred
+        ? 'recalled'
+        : candidate.inferred.probability === null
+          ? 'recalled (inferred)'
+          : `recalled (inferred ${candidate.inferred.probability.toFixed(2)})`
+    )
+  }
   parts.push(record.lane)
   parts.push(record.id)
   parts.push(`importance ${record.importance}`)
@@ -630,12 +703,25 @@ function formatInsertLine(
  * (sys.memory.whiteboard), nap extraction, or episode close. The stamp uses full
  * date+time — tail bytes are free, and freshness awareness is the point of the board.
  */
-function formatWhiteboardDcmLines(whiteboard: { content: string; updated_at: string }): string[] {
-  return [
-    `Episode whiteboard (working facts you maintain for the current episode; updated ${fmtDateTime(whiteboard.updated_at)}):`,
-    whiteboard.content,
-    '(Rewrite it with sys.memory.whiteboard — full replacement. It dissolves when the episode closes.)'
-  ]
+function formatWhiteboardDcmLines(whiteboard: {
+  content: string
+  updated_at: string
+  written_by?: WhiteboardAuthor
+}): string[] {
+  // 2026-09-19 (Josh): the board names its author. A nap fills only an empty board and
+  // never rewrites one the agent wrote, and the agent is told so where the board arrives.
+  const stamp = fmtDateTime(whiteboard.updated_at)
+  return whiteboardAuthor(whiteboard) === 'nap'
+    ? [
+        `Episode whiteboard (working facts for the current episode; filled in by a nap because you had not written one, updated ${stamp}):`,
+        whiteboard.content,
+        '(Rewrite it with sys.memory.whiteboard — full replacement. Once you write it, naps leave it alone. It dissolves when the episode closes.)'
+      ]
+    : [
+        `Episode whiteboard (working facts you maintain for the current episode; last written by you, updated ${stamp}):`,
+        whiteboard.content,
+        '(Rewrite it with sys.memory.whiteboard — full replacement. Naps never change a board you wrote, so keep it current. It dissolves when the episode closes.)'
+      ]
 }
 
 /** One awareness entry's exact rendered lines — the unit the fold fingerprints. */
@@ -920,6 +1006,8 @@ export async function computeMemoryCompileContext(options: {
   agentId: string
   sessionId: string
   currentUserMessage: string
+  /** SA-120 P4b: route-owned Jev Juice lane. Absent = today's selection, byte for byte. */
+  inferredRecallProvider?: MemoryInferredRecallProvider
 }): Promise<MemoryCompileContext> {
   const agentId = options.agentId?.trim()
   const sessionId = options.sessionId?.trim()
@@ -947,7 +1035,7 @@ export async function computeMemoryCompileContext(options: {
 
   const { openEpisode, episode } = await loadEpisodeContext({ agent, sessionId, linger, nowTs })
 
-  const selection = selectMemoryInserts({
+  const selectionInput = {
     agentId,
     currentUserMessage: options.currentUserMessage ?? '',
     records,
@@ -955,7 +1043,36 @@ export async function computeMemoryCompileContext(options: {
     budgets,
     episode,
     nowTs
-  })
+  }
+  let selection = selectMemoryInserts(selectionInput)
+
+  // SA-120 P4b: the route's Jev Juice lane may add memories that bear on this message
+  // without a trigger word. The engine only tells it what is already in context; the
+  // closure owns the pre-filter, the call, the deadline, and the evidence, and it hands
+  // `commitMemoryTurnState` the same answer. Still read-only, still no network call here.
+  // A provider that throws is a bug: logged loudly, and the turn compiles without it.
+  let inferredRecalls: MemoryInferredRecall[] = []
+  if (options.inferredRecallProvider && (options.currentUserMessage ?? '').trim()) {
+    try {
+      const answer = await options.inferredRecallProvider({
+        currentUserMessage: options.currentUserMessage,
+        excludeIds: Array.from(
+          new Set([
+            ...selection.onMyMind.eligibleEntries.map((record) => record.id),
+            ...selection.current.map((candidate) => candidate.record.id),
+            ...selection.lingering.map((candidate) => candidate.record.id),
+            ...selection.deferredPendingIds
+          ])
+        )
+      })
+      inferredRecalls = Array.isArray(answer) ? answer : []
+    } catch (error) {
+      console.error('[memoryRecall] Jev Juice inferred-recall provider threw; no inferred recalls this turn:', error)
+    }
+    if (inferredRecalls.length > 0) {
+      selection = selectMemoryInserts({ ...selectionInput, inferred: inferredRecalls })
+    }
+  }
 
   // SA-109 (DL-109-04): session clips are NOT listed here any more. The general
   // DCM clip roster owns every clip line for every agent, memory-on or not, so
@@ -995,6 +1112,10 @@ export async function computeMemoryCompileContext(options: {
     if (lingeringLines.length > 0) {
       dcmLines.push('- Lingering (from earlier messages):')
       dcmLines.push(...lingeringLines)
+    }
+    // SA-120 P4b (DL-120-04): the agent is told what Batshit did on its behalf.
+    if (inserted.some((candidate) => candidate.inferred)) {
+      dcmLines.push(MEMORY_INFERRED_RECALL_NOTE)
     }
     for (const note of selection.moreAvailable) {
       dcmLines.push(`- More available: ${note}`)
@@ -1041,11 +1162,13 @@ export async function computeMemoryCompileContext(options: {
   // Infinite Sessions (already loaded by the shared episode-context loader above).
   let whiteboardDcmLines: string[] = []
   let whiteboardTokens = 0
+  let whiteboardWrittenBy: WhiteboardAuthor | null = null
   if (episode.isFixedSession) {
     const whiteboard = openEpisode?.whiteboard
     if (whiteboard?.content?.trim()) {
       whiteboardDcmLines = formatWhiteboardDcmLines(whiteboard)
       whiteboardTokens = estimateTokens(whiteboard.content)
+      whiteboardWrittenBy = whiteboardAuthor(whiteboard)
     }
   }
 
@@ -1064,6 +1187,7 @@ export async function computeMemoryCompileContext(options: {
       whiteboard: {
         present: whiteboardDcmLines.length > 0,
         placement: 'dcm',
+        writtenBy: whiteboardWrittenBy,
         tokenEstimate: whiteboardTokens
       },
       awarenessFold: {
@@ -1103,7 +1227,15 @@ export async function computeMemoryCompileContext(options: {
         ...(candidate.record.media?.length
           ? { mediaIds: candidate.record.media.map((media) => media.id) }
           : {}),
-        ...(candidate.record.is_superseded === 'y' ? { superseded: true } : {})
+        ...(candidate.record.is_superseded === 'y' ? { superseded: true } : {}),
+        ...(candidate.inferred
+          ? {
+              inferred: true,
+              ...(candidate.inferred.probability !== null
+                ? { inferredProbability: candidate.inferred.probability }
+                : {})
+            }
+          : {})
       })),
       moreAvailable: selection.moreAvailable,
       timeAwareness: timeAwarenessLine ? timeAwarenessLine.replace(/^- /, '') : null
@@ -1126,11 +1258,17 @@ const RECENCY_HALF_LIFE_DAYS = 14
  * recency decays with a 14-day half-life over the LAST DELIVERY (recall-refresh:
  * `last_recalled_ts` beats `saved_ts`); importance maps 1-10 linearly. Returns a new
  * array, best first. Deterministic tiebreak: original hit order, then id.
+ *
+ * SA-120 P4a: `inferredRelevance` is the optional FOURTH term — a 0..1 judgment per
+ * record id (Jev's Noul) times a weight that lives in `memoryRerank.jev.ts`. It is added
+ * on top of the three terms above, so this function stays the one ranking authority.
+ * Absent (every caller but the rerank lane), the arithmetic is exactly what it always was.
  */
 export function blendMemoryRanking(
   records: MemoryRecord[],
   hitOrder: Map<string, number>,
-  nowTs: number
+  nowTs: number,
+  inferredRelevance?: { weight: number; scoreById: ReadonlyMap<string, number> }
 ): MemoryRecord[] {
   const total = Math.max(records.length, 1)
   const scored = records.map((record) => {
@@ -1140,10 +1278,13 @@ export function blendMemoryRanking(
     const ageDays = Math.max(0, nowTs - freshTs) / 86_400_000
     const recency = Math.exp((-Math.LN2 * ageDays) / RECENCY_HALF_LIFE_DAYS)
     const importance = (record.importance - 1) / 9
-    const score =
+    const blended =
       RANK_WEIGHT_RELEVANCE * relevance +
       RANK_WEIGHT_RECENCY * recency +
       RANK_WEIGHT_IMPORTANCE * importance
+    const score = inferredRelevance
+      ? blended + inferredRelevance.weight * (inferredRelevance.scoreById.get(record.id) ?? 0)
+      : blended
     return { record, score, rank }
   })
   scored.sort(
@@ -1164,6 +1305,8 @@ export interface MemoryInsertedItem {
   status: MemoryInsertStatus
   gist: string
   segment?: boolean
+  /** SA-120 P4b: Jev Juice brought this memory in (not the agent, not a trigger word). */
+  inferred?: boolean
   matchedTerms?: string[]
   /** STM rows: the record's trigger terms (first few) so lingering rows can badge too. */
   triggerTerms?: string[]
@@ -1194,6 +1337,12 @@ export async function commitMemoryTurnState(options: {
   agentId: string
   sessionId: string
   currentUserMessage: string
+  /**
+   * SA-120 P4b: exactly what the compile's `inferredRecallProvider` answered for this send
+   * (the route holds it), so the recomputed selection matches the compiled one. The commit
+   * never asks Jev anything itself.
+   */
+  inferredRecalls?: MemoryInferredRecall[]
 }): Promise<MemoryTurnCommitResult> {
   const agentId = options.agentId?.trim()
   const sessionId = options.sessionId?.trim()
@@ -1232,7 +1381,8 @@ export async function commitMemoryTurnState(options: {
     linger,
     budgets,
     episode,
-    nowTs
+    nowTs,
+    ...(options.inferredRecalls?.length ? { inferred: options.inferredRecalls } : {})
   })
 
   const previousLingering = (linger?.lingering ?? []).filter(
@@ -1253,6 +1403,8 @@ export async function commitMemoryTurnState(options: {
       : 'memory'
     recallKindById.set(memoryId, kind)
     const kindField = kind === 'segment' ? { kind: 'segment' as const } : {}
+    // SA-120 P4b: an inferred entry stays labelled while it lingers.
+    const inferredField = candidate.inferred ? { inferred: true as const } : {}
     if (candidate.status === 'held') {
       const previous = previousByMemoryId.get(memoryId)
       if (candidate.holdEpisode) {
@@ -1267,7 +1419,8 @@ export async function commitMemoryTurnState(options: {
           turns_remaining: 0,
           hold: 'episode',
           episode_id: previous?.episode_id ?? null,
-          ...kindField
+          ...kindField,
+          ...inferredField
         })
         continue
       }
@@ -1281,7 +1434,8 @@ export async function commitMemoryTurnState(options: {
         first_inserted_at: candidate.firstInsertedAt ?? previous?.first_inserted_at ?? nowIso,
         last_relevant_at: previous?.last_relevant_at ?? nowIso,
         turns_remaining: remaining,
-        ...kindField
+        ...kindField,
+        ...inferredField
       })
       continue
     }
@@ -1303,7 +1457,8 @@ export async function commitMemoryTurnState(options: {
         // Defensive: with no open episode at commit (should not happen — episode
         // upkeep runs before the commit), the hold dies on the next commit.
         episode_id: episode.isFixedSession ? episode.openEpisodeId : null,
-        ...kindField
+        ...kindField,
+        ...inferredField
       })
       continue
     }
@@ -1322,7 +1477,8 @@ export async function commitMemoryTurnState(options: {
           candidate.firstInsertedAt ?? previousByMemoryId.get(memoryId)?.first_inserted_at ?? nowIso,
         last_relevant_at: nowIso,
         turns_remaining: window,
-        ...kindField
+        ...kindField,
+        ...inferredField
       })
     }
   }
@@ -1395,6 +1551,7 @@ export async function commitMemoryTurnState(options: {
           ? `${candidate.record.content.slice(0, 140).trimEnd()}…`
           : candidate.record.content),
       ...((candidate.record as InsertableRecord).__segment ? { segment: true } : {}),
+      ...(candidate.inferred ? { inferred: true } : {}),
       ...(candidate.matchedTerms.length > 0 ? { matchedTerms: candidate.matchedTerms } : {}),
       ...(candidate.record.trigger_terms?.length
         ? { triggerTerms: candidate.record.trigger_terms.slice(0, 3) }

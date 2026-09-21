@@ -59,6 +59,16 @@ describe('formatToolDisplayName', () => {
 		expect(formatToolDisplayName('fabric:sys.cli_tool.list')).toBe('CLI Tool List')
 	})
 
+	it('SA-120 P2: names the Jev Juice judgment control the way its card reads', () => {
+		// The derived name would be "Jev Juice Ask", which reads backwards; the alias says
+		// what the agent did. The prefix label keeps any later `sys.judge.*` control on the
+		// product name (DL-120-13: two words, both capitalized).
+		expect(formatToolDisplayName('sys.judge.ask')).toBe('Ask Jev Juice')
+		expect(formatToolDisplayName('fabric:sys.judge.ask')).toBe('Ask Jev Juice')
+		expect(formatBatshitToolTargetDisplayName('sys.judge.ask')).toBe('Ask Jev Juice')
+		expect(formatBatshitToolTargetDisplayName('sys.judge.rank')).toBe('Jev Juice Rank')
+	})
+
 	it('keeps Batshit branding lowercase for unknown names', () => {
 		expect(formatToolDisplayName('BATSHIT')).toBe('batshit')
 		expect(formatToolDisplayName('N8N_connector')).toBe('n8n Connector')

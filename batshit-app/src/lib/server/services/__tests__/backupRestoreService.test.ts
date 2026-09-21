@@ -4,9 +4,10 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 
 import { unzipSync, zipSync } from 'fflate/node'
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
+import { mcpToolListCache } from '$lib/server/services/mcpToolListCache'
 import {
   createDefaultFacialArtworkState,
   createFacialArtworkArtworkLayer,
@@ -557,6 +558,13 @@ async function seedRepresentativeData(userId: string) {
     },
     schema_version: 1
   })
+  // SA-120: the instance-level Jev Juice config rides the `settings` group.
+  await redis.json.set('batshit:typesafe_config', '$', {
+    enabled: true,
+    modelId: 'jev-1.13.0',
+    attemptTimeoutMs: 2500,
+    updatedAt: '2026-09-16T12:00:00.000Z'
+  })
   await redis.json.set('batshit:memory_index_meta', '$', {
     embedding_model: 'local-ai:test-embedder@4',
     dims: 4,
@@ -737,6 +745,73 @@ describe('backupRestoreService', () => {
     for (const record of grouped) {
       expect(record.groupId).toBe('dms')
     }
+  })
+
+  it('files the Jev Juice config under the `settings` group, not the `chats` fall-through (SA-120)', async () => {
+    await seedRepresentativeData('source')
+
+    const bundle = await createBackupBundle('source')
+    const entries = unzipSync(bundle.bytes)
+    const grouped = Object.entries(entries)
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+      .filter((record) => record.key === 'batshit:typesafe_config')
+
+    expect(grouped).toHaveLength(1)
+    expect(grouped[0].groupId).toBe('settings')
+  })
+
+  it('carries the Jev Juice after-reply records with their chat, in the `chats` group, and restores them (SA-120 P6)', async () => {
+    // A new session-scoped key family owes backup a decision. These annotate a chat's replies
+    // (the chip under them), so they travel with the chat: collected per session on the way
+    // out, restorable on the way in.
+    await seedRepresentativeData('source')
+    const item = {
+      messageId: 'msg_1',
+      sessionId: 'sess_1',
+      agentId: 'agent_1',
+      at: '2026-09-17T08:00:00.000Z',
+      findings: [{ id: 'claimed_action', lane: 'reply_check', source: 'inferred', probability: 0.91 }],
+      notes: [],
+      toldAgent: true
+    }
+    await redis.sAdd('jev_post_turn:sess_1', 'msg_1')
+    await redis.json.set('jev_post_turn_item:sess_1:msg_1', '$', item)
+
+    const bundle = await createBackupBundle('source')
+    const records = Object.entries(unzipSync(bundle.bytes))
+      .filter(([name]) => name.startsWith('redis/records/') && name.endsWith('.json'))
+      .map(([, bytes]) => JSON.parse(Buffer.from(bytes).toString('utf8')))
+      .filter((record) => String(record.key).startsWith('jev_post_turn'))
+    expect(records.map((record) => [record.key, record.groupId]).sort()).toEqual([
+      ['jev_post_turn:sess_1', 'chats'],
+      ['jev_post_turn_item:sess_1:msg_1', 'chats']
+    ])
+
+    await redis.del('jev_post_turn:sess_1')
+    await redis.del('jev_post_turn_item:sess_1:msg_1')
+    const result = await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+    expect(result.restored).toBe(true)
+    expect(await redis.sMembers('jev_post_turn:sess_1')).toEqual(['msg_1'])
+    expect(await redis.json.get('jev_post_turn_item:sess_1:msg_1')).toEqual(item)
+  })
+
+  it("throws the restored user's saved tool lists away, because gateways and keys were replaced around the gateway service", async () => {
+    await seedRepresentativeData('source')
+    const bundle = await createBackupBundle('source')
+    const target = { userId: 'target', gatewayId: 'gw-docker', inputs: { probe: 'bundle' } }
+    const otherUser = { ...target, userId: 'someone-else' }
+    await mcpToolListCache.read(target, async () => ({ ok: true, tools: [] }))
+    await mcpToolListCache.read(otherUser, async () => ({ ok: true, tools: [] }))
+
+    const result = await restoreBackupBundle('target', bundle.bytes, { confirmReplace: true })
+    expect(result.restored).toBe(true)
+
+    const askAgain = vi.fn(async () => ({ ok: true as const, tools: [] }))
+    await mcpToolListCache.read(target, askAgain)
+    expect(askAgain).toHaveBeenCalledTimes(1)
+    await mcpToolListCache.read(otherUser, askAgain)
+    expect(askAgain).toHaveBeenCalledTimes(1)
   })
 
   it('leaves managed CLI run credentials out of the backup on BOTH sides (SA-117 DL-117-09)', async () => {
@@ -968,6 +1043,8 @@ describe('backupRestoreService', () => {
     expect(restoredSegment.session_id).toBe('sess_1')
     const restoredMemoryConfig = (await redis.json.get('batshit:memory_config')) as Record<string, any>
     expect(restoredMemoryConfig.embedding.lane).toBe('local-ai')
+    const restoredTypesafeConfig = (await redis.json.get('batshit:typesafe_config')) as Record<string, any>
+    expect(restoredTypesafeConfig).toMatchObject({ enabled: true, modelId: 'jev-1.13.0', attemptTimeoutMs: 2500 })
     const restoredMemoryMeta = (await redis.json.get('batshit:memory_index_meta')) as Record<string, any>
     expect(restoredMemoryMeta.dims).toBe(4)
     const restoredEpisode = (await redis.json.get('episode:sess_1:ep_1')) as Record<string, any>
@@ -1075,9 +1152,16 @@ describe('backupRestoreService', () => {
       restoreStagedBackup('target', stageId, { confirmReplace: true })
     ).rejects.toThrow(/verified SHA-256 identity/)
     await fs.writeFile(archivePath, bundle.bytes)
+    const savedToolList = { userId: 'target', gatewayId: 'gw-docker', inputs: { probe: 'staged' } }
+    await mcpToolListCache.read(savedToolList, async () => ({ ok: true, tools: [] }))
 
     const result = await restoreStagedBackup('target', stageId, { confirmReplace: true })
     expect(result).toMatchObject({ restored: true, fileAssetCount: 4, targetUserId: 'target' })
+    // The restore replaced the gateways and API keys around the gateway service, so the
+    // next send asks every tool server again.
+    const askAgain = vi.fn(async () => ({ ok: true as const, tools: [] }))
+    await mcpToolListCache.read(savedToolList, askAgain)
+    expect(askAgain).toHaveBeenCalledTimes(1)
     await expect(fs.readFile(path.join(uploadRoot, 'images', 'photo.png'), 'utf8')).resolves.toBe(
       'image-bytes'
     )

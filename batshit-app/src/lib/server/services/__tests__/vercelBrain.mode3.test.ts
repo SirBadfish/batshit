@@ -552,15 +552,13 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
       expect(typeof stream.fullStream?.[Symbol.asyncIterator]).toBe('function')
     })
 
-    it('wraps model-facing tool output with a reserved zipId notice', async () => {
-      const reserveToolZipId = vi.fn().mockReturnValue('cool_tool_1781000000000_abcde')
+    it('keeps model-facing tool output readable and free of any zip id (F-P4-9)', async () => {
       const request: NativeModeRequest = {
         messages: [{ role: 'user', content: 'Use a workflow tool' }],
         model: 'claude-3-5-sonnet',
         sessionId: 'test-session',
         messageId: 'test-message',
-        availableWorkflows: ['analyze_data'],
-        reserveToolZipId
+        availableWorkflows: ['analyze_data']
       }
 
       await brain.streamNativeMode(request)
@@ -576,20 +574,19 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
         output: { result: 'analyzed' }
       })
 
-      expect(reserveToolZipId).toHaveBeenCalledWith(
-        expect.objectContaining({
-          toolCallId: 'call_workflow_1',
-          toolName: 'analyze_data'
-        })
-      )
-      expect(String(modelOutput.value)).toContain('zipId: cool_tool_1781000000000_abcde')
-      expect(String(modelOutput.value)).toContain('Use this exact zipId')
+      // The one model-facing shape: pretty-printed text, and NO zip id. The reserved id
+      // used to ride along here, naming a zip the CLI lanes never saved and that memory
+      // tools never create at all. `tool_result_N` is the only current-response handle.
+      expect(modelOutput.type).toBe('text')
+      expect(String(modelOutput.value)).toContain('"result": "analyzed"')
+      expect(String(modelOutput.value)).not.toMatch(/zipId/i)
+      expect(String(modelOutput.value)).not.toContain('cool_tool_')
+      expect(String(modelOutput.value)).not.toContain('Batshit zip control')
       expect(String(modelOutput.value)).not.toContain('call_workflow_1')
       expect(String(modelOutput.value)).not.toContain('toolCallId')
     })
 
-    it('wraps broker tool output with a reserved zipId notice', async () => {
-      const reserveToolZipId = vi.fn().mockReturnValue('cool_tool_1781000000000_brok1')
+    it('leaves a broker tool its own summary and adds no zip id (F-P4-9)', async () => {
       const request: NativeModeRequest = {
         userId: 'josh',
         messages: [{ role: 'user', content: 'Use Dynamic Tool Search' }],
@@ -606,8 +603,7 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
             webSearchEnabled: false,
             bashEnabled: false
           }
-        },
-        reserveToolZipId
+        }
       }
 
       await brain.streamNativeMode(request)
@@ -635,21 +631,10 @@ describe('VercelBrain Mode 3 - Story 5.7', () => {
         }
       })
 
-      expect(reserveToolZipId).toHaveBeenCalledWith(
-        expect.objectContaining({
-          toolCallId: 'call_broker_1',
-          toolName: 'native_batshit_tool_use',
-          input: {
-            ref: 'mcp:sample_tool',
-            input: {
-              query: 'hello'
-            }
-          }
-        })
-      )
       expect(String(modelOutput.value)).toContain('batshit_tool_use succeeded: mcp:sample_tool')
-      expect(String(modelOutput.value)).toContain('zipId: cool_tool_1781000000000_brok1')
-      expect(String(modelOutput.value)).toContain('Use this exact zipId')
+      expect(String(modelOutput.value)).not.toMatch(/zipId/i)
+      expect(String(modelOutput.value)).not.toContain('cool_tool_')
+      expect(String(modelOutput.value)).not.toContain('Batshit zip control')
       expect(String(modelOutput.value)).not.toContain('call_broker_1')
       expect(String(modelOutput.value)).not.toContain('toolCallId')
     })

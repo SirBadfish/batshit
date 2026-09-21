@@ -51,6 +51,18 @@ export const QWEN_TOKEN_PLAN_TEXT_MODELS = [
     tags: ['chat', 'reasoning', 'fast']
   },
   {
+    id: 'deepseek-v4.1-flash',
+    developerId: 'deepseek',
+    displayName: 'DeepSeek V4.1 Flash',
+    tags: ['chat', 'reasoning', 'fast', 'code']
+  },
+  {
+    id: 'glm-5.3',
+    developerId: 'zai',
+    displayName: 'GLM-5.3',
+    tags: ['chat', 'reasoning', 'code']
+  },
+  {
     id: 'glm-5.2',
     developerId: 'zai',
     displayName: 'GLM-5.2',

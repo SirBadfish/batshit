@@ -1,5 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
+import { publishUserEvent } from '$lib/server/ssePublisher'
 
 // PUT /api/messages/[sessionId]/[messageId] - Update a message
 export const PUT: RequestHandler = async ({ params, request, locals }) => {
@@ -25,6 +26,13 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
   
   try {
     await redis.deleteMessage(params.messageId!, params.sessionId!, locals.user.id)
+    // Another tab showing this chat has no other way to hear that the message is gone.
+    // The chat page's old ten-times-a-second refetch used to cover it (2026-09-18).
+    await publishUserEvent(locals.user.id, {
+      type: 'session_messages_changed',
+      sessionId: params.sessionId!,
+      reason: 'message_deleted'
+    })
     return json({ success: true })
   } catch (error) {
     console.error('Error deleting message:', error)

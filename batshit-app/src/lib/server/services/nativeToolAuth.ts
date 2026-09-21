@@ -118,6 +118,11 @@ export async function resolveNativeToolUser(options: {
    * authenticated; the identity is not one that can act.
    */
   delegated?: boolean
+  /**
+   * BL-75 — on the `agent` lane, the Subagent or Worker whose skill access governs a
+   * delegated run (off the credential, never the body). Absent on a primary run.
+   */
+  scopeAgentId?: string
   projectPath?: string | null
   portableSkillToken?: PortableSkillTokenSummary
   portableSkillAllowedControlIds?: string[]
@@ -137,7 +142,11 @@ export async function resolveNativeToolUser(options: {
       agentId: agentCredential.record.agentId,
       sessionId: agentCredential.record.sessionId,
       credentialId: agentCredential.record.id,
-      delegated: agentCredential.record.delegated === true
+      delegated: agentCredential.record.delegated === true,
+      ...(typeof agentCredential.record.scopeAgentId === 'string' &&
+      agentCredential.record.scopeAgentId.trim()
+        ? { scopeAgentId: agentCredential.record.scopeAgentId.trim() }
+        : {})
     }
   }
 

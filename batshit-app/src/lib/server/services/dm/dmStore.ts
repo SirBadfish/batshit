@@ -52,6 +52,7 @@ import {
   type DmSender,
   type DmStatus
 } from '$lib/types/dm'
+import type { UntrustedTextScreen } from '$lib/types/typesafe'
 import {
   dmInboxKey,
   dmInboxScore,
@@ -983,6 +984,37 @@ export async function setDmCallbackStatus(dmId: string, callbackStatus: string):
     if (!current) return
     await writeDm({ ...current, callbackStatus })
   })
+}
+
+/**
+ * SA-120 P7: store what the Jev Juice incoming-text screen said about this DM.
+ *
+ * On the DM record itself, on purpose: the screen then shares the record's deletion
+ * (`deleteAgent`, the drawer's Delete), its 30-day retention, and its `dms` backup group, and
+ * owes no key, sweep, or backup row of its own. Under the recipient's lock with a re-read, like
+ * every other stamp here, because a woken recipient can be claiming this very record while the
+ * screen's one call is still out. Every whole-record writer in this file spreads the record it
+ * re-read, so the field survives a claim, a close, a reopen, and an acknowledge; the reaper
+ * writes two paths and never the root.
+ *
+ * It announces the inbox, so an open drawer re-reads and draws the badge. The open COUNT did
+ * not change; the event is simply the one every DM surface already listens to.
+ *
+ * ADVISORY ONLY (DL-120-12): nothing in this store, and nothing that reads a DM, may branch
+ * on `screen` to allow, refuse, or reorder anything.
+ */
+export async function stampDmScreen(dmId: string, screen: UntrustedTextScreen): Promise<boolean> {
+  if (!dmId?.trim()) return false
+  const record = await getDm(dmId)
+  if (!record) return false
+  const written = await withInboxLock(record.to, async () => {
+    const current = await getDm(dmId)
+    if (!current) return false
+    await writeDm({ ...current, screen })
+    return true
+  })
+  if (written) void announceInboxChanged(record.to, record.userId)
+  return written
 }
 
 /* ------------------------------------------------------------------ *

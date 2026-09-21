@@ -551,3 +551,77 @@ describe('Schedule controls (SA-115 P2, DL-115-10)', () => {
     ).toEqual([])
   })
 })
+
+describe('Judge controls (SA-120 P2, DL-120-06)', () => {
+  const ALL_ON = resolveBrokerToolToggles({})
+
+  it('never includes sys.judge.* by default (the judgment tool is opt-in per agent)', () => {
+    const allowed = resolveBrokerFabricAllowedControlIds({ toggles: ALL_ON })
+    expect(allowed).not.toContain('sys.judge.*')
+    expect(isControlIdAllowedByList('sys.judge.ask', allowed)).toBe(false)
+  })
+
+  it('adds sys.judge.* for an enabled primary even when the broad control plane is closed', () => {
+    const allowed = resolveBrokerFabricAllowedControlIds({
+      toggles: ALL_ON,
+      allowFabricControlTools: false,
+      judgeControlsEnabled: true
+    })
+    expect(allowed).toContain('sys.judge.*')
+    expect(allowed).not.toContain('sys.artifact.*')
+    expect(isControlIdAllowedByList('sys.judge.ask', allowed)).toBe(true)
+  })
+
+  it('judge controls still require the Batshit Tools toggle', () => {
+    const allowed = resolveBrokerFabricAllowedControlIds({
+      toggles: { ...ALL_OFF, fetchZipEnabled: true },
+      judgeControlsEnabled: true
+    })
+    expect(allowed).toEqual([BROKER_FABRIC_FETCH_ZIP_CONTROL_ID])
+  })
+
+  it('a subagent or worker (judgeControlsEnabled false/omitted) never sees judge refs', () => {
+    // DL-120-06: a delegated run never judges through Jev on the user's key; the primary
+    // decides for it. Every subagent and Worker site passes explicit false.
+    const allowed = resolveBrokerFabricAllowedControlIds({
+      toggles: ALL_ON,
+      allowFabricControlTools: false,
+      judgeControlsEnabled: false
+    })
+    expect(isControlIdAllowedByList('sys.judge.ask', allowed)).toBe(false)
+  })
+
+  it('memory, DMs, schedules, and judge are four independent allowances', () => {
+    const judgeOnly = resolveBrokerFabricAllowedControlIds({
+      toggles: ALL_ON,
+      allowFabricControlTools: false,
+      judgeControlsEnabled: true
+    })
+    expect(judgeOnly).toContain('sys.judge.*')
+    expect(judgeOnly).not.toContain('sys.dm.*')
+    expect(judgeOnly).not.toContain('sys.schedule.*')
+    expect(judgeOnly).not.toContain('sys.memory.*')
+  })
+
+  it('opens the fabric family on api and n8n for a judge-enabled agent', () => {
+    const toggles: BrokerToolToggles = { ...ALL_OFF, batshitToolsEnabled: true }
+    for (const runtime of ['api', 'n8n'] as const) {
+      expect(
+        resolveBrokerFamilies({
+          runtime,
+          toggles,
+          allowFabricControlTools: false,
+          judgeControlsEnabled: true
+        })
+      ).toEqual(['fabric'])
+    }
+    expect(
+      resolveBrokerFamilies({
+        runtime: 'api',
+        toggles: ALL_OFF,
+        allowFabricControlTools: false,
+        judgeControlsEnabled: true
+      })
+    ).toEqual([])
+  })
+})

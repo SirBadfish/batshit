@@ -1,17 +1,48 @@
-export type ZipStatusActor = 'auto' | 'user' | 'agent' | null
+/**
+ * Who holds a zip open. `inferred` (SA-120 P5) is Batshit acting on a Jev Juice judgment: the
+ * weakest actor, always temporary, never a lock.
+ */
+export type ZipStatusActor = 'auto' | 'user' | 'agent' | 'inferred' | null
+export type ZipExpandedReason = 'buffer' | 'user' | 'agent' | 'inferred'
 export type ZipStatusDuration = 'countdown' | 'permanent' | 'none'
 export type ZipStatusTone = 'zipped' | 'unzipped' | 'warning'
 
 export interface ZipStatusPresentationInput {
   isZipped?: boolean
   isUnzipped?: boolean
-  expandedReason?: 'buffer' | 'user' | 'agent'
+  expandedReason?: ZipExpandedReason
   isPermanent?: boolean
   remainingMessages?: number | null
   manualZip?: boolean
   autoZip?: boolean
   agentControlled?: boolean
+  /** Jev Juice opened it, or zipped it after a reply (`source: 'inferred'`). */
+  inferredControlled?: boolean
   aboutToZip?: boolean
+}
+
+/**
+ * The one reading of stored zip-state sources for every surface that draws a zip badge (the
+ * chat and the Zip Manager). An unknown or absent unzip source is the user's, as it always
+ * was; `inferred` is never shown as a user lock.
+ */
+export function resolveZipStateActors(
+  unzippedSource: string | null | undefined,
+  rezippedSource: string | null | undefined,
+  isUnzipped: boolean
+): { expandedReason: 'user' | 'agent' | 'inferred' | undefined; agentControlled: boolean; inferredControlled: boolean } {
+  const expandedReason = !isUnzipped
+    ? undefined
+    : unzippedSource === 'agent'
+      ? 'agent'
+      : unzippedSource === 'inferred'
+        ? 'inferred'
+        : 'user'
+  return {
+    expandedReason,
+    agentControlled: (isUnzipped && unzippedSource === 'agent') || rezippedSource === 'agent',
+    inferredControlled: (isUnzipped && unzippedSource === 'inferred') || rezippedSource === 'inferred'
+  }
 }
 
 export interface ZipStatusPresentation {
@@ -36,8 +67,10 @@ function normalizeRemainingMessages(value: unknown): number | null {
 
 function resolveActor(input: ZipStatusPresentationInput): ZipStatusActor {
   if (input.expandedReason === 'agent') return 'agent'
+  if (input.expandedReason === 'inferred') return 'inferred'
   if (input.expandedReason === 'user') return 'user'
   if (input.isUnzipped && input.agentControlled) return 'agent'
+  if (input.isUnzipped && input.inferredControlled) return 'inferred'
   if (input.isUnzipped) return 'user'
   return 'auto'
 }
@@ -56,11 +89,13 @@ function buildUnzippedTooltip(
   if (duration === 'countdown' && remainingMessages !== null) {
     const count = pluralizeMessage(remainingMessages)
     if (actor === 'agent') return `Agent kept this unzipped for ${count}`
+    if (actor === 'inferred') return `Jev unzipped this for ${count}`
     if (actor === 'user') return `You kept this unzipped for ${count}`
     return `Auto-managed: zips in ${count}`
   }
 
   if (actor === 'agent') return 'Agent kept this unzipped'
+  if (actor === 'inferred') return 'Jev unzipped this'
   if (actor === 'user') return 'You kept this unzipped'
   return 'Auto-managed: currently unzipped by buffer and threshold rules'
 }
@@ -70,7 +105,9 @@ export function buildZipStatusPresentation(
 ): ZipStatusPresentation {
   if (input.isZipped) {
     const agentMarker = input.agentControlled ? ' after agent zip control' : ''
-    const tooltip = input.manualZip
+    const tooltip = input.manualZip && input.inferredControlled && !input.agentControlled
+      ? 'Zipped by Jev: the agent seemed done with it'
+      : input.manualZip
       ? `Zipped manually${agentMarker}`
       : input.autoZip
         ? `Auto-zipped${agentMarker}`

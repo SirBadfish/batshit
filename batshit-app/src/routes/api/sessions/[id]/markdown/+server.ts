@@ -28,7 +28,7 @@ export const GET: RequestHandler = async ({ params, locals, url }) => {
     }
 
     const [messages, agents, userSettings] = await Promise.all([
-      redis.getSessionMessages(session.id),
+      redis.getAllSessionMessages(session.id),
       redis.getAgents(userId),
       redis.getUserSettings(userId)
     ])

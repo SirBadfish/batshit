@@ -547,41 +547,43 @@ $effect(() => {
           onfocusin={showOverlay}
           onfocusout={hideOverlay}
         >
-          <TabsPrimitive.List class="batshit-settings-icon-rail flex w-[72px] flex-col gap-2 border px-2 pt-12 pb-2 text-sm md:max-h-screen md:min-h-screen overflow-y-auto">
-            {#each visibleTabSections as section, sectionIndex}
-              {#each section as tab}
-                <TabsPrimitive.Trigger
-                  value={tab.value}
-                  class="batshit-settings-rail-item inline-flex items-center justify-start gap-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-                >
-                  <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center" aria-hidden="true">
-                    {#if tab.icon.type === 'lucide'}
-                      {@const Icon = tab.icon.component}
-                      <Icon class="size-5" />
-                    {:else if tab.icon.type === 'batshit'}
-                      <BatshitIcon id={tab.icon.id} class="size-5" />
-                    {:else}
-                      <img src={tab.icon.src} alt="" class={`size-5 ${tab.icon.class ?? ''}`} />
-                    {/if}
-                  </span>
-                  <span class="sr-only">{tab.label}</span>
-                </TabsPrimitive.Trigger>
+          <div class="batshit-settings-icon-rail flex w-[72px] flex-col border px-2 pt-12 pb-2 text-sm md:max-h-screen md:min-h-screen">
+            <TabsPrimitive.List class="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+              {#each visibleTabSections as section, sectionIndex}
+                {#each section as tab}
+                  <TabsPrimitive.Trigger
+                    value={tab.value}
+                    class="batshit-settings-rail-item inline-flex items-center justify-start gap-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  >
+                    <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center" aria-hidden="true">
+                      {#if tab.icon.type === 'lucide'}
+                        {@const Icon = tab.icon.component}
+                        <Icon class="size-5" />
+                      {:else if tab.icon.type === 'batshit'}
+                        <BatshitIcon id={tab.icon.id} class="size-5" />
+                      {:else}
+                        <img src={tab.icon.src} alt="" class={`size-5 ${tab.icon.class ?? ''}`} />
+                      {/if}
+                    </span>
+                    <span class="sr-only">{tab.label}</span>
+                  </TabsPrimitive.Trigger>
+                {/each}
+                {#if sectionIndex < visibleTabSections.length - 1}
+                  <div class="mx-1 my-1 h-px bg-border/70" aria-hidden="true"></div>
+                {/if}
               {/each}
-              {#if sectionIndex < visibleTabSections.length - 1}
-                <div class="mx-1 my-1 h-px bg-border/70" aria-hidden="true"></div>
-              {/if}
-            {/each}
+            </TabsPrimitive.List>
 
-            <!-- Mid-breakpoint close button lives in the icon rail so it's always visible -->
+            <!-- Mid-breakpoint close button lives in the icon rail, pinned outside the scroll region so it's always visible -->
             <button
               type="button"
-              class="batshit-settings-nav-close mt-auto mb-1 inline-flex items-center justify-center p-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              class="batshit-settings-nav-close mt-2 shrink-0 inline-flex items-center justify-center p-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
               aria-label="Close settings"
               onclick={() => handleSettingsOpenChange(false)}
             >
               ✕
             </button>
-          </TabsPrimitive.List>
+          </div>
 
           <TabsPrimitive.List
             class={`batshit-settings-nav-overlay absolute left-[72px] top-0 z-[var(--z-controls)] flex min-h-screen max-h-screen min-w-[240px] flex-col gap-2 border px-3 pt-0 pb-3 text-sm backdrop-blur transition-opacity duration-150 overflow-y-auto ${
@@ -606,34 +608,36 @@ $effect(() => {
         </div>
 
         <!-- Full nav for large breakpoints -->
-        <TabsPrimitive.List
-          class="batshit-settings-nav hidden w-64 shrink-0 flex-col gap-1 border text-sm lg:flex lg:sticky lg:top-0 lg:min-h-screen lg:max-h-screen lg:overflow-y-auto"
+        <div
+          class="batshit-settings-nav hidden w-64 shrink-0 flex-col border text-sm lg:flex lg:sticky lg:top-0 lg:min-h-screen lg:max-h-screen"
         >
-        <h5 class="batshit-settings-nav-title">SETTINGS</h5>
-          {#each visibleTabSections as section, sectionIndex}
-            {#each section as tab}
-              <TabsPrimitive.Trigger
-                value={tab.value}
-                class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-              >
-                <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center">
-                  {#if tab.icon.type === 'lucide'}
-                    {@const Icon = tab.icon.component}
-                    <Icon class="size-5" />
-                  {:else if tab.icon.type === 'batshit'}
-                    <BatshitIcon id={tab.icon.id} class="size-5" />
-                  {:else}
-                    <img src={tab.icon.src} alt="" class={`size-5 ${tab.icon.class ?? ''}`} />
-                  {/if}
-                </span>
-                <span>{tab.label}</span>
-              </TabsPrimitive.Trigger>
+          <TabsPrimitive.List class="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
+            <h5 class="batshit-settings-nav-title">SETTINGS</h5>
+            {#each visibleTabSections as section, sectionIndex}
+              {#each section as tab}
+                <TabsPrimitive.Trigger
+                  value={tab.value}
+                  class="batshit-settings-nav-item inline-flex w-full items-center justify-start gap-3 text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                >
+                  <span class="batshit-settings-nav-icon inline-flex size-5 items-center justify-center">
+                    {#if tab.icon.type === 'lucide'}
+                      {@const Icon = tab.icon.component}
+                      <Icon class="size-5" />
+                    {:else if tab.icon.type === 'batshit'}
+                      <BatshitIcon id={tab.icon.id} class="size-5" />
+                    {:else}
+                      <img src={tab.icon.src} alt="" class={`size-5 ${tab.icon.class ?? ''}`} />
+                    {/if}
+                  </span>
+                  <span>{tab.label}</span>
+                </TabsPrimitive.Trigger>
+              {/each}
+              {#if sectionIndex < visibleTabSections.length - 1}
+                <div class="mx-1 my-2 h-px bg-border/70" aria-hidden="true"></div>
+              {/if}
             {/each}
-            {#if sectionIndex < visibleTabSections.length - 1}
-              <div class="mx-1 my-2 h-px bg-border/70" aria-hidden="true"></div>
-            {/if}
-          {/each}
-          <div class="mt-4">
+          </TabsPrimitive.List>
+          <div class="mt-4 shrink-0">
             <button
               type="button"
               class="batshit-settings-nav-close w-full inline-flex items-center justify-center gap-2 px-3 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
@@ -642,7 +646,7 @@ $effect(() => {
               Close
             </button>
           </div>
-        </TabsPrimitive.List>
+        </div>
 
         <!-- Tab Content -->
         <div class="batshit-settings-panel-wrap relative z-0 flex-1 min-w-0">

@@ -1,13 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import {
   mapBrokerFailureToNativeAutomationErrorCode,
   mapControlUseErrorToNativeAutomationErrorCode,
   nativeToolService,
   normalizeNativeControlUseInput
 } from '../nativeTools'
+import { buildSbxSandboxName } from '../dockerSandboxSbx'
 import { mcpGatewayDiscovery } from '../mcpGatewayDiscovery'
 import { mcpGatewayService } from '../mcpGatewayService'
 import { apiKeyService } from '$lib/services/apiKey.server'
@@ -168,7 +170,6 @@ describe('nativeToolService hardening', () => {
     delete process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_URL
     delete process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN
     delete process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_TIMEOUT_MS
-    delete process.env.BATSHIT_DOCKER_SANDBOX_CLI
     delete process.env.BATSHIT_AGENT_BROWSER_SIDECAR_URL
     delete process.env.BATSHIT_AGENT_BROWSER_SIDECAR_TOKEN
     delete process.env.BATSHIT_AGENT_BROWSER_TMP_DIR
@@ -234,6 +235,7 @@ describe('nativeToolService hardening', () => {
       network: 'batshit-apple-sandbox-internal',
       image: 'bash:5.2',
       policy: 'internal-network',
+      systemRunning: false,
       reason: 'Apple Container sandbox mock not configured',
       installUrl: 'https://github.com/apple/container/releases/latest',
       capabilities: ['status', 'recover', 'execute', 'cleanup']
@@ -635,6 +637,52 @@ describe('nativeToolService hardening', () => {
     }
   })
 
+  it('blocks every recognized in-place sed/perl spelling from targeting Batshit product source', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-protected-in-place-'))
+    const protectedDir = path.join(tempWorkspace, 'batshit-app', 'src', 'routes')
+    const protectedFile = path.join(protectedDir, '+page.svelte')
+    const serverDir = path.join(tempWorkspace, 'batshit-server')
+    const target = 'batshit-app/src/routes/+page.svelte'
+    const writableTarget = '_local/notes.md'
+    const commands = [
+      `sed -I '' 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `sed -I.bak 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `sed -EI '' 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `sed -ai '' 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `sed --in 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `/usr/bin/sed -i '' 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `perl -pi -e 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `printf '%s\\n' ignored | xargs /usr/bin/sed -i '' 's/Original/Mutated/' ${target} ${writableTarget}`,
+      `find batshit-app/src/routes -name '+page.svelte' -exec /usr/bin/sed -i '' 's/Original/Mutated/' {} +`
+    ]
+
+    try {
+      await mkdir(protectedDir, { recursive: true })
+      await mkdir(serverDir, { recursive: true })
+      await mkdir(path.join(tempWorkspace, '_local'), { recursive: true })
+
+      for (const command of commands) {
+        await writeFile(protectedFile, '<h1>Original</h1>\n', 'utf8')
+        await writeFile(path.join(tempWorkspace, writableTarget), '# Original\n', 'utf8')
+
+        const result = await nativeToolService.nativeBashExecute({
+          command,
+          workspaceRoot: tempWorkspace,
+          cwd: tempWorkspace,
+          accessMode: 'dangerous',
+          backend: 'local'
+        })
+
+        expect(result.success, command).toBe(false)
+        expect(result.blocked, command).toBe(true)
+        expect(String(result.reason || ''), command).toMatch(/product source is read-only/i)
+        expect(await readFile(protectedFile, 'utf8'), command).toBe('<h1>Original</h1>\n')
+      }
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
   it('blocks apply_patch edits into Batshit repo docs', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-protected-docs-'))
     const docsDir = path.join(tempWorkspace, 'docs')
@@ -727,6 +775,293 @@ describe('nativeToolService hardening', () => {
     }
   })
 
+  // F-P6-5 follow-up: these spellings were mapped as READS, `sed` is on Plan mode's safe list, and
+  // the sandbox mounts the workspace writable, so they edited any file in Plan mode.
+  it.each([
+    'sed -i.bak s/one/two/ app.js',
+    "sed -i'' s/one/two/ app.js",
+    'sed -Ei s/one/two/ app.js',
+    'sed --in-place s/one/two/ app.js'
+  ])('blocks the in-place edit `%s` of a non-markdown file in Plan mode', async (command) => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-plan-sed-'))
+    try {
+      await writeFile(path.join(tempWorkspace, 'app.js'), 'one\n', 'utf8')
+      const result = await nativeToolService.nativeBashExecute({
+        command,
+        accessMode: 'plan',
+        requireApproval: false,
+        workspaceRoot: tempWorkspace
+      })
+
+      expect(result.success).toBe(false)
+      expect(result.blocked).toBe(true)
+      expect(result.reason).toMatch(/plan mode/i)
+      expect(await readFile(path.join(tempWorkspace, 'app.js'), 'utf8')).toBe('one\n')
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ["sed -I '' 's/one/two/' app.js notes.md", 'BSD sed -I'],
+    ["sed -I.bak 's/one/two/' app.js notes.md", 'BSD sed -I with backup suffix'],
+    ["sed -EI '' 's/one/two/' app.js notes.md", 'BSD sed clustered -EI'],
+    ["sed -ai '' 's/one/two/' app.js notes.md", 'BSD sed clustered -ai'],
+    ["sed --in 's/one/two/' app.js notes.md", 'GNU sed --in prefix'],
+    ["/usr/bin/sed -i '' 's/one/two/' app.js notes.md", 'full-path sed'],
+    ["perl -pi -e 's/one/two/' app.js notes.md", 'perl -pi'],
+    ["sed -i '' 's/one/two/' app.js notes.md", 'multi-file sed -i']
+  ])('blocks %s when any in-place edit target is not Markdown (%s)', async (command) => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-plan-in-place-'))
+    try {
+      await writeFile(path.join(tempWorkspace, 'app.js'), 'one\n', 'utf8')
+      await writeFile(path.join(tempWorkspace, 'notes.md'), 'one\n', 'utf8')
+
+      const result = await nativeToolService.nativeBashExecute({
+        command,
+        accessMode: 'plan',
+        requireApproval: false,
+        workspaceRoot: tempWorkspace,
+        cwd: tempWorkspace,
+        backend: 'local'
+      })
+
+      expect(result.success).toBe(false)
+      expect(result.blocked).toBe(true)
+      expect(result.reason).toMatch(/plan mode/i)
+      expect(await readFile(path.join(tempWorkspace, 'app.js'), 'utf8')).toBe('one\n')
+      expect(await readFile(path.join(tempWorkspace, 'notes.md'), 'utf8')).toBe('one\n')
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it('allows an in-place edit when every named target is Markdown', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-plan-in-place-md-'))
+    try {
+      await writeFile(path.join(tempWorkspace, 'notes.md'), 'one\n', 'utf8')
+      await writeFile(path.join(tempWorkspace, 'other.md'), 'one\n', 'utf8')
+
+      const result = await nativeToolService.nativeBashExecute({
+        command: "perl -pi -e 's/one/two/' notes.md other.md",
+        accessMode: 'plan',
+        requireApproval: false,
+        workspaceRoot: tempWorkspace,
+        cwd: tempWorkspace,
+        backend: 'local'
+      })
+
+      expect(result.success).toBe(true)
+      expect(result.blocked).toBe(false)
+      expect(await readFile(path.join(tempWorkspace, 'notes.md'), 'utf8')).toBe('two\n')
+      expect(await readFile(path.join(tempWorkspace, 'other.md'), 'utf8')).toBe('two\n')
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks hidden shell writes and command execution in Plan mode without changing files', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-plan-side-effects-'))
+    try {
+      await writeFile(path.join(tempWorkspace, 'probe.txt'), 'needle\n', 'utf8')
+      await writeFile(path.join(tempWorkspace, 'a.txt'), 'alpha\n', 'utf8')
+      await writeFile(path.join(tempWorkspace, 'b.txt'), 'beta\n', 'utf8')
+      await writeFile(path.join(tempWorkspace, 'script.txt'), 'touch made-by-cat-pipe.js\n', 'utf8')
+
+      const blockedCases = [
+        {
+          command: 'find . -name probe.txt -delete',
+          reason: /find action -delete/i
+        },
+        {
+          command: 'find . -name probe.txt -exec touch made-by-find-exec.js {} +',
+          reason: /find action -exec/i,
+          absentPath: 'made-by-find-exec.js'
+        },
+        {
+          command: 'find . -name probe.txt -execdir touch made-by-find-execdir.js {} +',
+          reason: /find action -execdir/i,
+          absentPath: 'made-by-find-execdir.js'
+        },
+        {
+          command: 'find . -name probe.txt -ok touch made-by-find-ok.js {} +',
+          reason: /find action -ok/i,
+          absentPath: 'made-by-find-ok.js'
+        },
+        {
+          command: 'find . -name probe.txt -okdir touch made-by-find-okdir.js {} +',
+          reason: /find action -okdir/i,
+          absentPath: 'made-by-find-okdir.js'
+        },
+        {
+          command: 'find . -name probe.txt -fprint made-by-find-fprint.txt',
+          reason: /find action -fprint/i,
+          absentPath: 'made-by-find-fprint.txt'
+        },
+        {
+          command: "sed -n 'w made-by-sed.js' probe.txt",
+          reason: /sed w\/W\/e commands/i,
+          absentPath: 'made-by-sed.js'
+        },
+        {
+          command: "sed 'e touch made-by-sed-e.js' probe.txt",
+          reason: /sed w\/W\/e commands/i,
+          absentPath: 'made-by-sed-e.js'
+        },
+        {
+          command: "sed -n 'W made-by-sed-W.js' probe.txt",
+          reason: /sed w\/W\/e commands/i,
+          absentPath: 'made-by-sed-W.js'
+        },
+        {
+          command: "sed 's/needle/touch made-by-sed-sub-e.js/e' probe.txt",
+          reason: /sed w\/W\/e commands/i,
+          absentPath: 'made-by-sed-sub-e.js'
+        },
+        {
+          command: "sed -n 's/needle/replaced/w made-by-sed-sub-w.js' probe.txt",
+          reason: /sed w\/W\/e commands/i,
+          absentPath: 'made-by-sed-sub-w.js'
+        },
+        {
+          command: "sed '1p' -e 'w made-by-sed-late-expression.js' probe.txt",
+          reason: /sed w\/W\/e commands/i,
+          absentPath: 'made-by-sed-late-expression.js'
+        },
+        {
+          command: "rg --pre 'touch made-by-rg-pre.js' needle probe.txt",
+          reason: /rg --pre/i,
+          absentPath: 'made-by-rg-pre.js'
+        },
+        {
+          command: 'git diff --no-index --output=made-by-git-diff.js a.txt b.txt',
+          reason: /blocks --output/i,
+          absentPath: 'made-by-git-diff.js'
+        },
+        {
+          command: 'git log --output=made-by-git-log.js -1',
+          reason: /blocks --output/i,
+          absentPath: 'made-by-git-log.js'
+        },
+        {
+          command: 'git show --output=made-by-git-show.js HEAD',
+          reason: /blocks --output/i,
+          absentPath: 'made-by-git-show.js'
+        },
+        {
+          command: 'diff --output=made-by-diff.js a.txt b.txt',
+          reason: /blocks --output/i,
+          absentPath: 'made-by-diff.js'
+        },
+        {
+          command: 'cat script.txt | sh',
+          reason: /pipelines.*read-only/i,
+          absentPath: 'made-by-cat-pipe.js'
+        },
+        {
+          command: "printf 'touch made-by-printf-pipe.js\\n' | sh",
+          reason: /pipelines.*read-only/i,
+          absentPath: 'made-by-printf-pipe.js'
+        },
+        {
+          command: "printf 'touch made-by-markdown-pipe.js\\n' | sh > NOTES.md",
+          reason: /pipelines.*read-only/i,
+          absentPath: 'made-by-markdown-pipe.js'
+        },
+        {
+          command: "echo 'touch made-by-echo-pipe.js' | sh",
+          reason: /pipelines.*read-only/i,
+          absentPath: 'made-by-echo-pipe.js'
+        },
+        {
+          command: 'cat <(touch made-by-process-sub.js)',
+          reason: /process substitutions/i,
+          absentPath: 'made-by-process-sub.js'
+        }
+      ]
+
+      for (const blockedCase of blockedCases) {
+        const result = await nativeToolService.nativeBashExecute({
+          command: blockedCase.command,
+          accessMode: 'plan',
+          requireApproval: false,
+          workspaceRoot: tempWorkspace,
+          cwd: tempWorkspace,
+          backend: 'local'
+        })
+
+        expect(result.success, blockedCase.command).toBe(false)
+        expect(result.blocked, blockedCase.command).toBe(true)
+        expect(String(result.reason || ''), blockedCase.command).toMatch(blockedCase.reason)
+        expect(await readFile(path.join(tempWorkspace, 'probe.txt'), 'utf8')).toBe('needle\n')
+        if (blockedCase.absentPath) {
+          await expect(stat(path.join(tempWorkspace, blockedCase.absentPath))).rejects.toMatchObject({
+            code: 'ENOENT'
+          })
+        }
+      }
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps ordinary inspection commands and Markdown writes available in Plan mode', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-plan-reads-'))
+    try {
+      await mkdir(path.join(tempWorkspace, 'src'), { recursive: true })
+      await writeFile(path.join(tempWorkspace, 'probe.txt'), 'needle\n', 'utf8')
+      await writeFile(path.join(tempWorkspace, 'src', 'sample.ts'), 'export const sample = true\n', 'utf8')
+
+      for (const command of [
+        'cat probe.txt',
+        "sed -n '1,20p' probe.txt",
+        "find . -name '*.ts'",
+        'rg needle .',
+        'ls -la'
+      ]) {
+        const result = await nativeToolService.nativeBashExecute({
+          command,
+          accessMode: 'plan',
+          requireApproval: false,
+          workspaceRoot: tempWorkspace,
+          cwd: tempWorkspace,
+          backend: 'local'
+        })
+
+        expect(result.blocked, command).toBe(false)
+        expect(result.success, command).toBe(true)
+      }
+
+      for (const command of ['git status --short', 'git diff --no-index probe.txt probe.txt', 'git log -1 --oneline']) {
+        const gitInspection = await nativeToolService.nativeBashExecute({
+          command,
+          accessMode: 'plan',
+          requireApproval: false,
+          workspaceRoot: tempWorkspace,
+          cwd: tempWorkspace,
+          backend: 'local'
+        })
+        expect(gitInspection.success, command).toBe(false)
+        expect(gitInspection.blocked, command).toBe(true)
+        expect(gitInspection.reason, command).toMatch(/repository configuration can execute helpers/i)
+      }
+
+      const markdownWrite = await nativeToolService.nativeBashExecute({
+        command: "printf '# Notes\\n' > NOTES.md",
+        accessMode: 'plan',
+        requireApproval: false,
+        workspaceRoot: tempWorkspace,
+        cwd: tempWorkspace,
+        backend: 'local'
+      })
+      expect(markdownWrite.blocked).toBe(false)
+      expect(markdownWrite.success).toBe(true)
+      expect(await readFile(path.join(tempWorkspace, 'NOTES.md'), 'utf8')).toBe('# Notes\n')
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
   it.each(['local', 'docker_sandbox'] as const)(
     'applies managed apply_patch in native_bash_execute on %s backend',
     async (backend) => {
@@ -764,6 +1099,63 @@ PATCH`
       }
     }
   )
+
+  it('refuses a managed apply_patch add through a workspace symlink', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-patch-root-'))
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-patch-outside-'))
+    try {
+      await symlink(outside, path.join(tempWorkspace, 'link'), 'dir')
+      const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Add File: link/outside.md
++must stay inside
+*** End Patch
+PATCH`
+
+      const result = await nativeToolService.nativeBashExecute({
+        command,
+        accessMode: 'agent',
+        requireApproval: false,
+        workspaceRoot: tempWorkspace
+      })
+
+      expect(result.success).toBe(false)
+      expect(result.reason).toMatch(/outside the allowed workspace root/i)
+      await expect(stat(path.join(outside, 'outside.md'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a managed apply_patch add through a dangling target symlink', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-patch-root-'))
+    const outside = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-patch-outside-'))
+    const outsideTarget = path.join(outside, 'not-yet-created.md')
+    try {
+      await symlink(outsideTarget, path.join(tempWorkspace, 'new.md'), 'file')
+      const command = `apply_patch <<'PATCH'
+*** Begin Patch
+*** Add File: new.md
++must stay inside
+*** End Patch
+PATCH`
+
+      const result = await nativeToolService.nativeBashExecute({
+        command,
+        accessMode: 'agent',
+        requireApproval: false,
+        workspaceRoot: tempWorkspace
+      })
+
+      expect(result.success).toBe(false)
+      expect(result.reason).toMatch(/cannot be resolved safely/i)
+      await expect(stat(outsideTarget)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
 
   it('enforces markdown-only apply_patch targets in Plan mode', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-plan-patch-'))
@@ -831,7 +1223,11 @@ PATCH`
           bashEnabled: true,
           bashAccessMode: 'agent',
           bashAgentApprovalCardsEnabled: true,
-          bashCommandAllowList: ['re:^\\s*npm\\s+run\\s+check\\b'],
+          bashCommandAllowList: [
+            're:^\\s*npm\\s+run\\s+check\\b',
+            're:^\\s*cat\\s+trusted-script\\.txt\\s+\\|\\s+sh\\s*$',
+            're:^\\s*printf\\s+approved\\s+>\\s+APPROVED\\.md;\\s+exit\\s+3\\s*$'
+          ],
           fetchZipEnabled: false,
           dynamicMcpEnabled: false,
           webSearchEnabled: false,
@@ -849,12 +1245,133 @@ PATCH`
     expect(await bashApproval({ command: 'npm run check' })).toBeUndefined()
     expect(await bashApproval({ command: 'npm run build' })).toBe('user-approval')
     expect(await bashApproval('{"command":"mkdir scratch"}')).toBe('user-approval')
-    expect(await bashApproval("cat > NOTES.md <<'EOF'\nhello\nEOF")).toBeUndefined()
+    expect(await bashApproval("cat > NOTES.md <<'EOF'\nhello\nEOF")).toBe('user-approval')
+    expect(
+      await bashApproval("cat > NOTES.md <<'EOF'\nexit 3; sh -c 'still file content'\nEOF")
+    ).toBe('user-approval')
+    expect(
+      await bashApproval("cat > NOTES.md <<EOF\n$(sh -c 'exit 3')\nEOF")
+    ).toBe('user-approval')
+    expect(
+      await bashApproval("set -euo pipefail\nmkdir -p notes\ncat > notes/NOTES.md <<'EOF'\nhello\nEOF\nwc -l notes/NOTES.md")
+    ).toBe('user-approval')
     expect(
       await bashApproval(
         "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: NOTES.md\n+hello\n*** End Patch\nPATCH"
       )
     ).toBeUndefined()
+    expect(await bashApproval({ command: 'apply_patch > out.md' })).toBe('user-approval')
+    expect(
+      await bashApproval({ command: 'printf ok > NOTES.md; apply_patch --version' })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: 'cat script.txt | sh' })).toBe('user-approval')
+    expect(await bashApproval({ command: "printf 'touch unexpected' | sh" })).toBe('user-approval')
+    expect(await bashApproval({ command: "printf 'hello' > NOTES.md; exit 3" })).toBe('user-approval')
+    expect(await bashApproval({ command: "printf 'hello' > NOTES.md && node -e 'process.exit(3)'" })).toBe('user-approval')
+    expect(await bashApproval({ command: "printf hello > NOTES.md; node -e 'process.exit(3)' > out.txt" })).toBe('user-approval')
+    expect(await bashApproval({ command: "node -e 'process.exit(3)' > out.txt" })).toBe('user-approval')
+    expect(await bashApproval({ command: '/tmp/cat > out.txt' })).toBe('user-approval')
+    expect(await bashApproval({ command: '/tmp/cat notes.txt' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'CAT notes.txt' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'PRINTF hello' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'printf ok > NOTES.md; ./cat > out.txt' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'PATH=/tmp; cat > out.txt' })).toBe('user-approval')
+    expect(
+      await bashApproval({ command: 'printf -v PATH /tmp; cat notes.txt' })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: 'cd /tmp; printf payload > out.md' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'printf payload > ~/.zshrc' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'printf payload > ../outside.md' })).toBe('user-approval')
+    expect(await bashApproval({ command: "printf payload > $'\\x2ftmp\\x2fout.md'" })).toBe('user-approval')
+    expect(await bashApproval({ command: "printf payload > $'\\x2e\\x2e/out.md'" })).toBe('user-approval')
+    expect(
+      await bashApproval({ command: 'printf payload > /dev/tcp/127.0.0.1/9' })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: "sed -i '' -e 's/x/y/' /tmp/notes.txt" })).toBe('user-approval')
+    expect(await bashApproval({ command: 'mkdir -p /tmp/notes' })).toBe('user-approval')
+    expect(await bashApproval({ command: "perl -pi -e 'system(\"touch surprise\"); s/x/y/' notes.txt" })).toBe('user-approval')
+    expect(await bashApproval({ command: "python3 -c 'open(\"out.txt\", \"w\").write(\"x\")'" })).toBe('user-approval')
+    expect(await bashApproval({ command: "sed -i '' -e 's/x/y/' notes.txt" })).toBe('user-approval')
+    expect(await bashApproval({ command: 'rg needle notes.txt > /dev/null 2>&1' })).toBeUndefined()
+    expect(
+      await bashApproval({ command: 'cat </dev/tcp/127.0.0.1/9 >/dev/null' })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: "printf 'hello' > NOTES.md; sh -c 'exit 3'" })).toBe('user-approval')
+    expect(await bashApproval({ command: "bash -lc 'printf hello > NOTES.md; exit 3'" })).toBe('user-approval')
+    expect(await bashApproval({ command: 'printf "$(node -e \'process.exit(3)\')" > NOTES.md' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'cat <(printf hello) > NOTES.md' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'printf `node -e \'process.exit(3)\'` > NOTES.md' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'find . -name probe.txt -delete' })).toBe('user-approval')
+    expect(
+      await bashApproval({ command: "printf ok > NOTES.md; find . -exec sh -c 'exit 3' \\;" })
+    ).toBe('user-approval')
+    expect(
+      await bashApproval({ command: "printf ok > NOTES.md; sed -i '' 's/x/y/; e touch surprise' notes.txt" })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: "sed -n 'w/tmp/out' notes.txt" })).toBe('user-approval')
+    expect(await bashApproval({ command: "sed -n '1!w /tmp/out' notes.txt" })).toBe('user-approval')
+    expect(
+      await bashApproval({ command: "printf ok > NOTES.md; rg --pre 'sh -c exit\\ 3' needle ." })
+    ).toBe('user-approval')
+    expect(
+      await bashApproval({
+        command: "rg --hostname-bin=/tmp/probe --hyperlink-format='file://{host}{path}' needle file"
+      })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: 'rg -z needle archive.gz' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'file -C -m review.magic' })).toBe('user-approval')
+    expect(await bashApproval({ command: 'file --comp -m review.magic' })).toBe('user-approval')
+    expect(
+      await bashApproval({ command: 'git --git-dir=.git diff --ext-diff > report.md' })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: 'git status --short' })).toBe('user-approval')
+    expect(
+      await bashApproval({
+        command: "cat harmless.txt\ncat script.txt | sh\ncat <<'EOF'\nnotes\nEOF"
+      })
+    ).toBe('user-approval')
+    expect(await bashApproval({ command: 'cat trusted-script.txt | sh' })).toBeUndefined()
+    expect(await bashApproval({ command: 'printf approved > APPROVED.md; exit 3' })).toBeUndefined()
+  })
+
+  it('blocks a composite mapped write in policy-only Agent mode before any operation runs', async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-agent-composite-write-'))
+    const target = path.join(workspace, 'should-not-exist.txt')
+    try {
+      const { tools } = await nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        projectPath: workspace,
+        providerSettings: {
+          nativeTools: {
+            bashEnabled: true,
+            executionBackend: 'local',
+            bashAccessMode: 'agent',
+            bashCommandAllowList: [
+              're:^\\s*printf\\s+hello\\s+>\\s+should-not-exist\\.txt\\s*$'
+            ],
+            fetchZipEnabled: false,
+            dynamicMcpEnabled: false,
+            webSearchEnabled: false,
+            agentBrowserEnabled: false
+          }
+        },
+        toolApprovalMode: 'off'
+      } as any)
+
+      const blocked = await (tools as any).native_bash_execute.execute({
+        command: 'printf hello > should-not-exist.txt; exit 3'
+      })
+      expect(blocked).toMatchObject({ success: false, blocked: true })
+      await expect(stat(target)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      const allowed = await (tools as any).native_bash_execute.execute({
+        command: 'printf hello > should-not-exist.txt'
+      })
+      expect(allowed.success).toBe(true)
+      expect(await readFile(target, 'utf8')).toBe('hello')
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
   })
 
   it('disables Agent-mode approval prompts by default (policy-only)', async () => {
@@ -2932,12 +3449,12 @@ PATCH`
 
     expect(status.installed).toBe(true)
     expect(status.version).toBe('0.9.2')
-    expect(status.testedVersion).toBe('0.24.1')
-    expect(status.packageSpec).toBe('agent-browser@0.24.1')
-    expect(status.packageTarballUrl).toContain('agent-browser-0.24.1.tgz')
+    expect(status.testedVersion).toBe('0.37.1')
+    expect(status.packageSpec).toBe('agent-browser@0.37.1')
+    expect(status.packageTarballUrl).toContain('agent-browser-0.37.1.tgz')
     expect(status.packageIntegrity).toMatch(/^sha512-/)
     expect(status.runtimeMatchesTestedVersion).toBe(false)
-    expect(String(status.reason || '')).toMatch(/tested runtime 0.24.1/i)
+    expect(String(status.reason || '')).toMatch(/tested runtime 0.37.1/i)
   })
 
   it('reports Agent Browser as a Docker sidecar when sidecar health is reachable', async () => {
@@ -2955,7 +3472,7 @@ PATCH`
           ok: true,
           service: 'batshit-agent-browser-sidecar',
           mode: 'docker-sidecar',
-          version: 'agent-browser 0.24.1'
+          version: 'agent-browser 0.37.1'
         })
       })
     )
@@ -2968,7 +3485,7 @@ PATCH`
     expect(status.supportLevel).toBe('docker-sidecar')
     expect(status.installScope).toBe('docker-sidecar')
     expect(status.command).toBe('agent-browser')
-    expect(status.version).toBe('0.24.1')
+    expect(status.version).toBe('0.37.1')
     expect(status.runtimeMatchesTestedVersion).toBe(true)
     expect(runner).not.toHaveBeenCalled()
   })
@@ -2985,7 +3502,7 @@ PATCH`
           ok: true,
           service: 'batshit-agent-browser-sidecar',
           mode: 'docker-sidecar',
-          version: 'agent-browser 0.24.1'
+          version: 'agent-browser 0.37.1'
         })
       )
     )
@@ -3052,7 +3569,7 @@ PATCH`
           ok: true,
           service: 'batshit-agent-browser-sidecar',
           mode: 'docker-sidecar',
-          version: 'agent-browser 0.24.1'
+          version: 'agent-browser 0.37.1'
         })
       }
       if (url === 'http://agent-browser.test/v1/run') {
@@ -3104,6 +3621,114 @@ PATCH`
       }
     })
     expect(runner).not.toHaveBeenCalled()
+  })
+
+  /**
+   * A Stop reaches an Agent Browser call in Docker (2026-09-18, the sweep's second round). The
+   * sidecar ends a run's CLI call when Batshit's request to it goes (its `sidecarRevision` 2); an
+   * older sidecar ran on after a Stop, so it is not handed one mid-run and Batshit waits for it,
+   * as before, rather than calling a command stopped that runs on.
+   */
+  describe('a Stop and the Docker Agent Browser sidecar', () => {
+    function useDockerSidecar() {
+      nativeToolEnv.BATSHIT_CONTAINERIZED = '1'
+      nativeToolEnv.BATSHIT_AGENT_BROWSER_SIDECAR_URL = 'http://agent-browser.test'
+      process.env.BATSHIT_CONTAINERIZED = '1'
+      process.env.BATSHIT_AGENT_BROWSER_SIDECAR_URL = 'http://agent-browser.test'
+    }
+
+    function sidecarFetch(options: { revision?: number; runMs?: number }) {
+      const runSignals: Array<AbortSignal | undefined> = []
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url === 'http://agent-browser.test/health') {
+          return Response.json({
+            ok: true,
+            service: 'batshit-agent-browser-sidecar',
+            mode: 'docker-sidecar',
+            version: 'agent-browser 0.37.1',
+            ...(options.revision !== undefined ? { sidecarRevision: options.revision } : {})
+          })
+        }
+        if (url === 'http://agent-browser.test/v1/run') {
+          const signal = init?.signal ?? undefined
+          runSignals.push(signal)
+          return await new Promise<Response>((resolve, reject) => {
+            const answer = setTimeout(
+              () =>
+                resolve(
+                  Response.json({
+                    ok: true,
+                    run: { command: 'agent-browser', args: [], stdout: '{"success":true,"data":{"title":"Example"}}', stderr: '', exitCode: 0, signal: null, timedOut: false, durationMs: options.runMs ?? 50, truncated: false }
+                  })
+                ),
+              options.runMs ?? 50
+            )
+            signal?.addEventListener('abort', () => {
+              clearTimeout(answer)
+              reject(new DOMException('The operation was aborted.', 'AbortError'))
+            })
+          })
+        }
+        throw new Error(`Unexpected fetch ${url}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      return { fetchMock, runSignals }
+    }
+
+    it('hands the Stop to a sidecar that ends its run when Batshit goes (revision 2)', async () => {
+      useDockerSidecar()
+      const { runSignals } = sidecarFetch({ revision: 2, runMs: 5_000 })
+      const stop = new AbortController()
+      setTimeout(() => stop.abort('user'), 100)
+      const started = Date.now()
+
+      const result = await nativeToolService.nativeAgentBrowserUse({
+        userId: 'josh',
+        toolName: 'get title',
+        params: {},
+        abortSignal: stop.signal
+      } as any)
+
+      expect(Date.now() - started).toBeLessThan(1_000)
+      expect(runSignals[0]).toBe(stop.signal)
+      expect(result).toMatchObject({ success: false, stopped: true, reason: 'The command was stopped.' })
+    })
+
+    it('waits for an older sidecar, which runs on after a Stop, instead of calling its call stopped', async () => {
+      useDockerSidecar()
+      const { runSignals } = sidecarFetch({ runMs: 300 })
+      const stop = new AbortController()
+      setTimeout(() => stop.abort('user'), 50)
+
+      const result = await nativeToolService.nativeAgentBrowserUse({
+        userId: 'josh',
+        toolName: 'get title',
+        params: {},
+        abortSignal: stop.signal
+      } as any)
+
+      expect(runSignals).toEqual([undefined])
+      expect(result).toMatchObject({ success: true, result: { title: 'Example' } })
+      expect(result.stopped).toBeUndefined()
+    })
+
+    it('never sends a call a Stop reached first, whatever the sidecar', async () => {
+      useDockerSidecar()
+      const { fetchMock } = sidecarFetch({})
+      const stop = new AbortController()
+      stop.abort('user')
+
+      const result = await nativeToolService.nativeAgentBrowserUse({
+        userId: 'josh',
+        toolName: 'get title',
+        params: {},
+        abortSignal: stop.signal
+      } as any)
+
+      expect(result).toMatchObject({ success: false, stopped: true })
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).not.toContain('http://agent-browser.test/v1/run')
+    })
   })
 
   it('blocks Agent Browser bash commands in Docker with Agent Browser wording', async () => {
@@ -4714,6 +5339,8 @@ printf 'ok\\n'
 
   // SA-105 P5: the PERSISTED screenshot payload (what send-routed reads for the
   // sanitized tool card) must tell the same truth the model was told.
+  // BL-57: it runs a real child process in a temp workspace, so a busy full lane can starve
+  // it past the 5 s default; the file alone takes well under a second.
   it('nativeBashExecute records a lane-aware modelVisibleInLoop on the screenshot payload', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-native-ab-lane-flag-'))
     const fakeAgentBrowserPath = path.join(tempWorkspace, 'agent-browser')
@@ -4766,7 +5393,7 @@ printf 'ok\n'
       process.env.PATH = originalPath
       await rm(tempWorkspace, { recursive: true, force: true })
     }
-  })
+  }, 20_000)
 
   it('native_bash_execute withholds a screenshot when the model cannot accept images at all', async () => {
     const { tools } = await nativeToolService.buildMode3NativeTools({
@@ -5395,12 +6022,14 @@ printf 'ok\\n'
         agent_id: 'agent_primary',
         mode: 'mode1',
         actor_type: 'primary'
-      }
+      },
+      actorType: 'session'
     })
 
     expect(executeSkillRuntimeAction).toHaveBeenCalledWith({
       userId: 'josh',
       skillId: 'agent_browser',
+      actor: { kind: 'agent', agentId: 'agent_primary' },
       action: 'invoke',
       path: undefined,
       maxChars: undefined
@@ -5441,12 +6070,14 @@ printf 'ok\\n'
         agent_id: 'agent_primary',
         mode: 'mode1',
         actor_type: 'primary'
-      }
+      },
+      actorType: 'session'
     })
 
     expect(executeSkillRuntimeAction).toHaveBeenCalledWith({
       userId: 'josh',
       skillId: 'agent_browser',
+      actor: { kind: 'agent', agentId: 'agent_primary' },
       action: 'invoke',
       path: undefined,
       maxChars: undefined
@@ -5715,6 +6346,22 @@ PATCH`
         cwd: expectedWorkspace,
         command: 'pwd'
       })
+
+      // Run-end cleanup asks the operator only for a chat that used Docker Sandbox.
+      fetchMock.mockClear()
+      fetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ ok: true, warnings: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      )
+      expect(await nativeToolService.cleanupDockerSandboxesForSession('session_never_used')).toEqual([])
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(await nativeToolService.cleanupDockerSandboxesForSession('session_operator')).toEqual([])
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://host.docker.internal:5629/v1/sandbox/cleanup',
+        expect.objectContaining({ method: 'POST', body: JSON.stringify({ sessionId: 'session_operator' }) })
+      )
     } finally {
       await rm(tempWorkspace, { recursive: true, force: true })
     }
@@ -5772,6 +6419,123 @@ PATCH`
     }
   })
 
+  // A Stop ends a running command on every backend (2026-09-18); `nativeBashStop.test.ts` runs
+  // real processes on the local one.
+  it('hands the run’s abort signal to the Apple Container sandbox and reports its stop', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-apple-container-stop-'))
+    try {
+      vi.mocked(appleContainerSandboxMocks.executeAppleContainerSandboxCommand).mockResolvedValue({
+        ok: true,
+        sandboxName: 'batshit-apple-sandbox-josh-session',
+        cleanupWarnings: [],
+        run: {
+          command: 'container exec batshit-apple-sandbox-josh-session bash -lc "sleep 20"',
+          stdout: '',
+          stderr: '',
+          exitCode: null,
+          signal: 'SIGTERM',
+          timedOut: false,
+          durationMs: 150,
+          truncated: false,
+          stopped: true
+        }
+      })
+      const stop = new AbortController()
+
+      const result = await nativeToolService.nativeBashExecute({
+        userId: 'josh',
+        sessionId: 'session_apple_stop',
+        command: 'sleep 20',
+        cwd: tempWorkspace,
+        workspaceRoot: tempWorkspace,
+        backend: 'apple_container',
+        accessMode: 'dangerous',
+        abortSignal: stop.signal
+      })
+
+      expect(
+        appleContainerSandboxMocks.executeAppleContainerSandboxCommand
+      ).toHaveBeenCalledWith(expect.objectContaining({ abortSignal: stop.signal }))
+      expect(result).toMatchObject({
+        success: false,
+        stopped: true,
+        reason: 'The command was stopped.'
+      })
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it('starts no sandbox for a command stopped before it began', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-apple-container-stop-'))
+    try {
+      const stop = new AbortController()
+      stop.abort('user')
+
+      const result = await nativeToolService.nativeBashExecute({
+        userId: 'josh',
+        sessionId: 'session_apple_stop_early',
+        command: 'pwd',
+        cwd: tempWorkspace,
+        workspaceRoot: tempWorkspace,
+        backend: 'apple_container',
+        accessMode: 'dangerous',
+        abortSignal: stop.signal
+      })
+
+      expect(appleContainerSandboxMocks.executeAppleContainerSandboxCommand).not.toHaveBeenCalled()
+      expect(result).toMatchObject({ success: false, stopped: true })
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
+  it('a Stop ends a docker_sandbox command run through the operator without waiting for its answer', async () => {
+    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-sandbox-operator-stop-'))
+    nativeToolEnv.BATSHIT_CONTAINERIZED = '1'
+    nativeToolEnv.BATSHIT_DOCKER_SANDBOX_OPERATOR_URL = 'http://host.docker.internal:5629'
+    nativeToolEnv.BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN = 'operator-token'
+    process.env.BATSHIT_CONTAINERIZED = '1'
+    process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_URL = 'http://host.docker.internal:5629'
+    process.env.BATSHIT_DOCKER_SANDBOX_OPERATOR_TOKEN = 'operator-token'
+    // The operator answers when its command ends; this one does not end on its own.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('The operation was aborted.', 'AbortError'))
+          )
+        })
+    )
+    const stop = new AbortController()
+    setTimeout(() => stop.abort('user'), 100)
+    const started = Date.now()
+
+    try {
+      const result = await nativeToolService.nativeBashExecute({
+        userId: 'josh',
+        sessionId: 'session_operator_stop',
+        command: 'sleep 20',
+        cwd: tempWorkspace,
+        workspaceRoot: tempWorkspace,
+        backend: 'docker_sandbox',
+        accessMode: 'dangerous',
+        abortSignal: stop.signal
+      })
+
+      expect(Date.now() - started).toBeLessThan(1_500)
+      // A stop, not "sandbox unavailable".
+      expect(result).toMatchObject({
+        success: false,
+        stopped: true,
+        reason: 'The command was stopped.'
+      })
+      expect(result.errorCode).toBeUndefined()
+    } finally {
+      await rm(tempWorkspace, { recursive: true, force: true })
+    }
+  })
+
   it('returns SANDBOX_UNAVAILABLE without falling back when Apple Container execution fails', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-apple-unavailable-'))
     try {
@@ -5805,6 +6569,7 @@ PATCH`
       network: 'batshit-apple-sandbox-internal',
       image: 'bash:5.2',
       policy: 'internal-network',
+      systemRunning: true,
       reason: null,
       installUrl: 'https://github.com/apple/container/releases/latest',
       capabilities: ['status', 'recover', 'execute', 'cleanup']
@@ -5848,338 +6613,420 @@ PATCH`
     expect(warnings).toContain('apple cleanup warning')
   })
 
-  it('reuses one docker sandbox across a session run and cleans it up at run end', async () => {
-    const fakeDockerDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-fake-docker-'))
-    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-sandbox-workspace-'))
-    const stateFile = path.join(fakeDockerDir, 'sandbox-state.txt')
-    const eventLogFile = path.join(fakeDockerDir, 'sandbox-event-log.txt')
-    const fakeDockerPath = path.join(fakeDockerDir, 'docker')
-    const staleSandboxName = 'batshit-josh-stale000'
-    const sessionId = 'session_demo_reuse'
+  // Docker Sandbox runs through Docker's `sbx` CLI. The shared fake plays sbx v0.43.0 as
+  // measured on 2026-09-18 (`tools/docker/test-fixtures/fake-sbx.mjs`).
+  describe('Docker Sandbox through sbx', () => {
+    // Vitest runs from batshit-app; the fixture sits beside the Docker host operator.
+    const FAKE_SBX = path.resolve(process.cwd(), '../tools/docker/test-fixtures/fake-sbx.mjs')
+    let binDir = ''
+    let stateDir = ''
+    let workspace = ''
+    let originalPath: string | undefined
+    let originalState: string | undefined
 
-    const fakeDockerScript = `#!/bin/bash
-set -eu
-STATE_FILE=${JSON.stringify(stateFile)}
-EVENT_LOG=${JSON.stringify(eventLogFile)}
-touch "$STATE_FILE" "$EVENT_LOG"
+    beforeEach(async () => {
+      expect((await stat(FAKE_SBX)).isFile()).toBe(true)
+      binDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-fake-sbx-bin-'))
+      stateDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-fake-sbx-state-'))
+      workspace = await realpath(await mkdtemp(path.join(os.tmpdir(), 'batshit-sbx-workspace-')))
+      await writeFile(
+        path.join(binDir, 'sbx'),
+        `#!/bin/sh\nexec "${process.execPath}" "${FAKE_SBX}" "$@"\n`,
+        'utf8'
+      )
+      await chmod(path.join(binDir, 'sbx'), 0o755)
+      originalPath = process.env.PATH
+      originalState = process.env.FAKE_SBX_STATE
+      process.env.PATH = `${binDir}:${originalPath ?? ''}`
+      process.env.FAKE_SBX_STATE = stateDir
+    })
 
-if [ "\${1:-}" != "sandbox" ]; then
-  echo "unsupported command: \${1:-}" >&2
-  exit 1
-fi
-
-subcommand="\${2:-}"
-shift 2 || true
-
-case "$subcommand" in
-  version)
-    echo "v0.11.0"
-    ;;
-  ls)
-    printf "SANDBOX                     AGENT   STATUS    WORKSPACE\\n"
-    if [ -s "$STATE_FILE" ]; then
-      while IFS='|' read -r name status workspace; do
-        [ -n "$name" ] || continue
-        printf "%s  codex   %s  %s\\n" "$name" "$status" "$workspace"
-      done < "$STATE_FILE"
-    fi
-    ;;
-  create)
-    sandbox_name=""
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--name" ]; then
-        sandbox_name="$2"
-        shift 2
-      else
-        break
-      fi
-    done
-    agent="\${1:-}"
-    workspace="\${2:-}"
-    tmp_file="$STATE_FILE.tmp.$$"
-    if [ -f "$STATE_FILE" ]; then
-      awk -F'|' -v target="$sandbox_name" '$1 != target { print $0 }' "$STATE_FILE" > "$tmp_file"
-    else
-      : > "$tmp_file"
-    fi
-    printf "%s|running|%s\\n" "$sandbox_name" "$workspace" >> "$tmp_file"
-    mv "$tmp_file" "$STATE_FILE"
-    echo "create:$sandbox_name" >> "$EVENT_LOG"
-    ;;
-  network)
-    ;;
-  exec)
-    sandbox_name=""
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --workdir)
-          shift 2
-          ;;
-        --env)
-          shift 2
-          ;;
-        *)
-          sandbox_name="$1"
-          shift
-          break
-          ;;
-      esac
-    done
-    echo "exec:$sandbox_name" >> "$EVENT_LOG"
-    echo "sandbox ok"
-    ;;
-  rm)
-    for sandbox_name in "$@"; do
-      echo "rm:$sandbox_name" >> "$EVENT_LOG"
-      tmp_file="$STATE_FILE.tmp.$$"
-      if [ -f "$STATE_FILE" ]; then
-        awk -F'|' -v target="$sandbox_name" '$1 != target { print $0 }' "$STATE_FILE" > "$tmp_file"
-      else
-        : > "$tmp_file"
-      fi
-      mv "$tmp_file" "$STATE_FILE"
-    done
-    ;;
-  stop)
-    for sandbox_name in "$@"; do
-      tmp_file="$STATE_FILE.tmp.$$"
-      awk -F'|' -v target="$sandbox_name" 'BEGIN { OFS = "|" } { if ($1 == target) $2 = "stopped"; print $0 }' "$STATE_FILE" > "$tmp_file"
-      mv "$tmp_file" "$STATE_FILE"
-    done
-    ;;
-  *)
-    echo "unsupported sandbox subcommand: $subcommand" >&2
-    exit 1
-    ;;
-esac
-`
-
-    await writeFile(stateFile, `${staleSandboxName}|stopped|/tmp/legacy-workspace\n`, 'utf8')
-    await writeFile(eventLogFile, '', 'utf8')
-    await writeFile(fakeDockerPath, fakeDockerScript, 'utf8')
-    await chmod(fakeDockerPath, 0o755)
-
-    const originalPath = process.env.PATH ?? ''
-    const originalSandboxCli = process.env.BATSHIT_DOCKER_SANDBOX_CLI
-    process.env.PATH = `${fakeDockerDir}:${originalPath}`
-    process.env.BATSHIT_DOCKER_SANDBOX_CLI = 'docker-sandbox'
-
-    try {
-      const firstResult = await nativeToolService.nativeBashExecute({
-        userId: 'josh',
-        sessionId,
-        command: 'pwd',
-        cwd: tempWorkspace,
-        workspaceRoot: tempWorkspace,
-        backend: 'docker_sandbox',
-        accessMode: 'dangerous'
-      })
-
-      const secondResult = await nativeToolService.nativeBashExecute({
-        userId: 'josh',
-        sessionId,
-        command: 'pwd',
-        cwd: tempWorkspace,
-        workspaceRoot: tempWorkspace,
-        backend: 'docker_sandbox',
-        accessMode: 'dangerous'
-      })
-
-      expect(firstResult.success).toBe(true)
-      expect(secondResult.success).toBe(true)
-      expect(typeof firstResult.sandboxName).toBe('string')
-      expect(firstResult.sandboxName).toBe(secondResult.sandboxName)
-
-      const eventsBeforeCleanup = (await readFile(eventLogFile, 'utf8'))
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-
-      expect(
-        eventsBeforeCleanup.filter((event) => event === `create:${firstResult.sandboxName}`).length
-      ).toBe(1)
-      expect(
-        eventsBeforeCleanup.filter((event) => event === `exec:${firstResult.sandboxName}`).length
-      ).toBe(2)
-      expect(eventsBeforeCleanup).not.toContain(`rm:${firstResult.sandboxName}`)
-
-      const cleanupWarnings =
-        await nativeToolService.cleanupDockerSandboxesForSession(sessionId)
-      expect(cleanupWarnings).toEqual([])
-
-      const eventsAfterCleanup = (await readFile(eventLogFile, 'utf8'))
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-
-      expect(eventsAfterCleanup).toContain(`rm:${firstResult.sandboxName}`)
-      expect(eventsAfterCleanup).toContain(`rm:${staleSandboxName}`)
-
-      const remainingState = (await readFile(stateFile, 'utf8')).trim()
-      expect(remainingState).toBe('')
-    } finally {
+    afterEach(async () => {
       process.env.PATH = originalPath
-      if (originalSandboxCli === undefined) {
-        delete process.env.BATSHIT_DOCKER_SANDBOX_CLI
-      } else {
-        process.env.BATSHIT_DOCKER_SANDBOX_CLI = originalSandboxCli
+      if (originalState === undefined) delete process.env.FAKE_SBX_STATE
+      else process.env.FAKE_SBX_STATE = originalState
+      delete process.env.FAKE_SBX_CREATE_MS
+      delete process.env.FAKE_SBX_EXEC_MS
+      delete process.env.FAKE_SBX_END_MS
+      delete process.env.FAKE_SBX_CREATED_ELSEWHERE
+      // Programs the fake left "inside" a sandbox, if a test failed before they were ended.
+      for (const file of await readdir(path.join(stateDir, 'inside')).catch(() => [] as string[])) {
+        const pid = Number(await readFile(path.join(stateDir, 'inside', file), 'utf8').catch(() => ''))
+        if (pid > 0) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {}
+        }
       }
-      await rm(fakeDockerDir, { recursive: true, force: true })
-      await rm(tempWorkspace, { recursive: true, force: true })
-    }
-  })
+      await rm(binDir, { recursive: true, force: true })
+      await rm(stateDir, { recursive: true, force: true })
+      await rm(workspace, { recursive: true, force: true })
+    })
 
-  it('prefers standalone sbx for docker sandbox execution when available', async () => {
-    const fakeSbxDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-fake-sbx-'))
-    const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-sbx-workspace-'))
-    const stateFile = path.join(fakeSbxDir, 'sandbox-state.txt')
-    const eventLogFile = path.join(fakeSbxDir, 'sandbox-event-log.txt')
-    const fakeSbxPath = path.join(fakeSbxDir, 'sbx')
-
-    const fakeSbxScript = `#!/bin/bash
-set -eu
-STATE_FILE=${JSON.stringify(stateFile)}
-EVENT_LOG=${JSON.stringify(eventLogFile)}
-touch "$STATE_FILE" "$EVENT_LOG"
-
-command="\${1:-}"
-shift || true
-
-case "$command" in
-  version)
-    echo "sbx v0.99.0"
-    ;;
-  ls)
-    printf "SANDBOX                     AGENT   STATUS    PORTS  WORKSPACE\\n"
-    if [ -s "$STATE_FILE" ]; then
-      while IFS='|' read -r name status workspace; do
-        [ -n "$name" ] || continue
-        printf "%s  codex   %s  -  %s\\n" "$name" "$status" "$workspace"
-      done < "$STATE_FILE"
-    fi
-    ;;
-  create)
-    sandbox_name=""
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--name" ]; then
-        sandbox_name="$2"
-        shift 2
-      else
-        break
-      fi
-    done
-    agent="\${1:-}"
-    workspace="\${2:-}"
-    tmp_file="$STATE_FILE.tmp.$$"
-    if [ -f "$STATE_FILE" ]; then
-      awk -F'|' -v target="$sandbox_name" '$1 != target { print $0 }' "$STATE_FILE" > "$tmp_file"
-    else
-      : > "$tmp_file"
-    fi
-    printf "%s|running|%s\\n" "$sandbox_name" "$workspace" >> "$tmp_file"
-    mv "$tmp_file" "$STATE_FILE"
-    echo "create:$agent:$sandbox_name:$workspace" >> "$EVENT_LOG"
-    ;;
-  policy)
-    if [ "\${1:-}" = "deny" ] && [ "\${2:-}" = "network" ]; then
-      sandbox_name="\${3:-}"
-      resource="\${4:-}"
-      echo "policy-deny:$sandbox_name:$resource" >> "$EVENT_LOG"
-      exit 0
-    fi
-    echo "unsupported policy command" >&2
-    exit 1
-    ;;
-  exec)
-    sandbox_name=""
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --workdir)
-          shift 2
-          ;;
-        --env)
-          shift 2
-          ;;
-        *)
-          sandbox_name="$1"
-          shift
-          break
-          ;;
-      esac
-    done
-    echo "exec:$sandbox_name" >> "$EVENT_LOG"
-    echo "sbx ok"
-    ;;
-  rm)
-    if [ "\${1:-}" = "--force" ]; then
-      shift
-    fi
-    for sandbox_name in "$@"; do
-      echo "rm:$sandbox_name" >> "$EVENT_LOG"
-      tmp_file="$STATE_FILE.tmp.$$"
-      if [ -f "$STATE_FILE" ]; then
-        awk -F'|' -v target="$sandbox_name" '$1 != target { print $0 }' "$STATE_FILE" > "$tmp_file"
-      else
-        : > "$tmp_file"
-      fi
-      mv "$tmp_file" "$STATE_FILE"
-    done
-    ;;
-  stop)
-    for sandbox_name in "$@"; do
-      echo "stop:$sandbox_name" >> "$EVENT_LOG"
-    done
-    ;;
-  *)
-    echo "unsupported sbx command: $command" >&2
-    exit 1
-    ;;
-esac
-`
-
-    await writeFile(stateFile, '', 'utf8')
-    await writeFile(eventLogFile, '', 'utf8')
-    await writeFile(fakeSbxPath, fakeSbxScript, 'utf8')
-    await chmod(fakeSbxPath, 0o755)
-
-    const originalPath = process.env.PATH ?? ''
-    const originalSandboxCli = process.env.BATSHIT_DOCKER_SANDBOX_CLI
-    process.env.PATH = `${fakeSbxDir}:${originalPath}`
-    process.env.BATSHIT_DOCKER_SANDBOX_CLI = 'sbx'
-
-    try {
-      const result = await nativeToolService.nativeBashExecute({
+    const events = async () =>
+      (await readFile(path.join(stateDir, 'events.log'), 'utf8').catch(() => ''))
+        .split('\n')
+        .filter(Boolean)
+    const sandboxNames = async () =>
+      (await readdir(path.join(stateDir, 'sandboxes')).catch(() => [] as string[]))
+        .filter((file) => file.endsWith('.json'))
+        .map((file) => file.replace(/\.json$/, ''))
+        .sort()
+    const bash = (command: string, sessionId?: string) =>
+      nativeToolService.nativeBashExecute({
         userId: 'josh',
-        command: 'pwd',
-        cwd: tempWorkspace,
-        workspaceRoot: tempWorkspace,
+        ...(sessionId ? { sessionId } : {}),
+        command,
+        cwd: workspace,
+        workspaceRoot: workspace,
         backend: 'docker_sandbox',
         accessMode: 'dangerous'
       })
+    const seedSandbox = async (sandbox: { name: string; status: string; lastUsedAt: string }) => {
+      await mkdir(path.join(stateDir, 'sandboxes'), { recursive: true })
+      await writeFile(
+        path.join(stateDir, 'sandboxes', `${sandbox.name}.json`),
+        JSON.stringify({
+          name: sandbox.name,
+          agent: 'shell',
+          status: sandbox.status,
+          last_used_at: sandbox.lastUsedAt,
+          workspaces: ['/tmp/elsewhere'],
+          denyNetwork: ['**']
+        }),
+        'utf8'
+      )
+    }
+
+    // BL-61 (2026-09-21): a status check started Docker's sbx daemon and nothing ever stopped it.
+    // A call whose output says it started the daemon records that, so quitting can stop it.
+    describe('the sbx daemon a call started', () => {
+      let recordDir = ''
+      let originalRecordDir: string | undefined
+      let originalOwner: string | undefined
+
+      beforeEach(async () => {
+        recordDir = await mkdtemp(path.join(os.tmpdir(), 'batshit-sbx-daemon-record-'))
+        originalRecordDir = process.env.BATSHIT_SBX_DAEMON_STATE_DIR
+        originalOwner = process.env.BATSHIT_VOICE_RUNTIME_OWNER
+        process.env.BATSHIT_SBX_DAEMON_STATE_DIR = recordDir
+        process.env.BATSHIT_VOICE_RUNTIME_OWNER = 'mac-app:/tmp/batshit-test-data'
+      })
+
+      afterEach(async () => {
+        if (originalRecordDir === undefined) delete process.env.BATSHIT_SBX_DAEMON_STATE_DIR
+        else process.env.BATSHIT_SBX_DAEMON_STATE_DIR = originalRecordDir
+        if (originalOwner === undefined) delete process.env.BATSHIT_VOICE_RUNTIME_OWNER
+        else process.env.BATSHIT_VOICE_RUNTIME_OWNER = originalOwner
+        delete process.env.FAKE_SBX_STARTS_DAEMON
+        await rm(recordDir, { recursive: true, force: true })
+      })
+
+      it('records which Batshit started it and when that call ran', async () => {
+        process.env.FAKE_SBX_STARTS_DAEMON = '1'
+        const before = Date.now()
+        const status = await nativeToolService.getSandboxBackendStatus()
+        const after = Date.now()
+
+        expect(status.available).toBe(true)
+        const record = JSON.parse(await readFile(path.join(recordDir, '.batshit-sbx-daemon-launch.json'), 'utf8'))
+        expect(record.launchedBy).toBe('mac-app:/tmp/batshit-test-data')
+        const [started, ended] = [Date.parse(record.callStartedAt), Date.parse(record.callEndedAt)]
+        expect(started).toBeGreaterThanOrEqual(before)
+        expect(ended).toBeGreaterThanOrEqual(started)
+        expect(ended).toBeLessThanOrEqual(after)
+      })
+
+      it('writes nothing when no call started it (a daemon the user runs is never recorded)', async () => {
+        const status = await nativeToolService.getSandboxBackendStatus()
+
+        expect(status.available).toBe(true)
+        expect(await readdir(recordDir)).toEqual([])
+      })
+    })
+
+    it('creates a shell sandbox with all network denied, reuses it for the chat, and removes it at run end', async () => {
+      const sessionId = 'session_sbx_reuse'
+      const first = await bash('pwd', sessionId)
+      const second = await bash('ls', sessionId)
+
+      expect([first.reason ?? first.stdout, second.reason ?? second.stdout]).toEqual(['sbx ok\n', 'sbx ok\n'])
+      expect(first.sandboxName).toBe(second.sandboxName)
+      const name = first.sandboxName as string
+      const batshitHome = path.join(os.homedir(), '.batshit')
+      const afterRuns = await events()
+      expect(afterRuns.filter((event) => event.startsWith('create '))).toEqual([
+        `create --name ${name} --deny-network ** shell ${workspace} ${batshitHome}`
+      ])
+      expect(afterRuns).toContain(`policy deny network --sandbox ${name} **`)
+      expect(afterRuns.filter((event) => event.startsWith('exec '))).toHaveLength(2)
+
+      expect(await nativeToolService.cleanupDockerSandboxesForSession(sessionId)).toEqual([])
+      expect(await events()).toContain(`rm --force ${name}`)
+      expect(await sandboxNames()).toEqual([])
+    })
+
+    // A Stop ends a running command (2026-09-18). Each Stop lands once the fake sbx has logged
+    // the step it is in, so it cannot land in the wrong one.
+    const stopWhenLogged = async (prefix: string, stop: AbortController) => {
+      for (let tries = 0; tries < 200; tries += 1) {
+        if ((await events()).some((event) => event.startsWith(prefix))) {
+          stop.abort('user')
+          return Date.now()
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      throw new Error(`the fake sbx never logged "${prefix}"`)
+    }
+    const stoppableBash = (command: string, sessionId: string, stop: AbortController) =>
+      nativeToolService.nativeBashExecute({
+        userId: 'josh',
+        sessionId,
+        command,
+        cwd: workspace,
+        workspaceRoot: workspace,
+        backend: 'docker_sandbox',
+        accessMode: 'dangerous',
+        abortSignal: stop.signal
+      })
+
+    it('a Stop ends a running sbx exec instead of waiting for it', async () => {
+      process.env.FAKE_SBX_EXEC_MS = '5000'
+      const sessionId = 'session_sbx_stop'
+      const stop = new AbortController()
+      const running = stoppableBash('sleep 20', sessionId, stop)
+      const stoppedAt = await stopWhenLogged('exec ', stop)
+
+      const result = await running
+
+      expect(Date.now() - stoppedAt).toBeLessThan(1_500)
+      expect(result).toMatchObject({ success: false, stopped: true })
+      expect(await events()).not.toContain(`exec-done ${result.sandboxName}`)
+      // The chat's sandbox is still removed at run end.
+      await nativeToolService.cleanupDockerSandboxesForSession(sessionId)
+      expect(await sandboxNames()).toEqual([])
+    })
+
+    it('a Stop while the chat’s sandbox starts lets the start finish and never runs the command', async () => {
+      process.env.FAKE_SBX_CREATE_MS = '600'
+      const sessionId = 'session_sbx_stop_starting'
+      const stop = new AbortController()
+      const running = stoppableBash('pwd', sessionId, stop)
+      await stopWhenLogged('create ', stop)
+
+      const result = await running
+
+      expect(result).toMatchObject({ success: false, stopped: true })
+      const all = await events()
+      expect(all.filter((event) => event.startsWith('exec '))).toEqual([])
+      // The sandbox it started is the chat's, and goes at run end like any other.
+      expect(await sandboxNames()).toHaveLength(1)
+      await nativeToolService.cleanupDockerSandboxesForSession(sessionId)
+      expect(await sandboxNames()).toEqual([])
+    })
+
+    // A Stop or timeout also ends what the command left running INSIDE the sandbox (2026-09-18).
+    // Real sbx does neither on its own: measured, the whole command ran on inside after its
+    // client was killed, and the client itself exited 28.9 s after its SIGTERM. The fake plays
+    // the command's program inside as a real process (`inside/<tag>.pid`).
+    const insidePrograms = async () =>
+      (await readdir(path.join(stateDir, 'inside')).catch(() => [] as string[])).filter((file) =>
+        file.endsWith('.pid')
+      )
+    const whenInsideRuns = async () => {
+      for (let tries = 0; tries < 200; tries += 1) {
+        const [file] = await insidePrograms()
+        if (file) {
+          const pid = Number(await readFile(path.join(stateDir, 'inside', file), 'utf8'))
+          return { tag: file.replace(/\.pid$/, ''), pid }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      throw new Error('the fake sbx never started the command inside its sandbox')
+    }
+    const isRunning = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM'
+      }
+    }
+    const goneWithin = async (pid: number, ms: number) => {
+      const deadline = Date.now() + ms
+      while (Date.now() < deadline && isRunning(pid)) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      return !isRunning(pid)
+    }
+
+    it('a Stop ends what the command left running inside the sandbox, before its result comes back', async () => {
+      process.env.FAKE_SBX_EXEC_MS = '5000'
+      // Longer than the client's 400 ms to its SIGKILL, so the result must wait for the end.
+      process.env.FAKE_SBX_END_MS = '800'
+      const stop = new AbortController()
+      const running = stoppableBash('sleep 20', 'session_sbx_stop_inside', stop)
+      const inside = await whenInsideRuns()
+      const stoppedAt = Date.now()
+      stop.abort('user')
+
+      const result = await running
+
+      expect(Date.now() - stoppedAt).toBeLessThan(2_000)
+      expect(result).toMatchObject({ success: false, stopped: true })
+      const all = await events()
+      // The command carried its tag, and the end ran in the same sandbox with that tag, and was
+      // done before the result.
+      expect(all.some((event) => event.startsWith('exec ') && event.includes(`BATSHIT_COMMAND_ID=${inside.tag}`))).toBe(true)
+      expect(all).toContain(`end-done ${result.sandboxName} ${inside.tag}`)
+      expect(await goneWithin(inside.pid, 1_000)).toBe(true)
+    })
+
+    it('a timeout ends what the command left running inside the sandbox, the same way', async () => {
+      process.env.FAKE_SBX_EXEC_MS = '5000'
+      const started = Date.now()
+      const running = nativeToolService.nativeBashExecute({
+        userId: 'josh',
+        sessionId: 'session_sbx_timeout_inside',
+        command: 'sleep 20',
+        cwd: workspace,
+        workspaceRoot: workspace,
+        backend: 'docker_sandbox',
+        accessMode: 'dangerous',
+        timeoutMs: 1_000
+      })
+      const inside = await whenInsideRuns()
+
+      const result = await running
+
+      expect(Date.now() - started).toBeLessThan(3_000)
+      expect(result).toMatchObject({ success: false, timedOut: true })
+      expect(await events()).toContain(`end ${result.sandboxName} ${inside.tag}`)
+      expect(await goneWithin(inside.pid, 1_000)).toBe(true)
+    })
+
+    it('a command that finishes by itself needs no end command', async () => {
+      process.env.FAKE_SBX_EXEC_MS = '200'
+      const result = await bash('sleep 0.2', 'session_sbx_finishes')
+
+      expect(result).toMatchObject({ success: true })
+      expect((await events()).some((event) => event.startsWith('end '))).toBe(false)
+    })
+
+    it('reuses a sandbox sbx stopped while idle instead of replacing it', async () => {
+      const sessionId = 'session_sbx_idle'
+      const first = await bash('pwd', sessionId)
+      const name = first.sandboxName as string
+      // sbx stops a sandbox about 30 s after its last command; `exec` starts it again.
+      execFileSync(path.join(binDir, 'sbx'), ['stop', name], { env: process.env })
+
+      const second = await bash('ls', sessionId)
+
+      expect(second.success).toBe(true)
+      expect(second.sandboxName).toBe(name)
+      const all = await events()
+      expect(all.filter((event) => event.startsWith('create '))).toHaveLength(1)
+      expect(all.filter((event) => event.startsWith('rm '))).toEqual([])
+    })
+
+    it('removes a one-shot sandbox as soon as its command ends', async () => {
+      const result = await bash('pwd')
 
       expect(result.success).toBe(true)
-      expect(result.stdout).toContain('sbx ok')
-      expect(typeof result.sandboxName).toBe('string')
+      expect(await events()).toContain(`rm --force ${result.sandboxName}`)
+      expect(await sandboxNames()).toEqual([])
+    })
 
-      const events = (await readFile(eventLogFile, 'utf8'))
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
+    it('prunes only Batshit sandboxes left unused for an hour, never a chat’s idle one', async () => {
+      const hoursAgo = (hours: number) => new Date(Date.now() - hours * 3_600_000).toISOString()
+      await seedSandbox({ name: 'batshit-josh-sdeadbeef-0000000001', status: 'stopped', lastUsedAt: hoursAgo(2) })
+      await seedSandbox({ name: 'batshit-josh-sfeedface-0000000002', status: 'stopped', lastUsedAt: hoursAgo(0.02) })
+      await seedSandbox({ name: 'someone-elses-sandbox', status: 'stopped', lastUsedAt: hoursAgo(5) })
 
-      expect(events).toContain(`create:codex:${result.sandboxName}:${result.workspaceRoot}`)
-      expect(events).toContain(`policy-deny:${result.sandboxName}:**`)
-      expect(events).toContain(`exec:${result.sandboxName}`)
-      expect(events).toContain(`rm:${result.sandboxName}`)
-    } finally {
-      process.env.PATH = originalPath
-      if (originalSandboxCli === undefined) {
-        delete process.env.BATSHIT_DOCKER_SANDBOX_CLI
-      } else {
-        process.env.BATSHIT_DOCKER_SANDBOX_CLI = originalSandboxCli
-      }
-      await rm(fakeSbxDir, { recursive: true, force: true })
-      await rm(tempWorkspace, { recursive: true, force: true })
-    }
+      const result = await bash('pwd')
+
+      expect(result.success).toBe(true)
+      const removals = (await events()).filter((event) => event.startsWith('rm '))
+      expect(removals).toEqual([
+        `rm --force ${result.sandboxName}`,
+        'rm --force batshit-josh-sdeadbeef-0000000001'
+      ])
+      expect(await sandboxNames()).toEqual(['batshit-josh-sfeedface-0000000002', 'someone-elses-sandbox'])
+    })
+
+    // F-P5-1: the API lane runs one step's bash calls in parallel.
+    it('creates a chat sandbox once when its first bash calls arrive together', async () => {
+      process.env.FAKE_SBX_CREATE_MS = '300'
+      const results = await Promise.all(
+        ['pwd', 'ls', 'git status'].map((command) => bash(command, 'session_parallel_first_calls'))
+      )
+
+      expect(results.map((result) => result.reason ?? result.stdout)).toEqual(['sbx ok\n', 'sbx ok\n', 'sbx ok\n'])
+      const name = results[0].sandboxName
+      expect(results.map((result) => result.sandboxName)).toEqual([name, name, name])
+      const all = await events()
+      expect(all.filter((event) => event.startsWith('create '))).toHaveLength(1)
+      expect(all.filter((event) => event.startsWith(`exec `))).toHaveLength(3)
+      expect(all.filter((event) => event.startsWith('rm '))).toEqual([])
+    })
+
+    it('uses a sandbox another process created between the list and the create', async () => {
+      const sessionId = 'session_sbx_created_elsewhere'
+      const name = buildSbxSandboxName({ userId: 'josh', workspaceRoot: workspace, sessionId })
+      process.env.FAKE_SBX_CREATED_ELSEWHERE = name
+
+      const result = await bash('pwd', sessionId)
+
+      expect(result.reason ?? result.stdout).toBe('sbx ok\n')
+      expect(result.sandboxName).toBe(name)
+      expect((await events()).filter((event) => event.startsWith('create '))).toHaveLength(1)
+    })
+
+    it('says to sign in, or to run the one-time network setup, instead of failing vaguely', async () => {
+      await writeFile(path.join(stateDir, '.not-signed-in'), '')
+      const signedOut = await bash('pwd', 'session_sbx_setup')
+      expect(signedOut.success).toBe(false)
+      expect(signedOut.errorCode).toBe('SANDBOX_UNAVAILABLE')
+      expect(signedOut.reason).toContain('Run `sbx login`')
+
+      await rm(path.join(stateDir, '.not-signed-in'))
+      await writeFile(path.join(stateDir, '.policy-not-initialized'), '')
+      const noPreset = await bash('pwd', 'session_sbx_setup')
+      expect(noPreset.success).toBe(false)
+      expect(noPreset.reason).toContain('Run `sbx policy init balanced`')
+    })
+
+    it('reports whether sbx is ready in the Docker Sandbox status', async () => {
+      const ready = await nativeToolService.getSandboxBackendStatus()
+      expect(ready).toMatchObject({ available: true, cli: 'sbx', version: 'sbx version: v0.43.0-fake', reason: null })
+
+      await writeFile(path.join(stateDir, '.not-signed-in'), '')
+      const signedOut = await nativeToolService.getSandboxBackendStatus()
+      expect(signedOut.available).toBe(false)
+      expect(signedOut.reason).toContain('Run `sbx login`')
+
+      await rm(path.join(stateDir, '.not-signed-in'))
+      await writeFile(path.join(stateDir, '.policy-not-initialized'), '')
+      const noPreset = await nativeToolService.getSandboxBackendStatus()
+      expect(noPreset.available).toBe(false)
+      expect(noPreset.reason).toContain('Run `sbx policy init balanced`')
+    })
+
+    it('runs no sbx command at run end for a chat that never used Docker Sandbox', async () => {
+      expect(await nativeToolService.cleanupDockerSandboxesForSession('session_apple_only')).toEqual([])
+      expect(await events()).toEqual([])
+    })
+
+    it('has nothing to clean, and no warning, when sbx has gone missing', async () => {
+      const sessionId = 'session_sbx_removed'
+      expect((await bash('pwd', sessionId)).success).toBe(true)
+      process.env.PATH = path.dirname(process.execPath)
+
+      expect(await nativeToolService.cleanupDockerSandboxesForSession(sessionId)).toEqual([])
+      const status = await nativeToolService.getSandboxBackendStatus()
+      expect(status.available).toBe(false)
+      expect(status.reason).toContain('brew install docker/tap/sbx')
+    })
   })
 
   it('blocks non-allowlisted automation commands in Agent mode', async () => {
@@ -6211,10 +7058,10 @@ esac
     expect(result.error?.message).toMatch(/agent mode policy/i)
   })
 
-  it('auto-allows setup-wrapped heredoc writes in Agent mode automation dispatch', async () => {
+  it('requires an explicit allow-list entry for shell writes in Agent mode automation dispatch', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-dispatch-agent-write-'))
     try {
-      const targetFile = path.join(tempWorkspace, 'notes.txt')
+      const targetFile = path.join(tempWorkspace, 'notes', 'notes.txt')
       vi.mocked(redis.getProjectPreferences).mockResolvedValue({
         default_workspace_path: tempWorkspace
       } as any)
@@ -6230,13 +7077,13 @@ esac
       } as any)
 
       const command = `set -euo pipefail
-mkdir -p ${tempWorkspace}
-cat > ${targetFile} <<'EOF'
+mkdir -p notes
+cat > notes/notes.txt <<'EOF'
 alpha
 beta
 gamma
 EOF
-wc -l ${targetFile}`
+wc -l notes/notes.txt`
 
       const result = await nativeToolService.dispatchNativeAutomationPackAction({
         userId: 'josh',
@@ -6250,11 +7097,10 @@ wc -l ${targetFile}`
         }
       })
 
-      expect(result.success).toBe(true)
-      expect(result.error).toBeUndefined()
-      expect(result.data?.mappedToolName).toBe('batshit_server_overwrite_file')
-      expect(result.data?.mappedToolInput?.filePath).toBe(targetFile)
-      expect(await readFile(targetFile, 'utf8')).toBe('alpha\nbeta\ngamma\n')
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('POLICY_BLOCKED')
+      expect(result.error?.message).toMatch(/agent mode policy/i)
+      await expect(stat(targetFile)).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await rm(tempWorkspace, { recursive: true, force: true })
     }
@@ -6312,7 +7158,7 @@ PATCH`
     }
   })
 
-  it('auto-allows in-place edits even when a verification heredoc follows in Agent mode automation dispatch', async () => {
+  it('blocks a mapped edit followed by an ambiguous interpreter heredoc in Agent mode automation dispatch', async () => {
     const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-dispatch-agent-edit-verify-'))
     try {
       const targetFile = path.join(tempWorkspace, 'notes.txt')
@@ -6350,15 +7196,80 @@ PY`
         }
       })
 
-      expect(result.success).toBe(true)
-      expect(result.error).toBeUndefined()
-      expect(result.data?.mappedToolName).toBe('batshit_server_edit_file')
-      expect(result.data?.before).toBe('alpha\nbeta\ngamma\n')
-      expect(result.data?.after).toBe('alpha\nbravo\ngamma\n')
-      expect(await readFile(targetFile, 'utf8')).toBe('alpha\nbravo\ngamma\n')
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('POLICY_BLOCKED')
+      expect(result.error?.message).toMatch(/agent mode policy/i)
+      expect(await readFile(targetFile, 'utf8')).toBe('alpha\nbeta\ngamma\n')
     } finally {
       await rm(tempWorkspace, { recursive: true, force: true })
     }
+  })
+
+  // The edit's two copies used to ride on this result, so the model read both in its loop (and
+  // every later call in the run sent them again), with the n8n dispatch, the SSE event, and the
+  // Execution Viewer carrying them too. Only their diff leaves `nativeBashExecute` now.
+  describe('an in-place edit reports its diff, never the copies it was built from', () => {
+    async function runEdit(initial: string, command: (file: string) => string) {
+      const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), 'batshit-bash-edit-diff-'))
+      const targetFile = path.join(tempWorkspace, 'notes.txt')
+      await writeFile(targetFile, initial, 'utf8')
+      vi.mocked(redis.getProjectPreferences).mockResolvedValue({ default_workspace_path: tempWorkspace } as any)
+      vi.mocked(redis.get).mockResolvedValue({
+        user_id: 'josh',
+        provider_specific_settings: {
+          nativeTools: { bashEnabled: true, executionBackend: 'local', bashAccessMode: 'dangerous' }
+        }
+      } as any)
+      try {
+        const result = await nativeToolService.dispatchNativeAutomationPackAction({
+          userId: 'josh',
+          action: 'bash_execute',
+          payloadInput: { command: command(targetFile) },
+          context: { session_id: 'session_edit_diff', agent_id: 'agent_primary', mode: 'mode1', actor_type: 'primary' }
+        })
+        return { data: result.data, targetFile }
+      } finally {
+        await rm(tempWorkspace, { recursive: true, force: true })
+      }
+    }
+
+    it('reports the changed lines', async () => {
+      const { data } = await runEdit('alpha\nbeta\n', (file) => `perl -pi -e 's/^beta$/bravo/' ${file}`)
+
+      expect(data?.diff).toBe('--- Before\n+++ After\n    1 | alpha\n-   2 | beta\n+   2 | bravo\n    3 | ')
+      expect(data).not.toHaveProperty('before')
+      expect(data).not.toHaveProperty('after')
+    })
+
+    it('says when the command left the file as it was', async () => {
+      const { data, targetFile } = await runEdit('alpha\nbeta\n', (file) => `perl -pi -e 's/^zzz$/yyy/' ${file}`)
+
+      expect(data?.diff).toBe(`No changes: the command left ${targetFile} exactly as it was.`)
+    })
+
+    // An empty file read as "no copy", so these edits kept saying "Diff unavailable".
+    it('still has a diff when the edit fills an empty file or empties one', async () => {
+      const filled = await runEdit(
+        '',
+        (file) =>
+          `python3 - <<'PY'\nfrom pathlib import Path\np = Path('${file}')\np.write_text(p.read_text() + 'hello\\n')\nPY`
+      )
+      const emptied = await runEdit('alpha\nbeta\n', (file) => `perl -0pi -e 's/.*//s' ${file}`)
+
+      expect(filled.data?.diff).toBe('--- Before\n+++ After\n+   1 | hello\n    1 | ')
+      expect(emptied.data?.diff).toBe('--- Before\n+++ After\n-   1 | alpha\n-   2 | beta\n    3 | ')
+    })
+
+    it('takes no copies of a file a patch edits: the patch is the diff', async () => {
+      const { data } = await runEdit(
+        'alpha\n',
+        (file) => `apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: ${file}\n@@\n-alpha\n+beta\n*** End Patch\nPATCH`
+      )
+
+      expect(data?.managedApplyPatch?.managed).toBe(true)
+      expect(data).not.toHaveProperty('diff')
+      expect(data).not.toHaveProperty('before')
+    })
   })
 
   it('applies subagent native overrides while inheriting backend from the parent primary agent', async () => {
@@ -7416,6 +8327,7 @@ PY`
     expect(executeSkillRuntimeAction).toHaveBeenCalledWith({
       userId: 'josh',
       skillId: 'skill-alpha',
+      actor: { kind: 'agent', agentId: 'agent_main' },
       action: 'invoke',
       path: undefined,
       maxChars: undefined
@@ -7429,6 +8341,253 @@ PY`
     expect(modelOutput?.type).toBe('text')
     expect(String(modelOutput?.value || '')).toContain('SKILL')
     expect(String(modelOutput?.value || '')).toContain('native_skill')
+  })
+
+  describe('native_skill names who is asking (BL-75)', () => {
+    const skillOnlySettings = {
+      nativeTools: {
+        fetchZipEnabled: false,
+        dynamicMcpEnabled: false,
+        batshitToolsEnabled: false,
+        webSearchEnabled: false,
+        bashEnabled: false
+      }
+    }
+
+    function refusal(action = 'invoke') {
+      return {
+        success: false,
+        action,
+        error: 'Skill "Skill Alpha" (skill_alpha) is not enabled for this agent, so it cannot be loaded.',
+        errorCode: 'SKILL_NOT_ENABLED',
+        blocked: true,
+        skillId: 'skill_alpha'
+      } as any
+    }
+
+    it('checks an API Subagent or Worker run against its own scope, not the parent', async () => {
+      vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
+      vi.mocked(resolveSkillRuntimeForTool).mockResolvedValue({
+        runtime: null,
+        error: 'refused',
+        errorCode: 'SKILL_NOT_ENABLED',
+        blocked: true,
+        skillId: 'skill_alpha'
+      } as any)
+
+      const { tools } = await nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        sessionId: 'session_skill',
+        agentId: 'agent_parent',
+        scopeAgentId: 'research_bot',
+        providerSettings: skillOnlySettings,
+        toolApprovalMode: 'none'
+      } as any)
+
+      const invoke = await (tools as any).native_skill.execute({ skillId: 'skill_alpha', action: 'invoke' })
+      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
+        expect.objectContaining({ actor: { kind: 'agent', agentId: 'research_bot', delegated: true } })
+      )
+      expect(invoke).toEqual(expect.objectContaining({ success: false, blocked: true }))
+
+      // The script actions pass the same gate, with the same actor.
+      const scripts = await (tools as any).native_skill.execute({
+        skillId: 'skill_alpha',
+        action: 'script_list'
+      })
+      expect(resolveSkillRuntimeForTool).toHaveBeenLastCalledWith('josh', 'skill_alpha', {
+        kind: 'agent',
+        agentId: 'research_bot',
+        delegated: true
+      })
+      expect(scripts).toEqual(
+        expect.objectContaining({ success: false, blocked: true, errorCode: 'SKILL_NOT_ENABLED' })
+      )
+    })
+
+    it('gives a run with no agent no skill access', async () => {
+      vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
+
+      const { tools } = await nativeToolService.buildMode3NativeTools({
+        userId: 'josh',
+        sessionId: 'session_skill',
+        providerSettings: skillOnlySettings,
+        toolApprovalMode: 'none'
+      } as any)
+
+      await (tools as any).native_skill.execute({ skillId: 'skill_alpha', action: 'invoke' })
+      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
+        expect.objectContaining({ actor: { kind: 'none', lane: 'in-process' } })
+      )
+    })
+
+    function mockPrimaryAndSubagent(subagentOwner: string | null) {
+      vi.mocked(redis.get).mockImplementation(async (key: string) => {
+        if (key === 'agent:agent_parent' || key === 'agent:agent_primary') {
+          return { user_id: 'josh', provider_specific_settings: {} } as any
+        }
+        return null as any
+      })
+      vi.mocked(redis.json.get).mockImplementation(async (key: string) => {
+        if (key === 'subagent:research_bot' && subagentOwner) {
+          return { id: 'research_bot', user_id: subagentOwner } as any
+        }
+        return null as any
+      })
+    }
+
+    async function dispatchSkill(options: {
+      actorType?: any
+      delegatedRun?: boolean
+      scopeAgentId?: string | null
+      context: Record<string, unknown>
+    }) {
+      return nativeToolService.dispatchNativeAutomationPackAction({
+        userId: 'josh',
+        action: 'native_skill',
+        payloadInput: { skillId: 'skill_alpha', action: 'invoke' },
+        context: { session_id: 'session_demo', mode: 'mode1', ...options.context },
+        actorType: options.actorType,
+        delegatedRun: options.delegatedRun,
+        scopeAgentId: options.scopeAgentId
+      })
+    }
+
+    const primaryContext = { agent_id: 'agent_primary', actor_type: 'primary' }
+    const subagentContext = {
+      agent_id: 'research_bot',
+      actor_type: 'subagent',
+      parent_agent_id: 'agent_parent'
+    }
+
+    it.each(['service', 'portable-skill', 'unknown', undefined])(
+      'gives the %s dispatch lane no agent identity',
+      async (lane) => {
+        mockPrimaryAndSubagent('josh')
+        vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
+
+        await dispatchSkill({ actorType: lane, context: primaryContext })
+
+        expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
+          expect.objectContaining({ actor: { kind: 'none', lane: lane ?? 'unknown' } })
+        )
+      }
+    )
+
+    it('uses the run credential on the agent lane, and a delegated run\'s scope', async () => {
+      mockPrimaryAndSubagent('josh')
+      vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
+
+      await dispatchSkill({ actorType: 'agent', context: primaryContext })
+      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
+        expect.objectContaining({ actor: { kind: 'agent', agentId: 'agent_primary', delegated: false } })
+      )
+
+      await dispatchSkill({
+        actorType: 'agent',
+        delegatedRun: true,
+        scopeAgentId: 'research_bot',
+        context: primaryContext
+      })
+      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
+        expect.objectContaining({ actor: { kind: 'agent', agentId: 'research_bot', delegated: true } })
+      )
+    })
+
+    it('never lets an agent-lane context claim a subagent\'s skills', async () => {
+      mockPrimaryAndSubagent('josh')
+      vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
+
+      await dispatchSkill({ actorType: 'agent', context: subagentContext })
+
+      // The governing field (the parent) is the credential's; the claimed subagent is ignored.
+      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
+        expect.objectContaining({ actor: { kind: 'agent', agentId: 'agent_parent', delegated: false } })
+      )
+    })
+
+    it('checks an n8n Workflow Subagent against its own list', async () => {
+      mockPrimaryAndSubagent('josh')
+      vi.mocked(executeSkillRuntimeAction).mockResolvedValue(refusal())
+
+      const result = await dispatchSkill({ actorType: 'n8n-callback', context: subagentContext })
+
+      expect(executeSkillRuntimeAction).toHaveBeenLastCalledWith(
+        expect.objectContaining({ actor: { kind: 'agent', agentId: 'research_bot', delegated: true } })
+      )
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('POLICY_BLOCKED')
+      expect(result.error?.message).toContain('is not enabled for this agent')
+      // The gate's own code survives for a workflow to read.
+      expect(result.error?.details).toEqual({ skillErrorCode: 'SKILL_NOT_ENABLED' })
+    })
+
+    it('refuses an n8n call that presents itself as the parent agent', async () => {
+      mockPrimaryAndSubagent('josh')
+
+      const result = await dispatchSkill({
+        actorType: 'n8n-callback',
+        context: { agent_id: 'agent_parent', actor_type: 'primary' }
+      })
+
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('INVALID_CONTEXT')
+      expect(result.error?.message).toContain('only as a Workflow Subagent')
+      expect(executeSkillRuntimeAction).not.toHaveBeenCalled()
+    })
+
+    it('asks no approval for a script the access gate will refuse, and asks for one it allows', async () => {
+      const commands: Record<string, any> = {
+        'slash_command:josh:skill_alpha': {
+          id: 'skill_alpha',
+          type: 'skill',
+          skill_id: 'skill_alpha',
+          is_active: true,
+          enabled_for_all_agents: false,
+          enabled_agent_ids: ['agent_main']
+        }
+      }
+      ;(redis as any).keys = vi.fn(async () => Object.keys(commands))
+      vi.mocked(redis.json.get).mockImplementation(async (key: string) => commands[key] ?? null)
+      try {
+        const { toolApprovals } = await nativeToolService.buildMode3NativeTools({
+          userId: 'josh',
+          sessionId: 'session_skill',
+          agentId: 'agent_main',
+          providerSettings: {
+            nativeTools: { bashEnabled: true, bashAccessMode: 'agent', executionBackend: 'local' }
+          },
+          toolApprovalMode: 'all'
+        } as any)
+
+        const allowed = await (toolApprovals as any).native_skill({
+          skillId: 'skill_alpha',
+          action: 'script_run',
+          path: 'scripts/run.sh'
+        })
+        expect(allowed).toBe('user-approval')
+
+        commands['slash_command:josh:skill_alpha'].enabled_agent_ids = ['someone_else']
+        const refused = await (toolApprovals as any).native_skill({
+          skillId: 'skill_alpha',
+          action: 'script_run',
+          path: 'scripts/run.sh'
+        })
+        expect(refused).toBeUndefined()
+      } finally {
+        delete (redis as any).keys
+      }
+    })
+
+    it('refuses a subagent context that names a subagent the user does not own', async () => {
+      mockPrimaryAndSubagent('someone_else')
+
+      const result = await dispatchSkill({ actorType: 'n8n-callback', context: subagentContext })
+
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('INVALID_CONTEXT')
+      expect(executeSkillRuntimeAction).not.toHaveBeenCalled()
+    })
   })
 
   it('supports on-demand skill reference listing and reads by skillId', async () => {
@@ -7459,7 +8618,7 @@ PY`
       originalChars: 10
     })
     vi.mocked(executeSkillRuntimeAction).mockImplementation(async (input: any) => {
-      const runtimeResult = await resolveSkillRuntimeForTool('josh', input.skillId)
+      const runtimeResult = await resolveSkillRuntimeForTool('josh', input.skillId, input.actor)
       if (!runtimeResult.runtime) {
         return {
           success: false,
@@ -7602,6 +8761,96 @@ PY`
     expect(runResult.success).toBe(true)
     expect(buildSkillScriptCommand).toHaveBeenCalledWith('/tmp/skill-alpha/scripts/run.sh', ['--demo'])
     expect(runResult.execution?.stdout).toContain('skill-script-ok')
+  })
+
+  it('a Stop ends a running skill script (2026-09-18)', async () => {
+    vi.mocked(resolveSkillRuntimeForTool).mockResolvedValue({
+      runtime: {
+        skill: { id: 'skill-alpha', name: 'skill-alpha', displayName: 'Skill Alpha' },
+        cacheDir: '/tmp/skill-alpha',
+        bundleFiles: [
+          {
+            path: 'scripts/run.sh',
+            kind: 'script',
+            encoding: 'utf8',
+            content: 'sleep 5',
+            sha256: 'abc',
+            size: 7
+          }
+        ]
+      },
+      error: null
+    } as any)
+    vi.mocked(resolveBundleFileAbsolutePath).mockReturnValue('/tmp/skill-alpha/scripts/run.sh')
+    vi.mocked(buildSkillScriptCommand).mockReturnValue('sleep 5')
+
+    const { tools } = await nativeToolService.buildMode3NativeTools({
+      userId: 'josh',
+      sessionId: 'session_skill_stop',
+      agentId: 'agent_main',
+      projectPath: process.cwd(),
+      providerSettings: {
+        nativeTools: {
+          fetchZipEnabled: false,
+          dynamicMcpEnabled: false,
+          batshitToolsEnabled: false,
+          webSearchEnabled: false,
+          bashEnabled: true,
+          executionBackend: 'local',
+          bashAccessMode: 'dangerous'
+        }
+      },
+      toolApprovalMode: 'none'
+    } as any)
+    const stop = new AbortController()
+    setTimeout(() => stop.abort('user'), 150)
+    const started = Date.now()
+
+    const runResult = await (tools as any).native_skill.execute(
+      { skillId: 'skill-alpha', action: 'script_run', path: 'scripts/run.sh' },
+      { abortSignal: stop.signal, toolCallId: 'call_skill_stop', messages: [] }
+    )
+
+    expect(Date.now() - started).toBeLessThan(1_500)
+    expect(runResult.runSucceeded).toBe(false)
+    expect(runResult.execution).toMatchObject({ success: false, stopped: true })
+  })
+
+  it('a Stop reaches a skill script run through the dispatch (n8n Workflow Subagents), 2026-09-18', async () => {
+    vi.mocked(resolveSkillRuntimeForTool).mockResolvedValue({
+      runtime: {
+        skill: { id: 'skill-alpha', name: 'skill-alpha', displayName: 'Skill Alpha' },
+        cacheDir: '/tmp/skill-alpha',
+        bundleFiles: [
+          { path: 'scripts/run.sh', kind: 'script', encoding: 'utf8', content: 'sleep 5', sha256: 'abc', size: 7 }
+        ]
+      },
+      error: null
+    } as any)
+    vi.mocked(resolveBundleFileAbsolutePath).mockReturnValue('/tmp/skill-alpha/scripts/run.sh')
+    vi.mocked(buildSkillScriptCommand).mockReturnValue('sleep 5')
+    vi.mocked(redis.get).mockResolvedValue({
+      user_id: 'josh',
+      provider_specific_settings: {
+        nativeTools: { bashEnabled: true, executionBackend: 'local', bashAccessMode: 'dangerous' }
+      }
+    } as any)
+    const stop = new AbortController()
+    setTimeout(() => stop.abort('user'), 150)
+    const started = Date.now()
+
+    const result = await nativeToolService.dispatchNativeAutomationPackAction({
+      userId: 'josh',
+      action: 'native_skill',
+      payloadInput: { skillId: 'skill-alpha', action: 'script_run', path: 'scripts/run.sh' },
+      context: { session_id: 'session_skill_dispatch_stop', agent_id: 'agent_main', mode: 'mode2', actor_type: 'primary' },
+      projectPath: process.cwd(),
+      abortSignal: stop.signal
+    } as any)
+
+    expect(Date.now() - started).toBeLessThan(1_500)
+    expect(result.success).toBe(true)
+    expect((result as any).data).toMatchObject({ runSucceeded: false, execution: { success: false, stopped: true } })
   })
 
   it('blocks skill script run when native bash is disabled', async () => {

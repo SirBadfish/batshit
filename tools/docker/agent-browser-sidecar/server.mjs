@@ -14,6 +14,11 @@ const BROWSER_ARGS = process.env.AGENT_BROWSER_ARGS || null
 const MAX_BODY_CHARS = 64_000
 const DEFAULT_TIMEOUT_MS = 45_000
 const MAX_TIMEOUT_MS = 120_000
+// What a run does, read by the app from /health (2026-09-18). 2: a run keeps the time limit the
+// app sends (1 s to 120 s), and ends its CLI call, never the daemon, when the app's request goes
+// before the answer (a Stop). The app hands the Stop to a sidecar that reports 2 or more; an
+// older one ran every call for 45 s and ran on after a Stop, so Batshit keeps waiting for it.
+const SIDECAR_REVISION = 2
 const DEFAULT_MAX_OUTPUT_CHARS = 200_000
 const ABSOLUTE_MAX_OUTPUT_CHARS = 400_000
 const ALLOWED_ENV_KEYS = new Set([
@@ -113,6 +118,23 @@ function runAgentBrowser(args, options = {}) {
     ABSOLUTE_MAX_OUTPUT_CHARS
   )
   const startedAt = Date.now()
+  const signal = options.signal
+
+  // The app went before this call started: it never runs.
+  if (signal?.aborted) {
+    return Promise.resolve({
+      command: 'agent-browser',
+      args,
+      stdout: '',
+      stderr: '',
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      stopped: true,
+      durationMs: 0,
+      truncated: false
+    })
+  }
 
   return new Promise((resolve) => {
     const child = spawn('agent-browser', args, {
@@ -129,11 +151,41 @@ function runAgentBrowser(args, options = {}) {
     let stderr = ''
     let truncated = false
     let timedOut = false
+    let stopped = false
+    let ending = false
+    let settled = false
+
+    // The time limit and the app hanging up end the call the same way: SIGTERM, then SIGKILL
+    // 400 ms later, to the CLI process ALONE. The daemon it starts once leaves its process group
+    // and is long-lived by design, so it is never signalled. Output still held after that is let go.
+    const end = () => {
+      if (ending || settled) return
+      ending = true
+      child.kill('SIGTERM')
+      setTimeout(() => {
+        child.kill('SIGKILL')
+        child.stdout.destroy()
+        child.stderr.destroy()
+      }, 400).unref()
+    }
+
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGTERM')
-      setTimeout(() => child.kill('SIGKILL'), 400).unref()
+      end()
     }, timeoutMs)
+
+    const onAbort = () => {
+      if (settled) return
+      stopped = true
+      end()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    const finish = () => {
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
 
     child.stdout.on('data', (chunk) => {
       const next = appendWithLimit(stdout, chunk, maxOutputChars)
@@ -148,7 +200,8 @@ function runAgentBrowser(args, options = {}) {
     })
 
     child.on('error', (error) => {
-      clearTimeout(timer)
+      if (settled) return
+      finish()
       resolve({
         command: 'agent-browser',
         args,
@@ -163,16 +216,18 @@ function runAgentBrowser(args, options = {}) {
       })
     })
 
-    child.on('close', (exitCode, signal) => {
-      clearTimeout(timer)
+    child.on('close', (exitCode, exitSignal) => {
+      if (settled) return
+      finish()
       resolve({
         command: 'agent-browser',
         args,
         stdout,
         stderr,
         exitCode,
-        signal,
+        signal: exitSignal,
         timedOut,
+        ...(stopped ? { stopped: true } : {}),
         durationMs: Date.now() - startedAt,
         truncated
       })
@@ -190,6 +245,7 @@ async function handleHealth(_req, res) {
     ok: run.exitCode === 0,
     service: 'batshit-agent-browser-sidecar',
     mode: 'docker-sidecar',
+    sidecarRevision: SIDECAR_REVISION,
     version: versionOutput,
     tmpDir: TMP_DIR,
     browserExecutablePath: BROWSER_EXECUTABLE_PATH,
@@ -205,6 +261,15 @@ async function handleRun(req, res) {
     return
   }
 
+  // The app ends its request when a Stop reaches the reply (2026-09-18). Only the response closing
+  // before it was answered says so: `req`'s own `close` fires once the body is read. Listened for
+  // from the start, so a call the app has already left never starts.
+  const hungUp = new AbortController()
+  const onClose = () => {
+    if (!res.writableFinished) hungUp.abort()
+  }
+  res.on('close', onClose)
+
   let body
   try {
     body = await readJsonBody(req)
@@ -212,8 +277,13 @@ async function handleRun(req, res) {
     const run = await runAgentBrowser(args, {
       env: body.env,
       maxOutputChars: body.maxOutputChars,
-      cwd: TMP_DIR
+      timeoutMs: body.timeoutMs,
+      cwd: TMP_DIR,
+      signal: hungUp.signal
     })
+    res.off('close', onClose)
+    // Nobody is waiting for the answer any more.
+    if (hungUp.signal.aborted) return
     sendJson(res, 200, { ok: run.exitCode === 0 && !run.timedOut, run })
   } catch (error) {
     sendJson(res, 400, {

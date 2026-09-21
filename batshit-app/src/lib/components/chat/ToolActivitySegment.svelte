@@ -62,12 +62,13 @@
       messagesFromEnd: number
     }) => {
       isUnzipped: boolean
-      expandedReason?: 'buffer' | 'user' | 'agent'
+      expandedReason?: 'buffer' | 'user' | 'agent' | 'inferred'
       isPermanent?: boolean
       remainingMessages?: number | null
       aboutToZip?: boolean
       autoZip?: boolean
       agentControlled?: boolean
+      inferredControlled?: boolean
       manualZip?: boolean
     }
     shouldShowAsZip: (segment: any, segmentIndex: number) => boolean
@@ -149,6 +150,7 @@
   let aboutToZip = $derived(!collapse ? zipState.aboutToZip : false)
   let autoZip = $derived(Boolean(zipState.autoZip))
   let agentControlled = $derived(Boolean(zipState.agentControlled))
+  let inferredControlled = $derived(Boolean(zipState.inferredControlled))
   let manualZip = $derived(Boolean(zipState.manualZip))
 </script>
 
@@ -163,6 +165,7 @@
   {aboutToZip}
   autoZip={autoZip}
   {agentControlled}
+  {inferredControlled}
   {manualZip}
   onToggleUnzip={(permanent: boolean) =>
     handleUnzip(

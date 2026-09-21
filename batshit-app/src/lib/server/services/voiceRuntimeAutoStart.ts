@@ -9,6 +9,7 @@ import {
   listVoiceEngineRecords,
   upsertVoiceEngineRecord
 } from '$lib/server/services/voiceEngineRegistry'
+import { shouldStopVoiceRuntimeOnShutdown } from '$lib/utils/voiceSchema'
 import { inspectByoSpeechRuntimeForRecord } from '$lib/server/services/voiceService'
 import {
   startLocalVoiceRuntime
@@ -17,7 +18,15 @@ import {
   resolveLocalVoiceRuntimeLogPath,
   resolveManagedInstallsRoot
 } from '$lib/server/services/voiceLocalRuntimePaths'
-import { startHostVoiceRuntimeViaOperator } from '$lib/server/services/voiceHostOperatorRuntime'
+import {
+  registerHostVoiceRuntimeShutdown,
+  startHostVoiceRuntimeViaOperator
+} from '$lib/server/services/voiceHostOperatorRuntime'
+import {
+  attachLocalRuntimeLaunchRecord,
+  pruneLocalRuntimeLaunchRecords
+} from '$lib/server/services/voiceRuntimeLaunchRecords'
+import { logger } from '$lib/utils/logger'
 import { autoStartLiveKitSidecarRuntime } from '$lib/server/services/liveKitSidecarRuntime'
 
 const AUTO_START_RECENT_WINDOW_MS = 15_000
@@ -135,7 +144,8 @@ async function inferEffectiveLocalRuntime(
       logPath: legacyState?.logPath ?? resolveLocalVoiceRuntimeLogPath(record.id)
     },
     startup: {
-      autoStartOnLaunch: record.localRuntime?.startup?.autoStartOnLaunch ?? false
+      autoStartOnLaunch: record.localRuntime?.startup?.autoStartOnLaunch ?? false,
+      stopOnShutdown: record.localRuntime?.startup?.stopOnShutdown ?? true
     }
   }
 
@@ -164,9 +174,37 @@ async function waitForReady(record: VoiceEngineRecord): Promise<{ ready: boolean
   }
 }
 
+/**
+ * Engines that share one runtime each record their own "Stop with Batshit" choice beside the
+ * launch that started it (`attachLocalRuntimeLaunchRecord`), so the shutdown hooks stop that
+ * runtime only if every engine that uses it says stop. Run on every boot, after the launches,
+ * for every engine that could show the switch: a runtime restarted since an engine last
+ * recorded its choice has a new pid, and "Start with Batshit" may be off for the engine that
+ * shares it. An endpoint that no live Batshit launch serves records nothing.
+ */
+async function recordSharedRuntimeChoices(records: VoiceEngineRecord[]) {
+  for (const record of records) {
+    if (record.enabled === false || !record.localRuntime?.launch?.command) continue
+    await attachLocalRuntimeLaunchRecord({
+      engineId: record.id,
+      endpoint: record.baseUrl,
+      stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(record.localRuntime.startup)
+    }).catch((error) => {
+      // Not fatal to the boot, but this engine's choice will not reach the shutdown hooks.
+      logger.warn('[voice-runtime] could not record a shared runtime choice', { engineId: record.id, error })
+    })
+  }
+}
+
 async function autoStartVoiceRuntimes(userId: string): Promise<VoiceRuntimeAutoStartReport> {
   const results: VoiceRuntimeAutoStartResult[] = []
   const records = await listVoiceEngineRecords(userId)
+  // Docker: the host operator started these engines, so it is what stops them when this
+  // container shuts down. Registered on every boot, not only when this boot started
+  // something, because an engine a previous container started may still be running.
+  if (isContainerizedRuntime()) {
+    registerHostVoiceRuntimeShutdown(() => listVoiceEngineRecords(userId))
+  }
 
   for (const rawRecord of records) {
     const providerId = buildProviderId(rawRecord.id)
@@ -230,14 +268,18 @@ async function autoStartVoiceRuntimes(userId: string): Promise<VoiceRuntimeAutoS
             engineId: record.id,
             installRoot: localRuntime.installRoot,
             installOwnership: localRuntime.installOwnership,
-            launch: localRuntime.launch
+            launch: localRuntime.launch,
+            endpoint: record.baseUrl,
+            stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(localRuntime.startup)
           })
         : await startLocalVoiceRuntime({
             userId,
             engineId: record.id,
             installRoot: localRuntime.installRoot,
             installOwnership: localRuntime.installOwnership,
-            launch: localRuntime.launch
+            launch: localRuntime.launch,
+            stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(localRuntime.startup),
+            endpoint: record.baseUrl
           })
 
       const readiness = await waitForReady(record)
@@ -260,6 +302,17 @@ async function autoStartVoiceRuntimes(userId: string): Promise<VoiceRuntimeAutoS
         reason: error instanceof Error ? error.message : 'Failed to auto-start the local runtime.'
       })
     }
+  }
+
+  // In Docker the operator records what it starts and applies the same shared-runtime rule
+  // when the container shuts down, from the choices the app sends then. Natively, first drop
+  // this registry's attach records that no longer match an engine (deleted, moved to another
+  // endpoint, or changed while this Batshit was not running), then record the current ones.
+  if (!isContainerizedRuntime()) {
+    await pruneLocalRuntimeLaunchRecords(records).catch((error) => {
+      logger.warn('[voice-runtime] could not tidy launch records at boot', { error })
+    })
+    await recordSharedRuntimeChoices(records)
   }
 
   const liveKitResult = await autoStartLiveKitSidecarRuntime(userId)

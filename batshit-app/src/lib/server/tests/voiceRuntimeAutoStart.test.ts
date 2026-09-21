@@ -1,6 +1,6 @@
 import os from 'node:os'
 import path from 'node:path'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -9,6 +9,7 @@ const mockUpsertVoiceEngineRecord = vi.fn()
 const mockInspectByoSpeechRuntimeForRecord = vi.fn()
 const mockStartLocalVoiceRuntime = vi.fn()
 const mockStartHostVoiceRuntimeViaOperator = vi.fn()
+const mockRegisterHostVoiceRuntimeShutdown = vi.fn()
 const mockAutoStartLiveKitSidecarRuntime = vi.fn()
 
 vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
@@ -34,7 +35,8 @@ vi.mock('$lib/server/services/voiceLocalEngineSetup', () => ({
 }))
 
 vi.mock('$lib/server/services/voiceHostOperatorRuntime', () => ({
-  startHostVoiceRuntimeViaOperator: (...args: any[]) => mockStartHostVoiceRuntimeViaOperator(...args)
+  startHostVoiceRuntimeViaOperator: (...args: any[]) => mockStartHostVoiceRuntimeViaOperator(...args),
+  registerHostVoiceRuntimeShutdown: (...args: any[]) => mockRegisterHostVoiceRuntimeShutdown(...args)
 }))
 
 vi.mock('$lib/server/services/liveKitSidecarRuntime', () => ({
@@ -265,7 +267,10 @@ describe('voiceRuntimeAutoStart', () => {
             args: ['--host', '127.0.0.1', '--port', '8012']
           }),
           startup: {
-            autoStartOnLaunch: true
+            autoStartOnLaunch: true,
+            // A backfilled legacy recipe carries the default stop choice, so
+            // the launch record it produces is not missing the field.
+            stopOnShutdown: true
           }
         })
       })
@@ -334,9 +339,19 @@ describe('voiceRuntimeAutoStart', () => {
         installRoot: '/Users/example/.batshit/installs/kokoro',
         launch: expect.objectContaining({
           command: '~/.batshit/tools/mlx-audio/.venv/bin/mlx_audio.server'
-        })
+        }),
+        // The operator records the listener it serves and the choice (absent means stop).
+        endpoint: 'http://127.0.0.1:8010',
+        stopOnShutdown: true
       })
     )
+    // The operator started it, so the operator stops it when this container shuts down; the
+    // shutdown reads the user's engines then, so a toggle made since boot is honored.
+    expect(mockRegisterHostVoiceRuntimeShutdown).toHaveBeenCalledTimes(1)
+    const listEngines = mockRegisterHostVoiceRuntimeShutdown.mock.calls[0][0]
+    mockListVoiceEngineRecords.mockClear()
+    await listEngines()
+    expect(mockListVoiceEngineRecords).toHaveBeenCalledWith('user-1')
     expect(report.results).toEqual([
       expect.objectContaining({
         engineId: 'kokoro',
@@ -371,5 +386,171 @@ describe('voiceRuntimeAutoStart', () => {
         pid: 6262
       })
     ])
+  })
+
+  it('hands each engine its own Stop with Batshit choice at launch', async () => {
+    // startLocalVoiceRuntime writes this into the launch record, which is the
+    // ONLY thing the Mac supervisor and the native launcher read at shutdown.
+    mockListVoiceEngineRecords.mockResolvedValue([
+      {
+        id: 'stays-up',
+        name: 'Stays Up',
+        enabled: true,
+        baseUrl: 'http://127.0.0.1:8090',
+        localRuntime: {
+          installRoot: '/tmp/stays-up',
+          installOwnership: 'batshit-managed',
+          launch: { command: '/tmp/stays-up/bin/engine' },
+          startup: { autoStartOnLaunch: true, stopOnShutdown: false }
+        }
+      },
+      {
+        id: 'never-chose',
+        name: 'Never Chose',
+        enabled: true,
+        baseUrl: 'http://127.0.0.1:8091',
+        localRuntime: {
+          installRoot: '/tmp/never-chose',
+          installOwnership: 'batshit-managed',
+          launch: { command: '/tmp/never-chose/bin/engine' },
+          startup: { autoStartOnLaunch: true }
+        }
+      }
+    ])
+    // Per engine: the pre-launch check says unreachable, the readiness poll
+    // right after the launch says ready, so neither engine sits in the 45 s
+    // readiness loop.
+    let inspectCalls = 0
+    mockInspectByoSpeechRuntimeForRecord.mockImplementation(async () => {
+      inspectCalls += 1
+      return inspectCalls % 2 === 1
+        ? { ready: false, reachable: false, state: 'unreachable', statusHint: 'connect ECONNREFUSED' }
+        : { ready: true, reachable: true, state: 'ready', statusHint: 'Health check passed.' }
+    })
+    mockStartLocalVoiceRuntime.mockResolvedValue({ pid: 7171 })
+
+    const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+    await ensureVoiceRuntimesAutoStarted('user-1')
+
+    const byEngineId = Object.fromEntries(
+      mockStartLocalVoiceRuntime.mock.calls.map(([options]: any[]) => [
+        options.engineId,
+        options.stopOnShutdown
+      ])
+    )
+    expect(byEngineId['stays-up']).toBe(false)
+    expect(byEngineId['never-chose']).toBe(true)
+  })
+
+  it('hands the launch the listener it serves, for engines that share it', async () => {
+    mockListVoiceEngineRecords.mockResolvedValue([
+      {
+        id: 'chatterbox-turbo',
+        name: 'Chatterbox Turbo',
+        enabled: true,
+        baseUrl: 'http://127.0.0.1:8012',
+        localRuntime: {
+          installRoot: '/tmp/chatterbox-turbo',
+          installOwnership: 'batshit-managed',
+          launch: { command: '/tmp/mlx_audio.server', args: ['--port', '8012'] },
+          startup: { autoStartOnLaunch: true }
+        }
+      }
+    ])
+    mockInspectByoSpeechRuntimeForRecord
+      .mockResolvedValueOnce({ ready: false, reachable: false, state: 'unreachable' })
+      .mockResolvedValueOnce({ ready: true, reachable: true, state: 'ready' })
+    mockStartLocalVoiceRuntime.mockResolvedValue({ pid: 7272 })
+
+    const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+    await ensureVoiceRuntimesAutoStarted('user-1')
+
+    expect(mockStartLocalVoiceRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ engineId: 'chatterbox-turbo', endpoint: 'http://127.0.0.1:8012' })
+    )
+  })
+
+  describe('an engine that uses a runtime it did not start', () => {
+    // Real launch records under the throwaway runtimeStateRoot; this test process stands in for
+    // the running runtime, because the record has to name a live process.
+    async function writeStarterRecord(endpoint: string) {
+      await mkdir(path.join(runtimeStateRoot, 'chatterbox-turbo'), { recursive: true })
+      await writeFile(
+        path.join(runtimeStateRoot, 'chatterbox-turbo', '.batshit-local-runtime-launch.json'),
+        JSON.stringify({
+          engineId: 'chatterbox-turbo',
+          pid: process.pid,
+          command: '/Users/example/.batshit/tools/mlx-audio/.venv/bin/mlx_audio.server',
+          args: ['--port', '8012'],
+          endpoint,
+          launchedAt: '2026-09-17T01:00:03.000Z'
+        })
+      )
+    }
+
+    function kokoroOn(port: number, startup: Record<string, boolean>) {
+      return {
+        id: 'kokoro',
+        name: 'Kokoro',
+        enabled: true,
+        baseUrl: `http://localhost:${port}`,
+        localRuntime: {
+          installRoot: '/tmp/kokoro',
+          installOwnership: 'batshit-managed',
+          launch: { command: '/tmp/mlx_audio.server', args: ['--port', String(port)] },
+          startup
+        }
+      }
+    }
+
+    it('records its own Stop with Batshit choice beside the launch that started it', async () => {
+      await writeStarterRecord('http://127.0.0.1:8012')
+      // "Start with Batshit" is off for kokoro, and the runtime is up: it still records.
+      mockListVoiceEngineRecords.mockResolvedValue([kokoroOn(8012, { stopOnShutdown: false })])
+
+      const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+      await ensureVoiceRuntimesAutoStarted('user-1')
+
+      expect(mockStartLocalVoiceRuntime).not.toHaveBeenCalled()
+      const record = JSON.parse(
+        await readFile(path.join(runtimeStateRoot, 'kokoro', '.batshit-local-runtime-launch.json'), 'utf8')
+      )
+      expect(record).toMatchObject({
+        engineId: 'kokoro',
+        pid: process.pid,
+        startedBy: 'chatterbox-turbo',
+        stopOnShutdown: false,
+        launchedAt: '2026-09-17T01:00:03.000Z'
+      })
+    })
+
+    it('drops this registry\'s attach records for engines no longer in it', async () => {
+      await writeStarterRecord('http://127.0.0.1:8012')
+      const { attachLocalRuntimeLaunchRecord } = await import('../services/voiceRuntimeLaunchRecords')
+      // Recorded while it existed; deleted since (say, by a Batshit that crashed before tidying).
+      await attachLocalRuntimeLaunchRecord({ engineId: 'deleted-engine', endpoint: 'http://127.0.0.1:8012', stopOnShutdown: false })
+      mockListVoiceEngineRecords.mockResolvedValue([kokoroOn(8012, { stopOnShutdown: true })])
+
+      const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+      await ensureVoiceRuntimesAutoStarted('user-1')
+
+      expect(await readdir(path.join(runtimeStateRoot, 'deleted-engine')).catch(() => [])).toEqual([])
+      expect(
+        JSON.parse(await readFile(path.join(runtimeStateRoot, 'kokoro', '.batshit-local-runtime-launch.json'), 'utf8'))
+      ).toMatchObject({ startedBy: 'chatterbox-turbo', stopOnShutdown: true })
+    })
+
+    it('records nothing for a runtime no Batshit launch serves', async () => {
+      // Something answers on 8013, but no launch record names it: Batshit did not start it.
+      await writeStarterRecord('http://127.0.0.1:8012')
+      mockListVoiceEngineRecords.mockResolvedValue([kokoroOn(8013, { autoStartOnLaunch: true })])
+      mockInspectByoSpeechRuntimeForRecord.mockResolvedValue({ ready: true, reachable: true, state: 'ready' })
+
+      const { ensureVoiceRuntimesAutoStarted } = await import('../services/voiceRuntimeAutoStart')
+      const report = await ensureVoiceRuntimesAutoStarted('user-1')
+
+      expect(report.results).toEqual([expect.objectContaining({ engineId: 'kokoro', status: 'already-running' })])
+      expect((await readdir(runtimeStateRoot)).sort()).toEqual(['chatterbox-turbo'])
+    })
   })
 })

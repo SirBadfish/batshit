@@ -3,6 +3,7 @@ import { redis } from '$lib/server/redis'
 import { syncAgentCodexProfiles, deleteAgentCodexConfig } from '$lib/server/services/codexProfileManager'
 import { syncAgentClaudeProfiles, deleteAgentClaudeConfig } from '$lib/server/services/claudeProfileManager'
 import { validateDmSenderFields } from '$lib/utils/dmControl'
+import { validateJevJuiceAgentFields } from '$lib/utils/jevJuiceControl'
 import { getCodexConfigOverrideValidationError } from '$lib/server/services/codexSettings'
 import { getClaudeConfigOverrideValidationError } from '$lib/server/services/claudeSettings'
 import {
@@ -17,6 +18,8 @@ import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { resolveUploadUrlsForBrowserInPayload } from '$lib/server/services/batshitServerUrls'
 import { isGoonRuntimeReady } from '$lib/goons/recipe/recipeProductLifecycle'
+import { deleteAgentChats, type AgentChatDeletionResult } from '$lib/server/services/agentChatDeletion'
+import { SessionDeleteRefusedError } from '$lib/server/services/sessionDeleteTurnStop'
 
 // GET /api/agents/[id] - Get a specific agent
 export const GET: RequestHandler = async ({ params, locals }) => {
@@ -69,6 +72,11 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
     const dmSenderValidationError = validateDmSenderFields(updates)
     if (dmSenderValidationError) {
       return json({ error: dmSenderValidationError }, { status: 400 })
+    }
+    // SA-120 P1: the per-agent Jev Juice switch must be a boolean (absent reads as OFF).
+    const jevJuiceValidationError = validateJevJuiceAgentFields(updates)
+    if (jevJuiceValidationError) {
+      return json({ error: jevJuiceValidationError }, { status: 400 })
     }
     
     // Verify agent exists and belongs to user
@@ -188,12 +196,14 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
   }
 }
 
-// DELETE /api/agents/[id] - Delete an agent
-export const DELETE: RequestHandler = async ({ params, locals }) => {
+// DELETE /api/agents/[id] - Delete an agent. `?chats=1` (the dialog's "Also delete its chats"
+// checkbox, 2026-09-19) deletes the agent's own chats first; group chats are never included.
+export const DELETE: RequestHandler = async ({ params, locals, url }) => {
   if (!locals.user?.id) {
     return json({ error: 'Unauthorized' }, { status: 401 })
   }
   const userId = locals.user.id
+  const deleteChats = url.searchParams.get('chats') === '1'
 
   try {
     // Verify agent exists and belongs to user
@@ -205,7 +215,24 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
     if (agent.user_id !== locals.user.id) {
       return json({ error: 'Unauthorized' }, { status: 403 })
     }
-    
+
+    // Chats first, agent second: a chat whose reply is still stopping refuses the delete
+    // (409) and the agent stays, so the user can simply try again.
+    let chats: AgentChatDeletionResult | null = null
+    if (deleteChats) {
+      try {
+        chats = await deleteAgentChats(userId, params.id!)
+      } catch (error) {
+        if (error instanceof SessionDeleteRefusedError) {
+          return json(
+            { error: `${error.message} The agent was not deleted.`, code: error.code },
+            { status: 409 }
+          )
+        }
+        throw error
+      }
+    }
+
     await redis.deleteAgent(params.id!)
     await Promise.allSettled([
       (async () => {
@@ -237,7 +264,10 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
         }
       })()
     ])
-    return json({ success: true })
+    return json({
+      success: true,
+      chats: chats ? { deleted: chats.deleted.length, keptLocked: chats.keptLocked.length } : null
+    })
   } catch (error) {
     console.error('Error deleting agent:', error)
     return json({ error: 'Failed to delete agent' }, { status: 500 })

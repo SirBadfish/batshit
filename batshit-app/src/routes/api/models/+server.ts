@@ -833,8 +833,11 @@ function buildConnectionOptions(
     'xai',
     'deepseek',
     'moonshot',
+    'kimi_code',
     'minimax',
+    'minimax_token_plan',
     'mimo',
+    'mimo_token_plan',
     'qwencloud',
     'qwen_token_plan',
     'alibaba',
@@ -855,13 +858,17 @@ function buildConnectionOptions(
     'cerebras'
   ]
   const DIRECT_PROVIDER_LABELS: Partial<Record<KnownProviderId, string>> = {
+    openai: 'OpenAI',
     deepseek: 'DeepSeek',
     zai: 'Z.ai General',
     zai_coding: 'Z.ai Coding Plan',
     xai: 'xAI',
     moonshot: 'Moonshot AI',
+    kimi_code: 'Kimi Code Membership',
     minimax: 'MiniMax',
+    minimax_token_plan: 'MiniMax Token Plan',
     mimo: 'MiMo',
+    mimo_token_plan: 'MiMo Token Plan',
     qwencloud: 'Qwen Cloud',
     qwen_token_plan: 'Qwen Token Plan',
     alibaba: 'Alibaba Cloud',
@@ -883,8 +890,14 @@ function buildConnectionOptions(
     zai_coding: 'Use current Z.ai Coding Plan models, including GLM-5.3 and GLM-5.3-Flash, through the OpenAI-compatible coding endpoint.',
     xai: 'Use xAI Grok models through the OpenAI-compatible xAI API.',
     moonshot: 'Use Moonshot AI Kimi models through the OpenAI-compatible Kimi API.',
+    kimi_code:
+      'Use Kimi Code membership quota and its separate coding endpoint. This connection does not spend Moonshot pay-as-you-go balance.',
     minimax: 'Use MiniMax M-series models through the OpenAI-compatible MiniMax API.',
+    minimax_token_plan:
+      'Use the separate MiniMax sk-cp subscription key for interactive M3 and M2.7 work. MiniMax recommends pay-as-you-go for production use.',
     mimo: 'Use Xiaomi MiMo V2.5 models through the OpenAI-compatible MiMo API.',
+    mimo_token_plan:
+      'Use the separate Xiaomi MiMo tp- subscription key for the V2.5 chat and speech model family.',
     qwencloud: 'Use Qwen and other DashScope-hosted models through Qwen Cloud.',
     qwen_token_plan:
       'Use the Alibaba Token Plan subscription route for interactive Batshit chats and agents. Alibaba excludes workflow, batch, and generic backend use.',

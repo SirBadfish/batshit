@@ -17,7 +17,10 @@ import {
 import {
   GROUP_CHAT_MAX_FOLLOWUPS_TOTAL,
   GROUP_CHAT_MIN_AGENT_COUNT,
-  GROUP_CHAT_SESSION_DEFAULTS
+  GROUP_CHAT_SESSION_DEFAULTS,
+  GROUP_CHAT_SPEAK_POLICIES,
+  isGroupChatSpeakPolicy,
+  validateGroupAgentSettingsInput
 } from '$lib/types/groupChat'
 
 describe('Group chat utils', () => {
@@ -68,6 +71,35 @@ describe('Group chat utils', () => {
     const instructions = buildSpeakPolicyInstructions('topic_only', ['redis', 'svelte'])
     expect(instructions).toContain('topic-only')
     expect(instructions).toContain('redis, svelte')
+  })
+
+  // SA-120 P3: the `smart` preset (Jev Juice) is a real preset with its own line.
+  it('builds the smart preset line and keeps the preset in a normalized config', () => {
+    const instructions = buildSpeakPolicyInstructions('smart')
+    expect(instructions).toContain('Speaking preset: smart')
+    expect(instructions).toContain('Jev Juice')
+    expect(instructions).toContain('respond unless you truly have nothing new to add')
+    expect(GROUP_CHAT_SPEAK_POLICIES).toContain('smart')
+    expect(isGroupChatSpeakPolicy('smart')).toBe(true)
+    expect(isGroupChatSpeakPolicy('smrt')).toBe(false)
+    const config = normalizeGroupChatConfig({
+      enabled: true,
+      agent_ids: ['agent-a', 'agent-b'],
+      agent_settings: { 'agent-a': { speak_policy: 'smart' } }
+    })
+    expect(config?.agent_settings?.['agent-a']?.speak_policy).toBe('smart')
+  })
+
+  it('refuses an unknown speak preset on the write side and accepts every known one', () => {
+    expect(validateGroupAgentSettingsInput(undefined)).toBeNull()
+    expect(validateGroupAgentSettingsInput({})).toBeNull()
+    for (const policy of GROUP_CHAT_SPEAK_POLICIES) {
+      expect(validateGroupAgentSettingsInput({ a: { speak_policy: policy, speak_topics: [] } })).toBeNull()
+    }
+    expect(validateGroupAgentSettingsInput({ a: { speak_policy: 'smrt' } })).toContain('speak_policy must be one of')
+    expect(validateGroupAgentSettingsInput({ a: { speak_topics: 'redis' } })).toContain('speak_topics must be an array of strings')
+    expect(validateGroupAgentSettingsInput({ a: 'bad' })).toContain('agent_settings.a must be an object')
+    expect(validateGroupAgentSettingsInput([])).toContain('agent_settings must be an object')
   })
 
   it('detects direct agent mentions', () => {

@@ -1,3 +1,5 @@
+import { isSwallowedQuickActionTurn } from '$lib/utils/jevJuiceQuickActions'
+
 type ChatHistoryMessage = Record<string, any>
 
 function messageTextContent(content: unknown): string {
@@ -77,7 +79,10 @@ export function prepareManagedHistoryMessages<T extends ChatHistoryMessage>({
 }: PrepareManagedHistoryOptions<T[] | unknown>): T[] | ChatHistoryMessage[] {
   if (!Array.isArray(messages)) return []
 
-  const history = messages.slice() as T[]
+  // SA-120 P9: a spoken turn that was ONLY a quick action never reached the agent (Batshit acted,
+  // nothing was sent), so it is not part of the agent's history either. The user still sees it in
+  // the chat with its chip. A mixed turn was sent and stays.
+  const history = (messages as T[]).filter((message) => !isSwallowedQuickActionTurn(message))
   if (preserveAllMessages) return history
 
   while (

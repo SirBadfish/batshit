@@ -131,9 +131,9 @@ export async function buildManagedSubagentDynamicInfo(options: {
   sessionId?: string | null
   projectPath?: string | null
   /**
-   * SA-111 P1: the canonical compiler resolves the scope and the slash capabilities once
-   * per subagent per compile and passes them in, so building the DCM roster's capability
-   * line costs no extra Redis work (DL-111-03: "cached per compile").
+   * A caller that has already resolved the scope or the slash capabilities can pass them in,
+   * so they are not read twice. (The chat compiler no longer builds a subagent's DYNAMIC
+   * INFO: it resolves only the roster facts, 2026-09-18.)
    */
   scope?: SubagentResolvedScope
   capabilities?: AgentSlashCapability[]
@@ -175,6 +175,8 @@ export async function buildManagedSubagentDynamicInfo(options: {
     dmControlsEnabled: false,
     // SA-115 P2 (DL-115-10): a delegated run cannot put anything on a clock.
     scheduleControlsEnabled: false,
+    // SA-120 P2 (DL-120-06): a delegated run never judges through Jev; the primary decides.
+    judgeControlsEnabled: false,
   })
   if (mcpIndex.text.trim()) {
     lines.push('', mcpIndex.text.trim())

@@ -13,6 +13,15 @@
 	 */
 	import Mail from '@lucide/svelte/icons/mail'
 	import FullTool from '../templates/FullTool.svelte'
+	import JevJuiceFlagBlock from '$lib/components/chat/JevJuiceFlagBlock.svelte'
+	import { getJevJuiceDmScreen, requestDmBrief } from '$lib/stores/dmBriefs.svelte'
+	import {
+		UNTRUSTED_TEXT_DM_CARD_TOLD_TEXT,
+		UNTRUSTED_TEXT_INLINE_TEXT,
+		jevJuiceNoteDetail,
+		jevJuiceNoteText,
+		untrustedTextSkippedNote
+	} from '$lib/utils/jevJuice'
 
 	let { tool } = $props()
 
@@ -82,8 +91,12 @@
 	const args = $derived.by<Record<string, any>>(() => {
 		const nested = (envelope as any)?.input
 		const direct = tool?.toolInput
+		// SA-120 P7, found live: the managed CLI lane keeps the agent's input under
+		// `toolArgs.input` (its result envelope has no `input`), so a Codex or Claude
+		// `sys.dm.read` / `claim` card had no DM id and an empty subtitle.
+		const cliInput = tool?.toolArgs?.input
 		const merged: Record<string, any> = {}
-		for (const source of [direct, nested]) {
+		for (const source of [direct, cliInput, nested]) {
 			if (source && typeof source === 'object' && !Array.isArray(source)) {
 				Object.assign(merged, source)
 			}
@@ -100,7 +113,9 @@
 
 	const deliveredAs = $derived(readString((result as any)?.delivered_as))
 	const reason = $derived(readString((result as any)?.reason))
-	const dmId = $derived(readString((result as any)?.dm_id, (args as any)?.dm_id))
+	const dmId = $derived(
+		readString((result as any)?.dm_id, (args as any)?.dm_id, (result as any)?.dm?.id)
+	)
 	const recipient = $derived(readString((args as any)?.to))
 	const kind = $derived(readString((args as any)?.kind))
 	const subject = $derived(readString((args as any)?.subject))
@@ -123,6 +138,27 @@
 		return { delivered, skipped }
 	})
 
+	/**
+	 * SA-120 P7 — the Jev Juice flag on this DM, if it has one.
+	 *
+	 * Asked by DM id from the screens store rather than read off the tool result, on purpose:
+	 * the result is what the AGENT reads, and only the agent that READS a flagged DM is told
+	 * about it (a sender gets no oracle for rewording). The user's badge must not depend on
+	 * that, so every card that names a DM (send, read, claim, done, blocked) looks its id up.
+	 * A broadcast shares one text, so its first delivery's id stands for all of them.
+	 * "No flag" and "never screened" both come back `null` and draw nothing.
+	 */
+	const screenDmId = $derived.by<string | null>(() => {
+		if (dmId) return dmId
+		const delivered = (result as any)?.delivered
+		return Array.isArray(delivered) ? readString(delivered[0]?.dm_id) : null
+	})
+	$effect(() => {
+		requestDmBrief(screenDmId)
+	})
+	const screen = $derived(getJevJuiceDmScreen(screenDmId))
+	const flagSuffix = $derived(screen?.status === 'flagged' ? ` · ${UNTRUSTED_TEXT_INLINE_TEXT}` : '')
+
 	const openCount = $derived.by<number | null>(() => {
 		const value = (result as any)?.total_open
 		return typeof value === 'number' && Number.isFinite(value) ? value : null
@@ -131,21 +167,23 @@
 	const subtitle = $derived.by(() => {
 		if (errorText) return errorText
 		if (broadcast) {
-			return `broadcast · ${broadcast.delivered} delivered${broadcast.skipped ? `, ${broadcast.skipped} skipped` : ''}`
+			return `broadcast · ${broadcast.delivered} delivered${broadcast.skipped ? `, ${broadcast.skipped} skipped` : ''}${flagSuffix}`
 		}
 		if (controlId === 'sys.dm.send') {
 			const who = recipient ? `to ${recipient}` : 'sent'
 			const what = kind ? ` · ${kind}` : ''
-			if (deliveredAs === 'wake') return `${who}${what} · woke a chat`
+			if (deliveredAs === 'wake') return `${who}${what} · woke a chat${flagSuffix}`
 			// SA-114 DL-114-13: a steer landed INSIDE a reply that was already running. It
 			// needs its own line, because without one it falls through to the bare `${who}`
 			// and reads as an ordinary send — the card would be the only place in Batshit
 			// that could not tell the three delivery modes apart.
-			if (deliveredAs === 'steer') return `${who}${what} · landed mid-reply`
+			if (deliveredAs === 'steer') return `${who}${what} · landed mid-reply${flagSuffix}`
 			if (deliveredAs === 'wait') {
-				return reason ? `${who}${what} · waiting in inbox (${reason})` : `${who}${what} · waiting in inbox`
+				return reason
+					? `${who}${what} · waiting in inbox (${reason})${flagSuffix}`
+					: `${who}${what} · waiting in inbox${flagSuffix}`
 			}
-			return `${who}${what}`
+			return `${who}${what}${flagSuffix}`
 		}
 		if (controlId === 'sys.dm.list') {
 			if (openCount === null) return 'Inbox'
@@ -156,7 +194,8 @@
 			const count = Array.isArray(agents) ? agents.length : 0
 			return count === 1 ? '1 agent' : `${count} agents`
 		}
-		return dmId ?? ''
+		// SA-120 P7: the card opens collapsed, so a flag has to be readable from the subtitle.
+		return `${dmId ?? ''}${flagSuffix}`
 	})
 
 	const cardStatus = $derived.by(() => {
@@ -164,6 +203,8 @@
 		// A degraded wake is not a failure — the DM is safely in the inbox — but it is not
 		// the thing the agent asked for either, so it reads as info rather than success.
 		if (controlId === 'sys.dm.send' && deliveredAs === 'wait' && reason) return 'info'
+		// SA-120 P7: a flagged DM is not a failed call, but a green tick beside it would read wrong.
+		if (screen?.status === 'flagged') return 'info'
 		return 'success'
 	})
 </script>
@@ -172,6 +213,18 @@
 	<div class="dm-card">
 		{#if errorText}
 			<div class="dm-card-refusal">{errorText}</div>
+		{/if}
+
+		{#if screen?.status === 'flagged'}
+			<JevJuiceFlagBlock view={screen} closing={UNTRUSTED_TEXT_DM_CARD_TOLD_TEXT} testId="jev-juice-dm-card-flag" />
+		{:else if screen?.status === 'skipped'}
+			<div
+				class="dm-card-flag-note"
+				title={jevJuiceNoteDetail(untrustedTextSkippedNote(screen))}
+				data-testid="jev-juice-dm-card-skipped"
+			>
+				{jevJuiceNoteText(untrustedTextSkippedNote(screen))}
+			</div>
 		{/if}
 
 		{#if subject}
@@ -220,6 +273,13 @@
 		color: var(--bs-settings-danger, var(--destructive));
 		font-size: 0.8125rem;
 		line-height: 1.4;
+	}
+
+	/* SA-120 P7: the skipped note under the card (the flag itself is `JevJuiceFlagBlock`). */
+	.dm-card-flag-note {
+		color: var(--muted-foreground);
+		font-size: 0.75rem;
+		line-height: 1.45;
 	}
 
 	.dm-card-subject {

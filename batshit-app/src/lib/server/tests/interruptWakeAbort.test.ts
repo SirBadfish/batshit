@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRedisTestServer } from '$lib/test-utils/redis-memory'
 import { redis } from '$lib/server/redis'
 import {
@@ -7,6 +7,7 @@ import {
 } from '$lib/server/services/wakeRunRegistry'
 import {
   __resetStreamAbortRegistryForTests,
+  getActiveSessionTurn,
   registerSessionTurn
 } from '$lib/server/services/streamAbortRegistry'
 import { buildSessionOrigin } from '$lib/utils/sessionOrigin'
@@ -66,6 +67,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   __resetWakeRunRegistryForTests()
   // A hard reset, not `clearSessionTurn`: an id-less release no longer deletes a live
   // owned lock, so teardown cannot rely on it.
@@ -108,17 +110,28 @@ describe('POST /api/messages/interrupt', () => {
     })
   })
 
-  it('still clears a genuinely stale lock for an ordinary turn', async () => {
-    registerSessionTurn('sess-woken', 'single', 'msg-1')
+  it('stops an ordinary turn with nothing registered to abort, and frees a stuck one 5 s later', async () => {
+    // Nothing is registered under this lock: its request is setting up, or stuck. A Stop stops
+    // the turn (2026-09-18). It used to delete the lock at once (`stale_turn_cleared`), which
+    // freed a stuck chat but let a reply still setting up run on to a full answer.
+    const turn = registerSessionTurn('sess-woken', 'single', 'msg-1')
+    if (!turn.ok) throw new Error('registration refused')
 
     const response = (await (interrupt as any)(interruptRequest('sess-woken'))) as Response
     const body = await response.json()
 
     expect(body).toMatchObject({
       success: true,
-      reason: 'stale_turn_cleared',
+      reason: 'setup_stopped',
       abortedWokenTurn: false
     })
+    expect(turn.entry.stop.signal.aborted).toBe(true)
+    expect(getActiveSessionTurn('sess-woken')).toBe(turn.entry)
+
+    // Its request never let go: the lock goes after the aborted-stream grace.
+    const stoppedAt = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(stoppedAt + 5_001)
+    expect(getActiveSessionTurn('sess-woken')).toBeNull()
   })
 
   it('refuses a session the user does not own', async () => {

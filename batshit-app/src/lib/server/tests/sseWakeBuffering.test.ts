@@ -152,8 +152,8 @@ describe('/api/sse POST with no listener', () => {
 
 describe('F-P1-2: a headless woken turn uses the USER\'s zip settings', () => {
   /**
-   * `/api/sse` GET loads `global_zip_settings` when a tab connects and drops them on the
-   * last disconnect. A woken turn can stream with nobody watching, and AMD-113-01 hands
+   * `/api/sse` loads `global_zip_settings` when a tab subscribes to the chat and drops them
+   * when its last listener goes. A woken turn can stream with nobody watching, and AMD-113-01 hands
    * its zips to the stream path — so without this the user\'s own thresholds would be
    * ignored for exactly the turns they never see happen.
    *

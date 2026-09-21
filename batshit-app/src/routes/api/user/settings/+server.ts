@@ -7,6 +7,7 @@ import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { mergeGoonsSettingsPatch } from '$lib/goons/resolve'
 import { normalizeGlobalChatSettings } from '$lib/utils/steerControl'
+import { validateJevJuiceGlobalZipFields } from '$lib/utils/jevJuiceControl'
 
 const NO_STORE_RESPONSE = {
 	headers: {
@@ -63,6 +64,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				if (nextDisplayName.length > 14) {
 					return json({ error: 'Display name must be 14 characters or less' }, { status: 400 })
 				}
+			}
+
+			// SA-120 P5 (LS-054): `global_zip_settings` is stored whole, so a mistyped Jev Juice
+			// switch is refused here rather than saved and quietly read as OFF.
+			const jevJuiceError = validateJevJuiceGlobalZipFields(data.global_zip_settings)
+			if (jevJuiceError) {
+				return json({ error: jevJuiceError }, { status: 400 })
 			}
 
 			const nextGoonsSettings =

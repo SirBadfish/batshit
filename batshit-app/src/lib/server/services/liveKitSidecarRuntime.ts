@@ -31,7 +31,10 @@ import {
   type RuntimeAddonStatus
 } from '$lib/server/services/runtimeAddons'
 import { startLocalVoiceRuntime } from '$lib/server/services/voiceLocalEngineSetup'
-import { normalizeVoiceSettings } from '$lib/utils/voiceSchema'
+import {
+  normalizeVoiceSettings,
+  shouldStopVoiceRuntimeOnShutdown
+} from '$lib/utils/voiceSchema'
 
 export const LIVEKIT_SIDECAR_RUNTIME_ID = 'livekit' as const
 const LIVEKIT_SIDECAR_ENGINE_ID = 'livekit-sidecar'
@@ -388,6 +391,7 @@ async function ensureManagedLocalLiveKitServer(config: {
   apiKey: string
   apiSecret: string
   forceRestart?: boolean
+  stopOnShutdown?: boolean
 }): Promise<LiveKitLocalServerSummary> {
   const inspected = await inspectManagedLocalLiveKitServer(config)
   if (!inspected.managed || (inspected.status === 'ready' && !config.forceRestart)) return inspected
@@ -398,7 +402,8 @@ async function ensureManagedLocalLiveKitServer(config: {
       serverUrl: config.serverUrl,
       apiKey: config.apiKey,
       apiSecret: config.apiSecret,
-      forceRestart: config.forceRestart
+      forceRestart: config.forceRestart,
+      stopOnShutdown: config.stopOnShutdown
     })
     return {
       ...inspected,
@@ -503,6 +508,7 @@ function dockerLiveKitRuntimeSummaryFromAddon(
 async function resolveRuntimePreferences(userId: string): Promise<{
   selected: boolean
   autoStartOnLaunch: boolean
+  stopOnShutdown: boolean
 }> {
   const settings = await redis.getUserSettings(userId).catch(() => null)
   const normalized = normalizeVoiceSettings(settings?.voice_settings)
@@ -510,7 +516,10 @@ async function resolveRuntimePreferences(userId: string): Promise<{
     selected: normalized.voiceSessionRuntime === 'livekit',
     autoStartOnLaunch:
       normalized.voiceRuntimes?.livekit?.startup?.autoStartOnLaunch === true ||
-      parseBooleanEnv(env.LIVEKIT_AGENT_AUTO_START)
+      parseBooleanEnv(env.LIVEKIT_AGENT_AUTO_START),
+    // "Stop with Batshit" for the LiveKit pair. Absent means stop, which is
+    // what quitting the packaged Mac app has always done to both processes.
+    stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(normalized.voiceRuntimes?.livekit?.startup)
   }
 }
 
@@ -733,7 +742,8 @@ export async function startLiveKitSidecarRuntime(
   const server = await ensureManagedLocalLiveKitServer({
     userId,
     ...liveKitConfig,
-    forceRestart: forceServerRestart
+    forceRestart: forceServerRestart,
+    stopOnShutdown: preferences.stopOnShutdown
   })
   const serverBlocksRuntime = server.managed && server.status !== 'ready'
   if (serverBlocksRuntime) {
@@ -819,6 +829,7 @@ export async function startLiveKitSidecarRuntime(
       engineId: LIVEKIT_SIDECAR_ENGINE_ID,
       installRoot,
       installOwnership: resolveSidecarInstallOwnership(),
+      stopOnShutdown: preferences.stopOnShutdown,
       launch: {
         command: process.execPath,
         args: ['node_modules/tsx/dist/cli.mjs', 'src/livekit-agent-sidecar.ts', 'start'],

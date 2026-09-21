@@ -21,6 +21,8 @@ import {
   validateMemorySavePayload,
   type MemorySavePayload
 } from '$lib/utils/memoryControl'
+import { resolveAgentJevMemoryRerankEnabled } from '$lib/utils/jevJuiceControl'
+import { describeTypesafeReason } from '$lib/utils/jevJuice'
 import {
   createMemory,
   createMemoryId,
@@ -71,6 +73,15 @@ import {
   MEMORY_STANDING_MEDIA_CAP,
   MemoryMediaError
 } from './memoryMedia'
+import {
+  buildMemoryRerankPool,
+  computeMemoryRerank,
+  rankMemoriesWithJevRelevance,
+  resolveMemoryRerankShortlistSize,
+  summarizeMemoryRerank
+} from './memoryRerank.jev'
+import { attachTypesafeRecordToActiveStream } from '../typesafe/typesafeRunEvidence'
+import type { TypesafeClient } from '../typesafe/typesafeClient'
 
 /** Cosine-distance ceiling for the dedup-on-save assist (records ≤ this are "near"). */
 export const MEMORY_NEAR_DUPLICATE_MAX_DISTANCE = 0.1
@@ -84,6 +95,8 @@ export interface MemoryToolContext {
   userId: string
   agentId: string
   sessionId?: string | null
+  /** SA-120 P4a test seam for the memory search rerank; production uses the shared Jev client. */
+  typesafeClient?: TypesafeClient
 }
 
 export class MemoryToolError extends Error {
@@ -144,6 +157,11 @@ export interface MemorySummary {
   last_recalled_at?: string | null
   /** P4 1-hop link expansion: set when this row rode in via another result's [[links]]. */
   linked_from?: string
+  /**
+   * SA-120 P4a: Jev Juice's 0-1 judgment that this memory bears on the query. Present only
+   * when the agent's rerank switch is on AND Jev answered; it is the provenance of the order.
+   */
+  jev_relevance?: number
 }
 
 const GIST_PREVIEW_CHARS = 140
@@ -508,7 +526,7 @@ export async function searchMemoriesOp(
   context: MemoryToolContext,
   input: MemorySearchInput
 ): Promise<MemorySearchResult> {
-  await requireMemoryEnabledAgent(context.userId, context.agentId)
+  const agent = await requireMemoryEnabledAgent(context.userId, context.agentId)
 
   const query = typeof input.query === 'string' ? input.query.trim() : ''
   if (query.length < 2) {
@@ -562,7 +580,81 @@ export async function searchMemoriesOp(
     hitOrder,
     nowTs
   )
-  const ranked = [...current, ...supersededRecords]
+  const usualRanking = [...current, ...supersededRecords]
+  let ranked = usualRanking
+
+  // SA-120 P4a: Jev's relevance Noul per shortlisted memory joins the blend as a fourth
+  // term (`memoryRerank.jev.ts`). Any miss keeps the ranking above and says so.
+  let jevRelevanceById: Map<string, number> | null = null
+  let rerankNote = ''
+  if (resolveAgentJevMemoryRerankEnabled(agent)) {
+    try {
+      // The usual search above is untouched and stays the fallback. The rerank judges a
+      // WIDER shortlist: the same query with more candidates per leg, plus any usual hit the
+      // wider fusion happened to push off its page, so the pool always covers today's result.
+      const shortlistSize = resolveMemoryRerankShortlistSize(limit, SEARCH_MAX_LIMIT)
+      const wideHits = await hybridSearchMemories({
+        agentId: context.agentId,
+        query,
+        vector,
+        limit: shortlistSize,
+        filters,
+        candidatesPerLeg: shortlistSize
+      })
+      const poolKeys = buildMemoryRerankPool(
+        wideHits.map((hit) => hit.key),
+        hits.map((hit) => hit.key)
+      )
+      const poolOrder = new Map<string, number>()
+      poolKeys.forEach((key, index) => poolOrder.set(key.split(':').pop() as string, index))
+      const pool = (await fetchMemoriesByKeys(poolKeys)).sort(
+        (a, b) => (poolOrder.get(a.id) ?? 0) - (poolOrder.get(b.id) ?? 0)
+      )
+
+      const rerank = await computeMemoryRerank({
+        userId: context.userId,
+        agent,
+        query,
+        records: pool,
+        client: context.typesafeClient
+      })
+      if (rerank.relevanceById && rerank.request) {
+        const ranking = rankMemoriesWithJevRelevance({
+          records: pool,
+          hitOrder: poolOrder,
+          relevanceById: rerank.relevanceById,
+          limit,
+          nowTs,
+          usualRanking
+        })
+        if (rerank.record) {
+          rerank.record.decision = summarizeMemoryRerank(rerank.request, rerank.relevanceById, ranking, limit)
+        }
+        ranked = ranking.ranked
+        jevRelevanceById = rerank.relevanceById
+        rerankNote =
+          ' The order includes Jev Juice\'s judgment of how well each memory bears on your query (jev_relevance, 0 to 1, advisory).'
+      } else if (rerank.record) {
+        // A call that answered but left a memory unjudged is never partly trusted.
+        const why =
+          rerank.record.status === 'ok'
+            ? 'an answer was missing.'
+            : describeTypesafeReason(rerank.record.reason)
+        rerankNote = ` Jev Juice did not rerank this search (${why}); the order is the usual ranking.`
+      }
+      // Mid-run call: the row goes on the running assistant message's snapshot (DL-120-07).
+      if (rerank.record) {
+        await attachTypesafeRecordToActiveStream(context.sessionId ?? null, rerank.record, 'memory search rerank')
+      }
+    } catch (error) {
+      // `computeMemoryRerank` is written not to throw; this is the last net so a bug in the
+      // lane can never fail a memory search. Loud, not silent: the usual ranking stands.
+      console.error('[Jev Juice] memory search rerank threw; the usual ranking stands:', error)
+      ranked = usualRanking
+      jevRelevanceById = null
+      rerankNote = ' Jev Juice did not rerank this search (it failed inside Batshit); the order is the usual ranking.'
+    }
+  }
 
   // 1-hop link expansion over the ranked hits, best-first, outside the limit.
   const includedIds = new Set(ranked.map((record) => record.id))
@@ -579,7 +671,15 @@ export async function searchMemoriesOp(
     }
   }
 
-  const results = [...ranked.map(toMemorySummary), ...linkedSummaries]
+  const results = [
+    ...ranked.map((record) => {
+      const relevance = jevRelevanceById?.get(record.id)
+      return relevance === undefined
+        ? toMemorySummary(record)
+        : { ...toMemorySummary(record), jev_relevance: Math.round(relevance * 100) / 100 }
+    }),
+    ...linkedSummaries
+  ]
 
   // SA-104 P6: graduated segments join search (the P4 deferral). Ordering keeps the
   // index's fused hit order — segments carry no importance, so the memory group's
@@ -617,7 +717,8 @@ export async function searchMemoriesOp(
       'These are summary references, not full memories. To bring chosen memories into your context, call ' +
       'sys.memory.recall with their ids. Entries marked superseded point to the chosen current memory — timestamps ' +
       'do not decide the winner. Rows with linked_from rode in via another result’s [[links]]. Rows under segments are graduated ' +
-      'conversation stretches — recall their ids to receive the full episode summary.'
+      'conversation stretches — recall their ids to receive the full episode summary.' +
+      rerankNote
   }
 }
 
@@ -1051,13 +1152,13 @@ export async function updateWhiteboardOp(
   }
 
   const content = rawContent.length > 0 ? rawContent : null
-  const updated = await updateEpisodeWhiteboard(sessionId, openEpisode.id, content)
+  const updated = await updateEpisodeWhiteboard(sessionId, openEpisode.id, content, 'agent')
   return {
     episode: episodeSummary(updated),
     whiteboard: updated.whiteboard?.content ?? null,
     note: content
-      ? 'Whiteboard updated. It arrives with every current message (Episode whiteboard section) until this episode closes.'
-      : 'Whiteboard cleared.'
+      ? 'Whiteboard updated. It arrives with every current message (Episode whiteboard section) until this episode closes. Naps never change a board you wrote.'
+      : 'Whiteboard cleared. A nap may fill an empty board; once you write it again, naps leave it alone.'
   }
 }
 

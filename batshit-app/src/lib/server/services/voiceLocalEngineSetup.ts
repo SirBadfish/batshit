@@ -22,15 +22,23 @@ import {
   type ByoSpeechRuntimeStatus
 } from '$lib/server/services/voiceService'
 import {
+  getVoiceEngineRecord,
   setVoiceEngineEnabled,
   upsertVoiceEngineRecord
 } from '$lib/server/services/voiceEngineRegistry'
+import { shouldStopVoiceRuntimeOnShutdown } from '$lib/utils/voiceSchema'
 import {
-  resolveLocalVoiceRuntimeLaunchRecordPath,
   resolveLocalVoiceRuntimeLogPath,
   resolveLocalVoiceRuntimeStatePath,
   resolveManagedInstallsRoot
 } from '$lib/server/services/voiceLocalRuntimePaths'
+import {
+  attachLocalRuntimeLaunchRecord,
+  normalizeLocalRuntimeEndpoint,
+  resolveVoiceRuntimeLaunchOwner,
+  writeLocalRuntimeLaunchRecord
+} from '$lib/server/services/voiceRuntimeLaunchRecords'
+import { logger } from '$lib/utils/logger'
 export {
   resolveLocalVoiceRuntimeLaunchRecordPath,
   resolveLocalVoiceRuntimeLogPath,
@@ -215,36 +223,37 @@ function expandUserHomePath(targetPath: string): string {
 }
 
 // Durable record of every detached local runtime launch (voice engines, native
-// LiveKit server, LiveKit sidecar). The Mac runtime supervisor reads these files
-// to stop the runtimes on app quit, since detached processes live in their own
-// process groups and would otherwise outlive Batshit.
-async function writeLocalRuntimeLaunchRecord(options: {
+// LiveKit server, LiveKit sidecar). The Mac runtime supervisor and the native
+// launcher read these files to stop the runtimes at shutdown, since detached
+// processes live in their own process groups and would otherwise outlive
+// Batshit. `stopOnShutdown` is the only way the user's "Stop with Batshit"
+// choice reaches them (neither reads Redis); `endpoint` is the listener the
+// process serves, which is how another engine using the same runtime finds it.
+async function recordDetachedLaunch(options: {
   engineId: string
   pid: number
   command: string
   args: string[]
   cwd: string
   logPath: string
+  stopOnShutdown: boolean
+  endpoint?: string | null
 }): Promise<void> {
-  const recordPath = resolveLocalVoiceRuntimeLaunchRecordPath(options.engineId)
-  await mkdir(path.dirname(recordPath), { recursive: true })
-  await writeFile(
-    recordPath,
-    `${JSON.stringify(
-      {
-        engineId: options.engineId,
-        pid: options.pid,
-        command: options.command,
-        args: options.args,
-        cwd: options.cwd,
-        logPath: options.logPath,
-        launchedAt: new Date().toISOString()
-      },
-      null,
-      2
-    )}\n`,
-    'utf8'
-  )
+  const endpoint = normalizeLocalRuntimeEndpoint(options.endpoint)
+  // Which Batshit launched it, so each stopper stops only its own Batshit's launches.
+  const launchedBy = resolveVoiceRuntimeLaunchOwner()
+  await writeLocalRuntimeLaunchRecord({
+    engineId: options.engineId,
+    pid: options.pid,
+    command: options.command,
+    args: options.args,
+    cwd: options.cwd,
+    logPath: options.logPath,
+    stopOnShutdown: options.stopOnShutdown,
+    ...(endpoint ? { endpoint } : {}),
+    ...(launchedBy ? { launchedBy } : {}),
+    launchedAt: new Date().toISOString()
+  })
 }
 
 function isLikelyScriptPath(value: string): boolean {
@@ -1030,6 +1039,10 @@ export async function startLocalVoiceRuntime(options: {
   installRoot: string
   installOwnership?: LocalVoiceEngineInstallOwnership
   launch: LocalVoiceEngineLaunchSpec
+  /** "Stop with Batshit". Omitted means stop, which is what quitting has always done. */
+  stopOnShutdown?: boolean
+  /** The engine's base URL: the listener this runtime serves, for engines that share it. */
+  endpoint?: string | null
 }): Promise<PreparedLocalVoiceRuntimeLaunch & { pid: number }> {
   assertCanLaunchLocalVoiceRuntimeInCurrentRuntime()
 
@@ -1043,13 +1056,15 @@ export async function startLocalVoiceRuntime(options: {
     logPath: prepared.logPath
   })
 
-  await writeLocalRuntimeLaunchRecord({
+  await recordDetachedLaunch({
     engineId: normalizeEngineId(options.engineId),
     pid,
     command: prepared.launchCommand,
     args: prepared.launchArgs,
     cwd: prepared.launchCwd,
-    logPath: prepared.logPath
+    logPath: prepared.logPath,
+    stopOnShutdown: options.stopOnShutdown !== false,
+    endpoint: options.endpoint
   })
 
   return {
@@ -1165,13 +1180,20 @@ export async function completeLocalVoiceEngineSetup(
         unsetEnv: preparedLaunch.launchUnsetEnv,
         logPath: preparedLaunch.logPath
       })
-      await writeLocalRuntimeLaunchRecord({
+      await recordDetachedLaunch({
         engineId,
         pid,
         command: preparedLaunch.launchCommand,
         args: preparedLaunch.launchArgs,
         cwd: preparedLaunch.launchCwd,
-        logPath: preparedLaunch.logPath
+        logPath: preparedLaunch.logPath,
+        // Re-running setup must not silently re-enable "Stop with Batshit" for
+        // someone who turned it off, the same way it preserves their existing
+        // "Start with Batshit" choice.
+        stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(
+          (await getVoiceEngineRecord(userId, engineId))?.localRuntime?.startup
+        ),
+        endpoint: normalizedPayload.baseUrl
       })
     } catch (error) {
       return blockResult(
@@ -1354,6 +1376,22 @@ export async function completeLocalVoiceEngineSetup(
       'enable',
       error instanceof Error ? error.message : 'The engine could not be enabled after registration.'
     )
+  }
+
+  // Set up against a runtime that was already running: this engine uses a
+  // process it did not start. When another engine's launch started it, this
+  // engine records its own "Stop with Batshit" choice beside that launch, so the
+  // shared runtime stops at quit only if every engine that uses it says stop.
+  // When nothing Batshit launched serves the endpoint, nothing is recorded.
+  if (!launched) {
+    await attachLocalRuntimeLaunchRecord({
+      engineId,
+      endpoint: normalizedPayload.baseUrl,
+      stopOnShutdown: shouldStopVoiceRuntimeOnShutdown(upserted.record.localRuntime?.startup)
+    }).catch((error) => {
+      // The engine is set up and working; only its shutdown choice failed to reach disk.
+      logger.warn('[voice-runtime] could not record a shared runtime choice', { engineId, error })
+    })
   }
 
   result.completed = true

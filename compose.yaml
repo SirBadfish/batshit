@@ -113,6 +113,14 @@ services:
       context: .
       dockerfile: batshit-app/Dockerfile
     restart: unless-stopped
+    # F-P7-10: run tini as PID 1 so orphaned children are reaped.
+    # This container's PID 1 is `node build`, and Node does NOT reap processes it did not
+    # spawn. A managed CLI helper bridge (`scripts/*-mcp.cjs`) orphans to PID 1 when its CLI
+    # exits; since it now exits with the run it would sit there as a zombie forever, holding
+    # a PID per managed turn. Measured both ways in a throwaway container: without init the
+    # exited helper stays `STAT Z` indefinitely, with init it is gone from the table.
+    # This is container process hygiene, not a substitute for the helper's own shutdown rule.
+    init: true
     env_file:
       - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}
         required: false
@@ -334,7 +342,7 @@ services:
       context: .
       dockerfile: tools/docker/agent-browser-sidecar/Dockerfile
       args:
-        AGENT_BROWSER_VERSION: ${AGENT_BROWSER_VERSION:-0.24.1}
+        AGENT_BROWSER_VERSION: ${AGENT_BROWSER_VERSION:-0.37.1}
     restart: unless-stopped
     env_file:
       - path: ${BATSHIT_DOCKER_ENV_FILE:-.env.docker}

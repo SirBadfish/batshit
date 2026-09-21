@@ -2,6 +2,18 @@
 
 import { logger } from '$lib/utils/logger'
 
+/**
+ * Who changed a zip's state. `user` locks (an agent may not zip it), `agent` is zip
+ * control, and `inferred` (SA-120 P5) is Batshit acting on a Jev Juice judgment: the
+ * weakest of the three. It never locks anything, either of the others overwrites it, and
+ * the browser never creates it; only the server writes it at the accepted-send boundary.
+ */
+export type ZipStateSource = 'user' | 'agent' | 'inferred'
+
+export function isZipStateSource(value: unknown): value is ZipStateSource {
+  return value === 'user' || value === 'agent' || value === 'inferred'
+}
+
 export interface UnzippedItem {
   zipId: string
   sessionId: string
@@ -12,17 +24,64 @@ export interface UnzippedItem {
   name?: string
   description?: string
   tokens?: number
-  source?: 'user' | 'agent'
+  source?: ZipStateSource
 }
 
+/**
+ * One chat's zip state, read-only: what `compileForAI` reads to decide zip activation, and
+ * what the DCM's `Current Zip State` lists. The browser singleton below is one (the tab's
+ * current chat). A server compile builds its own with `createZipStateView`, because two
+ * compiles can run at once in one process and a module-level object holds one chat.
+ */
+export interface ZipStateView {
+  isUnzipped(zipId: string): boolean
+  isRezipped(zipId: string): boolean
+  getRezippedSource(zipId: string): ZipStateSource | undefined
+  getUnzippedInfo(zipId: string): UnzippedItem | undefined
+  getAllUnzipped(): UnzippedItem[]
+}
+
+/**
+ * A frozen zip-state view over trusted records (the server's own Redis reads). A later item
+ * with the same zip id replaces an earlier one in place, and a rezip source that is not a
+ * known source is dropped, never guessed.
+ */
+export function createZipStateView(
+  items: UnzippedItem[],
+  rezippedIds: string[] = [],
+  rezippedSources: Record<string, ZipStateSource> = {}
+): ZipStateView {
+  const unzipped = new Map<string, UnzippedItem>()
+  for (const item of items) {
+    if (item?.zipId) {
+      unzipped.set(item.zipId, Object.freeze({ ...item }))
+    }
+  }
+  const rezipped = new Set(rezippedIds)
+  const sources = new Map<string, ZipStateSource>()
+  for (const [zipId, source] of Object.entries(rezippedSources)) {
+    if (isZipStateSource(source)) {
+      sources.set(zipId, source)
+    }
+  }
+  return Object.freeze({
+    isUnzipped: (zipId: string) => unzipped.has(zipId),
+    isRezipped: (zipId: string) => rezipped.has(zipId),
+    getRezippedSource: (zipId: string) => sources.get(zipId),
+    getUnzippedInfo: (zipId: string) => unzipped.get(zipId),
+    getAllUnzipped: () => Array.from(unzipped.values())
+  })
+}
+
+/** What the browser itself may write. `inferred` state is server-written and only read here. */
 type ZipControlSource = 'user' | 'agent'
 
-class ZippingService {
+class ZippingService implements ZipStateView {
   private apiUrl = '/api/unzipping' // Now using Vite API endpoint
   private currentSessionId: string | null = null
   private sessionUnzipped: Map<string, UnzippedItem> = new Map() // Memory cache only
   private sessionRezipped: Set<string> = new Set()
-  private sessionRezippedSources: Map<string, ZipControlSource> = new Map()
+  private sessionRezippedSources: Map<string, ZipStateSource> = new Map()
 
   private notifyStateChanged() {
     if (typeof window === 'undefined') return
@@ -118,7 +177,7 @@ class ZippingService {
         }
         if (data.rezippedSources && typeof data.rezippedSources === 'object') {
           Object.entries(data.rezippedSources).forEach(([id, source]) => {
-            if (source === 'user' || source === 'agent') {
+            if (isZipStateSource(source)) {
               this.sessionRezippedSources.set(id, source)
             }
           })
@@ -295,7 +354,7 @@ class ZippingService {
     return this.sessionRezipped.has(zipId)
   }
 
-  getRezippedSource(zipId: string): ZipControlSource | undefined {
+  getRezippedSource(zipId: string): ZipStateSource | undefined {
     return this.sessionRezippedSources.get(zipId)
   }
   
@@ -307,28 +366,18 @@ class ZippingService {
     return Array.from(this.sessionUnzipped.values())
   }
 
-  // Server-side hydration: populate from trusted data without hitting HTTP
-  hydrate(
-    sessionId: string,
-    items: UnzippedItem[],
-    rezippedIds: string[] = [],
-    rezippedSources: Record<string, ZipControlSource> = {}
-  ) {
-    this.currentSessionId = sessionId
-    this.sessionUnzipped.clear()
-    this.sessionRezipped.clear()
-    this.sessionRezippedSources.clear()
-    items.forEach(item => {
-      if (item?.zipId) {
-        this.sessionUnzipped.set(item.zipId, item)
-      }
-    })
-    rezippedIds.forEach(id => this.sessionRezipped.add(id))
-    Object.entries(rezippedSources).forEach(([id, source]) => {
-      if (source === 'user' || source === 'agent') {
-        this.sessionRezippedSources.set(id, source)
-      }
-    })
+  /**
+   * SA-120 P5: re-read this session's zip state from Redis. The server writes `inferred`
+   * unzips and rezips at the accepted-send boundary, so the tab learns of them here (the
+   * finished reply's metadata says when). Redis is the authority; nothing is re-posted.
+   */
+  async refreshFromServer(sessionId: string, fetcher?: typeof fetch): Promise<void> {
+    if (!sessionId) return
+    if (this.currentSessionId !== sessionId) {
+      await this.setCurrentSession(sessionId, fetcher)
+      return
+    }
+    await this.loadUnzippedFromAPI(fetcher)
     this.notifyStateChanged()
   }
   

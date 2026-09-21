@@ -29,6 +29,8 @@ Common Zip content:
 
 Cool Tool results are zip-first: Batshit stores the real result in Redis and renders the tool card from the Zip. If a Zip is missing or malformed, Batshit shows a clear missing-result state rather than pretending nothing happened.
 
+Memory tools are the one exception. The agent reads a memory search or recall result during that reply, but the result is never saved as a Zip; recalled memories reach later messages through the agent's [memory](../chat/memory-and-infinite-sessions.md) instead, so nothing is stored twice. Those calls show no tool card in the chat; the Execution Viewer still lists them.
+
 ## Buffer, threshold, and behavior
 
 Three settings control automatic zipping:
@@ -45,6 +47,12 @@ Changing a Zip while an agent is mid-answer affects later model calls and future
 
 The hands-on UI — the inline Zip badges, the per-item actions, and the Zip Manager's filter and sort — lives in [the Zip Manager](../chat/zip-manager.md).
 
+### Letting Batshit manage the exceptions (optional)
+
+Zips are a trade: fewer tokens, but the agent is left with a one-line label where a file used to be. Usually that's the right trade. Sometimes the label is for exactly the file your next message is about, and sometimes a result stays expanded for turns after the agent finished with it.
+
+If you use [Jev Juice](../jev-juice/overview.md), the **Jev Juice: Smart Zip** switch in the Global Tool Grid hands those exceptions to a fast judgment model. Before each reply it unzips the one or two zipped results your message clearly needs, for that message, and only names the ones it's less sure about. After each reply it zips the results the agent is finished with, instead of waiting for the buffer. Everything it does is marked (a lightning bolt on the Zip badge), the agent is told each time, and your own unzip, zip, and pins always win. It sends your message, the reply, and those one-line labels (never the results themselves) to TypeSafe's servers, so it is off until you turn it on.
+
 ## Context controls
 
 Zips shrink individual results. For the conversation as a whole — temporarily trimming older messages, permanently compacting them into a summary, and what happens when an agent runs out of context mid-task — see [Compact and Trim](../chat/compact-and-trim.md).
@@ -52,6 +60,7 @@ Zips shrink individual results. For the conversation as a whole — temporarily 
 ## Related docs
 
 - [The Zip Manager](../chat/zip-manager.md)
+- [Jev Juice (optional)](../jev-juice/overview.md)
 - [Compact and Trim](../chat/compact-and-trim.md)
 - [Clips](../clips/overview.md)
 - [Tools, MCPs, CLI Tools, and Skills](overview.md)

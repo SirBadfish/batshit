@@ -30,6 +30,9 @@ const DIRECT_MULTI_DEVELOPER_SERVICES = new Set([
   'cerebras',
   'qwencloud',
   'qwen_token_plan',
+  'kimi_code',
+  'minimax_token_plan',
+  'mimo_token_plan',
   ...LOCAL_AI_SERVER_IDS
 ])
 
@@ -94,6 +97,14 @@ export function isCatalogVariantCompatibleForConnection(
   return isDirectDeveloperCompatible(variant.developerId, connection)
 }
 
+function declaresConnections(model: CatalogModel): boolean {
+  return (
+    Boolean(model.connectionId) ||
+    Boolean(model.availableConnections?.length) ||
+    Object.keys(model.idVariants ?? {}).length > 0
+  )
+}
+
 function resolveModelTransport(model: CatalogModel): 'vercel-gateway' | 'openrouter' | 'local' {
   if (model.transport) {
     return model.transport === 'direct' ? 'local' : model.transport
@@ -133,8 +144,14 @@ export function isModelAllowedForConnection(
     case 'openrouter':
       return transport === 'openrouter'
     case 'direct':
-      // For direct connections, allow provider-based filtering to keep the UX usable even when the
-      // catalog doesn't provide explicit availability metadata for the selected provider.
+      // A row that names where it runs is authoritative. `/api/models` unions every advertised
+      // connection (idVariants keys, availableConnections, connectionId), and each one carries the
+      // exact provider identity, so this direct connection is not among them: applying the row
+      // would fail the identity check (resolveCatalogIds, the enrich and save routes). A gateway-only
+      // Anthropic row must not appear under Anthropic (Direct).
+      if (declaresConnections(model)) return false
+      // Only rows with no connection metadata at all (manual or legacy entries) fall back to the
+      // developer name, so they stay selectable.
       if (connection.providers && connection.providers.length) {
         const providers = getNormalizedConnectionProviders(connection)
         return providers.has(normalizeConnectionValue(model.provider))

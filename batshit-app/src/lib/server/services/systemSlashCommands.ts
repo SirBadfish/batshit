@@ -113,11 +113,29 @@ function normalizeExistingAgentIds(existing?: SlashCommandRow | null): string[] 
   )
 }
 
-function deriveAttachableState(existing?: SlashCommandRow | null): {
+/**
+ * Agent access for a system command. An existing record always keeps the user's choice (an
+ * empty list may be deliberate, and on disk it looks the same as the old default, so it is never
+ * migrated). Only a record that does not exist yet takes the new-install default:
+ * Artifact Creator and Batshit Guide start on for all agents, so a fresh agent can build an
+ * artifact and answer Batshit questions (Josh, 2026-09-21, BL-69); the other system skills start off.
+ */
+function deriveAttachableState(
+  existing?: SlashCommandRow | null,
+  options: { enabledForAllAgentsWhenNew?: boolean } = {}
+): {
   enabledForAllAgents: boolean
   enabledAgentIds: string[]
   canBeAttachedToAgents: boolean
 } {
+  if (!existing) {
+    const enabledForAllAgents = options.enabledForAllAgentsWhenNew === true
+    return {
+      enabledForAllAgents,
+      enabledAgentIds: [],
+      canBeAttachedToAgents: enabledForAllAgents
+    }
+  }
   const enabledAgentIds = normalizeExistingAgentIds(existing)
   const enabledForAllAgents = existing?.enabled_for_all_agents === true
   return {
@@ -545,7 +563,7 @@ export async function buildBatshitGuideSkillCommand(
 ): Promise<SlashCommandRow> {
   const sourceDir = resolveSystemSkillDir('batshit-guide')
   const { markdown, hasReferences, hasAssets } = readSystemSkillContent('batshit-guide')
-  const accessState = deriveAttachableState(existing)
+  const accessState = deriveAttachableState(existing, { enabledForAllAgentsWhenNew: true })
 
   const skill = await upsertSkill({
     userId,
@@ -615,7 +633,7 @@ export async function buildUnifiedArtifactSkillCommand(
 ): Promise<SlashCommandRow> {
   const sourceDir = resolveSystemSkillDir('artifacts')
   const { markdown, hasReferences, hasAssets } = readSystemSkillContent('artifacts')
-  const accessState = deriveAttachableState(existing)
+  const accessState = deriveAttachableState(existing, { enabledForAllAgentsWhenNew: true })
 
   const skill = await upsertSkill({
     userId,

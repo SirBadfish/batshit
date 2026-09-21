@@ -38,6 +38,7 @@
     RotateCcw
   } from '@lucide/svelte'
   import { debounce } from '$lib/utils/debounce'
+  import { GLOBAL_JEV_SMART_ZIP_FIELD, resolveJevSmartZipEnabled } from '$lib/utils/jevJuiceControl'
   import { setUserSettings } from '$lib/stores/userSettings.svelte'
   import {
     formatToolGridInheritedZipBehaviorLabel,
@@ -257,6 +258,8 @@
   let zipAgentControlEnabled = $state(false)
   let zipAiViewMode = $state<'inline' | 'appended'>('appended')
   let zipToolNotesEnabled = $state(true)
+  // SA-120 P5 (LS-054): "Jev Juice: Smart Zip", the one global switch. Absent means OFF.
+  let jevSmartZipEnabled = $state(false)
   let zipSaveState = $state<SaveState>('idle')
   let zipSaveError = $state<string | null>(null)
   let zipResetTimer: ReturnType<typeof setTimeout> | null = null
@@ -385,6 +388,7 @@
         typeof global.zip_tool_notes_enabled === 'boolean'
           ? global.zip_tool_notes_enabled
           : DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED
+      jevSmartZipEnabled = resolveJevSmartZipEnabled(global)
     } catch (error) {
       console.warn('[GlobalToolGrid] Failed loading zip defaults', error)
       zipSaveError =
@@ -648,6 +652,11 @@
     queueSaveZipSettings()
   }
 
+  function updateJevSmartZipEnabled(enabled: boolean) {
+    jevSmartZipEnabled = enabled
+    queueSaveZipSettings()
+  }
+
   const debouncedSaveZipSettings = debounce(async () => {
     if (!userId) return
 
@@ -658,6 +667,12 @@
         zip_ai_view_mode: zipAiViewMode,
         zip_tool_notes_enabled: zipToolNotesEnabled,
         custom_tool_settings: [...customToolSettings]
+      }
+      // Absent means OFF, so OFF is stored as absent: the same shape the global reset writes.
+      if (jevSmartZipEnabled) {
+        nextGlobalZipSettings[GLOBAL_JEV_SMART_ZIP_FIELD] = true
+      } else {
+        delete nextGlobalZipSettings[GLOBAL_JEV_SMART_ZIP_FIELD]
       }
 
       const settings = await saveUserToolGridDefaults(
@@ -734,6 +749,8 @@
       zipAgentControlEnabled = DEFAULT_GLOBAL_ZIP_AGENT_CONTROL_ENABLED
       zipAiViewMode = DEFAULT_GLOBAL_ZIP_AI_VIEW_MODE
       zipToolNotesEnabled = DEFAULT_GLOBAL_ZIP_TOOL_NOTES_ENABLED
+      // The reset writes product defaults, and this switch's default is OFF (absent).
+      jevSmartZipEnabled = false
       saveErrorByGateway = {}
       saveStateByGateway = { [GLOBAL_RESET_SAVE_KEY]: 'saved' }
       zipSaveState = 'saved'
@@ -1691,9 +1708,11 @@
       {zipAgentControlEnabled}
       {zipAiViewMode}
       {zipToolNotesEnabled}
+      {jevSmartZipEnabled}
       onZipControlPermissionChange={updateZipControlPermission}
       onZipAiViewModeChange={updateZipAiViewMode}
       onZipToolNotesEnabledChange={updateZipToolNotesEnabled}
+      onJevSmartZipEnabledChange={updateJevSmartZipEnabled}
     />
 
     {#if loading}

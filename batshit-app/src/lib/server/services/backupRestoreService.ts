@@ -14,6 +14,7 @@ import type { Entry, ZipFile } from 'yauzl'
 import { redis } from '$lib/server/redis'
 import { reconcileMemoryIndexesAfterRestore } from '$lib/server/services/memory/memoryIndex'
 import { invalidateScheduleDueCache } from '$lib/server/services/schedules/scheduleStore'
+import { mcpToolListCache } from '$lib/server/services/mcpToolListCache'
 import {
   GOON_RECIPE_OWNER_V2_CONTRACT,
   GOON_RECIPE_REVISION_ENVELOPE_CONTRACT,
@@ -80,6 +81,7 @@ const SYSTEM_PROMPT_KEYS = [
   'batshit:tool_guidance_zip_disabled_prompt',
   'batshit:tool_guidance_memory_prompt',
   'batshit:dm_guidance',
+  'batshit:jev_juice_guidance',
   'batshit:dynamic_mcp_prompt',
   'batshit:batshit_primary_system_prompt',
   'batshit:primary_system_prompt',
@@ -93,6 +95,7 @@ const SYSTEM_PROMPT_KEYS = [
   'batshit:tool_guidance_zip_disabled_prompt:last_updated',
   'batshit:tool_guidance_memory_prompt:last_updated',
   'batshit:dm_guidance:last_updated',
+  'batshit:jev_juice_guidance:last_updated',
   'batshit:dynamic_mcp_prompt:last_updated',
   'batshit:batshit_primary_system_prompt:last_updated',
   'batshit:primary_system_prompt:last_updated',
@@ -1135,7 +1138,9 @@ function groupForKey(key: string, userId: string): BackupGroupId {
     key === `user:${userId}:settings` ||
     key === `project_prefs:${userId}` ||
     key === `icon_library:${userId}:prefs` ||
-    key === 'system:settings:docker-mcp'
+    key === 'system:settings:docker-mcp' ||
+    // SA-120: the instance-level Jev Juice config (master switch, pinned model, timeout).
+    key === 'batshit:typesafe_config'
   ) {
     return 'settings'
   }
@@ -1251,6 +1256,7 @@ function groupForKey(key: string, userId: string): BackupGroupId {
 function isRestorableKeyForUser(key: string, userId: string) {
   if (SYSTEM_PROMPT_KEYS.includes(key as (typeof SYSTEM_PROMPT_KEYS)[number])) return true
   if (key === 'system:settings:docker-mcp') return true
+  if (key === 'batshit:typesafe_config') return true
   if (
     key === 'batshit:memory_config' ||
     key === 'batshit:memory_index_meta' ||
@@ -1319,6 +1325,10 @@ function isRestorableKeyForUser(key: string, userId: string) {
     'unzipped_item:',
     'rezipped:',
     'rezipped_item:',
+    // SA-120 P6: what the Jev Juice after-reply check noticed about a reply (the chip under it).
+    // Chat data, written only by `postTurnCheckState.ts`.
+    'jev_post_turn:',
+    'jev_post_turn_item:',
     'session_clip:',
     'subagent_sessions:',
     // SA-111 P2 (DL-111-06): the Batshit-issued n8n Workflow Subagent thread id. The
@@ -1496,6 +1506,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     `user_artifact_usage:${userId}`,
     'user:system:clips',
     'system:settings:docker-mcp',
+    'batshit:typesafe_config',
     'batshit:memory_config',
     'batshit:memory_index_meta',
     'batshit:memory_media_migration:v1',
@@ -1516,6 +1527,7 @@ async function collectCandidateKeys(client: any, userId: string) {
       `session:${sessionId}:active_clips`,
       `unzipped:${sessionId}`,
       `rezipped:${sessionId}`,
+      `jev_post_turn:${sessionId}`,
       `pins:${sessionId}`,
       `session:${sessionId}:episodes`,
       `memlinger:${sessionId}`
@@ -1529,6 +1541,7 @@ async function collectCandidateKeys(client: any, userId: string) {
     await addPatternKeys(keys, client, `subagent_thread:${sessionId}:*`)
     await addPatternKeys(keys, client, `unzipped_item:${sessionId}:*`)
     await addPatternKeys(keys, client, `rezipped_item:${sessionId}:*`)
+    await addPatternKeys(keys, client, `jev_post_turn_item:${sessionId}:*`)
     await addPatternKeys(keys, client, `zip_temp:${sessionId}:*`)
     await addPatternKeys(keys, client, `zip_temp_meta:${sessionId}:*`)
   }
@@ -2685,6 +2698,9 @@ export async function restoreBackupBundle(
   // T" cache is describing the keyspace that was just replaced. Without this the ticker
   // could ignore a restored schedule for up to five minutes.
   invalidateScheduleDueCache()
+  // The gateway registry and the API keys were replaced around the gateway service too, so
+  // every saved tool list of this user is thrown away and the next send asks again.
+  mcpToolListCache.clearUser(userId)
 
   return {
     restored: true,
@@ -3457,6 +3473,7 @@ export async function restoreStagedBackup(
     // SA-118 DL-118-01 — same reason as `restoreBackupBundle`: the schedule keyspace was
     // replaced from outside the store, so its due cache has to be thrown away.
     invalidateScheduleDueCache()
+    mcpToolListCache.clearUser(userId)
 
     return {
       restored: true,

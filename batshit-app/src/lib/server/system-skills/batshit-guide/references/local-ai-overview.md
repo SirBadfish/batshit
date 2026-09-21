@@ -15,10 +15,48 @@ Local AI is connect-first. Batshit doesn't bundle these programs or any model we
 | vLLM | `http://localhost:8000` | `/v1` | Connect existing |
 | SGLang | `http://localhost:30000` | `/v1` | Connect existing |
 | oMLX | `http://localhost:8000` | `/v1` | Connect existing |
+| KoboldCpp | `http://localhost:5001` | `/v1` | Connect existing |
 
 Connect existing means Batshit checks health and lists models, but you start, stop, update, and download models in that program's own app or command line.
 
 Ollama and Docker Model Runner are enabled by default. The rest you turn on when you have them.
+
+**Batshit can load and unload models for five of these programs.** Ollama, Docker Model Runner,
+KoboldCpp, LM Studio and oMLX each have a Models card in Settings, Local AI. The other three,
+llama.cpp, vLLM and SGLang, run one model per program start: you pick it on the command line, and
+nothing can change it while they run. Batshit shows you what they have loaded instead.
+
+**Batshit asks the program, it does not read your folders.** That is on purpose. If Batshit listed
+the model files on your disk, it would show you models for programs that cannot load them, and every
+one of those would be a dead entry.
+
+Two things to know:
+
+- **KoboldCpp restarts itself to change models.** It goes quiet for a few seconds. That is normal.
+  KoboldCpp also needs to be started with `--admin` and `--admindir` pointing at your models folder,
+  or it cannot switch at all. Batshit tells you if you forgot.
+- **LM Studio downloads are done in LM Studio.** Batshit can load and unload, but LM Studio has no
+  way to start a download from outside, so there is no download button here.
+
+**KoboldCpp is the newest.** It is one downloaded program file, it runs GGUF models, and it is what
+most of the roleplay community uses. Point Batshit at `http://localhost:5001` after you start it.
+
+Two of its features are off until you turn them on when you start it:
+
+- `--enableguidance` turns on negative prompts.
+- `--jinja` turns on chat-template options.
+
+Batshit cannot switch these on for you, because they are chosen when the program starts.
+
+**Two things Batshit deliberately does not show you for KoboldCpp.** Mirostat is offered by KoboldCpp
+but does nothing on the Mac version we tested — turning it on only switches off Top K and Top P, and
+its two dials change nothing at all. And KoboldCpp treats Frequency Penalty and Presence Penalty as
+the same setting, so Batshit shows you Presence Penalty only. An empty box is better than a box that
+lies.
+
+**KoboldCpp cannot tell Batshit about its prompt cache.** Its replies carry no cache numbers, so the
+Token Panel says the count is unknown rather than showing you a zero nobody measured. Its cache still
+works; Batshit just cannot see it. Watch the speed numbers instead.
 
 **SGLang and oMLX are new.** [Their setup page](sglang-and-omlx.md) covers both, including the fact that oMLX and vLLM share port 8000 by default.
 
@@ -47,7 +85,7 @@ Save it in **Settings → API Keys → Local AI**, alongside your cloud keys. Th
 
 Leave it blank if your program doesn't ask for one. Nothing changes.
 
-Full detail is on [the SGLang and oMLX page](sglang-and-omlx.md#local-api-keys), which covers keys for all seven programs.
+Full detail is on [the SGLang and oMLX page](sglang-and-omlx.md#local-api-keys), which covers keys for all eight programs.
 
 ## Mac app vs Docker
 

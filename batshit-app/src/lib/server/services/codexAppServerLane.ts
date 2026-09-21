@@ -19,7 +19,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import readline from 'node:readline'
-import type { ThreadEvent, ThreadItem, Usage } from '$lib/types/codexProtocol'
+import type { FileUpdateChange, ThreadEvent, ThreadItem, Usage } from '$lib/types/codexProtocol'
 import { logger } from '$lib/utils/logger'
 import {
   CONTEXT_GUARD_CLASSIFIER_MARKER,
@@ -120,6 +120,32 @@ function reasoningText(item: Record<string, any>): string {
 }
 
 /**
+ * One change of an app-server `fileChange` item, in the exec stream's shape the event adapter
+ * reads, where `kind` is a word. The app server describes the kind as an object (`{ type: 'add' }`,
+ * `{ type: 'delete' }`, or `{ type: 'update', move_path }`, codex-cli 0.139.0) and sends each
+ * file's own `diff`: unified hunks for an update, the whole text for an add or a delete, and
+ * `\n\nMoved to: <path>` after any hunks for a rename. Passing the object through crashed the
+ * adapter on every native patch (`kind.toLowerCase is not a function`), and dropping `diff` left
+ * the card to a start copy that an in-process patch can beat.
+ */
+function mapAppServerFileChange(raw: unknown): FileUpdateChange {
+  const change = raw && typeof raw === 'object' ? (raw as Record<string, any>) : {}
+  const kind = change.kind
+  const kindType =
+    typeof kind === 'string' ? kind : typeof kind?.type === 'string' ? kind.type : 'update'
+  const movePath =
+    typeof kind?.move_path === 'string' && kind.move_path ? kind.move_path : undefined
+  const diff = typeof change.diff === 'string' ? change.diff : undefined
+  return {
+    path: typeof change.path === 'string' ? change.path : '',
+    // A rename that also changed lines is an edit of that file; a bare rename is a move.
+    kind: (movePath ? (diff && /^@@/m.test(diff) ? 'update' : 'move') : kindType) as FileUpdateChange['kind'],
+    ...(movePath ? { to: movePath } : {}),
+    ...(diff !== undefined ? { diff } : {}),
+  }
+}
+
+/**
  * Maps an app-server thread item (camelCase) to the exec-JSONL ThreadItem
  * shape (snake_case) the event adapter consumes. Returns null for item kinds
  * the exec stream never emits (e.g. userMessage echoes) — those are skipped.
@@ -147,12 +173,7 @@ export function mapAppServerItem(raw: unknown): ThreadItem | null {
       return {
         id,
         type: 'file_change',
-        changes: Array.isArray(item.changes)
-          ? item.changes.map((change: any) => ({
-              path: change?.path ?? '',
-              kind: change?.kind ?? 'update',
-            }))
-          : [],
+        changes: Array.isArray(item.changes) ? item.changes.map(mapAppServerFileChange) : [],
         status: mapStatus(item.status) as any,
       }
     case 'mcpToolCall':
@@ -434,9 +455,26 @@ export function startCodexAppServerRun(
   const requestInterrupt = (reason: 'guard' | 'abort') => {
     if (interruptRequested || !threadId || !turnId) return false
     interruptRequested = true
-    logger.debug('[CodexAppServer] Sending turn/interrupt', { reason, threadId, turnId })
-    request('turn/interrupt', { threadId, turnId }).catch((error) => {
-      console.error('[CodexAppServer] turn/interrupt failed', { reason, error })
+    const interruptThreadId = threadId
+    const interruptTurnId = turnId
+    // Sent once the turn has STARTED (2026-09-18). Live Codex refuses `turn/interrupt` in the
+    // gap between the `turn/start` reply and the `turn/started` notification ("no active turn
+    // to interrupt", -32600), exactly as it refuses a steer there (F-P2-1). Sent at once, a Stop
+    // pressed in the first moments of a reply was refused and waited out the backstop below:
+    // 11.0 s measured (`_local/stopfix-proof/before-codex-stop-300.json`). A run that ends
+    // before its turn starts settles `turnReady` false and needs no interrupt.
+    void turnReady.then((ready) => {
+      if (!ready || closed) return
+      logger.debug('[CodexAppServer] Sending turn/interrupt', {
+        reason,
+        threadId: interruptThreadId,
+        turnId: interruptTurnId,
+      })
+      request('turn/interrupt', { threadId: interruptThreadId, turnId: interruptTurnId }).catch(
+        (error) => {
+          console.error('[CodexAppServer] turn/interrupt failed', { reason, error })
+        },
+      )
     })
     // Backstop: if codex does not finish the turn after an interrupt, fail loudly.
     setTimeout(() => {
@@ -834,6 +872,13 @@ export function startCodexAppServerRun(
       ]
       for (const imagePath of input.imagePaths ?? []) {
         inputItems.push({ type: 'localImage', path: imagePath })
+      }
+      // Stopped while the thread was starting: never start a turn only to interrupt it.
+      if (input.signal?.aborted) {
+        const abortError = new Error('Codex run aborted by user')
+        abortError.name = 'AbortError'
+        finishWithError(abortError)
+        return
       }
       const turnResult = await request('turn/start', {
         threadId,

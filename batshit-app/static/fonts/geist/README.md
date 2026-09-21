@@ -3,7 +3,7 @@ Batshit Geist font files
 
 Source: `geist@1.7.1` from npm, published by Vercel.
 
-Geist Sans is Batshit's official interface font. Geist Mono is Batshit's official monospaced font.
+Geist Sans and Geist Mono are the fallbacks behind Nunito Sans and Google Sans Code, and still the fonts Artifacts generate with (served to artifacts by `/artifact-assets/fonts/geist/`).
 
 Included files:
 - `Geist-Variable.woff2`

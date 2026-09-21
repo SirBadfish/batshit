@@ -3,6 +3,7 @@ import { redis } from '$lib/server/redis'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
 import { sanitizeId } from '$lib/utils/idSanitizer'
+import { validateGroupAgentSettingsInput } from '$lib/types/groupChat'
 
 // GET /api/groups - List all groups for the current user
 export const GET: RequestHandler = async ({ locals }) => {
@@ -27,6 +28,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
   try {
     const body = await request.json()
+    // SA-120 P3: a speaking preset must be one Batshit knows; a typo is refused, never read as something else.
+    const agentSettingsError = Object.prototype.hasOwnProperty.call(body ?? {}, 'agent_settings')
+      ? validateGroupAgentSettingsInput(body.agent_settings)
+      : null
+    if (agentSettingsError) {
+      return json({ error: agentSettingsError }, { status: 400 })
+    }
     const baseId = body.id?.trim() || sanitizeId(body.name || 'group')
     let groupId = baseId
 

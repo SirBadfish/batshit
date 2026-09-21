@@ -1,5 +1,7 @@
-import { error } from '@sveltejs/kit'
+import { error, json } from '@sveltejs/kit'
 import { logger } from '$lib/utils/logger'
+import { readApprovalResumeStart } from '$lib/utils/approvalResumeStream'
+import { mergeResumedMetadata, mergeResumedSteps } from '$lib/server/services/approvalResumeMessage'
 import type { RequestHandler } from './$types'
 import { redis } from '$lib/server/redis'
 import { resolveRedisConnectionUrl } from '$lib/server/redisConnection'
@@ -38,12 +40,25 @@ import { isTrustedN8nSseCallbackRequest } from '$lib/server/services/n8nCallback
 import { normalizeAssignedSubagent } from '$lib/server/services/assignedSubagentNormalization'
 import { parseJsonLike, normalizeToolArgs } from '$lib/server/services/sseToolNormalization'
 import {
+  collectTrustedZipIdsFromMetadata,
   neutralizeAllClipReferenceSyntax,
   neutralizeUntrustedZipReferenceSyntax
 } from '$lib/utils/zipReferenceSafety'
 import { registerRuntimeShutdownTask } from '$lib/server/services/runtimeShutdown'
 import { parseSseChannel } from '$lib/server/ssePublisher'
 import { getWakeRun, hasActiveWakeRun } from '$lib/server/services/wakeRunRegistry'
+import {
+  createLiveHubRegistry,
+  parseHubSubscriptionChange,
+  type HubListener
+} from '$lib/server/sseLiveHub'
+import {
+  TURN_SHUTDOWN_WAIT_MS,
+  hasTurnOutcome,
+  waitForRunningTurns,
+  watchTurnOutcome
+} from '$lib/server/services/turnOutcomeRegistry'
+import type { TurnOverEvent } from '$lib/services/liveHub/protocol'
 
 type SSEController = ReadableStreamDefaultController & {
   _id?: string;
@@ -63,6 +78,15 @@ type ActiveStreamState = {
   events: StreamEventPayload[];
   messageIds: Set<string>;
   nextEventIndex: number;
+  /**
+   * End finalization needs the WHOLE current run even when the joining-aid replay buffer is
+   * capped. One entry per active message keeps its start envelope plus only content/tool events;
+   * adjacent text chunks are coalesced so a long answer does not retain thousands of objects.
+   */
+  reconstructionByMessage: Map<string, {
+    start: StreamEventPayload | null;
+    events: StreamEventPayload[];
+  }>;
 }
 
 // Active SSE connections (can have multiple listeners per session)
@@ -232,6 +256,13 @@ async function ensureExternalSubscriber() {
 
 export function _closeSseRuntimeResources(reason = 'shutdown'): Promise<void> {
   sseRuntimeShutdownPromise ??= (async () => {
+    // A send answered early (respond-async, 2026-09-18) is still running here, and its tab hears
+    // how it ended only over its live hub. Its request used to be one adapter-node drained before
+    // it closed (up to 30 s); now the hubs stay open until those turns end, and Redis stays up
+    // until this task is done (`closeRuntimeResources` in hooks.server.ts awaits it first).
+    if (!(await waitForRunningTurns(TURN_SHUTDOWN_WAIT_MS))) {
+      console.warn(`[SSE] Closing the live streams with a reply still running (${reason})`)
+    }
     const visualCleanups: Promise<void>[] = []
     for (const [sessionId, sessionControllers] of connections) {
       for (const controller of sessionControllers) {
@@ -269,6 +300,8 @@ export function _closeSseRuntimeResources(reason = 'shutdown'): Promise<void> {
       }
     }
     userConnections.clear()
+    // Every listener above may have been a live hub subscription; now end the hub streams.
+    liveHubs.closeAllStreams()
 
     for (const timers of activeStreamCleanupTimers.values()) {
       for (const timer of timers.values()) clearTimeout(timer)
@@ -543,8 +576,8 @@ const sessionZipSettings = new Map<string, Record<string, any> | undefined>()
  * SA-113 F-P1-2 — sessions whose zip settings were loaded for a headless woken turn
  * rather than by a tab connecting.
  *
- * `sessionZipSettings` is normally filled on GET (a tab connects) and dropped on the last
- * disconnect. A woken turn can stream with nobody watching, and AMD-113-01 hands its zips
+ * `sessionZipSettings` is normally filled when a tab subscribes to the chat
+ * (`attachSessionListener`) and dropped when its last listener goes. A woken turn can stream with nobody watching, and AMD-113-01 hands its zips
  * to the stream path, so without this the user's own thresholds would be ignored for
  * exactly the turns they never see happen. Tracking which entries the wake path owns is
  * what lets them be dropped again without touching an entry a real tab owns.
@@ -633,16 +666,218 @@ async function loadAgentSettings(sessionId: string) {
 }
 
 /**
- * SA-113 P1 (DL-113-06) — the user-scoped live channel.
- *
- * Cookie-only, like the session channel: an `EventSource` cannot send headers, so there
- * is no token lane here and there must not be one. It carries `session_created`,
- * `session_updated`, `session_run_status`, and (from P2) `dm_inbox_changed`.
- *
- * Intentionally simpler than the session channel: no zip settings, no stream adapter, no
- * replay buffer, no visual-indicator monitoring. Those are all session-scoped concerns.
+ * Attach one listener to a chat: what a tab's own `GET /api/sse?sessionId=` did when it
+ * connected, before the live hub (2026-09-18). Loads the user's zip settings, files the
+ * listener, greets it, replays the chat's live turn to it, and starts zip-activity monitoring.
+ * The live hub calls this once per chat SUBSCRIPTION, so two tabs on one chat are still two
+ * listeners, as they were when each had its own stream.
  */
-async function openUserChannel(url: URL, locals: App.Locals): Promise<Response> {
+async function attachSessionListener(
+  sessionId: string,
+  controllerRef: SSEController,
+  userId: string
+) {
+  let globalZipSettings: Record<string, any> | undefined = undefined
+  try {
+    const userSettings = await redis.getUserSettings(userId)
+    globalZipSettings = userSettings?.global_zip_settings || undefined
+  } catch (err) {
+    console.error('[SSE] Failed to load user zip settings:', err)
+  }
+
+  sessionZipSettings.set(sessionId, globalZipSettings)
+  // A real tab now owns this entry; its disconnect is what drops it (F-P1-2).
+  wakeOwnedZipSettings.delete(sessionId)
+
+  if (!controllerRef._id) {
+    controllerRef._id = `sse-${randomUUID()}`
+  }
+
+  // Store connection (support multiple concurrent listeners)
+  let sessionControllers = connections.get(sessionId)
+  if (!sessionControllers) {
+    sessionControllers = new Set<SSEController>()
+    connections.set(sessionId, sessionControllers)
+  }
+  sessionControllers.add(controllerRef)
+
+  logger.debug('[SSE] Active listeners for session', {
+    sessionId,
+    listenerCount: sessionControllers.size,
+    controllers: Array.from(sessionControllers).map((entry) => entry._id)
+  })
+
+  // Send initial connection message
+  try {
+    controllerRef.enqueue(`data: ${JSON.stringify({
+      type: 'connected',
+      sessionId
+    })}\n\n`)
+  } catch (err) {
+    console.error('[SSE] Failed to enqueue connected event', {
+      sessionId,
+      controllerId: controllerRef._id,
+      error: err
+    })
+  }
+
+  // If an active stream is in progress, replay it for this listener
+  replayActiveStreamForListener(sessionId, controllerRef)
+
+  // Set up Redis keyspace monitoring for zip activity
+  try {
+    await setupRedisMonitoring(sessionId, controllerRef)
+  } catch (err) {
+    console.error('[SSE] Error setting up Redis monitoring:', err)
+    // Continue anyway - monitoring is optional
+  }
+
+  // Shutdown can begin while the async Redis subscription is still being
+  // established. If it did, tear down the late resource immediately.
+  if (controllerRef._closed) {
+    const lateVisualCleanup = controllerRef._visualCleanup
+    controllerRef._visualCleanup = undefined
+    await lateVisualCleanup?.()
+  }
+}
+
+/**
+ * Detach one listener from a chat: what a tab's stream closing did before the live hub. When
+ * the chat's LAST listener goes, its zip buffers, caches, stream adapter, and temp storage are
+ * torn down, exactly as before.
+ */
+async function detachSessionListener(sessionId: string, cancelController: SSEController) {
+  logger.debug('[SSE] Connection closed for session:', sessionId)
+
+  const sessionControllers = connections.get(sessionId)
+  if (sessionControllers && sessionControllers.size > 0) {
+    for (const entry of sessionControllers) {
+      if (entry === cancelController) {
+        entry._closed = true
+        if (entry._heartbeat) {
+          clearInterval(entry._heartbeat)
+        }
+        await entry._visualCleanup?.()
+        sessionControllers.delete(entry)
+        break
+      }
+    }
+
+    if (sessionControllers.size === 0) {
+      connections.delete(sessionId)
+      zipDetection.deleteSessionBuffers(sessionId)
+      agentSettingsCache.delete(sessionId)
+      sessionZipSettings.delete(sessionId)
+      sessionSubagentCache.delete(sessionId)
+      resetStreamAdapter(sessionId)
+
+      try {
+        await redisStreamService.cleanupSessionTempStorage(sessionId)
+        logger.debug(`[SSE] Cleaned up Redis temp storage for session ${sessionId}`)
+      } catch (error) {
+        console.error('[SSE] Error cleaning up Redis temp storage:', error)
+      }
+    } else {
+      logger.debug('[SSE] Connection closed', {
+        sessionId,
+        listenerCount: sessionControllers.size,
+        controllers: Array.from(sessionControllers).map((entry) => entry._id)
+      })
+    }
+  }
+}
+
+/**
+ * SA-113 P1 (DL-113-06) — attach one listener to the user-scoped live channel, which carries
+ * `session_created`, `session_updated`, `session_run_status`, `dm_inbox_changed`, and the chat
+ * page's re-read events. Intentionally simpler than a chat listener: no zip settings, no stream
+ * adapter, no replay buffer, no visual-indicator monitoring. Those are all chat concerns.
+ */
+function attachUserListener(userId: string, controller: SSEController) {
+  let listeners = userConnections.get(userId)
+  if (!listeners) {
+    listeners = new Set<SSEController>()
+    userConnections.set(userId, listeners)
+  }
+  listeners.add(controller)
+
+  try {
+    controller.enqueue(`data: ${JSON.stringify({ type: 'connected', scope: 'user' })}\n\n`)
+  } catch (err) {
+    logger.debug('[SSE] Failed to greet a user-channel listener', { userId, error: err })
+  }
+
+  logger.debug('[SSE] User channel opened', { userId, controllerId: controller._id })
+}
+
+function sessionRefusalCode(status: number) {
+  if (status === 404) return 'session_not_found'
+  if (status === 403) return 'forbidden'
+  return 'invalid_session'
+}
+
+/**
+ * A send's turn (2026-09-18). The page's send is answered once the server owns its turn
+ * (`Prefer: respond-async`, `respondAsyncSend.ts`), so its request no longer holds one of the
+ * browser's six connections for the whole reply; the tab subscribes to the turn and hears ONE
+ * event, `turn_over`, with the answer send-routed gave at the end of the turn. A subscription
+ * added after the turn ended gets it at once (the registry keeps it), which is what keeps a hub
+ * that reconnected mid-reply from waiting forever. Another user's turn and an unknown one are
+ * refused alike, `turn_not_found`.
+ */
+const turnWatchStops = new WeakMap<HubListener, () => void>()
+
+function attachTurnListener(turnId: string, listener: HubListener, userId: string) {
+  const stop = watchTurnOutcome(turnId, userId, (outcome) => {
+    const event: TurnOverEvent = { type: 'turn_over', turnId, ...outcome }
+    listener.enqueue(`data: ${JSON.stringify(event)}\n\n`)
+  })
+  if (!stop) throw new Error('turn_not_found')
+  turnWatchStops.set(listener, stop)
+}
+
+function detachTurnListener(listener: HubListener) {
+  turnWatchStops.get(listener)?.()
+  turnWatchStops.delete(listener)
+}
+
+/**
+ * The live hub (2026-09-18): ONE stream per browser. A browser opens at most six HTTP/1.1
+ * connections to one server, shared by all its tabs, and every chat tab used to hold two of
+ * them forever (its user channel and the chat on screen), so three tabs froze every request of
+ * every tab. Now the browser's SharedWorker opens `GET /api/sse?scope=hub` once and adds or
+ * removes subscriptions with `PATCH /api/sse`. Every subscription is its OWN listener, filed in
+ * `connections` or `userConnections` by the functions above, so the rules of this route (drop an
+ * event nobody hears, replay a live turn to a new listener, tear a chat down with its last
+ * listener) did not change. `$lib/server/sseLiveHub.ts` owns the hubs; the wire format is
+ * `$lib/services/liveHub/protocol.ts`.
+ */
+const liveHubs = createLiveHubRegistry({
+  async ownsSession(sessionId, userId) {
+    const check = await requireOwnedSession(sessionId, userId)
+    if (check.ok) return { ok: true }
+    const status = check.response.status
+    return { ok: false, status, code: sessionRefusalCode(status) }
+  },
+  attachSession: (sessionId, listener, userId) =>
+    attachSessionListener(sessionId, listener as unknown as SSEController, userId),
+  detachSession: (sessionId, listener) =>
+    detachSessionListener(sessionId, listener as unknown as SSEController),
+  attachUser: (userId, listener) => attachUserListener(userId, listener as unknown as SSEController),
+  detachUser: (userId, listener) => removeUserController(userId, listener as unknown as SSEController),
+  ownsTurn: (turnId, userId) =>
+    hasTurnOutcome(turnId, userId) ? { ok: true } : { ok: false, status: 404, code: 'turn_not_found' },
+  attachTurn: (turnId, listener, userId) => attachTurnListener(turnId, listener, userId),
+  detachTurn: (_turnId, listener) => detachTurnListener(listener)
+})
+
+/**
+ * `GET /api/sse?scope=hub` — the browser's one live stream. Cookie-only: an `EventSource`
+ * cannot send headers, so there is no token lane here and there must not be one. The first
+ * frame is `hub_connected` with this stream's hub id; every later frame is one subscription's
+ * event, wrapped with its id.
+ */
+async function openLiveHub(url: URL, locals: App.Locals): Promise<Response> {
   if (!locals.user) {
     throw error(401, 'Unauthorized')
   }
@@ -650,46 +885,19 @@ async function openUserChannel(url: URL, locals: App.Locals): Promise<Response> 
 
   await ensureExternalSubscriber()
 
-  let controllerRef: SSEController | null = null
-
+  let hubId: string | null = null
   const stream = new ReadableStream({
     start(controller) {
-      const typed = controller as SSEController
-      typed._id = `sse-user-${randomUUID()}`
-      typed._closed = false
-      controllerRef = typed
-
-      let listeners = userConnections.get(userId)
-      if (!listeners) {
-        listeners = new Set<SSEController>()
-        userConnections.set(userId, listeners)
-      }
-      listeners.add(typed)
-
-      try {
-        typed.enqueue(`data: ${JSON.stringify({ type: 'connected', scope: 'user' })}\n\n`)
-      } catch (err) {
-        logger.debug('[SSE] Failed to greet a user-channel listener', { userId, error: err })
-      }
-
-      const heartbeat = setInterval(() => {
-        if (typed._closed) {
-          clearInterval(heartbeat)
-          return
-        }
-        try {
-          typed.enqueue(':heartbeat\n\n')
-        } catch {
-          removeUserController(userId, typed)
-        }
-      }, 30000)
-      typed._heartbeat = heartbeat
-
-      logger.debug('[SSE] User channel opened', { userId, controllerId: typed._id })
+      hubId = liveHubs.open(userId, {
+        write: (text) => controller.enqueue(text),
+        close: () => controller.close()
+      }).id
+      logger.debug('[SSE] Live hub opened', { userId, hubId })
     },
-    cancel() {
-      if (controllerRef) removeUserController(userId, controllerRef)
-      logger.debug('[SSE] User channel closed', { userId })
+    async cancel() {
+      if (!hubId) return
+      logger.debug('[SSE] Live hub closed', { userId, hubId })
+      await liveHubs.close(hubId)
     }
   })
 
@@ -705,187 +913,39 @@ async function openUserChannel(url: URL, locals: App.Locals): Promise<Response> 
 }
 
 /**
- * SSE endpoint for canonical chat streaming events.
- * Native n8n sends forward webhook NDJSON here client-side; legacy/custom
- * callback workflows can still POST callback events directly.
- * Simplified version without "Respond to Webhook" complexity
+ * The browser's live stream. Only `?scope=hub` remains: the per-tab streams
+ * (`?sessionId=` and `?scope=user`) were removed with the live hub on 2026-09-18. A tab that was
+ * open across that update gets 410 and stops hearing live updates until it reloads.
  */
 export const GET: RequestHandler = async ({ url, locals }) => {
-  // SA-113 P1 (DL-113-06): one handler, two scopes. `?scope=user` opens the user-wide
-  // channel that tells the sidebar about sessions and runs the server started on its own.
-  if (url.searchParams.get('scope') === 'user') {
-    return openUserChannel(url, locals)
+  if (url.searchParams.get('scope') === 'hub') {
+    return openLiveHub(url, locals)
   }
+  throw error(410, 'Batshit now sends live updates over one connection per browser. Reload this page.')
+}
 
-  const sessionId = url.searchParams.get('sessionId')
-
-  if (typeof sessionId !== 'string' || !sessionId.trim()) {
-    throw error(400, 'Session ID is required')
-  }
-
-  // Check authentication via locals (set by hooks.server.ts)
-  if (!locals.user) {
+/**
+ * `PATCH /api/sse` — add or remove subscriptions on one of this user's live hubs. Removals run
+ * before additions; a chat the user does not own is refused per subscription, never attached.
+ * Answers `{ added, removed, refused }`, or 404 `hub_not_found` when the hub is gone (its
+ * stream closed, or the server restarted), which makes the browser open a new one.
+ */
+export const PATCH: RequestHandler = async ({ request, locals }) => {
+  if (!locals.user?.id) {
     throw error(401, 'Unauthorized')
   }
-
-  const sessionCheck = await requireOwnedSession(sessionId, locals.user.id)
-  if (!sessionCheck.ok) return sessionCheck.response
-
-  await ensureExternalSubscriber()
-
-  let globalZipSettings: Record<string, any> | undefined = undefined
+  let body: unknown
   try {
-    const userSettings = await redis.getUserSettings(locals.user.id)
-    globalZipSettings = userSettings?.global_zip_settings || undefined
-  } catch (err) {
-    console.error('[SSE] Failed to load user zip settings:', err)
+    body = await request.json()
+  } catch {
+    throw error(400, 'Invalid JSON body')
   }
-
-  sessionZipSettings.set(sessionId, globalZipSettings)
-  // A real tab now owns this entry; its disconnect is what drops it (F-P1-2).
-  wakeOwnedZipSettings.delete(sessionId)
-
-  logger.debug('[SSE] New connection for session:', sessionId)
-
-  // Create SSE stream
-  let activeController: SSEController | null = null
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      const controllerRef = controller as SSEController
-      if (!controllerRef._id) {
-        controllerRef._id = `sse-${randomUUID()}`
-      }
-      activeController = controllerRef
-
-      // Store connection (support multiple concurrent listeners)
-      let sessionControllers = connections.get(sessionId)
-      if (!sessionControllers) {
-        sessionControllers = new Set<SSEController>()
-        connections.set(sessionId, sessionControllers)
-      }
-      sessionControllers.add(controllerRef)
-
-      const controllerIds = Array.from(sessionControllers).map((entry) => entry._id)
-      logger.debug('[SSE] Active listeners for session', {
-        sessionId,
-        listenerCount: sessionControllers.size,
-        controllers: controllerIds
-      })
-
-      // Send initial connection message
-      try {
-        controllerRef.enqueue(`data: ${JSON.stringify({
-          type: 'connected',
-          sessionId
-        })}\n\n`)
-      } catch (err) {
-        console.error('[SSE] Failed to enqueue connected event', {
-          sessionId,
-          controllerId: controllerRef._id,
-          error: err
-        })
-      }
-
-      // If an active stream is in progress, replay it for this listener
-      replayActiveStreamForListener(sessionId, controllerRef)
-
-      logger.debug('[SSE] Connection registered', {
-        sessionId,
-        listenerCount: sessionControllers.size,
-        controllers: controllerIds
-      })
-
-      // Set up Redis keyspace monitoring for zip activity
-      try {
-        await setupRedisMonitoring(sessionId, controllerRef)
-      } catch (err) {
-        console.error('[SSE] Error setting up Redis monitoring:', err)
-        // Continue anyway - monitoring is optional
-      }
-
-      // Shutdown can begin while the async Redis subscription is still being
-      // established. If it did, tear down the late resource immediately and
-      // do not create a new heartbeat after the runtime cleanup has finished.
-      if (controllerRef._closed) {
-        const lateVisualCleanup = controllerRef._visualCleanup
-        controllerRef._visualCleanup = undefined
-        await lateVisualCleanup?.()
-        return
-      }
-
-      // Keep alive with heartbeat
-      const heartbeat = setInterval(() => {
-        try {
-          controllerRef.enqueue(':heartbeat\n\n')
-        } catch (e) {
-          // Connection closed
-          clearInterval(heartbeat)
-        }
-      }, 30000)
-
-      // Store heartbeat for cleanup
-      controllerRef._heartbeat = heartbeat
-  },
-
-  async cancel() {
-    // Cleanup on disconnect
-    logger.debug('[SSE] Connection closed for session:', sessionId)
-
-    const cancelController = activeController
-    activeController = null
-
-    if (cancelController) {
-      const sessionControllers = connections.get(sessionId)
-      if (sessionControllers && sessionControllers.size > 0) {
-        for (const entry of sessionControllers) {
-          if (entry === cancelController) {
-            entry._closed = true
-            if (entry._heartbeat) {
-              clearInterval(entry._heartbeat)
-            }
-            await entry._visualCleanup?.()
-            sessionControllers.delete(entry)
-            break
-          }
-        }
-
-        if (sessionControllers.size === 0) {
-          connections.delete(sessionId)
-          zipDetection.deleteSessionBuffers(sessionId)
-          agentSettingsCache.delete(sessionId)
-          sessionZipSettings.delete(sessionId)
-          sessionSubagentCache.delete(sessionId)
-          resetStreamAdapter(sessionId)
-
-          try {
-            await redisStreamService.cleanupSessionTempStorage(sessionId)
-            logger.debug(`[SSE] Cleaned up Redis temp storage for session ${sessionId}`)
-          } catch (error) {
-            console.error('[SSE] Error cleaning up Redis temp storage:', error)
-          }
-        } else {
-          logger.debug('[SSE] Connection closed', {
-            sessionId,
-            listenerCount: sessionControllers.size,
-            controllers: Array.from(sessionControllers).map((entry) => entry._id)
-          })
-        }
-      }
-    }
-
+  const parsed = parseHubSubscriptionChange(body)
+  if (!parsed.ok) {
+    return json({ error: parsed.error, code: 'invalid_change' }, { status: 400 })
   }
-})
-
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-      'Access-Control-Allow-Origin': url.origin
-    }
-  })
+  const answer = await liveHubs.change(locals.user.id, parsed.value)
+  return json(answer.body, { status: answer.status })
 }
 
 /**
@@ -1323,7 +1383,19 @@ async function processNDJSONLine(
 
       // Build fallback intermediate steps from streamed tool_result events when n8n omits intermediateSteps
       const activeState = activeStreams.get(sessionId)
-      const toolResultEvents = (activeState?.events ?? [])
+      const reconstruction = messageId
+        ? activeState?.reconstructionByMessage.get(messageId)
+        : undefined
+      const resumeStartEvent = reconstruction?.start
+      const approvalResume = readApprovalResumeStart(resumeStartEvent?.metadata)
+      const priorZipReferences: ZipReference[] = Array.isArray(approvalResume?.prior.metadata.zipReferences)
+        ? approvalResume.prior.metadata.zipReferences
+        : []
+      // The capped replay buffer is only a joining aid. End content must use the complete,
+      // compact reconstruction for THIS start, independent of another same-id approval run.
+      const reconstructionEvents = reconstruction?.events ?? (activeState?.events ?? [])
+        .filter((event) => !messageId || event.messageId === messageId)
+      const toolResultEvents = reconstructionEvents
         .filter((e: any) =>
           (e.type === 'tool-result' || e.type === 'tool_result') &&
           (!messageId || e.messageId === messageId)
@@ -1348,8 +1420,7 @@ async function processNDJSONLine(
       const coolToolZips: typeof incomingZipReferences = []
 
       // Recompute streamingContent after we may have added tool_result-derived zips above
-      const streamEvents = (activeState?.events ?? [])
-        .filter((event) => !messageId || event.messageId === messageId)
+      const streamEvents = reconstructionEvents
       const replayToolZipRefs = dedupeZipReferences([
         ...incomingZipReferences,
         ...coolToolZips
@@ -1360,10 +1431,12 @@ async function processNDJSONLine(
       )
       const supportsInlineToolReplay = isManagedAgent
       const streamingContentResult = buildEndStreamingContent({
+        priorContent: approvalResume?.prior.content,
         streamEvents: streamEvents as any,
         inlineCapable: supportsInlineToolReplay,
         toolZipRefs: replayToolZipRefs,
         allZipRefs: dedupeZipReferences([
+          ...priorZipReferences,
           ...incomingZipReferences,
           ...streamingRefs,
           ...zipRefs,
@@ -1374,6 +1447,7 @@ async function processNDJSONLine(
 
       // Merge all zip references
       const allZipRefs = dedupeZipReferences([
+        ...priorZipReferences,
         ...incomingZipReferences,
         ...streamingRefs,
         ...zipRefs,
@@ -1434,9 +1508,12 @@ async function processNDJSONLine(
         seenZips.add(match)
         return match
       })
-      const trustedFinalZipIds = allZipRefs
-        .map((ref) => extractZipIdFromReference(ref.reference))
-        .filter((id): id is string => Boolean(id))
+      const trustedFinalZipIds = Array.from(new Set([
+        ...collectTrustedZipIdsFromMetadata(approvalResume?.prior.metadata),
+        ...allZipRefs
+          .map((ref) => extractZipIdFromReference(ref.reference))
+          .filter((id): id is string => Boolean(id))
+      ]))
       cleanedFinalContent = neutralizeUntrustedZipReferenceSyntax(cleanedFinalContent, {
         trustedZipIds: trustedFinalZipIds
       })
@@ -1462,9 +1539,11 @@ async function processNDJSONLine(
 
       const endEvent = await adapter.emitEnd({
         content: cleanedFinalContent,
-        intermediateSteps: reconstructedSteps || [],
+        intermediateSteps: approvalResume
+          ? mergeResumedSteps(approvalResume.prior.intermediateSteps, reconstructedSteps) || []
+          : reconstructedSteps || [],
         zipReferences: allZipRefs,
-        metadata: endMetadata
+        metadata: approvalResume ? mergeResumedMetadata(approvalResume.prior.metadata, endMetadata) : endMetadata
       })
 
       enqueueWithTelemetry(sessionId, controller as SSEController, endEvent)
@@ -1664,7 +1743,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 function getActiveStreamState(sessionId: string) {
   let state = activeStreams.get(sessionId)
   if (!state) {
-    state = { events: [], messageIds: new Set(), nextEventIndex: 0 }
+    state = {
+      events: [],
+      messageIds: new Set(),
+      nextEventIndex: 0,
+      reconstructionByMessage: new Map()
+    }
     activeStreams.set(sessionId, state)
   }
   return state
@@ -1693,10 +1777,48 @@ function ensureActiveStreamEventId(sessionId: string, event: StreamEventPayload)
  * object-per-chunk transcripts could sit resident for four hours each.
  *
  * Keeping the most recent slice is enough for what the buffer is for: a joining tab wants
- * the tail it missed, and anything older is already on the persisted message it loads with
- * the chat. The terminal-event cleanup still clears the whole entry as before.
+ * the tail it missed. The message's start is pinned separately so the tail always has an owner,
+ * and complete end reconstruction is also separate so this cap can never truncate persistence.
+ * The terminal-event cleanup still clears the whole entry as before.
  */
 const MAX_ACTIVE_STREAM_REPLAY_EVENTS = 2000
+
+const END_RECONSTRUCTION_EVENT_TYPES = new Set([
+  'chunk',
+  'tool_start',
+  'tool-call',
+  'tool_call',
+  'tool-result',
+  'tool_result'
+])
+
+function appendEndReconstructionEvent(
+  state: ReturnType<typeof getActiveStreamState>,
+  event: StreamEventPayload
+) {
+  const messageId = event.messageId
+  if (!messageId || !END_RECONSTRUCTION_EVENT_TYPES.has(event.type)) return
+
+  let reconstruction = state.reconstructionByMessage.get(messageId)
+  if (!reconstruction) {
+    reconstruction = { start: null, events: [] }
+    state.reconstructionByMessage.set(messageId, reconstruction)
+  }
+
+  const last = reconstruction.events[reconstruction.events.length - 1]
+  if (
+    event.type === 'chunk' &&
+    last?.type === 'chunk' &&
+    typeof last.content === 'string' &&
+    typeof event.content === 'string'
+  ) {
+    // End reconstruction only needs the complete text, not one object per provider delta.
+    last.content += event.content
+    return
+  }
+
+  reconstruction.events.push({ ...event })
+}
 
 function pushActiveStreamEvent(
   state: ReturnType<typeof getActiveStreamState>,
@@ -1714,6 +1836,15 @@ function initializeActiveStream(sessionId: string, event: StreamEventPayload) {
     clearActiveStreamCleanup(sessionId, event.messageId)
   }
   const state = getActiveStreamState(sessionId)
+  if (event.messageId) {
+    // Approval resumes deliberately reuse the assistant message id. The old turn's replay and
+    // reconstruction must not bleed into the new continuation (the terminal cleanup waits 5 s).
+    state.events = state.events.filter((entry) => entry.messageId !== event.messageId)
+    state.reconstructionByMessage.set(event.messageId, {
+      start: { ...event },
+      events: []
+    })
+  }
   pushActiveStreamEvent(state, event)
   if (event.messageId) {
     state.messageIds.add(event.messageId)
@@ -1731,6 +1862,7 @@ function appendActiveStreamEvent(sessionId: string, event: StreamEventPayload) {
   ensureActiveStreamEventId(sessionId, event)
   const state = getActiveStreamState(sessionId)
   state.messageIds.add(event.messageId)
+  appendEndReconstructionEvent(state, event)
   pushActiveStreamEvent(state, event)
 }
 
@@ -1744,6 +1876,17 @@ function replayActiveStreamForListener(sessionId: string, controller: SSEControl
     sessionId,
     eventCount: state.events.length
   })
+
+  // The ordinary replay buffer is capped. A long stream can evict its start, but a joining tab
+  // still needs that envelope before any tail events (especially an approval-resume prefix).
+  for (const [messageId, reconstruction] of state.reconstructionByMessage) {
+    const start = reconstruction.start
+    if (!start) continue
+    const startStillBuffered = state.events.some(
+      (event) => event.messageId === messageId && event.type === 'start'
+    )
+    if (!startStillBuffered) enqueueWithTelemetry(sessionId, controller, start)
+  }
 
   for (const event of state.events) {
     enqueueWithTelemetry(sessionId, controller, event)
@@ -1847,6 +1990,7 @@ function scheduleActiveStreamCleanup(sessionId: string, messageId?: string, dela
     if (state) {
       state.events = state.events.filter((event) => event.messageId !== messageId)
       state.messageIds.delete(messageId)
+      state.reconstructionByMessage.delete(messageId)
       if (state.events.length === 0) {
         activeStreams.delete(sessionId)
         releaseWakeOwnedZipSettings(sessionId)

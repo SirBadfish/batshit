@@ -64,7 +64,7 @@ docker compose --env-file .env.docker stop
 docker compose --env-file .env.docker restart
 ```
 
-Docker Desktop's Play button resumes existing containers. It does not rebuild images or recreate containers after a Batshit update. To apply an update, use `./start-docker.sh` or an equivalent `docker compose --env-file .env.docker up -d --build` so containers are recreated from the updated images while volumes stay intact.
+Docker Desktop's Play button resumes existing containers. It does not rebuild images or recreate containers after a Batshit update. To apply an update, use `./start-docker.sh` or an equivalent `docker compose --env-file .env.docker up -d --build` so containers are recreated from the updated images while volumes stay intact. An optional add-on runs under its own profile, so an update reaches it only when you name that profile (for example `./start-docker.sh --profile agent-browser`) or stop and start the add-on in Settings -> Admin, whose Start rebuilds it.
 
 Don't use private development launchers as public Docker install commands.
 
@@ -159,6 +159,8 @@ Dockerized Batshit supports two command paths:
 App-container Bash is useful, but it's not your host computer shell and it's not the same thing as Docker Sandbox isolation.
 
 The normal `./start-docker.sh` launcher prepares and starts the host operator. If you bypass the launcher and use raw Compose, Docker Sandbox may show `Operator Required` until you configure the operator URL, token, and workspace mapping yourself.
+
+The host operator runs only while Docker Batshit does. On a Mac it is a login item (`~/Library/LaunchAgents/ai.batshit.sandbox-operator.plist`), so after a restart it is ready when Docker brings Docker Batshit back. About ten minutes after Docker Batshit stops, it stops the voice engines it started (except any you set to keep running), stops Docker's `sbx` background service if its own call started it and no sandbox is running, removes its login item, and exits, so nothing of Batshit starts at your next login; `./start-docker.sh` puts it back. While Docker itself is not running, it waits up to an hour for Docker to bring Docker Batshit back, then stops the same way but keeps its login item.
 
 Batshit does not mount the host Docker socket into the core app container by default. That's intentional.
 

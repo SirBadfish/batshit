@@ -39,6 +39,19 @@ describe('voiceCapabilityRegistry BYO validation', () => {
         runtimeSupport: 'supported'
       }
     })
+    expect(getVoiceProviderCapability('google')).toMatchObject({
+      supports: {
+        tts: true,
+        stt: true,
+        streaming: false
+      },
+      sttCapabilities: {
+        recorded: true,
+        realtime: false,
+        transport: 'http-upload',
+        runtimeSupport: 'supported'
+      }
+    })
     expect(getVoiceProviderCapability('deepgram')?.sttCapabilities).toMatchObject({
       recorded: true,
       realtime: true,
@@ -62,6 +75,50 @@ describe('voiceCapabilityRegistry BYO validation', () => {
         listVoices: true
       },
       voiceSource: 'remote'
+    })
+  })
+
+  it('validates Gemini recorded STT and Deepgram Flux batch options', () => {
+    expect(
+      validateVoiceOptionsForProvider('google', 'stt', {
+        language: 'en-US',
+        providerOptions: {
+          mode: 'verbatim',
+          customVocabulary: 'Batshit, Goon',
+          diarization: false,
+          wordTimestamps: false
+        }
+      })
+    ).toEqual({
+      language: 'en-US',
+      providerOptions: {
+        mode: 'verbatim',
+        customVocabulary: 'Batshit, Goon',
+        diarization: false,
+        wordTimestamps: false
+      }
+    })
+
+    expect(
+      validateVoiceOptionsForProvider('deepgram', 'tts', {
+        common: { speed: 1.1 },
+        providerOptions: {
+          encoding: 'mp3',
+          sampleRate: 24000,
+          bitRate: 48000,
+          expressivity: 2,
+          mipOptOut: true
+        }
+      })
+    ).toEqual({
+      common: { speed: 1.1 },
+      providerOptions: {
+        encoding: 'mp3',
+        sampleRate: 24000,
+        bitRate: 48000,
+        expressivity: 2,
+        mipOptOut: true
+      }
     })
   })
 

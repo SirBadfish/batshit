@@ -41,8 +41,10 @@ test('the immutable Electron staging inventory includes every required shell mod
     'main.mjs',
     'backup-export-download.mjs',
     'main-window-policy.mjs',
+    'main-window-state.mjs',
     'preload.cjs',
     'electron-shell-policy.mjs',
+    'local-style-overrides.mjs',
     'desktop-controls-contract.mjs',
     'desktop-controls-window-policy.mjs',
     'desktop-controls-window-state.mjs',
@@ -180,4 +182,32 @@ test('local signing gives every Electron process the same library-loading except
     adHoc: false
   });
   assert.equal(releaseHelperOptions, null);
+});
+
+
+test('every module the shell imports is staged into the package', () => {
+  // A module missing from ELECTRON_SOURCE_FILES is not caught by any build step:
+  // packaging succeeds, the audit passes, and the app throws ERR_MODULE_NOT_FOUND
+  // on launch. Walk the real import graph from the entrypoint instead.
+  const sourceRoot = path.join(scriptsRoot, '..', 'src-electron');
+  const staged = new Set(ELECTRON_SOURCE_FILES);
+  const seen = new Set();
+  const queue = ['main.mjs', 'preload.cjs'];
+  const missing = [];
+
+  while (queue.length) {
+    const file = queue.shift();
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const filePath = path.join(sourceRoot, file);
+    if (!fs.existsSync(filePath)) continue;
+    const source = fs.readFileSync(filePath, 'utf8');
+    for (const match of source.matchAll(/(?:from|import|require)\s*\(?\s*['"]\.\/([^'"]+)['"]/g)) {
+      const imported = match[1];
+      if (!staged.has(imported)) missing.push(`${file} imports ./${imported}`);
+      queue.push(imported);
+    }
+  }
+
+  assert.deepEqual(missing, [], 'these imports would be absent from the packaged app');
 });

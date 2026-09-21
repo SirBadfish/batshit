@@ -1,4 +1,4 @@
-import { buildCompactEditPreview, extractManagedPatchFromSources } from './editDiff'
+import { buildCompactEditPreview, buildSnapshotEditPreview, extractManagedPatchFromSources } from './editDiff'
 import { formatBatshitToolTargetDisplayName } from './toolNameFormatter'
 import {
   collapseToolNameAlphanumeric,
@@ -208,6 +208,38 @@ function unwrapNativeAutomationData(value: unknown): unknown {
   return candidate.data ?? candidate
 }
 
+/**
+ * A tool payload as `coolToolZipAdapter` stores it in a zip (`type: 'tool'`) or its raw
+ * sidecar (`type: 'tool_raw'`). A live tool result only carries one because it READ a zip,
+ * so it is data, never a transport envelope (F-P5-2).
+ */
+function isStoredToolPayload(value: unknown): boolean {
+  return (
+    isPlainObject(value) &&
+    typeof value.schemaVersion === 'number' &&
+    (value.type === 'tool' || value.type === 'tool_raw')
+  )
+}
+
+/**
+ * A zip fetch names itself: the broker stamps `operationKind: 'fetch_zip'`, the direct
+ * helpers answer `tool: 'fetch_zip'`. Its `content` is the fetched zip's stored body, which
+ * for a cool_tool zip is a whole tool payload; opening it hands the INNER tool's identity and
+ * output to the fetch call (F-P5-2).
+ */
+function isZipFetchRecord(value: Record<string, any>): boolean {
+  return normalizeExplicitOperationKind(value.operationKind) === 'fetch_zip' || value.tool === 'fetch_zip'
+}
+
+function isTransportPayload(value: unknown): boolean {
+  return (isPlainObject(value) || Array.isArray(value)) && !isStoredToolPayload(value)
+}
+
+/**
+ * Opens transport envelopes around a tool's own result: MCP text content, a JSON string or
+ * object under `content`, a bare `text`. It never opens what a tool RETURNED: a zip fetch's
+ * content, or a stored tool payload wherever it sits (F-P5-2).
+ */
 function unwrapMcpTextContentPayload(value: unknown, depth = 0): unknown {
   if (depth > 6) return value
 
@@ -221,22 +253,23 @@ function unwrapMcpTextContentPayload(value: unknown, depth = 0): unknown {
   }
 
   if (!isPlainObject(candidate)) return candidate
+  if (isZipFetchRecord(candidate)) return candidate
 
   const content = candidate.content
   if (typeof content === 'string') {
     const parsedContent = parseMaybeJson(content)
-    if (isPlainObject(parsedContent) || Array.isArray(parsedContent)) {
+    if (isTransportPayload(parsedContent)) {
       return unwrapMcpTextContentPayload(parsedContent, depth + 1)
     }
   }
-  if (isPlainObject(content)) {
+  if (isPlainObject(content) && isTransportPayload(content)) {
     return unwrapMcpTextContentPayload(content, depth + 1)
   }
   if (Array.isArray(content) && content.length > 0) {
     const first = content[0]
     if (isPlainObject(first) && 'text' in first) {
       const textPayload = parseMaybeJson(first.text)
-      if (isPlainObject(textPayload) || Array.isArray(textPayload)) {
+      if (isTransportPayload(textPayload)) {
         return unwrapMcpTextContentPayload(textPayload, depth + 1)
       }
     }
@@ -249,7 +282,7 @@ function unwrapMcpTextContentPayload(value: unknown, depth = 0): unknown {
     candidate.data === undefined
   ) {
     const textPayload = parseMaybeJson(candidate.text)
-    if (isPlainObject(textPayload) || Array.isArray(textPayload)) {
+    if (isTransportPayload(textPayload)) {
       return unwrapMcpTextContentPayload(textPayload, depth + 1)
     }
   }
@@ -1456,6 +1489,93 @@ function parseFilesOnlySearchOutput(value: string): ParsedSearchMatch[] {
     }))
 }
 
+/** The tokens after `ls` on the line that listed, or null when something else listed. */
+function lsCommandOperandTokens(command: string | undefined): string[] | null {
+  if (typeof command !== 'string' || command.trim().length === 0) return null
+  for (const segment of shellSegments(command)) {
+    if (segmentCommandName(segment) !== 'ls') continue
+    const tokens = tokenizeShellLike(segment)
+    const index = tokens.findIndex((token) => token.replace(/^.*\//, '').toLowerCase() === 'ls')
+    return index >= 0 ? tokens.slice(index + 1) : []
+  }
+  return null
+}
+
+/**
+ * True when this `ls` could print `<dir>:` section headers: it was given more than one operand
+ * (a glob stands for however many paths it matched) or it recurses.
+ */
+function lsCouldPrintSections(command: string | undefined): boolean {
+  const tokens = lsCommandOperandTokens(command)
+  if (!tokens) return false
+  let operands = 0
+  let recursive = false
+  let flagsEnded = false
+  for (const token of tokens) {
+    if (!flagsEnded && token === '--') {
+      flagsEnded = true
+      continue
+    }
+    if (!flagsEnded && token.length > 1 && token.startsWith('-')) {
+      if (token === '--recursive' || (!token.startsWith('--') && token.includes('R'))) recursive = true
+      continue
+    }
+    operands += /[*?[]/.test(token) ? 2 : 1
+  }
+  return recursive || operands > 1
+}
+
+export type LsListingSection = {
+  /** The directory whose entries these are, or null for a section `ls` printed no header for. */
+  dir: string | null
+  body: string
+}
+
+/**
+ * `ls` output split into its sections (F-P6-5 follow-up item 6).
+ *
+ * Given several operands or `-R`, `ls` prints a `<dir>:` header before each directory's entries
+ * and a blank line between sections. A header is not an entry, and an entry under one belongs to
+ * that directory, so both list parsers read the sections instead of the raw lines. A lone listing
+ * prints no header at all, which is why sections are recognized only from a second section or
+ * from a command that could print them: a file really named `x:` in `ls <dir>` stays an entry.
+ */
+export function splitLsSections(text: string, command: string | undefined): LsListingSection[] {
+  const whole: LsListingSection[] = [{ dir: null, body: text }]
+  if (!text.includes(':')) return whole
+
+  const lines = text.split('\n')
+  const isHeader = (index: number): boolean => {
+    const line = lines[index]
+    if (!/^[^\s].*:$/.test(line)) return false
+    return index === 0 || lines[index - 1].trim().length === 0
+  }
+  const headerIndexes = lines.map((_line, index) => index).filter(isHeader)
+  if (headerIndexes.length === 0) return whole
+  const sectioned = headerIndexes.some((index) => index > 0) || lsCouldPrintSections(command)
+  if (!sectioned) return whole
+
+  const sections: LsListingSection[] = []
+  let dir: string | null = null
+  let body: string[] = []
+  lines.forEach((line, index) => {
+    if (headerIndexes.includes(index)) {
+      if (dir !== null || body.length > 0) sections.push({ dir, body: body.join('\n') })
+      dir = line.slice(0, -1).replace(/\/+$/, '')
+      body = []
+      return
+    }
+    body.push(line)
+  })
+  sections.push({ dir, body: body.join('\n') })
+  return sections
+}
+
+/** An entry's path inside the section that listed it. */
+export function joinListingSectionPath(dir: string, name: string): string {
+  return `${dir.replace(/\/+$/, '')}/${name.replace(/^\.\//, '')}`
+}
+
 function inferListDefaultType(command: string | undefined): ListEntryType {
   if (typeof command !== 'string' || command.trim().length === 0) return 'unknown'
 
@@ -1600,28 +1720,44 @@ function summarizeFetchZipResult(toolArgs: Record<string, any>, toolResult: any)
     ? truncateText(content, FETCH_ZIP_CONTENT_PREVIEW_CHARS, FETCH_ZIP_CONTENT_PREVIEW_LINES)
     : null
   const metadata = pickPlainObject(payload.metadata)
+  // The direct helpers (`formatFetchZipResult` in the managed CLI bridge, batshit-server's
+  // `fetchZip`) answer `success` / `truncated` / `totalLength` and keep type, tokens, and
+  // description under `metadata`; the control answers `found` and the canonical names.
+  const type = payload.type ?? metadata?.type
+  const tokens = payload.tokens ?? metadata?.tokens
+  const description = payload.description ?? metadata?.description
 
   return {
     result: {
-      found: payload.found === true,
+      found: typeof payload.found === 'boolean' ? payload.found : payload.success === true,
       zipId:
         typeof payload.zipId === 'string'
           ? payload.zipId
           : typeof toolArgs.zipId === 'string'
             ? toolArgs.zipId
             : undefined,
-      type: typeof payload.type === 'string' ? payload.type : undefined,
-      tokens: typeof payload.tokens === 'number' ? payload.tokens : payload.tokens ?? undefined,
-      description: typeof payload.description === 'string' ? payload.description : payload.description ?? undefined,
+      type: typeof type === 'string' ? type : undefined,
+      tokens: typeof tokens === 'number' ? tokens : tokens ?? undefined,
+      description: typeof description === 'string' ? description : description ?? undefined,
       createdAt: typeof payload.createdAt === 'string' ? payload.createdAt : payload.createdAt ?? undefined,
-      reason: typeof payload.reason === 'string' ? payload.reason : undefined,
+      reason:
+        typeof payload.reason === 'string'
+          ? payload.reason
+          : typeof payload.error === 'string'
+            ? payload.error
+            : undefined,
       contentLength:
         typeof payload.contentLength === 'number'
           ? payload.contentLength
-          : content
-            ? content.length
-            : undefined,
-      contentTruncated: payload.contentTruncated === true || contentPreview?.truncated === true,
+          : typeof payload.totalLength === 'number'
+            ? payload.totalLength
+            : content
+              ? content.length
+              : undefined,
+      contentTruncated:
+        payload.contentTruncated === true ||
+        payload.truncated === true ||
+        contentPreview?.truncated === true,
       ...(contentPreview
         ? {
             content: contentPreview.text
@@ -1720,6 +1856,11 @@ function summarizeListResult(
                 ? (normalizedToolResult as any).command
                 : undefined
   const defaultListEntryType = inferListDefaultType(commandCandidate)
+  const actionCommand = shellActionCommand(toolArgs, toolResult)
+  const failureFields = shellFailureFields(toolArgs, toolResult)
+  // A listing's own error lines (`ls: /nope: No such file …`) are never entries, whatever the
+  // exit code said: a lane can report a `find` that hit a permission error as a success.
+  const listingText = (text: string | null) => stripShellErrorLines(text ?? '', actionCommand)
   const filesCandidate = Array.isArray((normalizedToolResult as any)?.files)
     ? (normalizedToolResult as any).files
     : Array.isArray((normalizedToolResult as any)?.items)
@@ -1742,7 +1883,8 @@ function summarizeListResult(
         totalFiles: (normalizedToolResult as any)?.totalFiles ?? totalFiles,
         totalDirectories: (normalizedToolResult as any)?.totalDirectories ?? totalDirectories,
         totalUnknownItems: (normalizedToolResult as any)?.totalUnknownItems ?? totalUnknownItems,
-        totalItems: (normalizedToolResult as any)?.totalItems ?? filesCandidate.length
+        totalItems: (normalizedToolResult as any)?.totalItems ?? filesCandidate.length,
+        ...failureFields
       },
       flags: {
         compacted: filesCandidate.length > files.length,
@@ -1752,13 +1894,21 @@ function summarizeListResult(
     }
   }
 
-  const previewSource =
+  const previewSource = listingText(
     extractDirectText((normalizedToolResult as any)?.stdout) ??
-    extractDirectText((normalizedToolResult as any)?.output) ??
-    extractPrimaryText(normalizedToolResult)
+      extractDirectText((normalizedToolResult as any)?.output) ??
+      extractPrimaryText(normalizedToolResult)
+  )
 
   if (isFilesListingCommand(commandCandidate)) {
-    const parsedLsFiles = parseLsListingOutput(previewSource ?? '')
+    // `ls` of several directories prints a `<dir>:` header before each one's entries; the header
+    // is not an entry, and an entry under it is that directory's (item 6).
+    const sections = splitLsSections(previewSource ?? '', commandCandidate)
+    const inSection = <T extends { path: string }>(entry: T, dir: string | null): T =>
+      dir ? { ...entry, path: joinListingSectionPath(dir, entry.path) } : entry
+    const parsedLsFiles = sections.flatMap((section) =>
+      parseLsListingOutput(section.body).map((entry) => inSection(entry, section.dir))
+    )
     if (parsedLsFiles.length > 0) {
       const files = parsedLsFiles.slice(0, LIST_ITEM_LIMIT)
       const totalItems = parsedLsFiles.length
@@ -1771,7 +1921,8 @@ function summarizeListResult(
           totalFiles,
           totalDirectories,
           totalUnknownItems: 0,
-          totalItems
+          totalItems,
+          ...failureFields
         },
         flags: {
           compacted: totalItems > files.length,
@@ -1781,12 +1932,21 @@ function summarizeListResult(
       }
     }
 
-    const listLines = (previewSource ?? '').split('\n').map((line) => line.trim()).filter(Boolean)
-    const files = listLines
-      .map((entry) => simplifyFileEntry(entry, defaultListEntryType))
+    const sectionLines = sections.flatMap((section) =>
+      section.body
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => ({ line, dir: section.dir }))
+    )
+    const files = sectionLines
+      .map(({ line, dir }) => {
+        const entry = simplifyFileEntry(line, defaultListEntryType)
+        return entry ? inSection(entry, dir) : null
+      })
       .filter((entry): entry is SimplifiedListEntry => Boolean(entry))
       .slice(0, LIST_ITEM_LIMIT)
-    const totalItems = listLines.length
+    const totalItems = sectionLines.length
     const totalDirectories = files.filter((entry) => entry.type === 'directory').length
     const totalFiles = files.filter((entry) => entry.type === 'file').length
     const totalUnknownItems = files.filter((entry) => entry.type === 'unknown').length
@@ -1798,7 +1958,8 @@ function summarizeListResult(
           totalFiles,
           totalDirectories,
           totalUnknownItems,
-          totalItems
+          totalItems,
+          ...failureFields
         },
         flags: {
           compacted: totalItems > files.length,
@@ -1814,7 +1975,8 @@ function summarizeListResult(
     result: {
       output: preview.text,
       stdout: preview.text,
-      truncated: preview.truncated
+      truncated: preview.truncated,
+      ...failureFields
     },
     flags: {
       compacted: preview.truncated,
@@ -1848,6 +2010,11 @@ function summarizeSearchResult(
                   ? toolArgs.command
                   : undefined
             ) ?? undefined
+  // A search that failed keeps its exit code and, like a failed write, edit, or listing, what it
+  // printed as `commandOutput`: the API lane keeps a command's error text in `stderr`, which this
+  // summary never stores. Exit 1 is "nothing matched" and keeps neither.
+  const actionCommand = shellActionCommand(toolArgs, toolResult)
+  const failureFields = shellFailureFields(toolArgs, toolResult)
   const structuredResults = Array.isArray((normalizedToolResult as any)?.results)
     ? (normalizedToolResult as any).results
     : null
@@ -1871,7 +2038,8 @@ function summarizeSearchResult(
         totalMatches:
           (normalizedToolResult as any)?.totalMatches ??
           files.reduce((sum: number, entry: Record<string, any>) => sum + (entry.matchCount || 0), 0),
-        totalMatchingFiles: (normalizedToolResult as any)?.totalMatchingFiles ?? structuredResults.length
+        totalMatchingFiles: (normalizedToolResult as any)?.totalMatchingFiles ?? structuredResults.length,
+        ...failureFields
       },
       flags: {
         compacted: structuredResults.length > files.length,
@@ -1897,7 +2065,8 @@ function summarizeSearchResult(
         results: files,
         ...(query ? { query } : {}),
         totalMatches: parsedFiles.reduce((sum, entry) => sum + entry.matchCount, 0),
-        totalMatchingFiles: parsedFiles.length
+        totalMatchingFiles: parsedFiles.length,
+        ...failureFields
       },
       flags: {
         compacted: truncated,
@@ -1922,7 +2091,9 @@ function summarizeSearchResult(
             ? (normalizedToolResult as any).command
             : undefined
   if (isFilesOnlySearchCommand(commandCandidate)) {
-    const filesOnlyResults = parseFilesOnlySearchOutput(previewSource ?? '')
+    // Every line a files-only search prints is a file, except its own error lines
+    // (`grep: /nope: No such file …`), which a lane that merges its streams prints among them.
+    const filesOnlyResults = parseFilesOnlySearchOutput(stripShellErrorLines(previewSource ?? '', actionCommand))
     if (filesOnlyResults.length > 0) {
       const files = filesOnlyResults.slice(0, SEARCH_FILE_LIMIT)
       const truncated = filesOnlyResults.length > files.length
@@ -1932,7 +2103,8 @@ function summarizeSearchResult(
           results: files,
           ...(query ? { query } : {}),
           totalMatches: filesOnlyResults.length,
-          totalMatchingFiles: filesOnlyResults.length
+          totalMatchingFiles: filesOnlyResults.length,
+          ...failureFields
         },
         flags: {
           compacted: truncated,
@@ -1949,7 +2121,9 @@ function summarizeSearchResult(
       ...(query ? { query } : {}),
       output: preview.text,
       stdout: preview.text,
-      truncated: preview.truncated
+      truncated: preview.truncated,
+      // A lane that merges its streams (Codex, Claude Code) already stores a failure's words here.
+      ...shellFailureFields(toolArgs, toolResult, previewSource)
     },
     flags: {
       compacted: preview.truncated,
@@ -2060,6 +2234,10 @@ function summarizeBashResult(toolArgs: Record<string, any>, toolResult: any): { 
     stdout: stdoutPreview.text,
     stderr: stderrPreview.text,
     exitCode: (normalizedToolResult as any)?.exitCode ?? (normalizedToolResult as any)?.code,
+    // Present when the command never started (for example `SANDBOX_UNAVAILABLE`).
+    ...(typeof (normalizedToolResult as any)?.errorCode === 'string'
+      ? { errorCode: (normalizedToolResult as any).errorCode }
+      : {}),
     interrupted: (normalizedToolResult as any)?.interrupted === true,
     isImage: (normalizedToolResult as any)?.isImage === true,
     stdoutTruncated: stdoutPreview.truncated,
@@ -2073,6 +2251,263 @@ function summarizeBashResult(toolArgs: Record<string, any>, toolResult: any): { 
       truncated: stdoutPreview.truncated || stderrPreview.truncated,
       binaryLikeOmitted: stdoutBinary || stderrBinary
     }
+  }
+}
+
+/** Search commands answer "nothing matched" with exit code 1; that is an answer, not a failure. */
+const EXIT_ONE_MEANS_NO_MATCH = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack'])
+
+type ShellSeparator = 'and' | 'or' | 'pipe' | 'sequence'
+
+interface ShellSegment {
+  text: string
+  separatorBefore?: ShellSeparator
+}
+
+/**
+ * A shell line's separate commands and the operator before each one. Operators inside quotes are
+ * text. Backslash escapes also stay with their command instead of changing quote/operator state.
+ */
+function parsedShellSegments(command: string): ShellSegment[] {
+  const segments: ShellSegment[] = []
+  let current = ''
+  let quote: string | null = null
+  let separatorBefore: ShellSeparator | undefined
+
+  const push = (separatorAfter?: ShellSeparator) => {
+    if (current.trim()) segments.push({ text: current, separatorBefore })
+    current = ''
+    separatorBefore = separatorAfter
+  }
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]
+    if (char === '\\') {
+      current += char
+      if (index + 1 < command.length) {
+        current += command[index + 1]
+        index += 1
+      }
+      continue
+    }
+    if (quote) {
+      if (char === quote) quote = null
+      current += char
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      current += char
+      continue
+    }
+    if (char === '&' && command[index + 1] === '&') {
+      push('and')
+      index += 1
+      continue
+    }
+    if (char === '|' && command[index + 1] === '|') {
+      push('or')
+      index += 1
+      continue
+    }
+    if (char === '|') {
+      push('pipe')
+      if (command[index + 1] === '&') index += 1
+      continue
+    }
+    if (char === ';' || char === '\n') {
+      push('sequence')
+      continue
+    }
+    current += char
+  }
+  push()
+  return segments
+}
+
+/** A shell line's separate commands (`parsedShellSegments` owns the operator parsing). */
+function shellSegments(command: string): string[] {
+  return parsedShellSegments(command).map((segment) => segment.text)
+}
+
+/** A segment's own command name, with leading variable assignments and a path prefix dropped. */
+function segmentCommandName(segment: string): string | null {
+  const token = tokenizeShellLike(segment).find((entry) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(entry))
+  return token ? token.replace(/^.*\//, '').toLowerCase() : null
+}
+
+/**
+ * The name of every command on a shell line, in order (`shellSegments` decides where one ends).
+ */
+function shellCommandNames(command: string): string[] {
+  return shellSegments(command)
+    .map((segment) => segmentCommandName(segment))
+    .filter((name): name is string => Boolean(name))
+}
+
+/**
+ * Whether an exit-1 shell line proves that its final command ran and that command belongs to the
+ * caller's set of commands for which exit 1 is an ordinary answer.
+ *
+ * The final command in a direct line or pipeline ran. The right side of `||` also necessarily ran
+ * when the whole line exited 1: a successful left side would have skipped it and returned 0.
+ * `&&` cannot prove that the final command ran. A normal sequence reaches its final command, except
+ * when the line explicitly exits/replaces the shell or enables errexit before it.
+ */
+export function commandExitOneIsExpectedAnswer(
+  command: string,
+  expectedExitOneCommands: ReadonlySet<string>
+): boolean {
+  const segments = parsedShellSegments(command)
+  const final = segments[segments.length - 1]
+  const name = final ? segmentCommandName(final.text) : null
+  if (!name || !expectedExitOneCommands.has(name)) return false
+
+  // The last command in a pipeline runs, but the complete pipeline may itself be guarded by a
+  // boolean operator. Find the operator before that pipeline rather than only the final pipe.
+  let pipelineStart = segments.length - 1
+  while (pipelineStart > 0 && segments[pipelineStart]?.separatorBefore === 'pipe') {
+    pipelineStart -= 1
+  }
+  const guard = segments[pipelineStart]?.separatorBefore
+
+  // Check the entire prefix before accepting `||`: `exit 1; false || rg ...` and an earlier
+  // failure under errexit both leave the final search unrun even though its immediate guard is OR.
+  const prefixCanTerminateShell = segments.slice(0, pipelineStart).some((segment) => {
+    const tokens = tokenizeShellLike(segment.text)
+    const name = segmentCommandName(segment.text)
+    if (name === 'exit' || name === 'return' || name === 'exec') return true
+    if (name !== 'set') return false
+    return tokens.some((token, index) =>
+      /^-[^-]*e/.test(token) ||
+      token === '-oerrexit' ||
+      (token === '-o' && tokens[index + 1] === 'errexit')
+    )
+  })
+  if (prefixCanTerminateShell) return false
+
+  if (guard === undefined || guard === 'or' || guard === 'sequence') return true
+  return false
+}
+
+/**
+ * A failed listing's text without its commands' own error lines (`ls: /nope: No such file …`,
+ * `find: ‘/x’: Permission denied`). Codex merges both output streams, and those lines are not
+ * entries. Claude Code's Bash tool runs `find` through `bfs`, which names itself in its
+ * diagnostics (`bfs: error: /nope: No such file or directory.`), so a `find` line drops those too.
+ */
+export function stripShellErrorLines(text: string, command: string | undefined): string {
+  const names = command ? shellCommandNames(command) : []
+  const prefixes = names.map((name) => `${name}: `)
+  if (names.includes('find')) prefixes.push('bfs: ')
+  if (prefixes.length === 0) return text
+  return text
+    .split('\n')
+    .filter((line) => !prefixes.some((prefix) => line.trimStart().startsWith(prefix)))
+    .join('\n')
+}
+
+/**
+ * The exit code of a shell command that failed, read from its result's `exitCode` (F-P6-5).
+ *
+ * A shell command stored as a file action (`cat` read as a file, `echo … >` as a write, `sed -i`
+ * as an edit, `ls` as a listing) keeps this beside its result, so the zip description reads
+ * `exit 1` and the card and AI view show the failure. Zero is not stored, which keeps a
+ * successful action's payload unchanged. A read tool's own `status` or `code` is not a command's
+ * exit code, and neither is Codex's `status` word. Given the command, exit 1 from a search
+ * (`rg`, `grep`, …, including an `rg --files` listing) is "nothing matched", not a failure. A
+ * stored payload is already filtered, so its readers pass no command.
+ */
+export function failedCommandExitCode(result: unknown, command?: unknown): number | undefined {
+  const exitCode = pickPlainObject(result)?.exitCode
+  if (typeof exitCode !== 'number' || !Number.isFinite(exitCode) || exitCode === 0) return undefined
+  if (exitCode === 1 && typeof command === 'string') {
+    if (commandExitOneIsExpectedAnswer(command, EXIT_ONE_MEANS_NO_MATCH)) return undefined
+  }
+  return exitCode
+}
+
+/**
+ * True when a shell command answered "nothing matched" instead of failing: it ran to the end and
+ * exited 1 from a search (D1's one exception, `failedCommandExitCode` above). A lane that reports
+ * every non-zero exit as a failure — the API lane's `success: exitCode === 0`, Claude Code's
+ * `is_error` — asks this before it turns that flag into a stored failure, so `rg zzz <dir>` is
+ * the answer it is on the Codex lane. A command that timed out or never started is a failure
+ * whatever it exited with.
+ */
+export function commandFoundNothing(result: unknown, command?: unknown): boolean {
+  const record = pickPlainObject(result)
+  if (!record || record.timedOut === true || record.blocked === true) return false
+  const exitCode = record.exitCode
+  if (typeof exitCode !== 'number' || !Number.isFinite(exitCode) || exitCode === 0) return false
+  return failedCommandExitCode(record, command) === undefined
+}
+
+/**
+ * True when a shell command stored as a file action failed: it reported a failing exit code, or
+ * it never reported one and its result says it did not succeed (a command Codex declined, a
+ * sandbox that never started, a policy block).
+ */
+export function shellCommandFailed(result: unknown, command?: unknown): boolean {
+  const record = pickPlainObject(result)
+  if (!record) return false
+  if (failedCommandExitCode(record, command) !== undefined) return true
+  return typeof record.exitCode !== 'number' && (record.success === false || record.blocked === true)
+}
+
+/**
+ * What a failed shell command printed: Codex's merged `output`, or the API's `stdout` and
+ * `stderr`. A file action stores it as `commandOutput` only when the command failed; the name is
+ * deliberate, because every generic text reader takes `content`, `output`, or `stdout`, and a
+ * failure's output must never read as written content, a diff, or file entries.
+ */
+export function failedCommandOutput(result: unknown): string | undefined {
+  const record = pickPlainObject(result)
+  if (!record) return undefined
+  for (const merged of [record.commandOutput, record.output, record.aggregated_output]) {
+    if (typeof merged === 'string' && merged.trim().length > 0) return merged
+  }
+  const streams = [record.stdout, record.stderr].filter(
+    (stream): stream is string => typeof stream === 'string' && stream.trim().length > 0
+  )
+  if (streams.length === 0) return undefined
+  // One line break between the streams, as a merged output would have it, never a blank line.
+  return streams.reduce((joined, stream) => (joined && !joined.endsWith('\n') ? `${joined}\n${stream}` : joined + stream), '')
+}
+
+/** The command a mapped shell action ran, unwrapped when the lane recorded both spellings. */
+export function shellActionCommand(toolArgs: unknown, toolResult?: unknown): string | undefined {
+  const args = pickPlainObject(toolArgs)
+  const mapped = extractNativeMappedToolInput(toolResult)
+  for (const candidate of [args?.innerCommand, args?.command, mapped?.innerCommand, mapped?.command]) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) return candidate
+  }
+  return undefined
+}
+
+/**
+ * The failure fields a file action keeps (nothing for a success, so its payload is unchanged).
+ * `storedOutput` is the text the action already stores as the command's own output (a search that
+ * parsed no match keeps its output as `output`); a failure that printed exactly that is not kept a
+ * second time as `commandOutput`.
+ */
+function shellFailureFields(
+  toolArgs: Record<string, any>,
+  toolResult: unknown,
+  storedOutput?: string | null
+): Record<string, any> {
+  const command = shellActionCommand(toolArgs, toolResult)
+  const normalized = unwrapNativeAutomationData(toolResult)
+  if (!shellCommandFailed(normalized, command)) return {}
+  const exitCode = failedCommandExitCode(normalized, command)
+  const output = failedCommandOutput(normalized)
+  const preview =
+    output && output !== storedOutput
+      ? truncateText(output, BASH_STDERR_PREVIEW_CHARS, BASH_STDERR_PREVIEW_LINES)
+      : null
+  return {
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(preview?.text ? { commandOutput: preview.text } : {})
   }
 }
 
@@ -2109,6 +2544,7 @@ function summarizeReadResult(
     toolResult?.size ??
     toolResult?.bytes ??
     (normalizedContent ? normalizedContent.length : 0)
+  const exitCode = failedCommandExitCode(toolResult, shellActionCommand(toolArgs, toolResult))
 
   return {
     result: {
@@ -2123,7 +2559,8 @@ function summarizeReadResult(
       contentTruncated: preview.truncated,
       contentOmitted: binaryLike,
       omittedReason: binaryLike ? 'binary_like' : undefined,
-      contentChars: normalizedContent.length
+      contentChars: normalizedContent.length,
+      ...(exitCode !== undefined ? { exitCode } : {})
     },
     flags: {
       compacted: preview.truncated || binaryLike,
@@ -2135,7 +2572,8 @@ function summarizeReadResult(
 
 function summarizeWriteResult(toolArgs: Record<string, any>, toolResult: any): { result: any; flags: CompactToolFlags } {
   const normalizedToolResult = unwrapNativeAutomationData(toolResult) as Record<string, any>
-  const content =
+  const failed = shellCommandFailed(normalizedToolResult, shellActionCommand(toolArgs, toolResult))
+  const writeContent =
     extractWriteContentFromSources({
       directContentCandidates: [
         normalizedToolResult?.content,
@@ -2154,9 +2592,11 @@ function summarizeWriteResult(toolArgs: Record<string, any>, toolResult: any): {
         normalizedToolResult?.mappedToolInput?.innerCommand,
         normalizedToolResult?.mappedToolInput?.command
       ]
-    }) ||
-    extractPrimaryText(normalizedToolResult) ||
-    extractPrimaryText(toolResult)
+    })
+  // A failed write wrote nothing: what it printed is its failure, never its content.
+  const content = failed
+    ? writeContent
+    : writeContent || extractPrimaryText(normalizedToolResult) || extractPrimaryText(toolResult)
 
   const binaryLike = isBinaryLikeText(content)
   const preview = binaryLike
@@ -2195,7 +2635,8 @@ function summarizeWriteResult(toolArgs: Record<string, any>, toolResult: any): {
       contentTruncated: preview.truncated,
       contentOmitted: binaryLike,
       omittedReason: binaryLike ? 'binary_like' : undefined,
-      contentChars: normalizedContent.length
+      contentChars: normalizedContent.length,
+      ...shellFailureFields(toolArgs, toolResult)
     },
     flags: {
       compacted: preview.truncated || binaryLike,
@@ -2207,6 +2648,7 @@ function summarizeWriteResult(toolArgs: Record<string, any>, toolResult: any): {
 
 function summarizeEditResult(toolArgs: Record<string, any>, toolResult: any): { result: any; flags: CompactToolFlags } {
   const normalizedToolResult = unwrapNativeAutomationData(toolResult) as Record<string, any>
+  const failed = shellCommandFailed(normalizedToolResult, shellActionCommand(toolArgs, toolResult))
   const filePath = extractPath(
     normalizedToolResult?.filePath,
     normalizedToolResult?.mappedToolInput?.filePath,
@@ -2224,7 +2666,7 @@ function summarizeEditResult(toolArgs: Record<string, any>, toolResult: any): { 
         ? normalizedToolResult.changes
         : typeof normalizedToolResult?.patch === 'string'
           ? normalizedToolResult.patch
-          : typeof normalizedToolResult?.content === 'string'
+          : typeof normalizedToolResult?.content === 'string' && !failed
             ? normalizedToolResult.content
             : undefined
 
@@ -2250,6 +2692,8 @@ function summarizeEditResult(toolArgs: Record<string, any>, toolResult: any): { 
       ? explicitDiff
       : buildCompactEditPreview({
           filePath: filePath ?? undefined,
+          // A failed edit changed nothing: never "Updated <path>", only a real patch or diff.
+          allowSummary: !failed,
           command: managedPatch,
           before:
             typeof normalizedToolResult?.before === 'string' ? normalizedToolResult.before : undefined,
@@ -2267,7 +2711,19 @@ function summarizeEditResult(toolArgs: Record<string, any>, toolResult: any): { 
               : typeof normalizedToolResult?.newContent === 'string'
                 ? normalizedToolResult.newContent
                 : undefined
-        }) ?? ''
+        }) ??
+        // Only a payload stored before 2026-09-18 still carries copies (`nativeBashExecute` now
+        // sends their diff instead). Copies that show no changed line give no diff above
+        // (identical ones end it before the summary), so say what they prove: an empty diff sends
+        // the AI view to the raw sidecar, which for the native wrapper is the whole result with
+        // both copies, and the Edit card to its JSON dump.
+        buildSnapshotEditPreview({
+          filePath: filePath ?? undefined,
+          before: normalizedToolResult?.before,
+          after: normalizedToolResult?.after,
+          allowSummary: !failed
+        }) ??
+        ''
 
   const binaryLike = isBinaryLikeText(diffSource)
   const preview = binaryLike
@@ -2285,7 +2741,8 @@ function summarizeEditResult(toolArgs: Record<string, any>, toolResult: any): { 
       changeCount:
         typeof toolResult?.changeCount === 'number'
           ? toolResult.changeCount
-          : undefined
+          : undefined,
+      ...shellFailureFields(toolArgs, toolResult)
     },
     flags: {
       compacted: preview.truncated || binaryLike,
@@ -3130,8 +3587,10 @@ export function normalizeCompactTool(input: CompactToolInput): CompactToolNormal
   return {
     operationKind,
     rendererFamily,
+    // A brokered zip fetch names its control too (`sys.zip.fetch` → Fetch Zip); a direct
+    // helper fetch names none and keeps its own tool label.
     displayToolName:
-      operationKind === 'artifact_use' || operationKind === 'fabric_use'
+      operationKind === 'artifact_use' || operationKind === 'fabric_use' || operationKind === 'fetch_zip'
         ? formatBatshitToolTargetDisplayName(extractControlTarget(toolArgs, toolResult))
           ?? undefined
         : undefined,

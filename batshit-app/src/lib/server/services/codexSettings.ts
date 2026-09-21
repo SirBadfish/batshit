@@ -19,7 +19,7 @@ const PERMISSION_PRESETS: Record<CodexPermissionMode, { sandbox: CodexRuntimeSet
   },
   agent: {
     sandbox: 'workspace-write',
-    approval: 'on-failure'
+    approval: 'on-request'
   },
   agent_full: {
     sandbox: 'danger-full-access',
@@ -35,9 +35,7 @@ const SANDBOX_VALUES: CodexRuntimeSettings['sandbox'][] = [
 
 const APPROVAL_VALUES: CodexRuntimeSettings['approval'][] = [
   'never',
-  'on-request',
-  'on-failure',
-  'untrusted'
+  'on-request'
 ]
 
 const REASONING_VALUES: CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh']
@@ -97,6 +95,10 @@ function sanitizeSandbox(value: unknown): CodexRuntimeSettings['sandbox'] | unde
 function sanitizeApproval(value: unknown): CodexRuntimeSettings['approval'] | undefined {
   if (typeof value === 'string') {
     const lower = value.toLowerCase()
+    // Codex retired the old selectable `untrusted` policy and deprecated
+    // `on-failure`. Preserve existing Batshit records by moving both onto the
+    // current interactive policy instead of emitting a value Codex rejects.
+    if (lower === 'on-failure' || lower === 'untrusted') return 'on-request'
     if (APPROVAL_VALUES.includes(lower as CodexRuntimeSettings['approval'])) {
       return lower as CodexRuntimeSettings['approval']
     }
@@ -295,7 +297,7 @@ export function buildCodexRuntimeSettings(
   const approval =
     overrides?.permissionMode
       ? preset.approval
-      : (structuredSource?.approval ?? sanitizeApproval(providerRecord?.codex_approval) ?? preset.approval)
+      : (sanitizeApproval(structuredSource?.approval) ?? sanitizeApproval(providerRecord?.codex_approval) ?? preset.approval)
 
   const sanitizedStructuredOverrides = sanitizeCodexConfigOverrides(structuredSource?.configOverrides)
   const sanitizedLegacyOverrides = sanitizeCodexConfigOverrides(

@@ -97,7 +97,7 @@
     margin: 0;
     padding: 1rem;
     background: transparent;
-    font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+    font-family: var(--bs-font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace);
     font-size: 0.875rem;
     line-height: 1.5;
     color: var(--terminal-text, var(--foreground));

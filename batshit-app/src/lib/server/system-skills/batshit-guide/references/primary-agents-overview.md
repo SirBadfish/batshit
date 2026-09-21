@@ -113,6 +113,12 @@ Both are valid setup paths. Mac app Batshit is the richer local workstation path
 
 If a URL works in your browser but fails from an agent, it's usually the wrong caller URL. [Ports and URLs](../reference/ports-and-urls.md) has the full caller table.
 
+## Deleting an agent
+
+Settings → Agents → the agent → **Delete Primary Agent**. This removes the agent and everything that is only its own: its settings, memories, DMs sent to it, schedules, and wake-up webhooks. It also drops the agent from any Group it was in, and from any skill or artifact list that named it.
+
+The confirm dialog has an **Also delete its chats** box, checked by default. Leave it checked and the agent's own chats go with it, including its Infinite Session. Uncheck it to keep the chats. Two things never go: a Group chat (it belongs to every agent in the group; the agent is only removed from the roster), and a chat you locked yourself (unlock it first if you want it gone too; the dialog tells you how many are kept).
+
 ## Common problems
 
 | Symptom | Likely cause | What to check |

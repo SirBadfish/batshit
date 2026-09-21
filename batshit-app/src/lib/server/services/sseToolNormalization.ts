@@ -136,20 +136,11 @@ export function normalizeToolArgs(raw: unknown): Record<string, any> {
       }
     }
 
-    if (
-      normalized.prompt !== undefined &&
-      normalized.Prompt__User_Message_ === undefined
-    ) {
-      const parsedPrompt = parseJsonLike(normalized.prompt)
-      normalized.prompt = parsedPrompt
-      const extracted = extractChatMessage(parsedPrompt)
-      if (extracted.trim().length > 0) {
-        normalized.Prompt__User_Message_ = extracted
-      } else if (typeof parsedPrompt === 'string') {
-        normalized.Prompt__User_Message_ = parsedPrompt
-      }
-    }
-
+    // A tool's own `prompt` argument is not a subagent's message (bug sweep, 2026-09-18). Every
+    // reader takes `Prompt__User_Message_`, n8n's Subagent field, for a subagent call (the zip step,
+    // the source detector, the reply sanitizer, the client's hydration and renderer), so inventing it
+    // from `prompt` filed Claude Code's WebFetch, CronCreate, and Agent helper as Subagent cards. A
+    // Batshit subagent tool takes `chatInput` (above), and n8n sends its own field.
     return normalized
   }
 

@@ -37,6 +37,9 @@ const {
   buildCallToolContent,
   attachMediaDeliveryError
 } = require(path.join(__dirname, 'lib', 'cli-tool-result-content.cjs'))
+// F-P7-10: one shutdown rule for every stdio bridge, so a helper can never outlive the
+// managed CLI run that spawned it.
+const { installStdioLifecycle } = require(path.join(__dirname, 'lib', 'mcp-stdio-lifecycle.cjs'))
 
 const TOOL_NAMES = {
   fetchZip: 'batshit_server_fetch_zip',
@@ -119,8 +122,11 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: TOOL_NAMES.bashExecute,
+    // The Stop sentence is a copy of `NATIVE_BASH_STOP_GUIDANCE` (nativeTools.ts); a test holds
+    // them to one text. The dispatch hands this command the Stop of the running reply.
     description:
-      'Run a Batshit-managed bash command through the current agent Bash settings/sandbox. Prefer this over raw CLI shell/read/list/search tools when the result may need same-turn Batshit zip-control or Batshit Read/List/Search/Edit/Bash rendering.',
+      'Run a Batshit-managed bash command through the current agent Bash settings/sandbox. Prefer this over raw CLI shell/read/list/search tools when the result may need same-turn Batshit zip-control or Batshit Read/List/Search/Edit/Bash rendering. ' +
+      'A Stop or a timeout ends the command and everything it started. To leave a program running, start it in the background with its output sent to a file (`cmd > log 2>&1 &`) and let the command finish; it then runs until Batshit quits (in a sandbox, at most until this reply ends).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -453,34 +459,18 @@ function toErrorPayload(message, details) {
   }
 }
 
-function reserveZipId(type = 'cool_tool') {
-  const timestamp = Date.now()
-  const random = Math.random().toString(36).substring(2, 7)
-  return `${type}_${timestamp}_${random}`
-}
-
-function attachZipControlNotice(payload) {
-  if (!sessionId) return payload
-
-  const zipId = reserveZipId('cool_tool')
-  const notice = {
-    zipId,
-    instruction:
-      'Use this exact zipId in unzip/zip controls if this tool result should stay expanded or change zip state. Use zip IDs only.'
-  }
-
-  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-    return {
-      ...payload,
-      batshitZipControl: notice
-    }
-  }
-
-  return {
-    result: payload,
-    batshitZipControl: notice
-  }
-}
+/**
+ * This bridge deliberately announces NO zip id (F-P4-9).
+ *
+ * It used to mint one per result and hand it to the model as `batshitZipControl`, but the
+ * zip is written by `send-routed`, which reserves its own id when the tool CALL event
+ * arrives — before this result exists — and keeps the first reservation. So the id the
+ * model was told never matched the zip that was saved, and a zip control or
+ * `sys.zip.fetch` naming it silently found nothing. The one model-facing handle for a
+ * current-response tool result is the `tool_result_N` alias, which every zip-control
+ * prompt already teaches and which the browser resolves against the ordered zips of that
+ * response; older zips keep their real ids. Do not re-add a minted id here.
+ */
 
 async function postJson(endpointPath, payload, timeoutMs = 60000) {
   const controller = new AbortController()
@@ -1109,6 +1099,9 @@ async function callBatshitToolUse(rawArgs) {
     ref: args.ref,
     family: parsed.family,
     target: parsed.target,
+    // The same presentation as the API broker (`resolveBrokerPresentation` in
+    // nativeTools.ts): a zip fetch is its own lane with its own zip policy, not a generic
+    // Fabric control (F-P5-2).
     operationKind:
       parsed.family === 'mcp'
         ? 'dynamic_use'
@@ -1117,7 +1110,9 @@ async function callBatshitToolUse(rawArgs) {
           : parsed.family === 'artifact'
             ? 'artifact_use'
             : parsed.family === 'fabric'
-              ? 'fabric_use'
+              ? parsed.target === 'sys.zip.fetch'
+                ? 'fetch_zip'
+                : 'fabric_use'
               : 'agent_browser_use',
     rendererFamily: parsed.family === 'cli' ? 'cli_tool' : 'generic_tool'
   }
@@ -1218,16 +1213,24 @@ async function main() {
     const name = request?.params?.name || ''
     const args = request?.params?.arguments || {}
     const delivery = await deliverRecalledImages(await executeTool(name, args))
-    const payload = attachZipControlNotice(delivery.payload)
 
     // `buildCallToolContent` never sets `structuredContent` — Codex drops
     // `content[]` when it is present (openai/codex#10334), which would delete
     // both the JSON text and the images.
-    return buildCallToolContent(payload, delivery.images)
+    return buildCallToolContent(delivery.payload, delivery.images)
   })
 
   const transport = new StdioServerTransport()
   await server.connect(transport)
+
+  // AFTER connect: the transport's `data` listener is what puts stdin into flowing mode, and
+  // a paused stream never emits `end`.
+  //
+  // F-P7-10: this bridge holds no open handle today, so stdin EOF already drains its event
+  // loop and it exits on its own. That is an accident of what it happens to open, not a
+  // contract — adding a Redis client or a keep-alive socket later would silently turn it
+  // into the PID-1 orphan its two siblings became. Every stdio bridge installs this.
+  installStdioLifecycle({ logPrefix: '[cli-controls-mcp]' })
 }
 
 main().catch((error) => {

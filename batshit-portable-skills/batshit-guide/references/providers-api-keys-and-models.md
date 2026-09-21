@@ -54,8 +54,11 @@ Common provider and connection types include:
 - Groq
 - Mistral
 - Moonshot AI
+- Kimi Code Membership
 - MiniMax
+- MiniMax Token Plan
 - MiMo
+- MiMo Token Plan
 - Qwen Cloud
 - Qwen Token Plan
 - Together.ai
@@ -78,18 +81,30 @@ Regular Z.ai and Z.ai Coding Plan use separate keys and endpoints. Saving `ZAI_A
 
 Qwen Cloud and Qwen Token Plan also use separate keys and endpoints. Keep your normal pay-as-you-go key in **Qwen Cloud**, and save the subscription key that starts with `sk-sp-` in **Qwen Token Plan**. Batshit uses Alibaba's OpenAI-compatible Token Plan endpoint automatically; the `ap-southeast-1` hostname is fixed because Token Plan is currently available only in Singapore, not because Batshit guessed your physical location.
 
+Batshit's Token Plan fallback list follows Alibaba's published Personal Edition text-model list and is merged with live `/models` discovery when an environment key is available. It includes the September 2026 additions **DeepSeek V4.1 Flash** and **GLM-5.3** even when the hosted registry cannot make a keyed discovery call.
+
 Alibaba limits Token Plan to interactive coding and agent tools. Use the Batshit connection for interactive chats and agents only. Do not use that plan key for n8n workflows, automation, batch calls, automated scripts, or generic application-backend work; Alibaba says out-of-scope use can suspend the subscription or key. The pay-as-you-go Qwen Cloud connection remains the unrestricted Batshit route for those other uses.
 
 Token Plan Personal is also licensed for one device at a time. Do not run the same subscription key simultaneously from Batshit on multiple computers; keep the pay-as-you-go Qwen Cloud key available on the other machine instead.
 
+Kimi, MiniMax, and MiMo also have separate subscription connections:
+
+- **Kimi Code Membership** uses the membership key from Kimi Code Console and the overseas coding endpoint. It exposes `k3`, `k3-256k`, `kimi-for-coding`, and `kimi-for-coding-highspeed`; availability still depends on your Kimi membership tier. Keep ordinary Moonshot pay-as-you-go keys in **Moonshot AI**.
+- **MiniMax Token Plan** uses the separate `sk-cp` subscription key. Batshit exposes the current M3/M2.7 text set and can use the same plan key for eligible MiniMax speech. MiniMax describes this plan as interactive individual/developer use and recommends pay-as-you-go for production workloads.
+- **MiMo Token Plan** uses the separate `tp-` subscription key. Batshit defaults to Xiaomi's Singapore OpenAI-compatible endpoint and exposes MiMo V2.5 Pro/V2.5 plus the plan's ASR/TTS audio models. Advanced self-hosters can override the endpoint with the exact China or Europe URL shown in their MiMo console.
+
+These rows do not replace or overwrite **Moonshot AI**, **MiniMax**, or **MiMo** pay-as-you-go keys. When both a pay-as-you-go and subscription speech key are saved for MiniMax or MiMo, Batshit prefers the subscription quota for eligible speech.
+
 ## Create a saved model preset
 
 1. Open Settings → Models.
-2. Use the catalog helper or manual preset creation.
-3. Choose the provider connection.
-4. Choose the developer/model ID.
-5. Confirm tools, image transport, reasoning, context, pricing, or other provider-specific settings.
-6. Save the preset.
+2. In **Browse Model Catalog**, pick the **Provider**: the key you added shows as `<Name> (Direct)`, for example `Anthropic (Direct)`; Vercel AI Gateway, OpenRouter, and Local AI programs have their own entries.
+3. Pick the **Developer** (the company that made the model), then pick a **Model**. Batshit never picks the model for you: the list holds every model that provider serves, older ones included, so choose a current one on purpose (for example Claude Sonnet 5, or a current GPT chat model).
+4. Choose **Use to Create New Preset**. You should see **Model preset created**, and the preset appears under **Saved Models**.
+5. Check the details it filled in: tools, image support, reasoning, context window, and pricing. Change anything provider-specific there; it saves by itself.
+   If the catalog does not list a price or a context window for that model, the field stays blank. The chat then shows its running cost or context use as **Unknown** instead of guessing; type the price or window in to get a real number. A price of `0` is kept as free. Local AI programs, Codex CLI, and Claude Code CLI are always priced at `0` per token, because they run on your own computer or on a plan you already pay for.
+
+The model list only shows models that run on the provider you picked. A model that only Vercel AI Gateway or OpenRouter serves appears under those providers, not under the direct one. For a model the catalog doesn't cover, providers like Alibaba Cloud, StepFun, and your custom OpenAI-compatible providers use manual entry instead.
 
 Use clear names, like:
 
@@ -155,6 +170,8 @@ If a Local AI URL works in your browser but fails from Docker Batshit, check the
 
 Cloud voice providers also use Settings → API Keys.
 
+The saved Google key powers both Gemini TTS and recorded Gemini 3.5 Transcribe. The saved Deepgram key powers recorded/realtime STT plus Aura and Flux batch TTS; realtime Deepgram Flux TTS is a separate future WebSocket lane. MiMo V2.5 ASR is also available for recorded/uploaded WAV or MP3 audio with either the pay-as-you-go key or the separate MiMo Token Plan key.
+
 Fish Audio and Inworld are Batshit's direct realtime TTS providers. Fish needs both:
 
 - a Fish API key
@@ -162,7 +179,7 @@ Fish Audio and Inworld are Batshit's direct realtime TTS providers. Fish needs b
 
 Inworld needs an Inworld API key and a selected Inworld voice in Voice Settings. When 3D Goon Lip Sync is set to Rhubarb WASM / the Premium viseme lane, Inworld realtime TTS can also use Inworld's provider phoneme/viseme timing for live Goon mouth shapes without waiting for Rhubarb WASM analysis.
 
-MiniMax, MiMo, Alibaba Cloud, and StepFun share the same saved key between their direct model-provider connection and their built-in TTS lane. Inworld, Cartesia, Async, and Azure Speech are TTS-only provider rows; Inworld supports Batshit-owned direct realtime TTS, while Cartesia, Async, and Azure Speech remain batch TTS lanes in Batshit until direct streaming adapters land.
+MiniMax, MiMo, Alibaba Cloud, and StepFun share their pay-as-you-go saved key between direct model-provider and built-in speech lanes. MiniMax Token Plan and MiMo Token Plan remain separate saved-key rows; eligible speech prefers the subscription key when present. Inworld, Cartesia, Async, and Azure Speech are TTS-only provider rows; Inworld supports Batshit-owned direct realtime TTS, while Cartesia, Async, and Azure Speech remain batch TTS lanes in Batshit until direct streaming adapters land.
 
 LiveKit is different — it's a voice runtime, not a TTS/STT engine. LiveKit URL/API key/API secret live under the voice runtime credentials area and may point to the native managed local runtime, Docker's optional `livekit` profile, or an external LiveKit service.
 

@@ -184,6 +184,59 @@ describe('tokenPanel utilities', () => {
     expect(summary.cost).toBeCloseTo(0.00996, 5)
   })
 
+  it('shows the running cost as unknown, never an exact $0.00, when the preset has no price (BL-67)', () => {
+    const model: SavedModel = { ...buildModel(), pricing: {} }
+    const summary = summarizeRunningCost([buildSnapshot()], model, buildAgent())
+
+    expect(summary.state).toBe('unknown')
+    expect(summary.cost).toBeNull()
+    expect(summary.note).toContain('no price')
+  })
+
+  it('shows the running cost as unknown when only one of the two prices is known (BL-67)', () => {
+    const model: SavedModel = { ...buildModel(), pricing: { input: 3 } }
+    const summary = summarizeRunningCost([buildSnapshot()], model, buildAgent())
+
+    expect(summary.state).toBe('unknown')
+    expect(summary.cost).toBeNull()
+  })
+
+  it('keeps an explicit price of zero as a real, exact $0.00 (BL-67)', () => {
+    const model: SavedModel = { ...buildModel(), pricing: { input: 0, output: 0, cachedInput: 0 } }
+    const summary = summarizeRunningCost([buildSnapshot()], model, buildAgent())
+
+    expect(summary.state).toBe('exact')
+    expect(summary.cost).toBe(0)
+  })
+
+  it('shows context usage as unknown, not a 0% bar, when the preset has no context window (BL-67)', () => {
+    const model: SavedModel = { ...buildModel() }
+    delete model.contextWindow
+    const messages = [buildMessage('m1', 'hello'), buildMessage('m2', 'world')]
+    const beforeAnyRun = summarizeContextUsage({
+      messages,
+      snapshots: [],
+      activeModel: model,
+      agent: buildAgent()
+    })
+
+    expect(beforeAnyRun.state).toBe('unknown')
+    expect(beforeAnyRun.label).toBe('Unknown')
+    expect(beforeAnyRun.contextLimit).toBeNull()
+    expect(beforeAnyRun.contextPercent).toBeNull()
+
+    // A reported token count stays a real count, but no percentage is claimed.
+    const afterARun = summarizeContextUsage({
+      messages,
+      snapshots: [buildSnapshot()],
+      activeModel: model,
+      agent: buildAgent()
+    })
+    expect(afterARun.displayTokens).toBe(1000)
+    expect(afterARun.contextLimit).toBeNull()
+    expect(afterARun.contextPercent).toBeNull()
+  })
+
   it('adds delegated usage at each run model price without changing context pressure', () => {
     const model = buildModel()
     const agent = buildAgent()

@@ -15,6 +15,7 @@ export type CoreSystemPromptId =
   | 'tool_guidance_zip_disabled'
   | 'tool_guidance_memory'
   | 'dm_guidance'
+  | 'jev_juice_guidance'
   | 'dynamic_mcp'
 
 type PromptDefinition = {
@@ -66,7 +67,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for API-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_api_system_prompt.md',
-    defaultVersion: '2026-08-31'
+    defaultVersion: '2026-09-21'
   },
   {
     id: 'cli_primary',
@@ -75,7 +76,7 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Core instructions for CLI-backed Batshit primary agents.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_primary_agent_cli_system_prompt.md',
-    defaultVersion: '2026-08-31'
+    defaultVersion: '2026-09-21'
   },
   {
     id: 'subagent_base',
@@ -140,7 +141,8 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     description: 'Injected for memory-enabled agents: lanes, inline saves, supersession discipline, and the sys.memory.* operations.',
     warning: COMMON_CORE_PROMPT_WARNING,
     defaultFile: 'batshit_tool_prompt_memory.md',
-    defaultVersion: '2026-09-02c'
+    // Bumped 2026-09-19: the agent owns its whiteboard; a nap fills only an empty board.
+    defaultVersion: '2026-09-19'
   },
   {
     id: 'dm_guidance',
@@ -176,6 +178,20 @@ const CORE_SYSTEM_PROMPTS: PromptDefinition[] = [
     // and one it names without its fields is a guaranteed first-call failure (the P2, P5
     // and SA-115 lesson, three times).
     defaultVersion: '2026-09-11'
+  },
+  {
+    id: 'jev_juice_guidance',
+    redisKey: 'batshit:jev_juice_guidance',
+    label: 'Jev Juice Guidance',
+    description:
+      'Injected for agents with the Jev Juice judgment tool turned on: what sys.judge.ask takes (state plus typed noul, choice, and score questions), what comes back, how to ask many narrow questions in one call, and what Jev cannot do.',
+    warning: COMMON_CORE_PROMPT_WARNING,
+    defaultFile: 'batshit_jev_juice_guidance.md',
+    // SA-120 P2 (H1): first version. Gated on the agent's `jev_juice_judge_tool` switch,
+    // the same switch that opens `sys.judge.*` in the broker, so a control the agent
+    // cannot call is never taught (the DM block's lesson: name the fields, or the first
+    // call fails on guessed names).
+    defaultVersion: '2026-09-16'
   },
   {
     id: 'dynamic_mcp',

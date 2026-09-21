@@ -27,6 +27,11 @@
   import type { LocalAiImageTransport, LocalAiServerSummary, LocalAiServerUpdate } from '$lib/types/localAi'
   import OllamaModelManager from '../OllamaModelManager.svelte'
   import DmrModelManager from '../DmrModelManager.svelte'
+  import LocalAiModelManager from '../LocalAiModelManager.svelte'
+  // SA-124 P8: the programs whose own API can actually load a model. The other
+  // three (llama.cpp, vLLM, SGLang) take one model per process from a launch
+  // flag, so they keep the read-only Detected Models card.
+  const MANAGEABLE_PROGRAMS = new Set(['koboldcpp', 'lmstudio', 'omlx'])
   import type { UserSettingsRow } from '$lib/types/database'
   import { dispatchLocalAiSettingsUpdated } from '$lib/utils/liveSettingsEvents'
 
@@ -722,7 +727,30 @@
                 </Card.Root>
               {/if}
 
-              {#if server.supports.modelList && server.id !== 'ollama' && server.id !== 'dmr'}
+              {#if MANAGEABLE_PROGRAMS.has(server.id)}
+                <Card.Root class="batshit-settings-card-subtle-frame">
+                  <Card.Header>
+                    <div class="flex items-center gap-1.5">
+                      <Card.Title class="flex items-center gap-2">
+                        <Boxes class="h-4 w-4" />
+                        {server.label} Models
+                      </Card.Title>
+                      <SettingsInfoMenu ariaLabel={`About ${server.label} Models`} contentClass="w-80">
+                        <p>
+                          Load and unload {server.label}'s models from here, so they appear in the
+                          model picker. Batshit asks {server.label} what it has rather than reading
+                          a folder, because only the program itself can load a model.
+                        </p>
+                      </SettingsInfoMenu>
+                    </div>
+                  </Card.Header>
+                  <Card.Content class="batshit-settings-card-content-flush">
+                    <LocalAiModelManager programId={server.id} enabled={server.enabled} />
+                  </Card.Content>
+                </Card.Root>
+              {/if}
+
+              {#if server.supports.modelList && server.id !== 'ollama' && server.id !== 'dmr' && !MANAGEABLE_PROGRAMS.has(server.id)}
                 <Card.Root class="batshit-settings-card-subtle-frame">
                   <Card.Header class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                     <div class="flex items-center gap-1.5">

@@ -39,6 +39,7 @@
 
 import { createHash } from 'node:crypto'
 import { redis } from '$lib/server/redis'
+import { publishUserEvent } from '$lib/server/ssePublisher'
 import {
   createPendingApproval,
   decideApproval,
@@ -627,6 +628,16 @@ export async function settleControlApprovalCard(options: {
     }
 
     await redis.updateMessage(messageId, options.sessionId, { metadata }, options.userId)
+
+    // The card is settled in Redis and nothing streams to say so: the resume turn (when
+    // there is one) writes a different message. Until 2026-09-18 the chat page re-fetched
+    // the open chat ten times a second, which is the only reason a spent card ever went
+    // away on screen — in this tab or in another one still showing live Approve buttons.
+    await publishUserEvent(options.userId, {
+      type: 'session_messages_changed',
+      sessionId: options.sessionId,
+      reason: 'approval_settled'
+    })
   } catch (error) {
     // Never fail the click over presentation. The record is already decided, which is the
     // part that matters; a card left on screen is visible and recoverable.

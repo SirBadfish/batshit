@@ -5,6 +5,8 @@
     formatControlApprovalRiskWord,
     formatControlApprovalTitle
   } from '$lib/utils/controlApprovalPresentation'
+  import { getDmBrief, requestDmBrief } from '$lib/stores/dmBriefs.svelte'
+  import { wakeOriginText } from '$lib/utils/jevJuice'
 
   interface Props {
     approvals: any[]
@@ -14,6 +16,8 @@
     formatApprovalInput: (input: any) => string
     getApprovalRemainingSeconds: (approval: any) => number | null
     onApprovalAction: (approvalId: string, approved: boolean) => void | Promise<void>
+    /** SA-120 P7: the DM whose wake started this turn, when a DM, a webhook, or a schedule did. */
+    wakeDmId?: string | null
   }
 
   /**
@@ -35,8 +39,29 @@
     describeApproval,
     formatApprovalInput,
     getApprovalRemainingSeconds,
-    onApprovalAction
+    onApprovalAction,
+    wakeDmId = null
   }: Props = $props()
+
+  /**
+   * SA-120 P7 (Josh's review, 2026-09-17) — the origin line.
+   *
+   * A chat that a DM, a wake-up webhook, or a schedule started is driven by text the user did
+   * not write, and this card is the moment the user decides whether to let it act. So every
+   * approval card of such a turn says so at the top, flagged or not: "This turn was started by
+   * a wake-up message from webhook "Nightly build", not by you." Without it the card reads
+   * like any ordinary "the agent wants a tool" card.
+   *
+   * The line comes from Batshit's own record of who wrote the DM (the brief), read HERE in the
+   * browser; Jev has no part in it. A Jev flag on that message is a SEPARATE notice card
+   * above this one (`JevJuiceFlagNotice.svelte`), never a line on this card, because a flag
+   * on the approval card made Approve feel like approving the flag. The server's risk gate
+   * never sees any of this (DL-120-12): both buttons work exactly as before.
+   */
+  $effect(() => {
+    requestDmBrief(wakeDmId)
+  })
+  const wakeOrigin = $derived(wakeDmId ? wakeOriginText(getDmBrief(wakeDmId)?.from) : null)
 </script>
 
 <div class="message-approval-panel">
@@ -46,11 +71,15 @@
       <p class="message-approval-copy">
         Review each tool call before it runs.
       </p>
+      {#if wakeOrigin}
+        <p class="message-approval-origin" data-testid="approval-wake-origin">{wakeOrigin}</p>
+      {/if}
     </div>
     {#if approvalSubmitting}
       <span class="message-approval-copy">Continuing...</span>
     {/if}
   </div>
+
 
   <div class="message-approval-list">
     {#each approvals as approval (approval.approvalId)}
@@ -165,6 +194,15 @@
   .message-approval-tool {
     color: var(--muted-foreground);
     font-size: 0.75rem;
+  }
+
+  /* SA-120 P7: the origin line of a woken turn. Quiet, but not muted: it is the one fact that
+     changes what the click below means. */
+  .message-approval-origin {
+    margin-top: 0.375rem;
+    color: var(--foreground);
+    font-size: 0.75rem;
+    line-height: 1.45;
   }
 
   .message-approval-list {

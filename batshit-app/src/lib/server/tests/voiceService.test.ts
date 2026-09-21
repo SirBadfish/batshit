@@ -316,6 +316,37 @@ describe('voiceService engine defaults', () => {
     expect(Array.from(result.audio)).toEqual([5, 6, 7, 8])
   })
 
+  it('prefers the separate MiniMax Token Plan key for eligible speech', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) => {
+      if (service === 'minimax_token_plan') return 'sk-cp-minimax-plan-test'
+      if (service === 'minimax') return 'minimax-paygo-test'
+      return null
+    })
+    mockFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: { audio: Buffer.from([5, 6]).toString('hex') },
+          extra_info: { audio_format: 'mp3' }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    )
+
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    await synthesizeSpeech({
+      text: 'Use the subscription quota',
+      provider: 'minimax',
+      model: 'speech-2.8-hd',
+      userId: 'user-1'
+    })
+
+    const [url, request] = mockFetch.mock.calls[0]
+    expect(url).toBe('https://api.minimax.io/v1/t2a_v2')
+    expect(request.headers).toMatchObject({
+      Authorization: 'Bearer sk-cp-minimax-plan-test'
+    })
+  })
+
   it('synthesizes speech through MiMo V2.5 TTS', async () => {
     mockRetrieveApiKey.mockImplementation(async (service: string) =>
       service === 'mimo' ? 'mimo-test-key-1234567890' : null
@@ -384,6 +415,74 @@ describe('voiceService engine defaults', () => {
       mediaType: 'audio/wav'
     })
     expect(Array.from(result.audio)).toEqual([9, 10, 11])
+  })
+
+  it('uses the separate MiMo Token Plan endpoint and key for speech when configured', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) => {
+      if (service === 'mimo_token_plan') return 'tp-mimo-plan-test'
+      if (service === 'mimo') return 'mimo-paygo-test'
+      return null
+    })
+    mockFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { audio: { data: Buffer.from([9, 10]).toString('base64') } } }]
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    )
+
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    await synthesizeSpeech({
+      text: 'Use MiMo plan speech',
+      provider: 'mimo',
+      model: 'mimo-v2.5-tts',
+      userId: 'user-1'
+    })
+
+    const [url, request] = mockFetch.mock.calls[0]
+    expect(url).toBe('https://token-plan-sgp.xiaomimimo.com/v1/chat/completions')
+    expect(request.headers).toMatchObject({
+      'api-key': 'tp-mimo-plan-test'
+    })
+  })
+
+  it('transcribes recorded audio through MiMo V2.5 ASR and the Token Plan', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'mimo_token_plan' ? 'tp-mimo-plan-test' : null
+    )
+    mockFetch.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'Good morning from MiMo.' } }]
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    )
+
+    const { transcribeAudio } = await import('../services/voiceService')
+    const result = await transcribeAudio({
+      audio: createTinyWav(),
+      provider: 'mimo',
+      model: 'mimo-v2.5-asr',
+      language: 'en',
+      contentType: 'audio/wav',
+      userId: 'user-1'
+    })
+
+    const [url, request] = mockFetch.mock.calls[0]
+    const body = JSON.parse(String(request.body))
+    expect(url).toBe('https://token-plan-sgp.xiaomimimo.com/v1/chat/completions')
+    expect(request.headers).toMatchObject({
+      'api-key': 'tp-mimo-plan-test'
+    })
+    expect(body).toMatchObject({
+      model: 'mimo-v2.5-asr',
+      asr_options: { language: 'en' },
+      stream: false
+    })
+    expect(body.messages[0].content[0].input_audio.data).toMatch(/^data:audio\/wav;base64,/)
+    expect(result).toEqual({ text: 'Good morning from MiMo.', language: 'en' })
   })
 
   it('synthesizes speech through Azure Speech REST TTS', async () => {
@@ -951,6 +1050,18 @@ describe('voiceService engine defaults', () => {
     })
   })
 
+  it('recognizes the standard Google Generative AI environment key for voice providers', async () => {
+    vi.stubEnv('GOOGLE_GENERATIVE_AI_API_KEY', 'google-test-key-1234567890')
+
+    const { buildVoiceProviderSummary } = await import('../services/voiceService')
+    const result = await buildVoiceProviderSummary('user-1')
+
+    expect(result.find((entry) => entry.id === 'google')).toMatchObject({
+      ready: true,
+      statusHint: undefined
+    })
+  })
+
   it('marks Fish and Inworld as built-in direct realtime TTS providers in provider summaries', async () => {
     mockRetrieveApiKey.mockImplementation(async (service: string) =>
       service === 'fish'
@@ -1248,11 +1359,27 @@ describe('voiceService engine defaults', () => {
       ],
       realtimeSttModels: ['gpt-realtime-whisper']
     })
+    expect(result.find((entry) => entry.id === 'google')).toMatchObject({
+      supports: {
+        tts: true,
+        stt: true,
+        streaming: false
+      },
+      defaultTtsModel: 'gemini-3.1-flash-tts-preview',
+      defaultSttModel: 'gemini-3.5-transcribe',
+      sttModels: ['gemini-3.5-transcribe'],
+      sttCapabilities: {
+        recorded: true,
+        realtime: false,
+        transport: 'http-upload'
+      }
+    })
     expect(result.find((entry) => entry.id === 'deepgram')).toMatchObject({
       defaultModel: 'aura-2-asteria-en',
       defaultTtsModel: 'aura-2-asteria-en',
       defaultSttModel: 'nova-3',
       defaultRealtimeSttModel: 'flux-general-en',
+      ttsModels: ['aura-2-asteria-en', 'flux-hannah-en'],
       sttModels: [
         'nova-3',
         'nova-3-general',
@@ -1303,6 +1430,239 @@ describe('voiceService engine defaults', () => {
       sttModels: ['voxtral-mini-latest', 'voxtral-mini-2602'],
       realtimeSttModels: ['voxtral-mini-transcribe-realtime-2602']
     })
+  })
+
+  it('synthesizes Deepgram Flux batch TTS through /v2/speak with Flux options', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'deepgram' ? 'dg-test-key-1234567890' : null
+    )
+    mockFetch.mockResolvedValue(
+      new Response(new Uint8Array([0x49, 0x44, 0x33, 1, 2, 3]), {
+        status: 200,
+        headers: { 'content-type': 'audio/mpeg' }
+      })
+    )
+
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    const result = await synthesizeSpeech({
+      text: 'Hello from Flux batch.',
+      provider: 'deepgram',
+      model: 'flux-hannah-en',
+      voiceId: 'flux-hannah-en',
+      userId: 'user-1',
+      options: {
+        common: { speed: 1.1 },
+        providerOptions: {
+          encoding: 'mp3',
+          sampleRate: 24000,
+          bitRate: 48000,
+          expressivity: 2,
+          mipOptOut: true
+        }
+      }
+    })
+
+    const [rawUrl, request] = mockFetch.mock.calls[0]
+    const url = new URL(String(rawUrl))
+    expect(url.origin + url.pathname).toBe('https://api.deepgram.com/v2/speak')
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      model: 'flux-hannah-en',
+      encoding: 'mp3',
+      speed: '1.1',
+      sample_rate: '24000',
+      bit_rate: '48000',
+      expressivity: '2',
+      mip_opt_out: 'true'
+    })
+    expect(request.headers).toMatchObject({
+      Authorization: 'Token dg-test-key-1234567890',
+      'Content-Type': 'application/json',
+      Accept: '*/*'
+    })
+    expect(JSON.parse(String(request.body))).toEqual({ text: 'Hello from Flux batch.' })
+    expect(result).toMatchObject({
+      provider: 'deepgram',
+      model: 'flux-hannah-en',
+      voiceId: 'flux-hannah-en',
+      mediaType: 'audio/mpeg'
+    })
+  })
+
+  it('rejects invalid Deepgram Flux speed before calling the provider', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'deepgram' ? 'dg-test-key-1234567890' : null
+    )
+
+    const { synthesizeSpeech } = await import('../services/voiceService')
+    await expect(
+      synthesizeSpeech({
+        text: 'Invalid speed probe.',
+        provider: 'deepgram',
+        model: 'flux-hannah-en',
+        userId: 'user-1',
+        options: { common: { speed: 0.53 } }
+      })
+    ).rejects.toThrow('Deepgram Flux speed must use 0.05 increments.')
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('uploads, transcribes, and deletes Google Gemini recorded audio', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'google' ? 'google-test-key-1234567890' : null
+    )
+    mockFetch
+      .mockResolvedValueOnce(
+        new Response('', {
+          status: 200,
+          headers: { 'x-goog-upload-url': 'https://upload.example.test/resumable' }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            file: {
+              name: 'files/batshit-audio',
+              uri: 'https://generativelanguage.googleapis.com/v1beta/files/batshit-audio',
+              mimeType: 'audio/m4a'
+            }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            steps: [
+              {
+                type: 'model_output',
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Batshit voice readiness check.',
+                    annotations: [
+                      {
+                        type: 'word_info',
+                        text: 'Batshit',
+                        speaker: 'spk_1',
+                        start_offset: '0.100s',
+                        end_offset: '0.400s'
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+
+    const { transcribeAudio } = await import('../services/voiceService')
+    const result = await transcribeAudio({
+      audio: new Uint8Array([1, 2, 3, 4]),
+      provider: 'google',
+      model: 'gemini-3.5-transcribe',
+      language: 'en-US',
+      contentType: 'audio/mp4; codecs=mp4a.40.2',
+      userId: 'user-1',
+      options: {
+        providerOptions: {
+          mode: 'verbatim',
+          diarization: true,
+          wordTimestamps: true
+        }
+      }
+    })
+
+    expect(mockFetch).toHaveBeenCalledTimes(4)
+    const startRequest = mockFetch.mock.calls[0]?.[1]
+    expect(mockFetch.mock.calls[0]?.[0]).toBe(
+      'https://generativelanguage.googleapis.com/upload/v1beta/files'
+    )
+    expect(startRequest?.headers).toMatchObject({
+      'x-goog-api-key': 'google-test-key-1234567890',
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Type': 'audio/m4a'
+    })
+    expect(mockFetch.mock.calls[1]?.[0]).toBe('https://upload.example.test/resumable')
+    const interactionRequest = mockFetch.mock.calls[2]?.[1]
+    expect(JSON.parse(String(interactionRequest?.body))).toMatchObject({
+      model: 'gemini-3.5-transcribe',
+      input: [
+        {
+          type: 'audio',
+          uri: 'https://generativelanguage.googleapis.com/v1beta/files/batshit-audio',
+          mime_type: 'audio/m4a'
+        }
+      ],
+      generation_config: {
+        transcription_config: {
+          language_codes: ['en-US'],
+          mode: {
+            type: 'verbatim',
+            diarization_mode: 'speaker',
+            timestamp_granularities: ['word']
+          }
+        }
+      }
+    })
+    expect(mockFetch.mock.calls[3]?.[0]).toBe(
+      'https://generativelanguage.googleapis.com/v1beta/files/batshit-audio'
+    )
+    expect(mockFetch.mock.calls[3]?.[1]?.method).toBe('DELETE')
+    expect(result).toMatchObject({
+      text: 'Batshit voice readiness check.',
+      language: 'en-US',
+      segments: [{ type: 'word_info', text: 'Batshit', speaker: 'spk_1' }]
+    })
+  })
+
+  it('rejects incompatible Google Gemini transcription options before upload', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'google' ? 'google-test-key-1234567890' : null
+    )
+
+    const { transcribeAudio } = await import('../services/voiceService')
+    await expect(
+      transcribeAudio({
+        audio: new Uint8Array([1, 2, 3]),
+        provider: 'google',
+        userId: 'user-1',
+        contentType: 'audio/wav',
+        options: {
+          providerOptions: { mode: 'smart', wordTimestamps: true }
+        }
+      })
+    ).rejects.toThrow(
+      'Google Gemini Smart transcription cannot be combined with speaker diarization or word timestamps.'
+    )
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('preserves Google Gemini transcription quota status for the API route', async () => {
+    mockRetrieveApiKey.mockImplementation(async (service: string) =>
+      service === 'google' ? 'google-test-key-1234567890' : null
+    )
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: { code: 429, message: 'Resource exhausted.' } }), {
+        status: 429,
+        headers: { 'content-type': 'application/json' }
+      })
+    )
+
+    const { transcribeAudio } = await import('../services/voiceService')
+    const error = await transcribeAudio({
+      audio: new Uint8Array([1, 2, 3]),
+      provider: 'google',
+      userId: 'user-1',
+      contentType: 'audio/wav'
+    }).catch((caught) => caught)
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error).toMatchObject({ status: 429 })
+    expect(error.message).toContain('Resource exhausted')
   })
 
   it('filters OpenAI TTS voices by selected model support', async () => {

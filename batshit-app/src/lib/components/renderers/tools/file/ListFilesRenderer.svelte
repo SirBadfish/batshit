@@ -2,9 +2,21 @@
 <script lang="ts">
 	import CompactTool from '../templates/CompactTool.svelte'
 	import type { ToolData } from '../toolRendererRegistry'
+	import { failedCommandExitCode } from '$lib/utils/toolActivityContract'
 	import { Folder, File, FolderOpen } from '@lucide/svelte'
-	
+
 	let { tool }: { tool: ToolData } = $props()
+	// A listing that failed says so (F-P6-5): it used to read "Empty directory" for a path that
+	// does not exist. Like the Bash card, a non-zero exit code is a failure even when the step
+	// itself reported none; the compact card shows no error of its own, so this one does.
+	let failedExitCode = $derived(failedCommandExitCode(tool.toolResult))
+	let failed = $derived(failedExitCode !== undefined || !tool.success)
+	let errorHeadline = $derived(
+		tool.error || (failedExitCode !== undefined ? `Command exited with code ${failedExitCode}` : '')
+	)
+	let commandOutput = $derived(
+		typeof tool.toolResult?.commandOutput === 'string' ? tool.toolResult.commandOutput : ''
+	)
 
 	// Extract directory info from input or result
 	let dirPath = $derived.by(() => {
@@ -386,14 +398,22 @@
 <CompactTool
 	icon={Folder}
 	title="List Files"
-	summary={`${summary} in ${dirName}`}
-	status={tool.success ? 'success' : 'error'}
-	expandable={totalItems > 0}
+	summary={failed ? `Failed to list ${dirName}` : `${summary} in ${dirName}`}
+	status={failed ? 'error' : 'success'}
+	expandable={totalItems > 0 || failed}
 	error={tool.error}
 >
 	<div class="file-list">
+		{#if failed}
+			<div class="error-message">{errorHeadline || 'Failed to list files'}</div>
+			{#if commandOutput}
+				<pre class="command-output">{commandOutput}</pre>
+			{/if}
+		{/if}
 		{#if fileList.length === 0}
-			<div class="empty-message">No files found</div>
+			{#if !failed}
+				<div class="empty-message">No files found</div>
+			{/if}
 		{:else}
 			{#each fileList as item (`${item.indent}-${item.name}-${item.size || ''}`)}
 				<div class="file-item" style="padding-left: {item.indent * 1.5}rem">
@@ -433,6 +453,16 @@
 		text-align: center;
 		color: var(--muted-foreground);
 		font-style: italic;
+	}
+
+	.error-message,
+	.command-output {
+		margin: 0;
+		padding: 0.25rem;
+		color: rgb(239 68 68);
+		font-family: var(--font-mono, monospace);
+		white-space: pre-wrap;
+		word-break: break-word;
 	}
 	
 	.file-item {

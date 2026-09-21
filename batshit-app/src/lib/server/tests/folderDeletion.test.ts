@@ -123,7 +123,10 @@ describe.runIf(REAL_REDIS_LANE)('folder deletion', () => {
       locked: false
     })
 
-    const result = await redis.deleteFolder(userId, folder.id, { deleteSessions: true })
+    const result = await redis.deleteFolder(userId, folder.id, {
+      deleteSessions: true,
+      deleteSession: (sessionId) => redis.deleteSession(sessionId)
+    })
 
     expect(result).toMatchObject({
       success: true,
@@ -154,7 +157,10 @@ describe.runIf(REAL_REDIS_LANE)('folder deletion', () => {
       locked: true
     })
 
-    const result = await redis.deleteFolder(userId, folder.id, { deleteSessions: true })
+    const result = await redis.deleteFolder(userId, folder.id, {
+      deleteSessions: true,
+      deleteSession: (sessionId) => redis.deleteSession(sessionId)
+    })
 
     expect(result.success).toBe(false)
     expect(result.error).toContain('locked')
@@ -173,7 +179,10 @@ describe.runIf(REAL_REDIS_LANE)('folder deletion', () => {
     const userId = 'folder-delete-default-user'
     const defaultFolder = await redis.getDefaultFolder(userId)
 
-    const result = await redis.deleteFolder(userId, defaultFolder.id, { deleteSessions: true })
+    const result = await redis.deleteFolder(userId, defaultFolder.id, {
+      deleteSessions: true,
+      deleteSession: (sessionId) => redis.deleteSession(sessionId)
+    })
 
     expect(result.success).toBe(false)
     expect(result.error).toBe('Cannot delete default folder')

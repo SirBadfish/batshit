@@ -17,6 +17,11 @@ import {
   extractAppServerSpawnArgs,
 } from '../services/codexBridge'
 import { resolveCodexTransportLane } from '../services/codexSettings'
+import {
+  CAPTURED_ADD_DELETE_MOVE_EDIT,
+  CAPTURED_UPDATE_AND_RENAME,
+  CODEX_PROJECT
+} from '$lib/test-utils/codex-app-server-file-changes'
 
 const spawnMock = vi.hoisted(() => vi.fn())
 vi.mock('node:child_process', async (importOriginal) => {
@@ -120,6 +125,35 @@ describe('mapAppServerItem', () => {
       changes: [{ path: '/a.ts', kind: 'update' }],
       status: 'completed',
     })
+  })
+
+  // The app server describes a change's kind as an object and sends each file's own diff
+  // (captured from codex-cli 0.139.0). Passing the object through crashed the adapter on every
+  // native patch (`kind.toLowerCase is not a function`), and dropping `diff` lost Codex's record.
+  it('maps a real app-server fileChange: a word for each kind, a rename target, and Codex\'s own diff', () => {
+    expect(mapAppServerItem(CAPTURED_UPDATE_AND_RENAME)).toEqual({
+      id: CAPTURED_UPDATE_AND_RENAME.id,
+      type: 'file_change',
+      changes: [
+        {
+          path: `${CODEX_PROJECT}/notes.md`,
+          kind: 'update',
+          diff: '@@ -2,3 +2,3 @@\n \n-First line.\n+Last line.\n Second line.\n'
+        },
+        {
+          path: `${CODEX_PROJECT}/old-name.txt`,
+          kind: 'move',
+          to: `${CODEX_PROJECT}/new-name.txt`,
+          diff: `\n\nMoved to: ${CODEX_PROJECT}/new-name.txt`
+        }
+      ],
+      status: 'completed'
+    })
+    const [added, deleted, movedAndEdited] = (mapAppServerItem(CAPTURED_ADD_DELETE_MOVE_EDIT) as any).changes
+    expect(added).toMatchObject({ kind: 'add', diff: 'hello\nworld\n' })
+    expect(deleted).toMatchObject({ kind: 'delete', diff: 'delete me\n' })
+    // A rename that also changed lines is an edit of that file, not a bare move.
+    expect(movedAndEdited).toMatchObject({ kind: 'update', to: `${CODEX_PROJECT}/moved-notes.md` })
   })
 
   it('skips userMessage echoes and unknown types', () => {
@@ -244,7 +278,7 @@ describe('bridge lane helpers', () => {
       ephemeral: true,
       cwd: '/tmp/work',
       model: 'gpt-5.3-codex-spark',
-      approvalPolicy: 'on-failure',
+      approvalPolicy: 'on-request',
       sandbox: 'workspace-write',
       developerInstructions: 'Stable\nBatshit "instructions"',
     })

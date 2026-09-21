@@ -137,6 +137,25 @@ beforeEach(() => {
   })
 })
 
+describe('the skill scope of an API Subagent run (BL-75)', () => {
+  it('passes the subagent own id as the skill scope, while agentId stays the parent', async () => {
+    await run()
+
+    expect(threadRunnerMocks.processNativeMode.mock.calls[0]?.[0]).toMatchObject({
+      agentId: 'primary-agent',
+      scopeAgentId: 'api-helper',
+    })
+  })
+
+  it('fails the run loudly when the subagent has no id, instead of borrowing the parent skills', async () => {
+    const result = await run({ subagent: { ...apiSubagent(), id: '  ' } })
+
+    expect(threadRunnerMocks.processNativeMode).not.toHaveBeenCalled()
+    expect(result.status).toBe('failed')
+    expect(result.output).toContain('no subagent id')
+  })
+})
+
 describe('managed subagent thread control (DL-111-04)', () => {
   it('starts fresh by default and discards a stored thread', async () => {
     subagentRedis.seed(THREAD_KEY, [

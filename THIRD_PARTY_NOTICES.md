@@ -40,8 +40,16 @@ The Mac app can include app-owned runtime binaries under `Batshit.app/Contents/R
 - Official source and legal guidance: <https://ffmpeg.org/download.html> and <https://ffmpeg.org/legal.html>
 - Packaging rule: do not bundle an arbitrary FFmpeg binary. Any packaged FFmpeg runtime must include the exact license files, source-code offer/source reference, checksum record, and build configuration used for that binary.
 - Mac app encoder rule: the packaged Mac runtime is expected to use FFmpeg's `h264_videotoolbox` encoder for MP4 previews, so the Mac bundle does not need a bundled `libx264`/GPL dependency for that path.
+- Mac app AV1 decoder: FFmpeg and FFprobe statically include VideoLAN dav1d 1.5.4 for software AV1 upload inspection and thumbnail generation. Browser playback remains a separate capability of Electron and the user's Mac.
 - Release guardrail: package preparation rejects FFmpeg builds configured with `--enable-nonfree`, and rejects `--enable-gpl` unless release owners explicitly accept GPL obligations for that release package.
 - Portability guardrail: the Mac build disables dependency autodetection and X11/XCB integration, targets macOS 14, and must resolve every non-system dynamic library from inside the app bundle.
+
+### dav1d
+
+- Purpose: software AV1 decoding in the Mac app's packaged FFmpeg/FFprobe, including Macs without hardware AV1 decoding.
+- Source: <https://download.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz>
+- License: BSD-2-Clause. The complete upstream copyright notice, conditions and disclaimer are included at `Contents/Resources/runtime/vendor/ffmpeg/share/dav1d/COPYING`.
+- Packaging rule: verify the pinned source archive SHA-256, statically link the arm64/macOS 14 build, and retain the `SOURCE.txt` and `CHECKSUMS.txt` alongside that notice. No system installation or Homebrew library is required on the user's Mac.
 
 ### Apple Container
 

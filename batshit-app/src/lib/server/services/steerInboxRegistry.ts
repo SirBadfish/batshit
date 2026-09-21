@@ -482,10 +482,10 @@ export function takeMissedDmSteers(
 }
 
 /**
- * Drop a session's entries. Called from send-routed's `finally`, beside `clearSessionTurn`,
- * so a finished request never leaves entries behind.
+ * Drop a session's entries. Called from send-routed's `finally`, beside the lock release
+ * (`releaseSessionTurn`), so a finished request never leaves entries behind.
  *
- * `keepMessageId` (F-P1-1) is the ownership check `clearSessionTurn` has, in the form this
+ * `keepMessageId` (F-P1-1) is the ownership check the lock release has, in the form this
  * map needs: entries carry the assistant `messageId` they belong to, so a finished request
  * removes every OTHER turn's entries and leaves the live turn's alone. The window is the
  * one SA-113 F-P1-1 closed for the lock — a turn stopped during setup unwinds its
@@ -522,8 +522,8 @@ export function clearSteerInbox(
  *
  * Registered by send-routed beside `registerStreamAbort`, cleared in the same `finally`
  * that clears the stream. Checking the message id on the way out is the same ownership rule
- * `clearSteerInbox` and `clearSessionTurn` use — a request that unwinds late must not
- * remove a live turn's registration.
+ * `clearSteerInbox` uses — a request that unwinds late must not remove a live turn's
+ * registration.
  */
 export function registerSteerRun(sessionId: string, run: SteerRunRegistration): void {
   runs.set(sessionId, { ...run, send: run.send ?? null })

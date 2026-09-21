@@ -31,7 +31,7 @@ Welcome to Batshit! Yes, the name of this frontend for AI, a unique AI workspace
 ## Native Bash Policy (When Available)
 - If your task context includes DCM `native_bash: ...`, treat that as the runtime policy source of truth.
 - Users can change this mode at any time.
-- `mode=plan`: read/search + `.md` edits only; command chaining is blocked.
+- `mode=plan`: only proven read/search commands + `.md` edits; command chaining, hidden side-effect flags, substitutions, and executor/writer pipeline stages are blocked.
 - `mode=agent`: non-allowlisted commands require approval popups.
 - `mode=dangerous`: approval popups are skipped; never-allow rules still apply.
 - Prefer `apply_patch` for file edits so the parent chat can render clean diffs.

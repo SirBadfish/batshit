@@ -321,7 +321,9 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
       id: 'ep2',
       state: 'open',
       opened_at: '2026-06-10T09:00:00.000Z',
-      whiteboard: { content: 'Garage width: 6m', updated_at: '2026-06-10T09:30:00.000Z' }
+      // Written by a NAP: the refresh path stays open. An agent-written board is never rewritten
+      // (2026-09-19, Josh) — that case has its own test below.
+      whiteboard: { content: 'Garage width: 6m', updated_at: '2026-06-10T09:30:00.000Z', written_by: 'nap' }
     })
     return { ep1, ep2 }
   }
@@ -432,10 +434,12 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(step3Segment?.message_ids).toEqual(['m5', 'm7', 'm8', 'm9', 'm10', 'm11'])
     expect(step3Segment?.episode_id).toBe('ep2')
 
-    // Whiteboard refreshed on the open episode.
+    // Whiteboard refreshed on the open episode (a nap wrote it, so a nap may rewrite it).
     const ep2 = await getEpisode(FIXED_SESSION, 'ep2')
     expect(ep2?.state).toBe('open')
     expect(ep2?.whiteboard?.content).toBe('Garage width: 6m. Next: order shelving.')
+    expect(ep2?.whiteboard?.written_by).toBe('nap')
+    expect(record.compaction!.whiteboard).toBe('refreshed')
 
     // The window now splices both gists; compacted messages excluded, the held m6 and
     // the floor-protected m12 still live.
@@ -449,6 +453,80 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(ids).not.toContain('m11')
     expect(ids).toContain('m6')
     expect(ids).toContain('m12')
+  })
+
+  it('nap step 3 never rewrites a board the agent wrote: summary-only call, board kept (2026-09-19)', async () => {
+    await seedNapConversation()
+    // The agent writes the board through its control — that makes it the agent's.
+    await updateWhiteboardOp(
+      { userId: USER, agentId: AGENT, sessionId: FIXED_SESSION },
+      { content: 'Garage width: 6m. Josh wants metal shelving.' }
+    )
+    expect((await getEpisode(FIXED_SESSION, 'ep2'))?.whiteboard?.written_by).toBe('agent')
+
+    let step3Prompt = ''
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async (prompt) => {
+        if (prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')) {
+          step3Prompt = prompt
+          // A model that returns a WHITEBOARD section anyway: it must be ignored.
+          return ['SUMMARY:', 'Garage project started; measurements done.', 'WHITEBOARD:', 'a board the nap must not write'].join('\n')
+        }
+        return 'Lake trip planned for July; cabin booked.'
+      },
+      estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+    })
+
+    expect(outcome.status).toBe('completed')
+    // Summary-only call: the board rides along as read-only context, no WHITEBOARD asked for.
+    expect(step3Prompt).toContain('Return EXACTLY one section')
+    expect(step3Prompt).toContain(
+      'CURRENT EPISODE WHITEBOARD (kept by the agent; context only, not yours to change):\nGarage width: 6m. Josh wants metal shelving.'
+    )
+    expect(step3Prompt).not.toContain('Return EXACTLY two sections')
+    // The compaction still happened; the board did not move.
+    expect(outcome.record!.compaction).not.toBeNull()
+    expect(outcome.record!.compaction!.whiteboard).toBe('kept')
+    const ep2 = await getEpisode(FIXED_SESSION, 'ep2')
+    expect(ep2?.whiteboard?.content).toBe('Garage width: 6m. Josh wants metal shelving.')
+    expect(ep2?.whiteboard?.written_by).toBe('agent')
+  })
+
+  it('nap step 3 fills an EMPTY board and signs it as the nap (2026-09-19)', async () => {
+    await seedNapConversation()
+    await redis.json.set(episodeKey(FIXED_SESSION, 'ep2'), '$.whiteboard', null as never)
+
+    let step3Prompt = ''
+    const outcome = await runFixedSessionNap({
+      userId: USER,
+      agent: agentRecord(),
+      sessionId: FIXED_SESSION,
+      trigger: 'manual',
+      eventFetch: fetch,
+      now: NOW,
+      generateSummary: async (prompt) => {
+        if (prompt.includes('OLDER OPEN-EPISODE SEGMENT TO COMPACT')) {
+          step3Prompt = prompt
+          return ['SUMMARY:', 'Garage project started; measurements done.', 'WHITEBOARD:', 'Garage width: 6m. Next: order shelving.'].join('\n')
+        }
+        return 'Lake trip planned for July; cabin booked.'
+      },
+      estimateTokens: estimateQueue([150_000, 130_000, 128_000, 70_000])
+    })
+
+    expect(outcome.status).toBe('completed')
+    expect(step3Prompt).toContain('Return EXACTLY two sections')
+    expect(step3Prompt).toContain('CURRENT EPISODE WHITEBOARD: (empty — build it from the segment below)')
+    expect(outcome.record!.compaction!.whiteboard).toBe('filled')
+    const ep2 = await getEpisode(FIXED_SESSION, 'ep2')
+    expect(ep2?.whiteboard?.content).toBe('Garage width: 6m. Next: order shelving.')
+    expect(ep2?.whiteboard?.written_by).toBe('nap')
   })
 
   it('nap step 3 parse failure is loud and leaves the window untouched by step 3', async () => {
@@ -536,6 +614,15 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     expect(parsed.summary).toBe('The summary text.')
     expect(parsed.whiteboard).toBe('- fact one\n- fact two')
     expect(() => parseNapCompactionSections('just prose')).toThrow(/SUMMARY\/WHITEBOARD/)
+    // Summary-only mode (the agent owns the board): WHITEBOARD is dropped, only SUMMARY is required.
+    const summaryOnly = parseNapCompactionSections(
+      ['SUMMARY:', 'Only this.', 'WHITEBOARD:', 'ignored'].join('\n'),
+      { whiteboard: false }
+    )
+    expect(summaryOnly).toEqual({ summary: 'Only this.', whiteboard: null })
+    expect(() => parseNapCompactionSections('WHITEBOARD:\nno summary', { whiteboard: false })).toThrow(
+      /required SUMMARY section/
+    )
   })
 
   // -------------------------------------------------------------------------
@@ -665,10 +752,27 @@ describe.runIf(memorySearchLaneActive())('SA-104 P6 window mechanics', () => {
     })
     // SA-110 (DL-110-01): the board is DCM lines now — never a system-prompt block.
     expect(compiled.whiteboardDcmLines[0]).toContain('Episode whiteboard (')
+    // 2026-09-19: the board names its author, and the agent is told naps leave its board alone.
+    expect(compiled.whiteboardDcmLines[0]).toContain('last written by you')
     expect(compiled.whiteboardDcmLines.join('\n')).toContain('Current goal: ship P6.')
     expect(compiled.whiteboardDcmLines.join('\n')).toContain('sys.memory.whiteboard')
+    expect(compiled.whiteboardDcmLines.join('\n')).toContain('Naps never change a board you wrote')
     expect(compiled.memoryContext?.whiteboard?.present).toBe(true)
     expect(compiled.memoryContext?.whiteboard?.placement).toBe('dcm')
+    expect(compiled.memoryContext?.whiteboard?.writtenBy).toBe('agent')
+    expect((await getEpisode(FIXED_SESSION, 'epw'))?.whiteboard?.written_by).toBe('agent')
+
+    // A nap-filled board says so where the agent reads it.
+    await redis.json.set(episodeKey(FIXED_SESSION, 'epw'), '$.whiteboard.written_by', 'nap' as never)
+    const napCompiled = await computeMemoryCompileContext({
+      userId: USER,
+      agentId: AGENT,
+      sessionId: FIXED_SESSION,
+      currentUserMessage: 'hello'
+    })
+    expect(napCompiled.whiteboardDcmLines[0]).toContain('filled in by a nap')
+    expect(napCompiled.memoryContext?.whiteboard?.writtenBy).toBe('nap')
+    await redis.json.set(episodeKey(FIXED_SESSION, 'epw'), '$.whiteboard.written_by', 'agent' as never)
 
     // Regular sessions never compile a whiteboard.
     const regularCompiled = await computeMemoryCompileContext({

@@ -35,7 +35,7 @@ export const MANAGED_CLI_RUNTIME_IDS: ManagedCliRuntimeId[] = ['codex', 'claude'
  * list) instead of floating to `latest`.
  */
 export const MANAGED_CLI_PINNED_VERSIONS: Record<ManagedCliRuntimeId, string> = {
-  codex: '0.141.0',
+  codex: '0.155.1',
   claude: '2.1.185'
 }
 
@@ -380,10 +380,10 @@ export function resolveManagedCliTarget(
 
   if (runtime === 'codex') {
     // Codex publishes platform builds as npm alias versions of @openai/codex
-    // (e.g. 0.141.0-darwin-arm64). The Linux builds are musl-static, so the
+    // (e.g. 0.155.1-darwin-arm64). The Linux builds are musl-static, so the
     // same package works on glibc and musl distros.
     //
-    // Layout note (verified against the live 0.141.0 tarballs): the binary
+    // Layout note (verified against the live 0.155.1 tarballs): the binary
     // lives at `package/vendor/<triple>/bin/codex`, with helper executables at
     // `codex-path/rg`, `codex-resources/zsh/bin/zsh`, and Linux `bwrap`. Older versions
     // (≤0.130.x) used `codex/codex` + `path/rg` — re-verify on any pin bump.

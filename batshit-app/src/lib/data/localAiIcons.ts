@@ -16,9 +16,14 @@ const LOCAL_AI_ICON_REFS: Partial<Record<string, IconRef>> = {
   dmr: { kind: 'brand', slug: 'docker-color', fixed: true },
   lmstudio: { kind: 'brand', slug: 'lmstudio-mono', fixed: true },
   'llama-cpp': { kind: 'brand', slug: 'llamacpp-color', fixed: true },
-  vllm: { kind: 'brand', slug: 'vllm-color', fixed: true }
-  // SGLang and oMLX have no brand mark in the generated set yet, so they take
-  // the generic fallback below rather than borrowing someone else's logo.
+  vllm: { kind: 'brand', slug: 'vllm-color', fixed: true },
+  // SA-124 P7. None of these three are in the Lobe Icons or Simple Icons packs
+  // Batshit already licenses (checked 2026-09-20: 850 and 3,429 marks, no hit),
+  // so each was taken from the project's own repository and reduced to a
+  // single-colour glyph in Batshit's house format. Provenance is in the story.
+  sglang: { kind: 'brand', slug: 'sglang-mono', fixed: true },
+  omlx: { kind: 'brand', slug: 'omlx-mono', fixed: true },
+  koboldcpp: { kind: 'brand', slug: 'koboldcpp-mono', fixed: true }
 }
 
 export function getLocalAiIconRef(serverId: string): IconRef {

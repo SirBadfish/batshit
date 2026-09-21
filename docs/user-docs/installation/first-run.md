@@ -18,21 +18,24 @@ http://localhost:5620
 
 ## Create the first admin account
 
-On a fresh instance, Batshit shows a setup screen. Create the first admin account with:
+On a fresh instance, Batshit shows a setup screen titled **Welcome to batshit!**. Create the first admin account with:
 
 - Email
 - Display name
 - Password (at least 10 characters)
+- Confirm password (the same password again)
+
+Then choose **Create Admin Account**.
 
 This is a single-user-per-instance app for alpha launch. The admin account is for the person running this instance.
 
-After setup, Batshit logs you in and opens the main workspace with the first-time setup wizard. Each step opens the matching Settings panel; close Settings after each step to return to the wizard. The wizard walks you through the right order:
+After setup, Batshit logs you in and opens the main workspace with the first-time setup wizard. Each step opens the matching Settings panel. Close Settings after each step to return to the wizard: use **Close** at the bottom of the Settings list (scroll the list down on a short window), or press Esc. The wizard walks you through the right order:
 
 1. Add one or more AI provider API keys.
 2. Create at least one saved Model Preset.
 3. Create your first Primary Agent.
 
-You can add more keys, Model Presets, and agents later. The first agent is only a starter; you can rename, edit, or delete it any time. After the third step, close the wizard, send a test message, then use Settings → Agents to tune the starter agent.
+You can add more keys, Model Presets, and agents later. The first agent is only a starter; you can rename, edit, or delete it any time. After the third step the wizard says you're ready: choose **Close / Start chat**, send a test message, then use Settings → Agents to tune the starter agent.
 
 ## Confirm the core services
 
@@ -76,16 +79,13 @@ You can use both over time. You only need one on day one.
 ## Create a simple `API` Primary Agent
 
 1. Open Settings → Agents, or use the Agents step in the first-time setup wizard.
-2. Choose Create Primary Agent if you're starting from the empty Agents page.
-3. Select Primary Agent.
-4. Set the type to `API`.
-5. Give it a name.
-6. Pick your saved Model Preset.
-7. Save, or wait for the settings panel to autosave.
-8. Select the agent in chat.
-9. Send: `Say hello and tell me what model you are using.`
+2. In **Create Primary Agent or Subagent**, keep **Primary Agent** and **API agent** selected.
+3. Type a **Display Name**, then choose **Create**.
+4. On the new agent's **Core** tab, pick your saved Model Preset under **Default Model**. It saves by itself.
+5. Select the agent in chat.
+6. Send: `Say hello and tell me one thing you can do in Batshit.`
 
-If the model responds, your core provider path is working.
+If the model responds, your core provider path is working. Don't ask the model which model it is: models often get their own name wrong. The chat bar shows the Model Preset Batshit actually used, and the Execution Viewer shows the exact request.
 
 ## Add n8n after basic chat works
 

@@ -98,6 +98,13 @@
 	// Extract output
 	let stdout = $derived(extractOutput(tool.toolResult, 'stdout'))
 	let stderr = $derived(extractOutput(tool.toolResult, 'stderr'))
+	// A failed search keeps everything the command printed as `commandOutput` when its stored
+	// output does not already say it (the API lane keeps a command's error text in `stderr`).
+	let commandOutput = $derived(
+		typeof tool.toolResult?.commandOutput === 'string' ? tool.toolResult.commandOutput : ''
+	)
+	let showsSearchResults = $derived(operationKind === 'search_files' && searchResults.length > 0)
+	let showsListFiles = $derived(operationKind === 'list_files' && listFiles.length > 0)
 	let exitCode = $derived.by(() => {
 		const value = tool.toolResult?.exitCode ?? tool.toolResult?.code
 		return typeof value === 'number' ? value : undefined
@@ -179,6 +186,8 @@
 	
 	// Combine outputs for display
 	let displayOutput = $derived.by(() => {
+		// Everything the command printed, both streams, so a failure never reads as "no output".
+		if (commandOutput) return commandOutput
 		let output = ''
 		if (stdout) output += stdout
 		if (stderr) {
@@ -198,7 +207,7 @@
 	duration={tool.metadata?.executionTime}
 	error={tool.error}
 >
-	{#if operationKind === 'search_files' && searchResults.length > 0}
+	{#if showsSearchResults}
 		<div class="search-results">
 			{#each searchResults as entry}
 				<div class="search-result-card">
@@ -221,7 +230,7 @@
 				</div>
 			{/each}
 		</div>
-	{:else if operationKind === 'list_files' && listFiles.length > 0}
+	{:else if showsListFiles}
 		<div class="list-results">
 			{#each listFiles as entry}
 				<div class="list-row">
@@ -235,8 +244,10 @@
 				</div>
 			{/each}
 		</div>
-	{:else}
-		<div class="terminal-wrapper">
+	{/if}
+	<!-- A search that failed after it matched shows what it printed under the matches. -->
+	{#if !(showsSearchResults || showsListFiles) || commandOutput}
+		<div class="terminal-wrapper" class:after-results={showsSearchResults || showsListFiles}>
 			{#if command && command !== 'Unknown command'}
 				<div class="command-line">
 					<span class="prompt">$</span>
@@ -362,6 +373,10 @@
 		font-family: var(--font-mono, monospace);
 		min-width: 0;
 		max-width: 100%;
+	}
+
+	.terminal-wrapper.after-results {
+		margin-top: 0.75rem;
 	}
 	
 	.command-line {

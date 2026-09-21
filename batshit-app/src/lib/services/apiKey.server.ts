@@ -44,8 +44,11 @@ const API_KEY_PATTERNS: Record<string, RegExp> = {
   groq: GENERIC_SECRET_PATTERN,
   xai: GENERIC_SECRET_PATTERN,
   moonshot: GENERIC_SECRET_PATTERN,
+  kimi_code: GENERIC_SECRET_PATTERN,
   minimax: GENERIC_SECRET_PATTERN,
+  minimax_token_plan: GENERIC_SECRET_PATTERN,
   mimo: GENERIC_SECRET_PATTERN,
+  mimo_token_plan: GENERIC_SECRET_PATTERN,
   qwencloud: GENERIC_SECRET_PATTERN,
   qwen_token_plan: GENERIC_SECRET_PATTERN,
   alibaba: GENERIC_SECRET_PATTERN,
@@ -93,6 +96,9 @@ const API_KEY_PATTERNS: Record<string, RegExp> = {
   n8n_instance_mcp_token: GENERIC_SECRET_PATTERN,
   batshit_token: INTERNAL_SECRET_PATTERN,
   batshit_artifact_complete_url: /^https?:\/\/.+/i,
+  // SA-120 (DL-120-01): Jev Juice. TypeSafe System One key, encrypted like every other
+  // provider key; read by `resolveTypesafeApiKey` with `TYPESAFE_API_KEY` as the env fallback.
+  typesafe: GENERIC_SECRET_PATTERN,
   // SA-102 P5 (DL-102-09, DL-102-14): local AI programs that can require a key.
   // ONE store per program, encrypted through the same AES-256-GCM path as every
   // other Batshit credential, shared by the chat transport and the memory

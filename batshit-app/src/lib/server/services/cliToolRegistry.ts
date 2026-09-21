@@ -14,6 +14,7 @@ import {
   type ControlApprovalRequest
 } from '$lib/server/services/controlApprovals'
 import type { ControlActorType } from '$lib/server/services/fabricRegistry'
+import { endCommandProcess, trackCommandGroup } from '$lib/server/services/commandEnd'
 import { buildControlApprovalPauseGuidance } from '$lib/utils/controlApprovalPresentation'
 import {
   INFRA_API_KEY_SERVICES,
@@ -200,6 +201,8 @@ type CliToolExecutionAuditEntry = {
   parseMode: CliToolParseMode
   exitCode: number | null
   durationMs: number
+  stopped?: boolean
+  timedOut?: boolean
   createdAt: string
   error?: string
 }
@@ -269,6 +272,8 @@ export type CliToolExecutionResult =
       stdout?: string
       stderr?: string
       durationMs?: number
+      stopped?: boolean
+      timedOut?: boolean
       auditId?: string
       blocked?: boolean
       requiresApproval?: boolean
@@ -1274,20 +1279,36 @@ function parseCliToolOutput(record: CliToolRecord, stdout: string): { parsedOutp
   }
 }
 
-async function runCliProcess(params: {
+export type CliToolProcessRunParams = {
   executable: string
   args: string[]
   cwd?: string
   env: Record<string, string>
   timeoutMs: number
-}): Promise<{
+  abortSignal?: AbortSignal | null
+}
+
+export async function runCliProcess(params: CliToolProcessRunParams): Promise<{
   exitCode: number | null
   stdout: string
   stderr: string
   durationMs: number
+  stopped: boolean
+  timedOut: boolean
 }> {
   const startedAt = Date.now()
+  if (params.abortSignal?.aborted) {
+    return {
+      exitCode: null,
+      stdout: '',
+      stderr: 'The command was stopped.',
+      durationMs: Date.now() - startedAt,
+      stopped: true,
+      timedOut: false
+    }
+  }
   return await new Promise((resolve, reject) => {
+    const ownGroup = process.platform !== 'win32'
     const child = spawn(params.executable, params.args, {
       cwd: params.cwd,
       env: {
@@ -1295,34 +1316,51 @@ async function runCliProcess(params: {
         ...params.env
       },
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: false
+      shell: false,
+      detached: ownGroup
     })
+    if (ownGroup && child.pid) trackCommandGroup(child.pid)
 
     let stdout = ''
     let stderr = ''
     let settled = false
+    let timeout: ReturnType<typeof setTimeout> | null = null
 
-    const finish = (result: { exitCode: number | null; stdout: string; stderr: string }) => {
+    const finish = (result: {
+      exitCode: number | null
+      stdout: string
+      stderr: string
+      stopped?: boolean
+      timedOut?: boolean
+    }) => {
       if (settled) return
       settled = true
+      if (timeout) clearTimeout(timeout)
+      params.abortSignal?.removeEventListener('abort', onAbort)
       resolve({
         ...result,
-        durationMs: Date.now() - startedAt
+        durationMs: Date.now() - startedAt,
+        stopped: result.stopped === true,
+        timedOut: result.timedOut === true
       })
     }
 
-    const timeout = setTimeout(() => {
-      try {
-        child.kill('SIGKILL')
-      } catch {
-        // ignore
-      }
+    const end = (reason: string, kind: 'stopped' | 'timedOut') => {
+      endCommandProcess(child, { ownGroup })
       finish({
         exitCode: null,
         stdout,
-        stderr: `${stderr}${stderr ? '\n' : ''}Process timed out after ${params.timeoutMs}ms`
+        stderr: `${stderr}${stderr ? '\n' : ''}${reason}`,
+        [kind]: true
       })
+    }
+    const onAbort = () => end('The command was stopped.', 'stopped')
+
+    timeout = setTimeout(() => {
+      end(`Process timed out after ${params.timeoutMs}ms`, 'timedOut')
     }, params.timeoutMs)
+    params.abortSignal?.addEventListener('abort', onAbort, { once: true })
+    if (params.abortSignal?.aborted) onAbort()
 
     child.stdout?.on('data', (chunk) => {
       stdout += chunk.toString()
@@ -1337,11 +1375,12 @@ async function runCliProcess(params: {
       }
     })
     child.on('error', (error) => {
-      clearTimeout(timeout)
+      if (settled) return
+      if (timeout) clearTimeout(timeout)
+      params.abortSignal?.removeEventListener('abort', onAbort)
       reject(error)
     })
     child.on('close', (code) => {
-      clearTimeout(timeout)
       finish({
         exitCode: typeof code === 'number' ? code : null,
         stdout,
@@ -1498,7 +1537,15 @@ function resolveCliToolApprovalLane(params: CliToolExecutionParams): ControlAppr
   return 'service'
 }
 
-export async function executeCliTool(params: CliToolExecutionParams): Promise<CliToolExecutionResult> {
+export type CliToolExecutionOptions = {
+  /** Server-owned cancellation for the run containing this CLI tool call. */
+  abortSignal?: AbortSignal | null
+}
+
+export async function executeCliTool(
+  params: CliToolExecutionParams,
+  options: CliToolExecutionOptions = {}
+): Promise<CliToolExecutionResult> {
   const { toolIds: selectedToolIds } = await resolveCliToolSelectionScope(params)
   const selectedSet = new Set(selectedToolIds)
   const record = await getCliTool(params.userId, params.toolId)
@@ -1632,7 +1679,8 @@ export async function executeCliTool(params: CliToolExecutionParams): Promise<Cl
       args,
       cwd: runtime.cwd,
       env: runtime.env,
-      timeoutMs: record.timeoutMs
+      timeoutMs: record.timeoutMs,
+      abortSignal: options.abortSignal
     })
     const auditId = crypto.randomUUID()
 
@@ -1654,6 +1702,8 @@ export async function executeCliTool(params: CliToolExecutionParams): Promise<Cl
         parseMode: record.parseMode,
         exitCode: execution.exitCode,
         durationMs: execution.durationMs,
+        stopped: execution.stopped,
+        timedOut: execution.timedOut,
         createdAt: new Date().toISOString(),
         error: execution.stderr.trim() || execution.stdout.trim() || 'CLI tool exited non-zero'
       })
@@ -1670,6 +1720,8 @@ export async function executeCliTool(params: CliToolExecutionParams): Promise<Cl
         stdout: execution.stdout,
         stderr: execution.stderr,
         durationMs: execution.durationMs,
+        stopped: execution.stopped,
+        timedOut: execution.timedOut,
         auditId,
         code: 'EXECUTION_FAILED',
         error: execution.stderr.trim() || execution.stdout.trim() || 'CLI tool exited non-zero',

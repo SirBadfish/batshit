@@ -15,10 +15,9 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { startCodexAppServerRun } from '../services/codexAppServerLane'
-import { isContextExhaustionError } from '../services/contextExhaustion'
 
 const LIVE = process.env.BATSHIT_LIVE_CODEX === '1'
-const MODEL = 'gpt-5.3-codex-spark'
+const MODEL = 'gpt-5.6-sol'
 
 function setupLiveEnv() {
   const root = mkdtempSync(join(tmpdir(), 'batshit-appserver-lane-live-'))
@@ -30,7 +29,8 @@ function setupLiveEnv() {
   if (!existsSync(realAuth)) throw new Error('No ~/.codex/auth.json — cannot run live smoke')
   symlinkSync(realAuth, join(codexHome, 'auth.json'))
   writeFileSync(join(workspace, 'notes.txt'), 'The live smoke magic word is kumquat.\n')
-  const executable = execSync('which codex', { encoding: 'utf8' }).trim()
+  const executable =
+    process.env.BATSHIT_CODEX_CLI_PATH ?? execSync('which codex', { encoding: 'utf8' }).trim()
   return {
     executable,
     env: { ...process.env, CODEX_HOME: codexHome },
@@ -53,7 +53,7 @@ describe.runIf(LIVE)('codex app-server lane (LIVE)', () => {
           ephemeral: true,
           cwd: workspace,
           model: MODEL,
-          approvalPolicy: 'never',
+          approvalPolicy: 'on-request',
           sandbox: 'workspace-write',
         },
         prompt:
@@ -89,40 +89,74 @@ describe.runIf(LIVE)('codex app-server lane (LIVE)', () => {
   )
 
   it(
-    'trips the context guard live and surfaces a classified failure',
+    'accepts a mid-turn steer on the pinned app-server wire',
     { timeout: 120_000 },
     async () => {
-      const { executable, env } = setupLiveEnv()
+      const { executable, env, root, workspace } = setupLiveEnv()
       const run = startCodexAppServerRun({
         executable,
         env,
-        cwd: WORKSPACE,
+        cwd: workspace,
         threadParams: {
           ephemeral: true,
-          cwd: WORKSPACE,
+          cwd: workspace,
           model: MODEL,
-          approvalPolicy: 'never',
+          approvalPolicy: 'on-request',
           sandbox: 'workspace-write',
         },
-        prompt:
-          'Count the lines of every file in this directory one at a time with separate shell commands, then summarize each file in detail.',
-        contextGuardThreshold: 0.01,
+        prompt: 'Run the shell command `sleep 2`, then reply with ORIGINAL and nothing else.',
       })
 
       const events: any[] = []
-      let failure: Error | null = null
+      let steerResult: Awaited<ReturnType<typeof run.steer>> | null = null
       try {
-        for await (const event of run.events) events.push(event)
-      } catch (error) {
-        failure = error as Error
+        for await (const event of run.events) {
+          events.push(event)
+          if (
+            !steerResult &&
+            event.type === 'item.started' &&
+            event.item?.type === 'command_execution'
+          ) {
+            steerResult = await run.steer({
+              steerIds: ['live-pin-steer'],
+              text: '[The user said, mid-reply: reply with PINEAPPLE and nothing else.]',
+            })
+          }
+        }
+      } finally {
+        await run.cleanup().catch(() => undefined)
+        rmSync(root, { recursive: true, force: true })
       }
-      await run.cleanup()
 
-      expect(failure).toBeNull()
-      const terminal = events.at(-1)
-      expect(terminal.type).toBe('turn.failed')
-      expect(terminal.error.message).toContain('Batshit context guard')
-      expect(isContextExhaustionError(terminal.error.message)).toBe(true)
+      expect(steerResult).toMatchObject({ accepted: true })
+      const finalMessage = events
+        .filter((event) => event.type === 'item.completed' && event.item?.type === 'agent_message')
+        .at(-1)
+      expect(String(finalMessage?.item?.text ?? '').toUpperCase()).toContain('PINEAPPLE')
     },
   )
+
+  it('refuses a live run when the context guard threshold is below its supported floor', () => {
+    const { executable, env, root, workspace } = setupLiveEnv()
+    try {
+      expect(() =>
+        startCodexAppServerRun({
+          executable,
+          env,
+          cwd: workspace,
+          threadParams: {
+            ephemeral: true,
+            cwd: workspace,
+            model: MODEL,
+            approvalPolicy: 'never',
+            sandbox: 'workspace-write',
+          },
+          prompt: 'This run must be rejected before the Codex process starts.',
+          contextGuardThreshold: 0.01,
+        }),
+      ).toThrow(/threshold must be from 0\.5/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })

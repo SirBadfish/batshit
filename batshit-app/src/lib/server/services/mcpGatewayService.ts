@@ -29,6 +29,7 @@ import {
   sanitizeStdioGatewayConfig,
   validateStdioGatewayConfig
 } from './mcpGatewayStdio'
+import { gatewayToolSettingsChanged, mcpToolListCache } from './mcpToolListCache'
 
 export class MCPGatewayService {
   private readonly VALID_GROUP_MODES = new Set([
@@ -334,6 +335,8 @@ export class MCPGatewayService {
       await client.json.set(key, '$', registry as unknown as RedisJSON)
     })
 
+    // Saved tool lists are kept until the user changes the tool settings (mcpToolListCache.ts).
+    mcpToolListCache.clearGateway(userId, newGateway.id)
     return newGateway
   }
 
@@ -382,6 +385,7 @@ export class MCPGatewayService {
     const key = this.getKey(userId)
 
     let updatedGateway: MCPGateway
+    let previousGateway: MCPGateway | null = null
 
     await redis.execute(async (client) => {
       // Get existing registry (already parsed!)
@@ -403,6 +407,7 @@ export class MCPGatewayService {
         delete (sanitizedUpdates as Partial<MCPGateway>).slug
       }
 
+      previousGateway = registry.gateways[index]
       updatedGateway = {
         ...registry.gateways[index],
         ...sanitizedUpdates,
@@ -414,6 +419,11 @@ export class MCPGatewayService {
       await client.json.set(key, '$', registry as unknown as RedisJSON)
     })
 
+    // Any edit but the record keeping a lookup or a Test writes back is the user changing the
+    // tool settings, so the next send asks the tool server again (mcpToolListCache.ts).
+    if (gatewayToolSettingsChanged(previousGateway, updatedGateway!)) {
+      mcpToolListCache.clearGateway(userId, gatewayId)
+    }
     return updatedGateway!
   }
 
@@ -453,6 +463,8 @@ export class MCPGatewayService {
     })
 
     if (!removal) return
+
+    mcpToolListCache.clearGateway(userId, gatewayId)
 
     // Reference sweep runs after the registry write so it compares against the
     // post-delete live set. A sweep failure must not leave the caller believing

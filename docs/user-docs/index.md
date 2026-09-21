@@ -18,7 +18,7 @@ Batshit is in alpha. That means:
 - Setup is real self-hosting, not a one-click consumer app yet.
 - The docs tell you when something is required, optional, advanced, or not included.
 
-Batshit is planned as open source under **AGPL-3.0-only**, the GNU Affero General Public License v3.0 only. The Batshit brand is protected separately, so the code license doesn't grant rights to present a fork or service as official Batshit.
+Batshit is open source under **AGPL-3.0-only**, the GNU Affero General Public License v3.0 only. The Batshit brand is protected separately, so the code license doesn't grant rights to present a fork or service as official Batshit.
 
 Your chats, agents, prompts, workflows, artifacts, uploads, project files, generated content, and local data remain yours. Batshit integrates with n8n, which is separately licensed by n8n.
 
@@ -98,6 +98,7 @@ These docs are grouped by subject — everything about a feature lives in one pl
 **Runtimes and operations**
 
 - [Local AI](local-ai/overview.md) — Ollama, LM Studio, oMLX, and the other programs that run models on your own hardware.
+- [Jev Juice](jev-juice/overview.md) — optional cloud judgments from TypeSafe's Jev model, off by default, with every call shown in the Execution Viewer.
 - [Chat](chat/execution-viewer.md) — the chat workspace, including the Execution Viewer.
 - [Admin](admin/backup-and-restore.md) — backup and restore.
 - [Resources](resources/n8n-workflow-templates.md) — n8n workflow templates and downloads.

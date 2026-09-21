@@ -30,6 +30,7 @@
         { "source": "clips/overview.md", "reference": "clips-overview.md" },
         { "source": "fabric/overview.md", "reference": "fabric-overview.md" },
         { "source": "goons/overview.md", "reference": "goons-overview.md" },
+        { "source": "jev-juice/overview.md", "reference": "jev-juice-overview.md" },
         { "source": "goons/setup-and-packages.md", "reference": "goons-setup-and-packages.md" },
         { "source": "groups/overview.md", "reference": "groups-overview.md" },
         { "source": "installation/choose-mac-app-or-docker.md", "reference": "installation-choose-mac-app-or-docker.md" },

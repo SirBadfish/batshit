@@ -29,6 +29,11 @@ import {
   normalizePremiumGoonLipSyncAnalyzerId
 } from '$lib/goons/lipSyncLab'
 import { normalizeGoonLipSyncVisemeBlendMs } from '$lib/utils/goonLipSync'
+import {
+  resolveJevQuickActionsEnabled,
+  resolveJevQuickActionsWakeWord,
+  resolveJevQuickActionsWakeWordRequired
+} from '$lib/utils/jevJuiceQuickActions'
 
 const BUILTIN_PROVIDER_IDS: VoiceProviderId[] = [
   'browser',
@@ -132,7 +137,12 @@ export function normalizeVoiceModeTurnSettings(value: unknown): VoiceModeTurnSet
       DEFAULT_VOICE_MODE_END_OF_TURN_THRESHOLD,
       MIN_VOICE_MODE_END_OF_TURN_THRESHOLD,
       MAX_VOICE_MODE_END_OF_TURN_THRESHOLD
-    )
+    ),
+    // SA-120 P9 (LS-060): only a stored `true` is ON; a record from before P9 reads OFF.
+    jevJuiceQuickActions: resolveJevQuickActionsEnabled(source),
+    // SA-120 P9b: the wake word gate; absent means required, and an unusable word reads as "Yo".
+    jevJuiceQuickActionsWakeWordRequired: resolveJevQuickActionsWakeWordRequired(source),
+    jevJuiceQuickActionsWakeWord: resolveJevQuickActionsWakeWord(source)
   }
 }
 
@@ -162,19 +172,42 @@ function normalizeVoiceTtsNarrationSettings(value: unknown): VoiceTtsConfig['nar
   }
 }
 
+/**
+ * "Stop with Batshit" for one local runtime, from its saved startup config.
+ *
+ * Absent means STOP. Quitting the packaged Mac app has always stopped every
+ * recorded local voice runtime, so a saved config from before this setting
+ * existed must keep behaving exactly the way it does today; only an explicit
+ * `false` keeps a runtime alive after Batshit shuts down.
+ *
+ * This lives here, in one place, because BOTH sides read it: the Engine Manager
+ * builds its save payload from it and the server decides shutdown from it. Two
+ * copies of "absent means stop" is one copy away from silently flipping every
+ * untouched engine to "keep running" on the next unrelated save.
+ */
+export function shouldStopVoiceRuntimeOnShutdown(
+  startup: { stopOnShutdown?: boolean } | null | undefined
+): boolean {
+  return startup?.stopOnShutdown !== false
+}
+
 function normalizeVoiceRuntimes(value: unknown): VoiceSettings['voiceRuntimes'] | undefined {
   if (!isObject(value)) return undefined
 
   const livekitSource = isObject(value.livekit) ? value.livekit : {}
   const startupSource = isObject(livekitSource.startup) ? livekitSource.startup : {}
   const autoStartOnLaunch = normalizeBoolean(startupSource.autoStartOnLaunch)
+  const stopOnShutdown = normalizeBoolean(startupSource.stopOnShutdown)
 
-  if (autoStartOnLaunch === undefined) return undefined
+  // Either half is enough to keep the block. "Stop with Batshit" turned off
+  // while "Start with Batshit" was never touched is a real saved choice.
+  if (autoStartOnLaunch === undefined && stopOnShutdown === undefined) return undefined
 
   return {
     livekit: {
       startup: {
-        autoStartOnLaunch
+        ...(autoStartOnLaunch === undefined ? {} : { autoStartOnLaunch }),
+        ...(stopOnShutdown === undefined ? {} : { stopOnShutdown })
       }
     }
   }
@@ -1033,6 +1066,13 @@ export function normalizeAgentVoiceProfile(value: unknown): AgentVoiceProfile | 
         inputMode: voiceModeInputMode ?? rawVoiceMode.inputMode
       })
     : undefined
+  // SA-120 P9: Quick Actions and its wake word are global (LS-060). An agent profile never
+  // carries them, so a profile spread over the global block can neither turn them on nor off.
+  if (voiceMode) {
+    delete voiceMode.jevJuiceQuickActions
+    delete voiceMode.jevJuiceQuickActionsWakeWordRequired
+    delete voiceMode.jevJuiceQuickActionsWakeWord
+  }
 
   const tts = normalizeVoiceTtsConfig(
     source.tts ?? {

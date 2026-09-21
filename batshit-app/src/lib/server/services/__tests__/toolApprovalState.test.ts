@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import {
   analyzeApprovalState,
+  ANSWERED_APPROVAL_IDS_KEY,
   buildApprovalHistoryMessages,
   buildControlApprovalEntry,
+  findAnsweredApprovalIds,
+  keepAnsweredApprovals,
+  readAnsweredApprovalIds,
+  recordApprovalAnswers,
   readControlApprovalRequestFromToolResult,
   resolveApprovalSummarySource,
   toolResultApprovalRendersCard,
@@ -379,3 +384,115 @@ describe('resolveApprovalSummarySource', () => {
     expect(resolveApprovalSummarySource([])).toBe('vercel')
   })
 })
+
+/**
+ * An approval is answered ONCE (bug sweep, 2026-09-18).
+ *
+ * A Bash card's stored entry said `pending` until its resumed run SUCCEEDED, so a resume that
+ * failed or was stopped after the approved command ran brought the buttons back, and a second
+ * Approve ran the command again. These are the pure halves of the record the server now keeps.
+ */
+describe('the answered-approval record', () => {
+  const card = (approvals: Array<Record<string, any>>, extra: Record<string, any> = {}) => ({
+    toolApprovals: { mode: 'all', source: 'vercel', approvals },
+    zipIds: ['zip_a'],
+    ...extra
+  })
+  const bash = (approvalId: string, status = 'pending') => ({
+    approvalId,
+    status,
+    toolName: 'native_bash_execute',
+    requestedAt: REQUESTED_AT
+  })
+  const DECIDED_AT = '2026-09-18T18:00:00.000Z'
+
+  it('records every answered id and each entry\'s decision, keeping the rest of the metadata', () => {
+    const recorded = recordApprovalAnswers(
+      card([bash('aitxt-1'), bash('aitxt-2'), bash('aitxt-3')]),
+      [
+        { approvalId: 'aitxt-1', approved: true },
+        { approvalId: ' aitxt-2 ', approved: false }
+      ],
+      DECIDED_AT
+    )
+    expect(recorded[ANSWERED_APPROVAL_IDS_KEY]).toEqual(['aitxt-1', 'aitxt-2'])
+    expect(recorded.zipIds).toEqual(['zip_a'])
+    expect(recorded.toolApprovals.approvals).toEqual([
+      { ...bash('aitxt-1'), status: 'approved', submitted: true, decidedAt: DECIDED_AT },
+      { ...bash('aitxt-2'), status: 'denied', submitted: true, decidedAt: DECIDED_AT },
+      bash('aitxt-3')
+    ])
+  })
+
+  it('keeps an expired entry expired: its late Approve reached the run as a denial', () => {
+    const recorded = recordApprovalAnswers(
+      card([bash('aitxt-1', 'expired')]),
+      [{ approvalId: 'aitxt-1', approved: false }],
+      DECIDED_AT
+    )
+    expect(recorded.toolApprovals.approvals[0]).toMatchObject({ status: 'expired', submitted: true })
+  })
+
+  it('adds to an existing list instead of replacing it, and writes no card that was not there', () => {
+    const recorded = recordApprovalAnswers(
+      { [ANSWERED_APPROVAL_IDS_KEY]: ['aitxt-0'], toolApprovals: null },
+      [{ approvalId: 'aitxt-1', approved: true }],
+      DECIDED_AT
+    )
+    expect(recorded[ANSWERED_APPROVAL_IDS_KEY]).toEqual(['aitxt-0', 'aitxt-1'])
+    expect(recorded.toolApprovals).toBeNull()
+  })
+
+  it('finds the ids a click already answered, and only those', () => {
+    const answered = readAnsweredApprovalIds({ [ANSWERED_APPROVAL_IDS_KEY]: ['aitxt-1', 7, '', ' aitxt-2 '] })
+    expect([...answered]).toEqual(['aitxt-1', 'aitxt-2'])
+    expect(
+      findAnsweredApprovalIds(
+        [{ approvalId: 'aitxt-9' }, { approvalId: 'aitxt-2' }, { approvalId: 'aitxt-2' }],
+        answered
+      )
+    ).toEqual(['aitxt-2'])
+    expect(findAnsweredApprovalIds([{ approvalId: 'aitxt-9' }], answered)).toEqual([])
+    expect([...readAnsweredApprovalIds(undefined)]).toEqual([])
+  })
+
+  describe('a message save cannot undo it', () => {
+    const stored = {
+      ...card([{ ...bash('aitxt-1'), status: 'approved', submitted: true, decidedAt: DECIDED_AT }]),
+      [ANSWERED_APPROVAL_IDS_KEY]: ['aitxt-1']
+    }
+
+    it('keeps the answered list when a tab saves a copy from before the click', () => {
+      const tabCopy = card([bash('aitxt-1')])
+      const merged = keepAnsweredApprovals(stored, { ...stored, ...tabCopy })
+      expect(merged[ANSWERED_APPROVAL_IDS_KEY]).toEqual(['aitxt-1'])
+      expect(merged.toolApprovals.approvals[0]).toMatchObject({
+        approvalId: 'aitxt-1',
+        status: 'approved',
+        submitted: true,
+        decidedAt: DECIDED_AT
+      })
+    })
+
+    it('keeps the union when a tab saves an older, shorter list', () => {
+      const newer = { ...stored, [ANSWERED_APPROVAL_IDS_KEY]: ['aitxt-1', 'aitxt-2'] }
+      const merged = keepAnsweredApprovals(newer, { ...newer, [ANSWERED_APPROVAL_IDS_KEY]: ['aitxt-1'] })
+      expect(merged[ANSWERED_APPROVAL_IDS_KEY]).toEqual(['aitxt-1', 'aitxt-2'])
+    })
+
+    it('leaves a save alone when nothing was answered, byte for byte', () => {
+      const plain = card([bash('aitxt-1')])
+      const incoming = { ...plain, content: 'x' }
+      expect(keepAnsweredApprovals(plain, incoming)).toBe(incoming)
+      expect(keepAnsweredApprovals(undefined, incoming)).toBe(incoming)
+    })
+
+    it('does not bring back a card the run cleared', () => {
+      const cleared = { toolApprovals: null, [ANSWERED_APPROVAL_IDS_KEY]: ['aitxt-1'] }
+      const merged = keepAnsweredApprovals(cleared, { ...cleared, zipIds: ['zip_b'] })
+      expect(merged.toolApprovals).toBeNull()
+      expect(merged[ANSWERED_APPROVAL_IDS_KEY]).toEqual(['aitxt-1'])
+    })
+  })
+})
+

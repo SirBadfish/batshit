@@ -9,6 +9,8 @@ import {
   DEEPGRAM_STT_CAPABILITIES,
   ELEVENLABS_STT_CAPABILITIES,
   FISH_STT_CAPABILITIES,
+  GOOGLE_STT_CAPABILITIES,
+  MIMO_STT_CAPABILITIES,
   MISTRAL_STT_CAPABILITIES,
   OPENAI_STT_CAPABILITIES,
   validateVoiceOptionsForProvider
@@ -72,6 +74,8 @@ import {
   OPENAI_TTS_VOICES
 } from '$lib/server/services/voiceModelCatalog'
 import { bytesToBlob, toOwnedBytes } from '$lib/utils/binary'
+import { MINIMAX_TOKEN_PLAN_OPENAI_BASE_URL } from '$lib/server/constants/minimaxTokenPlan'
+import { MIMO_TOKEN_PLAN_OPENAI_BASE_URL } from '$lib/server/constants/mimoTokenPlan'
 
 const DEFAULT_OPENAI_STT_MODEL = 'gpt-4o-mini-transcribe'
 const OPENAI_STT_MODELS = [
@@ -89,6 +93,9 @@ const GEMINI_TTS_MODELS = [
   'gemini-2.5-pro-preview-tts'
 ]
 const DEFAULT_GEMINI_TTS_VOICE = 'Kore'
+const GOOGLE_API_KEY_ENV_NAMES = ['GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY']
+const DEFAULT_GEMINI_STT_MODEL = 'gemini-3.5-transcribe'
+const GEMINI_STT_MODELS = [DEFAULT_GEMINI_STT_MODEL]
 const GEMINI_TTS_VOICES = [
   'Zephyr',
   'Puck',
@@ -122,6 +129,7 @@ const GEMINI_TTS_VOICES = [
   'Sulafat'
 ] as const
 const DEFAULT_DEEPGRAM_TTS_MODEL = 'aura-2-asteria-en'
+const DEFAULT_DEEPGRAM_FLUX_TTS_MODEL = 'flux-hannah-en'
 const DEFAULT_DEEPGRAM_STT_MODEL = 'nova-3'
 const DEEPGRAM_STT_MODELS = [
   'nova-3',
@@ -179,8 +187,11 @@ const MINIMAX_TTS_MODELS = [
   'speech-01-turbo'
 ]
 const DEFAULT_MIMO_TTS_MODEL = 'mimo-v2.5-tts'
+const DEFAULT_MIMO_STT_MODEL = 'mimo-v2.5-asr'
+const MAX_MIMO_ASR_BASE64_CHARS = 10 * 1024 * 1024
 const DEFAULT_MIMO_TTS_VOICE = 'Chloe'
 const MIMO_TTS_MODELS = ['mimo-v2.5-tts', 'mimo-v2.5-tts-voicedesign', 'mimo-v2.5-tts-voiceclone']
+const MIMO_STT_MODELS = [DEFAULT_MIMO_STT_MODEL]
 const MIMO_TTS_VOICES = [
   'mimo_default',
   '冰糖',
@@ -382,6 +393,45 @@ const DEEPGRAM_AURA1_VOICE_IDS = [
   'aura-arcas-en'
 ]
 
+const DEEPGRAM_FLUX_TTS_VOICE_IDS = [
+  'flux-hannah-en',
+  'flux-kit-en',
+  'flux-alexis-en',
+  'flux-cliff-en',
+  'flux-sienna-en',
+  'flux-cole-en',
+  'flux-brooke-en',
+  'flux-colin-en',
+  'flux-gemma-en',
+  'flux-haley-en',
+  'flux-heather-en',
+  'flux-miles-en',
+  'flux-sean-en',
+  'flux-bree-en',
+  'flux-brittany-en',
+  'flux-bruce-en',
+  'flux-conor-en',
+  'flux-donovan-en',
+  'flux-drew-en',
+  'flux-elise-en',
+  'flux-jack-en',
+  'flux-kai-en',
+  'flux-kelsey-en',
+  'flux-maeve-en',
+  'flux-marcelo-en',
+  'flux-marcus-en',
+  'flux-meena-en',
+  'flux-meghan-en',
+  'flux-naveen-en',
+  'flux-paige-en',
+  'flux-priya-en',
+  'flux-rufus-en',
+  'flux-sharon-en',
+  'flux-tanner-en',
+  'flux-wade-en',
+  'flux-wes-en'
+]
+
 const formatDeepgramVoiceName = (id: string) => {
   const isAura2 = id.startsWith('aura-2-')
   const stripped = id.replace(/^aura-2-/, '').replace(/^aura-/, '')
@@ -392,6 +442,10 @@ const formatDeepgramVoiceName = (id: string) => {
 }
 
 const DEEPGRAM_TTS_VOICES: Array<{ id: string; name: string }> = [
+  ...DEEPGRAM_FLUX_TTS_VOICE_IDS.map((id) => ({
+    id,
+    name: `${id.replace(/^flux-/, '').replace(/-en$/, '').replace(/^./, (value) => value.toUpperCase())} Flux (EN)`
+  })),
   ...DEEPGRAM_AURA2_VOICE_IDS.map((id) => ({ id, name: formatDeepgramVoiceName(id) })),
   ...DEEPGRAM_AURA1_VOICE_IDS.map((id) => ({ id, name: formatDeepgramVoiceName(id) }))
 ]
@@ -438,12 +492,12 @@ const PROVIDER_SUMMARIES: VoiceProviderSummary[] = [
   },
   {
     id: 'google',
-    label: 'Google Gemini (TTS)',
+    label: 'Google Gemini',
     type: 'cloud',
     requiresKey: true,
     supports: {
       tts: true,
-      stt: false,
+      stt: true,
       listVoices: true,
       clone: false,
       streaming: false,
@@ -452,8 +506,11 @@ const PROVIDER_SUMMARIES: VoiceProviderSummary[] = [
     },
     defaultModel: DEFAULT_GEMINI_TTS_MODEL,
     defaultTtsModel: DEFAULT_GEMINI_TTS_MODEL,
+    defaultSttModel: DEFAULT_GEMINI_STT_MODEL,
     defaultVoice: DEFAULT_GEMINI_TTS_VOICE,
-    ttsModels: GEMINI_TTS_MODELS
+    ttsModels: GEMINI_TTS_MODELS,
+    sttModels: GEMINI_STT_MODELS,
+    sttCapabilities: GOOGLE_STT_CAPABILITIES
   },
   {
     id: 'openai',
@@ -521,7 +578,7 @@ const PROVIDER_SUMMARIES: VoiceProviderSummary[] = [
     defaultSttModel: DEFAULT_DEEPGRAM_STT_MODEL,
     defaultRealtimeSttModel: DEFAULT_DEEPGRAM_REALTIME_STT_MODEL,
     defaultVoice: DEFAULT_DEEPGRAM_TTS_MODEL,
-    ttsModels: [DEFAULT_DEEPGRAM_TTS_MODEL],
+    ttsModels: [DEFAULT_DEEPGRAM_TTS_MODEL, DEFAULT_DEEPGRAM_FLUX_TTS_MODEL],
     sttModels: DEEPGRAM_STT_MODELS,
     realtimeSttModels: DEEPGRAM_REALTIME_STT_MODELS,
     sttCapabilities: DEEPGRAM_STT_CAPABILITIES
@@ -602,7 +659,7 @@ const PROVIDER_SUMMARIES: VoiceProviderSummary[] = [
     requiresKey: true,
     supports: {
       tts: true,
-      stt: false,
+      stt: true,
       listVoices: true,
       clone: false,
       streaming: false,
@@ -611,8 +668,11 @@ const PROVIDER_SUMMARIES: VoiceProviderSummary[] = [
     },
     defaultModel: DEFAULT_MIMO_TTS_MODEL,
     defaultTtsModel: DEFAULT_MIMO_TTS_MODEL,
+    defaultSttModel: DEFAULT_MIMO_STT_MODEL,
     defaultVoice: DEFAULT_MIMO_TTS_VOICE,
-    ttsModels: MIMO_TTS_MODELS
+    ttsModels: MIMO_TTS_MODELS,
+    sttModels: MIMO_STT_MODELS,
+    sttCapabilities: MIMO_STT_CAPABILITIES
   },
   {
     id: 'alibaba',
@@ -916,6 +976,50 @@ async function resolveApiKey(userId: string, service: string, envKeys: string[])
   return null
 }
 
+type VoiceApiCredential = {
+  apiKey: string
+  baseUrl: string
+  source: 'token-plan' | 'pay-as-you-go'
+}
+
+async function resolveMiniMaxVoiceCredential(userId: string): Promise<VoiceApiCredential | null> {
+  const tokenPlanKey = await resolveApiKey(userId, 'minimax_token_plan', ['MINIMAX_TOKEN_PLAN_API_KEY'])
+  if (tokenPlanKey) {
+    return {
+      apiKey: tokenPlanKey,
+      baseUrl: env.MINIMAX_TOKEN_PLAN_API_BASE_URL ?? MINIMAX_TOKEN_PLAN_OPENAI_BASE_URL,
+      source: 'token-plan'
+    }
+  }
+
+  const apiKey = await resolveApiKey(userId, 'minimax', ['MINIMAX_API_KEY'])
+  if (!apiKey) return null
+  return {
+    apiKey,
+    baseUrl: env.MINIMAX_API_BASE_URL ?? 'https://api.minimax.io/v1',
+    source: 'pay-as-you-go'
+  }
+}
+
+async function resolveMimoVoiceCredential(userId: string): Promise<VoiceApiCredential | null> {
+  const tokenPlanKey = await resolveApiKey(userId, 'mimo_token_plan', ['MIMO_TOKEN_PLAN_API_KEY'])
+  if (tokenPlanKey) {
+    return {
+      apiKey: tokenPlanKey,
+      baseUrl: env.MIMO_TOKEN_PLAN_API_BASE_URL ?? MIMO_TOKEN_PLAN_OPENAI_BASE_URL,
+      source: 'token-plan'
+    }
+  }
+
+  const apiKey = await resolveApiKey(userId, 'mimo', ['MIMO_API_KEY'])
+  if (!apiKey) return null
+  return {
+    apiKey,
+    baseUrl: env.MIMO_API_BASE_URL ?? 'https://api.xiaomimimo.com/v1',
+    source: 'pay-as-you-go'
+  }
+}
+
 export async function getVoiceSettings(userId: string): Promise<VoiceSettings> {
   const settings = await redis.getUserSettings(userId)
   const normalized = normalizeVoiceSettings(settings?.voice_settings)
@@ -932,13 +1036,13 @@ export function resolveAgentVoiceProfile(agent?: AgentRow | null): AgentVoicePro
 
 export async function buildVoiceProviderSummary(userId: string): Promise<VoiceProviderSummary[]> {
   const openaiKey = await resolveApiKey(userId, 'openai', ['OPENAI_API_KEY'])
-  const googleKey = await resolveApiKey(userId, 'google', ['GEMINI_API_KEY', 'GOOGLE_API_KEY'])
+  const googleKey = await resolveApiKey(userId, 'google', GOOGLE_API_KEY_ENV_NAMES)
   const elevenKey = await resolveApiKey(userId, 'elevenlabs', ['ELEVENLABS_API_KEY'])
   const deepgramKey = await resolveApiKey(userId, 'deepgram', ['DEEPGRAM_API_KEY'])
   const fishKey = await resolveApiKey(userId, 'fish', ['FISH_AUDIO_API_KEY', 'FISH_API_KEY'])
   const mistralKey = await resolveApiKey(userId, 'mistral', ['MISTRAL_API_KEY'])
-  const minimaxKey = await resolveApiKey(userId, 'minimax', ['MINIMAX_API_KEY'])
-  const mimoKey = await resolveApiKey(userId, 'mimo', ['MIMO_API_KEY'])
+  const minimaxKey = await resolveMiniMaxVoiceCredential(userId)
+  const mimoKey = await resolveMimoVoiceCredential(userId)
   const alibabaKey = await resolveApiKey(userId, 'alibaba', ['ALIBABA_CLOUD_API_KEY', 'DASHSCOPE_API_KEY'])
   const inworldKey = await resolveApiKey(userId, 'inworld', ['INWORLD_API_KEY'])
   const cartesiaKey = await resolveApiKey(userId, 'cartesia', ['CARTESIA_API_KEY'])
@@ -1451,7 +1555,15 @@ function createPrimaryProviderFailureError(
     return error instanceof Error ? error : new Error(detail)
   }
   const providerLabel = provider ?? 'configured'
-  return new Error(`Primary ${mode} provider "${providerLabel}" failed. ${FALLBACK_DISABLED_NOTE} ${detail}`)
+  const wrapped = new Error(
+    `Primary ${mode} provider "${providerLabel}" failed. ${FALLBACK_DISABLED_NOTE} ${detail}`
+  )
+  const status =
+    error && typeof error === 'object' && typeof (error as { status?: unknown }).status === 'number'
+      ? (error as { status: number }).status
+      : undefined
+  if (status !== undefined) Object.assign(wrapped, { status })
+  return wrapped
 }
 
 type FishModelListItem = {
@@ -1711,13 +1823,13 @@ function mapMiniMaxVoiceToSummary(voice: any, category: string): VoiceSummary | 
 }
 
 async function listMiniMaxVoices(userId: string): Promise<VoiceSummary[]> {
-  const apiKey = await resolveApiKey(userId, 'minimax', ['MINIMAX_API_KEY'])
-  if (!apiKey) throw new Error('MiniMax API key not configured')
+  const credential = await resolveMiniMaxVoiceCredential(userId)
+  if (!credential) throw new Error('MiniMax API key not configured')
 
-  const response = await fetch('https://api.minimax.io/v1/get_voice', {
+  const response = await fetch(`${credential.baseUrl.replace(/\/+$/, '')}/get_voice`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${credential.apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json'
     },
@@ -2279,6 +2391,12 @@ function buildRealtimeErrorEvent(error: unknown): VoiceRealtimeTtsEvent {
 async function readProviderError(response: Response, fallback: string): Promise<string> {
   const body = await response.text().catch(() => '')
   return body.trim() || fallback
+}
+
+async function createProviderHttpError(response: Response, fallback: string): Promise<Error> {
+  return Object.assign(new Error(await readProviderError(response, fallback)), {
+    status: response.status
+  })
 }
 
 async function* parseSseJsonStream(
@@ -3039,6 +3157,17 @@ export async function transcribeAudio(request: VoiceTranscribeRequest): Promise<
       })
     }
 
+    if (provider === 'google') {
+      return transcribeGemini({
+        audio,
+        userId,
+        model: resolvedModel ?? DEFAULT_GEMINI_STT_MODEL,
+        language: validated.language,
+        contentType: request.contentType ?? undefined,
+        options: validated.providerOptions
+      })
+    }
+
     if (provider === 'deepgram') {
       return transcribeDeepgram({
         audio,
@@ -3074,6 +3203,16 @@ export async function transcribeAudio(request: VoiceTranscribeRequest): Promise<
         audio,
         userId,
         model: resolvedModel ?? DEFAULT_MISTRAL_STT_MODEL,
+        language: validated.language,
+        contentType: request.contentType ?? undefined
+      })
+    }
+
+    if (provider === 'mimo') {
+      return transcribeMimo({
+        audio,
+        userId,
+        model: resolvedModel ?? DEFAULT_MIMO_STT_MODEL,
         language: validated.language,
         contentType: request.contentType ?? undefined
       })
@@ -4175,7 +4314,7 @@ async function synthesizeGemini({
   model: string
   voiceId?: string | null
 }): Promise<VoiceSynthesisResult> {
-  const apiKey = await resolveApiKey(userId, 'google', ['GEMINI_API_KEY', 'GOOGLE_API_KEY'])
+  const apiKey = await resolveApiKey(userId, 'google', GOOGLE_API_KEY_ENV_NAMES)
   if (!apiKey) throw new Error('Google Gemini API key not configured')
 
   const response = await fetch(
@@ -4320,6 +4459,7 @@ async function synthesizeDeepgram({
   if (!apiKey) throw new Error('Deepgram API key not configured')
 
   const targetModel = voiceId || model || DEFAULT_DEEPGRAM_TTS_MODEL
+  const isFlux = targetModel.startsWith('flux-')
   const query = new URLSearchParams({
     model: targetModel
   })
@@ -4331,23 +4471,56 @@ async function synthesizeDeepgram({
     query.set('container', options.providerOptions.container)
   }
 
-  const response = await fetch(`https://api.deepgram.com/v1/speak?${query.toString()}`, {
+  const speed = options?.common?.speed
+  if (typeof speed === 'number') {
+    const minimumSpeed = isFlux ? 0.5 : 0.7
+    if (speed < minimumSpeed || speed > 1.5) {
+      throw new Error(
+        `Deepgram ${isFlux ? 'Flux' : 'Aura'} speed must be between ${minimumSpeed} and 1.5.`
+      )
+    }
+    if (isFlux && Math.abs(speed * 20 - Math.round(speed * 20)) > Number.EPSILON) {
+      throw new Error('Deepgram Flux speed must use 0.05 increments.')
+    }
+    query.set('speed', String(speed))
+  }
+
+  const sampleRate = options?.providerOptions?.sampleRate
+  if (typeof sampleRate === 'number') query.set('sample_rate', String(sampleRate))
+
+  const bitRate = options?.providerOptions?.bitRate
+  if (typeof bitRate === 'number') query.set('bit_rate', String(bitRate))
+
+  const expressivity = options?.providerOptions?.expressivity
+  if (typeof expressivity === 'number') {
+    if (!isFlux) {
+      throw new Error('Deepgram expressivity is only supported by Flux TTS models.')
+    }
+    if (!Number.isInteger(expressivity)) {
+      throw new Error('Deepgram Flux expressivity must be a whole number from -2 to 2.')
+    }
+    query.set('expressivity', String(expressivity))
+  }
+
+  const mipOptOut = options?.providerOptions?.mipOptOut
+  if (typeof mipOptOut === 'boolean') query.set('mip_opt_out', String(mipOptOut))
+
+  const response = await fetch(`https://api.deepgram.com/${isFlux ? 'v2' : 'v1'}/speak?${query.toString()}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Accept: 'audio/wav',
+      Accept: '*/*',
       Authorization: `Token ${apiKey}`
     },
     body: JSON.stringify({ text })
   })
 
   if (!response.ok) {
-    const errorText = await response.text().catch(() => '')
-    throw new Error(errorText || 'Failed to synthesize speech with Deepgram')
+    throw await createProviderHttpError(response, 'Failed to synthesize speech with Deepgram')
   }
 
   const audioBuffer = new Uint8Array(await response.arrayBuffer())
-  const mediaType = response.headers.get('content-type') || 'audio/wav'
+  const mediaType = response.headers.get('content-type') || (isFlux ? 'audio/mpeg' : 'audio/wav')
 
   return {
     audio: audioBuffer,
@@ -4486,8 +4659,8 @@ async function synthesizeMiniMax({
   voiceId?: string | null
   options?: ResolvedVoiceRuntimeOptions
 }): Promise<VoiceSynthesisResult> {
-  const apiKey = await resolveApiKey(userId, 'minimax', ['MINIMAX_API_KEY'])
-  if (!apiKey) throw new Error('MiniMax API key not configured')
+  const credential = await resolveMiniMaxVoiceCredential(userId)
+  if (!credential) throw new Error('MiniMax API key not configured')
 
   const format =
     typeof options?.providerOptions?.format === 'string' &&
@@ -4526,11 +4699,11 @@ async function synthesizeMiniMax({
     body.language_boost = options.providerOptions.language_boost
   }
 
-  const baseUrl = (env.MINIMAX_API_BASE_URL ?? 'https://api.minimax.io/v1').replace(/\/+$/, '')
+  const baseUrl = credential.baseUrl.replace(/\/+$/, '')
   const response = await fetch(`${baseUrl}/t2a_v2`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${credential.apiKey}`,
       'Content-Type': 'application/json',
       Accept: 'application/json'
     },
@@ -4572,8 +4745,8 @@ async function synthesizeMiMo({
   voiceId?: string | null
   options?: ResolvedVoiceRuntimeOptions
 }): Promise<VoiceSynthesisResult> {
-  const apiKey = await resolveApiKey(userId, 'mimo', ['MIMO_API_KEY'])
-  if (!apiKey) throw new Error('MiMo API key not configured')
+  const credential = await resolveMimoVoiceCredential(userId)
+  if (!credential) throw new Error('MiMo API key not configured')
 
   const format =
     typeof options?.providerOptions?.format === 'string' &&
@@ -4586,11 +4759,13 @@ async function synthesizeMiMo({
   }
   messages.push({ role: 'assistant', content: text })
 
-  const baseUrl = (env.MIMO_API_BASE_URL ?? 'https://api.xiaomimimo.com/v1').replace(/\/+$/, '')
+  const baseUrl = credential.baseUrl.replace(/\/+$/, '')
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      ...(credential.source === 'token-plan'
+        ? { 'api-key': credential.apiKey }
+        : { Authorization: `Bearer ${credential.apiKey}` }),
       'Content-Type': 'application/json',
       Accept: 'application/json'
     },
@@ -5281,6 +5456,249 @@ export async function transcribeByoSpeechForRecord({
   })
 }
 
+const GEMINI_TRANSCRIBE_MIME_TYPES = new Set([
+  'audio/wav',
+  'audio/mp3',
+  'audio/aiff',
+  'audio/aac',
+  'audio/ogg',
+  'audio/flac',
+  'audio/mpeg',
+  'audio/m4a',
+  'audio/l16',
+  'audio/opus',
+  'audio/alaw',
+  'audio/mulaw',
+  'audio/webm'
+])
+
+function normalizeGeminiTranscriptionMimeType(contentType?: string): string {
+  const normalized = contentType?.split(';')[0]?.trim().toLowerCase() || 'audio/wav'
+  const aliases: Record<string, string> = {
+    'audio/x-wav': 'audio/wav',
+    'audio/wave': 'audio/wav',
+    'audio/vnd.wave': 'audio/wav',
+    'audio/x-m4a': 'audio/m4a',
+    'audio/mp4': 'audio/m4a'
+  }
+  const resolved = aliases[normalized] || normalized
+  if (!GEMINI_TRANSCRIBE_MIME_TYPES.has(resolved)) {
+    throw new Error(
+      `Google Gemini 3.5 Transcribe does not accept audio type "${normalized}". Use WAV, MP3, AIFF, AAC, OGG, FLAC, MPEG, M4A, L16, Opus, ALAW, MULAW, or WebM.`
+    )
+  }
+  return resolved
+}
+
+function parseGeminiCustomVocabulary(value: VoiceProviderOptionValue | undefined): string[] {
+  if (typeof value !== 'string') return []
+  const terms = value
+    .split(/[\n,]/)
+    .map((term) => term.trim())
+    .filter(Boolean)
+  if (terms.length > 1000) {
+    throw new Error('Google Gemini custom vocabulary accepts at most 1,000 terms.')
+  }
+  return terms
+}
+
+function extractGeminiWordAnnotations(payload: Record<string, unknown>): any[] | undefined {
+  const words: unknown[] = []
+  const steps = Array.isArray(payload.steps) ? payload.steps : []
+  for (const step of steps) {
+    if (!step || typeof step !== 'object') continue
+    const content = Array.isArray((step as Record<string, unknown>).content)
+      ? ((step as Record<string, unknown>).content as unknown[])
+      : []
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue
+      const annotations = Array.isArray((part as Record<string, unknown>).annotations)
+        ? ((part as Record<string, unknown>).annotations as unknown[])
+        : []
+      for (const annotation of annotations) {
+        if (
+          annotation &&
+          typeof annotation === 'object' &&
+          (annotation as Record<string, unknown>).type === 'word_info'
+        ) {
+          words.push(annotation)
+        }
+      }
+    }
+  }
+  return words.length > 0 ? words : undefined
+}
+
+function extractGeminiInteractionText(payload: Record<string, unknown>): string {
+  if (typeof payload.output_text === 'string' && payload.output_text.trim()) {
+    return payload.output_text.trim()
+  }
+
+  const textParts: string[] = []
+  const steps = Array.isArray(payload.steps) ? payload.steps : []
+  for (const step of steps) {
+    if (!step || typeof step !== 'object') continue
+    const stepRecord = step as Record<string, unknown>
+    if (stepRecord.type !== 'model_output') continue
+    const content = Array.isArray(stepRecord.content) ? stepRecord.content : []
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue
+      const partRecord = part as Record<string, unknown>
+      if (partRecord.type === 'text' && typeof partRecord.text === 'string' && partRecord.text.trim()) {
+        textParts.push(partRecord.text.trim())
+      }
+    }
+  }
+  return textParts.join('\n').trim()
+}
+
+async function transcribeGemini({
+  audio,
+  userId,
+  model,
+  language,
+  contentType,
+  options
+}: {
+  audio: Uint8Array
+  userId: string
+  model: string
+  language?: string
+  contentType?: string
+  options?: VoiceProviderOptionBlock
+}): Promise<VoiceTranscribeResult> {
+  const apiKey = await resolveApiKey(userId, 'google', GOOGLE_API_KEY_ENV_NAMES)
+  if (!apiKey) throw new Error('Google Gemini API key not configured')
+  if (model !== DEFAULT_GEMINI_STT_MODEL) {
+    throw new Error(`Google recorded transcription only supports ${DEFAULT_GEMINI_STT_MODEL} in Batshit today.`)
+  }
+
+  const mimeType = normalizeGeminiTranscriptionMimeType(contentType)
+  const mode = options?.mode === 'smart' ? 'smart' : 'verbatim'
+  const diarization = options?.diarization === true
+  const wordTimestamps = options?.wordTimestamps === true
+  const customVocabulary = parseGeminiCustomVocabulary(options?.customVocabulary)
+
+  if (mode === 'smart' && (diarization || wordTimestamps)) {
+    throw new Error('Google Gemini Smart transcription cannot be combined with speaker diarization or word timestamps.')
+  }
+  if (customVocabulary.length > 0 && (diarization || wordTimestamps)) {
+    throw new Error('Google Gemini custom vocabulary cannot be combined with speaker diarization or word timestamps.')
+  }
+
+  const uploadStart = await fetch('https://generativelanguage.googleapis.com/upload/v1beta/files', {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': apiKey,
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(audio.byteLength),
+      'X-Goog-Upload-Header-Content-Type': mimeType,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ file: { display_name: 'Batshit transcription' } })
+  })
+  if (!uploadStart.ok) {
+    throw await createProviderHttpError(uploadStart, 'Google Gemini file upload could not start.')
+  }
+  const uploadUrl = uploadStart.headers.get('x-goog-upload-url')
+  if (!uploadUrl) {
+    throw new Error('Google Gemini file upload did not return a resumable upload URL.')
+  }
+
+  const uploadResponse = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Length': String(audio.byteLength),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize'
+    },
+    body: toOwnedBytes(audio)
+  })
+  if (!uploadResponse.ok) {
+    throw await createProviderHttpError(uploadResponse, 'Google Gemini file upload failed.')
+  }
+
+  const uploadPayload = (await uploadResponse.json().catch(() => null)) as {
+    file?: { name?: unknown; uri?: unknown; mimeType?: unknown; mime_type?: unknown }
+  } | null
+  const fileName = typeof uploadPayload?.file?.name === 'string' ? uploadPayload.file.name : ''
+  const fileUri = typeof uploadPayload?.file?.uri === 'string' ? uploadPayload.file.uri : ''
+  const uploadedMimeType =
+    (typeof uploadPayload?.file?.mimeType === 'string' && uploadPayload.file.mimeType) ||
+    (typeof uploadPayload?.file?.mime_type === 'string' && uploadPayload.file.mime_type) ||
+    mimeType
+  if (!fileName || !fileUri) {
+    throw new Error('Google Gemini file upload returned incomplete file metadata.')
+  }
+
+  let primaryError: unknown = null
+  try {
+    const transcriptionConfig: Record<string, unknown> = {}
+    if (language) transcriptionConfig.language_codes = [language]
+    if (customVocabulary.length > 0) transcriptionConfig.custom_vocabulary = customVocabulary
+    if (mode === 'smart') {
+      transcriptionConfig.mode = 'smart'
+    } else if (diarization || wordTimestamps) {
+      transcriptionConfig.mode = {
+        type: 'verbatim',
+        ...(diarization ? { diarization_mode: 'speaker' } : {}),
+        ...(wordTimestamps ? { timestamp_granularities: ['word'] } : {})
+      }
+    }
+
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+      method: 'POST',
+      headers: {
+        'x-goog-api-key': apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model,
+        input: [{ type: 'audio', uri: fileUri, mime_type: uploadedMimeType }],
+        ...(Object.keys(transcriptionConfig).length > 0
+          ? { generation_config: { transcription_config: transcriptionConfig } }
+          : {})
+      })
+    })
+    if (!response.ok) {
+      throw await createProviderHttpError(response, 'Google Gemini transcription failed.')
+    }
+
+    const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null
+    const text = payload ? extractGeminiInteractionText(payload) : ''
+    if (!payload || !text) {
+      throw new Error('Google Gemini transcription returned no transcript text.')
+    }
+    return {
+      text,
+      language,
+      segments: extractGeminiWordAnnotations(payload)
+    }
+  } catch (error) {
+    primaryError = error
+    throw error
+  } finally {
+    const cleanupResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/${fileName}`, {
+      method: 'DELETE',
+      headers: {
+        'x-goog-api-key': apiKey
+      }
+    }).catch((error) => error)
+    if (!(cleanupResponse instanceof Response && cleanupResponse.ok)) {
+      const cleanupDetail =
+        cleanupResponse instanceof Response
+          ? await readProviderError(cleanupResponse, 'Google Gemini temporary file deletion failed.')
+          : extractVoiceErrorMessage(cleanupResponse)
+      if (primaryError) {
+        console.warn('[voice/google-transcribe] Temporary Google file cleanup also failed:', cleanupDetail)
+      } else {
+        throw new Error(`Google Gemini transcription completed, but temporary file cleanup failed. ${cleanupDetail}`)
+      }
+    }
+  }
+}
+
 async function transcribeOpenAI({
   audio,
   userId,
@@ -5320,6 +5738,85 @@ async function transcribeOpenAI({
     text: result.text,
     language: result.language,
     segments: result.segments
+  }
+}
+
+async function transcribeMimo({
+  audio,
+  userId,
+  model,
+  language,
+  contentType
+}: {
+  audio: Uint8Array
+  userId: string
+  model: string
+  language?: string
+  contentType?: string
+}): Promise<VoiceTranscribeResult> {
+  if (model !== DEFAULT_MIMO_STT_MODEL) {
+    throw new Error(`MiMo ASR only supports ${DEFAULT_MIMO_STT_MODEL} in Batshit today.`)
+  }
+
+  const credential = await resolveMimoVoiceCredential(userId)
+  if (!credential) throw new Error('MiMo API key not configured')
+
+  const normalizedAudio = await normalizeUploadedAudioToPcmWav({
+    audio,
+    contentType,
+    providerLabel: 'MiMo'
+  })
+  const audioBase64 = Buffer.from(normalizedAudio).toString('base64')
+  if (audioBase64.length > MAX_MIMO_ASR_BASE64_CHARS) {
+    throw new Error('MiMo ASR audio exceeds the provider 10 MB encoded-audio limit after WAV conversion.')
+  }
+
+  const recognizedLanguage = language === 'zh' || language === 'en' ? language : 'auto'
+  const baseUrl = credential.baseUrl.replace(/\/+$/, '')
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      ...(credential.source === 'token-plan'
+        ? { 'api-key': credential.apiKey }
+        : { Authorization: `Bearer ${credential.apiKey}` }),
+      'Content-Type': 'application/json',
+      Accept: 'application/json'
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'input_audio',
+              input_audio: {
+                data: `data:audio/wav;base64,${audioBase64}`
+              }
+            }
+          ]
+        }
+      ],
+      asr_options: {
+        language: recognizedLanguage
+      },
+      stream: false
+    })
+  })
+
+  if (!response.ok) {
+    throw new Error(await readProviderError(response, 'MiMo transcription failed'))
+  }
+
+  const payload = (await response.json().catch(() => null)) as Record<string, any> | null
+  const text = payload?.choices?.[0]?.message?.content
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new Error('MiMo transcription returned no transcript text.')
+  }
+
+  return {
+    text,
+    language: recognizedLanguage === 'auto' ? undefined : recognizedLanguage
   }
 }
 

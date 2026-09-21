@@ -238,7 +238,7 @@ describe('runtime add-on catalog', () => {
           ok: true,
           service: 'batshit-agent-browser-sidecar',
           mode: 'docker-sidecar',
-          version: 'agent-browser 0.24.1'
+          version: 'agent-browser 0.37.1'
         })
       )
     )
@@ -253,7 +253,7 @@ describe('runtime add-on catalog', () => {
       details: {
         supportLevel: 'docker-sidecar',
         url: 'http://agent-browser.test',
-        version: 'agent-browser 0.24.1'
+        version: 'agent-browser 0.37.1'
       }
     })
   })

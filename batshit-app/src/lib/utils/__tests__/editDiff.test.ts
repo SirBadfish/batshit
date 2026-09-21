@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildCompactEditPreview, extractManagedPatchFromSources } from '../editDiff'
+import { buildCompactEditPreview, buildSnapshotEditPreview, extractManagedPatchFromSources } from '../editDiff'
 
 describe('editDiff', () => {
 	it('extracts managed apply_patch bodies from command text', () => {
@@ -50,5 +50,49 @@ describe('editDiff', () => {
 		})
 
 		expect(preview).toBeUndefined()
+	})
+})
+
+// Copies of an edit's target read just before and just after the command (`nativeBashExecute`).
+describe('buildSnapshotEditPreview', () => {
+	const before = '# Notes\n\nFirst line.\nSecond line.\n'
+	const after = '# Notes\n\nLast line.\nSecond line.\n'
+
+	it('turns copies that differ into the changed lines', () => {
+		expect(buildSnapshotEditPreview({ filePath: 'notes.md', before, after })).toBe(
+			'--- Before\n+++ After\n    1 | # Notes\n    2 | \n-   3 | First line.\n+   3 | Last line.\n    4 | Second line.\n    5 | '
+		)
+	})
+
+	// An empty diff was stored for these, which sent the AI view to the raw sidecar (the whole
+	// native result, both copies included) and the Edit card to its JSON dump.
+	it('says that identical copies mean the command changed nothing', () => {
+		expect(buildSnapshotEditPreview({ filePath: 'notes.md', before, after: before })).toBe(
+			'No changes: the command left notes.md exactly as it was.'
+		)
+		expect(buildSnapshotEditPreview({ before, after: before })).toBe(
+			'No changes: the command left file exactly as it was.'
+		)
+	})
+
+	it('says when only line endings changed, which a line diff cannot show', () => {
+		expect(buildSnapshotEditPreview({ filePath: 'notes.md', before: 'a\r\nb\r\n', after: 'a\nb\n' })).toBe(
+			'Updated notes.md: only its line endings changed.'
+		)
+	})
+
+	it('never tells a failed run it changed nothing, and still shows a real change', () => {
+		expect(buildSnapshotEditPreview({ filePath: 'notes.md', before, after: before, allowSummary: false })).toBeUndefined()
+		expect(
+			buildSnapshotEditPreview({ filePath: 'notes.md', before: 'a\r\n', after: 'a\n', allowSummary: false })
+		).toBeUndefined()
+		expect(buildSnapshotEditPreview({ filePath: 'notes.md', before, after, allowSummary: false })).toContain(
+			'+   3 | Last line.'
+		)
+	})
+
+	it('needs both copies', () => {
+		expect(buildSnapshotEditPreview({ filePath: 'notes.md', before })).toBeUndefined()
+		expect(buildSnapshotEditPreview({ filePath: 'notes.md', before: null, after })).toBeUndefined()
 	})
 })

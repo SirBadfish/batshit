@@ -477,7 +477,8 @@ describe('a delegated run credential', () => {
       agentId: 'subagent_cli_worker_agent_cooper_1',
       sessionId: 'sess-worker',
       runtime: 'codex',
-      delegated: true
+      delegated: true,
+      scopeAgentId: 'worker_1'
     })
 
     expect(minted.record.delegated).toBe(true)
@@ -534,5 +535,76 @@ describe('a delegated run credential', () => {
         runtime: 'codex'
       })
     ).rejects.toThrow(/was not found for this user/)
+  })
+})
+
+/* -------------------------------------------------------------------------- *
+ * BL-75 — the skill scope a credential carries.
+ *
+ * A delegated run's `agentId` is a `subagent_cli_…` runtime id that no skill access list names,
+ * so its credential also names the Subagent or Worker whose list governs `native_skill`. The
+ * mint checks it the way it checks the agent: a caller bug must fail the run start, never hand
+ * a run another subagent's skills.
+ * -------------------------------------------------------------------------- */
+
+describe('a run credential skill scope (BL-75)', () => {
+  const delegatedMint = (scopeAgentId: unknown) =>
+    mintRunCredential({
+      userId: USER,
+      agentId: 'subagent_cli_research',
+      sessionId: 'sess-delegated',
+      runtime: 'claude',
+      delegated: true,
+      scopeAgentId: scopeAgentId as string
+    })
+
+  it('stores the Subagent a delegated run runs as, and hands it back on validation', async () => {
+    await redis.set('subagent:research_bot', { id: 'research_bot', user_id: USER })
+
+    const minted = await delegatedMint('research_bot')
+
+    expect(minted.record.scopeAgentId).toBe('research_bot')
+    const validation = await validateRunCredential(minted.token)
+    expect(validation.valid && validation.record.scopeAgentId).toBe('research_bot')
+  })
+
+  it('accepts a built-in Worker id, which is never stored', async () => {
+    const minted = await delegatedMint('worker_2b8f')
+    expect(minted.record.scopeAgentId).toBe('worker_2b8f')
+  })
+
+  it('refuses a delegated run with no scope', async () => {
+    await expect(delegatedMint(undefined)).rejects.toThrow(/needs the id whose skills it may load/)
+    await expect(delegatedMint('   ')).rejects.toThrow(/needs the id whose skills it may load/)
+  })
+
+  it('refuses another user\'s subagent, and an id that is neither a subagent nor a Worker', async () => {
+    await redis.set('subagent:their_bot', { id: 'their_bot', user_id: OTHER_USER })
+
+    await expect(delegatedMint('their_bot')).rejects.toThrow(/was not found for this user/)
+    await expect(delegatedMint('made_up_bot')).rejects.toThrow(/was not found for this user/)
+  })
+
+  it('stores no scope on a primary run, and refuses a primary run naming another agent\'s', async () => {
+    await seedAgent(COOPER)
+
+    const own = await mintRunCredential({
+      userId: USER,
+      agentId: COOPER,
+      sessionId: 'sess-primary',
+      runtime: 'codex',
+      scopeAgentId: COOPER
+    })
+    expect(own.record.scopeAgentId).toBeNull()
+
+    await expect(
+      mintRunCredential({
+        userId: USER,
+        agentId: COOPER,
+        sessionId: 'sess-primary',
+        runtime: 'codex',
+        scopeAgentId: 'research_bot'
+      })
+    ).rejects.toThrow(/cannot carry the skill scope/)
   })
 })

@@ -7,6 +7,7 @@ import {
   type VoiceEnginePublicUpdate
 } from '$lib/server/services/voiceEngineRegistry'
 import { cloneIconRef, isIconRef } from '$lib/icons/iconTypes'
+import type { VoiceEngineRuntimeStartupConfig } from '$lib/types/voice'
 
 function normalizeOptionalString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
@@ -160,15 +161,17 @@ function normalizePublicUpdates(value: unknown): VoiceEnginePublicUpdate[] {
     }
 
     if (Object.prototype.hasOwnProperty.call(source, 'localRuntime')) {
+      // This is an allow-list: a startup field that is not named here never
+      // reaches the registry, however correct the rest of the chain is.
+      const startup: VoiceEngineRuntimeStartupConfig = {}
+      if (typeof startupSource?.autoStartOnLaunch === 'boolean') {
+        startup.autoStartOnLaunch = startupSource.autoStartOnLaunch
+      }
+      if (typeof startupSource?.stopOnShutdown === 'boolean') {
+        startup.stopOnShutdown = startupSource.stopOnShutdown
+      }
       normalized.localRuntime = localRuntimeSource
-        ? {
-            startup:
-              typeof startupSource?.autoStartOnLaunch === 'boolean'
-                ? {
-                    autoStartOnLaunch: startupSource.autoStartOnLaunch
-                  }
-                : undefined
-          }
+        ? { startup: Object.keys(startup).length > 0 ? startup : undefined }
         : undefined
     }
 

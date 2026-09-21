@@ -7,7 +7,8 @@ import {
   buildMemoryPromptBlock,
   buildSubagentGuidancePromptBlock,
   buildToolGuidanceZipPromptBlock,
-  buildDmGuidancePromptBlock
+  buildDmGuidancePromptBlock,
+  buildJevJuiceGuidancePromptBlock
 } from './toolPromptInjection'
 import { formatSteerForModel, STEER_WRAPPER_GUIDANCE_EXAMPLES } from './steerControl'
 import {
@@ -591,6 +592,61 @@ describe('buildToolGuidanceZipPromptBlock', () => {
     for (const prompt of [readPackaged('batshit_dm_guidance.md'), buildDmGuidancePromptBlock()]) {
       const words = prompt.trim().split(/\s+/).length
       expect(words).toBeLessThan(660)
+    }
+  })
+
+  it('SA-120 P2: the Jev Juice guidance teaches the exact sys.judge.ask shape on both surfaces', () => {
+    // Packaged default and code fallback are one product surface (the DM block's rule):
+    // whichever one an instance uses, the agent is taught the same call. `tool_discovery`
+    // prints a Fabric COUNT and never a schema, so a control named here without its
+    // fields is a guaranteed first-call failure — the SA-113/SA-115 lesson, again.
+    const packaged = readPackaged('batshit_jev_juice_guidance.md')
+    const fallback = buildJevJuiceGuidancePromptBlock()
+
+    for (const prompt of [packaged, fallback]) {
+      // The control and its two required fields, plus the optional one.
+      expect(prompt).toContain('`sys.judge.ask` takes `state` and `questions`')
+      expect(prompt).toContain('`model` is optional')
+      // The three question shapes, each with an example the agent can copy, and the
+      // answer shape each one returns (`typesafeClient.ts` JevNoulAnswer/Choice/Score).
+      expect(prompt).toContain('"type":"noul"')
+      expect(prompt).toContain('"type":"choice"')
+      expect(prompt).toContain('"type":"score"')
+      expect(prompt).toContain('"probabilities":{…},"confidence"')
+      expect(prompt).toContain('the id is never shown to Jev')
+      // The limits, restated from JUDGE_ASK_LIMITS (judgeAsk.jev.test.ts ties the numbers).
+      expect(prompt).toContain('2 to 255 options')
+      expect(prompt).toContain('2 to 10 levels, low to high')
+      expect(prompt).toContain('Up to 64 questions per call')
+      expect(prompt).toContain('under about 30k tokens')
+      // Fan-out coaching (design record H1): many narrow questions, a none option, and
+      // thresholds that live in the agent's own reasoning, never in Jev.
+      expect(prompt).toContain('Ask everything at once')
+      expect(prompt).toContain('`other` or `none` option')
+      expect(prompt).toContain('Thresholds are yours')
+      // What Jev cannot do, and the privacy sentence (DL-120-01: text leaves the machine).
+      expect(prompt).toContain('no memory of earlier calls')
+      expect(prompt).toContain('never runs a tool')
+      expect(prompt).toContain('Jev cannot write')
+      expect(prompt).toContain('cannot approve a risky control')
+      expect(prompt).toContain("never counts as the user's")
+      expect(prompt).toContain('leaves this computer and goes to TypeSafe')
+      // A refusal is a reason to fix the request, never a retry loop.
+      expect(prompt).toContain('Do not loop on it')
+      // DL-120-07: every call is visible.
+      expect(prompt).toContain('Execution Viewer')
+      // DL-116-13 killed the flag everywhere; a new block must not resurrect it.
+      expect(prompt).not.toContain('allowRisky')
+    }
+  })
+
+  it('SA-120 P2: the Jev Juice guidance stays inside its token budget on both surfaces', () => {
+    // One control, three question shapes with a copyable example each, five rules, and
+    // the "cannot" paragraph. Sized for the block that exists, with a little room; the
+    // guard is here so it cannot quietly grow into a second memory prompt.
+    for (const prompt of [readPackaged('batshit_jev_juice_guidance.md'), buildJevJuiceGuidancePromptBlock()]) {
+      const words = prompt.trim().split(/\s+/).length
+      expect(words).toBeLessThan(560)
     }
   })
 

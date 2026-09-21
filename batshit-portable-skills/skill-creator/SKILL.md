@@ -138,7 +138,7 @@ End with:
 - type: Skill or Prompt
 - invocation pattern
 - dependencies or required tools
-- whether it is enabled for all agents or selected agents
+- who may use it: a save never turns a skill on for anyone, so tell the user to turn it on for their agents in Settings -> Agents -> Access (one agent) or Settings -> Skills & Prompts (all agents)
 - save/import result
 - any user action still needed
 

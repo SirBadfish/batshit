@@ -163,6 +163,7 @@ For Docker installs, host-local services usually need `host.docker.internal` whe
 | llama.cpp | `http://localhost:8080` | `http://host.docker.internal:8080` |
 | vLLM | `http://localhost:8000` | `http://host.docker.internal:8000` |
 | SGLang | `http://localhost:30000` | `http://host.docker.internal:30000` |
+| KoboldCpp | `http://localhost:5001` | `http://host.docker.internal:5001` |
 | oMLX | `http://localhost:8000` | `http://host.docker.internal:8000` |
 | whisper.cpp uploaded-audio STT | `http://localhost:8077` | `http://host.docker.internal:8077` |
 | Host BYO TTS engine | `http://localhost:<port>` | `http://host.docker.internal:<port>` |

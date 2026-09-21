@@ -10,6 +10,8 @@
  * Browser-safe on purpose: the P4 inbox drawer reads these shapes.
  */
 
+import type { UntrustedTextScreen } from './typesafe'
+
 /** `info` = read and acknowledge. `assignment` = do this and report back. `result` = the outcome. */
 export const DM_KINDS = ['info', 'assignment', 'result'] as const
 export type DmKind = (typeof DM_KINDS)[number]
@@ -126,6 +128,18 @@ export interface DmRecord {
 
   /** Set when a closing DM has already created its `result`, so a retry cannot double it. */
   resultDmId?: string
+
+  /**
+   * SA-120 P7 — what the Jev Juice incoming-text screen said about this DM's subject and body
+   * when it arrived (agent and webhook senders only; a schedule is the user's own words).
+   * Absent while **Screen Incoming Text** (on the Jev Juice card) is off, so such a record is today's bytes.
+   *
+   * ADVISORY ONLY. It feeds a warning badge and one note to the agent that reads the DM. No
+   * code may read it to allow, refuse, approve, deny, reorder, or withhold anything, and
+   * `no_flag` must never be shown or told as "safe" (DL-120-12). Written only by
+   * `stampDmScreen`; it lives and dies with this record, so it owes no sweep and no backup row.
+   */
+  screen?: UntrustedTextScreen
 }
 
 /** The summary shape `sys.dm.list` returns and the roster is built from. */

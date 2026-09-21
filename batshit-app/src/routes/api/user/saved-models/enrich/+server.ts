@@ -15,6 +15,10 @@ import { resolvePresetMaxOutputTokenResolution } from '$lib/utils/modelOutputTok
 import { resolveCatalogIds } from '$lib/utils/modelIdResolver'
 import { resolveConnectionServiceFromId } from '$lib/utils/modelConnections'
 
+function toPositiveNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
 export const POST: RequestHandler = async ({ request, locals }) => {
   if (!locals.user) {
     return json({ error: 'Unauthorized' }, { status: 401 })
@@ -105,11 +109,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
     const providerCapabilities = providerFeaturesToCapabilities(info.features)
     const capabilities = mergeCapabilities(providerCapabilities, enrichment?.capabilities)
-    const contextWindow =
+    // BL-67: blank sends nothing. A row with no known window returns none, never 0.
+    const contextWindow = toPositiveNumber(
       enrichment?.contextWindow ??
-      ('contextWindow' in info ? (info as any).contextWindow : undefined) ??
-      info.features.maxTokens ??
-      0
+        ('contextWindow' in info ? (info as any).contextWindow : undefined) ??
+        info.features.maxTokens
+    )
     const maxOutputResolution = resolvePresetMaxOutputTokenResolution({
       maxOutputTokens:
         enrichment?.maxOutputTokens ??
@@ -135,9 +140,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       catalogModelId: vercelModel?.id,
       effectiveModelId: catalogIdentity?.effectiveModelId,
       contextWindow,
+      // BL-67: an unknown price stays absent (the Token Panel then says Unknown); a
+      // catalog price of 0 is a real zero and passes through.
       pricing: {
-        input: enrichment?.pricing?.input ?? fallbackPricing.input ?? 0,
-        output: enrichment?.pricing?.output ?? fallbackPricing.output ?? 0,
+        input: enrichment?.pricing?.input ?? fallbackPricing.input,
+        output: enrichment?.pricing?.output ?? fallbackPricing.output,
         cachedInput: enrichment?.pricing?.cachedInput ?? fallbackPricing.cachedInput
       },
       capabilities,

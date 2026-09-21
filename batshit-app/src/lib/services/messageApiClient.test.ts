@@ -61,4 +61,23 @@ describe('MessageApiClient', () => {
     expect(message.content).toContain('Input exceeds the maximum length')
     expect(message.metadata?.error_message).toContain('Input exceeds the maximum length')
   })
+
+  it('puts a chat id with URL characters into the path encoded (bug sweep, 2026-09-18)', async () => {
+    const urls: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        urls.push(String(url))
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })
+      })
+    )
+    const store = new MessageApiClient()
+    await store.getSessionMessages('plan/a?b#c%d')
+    await store.getMessages('plan/a?b#c%d', 5)
+    expect(urls).toEqual([
+      '/api/messages/plan%2Fa%3Fb%23c%25d?limit=1000',
+      '/api/messages/plan%2Fa%3Fb%23c%25d?limit=5'
+    ])
+  })
 })
+

@@ -201,10 +201,18 @@ export interface VoiceEngineLaunchConfig {
 
 export interface VoiceEngineRuntimeStartupConfig {
   autoStartOnLaunch?: boolean
+  /**
+   * "Stop with Batshit". Absent means STOP, because stopping every recorded
+   * local runtime on quit is what the packaged Mac app has always done; an
+   * older record without the field must keep behaving the way it does today.
+   */
+  stopOnShutdown?: boolean
 }
 
 export interface VoiceRuntimeStartupConfig {
   autoStartOnLaunch?: boolean
+  /** "Stop with Batshit" for the LiveKit runtime pair. Absent means STOP. */
+  stopOnShutdown?: boolean
 }
 
 export interface LiveKitVoiceRuntimeSettings {
@@ -222,9 +230,21 @@ export interface VoiceEngineLocalRuntimeConfig {
   startup?: VoiceEngineRuntimeStartupConfig
 }
 
+/** Why Batshit cannot honestly offer "Stop with Batshit" for an engine. */
+export type VoiceEngineStopUnavailableReason = 'no-launch-recipe' | 'docker'
+
 export interface VoiceEngineLocalRuntimeSummary {
   installOwnership?: LocalVoiceEngineInstallOwnership
   startup?: VoiceEngineRuntimeStartupConfig
+  /**
+   * True only when Batshit can actually stop THIS engine in THIS runtime: it
+   * holds a launch recipe it recorded, and, in Docker, the host runtime add-on
+   * operator records what it starts and can stop it (protocol revision 5 or
+   * later, `stop` in its host voice controls; not on Windows yet).
+   * The client must not re-derive this; it is computed where the truth lives.
+   */
+  canStopOnShutdown?: boolean
+  stopOnShutdownUnavailableReason?: VoiceEngineStopUnavailableReason
 }
 
 export type VoiceEngineRealtimeSttTransport = 'websocket'
@@ -330,6 +350,17 @@ export interface VoiceModeTurnSettings {
   submitMode?: VoiceModeSubmitMode
   autoSubmitDelayMs?: number
   endOfTurnThreshold?: number
+  /**
+   * SA-120 P9: **Jev Juice: Quick Actions** (LS-060), default OFF. A spoken turn that asks Batshit itself
+   * for a small app action (stop, hang up, show or hide the Goon, open Settings, show the Execution
+   * Viewer) runs it at once, without the agent. Global only: an agent's voice profile never sets it.
+   * THE reader is `resolveJevQuickActionsEnabled` (`$lib/utils/jevJuiceQuickActions.ts`).
+   */
+  jevJuiceQuickActions?: boolean
+  /** SA-120 P9b: a spoken turn is judged only when it starts with the wake word. Absent means REQUIRED. */
+  jevJuiceQuickActionsWakeWordRequired?: boolean
+  /** SA-120 P9b: the wake word, default "Yo"; one to three plain words. */
+  jevJuiceQuickActionsWakeWord?: string
 }
 
 export interface VoiceTtsEnginePromptSettings {

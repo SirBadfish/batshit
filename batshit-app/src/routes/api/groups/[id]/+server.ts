@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { redis } from '$lib/server/redis'
 import { normalizeOptionalIconRefInput } from '$lib/server/icons/iconRefInput'
 import { normalizeOptionalAvatarIconFitInput } from '$lib/server/icons/avatarIconFitInput'
+import { validateGroupAgentSettingsInput } from '$lib/types/groupChat'
 
 async function clearDeletedGroupFromSessions(userId: string, groupId: string) {
   const sessions = await redis.getSessions(userId, true)
@@ -68,6 +69,14 @@ export const PUT: RequestHandler = async ({ params, request, locals }) => {
 
     if (group.user_id !== locals.user.id) {
       return json({ error: 'Unauthorized' }, { status: 403 })
+    }
+
+    // SA-120 P3: a speaking preset must be one Batshit knows; a typo is refused, never read as something else.
+    const agentSettingsError = Object.prototype.hasOwnProperty.call(updates ?? {}, 'agent_settings')
+      ? validateGroupAgentSettingsInput(updates.agent_settings)
+      : null
+    if (agentSettingsError) {
+      return json({ error: agentSettingsError }, { status: 400 })
     }
 
     const sanitizedUpdates = {

@@ -9,6 +9,7 @@
     remainingMessages = undefined,
     manualZip = false,
     agentControlled = false,
+    inferredControlled = false,
     aboutToZip = false,
     onToggleUnzip = () => {},
     onZipNow = undefined,
@@ -16,11 +17,12 @@
   }: {
     isZipped?: boolean
     isUnzipped?: boolean
-    expandedReason?: 'buffer' | 'user' | 'agent'
+    expandedReason?: 'buffer' | 'user' | 'agent' | 'inferred'
     isPermanent?: boolean
     remainingMessages?: number | null
     manualZip?: boolean
     agentControlled?: boolean
+    inferredControlled?: boolean
     aboutToZip?: boolean
     onToggleUnzip?: (permanent: boolean, name?: string, description?: string, tokens?: number) => void
     onZipNow?: (zipId: string, name?: string, description?: string, tokens?: number) => void
@@ -38,6 +40,7 @@
   {remainingMessages}
   {manualZip}
   {agentControlled}
+  {inferredControlled}
   {aboutToZip}
   name="Read File"
   description="Read File output"

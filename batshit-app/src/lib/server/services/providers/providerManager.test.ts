@@ -22,6 +22,7 @@ import { createBaseten } from '@ai-sdk/baseten'
 import { createCerebras } from '@ai-sdk/cerebras'
 import { createCohere } from '@ai-sdk/cohere'
 import { createAlibaba } from '@ai-sdk/alibaba'
+import { createOpenAI } from '@ai-sdk/openai'
 
 // Mock environment variables for testing
 vi.mock('$env/dynamic/private', () => ({
@@ -33,8 +34,11 @@ vi.mock('$env/dynamic/private', () => ({
     MISTRAL_API_KEY: 'mistralplaceholder',
     XAI_API_KEY: 'xai-placeholder',
     DEEPSEEK_API_KEY: 'deepseek-placeholder',
+    KIMI_CODE_API_KEY: 'kimi-code-placeholder',
     MINIMAX_API_KEY: 'minimax-placeholder',
+    MINIMAX_TOKEN_PLAN_API_KEY: 'minimax-token-plan-placeholder',
     MIMO_API_KEY: 'mimo-placeholder',
+    MIMO_TOKEN_PLAN_API_KEY: 'mimo-token-plan-placeholder',
     DASHSCOPE_API_KEY: 'dashscope-placeholder',
     QWEN_TOKEN_PLAN_API_KEY: 'qwen-token-plan-placeholder',
     ALIBABA_CLOUD_API_KEY: 'alibaba-placeholder',
@@ -378,15 +382,33 @@ describe('ProviderManager - Story 5.3 Tests', () => {
     })
 
     it('registers new OpenAI-compatible direct model providers', () => {
+      expect(providerManager.hasProvider('kimi_code')).toBe(true)
       expect(providerManager.hasProvider('minimax')).toBe(true)
+      expect(providerManager.hasProvider('minimax_token_plan')).toBe(true)
       expect(providerManager.hasProvider('mimo')).toBe(true)
+      expect(providerManager.hasProvider('mimo_token_plan')).toBe(true)
       expect(providerManager.hasProvider('qwencloud')).toBe(true)
       expect(providerManager.hasProvider('qwen_token_plan')).toBe(true)
       expect(providerManager.hasProvider('alibaba')).toBe(true)
       expect(providerManager.hasProvider('stepfun')).toBe(true)
 
+      expect(providerManager.getProviderInfo('kimi_code')?.models).toEqual([
+        'k3',
+        'k3-256k',
+        'kimi-for-coding',
+        'kimi-for-coding-highspeed'
+      ])
       expect(providerManager.getProviderInfo('minimax')?.models).toContain('MiniMax-M3')
+      expect(providerManager.getProviderInfo('minimax_token_plan')?.models).toEqual([
+        'MiniMax-M3',
+        'MiniMax-M2.7',
+        'MiniMax-M2.7-highspeed'
+      ])
       expect(providerManager.getProviderInfo('mimo')?.models).toContain('mimo-v2.5-pro')
+      expect(providerManager.getProviderInfo('mimo_token_plan')?.models).toEqual([
+        'mimo-v2.5-pro',
+        'mimo-v2.5'
+      ])
       expect(providerManager.getProviderInfo('alibaba')?.models).toContain('qwen3-max')
       expect(providerManager.getProviderInfo('stepfun')?.models).toContain('step-3.7-flash')
 
@@ -399,6 +421,19 @@ describe('ProviderManager - Story 5.3 Tests', () => {
       expect(createAlibaba).toHaveBeenCalledWith({
         apiKey: 'dashscope-placeholder',
         baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+      })
+
+      expect(createOpenAI).toHaveBeenCalledWith({
+        apiKey: 'kimi-code-placeholder',
+        baseURL: 'https://api.kimi.ai/coding/v1'
+      })
+      expect(createOpenAI).toHaveBeenCalledWith({
+        apiKey: 'minimax-token-plan-placeholder',
+        baseURL: 'https://api.minimax.io/v1'
+      })
+      expect(createOpenAI).toHaveBeenCalledWith({
+        apiKey: 'mimo-token-plan-placeholder',
+        baseURL: 'https://token-plan-sgp.xiaomimimo.com/v1'
       })
 
       expect(

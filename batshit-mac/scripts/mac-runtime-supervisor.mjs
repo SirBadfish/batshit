@@ -25,7 +25,18 @@ import {
   inspectManagedRuntimePortability,
   MAC_RUNTIME_MINIMUM_VERSION
 } from './managed-runtime-portability.mjs';
+import { DAV1D_PROOF_FILES, inspectFfmpegRuntimeCapabilities } from './ffmpeg-runtime-capabilities.mjs';
 import { HAIR_CATALOG_PACKAGE_CONTRACT } from './hair-catalog-package-contract.mjs';
+import {
+  decideLocalRuntimeGroupStop,
+  decideLocalRuntimeStop,
+  groupLocalRuntimeLaunchRecords,
+  nativeRunIsGone,
+  readLocalRuntimeLaunchRecords,
+  readLocalRuntimeProcessGroup,
+  removeLocalRuntimeLaunchRecord
+} from './local-voice-runtime-stop.mjs';
+import { resolveSbxDaemonStateDir, stopSbxDaemonIfBatshitStartedIt } from './sbx-daemon-stop.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const macRoot = resolve(__dirname, '..');
@@ -119,7 +130,6 @@ const monitorStateFile = join(runtimeDir, 'supervisor-monitor.state.json');
 const shutdownCompleteFile = join(runtimeDir, 'shutdown-complete.json');
 const MONITOR_POLL_INTERVAL_MS = 5_000;
 const SERVICE_STOP_GRACE_MS = 5_000;
-const LOCAL_RUNTIME_LAUNCH_RECORD_NAME = '.batshit-local-runtime-launch.json';
 const MONITOR_RESTART_WINDOW_MS = 10 * 60 * 1000;
 const MONITOR_MAX_RESTARTS_PER_WINDOW = 5;
 const MONITOR_MAX_BACKOFF_MS = 120_000;
@@ -203,6 +213,7 @@ function createServiceDefinitions(env = null, options = {}) {
     usePackagedRuntime && existsSync(packagedFfmpegPath)
       ? {
           FFMPEG_PATH: packagedFfmpegPath,
+          FFPROBE_PATH: join(packagedFfmpegRoot, 'bin', 'ffprobe'),
           BATSHIT_FFMPEG_H264_ENCODER: 'h264_videotoolbox'
         }
       : {};
@@ -287,6 +298,8 @@ function createServiceDefinitions(env = null, options = {}) {
         : ['vite', `--port ${ports.app}`, appRoot],
       env: {
         ...packagedFfmpegEnv,
+        // Stamped on every local voice runtime this app launches (see macVoiceRuntimeOwner).
+        BATSHIT_VOICE_RUNTIME_OWNER: macVoiceRuntimeOwner(),
         BATSHIT_APP_VERSION: process.env.BATSHIT_APP_VERSION || DEFAULT_APP_VERSION,
         BATSHIT_APP_CHANNEL: process.env.BATSHIT_APP_CHANNEL || DEFAULT_APP_CHANNEL,
         BATSHIT_LOG_DIR: paths.logs,
@@ -1459,7 +1472,8 @@ async function dockerMcpGatewayStatus(env) {
     };
   }
 
-  const pid = await readPid(dockerMcpGatewayPidFile);
+  const metadata = await dockerMcpGatewayMetadata();
+  const pid = Number.isInteger(Number(metadata?.pid)) ? Number(metadata.pid) : null;
   const pidAlive = processAlive(pid);
   const pidGroupAlive = processGroupAlive(pid);
   const health = await fetchDockerMcpGatewayStatus(env);
@@ -1495,14 +1509,60 @@ async function dockerMcpGatewayStatus(env) {
   };
 }
 
-async function dockerMcpGatewayMetadata() {
-  const raw = await readFile(dockerMcpGatewayMetaFile, 'utf8').catch(() => '');
+async function readDockerMcpGatewayMetadata(filePath = dockerMcpGatewayMetaFile) {
+  const raw = await readFile(filePath, 'utf8').catch(() => '');
   if (!raw) return null;
   try {
     return JSON.parse(raw);
   } catch {
     return null;
   }
+}
+
+const dockerMcpGatewayMetadata = () => readDockerMcpGatewayMetadata();
+
+function dockerMcpGatewayGeneration(metadata) {
+  return typeof metadata?.generation === 'string' && metadata.generation
+    ? metadata.generation
+    : typeof metadata?.generatedAt === 'string' && metadata.generatedAt
+      ? metadata.generatedAt
+      : null;
+}
+
+async function removeDockerMcpGatewayOwnershipIfCurrent(expected) {
+  const generation = dockerMcpGatewayGeneration(expected);
+  if (!generation || !Number.isInteger(Number(expected?.pid))) return false;
+  const current = await dockerMcpGatewayMetadata();
+  if (
+    dockerMcpGatewayGeneration(current) !== generation ||
+    Number(current?.pid) !== Number(expected.pid)
+  ) {
+    return false;
+  }
+  const safeGeneration = createHash('sha256').update(generation).digest('hex').slice(0, 16);
+  const movedPath = `${dockerMcpGatewayMetaFile}.stopped-${safeGeneration}-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    await rename(dockerMcpGatewayMetaFile, movedPath);
+  } catch {
+    return false;
+  }
+  const moved = await readDockerMcpGatewayMetadata(movedPath);
+  if (
+    dockerMcpGatewayGeneration(moved) !== generation ||
+    Number(moved?.pid) !== Number(expected.pid)
+  ) {
+    // The canonical record changed after the comparison. Restore what was moved only if the
+    // canonical name is still absent; hard-link creation never overwrites a newer successor.
+    await link(movedPath, dockerMcpGatewayMetaFile)
+      .then(() => rm(movedPath, { force: true }))
+      .catch(() => {});
+    return false;
+  }
+
+  // Metadata is the one authoritative ownership record. The pid file remains a diagnostic
+  // projection; deleting a second canonical file cannot be part of this generation claim.
+  await rm(movedPath, { force: true });
+  return true;
 }
 
 async function dockerMcpGatewayNeedsRestart(env, currentStatus) {
@@ -1543,17 +1603,52 @@ function extractCommandOption(command, option) {
   return match?.[1] || null;
 }
 
-function parseDockerMcpGatewayProcess(info, groupRows = []) {
+// Is this listening gateway one WE started and then lost the pid file for?
+// Only then may `ensureDockerMcpGateway` kill it to apply a different profile.
+//
+// This used to ask whether the process group contained a `tail -f /dev/null`,
+// which was an accidental side effect of how the gateway held its stdin open.
+// That helper is gone (F-P7-13), so ask something we own on purpose instead:
+// a Mac-managed gateway is started with its stdout and stderr on THIS Mac data
+// root's `docker-mcp-gateway.log`, so its process still has that exact file
+// open. A gateway someone else started — by hand, or from the source-checkout
+// launcher — does not.
+function processHoldsFileOpen(openFilePathsByPid, pid, filePath) {
+  return Boolean(openFilePathsByPid.get(pid)?.has(filePath));
+}
+
+function parseDockerMcpGatewayProcess(info, groupRows = [], openFilePathsByPid = new Map()) {
   if (!info?.command || !/\bmcp gateway run\b/.test(info.command)) return null;
   const profile = extractCommandOption(info.command, '--profile') || 'default';
   const rawPort = extractCommandOption(info.command, '--port');
   const port = rawPort && /^\d+$/.test(rawPort) ? Number(rawPort) : null;
+  const groupPids = groupRows.length ? groupRows.map((row) => row.pid) : [info.pid];
   return {
     ...info,
     profile,
     port,
-    macManagedOrphan: groupRows.some((row) => row.command === 'tail -f /dev/null')
+    macManagedOrphan: groupPids.some((groupPid) =>
+      processHoldsFileOpen(openFilePathsByPid, groupPid, dockerMcpGatewayLogFile)
+    )
   };
+}
+
+// Which of these PIDs hold `filePath` open. One `lsof` call for the file, so a
+// process that cannot be inspected simply does not match.
+async function pidsHoldingFileOpen(filePath, pids) {
+  if (!pids.length) return new Map();
+  const result = await run('lsof', ['-nP', '-t', '--', filePath], { timeoutMs: 3000 });
+  const holders = new Set(
+    result.stdout
+      .split('\n')
+      .map((line) => Number(line.trim()))
+      .filter((pid) => Number.isInteger(pid) && pid > 0)
+  );
+  const byPid = new Map();
+  for (const pid of pids) {
+    if (holders.has(pid)) byPid.set(pid, new Set([filePath]));
+  }
+  return byPid;
 }
 
 async function processRowsForPid(pid) {
@@ -1577,7 +1672,11 @@ async function dockerMcpGatewayListenerProcess(port) {
   const [info] = await processRowsForPid(pid);
   if (!info) return null;
   const groupRows = await processRowsForGroup(info.pgid);
-  return parseDockerMcpGatewayProcess(info, groupRows);
+  const openFilePathsByPid = await pidsHoldingFileOpen(
+    dockerMcpGatewayLogFile,
+    (groupRows.length ? groupRows : [info]).map((row) => row.pid)
+  );
+  return parseDockerMcpGatewayProcess(info, groupRows, openFilePathsByPid);
 }
 
 async function dockerMcpGatewayProfileConflict(env, currentStatus) {
@@ -1604,21 +1703,90 @@ async function terminateProcessGroupWithGrace(pgid, graceMs = SERVICE_STOP_GRACE
   return { ok, escalated: true, pgid };
 }
 
-async function terminateDockerMcpGatewayGroup(pgid) {
-  return terminateProcessGroupWithGrace(pgid, 2000);
+function dockerMcpGatewayGroupMatchesMetadata(pid, metadata, rows) {
+  if (!metadata || typeof metadata !== 'object' || Number(metadata.pid) !== pid) return false;
+  const port = Number(metadata.port);
+  const profile = typeof metadata.profile === 'string' ? metadata.profile : '';
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !dockerMcpProfilePattern.test(profile)) {
+    return false;
+  }
+  return rows.some(
+    (row) =>
+      /\bmcp gateway run\b/.test(row.command) &&
+      extractCommandOption(row.command, '--port') === String(port) &&
+      (extractCommandOption(row.command, '--profile') || 'default') === profile
+  );
+}
+
+async function dockerMcpGatewayGroupIsOwned(pid, metadata) {
+  const current = await dockerMcpGatewayMetadata();
+  if (
+    dockerMcpGatewayGeneration(current) !== dockerMcpGatewayGeneration(metadata) ||
+    Number(current?.pid) !== Number(metadata?.pid) ||
+    Number(metadata?.pid) !== pid
+  ) {
+    return false;
+  }
+  const rows = await processGroupRowsForPid(pid);
+  if (!dockerMcpGatewayGroupMatchesMetadata(pid, metadata, rows)) return false;
+  const openFiles = await pidsHoldingFileOpen(
+    dockerMcpGatewayLogFile,
+    rows.map((row) => row.pid)
+  );
+  return rows.some((row) => openFiles.has(row.pid));
+}
+
+async function terminateDockerMcpGatewayGroup(pgid, metadata) {
+  if (!(await dockerMcpGatewayGroupIsOwned(pgid, metadata))) {
+    return { ok: false, escalated: false, pgid, refusedSignal: true };
+  }
+  signalProcessGroup(pgid, 'SIGTERM');
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (!processAlive(pgid) && !processGroupAlive(pgid)) {
+      return { ok: true, escalated: false, pgid };
+    }
+    await wait(200);
+  }
+  // Revalidate immediately before escalation. If the old group exited and this numeric PGID now
+  // belongs to a successor, refusing SIGKILL is safer than treating the number as ownership.
+  if (!(await dockerMcpGatewayGroupIsOwned(pgid, metadata))) {
+    return { ok: false, escalated: false, pgid, refusedSignal: true };
+  }
+  signalProcessGroup(pgid, 'SIGKILL');
+  await wait(500);
+  const ok = !processAlive(pgid) && !processGroupAlive(pgid);
+  return { ok, escalated: true, pgid };
 }
 
 async function stopDockerMcpGateway() {
-  const pid = await readPid(dockerMcpGatewayPidFile);
+  const metadata = await dockerMcpGatewayMetadata();
+  const pid = Number.isInteger(Number(metadata?.pid)) ? Number(metadata.pid) : null;
   if (!pid) {
-    return { skipped: true, reason: 'No Mac-managed Docker MCP Gateway pid file.' };
+    return { skipped: true, reason: 'No Mac-managed Docker MCP Gateway ownership record.' };
   }
   if (!processAlive(pid) && !processGroupAlive(pid)) {
-    await rm(dockerMcpGatewayPidFile, { force: true });
-    await rm(dockerMcpGatewayMetaFile, { force: true });
+    await removeDockerMcpGatewayOwnershipIfCurrent(metadata);
     return { skipped: true, reason: 'Mac-managed Docker MCP Gateway was not running.' };
   }
-  const stopped = await terminateDockerMcpGatewayGroup(pid);
+  const rows = await processGroupRowsForPid(pid);
+  const commandMatches = dockerMcpGatewayGroupMatchesMetadata(pid, metadata, rows);
+  const openFiles = commandMatches
+    ? await pidsHoldingFileOpen(
+        dockerMcpGatewayLogFile,
+        rows.map((row) => row.pid)
+      )
+    : new Map();
+  const holdsManagedLog = rows.some((row) => openFiles.has(row.pid));
+  if (!commandMatches || !holdsManagedLog) {
+    await removeDockerMcpGatewayOwnershipIfCurrent(metadata);
+    const reason =
+      `Docker MCP Gateway pid ${pid} no longer matches its launch metadata and managed log ` +
+      '(likely pid reuse); refused to kill the process group and removed stale pid metadata.';
+    await supervisorLog('stop', reason);
+    return { skipped: true, reason, pid, commands: rows.map((row) => row.command) };
+  }
+  const stopped = await terminateDockerMcpGatewayGroup(pid, metadata);
   if (!stopped.ok) {
     return {
       skipped: false,
@@ -1627,9 +1795,35 @@ async function stopDockerMcpGateway() {
       error: 'Mac-managed Docker MCP Gateway did not stop.'
     };
   }
-  await rm(dockerMcpGatewayPidFile, { force: true });
-  await rm(dockerMcpGatewayMetaFile, { force: true });
+  await removeDockerMcpGatewayOwnershipIfCurrent(metadata);
   return { skipped: false, ok: true, pid };
+}
+
+// `bash` arguments that run `command` with an stdin that never reaches
+// end-of-file, leaving exactly one process that ends when the command ends.
+//
+// Why this exists: `docker mcp gateway run --transport streaming` exits after
+// the first real MCP client request if its stdin is closed, so a detached
+// launch has to hold stdin open. This used to be
+// `bash -c 'tail -f /dev/null | docker "$@"'`. `tail -f /dev/null` never
+// writes, so it never takes SIGPIPE when docker exits: the wrapper shell then
+// waits on it forever and the pair survives as an orphan. Opening a FIFO
+// read-write instead means the process holds its own stdin's write end, so
+// reads block forever and never hit EOF — the same thing `tail` provided,
+// with no helper process. `exec` then replaces the shell, so `child.pid` is the
+// real command and it stays the process-group leader of a detached spawn.
+//
+// Shell-side twin, with the mutation-checked test: `batshit_start_with_held_stdin`
+// in the dev launchers' process-lifecycle library (F-P7-13).
+function heldStdinSpawnArgs(command, args = []) {
+  const script = [
+    'stdin_dir="$(mktemp -d "${TMPDIR:-/tmp}/batshit-mcp-gateway-stdin.XXXXXX")" || exit 1',
+    'mkfifo "${stdin_dir}/stdin" || { rm -rf "${stdin_dir}"; exit 1; }',
+    'exec 3<>"${stdin_dir}/stdin" || { rm -rf "${stdin_dir}"; exit 1; }',
+    'rm -rf "${stdin_dir}"',
+    'exec "$@" <&3'
+  ].join('\n');
+  return ['-c', script, '_', command, ...args];
 }
 
 async function startDetachedDockerMcpGateway(env) {
@@ -1646,7 +1840,7 @@ async function startDetachedDockerMcpGateway(env) {
     { flag: 'a' }
   );
   const log = await open(dockerMcpGatewayLogFile, 'a');
-  const child = spawn('bash', ['-c', 'tail -f /dev/null | docker "$@"', '_', ...args], {
+  const child = spawn('bash', heldStdinSpawnArgs('docker', args), {
     cwd: paths.data,
     env: {
       ...envObject(env),
@@ -1657,12 +1851,13 @@ async function startDetachedDockerMcpGateway(env) {
   });
   child.unref();
   await log.close();
-  await writeFile(dockerMcpGatewayPidFile, `${child.pid}\n`);
+  const metadataTemp = `${dockerMcpGatewayMetaFile}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   await writeFile(
-    dockerMcpGatewayMetaFile,
+    metadataTemp,
     `${JSON.stringify(
       {
         pid: child.pid,
+        generation: randomBytes(16).toString('hex'),
         port,
         profile,
         url: dockerMcpGatewayUrl(env),
@@ -1672,6 +1867,9 @@ async function startDetachedDockerMcpGateway(env) {
       2
     )}\n`
   );
+  await rename(metadataTemp, dockerMcpGatewayMetaFile);
+  // Compatibility/diagnostic projection only. Ownership decisions read the atomic metadata.
+  await writeFile(dockerMcpGatewayPidFile, `${child.pid}\n`);
   return child.pid;
 }
 
@@ -2385,17 +2583,13 @@ function voiceRuntimeStateRoot(env = null) {
   return join(homedir(), '.batshit', 'runtime', 'voice-engines');
 }
 
-function launchRecordMatchesCommand(record, commandLine) {
-  // cwd matters: shell-style launches record a bare command ("npm"), but every
-  // process in the runtime's tree carries the absolute install path in its argv.
-  const absoluteCandidates = [
-    record.command,
-    record.cwd,
-    ...(Array.isArray(record.args) ? record.args : [])
-  ].filter((value) => typeof value === 'string' && value.startsWith('/'));
-  if (absoluteCandidates.some((candidate) => commandLine.includes(candidate))) return true;
-  const base = typeof record.command === 'string' ? record.command.split('/').pop() : '';
-  return Boolean(base) && commandLine.includes(base);
+// Which Batshit launched a local runtime: this packaged app, named by its data folder (stable
+// across runs, so what a crashed run left is still this app's to stop). The app stamps it on
+// every launch record (`BATSHIT_VOICE_RUNTIME_OWNER`), and this supervisor stops only its own
+// launches, unmarked ones (written before launches were marked), and those of a native run
+// whose launcher is gone. It never stops what a running native lane launched.
+function macVoiceRuntimeOwner() {
+  return `mac-app:${paths.data}`;
 }
 
 function processGroupMatchesFragments(rows, fragments = []) {
@@ -2414,64 +2608,125 @@ async function processGroupMatchesTrackedEntry(entry, pgid) {
   return { rows, matches };
 }
 
-async function readLocalRuntimeLaunchRecords(env = null) {
-  const root = voiceRuntimeStateRoot(env);
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-  const records = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const recordPath = join(root, entry.name, LOCAL_RUNTIME_LAUNCH_RECORD_NAME);
-    const raw = await readFile(recordPath, 'utf8').catch(() => '');
-    if (!raw) continue;
-    try {
-      records.push({ engineId: entry.name, ...JSON.parse(raw), recordPath });
-    } catch {
-      records.push({ engineId: entry.name, invalid: true, recordPath });
+// "Local runtime "chatterbox-turbo"", or, for one process several engines use,
+// "Local runtime "chatterbox-turbo" (shared with "kokoro")". The engine whose
+// launch started the process is named first.
+function localRuntimeLabel(records) {
+  const starter = records.find((record) => !record.startedBy) ?? records[0];
+  const others = records.filter((record) => record !== starter).map((record) => `"${record.engineId}"`);
+  return `Local runtime "${starter.engineId}"${others.length ? ` (shared with ${others.join(', ')})` : ''}`;
+}
+
+// One PROCESS, start to finish, with every record that names it (engines sharing a runtime, or a
+// launch moved aside for a newer one). Detached runtimes lead their own process group (pgid ==
+// launch pid). The pid-reuse guard is the group leader's start time against each record's launch
+// time, then the members' command lines (`readLocalRuntimeProcessGroup`, one whole-table `ps`), so
+// a reused pid never takes down an innocent process. Answers this process's results.
+async function stopOneManagedLocalRuntime({ pid, records }) {
+  const results = [];
+  // One process's trouble (a record folder that cannot be locked or changed) never stops the
+  // rest of the quit: this runs inside the ordered stop, where a throw would skip Redis.
+  try {
+    const alive = processAlive(pid) || processGroupAlive(pid);
+    const group = alive ? await readLocalRuntimeProcessGroup(pid) : { commandLines: [], leaderStartedAtMs: null };
+    const decision = decideLocalRuntimeGroupStop({
+      records,
+      alive,
+      commandLines: group ? group.commandLines : null,
+      leaderStartedAtMs: group ? group.leaderStartedAtMs : null,
+      owner: macVoiceRuntimeOwner(),
+      ownerIsGone: nativeRunIsGone
+    });
+
+    for (const record of decision.stale) {
+      await removeLocalRuntimeLaunchRecord(record);
+      if (decision.action === 'stop' || decision.action === 'keep-running') {
+        await supervisorLog(
+          'stop',
+          `Local runtime "${record.engineId}" pid ${pid} is no longer the process its launch record names (a reused pid); removed that record.`
+        );
+      }
     }
+    const live = records.filter((record) => !decision.stale.includes(record));
+    const label = localRuntimeLabel(live.length ? live : records);
+
+    if (decision.action === 'drop-records') {
+      for (const record of records) {
+        results.push({
+          engineId: record.engineId,
+          skipped: true,
+          reason: `${label} ${decision.reason}; removed its launch record.`
+        });
+      }
+      return results;
+    }
+
+    // Refused (pid reuse), or the command line could not be read: nothing is
+    // killed. An unverified process keeps its record for the next quit.
+    if (decision.action === 'refuse' || decision.action === 'unverified') {
+      const reason = `${label} ${decision.reason}.`;
+      await supervisorLog('stop', reason);
+      for (const record of records) results.push({ engineId: record.engineId, skipped: true, reason });
+      return results;
+    }
+
+    // "Stop with Batshit" is off for an engine that uses this process: the user
+    // asked for it to keep running. Leave the process AND its launch records
+    // alone, so the next quit still knows which process this is and what the
+    // user chose.
+    if (decision.action === 'keep-running') {
+      const reason = `${label} left running: ${decision.reason}.`;
+      await supervisorLog('stop', reason);
+      for (const record of live) {
+        results.push({ engineId: record.engineId, skipped: true, keptRunning: true, reason });
+      }
+      return results;
+    }
+
+    const stopped = await terminateProcessGroupWithGrace(pid);
+    if (!stopped.ok) {
+      const error = `${label} (pgid ${pid}) did not stop after SIGKILL.`;
+      await supervisorLog('stop', error);
+      for (const record of live) results.push({ engineId: record.engineId, ok: false, pid, error });
+      return results;
+    }
+    for (const record of live) await removeLocalRuntimeLaunchRecord(record);
+    await supervisorLog('stop', `Stopped ${label} (pgid ${pid}).`);
+    for (const record of live) {
+      results.push({ engineId: record.engineId, ok: true, pid, escalated: stopped.escalated });
+    }
+    return results;
+  } catch (error) {
+    const reason = `Local runtime (pgid ${pid}) could not be handled: ${normalizeError(error)}.`;
+    await supervisorLog('stop', reason);
+    return records.map((record) => ({ engineId: record.engineId, ok: false, pid, error: reason }));
   }
-  return records;
 }
 
 async function stopManagedLocalRuntimes(env = null) {
   const results = [];
-  for (const record of await readLocalRuntimeLaunchRecords(env)) {
-    const label = `Local runtime "${record.engineId}"`;
-    if (record.invalid || !Number.isInteger(record.pid) || record.pid <= 0) {
-      await rm(record.recordPath, { force: true });
-      const reason = `${label} launch record was invalid; removed it.`;
-      await supervisorLog('stop', reason);
-      results.push({ engineId: record.engineId, skipped: true, reason });
-      continue;
+  const { groups, unusable } = groupLocalRuntimeLaunchRecords(
+    await readLocalRuntimeLaunchRecords(voiceRuntimeStateRoot(env))
+  );
+
+  for (const record of unusable) {
+    const decision = decideLocalRuntimeStop({ record, alive: false });
+    try {
+      await removeLocalRuntimeLaunchRecord(record);
+    } catch (error) {
+      await supervisorLog('stop', `Local runtime "${record.engineId}": could not remove its launch record: ${normalizeError(error)}`);
     }
-    if (!processAlive(record.pid) && !processGroupAlive(record.pid)) {
-      await rm(record.recordPath, { force: true });
-      results.push({ engineId: record.engineId, skipped: true, reason: `${label} was not running.` });
-      continue;
-    }
-    // Detached runtimes lead their own process group (pgid == launch pid). Only
-    // kill when at least one current group member still matches the recorded
-    // launch command, so a reused pid never takes down an innocent process.
-    const groupRows = (await processRowsForGroup(record.pid)).filter(
-      (row) => row.pgid === record.pid
-    );
-    const matches = groupRows.some((row) => launchRecordMatchesCommand(record, row.command));
-    if (!groupRows.length || !matches) {
-      await rm(record.recordPath, { force: true });
-      const reason = `${label} pid ${record.pid} no longer matches its launch record (likely pid reuse); refused to kill it.`;
-      await supervisorLog('stop', reason);
-      results.push({ engineId: record.engineId, skipped: true, reason });
-      continue;
-    }
-    const stopped = await terminateProcessGroupWithGrace(record.pid);
-    if (!stopped.ok) {
-      const error = `${label} (pgid ${record.pid}) did not stop after SIGKILL.`;
-      await supervisorLog('stop', error);
-      results.push({ engineId: record.engineId, ok: false, pid: record.pid, error });
-      continue;
-    }
-    await rm(record.recordPath, { force: true });
-    await supervisorLog('stop', `Stopped ${label} (pgid ${record.pid}).`);
-    results.push({ engineId: record.engineId, ok: true, pid: record.pid, escalated: stopped.escalated });
+    const reason = `Local runtime "${record.engineId}" ${decision.reason}; removed its launch record.`;
+    if (record.invalid) await supervisorLog('stop', reason);
+    results.push({ engineId: record.engineId, skipped: true, reason });
+  }
+
+  // Processes are handled CONCURRENTLY (2026-09-21, BL-64), as the native launcher's helper
+  // already does: one after another, five engines held the quit (and the Dock icon) for about
+  // four seconds. Each process is independent, and record changes serialize under each engine
+  // folder's own lock.
+  for (const processResults of await Promise.all(groups.map((group) => stopOneManagedLocalRuntime(group)))) {
+    results.push(...processResults);
   }
   return results;
 }
@@ -3162,7 +3417,7 @@ async function runMonitorDaemon() {
     }
   };
 
-  const handleDeadGateway = async (state, deadPid, env) => {
+  const handleDeadGateway = async (state, deadPid, env, ownership) => {
     const now = Date.now();
     if (state.failed || now < state.nextAttemptAt) return;
     if (await markFailedIfCapped(state, now)) return;
@@ -3183,8 +3438,7 @@ async function runMonitorDaemon() {
     if (result.skipped && result.ok) {
       // An external gateway answered with the Mac runtime token; clear the stale
       // Mac-managed pid records and stop watching it.
-      await rm(dockerMcpGatewayPidFile, { force: true });
-      await rm(dockerMcpGatewayMetaFile, { force: true });
+      await removeDockerMcpGatewayOwnershipIfCurrent(ownership);
       await supervisorLog(
         'monitor',
         `${state.label} (pid ${deadPid}) died, but an external gateway is serving the port. ` +
@@ -3278,7 +3532,8 @@ async function runMonitorDaemon() {
           await handleDeadService(service, state, pid, env);
           continue;
         }
-        const pid = await readPid(dockerMcpGatewayPidFile);
+        const ownership = await dockerMcpGatewayMetadata();
+        const pid = Number.isInteger(Number(ownership?.pid)) ? Number(ownership.pid) : null;
         if (!pid) {
           await noteIssue(state, null);
           continue;
@@ -3287,7 +3542,7 @@ async function runMonitorDaemon() {
           await markAlive(state);
           continue;
         }
-        await handleDeadGateway(state, pid, env);
+        await handleDeadGateway(state, pid, env, ownership);
       } catch (error) {
         await supervisorLog(
           'monitor',
@@ -3322,17 +3577,36 @@ async function runMonitorDaemon() {
   }
 }
 
+function stopErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// Every step runs, whatever an earlier one did (bug sweep, 2026-09-18). A step that throws becomes
+// a failed result, and `stop()` reports it: under `Promise.all` one throw skipped Redis's clean
+// shutdown and the final sweep that proves nothing managed survived.
+async function containedStopStep(operation, failed = (error) => ({ ok: false, error })) {
+  try {
+    return await operation();
+  } catch (error) {
+    return failed(stopErrorMessage(error));
+  }
+}
+
 async function executeOrderedRuntimeStop(operations) {
-  const monitor = await operations.monitor();
-  const batshitApp = await operations.batshitApp();
+  const monitor = await containedStopStep(operations.monitor);
+  const batshitApp = await containedStopStep(operations.batshitApp);
+  // Docker's sbx daemon runs beside the rest, once the app is down, and nothing waits on it but the
+  // end: Redis's clean shutdown never waits behind an `sbx` call.
+  const sbxDaemonStop = containedStopStep(operations.sbxDaemon);
   const [localRuntimes, mcpProxy, batshitServer, dockerMcpGateway] = await Promise.all([
-    operations.localRuntimes(),
-    operations.mcpProxy(),
-    operations.batshitServer(),
-    operations.dockerMcpGateway()
+    containedStopStep(operations.localRuntimes, (error) => [{ ok: false, error }]),
+    containedStopStep(operations.mcpProxy),
+    containedStopStep(operations.batshitServer),
+    containedStopStep(operations.dockerMcpGateway)
   ]);
-  const redis = await operations.redis();
-  const sweep = await operations.sweep();
+  const redis = await containedStopStep(operations.redis);
+  const sweep = await containedStopStep(operations.sweep, (error) => ({ issues: [`The final sweep failed: ${error}`] }));
+  const sbxDaemon = await sbxDaemonStop;
   return {
     monitor,
     batshitApp,
@@ -3340,9 +3614,30 @@ async function executeOrderedRuntimeStop(operations) {
     mcpProxy,
     batshitServer,
     dockerMcpGateway,
+    sbxDaemon,
     redis,
     sweep
   };
+}
+
+// Docker's sbx daemon, only when this app's own `sbx` call started it and no sandbox runs
+// (2026-09-21, BL-61; `sbx-daemon-stop.mjs`). The app writes the record, so it runs after the app
+// has stopped: nothing can start another sandbox behind it.
+async function stopSbxDaemonStartedByThisApp(env = null) {
+  const configured = env?.get?.('BATSHIT_SBX_DAEMON_STATE_DIR') || process.env.BATSHIT_SBX_DAEMON_STATE_DIR;
+  const result = await stopSbxDaemonIfBatshitStartedIt({
+    stateDir: resolveSbxDaemonStateDir(configured),
+    owner: macVoiceRuntimeOwner(),
+    ownerIsGone: nativeRunIsGone
+  });
+  if (result.action === 'stopped') {
+    await supervisorLog('stop', `Stopped Docker's sbx daemon (pid ${result.pid}), which this Batshit started.`);
+  } else if (result.action === 'keep' || result.action === 'unverified') {
+    await supervisorLog('stop', `Left Docker's sbx daemon running: ${result.reason}.`);
+  } else if (result.action === 'drop-record') {
+    await supervisorLog('stop', `Docker's sbx daemon: ${result.reason}; removed its record.`);
+  }
+  return result;
 }
 
 async function stop() {
@@ -3359,13 +3654,20 @@ async function stop() {
     mcpProxy: () => stopService(serviceDefinitions.mcpProxy),
     batshitServer: () => stopService(serviceDefinitions.batshitServer),
     dockerMcpGateway: stopDockerMcpGateway,
+    sbxDaemon: () => stopSbxDaemonStartedByThisApp(env),
     redis: () => stopRedis(env),
     sweep: () => sweepOrphans('stop', env, serviceDefinitions)
   });
   const ok =
-    ![results.batshitApp, results.mcpProxy, results.batshitServer, results.dockerMcpGateway, results.redis].some(
-      (result) => result && result.ok === false
-    ) &&
+    ![
+      results.monitor,
+      results.batshitApp,
+      results.mcpProxy,
+      results.batshitServer,
+      results.dockerMcpGateway,
+      results.sbxDaemon,
+      results.redis
+    ].some((result) => result && result.ok === false) &&
     !results.localRuntimes.some((result) => result.ok === false) &&
     results.sweep.issues.length === 0;
   return { ok, stopped: results, status: await status() };
@@ -3516,6 +3818,7 @@ async function packageAudit(packagePath) {
     'Contents/Resources/THIRD_PARTY_NOTICES.md',
     'Contents/Resources/scripts/hair-catalog-package-contract.mjs',
     'Contents/Resources/scripts/managed-runtime-portability.mjs',
+    'Contents/Resources/scripts/ffmpeg-runtime-capabilities.mjs',
     'Contents/Resources/runtime/vendor/node/bin/node',
     'Contents/Resources/runtime/vendor/node/bin/npm',
     'Contents/Resources/runtime/vendor/node/bin/npx',
@@ -3534,7 +3837,9 @@ async function packageAudit(packagePath) {
     'Contents/Resources/runtime/vendor/redis/share/openssl/SOURCE.txt',
     'Contents/Resources/runtime/vendor/redis/share/openssl/CHECKSUMS.txt',
     'Contents/Resources/runtime/vendor/ffmpeg/bin/ffmpeg',
+    'Contents/Resources/runtime/vendor/ffmpeg/bin/ffprobe',
     'Contents/Resources/runtime/vendor/ffmpeg/BUILD-CONFIG.txt',
+    ...DAV1D_PROOF_FILES.map((path) => `Contents/Resources/runtime/vendor/ffmpeg/${path}`),
     'Contents/Resources/runtime/batshit-app/package.json',
     'Contents/Resources/runtime/batshit-app/build/index.js',
     'Contents/Resources/runtime/runtime-manifest.json',
@@ -3938,6 +4243,10 @@ async function packageAudit(packagePath) {
   runtimeAssetIssues.push(
     ...(await auditManagedNodeRuntime(join(managedRuntimeRoot, 'node')))
   );
+  const ffmpegCapabilities = await inspectFfmpegRuntimeCapabilities(join(managedRuntimeRoot, 'ffmpeg'), {
+    allowGpl: process.env.BATSHIT_MAC_ALLOW_GPL_FFMPEG === '1'
+  });
+  runtimeAssetIssues.push(...ffmpegCapabilities.issues);
 
   const mainExecutable = join(realTarget, 'Contents', 'MacOS', 'Batshit');
   const managedNodeExecutable = join(managedRuntimeRoot, 'node', 'bin', 'node');
@@ -3967,7 +4276,8 @@ async function packageAudit(packagePath) {
     for (const [label, executable] of [
       ['Electron main executable', mainExecutable],
       ['Redis executable', join(managedRuntimeRoot, 'redis', 'bin', 'redis-server')],
-      ['FFmpeg executable', join(managedRuntimeRoot, 'ffmpeg', 'bin', 'ffmpeg')]
+      ['FFmpeg executable', join(managedRuntimeRoot, 'ffmpeg', 'bin', 'ffmpeg')],
+      ['FFprobe executable', join(managedRuntimeRoot, 'ffmpeg', 'bin', 'ffprobe')]
     ]) {
       if (entitlementText(executable).includes('com.apple.security.cs.disable-library-validation')) {
         runtimeAssetIssues.push(
@@ -4111,6 +4421,17 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
 
 export {
   auditElectronPackage,
+  heldStdinSpawnArgs,
+  parseDockerMcpGatewayProcess,
+  dockerMcpGatewayGroupMatchesMetadata,
+  removeDockerMcpGatewayOwnershipIfCurrent,
+  pidsHoldingFileOpen,
+  startDetachedDockerMcpGateway,
+  stopDockerMcpGateway,
+  dockerMcpGatewayStatus,
+  dockerMcpGatewayListenerProcess,
+  dockerMcpGatewayLogFile,
+  dockerMcpGatewayPidFile,
   auditManagedNodeRuntime,
   attemptSafeRedisShutdown,
   cleanupAbandonedRedisTempSnapshots,
@@ -4122,5 +4443,7 @@ export {
   isRedisTempSnapshotName,
   parseRedisInfo,
   publishJsonAtomically,
-  redisStatusProvesStopped
+  redisStatusProvesStopped,
+  stopManagedLocalRuntimes,
+  stopSbxDaemonStartedByThisApp
 };

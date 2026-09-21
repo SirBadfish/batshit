@@ -166,7 +166,9 @@ describe('slash command bootstrap system skills', () => {
     expect(command.invocation_pattern).toBe('/batshit-guide')
     expect(command.is_system).toBe(true)
     expect(command.icon_ref).toEqual({ kind: 'lucide', id: 'book-open' })
-    expect(command.enabled_for_all_agents).toBe(false)
+    // BL-69 (Josh, 2026-09-21): a new install starts Batshit Guide on for all agents.
+    expect(command.enabled_for_all_agents).toBe(true)
+    expect(command.can_be_attached_to_agents).toBe(true)
     expect(command.enabled_agent_ids).toEqual([])
     const upsertInput = upsertSkillMock.mock.calls[0]?.[0]
     expect(upsertInput).toEqual(
@@ -181,6 +183,59 @@ describe('slash command bootstrap system skills', () => {
     expect(toPosixPath(upsertInput?.skill?.sourceRef)).toContain(
       '/batshit-app/src/lib/server/system-skills/batshit-guide'
     )
+  })
+
+  it('starts only Artifact Creator and Batshit Guide on for all agents on a new install (BL-69)', async () => {
+    const services = await import('$lib/server/services/systemSlashCommands')
+    const now = '2026-09-21T12:00:00.000Z'
+
+    const onByDefault = [
+      await services.buildUnifiedArtifactSkillCommand('user-1', now),
+      await services.buildBatshitGuideSkillCommand('user-1', now)
+    ]
+    for (const command of onByDefault) {
+      expect(command.enabled_for_all_agents).toBe(true)
+      expect(command.enabled_agent_ids).toEqual([])
+      expect(command.can_be_attached_to_agents).toBe(true)
+    }
+
+    const offByDefault = [
+      await services.buildSkillCreatorSkillCommand('user-1', now),
+      await services.buildSpeechSetupSkillCommand('user-1', now),
+      await services.buildCliToolsSkillCommand('user-1', now),
+      await services.buildGoonSceneCreatorSkillCommand('user-1', now)
+    ]
+    for (const command of offByDefault) {
+      expect(command.enabled_for_all_agents).toBe(false)
+      expect(command.enabled_agent_ids).toEqual([])
+      expect(command.can_be_attached_to_agents).toBe(false)
+    }
+  })
+
+  it('keeps the agent access of an existing record, even an empty one (BL-69)', async () => {
+    const services = await import('$lib/server/services/systemSlashCommands')
+    const now = '2026-09-21T12:00:00.000Z'
+
+    // The old default and a deliberate "no agents" look the same on disk, so neither is migrated.
+    const keptOff = await services.buildUnifiedArtifactSkillCommand('user-1', now, {
+      id: 'artifact-creator',
+      type: 'skill',
+      enabled_for_all_agents: false,
+      enabled_agent_ids: []
+    } as any)
+    expect(keptOff.enabled_for_all_agents).toBe(false)
+    expect(keptOff.enabled_agent_ids).toEqual([])
+    expect(keptOff.can_be_attached_to_agents).toBe(false)
+
+    const keptSelected = await services.buildBatshitGuideSkillCommand('user-1', now, {
+      id: 'batshit-guide',
+      type: 'skill',
+      enabled_for_all_agents: false,
+      enabled_agent_ids: ['agent-a', 'agent-a', ' agent-b ']
+    } as any)
+    expect(keptSelected.enabled_for_all_agents).toBe(false)
+    expect(keptSelected.enabled_agent_ids).toEqual(['agent-a', 'agent-b'])
+    expect(keptSelected.can_be_attached_to_agents).toBe(true)
   })
 
   it('rebuilds system slash commands when backing skill records are missing', async () => {

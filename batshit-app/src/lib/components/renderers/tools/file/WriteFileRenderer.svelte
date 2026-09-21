@@ -4,10 +4,21 @@
 	import type { ToolData } from '../toolRendererRegistry'
 	import { getLanguageFromPath } from '$lib/utils/languageDetection'
 	import { countTextLines, extractWriteContentFromSources } from '$lib/utils/writePreview'
+	import { failedCommandExitCode } from '$lib/utils/toolActivityContract'
 	import PrismCodeBlock from '$lib/components/renderers/shared/PrismCodeBlock.svelte'
 	import { FileEdit } from '@lucide/svelte'
-	
+
 	let { tool }: { tool: ToolData } = $props()
+	// A shell write that failed keeps its exit code and what it printed (F-P6-5). Like the Bash
+	// card, a non-zero exit code makes this card an error even when the step itself reported none.
+	let failedExitCode = $derived(failedCommandExitCode(tool.toolResult))
+	let failed = $derived(failedExitCode !== undefined || !tool.success)
+	let errorHeadline = $derived(
+		tool.error || (failedExitCode !== undefined ? `Command exited with code ${failedExitCode}` : '')
+	)
+	let commandOutput = $derived(
+		typeof tool.toolResult?.commandOutput === 'string' ? tool.toolResult.commandOutput : ''
+	)
 
 	// Extract file info from input AND result (batshit-server returns it in result too)
 	let filePath = $derived(
@@ -75,14 +86,23 @@
 				: 0
 	)
 
-	// Build metadata
-	let metadata = $derived({
-		'File Path': filePath,
-		'Lines Written': lineCount.toLocaleString(),
-		'Size': formatFileSize(fileSize),
-		'Language': language || 'Plain Text',
-		...(tool.metadata?.executionTime && { 'Write Time': `${tool.metadata.executionTime}ms` })
-	})
+	// Build metadata (a failed write wrote nothing, so it has no lines or size to report)
+	let metadata = $derived(
+		failed
+			? {
+					'File Path': filePath,
+					...(failedExitCode !== undefined ? { 'Exit Code': failedExitCode } : {}),
+					'Result': 'Not written',
+					...(errorHeadline ? { 'Reason': errorHeadline } : {})
+				}
+			: {
+					'File Path': filePath,
+					'Lines Written': lineCount.toLocaleString(),
+					'Size': formatFileSize(fileSize),
+					'Language': language || 'Plain Text',
+					...(tool.metadata?.executionTime && { 'Write Time': `${tool.metadata.executionTime}ms` })
+				}
+	)
 	
 	function formatFileSize(bytes: number): string {
 		if (bytes < 1024) return `${bytes} B`
@@ -95,25 +115,25 @@
 <FullTool
 	icon={FileEdit}
 	title={rendererTitle}
-	subtitle="{subtitleTarget} • {lineCount} lines written"
-	status={tool.success ? 'success' : 'error'}
+	subtitle={failed ? `${subtitleTarget} • not written` : `${subtitleTarget} • ${lineCount} lines written`}
+	status={failed ? 'error' : 'success'}
 	{metadata}
 	duration={tool.metadata?.executionTime}
-	error={tool.error}
+	error={[errorHeadline, commandOutput].filter(Boolean).join('\n') || undefined}
 >
 <!-- Use PrismCodeBlock directly like ReadFileRenderer -->
 	<div class="file-content-wrapper">
-		{#if fileContent && tool.success}
-			<PrismCodeBlock 
+		{#if fileContent && !failed}
+			<PrismCodeBlock
 				content={fileContent}
 				language={language || 'text'}
 				showCopyButton={true}
 				showLineNumbers={true}
 			/>
-		{:else if tool.error}
+		{:else if failed}
 			<div class="error-container">
 				<div class="error-message">
-					Failed to write file: {tool.error}
+					Failed to write file{errorHeadline ? `: ${errorHeadline}` : ''}
 				</div>
 			</div>
 		{:else}

@@ -19,7 +19,7 @@ Don't assume every provider supports every lane. A provider can transcribe uploa
 - **Browser STT** is the free, default, browser-dependent voice input lane.
 - **Deepgram Flux** is the first launch-supported cloud realtime STT Voice Mode lane, when a Deepgram key with the right permissions is configured.
 - **Fish Audio and Inworld** are Batshit's direct realtime TTS providers, when the matching API key and voice are configured.
-- OpenAI, Deepgram, Fish, MiniMax, MiMo, Alibaba Cloud, Inworld, Cartesia, Async, StepFun, Azure Speech, and other cloud lanes can also handle recorded/uploaded-audio transcription or batch speech where the provider supports it.
+- Google Gemini 3.5 Transcribe, OpenAI, Deepgram, Fish, Mistral, ElevenLabs, and proven BYO engines can handle recorded/uploaded-audio transcription where supported. Deepgram's Aura and Flux voices are both available for batch speech, but Flux's separate WebSocket conversation/interrupt path is not yet a Batshit realtime-TTS lane.
 - OpenAI, ElevenLabs, and Mistral realtime STT models are tracked as future live bridge candidates, but they are not launch-supported realtime microphone lanes until Batshit proves the full live transport path for each one.
 - Fish recorded/uploaded-audio ASR is supported, but Fish isn't a realtime microphone STT lane.
 

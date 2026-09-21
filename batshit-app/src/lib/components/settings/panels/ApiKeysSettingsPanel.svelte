@@ -118,6 +118,16 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     iconRef: { kind: 'brand', slug: 'moonshot-mono' }
   },
   {
+    id: 'kimi_code',
+    label: 'Kimi Code Membership',
+    description:
+      'Separate Kimi Code membership key for K3 and coding models. This does not use Moonshot pay-as-you-go balance.',
+    scope: 'provider',
+    connectionHint: 'Subscription',
+    docsUrl: 'https://www.kimi.com/code/docs/en/kimi-code/models.html',
+    iconRef: { kind: 'brand', slug: 'kimi-color' }
+  },
+  {
     id: 'minimax',
     label: 'MiniMax',
     description: 'MiniMax M-series chat models plus MiniMax cloud text-to-speech.',
@@ -127,12 +137,32 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     iconRef: { kind: 'brand', slug: 'minimax-color' }
   },
   {
+    id: 'minimax_token_plan',
+    label: 'MiniMax Token Plan',
+    description:
+      'Separate sk-cp subscription key for interactive M3/M2.7 use. Eligible MiniMax speech uses this quota before pay-as-you-go when both keys are saved.',
+    scope: 'provider',
+    connectionHint: 'Subscription',
+    docsUrl: 'https://platform.minimax.io/subscribe/token-plan',
+    iconRef: { kind: 'brand', slug: 'minimax-color' }
+  },
+  {
     id: 'mimo',
     label: 'MiMo',
     description: 'Xiaomi MiMo V2.5 chat models plus MiMo V2.5 text-to-speech.',
     scope: 'provider',
     connectionHint: 'Direct',
     docsUrl: 'https://mimo.mi.com/docs/en-US/api/chat/openai-api',
+    iconRef: { kind: 'brand', slug: 'mimo-color' }
+  },
+  {
+    id: 'mimo_token_plan',
+    label: 'MiMo Token Plan',
+    description:
+      'Separate tp- subscription key for MiMo V2.5 chat, ASR, and TTS. Batshit defaults to the Singapore plan endpoint.',
+    scope: 'provider',
+    connectionHint: 'Subscription',
+    docsUrl: 'https://mimo.mi.com/docs/en-US/tokenplan/Token%20Plan/quick-access',
     iconRef: { kind: 'brand', slug: 'mimo-color' }
   },
   {
@@ -326,6 +356,16 @@ const SERVICES: ApiKeyServiceDefinition[] = [
     connectionHint: 'Direct',
     docsUrl: 'https://docs.exa.ai/reference/search',
     iconRef: { kind: 'brand', slug: 'exa-color' }
+  },
+  {
+    id: 'typesafe',
+    label: 'TypeSafe (Jev Juice)',
+    description:
+      'Powers Jev Juice: fast typed judgments from TypeSafe\u2019s Jev model. Only Jev Juice features you turn on use it, and each one says what text it sends. Test sends Jev one fixed sample question and never your chats. Turn Jev Juice on in Settings \u2192 Admin.',
+    scope: 'provider',
+    connectionHint: 'Direct',
+    docsUrl: 'https://console.typesafe.ai',
+    iconRef: { kind: 'lucide', id: 'zap' }
   },
   {
     id: 'perplexity',
@@ -611,9 +651,12 @@ const GROUPS: ApiKeyGroup[] = [
       'luma',
       'inworld',
       'minimax',
+      'minimax_token_plan',
       'mimo',
+      'mimo_token_plan',
       'mistral',
       'moonshot',
+      'kimi_code',
       'openai',
       'openrouter',
       'perplexity',
@@ -622,6 +665,7 @@ const GROUPS: ApiKeyGroup[] = [
       'replicate',
       'stepfun',
       'togetherai',
+      'typesafe',
       'xai',
       'ai_gateway',
       'zai_coding',

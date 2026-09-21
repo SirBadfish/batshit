@@ -11,7 +11,10 @@ import {
 import { ArtifactsService, type ArtifactRecord } from '$lib/server/artifacts/artifactsService'
 import { isArtifactAgentUseEligible } from '$lib/artifacts/agentUseEligibility'
 import { importSkillDefinition, toImportErrorResponse, type SkillImportInput } from './skillImport'
-import { upsertSkill } from './skillRegistry'
+import { buildSkillScreenWarning, screenImportedSkill } from './skillImportScreen'
+import { buildUntrustedTextAdvisory } from './untrustedText.jev'
+import { normalizeSkillId, skillRecordExists, upsertSkill } from './skillRegistry'
+import { commandEnabledForAgent } from './slashCommandCapabilities'
 import { env } from '$env/dynamic/private'
 import { apiKeyService } from '$lib/services/apiKey.server'
 import {
@@ -75,6 +78,7 @@ import {
   sendDmOp,
   type DmToolContext
 } from '$lib/server/services/dm/dmTools'
+import { JudgeAskError, judgeAskOp } from './judgeAsk.jev'
 import {
   createScheduleOp,
   deleteScheduleOp,
@@ -1883,6 +1887,81 @@ const CADENCE_SCHEMA_JSON = {
   required: ['type']
 }
 
+// ---------------------------------------------------------------------------
+// SA-120 P2: the Jev Juice judgment tool (`sys.judge.ask`).
+//
+// Gating copies `sys.dm.*`: `safe`, PRIMARY actors only, broker exposure per agent on
+// `jev_juice_judge_tool` through `resolveBrokerFabricAllowedControlIds`, explicit false at
+// every subagent and Worker site. `actsAsAgent` is FALSE on purpose: the handler reads
+// nothing the agent owns — it checks the agent's switch and forwards the agent's own
+// `state` and `questions` to TypeSafe on the user's key. Results stay zip-first (the
+// generic tool card shows the answers; DL-120-07's Execution Viewer row is appended by
+// the op to the running assistant message's snapshot).
+// ---------------------------------------------------------------------------
+
+async function runJudgeControl<T extends Record<string, any>>(operation: () => Promise<T>): Promise<Record<string, any>> {
+  try {
+    return await operation()
+  } catch (error) {
+    if (error instanceof JudgeAskError) {
+      throw new Error(error.hint ? `${error.message} | fix: ${error.hint}` : error.message)
+    }
+    throw error
+  }
+}
+
+const judgeAskControlSchema = z
+  .object({
+    state: z.unknown(),
+    questions: z.record(z.string(), z.unknown()),
+    model: z.string().trim().min(1).optional()
+  })
+  .passthrough()
+
+const JUDGE_CONTROL_DEFINITIONS: ControlDefinition[] = [
+  {
+    controlId: 'sys.judge.ask',
+    sourceType: 'core',
+    executorType: 'internal_handler',
+    title: 'Ask Jev Juice',
+    description:
+      'Hand a piece of text or JSON (state) and a map of typed questions to TypeSafe\'s Jev, a fast non-generative judgment model, and get calibrated probabilities back in about a quarter of a second: noul (is this true?), choice (which of these options?), score (where on these levels?). Every question is answered in parallel in one call, so ask everything at once. Jev cannot write text, run tools, or approve anything; you read the probabilities and decide. The state leaves the machine and goes to TypeSafe.',
+    inputSchema: judgeAskControlSchema,
+    inputSchemaJson: {
+      type: 'object',
+      properties: {
+        state: {
+          description: 'The material every question is judged against: a string, an object with named parts (message, policy, candidates), or an array of items tagged with short ids.'
+        },
+        questions: {
+          type: 'object',
+          description:
+            'Map of your own question ids to questions. Each is {"type":"noul","instructions":"…"} (optional criteria {true,false}), {"type":"choice","instructions":"…","criteria":{"option":"description",…}} (2-255 options; add other/none), or {"type":"score","instructions":"…","criteria":["low level","…","high level"]} (2-10 levels). Put the whole question in instructions; the id is never shown to the model. Point at parts of state with backticks.'
+        },
+        model: { type: 'string', description: 'Optional; must be the configured Jev model id (omit to use it). jev-latest is refused.' }
+      },
+      required: ['state', 'questions']
+    },
+    outputSchema: null,
+    schemaHint: 'state (string | object | array) + questions {id: {type: noul | choice | score, instructions, criteria}}; optional model',
+    riskLevel: 'safe',
+    actsAsAgent: false,
+    status: 'published',
+    tags: ['jev', 'judge', 'classify', 'rank', 'score', 'typesafe'],
+    handler: async (context, input) =>
+      runJudgeControl(() =>
+        judgeAskOp(
+          {
+            userId: context.userId,
+            agentId: typeof context.agentId === 'string' ? context.agentId : '',
+            sessionId: context.sessionId ?? null
+          },
+          input
+        )
+      )
+  }
+]
+
 const SCHEDULE_CONTROL_DEFINITIONS: ControlDefinition[] = [
   {
     controlId: 'sys.schedule.list',
@@ -2018,6 +2097,7 @@ const CONTROL_DEFINITIONS: ControlDefinition[] = [
   ...MEMORY_CONTROL_DEFINITIONS,
   ...DM_CONTROL_DEFINITIONS,
   ...SCHEDULE_CONTROL_DEFINITIONS,
+  ...JUDGE_CONTROL_DEFINITIONS,
   {
     controlId: 'sys.model_catalog.search',
     sourceType: 'core',
@@ -3253,6 +3333,10 @@ async function executeDynamicMcpUse(context: ControlExecutionContext, input: Rec
   })
 }
 
+/** BL-80: a new skill saved with no agent (a portable-skill save) is on for nobody; say so. */
+const NEW_SKILL_ON_FOR_NOBODY_NOTE =
+  'Saved, but no agent can use it yet. Turn it on in Settings -> Agents -> Access (one agent) or Settings -> Skills & Prompts (all agents).'
+
 async function executeSkillSave(context: ControlExecutionContext, input: Record<string, any>) {
   const parsed = skillSaveInputSchema.parse(input)
 
@@ -3271,28 +3355,88 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
     throw new Error('Invocation must start with "/" and use only letters, numbers, :, -, or _.')
   }
 
-  const existingEnabledAgentIds = Array.isArray(existing?.enabled_agent_ids)
-    ? existing?.enabled_agent_ids
-    : []
-  const enabledForAllAgents =
-    parsed.enabledForAllAgents ?? (existing?.enabled_for_all_agents === true)
-  const enabledAgentIds = normalizeEnabledAgentIdsForCommand(
-    parsed.enabledAgentIds ?? existingEnabledAgentIds,
-    context.agentId
-  )
-
   if (existing?.is_system === true || parsed.skill.isSystem === true || parsed.skill.source === 'system') {
     throw new Error(
       'System skills are repo-backed and cannot be saved from live Batshit. Update files under batshit-app/src/lib/server/system-skills/ from the external coding workspace instead.'
     )
   }
 
+  /**
+   * BL-75 — a save may create a skill, or update one through ITS OWN command, but it never
+   * reaches a skill that already exists through a new or repointed command. That alias would
+   * carry an access list the saving agent wrote itself, and the skill load gate allows a skill
+   * when ANY command pointing at it is enabled, so it would hand the agent a skill (a built-in
+   * one included) that is off for it. The same id is handed to `upsertSkill`, so the skill
+   * checked is the skill written.
+   */
+  const targetSkillId = normalizeSkillId(parsed.skill.id, parsed.skill.name ?? commandName)
+  const commandOwnsTargetSkill = existing?.type === 'skill' && existing.skill_id === targetSkillId
+  if (!commandOwnsTargetSkill && (await skillRecordExists(context.userId, targetSkillId))) {
+    throw new Error(
+      `Skill "${targetSkillId}" already exists and belongs to another command. Update it through its own command, or save this one under a new skill id. Who may use a skill is set in Settings -> Agents -> Access or Settings -> Skills & Prompts, never by saving it.`
+    )
+  }
+
+  /**
+   * BL-80 — an agent changes only a skill it may use. Without this, an agent could rewrite the
+   * text of a skill that is off for it (through that skill's own command), and every agent the
+   * user turned it on for would then load the agent's words. A switched-off command counts as off.
+   * A caller with no agent (a portable-skill token, the user's own tools) is not an agent here.
+   */
+  // The exact id, trimmed: the load gate and the skills list compare it unchanged, so a
+  // sanitized copy could refuse (or store) an id that is not the agent's.
+  const savingAgentId = typeof context.agentId === 'string' ? context.agentId.trim() : ''
+  if (existing && savingAgentId && !commandEnabledForAgent(existing, savingAgentId)) {
+    const label = existing.displayName || existing.name || commandId
+    throw new Error(
+      `Skill "${label}" is not on for you, so you cannot change it. Ask the user to turn it on for you in Settings -> Agents -> Access, or to edit it in Settings -> Skills & Prompts.`
+    )
+  }
+
+  /**
+   * BL-75 — who may use a skill is the USER's setting (Settings -> Agents -> Access, Settings ->
+   * Skills & Prompts), never a save's. An EXISTING command keeps its access exactly as stored (a
+   * legacy record with no `enabled_agent_ids` field keeps having none), and a command the user
+   * switched off stays off. A NEW command is on for the saving agent alone, so it can use what it
+   * just wrote; nobody else gets it until the user turns it on. `enabledForAllAgents` and
+   * `enabledAgentIds` stay in the input schema so an older caller is not refused; they are
+   * answered with `accessNote` instead of applied.
+   */
+  const newCommandAgentIds = savingAgentId ? [savingAgentId] : []
+  const requestedAgentIds = normalizeEnabledAgentIdsForCommand(parsed.enabledAgentIds, null)
+  const accessRequested = existing
+    ? parsed.enabledForAllAgents !== undefined || parsed.enabledAgentIds !== undefined
+    : parsed.enabledForAllAgents === true ||
+      (parsed.enabledAgentIds !== undefined &&
+        requestedAgentIds.join(',') !== newCommandAgentIds.join(','))
+  const enabledForAllAgents = existing ? existing.enabled_for_all_agents === true : false
+  const enabledAgentIds: string[] | undefined = existing
+    ? Object.prototype.hasOwnProperty.call(existing, 'enabled_agent_ids')
+      ? Array.isArray(existing.enabled_agent_ids)
+        ? existing.enabled_agent_ids
+        : []
+      : undefined
+    : newCommandAgentIds
+  const reactivationRequested = existing?.is_active === false && parsed.isActive === true
+  const isActive =
+    existing?.is_active === false ? false : (parsed.isActive ?? existing?.is_active ?? true)
+  const accessNote =
+    accessRequested || reactivationRequested
+      ? existing
+        ? 'Access unchanged: who may use an existing skill, and whether it is on, is the user\'s setting. Ask the user to change it in Settings -> Agents -> Access (one agent) or Settings -> Skills & Prompts (all agents).'
+        : savingAgentId
+          ? 'Saved for you only. Who else may use it is the user\'s setting: ask the user to turn it on for other agents in Settings -> Agents -> Access, or for all agents in Settings -> Skills & Prompts.'
+          : NEW_SKILL_ON_FOR_NOBODY_NOTE
+      : !existing && !savingAgentId
+        ? NEW_SKILL_ON_FOR_NOBODY_NOTE
+        : null
+
   const upsertedSkill = await upsertSkill({
     userId: context.userId,
     commandId,
     nowIso,
     skill: {
-      id: parsed.skill.id,
+      id: targetSkillId,
       name: parsed.skill.name ?? commandName,
       displayName: parsed.skill.displayName,
       description: parsed.skill.description,
@@ -3349,7 +3493,9 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
     has_references: upsertedSkill.has_references === true,
     has_assets: upsertedSkill.has_assets === true,
     invocation_pattern: invocation,
-    can_be_attached_to_agents: enabledForAllAgents || enabledAgentIds.length > 0,
+    can_be_attached_to_agents: existing
+      ? (existing.can_be_attached_to_agents ?? (enabledForAllAgents || (enabledAgentIds?.length ?? 0) > 0))
+      : enabledForAllAgents || (enabledAgentIds?.length ?? 0) > 0,
     can_be_invoked_in_chat: existing?.can_be_invoked_in_chat ?? true,
     enabled_for_all_agents: enabledForAllAgents,
     enabled_agent_ids: enabledAgentIds,
@@ -3364,10 +3510,15 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
     icon: undefined,
     usage_count: existing?.usage_count ?? 0,
     last_used_at: existing?.last_used_at,
-    is_active: parsed.isActive ?? existing?.is_active ?? true,
+    is_active: isActive,
     is_system: false,
     created_at: existing?.created_at || nowIso,
     updated_at: nowIso
+  }
+
+  if (enabledAgentIds === undefined) {
+    // A legacy record with no access field keeps having none (it reads as "on for every agent").
+    delete slashCommand.enabled_agent_ids
   }
 
   await redis.json.set(commandKey, '$', slashCommand)
@@ -3384,6 +3535,7 @@ async function executeSkillSave(context: ControlExecutionContext, input: Record<
       enabledAgentIds: slashCommand.enabled_agent_ids ?? [],
       updatedAt: slashCommand.updated_at
     },
+    ...(accessNote ? { accessNote } : {}),
     skill: {
       id: upsertedSkill.id,
       name: upsertedSkill.name,
@@ -3409,6 +3561,20 @@ async function executeSkillImport(context: ControlExecutionContext, input: Recor
     const failure = toImportErrorResponse(error)
     throw new Error(failure.message)
   })
+
+  // SA-120 P7: SKILL.md is shown to Jev once (switch off: no call, today's result). This runs
+  // AFTER the risk gate and the user's Approve click and feeds nothing back into either
+  // (DL-120-12): the skill is saved exactly as asked, and a flag only adds a warning line for
+  // the user and an advisory field for the agent.
+  const skillScreen = await screenImportedSkill({
+    userId: context.userId,
+    skill: imported.skill,
+    evidenceSessionId: context.sessionId
+  })
+  const skillScreenWarning = buildSkillScreenWarning(skillScreen)
+  const skillScreenAdvisory = buildUntrustedTextAdvisory(skillScreen)
+  const importWarnings = skillScreenWarning ? [skillScreenWarning, ...imported.warnings] : imported.warnings
+  const skillScreenFields = skillScreenAdvisory ? { jev_juice_screen: skillScreenAdvisory } : {}
 
   const saveAsCommand = parsed.saveAsCommand !== false
   if (!saveAsCommand) {
@@ -3451,7 +3617,8 @@ async function executeSkillImport(context: ControlExecutionContext, input: Recor
         standardsStatus: savedSkill.standards_status ?? 'degraded',
         trustLevel: savedSkill.trust_level ?? 'untrusted'
       },
-      warnings: imported.warnings,
+      warnings: importWarnings,
+      ...skillScreenFields,
       parsedInstallCommand: imported.parsedInstallCommand ?? null
     }
   }
@@ -3497,7 +3664,8 @@ async function executeSkillImport(context: ControlExecutionContext, input: Recor
     imported: true,
     savedAsCommand: true,
     ...saveResult,
-    warnings: imported.warnings,
+    warnings: importWarnings,
+    ...skillScreenFields,
     parsedInstallCommand: imported.parsedInstallCommand ?? null
   }
 }
@@ -3690,8 +3858,31 @@ function serializeControlError(error: unknown): { message: string; status: numbe
   return { message: 'Control execution failed.', status: null }
 }
 
+// The shared enforcement text (`buildArtifactStructureEnforcementMessage`) is user-worded for the
+// Settings save error and ends on the opt-out. An agent reading only that line turned enforcement
+// off instead of learning the structure (BL-69), so the AGENT path adds the skill step and keeps
+// the code and issues it would otherwise lose.
+export const ARTIFACT_STRUCTURE_AGENT_NEXT_STEP =
+  'Agent next step: load the Artifact Creator skill with `native_skill` (skillId `artifact_creator`) if it is listed in your skills, then rebuild the artifact with its Builder Kit and Fabric steps. If it is not listed, you cannot load it: ask the user to turn on Artifact Creator for you in Settings -> Agents -> Access (or for every agent in Settings -> Skills & Prompts). Suggest turning enforcement off only if the user asked for a raw, hand-written artifact.'
+
 function toArtifactExecutionError(error: unknown) {
   const normalized = serializeControlError(error)
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined
+  if (code === 'ARTIFACT_STRUCTURE_ENFORCED') {
+    const rawIssues = (error as { details?: { issues?: unknown } }).details?.issues
+    const issues = Array.isArray(rawIssues)
+      ? rawIssues
+          .filter((issue): issue is { code?: unknown; message?: unknown } => Boolean(issue) && typeof issue === 'object')
+          .map((issue) => ({ code: String(issue.code ?? ''), message: String(issue.message ?? '') }))
+      : []
+    return {
+      success: false,
+      error: `${normalized.message}\n${ARTIFACT_STRUCTURE_AGENT_NEXT_STEP}`,
+      status: normalized.status,
+      code,
+      issues
+    }
+  }
   return {
     success: false,
     error: normalized.message,

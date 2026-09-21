@@ -1,6 +1,76 @@
 import { describe, it, expect } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte'
 import CoolToolRenderer from '../CoolToolRenderer.svelte'
+import { buildHydratedCoolToolStep } from '$lib/components/chat/coolToolHydration'
+
+// F-P6-5: a managed Codex `cat`, as the cool_tool zip stores it, before chat hydration.
+function storedShellReadPayload(filePath: string, toolResult: Record<string, any>) {
+  return {
+    schemaVersion: 1,
+    type: 'tool',
+    toolName: 'read_file',
+    displayToolName: 'batshit_server_read_file',
+    originalToolName: 'batshit_server_read_file',
+    operationKind: 'read_file',
+    rendererFamily: 'read_file',
+    toolCallId: 'call_shell_read',
+    toolArgs: { filePath, path: filePath, innerCommand: `cat ${filePath}` },
+    toolResult: { filePath, path: filePath, ...toolResult },
+    observation: '[Circular]',
+    timestamp: '2026-09-17T08:37:29.415Z',
+    toolProvider: 'batshit-server',
+    toolSource: 'mode3-workflow',
+    rawSidecar: { status: 'not_retained', reason: 'compact-main-payload' },
+    storage: { compacted: false, truncated: false, binaryLikeOmitted: false, forceCompress: false },
+    metadata: {
+      sessionId: 'session-shell-read',
+      operationKind: 'read_file',
+      rendererFamily: 'read_file',
+      forceCompress: false,
+      compacted: false,
+      truncated: false,
+      binaryLikeOmitted: false
+    }
+  }
+}
+
+// The same stored shape for the other file actions a shell command becomes (F-P6-5 follow-up).
+function storedShellActionPayload(options: {
+  lane: 'write_file' | 'edit_file' | 'list_files'
+  toolName: string
+  toolArgs: Record<string, any>
+  toolResult: Record<string, any>
+  error?: string
+}) {
+  return {
+    schemaVersion: 1,
+    type: 'tool',
+    toolName: options.lane,
+    displayToolName: options.toolName,
+    originalToolName: options.toolName,
+    operationKind: options.lane,
+    rendererFamily: options.lane,
+    toolCallId: `call_shell_${options.lane}`,
+    toolArgs: options.toolArgs,
+    toolResult: options.toolResult,
+    observation: '[Circular]',
+    ...(options.error ? { error: options.error } : {}),
+    timestamp: '2026-09-17T08:37:29.415Z',
+    toolProvider: 'batshit-server',
+    toolSource: 'mode3-workflow',
+    rawSidecar: { status: 'not_retained', reason: 'compact-main-payload' },
+    storage: { compacted: false, truncated: false, binaryLikeOmitted: false, forceCompress: false },
+    metadata: {
+      sessionId: 'session-shell-read',
+      operationKind: options.lane,
+      rendererFamily: options.lane,
+      forceCompress: false,
+      compacted: false,
+      truncated: false,
+      binaryLikeOmitted: false
+    }
+  }
+}
 
 const hydratedZip = {
   toolName: 'batshit_server_read_file',
@@ -319,6 +389,34 @@ const normalizedDiffEditFileZip = {
   },
   success: true
 }
+
+// What the API lane stores for `sed -i` now that the edit target's before/after copies reach the
+// diff, from the real path (`apiShellStep` → `adaptCoolToolsToZipSystem`), trimmed to the fields the
+// card reads.
+const apiSnapshotEditFileZip = (diff: string, command: string) => ({
+  toolName: 'edit_file',
+  displayToolName: 'batshit_server_edit_file',
+  originalToolName: 'native_bash_execute',
+  operationKind: 'edit_file',
+  rendererFamily: 'edit_file',
+  toolArgs: {
+    filePath: '/tmp/batshit-example/notes.md',
+    path: '/tmp/batshit-example/notes.md',
+    command,
+    innerCommand: command
+  },
+  toolResult: {
+    filePath: '/tmp/batshit-example/notes.md',
+    path: '/tmp/batshit-example/notes.md',
+    diff,
+    diffTruncated: false,
+    diffOmitted: false,
+    language: 'markdown'
+  },
+  toolProvider: 'batshit-server',
+  toolSource: 'native-tool',
+  success: true
+})
 
 const rawMode1NativeSkillInvokeZip = {
   toolName: 'Batshit_Native_Tools',
@@ -678,6 +776,378 @@ describe('CoolToolRenderer (zip-hydrated)', () => {
     expect(container.textContent || '').not.toContain('"stdout"')
   })
 
+  it('shows a shell read that exited non-zero as a failed Read File card (F-P6-5)', async () => {
+    const filePath = '/definitely/not/a/real/file.txt'
+    const step = buildHydratedCoolToolStep(
+      storedShellReadPayload(filePath, {
+        content: `cat: ${filePath}: No such file or directory`,
+        lineCount: 2,
+        size: 64,
+        language: 'plaintext',
+        contentTruncated: false,
+        contentOmitted: false,
+        contentChars: 64,
+        exitCode: 1
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_failed_shell_read_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /read file/i })
+    expect(container.querySelector('.full-tool')?.classList.contains('error')).toBe(true)
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain('Command exited with code 1')
+      expect(text).toContain('No such file or directory')
+      expect(text).toContain('Exit Code')
+    })
+    expect(container.querySelector('.error-content')).not.toBeNull()
+  })
+
+  it('keeps a successful shell read card free of any failure (F-P6-5)', async () => {
+    const filePath = '/tmp/batshit-example/notes.md'
+    const step = buildHydratedCoolToolStep(
+      storedShellReadPayload(filePath, {
+        content: '# Notes\n\nFirst line.\nSecond line.',
+        lineCount: 5,
+        size: 34,
+        language: 'markdown',
+        contentTruncated: false,
+        contentOmitted: false,
+        contentChars: 34
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_present_shell_read_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /read file/i })
+    expect(container.querySelector('.full-tool')?.classList.contains('error')).toBe(false)
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      expect(container.textContent || '').toContain('First line.')
+    })
+    const text = container.textContent || ''
+    expect(text).not.toContain('Exit Code')
+    expect(text).not.toContain('exited with code')
+    expect(container.querySelector('.error-content')).toBeNull()
+  })
+
+  it('shows a shell write that exited non-zero as not written (F-P6-5)', async () => {
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'write_file',
+        toolName: 'batshit_server_overwrite_file',
+        toolArgs: { filePath: '/nope/dir/out.txt', path: '/nope/dir/out.txt', innerCommand: 'echo hi > /nope/dir/out.txt' },
+        toolResult: {
+          filePath: '/nope/dir/out.txt',
+          path: '/nope/dir/out.txt',
+          content: 'hi',
+          lineCount: 1,
+          size: 2,
+          language: 'plaintext',
+          contentTruncated: false,
+          contentOmitted: false,
+          contentChars: 2,
+          exitCode: 1,
+          commandOutput: 'zsh: no such file or directory: /nope/dir/out.txt'
+        }
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_failed_shell_write_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /write file/i })
+    expect(container.querySelector('.full-tool')?.classList.contains('error')).toBe(true)
+    expect(headerButton.textContent || '').toContain('not written')
+    expect(headerButton.textContent || '').not.toContain('lines written')
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain('Command exited with code 1')
+      expect(text).toContain('zsh: no such file or directory: /nope/dir/out.txt')
+      expect(text).toContain('Not written')
+      expect(text).toContain('Exit Code')
+    })
+    expect(container.querySelector('.error-content')).not.toBeNull()
+  })
+
+  it('shows a shell edit that exited non-zero as not applied (F-P6-5)', async () => {
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'edit_file',
+        toolName: 'batshit_server_edit_file',
+        toolArgs: { filePath: '/nope/missing.txt', path: '/nope/missing.txt', innerCommand: 'sed -i s/a/b/ /nope/missing.txt' },
+        toolResult: {
+          filePath: '/nope/missing.txt',
+          path: '/nope/missing.txt',
+          diff: '',
+          diffTruncated: false,
+          diffOmitted: false,
+          language: 'plaintext',
+          exitCode: 1,
+          commandOutput: 'sed: /nope/missing.txt: No such file or directory'
+        }
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_failed_shell_edit_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /edit not applied/i })
+    expect(container.querySelector('.full-tool')?.classList.contains('error')).toBe(true)
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain('Edit not applied: Command exited with code 1')
+      expect(text).toContain('Not applied')
+      expect(text).toContain('Exit Code')
+    })
+    // What the command printed is in the error section, never a data dump shown as the diff.
+    expect(container.querySelector('.error-content')?.textContent).toContain(
+      'sed: /nope/missing.txt: No such file or directory'
+    )
+    expect(container.querySelector('.diff-display')).toBeNull()
+    expect(container.textContent || '').not.toContain('commandOutput')
+    expect(container.textContent || '').not.toContain('No changes made')
+  })
+
+  it.each([
+    {
+      label: 'a Codex listing that exited 1',
+      error: undefined,
+      exitCode: 1,
+      headline: 'Command exited with code 1'
+    },
+    {
+      label: 'an API listing the step marked failed',
+      error: 'Tool execution failed.',
+      exitCode: 2,
+      headline: 'Tool execution failed.'
+    }
+  ])('shows $label as a failed listing, not an empty directory (F-P6-5)', async ({ error, exitCode, headline }) => {
+    const step = buildHydratedCoolToolStep(
+      storedShellActionPayload({
+        lane: 'list_files',
+        toolName: 'batshit_server_list_files',
+        toolArgs: { path: '/nope', dirPath: '/nope', innerCommand: 'ls /nope' },
+        toolResult: {
+          files: [],
+          totalFiles: 0,
+          totalDirectories: 0,
+          totalUnknownItems: 0,
+          totalItems: 0,
+          exitCode,
+          commandOutput: 'ls: /nope: No such file or directory'
+        },
+        error
+      })
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: `zip_failed_shell_list_${exitCode}` }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /list files/i })
+    expect(headerButton.textContent || '').toContain('Failed to list nope')
+    expect(headerButton.textContent || '').not.toContain('Empty directory')
+    expect(headerButton.hasAttribute('disabled')).toBe(false)
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      const text = container.textContent || ''
+      expect(text).toContain(headline)
+      expect(text).toContain('ls: /nope: No such file or directory')
+    })
+    expect(container.textContent || '').not.toContain('No files found')
+  })
+
+  // fp65g: a failed search keeps what the command printed as `commandOutput`, because the API lane
+  // keeps a command's error text in `stderr`, apart from its output.
+  function storedSearchStep(toolResult: Record<string, any>, error?: string) {
+    const command = toolResult.results ? 'grep -rn First /tmp/batshit-example /nope' : 'grep -rn zzz /nope'
+    return buildHydratedCoolToolStep({
+      schemaVersion: 1,
+      type: 'tool',
+      toolName: 'search_files',
+      displayToolName: 'batshit_server_search_files',
+      originalToolName: 'native_bash_execute',
+      operationKind: 'search_files',
+      rendererFamily: 'bash',
+      toolCallId: 'call_failed_search',
+      toolArgs: { command, innerCommand: command },
+      toolResult,
+      ...(error ? { error } : {}),
+      timestamp: '2026-09-18T08:00:00.000Z',
+      toolProvider: 'batshit-server',
+      toolSource: 'native-tool',
+      rawSidecar: { status: 'not_retained', reason: 'compact-main-payload' },
+      storage: { compacted: false, truncated: false, binaryLikeOmitted: false, forceCompress: false },
+      metadata: { operationKind: 'search_files', rendererFamily: 'bash' }
+    })
+  }
+
+  it('shows what a failed API search printed, never that it printed nothing (fp65g)', async () => {
+    const step = storedSearchStep(
+      {
+        query: 'zzz',
+        output: '',
+        stdout: '',
+        truncated: false,
+        exitCode: 2,
+        commandOutput: 'grep: /nope: No such file or directory'
+      },
+      'Tool execution failed.'
+    )
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_failed_api_search_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /search files/i })
+    expect(container.querySelector('.full-tool')?.classList.contains('error')).toBe(true)
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      expect(container.querySelector('.terminal-output')?.textContent).toContain(
+        'grep: /nope: No such file or directory'
+      )
+    })
+    const text = container.textContent || ''
+    expect(text).not.toContain('Command completed with no output')
+    expect(text).toContain('Process exited with code 2')
+    expect(text).not.toContain('commandOutput')
+  })
+
+  it('shows what a failed search printed under the matches it found first (fp65g)', async () => {
+    const step = storedSearchStep({
+      results: [
+        {
+          path: '/tmp/batshit-example/notes.md',
+          matchCount: 1,
+          matches: [{ lineNumber: 3, text: 'First line.' }]
+        }
+      ],
+      query: 'First',
+      totalMatches: 1,
+      totalMatchingFiles: 1,
+      exitCode: 2,
+      commandOutput: '/tmp/batshit-example/notes.md:3:First line.\ngrep: /nope: No such file or directory'
+    })
+    const { container } = render(CoolToolRenderer as any, {
+      props: { intermediateStep: step, toolId: 'zip_failed_partial_search_1' }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /search files/i })
+    expect(headerButton.textContent || '').toContain('1 match in 1 file')
+    await fireEvent.click(headerButton)
+    await waitFor(() => {
+      expect(container.querySelector('.search-results')?.textContent).toContain('First line.')
+    })
+    expect(container.querySelector('.terminal-output')?.textContent).toContain(
+      'grep: /nope: No such file or directory'
+    )
+  })
+
+  it('shows a search error a lane stored as its output once, and a clean search no terminal (fp65g)', async () => {
+    const failed = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: storedSearchStep({
+          query: 'zzz',
+          output: 'grep: /nope: No such file or directory',
+          stdout: 'grep: /nope: No such file or directory',
+          truncated: false,
+          exitCode: 2
+        }),
+        toolId: 'zip_failed_codex_search_1'
+      }
+    })
+    await fireEvent.click(await within(failed.container).findByRole('button', { name: /search files/i }))
+    await waitFor(() => {
+      expect(failed.container.querySelector('.terminal-output')).not.toBeNull()
+    })
+    expect((failed.container.textContent || '').split('grep: /nope: No such file or directory').length - 1).toBe(1)
+
+    const matched = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: storedSearchStep({
+          results: [
+            { path: '/tmp/batshit-example/notes.md', matchCount: 1, matches: [{ lineNumber: 3, text: 'First line.' }] }
+          ],
+          query: 'First',
+          totalMatches: 1,
+          totalMatchingFiles: 1
+        }),
+        toolId: 'zip_matched_search_1'
+      }
+    })
+    await fireEvent.click(await within(matched.container).findByRole('button', { name: /search files/i }))
+    await waitFor(() => {
+      expect(matched.container.querySelector('.search-results')).not.toBeNull()
+    })
+    expect(matched.container.querySelector('.terminal-output')).toBeNull()
+  })
+
+  // F-P6-5 follow-up item 4: Codex reports a native patch's targets as a list of objects, and
+  // reading that list as a diff made every delete an Edit File card whose diff was its JSON.
+  it('renders a Codex delete as its command, not as an edit with a JSON diff', async () => {
+    const { container } = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: {
+          toolName: 'batshit_server_execute_command',
+          operationKind: 'bash',
+          rendererFamily: 'bash',
+          toolArgs: { command: 'rm /tmp/batshit-example/old.md' },
+          toolResult: { command: 'rm /tmp/batshit-example/old.md', stdout: '', stderr: '' },
+          metadata: { toolProvider: 'batshit-server' },
+          success: true
+        },
+        toolId: 'zip_codex_delete_1'
+      }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /bash/i })
+    expect(headerButton.textContent || '').toContain('rm /tmp/batshit-example/old.md')
+    expect(container.querySelector('.diff-display')).toBeNull()
+    expect(container.textContent || '').not.toContain('"kind"')
+  })
+
+  // F-P6-5 follow-up item 6: `ls` of several directories heads each one's entries with `<dir>:`.
+  it('renders a multi-directory listing under its directories, without the header rows', async () => {
+    const { container } = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: {
+          toolName: 'batshit_server_list_files',
+          operationKind: 'list_files',
+          rendererFamily: 'list_files',
+          toolArgs: { command: 'ls /tmp/x /tmp/y', innerCommand: 'ls /tmp/x /tmp/y', path: '/tmp/x' },
+          toolResult: {
+            files: [
+              { name: 'a.md', path: '/tmp/x/a.md', type: 'unknown' },
+              { name: 'b.md', path: '/tmp/y/b.md', type: 'unknown' }
+            ],
+            totalItems: 2,
+            totalFiles: 0,
+            totalDirectories: 0,
+            totalUnknownItems: 2
+          },
+          metadata: { toolProvider: 'batshit-server' },
+          success: true
+        },
+        toolId: 'zip_list_files_multi_1'
+      }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /list files/i })
+    expect(headerButton.textContent || '').toContain('2 files')
+    await fireEvent.click(headerButton)
+    const text = container.textContent || ''
+    expect(text).toContain('a.md')
+    expect(text).toContain('b.md')
+    // The directories are the tree the entries hang under, never entries of their own.
+    expect(text).not.toContain('/tmp/x:')
+    expect(text).not.toContain('/tmp/y:')
+  })
+
   it('keeps mapped native bash list results expandable', async () => {
     const { container } = render(CoolToolRenderer as any, {
       props: {
@@ -955,6 +1425,47 @@ describe('CoolToolRenderer (zip-hydrated)', () => {
     expect(text).toContain('2')
     expect(text).toContain('beta')
     expect(text).toContain('bravo')
+  })
+
+  it('renders an API edit stored from its before/after copies as its changed lines', async () => {
+    const { container } = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: apiSnapshotEditFileZip(
+          '--- Before\n+++ After\n    1 | # Notes\n    2 | \n-   3 | First line.\n+   3 | Last line.\n    4 | Second line.\n    5 |',
+          "sed -i 's/First/Last/' /tmp/batshit-example/notes.md"
+        ),
+        toolId: 'zip_api_edit_snapshot_1'
+      }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /edit file/i })
+    expect(headerButton.textContent || '').toContain('2 changes')
+
+    await fireEvent.click(headerButton)
+    const text = container.textContent || ''
+    expect(text).toContain('- 3 | First line.')
+    expect(text).toContain('+ 3 | Last line.')
+    expect(text).not.toContain('Diff unavailable')
+  })
+
+  it('renders an edit that changed nothing as that sentence, with no count and no data dump', async () => {
+    const sentence = 'No changes: the command left /tmp/batshit-example/notes.md exactly as it was.'
+    const { container } = render(CoolToolRenderer as any, {
+      props: {
+        intermediateStep: apiSnapshotEditFileZip(sentence, "sed -i 's/zzz/yyy/' /tmp/batshit-example/notes.md"),
+        toolId: 'zip_api_edit_unchanged_1'
+      }
+    })
+
+    const headerButton = await screen.findByRole('button', { name: /edit file/i })
+    expect(headerButton.textContent || '').not.toContain('changes')
+
+    await fireEvent.click(headerButton)
+    const text = container.textContent || ''
+    expect(text).toContain(sentence)
+    expect(text).not.toContain('Edit Not Applied')
+    expect(text).not.toContain('diffTruncated')
+    expect(text).not.toContain('Total Changes')
   })
 
   it('renders search_files fallback metadata with truthful query and counts', async () => {

@@ -49,6 +49,14 @@ vi.mock('../nativeTools', () => ({
   }
 }))
 
+/** The settle is the only thing that tells a tab a spent card is gone (2026-09-18). */
+const publishedUserEvents: Array<{ userId: string; event: Record<string, any> }> = []
+vi.mock('$lib/server/ssePublisher', () => ({
+  publishUserEvent: vi.fn(async (userId: string, event: Record<string, any>) => {
+    publishedUserEvents.push({ userId, event })
+  })
+}))
+
 /**
  * The card entry the AI SDK produces, in the shape P0 measured on BSMS:
  * `toolName: 'native_batshit_tool_use'`, the SDK's own `aitxt-…` approval id, and the
@@ -783,6 +791,59 @@ describe('planControlApprovalResumeTurn', () => {
 })
 
 describe('settleControlApprovalCard', () => {
+  beforeEach(() => {
+    publishedUserEvents.length = 0
+  })
+
+  it('tells every tab showing that chat to re-read it', async () => {
+    // Nothing streams when a card is settled: the resume turn, when there is one, writes a
+    // DIFFERENT message. Before 2026-09-18 the spent card only disappeared because the chat
+    // page re-fetched the open chat ten times a second.
+    await redis.createSession({
+      id: SESSION,
+      user_id: USER,
+      name: SESSION,
+      created_at: new Date().toISOString(),
+      last_modified_at: new Date().toISOString(),
+      metadata: {}
+    } as any)
+    await redis.saveMessage({
+      id: MESSAGE,
+      session_id: SESSION,
+      user_id: USER,
+      agent_id: AGENT,
+      role: 'assistant',
+      content: 'I need your approval first.',
+      created_at: new Date().toISOString(),
+      metadata: { toolApprovals: { mode: 'off', approvals: [{ approvalId: 'apr_x' }], source: 'fabric' } }
+    } as any)
+
+    await settleControlApprovalCard({
+      userId: USER,
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      denied: []
+    })
+
+    expect(publishedUserEvents).toEqual([
+      {
+        userId: USER,
+        event: { type: 'session_messages_changed', sessionId: SESSION, reason: 'approval_settled' }
+      }
+    ])
+  })
+
+  it('says nothing when there is no message to settle', async () => {
+    await settleControlApprovalCard({
+      userId: USER,
+      sessionId: SESSION,
+      messageId: 'msg_that_is_not_there',
+      denied: []
+    })
+
+    expect(publishedUserEvents).toEqual([])
+  })
+
   it('clears the spent card WITHOUT taking the rest of the message metadata with it', async () => {
     await redis.createSession({
       id: SESSION,

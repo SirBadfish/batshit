@@ -8,7 +8,7 @@ import type { ThreadEvent } from '$lib/types/codexProtocol'
 /**
  * SA-114 P2 (DL-114-06, AMD-114-02) — `turn/steer` on the managed Codex app-server lane.
  *
- * Driven against a fake app server that speaks the wire P0 measured on the pinned 0.141.0:
+ * Driven against a fake app server that speaks the wire P0 measured on the pinned 0.155.1:
  * `turn/start` emits a `userMessage` item for the ORIGINAL prompt, an accepted `turn/steer`
  * answers `{turnId}` and then emits `item/started` + `item/completed` for its own
  * `userMessage` item carrying the steered text, and every refusal is a `-32600` error with

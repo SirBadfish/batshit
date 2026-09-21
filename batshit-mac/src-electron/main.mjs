@@ -13,6 +13,7 @@ import {
   dialog,
   globalShortcut,
   ipcMain,
+  Menu,
   MessageChannelMain,
   protocol,
   screen,
@@ -38,7 +39,19 @@ import {
   createBackupExportFilename,
   streamBackupExportToFile
 } from './backup-export-download.mjs';
-import { resolveMainWindowSizePolicy } from './main-window-policy.mjs';
+import {
+  buildDeveloperContextMenuTemplate,
+  CustomStyleOverrides
+} from './local-style-overrides.mjs';
+import {
+  resolveMainWindowSizePolicy,
+  restoreMainWindowBounds
+} from './main-window-policy.mjs';
+import {
+  MAIN_WINDOW_STATE_VERSION,
+  readMainWindowState,
+  writeMainWindowState
+} from './main-window-state.mjs';
 import { settleShutdownPreparations } from './shutdown-lifecycle.mjs';
 
 import {
@@ -53,6 +66,8 @@ import {
   resolveBackupExportUrl,
   resolveDesktopControlsUrl,
   resolveDesktopGoonUrl,
+  resolveCustomCssPath,
+  resolveDevToolsEnabled,
   resolveShellAssetPath,
   validateElectronIpcSender,
   validateBackupExportOptions,
@@ -65,6 +80,8 @@ import {
 const execFileAsync = promisify(execFile);
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const allowedOrigins = collectAllowedOrigins();
+const devToolsEnabled = resolveDevToolsEnabled({ homePath: homedir(), fileExists: existsSync });
+const customCssPath = resolveCustomCssPath(process.env, homedir());
 const desktopGoonUrl = resolveDesktopGoonUrl();
 const desktopControlsUrl = resolveDesktopControlsUrl();
 const shellRoot = app.isPackaged
@@ -479,9 +496,51 @@ function intentionalShutdownInProgress() {
   return shutdownStarted || quittingAfterShutdown;
 }
 
-function createWindow() {
+const mainWindowStatePath = () => join(app.getPath('userData'), 'main-window-state-v1.json');
+
+/**
+ * Window geometry is cosmetic state. Unusable saved bounds are reported and
+ * then replaced with the default policy, because refusing to open the window
+ * would be a worse failure than losing a remembered size.
+ */
+async function loadMainWindowState() {
+  try {
+    return await readMainWindowState(mainWindowStatePath());
+  } catch (error) {
+    console.error('[Batshit Mac] Saved main window state was unusable and was ignored:', error);
+    return null;
+  }
+}
+
+function restoreSavedMainWindowBounds(savedState) {
+  if (!savedState) return null;
+  try {
+    const display = screen.getDisplayMatching(savedState.bounds);
+    return restoreMainWindowBounds({ saved: savedState.bounds, workArea: display.workArea });
+  } catch (error) {
+    console.error('[Batshit Mac] Saved main window bounds did not fit any display:', error);
+    return null;
+  }
+}
+
+async function persistMainWindowState(window) {
+  if (!window || window.isDestroyed() || window.isMinimized() || window.isFullScreen()) return;
+  try {
+    await writeMainWindowState(mainWindowStatePath(), {
+      schemaVersion: MAIN_WINDOW_STATE_VERSION,
+      bounds: window.getNormalBounds(),
+      maximized: window.isMaximized()
+    });
+  } catch (error) {
+    console.error('[Batshit Mac] Main window state was not saved:', error);
+  }
+}
+
+function createWindow(savedState = null) {
+  const restoredBounds = restoreSavedMainWindowBounds(savedState);
   const window = new BrowserWindow({
     ...resolveMainWindowSizePolicy(),
+    ...(restoredBounds ?? {}),
     show: false,
     backgroundColor: '#080810',
     title: 'Batshit',
@@ -492,12 +551,55 @@ function createWindow() {
       sandbox: true,
       webSecurity: true,
       backgroundThrottling: false,
-      devTools: process.env.BATSHIT_MAC_ENABLE_DEVTOOLS === '1'
+      devTools: devToolsEnabled
     }
   });
   registerWindowRole(window.webContents, DESKTOP_GOON_WINDOW_ROLES.main);
   configureRoleNavigation(window.webContents, DESKTOP_GOON_WINDOW_ROLES.main);
+  if (savedState?.maximized) window.maximize();
   window.once('ready-to-show', () => window.show());
+
+  let pendingStateSave = null;
+  const scheduleStateSave = () => {
+    if (pendingStateSave) clearTimeout(pendingStateSave);
+    pendingStateSave = setTimeout(() => {
+      pendingStateSave = null;
+      void persistMainWindowState(window);
+    }, 500);
+  };
+  for (const event of ['resize', 'move', 'maximize', 'unmaximize']) {
+    window.on(event, scheduleStateSave);
+  }
+
+  const styleOverrides = new CustomStyleOverrides({
+    webContents: window.webContents,
+    cssPath: customCssPath,
+    onError: (error) => {
+      console.error(`[Batshit Mac] Custom CSS at ${customCssPath} was not applied:`, error);
+    }
+  });
+  window.webContents.on('did-finish-load', () => {
+    styleOverrides.handleNavigated();
+    void styleOverrides.apply();
+  });
+  styleOverrides.start();
+
+  if (devToolsEnabled) {
+    window.webContents.on('context-menu', (_event, params) => {
+      const actions = {
+        inspect: () => window.webContents.inspectElement(params.x, params.y),
+        reload: () => window.webContents.reload(),
+        'reapply-css': () => void styleOverrides.apply()
+      };
+      const template = buildDeveloperContextMenuTemplate({
+        canInspect: true,
+        hasCustomCss: styleOverrides.hasCustomCss()
+      }).map((item) =>
+        item.type === 'separator' ? item : { label: item.label, click: actions[item.id] }
+      );
+      Menu.buildFromTemplate(template).popup({ window });
+    });
+  }
   window.webContents.on('render-process-gone', (_event, details) => {
     if (intentionalShutdownInProgress()) return;
     void desktopGoonController?.handleMainRendererFailure('main-renderer-stopped').finally(() => {
@@ -523,12 +625,18 @@ function createWindow() {
     });
   });
   window.on('close', (event) => {
+    if (pendingStateSave) clearTimeout(pendingStateSave);
+    pendingStateSave = null;
+    void persistMainWindowState(window);
     if (quittingAfterShutdown) return;
     event.preventDefault();
     pendingShutdownReason = 'window-close';
     app.quit();
   });
   window.on('closed', () => {
+    if (pendingStateSave) clearTimeout(pendingStateSave);
+    pendingStateSave = null;
+    styleOverrides.stop();
     if (mainWindow === window) mainWindow = null;
   });
   void window.loadURL(shellUrl);
@@ -605,7 +713,7 @@ if (!hasSingleInstanceLock) {
       getDesktopGoonState: () => desktopGoonController?.getStatus() || null,
       setAdjust: (enabled, source) => desktopGoonController?.setAdjustMode(enabled, source),
       emitState: (state) => sendDesktopControlsState(state),
-      devTools: process.env.BATSHIT_MAC_ENABLE_DEVTOOLS === '1'
+      devTools: devToolsEnabled
     });
     desktopGoonController = new DesktopGoonWindowController({
       BrowserWindow,
@@ -650,10 +758,10 @@ if (!hasSingleInstanceLock) {
           dialog.showErrorBox('Desktop Goon stopped', message);
         }
       },
-      devTools: process.env.BATSHIT_MAC_ENABLE_DEVTOOLS === '1'
+      devTools: devToolsEnabled
     });
     installIpcHandlers();
-    mainWindow = createWindow();
+    mainWindow = createWindow(await loadMainWindowState());
   }).catch((error) => {
     console.error('[Batshit Mac] Shell startup failed:', error);
     dialog.showErrorBox('Batshit could not open', error instanceof Error ? error.message : String(error));

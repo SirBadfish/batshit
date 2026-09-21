@@ -12,6 +12,7 @@ const mockTranscribeByoSpeechForRecord = vi.fn()
 const mockCheckByoSpeechStatus = vi.fn()
 const mockUpsertVoiceEngineRecord = vi.fn()
 const mockSetVoiceEngineEnabled = vi.fn()
+const mockGetVoiceEngineRecord = vi.fn()
 const mockSpawn = vi.fn()
 const mockRetrieveApiKey = vi.fn()
 
@@ -23,9 +24,13 @@ vi.mock('$lib/server/services/voiceService', () => ({
   checkByoSpeechStatus: (...args: any[]) => mockCheckByoSpeechStatus(...args)
 }))
 
+// This factory replaces the WHOLE module, so a new import in
+// voiceLocalEngineSetup that is missing here is `undefined` at call time, not a
+// pass-through. Keep it in step with what the service actually imports.
 vi.mock('$lib/server/services/voiceEngineRegistry', () => ({
   upsertVoiceEngineRecord: (...args: any[]) => mockUpsertVoiceEngineRecord(...args),
-  setVoiceEngineEnabled: (...args: any[]) => mockSetVoiceEngineEnabled(...args)
+  setVoiceEngineEnabled: (...args: any[]) => mockSetVoiceEngineEnabled(...args),
+  getVoiceEngineRecord: (...args: any[]) => mockGetVoiceEngineRecord(...args)
 }))
 
 vi.mock('$lib/services/apiKey.server', () => ({
@@ -44,12 +49,17 @@ vi.mock('$lib/services/apiKey.server', () => ({
   normalizeApiKeyServiceName: (service: string) => service.trim().toLowerCase()
 }))
 
-vi.mock('node:child_process', () => ({
-  spawn: (...args: any[]) => mockSpawn(...args),
-  default: {
-    spawn: (...args: any[]) => mockSpawn(...args)
+vi.mock('node:child_process', async (importOriginal) => {
+  const original = await importOriginal<typeof import('node:child_process')>()
+  return {
+    ...original,
+    spawn: (...args: any[]) => mockSpawn(...args),
+    default: {
+      ...(original as typeof original & { default?: Record<string, unknown> }).default,
+      spawn: (...args: any[]) => mockSpawn(...args)
+    }
   }
-}))
+})
 
 describe('voiceLocalEngineSetup', () => {
   let tempRoot: string
@@ -89,6 +99,7 @@ describe('voiceLocalEngineSetup', () => {
       return child
     })
     mockRetrieveApiKey.mockResolvedValue(null)
+    mockGetVoiceEngineRecord.mockResolvedValue(null)
   })
 
   afterEach(async () => {
@@ -1335,5 +1346,198 @@ describe('voiceLocalEngineSetup', () => {
     expect(result.blocker).toContain('whisper-large-v3')
     expect(mockUpsertVoiceEngineRecord).not.toHaveBeenCalled()
     expect(mockSetVoiceEngineEnabled).not.toHaveBeenCalled()
+  })
+  describe('Stop with Batshit is written into the launch record', () => {
+    // The Mac supervisor and the native launcher decide shutdown from this
+    // file, never from Redis, so a spawn that forgets the field silently
+    // reverts the user's choice to the default.
+    async function launchAndReadRecord(engineId: string) {
+      mockInspectByoSpeechRuntimeForRecord
+        .mockResolvedValueOnce({
+          ready: false,
+          reachable: false,
+          state: 'unreachable',
+          statusHint: 'Connection refused'
+        })
+        .mockResolvedValue({
+          ready: true,
+          reachable: true,
+          state: 'ready',
+          statusHint: 'Health check passed.'
+        })
+      mockListByoVoicesForRecord.mockResolvedValue([])
+      mockSynthesizeByoSpeechForRecord.mockResolvedValue({
+        audio: new Uint8Array([1, 2, 3, 4]),
+        mediaType: 'audio/wav',
+        voiceId: 'alloy',
+        provider: `byo:${engineId}`,
+        model: 'engine-default-model'
+      })
+      mockUpsertVoiceEngineRecord.mockResolvedValue({
+        created: true,
+        record: { id: engineId },
+        summary: { id: engineId, providerId: `byo:${engineId}`, name: engineId, enabled: false }
+      })
+      mockCheckByoSpeechStatus.mockResolvedValue({ ready: true, statusHint: 'Health check passed.' })
+      mockSetVoiceEngineEnabled.mockResolvedValue({ id: engineId, enabled: true })
+
+      const { completeLocalVoiceEngineSetup } = await import('../services/voiceLocalEngineSetup')
+      const result = await completeLocalVoiceEngineSetup('user-1', {
+        engineId,
+        installRoot,
+        installOwnership: 'user-managed',
+        launch: { command: '.venv/bin/python', args: ['main.py'] },
+        payload: {
+          name: engineId,
+          baseUrl: 'http://127.0.0.1:4123',
+          healthPath: '/health',
+          ttsPath: '/tts',
+          requestFormat: 'openai-compatible',
+          ttsDefaults: { modelId: 'engine-default-model', voiceId: 'alloy' },
+          supports: { tts: true, stt: false, clone: false }
+        },
+        readinessTimeoutMs: 10_000,
+        pollIntervalMs: 1
+      })
+
+      expect(result.launched).toBe(true)
+      return JSON.parse(
+        await readFile(
+          path.join(runtimeStateRoot, engineId, '.batshit-local-runtime-launch.json'),
+          'utf8'
+        )
+      )
+    }
+
+    it('records "stop" for an engine with no saved choice yet', async () => {
+      mockGetVoiceEngineRecord.mockResolvedValue(null)
+      expect(await launchAndReadRecord('fresh-engine')).toMatchObject({
+        engineId: 'fresh-engine',
+        pid: 4242,
+        stopOnShutdown: true
+      })
+    })
+
+    it('does not silently re-enable stopping for someone who turned it off', async () => {
+      // Re-running setup preserves the saved "Start with Batshit" choice. The
+      // stop half has to be preserved the same way.
+      mockGetVoiceEngineRecord.mockResolvedValue({
+        id: 'kept-running-engine',
+        localRuntime: { startup: { autoStartOnLaunch: true, stopOnShutdown: false } }
+      })
+      expect(await launchAndReadRecord('kept-running-engine')).toMatchObject({
+        engineId: 'kept-running-engine',
+        stopOnShutdown: false
+      })
+    })
+
+    it('names the Batshit that launched it, so only that Batshit\'s shutdown stops it', async () => {
+      const original = process.env.BATSHIT_VOICE_RUNTIME_OWNER
+      process.env.BATSHIT_VOICE_RUNTIME_OWNER = 'native:4321:1789700000000'
+      try {
+        expect(await launchAndReadRecord('owned-engine')).toMatchObject({
+          launchedBy: 'native:4321:1789700000000'
+        })
+      } finally {
+        if (original === undefined) delete process.env.BATSHIT_VOICE_RUNTIME_OWNER
+        else process.env.BATSHIT_VOICE_RUNTIME_OWNER = original
+      }
+    })
+
+    it('a Batshit started without a launcher identity writes an unmarked record (today\'s rules)', async () => {
+      const original = process.env.BATSHIT_VOICE_RUNTIME_OWNER
+      delete process.env.BATSHIT_VOICE_RUNTIME_OWNER
+      try {
+        expect((await launchAndReadRecord('unmarked-engine')).launchedBy).toBeUndefined()
+      } finally {
+        if (original !== undefined) process.env.BATSHIT_VOICE_RUNTIME_OWNER = original
+      }
+    })
+
+    it('records the listener the runtime serves, so an engine sharing it can find it', async () => {
+      expect(await launchAndReadRecord('endpoint-engine')).toMatchObject({
+        endpoint: 'http://127.0.0.1:4123'
+      })
+    })
+
+    it('a relaunch keeps the record of an earlier launch that is still running', async () => {
+      // This test process stands in for a copy of the engine that is still running.
+      const dir = path.join(runtimeStateRoot, 'relaunched-engine')
+      await mkdir(dir, { recursive: true })
+      await writeFile(
+        path.join(dir, '.batshit-local-runtime-launch.json'),
+        JSON.stringify({ engineId: 'relaunched-engine', pid: process.pid, command: '/opt/engine/bin/serve' })
+      )
+
+      expect((await launchAndReadRecord('relaunched-engine')).pid).toBe(4242)
+      const aside = JSON.parse(
+        await readFile(path.join(dir, `.batshit-local-runtime-launch.${process.pid}.json`), 'utf8')
+      )
+      expect(aside).toMatchObject({ pid: process.pid, command: '/opt/engine/bin/serve' })
+    })
+
+    it('set up against a runtime another engine launched, it records its own choice beside it', async () => {
+      await mkdir(path.join(runtimeStateRoot, 'shared-starter'), { recursive: true })
+      await writeFile(
+        path.join(runtimeStateRoot, 'shared-starter', '.batshit-local-runtime-launch.json'),
+        JSON.stringify({
+          engineId: 'shared-starter',
+          pid: process.pid,
+          command: '/opt/mlx/bin/mlx_audio.server',
+          endpoint: 'http://127.0.0.1:4123',
+          launchedAt: '2026-09-17T01:00:03.000Z'
+        })
+      )
+      mockInspectByoSpeechRuntimeForRecord.mockResolvedValue({
+        ready: true,
+        reachable: true,
+        state: 'ready',
+        statusHint: 'Health check passed.'
+      })
+      mockListByoVoicesForRecord.mockResolvedValue([])
+      mockSynthesizeByoSpeechForRecord.mockResolvedValue({
+        audio: new Uint8Array([1, 2, 3, 4]),
+        mediaType: 'audio/wav',
+        voiceId: 'alloy',
+        provider: 'byo:sharing-engine',
+        model: 'engine-default-model'
+      })
+      mockUpsertVoiceEngineRecord.mockResolvedValue({
+        created: true,
+        record: { id: 'sharing-engine', localRuntime: { startup: { stopOnShutdown: false } } },
+        summary: { id: 'sharing-engine', providerId: 'byo:sharing-engine', name: 'sharing-engine', enabled: false }
+      })
+      mockCheckByoSpeechStatus.mockResolvedValue({ ready: true, statusHint: 'Health check passed.' })
+      mockSetVoiceEngineEnabled.mockResolvedValue({ id: 'sharing-engine', enabled: true })
+
+      const { completeLocalVoiceEngineSetup } = await import('../services/voiceLocalEngineSetup')
+      const result = await completeLocalVoiceEngineSetup('user-1', {
+        engineId: 'sharing-engine',
+        installRoot,
+        installOwnership: 'user-managed',
+        launch: { command: '.venv/bin/python', args: ['main.py'] },
+        payload: {
+          name: 'sharing-engine',
+          baseUrl: 'http://localhost:4123',
+          healthPath: '/health',
+          ttsPath: '/tts',
+          requestFormat: 'openai-compatible',
+          ttsDefaults: { modelId: 'engine-default-model', voiceId: 'alloy' },
+          supports: { tts: true, stt: false, clone: false }
+        },
+        readinessTimeoutMs: 10_000,
+        pollIntervalMs: 1
+      })
+
+      expect(result).toMatchObject({ completed: true, launched: false, alreadyRunning: true })
+      expect(mockSpawn).not.toHaveBeenCalled()
+      const record = JSON.parse(
+        await readFile(
+          path.join(runtimeStateRoot, 'sharing-engine', '.batshit-local-runtime-launch.json'),
+          'utf8'
+        )
+      )
+      expect(record).toMatchObject({ pid: process.pid, startedBy: 'shared-starter', stopOnShutdown: false })
+    })
   })
 })

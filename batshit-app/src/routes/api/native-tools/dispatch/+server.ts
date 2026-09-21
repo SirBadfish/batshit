@@ -2,6 +2,7 @@ import { json, type RequestHandler } from '@sveltejs/kit'
 import { resolveNativeToolUser } from '$lib/server/services/nativeToolAuth'
 import { bindDispatchContextIdentity } from '$lib/server/services/actingAgentIdentity'
 import { nativeToolService } from '$lib/server/services/nativeTools'
+import { getRunningReplyStopSignal } from '$lib/server/services/streamAbortRegistry'
 
 interface NativeAutomationDispatchRequest {
   userId?: string
@@ -9,6 +10,13 @@ interface NativeAutomationDispatchRequest {
   input?: unknown
   context?: unknown
   projectPath?: unknown
+}
+
+/** The chat a (bound) dispatch context names; the dispatcher validates the rest of it. */
+function contextSessionId(context: unknown): string | undefined {
+  if (!context || typeof context !== 'object' || Array.isArray(context)) return undefined
+  const sessionId = (context as Record<string, unknown>).session_id
+  return typeof sessionId === 'string' ? sessionId : undefined
 }
 
 function statusForCode(code?: string): number {
@@ -103,7 +111,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
       // SA-117 / PR #106 review F-1: the lane travels with the call, so `useControl`'s
       // identity gate answers the same way here as on `/api/controls/use`.
       actorType: auth.auth,
-      delegatedRun: auth.delegated === true
+      delegatedRun: auth.delegated === true,
+      // BL-75: the Subagent or Worker a delegated run's credential names, for skill access.
+      scopeAgentId: auth.auth === 'agent' ? (auth.scopeAgentId ?? null) : null,
+      // A Stop of the reply running in the chat ends a command this call runs (2026-09-18): the
+      // managed CLI helper's `batshit_server_bash_execute` and n8n Workflow Subagents come through
+      // here. The chat is the bound one on the agent lane; no reply running, no Stop, as before.
+      abortSignal: getRunningReplyStopSignal(contextSessionId(boundContext.context))
     })
 
     const statusCode =
