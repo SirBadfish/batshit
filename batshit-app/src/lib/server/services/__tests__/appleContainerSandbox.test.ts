@@ -651,7 +651,9 @@ describe('appleContainerSandbox', () => {
 
     it('needs no end for a command that finishes by itself', async () => {
       let ends = 0
-      const run = await __runAppleContainerCommandForTests('sh', ['-c', 'exit 0'], {
+      // `true`, not `sh -c 'exit 0'`: CodeQL reads a shell run through this launcher in any file as
+      // the product running one, and flags every sandbox setting it passes (public PR 114).
+      const run = await __runAppleContainerCommandForTests('true', [], {
         timeoutMs: 10_000,
         abortSignal: new AbortController().signal,
         endInside: async () => {

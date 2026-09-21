@@ -202,6 +202,17 @@ describe('bashCommandMapper', () => {
     expect(mapped.args.filePath).toBe(filePath)
   })
 
+  // Public PR 114 (CodeQL js/redos): the options are skipped one at a time, never back, so a read
+  // with no file after its count reads stdin and shows as a plain command, not a read of the count.
+  it.each(['head -n 5 | grep x', 'tail -n +3 < notes.md'])(
+    'reads no count as the file in `%s`',
+    (command) => {
+      const mapped = mapBashCommandToRendererTool(command)
+      expect(mapped.toolName).toBe('native_bash_execute')
+      expect(mapped.args.filePath).toBeUndefined()
+    }
+  )
+
   // F-P6-5 follow-up: these spellings mapped as READS, and Plan mode's safe list allows `sed`, so a
   // Plan mode agent could edit any file with them.
   it.each([

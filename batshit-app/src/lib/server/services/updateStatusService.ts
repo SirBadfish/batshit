@@ -2,8 +2,11 @@ import { env } from '$env/dynamic/private'
 import { BATSHIT_APP_CHANNEL, BATSHIT_APP_VERSION } from '$lib/version'
 import type { BatshitUpdateStatus } from '$lib/types/updateStatus'
 
-const DEFAULT_RELEASE_FEED_URL = 'https://api.github.com/repos/SirBadfish/batshit/releases/latest'
-const DEFAULT_RELEASES_URL = 'https://github.com/SirBadfish/batshit/releases/latest'
+// The release list, not `releases/latest`: GitHub's latest skips a pre-release, and every alpha
+// ships as one, so `latest` answered 404 and no alpha install ever saw an update (BL-85).
+const DEFAULT_RELEASE_FEED_URL = 'https://api.github.com/repos/SirBadfish/batshit/releases?per_page=20'
+const DEFAULT_RELEASES_URL = 'https://github.com/SirBadfish/batshit/releases'
+const RELEASE_TAG_PATTERN = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
 const CACHE_TTL_MS = 15 * 60 * 1000
 
 type LatestRelease = {
@@ -110,6 +113,18 @@ function getCacheKey() {
   ].join('|')
 }
 
+/** The highest version among published releases: no draft, and only a tag that is a version. */
+function newestPublishedRelease(releases: unknown[]): any | null {
+  let newest: { tag: string; release: any } | null = null
+  for (const release of releases as any[]) {
+    if (!release || release.draft === true) continue
+    const tag = typeof release.tag_name === 'string' ? release.tag_name.trim() : ''
+    if (!RELEASE_TAG_PATTERN.test(tag)) continue
+    if (!newest || compareUpdateVersions(tag, newest.tag) > 0) newest = { tag, release }
+  }
+  return newest?.release ?? null
+}
+
 async function fetchLatestFromGitHub(feedUrl: string): Promise<LatestRelease> {
   const response = await fetch(feedUrl, {
     headers: {
@@ -122,7 +137,13 @@ async function fetchLatestFromGitHub(feedUrl: string): Promise<LatestRelease> {
     throw new Error(`Release feed returned ${response.status}`)
   }
 
-  const payload = await response.json()
+  const feed = await response.json()
+  // A release list (the default feed) gives its newest published version, pre-releases included;
+  // a single release (a custom feed shaped like GitHub's `releases/latest`) gives itself.
+  const payload = Array.isArray(feed) ? newestPublishedRelease(feed) : feed
+  if (Array.isArray(feed) && !payload) {
+    throw new Error('Release feed lists no published release')
+  }
   const tagName = typeof payload?.tag_name === 'string' ? payload.tag_name.trim() : ''
   if (!tagName) {
     throw new Error('Release feed did not include a tag name')

@@ -185,18 +185,48 @@ function firstPipelineStage(command: string): string {
   return command
 }
 
+// `head -n 2 file` and `tail -n +5 file` give a count before the file; the count is not the path.
+// An option without a separate value (`cat -n`, `head -5`, `--lines=5`) is skipped whole.
+const CAT_LIKE_COUNT_OPTION = /(?:-[nc]|--lines|--bytes)\s+[+-]?\d+[a-z]*\s+/iy
+const CAT_LIKE_OTHER_OPTION = /-\S+\s+/y
+const CAT_LIKE_PATH = /(?![><])['"]?([^'"`\s|><]+)/y
+
+function matchAt(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
+  pattern.lastIndex = index
+  return pattern.exec(text)
+}
+
+/**
+ * The file a `cat`, `head`, or `tail` in the read stage reads: the first word after its options.
+ * The options are skipped one at a time, never back: the single regex this replaced could match a
+ * run like `-c -0 ` two ways (CodeQL js/redos, public PR 114), and when no file followed it fell
+ * back to calling a count the file (`head -n 5 | grep x` read `5`).
+ */
+function extractCatLikePath(readStage: string): string | undefined {
+  const commands = /\b(?:cat|head|tail)\b\s+/gi
+  let command: RegExpExecArray | null
+  while ((command = commands.exec(readStage))) {
+    let index = command.index + command[0].length
+    for (;;) {
+      const option =
+        matchAt(CAT_LIKE_COUNT_OPTION, readStage, index) ?? matchAt(CAT_LIKE_OTHER_OPTION, readStage, index)
+      if (!option) break
+      index += option[0].length
+    }
+    const filePath = matchAt(CAT_LIKE_PATH, readStage, index)?.[1]
+    if (filePath) return filePath
+  }
+  return undefined
+}
+
 function extractPathFromReadCommand(shellCommand: string): string | undefined {
   // The read is the pipeline's first stage: `sed -n '1,5p' app.js | grep -i foo` reads app.js, as
   // `cat app.js | grep foo` and `head app.js | grep foo` always did, and a later `| head -3` or
   // `| cat -n` lends it no count or flag for a path (bug sweep item 7).
   const readStage = firstPipelineStage(shellCommand)
 
-  // `head -n 2 file` and `tail -n +5 file` give a count before the file; the count is not the
-  // path. An option without a separate value (`cat -n`, `head -5`, `--lines=5`) is skipped whole.
-  const catLikeMatch = readStage.match(
-    /\b(?:cat|head|tail)\b\s+(?:(?:-[nc]|--lines|--bytes)\s+[+-]?\d+[a-zA-Z]*\s+|-[^\s]+\s+)*(?![><])(?:['"]?)([^'"`\s|><]+)(?:['"]?)/i
-  )
-  if (catLikeMatch?.[1]) return catLikeMatch[1].trim()
+  const catLikePath = extractCatLikePath(readStage)
+  if (catLikePath) return catLikePath
 
   const sedMatch = readStage.match(
     /\bsed\b[\s\S]*?\s(?:['"]?)([^'"`\s|><]+)(?:['"]?)\s*$/i

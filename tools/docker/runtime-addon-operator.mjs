@@ -242,10 +242,14 @@ function appendOutput(current, chunk) {
   return next.length > MAX_OUTPUT_CHARS ? next.slice(0, MAX_OUTPUT_CHARS) : next
 }
 
+// Plain comparisons, not Math.min/Math.max: CodeQL reads only a comparison as the bound on a
+// request's time limit (js/resource-exhaustion, public PR 114).
 function clampRunTimeoutMs(value, fallback = RUN_TIMEOUT_MS) {
   const parsed = Number(value)
-  const candidate = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
-  return Math.min(MAX_RUN_TIMEOUT_MS, Math.max(1_000, Math.floor(candidate)))
+  const candidate = Math.floor(Number.isFinite(parsed) && parsed > 0 ? parsed : fallback)
+  if (candidate > MAX_RUN_TIMEOUT_MS) return MAX_RUN_TIMEOUT_MS
+  if (candidate < 1_000) return 1_000
+  return candidate
 }
 
 function isAuthorized(req) {
@@ -967,8 +971,10 @@ async function endSandboxCommand(sandboxName, tag) {
     .then((entries) => entries.some((entry) => entry.name === sandboxName))
     .catch(() => true)
   if (!stillThere) return
+  // JSON.stringify keeps the request's sandbox name and the CLI's output on one log line
+  // (CodeQL js/log-injection, public PR 114).
   console.warn(
-    `Could not end what a stopped command started in ${sandboxName}: ${describeSbxRunFailure(run, `Ending the command (exit ${run.exitCode ?? run.signal})`)}`
+    `Could not end what a stopped command started in ${JSON.stringify(sandboxName)}: ${JSON.stringify(describeSbxRunFailure(run, `Ending the command (exit ${run.exitCode ?? run.signal})`))}`
   )
 }
 

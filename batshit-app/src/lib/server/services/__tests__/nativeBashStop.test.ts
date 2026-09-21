@@ -269,7 +269,9 @@ describe('the Apple Container command runner', () => {
     const stop = new AbortController()
     stop.abort('user')
 
-    const run = await __runAppleContainerCommandForTests('sh', ['-c', 'echo ran > ran.txt'], {
+    // No `sh -c` here: CodeQL reads a shell run through this launcher in any file as the product
+    // running one, and flags every sandbox setting it passes (public PR 114).
+    const run = await __runAppleContainerCommandForTests('touch', ['ran.txt'], {
       cwd,
       timeoutMs: 10_000,
       abortSignal: stop.signal

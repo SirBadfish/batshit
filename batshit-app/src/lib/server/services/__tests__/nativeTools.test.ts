@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import {
   mapBrokerFailureToNativeAutomationErrorCode,
@@ -1012,6 +1012,9 @@ describe('nativeToolService hardening', () => {
       await writeFile(path.join(tempWorkspace, 'probe.txt'), 'needle\n', 'utf8')
       await writeFile(path.join(tempWorkspace, 'src', 'sample.ts'), 'export const sample = true\n', 'utf8')
 
+      // `rg` is not on every host: the Docker app image and CI's Linux runner have none. Plan mode
+      // must let it through everywhere; it can only run where it is installed (public PR 114).
+      const ripgrepInstalled = spawnSync('rg', ['--version'], { stdio: 'ignore' }).status === 0
       for (const command of [
         'cat probe.txt',
         "sed -n '1,20p' probe.txt",
@@ -1029,6 +1032,7 @@ describe('nativeToolService hardening', () => {
         })
 
         expect(result.blocked, command).toBe(false)
+        if (command.startsWith('rg ') && !ripgrepInstalled) continue
         expect(result.success, command).toBe(true)
       }
 

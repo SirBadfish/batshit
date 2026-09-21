@@ -35,10 +35,14 @@ const ALLOWED_ENV_KEYS = new Set([
   'KERNEL_API_URL'
 ])
 
+// Plain comparisons, not Math.min/Math.max: CodeQL reads only a comparison as the bound on a
+// request's time limit (js/resource-exhaustion, public PR 114).
 function clampNumber(value, fallback, min, max) {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return fallback
-  return Math.min(max, Math.max(min, parsed))
+  if (parsed > max) return max
+  if (parsed < min) return min
+  return parsed
 }
 
 function appendWithLimit(current, chunk, limit) {

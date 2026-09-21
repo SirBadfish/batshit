@@ -100,7 +100,7 @@ const DEFAULT_APP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.app}`;
 const DEFAULT_SERVER_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.server}`;
 const DEFAULT_MCP_ORIGIN = `http://127.0.0.1:${DEFAULT_PORTS.mcp}`;
 const DEFAULT_LIVEKIT_AGENT_NAME = 'batshit-livekit-agent';
-const DEFAULT_APP_VERSION = '0.1.0-alpha.1';
+const DEFAULT_APP_VERSION = '0.1.0-alpha.2';
 const DEFAULT_APP_CHANNEL = 'alpha';
 const APPLE_CONTAINER_INSTALL_URL = 'https://github.com/apple/container/releases/latest';
 

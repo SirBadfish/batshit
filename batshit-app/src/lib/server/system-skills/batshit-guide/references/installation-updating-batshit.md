@@ -82,7 +82,7 @@ If something breaks, use [Bug reports and diagnostics](../troubleshooting/bug-re
 
 ## Turning update checks off
 
-Update checks do not include your chats, prompts, keys, settings, logs, or project files. They only ask for the latest public Batshit release version.
+Update checks do not include your chats, prompts, keys, settings, logs, or project files. They only read the list of public Batshit releases.
 
 If your instance must stay fully offline, set:
 
